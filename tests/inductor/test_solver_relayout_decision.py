@@ -17,8 +17,8 @@
 A relayout group's destination is a ``RelayoutCopyBuffer``: an ordinary buffer
 whose residency IS the decision to shuffle, placed by the same no-overlap as
 everything else and priced by a plain term of the shared sympy objective
-(``cost_term``). Handcrafted buffers drive the pieces directly - no graph, no
-compile:
+(``cost_term``, one ``RelayoutCharge`` node per copy). Handcrafted buffers
+drive the pieces directly - no graph, no compile:
 
 - the price term is solver-agnostic: evaluated by ``lambdify`` it charges the
   source's chosen division exactly when the copy is resident;
@@ -37,12 +37,16 @@ carry one 4-way division; ``cd_parent_matches`` is EMPTY on the edge, so
 residency for P is possible only through the relayout copy.
 """
 
+from dataclasses import replace
+
 import pytest
 import sympy
 
 pytest.importorskip("ortools")
 
+from torch_spyre._inductor import config
 from torch_spyre._inductor.pass_utils import PerCoreView
+from torch_spyre._inductor.scratchpad import ilp_solver_ortools
 from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
 from torch_spyre._inductor.scratchpad.ilp_solver_ortools import CpSatLayoutSolver
 from torch_spyre._inductor.scratchpad.lx_relayout import (
@@ -60,6 +64,60 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
 _SPILL_NS = 20000.0  # what spilling P charges in the crafted objective
 _CORE = sympy.Symbol("core_id")
 _PER_CORE = 16  # P is 64 bytes sliced 4 ways
+
+
+@pytest.mark.parametrize(
+    "cap,costs,expected",
+    [(1, {0: 10000, 1: 1000}, [1]), (1, None, [0]), (0, {0: 10000, 1: 1000}, [0, 1])],
+)
+def test_relayout_shortlist_prices_the_consumer(monkeypatch, cap, costs, expected):
+    """Saving 500 ns on a copy must not hide a 9000 ns faster consumer."""
+    monkeypatch.setattr(config, "lx_solver_relayout_groups_per_edge", cap)
+    candidates = [
+        _candidate("C", 0, 500, group=0, j=0),
+        _candidate("C", 0, 1000, group=1, j=1),
+    ]
+    divisions = [CoreDivision(splits={sympy.Symbol("d0"): 4})] * 2
+    kept = CoOptimizingAllocator._cap_relayout_groups(
+        "P", "C", candidates, divisions, costs
+    )
+    assert [c.group for c in kept] == expected
+
+
+@pytest.mark.parametrize(
+    "cap,pinned,expected",
+    [
+        (2, (), [0, 2]),
+        (2, (1,), [1, 2]),
+        (1, (1,), [1]),
+        (1, (0, 1), [0, 1]),
+        (1, (2,), [2]),
+        (0, (1,), [0, 1, 2]),
+    ],
+)
+def test_relayout_full_replica_preserves_sibling_pins(
+    monkeypatch, cap, pinned, expected
+):
+    monkeypatch.setattr(config, "lx_solver_relayout_groups_per_edge", cap)
+    candidates = [
+        _candidate("C", 0, 100, group=0, j=0),
+        _candidate("C", 0, 200, group=1, j=1),
+        replace(
+            _candidate("C", 0, 1000, group=2, j=2),
+            destination_view=PerCoreView((), (), num_cores=4),
+            destination_footprint_bytes=64,
+        ),
+    ]
+    divisions = [CoreDivision(splits={sympy.Symbol("d0"): 4})] * 3
+    kept = CoOptimizingAllocator._cap_relayout_groups(
+        "P",
+        "C",
+        candidates,
+        divisions,
+        pinned_consumer_divisions=frozenset(pinned),
+    )
+    assert [c.group for c in kept] == expected
+    assert all(any(c is original for original in candidates) for c in kept)
 
 
 def _view(slot: int, num_cores: int = 4) -> PerCoreView:
@@ -149,6 +207,206 @@ def _disjoint(a_addr, b_addr, footprint=_PER_CORE) -> bool:
     return not (a_addr < b_addr + footprint and b_addr < a_addr + footprint)
 
 
+@pytest.mark.parametrize("priced", [False, True])
+def test_relayout_solve_presolves_by_default(monkeypatch, priced):
+    from ortools.sat.python import cp_model
+
+    p = _producer([0, 1])
+    c = _consumer("C", 1, 2, [_candidate("C", 0, 5000.0)])
+    buffers = _with_copies(p, c)
+    original = cp_model.CpSolver.Solve
+    parameters = []
+
+    def solve(solver, model, *args, **kwargs):
+        parameters.append(solver.parameters.cp_model_presolve)
+        assert solver.parameters.max_time_in_seconds == config.cpsat_time_limit_seconds
+        return original(solver, model, *args, **kwargs)
+
+    monkeypatch.setattr(cp_model.CpSolver, "Solve", solve)
+    result = _solve(buffers, expr=_objective(buffers) if priced else None)
+    assert parameters and all(parameters)
+    assert (_copy(result).address is not None) == priced
+
+
+@pytest.mark.parametrize(
+    "deterministic,num_cpus,expected_workers",
+    # Two counts, so the case cannot pass by detection happening to match one.
+    [(False, 4, 4), (False, 16, 16), (True, 16, 1)],
+)
+def test_relayout_solve_uses_available_parallel_search_workers(
+    monkeypatch, deterministic, num_cpus, expected_workers
+):
+    """Only deterministic mode restricts CP-SAT's parallel search portfolio."""
+    from ortools.sat.python import cp_model
+
+    p = _producer([0, 1])
+    c = _consumer("C", 1, 2, [_candidate("C", 0, 5000.0)])
+    buffers = _with_copies(p, c)
+    original = cp_model.CpSolver.Solve
+    workers = []
+
+    monkeypatch.setattr(config, "num_cpus", num_cpus)
+    monkeypatch.setattr(
+        ilp_solver_ortools.torch,
+        "are_deterministic_algorithms_enabled",
+        lambda: deterministic,
+    )
+
+    def solve(solver, model, *args, **kwargs):
+        workers.append(solver.parameters.num_search_workers)
+        assert solver.parameters.share_level_zero_bounds
+        return original(solver, model, *args, **kwargs)
+
+    monkeypatch.setattr(cp_model.CpSolver, "Solve", solve)
+    _solve(buffers, expr=_objective(buffers))
+    assert workers == [expected_workers]
+
+
+def test_cpu_count_setting_overrides_detection(monkeypatch):
+    """A set ``num_cpus`` is returned as is, before any detection runs."""
+    monkeypatch.setattr(config, "num_cpus", 3)
+    assert config.get_cpu_count() == 3
+
+
+def test_cpu_count_detects_when_the_setting_is_unset(monkeypatch):
+    """None means "detect"; a set 0 is not a CPU count either, so it detects the
+    same count, and a patched count lasts only as long as its patch."""
+    monkeypatch.setattr(config, "num_cpus", None)
+    detected = config.get_cpu_count()
+    assert detected >= 1
+    monkeypatch.setattr(config, "num_cpus", 0)
+    assert config.get_cpu_count() == detected
+    monkeypatch.setattr(config, "num_cpus", None)
+    with config.patch(num_cpus=detected + 1):
+        assert config.get_cpu_count() == detected + 1
+    assert config.num_cpus is None
+    assert config.get_cpu_count() == detected
+
+
+def _inductor_cache_key_config():
+    return config.save_config_portable(
+        ignore_private_configs=False, readonly_values=True
+    )
+
+
+# Settings that describe the machine, or where logs and kernels go, not the
+# graph. Each maps to a function giving a value that differs from the current
+# one, so the test also changes something when the environment sets it.
+_KEPT_OUT_OF_THE_CACHE_KEY = {
+    "num_cpus": lambda value: (value or 1) + 2,
+    "backend_compile_timeout_seconds": lambda value: value + 1,
+    "timing": lambda value: not value,
+    "timing_out": lambda value: value + ".other",
+    "dump_cost_expr_file": lambda value: value + ".other",
+    "spyre_kernel_cache": lambda value: not value,
+}
+
+
+@pytest.mark.parametrize("name", sorted(_KEPT_OUT_OF_THE_CACHE_KEY))
+def test_setting_stays_out_of_the_inductor_cache_key(name):
+    """These settings do not change the compiled code: setting one must not
+    change the FX graph cache key, which ``save_config_portable`` of this config
+    module feeds (it is the backend's ``device_custom_config``). A setting that
+    does shape the compile still changes the key, so the config is still in it."""
+    base = _inductor_cache_key_config()
+    assert name not in base
+    new_value = _KEPT_OUT_OF_THE_CACHE_KEY[name](getattr(config, name))
+    with config.patch({name: new_value}):
+        assert _inductor_cache_key_config() == base
+    with config.patch(cpsat_time_limit_seconds=config.cpsat_time_limit_seconds + 1):
+        assert _inductor_cache_key_config() != base
+
+
+def test_each_cache_key_ignore_prefix_matches_only_known_settings():
+    """The ignore list matches by prefix, so a new setting whose name starts with
+    one of them would leave the cache key without notice. Pin what each prefix
+    matches today: such a setting fails here first."""
+    names = config.get_config_copy()
+    matched = {
+        prefix: sorted(name for name in names if name.startswith(prefix))
+        for prefix in config._cache_config_ignore_prefix
+    }
+    assert matched == {
+        "num_cpus": ["num_cpus"],
+        "backend_compile_timeout_seconds": ["backend_compile_timeout_seconds"],
+        "timing": ["timing", "timing_out"],
+        "dump_cost_expr_file": ["dump_cost_expr_file"],
+        "spyre_kernel_cache": ["spyre_kernel_cache"],
+    }
+
+
+def test_cpu_count_is_read_per_call(monkeypatch):
+    """No cached count: a patched ``num_cpus`` takes effect on the next call."""
+    monkeypatch.setattr(config, "num_cpus", 5)
+    assert config.get_cpu_count() == 5
+    monkeypatch.setattr(config, "num_cpus", 7)
+    assert config.get_cpu_count() == 7
+
+
+@pytest.mark.parametrize(
+    "cpu_max,expected",
+    [
+        ("400000 100000\n", 4),  # a container quota below the host count
+        ("50000 100000\n", 1),  # a fractional quota still gets one worker
+    ],
+)
+def test_cpu_count_detects_the_cgroup_quota(monkeypatch, cpu_max, expected):
+    """Without a setting, the cgroup v2 quota wins over the host's CPU count."""
+    import builtins
+    import io
+
+    real_open = builtins.open
+
+    def fake_open(path, *args, **kwargs):
+        if path == "/sys/fs/cgroup/cpu.max":
+            return io.StringIO(cpu_max)
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(config, "num_cpus", None)
+    monkeypatch.setattr(builtins, "open", fake_open)
+    monkeypatch.setattr(config.os, "cpu_count", lambda: 32)
+    assert config.get_cpu_count() == expected
+
+
+def test_cpu_count_without_a_quota_is_at_least_one(monkeypatch):
+    """An unlimited cgroup (``max``) falls through to the host count, never 0."""
+    import builtins
+    import io
+
+    real_open = builtins.open
+
+    def fake_open(path, *args, **kwargs):
+        if path == "/sys/fs/cgroup/cpu.max":
+            return io.StringIO("max 100000\n")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(config, "num_cpus", None)
+    monkeypatch.setattr(builtins, "open", fake_open)
+    assert config.get_cpu_count() >= 1
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (None, None),
+        ("", None),
+        ("8", 8),
+        (" 8 ", 8),
+        ("0", None),
+        ("-2", None),
+        ("abc", None),
+    ],
+)
+def test_num_cpus_env_accepts_only_positive_integers(monkeypatch, value, expected):
+    """SPYRE_NUM_CPUS backs ``num_cpus``; anything but a positive integer is None,
+    "detect", as before the setting moved into the config."""
+    if value is None:
+        monkeypatch.delenv("SPYRE_NUM_CPUS", raising=False)
+    else:
+        monkeypatch.setenv("SPYRE_NUM_CPUS", value)
+    assert config._positive_int_env("SPYRE_NUM_CPUS") == expected
+
+
 # ---------------------------------------------------------------------------
 # The copy buffer and its generic price term
 # ---------------------------------------------------------------------------
@@ -211,7 +469,7 @@ def test_a_broadcast_copy_lives_on_the_destination_cores():
     plan = group.plan(source_address=0)
     assert plan.num_cores == 4, "the plan's core count is the source's (#3440)"
     assert plan.destination_view.num_cores == 8
-    with pytest.raises(ValueError, match="not a multiple"):
+    with pytest.raises(ValueError, match="destination on 6 cores is incompatible.*4"):
         _candidate("C", 0, 5000.0, destination_cores=6)
     with pytest.raises(ValueError, match="no physical core count"):
         RelayoutCandidate("P", "C", 0, 0, 0, _view(0), _view(1, None), 1.0, 16, 16)
@@ -482,7 +740,7 @@ def test_copy_spans_a_consumer_outside_the_group():
 def test_charge_follows_the_chosen_source_division():
     """P offers two divisions whose shuffles into the same destination view
     price differently (5000 vs 3000 ns). The solver picks the cheaper source
-    division, and the KroneckerDelta term charges that price: with the
+    division, and the RelayoutCharge term charges that price: with the
     spill at 4000 only the cheaper division makes the relayout worth it."""
     bufs = _with_copies(
         _producer([0, 3], divisions=2),

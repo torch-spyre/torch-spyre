@@ -27,10 +27,16 @@ since building real ones needs a compile.
 import unittest
 from unittest import mock
 import torch
-from torch._inductor.ir import ComputedBuffer
+from torch._inductor.ir import ComputedBuffer, NopKernel
+from torch._inductor.scheduler import NopKernelSchedulerNode, SchedulerNode
 from torch_spyre._inductor import config
 from torch_spyre._inductor.constants import DEVICE_NAME
-from torch_spyre._inductor.fusion import estimate_bundles, group_contiguous_fusable
+from torch_spyre._inductor.fusion import (
+    _is_fusable_node,
+    _is_hoistable_node,
+    estimate_bundles,
+    group_contiguous_fusable,
+)
 
 
 def _is_even(x: int) -> bool:
@@ -95,16 +101,19 @@ class TestGroupContiguousFusable(unittest.TestCase):
         self.assertEqual([item for group in groups for item in group], items)
 
 
-def _buffer(tag: str, device: str) -> ComputedBuffer:
+def _buffer(tag: str, device: str, zero_elements: bool = False) -> ComputedBuffer:
     """A bare ``ComputedBuffer`` carrying only what the grouping consults.
 
-    The grouping reads nothing but the type and the device, so the buffer needs no
-    layout or loop body -- just to satisfy the ``isinstance`` check and answer
-    ``get_device()``. ``tag`` identifies it in assertions.
+    The grouping reads nothing but the type, the device and ``is_no_op()``, so the
+    buffer needs no layout or loop body -- just to satisfy the ``isinstance``
+    check and answer those two calls. ``zero_elements`` stands in for a buffer
+    with no elements, which the scheduler turns into a
+    ``NopKernelSchedulerNode``. ``tag`` identifies it in assertions.
     """
     op = ComputedBuffer.__new__(ComputedBuffer)
     op.tag = tag
     op.get_device = lambda: torch.device(device)
+    op.is_no_op = lambda: zero_elements
     return op
 
 
@@ -122,6 +131,16 @@ class _Extern:
 
     def __init__(self, tag: str):
         self.tag = tag
+
+    def is_no_op(self) -> bool:
+        return False
+
+
+def _nop_kernel(tag: str) -> NopKernel:
+    """A bare ``NopKernel`` (e.g. the ``ConcatKernel`` behind ``cat``)."""
+    op = NopKernel.__new__(NopKernel)
+    op.tag = tag
+    return op
 
 
 def _tags(bundles) -> list[list[str]]:
@@ -148,12 +167,99 @@ class TestEstimateBundles(unittest.TestCase):
     def test_no_operations(self):
         self.assertEqual(estimate_bundles([]), [])
 
+    def test_nop_kernel_is_hoisted_ahead_of_the_run(self):
+        # ``spyre_fuse_nodes`` hoists the NopKernelSchedulerNode this becomes,
+        # so it must not split the estimate into [a] and [b].
+        ops = [_spyre("a"), _nop_kernel("cat"), _spyre("b")]
+        self.assertEqual(_tags(estimate_bundles(ops)), [["cat"], ["a", "b"]])
+
+    def test_zero_element_buffer_is_hoisted_not_fused(self):
+        # A Spyre ComputedBuffer with no elements is a nop, not a run member.
+        ops = [_spyre("a"), _buffer("pad", DEVICE_NAME, True), _spyre("b")]
+        self.assertEqual(_tags(estimate_bundles(ops)), [["pad"], ["a", "b"]])
+
+    def test_unvetted_nop_is_a_boundary(self):
+        ops = [_spyre("a"), _UnvettedNop("new"), _spyre("b")]
+        self.assertEqual(_tags(estimate_bundles(ops)), [["a"], ["new"], ["b"]])
+
     def test_fusion_off_gives_one_bundle_per_op(self):
         # The real pass leaves every node alone when bundling is off, so the
         # estimate must not claim a fusion that will not happen.
         ops = [_spyre("a"), _spyre("b"), _spyre("c")]
         with mock.patch.object(config, "bundle_symbolic_args", False):
             self.assertEqual(_tags(estimate_bundles(ops)), [["a"], ["b"], ["c"]])
+
+
+def _scheduler_node(tag: str) -> SchedulerNode:
+    """A bare Spyre ``SchedulerNode``: only the type and device are consulted."""
+    node = SchedulerNode.__new__(SchedulerNode)
+    node.tag = tag
+    node.get_device = lambda: torch.device(DEVICE_NAME)
+    return node
+
+
+class _UnvettedNop:
+    """Stands in for an IR kind whose ``is_no_op()`` is true but which is neither
+    a ``ComputedBuffer`` nor a ``NopKernel`` -- one a future PyTorch might add."""
+
+    def __init__(self, tag: str):
+        self.tag = tag
+
+    def is_no_op(self) -> bool:
+        return True
+
+
+def _nop_node(tag: str, op=None) -> NopKernelSchedulerNode:
+    """A bare ``NopKernelSchedulerNode`` wrapping ``op``, by default an empty
+    Spyre buffer (what ``lowering.empty`` produces): only the type and the
+    wrapped operation are consulted."""
+    node = NopKernelSchedulerNode.__new__(NopKernelSchedulerNode)
+    node.tag = tag
+    node.node = op if op is not None else _buffer(tag, DEVICE_NAME, True)
+    return node
+
+
+class TestHoistNopNodes(unittest.TestCase):
+    """The scheduler-node predicates that ``spyre_fuse_nodes`` groups by."""
+
+    def _group(self, nodes):
+        return _tags(
+            group_contiguous_fusable(nodes, _is_fusable_node, _is_hoistable_node)
+        )
+
+    def test_nop_is_moved_ahead_of_the_run(self):
+        # Without hoisting, the nop would split the run into [a, b] and [c, d].
+        nodes = [
+            _scheduler_node("a"),
+            _scheduler_node("b"),
+            _nop_node("nop"),
+            _scheduler_node("c"),
+            _scheduler_node("d"),
+        ]
+        self.assertEqual(self._group(nodes), [["nop"], ["a", "b", "c", "d"]])
+
+    def test_nop_at_end_of_run_is_hoisted(self):
+        # Intentional: a nop only allocates, so emitting it ahead of the run it
+        # follows is safe even with no fusable node after it.
+        nodes = [_scheduler_node("a"), _nop_node("nop")]
+        self.assertEqual(self._group(nodes), [["nop"], ["a"]])
+
+    def test_nop_with_no_pending_run_stays_in_place(self):
+        nodes = [_nop_node("nop"), _scheduler_node("a"), _scheduler_node("b")]
+        self.assertEqual(self._group(nodes), [["nop"], ["a", "b"]])
+
+    def test_nop_kernel_is_hoisted(self):
+        nodes = [_scheduler_node("a"), _nop_node("cat", _nop_kernel("cat"))]
+        self.assertEqual(self._group(nodes), [["cat"], ["a"]])
+
+    def test_unvetted_nop_is_a_boundary(self):
+        # Only nops known to codegen as a bare allocation are reordered.
+        nodes = [
+            _scheduler_node("a"),
+            _nop_node("new", _UnvettedNop("new")),
+            _scheduler_node("b"),
+        ]
+        self.assertEqual(self._group(nodes), [["a"], ["new"], ["b"]])
 
 
 if __name__ == "__main__":

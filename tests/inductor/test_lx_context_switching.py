@@ -131,10 +131,13 @@ class TestLxContextSwitching(unittest.TestCase):
         # test_scratchpad_use.py's BaseTestScratchpadUsage.setUp.
         self._caches_disabled = t_inductor_config.patch("force_disable_caches", True)
         self._caches_disabled.__enter__()
+        self._coopt_off = ts_inductor_config.patch({"co_optimizing_lx_planning": False})
+        self._coopt_off.__enter__()
 
     def tearDown(self):
         global _launch
         _launch = False
+        self._coopt_off.__exit__(None, None, None)
         self._caches_disabled.__exit__(None, None, None)
         torch.compiler.reset()
 

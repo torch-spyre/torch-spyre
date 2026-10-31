@@ -30,6 +30,7 @@ import json
 import math
 import os
 import unittest
+from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import patch
 
@@ -73,6 +74,48 @@ class CandidateDivisionTest(TestCase):
             return_value={m: 1024, n: 1024, kk: 2048},
         ):
             self.assertEqual(_work_slices(op, division), expected)
+
+    def test_symbolic_and_concrete_prices_receive_the_whole_legal_menu(self):
+        from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
+
+        m, n, k, split = sympy.symbols("m n k split", integer=True, positive=True)
+        op = SimpleNamespace(get_name=lambda: "out")
+        divisions = [CoreDivision(splits={m: 16}), CoreDivision(splits={m: 8, n: 2})]
+        expected = [{m: 16, n: 1, k: 1}, {m: 8, n: 2, k: 1}]
+        buffers = {
+            "out": SimpleNamespace(sym_core_divs={m: split}, core_divisions=divisions)
+        }
+        with (
+            patch(
+                "torch_spyre._inductor.scratchpad.sa_cooptimizer.iteration_space_from_op",
+                return_value={m: 32, n: 128, k: 64},
+            ),
+            patch("torch_spyre._inductor.cost_features.extract_op_features") as extract,
+            patch("torch_spyre._inductor.cost_model.predict_ops", return_value=1.0),
+            patch(
+                "torch_spyre._inductor.scratchpad.allocator.op_read_writes",
+                return_value=SimpleNamespace(reads=[SimpleNamespace(name="weight")]),
+            ),
+        ):
+            CoOptimizingAllocator._extract_op_features(
+                None, None, "out", buffers, {}, op=op
+            )
+            self.assertEqual(
+                extract.call_args.kwargs["candidate_work_slices"], expected
+            )
+            self.assertEqual(extract.call_args.args[1], {m: split, n: 1, k: 1})
+            extract.reset_mock()
+
+            # Shortlisting prices only candidate 0, but applicability must still
+            # see candidate 1. Otherwise symbolic and concrete prices disagree.
+            CoOptimizingAllocator._relayout_consumer_costs(
+                op, divisions, "weight", [SimpleNamespace(consumer_division=0)]
+            )
+            extract.assert_called_once()
+            self.assertEqual(
+                extract.call_args.kwargs["candidate_work_slices"], expected
+            )
+            self.assertEqual(extract.call_args.args[1], expected[0])
 
 
 class FixturePresentTest(TestCase):
@@ -177,8 +220,8 @@ class SymbolicTiledFeatureTest(TestCase):
     """
 
     #: One residency symbol PER BUFFER NAME, matching ``LifetimeBoundBuffer.sym_is_lx``
-    #: (plan_solver.py) and how ``dump_cost_model.extract_op_features`` looks each arg's
-    #: own buffer name up in the co-optimizer's ``is_lx`` map (dump_cost_model.py:700) --
+    #: (plan_solver.py) and how ``cost_features.extract_op_features`` looks each arg's
+    #: own buffer name up in the co-optimizer's buffer map --
     #: two different buffers get two DIFFERENT symbols, not one shared symbol.
     @staticmethod
     def _sym_is_lx(name: str) -> sympy.Symbol:
@@ -254,7 +297,7 @@ class SymbolicTiledFeatureTest(TestCase):
         """``ArgTraffic.mem`` REJECTS a symbolic ``is_lx``, and
         ``_loop_reread_bytes`` is reached unconditionally for an output-tiled
         matmul, so it used to lose the whole objective to a ValueError there --
-        but only once ``_tiled_rows`` already lets execution get that far. On
+        but only once a symbolic ``rpc`` no longer raises earlier. On
         the TRUE parent commit, the underfill-eff loop's
         ``o.tile_rows_per_core > 0`` comparison (``predict_ops``, a few lines
         before ``_loop_reread_bytes`` is called) raises the SAME TypeError as
@@ -338,11 +381,11 @@ class SymbolicTiledFeatureTest(TestCase):
         )
 
     def test_a_working_set_with_symbolic_cols_does_not_break_the_spill_gate(self):
-        """``_lx_spill_working_set`` multiplies ``rpc * _op_cols(o)``; ``_tiled_rows``
-        neutralizes a symbolic ``rpc`` but ``_op_cols`` -- an arg's own LOGICAL row
-        width, e.g. a dynamic-shape symbol, NOT a co-optimizer variable -- was not
-        similarly guarded. ``_lx_spill_bw_derate`` then compares the resulting
-        symbolic working set against its byte cap (``if ws <= _cap``), the same
+        """``_lx_spill_working_set`` multiplies ``rpc * _op_cols(o)``; a
+        symbolic ``rpc`` is a solver variable it keeps, but ``_op_cols`` -- an
+        arg's own LOGICAL row width, e.g. a dynamic-shape symbol, NOT a
+        co-optimizer variable -- was not guarded. ``_lx_spill_bw_derate`` then
+        compares the resulting symbolic working set against its byte cap (``if ws <= _cap``), the same
         "cannot determine truth value of Relational" failure as #4233 from an
         unrelated source. Built from scratch (independent of ``_symbolize`` and of
         the fixture's own residency) so ``rpc`` stays concrete and only ``cols`` is
@@ -357,7 +400,7 @@ class SymbolicTiledFeatureTest(TestCase):
             cores=1,
             dtype_bytes=2,
             tiles_output_dim=True,
-            tile_rows_per_core=16.0,  # concrete: not neutralized by `_tiled_rows`
+            tile_rows_per_core=16.0,  # concrete: only `cols` is symbolic
             args=[
                 ArgTraffic(
                     name="out0", role="output", is_lx=False, elems=1024, logical=[]
@@ -417,7 +460,7 @@ class SymbolicMatmulSplitCostTest(TestCase):
     """A matmul whose CORE SPLITS -- not just ``is_lx`` -- are undecided symbols.
 
     ``CoOptimizingAllocator._extract_op_features`` builds the work slices from
-    ``plan_solver.sym_core_divs``, so ``dump_cost_model._matmul_features`` sees one
+    ``plan_solver.sym_core_divs``, so ``cost_features._matmul_features`` sees one
     ``sympy.Symbol`` per split and a matmul reaches ``predict_ops`` with symbolic
     ``m``/``n``/``k``, symbolic ``cores`` and a symbolic ``matmul_rows_per_core``.
     That is a DIFFERENT shape from ``SymbolicTiledFeatureTest``, which symbolises
@@ -436,9 +479,9 @@ class SymbolicMatmulSplitCostTest(TestCase):
     #: ``Max(1, split)`` to ``split`` (so ``_SympyExprToCpSat._inv_sym`` still sees a
     #: BARE symbol under the reciprocal), and it lets ``expand_log`` split
     #: ``log(a/split)``.
-    M_SPLIT = sympy.Symbol("output_split_buf5_i0", integer=True, positive=True)
-    N_SPLIT = sympy.Symbol("output_split_buf5_i1", integer=True, positive=True)
-    K_SPLIT = sympy.Symbol("reduction_split_buf5_r0", integer=True, positive=True)
+    M_SPLIT = sympy.Symbol("split_buf5_i0", integer=True, positive=True)
+    N_SPLIT = sympy.Symbol("split_buf5_i1", integer=True, positive=True)
+    K_SPLIT = sympy.Symbol("split_buf5_r0", integer=True, positive=True)
     IS_LX = sympy.Symbol("is_lx_buf5", integer=True, nonnegative=True)
 
     #: The candidate splits a ``CoreDivisionBuffer`` would offer, which the CP-SAT
@@ -509,19 +552,19 @@ class SymbolicMatmulSplitCostTest(TestCase):
         )
 
     def test_the_extractor_max_is_symbolic_aware(self):
-        """``dump_cost_model`` SHADOWS the builtin ``max`` with the sympy-aware one.
+        """``cost_features`` SHADOWS the builtin ``max`` with the sympy-aware one.
 
         ``_matmul_features`` reduces the splits with ``max(1, readable.get(...))``.
         With ``builtins.max`` that raises ``cannot determine truth value of
         Relational``, its best-effort ``except Exception`` zeroes
         ``matmul_a_bytes``/``matmul_b_bytes``, and every matmul bundle then loses the
         graph's whole cost objective (see the counterfactual below). The import at
-        the top of ``dump_cost_model`` is the only thing preventing that, so pin it.
+        the top of ``cost_features`` is the only thing preventing that, so pin it.
         """
-        from torch_spyre._inductor import dump_cost_model
+        from torch_spyre._inductor import cost_features
 
-        self.assertEqual(dump_cost_model.max(1, self.M_SPLIT), self.M_SPLIT)
-        self.assertEqual(dump_cost_model.max(1, 3), 3)
+        self.assertEqual(cost_features.max(1, self.M_SPLIT), self.M_SPLIT)
+        self.assertEqual(cost_features.max(1, 3), 3)
 
     def test_symbolic_splits_still_resolve_the_matmul_axes(self):
         """``M``/``N``/``K``/``B`` come back CONCRETE; only the splits stay symbolic.
@@ -538,6 +581,19 @@ class SymbolicMatmulSplitCostTest(TestCase):
         self.assertEqual({m, n, k}, {self.M_SPLIT, self.N_SPLIT, self.K_SPLIT})
         self.assertFalse(getattr(b, "free_symbols", set()))
 
+    def test_single_batch_and_broadcast_inputs_use_shared_weight_cost(self):
+        from torch_spyre._inductor.cost_model import _matmul_axes_for_split_cost
+
+        mm = self._matmul()
+        self.assertTrue(_matmul_axes_for_split_cost(mm)[-1])
+        bmm = dataclasses.replace(mm, out_elems=4 * mm.out_elems)
+        self.assertFalse(_matmul_axes_for_split_cost(bmm)[-1])
+        inputs = [dataclasses.replace(a) for a in bmm.args]
+        inputs[-1].broadcast = True
+        self.assertTrue(
+            _matmul_axes_for_split_cost(dataclasses.replace(bmm, args=inputs))[-1]
+        )
+
     def test_a_symbolic_split_matmul_builds_a_cost_expression(self):
         expr = sympy.sympify(predict_ops([self._matmul()], self._params()))
         self.assertEqual(
@@ -551,9 +607,10 @@ class SymbolicMatmulSplitCostTest(TestCase):
     def test_the_symbolic_split_cost_expression_linearizes(self):
         """Run the REAL CP-SAT converter, not a structural proxy.
 
-        ``sym_map`` mirrors ``CpSatLayoutSolver._minimize_cost_expr``: the split
-        variable, plus the ``_buffer_``/``_raw_`` entries ``_print_Symbol`` needs to
-        tabulate the ``log2_``/``inv_`` aux variables over the candidate divisions.
+        ``sym_map``/``buffer_map`` mirror ``CpSatLayoutSolver._minimize_cost_expr``:
+        the split variable in ``sym_map``, plus a ``buffer_map`` entry
+        ``_print_Symbol`` needs to tabulate the ``log2_``/``inv_`` aux variables over
+        the candidate divisions.
         """
         import types
 
@@ -561,26 +618,27 @@ class SymbolicMatmulSplitCostTest(TestCase):
             from ortools.sat.python import cp_model
         except ImportError:
             self.skipTest("the cpsat converter needs ortools")
-        from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
+        from torch_spyre._inductor.scratchpad.cpsat_expr_printer import (
             _SympyExprToCpSat,
         )
 
         expr = sympy.sympify(predict_ops([self._matmul()], self._params()))
         model = cp_model.CpModel()
         sym_map: dict = {}
+        buffer_map: dict = {}
         for sym in (self.M_SPLIT, self.N_SPLIT, self.K_SPLIT):
             sym_map[sym.name] = model.new_int_var_from_domain(
                 cp_model.Domain.FromValues(list(self.RAW_SPLITS)), sym.name
             )
-            sym_map[f"_buffer_{sym.name}"] = types.SimpleNamespace(
+            buffer = types.SimpleNamespace(
                 division=model.new_int_var(
                     0, len(self.RAW_SPLITS) - 1, f"div_{sym.name}"
                 )
             )
-            sym_map[f"_raw_{sym.name}"] = list(self.RAW_SPLITS)
+            buffer_map[sym.name] = (buffer, list(self.RAW_SPLITS))
         sym_map[self.IS_LX.name] = model.new_bool_var(self.IS_LX.name)
 
-        cp_cost = _SympyExprToCpSat(model, sym_map).convert(expr)
+        cp_cost = _SympyExprToCpSat(model, sym_map, buffer_map).convert(expr)
         # A constant would mean the objective collapsed rather than linearized.
         self.assertNotIsInstance(cp_cost, (int, float))
         model.minimize(cp_cost)
@@ -607,6 +665,89 @@ class SymbolicMatmulSplitCostTest(TestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "unresolvable axes"):
             predict_ops([lost], self._params())
+
+
+class SymbolicTileCountCostTest(TestCase):
+    """A candidate coarse tiling whose tile COUNT is an undecided symbol.
+
+    ``extract_op_features(sym_tiling=...)`` hands ``predict_ops`` a
+    ``tiles_output_dim`` that is a CONDITION (``tile > 1``) rather than a bool,
+    since the solver may pick the candidate that leaves the axis untiled. Every
+    branch on the flag goes through ``cost_model._select``; binding the symbol
+    must then give exactly the cost of the matching concrete op -- untiled at
+    1, output-tiled at 4.
+    """
+
+    TILE = sympy.Symbol("tile_buf0_o0", integer=True, positive=True)
+    ROWS = 1024.0
+
+    def _at(self, op: OpFeatures, count) -> OpFeatures:
+        if isinstance(count, sympy.Basic):
+            tiled = sympy.Gt(count, 1)
+            rpc = sympy.Piecewise((self.ROWS / count, tiled), (0.0, True))
+        else:
+            tiled = count > 1
+            rpc = self.ROWS / count if tiled else 0.0
+        return dataclasses.replace(
+            op, tiles_output_dim=tiled, loop_trip=count, tile_rows_per_core=rpc
+        )
+
+    def test_binding_the_tile_count_matches_the_concrete_cost(self):
+        checked = 0
+        for gname, bname, b in _entries():
+            for raw in b["features"][:2]:
+                if raw is None:
+                    continue
+                op = op_from_dict(raw)
+                if op.tiles_output_dim or op.loop_trip > 1:
+                    continue  # already committed-tiled: no candidate applies
+                expr = sympy.sympify(predict_ops([self._at(op, self.TILE)]))
+                for count in (1, 4):
+                    want = float(predict_ops([self._at(op, count)]))
+                    got = float(expr.subs(self.TILE, count))
+                    self.assertAlmostEqual(
+                        got,
+                        want,
+                        delta=1e-6 * max(1.0, abs(want)),
+                        msg=f"{gname}/{bname} at tile count {count}",
+                    )
+                checked += 1
+        self.assertGreater(checked, 10)
+
+    def test_reduction_rows_ranks_symbolic_per_tile_inputs(self):
+        # A candidate tiling makes an undecided input's elems per-tile when
+        # LX-resident; the governing-rows argmax used to compare those sympy
+        # expressions and raise "cannot determine truth value of Relational".
+        from torch_spyre._inductor.cost_model import _reduction_rows
+
+        is_lx = sympy.Symbol("is_lx_buf1", integer=True, nonnegative=True)
+
+        def arg(name, dims, logical, is_lx=False):
+            elems = math.prod(dims)
+            if isinstance(is_lx, sympy.Basic):
+                elems = elems * (1 - is_lx) + elems / self.TILE * is_lx
+            return ArgTraffic(
+                name=name,
+                role="input",
+                is_lx=is_lx,
+                elems=elems,
+                dims=dims,
+                logical=logical,
+            )
+
+        op = OpFeatures(
+            name="sum",
+            is_reduction=True,
+            out_elems=64,
+            cores=1,
+            dtype_bytes=2,
+            args=[
+                arg("buf0", [16, 64], [16, 64], is_lx),
+                arg("buf1", [256, 64], [256, 64], is_lx),
+                arg("buf2", [1, 64], [1, 64]),
+            ],
+        )
+        self.assertEqual(_reduction_rows(op), 256)
 
 
 if __name__ == "__main__":

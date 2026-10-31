@@ -101,56 +101,29 @@ jobs:
       - image_ingest
     timeout-minutes: 10
 
-    env:
-      CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST_DEV }}
-      CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT_DEV }}
-      CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER_DEV }}
-      CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS_DEV }}
-      CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB_DEV }}
-
     steps:
-      - name: Checkout ingest script
+      # Checkout so ./.github/actions/... resolves; the action itself locates or
+      # sparse-checks-out the script and library it actually needs.
+      - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           sparse-checkout: |
-            .github/scripts/ingest_pytorch_dispatch.py
-
-      - name: Write dispatch payload to file
-        env:
-          PAYLOAD_JSON: ${{ toJSON(github.event.client_payload) }}
-        run: |
-          printf '%s' "$PAYLOAD_JSON" > payload.json
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
-        with:
-          # latest-known, not "latest": it resolves to the newest uv whose checksum is
-          # bundled INTO this setup-uv pin, resolved locally with no release lookup. A
-          # just-published release is not yet mirrored on releases.astral.sh, so "latest"
-          # 404s there and falls back to GitHub Releases, which rate-limits (429) once the
-          # fleet requests it concurrently. Bumping setup-uv moves this version forward.
-          version: latest-known
-
-      - name: Setup venv
-        run: |
-          uv venv
-          source .venv/bin/activate
-
-      - name: Install Python dependencies
-        run: |
-          source .venv/bin/activate
-          uv pip install clickhouse-connect regex
-          echo "VIRTUAL_ENV $VIRTUAL_ENV"
+            .github/actions
+          sparse-checkout-cone-mode: false
 
       - name: Classify dispatch and ingest into ClickHouse
         continue-on-error: true
-        run: |
-          source .venv/bin/activate
-          python3 .github/scripts/ingest_pytorch_dispatch.py \
-            --payload-file payload.json \
-            --event-type "${{ github.event.action }}" \
-            --run-id   "${{ github.run_id }}" \
-            --run-link "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        uses: ./.github/actions/ingest-pytorch-dispatch-to-clickhouse
+        with:
+          payload-json: ${{ toJSON(github.event.client_payload) }}
+          event-type: ${{ github.event.action }}
+          run-id: ${{ github.run_id }}
+          run-link: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          clickhouse-host: ${{ secrets.CLICKHOUSE_HOST_DEV }}
+          clickhouse-port: ${{ secrets.CLICKHOUSE_PORT_DEV }}
+          clickhouse-user: ${{ secrets.CLICKHOUSE_USER_DEV }}
+          clickhouse-pass: ${{ secrets.CLICKHOUSE_PASS_DEV }}
+          clickhouse-db: ${{ secrets.CLICKHOUSE_DB_DEV }}
 
       - name: Summary
         if: always()
@@ -173,13 +146,6 @@ jobs:
       pytorch_sha: ${{ steps.extract.outputs.pytorch_sha }}
       should_build: ${{ steps.extract.outputs.should_build }}
 
-    env:
-      CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST_DEV }}
-      CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT_DEV }}
-      CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER_DEV }}
-      CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS_DEV }}
-      CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB_DEV }}
-
     steps:
       - name: Checkout pyproject.toml
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -195,6 +161,8 @@ jobs:
           EVENT_TYPE: ${{ github.event.client_payload.event_type }}
           EXPLICIT_SHA: ${{ github.event.inputs.pytorch_sha }}
           EXPLICIT_BRANCH: ${{ github.event.inputs.pytorch_branch }}
+          # Authenticated api.github.com calls below: anonymous is 60 req/hr per IP, shared across the runner pool.
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
@@ -236,13 +204,13 @@ jobs:
           # source main SHA in parentheses, e.g. "... (abcdef0123...)".
           if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "Nightly trigger (${{ github.event_name }}): resolving source SHA from pytorch/pytorch@nightly"
-            NIGHTLY_SHA=$(curl -fsSL "https://api.github.com/repos/pytorch/pytorch/commits?sha=nightly&per_page=1" | jq -r '.[0].sha // empty')
+            NIGHTLY_SHA=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" "https://api.github.com/repos/pytorch/pytorch/commits?sha=nightly&per_page=1" | jq -r '.[0].sha // empty')
             if [ -z "${NIGHTLY_SHA}" ]; then
               echo "::error::Could not resolve HEAD for pytorch/pytorch/nightly"
               exit 1
             fi
 
-            COMMIT_MSG=$(curl -fsSL "https://api.github.com/repos/pytorch/pytorch/commits/${NIGHTLY_SHA}" | jq -r '.commit.message')
+            COMMIT_MSG=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" "https://api.github.com/repos/pytorch/pytorch/commits/${NIGHTLY_SHA}" | jq -r '.commit.message')
             SOURCE_SHA=$(echo "$COMMIT_MSG" | grep -oP '\(([a-f0-9]{40})\)' | tr -d '()')
             if [ -z "${SOURCE_SHA}" ]; then
               echo "::error::Could not extract source SHA from latest nightly commit"
@@ -312,44 +280,33 @@ jobs:
             exit 1
           fi
 
-      - name: Checkout ingest script
+      # Checkout so ./.github/actions/... resolves; the action itself locates or
+      # sparse-checks-out the script and library it actually needs.
+      - name: Checkout
         if: steps.extract.outputs.should_build == 'false'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           sparse-checkout: |
-            .github/scripts/ingest_pytorch_dispatch.py
-
-      - name: Write dispatch payload to file
-        if: steps.extract.outputs.should_build == 'false'
-        env:
-          PAYLOAD_JSON: ${{ toJSON(github.event.client_payload) }}
-        run: |
-          printf '%s' "$PAYLOAD_JSON" > payload.json
-
-      - name: Install uv
-        if: steps.extract.outputs.should_build == 'false'
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
-        with:
-          # latest-known, not "latest": it resolves to the newest uv whose checksum is
-          # bundled INTO this setup-uv pin, resolved locally with no release lookup. A
-          # just-published release is not yet mirrored on releases.astral.sh, so "latest"
-          # 404s there and falls back to GitHub Releases, which rate-limits (429) once the
-          # fleet requests it concurrently. Bumping setup-uv moves this version forward.
-          version: latest-known
+            .github/actions
+          sparse-checkout-cone-mode: false
 
       - name: Record gate rejection in ClickHouse
         if: steps.extract.outputs.should_build == 'false'
         continue-on-error: true
-        run: |
-          uv run --with clickhouse-connect --with regex \
-            .github/scripts/ingest_pytorch_dispatch.py \
-            --payload-file payload.json \
-            --event-type "${{ github.event.action }}" \
-            --run-id   "${{ github.run_id }}" \
-            --run-link "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            --job-name build_and_test \
-            --stage rejected \
-            --progress rejected
+        uses: ./.github/actions/ingest-pytorch-dispatch-to-clickhouse
+        with:
+          payload-json: ${{ toJSON(github.event.client_payload) }}
+          event-type: ${{ github.event.action }}
+          run-id: ${{ github.run_id }}
+          run-link: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          job-name: build_and_test
+          stage: rejected
+          progress: rejected
+          clickhouse-host: ${{ secrets.CLICKHOUSE_HOST_DEV }}
+          clickhouse-port: ${{ secrets.CLICKHOUSE_PORT_DEV }}
+          clickhouse-user: ${{ secrets.CLICKHOUSE_USER_DEV }}
+          clickhouse-pass: ${{ secrets.CLICKHOUSE_PASS_DEV }}
+          clickhouse-db: ${{ secrets.CLICKHOUSE_DB_DEV }}
 
   build_and_test:
     needs: gate_and_build

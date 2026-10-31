@@ -224,7 +224,8 @@ class Logger {
     torch_spyre::logging::Logger(                                              \
         component, torch_spyre::logging::LogLevel::level,                      \
         torch_spyre::logging::Logger::AlreadyEnabled{})                        \
-        .stream()
+            .stream()                                                          \
+        << __func__ << ": "
 
 // Component-specific macros
 #define SPYRE_RUNTIME_DEBUG() SPYRE_LOG("spyre.runtime", DEBUG)

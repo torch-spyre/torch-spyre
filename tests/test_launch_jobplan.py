@@ -20,12 +20,12 @@ import tempfile
 from typing import Tuple
 
 import pytest
-from torch.testing._internal.common_utils import TestCase
 import torch
 import torch._dynamo
-import torch_spyre
-
 from test_prepare_kernel import TestPrepareKernel as tpk
+from torch.testing._internal.common_utils import TestCase
+
+import torch_spyre
 
 
 def _run_compiled_op(op_name: str) -> None:
@@ -73,6 +73,46 @@ class TestLaunchJobPlan(TestCase):
     def test_mul_matches_cpu(self):
         _run_compiled_op("mul")
 
+    def test_program_corrections_on_repeated_launches(self):
+        """Corrections survive queued launches; VF uploads travel with compute."""
+        torch._dynamo.reset()
+        torch.manual_seed(42)
+
+        def fn(x, y):
+            return torch.softmax(x * y + x, dim=-1)
+
+        compiled = torch.compile(fn, backend="inductor")
+        inputs = [
+            (
+                torch.randn(64, 128, dtype=torch.float16),
+                torch.randn(64, 128, dtype=torch.float16),
+            )
+            for _ in range(3)
+        ]
+        device_inputs = [tuple(t.to("spyre") for t in pair) for pair in inputs]
+        compiled(*device_inputs[0])
+        torch.spyre.synchronize()
+
+        # Exclude compilation and input uploads so H2D scopes here would be
+        # standalone program-correction uploads. Keep multiple launches live
+        # to exercise ownership of each launch's correction buffers.
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU]
+        ) as prof:
+            outputs = [compiled(*pair) for pair in device_inputs]
+            torch.spyre.synchronize()
+
+        for output, pair in zip(outputs, inputs):
+            torch.testing.assert_close(output.cpu(), fn(*pair), atol=0.01, rtol=0.1)
+
+        names = {event.name for event in prof.events()}
+        self.assertIn("launch::HostCompute", names)
+        self.assertIn("launch::Compute", names)
+        if os.environ.get("FLEX_DEVICE") == "VF":
+            self.assertNotIn("launch::H2D", names)
+        elif os.environ.get("FLEX_DEVICE") == "PF":
+            self.assertIn("launch::H2D", names)
+
     def test_invalid_hcm_metadata_surfaces_on_synchronize(self):
         """Host callback failures should surface as RuntimeError on stream synchronize."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -114,6 +154,87 @@ class TestLaunchJobPlan(TestCase):
             with stream:
                 with pytest.raises(RuntimeError, match="Expect one DCI"):
                     torch_spyre._C.launch_jobplan(job_plan, [])
+
+    @staticmethod
+    def _payload_hcm(payload: bytes) -> dict:
+        """Minimal valid HCM whose host compute output is exactly `payload`.
+
+        A single SYMBOL_SUBSTITUTE dci (int8 src/dst, host-to-sen, no symbols)
+        copies senConstants[0] verbatim into the output buffer. output_shape_ is
+        in int8 elements and must be a multiple of 8. senConstants[1] is the
+        empty trailer required by processComputeOnHostCommand.
+        """
+        return {
+            "vdci": {
+                "dsName_": "payload",
+                "isMarker_": 0,
+                "data_conversion_info_group_": [
+                    {
+                        "key": [],
+                        "dci": {
+                            "dsName_": "payload",
+                            "isHostToSen_": 1,
+                            "dataformat_src_": 8,
+                            "dataformat_dst_": 8,
+                            "dcOpName_": 6,
+                            "pre_expand_dcsi_": [],
+                            "pre_input_shape_": [],
+                            "dcsi_": [],
+                            "input_shape_": [],
+                            "output_shape_": [len(payload)],
+                            "post_slice_dcsi_": [],
+                            "post_output_shape_": [],
+                            "input_dimwise_ea_": [],
+                            "output_dimwise_ea_": [],
+                            "useSpi_": 0,
+                            "usePca_": 0,
+                            "usePadVal_": 0,
+                            "inputPadVal_": 0,
+                            "useWli_": 0,
+                            "dmdi_": {"perTensorInfo": []},
+                            "ssi_": {
+                                "value_and_locs_": [],
+                                "inputSym_": [],
+                                "unSubstitutedFlitStartOffset_": 0,
+                            },
+                        },
+                    }
+                ],
+                "group_tags_": [],
+                "inputSym_": [],
+                "dciIdxSym_": [],
+                "variableDefs_": [],
+            },
+            "senConstants": [{"senconst_": payload.hex()}, {"senconst_": ""}],
+        }
+
+    def test_host_compute_produces_nonzero_payload(self):
+        """A valid zero-symbol HCM runs through flex and emits its payload.
+
+        prepare_kernel rejects a HostCompute+H2D-only plan (the validator
+        requires a following Compute, see test_prepare_host_compute_sequence)
+        and executing a Compute from a mock SpyreCode faults the device, so
+        this drives the same flex host-compute path as
+        JobPlanStepHostCompute::construct through the _host_compute_bytes seam.
+        The payload is non-zero so a no-op producer cannot pass.
+        """
+        payload = b"\xab" * 16
+        correction_size = 128
+        out = torch_spyre._C._host_compute_bytes(
+            json.dumps(self._payload_hcm(payload)), correction_size
+        )
+        self.assertEqual(len(out), correction_size)
+        self.assertEqual(out[: len(payload)], payload)
+        self.assertEqual(
+            out[len(payload) :], b"\x00" * (correction_size - len(payload))
+        )
+
+    def test_host_compute_invalid_hcm_raises(self):
+        """An HCM with no DCI is rejected by the host compute path."""
+        with self.assertRaisesRegex(RuntimeError, "Expect one DCI"):
+            torch_spyre._C._host_compute_bytes(
+                json.dumps({"vdci": {}, "senConstants": []}), 128
+            )
 
 
 def _build_d2h_jobplan(tmpdir: str, dev_ptr: int, size_bytes: int):
@@ -303,7 +424,9 @@ class TestSymbolicArg(TestCase):
 
             stream = torch.Stream("spyre")
             with stream:
-                with pytest.raises(RuntimeError, match="tensor_id=5 out of range"):
+                with pytest.raises(
+                    RuntimeError, match="symbolic_args tensor_id out of range"
+                ):
                     torch_spyre._C.launch_jobplan(job_plan, [t], symbolic_args=payload)
 
     def test_kaddress_ordering_forward_and_reversed_differ(self):
@@ -311,8 +434,8 @@ class TestSymbolicArg(TestCase):
         resolved vectors, each matching the expected per-slot address.
 
         Uses _resolve_symbolic_args, which calls
-        JobPlanStepHostCompute::resolveSymbolicArgs — the same function used
-        by the typed-payload resolution path at launch time — so the result is
+        JobPlanStepHostCompute::resolveSymbolicArgs -- the same function used
+        by the typed-payload resolution path at launch time -- so the result is
         identical to what would be passed to deeptools.
         """
         t0 = torch.zeros(64, dtype=torch.float16, device="spyre")
@@ -329,7 +452,7 @@ class TestSymbolicArg(TestCase):
             [t1], [torch_spyre._C.SymbolicArg(kind=kAddr, tensor_id=0)]
         )[0]
 
-        # Tensors must be at distinct addresses — if they coincidentally share
+        # Tensors must be at distinct addresses -- if they coincidentally share
         # one the reversed payload would produce the same vector and the
         # ordering assertion would be meaningless.
         self.assertNotEqual(
@@ -357,7 +480,7 @@ class TestSymbolicArg(TestCase):
             "Forward and reversed payloads produced identical resolved vectors",
         )
 
-        # Forward: slot 0 → t0, slot 1 → t1.
+        # Forward: slot 0 -> t0, slot 1 -> t1.
         self.assertEqual(
             resolved_fwd[0], addr_t0, "slot 0 of forward payload must be addr_t0"
         )
@@ -365,7 +488,7 @@ class TestSymbolicArg(TestCase):
             resolved_fwd[1], addr_t1, "slot 1 of forward payload must be addr_t1"
         )
 
-        # Reversed: slot 0 → t1, slot 1 → t0.
+        # Reversed: slot 0 -> t1, slot 1 -> t0.
         self.assertEqual(
             resolved_rev[0], addr_t1, "slot 0 of reversed payload must be addr_t1"
         )

@@ -18,13 +18,14 @@ import sys
 import unittest
 from unittest import mock
 
+import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
+from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 from torch._inductor.utils import run_and_get_code
-from torch_spyre._C import SpyreTensorLayout
+from torch_spyre._C import SpyreTensorLayout, get_device_dtype
 from torch_spyre._inductor import spyre_hint  # noqa: F401
 from torch_spyre._inductor import config
 
@@ -304,36 +305,16 @@ class TestBuildingBlocks(unittest.TestCase):
 
     def test_mixed_ea_staggered_broadcaster_fp32(self):
         # Case 3.2 with an fp32-physical staggered broadcaster (DL16_TO_FP32).
-        # The mixed-EA gate ALLOWS it (physically the equivalent all-STANDARD fp32
-        # broadcast), but the codegen doesn't yet emit an fp32 broadcast along
-        # the stick axis. The same crash hits a pure-STANDARD fp32
-        # [4,1]+[4,64] broadcast, so it is a separate, pre-existing codegen gap
-        # tracked in https://github.com/torch-spyre/torch-spyre/issues/4132.
-        #
-        # We assert the failure originates in *codegen*, not the mixed-EA layout
-        # gate: a plain @unittest.expectedFailure would also stay green if a future
-        # change re-tightened the gate and raised `Unsupported` before codegen,
-        # masking a regression of the path this test guards. So we require the
-        # error to be a codegen failure and NOT the gate's "mixed EA"
-        # Unsupported. Flip this to a compare_with_cpu once codegen lands.
+        # The mixed-EA gate allows it, being physically the equivalent
+        # all-STANDARD fp32 broadcast, and the backend now emits an fp32
+        # broadcast along the stick axis.
         x = torch.randn(4, 1, dtype=torch.float16)  # -> .to(f32): staggered bcast
         w = torch.randn(4, 64, dtype=torch.float32)  # STANDARD full
 
         def fn(x, w):
             return torch.add(x.to(torch.float32), w)
 
-        with self.assertRaises(Exception) as ctx:
-            compare_with_cpu(fn, x, w, cpu_compile=False, run_eager=False)
-        msg = str(ctx.exception)
-        self.assertNotIn(
-            "Multi-arg pointwise with mixed EA",
-            msg,
-            f"expected a codegen failure, but the mixed-EA gate rejected it: {msg}",
-        )
-        self.assertTrue(
-            any(k in msg for k in ("dxp_standalone", "ddc", "sbf-")),
-            f"expected a ddc/dxp codegen-stage failure, got: {msg[:300]}",
-        )
+        compare_with_cpu(fn, x, w, cpu_compile=False, run_eager=False)
 
     def test_flash_attention(self):
         B, H, L, D = 1, 8, 256, 64
@@ -391,10 +372,9 @@ class TestBuildingBlocks(unittest.TestCase):
         )
 
     @mock.patch(
-        "torch_spyre._inductor.decompositions._SDPA_MAX_BURST_EFFICIENT_KV_BLOCK_SIZE",
-        64,
+        "torch_spyre._inductor.decompositions._sdpa_kv_block_sizes",
+        new=lambda _: [64],
     )
-    @mock.patch("torch_spyre._inductor.decompositions._SDPA_MAX_SEQUENCE_TILE_SIZE", 64)
     def test_sdpa_lk_uses_for_each_tile(self):
         """Multiple K/V blocks lower to one counted loop instead of unrolling."""
         batch, heads, query_length, kv_length, head_dim = 1, 2, 64, 128, 128
@@ -471,8 +451,8 @@ class TestBuildingBlocks(unittest.TestCase):
         LQ,
         *,
         dtype=torch.float16,
-        name_inputs=False,
         LK=128,
+        kv_padding=0,
         transposed_inputs=False,
         reshape_output=False,
     ):
@@ -500,8 +480,8 @@ class TestBuildingBlocks(unittest.TestCase):
             v = torch.randn(B, LK, N_KV, D, dtype=dtype).transpose(1, 2)
         else:
             q = torch.randn(B, H, LQ, D, dtype=dtype)
-            k = torch.randn(B, N_KV, LK, D, dtype=dtype)
-            v = torch.randn(B, N_KV, LK, D, dtype=dtype)
+            k = torch.randn(B, N_KV, LK + kv_padding, D, dtype=dtype)[:, :, :LK, :]
+            v = torch.randn(B, N_KV, LK + kv_padding, D, dtype=dtype)[:, :, :LK, :]
         query_positions = torch.arange(LK - LQ, LK).view(1, 1, LQ, 1)
         key_positions = torch.arange(LK).view(1, 1, 1, LK)
         mask = torch.where(
@@ -512,37 +492,17 @@ class TestBuildingBlocks(unittest.TestCase):
         self.assertEqual(mask.shape, (B, 1, LQ, LK))
 
         expected = sdpa(q, k, v, mask)
-        q_dev, k_dev, v_dev, mask_dev = (
-            q.to("spyre"),
-            k.to("spyre"),
-            v.to("spyre"),
-            mask.to("spyre"),
-        )
-        if name_inputs:
-            for name, size in (
-                ("_b", B),
-                ("num_heads", H),
-                ("num_kvheads", N_KV),
-                ("max_seqlen_q", LQ),
-                ("max_seqlen_kv", LK),
-                ("head_dim", D),
-            ):
-                _pnd.declare_tensor_dim(name, size)
-            # The eager naming API omits static unit axes, matching the adapter.
-            logical_names = (
-                ("_b", "num_heads", "max_seqlen_q", "head_dim"),
-                ("_b", "num_kvheads", "max_seqlen_kv", "head_dim"),
-                ("_b", "num_kvheads", "max_seqlen_kv", "head_dim"),
-            )
-            for tensor, names in zip((q_dev, k_dev, v_dev), logical_names, strict=True):
-                _pnd.name_tensor_dims(
-                    tensor,
-                    [
-                        name
-                        for size, name in zip(tensor.shape, names, strict=True)
-                        if size != 1
-                    ],
-                )
+        q_dev = q.to("spyre")
+        if kv_padding:
+            # Preserve the prefix view on device. Calling k.to("spyre")
+            # directly would make a compact copy and miss the production
+            # static-cache layout this regression covers.
+            k_dev = k._base.to("spyre")[:, :, :LK, :]
+            v_dev = v._base.to("spyre")[:, :, :LK, :]
+        else:
+            k_dev = k.to("spyre")
+            v_dev = v.to("spyre")
+        mask_dev = mask.to("spyre")
         actual = torch.compile(sdpa, dynamic=False)(q_dev, k_dev, v_dev, mask_dev).cpu()
         tolerance = 0.2 if dtype is torch.bfloat16 else 0.1
         torch.testing.assert_close(actual, expected, atol=tolerance, rtol=tolerance)
@@ -550,6 +510,79 @@ class TestBuildingBlocks(unittest.TestCase):
     def test_granite_gqa_decode_with_finite_mask(self):
         """Decode SDPA uses all KV chunks through an unnamed broadcast mask."""
         self._run_granite_gqa_with_finite_broadcast_mask(LQ=1)
+
+    def test_gqa_decode_group_tiling_with_projected_query_layout(self):
+        """GQA tiling must rebase the noncanonical Q layout from projection."""
+        batch, query_heads, kv_heads, query_length, kv_length, head_dim = (
+            1,
+            16,
+            4,
+            1,
+            512,
+            128,
+        )
+        dtype = torch.bfloat16
+
+        def sdpa(query, key, value, mask):
+            return F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=mask,
+                dropout_p=0.0,
+                scale=0.0078125,
+                enable_gqa=True,
+            )
+
+        query = torch.randn(
+            batch, query_length, query_heads, head_dim, dtype=dtype
+        ).transpose(1, 2)
+        key = torch.zeros(batch, kv_heads, kv_length, head_dim, dtype=dtype)
+        value = torch.zeros(batch, kv_heads, kv_length, head_dim, dtype=dtype)
+        key[:, :, 59:65, :] = torch.randn(batch, kv_heads, 6, head_dim, dtype=dtype)
+        value[:, :, 59:65, :] = torch.randn(batch, kv_heads, 6, head_dim, dtype=dtype)
+        mask = torch.full(
+            (batch, query_heads, query_length, kv_length),
+            torch.finfo(dtype).min / 2,
+            dtype=dtype,
+        )
+        mask[..., 59:65] = 0
+
+        # Match the factorized physical layout emitted by Granite's compiled
+        # Q projection and RoPE path while retaining logical BHLD strides.
+        elems_per_stick = SpyreTensorLayout(query.shape, dtype).elems_per_stick()
+        query_layout = SpyreTensorLayout(
+            device_size=[
+                head_dim // elems_per_stick,
+                1,
+                1,
+                1,
+                1,
+                query_heads,
+                elems_per_stick,
+            ],
+            stride_map=[
+                elems_per_stick,
+                -1,
+                -1,
+                -1,
+                elems_per_stick,
+                head_dim,
+                1,
+            ],
+            device_dtype=get_device_dtype(dtype),
+        )
+
+        expected = sdpa(query, key, value, mask)
+        actual, sources = run_and_get_code(
+            torch.compile(sdpa, dynamic=False),
+            query.to("spyre", device_layout=query_layout),
+            key.to("spyre"),
+            value.to("spyre"),
+            mask.to("spyre"),
+        )
+        torch.testing.assert_close(actual.cpu(), expected, atol=0.01, rtol=0.01)
+        self.assertEqual(sum(source.count("LoopSpec(") for source in sources), 2)
 
     def test_granite_gqa_prefill_with_finite_broadcast_mask(self):
         """Prefill SDPA accepts the model's ``[B,1,Lq,Lk]`` causal mask.
@@ -559,18 +592,91 @@ class TestBuildingBlocks(unittest.TestCase):
         """
         self._run_granite_gqa_with_finite_broadcast_mask(LQ=128)
 
-    @mock.patch("torch_spyre._inductor.decompositions._SDPA_MAX_SEQUENCE_TILE_SIZE", 64)
+    @mock.patch(
+        "torch_spyre._inductor.decompositions._sdpa_kv_block_sizes",
+        new=lambda _: [64],
+    )
+    @config.patch(
+        {
+            "cpsat_time_limit_seconds": 30,
+        }
+    )
+    def test_granite_gqa_prefill_noncontiguous_kv_prefix(self):
+        """The Lk loop streams a padded cache prefix one tile at a time."""
+        self._run_granite_gqa_with_finite_broadcast_mask(
+            LQ=128,
+            LK=128,
+            kv_padding=64,
+        )
+
+    @mock.patch(
+        "torch_spyre._inductor.decompositions._sdpa_kv_block_sizes",
+        new=lambda _: [64],
+    )
+    @config.patch(
+        {
+            "cpsat_time_limit_seconds": 30,
+        }
+    )
+    def test_noncontiguous_kv_prefix_keeps_one_tile_fallback(self):
+        """A declined direct read retains the contracted one-tile staging copy."""
+        # The direct-read test above compiles the same helper and shapes. Make
+        # sure this test re-enters Inductor while the proof function is mocked.
+        torch._dynamo.reset_code_caches()
+        torch._inductor.codecache.FxGraphCache.clear()
+        copy_sizes = []
+
+        def decline_direct_read(_consumer, copy_op, _record):
+            copy_sizes.append(tuple(int(size) for size in copy_op.get_size()))
+            return None, "forced fallback for test"
+
+        with mock.patch(
+            "torch_spyre._inductor.read_copy_elision._prove_matmul_direct_read",
+            side_effect=decline_direct_read,
+        ) as prove:
+            self._run_granite_gqa_with_finite_broadcast_mask(
+                LQ=128,
+                LK=128,
+                kv_padding=64,
+            )
+
+        self.assertTrue(prove.called, "expected a direct-read proof attempt")
+        self.assertIn(
+            (1, 64, 1, 8, 128),
+            copy_sizes,
+            "the fallback was not the contracted one-Lk-tile staging buffer",
+        )
+
+    @mock.patch(
+        "torch_spyre._inductor.decompositions._sdpa_query_tile_sizes",
+        new=lambda _: [64],
+    )
+    @mock.patch(
+        "torch_spyre._inductor.decompositions._sdpa_kv_block_sizes",
+        new=lambda _: [64],
+    )
+    # patch the cpsat time to bypass the CI job stall timeout
+    @config.patch(
+        {
+            "cpsat_time_limit_seconds": 30,
+        }
+    )
     def test_granite_gqa_prefill_four_by_four_sequence_tiling(self):
         """Exercise Granite's transposed attention inputs and fused consumer."""
         self._run_granite_gqa_with_finite_broadcast_mask(
             LQ=256,
             dtype=torch.bfloat16,
-            name_inputs=True,
             LK=256,
             transposed_inputs=True,
             reshape_output=True,
         )
 
+    # patch the cpsat time to bypass the CI job stall timeout
+    @config.patch(
+        {
+            "cpsat_time_limit_seconds": 30,
+        }
+    )
     def test_siglip_multicrop_attention_span(self):
         """A seven-crop SigLIP prefill must fit each tiled BMM under 256 MB."""
         B, H, L, D = 7, 16, 576, 128
@@ -594,6 +700,114 @@ class TestBuildingBlocks(unittest.TestCase):
         ).cpu()
         torch.testing.assert_close(actual, expected, atol=0.2, rtol=0.2)
 
+    def test_ministral_vision_transposed_value_span(self):
+        """Stick-aligned KV tiles keep Pixtral's transposed V under 256 MiB."""
+        B, H, L, D = 1, 16, 3520, 128
+        generator = torch.Generator().manual_seed(1337)
+        q = torch.randn((B, H, L, D), dtype=torch.bfloat16, generator=generator)
+        k = torch.randn((B, H, L, D), dtype=torch.bfloat16, generator=generator)
+        v = torch.randn((B, L, H, D), dtype=torch.bfloat16, generator=generator)
+        mask = torch.zeros((B, 1, L, L), dtype=torch.bfloat16)
+
+        def sdpa(q, k, v, mask):
+            return F.scaled_dot_product_attention(
+                q,
+                k,
+                v.transpose(1, 2),
+                attn_mask=mask,
+                dropout_p=0.0,
+                scale=D**-0.5,
+            )
+
+        actual = torch.compile(sdpa, dynamic=False)(
+            q.to("spyre"),
+            k.to("spyre"),
+            v.to("spyre"),
+            mask.to("spyre"),
+        ).cpu()
+        self.assertTrue(torch.isfinite(actual).all())
+
+    def test_siglip_multicrop_attention_from_flat_projection(self):
+        """A rank-3 projection may feed the tiled K transpose without a copy.
+
+        SigLIP projects K as [B, L, H*D], views it as [B, L, H, D], and
+        transposes it to [B, H, L, D].  The per-tile K restickify therefore
+        reads the projection's last host coordinate as the dense mixed-radix
+        expression D*head + feature.  This must remain a direct read of the
+        projection rather than requiring k_blk.contiguous().
+        """
+        B, H, L, D, IN = 7, 16, 576, 128, 64
+        generator = torch.Generator().manual_seed(1337)
+        x = torch.randn((B, L, IN), dtype=torch.bfloat16, generator=generator)
+        w = torch.randn((H * D, IN), dtype=torch.bfloat16, generator=generator) / 8
+        q = torch.randn((B, H, L, D), dtype=torch.bfloat16, generator=generator)
+        v = torch.randn((B, H, L, D), dtype=torch.bfloat16, generator=generator)
+
+        def sdpa(x, w, q, v):
+            k = F.linear(x, w).view(B, L, H, D).transpose(1, 2)
+            return F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                dropout_p=0.0,
+                scale=72**-0.5,
+            )
+
+        expected = sdpa(x, w, q, v)
+        actual = torch.compile(sdpa, dynamic=False)(
+            x.to("spyre"), w.to("spyre"), q.to("spyre"), v.to("spyre")
+        ).cpu()
+        torch.testing.assert_close(actual, expected, atol=0.2, rtol=0.2)
+
+    def test_grouped_sdpa_from_packed_rows(self):
+        """A packed row dimension may be viewed as batch x sequence.
+
+        The per-tile K restickify reads its physical row coordinate as the
+        dense flattening ``L * batch + sequence``.  Input padding must account
+        for all batches instead of assuming one symbol per physical dimension.
+        """
+        heads, head_dim = 12, 64
+        generator = torch.Generator().manual_seed(4676)
+        for group, extent in ((2, 63), (2, 64), (4, 512)):
+            with self.subTest(group=group, extent=extent):
+                rows = group * extent
+                q, k, v = (
+                    torch.randn(
+                        (rows, heads, head_dim),
+                        dtype=torch.float16,
+                        generator=generator,
+                    )
+                    for _ in range(3)
+                )
+                mask = torch.zeros(group, 1, 1, extent, dtype=torch.float16)
+
+                def sdpa_grouped(q_rows, k_rows, v_rows, mask):
+                    def unpack(x):
+                        return x.reshape(group, extent, heads, head_dim).transpose(1, 2)
+
+                    attn = F.scaled_dot_product_attention(
+                        unpack(q_rows),
+                        unpack(k_rows),
+                        unpack(v_rows),
+                        attn_mask=mask,
+                        scale=head_dim**-0.5,
+                    )
+                    return attn.transpose(1, 2).reshape(rows, heads, head_dim)
+
+                expected = sdpa_grouped(q, k, v, mask)
+                actual = torch.compile(sdpa_grouped, fullgraph=True, dynamic=False)(
+                    q.to("spyre"),
+                    k.to("spyre"),
+                    v.to("spyre"),
+                    mask.to("spyre"),
+                ).cpu()
+                torch.testing.assert_close(
+                    actual,
+                    expected,
+                    atol=0.1,
+                    rtol=0.1,
+                )
+
     def test_sdpa_head_tiles_limit_heads_per_tile(self):
         """The hint value is a tile count, not a per-tile head extent."""
         # The backend entry point loaded by ``import torch`` has already
@@ -610,7 +824,6 @@ class TestBuildingBlocks(unittest.TestCase):
         self._run_granite_gqa_with_finite_broadcast_mask(
             LQ=1024,
             dtype=torch.bfloat16,
-            name_inputs=True,
             LK=1024,
             transposed_inputs=True,
             reshape_output=True,
@@ -619,13 +832,19 @@ class TestBuildingBlocks(unittest.TestCase):
     @unittest.skip(
         "Test skipped solely because of runtime.  It passes but takes over 10 minutes."
     )
-    @mock.patch("torch_spyre._inductor.decompositions._SDPA_MAX_SEQUENCE_TILE_SIZE", 64)
+    @mock.patch(
+        "torch_spyre._inductor.decompositions._sdpa_query_tile_sizes",
+        new=lambda _: [64],
+    )
+    @mock.patch(
+        "torch_spyre._inductor.decompositions._sdpa_kv_block_sizes",
+        new=lambda _: [64],
+    )
     def test_granite_gqa_prefill_grouped_sixteen_by_sixteen_tiling(self):
         """Sixteen KV loop groups preserve Granite's online-softmax carries."""
         self._run_granite_gqa_with_finite_broadcast_mask(
             LQ=1024,
             dtype=torch.bfloat16,
-            name_inputs=True,
             LK=1024,
             transposed_inputs=True,
             reshape_output=True,
@@ -649,27 +868,24 @@ class TestBuildingBlocks(unittest.TestCase):
         compare_with_cpu(fn, x, y, z, run_eager=False)
 
     def test_mixed_plain_and_loop_bundle_codegen(self):
-        """Plain op + hint-tiled op fuse into one bundle; LoopSpec must appear."""
-        from torch_spyre._inductor import spyre_hint as sh
-
+        """Plain op + for_each_tile op fuse into one bundle; LoopSpec must appear."""
         T, D = 128, 64
         x_cpu = torch.randn(T, D, dtype=torch.float16)
-
-        # Named dims must be set on the device tensor so propagation can map
-        # the hint's "T" name to the loop variable at compile time.
         x_dev = x_cpu.to("spyre")
-        _pnd.declare_tensor_dim("T", T)
-        _pnd.declare_tensor_dim("D", D)
-        _pnd.name_tensor_dims(x_dev, ["T", "D"])
+
+        def tiled_neg(y):
+            def body(_, ops):
+                (y_tile,) = ops
+                return None, torch.neg(y_tile)
+
+            return for_each_tile(body, (y,), dims=(0,), tile_size=T // 2, out_dim=0)[1]
 
         def fn(x):
-            # abs is a plain SchedulerNode; neg inside the hint becomes a
+            # abs is a plain SchedulerNode; neg inside the loop becomes a
             # CountedLoopSchedulerNode.  The two must fuse into one bundle.
-            y = torch.abs(x)
-            with sh(num_tiles_per_dim={"T": 2}):
-                return torch.neg(y)
+            return tiled_neg(torch.abs(x))
 
-        cfn = torch.compile(fn)
+        cfn = torch.compile(fn, fullgraph=True)
         spyre_result, source_codes = run_and_get_code(cfn, x_dev)
         self.assertTrue(len(source_codes) > 0)
         self.assertIn(
@@ -678,28 +894,25 @@ class TestBuildingBlocks(unittest.TestCase):
             "CountedLoopSchedulerNode must produce a LoopSpec in the bundle",
         )
 
-        cpu_result = fn(x_cpu)
+        cpu_result = torch.neg(torch.abs(x_cpu))
         torch.testing.assert_close(spyre_result.cpu(), cpu_result, atol=1e-3, rtol=1e-3)
 
     def test_tiled_symbol_trip_counts_populated_via_compile(self):
         """OpSpec.tiled_symbol_trip_counts reflects each tiled symbol's own
         loop trip count after a real coarse-tiled compilation.
         """
-        from torch_spyre._inductor import spyre_kernel, spyre_hint as sh
+        from torch_spyre._inductor import spyre_kernel
 
         T, D = 128, 64
         x_cpu = torch.randn(T, D, dtype=torch.float16)
-
-        # Named dims must be set on the device tensor so propagation can map
-        # the hint's "T" name to the loop variable at compile time.
         x_dev = x_cpu.to("spyre")
-        _pnd.declare_tensor_dim("T", T)
-        _pnd.declare_tensor_dim("D", D)
-        _pnd.name_tensor_dims(x_dev, ["T", "D"])
 
         def fn(x):
-            with sh(num_tiles_per_dim={"T": 2}):
-                return x + x
+            def body(_, ops):
+                (x_tile,) = ops
+                return None, x_tile + x_tile
+
+            return for_each_tile(body, (x,), dims=(0,), tile_size=T // 2, out_dim=0)[1]
 
         captured_op_specs = []
         original_create_op_spec = spyre_kernel.SpyreKernel.create_op_spec
@@ -714,7 +927,7 @@ class TestBuildingBlocks(unittest.TestCase):
             "create_op_spec",
             _capturing_create_op_spec,
         ):
-            compiled = torch.compile(fn)
+            compiled = torch.compile(fn, fullgraph=True)
             compiled(x_dev)
 
         tiled_specs = [s for s in captured_op_specs if s.tiled_symbols]
@@ -745,3 +958,132 @@ def test_op_spec_has_no_tile_advance_fields():
     field_names = {f.name for f in dataclasses.fields(OpSpec)}
     assert "tile_advance_expr" not in field_names
     assert "full_tiled_extent" not in field_names
+
+
+# Regression for #5458, with fixed weights and a common input prefix.
+def fixed_inputs(tokens):
+    # Preserve the issue's *failing* 2048-token tensors exactly. Draw the extra
+    # 64 tokens separately so changing the extent cannot change either weight.
+    generator = torch.Generator().manual_seed(1234)
+    x = torch.randn(1, 2048, 768, generator=generator).half()
+    wi = (0.02 * torch.randn(2304, 768, generator=generator)).half()
+    wo = (0.02 * torch.randn(768, 1152, generator=generator)).half()
+    tail = torch.randn(1, 64, 768, generator=torch.Generator().manual_seed(5678)).half()
+    assert tokens in (1984, 2048, 2112)
+    return torch.cat((x, tail), dim=1)[:, :tokens].contiguous(), wi, wo
+
+
+def tanh_gelu(x):
+    return (
+        0.5
+        * x
+        * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * x * x * x)))
+    )
+
+
+def geglu(x, wi, wo, *, decomposed=False, approximate="tanh"):
+    inp, gate = F.linear(x, wi).chunk(2, dim=-1)
+    activated = tanh_gelu(inp) if decomposed else F.gelu(inp, approximate=approximate)
+    return F.linear(activated * gate, wo)
+
+
+def reference(x, wi, wo, *, approximate="tanh"):
+    return geglu(x.float(), wi.float(), wo.float(), approximate=approximate).half()
+
+
+@pytest.mark.parametrize("tokens", [1984, 2048, 2112])
+@pytest.mark.parametrize(
+    ("decomposed", "approximate"),
+    [(False, "none"), (False, "tanh"), (True, "tanh")],
+    ids=["native-none", "native-tanh", "decomposed-tanh"],
+)
+def test_fused_geglu(tokens, decomposed, approximate):
+    # Keep the final-output-only graph: returning intermediates changes fusion
+    # and allocation, so it could mask a defect. Match the GELU approximation.
+    import torch_spyre  # noqa: F401
+
+    # Each parameter case must compile independently of earlier guard sets.
+    torch._dynamo.reset()
+    x, wi, wo = fixed_inputs(tokens)
+    # Native Spyre currently uses tanh for both modes. The none case guards
+    # the public reproducer, not full erf semantics (the mode gap here is tiny).
+    expected = reference(x, wi, wo, approximate=approximate)
+
+    def fn(x, wi, wo):
+        return geglu(x, wi, wo, decomposed=decomposed, approximate=approximate)
+
+    with torch._inductor.config.patch(force_disable_caches=True):
+        actual = torch.compile(fn, fullgraph=True, dynamic=False)(
+            x.to("spyre"), wi.to("spyre"), wo.to("spyre")
+        ).cpu()
+    assert torch.isfinite(actual).all()
+    difference = (actual.float() - expected.float()).abs()
+    bad = difference > 0.05
+    torch.testing.assert_close(
+        actual,
+        expected,
+        rtol=0,
+        atol=0.05,
+        msg=lambda message: (
+            f"tokens={tokens}, decomposed={decomposed}, approximate={approximate}; "
+            f"max_error={difference.max().item()}, "
+            f"mismatches={bad.sum().item()}/{bad.numel()}, "
+            f"affected_tokens={bad.any(dim=-1).sum().item()}, "
+            f"affected_columns={bad.any(dim=1).sum().item()}\n{message}"
+        ),
+    )
+
+
+def test_gelu_pinned_layout_reorder():
+    """Keep #5458 covered even if Inductor changes its preferred GEGLU layout."""
+    from sympy import Integer, Mod, floor, symbols
+
+    from op_specs.runner import run_op_specs
+    from torch_spyre._C import DataFormats, ElementArrangement, SpyreTensorLayout
+    from torch_spyre._inductor import config
+    from torch_spyre._inductor.op_spec import OpSpec, TensorArg
+
+    c0, c1, core_id = symbols("c0 c1 core_id")
+    dtype = DataFormats.SEN169_FP16
+    source = torch.randn(
+        2048, 2304, generator=torch.Generator().manual_seed(5458)
+    ).half()
+    expected = F.gelu(source[:, :1152].float(), approximate="tanh").half()
+    actual = torch.zeros_like(expected)
+    layouts = [
+        SpyreTensorLayout(
+            device_size=size,
+            stride_map=stride,
+            device_dtype=dtype,
+            element_arrangement=ElementArrangement.STANDARD,
+        )
+        for size, stride in [
+            ([2048, 36, 64], [2304, 64, 1]),
+            ([18, 2048, 64], [64, 1152, 1]),
+        ]
+    ]
+    op = OpSpec(
+        op="gelufwd",
+        is_reduction=False,
+        iteration_space={c0: (Integer(2048), 32), c1: (Integer(1152), 1)},
+        op_info={},
+        core_id_to_work_slice={c0: Mod(core_id, 32), c1: Integer(0)},
+        args=[
+            TensorArg(
+                is_input=index == 0,
+                arg_index=index,
+                device_dtype=dtype,
+                device_size=size,
+                device_coordinates=coordinates,
+                allocation={"hbm": index},
+            )
+            for index, size, coordinates in [
+                (0, [2048, 36, 64], [c0, floor(c1 / 64), Mod(c1, 64)]),
+                (1, [18, 2048, 64], [floor(c1 / 64), c0, Mod(c1, 64)]),
+            ]
+        ],
+    )
+    with config.patch(bundle_symbolic_args=True):
+        run_op_specs("gelu_pinned_layout_5458", [op], [source, actual], layouts=layouts)
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, atol=0.05, rtol=0)

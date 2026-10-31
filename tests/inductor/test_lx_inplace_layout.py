@@ -43,7 +43,7 @@ import torch._inductor.config as inductor_config
 
 import torch_spyre._inductor.propagate_layouts as propagate_layouts
 from torch_spyre._inductor import config, spyre_hint
-from utils_inductor import DEVICE
+from utils_inductor import mock_backend_compiler, DEVICE
 
 _LAUNCH_JOBPLAN = "torch_spyre.execution.kernel_runner.launch_jobplan"
 _PREPARE_KERNEL = "torch_spyre.execution.kernel_runner.prepare_kernel"
@@ -127,7 +127,7 @@ class TestLXInplaceLayout:
             ),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             torch._dynamo.reset()
             cfn = torch.compile(spyre_fn, backend="inductor")

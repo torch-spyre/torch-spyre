@@ -53,16 +53,11 @@ from torch._ops import OpOverload, OpOverloadPacket
 
 from typing import Union
 
+from .warning_types import FallbackWarning
+
 aten = torch._ops.ops.aten
 
 fallback_ops = list()
-
-
-class FallbackWarning(UserWarning):
-    """
-    Warning issued when an operator runs on a fallback device (e.g., CPU)
-    instead of Spyre
-    """
 
 
 warnings.simplefilter("once", FallbackWarning)
@@ -238,12 +233,10 @@ def register_fallback_default(ops):
 register_fallback_default(
     [
         aten.cumsum,
-        aten.repeat.out,
         aten.arange,
-        aten.ne.Scalar_out,
         aten.isin,
         aten.tril,
-        aten.triu,
+        aten.triu.out,
         aten.bitwise_xor.Tensor,
         aten.bitwise_xor.Tensor_out,
         aten.bitwise_or.Tensor,
@@ -251,7 +244,6 @@ register_fallback_default(
         aten.argmax.default,
         aten.argmin.default,
         aten.where.default,
-        aten.index_copy.out,
     ]
 )
 
@@ -262,6 +254,14 @@ register_fallback_default(
 # The kernel itself is registered in eager.py.
 fallback_ops.append(aten.normal_.default)
 fallback_ops.append(getattr(aten.random_, "from"))
+
+
+@register_fallback(["spyre::triu_cpu"])
+def spyre__triu_cpu(input, diagonal=0, **kwargs):
+    """
+    CPU fallback for torch.triu on dtypes with no Spyre elementwise support.
+    """
+    return torch.triu(input, diagonal)
 
 
 @register_fallback(["spyre::max_dim_int64_fallback"])

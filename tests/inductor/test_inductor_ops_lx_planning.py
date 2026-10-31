@@ -33,6 +33,7 @@ import inductor.test_inductor_ops  # noqa: E402
 from inductor.test_inductor_ops import (  # noqa: E402
     _arch_needs_fp32_proxy_cpu_ref,
     _build_fp32_proxy_cpu_refs,
+    _dlfloat16_saturating_ref,
     _is_test_large_matmul_fp32_proxy_shape,
 )
 
@@ -55,6 +56,7 @@ def make_lx_planning_class(cls):
         (torch_spyre._inductor.config, "lx_planning", True),
         (torch_spyre._inductor.config, "allow_all_ops_in_lx_planning", True),
         (torch_spyre._inductor.config, "sencores", 32),
+        (torch_spyre._inductor.config, "co_optimizing_lx_planning", True),
     )
 
 
@@ -69,8 +71,10 @@ def _canonical_test_names(test_cls):
     ``test_cls.PARAMS``, plus all non-parameterized test methods.
 
     For a PARAMS entry with an ``ops_dict``, every op gets one shape (the
-    first ``param_sets`` case); without an ``ops_dict``, only the first
-    case is emitted.
+    first ``param_sets`` case that is not in ``expect_fail`` or ``expect_raise``
+    for that op); without an ``ops_dict``, only the first such case is emitted.
+    Neither kind of case is ever copied (see ``_copy_canonical_tests``), so it
+    cannot be the representative.
     """
     params = getattr(test_cls, "PARAMS", {})
     canonical = set()
@@ -80,13 +84,27 @@ def _canonical_test_names(test_cls):
         if not param_sets:
             continue
         parameterized_prefixes.append(prefix)
-        first_case = next(iter(param_sets))
+        # expect_fail and expect_raise cases are not copied either.
+        expect_fail = set(cases.get("expect_fail", [])) | set(
+            cases.get("expect_raise", {})
+        )
         ops_dict = cases.get("ops_dict")
         if ops_dict:
             for op_name in ops_dict:
-                canonical.add(f"{prefix}_{op_name}_{first_case}")
+                case = next(
+                    (
+                        c
+                        for c in param_sets
+                        if c not in expect_fail and f"{op_name}_{c}" not in expect_fail
+                    ),
+                    None,
+                )
+                if case is not None:
+                    canonical.add(f"{prefix}_{op_name}_{case}")
         else:
-            canonical.add(f"{prefix}_{first_case}")
+            case = next((c for c in param_sets if c not in expect_fail), None)
+            if case is not None:
+                canonical.add(f"{prefix}_{case}")
     for name in vars(test_cls):
         if name.startswith("test_") and not any(
             name.startswith(p + "_") for p in parameterized_prefixes
@@ -116,12 +134,26 @@ _DELEGATOR_TESTS = frozenset(
 )
 
 
+def _has_xfail_mark(fn):
+    return any(m.name == "xfail" for m in getattr(fn, "pytestmark", []))
+
+
 def _copy_canonical_tests(
     src_cls, dst_cls, suffix, test_failures, inherited_test_attributes
 ):
     """Copy test methods from ``src_cls`` into ``dst_cls`` with ``_{suffix}``
     appended to each name. Unless ``TEST_LX_PLANNING_FULL`` is set, restrict
-    to the canonical subset derived from ``TestOps.PARAMS``."""
+    to the canonical subset derived from ``TestOps.PARAMS``.
+
+    A test that asserts a rejection (``expect_raise``, tagged ``_expects_raise``)
+    is not copied either: it says nothing about LX planning, and the wrap would
+    only change which op raises.
+
+    A test marked xfail in ``src_cls`` is not copied. It fails for a reason
+    unrelated to LX planning (an unsupported op, wrong values), and the wrap can
+    hide or change that failure: the reduction wrap's atol floor and dim-0 sum
+    pass some of them, so a copy would not reliably fail. Known failures that
+    are specific to LX planning are listed as ``mode: xfail`` in the lx configs."""
     keep = (
         None
         if tests_lx_planning_full
@@ -131,6 +163,8 @@ def _copy_canonical_tests(
         if not name.startswith("test_"):
             continue
         if name in _DELEGATOR_TESTS:
+            continue
+        if _has_xfail_mark(value) or getattr(value, "_expects_raise", False):
             continue
         if keep is not None and name not in keep:
             continue
@@ -148,8 +182,11 @@ def _copy_canonical_tests(
 
 INHERITED_TEST_ATTRIBUTES = [
     "is_dtype_supported",
-    "_get_core_reduction_invalid_dim_cases",
-    "_get_single_dim_reduction_invalid_dim_cases",
+    "_run_clamp_cpu",
+    # Shared body for the direct-path conv3d cases; the im2col conv3d and gate
+    # tests are self-contained, but test_conv3d_via_conv2d_base delegates here.
+    "_run_conv3d_via_conv2d",
+    "_assert_conversion_on_device",
 ]
 
 POINTWISE_TEST_FAILURES = []
@@ -173,6 +210,15 @@ class _LxPlanningTwoOpTestBase(unittest.TestCase):
     # flags. Subclasses with such a wrap raise this floor; wholesale coherence
     # bugs (orders of magnitude larger) still fail.
     _wrap_atol_floor: float = 0.0
+    # Floor on the relative tolerance, for the same wraps. The device sums fp16
+    # in DLFloat16, whose step is ~0.2% of the running sum, so the error grows
+    # with the sum and an absolute floor alone cannot cover a large one. It also
+    # keeps a base test's exact compare (rtol=0), meant for its own op, from
+    # being applied to the wrap's accumulation.
+    # TODO: the error scales with the sum of the magnitudes summed, not with the
+    # result, so a cancelling column still fails; replace both floors with a
+    # per-element bound (#5719).
+    _wrap_rtol_floor: float = 0.0
 
     def setUp(self):
         super().setUp()
@@ -181,13 +227,24 @@ class _LxPlanningTwoOpTestBase(unittest.TestCase):
     def wrap(self, fn):
         raise NotImplementedError
 
-    def compare_with_cpu(self, fn, *args, **kwargs):
+    def wrap_dlfloat16_reference(self, result):
+        raise NotImplementedError
+
+    def compare_with_cpu(self, fn, *args, dlfloat16_reference=None, **kwargs):
         def source_check(source):
             FileCheck().check("{lx: 0}").run(source)
 
         kwargs["cpu_compile"] = False
+        if dlfloat16_reference is not None:
+            kwargs["cpu_eager_result"] = self.wrap_dlfloat16_reference(
+                _dlfloat16_saturating_ref(dlfloat16_reference)
+            ).to(torch.float16)
         if self._wrap_atol_floor:
             kwargs["atol"] = max(kwargs.get("atol") or 0.0, self._wrap_atol_floor)
+        # Only an rtol the base test passes is raised; without one, the
+        # comparison's own default applies.
+        if self._wrap_rtol_floor and "rtol" in kwargs:
+            kwargs["rtol"] = max(kwargs["rtol"] or 0.0, self._wrap_rtol_floor)
 
         # Large matmul on s390x/ppc64: live fp16 CPU GEMM inside wrap(fn) is slow.
         # Build fp32→fp16 proxy gold through the same wrap as Spyre (matmul-only
@@ -222,13 +279,18 @@ class _LxPlanningTwoOpTestBase(unittest.TestCase):
             self.wrap(fn),
             *args,
             atol=max(cpu_atol, self._wrap_atol_floor),
-            rtol=cpu_rtol,
+            rtol=max(cpu_rtol, self._wrap_rtol_floor),
             needs_device=needs_device,
             cpu_compile=False,
         )
 
 
 class LxPlanningTwoOpPointwiseAdditionTest(_LxPlanningTwoOpTestBase):
+    def wrap_dlfloat16_reference(self, result):
+        # Check the addition before dividing: the final mathematical result
+        # can fit even though the intermediate addition overflows to NINF.
+        return _dlfloat16_saturating_ref(result + result) / 2
+
     def wrap(self, fn):
         @functools.wraps(fn)
         def make_seq_of_ops(*fn_args, **fn_kwargs):
@@ -259,8 +321,15 @@ REDUCTION_TEST_FAILURES = []
 
 class LxPlanningTwoOpReductionTest(_LxPlanningTwoOpTestBase):
     # The sum-reduction wrap accumulates in fp16 across cores; allow for the
-    # resulting order/cancellation noise (see _wrap_atol_floor).
+    # resulting order/cancellation noise (see _wrap_atol_floor and
+    # _wrap_rtol_floor).
     _wrap_atol_floor = 1.0
+    _wrap_rtol_floor = 0.1
+
+    def wrap_dlfloat16_reference(self, result):
+        # These references contain same-sign values, so a sum cannot overflow
+        # transiently and then return to range through cancellation.
+        return _dlfloat16_saturating_ref(torch.sum(result, dim=0))
 
     def wrap(self, fn):
         @functools.wraps(fn)

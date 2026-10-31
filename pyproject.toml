@@ -7,14 +7,17 @@ requires = [
     "jinja2",
     "ninja",
     "numpy",
+    "packaging",
     "pyyaml", # needed for codegen
     "regex",
     "setuptools>=77.0.3",  # match upstream torch dependency range
+    "setuptools_scm>=10",
     "torch~=2.13.0",
 #    "torch>=2.13.0",
     "wheel"
 ]
-build-backend = "setuptools.build_meta"
+build-backend = "build_backend"
+backend-path  = ["."]
 
 [project]
 name = "torch_spyre"
@@ -55,6 +58,16 @@ dynamic = ["version"]
 cpsat = [
     "ortools>=9.0; platform_machine != 's390x' and platform_machine != 'ppc64le'",
 ]
+# ortools' runtime deps, for arches where ortools is installed out-of-band (--no-deps).
+# Unmarked: a platform_machine marker here flips torch's p/z lock read to 2.13.0+cpu.
+ortools-oob = [
+    "absl-py",
+    "immutabledict",
+    "protobuf",
+    "typing-extensions",
+    # pandas 3.1.0's sdist does not compile on s390x: xtensor-stack/xsimd#954
+    "pandas<3.1.0",
+]
 build = [ # no-isolation build
     # any change here should be reflected in the build system above
     "build",  # only required to build torch_sendnn
@@ -63,9 +76,15 @@ build = [ # no-isolation build
     "jinja2",
     "ninja",
     "numpy",
+    "packaging",
     "pyyaml", # needed for codegen
     "regex",
     "setuptools>=77.0.3",  # match upstream torch dependency range
+    # The wheel build is non-isolated (`uv build --no-build-isolation`), so
+    # [build-system].requires is never installed -- setuptools_scm has to be in
+    # this extra, and in uv.lock, or the version falls back to 0.0.0 and
+    # version_file is silently never written.
+    "setuptools_scm>=10",
     "torch~=2.13.0",
 #    "torch>=2.13.0",
     "wheel"
@@ -94,8 +113,17 @@ package-data = { torch_spyre = ["*.dll", "*.dylib", "*.so"] }
 exclude = ["tests*", "extensions*"]  # glob patterns: the trailing * also excludes tests.* / extensions.* subpackages, not just the bare top-level name
 
 [tool.setuptools.dynamic]
-version = {attr = "torch_spyre.version.__version__"}  # any module attribute compatible with ast.literal_eval
 readme = {file = ["README.rst", "USAGE.rst"]}
+
+[tool.setuptools_scm]
+# _version.py is written at build time by setuptools_scm
+version_file = "torch_spyre/_version.py"
+version_scheme = "semver-pep440-release-branch"
+local_scheme   = "_versioning:ci_local_scheme"
+
+[tool.ruff.lint.per-file-ignores]
+"build_backend.py" = ["F401", "F403", "E402"]
+"_versioning.py" = ["F401"]
 
 [tool.ruff]
 line-length = 88

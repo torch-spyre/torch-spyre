@@ -465,7 +465,20 @@ After all changes:
 5. **Run tests:**
    ```bash
    cd $TORCH_SPYRE_DIR
-   python -m pytest tests/_inductor/test_inductor_ops.py -v
+   python -m pytest tests/inductor/test_inductor_ops.py -v
+   ```
+
+6. **Re-calibrate the frontend work bounds** (needs a Spyre device).
+   `tests/inductor/test_frontend_work_bounds.py` bounds read-writes
+   extractions per operation, and upstream's own `get_read_writes` calls
+   are part of that count, so a torch bump can move it. Re-measure, then
+   update `MAX_EXTRACTIONS_PER_OP` and the calibration table in the
+   module docstring if the figures moved:
+   ```bash
+   cd $TORCH_SPYRE_DIR
+   python3 -c "import sys; sys.argv=[sys.argv[0]]; \
+       sys.path.insert(0, 'tests/inductor'); import torch, torch_spyre; \
+       from test_frontend_work_bounds import _calibrate; _calibrate()"
    ```
 
 ---
@@ -491,6 +504,7 @@ After completing all steps, report:
    - [ ] Regenerate uv.lock + requirements/*.txt via `./tools/update-requirements.sh` (needs wheels on index)
    - [ ] Rebuild torch-spyre + any downstream C++ extensions (vllm, ...)
    - [ ] Run test suite
+   - [ ] Re-calibrate test_frontend_work_bounds.py (Step 10.6)
    - [ ] Check torch_spyre/_monkey_patch.py & torch_spyre/ops/eager.py
          for API drift against the new PyTorch (Dynamo guards, ATen ops)
 ```

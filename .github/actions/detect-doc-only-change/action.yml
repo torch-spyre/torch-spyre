@@ -1,7 +1,8 @@
 name: Detect doc-only change
 description: |
   Determines whether the triggering pull_request or merge_group event only
-  touched doc paths (tests/docs/, docs/, README.md, CODEOWNERS). push and
+  touched doc paths (tests/docs/, docs/, extensions/clickhouse-ingest/docs/,
+  README.md, extensions/clickhouse-ingest/README.md, CODEOWNERS). push and
   workflow_dispatch events have nothing to diff against, so they always
   report a code change.
 
@@ -44,9 +45,17 @@ runs:
         echo "$FILES"
 
         # Check if any changed file is outside the doc directories.
-        # tests/docs/, docs/, README.md, and CODEOWNERS are the only paths
-        # that should skip tests.
-        NON_DOC=$(echo "$FILES" | grep -v '^tests/docs/' | grep -v '^docs/' | grep -v '^README\.md$' | grep -v '^CODEOWNERS$' || true)
+        # tests/docs/, docs/, extensions/clickhouse-ingest/docs/, README.md,
+        # extensions/clickhouse-ingest/README.md, and CODEOWNERS are the only
+        # paths that should skip tests.
+        NON_DOC=$(echo "$FILES" \
+          | grep -v '^tests/docs/' \
+          | grep -v '^docs/' \
+          | grep -v '^extensions/clickhouse-ingest/docs/' \
+          | grep -v '^README\.md$' \
+          | grep -v '^extensions/clickhouse-ingest/README\.md$' \
+          | grep -v '^CODEOWNERS$' \
+          || true)
 
         if [[ -z "$NON_DOC" ]]; then
           echo "Only doc files changed — skipping tests."

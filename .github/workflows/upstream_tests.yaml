@@ -1,8 +1,6 @@
 name: upstream-pytorch-tests
 
-# One of torch-spyre's four "trunk" (push-to-main) workflows -- see
-# torch_spyre_tests.yaml, model_ops_tests.yaml, upstream_tests_beta.yaml for
-# the others. No test_type input here, so no trunk wiring beyond this label.
+# One of torch-spyre's trunk (push-to-main) workflows: runs upstream configs labeled with this event's tier (trunk on push, regression on PR/merge queue, as spyre-test).
 on:
   # Run automatically on every merge to main
   push:
@@ -10,7 +8,9 @@ on:
     paths-ignore:
       - tests/docs/**
       - docs/**
+      - extensions/clickhouse-ingest/docs/**
       - README.md
+      - extensions/clickhouse-ingest/README.md
       - CODEOWNERS
       - .github/workflows/config_integrity_checker.yaml
   pull_request:
@@ -18,7 +18,9 @@ on:
     paths-ignore:
       - tests/docs/**
       - docs/**
+      - extensions/clickhouse-ingest/docs/**
       - README.md
+      - extensions/clickhouse-ingest/README.md
       - CODEOWNERS
       - .github/workflows/config_integrity_checker.yaml
   merge_group:
@@ -50,6 +52,7 @@ jobs:
   #
   # code_changed=true  --> non-doc files changed  --> run tests
   # code_changed=false --> only doc/CODEOWNERS files changed --> skip tests
+  # has_configs=false  --> no upstream config carries this event's tier --> skip tests (an empty matrix would fail)
   # ---------------------------------------------------------------------------
   changes:
     name: Detect changed files
@@ -57,11 +60,16 @@ jobs:
     outputs:
       code_changed: ${{ steps.filter.outputs.code_changed }}
       integration_labeled: ${{ steps.label.outputs.labeled }}
+      test_type: ${{ steps.tier.outputs.test_type }}
+      has_configs: ${{ steps.tier.outputs.has_configs }}
     steps:
-      - name: Checkout composite actions
+      - name: Checkout composite actions and upstream configs
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          sparse-checkout: .github/actions
+          sparse-checkout: |
+            .github/actions
+            tests/configs/upstream_tests
+            tests/oot_framework/utils/filter_configs.py
           sparse-checkout-cone-mode: false
 
       - name: Check which paths changed
@@ -72,153 +80,46 @@ jobs:
         id: label
         uses: ./.github/actions/detect-integration-test-label
 
-  # Build the torch_spyre._C extension ONCE and publish it as a wheel; the
-  # matrix job below installs that single wheel instead of recompiling per entry.
-  build:
-    name: Build torch-spyre wheel (once)
+      - name: Check which upstream configs carry this event's tier
+        id: tier
+        env:
+          # Same tier per event as tests (torch_spyre_tests.yaml) and spyre-test.
+          TEST_TYPE: ${{ github.event_name == 'push' && 'trunk' || 'regression' }}
+        run: |
+          pip install pyyaml --quiet
+          configs=$(python3 tests/oot_framework/utils/filter_configs.py \
+            --config-dir tests/configs/upstream_tests \
+            --test-type "${TEST_TYPE}" \
+            --format paths)
+          has_configs=false
+          if [ -n "${configs}" ]; then
+            has_configs=true
+          fi
+          echo "tier=${TEST_TYPE} upstream configs carrying it: ${has_configs}"
+          echo "test_type=${TEST_TYPE}" >> "$GITHUB_OUTPUT"
+          echo "has_configs=${has_configs}" >> "$GITHUB_OUTPUT"
+
+  run-tests:
     needs: changes
-    # Also skipped when `integration-test` is labeled -- Jenkins handles it instead.
-    # Read via the composite action: a merge_group payload carries no
-    # pull_request object, so the inline labels expression never matched in the
-    # queue and this rebuilt/retested every queued entry.
+    # Skipped when no upstream config carries this event's tier, and for integration-test-labeled, auto-merge-enabled, and merge-queue runs, as in tests.
     if: |
       needs.changes.outputs.code_changed == 'true' &&
-      needs.changes.outputs.integration_labeled != 'true'
-    # Compile-only: needs the backend image + SDK toolchain but NO physical Spyre
-    # card, so it targets the cardless spyre_pf_x0 pool and leaves card runners
-    # for the test jobs.
-    runs-on:
-      - x86_64
-      - spyre_pf_x0
-      - linux
-      - ${{ (github.event_name == 'merge_group' && 'image_spyre_backend_mq') || 'image_spyre_backend' }}
-    timeout-minutes: 40
-    steps:
-      - name: Checkout composite actions
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          sparse-checkout: .github/actions
-          sparse-checkout-cone-mode: false
-
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          path: torch-spyre
-
-      - uses: ./.github/actions/gather-runner-info
-        with:
-          verbose: 'true'
-
-      - name: Build torch-spyre wheel
-        uses: ./.github/actions/build-torch-spyre-wheel
-        with:
-          image_label: image_spyre_backend
-
-      - name: Upload torch-spyre wheel
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: torch-spyre-wheel
-          path: torch-spyre/dist/*.whl
-          if-no-files-found: error
-          retention-days: 5
-
-  upstream-tests:
-    name: ${{ matrix.suite.name }}
-    needs: build
-    runs-on:
-      - x86_64
-      - spyre_pf_x1
-      - linux
-      - ${{ (github.event_name == 'merge_group' && 'image_spyre_backend_mq') || 'image_spyre_backend' }}
-    timeout-minutes: 60
-    env:
-      # The CI env var is very important.
-      # GitHub actions automatically sets CI=true
-      # which causes the pytest inductor tests to fail with AssertionError
-      # due to a mix of fallbacks and decompositions.
-      # Here we set it to an empty string (or we could also unset it).
-      CI: ''
-
-    # ---------------------------------------------------------------------------
-    # To add a new upstream test suite, append an entry here:
-    #   - name: <human-readable label shown in the GHA UI>
-    #     config: <filename inside tests/configs/>
-    #
-    # The JUnit XML report is automatically named after the config file, e.g.:
-    #   test_view_ops_config.yaml  ->  test_view_ops_config.xml
-    # ---------------------------------------------------------------------------
-    strategy:
-      fail-fast: false   # run all suites even if one fails
-      matrix:
-        suite:
-          - name: View Ops
-            config: test_view_ops_config.yaml
-          - name: Profiler
-            config: test_profiler_config.yaml
-          - name: Explicit Conversion Upstream
-            config: test_torch_config.yaml
-          - name: Implicit Promotion Upstream
-            config: test_binary_ufuncs_config.yaml
-          - name: Autocast Upstream
-            config: test_autocast_config.yaml
-
-    steps:
-      # Sparse checkout into the GHA workspace so the local composite
-      # actions under .github/actions/ are available.
-      - name: Checkout composite actions
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          sparse-checkout: .github/actions
-          sparse-checkout-cone-mode: false
-
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          path: torch-spyre
-
-      - run: |
-          export TORCH_SPYRE_DIR="$GITHUB_WORKSPACE/torch-spyre"
-          ls -la "$TORCH_SPYRE_DIR"
-          echo "TORCH_SPYRE_DIR $TORCH_SPYRE_DIR"
-          echo "TORCH_SPYRE_DIR=${TORCH_SPYRE_DIR}" >> "$GITHUB_ENV"
-
-      - uses: ./.github/actions/checkout-pytorch
-
-      - uses: ./.github/actions/gather-runner-info
-        with:
-          verbose: 'true'
-
-      - name: Install prebuilt torch-spyre
-        uses: ./.github/actions/install-prebuilt-torch-spyre
-
-      - name: Derive report paths
-        run: |
-          REPORT_NAME="${{ matrix.suite.config }}"; REPORT_NAME="${REPORT_NAME%.yaml}.xml"
-          echo "REPORT_NAME=${REPORT_NAME}" >> "$GITHUB_ENV"
-          echo "REPORT_PATH=${GITHUB_WORKSPACE}/${REPORT_NAME}" >> "$GITHUB_ENV"
-
-      - name: Run ${{ matrix.suite.name }} tests
-        uses: ./.github/actions/run-test-suite
-        with:
-          suite_name: ${{ matrix.suite.name }}
-          config: tests/configs/upstream_tests/${{ matrix.suite.config }}
-          extra_test_flags: -v
-          junit_xml_path: ${{ env.REPORT_PATH }}
-          report_name: ${{ env.REPORT_NAME }}
-
-      # ---------------------------------------------------------------------------
-      # Upload the JUnit XML as a GHA artifact so it can be downloaded and
-      # ingested by the Spyre dashboard.
-      #
-      # if: always() ensures the report is uploaded even when tests fail —
-      # a failed run is exactly when you most want the dashboard to show results.
-      #
-      # Artifact name matches the report filename so multiple matrix jobs don't
-      # overwrite each other (each config produces a distinct name).
-      # ---------------------------------------------------------------------------
-      - name: Upload JUnit XML report
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: ${{ env.REPORT_NAME }}
-          path: ${{ env.REPORT_PATH }}
-          if-no-files-found: warn   # warn (not fail) if pytest itself crashed
-          retention-days: 90 # for now keep it for 90 days until we push to COS
+      needs.changes.outputs.has_configs == 'true' &&
+      needs.changes.outputs.integration_labeled != 'true' &&
+      !(github.event_name == 'pull_request' && github.event.pull_request.auto_merge != null) &&
+      github.event_name != 'merge_group'
+    uses: ./.github/workflows/_test_matrix.yaml
+    with:
+      runner_label: linux
+      config_dir: upstream_tests
+      test_type: ${{ needs.changes.outputs.test_type }}
+      extra_test_flags: -v
+      checkout_pytorch: true
+      report_retention_days: 90
+    secrets:
+      CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
+      CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT }}
+      CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
+      CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS }}
+      CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB }}
+      CLICKHOUSE_DB_V2: ${{ secrets.CLICKHOUSE_DB_V2 }}

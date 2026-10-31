@@ -14,9 +14,10 @@ allocator and the other solvers, see [Scratchpad Planning](scratchpad_planning.m
 
 `config.layout_solver = "simulated_annealing"` with `co_optimizing_lx_planning` routes to
 `CoOptimizingAllocator(layout_planning=SaCoOptimizingSolver)`. The allocator builds one
-`CoreDivisionBuffer` per graph buffer — carrying the candidate division menu and the
-`cd_parent_matches` compatibility relation — and hands the list to the solver, which mutates it
-in place with a `chosen_division` and an `address`.
+`CoreDivisionBuffer` per graph buffer — carrying the candidate division menu, the
+`cd_parent_matches` compatibility relation, and, where it could derive them, the per-candidate
+machinery that stands in for both (`division_space` and `residency_edges`) — and hands the list to
+the solver, which mutates it in place with a `chosen_division` and an `address`.
 
 It runs as a **pre-scheduling pass**: `V.graph` is live but
 `V.graph.scheduler` is still `None`, so fusion has not happened yet. Anything the engine wants to
@@ -29,10 +30,59 @@ the search parameters are module constants in `sa_cooptimizer.py`.
 ## The search
 
 The state is the pair `(pi, W)`: the layout permutation `pi`, held in a composed
-`PermutationBasedLayoutSolver` packer, and the division vector `W`, one menu index per buffer. The
-seed is every buffer at menu index 0 with `pi` from a FirstFit pass. One geometric cool runs
-`clamp(40n, 200, 15000)` steps at fixed proposal weights, and the best state seen is what gets
+`NativePermutationLayoutSolver` packer, and the division vector `W`, one `DivisionConfig` per
+buffer. A config is a division as a *value* — the `CoreDivision` itself, a canonical hashable key
+identifying the choice it makes, and the menu position it came from, if any. The seed is every
+buffer at its first candidate with `pi` from a FirstFit pass. One geometric cool runs
+`min(200n, 50000)` steps at fixed proposal weights, and the best state seen is what gets
 written back — so the result is never worse than the seed.
+
+### Where the candidates come from
+
+Each buffer gets a `_DivisionSource`, and the engine asks nothing else: the seed, the divisions one
+step away (`neighbours`, what a flip proposes), and a splitting division to flood from
+(`anchor`, what a recolor proposes). A buffer whose producing op has an `OpSplitSpace` *generates*
+those (`_GeneratedDivisions`); the rest read the enumerated menu (`_MenuDivisions`). Each
+producer→consumer edge likewise gets an `_EdgeRelation`, which the residency gate and the recolor
+flood ask: computed per candidate off the buffer's geometry where both ends generate
+(`_ViewRelation`, which inverts the per-core view to construct the other end's division), and the
+`cd_parent_matches` table projected onto choices otherwise (`_TableRelation`). The one thing still
+keyed by menu position is the `chosen_division` written back; a generated division the menu does
+not carry is appended to it then — which is the path a tiled division always takes, since the
+enumeration carries no tilings.
+
+### The coarse tiling rides on the same candidate
+
+`CoreDivision.tiling` is a `TileSpec`, and `OpSplitSpace` chooses it jointly with the splits. It has
+to be joint: tiling rewrites index expressions and `splits_by_index_coeff` keys the output splits by
+each symbol's coefficient in the write index, so a `CoreDivision` carried across tilings is
+uninterpretable rather than merely illegal. The tiling half of the space is `TilingSpace`
+(`wsr/enumerate_tilings.py`), whose predicates `enumerate_tile_options` is the cross product over.
+
+The space is **ragged**. Each tiling is judged in its own per-tile frame, the context
+`work_division_context_for_op(op, max_cores, tiling)` builds, as the CP-SAT menu is. A tile level
+cuts its axis's extent, so a core split of that axis must divide the smaller extent; it cuts the
+per-core span too, so `MAX_SPAN_BYTES` can admit a split map the untiled op cannot take. The per-axis
+domains are nested — a divisor of the per-tile extent divides the whole one, and the committed span
+floors bind both — so the untiled ones are the widest and the view inverse searching them misses
+nothing. The joint verdict is not nested, so whatever falls back from a tiled config to its untiled
+twin checks the twin, as the recolor anchor does.
+
+In practice that difference is empty. An op that fits untiled at some split fits at any split
+meeting the committed floors, which every tiled-admitted split meets. An op that fits at none never
+reaches the search untiled: `span_reduction_pass` refuses it, unless the opt-in span-overflow pass
+has tiled it first, and an op already tiled is offered no tiling. So this search still only finds
+tilings that pay through LX residency.
+
+That payoff is not a derate. Every tiling-sensitive derate in the cost model is bounded by 1.0, and
+the objective's `_COST_PARAMS` pins them at 1.0 besides, so none can rank a tiling above not
+tiling. What a tiling does is divide `_per_core_size` by `output_tile_count` as well as
+`output_partition`, which can bring a buffer under `_eligible`'s capacity gate and be repaid in the
+HBM traffic residency then frees.
+
+The tiling half is attached only where `CoOptimizingAllocator._solver_chooses_tilings` holds: a
+solver that both `generates_divisions()` and `chooses_tilings()` (this engine), and
+`config.auto_coarse_tiling` (off by default; see its comment).
 
 Three move types:
 
@@ -43,10 +93,26 @@ Three move types:
   score-identical positions that a permutation move usually offers. Its weight drops to 0 while
   every eligible buffer is resident — `pi` only decides which eligible buffers win LX, so with all
   of them already in, only a structural move can still pay.
-* **flip** (weight 0.3) — move one buffer to a different entry in its own division menu, then
-  ripple: resize its per-core footprint and refresh LX-eligibility for it and its parents.
-* **recolor** (weight 0.2) — flood the `cd_parent_matches` relation bidirectionally from a
-  non-trivial (split) anchor tiling and recolor everything it reaches.
+* **flip** (weight 0.3) — one step from the drawn buffer's division: a single axis's split factor,
+  *or* one coarse tile level, never both. A division step is the drawn buffer's alone. A tiling step
+  moves a **boundary**: `_retile_boundary` re-specs the drawn op's run from it to one end, truncated
+  at the first op that refuses the spec. Runs are the groups `derive_tiling_groups` forms, measured
+  over `CoreDivisionBuffer.op_position`. Tile levels are concatenated onto the neighbour list, not
+  weighted against it (`OpSplitSpace.neighbours`).
+
+* **recolor** (weight 0.2) — draw a splitting anchor division, flood the residency relation
+  bidirectionally from it, and recolor everything it reaches.
+
+  This is the search's **long-range** move: an op's legal divisions are not connected by
+  one-axis moves (the core budget blocks a factor going up, a span floor blocks it coming down), so
+  its anchor is drawn from the whole space. A generated anchor draws its tiling first, and the flood
+  carries that tiling to each op that can take it: a coarse tiling group is a run of consecutive ops
+  on one loop nest, each reading the others tile by tile (`coarse_tiling.TileReads`), so the flood
+  is what forms one.
+
+  The flood reaches producers and consumers, not a contiguous run, so
+  `_trim_tilings_to_anchor_run` strips the `TileSpec` from every op outside the anchor's run and
+  leaves its splits alone. Flip moves a boundary; recolor repaints a region.
 
 Both structural moves carry a short cold layout burst, so `pi` has adapted to the new footprints
 before the compound move is judged as a unit by one Metropolis test. The burst stops early for the
@@ -60,6 +126,41 @@ A run is **bit-for-bit reproducible**: the RNG is seeded, every domain it draws 
 index-ordered, and the score is an integer fixed-point quantity, so there is no float
 accumulation to reorder.
 
+:::{warning}
+Reproducible is not stable: the trajectory is chaotic, so compare two revisions over several seeds,
+never one.
+:::
+
+### What the tiling costs, as an objective symbol
+
+`CoreDivisionBuffer.sym_tile_counts` declares one symbol per tileable axis, keyed
+`(host_dim, is_reduction)`. This engine's menu lists no tiling, so its keys are every output dim the
+buffer's division space may tile, and the annealer binds each through the chosen config's
+`TileSpec.count_for`, 1 for an axis it leaves untiled. `CoOptimizingAllocator._extract_op_features`
+resolves each axis to the op's loop variable and hands the symbols to the extractor as a candidate
+tiling (`dump_cost_model._candidate_tiling`). `tiles_output_dim` is then a condition over them, and
+every branch on it a `Piecewise` (`cost_model._select`). With the derates pinned and the loop
+re-read not double-counted (`_COST_PARAMS`), depth reaches the price mainly through the
+`loop_factor` of each operand the loop re-reads.
+
+### Residency across a tiling boundary
+
+A coarse-tiled op reading a buffer produced outside its run reads it at an address that advances
+per tile, which an LX address cannot: `_read_across_a_tiling_boundary` refuses that buffer LX.
+Nothing gives that residency back yet; a tile-local staging copy, placed by the anneal, could.
+
+## The apply round
+
+`CoOptimizingAllocator._post_solve` runs `apply_chosen_tilings` on the chosen `TileSpec`s
+before the divisions are committed, so the ownership is built against the already-tiled op, the
+same apply the CP-SAT solve uses. `check_priced_footprints` then checks that each tiled buffer's
+applied per-core footprint is the one it was placed at, and `commit_divisions` restates each
+tiled op's splits on the symbols its tile iterates (`planned_splits`), refusing with `Unsupported`
+only a split above 1 on an axis the tiling squeezed away; a copy-out takes the division of the op
+it drains. The anneal's placement stands, and the companion buffers the apply mints stay in HBM.
+A refusal from the apply raises: it is a defect in `OpSplitSpace.admits`, not a graph to route
+around.
+
 ## The objective
 
 **`cost_expr`** is `CoOptimizingAllocator._solve`'s symbolic prediction for the whole graph —
@@ -68,8 +169,8 @@ every buffer's own `sym_is_lx`/`sym_core_divs` (the same symbols the CP-SAT engi
 expression is built from). `plan_layout_and_core_divisions(cost_expr)` compiles it once, per
 solve, into a fast `(chosen, resident) -> fixed-point ns` callable (`_build_score_fn`): every free
 symbol in the expression maps back to a getter built off THESE buffers — an argument's residency
-from whether its owning buffer's name is in `resident`, a split symbol's value from
-`core_divisions[chosen[idx]]`. The compiled formula is evaluated fresh every step; unlike the
+from whether its owning buffer's name is in `resident`, a split symbol's value from the config
+`chosen[idx]` itself. The compiled formula is evaluated fresh every step; unlike the
 `BundleCostObjective` it replaced, there is no incremental per-bundle memoization or dirty
 tracking, and so nothing to invalidate on a rejected move.
 
@@ -92,6 +193,12 @@ or a `sumcol`-style reduction) either drops that rate silently or, if the read r
 whole expression back to the memory-only fallback. There is no per-bundle escape hatch for this
 the way `BundleCostObjective`'s concrete `predict_ops` calls had.
 :::
+
+**Companion traffic** is added to whichever of the two runs, at the HBM rate: the HBM reads and
+writes of the full-extent buffer the apply mints for a tiled op whose output escapes its group. It
+rides outside `cost_expr` because `op_features` is extracted from the untiled graph: the tile-count
+symbols price the loop over each op, but that buffer exists only once the apply has run; see
+`_companion_bytes`.
 
 :::{warning}
 The cost objective's plans are cheaper **by the cost model's own reckoning**. No device time has

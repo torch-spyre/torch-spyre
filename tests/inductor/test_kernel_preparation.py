@@ -36,6 +36,7 @@ from torch_spyre._inductor import config
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.pass_utils import PerCoreView
 from torch_spyre._inductor.spyre_kernel import SpyreKernel, _iter_op_specs
+from utils_inductor import mock_backend_compiler
 
 _LAUNCH_JOBPLAN = "torch_spyre.execution.kernel_runner.launch_jobplan"
 _PREPARE_KERNEL = "torch_spyre.execution.kernel_runner.prepare_kernel"
@@ -257,7 +258,7 @@ def test_emission_consumes_the_kernels_prepared_before_pooling():
         ),
         mock_patch(_LAUNCH_JOBPLAN),
         mock_patch(_PREPARE_KERNEL),
-        mock_patch("subprocess.run"),
+        mock_backend_compiler(),
     ):
         _, code = run_and_get_code(torch.compile(fn, dynamic=False), x, y)
     generated = "\n".join(code)

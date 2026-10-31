@@ -13,8 +13,6 @@ captured artifacts.
 
 | Variable | Effect |
 |---|---|
-| `SPYRE_INDUCTOR_LOG=1` | *Deprecated*. Use `TORCH_LOGS="torch_spyre.inductor"`. Enables Spyre-specific Inductor logging (INFO level) |
-| `SPYRE_INDUCTOR_LOG_LEVEL=DEBUG` | *Deprecated*. Use `TORCH_LOGS="+torch_spyre.inductor"`. Sets Spyre Inductor log verbosity to DEBUG |
 | `SPYRE_LOG_FILE=path/to/file.log` | *Deprecated*. Mapped to the top-level `spyre` logger file handler. Redirects Spyre Inductor log output to a file |
 | `TORCH_LOGS="+torch_spyre.inductor"` | Preferred logging control (DEBUG level). Accepts `torch_spyre.*` namespaces |
 | `TORCH_LOGS="torch_spyre.inductor"` | Same as above but at INFO level (no `+` prefix) |
@@ -67,6 +65,148 @@ The `torch_spyre.*` namespace is only for the `TORCH_LOGS` environment variable.
 | Variable | Effect |
 |---|---|
 | `SENCORES=<1..32>` | Number of Spyre cores to target (default 32) |
+
+## Compile-time timing
+
+Measures how long the compiler frontend takes, per pass pipeline and per
+pass, with the graph size each pass saw. This is compile time, not runtime:
+nothing here reports how long a kernel takes on device.
+
+| Variable | Effect |
+|---|---|
+| `TORCH_SPYRE_TIMING=1` | Record structured frontend compile timings (default off) |
+| `TORCH_SPYRE_TIMING_OUT=path/rec.json` | Write the record to `path/rec.<pid>.json` at process exit. Empty keeps events in memory only |
+
+```bash
+TORCH_SPYRE_TIMING=1 TORCH_SPYRE_TIMING_OUT=/tmp/rec.json python3 my_model.py
+# -> /tmp/rec.<pid>.json
+```
+
+Each event carries `inclusive_ns` and `self_ns` (inclusive minus direct
+children), so a pipeline total and its per-pass breakdown can be read from
+one record. Event names have three shapes:
+
+| Name | Region |
+|---|---|
+| `pipeline:<PipelineClass>` | One pass pipeline, start to finish |
+| `pass:<PipelineClass>:<pass_name>` | One pass within it |
+| `stage:<Owner>:<what>` | Anything else that is timed |
+
+The `stage:` regions are:
+
+| Name | Region |
+|---|---|
+| `stage:compile_fx:spyre_compile` | One whole Spyre compile; every other region nests inside it |
+| `stage:CustomPreSchedulingPasses:pass_loop` | The pre-scheduling pass list |
+| `stage:CustomPreSchedulingPasses:cost_model` / `:cost_dump` | Predicted-runtime report and its per-op dump |
+| `stage:CustomPreSchedulingPasses:finalize_work_division` | Work-division ownership handoff to the scheduler |
+| `stage:CustomPreSchedulingPasses:log_before` / `:log_after` | The IR dumps, only when INFO logging is on |
+| `stage:GraphLowering:update_scheduler` | Upstream scheduler construction |
+| `stage:SpyreAsyncCompile:generate_bundle` / `:generate_ktir` | Backend-input generation, per kernel |
+| `stage:SpyreAsyncCompile:kernel_provenance` | Kernel provenance descriptor, per kernel |
+| `stage:SpyreAsyncCompile:backend_compile` | The backend compiler, per kernel (named in `meta.tool`) |
+| `stage:SpyreAsyncCompile:prepare_kernel` | Loading the backend's output |
+| `stage:SpyreAsyncCompile:backend_skipped` | Marker where the backend was skipped; its duration is not a measurement |
+
+**Frontend time is a subtraction, not a span**, because the backend runs per
+kernel from inside codegen:
+
+```
+pre_backend = stage:compile_fx:spyre_compile
+              - sum(stage:SpyreAsyncCompile:backend_compile under that compile)
+```
+
+A process that compiles several graphs has one `spyre_compile` event per
+compile, so group by it rather than summing the whole record.
+
+`backend_compile` is recorded only when the backend runs in-process. With more
+than one compile thread the work goes to a pool worker, which does not share this
+recorder, so no `backend_compile` event is emitted and the subtraction above
+would charge the backend to the frontend. Measure with a single compile thread.
+
+### Skipping the backend
+
+The backend compiler -- `dbo-opt`, by either the sdsc or the `TORCH_SPYRE_KTIR=1`
+route -- is invoked once per kernel and usually dominates compile
+wall time, so paying for it on every frontend measurement is what makes a sweep
+expensive. `TORCH_SPYRE_FRONTEND_ONLY=1` runs the frontend in
+full -- all pass pipelines, scheduling, codegen, and backend-input generation --
+and stops at each per-kernel backend invocation:
+
+```bash
+TORCH_SPYRE_FRONTEND_ONLY=1 TORCH_SPYRE_TIMING=1 \
+  TORCH_SPYRE_TIMING_OUT=/tmp/rec.json \
+  TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 python3 my_model.py
+```
+
+The compile produces **no runnable kernel**: calling one raises a `RuntimeError`
+naming the variable and the bundle directory. Use it to measure, never to run --
+and to measure several graphs in one process, trigger compilation without
+executing the result, since the first call is what raises.
+
+**Disable caches when measuring**, with
+`TORCHINDUCTOR_FORCE_DISABLE_CACHES=1`. A cache hit skips the frontend
+altogether, so `stage:compile_fx:spyre_compile` would time a cache lookup and
+the record would still look valid -- which is what the second iteration of a
+sweep does by default.
+
+The Spyre kernel cache (`SPYRE_KERNEL_CACHE=1`) is forced off for the whole run,
+so the mode needs no flag of its own. A cache hit returns a compiled kernel
+without running bundle generation or the backend, leaving nothing to measure
+while still handing back a runnable kernel -- and a bundle with no backend output
+must never be committed, because a cache entry that already exists causes every
+later complete compile for that key to be discarded.
+
+Caches stay usable afterwards. Each kernel's bundle goes to a fresh directory,
+and the generated wrapper re-enters the backend step on a cache reload, so a
+normal run reusing the same `TORCHINDUCTOR_CACHE_DIR` still compiles and runs.
+
+The record makes the difference explicit. A normal compile carries one
+`stage:SpyreAsyncCompile:backend_compile` event per kernel; a frontend-only
+compile carries `stage:SpyreAsyncCompile:backend_skipped` instead. Every record
+states the mode in its metadata (`frontend_only: true` or `false`) whether or not
+a kernel was skipped, and a frontend-only one also lists
+`backend_skipped_kernels`, so a truncated compile can never be mistaken for a
+fast one.
+
+What it does not measure: the backend itself, kernel execution, and anything a
+later pass would have learned from a compiled artifact. Bundle generation is
+inside the boundary, not outside it.
+
+Each pipeline and pass event also carries `meta` with the graph size it saw
+(`input_nodes` / `output_nodes`, or `input_operations` / `output_operations`
+for the pre-scheduling pipeline) and counts of the analysis calls it made.
+Timing says a pass is slow; the counts say how many times it asked the same
+question, and unlike a duration they are reproducible to a fraction of a percent. A counter that
+did not move is omitted rather than recorded as zero.
+
+| Counter | Meaning |
+|---|---|
+| `read_writes.requests` | Calls to the memoized `op_read_writes` helper: how many times the pass asked |
+| `read_writes.misses` | Of those, the ones the per-op memo could not serve |
+| `read_writes.extractions` | `ComputedBuffer.get_read_writes` invocations -- the sympy dependency extraction that actually costs something, including callers that bypass the memo |
+| `read_writes.extract_ns` | Nanoseconds spent inside those extractions, so a count can be sized rather than guessed |
+| `device_coordinates` | Device-space coordinate constructions |
+| `host_coordinates` | Host-space coordinate constructions |
+
+`read_writes.extractions` and `read_writes.extract_ns` cover
+`ComputedBuffer.get_read_writes` only. The
+scheduler extracts directly in `SchedulerNode._compute_attrs`, and so do several
+`ir.py` classes (`Loops`, `BaseView`, `TemplateBuffer`), so `extractions` is a
+lower bound on dependency extraction and `extract_ns` a lower bound on its cost.
+
+Read these against a baseline record of the same workload rather than in the
+absolute. Most extractions come from callers that reach past the memo by design,
+so misses sitting far below extractions is the normal state and not a finding; a
+*change* in that relationship for one workload is. How much the memo absorbs is
+requests against misses, not against extractions. Pipeline events carry the
+inclusive total, the same way `inclusive_ns` does.
+
+The counters are one process-wide, unsynchronized store. If two threads compile
+at once (a multi-threaded server such as vLLM, say), each pass's counts include
+the other compile's work, and a negative delta means another compile reset the
+store mid-pass. Profile with a single compiling thread to get per-compile
+figures.
 
 ## FFDC (First Failure Data Capture)
 

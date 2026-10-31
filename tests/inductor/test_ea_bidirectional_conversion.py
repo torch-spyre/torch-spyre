@@ -26,9 +26,12 @@ Tests all 4 conversion cases:
 
 import pytest
 import torch
+from torch._inductor.exc import InductorError
 from torch_spyre._C import ElementArrangement, get_spyre_tensor_layout
+from torch_spyre._inductor import config
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
 from torch_spyre._inductor.constants import DEVICE_NAME
+from utils_inductor import expects_raise
 
 
 def _run(fn, *args, mode="compile"):
@@ -247,6 +250,105 @@ def test_bidirectional_roundtrip_fp32_start(device, fp16):
     print("✓ FP32→FP16→FP32 roundtrip works")
 
 
+# Shapes whose whole content fits in a single stick, so the tensor has no
+# spatial dim outside the stick dim for the conversion op to loop over.
+STICK_ONLY_SHAPES = [
+    (),
+    (1,),
+    (1, 1),
+    (1, 1, 1),
+    (1, 1, 1, 1),
+]
+
+
+@pytest.mark.parametrize("shape", STICK_ONLY_SHAPES)
+@pytest.mark.parametrize("start_dtype", [torch.float32, torch.float16])
+def test_roundtrip_stick_only_shape(shape, start_dtype):
+    """A conversion round trip works when the tensor is a scalar or all size-1 dims.
+
+    A type conversion needs one spatial dim beyond the stick, which these shapes
+    do not have; codegen supplies a virtual one. Both directions are exercised
+    because a single fp16->fp32 output is staggered and not comparable to CPU.
+    Random values make a lane read from the wrong place show up as a mismatch.
+    """
+    other_dtype = torch.float16 if start_dtype == torch.float32 else torch.float32
+
+    def fn(t):
+        return t.to(other_dtype).to(start_dtype)
+
+    x = torch.randn(shape, dtype=start_dtype)
+    result = torch.compile(fn, backend="inductor")(x.to("spyre"))
+
+    ea = get_spyre_tensor_layout(result).element_arrangement
+    assert ea == ElementArrangement.STANDARD, f"Expected STANDARD EA, got {ea}"
+    torch.testing.assert_close(result.cpu(), fn(x), rtol=1e-3, atol=1e-3)
+
+
+def test_int32_to_fp32_partial_stick_1d_then_rsqrt():
+    """A conversion of a 1-D tensor that ends inside a stick pads it to whole sticks.
+
+    The only loop variable is the stick, so codegen adds a virtual row before it;
+    the stick must still be padded. int32 and fp32 share a stick width, so this
+    covers the padding without a width change.
+    """
+
+    def fn(x):
+        return torch.rsqrt(x.to(torch.float32))
+
+    x = torch.randint(1, 1000, (44,), dtype=torch.int32)
+    result = torch.compile(fn, dynamic=False)(x.to("spyre"))
+    torch.testing.assert_close(result.cpu(), fn(x), rtol=1e-2, atol=1e-2)
+
+
+# An op consuming an upcast FP32 value before the downcast back, on stick lengths
+# that end inside a stick. The upcast value is staggered: each FP16 stick spans a
+# pair of FP32 sticks. Padding the conversions is enough while work division
+# leaves the stick dim unsplit, or while the stick dim rounded up to FP32 sticks
+# is a whole number of pairs; (68,) is the unsplit case.
+_PARTIAL_STICK_UPCAST_PASS = [(68,), (196,), (232,), (1000,), (4, 100), (4, 104)]
+# Here work division splits the stick dim and the round-up ends in the middle of
+# a pair, so the pair's second stick is left to no core.
+# TODO: make work division handle staggered FP32, splitting the stick dim by
+# whole stick pairs.
+_PARTIAL_STICK_UPCAST_NEEDS_PAIRS = [(4100,), (4, 68), (4, 196)]
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        *_PARTIAL_STICK_UPCAST_PASS,
+        *[
+            pytest.param(
+                shape,
+                marks=pytest.mark.xfail(
+                    strict=True,
+                    raises=AssertionError,
+                    reason="TODO: size work division for an upcast value by whole "
+                    "stick pairs, so the last pair's second stick is processed",
+                ),
+            )
+            for shape in _PARTIAL_STICK_UPCAST_NEEDS_PAIRS
+        ],
+    ],
+    ids=str,
+)
+def test_upcast_consumed_on_partial_stick(shape):
+    """An op between an FP16 -> FP32 -> FP16 round trip keeps every element.
+
+    The values are exact in DLFloat16, so any element the device moves or drops
+    shows up as a mismatch.
+    """
+    torch._dynamo.reset()
+
+    def fn(x):
+        y = x.to(torch.float32)
+        return (y + y).to(torch.float16)
+
+    x = (torch.randint(-64, 64, shape) / 8).to(torch.float16)
+    result = torch.compile(fn)(x.to("spyre"))
+    torch.testing.assert_close(result.cpu(), fn(x), rtol=0, atol=0)
+
+
 def _stagger_fn(x, fp16):
     """fp32 → fp16(staggered) → stagger_to_standard_ea → standard EA fp16."""
     return torch.ops.spyre.stagger_to_standard_ea(x.to(dtype=fp16))
@@ -303,6 +405,25 @@ def test_stagger_to_standard_ea(x, fp16):
     spyre_result = compiled_fn(x.to("spyre"), fp16)
     ea = get_spyre_tensor_layout(spyre_result).element_arrangement
     assert ea == ElementArrangement.STANDARD, f"Expected STANDARD EA, got {ea}"
+
+
+@pytest.mark.parametrize("lx_planning", [False, True], ids=["hbm", "lx"])
+@pytest.mark.parametrize(
+    "fp16",
+    DtypeOpTable.fp16_types(),
+    ids=lambda dt: str(dt).replace("torch.", ""),
+)
+def test_stagger_to_standard_ea_one_core_row_order(lx_planning, fp16):
+    """Keep conflicting physical row segments local to one core (#4703)."""
+    torch._dynamo.reset()
+    # Distinct, exactly representable rows make a row permutation unambiguous.
+    x = torch.arange(8, dtype=torch.float32).reshape(2, 4, 1)
+    x = x.expand(2, 4, 64).contiguous()
+    with config.patch({"sencores": 1, "lx_planning": lx_planning}):
+        compiled_fn = torch.compile(_stagger_fn, backend="inductor", fullgraph=True)
+        result = compiled_fn(x.to(DEVICE_NAME), fp16)
+    torch.testing.assert_close(result.cpu(), x.to(fp16), atol=0, rtol=0)
+    assert_ea(result, ElementArrangement.STANDARD)
 
 
 _SLICED_RMSNORM_SHAPES = {
@@ -425,6 +546,214 @@ def test_eager_ea(src_dev, dst_dev, fp16, eager_to):
 
     z32 = eager_to(y16, src_dev, torch.float32)
     assert_ea(z32, ea_of(src_dev))
+
+
+# (input dtype, on-device conversion, its staggered arrangement, conversion back)
+_STAGGERING_CONVERSIONS = {
+    "dl16_to_fp32": (
+        torch.float16,
+        lambda t: t.float(),
+        ElementArrangement.DL16_TO_FP32,
+        lambda y: y.half(),
+    ),
+    "fp32_to_dl16": (
+        torch.float32,
+        lambda t: t.half(),
+        ElementArrangement.FP32_TO_DL16,
+        lambda y: y.float(),
+    ),
+}
+
+_FRESH_ALLOCATION_PROGRAMS = {
+    "cat_dim0": lambda a, b: torch.cat([a, b]),
+    "cat_stick_dim": lambda a, b: torch.cat([a, b], dim=1),
+    "stack": lambda a, b: torch.stack([a, b]),
+    "pad_rows": lambda a, b: torch.nn.functional.pad(a, (0, 0, 0, 4)),
+}
+
+
+def _small_int_fp16(shape, modulus, base=0):
+    # Integers <= 1024 are exact in DLFloat16, so results compare bit-exact.
+    return (torch.arange(shape[0] * shape[1]) % modulus + base).reshape(shape).half()
+
+
+@pytest.mark.parametrize("conversion", list(_STAGGERING_CONVERSIONS))
+@pytest.mark.parametrize("program", list(_FRESH_ALLOCATION_PROGRAMS))
+def test_staggered_into_fresh_allocation(program, conversion):
+    """cat, stack and F.pad of converted tensors keep the staggered arrangement."""
+    combine = _FRESH_ALLOCATION_PROGRAMS[program]
+    dtype, convert, expected_ea, restore = _STAGGERING_CONVERSIONS[conversion]
+    a = _small_int_fp16((4, 64), 7).to(dtype)
+    b = _small_int_fp16((4, 64), 5, base=10).to(dtype)
+
+    def fn(a, b):
+        return combine(convert(a), convert(b))
+
+    out = torch.compile(fn)(a.to(DEVICE_NAME), b.to(DEVICE_NAME))
+    assert_ea(out, expected_ea)
+
+    def round_trip(a, b):
+        return restore(fn(a, b))
+
+    restored = torch.compile(round_trip)(a.to(DEVICE_NAME), b.to(DEVICE_NAME))
+    assert_ea(restored, ElementArrangement.STANDARD)
+    assert torch.equal(restored.cpu(), round_trip(a, b))
+
+
+_WHOLE_STICK_DIM_PROGRAMS = {
+    # Width 100 is not a multiple of 64, but each write covers the whole stick dim.
+    "dl16_to_fp32_cat_rows": (
+        torch.float16,
+        lambda a, b: torch.cat([a.float(), b.float()]),
+        ElementArrangement.DL16_TO_FP32,
+        lambda y: y.half(),
+    ),
+    "fp32_to_dl16_pad_rows": (
+        torch.float32,
+        lambda a, b: torch.nn.functional.pad(a.half(), (0, 0, 0, 4)),
+        ElementArrangement.FP32_TO_DL16,
+        lambda y: y.float(),
+    ),
+}
+
+
+@pytest.mark.parametrize("program", list(_WHOLE_STICK_DIM_PROGRAMS))
+def test_staggered_whole_stick_dim_write(program):
+    """A write of the whole stick dim keeps the arrangement at a width not a
+    multiple of 64, when its last stagger unit is allocated whole."""
+    dtype, fn, expected_ea, restore = _WHOLE_STICK_DIM_PROGRAMS[program]
+    a = _small_int_fp16((4, 100), 7).to(dtype)
+    b = _small_int_fp16((4, 100), 5, base=10).to(dtype)
+
+    out = torch.compile(fn)(a.to(DEVICE_NAME), b.to(DEVICE_NAME))
+    assert_ea(out, expected_ea)
+
+    def round_trip(a, b):
+        return restore(fn(a, b))
+
+    restored = torch.compile(round_trip)(a.to(DEVICE_NAME), b.to(DEVICE_NAME))
+    assert_ea(restored, ElementArrangement.STANDARD)
+    assert torch.equal(restored.cpu(), round_trip(a, b))
+
+
+@pytest.mark.parametrize("conversion", list(_STAGGERING_CONVERSIONS))
+def test_cat_of_staggered_along_stick_dim_with_tail(conversion):
+    """A write at a whole-unit offset may end the stick dim in a partial unit."""
+    dtype, convert, expected_ea, restore = _STAGGERING_CONVERSIONS[conversion]
+    a = _small_int_fp16((4, 64), 7).to(dtype)
+    b = _small_int_fp16((4, 100), 5, base=10).to(dtype)
+
+    def fn(a, b):
+        return torch.cat([convert(a), convert(b)], dim=1)
+
+    out = torch.compile(fn)(a.to(DEVICE_NAME), b.to(DEVICE_NAME))
+    assert_ea(out, expected_ea)
+
+    def round_trip(a, b):
+        return restore(fn(a, b))
+
+    restored = torch.compile(round_trip)(a.to(DEVICE_NAME), b.to(DEVICE_NAME))
+    assert_ea(restored, ElementArrangement.STANDARD)
+    assert torch.equal(restored.cpu(), round_trip(a, b))
+
+
+@pytest.mark.parametrize("conversion", list(_STAGGERING_CONVERSIONS))
+def test_staggered_pad_fills_partial_last_unit(conversion):
+    """A non-zero pad fill ending in a partial stagger unit lands on its elements."""
+    dtype, convert, expected_ea, restore = _STAGGERING_CONVERSIONS[conversion]
+    a = _small_int_fp16((4, 64), 7).to(dtype)
+
+    def fn(a):
+        return torch.nn.functional.pad(convert(a), (0, 36), value=5.0)
+
+    out = torch.compile(fn)(a.to(DEVICE_NAME))
+    assert_ea(out, expected_ea)
+
+    def round_trip(a):
+        return restore(fn(a))
+
+    restored = torch.compile(round_trip)(a.to(DEVICE_NAME))
+    assert_ea(restored, ElementArrangement.STANDARD)
+    assert torch.equal(restored.cpu(), round_trip(a))
+
+
+def _index_write(a, b, idx):
+    # The value is computed before the allocation, so it is laid out by then.
+    value = a.float() * 2
+    out = torch.empty(4, 64, dtype=torch.float32, device=a.device)
+    out[idx] = value
+    return out
+
+
+_ORDERLESS_READ_PROGRAMS = {
+    # The STANDARD reads here carry no element arrangement: a fill, an index.
+    "cat_zeros": lambda a, b, idx: torch.cat(
+        [a.float(), torch.zeros(4, 64, dtype=torch.float32, device=a.device)]
+    ),
+    "cat_full": lambda a, b, idx: torch.cat(
+        [a.float(), torch.full((4, 64), 3.0, dtype=torch.float32, device=a.device)]
+    ),
+    "index_write": _index_write,
+}
+
+
+@pytest.mark.parametrize("program", list(_ORDERLESS_READ_PROGRAMS))
+def test_staggered_write_with_orderless_reads(program):
+    """A constant fill or an index read does not mix arrangements."""
+    fn = _ORDERLESS_READ_PROGRAMS[program]
+    a = _small_int_fp16((4, 64), 7)
+    b = _small_int_fp16((4, 64), 5, base=10)
+    idx = torch.tensor([2, 0, 3, 1])
+
+    out = torch.compile(fn)(a.to(DEVICE_NAME), b.to(DEVICE_NAME), idx.to(DEVICE_NAME))
+    assert_ea(out, ElementArrangement.DL16_TO_FP32)
+
+    def round_trip(a, b, idx):
+        return fn(a, b, idx).half()
+
+    restored = torch.compile(round_trip)(
+        a.to(DEVICE_NAME), b.to(DEVICE_NAME), idx.to(DEVICE_NAME)
+    )
+    assert_ea(restored, ElementArrangement.STANDARD)
+    assert torch.equal(restored.cpu(), round_trip(a, b, idx))
+
+
+@expects_raise
+def test_pad_of_staggered_with_odd_fp32_sticks_raises():
+    """A DL16_TO_FP32 stick dim of 3 fp32 sticks has no room for its last pair."""
+    a = _small_int_fp16((4, 96), 7)
+
+    def fn(a):
+        return torch.nn.functional.pad(a.float(), (0, 0, 0, 4))
+
+    with pytest.raises(InductorError, match="not whole units"):
+        torch.compile(fn)(a.to(DEVICE_NAME))
+
+
+@expects_raise
+def test_cat_of_staggered_and_standard_raises():
+    """One allocation cannot hold a staggered and a STANDARD writer."""
+    a = _small_int_fp16((4, 64), 7)
+    c = torch.ones(4, 64, dtype=torch.float32)
+
+    def fn(a, c):
+        return torch.cat([a.float(), c])
+
+    with pytest.raises(InductorError, match="mixed element arrangements"):
+        torch.compile(fn)(a.to(DEVICE_NAME), c.to(DEVICE_NAME))
+
+
+@expects_raise
+def test_pad_of_staggered_inside_stick_pair_raises():
+    """A pad that splits DL16_TO_FP32 stick pairs cannot keep the stagger."""
+    a = _small_int_fp16((4, 64), 7)
+
+    def fn(a):
+        # Width 128 leaves room for whole pairs; both fills and the copy split one.
+        return torch.nn.functional.pad(a.float(), (32, 32))
+
+    with pytest.raises(InductorError, match="not whole units"):
+        torch.compile(fn)(a.to(DEVICE_NAME))
 
 
 # Made with Bob

@@ -413,6 +413,9 @@ class TestInGraphCpuComputedBuffers(unittest.TestCase):
             return y_s * 2.0
 
         x = torch.randn(num_tokens, hidden, dtype=DTYPE)
+        # `fn`'s code object is shared across tests; without a reset Dynamo
+        # reuses the first test's compile and the allocator under test never runs.
+        torch.compiler.reset()
         compiled = torch.compile(fn, fullgraph=True, dynamic=False, backend="inductor")
         out = compiled(x.to(spyre))
         test.assertEqual(out.device.type, DEVICE)
@@ -428,14 +431,29 @@ class TestInGraphCpuComputedBuffers(unittest.TestCase):
 
     # Pin greedy: this covers the co-opt allocator over the greedy inner solver
     # (ExhaustiveSearchSolver-wrapped), the path this CPU-buffer guard was written
-    # for. The cpsat *joint* co-opt path does not yet apply the same guard, but
-    # co_optimizing_lx_planning is off by default so it is never on the default
-    # compile path; enabling cpsat co-opt is deferred to the co-opt follow-up.
-    @config.patch({"co_optimizing_lx_planning": True, "layout_solver": "greedy"})
+    # for. The cpsat *joint* co-opt path does not yet apply the same guard;
+    # enabling cpsat co-opt is deferred to the co-opt follow-up. greedy has no
+    # core-division-capable solver, so this must opt into the
+    # ExhaustiveSearchSolver fallback via allow_exhaustive_search=True.
+    @config.patch(
+        {
+            "co_optimizing_lx_planning": True,
+            "layout_solver": "greedy",
+            "allow_exhaustive_search": True,
+        }
+    )
     def test_cpu_pointwise_chain_compiles_co_optimizing(self):
         """Co-optimizing allocator: `mem_usage_by_buf` runs on the RAW graph in
         `_build_cd_bound_buffers` / `_determine_in_place_division_invariant`,
         bypassing the gate -> exercises the defensive sentinel."""
+        self._run_and_check(self)
+
+    @config.patch(
+        {"co_optimizing_lx_planning": True, "layout_solver": "simulated_annealing"}
+    )
+    def test_cpu_pointwise_chain_compiles_co_optimizing_sa(self):
+        """Co-optimizing allocator over `SaCoOptimizingSolver`, which reaches
+        the footprint accounting by a different route than the greedy case."""
         self._run_and_check(self)
 
 

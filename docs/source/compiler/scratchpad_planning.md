@@ -13,11 +13,11 @@ default. Greedy, first-fit, and best-fit are available as opt-ins;
 `layout_solver` can also be set from the `LAYOUT_SOLVER` environment
 variable.
 
-Co-optimization with work distribution is opt-in.
-`config.co_optimizing_lx_planning` (`CO_OPTIMIZING_LX_PLANNING=1`)
-defaults to off. It enlarges each op's set of candidate splits — pointwise
+Co-optimization with work distribution is on by default.
+`config.co_optimizing_lx_planning` (`CO_OPTIMIZING_LX_PLANNING=0` to opt
+out) enlarges each op's set of candidate splits (pointwise
 dim-flips, the matmuls' tilings offered to neighbours, cross-matmul split
-transfer, a shared batch-major `B/M` tiling for matmuls and reductions —
+transfer, a shared batch-major `B/M` tiling for matmuls and reductions),
 then searches the cross-product for the assignment that minimizes HBM
 traffic. Every candidate, including work division's seed, must satisfy hard
 work-division constraints; generated alternatives also pass stick validation.
@@ -139,15 +139,16 @@ after work division has stamped per-op core splits:
 deadcode_elimination
 propagate_named_dims                  # named-dimension metadata (pre-stickification)
 assign_dim_hints
-_maybe_coarse_tile_hints              # hint-driven coarse tiling, when hints produce groups
 insert_bmm_padding                    # pad matmul y's K (pre-stickification)
 split_multi_ops
 propagate_spyre_tensor_layouts        # assign FixedTiledLayout
 validate_ops
 optimize_restickify_locations
+reorder_nonstick_dims                 # reorder matmul non-stick dims for work division
 finalize_layouts
 insert_restickify
 enforce_indirect_access_layout
+reorder_nonstick_dims_mutation        # execute deferred reorders after insert_restickify
 insert_post_mutation_restickify
 insert_restickify_padding
 dedup_and_promote_constants
@@ -271,10 +272,10 @@ The relevant code lives under `torch_spyre/_inductor/scratchpad/`:
 | `greedy_solver.py` | `GreedyLayoutSolver` |
 | `firstfit_bestfit_solver.py` | `FirstFitLayoutSolver`, `BestFitLayoutSolver` |
 | `ilp_solver_ortools.py` | `CpSatLayoutSolver` (OR-Tools CP-SAT) |
+| `cpsat_expr_printer.py` | `cost_expr_to_cpsat`, lowering the sympy cost expression into the CP-SAT objective |
 | `simulated_annealing.py` | `SimulatedAnnealingLayoutSolver` |
 | `cooling_schedules.py` | cooling schedules for the annealing search |
-| `permutation_layout.py` | `PermutationBasedLayoutSolver` |
-| `contact_profile.py` | `Profile`, buffer-contact profiling |
+| `torch_spyre/csrc/perm_layout_native.cpp` | `NativePermutationLayoutSolver`, the C++ permutation packer |
 | `graph_editor.py` | `GraphEditor`, the clone/rewrite helper used by input- and output-boundary cloning |
 | `allocator.py` | `ScratchpadAllocator`, `CoOptimizingAllocator`, and the single LX-eligibility predicate (`_residency_reasons`, one reason per buffer) |
 | `utils.py` | liveness, mem usage, op-name/eligibility helpers |
@@ -292,7 +293,7 @@ scratchpad_planning(graph, allocator=ScratchpadAllocator())
    HBM input that is read more than once *and* fits on LX. The clone output
    becomes a fresh LX-eligible buffer.
 2. **Buffer analysis.** `_generate_buffers` produces one
-   `LifetimeBoundBuffer` per buffer — *including* the ones that may not
+   `LifetimeBoundBuffer` per buffer, *including* the ones that may not
    reside. Nothing is filtered out; `ScratchpadAllocator._residency_reasons`
    (in `allocator.py`) decides eligibility and the verdict rides along as
    `residency_reason` (see
@@ -309,10 +310,40 @@ scratchpad_planning(graph, allocator=ScratchpadAllocator())
    `change_graph_output` to promote a producer to LX and clone the value
    back to a graph output.
 
+### Matmul output staging before a collective
+
+After the solver commits LX buffers and relayout copies, the co-optimizing
+allocator can stage a fresh matmul output in a gap that is free for the whole
+graph. Its sole reader must be a bare all-reduce. The allocator inserts an HBM
+clone after the matmul and makes the collective read and mutate that clone.
+This changes the matmul's output placement; it does not remove the HBM copy
+required by the collective.
+
+Staging uses only space left after other allocations. It cannot displace a
+chosen relayout copy. Enabling another relayout can remove a free gap and change
+which outputs are staged. This is a performance dependency, not a reason to
+relax either path's safety checks.
+
+Staging is a named post-solve exception to ordinary buffer residency. It requires
+one fresh, untiled matmul output, one bare all-reduce reader, private single-writer
+storage, complete reads and an accepted ownership view. Other opaque users,
+aliases, unsupported back gaps and K-split writers are refused. The selected
+collective uses the HBM clone. It does not read LX directly.
+
+`test_real_gap_solver_keeps_stages_disjoint_or_declines` checks full placed spans,
+including reduction splits and relayout copies. The captured-graph test
+`test_stage_push_rewrites_a_captured_matmul_collective` checks the clone and rewire.
+
+Set `SPYRE_LX_COLLECTIVE_OUTPUT_STAGING=0` to disable staging independently of
+ownership certificates. The switch clears staging state before placement and
+leaves solver allocations and ordinary output clones unchanged. Its value is
+part of the compile cache key. `test_staging_switch_declines_before_placement`
+checks this boundary.
+
 ### Declarative exclusion
 
-Eligibility is decided in exactly one place — `ScratchpadAllocator._residency_reasons`
-in `allocator.py` — and carried
+The ordinary pre-solve verdict is computed in `ScratchpadAllocator._residency_reasons`
+in `allocator.py`, and carried
 to the solver as a single field, `LifetimeBoundBuffer.residency_reason`:
 `None` means the buffer may be pinned, any string is the reason it may not.
 
@@ -326,33 +357,131 @@ simulated annealing, CP-SAT) routes its exclusions through it.
 
 **Where a check belongs.** Precomputable from the graph ⇒ it lives in
 `_residency_reasons` as a reason string. Depends on the solver's free variables ⇒
-it stays a constraint in the solver — today that is only CP-SAT's per-edge
+it stays a constraint in the solver: today that is only CP-SAT's per-edge
 slicing match over the division variables and its in-place merge gate.
 Capacity is the exception that belongs to neither allocator: it is solver
 state, so it lives on `MemoryPlanSolver.excluded` alongside the tag.
 
 The checks, in evaluation order (the first failure is the reason reported):
 
-| Reason | Why |
-|---|---|
-| `op not allowed` | not a `ComputedBuffer`, a mutation layout, or an op name inside `OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE` (the debug flag `config.allow_all_ops_in_lx_planning` bypasses the op-name gate) |
-| `unsized (no device layout)` | no computable footprint (e.g. a `MultiOutputLayout` tuple op) |
-| `empty tensor` | A zero-sized tensor needs no LX reservation |
-| `mutation target` | filled by offset writes, so one LX base mis-addresses it |
-| `tiled (advancing)` | LX addresses cannot be `affine.apply` symbols; the advancing-tile check reads `loop_info` (the sole source of truth for per-tile geometry) |
-| `read by restickify (cross-frame barrier)` | the read and write frames are transposes, so a per-core LX slice is not self-sufficient (the buffer a restickify reads; its own output is safe and is not barred) |
-| `read by restickify (local-read proof failed)` | Relayout is enabled, but exact physical ownership could not prove that every restickify read stays on the same core |
-| `extern kernel user` | extern ops read from HBM |
-| `index tensor or indirectly accessed` | index tensors and the value tensors they index into are read via data-dependent addressing, so they must stay in HBM |
-| `graph output (no clone)` / `graph input (no clone)` | without boundary cloning there is nothing to redirect |
-| `graph output is a ReinterpretView` | output cloning cannot rewrap the view |
-| `partial/offset read` | a sliced or multi-offset read mis-addresses a single LX base |
-| `core div mismatch: …` | the buffer's users disagree on core slicing (**placement path only** — the joint solver *chooses* the division, so its slicing gate decides instead) |
-| `no consumer reads it from LX` | residency would save nothing |
-| `lx back gap` | `backGap` is supported for HBM but not LX |
+<!-- BEGIN GENERATED BUFFER RESIDENCY RULES -->
+| Rule / reason label | Why | Requires | Exceptions / certificate | Covering tests |
+|---|---|---|---|---|
+| `op not allowed` | Only supported computed outputs can be placed. Mutation layouts use external storage; the debug flag only bypasses the operation-name denylist. | supported producer | None | `TestLoopCarryLxEligibility`; `test_buffer_residency_adapter_rejection_strings` |
+| `unsized (no device layout)` | Without a device layout, the allocator cannot measure the LX footprint. | computable footprint | None | `TestEmptyLxEligibility`; `test_buffer_residency_adapter_rejection_strings` |
+| `empty tensor` | A zero-sized tensor needs no LX reservation. | nonempty output | None | `TestEmptyLxEligibility` |
+| `mutation target` | Offset writes cannot use one fixed LX base. A counted-loop carry is accepted only when the solver also chooses its update division. | no mutation target | Counted-loop carry: `_is_loop_carry_storage` (joint division choice) | `TestLoopCarryLxEligibility` |
+| `tiled (advancing)` | LX addresses cannot use affine.apply symbols. The write or read advances per tile; loop_info supplies the tile geometry. | fixed LX address | None | `TestLoopCarryLxEligibility`; `test_buffer_residency_adapter_rejection_strings` |
+| `read by restickify` | A transposed or uncertified local read may cross cores. The joint solver checks each candidate division, so the committed-division barrier can reject a valid candidate (#4655). | fixed divisions agree or exact local-read proof | None | `test_buffer_residency_adapter_rejection_strings` |
+| `extern kernel user or live across extern kernel` | Extern kernels read HBM. PR #3683 added this guard; enable_lx_context_switching uses LxContextSwitchingPass to dump and restore LX around the call. | extern boundary protected | None | `test_buffer_residency_adapter_rejection_strings` |
+| `live across multi-output extern kernel` | Multi-output extern calls need HBM under either flag setting. LxContextSwitchingPass does not bracket them; the earlier extern guard handles the disabled case. | multi-output boundary protected | None | `test_buffer_residency_adapter_rejection_strings` |
+| `index tensor or indirectly accessed` | Data-dependent indices and the values they address resolve through HBM. | direct addressing | None | `test_buffer_residency_adapter_rejection_strings` |
+| `graph output is a ReinterpretView` | A boundary output clone cannot rewrap a ReinterpretView. | rewritable output clone | None | `test_buffer_residency_adapter_rejection_strings` |
+| `graph output mutated after production` | An output clone placed after its producer would copy a stale value before a later mutation. Only a validated drain plan moves that clone after the counted loop. | output clone sees final value | Validated output drain: `validated_drain_plans` (clone follows counted loop) | `TestLoopCarryLxEligibility` |
+| `partial/offset read` | Sliced or multi-offset LX reads can address the wrong data. A certified zero-offset prefix needs a served full-backing gather. | complete read | Zero-offset linear prefix: `prefix_lx_gather_source` (one reader and one writer, full-backing served copy, physical stride preserved, unsplit K, disjoint LX spans); Contained local read: `local_lx_subrange_source` (rollout enabled, compact materializer or certified cache scatter, storage and lifetime permission, exact local byte coverage) | `test_buffer_residency_adapter_rejection_strings`; `test_prefix_lx_contraction_requires_exact_backing_stride`; `test_prefix_linear_reads_a_separate_full_backing_lx_gather`; `test_prefix_linear_without_served_copy_spills_the_source`; `test_prefix_linear_scheduler_demotion_retains_valid_hbm_clone`; `test_prefix_lx_contraction_requires_exact_backing_stride[second_reader]`; `test_registry_exception_keeps_later_guards` |
+| `core div mismatch: ...` | Fixed divisions must agree across users. The joint solver chooses compatible divisions instead of rejecting a provisional mismatch. | compatible fixed division | None | `test_buffer_residency_adapter_rejection_strings` |
+| `graph output (no clone); no consumer reads it from LX` | Without a boundary clone, a graph output must land in HBM. Residency also saves no reads when the producer has no LX consumer. | untiled reuse or boundary clone | None | `TestLoopCarryLxEligibility`; `test_buffer_residency_adapter_rejection_strings` |
+| `lx back gap` | A generic LX back gap can misaddress a read. The prefix exception needs a full-backing copy, an unsplit-K reader and a uniform per-core gap. | no unsupported LX gap | Zero-offset linear prefix: `prefix_lx_gather_source` (one reader and one writer, full-backing served copy, physical stride preserved, unsplit K, disjoint LX spans) | `test_prefix_linear_reads_a_separate_full_backing_lx_gather`; `test_buffer_residency_adapter_rejection_strings`; `test_prefix_lx_contraction_requires_exact_backing_stride`; `test_prefix_linear_without_served_copy_spills_the_source`; `test_prefix_linear_scheduler_demotion_retains_valid_hbm_clone`; `test_prefix_lx_contraction_requires_exact_backing_stride[second_reader]` |
+<!-- END GENERATED BUFFER RESIDENCY RULES -->
+
+This table comes from `BUFFER_RESIDENCY_RULES` in
+`scratchpad/residency_rules.py`. Run `python tools/lx_planning/generate_residency_rules.py`
+to update it. The allocator evaluates these rules in this order. An exception
+clears only its own rule. Storage, lifetime, capacity and later rules still apply.
+Reason labels group related diagnostics. A returned reason can include more
+detail, such as the restickify proof failure or the mismatched core division.
+The adapter tests check the returned strings; the table does not replace them.
+
+Graph inputs use `_input_residency_reason`. They also require boundary cloning,
+rewritable uses, complete reads and useful LX reuse.
+
+A narrow exception permits an untiled matmul to read a zero-offset prefix made
+of complete storage sticks. It requires one private, full-width producer and a
+separate gather of its **complete backing buffer**, with the original physical
+row stride preserved. The reader must not split K. Source and copy spans must
+be disjoint, and both must fit in frontend LX. Only the outermost stick axis
+may have an unused tail. Other offset, strided, partial, aliased or multi-reader
+cases remain excluded. The fixed placement path must already have a copy plan;
+the joint solver must guarantee the copy through its relayout decision.
+
+This untiled exception does not require same-tile-group relayout search.
 
 That last distinction is the only difference between the two allocators,
 and it is a parameter (`division_is_fixed`) rather than a second predicate.
+
+With `auto_coarse_tiling` on, the joint path does not bar an op whose menu
+offers a tiling for `graph output (no clone)` or `no consumer reads it from
+LX`: both hold only while the op is untiled. The buffer carries the reason as
+`untiled_bar` instead, and the CP-SAT solve keeps it out of LX unless it tiles
+the op.
+
+### Prefix demotion contract
+
+If preparation rejects a prefix gather, scheduling retries after clearing the
+source and copy LX allocations, their physical LX views and their relayout
+registry entry. The ordinary HBM clone remains. It has one writer and keeps the
+full physical extent and stride. Its consumers keep valid reads from that clone.
+Preparation discards the rejected kernels and builds kernels for the HBM path.
+Unrelated LX allocations stay unchanged.
+
+This is an amendment to D6-2 in the merge plan. It does not remove the clone or
+restore the original graph topology. It is not plan-exact rollback. The focused
+test checks finite and NaN unused tails against the existing exact reference.
+A bitwise HBM-placement comparison requires a matched same-division control;
+this test does not force an allocator result to create one.
+
+### Certified exception contracts
+
+The generated table names each exception, its certificate, its required
+conditions and its tests. Add later ownership exceptions to the registry.
+An ownership proof does not replace storage, lifetime or capacity checks.
+The untiled prefix case does not require same-tile-group search.
+
+The planner and final emitter share the `local_lx_subrange_geometry` gate.
+Work division receives immutable facts through `local_lx_read_geometry`.
+At emission, `local_lx_emission_contract` repeats the gate on the live graph.
+Keep these paths on the same gate. A geometry certificate does not replace
+storage, alias, lifetime or allocation checks.
+
+The symbolic proof registry below is separate from storage permission. It
+selects the existing containment proofs in order. The view-recovery caller
+keeps its floor-only, single-driven-axis restriction. An emitted-access proof
+alone does not authorize a recovery candidate.
+`factor_slice_axis` is listed as "Factored ownership" in the transfer-certificate
+table below. It is separate from `SLICE_OWNERSHIP_PROOFS`.
+
+<!-- BEGIN GENERATED OWNERSHIP PROOFS -->
+| Ownership proof | Certificate | Requires | Covering tests |
+|---|---|---|---|
+| Affine rectangle containment; emitted access | `project_affine_slice_axis` | one contained loop partition, complete read rectangle, unchanged physical coordinates | `test_q_rope_ownership_keeps_the_whole_pair_in_its_slice`; `test_q_projection_rope_handoff_preserves_pairs_and_other_consumer`; `test_ownership_callers_keep_their_admission_policy` |
+| Floor-affine rectangle containment; floor-only recovery | `project_floor_affine_slice_axis` | one ascending affine floor, complete physical read rectangle, unchanged coordinates and caller admission | `test_floor_slice_projection_rejects_unproven_access`; `test_attention_output_repack_handoff`; `test_ownership_callers_keep_their_admission_policy` |
+<!-- END GENERATED OWNERSHIP PROOFS -->
+
+The following rows describe transfer checks and shortlist selection. They do
+not change admission order or authorize storage reuse. A reserved shortlist
+slot is a search heuristic, not an ownership proof or a performance guarantee.
+
+<!-- BEGIN GENERATED TRANSFER CERTIFICATES -->
+| Certificate | Function | Requires | Predicate tests | Integration tests |
+|---|---|---|---|---|
+| Full-replica gather | `torch_spyre._inductor.scratchpad.lx_relayout._movement_supported` | ownership flag ON; complete source partition; one destination slice; uniform fan-in/out; all source fragments; shuffle fan-in budget | `test_work_division_hint.py::test_full_replica_movement_tracks_ownership_flag`; `test_work_division_hint.py::test_movement_rule_reads_the_owner_maps` | `test_solver_relayout_e2e.py::test_attention_cache_transpose_handoff` |
+| Full-replica shortlist reservation | `torch_spyre._inductor.scratchpad.allocator.CoOptimizingAllocator._cap_relayout_groups` | ownership flag ON; cheapest priced full replica; an existing unpinned slot; sibling pins, prices and cap preserved; solver may decline the copy | `test_solver_relayout_decision.py::test_relayout_full_replica_preserves_sibling_pins` | `test_solver_relayout_e2e.py::test_attention_cache_transpose_handoff` |
+| Updated-input cache snapshot | `torch_spyre._inductor.scratchpad.lx_relayout._is_activation_source` | earlier direct cache mutation; immutable restickified snapshot; original cache load and dependencies preserved | `test_work_division_hint.py::test_lx_relayout_activation_policy_is_source_wide` | `test_solver_relayout_e2e.py::test_attention_cache_transpose_handoff` |
+| Fewer-core complete partitions | `torch_spyre._inductor.scratchpad.lx_relayout.core_domain_rejection` | integral core ratio; complete disjoint partitions; larger domain uses every compute core; physical spans stay separate | `test_solver_relayout_candidates.py::test_consumer_rules_are_shared_with_the_committed_collector` | `test_solver_relayout_e2e.py::test_k_projection_rope_complete_contraction` |
+| Persistent external cache scatter | `torch_spyre._inductor.scratchpad.lx_relayout._persistent_scatter_consumer` | fresh immutable matmul source; one external indirect overwrite; no source alias or cache read; mutation order and lifetime preserved | `test_solver_relayout_candidates.py::test_persistent_scatter_requires_independent_immutable_source` | `test_solver_relayout_e2e.py::test_v_projection_cache_handoff_preserves_persistent_alias` |
+| Contained local LX read | `torch_spyre._inductor.scratchpad.lx_relayout.local_lx_emission_contract` | ownership flag ON; shared graph and compact-read geometry gate; same-core byte certificate; fresh final access; disjoint live allocations | `test_lx_read_contracts.py::test_stale_or_unsafe_final_facts_are_rejected`; `test_work_division_hint.py::test_local_read_rollout_declines_before_graph_access` | `test_solver_relayout_e2e.py::test_gate_up_full_parent_repartition` |
+| Full-parent copy for local subranges | `torch_spyre._inductor.scratchpad.lx_relayout.materialize_lx_relayouts` | complete parent copied once per destination group; every partial reader re-certified against the destination view; positive disjoint LX spans | `test_subrange_transfer.py::test_gate_up_siblings_have_distinct_copy_identity`; `test_solver_relayout_decision.py::test_copy_is_sized_by_the_destination_span_not_the_source_share` | `test_solver_relayout_e2e.py::test_gate_up_full_parent_repartition` |
+| Pointwise persistent-scatter materializer | `torch_spyre._inductor.scratchpad.lx_relayout._pointwise_scatter_materializer` | ownership flag ON; one certified compact parent subrange; complete scatter read; persistent-scatter storage, alias and ordering checks | `test_solver_relayout_candidates.py::test_pointwise_scatter_materializer_admission` | None |
+| Direct cache-snapshot subrange read | `torch_spyre._inductor.scratchpad.lx_relayout._local_lx_scatter_geometry` | single-writer complete immutable snapshot; one direct partial read; other reads are scatter indices; standard 128-byte sticks; zero inner origin and exact rectangle size; external mutation target and final same-core ownership checks preserved | `test_solver_relayout_candidates.py::test_direct_cache_snapshot_scatter_geometry` | None |
+| Factored ownership | `torch_spyre._inductor.slice_ownership.factor_slice_axis` | exact zero-origin dense product; independent digits; complete rectangular slices; no address rewrite or storage permission | `test_work_division_hint.py::test_factored_slice_rejects_inexact_products` | `test_solver_relayout_e2e.py::test_k_projection_rope_complete_contraction` |
+<!-- END GENERATED TRANSFER CERTIFICATES -->
+
+`SPYRE_LX_EXTENDED_OWNERSHIP=0` disables the additional ownership proofs while
+retaining the earlier prefix-copy rules. Its default is ON. The flag does not
+disable storage, alias, lifetime or capacity validation. Compare successive
+revisions with this flag OFF in both; do not compare a later OFF result with
+the preceding revision's ON result. Default ON is intentional: the contained
+multi-loop affine path is enabled when this change lands.
 
 ### Per-core size and core-division mismatch
 
@@ -363,17 +492,17 @@ each buffer and is the gate for whether a buffer is even eligible.
 
 - **Sizing is writer-authoritative.** The op that *writes* a buffer
   determines how the data is physically spread across cores, so the
-  divisor is the writer's core count — not the maximum over all users. A
+  divisor is the writer's core count, not the maximum over all users. A
   reader on more cores only touches its own (smaller) slice of that
   residency. (Earlier code used `max()` over users, which under-sized a
-  buffer whose writer ran on fewer cores than a consumer — e.g. a 1-core
-  producer feeding a 32-core matmul — and wrongly pinned an over-large
+  buffer whose writer ran on fewer cores than a consumer (e.g. a 1-core
+  producer feeding a 32-core matmul) and wrongly pinned an over-large
   buffer to a single core's LX.) Graph inputs have no in-graph writer and
   fall back to the readers' (matching) count.
 - **Mismatch detection compares per-core views.** Two ops agree on a
   buffer only if their `PerCoreView` (`_per_core_view_on_buf` in
-  `pass_utils.py`) — which device dim each core's slice occupies, and the
-  core→slice mapping — matches. A genuine single-core "owns the whole
+  `pass_utils.py`), which device dim each core's slice occupies, and the
+  core→slice mapping, matches. A genuine single-core "owns the whole
   buffer" access is encoded distinctly from a multi-core broadcast that
   also touches the whole buffer, so the two never compare equal by
   accident. A writer/reader core-count disagreement, a partial-sum
@@ -445,21 +574,55 @@ Once a deeptools dependency clears, first-fit is the expected default.
 ### CpSatLayoutSolver
 
 `config.layout_solver = "cpsat"` selects an OR-Tools CP-SAT solver that
-models placement as a global 2D no-overlap — each resident buffer is an
-optional `[lifetime] × [address, address + size)` rectangle — and
-minimizes total HBM transfer traffic, so a buffer that would be re-read by
-*N* consumers costs `N × size` when spilled. In-place reuse is encoded by
-shortening a parent's lifetime by the single handoff tick, letting the
-in-place child legally share its slot.
+models placement as a global 2D no-overlap (each resident buffer is an
+optional `[lifetime] × [address, address + size)` rectangle). In-place
+reuse is encoded by shortening a parent's lifetime by the single handoff
+tick, letting the in-place child legally share its slot.
 
 It requires the optional `ortools` package
 (`pip install torch-spyre[cpsat]`); when it is missing, the allocator logs
 a warning and falls back to the greedy solver, so a `"cpsat"` request
-always degrades to a correct plan. Without co-optimization the CP-SAT
-solver only *places* buffers on each op's pre-determined core division;
-with `co_optimizing_lx_planning` it is driven by the joint
-`CoOptimizingAllocator` (below), which additionally chooses each op's core
-division.
+without co-optimization always degrades to a correct plan. Without
+co-optimization the CP-SAT solver only *places* buffers on each op's
+pre-determined core division; with `co_optimizing_lx_planning` it is driven
+by the joint `CoOptimizingAllocator` (below), which additionally chooses
+each op's core division -- see [The co-optimizer](co_optimizer.md) for what
+happens to that fallback when `ortools` is missing *and* co-optimization is
+requested.
+
+Those two modes minimize two different objectives:
+
+- **Placement-only** (no `co_optimizing_lx_planning`): a lexicographic
+  ladder in `_run`, each level pinning the previous level's optimum as a
+  constraint before optimizing the next -- (1) minimize total HBM transfer
+  traffic, (2) fewest coarse-tiling loop-group cuts, (3) maximize total
+  core usage, (4) prefer a balanced division (minimize the summed squared
+  split factors), (5) minimize the summed tile count. The traffic term is
+  *differential*: a resident buffer contributes 0, and a spill is charged
+  what it adds over residency -- `(consumers + 1) × size` for an
+  intermediate (one re-read each, plus the producer write residency would
+  have kept on-chip), `consumers × size` for a graph output, and
+  `(consumers - 1) × size` for a graph input, which pays a clone-in read
+  either way. With no candidate divisions or tilings to choose, levels
+  2--5 have nothing left to decide and the solve reduces to that traffic
+  term.
+- **Co-optimizing** (`co_optimizing_lx_planning`, the default): the
+  objective is instead the symbolic `cost_expr` the allocator builds from
+  the analytical cost model -- predicted runtime, not traffic alone, so
+  the matmul roofline term can pay for a spill.
+  `_minimize_cost_expr` (`scratchpad/ilp_solver_ortools.py`) maps each
+  sympy symbol onto the matching CP-SAT decision variable and lowers the
+  whole expression into the constraint model via `cost_expr_to_cpsat`
+  (`_SympyExprToCpSat` in
+  `scratchpad/cpsat_expr_printer.py`), so CP-SAT searches it symbolically
+  rather than evaluating it per candidate. When there is no usable
+  expression -- symbolic shapes, a serialized capture, `auto_coarse_tiling`
+  on (the allocator withholds it, the model being flat in tile size), or
+  the lowering raising -- the solve falls back to the ladder above, which
+  knows no relayout price and therefore pins every relayout copy out. See
+  [The co-optimizer](co_optimizer.md#cost-model) for how both production
+  solvers consume the same expression, and
+  [Analytical Cost Model](cost_model.md) for the pricing itself.
 
 ### SimulatedAnnealingLayoutSolver
 
@@ -475,7 +638,7 @@ algorithm and the tunable schedule parameters.
 
 Note this is placement-only. With `co_optimizing_lx_planning` the same config
 value instead selects `SaCoOptimizingSolver`, a *different* class that anneals
-the core divisions and the placement jointly — see
+the core divisions and the placement jointly. See
 [Joint core-division + LX placement](sa_co_optimization.md).
 
 ## Co-optimization with work-distribution
@@ -484,117 +647,22 @@ Work division optimizes each op independently for parallelism. Adjacent
 ops sharing a buffer can get different splits (different shapes mean
 different optimal decompositions), which triggers `core_div_mismatch`
 and disqualifies the shared buffer from LX even when it would have fit.
-
-`CoOptimizingAllocator` (gated by
-`config.co_optimizing_lx_planning`, env var `CO_OPTIMIZING_LX_PLANNING=1`)
-treats split choices and LX placement jointly:
-
-:::{figure} ../_static/images/lx/co-optimization.svg
-:alt: Co-optimization searches over alternative split assignments, scoring each by HBM bytes left unpinned
-:width: 700px
-:align: center
-
-The co-optimizer enumerates split variants per op, scores each
-combination by counting HBM bytes the solver could not pin, and commits
-the winning assignment back before the standard allocator flow.
-:::
-
-Each op's candidate list is built by `_enum_split_options`, dispatching
-on op type. Generated alternatives are deduped by canonical key and filtered
-through `_split_fits_sticks`, which rejects factors that overflow a stickified
-dim's stick count (those would abort the SuperDSC bundler) or that land on a
-collapsed/broadcast dim. The upstream seed is already stick-valid from work
-division. Every candidate, including the seed, must satisfy hard
-work-division constraints: blocked axes remain unsplit and split domains
-restrict legal factors. Candidate divisions remain symbol-keyed in their
-producing operation's iteration space. Fixed candidates and the solver's
-selected candidate are revalidated from that symbol-keyed map before commit;
-LX planning never decodes candidates through the legacy coefficient-keyed
-Scheduler transport. Cross-operation compatibility is derived from physical
-`PerCoreView` ownership rather than comparing those local symbols, so an LX
-candidate remains faithful through selection and commit even when adjacent
-operations use different iteration-symbol names.
-
-**Pointwise ops** get their seed, dim-flip variants (move the seed's
-single output-dim factor onto each compatible alternative output dim,
-bounded by `DEFAULT_VARIANT_CAP = 6`), and the matmul tilings from the
-shared pool (below). Adopting a neighbouring matmul's tiling makes the
-op's per-core view match the matmul's, so the shared buffer pins to LX
-*and* the op runs at the matmul's high-utilization shape.
-
-**Matmul splits are not overridden onto a single dim — but neighbours'
-tilings and a batch-major split are offered.** Concentrating a balanced
-`M/4×N/8` split onto one dim (`M/32`) pins the matmul output and the
-surrounding chain to LX but is a poor matmul shape: on `mlp-linear-kn.t`
-(SENCORES=32) it regressed kernel time ~2.5× as process-engine
-utilization fell from 66% to 33%. So the rule remains **prioritize compute
-utilization for compute-bound ops** — the seed split is never flipped onto
-one dim. Instead, `_check_and_add_matmul_option` offers each matmul its
-seed plus (a) every *other* matmul's split transferred into this op's
-coordinates by axis role (so two matmuls whose work-division splits
-disagree can find a consistent assignment), and (b) a factored batch-major
-`B/M` split. All of these are full-core splits, so compute utilization is
-preserved.
-
-**Batch-major `B/M` tiling reconciles attention.** Two attention matmuls
-(`Q·Kᵀ` and `scores·V`) contract different axes, so neither can adopt the
-other's `N`/`K` tiling — but both keep the batch (`B`) and `M` output
-axes. `_factored_bm_splits` emits a single full-core `B/b · M/m` split
-(largest batch factor that fits, from `(8, 4, 2)` with `m = ncores / b`),
-valid for both matmuls and divisible into both stick-count extents. This
-shared tiling is also offered to the **softmax reductions** (`max`/`sum`)
-in their own output coordinates via `_reduction_bm_axes` — reductions are
-otherwise left on their seed, but offering them the `B/M` split lets the
-whole softmax chain between the two matmuls reconcile to one tiling. On
-`mha_4h` (SENCORES=32) this converges both matmuls and the entire
-softmax chain on `B/4·M/8`, pinning the scores matrix and the chain to LX.
-Reductions are not given dim-flip variants (their reduced axis is fixed),
-and any candidate that fails to reconcile a shared buffer's per-core view
-self-eliminates during scoring.
-
-The shared matmul-tiling pool is collected once by
-`_find_distinct_matmul_splits`: each distinct matmul seed split plus each
-matmul's factored `B/M` split, deduped. This pool seeds both the pointwise
-candidate lists and the cross-matmul transfer.
-
-On `mlp-linear-kn.t` (SENCORES=32) the pointwise-seeding path lifted
-process-engine utilization from ~66% to ~79% and cut fused kernel time by
-~17% (about 2× faster than the sendnn reference).
-
-The leaf-scoring function is intentionally cheap and solver-agnostic. It
-runs the full `_generate_buffers + plan_layout` pass on the candidate
-splits and counts the HBM bytes of every buffer the solver could not pin.
-Repeated `_per_core_view_on_buf` work is memoized across leaves, and the
-split-invariant liveness / filtered-op-view / mem-usage computations are
-hoisted out of the per-leaf path.
-
-### Joint CP-SAT co-optimization
-
-Setting `layout_solver = "cpsat"` together with
-`co_optimizing_lx_planning` routes co-optimization through
-`CoOptimizingAllocator` instead of the search above. Rather than
-enumerating split variants and scoring leaves, it hands every op's
-candidate core divisions (from `enumerate_work_division_candidates`) and
-the producer/consumer slicing-match constraints to the CP-SAT solver,
-which chooses the core divisions and LX placements jointly in one
-constraint model. It falls back to the greedy allocator when `ortools`
-is unavailable.
-
-### Joint SA co-optimization
-
-Setting `layout_solver = "simulated_annealing"` together with
-`co_optimizing_lx_planning` routes through the same `CoOptimizingAllocator`,
-driven by `SaCoOptimizingSolver`, which anneals the division vector and the
-layout permutation as one joint state and scores it with the cost model. See
-[Joint core-division + LX placement](sa_co_optimization.md).
+`CoOptimizingAllocator` (the default; gated by
+`config.co_optimizing_lx_planning`, env var `CO_OPTIMIZING_LX_PLANNING`)
+treats split choices and LX placement jointly instead of leaving this
+interaction to two independent passes. See [The co-optimizer](co_optimizer.md)
+for why this joint search exists, how its production solvers (CP-SAT and
+simulated annealing), the pruned exhaustive-search fallback, and (for CP-SAT)
+solver-driven coarse tiling each work, and which decisions -- scratchpad
+placement, work division, and coarse tiling -- it covers today.
 
 ## LX context switching
 
 LX data corruption (clobbering) can happen when two conditions hold together: (1) two
 *separate* `torch.compile`s each plan their own LX addresses independently, with no shared view
-of what the other has pinned; and (2) one runs nested inside the other — a `FallbackKernel`'s
+of what the other has pinned; and (2) one runs nested inside the other, a `FallbackKernel`'s
 eager body launching a second, separately-compiled Spyre program (via a nested `torch.compile`,
-or any eager op compiled standalone through `ops/eager.py`) — while the outer graph still needs
+or any eager op compiled standalone through `ops/eager.py`), while the outer graph still needs
 a buffer it already has LX-resident. The inner compile has no knowledge of that buffer and may
 reuse its address for its own scratch:
 
@@ -603,7 +671,7 @@ op0 (write r -> LX)  ...  FallbackKernel (opaque)  ...  op1 (read r <- LX)
 ```
 
 An earlier fix (PR3683) closed this by refusing LX residency outright to any buffer live
-across such a call (`_extern_kernel_in_live_range` in `allocator.py`) — correct, but every
+across such a call (`_extern_kernel_in_live_range` in `allocator.py`), correct, but every
 access to that buffer then pays a full HBM round trip, not just the one crossing: cost scales
 as `(1 + read_count)·size/BW`, growing with reuse.
 
@@ -621,7 +689,7 @@ Not every `FallbackKernel` needs bracketing. A cheap classification skips it ent
 op is a confirmed CPU-only fallback (`ops/fallbacks.py`'s shared, once-verified `_fallback`
 body) or explicitly opted out via `mark_lx_safe(op)` for an op whose author has confirmed that
 no intermediate buffers will ever write into LX. Otherwise, the buffer-lifetime check above
-is the load-bearing gate — classifying op behavior by namespace or registry proved unreliable
+is the load-bearing gate. Classifying op behavior by namespace or registry proved unreliable
 in general, since `ops/eager.py` compiles plenty of aten ops (`mm`, `add`, `softmax`,
 `embedding`, …) standalone, and any of them can appear as the risky call.
 
@@ -631,8 +699,8 @@ Measured on an 8-layer, 512×512 fp16 repro (`read_count = 1` per bracketed buff
 | Configuration | Correctness | `kernel_ms` | HBM crossings for `r` |
 |---|---|---|---|
 | No fix | ❌ (`diff > 0`) | 0.313 | 0 (fully LX, but corrupted) |
-| Context switching (default) | ✅ | 0.386–0.388 | 2 — fixed dump + restore |
-| PR3683 guard alone | ✅ | 0.395–0.396 | 2 — this buffer's own write + read, both via HBM |
+| Context switching (default) | ✅ | 0.386 to 0.388 | 2: fixed dump + restore |
+| PR3683 guard alone | ✅ | 0.395 to 0.396 | 2: this buffer's own write + read, both via HBM |
 
 These costs are equal in bytes moved at `read_count = 1`, yet the guard still measures
 consistently slower: HBM reads/writes actually happen in small chunks, so an op processing data
@@ -684,8 +752,9 @@ utilization). Remaining gaps:
 - **No performance model.** The "honor compute-bound ops, search the
   rest" rule is still a heuristic; the trade between compute throughput
   and memory traffic is not scored.
-- **No coarse-tiling integration** when that pass also drives split
-  decisions.
+- **Coarse-tiling integration**: landed for CP-SAT (`#4768`) and simulated annealing
+  (`#4456`-`#4894`) — see [The co-optimizer](co_optimizer.md#b-lx-placement-work-division-and-coarse-tiling)
+  for current status.
 
 The factored-`B/M` and cross-matmul transfer code is marked TEMP/TODO:
 the intent is for work division to assign consistent splits directly, at
@@ -747,8 +816,10 @@ and softmax reductions. Planned extensions:
 - **Remove the compensating options** once work division assigns
   consistent splits directly (the factored-`B/M` and cross-matmul
   transfer code is marked TEMP/TODO for exactly this).
-- **Joint operation with the `coarse_tiling` pass** when that pass also
-  drives split decisions.
+- **Joint operation with the `coarse_tiling` pass**: landed for CP-SAT (`#4768`) and simulated
+  annealing (`#4456`-`#4894`) — see
+  [The co-optimizer](co_optimizer.md#b-lx-placement-work-division-and-coarse-tiling) for
+  current status.
 
 ### Solver-driven graph mutations
 
@@ -816,3 +887,83 @@ bugs that the hand-written cases miss.
 - [`hbm_pool_planning.md`](hbm_pool_planning.md) describes the
   complementary device-memory pass, which packs every intermediate that
   LX planning did not claim into a shared HBM segment.
+
+### Physical geometry and feature extraction
+
+`core_mapping.py` owns immutable `PerCoreView` values and physical owner
+interpretation. Symbolic projections stay in `slice_ownership.py`. A caller
+passes its rollout choice explicitly. Geometry cannot grant storage permission.
+The old `pass_utils.PerCoreView` name remains an import alias.
+
+The dense subrange certificate records physical domains, byte offsets, strides
+and fragment coverage. It does not allocate storage, approve a reader or emit a
+native shuffle. The planner must still check storage, writers, aliases,
+lifetimes and supported emission.
+
+`cost_features.py` owns feature extraction. Planning and reporting use the same
+functions. `dump_cost_model.py` keeps diagnostic output and latest-report state.
+This extraction does not change coefficients, units or physical core domains.
+
+### Local-read permission and final facts
+
+The planner checks graph structure, independent storage, writers, aliases and
+lifetimes. It exports `LocalReadGeometry` for one residency edge. Work division
+uses this immutable value to test physical ownership. Missing facts decline a
+partial match. Geometry alone cannot authorize storage.
+
+At the actual emitted read, the scheduler's provider repeats the planner's
+live checks. It returns a frozen `LocalReadEmission` value. The emitter checks
+that the final TensorArg still has the certified shape, format, owner map and
+allocation. It checks addresses and overlap before rebasing the read. A missing
+provider fails closed. A preparation retry creates a fresh provider and facts;
+no local-read certificate is reused across demotion.
+
+The earlier materialized-relayout registry still certifies copy identities.
+This interface does not alter that contract or add a new attention operation.
+
+### Matched OFF-plan comparison
+
+Use `tools/lx_planning/run_off_plan_capture.py` on the same existing fixture at each adjacent
+source pair, from the repository root in a clean developer checkout or Git
+worktree with the native test dependencies. The driver reads that checkout's
+HEAD and refuses tracked changes. It does not run from a source archive without
+Git metadata. Set `SPYRE_LX_EXTENDED_OWNERSHIP=0` before either process starts.
+Use fresh compile caches and the same upstream commit, inputs, hints, planner
+seed, worker count and other compiler settings. The contract records the
+verified input and hint hashes. Do not compare unmatched source configurations.
+
+The read-only observer records successful final codegen. It keeps final graph
+storage and physical layouts, dependencies, relayout registry, complete OpSpecs,
+argument binding and HBM pool size. It does not force a layout or a division.
+Unknown fields stop capture. Empty captures and cache hits cannot pass.
+Buffer names and program order remain significant; differences require review.
+
+Compare the two saved records with `tools/lx_planning/lx_semantic_plan.py`. Repeat the
+adjacent OFF/OFF comparison through the final stack, then compare its OFF plan
+with the matched #5160 OFF plan. Numerical checks remain separate. No recorded
+native OFF/OFF result is included in this PR. Separate historical receipts cover
+finite fixtures at pinned source revisions; they do not establish whole-model
+equality or plan equality after later upstream changes. Host tests of the
+recorder do not establish that native comparisons have passed.
+
+The pre-flag references are #5160 at `525dfd8c` and its squash merge on main,
+`10f40954`. A later main checkout is also accepted only when its recorded HEAD
+matches the checkout, it descends from that squash merge, it belongs to a local
+`main`, `origin/main` or `upstream/main` ref, and its config file has the same
+verified hash. Fetch the baseline history and main ref before using a later
+checkout. Only these verified sources may omit `lx_extended_ownership`; the
+missing flag represents OFF. Other missing settings stop capture. Iteration-axis
+order remains significant in the saved plan.
+
+### Cumulative local-read rollout
+
+`SPYRE_LX_EXTENDED_OWNERSHIP=0` also disables the optional local subrange
+admissions. This includes same-core compact readers and full-parent copies
+that serve them. The geometry helpers remain available for validation.
+Existing prefix support remains active. Mandatory span, ownership, lifetime,
+alias and final-emission checks stay active. The switch is part of the compile
+cache key; reuse of an ON plan cannot establish an OFF-plan comparison.
+
+The same switch disables the hinted compact-reader FX rewrite. Direct cache
+subranges use the local-read admission gates. Their physical and final-access
+validators remain active. No separate switch or relaxed cache guard is added.

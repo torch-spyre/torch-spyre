@@ -17,8 +17,11 @@
  */
 #include <libaiupti/aiupti_runtime_cbid.h>
 
+#include <cstring>
+#include <memory>
 #include <nlohmann/json.hpp>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -28,66 +31,71 @@
 
 namespace KINETO_NAMESPACE {
 
+namespace {
+
+// GenericTraceActivity stores a 32-bit flow ID, but ITraceActivity and Kineto's
+// loggers support 64 bits. Give submission flows their own ID range without
+// changing the batch IDs used by hardware-launch-to-device flows.
+class RuntimeTraceActivity : public libkineto::GenericTraceActivity {
+ public:
+  using GenericTraceActivity::GenericTraceActivity;
+
+  int64_t flowId() const override {
+    return submissionFlowId ? submissionFlowId : GenericTraceActivity::flowId();
+  }
+
+  void log(libkineto::ActivityLogger& logger) const override {
+    // handleGenericActivity copies a GenericTraceActivity and would slice away
+    // the 64-bit flow ID. The session transfers ownership in its trace buffer.
+    logger.handleActivity(*this);
+  }
+
+  int64_t submissionFlowId{0};
+};
+
+}  // namespace
+
 // =========== Session Private Methods ============= //
-void AiuptiActivityProfilerSession::removeCorrelatedPtiActivities(
-    const libkineto::ITraceActivity* act1) {
-  const auto key = act1->correlationId();
-  const auto& it = correlatedPtiActivities_.find(key);
-  if (it != correlatedPtiActivities_.end()) correlatedPtiActivities_.erase(key);
-  return;
-}
-
-void AiuptiActivityProfilerSession::checkTimestampOrder(
-    const libkineto::ITraceActivity* act1) {
-  const auto& it = correlatedPtiActivities_.find(act1->correlationId());
-  if (it == correlatedPtiActivities_.end()) {
-    correlatedPtiActivities_.insert({act1->correlationId(), act1});
-    return;
+const libkineto::ITraceActivity*
+AiuptiActivityProfilerSession::linkedCpuActivity(uint64_t externalId) {
+  // Kineto's lookup callback currently accepts int32_t. Preserve wider IDs in
+  // metadata, but never truncate one into a different CPU activity's identity.
+  if (!cpuActivity_ || externalId == 0 ||
+      externalId > static_cast<uint64_t>(std::numeric_limits<int32_t>::max())) {
+    return nullptr;
   }
-
-  const libkineto::ITraceActivity* act2 = it->second;
-  if (act2->type() == libkineto::ActivityType::PRIVATEUSE1_RUNTIME)
-    std::swap(act1, act2);
-  if (act1->timestamp() > act2->timestamp()) {
-    std::string err_msg;
-    err_msg += "AIU op timestamp (" + std::to_string(act2->timestamp());
-    err_msg += ") < runtime timestamp (" + std::to_string(act1->timestamp());
-    err_msg += ") by " + std::to_string(act1->timestamp() - act2->timestamp());
-    err_msg += "us Name: " + act2->name();
-    err_msg += " Device: " + std::to_string(act2->deviceId());
-    err_msg += " Queue: " + std::to_string(act2->resourceId());
-    errors_.push_back(err_msg);
-  }
-}
-
-inline bool AiuptiActivityProfilerSession::outOfRange(
-    const libkineto::ITraceActivity& act) {
-  bool out_of_range =
-      act.timestamp() < captureWindowStartTime_ ||
-      (act.timestamp() + act.duration()) > captureWindowEndTime_;
-  if (out_of_range) {
-    std::string err_msg;
-    err_msg += "TraceActivity outside of profiling window: " + act.name();
-    err_msg += " (" + std::to_string(act.timestamp());
-    err_msg += " < " + std::to_string(captureWindowStartTime_);
-    err_msg += " or " + std::to_string(act.timestamp() + act.duration());
-    err_msg += " > " + std::to_string(captureWindowEndTime_);
-    errors_.push_back(err_msg);
-  }
-  return out_of_range;
+  const auto* linked = cpuActivity_(static_cast<int32_t>(externalId));
+  return linked && linked->correlationId() == static_cast<int64_t>(externalId)
+             ? linked
+             : nullptr;
 }
 
 const libkineto::ITraceActivity* AiuptiActivityProfilerSession::linkedActivity(
     int32_t correlationId,
     const std::unordered_map<int64_t, int64_t>& correlationMap) {
   const auto& it = correlationMap.find(correlationId);
-  if (it != correlationMap.end()) return cpuActivity_(it->second);
+  if (it != correlationMap.end()) return linkedCpuActivity(it->second);
   return nullptr;
 }
 
 template <class ze_handle_type>
 inline std::string handleToHexString(ze_handle_type handle) {
   return fmt::format("0x{:016x}", reinterpret_cast<uintptr_t>(handle));
+}
+
+// Raw device timestamps TS1..TS5 as a compact JSON array.
+template <class activity_type>
+inline std::string cyclesTsJson(const activity_type* activity) {
+  return fmt::format("[{},{},{},{},{}]", activity->cycles_ts1,
+                     activity->cycles_ts2, activity->cycles_ts3,
+                     activity->cycles_ts4, activity->cycles_ts5);
+}
+
+template <class activity_type>
+inline bool hasCyclesTs(const activity_type* activity) {
+  return activity->cycles_ts1 != 0 || activity->cycles_ts2 != 0 ||
+         activity->cycles_ts3 != 0 || activity->cycles_ts4 != 0 ||
+         activity->cycles_ts5 != 0;
 }
 
 inline std::string runtimeCbidName(AIUpti_runtime_api_trace_cbid cbid) {
@@ -174,45 +182,285 @@ inline std::string runtimeCbidName(AIUpti_runtime_api_trace_cbid cbid) {
       return "aiuIssueCallback";
     case AIUPTI_RUNTIME_TRACE_CBID_VERIFY_ASYC_MSGS:
       return "aiuVerifyAsyncMsgs";
+    // Host-side spans emitted by spyre-comms (RFC 2973), cbids 41-77. These are
+    // what make collectives visible in a PyTorch trace: AIUPTI records carry no
+    // name, so the label shown to the user comes from here. A cbid missing from
+    // this switch renders as "Unknown CBID <n>" rather than failing.
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_ALLREDUCE:
+      return "aiuCommsCollAllreduce";
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_ALLGATHER:
+      return "aiuCommsCollAllgather";
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_GATHER:
+      return "aiuCommsCollGather";
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_GATHERV:
+      return "aiuCommsCollGatherv";
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_REDUCE:
+      return "aiuCommsCollReduce";
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_BROADCAST:
+      return "aiuCommsCollBroadcast";
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_BARRIER:
+      return "aiuCommsCollBarrier";
+    case AIUPTI_RUNTIME_TRACE_CBID_WORK_SCHED_START:
+      return "aiuCommsWorkSchedStart";
+    case AIUPTI_RUNTIME_TRACE_CBID_WORK_SCHED_WAIT:
+      return "aiuCommsWorkSchedWait";
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_ALLREDUCE_SETUP:
+      return "aiuCommsCollAllreduceSetup";
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_ALLGATHER_SETUP:
+      return "aiuCommsCollAllgatherSetup";
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_GATHER_SETUP:
+      return "aiuCommsCollGatherSetup";
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_GATHERV_SETUP:
+      return "aiuCommsCollGathervSetup";
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_REDUCE_SETUP:
+      return "aiuCommsCollReduceSetup";
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_BROADCAST_SETUP:
+      return "aiuCommsCollBroadcastSetup";
+    case AIUPTI_RUNTIME_TRACE_CBID_WORK_SCHED_PHASE_RECORDING:
+      return "aiuCommsWorkSchedPhaseRecord";
+    case AIUPTI_RUNTIME_TRACE_CBID_WORK_SCHED_PHASE_WIREUP:
+      return "aiuCommsWorkSchedPhaseWireup";
+    case AIUPTI_RUNTIME_TRACE_CBID_WORK_SCHED_MSG_INFO_MGR:
+      return "aiuCommsWorkSchedMsgInfoMgr";
+    case AIUPTI_RUNTIME_TRACE_CBID_WORK_SCHED_HDMA_RT_MGR:
+      return "aiuCommsWorkSchedHdmaRtMgr";
+    case AIUPTI_RUNTIME_TRACE_CBID_WORK_SCHED_PHASE_LAUNCH:
+      return "aiuCommsWorkSchedPhaseLaunch";
+    case AIUPTI_RUNTIME_TRACE_CBID_OP_SYNCHRONIZE:
+      return "aiuCommsOpSync";
+    case AIUPTI_RUNTIME_TRACE_CBID_OP_D2H_TRANSFER:
+      return "aiuCommsOpD2HXfer";
+    case AIUPTI_RUNTIME_TRACE_CBID_OP_H2D_TRANSFER:
+      return "aiuCommsOpH2DXfer";
+    case AIUPTI_RUNTIME_TRACE_CBID_OP_SEND_DATA:
+      return "aiuCommsOpSendData";
+    case AIUPTI_RUNTIME_TRACE_CBID_OP_MULTICAST_SEND_DATA:
+      return "aiuCommsOpMcastSendData";
+    case AIUPTI_RUNTIME_TRACE_CBID_OP_RECV_DATA:
+      return "aiuCommsOpRecvData";
+    case AIUPTI_RUNTIME_TRACE_CBID_OP_BROADCAST_DATA:
+      return "aiuCommsOpBcastData";
+    case AIUPTI_RUNTIME_TRACE_CBID_OP_GATHER_DATA:
+      return "aiuCommsOpGatherData";
+    case AIUPTI_RUNTIME_TRACE_CBID_OP_ALLGATHER_DATA:
+      return "aiuCommsOpAllgatherData";
+    case AIUPTI_RUNTIME_TRACE_CBID_OP_BINARY_COMPUTE:
+      return "aiuCommsOpBinaryComp";
+    case AIUPTI_RUNTIME_TRACE_CBID_OP_COPY:
+      return "aiuCommsOpCopy";
+    case AIUPTI_RUNTIME_TRACE_CBID_BUNDLE_GENERATE:
+      return "aiuCommsBundleGen";
+    case AIUPTI_RUNTIME_TRACE_CBID_ARTIFACT_LOAD_TO_DEVICE:
+      return "aiuCommsArtifactLoad";
+    case AIUPTI_RUNTIME_TRACE_CBID_ARTIFACT_LAUNCH_COMPUTE_OP:
+      return "aiuCommsArtifactLaunchOp";
+    case AIUPTI_RUNTIME_TRACE_CBID_COST_ESTIMATE:
+      return "aiuCommsCostEst";
+    case AIUPTI_RUNTIME_TRACE_CBID_BENCH_PAIRWISE:
+      return "aiuCommsBenchPairwise";
+    case AIUPTI_RUNTIME_TRACE_CBID_BENCH_ALLREDUCE:
+      return "aiuCommsBenchAllreduce";
+    case AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_TO_HARDWARE:
+      return "aiuSubmitToHardware";
+    case AIUPTI_RUNTIME_TRACE_CBID_FLEX_ROUNDTRIP:
+      return "flexRoundTrip";
+    case AIUPTI_RUNTIME_TRACE_CBID_AIU_ROUNDTRIP:
+      return "aiuRoundtrip";
+    case AIUPTI_RUNTIME_TRACE_CBID_WORK_SCHED_QUEUE_WAIT:
+      return "aiuCommsWorkSchedQueueWait";
+    case AIUPTI_RUNTIME_TRACE_CBID_WORK_SCHED_PREPARE:
+      return "aiuCommsWorkSchedPrepare";
+    case AIUPTI_RUNTIME_TRACE_CBID_WORK_SCHED_PRE_RECORD_RESET:
+      return "aiuCommsWorkSchedPreRecordReset";
+    case AIUPTI_RUNTIME_TRACE_CBID_OOB_BARRIER:
+      return "aiuCommsOobBarrier";
+    case AIUPTI_RUNTIME_TRACE_CBID_HDMA_RESET:
+      return "aiuCommsHdmaReset";
+    case AIUPTI_RUNTIME_TRACE_CBID_HDMA_FIRMWARE_RESET:
+      return "aiuCommsHdmaFirmwareReset";
+    case AIUPTI_RUNTIME_TRACE_CBID_WAIT_FOR_QUEUE_CAPACITY:
+      return "aiuWaitForQueueCapacity";
+
+    // ResponseWorker CBIDS (79-82)
+    case AIUPTI_RUNTIME_TRACE_CBID_FETCH_RESPONSE_BLOCKS:
+      return "aiuFetchResponseBlocks";
+    case AIUPTI_RUNTIME_TRACE_CBID_RESPONSE_COMPLETION_THREAD:
+      return "aiuResponseCompletionThread";
+    case AIUPTI_RUNTIME_TRACE_CBID_PARSE_RESPONSE_BLOCKS:
+      return "aiuParseResponseBlocks";
+    case AIUPTI_RUNTIME_TRACE_CBID_ITERATION_DURATION:
+      return "aiuIterationDuration";
+
+    // CBIDS 83 to 84 are reserved
+    // P2P RDMA CBIDS (85 - 91)
+    case AIUPTI_RUNTIME_TRACE_CBID_P2P_RDMA_MULTICAST:
+      return "aiuP2PRdmaMulticast";
+    case AIUPTI_RUNTIME_TRACE_CBID_P2P_RDMA_WAIT:
+      return "aiuP2PRdmaWait";
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULE_P2P_RDMA_SEND:
+      return "aiuScheduleP2PRdmaSend";
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULE_P2P_RDMA_WAIT:
+      return "aiuScheduleP2PRdmaWait";
+    case AIUPTI_RUNTIME_TRACE_CBID_LAUNCH_P2P_RDMA_SEND:
+      return "aiuLaunchP2PRdmaSend";
+    case AIUPTI_RUNTIME_TRACE_CBID_LAUNCH_P2P_RDMA_WAIT:
+      return "aiuLaunchP2PRdmaWait";
+    case AIUPTI_RUNTIME_TRACE_CBID_INITIALIZE_P2P:
+      return "aiuInitializeP2P";
+
+    // Scheduler submit/barrier CBIDS (102-105)
+    case AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_DMA:
+      return "aiuSubmitDMA";
+    case AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_COMPUTE:
+      return "aiuSubmitCompute";
+    case AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_FILL:
+      return "aiuSubmitFill";
+    case AIUPTI_RUNTIME_TRACE_CBID_ISSUE_BARRIER:
+      return "aiuIssueBarrier";
     default:
       break;
   }
   return "Unknown CBID " + std::to_string(cbid);
 }
 
+template <size_t N>
+inline std::string fixedCharField(const char (&field)[N]) {
+  return std::string(field, strnlen(field, N));
+}
+
+// Collective-communication metadata, when the producer set any. Emitted as
+// trace args only, so activity names and grouping are unaffected. The first
+// byte is checked before building a string because most records carry none.
+//
+// Producer contract (libaiupti AIUpti_ActivityCompute/_ActivityMemcpy): the
+// names are fixed char[AIUPTI_COLL_NAME_SIZE] arrays, empty when not set, and
+// coll_bytes is 0 both for a zero-byte transfer and when unknown. flex fills
+// coll_algo only from a structured "[Coll,Algo,Bytes]" label, whose fields are
+// all required, so a non-empty coll_algo means coll_bytes was really parsed.
+// On collective records coll_bytes is therefore the number when known
+// (including a real 0) and "" when the label carried no size.
+
+template <class T, class = void>
+struct HasCollFields : std::false_type {};
+template <class T>
+struct HasCollFields<T, std::void_t<decltype(std::declval<T&>().coll_group),
+                                    decltype(std::declval<T&>().coll_algo),
+                                    decltype(std::declval<T&>().coll_bytes)>>
+    : std::true_type {};
+
+template <class trace_activity_type, class aiupti_activity_type>
+inline void addCollMetadata(trace_activity_type& trace_activity,
+                            const aiupti_activity_type* activity) {
+  if constexpr (HasCollFields<aiupti_activity_type>::value) {
+    if (activity->coll_group[0] != '\0') {
+      trace_activity->addMetadataQuoted("coll_group",
+                                        fixedCharField(activity->coll_group));
+    }
+    if (activity->coll_algo[0] != '\0') {
+      trace_activity->addMetadataQuoted("coll_algo",
+                                        fixedCharField(activity->coll_algo));
+    }
+    if (activity->coll_bytes != 0 || activity->coll_algo[0] != '\0') {
+      trace_activity->addMetadata("coll_bytes", activity->coll_bytes);
+    } else if (activity->coll_group[0] != '\0') {
+      trace_activity->addMetadataQuoted("coll_bytes", "");
+    }
+  }
+}
+
 void AiuptiActivityProfilerSession::handleRuntimeActivity(
     const AIUpti_ActivityAPI* activity, libkineto::ActivityLogger* logger) {
   traceBuffer_.span.opCount += 1;
   traceBuffer_.gpuOpCount += 1;
-  cpuCorrelationMap_[activity->correlation_id] = 0;  // fake add correlation
   const libkineto::ITraceActivity* linked =
-      linkedActivity(activity->correlation_id, cpuCorrelationMap_);
+      linkedCpuActivity(activity->external_id);
   auto cbIDName =
       runtimeCbidName((AIUpti_runtime_api_trace_cbid)activity->cbid);
-  traceBuffer_.emplace_activity(traceBuffer_.span,
-                                libkineto::ActivityType::PRIVATEUSE1_RUNTIME,
-                                cbIDName);
-  auto& runtime_activity = traceBuffer_.activities.back();
+  auto runtime = std::make_unique<RuntimeTraceActivity>(
+      traceBuffer_.span, libkineto::ActivityType::PRIVATEUSE1_RUNTIME,
+      cbIDName);
+  auto* runtime_activity = runtime.get();
+  traceBuffer_.activities.push_back(std::move(runtime));
   runtime_activity->startTime = activity->start;
   runtime_activity->endTime = activity->end;
   runtime_activity->id = activity->correlation_id;
   runtime_activity->device = activity->process_id;
-  runtime_activity->resource = libkineto::systemThreadId();
-  runtime_activity->threadId = libkineto::threadId();
-  // only enable outgoing flow for launch control block runtime activities
-  if (activity->cbid == AIUPTI_RUNTIME_TRACE_CBID_LAUNCH_CB_CMPT) {
-    runtime_activity->flow.id = activity->correlation_id;
-  } else {
-    runtime_activity->flow.id = 0;
+  const bool calibration = activity->calibration_id != 0;
+  // One explicitly logical lane per calibrator, retaining physical host TIDs
+  // in metadata. Measurement helper threads do not create extra trace tracks.
+  runtime_activity->resource =
+      calibration ? 1000000000 + activity->calibration_id : activity->thread_id;
+  runtime_activity->threadId = activity->thread_id;
+  if (!hasDeviceResource(runtime_activity->device,
+                         runtime_activity->resource)) {
+    std::string name;
+    if (calibration) {
+      name = fmt::format("Spyre calibration (device {})",
+                         activity->calibration_id - 1);
+    } else {
+      const auto found =
+          threadNames_.find({activity->process_id, activity->thread_id});
+      if (found != threadNames_.end() && !found->second.empty()) {
+        name = fmt::format("{} ({})", found->second, activity->thread_id);
+      }
+    }
+    // Missing metadata only affects the label; numeric identity and flows
+    // remain.
+    recordThreadStream(runtime_activity->device, runtime_activity->resource,
+                       name);
   }
+  if (calibration) {
+    runtime_activity->addMetadata("calibration_device",
+                                  activity->calibration_id - 1);
+    runtime_activity->addMetadata("host_thread", activity->thread_id);
+  }
+  if (activity->external_id)
+    runtime_activity->addMetadata("external_correlation",
+                                  activity->external_id);
+  if (activity->user_external_id)
+    runtime_activity->addMetadata("user_external_correlation",
+                                  activity->user_external_id);
+  const bool isLaunch =
+      activity->cbid >= AIUPTI_RUNTIME_TRACE_CBID_LAUNCH_CB &&
+      activity->cbid <= AIUPTI_RUNTIME_TRACE_CBID_LAUNCH_CB_DMO;
+  const bool flowStart = !calibration && isLaunch &&
+                         deviceActivityIds_.count(activity->correlation_id);
+  runtime_activity->flow.id = flowStart ? activity->correlation_id : 0;
   runtime_activity->flow.type = libkineto::kLinkAsyncCpuGpu;
-  runtime_activity->flow.start = static_cast<bool>(
-      std::find(correlateRuntimeOps_.begin(), correlateRuntimeOps_.end(),
-                cbIDName) != correlateRuntimeOps_.end());
+  runtime_activity->flow.start = flowStart;
   runtime_activity->linked = linked;
   runtime_activity->addMetadata("correlation", activity->correlation_id);
 
+  if (activity->cbid == AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_TO_HARDWARE &&
+      !calibration && linked && linked->deviceId() == activity->process_id &&
+      linked->timestamp() <= runtime_activity->startTime) {
+    const auto flowId = ++nextSubmissionFlowId_;
+    runtime_activity->submissionFlowId = flowId;
+
+    // A CPU op can submit several batches, while each Kineto activity carries
+    // only one flow endpoint. Add a zero-duration marker per batch at the CPU
+    // origin instead of copying or mutating the original CPU activity. Keep it
+    // in the trace buffer so deferred exports retain the endpoint's lifetime.
+    auto source = std::make_unique<RuntimeTraceActivity>(
+        traceBuffer_.span, libkineto::ActivityType::PRIVATEUSE1_RUNTIME,
+        "aiuCpuLaunch");
+    source->startTime = source->endTime = linked->timestamp();
+    source->device = linked->deviceId();
+    source->resource = linked->resourceId();
+    source->threadId = linked->getThreadId();
+    source->id = activity->correlation_id;
+    source->linked = linked;
+    source->submissionFlowId = flowId;
+    source->flow.type = libkineto::kLinkAsyncCpuGpu;
+    source->flow.start = true;
+    source->addMetadata("external_correlation", activity->external_id);
+    source->addMetadata("correlation", activity->correlation_id);
+    traceBuffer_.activities.push_back(std::move(source));
+    traceBuffer_.activities.back()->log(*logger);
+  }
+
   switch ((AIUpti_runtime_api_trace_cbid)activity->cbid) {
+    case AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_TO_HARDWARE:
     case AIUPTI_RUNTIME_TRACE_CBID_LAUNCH_CB:
     case AIUPTI_RUNTIME_TRACE_CBID_LAUNCH_CB_CMPT:
     case AIUPTI_RUNTIME_TRACE_CBID_LAUNCH_CB_DMI:
@@ -229,18 +477,32 @@ void AiuptiActivityProfilerSession::handleRuntimeActivity(
       runtime_activity->addMetadata("bytes", activity->data);
       break;
 
+    case AIUPTI_RUNTIME_TRACE_CBID_ISSUE_BARRIER:
+      runtime_activity->addMetadata("fence_size", activity->data);
+      break;
+
+    case AIUPTI_RUNTIME_TRACE_CBID_P2P_RDMA_MULTICAST:
+      runtime_activity->addMetadata("bytes", activity->data);
+      break;
+
+    case AIUPTI_RUNTIME_TRACE_CBID_P2P_RDMA_WAIT:
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULE_P2P_RDMA_WAIT:
+    case AIUPTI_RUNTIME_TRACE_CBID_LAUNCH_P2P_RDMA_WAIT:
+      runtime_activity->addMetadata("num_sids", activity->data);
+      break;
+
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULE_P2P_RDMA_SEND:
+    case AIUPTI_RUNTIME_TRACE_CBID_LAUNCH_P2P_RDMA_SEND:
+      runtime_activity->addMetadata("num_dest_ranks", activity->data);
+      break;
+
+    case AIUPTI_RUNTIME_TRACE_CBID_INITIALIZE_P2P:
+      runtime_activity->addMetadata("world_size", activity->data);
+      break;
+
     default:
       break;
   }
-
-  // checkTimestampOrder(&*runtime_activity);
-  // if (outOfRange(*runtime_activity)) {
-  //   traceBuffer_.span.opCount -= 1;
-  //   traceBuffer_.gpuOpCount -= 1;
-  //   removeCorrelatedPtiActivities(&*runtime_activity);
-  //   traceBuffer_.activities.pop_back();
-  //   return;
-  // }
   runtime_activity->log(*logger);
 }
 
@@ -248,7 +510,6 @@ void AiuptiActivityProfilerSession::handleKernelActivity(
     const AIUpti_ActivityCompute* activity, libkineto::ActivityLogger* logger) {
   traceBuffer_.span.opCount += 1;
   traceBuffer_.gpuOpCount += 1;
-  cpuCorrelationMap_[activity->correlation_id] = 0;  // fake add correlation
   const libkineto::ITraceActivity* linked =
       linkedActivity(activity->correlation_id, cpuCorrelationMap_);
   traceBuffer_.emplace_activity(traceBuffer_.span,
@@ -257,21 +518,28 @@ void AiuptiActivityProfilerSession::handleKernelActivity(
   auto& kernel_activity = traceBuffer_.activities.back();
   kernel_activity->startTime = activity->start;
   kernel_activity->endTime = activity->end;
+  kernel_activity->addMetadataQuoted(
+      "timestamp_source", activity->timestamps_estimated
+                              ? "estimated (host completion, 1 ns/tick)"
+                              : "calibrated");
   kernel_activity->id = activity->correlation_id;
   kernel_activity->device = activity->device_id;
   kernel_activity->resource = activity->stream_id;
   kernel_activity->threadId = activity->stream_id;
-  kernel_activity->flow.id = activity->correlation_id;
+  kernel_activity->flow.id = launchActivityIds_.count(activity->correlation_id)
+                                 ? activity->correlation_id
+                                 : 0;
   kernel_activity->flow.type = libkineto::kLinkAsyncCpuGpu;
   kernel_activity->flow.start = 0;
   kernel_activity->linked = linked;
   kernel_activity->addMetadata("queued", activity->queued);
   kernel_activity->addMetadata("submitted", activity->submitted);
   kernel_activity->addMetadata("device", kernel_activity->deviceId());
-  kernel_activity->addMetadata("stream", 1);
+  kernel_activity->addMetadata("stream", activity->stream_id);
   kernel_activity->addMetadataQuoted("context",
                                      std::to_string(activity->context_id));
   kernel_activity->addMetadata("correlation", activity->correlation_id);
+  addCollMetadata(kernel_activity, activity);
   if (const auto key = spyre::extractKernelProvenanceKey(activity->name)) {
     kernel_activity->addMetadataQuoted("provenance_key", *key);
     if (const auto ids = spyre::lookupKernelProvenance(*key)) {
@@ -279,17 +547,11 @@ void AiuptiActivityProfilerSession::handleKernelActivity(
                                    nlohmann::json(*ids).dump());
     }
   }
+  // Compute records always carry counters, so emit unconditionally: an
+  // all-zero array here signals a counter failure rather than absence.
+  kernel_activity->addMetadata("cycles_ts", cyclesTsJson(activity));
 
   recordStream(kernel_activity->device, kernel_activity->resource);
-
-  // checkTimestampOrder(&*kernel_activity);
-  // if (outOfRange(*kernel_activity)) {
-  //   traceBuffer_.span.opCount -= 1;
-  //   traceBuffer_.gpuOpCount -= 1;
-  //   removeCorrelatedPtiActivities(&*kernel_activity);
-  //   traceBuffer_.activities.pop_back();
-  //   return;
-  // }
   kernel_activity->log(*logger);
 }
 
@@ -367,7 +629,6 @@ void AiuptiActivityProfilerSession::handleMemcpyActivity(
     const AIUpti_ActivityMemcpy* activity, libkineto::ActivityLogger* logger) {
   traceBuffer_.span.opCount += 1;
   traceBuffer_.gpuOpCount += 1;
-  cpuCorrelationMap_[activity->correlation_id] = 0;  // fake add correlation
   const libkineto::ITraceActivity* linked =
       linkedActivity(activity->correlation_id, cpuCorrelationMap_);
   traceBuffer_.emplace_activity(
@@ -376,11 +637,17 @@ void AiuptiActivityProfilerSession::handleMemcpyActivity(
   auto& memcpy_activity = traceBuffer_.activities.back();
   memcpy_activity->startTime = activity->start;
   memcpy_activity->endTime = activity->end;
+  memcpy_activity->addMetadataQuoted(
+      "timestamp_source", activity->timestamps_estimated
+                              ? "estimated (host completion, 1 ns/tick)"
+                              : "calibrated");
   memcpy_activity->id = activity->correlation_id;
   memcpy_activity->device = activity->device_id;
   memcpy_activity->resource = getResourceId(activity);
   memcpy_activity->threadId = activity->stream_id;
-  memcpy_activity->flow.id = 0;
+  memcpy_activity->flow.id = launchActivityIds_.count(activity->correlation_id)
+                                 ? activity->correlation_id
+                                 : 0;
   memcpy_activity->flow.type = libkineto::kLinkAsyncCpuGpu;
   memcpy_activity->flow.start = 0;
   memcpy_activity->linked = linked;
@@ -393,6 +660,16 @@ void AiuptiActivityProfilerSession::handleMemcpyActivity(
   memcpy_activity->addMetadata("memory operation id", activity->copy_kind);
   memcpy_activity->addMetadata("bytes", activity->bytes);
   memcpy_activity->addMetadata("memory bandwidth (GB/s)", bandwidth(activity));
+  memcpy_activity->addMetadata("stream", activity->stream_id);
+  // AIUpti_ActivityMemcpy does not say whether the record came from a
+  // command buffer (real counters) or a standalone flex MEMCPY (always 0;
+  // today flex reports every DMA this way), so omit the key when all slots
+  // are 0. Gate on record kind instead once libaiupti marks which records
+  // carry counters.
+  if (hasCyclesTs(activity)) {
+    memcpy_activity->addMetadata("cycles_ts", cyclesTsJson(activity));
+  }
+  addCollMetadata(memcpy_activity, activity);
 
   if (memcpy_activity->resource == getBaseResourceId(activity)) {
     recordMemoryStream(memcpy_activity->device, memcpy_activity->resource,
@@ -401,15 +678,6 @@ void AiuptiActivityProfilerSession::handleMemcpyActivity(
   } else {
     recordMemoryStream(memcpy_activity->device, memcpy_activity->resource, " ");
   }
-  // TODO(mamaral): verify if we can enable this
-  // checkTimestampOrder(&*memcpy_activity);
-  // if (outOfRange(*memcpy_activity)) {
-  //   traceBuffer_.span.opCount -= 1;
-  //   traceBuffer_.gpuOpCount -= 1;
-  //   removeCorrelatedPtiActivities(&*memcpy_activity);
-  //   traceBuffer_.activities.pop_back();
-  //   return;
-  // }
   memcpy_activity->log(*logger);
 }
 
@@ -433,16 +701,16 @@ void AiuptiActivityProfilerSession::handleMemoryActivity(
     traceBuffer_.span.opCount += 1;
     traceBuffer_.gpuOpCount += 1;
     const libkineto::ITraceActivity* linked =
-        linkedActivity(activity->correlation_id, cpuCorrelationMap_);
+        nullptr;  // Allocation IDs are separate from submission batch IDs.
     traceBuffer_.emplace_activity(
         traceBuffer_.span, libkineto::ActivityType::PRIVATEUSE1_DRIVER,
         fmt::format("Memory ({})",
                     memoryOperationName(activity->memory_operation_type)));
-    // memcpyName(
-    //     activity->memcpy_type, activity->mem_src, activity->mem_dst));
     auto& mem_activity = traceBuffer_.activities.back();
     mem_activity->startTime = activity->start;
     mem_activity->endTime = activity->end;
+    // Memory management uses host timestamps, not calibrated device ticks.
+    mem_activity->addMetadataQuoted("timestamp_source", "host");
     mem_activity->id = activity->correlation_id;
     mem_activity->device = activity->device_id;
     mem_activity->resource = getResourceId(activity);
@@ -461,6 +729,7 @@ void AiuptiActivityProfilerSession::handleMemoryActivity(
                               activity->memory_operation_type);
     mem_activity->addMetadata("bytes", activity->bytes);
     mem_activity->addMetadata("memory bandwidth (GB/s)", bandwidth(activity));
+    mem_activity->addMetadata("stream", activity->stream_id);
 
     if (mem_activity->resource == getBaseResourceId(activity)) {
       recordMemoryStream(mem_activity->device, mem_activity->resource,
@@ -468,14 +737,6 @@ void AiuptiActivityProfilerSession::handleMemoryActivity(
     } else {
       recordMemoryStream(mem_activity->device, mem_activity->resource, " ");
     }
-    // checkTimestampOrder(&*mem_activity);
-    // if (outOfRange(*mem_activity)) {
-    //   traceBuffer_.span.opCount -= 1;
-    //   traceBuffer_.gpuOpCount -= 1;
-    //   removeCorrelatedPtiActivities(&*mem_activity);
-    //   traceBuffer_.activities.pop_back();
-    //   return;
-    // }
     mem_activity->log(*logger);
   }
 
@@ -487,6 +748,7 @@ void AiuptiActivityProfilerSession::handleMemoryActivity(
   auto& memory_event = traceBuffer_.activities.back();
 
   memory_event->startTime = activity->start;
+  memory_event->addMetadataQuoted("timestamp_source", "host");
 
   // Following convention where all memory events are put on the
   // CPU thread. "Device Type" will denote CPU vs. AIU memory events
@@ -514,16 +776,16 @@ void AiuptiActivityProfilerSession::handleMemsetActivity(
     const AIUpti_ActivityMemset* activity, libkineto::ActivityLogger* logger) {
   traceBuffer_.span.opCount += 1;
   traceBuffer_.gpuOpCount += 1;
-  // TODO(mamaral): implement the libaiupti to add external correlation ID
-  cpuCorrelationMap_[activity->correlation_id] = 0;  // fake add correlation
   const libkineto::ITraceActivity* linked =
-      linkedActivity(activity->correlation_id, cpuCorrelationMap_);
+      nullptr;  // Allocation IDs are separate from submission batch IDs.
   traceBuffer_.emplace_activity(traceBuffer_.span,
                                 libkineto::ActivityType::GPU_MEMSET,
                                 "Memset (Device)");
   auto& memset_activity = traceBuffer_.activities.back();
   memset_activity->startTime = activity->start;
   memset_activity->endTime = activity->end;
+  // Libaiupti represents host-timed allocations as MEMSET records.
+  memset_activity->addMetadataQuoted("timestamp_source", "host");
   memset_activity->id = activity->correlation_id;
   memset_activity->device = activity->device_id;
   // TODO(mcalman): investigate why memset activities are being processed out
@@ -541,6 +803,7 @@ void AiuptiActivityProfilerSession::handleMemsetActivity(
   memset_activity->addMetadata("correlation", activity->correlation_id);
   memset_activity->addMetadata("bytes", activity->bytes);
   memset_activity->addMetadata("memory bandwidth (GB/s)", bandwidth(activity));
+  memset_activity->addMetadata("stream", activity->stream_id);
 
   if (memset_activity->resource == getBaseResourceId(activity)) {
     recordMemoryStream(memset_activity->device, memset_activity->resource,
@@ -548,22 +811,15 @@ void AiuptiActivityProfilerSession::handleMemsetActivity(
   } else {
     recordMemoryStream(memset_activity->device, memset_activity->resource, " ");
   }
-
-  // TODO(mamaral): verify if we can enable this
-  // checkTimestampOrder(&*memset_activity);
-  // if (outOfRange(*memset_activity)) {
-  //   traceBuffer_.span.opCount -= 1;
-  //   traceBuffer_.gpuOpCount -= 1;
-  //   removeCorrelatedPtiActivities(&*memset_activity);
-  //   traceBuffer_.activities.pop_back();
-  //   return;
-  // }
   memset_activity->log(*logger);
 }
 
 void AiuptiActivityProfilerSession::handlePtiActivity(
     const AIUpti_Activity* record, libkineto::ActivityLogger* logger) {
   switch (record->kind) {
+    case (uint8_t)AIUPTI_ACTIVITY_KIND_THREAD:
+      // Names were collected by the prepass; metadata is not a timeline span.
+      break;
     case (uint8_t)AIUPTI_ACTIVITY_KIND_RUNTIME:
       handleRuntimeActivity(reinterpret_cast<const AIUpti_ActivityAPI*>(record),
                             logger);

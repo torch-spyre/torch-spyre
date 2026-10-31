@@ -49,7 +49,7 @@ TEST_TYPE ?= regression
 TEST_EXCLUDE_TIERS ?=
 
 # Where TEST_TYPE=perf writes its benchmark report. Flat /tmp/results so the CI
-# ClickHouse push step (ingest_xml.py globs *.xml non-recursively) finds it
+# ClickHouse push step (`spyre_clickhouse_ingest results` globs *.xml non-recursively) finds it
 # alongside every other suite's JUnit XML, with no per-suite subdirectory.
 RESULTS_DIR ?= /tmp/results
 
@@ -96,9 +96,20 @@ tests: ## Run torch spyre tests, fanning out into tests-single-card + tests-mult
 # writes report.xml into RESULTS_DIR. Keeping it a mode of `tests` lets CI call
 # it through the same `make tests TEST_TYPE=...` entry point as every other
 # suite, so no new Makefile target or Jenkins wiring is needed.
+#
+# SENPERFORMANCE=2 must be in the environment before spyre-perf-suite launches
+# its benchmark subprocesses (which import torch and initialize the Spyre
+# runtime). Only then does the compiler emit the per-kernel ideal_cycles.json
+# that PT-active utilization (pt_util%) is computed from; without it that metric
+# is absent or zero. The ${VAR:-2} default leaves an inherited value (base
+# image or caller) untouched, and prefixing the command scopes the export to
+# this one invocation rather than every `make tests` target.
 ifeq ($(TEST_TYPE),perf)
 	@mkdir -p "$(RESULTS_DIR)"
-	spyre-perf-suite --no-experimental --stacks torch-spyre \
+	@# --ops-only: OPS here; models run in hf-adapters-dev (--hf-only), which has the
+	@# transformers pin they need. Needs a spyre-perf-suite wheel declaring the flag.
+	SENPERFORMANCE="$${SENPERFORMANCE:-2}" spyre-perf-suite --no-experimental --stacks torch-spyre \
+		--ops-only \
 		--report "$(RESULTS_DIR)/report.txt"
 	@test -f "$(RESULTS_DIR)/report.xml" || \
 		{ echo "ERROR: spyre-perf-suite did not emit $(RESULTS_DIR)/report.xml" >&2; \
@@ -140,6 +151,10 @@ ifeq ($(TEST_TYPE),trunk)
 	$(eval _ALL := $(shell python3 $(FILTER_SCRIPT) --config-dir tests/configs --test-type trunk $(_EXCLUDE_ARG) --format paths))
 else
 	$(eval _ALL := $(shell python3 $(FILTER_SCRIPT) --config-dir $(TEST_CONFIGS) --test-type "$(TEST_TYPE)" $(_EXCLUDE_ARG) --format paths))
+# The default scan also takes upstream PyTorch configs carrying this label, as integration-tests.yaml does on amd64.
+ifeq ($(TEST_CONFIGS),tests/configs/torch_spyre_tests)
+	$(eval _ALL += $(shell python3 $(FILTER_SCRIPT) --config-dir tests/configs/upstream_tests --test-type "$(TEST_TYPE)" $(_EXCLUDE_ARG) --format paths 2>/dev/null))
+endif
 endif
 	$(eval _DISTRIBUTED := $(abspath $(wildcard tests/configs/distributed_tests/*.yaml)))
 	$(eval _PATHS := $(filter-out $(_DISTRIBUTED),$(_ALL)))

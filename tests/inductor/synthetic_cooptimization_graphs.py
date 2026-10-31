@@ -51,7 +51,7 @@ structure the captures under-cover:
 
 from __future__ import annotations
 
-from tests.inductor.cooptimization_capture_loader import CapturedGraph
+from cooptimization_capture_loader import CapturedGraph
 from torch_spyre._inductor.scratchpad.plan_solver import (
     BufferType,
     CoreDivision,

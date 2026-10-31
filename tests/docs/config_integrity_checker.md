@@ -183,7 +183,7 @@ test_suite_config:
             - TestOps::test_linalg_norm_keepdim.*
             - TestOps::test_argmin_keepdim0
             - TestOps::test_min_tuple_output_keepdim0
-            - TestOps::test_logsumexp_keepdim0_known_xfail
+            - TestOps::test_logsumexp_keepdim0
             # test_mean has a param "3d_dim0_keepdim" — explicit entry needed
             # because the base method lives in the misc shard
             - TestOps::test_mean_3d_dim0_keepdim

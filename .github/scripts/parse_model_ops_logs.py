@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# v1 model-ops: delete once the dashboard reads v2 capabilities
 """
 Parse raw GHA job logs produced by the model-ops-tests workflow and produce:
 

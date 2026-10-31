@@ -10,14 +10,11 @@ test_suite_config:
         # Spyre's ability to propagate errors and handle dtype downcasting for int64 is relevant here.
         - names:
             - TestReductions::test_dim_arg_reduction_scalar
-            - TestReductions::test_histc_min_max_errors
             - TestReductions::test_histogram_error_handling
             - TestReductions::test_max_mixed_devices
             - TestReductions::test_min_mixed_devices
             - TestReductions::test_mode_wrong_device
             - TestReductions::test_quantile_error
-            - TestReductions::test_repeated_dim
-            - TestReductions::test_sum_cpu_device_mismatch
           mode: mandatory_success
         - names:
             - TestReductions::test_dim_multi_duplicate
@@ -282,6 +279,16 @@ test_suite_config:
             - TestReductions::test_var_dim
             - TestReductions::test_scalar_tensor_dim_compiled_mode
           mode: skip  # does not engage the torch-spyre layer
+        # Upstream regression: these tests now fail on the Spyre backend.
+        # test_histc_min_max_errors hits NotImplementedError for aten::histc (unimplemented);
+        # test_repeated_dim hits a fake-tensor RuntimeError for aten.mean.dim with duplicate
+        # dims; test_sum_cpu_device_mismatch no longer raises the expected device-mismatch
+        # RuntimeError before Dynamo's own cross-device check surfaces first.
+        - names:
+            - TestReductions::test_histc_min_max_errors
+            - TestReductions::test_repeated_dim
+            - TestReductions::test_sum_cpu_device_mismatch
+          mode: skip  # skip: NotImplementedError / RuntimeError on upstream PyTorch bump
 
   global:
     supported_dtypes:

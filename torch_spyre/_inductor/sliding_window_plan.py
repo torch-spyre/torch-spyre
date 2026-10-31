@@ -24,6 +24,7 @@ from dataclasses import dataclass
 # Elements per 128-byte stick at fp16. At float32 a stick holds 32 and the
 # alignment reasoning here does not carry.
 STICK = 64
+MAX_QUERY_BLOCK = 512
 
 
 def default_buffer_origin(seqlen_kv: int, cache_capacity: int) -> int:
@@ -233,16 +234,27 @@ def _required_width(
     return _ceil_stick(widest)
 
 
-def query_blocking(seqlen_q: int) -> tuple[int, int]:
+def query_blocking(seqlen_q: int, max_query_block: int = STICK) -> tuple[int, int]:
     """Block size and padded query length — one decision, so returned together.
 
     Decode takes a single-row block and no padding: padding one row to a full
-    block would be 64x the work for one row of output. The caller pads at the
+    block would be 64x the work for one row of output. Prefill uses the largest
+    stick-aligned divisor of the padded query length up to ``max_query_block``.
+    This lets a full-cache scan amortize its HOP over a 512-row chunk while a
+    narrow static window retains fine-grained placement. The caller pads at the
     FRONT (see spyre_sliding_window_attention).
     """
     if seqlen_q == 1:
         return 1, 1
-    return STICK, _ceil_stick(seqlen_q)
+    padded_seqlen_q = _ceil_stick(seqlen_q)
+    # Production callers pass STICK or MAX_QUERY_BLOCK; keep the helper
+    # bounded defensively if a future caller requests a larger block.
+    max_query_block = min(max_query_block, MAX_QUERY_BLOCK)
+    largest_candidate = min(padded_seqlen_q, max_query_block)
+    for q_block in range(largest_candidate, STICK - 1, -STICK):
+        if padded_seqlen_q % q_block == 0:
+            return q_block, padded_seqlen_q
+    return STICK, padded_seqlen_q
 
 
 def rejection_reason(

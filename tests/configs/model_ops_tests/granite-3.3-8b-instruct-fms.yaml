@@ -80,7 +80,7 @@ test_suite_config:
             - TestSpyreModelOps::test_model_ops_db
           mode: xfail
           tags:
-            - model__granite-3.3-8b-instruct-fms_spyre
+            - model__granite-3.3-8b-instruct-fms
           edits:
             ops:
               include:

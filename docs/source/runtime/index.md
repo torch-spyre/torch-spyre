@@ -7,12 +7,12 @@ machinery, eager-mode dispatch, streams, and multi-card support.
 
 ## Responsibilities
 
-- **Device registration** — registering `spyre` as a PyTorch device type
-- **Tensor memory management** — allocating and freeing device DRAM (DDR)
+- **Device registration**: registering `spyre` as a PyTorch device type
+- **Tensor memory management**: allocating and freeing device DRAM (DDR)
   for `SpyreTensorImpl` objects
-- **DMA transfers** — moving tensor data between host (CPU) memory and
+- **DMA transfers**: moving tensor data between host (CPU) memory and
   device (DDR) memory via the `to()` / `from_device()` APIs
-- **Kernel dispatch** — loading compiled program binaries and
+- **Kernel dispatch**: loading compiled program binaries and
   orchestrating their execution across Spyre cores
 
 :::{figure} ../_static/images/pytorch-dispatcher.png
@@ -26,7 +26,7 @@ The PyTorch Dispatcher routes each operation to the correct device implementatio
 ## Device Registration
 
 Torch-Spyre registers `spyre` as a PyTorch device using the
-`PrivateUse1` mechanism — the standard PyTorch pathway for out-of-tree
+`PrivateUse1` mechanism, the standard PyTorch pathway for out-of-tree
 accelerators. Registration happens in `torch_spyre/__init__.py`'s
 `_autoload_impl()`, invoked by the run-once `_autoload()` entry point:
 
@@ -103,12 +103,12 @@ A standard PyTorch `(size, stride)` pair cannot describe a tiled device tensor, 
 
 The `SpyreTensorLayout` holds:
 
-- `device_size` — the tensor's shape on device, including the extra tiling and padding dims.
-- `stride_map` — the host stride for each device dim. A `-1` here means the dim is synthetic or fully padded.
-- `device_dtype` — the on-device data format, for example `SEN169_FP16`.
-- `element_arrangement` — how elements are packed within a stick (defaults to `STANDARD`).
+- `device_size`: the tensor's shape on device, including the extra tiling and padding dims.
+- `stride_map`: the host stride for each device dim. A `-1` here means the dim is synthetic or fully padded.
+- `device_dtype`: the on-device data format, for example `SEN169_FP16`.
+- `element_arrangement`: how elements are packed within a stick (defaults to `STANDARD`).
 
-Alongside the layout, `SpyreTensorImpl` carries `dma_sizes` and `dma_strides` directly — a host-shape DMA descriptor used when copying views back to the host. They drive `copyAsync()` in `spyre_stream.cpp`.
+Alongside the layout, `SpyreTensorImpl` carries `dma_sizes` and `dma_strides` directly, a host-shape DMA descriptor used when copying views back to the host. They drive `copyAsync()` in `spyre_stream.cpp`.
 
 Note that the handles returned to Python never carry a raw device pointer. That is a hard requirement on IBM Z.
 
@@ -137,7 +137,7 @@ What happens between a Python tensor going out of scope and the device allocatio
 When the allocator runs out of memory regions it invokes a registered
 memory-pressure callback. The torch-spyre callback releases the allocator mutex,
 calls `PyGC_Collect()` to free Python cyclic garbage, and re-acquires the mutex
-before returning — allowing the allocation to be retried. See
+before returning, allowing the allocation to be retried. See
 [Memory Pressure and Python GC](memory_pressure_gc.md) for the full GIL
 interaction and lock-ordering details.
 
@@ -155,11 +155,11 @@ Eager kernels reach the Spyre dispatch key from two Python sources.
 
 The first is manual registrations in [`torch_spyre/ops/eager.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/ops/eager.py), which use `register_torch_compile_kernel` to register the 45+ ops in `COMPILED_OPS` (arithmetic, comparison, reduction, activation, and view ops) for the PrivateUse1 dispatch key.
 
-In-place variants are *derived* from that same list by `register_inplace_kernels`, not listed separately: each `foo_` overload whose signature matches its functional `foo` sibling gets a kernel that computes functionally and writes back with `self.copy_()`. In-place ops must never be added to `COMPILED_OPS` directly — a standalone-compiled in-place kernel bakes its write-destination address at trace time and can clobber an unrelated live buffer, whereas `copy_` is addressed at runtime.
+In-place variants are *derived* from that same list by `register_inplace_kernels`, not listed separately: each `foo_` overload whose signature matches its functional `foo` sibling gets a kernel that computes functionally and writes back with `self.copy_()`. In-place ops must never be added to `COMPILED_OPS` directly: a standalone-compiled in-place kernel bakes its write-destination address at trace time and can clobber an unrelated live buffer, whereas `copy_` is addressed at runtime.
 
 The match requires the same overload name *and* an identical argument signature modulo the `(a!)` write-alias, so a same-named pair with different operand order is rejected rather than mis-paired: `pow_.Scalar(Tensor self, Scalar exponent)` versus `pow.Scalar(Scalar self, Tensor exponent)` would otherwise yield a kernel computing `other ** self`. The kernel also enforces PyTorch's in-place dtype contract, raising if the promoted result cannot be cast back to `self`.
 
-The second is CPU fallbacks in [`torch_spyre/ops/fallbacks.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/ops/fallbacks.py), registered through `@register_fallback` (or the `register_fallback_default` helper for plain pass-throughs). These cover the long tail: `arange`, `embedding`, `cumsum`, `tril`/`triu`, `isin`, `bitwise_xor`/`bitwise_or`, `argmax`, and similar.
+The second is CPU fallbacks in [`torch_spyre/ops/fallbacks.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/ops/fallbacks.py), registered through `@register_fallback` (or the `register_fallback_default` helper for plain pass-throughs). These cover the long tail: `arange`, `embedding`, `cumsum`, `tril`, `isin`, `bitwise_xor`/`bitwise_or`, `argmax`, and similar.
 
 Inductor decompositions registered through `register_spyre_decomposition` also dispatch eagerly when the underlying ATen op does not already have a PrivateUse1 kernel. See the [supported operations table](../user_guide/supported_operations.md) for the full list.
 
@@ -248,14 +248,24 @@ Three ordered `RuntimeOperation`s on a stream: a CPU callback computes the corre
    `processComputeOnHostCommand` with compiler-supplied metadata (`Hcm`) and
    writes a small correction blob into a pinned host buffer. The closure
    captures the metadata, the destination CompositeAddresses, and the buffer
-   pointer.
+   pointer. In `JobPlanStepHostCompute::construct` (`csrc/job_plan.cpp`), each
+   tensor's `kAddress` symbolic argument is populated by calling
+   `get_composite_address()` on the corresponding context tensor, and the
+   resulting `flex::CompositeAddress` values are passed to
+   `flex::createHostComputeParams()` as the host-compute argument list.
+   torch-spyre passes these composite addresses rather than resolving them in
+   `construct()`; flex resolves each `kAddress` slot to a concrete device
+   address when it builds the correction, following the
+   `SymbolicArgKind::kAddress` contract (`compositeAddressToDeviceAddress()` in
+   `csrc/job_plan.h`). The correction blob therefore carries the resolved
+   addresses regardless of where the allocator placed each tensor.
 2. **`JobPlanStepH2D`** copies that buffer into the program region on the device.
 3. **`JobPlanStepCompute`** then runs the kernel. The device-side prologue
    reads the corrections, patches the symbolic operands, and starts execution.
 
 The pinned host buffer is allocated once during `prepareKernel` and reused
 across launches. For tiled execution the same buffer cycles through every
-iteration — FIFO ordering guarantees each iteration's H2D consumes the buffer
+iteration. FIFO ordering guarantees each iteration's H2D consumes the buffer
 before the next iteration's HostCompute overwrites it.
 
 ## Multi-card and distributed execution
@@ -299,8 +309,7 @@ The layers between user code and the device. Green boxes are in-tree (Apache-2.0
 
 ### Supported collectives
 
-The following collectives are implemented today, all in synchronous (blocking)
-mode:
+The following collectives are implemented:
 
 | Collective | Status |
 |---|---|
@@ -312,11 +321,74 @@ mode:
 | `reduce` | Implemented |
 | `allreduce` | Implemented |
 
-`asyncOp=True` is rejected uniformly across these methods. The remaining
-process-group entries (`scatter`, `reduce_scatter`, `alltoall`,
+`broadcast`, `gather`, `allgather`, `reduce`, and `allreduce` also support
+`async_op=True`; wait for completion with the returned work handle's `wait()`.
+The remaining process-group entries (`scatter`, `reduce_scatter`, `alltoall`,
 `alltoall_base`, `_allgather_base`, `allreduce_coalesced`) raise
 `SpyreCCLNotSupportedException`. `recvAnysource` is intentionally
-unsupported — the protocol overhead is high and call sites are rare.
+unsupported: the protocol overhead is high and call sites are rare.
+
+### BF16 collective tensors
+
+`torch.bfloat16` Spyre tensors use DL16 (`SEN169_FP16`) device storage by
+default. Eager broadcast, gather, allgather, SUM reduce, and SUM allreduce communicate
+that storage directly, preserving the public BF16 dtype. Compiled broadcast,
+allgather, and SUM allreduce use the same device format. No intermediate
+conversion through `torch.float16` is required.
+
+As with other BF16 Spyre operations, computation uses DL16 arithmetic.
+Explicit tensor layouts containing native BF16 device storage are rejected;
+their bytes cannot be interpreted as DL16. This storage check runs when a
+tensor is submitted, since compile-time plans contain scalar metadata only.
+Both eager and compiled collective plans include the device allocation's
+padding, including padding introduced by a producer operation before a
+compiled collective. The storage-extent guard compares `numel()` with
+`dma_sizes`, which records the logical allocation shape, not the padded
+`device_size`. Ordinary allocated tensors therefore pass this guard even
+when their physical storage includes stick padding.
+
+Collectives require contiguous inputs with zero storage offset and a device
+storage descriptor covering the input's own elements. Eager allgather also accepts
+contiguous zero-offset input prefixes with larger base descriptors. When the input
+and outputs have linear DL16 storage without lazy value transforms, it borrows
+the input and limits the transfer to the output allocation, including the final
+stick's padding. Single-row logits prefixes take this path with no extra tensor
+allocation or device copy on repeated calls. This contract applies to every
+eligible FP16/BF16 prefix: output padding may contain values from the source
+beyond the logical prefix, and downstream operations must ignore that padding.
+Logical tensor elements remain unchanged. Tiled prefixes are materialized
+into their own allocation. The work handle
+retains the borrowed or materialized input through asynchronous completion.
+Other eager collectives and allgather outputs reject these views. A compiled collective buffer
+must have a finalized device layout describing its own size, stride, offset,
+and dtype; missing or incompatible metadata is rejected instead
+of planning from an unpadded logical element count. Compiled broadcast,
+allgather, and allreduce materialize view inputs into their own allocation
+before planning. Compiled broadcast and allgather preserve that finalized layout
+in their receive buffers, including padding beyond the default stick layout.
+Compiled allgather retains both its input and receive buffers until communication
+completes. In-place compiled allreduce copies the full completed result
+back to the original view even when waiting on a slice or reshape of the
+collective result. Reshapes or other stride-changing views before a wait require
+the original target to cover its full allocation; a stride-changing wait on a
+partial-allocation target raises an explicit error.
+Repeated waits reuse the current target, preserving mutations made after the first wait.
+Dtype-changing views of an outstanding in-place collective result are rejected;
+wait before changing the view's dtype.
+Eager callers must materialize other unsupported views explicitly before submission.
+
+**Compatibility note:** eager collectives now diagnose nonzero storage offsets
+and descriptors that still cover a larger base allocation. Contiguity was
+already required. Eager allgather borrows compatible linear zero-offset prefixes
+and materializes other zero-offset input views, while
+compiled broadcast, allgather, and allreduce materialize view inputs automatically.
+Materialize other unsupported views before submission.
+
+Zero-dimensional FP16/BF16 broadcast and SUM allreduce retain scalar shape.
+A scalar has one logical element (`dma_sizes` is empty, whose product is
+one), while its DL16 allocation occupies a full 64-element stick. Collective
+plans communicate that physical allocation, just as they do for padded
+multidimensional tensors; the host result remains a single scalar.
 
 ### One device per process
 
@@ -324,6 +396,13 @@ unsupported — the protocol overhead is high and call sites are rare.
 to a single Spyre device (typically `torch.device(f"spyre:{os.getenv('RANK', '0')}")`
 in the user code). The backend reuses the rank's existing flex runtime instance
 and default stream. It does not own a separate runtime context.
+
+### Compiled collectives and streams
+
+In compiled graphs, `wait_tensor` blocks the host until the collective
+finishes. Set `TORCH_SPYRE_DIST_ENFORCE_WAIT=1` to enforce that wait;
+when unset the wait is skipped and ordering relies on the
+default stream, where `spyre_comms` runs every collective.
 
 ## More in This Section
 

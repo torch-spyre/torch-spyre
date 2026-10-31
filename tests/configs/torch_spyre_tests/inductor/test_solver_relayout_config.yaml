@@ -2,9 +2,10 @@
 # (device-free), CP-SAT decision behavior on handcrafted instances
 # (device-free), and end-to-end firing on compiled graphs (device).
 # The tests patch their own solver configuration, so no special
-# environment is needed. The one skipped E2E test documents its own
-# unskip condition (a coarse-tiled decline test blocked on an upstream
-# symbolic-objective crash).
+# environment is needed. All E2E tests run (no skips): the former
+# coarse-tiled decline test is split into a cross-group decline test
+# and a same-group offer-and-price test (torch-spyre#5057), after #5367
+# removed its skip once the symbolic-objective crash it cited was fixed.
 test_suite_config:
   labels: [regression, trunk]
   files:

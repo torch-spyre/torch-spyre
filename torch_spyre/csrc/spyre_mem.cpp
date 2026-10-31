@@ -53,7 +53,7 @@ namespace spyre {
  *
  * @param sizes: dimension sizes of the CPU tensor
  * @param strides: dimension strides of the CPU tensor
- * @param device_sizes: dimesion sizes of dev tensor
+ * @param device_sizes: dimension sizes of dev tensor
  * @param stride_map: mapping of strides of the CPU tensor to sizes of dev
  *                    tensor
  * @return index in `strides` that the `stride_map` value corresponds to.
@@ -100,7 +100,7 @@ auto get_dim_map(c10::IntArrayRef sizes, c10::IntArrayRef strides,
  *
  * @param sizes: dimension sizes of the CPU tensor
  * @param strides: dimension strides of the CPU tensor
- * @param device_sizes: dimesion sizes of dev tensor
+ * @param device_sizes: dimension sizes of dev tensor
  * @param stride_map: mapping of strides of the CPU tensor to sizes of dev
  *                    tensor
  * @return ordered indices (from back-to-front) in `stride_map` that the
@@ -165,32 +165,26 @@ auto get_tile_map(c10::IntArrayRef sizes, c10::IntArrayRef strides,
 /*
  * Fills out size and strides for each dimension of the tensor.
  *
- * @param sizes: dimension sizes of the tensor
- * @param spyre_dma_strides: Spyre device tensor DMA strides (for structural
- * matching)
- * @param storage_offset: storage offset of the CPU tensor
+ * @param sizes: dimension sizes of the CPU tensor
+ * @param strides: dimension strides of the CPU tensor
+ * @param cpu_offset: storage offset of the CPU tensor
+ * @param device_offset: storage offset of the dev tensor
  * @param stl: SpyreTensorLayout of dev tensor
  * @param host2device: direction of data conversion
- * @param cpu_tensor_strides: actual dimension strides of the CPU tensor
  * @return description of data conversion
  */
-auto get_device_stride_infos(c10::IntArrayRef sizes,
-                             c10::IntArrayRef spyre_dma_strides,
-                             int64_t storage_offset, SpyreTensorLayout stl,
-                             bool host2device,
-                             c10::IntArrayRef cpu_tensor_strides)
+auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
+                             int64_t cpu_offset, int64_t device_offset,
+                             SpyreTensorLayout stl, bool host2device)
     -> std::vector<DataConversionStrideInfo> {
   const std::vector<std::vector<int>> tile_map =
-      get_tile_map(sizes, spyre_dma_strides, stl.device_size, stl.stride_map);
+      get_tile_map(sizes, strides, stl.device_size, stl.stride_map);
 
-  const int host_rank = cpu_tensor_strides.size();
+  const int host_rank = strides.size();
   const int device_rank = stl.stride_map.size();
 
   // The host strides based on stride_map, used for remainder calculation.
   std::vector<int64_t> host_strides(device_rank, 1);
-  // The CPU layout strides (differs from stride_map for non-contiguous
-  // tensors).
-  std::vector<int64_t> cpu_layout_strides(device_rank, 1);
   // The device strides are always contiguous strides for device sizes.
   std::vector<int64_t> device_strides(device_rank, 1);
   // The sizes for the first DataConversionStrideInfo match the device sizes
@@ -207,21 +201,6 @@ auto get_device_stride_infos(c10::IntArrayRef sizes,
     // Size 1 dimensions are ignored.
     if (stl.stride_map[i] == -1) continue;
     host_strides[i] = stl.stride_map[i];
-    cpu_layout_strides[i] = stl.stride_map[i];
-  }
-
-  // Map host stride to actual CPU stride via stride map.
-  for (int dev_dim = 0; dev_dim < device_rank; dev_dim++) {
-    int64_t stride_map_val = stl.stride_map[dev_dim];
-    if (stride_map_val <= 0) continue;  // Skip non-data dims (like -1 or 0)
-
-    for (int host_dim = 0; host_dim < host_rank; host_dim++) {
-      if (spyre_dma_strides[host_dim] == stride_map_val) {
-        // Update with CPU tensor stride.
-        cpu_layout_strides[dev_dim] = cpu_tensor_strides[host_dim];
-        break;
-      }
-    }
   }
 
   // The sizes for the subsequent DataConversionStrideInfo (remainders) match
@@ -238,13 +217,13 @@ auto get_device_stride_infos(c10::IntArrayRef sizes,
     // Dimensions that do not appear in the tile map are ignored.
     if (tile_map[i].size() == 0) continue;
 
-    const int64_t host_stride = spyre_dma_strides[i];
+    const int64_t host_stride = strides[i];
     int64_t host_size = sizes[i];
 
     // Fold leading host dimensions that do not appear in the tile map.
     for (int j = i - 1; j > -1 && tile_map[j].size() == 0; j--) {
       // Expanded dimensions are ignored.
-      if (spyre_dma_strides[j] == 0) continue;
+      if (strides[j] == 0) continue;
 
       host_size *= sizes[j];
     }
@@ -255,7 +234,7 @@ auto get_device_stride_infos(c10::IntArrayRef sizes,
     // back-to-front.
     //
     // These are stored in the tile map from back-to-front, so we are in effect
-    // iterting them from front-to-back.
+    // iterating them from front-to-back.
     for (int j = tile_map[i].size() - 1; j > -1; j--) {
       const int tile_index = tile_map[i][j];
       const int64_t tile_size = stl.device_size[tile_index];
@@ -317,7 +296,7 @@ auto get_device_stride_infos(c10::IntArrayRef sizes,
         // When the current elements is not evenly divisible by the tile stride
         // then this tile and the next tile have a remainder.
         //
-        // In these cases we get both tile and compute the dcsi sizes and
+        // In these cases we get both tiles and compute the dcsi sizes and
         // remainders for this tile and the next tile using the information from
         // both tiles. We then update the remainders and offsets so they can be
         // used to populate subsequent DataConversionStrideInfo.
@@ -364,10 +343,10 @@ auto get_device_stride_infos(c10::IntArrayRef sizes,
   // Create the first DataConversionStrideInfo.
   DataConversionStrideInfo stride_info;
   stride_info.size_ = dcsi_sizes;
-  stride_info.stride_src_ = host2device ? cpu_layout_strides : device_strides;
-  stride_info.stride_dst_ = host2device ? device_strides : cpu_layout_strides;
-  stride_info.offset_src_ = host2device ? storage_offset : 0;
-  stride_info.offset_dst_ = host2device ? 0 : storage_offset;
+  stride_info.stride_src_ = host2device ? host_strides : device_strides;
+  stride_info.stride_dst_ = host2device ? device_strides : host_strides;
+  stride_info.offset_src_ = host2device ? cpu_offset : device_offset;
+  stride_info.offset_dst_ = host2device ? device_offset : cpu_offset;
 
   std::reverse(stride_info.size_.begin(), stride_info.size_.end());
   std::reverse(stride_info.stride_src_.begin(), stride_info.stride_src_.end());
@@ -377,15 +356,17 @@ auto get_device_stride_infos(c10::IntArrayRef sizes,
 
   // Iterate through the remainders and create subsequent
   // DataConversionStrideInfo for each.
-  for (auto i = 0; i < remainders.size(); i++) {
+  for (size_t i = 0; i < remainders.size(); i++) {
     std::reverse(remainders[i].begin(), remainders[i].end());
-    const auto offset_src = host2device ? host_offsets[i] : device_offsets[i];
-    const auto offset_dst = host2device ? device_offsets[i] : host_offsets[i];
+    const int64_t offset_src =
+        host2device ? host_offsets[i] : device_offsets[i];
+    const int64_t offset_dst =
+        host2device ? device_offsets[i] : host_offsets[i];
 
-    const auto num_infos = stride_infos.size();
-    for (auto j = 0; j < num_infos; j++) {
+    const size_t num_infos = stride_infos.size();
+    for (size_t j = 0; j < num_infos; j++) {
       DataConversionStrideInfo info = stride_infos[j];
-      for (auto k = 0; k < device_rank; k++) {
+      for (int k = 0; k < device_rank; k++) {
         info.size_[k] =
             remainders[i][k] == 0 ? info.size_[k] : remainders[i][k];
       }
@@ -406,7 +387,7 @@ auto get_device_stride_infos(c10::IntArrayRef sizes,
  * @return data conversion information
  */
 auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
-                  SpyreTensorLayout stl, int64_t cpu_offset, bool host2device)
+                  SpyreTensorLayout stl, bool host2device)
     -> DataConversionInfo {
   // Support dtype conversion: populate DCI with both source and destination
   // dtype formats
@@ -437,6 +418,21 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   dci.isHostToSen_ = host2device;
   dci.dataformat_src_ = host2device ? cpu_format_host : stl.device_dtype;
   dci.dataformat_dst_ = host2device ? stl.device_dtype : cpu_format_host;
+  // deeptools reads/writes the host buffer as storage_bytes /
+  // hostFormatBytes(cpu_format_host). When that width disagrees with PyTorch's
+  // element size the access is out of bounds (uint8: host format SENUINT32
+  // claims 4 bytes for a 1-byte buffer), and the resulting ConvertData throw
+  // lands on the stream worker and shuts the stream down. Refuse up front.
+  // Allocation is untouched: torch.distributed allocates uint8 internally.
+  // TODO(#5493): the uint8 half of this gate goes away with the SENUINT8 remap.
+  const size_t host_bytes = hostFormatBytes(cpu_format_host);
+  const size_t torch_bytes = c10::elementSize(cpu_tensor->scalar_type());
+  TORCH_CHECK(host_bytes == 0 || host_bytes == torch_bytes,
+              "Spyre backend does not support dtype ",
+              cpu_tensor->scalar_type(),
+              " for host transfers: its host data format declares ", host_bytes,
+              " byte(s) per element but PyTorch stores ", torch_bytes,
+              ". See https://github.com/torch-spyre/torch-spyre/issues/1588");
   TORCH_CHECK(
       isDCIConversionSupported(dci.dataformat_src_, dci.dataformat_dst_),
       "Unsupported DCI data format conversion: src=",
@@ -444,59 +440,472 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
       " dst=", static_cast<int>(dci.dataformat_dst_),
       " (cpu_type=", cpu_str_type, ", dev_type=", dev_str_type, ")");
 
-  std::vector<int64_t> cpu_shape;
-  std::vector<int64_t> dev_shape = stl.device_size;
   auto spyre_tensor_impl =
       static_cast<SpyreTensorImpl*>(dev_tensor->unsafeGetTensorImpl());
 
-  c10::IntArrayRef t_sizes;
-  c10::IntArrayRef t_dev_strides;
-  c10::IntArrayRef t_cpu_strides;
+  std::vector<int64_t> cpu_sizes = cpu_tensor->sizes().vec();
+  std::vector<int64_t> cpu_strides = cpu_tensor->strides().vec();
+  std::vector<int64_t> dev_sizes = dev_tensor->sizes().vec();
+  std::vector<int64_t> dev_strides = dev_tensor->strides().vec();
+  const std::vector<int64_t> dma_sizes = spyre_tensor_impl->dma_sizes;
+  const std::vector<int64_t> dma_strides = spyre_tensor_impl->dma_strides;
+  std::vector<int64_t> device_sizes = stl.device_size;
 
-  // For 0D (scalar) tensors, synthesize [1]/[1] so the DMA engine gets rank-1
-  // shapes (senlib treats [] as "0 iterations"). The tensor metadata stays 0D.
-  static const int64_t one_arr[] = {1};
+  // While the source strides may differ from the destination strides when the
+  // source is non-dense or overlapping, the source sizes should always match
+  // the destination sizes.
+  //
+  // This is assumed to be true for the following logic, so this check should
+  // not be removed unless the following logic is updated accordingly.
+  TORCH_CHECK(cpu_sizes == dev_sizes,
+              "Invalid device sizes for host sizes. Expected: ", cpu_sizes,
+              ", got: ", dev_sizes);
+
+  const int64_t cpu_offset = cpu_tensor->storage_offset();
+  int64_t dev_offset = dev_tensor->storage_offset();
+  int64_t device_offset = 0;
+
+  const int device_rank = stl.stride_map.size();
+
+  // Compute the device_offset, which is the offset into stl.device_size, based
+  // on the dev_offset, which is the offset into dma_sizes.
+  std::vector<int64_t> device_strides(device_rank, 1);
+  int64_t device_elements = 1;
+  for (int i = device_rank - 1; i >= 0; i--) {
+    device_strides[i] = device_elements;
+    device_elements *= stl.device_size[i];
+  }
+
+  std::map<int64_t, int, std::greater<int64_t>> stride_map_to_j;
+  for (int i = 0; i < device_rank; i++) {
+    if (stl.stride_map[i] <= 0) continue;
+    if (stl.device_size[i] <= 1) continue;
+    if (stride_map_to_j.contains(stl.stride_map[i])) {
+      TORCH_CHECK(i == (device_rank - 1),
+                  "Invalid device sizes and stride map. Expected only 1 non-1 ",
+                  "device_size value for stride_map value ", stl.stride_map[i],
+                  "got: ", stl.device_size[i], " and ",
+                  stl.device_size[stride_map_to_j[stl.stride_map[i]]]);
+      continue;
+    }
+    stride_map_to_j.insert({stl.stride_map[i], i});
+  }
+
+  for (const auto& [stride, index] : stride_map_to_j) {
+    if (stride > dev_offset) continue;
+    const int64_t slice = dev_offset / stride;
+    device_offset += slice * device_strides[index];
+    dev_offset -= slice * stride;
+    if (dev_offset <= 0) break;
+  }
+
+  TORCH_CHECK(dev_offset == 0, "Invalid device tensor storage offset");
+  TORCH_CHECK(device_offset < device_elements, "Invalid device storage offset");
+
+  // If the dma_sizes contains more elements than dev_tensor contains then the
+  // dev_tensor is a slice.
+  const bool dev_sliced =
+      c10::multiply_integers(dma_sizes) > dev_tensor->numel();
+  if (dev_sliced) {
+    // In these cases we first update the dma_sizes and dma_strides to reflect
+    // the cpu_tensor sizes and strides.
+    //
+    // We then update the stride_map of the SpyreTensorLayout to reflect the
+    // updated dma_sizes and dma_strides.
+    //
+    // Note that these updates are only applied to the local copy of the
+    // dma_sizes, dma_strides, and SpyreTensorLayout. The SpyreTensorImpl for
+    // the dev_tensor is not modified.
+    const int host_rank = dev_tensor->dim();
+    const int dma_rank = dma_strides.size();
+
+    // Inflate or deflate cpu_sizes, cpu_strides, dev_sizes, and dev_strides
+    // to the same rank as dma_sizes and dma_strides.
+    std::vector<int64_t> adjusted_cpu_sizes;
+    std::vector<int64_t> adjusted_cpu_strides;
+    std::vector<int64_t> adjusted_dev_sizes;
+    std::vector<int64_t> adjusted_dev_strides;
+    for (int i = 0; i < dma_rank; i++) {
+      const int64_t dma_size = dma_sizes[i];
+      const int64_t dma_stride = dma_strides[i];
+      const int64_t next_stride = dma_size * dma_stride;
+      int64_t cpu_product = 1;
+      int64_t dev_product = 1;
+      int64_t cpu_min_stride = dma_stride;
+      int64_t dev_min_stride = dma_stride;
+      for (int j = 0; j < host_rank; j++) {
+        if (dev_strides[j] >= dma_stride && dev_strides[j] < next_stride) {
+          cpu_product *= cpu_sizes[j];
+          cpu_min_stride = std::min(cpu_min_stride, cpu_strides[j]);
+          dev_product *= dev_sizes[j];
+          dev_min_stride = std::min(dev_min_stride, dev_strides[j]);
+        }
+      }
+      cpu_product = std::min(cpu_product, dma_size);
+      adjusted_cpu_sizes.push_back(cpu_product);
+      adjusted_cpu_strides.push_back(cpu_min_stride);
+      dev_product = std::min(dev_product, dma_size);
+      adjusted_dev_sizes.push_back(dev_product);
+      adjusted_dev_strides.push_back(dev_min_stride);
+    }
+    cpu_sizes = std::move(adjusted_cpu_sizes);
+    cpu_strides = std::move(adjusted_cpu_strides);
+
+    // Reorder cpu_sizes, cpu_strides, dev_sizes, and dev_strides to the same
+    // ordering as dma_sizes and dma_strides.
+    std::vector<int64_t> dma_order(dma_rank);
+    std::iota(dma_order.begin(), dma_order.end(), 0);
+    std::sort(dma_order.begin(), dma_order.end(),
+              [&dma_strides, &dma_sizes](int64_t i1, int64_t i2) {
+                if (dma_strides[i1] == dma_strides[i2]) {
+                  if (dma_strides[i1] != 1 && dma_strides[i2] != 1) {
+                    return i1 > i2;
+                  }
+                  return dma_sizes[i1] != 1;
+                }
+                return dma_strides[i1] > dma_strides[i2];
+              });
+
+    std::vector<int64_t> dev_order(dma_rank);
+    std::iota(dev_order.begin(), dev_order.end(), 0);
+    std::sort(
+        dev_order.begin(), dev_order.end(),
+        [&adjusted_dev_strides, &adjusted_dev_sizes](int64_t i1, int64_t i2) {
+          if (adjusted_dev_strides[i1] == adjusted_dev_strides[i2]) {
+            if (adjusted_dev_strides[i1] != 1 &&
+                adjusted_dev_strides[i2] != 1) {
+              return i1 > i2;
+            }
+            return adjusted_dev_sizes[i1] != 1;
+          }
+          return adjusted_dev_strides[i1] > adjusted_dev_strides[i2];
+        });
+
+    std::vector<int64_t> ordered_sizes(dma_rank);
+    std::vector<int64_t> ordered_strides(dma_rank);
+    std::vector<int64_t> ordered_dev_sizes(dma_rank);
+    std::vector<int64_t> ordered_dev_strides(dma_rank);
+    for (int i = 0; i < dma_rank; i++) {
+      for (int j = 0; j < dma_rank; j++) {
+        if (dev_order[i] == dma_order[j]) {
+          ordered_sizes[i] = cpu_sizes[j];
+          ordered_strides[i] = cpu_strides[j];
+          ordered_dev_sizes[i] = adjusted_dev_sizes[j];
+          ordered_dev_strides[i] = adjusted_dev_strides[j];
+          break;
+        }
+      }
+    }
+    cpu_sizes = std::move(ordered_sizes);
+    cpu_strides = std::move(ordered_strides);
+    dev_sizes = std::move(ordered_dev_sizes);
+    dev_strides = std::move(ordered_dev_strides);
+
+    // Create a dst_stride_map that reflects cpu_sizes and cpu_strides.
+    // This is done in 3 passes.
+
+    // Pass 1: Fill dst_stride_map with the min of stride_map and cpu_strides.
+    std::map<int64_t, int> dma_stride_to_j;
+    for (int i = 0; i < dma_rank; i++) {
+      if (dma_sizes[i] == 1) continue;
+      dma_stride_to_j.insert({dma_strides[i], i});
+    }
+
+    std::vector<int64_t> dst_stride_map(device_rank, -2);
+    for (int i = 0; i < device_rank; i++) {
+      const int64_t device_size = stl.device_size[i];
+      if (device_size == 1) {
+        dst_stride_map[i] = -1;
+        continue;
+      }
+      const int64_t device_stride = stl.stride_map[i];
+      if (device_stride < 1) {
+        dst_stride_map[i] = device_stride;
+        continue;
+      }
+      if (dma_stride_to_j.find(device_stride) != dma_stride_to_j.end()) {
+        const int j = dma_stride_to_j[device_stride];
+        dst_stride_map[i] = std::min(device_stride, cpu_strides[j]);
+      }
+    }
+
+    // Pass 2: Compute missing values (tiles) using dst_stride_map values.
+    const std::vector<std::vector<int>> tile_map =
+        get_tile_map(dma_sizes, dma_strides, stl.device_size, stl.stride_map);
+
+    for (int i = 0; i < dma_rank; i++) {
+      for (const int& j : tile_map[i]) {
+        if (dst_stride_map[j] == -2) {
+          int64_t prev_stride = 1;
+          int prev_index = -1;
+          for (int k = 0; k < device_rank; k++) {
+            if (stl.device_size[k] == 1) continue;
+            if (stl.stride_map[k] < 1) continue;
+            if (stl.stride_map[k] >= stl.stride_map[j]) continue;
+            if (stl.stride_map[k] >= prev_stride) {
+              prev_stride = stl.stride_map[k];
+              prev_index = k;
+            }
+          }
+          if (prev_index != -1) {
+            const int64_t tile_size = stl.stride_map[j] / prev_stride;
+            prev_stride = dst_stride_map[prev_index];
+            dst_stride_map[j] = tile_size * prev_stride;
+          } else {
+            dst_stride_map[j] = stl.stride_map[j];
+          }
+        }
+      }
+    }
+
+    TORCH_CHECK(
+        std::all_of(dst_stride_map.begin(), dst_stride_map.end(),
+                    [](int64_t val) { return val != -2; }),
+        "Invalid device sizes and stride map for host sizes and strides");
+
+    // Pass 3: Update dst_stride_map values to reflect sliced sizes.
+    for (int i = 0; i < dma_rank; i++) {
+      for (const int& j : tile_map[i]) {
+        if (cpu_sizes[i] == 1) {
+          dst_stride_map[j] = -1;
+        } else if (dst_stride_map[j] > cpu_sizes[i] * cpu_strides[i]) {
+          dst_stride_map[j] = cpu_sizes[i] * cpu_strides[i];
+        }
+      }
+    }
+
+    stl.stride_map = dst_stride_map;
+  }
+
   if (host2device) {
-    if (cpu_tensor->dim() == 0) {
-      cpu_shape = {1};
-      t_sizes = c10::IntArrayRef(one_arr, 1);
-      t_dev_strides = c10::IntArrayRef(one_arr, 1);
-      t_cpu_strides = c10::IntArrayRef(one_arr, 1);
-    } else {
-      cpu_shape = cpu_tensor->sizes().vec();
-      t_sizes = cpu_tensor->sizes();
-      t_dev_strides = c10::IntArrayRef(spyre_tensor_impl->dma_strides);
-      t_cpu_strides = cpu_tensor->strides();
+    // If the dev_strides do not match the cpu_strides then the cpu_tensor is
+    // sliced and/or expanded.
+    if (cpu_strides != dev_strides) {
+      // In these cases we update the stride_map of the SpyreTensorLayout to
+      // reflect the cpu_strides instead of the dma_strides.
+      //
+      // Note that these updates are only applied to the local copy of the
+      // SpyreTensorLayout. The SpyreTensorImpl for the dev_tensor is not
+      // modified.
+      const int host_rank = cpu_sizes.size();
+
+      std::vector<int64_t> dst_stride_map = stl.stride_map;
+      std::vector<int64_t> dst_strides = dev_strides;
+
+      // Adjust the dst_stride_map and dst_strides for all expanded dimension by
+      // dividing all other stride values greater than expanded stride value by
+      // the amount expanded.
+      const std::vector<std::vector<int>> tile_map =
+          get_tile_map(dev_sizes, dev_strides, stl.device_size, stl.stride_map);
+
+      std::map<int64_t, int64_t> expands;
+      for (int i = 0; i < host_rank; i++) {
+        const int64_t cpu_stride = cpu_strides[i];
+        const int64_t dev_stride = dev_strides[i];
+        if (cpu_stride == 0) {
+          const int64_t expand = cpu_sizes[i];
+          expands.insert({dev_stride, expand});
+          for (const int& j : tile_map[i]) {
+            dst_stride_map[j] = 0;
+          }
+        }
+      }
+
+      for (int i = 0; i < device_rank; i++) {
+        if (dst_stride_map[i] <= 0) continue;
+        for (const auto& [stride, expand] : expands) {
+          if (stl.stride_map[i] <= stride) continue;
+          dst_stride_map[i] /= expand;
+        }
+      }
+
+      for (int i = 0; i < host_rank; i++) {
+        const int64_t dev_stride = dev_strides[i];
+        for (const auto& [stride, expand] : expands) {
+          if (dev_stride <= stride) continue;
+          dst_strides[i] /= expand;
+        }
+      }
+
+      stl.stride_map = dst_stride_map;
+
+      // Adjust the dst_stride_map for all sliced dimension by multiplying all
+      // other stride values greater than or equal to the sliced stride value
+      // by the amount sliced.
+      std::vector<int64_t> cpu_order(host_rank);
+      std::iota(cpu_order.begin(), cpu_order.end(), 0);
+      std::sort(cpu_order.begin(), cpu_order.end(),
+                [&cpu_strides, &cpu_sizes](int64_t i1, int64_t i2) {
+                  if (cpu_strides[i1] == cpu_strides[i2]) {
+                    if (cpu_sizes[i1] == 1 && cpu_sizes[i2] == 1) {
+                      return i1 < i2;
+                    }
+                    return cpu_sizes[i1] == 1;
+                  }
+                  return cpu_strides[i1] < cpu_strides[i2];
+                });
+
+      std::multimap<int64_t, int64_t> slices;
+      int64_t current_slices = 1;
+      for (const auto& i : cpu_order) {
+        const int64_t cpu_stride = cpu_strides[i];
+        const int64_t dev_stride = dst_strides[i];
+        TORCH_CHECK(
+            dev_stride > 0,
+            "Invalid destination stride. Expected > 0, got: ", dev_stride);
+        const int64_t slice = cpu_stride / dev_stride / current_slices;
+        if (slice > 1) {
+          slices.insert({dev_stride, slice});
+          current_slices *= slice;
+        }
+      }
+
+      for (int i = 0; i < device_rank; i++) {
+        if (dst_stride_map[i] <= 0) continue;
+        for (const auto& [stride, slice] : slices) {
+          if (stl.stride_map[i] < stride) continue;
+          dst_stride_map[i] *= slice;
+        }
+      }
+
+      stl.stride_map = dst_stride_map;
     }
   } else {
-    // Transfer contiguous memory, deal with view on cpu
-    if (spyre_tensor_impl->dma_sizes.size() == 0) {
-      cpu_shape = {1};
-      t_sizes = c10::IntArrayRef(one_arr, 1);
-      t_dev_strides = c10::IntArrayRef(one_arr, 1);
-      t_cpu_strides = c10::IntArrayRef(one_arr, 1);
-    } else {
-      cpu_shape = spyre_tensor_impl->dma_sizes;
-      t_sizes = c10::IntArrayRef(spyre_tensor_impl->dma_sizes);
-      t_dev_strides = c10::IntArrayRef(spyre_tensor_impl->dma_strides);
-      t_cpu_strides = c10::IntArrayRef(spyre_tensor_impl->dma_strides);
+    // If the device tensors is not sliced we use the original dma_sizes and
+    // dma_strides.
+    if (!dev_sliced) {
+      cpu_sizes = dma_sizes;
+      cpu_strides = dma_strides;
     }
   }
-  // Reverse PyTorch ordering
-  std::reverse(cpu_shape.begin(), cpu_shape.end());
-  std::reverse(dev_shape.begin(), dev_shape.end());
-  dci.dcsi_ = get_device_stride_infos(t_sizes, t_dev_strides, cpu_offset, stl,
-                                      host2device, t_cpu_strides);
+  // FP8 multi-dim stick layout uses specialized DCI generation
+  if (stl.element_arrangement == ElementArrangement::QFP8WT) {
+    // Reverse PyTorch ordering before reading N/K from cpu_sizes.
+    std::reverse(cpu_sizes.begin(), cpu_sizes.end());
+    std::reverse(device_sizes.begin(), device_sizes.end());
 
-  dci.input_shape_ = host2device ? cpu_shape : dev_shape;
-  dci.output_shape_ = host2device ? dev_shape : cpu_shape;
+    const int64_t eps = stl.elems_per_stick();
+    const int64_t si = 2;
+    const int64_t so = eps / si;
+    // cpu_sizes is reversed from PyTorch ordering [K, N] → [N, K], so
+    // cpu_sizes[0] = N (columns) and cpu_sizes[1] = K (rows).
+    const int64_t N = cpu_sizes[0];
+    const int64_t K = cpu_sizes[1];
+
+    // Expanded device shape: [si, so, K/si, N/so]
+    TORCH_CHECK(K % si == 0, "QFP8WT K=", K, " must be divisible by si=", si);
+    TORCH_CHECK(N % so == 0, "QFP8WT N=", N, " must be divisible by so=", so);
+    const int64_t dim2 = K / si;
+    const int64_t dim3 = N / so;
+
+    // Host strides for the expanded layout
+    const int64_t dst2 = si * so;  // = eps = 128 (one full [2,64] stick)
+    const int64_t dst3 =
+        dim2 * eps;  // = (K/si) * si * so = K * so (one N-strip of sticks)
+
+    // Host (row-major) strides in the expanded 4D index space [si, so, dim2,
+    // dim3]:
+    //   element [k,n]: k = d2*si + a,  n = d3*so + b
+    //   host byte = k*N + n = (d2*si + a)*N + (d3*so + b)
+    //             = a*N + b*1 + d2*(si*N) + d3*so
+    //   → stride_src = [N, 1, si*N, so]
+    const std::vector<int64_t> host_strides = {N, 1, si * N, so};
+
+    // Device (QFP8WT [2,64] stick) strides in the expanded 4D index space:
+    //   physical byte = a*1 + b*si + d2*dst2 + d3*dst3
+    //   (within a stick: si dimension innermost at stride=1, so dimension at
+    //   stride=si) → stride = [1, si, dst2, dst3]
+    const std::vector<int64_t> device_strides = {1, si, dst2, dst3};
+
+    DataConversionStrideInfo dcsi;
+    dcsi.size_ = {si, so, dim2, dim3};
+    dcsi.stride_src_ = host2device ? host_strides : device_strides;
+    dcsi.stride_dst_ = host2device ? device_strides : host_strides;
+    dcsi.offset_src_ = host2device ? cpu_offset : 0;
+    dcsi.offset_dst_ = host2device ? 0 : cpu_offset;
+    dci.dcsi_ = {dcsi};
+    // For H2D, output (device) shape is the expanded 4D form.
+    // For D2H, output (host) shape is the original 2D cpu_sizes.
+    const std::vector<int64_t> expanded_dev_shape = {si, so, dim2, dim3};
+    dci.output_shape_ = host2device ? expanded_dev_shape : cpu_sizes;
+    dci.input_shape_ = host2device ? cpu_sizes : device_sizes;
+  } else {
+    dci.dcsi_ = get_device_stride_infos(cpu_sizes, cpu_strides, cpu_offset,
+                                        device_offset, stl, host2device);
+
+    // Reverse PyTorch ordering
+    std::reverse(cpu_sizes.begin(), cpu_sizes.end());
+    std::reverse(device_sizes.begin(), device_sizes.end());
+    dci.input_shape_ = host2device ? cpu_sizes : device_sizes;
+    dci.output_shape_ = host2device ? device_sizes : cpu_sizes;
+  }
   if (SPYRE_LOG_ENABLED("spyre.runtime",
                         torch_spyre::logging::LogLevel::DEBUG)) {
     std::stringstream s;
     dci.exportJson(s);
-    SPYRE_RUNTIME_DEBUG() << __func__ << ": DataConversionInfo: " << s.str();
+    SPYRE_RUNTIME_DEBUG() << "DataConversionInfo: " << s.str();
   }
   return dci;
+}
+
+/*
+ * True when a DCI describes a pure memcpy: same source and destination
+ * element format, a single descriptor, identical src/dst strides and zero
+ * offsets, and strides that densely cover the element range (each
+ * non-degenerate dimension sits exactly at the running element count, so
+ * there are no gaps and no stick padding). Such a conversion moves the same
+ * bytes a raw DMA would, so the caller can submit the copy without a DCI and
+ * skip flex's host-side staging (deeptools::ConvertData) entirely.
+ *
+ * Anything else -- dtype conversion, strided/sliced views (non-zero offsets),
+ * stickified or padded device layouts, specialized ops -- keeps the DCI.
+ */
+bool dci_is_identity_copy(const DataConversionInfo& dci) {
+  if (dci.dataformat_src_ != dci.dataformat_dst_) return false;
+  if (dci.dcOpName_ != DataConvertOpFuncs::GENERAL_SHUFFLE) return false;
+  if (!dci.pre_input_shape_.empty() || !dci.post_output_shape_.empty())
+    return false;
+  if (!dci.pre_expand_dcsi_.empty() || !dci.post_slice_dcsi_.empty())
+    return false;
+  if (!dci.input_dimwise_ea_.empty() || !dci.output_dimwise_ea_.empty())
+    return false;
+  if (dci.useSpi_ || dci.usePca_ || dci.usePadVal_ || dci.useWli_) return false;
+  if (dci.dcsi_.size() != 1) return false;
+
+  const auto& dcsi = dci.dcsi_[0];
+  // Non-zero (even if equal) offsets mean positions before the offset are
+  // zero-filled by ConvertData but would hold stale bytes after a raw DMA;
+  // keep the DCI for views with a storage offset.
+  if (dcsi.offset_src_ != 0 || dcsi.offset_dst_ != 0) return false;
+  if (dcsi.stride_src_ != dcsi.stride_dst_) return false;
+
+  const auto& sizes = dcsi.size_;
+  const auto& strides = dcsi.stride_src_;
+  const size_t rank = sizes.size();
+  if (rank == 0 || strides.size() != rank) return false;
+
+  // Densely covering: ordered from the innermost (smallest) stride outward,
+  // every non-degenerate dimension must start exactly where the inner
+  // dimensions end. A padding gap or a broadcast stride fails this and keeps
+  // the DCI.
+  std::vector<std::pair<int64_t, int64_t>> dims;
+  dims.reserve(rank);
+  for (size_t i = 0; i < rank; i++) dims.emplace_back(strides[i], sizes[i]);
+  std::sort(dims.begin(), dims.end(),
+            [](const auto& a, const auto& b) { return a.first < b.first; });
+
+  int64_t numel = 1;
+  for (const auto& [stride, size] : dims) {
+    if (size < 1) return false;
+    if (size == 1) continue;
+    if (stride != numel) return false;
+    numel *= size;
+  }
+
+  // The covered elements must be the whole tensor, not a dense slice of it.
+  int64_t volume = 1;
+  for (const auto& dim : dci.output_shape_) volume *= dim;
+  return volume == numel;
 }
 
 // Empty op needs C++ code and cannot be handled by python side fallback
@@ -508,8 +917,7 @@ at::Tensor spyre_empty(c10::IntArrayRef size,
                        std::optional<c10::MemoryFormat> memory_format_opt) {
   c10::Device device = device_opt.value_or(
       c10::impl::VirtualGuardImpl{c10::DeviceType::PrivateUse1}.getDevice());
-  SPYRE_RUNTIME_DEBUG() << __func__ << ": shape=" << size << " on Spyre "
-                        << device;
+  SPYRE_RUNTIME_DEBUG() << "shape=" << size << " on Spyre " << device;
   const auto dtype = c10::dtype_or_default(dtype_opt);
   TORCH_CHECK(device.is_privateuseone());
   TORCH_CHECK(c10::layout_or_default(layout_opt) == c10::Layout::Strided,
@@ -546,8 +954,7 @@ at::Tensor spyre_empty(c10::IntArrayRef size,
   spyre_tensor_impl->spyre_layout = device_layout;
   spyre_tensor_impl->dma_sizes = size.vec();
   spyre_tensor_impl->dma_strides = tensor.strides().vec();
-  SPYRE_RUNTIME_DEBUG() << __func__
-                        << ": SpyreTensorLayout: " << device_layout.toString();
+  SPYRE_RUNTIME_DEBUG() << "SpyreTensorLayout: " << device_layout.toString();
   return tensor;
 }
 
@@ -572,7 +979,7 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
   caffe2::TypeMeta dtype = c10::scalarTypeToTypeMeta(scalar_type);
   c10::Device device = device_opt.value_or(
       c10::impl::VirtualGuardImpl{c10::DeviceType::PrivateUse1}.getDevice());
-  SPYRE_RUNTIME_DEBUG() << __func__ << ": Tensor info on CPU (Size:" << size
+  SPYRE_RUNTIME_DEBUG() << "Tensor info on CPU (Size:" << size
                         << ", Stride: " << stride << ", dtype: " << dtype
                         << ") to be mapped onto device " << device;
   auto device_layout = SpyreTensorLayout(size.vec(), stride.vec(), scalar_type,
@@ -603,8 +1010,7 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
   spyre_tensor_impl->dma_sizes = size.vec();
   spyre_tensor_impl->dma_strides = stride.vec();
 
-  SPYRE_RUNTIME_DEBUG() << __func__
-                        << ": SpyreTensorLayout: " << device_layout.toString();
+  SPYRE_RUNTIME_DEBUG() << "SpyreTensorLayout: " << device_layout.toString();
   return tensor;
 }
 
@@ -642,15 +1048,14 @@ at::Tensor spyre_empty_with_layout(c10::IntArrayRef size,
   spyre_tensor_impl->spyre_layout = device_layout;
   spyre_tensor_impl->dma_sizes = size.vec();
   spyre_tensor_impl->dma_strides = stride.vec();
-  SPYRE_RUNTIME_DEBUG() << __func__
-                        << ": SpyreTensorLayout: " << device_layout.toString();
+  SPYRE_RUNTIME_DEBUG() << "SpyreTensorLayout: " << device_layout.toString();
   return tensor;
 }
 
 at::Tensor& spyre_set_storage(at::Tensor& result, at::Storage storage,
                               int64_t storage_offset, c10::IntArrayRef size,
                               c10::IntArrayRef stride) {
-  SPYRE_RUNTIME_DEBUG() << __func__ << ": set method";
+  SPYRE_RUNTIME_DEBUG() << "set method";
   return at::cpu::set_(result, storage, storage_offset, size, stride);
 }
 
@@ -677,23 +1082,20 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
     // using dma_sizes/dma_strides/spyre_layout (the layout the data was
     // written with), then apply the logical view on the CPU side.
     //
-    // This path is taken when either:
-    //   (a) the tensor is not dense+non-overlapping (e.g. expanded/broadcast),
-    //       where the DMA path would drop broadcast/strided dims, OR
-    //   (b) product(dma_sizes) > self.numel(), meaning the physical allocation
-    //       is larger than the logical view (e.g. a slice of a flattened
-    //       tensor).  In that case the fast dense path would DMA dma_sizes
-    //       bytes into a dst sized from the logical shape, overflowing the
-    //       allocation and corrupting the heap.
+    // This path is taken when:
+    //   (a) the tensor is expanded/repeated, where we transfer the minimal
+    //       amount of data over DMA and allow the CPU to perform the
+    //       expand/repeat.
+    //   (b) the tensor is sliced along a tiled dimension, starts in the middle
+    //       of a tile, and goes beyond the tile it starts in.
+    //   (c) the tensor is sliced along a dimension not in the stride_map.
     if (self.is_privateuseone()) {
       auto* spyre_impl =
           static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl());
-      int64_t dma_numel = 1;
-      for (auto s : spyre_impl->dma_sizes) dma_numel *= s;
-      const bool physical_exceeds_logical = (dma_numel > self.numel());
-
-      if (!self.unsafeGetTensorImpl()->is_non_overlapping_and_dense_default() ||
-          physical_exceeds_logical) {
+      const bool expanded = std::ranges::any_of(
+          self.strides(), [](const int64_t& stride) { return stride < 1; });
+      const int64_t dma_numel = c10::multiply_integers(spyre_impl->dma_sizes);
+      if (expanded || dma_numel < self.numel()) {
         non_overlapping_and_dense = false;
         c10::IntArrayRef alloc_sizes(spyre_impl->dma_sizes);
         c10::IntArrayRef alloc_strides(spyre_impl->dma_strides);
@@ -702,6 +1104,86 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
         cpu_alloc = at::empty(alloc_sizes, dst.options());
         copy_from = &alloc_view;
         copy_to = &cpu_alloc;
+      } else if (dma_numel > self.numel()) {
+        auto stl = spyre_impl->spyre_layout;
+        const std::vector<std::vector<int>> tile_map =
+            get_tile_map(spyre_impl->dma_sizes, spyre_impl->dma_strides,
+                         stl.device_size, stl.stride_map);
+        // Iterate through each dimension in self and ensure it either is found
+        // in dma_strides or is a valid view of a stride in dma_strides.
+        //
+        // Dimensions that are not views will be found in dma_strides and the
+        // tile_map. These dimensions are also checked to ensure they are valid
+        // slices within the tile(s) they reside.
+        //
+        // Dimensions that are views will not be found in dma_strides or the
+        // tile_map. These dimensions are also checked to ensure all views of
+        // dma_sizes[n] have a product equal to dma_sizes[n] (no slice).
+        const int self_rank = self.dim();
+        const int dma_rank = spyre_impl->dma_strides.size();
+        std::vector<bool> is_view(dma_rank, false);
+        std::vector<int64_t> view_sizes(dma_rank, 1);
+        for (int i = 0; i < self_rank; i++) {
+          const int64_t stride = self.strides()[i];
+          const int64_t size = self.sizes()[i];
+          if (size == 1) continue;
+          for (int j = 0; j < dma_rank; j++) {
+            const int64_t dma_size = spyre_impl->dma_sizes[j];
+            if (dma_size == 1) continue;
+            const int64_t dma_stride = spyre_impl->dma_strides[j];
+            const int64_t next_stride = dma_size * dma_stride;
+            if (stride < dma_stride || stride >= next_stride) continue;
+            if (size != dma_size) {
+              // Try to find the index in the tile_map for this stride.
+              size_t index = 0;
+              for (; index < tile_map[j].size(); index++) {
+                const int tile_index = tile_map[j][index];
+                if (stl.stride_map[tile_index] == stride) break;
+              }
+              if (index < tile_map[j].size()) {
+                // If the index was found in the tile_map we ensure that the
+                // sliced start and size are in a valid locations within the
+                // tile(s).
+                const int64_t next_tile_stride =
+                    index + 1 < tile_map[j].size()
+                        ? stl.stride_map[tile_map[j][index + 1]]
+                        : next_stride;
+                const int64_t tile_size = next_tile_stride / stride;
+                const int64_t offset = self.storage_offset() % next_stride;
+                const int64_t dim_offset = offset / stride;
+                const int64_t tile_offset = dim_offset % tile_size;
+                if (tile_offset != 0 && tile_offset + size > tile_size) {
+                  // Technically this is a slice, but the slice is on a tiled
+                  // dimension, starts in the middle of a tile, and goes beyond
+                  // the tile it starts in.
+                  non_overlapping_and_dense = false;
+                  break;
+                }
+              } else {
+                // If the index was not found in the tile_map then this size is
+                // a view of the original dimension in dma_sizes.
+                is_view[j] = true;
+              }
+            }
+            view_sizes[j] *= size;
+            break;
+          }
+        }
+        for (int i = 0; i < dma_rank; i++) {
+          if (is_view[i] && view_sizes[i] != spyre_impl->dma_sizes[i]) {
+            non_overlapping_and_dense = false;
+            break;
+          }
+        }
+        if (!non_overlapping_and_dense) {
+          c10::IntArrayRef alloc_sizes(spyre_impl->dma_sizes);
+          c10::IntArrayRef alloc_strides(spyre_impl->dma_strides);
+          alloc_view = at::as_strided(self, alloc_sizes, alloc_strides,
+                                      /*storage_offset=*/0);
+          cpu_alloc = at::empty(alloc_sizes, dst.options());
+          copy_from = &alloc_view;
+          copy_to = &cpu_alloc;
+        }
       }
     }
   }
@@ -727,8 +1209,7 @@ at::Tensor empty_with_layout(
     std::optional<c10::MemoryFormat> memory_format_opt) {
   c10::Device device = device_opt.value_or(
       c10::impl::VirtualGuardImpl{c10::DeviceType::PrivateUse1}.getDevice());
-  SPYRE_RUNTIME_DEBUG() << __func__ << ": shape=" << size << " on Spyre "
-                        << device;
+  SPYRE_RUNTIME_DEBUG() << "shape=" << size << " on Spyre " << device;
   const auto dtype = c10::dtype_or_default(dtype_opt);
   TORCH_CHECK(device.is_privateuseone());
   TORCH_CHECK(c10::layout_or_default(layout_opt) == c10::Layout::Strided,
@@ -764,8 +1245,7 @@ at::Tensor empty_with_layout(
   spyre_tensor_impl->spyre_layout = device_layout;
   spyre_tensor_impl->dma_sizes = size.vec();
   spyre_tensor_impl->dma_strides = tensor.strides().vec();
-  SPYRE_RUNTIME_DEBUG() << __func__
-                        << ": SpyreTensorLayout: " << device_layout.toString();
+  SPYRE_RUNTIME_DEBUG() << "SpyreTensorLayout: " << device_layout.toString();
   return tensor;
 }
 
@@ -816,7 +1296,7 @@ const at::Tensor& spyre_resize_(
     self_impl->spyre_layout = new_layout;
     self_impl->dma_sizes = size_int.vec();
     self_impl->dma_strides = self_impl->strides().vec();
-    SPYRE_RUNTIME_DEBUG() << __func__ << ": resize_ to shape=" << size_int
+    SPYRE_RUNTIME_DEBUG() << "to shape=" << size_int
                           << " layout=" << self_impl->spyre_layout.toString();
     return self;
   }
@@ -835,7 +1315,7 @@ const at::Tensor& spyre_resize_(
   self_impl->dma_sizes = size_int.vec();
   self_impl->dma_strides = self_impl->strides().vec();
   at::_copy_from(cpu_buf, self, /*non_blocking=*/false);
-  SPYRE_RUNTIME_DEBUG() << __func__ << ": resize_ expand to shape=" << size_int
+  SPYRE_RUNTIME_DEBUG() << "expand to shape=" << size_int
                         << " layout=" << self_impl->spyre_layout.toString();
   return self;
 }
@@ -846,13 +1326,21 @@ at::Tensor spyre_fill_tensor(const at::Tensor& self, double value) {
   TORCH_CHECK(self.numel() > 0, "spyre_fill_tensor: cannot fill empty tensor");
 
   // Map torch dtype to DataFormats for the value->pattern conversion, which
-  // fillAsync performs internally.
+  // flex::createFillAsyncParams performs internally.
   DataFormats dtype = get_device_dtype(self.scalar_type());
 
-  // Launch a device-side MEMORY_FILL DMA via the typed fillAsync overload.
+  // Launch a device-side MEMORY_FILL DMA. createFillAsyncParams converts value
+  // to the dtype-specific fill pattern; launchFillAsync submits it.
+  auto* params = flex::createFillAsyncParams(get_composite_address(self), value,
+                                             dtype, /*use_dmai=*/true);
+  struct Guard {
+    flex::FillAsyncParams* p;
+    ~Guard() {
+      flex::destroyFillAsyncParams(p);
+    }
+  } guard{params};
   SpyreStream stream;
-  stream.fillAsync(get_composite_address(self), value, dtype,
-                   /*use_dmai=*/true);
+  stream.launchFillAsync(params);
 
   return self;
 }

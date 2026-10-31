@@ -193,6 +193,11 @@ def compute_indirect_max_dim_sizes(
             return -1
         active_dims = _get_index_active_dims_for_value(index_arg, symbol_mapping)
         if len(active_dims) > 1 and dim != active_dims[-1]:
+            # A tiled index-table row can retain the full table's physical
+            # extent. A singleton role still accesses only one row per trip.
+            for symbol, (extent, _) in op_spec.iteration_space.items():
+                if symbol_mapping.get(symbol, symbol) == dim and extent == 1:
+                    return 1
             return idx_size
         return 1
 

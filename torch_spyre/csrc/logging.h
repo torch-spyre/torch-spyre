@@ -17,7 +17,6 @@
 #pragma once
 
 #include "logging_config.h"
-#include "logging_legacy.h"
 
 // Re-export new logging interface
 using torch_spyre::logging::Logger;

@@ -16,11 +16,8 @@
 
 // Native (C++) accelerator for the permutation-based scratchpad layout packer.
 //
-// This mirrors the *observable* behaviour of the canonical Python
-// ``PermutationBasedLayoutSolver``
-// (``torch_spyre/_inductor/scratchpad/permutation_layout.py``): given a
-// permutation (allocation order), per-buffer sizes and LX-eligibility, it
-// places every buffer on top of the earlier-placed, time-overlapping buffers
+// Given a permutation (allocation order), per-buffer sizes and LX-eligibility,
+// it places every buffer on top of the earlier-placed, time-overlapping buffers
 // (with in-place reuse and a capacity/eviction gate) and exposes the resulting
 // ``addresses`` (None == evicted / HBM), ``quality()`` and
 // ``count_allocated()``.
@@ -28,13 +25,10 @@
 // Placement is a pure function of (permutation, sizes, eligibility, lifetimes),
 // so after every mutating op the layout is recomputed from scratch in
 // permutation order using precomputed time-overlap sets plus the saturation
-// early-stop -- i.e. the same decision the Python reference/from-scratch placer
-// makes, which the incremental Python packer is differentially proven equal to.
-// The internal representation is therefore deliberately simpler than Python's
-// below/above contact profiles (the task allows any internal representation
-// that reproduces the observable state); the speedup comes from staying in C++
-// and never touching a Python object per operation. Buffer fields are read
-// exactly once, in the constructor.
+// early-stop -- the same decision the from-scratch
+// ``ReferencePermutationBasedLayoutSolver`` in the test suite makes, which
+// ``tests/inductor/test_perm_layout_solver.py`` asserts differentially after
+// every operation. Buffer fields are read exactly once, in the constructor.
 
 #include "perm_layout_native.h"
 
@@ -132,7 +126,7 @@ class NativePermutationLayoutSolver {
     auto st = std::make_shared<StaticData>();
     // Retained (not just read once): ``finalize`` writes each address back onto
     // the Python buffer objects. Shared, never deep-copied by ``copy()`` --
-    // the same contract as the Python packer's ``self.buffers = buffers``.
+    // the same contract as the Python reference's ``self.buffers = buffers``.
     buffers_ = buffers;
     const int n = static_cast<int>(buffers.size());
     st->n = n;
@@ -222,7 +216,7 @@ class NativePermutationLayoutSolver {
     // makes ``in_place_parents=["a"]`` ambiguous: first-wins (``emplace``) and
     // last-wins (Python's dict comprehension) are both arbitrary. Reject
     // instead of silently picking one. Mirrors the assert in
-    // ``PermutationBasedLayoutSolverBase.__init__``.
+    // ``ReferencePermutationBasedLayoutSolver.__init__``.
     if (static_cast<int>(name_to_idx.size()) != n) {
       throw std::invalid_argument("buffer names must be unique");
     }
@@ -246,10 +240,10 @@ class NativePermutationLayoutSolver {
         auto it = name_to_idx.find(pname);
         if (it == name_to_idx.end()) continue;
         int parent = it->second;
-        // The two invariants the Python packer asserts where it resolves the
-        // same pairs (``_compute_inplace_partners``), restated so the two
-        // packers reject the same inputs and not merely agree on the layouts
-        // they do produce. A write-only computed parent has no storage to hand
+        // The two invariants the Python reference asserts where it resolves
+        // the same pairs (``_compute_inplace_partners``), restated so the two
+        // reject the same inputs and not merely agree on the layouts they do
+        // produce. A write-only computed parent has no storage to hand
         // over; and ``PlaceDecision`` co-locates a declared partner on nothing
         // more than a time overlap, so a pair overlapping by more than the
         // handoff tick would be handed one address while both are live.
@@ -313,9 +307,9 @@ class NativePermutationLayoutSolver {
     permutation_[i + 1] = x;
     position_[x] = i + 1;
     position_[y] = i;
-    // No-op cases (identical to the Python packer): a transparent (HBM) member
-    // is outside the eligible stacking order, and independent buffers do not
-    // affect any address -- only the positions moved.
+    // No-op cases (identical to the Python reference): a transparent (HBM)
+    // member is outside the eligible stacking order, and independent buffers
+    // do not affect any address -- only the positions moved.
     if (!(eligible_[x] && eligible_[y])) return 0.0;
     if (!Overlaps(x, y)) return 0.0;
     const double old_total = total_quality_;
@@ -429,7 +423,7 @@ class NativePermutationLayoutSolver {
 
   // Write each buffer's address back onto the Python buffer object, for EVERY
   // index -- an evicted buffer gets ``None`` -- exactly like
-  // ``PermutationBasedLayoutSolverBase.finalize``.
+  // ``ReferencePermutationBasedLayoutSolver.finalize``.
   void finalize() const {
     for (int i = 0; i < st_->n; ++i) {
       py::object value =
@@ -439,7 +433,7 @@ class NativePermutationLayoutSolver {
   }
 
   // True if buffers ``i`` and ``j`` are alive at a common tick. Buffer-index
-  // args, bounds-checked; mirrors the Python base ``overlaps(i, j)``.
+  // args, bounds-checked; mirrors the Python reference's ``overlaps(i, j)``.
   bool overlaps(int i, int j) const {
     const int n = st_->n;
     if (i < 0 || i >= n || j < 0 || j >= n) {
@@ -449,7 +443,8 @@ class NativePermutationLayoutSolver {
   }
 
   // True if buffer ``idx`` has an address (fits below capacity).
-  // Bounds-checked; mirrors the Python base ``is_fully_allocated(idx)``.
+  // Bounds-checked; mirrors the Python reference's
+  // ``is_fully_allocated(idx)``.
   bool is_fully_allocated(int idx) const {
     if (idx < 0 || idx >= st_->n) {
       throw std::invalid_argument("is_fully_allocated index out of range");
@@ -458,8 +453,11 @@ class NativePermutationLayoutSolver {
   }
 
  private:
-  // Mirrors PermutationBasedLayoutSolverBase._build_interval_data. Takes a
-  // reference (not a pointer): the StaticData is a required, non-null argument.
+  // Cuts the timeline at the sorted unique lifetime endpoints and records, per
+  // resulting interval, how many buffers are alive on it and which intervals
+  // each buffer covers -- the data the saturation early-stop and the
+  // per-interval placement aggregates read. Takes a reference (not a pointer):
+  // the StaticData is a required, non-null argument.
   static void BuildIntervalData(StaticData& st) {
     const int n = st.n;
     std::vector<int64_t> pts;
@@ -505,7 +503,7 @@ class NativePermutationLayoutSolver {
 
   // Returns (parent, child) for an in-place pair. One of the two members must
   // declare the other as an in-place parent. Mirrors
-  // PermutationBasedLayoutSolverBase._in_place_pair.
+  // ReferencePermutationBasedLayoutSolver._in_place_pair.
   std::pair<int, int> InPlacePair(int i, int j) const {
     const std::vector<int>& dp = st_->declared_parents[i];
     if (std::find(dp.begin(), dp.end(), j) != dp.end()) {
@@ -514,8 +512,9 @@ class NativePermutationLayoutSolver {
     return {i, j};  // i parents j
   }
 
-  // Mirrors PermutationBasedLayoutSolverBase._placement_decision. ``cand`` are
-  // the already-placed, time-overlapping, eligible candidates for ``idx``.
+  // Mirrors ReferencePermutationBasedLayoutSolver._placement_decision.
+  // ``cand`` are the already-placed, time-overlapping, eligible candidates for
+  // ``idx``.
   // Returns {placed, addr}: {true, addr} if placed, {false, 0} if evicted
   // (None).
   std::pair<bool, int64_t> PlaceDecision(int idx,
@@ -565,8 +564,9 @@ class NativePermutationLayoutSolver {
   }
 
   // Places every buffer in permutation order with the saturation early-stop,
-  // rebuilding addresses, quality and the allocated count from scratch. Mirrors
-  // PermutationBasedLayoutSolverBase._sequential_place.
+  // rebuilding addresses, quality and the allocated count from scratch -- the
+  // same decision as ReferencePermutationBasedLayoutSolver._build, which takes
+  // none of the shortcuts.
   // --- RecomputeAll phases ---
 
   // Reset the saturation early-stop state and return the count of not-yet-

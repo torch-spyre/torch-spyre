@@ -48,8 +48,7 @@ std::shared_ptr<flex::FlexAllocator> SpyreAllocator::getFlexAllocator() {
       flex_alloc->registerMemoryPressureCallback(
           &SpyreAllocator::memoryPressureCallback);
       SPYRE_RUNTIME_DEBUG()
-          << __func__
-          << ": SpyreAllocator: registered memory pressure callback with "
+          << "(getFlexAllocator) registered memory pressure callback with "
              "FlexAllocator";
     }
   });
@@ -77,11 +76,24 @@ c10::CachingDeviceAllocator::DeviceStats SpyreAllocator::getDeviceStats(
   return stats_;
 }
 
+std::pair<size_t, size_t> SpyreAllocator::getMemoryInfo(
+    c10::DeviceIndex device) {
+  int64_t active_device_id = flex::RuntimeContext::getInstance()->getDeviceID();
+  TORCH_CHECK(static_cast<int64_t>(device) == active_device_id,
+              "SpyreAllocator::getMemoryInfo: requested device index ", device,
+              " does not match the active device (", active_device_id, ")");
+  auto flex_alloc = getFlexAllocator();
+  flex::MemoryStats mem_stats =
+      flex_alloc->getMemoryStats(flex::MemoryType::Tensor);
+  return {mem_stats.free_bytes, mem_stats.total_bytes};
+}
+
 void SpyreAllocator::resetAccumulatedStats(c10::DeviceIndex device) {
   std::lock_guard<std::mutex> lock(stats_mutex_);
   c10::CachingAllocator::for_each_selected_stat_type(
       stat_types, [&](size_t stat_type) {
         stats_.allocated_bytes[stat_type].reset_accumulated();
+        stats_.reserved_bytes[stat_type].reset_accumulated();
         stats_.allocation[stat_type].reset_accumulated();
       });
 }
@@ -91,56 +103,83 @@ void SpyreAllocator::resetPeakStats(c10::DeviceIndex device) {
   c10::CachingAllocator::for_each_selected_stat_type(
       stat_types, [&](size_t stat_type) {
         stats_.allocated_bytes[stat_type].reset_peak();
+        stats_.reserved_bytes[stat_type].reset_peak();
         stats_.allocation[stat_type].reset_peak();
       });
 }
 
-void SpyreAllocator::recordAlloc(size_t nbytes, void* data, int device_id) {
+void SpyreAllocator::recordAlloc(size_t nbytes, void* data, int device_id,
+                                 flex::MemoryType memory_type) {
+  // User-visible accounting (stats and profiler) is Tensor-only.
+  // Program and other non-Tensor allocations must not appear in user-visible
+  // memory stats: on release the CompositeAddress has already been moved out,
+  // so nbytes would be 0 and would leave an unmatched +N in the profiler.
+  if (memory_type != flex::MemoryType::Tensor) {
+    return;
+  }
   int64_t total_allocated;
+  int64_t total_reserved;
   {
     std::lock_guard<std::mutex> lock(stats_mutex_);
     c10::CachingAllocator::for_each_selected_stat_type(
         stat_types, [&](size_t stat_type) {
           stats_.allocation[stat_type].increase(1);
           stats_.allocated_bytes[stat_type].increase(nbytes);
+          stats_.reserved_bytes[stat_type].increase(nbytes);
         });
     total_allocated = stats_
                           .allocated_bytes[static_cast<size_t>(
                               c10::CachingAllocator::StatType::AGGREGATE)]
                           .current;
+    total_reserved = stats_
+                         .reserved_bytes[static_cast<size_t>(
+                             c10::CachingAllocator::StatType::AGGREGATE)]
+                         .current;
   }
   c10::Device curr_device =
       c10::Device(c10::DeviceType::PrivateUse1, device_id);
-  c10::reportMemoryUsageToProfiler(
-      data,
-      nbytes,           // alloc_size
-      total_allocated,  // total_allocated
-      total_allocated,  // total_reserved (currently same as total_allocated)
-      curr_device);
+  c10::reportMemoryUsageToProfiler(data,
+                                   nbytes,           // alloc_size
+                                   total_allocated,  // total_allocated
+                                   total_reserved,   // total_reserved
+                                   curr_device);
 }
 
-void SpyreAllocator::recordRelease(size_t nbytes, void* data, int device_id) {
+void SpyreAllocator::recordRelease(size_t nbytes, void* data, int device_id,
+                                   flex::MemoryType memory_type) {
+  // User-visible accounting (stats and profiler) is Tensor-only.
+  // Program and other non-Tensor allocations must not appear in user-visible
+  // memory stats: on release the CompositeAddress has already been moved out,
+  // so nbytes would be 0 and would leave an unmatched +N in the profiler.
+  if (memory_type != flex::MemoryType::Tensor) {
+    return;
+  }
   int64_t total_allocated;
+  int64_t total_reserved;
   {
     std::lock_guard<std::mutex> lock(stats_mutex_);
     c10::CachingAllocator::for_each_selected_stat_type(
         stat_types, [&](size_t stat_type) {
           stats_.allocation[stat_type].decrease(1);
           stats_.allocated_bytes[stat_type].decrease(nbytes);
+          stats_.reserved_bytes[stat_type].decrease(nbytes);
         });
     total_allocated = stats_
                           .allocated_bytes[static_cast<size_t>(
                               c10::CachingAllocator::StatType::AGGREGATE)]
                           .current;
+    total_reserved = stats_
+                         .reserved_bytes[static_cast<size_t>(
+                             c10::CachingAllocator::StatType::AGGREGATE)]
+                         .current;
   }
   c10::Device curr_device =
       c10::Device(c10::DeviceType::PrivateUse1, device_id);
-  c10::reportMemoryUsageToProfiler(
-      data,
-      -static_cast<int64_t>(nbytes),  // alloc_size
-      total_allocated,                // total_allocated
-      total_allocated,  // total_reserved (currently same as total_allocated)
-      curr_device);
+  c10::reportMemoryUsageToProfiler(data,
+                                   -static_cast<int64_t>(nbytes),  // alloc_size
+                                   total_allocated,  // total_allocated
+                                   total_reserved,   // total_reserved
+                                   curr_device);
 }
 
 c10::DataPtr SpyreAllocator::allocate(size_t nbytes) {
@@ -156,8 +195,8 @@ c10::DataPtr SpyreAllocator::allocate(
 
   auto device_id = curr_device.index();
 
-  SPYRE_RUNTIME_DEBUG() << __func__ << ": allocating " << nbytes
-                        << " (bytes) on Spyre" << curr_device;
+  SPYRE_RUNTIME_DEBUG() << "allocating " << nbytes << " (bytes) on Spyre"
+                        << curr_device;
   if (nbytes == 0) {
     return {nullptr, nullptr, &ReportAndDelete, curr_device};
   }
@@ -168,20 +207,21 @@ c10::DataPtr SpyreAllocator::allocate(
   flex::CompositeAddress composite_addr =
       flex_alloc->allocate(nbytes, directive);
 
-  SPYRE_RUNTIME_DEBUG() << __func__ << ": allocated " << composite_addr;
+  SPYRE_RUNTIME_DEBUG() << "allocated " << composite_addr;
   // FlexAllocator rounds up to DEVICE_ALIGNMENT (128 bytes), so the actual
   // allocation may be larger than the requested nbytes. Use total_size() for
   // accurate memory profiling.
   size_t actual_nbytes = composite_addr.total_size();
 
-  auto* ctx = new SharedOwnerCtx(std::move(composite_addr), device_id);
+  auto* ctx = new SharedOwnerCtx(std::move(composite_addr), device_id,
+                                 directive.memory_type);
   void* ctx_void = static_cast<void*>(ctx);
 
   // Use the SharedOwnerCtx pointer as the unique data handle for c10::DataPtr.
   // This pointer is never dereferenced — it serves only as a unique token for
   // memory profiling (recordAlloc/recordRelease).
   void* data_void = static_cast<void*>(ctx);
-  recordAlloc(actual_nbytes, data_void, device_id);
+  recordAlloc(actual_nbytes, data_void, device_id, directive.memory_type);
 
   auto data_ptr_result =
       at::DataPtr(data_void, ctx_void, &ReportAndDelete, curr_device);
@@ -197,7 +237,7 @@ void SpyreAllocator::ReportAndDelete(void* ctx_void) {
   size_t nbytes = ctx->composite_addr.total_size();
 
   SpyreAllocator::instance().recordRelease(nbytes, static_cast<void*>(ctx),
-                                           ctx->device_id);
+                                           ctx->device_id, ctx->memory_type);
   delete ctx;
 }
 
@@ -213,15 +253,16 @@ c10::DeleterFnPtr SpyreAllocator::raw_deleter() const {
 void SpyreAllocator::copy_data(void* dest, const void* src,
                                std::size_t count) const {
   py::gil_scoped_acquire acquire;
-  SPYRE_RUNTIME_DEBUG() << __func__ << ": entering allocator->copy_data method";
+  SPYRE_RUNTIME_DEBUG() << "called";
   // do nothing -- look into when this is called
   // spyre_copy_from(reinterpret_cast<spyre_ptr_t>(dest),
   // reinterpret_cast<spyre_ptr_t>(src));
 }
 
-uint64_t SpyreAllocator::compositeAddressToDmva(
+uint64_t SpyreAllocator::compositeAddressToDeviceAddress(
     const flex::CompositeAddress& addr) const {
-  return getFlexAllocator()->compositeAddressToDmva(addr);
+  return flex::compositeAddressToDeviceAddress(
+      addr, getFlexAllocator()->getIdToRegionMap());
 }
 
 void SpyreAllocator::memoryPressureCallback(
@@ -242,10 +283,7 @@ void SpyreAllocator::memoryPressureCallback(
   // handle the mutex correctly if this callback throws, so no catch-to-relock
   // pattern is needed here.
 
-  SPYRE_RUNTIME_DEBUG()
-      << __func__
-      << ": SpyreAllocator: memory pressure callback invoked, releasing "
-         "allocator mutex";
+  SPYRE_RUNTIME_DEBUG() << "releasing allocator mutex";
 
   // Step 1: Release allocator mutex
   lock.unlock();
@@ -253,37 +291,30 @@ void SpyreAllocator::memoryPressureCallback(
   // Step 2: Acquire Python GIL
   // PyGILState_Ensure() is safe to call from any thread, even if the thread
   // was not created by Python. It returns the previous GIL state.
-  SPYRE_RUNTIME_DEBUG()
-      << __func__
-      << ": SpyreAllocator: acquiring Python GIL for garbage collection";
+  SPYRE_RUNTIME_DEBUG() << "acquiring Python GIL for garbage collection";
   PyGILState_STATE gstate = PyGILState_Ensure();
 
   // Step 3: Trigger Python garbage collection
   // PyGC_Collect() runs a full collection cycle and returns the number of
   // unreachable objects found (or -1 on error)
-  SPYRE_RUNTIME_DEBUG() << __func__
-                        << ": SpyreAllocator: calling PyGC_Collect()";
+  SPYRE_RUNTIME_DEBUG() << "calling PyGC_Collect()";
   Py_ssize_t collected = PyGC_Collect();
 
   if (collected >= 0) {
-    SPYRE_RUNTIME_DEBUG()
-        << __func__ << ": SpyreAllocator: PyGC_Collect() completed, collected "
-        << collected << " objects";
+    SPYRE_RUNTIME_DEBUG() << "PyGC_Collect() completed, collected " << collected
+                          << " objects";
   } else {
-    SPYRE_RUNTIME_DEBUG() << __func__
-                          << ": SpyreAllocator: PyGC_Collect() returned error";
+    SPYRE_RUNTIME_DEBUG() << "PyGC_Collect() returned error";
   }
 
   // Step 4: Release Python GIL
-  SPYRE_RUNTIME_DEBUG() << __func__ << ": SpyreAllocator: releasing Python GIL";
+  SPYRE_RUNTIME_DEBUG() << "releasing Python GIL";
   PyGILState_Release(gstate);
 
   // Step 5: Re-acquire allocator mutex before returning to FlexAllocator
-  SPYRE_RUNTIME_DEBUG() << __func__
-                        << ": SpyreAllocator: re-acquiring allocator mutex";
+  SPYRE_RUNTIME_DEBUG() << "re-acquiring allocator mutex";
   lock.lock();
-  SPYRE_RUNTIME_DEBUG()
-      << __func__ << ": SpyreAllocator: memory pressure callback complete";
+  SPYRE_RUNTIME_DEBUG() << "memory pressure callback complete";
 }
 
 // Register our custom allocator

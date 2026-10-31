@@ -138,10 +138,14 @@ class _SpyreImpl:
         return default_generator.initial_seed()
 
     def is_available(self) -> bool:
+        # A process that doesn't own the card (forked, or started with
+        # IS_INDUCTOR_SPAWNED_SUBPROCESS=1) never starts the runtime, so it has
+        # no usable device. Reporting one makes torch.accelerator callers (e.g.
+        # Dynamo's stream tracking on every compile) reach stream code that
+        # needs the runtime, and the process aborts even for CPU-only code.
         if self._is_in_bad_fork():
-            return True
-        else:
-            return self.device_count() > 0
+            return False
+        return self.device_count() > 0
 
     def is_initialized(self):
         return self._initialized and not self._is_in_bad_fork()
@@ -366,11 +370,7 @@ def _autoload_impl():
         _orig_init = torch.profiler.profile.__init__
 
         def _init_with_spyre_profiler(self, *args, **kwargs):
-            # For first call, need to ensure torch_spyre._C is loaded so that SpyreProfiler is registered
-            if not torch.spyre.is_initialized():
-                torch.spyre._impl._lazy_init()
             try:
-                # This will automatically register the profiler
                 import torch_spyre._C  # noqa: F401
             except ImportError:
                 pass
@@ -388,6 +388,10 @@ def _autoload_impl():
     # to have enough cache space for all eager ops
     # You'll get recursion errors if this is exceeded
     torch._dynamo.config.cache_size_limit = 1024
+    # A second, independent cap that dynamo checks before the per-op limit
+    # above, so at its default of 256 it caps the cache whatever
+    # cache_size_limit says.
+    torch._dynamo.config.accumulated_cache_size_limit = 1024
 
     _orig_isAllocatorInitialized = torch._C._accelerator_isAllocatorInitialized
 
