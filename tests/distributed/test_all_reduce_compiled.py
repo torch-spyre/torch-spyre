@@ -22,6 +22,7 @@ Usage:
 """
 
 import os
+from unittest.mock import patch
 from types import SimpleNamespace
 
 import pytest
@@ -253,6 +254,43 @@ class TestAllReduceCompiled(TestCase):
         self.assertTrue(
             torch.allclose(result.to("cpu"), expected),
             f"Rank {self.comm_rank}: allreduce fp16 result incorrect",
+        )
+
+    def test_independent_compute_after_wait_is_hoisted_before_it(self):
+        """Compute written after the wait, but not reading the collective's
+        result, is emitted between allreduce_run and wait_work as its own kernel.
+        """
+        m, k, n = 128, 256, 256
+        x = torch.full((m, k), 0.01, dtype=torch.float16, device=DEVICE)
+        w = torch.full((k, n), 0.01, dtype=torch.float16, device=DEVICE)
+        y = torch.full((m, k), 0.01, dtype=torch.float16, device=DEVICE)
+
+        def late(x, w, y):
+            r = torch.ops._c10d_functional.all_reduce(x @ w, "sum", _GROUP_NAME)
+            r = torch.ops._c10d_functional.wait_tensor(r)
+            return r + torch.relu(y @ w)
+
+        with patch.object(spyre_config, "sink_collective_waits", True):
+            result, (code, *_) = run_and_get_code(torch.compile(late), x, w, y)
+
+        body = code[code.index("def call") :].splitlines()
+        run = next(i for i, line in enumerate(body) if "allreduce_run(" in line)
+        wait = next(i for i, line in enumerate(body) if "wait_work(" in line)
+        between = [line for line in body[run + 1 : wait] if ".run(" in line]
+        self.assertEqual(
+            len(between), 1, "expected relu(y @ w) between run and wait:\n" + code
+        )
+        # The hoisted kernel must not read the collective's buffer.
+        reduced = re.search(r"allreduce_run\((\w+),", body[run]).group(1)
+        self.assertNotIn(reduced, between[0])
+
+        expected = self.comm_size * k * 1e-4 + k * 1e-4
+        self.assertTrue(
+            torch.allclose(
+                result.to("cpu").float(), torch.full((m, n), expected), rtol=1e-2
+            ),
+            f"Rank {self.comm_rank}: got {result[0, 0].to('cpu').item()}, "
+            f"expected {expected}",
         )
 
     def test_allreduce_compiled_with_interleaved_compute(self):
@@ -498,7 +536,7 @@ class TestAllReduceCompiled(TestCase):
         from torch._inductor.virtualized import V
 
         from torch_spyre._inductor import lowering as spyre_lowering
-        from torch_spyre._inductor.ir import WaitWorkFallback
+        from torch_spyre._inductor.ir import get_copy_back_producer
 
         full_allocation = wait_kind in ("reshape", "nested")
         shape = (2, 2, 96) if full_allocation else (5, 96)
@@ -528,12 +566,12 @@ class TestAllReduceCompiled(TestCase):
                 return base * 0.5, ready * 0.5, again * 0.5
             return base * 0.5, ready * 0.5
 
-        wait_impl = spyre_lowering.lower_c10d_wait_tensor_async
+        wait_impl = spyre_lowering.lower_c10d_wait_tensor
         rebound = []
         mutations = []
 
         def wait_with_test_mutations(tensor):
-            producer = WaitWorkFallback.get_copy_back_producer(tensor)
+            producer = get_copy_back_producer(tensor)
             if (
                 wait_kind == "repeated"
                 and producer is not None
@@ -610,7 +648,7 @@ class TestAllReduceCompiled(TestCase):
         from torch._inductor import ir
 
         from torch_spyre._inductor.errors import Unsupported
-        from torch_spyre._inductor.ir import WaitWorkFallback
+        from torch_spyre._inductor.ir import copy_back_view
 
         layout = ir.FixedLayout(DEVICE, dtype, [4, 96], [96, 1])
         target = ir.TensorBox.create(ir.InputBuffer(name="target", layout=layout))
@@ -626,7 +664,7 @@ class TestAllReduceCompiled(TestCase):
             Unsupported,
             match="dtype-changing views of an in-place collective before its wait",
         ):
-            WaitWorkFallback.copy_back_view(ir.TensorBox(view), producer, target)
+            copy_back_view(ir.TensorBox(view), producer, target)
 
     @parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_allreduce_compiled_row_parallel_linear(self, dtype):

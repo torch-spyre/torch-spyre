@@ -14,7 +14,7 @@
 
 
 import math
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping, Sequence
 from typing import Optional
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
@@ -297,23 +297,26 @@ def storage_has_single_writer(
     graph: GraphLowering,
     producer: Operation,
     *,
-    transferred_mutation: Operation | None = None,
+    transferred_mutations: Sequence[Operation] = (),
 ) -> bool:
     """Prove fresh storage has no aliases or writers beyond its producer.
 
-    An explicitly transferred mutation (a collective moved onto a private
-    drain) may be exempted. Ordinary gathered sources have no exemption.
-    Inspect mutation/alias declarations as well as liveness dependencies.
+    Explicitly transferred mutations (a collective and its later accesses,
+    moved onto a private drain) are exempted, including the alias an in-place
+    collective declares on its operand. Ordinary gathered sources have no
+    exemption. Inspect mutation/alias declarations as well as liveness
+    dependencies.
     """
     name = producer.get_name()
     for op in graph.operations:
+        if any(op is moved for moved in transferred_mutations):
+            continue
         try:
             if (
-                (op is not transferred_mutation and name in op.get_mutation_names())
+                name in op.get_mutation_names()
                 or name in op.get_inputs_that_alias_output()
                 or (
                     op is not producer
-                    and op is not transferred_mutation
                     and any(dep.name == name for dep in op_read_writes(op).writes)
                 )
             ):
@@ -595,7 +598,7 @@ def _op_num_cores(op: Operation) -> int:
 def get_ncores_for_buffers(
     graph: GraphLowering,
     cache: Optional[dict] = None,
-    drained_readers: Optional[Mapping[str, str]] = None,
+    drained_readers: Optional[Mapping[str, Collection[str]]] = None,
 ) -> tuple[dict[str, int], dict[str, str], dict[str, PerCoreView]]:
     """
     Return ``(num_cores, mismatch_reasons, accepted_views)``, where ``num_cores`` maps each
@@ -611,9 +614,10 @@ def get_ncores_for_buffers(
     share only within a single graph, since the cache key includes the
     op name and `dep` (which carries the buffer name).
 
-    ``drained_readers`` maps a loop-carry storage to the collective that a
-    validated drain plan will repoint at the post-loop drain.  The judge runs
-    before that rewrite, so that collective's use is not one of the storage's.
+    ``drained_readers`` maps a loop-carry storage to the post-loop accesses (a
+    collective, its waits, later readers) that a validated drain plan will
+    repoint at the post-loop drain.  The judge runs before that rewrite, so
+    their uses are not the storage's.
     """
     from .lx_relayout import is_partial_lx_read, local_lx_subrange_certificate
 
@@ -622,9 +626,9 @@ def get_ncores_for_buffers(
     accepted_views: dict[str, PerCoreView] = {}
     buf_user_deps = _get_buffer_user_deps(graph)
     for buf_name, users in buf_user_deps.items():
-        drained_reader = (drained_readers or {}).get(buf_name)
-        if drained_reader is not None:
-            users = [(op, dep) for op, dep in users if op.get_name() != drained_reader]
+        drained = (drained_readers or {}).get(buf_name)
+        if drained:
+            users = [(op, dep) for op, dep in users if op.get_name() not in drained]
         layout = getattr(graph.try_get_buffer(buf_name), "layout", None)
         if is_empty_tiled_layout(layout):
             # Reject before the unsplit whole-buffer view shortcut and before
