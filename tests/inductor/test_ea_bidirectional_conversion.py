@@ -28,10 +28,12 @@ import pytest
 import torch
 from torch._inductor.exc import InductorError
 from torch_spyre._C import ElementArrangement, get_spyre_tensor_layout
-from torch_spyre._inductor import config
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
 from torch_spyre._inductor.constants import DEVICE_NAME
-from utils_inductor import expects_raise
+from utils_inductor import cached_randn, shapes2key, expects_raise
+
+
+EA = ElementArrangement
 
 
 def _run(fn, *args, mode="compile"):
@@ -55,10 +57,13 @@ def assert_ea(tensor, expected_ea):
     assert actual_ea == expected_ea, f"Expected: {expected_ea}, Got: {actual_ea}"
 
 
-def assert_val(fn, x, result):
-    x_cpu = x.cpu()
-    result_cpu = fn(x_cpu)
-    torch.testing.assert_close(result.cpu(), result_cpu, rtol=1e-3, atol=1e-3)
+def assert_val(fn, x, result, rtol=1e-3, atol=1e-3):
+    """Compare ``result`` to ``fn`` on CPU; ``x`` is a tensor or a tuple of them."""
+    result_ea = get_ea(result)
+    if result_ea == EA.STANDARD:
+        xs = x if isinstance(x, tuple) else (x,)
+        result_cpu = fn(*(t.cpu() for t in xs))
+        torch.testing.assert_close(result.cpu(), result_cpu, rtol=rtol, atol=atol)
 
 
 def ea_of(dev):
@@ -103,17 +108,19 @@ def test_fp16_to_fp32_standard_input(device, mode, fp16):
 
 @pytest.mark.parametrize("device", ["spyre"])
 @pytest.mark.parametrize("mode", ["compile", "eager"])
-def test_mixed_bf16_fp32_add_rejects_ea_mismatch(device, mode):
-    """A bf16/fp32 add must raise on EA mismatch instead of silently executing (#2843)."""
+def test_mixed_bf16_fp32_add_shuffles_ea_mismatch(device, mode):
+    """A bf16/fp32 add mixes EAs; a shuffle makes them match (#2843)."""
 
     def fn(x, y):
         return torch.add(x, y)
 
-    x_fp32 = torch.randn(5120, dtype=torch.float32, device=device)
-    y_bf16 = torch.randn(5120, dtype=torch.bfloat16, device=device)
+    x_fp32 = torch.randn(5120, dtype=torch.float32)
+    y_bf16 = torch.randn(5120, dtype=torch.bfloat16)
 
-    with pytest.raises(Exception, match="element arrangement|EA"):
-        _run(fn, x_fp32, y_bf16)
+    result = _run(fn, x_fp32.to(device), y_bf16.to(device), mode=mode)
+
+    assert_ea(result, ElementArrangement.STANDARD)
+    assert_val(fn, (x_fp32, y_bf16), result, rtol=1e-2, atol=1e-2)
 
 
 @pytest.mark.parametrize(
@@ -302,36 +309,22 @@ def test_int32_to_fp32_partial_stick_1d_then_rsqrt():
 
 # An op consuming an upcast FP32 value before the downcast back, on stick lengths
 # that end inside a stick. The upcast value is staggered: each FP16 stick spans a
-# pair of FP32 sticks. Padding the conversions is enough while work division
-# leaves the stick dim unsplit, or while the stick dim rounded up to FP32 sticks
-# is a whole number of pairs; (68,) is the unsplit case.
-_PARTIAL_STICK_UPCAST_PASS = [(68,), (196,), (232,), (1000,), (4, 100), (4, 104)]
-# Here work division splits the stick dim and the round-up ends in the middle of
-# a pair, so the pair's second stick is left to no core.
-# TODO: make work division handle staggered FP32, splitting the stick dim by
-# whole stick pairs.
-_PARTIAL_STICK_UPCAST_NEEDS_PAIRS = [(4100,), (4, 68), (4, 196)]
+# pair of FP32 sticks, and the last pair's second stick must still be processed
+# when work division splits the stick dim.
+_PARTIAL_STICK_UPCAST_SHAPES = [
+    (68,),
+    (196,),
+    (232,),
+    (1000,),
+    (4100,),
+    (4, 68),
+    (4, 100),
+    (4, 104),
+    (4, 196),
+]
 
 
-@pytest.mark.parametrize(
-    "shape",
-    [
-        *_PARTIAL_STICK_UPCAST_PASS,
-        *[
-            pytest.param(
-                shape,
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=AssertionError,
-                    reason="TODO: size work division for an upcast value by whole "
-                    "stick pairs, so the last pair's second stick is processed",
-                ),
-            )
-            for shape in _PARTIAL_STICK_UPCAST_NEEDS_PAIRS
-        ],
-    ],
-    ids=str,
-)
+@pytest.mark.parametrize("shape", _PARTIAL_STICK_UPCAST_SHAPES, ids=str)
 def test_upcast_consumed_on_partial_stick(shape):
     """An op between an FP16 -> FP32 -> FP16 round trip keeps every element.
 
@@ -347,83 +340,6 @@ def test_upcast_consumed_on_partial_stick(shape):
     x = (torch.randint(-64, 64, shape) / 8).to(torch.float16)
     result = torch.compile(fn)(x.to("spyre"))
     torch.testing.assert_close(result.cpu(), fn(x), rtol=0, atol=0)
-
-
-def _stagger_fn(x, fp16):
-    """fp32 → fp16(staggered) → stagger_to_standard_ea → standard EA fp16."""
-    return torch.ops.spyre.stagger_to_standard_ea(x.to(dtype=fp16))
-
-
-@pytest.mark.parametrize(
-    "x",
-    [
-        # 1-D: stick-aligned
-        torch.randn(64, dtype=torch.float32),
-        torch.randn(128, dtype=torch.float32),
-        # 1-D: non-stick-aligned (padded to 64-multiple)
-        torch.nn.functional.pad(torch.randn(44, dtype=torch.float32), (0, 20)),
-        # 2-D: stick-aligned
-        torch.randn(4, 64, dtype=torch.float32),
-        torch.randn(7, 128, dtype=torch.float32),
-        # 2-D: non-stick-aligned (padded)
-        torch.nn.functional.pad(torch.randn(7, 44, dtype=torch.float32), (0, 20)),
-        # 3-D: stick-aligned
-        torch.randn(2, 4, 64, dtype=torch.float32),
-        torch.randn(3, 5, 128, dtype=torch.float32),
-        # 3-D: non-stick-aligned (padded)
-        torch.nn.functional.pad(torch.randn(2, 4, 44, dtype=torch.float32), (0, 20)),
-        # 4-D: stick-aligned
-        torch.randn(2, 3, 4, 64, dtype=torch.float32),
-        torch.randn(2, 3, 4, 128, dtype=torch.float32),
-        # 4-D: non-stick-aligned (padded)
-        torch.nn.functional.pad(torch.randn(2, 3, 4, 44, dtype=torch.float32), (0, 20)),
-    ],
-)
-@pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
-@pytest.mark.parametrize(
-    "fp16",
-    DtypeOpTable.fp16_types(),
-    ids=lambda dt: str(dt).replace("torch.", ""),
-)
-def test_stagger_to_standard_ea(x, fp16):
-    """stagger_to_standard_ea restores standard EA after fp32→fp16 (fp32todl16).
-
-    Verifies:
-      1. Output values match a plain x.to(fp16) on CPU (logical correctness).
-      2. Output EA is STANDARD (layout correctness).
-    """
-    expected = x.to(fp16)
-
-    compiled_fn = torch.compile(_stagger_fn, backend="inductor")
-
-    # 1. Value correctness: Spyre result matches CPU fp16 cast.
-    # fp32→fp16 rounding differs slightly (Spyre uses DF16); use fp16 tolerances.
-    result = compiled_fn(x.to("spyre"), fp16).cpu()
-    torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
-
-    # 2. Layout correctness: output EA must be STANDARD.
-    spyre_result = compiled_fn(x.to("spyre"), fp16)
-    ea = get_spyre_tensor_layout(spyre_result).element_arrangement
-    assert ea == ElementArrangement.STANDARD, f"Expected STANDARD EA, got {ea}"
-
-
-@pytest.mark.parametrize("lx_planning", [False, True], ids=["hbm", "lx"])
-@pytest.mark.parametrize(
-    "fp16",
-    DtypeOpTable.fp16_types(),
-    ids=lambda dt: str(dt).replace("torch.", ""),
-)
-def test_stagger_to_standard_ea_one_core_row_order(lx_planning, fp16):
-    """Keep conflicting physical row segments local to one core (#4703)."""
-    torch._dynamo.reset()
-    # Distinct, exactly representable rows make a row permutation unambiguous.
-    x = torch.arange(8, dtype=torch.float32).reshape(2, 4, 1)
-    x = x.expand(2, 4, 64).contiguous()
-    with config.patch({"sencores": 1, "lx_planning": lx_planning}):
-        compiled_fn = torch.compile(_stagger_fn, backend="inductor", fullgraph=True)
-        result = compiled_fn(x.to(DEVICE_NAME), fp16)
-    torch.testing.assert_close(result.cpu(), x.to(fp16), atol=0, rtol=0)
-    assert_ea(result, ElementArrangement.STANDARD)
 
 
 _SLICED_RMSNORM_SHAPES = {
@@ -754,6 +670,58 @@ def test_pad_of_staggered_inside_stick_pair_raises():
 
     with pytest.raises(InductorError, match="not whole units"):
         torch.compile(fn)(a.to(DEVICE_NAME))
+
+
+# ---------------------------------------------------------------------------
+# Shuffle op
+# ---------------------------------------------------------------------------
+class TestEAShuffle:
+    """A multi-arg op mixing STANDARD and staggered operands gets a shuffle."""
+
+    BASIC_SHAPES = [(2, 64)]
+
+    OPS_DICT = {
+        "add": torch.add,
+        "mul": torch.mul,
+        "eq": torch.eq,
+    }
+
+    @pytest.mark.parametrize(
+        "shape", BASIC_SHAPES, ids=[shapes2key((s,)) for s in BASIC_SHAPES]
+    )
+    @pytest.mark.parametrize(
+        "op",
+        list(OPS_DICT.values()),
+        ids=list(OPS_DICT.keys()),
+    )
+    def test_shuffle_implicit_pointwise(self, shape, op):
+        def fn(x, y_std):
+            # x is fp32 -> fp16 (staggered FP32_TO_DL16) meets a STANDARD fp16
+            return op(x.to(torch.float16), y_std)
+
+        x = cached_randn(shape, dtype=torch.float32)
+        y = cached_randn(shape, dtype=torch.float16)
+
+        result = _run(fn, x.to(DEVICE_NAME), y.to(DEVICE_NAME))
+
+        assert_ea(result, EA.STANDARD)
+        assert_val(fn, (x, y), result, rtol=1e-2, atol=1e-2)
+
+    @pytest.mark.parametrize(
+        "shape", BASIC_SHAPES, ids=[shapes2key((s,)) for s in BASIC_SHAPES]
+    )
+    def test_shuffle_feeds_downstream_op(self, shape):
+        def fn(x, y):
+            # x is fp16 -> fp32 (staggered) -> shuffled to std for add with y (std)
+            return (x.to(torch.float32) + y) * 2.0
+
+        x = cached_randn(shape, dtype=torch.float16)
+        y = cached_randn(shape, dtype=torch.float32)
+
+        result = _run(fn, x.to(DEVICE_NAME), y.to(DEVICE_NAME))
+
+        assert_ea(result, EA.STANDARD)
+        assert_val(fn, (x, y), result, rtol=1e-2, atol=1e-2)
 
 
 # Made with Bob
