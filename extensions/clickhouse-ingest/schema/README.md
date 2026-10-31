@@ -35,7 +35,23 @@ Applying them in filename order works from an empty database.
 | `62-benchmark-verdicts.sql` | `benchmark_metric_policy`, `v_benchmark_metric_verdicts`, `v_benchmark_gate`, `benchmark_metric_verdicts` + its refreshable MV | 60 |
 | `63-perf-regression-gate.sql` | `v_perf_regression_gate` | 20, 62 |
 | `64-rbac.sql` | `rbac_roles`, `rbac_bindings`, each with a `*_versions` log and MV | — |
+| `65-insight-reports.sql` | `insight_reports`, `v_insight_reports` | — |
+| `66-chat-turns.sql` | `chat_turns` (kept forever), `chat_turn_retention`, `v_chat_turns`, `v_chat_turn_retention`, `v_chat_turn_daily` | — |
 | `70-vllm-hud-projection.sql` | `oss_ci_benchmark_v3`, `oss_ci_benchmark_metadata`, their `_by_tag` copies + their MVs | 30, 60 |
+
+Column names `chat_turns` shares with `vigil_ops.analyst_turns`, so one `UNION ALL` view can read both:
+
+| column | values |
+|---|---|
+| `ts` | DateTime64(3, 'UTC') |
+| `session_id` | the conversation |
+| `role` | what the call was for |
+| `actor`, `actor_kind` | `human`, `anonymous`, `agent`, `service` |
+| `model_alias`, `served_model` | display name, model id |
+| `prompt_version` | first 12 hex of the system prompt sha256 |
+| `tokens_in`, `tokens_out`, `latency_ms`, `cost_usd` | numbers, 0 when unknown |
+| `outcome` | `ok`, `rejected_schema`, `error`, `timeout`, `budget` |
+| `props` | Map(String, String), error detail |
 
 The `50`/`51`/`52` split is by what a view reads, not by taste: the artifact and functional view
 families are independent, and `v_run_coverage` is separate because it measures the join between
