@@ -466,5 +466,89 @@ class TestTheCacheKeySeparatesThem(unittest.TestCase):
         self.assertEqual(keys[0], keys[1])
 
 
+class TestTheRealKernelCacheRoundTrip(unittest.TestCase):
+    """Write an entry, reload the spec, and find the entry again.
+
+    The tests above check the serializer and the key one at a time. This one
+    goes through the kernel cache itself, in a scratch cache root: the first
+    compile commits an entry under its key, the reloaded spec must compute the
+    same key and hit it, and the loop_dimension kind stored with the entry must
+    come back with its bounds and source intact.
+    """
+
+    def test_a_reloaded_kernel_hits_the_entry_its_first_compile_wrote(self):
+        import os
+        import tempfile
+
+        from torch_spyre._inductor.codegen.compute_ops import SymbolKind
+        from torch_spyre.execution import kernel_cache
+
+        spec = LoopSpec(
+            count=FloorDiv(_sym(), TILE),
+            body=[],
+            count_symbol_bounds={SYM: (MAX, TILE)},
+            count_symbol_sources={SYM: (0, 0)},
+        )
+        kinds = [
+            SymbolKind.loop_dimension(
+                granularity=TILE,
+                max_value=MAX,
+                pytorch_sym=SYM,
+                arg_index=0,
+                dim_index=0,
+            ),
+            SymbolKind.kernel(0),
+        ]
+
+        with (
+            tempfile.TemporaryDirectory() as root,
+            mock.patch.dict(os.environ, {"TORCHINDUCTOR_CACHE_DIR": root}),
+        ):
+            key = kernel_cache.compute_specs_hash([spec])
+            tmp_dir = kernel_cache.allocate_compile_dir(key, kernel_name="k")
+            for artifact in (*kernel_cache._REQUIRED_ARTIFACTS, "sdsc_0.json"):
+                path = os.path.join(tmp_dir, artifact)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w") as f:
+                    f.write("{}")
+            kernel_cache.save_symbol_kinds(tmp_dir, kinds)
+            kernel_cache.commit_compile_dir(tmp_dir, key)
+
+            (reloaded,), _source = TestItSurvivesTheRealSerializer._round_trip(spec)
+            reloaded_key = kernel_cache.compute_specs_hash([reloaded])
+            cached_dir = kernel_cache.get_cached_kernel_dir(reloaded_key)
+
+            self.assertEqual(reloaded_key, key)
+            self.assertIsNotNone(cached_dir, "the reloaded kernel missed its entry")
+            self.assertEqual(kernel_cache.load_symbol_kinds(cached_dir), kinds)
+        self.assertEqual(reloaded.count_symbol_bounds, {SYM: (MAX, TILE)})
+        self.assertEqual(reloaded.count_symbol_sources, {SYM: (0, 0)})
+
+
+class TestTheFloorDivSpellingCanary(unittest.TestCase):
+    """The reload path depends on how a FloorDiv prints. Fail loudly if it moves.
+
+    The serializer writes a count as ``sympify('<str(count)>')`` and the cache
+    key hashes the count after one more sympify. Both rely on
+    ``str(FloorDiv(s, G))`` being ``(s//G)``, which sympify reads back as
+    ``floor(s/G)``. If sympy or torch prints FloorDiv another way, the reloaded
+    count may not decompose and the key may not normalise, so check
+    ``decompose_tiled_count`` and ``_normalized_expr_str`` before updating this.
+    """
+
+    def test_floordiv_prints_as_floor_division(self):
+        self.assertEqual(str(FloorDiv(_sym(), TILE)), f"({SYM}//{TILE})")
+
+    def test_the_printed_count_reads_back_as_the_same_decomposition(self):
+        from torch_spyre.execution.kernel_cache import _normalized_expr_str
+
+        count = FloorDiv(_sym(), TILE)
+        reread = sympy.sympify(str(count))
+
+        symbol, tile = decompose_tiled_count(reread)
+        self.assertEqual((str(symbol), tile), (SYM, TILE))
+        self.assertEqual(_normalized_expr_str(reread), _normalized_expr_str(count))
+
+
 if __name__ == "__main__":
     unittest.main()
