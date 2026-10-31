@@ -669,6 +669,233 @@ class _ScatterScenarios:
 
         self._assert_compiled_matches_cpu(kernel, y, src, idx)
 
+    # ===== scatter through a view of the destination =====================
+    # The scatter writes through a view, so the shape the index uses and the
+    # shape the destination was allocated with are not the same.
+
+    def _view_cache_operands(self, pages, slots, P, dtype=torch.bfloat16):
+        """A paged cache addressed through ``view(-1, 8, 128)``, with a
+        matching source and P unique slots.
+        """
+        cache = torch.rand(pages, slots, 8, 128, dtype=dtype).to("spyre")
+        src = torch.rand(P, 8, 128, dtype=dtype).to("spyre")
+        idx = torch.randperm(pages * slots, dtype=torch.int64)[:P].to("spyre")
+        return cache, src, idx
+
+    @staticmethod
+    def _put_through_view(c, s, i):
+        c.view(-1, 8, 128).index_put_((i,), s)
+        return c
+
+    @staticmethod
+    def _copy_through_view(c, s, i):
+        c.view(-1, 8, 128).index_copy_(0, i, s)
+        return c
+
+    def test_index_put_through_view_consecutive_slots_e2e(self):
+        """8192 consecutive slots in a 1024-page cache."""
+        cache = torch.rand(1024, 16, 8, 128, dtype=torch.bfloat16).to("spyre")
+        src = torch.rand(8192, 8, 128, dtype=torch.bfloat16).to("spyre")
+        idx = torch.arange(8192, dtype=torch.int64).to("spyre")
+        self._assert_compiled_matches_cpu(self._put_through_view, cache, src, idx)
+
+    def test_index_put_through_view_scattered_slots_e2e(self):
+        """A few slots scattered across the same cache."""
+        cache, src, idx = self._view_cache_operands(1024, 16, P=64)
+        self._assert_compiled_matches_cpu(self._put_through_view, cache, src, idx)
+
+    def test_index_put_through_view_page_geometries_e2e(self):
+        """Several page counts and page sizes."""
+        for pages, slots_per_page in ((4, 16), (16, 4), (4, 32), (64, 16), (512, 16)):
+            with self.subTest(pages=pages, slots_per_page=slots_per_page):
+                cache, src, idx = self._view_cache_operands(
+                    pages, slots_per_page, P=max(1, pages * slots_per_page // 2)
+                )
+                self._assert_compiled_matches_cpu(
+                    self._put_through_view, cache, src, idx
+                )
+
+    def test_index_copy_through_view_e2e(self):
+        """The index_copy_ form of the same write."""
+        cache, src, idx = self._view_cache_operands(8, 16, P=16)
+        self._assert_compiled_matches_cpu(self._copy_through_view, cache, src, idx)
+
+    def test_index_put_through_three_level_view_e2e(self):
+        """Three leading dims collapsed into the indexed dimension."""
+        cache = torch.rand(2, 4, 16, 8, 128, dtype=torch.bfloat16).to("spyre")
+        src = torch.rand(32, 8, 128, dtype=torch.bfloat16).to("spyre")
+        idx = torch.randperm(2 * 4 * 16, dtype=torch.int64)[:32].to("spyre")
+        self._assert_compiled_matches_cpu(self._put_through_view, cache, src, idx)
+
+    def test_index_put_through_view_of_5d_cache_e2e(self):
+        """Four leading dims collapsed into the indexed dimension."""
+        cache = torch.rand(2, 2, 4, 16, 8, 128, dtype=torch.bfloat16).to("spyre")
+        src = torch.rand(32, 8, 128, dtype=torch.bfloat16).to("spyre")
+        idx = torch.randperm(2 * 2 * 4 * 16, dtype=torch.int64)[:32].to("spyre")
+        self._assert_compiled_matches_cpu(self._put_through_view, cache, src, idx)
+
+    def test_index_put_through_partial_view_e2e(self):
+        """A view that collapses only some leading dims, leaving one in place."""
+        cache = torch.rand(2, 4, 16, 8, 128, dtype=torch.bfloat16).to("spyre")
+        src = torch.rand(4, 16, 8, 128, dtype=torch.bfloat16).to("spyre")
+        idx = torch.randperm(8, dtype=torch.int64)[:4].to("spyre")
+
+        def kernel(c, s, i):
+            c.view(8, 16, 8, 128).index_put_((i,), s)
+            return c
+
+        self._assert_compiled_matches_cpu(kernel, cache, src, idx)
+
+    def test_index_copy_through_view_on_middle_dim_e2e(self):
+        """A non-leading indexed dim, which can still be made outermost."""
+        idx = torch.randperm(128, dtype=torch.int64)[:4].to("spyre")
+
+        def kept_tail(c, s, i):
+            c.view(2, -1, 8, 128).index_copy_(1, i, s)
+            return c
+
+        def flat_tail(c, s, i):
+            c.view(2, 128, -1).index_copy_(1, i, s)
+            return c
+
+        for name, kernel, src_shape in (
+            ("trailing dims kept", kept_tail, (2, 4, 8, 128)),
+            ("trailing dims flattened", flat_tail, (2, 4, 8 * 128)),
+        ):
+            with self.subTest(view=name):
+                cache = torch.rand(2, 8, 16, 8, 128, dtype=torch.bfloat16).to("spyre")
+                src = torch.rand(*src_shape, dtype=torch.bfloat16).to("spyre")
+                self._assert_compiled_matches_cpu(kernel, cache, src, idx)
+
+    # -- a view that keeps the indexed dim and flattens the rest -----------
+    def _flat_view_operands(self, N=8192, P=64, dtype=torch.bfloat16):
+        x = torch.rand(N, 8, 128, dtype=dtype).to("spyre")
+        values = torch.rand(P, 8 * 128, dtype=dtype).to("spyre")
+        return x, values, torch.arange(P, dtype=torch.int64).to("spyre")
+
+    def test_scatter_through_flat_view_e2e(self):
+        """Both scatter ops on x.view(N, H*D), mutating the view itself."""
+
+        def put(x, v, i):
+            x.view(x.shape[0], 8 * 128).index_put_((i,), v, accumulate=False)
+            return x
+
+        def copy(x, v, i):
+            x.view(x.shape[0], 8 * 128).index_copy_(0, i, v)
+            return x
+
+        for name, kernel in (("index_put_", put), ("index_copy_", copy)):
+            with self.subTest(op=name):
+                self._assert_compiled_matches_cpu(kernel, *self._flat_view_operands())
+
+    def test_scatter_through_flat_view_clone_e2e(self):
+        """Controls -- .clone() breaks the alias, so no view is written through."""
+
+        def put(x, v, i):
+            x2 = x.view(x.shape[0], 8 * 128).clone()
+            x2.index_put_((i,), v, accumulate=False)
+            return x2
+
+        def copy(x, v, i):
+            x2 = x.view(x.shape[0], 8 * 128).clone()
+            x2.index_copy_(0, i, v)
+            return x2
+
+        for name, kernel in (("index_put_", put), ("index_copy_", copy)):
+            with self.subTest(op=name):
+                self._assert_compiled_matches_cpu(kernel, *self._flat_view_operands())
+
+    def test_index_copy_through_small_flat_view_fp16_e2e(self):
+        """The same pattern at 8 rows, in fp16."""
+
+        def kernel(x, v, i):
+            x.view(x.shape[0], 8 * 128).index_copy_(0, i, v)
+            return x
+
+        self._assert_compiled_matches_cpu(
+            kernel, *self._flat_view_operands(N=8, P=4, dtype=torch.float16)
+        )
+
+    def test_scatter_through_bias_view_e2e(self):
+        """A 4-D fp32 attention bias viewed as [B, S*S].
+
+        Uses a tensor source because an indirect store of a scalar constant is
+        unsupported.
+        """
+        B, S = 4, 64
+        idx = torch.tensor([0, 2], dtype=torch.int64).to("spyre")
+        values = torch.rand(2, S * S, dtype=torch.float32).to("spyre")
+
+        def put(b, i, v):
+            b.view(b.shape[0], -1).index_put_((i,), v)
+            return b
+
+        def copy(b, i, v):
+            b.view(b.shape[0], -1).index_copy_(0, i, v)
+            return b
+
+        for name, kernel in (("index_put_", put), ("index_copy_", copy)):
+            with self.subTest(op=name):
+                bias = torch.rand(B, 1, S, S, dtype=torch.float32).to("spyre")
+                self._assert_compiled_matches_cpu(kernel, bias, idx, values)
+
+    # -- other shapes, dtypes and index patterns ---------------------------
+    def test_index_put_through_view_fp32_e2e(self):
+        """fp32, where a stick holds 32 elements rather than 64."""
+        cache, src, idx = self._view_cache_operands(8, 16, P=16, dtype=torch.float32)
+        self._assert_compiled_matches_cpu(self._put_through_view, cache, src, idx)
+
+    def test_index_put_through_view_feature_widths_e2e(self):
+        """Trailing widths of one, three and four sticks."""
+        for head_dim in (64, 192, 256):
+            with self.subTest(head_dim=head_dim):
+                cache = torch.rand(8, 16, 8, head_dim, dtype=torch.bfloat16).to("spyre")
+                src = torch.rand(16, 8, head_dim, dtype=torch.bfloat16).to("spyre")
+                idx = torch.randperm(128, dtype=torch.int64)[:16].to("spyre")
+
+                def kernel(c, s, i, hd=head_dim):
+                    c.view(-1, 8, hd).index_put_((i,), s)
+                    return c
+
+                self._assert_compiled_matches_cpu(kernel, cache, src, idx)
+
+    def test_index_put_through_view_single_head_e2e(self):
+        """A middle dimension of size 1."""
+        cache = torch.rand(8, 16, 1, 128, dtype=torch.bfloat16).to("spyre")
+        src = torch.rand(16, 1, 128, dtype=torch.bfloat16).to("spyre")
+        idx = torch.randperm(128, dtype=torch.int64)[:16].to("spyre")
+
+        def kernel(c, s, i):
+            c.view(-1, 1, 128).index_put_((i,), s)
+            return c
+
+        self._assert_compiled_matches_cpu(kernel, cache, src, idx)
+
+    def test_index_put_through_view_int32_index_e2e(self):
+        """An int32 index, which skips the int64 downcast."""
+        cache = torch.rand(8, 16, 8, 128, dtype=torch.bfloat16).to("spyre")
+        src = torch.rand(16, 8, 128, dtype=torch.bfloat16).to("spyre")
+        idx = torch.randperm(128)[:16].to(torch.int32).to("spyre")
+        self._assert_compiled_matches_cpu(self._put_through_view, cache, src, idx)
+
+    def test_index_put_through_view_narrow_slot_sets_e2e(self):
+        """A single slot, and the last slot.
+
+        Duplicates are excluded: index_put_ with accumulate=False is
+        nondeterministic when the index repeats.
+        """
+        rows = 8 * 16
+        for name, slot_list in (("one slot", [77]), ("last slot", [rows - 1])):
+            with self.subTest(slots=name):
+                cache = torch.rand(8, 16, 8, 128, dtype=torch.bfloat16).to("spyre")
+                src = torch.rand(len(slot_list), 8, 128, dtype=torch.bfloat16).to(
+                    "spyre"
+                )
+                idx = torch.tensor(slot_list, dtype=torch.int64).to("spyre")
+                self._assert_compiled_matches_cpu(
+                    self._put_through_view, cache, src, idx
+                )
+
     # ===== index_add: gather + add + overwrite-scatter decomposition =====
     # aten.index_add lowers (spyre_index_add in decompositions.py) to
     # index_select (indirect gather) + add + index_put (indirect overwrite
