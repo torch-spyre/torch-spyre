@@ -133,6 +133,16 @@ def _load_labels(path: Path) -> list:
     return list(tsc.get("labels") or [])
 
 
+def _load_shards(path: Path) -> int:
+    """test_suite_config.shards: how many parallel jobs this suite's tests split across (>= 1)."""
+    with path.open() as fh:
+        raw = yaml.safe_load(fh) or {}
+    n = (raw.get("test_suite_config") or {}).get("shards", 1)
+    if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+        sys.exit(f"ERROR: {path}: test_suite_config.shards must be a positive integer, got {n!r}")
+    return n
+
+
 def _load_path_map(map_path: str) -> dict:
     """Load a {config-relative-path: value} YAML file (--runner-map, --flags-map)."""
     path = Path(map_path)
@@ -302,6 +312,7 @@ def main() -> None:
                 "runner": runner_map.get(rel, "spyre_pf_x1"),
                 "flags": _suite_flags(flags_map, rel),
                 "path": str(cfg),
+                "shards": _load_shards(cfg),
             }
         )
 
@@ -321,15 +332,23 @@ def main() -> None:
     if args.format == "paths":
         print(" ".join(r["path"] for r in results))
     else:
-        matrix = [
-            {
+        matrix = []
+        for r in results:
+            entry = {
                 "name": r["name"],
                 "config": r["config"],
                 "runner": r["runner"],
                 **({"extra_test_flags": r["flags"]} if r["flags"] else {}),
             }
-            for r in results
-        ]
+            n = r["shards"]
+            if n == 1:
+                matrix.append(entry)
+                continue
+            # One job per shard. shard_id/num_shards reach pytest as SPYRE_TEST_SHARD_ID /
+            # SPYRE_TEST_NUM_SHARDS (see utils/shard.py); the name keeps job and report distinct.
+            for k in range(n):
+                matrix.append({**entry, "name": f"{r['name']} ({k + 1}/{n})",
+                               "shard_id": k, "num_shards": n})
         print(json.dumps({"suite": matrix}))
 
 

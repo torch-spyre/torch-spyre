@@ -25,6 +25,12 @@ from oot_framework.oot_test_utilities import (
     _RUNTIME_SHAPES,
     _RUNTIME_TAGS,
 )
+from oot_framework.utils.shard import (
+    ENV_DURATIONS,
+    load_durations,
+    select_shard,
+    shard_from_env,
+)
 
 
 # Cap on the failure message folded into wasxfail (see _extract_failure_message):
@@ -531,6 +537,17 @@ def pytest_configure(config):
 
 
 def pytest_collection_modifyitems(config, items):
+    _filter_collected(config, items)
+    # After every other filter, so each shard splits exactly the set an unsharded run keeps.
+    shard = shard_from_env()
+    if shard is not None:
+        kept, dropped = select_shard(items, shard, load_durations(os.environ.get(ENV_DURATIONS)))
+        if dropped:
+            config.hook.pytest_deselected(items=dropped)
+            items[:] = kept
+
+
+def _filter_collected(config, items):
     # Files ignored for plain `pytest` runs (known failures outside `make tests`)
     # When run via run_test.sh / make tests, PYTORCH_TEST_CONFIG is set so skip the ignore.
     ignored_files = set()

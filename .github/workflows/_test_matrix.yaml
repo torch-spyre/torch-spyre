@@ -619,6 +619,9 @@ jobs:
       # Explicitly clear it.
       CI: ''
       TORCH_SPYRE_TEST_TYPE: ${{ needs.generate_matrix.outputs.resolved_test_type }}
+      # Set only for a sharded suite (test_suite_config.shards > 1); empty runs every test.
+      SPYRE_TEST_SHARD_ID: ${{ matrix.suite.shard_id }}
+      SPYRE_TEST_NUM_SHARDS: ${{ matrix.suite.num_shards }}
 
     strategy:
       fail-fast: false
@@ -690,7 +693,13 @@ jobs:
       - name: Derive report paths
         run: |
           CONFIG="${{ matrix.suite.config }}"
-          REPORT_NAME="$(basename "${CONFIG%.yaml}.xml")"
+          REPORT_NAME="$(basename "${CONFIG%.yaml}")"
+          # Shards of one config must not share a report name: the upload below uses
+          # overwrite: true, so a second shard would silently replace the first's results.
+          if [ -n "${SPYRE_TEST_NUM_SHARDS}" ]; then
+            REPORT_NAME="${REPORT_NAME}-shard$((SPYRE_TEST_SHARD_ID + 1))of${SPYRE_TEST_NUM_SHARDS}"
+          fi
+          REPORT_NAME="${REPORT_NAME}.xml"
           echo "REPORT_NAME=${REPORT_NAME}" >> "$GITHUB_ENV"
           echo "REPORT_PATH=${GITHUB_WORKSPACE}/${REPORT_NAME}" >> "$GITHUB_ENV"
 
@@ -1451,6 +1460,9 @@ jobs:
     env:
       CI: ''
       TORCH_SPYRE_TEST_TYPE: ${{ needs.generate_matrix.outputs.resolved_test_type }}
+      # Carried in the failed shard's suite.json, so a retry re-runs only that shard.
+      SPYRE_TEST_SHARD_ID: ${{ matrix.suite.shard_id }}
+      SPYRE_TEST_NUM_SHARDS: ${{ matrix.suite.num_shards }}
 
     strategy:
       fail-fast: false
@@ -1507,7 +1519,11 @@ jobs:
       - name: Derive report paths
         run: |
           CONFIG="${{ matrix.suite.config }}"
-          REPORT_NAME="$(basename "${CONFIG%.yaml}.xml")"
+          REPORT_NAME="$(basename "${CONFIG%.yaml}")"
+          if [ -n "${SPYRE_TEST_NUM_SHARDS}" ]; then
+            REPORT_NAME="${REPORT_NAME}-shard$((SPYRE_TEST_SHARD_ID + 1))of${SPYRE_TEST_NUM_SHARDS}"
+          fi
+          REPORT_NAME="${REPORT_NAME}.xml"
           echo "REPORT_NAME=${REPORT_NAME}" >> "$GITHUB_ENV"
           echo "REPORT_PATH=${GITHUB_WORKSPACE}/${REPORT_NAME}" >> "$GITHUB_ENV"
 

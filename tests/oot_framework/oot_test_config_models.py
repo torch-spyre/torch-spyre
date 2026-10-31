@@ -1782,6 +1782,15 @@ class TestsBlock(BaseModel):
     files: List[FileEntry]
     global_config: GlobalConfig = GlobalConfig()
     labels: List[str] = []
+    # Parallel CI jobs this suite's tests split across (filter_configs.py, utils/shard.py).
+    shards: int = 1
+
+    @field_validator("shards")
+    @classmethod
+    def _positive_shards(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(f"shards must be >= 1, got {v}")
+        return v
 
     @model_validator(mode="before")
     @classmethod
