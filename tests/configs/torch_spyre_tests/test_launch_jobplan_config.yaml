@@ -1,5 +1,6 @@
 test_suite_config:
   labels: [unit, regression, integration, trunk]
+  ci_group: runtime
   files:
     - path: ${TORCH_DEVICE_ROOT}/tests/test_launch_jobplan.py
       unlisted_test_mode: mandatory_success

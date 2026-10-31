@@ -1,5 +1,44 @@
+# Sliding-window-attention shard: everything except the eight slow prefill tests
+# that test_sliding_window_attention_a_config.yaml and
+# test_sliding_window_attention_b_config.yaml run (each takes 90-130s to compile;
+# together with the rest they made one ~21 minute job). Every test is named in
+# exactly one of the three files, as make check-all-configs requires: a test added
+# to the SWA test file must be added to one of them.
 test_suite_config:
   labels: [unit, regression, integration, trunk]
   files:
     - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_sliding_window_attention.py
-      unlisted_test_mode: mandatory_success
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            - TestCompactCache::test_anchored_decode_gemma3
+            - TestCompactCache::test_anchored_decode_gemma4
+            - TestCompactCache::test_block_granular_eviction_with_an_explicit_buffer_origin
+            - TestCompactCache::test_capacity_equals_window_decode
+            - TestCompactCache::test_multiblock_rolled_prefill_with_distinct_read_starts
+            - TestCompactCache::test_non_causal_prefill_mask_reuses_one_graph_as_values_change
+            - TestCompactCache::test_rolled_decode_at_a_non_aligned_position
+            - TestCompactCache::test_runtime_decode_mask_reuses_one_graph_as_values_change
+            - TestCompactCache::test_runtime_mask_excludes_padded_columns
+            - TestCompactCache::test_runtime_mask_per_sequence_padding
+            - TestCompactCache::test_runtime_mask_prefill_padding_rows_stay_finite
+            - TestCompactCache::test_runtime_mask_skips_fully_masked_leading_chunks
+            - TestCompactCache::test_runtime_prefill_mask_reuses_one_graph_as_values_change
+            - TestCompactCache::test_warmup_cache_at_a_non_aligned_seqlen
+            - TestSlidingWindowAttention::test_chunked_prefill
+            - TestSlidingWindowAttention::test_decode
+            - TestSlidingWindowAttention::test_decode_gqa
+            - TestSlidingWindowAttention::test_decode_long_cache
+            - TestSlidingWindowAttention::test_decode_window_not_a_multiple_of_the_stick
+            - TestSlidingWindowAttention::test_non_causal_prefill_reads_future_keys_outside_the_causal_plan
+            - TestSlidingWindowAttention::test_nondivisible_kv_extent_uses_for_each_tile
+            - TestSlidingWindowAttention::test_prefill_from_pinned_larger_cache_with_left_padding
+            - TestSlidingWindowAttention::test_prefill_from_pinned_larger_cache_without_left_padding
+            - TestSlidingWindowAttention::test_prefill_head_dim_256_gqa
+            - TestSlidingWindowAttention::test_prefill_left_padding_head_dim_256
+            - TestSlidingWindowAttention::test_prefill_long
+            - TestSlidingWindowAttention::test_prefill_reads_a_prefix_of_a_larger_cache
+            - TestSlidingWindowAttention::test_query_length_not_a_multiple_of_the_block
+            - TestSlidingWindowAttention::test_ragged_query_and_window_together
+            - TestSlidingWindowAttention::test_window_covering_the_whole_cache
+          mode: mandatory_success

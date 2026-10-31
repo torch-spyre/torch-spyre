@@ -15,10 +15,16 @@ from .checks import (
     check_dead_patterns,
     check_missing_labels,
     check_invalid_platforms,
+    check_ci_groups,
 )
 from .discovery import find_test_files
 from .display import bold, green, red, yellow, heuristic_base_names, warn
-from .loader import load_all_patterns, load_labels, load_excluded_platforms
+from .loader import (
+    load_all_patterns,
+    load_labels,
+    load_excluded_platforms,
+    load_ci_groups,
+)
 from .parser import parse_test_file
 
 
@@ -58,6 +64,9 @@ def run(
     total_hard_problems += check_invalid_platforms(
         load_excluded_platforms(config_files)
     )
+
+    print(bold("CHECK 0c: CI groups"))
+    total_hard_problems += check_ci_groups(load_ci_groups(config_files))
 
     all_patterns = load_all_patterns(config_files)
 

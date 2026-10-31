@@ -1782,6 +1782,9 @@ class TestsBlock(BaseModel):
     files: List[FileEntry]
     global_config: GlobalConfig = GlobalConfig()
     labels: List[str] = []
+    # CI only: configs in one directory sharing a ci_group run as a single job
+    # (see tests/oot_framework/utils/filter_configs.py). Unused by the runner.
+    ci_group: str = ""
 
     @model_validator(mode="before")
     @classmethod
