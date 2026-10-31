@@ -4,25 +4,30 @@
 
 CREATE VIEW IF NOT EXISTS v_experiments AS
 SELECT
-    e.experiment_id                               AS experiment_id,
-    argMax(e.parent_id, (e.ts, e.event_id))       AS parent_id,
-    argMax(e.name, (e.ts, e.event_id))            AS name,
-    argMax(e.kind, (e.ts, e.event_id))            AS kind,
-    argMax(e.state, (e.ts, e.event_id))           AS state,
-    argMax(e.subject_level, (e.ts, e.event_id))   AS subject_level,
-    argMax(e.subject_key, (e.ts, e.event_id))     AS subject_key,
-    argMax(e.workload, (e.ts, e.event_id))        AS workload,
-    argMax(e.hypothesis, (e.ts, e.event_id))      AS hypothesis,
-    argMax(e.spec_sha256, (e.ts, e.event_id))     AS spec_sha256,
-    argMax(e.budget, (e.ts, e.event_id))          AS budget,
-    argMax(e.spent, (e.ts, e.event_id))           AS spent,
-    argMax(e.code_ref, (e.ts, e.event_id))        AS code_ref,
-    argMax(e.reason, (e.ts, e.event_id))          AS reason,
-    argMin(e.actor, (e.ts, e.event_id))           AS created_by,
-    argMax(e.props, (e.ts, e.event_id))           AS props,
-    min(e.ts)                                     AS created_at,
-    max(e.ts)                                     AS updated_at
-FROM experiment_events AS e  -- qualified: the aliases above would shadow the columns
+    e.experiment_id                                           AS experiment_id,
+    argMax(e.parent_id, (e.ts, e.state_rank, e.event_id))     AS parent_id,
+    argMax(e.name, (e.ts, e.state_rank, e.event_id))          AS name,
+    argMax(e.kind, (e.ts, e.state_rank, e.event_id))          AS kind,
+    argMax(e.state, (e.ts, e.state_rank, e.event_id))         AS state,
+    argMax(e.subject_level, (e.ts, e.state_rank, e.event_id)) AS subject_level,
+    argMax(e.subject_key, (e.ts, e.state_rank, e.event_id))   AS subject_key,
+    argMax(e.workload, (e.ts, e.state_rank, e.event_id))      AS workload,
+    argMax(e.hypothesis, (e.ts, e.state_rank, e.event_id))    AS hypothesis,
+    argMax(e.spec_sha256, (e.ts, e.state_rank, e.event_id))   AS spec_sha256,
+    argMax(e.budget, (e.ts, e.state_rank, e.event_id))        AS budget,
+    argMax(e.spent, (e.ts, e.state_rank, e.event_id))         AS spent,
+    argMax(e.code_ref, (e.ts, e.state_rank, e.event_id))      AS code_ref,
+    argMax(e.reason, (e.ts, e.state_rank, e.event_id))        AS reason,
+    argMin(e.actor, (e.ts, e.state_rank, e.event_id))         AS created_by,
+    argMax(e.props, (e.ts, e.state_rank, e.event_id))         AS props,
+    min(e.ts)                                                 AS created_at,
+    max(e.ts)                                                 AS updated_at
+FROM
+(
+    -- Same-ts events order by lifecycle, so a terminal state is never undone by a tie.
+    SELECT x.*, indexOf(['proposed', 'approved', 'running', 'paused', 'done', 'stopped', 'failed', 'abandoned'], x.state) AS state_rank
+    FROM experiment_events AS x
+) AS e  -- qualified: the aliases above would shadow the columns
 GROUP BY e.experiment_id;
 
 CREATE VIEW IF NOT EXISTS v_experiment_arms AS

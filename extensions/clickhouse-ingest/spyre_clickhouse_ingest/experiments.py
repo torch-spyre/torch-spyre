@@ -140,9 +140,8 @@ class Bundle:
             "props": _strs(r.get("props")),
             **self._who(r),
         }
-        row["event_id"] = _id(
-            "experiment_event", eid, _sha({k: v for k, v in row.items() if k != "ts"})
-        )
+        # ts is in the id: a state can recur (running, paused, running) and each is an event.
+        row["event_id"] = _id("experiment_event", eid, _sha(row))
         self.add(schema.ExperimentEvents, row)
 
     def _arm(self, r: Mapping) -> None:
@@ -476,28 +475,34 @@ def abab_bundle(
         )
     result = next((r for r in rows if r.get("kind") == "result"), None)
     state = "done" if result else (status or {}).get("state", "running")
-    out.append(
-        {
-            "record": "experiment",
-            "name": name,
-            "parent": parent,
-            "ts": ts0,
-            "state": state,
-            "kind": "noise" if aa else "ab",
-            "workload": workload,
-            "subject_level": "workload",
-            "subject_key": workload,
-            "spec": spec,
-            "budget": {"card_min": status["budget_cap_card_min"]}
-            if status and "budget_cap_card_min" in status
-            else {},
-            "spent": {"card_min": status["budget_used_card_min"]}
-            if status and "budget_used_card_min" in status
-            else {},
-            "reason": result["stop"] if result else "",
-            **({"actor": actor} if actor else {}),
-        }
-    )
+    event = {
+        "record": "experiment",
+        "name": name,
+        "parent": parent,
+        "kind": "noise" if aa else "ab",
+        "workload": workload,
+        "subject_level": "workload",
+        "subject_key": workload,
+        "spec": spec,
+        "budget": {"card_min": status["budget_cap_card_min"]}
+        if status and "budget_cap_card_min" in status
+        else {},
+        **({"actor": actor} if actor else {}),
+    }
+    # running at the first record, the current state at the last: a later load supersedes it.
+    out.append({**event, "ts": ts0, "state": "running"})
+    if state != "running":
+        out.append(
+            {
+                **event,
+                "ts": max(r["ts"] for r in rows if "ts" in r),
+                "state": state,
+                "spent": {"card_min": status["budget_used_card_min"]}
+                if status and "budget_used_card_min" in status
+                else {},
+                "reason": result["stop"] if result else "",
+            }
+        )
     for i, arm in enumerate(arms):
         knobs = {f"env.{k}": v for k, v in (arm.get("env") or {}).items()}
         if arm.get("args"):

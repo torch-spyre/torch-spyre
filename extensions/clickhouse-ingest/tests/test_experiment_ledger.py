@@ -439,3 +439,28 @@ def test_results_are_listed_by_experiment_tag(chdb_session):
     assert [(r["experiment"], r["arm"]) for r in camp] == [
         ("exp-aa", "A"), ("exp-aa", "B"), ("exp-ab", "A"), ("exp-ab", "B")
     ]  # fmt: skip
+
+
+def test_a_finished_run_reads_done_and_a_same_ts_tie_goes_to_the_terminal_state(
+    chdb_session,
+):
+    s = chdb_session
+    recs = abab_bundle(_driver_rows(aa=False), SPEC, "exp-ab")
+    states = [(r["state"], r["ts"]) for r in recs if r["record"] == "experiment"]
+    assert [st for st, _ in states] == ["running", "done"] and states[0][1] < states[1][
+        1
+    ]
+    _load(s, recs)
+    assert rows(s, "SELECT state FROM v_experiments") == [{"state": "done"}]
+    assert set(_load(s, recs).values()) == {0}
+    # A producer stamping both events alike must still read as finished.
+    _load(
+        s,
+        [
+            {"record": "experiment", "name": "tie", "state": st, "ts": 5}
+            for st in ("done", "running")
+        ],
+    )
+    assert rows(s, "SELECT state FROM v_experiments WHERE name = 'tie'") == [
+        {"state": "done"}
+    ]
