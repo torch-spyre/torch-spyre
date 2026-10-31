@@ -183,6 +183,7 @@ SPYRE_FP32_OPS = [
     "equal",
     "notequal",
     "prod",
+    "keepbyindex",
     "log",
 ]
 
@@ -234,6 +235,13 @@ FP8_2D_STICK_OPS = ("batchmatmulfp8", "qfp8wt")
 TOPK_OPS = {"topkvalue", "topkindex"}
 _MAX_K_PER_CORE = 4
 TOPK_MAX_K_PER_CORE = _MAX_K_PER_CORE
+# Largest k topkvalue/topkindex accept.
+TOPK_MAX_K = 128
+
+# fp16 holds every integer exactly only up to 2048 (11 significand bits). Above
+# it, odd integers are not representable, so fp16 values used as integers (such
+# as topkindex's indices, which come back in the input dtype) lose precision.
+FP16_MAX_PRECISE_INTEGER = 2048
 
 LAYOUT_LABELS = ["OUTPUT", "KERNEL", "INPUT", "KERNEL_IDX"]
 MATMUL_LAYOUT_LABELS = ["INPUT", "KERNEL", "OUTPUT", "KERNEL_IDX"]
