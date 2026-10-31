@@ -2145,6 +2145,20 @@ def coeff_through_floor(expr: sympy.Expr, sym: sympy.Symbol) -> sympy.Expr:
     return coeff
 
 
+def _is_concrete_unit_extent(size: sympy.Expr) -> bool:
+    """Whether ``size`` is a compile-time-known extent of 1.
+
+    A symbolic extent carries no compile-time guarantee of triviality (see
+    ``views.compute_coordinates``), so only a concrete 1 counts. Shared by
+    :func:`unrepresentable_splits_by_index_coeff` and
+    :func:`apply_splits_from_index_coeff` so the two stay in lockstep: a
+    symbol this predicate calls trivial is one the decoder skips
+    unconditionally, so a coefficient collision solely with such a symbol is
+    not a real transport hazard.
+    """
+    return isinstance(size, (int, sympy.Integer)) and int(size) <= 1
+
+
 def unrepresentable_splits_by_index_coeff(
     splits: dict[sympy.Symbol, int],
     it_space: dict[sympy.Symbol, sympy.Expr],
@@ -2162,11 +2176,14 @@ def unrepresentable_splits_by_index_coeff(
     - its symbol's coefficient in the relevant index is 0 (the symbol is not
       a linear term there -- e.g. a kernel-window offset that lives in op
       metadata rather than the index expression), or
-    - it shares a nonzero coefficient with a *different* symbol of
-      ``it_space`` -- split or not: the coefficient-keyed dict holds one
-      entry per coefficient, so the decoder cannot tell the two symbols
-      apart and applies the stored split to both, splitting an axis the
-      planner meant to leave whole.
+    - it shares a nonzero coefficient with a *different*, non-trivial
+      (``_is_concrete_unit_extent`` false) symbol of ``it_space`` -- split or
+      not: the coefficient-keyed dict holds one entry per coefficient, so the
+      decoder cannot tell the two symbols apart and applies the stored split
+      to both, splitting an axis the planner meant to leave whole. A
+      collision with a symbol of concrete extent 1 is not a hazard:
+      ``apply_splits_from_index_coeff`` skips such a symbol unconditionally,
+      never consulting the coefficient it shares with anything else.
 
     ``it_space`` must be every iteration symbol the op defines, not just the
     ones ``splits`` mentions: a caller (such as a user hint) may omit an
@@ -2192,6 +2209,8 @@ def unrepresentable_splits_by_index_coeff(
     ):
         coeff_syms: dict[sympy.Expr, list[sympy.Symbol]] = {}
         for sym in symbols:
+            if _is_concrete_unit_extent(it_space[sym]):
+                continue  # the decoder skips this symbol unconditionally
             coeff = index.coeff(sym)
             if coeff != 0:
                 coeff_syms.setdefault(coeff, []).append(sym)
@@ -2202,7 +2221,7 @@ def unrepresentable_splits_by_index_coeff(
             if coeff == 0:
                 problems.append(f"{label}:{sym}=absent")
                 continue
-            collisions = [s for s in coeff_syms[coeff] if s != sym]
+            collisions = [s for s in coeff_syms.get(coeff, []) if s != sym]
             if collisions:
                 problems.append(
                     f"{label}: coeff {coeff} {sym} collides with "
@@ -2442,12 +2461,10 @@ def apply_splits_from_index_coeff(
     output_coeff_splits, reduction_coeff_splits = coeff_splits
     result: dict[sympy.Symbol, int] = dict.fromkeys(sched_it_space, 1)
     for sym, size in sched_it_space.items():
-        # Skip iteration vars with trivial range.  For symbolic ranges we
-        # cannot statically determine triviality (and a symbolic size
-        # carries no compile-time guarantee that it is 1), so we assume
-        # they are non-trivial — consistent with views.compute_coordinates.
-        # TODO(issue#1373): replace with a sympy-aware predicate.
-        if isinstance(size, (int, sympy.Integer)) and int(size) <= 1:
+        # Skip iteration vars with a compile-time-known trivial range; see
+        # _is_concrete_unit_extent. TODO(issue#1373): replace with a fuller
+        # sympy-aware predicate for symbolic ranges.
+        if _is_concrete_unit_extent(size):
             continue
         wc = write_index.coeff(sym)
         if wc != 0:
