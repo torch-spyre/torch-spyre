@@ -657,15 +657,19 @@ PYBIND11_MODULE(_C, m) {
   // Symbolic argument payload types
   py::enum_<spyre::SymbolicArgKind>(m, "SymbolicArgKind")
       .value("kAddress", spyre::SymbolicArgKind::kAddress)
-      .value("kDimension", spyre::SymbolicArgKind::kDimension);
+      .value("kDimension", spyre::SymbolicArgKind::kDimension)
+      .value("kShardAddress", spyre::SymbolicArgKind::kShardAddress);
 
   py::class_<spyre::SymbolicArg>(m, "SymbolicArg")
       .def(py::init([](spyre::SymbolicArgKind kind, int64_t tensor_id,
-                       int64_t dim_index, int64_t value) {
-             return spyre::SymbolicArg{kind, tensor_id, dim_index, value};
+                       int64_t dim_index, int64_t value, int64_t num_shards) {
+             return spyre::SymbolicArg{kind, tensor_id, dim_index, value,
+                                       num_shards};
            }),
            py::arg("kind"), py::arg("tensor_id"),
-           py::arg("dim_index") = int64_t{-1}, py::arg("value") = int64_t{-1})
+           py::arg("dim_index") = int64_t{-1}, py::arg("value") = int64_t{-1},
+           py::arg("num_shards") = int64_t{-1})
+      .def_readwrite("num_shards", &spyre::SymbolicArg::num_shards)
       .def_readwrite("kind", &spyre::SymbolicArg::kind)
       .def_readwrite("value", &spyre::SymbolicArg::value)
       .def_readwrite("tensor_id", &spyre::SymbolicArg::tensor_id)
@@ -756,8 +760,12 @@ PYBIND11_MODULE(_C, m) {
         std::vector<uintptr_t> addrs;
         addrs.reserve(resolved.size());
         for (const auto& host_arg : resolved) {
-          addrs.push_back(reinterpret_cast<uintptr_t>(
-              std::get<const flex::CompositeAddress*>(host_arg)));
+          if (const auto* value = std::get_if<int64_t>(&host_arg)) {
+            addrs.push_back(static_cast<uintptr_t>(*value));
+          } else {
+            addrs.push_back(reinterpret_cast<uintptr_t>(
+                std::get<const flex::CompositeAddress*>(host_arg)));
+          }
         }
         return addrs;
       },
@@ -825,6 +833,70 @@ PYBIND11_MODULE(_C, m) {
       "TEST-ONLY: project REAL plan steps (classifyStep + role(), exactly as "
       "validate() does) in the given index order, then run the ordering "
       "checker. Returns '' if valid else the error message.");
+
+  m.def(
+      "_spyre_empty_sharded",
+      [](std::vector<int64_t> size, c10::ScalarType dtype, int64_t shard_dim,
+         int64_t num_shards, std::optional<c10::Device> device) {
+        return spyre::spyre_empty_sharded(size, dtype, shard_dim, num_shards,
+                                          device);
+      },
+      py::arg("size"), py::arg("dtype"), py::arg("shard_dim"),
+      py::arg("num_shards"), py::arg("device") = std::nullopt,
+      "Allocate an uninitialized sharded Spyre tensor.");
+  m.def("_spyre_is_sharded", &spyre::spyre_is_sharded, py::arg("tensor"),
+        "Whether a tensor's storage is sharded storage.");
+  m.def(
+      "_spyre_sharding_info",
+      [](const at::Tensor& tensor) {
+        TORCH_CHECK(spyre::spyre_is_sharded(tensor),
+                    "expected a sharded Spyre tensor");
+        auto* ctx = static_cast<spyre::SharedOwnerCtx*>(
+            tensor.storage().data_ptr().get_context());
+        const auto& info = *ctx->sharding;
+        const auto& regions = flex::RuntimeContext::getInstance()
+                                  ->getAllocator()
+                                  ->getIdToRegionMap();
+        py::dict result;
+        result["shard_dim"] = info.shard_dim;
+        result["num_shards"] = info.num_shards;
+        result["shard_device_bytes"] = info.shard_device_bytes;
+        result["total_bytes"] = ctx->composite_addr.total_size();
+        py::list entries;
+        // The shard table is indexed by shard ordinal; shard i backs core i.
+        // Physical placement is read from the live region map.
+        for (size_t i = 0; i < ctx->shard_addrs.size(); ++i) {
+          const flex::Chunk& chunk = ctx->shard_addrs[i].chunks()[0];
+          auto region_it = regions.find(chunk.addr.region_id);
+          TORCH_CHECK(region_it != regions.end(), "shard ", i,
+                      " references unknown region ", chunk.addr.region_id);
+          const flex::MemoryRegion* region = region_it->second;
+          py::dict entry;
+          entry["logical_chunk_id"] = i;
+          entry["logical_core_id"] = i;
+          entry["physical_domain_id"] = region->domainId();
+          entry["region_id"] = region->regionId();
+          entry["segment_id"] = region->hardwareId();
+          entry["segment_offset_bytes"] = chunk.addr.offset;
+          entry["size_bytes"] = static_cast<uint64_t>(chunk.size);
+          entry["is_device_addressable"] = true;
+          entries.append(entry);
+        }
+        result["chunks"] = entries;
+        return result;
+      },
+      py::arg("tensor"),
+      "Address-free sharding record and per-chunk placement receipt.");
+  m.def(
+      "num_memory_domains",
+      []() -> size_t {
+        auto allocator = flex::RuntimeContext::getInstance()->getAllocator();
+        TORCH_CHECK(allocator != nullptr,
+                    "num_memory_domains requires the Flex runtime to be "
+                    "initialized");
+        return allocator->topology().num_domains();
+      },
+      "Number of memory domains in the Flex device topology.");
 
   // Allocator statistics functions
   m.def(

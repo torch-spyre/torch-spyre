@@ -26,6 +26,7 @@ from torch_spyre._inductor.constants import (
     FP8_2D_STICK_OPS,
 )
 from torch_spyre._inductor.errors import Unsupported
+from torch_spyre._inductor.sharded_hbm import verify_non_unified_split
 from torch_spyre._inductor.op_spec import TensorWorkDivision
 from torch_spyre._inductor.pass_utils import coeff_through_floor
 
@@ -151,6 +152,26 @@ class SymbolKind:
         )
 
     @classmethod
+    def shard_kernel(
+        cls, arg_index: int, core_idx: int, num_shards: int, shard_bytes: int
+    ) -> "SymbolKind":
+        """Start address of core ``core_idx``'s own shard of a sharded tensor.
+
+        Non-unified kernels give every core an independent start address
+        (``nonUnifiedAllocInHBM_``); the runtime resolves this one to the
+        chunk holding shard ``core_idx`` of kernel arg ``arg_index``, after
+        checking the tensor has ``num_shards`` (``split_count``) shards of
+        ``shard_bytes`` (``offset``) device bytes.
+        """
+        return cls(
+            kind="shard_kernel",
+            arg_index=arg_index,
+            core_idx=core_idx,
+            split_count=num_shards,
+            offset=shard_bytes,
+        )
+
+    @classmethod
     def pool(cls) -> "SymbolKind":
         return cls(kind="pool")
 
@@ -172,6 +193,10 @@ class SymbolKind:
     @property
     def is_derived_symbolic(self) -> bool:
         return self.kind == "kernel_derived_symbolic"
+
+    @property
+    def is_shard_kernel(self) -> bool:
+        return self.kind == "shard_kernel"
 
     @property
     def is_pool(self) -> bool:
@@ -808,6 +833,8 @@ def generate_sdsc(
             key = ("kernel", kind.arg_index)
         elif kind.kind == "kernel_slice":
             key = ("kernel_slice", kind.arg_index, kind.offset)
+        elif kind.is_shard_kernel:
+            key = ("shard_kernel", kind.arg_index, kind.core_idx)
         elif kind.is_derived_symbolic:
             # Per-core symbolic address: key by (tensor, core) so every
             # (arg_index, core_idx) is a distinct registration and never
@@ -871,7 +898,37 @@ def generate_sdsc(
     # the symbols at that level that advance tensor i.  Empty list of dicts
     # (i.e. [{}] * n_levels or []) for non-tiled tensors.
     affine_strides: list[list[dict]] = []
+    non_unified_args = [t for t in sdsc_spec.args if t.non_unified]
+    if non_unified_args:
+        if len(non_unified_args) != len(sdsc_spec.args):
+            raise Unsupported("non-unified kernels need every tensor argument sharded")
+        verify_non_unified_split(sdsc_spec, non_unified_args)
     for tensor in sdsc_spec.args:
+        if tensor.non_unified:
+            # Sharded storage: core c owns chunk c, addressed from its own
+            # start (no base + per-core offset).
+            if tensor.arg_index < 0 or any(
+                _tensor_tiled_by_symbol(tensor, s)
+                for level_syms in tiled_symbols
+                for s in level_syms
+            ):
+                raise Unsupported(
+                    "non-unified kernels support untiled HBM kernel arguments "
+                    f"only (arg {tensor.arg_index}, allocation {tensor.allocation})"
+                )
+            shard_bytes = tensor.non_unified_shard_bytes
+            for c in range(sdsc_spec.num_cores):
+                offset_as_symbol(
+                    tensor.arg_index,
+                    SymbolKind.shard_kernel(
+                        arg_index=tensor.arg_index,
+                        core_idx=c,
+                        num_shards=sdsc_spec.num_cores,
+                        shard_bytes=shard_bytes,
+                    ),
+                )
+            affine_strides.append([{} for _ in tiled_symbols])
+            continue
         if "lx" in tensor.allocation:
             # LX addresses are never registered as symbols in the SDSC JSON
             # (isStartAddrSymbolic_ is always unset for lx, and bundle.py's
@@ -1110,6 +1167,13 @@ def generate_sdsc(
     def _start_addr_data(tensor):
         # All per-core addresses were already registered by the per-tensor loop
         # above. Look them up using the same key scheme as offset_as_symbol.
+        if tensor.non_unified:
+            return {
+                f"[{c}, 0, 0]": str(
+                    local_symbols[("shard_kernel", tensor.arg_index, c)]
+                )
+                for c in range(sdsc_spec.num_cores)
+            }
         if "lx" in tensor.allocation:
             return {
                 f"[{c}, 0, 0]": str(tensor.start_address)
@@ -1526,6 +1590,11 @@ def generate_sdsc(
                                     **(
                                         {"isStartAddrSymbolic_": 1}
                                         if "lx" not in tensor.allocation
+                                        else {}
+                                    ),
+                                    **(
+                                        {"nonUnifiedAllocInHBM_": True}
+                                        if tensor.non_unified
                                         else {}
                                     ),
                                     "layoutDimOrder_": [

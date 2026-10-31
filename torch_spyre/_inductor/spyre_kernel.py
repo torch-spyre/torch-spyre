@@ -66,6 +66,7 @@ from .lx_read_contracts import (
     normalize_local_read as normalize_local_lx_subrange,
 )
 from .ir import FixedTiledLayout, SpyreConstantFallback
+from .sharded_hbm import placement_of
 from .scratchpad.lx_relayout import (
     materialized_lx_relayout_for_destination,
 )
@@ -555,6 +556,27 @@ def _tile_advance_expr_from_dep(
     return dep.index.subs(subs)
 
 
+def _non_unified_shard_bytes(name: str, layout: FixedTiledLayout) -> int:
+    """Per-shard device bytes of a sharded kernel tensor, else 0.
+
+    The chunks hold shards in the default layout of the shard-local shape, so
+    the tensor's committed layout must be the default global layout; a
+    restickified or otherwise relaid tensor cannot use chunk addressing.
+    """
+    placement = placement_of(name)
+    if placement is None:
+        return 0
+    from torch_spyre._C import SpyreTensorLayout
+
+    size = [int(s) for s in layout.size]
+    if layout.device_layout != SpyreTensorLayout(size, layout.dtype):
+        raise Unsupported(
+            f"{name}: non-unified kernels need sharded tensors in the default "
+            f"device layout; got {layout.device_layout}"
+        )
+    return placement.shard_device_bytes
+
+
 class SpyreKernel(Kernel[CSEVariable]):
     overrides = SpyreOpFuncs  # type: ignore[assignment]
 
@@ -917,6 +939,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             work_division=work_division,
             kernel_local=kernel_local,
             replicated_scalar=replicated_scalar,
+            non_unified_shard_bytes=_non_unified_shard_bytes(name, tensor.layout),
         )
         if (
             _spyre_config.lx_planner_relayout
@@ -1788,6 +1811,11 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                                 buf.writeline("kernel_local=True,")
                             if arg.replicated_scalar:
                                 buf.writeline("replicated_scalar=True,")
+                            if arg.non_unified:
+                                buf.writeline(
+                                    "non_unified_shard_bytes="
+                                    f"{arg.non_unified_shard_bytes},"
+                                )
                             if arg.device_tile_advance_expr is not None:
                                 buf.writeline(
                                     "device_tile_advance_expr="
