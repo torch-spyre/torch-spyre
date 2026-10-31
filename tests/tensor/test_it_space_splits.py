@@ -214,6 +214,22 @@ class TestItSpaceSplits(TestCase):
         )
         self.assertTrue(problems, "collision with an unsplit axis must be flagged")
 
+    def test_split_colliding_only_with_a_size1_axis_is_representable(self):
+        # Contrast with test_split_colliding_with_nontrivial_unsplit_axis_is_-
+        # unrepresentable above: here i1 is genuinely size-1 (extent 1, like
+        # test_size1_dim_not_assigned_split), so the decoder's size<=1 guard
+        # already makes the shared coefficient harmless -- the decoder never
+        # looks up i1's coefficient at all. The representability check must
+        # not reject this as a false collision.
+        write_idx = 8 * i0 + 8 * i1 + i2
+        splits = {i0: 4, i1: 1, i2: 1}
+        problems = unrepresentable_splits_by_index_coeff(
+            splits, {i0: 8, i1: 1, i2: 8}, write_idx, write_idx
+        )
+        self.assertEqual(
+            problems, [], "a collision solely with a size-1 axis is not a hazard"
+        )
+
     def test_broadcast_dim_not_assigned_split(self):
         # Broadcast dim has stride 0 — coeff==0, so absent from stored splits
         # and correctly defaults to 1 on the apply side.
