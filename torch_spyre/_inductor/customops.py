@@ -1169,6 +1169,21 @@ def _(
     return torch.empty(1, 1, seqlen_q, seqlen_kv, dtype=dtype, device=device)
 
 
+@torch.library.register_kernel("spyre::causal_mask", ["cpu"])
+def causal_mask_cpu(
+    seqlen_q: int,
+    seqlen_kv: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    causal_cpu = torch.tril(
+        torch.ones(seqlen_q, seqlen_kv, dtype=torch.bool, device="cpu")
+    )
+    mask_cpu = torch.zeros(1, 1, seqlen_q, seqlen_kv, dtype=dtype, device="cpu")
+    mask_cpu.masked_fill_(~causal_cpu, float("-inf"))
+    return mask_cpu.to(device=device)
+
+
 @torch.library.custom_op("spyre::triu_cpu", mutates_args=())
 def triu_cpu(input: torch.Tensor, diagonal: int) -> torch.Tensor:
     """
@@ -1498,6 +1513,85 @@ def _(
 ) -> torch.Tensor:
     return torch.empty(
         num_experts * capacity + total_tokens, dtype=torch.int32, device=offs.device
+    )
+
+
+@torch.library.custom_op(
+    "spyre::linear_attention", mutates_args=(), device_types="spyre"
+)
+def linear_attention(  # type: ignore[empty-body]
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    initial_state: Optional[torch.Tensor] = None,
+    is_causal: bool = False,
+    feature_map: str = "elu",
+    scale: Optional[float] = None,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Linear attention custom operator for Spyre.
+
+    Replaces the standard quadratic softmax attention with linear attention using
+    feature maps phi(Q) and phi(K). By computing (phi(K)^T @ V) first, it reduces
+    time and memory complexity from O(N^2) to O(N).
+
+    Args:
+        query: Tensor of shape [B, Hq, Lq, Dk]
+        key: Tensor of shape [B, Hkv, Lkv, Dk]
+        value: Tensor of shape [B, Hkv, Lkv, Dv]
+        initial_state: Optional recurrent KV state [B, Hq, Dk, Dv]
+        is_causal: Whether to apply causal autoregressive masking (prefix scan)
+        feature_map: Feature map function ("elu", "relu", "silu", "identity")
+        scale: Scaling factor for query (defaults to 1 / sqrt(Dk))
+        eps: Epsilon constant for denominator normalization
+
+    Returns:
+        output: Tensor of shape [B, Hq, Lq, Dv]
+        final_state: Tensor of shape [B, Hq, Dk, Dv]
+    """
+    pass
+
+
+@linear_attention.register_fake
+def _(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    initial_state: Optional[torch.Tensor] = None,
+    is_causal: bool = False,
+    feature_map: str = "elu",
+    scale: Optional[float] = None,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    batch_size, num_heads, seqlen_q, head_dim_k = query.shape
+    _, _, _, head_dim_v = value.shape
+    output = query.new_empty((batch_size, num_heads, seqlen_q, head_dim_v))
+    final_state = query.new_empty((batch_size, num_heads, head_dim_k, head_dim_v))
+    return output, final_state
+
+
+@torch.library.register_kernel("spyre::linear_attention", ["cpu"])
+def linear_attention_cpu(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    initial_state: Optional[torch.Tensor] = None,
+    is_causal: bool = False,
+    feature_map: str = "elu",
+    scale: Optional[float] = None,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from torch_spyre._inductor.decompositions import spyre_linear_attention
+
+    return spyre_linear_attention(
+        query=query,
+        key=key,
+        value=value,
+        initial_state=initial_state,
+        is_causal=is_causal,
+        feature_map=feature_map,
+        scale=scale,
+        eps=eps,
     )
 
 
