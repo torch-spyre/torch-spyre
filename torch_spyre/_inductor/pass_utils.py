@@ -2400,7 +2400,15 @@ def compute_restickify_target_layout(
     (FloorDiv) coordinate expressions via ``_factorized_chain``.
     """
     if target_stick_expr == sympy.S.Zero:
-        return compute_size1_restickify_layout(stl, host_layout, ic, idc)
+        return compute_size1_restickify_layout(
+            stl,
+            host_layout,
+            ic,
+            idc,
+            arg=arg,
+            reduction_type=reduction_type,
+            label=label,
+        )
     if not target_stick_expr.free_symbols:
         return None
     if arg is None:
@@ -2479,6 +2487,10 @@ def compute_size1_restickify_layout(
     host_layout: FixedLayout,
     ic: list,
     idc: list,
+    *,
+    arg: "PropArg | None" = None,
+    reduction_type: str = "",
+    label: str = "",
 ) -> "SpyreTensorLayout | None":
     """Compute the target STL that results from moving stl's stick onto a size-1 dim.
 
@@ -2489,14 +2501,31 @@ def compute_size1_restickify_layout(
     size-1 dim: such a layout has a stick expression of the constant 0, which
     matching_dim cannot resolve to a host dim.
 
+    ``arg``, ``reduction_type``, and ``label`` are forwarded to
+    ``_host_size_stride_for_expr`` to enable resolution of factorized
+    (FloorDiv) coordinate expressions via ``_factorized_chain``.
+
     Returns None if the restickify is infeasible.
     """
     host_size = [concretize_expr(s) for s in host_layout.size]
     host_stride = [concretize_expr(s) for s in host_layout.stride]
-    old_sd = matching_dim(ic, idc[-1])
-    if old_sd is None:
-        return None
     old_stick_expr = idc[-1]
+    old_sd = matching_dim(ic, old_stick_expr)
+    if old_sd is not None:
+        old_sd_size_stride: "tuple[int, int] | None" = (
+            host_size[old_sd],
+            host_stride[old_sd],
+        )
+    elif arg is not None:
+        # matching_dim cannot handle factorized layouts; try _host_size_stride_for_expr.
+        old_sd_size_stride = _host_size_stride_for_expr(
+            old_stick_expr, ic, host_size, host_stride, arg, reduction_type, label
+        )
+    else:
+        old_sd_size_stride = None
+    if old_sd_size_stride is None:
+        return None
+    old_sd_host_size, old_sd_host_stride = old_sd_size_stride
     old_var = next(iter(old_stick_expr.free_symbols))
     stick_size = get_elem_in_stick(host_layout.dtype)
     old_var_outer_dims = [
@@ -2533,7 +2562,7 @@ def compute_size1_restickify_layout(
     device_size = restickify_device_size(
         list(stl.device_size),
         old_sd_outer_dim,
-        host_size[old_sd],
+        old_sd_host_size,
         new_sd_outer_dim,
         1,
         stick_size,
@@ -2541,7 +2570,7 @@ def compute_size1_restickify_layout(
     stride_map = restickify_stride_map(
         list(stl.stride_map),
         old_sd_outer_dim,
-        host_stride[old_sd],
+        old_sd_host_stride,
         new_sd_outer_dim,
         -1,
         stick_size,
@@ -2813,12 +2842,16 @@ def compute_size1_restickify_target(
     Used when the input's stick var must leave the stick (e.g. topk's
     reduction var) and no other dim can take it.
     """
+    # Local import avoids circular dependency (propagate_layouts imports pass_utils).
+    from .propagate_layouts import PropArg  # noqa: PLC0415
+
     _, _, ind_sizes = indirect_info_from_op(op)
     idc = try_device_coordinates(in_stl, in_dep, ind_sizes, op=op)
     if idc is None:
         return None
     ic = host_coordinates(in_host, in_dep, ind_sizes, op=op)
-    return compute_size1_restickify_layout(in_stl, in_host, ic, idc)
+    arg = PropArg(in_dep, in_host, [in_stl])
+    return compute_size1_restickify_layout(in_stl, in_host, ic, idc, arg=arg)
 
 
 def copy_fx_custom_meta(src: "torch.fx.Node", dst: "torch.fx.Node") -> None:
