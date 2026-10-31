@@ -795,4 +795,45 @@ def spyre__copy_from(self, dst, non_blocking=False):
         return dst
 
 
+@torch.library.register_kernel("aten::_to_copy", ["spyre"])  # type:ignore
+def spyre__to_copy(
+    self: torch.Tensor,
+    *,
+    dtype: torch.dtype | None = None,
+    layout: torch.layout | None = None,
+    device: torch.device | None = None,
+    pin_memory: bool | None = None,
+    non_blocking: bool = False,
+    memory_format: torch.memory_format | None = None,
+) -> torch.Tensor:
+    """Route same-device dtype casts through ``spyre.to_dtype_d2d``.
+
+    ``Tensor.to`` is intercepted in Python (``spyre_to``), but ``x.float()``,
+    ``x.type(dtype)`` and ``torch.softmax(x, dtype=...)`` reach the dispatcher
+    as ``aten._to_copy`` and would otherwise take the default
+    allocate-and-``copy_`` implementation. That path never stamps the staggered
+    element arrangement (e.g. DL16_TO_FP32) on the result, so the buffer is read
+    back, and consumed by later kernels, as STANDARD.
+    """
+    if (
+        dtype is not None
+        and dtype != self.dtype
+        and (device is None or torch.device(device).type == self.device.type)
+        and layout in (None, torch.strided)
+        and not pin_memory
+        and memory_format in (None, torch.preserve_format, torch.contiguous_format)
+    ):
+        return torch.ops.spyre.to_dtype_d2d(self, dtype, self.storage_offset())
+
+    out = torch.empty_like(
+        self,
+        dtype=dtype,
+        layout=layout,
+        device=device,
+        pin_memory=pin_memory,
+        memory_format=torch.preserve_format if memory_format is None else memory_format,
+    )
+    return out.copy_(self, non_blocking=non_blocking)
+
+
 # INSERT_CODEGEN_HERE
