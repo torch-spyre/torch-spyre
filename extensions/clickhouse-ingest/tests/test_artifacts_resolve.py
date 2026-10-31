@@ -626,7 +626,8 @@ def test_the_cli_dates_a_family_tag_today_unless_given_a_tag_date(monkeypatch, c
 def test_the_packaged_families_are_the_recorded_ones():
     supply_chain = {"snap-supply-chain", "nightly-supply-chain", "weekly-supply-chain"}
     assert set(tag_families()) == supply_chain | {
-        "ci-cd-tech-preview", "release", "pr", "main", "nightly", "weekly", "snap", "misc"
+        "ci-cd-tech-preview", "release", "pr", "main", "nightly", "weekly", "snap", "experiment",
+        "misc",
     }  # fmt: skip
     assert {f for f in tag_families() if dated(f)} == supply_chain
     # A family with no registry tag and no fallback is named only by an explicit --tag.
