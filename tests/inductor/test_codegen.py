@@ -86,14 +86,16 @@ class TestSpyreConfig(InductorTestCase):
         torch.manual_seed(0xAFFE)
 
     def test_config_default(self):
-        fn = torch.abs
-        x = torch.randn((256, 128, 512)).to("spyre")
+        # A compute-bound matmul, so the co-optimizer's best plan uses every
+        # configured core. A bandwidth-bound pointwise op would not show it:
+        # its HBM time is the same on 8 cores as on 32, and CP-SAT may return
+        # either (an 8-way abs split is the faster one on device).
+        a = torch.randn((2048, 2048), dtype=torch.float16).to("spyre")
+        b = torch.randn((2048, 2048), dtype=torch.float16).to("spyre")
 
-        comp_fn = torch.compile(fn)
-        out, source_codes = run_and_get_code(comp_fn, x)
-        # print("test_config_default")
-        # print(source_codes[0])
-        FileCheck().check("sdsc_fused_abs").run(source_codes[0])
+        comp_fn = torch.compile(torch.mm)
+        out, source_codes = run_and_get_code(comp_fn, a, b)
+        FileCheck().check("sdsc_fused_mm").run(source_codes[0])
         # Co-optimization spreads the split across dims; the product of the
         # per-dim split factors must add up to the configured core count.
         self.assertEqual(_total_core_split(source_codes[0]), config.sencores)
