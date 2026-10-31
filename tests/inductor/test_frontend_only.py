@@ -101,7 +101,7 @@ def _compile_ktir_one_kernel(tmp_path):
         patch.object(ac.os.path, "exists", return_value=True),
     ):
         runner = compiler._compile_ktir_with_dbo(
-            "fused_add_0", str(ktir_path), str(tmp_path)
+            "fused_add_0", str(ktir_path), str(tmp_path), "ab12cd34"
         )
         return runner, prereqs, subprocess_run, sdsc_runner
 
