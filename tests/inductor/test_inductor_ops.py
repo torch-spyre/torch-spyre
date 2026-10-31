@@ -7458,6 +7458,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_where_self", "test_where_eager"): {
             "ops_dict": {"where": torch.where},
+            # A host bool mask converted to fp32 for an int32 where is staggered,
+            # and a STANDARD full operand cannot combine with it. Pending
+            # de-staggering support (#5495).
+            "expect_fail": {
+                "int32_2d": "host bool mask with fp32/int32 values is refused as mixed EA, pending #5495",
+                "int32_3d": "host bool mask with fp32/int32 values is refused as mixed EA, pending #5495",
+            },
+            # Bool values are not supported: they must be refused as mixed EA, not
+            # computed (a computed result is silently wrong).
+            "expect_raise": {"bool_2d": "mixed EA"},
             "param_sets": {
                 "fp16_2d": (
                     cached_randn((10, 10), dtype=torch.float16) > 1,
@@ -7487,14 +7497,19 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
                 # int32: INT32TOFP32 on Spyre; result cast back to int32
                 "int32_2d": (
-                    torch.zeros(4, 32, dtype=torch.bool),
+                    cached_randn((4, 32), dtype=torch.float16) > 0,
                     torch.randint(0, 1000, (4, 32), dtype=torch.int32),
                     torch.randint(0, 1000, (4, 32), dtype=torch.int32),
                 ),
                 "int32_3d": (
-                    torch.zeros(2, 8, 64, dtype=torch.bool),
+                    cached_randn((2, 8, 64), dtype=torch.float16) > 0,
                     torch.randint(0, 1000, (2, 8, 64), dtype=torch.int32),
                     torch.randint(0, 1000, (2, 8, 64), dtype=torch.int32),
+                ),
+                "bool_2d": (
+                    cached_randn((4, 64), dtype=torch.float16) > 0,
+                    cached_randn((4, 64), dtype=torch.float16, differentiation=1) > 0,
+                    cached_randn((4, 64), dtype=torch.float16, differentiation=2) > 0,
                 ),
             },
         },
@@ -7520,6 +7535,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_where_scalarself", "test_where_eager"): {
             "ops_dict": {"where": torch.where},
+            # int64 values are promoted to fp32, so a host bool mask is converted
+            # to a staggered fp32 here as well. Pending de-staggering support
+            # (#5495).
+            "expect_fail": {
+                "int64_1x24": "host bool mask with fp32/int values is refused as mixed EA, pending #5495",
+            },
             "param_sets": {
                 "fp16_2d": (
                     cached_randn((10, 10), dtype=torch.float16) > 1,
@@ -7543,7 +7564,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     torch.randint(0, 1000, (1, 1), dtype=torch.int64),
                 ),
                 "int64_1x24": (
-                    torch.zeros(1, 24, dtype=torch.bool),
+                    cached_randn((1, 24), dtype=torch.float16) > 0,
                     0,
                     torch.randint(0, 1000, (1, 24), dtype=torch.int64),
                 ),
@@ -7589,6 +7610,67 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((5, 10), dtype=torch.float16),
                     cached_randn((5, 10), dtype=torch.float16),
                     cached_randn((5, 10), dtype=torch.float16),
+                ),
+            },
+        },
+        ("test_masked_fill_scalar", "test_masked_fill_scalar_eager"): {
+            "ops_dict": {
+                "masked_fill": lambda x, mask, value: x.masked_fill(mask, value),
+                "masked_fill_": lambda x, mask, value: x.masked_fill_(mask, value),
+            },
+            # masked_fill lowers to where; a host bool mask with fp32/int32 values
+            # is refused as mixed EA. Pending de-staggering support (#5495).
+            "expect_fail": {
+                "fp32_2d": "host bool mask with fp32/int32 values is refused as mixed EA, pending #5495",
+                "fp32_3d": "host bool mask with fp32/int32 values is refused as mixed EA, pending #5495",
+                "int32_2d": "host bool mask with fp32/int32 values is refused as mixed EA, pending #5495",
+                "int32_3d": "host bool mask with fp32/int32 values is refused as mixed EA, pending #5495",
+            },
+            "param_sets": {
+                "fp16_2d_zero": (
+                    cached_randn((4, 64), dtype=torch.float16) > 0,
+                    cached_randn((4, 64), dtype=torch.float16),
+                    0.0,
+                ),
+                "fp16_2d_neginf": (
+                    cached_randn((5, 10), dtype=torch.float16) > 0,
+                    cached_randn((5, 10), dtype=torch.float16),
+                    float("-inf"),
+                ),
+                "fp16_3d": (
+                    cached_randn((2, 8, 32), dtype=torch.float16) > 0,
+                    cached_randn((2, 8, 32), dtype=torch.float16),
+                    -1.0e4,
+                ),
+                "fp16_broadcast": (
+                    cached_randn((64,), dtype=torch.float16) > 0,
+                    cached_randn((4, 64), dtype=torch.float16),
+                    0.0,
+                ),
+                "fp16_empty": (
+                    cached_randn((4, 0), dtype=torch.float16) > 0,
+                    cached_randn((4, 0), dtype=torch.float16),
+                    0.0,
+                ),
+                "fp32_2d": (
+                    cached_randn((4, 64), dtype=torch.float32) > 0,
+                    cached_randn((4, 64), dtype=torch.float32),
+                    0.0,
+                ),
+                "fp32_3d": (
+                    cached_randn((2, 8, 32), dtype=torch.float32) > 0,
+                    cached_randn((2, 8, 32), dtype=torch.float32),
+                    -1.0e4,
+                ),
+                "int32_2d": (
+                    cached_randn((4, 32), dtype=torch.float16) > 0,
+                    torch.randint(0, 1000, (4, 32), dtype=torch.int32),
+                    0,
+                ),
+                "int32_3d": (
+                    cached_randn((2, 8, 64), dtype=torch.float16) > 0,
+                    torch.randint(0, 1000, (2, 8, 64), dtype=torch.int32),
+                    -1,
                 ),
             },
         },
@@ -12292,6 +12374,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_where_eager_selfout(self, op, condition, x, y, z):
         self.compare_with_cpu(
             lambda condition, x, y, z: op(condition, x, y, out=z), condition, x, y, z
+        )
+
+    def test_masked_fill_scalar_eager(self, op, mask, x, value):
+        # clone_inputs: the in-place op mutates x, so the CPU reference and the
+        # Spyre run must each get a fresh copy.
+        self.compare_with_cpu(
+            lambda mask, x: op(x, mask, value), mask, x, clone_inputs=True
         )
 
     def test_attn_qkv_paths(self, q, k, v):
