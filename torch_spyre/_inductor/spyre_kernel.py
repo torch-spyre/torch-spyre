@@ -1107,7 +1107,18 @@ class SpyreKernel(Kernel[CSEVariable]):
                     level_syms.append(self._get_or_mint_level_symbol(lvl, op_name))
                 tiled_syms_per_level_outermost.append(level_syms)
                 if lvl < len(loop_count):
-                    trip_count = int(loop_count[lvl])
+                    count = loop_count[lvl]
+                    # A symbolic count needs its op geometry built at the declared
+                    # maximum, and a launch slot that reads the size, before it
+                    # can run. Neither exists yet, so say that plainly here
+                    # instead of failing in int() with "Cannot convert symbols".
+                    if getattr(count, "free_symbols", None):
+                        raise Unsupported(
+                            f"{op_name} inside a for_each_tile loop whose trip "
+                            f"count {count} depends on a varying size. Building its "
+                            "geometry at the declared maximum is not implemented yet"
+                        )
+                    trip_count = int(count)
                     for sym in level_syms:
                         tiled_symbol_trip_counts[sym] = trip_count
             # Reverse so index 0 = innermost level.

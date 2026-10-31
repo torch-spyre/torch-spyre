@@ -1831,5 +1831,44 @@ class TestForEachTileCarriedSumE2E(_DynamoResetTestCase):
                     )
 
 
+def _length_tiled_double_fn(x: torch.Tensor) -> torch.Tensor:
+    """for_each_tile over a varying length, so the trip count is symbolic."""
+    from torch_spyre._inductor.wsr import for_each_tile
+
+    rows = x.shape[0]
+    torch._check(rows >= 64)
+    torch._check(rows <= 512)
+    torch._check(rows % 32 == 0)
+
+    def body(_, ops):
+        (tile,) = ops
+        return None, tile * 2
+
+    _, out = for_each_tile(body, (x,), dims=(0,), tile_size=32, out_dim=0)
+    return out
+
+
+class TestASymbolicTripCountIsRefusedByName(_DynamoResetTestCase):
+    """A varying trip count reaches codegen and stops there with a clear reason.
+
+    TODO: becomes a positive test, one compile correct at several sizes, once
+    the geometry is built at the declared maximum and the launch reads the size
+    (the next pull request of the #5186 split).
+    """
+
+    @expects_raise
+    def test_a_varying_trip_count_says_what_is_missing(self):
+        from torch._inductor.exc import InductorError
+
+        x = torch.randn(128, 64, dtype=torch.float16).to(DEVICE_NAME)
+        torch._dynamo.mark_dynamic(x, 0)
+        compiled = torch.compile(_length_tiled_double_fn, fullgraph=True)
+
+        with self.assertRaisesRegex(
+            InductorError, "geometry at the declared maximum is not implemented"
+        ):
+            compiled(x)
+
+
 if __name__ == "__main__":
     unittest.main()
