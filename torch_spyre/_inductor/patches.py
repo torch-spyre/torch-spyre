@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 from contextlib import contextmanager
 from functools import wraps
 
@@ -29,6 +30,9 @@ from torch._inductor.virtualized import V
 
 from . import pass_counters
 from .constants import DEVICE_NAME
+from .logging_utils import get_inductor_logger
+
+logger = get_inductor_logger("patches")
 
 
 @contextmanager
@@ -132,6 +136,90 @@ def _unique_operation_names():
         yield
     finally:
         GraphLowering.register_operation = old_register_operation  # type: ignore[method-assign]
+
+
+# The upstream report for the gap _resolve_scan_shapes_by_expression patches,
+# and the signature the patch was written against.
+# TODO(Vivek1258): file the PyTorch issue for this gap and put its URL here.
+RESOLVE_SHAPE_ISSUE = "upstream PyTorch issue not yet filed"
+RESOLVE_SHAPE_PARAMS = ("shape", "bound_symbols")
+
+
+@contextmanager
+def _resolve_scan_shapes_by_expression():
+    """Let upstream rebuild a scan output shape whose extent is an expression.
+
+    ``decompose_scan_to_while_loop`` rebuilds the scan output's shape through
+    ``resolve_shape_to_proxy``, against an env keyed ``{arg.node.expr: arg}``
+    over the scan's SymInt args plus the scan length. ``sympy_interp`` only
+    consults that env for a bare ``sympy.Symbol`` leaf, so an expression key
+    such as ``FloorDiv(s97, 64)`` sits in the dict unread: it recurses into
+    ``s97`` and raises ``KeyError(s97)``.
+
+    That fires exactly when the body is fully static and only the trip count is
+    derived from a dynamic dim, which is the shape a symbolic loop bound has.
+    The proxy for the whole expression is already in the dict as the scan
+    length, so matching the expression before upstream's symbol walk is enough.
+
+    An upstream gap, not a Spyre one, tracked as RESOLVE_SHAPE_ISSUE. Remove it
+    once that is fixed. Everything else takes the original path, one element at
+    a time so upstream keeps its own type checking and error messages.
+
+    The module attribute is the only hook, so the wrapper is in place for the
+    whole Spyre compile and main's map decomposition reaches it too. It answers
+    differently from upstream only where upstream would raise ``KeyError``.
+    Wherever upstream resolves a size, the result is the same value.
+
+    The wrapper is installed only over the signature it was written against.
+    A PyTorch upgrade that changes or removes the function leaves upstream in
+    place and warns, rather than wrapping something it no longer matches.
+    """
+    from torch._inductor.fx_passes import post_grad as _post_grad
+
+    original = getattr(_post_grad, "resolve_shape_to_proxy", None)
+    if original is None:
+        logger.warning(
+            "post_grad.resolve_shape_to_proxy is absent, so its expression-key "
+            "gap (%s) is not patched. Upstream may have fixed it or moved it. "
+            "A symbolic trip count may fail in the scan decomposition with "
+            "KeyError until this patch is updated or removed",
+            RESOLVE_SHAPE_ISSUE,
+        )
+        yield
+        return
+    try:
+        params = tuple(inspect.signature(original).parameters)
+    except (TypeError, ValueError):
+        params = None
+    if params != RESOLVE_SHAPE_PARAMS:
+        logger.warning(
+            "post_grad.resolve_shape_to_proxy has parameters %s, the patch for "
+            "its expression-key gap (%s) was written for %s, so it is not "
+            "installed. A symbolic trip count may fail in the scan "
+            "decomposition with KeyError until this patch is updated or removed",
+            params,
+            RESOLVE_SHAPE_ISSUE,
+            RESOLVE_SHAPE_PARAMS,
+        )
+        yield
+        return
+
+    @wraps(original)
+    def resolve_shape_to_proxy(shape, bound_symbols):
+        resolved = []
+        for size in shape:
+            expr = getattr(getattr(size, "node", None), "expr", None)
+            if expr is not None and expr in bound_symbols:
+                resolved.append(bound_symbols[expr])
+            else:
+                resolved.append(original([size], bound_symbols)[0])
+        return resolved
+
+    _post_grad.resolve_shape_to_proxy = resolve_shape_to_proxy
+    try:
+        yield
+    finally:
+        _post_grad.resolve_shape_to_proxy = original
 
 
 @contextmanager
@@ -267,6 +355,7 @@ def enable_spyre_context(example_inputs: list[InputType]):
         spyre_data_types(),
         _preserve_spyre_input_storage_offsets(),
         _unique_operation_names(),
+        _resolve_scan_shapes_by_expression(),
         enable_spyre_lowerings(),
         # Analysis-call counters ride the timing gate: they exist to annotate
         # timing records, and a second knob would let the two disagree.
