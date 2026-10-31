@@ -2147,6 +2147,7 @@ def coeff_through_floor(expr: sympy.Expr, sym: sympy.Symbol) -> sympy.Expr:
 
 def unrepresentable_splits_by_index_coeff(
     splits: dict[sympy.Symbol, int],
+    it_space: dict[sympy.Symbol, sympy.Expr],
     write_index: sympy.Expr,
     read_index: sympy.Expr,
 ) -> list[str]:
@@ -2161,52 +2162,58 @@ def unrepresentable_splits_by_index_coeff(
     - its symbol's coefficient in the relevant index is 0 (the symbol is not
       a linear term there -- e.g. a kernel-window offset that lives in op
       metadata rather than the index expression), or
-    - it shares a nonzero coefficient with a *different* symbol that also
-      has factor > 1: the coefficient-keyed dict holds one entry per
-      coefficient, so the later axis silently overwrites the earlier one.
+    - it shares a nonzero coefficient with a *different* symbol of
+      ``it_space`` -- split or not: the coefficient-keyed dict holds one
+      entry per coefficient, so the decoder cannot tell the two symbols
+      apart and applies the stored split to both, splitting an axis the
+      planner meant to leave whole.
+
+    ``it_space`` must be every iteration symbol the op defines, not just the
+    ones ``splits`` mentions: a caller (such as a user hint) may omit an
+    unsplit axis from ``splits`` entirely rather than recording it as 1, and
+    that omitted axis can still collide on a coefficient with one that is
+    split.
 
     Returns one description string per unrepresentable axis/collision, empty
     iff ``splits`` is fully representable. This is the single
     collision-detection implementation shared by
-    :func:`~.work_division.WorkDivisionContext.is_legal` and
-    :func:`~.work_division._apply_user_hint` (which must reject an
-    unrepresentable candidate before it is ever committed) and by
+    :func:`~.work_division.WorkDivisionContext.is_legal`,
+    :func:`~.work_division._apply_user_hint`, and
+    :func:`~.work_division.apply_splits` (which must reject an unrepresentable
+    candidate before it is ever committed) and by
     :func:`finalize_work_division_for_scheduler` (which must never see a
     non-empty result once those checks hold, and raises if it does).
     """
-    reduction_syms = {sym for sym in splits if write_index.coeff(sym) == 0}
+    reduction_syms = {sym for sym in it_space if write_index.coeff(sym) == 0}
     problems: list[str] = []
     for label, index, symbols in (
-        (
-            "output",
-            write_index,
-            {s: v for s, v in splits.items() if s not in reduction_syms},
-        ),
-        (
-            "reduction",
-            read_index,
-            {s: v for s, v in splits.items() if s in reduction_syms},
-        ),
+        ("output", write_index, [s for s in it_space if s not in reduction_syms]),
+        ("reduction", read_index, [s for s in it_space if s in reduction_syms]),
     ):
-        seen: dict[sympy.Expr, sympy.Symbol] = {}
-        for sym, split in symbols.items():
-            if split <= 1:
+        coeff_syms: dict[sympy.Expr, list[sympy.Symbol]] = {}
+        for sym in symbols:
+            coeff = index.coeff(sym)
+            if coeff != 0:
+                coeff_syms.setdefault(coeff, []).append(sym)
+        for sym in symbols:
+            if splits.get(sym, 1) <= 1:
                 continue
             coeff = index.coeff(sym)
             if coeff == 0:
                 problems.append(f"{label}:{sym}=absent")
                 continue
-            if coeff in seen:
+            collisions = [s for s in coeff_syms[coeff] if s != sym]
+            if collisions:
                 problems.append(
-                    f"{label}: coeff {coeff} {seen[coeff]} -> {sym} collide"
+                    f"{label}: coeff {coeff} {sym} collides with "
+                    f"{', '.join(str(s) for s in collisions)}"
                 )
-            else:
-                seen[coeff] = sym
     return problems
 
 
 def splits_representable_by_index_coeff(
     splits: dict[sympy.Symbol, int],
+    it_space: dict[sympy.Symbol, sympy.Expr],
     write_index: sympy.Expr,
     read_index: sympy.Expr,
 ) -> bool:
@@ -2214,7 +2221,9 @@ def splits_representable_by_index_coeff(
     (factor > 1 entries) without loss. See
     :func:`unrepresentable_splits_by_index_coeff`.
     """
-    return not unrepresentable_splits_by_index_coeff(splits, write_index, read_index)
+    return not unrepresentable_splits_by_index_coeff(
+        splits, it_space, write_index, read_index
+    )
 
 
 def _coeff_splits_from_index(
@@ -2393,21 +2402,23 @@ def finalize_work_division_for_scheduler(graph: GraphLowering) -> None:
         if ownership is None:
             continue
         rw = op_read_writes(op)
+        it_space = iteration_space_from_op(op)
         try:
             write_index, read_index = select_work_division_transport_indexes(
-                op, rw, iteration_space_from_op(op)
+                op, rw, it_space
             )
         except Unsupported:
             continue
         problems = unrepresentable_splits_by_index_coeff(
-            ownership.work_slices, write_index, read_index
+            ownership.work_slices, it_space, write_index, read_index
         )
         if problems:
             raise Unsupported(
                 f"work division for {op.get_name()} cannot be represented by "
                 "the scheduler's coefficient-keyed transport (this should be "
-                "unreachable: is_legal/_apply_user_hint are expected to "
-                f"reject such a split before it is committed): {'; '.join(problems)}"
+                "unreachable: is_legal/_apply_user_hint/apply_splits are "
+                f"expected to reject such a split before it is committed): "
+                f"{'; '.join(problems)}"
             )
         op.op_it_space_splits = splits_by_index_coeff(
             ownership.work_slices, write_index, read_index

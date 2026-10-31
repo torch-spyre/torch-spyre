@@ -435,13 +435,18 @@ Scheduler/codegen can survive iteration-symbol renaming.
 For the worked example below, the pre-scheduler ownership is
 `{M: 16, N: 1, K: 2}`. Scheduler/codegen receives this same split
 re-keyed by write/read index coefficient rather than by symbol.
-`WorkDivisionContext.is_legal` and user-hint application reject any split
-the coefficient-keyed encoding cannot carry losslessly (an axis absent from
-the relevant index, or two split axes that would collide on one
-coefficient) before it is ever committed, so this re-keying is lossless for
-every split that reaches `finalize_work_division_for_scheduler()`; that
-function re-checks the same condition defensively and raises rather than
-emitting a lossy encoding if it is somehow still reached.
+`apply_splits()` -- the one function every work-division pass (span
+reduction, the default greedy distributor, the cost-model matmul re-pricer,
+and user hints alike) commits a split through -- rejects any split the
+coefficient-keyed encoding cannot carry losslessly (an axis absent from the
+relevant index, or two axes, split or not, that would collide on one
+coefficient) before it is ever committed. `WorkDivisionContext.is_legal` and
+user-hint application additionally reject such a split earlier, at
+candidate-enumeration time, so a search never wastes a step on one. Together
+these make this re-keying lossless for every split that reaches
+`finalize_work_division_for_scheduler()`; that function re-checks the same
+condition defensively and raises rather than emitting a lossy encoding if it
+is somehow still reached.
 :::
 
 Two op-kind constraints apply on top of the algorithm above. For
