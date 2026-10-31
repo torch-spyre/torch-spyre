@@ -3965,6 +3965,49 @@ class TestTopKConstraints(unittest.TestCase):
         self.assertEqual(splits[k], 2)
         self.assertEqual(splits[search], 1)
 
+    def _router_topk_domains(self, row_sticks, k_size):
+        """A [row_sticks * 64, 512] fp16 router topk, as work division sees it."""
+        rows, k, search = _isym("rows"), _isym("k"), _isym("search")
+        op = _computed_buffer(
+            (row_sticks * 64, k_size),
+            reduction_type="topkvalue",
+            reduction_ranges=(search,),
+        )
+        input_td = _tensor_dep("input", (512, row_sticks * 64), (search, rows))
+        output_td = _tensor_dep("output", (k_size, row_sticks * 64), (k, rows))
+        ctx = _make_context(
+            op,
+            output_td,
+            input_tds=[input_td],
+            it_space={rows: row_sticks * 64, k: k_size, search: 512},
+            it_space_adjusted={rows: row_sticks, k: k_size, search: 512},
+            stick_vars={rows: 64},
+            reduction_vars=[search],
+        )
+        with patch.object(
+            work_division_constraints, "topk_input_lx_budget", return_value=196608
+        ):
+            return topk_split_domains(ctx).allowed_splits, rows
+
+    def test_topk_rows_split_until_each_core_input_fits_lx(self):
+        """Past the bound topk.ddl returned out-of-range indices without an error."""
+        within, rows = self._router_topk_domains(row_sticks=3, k_size=16)
+        self.assertNotIn(rows, within)
+        over, rows = self._router_topk_domains(row_sticks=4, k_size=16)
+        self.assertEqual(over[rows], frozenset({2, 4}))
+
+    def test_topk_rows_the_k_split_leaves_no_core_for_are_rejected(self):
+        """k=17 splits 17 ways, leaving one core for every row."""
+        with self.assertRaisesRegex(Unsupported, "each core's input must stay within"):
+            self._router_topk_domains(row_sticks=4, k_size=17)
+
+    def test_topk_row_splits_spread_over_several_row_dims(self):
+        self.assertEqual(
+            work_division_constraints.topk_row_splits([2, 8], 8, 16),
+            [frozenset({2}), frozenset({4, 8})],
+        )
+        self.assertIsNone(work_division_constraints.topk_row_splits([3], 4, 32))
+
 
 class TestIndirectAccessSplitDomains(unittest.TestCase):
     _PATCH_TARGET = (
