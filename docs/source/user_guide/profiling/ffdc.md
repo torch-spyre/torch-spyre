@@ -15,48 +15,81 @@ Capture is opt-in via `TORCH_SPYRE_FFDC=1`. Retrieval via
 variable. For field-level API details see
 [`get_diagnostic_report`](../../api/torch_spyre.rst).
 
-Auto-capture hooks landed in
-[PR #2704](https://github.com/torch-spyre/torch-spyre/pull/2704); this
-guide covers the retrieval API and report schema.
-
-## Quick start
-
-```bash
-export TORCH_SPYRE_FFDC=1
-export TORCH_COMPILE_DEBUG=1   # optional; adds torch_compile_debug/ paths
-export DUMP_SPYRE_CODE=1       # optional; adds sdsc_*.json and *.mlir paths
-python your_script.py
-```
-
-Then inspect the newest valid report:
-
-```python
-import torch
-import torch_spyre
-
-report = torch.spyre.get_diagnostic_report()
-if report is not None:
-    print(report["failure"]["category"])
-    print(report["failure"]["file"], report["failure"]["lineno"])
-    print(report["failure"]["message"])
-    print(report["_report_path"])
-```
-
-`TORCH_SPYRE_FFDC=1` controls whether new reports are written.
-`get_diagnostic_report()` can still read already-written reports even if
-that variable is unset later.
-
 This gate is intentionally separate from `USE_SPYRE_PROFILER` (the
 `setup.py` Kineto profiler build flag). FFDC capture does not require a
 profiler build, and pods do not enable `TORCH_SPYRE_FFDC` by default.
-Set it explicitly for the failing run.
 
-With `TORCH_SPYRE_FFDC=1` set, frontend-compile, backend-compile,
-runtime-launch, and unimplemented-operation hooks write a report
-automatically. `TORCH_COMPILE_DEBUG=1` and `DUMP_SPYRE_CODE=1` are
-optional enrichment flags (often already available in debug workflows);
-they are not required for capture, but they give FFDC more artifact
-paths to link into the report.
+Auto-capture hooks landed in
+[PR #2704](https://github.com/torch-spyre/torch-spyre/pull/2704); the
+retrieve API landed in
+[PR #3305](https://github.com/torch-spyre/torch-spyre/pull/3305). This
+guide is the field/support path: enable → fail → retrieve → triage.
+
+## Workflow
+
+1. **Enable capture** for the failing run:
+
+   ```bash
+   export TORCH_SPYRE_FFDC=1
+   export TORCH_COMPILE_DEBUG=1   # optional; more artifact paths
+   ```
+
+   `TORCH_COMPILE_DEBUG` is optional enrichment. It is not required
+   for capture. Bundle files (`sdsc_*.json`, `bundle.mlir`) are
+   written by `generate_bundle()` without an extra env var.
+   `DUMP_SPYRE_CODE` is snapshotted into the report if set; torch-spyre
+   does not read it.
+
+2. **Reproduce the failure.** With the gate set, frontend-compile,
+   backend-compile, runtime-launch, and unimplemented-operation hooks
+   write a JSON report automatically. FFDC never changes program
+   behaviour: hooks use nested `try/except` so a collection failure
+   cannot mask the original exception.
+
+3. **Retrieve** the newest valid report. Search the same **report**
+   directory the failing process wrote — usually
+   `<cache-root>/torch-spyre/ffdc_reports` (where `<cache-root>` is
+   `$TORCHINDUCTOR_CACHE_DIR` or else
+   `<tempdir>/torchinductor_<user>`), or
+   `<tempdir>/torch-spyre-ffdc` when Inductor `cache_dir()`
+   resolution fails. See
+   [Where reports are stored](#where-reports-are-stored). A new
+   interpreter does **not** inherit an isolated cache unless you
+   export `TORCHINDUCTOR_CACHE_DIR` **before** the first Inductor
+   `cache_dir()` call (often during `import torch`). That helper
+   assigns `TORCHINDUCTOR_CACHE_DIR` to a default when it is unset,
+   and no-arg `get_diagnostic_report()` will miss reports written
+   under a different root. To point at a specific tree, pass that
+   report directory as `output_dir` (not the cache root).
+
+   ```python
+   import torch
+   import torch_spyre
+
+   report = torch.spyre.get_diagnostic_report()
+   if report is not None:
+       print(report["failure"]["category"])
+       print(report["failure"]["file"], report["failure"]["lineno"])
+       print(report["failure"]["message"])
+       print(report["_report_path"])
+   ```
+
+   The same function is available as
+   `torch_spyre.profiler.get_diagnostic_report`. Retrieval does not
+   require `TORCH_SPYRE_FFDC`.
+
+4. **Triage.** Start with `failure.category`, then the fields in
+   [Field / support enumeration](#field--support-enumeration).
+   Confirm `metadata.pid` / `metadata.timestamp` match this run —
+   `get_diagnostic_report()` returns the newest valid file in the
+   directory, not “this process.”
+
+Reports are **local to the host** that produced them. CI web UIs do
+not show them unless a workflow prints `_report_path` or uploads the
+report directory as an artifact. Logging the path on capture and CI
+upload are tracked in
+[#4052](https://github.com/torch-spyre/torch-spyre/issues/4052); they
+are not shipped yet.
 
 ## Failure categories and hook locations
 
@@ -81,10 +114,10 @@ triage notes follow in Field / support enumeration.
 
 | `failure.category` | Layer | When it fires | Hook location |
 |---|---|---|---|
-| `compile_frontend` | Frontend | `torch.compile()` / Spyre Inductor frontend fails (including decomposition and lowering paths that surface through `compile_fx`) | `torch_spyre/_inductor/__init__.py` |
+| `compile_frontend` | Frontend | `torch.compile()` / Spyre Inductor frontend fails (including decomposition and lowering paths that surface through `compile_fx`) | `torch_spyre/_inductor/__init__.py` (`compile_fx`) |
 | `compile_backend` | Backend | `dbo-opt` fails after artifact emit (`sdsc` SDSC bundle or `_compile_ktir_with_dbo`, including missing spyrecode) | `torch_spyre/execution/async_compile.py` |
-| `runtime_launch` | Runtime | Kernel launch or `launch_jobplan` fails on device | `torch_spyre/execution/kernel_runner.py` (`SpyreSDSCKernelRunner`) |
-| `unimplemented` | Runtime | An op reaches the runtime without a Spyre lowering | `torch_spyre/execution/kernel_runner.py` (`SpyreUnimplementedRunner`) |
+| `runtime_launch` | Runtime | `launch_jobplan` fails on device | `torch_spyre/execution/kernel_runner.py` (`SpyreSDSCKernelRunner.run`) |
+| `unimplemented` | Runtime | An op reaches the runtime without a Spyre lowering | `torch_spyre/execution/kernel_runner.py` (`SpyreUnimplementedRunner.run`) |
 | `unknown` | — | `collect()` / `try_collect()` omit `failure_category`, or empty / whitespace-only / non-`str` input | `torch_spyre/profiler/_ffdc.py` (no auto-hook) |
 
 `collect()` does **not** reject non-vocabulary strings: empty /
@@ -95,18 +128,12 @@ only). `get_diagnostic_report()` accepts any report whose
 `failure.category` is a string — it does not restrict to
 `KNOWN_FAILURE_CATEGORIES`.
 
-FFDC never changes program behaviour: hooks use nested `try/except` so
-a collection failure cannot mask the original exception.
-
 When a backend `dbo-opt` hook (`sdsc` or `_compile_ktir_with_dbo`)
 captures and re-raises, the outer `compile_fx` wrapper does **not**
 write a second `compile_frontend` report for that same exception, a
 wrapper raised `from` it (`__cause__`), or a wrapper whose `__context__`
 is that exception (bare `raise New` inside `except`). The inner
 category is kept.
-
-The same function is available as
-`torch_spyre.profiler.get_diagnostic_report`.
 
 ### Field / support enumeration
 
@@ -276,7 +303,146 @@ Capture and retrieval can use different environment variables:
   that variable is unset in a later session.
 - The **search directory** must still match. If
   `TORCHINDUCTOR_CACHE_DIR` or `TMPDIR` changed between capture and
-  retrieval, pass the original path as `output_dir`.
+  retrieval, pass the original **report** directory as `output_dir`
+  — that is `<cache-root>/torch-spyre/ffdc_reports` (or
+  `<tempdir>/torch-spyre-ffdc` on the fallback path), **not** the
+  cache or `TMPDIR` root. `get_diagnostic_report(output_dir=...)`
+  searches that directory for JSON files; it does not append
+  `torch-spyre/ffdc_reports` for you. If a tool or test isolated the
+  cache, either pass that report directory explicitly, or export the
+  printed `TORCHINDUCTOR_CACHE_DIR` **before** `import torch` in a
+  new interpreter and call `get_diagnostic_report()` with no
+  `output_dir`.
+
+## Report schema
+
+Top-level keys on the dict **returned** by `collect()` and
+`get_diagnostic_report()`: `metadata`, `failure`, `environment`,
+`artifacts`, `runtime`, `hardware_state`, `collector`, `_report_path`.
+
+The on-disk JSON is that dict **without** `_report_path`.
+`collect()` attaches `_report_path` only on the in-memory return
+value after a successful write. `get_diagnostic_report()` injects
+it when loading a file.
+
+When `TORCH_SPYRE_FFDC` is not `1`, `collect()` still returns that
+shape but skips filesystem work: sections are empty or placeholder,
+`collector.disabled` is `true`, and `_report_path` is `null`.
+`get_diagnostic_report()` can still read reports written earlier.
+
+Look at `failure` first, then `collector` (did capture itself work?),
+then the category-specific fields above.
+
+### `metadata`
+
+| Field | Meaning |
+|---|---|
+| `timestamp` | UTC ISO-8601 time of capture |
+| `host` | `platform.node()` |
+| `pid` | Process id that wrote the report |
+| `python_version` | `sys.version` |
+| `torch_version` | `torch.__version__`, or `"unavailable"` |
+| `torch_spyre_version` | `torch_spyre._version.__version__`, or `"unavailable"` |
+| `platform` | `platform.platform()` |
+
+### `failure`
+
+| Field | Meaning |
+|---|---|
+| `category` | Hook label (see table above) |
+| `exception_type` | `type(exc).__name__` of the object passed to `collect()` (not walked via `__cause__`); `null` for manual `collect()` with no exception |
+| `message` | `str(exc)`, or `"manual collection (no exception)"` when `exc` is omitted |
+| `traceback` | Joined traceback text; `null` when `exc` is omitted |
+| `file` | Filename of the innermost raise site |
+| `lineno` | Line of the innermost raise site |
+
+`file` / `lineno` are the innermost frame of that exception object,
+not the hook wrapper. A backend tool hook may capture the inner
+subprocess error, then re-raise a wrapping `RuntimeError` — the
+report type/message will not match the exception the caller sees.
+
+### `environment`
+
+Captured as strings (`""` if unset — completeness treats `""` as
+present, not missing). Keys come from `_ENV_KEYS` in
+`torch_spyre/profiler/_ffdc.py`. `TORCHINDUCTOR_CACHE_DIR` and
+`TMPDIR` are **not** in this snapshot; they still control where
+reports are written (see [Where reports are stored](#where-reports-are-stored)).
+
+| Key | Role |
+|---|---|
+| `TORCH_SPYRE_FFDC` | Capture gate (`1` to write reports) |
+| `TORCH_COMPILE_DEBUG` | Enables `torch_compile_debug/` trees that artifact search links |
+| `DUMP_SPYRE_CODE` | Snapshotted if set; torch-spyre does not read this variable |
+| `TORCH_SPYRE_DEBUG` | Legacy runtime/build debug gate (prefer `TORCH_LOGS`) |
+| `TORCH_LOGS` | PyTorch logging selector |
+| `TORCHINDUCTOR_FORCE_DISABLE_CACHES` | Forces full recompile |
+| `SENCORES` | Spyre core count |
+
+### `artifacts`
+
+| Field | Meaning |
+|---|---|
+| `searched` | `true` if the artifact walk ran |
+| `found_count` | Unique paths found before the cap (when search ran) |
+| `paths` | Up to 20 unique paths (when search ran) |
+| `error` | Present when search timed out or failed |
+
+Search is best-effort and bounded (2.0s). A timeout sets
+`searched: false` and records `artifacts: timed out` in
+`collector.collector_errors`. See
+[Compiler artifacts FFDC searches for](#compiler-artifacts-ffdc-searches-for).
+
+### `runtime`
+
+| Field | Meaning |
+|---|---|
+| `kernel_name` | Set by backend and runtime hooks; `null` for frontend |
+| `code_dir` | Set by backend and `runtime_launch`; `null` for frontend and `unimplemented` |
+
+These are path **strings**. FFDC does not copy or inventory `code_dir`.
+
+### `hardware_state`
+
+| Field | Meaning |
+|---|---|
+| `spyre_available` | Result of `torch.spyre.is_available()` (1.0s timeout) when `torch.spyre` is registered |
+| `note` | Set when the probe times out, finds no Spyre hardware, or the check fails |
+
+Off-pod, when `torch.spyre` is registered, `spyre_available` is
+typically `false` with a short `note`. If the Spyre backend was never
+loaded, this section may be only `{spyre_available: false}` with no
+`note`. It is not device telemetry.
+
+### `collector`
+
+| Field | Meaning |
+|---|---|
+| `capture_latency_ms` | Wall time of this `collect()` call |
+| `missing_fields` | Required dotted paths that were `null` |
+| `collector_errors` | Best-effort errors from individual sections or the write |
+| `success` | `true` when `collector_errors` is empty |
+| `completeness_pct` | Share of required fields that were present |
+| `disabled` | Present and `true` only when capture was gated off |
+
+Required fields for `completeness_pct` (`REQUIRED_FIELDS` in
+`_ffdc.py`): `metadata.timestamp`, `metadata.torch_version`,
+`metadata.python_version`, `failure.category`,
+`failure.exception_type`, `failure.message`, `failure.traceback`,
+`environment.TORCH_COMPILE_DEBUG`, `environment.TORCH_SPYRE_DEBUG`,
+`artifacts.searched`. Manual `collect()` with no exception leaves
+`exception_type` and `traceback` null, so completeness is not 100%.
+
+Do not treat `collector.success` as “the user’s failure was
+diagnosed.” Artifact search can time out on a complete-enough
+report; the original exception still propagated.
+
+### `_report_path`
+
+Present on the dict returned by `collect()` (after a successful
+write) and on the dict returned by `get_diagnostic_report()`.
+**Not** stored inside the JSON file. `null` when capture was
+disabled or the write failed.
 
 ## JSON report triage
 
@@ -285,11 +451,11 @@ Capture and retrieval can use different environment variables:
 | `metadata` | `timestamp`, `host`, `pid`, `python_version`, `torch_version`, `torch_spyre_version`, `platform` — identifies which run produced this report |
 | `failure` | `category` (encodes layer: frontend / backend / runtime), `exception_type`, `message`, `file`, `lineno` (innermost raise site), `traceback` — start here |
 | `artifacts` | `paths` lists compiler files found near the failure (`fx_graph_readable.py`, `fx_graph_transformed.py`, `ir_*.txt`, `output_code.py`, `sdsc_*.json`, `*.mlir`, logs) |
-| `environment` | Values of `TORCH_SPYRE_FFDC`, `TORCH_COMPILE_DEBUG`, `DUMP_SPYRE_CODE`, `SENCORES`, and other captured env vars |
+| `environment` | Values of `_ENV_KEYS` above (`TORCH_SPYRE_FFDC`, `TORCH_COMPILE_DEBUG`, `DUMP_SPYRE_CODE`, `SENCORES`, …) |
 | `runtime` | `kernel_name` and `code_dir` when a backend or runtime hook attached them (not frontend) |
 | `hardware_state` | `spyre_available` and any probe notes |
-| `collector` | `completeness_pct` is the non-`None` share of `REQUIRED_FIELDS` in `torch_spyre/profiler/_ffdc.py`; `missing_fields` lists the rest; `success` / `collector_errors` say whether capture itself raised |
-| `_report_path` | Absolute path to the loaded JSON file on the host that produced it |
+| `collector` | `completeness_pct` / `missing_fields` / `success` / `collector_errors` / optional `disabled` |
+| `_report_path` | Absolute path to the loaded JSON file on the host that produced it (return dict only) |
 
 ### Compiler artifacts FFDC searches for
 
@@ -303,7 +469,9 @@ current working directory, the torch-spyre repo root, `/dev/shm`, and
 - `ir_pre_fusion.txt`, `ir_post_fusion.txt`
 - `output_code.py`, `graph_diagram.html`
 - `aot_model_*` logs and other `*.log` files (e.g. `torchdynamo/debug.log`)
-- `sdsc_*.json`, `*.mlir`, `*.ll` (when present, e.g. with `DUMP_SPYRE_CODE=1`)
+- `sdsc_*.json`, `*.mlir`, `*.ll` (when present under that `run_*` tree;
+  bundle emit also writes `sdsc_*.json` / `bundle.mlir` under the Spyre
+  kernel cache searched below)
 
 Because all four locations are checked, a stale `torch_compile_debug/`
 tree left over from an earlier, unrelated run can still surface in
@@ -336,7 +504,16 @@ To exercise runtime hooks on hardware without a full model failure:
 TORCH_SPYRE_FFDC=1 TORCH_COMPILE_DEBUG=1 python tools/ffdc_trigger.py
 ```
 
-Print the exact report path that `get_diagnostic_report()` would return:
+`tools/ffdc_trigger.py` isolates `TORCHINDUCTOR_CACHE_DIR` before
+`import torch`, runs Scenario A (`prepare_kernel` then patched
+`launch_jobplan` → `runtime_launch`) and Scenario B
+(`SpyreUnimplementedRunner` → `unimplemented`), finds new reports by
+**path snapshot** (not `mtime`), prints
+`export TORCHINDUCTOR_CACHE_DIR=...` for a later retrieve, and prints a
+commented `rm -rf` for that isolated cache after retrieve.
+
+Print the exact report path that `get_diagnostic_report()` would return
+(export the printed cache dir first if the trigger isolated it):
 
 ```bash
 python - <<'PY'
@@ -383,15 +560,36 @@ directory as an artifact.
   or simply finds no Spyre hardware available (the common case off-pod).
 - Artifact capture links raw files; it does not yet parse IR / bundle
   files into a machine-generated root-cause summary.
+- Successful capture does not yet log the report path next to the
+  traceback ([#4052](https://github.com/torch-spyre/torch-spyre/issues/4052)).
 
 ## Planned enhancements
 
+- Logging category + absolute `_report_path` on successful write, and
+  CI artifact upload of `ffdc_reports/` when capture is enabled
+  ([#4052](https://github.com/torch-spyre/torch-spyre/issues/4052))
 - Parsing IR / bundle artifacts to populate an `error_summary` field in
   the JSON report
 - Additional hooks for device-side and profiling failures (see Deferred
   category gaps)
 - Formal KPI targets (MTTRC, zero-repro diagnostics) — design goals,
   not current guarantees
+
+## Related work
+
+- [PR #3626](https://github.com/torch-spyre/torch-spyre/pull/3626)
+  ([#3551](https://github.com/torch-spyre/torch-spyre/issues/3551)) —
+  **merged**. Preferred-vocabulary constants
+  (`KNOWN_FAILURE_CATEGORIES` / `HOOK_FAILURE_CATEGORIES`) and empty-
+  category normalization live on `main`.
+- [PR #3896](https://github.com/torch-spyre/torch-spyre/pull/3896)
+  ([#3554](https://github.com/torch-spyre/torch-spyre/issues/3554),
+  [#3555](https://github.com/torch-spyre/torch-spyre/issues/3555)) —
+  this PR: CI/pod integration coverage for `unimplemented` /
+  `runtime_launch`, `ffdc_trigger.py` isolation, and this field/schema
+  guide.
+- [#4052](https://github.com/torch-spyre/torch-spyre/issues/4052) —
+  log report path + CI artifacts (**not started**).
 
 ## See also
 
@@ -405,3 +603,5 @@ directory as an artifact.
   layout and review process
 - Auto-capture hooks:
   [PR #2704](https://github.com/torch-spyre/torch-spyre/pull/2704)
+- Retrieve API:
+  [PR #3305](https://github.com/torch-spyre/torch-spyre/pull/3305)
