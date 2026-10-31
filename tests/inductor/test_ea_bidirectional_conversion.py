@@ -24,11 +24,17 @@ Tests all 4 conversion cases:
 4. FP32→FP16 with DL16_TO_FP32 → STANDARD
 """
 
+from unittest.mock import patch
+
 import pytest
 import torch
+from torch._inductor import config as inductor_config
+from torch._inductor.dependencies import MemoryDep
 from torch._inductor.exc import InductorError
 from torch_spyre._C import ElementArrangement, get_spyre_tensor_layout
+from torch_spyre._inductor import passes
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
+from torch_spyre._inductor.passes import CustomPreSchedulingPasses, _get_pass_name
 from torch_spyre._inductor.constants import DEVICE_NAME
 from utils_inductor import cached_randn, shapes2key, expects_raise
 
@@ -722,6 +728,143 @@ class TestEAShuffle:
 
         assert_ea(result, EA.STANDARD)
         assert_val(fn, (x, y), result, rtol=1e-2, atol=1e-2)
+
+
+# ---------------------------------------------------------------------------
+# Shuffle optimization (optimize_shuffling)
+# ---------------------------------------------------------------------------
+class _ShuffleRecorder(CustomPreSchedulingPasses):
+    """Pre-scheduling pipeline that records the EA shuffles around the pass.
+
+    ``records["before"]`` is taken right after ``validate_ops`` (what it
+    inserted) and ``records["after"]`` right after ``optimize_shuffling``. Each
+    is the list of source dtypes, one entry per shuffle copy.
+    """
+
+    records: dict = {}
+
+    def __init__(self):
+        super().__init__()
+        self.passes = [self._record(p) for p in self.passes]
+
+    @staticmethod
+    def _shuffle_source_dtypes(graph):
+        dtypes = []
+        for op in graph.operations:
+            if not getattr(op, "ea_shuffle", False):
+                continue
+            (src,) = {
+                d.name for d in op.get_read_writes().reads if isinstance(d, MemoryDep)
+            }
+            dtypes.append(graph.get_buffer(src).get_dtype())
+        return dtypes
+
+    @classmethod
+    def _record(cls, pass_fn):
+        name = _get_pass_name(pass_fn)
+        key = {"validate_ops": "before", "optimize_shuffling": "after"}.get(name)
+        if key is None:
+            return pass_fn
+
+        def wrapped(graph):
+            pass_fn(graph)
+            cls.records[key] = cls._shuffle_source_dtypes(graph)
+
+        wrapped.__name__ = name
+        return wrapped
+
+
+def _run_recording(fn, *args):
+    """Compile ``fn`` and return ``(result, before, after)`` shuffle source dtypes."""
+    _ShuffleRecorder.records = {}
+    torch.compiler.reset()
+    with (
+        inductor_config.patch(force_disable_caches=True),
+        patch.object(passes, "CustomPreSchedulingPasses", _ShuffleRecorder),
+    ):
+        result = torch.compile(fn)(*args)
+    torch.compiler.reset()
+    records = _ShuffleRecorder.records
+    return result, records["before"], records["after"]
+
+
+class TestEAShuffleOptimize:
+    """``optimize_shuffling`` removes or cheapens the shuffles ``validate_ops`` adds.
+
+    The structural assertions look at the IR between ``validate_ops`` and
+    ``optimize_shuffling``; each test also checks the numerical result.
+    """
+
+    SHAPE = (4, 128)
+
+    def test_no_shuffle_when_arrangements_match(self):
+        """Operands that share one arrangement need no shuffle at all."""
+
+        def fn(x, y):
+            return x.to(torch.float32) + y.to(torch.float32)
+
+        x = cached_randn(self.SHAPE, dtype=torch.float16)
+        y = cached_randn(self.SHAPE, dtype=torch.float16)
+
+        result, before, after = _run_recording(fn, x.to(DEVICE_NAME), y.to(DEVICE_NAME))
+
+        assert before == [] and after == []
+        assert_val(fn, (x, y), result, rtol=1e-2, atol=1e-2)
+
+    def test_required_shuffle_is_kept(self):
+        """A staggered fp16 operand meeting a STANDARD one still needs its shuffle."""
+
+        def fn(x, y):
+            return x.to(torch.float16) + y
+
+        x = cached_randn(self.SHAPE, dtype=torch.float32)
+        y = cached_randn(self.SHAPE, dtype=torch.float16)
+
+        result, before, after = _run_recording(fn, x.to(DEVICE_NAME), y.to(DEVICE_NAME))
+
+        # The shuffle reads the fp32 -> fp16 cast; a downcast has no narrower
+        # input to move the shuffle onto, so it is neither removed nor rewritten.
+        assert before == [torch.float16]
+        assert after == [torch.float16]
+        assert_ea(result, EA.STANDARD)
+        assert_val(fn, (x, y), result, rtol=1e-2, atol=1e-2)
+
+    def test_shuffle_sinks_through_upcast(self):
+        """``fp16 -> fp32`` then a shuffle becomes a shuffle of the fp16 input."""
+
+        def fn(x, y):
+            return (x.to(torch.float32) + y) * 2.0
+
+        x = cached_randn(self.SHAPE, dtype=torch.float16)
+        y = cached_randn(self.SHAPE, dtype=torch.float32)
+
+        result, before, after = _run_recording(fn, x.to(DEVICE_NAME), y.to(DEVICE_NAME))
+
+        # Before: the staggered fp32 cast output is shuffled (4 B/element).
+        # After: the fp16 input is shuffled and the cast itself restores STANDARD.
+        assert before == [torch.float32]
+        assert after == [torch.float16]
+        assert_ea(result, EA.STANDARD)
+        assert_val(fn, (x, y), result, rtol=1e-2, atol=1e-2)
+
+    def test_duplicate_shuffles_are_merged(self):
+        """Two consumers of one staggered value share a single shuffle."""
+
+        def fn(x, y):
+            a = x.to(torch.float16)
+            return a + y, a * y
+
+        x = cached_randn(self.SHAPE, dtype=torch.float32)
+        y = cached_randn(self.SHAPE, dtype=torch.float16)
+
+        (r1, r2), before, after = _run_recording(
+            fn, x.to(DEVICE_NAME), y.to(DEVICE_NAME)
+        )
+
+        assert len(before) >= len(after) == 1
+        for r, ref in zip((r1, r2), fn(x, y)):
+            assert_ea(r, EA.STANDARD)
+            torch.testing.assert_close(r.cpu(), ref, rtol=1e-2, atol=1e-2)
 
 
 # Made with Bob

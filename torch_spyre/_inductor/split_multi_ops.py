@@ -39,13 +39,19 @@ from .pass_utils import (
     indirect_info_from_op,
     origin_in_graph,
     patch_env,
+    redirect_computed_buffer_reads,
     replace_computed_buffer_body,
 )
-from .constants import is_ea_compatible, SUPPORTED_EAS
+from .constants import is_ea_compatible, STAGGERED_EAS, SUPPORTED_EAS
+from .dtype_ops import DtypeOpTable
 from .optimize_restickify import AllSameNode, AnyInNode
 from .propagate_layouts import _get_prop_args
 from .provenance import decompose_provenance
-from torch_spyre._C import SpyreTensorLayout, ElementArrangement
+from torch_spyre._C import (
+    SpyreTensorLayout,
+    ElementArrangement,
+    get_device_size_in_bytes,
+)
 from torch_spyre.constants import DEVICE_NAME
 
 logger = get_inductor_logger("split_multi_ops")
@@ -735,6 +741,15 @@ def _get_op_name(op) -> str:
     return str(target) if target else str(origin_node)
 
 
+def _find_fx_node(graph: GraphLowering, buf) -> fx.Node | None:
+    """Return the FX node (by name match on ``buf.origins``) that produced ``buf``."""
+    for origin in getattr(buf, "origins", ()):
+        for node in graph.graph.nodes:
+            if node.name == origin.name:
+                return node
+    return None
+
+
 def _insert_shuffle_op(
     graph: GraphLowering, op, stg_name: str, stg_buf, target_ea: ElementArrangement
 ) -> ComputedBuffer | None:
@@ -743,6 +758,8 @@ def _insert_shuffle_op(
     The copy is lowered as a plain ``aten.clone``; its output layout (the same
     device geometry with ``target_ea``) is set explicitly below, and codegen
     emits a ``shuffle`` because the input and output element arrangements differ.
+    The new buffer is tagged ``ea_shuffle`` so ``optimize_shuffling`` can find
+    it later, and ``op`` (rebuilt and returned) is redirected to read it.
     """
 
     # Find the origin FX node from the operation
@@ -757,16 +774,7 @@ def _insert_shuffle_op(
         insert_idx = 0
 
     # Find the FX node that produces the staggered buffer
-    stg_fx_node = None
-    if hasattr(stg_buf, "origins"):
-        for origin in stg_buf.origins:
-            # Try to find the FX node by name matching
-            for node in graph.graph.nodes:
-                if node.name == origin.name:
-                    stg_fx_node = node
-                    break
-            if stg_fx_node:
-                break
+    stg_fx_node = _find_fx_node(graph, stg_buf)
 
     if stg_fx_node is None:
         logger.warning(
@@ -811,6 +819,7 @@ def _insert_shuffle_op(
     )
     new_buf.layouts = [out_stl]
     new_buf.restick_cost_fn = AnyInNode.from_args()
+    new_buf.ea_shuffle = True
 
     # Update provenance
     decompose_provenance(
@@ -989,9 +998,332 @@ def validate_ops(graph: GraphLowering) -> None:
                     op = new_op
 
 
+def _reader_ops(graph: GraphLowering, name: str) -> list:
+    """Operations that read buffer ``name`` through a ``MemoryDep``."""
+    readers = []
+    for op in graph.operations:
+        if op.get_name() == name:
+            continue
+        try:
+            reads = op.get_read_writes().reads
+        except Exception:  # ops without read/write metadata cannot read ``name``
+            continue
+        if any(isinstance(d, MemoryDep) and d.name == name for d in reads):
+            readers.append(op)
+    return readers
+
+
+def _can_redirect_readers(readers: list) -> bool:
+    """True if every reader can be re-pointed to another buffer in place.
+
+    A reader is redirectable when it is a plain ``ComputedBuffer`` whose layout
+    cost function can be rebuilt from its (new) inputs: ``AllSameNode`` (rebuilt
+    from the new input layouts) or ``AnyInNode`` (input independent). Matmul,
+    conv and mutation consumers carry layout state tied to the exact producer,
+    so they are left alone and the shuffle stays.
+    """
+    for op in readers:
+        if not isinstance(op, ComputedBuffer):
+            return False
+        if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
+            return False
+        if isinstance(op.data, Scatter):
+            return False
+        cost_fn = getattr(op, "restick_cost_fn", None)
+        if cost_fn is not None and not isinstance(cost_fn, (AllSameNode, AnyInNode)):
+            return False
+    return True
+
+
+def _redirect_readers(graph: GraphLowering, readers: list, old: str, new: str) -> None:
+    """Make every op in ``readers`` read ``new`` instead of ``old``.
+
+    ``new`` must hold the same value with the same candidate layouts as ``old``
+    (callers check this), so the readers' own ``layouts`` are unchanged. Only the
+    cost function is rebuilt, because its edges are keyed by input buffer name.
+    The input is rewired by wrapping ``inner_fn`` (never by rebuilding indices).
+    """
+    for op in readers:
+        layouts = getattr(op, "layouts", None)
+        cost_fn = getattr(op, "restick_cost_fn", None)
+        new_op = redirect_computed_buffer_reads(
+            op,
+            {old: new},
+            graph.operations,
+            pass_name="optimize_shuffling",
+            reason="redirect reads past a removed EA shuffle",
+        )
+        if layouts is not None:
+            new_op.layouts = list(layouts)
+        if isinstance(cost_fn, AllSameNode):
+            rw = new_op.get_read_writes()
+            new_op.restick_cost_fn = AllSameNode.from_args(
+                _get_prop_args(rw.reads),
+                new_op.layouts,
+                next(iter(rw.writes)),
+                new_op,
+            )
+        elif cost_fn is not None:
+            new_op.restick_cost_fn = cost_fn
+
+
+def _remove_op(graph: GraphLowering, op) -> None:
+    """Drop ``op`` from the graph the way ``deadcode_elimination`` does."""
+    graph.removed_buffers.add(op.get_name())
+    graph.operations.remove(op)
+
+
+def _single_layout(buf) -> SpyreTensorLayout | None:
+    """The one committed-candidate layout of ``buf``, or None if there are several."""
+    layouts = getattr(buf, "layouts", None)
+    if layouts is None or len(layouts) != 1:
+        return None
+    return layouts[0]
+
+
+def _shuffle_source(op) -> str | None:
+    """Name of the buffer a shuffle copy reads, or None if it is not a plain copy."""
+    reads = [d for d in op.get_read_writes().reads if isinstance(d, MemoryDep)]
+    return reads[0].name if len(reads) == 1 else None
+
+
+def _try_drop_shuffle(graph: GraphLowering, op, outputs: set[str]) -> bool:
+    """Techniques 1-3: remove a dead, no-op or collapsible shuffle."""
+    name = op.get_name()
+    src_name = _shuffle_source(op)
+    out_stl = _single_layout(op)
+    if src_name is None or out_stl is None:
+        return False
+    src = graph.get_buffer(src_name)
+    src_stl = _single_layout(src)
+    readers = _reader_ops(graph, name)
+
+    # 1. Dead shuffle: nothing reads it and it is not a graph output.
+    if not readers and name not in outputs:
+        _remove_op(graph, op)
+        return True
+
+    # 2. No-op shuffle: the source already has the target arrangement and the same
+    #    device geometry, so the copy moves nothing.
+    if (
+        name not in outputs
+        and src_stl is not None
+        and src_stl == out_stl
+        and _can_redirect_readers(readers)
+    ):
+        _redirect_readers(graph, readers, name, src_name)
+        _remove_op(graph, op)
+        return True
+
+    # 3. Shuffle of a shuffle: ``A -S1-> B -S2-> C`` becomes ``A -S2-> C``. If A
+    #    already has C's arrangement the pair cancels and C's readers read A.
+    if (
+        getattr(src, "ea_shuffle", False)
+        and src_name not in outputs
+        and _can_redirect_readers([op])
+    ):
+        a_name = _shuffle_source(src)
+        a_stl = _single_layout(graph.get_buffer(a_name)) if a_name else None
+        if a_name is not None and a_stl is not None:
+            if a_stl == out_stl and name not in outputs:
+                if _can_redirect_readers(readers):
+                    _redirect_readers(graph, readers, name, a_name)
+                    _remove_op(graph, op)
+                    return True
+            elif (
+                a_stl.device_size == out_stl.device_size
+                and a_stl.stride_map == out_stl.stride_map
+                and a_stl.device_dtype == out_stl.device_dtype
+            ):
+                _redirect_readers(graph, [op], src_name, a_name)
+                return True
+    return False
+
+
+def _try_merge_duplicates(graph: GraphLowering, shuffles: list, outputs: set[str]):
+    """Technique 4: keep one shuffle per (source, target layout)."""
+    seen: dict = {}
+    for op in shuffles:
+        src_name, out_stl = _shuffle_source(op), _single_layout(op)
+        if src_name is None or out_stl is None:
+            continue
+        key = (
+            src_name,
+            out_stl.element_arrangement,
+            tuple(out_stl.device_size),
+            tuple(out_stl.stride_map),
+        )
+        keep = seen.setdefault(key, op)
+        if keep is op or op.get_name() in outputs:
+            continue
+        readers = _reader_ops(graph, op.get_name())
+        if _can_redirect_readers(readers):
+            _redirect_readers(graph, readers, op.get_name(), keep.get_name())
+            _remove_op(graph, op)
+            return True
+    return False
+
+
+def _try_sink_shuffle_through_cast(graph: GraphLowering, op, outputs: set[str]) -> bool:
+    """Technique 5: shuffle the narrow side of a cast instead of the wide one.
+
+    Rewrites ``x -upcast-> s (staggered) -shuffle-> t (STANDARD)`` into
+    ``x -shuffle-> x' -upcast-> t``. The upcast reads ``x'`` in the arrangement
+    for which the hardware conversion map already yields STANDARD (see
+    ``DtypeOpTable.ea_map``), so the staggering is undone by the cast that is
+    executed anyway. The shuffle now moves fp16 (2 B/element) instead of fp32
+    (4 B/element), halving its traffic; the cast and its output layout are
+    unchanged, so ``t``'s readers need no layout update.
+    """
+    name = op.get_name()
+    s_name = _shuffle_source(op)
+    t_stl = _single_layout(op)
+    if s_name is None or t_stl is None or name in outputs:
+        return False
+    if t_stl.element_arrangement != ElementArrangement.STANDARD:
+        return False
+    cast = graph.get_buffer(s_name)
+    if (
+        not isinstance(cast, ComputedBuffer)
+        or not isinstance(cast.data, Pointwise)
+        or s_name in outputs
+    ):
+        return False
+    s_stl = _single_layout(cast)
+    if s_stl is None or s_stl.element_arrangement not in STAGGERED_EAS:
+        return False
+
+    # ``cast`` must be a whole-tensor, single-input conversion with no other user.
+    rw = cast.get_read_writes()
+    reads = [d for d in rw.reads if isinstance(d, MemoryDep)]
+    if len(reads) != 1 or reads[0].index != next(iter(rw.writes)).index:
+        return False
+    if [r.get_name() for r in _reader_ops(graph, s_name)] != [name]:
+        return False
+    x_name = reads[0].name
+    x = graph.get_buffer(x_name)
+    x_stl = _single_layout(x)
+    if x_stl is None or x_stl.element_arrangement != ElementArrangement.STANDARD:
+        return False
+    if x.get_dtype() == cast.get_dtype():
+        return False
+
+    # Only the fp16 -> fp32 direction narrows the shuffled data.
+    if get_device_size_in_bytes(x_stl) >= get_device_size_in_bytes(s_stl):
+        return False
+
+    # Find the input arrangement for which the cast itself produces STANDARD.
+    e_in = None
+    for candidate in STAGGERED_EAS:
+        try:
+            produced = DtypeOpTable.ea_map(x.get_dtype(), cast.get_dtype(), candidate)
+        except Unsupported:
+            continue
+        if produced == ElementArrangement.STANDARD:
+            e_in = candidate
+            break
+    if e_in is None:
+        return False
+
+    readers = _reader_ops(graph, name)
+    if not _can_redirect_readers(readers):
+        return False
+
+    # Insert ``x' = shuffle(x, e_in)`` in front of the cast and re-point the cast.
+    new_cast = _insert_shuffle_op(graph, cast, x_name, x, e_in)
+    if new_cast is None:
+        return False
+    # The cast now yields STANDARD, which is exactly what ``op`` used to hold.
+    new_cast.layouts = list(op.layouts)
+    rw = new_cast.get_read_writes()
+    new_cast.restick_cost_fn = AllSameNode.from_args(
+        _get_prop_args(rw.reads),
+        new_cast.layouts,
+        next(iter(rw.writes)),
+        new_cast,
+    )
+    _redirect_readers(graph, readers, name, new_cast.get_name())
+    _remove_op(graph, op)
+    return True
+
+
 def optimize_shuffling(graph: GraphLowering) -> None:
-    """TODO implement global analysis of shuffle to optimze."""
-    pass
+    """Minimize the element-arrangement (EA) shuffles inserted by ``validate_ops``.
+
+    A shuffle is a full read-and-write copy of a tensor through the device, so it
+    is among the most expensive things the pre-scheduling passes can add, and
+    ``validate_ops`` inserts one greedily for every mixed STANDARD/staggered
+    operand pair. This pass looks at all of them together (``_insert_shuffle_op``
+    tags each with ``ea_shuffle``) and removes or cheapens what it can. It runs
+    after layout propagation and ``validate_ops`` and before
+    ``optimize_restickify_locations``, so the layouts it keeps are the ones the
+    restickify optimizer sees. It repeats until nothing changes.
+
+    Implemented techniques, in the order they are tried:
+
+    1. **Dead shuffle.** A shuffle nobody reads and that is not a graph output
+       is deleted. Earlier rewrites below can orphan shuffles.
+    2. **No-op shuffle.** If the source already has the target arrangement and
+       the same device geometry, the copy moves nothing; its readers read the
+       source directly.
+    3. **Shuffle chains.** ``A -> B -> C`` through two shuffles collapses to one
+       shuffle ``A -> C``; if ``A`` already has ``C``'s layout the pair cancels
+       and ``C``'s readers read ``A``. This is how a shuffle in front of and
+       behind the same value (``STANDARD -> staggered -> STANDARD``) disappears.
+    4. **Duplicate shuffles.** Several ops that need the same value in the same
+       arrangement (e.g. a weight shuffled once per consumer) share one shuffle.
+    5. **Cast sinking (the "bracket" conversion).** Spyre converts between fp16
+       and fp32 by staggering the elements, and the conversion map
+       (``DtypeOpTable.ea_map``) is a bracket: an fp16 value stored with
+       ``FP32_TO_DL16`` up-casts to a STANDARD fp32 value, and a staggered fp32
+       down-casts to STANDARD fp16. A cast therefore already undoes a stagger for
+       free. ``upcast`` followed by a shuffle back to STANDARD is rewritten as
+       "shuffle the fp16 input, then up-cast", which moves half the bytes and
+       removes the shuffle from the wide (fp32) tensor. This is the case where a
+       shuffle is not needed at all if the surrounding conversions are chosen
+       as a bracket.
+
+    A shuffle is only rewritten when all of its readers are plain ``ComputedBuffer``
+    ops whose cost function can be rebuilt (see ``_can_redirect_readers``), when
+    the buffers involved have a single candidate layout (a shuffle's output
+    layout is fixed when it is inserted, so a multi-candidate source could later
+    be committed to a different layout than the shuffle assumed), and when the
+    value is not a graph output. Anything else is left exactly as
+    ``validate_ops`` produced it.
+
+    Not implemented yet (the rewrites need layout re-propagation or codegen
+    support that this pass cannot provide on its own):
+
+    * **Operand flipping for a bracket.** In ``(a_staggered, b_STANDARD) -> op ->
+      downcast`` the shuffle can be placed on ``b`` (to the staggered EA) instead
+      of ``a`` (to STANDARD). The op's output then stays staggered and the
+      closing conversion restores STANDARD, so the bracket is kept and only one
+      narrow operand is shuffled. It also changes the EA of every value up to the
+      closing cast, whose layouts would have to be recomputed.
+    * **Restickify instead of cast plus shuffle.** When an edge needs both a
+      stick change and an EA change, a single ``ReStickifyOpHBM`` that also
+      writes the target arrangement replaces a restickify followed by a shuffle,
+      saving a full pass over the tensor. It needs the restickify codegen to
+      encode the EA on its output tensor.
+    """
+    outputs = set(graph.get_output_names())
+    # Every successful rewrite removes at least one operation or one shuffle
+    # candidate, so this loop is bounded.
+    for _ in range(len(graph.operations) + 1):
+        shuffles = [op for op in graph.operations if getattr(op, "ea_shuffle", False)]
+        if not shuffles:
+            return
+        changed = False
+        for op in shuffles:
+            if _try_drop_shuffle(graph, op, outputs) or _try_sink_shuffle_through_cast(
+                graph, op, outputs
+            ):
+                changed = True
+                break
+        if not changed:
+            changed = _try_merge_duplicates(graph, shuffles, outputs)
+        if not changed:
+            return
 
 
 def _validate_split_supported(op, trace, intermediate_ops) -> None:

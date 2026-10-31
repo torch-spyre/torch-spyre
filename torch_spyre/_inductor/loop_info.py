@@ -366,6 +366,10 @@ _SPYRE_METADATA_ATTRS = (
     # work_division_constraints.JOINT_TILING_AND_DIVISION_ATTR, spelled out
     # since that module imports this one (through pass_utils).
     "_work_division_chosen_with_tiling",
+    # Marks an element-arrangement shuffle copy inserted by split_multi_ops;
+    # optimize_shuffling finds them by this tag, and must still see it after any
+    # rebuild of the buffer (e.g. when its input is redirected).
+    "ea_shuffle",
 )
 
 
