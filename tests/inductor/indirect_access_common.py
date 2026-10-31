@@ -452,7 +452,14 @@ def run_e2e(
     )
 
     diff = torch.abs(reference.float() - result.float()).amax().item()
-    close = torch.allclose(result, reference, atol=atol, rtol=rtol, equal_nan=True)
+    # torch.allclose has no float8 kernel, so compare 1-byte floats in fp32.
+    # Other dtypes compare natively so int64/float64 checks stay exact.
+    if result.dtype.is_floating_point and result.dtype.itemsize == 1:
+        close = torch.allclose(
+            result.float(), reference.float(), atol=atol, rtol=rtol, equal_nan=True
+        )
+    else:
+        close = torch.allclose(result, reference, atol=atol, rtol=rtol, equal_nan=True)
     if expect_close:
         test.assertTrue(
             close, f"e2e result must match the CPU reference (max abs diff {diff:.4g})"

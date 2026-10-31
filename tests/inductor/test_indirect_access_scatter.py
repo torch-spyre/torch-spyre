@@ -230,6 +230,80 @@ class _ScatterScenarios:
         # different order; layout corruption is orders of magnitude larger.
         torch.testing.assert_close(actual, expected, atol=0.03, rtol=0.02)
 
+    def test_index_copy_fp8_e4m3_kv_cache(self):
+        """FP8 (torch.float8_e4m3fn) static KV-cache update via index_copy_ (#4710).
+
+        A pinned [B, H, max_seq, D] FP8 cache (max_seq at device position 0,
+        D=128 is one FP8 stick) takes a 128-token prefill write and then a
+        1-token decode write on dim 2. The scatter lowers to an identity copy,
+        which create_op_spec allows for every dtype, so no SPYRE_FP8_OPS entry
+        is needed. CPU has no float8 index_copy_, so the reference runs in fp32;
+        small integers are exact in E4M3, so the compare is exact.
+        """
+        Bn, H, L, D, M = 1, 8, 128, 128, 512
+        dtype = torch.float8_e4m3fn
+        eps = get_elem_in_stick(dtype)
+        cache_layout = SpyreTensorLayout(
+            device_size=[M, H, (D + eps - 1) // eps, Bn, eps],
+            stride_map=[D, M * D, eps, H * M * D, 1],
+            device_dtype=get_device_dtype(dtype),
+            valid_elements={(0,): M, (1,): H, (2, 4): D, (3,): Bn},
+        )
+
+        def store(dst, src, idx):
+            dst.index_copy_(2, idx, src)
+            return dst
+
+        compiled = torch.compile(store, dynamic=False)
+        expected = torch.zeros(Bn, H, M, D)
+        actual = expected.to(dtype)
+        # Prefill writes positions [0, L); decode then appends position L.
+        for idx in (torch.arange(L), torch.tensor([L])):
+            src = torch.randint(-10, 10, (Bn, H, len(idx), D)).float()
+            expected = store(expected.clone(), src, idx)
+            actual = compiled(
+                actual.to("spyre", device_layout=cache_layout),
+                src.to(dtype).to("spyre"),
+                idx.to("spyre"),
+            ).cpu()
+            torch.testing.assert_close(actual.float(), expected, atol=0, rtol=0)
+
+    def test_index_copy_fp8_e4m3_paged_kv_cache_e2e(self):
+        """FP8 index_copy into a paged-KV-cache-shaped destination (#4710).
+
+        FP8 variant of test_index_copy_e2e / test_index_copy_decode_e2e: a
+        [L, H, D] cache on the paged layout (L outermost, D=128 one FP8 stick)
+        takes a multi-token (P=3) and a single-token decode (P=1) write at
+        unique random slots. The reference runs in fp32 (no CPU float8
+        index_copy); small integers are exact in E4M3, so the compare is exact.
+        """
+        dtype = torch.float8_e4m3fn
+        L, H, D = 576, 8, 128
+        eps = get_elem_in_stick(dtype)
+        stl = SpyreTensorLayout(
+            device_size=[L, H, (D + eps - 1) // eps, eps],
+            stride_map=[H * D, D, eps, 1],
+            device_dtype=get_device_dtype(dtype),
+            valid_elements={(0,): L, (1,): H, (2, 3): D},
+        )
+
+        def kernel(c, s, i):
+            return c.index_copy(0, i, s)
+
+        for P in (3, 1):
+            with self.subTest(P=P):
+                torch._dynamo.reset()
+                cache = torch.randint(-10, 10, (L, H, D)).float()
+                src = torch.randint(-10, 10, (P, H, D)).float()
+                idx = torch.randperm(L, dtype=torch.int64)[:P]
+                expected = kernel(cache, src, idx)
+                actual = torch.compile(kernel, dynamic=False)(
+                    cache.to(dtype).to("spyre", device_layout=stl),
+                    src.to(dtype).to("spyre"),
+                    idx.to("spyre"),
+                ).cpu()
+                torch.testing.assert_close(actual.float(), expected, atol=0, rtol=0)
+
     def test_index_put_p7(self):
         """y[idx] = src -- 1-D scatter with an odd (non-power-of-2) P=7."""
         M, N, P = 16, 1024, 7
