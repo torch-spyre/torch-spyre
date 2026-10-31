@@ -79,6 +79,37 @@ Documentation serves two personas:
 Check that content is appropriate for its target audience and does not leak
 internal implementation details into user-facing pages.
 
+## Common mistakes to avoid
+
+These are the errors that have actually reached doc PRs here and been caught
+in review. Check against each before claiming a section is done.
+
+- **A registration is not the same as eager support.** A lowering or a
+  decomposition is the compiled path. Do not read a `@register_spyre_lowering`
+  and mark the op Eager = Y. See section 1b for the exact rule and the
+  `run_eager=False` check.
+- **Do not document behavior the code does not produce.** Trace the claim to
+  the line that implements it, and prefer to confirm by the op's test. Real
+  examples that slipped through: a claim that `F.embedding` zeroes the
+  `padding_idx` row on the forward pass (it does not; only `nn.Embedding`
+  zeroes it at construction), and a failure-mode description that named an
+  error the code does not raise. If you cannot cite the line, do not state it.
+- **An example or diagram must run or match the current mechanism.** An example
+  lifted from a test can break when the test or its API changes: a script using
+  `spyre_hint(num_tiles_per_dim=...)` after that key was removed raises rather
+  than runs, and `for_each_tile` needs `torch.compile(fn, fullgraph=True)`. A
+  diagram node that names a deleted function (`coarse_tile_pre_stickify`) is
+  stale. Verify example APIs and diagram labels against the current source, not
+  against the test you copied from.
+- **Watch for very recent merges.** The code can move the same week. After the
+  preflight fetch, read `git log` for the pages and APIs you touch, and check
+  whether a feature you are documenting was just changed or removed.
+- **Get API names exact.** A method or flag name in prose must match the code
+  and the rest of the docs character for character (for example
+  `torch.spyre.set_downcast_warning`). Grep the symbol before writing it.
+- **Describe the current state only.** No "previously", "used to", or
+  before-and-after framing; fold new behavior into the current-state text.
+
 ## 1. Supported Operations Table
 
 **File:** `docs/source/user_guide/supported_operations.md`
@@ -112,11 +143,25 @@ Eager support comes from three sources:
     also dispatch eagerly: `rms_norm`, `layer_norm`, `softplus`,
     `linear`, and `scaled_dot_product_attention`.
 
+**A lowering or a decomposition alone does NOT make an op eager.** Eager =
+Y requires one of: an eager kernel in `eager.py`, membership in
+`COMPILED_OPS` in `eager.py` (these get an auto-installed PrivateUse1
+kernel), a `register_fallback` in `fallbacks.py`, or an aten-namespace
+decomposition that auto-installs a PrivateUse1 kernel (the five named
+above). A `@register_spyre_lowering` or a custom-op lowering is the
+`torch.compile` path only. When an op has just a lowering, it is
+Compiled = Y and the Eager column stays blank. This is the single most
+repeated error in doc PRs (`torch.nn.functional.gelu`, `torch.trunc`):
+seeing a registration and assuming it means eager.
+
 To verify the Eager column:
-  - Read `eager.py` and `fallbacks.py` for the explicit registrations.
-  - Confirm that any op tested with `run_eager=False` in
-    `tests/inductor/test_inductor_ops.py` does NOT have Eager = Y;
-    those are compiled-only.
+  - Read `eager.py` (including the `COMPILED_OPS` list) and `fallbacks.py`
+    for the explicit registrations.
+  - The decisive check: find the op's test in
+    `tests/inductor/test_inductor_ops.py`. If it runs with
+    `run_eager=False`, the op is compiled-only and MUST NOT have Eager =
+    Y. If no test runs it eagerly and it has only a lowering, it is
+    compiled-only.
   - Ops registered through `register_fallback` should appear under
     the "CPU Fallback" section of the table with Execution = "CPU
     fallback".
