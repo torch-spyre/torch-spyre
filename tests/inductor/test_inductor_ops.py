@@ -741,6 +741,19 @@ _PAIR_SECOND_STICK_UNSPLIT = (
     "work division leaves the second stick of a stick pair to no core; correct "
     "with SENCORES=1 (#5361)"
 )
+# torch.sort returns int64 indices, and the cast of topk's fp16 indices to
+# int64 runs on the device through a staggered fp32 value. The sort
+# values stay exact; the indices come back wrong, deterministically:
+# - permuted when the stick dim fills whole stick pairs (#4393);
+# - wrong numbers, some out of range, when it does not (#3999).
+_SORT_PERMUTED = (
+    "readback of the staggered int64 index cast is permuted, so the indices come "
+    "back reordered (#4393)"
+)
+_SORT_UNALIGNED = (
+    "the staggered fp32 value of the int64 index cast does not fill whole stick "
+    "pairs, so the indices come back wrong (#3999)"
+)
 _ROUND_TRIP_PAIR_REASON_BY_SHAPE = {
     "4x16": _PAIR_SECOND_STICK_LOST,
     "4x63": _PAIR_SECOND_STICK_LOST,
@@ -1224,6 +1237,83 @@ def _build_fp32_proxy_cpu_refs(
         else:
             kwargs["cpu_eager_result"] = wrap(op_fp32_proxy)(a, b)
     return kwargs
+
+
+# Stable torch.sort cases. Inputs repeat a few small integers so every row
+# has ties (exercising stability) and fp16 holds every value exactly.
+# test_sort checks values and indices; test_sort_values checks the values
+# only, so a regression in them is still caught while the index cast
+# fails (see _SORT_PERMUTED).
+_SORT_PARAM_SETS = {
+    # Random columns, so each column's indices differ and a
+    # permuted readback is caught.
+    "2d_dim0_asc": (unique_randn_along_dim((8, 64), dim=0), 0, False),
+    "2d_dim0_desc": (unique_randn_along_dim((8, 64), dim=0), 0, True),
+    "2d_ties_dim0_asc": (
+        (torch.arange(64 * 8) % 5).reshape(64, 8).to(torch.float16),
+        0,
+        False,
+    ),
+    "2d_ties_dim0_desc": (
+        (torch.arange(128 * 64) % 7).reshape(128, 64).to(torch.float16),
+        0,
+        True,
+    ),
+    "2d_dim0_fp32": (
+        unique_randn_along_dim((32, 64), dim=0, dtype=torch.float32),
+        0,
+        False,
+    ),
+    "3d_ties_dim1": (
+        (torch.arange(2 * 16 * 64) % 3).reshape(2, 16, 64).half(),
+        1,
+        False,
+    ),
+    "4d_ties_dim2_desc": (
+        (torch.arange(2 * 4 * 8 * 64) % 3).reshape(2, 4, 8, 64).half(),
+        2,
+        True,
+    ),
+    "2d_size1_dim0": (
+        unique_randn_along_dim((1, 64), dim=1),
+        0,
+        False,
+    ),
+    # Last (stick) dim, widths that are not a whole number of
+    # sticks: the stable flip pads to a full stick.
+    "2d_ties_last_dim_w60": (
+        (torch.arange(16 * 60) * 7 % 5).reshape(16, 60).half(),
+        1,
+        False,
+    ),
+    "2d_ties_last_dim_w7_desc": (
+        (torch.arange(16 * 7) * 7 % 5).reshape(16, 7).half(),
+        1,
+        True,
+    ),
+    "2d_ties_last_dim_w100": (
+        (torch.arange(16 * 100) * 7 % 5).reshape(16, 100).half(),
+        1,
+        False,
+    ),
+    # Sort-dim sizes topk can't split across cores: padded to the
+    # next size that can (67 -> 68, 127 -> 128, 35 -> 36).
+    "2d_ties_unsplittable_n67_dim0": (
+        (torch.arange(67 * 16) * 7 % 5).reshape(67, 16).half(),
+        0,
+        False,
+    ),
+    "2d_ties_unsplittable_n127_last_dim_desc": (
+        (torch.arange(16 * 127) * 7 % 5).reshape(16, 127).half(),
+        1,
+        True,
+    ),
+    "2d_ties_unsplittable_n35_dim0_desc": (
+        (torch.arange(35 * 16) * 7 % 5).reshape(35, 16).half(),
+        0,
+        True,
+    ),
+}
 
 
 class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
@@ -2327,6 +2417,82 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        ("test_sort", "test_sort_cpu"): {
+            "param_sets": _SORT_PARAM_SETS,
+            # The values are exact; the int64 index cast is what fails. It runs
+            # on the device through fp32, so the indices come back wrong
+            # on every run. TODO: remove each entry when its issue is fixed.
+            "expect_fail": {
+                "2d_dim0_asc": _SORT_PERMUTED,
+                "2d_dim0_desc": _SORT_PERMUTED,
+                "2d_ties_dim0_asc": _SORT_PERMUTED,
+                "2d_ties_dim0_desc": _SORT_PERMUTED,
+                "3d_ties_dim1": _SORT_PERMUTED,
+                "4d_ties_dim2_desc": _SORT_PERMUTED,
+                "2d_ties_unsplittable_n67_dim0": _SORT_PERMUTED,
+                "2d_ties_last_dim_w60": _SORT_UNALIGNED,
+                "2d_ties_last_dim_w7_desc": _SORT_UNALIGNED,
+                "2d_ties_last_dim_w100": _SORT_UNALIGNED,
+                "2d_ties_unsplittable_n127_last_dim_desc": _SORT_UNALIGNED,
+                "2d_ties_unsplittable_n35_dim0_desc": _SORT_UNALIGNED,
+            },
+        },
+        ("test_sort_values", "test_sort_values_cpu"): {
+            "param_sets": _SORT_PARAM_SETS,
+        },
+        ("test_sort_unstable", "test_sort_unstable_cpu"): {
+            "param_sets": {
+                "2d_dim0_asc": (unique_randn_along_dim((8, 64), dim=0), 0, False),
+                "2d_dim0_desc": (unique_randn_along_dim((96, 64), dim=0), 0, True),
+                "2d_ties_dim0": (
+                    (torch.arange(64 * 8) % 5).reshape(64, 8).to(torch.float16),
+                    0,
+                    False,
+                ),
+                "3d_ties_dim1_desc": (
+                    (torch.arange(2 * 16 * 64) % 3).reshape(2, 16, 64).half(),
+                    1,
+                    True,
+                ),
+                # Along the stick dim: neg feeds topk through a restickify.
+                "2d_dim1_asc": (unique_randn_along_dim((8, 64), dim=1), 1, False),
+            },
+            # See test_sort: the int64 index cast fails on the device.
+            "expect_fail": {
+                "2d_dim0_asc": _SORT_PERMUTED,
+                "2d_dim0_desc": _SORT_PERMUTED,
+                "3d_ties_dim1_desc": _SORT_PERMUTED,
+                "2d_dim1_asc": _SORT_PERMUTED,
+                "2d_ties_dim0": _SORT_UNALIGNED,
+            },
+        },
+        ("test_sort_unsplittable_with_inf", "test_sort_unsplittable_with_inf_cpu"): {
+            "param_sets": {"dim0": (0,), "dim1": (1,)},
+            # See test_sort: the int64 index cast fails on the device.
+            "expect_fail": {"dim0": _SORT_PERMUTED, "dim1": _SORT_UNALIGNED},
+        },
+        # Stable sort along the stick dim fails on main: Inductor fuses flip's
+        # gather, neg and topk into one kernel that DeepTools rejects ("There
+        # must be at least one valid candidate"). It passes with #4975.
+        ("test_sort_stick_dim", "test_sort_stick_dim_cpu"): {
+            "param_sets": {
+                "2d_dim1_asc": (
+                    torch.arange(8 * 64, dtype=torch.float16).reshape(8, 64),
+                    1,
+                    False,
+                ),
+                "2d_ties_dim1_desc": (
+                    (torch.arange(8 * 64) % 5).reshape(8, 64).to(torch.float16),
+                    1,
+                    True,
+                ),
+                "1d_ties": (
+                    (torch.arange(64) % 4).to(torch.float16),
+                    0,
+                    False,
+                ),
+            },
+        },
         ("test_keep_by_index", "test_keep_by_index_cpu"): {
             "param_sets": {
                 "2d_dim0": (
@@ -2587,6 +2753,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "4d_dim_0_2": ([0, 2], cached_randn((2, 3, 5, 256))),
                 "2d_size1_dim_0": ([0], cached_randn((1, 256))),
                 "2d_no_dims": ([], cached_randn((67, 256))),
+                # Stick-dim widths that are not a whole number of sticks are
+                # left-padded to a full stick, flipped, and narrowed back.
+                "2d_dim_1_unaligned": ([1], cached_randn((16, 60))),
+                "2d_dim_neg1_unaligned_narrow": ([-1], cached_randn((16, 7))),
+                "2d_dim_1_unaligned_two_sticks": ([1], cached_randn((16, 100))),
+                "3d_dim_2_unaligned": ([2], cached_randn((2, 8, 60))),
                 # Stick-dim reversals are unsupported and, rather than raising,
                 # fault the card, so they cannot run as xfails.
                 "2d_dim_1_stick": ([1], cached_randn((67, 256))),
@@ -10584,6 +10756,64 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=False,
         )
 
+    def test_sort_cpu(self, x, dim: int, descending: bool):
+        # Indices are compared too: the decomposition is always stable, so
+        # they must match CPU's stable sort exactly, ties included.
+        self.compare_with_cpu(
+            lambda x: torch.sort(x, dim=dim, descending=descending, stable=True), x
+        )
+
+    def test_sort_values_cpu(self, x, dim: int, descending: bool):
+        # Values only, so the sort is still checked while the int64 index
+        # cast is an expected failure in test_sort.
+        self.compare_with_cpu(
+            lambda x: torch.sort(x, dim=dim, descending=descending, stable=True)[0],
+            x,
+        )
+
+    def test_sort_unstable_cpu(self, x, dim: int, descending: bool):
+        # Without stable=True ties may come out in any order, so only the
+        # values must match CPU; the indices must still pick those values.
+        values, indices = _compile_and_run(
+            lambda x: torch.sort(x, dim=dim, descending=descending), [x], "spyre"
+        )
+        expected = torch.sort(x, dim=dim, descending=descending).values
+        torch.testing.assert_close(values.cpu(), expected)
+        torch.testing.assert_close(x.gather(dim, indices.cpu()), expected)
+
+    def test_sort_unsplittable_with_inf_cpu(self, dim: int):
+        # The pad for an unsplittable sort dim is -inf in topk's key space and
+        # sits at the front, so it loses every tie with a real +-inf element.
+        shape = (67, 16) if dim == 0 else (16, 67)
+        x = (torch.arange(67 * 16) * 7 % 5).reshape(shape).half()
+        x.narrow(dim, 0, 2).fill_(float("inf"))
+        x.narrow(dim, 5, 2).fill_(float("-inf"))
+        self.compare_with_cpu(lambda x: torch.sort(x, dim=dim, stable=True), x)
+
+    @expects_raise
+    def test_sort_int64_rejected(self):
+        # topkvalue/topkindex only bind fp16/fp32, so compile must raise.
+        x = (torch.arange(64 * 8) % 5).reshape(64, 8)
+        with pytest.raises(Exception, match="Unsupported"):
+            _compile_and_run(
+                lambda x: torch.sort(x, dim=0, stable=True),
+                [x],
+                "spyre",
+            )
+
+    @unittest.skip("fused flip->topk kernel along the stick dim needs #4975")
+    def test_sort_stick_dim_cpu(self, x, dim: int, descending: bool):
+        self.compare_with_cpu(
+            lambda x: torch.sort(x, dim=dim, descending=descending, stable=True), x
+        )
+
+    @expects_raise
+    def test_sort_k_over_max_rejected(self):
+        # topk caps k at 128, and sort runs it with k = size of the sort dim.
+        x = unique_randn_along_dim((129, 8), dim=0)
+        with pytest.raises(Exception, match="Unsupported"):
+            _compile_and_run(lambda x: torch.sort(x, dim=0), [x], "spyre")
+
     def test_keep_by_index_cpu(self, x, k: int, dim: int, fill_value: float):
         _, indices = torch.topk(x, k, dim=dim, largest=True)
 
@@ -11006,6 +11236,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # descending index (see spyre_flip); the arange building that index
         # falls back to CPU, hence the filtered FallbackWarning.
         self.compare_with_cpu(lambda x: torch.flip(x, dims), x)
+
+    @expects_raise
+    def test_flip_unaligned_multi_dim_rejected(self):
+        # A padded (unaligned) stick-dim flip combined with another dim's
+        # gather faults the card, so it must raise before any kernel runs.
+        x = cached_randn((16, 60))
+        with pytest.raises(Exception, match="Unsupported"):
+            _compile_and_run(lambda x: torch.flip(x, [0, 1]), [x], "spyre")
 
     def test_transpose_2d_cpu(self, dim0: int, dim1: int, x):
         self.compare_with_cpu(lambda x: torch.transpose(x, dim0, dim1), x)
