@@ -900,7 +900,11 @@ class _BufferResidencyChecks:
             and not config.ktir_emitter
             and prefix_lx_gather_source(self.graph, self.name, self.uses)
             and (
-                (not self.division_is_fixed and self.allocator._decides_lx_relayouts)
+                (
+                    not self.division_is_fixed
+                    and self.allocator._decides_lx_relayouts
+                    and config.lx_solver_relayout
+                )
                 or (
                     self.division_is_fixed
                     and any(
@@ -4924,14 +4928,18 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         ``collect_lx_relayout_plans``; the per-pair gates (permutation
         compatibility, projectable ownership on both frames, the law's fitted
         split range) live in ``solver_relayout_pair_cost``. Gated on the
-        solver's ``decides_lx_relayouts``.
+        solver's ``decides_lx_relayouts`` and on ``config.lx_solver_relayout``.
 
         ``cd_parent_matches`` (the caller's own ``_cd_parent_matches`` result)
         gives each parent's cap-and-rank step the other parents' already-free
         divisions, so it won't drop the one group that would let this parent
         join them.
         """
-        if not self._decides_lx_relayouts or config.ktir_emitter:
+        if (
+            not self._decides_lx_relayouts
+            or not config.lx_solver_relayout
+            or config.ktir_emitter
+        ):
             return {}
         if consumer_op is None:
             return {}

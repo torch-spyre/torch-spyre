@@ -130,7 +130,11 @@ from torch_spyre._inductor.wsr.tile import (
     compute_tile_index,
     compute_tile_stride,
 )
-from utils_inductor import ir_computed_buffer, ir_input_loader
+from utils_inductor import (
+    ir_computed_buffer,
+    ir_input_loader,
+    patch_tiling_helper,
+)
 
 _FP16 = DataFormats.SEN169_FP16
 
@@ -1937,17 +1941,15 @@ class TestDivideRanges(unittest.TestCase):
         after_space = dict(zip(symbols, (Integer(64), Integer(64))))
 
         with (
-            patch(
-                "torch_spyre._inductor.wsr.coarse_tile._capture_logical_iteration_symbols",
+            patch_tiling_helper(
+                "_capture_logical_iteration_symbols",
                 side_effect=Unsupported("fused dimensions"),
             ),
-            patch(
-                "torch_spyre._inductor.wsr.coarse_tile.iteration_space_from_op",
+            patch_tiling_helper(
+                "iteration_space_from_op",
                 side_effect=(before_space, after_space),
             ),
-            patch(
-                "torch_spyre._inductor.wsr.coarse_tile.invalidate_op_read_writes"
-            ) as invalidate,
+            patch_tiling_helper("invalidate_op_read_writes") as invalidate,
         ):
             result = _divide_ranges(op, Integer(2), tiled_dims=[0])
 
@@ -1966,12 +1968,12 @@ class TestDivideRanges(unittest.TestCase):
         after_symbols = before_symbols[:1]
 
         with (
-            patch(
-                "torch_spyre._inductor.wsr.coarse_tile._capture_logical_iteration_symbols",
+            patch_tiling_helper(
+                "_capture_logical_iteration_symbols",
                 side_effect=Unsupported("fused dimensions"),
             ),
-            patch(
-                "torch_spyre._inductor.wsr.coarse_tile.iteration_space_from_op",
+            patch_tiling_helper(
+                "iteration_space_from_op",
                 side_effect=(
                     dict(zip(before_symbols, (Integer(2), Integer(64)))),
                     {after_symbols[0]: Integer(64)},
@@ -2509,8 +2511,8 @@ def _mock_iteration_space(op):
 
 class TestCoarseTile(unittest.TestCase):
     def setUp(self):
-        self._patch = patch(
-            "torch_spyre._inductor.wsr.coarse_tile.op_out_coords",
+        self._patch = patch_tiling_helper(
+            "op_out_coords",
             side_effect=_mock_op_out_coords,
         )
         self._patch.start()
@@ -2847,8 +2849,8 @@ class TestCoarseTileNested(unittest.TestCase):
     """Verify that the nested group format [(hint_id, K1), ...] works."""
 
     def setUp(self):
-        self._patch = patch(
-            "torch_spyre._inductor.wsr.coarse_tile.op_out_coords",
+        self._patch = patch_tiling_helper(
+            "op_out_coords",
             side_effect=_mock_op_out_coords,
         )
         self._patch.start()
@@ -3021,8 +3023,8 @@ class TestCoarseTileTiledDimsPerRead(unittest.TestCase):
     """
 
     def setUp(self):
-        self._patch = patch(
-            "torch_spyre._inductor.wsr.coarse_tile.op_out_coords",
+        self._patch = patch_tiling_helper(
+            "op_out_coords",
             side_effect=_mock_op_out_coords,
         )
         self._patch.start()
@@ -7378,8 +7380,8 @@ class TestDivideReductionRanges(unittest.TestCase):
             Symbol("d2"): ["E"],
         }
 
-        with patch(
-            "torch_spyre._inductor.wsr.coarse_tile._capture_logical_iteration_symbols",
+        with patch_tiling_helper(
+            "_capture_logical_iteration_symbols",
             side_effect=(before, after),
         ):
             remap = _divide_reduction_ranges(op, Integer(128), [0])
@@ -7426,11 +7428,11 @@ class TestDivideReductionRanges(unittest.TestCase):
         }
 
         with (
-            patch(
-                "torch_spyre._inductor.wsr.coarse_tile.op_read_writes",
+            patch_tiling_helper(
+                "op_read_writes",
                 side_effect=(rw_before, rw_after),
             ),
-            patch("torch_spyre._inductor.wsr.coarse_tile.invalidate_op_read_writes"),
+            patch_tiling_helper("invalidate_op_read_writes"),
         ):
             remap = _divide_reduction_ranges(op, Integer(128), [0])
         _apply_work_div_symbol_remap(op, remap)
@@ -7458,20 +7460,18 @@ class TestDivideReductionRanges(unittest.TestCase):
         }
 
         with (
-            patch(
-                "torch_spyre._inductor.wsr.coarse_tile._capture_logical_iteration_symbols",
+            patch_tiling_helper(
+                "_capture_logical_iteration_symbols",
                 side_effect=Unsupported("fused output dimensions"),
             ),
-            patch(
-                "torch_spyre._inductor.wsr.coarse_tile.iteration_space_from_op",
+            patch_tiling_helper(
+                "iteration_space_from_op",
                 side_effect=(
                     {output_sym: Integer(512 * 704), reduction_sym: Integer(128)},
                     {output_sym: Integer(512 * 704)},
                 ),
             ),
-            patch(
-                "torch_spyre._inductor.wsr.coarse_tile.invalidate_op_read_writes"
-            ) as invalidate,
+            patch_tiling_helper("invalidate_op_read_writes") as invalidate,
         ):
             remap = _divide_reduction_ranges(op, Integer(128), [0])
 
@@ -8818,8 +8818,9 @@ class TestTileSpecLoweringReduction(unittest.TestCase):
         leaked = [*reduction_loop_vars(op), sympy_index_symbol("d9")]
         spec = TileSpec((TileAxis(0, 2, is_reduction=True),))
         with (
-            patch(
-                "torch_spyre._inductor.wsr.coarse_tile.reduction_loop_vars",
+            patch_tiling_helper(
+                "reduction_loop_vars",
+                common_only=True,
                 return_value=leaked,
             ),
             patch(
@@ -9396,8 +9397,8 @@ class TestApplyTilingsEquivalence(unittest.TestCase):
 
     def setUp(self):
         self.enterContext(
-            patch(
-                "torch_spyre._inductor.wsr.coarse_tile.op_out_coords",
+            patch_tiling_helper(
+                "op_out_coords",
                 side_effect=_mock_op_out_coords,
             )
         )
@@ -9527,8 +9528,8 @@ class TestApplyTilingsRegionRefusal(unittest.TestCase):
 
     def setUp(self):
         self.enterContext(
-            patch(
-                "torch_spyre._inductor.wsr.coarse_tile.op_out_coords",
+            patch_tiling_helper(
+                "op_out_coords",
                 side_effect=_mock_op_out_coords,
             )
         )
