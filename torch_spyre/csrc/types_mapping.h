@@ -74,7 +74,9 @@ inline std::pair<DataFormats, DataFormats> stringToDTDataFormatPair(
           {"qint8", {DataFormats::SENINT8, DataFormats::SENINT8}},
           {"quint4x2", {DataFormats::SENUINT2, DataFormats::SENUINT2}},
           {"quint2x4", {DataFormats::SENUINT2, DataFormats::SENUINT2}},
-          {"uint8", {DataFormats::SENUINT32, DataFormats::SENUINT32}},
+          // 1-byte host leg matching PyTorch's storage; the device has no
+          // 1-byte unsigned format, so values live as SENUINT32 there.
+          {"uint8", {DataFormats::SENUINT8, DataFormats::SENUINT32}},
           {"int4", {DataFormats::SENINT4, DataFormats::SENINT4}},
           {"int2", {DataFormats::SENINT2, DataFormats::SENINT2}},
           {"fp8_143", {DataFormats::SEN143_FP8, DataFormats::SEN143_FP8}},
@@ -150,6 +152,8 @@ inline bool isDCIConversionSupported(DataFormats src, DataFormats dst) {
       {DF::SENUINT32,   DF::IEEE_INT64},
       {DF::IEEE_INT64,  DF::SENUINT32},
       {DF::SENUINT32,   DF::SENUINT32},
+      {DF::SENUINT8,    DF::SENUINT32},
+      {DF::SENUINT32,   DF::SENUINT8},
       {DF::SEN169_FP16, DF::IEEE_INT64},
       {DF::BFLOAT16,    DF::SEN169_FP16},
       {DF::SEN169_FP16, DF::BFLOAT16},
@@ -179,6 +183,7 @@ inline size_t hostFormatBytes(DataFormats df) {
     case DataFormats::SENINT16:
       return 2;
     case DataFormats::SENINT8:
+    case DataFormats::SENUINT8:
     case DataFormats::SEN080_FP8:
     case DataFormats::SEN143_FP8:
     case DataFormats::SEN152_FP8:
