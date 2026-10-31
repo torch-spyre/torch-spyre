@@ -376,6 +376,40 @@ def _(src: torch.Tensor, dtype: torch.dtype, src_off: int) -> torch.Tensor:
     return torch.empty_like(src, dtype=dtype)
 
 
+# `shuffle`: moves elements within sticks to change the ElementArrangement of a
+# tensor without changing its dtype or logical shape.
+#
+# The four cases:
+#   1. fp32 DL16_TO_FP32  → fp32 STANDARD  : undo upcast stagger (2B source)
+#   2. fp16 FP32_TO_DL16  → fp16 STANDARD  : undo downcast stagger (4B source)
+#   3. fp32 STANDARD      → fp32 FP32_TO_DL16 : apply downcast stagger
+#   4. fp16 STANDARD      → fp16 DL16_TO_FP32 : apply upcast stagger
+#
+# ``ea`` is the integer value of the target ElementArrangement.
+@torch.library.custom_op("spyre::shuffle", mutates_args=(), device_types="spyre")
+@compile_once("spyre.shuffle", dynamic=False)
+def shuffle(src: torch.Tensor, ea: int, compiled) -> torch.Tensor:
+    """Run an eager shuffle as a compiled Spyre op.
+
+    specialize_int=True bakes ``ea`` into the trace: the lowering stashes it as a
+    constant, so a symbolic ``ea`` reused for another value would shuffle to the
+    wrong arrangement.
+    """
+    with torch._dynamo.config.patch(specialize_int=True):
+        return compiled(src, ea)
+
+
+@shuffle.register_fake
+def _(src: torch.Tensor, ea: int) -> torch.Tensor:
+    return src.new_empty(src.size())
+
+
+@torch.library.register_kernel("spyre::shuffle", ["cpu"])
+def shuffle_cpu(src: torch.Tensor, ea: int) -> torch.Tensor:
+    # On CPU element arrangement is a no-op: return a copy with the same data.
+    return src.clone()
+
+
 # Copy src into dst, guaranteed to survive both Inductor's remove_noop_ops
 # pass (unlike aten.copy_, this op is not in noop_registry) and
 # AOTAutograd's dead-code elimination when dst is never read again in the
@@ -1169,6 +1203,36 @@ def _(
     return torch.empty(1, 1, seqlen_q, seqlen_kv, dtype=dtype, device=device)
 
 
+@torch.library.custom_op("spyre::argmax_cpu", mutates_args=())
+def argmax_cpu(input: torch.Tensor, dim: Optional[int], keepdim: bool) -> torch.Tensor:
+    """CPU fallback for the argmax cases the Spyre decomposition does not cover.
+
+    Mirrors max_dim_int64_fallback: the Spyre kernel is registered in
+    fallbacks.py, and this body computes the real result for non-Spyre inputs.
+    """
+    return torch.argmax(input, dim, keepdim)
+
+
+@argmax_cpu.register_fake
+def _(input: torch.Tensor, dim: Optional[int], keepdim: bool) -> torch.Tensor:
+    return torch.argmax(torch.empty_like(input, device="meta"), dim, keepdim).to(
+        input.device
+    )
+
+
+@torch.library.custom_op("spyre::argmin_cpu", mutates_args=())
+def argmin_cpu(input: torch.Tensor, dim: Optional[int], keepdim: bool) -> torch.Tensor:
+    """CPU fallback for the argmin cases the Spyre decomposition does not cover."""
+    return torch.argmin(input, dim, keepdim)
+
+
+@argmin_cpu.register_fake
+def _(input: torch.Tensor, dim: Optional[int], keepdim: bool) -> torch.Tensor:
+    return torch.argmin(torch.empty_like(input, device="meta"), dim, keepdim).to(
+        input.device
+    )
+
+
 @torch.library.custom_op("spyre::triu_cpu", mutates_args=())
 def triu_cpu(input: torch.Tensor, diagonal: int) -> torch.Tensor:
     """
@@ -1350,67 +1414,6 @@ def _(
     k_win = key.new_empty((batch, num_kvheads, buffer_width, head_dim))
     v_win = value.new_empty((batch, num_kvheads, buffer_width, head_dim))
     return k_win, v_win
-
-
-@torch.library.custom_op(
-    "spyre::stagger_to_standard_ea", mutates_args=(), device_types="spyre"
-)
-def stagger_to_standard_ea(x: torch.Tensor) -> torch.Tensor:
-    """Restore standard Element Arrangement (EA) from staggered EA.
-
-    The fp32todl16 conversion reorders elements when converting fp32 to fp16,
-    producing staggered EA in the output.  This op applies mm(x, P.t()) to
-    permute the last dimension back to standard EA so downstream ops see a
-    normal fp16 tensor.
-
-    The permutation matrix P encodes the hardware fp32→fp16 stagger pattern.
-    Each fp16 stick (64 elements) staggers independently:
-        stick_base = (phys // 64) * 64
-        local_phys = phys % 64
-        k, w = local_phys // 8, local_phys % 8
-        local_logical = k*4 + w            if w < 4
-                      = k*4 + (w-4) + 32   otherwise   (32 = fp16_stick // 2)
-        logical = stick_base + local_logical
-
-    ``half`` is always 32 (half of one fp16 stick), independent of N.
-    N = x.shape[-1] must be a multiple of 64.
-
-    P is built on CPU and transferred to the device.  It is determined solely
-    by N, so it is constant for a given tensor width and can be reused across
-    ops (lt, eq, etc.) that produce the same stagger pattern.
-
-    Input:  fp16 tensor with staggered EA, any shape [..., N]
-    Output: fp16 tensor with standard EA, same shape [..., N]
-    """
-    n = x.shape[-1]
-    device = x.device
-
-    # Build N×N permutation matrix on CPU, transfer to device.
-    # Each fp16 stick (64 elements) staggers independently with half=32.
-    FP16_STICK = 64
-    half = FP16_STICK // 2  # 32 — fixed, independent of n
-    P = torch.zeros(n, n, dtype=x.dtype, device="cpu")
-    for phys_j in range(n):
-        stick_base = (phys_j // FP16_STICK) * FP16_STICK
-        local_phys = phys_j % FP16_STICK
-        k, w = local_phys // 8, local_phys % 8
-        local_logical = k * 4 + w if w < 4 else k * 4 + (w - 4) + half
-        P[stick_base + local_logical, phys_j] = 1.0
-    P = P.to(device=device)
-
-    # Flatten all dims except the last into a single batch dim for mm,
-    # then restore the original shape.  This works for any rank >= 1:
-    # the stagger pattern only affects the last (stick) dimension, so
-    # flattening leading dims produces the correct row ordering for mm.
-    orig_shape = list(x.shape)
-    m = x.numel() // n
-    result = torch.mm(x.reshape(m, n), P.t()).reshape(orig_shape)
-    return result
-
-
-@stagger_to_standard_ea.register_fake
-def _(x: torch.Tensor) -> torch.Tensor:
-    return torch.empty_like(x)
 
 
 @torch.library.custom_op(

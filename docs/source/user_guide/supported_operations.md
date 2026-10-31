@@ -144,8 +144,8 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 | `torch.isin` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.bitwise_xor` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.bitwise_or` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
-| `torch.argmax` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
-| `torch.argmin` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
+| `torch.argmax` | Y | Y | Spyre | float32 along the last dim; other dtypes, dims and `dim=None` run on CPU. Ties pick the lowest index and NaN wins, as on CPU |
+| `torch.argmin` | Y | Y | Spyre | float32 along the last dim; other dtypes, dims and `dim=None` run on CPU. Ties pick the lowest index and NaN wins, as on CPU |
 | `torch.cumsum` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 
 > **Column key:**

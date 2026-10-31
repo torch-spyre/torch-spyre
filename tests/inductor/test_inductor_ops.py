@@ -507,6 +507,12 @@ _CMP_BIGINT_REASON = (
     "integers above 2**24 are compared as fp32, so near neighbours collapse"
 )
 
+# A comparison of an integer with an fp16 tensor converts the integer to fp16 on
+# device, and the bool result then has operands in both fp16 and fp32 device formats.
+_BOOL_RESULT_MIXED_FORMAT_REJECTION = (
+    "torch.bool result from operands with device format"
+)
+
 TO_DTYPE_OP_MAP_PARAMS_SETS = {
     f"{_dtype_name(src)}_to_{_dtype_name(dst)}": (src, dst)
     for src, dst in ALL_DTYPE_PAIRS
@@ -579,50 +585,15 @@ TO_DTYPE_OP_EXPECT_FAIL = [
     case for case in TO_DTYPE_OP_EXPECT_FAIL if case not in _TO_DTYPE_OP_NOW_PASSING
 ]
 
-# Conversions the device layout cannot be rescaled for. An fp32 stick holds 32
-# elements and an fp16/bf16 stick 64, so a dim of one or three fp32 sticks (the
-# 4x32, 4x68 and 68 shapes) is not a whole number of output sticks. The staggered
-# element arrangement cannot use a partially filled stick, so
-# rescale_stl_for_dtype rejects the conversion with Unsupported instead of
-# dropping data (flooring) or returning wrong values (rounding up) (#3809, #3604).
-# This is a rejection by design, so these cases assert it.
-_RESCALE_REJECTION = "cannot rescale device layout"
-_RESCALE_REJECTED_SHAPES = ("4x32", "4x68", "68")
-TO_DTYPE_OP_RESCALE_REJECTED = {
-    f"float32_to_{dst}_{shape}"
-    for dst in ("float16", "bfloat16")
-    for shape in _RESCALE_REJECTED_SHAPES
-}
-TO_DTYPE_OP_EXPECT_FAIL = [
-    case for case in TO_DTYPE_OP_EXPECT_FAIL if case not in TO_DTYPE_OP_RESCALE_REJECTED
-]
-
-# The cases left in TO_DTYPE_OP_EXPECT_FAIL return the cast result straight to the
-# host, and the result is wrong on 27-88% of its elements. The values on the device
-# are correct; the readback is not. A cast between fp16/bf16 and fp32 leaves a
-# staggered element arrangement, and the device-to-host copy reads it as STANDARD,
-# so the elements come back permuted with no error (#4393). In 30 of the 34 cases
-# converting the result back on the device restores the input exactly, which shows
-# the values are right; the other four cannot be checked that way, because the
-# conversion back is itself rejected (4x32: "cannot rescale device layout") or hits
-# the partial-stick limit (4x68).
+# The cases in TO_DTYPE_OP_EXPECT_FAIL return the cast result straight to the host,
+# and the result is wrong on part of its elements. The values on the device are
+# correct; the readback is not. A cast between fp16/bf16 and fp32 leaves a staggered
+# element arrangement, and the device-to-host copy reads it as STANDARD, so the
+# elements come back permuted with no error (#4393); converting the result back on
+# the device restores the input (the round-trip tests).
 _STAGGERED_READBACK = "readback of the staggered cast result is permuted, #4393"
-_STAGGERED_READBACK_UNCHECKED = (
-    "readback of the staggered cast result is wrong, probably #4393 "
-    "(the values cannot be checked on the device for this shape)"
-)
-_STAGGERED_READBACK_UNCHECKED_CASES = {
-    f"{src}_to_float32_{shape}"
-    for src in ("float16", "bfloat16")
-    for shape in ("4x32", "4x68")
-}
 TO_DTYPE_OP_EXPECT_FAIL = {
-    case: (
-        _STAGGERED_READBACK_UNCHECKED
-        if case in _STAGGERED_READBACK_UNCHECKED_CASES
-        else _STAGGERED_READBACK
-    )
-    for case in TO_DTYPE_OP_EXPECT_FAIL
+    case: _STAGGERED_READBACK for case in TO_DTYPE_OP_EXPECT_FAIL
 }
 
 TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS = {
@@ -635,139 +606,6 @@ TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS = {
     if src != dst
     for shape in TO_DTYPE_OP_SHAPES
 }
-
-TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL = [
-    f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}"
-    for src in [torch.float16, torch.bfloat16, torch.float32]
-    for dst in [torch.float16, torch.float32]
-    if src != dst
-    for shape in TO_DTYPE_OP_SHAPES_UNALIGNED
-]
-
-# Explicit round trips that pass on a stick ending inside a stick; the rest of the
-# unaligned shapes need the consumer of the upcast value padded to whole stick
-# pairs (see test_upcast_consumed_on_partial_stick). The implicit round
-# trip still hits an unsupported op on these shapes.
-_ROUND_TRIP_PASSING_PARTIAL_STICK = ("float16_to_float32_68", "bfloat16_to_float32_68")
-# The explicit add and copy round trips are rejected for the rescale reason above
-# on fp32 -> fp16 at all three shapes, and on the 4x32 upcast to fp32. The implicit
-# round trip is rejected on every pair at all three shapes.
-ROUND_TRIP_RESCALE_REJECTED = {
-    *(f"float32_to_float16_{shape}" for shape in _RESCALE_REJECTED_SHAPES),
-    "float16_to_float32_4x32",
-    "bfloat16_to_float32_4x32",
-}
-ROUND_TRIP_IMPLICIT_RESCALE_REJECTED = {
-    f"{src}_to_{dst}_{shape}"
-    for src, dst in (
-        ("bfloat16", "float16"),
-        ("bfloat16", "float32"),
-        ("float16", "float32"),
-        ("float32", "float16"),
-    )
-    for shape in _RESCALE_REJECTED_SHAPES
-}
-_TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL_ALL = [
-    case
-    for case in TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL
-    if case not in _ROUND_TRIP_PASSING_PARTIAL_STICK
-    and case not in ROUND_TRIP_RESCALE_REJECTED
-]
-
-# Further round-trip cases that now pass on every config. They differ between the
-# add and copy variants, so each variant gets its own expect_fail list. The implicit
-# variant is the same as the shared implicit list minus its own passing cases.
-_ROUND_TRIP_ADD_NOW_PASSING = {
-    "bfloat16_to_float16_4x16",
-    "bfloat16_to_float16_4x32",
-    "bfloat16_to_float16_4x63",
-    "bfloat16_to_float16_4x68",
-    "bfloat16_to_float16_68",
-    "bfloat16_to_float32_4x63",
-    "float16_to_float32_4x63",
-    "float32_to_float16_4x16",
-    "float32_to_float16_4x63",
-}
-_ROUND_TRIP_COPY_NOW_PASSING = _ROUND_TRIP_ADD_NOW_PASSING | {
-    "bfloat16_to_float32_4x16",
-    "float16_to_float32_4x16",
-}
-_ROUND_TRIP_IMPLICIT_NOW_PASSING = {
-    "float32_to_float16_4x16",
-    "float32_to_float16_4x63",
-}
-TO_DTYPE_OP_ROUND_TRIP_ADD_EXPECT_FAIL = [
-    case
-    for case in _TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL_ALL
-    if case not in _ROUND_TRIP_ADD_NOW_PASSING
-]
-TO_DTYPE_OP_ROUND_TRIP_COPY_EXPECT_FAIL = [
-    case
-    for case in _TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL_ALL
-    if case not in _ROUND_TRIP_COPY_NOW_PASSING
-]
-# These fail with a value mismatch, but pass on some runs (in cold-cache full runs of
-# the xfail-marked tests, each has passed in some of them), so they are non-strict
-# xfails. They fail on a single core as well, with the signature of the lost second
-# stick of a pair below (#5361), so splitting a dim across cores (#5285) does not
-# explain them; #5285 tracks the intermittency.
-_ROUND_TRIP_IMPLICIT_UNSTABLE = {
-    "float16_to_float32_4x63": "mismatch that passes on some runs; lost second stick "
-    "of a stick pair (#5361), intermittency #5285",
-    "bfloat16_to_float32_4x63": "mismatch that passes on some runs; lost second stick "
-    "of a stick pair (#5361), intermittency #5285",
-}
-TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL = [
-    case
-    for case in TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL
-    if case not in _ROUND_TRIP_IMPLICIT_NOW_PASSING
-    and case not in _ROUND_TRIP_IMPLICIT_UNSTABLE
-    and case not in ROUND_TRIP_IMPLICIT_RESCALE_REJECTED
-]
-
-# The round trips left in the three lists above return the right number of elements
-# with about half of them zero (#5361). The upcast value is staggered, so an fp16
-# stick is spread over a pair of fp32 sticks, in interleaved groups of four
-# elements; when the stick dim does not fill whole pairs, the pair's second stick is
-# missing. It happens in two ways:
-# - 4x16 and 4x63: the second stick is not allocated, so it fails on one core too;
-# - 4x68: it is allocated, but work division leaves it to no core, so it passes
-#   with SENCORES=1.
-_PAIR_SECOND_STICK_LOST = (
-    "the staggered fp32 value lacks the second stick of a stick pair, so half the "
-    "elements come back as zero (#5361)"
-)
-_PAIR_SECOND_STICK_UNSPLIT = (
-    "work division leaves the second stick of a stick pair to no core; correct "
-    "with SENCORES=1 (#5361)"
-)
-_ROUND_TRIP_PAIR_REASON_BY_SHAPE = {
-    "4x16": _PAIR_SECOND_STICK_LOST,
-    "4x63": _PAIR_SECOND_STICK_LOST,
-    "4x68": _PAIR_SECOND_STICK_UNSPLIT,
-}
-
-
-def _round_trip_pair_reasons(cases):
-    """``{case: reason}`` for round trips that lose the second stick of a pair.
-
-    A case whose shape has no reason raises KeyError: a new failing shape has to
-    be looked at before it is given one.
-    """
-    return {
-        case: _ROUND_TRIP_PAIR_REASON_BY_SHAPE[case.rsplit("_", 1)[1]] for case in cases
-    }
-
-
-TO_DTYPE_OP_ROUND_TRIP_ADD_EXPECT_FAIL = _round_trip_pair_reasons(
-    TO_DTYPE_OP_ROUND_TRIP_ADD_EXPECT_FAIL
-)
-TO_DTYPE_OP_ROUND_TRIP_COPY_EXPECT_FAIL = _round_trip_pair_reasons(
-    TO_DTYPE_OP_ROUND_TRIP_COPY_EXPECT_FAIL
-)
-TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL = _round_trip_pair_reasons(
-    TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL
-)
 
 TO_DTYPE_REDUCTION_DTYPES = [torch.float16, torch.float32]
 
@@ -988,6 +826,36 @@ def _bound_divisor(t: torch.Tensor, numerator: torch.Tensor = None) -> torch.Ten
 
 def _floor_div(a, b):
     return torch.div(a, b, rounding_mode="floor")
+
+
+# TODO: cite an issue once the shuffle compile failure is reported on the
+# shuffle-op PR.
+_ARG_REDUCE_SHUFFLE_COMPILE_FAIL = (
+    "the backend compiler fails on the fused float16 cast and shuffle kernel"
+)
+# TODO: cite an issue once reported; the shuffle takes whole float32 stick pairs.
+_ARG_REDUCE_NARROW_FP16 = (
+    "the float16 upcast cannot be shuffled back to STANDARD on a row narrower than "
+    "64 columns"
+)
+
+
+def _argmax_rows(shape, dtype=torch.float32):
+    """fp32 rows with the cases argmax must break like PyTorch: ties, NaN and inf.
+
+    Row 0 ties its max at three columns, row 1 ties +inf, row 2 holds two NaN and
+    a +inf, row 3 is all -inf and row 4 all equal; the rest are random. The lowest
+    index wins a tie, a NaN wins over any number.
+    """
+    rows, v = shape
+    x = torch.randn(shape, generator=torch.Generator().manual_seed(rows * v))
+    x[0, [3, v // 2, v - 1]] = 9.0
+    x[1, [5, 9]] = float("inf")
+    x[2, [v - 1, 11]] = float("nan")
+    x[2, 4] = float("inf")
+    x[3] = float("-inf")
+    x[4] = 1.0
+    return x.to(dtype)
 
 
 def _attention_fn(q, k, v, scale=True):
@@ -2290,6 +2158,31 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        ("test_arg_reduce", "test_arg_reduce_base"): {
+            "ops_dict": {"argmax": torch.argmax, "argmin": torch.argmin},
+            "param_sets": {
+                f"{_dtype_name(dtype)}_{rows}x{v}": (_argmax_rows((rows, v), dtype),)
+                for dtype in (torch.float32, torch.float16)
+                for rows, v in (
+                    (8, 256),
+                    (8, 768),
+                    (64, 32000),
+                    (8, 128256),
+                    (64, 151936),
+                    (5344, 768),
+                )
+            },
+            # The float16 path shuffles its staggered float32 upcast back to
+            # STANDARD; the backend compiler fails on the fused cast and shuffle
+            # kernel at these shapes.
+            "expect_fail": {
+                **{
+                    f"float16_{shape}": _ARG_REDUCE_SHUFFLE_COMPILE_FAIL
+                    for shape in ("8x768", "64x151936")
+                },
+                "argmin_float16_8x256": _ARG_REDUCE_SHUFFLE_COMPILE_FAIL,
+            },
+        },
         ("test_topk_indices", "test_topk_indices_cpu"): {
             "param_sets": {
                 "2d_k4_dim0": (unique_randn_along_dim((64, 256), dim=0), 4, 0),
@@ -3359,33 +3252,30 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         #
         #   fp16  x fp32 -> fp32 : dl16tofp32 is a STICK-REORDERING conversion
         #                          (2B -> 4B changes the element arrangement).
-        #                          expect_fail, but for TWO different reasons
-        #                          depending on the other operand:
-        #                            - neither operand broadcasts at the stick
-        #                              dim: propagate_layouts.py rejects the
-        #                              mixed-EA pointwise op. A clean compile
-        #                              error.
-        #                            - the other operand DOES broadcast at the
-        #                              stick dim: that combination is legal and
-        #                              propagate_layouts allows it, correctly.
-        #                              The compare is computed CORRECTLY too.
-        #                              But the result carries the staggered EA,
-        #                              and the D2H copy-out ignores
-        #                              element_arrangement and reads the buffer
-        #                              as STANDARD, so the mask comes back
-        #                              PERMUTED with no error raised (issue
-        #                              #4393). These two cases are therefore
-        #                              skipped: the defect is pre-existing and
-        #                              not in this lowering.
+        #                          The element-arrangement shuffle makes the
+        #                          operands compatible, so the compare compiles
+        #                          and runs correctly when neither operand
+        #                          broadcasts at the stick dim.
+        #                          When the other operand DOES broadcast at the
+        #                          stick dim, the compare is computed correctly
+        #                          too, but the result carries the staggered EA,
+        #                          and the D2H copy-out ignores
+        #                          element_arrangement and reads the buffer
+        #                          as STANDARD, so the mask comes back
+        #                          PERMUTED with no error raised (issue
+        #                          #4393). Those two cases are therefore
+        #                          expect_fail: the defect is pre-existing and
+        #                          not in this lowering.
         #
         #   int32 x fp32 -> fp32 : int32tofp32 is 4B -> 4B, so the EA is unchanged
         #                          and this runs entirely on device. The only
         #                          genuinely on-device mixed case here.
         #
         #   int32 x fp16 -> fp16 : int32tofp32 then fp32todl16, the second of
-        #                          which reorders sticks, so the converted operand
-        #                          is staggered and meets the STANDARD fp16 one:
-        #                          rejected as mixed EA, like fp16 x fp32.
+        #                          which reorders sticks. The bool result is then
+        #                          computed from operands whose device formats
+        #                          differ (fp16 and fp32), which the backend
+        #                          rejects at compile time.
         #
         # Promoting to fp16 also inherits fp16's 11-bit significand, so integers
         # above 2048 lose their distinction. That is not a divergence: eager does
@@ -3402,19 +3292,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "gt": torch.gt,
                 "ge": torch.ge,
             },
-            # A STANDARD operand mixed with a staggered one is rejected at compile
-            # time unless the STANDARD operand broadcasts at the stick dim (see
-            # test_round_trip_to_dtype_implicit_invalid, which asserts the same).
+            # A bool result computed from operands in different device formats
+            # (fp16 and fp32) is rejected at compile time.
             "expect_raise": {
-                "fp16_fp32_1d256": "Multi-arg pointwise with mixed EA",
-                "fp32_fp16_1d256": "Multi-arg pointwise with mixed EA",
-                "fp16_fp32_2d4x64": "Multi-arg pointwise with mixed EA",
-                "fp32_fp16_2d4x64": "Multi-arg pointwise with mixed EA",
-                "int32_fp16_1d256": "Multi-arg pointwise with mixed EA",
-                "fp16_int32_1d256": "Multi-arg pointwise with mixed EA",
-                "int32_fp16_2d4x64": "Multi-arg pointwise with mixed EA",
-                "int64_fp16_1d256": "Multi-arg pointwise with mixed EA",
-                "fp16_int64_1d256": "Multi-arg pointwise with mixed EA",
+                "int32_fp16_1d256": _BOOL_RESULT_MIXED_FORMAT_REJECTION,
+                "fp16_int32_1d256": _BOOL_RESULT_MIXED_FORMAT_REJECTION,
+                "int32_fp16_2d4x64": _BOOL_RESULT_MIXED_FORMAT_REJECTION,
+                "int64_fp16_1d256": _BOOL_RESULT_MIXED_FORMAT_REJECTION,
+                "fp16_int64_1d256": _BOOL_RESULT_MIXED_FORMAT_REJECTION,
             },
             # The compare is right on the device, but its staggered result is read
             # back permuted with no error (#4393).
@@ -3423,7 +3308,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "fp16_fp32_bcast_0dim": "readback of the staggered mask is permuted, #4393",
             },
             "param_sets": {
-                # fp16 -> fp32 is stick-reordering: blocked by mixed EA
+                # fp16 -> fp32 is stick-reordering: handled by the EA shuffle
                 "fp16_fp32_1d256": (
                     torch.ceil(cached_randn((256,), abs=True, scale=10.0)).to(
                         dtype=torch.float16
@@ -3456,7 +3341,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                         dtype=torch.float16
                     ),
                 ),
-                # fp16 vs a broadcaster at the stick dim: skipped, result incorrect
+                # fp16 vs a broadcaster at the stick dim: result incorrect
                 "fp16_fp32_bcast_stick": (
                     torch.ceil(cached_randn((4, 64), abs=True, scale=10.0)).to(
                         dtype=torch.float16
@@ -3471,7 +3356,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ),
                     torch.tensor(2.0, dtype=torch.float32),
                 ),
-                # int32 -> fp16 gives a staggered operand (see the header above)
+                # int32 -> fp16 gives operands in different formats (see header)
                 "int32_fp16_1d256": (
                     torch.randint(0, 100, (256,), dtype=torch.int32),
                     torch.ceil(cached_randn((256,), abs=True, scale=50.0)).to(
@@ -3503,7 +3388,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                         cached_randn((4, 64), abs=True, scale=50.0, dtype=torch.float32)
                     ),
                 ),
-                # int64 x float16 -> float16: staggered, as for int32
+                # int64 x float16 -> float16: different formats, as for int32
                 "int64_fp16_1d256": (
                     torch.randint(0, 100, (256,), dtype=torch.int64),
                     torch.ceil(cached_randn((256,), abs=True, scale=50.0)).to(
@@ -3567,12 +3452,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "clamp": torch.clamp,
                 "clamp_min": torch.clamp_min,
                 "clamp_max": torch.clamp_max,
-            },
-            # TODO: the clamped int64 mask converts to fp16 on device, which makes
-            # it staggered, and it does not broadcast at the stick dim, so its
-            # product with the STANDARD fp16 operand is rejected as mixed EA.
-            "expect_raise": {
-                "fp16_1x64x64": "Multi-arg pointwise with mixed EA",
             },
             "param_sets": {
                 "fp16_1x64x64": (cached_randn((1, 64, 64)),),
@@ -7598,17 +7477,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ("test_to_dtype", "test_to_dtype_cpu"): {
             "param_sets": TO_DTYPE_OP_PARAMS_SETS,
             "expect_fail": TO_DTYPE_OP_EXPECT_FAIL,
-            "expect_raise": dict.fromkeys(
-                TO_DTYPE_OP_RESCALE_REJECTED, _RESCALE_REJECTION
-            ),
         },
         ("test_round_trip_to_dtype", "test_round_trip_to_dtype_cpu"): {
             "ops_dict": {"add": torch.add},
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
-            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_ADD_EXPECT_FAIL,
-            "expect_raise": dict.fromkeys(
-                ROUND_TRIP_RESCALE_REJECTED, _RESCALE_REJECTION
-            ),
         },
         # storage_offset support for graph-input placeholders, non-stick dims.
         # `slicer` runs after .to("spyre") and before compile, so the offset
@@ -7825,10 +7697,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_round_trip_to_dtype_copy", "test_round_trip_to_dtype_copy_cpu"): {
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
-            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_COPY_EXPECT_FAIL,
-            "expect_raise": dict.fromkeys(
-                ROUND_TRIP_RESCALE_REJECTED, _RESCALE_REJECTION
-            ),
         },
         (
             "test_round_trip_to_dtype_implicit",
@@ -7836,11 +7704,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ): {
             "ops_dict": {"add": torch.add},
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
-            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL,
-            "expect_fail_unstable": _ROUND_TRIP_IMPLICIT_UNSTABLE,
-            "expect_raise": dict.fromkeys(
-                ROUND_TRIP_IMPLICIT_RESCALE_REJECTED, _RESCALE_REJECTION
-            ),
         },
         (
             "test_reduction_with_to_dtype",
@@ -10644,6 +10507,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
 
+    @pytest.mark.xfail(
+        strict=True, raises=InductorError, reason=_ARG_REDUCE_NARROW_FP16
+    )
     def test_min_tuple_output_keepdim0(self):
         x = unique_randn_along_dim((5, 7), dim=1)
         self.compare_with_cpu(
@@ -10652,6 +10518,20 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=False,
         )
 
+    def test_arg_reduce_base(self, op, x):
+        # Indices are exact, so compare them exactly. The CPU reference reads the
+        # card-rounded input, as float16 rounds to DLFloat16 on the device and
+        # makes more ties.
+        x = x.to("spyre").cpu()
+
+        def fn(t):
+            return op(t, dim=-1), op(t, dim=1, keepdim=True)
+
+        self.compare_with_cpu(fn, x, atol=0, rtol=0)
+
+    @pytest.mark.xfail(
+        strict=True, raises=InductorError, reason=_ARG_REDUCE_NARROW_FP16
+    )
     def test_argmin_keepdim0(self):
         x = unique_randn_along_dim((5, 7), dim=1)
         self.compare_with_cpu(
@@ -12608,13 +12488,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_bool_host_reshaped_to_fp32_cpu(self):
         # Same as test_bool_host_to_fp32_cpu, but through a reshape view first,
         # which leaves 8 elements on the stick dim.
-        # TODO: convert a stick-unaligned float16 tensor to float32 (#3999); then
-        # this reads back like test_bool_host_to_fp32_cpu.
+        # TODO: read a view that folds rows into one stick (stick expression
+        # 8*d0 + d1); then this reads back like test_bool_host_to_fp32_cpu.
         def fn(x):
             return x.reshape(8, 8).to(dtype=torch.float32)
 
         x = torch.randint(0, 2, (64,), dtype=torch.bool)
-        with pytest.raises(Exception, match="no supported output layout"):
+        with pytest.raises(Exception, match="Unexpected stick expression"):
             self.compare_with_cpu(fn, x, cpu_compile=False, run_eager=False)
 
     def test_bool_host_to_fp32_consumed_cpu(self):
