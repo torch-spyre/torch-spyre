@@ -575,11 +575,9 @@ Once a deeptools dependency clears, first-fit is the expected default.
 
 `config.layout_solver = "cpsat"` selects an OR-Tools CP-SAT solver that
 models placement as a global 2D no-overlap (each resident buffer is an
-optional `[lifetime] × [address, address + size)` rectangle) and
-minimizes total HBM transfer traffic, so a buffer that would be re-read by
-*N* consumers costs `N × size` when spilled. In-place reuse is encoded by
-shortening a parent's lifetime by the single handoff tick, letting the
-in-place child legally share its slot.
+optional `[lifetime] × [address, address + size)` rectangle). In-place
+reuse is encoded by shortening a parent's lifetime by the single handoff
+tick, letting the in-place child legally share its slot.
 
 It requires the optional `ortools` package
 (`pip install torch-spyre[cpsat]`); when it is missing, the allocator logs
@@ -591,6 +589,40 @@ by the joint `CoOptimizingAllocator` (below), which additionally chooses
 each op's core division -- see [The co-optimizer](co_optimizer.md) for what
 happens to that fallback when `ortools` is missing *and* co-optimization is
 requested.
+
+Those two modes minimize two different objectives:
+
+- **Placement-only** (no `co_optimizing_lx_planning`): a lexicographic
+  ladder in `_run`, each level pinning the previous level's optimum as a
+  constraint before optimizing the next -- (1) minimize total HBM transfer
+  traffic, (2) fewest coarse-tiling loop-group cuts, (3) maximize total
+  core usage, (4) prefer a balanced division (minimize the summed squared
+  split factors), (5) minimize the summed tile count. The traffic term is
+  *differential*: a resident buffer contributes 0, and a spill is charged
+  what it adds over residency -- `(consumers + 1) × size` for an
+  intermediate (one re-read each, plus the producer write residency would
+  have kept on-chip), `consumers × size` for a graph output, and
+  `(consumers - 1) × size` for a graph input, which pays a clone-in read
+  either way. With no candidate divisions or tilings to choose, levels
+  2--5 have nothing left to decide and the solve reduces to that traffic
+  term.
+- **Co-optimizing** (`co_optimizing_lx_planning`, the default): the
+  objective is instead the symbolic `cost_expr` the allocator builds from
+  the analytical cost model -- predicted runtime, not traffic alone, so
+  the matmul roofline term can pay for a spill.
+  `_minimize_cost_expr` (`scratchpad/ilp_solver_ortools.py`) maps each
+  sympy symbol onto the matching CP-SAT decision variable and lowers the
+  whole expression into the constraint model via `cost_expr_to_cpsat`
+  (`_SympyExprToCpSat` in
+  `scratchpad/cpsat_expr_printer.py`), so CP-SAT searches it symbolically
+  rather than evaluating it per candidate. When there is no usable
+  expression -- symbolic shapes, a serialized capture, `auto_coarse_tiling`
+  on (the allocator withholds it, the model being flat in tile size), or
+  the lowering raising -- the solve falls back to the ladder above, which
+  knows no relayout price and therefore pins every relayout copy out. See
+  [The co-optimizer](co_optimizer.md#cost-model) for how both production
+  solvers consume the same expression, and
+  [Analytical Cost Model](cost_model.md) for the pricing itself.
 
 ### SimulatedAnnealingLayoutSolver
 

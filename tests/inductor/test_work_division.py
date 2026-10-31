@@ -260,6 +260,46 @@ class TestLoopCarryLxEligibility(unittest.TestCase):
             self.assertEqual(clone.call_count, 2)
             self.assertEqual(prefix.call_count, 2)
 
+    def test_solver_relayout_off_offers_no_prefix_gather(self):
+        """``lx_solver_relayout=0`` keeps a solver from relayouting at all: a
+        prefix-gather source whose division the solver chooses gets no gather
+        either, so its consumers' differing views spill to HBM."""
+        from torch_spyre._inductor.scratchpad.allocator import _BufferResidencyChecks
+
+        op = _computed_buffer((64, 64), name="buf")
+        self.allocator._decides_lx_relayouts = True
+        for enabled in (True, False):
+            checks = _BufferResidencyChecks(
+                allocator=self.allocator,
+                graph=_residency_graph(op),
+                name="buf",
+                uses=[0, 1],
+                op=op,
+                mutated_buffers=set(),
+                graph_output_names=set(),
+                reinterpret_output_names=set(),
+                ncores={"buf": 32},
+                ncores_reasons={},
+                division_is_fixed=False,
+                buf_user_deps={},
+                planned_lx_buffers=frozenset(),
+                lx_relayout_plans=(),
+                drain_plans=(),
+                tileable=False,
+            )
+            with (
+                self.subTest(lx_solver_relayout=enabled),
+                allocator_module.config.patch(
+                    lx_planner_relayout=True,
+                    lx_solver_relayout=enabled,
+                    ktir_emitter=False,
+                ),
+                patch.object(
+                    allocator_module, "prefix_lx_gather_source", return_value=True
+                ),
+            ):
+                self.assertEqual(checks.prefix_gather(), enabled)
+
     def test_buffer_residency_adapter_rejection_strings(self):
         from torch_spyre._inductor.scratchpad.residency_rules import (
             BUFFER_RESIDENCY_RULES,
