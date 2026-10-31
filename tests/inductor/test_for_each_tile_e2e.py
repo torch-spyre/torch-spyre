@@ -90,6 +90,8 @@ from for_each_tile_fixtures import (
     abs_add_mul_tiled_reference,
     abs_tiled_fn,
     abs_tiled_reference,
+    upcast_add_tiled_fn,
+    upcast_add_tiled_reference,
     add_tiled_fn,
     add_tiled_reference,
     batched_online_softmax_fn,
@@ -756,6 +758,26 @@ class TestForEachTilePointwiseE2E(_DynamoResetTestCase):
         torch.testing.assert_close(
             out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
         )
+
+    def _check_upcast_add_tiled(self, downcast_in_body):
+        # Multiples of 1/64 below 5 are exact in fp16 and fp32, so a staggered
+        # stick read as standard cannot hide inside a tolerance.
+        A = (torch.arange(STICK_ROWS * STICK_COLS) % 257 / 64).to(torch.float16)
+        A = A.reshape(STICK_ROWS, STICK_COLS)
+        compiled = torch.compile(
+            upcast_add_tiled_fn, backend="inductor", fullgraph=True, dynamic=False
+        )
+        out = compiled(A.to(DEVICE_NAME), 64, downcast_in_body)
+
+        torch.testing.assert_close(
+            out.cpu(), upcast_add_tiled_reference(A), atol=0, rtol=0
+        )
+
+    def test_upcast_add_downcast_in_body(self):
+        self._check_upcast_add_tiled(downcast_in_body=True)
+
+    def test_upcast_add_in_body_downcast_after_loop(self):
+        self._check_upcast_add_tiled(downcast_in_body=False)
 
     def test_abs_add_mul_tiled_small(self):
         A = cached_randn((ROWS, COLS))
