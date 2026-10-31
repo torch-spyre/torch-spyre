@@ -1083,6 +1083,7 @@ class _GatherMulticoreScenarios:
             device_size=[V, stick_count, eps],
             stride_map=[E, eps, 1],
             device_dtype=get_device_dtype(torch.float16),
+            valid_elements={(0,): V, (1, 2): E},
         )
         table = torch.rand(V, E, dtype=torch.float16).to("spyre", device_layout=stl)
         token_ids = torch.randint(0, V, (2, 128), dtype=torch.int64).to("spyre")

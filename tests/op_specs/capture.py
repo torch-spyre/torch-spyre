@@ -151,6 +151,7 @@ class ArgRecord:
     stride_map: list
     device_dtype_name: str
     element_arrangement_name: str
+    valid_elements: dict = dataclasses.field(default_factory=dict)
     values: object = None
 
 
@@ -202,6 +203,7 @@ def _record_args(rec: KernelRecord, args: tuple, save_inputs: bool) -> None:
                 stride_map=list(layout.stride_map),
                 device_dtype_name=_enum_name(layout.device_dtype),
                 element_arrangement_name=_enum_name(layout.element_arrangement),
+                valid_elements=dict(layout.valid_elements),
                 values=tensor.cpu() if save_inputs else None,
             )
         )
@@ -381,6 +383,7 @@ def _layout_source(arg: ArgRecord) -> str:
         f"        device_size={arg.device_size},\n"
         f"        stride_map={arg.stride_map},\n"
         f"        device_dtype=DataFormats.{arg.device_dtype_name},\n"
+        f"        valid_elements={arg.valid_elements},\n"
         "        element_arrangement=ElementArrangement."
         f"{arg.element_arrangement_name},\n"
         "    ),"

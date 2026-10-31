@@ -351,15 +351,19 @@ def test_symbolic_cpsat_picks_measured_fast_division(n, trips):
 
 
 def test_real_layout_extraction_uses_device_order_and_invocation_extent(monkeypatch):
+    _src_ds = [33280, 8, 2, 64]
     src = SpyreTensorLayout(
-        device_size=[33280, 8, 2, 64],
+        device_size=_src_ds,
         stride_map=[1024, 128, 64, 1],
         device_dtype=DataFormats.SEN169_FP16,
+        valid_elements={(0,): 33280, (1,): 8, (2, 3): 128},
     )
+    _dst_ds = [8, 16, 128, 64]
     dst = SpyreTensorLayout(
-        device_size=[8, 16, 128, 64],
+        device_size=_dst_ds,
         stride_map=[131072, 64, 1024, 1],
         device_dtype=DataFormats.SEN169_FP16,
+        valid_elements={(0,): 8, (1, 3): 128, (2,): 1024},
     )
     read = MemoryDep("input", N * 1024 + B * 128 + X, (B, X, N), (8, 128, 1024))
     write = MemoryDep("output", B * 131072 + X * 1024 + N, (B, X, N), (8, 128, 1024))
@@ -394,7 +398,7 @@ def staged_transport_graph():
     graph = GraphLowering(fx.symbolic_trace(lambda: None))
     device = torch.device("spyre")
 
-    def layout(shape, strides, device_size, stride_map):
+    def layout(shape, strides, device_size, stride_map, valid_elements):
         return FixedTiledLayout(
             device,
             torch.float16,
@@ -404,6 +408,7 @@ def staged_transport_graph():
                 device_size=device_size,
                 stride_map=stride_map,
                 device_dtype=DataFormats.SEN169_FP16,
+                valid_elements=valid_elements,
             ),
         )
 
@@ -411,13 +416,21 @@ def staged_transport_graph():
         source = InputBuffer(
             name="input",
             layout=layout(
-                [32768, 8, 128], [1024, 128, 1], [32768, 8, 2, 64], [1024, 128, 64, 1]
+                [32768, 8, 128],
+                [1024, 128, 1],
+                [32768, 8, 2, 64],
+                [1024, 128, 64, 1],
+                {(0,): 32768, (1,): 8, (2, 3): 128},
             ),
         )
         stage = ComputedBuffer(
             name="stage",
             layout=layout(
-                [1024, 8, 128], [1024, 128, 1], [8, 2, 1024, 64], [128, 64, 1024, 1]
+                [1024, 8, 128],
+                [1024, 128, 1],
+                [8, 2, 1024, 64],
+                [128, 64, 1024, 1],
+                {(0,): 8, (1, 3): 128, (2,): 1024},
             ),
             data=Pointwise(
                 device=device,
@@ -433,6 +446,7 @@ def staged_transport_graph():
                 [131072, 1024, 1],
                 [8, 16, 128, 64],
                 [131072, 64, 1024, 1],
+                {(0,): 8, (1, 3): 128, (2,): 1024},
             ),
             data=Pointwise(
                 device=device,

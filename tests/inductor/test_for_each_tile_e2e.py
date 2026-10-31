@@ -284,6 +284,7 @@ class TestForEachTileE2E(_DynamoResetTestCase):
                         device_size=[4, rows // 32, 32],
                         stride_map=[rows, 32, 1],
                         device_dtype=get_device_dtype(torch.int32),
+                        valid_elements={(0,): 4, (1, 2): rows},
                     )
                     inputs = (
                         values.to(DEVICE_NAME),
@@ -367,6 +368,7 @@ class TestForEachTileE2E(_DynamoResetTestCase):
                             device_size=[96, 1, 64],
                             stride_map=[64, 64, 1],
                             device_dtype=get_device_dtype(torch.float16),
+                            valid_elements={(0,): 96, (1, 2): 64},
                         )
                     }
                     if row_outermost

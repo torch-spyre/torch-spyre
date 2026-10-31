@@ -280,6 +280,49 @@ SPYRE_MODE_SUPPORT_OVERRIDES_BY_OP = {
 }
 
 
+def _valid_elements_from_host(sizes, strides, device_size, stride_map):
+    """Compute valid_elements by mapping device dims to host dims.
+
+    Mirrors the C++ get_dim_map logic: maps each device dim to the host dim
+    with the largest host stride <= stride_map[j], then groups device dims
+    by their host dim.  The value for each group is the host dimension's
+    element count.  Use this for manually-constructed device layouts where
+    the 4-arg dim_order constructor is not available.
+    """
+    host_rank = len(sizes)
+    device_rank = len(stride_map)
+    stick_dim_index = max(0, device_rank - 3)
+
+    max_stride_le = [0] * device_rank
+    dim_map = [-1] * device_rank
+
+    for i in range(host_rank):
+        if sizes[i] == 1:
+            continue
+        hst = strides[i]
+        if hst == 0:
+            continue
+        for j in range(device_rank):
+            if device_size[j] == 1:
+                continue
+            dst = stride_map[j]
+            if hst > max_stride_le[j] and hst <= dst:
+                max_stride_le[j] = hst
+                dim_map[j] = i
+
+    if dim_map[stick_dim_index] != -1:
+        dim_map[stick_dim_index] = dim_map[device_rank - 1]
+
+    groups: dict[int, list[int]] = {}
+    for j in range(device_rank):
+        h = dim_map[j]
+        if h == -1:
+            continue
+        groups.setdefault(h, []).append(j)
+
+    return {tuple(sorted(dims)): sizes[h] for h, dims in groups.items()}
+
+
 def _get_spyre_mode_support(op):
     return SPYRE_MODE_SUPPORT_OVERRIDES_BY_OP.get(
         op,
@@ -13364,9 +13407,22 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         torch._inductor.codecache.FxGraphCache.clear()
 
         device_dtype_fp16 = get_device_dtype(torch.float16)
-        x_layout = SpyreTensorLayout(dev_layout[0], dev_stride[0], device_dtype_fp16)
+
+        x_layout = SpyreTensorLayout(
+            dev_layout[0],
+            dev_stride[0],
+            device_dtype_fp16,
+            _valid_elements_from_host(
+                list(x.shape), list(x.stride()), dev_layout[0], dev_stride[0]
+            ),
+        )
         weight_layout = SpyreTensorLayout(
-            dev_layout[1], dev_stride[1], device_dtype_fp16
+            dev_layout[1],
+            dev_stride[1],
+            device_dtype_fp16,
+            _valid_elements_from_host(
+                list(weight.shape), list(weight.stride()), dev_layout[1], dev_stride[1]
+            ),
         )
 
         x_dev = x.to(device_layout=x_layout)
@@ -13410,9 +13466,22 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         torch._inductor.codecache.FxGraphCache.clear()
 
         device_dtype_fp16 = get_device_dtype(torch.float16)
-        x_layout = SpyreTensorLayout(dev_layout[0], dev_stride[0], device_dtype_fp16)
+
+        x_layout = SpyreTensorLayout(
+            dev_layout[0],
+            dev_stride[0],
+            device_dtype_fp16,
+            _valid_elements_from_host(
+                list(x.shape), list(x.stride()), dev_layout[0], dev_stride[0]
+            ),
+        )
         weight_layout = SpyreTensorLayout(
-            dev_layout[1], dev_stride[1], device_dtype_fp16
+            dev_layout[1],
+            dev_stride[1],
+            device_dtype_fp16,
+            _valid_elements_from_host(
+                list(weight.shape), list(weight.stride()), dev_layout[1], dev_stride[1]
+            ),
         )
 
         x_dev = x.to(device_layout=x_layout)

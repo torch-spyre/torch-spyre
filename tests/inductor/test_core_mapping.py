@@ -1106,10 +1106,12 @@ def test_fused_split_view_checks_complete_owned_tuple(monkeypatch, feature_owned
 
 
 def _prepare_compound_axis_view(iter_space, index, repeat_info=None):
+    _ds = [1, 1, 8, 16, 64]
     device_layout = pass_utils_module.SpyreTensorLayout(
         [1, 1, 8, 16, 64],
         [-1, -1, 64, 512, 1],
         DataFormats.SEN169_FP16,
+        {(0,): 1, (1,): 1, (2, 4): 512, (3,): 16},
         ElementArrangement.STANDARD,
     )
     layout = pass_utils_module.FixedTiledLayout(
