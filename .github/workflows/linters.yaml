@@ -55,3 +55,6 @@ jobs:
 
       - name: Run pre-commit
         run: pre-commit run --all-files
+
+      - name: Fail if pre-commit modified files
+        run: git diff --exit-code
