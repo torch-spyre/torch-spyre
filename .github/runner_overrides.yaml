@@ -14,3 +14,16 @@ inductor/test_inductor_ops_misc_shape_a_config.yaml: spyre_pf_x2
 # to keep to default spyre_pf_x1 label (1 card)
 
 # inductor/test_ops_lx_planning_config.yaml: spyre_pf_x4
+
+# CI-tooling suites: pure Python, no device paths -- keep them off the card pool.
+test_derive_artifact_id_config.yaml: spyre_pf_x0
+test_gha_composite_action_manifests_config.yaml: spyre_pf_x0
+test_hw_diagnostics_scripts_config.yaml: spyre_pf_x0
+test_ingest_kernel_xml_config.yaml: spyre_pf_x0
+test_ingest_xml_config.yaml: spyre_pf_x0
+test_mark_retried_config.yaml: spyre_pf_x0
+test_model_ops_capability_config.yaml: spyre_pf_x0
+test_model_ops_v1_parity_config.yaml: spyre_pf_x0
+test_oot_framework_utils_config.yaml: spyre_pf_x0
+test_op_spec_lab_config.yaml: spyre_pf_x0
+test_regex_config.yaml: spyre_pf_x0
