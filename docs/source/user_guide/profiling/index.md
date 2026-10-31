@@ -125,7 +125,7 @@ design and may change.
 :::
 
 [rfc-0601]: https://github.com/torch-spyre/rfcs/blob/main/0601-SpyreProfilingToolkit/0601-SpyreProfilingToolkitRFC.md
-[ata]: https://github.com/IBM/aiu-trace-analyzer
+[ata]: https://github.com/torch-spyre/aiu-trace-analyzer
 [issue-1335]: https://github.com/torch-spyre/torch-spyre/issues/1335
 [pr-770]: https://github.com/torch-spyre/torch-spyre/pull/770
 [pr-1856]: https://github.com/torch-spyre/torch-spyre/pull/1856
