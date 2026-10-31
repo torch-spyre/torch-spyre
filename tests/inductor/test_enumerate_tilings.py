@@ -307,7 +307,7 @@ class TestApplyRefusals(unittest.TestCase):
         self.assertNotEqual(enumerate_tile_options(op), [TileSpec()])  # non-vacuity
         dl = op.layout.device_layout
         op.layout.device_layout = SpyreTensorLayout(
-            [64, 80, 1, 64], [5120, 64, -1, 1], dl.device_dtype, dl.element_arrangement
+            [64, 80, 1, 64], [5120, 64, 0, 1], dl.device_dtype, dl.element_arrangement
         )
         self.assertEqual(enumerate_tile_options(op), [TileSpec()])
 

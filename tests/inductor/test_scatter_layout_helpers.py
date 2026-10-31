@@ -219,15 +219,15 @@ class TestIndirectInsideStick(unittest.TestCase):
         required_stl = self._retile(128)
 
         self.assertEqual(list(required_stl.device_size), [128, 64])
-        self.assertEqual(list(required_stl.stride_map), [1, -1])
+        self.assertEqual(list(required_stl.stride_map), [1, 0])
 
     def test_entries_moved_out_of_a_spare_size1_dim(self):
         """A spare size-1 dim takes the entries, then a reorder puts them first."""
-        required_stl = self._retile(128, device_size=[2, 1, 64], stride_map=[64, -1, 1])
+        required_stl = self._retile(128, device_size=[2, 1, 64], stride_map=[64, 0, 1])
 
         # The layout a host [N, 1] input already receives.
         self.assertEqual(list(required_stl.device_size), [128, 1, 64])
-        self.assertEqual(list(required_stl.stride_map), [1, -1, -1])
+        self.assertEqual(list(required_stl.stride_map), [1, 0, 0])
 
     def test_entry_count_comes_from_the_host_extent(self):
         """A 100-entry table keeps its length, not the 128 slots it sits in."""

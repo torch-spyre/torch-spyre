@@ -144,10 +144,13 @@ def _resize_device_layout(
     dim grows: growing back is ambiguous where the tile has two host dims of
     extent 1.
 
-    ``stride_map`` semantics: a value of ``-1`` means "this device dimension has
-    extent 1 and is never stepped through; its stride is undefined."  For
-    non-contiguous (transposed / col-major) dims, the *physical* stride on
-    device is invariant to resizing, so it is left unchanged.
+    ``stride_map`` semantics: a value of ``0`` means "every access lands at
+    host coordinate zero along this dimension; its stride is undefined."  This
+    covers size-1 dims (broadcast collapsed to one element), broadcast dims
+    with device_size > 1 (every device coordinate reads the same host element),
+    and gap dims inserted by padding.  For non-contiguous (transposed / col-major)
+    dims, the *physical* stride on device is invariant to resizing, so it is
+    left unchanged.
 
     Device-dim classification (as produced by ``get_generic_stick_layout``):
 
@@ -163,8 +166,8 @@ def _resize_device_layout(
       spanning the stick host dim ``p*``.  Updated to
       ``ceil(new_host_size[p*] / eps)``.  Same stride-update rule as non-stick.
       Of size 1 when ``p*`` is at most one stick long, told from a singleton
-      by its ``stride_map`` (never ``-1``).
-    * **singleton** (``device_size == 1, stride_map == -1``) — either a sparse
+      by its ``stride_map`` (never ``0``).
+    * **singleton** (``device_size == 1, stride_map == 0``) — either a sparse
       placeholder (no corresponding host dim) or a non-stick dim tiled to
       extent 1.  Left as-is when there is no host dim to match; matched by
       size-1 to a host dim of size 1 when one exists.
@@ -195,7 +198,7 @@ def _resize_device_layout(
     Multi-pass algorithm:
 
     * **Pass 1**: match non-inner-stick device dims to host dims by size.
-      Size-1 dims with ``stride_map == -1`` match only to host dims of size 1;
+      Size-1 dims with ``stride_map == 0`` match only to host dims of size 1;
       other size-1 dims are tile-count.  Size > 1 dims match by
       ``device_size == old_host_size[p]``, with stride as tiebreaker when sizes
       collide.  Unmatched dims are candidates for tile-count.
@@ -260,8 +263,8 @@ def _resize_device_layout(
 
     for j in range(ndev - 1):  # j == ndev-1 is always inner stick
         dsz = orig_ds[j]
-        if dsz == 1 and orig_sm[j] != -1:
-            # A host dim of extent 1 always has stride_map -1: this is the
+        if dsz == 1 and orig_sm[j] != 0:
+            # A host dim of extent 1 always has stride_map 0: this is the
             # tile count of a stick host dim at most one stick long.
             unmatched_j.append(j)
         elif dsz == 1:
@@ -361,7 +364,7 @@ def _resize_device_layout(
     for j, p in matched_host.items():
         new_ds[j] = new_host_size[p]
         if new_host_size[p] == 1:
-            new_sm[j] = -1
+            new_sm[j] = 0
         elif orig_sm[j] == old_hs[p]:
             new_sm[j] = new_hs[p]
         # else: non-contiguous stride; physical layout is invariant — leave unchanged.
@@ -399,7 +402,7 @@ def _resize_device_layout(
             )
         new_ds[j] = -(-new_host_size[pstar] // eps)  # ceil division
         if new_host_size[pstar] == 1:
-            new_sm[j] = -1
+            new_sm[j] = 0
         elif orig_sm[j] == tc_stride:
             new_sm[j] = new_tc_scale * new_hs[pstar]
         # else: non-contiguous stick; physical stride invariant.
@@ -407,7 +410,7 @@ def _resize_device_layout(
     # Pass 4: inner stick (j == ndev-1) — device_size is always eps, update stride only.
     j = ndev - 1
     if new_host_size[pstar] == 1:
-        new_sm[j] = -1
+        new_sm[j] = 0
     elif orig_sm[j] == old_hs[pstar]:
         new_sm[j] = new_hs[pstar]
     # else: non-contiguous stick; physical stride invariant.

@@ -113,10 +113,10 @@ def _overpadded_collective_tensor(values, padded_width, device):
     from torch_spyre._C import DataFormats, SpyreTensorLayout, spyre_empty_with_layout
 
     # Match the materialized input in Granite's compiled logits allgather:
-    # logical [1, 24640], device [416, 1, 64], stride map [64, -1, 1].
+    # logical [1, 24640], device [416, 1, 64], stride map [64, 0, 1].
     # The compiler retains the projection's 26624-element physical allocation.
     layout = SpyreTensorLayout(
-        [padded_width // 64, 1, 64], [64, -1, 1], DataFormats.SEN169_FP16, {}
+        [padded_width // 64, 1, 64], [64, 0, 1], DataFormats.SEN169_FP16, {}
     )
     tensor = spyre_empty_with_layout(
         values.shape, values.stride(), values.dtype, layout, device=device

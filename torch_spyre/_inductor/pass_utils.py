@@ -250,7 +250,7 @@ def rescale_stl_for_dtype(
     # Rescale the first non-stick dim that indexes whole sticks (stride == the
     # input stick depth) by the stick-depth ratio. A staggered/sparse layout
     # (e.g. the DL16_TO_FP32 restoration operand, whose stride_map carries
-    # sentinel -1 entries rather than a linear num-sticks stride) has no such
+    # sentinel 0 entries rather than a linear num-sticks stride) has no such
     # dim; there only the stick depth changes, so a no-match is expected and
     # left as-is.
     for i, s in enumerate(stl.stride_map):
@@ -2574,7 +2574,7 @@ def is_sparse_stl(stl) -> bool:
 
     A sparse layout is produced by a reduction along the stick dimension:
     the stick dim (device_size[-1] == elems_per_stick) is synthetic with
-    stride_map[-1] == -1 (no corresponding host stride).
+    stride_map[-1] == 0 (no corresponding host stride).
 
     A device tensor has a device_size and stride_map. Remove the dimensions of
     size one from both lists. The stride of a dimension is the prod of the
@@ -2756,7 +2756,7 @@ def compute_restickify_needed(
             y_sm = list(sm)
             y_ds[k_chunk_dim] = ds[k_chunk_dim] * stick_size
             y_sm[k_chunk_dim] = elem_stride
-            y_sm[-1] = -1
+            y_sm[-1] = 0
             return True, SpyreTensorLayout(y_ds, y_sm, in_stl.device_dtype)
         assert False, (
             f"k_chunk_dim not found in sparse-N=1 restickify path: "

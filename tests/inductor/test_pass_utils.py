@@ -401,4 +401,4 @@ def test_compute_restickify_target_layout_synthesizes_when_no_size1_dim_exists()
     # One element per stick: the old stick's 64 elements become an outer dim
     # and the stick maps to no host stride.
     assert list(result.device_size) == [64, 4, 64]
-    assert list(result.stride_map) == [1, 64, -1]
+    assert list(result.stride_map) == [1, 64, 0]

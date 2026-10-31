@@ -725,8 +725,8 @@ class TestUnrepresentableStickCandidates(TestCase):
         dev = self._dtype()
         d0, d1, d2 = sympy.symbols("d0 d1 d2", integer=True, nonnegative=True)
         dep = MemoryDep("buf", 4096 * d0 + d2, (d0, d1, d2), (512, 4096, 4096))
-        bad = SpyreTensorLayout([512, 128, 1, 1, 64], [4096, 1, 8192, -1, 128], dev)
-        good = SpyreTensorLayout([512, 1, 1, 64], [4096, -1, -1, 1], dev)
+        bad = SpyreTensorLayout([512, 128, 1, 1, 64], [4096, 1, 8192, 0, 128], dev)
+        good = SpyreTensorLayout([512, 1, 1, 64], [4096, 0, 0, 1], dev)
         return dep, bad, good
 
     def test_device_coordinates_raises_try_returns_none(self):
@@ -929,7 +929,7 @@ class TestFactorizedMatmulCandidates(TestCase):
             arg, contraction, BATCH_MATMUL_OP, "x"
         )
         self.assertEqual(list(result.device_size), [64, 64, 1, 64])
-        self.assertEqual(list(result.stride_map), [4096, 64, -1, 1])
+        self.assertEqual(list(result.stride_map), [4096, 64, 0, 1])
 
     def test_outer_loop_var_in_the_head_coordinate_collapses_the_whole_chain(self):
         """An outer variable added to the head coordinate does not block collapse.
@@ -953,7 +953,7 @@ class TestFactorizedMatmulCandidates(TestCase):
         )
         source = SpyreTensorLayout(
             [heads, 1, 2, 1, 64],
-            [128, -1, 64, -1, 1],
+            [128, 0, 64, 0, 1],
             get_device_dtype(torch.float16),
             {(0,): heads, (1,): 1, (2, 4): 128, (3,): 1},
         )
@@ -964,7 +964,7 @@ class TestFactorizedMatmulCandidates(TestCase):
             PropArg(dep, host, [source]), contraction, BATCH_MATMUL_OP, "x"
         )
         self.assertEqual(list(result.device_size), [1, 128, 1, 64])
-        self.assertEqual(list(result.stride_map), [-1, 64, -1, 1])
+        self.assertEqual(list(result.stride_map), [0, 64, 0, 1])
 
     def test_nonstandard_matmul_layout_is_not_canonicalized(self):
         """Non-STANDARD formats are returned unchanged by Pass 3."""
