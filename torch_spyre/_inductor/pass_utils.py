@@ -1694,23 +1694,6 @@ def _find_entry_output_dim(op) -> "tuple[int, int, int] | None":
     return None
 
 
-def is_output_stick_aligned_for_entry(op) -> bool:
-    """Whether a gather output already holds a whole-stick slice for its entry dim.
-
-    The work-division guard uses this to decide the partial-last-stick split:
-    True means the stick-aligned split is legal (the output extent is a multiple
-    of the index ``eps`` -- either naturally, or because the padding pass grew
-    it); False means keep the split forbidden. Returns False for anything that is
-    not a paddable gather entry (scatter, non-committed layout), so the guard
-    stays conservative.
-    """
-    found = _find_entry_output_dim(op)
-    if found is None:
-        return False
-    eps, _out_pos, out_extent = found
-    return out_extent % eps == 0
-
-
 def padded_entry_output_stl(op) -> "SpyreTensorLayout | None":
     """The gather output's device layout grown so the entry dim is a whole stick.
 
@@ -1827,25 +1810,16 @@ def indirect_forbidden_split_syms(op: "ComputedBuffer") -> set[Symbol]:
     1. **Shared-table data dims** — the non-row dims of a shared gather/scatter
        table must not advance per core (all cores share the same base address).
 
-    2. **Partial-last-stick entry dims** — splitting a partial last index stick
-       across cores straddles the stick boundary. Forbidden unless the gather
-       output was already padded to a stick boundary by
-       ``enforce_indirect_access_layout``, which makes the split safe. Scatter
-       output rows are chosen at runtime so can never be padded; they stay unsplit.
+    2. **Partial-last-stick entry dims** — an index-entry dim whose count is not
+       a whole number of index sticks stays on one core, for gathers and
+       scatters alike. Work division splits the entry dim in whole index
+       sticks, so the last core would iterate the padding lanes of the index's
+       last stick and use whatever they hold as rows; an invalid value faults
+       the card.
     """
     syms = shared_indirect_data_syms(op)  # (1)
 
-    # (2) Forbid a partial-last-stick index-entry dim UNLESS the gather output is
-    # provably stick-aligned for it. The partial check keys off the INDEX's
-    # *logical* entry count (d.ranges[stick_var], e.g. 40), which is never padded
-    # -- the stick-alignment fix grows the gather OUTPUT's device_size, not the
-    # index. is_output_stick_aligned_for_entry reads that (possibly padded)
-    # output extent, so the split is allowed only when the output can hold a
-    # whole-stick slice. It stays forbidden when the output is NOT aligned: a
-    # SCATTER (its in-place dest can't be resized -> returns False) or a gather
-    # whose output the pass could not grow -- those fall back to a single core,
-    # not miscompile. Applies to BOTH gather and scatter
-    output_aligned = is_output_stick_aligned_for_entry(op)
+    # (2) keys off the index's logical entry count (d.ranges[stick_var]).
     subs = indirect_access_subs_from_op(op)
     index_names = {e.args[0].name for e in subs.values() if e.args}
     for d in op.get_read_writes().reads:
@@ -1860,7 +1834,7 @@ def indirect_forbidden_split_syms(op: "ComputedBuffer") -> set[Symbol]:
         partial = (
             stick_var in d.ranges and concretize_expr(d.ranges[stick_var]) % eps != 0
         )
-        if partial and not output_aligned:
+        if partial:
             syms.add(stick_var)
 
     return syms
