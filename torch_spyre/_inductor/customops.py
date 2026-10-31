@@ -248,6 +248,24 @@ def _(input: torch.Tensor):
     return input.new_empty(input.size())
 
 
+@torch.library.custom_op("spyre::batchnormfwd", mutates_args=(), device_types="spyre")
+def batchnormfwd(
+    input: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+) -> torch.Tensor:
+    """Per-channel affine ``input * scale + shift`` over channel dim 1.
+
+    ``scale`` and ``shift`` are 1-D tensors of length ``input.size(1)``.
+    """
+    return torch.compile(torch.ops.spyre.batchnormfwd)(input, scale, shift)
+
+
+@batchnormfwd.register_fake
+def _(input: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor):
+    return input.new_empty(input.size())
+
+
 @torch.library.custom_op("spyre::clamp", mutates_args=(), device_types="spyre")
 def clamp(
     input: torch.Tensor,
