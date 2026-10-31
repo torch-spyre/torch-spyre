@@ -161,17 +161,6 @@ def same_device_size(t1: torch.dtype, t2: torch.dtype) -> bool:
     return get_elem_in_stick(t1) == get_elem_in_stick(t2)
 
 
-def _stick_in_extent(in_layout, stl):
-    target = concretize_expr(stl.stride_map[-1])
-    sizes = [int(concretize_expr(s)) for s in in_layout.size]
-    strides = [concretize_expr(s) for s in in_layout.stride]
-    # Size-1 dims share strides with their neighbours and are ambiguous; skip them.
-    cands = [
-        i for i, (st, n) in enumerate(zip(strides, sizes)) if st == target and n != 1
-    ]
-    return sizes[cands[-1]] if cands else None
-
-
 def _compact_broadcast_device_dims(stl: SpyreTensorLayout) -> SpyreTensorLayout:
     """Remove physical extent from logical stride-zero dimensions.
 
@@ -858,45 +847,6 @@ def _single_arg_op_layout(
             return _convert_layout(
                 stl, dep, in_layout, output, output_dep, fmt, input_ea
             )
-
-        case spyreop.shuffle.default:
-            # Read dst_ea from the stashed attribute on the buffer data
-            # (set by lower_spyre_shuffle).
-            dst_ea_int = getattr(op, "shuffle_ea", None)
-
-            if dst_ea_int is None:
-                raise Unsupported("shuffle: missing shuffle_ea on buffer")
-
-            # Convert int back to ElementArrangement enum. The pybind enum has no
-            # int constructor (mypy: call-arg), so look the member up by value.
-            ea_by_value = {
-                int(member.value): member
-                for member in ElementArrangement.__members__.values()
-            }
-            try:
-                dst_ea = ea_by_value[int(dst_ea_int)]
-            except (KeyError, TypeError, ValueError):
-                raise Unsupported(
-                    f"shuffle: invalid EA value {dst_ea_int!r} "
-                    f"({type(dst_ea_int).__name__})"
-                )
-
-            if stl.element_arrangement == ElementArrangement.DL16_TO_FP32:
-                ext = _stick_in_extent(in_layout, stl)
-                pair_columns = 2 * 32  # 2 sticks x 32 fp32 elements
-                if ext is not None and ext < pair_columns:
-                    return []
-
-            # Preserve the full device geometry (device_size, stride_map) and
-            # only change the element_arrangement tag.
-            out_stl = SpyreTensorLayout(
-                stl.device_size,
-                stl.stride_map,
-                stl.device_dtype,
-                dst_ea,
-            )
-            op.restick_cost_fn = AnyInNode.from_args()
-            return [out_stl]
 
         case spyreop.qfp8ch.default:
             # fp16 (64 elems/stick) -> fp8 (128 elems/stick) quantization.
@@ -2413,24 +2363,6 @@ def compute_layouts(
         # input stick — equivalent to a restickify. No restickify before it is needed,
         # unless there is an offset in the stick dimension.
         return _clone_layout(op, output, output_dep, args)
-
-    if aten_op == spyreop.shuffle.default or any(
-        origin.target == spyreop.shuffle.default for origin in data.origins
-    ):
-        layouts = []
-        for stl in args[0].layouts:
-            result = _single_arg_op_layout(
-                op, output, output_dep, args[0].dep, args[0].layout, stl
-            )
-            layouts.extend(result)
-        if not layouts:
-            raise Unsupported(
-                f"{op.get_name()} ({aten_op}): no supported output layout found for "
-                f"any of {len(args[0].layouts)} candidate input layouts; "
-                f"output size={output.size}"
-            )
-        op.restick_cost_fn = AnyInNode.from_args()
-        return layouts
 
     # All other single arg ops
     layouts = []

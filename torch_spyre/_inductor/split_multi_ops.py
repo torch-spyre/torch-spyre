@@ -738,7 +738,12 @@ def _get_op_name(op) -> str:
 def _insert_shuffle_op(
     graph: GraphLowering, op, stg_name: str, stg_buf, target_ea: ElementArrangement
 ) -> ComputedBuffer | None:
-    """Create and insert a torch.ops.spyre.shuffle op."""
+    """Insert an identity copy of ``stg_buf`` that re-arranges it to ``target_ea``.
+
+    The copy is lowered as a plain ``aten.clone``; its output layout (the same
+    device geometry with ``target_ea``) is set explicitly below, and codegen
+    emits a ``shuffle`` because the input and output element arrangements differ.
+    """
 
     # Find the origin FX node from the operation
     orig_node = origin_in_graph(op.data.origins, graph.graph)
@@ -769,12 +774,12 @@ def _insert_shuffle_op(
         )
         return None
 
-    shuffle_op = torch.ops.spyre.shuffle.default
+    shuffle_op = torch.ops.aten.clone.default
     with graph.graph.inserting_before(orig_node):
         shuffle_node = graph.graph.create_node(
             "call_function",
             shuffle_op,
-            (stg_fx_node, target_ea.value),
+            (stg_fx_node,),
             {},
         )
 

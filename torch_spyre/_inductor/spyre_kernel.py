@@ -1408,8 +1408,6 @@ class SpyreKernel(Kernel[CSEVariable]):
                 args[-2].element_arrangement != args[-1].element_arrangement
                 and not indirect_syms_used
             ):
-                # A copy whose two sides arrange the elements of a stick
-                # differently (spyre.shuffle) is a `shuffle`, not a plain identity.
                 op = SHUFFLE_OP
             else:
                 op = IDENTITY_OP

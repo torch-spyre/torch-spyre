@@ -358,21 +358,11 @@ def _layout_info_for_tensor(sdsc_spec, tensor, tensor_idx: int) -> dict:
 def _shuffle_stick_levels(
     size: int, elems_per_stick: int, ea: ElementArrangement
 ) -> list[tuple[int, int]]:
-    """Element-arrangement levels (cardinality, alpha) of a `shuffle` stick dim.
+    """Element arrangement shuffle: compute nested levels for stick dimension
 
-    Levels are listed innermost first (``elem_arr_0`` first); alpha is how far
-    the coordinate advances per step of that level. Levels of cardinality 1
-    carry no arrangement and are dropped (the innermost level is always kept),
-    so a single-stick STANDARD dim is just ``[(elems_per_stick, 1)]``.
-
-    The staggered patterns are the ones deeptools exercises in
-    ``dxp/test/elem_arrangement``:
-
-    * 16-bit tensor (64 elements per stick), staggered inside the stick:
-      ``[4/a1, 2/a32, 8/a4]`` then one level of ``a64`` per stick.
-    * FP32 tensor (32 elements per stick), staggered over a stick pair that
-      holds 64 columns: ``[4/a1, 8/a8 // 2/a4]`` then one level of ``a64`` per
-      pair.
+    Returns a list of levels (dimension size and step multiplier) based on
+    the element arrangement and elements per stick, filtering out trivial
+    levels of size 1.
     """
     if ea not in STAGGERED_EAS:
         levels = [(elems_per_stick, 1), (-(-size // elems_per_stick), elems_per_stick)]
@@ -390,7 +380,7 @@ def _shuffle_stick_levels(
         levels = [(4, 1), (8, 8), (2, 4), (sticks // 2, 64)]
     else:
         raise Unsupported(
-            f"shuffle to/from {ea.name} is not defined for {elems_per_stick} "
+            f"shuffle: {ea.name} is not defined for {elems_per_stick} "
             f"elements per stick"
         )
     return [lvl for i, lvl in enumerate(levels) if i == 0 or lvl[0] != 1]
@@ -1321,8 +1311,7 @@ def generate_sdsc(
             result[f"[{c}, 0, 0]"] = str(local_symbols[key])
         return result
 
-    # `shuffle` is also the opfunc of restickify; only a shuffle with a staggered
-    # side re-arranges the elements of a stick.
+    # `shuffle` with staggered tensors re-arranges the elements to standard.
     is_ea_shuffle = sdsc_spec.opfunc == "shuffle" and any(
         a.element_arrangement in STAGGERED_EAS for a in sdsc_spec.args
     )

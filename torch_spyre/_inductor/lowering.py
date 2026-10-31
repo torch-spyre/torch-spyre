@@ -1590,33 +1590,6 @@ def lower_spyre_to_dtype_d2d(src, dtype, src_off):
     return to_dtype(src, dtype)
 
 
-@register_spyre_lowering(torch.ops.spyre.shuffle, type_promotion_kind=None)
-def lower_spyre_shuffle(src, ea):
-    # shuffle changes the element arrangement of a tensor in-place on the
-    # device without altering its dtype or logical shape. Create a Pointwise
-    # that is an identity copy of src — same dtype and shape — but materialises
-    # as a distinct ComputedBuffer. The origin_node keeps the FX-level
-    # spyre.shuffle node alive in data.origins so propagate_layouts can
-    # identify it and read ea from the node's args.
-    # Dynamo can hand a int read off an object attribute (e.g. ``ea.value``) over
-    # as a symbolic int; the target EA must be a concrete value here.
-    ea = V.graph.sizevars.guard_int(ea)
-    src.realize()
-    loader = src.make_loader()
-    pw = Pointwise.create(
-        device=src.get_device(),
-        dtype=src.get_dtype(),
-        inner_fn=lambda index: loader(index),
-        ranges=list(src.get_size()),
-        origin_node=V.get_current_node(),
-    )
-    # Stash ea on the realized buffer so propagate_layouts can
-    # read it back without having to search the FX node args at that stage.
-    pw.realize()
-    pw.data.data.shuffle_ea = ea
-    return pw
-
-
 def _build_mutation_lowering(src, dst):
     # Builds an explicit MutationLayoutSHOULDREMOVE buffer so the mutation into dst
     # survives regardless of what the scheduler would otherwise decide.

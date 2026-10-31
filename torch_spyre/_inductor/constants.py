@@ -71,8 +71,8 @@ STAGGERED_EAS = frozenset(
     }
 )
 
-# SUPPORTED_EAS can be a separate a list of all non-STANDARD EAs that can be
-# used with the new torch.ops.spyre.shuffle but now it is same as STAGGERED_EAS
+# SUPPORTED_EAS can be a separate list of all non-STANDARD EAs that split_multi_ops
+# can shuffle back to STANDARD, but for now it is the same as STAGGERED_EAS
 SUPPORTED_EAS = STAGGERED_EAS
 
 

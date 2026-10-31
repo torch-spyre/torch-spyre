@@ -376,40 +376,6 @@ def _(src: torch.Tensor, dtype: torch.dtype, src_off: int) -> torch.Tensor:
     return torch.empty_like(src, dtype=dtype)
 
 
-# `shuffle`: moves elements within sticks to change the ElementArrangement of a
-# tensor without changing its dtype or logical shape.
-#
-# The four cases:
-#   1. fp32 DL16_TO_FP32  → fp32 STANDARD  : undo upcast stagger (2B source)
-#   2. fp16 FP32_TO_DL16  → fp16 STANDARD  : undo downcast stagger (4B source)
-#   3. fp32 STANDARD      → fp32 FP32_TO_DL16 : apply downcast stagger
-#   4. fp16 STANDARD      → fp16 DL16_TO_FP32 : apply upcast stagger
-#
-# ``ea`` is the integer value of the target ElementArrangement.
-@torch.library.custom_op("spyre::shuffle", mutates_args=(), device_types="spyre")
-@compile_once("spyre.shuffle", dynamic=False)
-def shuffle(src: torch.Tensor, ea: int, compiled) -> torch.Tensor:
-    """Run an eager shuffle as a compiled Spyre op.
-
-    specialize_int=True bakes ``ea`` into the trace: the lowering stashes it as a
-    constant, so a symbolic ``ea`` reused for another value would shuffle to the
-    wrong arrangement.
-    """
-    with torch._dynamo.config.patch(specialize_int=True):
-        return compiled(src, ea)
-
-
-@shuffle.register_fake
-def _(src: torch.Tensor, ea: int) -> torch.Tensor:
-    return src.new_empty(src.size())
-
-
-@torch.library.register_kernel("spyre::shuffle", ["cpu"])
-def shuffle_cpu(src: torch.Tensor, ea: int) -> torch.Tensor:
-    # On CPU element arrangement is a no-op: return a copy with the same data.
-    return src.clone()
-
-
 # Copy src into dst, guaranteed to survive both Inductor's remove_noop_ops
 # pass (unlike aten.copy_, this op is not in noop_registry) and
 # AOTAutograd's dead-code elimination when dst is never read again in the
