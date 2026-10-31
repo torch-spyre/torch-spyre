@@ -1058,6 +1058,23 @@ def _build_fp32_proxy_cpu_refs(
     return kwargs
 
 
+def _linear_of_kn(x, y):
+    """``F.linear`` with the weight given as ``[K, N]``, as a matmul's ``y``."""
+    return F.linear(x, y.transpose(-1, -2).contiguous())
+
+
+def _upcast_matmul(x, y):
+    return x.float() @ y.float()
+
+
+def _mm_fp32_out(x, y):
+    return torch.mm(x, y, out_dtype=torch.float32)
+
+
+def _bmm_fp32_out(x, y):
+    return torch.bmm(x, y, out_dtype=torch.float32)
+
+
 class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     torch.manual_seed(0xAFFE)  # seeds cached_randn/cached_xavier calls in PARAMS below
 
@@ -1644,6 +1661,43 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ],
                 rand_type="xavier",
             ),
+        },
+        ("test_mm_fp32", "test_mm_fp32_cpu"): {
+            # (op, operand dtype, x shape, y shape)
+            "param_sets": {
+                "mm_aligned": (torch.mm, torch.float32, (64, 128), (128, 96)),
+                "mm_unaligned": (torch.mm, torch.float32, (67, 255), (255, 99)),
+                "mm_k1": (torch.mm, torch.float32, (99, 1), (1, 55)),
+                "bmm_unaligned": (
+                    torch.bmm,
+                    torch.float32,
+                    (2, 99, 65),
+                    (2, 65, 55),
+                ),
+                "matmul_3d_2d": (
+                    torch.matmul,
+                    torch.float32,
+                    (2, 64, 128),
+                    (128, 96),
+                ),
+                "linear": (_linear_of_kn, torch.float32, (64, 2048), (2048, 256)),
+                # A 512 MiB [M, N, K] product, computed in eight 64 MiB M tiles.
+                "mm_tiled": (torch.mm, torch.float32, (512, 512), (512, 512)),
+                "upcast_mm": (_upcast_matmul, torch.float16, (64, 2048), (2048, 256)),
+                "upcast_bmm_unaligned": (
+                    _upcast_matmul,
+                    torch.float16,
+                    (4, 64, 128),
+                    (4, 128, 96),
+                ),
+                "mm_out_dtype": (_mm_fp32_out, torch.float16, (64, 2048), (2048, 256)),
+                "bmm_out_dtype_unaligned": (
+                    _bmm_fp32_out,
+                    torch.float16,
+                    (4, 64, 128),
+                    (4, 128, 96),
+                ),
+            },
         },
         ("test_matmul_noncontiguous", "test_mm_relaxed"): {
             "ops_dict": {"matmul": torch.matmul},
@@ -9918,6 +9972,24 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             kwargs.update(_build_fp32_proxy_cpu_refs(op, a, b))
 
         self.compare_with_cpu(op, a, b, **kwargs)
+
+    def test_mm_fp32_cpu(self, op, dtype, x_shape, y_shape):
+        x = cached_randn(x_shape, dtype=dtype, scale=0.1)
+        y = cached_randn(y_shape, differentiation=1, dtype=dtype, scale=0.1)
+        # fp32 accumulation, so compare with an fp32 matmul of the values the
+        # device holds: an fp16 operand is stored as DLFloat16 on the device.
+        x_held, y_held = (t.to(utils_inductor.DEVICE).cpu().float() for t in (x, y))
+        torch._dynamo.reset()
+        device_x, device_y = x.to(utils_inductor.DEVICE), y.to(utils_inductor.DEVICE)
+        out, code = run_and_get_code(
+            torch.compile(op, dynamic=False), device_x, device_y
+        )
+        *batch, m, k = x_shape
+        product_bytes = math.prod(batch) * m * y_shape[-1] * k * 4
+        tiled = k > 1 and product_bytes > inductor_config.fp32_matmul_product_bytes
+        self.assertEqual("LoopSpec(" in "\n".join(code), tiled)
+        self.assertEqual(out.dtype, torch.float32)
+        torch.testing.assert_close(out.cpu(), x_held @ y_held, atol=1e-5, rtol=1e-5)
 
     def test_mm_autocast_cpu(self, enabled, a, b):
         def fn(a, b):
