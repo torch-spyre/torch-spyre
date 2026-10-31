@@ -229,6 +229,22 @@ class TestStrideScaling(unittest.TestCase):
         self.assertIn("100", msg)
         self.assertIn(str(G), msg)
 
+    def test_a_padded_row_never_trips_the_divisibility_check(self):
+        """The check fires on a disagreement, not on an odd-looking layout.
+
+        compute_ops sets a level's stride to the coefficient of the tile index
+        in the tensor's device advance, times the element size. For a symbolic
+        level that is the tile size times the device row stride, and the row
+        stride already carries the stick padding. So a dimension that is not a
+        multiple of a stick (96 fp16 padded to 128, or rows of 3 or 5 sticks)
+        still gives a stride the step divides, for any tile size.
+        """
+        for row_bytes in (128, 256, 384, 640):
+            for tile in (2, 3, 32, 48, 64):
+                with self.subTest(row_bytes=row_bytes, tile=tile):
+                    got = list(_scaled_strides([{"a": tile * row_bytes}], [tile]))
+                    self.assertEqual(got, [(0, row_bytes)])
+
 
 class TestLoopDimensionSymbolKind(unittest.TestCase):
     """The new symbol kind, and the gate it deliberately does not trip."""

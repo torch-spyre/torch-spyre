@@ -246,6 +246,73 @@ class TestItRefusesRatherThanGuesses(_BundleHarness):
         self.assertIn("disagree", str(caught.exception))
 
 
+class TestEveryPassScalesANestedLevelTheSameWay(_BundleHarness):
+    """Concrete and symbolic levels nested both ways, through the emitter.
+
+    _collect_affine_maps registers each map under its scaled stride key and
+    _emit_specs looks it up by the key it builds itself, both through
+    _scaled_strides. If the two scaled differently, the lookup would raise
+    KeyError. The SDSC here carries an HBM base address, so the emitter really
+    issues the affine.apply and does that lookup.
+    """
+
+    OUTER_STRIDE = 1048576
+    INNER_STRIDE = 4096
+
+    @staticmethod
+    def _addressed_entry(per_level_strides):
+        sdsc = {
+            "0_fused_test": {
+                "numCoresUsed_": 1,
+                "dscs_": [
+                    {
+                        "op": {
+                            "dimToSymbolMapping_": {},
+                            "scheduleTree_": [
+                                {
+                                    "component_": "hbm",
+                                    "startAddressCoreCorelet_": {
+                                        "data_": {"[0, 0, 0]": "-1"}
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ],
+            }
+        }
+        return (sdsc, [0], [per_level_strides], [SymbolKind.kernel(0)])
+
+    def test_a_symbolic_level_inside_a_concrete_one(self):
+        inner = self._symbolic_loop(body=[_op_spec()])
+        outer = LoopSpec(count=sympy.Integer(4), body=[inner])
+        entry = self._addressed_entry(
+            [{sympy.Symbol("a"): self.OUTER_STRIDE}, {_sym(): TILE_STRIDE}]
+        )
+
+        bundle, _kinds = self._run([outer], [entry])
+
+        # The concrete level keeps its stride, the symbolic one is divided.
+        self.assertIn(
+            f"(s0 + {self.OUTER_STRIDE}*d0 + {ROW_STRIDE}*d1)", bundle, bundle
+        )
+        self.assertIn("affine.apply #map_0(%i_0, %i_1)", bundle)
+
+    def test_a_concrete_level_inside_a_symbolic_one(self):
+        inner = LoopSpec(count=sympy.Integer(2), body=[_op_spec()])
+        outer = self._symbolic_loop(body=[inner])
+        entry = self._addressed_entry(
+            [{_sym(): TILE_STRIDE}, {sympy.Symbol("b"): self.INNER_STRIDE}]
+        )
+
+        bundle, _kinds = self._run([outer], [entry])
+
+        self.assertIn(
+            f"(s0 + {ROW_STRIDE}*d0 + {self.INNER_STRIDE}*d1)", bundle, bundle
+        )
+        self.assertIn("affine.apply #map_0(%i_0, %i_1)", bundle)
+
+
 class TestOneParameterServesEveryLoopOnThatDimension(_BundleHarness):
     def test_two_loops_sharing_a_dimension_share_one_parameter(self):
         """The same shape variable reaches every loop that tiles on it."""
