@@ -1526,6 +1526,49 @@ class TestSpliceWhileLoops(unittest.TestCase):
                 ):
                     lowering.splice_while_loops(graph)
 
+    def test_a_symint_operand_the_body_reads_splices(self):
+        # The SymInt operand drops out of while_op.inputs, so the bridge rebuilds
+        # the operand list. The body names the same symbol as the parent, so
+        # the spliced body stays bound and no WhileLoop is left behind.
+        from torch._inductor import ir
+
+        from torch_spyre._inductor.wsr import for_each_tile_lowering as lowering
+
+        x = torch.randn(128, 64)
+        torch._dynamo.mark_dynamic(x, 0)
+        graph = self._run_graph(_length_scaled_fn, (x,))
+        (loop,) = [op for op in graph.operations if isinstance(op, ir.WhileLoop)]
+        self.assertLess(
+            len(loop.inputs), len(loop.body_subgraph.graph.graph_inputs), loop.inputs
+        )
+
+        with V.set_graph_handler(graph):
+            lowering.splice_while_loops(graph)
+
+        self.assertFalse(any(isinstance(op, ir.WhileLoop) for op in graph.operations))
+
+    def test_a_symint_operand_the_body_names_differently_is_refused(self):
+        # If the body's placeholder were a symbol other than the operand's own,
+        # the spliced reads would name a symbol the parent never binds. Refuse
+        # that at the splice instead of failing later on a missing symbol.
+        import sympy
+        from torch._inductor import ir
+
+        from torch_spyre._inductor.errors import Unsupported
+        from torch_spyre._inductor.wsr import for_each_tile_lowering as lowering
+
+        x = torch.randn(128, 64)
+        torch._dynamo.mark_dynamic(x, 0)
+        graph = self._run_graph(_length_scaled_fn, (x,))
+        (loop,) = [op for op in graph.operations if isinstance(op, ir.WhileLoop)]
+        body_inputs = loop.body_subgraph.graph.graph_inputs
+        (name,) = [k for k, v in body_inputs.items() if isinstance(v, sympy.Expr)]
+        body_inputs[name] = sympy.Symbol("s_unbound", integer=True, positive=True)
+
+        with V.set_graph_handler(graph):
+            with self.assertRaisesRegex(Unsupported, "does not bind"):
+                lowering.splice_while_loops(graph)
+
     def test_every_nested_level_is_checked(self):
         # Break only the INNER loop's step: the outer loop splices fine, then the
         # inner loop is found and must still be refused.
