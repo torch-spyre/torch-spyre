@@ -401,20 +401,6 @@ def compute_granularity(expr: Expr, max_size: int) -> int:
     max_buckets = config.max_buckets
     min_default_g = config.min_default_granularity
 
-    # When ShapeEnv has no finite upper bound, max_size came from
-    # optimization_hint (via compute_max_size below, merged in #2003), not from
-    # mark_dynamic(max=...). The granularity is then only as trustworthy
-    # as that hint -- warn the user so they can pin it explicitly with
-    # mark_dynamic(max=...).
-    if finite_upper_or_none(expr) is None:
-        warnings.warn(
-            f"max for symbolic dim {expr} came from optimization_hint, not from "
-            f"mark_dynamic(max=...). Proceeding with max={max_size} as a "
-            f"best-effort estimate. Set max explicitly via mark_dynamic to "
-            f"lock the bucket structure.",
-            stacklevel=2,
-        )
-
     user_min = _user_min_or_none(expr)
     if user_min is not None:
         if max_size % user_min != 0:
@@ -457,7 +443,7 @@ def compute_granularity(expr: Expr, max_size: int) -> int:
 def concretize_index(index: sympy.Expr, loop_vars: set) -> sympy.Expr:
     """Replace non-loop symbolic variables in an index expression with concrete values.
 
-    With ``dynamic=True``, the host index may contain symbolic strides. When
+    With automatic dynamic shapes, the host index may contain symbolic strides. When
     ``normalize_coordinates`` isolates each loop variable's contribution
     by substituting 0 for all other free symbols, the size symbol ``s1``
     is also zeroed.  This function replaces size symbols with their concrete
@@ -514,11 +500,14 @@ def concretize_index(index: sympy.Expr, loop_vars: set) -> sympy.Expr:
 def compute_max_size(expr: Union[Expr, int]) -> int:
     """Return the maximum value a symbolic size expression can take.
 
-    Uses the ShapeEnv upper bound when one is recorded (i.e. the symbol was
-    created with an explicit ``max=`` constraint using mark_dynamic API). Falls
-    back to ``optimization_hint`` when no finite upper bound exists.
+    Uses the ShapeEnv upper bound recorded for the symbol (i.e. the symbol was
+    created with an explicit ``max=`` constraint using mark_dynamic API).
 
-    Needed for dynamic shape support.
+    Callers skip symbols without a finite upper bound before calling this
+    (see ``finite_upper_or_none``), so there is no fallback for them.
+
+    Raises:
+        Unsupported: ``expr`` is symbolic with no finite upper bound.
     """
     if isinstance(expr, int):
         return expr
@@ -527,13 +516,12 @@ def compute_max_size(expr: Union[Expr, int]) -> int:
     if not (hasattr(expr, "free_symbols") and expr.free_symbols):
         return int(expr)
     bound = finite_upper_or_none(expr)
-    if bound is not None:
-        return bound
-    # No finite ShapeEnv bound: fall back to the permissive hint. size_hint was
-    # removed in PT 2.12; optimization_hint is its replacement and keeps the
-    # intended "best-effort max estimate" semantics (a heuristic/fallback for
-    # unbacked symbols) rather than raising.
-    return V.graph.sizevars.optimization_hint(expr)
+    if bound is None:
+        raise Unsupported(
+            f"symbolic size {expr} has no declared maximum; "
+            f"set it with mark_dynamic(max=...)"
+        )
+    return bound
 
 
 def compute_symbolic_bounds(expr: Union[Expr, int]) -> "tuple[int, int] | None":
