@@ -162,6 +162,48 @@ class TestTheProducer(unittest.TestCase):
         self.assertIn("no finite upper bound", warned.call_args[0][0])
 
 
+class TestEveryLoopLevelIsBuiltInOnePlace(unittest.TestCase):
+    """The outermost loop and each nested level both get their bounds.
+
+    They are built at two sites, SpyreKernel.wrap_op_specs_in_loop for the
+    outermost and the scheduler's _codegen_loop_body for each nested level. Both
+    go through SpyreKernel.counted_loop, so the bounds are resolved in one place.
+    """
+
+    def test_the_outermost_loop_carries_its_bounds(self):
+        from torch_spyre._inductor.spyre_kernel import SpyreKernel
+
+        kernel = SimpleNamespace(
+            op_specs=["body-op"], counted_loop=SpyreKernel.counted_loop
+        )
+        with V.set_graph_handler(_graph_with_upper(sympy.Integer(MAX))):
+            SpyreKernel.wrap_op_specs_in_loop(kernel, FloorDiv(_sym(), TILE))
+
+        (loop,) = kernel.op_specs
+        self.assertEqual(loop.body, ["body-op"])
+        self.assertEqual(loop.count_symbol_bounds, {SYM: (MAX, TILE)})
+
+    def test_a_nested_level_carries_its_bounds(self):
+        from torch_spyre._inductor.scheduler import SuperDSCScheduling
+
+        kernel = SimpleNamespace(op_specs=["outer-op"])
+
+        def codegen_into_kernel(_nodes, k):
+            k.op_specs.append("inner-op")
+
+        scheduling = SimpleNamespace(
+            _live_nodes=lambda node: [], _codegen_into_kernel=codegen_into_kernel
+        )
+        node = SimpleNamespace(loop_count=FloorDiv(_sym(), TILE))
+        with V.set_graph_handler(_graph_with_upper(sympy.Integer(MAX))):
+            SuperDSCScheduling._codegen_loop_body(scheduling, node, kernel)
+
+        outer_op, loop = kernel.op_specs
+        self.assertEqual(outer_op, "outer-op")
+        self.assertEqual(loop.body, ["inner-op"])
+        self.assertEqual(loop.count_symbol_bounds, {SYM: (MAX, TILE)})
+
+
 class TestPlacingASymbolOnALaunchArgument(unittest.TestCase):
     """Which argument and dim the runtime reads the dimension from."""
 

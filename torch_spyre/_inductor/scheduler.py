@@ -36,7 +36,7 @@ from torch.utils._ordered_set import OrderedSet
 
 from .spyre_kernel import SpyreKernel
 from .ir import FixedTiledLayout
-from .pass_utils import iteration_space, symbolic_count_bounds
+from .pass_utils import iteration_space
 from .logging_utils import get_inductor_logger
 from .loop_facts import scheduler_enclosing_loops
 from .scratchpad.lx_relayout import (
@@ -44,7 +44,6 @@ from .scratchpad.lx_relayout import (
     local_lx_emission_contract,
     materialized_lx_relayout_for_destination,
 )
-from .op_spec import LoopSpec
 from . import config as _spyre_config
 from .errors import Unsupported
 
@@ -634,13 +633,7 @@ class SuperDSCScheduling(BaseScheduling):
         # Wrap only the newly-added op_specs entries in this inner LoopSpec.
         body = kernel.op_specs[body_start:]
         kernel.op_specs = kernel.op_specs[:body_start]
-        kernel.op_specs.append(
-            LoopSpec(
-                count=node.loop_count,
-                body=body,
-                count_symbol_bounds=symbolic_count_bounds(node.loop_count),
-            )
-        )
+        kernel.op_specs.append(SpyreKernel.counted_loop(node.loop_count, body))
 
     def _codegen_into_kernel(
         self, nodes: list[BaseSchedulerNode], kernel: SpyreKernel

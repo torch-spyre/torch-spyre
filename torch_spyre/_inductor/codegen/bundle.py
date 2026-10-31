@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 import json
 import logging
 import os
@@ -19,8 +20,6 @@ from collections.abc import Callable, Sequence
 from typing import Any
 
 import sympy
-
-import dataclasses
 
 from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.pass_utils import decompose_tiled_count

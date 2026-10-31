@@ -1499,19 +1499,23 @@ class SpyreKernel(Kernel[CSEVariable]):
             self.op_specs.append(self.create_op_spec(value.op, True, args, op_info))
 
     def wrap_op_specs_in_loop(self, count: sympy.Expr) -> None:
-        """Replace the current op_specs list with a single LoopSpec of the given count.
+        """Replace the current op_specs list with a single LoopSpec of the given count."""
+        self.op_specs = [self.counted_loop(count, self.op_specs)]
 
-        The count's per-symbol bounds are resolved here rather than at codegen
-        because this is the last point the ShapeEnv is available.
+    @staticmethod
+    def counted_loop(count: sympy.Expr, body: list) -> LoopSpec:
+        """The one place a LoopSpec is built from a trip count.
+
+        The outermost loop (wrap_op_specs_in_loop) and every nested level (the
+        scheduler's _codegen_loop_body) both come through here, so each level's
+        per-symbol bounds are resolved exactly once, and at codegen time, the
+        last point the ShapeEnv is available.
         """
-        body = self.op_specs
-        self.op_specs = [
-            LoopSpec(
-                count=count,
-                body=body,
-                count_symbol_bounds=symbolic_count_bounds(count),
-            )
-        ]
+        return LoopSpec(
+            count=count,
+            body=body,
+            count_symbol_bounds=symbolic_count_bounds(count),
+        )
 
     def check_op_specs(self) -> None:
         """Validate and log the finished operation sequence after loop wrapping."""
@@ -1534,9 +1538,10 @@ class SpyreKernel(Kernel[CSEVariable]):
         """
         node = getattr(V.graph, "graph_inputs", {}).get(name)
         if node is None:
-            try:
-                node = V.graph.get_buffer(name)
-            except Exception:  # noqa: BLE001 - may not name a buffer at all
+            # The name may not be a buffer at all. try_get_buffer says so with
+            # None, where get_buffer raises.
+            node = V.graph.try_get_buffer(name)
+            if node is None:
                 return None
         try:
             return list(node.get_size())
@@ -1785,6 +1790,12 @@ def _place_symbol(sym_name: str, actuals: list[str], sizes: dict) -> "tuple | No
     and either position binds the same value, so the first is as good as any.
     ``actuals`` order is what ``arg_index`` means, so it is iterated rather than
     the dict.
+
+    Only an extent that IS the symbol matches. An argument whose dimension is a
+    derived expression such as ``2*s0`` carries the size, but the runtime reads
+    one dimension as is and cannot divide it back, so it is not a place to read
+    ``s0`` from. With no exact match this returns None and bundle generation
+    refuses the symbol, which is the safe failure.
     """
     for arg_index, name in enumerate(actuals):
         for dim_index, extent in enumerate(sizes.get(name) or ()):
