@@ -1,4 +1,4 @@
-# Copyright 2025 The Torch-Spyre Authors.
+# Copyright 2026 The Torch-Spyre Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -145,7 +145,18 @@ def get_kernel_registry() -> _KernelHashRegistry:
     return _registry
 
 
-@lru_cache(maxsize=1)
+# Module-level state for _get_backend_compiler_version():
+#   _backend_compiler_version_cache - stores the result string after a successful read
+#                          so the components file is opened at most once.
+#   _lib_version_warning_emitted :  suppresses repeated "LIB_VERSION_FILE not
+#                          set" warnings when caching is enabled but the env
+#                          var is absent (e.g. in test / dev environments).
+
+# _dxp_version_cache: Optional[str] = None
+_backend_compiler_version_cache: Optional[str] = None
+_lib_version_warning_emitted: bool = False
+
+
 def _get_backend_compiler_version() -> str:
     """Return a combined deeptools+flex version string from the Spyre components file.
 
@@ -156,11 +167,29 @@ def _get_backend_compiler_version() -> str:
 
     Raises ``RuntimeError`` if ``LIB_VERSION_FILE`` is unset, the file is
     missing, or either the ``ibm-deeptools`` or ``flex`` entry cannot be
-    found  callers must disable caching rather than risk stale cache hits
+    found - callers must disable caching rather than risk stale cache hits
     with an unknown compiler version.
+
+    Successful reads are memoised in ``_dxp_version_cache`` so the file is
+    opened at most once per process.  Failures are NOT memoised: the caller's
+    ``except RuntimeError`` handles each call individually, and
+    ``_lib_version_warning_emitted`` ensures the user sees the warning only
+    once per process regardless of how many kernels trigger the fallback.
     """
+    global _backend_compiler_version_cache, _lib_version_warning_emitted  # noqa: PLW0603
+
+    if _backend_compiler_version_cache is not None:
+        return _backend_compiler_version_cache
+
     components_file = os.environ.get("LIB_VERSION_FILE")
     if not components_file:
+        if not _lib_version_warning_emitted:
+            _lib_version_warning_emitted = True
+            logger.warning(
+                "LIB_VERSION_FILE is not set; kernel cache will be disabled "
+                "for all kernels. Set SPYRE_KERNEL_CACHE=0 to suppress this "
+                "warning, or set LIB_VERSION_FILE to enable caching."
+            )
         raise RuntimeError(
             "LIB_VERSION_FILE is not set; cannot determine compiler version "
             "for cache key. Set SPYRE_KERNEL_CACHE=0 to run without caching."
@@ -192,7 +221,10 @@ def _get_backend_compiler_version() -> str:
                 "cannot determine compiler version for cache key. "
                 "Set SPYRE_KERNEL_CACHE=0 to run without caching."
             )
-    return f"deeptools={versions['ibm-deeptools']};flex={versions['ibm-flex']}"
+    _backend_compiler_version_cache = (
+        f"deeptools={versions['ibm-deeptools']};flex={versions['ibm-flex']}"
+    )
+    return _backend_compiler_version_cache
 
 
 @lru_cache(maxsize=1)
@@ -275,6 +307,12 @@ def compute_specs_hash(
     specs_list = list(specs)
 
     content_parts: list[bytes] = []
+    # Always include use_symbols as an explicit discriminator so that two
+    # compilations of the same specs under different BUNDLE_SYMBOLIC_ARGS
+    # settings never collide, even when the symbol-kind tag list is empty
+    # (e.g. a pure pointwise op with no pool/slice/derived symbols).
+    content_parts.append(f"use_symbols:{int(use_symbols)}".encode())
+
     symbols: list[int] = []
     symbol_id_offset = 0
     sdsc_idx = 0
@@ -347,12 +385,20 @@ def compute_specs_hash(
                 # IDs in sdsc_N.json, so they must be hashed separately to
                 # distinguish graphs that differ only in their offsets.
                 if use_symbols:
-                    for sk in local_symbol_kinds:
+                    for sk, sym_key in zip(
+                        local_symbol_kinds, local_sym_values
+                    ):  # in local_symbol_kinds:
                         if sk.kind == "pool":
-                            tag = f"pool:{sk.offset}"
+                            # tag = f"pool:{sk.offset}"
+                            tag = f"pool:{sym_key[1]}"
                             content_parts.append(tag.encode())
                             _debug_pool_offsets.append(tag)
-                            logger.debug("  [hash]   pool offset=%d", sk.offset)
+                            logger.debug("  [hash]   pool offset=%d", sym_key[1])
+                        elif sk.kind == "kernel":
+                            tag = f"kernel:arg{sk.arg_index}"
+                            content_parts.append(tag.encode())
+                            _debug_pool_offsets.append(tag)
+                            logger.debug("  [hash]   kernel arg%d", sk.arg_index)
                         elif sk.kind == "kernel_slice":
                             tag = f"slice:arg{sk.arg_index}:{sk.offset}"
                             content_parts.append(tag.encode())
@@ -551,21 +597,21 @@ def allocate_compile_dir(cache_key: str, *, kernel_name: str = "") -> str:
 
 def commit_compile_dir(tmp_dir: str, cache_key: str) -> str:
     """Atomically promote tmp_dir to <cache_root>/<cache_key>/.
+    Uses ``os.rename`` as the sole synchronisation point — it is atomic on
+    POSIX when source and destination are on the same filesystem (guaranteed
+    by ``allocate_compile_dir`` placing tmp_dir inside the cache root).
+
+    If another process committed the same key concurrently, ``os.rename``
+    raises ``OSError`` (ENOTEMPTY / EEXIST on Linux).  We discard our copy
+    and return the winner's directory.  A pre-check with ``os.path.isdir``
+    would introduce a TOCTOU race window without adding any safety, so it
+    is intentionally absent.
 
     If another process already committed the same key, discards the temp dir
     and reuses the existing entry. Returns the final cache dir.
     """
     cache_root = get_cache_root_dir()
     cached_dir = os.path.join(cache_root, cache_key)
-
-    if os.path.isdir(cached_dir):
-        # Another process/thread won the race — discard our copy, but first
-        # merge our recorded kernel names into the winner's file so no name
-        # is lost.
-        _merge_kernel_names(tmp_dir, cached_dir)
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        logger.info("Cache race resolved: reusing existing entry at %s", cached_dir)
-        return cached_dir
 
     try:
         os.rename(tmp_dir, cached_dir)  # Atomic on POSIX (same filesystem)

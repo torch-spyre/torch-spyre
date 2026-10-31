@@ -461,7 +461,7 @@ _cpsat_warn_on_cost_expr: bool = True
 # To force recompilation (bypass lookup but still save), use the standard
 # PyTorch flag: TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 / set
 # torch._inductor.config.force_disable_caches = True.
-spyre_kernel_cache: bool = os.environ.get("SPYRE_KERNEL_CACHE", "0") == "1"
+spyre_kernel_cache: bool = os.environ.get("SPYRE_KERNEL_CACHE", "1") == "1"
 
 # Enable or disable uniqueness checks for optimal CP-SAT solutions to determine
 # if an optimal solution is fully priced. The check is a second solve with no

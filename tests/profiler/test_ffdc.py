@@ -17,6 +17,7 @@ import os
 import stat
 import tempfile
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -1125,6 +1126,15 @@ class TestFfdcAsyncCompile:
         monkeypatch.setattr(mod, "get_output_dir", lambda name: out_dir)
         monkeypatch.setattr(mod, "generate_bundle", lambda *a, **k: [])
         monkeypatch.setattr(mod, "find_unimplemented", lambda specs: None)
+        # With the kernel cache on, sdsc() compiles into a cache temp dir. Stub the
+        # cache so the compile still lands in out_dir; unused when the cache is off.
+        monkeypatch.setattr(mod, "compute_specs_hash", lambda *a, **k: "fakehash")
+        monkeypatch.setattr(mod, "get_cached_kernel_dir", lambda cache_key: None)
+        monkeypatch.setattr(mod, "allocate_compile_dir", lambda *a, **k: out_dir)
+        monkeypatch.setattr(mod, "save_symbol_kinds", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_move_to_failed_dir", lambda path: None)
+        monkeypatch.setattr(mod, "record_kernel_name", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "get_kernel_registry", lambda: MagicMock())
         return mod, out_dir
 
     def test_sdsc_dxp_failure_triggers_ffdc_collect(self, monkeypatch, tmp_path):
