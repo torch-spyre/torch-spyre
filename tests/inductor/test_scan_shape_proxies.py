@@ -26,12 +26,19 @@ needs a live tracer, so calling it standalone would fail for reasons that have
 nothing to do with the claim. One test uses a real ``SymInt`` to pin the
 accessor the wrapper reads, which is what would catch an upstream rename.
 
+Two tests call upstream's real function, because they are about upstream
+itself: its signature is still the one the wrapper is installed over, and it
+still raises ``KeyError`` on an expression key, which it does before it builds
+any proxy. When upstream fixes the gap the second one fails, and the patch can
+be deleted.
+
 The end-to-end claim, that a symbolic trip count now survives the scan
 decomposition at all, is asserted on device in the trip-count recovery tests.
 It cannot be asserted here: the patch is scoped to a Spyre compile and a CPU
 compile never enters it.
 """
 
+import inspect
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -42,6 +49,8 @@ from torch.utils._sympy.functions import FloorDiv
 
 from symbolic_shape_fixtures import TILE, fake_symbolic_rows  # noqa: E402
 from torch_spyre._inductor.patches import (
+    RESOLVE_SHAPE_ISSUE,
+    RESOLVE_SHAPE_PARAMS,
     _resolve_scan_shapes_by_expression,
     logger as patches_logger,
 )
@@ -171,15 +180,71 @@ class TestThePatchIsScoped(unittest.TestCase):
         )
         try:
             delattr(post_grad, ATTR)
-            with self.assertLogs(patches_logger.name, level="INFO") as captured:
+            with self.assertLogs(patches_logger.name, level="WARNING") as captured:
                 with _resolve_scan_shapes_by_expression():
                     self.assertFalse(hasattr(post_grad, ATTR))
-            self.assertTrue(
-                any(ATTR in line for line in captured.output),
-                f"the no-op path did not say so: {captured.output}",
-            )
         finally:
             setattr(post_grad, ATTR, saved)
+
+        # Assert on the record, not its wording: one warning that carries the
+        # issue link as an argument.
+        (record,) = captured.records
+        self.assertEqual(record.levelname, "WARNING")
+        self.assertIn(RESOLVE_SHAPE_ISSUE, record.args)
+
+
+class TestTheSignatureGuard(unittest.TestCase):
+    def test_a_changed_signature_is_left_alone_and_warned_about(self):
+        def resolve_shape_to_proxy(shape, bound_symbols, extra=None):
+            raise AssertionError("the guard should not wrap or call this")
+
+        with mock.patch.object(post_grad, ATTR, resolve_shape_to_proxy):
+            with self.assertLogs(patches_logger.name, level="WARNING") as captured:
+                with _resolve_scan_shapes_by_expression():
+                    self.assertIs(getattr(post_grad, ATTR), resolve_shape_to_proxy)
+            self.assertIs(getattr(post_grad, ATTR), resolve_shape_to_proxy)
+
+        (record,) = captured.records
+        self.assertEqual(record.levelname, "WARNING")
+        self.assertIn(("shape", "bound_symbols", "extra"), record.args)
+        self.assertIn(RESOLVE_SHAPE_ISSUE, record.args)
+
+    def test_the_expected_signature_is_wrapped_without_a_warning(self):
+        stub, _ = _recording_stub()
+
+        with mock.patch.object(post_grad, ATTR, stub):
+            with self.assertNoLogs(patches_logger.name, level="WARNING"):
+                with _resolve_scan_shapes_by_expression():
+                    self.assertIsNot(getattr(post_grad, ATTR), stub)
+
+
+class TestTheUpstreamGapIsStillThere(unittest.TestCase):
+    """Upstream's real function, so a PyTorch upgrade cannot pass this blind."""
+
+    def test_upstream_still_has_the_signature_the_wrapper_expects(self):
+        self.assertEqual(
+            tuple(inspect.signature(getattr(post_grad, ATTR)).parameters),
+            RESOLVE_SHAPE_PARAMS,
+            f"post_grad.{ATTR} changed its signature, so the patch is no longer "
+            f"installed. Check whether {RESOLVE_SHAPE_ISSUE} is fixed, then "
+            f"update or delete _resolve_scan_shapes_by_expression",
+        )
+
+    def test_upstream_still_misses_an_expression_key(self):
+        shape_env, mode, x = fake_symbolic_rows()
+        with mode:
+            tiles = x.shape[0] // TILE
+        expr = tiles.node.expr
+
+        try:
+            getattr(post_grad, ATTR)([tiles], {expr: SENTINEL})
+        except KeyError:
+            return
+        self.fail(
+            f"upstream {ATTR} now resolves an expression key, so "
+            f"{RESOLVE_SHAPE_ISSUE} looks fixed. Delete "
+            f"_resolve_scan_shapes_by_expression and this test"
+        )
 
 
 if __name__ == "__main__":

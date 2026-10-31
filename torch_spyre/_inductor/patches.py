@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 from contextlib import contextmanager
 from functools import wraps
 
@@ -137,6 +138,13 @@ def _unique_operation_names():
         GraphLowering.register_operation = old_register_operation  # type: ignore[method-assign]
 
 
+# The upstream report for the gap _resolve_scan_shapes_by_expression patches,
+# and the signature the patch was written against.
+# TODO(Vivek1258): file the PyTorch issue for this gap and put its URL here.
+RESOLVE_SHAPE_ISSUE = "upstream PyTorch issue not yet filed"
+RESOLVE_SHAPE_PARAMS = ("shape", "bound_symbols")
+
+
 @contextmanager
 def _resolve_scan_shapes_by_expression():
     """Let upstream rebuild a scan output shape whose extent is an expression.
@@ -153,19 +161,45 @@ def _resolve_scan_shapes_by_expression():
     The proxy for the whole expression is already in the dict as the scan
     length, so matching the expression before upstream's symbol walk is enough.
 
-    An upstream gap, not a Spyre one. Remove it once that is fixed. Everything
-    else takes the original path, one element at a time so upstream keeps its
-    own type checking and error messages.
+    An upstream gap, not a Spyre one, tracked as RESOLVE_SHAPE_ISSUE. Remove it
+    once that is fixed. Everything else takes the original path, one element at
+    a time so upstream keeps its own type checking and error messages.
+
+    The module attribute is the only hook, so the wrapper is in place for the
+    whole Spyre compile and main's map decomposition reaches it too. It answers
+    differently from upstream only where upstream would raise ``KeyError``.
+    Wherever upstream resolves a size, the result is the same value.
+
+    The wrapper is installed only over the signature it was written against.
+    A PyTorch upgrade that changes or removes the function leaves upstream in
+    place and warns, rather than wrapping something it no longer matches.
     """
     from torch._inductor.fx_passes import post_grad as _post_grad
 
     original = getattr(_post_grad, "resolve_shape_to_proxy", None)
     if original is None:
-        # Renamed or removed upstream. Say so once rather than failing here: if
-        # the gap is fixed we want to know, and if it moved we want to look.
-        logger.info(
-            "[symbolic-loop] resolve_shape_to_proxy is absent, so its "
-            "expression-key gap is not patched. Check whether upstream fixed it"
+        logger.warning(
+            "post_grad.resolve_shape_to_proxy is absent, so its expression-key "
+            "gap (%s) is not patched. Upstream may have fixed it or moved it. "
+            "A symbolic trip count may fail in the scan decomposition with "
+            "KeyError until this patch is updated or removed",
+            RESOLVE_SHAPE_ISSUE,
+        )
+        yield
+        return
+    try:
+        params = tuple(inspect.signature(original).parameters)
+    except (TypeError, ValueError):
+        params = None
+    if params != RESOLVE_SHAPE_PARAMS:
+        logger.warning(
+            "post_grad.resolve_shape_to_proxy has parameters %s, the patch for "
+            "its expression-key gap (%s) was written for %s, so it is not "
+            "installed. A symbolic trip count may fail in the scan "
+            "decomposition with KeyError until this patch is updated or removed",
+            params,
+            RESOLVE_SHAPE_ISSUE,
+            RESOLVE_SHAPE_PARAMS,
         )
         yield
         return
