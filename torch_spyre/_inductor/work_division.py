@@ -837,13 +837,20 @@ def collect_tensor_deps(
 def apply_splits(op: ComputedBuffer, splits: dict) -> None:
     """Commit symbol-keyed work division; scheduler transport is finalized later.
 
-    The one gate every work-division pass commits a split through --
-    span_reduction, the default greedy distributor, the cost-model matmul
-    re-pricer, and user hints alike -- so none of them can individually
-    forget to reject a split the scheduler's coefficient-keyed transport
-    cannot carry losslessly (see ``unrepresentable_splits_by_index_coeff``).
-    An op with no ``MemoryDep`` write never goes through that transport, so
-    nothing is checked for it here.
+    The gate span_reduction, the default greedy distributor, the cost-model
+    matmul re-pricer, and user hints all commit a split through -- so none of
+    them can individually forget to reject a split the scheduler's
+    coefficient-keyed transport cannot carry losslessly (see
+    ``unrepresentable_splits_by_index_coeff``). An op with no ``MemoryDep``
+    write never goes through that transport, so nothing is checked for it
+    here.
+
+    The LX co-optimizer (``scratchpad.allocator.commit_divisions``) does not
+    go through this gate: it commits its chosen division directly via
+    ``commit_iteration_space_ownership``, but its candidates come from
+    ``enumerate_work_division_candidates``, which already filters through
+    ``WorkDivisionContext.is_legal`` -- the same representability check --
+    before the solver ever sees them.
     """
     it_space = iteration_space_from_op(op)
     try:
@@ -953,11 +960,21 @@ class WorkDivisionContext:
     def _representable_by_index_coeff(self, splits: dict[Symbol, int]) -> bool:
         """Whether the scheduler's coefficient-keyed transport can carry
         ``splits`` without loss -- see ``unrepresentable_splits_by_index_coeff``.
+
+        Uses a fresh, un-tiled ``iteration_space_from_op(self.op)`` rather
+        than ``self.it_space``/``self.it_space_adjusted``: those are the
+        per-tile frame under a non-trivial ``tiling``, whose extents can be
+        smaller than the op's real ones (a stick var with a small element
+        extent can adjust to a per-tile size of 1). The commit-time gates
+        (``apply_splits``, ``finalize_work_division_for_scheduler``) judge
+        the whole, un-tiled op, so the size-1 carve-out here must use the
+        same real extents they do, or this could admit a candidate at
+        enumeration time that the commit gate then rejects.
         """
         if self.write_index is None:
             return True
         return not unrepresentable_splits_by_index_coeff(
-            splits, self.it_space_adjusted, self.write_index, self.read_index
+            splits, iteration_space_from_op(self.op), self.write_index, self.read_index
         )
 
     def obeys_op_constraints(self, splits: dict[Symbol, int]) -> bool:
