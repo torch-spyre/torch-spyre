@@ -8,6 +8,7 @@
 # removed its skip once the symbolic-objective crash it cited was fixed.
 test_suite_config:
   labels: [regression, trunk]
+  ci_group: cost_and_solvers
   files:
     - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_solver_relayout_candidates.py
       unlisted_test_mode: mandatory_success
