@@ -57,7 +57,9 @@ if torch._C._dispatch_has_kernel("spyre::broadcast_run"):
     # m.def+impl), so they need no separate fake kernel here.
 
     # ------------------------------------------------------------------
-    # Runtime run ops — shape inference matches the legacy async ops.
+    # Runtime run ops — what the collective kernels in ir.py emit. The
+    # *_async fakes above and below are legacy: nothing lowers to those ops
+    # any more; drop them together with their C++ schemas.
     # ------------------------------------------------------------------
 
     @torch.library.register_fake("spyre::broadcast_run")

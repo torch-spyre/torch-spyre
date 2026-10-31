@@ -39,7 +39,7 @@ def run_demo():
         # Pre-gather computation
         y = t * 2
 
-        # All-gather from all ranks - lowered to all_gather_async
+        # All-gather from all ranks - lowered to allgather_run + wait_work
         # Output shape[0] = input shape[0] * world_size = 8*2 = 16
         y_gathered = torch.ops._c10d_functional.all_gather_into_tensor(
             y, world_size, "default"
