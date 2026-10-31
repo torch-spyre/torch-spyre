@@ -19,6 +19,8 @@
 #include <ATen/ATen.h>
 #include <c10/util/intrusive_ptr.h>
 
+#include <flex/memory_interface/shared_host_pool.hpp>
+
 #include "module.h"
 
 namespace spyre {
@@ -31,6 +33,10 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
 
 at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
                            bool non_blocking);
+
+void copy_kv_page_raw(const at::Tensor& cache, size_t block_id,
+                      const flex::SharedPool& pool, size_t slot_id,
+                      bool to_device);
 
 /**
  * Uses flex::RuntimeStream::fillAsync() to perform the fill entirely
