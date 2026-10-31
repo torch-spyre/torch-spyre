@@ -111,6 +111,7 @@ from torch_spyre._inductor.work_division import (
     _matmul_multicast_penalty,
     _matmul_split_cost,
     adjust_it_space_for_sticks,
+    apply_splits,
     enumerate_work_division_candidates,
     work_division_context_for_op,
     work_division_splits_are_legal,
@@ -2440,6 +2441,66 @@ class TestDepthwiseConvWindowBlocked(unittest.TestCase):
         # The guard that forced the split ran, so this is the hazard the
         # finalize hard failure is defending against, not a vacuous pass.
         self.assertIn("kh", forced)
+
+
+class TestApplySplitsRepresentabilityGate(unittest.TestCase):
+    """apply_splits() is the one function every work-division pass commits a
+    split through: span_reduction, the default greedy distributor, the
+    cost-model matmul re-pricer, and user hints alike. Unlike
+    WorkDivisionContext.is_legal / _apply_user_hint, the default distributor
+    and the cost-model re-pricer never ask those checks (see
+    TestDepthwiseConvWindowBlocked for the real-compile instance), so
+    apply_splits must itself reject a split the scheduler's coefficient-keyed
+    transport cannot carry losslessly, before ever committing it."""
+
+    class _Op:
+        """Lightweight stand-in: a real MemoryDep write/read pair, no real
+        Inductor IR lowering needed. Mirrors
+        test_it_space_splits.py::test_scheduler_transport_raises_on_collision's
+        Op, extended with a Pointwise ``data`` so iteration_space_from_op (used
+        by both apply_splits and commit_iteration_space_ownership) resolves on
+        the real, unpatched code path."""
+
+        def __init__(self, write_index, symbols, sizes):
+            self.data = MagicMock(spec=Pointwise)
+            write = MemoryDep("op_under_test", write_index, symbols, sizes)
+            self._rw = type("ReadWrites", (), {"writes": [write], "reads": []})()
+
+        def get_name(self):
+            return "op_under_test"
+
+        def get_read_writes(self):
+            return self._rw
+
+    def test_two_split_axes_sharing_a_coefficient_are_rejected(self):
+        i0, i1 = _isym("i0"), _isym("i1")
+        op = self._Op(8 * i0 + 8 * i1, (i0, i1), (8, 8))
+        with self.assertRaisesRegex(
+            Unsupported,
+            "cannot be represented by the scheduler's coefficient-keyed transport",
+        ):
+            apply_splits(op, {i0: 2, i1: 4})
+        self.assertFalse(hasattr(op, "iteration_space_ownership"))
+
+    def test_split_axis_colliding_with_an_unsplit_axis_is_rejected(self):
+        """i1 is left unsplit (factor 1) in this candidate but has real
+        extent (8, not 1): the decoder cannot distinguish it from i0's split
+        by coefficient alone, so this must be rejected just as a split-split
+        collision would be, not silently miscommitted."""
+        i0, i1, i2 = _isym("i0"), _isym("i1"), _isym("i2")
+        op = self._Op(8 * i0 + 8 * i1 + i2, (i0, i1, i2), (8, 8, 64))
+        with self.assertRaisesRegex(
+            Unsupported,
+            "cannot be represented by the scheduler's coefficient-keyed transport",
+        ):
+            apply_splits(op, {i0: 4, i1: 1, i2: 1})
+        self.assertFalse(hasattr(op, "iteration_space_ownership"))
+
+    def test_representable_split_still_commits(self):
+        i0, i1 = _isym("i0"), _isym("i1")
+        op = self._Op(64 * i0 + i1, (i0, i1), (8, 64))
+        apply_splits(op, {i0: 4, i1: 1})
+        self.assertEqual(op.iteration_space_ownership.work_slices, {i0: 4, i1: 1})
 
 
 class TestQfp8wtConstraints(unittest.TestCase):

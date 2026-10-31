@@ -835,7 +835,33 @@ def collect_tensor_deps(
 
 
 def apply_splits(op: ComputedBuffer, splits: dict) -> None:
-    """Commit symbol-keyed work division; scheduler transport is finalized later."""
+    """Commit symbol-keyed work division; scheduler transport is finalized later.
+
+    The one gate every work-division pass commits a split through --
+    span_reduction, the default greedy distributor, the cost-model matmul
+    re-pricer, and user hints alike -- so none of them can individually
+    forget to reject a split the scheduler's coefficient-keyed transport
+    cannot carry losslessly (see ``unrepresentable_splits_by_index_coeff``).
+    An op with no ``MemoryDep`` write never goes through that transport, so
+    nothing is checked for it here.
+    """
+    it_space = iteration_space_from_op(op)
+    try:
+        write_index, read_index = select_work_division_transport_indexes(
+            op, op_read_writes(op), it_space
+        )
+    except Unsupported:
+        write_index = read_index = None
+    if write_index is not None:
+        problems = unrepresentable_splits_by_index_coeff(
+            splits, it_space, write_index, read_index
+        )
+        if problems:
+            raise Unsupported(
+                f"work division for {op.get_name()} split {splits} cannot be "
+                "represented by the scheduler's coefficient-keyed transport: "
+                f"{'; '.join(problems)}."
+            )
     commit_iteration_space_ownership(op, splits)
 
 
@@ -931,7 +957,7 @@ class WorkDivisionContext:
         if self.write_index is None:
             return True
         return not unrepresentable_splits_by_index_coeff(
-            splits, self.write_index, self.read_index
+            splits, self.it_space_adjusted, self.write_index, self.read_index
         )
 
     def obeys_op_constraints(self, splits: dict[Symbol, int]) -> bool:
@@ -1964,7 +1990,7 @@ def _apply_user_hint(
         write_index = read_index = None
     if write_index is not None:
         problems = unrepresentable_splits_by_index_coeff(
-            splits, write_index, read_index
+            splits, it_space_adjusted, write_index, read_index
         )
         if problems:
             raise Unsupported(
