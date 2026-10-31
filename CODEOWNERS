@@ -73,3 +73,6 @@
 
 # tools that check or capture the LX planner's decisions
 /tools/lx_planning/  @dgrove-oss @avery-blanchard @cyang49 @marnold-ibm @tardieu @chichun-charlie-liu
+
+# tools that measure how long the compiler frontend takes
+/tools/frontend_timing/  @dgrove-oss @avery-blanchard @cyang49 @marnold-ibm @tardieu
