@@ -113,6 +113,7 @@ from torch_spyre._inductor.wsr.enumerate_tilings import (
 
 from torch_spyre._inductor.work_division import (
     TensorDep,
+    WorkDivisionContext,
     _cost_model_matmul_planner,
     _decode_weight_delivery_us,
     _default_split,
@@ -1591,6 +1592,42 @@ class TestWorkDivisionContextAnswers(unittest.TestCase):
                 with self.subTest(why):
                     self.assertEqual(ctx.is_legal(splits), legal, _by_name(splits))
 
+    def test_is_legal_representability_uses_real_extents_not_adjusted_ones(self):
+        """The representability sub-check must judge the op's real,
+        un-tiled extents, not it_space_adjusted: those are the per-tile frame
+        under a non-trivial tiling, whose extents can be smaller than the
+        op's real ones (a stick var with a small element extent can adjust
+        to a per-tile/per-stick size of 1). The commit-time gates
+        (apply_splits, finalize_work_division_for_scheduler) judge the real,
+        un-tiled op, so a candidate is_legal wrongly admits here would still
+        be rejected there -- a latent, fail-closed inconsistency, not merely
+        a cosmetic one."""
+        i0, i1 = _isym("i0"), _isym("i1")
+        write_index = 8 * i0 + 8 * i1  # i0, i1 share coeff 8
+        op = _computed_buffer((8, 8), name="divergent_extents")
+        ctx = WorkDivisionContext(
+            op=op,
+            max_cores=32,
+            it_space={i0: 8, i1: 8},
+            it_space_adjusted={i0: 8, i1: 1},  # i1 looks trivial only here
+            stick_vars={i1: 64},
+            symbol_meta={},
+            tensor_deps=[],
+            reduction_vars=[],
+            constraints=ConstraintResult(),
+            span_min_splits={},
+            write_index=write_index,
+            read_index=write_index,
+        )
+        with patch(
+            "torch_spyre._inductor.work_division.iteration_space_from_op",
+            return_value={i0: 8, i1: 8},  # the op's real, un-tiled extents
+        ):
+            self.assertFalse(
+                ctx._representable_by_index_coeff({i0: 4, i1: 1}),
+                "i1's real extent (8) must be used, not its tile-adjusted extent (1)",
+            )
+
     def test_context_answers_match_the_enumeration(self):
         """The seam itself: the context's axis order is the one a candidate is
         keyed by, and every enumerated candidate is one the context calls legal
@@ -2455,14 +2492,14 @@ class TestDepthwiseConvWindowBlocked(unittest.TestCase):
 
 
 class TestApplySplitsRepresentabilityGate(unittest.TestCase):
-    """apply_splits() is the one function every work-division pass commits a
-    split through: span_reduction, the default greedy distributor, the
-    cost-model matmul re-pricer, and user hints alike. Unlike
-    WorkDivisionContext.is_legal / _apply_user_hint, the default distributor
-    and the cost-model re-pricer never ask those checks (see
-    TestDepthwiseConvWindowBlocked for the real-compile instance), so
-    apply_splits must itself reject a split the scheduler's coefficient-keyed
-    transport cannot carry losslessly, before ever committing it."""
+    """apply_splits() is the gate span_reduction, the default greedy
+    distributor, the cost-model matmul re-pricer, and user hints all commit a
+    split through. Unlike WorkDivisionContext.is_legal / _apply_user_hint,
+    the default distributor and the cost-model re-pricer never ask those
+    checks (see TestDepthwiseConvWindowBlocked for the real-compile
+    instance), so apply_splits must itself reject a split the scheduler's
+    coefficient-keyed transport cannot carry losslessly, before ever
+    committing it."""
 
     class _Op:
         """Lightweight stand-in: a real MemoryDep write/read pair, no real
@@ -2506,6 +2543,17 @@ class TestApplySplitsRepresentabilityGate(unittest.TestCase):
         ):
             apply_splits(op, {i0: 4, i1: 1, i2: 1})
         self.assertFalse(hasattr(op, "iteration_space_ownership"))
+
+    def test_split_colliding_only_with_a_size1_axis_still_commits(self):
+        """i1 is genuinely size-1 here (not merely unsplit): the decoder
+        skips it unconditionally regardless of coefficient, so sharing i0's
+        coefficient is not a real hazard and this split must still commit."""
+        i0, i1, i2 = _isym("i0"), _isym("i1"), _isym("i2")
+        op = self._Op(8 * i0 + 8 * i1 + i2, (i0, i1, i2), (8, 1, 64))
+        apply_splits(op, {i0: 4, i1: 1, i2: 1})
+        self.assertEqual(
+            op.iteration_space_ownership.work_slices, {i0: 4, i1: 1, i2: 1}
+        )
 
     def test_representable_split_still_commits(self):
         i0, i1 = _isym("i0"), _isym("i1")
