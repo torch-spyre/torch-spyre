@@ -36,6 +36,8 @@ Applying them in filename order works from an empty database.
 | `63-perf-regression-gate.sql` | `v_perf_regression_gate` | 20, 62 |
 | `64-rbac.sql` | `rbac_roles`, `rbac_bindings`, each with a `*_versions` log and MV | — |
 | `70-vllm-hud-projection.sql` | `oss_ci_benchmark_v3`, `oss_ci_benchmark_metadata`, their `_by_tag` copies + their MVs | 30, 60 |
+| `75-experiment-ledger.sql` | `experiment_events`, `experiment_arms`, `experiment_samples`, `experiment_decisions`, `experiment_findings`, `experiment_links`, `run_env_reports` | — |
+| `76-experiment-views.sql` | `v_experiments`, `v_experiment_arms`, `v_experiment_samples`, `v_experiment_findings`, `v_arm_verdicts`, `v_noise_floors`, `v_experiment_progress`, `v_subject_tried` | 75 |
 
 The `50`/`51`/`52` split is by what a view reads, not by taste: the artifact and functional view
 families are independent, and `v_run_coverage` is separate because it measures the join between
@@ -45,6 +47,28 @@ to learn which tier a run's leg was dispatched for.
 `70-` is named for what it is — a projection of `benchmark_runs` into the shape the PyTorch HUD
 reads — rather than for a table, because the tables it declares carry upstream's names
 (`oss_ci_benchmark_*`), not ours.
+
+## Experiment bundles
+
+`python -m spyre_clickhouse_ingest experiments write <bundle.jsonl>...` loads the 75- ledger from
+JSONL, one record per line, discriminated by `record`. Any producer (a pod, a laptop study, a CI
+step) emits the same lines; ids are derived from content, so a bundle can be written again after
+it grows and only its new lines land. `experiments abab <samples.jsonl> --spec <spec.json> --name
+<n>` converts a paired A/B driver's output into a bundle.
+
+| `record` | required | optional |
+|---|---|---|
+| `experiment` | `name`, `state`, `ts` | `parent` (campaign name), `kind`, `subject_level`, `subject_key`, `workload`, `hypothesis`, `spec` (object), `budget`, `spent` (`{card_min, wall_s, trials, usd}`), `code_ref`, `reason`, `actor`, `actor_kind`, `on_behalf_of`, `props` |
+| `arm` | `experiment`, `arm`, `role`, `ts` | `knobs` (the full vector), `change_class`, `hazard_class`, `state`, `hypothesis`, `props` |
+| `env` | `ts` | `env_sha` (else hashed from the record), `host`, `node`, `arch`, `cpu_model`, `ncpu`, `card_class`, `cards`, `image`, `image_digest`, `artifact_id`, `git_shas`, `packages`, `env`, `profiler_build`, `load1`, `raw` |
+| `sample` | `experiment`, `arm`, `ts`, `metrics` (`{name: value}`) | `trial`, `position`, `warmup`, `status`, `split`, `workload`, `stratum`, `units`, `kind`, `fidelity`, `wall_s`, `load1_before`, `load1_after`, `node`, `env_sha`, `run_id`, `benchmark_id`, `props` |
+| `decision` | `experiment`, `arm`, `baseline_arm`, `metric`, `n`, `decision`, `ts` | `final`, `test`, `effect_pct`, `ci_lo_pct`, `ci_hi_pct`, `sd_log`, `e_value`, `p_value`, `floor_pct`, `stop_reason` |
+| `finding` | `experiment`, `key` (stable within the experiment), `kind`, `metric`, `estimate`, `ts` | `verdict` + `gain_evidence` (required for `effect`), `arm`, `baseline_arm`, `subject_*`, `workload`, `stratum`, `unit`, `ci_lo`, `ci_hi`, `n`, `floor_pct`, `demoted_by`, `gates`, `policy_version`, `state`, `summary` |
+| `link` | `experiment`, `kind`, `ts`, and `target_id` (uuid) or `target` | `finding` (its `key`), `role` |
+
+`ts` is epoch seconds or ISO-8601 (naive = UTC). A record without `actor` takes `--actor`.
+Effect sign: positive means the candidate is better. A corrected sample or finding is a new line
+with the same key; `status: void` and `state: retracted` withdraw one.
 
 ## Why it lives here
 

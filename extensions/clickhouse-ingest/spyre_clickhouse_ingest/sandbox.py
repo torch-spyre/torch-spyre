@@ -148,6 +148,33 @@ class Sandbox:
             "published_at >= now() - INTERVAL {days} DAY",
             "(published_at, target_type, target_prefix)",
         ),
+        # Experiments are few and self-contained: copy each whole, by its first event.
+        (
+            "experiment_events",
+            "experiment_id GLOBAL IN (SELECT experiment_id FROM {src:experiment_events} "
+            "WHERE ts >= now() - INTERVAL {days} DAY)",
+            "event_id",
+        ),
+        (
+            "run_env_reports",
+            "env_id GLOBAL IN (SELECT env_id FROM {src:experiment_samples} WHERE experiment_id "
+            "GLOBAL IN (SELECT experiment_id FROM {db}.experiment_events))",
+            "env_id",
+        ),
+        *(
+            (
+                t,
+                "experiment_id GLOBAL IN (SELECT experiment_id FROM {db}.experiment_events)",
+                k,
+            )
+            for t, k in (
+                ("experiment_arms", "event_id"),
+                ("experiment_samples", "sample_id"),
+                ("experiment_decisions", "decision_id"),
+                ("experiment_findings", "event_id"),
+                ("experiment_links", "link_id"),
+            )
+        ),
     )
 
     @classmethod

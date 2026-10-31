@@ -99,6 +99,77 @@ REQUESTED_BY_VALUES = frozenset({"user", "pipeline"})
 RBAC_SUBJECT_TYPE_VALUES = frozenset({"user", "group"})
 DISPATCHED_BY_VALUES = REQUESTED_BY_VALUES | {"auto"}
 
+# 75-experiment-ledger.sql vocabularies.
+ACTOR_KIND_VALUES = frozenset({"human", "anonymous", "agent", "service"})
+EXPERIMENT_KIND_VALUES = frozenset(
+    {"ab", "noise", "sweep", "fit", "parity", "regression", "feasibility", "other"}
+)
+EXPERIMENT_STATE_VALUES = frozenset(
+    {
+        "proposed",
+        "approved",
+        "running",
+        "paused",
+        "done",
+        "stopped",
+        "failed",
+        "abandoned",
+    }
+)
+ARM_ROLE_VALUES = frozenset({"baseline", "candidate"})
+ARM_STATE_VALUES = frozenset({"active", "dropped", "rejected"})
+CHANGE_CLASS_VALUES = frozenset(
+    {
+        "",
+        "analysis",
+        "runtime_knob",
+        "serving_config",
+        "codegen_param",
+        "model_param",
+        "source_patch",
+    }
+)
+HAZARD_CLASS_VALUES = frozenset({"", "safe", "may_fail_compile", "may_hang"})
+SAMPLE_SPLIT_VALUES = frozenset({"search", "hidden", "confirm"})
+SAMPLE_STATUS_VALUES = frozenset({"ok", "fail", "hang", "no_metric", "void"})
+SAMPLE_KIND_VALUES = frozenset({"measured", "predicted"})
+FIDELITY_VALUES = frozenset({"hardware", "emulator", "cost_model", "analytic"})
+DECISION_VALUES = frozenset({"continue", "effect", "null", "max_n", "stopped"})
+FINDING_KIND_VALUES = frozenset(
+    {
+        "effect",
+        "noise_floor",
+        "calibration",
+        "parity_gap",
+        "regression",
+        "feasibility",
+        "method",
+    }
+)
+VERDICT_VALUES = frozenset(
+    {"", "better", "worse", "equal", "inconclusive", "infeasible", "void"}
+)
+GAIN_EVIDENCE_VALUES = ("", "G0", "G1", "G2", "G3", "G4")
+FINDING_STATE_VALUES = frozenset({"draft", "published", "retracted"})
+LINK_KIND_VALUES = frozenset(
+    {
+        "run",
+        "artifact",
+        "benchmark",
+        "ci_request",
+        "trace",
+        "file",
+        "pr",
+        "issue",
+        "commit",
+        "experiment",
+    }
+)
+LINK_ROLE_VALUES = frozenset(
+    {"baseline", "candidate", "evidence", "source", "output", "supersedes"}
+)
+CARD_CLASS_VALUES = frozenset({"", "PF", "VF"})
+
 # NOT constrained, deliberately: the DDL declares tag_family and arch without a CHECK.
 
 # A dep entry is "<component>@<id12>", 'base=<sha256>', or a bare name -- NOT a uuid,
@@ -884,6 +955,257 @@ class PipelineRunLinks(Table):
     )
 
 
+# ── experiment ledger (75-experiment-ledger.sql) ──
+# Writers derive every id from content (experiments.py), so each table dedups on its own id.
+
+
+class ExperimentEvents(Table):
+    """One lifecycle event of an experiment or campaign."""
+
+    name = "experiment_events"
+    columns = (
+        "ts",
+        "event_id",
+        "experiment_id",
+        "parent_id",
+        "name",
+        "kind",
+        "state",
+        "subject_level",
+        "subject_key",
+        "workload",
+        "hypothesis",
+        "spec",
+        "spec_sha256",
+        "budget",
+        "spent",
+        "code_ref",
+        "reason",
+        "actor",
+        "actor_kind",
+        "on_behalf_of",
+        "props",
+    )
+    required = ("ts", "event_id", "experiment_id", "name", "actor")
+    enums = (
+        ("kind", EXPERIMENT_KIND_VALUES),
+        ("state", EXPERIMENT_STATE_VALUES),
+        ("actor_kind", ACTOR_KIND_VALUES),
+    )
+    identity = "event_id"
+
+
+class ExperimentArms(Table):
+    """One version of an arm: its role, full knob vector and change/hazard class."""
+
+    name = "experiment_arms"
+    columns = (
+        "ts",
+        "event_id",
+        "experiment_id",
+        "arm",
+        "role",
+        "state",
+        "hypothesis",
+        "knobs",
+        "knob_sha",
+        "change_class",
+        "hazard_class",
+        "actor",
+        "actor_kind",
+        "props",
+    )
+    required = ("ts", "event_id", "experiment_id", "arm", "knob_sha", "actor")
+    enums = (
+        ("role", ARM_ROLE_VALUES),
+        ("state", ARM_STATE_VALUES),
+        ("change_class", CHANGE_CLASS_VALUES),
+        ("hazard_class", HAZARD_CLASS_VALUES),
+        ("actor_kind", ACTOR_KIND_VALUES),
+    )
+    identity = "event_id"
+
+
+class ExperimentSamples(Table):
+    """One raw value of one metric from one run of an arm."""
+
+    name = "experiment_samples"
+    columns = (
+        "ts",
+        "sample_id",
+        "experiment_id",
+        "arm",
+        "trial",
+        "position",
+        "warmup",
+        "split",
+        "status",
+        "workload",
+        "stratum",
+        "metric",
+        "value",
+        "unit",
+        "kind",
+        "fidelity",
+        "wall_s",
+        "load1_before",
+        "load1_after",
+        "node",
+        "env_id",
+        "run_id",
+        "benchmark_id",
+        "props",
+    )
+    required = ("ts", "sample_id", "experiment_id", "arm")
+    enums = (
+        ("split", SAMPLE_SPLIT_VALUES),
+        ("status", SAMPLE_STATUS_VALUES),
+        ("kind", SAMPLE_KIND_VALUES),
+        ("fidelity", FIDELITY_VALUES),
+    )
+    identity = "sample_id"
+
+
+class ExperimentDecisions(Table):
+    """One stopping-rule evaluation, interim or final."""
+
+    name = "experiment_decisions"
+    columns = (
+        "ts",
+        "decision_id",
+        "experiment_id",
+        "arm",
+        "baseline_arm",
+        "metric",
+        "final",
+        "n",
+        "test",
+        "effect_pct",
+        "ci_lo_pct",
+        "ci_hi_pct",
+        "sd_log",
+        "e_value",
+        "p_value",
+        "floor_pct",
+        "decision",
+        "stop_reason",
+        "props",
+    )
+    required = ("ts", "decision_id", "experiment_id", "arm", "baseline_arm", "metric")
+    enums = (("decision", DECISION_VALUES),)
+    identity = "decision_id"
+
+
+class ExperimentFindings(Table):
+    """One version of a finding; gain_evidence is set by code, never by hand."""
+
+    name = "experiment_findings"
+    columns = (
+        "ts",
+        "event_id",
+        "finding_id",
+        "experiment_id",
+        "kind",
+        "arm",
+        "baseline_arm",
+        "subject_level",
+        "subject_key",
+        "workload",
+        "stratum",
+        "metric",
+        "unit",
+        "estimate",
+        "ci_lo",
+        "ci_hi",
+        "n",
+        "floor_pct",
+        "verdict",
+        "gain_evidence",
+        "demoted_by",
+        "gates",
+        "policy_version",
+        "state",
+        "summary",
+        "actor",
+        "actor_kind",
+        "props",
+    )
+    required = ("ts", "event_id", "finding_id", "experiment_id", "metric", "actor")
+    enums = (
+        ("kind", FINDING_KIND_VALUES),
+        ("verdict", VERDICT_VALUES),
+        ("gain_evidence", frozenset(GAIN_EVIDENCE_VALUES)),
+        ("state", FINDING_STATE_VALUES),
+        ("actor_kind", ACTOR_KIND_VALUES),
+    )
+    identity = "event_id"
+
+    @classmethod
+    def row(cls, values: Mapping[str, Any]) -> list[Any]:
+        """As Table.row, plus chk_effect: an effect states its verdict and gain_evidence."""
+        ordered = super().row(values)
+        if values["kind"] == "effect" and not (
+            values["verdict"] and values["gain_evidence"]
+        ):
+            raise SchemaError(
+                f"{cls.name}: an effect finding needs verdict and gain_evidence"
+            )
+        return ordered
+
+
+class ExperimentLinks(Table):
+    """An experiment's (or finding's) edge to a run, artifact, benchmark, trace, file or PR."""
+
+    name = "experiment_links"
+    columns = (
+        "ts",
+        "link_id",
+        "experiment_id",
+        "finding_id",
+        "link_kind",
+        "role",
+        "target_id",
+        "target",
+        "props",
+    )
+    required = ("link_id", "experiment_id")
+    enums = (("link_kind", LINK_KIND_VALUES), ("role", LINK_ROLE_VALUES))
+    identity = "link_id"
+
+
+class RunEnvReports(Table):
+    """The host, card and software one measurement ran on, once per distinct report."""
+
+    name = "run_env_reports"
+    columns = (
+        "ts",
+        "env_id",
+        "env_sha",
+        "host",
+        "node",
+        "arch",
+        "cpu_model",
+        "ncpu",
+        "cpu_quota",
+        "host_kernel",
+        "card_class",
+        "cards",
+        "image",
+        "image_digest",
+        "artifact_id",
+        "git_shas",
+        "packages",
+        "env",
+        "profiler_build",
+        "load1",
+        "raw",
+        "props",
+    )
+    required = ("env_id", "env_sha")
+    enums = (("card_class", CARD_CLASS_VALUES),)
+    identity = "env_id"
+
+
 # Constant API, kept so installed consumers name one table model rather than copying it.
 TEST_CASES = TestCases
 TEST_CASE_RUNS = TestCaseRuns
@@ -905,6 +1227,15 @@ RBAC_BINDINGS = RbacBindings
 DISPATCH_REQUESTS = DispatchRequests
 ARTIFACT_DISPATCHES = ArtifactDispatches
 DISPATCH_TARGETS = DispatchTargets
+EXPERIMENT_TABLES = (
+    ExperimentEvents,
+    ExperimentArms,
+    ExperimentSamples,
+    ExperimentDecisions,
+    ExperimentFindings,
+    ExperimentLinks,
+    RunEnvReports,
+)
 
 TABLES = {
     t.name: t
@@ -929,6 +1260,7 @@ TABLES = {
         DispatchRequests,
         ArtifactDispatches,
         DispatchTargets,
+        *EXPERIMENT_TABLES,
     )
 }
 
