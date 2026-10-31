@@ -638,6 +638,31 @@ class _ScatterScenarios:
 
         self._assert_compiled_matches_cpu(kernel, y, src_y, idx_y, z, src_z, idx_z)
 
+    def test_scatter_dim1_router(self):
+        """dst.scatter(1, idx, src) on a [192, 128] fp16 router map -- #4404.
+
+        Llama 4 router densify (K=1). Codegen asserted in
+        _restickify_restore_elided_dim because the restickify copy-in kept an
+        input-layout override naming the unpadded layout. It now compiles and
+        runs, but the device values still differ from CPU (#4403).
+        """
+        T, E = 192, 128
+        dst = torch.full((T, E), float("-inf"), dtype=torch.float16).to("spyre")
+        # One column per row, so no two writes share a destination.
+        idx = torch.stack([torch.randperm(E)[:1] for _ in range(T)]).to("spyre")
+        src = (torch.arange(T, dtype=torch.float32) / 7.0).to(torch.float16)
+        src = src.unsqueeze(1).to("spyre")
+
+        # The device result is wrong (#4403); drop the pin once that is fixed.
+        self._stage_and_e2e(
+            lambda d, i, s: d.scatter(1, i, s),
+            dst,
+            idx,
+            src,
+            expect=SCATTER_OP_SPEC,
+            expect_close=False,
+        )
+
     def test_index_put_3d_scatter_dim1_e2e(self):
         """3-D tensor [B, H, D] scatter on dim 1 (H): y[:, idx, :] = src.
         Tests indirect access on a non-leading dimension, validating stride

@@ -1056,13 +1056,9 @@ def align_tensors_pure(
         else:
             # no splits keep existing var, range, and work division
             # may happen with a single stick since the stick size is omitted
-            # downstream passes receive the symbolic expression, not the concretized
-            # hint -- unless the symbol is unbounded, see _bounded_or_hint.
-            # Synthetic vars (z0, z1, …) are introduced by normalize_coordinates
-            # for restored size-1 dims and are not in orig_ranges; fall back to
-            # the concretized value (always 1) for those.
-            new_var_ranges[var] = inputs.restored_ranges.get(var, var_ranges[var])
-            # var can be a loop var or an indirect symbol
+            # Symbolic ranges are restored after this loop (see restored_ranges).
+            # var can be a loop var or an indirect symbol (e.g. a scatter's tmp0,
+            # which is only in indirect_sizes), so do not index var_ranges first.
             if var in var_ranges:
                 new_var_ranges[var] = var_ranges[var]
             elif indirect_sizes is not None and var in indirect_sizes:

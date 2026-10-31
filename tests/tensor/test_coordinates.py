@@ -46,6 +46,8 @@ from torch_spyre._inductor.propagate_layouts import (
 from torch_spyre._inductor.views import (
     _decompose_constant_offset,
     align_tensors,
+    align_tensors_pure,
+    build_alignment_inputs,
     compute_coordinates,
     normalize_coordinates,
     tiling_expr_to_device_expr,
@@ -1188,6 +1190,41 @@ class TestNormalizeCoordinatesFusion(TestCase):
             ],
         )
         self.assertEqual([int(t.dim_size) for t in terms], [32, 64])
+
+
+class TestAlignScatterIndirectSymbol(TestCase):
+    """align_tensors_pure with a scatter's indirect symbol in a destination coord.
+
+    Inputs are the ones enforce_indirect_access_layout builds for
+    dst(4, 64).scatter_reduce(1, idx(4, 32), src(4, 32), "sum") in fp16 (#4637):
+    the scatter column tmp0 is not a loop var, only in indirect_sizes.  Looking
+    it up in the loop ranges raised KeyError: tmp0.
+    """
+
+    def test_indirect_symbol_without_split(self):
+        d0, d1, tmp0 = (
+            sympy.Symbol(n, integer=True, nonnegative=True)
+            for n in ("d0", "d1", "tmp0")
+        )
+        zero = sympy.Integer(0)
+        inputs = build_alignment_inputs(
+            {d0: (sympy.Integer(4), 1), d1: (sympy.Integer(32), 1)},
+            [
+                {"size": [1, 4, 32], "coordinates": [zero, d0, d1]},  # idx, int32
+                {"size": [1, 4, 64], "coordinates": [zero, d0, d1]},  # src, fp16
+                {"size": [1, 4, 64], "coordinates": [zero, d0, tmp0]},  # dst
+            ],
+            indirect_sizes={tmp0: sympy.Integer(64)},
+        )
+
+        space, tensors, _ = align_tensors_pure(inputs)
+
+        # tmp0 addresses dst but is not a loop of the op.
+        self.assertEqual(space, {d0: (4, 1), d1: (32, 1)})
+        self.assertEqual(
+            tensors[2]["coordinates"],
+            [sympy.floor(tmp0 / 64), d0, sympy.Mod(tmp0, 64)],
+        )
 
 
 class TestFlatDenseProjectionLayout(TestCase):
