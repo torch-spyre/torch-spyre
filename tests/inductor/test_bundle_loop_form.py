@@ -24,10 +24,13 @@ The two decisions are one decision, and `TestStrideScaling` is where that is
 pinned.
 """
 
+import dataclasses
 import unittest
 
 import sympy
 from torch.utils._sympy.functions import FloorDiv
+
+from utils_inductor import expects_raise
 
 from torch_spyre._inductor.codegen.bundle import (
     LoopLevel,
@@ -156,6 +159,7 @@ class TestLoopLevel(unittest.TestCase):
         self.assertEqual(level.stride_scale, 1)
         self.assertEqual(level.setup, ())
 
+    @expects_raise
     def test_unrecognised_count_raises_naming_the_symbol(self):
         with self.assertRaises(NotImplementedError) as cm:
             _loop_level(_sym() * 2, 0, DIM_SSA)
@@ -163,6 +167,7 @@ class TestLoopLevel(unittest.TestCase):
         self.assertIn(SYM, msg, "the message must name the symbol")
         self.assertIn("decompose_tiled_count", msg, "and where to extend")
 
+    @expects_raise
     def test_symbol_with_no_input_arg_raises_naming_it(self):
         with self.assertRaises(NotImplementedError) as cm:
             _loop_level(FloorDiv(_sym(), G), 0, {})
@@ -215,6 +220,7 @@ class TestStrideScaling(unittest.TestCase):
         per_level = [{}, {"b": 128}]
         self.assertEqual(list(_scaled_strides(per_level, [G, 1])), [(1, 128)])
 
+    @expects_raise
     def test_an_indivisible_stride_raises(self):
         """The guard that stops a silently wrong address.
 
@@ -291,7 +297,7 @@ class TestLoopDimensionSymbolKind(unittest.TestCase):
 class TestLoopLevelIsFrozen(unittest.TestCase):
     def test_frozen(self):
         level = LoopLevel(setup=(), bound="%x", step="%c1", stride_scale=1)
-        with self.assertRaises(Exception):
+        with self.assertRaises(dataclasses.FrozenInstanceError):
             level.bound = "%y"  # type: ignore[misc]
 
 

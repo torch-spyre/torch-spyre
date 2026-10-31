@@ -35,6 +35,8 @@ import sympy
 from torch._inductor.test_case import TestCase as InductorTestCase
 from torch.utils._sympy.functions import FloorDiv
 
+from utils_inductor import expects_raise
+
 from torch_spyre._inductor.codegen.bundle import generate_bundle
 from torch_spyre._inductor.codegen.compute_ops import SymbolKind
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec
@@ -214,6 +216,7 @@ class TestTheLoopForm(_BundleHarness):
 
 
 class TestItRefusesRatherThanGuesses(_BundleHarness):
+    @expects_raise
     def test_bounds_with_no_source_refuse_and_name_the_symbol(self):
         """A wrong (arg_index, dim_index) is silently wrong on every launch."""
         spec = self._symbolic_loop(sources={})
@@ -224,6 +227,7 @@ class TestItRefusesRatherThanGuesses(_BundleHarness):
         self.assertIn(SYM, str(caught.exception))
         self.assertIn("no source", str(caught.exception))
 
+    @expects_raise
     def test_two_loops_disagreeing_about_one_dimension_refuse(self):
         """One parameter cannot serve two different tile sizes.
 

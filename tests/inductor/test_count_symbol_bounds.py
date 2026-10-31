@@ -48,6 +48,8 @@ from torch._inductor.utils import IndentedBuffer
 from torch._inductor.virtualized import V
 from torch.utils._sympy.functions import FloorDiv
 
+from utils_inductor import expects_raise
+
 from torch_spyre._inductor.kernel_provenance import (
     _EXPECTED_LOOP_SPEC_SCHEMA,
     _validate_finalized_schema,
@@ -274,6 +276,7 @@ class TestMoreThanOneSymbolIsRefusedHere(unittest.TestCase):
     belongs where the message can tell the caller what to do.
     """
 
+    @expects_raise
     def test_two_symbols_refuse_and_name_both(self):
         other = sympy.Symbol("s1", integer=True, positive=True)
         count = FloorDiv(_sym() + other, TILE)
@@ -286,6 +289,7 @@ class TestMoreThanOneSymbolIsRefusedHere(unittest.TestCase):
         self.assertIn(SYM, message)
         self.assertIn("s1", message)
 
+    @expects_raise
     def test_the_message_says_how_to_fix_it(self):
         """A refusal a caller cannot act on is only half a refusal."""
         other = sympy.Symbol("s1", integer=True, positive=True)

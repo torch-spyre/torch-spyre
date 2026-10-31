@@ -1547,6 +1547,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
 
         self.assertFalse(any(isinstance(op, ir.WhileLoop) for op in graph.operations))
 
+    @expects_raise
     def test_a_symint_operand_the_body_names_differently_is_refused(self):
         # If the body's placeholder were a symbol other than the operand's own,
         # the spliced reads would name a symbol the parent never binds. Refuse
