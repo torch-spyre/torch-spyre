@@ -2969,18 +2969,21 @@ def test_matmul_weight_with_factorized_contraction_dim():
 
 
 def test_restickify_target_is_infeasible_when_the_old_stick_is_factorized():
-    """Moving the stick off a factorized contraction var is not computable.
+    """Restickify returns None when the old-stick var spans multiple outer dims
+    and the reduction type is not BATCH_MATMUL_OP.
 
-    The weight ``[N, 8, 128]`` has its K var ``d1`` on the heads dim, the D-high
-    dim and the stick.  There is no single outer dim to repurpose when the stick
-    moves to N, and repurposing the first one overwrites the heads dim.  The
-    target must be reported infeasible (``None``) instead of a layout whose device
-    size no longer matches the tensor (issue #5550).
+    The weight ``[N, 8, 128]`` has its K var ``d1`` factorized across outer dims 0
+    and 1. For BATCH_MATMUL_OP, _prepare_for_restickify would collapse those dims
+    before calling compute_restickify_target_layout. For other reduction types,
+    no collapse is attempted and compute_restickify_target_layout returns None
+    (old_var_outer_dims > 1). Ensures the fix does not regress issue #5550.
     """
     import sympy
+    from torch._inductor.dependencies import MemoryDep
     from torch._inductor.ir import FixedLayout
     from torch_spyre._C import DataFormats, SpyreTensorLayout as _CSTL
     from torch_spyre._inductor.pass_utils import compute_restickify_target_layout
+    from torch_spyre._inductor.propagate_layouts import PropArg
 
     d0, d1 = sympy.symbols("d0 d1", integer=True, nonnegative=True)
     host = FixedLayout(DEVICE, torch.float16, [4096, 8, 128], [1024, 128, 1])
@@ -2997,7 +3000,76 @@ def test_restickify_target_is_infeasible_when_the_old_stick_is_factorized():
         d0,
         sympy.Mod(d1, 64),
     ]
+    dep = MemoryDep("w", d0 * 1024 + d1, (d0, d1), (4096, 1024))
+    arg = PropArg(dep, host, [stl])
     assert (
-        compute_restickify_target_layout(stl, host, d0, host_coords, device_coords)
+        compute_restickify_target_layout(
+            stl, host, d0, host_coords, device_coords, arg=arg
+        )
         is None
+    )
+
+
+def test_compute_restickify_target_layout_factorized_new_sd():
+    """compute_restickify_target_layout must handle a factorized target_stick_expr.
+
+    When ``target_stick_expr`` is a FloorDiv expression such as ``floor(k/128)``,
+    ``matching_dim`` returns None and the old code immediately returned None.
+    The new code must resolve the host size/stride via ``_factorized_chain`` and
+    return a valid STL moving the stick to the K variable.
+
+    Scenario: host ``[L=4, H=8, D=128]`` with the current stick on ``lq`` (the
+    sequence dim).  We want to move the stick to ``k`` (the contraction dim)
+    whose target coord is ``floor(k/128)`` — a FloorDiv that ``matching_dim``
+    cannot resolve.
+    """
+    import sympy
+    from torch._inductor.dependencies import MemoryDep
+    from torch._inductor.ir import FixedLayout
+    from torch_spyre._C import DataFormats, SpyreTensorLayout as _CSTL
+    from torch_spyre._inductor.pass_utils import compute_restickify_target_layout
+    from torch_spyre._inductor.propagate_layouts import PropArg
+
+    lq, k = sympy.symbols("lq k", integer=True, nonnegative=True)
+    # Host layout: [L=4, H=8, D=128], row-major strides.
+    host = FixedLayout(DEVICE, torch.float16, [4, 8, 128], [1024, 128, 1])
+    # dep: index 1024*lq + k iterates L (range 4) and the collapsed H*D (range 1024).
+    dep = MemoryDep("x", 1024 * lq + k, (lq, k), (4, 1024))
+    # STL with lq on the stick: H outer (stride 128), D-high outer (stride 64),
+    # L-sticks outer (stride 1024, 1 stick for L=4), stick (64 elements).
+    stl = _CSTL(
+        [8, 2, 1, 64],
+        [128, 64, 1024, 1],
+        DataFormats.SEN169_FP16,
+    )
+    # host_coords (ic): L maps to lq, H to floor(k/128), D to Mod(k, 128).
+    ic = [lq, sympy.floor(k / 128), sympy.Mod(k, 128)]
+    # device_coords (idc): H outer, D-high outer, L-sticks (=0 since L<64), stick.
+    idc = [
+        sympy.floor(k / 128),
+        sympy.floor(sympy.Mod(k, 128) / 64),
+        sympy.S.Zero,
+        sympy.Mod(lq, 64),
+    ]
+    # PropArg so the slow path in _host_size_stride_for_expr can call
+    # _factorized_chain for the factorized floor(k/128) expression.
+    arg = PropArg(dep, host, [stl])
+    # target_stick_expr = floor(k/128): matching_dim returns None for FloorDiv,
+    # so the old code returned None here.  The new code must succeed.
+    target_stick_expr = sympy.floor(k / 128)
+    result = compute_restickify_target_layout(
+        stl, host, target_stick_expr, ic, idc, arg=arg, reduction_type="test", label="x"
+    )
+    assert result is not None, (
+        "compute_restickify_target_layout returned None for factorized "
+        "target_stick_expr=floor(k/128); expected a valid STL"
+    )
+    # After the fix: K on the stick with 16 sticks of 64 = 1024 K elements.
+    # L (size 4) occupies the old L-outer dim; the old H-outer dim gets the
+    # number of K-sticks.
+    assert list(result.device_size) == [4, 2, 16, 64], (
+        f"Unexpected device_size: {list(result.device_size)}"
+    )
+    assert list(result.stride_map) == [1024, 64, 64, 1], (
+        f"Unexpected stride_map: {list(result.stride_map)}"
     )

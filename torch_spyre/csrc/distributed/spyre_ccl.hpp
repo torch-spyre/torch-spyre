@@ -218,6 +218,8 @@ class SpyreCCLWork : public Work {
 
  private:
   c10::intrusive_ptr<c10::ivalue::Future> future_;
+  // Keep an allgather's borrowed input (including materialized views) alive.
+  at::Tensor input_tensor_;
   std::shared_ptr<spyre_comms::WorkSchedule> work_schedule_;
   bool completed_ = false;
   std::exception_ptr exception_ = nullptr;

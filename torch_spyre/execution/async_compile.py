@@ -62,12 +62,23 @@ if TYPE_CHECKING:
 
 logger = get_inductor_logger("sdsc_compile")
 
-# Wall-clock ceiling on ONE backend-compiler invocation, applied to dbo-opt on
-# both the bundle and the KTIR path. It bounds a wedged compiler -- which would
-# otherwise block torch.compile forever with no diagnostic -- rather than
-# policing slowness: both finish in well under a second on a small kernel.
-# Raise it if a large bundle legitimately needs longer.
-_COMPILE_TIMEOUT_S = 60.0
+
+def _backend_compile_timeout() -> float | None:
+    """The dbo-opt timeout for ``subprocess.run``: None when the knob is <= 0.
+
+    See ``backend_compile_timeout_seconds`` in ``_inductor/config``.
+    """
+    timeout = _spyre_config.backend_compile_timeout_seconds
+    return timeout if timeout > 0 else None
+
+
+def _timeout_message(timeout: float | None) -> str:
+    return (
+        f"dbo-opt timed out after {timeout}s; raise "
+        "SPYRE_BACKEND_COMPILE_TIMEOUT_SECONDS (config "
+        "backend_compile_timeout_seconds, <= 0 disables) if this kernel "
+        "legitimately needs longer."
+    )
 
 
 def _check_ktir_device_prerequisites() -> None:
@@ -212,6 +223,8 @@ def _run_backend_compiler(
     compile_dir: str,
     env: dict[str, str],
     backend_loop_unroll: bool,
+    ktir_device_mlir: str,
+    timeout: float | None,
 ) -> str:
     """Compile one materialized bundle with dbo-opt and return its directory.
 
@@ -224,6 +237,9 @@ def _run_backend_compiler(
     the dbo-opt lookup below resolves the same binary the parent would.
     ``backend_loop_unroll`` is the resolved parent config used for the cache key;
     workers must not re-read it from their own config or environment.
+    ``ktir_device_mlir`` is the same parent-side device override used for the key.
+    ``timeout`` is likewise resolved in the parent (``_backend_compile_timeout``)
+    so a runtime config change reaches pool workers too.
     """
     _check_backend_compiler_on_path()
 
@@ -232,8 +248,8 @@ def _run_backend_compiler(
     # to the spyre_dd2_basic under DEEPTOOLS_PATH, so passing an empty value
     # would be worse than omitting the flag.  KTIR_DEVICE_MLIR is reused rather
     # than given a bundle-path spelling of its own.
-    if _spyre_config.ktir_device_mlir:
-        cmd.append(f"--device={_spyre_config.ktir_device_mlir}")
+    if ktir_device_mlir:
+        cmd.append(f"--device={ktir_device_mlir}")
     # Always pass the resolved value, including the default, so compilation
     # matches the cache key instead of depending on dbo-opt's own default.
     cmd.append(f"--enable-loop-unroll={int(backend_loop_unroll)}")
@@ -257,7 +273,7 @@ def _run_backend_compiler(
                 text=True,
                 check=True,
                 env=env,
-                timeout=_COMPILE_TIMEOUT_S,
+                timeout=timeout,
             )
             # The KTIR path (#3651) reports that dbo-opt can exit 0 having
             # written nothing, so treat the artifact -- not the return code --
@@ -282,8 +298,7 @@ def _run_backend_compiler(
                 code_dir=compile_dir,
             )
             raise RuntimeError(
-                f"dbo-opt timed out after {_COMPILE_TIMEOUT_S}s "
-                f"(_COMPILE_TIMEOUT_S).\ncommand: {' '.join(cmd)}"
+                f"{_timeout_message(timeout)}\ncommand: {' '.join(cmd)}"
             ) from exc
         except subprocess.CalledProcessError as exc:
             try_collect(
@@ -417,7 +432,9 @@ class SpyreAsyncCompile(AsyncCompile):
         kernel_name: str,
         compile_dir: str,
         *,
-        backend_loop_unroll: bool | None = None,
+        backend_loop_unroll: bool,
+        ktir_device_mlir: str,
+        timeout: float | None,
     ) -> Future[str] | None:
         """Submit the backend compile to Inductor's pool, or compile inline."""
         # Everything before this call is frontend work and _run_backend_compiler
@@ -427,8 +444,6 @@ class SpyreAsyncCompile(AsyncCompile):
         assert not _spyre_config.frontend_only, (
             "frontend-only must stop before the backend is submitted"
         )
-        if backend_loop_unroll is None:
-            backend_loop_unroll = _spyre_config.backend_loop_unroll
         if get_compile_threads() > 1:
             # The first use creates the pool and submits its readiness probe.
             # Waiting for that short probe guarantees the first Spyre kernel is
@@ -441,11 +456,18 @@ class SpyreAsyncCompile(AsyncCompile):
                     compile_dir,
                     dict(os.environ),
                     backend_loop_unroll,
+                    ktir_device_mlir,
+                    timeout,
                 )
 
         with timing_recorder.stage(_BACKEND_STAGE, kernel=kernel_name, tool="dbo-opt"):
             _run_backend_compiler(
-                kernel_name, compile_dir, dict(os.environ), backend_loop_unroll
+                kernel_name,
+                compile_dir,
+                dict(os.environ),
+                backend_loop_unroll,
+                ktir_device_mlir,
+                timeout,
             )
         return None
 
@@ -511,6 +533,8 @@ class SpyreAsyncCompile(AsyncCompile):
         # Keep cache identity and the worker's compiler argument on the same
         # config snapshot, including overrides made with config.patch.
         backend_loop_unroll = _spyre_config.backend_loop_unroll
+        ktir_device_mlir = _spyre_config.ktir_device_mlir
+        timeout = _backend_compile_timeout()
         use_cache = (
             _spyre_config.spyre_kernel_cache
             and not torch._inductor.config.force_disable_caches
@@ -532,6 +556,7 @@ class SpyreAsyncCompile(AsyncCompile):
                     kernel_name=kernel_name,
                     pool_size=pool_size,
                     backend_loop_unroll=backend_loop_unroll,
+                    ktir_device_mlir=ktir_device_mlir,
                 )
             except RuntimeError as e:
                 logger.warning(
@@ -572,6 +597,8 @@ class SpyreAsyncCompile(AsyncCompile):
                         kernel_name,
                         compile_dir,
                         backend_loop_unroll=backend_loop_unroll,
+                        ktir_device_mlir=ktir_device_mlir,
+                        timeout=timeout,
                     )
                     if task is not None:
                         return self._compile_future(
@@ -601,7 +628,11 @@ class SpyreAsyncCompile(AsyncCompile):
         if _spyre_config.frontend_only:
             return _skip_backend(kernel_name, output_dir, "dbo-opt")
         task = self._submit_backend_compile(
-            kernel_name, output_dir, backend_loop_unroll=backend_loop_unroll
+            kernel_name,
+            output_dir,
+            backend_loop_unroll=backend_loop_unroll,
+            ktir_device_mlir=ktir_device_mlir,
+            timeout=timeout,
         )
         if task is not None:
             return self._compile_future(
@@ -711,6 +742,7 @@ class SpyreAsyncCompile(AsyncCompile):
         # problem to fix in the shell, not something to paper over per-child --
         # and a child-only path stopped being separable once a process commits
         # to one backend for its lifetime via ``ktir_emitter``.
+        timeout = _backend_compile_timeout()
         with torch.profiler.record_function(f"dbo-opt:{kernel_name}"):
             try:
                 with timing_recorder.stage(
@@ -721,7 +753,7 @@ class SpyreAsyncCompile(AsyncCompile):
                         capture_output=True,
                         text=True,
                         check=True,
-                        timeout=_COMPILE_TIMEOUT_S,
+                        timeout=timeout,
                     )
                 # dbo-opt can exit 0 having written nothing, so the artifact
                 # itself -- not the return code -- is the success condition.
@@ -744,8 +776,7 @@ class SpyreAsyncCompile(AsyncCompile):
                     code_dir=output_dir,
                 )
                 raise RuntimeError(
-                    f"OpSpec->KTIR: dbo-opt timed out after "
-                    f"{_COMPILE_TIMEOUT_S}s (_COMPILE_TIMEOUT_S).\n"
+                    f"OpSpec->KTIR: {_timeout_message(timeout)}\n"
                     f"command: {' '.join(cmd)}"
                 ) from exc
             except subprocess.CalledProcessError as exc:

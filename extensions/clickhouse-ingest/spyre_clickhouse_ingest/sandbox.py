@@ -100,6 +100,8 @@ class Sandbox:
         ("artifact_results", "{runs}", "run_id"),
         ("artifact_result_reasons", "{runs}", "run_id"),
         ("artifact_subscriptions", "1", "subscription_id"),
+        ("rbac_roles", "1", "role_id"),
+        ("rbac_bindings", "1", "binding_id"),
         (
             "artifact_dispatches",
             "artifact_id GLOBAL IN (SELECT artifact_id FROM {db}.artifacts)",
@@ -112,6 +114,13 @@ class Sandbox:
         ),
         ("hw_failure_diagnostics", "{runs}", "run_id"),
         ("jenkins_agents", "ts >= now() - INTERVAL {days} DAY", "(node, ts)"),
+        # By time: a request rejected by the grammar has no run of its own to be picked by.
+        (
+            "ops_requests",
+            "requested_at >= now() - INTERVAL {days} DAY",
+            "(requested_at, requested_by)",
+        ),
+        ("ci_requests", "ts >= now() - INTERVAL {days} DAY", "(request_id, ts)"),
         # By time, not {runs}: a run that failed before publishing has no run_id to be picked by.
         ("pipeline_runs", "started_at >= now() - INTERVAL {days} DAY", "run_key"),
         (
@@ -129,6 +138,9 @@ class Sandbox:
             "run_key GLOBAL IN (SELECT run_key FROM {db}.pipeline_runs)",
             "(run_key, entry, component, artifact_name, arch, leg, attempt)",
         ),
+        ("poller_decisions", "ts >= now() - INTERVAL {days} DAY", "audit_uuid"),
+        ("ci_write_failures", "ts >= now() - INTERVAL {days} DAY", "audit_uuid"),
+        ("merge_queue_events", "ts >= now() - INTERVAL {days} DAY", "audit_uuid"),
         # By time: a pending or rejected upload has no run_id.
         ("result_uploads", "ts >= now() - INTERVAL {days} DAY", "(upload_id, ts)"),
         (

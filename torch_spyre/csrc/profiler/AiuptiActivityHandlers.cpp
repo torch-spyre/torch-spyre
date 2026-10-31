@@ -280,6 +280,43 @@ inline std::string runtimeCbidName(AIUpti_runtime_api_trace_cbid cbid) {
       return "aiuCommsHdmaFirmwareReset";
     case AIUPTI_RUNTIME_TRACE_CBID_WAIT_FOR_QUEUE_CAPACITY:
       return "aiuWaitForQueueCapacity";
+
+    // ResponseWorker CBIDS (79-82)
+    case AIUPTI_RUNTIME_TRACE_CBID_FETCH_RESPONSE_BLOCKS:
+      return "aiuFetchResponseBlocks";
+    case AIUPTI_RUNTIME_TRACE_CBID_RESPONSE_COMPLETION_THREAD:
+      return "aiuResponseCompletionThread";
+    case AIUPTI_RUNTIME_TRACE_CBID_PARSE_RESPONSE_BLOCKS:
+      return "aiuParseResponseBlocks";
+    case AIUPTI_RUNTIME_TRACE_CBID_ITERATION_DURATION:
+      return "aiuIterationDuration";
+
+    // CBIDS 83 to 84 are reserved
+    // P2P RDMA CBIDS (85 - 91)
+    case AIUPTI_RUNTIME_TRACE_CBID_P2P_RDMA_MULTICAST:
+      return "aiuP2PRdmaMulticast";
+    case AIUPTI_RUNTIME_TRACE_CBID_P2P_RDMA_WAIT:
+      return "aiuP2PRdmaWait";
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULE_P2P_RDMA_SEND:
+      return "aiuScheduleP2PRdmaSend";
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULE_P2P_RDMA_WAIT:
+      return "aiuScheduleP2PRdmaWait";
+    case AIUPTI_RUNTIME_TRACE_CBID_LAUNCH_P2P_RDMA_SEND:
+      return "aiuLaunchP2PRdmaSend";
+    case AIUPTI_RUNTIME_TRACE_CBID_LAUNCH_P2P_RDMA_WAIT:
+      return "aiuLaunchP2PRdmaWait";
+    case AIUPTI_RUNTIME_TRACE_CBID_INITIALIZE_P2P:
+      return "aiuInitializeP2P";
+
+    // Scheduler submit/barrier CBIDS (102-105)
+    case AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_DMA:
+      return "aiuSubmitDMA";
+    case AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_COMPUTE:
+      return "aiuSubmitCompute";
+    case AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_FILL:
+      return "aiuSubmitFill";
+    case AIUPTI_RUNTIME_TRACE_CBID_ISSUE_BARRIER:
+      return "aiuIssueBarrier";
     default:
       break;
   }
@@ -440,6 +477,29 @@ void AiuptiActivityProfilerSession::handleRuntimeActivity(
       runtime_activity->addMetadata("bytes", activity->data);
       break;
 
+    case AIUPTI_RUNTIME_TRACE_CBID_ISSUE_BARRIER:
+      runtime_activity->addMetadata("fence_size", activity->data);
+      break;
+
+    case AIUPTI_RUNTIME_TRACE_CBID_P2P_RDMA_MULTICAST:
+      runtime_activity->addMetadata("bytes", activity->data);
+      break;
+
+    case AIUPTI_RUNTIME_TRACE_CBID_P2P_RDMA_WAIT:
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULE_P2P_RDMA_WAIT:
+    case AIUPTI_RUNTIME_TRACE_CBID_LAUNCH_P2P_RDMA_WAIT:
+      runtime_activity->addMetadata("num_sids", activity->data);
+      break;
+
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULE_P2P_RDMA_SEND:
+    case AIUPTI_RUNTIME_TRACE_CBID_LAUNCH_P2P_RDMA_SEND:
+      runtime_activity->addMetadata("num_dest_ranks", activity->data);
+      break;
+
+    case AIUPTI_RUNTIME_TRACE_CBID_INITIALIZE_P2P:
+      runtime_activity->addMetadata("world_size", activity->data);
+      break;
+
     default:
       break;
   }
@@ -475,7 +535,7 @@ void AiuptiActivityProfilerSession::handleKernelActivity(
   kernel_activity->addMetadata("queued", activity->queued);
   kernel_activity->addMetadata("submitted", activity->submitted);
   kernel_activity->addMetadata("device", kernel_activity->deviceId());
-  kernel_activity->addMetadata("stream", 1);
+  kernel_activity->addMetadata("stream", activity->stream_id);
   kernel_activity->addMetadataQuoted("context",
                                      std::to_string(activity->context_id));
   kernel_activity->addMetadata("correlation", activity->correlation_id);
@@ -600,6 +660,7 @@ void AiuptiActivityProfilerSession::handleMemcpyActivity(
   memcpy_activity->addMetadata("memory operation id", activity->copy_kind);
   memcpy_activity->addMetadata("bytes", activity->bytes);
   memcpy_activity->addMetadata("memory bandwidth (GB/s)", bandwidth(activity));
+  memcpy_activity->addMetadata("stream", activity->stream_id);
   // AIUpti_ActivityMemcpy does not say whether the record came from a
   // command buffer (real counters) or a standalone flex MEMCPY (always 0;
   // today flex reports every DMA this way), so omit the key when all slots
@@ -668,6 +729,7 @@ void AiuptiActivityProfilerSession::handleMemoryActivity(
                               activity->memory_operation_type);
     mem_activity->addMetadata("bytes", activity->bytes);
     mem_activity->addMetadata("memory bandwidth (GB/s)", bandwidth(activity));
+    mem_activity->addMetadata("stream", activity->stream_id);
 
     if (mem_activity->resource == getBaseResourceId(activity)) {
       recordMemoryStream(mem_activity->device, mem_activity->resource,
@@ -741,6 +803,7 @@ void AiuptiActivityProfilerSession::handleMemsetActivity(
   memset_activity->addMetadata("correlation", activity->correlation_id);
   memset_activity->addMetadata("bytes", activity->bytes);
   memset_activity->addMetadata("memory bandwidth (GB/s)", bandwidth(activity));
+  memset_activity->addMetadata("stream", activity->stream_id);
 
   if (memset_activity->resource == getBaseResourceId(activity)) {
     recordMemoryStream(memset_activity->device, memset_activity->resource,

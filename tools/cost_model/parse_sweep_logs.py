@@ -25,9 +25,13 @@ re-parsing a log updates its rows in place (idempotent) without touching other l
 PROVENANCE / VERSION HYGIENE. ``pred_us`` / ``T_model_us`` are baked into each log at RUN
 time, so a log carries the predictions of whatever model version produced it -- mixing
 logs mixes model generations. Every sweep header echoes ``git: <sha>``; we capture it as
-``model_sha`` (and ``log_date`` from the filename) on each record, then flag ``is_current``
-= (model_sha == the current-model SHA). The MEASURED ``kernel_us`` is version-independent
-and always trustworthy; ``pred_us`` is only trustworthy for ``is_current`` rows. Use
+``model_sha`` (and ``log_date`` from the header's ``date:`` line, else the filename) on
+each record, then flag ``is_current`` = (model_sha == the current-model SHA). The MEASURED
+``kernel_us`` does not depend on the model version, but it does depend on the build and on
+how the harness timed it: a SUMMARY carrying ``timing=device`` counted device events only,
+while harnesses before that marker also counted the ``launch::*`` host markers (since
+#3424), about twice the kernel plus the read-back. ``eval_model.in_scope`` keeps those
+apart. ``pred_us`` is only trustworthy for ``is_current`` rows. Use
 ``--current-sha`` to set the authoritative SHA (default: the SHA of the newest parsed log)
 and ``--drop-ops`` to exclude retired ops (e.g. ``chain``) from the output entirely.
 
@@ -49,6 +53,8 @@ import regex as re
 
 _GIT = re.compile(r"^git:\s*([0-9a-f]{7,40})\b")
 _LOG_DATE = re.compile(r"_(\d{8})_(\d{6})")  # <name>_YYYYMMDD_HHMMSS.log
+# The sweep header's `date: YYYY-MM-DDTHH:MM:SS`, which survives renaming the log.
+_HDR_DATE = re.compile(r"^date:\s*(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})\b")
 _SECTION = re.compile(r"^##\s+(.*\S)")
 _LABEL = re.compile(r"^--\s+(.*\S)")
 _RUN_HDR = re.compile(r"^===\s+(.*?)\s+===\s*$")  # 3-equals run header (not the banner)
@@ -308,6 +314,7 @@ def parse_log(path):
     dm = _LOG_DATE.search(base)
     log_date = f"{dm[1]}_{dm[2]}" if dm else ""
     model_sha = ""  # set by the first ``git: <sha>`` header line (sweep provenance)
+    hdr_date = ""  # set by the first ``date:`` header line
     section = label = None
     splits, io_lines, model_lines, feats_json = {}, [], [], None
     with open(path, encoding="utf-8", errors="replace") as f:
@@ -315,6 +322,9 @@ def parse_log(path):
             line = raw.rstrip("\n")
             if (g := _GIT.match(line)) and not model_sha:
                 model_sha = g[1][:7]
+            elif (g := _HDR_DATE.match(line)) and not hdr_date:
+                # Ahead of the filename's date for every later record.
+                hdr_date = log_date = f"{g[1]}{g[2]}{g[3]}_{g[4]}{g[5]}{g[6]}"
             elif g := _SECTION.match(line):
                 section = g[1]
             elif g := _LABEL.match(line):
@@ -389,6 +399,7 @@ _CSV_COLS = [
     "kernel_us_median",
     "kernel_us_std",
     "kernel_us_cv",
+    "timing",
     "reps",
     "pred_us",
     "err_pct",
@@ -404,6 +415,15 @@ _CSV_COLS = [
     "k_tiles",
     "loop_trips",
     "wd",
+    "rl_src",
+    "rl_dst",
+    "rl_mode",
+    "rl_copies",
+    "rl_split",
+    "rl_run_elems",
+    "rl_cores",
+    "rl_bytes",
+    "rl_pred_us",
     "failed",
 ]
 
