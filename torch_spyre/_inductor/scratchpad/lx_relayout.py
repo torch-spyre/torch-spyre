@@ -512,6 +512,19 @@ def _movement_supported(
         return False
     if max(fanin) > _MAX_SHUFFLE_FANIN:
         return False
+    # A complete repartition where source splits a dropped axis (not present in
+    # destination.work_slice_dims) by _MAX_SHUFFLE_FANIN causes silent corruption:
+    # the shuffle emitter only programs addressing for destination axes, so all
+    # slices along the dropped axis write to the same offset (issue #5811, NDO=1).
+    _dropped_split_product = 1
+    for _axis, _split in source_splits.items():
+        if _axis not in destination_splits:
+            _dropped_split_product *= _split
+    if (
+        destination_slices == destination_num_cores
+        and _dropped_split_product >= _MAX_SHUFFLE_FANIN
+    ):
+        return False
     # A complete destination is an exact repartition, including contraction
     # onto fewer cores and expansion onto more cores. The shuffle's per-tensor
     # maps describe the two domains; STCDP intersects their pieces rather than
