@@ -47,6 +47,7 @@ from torch_spyre._C import SpyreTensorLayout
 from torch_spyre._inductor import config
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.scratchpad.plan_solver import TileAxis, TileSpec
+from torch_spyre._inductor.wsr import enumerate_tilings as enumerate_tilings_module
 from torch_spyre._inductor.wsr.enumerate_tilings import (
     _MAX_AUTO_TILE_SPLIT_COUNT,
     _reduction_split_counts,
@@ -595,6 +596,66 @@ class TestTilingSpace(unittest.TestCase):
         space = build_tiling_space(op)
         self.assertTrue(space.is_empty)
         self.assertEqual(space.enumerate(), [TileSpec()])
+
+
+class TestRefusalLog(unittest.TestCase):
+    """One DEBUG line per call: what the op is offered, and why the rest is
+    refused."""
+
+    def _log(self, op, **kwargs):
+        with self.assertLogs(enumerate_tilings_module.logger, level="DEBUG") as logs:
+            build_tiling_space(op, **kwargs)
+        return "\n".join(logs.output)
+
+    def test_an_offered_op_names_each_refused_dim(self):
+        log = self._log(_pointwise_op((1, 6, 128)))
+        self.assertIn("buf0 is offered coarse tiling counts {1: [2, 3, 6]}", log)
+        # Dim 0's reason is forwarded from _split_candidates_for_host_dim, so
+        # match only the word that identifies it.
+        self.assertIn("dim 0: ", log)
+        self.assertIn("unsplittable", log)
+        self.assertIn("dim 2: the stick dim", log)
+
+    def test_a_dim_whose_every_count_breaks_a_reader_says_so(self):
+        # Dim 1's only count, 2, is a unit tile the rank-changing reader refuses.
+        log = self._log(_pointwise_op((4, 2, 128)), readers=[_reader((8, 128))])
+        self.assertIn("counts {0: [2]}", log)
+        self.assertIn("dim 1: every count leaves a unit tile", log)
+
+    def test_a_dim_the_lowering_refuses_says_why(self):
+        with patch.object(
+            enumerate_tilings_module,
+            "try_resolve_tile_axis_loop_vars",
+            return_value=(None, "no loop var"),
+        ):
+            log = self._log(_pointwise_op((4, 8, 256)))
+        self.assertIn("buf0 is offered coarse tiling counts {}", log)
+        self.assertIn("dim 0: no loop var; dim 1: no loop var; dim 2: the stick", log)
+
+    def test_an_op_refused_whole_says_why(self):
+        def hinted(op):
+            op.dim_hints = [object()]
+
+        def grouped(op):
+            op.loop_info = object()
+
+        for mark, reason in (
+            (hinted, "already tiled by the hint or span-overflow pass"),
+            (grouped, "already a member of a coarse-tiling loop group"),
+        ):
+            with self.subTest(reason=reason):
+                op = _pointwise_op((512, 256, 128))
+                mark(op)
+                self.assertIn(
+                    f"buf0 is offered no coarse tiling: {reason}", self._log(op)
+                )
+        with patch(
+            "torch_spyre._inductor.wsr.enumerate_tilings._stick_host_dim",
+            return_value=None,
+        ):
+            log = self._log(_pointwise_op((512, 256, 128)))
+        self.assertIn("cannot name its stick dim", log)
+        self.assertIn("a MagicMock, not a ComputedBuffer", self._log(MagicMock()))
 
 
 if __name__ == "__main__":
