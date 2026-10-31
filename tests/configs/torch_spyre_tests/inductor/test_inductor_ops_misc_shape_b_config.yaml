@@ -37,6 +37,8 @@ test_suite_config:
             # flip: non-stick dims reverse via index_select; the stick-dim
             # cases are skipped inside the test: they fault the card
             - TestOps::test_flip.*
+            # upsample_nearest covers test_upsample_nearest_dynamic too
+            - TestOps::test_upsample_nearest.*
             - TestOps::test_permute.*
             - TestOps::test_unbind.*
             - TestOps::test_size_one.*
