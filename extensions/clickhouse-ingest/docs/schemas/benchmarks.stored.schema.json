@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Benchmark identity, component-scoped so two repos cannot collide on one name.",
+  "properties": {
+    "benchmark_id": {},
+    "component": {
+      "minLength": 1
+    },
+    "name": {
+      "minLength": 1
+    },
+    "props": {},
+    "tags": {}
+  },
+  "required": [
+    "benchmark_id",
+    "component",
+    "name",
+    "tags",
+    "props"
+  ],
+  "title": "benchmarks: the stored row",
+  "type": "object",
+  "x-uploadable": false
+}
