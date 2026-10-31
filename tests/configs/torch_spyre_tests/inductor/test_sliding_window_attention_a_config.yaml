@@ -1,0 +1,18 @@
+# Sliding-window-attention shard A. The test file is split three ways for CI
+# wall-clock balance: the prefill tests below each take 90-130s to compile, and
+# together with the rest they made one ~21 minute job. Shards _a and _b each take
+# four of the slow tests; test_sliding_window_attention_config.yaml runs the rest.
+# Every test is named in exactly one of the three files, as make check-all-configs
+# requires: a test added to the SWA test file must be added to one of them.
+test_suite_config:
+  labels: [unit, regression, integration, trunk]
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_sliding_window_attention.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            - TestSlidingWindowAttention::test_prefill_batch_gqa
+            - TestSlidingWindowAttention::test_prefill_gqa
+            - TestSlidingWindowAttention::test_prefill_batch
+            - TestSlidingWindowAttention::test_prefill_head_dim_128
+          mode: mandatory_success
