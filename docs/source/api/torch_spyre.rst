@@ -725,6 +725,10 @@ Environment Variables
      - Wall-clock budget for one CP-SAT solve (default ``60``; ``0``
        disables the limit). Applies separately to each optimization phase.
        A timeout may return a feasible plan without proving optimality.
+   * - ``SPYRE_FP32_MATMUL_PRODUCT_BYTES``
+     - Largest fp32 ``[..., M, N, K]`` product one step of an fp32 matmul
+       materializes (default ``67108864``, 64 MiB); a larger product is
+       computed in M tiles
    * - ``HBM_POOL_PLANNING``
      - Enable HBM-pool planning for intermediates not in LX
        (default ``1``)
