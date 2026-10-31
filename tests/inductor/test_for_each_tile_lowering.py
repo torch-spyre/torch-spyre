@@ -3007,7 +3007,9 @@ class TestTryProveForEachTile(unittest.TestCase):
                 enable_spyre_lowerings(),
             ):
                 graph.run(counter)
-                self.assertEqual(_extract_trip_count(graph), 16)
+                result = _extract_trip_count(graph)
+                self.assertTrue(result.accepted, result.reason)
+                self.assertEqual(result.trip_count, 16)
                 self.assertEqual(len(graph.operations), 1)
                 self.assertIsInstance(graph.operations[0], ir.ComputedBuffer)
 
@@ -3044,7 +3046,8 @@ class TestTryProveForEachTile(unittest.TestCase):
         # insert a to_dtype cast for 0-dim integer predicates compared against
         # an int.  If it does, the cond graph grows a second op (n_ops == 2)
         # and the bound becomes float(N) instead of int(N), both of which make
-        # _extract_trip_count return None, causing silently wrong loop counts.
+        # _extract_trip_count decline, and splice_while_loops then refuses the
+        # loop.
         while_op = _find_while_loop_ir_op_with_spyre_cmp_lowerings(
             split_m_fn, matmul_inputs()[0]
         )
@@ -3274,11 +3277,41 @@ class TestTryProveForEachTile(unittest.TestCase):
                     self.assertTrue(result.accepted, result.reason)
                     self.assertIsInstance(loop, ir.WhileLoop)
 
+    def test_a_symint_operand_leaves_the_counter_first(self):
+        # A symbolic trip count brings a SymInt into the loop's operands. The
+        # counter must still be carried_inputs[0], since every proof above reads
+        # it by position.
+        x = torch.randn(128, 64)
+        torch._dynamo.mark_dynamic(x, 0)
+
+        (loop,) = self._all_while_loops(_length_scaled_fn, (x,))
+        result = try_prove_for_each_tile(loop)
+
+        self.assertTrue(result.accepted, result.reason)
+        self.assertTrue(result.trip_count.free_symbols, result.trip_count)
+
     def _all_while_loops(self, fn, args):
         from torch._inductor import ir
 
         graph = TestSpliceWhileLoops()._run_graph(fn, args)
         return [op for op in graph.operations if isinstance(op, ir.WhileLoop)]
+
+
+def _length_scaled_fn(x: torch.Tensor) -> torch.Tensor:
+    """A symbolic-length loop whose body reads the length, a SymInt operand."""
+    from torch_spyre._inductor.wsr import for_each_tile
+
+    rows = x.shape[0]
+    torch._check(rows >= 64)
+    torch._check(rows <= 512)
+    torch._check(rows % 32 == 0)
+
+    def body(_, ops):
+        (tile,) = ops
+        return None, tile * rows
+
+    _, out = for_each_tile(body, (x,), dims=(0,), tile_size=32, out_dim=0)
+    return out
 
 
 class TestPassPipelineRegistration(unittest.TestCase):

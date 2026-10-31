@@ -67,7 +67,9 @@ does exactly:
     return tmp2
 
 i.e. `lt(iteration_sym, N)` with N a plain Python int/constant baked in by
-the tracer (for_each_tile.py's `_step_counter`/`count_mode` logic always
+the tracer, or, for a symbolic trip count, an `ops.index_expr` carrying the
+count expression in place of the constant (for_each_tile.py's
+`_step_counter`/`count_mode` logic always
 carries the trip counter as carried_inputs[0], and the cond subgraph's own
 first placeholder is that same carry positionally). `N` is not exposed as a
 separate symbolic node anywhere reachable from the IR level -- it only shows
@@ -158,6 +160,11 @@ class _CounterStepRecorder(DefaultHandler):
     Anything else is routed through ``_default`` and recorded as an
     unexpected op so the caller can decline with a useful reason, mirroring
     ``_CondInnerFnRecorder``.
+
+    This one records only ``constants``, where ``_CondInnerFnRecorder`` records
+    ``bounds`` from both ``constant`` and ``index_expr``. That is on purpose:
+    the trip count can be symbolic, but the counter's step is always the
+    literal 1, so an ``index_expr`` here is not a step and declines.
     """
 
     def __init__(self) -> None:
@@ -193,9 +200,8 @@ def _extract_trip_count(cond_graph) -> ProverResult:
     trip count and an index_expr for a symbolic one.
 
     Returns an accepted result carrying N, or a declined one whose reason names
-    what it saw instead. The reason matters: declining is not an error, the
-    kernel simply specialises, so without it a symbolic loop that failed to be
-    recognised looks exactly like one that was never asked for.
+    what it saw instead. splice_while_loops refuses every declined loop with
+    Unsupported, so the reason is the error message a user sees.
     """
 
     def declined(reason: str) -> ProverResult:
