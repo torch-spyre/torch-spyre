@@ -17,7 +17,7 @@
 Covers the three `FallbackKernel.create` output shapes (upstream
 torch/_inductor/ir.py):
 
-  shape 1 (single tensor)  -> MultiOutputLayout + 1 trailing MultiOutput
+  shape 1 (single tensor)  -> FixedLayout on the FallbackKernel itself
   shape 2 (tuple of N)     -> MultiOutputLayout + N trailing MultiOutputs
   shape 3 (void/in-place)  -> NoneLayout       + 0 trailing MultiOutputs
 
@@ -180,9 +180,9 @@ if not _ns_has_op("test_fk_cat", "cat_two"):
 class TestFallbackKernelShape1Single(unittest.TestCase):
     """Shape 1: op(...) -> Tensor.
 
-    Lowered to MultiOutputLayout FallbackKernel + 1 trailing MultiOutput.
-    Was the only shape the original passes handled correctly; included
-    here so all three shapes are covered by one test file.
+    PyTorch 2.14 puts the output layout on the FallbackKernel itself, instead
+    of creating a trailing MultiOutput. The consumer must still receive a
+    Spyre layout.
     """
 
     def test_single_tensor_return_compiles(self):

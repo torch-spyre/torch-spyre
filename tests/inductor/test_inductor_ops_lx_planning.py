@@ -24,7 +24,7 @@ from torch.testing import FileCheck
 from torch._dynamo.testing import make_test_cls_with_patches
 
 import unittest
-from utils_inductor import compare_with_cpu
+from utils_inductor import _safe_test_name, compare_with_cpu
 
 _test_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 sys.path.append(_test_dir)
@@ -100,11 +100,11 @@ def _canonical_test_names(test_cls):
                     None,
                 )
                 if case is not None:
-                    canonical.add(f"{prefix}_{op_name}_{case}")
+                    canonical.add(_safe_test_name(f"{prefix}_{op_name}_{case}"))
         else:
             case = next((c for c in param_sets if c not in expect_fail), None)
             if case is not None:
-                canonical.add(f"{prefix}_{case}")
+                canonical.add(_safe_test_name(f"{prefix}_{case}"))
     for name in vars(test_cls):
         if name.startswith("test_") and not any(
             name.startswith(p + "_") for p in parameterized_prefixes

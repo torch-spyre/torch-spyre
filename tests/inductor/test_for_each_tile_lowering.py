@@ -2894,6 +2894,66 @@ class TestDrainMaterialization(unittest.TestCase):
 
 
 class TestTryProveForEachTile(unittest.TestCase):
+    def _fallback_counter_init(self, fill=0, size=(), dtype=torch.int64, wrapped=False):
+        from torch._inductor import ir
+        from torch._inductor.graph import GraphLowering
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        from torch.fx.experimental.proxy_tensor import make_fx
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        from torch_spyre._inductor.lowering import enable_spyre_lowerings
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import _unwrap_to_buffer
+
+        # Use the real Spyre full lowering: CPU re-lowering alone emits a
+        # Pointwise and cannot exercise the fallback representation from CI.
+        with FakeTensorMode(shape_env=ShapeEnv()) as fake_mode:
+            gm = make_fx(lambda: (torch.full(size, fill, dtype=dtype),))()
+            graph = GraphLowering(gm, example_inputs=[], shape_env=fake_mode.shape_env)
+            with (
+                V.set_graph_handler(graph),
+                V.set_fake_mode(fake_mode),
+                enable_spyre_lowerings(),
+            ):
+                graph.run()
+                init = _unwrap_to_buffer(graph.graph_outputs[0])
+                self.assertIsInstance(init, ir.FallbackKernel)
+                if wrapped:
+                    # Recreate the pre-2.14 single-output representation.
+                    layout = init.layout
+                    init.layout = ir.MultiOutputLayout(device=init.get_device())
+                    init = ir.MultiOutput(layout, init, [])
+                return init
+
+    def test_fallback_counter_zero_is_proven(self):
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _counter_init_failure,
+        )
+
+        for wrapped in (False, True):
+            with self.subTest(wrapped=wrapped):
+                init = self._fallback_counter_init(wrapped=wrapped)
+                self.assertIsNone(
+                    _counter_init_failure(mock.Mock(carried_inputs=[init]))
+                )
+
+    def test_fallback_counter_requires_scalar_int64_zero(self):
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _counter_init_failure,
+        )
+
+        cases = (
+            ({"fill": 1}, "fill value is 1, not 0"),
+            ({"size": (1,)}, "not a scalar fill"),
+            ({"dtype": torch.int32}, "not the int64"),
+        )
+        for wrapped in (False, True):
+            for kwargs, reason in cases:
+                with self.subTest(wrapped=wrapped, kwargs=kwargs):
+                    init = self._fallback_counter_init(wrapped=wrapped, **kwargs)
+                    failure = _counter_init_failure(mock.Mock(carried_inputs=[init]))
+                    self.assertIsNotNone(failure)
+                    self.assertIn(reason, failure)
+
     def test_host_counter_stays_integer_under_spyre_comparison_lowering(self):
         from torch._inductor import ir
         from torch._inductor.graph import GraphLowering

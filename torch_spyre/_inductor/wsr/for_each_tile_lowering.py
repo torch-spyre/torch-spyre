@@ -283,10 +283,11 @@ def _counter_init_failure(while_op: "ir.WhileLoop") -> str | None:
 
     The trip count ``N`` of ``lt(counter, N)`` is the number of iterations only
     if the counter starts at 0. The frontend's counter (``carried_inputs[0]``)
-    is always ``torch.zeros([], int64)``, which reaches the IR as a
-    ``MultiOutput`` of an ``aten.full.default`` ``FallbackKernel`` with no
-    tensor inputs. Anything else -- a caller-provided tensor, a different fill
-    value, a non-scalar -- is not proven.
+    is always ``torch.zeros([], int64)``, which reaches the IR as an
+    ``aten.full.default`` ``FallbackKernel`` with no tensor inputs. Before
+    PyTorch 2.14 its output was wrapped in a ``MultiOutput``; 2.14 returns the
+    kernel directly. Both representations must satisfy the same checks.
+    A caller-provided tensor, a different fill value, or a non-scalar is not proven.
     """
     from torch._inductor import ir
 
@@ -302,12 +303,15 @@ def _counter_init_failure(while_op: "ir.WhileLoop") -> str | None:
         )
     if isinstance(init, ir.ComputedBuffer):
         return _pointwise_zero_failure(init)
-    if not isinstance(init, ir.MultiOutput):
+    if isinstance(init, ir.FallbackKernel):
+        kernel = init
+    elif isinstance(init, ir.MultiOutput):
+        kernel = init.inputs[0] if init.inputs else None
+    else:
         return (
             "counter init is a "
             f"{type(init).__name__}, not a constant fill the prover can read"
         )
-    kernel = init.inputs[0] if init.inputs else None
     if not isinstance(kernel, ir.FallbackKernel):
         return "counter init is not produced by a fallback kernel"
     if getattr(kernel, "op_overload", None) is not torch.ops.aten.full.default:
