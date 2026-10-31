@@ -70,6 +70,7 @@ from .insert_restickify import (
     validate_no_restickify_on_mutation_targets,
 )
 from .enforce_indirect_access_layout import enforce_indirect_access_layout
+from .fold_shared_indirect_dims import fold_shared_indirect_dims
 from .hbm_pool_planning import hbm_pool_planning
 from .work_division import (
     span_reduction,
@@ -459,6 +460,12 @@ class CustomPreSchedulingPasses:
             # Convert for_each_tile WhileLoops bodies into inlined IR with loop_infos
             splice_while_loops,
             deadcode_elimination,
+            #
+            # Fold a loop dim that both reads a gather index and addresses the
+            # gathered tensor into the index (#4840). Runs before named dims and
+            # stickification so its new arange/add ops are handled like any
+            # user-written op.
+            fold_shared_indirect_dims,
             #
             # Named-dimension propagation (pre-stickification)
             # Resolves spyre_hint(work_div=...) names onto loop variables from
