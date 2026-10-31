@@ -35,6 +35,7 @@ test_suite_config:
             # bitwise (fallback path)
             - TestOps::test_bitwise_and.*
             - TestOps::test_bitwise_not.*
+            - TestOps::test_logical_int_mask.*
             # misc arithmetic / ops
             - TestOps::test_dropout_functional.*
             - TestOps::test_fallback.*
