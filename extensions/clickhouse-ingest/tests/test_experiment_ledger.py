@@ -16,7 +16,7 @@
 
 import json
 import math
-import re
+import regex as re
 from datetime import datetime
 
 import pytest
