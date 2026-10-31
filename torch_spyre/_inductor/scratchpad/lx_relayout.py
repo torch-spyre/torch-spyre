@@ -60,6 +60,7 @@ from ..loop_info import CoarseTileInfo
 from ..logging_utils import get_inductor_logger
 from ..op_spec import TensorWorkDivision
 from ..padding import is_restickify_op
+from ..work_division import has_resolved_work_div_hint
 from ..pass_utils import (
     PerCoreView,
     _is_matmul_op,
@@ -903,6 +904,27 @@ def solver_relayout_edge_context(
     # not once.
     producer_loop_info = getattr(producer, "loop_info", None)
     consumer_loop_info = getattr(consumer, "loop_info", None)
+    # Narrowed per the #5632 follow-up: only a matmul consumer fed by a
+    # producer whose OWN work_div hint actually resolved
+    # (has_resolved_work_div_hint -- needs get_op_hints to find a real
+    # _hint_N on some origin, which needed its own fix: a for_each_tile
+    # body's while_loop origin carries unrelated, also-non-empty scan-replay
+    # bookkeeping that was stopping the old scan before it ever reached the
+    # hinted node) gets the same-tile-group exception at all. That is K/V's
+    # own page gather feeding the QK^T/PV matmuls in spyre-inference's
+    # prefill kernel, torch-spyre#5057's real case. Everything else (a
+    # pointwise consumer, or a matmul consumer fed by an unhinted
+    # intermediate) keeps the pre-#5057 blanket exclusion.
+    #
+    # Measured on that kernel (prefill_q512_ctx512): a resolved hint also
+    # collapses the producer's own candidate division count (43-72 ->
+    # near-1), which is most of the win -- not just which edges reach this
+    # gate. Full enumeration: 17 edges, 4527 relayout candidates priced,
+    # ~43-47s cold compile. This gate: 4 edges (2 inside the exception, K's
+    # restickify and V's identity; 2 unrelated pre-existing candidates
+    # outside it), 1147 candidates, ~25-27s -- compile time within ~2s of
+    # the exception being off entirely (~24s), device time unchanged from
+    # full enumeration (~14% faster than the exception being off).
     same_tile_group = (
         config.lx_same_tile_group_relayout
         and isinstance(producer_loop_info, CoarseTileInfo)
@@ -912,6 +934,9 @@ def solver_relayout_edge_context(
             hasattr(consumer, "_read_copy_elision_record")
             and is_restickify_op(consumer, graph)
         )
+        and _is_matmul_op(consumer)
+        and isinstance(producer, ComputedBuffer)
+        and has_resolved_work_div_hint(producer)
     )
     if (
         producer_loop_info is not None or consumer_loop_info is not None

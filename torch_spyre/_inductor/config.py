@@ -485,6 +485,11 @@ enable_uniqueness_check: bool = (
 # This trades a device-runtime boost for a compile-time slow-down. While
 # investigating ways to speed up the compile side (#5609), we leave it off by
 # default for now. Set SPYRE_LX_SAME_TILE_GROUP_RELAYOUT=1 to opt in.
+# solver_relayout_edge_context's own gate (lx_relayout.py) narrows what this
+# flag actually admits to a specific, named case (a matmul consumer fed by a
+# producer whose own work_div hint resolved) rather than every same-group
+# edge, which recovers most of the compile-time cost without losing the
+# device-time win -- see that function's comment for the measured numbers.
 lx_same_tile_group_relayout: bool = (
     os.environ.get("SPYRE_LX_SAME_TILE_GROUP_RELAYOUT", "0") == "1"
 )
