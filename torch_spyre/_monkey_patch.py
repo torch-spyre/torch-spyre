@@ -490,6 +490,58 @@ def _patch_tensor_for_spyre():
         warnings.warn(f"Failed to install safetensors Spyre patches: {e}")
 
 
+def _patch_fake_tensor_device_init():
+    """Force ``FakeTensorMode.avoid_device_init`` to True for the Spyre backend.
+
+    ``FakeTensorMode.avoid_device_init`` returns False whenever a PrivateUse1
+    backend is available, so ``torch.tensor(..., device="spyre")`` executed
+    under FakeTensorMode materializes a real device scalar: the C++ ctor
+    H2D-copies the data onto the device, and the ``lift_fresh``
+    constant-propagation ``clone()`` under ``no_dispatch`` falls into
+    ``spyre__copy_from``'s CPU round-trip (D2H + H2D). Inductor's SDPA
+    pattern init (``fuse_attention.py``'s
+    ``c_inp = functools.partial(torch.tensor, 2.0, device=device)``) hits
+    this 26 times per cold compile: 78 one-stick (128B) DMAs plus 78 device
+    memsets, each with a forced host synchronize.
+
+    Forcing the property to True makes ``FakeTensorMode.__enter__`` set
+    ``torch._C._set_only_lift_cpu_tensors(True)`` (see NOTE: [torch.tensor,
+    lift_fresh, and device movement] in torch/csrc/utils/tensor_new.h), so
+    the ctor builds a CPU constant, ``lift_fresh`` clones it on CPU, and the
+    move to Spyre is a fake ``.to`` — no real device storage is touched
+    while tracing. Eager (non-fake) ``torch.tensor`` behavior is unchanged.
+
+    Scoped to processes whose registered PrivateUse1 backend is Spyre;
+    anything else keeps torch's own availability logic. Disable with
+    ``SPYRE_AVOID_FAKE_DEVICE_INIT=0``. Idempotent.
+
+    TODO: remove once torch grows a supported opt-out for third-party
+    backends (e.g. a ``fake_tensor_avoid_device_init`` config).
+    """
+    import os
+
+    if os.environ.get("SPYRE_AVOID_FAKE_DEVICE_INIT", "1") == "0":
+        return
+
+    import torch
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    current = getattr(FakeTensorMode, "avoid_device_init", None)
+    orig_fget = getattr(current, "fget", None)
+    if not isinstance(current, property) or orig_fget is None:
+        return
+    if getattr(orig_fget, "_spyre_patched", False):
+        return
+
+    def _spyre_avoid_device_init(self):
+        if torch._C._get_privateuse1_backend_name() == DEVICE_NAME:
+            return True
+        return orig_fget(self)
+
+    _spyre_avoid_device_init._spyre_patched = True  # type: ignore[attr-defined]
+    FakeTensorMode.avoid_device_init = property(_spyre_avoid_device_init)
+
+
 def _patch_invoke_subgraph_decompositions():
     """Thread the Spyre decomp table into invoke_subgraph subgraph re-traces.
 
