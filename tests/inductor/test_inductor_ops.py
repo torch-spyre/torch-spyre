@@ -5173,8 +5173,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
-        # TODO: aten::native_batch_norm not implemented for the 'spyre' backend
-        # (runtime NotImplementedError before compilation) (issue #1889)
         ("test_batch_norm_functional", "test_batch_norm_functional_cpu"): {
             "param_sets": {
                 "eval_mode": (
@@ -5184,10 +5182,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     torch.ones((256,), dtype=torch.float16),
                     torch.zeros((256,), dtype=torch.float16),
                 ),
+                "nontrivial_stats": (
+                    cached_randn((64, 256), dtype=torch.float16),
+                    cached_randn((256,), dtype=torch.float16, differentiation=1),
+                    cached_randn(
+                        (256,), dtype=torch.float16, differentiation=2, abs=True
+                    ),
+                    cached_randn((256,), dtype=torch.float16, differentiation=3),
+                    cached_randn((256,), dtype=torch.float16, differentiation=4),
+                ),
             },
-            # TODO: a missing feature, not a design limit. When aten::native_batch_norm
-            # is registered this stops raising, and the case has to become a positive one.
-            "expect_raise": {"eval_mode": "Could not run 'aten::native_batch_norm'"},
         },
         # TODO: group_norm fails layout propagation with a stick incompatibility
         # (issue #3287).
@@ -11534,7 +11538,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, x, weight)
 
-    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    @pytest.mark.filterwarnings("error::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_batch_norm_functional_cpu(
         self, x, running_mean, running_var, weight, bias
     ):
