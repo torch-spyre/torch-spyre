@@ -98,7 +98,8 @@ FROM experiment_findings AS f
 GROUP BY f.finding_id;
 
 -- Per candidate arm and metric: its newest published effect finding, beside the newest
--- stopping-rule decision (which exists before any finding is published).
+-- stopping-rule decision (which exists before any finding is published). Finding columns are
+-- NULL when there is none, not 0.
 CREATE VIEW IF NOT EXISTS v_arm_verdicts AS
 SELECT
     d.experiment_id                               AS experiment_id,
@@ -148,7 +149,8 @@ LEFT JOIN
     FROM v_experiment_findings AS y
     WHERE y.kind = 'effect' AND y.state = 'published'
     GROUP BY y.experiment_id, y.arm, y.metric
-) AS f USING (experiment_id, arm, metric);
+) AS f USING (experiment_id, arm, metric)
+SETTINGS join_use_nulls = 1;
 
 -- A/A noise floor per (workload, metric, stratum). `measured` pools the paired log differences
 -- of every experiment whose two arms share a knob_sha; `reported` is a noise_floor finding from
@@ -239,7 +241,7 @@ LEFT JOIN
 ) AS fc ON fc.experiment_id = e.experiment_id;
 
 -- What was already tried for a subject, one row per (experiment, arm): its knobs and best
--- published finding, so an opportunity is not re-run blind. Filter on subject_key.
+-- published finding (NULL when none), so an opportunity is not re-run blind. Filter on subject_key.
 CREATE VIEW IF NOT EXISTS v_subject_tried AS
 SELECT
     e.subject_level                               AS subject_level,
@@ -276,4 +278,5 @@ LEFT JOIN
     FROM v_experiment_findings AS t
     WHERE t.state = 'published' AND t.kind IN ('effect', 'calibration', 'feasibility')
     GROUP BY t.experiment_id, t.arm
-) AS f ON f.experiment_id = a.experiment_id AND f.arm = a.arm;
+) AS f ON f.experiment_id = a.experiment_id AND f.arm = a.arm
+SETTINGS join_use_nulls = 1;

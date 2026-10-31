@@ -330,7 +330,7 @@ def test_views_read_an_ab_and_an_aa_run(chdb_session):
         "WHERE subject_key = 'toy_model_b1' AND role = 'candidate' ORDER BY experiment",
     )
     assert tried == [
-        {"experiment": "exp-aa", "arm": "B", "knobs": {}, "gain_evidence": ""},
+        {"experiment": "exp-aa", "arm": "B", "knobs": {}, "gain_evidence": None},
         {
             "experiment": "exp-ab",
             "arm": "B",
