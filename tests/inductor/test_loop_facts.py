@@ -17,6 +17,7 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
 import torch  # noqa: F401
 import sympy
 from torch._inductor.ir import ExternKernel
@@ -30,6 +31,7 @@ from torch_spyre._inductor.loop_facts import (
     scheduler_enclosing_loops,
 )
 from torch_spyre._inductor.loop_info import CoarseTileInfo
+from torch_spyre._inductor.scheduler import _loop_count, _loop_group_id
 from torch_spyre._inductor.scratchpad.utils import counted_loop_group_path
 
 
@@ -152,3 +154,36 @@ def test_agrees_with_existing_readers():
             assert [lvl.tiled_dims for lvl in levels] == [
                 tuple(d) for d in info.loop_tiled_dims
             ] + [()] * (len(levels) - len(info.loop_tiled_dims))
+
+
+def _sched_node(info):
+    node = MagicMock()
+    node.get_nodes.return_value = [_snode(info)]
+    node.get_name.return_value = "buf0"
+    return node
+
+
+def test_scheduler_readers_well_formed():
+    node = _sched_node(_info((3, 0), [2, 8]))
+    assert _loop_group_id(node) == (3, 0)
+    assert _loop_count(node, 0) == 2
+    assert _loop_count(node, 1) == 8
+    assert _loop_group_id(_sched_node(None)) is None
+
+
+def test_scheduler_readers_malformed_ids_read_as_no_loop():
+    # A bare-int or empty id used to raise TypeError / return () from
+    # _loop_group_id; it now reads as "no loop", like the other accessors.
+    for gid in (3, ()):
+        assert _loop_group_id(_sched_node(_info(gid, [4]))) is None
+
+
+def test_scheduler_loop_count_missing_depth_is_loud():
+    node = _sched_node(_info((0,), [4]))
+    with pytest.raises(AssertionError, match="no loop_count for depth 1"):
+        _loop_count(node, 1)
+    # A loop_count shorter than the id reads as "no loop" for both readers.
+    short = _sched_node(_info((0, 1), [4]))
+    assert _loop_group_id(short) is None
+    with pytest.raises(AssertionError, match="no loop_count for depth 0"):
+        _loop_count(short, 0)
