@@ -8964,6 +8964,25 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        # A row slice of two dims merged by a reshape: the buffer is stored as
+        # (1, A=8, s=2, W, C) and read as (1, 16, W, C)[:, lo:hi]. Row r is
+        # stored at (r // 2, r % 2), so the slice offset must be split across
+        # both dims and recombined when they fuse back into one.
+        ("test_merged_row_slice", "test_merged_row_slice_cpu"): {
+            "param_sets": {
+                # Outer offset 1 fuses as 1*2 + 0 = 2 rows, not 1 + 0.
+                "even_start": (2, 16, cached_randn((1, 8, 8, 2, 64))),
+                # Odd starts past row s are affected too: 1*2 + 1 = 3, not 2.
+                "odd_start": (3, 15, cached_randn((1, 8, 8, 2, 64))),
+                # The row var fits the inner dim (2 rows), but with the offset
+                # rows 1..2 cross into the next outer index and must carry.
+                "carry": (1, 3, cached_randn((1, 8, 8, 2, 64))),
+                # Outer offset 0: the fused offset is right without scaling.
+                "start_below_s": (1, 15, cached_randn((1, 8, 8, 2, 64))),
+                # One outer index: the dims stay separate and nothing carries.
+                "aligned": (2, 4, cached_randn((1, 8, 8, 2, 64))),
+            },
+        },
         # rotate_half on q/k built by view + transpose of the projection output:
         # the HF attention pattern issue #4050 was reported against.
         ("test_rope_on_split_stick_view", "test_rope_on_split_stick_view_cpu"): {
@@ -11647,6 +11666,20 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         def fn(x):
             return slicer(x.view(*view_shape)) * 1.0
+
+        self.compare_with_cpu(fn, x, run_eager=False)
+
+    def test_merged_row_slice_cpu(self, lo, hi, x):
+        """Slice rows of a (A, s) pair merged into A*s rows by a reshape.
+
+        x is (1, A, W, s, C); the permute makes the compiled graph store it as
+        (1, A, s, W, C), and the add is a real kernel that reads the view.
+        """
+
+        def fn(x):
+            n, a, w, s, c = x.shape
+            y = torch.permute(x, (0, 1, 3, 2, 4)).reshape(n, a * s, w, c)
+            return y[:, lo:hi] + 1.0
 
         self.compare_with_cpu(fn, x, run_eager=False)
 
