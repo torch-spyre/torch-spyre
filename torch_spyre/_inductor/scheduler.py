@@ -43,7 +43,6 @@ from .scratchpad.lx_relayout import (
     local_lx_emission_contract,
     materialized_lx_relayout_for_destination,
 )
-from .op_spec import LoopSpec
 from . import config as _spyre_config
 from .errors import Unsupported
 
@@ -631,7 +630,7 @@ class SuperDSCScheduling(BaseScheduling):
         # Wrap only the newly-added op_specs entries in this inner LoopSpec.
         body = kernel.op_specs[body_start:]
         kernel.op_specs = kernel.op_specs[:body_start]
-        kernel.op_specs.append(LoopSpec(count=node.loop_count, body=body))
+        kernel.op_specs.append(SpyreKernel.counted_loop(node.loop_count, body))
 
     def _codegen_into_kernel(
         self, nodes: list[BaseSchedulerNode], kernel: SpyreKernel

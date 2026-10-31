@@ -55,6 +55,7 @@ from torch._inductor.ops_handler import DefaultHandler, WrapperHandler
 from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.graph import GraphLowering
 from torch._inductor.utils import sympy_subs
+from torch.utils._sympy.functions import FloorDiv
 from torch._inductor.dependencies import MemoryDep, ReadWrites, is_indirect
 from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
 from torch._inductor.virtualized import V
@@ -379,8 +380,120 @@ def finite_upper_or_none(expr: Expr) -> Optional[int]:
     return None
 
 
+def decompose_tiled_count(count) -> "tuple[sympy.Symbol, int] | None":
+    """Split a loop's trip count into the symbol it tiles and its tile size.
+
+    Returns ``(symbol, tile_size)``, or None when the count is not a shape the
+    loop production can produce. Only two shapes are: a tiled dimension gives
+    ``shape[dim] // tile_size``, and a tile size of 1 gives the bare symbol.
+
+    This is how the granularity is RECOVERED rather than inferred.
+    ``for_each_tile(tile_size=G)`` puts G into the count itself, so reading it
+    back here means the granularity a bundle declares and the step its loop
+    takes come from one expression and cannot disagree. Not to be confused with
+    ``compute_granularity``, which picks a divisor for the SDSC route.
+
+    Both spellings of the division are accepted, at this one point. A trip count
+    reaches codegen as ``FloorDiv(s, G)``, but the kernel serializer writes
+    expressions as ``sympify('<str>')`` and ``str`` prints ``FloorDiv`` as
+    ``(s//G)``, which sympy re-parses into ``floor(s/G)``.
+
+    That same round trip builds a fresh ``Symbol`` without its assumptions, and
+    sympy counts assumptions as part of identity, so the reloaded symbol is
+    unequal to the one the scheduler saw while printing the same. **Any map that
+    has to outlive the reload is keyed by ``str(symbol)``.** The symbol itself is
+    returned because the scheduler needs it to query the ShapeEnv, which only
+    happens before the reload.
+    """
+    if isinstance(count, sympy.Symbol):
+        return count, 1
+
+    if isinstance(count, FloorDiv):
+        numerator, denominator = count.args
+    elif isinstance(count, sympy.floor):
+        numerator, denominator = count.args[0].as_numer_denom()
+    else:
+        return None
+
+    if isinstance(numerator, sympy.Symbol) and denominator.is_Integer:
+        tile_size = int(denominator)
+        if tile_size > 0:
+            return numerator, tile_size
+    return None
+
+
+def symbolic_count_bounds(count) -> "dict[str, tuple[int, int]]":
+    """``{symbol name: (max_value, tile_size)}`` for one loop's trip count.
+
+    Resolved here, while the ShapeEnv still exists, and carried on
+    ``LoopSpec.count_symbol_bounds`` because codegen also runs in a reload phase
+    where it is gone. The bundle turns each entry into one
+    ``!sdscbundle.input_arg<index, granularity=G, max_value=M>`` parameter and
+    takes its loop bound from it.
+
+    Keyed by NAME, not by the symbol, because the reload builds a fresh symbol
+    without its assumptions. See decompose_tiled_count.
+
+    Empty when there is nothing to carry, and the caller need not distinguish
+    the reasons: a concrete count, a shape the loop production cannot produce,
+    or a symbol with no declared ceiling all give ``{}``. Each leaves a kernel
+    that specialises, which is a worse binary rather than a wrong one, so the
+    refusal belongs at emission where the message can name the symbol.
+
+    Raises:
+        Unsupported: the count involves more than one symbol. The backend
+            asserts exactly one per symbolic loop, so that is a check failure
+            there rather than a degraded kernel here.
+    """
+    free_symbols = getattr(count, "free_symbols", None) or set()
+    if len(free_symbols) > 1:
+        raise Unsupported(
+            f"symbolic loop count {count} involves {len(free_symbols)} symbols, "
+            f"{sorted(map(str, free_symbols))}. A symbolic loop takes exactly "
+            f"one. If these dimensions are meant to be equal, tie them with "
+            f"torch._check before the region so they become one symbol."
+        )
+
+    decomposed = decompose_tiled_count(count)
+    if decomposed is None:
+        return {}
+
+    symbol, tile_size = decomposed
+    shape_env = V.graph.sizevars.shape_env
+    if shape_env is None:
+        return {}
+
+    upper = finite_upper_or_none(symbol)
+    if upper is None:
+        # The one empty case worth saying out loud. Without a ceiling there is
+        # nothing to build the geometry against, so the kernel specialises, and
+        # that looks identical to never having asked for a symbolic loop.
+        logger.warning(
+            "[symbolic-loop] trip count %s has no finite upper bound for %s, so "
+            "no bundle parameter can be emitted for it and this kernel will be "
+            "size-specific. Declare the range in the traced region",
+            count,
+            symbol,
+        )
+        return {}
+
+    logger.info(
+        "[symbolic-loop] %s: symbol %s max=%d tile_size=%d",
+        count,
+        symbol,
+        upper,
+        tile_size,
+    )
+    return {str(symbol): (upper, tile_size)}
+
+
 def compute_granularity(expr: Expr, max_size: int) -> int:
-    """Return the granularity for a symbolic dimension.
+    """Return the granularity for a symbolic dimension. SDSC route only.
+
+    Deprecated. The explicit-loop route supersedes this one and never calls it:
+    there G comes from ``for_each_tile(tile_size=G)`` through the trip count, so
+    the bundle's declared granularity and the loop's own step cannot disagree.
+    TODO(issue#5890): remove with the rest of the symbolic-SDSC route.
 
     Admissible runtime values are ``{G, 2G, ..., max_size}``. If the
     user passed ``mark_dynamic(min=...)`` we honour it after validation;
