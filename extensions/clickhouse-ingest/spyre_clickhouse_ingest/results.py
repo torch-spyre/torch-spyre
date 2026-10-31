@@ -1758,6 +1758,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="artifact_results prop k=v, repeatable; `source` replaces the jenkins/gha default",
     )
     parser.add_argument(
+        "--case-prop",
+        dest="case_props",
+        action="append",
+        type=pair,
+        default=[],
+        help="test_case_runs prop k=v added to every case row, repeatable (not part of any id)",
+    )
+    parser.add_argument(
         "--strict",
         action="store_true",
         help="exit 1 when --artifact/--artifact-id named an artifact but its verdicts were not "
@@ -2221,6 +2229,7 @@ def main(argv=None):
                             xml_path.name,
                             attempt=args.run_attempt,
                             arch=args.platform or run["platform"],
+                            row_props=dict(_opt(args, "case_props") or []),
                         )
                         print(f"  v2: {_n} test_case_runs under run_id={_v2_run_id}")
 

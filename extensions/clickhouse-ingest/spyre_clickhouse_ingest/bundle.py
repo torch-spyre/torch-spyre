@@ -120,6 +120,70 @@ def existing_run(client, db: str, rid: str, component: str) -> tuple:
     return {r[0] for r in verdicts}, {r[0] for r in files}
 
 
+def append_target(client, db: str, rid: str, component: str, upload_id: str) -> tuple:
+    """(the run's first verdict as (artifact_id, arch, test_type, result_kind, bundle_kind) or
+    None, file names its other uploads hold). A retried upload's own rows are not counted."""
+    first = client.query(
+        "SELECT artifact_id, arch, test_type, result_kind, props['bundle_kind'] "
+        f"FROM {db}.artifact_results WHERE run_id = {{rid:UUID}} AND state != 'running' "
+        "ORDER BY ts, audit_timestamp LIMIT 1",
+        parameters={"rid": rid},
+    ).result_rows
+    params = {"rid": rid, "c": component, "u": upload_id}
+    names = {
+        r[0]
+        for table in ("test_case_runs", "benchmark_runs")
+        for r in client.query(
+            f"SELECT DISTINCT props['source_file'] FROM {db}.{table} WHERE component = "
+            "{c:String} AND run_id = {rid:UUID} AND props['upload_id'] != {u:String}",
+            parameters=params,
+        ).result_rows
+    }
+    for (listed,) in client.query(
+        f"SELECT props['bundle_files'] FROM {db}.artifact_results "
+        "WHERE run_id = {rid:UUID} AND state != 'running'",
+        parameters=params,
+    ).result_rows:
+        names |= set(listed.split("\n"))
+    return (tuple(map(str, first[0])) if first else None), names - {""}
+
+
+def check_append(
+    target, names: set, taken: set, meta: dict, aid: str, rid: str
+) -> None:
+    """Refuse a round that is not for this run's artifact, arch, tier and kind, or that
+    repeats a file name the run holds."""
+    key = meta["run_key"]
+    if not is_manual(key):
+        raise BundleError(f"--append-to-run: {key!r} is not a manual run")
+    if target is None:
+        raise BundleError(
+            f"--append-to-run: run {key!r} ({rid}) has no recorded results"
+        )
+    t_aid, t_arch, t_type, t_result, t_kind = target
+    kind = meta.get("kind", "junit")
+    # A run recorded before bundle_kind was written is compared by result_kind alone.
+    if t_kind and t_kind != kind:
+        raise BundleError(
+            f"--append-to-run: run is a {t_kind} run, the bundle is {kind}"
+        )
+    if not t_kind and t_result != ("functional" if kind == "junit" else "performance"):
+        raise BundleError(f"--append-to-run: run is {t_result}, the bundle is {kind}")
+    for what, have, want in (
+        ("artifact", t_aid, aid),
+        ("arch", DerivedId.arch(t_arch), DerivedId.arch(meta["arch"])),
+        ("test_type", t_type, meta["test_type"]),
+    ):
+        if have != want:
+            raise BundleError(
+                f"--append-to-run: run has {what} {have}, the bundle {want}"
+            )
+    if names & taken:
+        raise BundleError(
+            f"--append-to-run: run {rid} already has {sorted(names & taken)}"
+        )
+
+
 def verdict_recorded(client, db: str, aid: str, rid: str, test_type: str) -> bool:
     return (
         client.query(
@@ -156,6 +220,10 @@ def results_argv(meta: dict, root: Path, aid: str, rid: str, props: dict, strict
     for k, v in props.items():
         if v:
             argv += ["--result-prop", f"{k}={v}"]
+    from .writer import upload_row_props
+
+    for k, v in upload_row_props(props).items():
+        argv += ["--case-prop", f"{k}={v}"]
     return argv + (["--strict"] if strict else [])
 
 
@@ -225,19 +293,35 @@ def _ingest(root: Path, args) -> dict:
     report = {"run_key": meta["run_key"], "run_id": rid, "artifact_id": aid, "artifact_from": via,
               "test_type": meta["test_type"], "arch": meta["arch"], "bundle_sha256": sha}  # fmt: skip
     seen, files = existing_run(client, db, rid, meta["component"])
-    if seen == {sha}:
+    names = {Path(p).name for p in (root / "results").iterdir()}
+    extra = dict(getattr(args, "bundle_prop", None) or [])
+    append = getattr(args, "append_to_run", False)
+    if append:
+        if sha in seen:
+            return {**report, "status": "duplicate"}
+        if not extra.get("upload_id"):
+            raise BundleError(
+                "--append-to-run needs --bundle-prop upload_id=<id>, which names the round"
+            )
+        target, taken = append_target(
+            client, db, rid, meta["component"], extra["upload_id"]
+        )
+        check_append(target, names, taken, meta, aid, rid)
+        report["append"] = True
+    elif seen == {sha}:
         return {**report, "status": "duplicate"}
-    if seen:
+    elif seen:
         raise BundleError(
             f"run {meta['run_key']!r} ({rid}) is already recorded by another run or bundle"
         )
-    names = {Path(p).name for p in (root / "results").iterdir()}
-    if files - names:
+    elif files - names:
         raise BundleError(f"run {rid} already has cases from {sorted(files - names)}")
     if args.dry_run:
         return {**report, "status": "would-ingest"}
-    props = {**dict(getattr(args, "bundle_prop", None) or []), "source": SOURCE,
-             "uploader": uploader, "bundle_sha256": sha, "bundle_url": args.bundle_url}  # fmt: skip
+    props = {**extra, "source": SOURCE, "uploader": uploader, "bundle_sha256": sha,
+             "bundle_url": args.bundle_url, "bundle_kind": meta.get("kind", "junit"),
+             "bundle_files": "\n".join(sorted(names)),
+             **({"round": "1"} if append else {})}  # fmt: skip
     if meta.get("kind") == "vllm":
         report["benchmark_runs"] = write_vllm(client, db, root, meta, aid, rid, props)
     elif meta.get("kind") == "sendnn":
@@ -248,6 +332,8 @@ def _ingest(root: Path, args) -> dict:
         )
     else:
         write_junit(db, root, meta, aid, rid, props, args.strict)
+        if append:
+            recount_junit(client, db, meta, aid, rid, props)
     if not verdict_recorded(client, db, aid, rid, meta["test_type"]):
         raise BundleError(
             f"no {meta['test_type']} verdict landed for {aid} under {rid}", FAILED
@@ -268,11 +354,65 @@ def write_junit(db, root, meta, aid, rid, props, strict) -> None:
             raise BundleError(f"results exited {exit_.code}", FAILED) from None
 
 
+def is_append(props: dict) -> bool:
+    return props.get("round") == "1"
+
+
+def record_verdict(
+    client, db, meta, aid, rid, props, state, duration_s, **extra
+) -> None:
+    """A benchmark kind's verdict. A round's is written over the whole run: the worst state of
+    its own and the run's, the durations added; the views read the newest row of the key."""
+    from .writer import ArtifactWriter, insert_artifact_result
+
+    append = is_append(props)
+    if append:
+        state, duration_s = ArtifactWriter.over_prior(
+            client, db, aid, rid, meta["test_type"], state, duration_s
+        )
+    insert_artifact_result(
+        client, db, artifact_id=aid, run_id=rid, test_type=meta["test_type"], state=state,
+        arch=meta["arch"], result_kind="performance", duration_s=duration_s, supersede=append,
+        props={**{k: v for k, v in props.items() if v}, **extra,
+               "run_url": meta.get("run_url") or props.get("bundle_url", "")},
+    )  # fmt: skip
+
+
+def recount_junit(client, db, meta, aid, rid, props) -> None:
+    """The junit verdict of a run after a round: recounted from every case the run holds, the
+    round's own case time added to the run's duration."""
+    from .results import _leg_failure, _leg_state
+    from .writer import ArtifactWriter, insert_artifact_result
+
+    where = "component = {c:String} AND run_id = {rid:UUID}"
+    params = {"c": meta["component"], "rid": rid, "u": props["upload_id"]}
+    failed, total, added = client.query(
+        "SELECT countIf(status IN ('failed', 'error')), count(), "
+        f"sumIf(duration_s, props['upload_id'] = {{u:String}}) FROM {db}.test_case_runs "
+        f"WHERE {where} AND props['upload_id'] NOT IN "
+        f"(SELECT toString(upload_id) FROM {db}.v_retracted_rounds)",
+        parameters=params,
+    ).result_rows[0]
+    prior = ArtifactWriter.latest_result(client, db, aid, rid, meta["test_type"])
+    state = _leg_state(failed, total)
+    acc = {"failed": failed, "total": total}
+    try:
+        insert_artifact_result(
+            client, db, artifact_id=aid, run_id=rid, test_type=meta["test_type"], state=state,
+            arch=meta["arch"], duration_s=(prior[1] if prior else 0.0) + float(added or 0),
+            supersede=True,
+            props={**{k: v for k, v in props.items() if v}, **_leg_failure(state, acc, {}),
+                   "run_url": meta.get("run_url") or props.get("bundle_url", "")},
+        )  # fmt: skip
+    except Exception as err:  # noqa: BLE001 -- a write error is a retry; the cases dedup
+        raise BundleError(f"verdict recount failed: {err!r}", FAILED) from None
+
+
 def write_vllm(client, db, root, meta, aid, rid, props) -> int:
     """The live vLLM leg's v2 rows: benchmarks + benchmark_runs, then its performance verdict."""
     from .client import tables_present
     from .schema import ARTIFACT_RESULTS, BENCHMARK_RUNS, BENCHMARKS
-    from .writer import insert_artifact_result
+    from .writer import upload_row_props
 
     if not tables_present(
         client, db, tables=(BENCHMARKS, BENCHMARK_RUNS, ARTIFACT_RESULTS)
@@ -283,15 +423,17 @@ def write_vllm(client, db, root, meta, aid, rid, props) -> int:
         raise BundleError("no vLLM metric extracted from results/")
     perf = meta.get("perf", {})
     try:
-        n = vllm.write_benchmarks(client, db, rows, rid)
-        insert_artifact_result(
-            client, db, artifact_id=aid, run_id=rid, test_type=meta["test_type"],
-            state=perf.get("state", "passed"), arch=meta["arch"],
-            result_kind="performance", duration_s=vllm.duration_s(rows),
-            props={**{k: v for k, v in props.items() if v},
-                   **{k: v for k, v in perf.items() if k.startswith("failure_")},
-                   "run_url": meta.get("run_url") or props.get("bundle_url", "")},
-        )  # fmt: skip
+        n = vllm.write_benchmarks(
+            client,
+            db,
+            rows,
+            rid,
+            row_props=upload_row_props(props),
+            append=is_append(props),
+        )
+        record_verdict(client, db, meta, aid, rid, props, perf.get("state", "passed"),
+                       vllm.duration_s(rows),
+                       **{k: v for k, v in perf.items() if k.startswith("failure_")})  # fmt: skip
     except Exception as err:  # noqa: BLE001 -- a write error is a retry; the writes dedup
         raise BundleError(f"vLLM write failed: {err!r}", FAILED) from None
     return n
@@ -323,8 +465,8 @@ def write_generic(client, db, root, meta, aid, rid, props) -> int:
     from .schema import ARTIFACT_RESULTS, BENCHMARK_RUNS, BENCHMARKS
     from .writer import (
         benchmarks_already_ingested,
-        insert_artifact_result,
         insert_benchmarks,
+        upload_row_props,
     )
 
     if not tables_present(
@@ -341,13 +483,9 @@ def write_generic(client, db, root, meta, aid, rid, props) -> int:
             ):
                 continue
             n += insert_benchmarks(client, db, component, rid, generic_entries(benchmark_entries(path)),
-                                   report_kind=GENERIC_KIND, source_file=path.name)  # fmt: skip
-        insert_artifact_result(
-            client, db, artifact_id=aid, run_id=rid, test_type=meta["test_type"],
-            state="passed", arch=meta["arch"], result_kind="performance", duration_s=0.0,
-            props={**{k: v for k, v in props.items() if v},
-                   "run_url": meta.get("run_url") or props.get("bundle_url", "")},
-        )  # fmt: skip
+                                   report_kind=GENERIC_KIND, source_file=path.name,
+                                   row_props=upload_row_props(props))  # fmt: skip
+        record_verdict(client, db, meta, aid, rid, props, "passed", 0.0)
     except Exception as err:  # noqa: BLE001 -- a write error is a retry; the writes dedup
         raise BundleError(f"benchmarks write failed: {err!r}", FAILED) from None
     return n
@@ -357,7 +495,7 @@ def write_sendnn(client, db, root, meta, aid, rid, props) -> int:
     """report_sendnn.txt as benchmark_runs on torch-spyre's own benchmark ids, then the verdict."""
     from .client import tables_present
     from .schema import ARTIFACT_RESULTS, BENCHMARK_RUNS, BENCHMARKS
-    from .writer import insert_artifact_result
+    from .writer import upload_row_props
 
     if not tables_present(
         client, db, tables=(BENCHMARKS, BENCHMARK_RUNS, ARTIFACT_RESULTS)
@@ -372,13 +510,9 @@ def write_sendnn(client, db, root, meta, aid, rid, props) -> int:
     if not any(sendnn.parse(p) for p in reports):
         raise BundleError("no sendnn metric parsed from results/")
     try:
-        n = sum(sendnn.write(client, db, rid, p, run_props) for p in reports)
-        insert_artifact_result(
-            client, db, artifact_id=aid, run_id=rid, test_type=meta["test_type"],
-            state="passed", arch=meta["arch"], result_kind="performance", duration_s=0.0,
-            props={**{k: v for k, v in props.items() if v},
-                   "run_url": meta.get("run_url") or props.get("bundle_url", "")},
-        )  # fmt: skip
+        row_props = upload_row_props(props)
+        n = sum(sendnn.write(client, db, rid, p, run_props, row_props) for p in reports)
+        record_verdict(client, db, meta, aid, rid, props, "passed", 0.0)
     except Exception as err:  # noqa: BLE001 -- a write error is a retry; the writes dedup
         raise BundleError(f"sendnn write failed: {err!r}", FAILED) from None
     return n
