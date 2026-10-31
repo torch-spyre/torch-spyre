@@ -369,6 +369,46 @@ class NativePermutationLayoutSolver {
     return total_quality_ - old_total;
   }
 
+  // resize and set_eligible over several buffers with one re-place: the
+  // layout is a function of the permutation, the sizes and the eligibility
+  // alone, so it equals the result of the calls made one at a time, which
+  // re-place after each. Resizes are applied before eligibility flags, as a
+  // caller that resizes then re-flags would. Returns the change in quality.
+  double update(const std::vector<std::pair<int, int64_t>>& resizes,
+                const std::vector<std::pair<int, bool>>& flags) {
+    const int n = st_->n;
+    for (const auto& [idx, new_size] : resizes) {
+      if (idx < 0 || idx >= n) {
+        throw std::invalid_argument("update resize index out of range");
+      }
+      if (new_size < 0) {
+        throw std::invalid_argument("resize size must be non-negative");
+      }
+    }
+    for (const auto& [idx, flag] : flags) {
+      if (idx < 0 || idx >= n) {
+        throw std::invalid_argument("update set_eligible index out of range");
+      }
+    }
+    bool dirty = false;
+    for (const auto& [idx, new_size] : resizes) {
+      if (sizes_[idx] == new_size) continue;
+      sizes_[idx] = new_size;
+      // An ineligible buffer's size is only recorded (see resize), unless a
+      // flag below makes it eligible, which marks the layout dirty itself.
+      dirty = dirty || eligible_[idx];
+    }
+    for (const auto& [idx, flag] : flags) {
+      if (static_cast<bool>(eligible_[idx]) == flag) continue;
+      eligible_[idx] = flag ? 1 : 0;
+      dirty = true;
+    }
+    if (!dirty) return 0.0;
+    const double old_total = total_quality_;
+    RecomputeAll();
+    return total_quality_ - old_total;
+  }
+
   NativePermutationLayoutSolver copy() const {
     return *this;
   }
@@ -378,6 +418,16 @@ class NativePermutationLayoutSolver {
   }
   int count_allocated() const {
     return total_allocated_count_;
+  }
+
+  // The buffers holding an address, in index order: what ``addresses`` marks
+  // not-None, without materializing an entry for every buffer.
+  py::list allocated_indices() const {
+    py::list out;
+    for (int i = 0; i < st_->n; ++i) {
+      if (allocated_[i]) out.append(py::int_(i));
+    }
+    return out;
   }
 
   py::list addresses() const {
@@ -450,6 +500,17 @@ class NativePermutationLayoutSolver {
       throw std::invalid_argument("is_fully_allocated index out of range");
     }
     return allocated_[idx] != 0;
+  }
+
+  // The permutation position buffer ``idx`` holds: the inverse of
+  // ``permutation[pos]``, kept incrementally, so a caller that picks a buffer
+  // finds its slot in O(1) instead of scanning the permutation. Bounds-checked;
+  // mirrors the Python reference's ``position(idx)``.
+  int position(int idx) const {
+    if (idx < 0 || idx >= st_->n) {
+      throw std::invalid_argument("position index out of range");
+    }
+    return position_[idx];
   }
 
  private:
@@ -830,15 +891,20 @@ void register_perm_layout_native(py::module_& m) {
            py::arg("new_size"))
       .def("set_eligible", &NativePermutationLayoutSolver::set_eligible,
            py::arg("idx"), py::arg("flag"))
+      .def("update", &NativePermutationLayoutSolver::update, py::arg("resizes"),
+           py::arg("flags"))
       .def("copy", &NativePermutationLayoutSolver::copy)
       .def("quality", &NativePermutationLayoutSolver::quality)
       .def("count_allocated", &NativePermutationLayoutSolver::count_allocated)
+      .def("allocated_indices",
+           &NativePermutationLayoutSolver::allocated_indices)
       .def("overlaps", &NativePermutationLayoutSolver::overlaps, py::arg("i"),
            py::arg("j"))
       .def("is_fully_allocated",
            &NativePermutationLayoutSolver::is_fully_allocated, py::arg("idx"))
       .def("top_or_inf", &NativePermutationLayoutSolver::top_or_inf,
            py::arg("idx"))
+      .def("position", &NativePermutationLayoutSolver::position, py::arg("idx"))
       .def("finalize", &NativePermutationLayoutSolver::finalize)
       .def_property_readonly("buffers", &NativePermutationLayoutSolver::buffers)
       // The view borrows the solver, so the solver must outlive it. The

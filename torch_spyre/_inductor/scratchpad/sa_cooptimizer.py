@@ -45,11 +45,12 @@ from __future__ import annotations
 
 import copy
 import heapq
+import keyword
 import math
 import random as rnd
 import statistics
 from abc import ABC, abstractmethod
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence, Set as AbstractSet
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Callable, Optional, cast
 
@@ -69,10 +70,13 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionBuffer,
     CoreDivisionLayoutSolver,
     LifetimeBoundBuffer,
+    RelayoutCharge,
+    RelayoutCopyBuffer,
     TileAxis,
     TileSpec,
     ceil_div,
 )
+from torch_spyre._inductor.scratchpad.lx_relayout import ChosenRelayout
 from torch_spyre._C import NativePermutationLayoutSolver
 from torch_spyre._inductor.scratchpad import utils
 from torch_spyre._inductor.logging_utils import get_inductor_logger
@@ -80,6 +84,7 @@ from torch_spyre._inductor.pass_utils import iteration_space_from_op
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from torch_spyre._inductor.scratchpad.coarse_tiling import TileReads
+    from torch_spyre._inductor.scratchpad.lx_relayout import RelayoutCandidate
     from torch_spyre._inductor.scratchpad.plan_solver import CoreDivision
 
 logger = get_inductor_logger("scratchpad.sa_cooptimizer")
@@ -100,10 +105,10 @@ def _step_budget(n: int) -> int:
     return min(_MAX_STEPS, _STEPS_PER_BUFFER * n)
 
 
-# Fixed proposal weights over the three move types. Reorder's weight is
-# effectively 0 while every eligible buffer is resident (see
-# :meth:`_applicable_moves`).
-_MOVE_WEIGHTS = {"reorder": 0.5, "flip": 0.3, "recolor": 0.2}
+# Fixed proposal weights over the move types. Reorder's weight is effectively 0
+# while every eligible buffer is resident, and relayout's on a graph with no
+# relayout copy (see :meth:`_applicable_moves`).
+_MOVE_WEIGHTS = {"reorder": 0.5, "flip": 0.3, "recolor": 0.2, "relayout": 0.2}
 
 # Layout-burst length as a fraction of the buffer count. The burst warms ``pi`` to
 # the new footprints before a compound structural move is judged.
@@ -120,6 +125,11 @@ _COOLING_SPAN = 1000.0
 
 # Cause recorded for a buffer the SA engine left out of LX.
 _SOLVER_CHOSE_SPILL = "spilled by solver (no residency benefit / no room)"
+
+# What ``sym_division`` binds to for a division its buffer's menu does not carry:
+# outside every table indexed by menu position, which ``RelayoutCharge`` reads as
+# unpriced.
+_UNPRICED = -1
 
 
 def _work_slices(op, division: "CoreDivision") -> dict:
@@ -683,8 +693,25 @@ class _ViewRelation(_EdgeRelation):
         return self._up[child.key]
 
 
+# The joint state ``(pi, W)`` as :meth:`SaCoOptimizingSolver._snapshot` takes it:
+# the packer, the division vector, the eligible count and mask, the relayout copies
+# switched on, and the ones eligible.
+_Snapshot = tuple[
+    NativePermutationLayoutSolver,
+    list[DivisionConfig],
+    int,
+    bytearray,
+    set[int],
+    set[int],
+]
+
+
 class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
     """SA joint core-division + LX-placement engine.
+
+    Decides LX relayouts: the allocator hands it one ``RelayoutCopyBuffer`` per
+    relayout group, the search switches each on or off, and a consumer reading
+    a resident parent through a resident copy gets ``chosen_relayouts``.
 
     The search is fully determined by the module constants above; there is
     nothing to configure per call.
@@ -714,7 +741,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
     @classmethod
     def decides_lx_relayouts(cls) -> bool:
-        return False
+        return True
 
     @classmethod
     def generates_divisions(cls) -> bool:
@@ -755,12 +782,16 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         # Best-seen over the anneal (set in _anneal, read in _step); declared for
         # the types.
         self._best_score: int
-        self._best_snap: tuple[NativePermutationLayoutSolver, list[DivisionConfig], int]
-        # Number of buffers passing :meth:`_eligible` under the live ``W``. Kept
-        # as a count, not a mask: the two ripple sites already evaluate
-        # ``_eligible`` over the buffers a move can change, so they carry the
-        # count by differencing that set before and after.
+        self._best_snap: _Snapshot
+        # Number of buffers passing :meth:`_eligible` under the live ``W``,
+        # carried by the two ripple sites as the change over the buffers a move
+        # can change.
         self._n_eligible: int
+        # The eligibility the packer holds, per buffer (``_note_eligibility``).
+        # A ripple reads the old flags of the buffers it changes here instead
+        # of re-deriving them, which on a graph with thousands of relayout
+        # copies was half of every move's eligibility work.
+        self._eligible_mask: bytearray
 
     # -- public interface ----------------------------------------------------
 
@@ -817,6 +848,11 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         ``None`` (no expression, or a symbol this can't place -- e.g. a dynamic-
         shape symbol the allocator's build left in) falls back to the
         memory-only objective
+
+        A relayout copy's price term is summed directly rather than compiled
+        (:meth:`_split_relayout_charges`): it is zero unless the copy is
+        resident, and a graph can carry thousands of copies, each otherwise a
+        getter and a table lookup on every score.
         """
         if cost_expr is None:
             return None
@@ -826,13 +862,14 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
                 1 if name in resident else 0
             )
             # The division's identity, for table terms over candidates (the
-            # relayout price is one; see RelayoutCopyBuffer.cost_term). It is the
-            # menu position, not the key, so equal configs need not bind alike: a
-            # generated config has no position at all. Sound only while no such
-            # term reaches the annealer, which ``decides_lx_relayouts()`` ensures
-            # (#4425).
+            # relayout price is one; see RelayoutCopyBuffer.cost_term): the menu
+            # position naming the choice, which a generated config finds by its
+            # key. One the menu does not carry binds outside every table, which
+            # reads as unpriced (RelayoutCharge).
             value_of[buf.sym_division] = lambda chosen, resident, idx=idx: (
-                chosen[idx].menu_index
+                _UNPRICED
+                if (position := self._known_menu_position(idx, chosen[idx])) is None
+                else position
             )
             for key, sym in buf.sym_core_divs.items():
                 value_of[sym] = lambda chosen, resident, idx=idx, key=key: (
@@ -842,19 +879,90 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
                 value_of[sym] = lambda chosen, resident, idx=idx, key=key: (
                     chosen[idx].tiling.count_for(key)
                 )
+        charges, cost_expr = self._split_relayout_charges(cost_expr)
         try:
             free = sorted(cost_expr.free_symbols, key=str)
             if any(sym not in value_of for sym in free):
                 return None
-            fn = sympy.lambdify(free, cost_expr, modules="math")
+            # lambdify renames a symbol that is not a Python identifier (a copy's
+            # name carries ``:``) and searches the whole expression for a fresh
+            # name each time; renaming them all here is one pass instead.
+            renamed = {
+                sym: sympy.Symbol(f"_sa_arg{i}")
+                for i, sym in enumerate(free)
+                if not str(sym).isidentifier() or keyword.iskeyword(str(sym))
+            }
+            fn = sympy.lambdify(
+                [renamed.get(sym, sym) for sym in free],
+                cost_expr.xreplace(renamed) if renamed else cost_expr,
+                modules="math",
+            )
         except (ValueError, TypeError, ZeroDivisionError, RuntimeError):
             return None
 
+        charge_of = {name: (source, prices) for name, source, prices in charges}
+        charged = frozenset(charge_of)
+        # Bound once, in argument order. ``value_of`` is keyed by the symbols
+        # the buffers hand out, which equal the expression's but are other
+        # objects, so every lookup misses the identity fast path for sympy's
+        # ``__eq__``: looked up per score, that was 90% of a score's time.
+        getters = [value_of[sym] for sym in free]
+
         def score(chosen, resident) -> int:
-            ns = fn(*(value_of[sym](chosen, resident) for sym in free))
+            ns = fn(*(getter(chosen, resident) for getter in getters))
+            if charged:
+                # Over the resident copies only, a handful against the thousands
+                # a graph can carry; in name order, so the sum is the same
+                # whatever order the sets iterate in.
+                extra = 0.0
+                for name in sorted(charged.intersection(resident)):
+                    source, prices = charge_of[name]
+                    position = self._known_menu_position(source, chosen[source])
+                    if position is not None and 0 <= position < len(prices):
+                        extra += prices[position]
+                ns += extra
             return utils.to_fixed_us(max(0.0, ns) / 1000.0)
 
         return score
+
+    def _split_relayout_charges(
+        self, cost_expr: sympy.Expr
+    ) -> tuple[list[tuple[str, int, tuple[float, ...]]], sympy.Expr]:
+        """``cost_expr``'s top-level ``RelayoutCharge`` terms over this solver's
+        own copies, as ``(copy name, source idx, prices)``, and the rest of the
+        expression. Summed directly they price exactly as
+        ``RelayoutCharge._imp_`` does: the price at the source's menu position
+        while the copy is resident, else nothing. A term this cannot place
+        stays in the expression, which still prices it."""
+        is_lx_of = {
+            buf.sym_is_lx: buf.name
+            for buf in self._bufs
+            if isinstance(buf, RelayoutCopyBuffer)
+        }
+        if not is_lx_of:
+            return [], cost_expr
+        division_of = {buf.sym_division: idx for idx, buf in enumerate(self._bufs)}
+        charges: list[tuple[str, int, tuple[float, ...]]] = []
+        rest = []
+        for term in sympy.Add.make_args(cost_expr):
+            if (
+                isinstance(term, RelayoutCharge)
+                and term.args[0] in is_lx_of
+                and term.args[1] in division_of
+            ):
+                is_lx, division, *prices = term.args
+                charges.append(
+                    (
+                        is_lx_of[is_lx],
+                        division_of[division],
+                        tuple(float(price) for price in prices),
+                    )
+                )
+            else:
+                rest.append(term)
+        if not charges:
+            return [], cost_expr
+        return charges, sympy.Add(*rest)
 
     # -- static topology (division-invariant) --------------------------------
 
@@ -933,8 +1041,15 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         # Ops that could take a split division at all -- the only legal recolor
         # anchors, so recolor stays a coordinated *splitting* move and leaves
         # undividing to atomic flips. Static; what a given step can actually
-        # draw is :meth:`_DivisionSource.anchor`.
-        self._anchor_candidates = [i for i in range(n) if self._sources[i].can_split()]
+        # draw is :meth:`_DivisionSource.anchor`. A relayout copy's one division
+        # is its destination's slicing, not a choice, and it has no edge to
+        # flood along.
+        self._anchor_candidates = [
+            i
+            for i in range(n)
+            if self._sources[i].can_split()
+            and not isinstance(bufs[i], RelayoutCopyBuffer)
+        ]
         self._build_operation_positions()
         # Whether any buffer can carry a tiling at all, so the companion term
         # costs one bool per score where it cannot -- which is every graph with
@@ -957,7 +1072,101 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             view_relations,
             len(self._relations) - view_relations,
         )
+        self._build_relayout_topology()
         self._precompute_spill_costs()
+
+    def _build_relayout_topology(self) -> None:
+        """Index the relayout copies (:class:`RelayoutCopyBuffer`) the
+        allocator handed over: each copy's source, each source's copies, and
+        per edge which copy a consumer reads its parent through under which
+        pair of divisions.
+
+        A candidate is keyed by ``(source division, consumer division)`` as
+        menu positions, and the consumer's division fixes the view it reads,
+        so a pair names at most one group: on a given edge the divisions alone
+        decide which copy serves, and the search decides only whether it is
+        resident. A pair naming two copies is an enumeration error.
+        """
+        n = len(self._bufs)
+        # copy idx -> source idx. A copy whose source is not in the solve is
+        # absent and never eligible (the allocator builds none such).
+        self._relayout_source: dict[int, int] = {}
+        # source idx -> its copies.
+        self._relayout_copies_of: list[list[int]] = [[] for _ in range(n)]
+        # copy idx -> the consumers it may serve, in index order.
+        self._relayout_consumers: dict[int, list[int]] = {}
+        # (source idx, consumer idx) -> {(source pos, consumer pos): (copy idx,
+        # the candidate)}.
+        self._relayout_reads: dict[
+            tuple[int, int], dict[tuple[int, int], tuple[int, RelayoutCandidate]]
+        ] = {}
+        for idx, buf in enumerate(self._bufs):
+            if not isinstance(buf, RelayoutCopyBuffer):
+                continue
+            source = self._name_to_idx.get(buf.relayout_parent)
+            if source is None:
+                continue
+            self._relayout_source[idx] = source
+            self._relayout_copies_of[source].append(idx)
+            consumers: set[int] = set()
+            for candidate in buf.candidates:
+                consumer = self._name_to_idx.get(candidate.consumer)
+                # Only an edge the solve carries can be served: the coupling
+                # prices the read by that edge's relation.
+                if consumer is None or (source, consumer) not in self._relations:
+                    continue
+                consumers.add(consumer)
+                pairs = self._relayout_reads.setdefault((source, consumer), {})
+                pair = (candidate.source_division, candidate.consumer_division)
+                known = pairs.setdefault(pair, (idx, candidate))
+                assert known[0] == idx, (
+                    f"{candidate.consumer} reads {buf.relayout_parent} under "
+                    f"division pair {pair} through two copies: "
+                    f"{self._bufs[known[0]].name} and {buf.name}"
+                )
+            self._relayout_consumers[idx] = sorted(consumers)
+        # Whether each copy could hold its destination at all: no residency pin,
+        # and a per-core span that fits. Constant, since a copy's one division
+        # is never moved.
+        self._relayout_fits = {
+            idx: self._bufs[idx].residency_reason is None
+            and self._per_core_size(idx, self._sources[idx].seed()) <= self.limit
+            for idx in self._relayout_source
+        }
+        # The copies a relayout move draws from and a seam may buy: the ones
+        # that could ever be resident and serve. One that does not fit, whose
+        # source is pinned out of LX, or that no consumer in the solve reads,
+        # is never eligible, so switching it on would only move divisions for
+        # nothing.
+        self._relayout_copy_list = sorted(
+            idx
+            for idx, source in self._relayout_source.items()
+            if self._relayout_fits[idx]
+            and self._bufs[source].residency_reason is None
+            and self._relayout_consumers[idx]
+        )
+        self._relayout_buyable = frozenset(self._relayout_copy_list)
+        # The copies switched on. All start off, so the seed is the plan
+        # without relayouts.
+        self._relayout_on: set[int] = set()
+        # The copies eligible under the current state, kept by every site that
+        # sets the packer's eligibility (:meth:`_note_eligibility`): all
+        # the post-packing cleanup has to look at (:meth:`_resident_indices`).
+        self._eligible_copies: set[int] = set()
+        # The occupants the layout moves draw from (:meth:`_draw_layout_buffer`):
+        # every buffer but the copies, which join while eligible.
+        self._layout_buffers = [
+            idx
+            for idx, b in enumerate(self._bufs)
+            if not isinstance(b, RelayoutCopyBuffer)
+        ]
+        self._has_copies = len(self._layout_buffers) < n
+        if self._relayout_source:
+            logger.debug(
+                "%d relayout copies over %d sources",
+                len(self._relayout_source),
+                sum(1 for copies in self._relayout_copies_of if copies),
+            )
 
     def _build_operation_positions(self) -> None:
         """Index the buffers by ``CoreDivisionBuffer.op_position``, both ways.
@@ -1134,7 +1343,13 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         """Cache the loop-invariant inputs to :meth:`_score`. A move changes only
         the *per-core* footprint the packer sees, never a buffer's total size, so
         neither the spill costs nor the bandwidth constant can move."""
-        self._spill_costs = [self._spill_cost(b) for b in self._bufs]
+        # A relayout copy left out of LX moves nothing: the shuffle does not fire.
+        self._spill_costs = [
+            0 if isinstance(b, RelayoutCopyBuffer) else self._spill_cost(b)
+            for b in self._bufs
+        ]
+        self._total_spill_cost = sum(self._spill_costs)
+        self._names = [b.name for b in self._bufs]
         self._hbm_bytes_per_us = utils.hbm_bytes_per_us()
 
     # -- division-dependent derivations --------------------------------------
@@ -1181,15 +1396,216 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         # limit`` test, which is division-dependent and is the next gate down.
         if b.residency_reason is not None:
             return False
+        if isinstance(b, RelayoutCopyBuffer):
+            return self._relayout_copy_eligible(idx)
         if self._per_core_size(idx, self.chosen[idx]) > self.limit:
             return False
         parent = self.chosen[idx]
         if self._read_across_a_tiling_boundary(idx, parent):
             return False
+        # A child the division pair does not match may still read this buffer
+        # from LX, through the relayout copy that pair names.
         return all(
             relation.compatible(parent, self.chosen[c_idx])
+            or self._relayout_copy_can_serve(idx, c_idx)
             for c_idx, relation in self._children[idx]
         )
+
+    # -- relayout copies -----------------------------------------------------
+    #
+    # A RelayoutCopyBuffer is the LX destination of one relayout group, and its
+    # residency is the decision that the shuffle fires; its price is the
+    # RelayoutCharge term the allocator adds to ``cost_expr``. What the copy
+    # cannot carry as data is the coupling: a resident copy needs its source
+    # resident under a priced division, and a resident source a consumer does not
+    # match needs that consumer's copy resident. The division-only half is
+    # eligibility (below), consistent by construction: a copy is eligible only
+    # while its source is, and a source only while every copy it needs could
+    # hold. The placement half is the packer's outcome, so it is enforced after
+    # packing by :meth:`_resident_addresses`.
+
+    def _relayout_read(
+        self, source: int, consumer: int
+    ) -> Optional[tuple[int, RelayoutCandidate]]:
+        """The copy ``consumer`` reads ``source`` through under the current
+        divisions and the candidate that prices it, or ``None`` if the pair of
+        divisions has none -- including a division the menu does not carry,
+        which nothing priced."""
+        pairs = self._relayout_reads.get((source, consumer))
+        if not pairs:
+            return None
+        i = self._known_menu_position(source, self.chosen[source])
+        j = self._known_menu_position(consumer, self.chosen[consumer])
+        if i is None or j is None:
+            return None
+        return pairs.get((i, j))
+
+    def _relayout_copy_admissible(self, copy_idx: int) -> bool:
+        """Whether copy ``copy_idx`` could hold its destination at all, apart
+        from its source and its consumers: switched on by the search (see
+        :meth:`_toggle_relayout`), under the cost objective only, since the
+        memory-only fallback has no price for a shuffle and would take every
+        one as free, and at a per-core span that fits."""
+        if self._score_fn is None or copy_idx not in self._relayout_on:
+            return False
+        return self._relayout_fits[copy_idx]
+
+    def _relayout_copy_can_serve(self, source: int, consumer: int) -> bool:
+        """Whether ``consumer`` could read ``source`` from LX through a copy
+        under the current divisions."""
+        read = self._relayout_read(source, consumer)
+        return read is not None and self._relayout_copy_admissible(read[0])
+
+    def _relayout_copy_serves(self, copy_idx: int) -> bool:
+        """Whether some consumer reads its source through copy ``copy_idx``
+        under the current divisions, i.e. does not match the source and names
+        this copy. A copy no one reads is a shuffle for nothing."""
+        source = self._relayout_source[copy_idx]
+        parent = self.chosen[source]
+        for consumer in self._relayout_consumers[copy_idx]:
+            read = self._relayout_read(source, consumer)
+            if (
+                read is not None
+                and read[0] == copy_idx
+                and not self._relations[(source, consumer)].compatible(
+                    parent, self.chosen[consumer]
+                )
+            ):
+                return True
+        return False
+
+    def _relayout_copy_eligible(self, copy_idx: int) -> bool:
+        """:meth:`_eligible` for a relayout copy: admissible, serving someone,
+        and its source eligible. The last makes the predicate consistent, so
+        when every eligible buffer is placed nothing has to be dropped
+        (:meth:`_all_eligible_resident` stays exact)."""
+        return self._relayout_copy_eligible_given(copy_idx, None)
+
+    def _relayout_copy_eligible_given(
+        self, copy_idx: int, source_eligible: Optional[bool]
+    ) -> bool:
+        """:meth:`_relayout_copy_eligible`, reusing ``source_eligible`` where the
+        caller already evaluated the source in this state."""
+        if not self._relayout_copy_admissible(copy_idx):
+            return False
+        if source_eligible is None:
+            source_eligible = self._eligible(self._relayout_source[copy_idx])
+        return source_eligible and self._relayout_copy_serves(copy_idx)
+
+    def _eligibility(self, indices: Sequence[int]) -> dict[int, bool]:
+        """:meth:`_eligible` over ``indices`` in the current state, evaluating
+        each source once rather than again for every copy of it: a ripple over
+        a recolored region holds hundreds of copies of a few sources."""
+        flags = {
+            x: self._eligible(x) for x in indices if x not in self._relayout_source
+        }
+        for x in indices:
+            if x in self._relayout_source:
+                flags[x] = self._relayout_copy_eligible_given(
+                    x, flags.get(self._relayout_source[x])
+                )
+        return flags
+
+    def _with_relayout_copies(self, affected: set[int]) -> set[int]:
+        """``affected`` plus the switched-on relayout copies of every buffer in
+        it: a copy's eligibility follows its source's, and a buffer whose
+        eligibility a move can change is in ``affected`` already. A copy that is
+        off is ineligible whatever the divisions, and only a toggle, which
+        ripples it itself, can change that."""
+        if not self._relayout_on:
+            return affected
+        on = self._relayout_on
+        return affected.union(
+            *(
+                [c for c in self._relayout_copies_of[idx] if c in on]
+                for idx in list(affected)
+            )
+        )
+
+    def _note_eligibility(self, flags: dict[int, bool]) -> None:
+        """Record the eligibility ``flags`` set on the packer: in the mask,
+        and for the relayout copies among them, in the eligible copies."""
+        mask = self._eligible_mask
+        for idx, flag in flags.items():
+            mask[idx] = flag
+        if not self._relayout_source:
+            return
+        for idx, flag in flags.items():
+            if idx in self._relayout_source:
+                if flag:
+                    self._eligible_copies.add(idx)
+                else:
+                    self._eligible_copies.discard(idx)
+
+    def _switch_off_stale_copies(self, flags: dict[int, bool]) -> None:
+        """Switch off the copies among ``flags`` that a division change left
+        serving no one: switched on, and no consumer now reads its source
+        through them.
+
+        Such a copy is ineligible already, so nothing placed or counted
+        changes; it would only be carried through every later ripple, and the
+        anchoring, as a switched-on copy, which on a large graph is most of
+        them. Should the divisions return to its pair, a relayout move buys it
+        again. Called after a division change only, once any copies the move
+        bought are switched on.
+        """
+        if not self._relayout_on:
+            return
+        stale = [
+            idx
+            for idx, flag in flags.items()
+            if not flag
+            and idx in self._relayout_on
+            and not self._relayout_copy_serves(idx)
+        ]
+        self._relayout_on.difference_update(stale)
+
+    def _resident_addresses(self) -> list[Optional[int]]:
+        """``packer.addresses`` with every buffer :meth:`_resident_indices`
+        drops set to ``None``: the addresses the write-back commits."""
+        addresses = self.packer.addresses
+        if not self._relayout_on:
+            return addresses
+        resident = self._resident_indices()
+        return [
+            address if i in resident else None for i, address in enumerate(addresses)
+        ]
+
+    def _resident_indices(self) -> set[int]:
+        """The buffers actually resident: the ones the packer placed, with the
+        relayout coupling the packer cannot see enforced.
+
+        Eligibility keeps the coupling over divisions, but under capacity
+        pressure the packer can place one side and spill the other. So, only
+        ever *removing* what it placed: a source some consumer must read
+        through a copy the packer did not place is dropped, then every copy
+        whose source is not resident. That is a fixpoint already -- dropping a
+        source orphans only its own copies, and dropping a copy strands no
+        other source -- and the result does not depend on order. A dropped
+        buffer wastes its LX in this state, which the objective prices; it never
+        reaches the write-back.
+
+        Only the eligible copies need looking at. A placed source is eligible,
+        so each consumer it does not match reads it through a copy that is
+        admissible and serves that consumer -- an eligible copy. So a placed
+        source loses a consumer's copy exactly when one of its eligible copies
+        is not placed; and every placed copy is an eligible one.
+
+        Hot path: the packer reports the placed buffers only
+        (``allocated_indices``), a few hundred against the thousands of
+        occupants a graph with relayout copies hands it, and the eligible
+        copies are a handful.
+        """
+        placed = set(self.packer.allocated_indices())
+        if not self._eligible_copies:
+            return placed
+        placed.difference_update(
+            [self._relayout_source[c] for c in self._eligible_copies if c not in placed]
+        )
+        placed.difference_update(
+            [c for c in self._eligible_copies if self._relayout_source[c] not in placed]
+        )
+        return placed
 
     def _read_across_a_tiling_boundary(self, idx: int, parent: DivisionConfig) -> bool:
         """Whether buffer ``idx`` is read by a coarse-tiled consumer at an
@@ -1259,6 +1675,8 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         sizes = [self._per_core_size(i, self.chosen[i]) for i in range(n)]
         eligible = [self._eligible(i) for i in range(n)]
         self._n_eligible = sum(eligible)
+        self._eligible_mask = bytearray(n)
+        self._note_eligibility(dict(enumerate(eligible)))
 
         # pi from a FirstFit pass over the per-core sizes. FirstFit leaves the
         # fixed pins unplaced and ``SolverToPermutation`` sorts them after every
@@ -1279,6 +1697,14 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
                 for p in b.in_place_parents
                 if sizes[self._name_to_idx[p]] >= child_size
             ]
+        # Every copy starts off, so ineligible, and an ineligible occupant is
+        # transparent to the packer. Left in this pass it would still take an
+        # address, and so shape the order of the buffers around it; pinned
+        # here, it sorts after them, and the seed pi of the buffers is the one
+        # the solve without relayouts starts from.
+        for idx in range(n):
+            if isinstance(self._bufs[idx], RelayoutCopyBuffer):
+                ff_bufs[idx].residency_reason = "relayout copy (off in the seed)"
         # Deep-copied so FirstFit lays out its own objects, never the ones the
         # solver mutates; SolverToPermutation reads addresses back by name.
         pi = SolverToPermutation(
@@ -1315,15 +1741,15 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         reads_served = buffer.read_count - (1 if buffer.first_use_is_read else 0)
         return (reads_served + (1 if is_intermediate else 0)) * max(0, buffer.size)
 
-    def _companion_bytes(self, addresses: Sequence[Optional[int]]) -> int:
+    def _companion_bytes(self, resident: AbstractSet[int]) -> int:
         """HBM bytes the apply's companion buffers move that the rest of the
         objective does not count, under the current state: the sum of
         :meth:`_companion_charges`.
         """
-        return sum(nbytes for _run, nbytes in self._companion_charges(addresses))
+        return sum(nbytes for _run, nbytes in self._companion_charges(resident))
 
     def _companion_charges(
-        self, addresses: Sequence[Optional[int]]
+        self, resident: AbstractSet[int]
     ) -> Iterator[tuple[tuple[int, int], int]]:
         """``(run, bytes)`` for each escaping buffer of a tiled run: the HBM bytes
         its companion moves that the rest of the objective does not count.
@@ -1398,22 +1824,22 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
                 # scratch and allocates no full buffer at all.
                 continue
             size = max(0, buf.size)
-            copy_read = 0 if addresses[idx] is not None else size
+            copy_read = 0 if idx in resident else size
             copy_write = copy_read if is_graph_output else size
-            outside_reads = size * outside if addresses[idx] is not None else 0
+            outside_reads = size * outside if idx in resident else 0
             yield (lo, hi), copy_read + copy_write + outside_reads
 
-    def _companions(self, addresses: Sequence[Optional[int]]) -> int:
+    def _companions(self, resident: AbstractSet[int]) -> int:
         """:meth:`_score`'s term outside ``cost_expr``, in its fixed-point units."""
         return utils.to_fixed_us(
-            self._companion_bytes(addresses) / self._hbm_bytes_per_us
+            self._companion_bytes(resident) / self._hbm_bytes_per_us
         )
 
     def off_expression_ns(self) -> dict[str, float]:
         if not self._bufs:
             return {}
         ns = 1000.0 / utils.US_FIXED_POINT_SCALE
-        return {"companions": self._companions(self.packer.addresses) * ns}
+        return {"companions": self._companions(self._resident_indices()) * ns}
 
     def score_ns(self) -> Optional[float]:
         if not self._bufs:
@@ -1422,12 +1848,12 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
     def _score(self) -> int:
         """The shared objective for the current state, in integer fixed-point
-        time units. A buffer with a packer address is LX-resident (its address is
-        ``None`` iff ineligible or spilled).
+        time units, over the buffers :meth:`_resident_indices` reports resident
+        (the placed ones, less any the relayout coupling drops).
 
-        Hot path: reads ``packer.addresses`` **once**. The native packer
-        materializes a fresh list per ``addresses`` access, so a per-buffer read
-        inside the loop was quadratic; hoisting it is 8-31x faster on the captures.
+        Hot path: asks the packer once, for the placed buffers only. The native
+        packer materializes a fresh list per query, so a per-buffer read inside
+        the loop was quadratic; hoisting it is 8-31x faster on the captures.
 
         The memory-only fallback is *differential* -- ``spill_cost`` is the traffic
         a spill adds **over** residency -- so a resident buffer contributes zero
@@ -1436,20 +1862,15 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
         Both add :meth:`_companion_bytes` at the HBM rate.
         """
-        addresses = self.packer.addresses
-        companions = self._companions(addresses)
+        resident_idx = self._resident_indices()
+        companions = self._companions(resident_idx)
         if self._score_fn is not None:
-            resident = frozenset(
-                b.name
-                for b, address in zip(self._bufs, addresses)
-                if address is not None
-            )
+            resident = frozenset(self._names[i] for i in resident_idx)
             return self._score_fn(self.chosen, resident) + companions
-
-        traffic = sum(
-            cost
-            for cost, address in zip(self._spill_costs, addresses)
-            if address is None
+        # Spill costs are integers, so summing the resident ones off the total
+        # is exact whatever the order.
+        traffic = self._total_spill_cost - sum(
+            self._spill_costs[i] for i in resident_idx
         )
         return utils.to_fixed_us(traffic / self._hbm_bytes_per_us) + companions
 
@@ -1462,23 +1883,19 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         the buffer currently holds has a *neighbour* is decided at move time."""
         return [i for i in range(len(self._bufs)) if self._sources[i].can_move()]
 
-    def _atomic_flip(self, idx: int, config: DivisionConfig) -> None:
+    def _atomic_flip(
+        self, idx: int, config: DivisionConfig, *, buy_seams: bool = False
+    ) -> set[int]:
         """Change buffer ``idx``'s division to ``config`` and ripple: resize its
         per-core footprint, then refresh eligibility for ``idx`` and its parents.
         Those are the only buffers a flip can change, since eligibility depends on
-        an op's own division and its children's."""
-        affected = sorted({idx} | self._parents_idx[idx])
-        before = sum(self._eligible(x) for x in affected)
-        self.chosen[idx] = config
-        self.packer.resize(idx, self._per_core_size(idx, config))
-        after = 0
-        for x in affected:
-            flag = self._eligible(x)
-            after += flag
-            self.packer.set_eligible(x, flag)
-        self._n_eligible += after - before
+        an op's own division and its children's -- plus their relayout copies,
+        whose eligibility follows their source's. The one-op case of
+        :meth:`_apply_assignment`, whose ripple is exactly that. Returns the
+        seams it bought."""
+        return self._apply_assignment({idx: config}, buy_seams=buy_seams)
 
-    def _retile_boundary(self, idx: int, config: DivisionConfig) -> None:
+    def _retile_boundary(self, idx: int, config: DivisionConfig) -> set[int]:
         """Spread ``config``'s tiling from ``idx`` to one end of its run.
 
         The tiling arm of flip. ``idx`` sits in a uniform run ``A..Z``; this
@@ -1505,10 +1922,12 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
         The single-op flip survives as the degenerate case -- ``H`` at a run end
         -- and a mid-run split is two steps rather than one.
+
+        Returns the seams it bought.
         """
         position = self._position_of[idx]
         if position is None:
-            return  # no operation position, so no run to move a boundary in
+            return set()  # no operation position, so no run to move a boundary in
         lo, hi = self._run_bounds(position)
         # The only randomness this move draws beyond the neighbour choice, and it
         # is drawn only here: a space with no tiling half never reaches this arm,
@@ -1532,8 +1951,9 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             if at == end:
                 break
             at += step
-        if assignment:
-            self._apply_assignment(assignment)
+        if not assignment:
+            return set()
+        return self._apply_assignment(assignment, buy_seams=True)
 
     def _misread_across(
         self, at: int, start: int, spec: "TileSpec", forward: bool
@@ -1632,31 +2052,218 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
                 trimmed[idx] = untiled
         return trimmed
 
-    def _apply_assignment(self, assignment: dict[int, DivisionConfig]) -> None:
+    def _apply_assignment(
+        self,
+        assignment: dict[int, DivisionConfig],
+        *,
+        buy_seams: bool = False,
+        switch_on: Sequence[int] = (),
+    ) -> set[int]:
         """Commit a multi-op division assignment: set every op's division, resize
         its footprint, and refresh eligibility for the assigned set plus their
         parents (the same ripple as a flip, unioned over the set).
 
-        Both structural moves that touch more than one buffer land here -- a
-        flooded region coloring, and a boundary flip's sub-run.
+        Every structural move lands here -- a flooded region coloring, a
+        boundary flip's sub-run, a single-op flip and a relayout move. With
+        ``buy_seams`` it also switches on the copies the new divisions need
+        (:meth:`_seam_copies`), and the copies in ``switch_on``, all in the same
+        one re-place. Returns the seams it switched on, apart from
+        ``switch_on``, for :meth:`_settle` to judge.
         """
         # The affected set is division-invariant, so it is built (and its old
-        # eligibility counted) before the coloring lands.
+        # eligibility counted, off the mask) before the coloring lands. A copy
+        # switched on here was off, so ineligible before; its source is in the
+        # set.
         affected = set(assignment)
         for op in assignment:
             affected |= self._parents_idx[op]
-        affected_sorted = sorted(affected)
-        before = sum(self._eligible(x) for x in affected_sorted)
+        affected.update(self._relayout_source[c] for c in switch_on)
+        affected = self._with_relayout_copies(affected)
+        before = sum(self._eligible_mask[x] for x in affected)
         for op, config in assignment.items():
             self.chosen[op] = config
-        for op in sorted(assignment):
-            self.packer.resize(op, self._per_core_size(op, self.chosen[op]))
-        after = 0
-        for x in affected_sorted:
-            flag = self._eligible(x)
-            after += flag
-            self.packer.set_eligible(x, flag)
-        self._n_eligible += after - before
+        seams = self._seam_copies(assignment) if buy_seams else set()
+        seams.difference_update(switch_on)
+        bought = (seams | set(switch_on)) - self._relayout_on
+        self._relayout_on |= bought
+        affected_sorted = sorted(affected | bought)
+        resizes = [
+            (op, self._per_core_size(op, self.chosen[op])) for op in sorted(assignment)
+        ]
+        flags = self._eligibility(affected_sorted)
+        # One re-place for the whole region rather than one per buffer.
+        self.packer.update(resizes, [(x, flags[x]) for x in affected_sorted])
+        self._note_eligibility(flags)
+        self._switch_off_stale_copies(flags)
+        self._n_eligible += sum(flags.values()) - before
+        return seams
+
+    def _toggle_relayout(self, copy_idx: int) -> None:
+        """Switch relayout copy ``copy_idx`` on or off, and ripple.
+
+        Residency cannot decide a shuffle on its own: the packer places every
+        eligible buffer that fits, which is right for a buffer whose residency
+        only saves traffic, and wrong for a copy, whose residency costs its
+        price. Off, the copy is ineligible, and so is its source wherever a
+        consumer reads it only through this copy. On, both may be placed.
+        """
+        self._switch_relayouts({copy_idx}, on=copy_idx not in self._relayout_on)
+
+    def _switch_relayouts(self, copies: set[int], *, on: bool) -> None:
+        """Switch every copy in ``copies`` on or off, and ripple, in one
+        re-place.
+
+        A switch changes the eligibility of the copy and its source, and the
+        source's decides its other copies' (:meth:`_relayout_copy_eligible`).
+        """
+        sources = {self._relayout_source[c] for c in copies}
+        affected = sorted(self._with_relayout_copies(sources) | copies)
+        before = sum(self._eligible_mask[x] for x in affected)
+        if on:
+            self._relayout_on |= copies
+        else:
+            self._relayout_on -= copies
+        flags = self._eligibility(affected)
+        self.packer.update([], [(x, flags[x]) for x in affected])
+        self._note_eligibility(flags)
+        self._n_eligible += sum(flags.values()) - before
+
+    def _relayout(self) -> None:
+        """One relayout move: switch a uniformly drawn copy off, or on together
+        with the divisions it is priced for, then burst.
+
+        Switching a copy on alone rarely pays: a consumer reads through it only
+        under one of its candidates' division pairs, and those are few among the
+        pairs an edge can take, so the move that would make it pay is a second,
+        independent one, and each half on its own is worth nothing to the score.
+        So switching on also moves the copy's source and every consumer it can
+        serve to one of its priced pairs (:meth:`_relayout_assignment`), and
+        buys every seam that change opens (:meth:`_seam_copies`) -- the whole
+        group, and the copies the new divisions need around it, bought in one
+        re-place and judged as a unit, as recolor judges a flooded region. The
+        drawn copy is the move; the seams around it are kept only where they
+        pay (:meth:`_settle`).
+        """
+        copy_idx = self._rng.choice(self._relayout_copy_list)
+        if copy_idx in self._relayout_on:
+            self._toggle_relayout(copy_idx)
+            self._burst()
+        else:
+            self._settle(
+                self._apply_assignment(
+                    self._relayout_assignment(copy_idx),
+                    buy_seams=True,
+                    switch_on=(copy_idx,),
+                )
+            )
+
+    def _relayout_assignment(self, copy_idx: int) -> dict[int, DivisionConfig]:
+        """The divisions that make copy ``copy_idx`` serve: its source at one of
+        the source divisions its candidates price, and each consumer at a
+        division priced into this group from that one -- its current division
+        where that is priced, the first in candidate order otherwise.
+
+        The source division is drawn uniformly among those that move the
+        fewest *anchored* buffers: ones another eligible copy serves or reads
+        from under their current divisions. Moving one unprices that copy,
+        which is how a chain of relayouts (a buffer that is the consumer of one
+        copy and the source of the next) used to lose one link for every link
+        it gained.
+
+        Only the consumers the copy can serve (``_relayout_consumers``, built
+        with the topology): a candidate whose edge the solve does not carry
+        would move a consumer no copy reads for."""
+        copy = cast(RelayoutCopyBuffer, self._bufs[copy_idx])
+        source = self._relayout_source[copy_idx]
+        served = set(self._relayout_consumers[copy_idx])
+        anchored = self._relayout_anchored(exclude=copy_idx)
+        by_division: dict[int, dict[int, DivisionConfig]] = {}
+        for candidate in copy.candidates:
+            consumer = self._name_to_idx.get(candidate.consumer)
+            if consumer not in served:
+                continue
+            assignment = by_division.setdefault(
+                candidate.source_division,
+                {source: self._menus[source].configs[candidate.source_division]},
+            )
+            config = self._menus[consumer].configs[candidate.consumer_division]
+            if consumer not in assignment or config == self.chosen[consumer]:
+                assignment[consumer] = config
+        disturbance = {
+            division: sum(
+                idx in anchored and config != self.chosen[idx]
+                for idx, config in assignment.items()
+            )
+            for division, assignment in by_division.items()
+        }
+        least = min(disturbance.values())
+        division = self._rng.choice(
+            sorted(d for d, moved in disturbance.items() if moved == least)
+        )
+        return by_division[division]
+
+    def _relayout_anchored(self, exclude: int) -> set[int]:
+        """The buffers whose current division an eligible copy other than
+        ``exclude`` is priced for: its source and the consumers reading it.
+
+        Eligible, not merely switched on: a copy that is on while its source is
+        ineligible for another reason (too big at its division, another
+        mismatched child with no copy) delivers nothing, and anchoring for it
+        would steer the draw away from divisions no paying relayout depends
+        on. Not resident either: placement follows ``pi``, which the burst
+        after the move adjusts."""
+        anchored: set[int] = set()
+        for copy_idx in sorted(self._eligible_copies):
+            if copy_idx == exclude:
+                continue
+            source = self._relayout_source[copy_idx]
+            for consumer in self._relayout_consumers[copy_idx]:
+                read = self._relayout_read(source, consumer)
+                if read is not None and read[0] == copy_idx:
+                    anchored.update((source, consumer))
+        return anchored
+
+    def _seam_copies(self, assignment: dict[int, DivisionConfig]) -> set[int]:
+        """The switched-off copies an edge the ``assignment`` changed now needs,
+        under the divisions it set -- after any structural move, not only a
+        relayout one: the edges out of each reassigned buffer and into it from
+        its parents that no longer match, where the new pair of divisions names
+        a copy that could be resident.
+
+        Without them, the next link of a chain, or a source whose reassignment
+        mismatches several consumers, stays ineligible until another relayout
+        move happens to draw exactly that copy, and that move alone is worth
+        nothing to the score. A seam with no priced copy is left as it is: the
+        source goes out of LX, which the score judges. Under the memory-only
+        fallback there is no price for a shuffle, so none is bought.
+
+        Only edges with an end in ``assignment``: an edge between a parent and
+        a sibling of a reassigned buffer has the pair of divisions it had, so a
+        copy the search switched off there stays off. Whether a bought seam
+        pays is :meth:`_settle`'s call."""
+        if self._score_fn is None or not self._relayout_buyable:
+            return set()
+        touched = set(assignment)
+        for idx in assignment:
+            touched |= self._parents_idx[idx]
+        seams: set[int] = set()
+        for parent in touched:
+            if not self._relayout_copies_of[parent]:
+                continue
+            config = self.chosen[parent]
+            for child, relation in self._children[parent]:
+                if parent not in assignment and child not in assignment:
+                    continue
+                if relation.compatible(config, self.chosen[child]):
+                    continue
+                read = self._relayout_read(parent, child)
+                if (
+                    read is not None
+                    and read[0] in self._relayout_buyable
+                    and read[0] not in self._relayout_on
+                ):
+                    seams.add(read[0])
+        return seams
 
     def _recolor(self) -> None:
         """One region-recolor move: a uniform anchor op (so a region is hit
@@ -1669,10 +2276,74 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         config = self._sources[anchor].anchor(self.chosen[anchor], self._rng)
         if config is None:
             return
-        self._apply_assignment(
-            self._trim_tilings_to_anchor_run(anchor, self._flood_region(anchor, config))
+        assignment = self._trim_tilings_to_anchor_run(
+            anchor, self._flood_region(anchor, config)
         )
+        # The flood stops at every edge with no compatible pair, and those
+        # seams are where a relayout can stand: buying them turns an accepted
+        # seam into a priced choice rather than a source spilled.
+        self._settle(self._apply_assignment(assignment, buy_seams=True))
+
+    def _settle(self, seams: set[int]) -> None:
+        """Burst, then judge the ``seams`` a structural move bought as a unit:
+        keep them only if the state scores no worse with them than without.
+
+        A seam is a choice between two plans for its edge: the copy on and its
+        price paid, or the copy off and its source spilled. Bought blind, every
+        structural move is scored as the first, so a move whose own gain beats
+        the spill but not the shuffle is rejected for a price it need not pay.
+        A per-copy price test (price below the source's spill) cannot replace
+        this: two copies of one source can each pass it and together cost more
+        than the spill, and the spill a copy saves depends on the source's
+        other consumers. Scoring both is exact, for one more re-place and score
+        on the moves that open a seam. A subset of the seams stays reachable
+        through the relayout move.
+
+        The variant without the seams keeps the burst's ``pi``: switching
+        copies off only removes eligible buffers, so the packer re-places what
+        is left from the same order. Draws no randomness, so a move that buys
+        no seam -- every move on a graph without copies -- is just the burst.
+        """
         self._burst()
+        if not seams:
+            return
+        with_seams = self._score()
+        snap = self._snapshot()
+        self._switch_relayouts(seams, on=False)
+        if self._score() > with_seams:
+            self._adopt(snap)
+
+    def _draw_layout_buffer(self) -> int:
+        """A buffer for a layout move, uniformly over the buffers and the
+        eligible relayout copies.
+
+        A copy that is not eligible is transparent to the packer: moving it, or
+        moving a buffer past it, changes no address. A graph with copies has
+        many times more of them than buffers, and almost all are off, so a draw
+        over every occupant would spend most layout moves on nothing. An
+        ineligible *buffer* stays in the draw, as on a graph without copies.
+        """
+        movers = self._layout_buffers
+        r = self._rng.randrange(len(movers) + len(self._eligible_copies))
+        if r < len(movers):
+            return movers[r]
+        return sorted(self._eligible_copies)[r - len(movers)]
+
+    def _draw_layout_position(self) -> int:
+        """A permutation position for a layout move: the position of
+        :meth:`_draw_layout_buffer`'s buffer, or, on a graph without copies,
+        any position (the same draw, without the lookup)."""
+        if not self._has_copies:
+            return self._rng.randrange(len(self._bufs))
+        return self.packer.position(self._draw_layout_buffer())
+
+    def _layout_positions(self) -> list[int]:
+        """The permutation positions :meth:`_draw_layout_buffer` can land on,
+        in position order."""
+        if not self._has_copies:
+            return list(range(len(self._bufs)))
+        movers = self._layout_buffers + sorted(self._eligible_copies)
+        return sorted(self.packer.position(idx) for idx in movers)
 
     def _burst(self) -> None:
         """A short cold layout burst: greedily accept layout steps that do not
@@ -1682,46 +2353,61 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         Rejected steps are reverted rather than snapshotted, since
         ``rotate(j, i)`` undoes ``rotate(i, j)``.
         """
-        n = len(self._bufs)
-        if n < 2:
+        if len(self._bufs) < 2:
             return
+        # Per buffer, as the step budget is: a copy carries no decision.
         # The floor of 1 is there so a small graph still gets a burst.
-        for _ in range(max(1, int(_BURST_FRACTION * n))):
+        for _ in range(max(1, int(_BURST_FRACTION * len(self._layout_buffers)))):
             # Nothing left for pi to win once the structural move has left every
             # eligible buffer resident; the rest of the burst is noise.
             if self._all_eligible_resident():
                 return
-            i = self._rng.randrange(n)
-            j = self._rng.randrange(n)
+            i = self._draw_layout_position()
+            j = self._draw_layout_position()
             if self.packer.rotate(i, j) < 0:
                 self.packer.rotate(j, i)  # revert
 
     # -- state snapshots -----------------------------------------------------
 
-    def _snapshot(
-        self,
-    ) -> tuple[NativePermutationLayoutSolver, list[DivisionConfig], int]:
+    def _snapshot(self) -> _Snapshot:
         """An independent copy of the joint state ``(pi, W)``: the packer's
         dynamic layout (``copy`` shares only plan-lifetime structures) plus the
-        division vector, and the eligible count ``W`` implies -- rebuilding that
-        from ``W`` would cost an O(n) pass the restore does not otherwise need."""
-        return (self.packer.copy(), list(self.chosen), self._n_eligible)
+        division vector, and the eligible count and mask ``W`` implies --
+        rebuilding those from ``W`` would cost an O(n) pass of ``_eligible`` the
+        restore does not otherwise need -- the relayout copies switched on,
+        which nothing else can rebuild, and the ones eligible, kept for the same
+        reason as the count."""
+        return (
+            self.packer.copy(),
+            list(self.chosen),
+            self._n_eligible,
+            bytearray(self._eligible_mask),
+            set(self._relayout_on),
+            set(self._eligible_copies),
+        )
 
-    def _adopt(
-        self, snap: tuple[NativePermutationLayoutSolver, list[DivisionConfig], int]
-    ) -> None:
+    def _adopt(self, snap: _Snapshot) -> None:
         """Install ``snap`` as the live state by *taking ownership* of it -- no
         copy, so the engine goes on mutating those objects and the caller must
         treat ``snap`` as dead from here on. Zero-copy because a step already pays
         one O(n) packer copy for its snapshot.
         """
-        self.packer, self.chosen, self._n_eligible = snap
+        (
+            self.packer,
+            self.chosen,
+            self._n_eligible,
+            self._eligible_mask,
+            self._relayout_on,
+            self._eligible_copies,
+        ) = snap
 
     # -- move selection & execution -----------------------------------------
 
     def _applicable_moves(self) -> list[str]:
         """Move types available this step, in fixed (deterministic) order: reorder
-        needs >=2 buffers, flip a multi-entry menu, recolor a non-trivial anchor.
+        needs >=2 buffers, flip a multi-entry menu, recolor a non-trivial anchor,
+        relayout a relayout copy and the cost objective that prices it (the
+        memory-only fallback keeps every copy off).
 
         Reorder additionally drops out (its proposal weight becomes 0) once every
         eligible buffer is resident: ``pi`` only decides which eligible buffers
@@ -1734,6 +2420,8 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             moves.append("flip")
         if self._anchor_candidates:
             moves.append("recolor")
+        if self._relayout_copy_list and self._score_fn is not None:
+            moves.append("relayout")
         return moves
 
     def _choose_move(self) -> str:
@@ -1746,9 +2434,9 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
     def _execute_move(self, name: str) -> None:
         """Apply move ``name`` in place; structural moves carry their own burst."""
-        n = len(self._bufs)
         if name == "reorder":
-            self.packer.rotate(self._rng.randrange(n), self._rng.randrange(n))
+            i = self._draw_layout_position()
+            self.packer.rotate(i, self._draw_layout_position())
         elif name == "flip":
             idx = self._rng.choice(self._flippable_ops)
             # One axis's factor, or one coarse tile level, drawn uniformly
@@ -1762,12 +2450,14 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             # a stretch that reaches one end of the op's run rather than the op
             # alone (see ``_retile_boundary`` for where it stops short).
             if config.tiling == self.chosen[idx].tiling:
-                self._atomic_flip(idx, config)
+                seams = self._atomic_flip(idx, config, buy_seams=True)
             else:
-                self._retile_boundary(idx, config)
-            self._burst()
+                seams = self._retile_boundary(idx, config)
+            self._settle(seams)
         elif name == "recolor":
             self._recolor()
+        elif name == "relayout":
+            self._relayout()
         # "none": no applicable move; no-op.
 
     # -- annealing loop ------------------------------------------------------
@@ -1792,11 +2482,15 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         """Pick the permutation *position* to lift out for a sweep reorder, using
         the layout-only annealer's bias (weight ``n`` for a fully-allocated buffer,
         ``n_allocated + 1`` otherwise), which oversamples the buffers that miss LX
-        -- the ones the objective prices."""
-        n = len(allocated)
-        n_allocated = sum(1 for a in allocated if a)
+        -- the ones the objective prices. Over the positions a layout move
+        draws (:meth:`_layout_positions`): a copy that is off is never
+        allocated, and would otherwise take the larger part of the draws."""
+        positions = self._layout_positions()
+        n = len(positions)
+        n_allocated = sum(1 for p in positions if allocated[p])
         return self._rng.choices(
-            range(n), weights=[n if a else n_allocated + 1 for a in allocated]
+            positions,
+            weights=[n if allocated[p] else n_allocated + 1 for p in positions],
         )[0]
 
     def _sweep_upper_bound(self, i: int, allocated: list[bool]) -> int:
@@ -1807,12 +2501,21 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         legally allocated can only be made to fit by moving earlier: past the last
         legally-allocated position, nothing it reaches changes the outcome. An
         allocated buffer has no such bound and sweeps to the end.
+
+        Nor past the last occupant a layout move draws: everything after it is
+        a copy that is off, which no address depends on, so every position
+        there is the one just after that occupant.
         """
         n = len(allocated)
-        if allocated[i]:
-            return n - 1
-        last = max((pos for pos, a in enumerate(allocated) if a), default=0)
-        return min(n - 1, last + 1)
+        upper = n - 1
+        if not allocated[i]:
+            last = max((pos for pos, a in enumerate(allocated) if a), default=0)
+            upper = min(upper, last + 1)
+        if self._has_copies:
+            last = max((p for p in self._layout_positions() if p != i), default=0)
+            # Lifting ``i`` shifts an occupant after it down by one.
+            upper = min(upper, last if i < last else last + 1)
+        return upper
 
     def _step_reorder(self, temperature: float, cur: int) -> int:
         """One best-first reinsertion reorder, the layout-only annealer's move
@@ -1897,7 +2600,10 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
     def _anneal(self) -> None:
         """One geometric cool over the clamped step budget, at fixed proposal
         weights, publishing the best state seen."""
-        n = len(self._bufs)
+        # Per decision, not per slot: a relayout copy carries no division
+        # decision (which one an edge reads is the divisions' call), and a graph
+        # can carry thousands.
+        n = sum(not isinstance(b, RelayoutCopyBuffer) for b in self._bufs)
         steps = _step_budget(n)
         if steps < _STEPS_PER_BUFFER * n:
             logger.debug(
@@ -1941,7 +2647,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         if not self._tilings_are_possible:
             return
         charges: dict[tuple[int, int], int] = {}
-        for run, nbytes in self._companion_charges(self.packer.addresses):
+        for run, nbytes in self._companion_charges(self._resident_indices()):
             charges[run] = charges.get(run, 0) + nbytes
         tiled = [run for run in self._runs() if not self._tiling_at(run[0]).is_untiled]
         if not tiled:
@@ -1963,6 +2669,27 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
                 charges.get((lo, hi), 0),
             )
 
+    def _log_coupling_drops(self, addresses: list[Optional[int]]) -> None:
+        """Log the buffers the packer placed but the committed plan drops for
+        the relayout coupling (:meth:`_resident_indices`), with the LX they held.
+
+        The coupling is enforced after packing, so a dropped buffer's range
+        still pushed others out while the packer ran. No final plan of the
+        measured attention graphs drops anything, so this is the signal to look
+        for before teaching the packer the coupling."""
+        if not self._relayout_on:
+            return
+        dropped = sorted(
+            i for i in self.packer.allocated_indices() if addresses[i] is None
+        )
+        if dropped:
+            logger.debug(
+                "relayout coupling dropped %d placed buffer(s), %d B of LX: %s",
+                len(dropped),
+                sum(self._per_core_size(i, self.chosen[i]) for i in dropped),
+                ", ".join(self._bufs[i].name for i in dropped),
+            )
+
     def _write_back(self) -> None:
         """Commit the best state to the buffers and record spill causes.
 
@@ -1973,22 +2700,99 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         does not carry (a tiled one, once the search chooses tilings) is
         appended. Appending here rather than when the division is proposed keeps
         the menu the search ran against unchanged.
+
+        A consumer reading a resident parent it does not match reads it through
+        the relayout copy its division pair names, which is resident too
+        (:meth:`_resident_addresses`); that read is recorded on the consumer
+        with the copy's address, as ``CpSatLayoutSolver`` records it, for the
+        commit path to materialize.
+
+        Both checks run before any buffer is touched, and raise rather than
+        assert: a failure would otherwise commit a consumer reading LX in the
+        wrong layout, and ``python -O`` strips an ``assert``.
         """
+        self._check_tracked_eligibility()
+        addresses = self._resident_addresses()
+        self._log_coupling_drops(addresses)
+        reads: list[tuple[int, int, int, RelayoutCandidate]] = []
+        for source, copies in enumerate(self._relayout_copies_of):
+            if not copies or addresses[source] is None:
+                continue
+            parent = self.chosen[source]
+            for consumer, relation in self._children[source]:
+                if relation.compatible(parent, self.chosen[consumer]):
+                    continue
+                read = self._relayout_read(source, consumer)
+                if read is None or addresses[read[0]] is None:
+                    raise RuntimeError(
+                        f"SA co-optimizer: {self._bufs[source].name} is resident "
+                        f"but {self._bufs[consumer].name} has no resident copy to "
+                        "read it through"
+                    )
+                reads.append((source, consumer, *read))
         for i, b in enumerate(self._bufs):
-            addr = self.packer.addresses[i]
+            addr = addresses[i]
             b.chosen_division = self._menu_position(i, self.chosen[i])
+            # Replaced, not merged, as ``CpSatLayoutSolver`` does: only this
+            # solve's reads are recorded below.
+            b.chosen_relayouts = {}
             b.address = addr
             spilled = b.residency_reason or _SOLVER_CHOSE_SPILL
             b.spill_reason = spilled if addr is None else None
+        for source, consumer, copy_idx, candidate in reads:
+            self._bufs[consumer].chosen_relayouts[self._bufs[source].name] = (
+                ChosenRelayout(candidate, cast(int, addresses[copy_idx]))
+            )
+
+    def _check_tracked_eligibility(self) -> None:
+        """Recount eligibility from scratch and raise if the tracked state
+        disagrees.
+
+        The anneal keeps the eligibility mask, the eligible copies and their
+        count incrementally: each move updates only the buffers it can change.
+        The coupling cleanup (:meth:`_resident_indices`) reads the eligible
+        copies alone, so a buffer a move missed would let a source stay
+        resident without the copy a consumer reads it through. A disagreement
+        also means the search scored states under the wrong eligibility, so it
+        is an error in the tracking, never repaired here. One O(n) pass, next
+        to an anneal of thousands of moves.
+        """
+        n = len(self._bufs)
+        recount = [self._eligible(i) for i in range(n)]
+        wrong = {i for i in range(n) if bool(self._eligible_mask[i]) != recount[i]}
+        wrong |= self._eligible_copies ^ {
+            c for c in self._relayout_source if recount[c]
+        }
+        if not wrong and self._n_eligible == sum(recount):
+            return
+        names = sorted(self._bufs[i].name for i in wrong)
+        logger.error(
+            "SA co-optimizer: tracked eligibility drifted from a recount "
+            "(eligible count %d, recount %d; buffers that differ: %s)",
+            self._n_eligible,
+            sum(recount),
+            names,
+        )
+        raise RuntimeError(
+            f"SA co-optimizer: tracked eligibility drifted from a recount: {names}"
+        )
+
+    def _known_menu_position(self, idx: int, config: DivisionConfig) -> Optional[int]:
+        """The position in buffer ``idx``'s ``core_divisions`` that names
+        ``config``'s division, or ``None`` if the menu carries no such entry.
+        What the allocator indexed anything per division by -- the relayout
+        candidates and their prices among them."""
+        if config.menu_index is not None:
+            return config.menu_index
+        known = self._menus[idx].by_key.get(config.key)
+        return None if known is None else known.menu_index
 
     def _menu_position(self, idx: int, config: DivisionConfig) -> int:
         """The position in buffer ``idx``'s ``core_divisions`` that names
         ``config``'s division, registering it if the menu has no such entry."""
-        if config.menu_index is not None:
-            return config.menu_index
-        known = self._menus[idx].by_key.get(config.key)
+        known = self._known_menu_position(idx, config)
         if known is not None:
-            return known.menu_index
+            return known
         divisions = self._bufs[idx].core_divisions
         divisions.append(config.division)
         return len(divisions) - 1

@@ -4879,7 +4879,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         Extract once per consumer division, not once per source/destination pair.
         """
         from torch_spyre._inductor.cost_model import predict_ops
-        from torch_spyre._inductor.cost_features import extract_op_features
+        from torch_spyre._inductor.cost_features import (
+            extract_op_features,
+            feature_memo,
+        )
         from torch_spyre._inductor.scratchpad.sa_cooptimizer import _work_slices
 
         is_lx = {dep.name: False for dep in op_read_writes(consumer_op).reads}
@@ -4888,22 +4891,25 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         candidate_work_slices = [
             _work_slices(consumer_op, division) for division in consumer_divs
         ]
-        return {
-            j: float(
-                predict_ops(
-                    [
-                        extract_op_features(
-                            consumer_op,
-                            _work_slices(consumer_op, consumer_divs[j]),
-                            is_lx=is_lx,
-                            candidate_work_slices=candidate_work_slices,
-                        )
-                    ],
-                    params=_COST_PARAMS,
+        # The same op under every division: what its reads alone decide is
+        # derived once (``feature_memo``), and nothing here mutates the graph.
+        with feature_memo():
+            return {
+                j: float(
+                    predict_ops(
+                        [
+                            extract_op_features(
+                                consumer_op,
+                                _work_slices(consumer_op, consumer_divs[j]),
+                                is_lx=is_lx,
+                                candidate_work_slices=candidate_work_slices,
+                            )
+                        ],
+                        params=_COST_PARAMS,
+                    )
                 )
-            )
-            for j in sorted({c.consumer_division for c in candidates})
-        }
+                for j in sorted({c.consumer_division for c in candidates})
+            }
 
     def _cd_parent_relayouts(
         self,
