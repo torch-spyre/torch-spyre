@@ -276,7 +276,14 @@ PYBIND11_MODULE(_C, m) {
   m.def("extract_kernel_provenance_key", &spyre::extractKernelProvenanceKey,
         py::arg("event_name"),
         "Extract a canonical bundle key from a Spyre profiler event name");
-  m.def("start_runtime", &spyre::startRuntime);
+  // The device open takes seconds of native work that touches no Python
+  // object, so drop the GIL: a caller can then start the runtime on a
+  // background thread while the main thread keeps running Python (e.g. the
+  // vLLM worker loading weights). startRuntime() is std::call_once, so a
+  // concurrent device op blocks until it is done.
+  m.def("start_runtime", &spyre::startRuntime,
+        py::call_guard<py::gil_scoped_release>());
+  m.attr("_start_runtime_releases_gil") = py::bool_(true);
   m.def("free_runtime", &spyre::freeRuntime);
   m.def("device_count", &spyre::getVisibleDeviceCount);
   m.def("encode_constant", &spyre::encodeConstant);

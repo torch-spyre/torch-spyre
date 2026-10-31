@@ -200,6 +200,11 @@ c10::DataPtr SpyreAllocator::allocate(
   if (nbytes == 0) {
     return {nullptr, nullptr, &ReportAndDelete, curr_device};
   }
+  // getFlexAllocator() reads the RuntimeContext singleton directly. Make sure
+  // the runtime is up first, so an allocation racing a start_runtime() on
+  // another thread waits for it (std::call_once) instead of reading a
+  // half-built context. A no-op once the runtime has started.
+  startRuntime();
   // Get shared_ptr to keep FlexAllocator alive during operations
   auto flex_alloc = getFlexAllocator();
 

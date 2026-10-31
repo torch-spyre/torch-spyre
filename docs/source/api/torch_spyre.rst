@@ -678,6 +678,16 @@ Environment Variables
    * - ``TORCH_SPYRE_FFDC=1``
      - Enable first-failure data capture at write time. Retrieve the report
        with :func:`torch.spyre.get_diagnostic_report`
+   * - ``TORCH_SPYRE_EARLY_INIT``
+     - Open the Spyre device on a background thread right after
+       ``import torch``, so the device open (about 6 s) overlaps the rest of
+       the startup. Off by default. ``1`` opens it in every process that
+       imports torch with the variable set, so set it only in the process
+       that uses the card. A process name instead opens it only in the
+       process with that ``multiprocessing`` name: for vLLM at tensor
+       parallel size 1, ``TORCH_SPYRE_EARLY_INIT=EngineCore`` opens it early
+       in the engine process, and the other processes leave it alone. When
+       vLLM's engine runs in the calling process, use ``1``
    * - ``TORCH_SPYRE_NUM_HOST_COMPUTE_STREAMS``
      - Size of the host-compute stream pool used by program correction
        (default ``4``, maximum ``8``)
