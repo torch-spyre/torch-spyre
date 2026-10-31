@@ -16,6 +16,7 @@
 
 import json
 import math
+import re
 from datetime import datetime
 
 import pytest
@@ -27,7 +28,7 @@ AUDIT = {"audit_uuid", "audit_timestamp"}
 
 
 class ChdbClient:
-    """The two calls Table.insert/insert_identities make, served by a chdb session."""
+    """The calls Table.insert/insert_identities/count_rows make, served by a chdb session."""
 
     def __init__(self, session):
         self.s = session
@@ -44,8 +45,11 @@ class ChdbClient:
         self.s.query(f"INSERT INTO {table} FORMAT JSONEachRow\n{body}")
 
     def query(self, sql, parameters=None):
-        ids = ", ".join(f"'{i}'" for i in (parameters or {}).get("ids", [])) or "''"
+        params = dict(parameters or {})
+        ids = ", ".join(f"'{i}'" for i in params.pop("ids", [])) or "''"
         sql = sql.replace("{ids:Array(UUID)}", f"({ids})")
+        for k, v in params.items():
+            sql = re.sub(r"\{" + k + r":\w+\}", f"'{v}'", sql)
 
         class R:
             result_rows = [
@@ -66,7 +70,11 @@ def rows(s, sql):
 def chdb_session():
     session = pytest.importorskip("chdb.session")
     s = session.Session()
-    for f in ("75-experiment-ledger.sql", "76-experiment-views.sql"):
+    # 76- also reads the artifact tables and views; 80- (OTel) needs a newer server.
+    for path in SchemaApplier.sql_files(SCHEMA_DIR):
+        f = path.name
+        if f.startswith("80-"):
+            continue
         for stmt in SchemaApplier.statements((SCHEMA_DIR / f).read_text()):
             s.query(stmt)
     yield s
@@ -90,7 +98,7 @@ def _driver_rows(aa: bool):
                 "env": {"FLEX_DEVICE": "PF"},
                 "rpms": "ibm-flex-1.0-1.x86_64",
                 "profiler_build": "false",
-                "image_artifact": '{"artifact_id": "05ab2b13-374e-59de-9872-689d9333cd30"}',
+                "image_artifact": f'{{"artifact_id": "{IMAGE}", "id12": "c3ecbf743109"}}',
                 "sha": "e1",
             },
         },
@@ -180,6 +188,9 @@ SPEC = {
 AA_SPEC = {**SPEC, "arms": [{"name": "A", "env": {}}, {"name": "B", "env": {}}]}
 
 
+IMAGE = "05ab2b13-374e-59de-9872-689d9333cd30"
+
+
 def _load(s, *records):
     bundle = Bundle(actor="ci@example.com").load(r for recs in records for r in recs)
     return bundle.write(ChdbClient(s), "")
@@ -259,6 +270,7 @@ def test_a_bundle_written_twice_adds_nothing(chdb_session):
     first = _load(chdb_session, recs)
     assert first["experiment_samples"] == 4 * 2 * 2 + 2 * 1
     assert first["run_env_reports"] == 1
+    assert first["artifact_tags"] == 3  # experiment-exp-ab, @A, @B
     assert set(_load(chdb_session, recs).values()) == {0}
 
 
@@ -372,3 +384,58 @@ def test_a_later_finding_version_supersedes_and_a_retraction_hides_it(chdb_sessi
     assert rows(
         s, "SELECT count() AS n FROM v_noise_floors WHERE source = 'reported'"
     ) == [{"n": 0}]
+
+
+def test_results_are_listed_by_experiment_tag(chdb_session):
+    s = chdb_session
+    s.query(
+        "INSERT INTO artifacts (artifact_id, component, arch, kind, artifact_name, origin, props) "
+        f"VALUES ('{IMAGE}', 'spyre-inference', 'x86_64', 'image', 'spyre-inference-dev', 'built', "
+        "{'id12': 'c3ecbf743109'})"
+    )
+    _load(
+        s,
+        [
+            {
+                "record": "experiment",
+                "name": "camp",
+                "kind": "other",
+                "state": "running",
+                "ts": 0,
+            }
+        ],
+        abab_bundle(_driver_rows(aa=False), SPEC, "exp-ab", parent="camp"),
+        abab_bundle(_driver_rows(aa=True), AA_SPEC, "exp-aa", parent="camp"),
+    )
+    tags = rows(
+        s, "SELECT tag, tag_family, props['arm'] AS arm FROM artifact_tags ORDER BY tag"
+    )
+    assert [t["tag"] for t in tags] == [
+        "experiment-exp-aa", "experiment-exp-aa@A", "experiment-exp-aa@B",
+        "experiment-exp-ab", "experiment-exp-ab@A", "experiment-exp-ab@B",
+    ]  # fmt: skip
+    assert {t["tag_family"] for t in tags} == {"experiment"}
+
+    def by_tag(tag):
+        return rows(
+            s,
+            "SELECT experiment, arm, id12, artifact_name, runs, verdict, gain_evidence, "
+            "round(floor_run_sd_pct, 3) AS floor FROM v_experiment_tag_results "
+            f"WHERE tag = '{tag}' AND metric = 'lat' ORDER BY experiment, arm",
+        )
+
+    # floor: exp-aa's A/A floor, same workload and stratum.
+    one = by_tag("experiment-exp-ab@B")
+    assert one == [{"experiment": "exp-ab", "arm": "B", "id12": "c3ecbf743109",
+                    "artifact_name": "spyre-inference-dev", "runs": 4, "verdict": "better",
+                    "gain_evidence": "G2", "floor": 0.913}]  # fmt: skip
+    # No campaign-level tag was written, so the campaign is reached through a child's tag only.
+    assert by_tag("experiment-camp") == []
+    s.query(
+        "INSERT INTO artifact_tags (tag, tag_family, artifact_id) "
+        f"VALUES ('experiment-camp', 'experiment', '{IMAGE}')"
+    )
+    camp = by_tag("experiment-camp")
+    assert [(r["experiment"], r["arm"]) for r in camp] == [
+        ("exp-aa", "A"), ("exp-aa", "B"), ("exp-ab", "A"), ("exp-ab", "B")
+    ]  # fmt: skip

@@ -1,5 +1,6 @@
 -- Latest-state views over the 75- ledger, plus the reads its consumers make: arm verdicts, A/A
--- noise floors, campaign progress, and what was already tried for a subject.
+-- noise floors, campaign progress, what was already tried for a subject, and results by
+-- experiment tag (joins 20-/50-'s artifacts and tags).
 
 CREATE VIEW IF NOT EXISTS v_experiments AS
 SELECT
@@ -35,6 +36,8 @@ SELECT
     argMax(a.knob_sha, (a.ts, a.event_id))        AS knob_sha,
     argMax(a.change_class, (a.ts, a.event_id))    AS change_class,
     argMax(a.hazard_class, (a.ts, a.event_id))    AS hazard_class,
+    argMax(a.artifact_id, (a.ts, a.event_id))     AS artifact_id,
+    argMax(a.id12, (a.ts, a.event_id))            AS id12,
     argMax(a.props, (a.ts, a.event_id))           AS props
 FROM experiment_arms AS a
 GROUP BY a.experiment_id, a.arm;
@@ -62,6 +65,8 @@ SELECT
     argMax(s.load1_before, s.audit_timestamp)     AS load1_before,
     argMax(s.node, s.audit_timestamp)             AS node,
     argMax(s.env_id, s.audit_timestamp)           AS env_id,
+    argMax(s.artifact_id, s.audit_timestamp)      AS artifact_id,
+    argMax(s.id12, s.audit_timestamp)             AS id12,
     argMax(s.run_id, s.audit_timestamp)           AS run_id,
     argMax(s.benchmark_id, s.audit_timestamp)     AS benchmark_id
 FROM experiment_samples AS s
@@ -279,4 +284,89 @@ LEFT JOIN
     WHERE t.state = 'published' AND t.kind IN ('effect', 'calibration', 'feasibility')
     GROUP BY t.experiment_id, t.arm
 ) AS f ON f.experiment_id = a.experiment_id AND f.arm = a.arm
+SETTINGS join_use_nulls = 1;
+
+-- Results reusable by tag: per experiment tag (`experiment-<experiment or campaign>[@<arm>]`,
+-- family experiment), the images it names, the runs taken on each, and their latest verdict
+-- and A/A floor. A campaign tag covers its child experiments; an @<arm> tag only that arm.
+CREATE VIEW IF NOT EXISTS v_experiment_tag_results AS
+SELECT
+    t.tag                                         AS tag,
+    e.name                                        AS experiment,
+    s.experiment_id                               AS experiment_id,
+    s.arm                                         AS arm,
+    am.role                                       AS role,
+    am.knobs                                      AS knobs,
+    t.artifact_id                                 AS artifact_id,
+    if(art.props['id12'] != '', art.props['id12'], s.id12) AS id12,
+    art.component                                 AS component,
+    art.artifact_name                             AS artifact_name,
+    art.arch                                      AS arch,
+    s.workload                                    AS workload,
+    s.stratum                                     AS stratum,
+    s.metric                                      AS metric,
+    s.runs                                        AS runs,
+    s.runs_ok                                     AS runs_ok,
+    s.median_value                                AS median_value,
+    s.run_ids                                     AS run_ids,
+    ifNull(r.v2_runs, 0)                          AS v2_runs,  -- artifact_results runs of this image
+    v.decision                                    AS decision,
+    v.verdict                                     AS verdict,
+    v.gain_evidence                               AS gain_evidence,
+    v.effect_pct                                  AS effect_pct,
+    v.last_effect_pct                             AS last_effect_pct,
+    f.run_sd_pct                                  AS floor_run_sd_pct,
+    f.n_pairs                                     AS floor_n_pairs,
+    s.last_ts                                     AS last_ts
+FROM
+(
+    SELECT g.tag AS tag, g.artifact_id AS artifact_id,
+           substring(g.tag, 12) AS rest,  -- after 'experiment-'
+           if(position(rest, '@') > 0, substring(rest, 1, position(rest, '@') - 1), rest) AS scope_name,
+           if(position(rest, '@') > 0, substring(rest, position(rest, '@') + 1), '')       AS tag_arm
+    FROM artifact_tags AS g
+    WHERE g.tag_family = 'experiment' AND startsWith(g.tag, 'experiment-')
+    GROUP BY g.tag, g.artifact_id
+) AS t
+INNER JOIN v_experiments AS sc ON sc.name = t.scope_name
+INNER JOIN
+(
+    -- (scope, experiment): every experiment is its own scope, and its campaign's.
+    SELECT x.experiment_id AS scope_id, x.experiment_id AS experiment_id FROM v_experiments AS x
+    UNION ALL
+    SELECT x.parent_id, x.experiment_id FROM v_experiments AS x
+    WHERE x.parent_id != toUUID('00000000-0000-0000-0000-000000000000')
+) AS m ON m.scope_id = sc.experiment_id
+INNER JOIN
+(
+    SELECT q.experiment_id AS experiment_id, q.arm AS arm, q.artifact_id AS artifact_id,
+           any(q.id12) AS id12, q.workload AS workload, q.stratum AS stratum, q.metric AS metric,
+           count()                                        AS runs,
+           countIf(q.status = 'ok')                       AS runs_ok,
+           quantileExactIf(0.5)(q.value, q.status = 'ok') AS median_value,
+           groupUniqArrayIf(q.run_id, q.run_id != toUUID('00000000-0000-0000-0000-000000000000')) AS run_ids,
+           max(q.ts)                                      AS last_ts
+    FROM v_experiment_samples AS q
+    WHERE NOT q.warmup AND q.metric != ''
+    GROUP BY q.experiment_id, q.arm, q.artifact_id, q.workload, q.stratum, q.metric
+) AS s ON s.experiment_id = m.experiment_id AND s.artifact_id = t.artifact_id
+INNER JOIN v_experiments AS e ON e.experiment_id = s.experiment_id
+LEFT JOIN v_experiment_arms AS am ON am.experiment_id = s.experiment_id AND am.arm = s.arm
+LEFT JOIN v_artifacts AS art ON art.artifact_id = t.artifact_id
+LEFT JOIN
+(
+    SELECT ar.artifact_id AS artifact_id, uniqExact(ar.run_id) AS v2_runs
+    FROM artifact_results AS ar
+    GROUP BY ar.artifact_id
+) AS r ON r.artifact_id = t.artifact_id
+LEFT JOIN v_arm_verdicts AS v
+    ON v.experiment_id = s.experiment_id AND v.arm = s.arm AND v.metric = s.metric
+LEFT JOIN
+(
+    SELECT n.workload AS workload, n.metric AS metric, n.stratum AS stratum,
+           n.run_sd_pct AS run_sd_pct, n.n_pairs AS n_pairs
+    FROM v_noise_floors AS n
+    WHERE n.source = 'measured'
+) AS f ON f.workload = s.workload AND f.metric = s.metric AND f.stratum = s.stratum
+WHERE t.tag_arm = '' OR t.tag_arm = s.arm
 SETTINGS join_use_nulls = 1;

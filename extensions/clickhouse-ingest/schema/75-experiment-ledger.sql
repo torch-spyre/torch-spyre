@@ -46,6 +46,8 @@ ENGINE = MergeTree()
 ORDER BY (experiment_id, ts, event_id);
 
 -- One configuration under test. Two arms with one knob_sha make an A/A pair (76- floors).
+-- An image an experiment ran is a spyre_v2 artifact tagged `experiment-<name>[@<arm>]` (family
+-- experiment, in artifact_tags); artifact_id here and on samples is the join back to it.
 -- change_class and hazard_class are separate axes: a runtime knob can still hang the card.
 CREATE TABLE IF NOT EXISTS experiment_arms
 (
@@ -60,6 +62,8 @@ CREATE TABLE IF NOT EXISTS experiment_arms
     knob_sha        String,                        -- sha256 of the sorted knobs
     change_class    LowCardinality(String) DEFAULT '',  -- analysis | runtime_knob | serving_config | codegen_param | model_param | source_patch
     hazard_class    LowCardinality(String) DEFAULT '',  -- safe | may_fail_compile | may_hang
+    artifact_id     UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),  -- the image the arm runs, when fixed
+    id12            String DEFAULT '',
     actor           String,
     actor_kind      LowCardinality(String) DEFAULT 'human',
     props           Map(LowCardinality(String), String),
@@ -102,6 +106,8 @@ CREATE TABLE IF NOT EXISTS experiment_samples
     load1_after     Float32 DEFAULT 0,
     node            String DEFAULT '',
     env_id          UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),  -- run_env_reports
+    artifact_id     UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),  -- the image this run ran on
+    id12            String DEFAULT '',
     run_id          UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),  -- set when a CI run took it
     benchmark_id    UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
     props           Map(LowCardinality(String), String),

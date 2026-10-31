@@ -14,7 +14,8 @@
 
 """Write experiment bundles (JSONL, format in schema/README.md) into the 75- experiment ledger.
 
-`write` loads bundles; `abab` turns a paired A/B driver's samples.jsonl into a bundle.
+`write` loads bundles and tags each image a sample ran on (artifact_tags, family
+`experiment`); `abab` turns a paired A/B driver's samples.jsonl into a bundle.
 Every id is derived from content, so writing a bundle twice adds no rows.
 """
 
@@ -38,6 +39,9 @@ RECORDS = ("experiment", "arm", "env", "sample", "decision", "finding", "link")
 # The A/B driver's per-pair outcome; anything but these is not a sample.
 ABAB_SAMPLE_KINDS = ("warmup", "sample")
 RPM_NAME = regex.compile(r"^(.+?)-(\d.*)$")
+# Images an experiment ran are tagged `experiment-<name>` and `experiment-<name>@<arm>`.
+TAG_FAMILY = "experiment"
+TAG_PREFIX = TAG_FAMILY + "-"
 
 
 def _id(*parts: Any) -> str:
@@ -155,6 +159,8 @@ class Bundle:
             "knob_sha": _sha(knobs),
             "change_class": r.get("change_class", ""),
             "hazard_class": r.get("hazard_class", ""),
+            "artifact_id": r.get("artifact_id") or NIL,
+            "id12": r.get("id12", ""),
             "props": _strs(r.get("props")),
             **self._who(r),
         }
@@ -213,6 +219,10 @@ class Bundle:
         units = r.get("units") or {}
         warmup = bool(r.get("warmup", False))
         key = (eid, r["arm"], int(r.get("trial", 0)), int(r.get("position", 0)), warmup)
+        env_id = self.env_id(r.get("env_sha", ""))
+        env = self.rows[schema.RunEnvReports].get(env_id, {})
+        # A run's image defaults to the one its env report names.
+        artifact_id = r.get("artifact_id") or env.get("artifact_id") or NIL
         for metric, value in metrics.items() or [("", math.nan)]:
             self.add(
                 schema.ExperimentSamples,
@@ -237,7 +247,9 @@ class Bundle:
                     "load1_before": _num(r.get("load1_before"), 0.0),
                     "load1_after": _num(r.get("load1_after"), 0.0),
                     "node": r.get("node", ""),
-                    "env_id": self.env_id(r.get("env_sha", "")),
+                    "env_id": env_id,
+                    "artifact_id": artifact_id,
+                    "id12": r.get("id12", ""),
                     "run_id": r.get("run_id") or NIL,
                     "benchmark_id": r.get("benchmark_id") or NIL,
                     "props": _strs(r.get("props")),
@@ -333,13 +345,52 @@ class Bundle:
             },
         )
 
-    def write(self, client, db: str) -> dict[str, int]:
-        """Insert rows the database does not hold yet, env reports first."""
+    def tags(self) -> list[dict]:
+        """artifact_tags rows naming each image a sample ran on by its experiment and arm."""
+        names = {
+            r["experiment_id"]: r["name"]
+            for r in self.rows[schema.ExperimentEvents].values()
+        }
+        seen = {}
+        for r in self.rows[schema.ExperimentSamples].values():
+            if r["artifact_id"] == NIL or r["experiment_id"] not in names:
+                continue
+            name = names[r["experiment_id"]]
+            for tag in (f"{TAG_PREFIX}{name}", f"{TAG_PREFIX}{name}@{r['arm']}"):
+                props = {"experiment_id": r["experiment_id"], "id12": r["id12"]}
+                if "@" in tag:
+                    props["arm"] = r["arm"]
+                seen[(tag, r["artifact_id"])] = {
+                    "tag": tag,
+                    "tag_family": TAG_FAMILY,
+                    "artifact_id": r["artifact_id"],
+                    "refs": [],
+                    "published_refs": [],
+                    "props": {k: v for k, v in props.items() if v},
+                }
+        return list(seen.values())
+
+    def write(self, client, db: str, tag: bool = True) -> dict[str, int]:
+        """Insert rows the database does not hold yet, env reports first, then the tags."""
         order = (
             schema.RunEnvReports,
             *[t for t in schema.EXPERIMENT_TABLES if t is not schema.RunEnvReports],
         )
-        return {t.name: t.insert_identities(client, self.rows[t], db=db) for t in order}
+        done = {t.name: t.insert_identities(client, self.rows[t], db=db) for t in order}
+        if tag:
+            from .writer import ArtifactWriter
+
+            fresh = [
+                t
+                for t in self.tags()
+                if not ArtifactWriter.tag_recorded(
+                    client, db, t["tag"], t["artifact_id"]
+                )
+            ]
+            done[schema.ArtifactTags.name] = schema.ArtifactTags.insert(
+                client, fresh, db=db
+            )
+        return done
 
     def counts(self) -> dict[str, int]:
         return {t.name: len(rows) for t, rows in self.rows.items()}
@@ -354,9 +405,9 @@ def read_jsonl(path: Path) -> list[dict]:
 
 def _abab_env(report: Mapping, ts: Any) -> dict:
     env = report.get("env") or {}
-    art = regex.search(
-        r'"artifact_id":\s*"([0-9a-f-]{36})"', str(report.get("image_artifact", ""))
-    )
+    image = str(report.get("image_artifact", ""))
+    art = regex.search(r'"artifact_id":\s*"([0-9a-f-]{36})"', image)
+    id12 = regex.search(r'"id12":\s*"([0-9a-f]{12})"', image)
     packages = {}
     for nevra in str(report.get("rpms", "")).split():
         m = RPM_NAME.match(nevra)
@@ -385,6 +436,7 @@ def _abab_env(report: Mapping, ts: Any) -> dict:
             if c
         ],
         "artifact_id": art.group(1) if art else "",
+        "props": {"id12": id12.group(1)} if id12 else {},
         "packages": packages,
         "env": env,
         "profiler_build": report.get("profiler_build"),
@@ -414,10 +466,11 @@ def abab_bundle(
     env_rec = next(
         (_abab_env(r["report"], r["ts"]) for r in rows if r.get("kind") == "env"), None
     )
-    stratum, env_sha, profiler = "", "", None
+    stratum, env_sha, profiler, id12 = "", "", None, ""
     if env_rec:
         out.append(env_rec)
         env_sha, profiler = env_rec["env_sha"], env_rec["profiler_build"]
+        id12 = env_rec["props"].get("id12", "")
         stratum = "/".join(
             [env_rec["arch"], env_rec["card_class"], env_rec["cpu_model"]]
         )
@@ -492,6 +545,7 @@ def abab_bundle(
                     "load1_before": r.get("load1_before"),
                     "load1_after": r.get("load1_after"),
                     "env_sha": env_sha,
+                    "id12": id12,
                     "props": {
                         "run_dir": r.get("run_dir", ""),
                         "order": r.get("order", ""),
@@ -634,6 +688,9 @@ def main(argv=None) -> None:
     wr.add_argument(
         "--dry-run", action="store_true", help="validate and count, write nothing"
     )
+    wr.add_argument(
+        "--no-tags", action="store_true", help="leave the images' artifact_tags alone"
+    )
     ab = sub.add_parser(
         "abab", help="a paired A/B driver's samples.jsonl -> bundle JSONL on stdout"
     )
@@ -664,7 +721,8 @@ def main(argv=None) -> None:
     for path in args.bundles:
         bundle.load(read_jsonl(path))
     if args.dry_run:
-        print(json.dumps(bundle.counts(), sort_keys=True))
+        counts = {**bundle.counts(), "artifact_tags": len(bundle.tags())}
+        print(json.dumps(counts, sort_keys=True))
         return
 
     from .client import ClickHouse, ClickHouseEnv
@@ -672,7 +730,7 @@ def main(argv=None) -> None:
     db = args.database or ClickHouseEnv.target_database()
     if not db:
         sys.exit("[error] no database: pass --database or set CLICKHOUSE_DB_V2")
-    done = bundle.write(ClickHouse.connect(database=db), db)
+    done = bundle.write(ClickHouse.connect(database=db), db, tag=not args.no_tags)
     print(f"[info] {db}: " + ", ".join(f"{k} {v}" for k, v in done.items()))
 
 
