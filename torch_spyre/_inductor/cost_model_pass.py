@@ -71,6 +71,7 @@ from .constants import DEVICE_NAME
 from .cost_model import CostParams, _loop_reread_bytes, predict_ops, relayout_ns
 from .cost_features import extract_op_features
 from .logging_utils import get_inductor_logger
+from .loop_facts import counted_loop_path
 
 logger = get_inductor_logger("cost_model_pass")
 
@@ -287,11 +288,8 @@ def _traffic(o: "OpCost", width: int = 12) -> str:
 
 
 def _loop_group_id(op) -> tuple[int, ...] | None:
-    gid = getattr(getattr(op, "loop_info", None), "loop_group_id", None)
-    try:
-        return tuple(gid) if gid else None
-    except TypeError:  # a malformed id (e.g. a bare int) must not sink the report
-        return None
+    # A malformed id (e.g. a bare int) reads as "no loop" and must not sink the report.
+    return counted_loop_path(op, include_extern=True) or None
 
 
 def _per_iteration(f) -> dict:
