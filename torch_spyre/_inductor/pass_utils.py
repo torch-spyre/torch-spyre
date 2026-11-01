@@ -2370,6 +2370,35 @@ def _host_size_stride_for_expr(
     return host_size[d], host_stride[d]
 
 
+def _locate_stick_by_stride(
+    stl: SpyreTensorLayout, host_size: list, host_stride: list, stick_size: int
+) -> "tuple[int, int] | None":
+    """Return (host dim, stick-tile device dim) of stl's stick, found by stride.
+
+    The host dim is the one whose stride is the stick's element stride; the device
+    dim is the one whose stride_map steps by one stick of it. Unlike a lookup by the
+    access's coordinates, this does not depend on how the access reads the stick
+    dim. Returns None when either is not unique, or the stick is sparse.
+    """
+    stride_map = list(stl.stride_map)
+    elem_stride = stride_map[-1]
+    if elem_stride <= 0:
+        return None
+    host_dims = [
+        d
+        for d, (size, stride) in enumerate(zip(host_size, host_stride))
+        if size > 1 and stride == elem_stride
+    ]
+    device_dims = [
+        j
+        for j in range(len(stride_map) - 1)
+        if stride_map[j] == elem_stride * stick_size
+    ]
+    if len(host_dims) != 1 or len(device_dims) != 1:
+        return None
+    return host_dims[0], device_dims[0]
+
+
 def compute_restickify_target_layout(
     stl: SpyreTensorLayout,
     host_layout: FixedLayout,
@@ -2416,12 +2445,35 @@ def compute_restickify_target_layout(
     old_stick_expr = idc[-1]
     new_var = next(iter(target_stick_expr.free_symbols))
     stick_size = get_elem_in_stick(host_layout.dtype)
-    if old_stick_expr.free_symbols:
-        old_sd_size_stride = _host_size_stride_for_expr(
+    old_sd_size_stride = (
+        _host_size_stride_for_expr(
             old_stick_expr, ic, host_size, host_stride, arg, reduction_type, label
         )
-        if old_sd_size_stride is None:
+        if old_stick_expr.free_symbols
+        else None
+    )
+    by_stride = old_sd_size_stride is None and (
+        old_stick_expr.free_symbols or reduction_type != BATCH_MATMUL_OP
+    )
+    if by_stride:
+        # The access's coordinates no longer match the stick when it reads the
+        # stick dim from inside a later stick (host d1 + 96 for in-stick d1 + 32,
+        # whose stick index went to the constant stick-tile coordinate), reads a
+        # single element of it (a constant stick), or reads it through a view
+        # folding several loop variables into that host dim. A restickify
+        # relayouts the whole buffer, so locate both dims from its strides; the
+        # stick-tile dim then holds the old stick by construction, so the
+        # coordinate path's stick-tile lookup and folded-axis guard are skipped.
+        located = _locate_stick_by_stride(stl, host_size, host_stride, stick_size)
+        if located is None:
             return None
+        old_sd, old_sd_outer_dim = located
+        old_sd_host_size, old_sd_host_stride = host_size[old_sd], host_stride[old_sd]
+        if (old_sd_host_size, old_sd_host_stride) == new_sd_size_stride:
+            # TODO: regrouping sticks within one host dim is not supported.
+            return None
+        old_var = None
+    elif old_sd_size_stride is not None:
         old_sd_host_size, old_sd_host_stride = old_sd_size_stride
         old_var = next(iter(old_stick_expr.free_symbols))
         old_var_outer_dims = [
@@ -2430,30 +2482,35 @@ def compute_restickify_target_layout(
     else:
         # Zero stick (placeholder dim with no variable): only valid for BATCH_MATMUL_OP,
         # where a size-1 contraction dim produces a constant stick expression.
-        # For all other ops, this layout is infeasible.
-        if reduction_type != BATCH_MATMUL_OP:
-            return None
         old_sd_host_size, old_sd_host_stride = 1, 1
         old_var_outer_dims = []
         old_var = None
-    if len(old_var_outer_dims) > 1:
-        return None
     old_device_size = list(stl.device_size)
     old_stride_map = list(stl.stride_map)
-    old_sd_outer_dim = next(
-        iter(old_var_outer_dims),
-        next((j for j in range(len(idc) - 1) if idc[j] == sympy.S.Zero), None),
-    )
-    if old_sd_outer_dim is None:
-        return None
+    if not by_stride:
+        if len(old_var_outer_dims) > 1:
+            return None
+        coordinate_outer_dim = next(
+            iter(old_var_outer_dims),
+            next((j for j in range(len(idc) - 1) if idc[j] == sympy.S.Zero), None),
+        )
+        if coordinate_outer_dim is None:
+            return None
+        old_sd_outer_dim = coordinate_outer_dim
     candidates = [j for j in range(len(idc) - 1) if new_var in idc[j].free_symbols]
     if not candidates:
         return None
     new_sd_outer_dim = candidates[0]
     # Swapping one device axis cannot preserve another host dimension folded
     # into it (for example page * block_size + token in a paged cache).
-    old_sd_free = idc[old_sd_outer_dim].free_symbols - ({old_var} if old_var else set())
+    old_sd_free = (
+        set()
+        if by_stride
+        else idc[old_sd_outer_dim].free_symbols - ({old_var} if old_var else set())
+    )
     if old_sd_free or idc[new_sd_outer_dim].free_symbols - {new_var}:
+        return None
+    if by_stride and new_sd_outer_dim == old_sd_outer_dim:
         return None
     device_size = restickify_device_size(
         old_device_size,
