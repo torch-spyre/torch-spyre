@@ -58,6 +58,7 @@ from .kernel_cache import (
 )
 
 if TYPE_CHECKING:
+    from torch_spyre._inductor.codegen.compute_ops import SymbolKind
     from torch_spyre._inductor.kernel_provenance import KernelProvenanceDescriptor
 
 logger = get_inductor_logger("sdsc_compile")
@@ -101,8 +102,9 @@ def _check_ktir_device_prerequisites() -> None:
 
 # One event name for every backend invocation, whichever emitter selected it, so
 # a frontend total stays a single subtraction as emitters come and go. The tool
-# is in the event's meta.
-_BACKEND_STAGE = "stage:SpyreAsyncCompile:backend_compile"
+# is in the event's meta. Defined in timing_recorder so a reader computing that
+# subtraction has one name to match rather than a copy of this string.
+_BACKEND_STAGE = timing_recorder.BACKEND_COMPILE_EVENT
 
 # The frontend-only warning is per process, not per kernel: a large model emits
 # hundreds of kernels and the record already names each skipped one.
@@ -331,7 +333,7 @@ def _prepare_kernel(
     kernel_name: str,
     output_dir: str,
     kernel_provenance: "KernelProvenanceDescriptor | None",
-    symbol_kinds: Any = None,
+    symbol_kinds: "list[SymbolKind] | None" = None,
 ) -> SpyreSDSCKernelRunner:
     with timing_recorder.stage(
         "stage:SpyreAsyncCompile:prepare_kernel", kernel=kernel_name
