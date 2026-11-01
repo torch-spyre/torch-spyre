@@ -46,10 +46,11 @@ those (`_GeneratedDivisions`); the rest read the enumerated menu (`_MenuDivision
 producer→consumer edge likewise gets an `_EdgeRelation`, which the residency gate and the recolor
 flood ask: computed per candidate off the buffer's geometry where both ends generate
 (`_ViewRelation`, which inverts the per-core view to construct the other end's division), and the
-`cd_parent_matches` table projected onto choices otherwise (`_TableRelation`). The one thing still
-keyed by menu position is the `chosen_division` written back; a generated division the menu does
-not carry is appended to it then — which is the path a tiled division always takes, since the
-enumeration carries no tilings.
+`cd_parent_matches` table projected onto choices otherwise (`_TableRelation`). Two things are still
+keyed by menu position: the `chosen_division` written back, and the relayout candidates and their
+prices (see [LX relayouts](#lx-relayouts)). A generated division finds its position by its key; one
+the menu does not carry is unpriced for a relayout, and is appended to the menu at write-back,
+which is the path a tiled division always takes, since the enumeration carries no tilings.
 
 ### The coarse tiling rides on the same candidate
 
@@ -148,6 +149,58 @@ re-read not double-counted (`_COST_PARAMS`), depth reaches the price mainly thro
 A coarse-tiled op reading a buffer produced outside its run reads it at an address that advances
 per tile, which an LX address cannot: `_read_across_a_tiling_boundary` refuses that buffer LX.
 Nothing gives that residency back yet; a tile-local staging copy, placed by the anneal, could.
+
+### LX relayouts
+
+The allocator hands the engine one `RelayoutCopyBuffer` per relayout group, as it does CP-SAT, and the objective carries each copy's `RelayoutCharge` price term.
+A copy is the LX destination of one (source, destination view) shuffle, and its residency is the decision that the shuffle fires.
+A candidate is keyed by the (source, consumer) pair of menu positions, and the consumer's division fixes the view it reads, so on a given edge the divisions alone name the copy that serves it.
+
+The coupling CP-SAT states as constraints splits in two here.
+The half that depends only on divisions is eligibility.
+A source's child gate relaxes from "every child compatible" to "compatible, or a copy serves this pair and could hold it".
+A copy is eligible only while some consumer it can serve does not match its source, and only while its source is eligible, which keeps the predicate consistent, so `_all_eligible_resident` stays exact.
+The half that depends on placement is the packer's outcome: under capacity pressure it can place a source and spill the copy a consumer must read it through, or the reverse.
+`_resident_addresses` enforces it after packing by removing, never adding: a placed source a consumer cannot read is dropped, then every copy whose source is not resident.
+That is already a fixpoint, since dropping a source orphans only its own copies.
+A dropped buffer's range still pushed others out while the packer ran, which teaching the packer the coupling would avoid.
+It has not been needed: on the decode (ctx 512 and 2048) and prefill (128 and 512) attention graphs no final plan drops anything, and only the search's intermediate states do (21% of them on prefill 512), which the score prices.
+The write-back logs any drop at debug level (`_log_coupling_drops`), the signal to look for before changing the packer.
+The score, the dump and the write-back all read that resident set, and the write-back records each relayout read in `chosen_relayouts`, as CP-SAT does.
+The eligibility that resident set rests on is kept incrementally: each move updates only the buffers it can change, and the cleanup reads only the eligible copies.
+So before committing anything, the write-back recounts eligibility from scratch and raises if the tracked state disagrees (`_check_tracked_eligibility`), and raises if a resident source has a mismatched consumer with no resident copy to read it through.
+Both are explicit raises, not asserts: either failure would commit a consumer reading LX in the wrong layout, and `python -O` strips an assert.
+A randomized test drives every move, keeping or restoring each at random, and checks the tracking after every step against a recount, the coupling read off the graph, and the objective evaluated directly.
+
+Residency cannot decide a shuffle on its own.
+The packer places every eligible buffer that fits, which is right for a buffer whose residency only saves traffic and wrong for a copy, whose residency costs its price.
+So each copy carries an on/off bit, part of the state and of every snapshot, and every copy starts off, so the seed is the plan without relayouts.
+The `relayout` move draws a copy uniformly among the ones that could ever be resident: a copy that does not fit, or whose source is pinned out of LX, is never offered.
+It switches a copy that is on off.
+It switches a copy that is off on together with one of its candidates' divisions, for the source and for every consumer the group can serve from it.
+Switching it on alone would pay only when the divisions already sat on one of its few priced pairs, so each half of the change would be worth nothing to the score on its own.
+Among the copy's source divisions, it draws from those that move the fewest buffers another eligible copy is priced for (one that is on but whose source is ineligible for another reason delivers nothing, so it anchors nothing), so a chain of relayouts (a buffer that is the consumer of one copy and the source of the next) does not lose one link for every link it gains.
+
+Every structural move also buys the seams it opened (`_seam_copies`): each edge out of a reassigned buffer, or into it from a parent, that no longer matches and whose new pair names a copy gets that copy switched on in the same step.
+Only those edges: an edge from a parent to a sibling of a reassigned buffer keeps its pair of divisions, so a copy the search switched off there stays off.
+The divisions, the copies and the packer's eligibility all change in one re-place, so a move pays for one re-place however many seams it opens.
+A recolor's flood stops at every edge with no compatible pair, and those seams are exactly where a relayout can stand, so a region and the relayouts at its boundary are judged as one move.
+On the prefill attention graphs this is what reaches CP-SAT's plans, which recolor a region and relay out into it.
+
+A seam is a choice between two plans for its edge: the copy on and its price paid, or the copy off and its source spilled.
+So a move that bought seams is scored both ways after its burst, and keeps the seams only if they score no worse (`_settle`).
+Bought blind, every move would be scored with its copies on, and a move whose own gain beats the spill but not the shuffle would be rejected.
+A per-copy price test cannot replace this: two copies of one source can each cost less than its spill and together cost more.
+The second score costs one re-place on the moves that open a seam; a move that opens none, which is every move on a graph without copies, is unchanged.
+
+The memory-only fallback has no price for a shuffle, so under it every copy stays off: the move is not offered and no seam is bought.
+A relayout copy carries no division decision, so it buys the search no steps.
+Nor does a copy that is off take layout moves, or a place in the seed order.
+It is transparent to the packer, so no address depends on where it sits in `pi`, and a graph has many times more copies than buffers.
+So the seed's FirstFit pass treats every copy as pinned, which sorts the copies after the buffers and orders the buffers as the solve without copies does.
+The rotate and reinsertion moves draw over the buffers and the eligible copies only (`_draw_layout_buffer`), the native packer giving a buffer's position in O(1), and the reinsertion sweep stops after the last such occupant.
+Drawn over every occupant, most layout moves went to copies that were off, and on the decode attention graphs with relayout prices raised tenfold the search ended 1-7% worse than the solve without relayouts, with no copy fired.
+Its price term is summed directly over the resident copies rather than compiled into the score function, since a graph can carry thousands of copies and each is zero while the copy is off.
 
 ## The apply round
 
