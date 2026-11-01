@@ -621,6 +621,11 @@ void initializeStreamPoolImpl(c10::DeviceIndex device_index) {
 }
 
 void initializeStreamPool(c10::DeviceIndex device_index) {
+  // initializeStreamPoolImpl reads GlobalRuntime. start_runtime() may run on
+  // another thread without the GIL, so every stream lookup (getDefaultStream,
+  // getCurrentStream, ...) waits for it here, as getStreamFromPool and
+  // getHostComputeStream already do. A no-op once the runtime has started.
+  startRuntime();
   auto& pool = getStreamPool();
   std::call_once(pool.device_init_flags[device_index], initializeStreamPoolImpl,
                  device_index);

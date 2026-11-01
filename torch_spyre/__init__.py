@@ -285,6 +285,61 @@ def _autoload():
         raise
 
 
+def _early_init_requested() -> bool:
+    """Whether ``TORCH_SPYRE_EARLY_INIT`` asks this process to open the device early.
+
+    ``1`` means this process. Any other value except ``0`` or empty names a
+    process: only the process whose ``multiprocessing`` name is exactly that
+    value opens the device early. A spawned child gets its name before it
+    imports anything, so the check works at ``import torch``.
+    """
+    value = os.getenv("TORCH_SPYRE_EARLY_INIT", "0").strip()
+    if value in ("", "0"):
+        return False
+    if value == "1":
+        return True
+    import multiprocessing
+
+    return multiprocessing.current_process().name == value
+
+
+def _maybe_start_runtime_early() -> None:
+    """Open the Spyre device on a background thread right after ``import torch``.
+
+    Off by default. ``TORCH_SPYRE_EARLY_INIT=1`` opens it in every process that
+    imports torch with the variable set, so set it only in the one process that
+    uses the card. A process name instead (``TORCH_SPYRE_EARLY_INIT=EngineCore``
+    for vLLM's engine process at tensor parallel size 1) can be set for a whole
+    multi-process program: only that process opens the card early, and the
+    others, which inherit the variable, leave it alone. Opening the device
+    (``start_runtime``) takes about 6 s and waits on the device, not the CPU; it
+    releases the GIL, so the rest of the imports and the model setup run while it
+    happens. The C++ start is a call-once, so the first device operation waits
+    for it to finish. A forked child does not own the device, as before.
+    """
+    if not _early_init_requested():
+        return
+    import torch
+
+    impl = getattr(torch.spyre, "_impl", None)
+    if impl is None or impl._initialized or impl._is_in_bad_fork():
+        return
+
+    def _start():
+        try:
+            impl._lazy_init()
+        except Exception:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "TORCH_SPYRE_EARLY_INIT: background device start failed; "
+                "the first device operation will start it",
+                exc_info=True,
+            )
+
+    threading.Thread(target=_start, name="spyre-early-init", daemon=True).start()
+
+
 def _autoload_impl():
     import torch  # noqa: E402
 
@@ -414,3 +469,5 @@ def _autoload_impl():
 
     # Enable spyre code with symbolic args by default
     os.environ.setdefault("BUNDLE_SYMBOLIC_ARGS", "1")
+
+    _maybe_start_runtime_early()
