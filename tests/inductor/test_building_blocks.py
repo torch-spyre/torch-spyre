@@ -571,6 +571,14 @@ class TestBuildingBlocks(unittest.TestCase):
                 1,
             ],
             device_dtype=get_device_dtype(dtype),
+            valid_elements={
+                (0, 6): head_dim,
+                (1,): 1,
+                (2,): 1,
+                (3,): 1,
+                (4,): 1,
+                (5,): query_heads,
+            },
         )
 
         expected = sdpa(query, key, value, mask)
@@ -1052,15 +1060,19 @@ def test_gelu_pinned_layout_reorder():
     actual = torch.zeros_like(expected)
     layouts = [
         SpyreTensorLayout(
-            device_size=size,
-            stride_map=stride,
+            device_size=[2048, 36, 64],
+            stride_map=[2304, 64, 1],
             device_dtype=dtype,
+            valid_elements={(0,): 2048, (1, 2): 2304},
             element_arrangement=ElementArrangement.STANDARD,
-        )
-        for size, stride in [
-            ([2048, 36, 64], [2304, 64, 1]),
-            ([18, 2048, 64], [64, 1152, 1]),
-        ]
+        ),
+        SpyreTensorLayout(
+            device_size=[18, 2048, 64],
+            stride_map=[64, 1152, 1],
+            device_dtype=dtype,
+            valid_elements={(0, 2): 1152, (1,): 2048},
+            element_arrangement=ElementArrangement.STANDARD,
+        ),
     ]
     op = OpSpec(
         op="gelufwd",

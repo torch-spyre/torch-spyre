@@ -223,6 +223,7 @@ class InputTensorSpec(BaseModel):
             device_size=device_size,
             stride_map=stride_map,
             device_dtype=device_dtype,
+            valid_elements={(i,): device_size[i] for i in range(len(device_size))},
         )
         logger.debug("Layout created: %s", stl)
 

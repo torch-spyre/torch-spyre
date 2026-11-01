@@ -152,6 +152,7 @@ def _to_cache_position_first(tensor):
             1,
         ],
         device_dtype=get_device_dtype(tensor.dtype),
+        valid_elements={(0,): capacity, (1,): kvheads, (2, 4): head_dim, (3,): batch},
     )
     return tensor.to("spyre", device_layout=layout)
 

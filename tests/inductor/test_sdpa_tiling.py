@@ -1049,10 +1049,12 @@ class TestSDPAForEachTileIntegration(unittest.TestCase):
 
         query_device = query.to("spyre")
         # Position-first cache layout used by decode: [L, Hkv, D/64, B, D%64].
+        _cache_ds = [512, 4, 2, 1, 64]
         cache_layout = SpyreTensorLayout(
-            device_size=[512, 4, 2, 1, 64],
+            device_size=_cache_ds,
             stride_map=[128, 512 * 128, 64, 4 * 512 * 128, 1],
             device_dtype=get_device_dtype(dtype),
+            valid_elements={(0,): 512, (1,): 4, (2, 4): 128, (3,): 1},
         )
         caches = [
             torch.empty(
