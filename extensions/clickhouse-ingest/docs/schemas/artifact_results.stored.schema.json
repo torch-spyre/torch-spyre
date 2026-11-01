@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "One leg's verdict on one artifact; counters are derived, never stored.",
+  "properties": {
+    "arch": {},
+    "artifact_id": {},
+    "duration_s": {},
+    "props": {},
+    "result_kind": {
+      "enum": [
+        "capability",
+        "functional",
+        "performance"
+      ]
+    },
+    "run_id": {},
+    "state": {
+      "enum": [
+        "error",
+        "failed",
+        "passed",
+        "running"
+      ]
+    },
+    "test_type": {
+      "enum": [
+        "fvt",
+        "fvt-dynamic",
+        "fvt-static",
+        "integration",
+        "model_modules",
+        "model_ops",
+        "model_serving",
+        "model_support",
+        "perf",
+        "quality",
+        "regression",
+        "smoke",
+        "svt",
+        "svt-dynamic",
+        "svt-static",
+        "trunk",
+        "unit"
+      ]
+    }
+  },
+  "required": [
+    "artifact_id",
+    "run_id",
+    "result_kind",
+    "test_type",
+    "state",
+    "arch",
+    "duration_s",
+    "props"
+  ],
+  "title": "artifact_results: the stored row",
+  "type": "object",
+  "x-uploadable": true
+}
