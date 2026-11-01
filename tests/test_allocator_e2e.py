@@ -1236,7 +1236,7 @@ class TestAllocatorE2E(TestCase):
         the Tensor-only allocator stats.
 
         SpyreAllocator gates allocated_bytes and reserved_bytes updates on
-        MemoryType::Tensor.  prepare_kernel() issues one MemoryType::Program
+        MemoryType::Tensor.  prepare_kernel() issues one MemoryType::ProgramStatic
         allocation. executeAllocate() calls SpyreAllocator::allocate()
         (recordAlloc, N bytes), moves the CompositeAddress into job_allocation_,
         then drops the DataPtr (recordRelease, 0 bytes because the address was
@@ -1244,9 +1244,12 @@ class TestAllocatorE2E(TestCase):
         job_plan still owns the Program memory. Neither call may change the
         Tensor-only counters.
 
-        The only Python-reachable path that issues a MemoryType::Program
+        The only Python-reachable path that issues a MemoryType::ProgramStatic
         allocation is prepare_kernel(): its "Allocate" command calls
-        SpyreAllocator::allocate(size, AllocationDirective{MemoryType::Program}).
+        SpyreAllocator::allocate(static_size,
+        AllocationDirective{MemoryType::ProgramStatic}). Its dynamic_size is
+        only recorded on the JobPlan; the MemoryType::ProgramDynamic region is
+        allocated per launch, not here, so this test sets it to 0.
 
         Note: get_memory_info() free bytes cover the whole Flex Tensor region,
         including Flex-internal buffers that bypass SpyreAllocator. With
@@ -1268,11 +1271,15 @@ class TestAllocatorE2E(TestCase):
             os.makedirs(spyrecode_dir, exist_ok=True)
             spyrecode_json = {
                 "JobPreparationPlan": [
-                    # executeAllocate() calls SpyreAllocator::allocate(size,
-                    # MemoryType::Program) (recordAlloc), moves the
-                    # CompositeAddress into job_allocation_, then drops the
-                    # DataPtr (recordRelease, 0 bytes).
-                    {"command": "Allocate", "properties": {"size": "4096"}},
+                    # executeAllocate() calls SpyreAllocator::allocate(
+                    # static_size, MemoryType::ProgramStatic) (recordAlloc),
+                    # moves the CompositeAddress into job_allocation_, then
+                    # drops the DataPtr (recordRelease, 0 bytes). dynamic_size
+                    # is required but allocates nothing at prepare time.
+                    {
+                        "command": "Allocate",
+                        "properties": {"static_size": "4096", "dynamic_size": "0"},
+                    },
                     {
                         "command": "InitTransfer",
                         "properties": {
