@@ -537,7 +537,9 @@ jobs:
       - spyre_pf_x0
       - ${{ inputs.runner_label }}
       - ${{ inputs.image_label }}
-    timeout-minutes: 40
+    # EXPERIMENT ONLY (not part of the proposed change): 40 -> 75 so a cold-ccache wheel build
+    # (ccache restores from GitHub are timing out today) still reaches the test phase being timed.
+    timeout-minutes: 75
     outputs:
       wheel_name: ${{ steps.build.outputs.wheel_name }}
     steps:
