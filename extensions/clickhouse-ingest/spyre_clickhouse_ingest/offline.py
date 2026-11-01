@@ -57,7 +57,13 @@ FAILED, REJECTED, INCOMPLETE = 1, 2, 3
 STATUS = {FAILED: "failed", REJECTED: "rejected", INCOMPLETE: "incomplete"}
 MANUAL_PREFIX = "manual:"
 # kind -> the extension of its results/ files.
-KINDS = {"junit": ".xml", "vllm": ".json", "sendnn": ".txt", "benchmarks": ".json"}
+KINDS = {
+    "junit": ".xml",
+    "vllm": ".json",
+    "sendnn": ".txt",
+    "benchmarks": ".json",
+    "tables": ".json",
+}
 # kinds whose test_type is always perf
 PERF_KINDS = ("vllm", "sendnn")
 # A benchmarks bundle's tiers: perf numbers, or accuracy evals.
@@ -386,6 +392,47 @@ def check_benchmarks(root: Path, meta: dict, results: list) -> None:
         benchmark_entries(root / p)
 
 
+def check_tables(root: Path, meta: dict, results: list) -> None:
+    """Each results/<table>.json holds that table's rows; one bundle is one leg, so one test_type."""
+    from . import schema as _schema
+    from .tables import RowError, load_rows
+
+    test_type, loaded = meta["test_type"], {}
+    for p in results:
+        try:
+            table, rows = load_rows(root / p)
+        except RowError as err:
+            raise BundleError(str(err)) from None
+        if table in loaded:
+            raise BundleError(f"{table} appears twice")
+        loaded[table] = rows
+    capability = test_type in _schema.CAPABILITY_TYPE_VALUES
+    if "benchmark_runs" in loaded and test_type not in BENCHMARK_TEST_TYPES:
+        raise BundleError(
+            f"benchmark_runs is test_type {' or '.join(BENCHMARK_TEST_TYPES)}, not {test_type!r}"
+        )
+    if "capability_runs" in loaded and not capability:
+        raise BundleError(
+            f"capability_runs is a capability test_type, not {test_type!r}"
+        )
+    if "test_case_runs" in loaded and (capability or test_type in BENCHMARK_TEST_TYPES):
+        raise BundleError(
+            f"test_case_runs is a functional test_type, not {test_type!r}"
+        )
+    for row in loaded.get("capability_runs", []):
+        if row["test_type"] != test_type:
+            raise BundleError(
+                f"capability_runs row has test_type {row['test_type']!r}; the bundle is {test_type!r}"
+            )
+    verdicts = loaded.get("artifact_results", [])
+    if len(verdicts) > 1:
+        raise BundleError("artifact_results holds the leg's one verdict")
+    if verdicts and verdicts[0]["test_type"] != test_type:
+        raise BundleError(
+            f"artifact_results has test_type {verdicts[0]['test_type']!r}; the bundle is {test_type!r}"
+        )
+
+
 def check_sendnn(root: Path, meta: dict, results: list) -> None:
     """Each results/*.txt is a perf-suite report_sendnn.txt: sections with a sendnn column."""
     if meta["test_type"] != "perf":
@@ -490,6 +537,8 @@ def check(root: Path) -> dict:
         check_sendnn(root, meta, results)
     elif kind == "benchmarks":
         check_benchmarks(root, meta, results)
+    elif kind == "tables":
+        check_tables(root, meta, results)
     elif sum(count_cases(root / p) for p in results) == 0:
         raise BundleError(
             "no <testcase> in any results/*.xml: the bundle records nothing"
@@ -576,7 +625,13 @@ def write(args) -> Path:
     kind = "vllm" if (args.kind == "vllm" or args.vllm_results_dir) else args.kind
     if getattr(args, "benchmarks_dir", ""):
         kind = "benchmarks"
-    if kind == "benchmarks":
+    if getattr(args, "tables_dir", ""):
+        kind = "tables"
+    if kind == "tables":
+        if not args.tables_dir:
+            raise BundleError("--kind tables needs --tables-dir")
+        results, extra = sorted(Path(args.tables_dir).glob("*.json")), []
+    elif kind == "benchmarks":
         if not args.benchmarks_dir:
             raise BundleError("--kind benchmarks needs --benchmarks-dir")
         results, extra = sorted(Path(args.benchmarks_dir).glob("*.json")), []
@@ -853,6 +908,11 @@ def add_offline_options(parser) -> None:
         "--benchmarks-dir",
         default="",
         help='--kind benchmarks: *.json of {"benchmarks": [...]} rows (implies --kind benchmarks)',
+    )
+    g.add_argument(
+        "--tables-dir",
+        default="",
+        help='--kind tables: <table>.json files of {"rows": [...]} (implies --kind tables)',
     )
     g.add_argument("--perf", action="append", type=_pair, default=[],
                    help="vllm run context k=v: model, tensor_parallel, input_len, output_len, cards, "

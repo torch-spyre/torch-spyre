@@ -132,7 +132,9 @@ SELECT
 FROM benchmark_runs AS r
 INNER JOIN benchmarks AS b USING (benchmark_id)
 ARRAY JOIN arrayZip(mapKeys(r.measurements), mapValues(r.measurements)) AS m
-WHERE r.component = 'spyre-inference';
+-- Measured model-level rows only: predicted backends and experiment subjects share these tables.
+WHERE r.component = 'spyre-inference' AND r.backend = 'spyre' AND b.props['record_type'] = 'model'
+  AND NOT startsWith(r.props['source_file'], 'optbench-');
 
 -- ── upstream's dropdown table, its own definition ───────────────────────────────────────────
 -- Keeps oss_ci_benchmark_names/_branches fast, and is where the PREWHERE lands. Copied from
