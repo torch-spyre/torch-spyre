@@ -165,10 +165,12 @@ thread_local std::unordered_map<c10::DeviceIndex, c10::StreamId>
 // Per device:
 // - Stream 0: Default stream (always available, priority 0)
 // - Streams 1-32: Low priority streams (priority 0)
-// - Streams 33-64: High priority streams (priority -1)
+// - Streams 33-63: High priority streams (priority -1)
+// - Stream 64: Dedicated DMA stream (TORCH_SPYRE_THREE_STREAM prototype)
 // - Stream 65+: Host compute streams (priority -1)
 constexpr int kStreamsPerDevice = 32;
-constexpr int kHighPriorityStreamsPerDevice = 32;
+constexpr int kHighPriorityStreamsPerDevice = 31;  // 33-63 inclusive
+constexpr c10::StreamId kDmaStreamId = 64;
 constexpr int kHostComputeStreamStartPerDevice = 65;
 constexpr int kDefaultHostComputeStreams = 4;
 constexpr int kMaxHostComputeStreams = 8;
@@ -504,9 +506,13 @@ void SpyreStream::launch(const JobPlan& plan,
                 " must be on Spyre device, got ", args[i].device());
   }
 
-  // Two-stream overlap topology:
+  // Two-stream overlap topology (default):
   //   S_dev  = this stream (the default) — Compute (+ D2H).
-  //   S_prep = the persistent host-compute stream — HostCompute + separate H2D.
+  //   S_prep = the persistent host-compute stream — HostCompute + H2D.
+  // Three-stream topology (TORCH_SPYRE_THREE_STREAM=1):
+  //   S_dev  = this stream — Compute (+ D2H).
+  //   S_prep = host-compute stream (ID 65) — HostCompute only.
+  //   S_dma  = dedicated DMA stream (ID 64) — standalone H2D only.
   // Batched correction uploads instead travel with their compute on S_dev.
   // HostCompute runs inline on the caller; only uploads and compute are queued.
   // S_dev compute can overlap preparation for subsequent launches. Every op
@@ -531,6 +537,14 @@ void SpyreStream::launch(const JobPlan& plan,
   // This switch controls stream splitting only: eligible correction batching is
   // enabled in both topologies, including the single-stream path.
   const bool should_split = get_hazard_tracker_enabled();
+  // three_stream requires the hazard tracker (it inserts the S_dma → S_dev
+  // cross-stream edge automatically). Without it, fall back to two-stream.
+  const bool three_stream =
+      should_split && (std::getenv("TORCH_SPYRE_THREE_STREAM") != nullptr);
+  const SpyreStream s_dma =
+      three_stream ? SpyreStream(c10::Stream(c10::Stream::UNSAFE, device(),
+                                             kDmaStreamId))
+                   : s_prep;
   for (size_t i = 0; i < plan.steps.size(); ++i) {
     const auto& step = plan.steps[i];
     const auto kind = classifyStep(*step);
@@ -555,7 +569,9 @@ void SpyreStream::launch(const JobPlan& plan,
           classifyStep(*plan.steps[end]) == StepKind::Compute;
     }
     const SpyreStream& target =
-        (should_split && step->role() == StreamRole::Prep) ? s_prep : s_dev;
+        (three_stream && kind == StepKind::H2D)              ? s_dma
+        : (should_split && step->role() == StreamRole::Prep) ? s_prep
+                                                             : s_dev;
     step->construct(ctx, target);
   }
   TORCH_CHECK(ctx.program_corrections.empty(),
@@ -582,6 +598,13 @@ void initializeStreamPoolImpl(c10::DeviceIndex device_index) {
 
   // Register default stream (ID 0).
   pool.stream_handle_map[0] = runtime->getDefaultStream();
+
+  // Register dedicated DMA stream (ID 64) for TORCH_SPYRE_THREE_STREAM.
+  // Always created so the handle is ready if the flag is set at launch time.
+  pool.stream_handle_map[kDmaStreamId] =
+      runtime->createStream(flex::RuntimeStreamPriority::NORMAL,
+                            flex::RuntimeStreamMode::STRICT_ORDERING,
+                            /*track_hazards=*/get_hazard_tracker_enabled());
 
   // Register host compute streams (IDs 65+)
   int num_host_streams = getNumHostComputeStreams();
@@ -791,6 +814,11 @@ void synchronizeDevice(c10::optional<c10::Device> device) {
       collect(pool.low_priority_streams);
       collect(pool.high_priority_streams);
       collect(pool.host_compute_streams);
+      // Always sync the DMA stream (present once pool is initialized).
+      auto dma_it = pool.stream_handle_map.find(kDmaStreamId);
+      if (dma_it != pool.stream_handle_map.end()) {
+        handles_to_sync.push_back(dma_it->second);
+      }
     }  // lock released
 
     c10::DeviceGuard guard(dev);
