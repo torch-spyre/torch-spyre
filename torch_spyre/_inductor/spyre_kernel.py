@@ -866,9 +866,6 @@ class SpyreKernel(Kernel[CSEVariable]):
             and isinstance(V.graph.try_get_buffer(name), SpyreConstantFallback)
         )
         it_space = iteration_space(current_node)
-        # With dynamic=True the host index may contain symbolic strides
-        # (e.g. x0*s1+x1).  Concretize size symbols so normalize_coordinates
-        # can correctly isolate each loop variable's contribution.
 
         # insert_post_mutation_restickify may override the input layout for this input tensor.
         # Restore it here because the tensor data was uploaded as orig_stl.

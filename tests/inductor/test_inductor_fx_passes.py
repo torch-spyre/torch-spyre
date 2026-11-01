@@ -276,17 +276,22 @@ class TestPassUtils(unittest.TestCase):
         with patch("torch_spyre._inductor.pass_utils.V", mock_v):
             assert compute_max_size(s) == 576
 
-        # No usable upper bound (sympy.oo) -- fall back to optimization_hint.
-        mock_v = self._mock_v(upper=sympy.oo, optimization_hint=64)
+        # No usable upper bound (sympy.oo) -- refused, never the hint.
+        # ``optimization_hint`` is not wired, so falling back to it would
+        # raise AttributeError instead of Unsupported.
+        mock_v = self._mock_v(upper=sympy.oo)
         with patch("torch_spyre._inductor.pass_utils.V", mock_v):
-            assert compute_max_size(s) == 64
+            with self.assertRaises(Unsupported) as cm:
+                compute_max_size(s)
+        assert "no declared maximum" in str(cm.exception)
 
         # Edge case: the ``finite_upper_or_none`` predicate filters
         # non-positive bounds (``int(vr.upper) > 0``). Zero upper must
-        # fall through to optimization_hint just like sympy.oo does.
-        mock_v = self._mock_v(upper=sympy.Integer(0), optimization_hint=42)
+        # be refused just like sympy.oo is.
+        mock_v = self._mock_v(upper=sympy.Integer(0))
         with patch("torch_spyre._inductor.pass_utils.V", mock_v):
-            assert compute_max_size(s) == 42
+            with self.assertRaises(Unsupported):
+                compute_max_size(s)
 
     def test_compute_granularity_user_min_happy_path(self):
         expr = sympy.Symbol("s0", integer=True, positive=True)
@@ -324,8 +329,10 @@ class TestPassUtils(unittest.TestCase):
         assert granularity == 32
         assert any("defaulting granularity" in str(x.message) for x in w)
 
-    def test_compute_granularity_hint_fallback_emits_warning(self):
-        # No finite upper bound -> max came from optimization_hint; helper warns.
+    def test_compute_granularity_no_upper_bound_has_no_hint_warning(self):
+        # The granularity depends only on max_size and the user min; the
+        # optimization_hint warning for an unbounded max is gone with the
+        # compute_max_size fallback that produced such a max.
         expr = sympy.Symbol("s0", integer=True, positive=True)
         mock_v = self._mock_v(sympy.Integer(2), sympy.oo)
         with patch("torch_spyre._inductor.pass_utils.V", mock_v):
@@ -333,7 +340,7 @@ class TestPassUtils(unittest.TestCase):
                 warnings.simplefilter("always")
                 granularity = compute_granularity(expr, max_size=1024)
         assert granularity == 32
-        assert any("came from optimization_hint" in str(x.message) for x in w)
+        assert not any("came from optimization_hint" in str(x.message) for x in w)
 
     def test_compute_symbolic_bounds_concrete_int_returns_none(self):
         with patch("torch_spyre._inductor.pass_utils.V", self._mock_v()):
@@ -364,25 +371,15 @@ class TestPassUtils(unittest.TestCase):
             result = compute_symbolic_bounds(s0)
         assert result == (1024, 64)
 
-    def test_compute_symbolic_bounds_infinite_upper_falls_back_to_hint(self):
-        # dynamic=True without mark_dynamic(max=...) gives upper=oo.
-        # max_size must fall back to optimization_hint, not oo. lower=2 is
-        # ShapeEnv's default (no mark_dynamic(min=...) given), so
-        # granularity comes from compute_granularity's default-divisor
-        # branch: smallest divisor of 256 >= min_default_granularity(4)
-        # with 256/d <= max_buckets(32) is 8.
+    def test_compute_symbolic_bounds_infinite_upper_raises(self):
+        # A symbol without mark_dynamic(max=...) has upper=oo. Callers skip
+        # such symbols before calling, so reaching here is refused rather
+        # than sized from optimization_hint (which is deliberately not wired).
         s0 = sympy.Symbol("s0", integer=True, positive=True)
-        mock_v = self._mock_v(
-            lower=sympy.Integer(2), upper=sympy.oo, optimization_hint=256
-        )
+        mock_v = self._mock_v(lower=sympy.Integer(2), upper=sympy.oo)
         with patch("torch_spyre._inductor.pass_utils.V", mock_v):
-            with warnings.catch_warnings(record=True):
-                warnings.simplefilter("always")
-                result = compute_symbolic_bounds(s0)
-        assert result is not None
-        max_size, granularity = result
-        assert max_size == 256
-        assert granularity == 8
+            with self.assertRaises(Unsupported):
+                compute_symbolic_bounds(s0)
 
 
 class TestRepointMutationTargets(unittest.TestCase):

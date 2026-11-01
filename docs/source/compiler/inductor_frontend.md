@@ -331,4 +331,4 @@ The headline modules above are the ones a contributor reaches for first. The fro
 | [`constants.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/constants.py) | Shared constants: `DEVICE_NAME`, `BATCH_MATMUL_OP`, `TOPK_OPS`. |
 | [`logging_utils.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/logging_utils.py) | `get_inductor_logger` and Spyre Inductor logging setup. |
 
-`torch.compile(..., dynamic=True)` is supported through the static-binary path. Shapes are specialized at compile time and the resulting binary is reused across calls with the same input geometry.
+`torch.compile(..., dynamic=True)` is refused on Spyre with an `Unsupported` error. It makes every dimension of every input symbolic with no declared range, and Spyre resolves such a symbol to the size of the call being compiled, so it only ever produced a fixed-size binary per input shape. To enable dynamism, declare the varying dimension on the tensor and compile with the default `dynamic=None`, e.g. `x = x.to("spyre", dynamic={0: dict(min=32, max=576, granularity=32)})`.
