@@ -1833,6 +1833,7 @@ def main(argv=None):
         or args.vllm_results_dir
         or args.sendnn_report
         or args.benchmarks_dir
+        or args.tables_dir
     ):
         return _ingest_kind(argv, args)
     args.arch = args.arch or _platform.machine() or ""
