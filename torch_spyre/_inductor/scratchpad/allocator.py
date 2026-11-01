@@ -3762,6 +3762,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 # pricing the direct read in the actual allocation context.
                 # Other callers and unrecognized records keep the fixed pin.
                 reason = "deferred direct graph-input read"
+            elif isinstance(op, ComputedBuffer) and getattr(
+                op, "shard_pinned_splits", None
+            ):
+                reason = "shard plan"
             elif (
                 not config.ignore_work_division_hints
                 and isinstance(op, ComputedBuffer)

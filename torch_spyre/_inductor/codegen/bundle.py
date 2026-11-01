@@ -15,7 +15,7 @@
 import json
 import logging
 import os
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import sympy
@@ -54,6 +54,35 @@ sdsc_log = get_inductor_logger("sdsc")
 #                   carries the original symbol IDs while sdsc_json carries the
 #                   fresh ones used for operand resolution.
 _CompiledEntry = tuple[Any, list[int], list[list[dict]], list[SymbolKind], Any]
+
+
+def _dedup_syms(
+    symbol_kinds: Sequence[SymbolKind],
+    matches: Callable[[SymbolKind], bool],
+    key: Callable[[SymbolKind], object],
+) -> tuple[list[int], dict[int, int]]:
+    """First-seen canonicalization of symbol indices.
+
+    Multiple SDSCs operating on different slices of the same logical tensor
+    (or the same dimension symbol) emit duplicate symbols that must map to one
+    function parameter. Returns the sym_idx of the first symbol matching each
+    distinct ``key``, in first-seen order, and a map from duplicate sym_idx to
+    its canonical (first-seen) sym_idx.
+    """
+
+    indices: list[int] = []
+    dup_canonical: dict[int, int] = {}  # duplicate sym_idx -> canonical sym_idx
+    seen: dict[object, int] = {}  # key -> canonical sym_idx
+    for i, kind_i in enumerate(symbol_kinds):
+        if not matches(kind_i):
+            continue
+        sym_key = key(kind_i)
+        if sym_key not in seen:
+            seen[sym_key] = i
+            indices.append(i)
+        else:
+            dup_canonical[i] = seen[sym_key]
+    return indices, dup_canonical
 
 
 # ---------------------------------------------------------------------------
@@ -213,34 +242,37 @@ def generate_bundle(
     # but the same arg_index and must map to one %arg_{ai}_base_addr param.
     # kernel_arg_sym_indices: list of sym_idx values, one per unique arg_index.
     # kernel_dup_canonical: maps duplicate kernel sym_idx → canonical sym_idx.
-    kernel_arg_sym_indices: list[int] = []
-    kernel_dup_canonical: dict[int, int] = {}  # duplicate sym_idx → canonical sym_idx
-    seen_kernel_arg_index: dict[int, int] = {}  # arg_index → canonical sym_idx
-    for i, kind_i in enumerate(symbol_kinds):
-        if kind_i.kind == "kernel":
-            ai = kind_i.arg_index
-            if ai not in seen_kernel_arg_index:
-                seen_kernel_arg_index[ai] = i
-                kernel_arg_sym_indices.append(i)
-            else:
-                kernel_dup_canonical[i] = seen_kernel_arg_index[ai]
+    kernel_arg_sym_indices, kernel_dup_canonical = _dedup_syms(
+        symbol_kinds,
+        matches=lambda sk: sk.kind == "kernel",
+        key=lambda sk: sk.arg_index,
+    )
     # Sort by arg_index so the function signature matches the positional order
     # that call_kernel passes tensors to .run().
     kernel_arg_sym_indices.sort(key=lambda idx: symbol_kinds[idx].arg_index)
 
+    # Non-unified (sharded) tensors: one input_arg per (arg_index, core), each
+    # an independent start address. Deduplicated across SDSCs like kernel args.
+    shard_sym_indices, shard_dup_canonical = _dedup_syms(
+        symbol_kinds,
+        matches=lambda sk: sk.is_shard_kernel,
+        key=lambda sk: (sk.arg_index, sk.core_idx),
+    )
+    shard_sym_indices.sort(
+        key=lambda idx: (symbol_kinds[idx].arg_index, symbol_kinds[idx].core_idx)
+    )
+    shard_names: dict[int, str] = {
+        idx: f"%arg_{symbol_kinds[idx].arg_index}_shard_{symbol_kinds[idx].core_idx}"
+        for idx in shard_sym_indices
+    }
+
     # Deduplicate dimension symbols by pytorch_sym (same shape var may appear
     # in every SDSC with a different local ID).
-    dimension_sym_indices: list[int] = []
-    dimension_dup_canonical: dict[int, int] = {}  # dup sym_idx → canonical sym_idx
-    seen_dim_sym: dict[str, int] = {}  # pytorch_sym → canonical sym_idx
-    for i, kind_i in enumerate(symbol_kinds):
-        if kind_i.is_dimension:
-            dim_sym_key = kind_i.pytorch_sym
-            if dim_sym_key not in seen_dim_sym:
-                seen_dim_sym[dim_sym_key] = i
-                dimension_sym_indices.append(i)
-            else:
-                dimension_dup_canonical[i] = seen_dim_sym[dim_sym_key]
+    dimension_sym_indices, dimension_dup_canonical = _dedup_syms(
+        symbol_kinds,
+        matches=lambda sk: sk.is_dimension,
+        key=lambda sk: sk.pytorch_sym,
+    )
     # MLIR name for each canonical dimension symbol, e.g. "%sym_0_1".
     dim_param_names: dict[int, str] = {
         sym_idx: (
@@ -278,7 +310,12 @@ def generate_bundle(
         # Built in lock-step with the params list so the two can never diverge.
         # Order: pool (when frontend_pool_allocation), kernel addresses, dimensions.
         param_symbol_kinds: list[SymbolKind] = []
-        if emit_pool_param or kernel_arg_sym_indices or dimension_sym_indices:
+        if (
+            emit_pool_param
+            or kernel_arg_sym_indices
+            or shard_sym_indices
+            or dimension_sym_indices
+        ):
             params = []
             if emit_pool_param:
                 params.append("%pool_base_addr: !sdscbundle.input_arg<index>")
@@ -286,6 +323,11 @@ def generate_bundle(
             for sym_idx in kernel_arg_sym_indices:
                 ai = symbol_kinds[sym_idx].arg_index
                 params.append(f"%arg_{ai}_base_addr: !sdscbundle.input_arg<index>")
+                param_symbol_kinds.append(symbol_kinds[sym_idx])
+            for sym_idx in shard_sym_indices:
+                params.append(
+                    f"{shard_names[sym_idx]}_addr: !sdscbundle.input_arg<index>"
+                )
                 param_symbol_kinds.append(symbol_kinds[sym_idx])
             for sym_idx in dimension_sym_indices:
                 dim_sk = symbol_kinds[sym_idx]
@@ -318,6 +360,12 @@ def generate_bundle(
             f.write(
                 f"\t\t%arg_{ai} = sdscbundle.input_arg_extract value from"
                 f" %arg_{ai}_base_addr : !sdscbundle.input_arg<index> -> index\n"
+            )
+        for sym_idx in shard_sym_indices:
+            name = shard_names[sym_idx]
+            f.write(
+                f"\t\t{name} = sdscbundle.input_arg_extract value from"
+                f" {name}_addr : !sdscbundle.input_arg<index> -> index\n"
             )
         for sym_idx in dimension_sym_indices:
             dim_sk = symbol_kinds[sym_idx]
@@ -365,6 +413,11 @@ def generate_bundle(
             for dup_idx in kernel_dup_canonical
             if dup_idx in kernel_sym_to_arg_idx
         }
+        sym_canonical.update(shard_names)
+        sym_canonical.update(
+            (dup_idx, shard_names[canon_idx])
+            for dup_idx, canon_idx in shard_dup_canonical.items()
+        )
         # Dimension symbols resolve to their input_arg_extract result.
         sym_canonical.update(
             (sym_idx, dim_param_names[sym_idx]) for sym_idx in dimension_sym_indices
@@ -443,7 +496,7 @@ def generate_bundle(
                     )
                     pool_addi_emitted[value] = addi_ssa
                 sym_canonical[sym_idx] = pool_addi_emitted[value]
-            elif sk is not None and sk.is_dimension:
+            elif sk is not None and (sk.is_dimension or sk.is_shard_kernel):
                 continue  # replaced by function parameter; resolved via sym_canonical
             else:
                 f.write(f"\t\t%sym_{sym_idx + 1} = arith.constant {value} : index\n")

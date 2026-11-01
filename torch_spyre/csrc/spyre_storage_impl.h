@@ -33,6 +33,12 @@ class SpyreStorageImpl : public c10::StorageImpl {
  public:
   SpyreStorageImpl(use_byte_size_t, c10::SymInt size_bytes,
                    c10::DeviceAllocator* allocator, bool resizable);
+
+  // Adopt an already-allocated DataPtr (non-resizable). Used for sharded
+  // storage, whose allocation is made by a placement-specific allocator call
+  // rather than allocator->allocate(nbytes).
+  SpyreStorageImpl(use_byte_size_t, c10::SymInt size_bytes,
+                   c10::DataPtr data_ptr, c10::DeviceAllocator* allocator);
 };
 
 }  // namespace spyre

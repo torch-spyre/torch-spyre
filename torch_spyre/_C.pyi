@@ -18,10 +18,14 @@ __all__: list[str] = [
     "SymbolicArg",
     "SymbolicArgKind",
     "_SpyreStreamBase",
+    "_spyre_empty_sharded",
+    "_spyre_is_sharded",
+    "_spyre_sharding_info",
     "current_stream",
     "default_stream",
     "get_device_state",
     "get_stream_from_pool",
+    "num_memory_domains",
     "set_current_stream",
     "stream_get_error",
     "stream_get_error_string",
@@ -56,6 +60,16 @@ __all__: list[str] = [
 
 AIUPTI_ACTIVITY_NAME_MAX_BYTES: int
 
+def _spyre_empty_sharded(
+    size: collections.abc.Sequence[typing.SupportsInt],
+    dtype: torch.dtype,
+    shard_dim: typing.SupportsInt,
+    num_shards: typing.SupportsInt,
+    device: torch.device | None = None,
+) -> torch.Tensor: ...
+def _spyre_is_sharded(tensor: torch.Tensor) -> bool: ...
+def _spyre_sharding_info(tensor: torch.Tensor) -> dict[str, object]: ...
+def num_memory_domains() -> int: ...
 def extract_kernel_provenance_key(event_name: str) -> str | None: ...
 def kernel_provenance_registry_stats() -> dict[str, int]: ...
 def lookup_kernel_provenance(key: str) -> list[str] | None: ...
@@ -428,10 +442,13 @@ class SymbolicArgKind:
       kAddress
 
       kDimension
+
+      kShardAddress
     """
 
     kAddress: typing.ClassVar[SymbolicArgKind]
     kDimension: typing.ClassVar[SymbolicArgKind]
+    kShardAddress: typing.ClassVar[SymbolicArgKind]
     __members__: typing.ClassVar[dict[str, SymbolicArgKind]]
     def __eq__(self, other: typing.Any) -> bool: ...
     def __hash__(self) -> int: ...
@@ -448,12 +465,14 @@ class SymbolicArg:
     value: int
     tensor_id: int
     dim_index: int
+    num_shards: int
     def __init__(
         self,
         kind: SymbolicArgKind,
         tensor_id: int,
         dim_index: int = -1,
         value: int = -1,
+        num_shards: int = -1,
     ) -> None: ...
     def __repr__(self) -> str: ...
 

@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "spyre_composite_address.h"
+#include "spyre_mem.h"
 #include "spyre_stream.h"
 
 namespace spyre {
@@ -147,6 +148,12 @@ std::vector<flex::HostComputeArg> JobPlanStepHostCompute::resolveSymbolicArgs(
     switch (arg.kind) {
       case SymbolicArgKind::kAddress:
         resolved[i] = get_composite_address(tensors[arg.tensor_id]);
+        break;
+      case SymbolicArgKind::kShardAddress:
+        // dim_index = core (= shard), value = expected per-shard bytes,
+        // num_shards = expected shard count; all checked against the tensor.
+        resolved[i] = static_cast<int64_t>(shard_device_address(
+            tensors[arg.tensor_id], arg.dim_index, arg.num_shards, arg.value));
         break;
       case SymbolicArgKind::kDimension:
         TORCH_CHECK(false,

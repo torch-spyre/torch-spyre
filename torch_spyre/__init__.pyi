@@ -12,7 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import TYPE_CHECKING
+
 import torch
+
+if TYPE_CHECKING:
+    from torch.distributed.tensor import Shard
+
+from torch_spyre._sharded_api import ShardedTensorInfo
 
 def _is_in_bad_fork() -> bool: ...
 def manual_seed_all(seed: int) -> None: ...
@@ -26,3 +33,12 @@ def set_rng_state(
     new_state: torch.Tensor, device: int | str | torch.device = "spyre"
 ) -> None: ...
 def initial_seed(device: int | str | torch.device = "spyre") -> int: ...
+def distribute_tensor(
+    tensor: torch.Tensor | torch.nn.Parameter,
+    placement: Shard | list[Shard] | tuple[Shard],
+    *,
+    num_shards: int | None = None,
+) -> torch.Tensor: ...
+def full_tensor(tensor: torch.Tensor) -> torch.Tensor: ...
+def is_sharded(tensor: object) -> bool: ...
+def sharding_info(tensor: torch.Tensor) -> ShardedTensorInfo: ...

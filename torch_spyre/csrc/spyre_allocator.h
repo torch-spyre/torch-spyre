@@ -22,14 +22,40 @@
 #include <flex/flex.hpp>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <utility>
+#include <vector>
 
 namespace spyre {
 
+// Defined in spyre_mem.cpp: a single-shard view whose DataPtr context is the
+// SharedOwnerCtx below. Forward-declared so the ctx can point back at it.
+struct ShardViewCtx;
+
+// Sharding of a tensor's storage: shard i lives in the chunk whose
+// segment-emulated placement has logical_chunk_id == i, encoded in that
+// shard's own device layout (shard_device_bytes). Address-free.
+struct ShardedStorageInfo {
+  int64_t shard_dim;
+  uint32_t num_shards;
+  uint64_t shard_device_bytes;
+};
+
 struct SharedOwnerCtx {
+  // Non-sharded storage: the owning allocation. Sharded storage: a non-owning
+  // whole-storage view over the shards' chunks (hand-built, so its destructor
+  // never frees); the owning per-shard allocations live in shard_addrs.
   flex::CompositeAddress composite_addr;
+  // Sharded storage only: one owning plain allocation per shard, indexed by
+  // shard ordinal (shard i backs core i). Empty for non-sharded storage.
+  std::vector<flex::CompositeAddress> shard_addrs;
   signed char device_id;
   flex::MemoryType memory_type;
+  // Set only for sharded storage.
+  std::optional<ShardedStorageInfo> sharding;
+  // Set only on the SharedOwnerCtx embedded in a ShardViewCtx: points back
+  // at the enclosing view so the view's DataPtr deleter can free it.
+  ShardViewCtx* shard_view = nullptr;
 
   SharedOwnerCtx(flex::CompositeAddress addr, signed char dev_id,
                  flex::MemoryType mem_type)
@@ -82,6 +108,13 @@ struct SpyreAllocator final : public c10::DeviceAllocator {
 
   c10::DataPtr allocate(size_t nbytes,
                         const flex::AllocationDirective& directive);
+
+  // Allocate sharded storage: logical_chunks segment-emulated chunks, each at
+  // least shard_device_bytes, tagged with the sharding record. The returned
+  // DataPtr owns the allocation through a SharedOwnerCtx.
+  static c10::DataPtr allocateShardedStorage(int64_t shard_dim,
+                                             uint32_t logical_chunks,
+                                             uint64_t shard_device_bytes);
 
   static void ReportAndDelete(void* ctx_void);
 
