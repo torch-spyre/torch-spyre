@@ -180,7 +180,7 @@ reference.
 This is gated on the [uniqueness condition](#the-scatter-only-correctness-condition-index-uniqueness):
 `indirect_store_entry_syms` returns dims only for overwrite scatters.
 
-### 3. Stick-align the index-entry split (partial last stick)
+### 3. Keep a partial-last-stick entry dim on one core
 
 Enabling the index-entry split (fixes #1–2) exposes a second hazard when the
 entry count is **not a whole multiple of the index stick** (32 int32 entries per
@@ -200,26 +200,23 @@ it. The physical allocation grows, so the per-core base becomes stick-aligned �
 matching the index tensor, whose device layout is already stick-padded — and the
 D2H copy extracts the logical rows from the larger allocation (its
 `physical_exceeds_logical` path). To keep the per-core base stride consistent,
-`superdsc` grows the SDSC iteration to the padded size **before**
-`_create_sdsc_tensors` computes strides; otherwise the base lands element-aligned
-(mid-stick) and the split still miscompiles.
+`superdsc` grows the SDSC iteration of a split entry dim to the padded size
+**before** `_create_sdsc_tensors` computes strides; otherwise the base lands
+element-aligned (mid-stick) and the split still miscompiles. An unsplit entry
+dim keeps its logical count, and the padded output rows become a back gap.
+
+A stick-aligned split still leaves a hazard: the last core iterates the whole
+last index stick, padding lanes included, and uses whatever those lanes hold as
+table rows. A padding lane holds whatever the index's producer left there (a
+device `arange` ramp continues past the logical end, for example), and an
+invalid row faults the card.
 
 `indirect_forbidden_split_syms`
 ([pass_utils.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/pass_utils.py))
-enforces the invariant, **forbid unless provably padded**, as a single predicate:
-it forbids a partial-last-stick entry dim — reading the index's *unpadded*
-logical count (`d.ranges`), which the output padding never changes — **unless**
-`is_output_stick_aligned_for_entry(op)` confirms the output extent is already a
-whole multiple of the index `eps` (either naturally, or because the padding pass
-grew it).
-
-So a padded gather splits stick-aligned, while anything unpadded falls back to a
-single core rather than miscompiling. A **scatter cannot be padded**: its
-destination is written in place (a mutation layout) and its entry row is
-data-dependent (an `IndirectAccess` coord), so `_find_entry_output_dim` finds no
-paddable entry, `is_output_stick_aligned_for_entry` returns `False`, the
-forbiddance is never lifted, and a partial-stick scatter stays on a single core —
-correct-but-serial rather than miscompiling.
+therefore forbids a partial-last-stick entry dim outright, reading the index's
+*unpadded* logical count (`d.ranges`), which the output padding never changes.
+The output padding no longer enables a split. A partial-stick gather or scatter
+stays on a single core: correct-but-serial rather than faulting.
 
 Stick-aligned counts (a multiple of 32) are unaffected: no padding, the
 forbiddance never fires, and they split exactly as before.
@@ -272,8 +269,8 @@ stickifies `d0` to `ceil(5 / 32) = 1` stick.
 
 In both cases parallelism is set by the index size in sticks: for a 1-D index,
 planner selects largest legal divisor of `ceil(Q / 32)` within `SENCORES`
-(`Q = 256 → 8` sticks → 8 cores; a partial `Q = 40` gather pads to 2 sticks →
-2 cores; `SENCORES = 6` rounds 8 sticks down to 4). A spatial non-stick index
+(`Q = 256 → 8` sticks → 8 cores; a partial `Q = 40` stays on 1 core;
+`SENCORES = 6` rounds 8 sticks down to 4). A spatial non-stick index
 dimension splits directly. A small index (the scatter `Q = 5` here) runs
 correct-but-serial.
 
@@ -290,6 +287,12 @@ correct-but-serial.
   need atomic accumulate to stay correct under duplicate indices. Enabling them
   requires backend atomic-add support.
 
+* **A partial-last-stick index runs on one core.** An entry count that is not a
+  multiple of 32 keeps its entry dim unsplit (see
+  [section 3](#3-keep-a-partial-last-stick-entry-dim-on-one-core)). Splitting it
+  would need the last core to iterate a shorter slice than the others, which the
+  per-core iteration cannot express.
+
 * **Multi-index scatter is not divided.** When the destination index is built
   from more than one index tensor, `_build_indirect_store_subs` cannot
   unambiguously map each indirect symbol to its source buffer, so it returns no
@@ -303,7 +306,7 @@ correct-but-serial.
 | `_inductor/work_division_constraints.py` | `indirect_access_split_domains` maps hard indirect restrictions to `allowed_splits={symbol: {1}}` |
 | `_inductor/work_division.py` | consumes generic legal split domains; `prioritize_indirect_scatter_dimensions` promotes overwrite-scatter entry dims; split encoding and recovery use direct-read reference |
 | `_inductor/enforce_indirect_access_layout.py` | `_pad_output_for_stick_aligned_split` — applies the grown output layout from `pass_utils.padded_entry_output_stl` to a partial-stick gather output (fix #5) |
-| `_inductor/codegen/superdsc.py` | grow the SDSC index-entry iteration to the padded output size before `_create_sdsc_tensors` so the per-core base is stick-aligned (fix #5) |
+| `_inductor/codegen/superdsc.py` | grow a core-split index-entry iteration to the padded output size before `_create_sdsc_tensors` so the per-core base is stick-aligned; an unsplit entry dim keeps its logical count (fix #5) |
 | `_inductor/spyre_kernel.py` | non-indirect read index in `create_op_spec` |
 
 ## See also
