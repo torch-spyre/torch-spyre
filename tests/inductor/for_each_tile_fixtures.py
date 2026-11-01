@@ -1043,6 +1043,28 @@ def abs_tiled_reference(A: torch.Tensor) -> torch.Tensor:
     return A.abs()
 
 
+def upcast_add_tiled_fn(
+    A: torch.Tensor, tile_size: int, downcast_in_body: bool
+) -> torch.Tensor:
+    """Map mode: fp16 -> fp32 conversion inside the body, then ``+ 1``.
+
+    The result returns to fp16 inside the body or, with ``downcast_in_body``
+    false, after the loop, so the loop also writes an fp32 output.
+    """
+
+    def body(_, ops):
+        (a_tile,) = ops
+        out = a_tile.float() + 1.0
+        return None, out.half() if downcast_in_body else out
+
+    _, out = for_each_tile(body, (A,), dims=(0,), tile_size=tile_size, out_dim=0)
+    return out.half()
+
+
+def upcast_add_tiled_reference(A: torch.Tensor) -> torch.Tensor:
+    return (A.float() + 1.0).half()
+
+
 def abs_add_mul_tiled_fn(
     A: torch.Tensor, B: torch.Tensor, C: torch.Tensor, tile_size: int
 ) -> torch.Tensor:

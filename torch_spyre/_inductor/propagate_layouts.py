@@ -774,6 +774,31 @@ def _default_pointwise_layout(
     )
 
 
+def _origin_target(data: Pointwise | Reduction):
+    """The target of the first origin of ``data``, skipping enclosing loops.
+
+    A buffer lowered inside a ``while_loop`` body (``for_each_tile``) inherits
+    the origins of the enclosing lowering context, which come first: the loop
+    HOP, its subgraph ``get_attr`` nodes and other nodes of the graph holding
+    the loop. Origins in a graph that holds a loop HOP are therefore skipped,
+    leaving the body's own nodes; a buffer with no origin elsewhere keeps its
+    first one. (``origin_node`` is no substitute: some lowerings set it to
+    their input's node.)
+    """
+    if not data.origins:
+        return None
+    loop_graphs = {
+        n.graph
+        for n in data.origins
+        if isinstance(n.target, torch._ops.HigherOrderOperator)
+    }
+    node = next(
+        (n for n in data.origins if n.graph not in loop_graphs),
+        next(iter(data.origins)),
+    )
+    return node.target
+
+
 def _single_arg_op_layout(
     op: Operation,
     output: FixedLayout,
@@ -795,7 +820,7 @@ def _single_arg_op_layout(
 
     # Single-arg pointwise
     assert isinstance(data, Pointwise)
-    aten_op = next(iter(data.origins)).target if data.origins else None
+    aten_op = _origin_target(data)
     match aten_op:
         case (
             prims.convert_element_type.default
@@ -2319,7 +2344,7 @@ def compute_layouts(
     if is_keep_by_index(op):
         return _keep_by_index_layouts(op, output, output_dep, args)
 
-    aten_op = next(iter(data.origins)).target if data.origins else None
+    aten_op = _origin_target(data)
 
     if aten_op == spyreop.layernormnorm.default:
         # layernormnorm is pointwise but special: it has multiple args, input and
