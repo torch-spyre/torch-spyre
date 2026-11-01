@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "One stopping-rule evaluation, interim or final.",
+  "properties": {
+    "arm": {
+      "minLength": 1
+    },
+    "baseline_arm": {
+      "minLength": 1
+    },
+    "ci_hi_pct": {},
+    "ci_lo_pct": {},
+    "decision": {
+      "enum": [
+        "continue",
+        "effect",
+        "max_n",
+        "null",
+        "stopped"
+      ]
+    },
+    "decision_id": {
+      "minLength": 1
+    },
+    "e_value": {},
+    "effect_pct": {},
+    "experiment_id": {
+      "minLength": 1
+    },
+    "final": {},
+    "floor_pct": {},
+    "metric": {
+      "minLength": 1
+    },
+    "n": {},
+    "p_value": {},
+    "props": {},
+    "sd_log": {},
+    "stop_reason": {},
+    "test": {},
+    "ts": {
+      "minLength": 1
+    }
+  },
+  "required": [
+    "ts",
+    "decision_id",
+    "experiment_id",
+    "arm",
+    "baseline_arm",
+    "metric",
+    "final",
+    "n",
+    "test",
+    "effect_pct",
+    "ci_lo_pct",
+    "ci_hi_pct",
+    "sd_log",
+    "e_value",
+    "p_value",
+    "floor_pct",
+    "decision",
+    "stop_reason",
+    "props"
+  ],
+  "title": "experiment_decisions: the stored row",
+  "type": "object",
+  "x-uploadable": false
+}

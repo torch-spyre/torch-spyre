@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "One version of an arm: its role, full knob vector and change/hazard class.",
+  "properties": {
+    "actor": {
+      "minLength": 1
+    },
+    "actor_kind": {
+      "enum": [
+        "agent",
+        "anonymous",
+        "human",
+        "service"
+      ]
+    },
+    "arm": {
+      "minLength": 1
+    },
+    "artifact_id": {},
+    "change_class": {
+      "enum": [
+        "",
+        "analysis",
+        "codegen_param",
+        "model_param",
+        "runtime_knob",
+        "serving_config",
+        "source_patch"
+      ]
+    },
+    "event_id": {
+      "minLength": 1
+    },
+    "experiment_id": {
+      "minLength": 1
+    },
+    "hazard_class": {
+      "enum": [
+        "",
+        "may_fail_compile",
+        "may_hang",
+        "safe"
+      ]
+    },
+    "hypothesis": {},
+    "id12": {},
+    "knob_sha": {
+      "minLength": 1
+    },
+    "knobs": {},
+    "props": {},
+    "role": {
+      "enum": [
+        "baseline",
+        "candidate"
+      ]
+    },
+    "state": {
+      "enum": [
+        "active",
+        "dropped",
+        "rejected"
+      ]
+    },
+    "ts": {
+      "minLength": 1
+    }
+  },
+  "required": [
+    "ts",
+    "event_id",
+    "experiment_id",
+    "arm",
+    "role",
+    "state",
+    "hypothesis",
+    "knobs",
+    "knob_sha",
+    "change_class",
+    "hazard_class",
+    "artifact_id",
+    "id12",
+    "actor",
+    "actor_kind",
+    "props"
+  ],
+  "title": "experiment_arms: the stored row",
+  "type": "object",
+  "x-uploadable": false
+}

@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "The host, card and software one measurement ran on, once per distinct report.",
+  "properties": {
+    "arch": {},
+    "artifact_id": {},
+    "card_class": {
+      "enum": [
+        "",
+        "PF",
+        "VF"
+      ]
+    },
+    "cards": {},
+    "cpu_model": {},
+    "cpu_quota": {},
+    "env": {},
+    "env_id": {
+      "minLength": 1
+    },
+    "env_sha": {
+      "minLength": 1
+    },
+    "git_shas": {},
+    "host": {},
+    "host_kernel": {},
+    "image": {},
+    "image_digest": {},
+    "load1": {},
+    "ncpu": {},
+    "node": {},
+    "packages": {},
+    "profiler_build": {},
+    "props": {},
+    "raw": {},
+    "ts": {}
+  },
+  "required": [
+    "ts",
+    "env_id",
+    "env_sha",
+    "host",
+    "node",
+    "arch",
+    "cpu_model",
+    "ncpu",
+    "cpu_quota",
+    "host_kernel",
+    "card_class",
+    "cards",
+    "image",
+    "image_digest",
+    "artifact_id",
+    "git_shas",
+    "packages",
+    "env",
+    "profiler_build",
+    "load1",
+    "raw",
+    "props"
+  ],
+  "title": "run_env_reports: the stored row",
+  "type": "object",
+  "x-uploadable": false
+}

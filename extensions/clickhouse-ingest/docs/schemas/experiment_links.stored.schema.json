@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "An experiment's (or finding's) edge to a run, artifact, benchmark, trace, file or PR.",
+  "properties": {
+    "experiment_id": {
+      "minLength": 1
+    },
+    "finding_id": {},
+    "link_id": {
+      "minLength": 1
+    },
+    "link_kind": {
+      "enum": [
+        "artifact",
+        "benchmark",
+        "ci_request",
+        "commit",
+        "experiment",
+        "file",
+        "issue",
+        "pr",
+        "run",
+        "trace"
+      ]
+    },
+    "props": {},
+    "role": {
+      "enum": [
+        "baseline",
+        "candidate",
+        "evidence",
+        "output",
+        "source",
+        "supersedes"
+      ]
+    },
+    "target": {},
+    "target_id": {},
+    "ts": {}
+  },
+  "required": [
+    "ts",
+    "link_id",
+    "experiment_id",
+    "finding_id",
+    "link_kind",
+    "role",
+    "target_id",
+    "target",
+    "props"
+  ],
+  "title": "experiment_links: the stored row",
+  "type": "object",
+  "x-uploadable": false
+}

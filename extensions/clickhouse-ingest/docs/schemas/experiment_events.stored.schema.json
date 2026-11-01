@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "One lifecycle event of an experiment or campaign.",
+  "properties": {
+    "actor": {
+      "minLength": 1
+    },
+    "actor_kind": {
+      "enum": [
+        "agent",
+        "anonymous",
+        "human",
+        "service"
+      ]
+    },
+    "budget": {},
+    "code_ref": {},
+    "event_id": {
+      "minLength": 1
+    },
+    "experiment_id": {
+      "minLength": 1
+    },
+    "hypothesis": {},
+    "kind": {
+      "enum": [
+        "ab",
+        "feasibility",
+        "fit",
+        "noise",
+        "other",
+        "parity",
+        "regression",
+        "sweep"
+      ]
+    },
+    "name": {
+      "minLength": 1
+    },
+    "on_behalf_of": {},
+    "parent_id": {},
+    "props": {},
+    "reason": {},
+    "spec": {},
+    "spec_sha256": {},
+    "spent": {},
+    "state": {
+      "enum": [
+        "abandoned",
+        "approved",
+        "done",
+        "failed",
+        "paused",
+        "proposed",
+        "running",
+        "stopped"
+      ]
+    },
+    "subject_key": {},
+    "subject_level": {},
+    "ts": {
+      "minLength": 1
+    },
+    "workload": {}
+  },
+  "required": [
+    "ts",
+    "event_id",
+    "experiment_id",
+    "parent_id",
+    "name",
+    "kind",
+    "state",
+    "subject_level",
+    "subject_key",
+    "workload",
+    "hypothesis",
+    "spec",
+    "spec_sha256",
+    "budget",
+    "spent",
+    "code_ref",
+    "reason",
+    "actor",
+    "actor_kind",
+    "on_behalf_of",
+    "props"
+  ],
+  "title": "experiment_events: the stored row",
+  "type": "object",
+  "x-uploadable": false
+}

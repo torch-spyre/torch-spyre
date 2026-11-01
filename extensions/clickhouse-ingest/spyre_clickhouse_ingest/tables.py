@@ -40,6 +40,8 @@ REFERENCE_ONLY = (
     "artifacts", "artifact_refs", "artifact_tags", "artifact_result_reasons", "pipeline_runs",
     "ci_run_timings", "artifact_subscriptions", "dispatch_requests", "artifact_dispatches",
     "dispatch_targets", "pipeline_run_links", "rbac_roles", "rbac_bindings",
+    "experiment_events", "experiment_arms", "experiment_samples", "experiment_decisions",
+    "experiment_findings", "experiment_links", "run_env_reports",
 )  # fmt: skip
 FILE_SUFFIX = ".json"
 # What a bundle's tests may call themselves; the DDL admits more for verdicts than a run uploads.

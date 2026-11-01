@@ -225,6 +225,7 @@ generated schema for reference only.
 | `pipeline_runs`, `pipeline_run_links`, `ci_run_timings` | CI bookkeeping | Jenkins and GitHub Actions |
 | `artifact_subscriptions`, `dispatch_*`, `artifact_dispatches` | Subscriptions and dispatch | The dashboard's subscription editor |
 | `rbac_roles`, `rbac_bindings` | Access control | The dashboard's access admin |
+| `experiment_*`, `run_env_reports` | Experiment ledger and run environment | The autoresearch driver and the dashboard's experiment section |
 | `test_cases`, `benchmarks`, `capabilities` | Identity tables | Filled by the writers from the rows above |
 
 ## Schemas

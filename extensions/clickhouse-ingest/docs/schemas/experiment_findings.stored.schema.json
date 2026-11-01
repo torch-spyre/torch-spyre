@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "One version of a finding; gain_evidence is set by code, never by hand.",
+  "properties": {
+    "actor": {
+      "minLength": 1
+    },
+    "actor_kind": {
+      "enum": [
+        "agent",
+        "anonymous",
+        "human",
+        "service"
+      ]
+    },
+    "arm": {},
+    "baseline_arm": {},
+    "ci_hi": {},
+    "ci_lo": {},
+    "demoted_by": {},
+    "estimate": {},
+    "event_id": {
+      "minLength": 1
+    },
+    "experiment_id": {
+      "minLength": 1
+    },
+    "finding_id": {
+      "minLength": 1
+    },
+    "floor_pct": {},
+    "gain_evidence": {
+      "enum": [
+        "",
+        "G0",
+        "G1",
+        "G2",
+        "G3",
+        "G4"
+      ]
+    },
+    "gates": {},
+    "kind": {
+      "enum": [
+        "calibration",
+        "effect",
+        "feasibility",
+        "method",
+        "noise_floor",
+        "parity_gap",
+        "regression"
+      ]
+    },
+    "metric": {
+      "minLength": 1
+    },
+    "n": {},
+    "policy_version": {},
+    "props": {},
+    "state": {
+      "enum": [
+        "draft",
+        "published",
+        "retracted"
+      ]
+    },
+    "stratum": {},
+    "subject_key": {},
+    "subject_level": {},
+    "summary": {},
+    "ts": {
+      "minLength": 1
+    },
+    "unit": {},
+    "verdict": {
+      "enum": [
+        "",
+        "better",
+        "equal",
+        "inconclusive",
+        "infeasible",
+        "void",
+        "worse"
+      ]
+    },
+    "workload": {}
+  },
+  "required": [
+    "ts",
+    "event_id",
+    "finding_id",
+    "experiment_id",
+    "kind",
+    "arm",
+    "baseline_arm",
+    "subject_level",
+    "subject_key",
+    "workload",
+    "stratum",
+    "metric",
+    "unit",
+    "estimate",
+    "ci_lo",
+    "ci_hi",
+    "n",
+    "floor_pct",
+    "verdict",
+    "gain_evidence",
+    "demoted_by",
+    "gates",
+    "policy_version",
+    "state",
+    "summary",
+    "actor",
+    "actor_kind",
+    "props"
+  ],
+  "title": "experiment_findings: the stored row",
+  "type": "object",
+  "x-uploadable": false
+}

@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "One raw value of one metric from one run of an arm.",
+  "properties": {
+    "arm": {
+      "minLength": 1
+    },
+    "artifact_id": {},
+    "benchmark_id": {},
+    "env_id": {},
+    "experiment_id": {
+      "minLength": 1
+    },
+    "fidelity": {
+      "enum": [
+        "analytic",
+        "cost_model",
+        "emulator",
+        "hardware"
+      ]
+    },
+    "id12": {},
+    "kind": {
+      "enum": [
+        "measured",
+        "predicted"
+      ]
+    },
+    "load1_after": {},
+    "load1_before": {},
+    "metric": {},
+    "node": {},
+    "position": {},
+    "props": {},
+    "run_id": {},
+    "sample_id": {
+      "minLength": 1
+    },
+    "split": {
+      "enum": [
+        "confirm",
+        "hidden",
+        "search"
+      ]
+    },
+    "status": {
+      "enum": [
+        "fail",
+        "hang",
+        "no_metric",
+        "ok",
+        "void"
+      ]
+    },
+    "stratum": {},
+    "trial": {},
+    "ts": {
+      "minLength": 1
+    },
+    "unit": {},
+    "value": {},
+    "wall_s": {},
+    "warmup": {},
+    "workload": {}
+  },
+  "required": [
+    "ts",
+    "sample_id",
+    "experiment_id",
+    "arm",
+    "trial",
+    "position",
+    "warmup",
+    "split",
+    "status",
+    "workload",
+    "stratum",
+    "metric",
+    "value",
+    "unit",
+    "kind",
+    "fidelity",
+    "wall_s",
+    "load1_before",
+    "load1_after",
+    "node",
+    "env_id",
+    "artifact_id",
+    "id12",
+    "run_id",
+    "benchmark_id",
+    "props"
+  ],
+  "title": "experiment_samples: the stored row",
+  "type": "object",
+  "x-uploadable": false
+}
