@@ -5761,6 +5761,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d128_01": (2, 32, 160, cached_randn((128, 192, 256))),
             },
         },
+        (
+            "test_slice_stick_column_transpose_clone",
+            "test_slice_stick_column_transpose_clone_cpu",
+        ): {
+            "param_sets": {
+                "col0": ((256, 128), 0),
+                "col64": ((256, 128), 64),
+                "col128": ((256, 256), 128),
+                "col192": ((256, 256), 192),
+            },
+        },
         ("test_slice_stick_reduce_dim0", "test_slice_cpu"): {
             "ops_dict": {
                 "sum": lambda _, x: torch.sum(x, dim=0, keepdim=True),
@@ -12148,6 +12159,20 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 return op(dim, x[:, :, start:end], *args)
 
         self.compare_with_cpu(fn, x, *args, clone_inputs=True, run_eager=False)
+
+    def test_slice_stick_column_transpose_clone_cpu(self, shape, column):
+        # A one-column slice has a constant stick coordinate, so its transposed
+        # clone restickifies an elided size-1 stick. Columns past the first stick
+        # also carry a stick-tile offset. Distinct integers up to 256 are exact in
+        # fp16, so reading the wrong column cannot pass.
+        x = (torch.arange(math.prod(shape)) % 257).reshape(shape).to(torch.float16)
+
+        def fn(x):
+            return x[..., column : column + 1].transpose(0, -1).clone()
+
+        torch._dynamo.reset()
+        got = torch.compile(fn, dynamic=False)(x.to("spyre")).cpu()
+        assert torch.equal(got, fn(x))
 
     def test_slice_stick_mutation_layout_update_cpu(self, dim, start, end, x, y):
         """Test that device_tensor_layout() updates to alt STL after slice-mutation."""
