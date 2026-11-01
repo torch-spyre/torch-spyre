@@ -488,6 +488,27 @@ PYBIND11_MODULE(_C, m) {
         py::arg("dst"), py::arg("non_blocking") = false,
         py::call_guard<py::gil_scoped_release>());
 
+  // Single KV page copy
+  m.def("copy_kv_page_raw", &spyre::copy_kv_page_raw,
+        "Copy one KV cache page between a shared pool slot and the device.\n\n"
+        "The copy is byte-exact (no dtype or layout conversion) and blocks "
+        "until the DMA finishes.\n\n"
+        "Args:\n"
+        "    cache: The full KV cache on Spyre, slot-major, rank 4 and "
+        "row-major, as slot_major_kv_layout allocates it. Pass the whole "
+        "cache, not a page view.\n"
+        "    block_id: Index of the page to copy.\n"
+        "    pool: Attached SharedPool that holds the slot. Don't detach it "
+        "from another thread while the copy runs.\n"
+        "    slot_id: Slot to copy to or from. The caller decides which "
+        "process uses which slot; nothing here stops two processes from "
+        "writing the same slot.\n"
+        "    to_device: True copies the slot into the page (H2D), False "
+        "copies the page into the slot (D2H).",
+        py::arg("cache"), py::arg("block_id"), py::arg("pool"),
+        py::arg("slot_id"), py::arg("to_device"),
+        py::call_guard<py::gil_scoped_release>());
+
   // Device-side fill using FillDMA (no host buffer or H2D copy)
   m.def("fill_tensor", &spyre::spyre_fill_tensor,
         "Fill a spyre tensor with a scalar value using device-side FillDMA",

@@ -33,6 +33,7 @@ __all__: list[str] = [
     "get_composite_address",
     "empty_with_layout",
     "copy_tensor",
+    "copy_kv_page_raw",
     "fill_tensor",
     "encode_constant",
     "extract_kernel_provenance_key",
@@ -383,6 +384,29 @@ def copy_tensor(
 
     Args:
         self or dst: one of that must be on spyre device
+    """
+    ...
+
+def copy_kv_page_raw(
+    cache: torch.Tensor,
+    block_id: int,
+    pool: SharedPool,
+    slot_id: int,
+    to_device: bool,
+) -> None:
+    """
+    Copy one KV cache page between a shared pool slot and the device.
+
+    The copy is byte-exact (no dtype or layout conversion) and blocks until
+    the DMA finishes.
+
+    Args:
+        cache: the full KV cache on Spyre, slot-major, rank 4 and row-major
+        block_id: index of the page to copy
+        pool: attached SharedPool that holds the slot
+        slot_id: slot to copy to or from
+        to_device: True copies the slot into the page (H2D), False copies
+            the page into the slot (D2H)
     """
     ...
 
