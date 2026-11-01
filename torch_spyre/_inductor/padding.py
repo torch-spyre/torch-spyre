@@ -80,6 +80,7 @@ from .pass_utils import (
     find_fx_node,
     host_coordinates,
     identify_matmul_inputs,
+    indirect_info_from_op,
     is_restickify_coords,
     lower_pad_sequence,
     patch_env,
@@ -958,6 +959,12 @@ def lower_identity_clone(
     return clone_buf, new_ops
 
 
+def _is_indirect_producer(buf: ComputedBuffer) -> bool:
+    """Return True if ``buf`` has an indirect (index) read."""
+    _, load_subs, _ = indirect_info_from_op(buf)
+    return bool(load_subs)
+
+
 def _pad_restickify_input(op: Operation, graph: GraphLowering) -> None:
     """Pad a restickify input's non-stick dim to cover codegen's stick-boundary
     read window.
@@ -1013,10 +1020,8 @@ def _pad_restickify_input(op: Operation, graph: GraphLowering) -> None:
     # --- Get a buffer we can pad: the producer's output, or a graph-input clone. ---
     # Run AFTER the gate: cloning mutates the graph (insert + redirect), so
     # cloning for an input we then skip would strand a redundant clone.
-    if not isinstance(in_buf, ComputedBuffer):
-        # A graph input has no producer output to pad: insert an identity clone
-        # ahead of the restickify, move it into place, redirect the read to it,
-        # then pad the clone.
+    # Clone indirect-access producers too: their index is not padded or masked.
+    if not isinstance(in_buf, ComputedBuffer) or _is_indirect_producer(in_buf):
         device = in_buf.get_device()
         if device is None:
             return
