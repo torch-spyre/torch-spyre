@@ -2763,6 +2763,21 @@ def compute_restickify_needed(
             f"stride_map={sm}, elem_stride={elem_stride}, stick_size={stick_size}"
         )
 
+    if (
+        in_stick_offset_free
+        and not is_sparse_stl(in_stl)
+        and not _is_matmul_op(op)
+        and len(target_stick.free_symbols) == 1
+        and not (target_stick.free_symbols & in_dep.index.free_symbols)
+    ):
+        # The target stick runs along a loop variable the input is not indexed by,
+        # i.e. the input is broadcast along it. There is no input dim to move the
+        # stick onto, so compute_restickify_target_layout would return None. Every
+        # lane of such a stick needs the same input element, so give the input a
+        # sparse stick (one element per stick), which is compatible with any
+        # output stick. None (infeasible) is kept when the layout cannot be built.
+        return True, compute_size1_restickify_layout(in_stl, in_host, ic, idc)
+
     if target_stick == sympy.S.Zero and not in_stick_offset_free:
         # No output dim carries the input's stick var, so compute_restickify_target_layout
         # would fail to match. Promote the reduction var to the stick dimension so the

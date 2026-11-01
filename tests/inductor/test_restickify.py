@@ -2403,7 +2403,9 @@ def test_unsqueeze_broadcast_dense_pointwise():
     """a.unsqueeze(-1) + b - unsqueeze broadcast followed by pointwise."""
     a = torch.randn((S,), dtype=torch.float16)
     b = torch.randn((S, S), dtype=torch.float16)
-    _compare(lambda a, b: a.unsqueeze(-1) + b, a, b, optimal_cost=S * S)
+    # The 1-D ``a`` is broadcast along b's stick, so it is restickified to a
+    # sparse stick (cost S) instead of restickifying the dense [S, S] ``b``.
+    _compare(lambda a, b: a.unsqueeze(-1) + b, a, b, optimal_cost=S)
 
 
 def test_unsqueeze_broadcast_dense_pointwise_d0_stick():
@@ -2426,7 +2428,8 @@ def test_unsqueeze_expand_broadcast_dense_pointwise():
     """a.unsqueeze(-1).expand(S, S) + b - unsqueeze+expand broadcast followed by pointwise."""
     a = torch.randn((S,), dtype=torch.float16)
     b = torch.randn((S, S), dtype=torch.float16)
-    _compare(lambda a, b: a.unsqueeze(-1).expand(S, S) + b, a, b, optimal_cost=S * S)
+    # Same as above: the 1-D ``a`` goes sparse (cost S), not the dense [S, S] ``b``.
+    _compare(lambda a, b: a.unsqueeze(-1).expand(S, S) + b, a, b, optimal_cost=S)
 
 
 def test_unsqueeze_expand_broadcast_dense_pointwise_d0_stick():
@@ -2445,21 +2448,36 @@ def test_unsqueeze_expand_broadcast_dense_pointwise_d0_stick():
     )
 
 
+def test_broadcast_outer_mul_fp32():
+    """RoPE frequencies: int64 position ids [B, N] -> [..., None].float() * f32[D].
+
+    The [B, N, 1] operand has its stick on N and the [D] operand on D; each is
+    broadcast along the other's stick. The small [D] operand is restickified to a
+    sparse stick (cost D) rather than failing with "no mechanism to resolve stick
+    incompatibility".
+    """
+    B, N, D = 1, 384, 64
+    pos = _arange(B, N, span=N, dtype=torch.int64)
+    inv = 0.25 * torch.arange(0, 2 * D, 2, dtype=torch.float32)
+    _compare(lambda p, f: p[..., None].float() * f, pos, inv, optimal_cost=D)
+
+
 # ------- Broadcast outer-product tests ---------
 
 
 def test_broadcast_outer_diff():
     """acs.unsqueeze(-1) - acs.unsqueeze(-2): outer-product subtraction over [BH, C].
 
-    Both reads of acs conflict (stick on d1 vs d2); the optimizer picks stick on
-    dim 0 (BH) at cost 2 * acs.numel() — two restickifies of the 2D input.
+    Both reads of acs conflict (stick on d1 vs d2). Each read is broadcast along
+    the other's stick, so one of them can be restickified to a sparse stick; the
+    optimizer then needs a single restickify, at cost acs.numel().
     """
     BH, C = 64, 64
     acs = torch.randn((BH, C), dtype=torch.float16)
     _compare(
         lambda acs: torch.exp(acs.unsqueeze(-1) - acs.unsqueeze(-2)),
         acs,
-        optimal_cost=2 * acs.numel(),
+        optimal_cost=acs.numel(),
         check_strides=False,
     )
 
@@ -2471,7 +2489,7 @@ def test_broadcast_expand_first():
     _compare(
         lambda acs: torch.exp(acs.unsqueeze(-1).expand(-1, -1, C) - acs.unsqueeze(-2)),
         acs,
-        optimal_cost=2 * acs.numel(),
+        optimal_cost=acs.numel(),
         check_strides=False,
     )
 
@@ -2483,7 +2501,7 @@ def test_broadcast_expand_second():
     _compare(
         lambda acs: torch.exp(acs.unsqueeze(-1) - acs.unsqueeze(-2).expand(-1, C, -1)),
         acs,
-        optimal_cost=2 * acs.numel(),
+        optimal_cost=acs.numel(),
         check_strides=False,
     )
 
@@ -2497,7 +2515,7 @@ def test_broadcast_expand_both():
             acs.unsqueeze(-1).expand(-1, -1, C) - acs.unsqueeze(-2).expand(-1, C, -1)
         ),
         acs,
-        optimal_cost=2 * acs.numel(),
+        optimal_cost=acs.numel(),
         check_strides=False,
     )
 
