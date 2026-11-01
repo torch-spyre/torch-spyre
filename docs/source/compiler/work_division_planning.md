@@ -433,8 +433,25 @@ the splits to legacy coefficient-keyed `op_it_space_splits` transport so
 Scheduler/codegen can survive iteration-symbol renaming.
 
 For the worked example below, the pre-scheduler ownership is
-`{M: 16, N: 1, K: 2}`. Scheduler/codegen receives the equivalent legacy
-coefficient-keyed encoding.
+`{M: 16, N: 1, K: 2}`. Scheduler/codegen receives this same split
+re-keyed by write/read index coefficient rather than by symbol.
+`apply_splits()` -- the gate span reduction, the default greedy distributor,
+the cost-model matmul re-pricer, and user hints all commit a split through --
+rejects any split the coefficient-keyed encoding cannot carry losslessly: an
+axis absent from the relevant index, or two axes, split or not, that would
+collide on one coefficient (a collision solely with an axis of concrete
+extent 1 does not count -- `apply_splits_from_index_coeff()` skips such an
+axis unconditionally, without ever consulting the coefficient it shares).
+`WorkDivisionContext.is_legal` and user-hint application additionally reject
+such a split earlier, at candidate-enumeration time, so a search never
+wastes a step on one. The LX co-optimizer draws its candidates from that same
+`is_legal`-filtered enumeration and then commits its chosen division
+directly (bypassing `apply_splits()`), so its input is pre-filtered the same
+way even though the gate itself does not run on that path. Together these
+make this re-keying lossless for every split that reaches
+`finalize_work_division_for_scheduler()`; that function re-checks the same
+condition defensively and raises rather than emitting a lossy encoding if it
+is somehow still reached.
 :::
 
 Two op-kind constraints apply on top of the algorithm above. For

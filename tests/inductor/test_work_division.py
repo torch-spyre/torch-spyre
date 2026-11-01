@@ -28,6 +28,8 @@ from types import SimpleNamespace
 from typing import NamedTuple
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 import sympy
 from torch._inductor.utils import sympy_index_symbol
 import torch
@@ -50,7 +52,6 @@ from torch_spyre._C import (
     SpyreTensorLayout,
     get_device_dtype,
 )
-from torch_spyre._inductor import passes
 from torch_spyre._inductor import work_division_constraints
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.ir import FixedTiledLayout
@@ -101,6 +102,7 @@ from torch_spyre._inductor.wsr.enumerate_tilings import (
 
 from torch_spyre._inductor.work_division import (
     TensorDep,
+    WorkDivisionContext,
     _cost_model_matmul_planner,
     _decode_weight_delivery_us,
     _default_split,
@@ -110,6 +112,7 @@ from torch_spyre._inductor.work_division import (
     _matmul_multicast_penalty,
     _matmul_split_cost,
     adjust_it_space_for_sticks,
+    apply_splits,
     enumerate_work_division_candidates,
     work_division_context_for_op,
     work_division_splits_are_legal,
@@ -1576,6 +1579,42 @@ class TestWorkDivisionContextAnswers(unittest.TestCase):
                 with self.subTest(why):
                     self.assertEqual(ctx.is_legal(splits), legal, _by_name(splits))
 
+    def test_is_legal_representability_uses_real_extents_not_adjusted_ones(self):
+        """The representability sub-check must judge the op's real,
+        un-tiled extents, not it_space_adjusted: those are the per-tile frame
+        under a non-trivial tiling, whose extents can be smaller than the
+        op's real ones (a stick var with a small element extent can adjust
+        to a per-tile/per-stick size of 1). The commit-time gates
+        (apply_splits, finalize_work_division_for_scheduler) judge the real,
+        un-tiled op, so a candidate is_legal wrongly admits here would still
+        be rejected there -- a latent, fail-closed inconsistency, not merely
+        a cosmetic one."""
+        i0, i1 = _isym("i0"), _isym("i1")
+        write_index = 8 * i0 + 8 * i1  # i0, i1 share coeff 8
+        op = _computed_buffer((8, 8), name="divergent_extents")
+        ctx = WorkDivisionContext(
+            op=op,
+            max_cores=32,
+            it_space={i0: 8, i1: 8},
+            it_space_adjusted={i0: 8, i1: 1},  # i1 looks trivial only here
+            stick_vars={i1: 64},
+            symbol_meta={},
+            tensor_deps=[],
+            reduction_vars=[],
+            constraints=ConstraintResult(),
+            span_min_splits={},
+            write_index=write_index,
+            read_index=write_index,
+        )
+        with patch(
+            "torch_spyre._inductor.work_division.iteration_space_from_op",
+            return_value={i0: 8, i1: 8},  # the op's real, un-tiled extents
+        ):
+            self.assertFalse(
+                ctx._representable_by_index_coeff({i0: 4, i1: 1}),
+                "i1's real extent (8) must be used, not its tile-adjusted extent (1)",
+            )
+
     def test_context_answers_match_the_enumeration(self):
         """The seam itself: the context's axis order is the one a candidate is
         keyed by, and every enumerated candidate is one the context calls legal
@@ -2396,11 +2435,12 @@ class TestDepthwiseConvWindowBlocked(unittest.TestCase):
 
     def test_unblocked_window_split_is_dropped_before_codegen(self):
         """What the guard prevents: permit (and force) a kh split, and the
-        committed plan cannot be carried to codegen."""
+        committed plan cannot be carried to codegen -- compilation now raises
+        rather than silently dropping the split and running on fewer cores."""
+        from torch._inductor.exc import InductorError
+
         forced = {}
-        committed = {}
         real_window = work_division_constraints.reduction_window_blocked_vars
-        real_finalize = passes.finalize_work_division_for_scheduler
 
         def force_kh_split(ctx):
             if getattr(ctx.op.data, "reduction_type", None) != DEPTHWISE_CONV2D_OP:
@@ -2409,14 +2449,7 @@ class TestDepthwiseConvWindowBlocked(unittest.TestCase):
             forced["kh"] = kh
             return ConstraintResult(allowed_splits={kh: frozenset({3})})
 
-        def finalize(graph):
-            for op in graph.operations:
-                data = getattr(op, "data", None)
-                if getattr(data, "reduction_type", None) == DEPTHWISE_CONV2D_OP:
-                    committed.update(op.iteration_space_ownership.work_slices)
-            real_finalize(graph)
-
-        x, w, x_dev, w_dev = self._inputs()
+        _, _, x_dev, w_dev = self._inputs()
         torch._dynamo.reset()
         with (
             fresh_cache(),
@@ -2425,25 +2458,87 @@ class TestDepthwiseConvWindowBlocked(unittest.TestCase):
                 "reduction_window_blocked_vars",
                 force_kh_split,
             ),
-            patch.object(passes, "finalize_work_division_for_scheduler", finalize),
-        ):
-            with self.assertLogs("spyre.inductor.pass_utils", "WARNING") as logs:
-                out = torch.compile(self._conv)(x_dev, w_dev).cpu()
-        ref = self._conv(x, w)
-        kh = forced["kh"]
-        self.assertEqual(committed[kh], 3)
-        self.assertTrue(
-            any(
-                "lossy work-division scheduler transport" in line
-                and f"reduction:{kh}=absent" in line
-                for line in logs.output
+            pytest.raises(
+                InductorError,
+                match="cannot be represented by the scheduler's "
+                "coefficient-keyed transport",
             ),
-            logs.output,
+        ):
+            torch.compile(self._conv)(x_dev, w_dev).cpu()
+        # The guard that forced the split ran, so this is the hazard the
+        # finalize hard failure is defending against, not a vacuous pass.
+        self.assertIn("kh", forced)
+
+
+class TestApplySplitsRepresentabilityGate(unittest.TestCase):
+    """apply_splits() is the gate span_reduction, the default greedy
+    distributor, the cost-model matmul re-pricer, and user hints all commit a
+    split through. Unlike WorkDivisionContext.is_legal / _apply_user_hint,
+    the default distributor and the cost-model re-pricer never ask those
+    checks (see TestDepthwiseConvWindowBlocked for the real-compile
+    instance), so apply_splits must itself reject a split the scheduler's
+    coefficient-keyed transport cannot carry losslessly, before ever
+    committing it."""
+
+    class _Op:
+        """Lightweight stand-in: a real MemoryDep write/read pair, no real
+        Inductor IR lowering needed. Mirrors
+        test_it_space_splits.py::test_scheduler_transport_raises_on_collision's
+        Op, extended with a Pointwise ``data`` so iteration_space_from_op (used
+        by both apply_splits and commit_iteration_space_ownership) resolves on
+        the real, unpatched code path."""
+
+        def __init__(self, write_index, symbols, sizes):
+            self.data = MagicMock(spec=Pointwise)
+            write = MemoryDep("op_under_test", write_index, symbols, sizes)
+            self._rw = type("ReadWrites", (), {"writes": [write], "reads": []})()
+
+        def get_name(self):
+            return "op_under_test"
+
+        def get_read_writes(self):
+            return self._rw
+
+    def test_two_split_axes_sharing_a_coefficient_are_rejected(self):
+        i0, i1 = _isym("i0"), _isym("i1")
+        op = self._Op(8 * i0 + 8 * i1, (i0, i1), (8, 8))
+        with self.assertRaisesRegex(
+            Unsupported,
+            "cannot be represented by the scheduler's coefficient-keyed transport",
+        ):
+            apply_splits(op, {i0: 2, i1: 4})
+        self.assertFalse(hasattr(op, "iteration_space_ownership"))
+
+    def test_split_axis_colliding_with_an_unsplit_axis_is_rejected(self):
+        """i1 is left unsplit (factor 1) in this candidate but has real
+        extent (8, not 1): the decoder cannot distinguish it from i0's split
+        by coefficient alone, so this must be rejected just as a split-split
+        collision would be, not silently miscommitted."""
+        i0, i1, i2 = _isym("i0"), _isym("i1"), _isym("i2")
+        op = self._Op(8 * i0 + 8 * i1 + i2, (i0, i1, i2), (8, 8, 64))
+        with self.assertRaisesRegex(
+            Unsupported,
+            "cannot be represented by the scheduler's coefficient-keyed transport",
+        ):
+            apply_splits(op, {i0: 4, i1: 1, i2: 1})
+        self.assertFalse(hasattr(op, "iteration_space_ownership"))
+
+    def test_split_colliding_only_with_a_size1_axis_still_commits(self):
+        """i1 is genuinely size-1 here (not merely unsplit): the decoder
+        skips it unconditionally regardless of coefficient, so sharing i0's
+        coefficient is not a real hazard and this split must still commit."""
+        i0, i1, i2 = _isym("i0"), _isym("i1"), _isym("i2")
+        op = self._Op(8 * i0 + 8 * i1 + i2, (i0, i1, i2), (8, 1, 64))
+        apply_splits(op, {i0: 4, i1: 1, i2: 1})
+        self.assertEqual(
+            op.iteration_space_ownership.work_slices, {i0: 4, i1: 1, i2: 1}
         )
-        # The dropped split leaves numerics intact -- the op simply runs on
-        # fewer cores than the solver priced -- which is why only the guard,
-        # not a numeric test, keeps this plan out.
-        torch.testing.assert_close(out, ref, atol=0.1, rtol=0.1)
+
+    def test_representable_split_still_commits(self):
+        i0, i1 = _isym("i0"), _isym("i1")
+        op = self._Op(64 * i0 + i1, (i0, i1), (8, 64))
+        apply_splits(op, {i0: 4, i1: 1})
+        self.assertEqual(op.iteration_space_ownership.work_slices, {i0: 4, i1: 1})
 
 
 class TestQfp8wtConstraints(unittest.TestCase):
