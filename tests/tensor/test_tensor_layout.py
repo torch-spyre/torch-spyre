@@ -165,6 +165,23 @@ class TestSpyreTensorLayout(TestCase):
             "SpyreTensorLayout(device_size=[4, 512, 64], stride_map =[64, 256, 1], device_dtype=DataFormats.SEN169_FP16, valid_elements={(0, 2): 256, (1,): 512})",
         )
 
+    def test_stl_repr_round_trips_padding(self):
+        # Generated wrapper code embeds repr(stl), so it must eval back to an
+        # equal layout, including the padding value.
+        from torch_spyre._C import DataFormats  # noqa: F401
+
+        for value in [0.0, 1.0019378662109375, -3.4028234663852886e38, float("inf")]:
+            stl = SpyreTensorLayout(
+                [1, 64, 64],
+                [-1, 1, -1],
+                DataFormats.IEEE_FP32,
+                valid_elements={(0, 2): 1, (1,): 64},
+            )
+            stl.padding_value = value
+            rebuilt = eval(repr(stl))
+            self.assertEqual(rebuilt, stl)
+            self.assertEqual(rebuilt.padding_value, value)
+
     def test_device_alloc(self):
         x = torch.rand([512, 256], dtype=torch.float16).to("spyre")
         stl = x.device_tensor_layout()

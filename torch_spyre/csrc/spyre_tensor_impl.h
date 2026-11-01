@@ -73,6 +73,24 @@ inline std::string elementArrangementToString(ElementArrangement ea) {
   }
 }
 
+// Explicit numeric values are assigned so that the integer encoding used by the
+// SpyreTensorLayout pickle in module.cpp is stable regardless of source order.
+enum class PADDING {
+  UNINITIALIZED = 0,  // padding elements may hold any value
+  CONSTANT = 1,       // DMA sets padding elements to padding_value
+};
+
+inline std::string paddingToString(PADDING p) {
+  switch (p) {
+    case PADDING::UNINITIALIZED:
+      return "UNINITIALIZED";
+    case PADDING::CONSTANT:
+      return "CONSTANT";
+    default:
+      DT_ERROR("Invalid PADDING");
+  }
+}
+
 class SpyreTensorLayout {
  public:
   /**
@@ -99,6 +117,19 @@ class SpyreTensorLayout {
    * sizes.
    */
   std::map<std::vector<int64_t>, int64_t> valid_elements;
+
+  /**
+   * Signals whether a padding value should be replicated by DMA
+   */
+  PADDING padding = PADDING::UNINITIALIZED;
+
+  /**
+   * The value of one padding element, encoded in device_dtype exactly as it
+   * is stored in device memory, so the DMA can replicate these bytes as-is.
+   * Its size is the element size of device_dtype (1 to 8 bytes). Empty unless
+   * padding is PADDING::CONSTANT.
+   */
+  std::vector<uint8_t> padding_value;
 
   SpyreTensorLayout() = default;
   ~SpyreTensorLayout() = default;
@@ -222,6 +253,28 @@ class SpyreTensorLayout {
     return copy;
   }
 
+  /**
+   * Set padding to PADDING::CONSTANT and padding_value to the device_dtype
+   * encoding of value. Only SEN169_FP16 and IEEE_FP32 with
+   * ElementArrangement::STANDARD are supported; value is rounded to
+   * device_dtype.
+   */
+  void set_constant_padding(double value);
+
+  /**
+   * Decode padding_value back to a double, or std::nullopt when padding is
+   * not PADDING::CONSTANT.
+   */
+  std::optional<double> constant_padding_value() const;
+
+  /**
+   * Reset padding to PADDING::UNINITIALIZED and clear padding_value.
+   */
+  void clear_padding() {
+    padding = PADDING::UNINITIALIZED;
+    padding_value.clear();
+  }
+
   void init(std::vector<int64_t> host_size, c10::ScalarType dtype);
 
   void init(std::vector<int64_t> host_size, std::vector<int64_t> host_strides,
@@ -239,7 +292,9 @@ class SpyreTensorLayout {
     return this->device_size == other.device_size &&
            this->stride_map == other.stride_map &&
            this->device_dtype == other.device_dtype &&
-           this->element_arrangement == other.element_arrangement;
+           this->element_arrangement == other.element_arrangement &&
+           this->padding == other.padding &&
+           this->padding_value == other.padding_value;
   }
 };
 
@@ -309,6 +364,10 @@ struct hash<spyre::SpyreTensorLayout> {
         seed, std::hash<size_t>{}(static_cast<size_t>(layout.device_dtype)));
     seed = c10::hash_combine(
         seed, std::hash<int>{}(static_cast<int>(layout.element_arrangement)));
+    seed = c10::hash_combine(
+        seed, std::hash<int>{}(static_cast<int>(layout.padding)));
+    for (uint8_t b : layout.padding_value)
+      seed = c10::hash_combine(seed, std::hash<uint8_t>{}(b));
     return seed;
   }
 };

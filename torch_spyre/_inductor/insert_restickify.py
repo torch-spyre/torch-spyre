@@ -614,6 +614,7 @@ def finalize_layouts(graph: GraphLowering) -> None:
             )
             stl = input_buf.committed_stl
             input_buf.layout = _fixed_tiled(input_buf.layout, stl)
+
             del tensor_box.layouts
 
     plan: defaultdict[str, list[RestickifyArgInfo]] = defaultdict(list)
@@ -631,7 +632,12 @@ def finalize_layouts(graph: GraphLowering) -> None:
         # until after the scheduler runs
         if op_layouts and not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
             stl = committed if cost_fn else op_layouts[0]
-            op.layout = _fixed_tiled(op.layout, cast(SpyreTensorLayout, stl))
+            stl = cast(SpyreTensorLayout, stl)
+            if op.annotations.get("do_coord_mask", False) or op.annotations.get(
+                "do_pad", False
+            ):
+                stl.padding_value = op.annotations["pad_value"]
+            op.layout = _fixed_tiled(op.layout, stl)
             # Tiled-reduction scratch: propagate the reduction op's device
             # layout to accum_full so fill, combine, and copy all agree on
             # the device coordinate system.
