@@ -2807,13 +2807,21 @@ def compute_size1_restickify_target(
     in_host: FixedLayout,
     in_dep: MemoryDep,
     op: "ComputedBuffer | None" = None,
+    indirect_sizes: "dict[sympy.Symbol, int] | None" = None,
 ) -> "SpyreTensorLayout | None":
     """Target STL that moves in_stl's stick onto a dim of size 1.
 
     Used when the input's stick var must leave the stick (e.g. topk's
     reduction var) and no other dim can take it.
+
+    indirect_sizes, when given, is used instead of indirect_info_from_op(op).
+    A Scatter caller must pass it: indirect_info_from_op returns sizes=None
+    for a Scatter, which drops the scatter index symbol from the coordinates.
     """
-    _, _, ind_sizes = indirect_info_from_op(op)
+    if indirect_sizes is not None:
+        ind_sizes = indirect_sizes
+    else:
+        _, _, ind_sizes = indirect_info_from_op(op)
     idc = try_device_coordinates(in_stl, in_dep, ind_sizes, op=op)
     if idc is None:
         return None
