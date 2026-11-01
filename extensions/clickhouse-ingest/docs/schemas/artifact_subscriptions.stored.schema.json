@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Who an artifact triggers; one row per version, the newest updated_at wins.",
+  "properties": {
+    "arch": {},
+    "artifact_name": {},
+    "coalesce_minutes": {},
+    "component": {},
+    "credential_id": {},
+    "enabled": {},
+    "event_types": {},
+    "exclude_families": {},
+    "exclude_tag_patterns": {},
+    "kind": {},
+    "max_per_day": {},
+    "max_per_hour": {},
+    "not_before": {},
+    "notes": {},
+    "owner": {},
+    "params": {},
+    "payload_fields": {},
+    "props": {},
+    "require": {},
+    "result_states": {},
+    "result_test_types": {},
+    "subscription_id": {
+      "minLength": 1
+    },
+    "tag_family": {},
+    "tag_pattern": {},
+    "tag_props": {},
+    "target": {
+      "minLength": 1
+    },
+    "target_type": {
+      "enum": [
+        "gha_dispatch",
+        "jenkins",
+        "webhook"
+      ]
+    },
+    "unless_exists": {},
+    "updated_at": {},
+    "updated_by": {}
+  },
+  "required": [
+    "subscription_id",
+    "updated_at",
+    "enabled",
+    "event_types",
+    "tag_family",
+    "tag_pattern",
+    "tag_props",
+    "exclude_families",
+    "exclude_tag_patterns",
+    "result_test_types",
+    "result_states",
+    "component",
+    "arch",
+    "kind",
+    "artifact_name",
+    "not_before",
+    "require",
+    "unless_exists",
+    "max_per_hour",
+    "max_per_day",
+    "coalesce_minutes",
+    "target_type",
+    "target",
+    "params",
+    "payload_fields",
+    "credential_id",
+    "owner",
+    "updated_by",
+    "notes",
+    "props"
+  ],
+  "title": "artifact_subscriptions: the stored row",
+  "type": "object",
+  "x-uploadable": false
+}

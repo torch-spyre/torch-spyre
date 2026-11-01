@@ -141,6 +141,7 @@ class Sandbox:
         ("poller_decisions", "ts >= now() - INTERVAL {days} DAY", "audit_uuid"),
         ("ci_write_failures", "ts >= now() - INTERVAL {days} DAY", "audit_uuid"),
         ("merge_queue_events", "ts >= now() - INTERVAL {days} DAY", "audit_uuid"),
+        ("effect_status", "ts >= now() - INTERVAL {days} DAY", "(event_id)"),
         # By time: a pending or rejected upload has no run_id.
         ("result_uploads", "ts >= now() - INTERVAL {days} DAY", "(upload_id, ts)"),
         ("insight_reports", "ts >= now() - INTERVAL {days} DAY", "(report_id, ts)"),

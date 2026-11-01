@@ -37,6 +37,7 @@ Applying them in filename order works from an empty database.
 | `64-rbac.sql` | `rbac_roles`, `rbac_bindings`, each with a `*_versions` log and MV | — |
 | `65-insight-reports.sql` | `insight_reports`, `v_insight_reports` | — |
 | `66-chat-turns.sql` | `chat_turns` (kept forever), `chat_turn_retention`, `v_chat_turns`, `v_chat_turn_retention`, `v_chat_turn_daily` | — |
+| `67-effect-status.sql` | `effect_status` (append-only triage events), `v_effect_status` | — |
 | `70-vllm-hud-projection.sql` | `oss_ci_benchmark_v3`, `oss_ci_benchmark_metadata`, their `_by_tag` copies + their MVs | 30, 60 |
 
 Column names `chat_turns` shares with `vigil_ops.analyst_turns`, so one `UNION ALL` view can read both:
