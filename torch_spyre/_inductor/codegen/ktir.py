@@ -73,11 +73,13 @@ from torch_spyre._inductor.codegen.opspec_utils import (
     per_core_extent,
     placeholder_axes,
     reduction_indexing,
+    relayout_strides,
     row_major_strides,
 )
 from torch_spyre._inductor.constants import (
     ABSMAX_OP,
     MAX_POOL_SIZE_BYTES,
+    RESTICKIFY_OP,
     STAGGERED_EAS,
 )
 from torch_spyre._inductor.logging_utils import get_inductor_logger
@@ -1745,9 +1747,11 @@ class KernelPlan:
         access is built from, so a view and the tiles into it cannot disagree, and
         emission has nothing left to derive.
         """
+        recipe = KtirBuilder.RECIPES[spec.op]
+        if recipe.relayout:
+            return self._relayout_step(spec, loops, stage)
         out, inputs = validated_roles(spec)
         dtype = dtype_of(spec)
-        recipe = KtirBuilder.RECIPES[spec.op]
         for arg in inputs:
             # In-place (input buffer aliases the output) is not supported yet.
             if buf_id(arg) == buf_id(out):
@@ -1924,6 +1928,102 @@ class KernelPlan:
             # pooled one does reach memory -- at the pool base plus its offset --
             # so it is stored like any passed-in buffer.
             store=not is_threaded(out),
+        )
+
+    def _relayout_step(
+        self, spec: OpSpec, loops: Sequence[LoopSpec], stage: int
+    ) -> ComputeStep:
+        """One relayout: the input viewed in the output's order, then a copy.
+
+        The step every other op gets from alignment, built from
+        ``relayout_strides`` instead: one iteration space for both views (the
+        output's device axes, split where the input splits a symbol into stick
+        and lane), the output view row-major over it, and the input view at
+        whatever strides put each of its elements under the output element it
+        becomes.  The compute between them is the identity, so the step is a
+        ``GENERIC`` with identity maps and a payload that yields its operand.
+
+        Untiled and undivided only: a level or a division would have to walk
+        the refined iteration space, and ``_solve_layout``'s steps are steps
+        along a buffer's own axes.  Both buffers must reach memory, because the
+        layout change is a fact about how one is addressed.
+        """
+        out, [source] = validated_roles(spec)
+        dtype = dtype_of(spec)
+        recipe = KtirBuilder.RECIPES[spec.op]
+        if buf_id(source) == buf_id(out):
+            raise NotImplementedError(
+                "OpSpec->KTIR: in-place ops (input aliases output) not supported"
+            )
+        if loops or self.divisions:
+            _unimplemented(
+                "relayout-tiling",
+                f"{spec.op!r} is tiled or work-divided; a relayout is emitted over "
+                "one whole, undivided iteration space (SENCORES=1)",
+            )
+        for arg in (source, out):
+            if is_threaded(arg):
+                _unimplemented(
+                    "relayout-threaded",
+                    f"{spec.op!r} operand {arg.name!r} is threaded; a relayout "
+                    "reads and writes memory",
+                )
+            if _arrangement(arg) not in (None, ElementArrangement.STANDARD):
+                _unimplemented(
+                    "relayout-element-arrangement",
+                    f"{spec.op!r} operand {arg.name!r} has element arrangement "
+                    f"{_arrangement(arg)!r}",
+                )
+        ranges = {}
+        for sym, (count, _div) in spec.iteration_space.items():
+            count = _static(count)
+            if not isinstance(count, int):
+                raise NotImplementedError(
+                    f"OpSpec->KTIR: {spec.op!r} iterates {sym} over {count}; a "
+                    "relayout's ranges must be whole numbers"
+                )
+            ranges[sym] = count
+        if dtype != DataFormats.SEN169_FP16:
+            # The payload would serve any format; the backend's transpose
+            # lowering has only been run at fp16.
+            _unimplemented(
+                "relayout-format",
+                f"{spec.op!r} at {dtype.name}; a relayout is emitted at fp16 only",
+            )
+        recipe.arm(dtype)
+        extent, in_strides, out_strides = relayout_strides(
+            list(source.device_coordinates),
+            [int(s) for s in source.device_size],
+            list(out.device_coordinates),
+            [int(s) for s in out.device_size],
+            ranges,
+        )
+        accesses = {}
+        for arg, strides in ((source, in_strides), (out, out_strides)):
+            layout = Layout(extent=extent, strides=strides)
+            elems = ElemTypes.of(arg.device_dtype)
+            buffer = _buffer(
+                arg,
+                layout,
+                elems,
+                bake_addresses=self.options.bake_addresses,
+                frontend_pool_allocation=self.options.frontend_pool_allocation,
+            )
+            self.buffers.setdefault(buf_id(arg), buffer)
+            accesses[buf_id(arg)] = _access(arg, extent, [], layout, elems, buffer)
+        identity = tuple(range(len(extent)))
+        return ComputeStep(
+            op=spec.op,
+            surface=Surface.GENERIC,
+            ins=((buf_id(source), accesses[buf_id(source)]),),
+            out=accesses[buf_id(out)],
+            out_buf_id=buf_id(out),
+            stage=stage,
+            indexing=Indexing(
+                iters=(PARALLEL,) * len(extent), maps=(identity, identity)
+            ),
+            dtype=dtype,
+            store=True,
         )
 
     def _access_of(
@@ -2674,6 +2774,13 @@ class Recipe:
     # binds it as an INSTANCE attribute, and instance attributes are not
     # descriptors, so ``self.dispatch(arms, request)`` passes no ``self``.
     dispatch: Dispatch = request_by_dtype
+    # Whether the op MOVES elements between two layouts rather than computing
+    # them.  A relayout's operand and result order their device axes
+    # differently, so neither alignment nor a broadcast map can line them up;
+    # its step is built by ``KernelPlan._relayout_step`` instead, which puts the
+    # whole layout change into the input view's strides and leaves the compute
+    # an identity.
+    relayout: bool = False
 
     def __post_init__(self) -> None:
         if self.arity < 1:
@@ -3104,7 +3211,17 @@ class KtirBuilder:
         )
         sizes = [int(e) for e in buffer.layout.extent]
         strides = [int(s) for s in buffer.layout.strides]
-        memref_t = ir.MemRefType.get(sizes, self.named_type(buffer.elems.storage))
+        # A view at other than row-major strides says so in its type as well as
+        # in its operands -- a relayout's input, viewed in its output's order.
+        # A row-major one keeps the plain type every other view has.
+        layout = (
+            None
+            if strides == row_major_strides(sizes)
+            else ir.StridedLayoutAttr.get(0, strides)
+        )
+        memref_t = ir.MemRefType.get(
+            sizes, self.named_type(buffer.elems.storage), layout=layout
+        )
         # The ``memory_space`` builder takes the tablegen-generated
         # ``MemorySpaceKind``, not a
         # spelling, so the mapping names enum members.  ``global_`` carries the
@@ -3560,6 +3677,15 @@ class KtirBuilder:
         "realdiv": Recipe(
             arity=2,
             arms=Arm(kind=BindingKind.PAYLOAD, binding=lambda: spyreop.realdiv),
+        ),
+        # A transpose that moves the stick dim.  It is a copy once the input is
+        # viewed in the output's order, so the payload yields its operand.  The
+        # payload is format-free; which formats the plan lets through is
+        # ``_relayout_step``'s business.
+        RESTICKIFY_OP: Recipe(
+            arity=1,
+            relayout=True,
+            arms=Arm(kind=BindingKind.PAYLOAD, binding=_written_here(lambda x: x)),
         ),
     }
 
