@@ -309,9 +309,21 @@ def _autoload_impl():
     # cache guards. It must be available before any .to("spyre") /
     # .to(device_layout=...) call -- including when that call is the very first
     # mention of the device (e.g. moving model weights onto Spyre).
-    from ._monkey_patch import _patch_tensor_for_spyre
+    from ._monkey_patch import _patch_fake_tensor_device_init, _patch_tensor_for_spyre
 
     _patch_tensor_for_spyre()
+
+    # FakeTensorMode device-init opt-out for the Spyre backend: keeps
+    # torch.tensor(..., device="spyre") under FakeTensorMode from
+    # materializing real device storage (78 one-stick DMAs + memsets per
+    # cold compile from Inductor's SDPA pattern init). See
+    # _monkey_patch._patch_fake_tensor_device_init.
+    try:
+        _patch_fake_tensor_device_init()
+    except Exception as e:  # pragma: no cover - defensive during torch import
+        import warnings
+
+        warnings.warn(f"Failed to install FakeTensorMode device-init patch: {e}")
 
     # Inductor backend registration (scheduler / codegen / op-overrides).
     from torch_spyre._inductor import _autoload as ts_inductor_autoload
