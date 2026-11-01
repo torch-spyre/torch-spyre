@@ -4509,6 +4509,23 @@ class TestOpSplitSpaceTiling(unittest.TestCase):
             self.assertFalse(space.admits({self.x: 1, self.y: 1}, _SPEC_ON_DIM_1))
             self.assertFalse(space.admits_tiling(_SPEC_ON_DIM_1))
 
+    def test_a_tiling_with_no_per_tile_context_is_refused_and_says_why(self):
+        by_2 = TileSpec((TileAxis(host_dim=0, count=2),))
+        by_4 = TileSpec((TileAxis(host_dim=0, count=4),))
+        with self._space(self.tiling) as space:
+            self.assertTrue(space.admits_tiling(by_2))  # non-vacuity
+            with (
+                patch.object(
+                    work_division_module,
+                    "work_division_context_for_op",
+                    side_effect=Unsupported("no frame"),
+                ),
+                self.assertLogs(work_division_module.logger, level="DEBUG") as logs,
+            ):
+                self.assertFalse(space.admits_tiling(by_4))
+        self.assertIn(f"dropping tiling {by_4} on tiled: ", logs.output[0])
+        self.assertIn("no frame", logs.output[0])
+
     def test_a_step_moves_one_axis_or_one_level_but_never_both(self):
         untiled = TileSpec()
         with self._space(self.tiling) as space:

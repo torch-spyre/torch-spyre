@@ -1253,7 +1253,10 @@ class OpSplitSpace:
                 context = work_division_context_for_op(
                     self.op, self.context.max_cores, tiling
                 )
-            except Unsupported:
+            except Unsupported as exc:
+                logger.debug(
+                    "dropping tiling %s on %s: %s", tiling, self.op.get_name(), exc
+                )
                 context = None
             self._contexts[tiling] = context
         return self._contexts[tiling]
