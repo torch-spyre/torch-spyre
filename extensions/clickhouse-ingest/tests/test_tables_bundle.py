@@ -270,3 +270,19 @@ def test_the_committed_schemas_match_the_table_classes(tmp_path):
     committed = Path(__file__).parent.parent / "docs" / "schemas"
     fresh = {p.name: p.read_text() for p in tmp_path.iterdir()}
     assert fresh == {p.name: p.read_text() for p in committed.iterdir()}
+
+
+def test_connected_results_routes_tables_dir_to_the_bundle_path(tmp_path, monkeypatch):
+    """`results --tables-dir` without --offline records the bundle `--offline` would write (as every other kind does)."""
+    from spyre_clickhouse_ingest import results
+
+    (tmp_path / "rows").mkdir()
+    (tmp_path / "rows" / "test_case_runs.json").write_text(json.dumps(CASES))
+    seen = {}
+    monkeypatch.setattr(
+        bundle, "ingest", lambda args: seen.update(bundle=args.from_bundle) or 0
+    )
+    argv = ["--tables-dir", str(tmp_path / "rows"), "--artifact-id", AID, "--arch", "s390x",
+            "--trigger-type", "regression", "--component", "my-suite"]  # fmt: skip
+    assert results.main(argv) == 0
+    assert seen["bundle"].endswith("bundle")
