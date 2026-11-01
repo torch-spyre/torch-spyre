@@ -11,6 +11,7 @@ Assignment is deterministic, so every job computes the same partition without co
   - Without one, each test goes to sha1(nodeid) % N.
 Ties in the greedy pass break on nodeid, so the result never depends on collection order.
 """
+import gzip
 import hashlib
 import json
 import os
@@ -42,11 +43,15 @@ def shard_from_env(environ=os.environ) -> Optional[Tuple[int, int]]:
 
 
 def load_durations(path: Optional[str]) -> Dict[str, float]:
-    """{nodeid: seconds} from a JSON file; {} when the path is unset or unreadable."""
+    """{key: seconds} from a JSON file (gzipped if it ends in .gz); {} when unset or unreadable.
+
+    Keys are `duration_key` strings or nodeids.
+    """
     if not path:
         return {}
     try:
-        with open(path, encoding="utf-8") as fh:
+        opener = gzip.open if str(path).endswith(".gz") else open
+        with opener(path, "rt", encoding="utf-8") as fh:
             data = json.load(fh)
     except (OSError, ValueError):
         return {}
@@ -71,10 +76,38 @@ def assign(nodeids: Sequence[str], num_shards: int,
     return out
 
 
+_WRAPPER_SUFFIX = "__oot_wrapper"
+
+
+def duration_key(item) -> str:
+    """`<file stem>::[<Class>::]<test name>`, the same for a collected item and its JUnit case.
+
+    A nodeid depends on how run_test.sh invoked pytest (its cwd, xdist, torchrun, and the generated
+    `<stem>__oot_wrapper.py` module), so durations recorded from one run's JUnit XML would not match
+    another run's nodeids. The stem (wrapper suffix dropped), class and name are the same everywhere.
+    """
+    path = getattr(item, "path", None) or getattr(item, "fspath", None)
+    stem = os.path.splitext(os.path.basename(str(path)))[0] if path else ""
+    if stem.endswith(_WRAPPER_SUFFIX):
+        stem = stem[: -len(_WRAPPER_SUFFIX)]
+    cls = getattr(item, "cls", None)
+    parts = [stem] + ([cls.__name__] if cls is not None else []) + [getattr(item, "name", "")]
+    return "::".join(parts)
+
+
 def select_shard(items: List, shard: Tuple[int, int], durations: Dict[str, float]):
-    """(kept, deselected) items for shard `shard` = (k, N)."""
+    """(kept, deselected) items for shard `shard` = (k, N).
+
+    A test's duration is looked up by `duration_key`, then by its nodeid. The partition itself is
+    keyed by nodeid, so every test still lands in exactly one shard whatever the durations say.
+    """
     k, n = shard
-    where = assign([i.nodeid for i in items], n, durations)
+    by_nodeid = {}
+    for i in items:
+        d = durations.get(duration_key(i), durations.get(i.nodeid))
+        if d is not None:
+            by_nodeid[i.nodeid] = d
+    where = assign([i.nodeid for i in items], n, by_nodeid)
     kept = [i for i in items if where[i.nodeid] == k]
     dropped = [i for i in items if where[i.nodeid] != k]
     return kept, dropped

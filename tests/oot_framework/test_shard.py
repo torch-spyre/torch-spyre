@@ -89,6 +89,11 @@ def test_load_durations(tmp_path):
     assert load_durations(str(p)) == {"a": 1.5, "b": 2.0}
     assert load_durations(str(tmp_path / "missing.json")) == {}
     assert load_durations(None) == {}
+    gz = tmp_path / "d.json.gz"
+    import gzip
+    with gzip.open(gz, "wt", encoding="utf-8") as fh:
+        json.dump({"test_m::TestA::t1": 3.0}, fh)
+    assert load_durations(str(gz)) == {"test_m::TestA::t1": 3.0}
 
 
 def test_filter_configs_expands_a_sharded_suite(tmp_path):
@@ -116,3 +121,46 @@ def test_filter_configs_expands_a_sharded_suite(tmp_path):
                             "--test-type", "regression", "--format", "paths"],
                            capture_output=True, text=True, check=True).stdout.split()
     assert len(paths) == 2, "paths format lists each config once, unsharded"
+
+
+class _Collected:
+    """A pytest item's shape as select_shard reads it: nodeid, path, cls, name."""
+    def __init__(self, nodeid, path, cls, name):
+        self.nodeid, self.path, self.cls, self.name = nodeid, path, cls, name
+
+
+class TestAllocatorSPYRE:
+    pass
+
+
+@pytest.mark.parametrize("nodeid,path,cls,expected", [
+    # generated wrapper module + device-instantiated class: the suffix is dropped
+    ("test_hbm_pool_planning__oot_wrapper.py::TestAllocatorSPYRE::test_a_spyre",
+     "/w/tests/inductor/test_hbm_pool_planning__oot_wrapper.py", TestAllocatorSPYRE,
+     "test_hbm_pool_planning::TestAllocatorSPYRE::test_a_spyre"),
+    # plain module-level test, no class
+    ("tests/inductor/test_hint_flags.py::test_x", "/w/tests/inductor/test_hint_flags.py", None,
+     "test_hint_flags::test_x"),
+    # parametrized id with brackets and regex characters survives unchanged
+    ("x.py::test_validation_guards[mask_shape-attention_mask shape.*must be]",
+     "/w/tests/inductor/test_sliding_window_attention__oot_wrapper.py", None,
+     "test_sliding_window_attention::test_validation_guards[mask_shape-attention_mask shape.*must be]"),
+])
+def test_duration_key_matches_the_junit_case(nodeid, path, cls, expected):
+    from oot_framework.utils.shard import duration_key
+    name = nodeid.rsplit("::", 1)[1]
+    assert duration_key(_Collected(nodeid, path, cls, name)) == expected
+
+
+def test_durations_found_by_key_balance_the_split():
+    from oot_framework.utils.shard import duration_key
+    # One very long test and many short ones, recorded under JUnit-derived keys, not nodeids.
+    items = [_Collected(f"run1/test_m__oot_wrapper.py::TestAllocatorSPYRE::t{i}",
+                        "/w/test_m__oot_wrapper.py", TestAllocatorSPYRE, f"t{i}") for i in range(20)]
+    durations = {duration_key(it): (600.0 if it.name == "t0" else 10.0) for it in items}
+    loads = []
+    for k in range(2):
+        kept, _ = select_shard(items, (k, 2), durations)
+        loads.append(sum(durations[duration_key(i)] for i in kept))
+    # Balanced: the 600 s test sits alone; the 19 short ones (190 s) go to the other shard.
+    assert sorted(loads) == [190.0, 600.0]

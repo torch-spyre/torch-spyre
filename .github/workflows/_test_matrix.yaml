@@ -698,6 +698,9 @@ jobs:
           # overwrite: true, so a second shard would silently replace the first's results.
           if [ -n "${SPYRE_TEST_NUM_SHARDS}" ]; then
             REPORT_NAME="${REPORT_NAME}-shard$((SPYRE_TEST_SHARD_ID + 1))of${SPYRE_TEST_NUM_SHARDS}"
+            # Recorded per-test durations balance the split; without them shards fall back to a hash split.
+            _DUR="${{ inputs.prebaked_image && env.PREBAKED_TORCH_SPYRE_DIR || format('{0}/torch-spyre', github.workspace) }}/.github/test_durations.json.gz"
+            if [ -f "$_DUR" ]; then echo "SPYRE_TEST_DURATIONS=${_DUR}" >> "$GITHUB_ENV"; fi
           fi
           REPORT_NAME="${REPORT_NAME}.xml"
           echo "REPORT_NAME=${REPORT_NAME}" >> "$GITHUB_ENV"
@@ -1522,6 +1525,9 @@ jobs:
           REPORT_NAME="$(basename "${CONFIG%.yaml}")"
           if [ -n "${SPYRE_TEST_NUM_SHARDS}" ]; then
             REPORT_NAME="${REPORT_NAME}-shard$((SPYRE_TEST_SHARD_ID + 1))of${SPYRE_TEST_NUM_SHARDS}"
+            # Recorded per-test durations balance the split; without them shards fall back to a hash split.
+            _DUR="${{ inputs.prebaked_image && env.PREBAKED_TORCH_SPYRE_DIR || format('{0}/torch-spyre', github.workspace) }}/.github/test_durations.json.gz"
+            if [ -f "$_DUR" ]; then echo "SPYRE_TEST_DURATIONS=${_DUR}" >> "$GITHUB_ENV"; fi
           fi
           REPORT_NAME="${REPORT_NAME}.xml"
           echo "REPORT_NAME=${REPORT_NAME}" >> "$GITHUB_ENV"
