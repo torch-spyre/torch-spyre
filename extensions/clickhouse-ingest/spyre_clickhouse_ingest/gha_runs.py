@@ -179,6 +179,7 @@ def workflow_row(
     created, started, updated = (
         _ts(run.get(k)) for k in ("created_at", "run_started_at", "updated_at")
     )
+    base = ((run.get("pull_requests") or [{}])[0].get("base")) or {}
     row = _blank()
     row.update(
         run_key=run_key(repo, run["id"], attempt),
@@ -204,6 +205,8 @@ def workflow_row(
                 ("workflow", run.get("name")),
                 ("head_branch", run.get("head_branch")),
                 ("run_id", run.get("id")),
+                ("base_ref", base.get("ref")),
+                ("base_sha", base.get("sha")),
             )
             if v
         },
