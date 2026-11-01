@@ -1812,6 +1812,41 @@ def silu(input: torch.Tensor) -> torch.Tensor:
     return torch.ops.spyre.silu(input)
 
 
+def _topk_row_tile(input: torch.Tensor, k: int, dim: int) -> Optional[int]:
+    """Rows per ``for_each_tile`` step of a [rows, n] topk over n that one kernel
+    cannot hold.
+
+    ``topk.ddl`` is wrong once a core's input passes ``topk_input_lx_budget()``, and
+    the cores the k split leaves may be too few to divide the rows that far. A tile
+    within the budget fits however the loop body is divided. None when the whole
+    input fits, or when even one stick of rows is too large, which the work-division
+    constraint then rejects.
+    """
+    from .work_division_constraints import (
+        topk_input_lx_budget,
+        topk_k_split,
+        topk_row_splits,
+    )
+
+    if input.ndim != 2 or dim % 2 != 1:
+        return None
+    if not all(isinstance(size, int) for size in input.shape):
+        return None
+    stick = get_elem_in_stick(input.dtype)
+    rows, n = input.shape
+    row_bytes = n * input.element_size()
+    budget = topk_input_lx_budget()
+    sticks = -(-rows // stick)
+    needed = -(-sticks * stick * row_bytes // budget)
+    try:
+        cores_left = config.sencores // topk_k_split(k)
+    except Unsupported:
+        return None
+    if needed <= 1 or topk_row_splits([sticks], needed, cores_left) is not None:
+        return None
+    return budget // (stick * row_bytes) * stick or None
+
+
 @register_spyre_decompositions([torch.ops.aten.topk])
 def spyre_topk(
     input: torch.Tensor,
@@ -1824,12 +1859,29 @@ def spyre_topk(
         raise Unsupported(f"topk with k={k} is not supported (max k=128)")
     if not largest:
         raise Unsupported("topk with largest=False")
+
     # sorted=False is a no-op: our reduction always returns sorted output.
     # Index stays in the input dtype (not int64) all the way out; topkindex's
     # fake reports it so Dynamo traces it with no meta conflict.
-    return torch.ops.spyre.topkvalue(input, k, dim), torch.ops.spyre.topkindex(
-        input, k, dim
+    def topk(x):
+        return torch.ops.spyre.topkvalue(x, k, dim), torch.ops.spyre.topkindex(
+            x, k, dim
+        )
+
+    tile = _topk_row_tile(input, k, -1 if dim is None else dim)
+    if tile is None:
+        return topk(input)
+    rows, n = input.shape
+    if rows % tile:
+        input = torch.cat([input, input.new_zeros(-rows % tile, n)])
+    _, (values, indices) = for_each_tile(
+        lambda _, tiles: (None, topk(tiles[0])),
+        (input,),
+        dims=0,
+        tile_size=tile,
+        out_dim=0,
     )
+    return values[:rows], indices[:rows]
 
 
 @register_spyre_decompositions([torch.ops.aten.gelu.default])

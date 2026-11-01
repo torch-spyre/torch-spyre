@@ -818,19 +818,121 @@ def topk_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
     if k_var is None:
         return ConstraintResult(allowed_splits=allowed_splits)
 
-    k_size = concretize_expr(ctx.it_space[k_var])
-    legal_k_splits = frozenset(
+    k_split = topk_k_split(concretize_expr(ctx.it_space[k_var]))
+    allowed_splits[k_var] = frozenset({k_split})
+    allowed_splits.update(_topk_input_lx_split_domains(ctx, k_var, k_split))
+    return ConstraintResult(allowed_splits=allowed_splits)
+
+
+def topk_k_split(k: int) -> int:
+    """The k split ``topk_split_domains`` commits TopK's result dim to."""
+    legal_k_splits = [
         split
-        for split in divisors(k_size)
-        if split <= config.sencores and k_size // split <= TOPK_MAX_K_PER_CORE
-    )
+        for split in divisors(k)
+        if split <= config.sencores and k // split <= TOPK_MAX_K_PER_CORE
+    ]
     if not legal_k_splits:
         raise Unsupported(
-            f"topk(k={k_size}): no divisor within {config.sencores} cores gives "
+            f"topk(k={k}): no divisor within {config.sencores} cores gives "
             f"k_per_core <= {TOPK_MAX_K_PER_CORE}."
         )
-    allowed_splits[k_var] = frozenset({min(legal_k_splits)})
-    return ConstraintResult(allowed_splits=allowed_splits)
+    return min(legal_k_splits)
+
+
+# topk.ddl returns wrong values and out-of-range indices, without an error, once a
+# core's input is more than half of the LX Deeptools owns: measured over widths 64 to
+# 1024 and at DXP_LX_FRAC_AVAIL 0.2 and 0.4, it is right exactly up to that bound.
+_TOPK_INPUT_LX_FRACTION_DENOMINATOR = 2
+
+
+def topk_input_lx_budget() -> int:
+    """Input bytes one core may hold for ``topk.ddl`` to be correct."""
+    # Import lazily: the scratchpad allocator imports work division.
+    from .scratchpad.allocator import _LX_TRACKER_CAPACITY_BYTES, _lx_planning_size
+
+    dxp_lx_bytes = _LX_TRACKER_CAPACITY_BYTES - _lx_planning_size()
+    return dxp_lx_bytes // _TOPK_INPUT_LX_FRACTION_DENOMINATOR
+
+
+def _topk_input_lx_split_domains(
+    ctx: WorkDivConstraintContext, k_var: Symbol, k_split: int
+) -> dict[Symbol, frozenset[int]]:
+    """Split TopK's result rows until each core's input fits ``topk.ddl``'s LX bound.
+
+    The search dim is never split and the k split is fixed above, so only the dims
+    shared by the input and the output (the rows) shrink the input a core holds. They
+    share the cores the k split leaves. The input is sized from the iteration space,
+    so a topk tiled by ``for_each_tile`` is held to its tile. Raises Unsupported when
+    the rows cannot reach the bound, rather than produce the template's silently
+    wrong result.
+
+    Only 2-D inputs, where the bound was measured, are held to it; 3-D inputs do
+    not follow it (a [67, 71, 256] topk over dim 0 is right at 12 times it in total).
+    """
+    input_td = ctx.input_tds[0]
+    if len(input_td.layout.size) != 2:
+        return {}
+    input_vars = [
+        var
+        for var in input_td.dep.index.free_symbols
+        if isinstance(var, Symbol) and var in ctx.it_space_adjusted
+    ]
+    input_bytes = input_td.layout.dtype.itemsize * math.prod(
+        concretize_expr(ctx.it_space_adjusted[var]) * ctx.stick_vars.get(var, 1)
+        for var in input_vars
+    )
+    budget = topk_input_lx_budget()
+    needed = -(-input_bytes // budget)
+    if needed <= 1:
+        return {}
+
+    output_vars = {
+        var for var in ctx.output_td.dep.index.free_symbols if isinstance(var, Symbol)
+    }
+    row_vars = sorted(
+        (v for v in output_vars - {k_var} if v in ctx.it_space_adjusted),
+        key=lambda v: -concretize_expr(ctx.it_space_adjusted[v]),
+    )
+    cores_left = config.sencores // k_split
+    splits = topk_row_splits(
+        [concretize_expr(ctx.it_space_adjusted[v]) for v in row_vars],
+        needed,
+        cores_left,
+    )
+    if splits is None:
+        raise Unsupported(
+            f"topk(k={concretize_expr(ctx.it_space[k_var])}): each core's input must "
+            f"stay within {budget} bytes of LX, but {input_bytes} bytes of input over "
+            f"the {cores_left} cores the k split leaves cannot get there; split the "
+            "rows into smaller topk calls."
+        )
+    return {var: split for var, split in zip(row_vars, splits) if split is not None}
+
+
+def topk_row_splits(
+    row_extents: list[int], needed: int, cores: int
+) -> list[frozenset[int] | None] | None:
+    """Split domains that divide TopK's rows ``needed`` ways within ``cores``.
+
+    Greedy over the rows in order, so pass the largest first. A row left free is
+    None. Returns None when the rows cannot be divided that far.
+    """
+    domains: list[frozenset[int] | None] = []
+    for extent in row_extents:
+        if needed <= 1:
+            domains.append(None)
+            continue
+        options = [d for d in divisors(extent) if d <= cores]
+        enough = frozenset(d for d in options if d >= needed)
+        if enough:
+            domains.append(enough)
+            needed = 1
+            continue
+        largest = max(options)
+        domains.append(frozenset({largest}))
+        needed = -(-needed // largest)
+        cores //= largest
+    return domains if needed <= 1 else None
 
 
 def _keep_by_index_axes(ctx: WorkDivConstraintContext) -> set[Symbol] | None:
