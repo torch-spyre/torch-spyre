@@ -19,7 +19,8 @@ SELECT
     cr.ts           AS ts
 FROM test_case_runs AS cr
 LEFT JOIN test_cases AS c
-       ON c.test_case_id = cr.test_case_id AND c.component = cr.component;
+       ON c.test_case_id = cr.test_case_id AND c.component = cr.component
+WHERE cr.props['upload_id'] NOT IN (SELECT toString(upload_id) FROM v_retracted_rounds);
 
 -- Per-case pass history across runs, for the flaky/regressing panel. Grouped on (component,
 -- classname, name), not test_case_id: `tags` is in the identity hash, so re-tagging a test
@@ -43,7 +44,8 @@ SELECT
 FROM test_case_runs AS cr
 INNER JOIN test_cases AS c
         ON c.test_case_id = cr.test_case_id AND c.component = cr.component
-WHERE cr.run_id NOT IN (SELECT run_id FROM v_result_uploads WHERE state = 'retracted')
+WHERE cr.run_id NOT IN (SELECT run_id FROM v_result_uploads WHERE state = 'retracted' AND NOT is_round)
+  AND cr.props['upload_id'] NOT IN (SELECT toString(upload_id) FROM v_retracted_rounds)
 GROUP BY component, classname, name, day;
 
 -- Per-tier counters for one run. The tier is the one its leg was dispatched for
@@ -75,6 +77,7 @@ INNER JOIN
     WHERE result_kind = 'functional'
     GROUP BY run_id
 ) AS leg ON leg.run_id = cr.run_id
+WHERE cr.props['upload_id'] NOT IN (SELECT toString(upload_id) FROM v_retracted_rounds)
 GROUP BY run_id, component, tier;
 
 -- Completeness of a run against its leg's tier: of the cases tagged for that tier, how many
@@ -102,6 +105,7 @@ FROM
         WHERE result_kind = 'functional'
         GROUP BY run_id
     ) AS leg ON leg.run_id = cr.run_id
+    WHERE cr.props['upload_id'] NOT IN (SELECT toString(upload_id) FROM v_retracted_rounds)
     GROUP BY run_id, component, tier
 ) AS ran
 INNER JOIN
