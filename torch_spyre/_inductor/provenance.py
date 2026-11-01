@@ -422,7 +422,10 @@ def _iter_prov_units(target: Any, kind: str) -> list:
     units: list = []
     try:
         if kind == "graphlowering":
-            for op in getattr(target, "operations", []) or []:
+            from .loop_node import all_ops
+
+            # Leaf ops: a LoopNode holds no provenance of its own.
+            for op in all_ops(getattr(target, "operations", []) or []):
                 units.append(op)
         elif kind == "node":
             visited: set[int] = set()
