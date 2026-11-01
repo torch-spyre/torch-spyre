@@ -25,7 +25,7 @@ Ensure that you have access to a pod with a Spyre accelerator and the torch-spyr
 |---|---|---|
 | `foundation-model-stack` (`fms`) | [github.com/foundation-model-stack/foundation-model-stack][fms] (`eager_spyre` branch) | `git clone -b eager_spyre <repo>.git && uv pip install -e ./foundation-model-stack` |
 | `aiu-fms-testing-utils` | [github.com/foundation-model-stack/aiu-fms-testing-utils][aiu-fms] (`eager_spyre` branch) | `git clone -b eager_spyre <repo>.git && uv pip install -e ./aiu-fms-testing-utils` |
-| `aiu-trace-analyzer` (optional) | [github.com/IBM/aiu-trace-analyzer][ata] | `pip install aiu-trace-analyzer` |
+| `aiu-trace-analyzer` (optional) | [github.com/torch-spyre/aiu-trace-analyzer][ata] | `pip install aiu-trace-analyzer` |
 | Granite checkpoint | [huggingface.co/ibm-granite/granite-3.3-8b-instruct](https://huggingface.co/ibm-granite/granite-3.3-8b-instruct) | `hf download ibm-granite/granite-3.3-8b-instruct --local-dir /tmp/models/granite-3.3-8b-instruct` |
 
 The sample commands above are starting points; each upstream README is
@@ -238,5 +238,5 @@ For a Granite-class transformer the typical signals are:
 
 [fms]: https://github.com/foundation-model-stack/foundation-model-stack
 [aiu-fms]: https://github.com/foundation-model-stack/aiu-fms-testing-utils
-[ata]: https://github.com/IBM/aiu-trace-analyzer
+[ata]: https://github.com/torch-spyre/aiu-trace-analyzer
 [rfc-0601]: https://github.com/torch-spyre/rfcs/blob/main/0601-SpyreProfilingToolkit/0601-SpyreProfilingToolkitRFC.md
