@@ -296,10 +296,22 @@ void SpyreStream::copyAsync(const at::Tensor& src,
     // two products are always equal here. Both halves are kept anyway as
     // defense-in-depth, in case the size precondition is ever relaxed or
     // copyAsync gains a caller that bypasses spyre_copy_'s check.
+    //
+    // On big-endian hosts the device is little-endian, and a raw DMA skips
+    // the byte-order conversion that deeptools::ConvertData performs, so
+    // multi-byte elements would arrive byte-swapped. Single-byte elements
+    // have no byte order, so they may still take the raw-DMA fast path.
+    // dci_is_identity_copy requires matching data formats, so the CPU and
+    // device element sizes are equal here.
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    const bool byte_order_safe = cpu_tensor->element_size() == 1;
+#else
+    const bool byte_order_safe = true;
+#endif
     const auto* allocation = get_composite_address(*dev_tensor);
     const size_t dev_total_size = static_cast<size_t>(allocation->total_size());
     const DataConversionInfo* dci_arg =
-        (dci_is_identity_copy(dci) &&
+        (byte_order_safe && dci_is_identity_copy(dci) &&
          static_cast<size_t>(cpu_tensor->numel() *
                              cpu_tensor->element_size()) == dev_total_size &&
          static_cast<size_t>(dev_tensor->numel() *
