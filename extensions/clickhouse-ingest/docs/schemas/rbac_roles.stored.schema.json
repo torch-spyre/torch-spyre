@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "A named set of '<resource>:<action>' permissions; the newest updated_at wins.",
+  "properties": {
+    "active": {},
+    "description": {},
+    "permissions": {},
+    "props": {},
+    "role_id": {
+      "minLength": 1
+    },
+    "updated_at": {},
+    "updated_by": {}
+  },
+  "required": [
+    "role_id",
+    "updated_at",
+    "active",
+    "permissions",
+    "description",
+    "updated_by",
+    "props"
+  ],
+  "title": "rbac_roles: the stored row",
+  "type": "object",
+  "x-uploadable": false
+}
