@@ -52,9 +52,11 @@ them with `PARAMS`, and `pr-review` checks them.
   (`expect_fail`, `expect_fail_unstable`, `expect_raise`), or, when it depends on a
   fixture or parameter, `strict_xfail(request, raises, reason)` from
   `tests/inductor/utils_inductor.py`, which applies the marker from inside the body.
-  (`expected_unimplemented` in `tests/inductor/test_solver_auto_coarse_tiling.py` is
-  the one exception: it xfails only on the expected error and fails if the body
-  passes.)
+  (`_check_tiling_discovered` in `tests/inductor/test_solver_auto_coarse_tiling.py`
+  is the one exception. Its `pytest.xfail` runs last, after the result has been
+  checked against CPU, and only when the simulated-annealing solver leaves a case
+  untiled whose `sa_may_stay_untiled` says its cost model prefers untiled. A tiled
+  result passes.)
 - **A failure that kills the process (SIGFPE, SIGABRT, a hang) is a skip, not an
   xfail**, because the run dies with it. Cite an issue in the reason.
 
