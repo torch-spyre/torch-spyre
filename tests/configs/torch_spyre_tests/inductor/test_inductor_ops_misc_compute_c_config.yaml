@@ -8,8 +8,6 @@
 # compute group, assign it to whichever shard keeps the jobs balanced.
 
 test_suite_config:
-  # 9.3 min as one job (run 41202882088); split so each shard is ~4.7 min.
-  shards: 2
   labels: [unit, regression, integration, trunk]
   files:
     - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops.py

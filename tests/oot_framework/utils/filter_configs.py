@@ -163,6 +163,84 @@ def _suite_flags(flags_map: dict, rel: str) -> str:
     return flags_map[max(prefixes, key=len)] if prefixes else ""
 
 
+# Map files (runner, flags, layout) key configs relative to tests/configs/torch_spyre_tests/,
+# but trunk scans tests/configs, where the same file is torch_spyre_tests/<key>. Look keys up
+# under that one root whichever directory was scanned, or a map entry silently stops applying.
+MAP_ROOT = "torch_spyre_tests/"
+
+
+def _map_key(rel: str) -> str:
+    return rel[len(MAP_ROOT) :] if rel.startswith(MAP_ROOT) else rel
+
+
+def _load_layout(map_path: str) -> dict:
+    """{config key: {"shards": N} | {"bucket": name}} from --layout-map (.github/suite_layout.yaml)."""
+    path = Path(map_path)
+    if not path.is_file():
+        sys.exit(f"ERROR: layout map not found: {path}")
+    with path.open() as fh:
+        data = yaml.safe_load(fh) or {}
+    for key, v in data.items():
+        ok = isinstance(v, dict) and (
+            (set(v) == {"shards"} and isinstance(v["shards"], int) and v["shards"] >= 2)
+            or (set(v) == {"bucket"} and isinstance(v["bucket"], str) and v["bucket"])
+        )
+        if not ok:
+            sys.exit(
+                f"ERROR: {path}: {key}: expected {{shards: N>=2}} or {{bucket: <name>}}, got {v!r}"
+            )
+    return data
+
+
+def _bucket_facts(path: Path) -> tuple:
+    """(global block, test file paths) of a config, for the bucket safety checks."""
+    with path.open() as fh:
+        raw = yaml.safe_load(fh) or {}
+    tsc = raw.get("test_suite_config") or {}
+    return tsc.get("global"), [str(f.get("path", "")) for f in tsc.get("files") or []]
+
+
+def _fold_buckets(results: list) -> list:
+    """Fold configs that share a layout bucket into one matrix entry, after tier filtering.
+
+    Exits rather than running a bucket that would behave differently from its members run alone:
+    members must share runner, flags and `global:` block (run_test.sh unions global lists, and an
+    absent list means no filter), must not name the same test file (the merge keeps the first
+    config's unlisted_test_mode for a shared path), and must not be sharded (the shard env vars
+    are job-wide). A bucket left with one member after tier filtering runs as a plain config.
+    """
+    out, buckets = [], {}
+    for r in results:
+        b = r.get("bucket")
+        if not b:
+            out.append(r)
+            continue
+        if b not in buckets:
+            buckets[b] = dict(r, members=[r])
+            out.append(buckets[b])
+            continue
+        g = buckets[b]
+        for field in ("runner", "flags", "global"):
+            if r[field] != g[field]:
+                sys.exit(
+                    f"ERROR: bucket {b!r}: {r['config']} and {g['config']} differ in {field}"
+                )
+        shared = set(r["files"]) & {f for m in g["members"] for f in m["files"]}
+        if shared:
+            sys.exit(
+                f"ERROR: bucket {b!r}: {r['config']} shares test file(s) {sorted(shared)} with another member"
+            )
+        g["members"].append(r)
+    for g in out:
+        members = g.pop("members", None)
+        if not members or len(members) < 2:
+            continue
+        g["configs"] = " ".join(m["config"] for m in members)
+        g["report"] = f"bucket_{g['bucket']}"
+        g["name"] = f"Bucket {g['bucket']} ({len(members)} suites)"
+    return out
+
+
 # The tier ladder. A config's labels also carry suite groups and one-off markers;
 # those are not tiers and must never make a config look already-covered.
 TIER_LABELS = ("smoke", "unit", "integration", "regression", "trunk")
@@ -275,6 +353,12 @@ def main() -> None:
             "'matrix-json': GitHub Actions dynamic-matrix JSON."
         ),
     )
+    ap.add_argument(
+        "--layout-map",
+        metavar="YAML_FILE",
+        default=None,
+        help="Optional .github/suite_layout.yaml: per config, {shards: N} or {bucket: name}.",
+    )
     args = ap.parse_args()
 
     config_dir = Path(args.config_dir).resolve()
@@ -292,6 +376,7 @@ def main() -> None:
     if args.runner_map:
         runner_map = _load_path_map(args.runner_map)
     flags_map: dict = _load_path_map(args.flags_map) if args.flags_map else {}
+    layout: dict = _load_layout(args.layout_map) if args.layout_map else {}
 
     results = []
     skipped_covered = 0
@@ -307,14 +392,20 @@ def main() -> None:
             skipped_covered += 1
             continue
         rel = str(cfg.relative_to(config_dir))
+        key = _map_key(rel)
+        lay = layout.get(key, {})
+        glob, files = _bucket_facts(cfg)
         results.append(
             {
                 "name": _display_name(cfg, config_dir),
                 "config": rel,
-                "runner": runner_map.get(rel, "spyre_pf_x1"),
-                "flags": _suite_flags(flags_map, rel),
+                "runner": runner_map.get(key, "spyre_pf_x1"),
+                "flags": _suite_flags(flags_map, key),
                 "path": str(cfg),
-                "shards": _load_shards(cfg),
+                "shards": lay.get("shards") or _load_shards(cfg),
+                "bucket": lay.get("bucket", ""),
+                "global": glob,
+                "files": files,
             }
         )
 
@@ -334,6 +425,12 @@ def main() -> None:
     if args.format == "paths":
         print(" ".join(r["path"] for r in results))
     else:
+        for r in results:
+            if r["bucket"] and r["shards"] > 1:
+                sys.exit(
+                    f"ERROR: {r['config']} is both sharded and in bucket {r['bucket']!r}"
+                )
+        results = _fold_buckets(results)
         matrix = []
         for r in results:
             entry = {
@@ -341,6 +438,11 @@ def main() -> None:
                 "config": r["config"],
                 "runner": r["runner"],
                 **({"extra_test_flags": r["flags"]} if r["flags"] else {}),
+                **(
+                    {"configs": r["configs"], "report": r["report"]}
+                    if r.get("configs")
+                    else {}
+                ),
             }
             n = r["shards"]
             if n == 1:

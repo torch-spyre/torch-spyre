@@ -230,3 +230,143 @@ def test_durations_found_by_key_balance_the_split():
         loads.append(sum(durations[duration_key(i)] for i in kept))
     # Balanced: the 600 s test sits alone; the 19 short ones (190 s) go to the other shard.
     assert sorted(loads) == [190.0, 600.0]
+
+
+def _matrix(tmp_path, configs, layout, extra=()):
+    """Run filter_configs.py on a temp config tree with a --layout-map; (returncode, suites, stderr)."""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    cfgdir = tmp_path / "configs"
+    for rel, body in configs.items():
+        p = cfgdir / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(body)
+    lay = tmp_path / "layout.yaml"
+    lay.write_text(layout)
+    script = Path(__file__).resolve().parent / "utils" / "filter_configs.py"
+    r = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--config-dir",
+            str(cfgdir),
+            "--test-type",
+            "regression",
+            "--layout-map",
+            str(lay),
+            "--format",
+            "matrix-json",
+            *extra,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    suites = json.loads(r.stdout)["suite"] if r.returncode == 0 else []
+    return r.returncode, suites, r.stderr
+
+
+def _cfg(path, glob=""):
+    g = f"  global:\n    {glob}\n" if glob else ""
+    return (
+        f"test_suite_config:\n  labels: [regression]\n{g}  files:\n    - path: {path}\n"
+    )
+
+
+def test_layout_buckets_and_shards(tmp_path):
+    rc, suites, err = _matrix(
+        tmp_path,
+        {
+            "inductor/test_a_config.yaml": _cfg(
+                "${TORCH_DEVICE_ROOT}/tests/inductor/test_a.py"
+            ),
+            "inductor/test_b_config.yaml": _cfg(
+                "${TORCH_DEVICE_ROOT}/tests/inductor/test_b.py"
+            ),
+            "inductor/test_big_config.yaml": _cfg(
+                "${TORCH_DEVICE_ROOT}/tests/inductor/test_big.py"
+            ),
+            "inductor/test_alone_config.yaml": _cfg(
+                "${TORCH_DEVICE_ROOT}/tests/inductor/test_alone.py"
+            ),
+        },
+        "inductor/test_a_config.yaml: {bucket: b1}\n"
+        "inductor/test_b_config.yaml: {bucket: b1}\n"
+        "inductor/test_big_config.yaml: {shards: 2}\n",
+    )
+    assert rc == 0, err
+    bucket = [s for s in suites if s.get("configs")]
+    assert len(bucket) == 1
+    assert bucket[0]["configs"].split() == [
+        "inductor/test_a_config.yaml",
+        "inductor/test_b_config.yaml",
+    ]
+    assert bucket[0]["report"] == "bucket_b1"
+    assert [
+        (s["shard_id"], s["num_shards"]) for s in suites if s.get("num_shards")
+    ] == [(0, 2), (1, 2)]
+    assert [
+        s["config"] for s in suites if not s.get("configs") and not s.get("num_shards")
+    ] == ["inductor/test_alone_config.yaml"]
+
+
+def test_layout_rejects_unsafe_buckets(tmp_path):
+    # members that name the same test file: the merge keeps only the first config's mode for it
+    rc, _, err = _matrix(
+        tmp_path,
+        {
+            "inductor/test_a_config.yaml": _cfg(
+                "${TORCH_DEVICE_ROOT}/tests/inductor/test_shared.py"
+            ),
+            "inductor/test_b_config.yaml": _cfg(
+                "${TORCH_DEVICE_ROOT}/tests/inductor/test_shared.py"
+            ),
+        },
+        "inductor/test_a_config.yaml: {bucket: b1}\ninductor/test_b_config.yaml: {bucket: b1}\n",
+    )
+    assert rc != 0 and "shares test file" in err
+    # differing global blocks would union each other's dtype lists
+    rc, _, err = _matrix(
+        tmp_path / "g",
+        {
+            "inductor/test_a_config.yaml": _cfg(
+                "${TORCH_DEVICE_ROOT}/tests/inductor/test_a.py",
+                "supported_dtypes: [float16]",
+            ),
+            "inductor/test_b_config.yaml": _cfg(
+                "${TORCH_DEVICE_ROOT}/tests/inductor/test_b.py"
+            ),
+        },
+        "inductor/test_a_config.yaml: {bucket: b1}\ninductor/test_b_config.yaml: {bucket: b1}\n",
+    )
+    assert rc != 0 and "differ in global" in err
+    # a malformed layout entry is an error, not a silent no-op
+    rc, _, err = _matrix(
+        tmp_path / "m",
+        {
+            "inductor/test_a_config.yaml": _cfg(
+                "${TORCH_DEVICE_ROOT}/tests/inductor/test_a.py"
+            ),
+        },
+        "inductor/test_a_config.yaml: {shards: 1}\n",
+    )
+    assert rc != 0 and "expected" in err
+
+
+def test_layout_keys_apply_when_scanning_the_parent_dir(tmp_path):
+    # trunk scans tests/configs, where a config is torch_spyre_tests/<key>; the layout still applies
+    rc, suites, err = _matrix(
+        tmp_path,
+        {
+            "torch_spyre_tests/inductor/test_a_config.yaml": _cfg(
+                "${TORCH_DEVICE_ROOT}/tests/inductor/test_a.py"
+            ),
+            "torch_spyre_tests/inductor/test_b_config.yaml": _cfg(
+                "${TORCH_DEVICE_ROOT}/tests/inductor/test_b.py"
+            ),
+        },
+        "inductor/test_a_config.yaml: {bucket: b1}\ninductor/test_b_config.yaml: {bucket: b1}\n",
+    )
+    assert rc == 0, err
+    assert [s.get("report") for s in suites] == ["bucket_b1"]

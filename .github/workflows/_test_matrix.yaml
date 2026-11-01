@@ -360,6 +360,7 @@ jobs:
               "${_delta_args[@]}" \
               --runner-map .github/runner_overrides.yaml \
               --flags-map .github/suite_test_flags.yaml \
+              --layout-map .github/suite_layout.yaml \
               --format matrix-json)
           else
             CONFIG_ROOT=tests/configs/torch_spyre_tests
@@ -369,6 +370,7 @@ jobs:
               "${_delta_args[@]}" \
               --runner-map .github/runner_overrides.yaml \
               --flags-map .github/suite_test_flags.yaml \
+              --layout-map .github/suite_layout.yaml \
               --format matrix-json)
           fi
 
@@ -693,7 +695,9 @@ jobs:
       - name: Derive report paths
         run: |
           CONFIG="${{ matrix.suite.config }}"
-          REPORT_NAME="$(basename "${CONFIG%.yaml}")"
+          # A bucket (several configs in one job, .github/suite_layout.yaml) is named after the bucket.
+          REPORT_STEM="${{ matrix.suite.report }}"
+          REPORT_NAME="${REPORT_STEM:-$(basename "${CONFIG%.yaml}")}"
           # Shards of one config must not share a report name: the upload below uses
           # overwrite: true, so a second shard would silently replace the first's results.
           if [ -n "${SPYRE_TEST_NUM_SHARDS}" ]; then
@@ -705,6 +709,12 @@ jobs:
           REPORT_NAME="${REPORT_NAME}.xml"
           echo "REPORT_NAME=${REPORT_NAME}" >> "$GITHUB_ENV"
           echo "REPORT_PATH=${GITHUB_WORKSPACE}/${REPORT_NAME}" >> "$GITHUB_ENV"
+          # Every member of a bucket, root-qualified; one path for anything else.
+          MEMBERS="${{ matrix.suite.configs }}"
+          ROOT="${{ needs.generate_matrix.outputs.config_root }}"
+          CONFIG_PATHS=""
+          for m in ${MEMBERS:-$CONFIG}; do CONFIG_PATHS="${CONFIG_PATHS:+$CONFIG_PATHS }${ROOT}/${m}"; done
+          echo "CONFIG_PATHS=${CONFIG_PATHS}" >> "$GITHUB_ENV"
 
       - name: Run ${{ matrix.suite.name }} tests
         id: run_tests
@@ -712,7 +722,7 @@ jobs:
         with:
           suite_name: ${{ matrix.suite.name }}
           # matrix.suite.config is relative to the dir generate_matrix scanned.
-          config: ${{ format('{0}/{1}', needs.generate_matrix.outputs.config_root, matrix.suite.config) }}
+          config: ${{ env.CONFIG_PATHS }}
           # Prebaked: run FROM the baked source dir + its SHARED venv at
           # $HOME/.venv (a sibling of the source, not inside it); normal: the
           # checkout (default 'torch-spyre') + its local '.venv'.
@@ -1522,7 +1532,9 @@ jobs:
       - name: Derive report paths
         run: |
           CONFIG="${{ matrix.suite.config }}"
-          REPORT_NAME="$(basename "${CONFIG%.yaml}")"
+          # A bucket (several configs in one job, .github/suite_layout.yaml) is named after the bucket.
+          REPORT_STEM="${{ matrix.suite.report }}"
+          REPORT_NAME="${REPORT_STEM:-$(basename "${CONFIG%.yaml}")}"
           if [ -n "${SPYRE_TEST_NUM_SHARDS}" ]; then
             REPORT_NAME="${REPORT_NAME}-shard$((SPYRE_TEST_SHARD_ID + 1))of${SPYRE_TEST_NUM_SHARDS}"
             # Recorded per-test durations balance the split; without them shards fall back to a hash split.
@@ -1532,6 +1544,12 @@ jobs:
           REPORT_NAME="${REPORT_NAME}.xml"
           echo "REPORT_NAME=${REPORT_NAME}" >> "$GITHUB_ENV"
           echo "REPORT_PATH=${GITHUB_WORKSPACE}/${REPORT_NAME}" >> "$GITHUB_ENV"
+          # Every member of a bucket, root-qualified; one path for anything else.
+          MEMBERS="${{ matrix.suite.configs }}"
+          ROOT="${{ needs.generate_matrix.outputs.config_root }}"
+          CONFIG_PATHS=""
+          for m in ${MEMBERS:-$CONFIG}; do CONFIG_PATHS="${CONFIG_PATHS:+$CONFIG_PATHS }${ROOT}/${m}"; done
+          echo "CONFIG_PATHS=${CONFIG_PATHS}" >> "$GITHUB_ENV"
 
       # The first attempt's report, which this job's upload overwrites; kept as prior_* props.
       - name: Download the first attempt's JUnit XML report
@@ -1548,7 +1566,7 @@ jobs:
           retried: pod
           replaced_junit_xml: ${{ runner.temp }}/replaced-report/${{ env.REPORT_NAME }}
           suite_name: ${{ matrix.suite.name }}
-          config: ${{ format('{0}/{1}', needs.generate_matrix.outputs.config_root, matrix.suite.config) }}
+          config: ${{ env.CONFIG_PATHS }}
           torch_spyre_dir: ${{ inputs.prebaked_image && env.PREBAKED_TORCH_SPYRE_DIR || 'torch-spyre' }}
           venv_path: ${{ inputs.prebaked_image && env.PREBAKED_VENV_PATH || '.venv' }}
           extra_test_flags: ${{ matrix.suite.extra_test_flags || inputs.extra_test_flags }}
