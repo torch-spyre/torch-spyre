@@ -139,7 +139,9 @@ def _load_shards(path: Path) -> int:
         raw = yaml.safe_load(fh) or {}
     n = (raw.get("test_suite_config") or {}).get("shards", 1)
     if isinstance(n, bool) or not isinstance(n, int) or n < 1:
-        sys.exit(f"ERROR: {path}: test_suite_config.shards must be a positive integer, got {n!r}")
+        sys.exit(
+            f"ERROR: {path}: test_suite_config.shards must be a positive integer, got {n!r}"
+        )
     return n
 
 
@@ -347,8 +349,14 @@ def main() -> None:
             # One job per shard. shard_id/num_shards reach pytest as SPYRE_TEST_SHARD_ID /
             # SPYRE_TEST_NUM_SHARDS (see utils/shard.py); the name keeps job and report distinct.
             for k in range(n):
-                matrix.append({**entry, "name": f"{r['name']} ({k + 1}/{n})",
-                               "shard_id": k, "num_shards": n})
+                matrix.append(
+                    {
+                        **entry,
+                        "name": f"{r['name']} ({k + 1}/{n})",
+                        "shard_id": k,
+                        "num_shards": n,
+                    }
+                )
         print(json.dumps({"suite": matrix}))
 
 

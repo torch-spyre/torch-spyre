@@ -11,6 +11,7 @@ Assignment is deterministic, so every job computes the same partition without co
   - Without one, each test goes to sha1(nodeid) % N.
 Ties in the greedy pass break on nodeid, so the result never depends on collection order.
 """
+
 import gzip
 import hashlib
 import json
@@ -34,8 +35,10 @@ def shard_from_env(environ=os.environ) -> Optional[Tuple[int, int]]:
     if not raw_n and not raw_k:
         return None
     if not raw_n or not raw_k:
-        raise ValueError(f"{ENV_SHARD_ID} and {ENV_NUM_SHARDS} must be set together "
-                         f"(got {raw_k!r}, {raw_n!r})")
+        raise ValueError(
+            f"{ENV_SHARD_ID} and {ENV_NUM_SHARDS} must be set together "
+            f"(got {raw_k!r}, {raw_n!r})"
+        )
     n, k = int(raw_n), int(raw_k)
     if n < 1 or not 0 <= k < n:
         raise ValueError(f"shard {k} out of range for {n} shard(s)")
@@ -55,15 +58,24 @@ def load_durations(path: Optional[str]) -> Dict[str, float]:
             data = json.load(fh)
     except (OSError, ValueError):
         return {}
-    return {str(k): float(v) for k, v in data.items() if isinstance(v, (int, float)) and v >= 0}
+    return {
+        str(k): float(v)
+        for k, v in data.items()
+        if isinstance(v, (int, float)) and v >= 0
+    }
 
 
-def assign(nodeids: Sequence[str], num_shards: int,
-           durations: Optional[Dict[str, float]] = None) -> Dict[str, int]:
+def assign(
+    nodeids: Sequence[str],
+    num_shards: int,
+    durations: Optional[Dict[str, float]] = None,
+) -> Dict[str, int]:
     """nodeid -> shard index, the same on every job for the same inputs."""
     if not durations:
-        return {n: int(hashlib.sha1(n.encode("utf-8")).hexdigest(), 16) % num_shards
-                for n in nodeids}
+        return {
+            n: int(hashlib.sha1(n.encode("utf-8")).hexdigest(), 16) % num_shards
+            for n in nodeids
+        }
     known = [durations[n] for n in nodeids if n in durations]
     default = statistics.median(known) if known else 1.0
     weight = {n: durations.get(n, default) for n in nodeids}
@@ -91,7 +103,11 @@ def duration_key(item) -> str:
     if stem.endswith(_WRAPPER_SUFFIX):
         stem = stem[: -len(_WRAPPER_SUFFIX)]
     cls = getattr(item, "cls", None)
-    parts = [stem] + ([cls.__name__] if cls is not None else []) + [getattr(item, "name", "")]
+    parts = (
+        [stem]
+        + ([cls.__name__] if cls is not None else [])
+        + [getattr(item, "name", "")]
+    )
     return "::".join(parts)
 
 

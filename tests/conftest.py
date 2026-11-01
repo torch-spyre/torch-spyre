@@ -541,7 +541,9 @@ def pytest_collection_modifyitems(config, items):
     # After every other filter, so each shard splits exactly the set an unsharded run keeps.
     shard = shard_from_env()
     if shard is not None:
-        kept, dropped = select_shard(items, shard, load_durations(os.environ.get(ENV_DURATIONS)))
+        kept, dropped = select_shard(
+            items, shard, load_durations(os.environ.get(ENV_DURATIONS))
+        )
         if dropped:
             config.hook.pytest_deselected(items=dropped)
             items[:] = kept
