@@ -372,6 +372,40 @@ def test_relayout_fires_naturally_on_a_hinted_graph(monkeypatch):
     torch.testing.assert_close(out.cpu(), ref, rtol=1e-3, atol=1e-3)
 
 
+def test_relayout_off_spills_the_hinted_edge(monkeypatch):
+    """``lx_solver_relayout=False`` on the graph above: the solver that fires the
+    relayout there is offered none, so the edge spills and nothing is emitted.
+    The cost-model sweep's RL_MODE=off measures exactly this."""
+    import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
+    from torch_spyre._inductor import spyre_hint
+
+    observed = _Observed(monkeypatch, force=False)
+
+    def fn(t):
+        with spyre_hint(work_div={"B": 4, "M": 2}):
+            hidden = torch.neg(t)
+        with spyre_hint(work_div={"B": 2, "M": 4}):
+            return torch.relu(hidden)
+
+    torch.manual_seed(0)
+    host = torch.randn(8, 256, 512, dtype=torch.float16)
+    for name, size in (("B", 8), ("M", 256), ("K", 512)):
+        _pnd.declare_tensor_dim(name, size)
+    x = _pnd.name_tensor_dims(host.to("spyre"), ["B", "M", "K"])
+    with config.patch(
+        {
+            "co_optimizing_lx_planning": True,
+            "layout_solver": "cpsat",
+            "lx_solver_relayout": False,
+        }
+    ):
+        out = torch.compile(fn, dynamic=False)(x)
+
+    observed.assert_nothing_emitted()
+    ref = torch.relu(torch.neg(host.float())).to(torch.float16)
+    torch.testing.assert_close(out.cpu(), ref, rtol=1e-3, atol=1e-3)
+
+
 @pytest.mark.parametrize("fragments", [8, 10])
 def test_gather_respects_shuffle_register_budget(monkeypatch, fragments):
     """Keep an eight-way LX gather; replan a ten-way gather through HBM.

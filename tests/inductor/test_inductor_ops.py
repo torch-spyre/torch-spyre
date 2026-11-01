@@ -8669,15 +8669,32 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
         },
         ("test_repeat", "test_repeat_cpu"): {
+            "ops_dict": {
+                "default": lambda x, repeats, shape: x.repeat(*repeats),
+                "out": lambda x, repeats, shape: torch.ops.aten.repeat.out(
+                    x, list(repeats), out=x.new_empty(shape)
+                ),
+            },
             "param_sets": {
-                "1d_1": (cached_randn((64), dtype=torch.float16), 1),
-                "1d_1_int32": (torch.randint(0, 100, (64,), dtype=torch.int32), 1),
-                "1d_1_size1": (cached_randn((1), dtype=torch.float16), 1),
-                "1d_1_size1_int32": (torch.randint(0, 100, (1,), dtype=torch.int32), 1),
-                "2d_3x2": (cached_randn((2, 64), dtype=torch.float16), 3, 2),
-                "2d_4x6": (cached_randn((2, 64), dtype=torch.float16), 4, 6),
-                "2d_1x1": (cached_randn((2, 64), dtype=torch.float16), 1, 1),
-                "3d_8x6x4": (cached_randn((2, 3, 64), dtype=torch.float16), 8, 6, 4),
+                "1d_1": (cached_randn((64), dtype=torch.float16), (1,)),
+                "1d_1_int32": (torch.randint(0, 100, (64,), dtype=torch.int32), (1,)),
+                "1d_1_size1": (cached_randn((1), dtype=torch.float16), (1,)),
+                "1d_1_size1_int32": (
+                    torch.randint(0, 100, (1,), dtype=torch.int32),
+                    (1,),
+                ),
+                "1d_fp32": (cached_randn((64), dtype=torch.float32), (4,)),
+                "2d_3x2": (cached_randn((2, 64), dtype=torch.float16), (3, 2)),
+                "2d_4x6": (cached_randn((2, 64), dtype=torch.float16), (4, 6)),
+                "2d_1x1": (cached_randn((2, 64), dtype=torch.float16), (1, 1)),
+                "2d_fp32": (cached_randn((2, 64), dtype=torch.float32), (3, 2)),
+                "2d_int64": (
+                    torch.randint(0, 100, (2, 64), dtype=torch.int64),
+                    (3, 2),
+                ),
+                # A single position id repeated along the stick (fms positions).
+                "2d_1x1_int64": (torch.tensor([[382]], dtype=torch.int64), (1, 64)),
+                "3d_8x6x4": (cached_randn((2, 3, 64), dtype=torch.float16), (8, 6, 4)),
             },
         },
         # TODO: torch.prod(x) (reduction over all tensor elements) is not yet
@@ -13606,11 +13623,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=True,
         )
 
-    def test_repeat_cpu(self, x, *repeat_args):
-        def fn(a):
-            return a.repeat(*repeat_args)
-
-        self.compare_with_cpu(fn, x, run_eager=False)
+    def test_repeat_cpu(self, op, x, repeats):
+        shape = x.repeat(*repeats).shape
+        self.compare_with_cpu(lambda a: op(a, repeats, shape), x)
 
     def test_unfold_cpu(self, dimension, size, step, x):
         """Test unfold operation (view only, no contiguous).

@@ -15,5 +15,5 @@ questions, see [Debugging](../debugging/index.md).
 | Scratchpad utilization | *Planned* | [RFC 0601][rfc-0601] |
 | IR-instrumentation profiling | *Planned* | [RFC 0601][rfc-0601] |
 
-[ata]: https://github.com/IBM/aiu-trace-analyzer
+[ata]: https://github.com/torch-spyre/aiu-trace-analyzer
 [rfc-0601]: https://github.com/torch-spyre/rfcs/blob/main/0601-SpyreProfilingToolkit/0601-SpyreProfilingToolkitRFC.md

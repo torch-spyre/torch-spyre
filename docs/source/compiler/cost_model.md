@@ -521,7 +521,7 @@ checkout builds its own database from zero:
 ```bash
 python3 docs/source/user_guide/examples/run_cost_model_sweep.py --dry-run   # what it would run
 python3 docs/source/user_guide/examples/run_cost_model_sweep.py --limit 20  # a timed pilot
-python3 docs/source/user_guide/examples/run_cost_model_sweep.py             # 1632 configurations
+python3 docs/source/user_guide/examples/run_cost_model_sweep.py             # 1762 configurations
 python3 tools/cost_model/eval_model.py                                      # score, no hardware
 ```
 
