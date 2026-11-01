@@ -3315,7 +3315,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 for output_name in feature_names
             }
             bundle_terms = predict_bundles(
-                pricing_ops, op_features, params=_COST_PARAMS
+                pricing_ops,
+                op_features,
+                params=replace(_COST_PARAMS, restore_matmul_split_preferences=True),
             )
             cost_expr = sympy.sympify(sum(term for _, term in bundle_terms))
         except (ValueError, RuntimeError, TypeError) as e:
