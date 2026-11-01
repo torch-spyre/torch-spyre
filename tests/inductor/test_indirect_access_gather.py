@@ -474,6 +474,38 @@ class _GatherScenarios:
         # check() asserts that (assert_indirect_source_indexed_dim_outermost).
         self._stage_and_e2e(lambda k, i: k[i], keys, slot_idxs, expect=GATHER_OP_SPEC)
 
+    def test_gather_dim1_broadcast_index(self):
+        """logits.gather(1, pos.view(-1, 1, 1).expand(-1, 1, V)) -- #4840.
+
+        Decode-step last-token extraction, logits[b, pos[b], :]. Inductor drops
+        the expanded (stride-0) index dims, so the value is read at
+        x[b, IndirectAccess(pos[b]), v]: the batch dim b drives the index load
+        and also addresses the value directly.
+        """
+        B, T, V = 12, 4, 512
+        x = self.to_spyre(torch.rand(B, T, V, dtype=torch.float16))
+        pos = torch.randint(0, T, (B,), dtype=torch.int64).to("spyre")
+        self.name_dims(x, {"B": B, "T": T, "V": V})
+        self.name_dims(pos, {"B": B})
+
+        def kernel(x, pos):
+            idx = pos.view(-1, 1, 1).expand(-1, 1, x.shape[-1])
+            return x.gather(1, idx).squeeze(1)
+
+        self._stage_and_e2e(kernel, x, pos, expect=GATHER_OP_SPEC)
+
+    def test_gather_dim0_broadcast_index(self):
+        """x.gather(0, idx.expand(P, N)) with idx[P, 1] -- whole rows, no prefix."""
+        M, N, P = 64, 256, 8
+        x = self.to_spyre(torch.rand(M, N, dtype=torch.float16))
+        idx = torch.randint(0, M, (P, 1), dtype=torch.int64).to("spyre")
+        self.name_dims(x, {"M": M, "N": N})
+
+        def kernel(x, idx):
+            return x.gather(0, idx.expand(-1, x.shape[-1]))
+
+        self._stage_and_e2e(kernel, x, idx, expect=GATHER_OP_SPEC)
+
     def test_gather_multistick_source_indexed_dim_outermost(self):
         """Gather whose source rows span several sticks: the source relayout must
         put the indexed dim outermost in the OpSpec device coordinates.

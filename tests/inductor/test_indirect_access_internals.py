@@ -848,6 +848,63 @@ class TestMaskedScatterRejectReason(IndirectAccessTestCase):
         self.assertIn("rank", reason)
 
 
+class TestFoldSharedDimHandler(IndirectAccessTestCase):
+    """`_FoldSharedDimHandler`: the inner_fn rewrite of fold_shared_indirect_dims.
+
+    Device-free: drives the handler with a recording ops handler, using the #4840
+    load pattern (index `pos[d0]`, value `2048*d0 + 512*s + d1` on a [12, 4, 512]
+    source), and checks the exact rewrite it forwards.
+    """
+
+    class _RecordingOps:
+        def __init__(self):
+            self.loads = []
+            self.sizes = []
+
+        def load(self, name, index):
+            self.loads.append((name, index))
+            return f"v{len(self.loads)}"
+
+        def indirect_indexing(self, var, size, check=True, wrap_neg=True):
+            self.sizes.append(size)
+            return sympy.Symbol("s")
+
+    def _handler(self):
+        from torch_spyre._inductor.fold_shared_indirect_dims import (
+            _FoldPlan,
+            _FoldSharedDimHandler,
+        )
+
+        plan = _FoldPlan(
+            index_name="pos",
+            value_name="x",
+            index_coeff=1,
+            value_coeff=2048,
+            step=4,
+            extent=12,
+            index_dim=0,
+        )
+        inner = self._RecordingOps()
+        return inner, _FoldSharedDimHandler(inner, plan, "rows")
+
+    def test_reads_rows_and_drops_shared_term(self):
+        d0, d1 = sympy.symbols("d0 d1")
+        inner, handler = self._handler()
+        s = handler.indirect_indexing(handler.load("pos", d0), 4)
+        handler.load("x", 2048 * d0 + 512 * s + d1)
+        self.assertEqual(inner.loads, [("rows", d0), ("x", 512 * s + d1)])
+        # The folded row index covers all 12 blocks of 4 rows.
+        self.assertEqual(inner.sizes, [48])
+
+    def test_other_loads_untouched(self):
+        d0, d1 = sympy.symbols("d0 d1")
+        inner, handler = self._handler()
+        handler.load("y", d0 + d1)
+        # Without the index load first, the value address is left as is.
+        handler.load("x", 2048 * d0 + d1)
+        self.assertEqual(inner.loads, [("y", d0 + d1), ("x", 2048 * d0 + d1)])
+
+
 if __name__ == "__main__":
     from torch._inductor.test_case import run_tests
 
