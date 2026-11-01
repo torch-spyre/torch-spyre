@@ -37,7 +37,11 @@ stick multiple) still copies correctly at offset 192 (3 sticks) but errors at
 offset 96 (1.5 sticks). _validate_reoffset_supported in lower_spyre_from_d2d
 surfaces this rejection early with an actionable message; see
 test_unaligned_offset_raises{,_select} and
-test_stick_multiple_offset_unaligned_inner_dim_ok.
+test_stick_multiple_offset_unaligned_inner_dim_ok. The eager dispatcher checks
+the same rule before compiling (issue #4329): an unaligned SOURCE view is staged
+through the host instead, so ``clone()`` of such a view is correct rather than
+refused, and only a direct ``spyre::copy_from_d2d`` call (or an unaligned
+DESTINATION offset) still reaches the lowering guard.
 
 An offset that falls INSIDE the stick dim (a column narrow at a stick-aligned
 offset) used to be a silent-wrong-data case: the copy reads the source as a
@@ -119,7 +123,8 @@ class TestCopyFromD2DContiguousOffsets(unittest.TestCase):
         torch.testing.assert_close(out.cpu(), x.cpu()[:, 64:128])
 
     def test_unaligned_offset_raises(self):
-        """A storage_offset that is not a whole number of sticks is rejected.
+        """A storage_offset that is not a whole number of sticks is rejected by
+        the d2d lowering, and eager routes around that rejection.
 
         REQUIREMENT (not a missing feature). The re-injected offset must step by
         complete sticks: the innermost device dim holds elems_per_stick elements
@@ -130,34 +135,46 @@ class TestCopyFromD2DContiguousOffsets(unittest.TestCase):
         "no mechanism to resolve stick incompatibility".
 
         The rule keys on the OFFSET, not the inner-dim size. reshape(4, 100)
-        row 2 has offset 200 (200 % 64 != 0), so _validate_reoffset_supported in
-        lower_spyre_from_d2d raises Unsupported at lowering time — surfacing the
-        rejection early with an actionable message instead of the cryptic
-        downstream restickify error. Row 0 (offset 0) is always fine."""
+        row 2 has offset 200 (200 % 64 != 0). A direct ``spyre::copy_from_d2d``
+        with that offset hits _validate_reoffset_supported in
+        lower_spyre_from_d2d, which raises Unsupported at lowering time with an
+        actionable message instead of the cryptic downstream restickify error.
+        Eager ``clone()`` of the same view applies the rule up front and stages
+        the view through the host instead (issue #4329), so it is correct rather
+        than refused. Row 0 (offset 0) is always fine."""
         x = torch.arange(4 * 100, dtype=DTYPE, device=DEVICE).reshape(4, 100)
         # offset 0 -> guard no-op, must succeed and be correct
         a = x.narrow(0, 0, 1).clone()
         torch.testing.assert_close(a.cpu(), x.cpu()[0:1])
-        # offset 200 is not a stick multiple -> clean compile-time error
+        # offset 200 is not a stick multiple: the lowering guard rejects a
+        # direct d2d copy with a clean compile-time error ...
+        src = x.narrow(0, 2, 1)
+        dst = torch.empty_like(src)
         with self.assertRaises(Exception) as cm:
-            x.narrow(0, 2, 1).clone()
+            torch.ops.spyre.copy_from_d2d(src, dst, src.storage_offset(), 0)
         self.assertIn("stick", str(cm.exception).lower())
+        # ... while eager clone of the same view stages through the host.
+        torch.testing.assert_close(src.clone().cpu(), x.cpu()[2:3])
 
     def test_unaligned_offset_raises_select(self):
-        """select (rank-reducing) with an unaligned offset is rejected too.
+        """select (rank-reducing) with an unaligned offset follows the same rule.
 
         select(0, r) drops the outer dim, so the view handed to the op is 1-D
         with the outer-dim offset baked into its storage_offset. The rule keys
         on the offset alone, so rank reduction is irrelevant: reshape(4, 100)
-        select(0, 2) has offset 200 (not a stick multiple) and must raise, while
-        select(0, 0) (offset 0) succeeds. Guards against the earlier concern
-        that the select path could silently misread (it cannot: it either copies
-        correctly or errors)."""
+        select(0, 2) has offset 200 (not a stick multiple), so a direct d2d copy
+        must raise while eager ``clone()`` stages through the host and is
+        correct (issue #4329); select(0, 0) (offset 0) succeeds either way.
+        Guards against the earlier concern that the select path could silently
+        misread (it cannot: it either copies correctly or errors)."""
         x = torch.arange(4 * 100, dtype=DTYPE, device=DEVICE).reshape(4, 100)
         torch.testing.assert_close(x.select(0, 0).clone().cpu(), x.cpu()[0])
+        src = x.select(0, 2)
+        dst = torch.empty_like(src)
         with self.assertRaises(Exception) as cm:
-            x.select(0, 2).clone()
+            torch.ops.spyre.copy_from_d2d(src, dst, src.storage_offset(), 0)
         self.assertIn("stick", str(cm.exception).lower())
+        torch.testing.assert_close(src.clone().cpu(), x.cpu()[2])
 
     def test_stick_multiple_offset_unaligned_inner_dim_ok(self):
         """A stick-multiple offset is accepted even if the inner dim is not.

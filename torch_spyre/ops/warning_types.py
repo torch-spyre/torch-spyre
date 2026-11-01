@@ -25,3 +25,8 @@ class FallbackWarning(UserWarning):
 class RetileWarning(UserWarning):
     """Warning issued when an eager result had to be re-tiled to the layout a
     compiled graph assumes for it."""
+
+
+class HostStagedCopyWarning(UserWarning):
+    """Warning issued when an eager device-to-device copy had to be staged
+    through the host because its source view starts inside a stick."""
