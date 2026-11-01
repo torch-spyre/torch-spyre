@@ -31,6 +31,7 @@ from torch_spyre._inductor.constants import (
     CONV_DIM_LABELS,
     CONV_OPS,
     DEPTHWISE_CONV2D_OP,
+    SHUFFLE_OP,
     FP32TOINT32_OP,
     IDENTITY_OP,
     INPUT_DIM_LABELS,
@@ -92,6 +93,9 @@ class SDSCArgs:
     is_index_tensor: bool = False
     related_value_tensor_idx: int = -1
     device_tile_advance_expr: Expr | None = None
+    element_arrangement: ElementArrangement = dataclasses.field(
+        default_factory=lambda: ElementArrangement.STANDARD
+    )
 
     def __str__(self) -> str:
         scales = ", ".join(f"{k}={v}" for k, v in self.scales.items())
@@ -1782,6 +1786,7 @@ def _create_sdsc_tensors(
             is_index_tensor=is_idx_tensor,
             related_value_tensor_idx=related_val_idx,
             device_tile_advance_expr=arg.device_tile_advance_expr,
+            element_arrangement=arg.element_arrangement,
         )
         if arg.work_division is not None:
             sdsc_arg.work_division = arg.work_division.remap_symbols(symbol_mapping)
@@ -2135,6 +2140,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     is_conv2d = _is_conv(op_spec.op)
     is_relayout = is_lx_relayout_identity(op_spec.op, op_spec.args, op_spec.op_info)
     is_restickify = op_spec.op == RESTICKIFY_OP
+    is_ea_shuffle = op_spec.op == SHUFFLE_OP
     is_pool = _is_pool(op_spec.op)
     is_conv = _is_conv(op_spec.op)
     ndim = len(op_spec.iteration_space)
@@ -2465,9 +2471,11 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             [args[0]],
             [args[0].dim_order],
         )
-    elif is_restickify:
+    elif is_restickify or is_ea_shuffle:
         # Pad iteration space using all args so both the old stick (input) and
         # new stick (output) are rounded up to the nearest stick boundary.
+        # SHUFFLE_OP (element-arrangement shuffle) also has potentially
+        # different arrangements on input and output and needs both padded.
         pad_args, pad_sdsc_args, dim_order = (
             list(op_spec.args),
             args,
@@ -2680,7 +2688,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     value_arg_index = 1 if indirect_access_indices else 0
     opfunc = (
         "shuffle"
-        if is_relayout
+        if is_relayout or is_ea_shuffle
         else _get_op_func(
             op_spec.op,
             op_spec.is_reduction,
