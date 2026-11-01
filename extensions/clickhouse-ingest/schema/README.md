@@ -39,6 +39,8 @@ Applying them in filename order works from an empty database.
 | `66-chat-turns.sql` | `chat_turns` (kept forever), `chat_turn_retention`, `v_chat_turns`, `v_chat_turn_retention`, `v_chat_turn_daily` | — |
 | `67-effect-status.sql` | `effect_status` (append-only triage events), `v_effect_status` | — |
 | `70-vllm-hud-projection.sql` | `oss_ci_benchmark_v3`, `oss_ci_benchmark_metadata`, their `_by_tag` copies + their MVs | 30, 60 |
+| `72-ops-audit-events.sql` | `ops_audit_events`, `v_ops_audit_events` | — |
+| `73-ci-access-audit.sql` | `ci_access_audit`, `v_ci_access_audit` | — |
 
 Column names `chat_turns` shares with `vigil_ops.analyst_turns`, so one `UNION ALL` view can read both:
 

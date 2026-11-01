@@ -144,6 +144,8 @@ class Sandbox:
         ("effect_status", "ts >= now() - INTERVAL {days} DAY", "(event_id)"),
         # By time: a pending or rejected upload has no run_id.
         ("result_uploads", "ts >= now() - INTERVAL {days} DAY", "(upload_id, ts)"),
+        ("ops_audit_events", "ts >= now() - INTERVAL {days} DAY", "(event_id)"),
+        ("ci_access_audit", "ts >= now() - INTERVAL {days} DAY", "(event_id)"),
         ("insight_reports", "ts >= now() - INTERVAL {days} DAY", "(report_id, ts)"),
         ("chat_turns", "ts >= now() - INTERVAL {days} DAY", "(turn_id, ts)"),
         ("chat_turn_retention", "ts >= now() - INTERVAL {days} DAY", "(actor, ts)"),
