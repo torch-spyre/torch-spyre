@@ -106,8 +106,8 @@ def main(argv=None) -> int:
     flags_map = load_map(args.flags_map)
     keep_alone = {k.strip() for k in args.keep_alone.split(",") if k.strip()}
 
-    layout = {}
-    small = defaultdict(list)
+    layout: dict[str, dict[str, int | str]] = {}
+    small: dict[tuple, list[dict]] = defaultdict(list)
     for cfg in sorted(root.rglob("*.yaml")):
         f = config_facts(cfg, root)
         minutes = runtimes.get(cfg.stem, UNKNOWN_MIN)
@@ -131,7 +131,7 @@ def main(argv=None) -> int:
 
     for (runner, d, _flags, _glob), members in sorted(small.items()):
         members.sort(key=lambda m: (-m["t"], m["rel"]))
-        bins = []  # [minutes, [facts], set(file stems)]
+        bins: list[list] = []  # [minutes, [facts], set(file stems)]
         for m in members:
             best = None
             for b in bins:
