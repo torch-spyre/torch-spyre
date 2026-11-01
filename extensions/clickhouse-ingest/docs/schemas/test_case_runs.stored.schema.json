@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "One test's outcome in one run: run-context tags, recorded measurements and results.",
+  "properties": {
+    "component": {
+      "minLength": 1
+    },
+    "duration_s": {},
+    "fail_message": {},
+    "measurements": {},
+    "props": {},
+    "run_id": {},
+    "status": {
+      "enum": [
+        "error",
+        "failed",
+        "passed",
+        "skipped",
+        "xfail",
+        "xpass"
+      ]
+    },
+    "tags": {},
+    "test_case_id": {}
+  },
+  "required": [
+    "run_id",
+    "test_case_id",
+    "component",
+    "status",
+    "duration_s",
+    "fail_message",
+    "props",
+    "tags",
+    "measurements"
+  ],
+  "title": "test_case_runs: the stored row",
+  "type": "object",
+  "x-uploadable": true
+}
