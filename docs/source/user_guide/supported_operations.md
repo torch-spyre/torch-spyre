@@ -31,7 +31,8 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 | `torch.nn.functional.linear` | Y | Y | Spyre | Decomposed to `matmul` + `add` |
 | `torch.nn.functional.conv2d` | Y | Y | Spyre | Custom decomposition (`conv2d_via_bmm`); CPU fallback for the im2col step |
 | `torch.nn.functional.avg_pool2d` | | Y | Spyre | Compiled only; custom lowering |
-| `torch.triu` | Y | Y | Spyre | Compiled via mask-multiply decomposition; integer dtypes and `out=` variant fall back to CPU |
+| `torch.tril` | Y | Y | Spyre | Custom decomposition to a coordinate mask; float16, bfloat16, float32, int32, int64 and bool run on Spyre, other dtypes fall back to CPU |
+| `torch.triu` | Y | Y | Spyre | Custom decomposition to a coordinate mask; float16, bfloat16, float32, int32, int64 and bool run on Spyre, other dtypes fall back to CPU |
 | **Activation Functions** | | | | |
 | `torch.nn.functional.softmax` | Y | Y | Spyre | |
 | `torch.nn.functional.layer_norm` | Y | Y | Spyre | Custom decomposition |
@@ -123,6 +124,8 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 | `torch.zeros` | Y | Y | Spyre | Eager via `aten::zero_` (`ops/eager.py`) |
 | `torch.empty_like` | Y | Y | Spyre | |
 | `torch.full` | Y | Y | Spyre | Custom decomposition |
+| `torch.arange` | Y | Y | Spyre | Compiled: custom decomposition for float16, bfloat16, float32, int32 and int64 with static bounds, others fall back to CPU. Eager runs on CPU |
+| `torch.eye` | Y | Y | Spyre | Custom decomposition to a coordinate mask; float16, bfloat16, float32, int32, int64 and bool run on Spyre, other dtypes fall back to CPU |
 | `torch.nn.functional.pad` / `torch.constant_pad_nd` | Y | Y | Spyre | Custom lowering |
 | **In-place / Initialization** | | | | |
 | `torch.Tensor.fill_` | | Y | Spyre | Compiled only; eager kernel registered but not yet stable |
@@ -139,8 +142,6 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 | `torch.item` | Y | Y | Spyre | Copies to CPU, returns Python scalar |
 | `torch.Tensor.to` (dtype cast) | | Y | Spyre | Compiled only; eager dtype casts not yet supported. Converts fp16, bf16, int32, int64, and bool on device; int32 and int64 share one storage layout, so a cast between them is an identity |
 | **CPU Fallback** | | | | |
-| `torch.arange` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
-| `torch.tril` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.isin` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.bitwise_xor` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.bitwise_or` | Y | Y | CPU fallback | Runs on CPU, result transferred back |

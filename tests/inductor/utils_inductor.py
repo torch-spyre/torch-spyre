@@ -91,6 +91,17 @@ def cached_randn(
 
 
 @functools.lru_cache(maxsize=None)
+def cached_randint(shape, high=8, dtype=torch.int64):
+    """Return a deterministically-seeded random integer tensor, cached by args.
+
+    The integer counterpart of :func:`cached_randn`. Values come from
+    ``[-high, high)``, small enough to stay exact through a float32 conversion.
+    """
+    gen = _make_generator(shape, high, dtype)
+    return torch.randint(-high, high, shape, dtype=dtype, generator=gen)
+
+
+@functools.lru_cache(maxsize=None)
 def cached_xavier(
     shape,
     differentiation=None,

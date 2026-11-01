@@ -37,6 +37,7 @@ from .constants import (
     RESTICKIFY_DEVICE_DTYPE_COST_WEIGHT,
     RESTICKIFY_SUPPORTED_DEVICE_DTYPES,
 )
+from .ir import SpyreArangeFallback
 from .pass_utils import (
     compute_restickify_needed,
     compute_size1_restickify_target,
@@ -749,6 +750,23 @@ def beam_global_min_cost(operations: list) -> None:
                 )
                 for state in frontier.states
             ]
+    # A coordinate is produced outside any kernel and carries a committed
+    # device layout from construction, so it behaves like a graph input here
+    # rather than like a buffer whose layout is still being chosen.
+    for op in operations:
+        if isinstance(op, SpyreArangeFallback):
+            stl = op.get_layout().device_layout
+            frontier.add_buf(op.get_name())
+            total_inp_future += future_min_cost.get(op.get_name(), {}).get(stl, 0.0)
+            frontier.states = [
+                BeamState(
+                    assignments=state.assignments + (stl,),
+                    cost=state.cost,
+                    lower_bound=state.cost,
+                )
+                for state in frontier.states
+            ]
+
     frontier.states = [
         BeamState(
             assignments=state.assignments,
