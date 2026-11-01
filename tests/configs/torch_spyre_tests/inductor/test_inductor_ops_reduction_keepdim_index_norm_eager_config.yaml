@@ -16,6 +16,7 @@ test_suite_config:
             - TestOps::test_matrix_norm_keepdim.*
             - TestOps::test_linalg_norm_keepdim.*
             - TestOps::test_argmin_keepdim0
+            - TestOps::test_arg_reduce_.*
             - TestOps::test_min_tuple_output_keepdim0
             - TestOps::test_logsumexp_keepdim0
             # test_mean has a param named "3d_dim0_keepdim" whose instantiated name
