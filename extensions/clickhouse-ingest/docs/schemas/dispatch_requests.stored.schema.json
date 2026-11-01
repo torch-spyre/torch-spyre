@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "A person's or pipeline's \"run this subscription against this artifact\".",
+  "properties": {
+    "artifact_id": {
+      "minLength": 1
+    },
+    "params": {},
+    "props": {},
+    "reason": {},
+    "request_id": {
+      "minLength": 1
+    },
+    "requested_at": {},
+    "requested_by": {
+      "enum": [
+        "pipeline",
+        "user"
+      ]
+    },
+    "requester": {},
+    "subscription_id": {
+      "minLength": 1
+    },
+    "tag": {}
+  },
+  "required": [
+    "request_id",
+    "requested_at",
+    "subscription_id",
+    "artifact_id",
+    "tag",
+    "requested_by",
+    "requester",
+    "params",
+    "reason",
+    "props"
+  ],
+  "title": "dispatch_requests: the stored row",
+  "type": "object",
+  "x-uploadable": false
+}

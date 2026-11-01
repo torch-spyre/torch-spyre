@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "one capability's verdict on one backend. Identity fields ride in the row; ids are derived.",
+  "properties": {
+    "rows": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "arch": {
+            "type": "string"
+          },
+          "backend": {
+            "description": "spyre or cpu; a column, not identity.",
+            "type": "string"
+          },
+          "fail_reason": {
+            "type": "string"
+          },
+          "name": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "props": {
+            "additionalProperties": {
+              "type": [
+                "string",
+                "number"
+              ]
+            },
+            "type": "object"
+          },
+          "sig": {
+            "additionalProperties": {
+              "type": [
+                "string",
+                "number"
+              ]
+            },
+            "description": "Keys that, with subject and name, make the capability unique. Hashed.",
+            "type": "object"
+          },
+          "status": {
+            "enum": [
+              "failed",
+              "not_implemented",
+              "passed",
+              "undetermined"
+            ]
+          },
+          "subject": {
+            "description": "What the capability belongs to (a model, a config).",
+            "minLength": 1,
+            "type": "string"
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "test_type": {
+            "enum": [
+              "model_modules",
+              "model_ops",
+              "model_serving",
+              "model_support"
+            ]
+          }
+        },
+        "required": [
+          "test_type",
+          "subject",
+          "name",
+          "status"
+        ],
+        "type": "object"
+      },
+      "minItems": 1,
+      "type": "array"
+    }
+  },
+  "required": [
+    "rows"
+  ],
+  "title": "capability_runs upload file: results/capability_runs.json",
+  "type": "object"
+}
