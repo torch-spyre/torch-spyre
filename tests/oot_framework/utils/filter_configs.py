@@ -177,7 +177,13 @@ def _load_layout(map_path: str) -> dict:
     """{config key: {"shards": N} | {"bucket": name}} from --layout-map (.github/suite_layout.yaml)."""
     path = Path(map_path)
     if not path.is_file():
-        sys.exit(f"ERROR: layout map not found: {path}")
+        # A prebaked image built before the layout existed has no such file: run every config
+        # as its own job, as before, rather than failing the whole matrix.
+        print(
+            f"WARNING: layout map not found: {path}; every config runs as its own job",
+            file=sys.stderr,
+        )
+        return {}
     with path.open() as fh:
         data = yaml.safe_load(fh) or {}
     for key, v in data.items():

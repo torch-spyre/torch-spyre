@@ -258,6 +258,7 @@ jobs:
             .github/scripts/resolve_covered_tiers.py
             .github/runner_overrides.yaml
             .github/suite_test_flags.yaml
+            .github/suite_layout.yaml
           sparse-checkout-cone-mode: false
 
       - name: Filter configs by TEST_TYPE
