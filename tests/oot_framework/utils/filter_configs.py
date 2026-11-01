@@ -70,6 +70,20 @@ Runner overrides
   ending in "/", to the pytest flags that suite runs with instead of the
   caller's extra_test_flags.
 
+CI groups
+---------
+  A config may declare test_suite_config.ci_group: <name>. For matrix-json, all
+  selected configs in the same directory that share a group become ONE matrix
+  entry, so a handful of short suites pay for one runner setup instead of one
+  each. The entry carries "config" (the first member, so existing consumers keep
+  working), "configs" (every member, space-separated) and "report" (the JUnit
+  file stem, "group_<dir>_<group>" for a group and the config stem otherwise). Grouping is
+  applied AFTER tier filtering, so a smoke or delta run only runs the members
+  that match it. Members of a group must agree on runner and flags, and must
+  declare identical "global:" blocks (run_test.sh unions global list keys across
+  merged configs, so differing blocks would widen each other's coverage).
+  Violations exit with an error rather than silently splitting the group.
+
 Usage
 -----
   # Makefile / local dev
@@ -131,6 +145,67 @@ def _load_labels(path: Path) -> list:
         raw = yaml.safe_load(fh) or {}
     tsc = raw.get("test_suite_config") or {}
     return list(tsc.get("labels") or [])
+
+
+def _load_ci_group(path: Path) -> tuple:
+    """Read (ci_group, global block) from a YAML config; ci_group is "" if absent."""
+    with path.open() as fh:
+        raw = yaml.safe_load(fh) or {}
+    tsc = raw.get("test_suite_config") or {}
+    return str(tsc.get("ci_group") or "").strip(), tsc.get("global") or {}
+
+
+def _fold_groups(results: list) -> list:
+    """Fold results that share (directory, ci_group) into one entry per group.
+
+    Ungrouped results pass through unchanged. Order follows the first member of
+    each group. Exits on a group whose members disagree on runner or flags, or
+    whose members declare different global: blocks.
+    """
+    out: list = []
+    groups: dict = {}
+    for r in results:
+        if not r["group"]:
+            out.append(r)
+            continue
+        key = (str(Path(r["config"]).parent), r["group"])
+        if key not in groups:
+            first = dict(r, members=[r["config"]])
+            groups[key] = first
+            out.append(first)
+            continue
+        g = groups[key]
+        if r["global"] != g["global"]:
+            sys.exit(
+                f"ERROR: ci_group {r['group']!r}: {r['config']} and {g['config']} "
+                "declare different 'global:' blocks; run_test.sh unions global list "
+                "keys across merged configs, which would widen coverage. Give them "
+                "identical blocks or different groups."
+            )
+        for field in ("runner", "flags"):
+            if r[field] != g[field]:
+                sys.exit(
+                    f"ERROR: ci_group {r['group']!r}: {r['config']} has {field} "
+                    f"{r[field]!r} but {g['config']} has {g[field]!r}. Members of a "
+                    "group must share runner and flags."
+                )
+        g["members"].append(r["config"])
+    for g in out:
+        if g["group"]:
+            # Directory-qualified so groups in different directories cannot collide.
+            parent = Path(g["config"]).parent
+            g["name"] = _title_words(parent.name) + " / " if parent.name else ""
+            g["name"] += _title_words(g["group"]) + f" ({len(g['members'])} suites)"
+            # "group_" keeps a report from colliding with a config stem, and the
+            # directory with a same-named group elsewhere.
+            g["report"] = "_".join(["group", parent.name, g["group"]]).replace(
+                "__", "_"
+            )
+    return out
+
+
+def _title_words(s: str) -> str:
+    return " ".join(w.capitalize() for w in s.replace("_", " ").split())
 
 
 def _load_path_map(map_path: str) -> dict:
@@ -295,6 +370,7 @@ def main() -> None:
             skipped_covered += 1
             continue
         rel = str(cfg.relative_to(config_dir))
+        group, glob = _load_ci_group(cfg)
         results.append(
             {
                 "name": _display_name(cfg, config_dir),
@@ -302,8 +378,15 @@ def main() -> None:
                 "runner": runner_map.get(rel, "spyre_pf_x1"),
                 "flags": _suite_flags(flags_map, rel),
                 "path": str(cfg),
+                "group": group,
+                "global": glob,
+                "members": [rel],
+                "report": cfg.stem,
             }
         )
+
+    if args.format == "matrix-json":
+        results = _fold_groups(results)
 
     if skipped_covered:
         print(
@@ -326,6 +409,8 @@ def main() -> None:
                 "name": r["name"],
                 "config": r["config"],
                 "runner": r["runner"],
+                "configs": " ".join(r["members"]),
+                "report": r["report"],
                 **({"extra_test_flags": r["flags"]} if r["flags"] else {}),
             }
             for r in results

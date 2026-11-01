@@ -1,5 +1,6 @@
 test_suite_config:
   labels: [unit, regression, trunk]
+  ci_group: logging_provenance
   files:
     - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_sdsc_logging.py
       unlisted_test_mode: mandatory_success
