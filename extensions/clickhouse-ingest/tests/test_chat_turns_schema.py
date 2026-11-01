@@ -116,9 +116,25 @@ def test_a_turn_without_feedback_has_none(chdb_session):
 
 
 def test_defaults_and_shared_columns(chdb_session):
-    _insert(chdb_session, _event(model_alias="Gemma", served_model="g", session_id="s1", prompt_version="abc"))
-    got = json.loads(chdb_session.query("SELECT outcome, cost_usd, session_id, model_alias, served_model FROM v_chat_turns", "JSONEachRow").data())
-    assert got == {"outcome": "ok", "cost_usd": 0, "session_id": "s1", "model_alias": "Gemma", "served_model": "g"}
+    _insert(
+        chdb_session,
+        _event(
+            model_alias="Gemma", served_model="g", session_id="s1", prompt_version="abc"
+        ),
+    )
+    got = json.loads(
+        chdb_session.query(
+            "SELECT outcome, cost_usd, session_id, model_alias, served_model FROM v_chat_turns",
+            "JSONEachRow",
+        ).data()
+    )
+    assert got == {
+        "outcome": "ok",
+        "cost_usd": 0,
+        "session_id": "s1",
+        "model_alias": "Gemma",
+        "served_model": "g",
+    }
 
 
 def test_retention_rows_are_validated_and_only_the_actor_sets_their_own(chdb_session):
