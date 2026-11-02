@@ -131,7 +131,7 @@ Short-circuit only after that reason is stored.
 
 | Check | Pass | Fail |
 | --- | --- | --- |
-| Intended count | Evaluation step 3. Step 1 is the only skip | `ENV_CARD_COUNT_MISSING` |
+| Intended count | Evaluation step 3. Step 1 is the only skip | `ENV_CARD_COUNT_MISSING` (evaluation step 2) |
 | Acquired lock | Card-using job acquired a lock quantity greater than zero | `ENV_NO_CARD_LOCK` |
 | Recorded vs intended | The recorded count chosen in evaluation step 5 equals intended. When the lock is greater than zero and a measured count is present, those two values must be equal. A zero or absent lock is `ENV_NO_CARD_LOCK` only, unless the measured count also differs from intended | `ENV_CARD_COUNT_MISMATCH` |
 | Series topology | Intended card count matches the other members of the series | `ENV_TOPOLOGY_MISMATCH` |
