@@ -9,11 +9,18 @@ test_suite_config:
         # They are mandatory_success because Spyre's inductor backend raises InductorError for unsupported meta ops.
         # Spyre's capability to run these tests relies on PyTorch's CPU fallback for error checking.
         - names:
-            - TestShapeOps::test_clamp_raises_arg_errors
             - TestShapeOps::test_fliplr_invalid
             - TestShapeOps::test_flipud_invalid
-            - TestShapeOps::test_unfold_errors
           mode: mandatory_success
+        # Upstream regression: test_clamp_raises_arg_errors assertRaisesRegex() against
+        # "At least one of 'min' or 'max' must not be None", but the fake-tensor validation
+        # now raises first with a different RuntimeError. test_unfold_errors expects "size is
+        # -1 but must be >= 0" but upstream's message changed to "unfold: size must be
+        # positive, got -1". Neither pattern matches on this upstream PyTorch bump.
+        - names:
+            - TestShapeOps::test_clamp_raises_arg_errors
+            - TestShapeOps::test_unfold_errors
+          mode: skip  # skip: error message mismatch on upstream PyTorch bump
         # These tests exercise sparse_dim and dense_dim methods on tensors of various shapes and dtypes. The int64 dtype fails because Spyre lacks support for the aten::random_.from operator used in integer tensor creation. The mandatory_success classification reflects that the test passes for float32 but fails for int64 due to this missing operator.
         - names:
             - TestShapeOps::test_sparse_dense_dim

@@ -1,3 +1,4 @@
+# v1 model-ops: delete once the dashboard reads v2 capabilities
 name: push-model-ops-logs-to-clickhouse
 
 # Triggers automatically when the nightly completes, OR manually so you can
@@ -46,10 +47,6 @@ jobs:
       github.event.workflow_run.conclusion != 'cancelled'
 
     env:
-      # The arch of the ANALYSED leg, not of this ingest job. See the note in
-      # push-hw-diagnostics-to-clickhouse.yaml: arch is a run_id hash input.
-      LEG_ARCH: x86_64
-
       TRIGGERING_RUN_ID: ${{ github.event.workflow_run.id        || inputs.gha_run_id }}
       TRIGGERING_WORKFLOW: ${{ github.event.workflow_run.name      || 'model-ops-tests' }}
       TRIGGERING_BRANCH: ${{ github.event.workflow_run.head_branch || github.ref_name }}
@@ -73,16 +70,12 @@ jobs:
           workflow-name: ${{ env.TRIGGERING_WORKFLOW }}
           branch: ${{ env.TRIGGERING_BRANCH }}
           sha: ${{ env.TRIGGERING_SHA }}
-          arch: ${{ env.LEG_ARCH }}
-          schema: both
           gh-token: ${{ secrets.GITHUB_TOKEN }}
           clickhouse-host: ${{ secrets.CLICKHOUSE_HOST }}
           clickhouse-port: ${{ secrets.CLICKHOUSE_PORT }}
           clickhouse-user: ${{ secrets.CLICKHOUSE_USER }}
           clickhouse-pass: ${{ secrets.CLICKHOUSE_PASS }}
           clickhouse-db: ${{ secrets.CLICKHOUSE_DB }}
-          # Unset => the v2 write is a no-op, so this can deploy before the migration lands.
-          clickhouse-db-v2: ${{ secrets.CLICKHOUSE_DB_V2 }}
 
       - name: Upload Logs artifact
         if: always() && steps.ingest.outputs.log-file != ''

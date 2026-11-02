@@ -12,11 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import decimal
+import math
 import os
 import sys
 from typing import Literal
 
 from torch.utils._config_module import install_config_module
+
+
+def _backend_loop_unroll_from_env() -> bool:
+    value = os.environ.get("SPYRE_BACKEND_LOOP_UNROLL", "1")
+    normalized = value.strip().lower()
+    if normalized in ("1", "true", "yes"):
+        return True
+    if normalized in ("0", "false", "no"):
+        return False
+    raise ValueError(
+        f"SPYRE_BACKEND_LOOP_UNROLL must be 1/true/yes or 0/false/no, got {value!r}"
+    )
+
+
+# Controls dbo-opt's SDSC-bundle loop unrolling, not the direct KTIR path.
+# Resolve at import like the other options; config.patch can override it.
+backend_loop_unroll: bool = _backend_loop_unroll_from_env()
 
 lx_planning: bool = os.environ.get("LX_PLANNING", "1") == "1"
 co_optimizing_lx_planning: bool = (
@@ -79,6 +98,13 @@ def pool_allocated_by_frontend() -> bool:
 # lowering does not yet support (grouped/transposed/non-fp16).
 conv2d_direct_lowering: bool = os.environ.get("SPYRE_CONV2D_DIRECT", "0") == "1"
 
+# Extend the phase-2 matmul perf reorder (NDO) to the matmul's own output
+# buffer in addition to its input buffers. Off by default until the
+# interaction with downstream span limits is fully validated.
+ndo_matmul_output_reorder: bool = (
+    os.environ.get("SPYRE_NDO_MATMUL_OUTPUT_REORDER", "0") == "1"
+)
+
 # For a strided (stride>1) direct-lowered conv2d, forbid splitting the output
 # spatial dims (i/j) across cores. A strided conv's output coordinates do not
 # map to a contiguous input span per core, so a spatial split shuffles the
@@ -96,18 +122,66 @@ disable_conv2d_spatial_split: bool = (
 # stable per-buffer identity. Inert by default: the SDSC/flex path is unchanged.
 ktir_emitter: bool = os.environ.get("TORCH_SPYRE_KTIR", "0") == "1"
 
-# Settings for device execution over the KTIR path. What is required is checked
-# upfront by ``_check_ktir_device_prerequisites`` in ``execution/async_compile``,
-# which names anything missing.
-
-# A .mlir declaring the target device, passed to the backend compiler.
+# A .mlir declaring the target device for the KTIR path, passed to the backend
+# compiler as ``--device``. An override, not a prerequisite: left unset the flag
+# is omitted and dbo-opt falls back to its own default, so
+# ``_check_ktir_device_prerequisites`` does not name this field.
 ktir_device_mlir: str = os.environ.get("KTIR_DEVICE_MLIR", "")
+
+
+# Wall-clock ceiling, in seconds, on ONE backend-compiler (dbo-opt) invocation,
+# on both the bundle and the KTIR path. It bounds a wedged compiler -- which
+# would otherwise block torch.compile forever with no diagnostic -- rather than
+# policing slowness: a small kernel finishes in well under a second. Raise it if
+# a large bundle legitimately needs longer; non-positive values disable the
+# limit. The parent reads it and passes it to each compile, so a runtime
+# ``config.patch`` also reaches compiles in Inductor's subprocess pool.
+def _backend_compile_timeout_from_env() -> float:
+    value = os.environ.get("SPYRE_BACKEND_COMPILE_TIMEOUT_SECONDS", "60")
+    try:
+        timeout = float(value)
+    except ValueError as exc:
+        raise ValueError(
+            "SPYRE_BACKEND_COMPILE_TIMEOUT_SECONDS must be a number of seconds, "
+            f"got {value!r}"
+        ) from exc
+    if not math.isfinite(timeout) or (timeout == 0 and decimal.Decimal(value) != 0):
+        raise ValueError(
+            "SPYRE_BACKEND_COMPILE_TIMEOUT_SECONDS must be a finite number "
+            f"of seconds representable as a float, got {value!r}"
+        )
+    return timeout
+
+
+backend_compile_timeout_seconds: float = _backend_compile_timeout_from_env()
 
 # Enable certified LX ownership changes: movement, exact fused-axis views,
 # consumer-compatible producer order, and same-core restickify residency.
 # Set SPYRE_LX_PLANNER_RELAYOUT=0 to disable these optional optimizations, not
 # ownership validation. This does not change the allocator or LX memory budget.
 lx_planner_relayout: bool = os.getenv("SPYRE_LX_PLANNER_RELAYOUT", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+# Enable optional ownership proofs and local reads added after prefix support.
+# Set SPYRE_LX_EXTENDED_OWNERSHIP=0 to keep the earlier ownership and prefix rules.
+lx_extended_ownership: bool = os.getenv("SPYRE_LX_EXTENDED_OWNERSHIP", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+# Let a co-optimizing solver that decides LX relayouts (one whose
+# decides_lx_relayouts() is true) choose them. Set SPYRE_LX_SOLVER_RELAYOUT=0 to
+# offer it no relayout candidates, so an edge whose views differ spills to HBM, and
+# nothing else about the plan changes; unlike SPYRE_LX_PLANNER_RELAYOUT=0, which
+# also turns off restickify residency and fused-axis views. It does not gate the
+# greedy fallback after a failed solve, which plans relayouts under
+# SPYRE_LX_PLANNER_RELAYOUT. For measuring what a relayout is worth (the cost-model
+# sweep's `relayout` op) and for tests that need the spill side of an edge.
+lx_solver_relayout: bool = os.getenv("SPYRE_LX_SOLVER_RELAYOUT", "1").lower() in (
     "1",
     "true",
     "yes",
@@ -136,16 +210,6 @@ lx_solver_relayout_presolve_max_copies: int = int(
     os.getenv("SPYRE_LX_SOLVER_RELAYOUT_PRESOLVE_MAX_COPIES", "0")
 )
 
-# Submit independent backend-compiler kernel compilations to Inductor's
-# subprocess pool and resolve them together at the generated wrapper's
-# async_compile.wait() barrier. This is opt-in while the parallel path is
-# evaluated on full model compiles.
-async_backend_compile: bool = os.getenv("SPYRE_ASYNC_BACKEND_COMPILE", "0").lower() in (
-    "1",
-    "true",
-    "yes",
-)
-
 allow_all_ops_in_lx_planning: bool = False
 
 dxp_lx_frac_avail: float = float(os.environ.get("DXP_LX_FRAC_AVAIL", "0.2"))
@@ -166,11 +230,10 @@ max_buckets: int = int(os.getenv("MAX_BUCKETS", "32"))
 # very small divisor when max_size has many of them.
 min_default_granularity: int = int(os.getenv("MIN_DEFAULT_GRANULARITY", "4"))
 
+# Ignore spyre_hint(work_div=...) and use the automatic work-distribution planner.
 ignore_work_division_hints: bool = (
-    os.environ.get("SPYRE_INDUCTOR_IGNORE_HINTS", "0") == "1"
+    os.environ.get("SPYRE_INDUCTOR_IGNORE_WORK_DIV_HINTS", "0") == "1"
 )
-
-ignore_wsr_hints: bool = os.environ.get("SPYRE_INDUCTOR_IGNORE_HINTS", "0") == "1"
 
 # Temporary kill switch for removing a proven-redundant read copy after LX
 # planning.  A failed proof leaves the original graph unchanged.
@@ -207,6 +270,17 @@ timing: bool = os.getenv("TORCH_SPYRE_TIMING", "0").lower() in (
 # timing_recorder.RECORDER directly wants.
 timing_out: str = os.environ.get("TORCH_SPYRE_TIMING_OUT", "")
 
+# Measurement mode: run a compile through backend-input generation and stop
+# before the backend compiler.  The frontend runs in full; every per-kernel
+# backend invocation is skipped, so the compile produces no runnable
+# kernel and calling one raises.  Never enable this to run a model -- it exists
+# so a frontend measurement does not have to pay for the backend.
+frontend_only: bool = os.getenv("TORCH_SPYRE_FRONTEND_ONLY", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
 # Predicted-runtime reporting from the analytical cost model (cost_model.py,
 # cost_model_pass.py).  NOT related to work_division.cost_model_matmul_division,
 # which is a separate model used to choose a matmul work division.
@@ -223,12 +297,12 @@ cost_model: str = os.environ.get("SPYRE_DUMP_COST", "")
 # Append one JSON record per co-optimized graph to this file: the symbolic cost
 # objective the solver minimized (per-bundle terms and relayout charges as sympy
 # ``srepr`` strings), the symbol values the solve chose, and each term evaluated
-# under them. Read by the summarize-sdsc skill. Empty = off.
+# under them, plus any terms the engine adds outside the expression and the
+# total it minimized (see ``cost_expr_record``). Read by the summarize-sdsc
+# skill. Empty = off.
 dump_cost_expr_file: str = os.environ.get("SPYRE_DUMP_COST_EXPR_FILE", "")
 
-# Disable compiler-generated span-overflow coarse-tiling hints.  The global
-# SPYRE_INDUCTOR_IGNORE_HINTS flag also disables these so one switch can still
-# suppress all WSR/coarse-tiling hint paths.
+# Disable compiler-generated span-overflow coarse-tiling hints.
 #
 # Defaults to disabled (opt-in): span-overflow auto-tiling can synchronize
 # compatible contiguous pointwise groups, but incompatible producer/consumer
@@ -237,8 +311,7 @@ dump_cost_expr_file: str = os.environ.get("SPYRE_DUMP_COST_EXPR_FILE", "")
 # tests exercising this path directly should override via
 # config.patch({"ignore_span_overflow_hints": False}).
 ignore_span_overflow_hints: bool = (
-    ignore_wsr_hints
-    or os.environ.get("SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS", "1") == "1"
+    os.environ.get("SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS", "1") == "1"
 )
 
 # Enable reduction-dim (Lk-style) coarse tiling. Defaults to enabled — this
@@ -285,41 +358,100 @@ sdsc_cache: bool = os.environ.get("SPYRE_INDUCTOR_SDSC_CACHE", "1") == "1"
 #
 # For "cpsat" and "simulated_annealing" the value names a solver *family* whose
 # joint-ness is selected by ``co_optimizing_lx_planning``; for the gap-based
-# solvers that same flag instead wraps them in ExhaustiveSearchSolver.
+# solvers, co-optimization instead requires wrapping them in
+# ExhaustiveSearchSolver -- see ``allow_exhaustive_search`` below, which gates
+# that wrapping.
 
 layout_solver: Literal[
     "greedy", "bestfit", "firstfit", "cpsat", "simulated_annealing"
 ] = os.environ.get("LAYOUT_SOLVER", "cpsat")  # type: ignore[assignment]
 
-# Wall-clock budget for one CP-SAT solve, in seconds. The joint objective is
-# lexicographic and re-solves the same model up to three times (residency, then
-# parallelism, then division balance), so this bounds each phase, not the pass.
-# It is a compile-time guard, not a correctness one: a solve that runs out of
-# budget without an incumbent raises SolveError, and scratchpad_planning falls
-# back to greedy placement (correct, but co-optimization is lost for that
-# graph). Raise it if large graphs are falling back; 0 disables the limit.
-# The default matches the budget CpSatLayoutSolver hard-coded before this knob
-# existed, so exposing it does not change how long any solve is allowed to run.
+# co_optimizing_lx_planning requires a layout_solver whose solver is natively
+# core-division-capable ("cpsat" with ortools installed, or
+# "simulated_annealing"). Every other combination -- "greedy"/"bestfit"/
+# "firstfit", or "cpsat" without ortools -- can only participate in
+# co-optimization by wrapping the placement-only solver in
+# ExhaustiveSearchSolver, an expensive DFS over core-division candidates.
+# That is opt-in: select_allocator() raises ValueError for such a combination
+# unless this is explicitly set. Set ALLOW_EXHAUSTIVE_SEARCH=1 to opt in.
+allow_exhaustive_search: bool = os.environ.get("ALLOW_EXHAUSTIVE_SEARCH", "0") == "1"
+
+# Wall-clock budget for one CP-SAT solve, in seconds. This applies to the cost
+# objective or to each phase of the fallback lexicographic objective, not the
+# whole compilation. A timeout can return a feasible plan without proving
+# optimality; without an incumbent it raises SolveError and scratchpad_planning
+# falls back to greedy placement. Override for difficult graphs; 0 disables
+# the limit.
 cpsat_time_limit_seconds: float = float(
-    os.environ.get("CPSAT_TIME_LIMIT_SECONDS", "30")
+    os.environ.get("CPSAT_TIME_LIMIT_SECONDS", "60")
 )
+
+
+def _positive_int_env(name: str) -> int | None:
+    """``name`` as a positive integer, or None when it is unset or not one."""
+    value = os.environ.get(name, "").strip()
+    return int(value) if value.isdigit() and int(value) > 0 else None
+
+
+# CPUs this process may use; sizes CP-SAT's parallel search worker pool (a
+# deterministic-algorithms run still uses one worker). None detects the count,
+# see ``get_cpu_count``. SPYRE_NUM_CPUS backs the default, the variable
+# spyre-inference's ``threading_config`` reads for the same budget. A value
+# that is not a positive integer (unset, ``0``, ``-2``, ``abc``) means None.
+num_cpus: int | None = _positive_int_env("SPYRE_NUM_CPUS")
+
+
+def get_cpu_count() -> int:
+    """CPUs this process may actually use, after spyre-inference's
+    ``threading_config.get_cpu_count``. Resolution order: ``num_cpus`` when it
+    is a positive integer, the cgroup v2 CPU quota, psutil's physical core
+    count, ``os.cpu_count()``.
+
+    ``os.cpu_count()`` reports every CPU on the host, even when a container's
+    cgroup quota lets the process use only some of them. Sizing CP-SAT's worker
+    pool to the host then oversubscribes the CPUs actually available: the search
+    thrashes instead of progressing, and the other work in the container is
+    starved."""
+    # ``install_config_module`` below moves ``num_cpus`` onto a wrapper object,
+    # so it is an attribute of this module and not a global of this function.
+    cfg = sys.modules[__name__]
+    if cfg.num_cpus is not None and cfg.num_cpus > 0:
+        return cfg.num_cpus
+    try:
+        with open("/sys/fs/cgroup/cpu.max") as f:
+            quota, period = f.read().split()
+        if quota != "max":
+            return max(1, int(quota) // int(period))
+    except (OSError, ValueError):
+        pass
+    try:
+        import psutil
+
+        physical = psutil.cpu_count(logical=False)
+        if physical:
+            return int(physical)
+    except ImportError:
+        pass
+    return os.cpu_count() or 1
+
 
 # OpSpec validation at pipeline stage boundaries. Enabled by default to catch
 # invariant violations early. Set SPYRE_VALIDATE_OP_SPECS=0 to disable.
 validate_op_specs: bool = os.environ.get("SPYRE_VALIDATE_OP_SPECS", "1") == "1"
 
-# Use the C++ (native) permutation-layout packer accelerator, which both
-# simulated-annealing solvers drive (the layout-only one and the joint
-# co-optimizer). The native and Python packers are behaviourally identical
-# (verified bit-for-bit); the native one is faster. Set
-# False (or ``TORCH_SPYRE_NATIVE_PACKER=0``/``false``, which backs this default)
-# to force the pure-Python packer. A missing native class is a stale or
-# incomplete build, not a supported mode, and raises rather than falling back.
-native_layout_packer: bool = os.getenv("TORCH_SPYRE_NATIVE_PACKER", "1").lower() in (
-    "1",
-    "true",
-    "yes",
-)
+# Solver-driven coarse tiling: let the co-optimizing solve choose a coarse
+# tiling for each op alongside its core division, and apply the tilings it
+# selects. Off by default, and inert unless a joint co-opt path is active
+# (co_optimizing_lx_planning, with layout_solver "cpsat" or
+# "simulated_annealing"). Ops a spyre_hint or for_each_tile loop already tiles
+# keep that tiling.
+#
+# Under the SA co-optimizer, anything the apply refuses raises rather than
+# falling back, so any gap between what the search believes it may tile and
+# what ``coarse_tile`` accepts is a compile failure. And the loop cost the
+# search sees is only part of what ``predict_ops`` charges a real tiling, so it
+# is not yet a calibrated brake on the tiling axis.
+auto_coarse_tiling: bool = os.environ.get("AUTO_COARSE_TILING", "0") == "1"
 
 # When symbolic cost_expr fails, use the fallback cost instead of erroring out
 _cpsat_warn_on_cost_expr: bool = True
@@ -330,5 +462,60 @@ _cpsat_warn_on_cost_expr: bool = True
 # PyTorch flag: TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 / set
 # torch._inductor.config.force_disable_caches = True.
 spyre_kernel_cache: bool = os.environ.get("SPYRE_KERNEL_CACHE", "0") == "1"
+
+# Enable or disable uniqueness checks for optimal CP-SAT solutions to determine
+# if an optimal solution is fully priced. The check is a second solve with no
+# time limit, so it can run well past ``cpsat_time_limit_seconds`` on a hard model;
+# not for production compiles.
+enable_uniqueness_check: bool = (
+    os.environ.get("SPYRE_ENABLE_UNIQUENESS_CHECK", "0") == "1"
+)
+
+# solver_relayout_edge_context's same-tile-group exception (#5057): without it,
+# a coarse-tiled producer or consumer can never host a relayout candidate at
+# all, even when the pair shares one loop_group_id (same iteration, same tile,
+# direct read, no staging op between them). With it, every such edge is priced,
+# which can enumerate and cost a large number of candidate divisions on a graph
+# with many eligible same-group edges -- see #5609's compile-time report.
+# This is not for_each_tile-specific: loop_group_id/CoarseTileInfo is stamped
+# by for_each_tile_lowering.py AND by the separate declarative coarse-tiling
+# path (scratchpad/coarse_tiling.py, wsr/coarse_tile.py), so the flag affects
+# any graph with coarse-tiled ops sharing a loop_group_id with their consumer,
+# through either mechanism.
+# This trades a device-runtime boost for a compile-time slow-down. While
+# investigating ways to speed up the compile side (#5609), we leave it off by
+# default for now. Set SPYRE_LX_SAME_TILE_GROUP_RELAYOUT=1 to opt in.
+lx_same_tile_group_relayout: bool = (
+    os.environ.get("SPYRE_LX_SAME_TILE_GROUP_RELAYOUT", "0") == "1"
+)
+
+# Allow post-solve matmul output staging before an all-reduce's HBM copy.
+# Set SPYRE_LX_COLLECTIVE_OUTPUT_STAGING=0 to disable this step alone.
+lx_collective_output_staging: bool = (
+    os.environ.get("SPYRE_LX_COLLECTIVE_OUTPUT_STAGING", "1") == "1"
+)
+
+# Settings left out of the Inductor FX graph cache key. This module is the Spyre
+# backend's ``device_custom_config``, so ``save_config_portable`` puts every
+# other setting's value in the key. A setting belongs here when it describes the
+# machine rather than the graph, as Inductor's own ``compile_threads`` does: a
+# cached compile is reused whatever its value is.
+_cache_config_ignore_prefix: list[str] = [
+    # The CP-SAT worker count: an explicit SPYRE_NUM_CPUS or patch would
+    # otherwise split the cache by machine for identical graphs.
+    "num_cpus",
+    # A limit on compiler execution time, not an input to generated code.
+    "backend_compile_timeout_seconds",
+    # Where logs go and whether kernels are kept on disk: these do not change
+    # the compiled code (spyre_kernel_cache only picks between the kernel disk
+    # cache and a fresh backend compile). Without them, a run that only writes
+    # its timing log to a new file cannot reuse any cached graph and compiles
+    # everything again. These are prefixes: "timing" covers both timing and
+    # timing_out. A test in test_solver_relayout_decision.py pins what each
+    # prefix matches.
+    "timing",
+    "dump_cost_expr_file",
+    "spyre_kernel_cache",
+]
 
 install_config_module(sys.modules[__name__])

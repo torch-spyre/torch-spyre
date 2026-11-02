@@ -47,6 +47,59 @@ class _ProfilerMLP(torch.nn.Module):
         return self.fc2(torch.relu(self.fc1(x)))
 
 
+def _find_shifted_kernel_timestamps(events):
+    """Return correlated (aiuLaunchControlBlocks, kernel) pairs and those where kernel.ts < cpu_launch.ts.
+
+    A kernel is "shifted" when its hardware start timestamp is earlier than
+    the ``aiuLaunchControlBlocks`` CPU dispatch event that launched it,
+    indicating the Spyre hardware clock and the host clock are not correctly
+    correlated.
+
+    ``aiuLaunchControlBlocks`` events have ``cat == "privateuse1_runtime"``
+    and carry an ``args["correlation"]`` integer that matches the
+    ``args["correlation"]`` on the corresponding ``cat == "kernel"`` event.
+
+    Only complete events (``ph == "X"``) with a finite numeric ``ts`` are
+    considered. Events missing ``args`` or a ``correlation`` key are silently
+    skipped; the caller asserts that at least one correlated pair was found.
+
+    Returns:
+        pairs: list of (cpu_event, kernel_event) dicts for every correlated pair
+        shifted: subset of pairs where kernel_event["ts"] < cpu_event["ts"]
+    """
+    cpu_ev_by_corr: dict[int, dict] = {}
+    kernel_evs: list[dict] = []
+
+    for ev in events:
+        if not isinstance(ev, dict) or ev.get("ph") != "X":
+            continue
+        ts = ev.get("ts")
+        if not (
+            isinstance(ts, (int, float))
+            and not isinstance(ts, bool)
+            and math.isfinite(ts)
+        ):
+            continue
+        corr = ev.get("args", {}).get("correlation")
+        if corr is None:
+            continue
+        if (
+            ev.get("cat") == "privateuse1_runtime"
+            and ev.get("name") == "aiuLaunchControlBlocks"
+        ):
+            cpu_ev_by_corr[int(corr)] = ev
+        elif ev.get("cat") == "kernel":
+            kernel_evs.append(ev)
+
+    pairs = [
+        (cpu_ev_by_corr[int(ev["args"]["correlation"])], ev)
+        for ev in kernel_evs
+        if int(ev["args"]["correlation"]) in cpu_ev_by_corr
+    ]
+    shifted = [(cpu_ev, k_ev) for cpu_ev, k_ev in pairs if k_ev["ts"] < cpu_ev["ts"]]
+    return pairs, shifted
+
+
 class TestSpyreProfiler(TestCase):
     @unittest.skipUnless(Test_spyre, "requires spyre device")
     @skipIfTorchDynamo("profiler gets ignored if dynamo activated")
@@ -158,6 +211,187 @@ class TestSpyreProfiler(TestCase):
                 msg="Recovered Chrome trace ts doesn't match Json for aten::add",
             )
 
+    @pytest.mark.requires_spyre_profiler
+    @unittest.skipUnless(Test_spyre, "requires spyre device")
+    def test_kernel_timestamp_after_cpu_dispatch(self):
+        """Verify every Spyre kernel starts after its CPU dispatch event.
+
+        Correlates ``aiuLaunchControlBlocks`` CPU launch events with
+        ``cat == "kernel"`` hardware events via ``args["correlation"]``.  A
+        negative delta (kernel.ts < cpu_launch.ts) indicates the Spyre
+        hardware clock and the host clock are not correctly correlated —
+        the "shifted timestamp" bug.
+
+        The workload uses large repeated matmuls to push total kernel execution
+        time past ~2 s, increasing the probability of a hardware timer
+        wrap-around that would surface the bug.
+        """
+        x = torch.randn((2048, 2048), dtype=torch.float16, device="spyre")
+        y = torch.randn((2048, 2048), dtype=torch.float16, device="spyre")
+
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]
+        ) as prof:
+            for _ in range(8):
+                torch.matmul(x, y)
+            torch.spyre.synchronize()
+
+        with TemporaryFileName(mode="w+") as fname:
+            prof.export_chrome_trace(fname)
+            with open(fname) as f:
+                trace_data = json.load(f)
+
+        self.assertIn(
+            "traceEvents", trace_data, "Chrome trace is missing 'traceEvents'"
+        )
+        trace_events = trace_data["traceEvents"]
+        self.assertIsInstance(trace_events, list, "'traceEvents' must be a list")
+
+        pairs, shifted = _find_shifted_kernel_timestamps(trace_events)
+
+        self.assertTrue(
+            pairs,
+            "No correlated aiuLaunchControlBlocks ↔ kernel pairs found in the trace.",
+        )
+
+        if shifted:
+            details = []
+            for cpu_ev, k_ev in shifted[:10]:
+                delta = k_ev["ts"] - cpu_ev["ts"]
+                details.append(
+                    f"  kernel={k_ev.get('name', '<unnamed>')} "
+                    f"(ts={k_ev['ts']:.3f}) started before "
+                    f"cpu_launch={cpu_ev.get('name', '<unnamed>')} "
+                    f"(ts={cpu_ev['ts']:.3f}), delta={delta:+.3f} µs "
+                    f"[correlation={k_ev.get('args', {}).get('correlation')}]"
+                )
+            self.fail(
+                f"{len(shifted)} of {len(pairs)} correlated kernel(s) have a "
+                "timestamp earlier than their CPU dispatch (shifted hardware clock):\n"
+                + "\n".join(details)
+            )
+
+    @pytest.mark.requires_spyre_profiler
+    @unittest.skipUnless(Test_spyre, "requires spyre device")
+    def test_no_zero_timestamp_or_duration(self) -> None:
+        """Verify no Chrome trace event has ts == 0 or dur == 0 for a large matmul workload."""
+
+        device = torch.device("spyre")
+        M, K, N = 1024, 2048, 1024
+
+        # Keep source tensors on CPU so the profiled region can include explicit
+        # HtoD transfers that must appear in the Chrome trace.
+        a_cpu = torch.randn(M, K, dtype=torch.float16)
+        b_cpu = torch.randn(K, N, dtype=torch.float16)
+
+        # Separate warmup inputs are moved to Spyre before profiling so the
+        # first profiled call measures runtime activity rather than compilation.
+        a_warmup = a_cpu.to(device)
+        b_warmup = b_cpu.to(device)
+
+        def large_matmul(a, b):
+            return torch.matmul(a, b)
+
+        compiled_fn = torch.compile(large_matmul, backend="inductor")
+        # Warm up outside the profiled region to avoid compile-time activity in
+        # the trace we validate below.
+        compiled_fn(a_warmup, b_warmup)
+        # Spyre execution is asynchronous, so drain warmup work before the
+        # profiled region starts.
+        torch.spyre.synchronize()
+
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
+        ) as prof:
+            # Move inputs during profiling so HtoD memcpy events are required in
+            # the exported trace.
+            a = a_cpu.to(device)
+            b = b_cpu.to(device)
+            output = compiled_fn(a, b)
+            # Force memset activity in the profiled region.
+            scratch = torch.zeros((M, N), dtype=torch.float16, device=device)
+            # Move the result back to CPU during profiling so DtoH memcpy events
+            # are also required in the exported trace.
+            output.cpu()
+            # Drop a temporary device allocation in the profiled region so a
+            # memory release event can be emitted before export.
+            del scratch
+            # Flush device work before the profile closes so async events land in
+            # the trace before export.
+            torch.spyre.synchronize()
+
+        with TemporaryFileName(mode="w+") as trace_path:
+            prof.export_chrome_trace(trace_path)
+
+            with open(trace_path) as f:
+                data = json.load(f)
+
+            self.assertIn("traceEvents", data, "Chrome trace is missing 'traceEvents'")
+            trace_events = data["traceEvents"]
+            self.assertTrue(trace_events, "No trace events in trace")
+
+            # Require Spyre event categories and validate their timing fields.
+            memcpy_events = [e for e in trace_events if e.get("cat") == "gpu_memcpy"]
+            htod_events = [e for e in memcpy_events if "HtoD" in e.get("name", "")]
+            dtoh_events = [e for e in memcpy_events if "DtoH" in e.get("name", "")]
+            self.assertTrue(htod_events, "Expected at least one HtoD memcpy event")
+            self.assertTrue(dtoh_events, "Expected at least one DtoH memcpy event")
+
+            def has_invalid_timing(event):
+                return event.get("ts") in (0, None) or event.get("dur") in (0, None)
+
+            htod_invalid = [e for e in htod_events if has_invalid_timing(e)]
+            dtoh_invalid = [e for e in dtoh_events if has_invalid_timing(e)]
+            self.assertFalse(
+                htod_invalid,
+                f"{len(htod_invalid)} HtoD memcpy event(s) have invalid ts/dur: "
+                + ", ".join(e.get("name", "<unnamed>") for e in htod_invalid),
+            )
+            self.assertFalse(
+                dtoh_invalid,
+                f"{len(dtoh_invalid)} DtoH memcpy event(s) have invalid ts/dur: "
+                + ", ".join(e.get("name", "<unnamed>") for e in dtoh_invalid),
+            )
+
+            memset_events = [
+                e
+                for e in trace_events
+                if e.get("cat") == "gpu_memset" and e.get("name") == "Memset (Device)"
+            ]
+            self.assertTrue(memset_events, "Expected at least one device memset event")
+            memset_invalid = [e for e in memset_events if has_invalid_timing(e)]
+            self.assertFalse(
+                memset_invalid,
+                f"{len(memset_invalid)} memset event(s) have invalid ts/dur: "
+                + ", ".join(e.get("name", "<unnamed>") for e in memset_invalid),
+            )
+
+            memrelease_events = [
+                e
+                for e in trace_events
+                if e.get("cat") == "privateuse1_driver"
+                and e.get("name") == "Memory (Release)"
+            ]
+            self.assertTrue(
+                memrelease_events, "Expected at least one memory release event"
+            )
+            memrelease_invalid = [e for e in memrelease_events if has_invalid_timing(e)]
+            self.assertFalse(
+                memrelease_invalid,
+                f"{len(memrelease_invalid)} memory release event(s) have invalid ts/dur: "
+                + ", ".join(e.get("name", "<unnamed>") for e in memrelease_invalid),
+            )
+
+            # Require kernel events and validate their timing fields
+            kernel_events = [e for e in trace_events if e.get("cat") == "kernel"]
+            self.assertTrue(kernel_events, "Expected at least one kernel event")
+            kernel_invalid = [e for e in kernel_events if has_invalid_timing(e)]
+            self.assertFalse(
+                kernel_invalid,
+                f"{len(kernel_invalid)} kernel event(s) have invalid ts/dur: "
+                + ", ".join(e.get("name", "<unnamed>") for e in kernel_invalid),
+            )
+
 
 def test_package_importable():
     """
@@ -253,8 +487,12 @@ def test_synchronize_callable():
 
 
 @pytest.mark.requires_spyre_profiler
-def test_compiled_kernel_event_keys_match_captured_debug_handles(monkeypatch):
+@pytest.mark.parametrize("compile_threads", [1, 2])
+def test_compiled_kernel_event_keys_match_captured_debug_handles(
+    monkeypatch, compile_threads
+):
     """Real events carry compiler keys and direct handles from the same process."""
+    from torch._inductor.codecache import CodeCacheFuture
     from torch_spyre._inductor.op_spec import LoopSpec, OpSpec
     from torch_spyre._inductor.profiler_event import (
         AIUPTI_ACTIVITY_NAME_MAX_BYTES,
@@ -262,11 +500,11 @@ def test_compiled_kernel_event_keys_match_captured_debug_handles(monkeypatch):
     )
     from torch_spyre.execution.async_compile import SpyreAsyncCompile
 
-    captures = []
+    pending_captures = []
     original_sdsc = SpyreAsyncCompile.sdsc
 
     def capture_sdsc(self, kernel_name, specs, pool_size=0):
-        runner = original_sdsc(self, kernel_name, specs, pool_size=pool_size)
+        result = original_sdsc(self, kernel_name, specs, pool_size=pool_size)
         handles = []
 
         def collect(spec_list):
@@ -277,14 +515,12 @@ def test_compiled_kernel_event_keys_match_captured_debug_handles(monkeypatch):
                     collect(spec.body)
 
         collect(specs)
-        if runner.kernel_provenance is not None:
-            captures.append(
-                (runner.kernel_provenance, runner.profiler_event_name, tuple(handles))
-            )
-        return runner
+        pending_captures.append((result, tuple(handles)))
+        return result
 
     monkeypatch.setattr(SpyreAsyncCompile, "sdsc", capture_sdsc)
     monkeypatch.setattr(torch._inductor.config, "force_disable_caches", True)
+    monkeypatch.setattr(torch._inductor.config, "compile_threads", compile_threads)
     torch._dynamo.reset()
 
     model = _ProfilerMLP().half().to("spyre").eval()
@@ -294,6 +530,17 @@ def test_compiled_kernel_event_keys_match_captured_debug_handles(monkeypatch):
     with torch.no_grad():
         compiled(x)
         torch.spyre.synchronize()
+
+        # The generated wrapper has now waited for all compile jobs. Inspect
+        # resolved runners here so capturing does not serialize compilation.
+        captures = []
+        for result, handles in pending_captures:
+            assert isinstance(result, CodeCacheFuture) == (compile_threads > 1)
+            runner = result.result() if isinstance(result, CodeCacheFuture) else result
+            if runner.kernel_provenance is not None:
+                captures.append(
+                    (runner.kernel_provenance, runner.profiler_event_name, handles)
+                )
 
         assert captures, "compilation produced no provenance-aware Spyre runners"
 
@@ -346,6 +593,17 @@ def test_compiled_kernel_event_keys_match_captured_debug_handles(monkeypatch):
             )
             assert all(isinstance(handle_id, str) for handle_id in debug_handles)
             assert debug_handles == list(descriptor.debug_handle_ids)
+            # Raw 32-bit device timestamps TS1..TS5. Raw ordering is not
+            # asserted: the counter wraps and unfilled slots read 0.
+            cycles_ts = args.get("cycles_ts")
+            assert isinstance(cycles_ts, list), (
+                "args.cycles_ts must be a JSON array, not a quoted string"
+            )
+            assert len(cycles_ts) == 5
+            assert all(
+                isinstance(ts, int) and 0 <= ts <= 0xFFFFFFFF for ts in cycles_ts
+            )
+            assert any(cycles_ts), "all-zero kernel cycles_ts: counters failed"
 
     def lineage(handle):
         yield handle
@@ -442,6 +700,73 @@ def test_kineto_memcpy_and_memset_events_captured():
     assert memset_events, (
         "Expected at least one memset event in the AIUPTI-backed trace"
     )
+
+    # Memcpy events carry cycles_ts only when the record has counters; flex
+    # currently reports every DMA without them, so today the key is absent.
+    # Either way, an emitted array must be valid and never all zero.
+    for e in h2d_events + d2h_events:
+        cycles_ts = e.get("args", {}).get("cycles_ts")
+        if cycles_ts is None:
+            continue
+        assert isinstance(cycles_ts, list), (
+            "args.cycles_ts must be a JSON array, not a quoted string"
+        )
+        assert len(cycles_ts) == 5
+        assert all(isinstance(ts, int) and 0 <= ts <= 0xFFFFFFFF for ts in cycles_ts)
+        assert any(cycles_ts), "memcpy cycles_ts emitted with all slots zero"
+    for e in memset_events:
+        assert "cycles_ts" not in e.get("args", {}), "memset never carries cycles_ts"
+
+
+COLL_ARG_KEYS = ("coll_group", "coll_algo", "coll_bytes")
+
+
+@pytest.mark.requires_spyre_profiler
+def test_non_collective_activities_have_no_coll_args():
+    """
+    Kernel and memcpy events outside a collective carry no coll_* args.
+    """
+    torch._dynamo.reset()
+    model = _ProfilerMLP().half().to(DEVICE_NAME).eval()
+    compiled_input = torch.randn(2, 128, dtype=torch.float16, device=DEVICE_NAME)
+    compiled = torch.compile(model, fullgraph=True)
+    with torch.no_grad():
+        compiled(compiled_input)
+        torch.spyre.synchronize()
+
+    cpu_src = torch.randn(64, 64, dtype=torch.float16)
+
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]
+    ) as prof:
+        device_tensor = cpu_src.to(DEVICE_NAME)  # H2D memcpy
+        with torch.no_grad():
+            compiled_out = compiled(compiled_input)
+        _ = device_tensor.cpu()  # D2H memcpy
+        _ = compiled_out.cpu()
+        torch.spyre.synchronize()
+
+    with TemporaryFileName(mode="w+") as fname:
+        prof.export_chrome_trace(fname)
+        with open(fname) as f:
+            trace = json.load(f)
+
+    activity_events = [
+        e
+        for e in trace["traceEvents"]
+        if e.get("ph") == "X" and e.get("cat") in {"kernel", "gpu_memcpy"}
+    ]
+    assert any(e["cat"] == "kernel" for e in activity_events), (
+        "Expected at least one compiled kernel event in the AIUPTI-backed trace"
+    )
+    assert any(e["cat"] == "gpu_memcpy" for e in activity_events), (
+        "Expected at least one memcpy event in the AIUPTI-backed trace"
+    )
+    for e in activity_events:
+        leaked = [key for key in COLL_ARG_KEYS if key in e.get("args", {})]
+        assert not leaked, (
+            f"non-collective {e['cat']} event {e.get('name')!r} carries {leaked}"
+        )
 
 
 @pytest.mark.requires_spyre_profiler
@@ -1104,4 +1429,769 @@ def test_kernel_time_overlap(tmp_path):
         pytest.fail(
             f"{len(overlaps)} Spyre device overlap(s) detected:\n"
             + "\n".join(overlap_details)
+        )
+
+
+def _find_duplicate_kernel_start_timestamps(events):
+    """Return complete Spyre kernel events and duplicate start timestamp groups."""
+    kernel_events = []
+    # Group by stream and timestamp so matching timestamps on different streams are allowed.
+    timestamp_groups = {}
+
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        if event.get("ph") != "X" or event.get("cat") != "kernel":
+            continue
+
+        timestamp = event.get("ts")
+        stream_id = event.get("tid")
+        name = event.get("name", "unknown")
+
+        assert (
+            isinstance(timestamp, (int, float))
+            and not isinstance(timestamp, bool)
+            and math.isfinite(timestamp)
+        ), (
+            f"Spyre kernel event {name} must have a finite numeric timestamp "
+            f"(ts={timestamp})"
+        )
+
+        assert isinstance(stream_id, int) and not isinstance(stream_id, bool), (
+            f"Spyre kernel event {name} must have a valid stream ID (tid={stream_id})"
+        )
+
+        kernel_events.append(event)
+
+        group_key = (stream_id, timestamp)
+
+        if group_key not in timestamp_groups:
+            timestamp_groups[group_key] = []
+
+        timestamp_groups[group_key].append(event)
+
+    duplicate_groups = [
+        (stream_id, timestamp, grouped_events)
+        for (stream_id, timestamp), grouped_events in timestamp_groups.items()
+        if len(grouped_events) > 1
+    ]
+
+    duplicate_groups.sort(key=lambda group: (group[0], group[1]))
+
+    return kernel_events, duplicate_groups
+
+
+def test_find_duplicate_kernel_start_timestamps():
+    """Verify duplicate start timestamp detection with synthetic kernel events."""
+    clean_events = [
+        {
+            "ph": "X",
+            "cat": "kernel",
+            "name": "kernel_1",
+            "ts": 0,
+            "dur": 10,
+            "tid": 1,
+        },
+        {
+            "ph": "X",
+            "cat": "kernel",
+            "name": "kernel_2",
+            "ts": 10,
+            "dur": 10,
+            "tid": 1,
+        },
+    ]
+
+    duplicate_events = [
+        {
+            "ph": "X",
+            "cat": "kernel",
+            "name": "kernel_1",
+            "ts": 0,
+            "dur": 10,
+            "tid": 1,
+        },
+        {
+            "ph": "X",
+            "cat": "kernel",
+            "name": "kernel_2",
+            "ts": 0,
+            "dur": 5,
+            "tid": 1,
+        },
+    ]
+
+    different_stream_events = [
+        {
+            "ph": "X",
+            "cat": "kernel",
+            "name": "kernel_stream_1",
+            "ts": 0,
+            "dur": 10,
+            "tid": 1,
+        },
+        {
+            "ph": "X",
+            "cat": "kernel",
+            "name": "kernel_stream_2",
+            "ts": 0,
+            "dur": 5,
+            "tid": 2,
+        },
+    ]
+
+    kernel_cpu_same_timestamp = [
+        {
+            "ph": "X",
+            "cat": "kernel",
+            "name": "kernel_1",
+            "ts": 0,
+            "dur": 10,
+            "tid": 1,
+        },
+        {
+            "ph": "X",
+            "cat": "cpu_op",
+            "name": "cpu_op_1",
+            "ts": 0,
+            "dur": 10,
+            "tid": 1,
+        },
+    ]
+
+    kernel_memory_same_timestamp = [
+        {
+            "ph": "X",
+            "cat": "kernel",
+            "name": "kernel_1",
+            "ts": 0,
+            "dur": 10,
+            "tid": 1,
+        },
+        {
+            "ph": "X",
+            "cat": "gpu_memcpy",
+            "name": "Memcpy (HtoD)",
+            "ts": 0,
+            "dur": 10,
+            "tid": 1,
+        },
+    ]
+
+    clean_kernel_events, clean_duplicates = _find_duplicate_kernel_start_timestamps(
+        clean_events
+    )
+    duplicate_kernel_events, duplicate_groups = _find_duplicate_kernel_start_timestamps(
+        duplicate_events
+    )
+    different_stream_kernel_events, different_stream_duplicates = (
+        _find_duplicate_kernel_start_timestamps(different_stream_events)
+    )
+    cpu_kernel_events, cpu_kernel_duplicates = _find_duplicate_kernel_start_timestamps(
+        kernel_cpu_same_timestamp
+    )
+    memory_kernel_events, memory_duplicates = _find_duplicate_kernel_start_timestamps(
+        kernel_memory_same_timestamp
+    )
+
+    assert len(clean_kernel_events) == 2
+    assert clean_duplicates == []
+
+    assert len(duplicate_kernel_events) == 2
+    assert len(duplicate_groups) == 1
+
+    duplicate_stream_id, duplicate_timestamp, kernels = duplicate_groups[0]
+    assert duplicate_stream_id == 1
+    assert duplicate_timestamp == 0
+    assert len(kernels) == 2
+    assert kernels[0]["name"] == "kernel_1"
+    assert kernels[1]["name"] == "kernel_2"
+
+    assert len(different_stream_kernel_events) == 2
+    assert different_stream_duplicates == []
+
+    assert len(cpu_kernel_events) == 1
+    assert cpu_kernel_duplicates == []
+
+    assert len(memory_kernel_events) == 1
+    assert memory_duplicates == []
+
+
+def test_find_duplicate_kernel_start_timestamps_invalid_events():
+    """Verify invalid kernel start timestamps are rejected."""
+    missing_timestamp_event = [
+        {"ph": "X", "cat": "kernel", "name": "kernel_missing_ts", "dur": 10}
+    ]
+
+    boolean_timestamp_event = [
+        {
+            "ph": "X",
+            "cat": "kernel",
+            "name": "kernel_boolean_ts",
+            "ts": True,
+            "dur": 10,
+        }
+    ]
+
+    non_finite_timestamp_event = [
+        {
+            "ph": "X",
+            "cat": "kernel",
+            "name": "kernel_nan_ts",
+            "ts": float("nan"),
+            "dur": 10,
+        }
+    ]
+
+    with pytest.raises(AssertionError):
+        _find_duplicate_kernel_start_timestamps(missing_timestamp_event)
+
+    with pytest.raises(AssertionError):
+        _find_duplicate_kernel_start_timestamps(boolean_timestamp_event)
+
+    with pytest.raises(AssertionError):
+        _find_duplicate_kernel_start_timestamps(non_finite_timestamp_event)
+
+
+@pytest.mark.requires_spyre_profiler
+def test_duplicate_kernel_start_timestamps(tmp_path):
+    """Verify kernel start timestamps are unique in a Spyre profiler trace."""
+    trace_file = tmp_path / "duplicate_kernel_start_timestamp_trace.json"
+
+    x = torch.randn((64, 64), dtype=torch.float16, device="spyre")
+    y = torch.randn((64, 64), dtype=torch.float16, device="spyre")
+
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]
+    ) as prof:
+        result = torch.matmul(x, y)
+        result = F.gelu(result)
+        result = torch.sum(result)
+        torch.spyre.synchronize()
+
+    prof.export_chrome_trace(str(trace_file))
+
+    assert trace_file.exists(), "Chrome trace file was not created"
+
+    with trace_file.open("r", encoding="utf-8") as trace:
+        trace_data = json.load(trace)
+
+    assert isinstance(trace_data, dict), "Trace JSON must be a dictionary"
+    assert "traceEvents" in trace_data, "Chrome trace is missing the 'traceEvents' key"
+
+    trace_events = trace_data["traceEvents"]
+    assert isinstance(trace_events, list), "'traceEvents' must contain a list"
+
+    kernel_events, duplicate_groups = _find_duplicate_kernel_start_timestamps(
+        trace_events
+    )
+
+    assert len(kernel_events) >= 2, (
+        "Expected at least two Spyre kernel events for duplicate timestamp validation"
+    )
+
+    if duplicate_groups:
+        duplicate_details = []
+
+        for stream_id, timestamp, grouped_events in duplicate_groups[:10]:
+            event_details = []
+
+            for event in grouped_events:
+                details = (
+                    f"{event.get('name', 'unknown')} "
+                    f"(ts={event.get('ts')}, dur={event.get('dur', 'unknown')}, "
+                    f"pid={event.get('pid', 'unknown')}, "
+                    f"tid={event.get('tid', 'unknown')})"
+                )
+                event_details.append(details)
+
+            duplicate_details.append(
+                f"tid={stream_id}, ts={timestamp}: {', '.join(event_details)}"
+            )
+
+        pytest.fail(
+            f"{len(duplicate_groups)} duplicate kernel start timestamp group(s) "
+            f"detected:\n" + "\n".join(duplicate_details)
+        )
+
+
+@pytest.mark.requires_spyre_profiler
+def test_runtime_events_emitted_on_multiple_thread_rows():
+    """Runtime activities are attributed to the flex thread that emitted them,
+    so they span more than one thread row instead of collapsing onto one."""
+    cpu_src = torch.randn(64, 64, dtype=torch.float16)
+
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]
+    ) as prof:
+        device_tensor = cpu_src.to("spyre")
+        _ = device_tensor + device_tensor
+        _ = device_tensor.cpu()
+        torch.spyre.synchronize()
+
+    with TemporaryFileName(mode="w+") as fname:
+        prof.export_chrome_trace(fname)
+        with open(fname) as f:
+            trace = json.load(f)
+
+    events = trace.get("traceEvents", [])
+    runtime_tids = {
+        e["tid"]
+        for e in events
+        if e.get("cat") == "privateuse1_runtime" and e.get("ph") == "X"
+    }
+
+    assert runtime_tids, (
+        "Expected at least one runtime event in the AIUPTI-backed trace"
+    )
+    assert len(runtime_tids) > 1, (
+        f"Runtime events all landed on tid(s) {sorted(runtime_tids)}; "
+        "expected more than one thread row"
+    )
+
+
+_RUNTIME_DEVICE_PAIRS = {
+    "aiuLaunchDMIControlBlocks": ("gpu_memcpy", "HtoD"),
+    "aiuLaunchDMOControlBlocks": ("gpu_memcpy", "DtoH"),
+    "aiuLaunchControlBlocks": ("kernel", None),
+}
+
+
+def _find_runtime_device_pair_errors(events):
+    """Find invalid runtime-to-device event pairs using correlation IDs."""
+    runtime_events = []
+    errors = []
+    runtime_correlations = set()
+
+    for runtime_event in events:
+        if not isinstance(runtime_event, dict):
+            continue
+        if runtime_event.get("cat") != "privateuse1_runtime":
+            continue
+
+        runtime_name = runtime_event.get("name")
+        if runtime_name not in _RUNTIME_DEVICE_PAIRS:
+            continue
+
+        runtime_events.append(runtime_event)
+
+        runtime_args = runtime_event.get("args") or {}
+        correlation = runtime_args.get("correlation")
+
+        if correlation is None:
+            errors.append(f"{runtime_name}: missing correlation ID")
+            continue
+
+        if correlation in runtime_correlations:
+            errors.append(f"duplicate runtime correlation ID {correlation}")
+            continue
+
+        runtime_correlations.add(correlation)
+
+        expected_cat, expected_call = _RUNTIME_DEVICE_PAIRS[runtime_name]
+
+        correlated_device_events = []
+
+        for device_event in events:
+            if not isinstance(device_event, dict):
+                continue
+            if device_event.get("cat") not in {"kernel", "gpu_memcpy"}:
+                continue
+
+            device_args = device_event.get("args") or {}
+            if device_args.get("correlation") == correlation:
+                correlated_device_events.append(device_event)
+
+        if not correlated_device_events:
+            errors.append(
+                f"{runtime_name} correlation {correlation}: no correlated device event"
+            )
+            continue
+
+        if len(correlated_device_events) > 1:
+            errors.append(
+                f"{runtime_name} correlation {correlation}: "
+                f"found {len(correlated_device_events)} correlated device events"
+            )
+            continue
+
+        correct_type = [
+            event
+            for event in correlated_device_events
+            if event.get("cat") == expected_cat
+        ]
+
+        if not correct_type:
+            actual_types = ", ".join(
+                event.get("cat", "unknown") for event in correlated_device_events
+            )
+            errors.append(
+                f"{runtime_name} correlation {correlation}: "
+                f"expected {expected_cat}, found {actual_types}"
+            )
+            continue
+
+        matching_events = correct_type
+
+        if expected_call is not None:
+            matching_events = [
+                event
+                for event in correct_type
+                if (event.get("args") or {}).get("call") == expected_call
+            ]
+
+            if not matching_events:
+                actual_calls = ", ".join(
+                    str((event.get("args") or {}).get("call")) for event in correct_type
+                )
+                errors.append(
+                    f"{runtime_name} correlation {correlation}: "
+                    f"expected memcpy direction {expected_call}, "
+                    f"found {actual_calls}"
+                )
+                continue
+
+        if len(matching_events) > 1:
+            errors.append(
+                f"{runtime_name} correlation {correlation}: "
+                f"found {len(matching_events)} matching device events"
+            )
+            continue
+
+        device_event = matching_events[0]
+
+        # Kernel timestamp ordering is covered by the shifted timestamp validation.
+        if runtime_name == "aiuLaunchControlBlocks":
+            continue
+
+        runtime_ts = runtime_event.get("ts")
+        device_ts = device_event.get("ts")
+
+        runtime_ts_valid = (
+            isinstance(runtime_ts, (int, float))
+            and not isinstance(runtime_ts, bool)
+            and math.isfinite(runtime_ts)
+        )
+        device_ts_valid = (
+            isinstance(device_ts, (int, float))
+            and not isinstance(device_ts, bool)
+            and math.isfinite(device_ts)
+        )
+
+        if not runtime_ts_valid:
+            errors.append(
+                f"{runtime_name} correlation {correlation}: "
+                f"invalid runtime timestamp {runtime_ts}"
+            )
+            continue
+
+        if not device_ts_valid:
+            errors.append(
+                f"{runtime_name} correlation {correlation}: "
+                f"invalid device timestamp {device_ts}"
+            )
+            continue
+
+        if device_ts < runtime_ts:
+            errors.append(
+                f"{runtime_name} correlation {correlation}: "
+                f"device event starts before runtime launch "
+                f"({device_ts} < {runtime_ts})"
+            )
+
+    return runtime_events, errors
+
+
+def test_runtime_device_correlation_pairs():
+    """Verify valid runtime launches map to the expected device events."""
+    events = [
+        {
+            "cat": "privateuse1_runtime",
+            "name": "aiuLaunchDMIControlBlocks",
+            "ts": 100,
+            "args": {"correlation": 10},
+        },
+        {
+            "cat": "gpu_memcpy",
+            "name": "Memcpy (HtoD)",
+            "ts": 110,
+            "args": {"correlation": 10, "call": "HtoD"},
+        },
+        {
+            "cat": "privateuse1_runtime",
+            "name": "aiuLaunchControlBlocks",
+            "ts": 120,
+            "args": {"correlation": 11},
+        },
+        {
+            "cat": "kernel",
+            "name": "synthetic_kernel",
+            "ts": 130,
+            "args": {"correlation": 11},
+        },
+        {
+            "cat": "privateuse1_runtime",
+            "name": "aiuLaunchDMOControlBlocks",
+            "ts": 140,
+            "args": {"correlation": 12},
+        },
+        {
+            "cat": "gpu_memcpy",
+            "name": "Memcpy (DtoH)",
+            "ts": 150,
+            "args": {"correlation": 12, "call": "DtoH"},
+        },
+        {
+            "cat": "gpu_memset",
+            "name": "Memset (Device)",
+            "ts": 105,
+            "args": {"correlation": 0},
+        },
+        {
+            "cat": "cpu_op",
+            "name": "aten::matmul",
+            "ts": 90,
+            "args": {},
+        },
+    ]
+
+    runtime_events, errors = _find_runtime_device_pair_errors(events)
+
+    assert len(runtime_events) == 3
+    assert errors == []
+
+
+@pytest.mark.parametrize(
+    ("events", "expected_error"),
+    [
+        (
+            [
+                {
+                    "cat": "privateuse1_runtime",
+                    "name": "aiuLaunchDMIControlBlocks",
+                    "ts": 100,
+                    "args": {"correlation": 20},
+                }
+            ],
+            "no correlated device event",
+        ),
+        (
+            [
+                {
+                    "cat": "privateuse1_runtime",
+                    "name": "aiuLaunchDMIControlBlocks",
+                    "ts": 100,
+                    "args": {"correlation": 30},
+                },
+                {
+                    "cat": "gpu_memcpy",
+                    "name": "Memcpy (HtoD)",
+                    "ts": 110,
+                    "args": {"correlation": 31, "call": "HtoD"},
+                },
+            ],
+            "no correlated device event",
+        ),
+        (
+            [
+                {
+                    "cat": "privateuse1_runtime",
+                    "name": "aiuLaunchDMIControlBlocks",
+                    "ts": 100,
+                    "args": {"correlation": 40},
+                },
+                {
+                    "cat": "kernel",
+                    "name": "wrong_device_type",
+                    "ts": 110,
+                    "args": {"correlation": 40},
+                },
+            ],
+            "expected gpu_memcpy, found kernel",
+        ),
+        (
+            [
+                {
+                    "cat": "privateuse1_runtime",
+                    "name": "aiuLaunchDMIControlBlocks",
+                    "ts": 100,
+                    "args": {"correlation": 50},
+                },
+                {
+                    "cat": "gpu_memcpy",
+                    "name": "Memcpy (DtoH)",
+                    "ts": 110,
+                    "args": {"correlation": 50, "call": "DtoH"},
+                },
+            ],
+            "expected memcpy direction HtoD",
+        ),
+        (
+            [
+                {
+                    "cat": "privateuse1_runtime",
+                    "name": "aiuLaunchDMIControlBlocks",
+                    "ts": 200,
+                    "args": {"correlation": 60},
+                },
+                {
+                    "cat": "gpu_memcpy",
+                    "name": "Memcpy (HtoD)",
+                    "ts": 190,
+                    "args": {"correlation": 60, "call": "HtoD"},
+                },
+            ],
+            "device event starts before runtime launch",
+        ),
+        (
+            [
+                {
+                    "cat": "privateuse1_runtime",
+                    "name": "aiuLaunchControlBlocks",
+                    "ts": 100,
+                    "args": {},
+                }
+            ],
+            "missing correlation ID",
+        ),
+        (
+            [
+                {
+                    "cat": "privateuse1_runtime",
+                    "name": "aiuLaunchDMIControlBlocks",
+                    "ts": 100,
+                    "args": {"correlation": 80},
+                },
+                {
+                    "cat": "privateuse1_runtime",
+                    "name": "aiuLaunchDMIControlBlocks",
+                    "ts": 105,
+                    "args": {"correlation": 80},
+                },
+                {
+                    "cat": "gpu_memcpy",
+                    "name": "Memcpy (HtoD)",
+                    "ts": 110,
+                    "args": {"correlation": 80, "call": "HtoD"},
+                },
+            ],
+            "duplicate runtime correlation ID 80",
+        ),
+        (
+            [
+                {
+                    "cat": "privateuse1_runtime",
+                    "name": "aiuLaunchDMIControlBlocks",
+                    "ts": float("nan"),
+                    "args": {"correlation": 81},
+                },
+                {
+                    "cat": "gpu_memcpy",
+                    "name": "Memcpy (HtoD)",
+                    "ts": 110,
+                    "args": {"correlation": 81, "call": "HtoD"},
+                },
+            ],
+            "invalid runtime timestamp",
+        ),
+        (
+            [
+                {
+                    "cat": "privateuse1_runtime",
+                    "name": "aiuLaunchDMIControlBlocks",
+                    "ts": 100,
+                    "args": {"correlation": 82},
+                },
+                {
+                    "cat": "gpu_memcpy",
+                    "name": "Memcpy (HtoD)",
+                    "ts": float("inf"),
+                    "args": {"correlation": 82, "call": "HtoD"},
+                },
+            ],
+            "invalid device timestamp",
+        ),
+        (
+            [
+                {
+                    "cat": "privateuse1_runtime",
+                    "name": "aiuLaunchDMIControlBlocks",
+                    "ts": 100,
+                    "args": {"correlation": 83},
+                },
+                {
+                    "cat": "gpu_memcpy",
+                    "name": "Memcpy (HtoD)",
+                    "ts": 110,
+                    "args": {"correlation": 83, "call": "HtoD"},
+                },
+                {
+                    "cat": "kernel",
+                    "name": "unexpected_kernel",
+                    "ts": 120,
+                    "args": {"correlation": 83},
+                },
+            ],
+            "found 2 correlated device events",
+        ),
+    ],
+)
+def test_runtime_device_correlation_pair_errors(events, expected_error):
+    """Verify invalid runtime-to-device correlation pairs are rejected."""
+    _, errors = _find_runtime_device_pair_errors(events)
+
+    assert len(errors) == 1
+    assert expected_error in errors[0]
+
+
+@pytest.mark.requires_spyre_profiler
+def test_runtime_device_correlation_on_trace(tmp_path):
+    """Verify Spyre runtime-to-device correlation validation on a hardware trace."""
+    trace_file = tmp_path / "runtime_device_correlation_trace.json"
+
+    x_cpu = torch.randn((64, 64), dtype=torch.float16)
+    y_cpu = torch.randn((64, 64), dtype=torch.float16)
+
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]
+    ) as prof:
+        x = x_cpu.to("spyre")
+        y = y_cpu.to("spyre")
+        result = torch.matmul(x, y)
+        result = F.gelu(result)
+        result = torch.sum(result)
+        result.cpu()
+        torch.spyre.synchronize()
+
+    prof.export_chrome_trace(str(trace_file))
+
+    assert trace_file.exists(), "Chrome trace file was not created"
+
+    with trace_file.open("r", encoding="utf-8") as trace:
+        trace_data = json.load(trace)
+
+    assert isinstance(trace_data, dict), "Trace JSON must be a dictionary"
+    assert "traceEvents" in trace_data, "Chrome trace is missing the 'traceEvents' key"
+
+    trace_events = trace_data["traceEvents"]
+    assert isinstance(trace_events, list), "'traceEvents' must contain a list"
+
+    runtime_events, errors = _find_runtime_device_pair_errors(trace_events)
+
+    runtime_names = {event.get("name") for event in runtime_events}
+    expected_runtime_names = {
+        "aiuLaunchDMIControlBlocks",
+        "aiuLaunchDMOControlBlocks",
+        "aiuLaunchControlBlocks",
+    }
+
+    assert expected_runtime_names.issubset(runtime_names), (
+        "Expected all Spyre runtime launch types for runtime/device correlation "
+        f"validation; missing: {sorted(expected_runtime_names - runtime_names)}"
+    )
+
+    if errors:
+        pytest.fail(
+            f"{len(errors)} invalid Spyre runtime/device pair(s) detected:\n"
+            + "\n".join(errors[:10])
         )

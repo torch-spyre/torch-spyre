@@ -40,6 +40,7 @@ from .pass_utils import iteration_space
 from .logging_utils import get_inductor_logger
 from .scratchpad.lx_relayout import (
     demote_lx_relayout_group,
+    local_lx_emission_contract,
     materialized_lx_relayout_for_destination,
 )
 from .op_spec import LoopSpec
@@ -110,7 +111,7 @@ def _loop_count(node: BaseSchedulerNode, depth: int) -> sympy.Expr:
 
     ``loop_count`` on the ir.Operation is a list of trip counts, one per
     nesting level from outermost to innermost (stamped by
-    coarse_tile_pre_stickify()/coarse_tile_post_stickify()).
+    coarse_tile_post_stickify() or the for_each_tile lowering).
     ``depth`` is the absolute nesting depth being queried (0 = outermost).
 
     For a flat (depth-1) op, ``loop_count = [K]`` and only depth 0 is valid.
@@ -432,107 +433,18 @@ def prepare_spyre_kernels(
     )
 
 
-def verify_carried_reduction_ownership(
-    nodes: list[BaseSchedulerNode],
-) -> list[BaseSchedulerNode]:
-    """Require carried-reduction stages and their committed LX ownership to survive.
+class SuperDSCScheduling(BaseScheduling):
+    """Inductor scheduling backend for Spyre.
 
-    Kernel preparation already proved each access against the physical view.
-    After HBM-pool planning, check that the stages, accesses, and view still exist.
+    Inductor's own node-pairwise fusion (`can_fuse_vertical`/
+    `can_fuse_horizontal` below) is permanently disabled, not merely
+    unimplemented. Spyre does its own op-to-kernel grouping in a later,
+    separate stage: `spyre_fuse_nodes` in `fusion.py` bundles
+    `BaseSchedulerNode`s into `SuperDSCBundle`s, and each bundle maps
+    one-to-one to a `SpyreKernel` device launch. See
+    `docs/source/compiler/inductor_frontend.md` for the full pipeline.
     """
 
-    grouped: dict[object, dict[str, SchedulerNode]] = {}
-    for node in _all_scheduler_nodes(nodes):
-        record = getattr(node.node, "_carried_reduction_record", None)
-        if record is not None:
-            grouped.setdefault(record, {})[node.get_name()] = node
-
-    for record, by_name in grouped.items():
-        expected_names = {
-            record.fill_name,
-            record.combine_name,
-            record.drain_name,
-        }
-        missing = expected_names - by_name.keys()
-        if missing:
-            raise Unsupported(
-                "carried reduction lost physical stages after fusion: "
-                f"accumulator={record.accumulator_name}, missing={sorted(missing)}"
-            )
-
-        accumulator = V.graph.try_get_buffer(record.accumulator_name)
-        if accumulator is None:
-            raise Unsupported(
-                f"carried reduction accumulator {record.accumulator_name} is missing"
-            )
-        layout = accumulator.get_layout()
-        if not isinstance(layout, FixedTiledLayout):
-            raise Unsupported(
-                f"carried reduction accumulator {record.accumulator_name} has "
-                f"non-device layout {type(layout).__name__}"
-            )
-        if "lx" not in layout.allocation:
-            logger.info(
-                "carried reduction %s remained in HBM; execution is correct but "
-                "the persistent-LX performance contract was not realized",
-                record.accumulator_name,
-            )
-            continue
-
-        checks = (
-            (record.fill_name, "write"),
-            (record.combine_name, "read"),
-            (record.combine_name, "write"),
-            (record.drain_name, "read"),
-        )
-        if layout.lx_view is None:
-            raise Unsupported(
-                f"carried reduction accumulator {record.accumulator_name} has "
-                "an LX address but no physical ownership"
-            )
-        for op_name, access in checks:
-            node = by_name[op_name]
-            deps = (
-                node.read_writes.reads if access == "read" else node.read_writes.writes
-            )
-            dep = next(
-                (
-                    candidate
-                    for candidate in deps
-                    if isinstance(candidate, MemoryDep)
-                    and candidate.name == record.accumulator_name
-                ),
-                None,
-            )
-            if dep is None and access == "write" and op_name == record.combine_name:
-                # MutationLayout's scheduled write is named after the combine
-                # op, while its storage target is the carried accumulator.
-                memory_deps = [
-                    candidate for candidate in deps if isinstance(candidate, MemoryDep)
-                ]
-                dep = memory_deps[0] if len(memory_deps) == 1 else None
-            if dep is None and access == "read" and op_name == record.drain_name:
-                # Mutation propagation names this dependency after the latest
-                # in-place writer, but it still reads the accumulator storage.
-                memory_deps = [
-                    candidate for candidate in deps if isinstance(candidate, MemoryDep)
-                ]
-                dep = memory_deps[0] if len(memory_deps) == 1 else None
-            if dep is None:
-                raise Unsupported(
-                    f"carried reduction {op_name} lost its {access} of "
-                    f"{record.accumulator_name}; deps="
-                    f"{[(type(candidate).__name__, candidate.name) for candidate in deps]}"
-                )
-            # The row decision was made by carried_reduction_pinned_row before
-            # placement. Kernel preparation above already proved this
-            # stage can consume the committed physical view. Do not recreate a
-            # symbol correspondence from post-scheduler loop position here.
-
-    return nodes
-
-
-class SuperDSCScheduling(BaseScheduling):
     def group_fn(self, sizes):
         """
         Process the iteration sizes in case a transformation needs to be applied.
@@ -559,18 +471,20 @@ class SuperDSCScheduling(BaseScheduling):
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
     ) -> bool:
         """
-        Check whether node1 and node2 can be vertically fused or not.
+        Always False: Inductor-level fusion is disabled by design. Spyre's
+        real op-to-kernel grouping happens later, in `spyre_fuse_nodes`
+        (see the class docstring above).
         """
-        # TODO: Revisit this as part of https://github.com/torch-spyre/torch-spyre/issues/826
         return False
 
     def can_fuse_horizontal(
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
     ) -> bool:
         """
-        Check whether node1 and node2 can be horizontally fused or not.
+        Always False: Inductor-level fusion is disabled by design. Spyre's
+        real op-to-kernel grouping happens later, in `spyre_fuse_nodes`
+        (see the class docstring above).
         """
-        # TODO: Revisit this as part of https://github.com/torch-spyre/torch-spyre/issues/826
         return False
 
     def generate_node_schedule(self, nodes: Sequence[BaseSchedulerNode]):
@@ -634,6 +548,9 @@ class SuperDSCScheduling(BaseScheduling):
         # _codegen_into_kernel may reach further inner nodes, so the set can be a
         # subset -- which errs towards declining.
         kernel.fused_node_names = OrderedSet(n.get_name() for n in nodes)
+        kernel.local_read_contract_factory = lambda name, consumer: (
+            local_lx_emission_contract(V.graph, name, consumer)
+        )
         with kernel:
             self._codegen_into_kernel(nodes, kernel)
         if isinstance(node, CountedLoopSchedulerNode):

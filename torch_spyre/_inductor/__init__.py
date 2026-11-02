@@ -16,6 +16,7 @@ from .constants import DEVICE_NAME
 from .patches import enable_spyre_context, patch_inductor_fusions
 from . import config
 
+import os
 import threading
 from functools import wraps
 from typing import Any
@@ -87,6 +88,7 @@ def enable_spyre_compile_fx_wrapper():
         patch_inductor_fusions()
 
         _orig = cfx.compile_fx
+        from torch_spyre._inductor import timing_recorder
         from torch_spyre._inductor.logging_utils import get_inductor_logger
 
         logger = get_inductor_logger("compile_fx_wrapper")
@@ -178,8 +180,12 @@ def enable_spyre_compile_fx_wrapper():
                     _prev_in_spyre = getattr(_compile_state, "in_spyre_compile", False)
                     _compile_state.in_spyre_compile = True
                     try:
-                        with enable_spyre_context(example_inputs):
-                            return _orig(gm, example_inputs, *args, **kwargs)
+                        # The outermost region of one Spyre compile: every other
+                        # timed region nests inside it, so a frontend total is
+                        # this minus the per-kernel backend calls.
+                        with timing_recorder.stage("stage:compile_fx:spyre_compile"):
+                            with enable_spyre_context(example_inputs):
+                                return _orig(gm, example_inputs, *args, **kwargs)
                     finally:
                         _compile_state.in_spyre_compile = _prev_in_spyre
 
@@ -202,6 +208,38 @@ def _light_autoload():
     from . import distributed as _distributed_init  # noqa: F401  registers spyre::broadcast_async/wait_work
 
     enable_spyre_compile_fx_wrapper()
+
+
+# Name of the ``scan`` higher-order op as PyTorch's cache checks see it.
+_SCAN_HOP_NAME = "torch.ops.higher_order.scan"
+# Salt for the cache key of graphs that contain ``scan``. Change it to drop
+# every cached graph that has a ``scan`` in it.
+_SCAN_CACHE_SALT = "torch-spyre-scan-v1"
+
+
+def _allow_scan_graph_caching() -> None:
+    """Let the FX graph and AOTAutograd caches keep graphs that use ``scan``.
+
+    On by default; turn off with ``TORCH_SPYRE_CACHE_SCAN=0``. ``for_each_tile`` (used by the
+    SDPA K/V loop) is the ``scan`` op, and PyTorch skips the caches for any
+    graph with a higher-order op it does not know is cacheable. So every
+    SDPA with more than one K/V block is compiled again in every process.
+    The ``scan`` body is a subgraph of the cached graph and is part of the
+    cache key like the rest of the graph; the salt is added to the key too.
+
+    What "unsafe" leaves to us: PyTorch does not check that ``scan`` itself
+    is safe to cache. Tensors used inside the body are hashed by value (or
+    are graph inputs), except non-inlined frozen parameters, which are hashed
+    by metadata only, as for any other graph. A change to ``scan`` in PyTorch
+    is not in the key: bump ``_SCAN_CACHE_SALT`` to drop old entries.
+    """
+    if os.environ.get("TORCH_SPYRE_CACHE_SCAN", "1") != "1":
+        return
+    import torch._inductor.config as inductor_config
+
+    marked = dict(inductor_config.unsafe_marked_cacheable_functions)
+    marked.setdefault(_SCAN_HOP_NAME, _SCAN_CACHE_SALT)
+    inductor_config.unsafe_marked_cacheable_functions = marked
 
 
 def _autoload():
@@ -241,5 +279,7 @@ def _autoload():
             SpyrePythonWrapperCodegen,
             device_custom_config=config,
         )
+
+        _allow_scan_graph_caching()
 
         _autoload._ran = True

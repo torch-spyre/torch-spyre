@@ -163,6 +163,32 @@ inline bool isDCIConversionSupported(DataFormats src, DataFormats dst) {
   return false;
 }
 
+// Bytes per element of a host DataFormat as deeptools' bounds check sees it
+// (elemBytesForBoundCheck); 0 for packed sub-byte formats.
+inline size_t hostFormatBytes(DataFormats df) {
+  switch (df) {
+    case DataFormats::IEEE_INT64:
+      return 8;
+    case DataFormats::IEEE_FP32:
+    case DataFormats::SENUINT32:
+    case DataFormats::IEEE_INT32:
+      return 4;
+    case DataFormats::BFLOAT16:
+    case DataFormats::SEN169_FP16:
+    case DataFormats::IEEE_FP16:
+    case DataFormats::SENINT16:
+      return 2;
+    case DataFormats::SENINT8:
+    case DataFormats::SEN080_FP8:
+    case DataFormats::SEN143_FP8:
+    case DataFormats::SEN152_FP8:
+    case DataFormats::BOOL:
+      return 1;
+    default:
+      return 0;  // sub-byte or unknown: no single byte width
+  }
+}
+
 inline std::pair<size_t, size_t> elementSize(const c10::ScalarType& dtype) {
   /* return size (bytes) on CPU and on Spyre*/
   static const std::unordered_map<c10::ScalarType, std::pair<size_t, size_t>>

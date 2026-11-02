@@ -23,12 +23,8 @@
 #include <variant>
 #include <vector>
 
-#include "flex/memory_interface/raii_buffer.hpp"
-#include "flex/runtime_stream/operations/runtime_operation_host_produce.hpp"
-#include "spyre_allocator.h"
 #include "spyre_composite_address.h"
 #include "spyre_stream.h"
-#include "spyrecode-host-functions/processSpyreCodeArtifacts.h"
 
 namespace spyre {
 
@@ -62,8 +58,9 @@ void JobPlanStepD2H::construct(LaunchContext& ctx,
     stream.launchD2H(params);
     flex::destroyDmaParams(params);
   } else {
-    const uint64_t dmva = std::get<Dmva>(device_address_).value;
-    auto segment_id = flex::dmvaToSegmentId(dmva);
+    const uint64_t device_ptr = std::get<Dmva>(device_address_).value;
+    const auto [segment_id, segment_offset, segment_type] =
+        flex::decodeDevicePointer(device_ptr);
     TORCH_CHECK(segment_id < ctx.inputs_outputs.size(),
                 "D2H tensor-segment lookup out of range: segment ", segment_id,
                 " but only ", ctx.inputs_outputs.size(),
@@ -73,7 +70,6 @@ void JobPlanStepD2H::construct(LaunchContext& ctx,
     TORCH_CHECK(tensor_address.chunks().size() == 1,
                 "Tensor address must have 1 chunk");
     const auto& base_chunk = tensor_address.chunks()[0];
-    uint64_t segment_offset = dmva - (segment_id << flex::SEGMENT_SIZE_BITS);
     TORCH_CHECK(segment_offset + size_ <= tensor_address.total_size(),
                 "D2H transfer out of bounds: offset ", segment_offset,
                 " + size ", size_, " exceeds tensor allocation size ",
@@ -90,7 +86,8 @@ void JobPlanStepD2H::construct(LaunchContext& ctx,
         flex::createDmaParams(host_address_, device_address->total_size(),
                               /*to_device=*/false, device_address.get());
     params->pipeline_barrier = pipeline_barrier_;
-    params->callback = [device_address](void*) {};
+    params->callback = [device_address](void*,
+                                        const flex::FlexCallbackMetadata*) {};
     stream.launchD2H(params);
     flex::destroyDmaParams(params);
   }
@@ -117,11 +114,14 @@ void JobPlanStepCompute::construct(LaunchContext& ctx,
       tensor_allocs.push_back(get_composite_address(tensor));
     }
   }
-  auto* params = flex::createComputeParams(
-      &program_address_, std::move(tensor_allocs), name_, bootstrap_offset_);
+  std::unique_ptr<flex::ComputeParams, decltype(&flex::destroyComputeParams)>
+      params(
+          flex::createComputeParams(&program_address_, std::move(tensor_allocs),
+                                    name_, bootstrap_offset_),
+          flex::destroyComputeParams);
+  params->program_corrections = std::move(ctx.program_corrections);
   params->pipeline_barrier = pipeline_barrier_;
-  stream.launchCompute(params);
-  flex::destroyComputeParams(params);
+  stream.launchCompute(params.get());
 }
 
 void JobPlanStepCompute::write(std::ostream& os) const {
@@ -134,22 +134,19 @@ void JobPlanStepCompute::write(std::ostream& os) const {
      << "\n";
 }
 
-std::vector<int64_t> JobPlanStepHostCompute::resolveSymbolicArgs(
+// NOTE: kDimension is not yet implemented; only kAddress is supported.
+std::vector<flex::HostComputeArg> JobPlanStepHostCompute::resolveSymbolicArgs(
     const std::vector<at::Tensor>& tensors,
     const std::vector<SymbolicArg>& symbolic_args) {
-  auto& allocator = SpyreAllocator::instance();
-  std::vector<int64_t> resolved(symbolic_args.size());
+  std::vector<flex::HostComputeArg> resolved(symbolic_args.size());
   for (size_t i = 0; i < symbolic_args.size(); ++i) {
     const SymbolicArg& arg = symbolic_args[i];
     TORCH_CHECK(arg.tensor_id >= 0 &&
                     static_cast<size_t>(arg.tensor_id) < tensors.size(),
-                "SymbolicArg[", i, "].tensor_id=", arg.tensor_id,
-                " out of range [0, ", tensors.size(), ")");
+                "symbolic_args tensor_id out of range");
     switch (arg.kind) {
       case SymbolicArgKind::kAddress:
-        resolved[i] =
-            static_cast<int64_t>(allocator.compositeAddressToDeviceAddress(
-                *get_composite_address(tensors[arg.tensor_id])));
+        resolved[i] = get_composite_address(tensors[arg.tensor_id]);
         break;
       case SymbolicArgKind::kDimension:
         TORCH_CHECK(false,
@@ -165,119 +162,81 @@ std::vector<int64_t> JobPlanStepHostCompute::resolveSymbolicArgs(
 
 void JobPlanStepHostCompute::construct(LaunchContext& ctx,
                                        const SpyreStream& stream) const {
-  // Alignment for the staged RaiiBuffer: use the device's IOVA alignment so
-  // the buffer is correctly mapped on all platforms (64 KB on PowerPC, 4 KB
-  // on x86/s390x).
-  const size_t kAlign = flex::RuntimeContext::getInstance()
-                            ->getDeviceHandle()
-                            ->GetIovaAlignment();
+  std::vector<flex::HostComputeArg> args;
 
-  // Build the producer body.  All three source cases produce the same type
-  // (shared_ptr<RaiiBuffer>) via different fill strategies; the kind label
-  // "correction" surfaces in logs/profiler only.
-  flex::RuntimeOperationHostProduce::Producer producer;
-
-  if (input_buffer_ != nullptr) {
-    // Case 1: input_buffer_ is provided — use it directly as the source.
-    producer = [this, kAlign]() -> std::shared_ptr<flex::RaiiBuffer> {
-      auto buf = std::make_shared<flex::RaiiBuffer>(correction_size_, kAlign);
-      deeptools::processComputeOnHostCommand(*hcm_, buf->Pointer(),
-                                             input_buffer_);
-      return buf;
-    };
-  } else if (ishape_.size() == 1 && ishape_[0] == 0) {
-    // Case 2: fake symbols (ishape_ is {0}) — nullptr src argument.
-    producer = [this, kAlign]() -> std::shared_ptr<flex::RaiiBuffer> {
-      auto buf = std::make_shared<flex::RaiiBuffer>(correction_size_, kAlign);
-      deeptools::processComputeOnHostCommand(*hcm_, buf->Pointer(), nullptr);
-      return buf;
-    };
-  } else if (!ctx.symbolic_args.empty()) {
-    // Case 3a: typed symbolic payload — resolve addresses by kind.
-    std::vector<int64_t> resolved_addresses =
-        resolveSymbolicArgs(ctx.inputs_outputs, ctx.symbolic_args);
-
-    // Wrong symbolic_args count is an OOB read inside deeptools
-    // (DT_CHECK_MSG_OPT is compiled out by default).
-    TORCH_CHECK(resolved_addresses.size() == hcm_->vdci.inputSym_.size(),
-                "symbolic_args count (", resolved_addresses.size(),
-                ") does not match compiled symbol count (",
-                hcm_->vdci.inputSym_.size(), ") for this host-compute step");
-
-    producer = [this, kAlign,
-                resolved_addresses]() -> std::shared_ptr<flex::RaiiBuffer> {
-      auto buf = std::make_shared<flex::RaiiBuffer>(correction_size_, kAlign);
-      deeptools::processComputeOnHostCommand(*hcm_, buf->Pointer(),
-                                             &resolved_addresses);
-      return buf;
-    };
-  } else {
-    // Case 3b: no payload — legacy path: treat every context tensor as an
-    // address source in iteration order.  Back-compat for callers that pass no
-    // symbolic_args (empty payload).
-    std::vector<int64_t> addresses(ctx.inputs_outputs.size());
-    int addr_idx = 0;
-    auto& allocator = SpyreAllocator::instance();
-    for (auto& tensor : ctx.inputs_outputs) {
-      int64_t addr =
-          static_cast<int64_t>(allocator.compositeAddressToDeviceAddress(
-              (static_cast<SharedOwnerCtx*>(
-                   tensor.storage().data_ptr().get_context())
-                   ->composite_addr)));
-      addresses[addr_idx++] = addr;
+  // Cases 1 and 2 need no address args, input_buffer_ and ishape_ carry
+  // the distinction into HostComputeParams directly.
+  if (input_buffer_ == nullptr && !(ishape_.size() == 1 && ishape_[0] == 0)) {
+    if (!ctx.symbolic_args.empty()) {
+      // Case 3a: typed symbolic args — delegate to resolveSymbolicArgs.
+      args = resolveSymbolicArgs(ctx.inputs_outputs, ctx.symbolic_args);
+    } else {
+      // Case 3b: legacy: one Address arg per context tensor in order.
+      for (const auto& tensor : ctx.inputs_outputs) {
+        args.push_back(get_composite_address(tensor));
+      }
     }
-
-    producer = [this, kAlign,
-                addresses]() -> std::shared_ptr<flex::RaiiBuffer> {
-      auto buf = std::make_shared<flex::RaiiBuffer>(correction_size_, kAlign);
-      // Use fast path with all tensor addresses.
-      deeptools::processComputeOnHostCommandFast(
-          fast_plan_, *hcm_, buf->Pointer(), addresses.data(),
-          addresses.size());
-      return buf;
-    };
   }
 
-  // Wrap in a RuntimeOperationHostProduce so the correction producer uses
-  // the same uniform HostProduce type as the DCI path in flex.  The kind
-  // label "correction" surfaces in logs/profiler but never selects a code path.
-  flex::RuntimeOperationHostProduce produce_op(std::move(producer),
-                                               /*kind=*/"correction");
+  auto* params = flex::createHostComputeParams(handle_.get(), correction_size_,
+                                               input_buffer_, std::move(args));
 
-  // Run the producer on the caller thread and obtain the staged buffer.
-  // output_buffer_ is not written; the correction bytes live only in the
-  // RaiiBuffer returned here and are freed when the DMA completion callback
-  // fires (see params->callback below).
-  auto staged = produce_op.produce();
+  struct Guard {
+    flex::HostComputeParams* p;
+    ~Guard() {
+      flex::destroyHostComputeParams(p);
+    }
+  } guard{params};
 
-  // Launch the correction H2D with the staged buffer as the source.
-  // The RaiiBuffer lifetime is extended by the completion callback set below.
-  // Nothing reads output_buffer_ after this point — the D2H readback path
-  // uses a separate buffer map (pinned_buffer_map_) and is untouched.
-  auto* params = flex::createDmaParams(staged->Pointer(), correction_size_,
-                                       /*to_device=*/true, &device_address_);
-  params->pipeline_barrier = pipeline_barrier_;
-  // Keep staged alive until the DMA engine finishes reading it.
-  params->callback = [staged](void*) { /* staged freed here */ };
-  stream.launchH2D(params);
-  flex::destroyDmaParams(params);
+  // Flex RuntimeStream::launchOperation(const HostComputeParams*) resolves
+  // arguments and calls deeptools::processComputeOnHostCommand[Fast] inline
+  // before returning this fully written buffer (Flex #1990,
+  // src/runtime_stream/runtime_stream.cpp). This is not queued work on S_prep:
+  // caller ordering makes the bytes ready before S_dev receives the consuming
+  // ComputeParams, regardless of whether hazard tracking is enabled.
+  // Shared ownership then keeps the bytes alive through upload completion.
+  std::shared_ptr<flex::HostComputeBuffer> host_buffer(
+      stream.launchHostCompute(params), flex::destroyHostComputeBuffer);
+
+  // Enforce that the host buffer correction size matches the expected device
+  // allocation size.
+  TORCH_DCHECK_EQ(host_buffer->size(), device_address_.total_size());
+
+  if (ctx.batch_program_corrections) {
+    ctx.program_corrections.push_back(
+        {std::move(host_buffer), std::make_shared<flex::CompositeAddress>(
+                                     device_address_.clone_non_owning())});
+    return;
+  }
+
+  // Create DmaParams to transfer the host buffer.
+  auto* dma_params =
+      flex::createDmaParams(host_buffer->data(), host_buffer->size(),
+                            /*to_device=*/true, &device_address_);
+  dma_params->pipeline_barrier = pipeline_barrier_;
+  // The managed buffer is freed when the callback is destroyed, which happens
+  // after the DMA completes or is cancelled.
+  dma_params->callback = [host_buffer](void*,
+                                       const flex::FlexCallbackMetadata*) {};
+
+  try {
+    stream.launchH2D(dma_params);
+  }
+  catch (...) {
+    flex::destroyDmaParams(dma_params);
+    throw;
+  }
+  flex::destroyDmaParams(dma_params);
+
+  // managed goes out of scope here, leaving the callback with the only
+  // remaining reference to the host buffer. The buffer will be freed when the
+  // callback is destroyed.
 }
 
 void JobPlanStepHostCompute::write(std::ostream& os) const {
   os << "  Host Compute\n";
   os << "    Correction size: " << correction_size_ << " bytes\n";
   os << "    Device address: " << device_address_ << "\n";
-  os << "    HCM metadata: " << (hcm_ ? "present" : "null") << "\n";
-  os << "    Fast path: "
-     << (fast_plan_.valid
-             ? "enabled"
-             : (fast_plan_.output_size == UINT32_MAX ? "disabled" : "building"))
-     << "\n";
-  if (fast_plan_.valid) {
-    os << "    Fast plan: " << fast_plan_.patches.size() << " patches, "
-       << fast_plan_.num_input_symbols << " input symbols, "
-       << fast_plan_.output_size << " bytes output\n";
-  }
   os << "    Pipeline barrier: " << (pipeline_barrier_ ? "enabled" : "disabled")
      << "\n";
 }
@@ -439,7 +398,7 @@ std::string checkJobPlanStepOrdering(const std::vector<StepKind>& kinds,
 
   // S_dev must BEGIN with Compute (leading-producer guarantee) and carry only
   // {Compute, D2H} (the device stream; see StreamRole in job_plan.h). No
-  // HostCompute/H2D -- host-produce steps belong on S_prep.
+  // HostCompute/H2D.
   {
     if (dev.empty() || dev[0] != StepKind::Compute) {
       return "S_dev ordering violation: device stream must begin with Compute, "

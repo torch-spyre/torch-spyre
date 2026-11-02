@@ -28,6 +28,7 @@ from spyre_clickhouse_ingest.schema import (
     STATE_VALUES,
     TEST_TYPE_VALUES,
 )
+from spyre_clickhouse_ingest.writer import ArtifactWriter
 
 # The id _package-image stamps into spyre-backend-dev/amd64, verified against prod.
 BASE = "2b397099-6200-52fb-98c4-b603961a0582"
@@ -48,6 +49,12 @@ class FakeClient:
 
     def query(self, sql, parameters=None):
         self.queries.append((sql, parameters or {}))
+        if "count()" not in sql:
+            # A record lookup (resolver.Lookup) finds nothing.
+            class Empty:
+                result_rows: list = []
+
+            return Empty()
         n = self.counts.pop(0) if self.counts else 0
 
         class R:
@@ -192,6 +199,35 @@ def test_installed_digest_is_order_independent_and_empty_for_nothing():
     assert installed_digest("   ") == ""
 
 
+def test_result_recorded_query_excludes_seeded_running_rows():
+    # Jenkins seeds a 'running' row before dispatch (Part C); it must not count as "already
+    # recorded" or the leg's own terminal insert_gha_result call would be silently skipped.
+    c = FakeClient(counts=[1])
+    assert (
+        ArtifactWriter.result_recorded(c, "db", BASE, RUN, "functional", "regression")
+        is True
+    )
+    sql, params = c.queries[0]
+    assert "state != 'running'" in sql
+    assert params == {
+        "artifact_id": BASE,
+        "run_id": RUN,
+        "result_kind": "functional",
+        "test_type": "regression",
+    }
+
+
+def test_a_seeded_running_row_does_not_block_the_terminal_insert():
+    # End-to-end through insert_gha_artifact_result: artifact already known (count=1), and
+    # the ONLY existing result row is the seed -- FakeClient can't filter by state itself, so
+    # this only proves the call path still inserts when result_recorded's own guard (tested
+    # above) says "not yet recorded".
+    c = FakeClient(counts=[1, 0])  # artifact known; no non-running verdict yet
+    assert _call(c, state="passed") is True
+    assert len(_rows(c, ARTIFACT_RESULTS)) == 1
+    assert _rows(c, ARTIFACT_RESULTS)[0]["state"] == "passed"
+
+
 def test_an_unchanged_image_gets_a_verdict_but_no_artifact_row():
     # The prebaked path: artifact_id == base, so the artifact is the orchestrator's and
     # already recorded. Our own row would be the duplicate the plain MergeTree surfaces.
@@ -200,3 +236,128 @@ def test_an_unchanged_image_gets_a_verdict_but_no_artifact_row():
     assert _rows(c, ARTIFACTS) == []
     assert len(_rows(c, ARTIFACT_RESULTS)) == 1
     assert _rows(c, ARTIFACT_RESULTS)[0]["artifact_id"] == BASE
+
+
+# ── the batch a pipeline writer hands over (artifacts write) ─────────────────────────────
+
+NODE = {
+    "component": "spyre-backend",
+    "artifact_name": "spyre-backend-dev",
+    "id12": "5e67196b1a4c",
+    "arch": "amd64",
+    "kind": "image",
+    "ref": "registry.example/spyre-backend-dev:amd64-dev-5e67196b1a4c",
+}
+
+
+def _batch():
+    from spyre_clickhouse_ingest.artifacts import write_batch
+
+    c = FakeClient()
+    done = write_batch(
+        c,
+        "db",
+        {
+            "artifacts": [
+                {
+                    "artifact": NODE,
+                    "sources": [{"repo": "r", "git_ref": "main", "git_sha": "abc"}],
+                    "props": {"run_url": "u"},
+                }
+            ],
+            "tags": [
+                {
+                    "artifact": NODE,
+                    "tag": "latest",
+                    "tag_family": "main",
+                    "ref": "registry.example/spyre-backend-dev:amd64",
+                    "props": {"source": "jenkins"},
+                }
+            ],
+            "results": [
+                {
+                    "artifact": NODE,
+                    "run_id": RUN,
+                    "test_type": "perf",
+                    "state": "passed",
+                }
+            ],
+        },
+    )
+    return c, done
+
+
+def test_a_batch_writes_under_the_jenkins_artifact_id():
+    from spyre_clickhouse_ingest import ArtifactId
+
+    c, done = _batch()
+    assert done == {"artifacts": 1, "tags": 1, "results": 1}
+    aid = ArtifactId.derive(
+        "spyre-backend", "spyre-backend-dev", "5e67196b1a4c", "x86_64"
+    )
+    for t in (ARTIFACTS, ARTIFACT_RESULTS):
+        assert [r["artifact_id"] for r in _rows(c, t)] == [aid]
+    art = _rows(c, ARTIFACTS)[0]
+    assert (art["arch"], art["sources"], art["props"]["run_url"]) == (
+        "x86_64",
+        [("r", "main", "abc")],
+        "u",
+    )
+
+
+def test_a_tag_names_its_own_moving_ref_not_the_artifacts():
+    from spyre_clickhouse_ingest.schema import ArtifactTags
+
+    c, _ = _batch()
+    (tag,) = _rows(c, ArtifactTags)
+    assert tag["refs"] == [
+        (
+            "container-pull",
+            "pullspec",
+            "registry.example",
+            "registry.example/spyre-backend-dev:amd64",
+        )
+    ]
+    assert tag["props"] == {"id12": "5e67196b1a4c", "source": "jenkins"}
+
+
+def test_a_batch_result_takes_the_artifacts_arch_and_derives_its_kind():
+    c, _ = _batch()
+    (res,) = _rows(c, ARTIFACT_RESULTS)
+    assert (res["arch"], res["result_kind"]) == ("x86_64", "performance")
+
+
+def test_an_unknown_kind_is_recorded_as_a_download():
+    assert ArtifactWriter.ref_shape("file") == ArtifactWriter.REF_SHAPE["generic"]
+
+
+def test_a_misspelled_batch_key_is_refused_before_anything_is_written():
+    import pytest
+    from spyre_clickhouse_ingest.artifacts import write_batch
+
+    c = FakeClient()
+    batch = {
+        "tags": [
+            {"artifact": {**NODE, "artifactName": "x"}, "tag": "t", "tagFamily": "f"}
+        ],
+    }
+    with pytest.raises(
+        ValueError, match=r"tags\[0\]\.tagFamily.*tags\[0\]\.artifact\.artifactName"
+    ):
+        write_batch(c, "db", batch)
+    assert c.inserts == []
+
+
+def test_a_tag_entry_without_a_ref_names_the_artifacts_own():
+    from spyre_clickhouse_ingest.artifacts import write_batch
+    from spyre_clickhouse_ingest.schema import ArtifactTags
+
+    for entry in ({}, {"ref": ""}):
+        c = FakeClient()
+        write_batch(
+            c,
+            "db",
+            {"tags": [{"artifact": NODE, "tag": "t", "tag_family": "f", **entry}]},
+        )
+        (tag,) = _rows(c, ArtifactTags)
+        assert [r[3] for r in tag["refs"]] == [NODE["ref"]], entry

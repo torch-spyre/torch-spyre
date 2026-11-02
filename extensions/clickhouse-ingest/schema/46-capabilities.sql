@@ -35,13 +35,14 @@ CREATE TABLE IF NOT EXISTS capabilities
     capability_id UUID,
 
     component     LowCardinality(String),
-    -- Which analysis: model_ops | model_support -- the axis v1 put in the table name. Named
-    -- test_type (artifact_results' 'capability' tier covers the family; these are within it).
-    -- Constrained by convention, not CHECK, so a new analysis can start writing unedited.
+    -- Which analysis: model_ops | model_modules | model_support -- the axis v1 put in the table
+    -- name. Named test_type, as on artifact_results, where their verdicts carry result_kind
+    -- 'capability'. No CHECK here: the writer refuses a type artifact_results.chk_test_type lacks.
     test_type     LowCardinality(String),
 
     -- The thing analysed (a model), and the capability asked of it (a torch op for model_ops, an
-    -- adapter for model_support). v1 spelled `subject` three ways for only 10 distinct triples.
+    -- nn.Module for model_modules, an adapter for model_support). v1 spelled `subject` three ways
+    -- for only 10 distinct triples.
     subject       String,
     name          String,
 
@@ -50,6 +51,9 @@ CREATE TABLE IF NOT EXISTS capabilities
     -- The signature distinguishing two variants of one operation (input shapes/dtypes). Hashed
     -- into capability_id, so it cannot drift from the identity it defines.
     props         Map(LowCardinality(String), String),
+    audit_uuid      UUID DEFAULT generateUUIDv7(),
+    audit_timestamp DateTime64(3) DEFAULT now64(3),
+
 
     CONSTRAINT chk_component CHECK component != '',
     CONSTRAINT chk_test_type CHECK test_type != '',
@@ -87,8 +91,11 @@ CREATE TABLE IF NOT EXISTS capability_runs
     fail_reason   LowCardinality(String) DEFAULT '',
 
     props         Map(LowCardinality(String), String),
+    audit_uuid      UUID DEFAULT generateUUIDv7(),
+    audit_timestamp DateTime64(3) DEFAULT now64(3),
 
-    CONSTRAINT chk_status CHECK status IN ('passed','failed','not_implemented')
+
+    CONSTRAINT chk_status CHECK status IN ('passed','failed','not_implemented','undetermined')
 )
 ENGINE = MergeTree()
 PARTITION BY toYYYYMM(ts)

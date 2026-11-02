@@ -19,7 +19,7 @@ on:
         required: false
         default: ''
       workflow_name:
-        description: Workflow name (model-module-tests | upstream-tests | model-ops-tests | integration-tests)
+        description: Workflow name (model-module-tests | upstream-tests | model-ops-tests | tests | integration-tests)
         required: false
         default: upstream-pytorch-tests
       component:
@@ -30,6 +30,13 @@ on:
         required: false
         type: string
         default: torch-spyre
+      test_type:
+        description: >-
+          Suite tier to record (trunk | regression | integration | ...). Blank reads the run's
+          "test-type" artifact; set it to re-ingest a run that predates that artifact.
+        required: false
+        type: string
+        default: ''
       clickhouse_env:
         description: >-
           ClickHouse instance for a MANUAL re-ingest: "prod" (the CLICKHOUSE_*
@@ -84,10 +91,15 @@ on:
         required: false
         type: string
         default: ''
+      test_type:
+        description: Suite tier. Blank reads the run's "test-type" artifact.
+        required: false
+        type: string
+        default: ''
       display_title:
         description: >-
-          run-name of the triggering run, which is how the suite tier is recovered
-          ("integration-tests (<tier>)") without a second API call.
+          run-name of the triggering run. Its "(<tier>)" wins over the "test-type" artifact, read
+          only when it equals workflow_name ("integration-tests (<tier>)").
         required: false
         type: string
         default: ''
@@ -135,7 +147,8 @@ jobs:
       - x86_64
       - linux
       - image_ingest
-    timeout-minutes: 15
+    # PyPI/GitHub downloads from torch-cicd pods can be slow enough to blow a tighter budget.
+    timeout-minutes: 30
     # Skip if the triggering workflow was cancelled (but ingest failures are fine)
     if: |
       github.event_name == 'workflow_dispatch' ||
@@ -177,13 +190,13 @@ jobs:
 
       # Metadata about the triggering run
       TRIGGERING_RUN_ID: ${{ github.event.workflow_run.id || inputs.gha_run_id }}
+      # Empty on a manual re-ingest, which then keeps first-write-wins.
+      TRIGGERING_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt || '' }}
       TRIGGERING_WORKFLOW: ${{ github.event.workflow_run.name || inputs.workflow_name }}
       TRIGGERING_BRANCH: ${{ github.event.workflow_run.head_branch || inputs.branch || github.ref_name }}
       TRIGGERING_SHA: ${{ github.event.workflow_run.head_sha || inputs.sha || github.sha }}
       TRIGGERING_AT: ${{ github.event.workflow_run.created_at || inputs.triggered_at || '' }}
-      # display_title carries "integration-tests (<test_type>)" via that workflow's
-      # run-name: — this is the only way a workflow_run-triggered job can recover the
-      # original dispatch tier (integration/regression/smoke/etc) without an extra API call.
+      # Read for its tier only when it is a run-name (see "Resolve suite tier"); usually a PR title.
       TRIGGERING_DISPLAY_TITLE: ${{ github.event.workflow_run.display_title || inputs.display_title || '' }}
       # Triggering event (push/pull_request/schedule/workflow_dispatch/merge_group; empty on manual re-ingest) -- gates the PR-number lookup below.
       TRIGGERING_EVENT: ${{ github.event.workflow_run.event || inputs.triggering_event || '' }}
@@ -201,18 +214,13 @@ jobs:
           which python3
           python3 --version
 
-      # Check out the local composite action (and the ingest script it runs).
-      # The uv/venv/deps/ingest steps that used to live here inline now live in
-      # .github/actions/ingest-xml-to-clickhouse, shared with the perf job's
-      # inline push so there is one ingest implementation. `uses: ./...`
-      # resolves against the workspace, so the action tree must be present.
-      - name: Checkout (for the composite action and ingest script)
+      # The local composite action and the ingest library it runs: `uses: ./...` resolves
+      # against the workspace, so both must be present.
+      - name: Checkout (for the composite action and ingest library)
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           sparse-checkout: |
             .github/actions
-            .github/scripts/ingest_xml.py
-            # Imported by the script above; omitting it fails the import at startup.
             extensions/clickhouse-ingest
           sparse-checkout-cone-mode: false
 
@@ -233,13 +241,15 @@ jobs:
           # Track the latest gh release rather than a pin: nothing here depends on a
           # specific gh version, and a pin silently rots (this fleet had 2.92.0 and 2.97.0
           # drifting apart across workflows).
-          GH_CLI_VERSION="$(curl -fsSL https://api.github.com/repos/cli/cli/releases/latest \
+          # github.com intermittently 403s release downloads from this runner pool.
+          CURL_RETRY=(--retry 5 --retry-delay 5 --retry-all-errors)
+          GH_CLI_VERSION="$(curl -fsSL "${CURL_RETRY[@]}" https://api.github.com/repos/cli/cli/releases/latest \
                               | jq -r '.tag_name // empty' | sed 's/^v//')" || GH_CLI_VERSION=""
           if [ -z "$GH_CLI_VERSION" ]; then
             echo "api.github.com unreachable; flooring to ${GH_CLI_VERSION_FLOOR}"
             GH_CLI_VERSION="${GH_CLI_VERSION_FLOOR}"
           fi
-          curl -fsSL \
+          curl -fsSL "${CURL_RETRY[@]}" \
             "https://github.com/cli/cli/releases/download/v${GH_CLI_VERSION}/gh_${GH_CLI_VERSION}_linux_amd64.tar.gz" \
             -o "${RUNNER_TEMP}/gh-cli.tar.gz"
           mkdir -p "${RUNNER_TEMP}/gh-cli"
@@ -271,7 +281,7 @@ jobs:
       # along are simply ignored.
       #
       # `--paginate` is required: the artifacts endpoint defaults to 30 per
-      # page, and a run with more jobs than that (e.g. the model-ops-tests /
+      # page, and a run with more jobs than that (e.g. the tests /
       # integration-tests matrices) silently lost every artifact past the
       # first page, with no error — rows just never showed up in ClickHouse.
       # `--paginate` applies `--jq` per page and concatenates the filtered
@@ -284,10 +294,19 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          ARTIFACTS=$(gh api --paginate \
-            "/repos/${TRIGGERING_REPO}/actions/runs/${TRIGGERING_RUN_ID}/artifacts?per_page=100" \
-            --jq '.artifacts[] | {id: .id, name: .name}' \
-            | python3 -c "import json,sys; print(json.dumps([json.loads(l) for l in sys.stdin if l.strip()]))")
+          # pipefail: a page that fails mid-listing must not pass as a shorter list.
+          set -o pipefail
+          for attempt in 1 2 3 4 5; do
+            if ARTIFACTS=$(gh api --paginate \
+                "/repos/${TRIGGERING_REPO}/actions/runs/${TRIGGERING_RUN_ID}/artifacts?per_page=100" \
+                --jq '.artifacts[] | {id: .id, name: .name}' \
+                | python3 -c "import json,sys; print(json.dumps([json.loads(l) for l in sys.stdin if l.strip()]))"); then
+              break
+            fi
+            [ "$attempt" -eq 5 ] && exit 1
+            echo "[retry] listing attempt ${attempt} failed" >&2
+            sleep $((2 ** attempt))
+          done
           echo "artifacts=$ARTIFACTS" >> "$GITHUB_OUTPUT"
           echo "Found artifacts:"
           echo "$ARTIFACTS" | python3 -c "import json,sys; [print(' •', a['name']) for a in json.load(sys.stdin)]"
@@ -299,38 +318,83 @@ jobs:
           mkdir -p xml_artifacts
           export ARTIFACTS='${{ steps.list-artifacts.outputs.artifacts }}'
           python3 <<'PYEOF'
-          import json, os, subprocess, sys
+          import json, os, subprocess, sys, time
+          from pathlib import Path
+
+          ATTEMPTS = 5
           artifacts = json.loads(os.environ['ARTIFACTS'])
           # TRIGGERING_REPO, not GITHUB_REPOSITORY: on a called workflow the latter is the
           # CALLER, and the artifacts live in the repo whose run produced them.
           repo  = os.environ['TRIGGERING_REPO']
+
+          def fetch(a, zip_path):
+              """Download, test and unzip one artifact; retried whole, since a truncated zip only
+              fails at unzip. The -t pass keeps a bad zip from half-extracting into the shared dir."""
+              for attempt in range(1, ATTEMPTS + 1):
+                  for cmd in (
+                      ["gh", "api", f"/repos/{repo}/actions/artifacts/{a['id']}/zip"],
+                      ["unzip", "-tq", str(zip_path)],
+                      ["unzip", "-q", "-o", str(zip_path), "-d", "xml_artifacts/"],
+                  ):
+                      result = subprocess.run(cmd, capture_output=True)
+                      if result.returncode != 0:
+                          err = (result.stderr or result.stdout[-500:]).decode(errors="replace").strip()
+                          print(f"[retry] {a['name']}: {' '.join(cmd[:2])} attempt {attempt}/{ATTEMPTS} "
+                                f"exited {result.returncode}: {err}")
+                          break
+                      if cmd[0] == "gh":
+                          zip_path.write_bytes(result.stdout)
+                  else:
+                      return True
+                  if attempt < ATTEMPTS:
+                      time.sleep(2 ** attempt)
+              return False
+
+          failed = []
           for a in artifacts:
               print(f"Downloading: {a['name']} (id={a['id']})")
-              with open(f"xml_artifacts/{a['name']}.zip", "wb") as f:
-                result = subprocess.run([
-                    "gh", "api",
-                    f"/repos/{repo}/actions/artifacts/{a['id']}/zip",
-                ], check=True, env={**os.environ}, capture_output=True)
-                f.write(result.stdout)
-              subprocess.run([
-                  "unzip", "-o", f"xml_artifacts/{a['name']}.zip",
-                  "-d", "xml_artifacts/"
-              ], check=True)
+              if not fetch(a, Path("xml_artifacts") / f"{a['name']}.zip"):
+                  print(f"::warning::Skipping artifact {a['name']} (id={a['id']}): "
+                        f"download/unzip failed {ATTEMPTS} times; its results are not ingested.")
+                  failed.append(a["name"])
+          print(f"Fetched {len(artifacts) - len(failed)}/{len(artifacts)} artifact(s).")
+          if artifacts and len(failed) == len(artifacts):
+              print("::error::No artifact could be downloaded.")
+              sys.exit(1)
           PYEOF
           echo "Downloaded XML files:"
           find xml_artifacts -name "*.xml" 2>/dev/null || echo "(none)"
 
       # ---------------------------------------------------------------------------
       # Parse each XML file and insert rows into ClickHouse.
-      # The Python script is in .github/scripts/ingest_xml.py (see below).
+      # `python -m spyre_clickhouse_ingest results`, via ingest-xml-to-clickhouse.
       # ---------------------------------------------------------------------------
-      - name: Extract suite tier from display title
+      # _test_matrix uploads the tier it ran as the "test-type" artifact.
+      - name: Recover suite tier
+        id: test-type
+        if: inputs.test_type == ''
+        uses: ./.github/actions/recover-threaded-run-id
+        with:
+          triggering-run-id: ${{ env.TRIGGERING_RUN_ID }}
+          repository: ${{ env.TRIGGERING_REPO }}
+          artifact-name: test-type
+          label: Suite tier
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # tier is a run_id hash input. A run-name tier beats the artifact: integration-tests runs
+      # test_type=model_ops as _test_matrix trunk. Only a run-name counts (workflow_run.name then
+      # repeats it), so a PR title's "(#1234)" is no tier.
+      - name: Resolve suite tier
         id: extract-tier
+        env:
+          TIER_INPUT: ${{ inputs.test_type }}
+          TIER_ARTIFACT: ${{ steps.test-type.outputs.value }}
         run: |
-          # display_title is "integration-tests (regression)" / "integration-tests (integration)" / etc.
-          # Fall back to empty (ingest_xml.py defaults it to 'unknown') for manual workflow_dispatch
-          # re-ingests or older runs whose display_title predates this convention.
-          TIER=$(echo "${TRIGGERING_DISPLAY_TITLE}" | sed -n 's/.*(\(.*\))\s*$/\1/p')
+          TIER_TITLE=""
+          if [ "${TRIGGERING_DISPLAY_TITLE}" = "${TRIGGERING_WORKFLOW}" ]; then
+            TIER_TITLE=$(echo "${TRIGGERING_DISPLAY_TITLE}" | sed -n 's/^[a-z_-]* (\([a-z_-]*\))$/\1/p')
+          fi
+          TIER="${TIER_INPUT:-${TIER_TITLE:-${TIER_ARTIFACT}}}"
           echo "Resolved tier: ${TIER:-<none>}"
           echo "tier=${TIER}" >> "${GITHUB_OUTPUT}"
 
@@ -371,13 +435,15 @@ jobs:
           branch: ${{ env.TRIGGERING_BRANCH }}
           sha: ${{ env.TRIGGERING_SHA }}
           gha-run-id: ${{ env.TRIGGERING_RUN_ID }}
+          run-attempt: ${{ env.TRIGGERING_RUN_ATTEMPT }}
           run-id: ${{ steps.threaded-run-id.outputs.run_id }}
-          artifact-id: ${{ steps.leg-artifact-id.outputs.value }}
+          artifact: ${{ steps.leg-artifact-id.outputs.value && format('gha:{0}', steps.leg-artifact-id.outputs.value) || '' }}
           # TRIGGERING_REPO: on a workflow_call github.repository is the CALLER.
           repository: ${{ env.TRIGGERING_REPO }}
           component: ${{ inputs.component || 'torch-spyre' }}
           triggered-at: ${{ env.TRIGGERING_AT }}
           pr-number: ${{ steps.resolve-pr.outputs.pr_number }}
+          ci-event: ${{ env.TRIGGERING_EVENT }}
           trigger-type: ${{ steps.extract-tier.outputs.tier }}
           platform: x86_64
           clickhouse-host: ${{ env.CLICKHOUSE_HOST }}
