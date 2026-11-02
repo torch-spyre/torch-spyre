@@ -1,0 +1,163 @@
+"""Group short test configs into shared CI jobs, from measured runtimes.
+
+Which job a config runs in is a CI scheduling concern, so it is decided here at matrix time and
+never written into the test configs. Two files feed it:
+
+  .github/test_layout_policy.json  the knobs, edited by people and reviewed in PRs
+  .github/test_timings.json        per-config runtimes, regenerated from ClickHouse
+                                   (tests/scripts/refresh_test_timings.py)
+
+Each config the tier filter selected is either `alone` (its own job, as today) or in a `bucket`
+with other short configs. A config at or above the policy's threshold always runs alone. Members of
+a bucket share a runner, directory, flags and `global:` block, and never two of them name the same
+test file, so a bucket runs exactly the tests its members would run on their own.
+
+No policy file means every config runs alone, which is today's behaviour, so this can never be the
+reason a matrix fails to build. A malformed policy or timings file is an error instead, because it
+would otherwise change what runs without anyone noticing.
+"""
+
+import json
+from pathlib import Path
+from typing import Dict, List, Optional
+
+DEFAULT_POLICY: dict = {
+    "version": 1,
+    "target_job_minutes": 8.0,
+    "max_members": 16,
+    "threshold_minutes": 4.0,
+    "default_minutes": 1.0,
+    "exclude": [],
+}
+
+
+class LayoutError(ValueError):
+    """A policy or timings file that would silently change what runs."""
+
+
+def load_policy(path: Optional[str]) -> Optional[dict]:
+    """The policy merged over the defaults, or None when the file is absent (grouping off)."""
+    if not path or not Path(path).is_file():
+        return None
+    try:
+        raw = json.loads(Path(path).read_text())
+    except ValueError as exc:
+        raise LayoutError(f"{path}: not valid JSON ({exc})") from None
+    if not isinstance(raw, dict):
+        raise LayoutError(f"{path}: expected a JSON object")
+    unknown = set(raw) - set(DEFAULT_POLICY) - {"_comment"}
+    if unknown:
+        raise LayoutError(f"{path}: unknown key(s) {sorted(unknown)}")
+    policy = {**DEFAULT_POLICY, **{k: v for k, v in raw.items() if k != "_comment"}}
+    for name in ("target_job_minutes", "threshold_minutes", "default_minutes"):
+        v = policy[name]
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
+            raise LayoutError(f"{path}: {name} must be a positive number, got {v!r}")
+    v = policy["max_members"]
+    if isinstance(v, bool) or not isinstance(v, int) or v < 2:
+        raise LayoutError(f"{path}: max_members must be an integer >= 2, got {v!r}")
+    if not isinstance(policy["exclude"], list) or not all(
+        isinstance(e, str) for e in policy["exclude"]
+    ):
+        raise LayoutError(
+            f"{path}: exclude must be a list of config paths or directory prefixes"
+        )
+    return policy
+
+
+def load_timings(path: Optional[str]) -> Dict[str, float]:
+    """{config key: median minutes of tests}; {} when absent (every config then counts as unknown)."""
+    if not path or not Path(path).is_file():
+        return {}
+    try:
+        raw = json.loads(Path(path).read_text())
+    except ValueError as exc:
+        raise LayoutError(f"{path}: not valid JSON ({exc})") from None
+    configs = raw.get("configs") if isinstance(raw, dict) else None
+    if not isinstance(configs, dict):
+        raise LayoutError(f'{path}: expected a "configs" object')
+    out = {}
+    for key, rec in configs.items():
+        t = rec.get("p50_min") if isinstance(rec, dict) else None
+        if isinstance(t, bool) or not isinstance(t, (int, float)) or t < 0:
+            raise LayoutError(
+                f"{path}: {key}: p50_min must be a number >= 0, got {t!r}"
+            )
+        out[key] = float(t)
+    return out
+
+
+def step_overhead(minutes: float) -> float:
+    """Pytest step time beyond the summed case time: ~0.25 min small, up to ~2 min for big configs."""
+    return 0.25 + min(2.0, 0.12 * minutes)
+
+
+def plan(
+    configs: List[dict], policy: Optional[dict], timings: Dict[str, float]
+) -> Dict[str, str]:
+    """{config key: bucket name, or "" to run alone} for the configs one matrix will run.
+
+    `configs` are the tier-filtered records: key, dir, runner, flags, global, files.
+    """
+    if policy is None:
+        return {c["key"]: "" for c in configs}
+    cap = float(policy["target_job_minutes"])
+    out: Dict[str, str] = {}
+    groups: Dict[tuple, List[dict]] = {}
+    for c in configs:
+        key = c["key"]
+        t = timings.get(key, float(policy["default_minutes"]))
+        excluded = any(
+            key == e or (e.endswith("/") and key.startswith(e))
+            for e in policy["exclude"]
+        )
+        if excluded or t >= float(policy["threshold_minutes"]):
+            out[key] = ""
+            continue
+        group = (
+            c["runner"],
+            c["dir"],
+            json.dumps(c["flags"], sort_keys=True),
+            json.dumps(c["global"], sort_keys=True),
+        )
+        groups.setdefault(group, []).append({**c, "t": t})
+    # Number buckets per (runner, dir) across all their flag/global groups: groups that differ only
+    # in flags or `global:` share a prefix, and a per-group counter would give two of them the same
+    # name, which filter_configs.py would then fold into one bucket.
+    counters: Dict[str, int] = {}
+    for (runner, d, _flags, _glob), members in sorted(groups.items()):
+        prefix = f"{d.replace('/', '_') or 'top'}_{runner}"
+        for bucket in _pack(members, cap, int(policy["max_members"])):
+            if len(bucket) < 2:
+                for m in bucket:
+                    out[m["key"]] = ""
+                continue
+            counters[prefix] = counters.get(prefix, 0) + 1
+            for m in bucket:
+                out[m["key"]] = f"{prefix}_{counters[prefix]}"
+    return out
+
+
+def _pack(members: List[dict], cap: float, max_members: int) -> List[List[dict]]:
+    """First-fit decreasing: longest first onto the fullest bucket that stays under both caps."""
+    bins: List[list] = []  # [minutes, members, test file stems]
+    for m in sorted(members, key=lambda m: (-m["t"], m["key"])):
+        stems = {Path(f).stem for f in m["files"]}
+        best = None
+        for b in bins:
+            after = b[0] + m["t"]
+            if (
+                after + step_overhead(after) > cap
+                or len(b[1]) >= max_members
+                or (b[2] & stems)
+            ):
+                continue
+            if best is None or b[0] > best[0]:
+                best = b
+        if best is None:
+            bins.append([m["t"], [m], set(stems)])
+        else:
+            best[0] += m["t"]
+            best[1].append(m)
+            best[2] |= stems
+    return [b[1] for b in bins]

@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""Regenerate .github/test_timings.json: median test minutes per config, from ClickHouse.
+
+filter_configs.py --timings packs short configs into shared CI jobs from this file (see
+tests/oot_framework/utils/test_layout.py). It is generated, never hand-edited: run this on a
+schedule and review the data diff in a PR.
+
+Each config's time is the median, over the window, of its summed test-case durations per run, on
+first attempts. Keys are config paths relative to tests/configs/torch_spyre_tests/, the same as
+.github/runner_overrides.yaml. Configs on disk with no runs in the window are left out, and the
+grouping then sizes them with the policy's default_minutes.
+
+Connection: by default the repo's ClickHouse client (CLICKHOUSE_HOST / CLICKHOUSE_USER /
+CLICKHOUSE_PASS, see extensions/clickhouse-ingest). For a laptop, --http-url plus --token-file
+uses ClickHouse's HTTP interface instead. The query is the same either way.
+
+Usage:
+  python tests/scripts/refresh_test_timings.py --out .github/test_timings.json
+  python tests/scripts/refresh_test_timings.py --http-url https://host/ch/ --token-file ~/.ch-token
+"""
+
+import argparse
+import datetime as dt
+import json
+import sys
+import urllib.request
+from pathlib import Path
+
+CONFIG_ROOT = Path("tests/configs/torch_spyre_tests")
+
+# One row per (run, report): the report is <config stem>.xml, one per config per job. Summed case
+# time per run, then the median across runs. A pod-level retry overwrites its report, so first
+# attempts and retries are not double-counted.
+QUERY = """
+SELECT stem, round(quantile(0.5)(run_min), 3) AS p50_min, round(quantile(0.9)(run_min), 3) AS p90_min,
+       count() AS runs, round(quantile(0.5)(cases)) AS cases
+FROM (
+  SELECT replaceRegexpOne(props['source_file'], '\\\\.xml$', '') AS stem, run_id,
+         sum(duration_s) / 60 AS run_min, count() AS cases
+  FROM {db}.test_case_runs
+  WHERE component = 'torch-spyre' AND ts > now() - INTERVAL {days} DAY
+    AND props['source_file'] != '' AND duration_s >= 0
+  GROUP BY stem, run_id
+)
+GROUP BY stem HAVING runs >= {min_runs}
+FORMAT JSONEachRow
+"""
+
+
+def query_http(url: str, token: str, sql: str) -> list:
+    req = urllib.request.Request(url, data=sql.encode(), method="POST")
+    req.add_header(
+        "Authorization",
+        "Basic " + __import__("base64").b64encode(f"default:{token}".encode()).decode(),
+    )
+    with urllib.request.urlopen(req, timeout=300) as resp:
+        return [
+            json.loads(line)
+            for line in resp.read().decode().splitlines()
+            if line.strip()
+        ]
+
+
+def query_client(sql: str) -> list:
+    sys.path.insert(
+        0, str(Path(__file__).resolve().parents[2] / "extensions" / "clickhouse-ingest")
+    )
+    from spyre_clickhouse_ingest.client import ClickHouse  # noqa: E402
+
+    client = ClickHouse.connect()
+    result = client.query(sql.replace("FORMAT JSONEachRow", ""))
+    cols = result.column_names
+    return [dict(zip(cols, row)) for row in result.result_rows]
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument("--out", default=".github/test_timings.json")
+    ap.add_argument("--days", type=int, default=30)
+    ap.add_argument("--min-runs", type=int, default=5)
+    ap.add_argument("--db", default="spyre_v2")
+    ap.add_argument(
+        "--http-url", default="", help="ClickHouse HTTP endpoint (laptop use)"
+    )
+    ap.add_argument("--token-file", default="", help="file holding the HTTP password")
+    args = ap.parse_args(argv)
+
+    sql = QUERY.format(db=args.db, days=args.days, min_runs=args.min_runs)
+    if args.http_url:
+        token = Path(args.token_file).expanduser().read_text().strip()
+        rows = query_http(args.http_url, token, sql)
+    else:
+        rows = query_client(sql)
+    by_stem = {r["stem"]: r for r in rows}
+
+    configs = {}
+    for cfg in sorted(CONFIG_ROOT.rglob("*.yaml")):
+        r = by_stem.get(cfg.stem)
+        if r is None:
+            continue
+        configs[str(cfg.relative_to(CONFIG_ROOT))] = {
+            "p50_min": float(r["p50_min"]),
+            "p90_min": float(r["p90_min"]),
+            "runs": int(r["runs"]),
+            "cases": int(r["cases"]),
+        }
+    out = {
+        "version": 1,
+        "generated_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "window_days": args.days,
+        "source": f"ClickHouse {args.db}.test_case_runs, median of per-run summed case minutes",
+        "configs": configs,
+    }
+    Path(args.out).write_text(json.dumps(out, indent=1, sort_keys=False) + "\n")
+    print(f"wrote {args.out}: {len(configs)} configs with timings", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
