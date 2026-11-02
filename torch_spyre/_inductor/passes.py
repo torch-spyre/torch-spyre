@@ -90,6 +90,7 @@ from .constants import DEVICE_NAME
 from .deadcode_elimination import deadcode_elimination
 from .dedup_constants import dedup_and_promote_constants
 from .read_copy_elision import elide_proven_read_copies
+from .materialize_hinted_views import materialize_hinted_views
 from .wsr.coarse_tile import coarse_tile_post_stickify
 from .dump_cost_model import dump_cost_model
 
@@ -269,7 +270,7 @@ class CustomPrePasses(_SpyreGraphPassPipeline):
     """
 
     def __init__(self):
-        super().__init__([collect_spyre_hints])
+        super().__init__([materialize_hinted_views, collect_spyre_hints])
 
 
 class CustomPostPasses(_SpyreGraphPassPipeline):
