@@ -161,6 +161,8 @@ jobs:
           EVENT_TYPE: ${{ github.event.client_payload.event_type }}
           EXPLICIT_SHA: ${{ github.event.inputs.pytorch_sha }}
           EXPLICIT_BRANCH: ${{ github.event.inputs.pytorch_branch }}
+          # Authenticated api.github.com calls below: anonymous is 60 req/hr per IP, shared across the runner pool.
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
@@ -202,13 +204,13 @@ jobs:
           # source main SHA in parentheses, e.g. "... (abcdef0123...)".
           if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "Nightly trigger (${{ github.event_name }}): resolving source SHA from pytorch/pytorch@nightly"
-            NIGHTLY_SHA=$(curl -fsSL "https://api.github.com/repos/pytorch/pytorch/commits?sha=nightly&per_page=1" | jq -r '.[0].sha // empty')
+            NIGHTLY_SHA=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" "https://api.github.com/repos/pytorch/pytorch/commits?sha=nightly&per_page=1" | jq -r '.[0].sha // empty')
             if [ -z "${NIGHTLY_SHA}" ]; then
               echo "::error::Could not resolve HEAD for pytorch/pytorch/nightly"
               exit 1
             fi
 
-            COMMIT_MSG=$(curl -fsSL "https://api.github.com/repos/pytorch/pytorch/commits/${NIGHTLY_SHA}" | jq -r '.commit.message')
+            COMMIT_MSG=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" "https://api.github.com/repos/pytorch/pytorch/commits/${NIGHTLY_SHA}" | jq -r '.commit.message')
             SOURCE_SHA=$(echo "$COMMIT_MSG" | grep -oP '\(([a-f0-9]{40})\)' | tr -d '()')
             if [ -z "${SOURCE_SHA}" ]; then
               echo "::error::Could not extract source SHA from latest nightly commit"

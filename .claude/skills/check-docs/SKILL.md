@@ -234,7 +234,7 @@ Cross-reference the "Streams" tables in `torch_spyre.rst` against
 - Cross-reference the environment variables table against:
   - `torch_spyre/_inductor/logging_utils.py` (Spyre Inductor logging vars)
   - `torch_spyre/__init__.py` (runtime vars like `TORCH_SPYRE_DEBUG`)
-  - `CLAUDE.md` env var table
+  - `AGENTS.md` env var table
 - If new env vars were added anywhere in the codebase, add them to the
   API docs table.
 

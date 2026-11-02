@@ -418,6 +418,21 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   dci.isHostToSen_ = host2device;
   dci.dataformat_src_ = host2device ? cpu_format_host : stl.device_dtype;
   dci.dataformat_dst_ = host2device ? stl.device_dtype : cpu_format_host;
+  // deeptools reads/writes the host buffer as storage_bytes /
+  // hostFormatBytes(cpu_format_host). When that width disagrees with PyTorch's
+  // element size the access is out of bounds (uint8: host format SENUINT32
+  // claims 4 bytes for a 1-byte buffer), and the resulting ConvertData throw
+  // lands on the stream worker and shuts the stream down. Refuse up front.
+  // Allocation is untouched: torch.distributed allocates uint8 internally.
+  // TODO(#5493): the uint8 half of this gate goes away with the SENUINT8 remap.
+  const size_t host_bytes = hostFormatBytes(cpu_format_host);
+  const size_t torch_bytes = c10::elementSize(cpu_tensor->scalar_type());
+  TORCH_CHECK(host_bytes == 0 || host_bytes == torch_bytes,
+              "Spyre backend does not support dtype ",
+              cpu_tensor->scalar_type(),
+              " for host transfers: its host data format declares ", host_bytes,
+              " byte(s) per element but PyTorch stores ", torch_bytes,
+              ". See https://github.com/torch-spyre/torch-spyre/issues/1588");
   TORCH_CHECK(
       isDCIConversionSupported(dci.dataformat_src_, dci.dataformat_dst_),
       "Unsupported DCI data format conversion: src=",
@@ -763,15 +778,67 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
       cpu_strides = dma_strides;
     }
   }
+  // FP8 multi-dim stick layout uses specialized DCI generation
+  if (stl.element_arrangement == ElementArrangement::QFP8WT) {
+    // Reverse PyTorch ordering before reading N/K from cpu_sizes.
+    std::reverse(cpu_sizes.begin(), cpu_sizes.end());
+    std::reverse(device_sizes.begin(), device_sizes.end());
 
-  dci.dcsi_ = get_device_stride_infos(cpu_sizes, cpu_strides, cpu_offset,
-                                      device_offset, stl, host2device);
+    const int64_t eps = stl.elems_per_stick();
+    const int64_t si = 2;
+    const int64_t so = eps / si;
+    // cpu_sizes is reversed from PyTorch ordering [K, N] → [N, K], so
+    // cpu_sizes[0] = N (columns) and cpu_sizes[1] = K (rows).
+    const int64_t N = cpu_sizes[0];
+    const int64_t K = cpu_sizes[1];
 
-  // Reverse PyTorch ordering
-  std::reverse(cpu_sizes.begin(), cpu_sizes.end());
-  std::reverse(device_sizes.begin(), device_sizes.end());
-  dci.input_shape_ = host2device ? cpu_sizes : device_sizes;
-  dci.output_shape_ = host2device ? device_sizes : cpu_sizes;
+    // Expanded device shape: [si, so, K/si, N/so]
+    TORCH_CHECK(K % si == 0, "QFP8WT K=", K, " must be divisible by si=", si);
+    TORCH_CHECK(N % so == 0, "QFP8WT N=", N, " must be divisible by so=", so);
+    const int64_t dim2 = K / si;
+    const int64_t dim3 = N / so;
+
+    // Host strides for the expanded layout
+    const int64_t dst2 = si * so;  // = eps = 128 (one full [2,64] stick)
+    const int64_t dst3 =
+        dim2 * eps;  // = (K/si) * si * so = K * so (one N-strip of sticks)
+
+    // Host (row-major) strides in the expanded 4D index space [si, so, dim2,
+    // dim3]:
+    //   element [k,n]: k = d2*si + a,  n = d3*so + b
+    //   host byte = k*N + n = (d2*si + a)*N + (d3*so + b)
+    //             = a*N + b*1 + d2*(si*N) + d3*so
+    //   → stride_src = [N, 1, si*N, so]
+    const std::vector<int64_t> host_strides = {N, 1, si * N, so};
+
+    // Device (QFP8WT [2,64] stick) strides in the expanded 4D index space:
+    //   physical byte = a*1 + b*si + d2*dst2 + d3*dst3
+    //   (within a stick: si dimension innermost at stride=1, so dimension at
+    //   stride=si) → stride = [1, si, dst2, dst3]
+    const std::vector<int64_t> device_strides = {1, si, dst2, dst3};
+
+    DataConversionStrideInfo dcsi;
+    dcsi.size_ = {si, so, dim2, dim3};
+    dcsi.stride_src_ = host2device ? host_strides : device_strides;
+    dcsi.stride_dst_ = host2device ? device_strides : host_strides;
+    dcsi.offset_src_ = host2device ? cpu_offset : 0;
+    dcsi.offset_dst_ = host2device ? 0 : cpu_offset;
+    dci.dcsi_ = {dcsi};
+    // For H2D, output (device) shape is the expanded 4D form.
+    // For D2H, output (host) shape is the original 2D cpu_sizes.
+    const std::vector<int64_t> expanded_dev_shape = {si, so, dim2, dim3};
+    dci.output_shape_ = host2device ? expanded_dev_shape : cpu_sizes;
+    dci.input_shape_ = host2device ? cpu_sizes : device_sizes;
+  } else {
+    dci.dcsi_ = get_device_stride_infos(cpu_sizes, cpu_strides, cpu_offset,
+                                        device_offset, stl, host2device);
+
+    // Reverse PyTorch ordering
+    std::reverse(cpu_sizes.begin(), cpu_sizes.end());
+    std::reverse(device_sizes.begin(), device_sizes.end());
+    dci.input_shape_ = host2device ? cpu_sizes : device_sizes;
+    dci.output_shape_ = host2device ? device_sizes : cpu_sizes;
+  }
   if (SPYRE_LOG_ENABLED("spyre.runtime",
                         torch_spyre::logging::LogLevel::DEBUG)) {
     std::stringstream s;
@@ -779,6 +846,66 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
     SPYRE_RUNTIME_DEBUG() << "DataConversionInfo: " << s.str();
   }
   return dci;
+}
+
+/*
+ * True when a DCI describes a pure memcpy: same source and destination
+ * element format, a single descriptor, identical src/dst strides and zero
+ * offsets, and strides that densely cover the element range (each
+ * non-degenerate dimension sits exactly at the running element count, so
+ * there are no gaps and no stick padding). Such a conversion moves the same
+ * bytes a raw DMA would, so the caller can submit the copy without a DCI and
+ * skip flex's host-side staging (deeptools::ConvertData) entirely.
+ *
+ * Anything else -- dtype conversion, strided/sliced views (non-zero offsets),
+ * stickified or padded device layouts, specialized ops -- keeps the DCI.
+ */
+bool dci_is_identity_copy(const DataConversionInfo& dci) {
+  if (dci.dataformat_src_ != dci.dataformat_dst_) return false;
+  if (dci.dcOpName_ != DataConvertOpFuncs::GENERAL_SHUFFLE) return false;
+  if (!dci.pre_input_shape_.empty() || !dci.post_output_shape_.empty())
+    return false;
+  if (!dci.pre_expand_dcsi_.empty() || !dci.post_slice_dcsi_.empty())
+    return false;
+  if (!dci.input_dimwise_ea_.empty() || !dci.output_dimwise_ea_.empty())
+    return false;
+  if (dci.useSpi_ || dci.usePca_ || dci.usePadVal_ || dci.useWli_) return false;
+  if (dci.dcsi_.size() != 1) return false;
+
+  const auto& dcsi = dci.dcsi_[0];
+  // Non-zero (even if equal) offsets mean positions before the offset are
+  // zero-filled by ConvertData but would hold stale bytes after a raw DMA;
+  // keep the DCI for views with a storage offset.
+  if (dcsi.offset_src_ != 0 || dcsi.offset_dst_ != 0) return false;
+  if (dcsi.stride_src_ != dcsi.stride_dst_) return false;
+
+  const auto& sizes = dcsi.size_;
+  const auto& strides = dcsi.stride_src_;
+  const size_t rank = sizes.size();
+  if (rank == 0 || strides.size() != rank) return false;
+
+  // Densely covering: ordered from the innermost (smallest) stride outward,
+  // every non-degenerate dimension must start exactly where the inner
+  // dimensions end. A padding gap or a broadcast stride fails this and keeps
+  // the DCI.
+  std::vector<std::pair<int64_t, int64_t>> dims;
+  dims.reserve(rank);
+  for (size_t i = 0; i < rank; i++) dims.emplace_back(strides[i], sizes[i]);
+  std::sort(dims.begin(), dims.end(),
+            [](const auto& a, const auto& b) { return a.first < b.first; });
+
+  int64_t numel = 1;
+  for (const auto& [stride, size] : dims) {
+    if (size < 1) return false;
+    if (size == 1) continue;
+    if (stride != numel) return false;
+    numel *= size;
+  }
+
+  // The covered elements must be the whole tensor, not a dense slice of it.
+  int64_t volume = 1;
+  for (const auto& dim : dci.output_shape_) volume *= dim;
+  return volume == numel;
 }
 
 // Empty op needs C++ code and cannot be handled by python side fallback
@@ -1199,13 +1326,21 @@ at::Tensor spyre_fill_tensor(const at::Tensor& self, double value) {
   TORCH_CHECK(self.numel() > 0, "spyre_fill_tensor: cannot fill empty tensor");
 
   // Map torch dtype to DataFormats for the value->pattern conversion, which
-  // fillAsync performs internally.
+  // flex::createFillAsyncParams performs internally.
   DataFormats dtype = get_device_dtype(self.scalar_type());
 
-  // Launch a device-side MEMORY_FILL DMA via the typed fillAsync overload.
+  // Launch a device-side MEMORY_FILL DMA. createFillAsyncParams converts value
+  // to the dtype-specific fill pattern; launchFillAsync submits it.
+  auto* params = flex::createFillAsyncParams(get_composite_address(self), value,
+                                             dtype, /*use_dmai=*/true);
+  struct Guard {
+    flex::FillAsyncParams* p;
+    ~Guard() {
+      flex::destroyFillAsyncParams(p);
+    }
+  } guard{params};
   SpyreStream stream;
-  stream.fillAsync(get_composite_address(self), value, dtype,
-                   /*use_dmai=*/true);
+  stream.launchFillAsync(params);
 
   return self;
 }
