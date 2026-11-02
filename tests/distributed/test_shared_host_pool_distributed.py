@@ -15,13 +15,14 @@
 import contextlib
 import os
 import uuid
+from datetime import timedelta
 
 import pytest
 import torch
 import torch.distributed as dist
 from torch.testing._internal.common_utils import TestCase, run_tests
 
-from torch_spyre._C import (  # type: ignore[attr-defined]
+from torch_spyre._C import (
     PoolConfig,
     PoolStatus,
     attach_pool,
@@ -71,7 +72,10 @@ class TestSharedHostPoolCrossProcess(TestCase):
             )
 
         if not dist.is_initialized():
-            dist.init_process_group(f"cpu:gloo,spyre:{C10D_BACKEND}")
+            # A dead rank shouldn't hang its peer for more than 5 minutes.
+            dist.init_process_group(
+                f"cpu:gloo,spyre:{C10D_BACKEND}", timeout=timedelta(minutes=5)
+            )
 
         cls.comm_size = dist.get_world_size()
         cls.comm_rank = dist.get_rank()

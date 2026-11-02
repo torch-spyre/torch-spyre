@@ -286,6 +286,12 @@ class TestSharedHostPool(TestCase):
         # The pool really is detached: nothing blocks destroy anymore
         self.assertEqual(destroy_pool(descriptor), PoolStatus.Ok)
 
+    def test_detach_non_pool_raises(self):
+        # Only an already detached pool is a silent no-op; a wrong type must
+        # still raise rather than take that path
+        with self.assertRaises(RuntimeError):
+            detach_pool("not a pool")
+
     def test_garbage_collection_detaches(self):
         descriptor = self._create()
         status, pool = attach_pool(descriptor)

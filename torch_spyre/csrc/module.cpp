@@ -488,7 +488,8 @@ PYBIND11_MODULE(_C, m) {
         const flex::PoolDescriptor descriptor_copy = descriptor;
         flex::AttachResult result;
         {
-          // Reacquire the GIL before building the Python tuple below.
+          // Release the GIL for AttachPool; the closing brace takes it back
+          // before py::make_tuple() below touches Python objects.
           py::gil_scoped_release release;
           result =
               flex::AttachPool(spyre::GlobalRuntime::get(), descriptor_copy);
