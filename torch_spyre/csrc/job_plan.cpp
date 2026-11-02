@@ -161,7 +161,8 @@ std::vector<flex::HostComputeArg> JobPlanStepHostCompute::resolveSymbolicArgs(
 }
 
 void JobPlanStepHostCompute::construct(LaunchContext& ctx,
-                                       const SpyreStream& stream) const {
+                                       const SpyreStream& stream,
+                                       const SpyreStream* dma_stream) const {
   std::vector<flex::HostComputeArg> args;
 
   // Cases 1 and 2 need no address args, input_buffer_ and ishape_ carry
@@ -219,8 +220,9 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
   dma_params->callback = [host_buffer](void*,
                                        const flex::FlexCallbackMetadata*) {};
 
+  const SpyreStream& upload_stream = dma_stream ? *dma_stream : stream;
   try {
-    stream.launchH2D(dma_params);
+    upload_stream.launchH2D(dma_params);
   }
   catch (...) {
     flex::destroyDmaParams(dma_params);
