@@ -6,8 +6,10 @@ CREATE TABLE IF NOT EXISTS result_uploads
 (
     ts             DateTime64(3, 'UTC') DEFAULT now64(3),
     upload_id      UUID,                          -- uuid7; the run key is manual:<uploader>:<upload_id>
-    state          LowCardinality(String),        -- 'published', 'failed' (ingest error) or 'retracted'
-    actor          String,                        -- who made this event: the uploader, or an admin who retracted
+    -- 'pending' (stored, awaiting review; not ingested), 'rejected', 'expired' (pending too long),
+    -- 'published', 'failed' (ingest error) or 'retracted'
+    state          LowCardinality(String),
+    actor          String,                        -- who made this event: the uploader, a reviewer, or an admin who retracted
     artifact_id    UUID,
     run_id         UUID,                          -- RunId of the run key, known before the ingest runs
     format         LowCardinality(String),        -- bundle.schema.json `kind`
@@ -23,7 +25,7 @@ CREATE TABLE IF NOT EXISTS result_uploads
     audit_uuid      UUID DEFAULT generateUUIDv7(),
     audit_timestamp DateTime64(3) DEFAULT now64(3),
 
-    CONSTRAINT chk_state  CHECK state IN ('published', 'failed', 'retracted'),
+    CONSTRAINT chk_state  CHECK state IN ('pending', 'rejected', 'expired', 'published', 'failed', 'retracted'),
     CONSTRAINT chk_linked CHECK artifact_id != toUUID('00000000-0000-0000-0000-000000000000')
                             AND run_id != toUUID('00000000-0000-0000-0000-000000000000'),
     CONSTRAINT chk_format CHECK format IN ('junit', 'vllm', 'sendnn', 'benchmarks'),
