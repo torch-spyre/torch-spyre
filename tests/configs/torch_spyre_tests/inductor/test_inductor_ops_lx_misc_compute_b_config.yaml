@@ -22,6 +22,10 @@ test_suite_config:
             # remove when multi-arg pointwise with mixed EA is supported)
             - LxPlanning.*::test_div_mixed_dtype_true_div_fp16_fp32_1d256_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_div_mixed_dtype_floor_div_fp16_fp32_1d256_lx_planning_(pointwise|reduction)
+            # masked_fill/masked_fill_ fp16_2d_neginf: the -inf result is exact;
+            # the LX wrappers then compute (y + y) / 2 or sum(y, dim=0) on it,
+            # which gives NaN on device even without LX planning (#5190)
+            - LxPlanning.*::test_masked_fill_scalar.*fp16_2d_neginf_lx_planning_(pointwise|reduction)
           mode: xfail_strict
         - names:
             - LxPlanning.*::test_layernorm.*_lx_planning_(pointwise|reduction)
@@ -53,6 +57,7 @@ test_suite_config:
             - LxPlanning.*::test_uniform_custom_range_cpu.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_random_from_cpu.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_where.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_masked_fill_scalar.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_restickify_add_transpose.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_restickify_clone.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_prod.*_lx_planning_(pointwise|reduction)
