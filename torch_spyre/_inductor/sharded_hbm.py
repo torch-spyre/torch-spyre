@@ -116,12 +116,10 @@ def check_sharded_input(
 def _check_core_match(placement: ShardedPlacement) -> None:
     """Non-unified kernels need one core per shard.
 
-    The storage side is validated where the tensor is created: ``distribute_tensor``
-    checks the placement receipt in Python, and the compiled wrapper's raw
-    ``_spyre_empty_sharded`` outputs are checked by native TORCH_CHECKs in the
-    Spyre allocator (chunk count, unique ids, core matching, sizes). This
-    checks the compiler-side core count so the pinned work split has a core
-    to pin to.
+    The storage side is validated where the tensor is created:
+    ``distribute_tensor`` checks the placement receipt in Python. This checks
+    the compiler-side core count so the pinned work split has a core to pin
+    to.
     """
 
     if placement.num_shards != config.sencores:

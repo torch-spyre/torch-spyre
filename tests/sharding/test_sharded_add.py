@@ -601,9 +601,9 @@ def test_bundle_symbolic_args_disabled_fails_at_compile(monkeypatch):
 def test_dtype_casting_copy_fails_closed():
     """Dtype-converting copies of sharded tensors are rejected, not truncated.
 
-    The installed Flex build lacks the D2H host-capacity argument (the LOCAL
-    DEMO SHIM in spyre_stream.cpp), so a converting copy cannot bound its
-    host output. TODO: positive once Flex is rebased onto aaf176a7.
+    The D2H conversion path bounds its host output only through the
+    post-factory host_capacity_bytes write in spyre_stream.cpp (a flex-side
+    TODO), and converting shard copies are untested against it.
     """
     n = _num_shards()
     torch.manual_seed(0)

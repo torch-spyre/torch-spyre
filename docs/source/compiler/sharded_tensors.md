@@ -25,12 +25,35 @@ allocation. Sharded tensors are the smallest faithful implementation of that mod
   slot *i* backs core *i*. There is no placement freedom yet; the extension
   points for a non-identity map exist but are pinned to identity (see
   [Roadmap extension points](#roadmap-extension-points)).
-* **One op compiled end-to-end.** `add` runs as a sharded kernel. Every
-  other op that would touch sharded storage is rejected at compile time
-  with a message saying why.
+* **Pointwise ops compiled end-to-end.** Any same-shape pointwise op runs
+  as a sharded kernel (`add` is the one the test suite pins); chaining
+  works across compiled calls, but a multi-op graph with a sharded
+  intermediate is rejected. Everything else that would touch sharded
+  storage is rejected at compile time with a message saying why.
 * **Host copies only.** Sharded tensors copy to and from the CPU
   (whole-tensor, no dtype change). Device-to-device copies and fills are
   rejected because they take a single device address.
+
+Beyond the op set, the compiled path admits only a narrow shape regime;
+everything outside it fails at compile time with a specific message:
+
+* Every sharded operand must share one placement and have the op's exact
+  shape — no views, slices, reshapes, broadcasts or reindexing (views of
+  sharded storage are additionally rejected at construction; see
+  [Runtime](#runtime-storage-and-addressing-c)).
+* Shard-local strides must equal the global ones (DeepTools strides each
+  core's tiles from the global shape): the shard boundary must fall on
+  whole sticks for a last-dim shard, exactly one (the shard) dim may be
+  divided, and rows may not span multiple sticks — a 32×128 fp16
+  `Shard(0)` tensor fails because the second stick of every row would go
+  unwritten (`_check_local_strides` in `sharded_hbm.py`).
+* Static shapes only (`dynamic=False`), one dtype across operands and
+  output, `BUNDLE_SYMBOLIC_ARGS=1` (each core's start address is a bundle
+  `input_arg`), and each input must be a base tensor carrying its
+  shard-local `SpyreTensorLayout` (a tiled kernel argument whose layout is
+  not the shard-local one is rejected).
+* Sharded intermediates and in-place writes into sharded storage are
+  rejected — only graph inputs and outputs may be sharded.
 
 `num_shards` must equal the active core count (`SENCORES`), so the storage
 and the kernels that consume it agree on how many cores participate.
@@ -187,9 +210,12 @@ The sharded storage lives in the Spyre allocator,
   **non-owning** `composite_addr` spanning all shards' chunks, so the
   whole-storage view reports a total size without ever freeing anything in
   its destructor. A `sharding` record (`ShardedStorageInfo`: shard dim,
-  count, per-shard bytes) marks the storage as sharded; a `shard_view`
+  shard count, per-shard bytes, the global shape the storage was allocated
+  for) marks the storage as sharded; a `shard_view`
   back-pointer lets a view's `DataPtr` deleter free its enclosing
-  `ShardViewCtx`.
+  `ShardViewCtx`. Each shard's allocation is placed round-robin: shard *i*
+  is bound to Flex memory domain `i % num_memory_domains()`, spreading the
+  shards across the device's domains.
 
 On top of that,
 [spyre_mem.cpp](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/csrc/spyre_mem.cpp)
@@ -206,7 +232,15 @@ implements:
   per-shard bytes against what the kernel was compiled for, so a stale
   kernel or a differently-sharded tensor fails at launch, not silently.
 * Fail-closed guards: `set_`, `resize_`, and fills reject sharded storage
-  (they would reinterpret or partially write it);
+  (they would reinterpret or partially write it); the view constructors and
+  in-place `as_strided_` reject any view of sharded storage that does not
+  reproduce the base tensor exactly — same sizes, strides, and storage
+  offset — because a view's shape no longer matches the shard mapping
+  (`check_sharded_view` in
+  [spyre_views.cpp](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/csrc/spyre_views.cpp);
+  identity views such as `detach` are allowed); and `copy_sharded` checks
+  the tensor's sizes against the recorded `global_shape` before mapping
+  elements onto shards;
   [spyre_composite_address.cpp](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/csrc/spyre_composite_address.cpp)
   rejects sharded storage anywhere a single `CompositeAddress` is
   consumed (kernels, fills, device copies).
@@ -216,7 +250,7 @@ artifacts** — a compiled kernel names its sharded arguments symbolically
 and the runner resolves them against the actual tensor at call time.
 
 The pybind surface (`_spyre_empty_sharded`, `_spyre_is_sharded`,
-`_spyre_sharding_info`) is declared in
+`_spyre_sharding_info`, `num_memory_domains`) is declared in
 [module.cpp](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/csrc/module.cpp)
 and mirrored in
 [_C.pyi](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_C.pyi).
@@ -228,12 +262,12 @@ The Inductor side is led by
 whose `plan_sharded_hbm` admits a graph for sharded compilation or raises
 `Unsupported`. Its checks, in order:
 
-1. Only `add` (and the dtypes/shape regimes it supports) is admitted;
-   mixed dtypes, dynamic shapes, and views of sharded inputs are rejected
-   with specific messages.
-2. Every sharded input must agree on placement (shard dim, count,
-   per-shard bytes) with what the storage receipt records — a
-   compiler-vs-storage cross-check, not a re-derivation.
+1. Only same-shape pointwise ops are admitted (the op-kind check is
+   generic — not limited to `add`); mixed dtypes, dynamic shapes, and
+   views of sharded inputs are rejected with specific messages.
+2. Every sharded input must agree with the others on placement (shard dim,
+   count) — an operand-vs-operand check; each operand's own storage was
+   already validated against its receipt when the tensor was created.
 3. Only pinned ops may read sharded storage, including
    non-`ComputedBuffer` consumers (fallback kernels), which a separate
    loop catches.
@@ -241,8 +275,9 @@ whose `plan_sharded_hbm` admits a graph for sharded compilation or raises
 Downstream, the sharding plan pins work division — a sharded op's core
 split is fixed by its shard plan (the scratchpad allocator's "shard plan"
 branch), never renegotiated by the work-division passes — and codegen
-emits **one kernel invocation per core with one input argument per
-(sharded tensor, core) pair**:
+emits **one SDSC (kernel invocation) with the non-unified
+`nonUnifiedAllocInHBM_` form and one `input_arg` per (sharded tensor,
+core) pair** — every core executes the same kernel on its own shard:
 
 * [bundle.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/codegen/bundle.py)
   introduces the `kShardAddress` symbol kind: a sharded kernel argument
@@ -312,8 +347,9 @@ pinned to identity or unused, for the multi-domain memory compiler
 milestone 1:
 
 * `ShardPlacementEntry.physical` — the opaque per-entry physical mapping
-  (today: domain, region, segment, offset). Domain-aware placement will
-  fill this instead of the identity layout.
+  (today: domain, region, segment, offset, filled from the live region
+  map at allocation time; shards spread round-robin across domains).
+  Non-identity *placement policies* would land here.
 * `SpyreShardingSpec.bindings()` / `ShardChunkBinding` — binds each
   semantic shard to a placement slot and core. Today the map is identity;
   a non-identity slot-to-core map lands here without changing the public
@@ -323,6 +359,3 @@ milestone 1:
   this is the contract a future backend is held to.
 * Moving the generation-aware adapter into Flex — the end-state that
   deletes the adapter file.
-
-Removing these extension points to shrink the diff is a regression against the
-roadmap, not a simplification.

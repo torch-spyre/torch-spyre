@@ -112,9 +112,10 @@ struct SpyreAllocator final : public c10::DeviceAllocator {
   c10::DataPtr allocate(size_t nbytes,
                         const flex::AllocationDirective& directive);
 
-  // Allocate sharded storage: logical_chunks segment-emulated chunks, each at
-  // least shard_device_bytes, tagged with the sharding record. The returned
-  // DataPtr owns the allocation through a SharedOwnerCtx.
+  // Allocate sharded storage: num_shards plain per-shard allocations of
+  // shard_device_bytes, shard i bound to Flex memory domain
+  // i % num_memory_domains, tagged with the sharding record. The returned
+  // DataPtr owns them through a SharedOwnerCtx.
   static c10::DataPtr allocateShardedStorage(int64_t shard_dim,
                                              uint32_t logical_chunks,
                                              uint64_t shard_device_bytes);

@@ -1782,8 +1782,9 @@ def has_resolved_work_div_hint(op: ComputedBuffer) -> bool:
 
     ``spyre_hint`` annotates every node in its scope, so an op can carry a
     ``work_div`` hint naming none of its dims; that op gets a default split.
-    Shard-pinned ops are excluded: the scratchpad allocator pins their
-    division through its own "shard plan" branch instead.
+    Shard-pinned ops are not excluded here: the scratchpad allocator's
+    "shard plan" branch commits their division first, so this predicate never
+    decides for them.
     """
     return (
         isinstance(op.data, (Pointwise, Reduction))
