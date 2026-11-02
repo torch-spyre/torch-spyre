@@ -140,6 +140,14 @@ class TestSpyre(TestCase):
         self._kv_page_round_trip(shape, block_id=0)
         self._kv_page_round_trip(shape, block_id=NUM_BLOCKS - 1)
 
+    def test_rejects_host_cache(self):
+        """The cache has to be on the device; the pool is the host side."""
+        shape = (NUM_BLOCKS, 16, NUM_KV_HEADS, HEAD_DIM)
+        pool = self._pool(make_cache(shape, fill_random=False), NUM_BLOCKS)
+        host_cache = torch.zeros(shape, dtype=torch.float16)
+        with self.assertRaisesRegex(RuntimeError, "must be a Spyre tensor"):
+            copy_kv_page_raw(host_cache, 1, pool, 0, to_device=False)
+
     def test_rejects_default_layout(self):
         """A cache allocated without a device_layout gets the generated tiled
         layout, which reorders dimensions so a page is not contiguous.
@@ -170,6 +178,17 @@ class TestSpyre(TestCase):
         pool = self._pool(cache, NUM_BLOCKS)
         with self.assertRaisesRegex(RuntimeError, r"block_id \d+ out of range"):
             copy_kv_page_raw(cache, NUM_BLOCKS, pool, 0, to_device=False)
+
+    def test_rejects_slot_id_out_of_range(self):
+        """flex checks the slot while resolving it, so the error reaches
+        Python before anything is submitted.
+        """
+        shape = (NUM_BLOCKS, 16, NUM_KV_HEADS, HEAD_DIM)
+        cache = make_cache(shape, fill_random=True)
+        pool = self._pool(cache, NUM_BLOCKS)
+        # _pool() builds one slot pools, so slot 0 is the only valid slot
+        with self.assertRaisesRegex(RuntimeError, "slot index is out of range"):
+            copy_kv_page_raw(cache, 1, pool, 1, to_device=False)
 
 
 if __name__ == "__main__":

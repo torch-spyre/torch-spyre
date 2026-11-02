@@ -1077,8 +1077,8 @@ flex::Range derive_kv_page_range(const at::Tensor& cache, size_t block_id) {
   TORCH_CHECK(device_size.size() == 4,
               "copy_kv_page_raw: expected a rank 4 device layout, got rank ",
               device_size.size(),
-              ". A generic tiled layout is not a supported KV cache, allocate "
-              "with slot_major_kv_layout");
+              ". A generic tiled layout is not a supported KV cache, pass a "
+              "rank 4 row-major device_layout when allocating");
 
   const int64_t num_blocks = cache.size(0);
   const int64_t head_size = cache.size(3);

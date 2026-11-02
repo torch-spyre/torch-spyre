@@ -20,7 +20,6 @@
 #include <c10/core/Stream.h>
 
 #include <cstdint>
-#include <flex/memory_interface/shared_host_pool.hpp>
 #include <memory>
 #include <vector>
 
