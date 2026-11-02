@@ -84,6 +84,7 @@ from .pass_utils import (
 )
 from .views import align_tensors, tiling_expr_to_device_expr
 from .logging_utils import get_inductor_logger
+from .loop_facts import enclosing_loops
 from .op_spec import (
     IndirectAccess,
     LX_RELAYOUT_INFO_KEY,
@@ -1045,10 +1046,9 @@ class SpyreKernel(Kernel[CSEVariable]):
         # device_tile_advance_expr.coeff(sym) resolves to that level's own
         # contribution regardless of how many host dims it tiles.
         li = getattr(ir_node, "loop_info", None)
-        raw_tiled_dims: list[list[int]] = li.loop_tiled_dims if li is not None else []
-        raw_tiled_red_dims: list[list[int]] = (
-            li.loop_tiled_reduction_dims if li is not None else []
-        )
+        loops = enclosing_loops(ir_node)
+        raw_tiled_dims = [loop.tiled_dims for loop in loops]
+        raw_tiled_red_dims = [loop.tiled_reduction_dims for loop in loops]
         # A dim tiled down to a per-tile extent of 1 is squeezed out of the
         # op's own iteration space entirely (no d{i} symbol survives), so it
         # is invisible to loop_tiled_dims/loop_tiled_reduction_dims and can
@@ -1068,11 +1068,9 @@ class SpyreKernel(Kernel[CSEVariable]):
         raw_squeezed_advance_output: list[list[tuple]] = (
             li.squeezed_advance_output if li is not None else []
         )
-        # CoarseTileInfo always constructs loop_tiled_dims and
-        # loop_tiled_reduction_dims with the same length (one sublist per
-        # nesting level), so max() is just a safety net; in practice both
-        # lists have the same length and the per-level loop below never
-        # silently drops an entry from the shorter one.
+        # enclosing_loops gives one entry per nesting level, so the first two
+        # terms are both the loop depth; max() keeps a squeezed record that
+        # (malformed) runs deeper than the loop nest from being dropped.
         n_levels = max(
             len(raw_tiled_dims),
             len(raw_tiled_red_dims),
@@ -1083,7 +1081,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         tiled_symbol_trip_counts: dict = {}
         tiled_syms: list[list] = []
         if n_levels > 0:
-            loop_count = li.loop_count if li is not None else []
+            loop_count = [loop.trip_count for loop in loops]
 
             op_name = ir_node.get_operation_name()
             tiled_syms_per_level_outermost: list[list] = []
