@@ -134,6 +134,14 @@ def test_workflow_row_is_a_valid_attempt_row():
     assert row["failed_stage"] == "run-tests (x86_64)" and row["arches"] == ["x86_64"]
 
 
+def test_workflow_row_records_the_pr_base():
+    pr = {"number": 5190, "base": {"ref": "main", "sha": "b45e"}}
+    row = gha_runs.workflow_row(REPO, _run(pull_requests=[pr]), [_job()])
+    assert (row["props"]["base_ref"], row["props"]["base_sha"]) == ("main", "b45e")
+    bare = gha_runs.workflow_row(REPO, _run(pull_requests=[]), [_job()])
+    assert "base_sha" not in bare["props"]
+
+
 def test_job_row_links_to_its_attempt_and_names_the_failed_step():
     row = gha_runs.job_row(REPO, _run(), _job())
     PipelineRuns.row(row)

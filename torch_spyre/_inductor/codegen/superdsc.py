@@ -1850,6 +1850,11 @@ def _resolve_sdsc_size(expr: Expr, symbolic_dim_bounds: dict) -> int:
     codegen time from ShapeEnv, serialized as plain ints into the generated
     file) so this works during the reload phase when ShapeEnv is gone.
     Falls back to _concretize_for_sdsc for concrete expressions.
+
+    The symbolic branch is deprecated: only the symbolic-SDSC route reaches it.
+    The explicit-loop route that supersedes that one puts no dimension symbol in
+    an SDSC, so every size here is already concrete and takes the fallback.
+    TODO(issue#5890): drop the symbolic branch with the symbolic-SDSC route.
     """
     # ``symbolic_dim_bounds`` is keyed by a single symbol name, so it can only
     # answer for a single-symbol expression; a multi-symbol one falls through to
@@ -2372,15 +2377,14 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     elif is_restickify:
         _extend_restickify_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
 
-    # Grow the index-entry iteration to the padded output device_size so a
-    # partial-last-stick gather splits stick-aligned across cores. The output's
-    # entry-dim device_size was rounded up to the index stick multiple at layout
-    # time (enforce_indirect_access_layout); match the SDSC iteration to it BEFORE
-    # _create_sdsc_tensors so the output's per-core base stride is computed from
-    # the padded (stick-aligned) size rather than the shorter logical count.
-    # Otherwise the per-core base lands element-aligned (mid-stick) and the split
-    # miscompiles. No-op unless the output was actually padded (device_size >
-    # iteration), i.e. only for the multi-core partial-stick case.
+    # Grow a core-split index-entry iteration to the padded output device_size.
+    # The output's entry-dim device_size was rounded up to the index stick
+    # multiple at layout time (enforce_indirect_access_layout) so the entry dim
+    # can split in whole index sticks; matching the SDSC iteration to it BEFORE
+    # _create_sdsc_tensors puts each core's output base on a stick boundary
+    # rather than mid-stick. An unsplit entry dim keeps its logical count: the
+    # grown iteration would dereference the index's padding lanes as table rows,
+    # and those hold whatever the index's producer left there.
     if has_indirect_access and _spyre_config.sencores > 1:
         idx_arg = op_spec.args[next(iter(index_tensor_indices))]
         idx_stick = idx_arg.device_coordinates[-1]
@@ -2393,6 +2397,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
                     dev = int(out_arg.device_size[pos])
                     if (
                         entry_mb in sdsc_iteration_space
+                        and dim_splits[entry_mb] > 1
                         and dev > sdsc_iteration_space[entry_mb]
                     ):
                         sdsc_iteration_space[entry_mb] = dev
