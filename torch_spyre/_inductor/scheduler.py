@@ -40,6 +40,7 @@ from .pass_utils import iteration_space
 from .logging_utils import get_inductor_logger
 from .scratchpad.lx_relayout import (
     demote_lx_relayout_group,
+    local_lx_emission_contract,
     materialized_lx_relayout_for_destination,
 )
 from .op_spec import LoopSpec
@@ -547,6 +548,9 @@ class SuperDSCScheduling(BaseScheduling):
         # _codegen_into_kernel may reach further inner nodes, so the set can be a
         # subset -- which errs towards declining.
         kernel.fused_node_names = OrderedSet(n.get_name() for n in nodes)
+        kernel.local_read_contract_factory = lambda name, consumer: (
+            local_lx_emission_contract(V.graph, name, consumer)
+        )
         with kernel:
             self._codegen_into_kernel(nodes, kernel)
         if isinstance(node, CountedLoopSchedulerNode):
