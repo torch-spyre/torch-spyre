@@ -26,10 +26,12 @@ Tests all 4 conversion cases:
 4. FP32→FP16 with DL16_TO_FP32 → STANDARD
 """
 
+import itertools
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+import sympy
 import torch
 from torch._inductor import config as inductor_config
 from torch._inductor.dependencies import MemoryDep
@@ -37,6 +39,7 @@ from torch._inductor.exc import InductorError
 from torch._inductor.ir import (
     ComputedBuffer,
     MutationLayoutSHOULDREMOVE,
+    Operation,
     Pointwise,
     Scatter,
 )
@@ -48,22 +51,19 @@ from torch_spyre._C import (
     get_spyre_tensor_layout,
 )
 from torch_spyre._inductor import config as spyre_config
-from torch_spyre._inductor import passes
-from torch_spyre._inductor.codegen.compute_ops import (
-    _gen_shuffle_stick_coord_info,
-    _shuffle_stick_levels,
-    gen_coord_info_value,
-)
+from torch_spyre._inductor import element_arrangement, passes
+from torch_spyre._inductor.codegen.compute_ops import gen_coord_info_value
 from torch_spyre._inductor.constants import DEVICE_NAME, STAGGERED_EAS
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
 from torch_spyre._inductor.element_arrangement import (
-    _can_redirect_readers,
-    _needs_shuffle,
+    insert_ea_shuffle,
+    optimize_shuffling,
     validate_ops,
 )
 from torch_spyre._inductor.errors import Unsupported
-from torch_spyre._inductor.passes import CustomPreSchedulingPasses, _get_pass_name
-from utils_inductor import cached_randn, shapes2key, expects_raise
+from torch_spyre._inductor.ir import FixedTiledLayout
+from torch_spyre._inductor.passes import CustomPreSchedulingPasses
+from utils_inductor import cached_randn, expects_raise, shapes2key
 
 
 EA = ElementArrangement
@@ -714,186 +714,355 @@ def test_pad_of_staggered_inside_stick_pair_raises():
 _BACKEND_SHUFFLE_ISSUE = "#TBD"
 
 
-def _shape_id(shape):
-    return shapes2key((shape,)) or "scalar"
-
-
-def _dedupe(*shape_lists):
-    return list(dict.fromkeys(s for shapes in shape_lists for s in shapes))
-
-
-# Widths of the fp32 stick dim from the review: 32, 69 and 96 hold an odd number
-# of fp32 sticks, the odd-pair widths (192 ... 704) fail in the backend compiler.
-REVIEW_WIDTHS = [32, 64, 69, 96, 100, 128, 192, 256, 320, 384, 448, 576, 640, 704]
-REVIEW_WIDTHS += [768, 896, 1024]
-
-_STICK_ALIGNED_SHAPES = [
-    (64,),
-    (128,),
-    (4, 64),
-    (4, 128),
-    (7, 128),
-    (2, 4, 64),
-    (3, 5, 128),
-    (4, 8, 128),
-    (8, 16, 64),
-    (8, 16, 128),
-    (2, 3, 4, 64),
-    (2, 3, 4, 128),
-    (2, 4, 8, 64),
-]
-_SMALL_N_SHAPES = [(2,), (3,), (4,), (16,), (32,), (63,), (2, 2), (4, 16), (4, 32)]
-_BASE_SHAPES = _STICK_ALIGNED_SHAPES + _SMALL_N_SHAPES + STICK_ONLY_SHAPES
-_REVIEW_SHAPES = [(2, 64), (4, 128), (64, 256)]
-
-# Non-stick-aligned shapes (the stick dim ends inside a stick).
-_PARTIAL_STICK_SHAPES = [
-    (44,),
-    (100,),
-    (7, 44),
-    (3, 100),
-    (4, 44),
-    (4, 100),
-    (2, 4, 44),
-    (8, 16, 100),
-    (2, 3, 4, 44),
-]
-
-# fp16 -> fp32: the staggered operand is the fp32 one (DL16_TO_FP32).
-_DL16_TO_FP32_SHAPES = _dedupe(
-    _BASE_SHAPES,
-    _REVIEW_SHAPES,
-    _PARTIAL_STICK_SHAPES,
-    # Partial last stick or pair
-    [(68,), (4, 68), (8, 16, 68), (2, 96), (4, 96), (8, 16, 96)],
-    [(4, 160), (8, 16, 160)],
-    [(r, w) for r in (1, 4, 64) for w in REVIEW_WIDTHS],
-)
-# fp32 -> fp16: the compiler only accepts an even number of 32-element fp32
-# sticks (rescale_stl_for_dtype), so 68, 96, 160 and 32 wide are left out.
-_FP32_TO_DL16_SHAPES = _dedupe(
-    _BASE_SHAPES,
-    _REVIEW_SHAPES,
-    _PARTIAL_STICK_SHAPES,
-    [(r, w) for r in (1, 4, 64) for w in REVIEW_WIDTHS if -(-w // 32) % 2 == 0],
-)
-
-
-def _fp32_stick_pairs(width):
-    """Stick pairs in a row of ``width`` fp32 elements, padded to whole pairs."""
-    sticks = -(-width // 32)
-    return -(-sticks // 2)
-
-
-def _odd_fp32_pairs(shape):
-    """True if a row of an fp32 staggered tensor holds an odd number (>= 3) of
-    stick pairs (a backend failure)."""
-    if not shape:
-        return False
-    pairs = _fp32_stick_pairs(shape[-1])
-    return pairs >= 3 and pairs % 2 == 1
-
-
-# direction -> (dtype of the converted operand, dtype of the STANDARD operand,
-#               conversion to the staggered dtype), given the fp16 flavour
-_SHUFFLE_DIRECTIONS = {
-    "dl16_to_fp32": (lambda f: f, lambda f: torch.float32, lambda f: torch.float32),
-    "fp32_to_dl16": (lambda f: torch.float32, lambda f: f, lambda f: f),
-}
-_SHUFFLE_SHAPES = {
-    "dl16_to_fp32": _DL16_TO_FP32_SHAPES,
-    "fp32_to_dl16": _FP32_TO_DL16_SHAPES,
-}
-
-
-def _shuffle_cases():
-    cases = []
-    for direction, shapes in _SHUFFLE_SHAPES.items():
-        for shape in shapes:
-            marks = []
-            if direction == "dl16_to_fp32" and _odd_fp32_pairs(shape):
-                marks.append(
-                    pytest.mark.xfail(
-                        strict=True,
-                        raises=InductorError,
-                        reason=(
-                            "the backend compiler (dbo-opt) rejects the shuffle "
-                            "kernel when a row holds an odd number (>= 3) of fp32 "
-                            f"stick pairs, {_BACKEND_SHUFFLE_ISSUE}"
-                        ),
-                    )
-                )
-            cases.append(
-                pytest.param(
-                    direction,
-                    shape,
-                    marks=marks,
-                    id=f"{direction}-{_shape_id(shape)}",
-                )
-            )
-    return cases
-
-
-_SHUFFLE_CASES = _shuffle_cases()
-
-
-def _shuffle_operands(direction, shape, fp16):
-    """Inputs and conversion for ``direction``: x is converted, y is STANDARD."""
-    x_dtype, y_dtype, to_dtype = (f(fp16) for f in _SHUFFLE_DIRECTIONS[direction])
-    x = _small_int_fp16(shape, 7).to(x_dtype)
-    y = _small_int_fp16(shape, 5, base=3).to(y_dtype)
-    return x, y, lambda t: t.to(to_dtype)
-
-
 class TestEAShuffle:
     """A multi-arg op mixing STANDARD and staggered operands gets a shuffle.
 
     Both staggered arrangements (fp16 -> fp32 gives DL16_TO_FP32, fp32 -> fp16
-    gives FP32_TO_DL16) are met by a STANDARD operand, in both operand orders,
-    over aligned, partial-stick, small, stick-only and review shapes. Inputs
-    are small integers, so the results compare exactly.
+    gives FP32_TO_DL16) are met by a STANDARD operand. ``test_ea_shuffle`` covers
+    every shape group on the device with one pointwise op, and
+    ``test_shuffle_pointwise`` covers every pointwise op and chain on one small
+    shape. The remaining tests check the stick coordinate info that codegen
+    emits for a shuffle (``gen_coord_info_value``) on the same shapes, without a
+    device. Inputs are small integers, so device results compare exactly.
     """
 
-    OPS_DICT = {
+    # Shape groups. Every shape is distinct; a group is kept small by taking one
+    # representative per rank and per stick-count class.
+    #
+    # STICK_ONLY_SHAPES (module level, shared with test_roundtrip_stick_only_shape)
+    # hold a scalar or all size-1 dims.
+
+    # The stick dim is a whole number of 64-element sticks.
+    _STICK_ALIGNED_SHAPES = [
+        (64,),
+        (128,),
+        (2, 64),
+        (4, 64),
+        (4, 128),
+        (2, 4, 64),
+        (3, 5, 128),
+        (2, 3, 4, 64),
+        (64, 256),
+        # an odd number (>= 3) of fp32 stick pairs when staggered as DL16_TO_FP32
+        (4, 192),
+        (4, 320),
+    ]
+    # The stick dim is shorter than a stick, or ends a stick early.
+    _SMALL_N_SHAPES = [(2,), (16,), (32,), (63,), (2, 2), (4, 16), (4, 32)]
+    # The stick dim ends inside a stick.
+    _PARTIAL_STICK_SHAPES = [(44,), (100,), (7, 44), (4, 100), (2, 4, 44), (8, 16, 100)]
+
+    # fp16 -> fp32: the staggered operand is the fp32 one (DL16_TO_FP32). Its
+    # stick dim may hold an odd number of fp32 sticks, padded to a whole pair.
+    _DL16_TO_FP32_SHAPES = (
+        STICK_ONLY_SHAPES
+        + _STICK_ALIGNED_SHAPES
+        + _SMALL_N_SHAPES
+        + _PARTIAL_STICK_SHAPES
+        + [(68,), (4, 68), (4, 69), (4, 96), (4, 160)]
+    )
+    # fp32 -> fp16: the staggered operand is the fp16 one (FP32_TO_DL16). The
+    # compiler only accepts an even number of 32-element fp32 sticks
+    # (rescale_stl_for_dtype), so the odd-stick shapes above are left out.
+    _FP32_TO_DL16_SHAPES = (
+        STICK_ONLY_SHAPES
+        + _STICK_ALIGNED_SHAPES
+        + _SMALL_N_SHAPES
+        + _PARTIAL_STICK_SHAPES
+    )
+
+    # Shapes the compiler rejects today, with a fragment of the error. They are
+    # left out of the shuffle cases on the device and checked by
+    # test_ea_shuffle_rejected. TODO: when a rejection is lifted, move its shape
+    # to a group above so that it is checked by test_ea_shuffle.
+    _DL16_TO_FP32_REJECTED = {
+        # fewer than a whole pair of 32-element fp32 sticks
+        (2,): "whole FP32 stick pairs",
+        (16,): "whole FP32 stick pairs",
+        (32,): "whole FP32 stick pairs",
+        (2, 2): "whole FP32 stick pairs",
+        (4, 16): "whole FP32 stick pairs",
+        (4, 32): "whole FP32 stick pairs",
+        # a rank >= 3 read of the shuffled stick dim is not affine
+        (2, 4, 64): "cannot be divided safely",
+        (2, 3, 4, 64): "cannot be divided safely",
+    }
+    _FP32_TO_DL16_REJECTED = {
+        # one 32-element fp32 stick is not a whole 64-element fp16 stick
+        (32,): "cannot rescale device layout",
+        (4, 32): "cannot rescale device layout",
+    }
+
+    # (staggered arrangement, shape) over both conversion directions, for the
+    # tests that need no device.
+    _SHUFFLE_CASES = [
+        pytest.param(
+            EA.DL16_TO_FP32, s, id=f"dl16_to_fp32-{shapes2key((s,)) or 'scalar'}"
+        )
+        for s in _DL16_TO_FP32_SHAPES
+    ] + [
+        pytest.param(
+            EA.FP32_TO_DL16, s, id=f"fp32_to_dl16-{shapes2key((s,)) or 'scalar'}"
+        )
+        for s in _FP32_TO_DL16_SHAPES
+    ]
+
+    # The same shapes on the device, without the rejected ones. A broadcast stick
+    # (STICK_ONLY_SHAPES) gets no shuffle: its order is moot.
+    _DL16_TO_FP32_RUN = sorted(
+        set(_DL16_TO_FP32_SHAPES)
+        - set(_DL16_TO_FP32_REJECTED)
+        - set(STICK_ONLY_SHAPES),
+        key=_DL16_TO_FP32_SHAPES.index,
+    )
+    _FP32_TO_DL16_RUN = sorted(
+        set(_FP32_TO_DL16_SHAPES)
+        - set(_FP32_TO_DL16_REJECTED)
+        - set(STICK_ONLY_SHAPES),
+        key=_FP32_TO_DL16_SHAPES.index,
+    )
+    _RUN_CASES = [
+        pytest.param(EA.DL16_TO_FP32, s, id=f"dl16_to_fp32-{shapes2key((s,))}")
+        for s in _DL16_TO_FP32_RUN
+    ] + [
+        pytest.param(EA.FP32_TO_DL16, s, id=f"fp32_to_dl16-{shapes2key((s,))}")
+        for s in _FP32_TO_DL16_RUN
+    ]
+    _REJECTED_CASES = [
+        pytest.param(EA.DL16_TO_FP32, s, m, id=f"dl16_to_fp32-{shapes2key((s,))}")
+        for s, m in _DL16_TO_FP32_REJECTED.items()
+    ] + [
+        pytest.param(EA.FP32_TO_DL16, s, m, id=f"fp32_to_dl16-{shapes2key((s,))}")
+        for s, m in _FP32_TO_DL16_REJECTED.items()
+    ]
+
+    # Pointwise ops and chains of them; ``s`` is the staggered operand and ``std``
+    # the STANDARD one.
+    POINTWISE_FNS = {
         "add": torch.add,
         "mul": torch.mul,
         "eq": torch.eq,
-        # the STANDARD operand comes first
-        "rsub": lambda s, y: y - s,
+        "rsub": lambda s, std: std - s,
+        "add_then_mul": lambda s, std: (s + std) * 2.0,
+        "mul_then_add": lambda s, std: s * std + std,
+        "rsub_then_mul": lambda s, std: (std - s) * 2.0,
     }
 
-    @pytest.mark.parametrize("fp16", DtypeOpTable.fp16_types())
-    @pytest.mark.parametrize("direction, shape", _SHUFFLE_CASES)
-    @pytest.mark.parametrize(
-        "op",
-        list(OPS_DICT.values()),
-        ids=list(OPS_DICT.keys()),
+    # Sizes of a stick dim that hold an odd number of fp32 sticks.
+    _ODD_FP32_STICK_SIZES = sorted(
+        {s[-1] for s in _DL16_TO_FP32_SHAPES if s and -(-s[-1] // 32) % 2 == 1}
     )
-    def test_shuffle_implicit_pointwise(self, direction, shape, fp16, op):
-        x, y, convert = _shuffle_operands(direction, shape, fp16)
 
-        def fn(x, y_std):
-            # the converted operand is staggered and meets a STANDARD one
-            return op(convert(x), y_std)
+    @staticmethod
+    def _operands(ea, shape, fp16):
+        """Inputs for ``ea``: ``x`` is converted to the dtype of ``y`` (STANDARD)."""
+        if ea == EA.DL16_TO_FP32:
+            x_dtype, y_dtype = fp16, torch.float32
+        else:
+            x_dtype, y_dtype = torch.float32, fp16
+        x = _small_int_fp16(shape, 7).to(x_dtype)
+        y = _small_int_fp16(shape, 5, base=3).to(y_dtype)
+        return x, y
 
-        result = _run(fn, x.to(DEVICE_NAME), y.to(DEVICE_NAME))
+    @staticmethod
+    def _stick_geometry(ea, shape):
+        """``(size, elems_per_stick)`` of the stick dim of the staggered tensor."""
+        return (shape[-1] if shape else 1), (32 if ea == EA.DL16_TO_FP32 else 64)
 
-        assert_ea(result, EA.STANDARD)
-        assert torch.equal(result.cpu(), fn(x, y))
+    @staticmethod
+    def _coord_info(size, nsplits, eps, ea, device_size=None):
+        return gen_coord_info_value(
+            size=size,
+            nsplits=nsplits,
+            elems_per_stick=eps,
+            is_stick_dim=True,
+            element_arrangement=ea,
+            is_ea_shuffle=True,
+            stick_device_size=device_size,
+        )
 
-    @pytest.mark.parametrize("fp16", DtypeOpTable.fp16_types())
-    @pytest.mark.parametrize("direction, shape", _SHUFFLE_CASES)
-    def test_shuffle_feeds_downstream_op(self, direction, shape, fp16):
-        x, y, convert = _shuffle_operands(direction, shape, fp16)
+    @staticmethod
+    def _levels_of(info):
+        """The ``(cardinality, step)`` levels of a stick dim, innermost first."""
+        folds = info["folds"]
+        return [
+            (attr["factor_"], func["Affine"]["alpha_"])
+            for attr, func in zip(
+                folds["dim_prop_attr"][3:], folds["dim_prop_func"][3:]
+            )
+        ][::-1]
+
+    @staticmethod
+    def _stick_offsets(levels):
+        """Sorted element offsets visited by nested ``(cardinality, step)`` levels."""
+        offsets = [0]
+        for card, step in levels:
+            offsets = [o + i * step for o in offsets for i in range(card)]
+        return sorted(offsets)
+
+    @staticmethod
+    def _drop_trivial(levels):
+        return [lvl for i, lvl in enumerate(levels) if i == 0 or lvl[0] != 1]
+
+    @staticmethod
+    def _expected_levels(size, eps):
+        """Reference staggered levels, written out per elements-per-stick."""
+        if eps == 64:
+            return [(4, 1), (2, 32), (8, 4), (-(-size // 64), 64)]
+        sticks = -(-size // 32)
+        return [(4, 1), (8, 8), (2, 4), (sticks // 2, 64)]
+
+    # -- on the device -----------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "fp16",
+        DtypeOpTable.fp16_types(),
+        ids=lambda dt: str(dt).replace("torch.", ""),
+    )
+    @pytest.mark.parametrize("ea, shape", _RUN_CASES)
+    def test_ea_shuffle(self, ea, shape, fp16):
+        """A staggered operand added to a STANDARD one is shuffled, on every shape."""
+        x, y = self._operands(ea, shape, fp16)
 
         def fn(x, y):
-            # staggered -> shuffled to std for the add with y (std) -> next op
-            return (convert(x) + y) * 2.0
+            # the converted operand is staggered and meets a STANDARD one
+            return torch.add(x.to(y.dtype), y)
 
         result = _run(fn, x.to(DEVICE_NAME), y.to(DEVICE_NAME))
 
         assert_ea(result, EA.STANDARD)
         assert torch.equal(result.cpu(), fn(x, y))
+
+    @expects_raise
+    @pytest.mark.parametrize(
+        "fp16",
+        DtypeOpTable.fp16_types(),
+        ids=lambda dt: str(dt).replace("torch.", ""),
+    )
+    @pytest.mark.parametrize("ea, shape, match", _REJECTED_CASES)
+    def test_ea_shuffle_rejected(self, ea, shape, match, fp16):
+        """Shapes the compiler cannot shuffle yet fail with a stable error."""
+        x, y = self._operands(ea, shape, fp16)
+
+        def fn(x, y):
+            return torch.add(x.to(y.dtype), y)
+
+        with pytest.raises(InductorError, match=match):
+            _run(fn, x.to(DEVICE_NAME), y.to(DEVICE_NAME))
+
+    @pytest.mark.parametrize(
+        "fp16",
+        DtypeOpTable.fp16_types(),
+        ids=lambda dt: str(dt).replace("torch.", ""),
+    )
+    @pytest.mark.parametrize(
+        "ea", [EA.DL16_TO_FP32, EA.FP32_TO_DL16], ids=["dl16_to_fp32", "fp32_to_dl16"]
+    )
+    @pytest.mark.parametrize(
+        "pointwise", list(POINTWISE_FNS.values()), ids=list(POINTWISE_FNS)
+    )
+    def test_shuffle_pointwise(self, ea, fp16, pointwise):
+        """Each pointwise op, and chains of them, read a shuffled operand."""
+        x, y = self._operands(ea, (2, 64), fp16)
+
+        def fn(x, y):
+            return pointwise(x.to(y.dtype), y)
+
+        result = _run(fn, x.to(DEVICE_NAME), y.to(DEVICE_NAME))
+
+        assert_ea(result, EA.STANDARD)
+        assert torch.equal(result.cpu(), fn(x, y))
+
+    # -- stick coordinate info of a shuffle (no device) --------------------
+
+    @pytest.mark.parametrize("nsplits", [1, 4])
+    @pytest.mark.parametrize("ea, shape", _SHUFFLE_CASES)
+    def test_coord_info(self, ea, shape, nsplits):
+        """The levels visit every element of the padded per-core stick dim once."""
+        size, eps = self._stick_geometry(ea, shape)
+        # the device pads the stick dim of each core to whole units (stick pairs
+        # for fp32)
+        per_core = -(-size // 64) * 64
+        info = self._coord_info(size, nsplits, eps, ea, per_core * nsplits)
+        funcs = info["folds"]["dim_prop_func"]
+        attrs = info["folds"]["dim_prop_attr"]
+        levels = self._levels_of(info)
+
+        assert levels == self._drop_trivial(self._expected_levels(per_core, eps))
+        assert info["elemArr"] == len(levels)
+        assert len(funcs) == len(attrs) == 3 + len(levels)
+        # the core fold advances by the logical per-core size
+        assert funcs[0] == {"Affine": {"alpha_": size, "beta_": 0}}
+        assert attrs[0] == {"factor_": nsplits, "label_": "core_fold"}
+        assert attrs[1] == {"factor_": 1, "label_": "corelet_fold"}
+        assert attrs[2] == {"factor_": 1, "label_": "row_fold"}
+        # outermost level first
+        assert [a["label_"] for a in attrs[3:]] == [
+            f"elem_arr_{i}" for i in reversed(range(len(levels)))
+        ]
+        assert self._stick_offsets(levels) == list(range(per_core))
+
+    @pytest.mark.parametrize("ea, shape", _SHUFFLE_CASES)
+    def test_coord_info_same_levels(self, ea, shape):
+        size, eps = self._stick_geometry(ea, shape)
+        per_core = -(-size // 64) * 64
+        assert self._coord_info(
+            size, 1, eps, EA.DL16_TO_FP32, per_core
+        ) == self._coord_info(size, 1, eps, EA.FP32_TO_DL16, per_core)
+
+    @pytest.mark.parametrize("ea, shape", _SHUFFLE_CASES)
+    def test_coord_info_standard(self, ea, shape):
+        """The STANDARD side of a shuffle is a plain stick, then the sticks."""
+        size, eps = self._stick_geometry(ea, shape)
+        per_core = -(-size // eps) * eps
+        levels = self._levels_of(self._coord_info(size, 1, eps, EA.STANDARD, per_core))
+        assert levels == self._drop_trivial([(eps, 1), (per_core // eps, eps)])
+        assert self._stick_offsets(levels) == list(range(per_core))
+
+    @pytest.mark.parametrize("ea", STAGGERED_EAS, ids=lambda ea: ea.name.lower())
+    @pytest.mark.parametrize(
+        "eps, size, expected",
+        [
+            (64, 64, [(4, 1), (2, 32), (8, 4)]),
+            (64, 128, [(4, 1), (2, 32), (8, 4), (2, 64)]),
+            (32, 64, [(4, 1), (8, 8), (2, 4)]),
+            (32, 128, [(4, 1), (8, 8), (2, 4), (2, 64)]),
+        ],
+        ids=["fp16-64", "fp16-128", "fp32-64", "fp32-128"],
+    )
+    def test_coord_info_levels(self, ea, eps, size, expected):
+        info = self._coord_info(size, 1, eps, ea, size)
+        assert self._levels_of(info) == expected
+
+    @pytest.mark.parametrize("ea", STAGGERED_EAS, ids=lambda ea: ea.name.lower())
+    @pytest.mark.parametrize("eps", [32, 64])
+    @pytest.mark.parametrize("nsplits", [1, 4, 32])
+    def test_coord_info_non_stick_dim(self, nsplits, eps, ea):
+        got = gen_coord_info_value(
+            size=8,
+            nsplits=nsplits,
+            elems_per_stick=eps,
+            is_stick_dim=False,
+            element_arrangement=ea,
+            is_ea_shuffle=True,
+            stick_device_size=256,
+        )
+        assert got["elemArr"] == 1
+        assert got["folds"]["dim_prop_attr"][0]["factor_"] == nsplits
+
+    @expects_raise
+    @pytest.mark.parametrize("ea", STAGGERED_EAS, ids=lambda ea: ea.name.lower())
+    @pytest.mark.parametrize("size", _ODD_FP32_STICK_SIZES)
+    def test_coord_info_odd_sticks_raises(self, size, ea):
+        with pytest.raises(Unsupported, match="whole FP32 stick pairs"):
+            self._coord_info(size, 1, 32, ea)
+
+    @expects_raise
+    @pytest.mark.parametrize("ea", STAGGERED_EAS, ids=lambda ea: ea.name.lower())
+    @pytest.mark.parametrize("eps", [16, 128])
+    def test_coord_info_bad_eps_raises(self, eps, ea):
+        with pytest.raises(Unsupported, match="not defined for"):
+            self._coord_info(128, 1, eps, ea)
 
 
 # ---------------------------------------------------------------------------
@@ -945,8 +1114,7 @@ class _ShuffleRecorder(CustomPreSchedulingPasses):
 
     @classmethod
     def _record(cls, pass_fn):
-        name = _get_pass_name(pass_fn)
-        key = {"insert_ea_shuffle": "before", "optimize_shuffling": "after"}.get(name)
+        key = {insert_ea_shuffle: "before", optimize_shuffling: "after"}.get(pass_fn)
         if key is None:
             return pass_fn
 
@@ -956,7 +1124,7 @@ class _ShuffleRecorder(CustomPreSchedulingPasses):
             if key == "before":
                 cls.records["layouts"] = cls._shuffle_layouts(graph)
 
-        wrapped.__name__ = name
+        wrapped.__name__ = pass_fn.__name__
         return wrapped
 
 
@@ -973,13 +1141,90 @@ def _compile_recording(fn, *args):
     return result, _ShuffleRecorder.records
 
 
-def _run_recording(fn, *args):
-    """Compile ``fn`` and return ``(result, before, after)`` shuffle source dtypes."""
-    result, records = _compile_recording(fn, *args)
-    return result, records["before"], records["after"]
+# ---------------------------------------------------------------------------
+# Device-free graphs for insert_ea_shuffle / optimize_shuffling
+#
+# The passes run on committed layouts only, so a graph of mock ``ComputedBuffer``
+# ops with real ``FixedTiledLayout``s is enough. Only the IR rewrites (inserting
+# the shuffle copy, re-pointing a reader) are replaced by a fake that edits the
+# ``reads`` list of the mock op; tests assert the resulting ``(name, reads)``.
+# ---------------------------------------------------------------------------
+def _ea_buf(
+    name, ea=EA.STANDARD, reads=(), dtype=torch.float16, shuffle=False, **attrs
+):
+    """A mock pointwise ``ComputedBuffer`` of shape (4, 128) in arrangement ``ea``.
+
+    ``attrs`` override attributes of the mock (``data``, ``loop_info``, ...);
+    ``broadcast=True`` makes the stick a broadcast (``stride_map[-1] == -1``).
+    """
+    broadcast = attrs.pop("broadcast", False)
+    stl = SpyreTensorLayout([4, 128], dtype).with_element_arrangement(ea)
+    if broadcast:
+        stl = SpyreTensorLayout(
+            device_size=list(stl.device_size),
+            stride_map=[*stl.stride_map[:-1], -1],
+            device_dtype=stl.device_dtype,
+            element_arrangement=ea,
+        )
+    op = MagicMock(spec=ComputedBuffer)
+    op.layout = FixedTiledLayout(torch.device("spyre"), dtype, [4, 128], [128, 1], stl)
+    op.data = MagicMock(spec=Pointwise)
+    op.loop_info = None
+    op._read_copy_elision_record = None
+    op.ea_shuffle = shuffle
+    op.reads = list(reads)
+    op.get_name.return_value = name
+    op.get_layout.side_effect = lambda: op.layout
+    op.get_dtype.return_value = dtype
+    op.get_read_names.side_effect = lambda: list(op.reads)
+    op.get_read_writes.side_effect = lambda: SimpleNamespace(
+        reads=[MemoryDep(r, sympy.Integer(0), (), ()) for r in op.reads],
+        writes=[MemoryDep(name, sympy.Integer(0), (), ())],
+    )
+    for key, value in attrs.items():
+        setattr(op, key, value)
+    return op
 
 
-class TestEAShuffleOptimize:
+@pytest.fixture
+def run_pass(monkeypatch):
+    """``run_pass(pass_fn, ops, outputs=())`` runs a pass on a fake graph and
+    returns the ``(name, reads)`` of the operations left in it."""
+
+    def fake_insert_shuffle_op(graph, src_name, target_ea, before_op):
+        shuffle = _ea_buf(f"shuffle_of_{src_name}", target_ea, [src_name], shuffle=True)
+        graph.operations.insert(graph.operations.index(before_op), shuffle)
+        return shuffle
+
+    def fake_redirect(op, name_map, operations, **_):
+        op.reads = [name_map.get(r, r) for r in op.reads]
+        return op
+
+    monkeypatch.setattr(
+        element_arrangement, "_insert_shuffle_op", fake_insert_shuffle_op
+    )
+    monkeypatch.setattr(
+        element_arrangement, "redirect_computed_buffer_reads", fake_redirect
+    )
+    monkeypatch.setattr(
+        element_arrangement, "indirect_info_from_op", lambda op: (set(), {}, None)
+    )
+
+    def run(pass_fn, ops, outputs=()):
+        graph = SimpleNamespace(
+            operations=list(ops), removed_buffers=set(), graph_inputs={}
+        )
+        graph.get_output_names = lambda: list(outputs)
+        graph.get_buffer = lambda n: next(
+            o for o in graph.operations if o.get_name() == n
+        )
+        pass_fn(graph)
+        return [(op.get_name(), op.reads) for op in graph.operations]
+
+    return run
+
+
+class TestOptimizeShuffling:
     """``optimize_shuffling`` removes or cheapens the shuffles
     ``insert_ea_shuffle`` adds.
 
@@ -989,7 +1234,13 @@ class TestEAShuffleOptimize:
 
     SHAPE = (4, 128)
 
-    def test_no_shuffle_when_arrangements_match(self):
+    @staticmethod
+    def _run_recording(fn, *args):
+        """Compile ``fn``; return ``(result, before, after)`` shuffle source dtypes."""
+        result, records = _compile_recording(fn, *args)
+        return result, records["before"], records["after"]
+
+    def test_no_shuffle(self):
         """Operands that share one arrangement need no shuffle at all."""
 
         def fn(x, y):
@@ -998,12 +1249,14 @@ class TestEAShuffleOptimize:
         x = cached_randn(self.SHAPE, dtype=torch.float16)
         y = cached_randn(self.SHAPE, dtype=torch.float16)
 
-        result, before, after = _run_recording(fn, x.to(DEVICE_NAME), y.to(DEVICE_NAME))
+        result, before, after = self._run_recording(
+            fn, x.to(DEVICE_NAME), y.to(DEVICE_NAME)
+        )
 
         assert before == [] and after == []
         assert_val(fn, (x, y), result, rtol=1e-2, atol=1e-2)
 
-    def test_required_shuffle_is_kept(self):
+    def test_shuffle_kept(self):
         """A staggered fp16 operand meeting a STANDARD one still needs its shuffle."""
 
         def fn(x, y):
@@ -1012,7 +1265,9 @@ class TestEAShuffleOptimize:
         x = cached_randn(self.SHAPE, dtype=torch.float32)
         y = cached_randn(self.SHAPE, dtype=torch.float16)
 
-        result, before, after = _run_recording(fn, x.to(DEVICE_NAME), y.to(DEVICE_NAME))
+        result, before, after = self._run_recording(
+            fn, x.to(DEVICE_NAME), y.to(DEVICE_NAME)
+        )
 
         # The shuffle reads the fp32 -> fp16 cast; a downcast has no narrower
         # input to move the shuffle onto, so it is neither removed nor rewritten.
@@ -1021,7 +1276,7 @@ class TestEAShuffleOptimize:
         assert_ea(result, EA.STANDARD)
         assert_val(fn, (x, y), result, rtol=1e-2, atol=1e-2)
 
-    def test_shuffle_sinks_through_upcast(self):
+    def test_sink_through_upcast(self):
         """``fp16 -> fp32`` then a shuffle becomes a shuffle of the fp16 input."""
 
         def fn(x, y):
@@ -1030,7 +1285,9 @@ class TestEAShuffleOptimize:
         x = cached_randn(self.SHAPE, dtype=torch.float16)
         y = cached_randn(self.SHAPE, dtype=torch.float32)
 
-        result, before, after = _run_recording(fn, x.to(DEVICE_NAME), y.to(DEVICE_NAME))
+        result, before, after = self._run_recording(
+            fn, x.to(DEVICE_NAME), y.to(DEVICE_NAME)
+        )
 
         # Before: the staggered fp32 cast output is shuffled (4 B/element).
         # After: the fp16 input is shuffled and the cast itself restores STANDARD.
@@ -1039,7 +1296,7 @@ class TestEAShuffleOptimize:
         assert_ea(result, EA.STANDARD)
         assert_val(fn, (x, y), result, rtol=1e-2, atol=1e-2)
 
-    def test_duplicate_shuffles_are_merged(self):
+    def test_merge_duplicates(self):
         """Two consumers of one staggered value share a single shuffle."""
 
         def fn(x, y):
@@ -1049,7 +1306,7 @@ class TestEAShuffleOptimize:
         x = cached_randn(self.SHAPE, dtype=torch.float32)
         y = cached_randn(self.SHAPE, dtype=torch.float16)
 
-        (r1, r2), before, after = _run_recording(
+        (r1, r2), before, after = self._run_recording(
             fn, x.to(DEVICE_NAME), y.to(DEVICE_NAME)
         )
 
@@ -1058,30 +1315,160 @@ class TestEAShuffleOptimize:
             assert_ea(r, EA.STANDARD)
             torch.testing.assert_close(r.cpu(), ref, rtol=1e-2, atol=1e-2)
 
+    @staticmethod
+    def _shuffle(name, src, ea=EA.STANDARD, **kwargs):
+        return _ea_buf(name, ea, [src], shuffle=True, **kwargs)
+
+    def test_dead(self, run_pass):
+        ops = [_ea_buf("a", EA.DL16_TO_FP32), self._shuffle("s", "a")]
+        assert run_pass(optimize_shuffling, ops) == [("a", [])]
+
+    def test_dead_output_kept(self, run_pass):
+        ops = [_ea_buf("a", EA.DL16_TO_FP32), self._shuffle("s", "a")]
+        assert run_pass(optimize_shuffling, ops, outputs=["s"]) == [
+            ("a", []),
+            ("s", ["a"]),
+        ]
+
+    def test_noop(self, run_pass):
+        """The source already has the target layout, so readers read it."""
+        ops = [
+            _ea_buf("a"),
+            self._shuffle("s", "a"),
+            _ea_buf("out", EA.STANDARD, ["s"]),
+        ]
+        assert run_pass(optimize_shuffling, ops, outputs=["out"]) == [
+            ("a", []),
+            ("out", ["a"]),
+        ]
+
+    def test_required_kept(self, run_pass):
+        ops = [
+            _ea_buf("a", EA.DL16_TO_FP32),
+            self._shuffle("s", "a"),
+            _ea_buf("out", EA.STANDARD, ["s"]),
+        ]
+        assert run_pass(optimize_shuffling, ops, outputs=["out"]) == [
+            ("a", []),
+            ("s", ["a"]),
+            ("out", ["s"]),
+        ]
+
+    def test_chain_cancels(self, run_pass):
+        """``STANDARD -> staggered -> STANDARD`` leaves no shuffle."""
+        ops = [
+            _ea_buf("a"),
+            self._shuffle("s1", "a", EA.DL16_TO_FP32),
+            self._shuffle("s2", "s1"),
+            _ea_buf("out", EA.STANDARD, ["s2"]),
+        ]
+        assert run_pass(optimize_shuffling, ops, outputs=["out"]) == [
+            ("a", []),
+            ("out", ["a"]),
+        ]
+
+    def test_chain_collapses(self, run_pass):
+        """``A -> B -> C`` through two shuffles becomes ``A -> C``."""
+        ops = [
+            _ea_buf("a", EA.FP32_TO_DL16),
+            self._shuffle("s1", "a", EA.DL16_TO_FP32),
+            self._shuffle("s2", "s1"),
+            _ea_buf("out", EA.STANDARD, ["s2"]),
+        ]
+        result = run_pass(optimize_shuffling, ops, outputs=["out"])
+        assert ("s2", ["a"]) in result and "s1" not in dict(result)
+
+    def test_dup_merged(self, run_pass):
+        ops = [
+            _ea_buf("a", EA.DL16_TO_FP32),
+            self._shuffle("s1", "a"),
+            self._shuffle("s2", "a"),
+            _ea_buf("out1", EA.STANDARD, ["s1"]),
+            _ea_buf("out2", EA.STANDARD, ["s2"]),
+        ]
+        result = dict(run_pass(optimize_shuffling, ops, outputs=["out1", "out2"]))
+        assert result["out1"] == result["out2"] == ["s1"]
+        assert "s2" not in result
+
+    def test_upcast_sunk(self, run_pass):
+        """``x(fp16) -upcast-> s -shuffle-> t`` shuffles the narrow ``x`` instead."""
+        fp32 = torch.float32
+        ops = [
+            _ea_buf("x"),
+            _ea_buf("s", EA.DL16_TO_FP32, ["x"], dtype=fp32),
+            self._shuffle("t", "s", dtype=fp32),
+            _ea_buf("out", EA.STANDARD, ["t"], dtype=fp32),
+        ]
+        result = run_pass(optimize_shuffling, ops, outputs=["out"])
+        names = dict(result)
+        assert "t" not in names and "shuffle_of_x" in names
+
+    @pytest.mark.parametrize(
+        "attrs",
+        [
+            {"layout": MagicMock(spec=MutationLayoutSHOULDREMOVE)},
+            {"data": MagicMock(spec=Scatter)},
+            {"loop_info": object()},
+            {"_read_copy_elision_record": object()},
+        ],
+        ids=["mutation", "scatter", "coarse_tiled", "copy_elision"],
+    )
+    def test_unredirectable_reader(self, run_pass, attrs):
+        """A no-op shuffle stays if one of its readers cannot be re-pointed."""
+        ops = [
+            _ea_buf("a"),
+            self._shuffle("s", "a"),
+            _ea_buf("ok", EA.STANDARD, ["s"]),
+            _ea_buf("bad", EA.STANDARD, ["s"], **attrs),
+        ]
+        result = dict(run_pass(optimize_shuffling, ops, outputs=["ok", "bad"]))
+        assert result["s"] == ["a"] and result["ok"] == ["s"]
+
+    def test_reader_reads_source(self, run_pass):
+        """Renaming would merge two reads of one op, so the shuffle stays."""
+        ops = [
+            _ea_buf("a"),
+            self._shuffle("s", "a"),
+            _ea_buf("out", EA.STANDARD, ["s", "a"]),
+        ]
+        result = dict(run_pass(optimize_shuffling, ops, outputs=["out"]))
+        assert result["s"] == ["a"] and result["out"] == ["s", "a"]
+
+    def test_non_computed_reader(self, run_pass):
+        extern = MagicMock(spec=Operation)
+        extern.reads = ["s"]
+        extern.get_name = lambda: "ext"
+        extern.get_read_writes = lambda: SimpleNamespace(
+            reads=[MemoryDep("s", sympy.Integer(0), (), ())], writes=[]
+        )
+        ops = [_ea_buf("a"), self._shuffle("s", "a"), extern]
+        result = dict(run_pass(optimize_shuffling, ops, outputs=["ext"]))
+        assert result["s"] == ["a"] and result["ext"] == ["s"]
+
 
 # ---------------------------------------------------------------------------
 # insert_ea_shuffle: exactness on device and the geometry of the inserted copy
 # ---------------------------------------------------------------------------
-def _staggered_add(a, b):
-    """``a`` (fp16) upcast to a staggered fp32 meets the STANDARD fp32 ``b``."""
-    return a.float() + b
-
-
-def _staggered_add_inputs(shape):
-    return _small_int_fp16(shape, 7), _small_int_fp16(shape, 5, base=3).float()
-
-
-def _assert_exact_on_device(fn, *cpu_args):
-    """Compile ``fn`` on the device and compare with CPU bit for bit."""
-    torch.compiler.reset()
-    with inductor_config.patch(force_disable_caches=True):
-        result = torch.compile(fn)(*(t.to(DEVICE_NAME) for t in cpu_args))
-    torch.compiler.reset()
-    assert torch.equal(result.cpu(), fn(*cpu_args))
-
-
-class TestEAShuffleInsert:
+class TestInsertEAShuffle:
     """Mixed staggered/STANDARD pointwise ops compile and match CPU exactly."""
+
+    @staticmethod
+    def _staggered_add(a, b):
+        """``a`` (fp16) upcast to a staggered fp32 meets the STANDARD fp32 ``b``."""
+        return a.float() + b
+
+    @staticmethod
+    def _staggered_add_inputs(shape):
+        return _small_int_fp16(shape, 7), _small_int_fp16(shape, 5, base=3).float()
+
+    @staticmethod
+    def _assert_exact_on_device(fn, *cpu_args):
+        """Compile ``fn`` on the device and compare with CPU bit for bit."""
+        torch.compiler.reset()
+        with inductor_config.patch(force_disable_caches=True):
+            result = torch.compile(fn)(*(x.to(DEVICE_NAME) for x in cpu_args))
+        torch.compiler.reset()
+        assert torch.equal(result.cpu(), fn(*cpu_args))
 
     PROGRAMS = {
         "fp32_to_fp16_plus_fp16": (
@@ -1094,7 +1481,11 @@ class TestEAShuffleInsert:
             torch.float16,
             lambda a, b: b * a.to(torch.float16),
         ),
-        "fp16_to_fp32_plus_fp32": (torch.float16, torch.float32, _staggered_add),
+        "fp16_to_fp32_plus_fp32": (
+            torch.float16,
+            torch.float32,
+            lambda a, b: a.float() + b,
+        ),
         "fp16_to_fp32_clone_plus_fp32": (
             torch.float16,
             torch.float32,
@@ -1103,19 +1494,37 @@ class TestEAShuffleInsert:
     }
     SHAPES = [(2, 64), (4, 128), (64, 256)]
 
-    @pytest.mark.parametrize("shape", SHAPES, ids=[shapes2key((s,)) for s in SHAPES])
-    @pytest.mark.parametrize("program", list(PROGRAMS))
-    def test_mixed_ea_pointwise_is_exact(self, program, shape):
+    @pytest.mark.parametrize(
+        "program, shape",
+        [
+            pytest.param(
+                p,
+                s,
+                id=f"{p}-{shapes2key((s,))}",
+                marks=pytest.mark.xfail(
+                    p.startswith("fp16_to_fp32") and s == (64, 256),
+                    strict=True,
+                    raises=InductorError,
+                    reason=(
+                        "the backend compiler: Cannot find a valid minimum value"
+                        f"{_BACKEND_SHUFFLE_ISSUE}"
+                    ),
+                ),
+            )
+            for p, s in itertools.product(PROGRAMS, SHAPES)
+        ],
+    )
+    def test_mixed_ea_pointwise(self, program, shape):
         a_dtype, b_dtype, fn = self.PROGRAMS[program]
         a = _small_int_fp16(shape, 7).to(a_dtype)
         b = _small_int_fp16(shape, 5, base=3).to(b_dtype)
-        _assert_exact_on_device(fn, a, b)
+        self._assert_exact_on_device(fn, a, b)
 
-    def test_shuffle_keeps_input_geometry(self):
+    def test_shuffle_geometry(self):
         """The copy has the committed input layout, only the arrangement changes."""
-        a, b = _staggered_add_inputs((4, 128))
+        a, b = self._staggered_add_inputs((4, 128))
         _, records = _compile_recording(
-            _staggered_add, a.to(DEVICE_NAME), b.to(DEVICE_NAME)
+            self._staggered_add, a.to(DEVICE_NAME), b.to(DEVICE_NAME)
         )
         assert records["layouts"], "no shuffle was inserted"
         for src, shuffle in records["layouts"]:
@@ -1150,407 +1559,149 @@ class TestEAShuffleInsert:
         ],
         ids=lambda s: shapes2key((s,)),
     )
-    def test_wide_rows_with_lx_planning(self, shape):
-        _assert_exact_on_device(_staggered_add, *_staggered_add_inputs(shape))
+    def test_wide_rows_lx(self, shape):
+        self._assert_exact_on_device(
+            self._staggered_add, *self._staggered_add_inputs(shape)
+        )
 
     @pytest.mark.parametrize(
         "shape", WIDE_SHAPES, ids=[shapes2key((s,)) for s in WIDE_SHAPES]
     )
-    def test_wide_rows_without_lx_planning(self, shape):
+    def test_wide_rows_no_lx(self, shape):
         with spyre_config.patch(lx_planning=False):
-            _assert_exact_on_device(_staggered_add, *_staggered_add_inputs(shape))
+            self._assert_exact_on_device(
+                self._staggered_add, *self._staggered_add_inputs(shape)
+            )
+
+    @pytest.mark.parametrize(
+        "in_ea, out_ea, kwargs, shuffled",
+        [
+            (EA.DL16_TO_FP32, EA.STANDARD, {}, True),
+            (EA.FP32_TO_DL16, EA.STANDARD, {}, True),
+            # A broadcast stick reads one element of the stick: order is moot.
+            (EA.DL16_TO_FP32, EA.STANDARD, {"broadcast": True}, False),
+            (EA.STANDARD, EA.STANDARD, {}, False),
+            # The op itself produces a staggered result: nothing to restore.
+            (EA.DL16_TO_FP32, EA.DL16_TO_FP32, {}, False),
+            (EA.DL16_TO_FP32, EA.FP32_TO_DL16, {}, False),
+        ],
+        ids=[
+            "dl16_to_fp32",
+            "fp32_to_dl16",
+            "broadcast_stick",
+            "standard_input",
+            "staggered_output_same",
+            "staggered_output_other",
+        ],
+    )
+    def test_operand(self, run_pass, in_ea, out_ea, kwargs, shuffled):
+        ops = [
+            _ea_buf("a", in_ea, **kwargs),
+            _ea_buf("b"),
+            _ea_buf("out", out_ea, ["a", "b"]),
+        ]
+        reads = dict(run_pass(insert_ea_shuffle, ops))
+        assert reads["out"] == (["shuffle_of_a", "b"] if shuffled else ["a", "b"])
+
+    def test_single_operand(self, run_pass):
+        ops = [_ea_buf("a", EA.DL16_TO_FP32), _ea_buf("out", EA.STANDARD, ["a"])]
+        assert dict(run_pass(insert_ea_shuffle, ops))["out"] == ["a"]
+
+    def test_both_staggered(self, run_pass):
+        ops = [
+            _ea_buf("a", EA.DL16_TO_FP32),
+            _ea_buf("b", EA.DL16_TO_FP32),
+            _ea_buf("out", EA.STANDARD, ["a", "b"]),
+        ]
+        reads = dict(run_pass(insert_ea_shuffle, ops))
+        assert reads["out"] == ["shuffle_of_a", "shuffle_of_b"]
+
+    @expects_raise
+    def test_coarse_tiled_raises(self, run_pass):
+        ops = [
+            _ea_buf("a", EA.DL16_TO_FP32),
+            _ea_buf("b"),
+            _ea_buf("out", EA.STANDARD, ["a", "b"], loop_info=object()),
+        ]
+        with pytest.raises(Unsupported, match="coarse-tiled loop"):
+            run_pass(insert_ea_shuffle, ops)
 
 
 # ---------------------------------------------------------------------------
 # validate_ops is a read-only check
 # ---------------------------------------------------------------------------
-def _stl(ea, dtype=torch.float16, broadcast=False):
-    elems = 64 if dtype == torch.float16 else 32
-    return SpyreTensorLayout(
-        device_size=[2, elems],
-        stride_map=[elems, -1 if broadcast else 1],
-        device_dtype=get_device_dtype(dtype),
-        element_arrangement=ea,
-    )
-
-
-def _fake_op(buffer_names, pointwise=True):
-    """A pointwise op that reads ``buffer_names``."""
-    op = MagicMock()
-    op.data = MagicMock(spec=Pointwise) if pointwise else MagicMock()
-    op.data.origins = []
-    deps = []
-    for name in buffer_names:
-        dep = MagicMock(spec=MemoryDep)
-        dep.name = name
-        deps.append(dep)
-    op.get_read_writes.return_value = SimpleNamespace(reads=deps, writes=[])
-    return op
-
-
-def _fake_graph(ops, buffer_eas):
-    buffers = {
-        name: SimpleNamespace(layouts=[_stl(ea) for ea in eas])
-        for name, eas in buffer_eas.items()
-    }
-    return SimpleNamespace(operations=list(ops), get_buffer=buffers.__getitem__)
-
-
-def _validate(ops, buffer_eas):
-    graph = _fake_graph(ops, buffer_eas)
-    before = list(graph.operations)
-    with V.set_graph_handler(graph):
-        validate_ops(graph)
-    assert graph.operations == before, "validate_ops must not edit the graph"
-
-
 class TestValidateOps:
-    def test_mixed_standard_and_staggered_is_accepted(self):
+    @staticmethod
+    def _stl(ea):
+        return SpyreTensorLayout(
+            device_size=[2, 64],
+            stride_map=[64, 1],
+            device_dtype=get_device_dtype(torch.float16),
+            element_arrangement=ea,
+        )
+
+    @staticmethod
+    def _fake_op(buffer_names, pointwise=True):
+        """A pointwise op that reads ``buffer_names``."""
+        op = MagicMock()
+        op.data = MagicMock(spec=Pointwise) if pointwise else MagicMock()
+        op.data.origins = []
+        deps = []
+        for name in buffer_names:
+            dep = MagicMock(spec=MemoryDep)
+            dep.name = name
+            deps.append(dep)
+        op.get_read_writes.return_value = SimpleNamespace(reads=deps, writes=[])
+        return op
+
+    def _validate(self, ops, buffer_eas):
+        buffers = {
+            name: SimpleNamespace(layouts=[self._stl(ea) for ea in eas])
+            for name, eas in buffer_eas.items()
+        }
+        graph = SimpleNamespace(operations=list(ops), get_buffer=buffers.__getitem__)
+        before = list(graph.operations)
+        with V.set_graph_handler(graph):
+            validate_ops(graph)
+        assert graph.operations == before, "validate_ops must not edit the graph"
+
+    def test_mixed_ok(self):
         """Case 3.3 (one staggered EA with STANDARD operands) is no longer an error."""
-        _validate(
-            [_fake_op(["a", "b"])],
+        self._validate(
+            [self._fake_op(["a", "b"])],
             {"a": [EA.STANDARD], "b": [EA.DL16_TO_FP32]},
         )
 
-    def test_same_ea_is_accepted(self):
-        _validate(
-            [_fake_op(["a", "b"])],
+    def test_same_ea_ok(self):
+        self._validate(
+            [self._fake_op(["a", "b"])],
             {"a": [EA.FP32_TO_DL16], "b": [EA.FP32_TO_DL16]},
         )
 
-    def test_single_operand_is_skipped(self):
-        _validate([_fake_op(["a"])], {"a": [EA.DL16_TO_FP32]})
+    def test_single_operand_skipped(self):
+        self._validate([self._fake_op(["a"])], {"a": [EA.DL16_TO_FP32]})
 
-    def test_non_pointwise_is_skipped(self):
-        _validate(
-            [_fake_op(["a", "b"], pointwise=False)],
+    def test_non_pointwise_skipped(self):
+        self._validate(
+            [self._fake_op(["a", "b"], pointwise=False)],
             {"a": [EA.DL16_TO_FP32], "b": [EA.FP32_TO_DL16]},
         )
 
     @expects_raise
-    def test_two_staggered_eas_are_rejected(self):
+    def test_two_staggered_rejected(self):
         with pytest.raises(Unsupported, match="Incompatible ElementArrangement"):
-            _validate(
-                [_fake_op(["a", "b"])],
+            self._validate(
+                [self._fake_op(["a", "b"])],
                 {"a": [EA.DL16_TO_FP32], "b": [EA.FP32_TO_DL16]},
             )
 
     @expects_raise
-    def test_exx2_mixed_with_standard_is_rejected(self):
+    def test_exx2_rejected(self):
         with pytest.raises(Unsupported, match="Incompatible ElementArrangement"):
-            _validate(
-                [_fake_op(["a", "b"])],
+            self._validate(
+                [self._fake_op(["a", "b"])],
                 {"a": [EA.EXX2], "b": [EA.STANDARD]},
             )
-
-
-# ---------------------------------------------------------------------------
-# Helpers of insert_ea_shuffle / optimize_shuffling
-# ---------------------------------------------------------------------------
-class TestNeedsShuffle:
-    @pytest.mark.parametrize(
-        "in_ea, broadcast, out_ea, expected",
-        [
-            (EA.DL16_TO_FP32, False, EA.STANDARD, True),
-            (EA.FP32_TO_DL16, False, EA.STANDARD, True),
-            # A broadcast stick reads one element of the stick: order is moot.
-            (EA.DL16_TO_FP32, True, EA.STANDARD, False),
-            (EA.STANDARD, False, EA.STANDARD, False),
-            # The op itself produces a staggered result: nothing to restore.
-            (EA.DL16_TO_FP32, False, EA.DL16_TO_FP32, False),
-            (EA.DL16_TO_FP32, False, EA.FP32_TO_DL16, False),
-        ],
-    )
-    def test_needs_shuffle(self, in_ea, broadcast, out_ea, expected):
-        layout = SimpleNamespace(device_layout=_stl(in_ea, broadcast=broadcast))
-        assert _needs_shuffle(layout, out_ea) is expected
-
-
-def _reader(**attrs):
-    """A plain pointwise ``ComputedBuffer`` reader that can be redirected."""
-    op = MagicMock(spec=ComputedBuffer)
-    op.layout = MagicMock()
-    op.data = MagicMock(spec=Pointwise)
-    op.loop_info = None
-    op._read_copy_elision_record = None
-    op.get_read_names.return_value = ["old"]
-    for name, value in attrs.items():
-        setattr(op, name, value)
-    return op
-
-
-class TestCanRedirectReaders:
-    def test_plain_readers(self):
-        assert _can_redirect_readers([_reader(), _reader()], "new")
-
-    def test_no_readers(self):
-        assert _can_redirect_readers([], "new")
-
-    @pytest.mark.parametrize(
-        "attrs",
-        [
-            {"layout": MagicMock(spec=MutationLayoutSHOULDREMOVE)},
-            {"data": MagicMock(spec=Scatter)},
-            {"loop_info": object()},
-            {"_read_copy_elision_record": object()},
-            {"get_read_names": MagicMock(return_value=["old", "new"])},
-        ],
-        ids=["mutation", "scatter", "coarse_tiled", "copy_elision", "reads_new"],
-    )
-    def test_reader_that_cannot_be_redirected(self, attrs):
-        assert not _can_redirect_readers([_reader(), _reader(**attrs)], "new")
-
-    def test_not_a_computed_buffer(self):
-        assert not _can_redirect_readers([MagicMock()], "new")
-
-
-# ---------------------------------------------------------------------------
-# Shuffle stick levels and coordinate info (codegen, no device needed)
-# ---------------------------------------------------------------------------
-def _stick_offsets(levels):
-    """Sorted element offsets visited by nested ``(cardinality, step)`` levels."""
-    offsets = [0]
-    for card, step in levels:
-        offsets = [o + i * step for o in offsets for i in range(card)]
-    return sorted(offsets)
-
-
-STAGGERED = [EA.DL16_TO_FP32, EA.FP32_TO_DL16]
-
-# Stick-dim sizes (elements, one core) to cover, per elements-per-stick: the
-# stick dims of every shape above (aligned, partial, small, review widths).
-_STICK_DIM_SIZES = sorted(
-    {1, 2, 3, 4, 16, 32, 44, 63, 64, 68, 69, 96, 100, 128, 160, 192}
-    | set(REVIEW_WIDTHS)
-    | {s[-1] for s in _DL16_TO_FP32_SHAPES + _FP32_TO_DL16_SHAPES if s}
-)
-# (size, elems per stick) pairs that have staggered levels without a device size:
-# an fp32 stick dim needs a whole number of stick pairs.
-_LEVEL_CASES = [
-    (size, eps)
-    for eps in (32, 64)
-    for size in _STICK_DIM_SIZES
-    if eps == 64 or (-(-size // 32)) % 2 == 0
-]
-
-
-def _expected_levels(size, eps):
-    """Reference staggered levels, written out per elements-per-stick."""
-    if eps == 64:
-        return [(4, 1), (2, 32), (8, 4), (-(-size // 64), 64)]
-    sticks = -(-size // 32)
-    return [(4, 1), (8, 8), (2, 4), (sticks // 2, 64)]
-
-
-def _drop_trivial(levels):
-    return [lvl for i, lvl in enumerate(levels) if i == 0 or lvl[0] != 1]
-
-
-class TestShuffleStickLevels:
-    @pytest.mark.parametrize("ea", STAGGERED)
-    @pytest.mark.parametrize("size", _STICK_DIM_SIZES)
-    def test_fp16_levels_permute_the_padded_sticks(self, size, ea):
-        """The levels visit every element of the (padded) sticks exactly once."""
-        sticks = -(-size // 64)
-        levels = _shuffle_stick_levels(size, 64, ea)
-        assert levels == _drop_trivial(_expected_levels(size, 64))
-        assert levels[:3] == [(4, 1), (2, 32), (8, 4)]
-        assert levels[3:] == ([(sticks, 64)] if sticks > 1 else [])
-        assert _stick_offsets(levels) == list(range(64 * sticks))
-
-    @pytest.mark.parametrize("ea", STAGGERED)
-    @pytest.mark.parametrize(
-        "size", [s for s in _STICK_DIM_SIZES if (-(-s // 32)) % 2 == 0]
-    )
-    def test_fp32_levels_permute_the_padded_stick_pairs(self, size, ea):
-        sticks = -(-size // 32)
-        pairs = sticks // 2
-        levels = _shuffle_stick_levels(size, 32, ea)
-        assert levels == _drop_trivial(_expected_levels(size, 32))
-        assert levels[:3] == [(4, 1), (8, 8), (2, 4)]
-        assert levels[3:] == ([(pairs, 64)] if pairs > 1 else [])
-        assert _stick_offsets(levels) == list(range(32 * sticks))
-
-    @pytest.mark.parametrize("size, eps", _LEVEL_CASES)
-    def test_both_staggered_eas_share_levels(self, size, eps):
-        assert _shuffle_stick_levels(size, eps, EA.DL16_TO_FP32) == (
-            _shuffle_stick_levels(size, eps, EA.FP32_TO_DL16)
-        )
-
-    @expects_raise
-    @pytest.mark.parametrize("ea", STAGGERED)
-    @pytest.mark.parametrize(
-        "size", [s for s in _STICK_DIM_SIZES if (-(-s // 32)) % 2 == 1]
-    )
-    def test_fp32_odd_stick_count_without_device_size_raises(self, size, ea):
-        with pytest.raises(Unsupported, match="whole FP32 stick pairs"):
-            _shuffle_stick_levels(size, 32, ea)
-
-    @pytest.mark.parametrize("ea", STAGGERED)
-    @pytest.mark.parametrize(
-        "size", [s for s in _STICK_DIM_SIZES if (-(-s // 32)) % 2 == 1]
-    )
-    def test_fp32_levels_follow_the_device_size(self, size, ea):
-        """The device pads the stick dim to whole pairs; the count follows it."""
-        padded = 64 * _fp32_stick_pairs(size)
-        levels = _shuffle_stick_levels(size, 32, ea, padded)
-        assert levels == _shuffle_stick_levels(padded, 32, ea)
-        assert _stick_offsets(levels) == list(range(padded))
-
-    @pytest.mark.parametrize("ea", STAGGERED)
-    @pytest.mark.parametrize("eps", [32, 64])
-    @pytest.mark.parametrize("size", [64, 128, 192, 256, 384])
-    def test_device_size_smaller_than_size_is_ignored(self, size, eps, ea):
-        assert _shuffle_stick_levels(size, eps, ea, eps) == _shuffle_stick_levels(
-            size, eps, ea
-        )
-
-    @pytest.mark.parametrize("eps", [32, 64])
-    @pytest.mark.parametrize("size", _STICK_DIM_SIZES)
-    def test_standard_levels(self, size, eps):
-        sticks = -(-size // eps)
-        expected = [(eps, 1), (sticks, eps)]
-        assert _shuffle_stick_levels(size, eps, EA.STANDARD) == _drop_trivial(expected)
-
-    @expects_raise
-    @pytest.mark.parametrize("ea", STAGGERED)
-    @pytest.mark.parametrize("eps", [16, 128])
-    def test_unsupported_elements_per_stick_raises(self, eps, ea):
-        with pytest.raises(Unsupported, match="not defined for"):
-            _shuffle_stick_levels(128, eps, ea)
-
-
-def _shuffle_coord_info_cases():
-    """(size, nsplits, eps, ea, device_size) over cores, widths and arrangements."""
-    cases = []
-    for ea in STAGGERED:
-        for eps in (64, 32):
-            for nsplits in (1, 2, 4, 32):
-                for size in _STICK_DIM_SIZES:
-                    # device size over all cores, padded to whole units per core
-                    unit = eps * (2 if eps == 32 else 1)
-                    per_core = -(-size // unit) * unit
-                    cases.append((size, nsplits, eps, ea, per_core * nsplits))
-    return cases
-
-
-_COORD_CASES = _shuffle_coord_info_cases()
-_COORD_IDS = [f"{c[3].name}-eps{c[2]}-n{c[1]}-s{c[0]}" for c in _COORD_CASES]
-
-
-class TestShuffleStickCoordInfo:
-    @pytest.mark.parametrize("case", _COORD_CASES, ids=_COORD_IDS)
-    def test_structure_over_cores_widths_and_arrangements(self, case):
-        size, nsplits, eps, ea, device_size = case
-        info = _gen_shuffle_stick_coord_info(
-            size, nsplits, eps, "nopad", ea, device_size
-        )
-        funcs = info["folds"]["dim_prop_func"]
-        attrs = info["folds"]["dim_prop_attr"]
-        per_core = device_size // nsplits
-        levels = _shuffle_stick_levels(size, eps, ea, per_core)
-
-        assert levels == _drop_trivial(_expected_levels(per_core, eps))
-        assert info["elemArr"] == len(levels)
-        assert info["padding"] == "nopad"
-        assert len(funcs) == len(attrs) == 3 + len(levels)
-        # the core fold advances by the logical per-core size
-        assert funcs[0] == {"Affine": {"alpha_": size, "beta_": 0}}
-        assert attrs[0] == {"factor_": nsplits, "label_": "core_fold"}
-        assert attrs[1] == {"factor_": 1, "label_": "corelet_fold"}
-        assert attrs[2] == {"factor_": 1, "label_": "row_fold"}
-        # outermost level first
-        assert [a["factor_"] for a in attrs[3:]] == [c for c, _ in reversed(levels)]
-        assert [f["Affine"]["alpha_"] for f in funcs[3:]] == [
-            s for _, s in reversed(levels)
-        ]
-        assert [a["label_"] for a in attrs[3:]] == [
-            f"elem_arr_{i}" for i in reversed(range(len(levels)))
-        ]
-        # the levels still cover the whole per-core stick dim once
-        assert _stick_offsets(levels) == list(range(per_core))
-
-    @pytest.mark.parametrize("ea", STAGGERED)
-    @pytest.mark.parametrize("width", [64, 128, 256])
-    def test_fp16_reference_structure(self, width, ea):
-        info = _gen_shuffle_stick_coord_info(width, 1, 64, "nopad", ea)
-        funcs = info["folds"]["dim_prop_func"]
-        attrs = info["folds"]["dim_prop_attr"]
-        sticks = width // 64
-        outer = [] if sticks == 1 else [sticks]
-        assert [a["factor_"] for a in attrs[3:]] == [*outer, 8, 2, 4]
-        assert [f["Affine"]["alpha_"] for f in funcs[3:]] == [
-            *([64] if outer else []),
-            4,
-            32,
-            1,
-        ]
-
-    @pytest.mark.parametrize("ea", STAGGERED)
-    @pytest.mark.parametrize("width", [64, 128, 256])
-    def test_fp32_reference_structure(self, width, ea):
-        info = _gen_shuffle_stick_coord_info(width, 1, 32, "nopad", ea)
-        funcs = info["folds"]["dim_prop_func"]
-        attrs = info["folds"]["dim_prop_attr"]
-        pairs = width // 64
-        outer = [] if pairs == 1 else [pairs]
-        assert [a["factor_"] for a in attrs[3:]] == [*outer, 2, 8, 4]
-        assert [f["Affine"]["alpha_"] for f in funcs[3:]] == [
-            *([64] if outer else []),
-            4,
-            8,
-            1,
-        ]
-
-    @pytest.mark.parametrize("ea", STAGGERED)
-    @pytest.mark.parametrize("size", [32, 69, 96, 160, 192, 320, 448, 576, 704])
-    def test_odd_logical_size_padded_to_whole_pairs_on_the_device(self, size, ea):
-        """An odd fp32 stick count sits in whole pairs on the device."""
-        device_size = 64 * _fp32_stick_pairs(size)
-        info = _gen_shuffle_stick_coord_info(
-            size, 1, 32, "nopad", ea, device_size=device_size
-        )
-        ref = _gen_shuffle_stick_coord_info(device_size, 1, 32, "nopad", ea)
-        funcs, ref_funcs = info["folds"]["dim_prop_func"], ref["folds"]["dim_prop_func"]
-        assert info["elemArr"] == ref["elemArr"]
-        assert info["folds"]["dim_prop_attr"] == ref["folds"]["dim_prop_attr"]
-        assert funcs[1:] == ref_funcs[1:]
-        # the core fold still advances by the logical per-core size
-        assert funcs[0] == {"Affine": {"alpha_": size, "beta_": 0}}
-
-    @pytest.mark.parametrize("case", _COORD_CASES, ids=_COORD_IDS)
-    def test_gen_coord_info_value_routes_the_stick_dim_of_a_shuffle(self, case):
-        size, nsplits, eps, ea, device_size = case
-        got = gen_coord_info_value(
-            size=size,
-            nsplits=nsplits,
-            elems_per_stick=eps,
-            is_stick_dim=True,
-            element_arrangement=ea,
-            is_ea_shuffle=True,
-            stick_device_size=device_size,
-        )
-        assert got == _gen_shuffle_stick_coord_info(
-            size, nsplits, eps, "nopad", ea, device_size
-        )
-
-    @pytest.mark.parametrize("ea", STAGGERED)
-    @pytest.mark.parametrize("eps", [32, 64])
-    @pytest.mark.parametrize("nsplits", [1, 4, 32])
-    def test_gen_coord_info_value_leaves_other_dims_of_a_shuffle(
-        self, nsplits, eps, ea
-    ):
-        got = gen_coord_info_value(
-            size=8,
-            nsplits=nsplits,
-            elems_per_stick=eps,
-            is_stick_dim=False,
-            element_arrangement=ea,
-            is_ea_shuffle=True,
-            stick_device_size=256,
-        )
-        assert got["elemArr"] == 1
-        assert got["folds"]["dim_prop_attr"][0]["factor_"] == nsplits
 
 
 # Made with Bob
