@@ -1112,6 +1112,8 @@ at::Tensor spyre_empty_sharded(c10::IntArrayRef size, c10::ScalarType dtype,
 
   c10::DataPtr data_ptr = SpyreAllocator::allocateShardedStorage(
       shard_dim, static_cast<uint32_t>(num_shards), shard_device_bytes);
+  static_cast<SharedOwnerCtx*>(data_ptr.get_context())->sharding->global_shape =
+      size.vec();
   const size_t total_bytes =
       static_cast<SharedOwnerCtx*>(data_ptr.get_context())
           ->composite_addr.total_size();
@@ -1269,6 +1271,10 @@ void copy_sharded(const at::Tensor& self, const at::Tensor& dst) {
               "change (got ",
               sharded.dtype(), " -> ", host.dtype(), ")");
   const auto& info = *sharding_of(sharded)->sharding;
+  TORCH_CHECK(sharded.sizes().equals(c10::IntArrayRef(info.global_shape)),
+              "sharded Spyre tensors only support whole-tensor copies: tensor "
+              "metadata no longer matches the sharded allocation (",
+              sharded.sizes(), " vs ", info.global_shape, ")");
   const int64_t extent = sharded.size(info.shard_dim) / info.num_shards;
 
   SpyreStream stream = getCurrentStream(sharded.device());

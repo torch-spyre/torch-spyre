@@ -39,6 +39,9 @@ struct ShardedStorageInfo {
   int64_t shard_dim;
   uint32_t num_shards;
   uint64_t shard_device_bytes;
+  // Shape the storage was allocated for; the copy path checks tensor
+  // metadata against it. Filled in by spyre_empty_sharded.
+  std::vector<int64_t> global_shape;
 };
 
 struct SharedOwnerCtx {

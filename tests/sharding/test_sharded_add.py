@@ -463,6 +463,21 @@ def test_views_of_sharded_inputs_fail(view):
 
 
 @_requires_emulation
+@expects_raise
+def test_as_strided_in_place_of_sharded_fails():
+    # as_strided_ changes metadata in place, bypassing the view
+    # constructors; an unguarded call leaves the shard table describing the
+    # old shape and the next copy reads the wrong elements.
+    n = _num_shards()
+    x = _sharded(torch.arange(4 * n, dtype=torch.float16), 0, n)
+
+    with pytest.raises(
+        RuntimeError, match="views of sharded Spyre tensors are not supported"
+    ):
+        x.as_strided_((2 * n,), (1,), 0)
+
+
+@_requires_emulation
 def test_compiled_add_over_detached_views(launched):
     """Detached views of sharded inputs reach the compiled path unchanged.
 
@@ -525,6 +540,8 @@ def test_identity_views_of_sharded_keep_round_trip():
     assert torch.equal(x.to("cpu"), expected)
     assert torch.equal(d.to("cpu"), expected)
     assert torch.equal(a.to("cpu"), expected)
+    x.as_strided_(x.size(), x.stride(), 0)
+    assert torch.equal(x.to("cpu"), expected)
 
 
 @_requires_emulation
