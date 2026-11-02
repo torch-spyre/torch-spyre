@@ -247,6 +247,38 @@ def _decompose_constant_offset(
     return True
 
 
+def _has_misaligned_step(index, vars, var_ranges, size, stride) -> bool:
+    """Whether a linear ``index`` has a variable whose step is not a multiple of
+    the largest stride not exceeding it.
+
+    ``96 * a + b`` over strides ``[64, 128, 1]`` is such an index: ``96 * a``
+    lands on the 64 stride with a remainder of 32 for odd ``a``.
+    """
+    if index.atoms(sympy.Mod, sympy.floor, FloorDiv, ModularIndexing):
+        return False
+    for var in vars:
+        if var not in var_ranges:
+            continue
+        term = index.xreplace(dict.fromkeys(vars - {var}, 0))
+        step = sympy.sympify(term.xreplace({var: 1}))
+        if term != var * step or not (step.is_Integer and step > 0):
+            continue
+        range_val = _concretize_for_cmp(var_ranges[var])
+        if range_val <= 1:
+            continue
+        primary = max(
+            (
+                _concretize_for_cmp(stride[d])
+                for d in range(len(size))
+                if size[d] > 1 and 0 < _concretize_for_cmp(stride[d]) <= int(step)
+            ),
+            default=0,
+        )
+        if primary and int(step) % primary:
+            return True
+    return False
+
+
 def compute_coordinates(
     size: Sequence[sympy.Expr],
     stride: Sequence[sympy.Expr],
@@ -284,14 +316,7 @@ def compute_coordinates(
     if repeat_info_out is not None:
         repeat_info_out.update(repeat_info)
 
-    # find stride immediately strictly larger that dim stride
     n = len(size)
-    next_stride = [sympy.oo] * n
-    for i in range(n):
-        for j in range(n):
-            # n^2 is ok since n is small
-            if next_stride[i] > stride[j] and stride[j] > stride[i] and size[j] > 1:
-                next_stride[i] = stride[j]
     # compute coordinate expressions
     coordinates = [sympy.S.Zero] * n
 
@@ -323,33 +348,44 @@ def compute_coordinates(
                 f"be expressed as a device coordinate"
             )
 
+        def _wrap_and_project(target_stride):
+            # Wrap by every larger stride the variable's range crosses, from the
+            # largest down, then project onto ``target_stride``.  Wrapping by the
+            # next larger stride alone is exact only when the strides divide each
+            # other; for [8, 65] (strides 64, 65, 1) the stick coordinate must
+            # also be wrapped by the row stride 65: Mod(Mod(c0, 65), 64).
+            enclosing = sorted(
+                {
+                    _concretize_for_cmp(stride[j])
+                    for j in range(n)
+                    if size[j] > 1
+                    and _concretize_for_cmp(stride[j]) > target_stride
+                    and _concretize_for_cmp(stride[j]) < concrete_limit
+                },
+                reverse=True,
+            )
+            term = var * step
+            for s in enclosing:
+                term = term % s
+            return term // target_stride
+
         # find primary dim with largest stride less than or equal to step
         primary_stride = 0
         primary_dim = -1
         for dim in range(n):
             if size[dim] == 1:
                 continue  # ignore dim with size 1
-            st = stride[dim]
+            st = _concretize_for_cmp(stride[dim])
             if st <= concrete_step and st > primary_stride:
                 # found candidate primary dim
                 primary_stride = st
                 primary_dim = dim
             elif st > concrete_step and st < concrete_limit:
                 # var range intersects dim, add term
-                if next_stride[dim] < concrete_limit:
-                    # var range overflows dim
-                    coordinates[dim] += var * step % next_stride[dim] // st
-                else:
-                    coordinates[dim] += var * step // st
+                coordinates[dim] += _wrap_and_project(st)
         # add term for primary dim
         if primary_stride > 0:
-            if next_stride[primary_dim] < concrete_limit:
-                coordinates[primary_dim] += (
-                    # var range overflows primary dim
-                    var * step % next_stride[primary_dim] // primary_stride
-                )
-            else:
-                coordinates[primary_dim] += var * step // primary_stride
+            coordinates[primary_dim] += _wrap_and_project(primary_stride)
 
     vars = index.free_symbols
     offset = index.xreplace(dict.fromkeys(vars, 0))
@@ -362,6 +398,34 @@ def compute_coordinates(
         handled = _decompose_constant_offset(offset, size, stride, coordinates)
         if not handled:
             add_term(var=offset, step=sympy.S.One, limit=sympy.oo)
+
+    if not repeat_info and _has_misaligned_step(index, vars, var_ranges, size, stride):
+        # A step that is not a whole number of the stride it lands on leaves a
+        # remainder that carries into the smaller dims, and the carry depends on
+        # the other variables too, so the coordinates cannot be built one
+        # variable at a time.  Decompose the whole index position instead.
+        limit = sum(
+            _concretize_for_cmp(index.xreplace({v: 1, **dict.fromkeys(vars - {v}, 0)}))
+            * (_concretize_for_cmp(var_ranges[v]) - 1)
+            for v in vars
+            if v in var_ranges
+        )
+        for dim in range(n):
+            st = _concretize_for_cmp(stride[dim])
+            if size[dim] == 1 or st <= 0 or st > limit:
+                continue
+            term = index
+            for enclosing in sorted(
+                {
+                    _concretize_for_cmp(stride[j])
+                    for j in range(n)
+                    if size[j] > 1 and st < _concretize_for_cmp(stride[j]) <= limit
+                },
+                reverse=True,
+            ):
+                term = term % enclosing
+            coordinates[dim] += term // st
+        return coordinates
 
     for var in vars:
         # Skip symbols that are not loop variables (e.g. size symbols

@@ -221,6 +221,25 @@ class TestCoordinates(TestCase):
             expected = [0, 3 * p0] if count == 2 else [(3 * p0) // 6, (3 * p0) % 6]
             self.assertEqual(coords, expected)
 
+    def test_flat_read_across_unaligned_rows_wraps_stick_by_row_stride(self):
+        # Dense fp16 [8, 65]: device [2, 8, 64], stride_map [64, 65, 1]. Element
+        # c0 = 65 is row 1, column 0, so it sits at position 0 of its stick; the
+        # stick coordinate must wrap by the row stride 65 first (issue #5872).
+        c0 = sympy.Symbol("c0", integer=True, nonnegative=True)
+        coords = compute_coordinates([2, 8, 64], [64, 65, 1], {c0: 520}, c0)
+        self.assertEqual(coords[-1], sympy.Mod(sympy.Mod(c0, 65), 64))
+        for flat in range(520):
+            row, col = divmod(flat, 65)
+            actual = [int(c.subs({c0: flat})) for c in coords]
+            self.assertEqual(actual, [col // 64, row, col % 64], f"c0={flat}")
+
+    def test_wrap_by_every_larger_stride_folds_when_strides_divide(self):
+        # Where the larger strides divide each other, the chain folds back to the
+        # single wrap, so the coordinates of aligned layouts do not change.
+        c0 = sympy.Symbol("c0", integer=True, nonnegative=True)
+        coords = compute_coordinates([2, 8, 64], [64, 128, 1], {c0: 1024}, c0)
+        self.assertEqual(coords[-1], sympy.Mod(c0, 64))
+
     def test_compute_coordinates_mixed_radix_flattened_dim(self):
         """A flattened H*D loop maps back to separate H and D coordinates."""
         lq, hd = sympy.symbols("lq hd", integer=True, nonnegative=True)
