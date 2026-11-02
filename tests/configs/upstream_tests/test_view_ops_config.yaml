@@ -14,9 +14,17 @@ test_suite_config:
             - TestViewOps::test_view_dtype_upsize_errors
             - TestViewOps::test_view_tensor_split
             - TestOldViewOps::test_broadcast_to
+          mode: mandatory_success
+
+        # Sub-stick DMA: the runtime moves whole 128-byte flits, and tensor_split((10,), (3,))
+        # yields 3- and 7-element chunks, so the copy back reads neighbours and all 7
+        # elements of chunk[1] mismatch. Same cause as the unbind cases in #5720 and the
+        # slice copies in #5600; sub-stick DMA support is flex#2083. Non-strict:
+        # a runtime without the flit-granularity change still passes these.
+        - names:
             - TestOldViewOps::test_tensor_split_indices
             - TestOldViewOps::test_tensor_split_sections
-          mode: mandatory_success
+          mode: xfail
 
         ############################################################
         ## Tests that fail on spyre with @onlyNativeDeviceTypes ###
