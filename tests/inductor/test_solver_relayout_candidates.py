@@ -306,8 +306,12 @@ def test_coarse_tiled_endpoints_are_declined_at_the_edge_gate():
     """Cross-group endpoints must stop before any layout inspection.
 
     Real sibling and nested group IDs pin exact scope equality. Recording
-    layout properties distinguish this gate from later layout rejection;
-    untiled and equal-group controls must reach that later check.
+    layout properties distinguish this gate from later layout rejection; the
+    untiled control reaches that later check unconditionally, and an
+    equal-group control passes the scope-equality part of the gate but is
+    still correctly rejected by same_tile_group's other conditions (matmul
+    consumer, resolved producer hint) before reaching the layout check,
+    since this probe satisfies neither.
     """
     from torch._inductor.ir import ComputedBuffer
 
@@ -326,6 +330,12 @@ def test_coarse_tiled_endpoints_are_declined_at_the_edge_gate():
     def probe(loop_info):
         class _Probe(ComputedBuffer):
             layout_accessed = False
+            # Not a real op body: lx_same_tile_group_relayout defaulting to on
+            # means an equal-group pair now reaches _is_matmul_op(consumer)
+            # before the layout check this test is isolating, and that only
+            # needs `.data` to not be a Reduction -- None satisfies that
+            # without claiming any real matmul/pointwise semantics.
+            data = None
 
             @property
             def layout(self):
@@ -355,15 +365,30 @@ def test_coarse_tiled_endpoints_are_declined_at_the_edge_gate():
             "a cross-group endpoint reached checks past the loop_info gate"
         )
 
-    # Distinct metadata objects with equal IDs must also pass the scope gate.
-    for prod_info, cons_info in [
-        (None, None),
-        (tiled((0,)), tiled((0,))),
-        (tiled((0, 1)), tiled((0, 1))),
-    ]:
-        prod, cons = probe(prod_info), probe(cons_info)
+    # Distinct metadata objects with equal IDs must also pass the scope gate --
+    # the untiled control reaches the later layout check unconditionally (its
+    # loop_info is None on both sides, so the scope-equality branch never
+    # applies). An equal-group pair with real CoarseTileInfo also passes the
+    # scope gate itself, but since the #5632 follow-up (narrow-same-tile-group-
+    # relayout) same_tile_group also requires a matmul consumer fed by a
+    # producer whose own work_div hint resolved -- neither of which this
+    # probe claims -- it is correctly rejected by that later part of the same
+    # condition, before the layout check. Distinguishing "rejected by scope"
+    # from "rejected by the matmul/hint requirement" needs a real matmul op
+    # and a resolved hint, which is what test_same_group_coarse_tiled_edge_is_offered_and_priced_per_trip
+    # (test_solver_relayout_e2e.py) exercises on a real compiled graph instead.
+    prod, cons = probe(None), probe(None)
+    assert solver_relayout_edge_context(None, prod, cons, "buf0", {}) is None
+    assert type(prod).layout_accessed
+
+    for group in [(0,), (0, 1)]:
+        prod, cons = probe(tiled(group)), probe(tiled(group))
         assert solver_relayout_edge_context(None, prod, cons, "buf0", {}) is None
-        assert type(prod).layout_accessed
+        assert not type(prod).layout_accessed, (
+            "an equal-group pair with no matmul consumer or resolved hint "
+            "should be rejected by same_tile_group's own conditions, before "
+            "ever reaching the layout check"
+        )
 
 
 # --- Solver gate vs committed gate ------------------------------------------

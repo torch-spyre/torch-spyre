@@ -868,6 +868,25 @@ def test_same_group_coarse_tiled_edge_is_offered_and_priced_per_trip(monkeypatch
                     "co_optimizing_lx_planning": True,
                     "layout_solver": "cpsat",
                     "lx_same_tile_group_relayout": True,
+                    # This fixture's one hinted edge prices 17 candidates across
+                    # 13 distinct destination-view groups -- over
+                    # lx_solver_relayout_groups_per_edge's default cap of 4.
+                    # _cap_relayout_groups keeps only the cheapest groups past
+                    # that cap, ranked by cost_ns (which carries the very
+                    # loop-trip multiplier this test is isolating) plus the
+                    # consumer's own (trip-count-independent) execution cost --
+                    # so which groups survive the cap can itself depend on the
+                    # trip count, which would make the scaled-vs-unscaled
+                    # comparison below compare different candidate sets instead
+                    # of the same candidates at two different costs. 0 keeps
+                    # every view uncapped (see the config's own docstring),
+                    # the same way test_complete_partition_expansion_fires_and_preserves_values's
+                    # "no_copy" mode uses it to see every candidate the
+                    # enumerator built; safe here since this fixture is one
+                    # small hinted edge, nowhere near the unbounded-enumeration
+                    # scale (5789 copies on the real decode graph) the default
+                    # cap exists to bound.
+                    "lx_solver_relayout_groups_per_edge": 0,
                 }
             ):
                 out = torch.compile(fn, dynamic=False, fullgraph=True)(a, w)

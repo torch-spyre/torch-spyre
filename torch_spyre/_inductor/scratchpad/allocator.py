@@ -3779,8 +3779,59 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     max_cores,
                     prep_cache,
                 )
+            # for_each_tile lowers through decompose_scan_to_while_loop, which
+            # retraces the tile body into a fresh while_loop HOP subgraph and
+            # names every node in it "while_loop_body_graph_<N>_<M>_<...>" --
+            # not a typed marker torch-spyre defines, but the one signal that
+            # is specific to a for_each_tile body and not shared with the
+            # unrelated declarative coarse-tiling path (scratchpad/coarse_tiling.py,
+            # wsr/coarse_tile.py), which also stamps CoarseTileInfo/loop_group_id
+            # but never goes through scan/while_loop. See propagate_hints.py's
+            # get_op_hints for the same prefix mattering to hint recovery.
+            in_for_each_tile_body = op.name.startswith("while_loop_body_graph")
             if aligned is not None:
                 divs = [aligned]
+            elif (
+                reason == "user work_div hint"
+                and config.lx_same_tile_group_relayout
+                and in_for_each_tile_body
+            ):
+                # Scoped to the same-tile-group relayout exception's own
+                # for_each_tile ops only (flag on, in_for_each_tile_body) --
+                # NOT every resolved-hint op in the compiler. A resolved hint
+                # pins the op to exactly its own division, correct for the
+                # hinted axis/axes, but it also freezes every OTHER axis at
+                # split=1, even when the solver has room to widen them for
+                # free. Offer a second candidate: the widest (max-cores)
+                # division that still honors the hint's own axis/axes at their
+                # hinted values, splitting only the unhinted ones further. This
+                # is deliberately a 2-candidate menu, not the full enumeration --
+                # the joint CP-SAT solve's cost tracks each op's menu size (via
+                # how many relayout copies end up "free" rather than fixed, not
+                # the raw count of priced RelayoutCandidate objects), so handing
+                # every hinted op the full candidate set reintroduces close to
+                # the no-hints/full-enumeration compile cost this narrowing
+                # exists to avoid, for one extra candidate's worth of benefit.
+                # Leaving every other hinted op (outside a for_each_tile body)
+                # on the plain fixed pin keeps this change -- and its tests --
+                # confined to the same-tile-group exception's own graphs.
+                fixed_divs = _legal_fixed_division(
+                    op, [_fixed_core_division(op)], reason
+                )
+                hinted_splits = fixed_divs[0].splits
+                enum_divs, _ = self._enumerate_core_divisions(op, max_cores)
+                compatible = [
+                    d
+                    for d in enum_divs
+                    if all(
+                        d.splits.get(sym, 1) == val
+                        for sym, val in hinted_splits.items()
+                    )
+                ]
+                widest = max(compatible, key=lambda d: d.cores_used, default=None)
+                divs = fixed_divs + (
+                    [widest] if widest is not None and widest not in fixed_divs else []
+                )
             elif reason is not None:
                 divs = _legal_fixed_division(op, [_fixed_core_division(op)], reason)
             elif self.prune and isinstance(op, ComputedBuffer):
