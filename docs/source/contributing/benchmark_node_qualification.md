@@ -52,6 +52,12 @@ qualify(environment) ->
 gates. `unqualified` means it is excluded from the regression baseline
 with the recorded `ENV_*` reasons.
 
+`criteria_version` labels these pass/fail rules. Bump it in the same
+change that changes a gate outcome. Do not implement a producer or a
+schema for the object above. It is not stored on an observation today.
+If that storage is added later, it belongs entirely to the
+[Multi-AIU proposal][multi-aiu].
+
 ## 1. Architecture and device identity
 
 Required for every regression-grade run.
@@ -67,24 +73,16 @@ Public text names architecture and device **class** only.
 (card-count-and-topology)=
 ## 2. Card count and topology
 
-Required unless the job's first present intended source is an explicit 0.
-A job is card-using when it **declares or requests** one or more Spyre
-cards. Successful lock is not the test. A failed lock or a short lock
-stays card-using: record `ENV_NO_CARD_LOCK` or `ENV_CARD_COUNT_MISMATCH`.
-Do not reclassify that job as not applicable. When no intended source is
-present, card usage cannot be ruled out, so this section fails closed.
-
-A job is not card-using only when its first present intended source is an
-explicit 0. That is the only case where this section does not apply. Do not
-treat a missing intended count as zero. A failed lock, a short lock, a
-measured count with no declaration, or no card-count evidence at all stays
-on the fail path below and is never reclassified as not applicable.
+The steps below are the procedure. The only skip is an explicit intended
+0. The job is card-using when the selected intended count is greater than
+zero. Successful lock is not the test.
 
 ### Intended count
 
 Intended count is the count the job asked for, in this priority order.
-Stop at the first present source. Do **not** read intended count from a
-measured report field.
+Stop at the first present source, including when that value is 0. A later
+source is not consulted. Do **not** read intended count from a measured
+report field.
 
 1. `jenkins_job.cards` / `CARDS`
 2. GitHub Actions or Actions Runner Controller requested pool quantity
@@ -126,11 +124,6 @@ Short-circuit only after that reason is stored.
 6. Intended card count differs from the other members of the series.
    Fail `ENV_TOPOLOGY_MISMATCH`.
 
-A job that stamps neither a declaration nor a measured count has not
-declared zero. Record `ENV_CARD_COUNT_MISSING`. Non-card jobs must stamp
-an explicit 0. This page does not infer a card request, or the absence of
-one, from the suite name.
-
 ### Gates
 
 `ENV_NO_CARD_LOCK` is defined only in this section.
@@ -138,9 +131,9 @@ one, from the suite name.
 
 | Check | Pass | Fail |
 | --- | --- | --- |
-| Intended count | First present source is greater than or equal to 1, then continue. An explicit 0 skips this section. No intended source fails, with or without a measured count | `ENV_CARD_COUNT_MISSING` |
+| Intended count | Evaluation step 3. Step 1 is the only skip | `ENV_CARD_COUNT_MISSING` |
 | Acquired lock | Card-using job acquired a lock quantity greater than zero | `ENV_NO_CARD_LOCK` |
-| Recorded vs intended | Recorded count from step 5 is present and equal to intended. Lock and measured count must agree when both are present. A short lock stays card-using | `ENV_CARD_COUNT_MISMATCH` |
+| Recorded vs intended | The recorded count chosen in evaluation step 5 equals intended. When the lock is greater than zero and a measured count is present, those two values must be equal. A zero or absent lock is `ENV_NO_CARD_LOCK` only, unless the measured count also differs from intended | `ENV_CARD_COUNT_MISMATCH` |
 | Series topology | Intended card count matches the other members of the series | `ENV_TOPOLOGY_MISMATCH` |
 
 ### `FLEX_DEVICE` is optional
@@ -264,7 +257,10 @@ Do not copy that inventory into this page.
 - Detector math or dashboard layout. Noise math stays in [#5181][pr-5181].
 - Historical commit resolution or backfill fan-out.
 - A parallel environment schema, table, or migration. Those ride the
-  [Multi-AIU proposal][multi-aiu].
+  [Multi-AIU proposal][multi-aiu]. The `qualify()` object, including
+  `criteria_version`, is not stored by this page.
+- One combined `ENV_*` registry. Each code stays beside its gate. A later
+  `qualify()` can collect them.
 
 ## Producer gaps
 
