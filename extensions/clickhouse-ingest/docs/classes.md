@@ -60,12 +60,40 @@ orchestrator.
 ```python
 CaseId.derive(component, classname, name, tags)   # -> uuid, or "" without component/name
 CaseId.tags_for(case)                              # JUnit <properties> -> tags array
+CaseId.split_tags(tags)                            # -> (identity tags, run-context tags, result props)
 ```
 
 **Use case.** `TestResultWriter.insert` (see [writer.py](#writerpy)) calls
 this once per JUnit `<testcase>` so the *same test* — same component,
-classname, name, tags — reconciles across every run that ever exercised it,
-regardless of which CI system or architecture ran it this time.
+classname, name, identity tags — reconciles across every run that ever exercised it,
+regardless of which CI system, architecture or test type ran it this time.
+
+What a case's JUnit properties become:
+
+| property | example | lands in |
+|---|---|---|
+| `tag` in `RUN_CONTEXT_TAG_NAMESPACES` (`platform`, `testtype`, `cadence`) | `testtype__svt` | `test_case_runs.tags`, not hashed |
+| `tag` in `RESULT_TAG_NAMESPACES` (`refcoverage`) | `refcoverage__48/48` | `test_case_runs.props['result.refcoverage']` |
+| any other `tag` | `op__torch_mul` | `test_cases.tags`, hashed into `test_case_id` |
+| `metric.<name>`, a finite number | `metric.latency_ms=41.5` | `test_case_runs.measurements['latency_ms']` |
+| `result.<name>` | `result.backend=cpu` | `test_case_runs.props['result.backend']` |
+| `capability.test_type` / `.subject` / `.name` | `capability.name=torch.mul` | `capabilities`, hashed into `capability_id` |
+| `capability.sig.<k>` | `capability.sig.input_shapes=["[1,2]"]` | `capabilities.props`, hashed (sorted by key) |
+| `capability.backend` | `capability.backend=cpu` | `capability_runs.backend` |
+| `capability.tag` (repeatable) | `capability.tag=torch.mul.1` | `capabilities.tags` |
+| `capability.prop.<k>` | `capability.prop.fallback_ops=aten.mul.Tensor` | `capability_runs.props[k]` |
+| any other `capability.<k>` | `capability.fallback_ops=x` | dropped, counted in a `[warn]` |
+| anything else | `single_input_index` | ignored, counted in a `[warn]` |
+
+A case declaring `capability.test_type`, `.subject` and `.name` (all three required; one
+missing, or a scalar given two values, skips the verdict with a `[warn]`) also writes one
+`capability_runs` verdict from its outcome:
+passed/xpass → `passed`, failed → `failed`, xfail → `not_implemented`, error (pytest's
+broken setup/teardown) → `undetermined`; a skipped case writes none. `arch` is the run's `platform__` tag and `shard` is the source file, so the
+verdicts share the outcomes' dedup and re-run replacement.
+
+Bare tags older emitters wrote are read as their namespaced form (`LEGACY_TAG_ALIASES`:
+`nightly` → `cadence__nightly`, `fvt` → `testtype__fvt`, `torch-spyre` → `domain__torch-spyre`).
 
 ### `ArtifactId(DerivedId)` / `GhaArtifactId(ArtifactId)` — identity of a built thing
 
@@ -98,12 +126,19 @@ capability verdict or a benchmark measurement gets *compared across*, not part
 of what identifies the subject.
 
 **Use cases.**
-- `ingest_model_ops.py` (torch-spyre) derives `CapabilityId`s for
-  `test_type="model_ops"` — "does this build support op X".
+- `TestResultWriter` derives `CapabilityId`s for any JUnit case that declares
+  `capability.*` properties — torch-spyre's model-ops suites, `test_type="model_ops"`:
+  "does this build support op X"; hf-adapters' module tests, `test_type="model_modules"`:
+  "does this build run the model's nn.Module X"; spyre-inference's model tests,
+  `test_type="model_serving"`: "is model X declared for, or did this build serve it at,
+  tensor parallel T / max_model_len L / max_num_seqs S" (`name` is `declared` or `served`,
+  `sig.tensor_parallel` / `sig.max_model_len` / `sig.max_num_seqs` the config).
 - `capability_write.py` (hf-adapters) derives them for
   `test_type="model_support"` — "does this Hub checkpoint run on backend Y" —
-  the two share one table pair (`capabilities`/`capability_runs`) and are told
-  apart purely by `test_type`, a sibling vocabulary, not a subtype.
+  all share one table pair (`capabilities`/`capability_runs`) and are told
+  apart purely by `test_type`, a sibling vocabulary, not a subtype. The set is
+  closed (`schema.CAPABILITY_TYPE_VALUES`, mirrored by `artifact_results.chk_test_type`):
+  a case naming another type is skipped with a warning, before any insert.
 - `ingest_vllm_benchmarks.py` (spyre-inference) derives `BenchmarkId`s per
   vLLM benchmark name/tag/discriminator combination.
 
@@ -154,7 +189,7 @@ DepEntry.component(entry)   # the component the entry names, without its pin
 > column alone — resolve an `id12` via `props['id12']` on the row it names,
 > never by treating the string as an id you can look up directly.
 
-### The ten concrete tables
+### The concrete tables
 
 | Class | Table | Identity column | Use case |
 |---|---|---|---|
@@ -168,6 +203,7 @@ DepEntry.component(entry)   # the component the entry names, without its pin
 | `ArtifactRefs` | `artifact_refs` | — | How a consumer obtains an artifact. |
 | `ArtifactTags` | `artifact_tags` | — | What a channel tag pointed to as of `ts`. |
 | `ArtifactResults` | `artifact_results` | — (fact) | One leg's verdict on one artifact. |
+| `ArtifactResultReasons` | `artifact_result_reasons` | — (one row per verdict and source) | Why a verdict did not pass, when the reason arrives after the write-once verdict. |
 
 Every table is also exposed as an `UPPER_CASE` constant
 (`TEST_CASES`, `ARTIFACT_RESULTS`, …) and via the `TABLES` dict keyed by name
@@ -218,7 +254,7 @@ TestResultWriter.already_ingested(client, db, run_id, component, source_file="")
 TestResultWriter.insert(client, db, component, run_id, cases, source_file="")
 ```
 
-**Use case.** `ingest_xml.py`, `ingest_xml_si.py` and
+**Use case.** `python -m spyre_clickhouse_ingest results`, `ingest_xml_si.py` and
 `ingest_xml_hf_adapters.py` all call this for the same reason: turn a parsed
 JUnit case list into `test_cases`/`test_case_runs` rows. A case whose identity
 can't be derived (no name) is skipped with a warning rather than colliding
@@ -232,7 +268,7 @@ BenchmarkWriter.insert(client, db, component, run_id, benchmarks, report_kind=""
 ```
 
 **Use case.** `ingest_vllm_benchmarks.py` (spyre-inference) and the perf leg
-of torch-spyre's own `ingest_xml.py` both call this — one row per (benchmark,
+of `python -m spyre_clickhouse_ingest results` both call this — one row per (benchmark,
 backend), samples extended across repeated entries, and any run row with zero
 measurements dropped (the DDL's `CHECK` would otherwise fail the *whole*
 insert for one bad benchmark).
@@ -245,8 +281,9 @@ CapabilityWriter.insert(client, db, component, run_id, test_type, results, arch=
 ```
 
 **Use case.** Two genuinely different producers share this one writer:
-`ingest_model_ops.py` (torch-spyre, `test_type="model_ops"`) and
-`capability_write.py` (hf-adapters, `test_type="model_support"`). Both pass a
+`TestResultWriter`, for JUnit cases carrying `capability.*` properties (torch-spyre's
+model-ops suites, `test_type="model_ops"`), and `capability_write.py` (hf-adapters,
+`test_type="model_support"`). Both pass a
 `shard` when the caller fans out over parallel workers — scoping the dedup
 check per shard is what stops the *first* shard to flush from making every
 other shard look already-ingested.
@@ -257,9 +294,19 @@ other shard look already-ingested.
 ArtifactWriter.artifact_recorded(client, db, artifact_id)
 ArtifactWriter.result_recorded(client, db, artifact_id, run_id, result_kind, test_type)
 ArtifactWriter.insert_gha_result(client, db, *, artifact_id, component, arch, run_id, test_type, state, ...)
+ArtifactWriter.insert_reason(client, db, *, artifact_id, run_id, test_type, props, source, confidence=1)
 ```
 
-**Use case.** `ingest_xml.py`, given a non-empty `--artifact-id` from
+**Failure reasons.** A failed/error verdict carries `props.failure_reason` (one of
+`schema.FAILURE_REASON_VALUES`), `failure_subreason`, `failure_detail` (≤300 chars),
+`failure_log_url` and `failure_wait_s` (whole seconds); any other state has them stripped. `results`
+fills `test_failure` (or `ingest_error`/`no_cases`) when no `--result-prop failure_*=` is given, marked
+`failure_confidence=1` so any later collector outranks it. The
+verdict is write-once, so a repeat that carries a reason writes it to `artifact_result_reasons`
+instead; `v_artifact_results_enriched` resolves the two, plus the older `diagnosis`/`closed_reason`
+props, into its `failure_*` columns.
+
+**Use case.** `python -m spyre_clickhouse_ingest results`, given a non-empty `--artifact-id` from
 `derive-gha-artifact-id`, records both the artifact a GHA leg ran *and* its
 verdict as one call — refusing on a partial id (missing component/arch/etc.)
 rather than writing a half-identified row that a dashboard join would never

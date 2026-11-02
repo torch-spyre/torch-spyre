@@ -70,18 +70,75 @@ _SDPA_MHA_QUERY_ONLY_MIN_KV_BLOCKS = 8
 # These constants do not represent a legacy non-HOP SDPA implementation.
 _SDPA_NARROW_LIVE_SCORE_BUFFER_ALLOWANCE = 2
 _SDPA_NARROW_LIVE_QUERY_BUFFER_ALLOWANCE = 2
-# When every selected tile count is one, ``map_tiles`` and the K/V scan
-# invoke their bodies directly. There is no HOP staging or carry handoff in
-# that graph: the score allocation can be reused after its reduction and only
-# the scaled query, weighted result, and normalized output overlap at peak.
+# A single K/V block uses stable softmax even inside outer B/H/G/Lq maps.
+# Decode and SWA keep their calibrated one-score estimate for that body, with
+# the scaled query, weighted result, and normalized output at peak. Single-
+# query score tiles are small, and the single-block batched-decode plans this
+# admits measured fastest (B16/H32/Hkv8/S8192: K1x8192 17 ms vs 113 ms for
+# K2x4096). Full prefill counts two co-live scores
+# (_SDPA_PREFILL_RESIDENT_SCORE_BUFFERS).
 _SDPA_DIRECT_LIVE_SCORE_BUFFER_ALLOWANCE = 1
 _SDPA_DIRECT_LIVE_QUERY_BUFFER_ALLOWANCE = 3
+# In full prefill two score-sized tiles are co-live. ``exp(scores - max)`` may
+# take over the QK^T output's slot, but the P@V matmul reads it in another
+# stick layout, and that relayout keeps both copies live: at B4/H12/S512/D64
+# the softmax output is [12, 512, 8, 4, 64] and the P@V operand is
+# [12, 4, 8, 512, 64], so they cannot alias. Producing the exponentials in the
+# P@V layout would reduce this to one score. Both fit at H12 (2 x 786K), but at
+# H14 (2 x 917K) the second one spills. The floor keeps
+# only the two scores resident; at H12 the remaining ~50 KiB is less than one
+# query tile, so Q, the restickified K and the output are evicted first.
+_SDPA_PREFILL_RESIDENT_SCORE_BUFFERS = 2
+# An online-softmax block also keeps three query-shaped values resident: the
+# scaled query and the output carry, which live across K/V blocks, and the
+# block's weighted P@V. Over the measured scan plans this floor rejects only
+# plans at least 1.46x slower than the best one, including Lq1024 K256 chunks
+# (2 x 512K scores + 3 x 256K) that ran up to 2x slower than K128.
+_SDPA_SCAN_RESIDENT_QUERY_BUFFERS = 3
+# Prefill plans are ranked by predicted device time in nanoseconds. The
+# coefficients come from a non-negative least-squares fit over 488 forced plans
+# across 68 prefill cases, with a per-case intercept for plan-invariant compute:
+# full and chunked prefill (Lq 2-8192, contexts to 32K), B 1-8, MHA and GQA
+# (groups 1-16), D 64-512, both contiguous unmasked inputs and the adapter's
+# interleaved B/S/H/D inputs with a causal mask and SPYRE_LX_PLANNER_RELAYOUT=1.
+# The query-split and replay weights were then refit with Gemma 4 global and
+# sliding layers added. Against the previous planner, adapter-layout chunks run
+# 26.7% faster with no case slower; four contiguous D64/GQA shapes remain
+# slower (#5087), where the scratchpad co-optimizer spills the query and output
+# tiles of a head-tiled plan. DSC counts, load bursts and transfer waves fit to
+# zero, so they no longer enter the prefill cost; they remain prefill
+# tie-breaks and still drive decode selection.
+#
+# Fixed cost of each outer map tile (B, H, G or Lq), including the inner
+# iterations of nested maps. This weight was swept rather than fitted: 0.15 ms
+# leaves no case slower than before, while 0.10 and 0.20 ms each leave one.
+# Separately, adding outer tiles to otherwise identical plans measured
+# 0.15-0.18 ms each.
+_SDPA_MAP_TILE_NS = 150_000
+# Each MiB of query-shaped carry an online-softmax scan reads and writes: every
+# K/V block rescales the output carry and reads the scaled query and running
+# statistics, so the cost scales with the per-core query tile, not with the
+# block count alone. A group or head split halves it; at head_dim 512 (Gemma 4
+# global layers) G2/G4 plans measured 1.3-1.9x faster than an unsplit group.
+_SDPA_SCAN_CARRY_NS_PER_MIB = 5_200
+# Extra cost of each outer tile when the plan splits query rows. With equal
+# per-core scores and queries, a GQA group split beats a query split: Gemma 4
+# 12B global layers (Hkv1, D512) at Lq=S=2048 measured 10.0 ms with G4 vs
+# 13.4 ms with Q4. A query split shortens each head's matmul M extent and
+# replays the restickified K once per query tile.
+_SDPA_QUERY_SPLIT_TILE_NS = 50_000
+# Each MiB of plan-dependent HBM traffic: K/V streams (query and group tiles
+# replay the whole K/V extent and its restickify once per tile) and
+# interleaved-layout head-tile staging. Broadcast-mask replay is excluded: it
+# streams beside the scores, and with it removed (and the query-split charge
+# added) the Gemma 4 global-layer picks measured 28-41% faster than before.
+_SDPA_REPLAYED_HBM_NS_PER_MIB = 8_900
+# Compile-feasibility bounds for prefill plans (see _sdpa_plan_fits_compiler).
+# No measured-fastest plan across the sweeps used more than two nested maps or
+# 256 tile iterations.
+_SDPA_MAX_NESTED_MAP_LEVELS = 2
+_SDPA_MAX_UNROLLED_TILE_ITERATIONS = 1024
 _SDPA_TARGET_KV_BYTES_PER_CORE = 1024 * 1024
-_SDPA_MAX_TARGET_KV_BYTES_PER_CORE = 2 * 1024 * 1024
-_SDPA_GQA_HEADS_PER_KV_TARGET_MIB = 4
-_SDPA_QUERY_ROWS_PER_KV_TARGET_MIB = 8
-_SDPA_BASE_BURST_EFFICIENT_KV_BLOCK_SIZE = 512
-_SDPA_MAX_BURST_EFFICIENT_KV_BLOCK_SIZE = 1024
 # Nested HOP prefill keeps the scaled query and online-softmax carries live
 # across the K loop. At the widest point, the dataflow contains four
 # score-shaped values and seven query/output-shaped values once the enclosing
@@ -211,6 +268,35 @@ def _sdpa_effective_group_tiles(
     return num_group_tiles if num_q_tiles > 1 or num_kv_blocks > 1 else 1
 
 
+def _sdpa_plan_fits_compiler(
+    *,
+    num_batch_tiles: int,
+    num_head_tiles: int,
+    num_group_tiles: int,
+    num_q_tiles: int,
+    num_kv_blocks: int,
+) -> bool:
+    """Whether a prefill plan stays within tracing and backend compile limits.
+
+    With backend loop unrolling enabled (the default), the unrolled tile count
+    bounds a kernel's build: on B1/H16/S3520/D128, 1210 iterations built in 63 s,
+    while 2420 and 3025 exceeded the 60 s per-kernel dbo-opt timeout. Each nested
+    map adds about 65 Python frames of HOP tracing (issue #4885).
+    These conservative plan limits also apply when backend unrolling is disabled.
+    """
+    effective_group_tiles = _sdpa_effective_group_tiles(
+        num_group_tiles, num_q_tiles, num_kv_blocks
+    )
+    map_counts = (num_batch_tiles, num_head_tiles, effective_group_tiles, num_q_tiles)
+    iterations = num_kv_blocks
+    for count in map_counts:
+        iterations *= count
+    return (
+        sum(count > 1 for count in map_counts) <= _SDPA_MAX_NESTED_MAP_LEVELS
+        and iterations <= _SDPA_MAX_UNROLLED_TILE_ITERATIONS
+    )
+
+
 def _sdpa_has_loop_boundary(
     *,
     num_non_group_outer_tiles: int,
@@ -282,7 +368,8 @@ def _padded_tiling_for_max_extent(
 def _kv_blocks_per_loop_group(num_q_tiles: int, num_kv_blocks: int) -> int:
     """Keep each SDPA backend bundle near the proven 4-by-4 size.
 
-    The backend specializes a counted Lq loop across every unrolled Lk block.
+    With default backend unrolling, a counted Lq loop is specialized across
+    every unrolled Lk block.
     Bundle code size therefore scales with their product, not with the number of
     Lk blocks alone. Cap that product at sixteen when possible, while retaining at
     least one Lk block per group. Once Lq alone needs sixteen or more tiles,
@@ -437,13 +524,10 @@ def _sdpa_estimated_live_bytes_per_core(
     """Estimate the co-live, non-streamed values for one SDPA iteration.
 
     V is streamed by the second matmul. K is restickified before the first
-    matmul and therefore participates in full-SDPA prefill residency. Full
-    nested prefill accounts for every score- and query-shaped value that can
-    overlap at a map/carry boundary. Any plan with no effective loop uses the
-    direct-body live set because ``map_tiles`` and the one-block scan bypass
-    ``for_each_tile``. Looped decode and SWA retain their separately calibrated
-    two-score/two-query estimate. These flags select a liveness accounting
-    regime; they do not select a different SDPA implementation.
+    matmul and participates in full-SDPA prefill residency. One K/V block
+    uses stable softmax even inside outer maps; multi-block scans retain
+    online-softmax carry buffers. Looped decode and SWA retain their
+    separately calibrated two-score/two-query estimate.
     """
     score_bytes = (
         batch_size * heads_per_core * query_rows_per_core * kv_block_size * element_size
@@ -453,7 +537,11 @@ def _sdpa_estimated_live_bytes_per_core(
     )
     accumulator_bytes = batch_size * heads_per_core * query_rows_per_core * element_size
     if not has_loop_boundary:
-        score_allowance = _SDPA_DIRECT_LIVE_SCORE_BUFFER_ALLOWANCE
+        score_allowance = (
+            _SDPA_PREFILL_RESIDENT_SCORE_BUFFERS
+            if full_sdpa_prefill
+            else _SDPA_DIRECT_LIVE_SCORE_BUFFER_ALLOWANCE
+        )
         query_allowance = _SDPA_DIRECT_LIVE_QUERY_BUFFER_ALLOWANCE
     elif full_sdpa_prefill:
         score_allowance = _SDPA_PREFILL_LIVE_SCORE_BUFFER_ALLOWANCE
@@ -510,37 +598,6 @@ def _sdpa_query_tile_sizes(max_seqlen_q: int) -> list[int]:
             candidates.append(tile_size)
         target //= 2
     return candidates
-
-
-def _sdpa_target_kv_bytes_per_core(
-    num_heads: int, num_kvheads: int, query_rows_per_core: int
-) -> int:
-    """Return the useful K/V streaming footprint for one core."""
-    gqa_reuse = num_heads // num_kvheads if num_heads % num_kvheads == 0 else 1
-    head_target = (
-        _SDPA_TARGET_KV_BYTES_PER_CORE
-        * max(_SDPA_GQA_HEADS_PER_KV_TARGET_MIB, gqa_reuse)
-        // _SDPA_GQA_HEADS_PER_KV_TARGET_MIB
-    )
-    query_target = (
-        _SDPA_TARGET_KV_BYTES_PER_CORE
-        * max(_SDPA_QUERY_ROWS_PER_KV_TARGET_MIB, query_rows_per_core)
-        // _SDPA_QUERY_ROWS_PER_KV_TARGET_MIB
-    )
-    return min(
-        _SDPA_MAX_TARGET_KV_BYTES_PER_CORE,
-        head_target,
-        query_target,
-    )
-
-
-def _sdpa_burst_efficient_kv_block_limit(query_rows_per_core: int) -> int:
-    """Bound K by the DPO BMM profile for the available query-row reuse."""
-    scale = max(1, query_rows_per_core // _SDPA_QUERY_ROWS_PER_KV_TARGET_MIB)
-    return min(
-        _SDPA_MAX_BURST_EFFICIENT_KV_BLOCK_SIZE,
-        _SDPA_BASE_BURST_EFFICIENT_KV_BLOCK_SIZE * scale,
-    )
 
 
 def _sdpa_restick_active_cores(
@@ -671,13 +728,13 @@ def _sdpa_kv_candidates(
             element_size=element_size,
             restick_bytes_per_core=(restick_bytes_per_core if full_sdpa_prefill else 0),
             full_sdpa_prefill=full_sdpa_prefill,
-            has_loop_boundary=_sdpa_has_loop_boundary(
-                num_non_group_outer_tiles=num_non_group_outer_tiles,
-                num_group_tiles=num_group_tiles,
-                num_q_tiles=num_q_tiles,
-                num_kv_blocks=num_blocks,
-            ),
+            has_loop_boundary=num_blocks > 1,
         )
+        # A mapped direct body also keeps the map's input Q tile and output
+        # tile at its boundary. Neither is an online-softmax carry.
+        query_bytes = score_bytes * head_dim // effective_block_size
+        if full_sdpa_prefill and num_blocks == 1 and num_outer_tiles > 1:
+            live_bytes += 2 * query_bytes
         blocks_per_group = _kv_blocks_per_loop_group(1, num_blocks)
         num_loop_groups = (num_blocks + blocks_per_group - 1) // blocks_per_group
         result.append(
@@ -685,17 +742,16 @@ def _sdpa_kv_candidates(
                 block_size=effective_block_size,
                 num_blocks=num_blocks,
                 score_bytes_per_core=score_bytes,
-                query_bytes_per_core=(score_bytes * head_dim // effective_block_size),
+                query_bytes_per_core=query_bytes,
                 estimated_live_bytes_per_core=live_bytes,
                 kv_bytes_per_core=kv_bytes_per_core,
                 estimated_restick_active_cores=restick_active_cores,
                 restick_bytes_per_core=restick_bytes_per_core,
                 restick_lx_eligible=restick_bytes_per_core <= restick_lx_limit,
-                # Eight fixed executes, about seventeen for every unrolled
-                # block, and one carry boundary per loop group in the DBO
-                # bundles inspected during calibration.
+                # A single block emits the ten operations of stable softmax;
+                # multi-block scans retain their online carry operations.
                 estimated_dsc_executions=num_outer_tiles
-                * (8 + 17 * num_blocks + num_loop_groups),
+                * (10 if num_blocks == 1 else 8 + 17 * num_blocks + num_loop_groups),
                 # One K and one V stream per online-softmax trip. Outer HOP
                 # tiles replay both streams; wider resident blocks reduce the
                 # number of independent load bursts without a token cutoff.
@@ -722,11 +778,12 @@ def _select_sdpa_tiling(
     """Choose SDPA tiling from compiler-visible costs.
 
     Prefill enumerates exact B/Hkv/G/Lq/Lk plans. It distinguishes the direct
-    body from nested-HOP staging in its live-set estimate, permits at most one
-    whole intermediate to spill, and balances loop/DSC executions, HBM load
-    bursts, and aggregate transfer waves. Decode retains its separately
-    calibrated policy. No model identity or sequence-length cutoff participates
-    in the decision.
+    body from nested-HOP staging in its live-set estimate, admits only plans
+    whose co-live scores (plus a scan's query and output carry) fit LX, and
+    ranks those by predicted device time from map tiles, scan blocks, and HBM
+    traffic. Decode keeps its separately calibrated selection; a single-block
+    decode plan, batch-mapped or not, is costed as the direct stable body. No
+    model identity or sequence-length cutoff participates in the decision.
     """
     quarter_kv_stick_aligned = max(64, ((max_seqlen_kv + 3) // 4 + 63) // 64 * 64)
     fallback_kv_block_limit = min(
@@ -771,6 +828,7 @@ def _select_sdpa_tiling(
         num_group_tiles: int,
         num_q_tiles: int,
         num_kv_blocks: int,
+        include_mask: bool = True,
     ) -> int:
         effective_group_tiles = _sdpa_effective_group_tiles(
             num_group_tiles, num_q_tiles, num_kv_blocks
@@ -794,15 +852,20 @@ def _select_sdpa_tiling(
         return (
             query_output_bytes
             + kv_bytes * effective_group_tiles * num_q_tiles
-            + _sdpa_mask_hbm_bytes(
-                mask_shapes=mask_shapes,
-                axis_extents=mask_axis_extents,
-                axis_tile_counts=axis_tile_counts,
-                element_size=element_size,
+            + (
+                _sdpa_mask_hbm_bytes(
+                    mask_shapes=mask_shapes,
+                    axis_extents=mask_axis_extents,
+                    axis_tile_counts=axis_tile_counts,
+                    element_size=element_size,
+                )
+                if include_mask
+                else 0
             )
             + (head_tile_staging_bytes if num_head_tiles > 1 else 0)
         )
 
+    fallback_reason = "estimated per-core live footprint exceeds the LX budget"
     if is_decode:
         num_batch_tiles = _sdpa_num_batch_tiles(batch_size)
         batch_tile_size = batch_size // num_batch_tiles
@@ -938,31 +1001,36 @@ def _select_sdpa_tiling(
                                 * num_group_tiles
                                 // effective_group_tiles
                             )
-                            live_overflow = max(
-                                0,
-                                candidate.estimated_live_bytes_per_core
-                                - lx_budget_bytes,
+                            # Both the stable body and an online-softmax
+                            # block keep the QK^T scores and their
+                            # exponentials co-live, and a K/V scan also holds
+                            # the scaled query, the output carry, and each
+                            # block's P@V. Only that floor is kept resident: a
+                            # spilled score costs far more than its HBM bytes.
+                            # The query, restickified K and output tiles may
+                            # still be evicted; across the measured plans that
+                            # overflow above the floor had no measurable cost,
+                            # so the live estimate is not charged.
+                            resident_floor = (
+                                _SDPA_PREFILL_RESIDENT_SCORE_BUFFERS
+                                * candidate.score_bytes_per_core
                             )
-                            # The analytical live count is conservative around
-                            # the map/carry handoff by one query-shaped slot.
-                            # Use that slot for admission, but charge the larger
-                            # score/query buffer that allocation may evict.
-                            spill_allowance = candidate.query_bytes_per_core
-                            spill_buffer_size = max(
-                                candidate.score_bytes_per_core,
-                                candidate.query_bytes_per_core,
-                            )
+                            if candidate.num_blocks > 1:
+                                resident_floor += (
+                                    _SDPA_SCAN_RESIDENT_QUERY_BUFFERS
+                                    * candidate.query_bytes_per_core
+                                )
                             estimated_spill_buffers = (
-                                (live_overflow + spill_allowance - 1) // spill_allowance
-                                if live_overflow
-                                else 0
-                            )
-                            # A spilled intermediate is written to HBM and read
-                            # back on every innermost loop trip.
+                                max(0, resident_floor - lx_budget_bytes)
+                                + candidate.score_bytes_per_core
+                                - 1
+                            ) // candidate.score_bytes_per_core
+                            # A spilled score is written to HBM and read back on
+                            # every innermost loop trip.
                             estimated_spill_bytes = (
                                 2
                                 * estimated_spill_buffers
-                                * spill_buffer_size
+                                * candidate.score_bytes_per_core
                                 * num_cores
                                 * num_outer_tiles
                                 * candidate.num_blocks
@@ -1022,21 +1090,65 @@ def _select_sdpa_tiling(
                                     estimated_spill_buffers=(estimated_spill_buffers),
                                     estimated_spill_bytes=estimated_spill_bytes,
                                     estimated_work=(
-                                        candidate.estimated_dsc_executions
-                                        + plan_load_bursts
-                                        + plan_hbm_transfer_waves
+                                        _SDPA_MAP_TILE_NS * num_outer_tiles
+                                        + _SDPA_QUERY_SPLIT_TILE_NS
+                                        * (num_outer_tiles if num_q_tiles > 1 else 0)
+                                        + _SDPA_SCAN_CARRY_NS_PER_MIB
+                                        * (
+                                            num_outer_tiles
+                                            * candidate.num_blocks
+                                            * candidate.query_bytes_per_core
+                                            * num_cores
+                                            if candidate.num_blocks > 1
+                                            else 0
+                                        )
+                                        // (1024 * 1024)
+                                        + _SDPA_REPLAYED_HBM_NS_PER_MIB
+                                        * (
+                                            estimated_hbm_bytes(
+                                                num_batch_tiles=num_batch_tiles,
+                                                num_head_tiles=num_head_tiles,
+                                                num_group_tiles=num_group_tiles,
+                                                num_q_tiles=num_q_tiles,
+                                                num_kv_blocks=candidate.num_blocks,
+                                                include_mask=False,
+                                            )
+                                            - query_output_bytes
+                                        )
+                                        // (1024 * 1024)
                                     ),
                                 )
                             )
 
-        bounded_prefill = [
+        buildable = [
             plan
             for plan in plans
-            # Tolerate and price one query/output carry-sized uncertainty at
-            # the map boundary. Requiring more means DWSRS did not right-size
-            # the working set.
-            if plan.estimated_spill_buffers <= 1
+            if _sdpa_plan_fits_compiler(
+                num_batch_tiles=plan.num_batch_tiles,
+                num_head_tiles=plan.num_head_tiles,
+                num_group_tiles=plan.num_group_tiles,
+                num_q_tiles=plan.num_q_tiles,
+                num_kv_blocks=plan.kv.num_blocks,
+            )
         ]
+        # Prefer plans whose resident floor fits LX. When the compile caps
+        # leave none, a buildable plan that spills scores is still better
+        # than one the backend may fail to build, so take the fewest spills.
+        bounded_prefill = [
+            plan for plan in buildable if plan.estimated_spill_buffers == 0
+        ]
+        prefill_reason = "lowest predicted map-tile, K/V scan, and HBM traffic time"
+        if not bounded_prefill and buildable:
+            fewest_spills = min(plan.estimated_spill_buffers for plan in buildable)
+            bounded_prefill = [
+                plan
+                for plan in buildable
+                if plan.estimated_spill_buffers == fewest_spills
+            ]
+            prefill_reason = (
+                "no buildable plan keeps both score tiles in LX; fewest "
+                "spilled scores within the compile limits"
+            )
         for plan in plans:
             logger.debug(
                 "SDPA tile candidate: B=%s H=%s G=%s Lq=%s K=%s "
@@ -1061,7 +1173,7 @@ def _select_sdpa_tiling(
                 plan.estimated_work,
                 plan.kv.score_bytes_per_core,
                 plan.kv.estimated_live_bytes_per_core,
-                plan.estimated_spill_buffers <= 1,
+                plan.estimated_spill_buffers == 0,
             )
         if bounded_prefill:
             selected_plan = min(
@@ -1097,7 +1209,7 @@ def _select_sdpa_tiling(
                     )
                     else "work_divided_tiled"
                 ),
-                reason=("lowest loop, HBM burst, and bounded-spill transfer cost"),
+                reason=prefill_reason,
                 kv_block_size=selected.block_size,
                 num_kv_blocks=selected.num_blocks,
                 num_q_tiles=selected_plan.num_q_tiles,
@@ -1121,10 +1233,12 @@ def _select_sdpa_tiling(
             plans, key=lambda plan: plan.kv.estimated_live_bytes_per_core
         )
         smallest_candidate = smallest_plan.kv
+        # Prefill reaches the coarse fallback only when no plan is buildable.
+        fallback_reason = "no enumerated plan fits the compile limits"
 
     score_bytes_per_core = smallest_candidate.score_bytes_per_core
     estimated_live_bytes_per_core = smallest_candidate.estimated_live_bytes_per_core
-    reason = "estimated per-core live footprint exceeds the LX budget"
+    reason = fallback_reason
 
     fallback_effective_group_tiles = _sdpa_effective_group_tiles(
         fallback_num_group_tiles,
@@ -1262,11 +1376,38 @@ def _select_swa_tiling(
                 candidate.restick_lx_eligible,
                 candidate.estimated_live_bytes_per_core <= lx_budget_bytes,
             )
-        feasible = [
+        # A tiling that covers the buffer exactly is not padded, so the K/V
+        # loop slices the cache view itself. Tile strides must then divide the
+        # cache strides (powers of two), which an odd block count breaks: 17x64
+        # of 1088 and 3x704 of 2112 fail to compile while padded 5x256 of 1088
+        # and 5x448 of 2112 build.
+        candidates = [
             candidate
             for candidate in candidates
-            if candidate.estimated_live_bytes_per_core <= lx_budget_bytes
-        ]
+            if candidate.num_blocks * candidate.block_size != buffer_width
+            or candidate.num_blocks & (candidate.num_blocks - 1) == 0
+        ] or candidates
+        if is_decode:
+            feasible = [
+                candidate
+                for candidate in candidates
+                if candidate.estimated_live_bytes_per_core <= lx_budget_bytes
+            ]
+        else:
+            # Prefill admits a K block when its resident floor fits LX, as full
+            # SDPA prefill does: two co-live score tiles, plus the scaled
+            # query, output carry and per-block P@V for a multi-block scan.
+            feasible = [
+                candidate
+                for candidate in candidates
+                if _SDPA_PREFILL_RESIDENT_SCORE_BUFFERS * candidate.score_bytes_per_core
+                + (
+                    _SDPA_SCAN_RESIDENT_QUERY_BUFFERS * candidate.query_bytes_per_core
+                    if candidate.num_blocks > 1
+                    else 0
+                )
+                <= lx_budget_bytes
+            ]
         if not feasible:
             smallest = candidates[0]
             score_bytes_per_core = smallest.score_bytes_per_core
@@ -1313,40 +1454,22 @@ def _select_swa_tiling(
                     else "single-query decode; longest bursts and fewest DSC executes"
                 )
             else:
-                # Prefill starts from the generated candidates, keeps only
-                # LX-feasible tiles, then selects the one closest to the
-                # analytical K/V streaming target.
-                assert sdpa_work_div is not None
-                query_rows_per_core = q_block // sdpa_work_div["max_seqlen_q"]
-                target_kv_bytes = _sdpa_target_kv_bytes_per_core(
-                    num_heads,
-                    num_kvheads,
-                    query_rows_per_core,
-                )
-                target_kv_block_size = _sdpa_burst_efficient_kv_block_limit(
-                    query_rows_per_core
-                )
-                kv_bytes_per_row = (
-                    candidates[0].kv_bytes_per_core // candidates[0].block_size
-                )
-                target_kv_extent = min(
-                    target_kv_block_size,
-                    max(1, target_kv_bytes // kv_bytes_per_row),
-                )
-                # Equal HOP tiles can leave large gaps around the analytical
-                # target.  Choose the closest physically runnable divisor,
-                # rather than always rounding down and accidentally halving
-                # the useful burst.  LX remains a hard feasibility bound;
-                # execution count and burst length break equidistant ties.
+                # Every extra K/V block adds a scan step that rescales the
+                # query-shaped carry, so the fewest blocks whose floor fits LX
+                # win. On Gemma-style sliding layers (H16/Hkv8/D256, window
+                # 1024) this picks the measured-fastest block in every case,
+                # up to 3.4x faster than the former streaming-target choice
+                # (S4096 square prefill: one 1088-row block 31.8 ms vs K256
+                # 108.9 ms).
                 selected = min(
                     feasible,
                     key=lambda candidate: (
-                        abs(candidate.block_size - target_kv_extent),
+                        candidate.num_blocks,
                         candidate.estimated_dsc_executions,
                         -candidate.block_size,
                     ),
                 )
-                reason = "closest exact tile to K/V streaming and burst targets"
+                reason = "fewest K/V blocks whose resident floor fits LX"
 
             selected_work_div = (
                 dict(sdpa_work_div) if sdpa_work_div is not None else None
@@ -1717,19 +1840,48 @@ def spyre_gelu(
     return torch.ops.spyre.gelu(input, approximate)
 
 
+# Below this input the log1p series replaces the runtime primitive, which is up to
+# 1.4% off in [-2, -1) and returns 0 below -7 (#5741). The series' truncation error
+# peaks here at 3.1e-4, but the primitive just above is up to 0.6% off, so the
+# output can step by that much at the cutoff.
+_SOFTPLUS_SERIES_CUTOFF = -1.0
+# Terms of log1p(u) = u - u^2/2 + u^3/3 - ...; at u = e^-1 the next one is below
+# fp16 resolution.
+_SOFTPLUS_SERIES_TERMS = 6
+
+
+def _softplus_unit_beta(input: torch.Tensor, threshold: float) -> torch.Tensor:
+    """``softplus(x, beta=1)``: the primitive above the cutoff, log1p(e^x) below.
+
+    There is no log1p on Spyre and log(1 + e^x) rounds to 0 just like the
+    primitive, so the small-x branch is the log1p series in Horner form. PyTorch
+    returns x only for x > threshold, so a threshold below the cutoff lowers it.
+    """
+    cutoff = min(_SOFTPLUS_SERIES_CUTOFF, threshold)
+    u = torch.exp(torch.clamp_max(input, cutoff))
+    acc = torch.full_like(u, 1.0 / _SOFTPLUS_SERIES_TERMS)
+    for k in range(_SOFTPLUS_SERIES_TERMS - 1, 0, -1):
+        acc = 1.0 / k - u * acc
+    return torch.where(
+        input < cutoff,
+        u * acc,
+        torch.ops.spyre.softplus(input, 1.0, threshold),
+    )
+
+
 @register_spyre_decompositions([torch.ops.aten.softplus.default])
 def spyre_softplus(
     input: torch.Tensor, beta: float = 1.0, threshold: float = 20.0
 ) -> torch.Tensor:
     if beta == 1.0:
-        return torch.ops.spyre.softplus(input, beta, threshold)
+        return _softplus_unit_beta(input, threshold)
     # The runtime primitive drops the outer 1/beta factor, so beta == 1 is its
     # only exact path. Scale into it and back out; the threshold branch stays
     # exact because 1 * (beta * x) > threshold is PyTorch's beta * x > threshold.
     # aten accepts beta == 0 and saturates every element to +-inf, so take the
     # reciprocal under IEEE rules rather than letting Python raise here.
     inv_beta = math.copysign(math.inf, beta) if beta == 0.0 else 1.0 / beta
-    return torch.ops.spyre.softplus(input * beta, 1.0, threshold) * inv_beta
+    return _softplus_unit_beta(input * beta, threshold) * inv_beta
 
 
 def _pow_by_squaring(input: torch.Tensor, exponent: int) -> torch.Tensor:
@@ -1957,14 +2109,6 @@ def spyre__sdpa_overrideable(
     num_group_tiles = _sdpa_effective_group_tiles(
         tiling.num_group_tiles, tiling.num_q_tiles, num_kv_tiles
     )
-    direct_plan = not _sdpa_has_loop_boundary(
-        num_non_group_outer_tiles=(
-            tiling.num_batch_tiles * tiling.num_head_tiles * tiling.num_q_tiles
-        ),
-        num_group_tiles=tiling.num_group_tiles,
-        num_q_tiles=tiling.num_q_tiles,
-        num_kv_blocks=num_kv_tiles,
-    )
     logger.debug(
         "SDPA tiling: strategy=%s reason=%s Lq=%s q_tiles=%s "
         "q_tile_size=%s Lk=%s kv_blocks=%s kv_block_size=%s "
@@ -2030,11 +2174,8 @@ def spyre__sdpa_overrideable(
         # Q is invariant across the counted Lk loop.
         q_scaled = q_tile * query_scale
 
-        # A loop-free plan has no online-softmax state to carry. Keep
-        # its graph as the stable-softmax formula so the compiler sees the same
-        # short live ranges that the cost model charges above. Tiled plans retain
-        # the common carry path below.
-        if direct_plan:
+        # Only a multi-block K/V scan requires online-softmax carry state.
+        if num_kv_tiles == 1:
             if use_gqa:
                 k_tile = k_tile.unsqueeze(2)
                 v_tile = v_tile.unsqueeze(2)
@@ -2078,7 +2219,7 @@ def spyre__sdpa_overrideable(
 
         def sdpa_lk_body(carry, tiles):
             block_maximum, block_denominator, block_output = carry
-            _, k_blk, v_blk, *block_masks = tiles
+            q_blk, k_blk, v_blk, *block_masks = tiles
             if use_gqa:
                 k_blk = k_blk.unsqueeze(2)
                 v_blk = v_blk.unsqueeze(2)
@@ -2091,9 +2232,9 @@ def spyre__sdpa_overrideable(
                 k_blk = k_blk.contiguous()
             keys_T = k_blk.transpose(-1, -2).contiguous()
             scores = (
-                torch.ops.spyre.batched_matmul(q_scaled, keys_T)
+                torch.ops.spyre.batched_matmul(q_blk, keys_T)
                 if use_gqa
-                else torch.matmul(q_scaled, keys_T)
+                else torch.matmul(q_blk, keys_T)
             )
             for block_mask in block_masks:
                 scores = scores + block_mask
@@ -2115,19 +2256,19 @@ def spyre__sdpa_overrideable(
             new_output = block_output * correction.unsqueeze(-1) + weighted
             return (new_max, new_denominator, new_output), None
 
-        kv_operands = (q_tile, k_tile, v_tile, *mask_tiles)
+        # The body reads the scaled Q as an operand: for_each_tile traces it
+        # without Dynamo, so a closed-over tensor would not be lifted.
+        kv_operands = (q_scaled, k_tile, v_tile, *mask_tiles)
         kv_dims = (None, -2, -2, *mask_dims(-1, max_seqlen_kv))
         initial = (running_max, denominator, output_tile)
-        if num_kv_tiles == 1:
-            (_, denominator, output_tile), _ = sdpa_lk_body(initial, kv_operands)
-        else:
-            (_, denominator, output_tile), _ = for_each_tile(
-                sdpa_lk_body,
-                kv_operands,
-                dims=kv_dims,
-                tile_size=kv_tile_size,
-                init=initial,
-            )
+        # One K/V block already returned through the stable body above.
+        (_, denominator, output_tile), _ = for_each_tile(
+            sdpa_lk_body,
+            kv_operands,
+            dims=kv_dims,
+            tile_size=kv_tile_size,
+            init=initial,
+        )
         return output_tile / denominator.unsqueeze(-1)
 
     def query_level(q_tile, k_tile, v_tile, *mask_tiles):
@@ -2412,15 +2553,15 @@ def _windowed_attention(
 
             def swa_kv_body(carry, tiles):
                 running_max, denominator, output = carry
-                _, k_blk, v_blk, mask_blk = tiles
+                q_blk, k_blk, v_blk, mask_blk = tiles
                 # Match full SDPA: the scan walks K in cache order and
                 # materializes only the bounded, transposed tile required by
                 # the score matmul.
                 keys_t = k_blk.transpose(-1, -2).contiguous()
                 scores = (
-                    torch.ops.spyre.batched_matmul(q_scaled, keys_t)
+                    torch.ops.spyre.batched_matmul(q_blk, keys_t)
                     if use_gqa
-                    else torch.matmul(q_scaled, keys_t)
+                    else torch.matmul(q_blk, keys_t)
                 )
                 scores = scores + mask_blk
 
@@ -2442,7 +2583,9 @@ def _windowed_attention(
                 new_output = output * correction.unsqueeze(-1) + weighted
                 return (new_max, new_denominator, new_output), None
 
-            kv_operands = (q_tile, k_tile, v_tile, mask_tile)
+            # The body reads the scaled Q as an operand: for_each_tile traces it
+            # without Dynamo, so a closed-over tensor would not be lifted.
+            kv_operands = (q_scaled, k_tile, v_tile, mask_tile)
             initial = (running_max, denominator, output_tile)
             if tiling.num_kv_blocks == 1:
                 (_, denominator, output_tile), _ = swa_kv_body(initial, kv_operands)
@@ -2964,8 +3107,9 @@ _CONV_MAX_KERNEL = 3
 
 
 def _is_direct_conv_supported(
-    input: torch.Tensor,
-    weight: torch.Tensor,
+    input_shape: Sequence[int],
+    input_dtype: torch.dtype,
+    weight_shape: Sequence[int],
     stride: list[int],
     transposed: bool,
     output_padding: list[int],
@@ -3037,7 +3181,7 @@ def _is_direct_conv_supported(
     NCHW contract) and assumes the direct path will place C_in on the device
     stick. That stick placement is NOT decided here -- it is requested by the
     direct path and enforced downstream in propagate_layouts (_conv_layouts /
-    find_stick_compatible_input_layout), which restickify the activation onto
+    generate_stl_with_required_stick), which restickify the activation onto
     C_in or raise Unsupported if they cannot. So the ``C_in % stick == 0`` check
     below is a precondition of the channel-last layout the path *will request*,
     validated against the channel *count* (which no layout choice changes). The
@@ -3049,8 +3193,11 @@ def _is_direct_conv_supported(
     the im2col+matmul fallback branch is gone (see above) -- a mismatch surfaces
     downstream as a hard Unsupported, not silent wrong numerics.
     """
-    kH, kW = weight.shape[-2], weight.shape[-1]
-    C_in = input.shape[1]
+    # A rank-3 (conv1d) weight is [C_out, C_in_per_group, K_w], so shape[-2] is
+    # the input-channel count, not a kernel height. For conv1d, kH is always 1
+    kH = 1 if len(weight_shape) == 3 else weight_shape[-2]
+    kW = weight_shape[-1]
+    C_in = input_shape[1]
     eps = get_elem_in_stick(torch.float16)
     supported = (
         not transposed
@@ -3058,8 +3205,9 @@ def _is_direct_conv_supported(
         and all(p == 0 for p in padding)
         and all(d == 1 for d in dilation)
         and groups == 1
-        and input.dim() == 4
-        and input.dtype == torch.float16
+        # Expand acceptable dim count to include 3 to support conv1d
+        and len(input_shape) in (3, 4)
+        and input_dtype == torch.float16
         and not (kH == 1 and kW == 1)
         # Dense conv k>3 overflows the LX contraction budget in the backend.
         and kH <= _CONV_MAX_KERNEL
@@ -3079,11 +3227,206 @@ def _is_direct_conv_supported(
     # and mis-accumulates the dangling column when (W_in - kW) % sW != 0. Only
     # decidable for a static width; a dynamic (SymInt) width stays on the direct
     # path rather than adding a symbolic-remainder shape guard.
-    W_in = input.shape[-1]
+    W_in = input_shape[-1]
     sW = stride[-1]
     if isinstance(W_in, int) and (W_in - kW) % sW != 0:
         return False
     return True
+
+
+def _will_lower_conv2d_direct(
+    input_shape: Sequence[int],
+    input_dtype: torch.dtype,
+    weight_shape: Sequence[int],
+    stride: list[int],
+    transposed: bool,
+    output_padding: list[int],
+    padding: list[int],
+    dilation: list[int],
+    groups: int,
+) -> bool:
+    """Single source of truth for whether conv2d_via_bmm_decomp defers a 4D conv.
+
+    True iff the decomposition will decline (return NotImplemented) and leave
+    aten.convolution for the native direct SDSC lowering, rather than expand into
+    im2col+matmul. Decides purely from shapes/dtype, so both callers pass shapes
+    directly: the 4D gate its own input/weight shapes, and the 3D->2D fold the
+    *folded* 4D shapes (it must pick a physical layout matching the path the
+    recursive 4D conv will actually take -- channel-last for direct, row-major for
+    im2col). Sharing this one decision is what keeps the fold's layout choice from
+    ever diverging from the routing the recursion makes.
+    """
+    return config.conv2d_direct_lowering and _is_direct_conv_supported(
+        input_shape,
+        input_dtype,
+        weight_shape,
+        stride,
+        transposed,
+        output_padding,
+        padding,
+        dilation,
+        groups,
+    )
+
+
+# Per-band byte limit for the im2col and matmul-output buffers of
+# _conv2d_im2col_matmul. Each band stays well inside the 256 MiB per-core span
+# limit, which the full im2col of a large patch-embed conv exceeds.
+_CONV_IM2COL_BAND_BYTES = 64 << 20
+
+
+def _round_up(value: int, multiple: int) -> int:
+    return (value + multiple - 1) // multiple * multiple
+
+
+def _conv2d_im2col_matmul(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    stride: Sequence[int],
+    padding: Sequence[int],
+    dilation: Sequence[int],
+    groups: int,
+) -> torch.Tensor:
+    """2D convolution as an on-device channel-last im2col and one matmul.
+
+    Every step is a view, pad, permute or cat that lowers on the device, so
+    there is no CPU fallback. A tap (one kernel position (a, b)) can be read as
+    a plain view only along a dim that is not the stick, because slicing the
+    stick dim shifts elements across sticks. So the taps are gathered in two
+    phases, each with a different dim on the stick: the W taps while H is the
+    stick, then the H taps after the channels have become the stick.
+
+    1. Transpose the input to (N, C, W, H) and pad W. Viewing the padded W as
+       (Wq, sW) turns tap ``b``, at column ``sW*ow + dW*b``, into the slice
+       ``[q:q+W_out]`` of phase ``r``, where ``q, r = divmod(dW*b, sW)``.
+       Concatenating the kW taps on the channel dim gives (N, kW*C, W_out, H).
+    2. Pad kW*C to a whole number of sticks, C1, and go channel-last:
+       (N, H, W_out, C1). The H taps are then concatenated on the stick in whole
+       C1 chunks, so no copy lands at a partial-stick offset.
+    3. Multiply the (M, kH*C1) im2col by a (kH*C1, C_out) weight built in the
+       same tap order. Each band of output rows stays under
+       _CONV_IM2COL_BAND_BYTES.
+
+    The weight is a real 2-D buffer built with a cat: viewing a contiguous
+    (kH, kW*C, C_out) as (K, C_out) gives the matmul a K that spans two device
+    dims, which batchmatmul rejects. A grouped conv runs as one dense conv
+    whose weight is zero outside each group's diagonal block.
+
+    When H is 1 (conv1d), the transpose in step 1 would put a one-element dim on
+    the stick. Then each tap's channels are padded to a whole stick instead,
+    and both tap gathers run channel-last.
+
+    Returns a logical NCHW tensor whose storage is channel-last.
+    """
+    N, C, H, W = input.shape
+    C_out, C_in_per_group, K_h, K_w = weight.shape
+    stride_h, stride_w = stride
+    pad_h, pad_w = padding
+    dil_h, dil_w = dilation
+    # A whole fp16/bf16 stick, and two fp32 sticks. get_elem_in_stick cannot
+    # be traced here.
+    stick = STICK
+
+    if groups != 1:
+        C_out_per_group = C_out // groups
+        weight = torch.cat(
+            [
+                torch.constant_pad_nd(
+                    weight[g * C_out_per_group : (g + 1) * C_out_per_group],
+                    (0, 0, 0, 0, g * C_in_per_group, C - (g + 1) * C_in_per_group),
+                )
+                for g in range(groups)
+            ],
+            dim=0,
+        )
+
+    H_out = (H + 2 * pad_h - dil_h * (K_h - 1) - 1) // stride_h + 1
+    W_out = (W + 2 * pad_w - dil_w * (K_w - 1) - 1) // stride_w + 1
+    # Padded extents: whole strides covering the input and every tap.
+    Hq = max(-(-(H + 2 * pad_h) // stride_h), H_out + dil_h * (K_h - 1) // stride_h)
+    Wq = max(-(-(W + 2 * pad_w) // stride_w), W_out + dil_w * (K_w - 1) // stride_w)
+    C_out_p = _round_up(C_out, stick)
+    if C_out_p != C_out:
+        weight = torch.constant_pad_nd(weight, (0, 0, 0, 0, 0, 0, 0, C_out_p - C_out))
+
+    if H == 1:
+        # Pad C to a whole stick, so each tap is C1 = C_p channels.
+        C_p = _round_up(C, stick)
+        x = input
+        if C_p != C:
+            x = torch.constant_pad_nd(x, (0, 0, 0, 0, 0, C_p - C))
+            weight = torch.constant_pad_nd(weight, (0, 0, 0, 0, 0, C_p - C))
+        # contiguous(): with zero spatial padding the pad below is dropped, and
+        # the tap views must then not read through a W-stick permuted view.
+        x = x.permute(0, 2, 3, 1).contiguous()
+        x = torch.constant_pad_nd(
+            x,
+            (0, 0, pad_w, Wq * stride_w - W - pad_w, pad_h, Hq * stride_h - H - pad_h),
+        )
+        xv = x.view(N, Hq * stride_h, Wq, stride_w, C_p)
+        cols = []
+        for b in range(K_w):
+            q, r = divmod(dil_w * b, stride_w)
+            cols.append(xv[:, :, q : q + W_out, r, :])
+        t = torch.cat(cols, dim=-1) if K_w > 1 else cols[0]
+        C1 = K_w * C_p
+        tv = t.view(N, Hq, stride_h, W_out, C1)
+        w_cl = weight.permute(2, 3, 1, 0).contiguous().view(K_h, C1, C_out_p)
+    else:
+        C1 = _round_up(K_w * C, stick)
+        # The W taps read through the input's own H stick, whose device size is
+        # the padded extent rounded up to a stick; keep that a whole number of
+        # strides.
+        if _round_up(Wq * stride_w, stick) % stride_w:
+            Wq = _round_up(Wq * stride_w, math.lcm(stick, stride_w)) // stride_w
+        if _round_up(Hq * stride_h, stick) % stride_h:
+            Hq = _round_up(Hq * stride_h, math.lcm(stick, stride_h)) // stride_h
+        xt = input.transpose(2, 3).contiguous()  # (N, C, W, H)
+        xt = torch.constant_pad_nd(xt, (0, 0, pad_w, Wq * stride_w - W - pad_w))
+        xv = xt.view(N, C, Wq, stride_w, H)
+        cols = []
+        for b in range(K_w):
+            q, r = divmod(dil_w * b, stride_w)
+            cols.append(xv[:, :, q : q + W_out, r, :])
+        t = torch.cat(cols, dim=1) if K_w > 1 else cols[0]  # (N, kW*C, W_out, H)
+        t = torch.constant_pad_nd(t, (0, 0, 0, 0, 0, C1 - K_w * C))
+        tc = t.permute(0, 3, 2, 1).contiguous()  # (N, H, W_out, C1)
+        tc = torch.constant_pad_nd(tc, (0, 0, 0, 0, pad_h, Hq * stride_h - H - pad_h))
+        tv = tc.view(N, Hq, stride_h, W_out, C1)
+        w_cl = weight.permute(2, 3, 1, 0).contiguous().view(K_h, K_w * C, C_out_p)
+        w_cl = torch.constant_pad_nd(w_cl, (0, 0, 0, C1 - K_w * C))
+
+    K = K_h * C1
+    if K_h > 1:
+        weight_2d = torch.cat([w_cl[a] for a in range(K_h)], dim=0)
+    else:
+        # w_cl[0] can still be a view that merges (K_w, C) into K, leaving K two
+        # device dims: always when H == 1, and when H > 1 if K_w * C is whole
+        # sticks so the pad above is dropped. batchmatmul rejects such a K once
+        # C_out is more than one stick (out_reuse_dim.size() == 1). A clone of a
+        # contiguous view is dropped too, so pad and slice to write it through
+        # a real kernel.
+        weight_2d = torch.constant_pad_nd(w_cl[0], (0, 0, 0, stick))[:C1]
+
+    band_bytes = N * W_out * max(K, C_out_p) * input.element_size()
+    rows_per_band = max(1, min(H_out, _CONV_IM2COL_BAND_BYTES // band_bytes))
+    bands = []
+    for h0 in range(0, H_out, rows_per_band):
+        rows = min(rows_per_band, H_out - h0)
+        taps = []
+        for a in range(K_h):
+            q, r = divmod(dil_h * a, stride_h)
+            taps.append(tv[:, q + h0 : q + h0 + rows, r])
+        patches = torch.cat(taps, dim=-1) if K_h > 1 else taps[0].contiguous()
+        band = torch.matmul(patches.reshape(N * rows * W_out, K), weight_2d)
+        bands.append(band.view(N, rows, W_out, C_out_p))
+    output = torch.cat(bands, dim=1) if len(bands) > 1 else bands[0]
+    if C_out_p != C_out:
+        output = torch.constant_pad_nd(output, (0, C_out - C_out_p))
+    if bias is not None:
+        output = output + bias
+    return output.permute(0, 3, 1, 2)
 
 
 @register_spyre_decompositions([torch.ops.aten.convolution.default])
@@ -3099,9 +3442,8 @@ def conv2d_via_bmm_decomp(
     groups: int,
 ) -> torch.Tensor:
     """
-    Decompose 2D convolution into batch matrix multiplication using torch.nn.unfold.
-    torch.nn.unfold directly returns (N, C_in * K_h * K_w, H_out * W_out), avoiding
-    intermediate reshape/view/unsqueeze operations.
+    Decompose 2D convolution into an on-device im2col and one matrix
+    multiplication (see _conv2d_im2col_matmul).
     For depthwise convolutions (C_in = groups = C_out), invoke torch.spyre.conv2d directly.
     """
     # When the direct-lowering flag is on and the case is supported, decline the
@@ -3111,8 +3453,22 @@ def conv2d_via_bmm_decomp(
     # non-fp16) fall through and decompose to im2col+matmul as before. This is
     # the compile-path target; the flag defaults off so eager and default
     # compile behavior are unchanged.
-    if config.conv2d_direct_lowering and _is_direct_conv_supported(
-        input, weight, stride, transposed, output_padding, padding, dilation, groups
+    #
+    # NOTE: this first call passes the *original* input shape, so for a
+    # 5-dimensional (Conv3D) input it always returns False -- _is_direct_conv_
+    # supported gates on len(input_shape) in (3, 4). The direct deferral for a
+    # temporal-1 Conv3D is decided later, by the *second* call below on the
+    # folded 4D shapes; here a 5D input simply proceeds into the fold branch.
+    if _will_lower_conv2d_direct(
+        input.shape,
+        input.dtype,
+        weight.shape,
+        stride,
+        transposed,
+        output_padding,
+        padding,
+        dilation,
+        groups,
     ):
         return NotImplemented
 
@@ -3121,6 +3477,193 @@ def conv2d_via_bmm_decomp(
 
     if any(op != 0 for op in output_padding):
         raise Unsupported("conv2d_via_bmm: output_padding not supported")
+
+    # conv1d (rank-3 activation) splits by whether it is depthwise.
+    #
+    # Depthwise goes to spyre.conv2d, which handles a rank-3 activation natively.
+    #
+    # The general case (C_in != C_out, or any grouping that is not depthwise) is
+    # direct-lowered at rank 3 too when _is_direct_conv_supported accepts it.
+    #
+    # This function is reached only when direct lowering returns NotImplemented
+    #
+    # That leaves the im2col+matmul fallback, which needs rank 4, so needed expansion
+    # is performed via unsqueeze.
+    if input.dim() == 3:
+        C_in = input.shape[1]
+        C_out = weight.shape[0]
+        if C_in == groups == C_out:
+            return torch.ops.spyre.conv2d_with_bias(
+                input, weight, bias, stride, padding, dilation, groups
+            )
+        if len(stride) != 1 or len(padding) != 1 or len(dilation) != 1:
+            raise Unsupported(
+                f"conv2d_via_bmm: conv1d expects 1-element stride/padding/"
+                f"dilation, got stride={stride}, padding={padding}, "
+                f"dilation={dilation}"
+            )
+        input = input.unsqueeze(2)
+        weight = weight.unsqueeze(2)
+        stride = [1, stride[0]]
+        padding = [0, padding[0]]
+        dilation = [1, dilation[0]]
+        # The trailing reshape below restores rank 4 as (N, C_out, 1, W_out);
+        # squeeze the degenerate height back out so the result matches the
+        # rank-3 shape aten.convolution promises for a 1-D conv.
+        return conv2d_via_bmm_decomp(
+            input,
+            weight,
+            bias,
+            stride,
+            padding,
+            dilation,
+            transposed,
+            output_padding,
+            groups,
+        ).squeeze(2)
+    if input.dim() == 5:
+        # A Conv3D with a unit temporal (depth) kernel is a *batched* Conv2d:
+        # with kD == 1 (and unit depth stride, zero depth pad, unit depth
+        # dilation) every depth slice is convolved independently with the same
+        # [C_out, C_in, kH, kW] weight. So fold D into the batch dim, run the
+        # ordinary 2D conv, and unfold:
+        #     (N, C, D, H, W) -> (N*D, C, H, W) -> conv2d -> unfold back.
+        # The folded op is a plain aten.convolution.default that the
+        # decomposition table re-processes exactly like any 2D conv: with the
+        # direct-lowering flag on and a supported case it declines to the native
+        # conv2d SDSC (lower_convolution / _is_direct_conv_supported); otherwise
+        # -- the flag is off, or the case is outside the SDSC envelope, e.g. a
+        # ViT patch-embed kernel (kH/kW > 3) or a non-stick-aligned C_in as in
+        # Prithvi-EO-2.0's Conv3d(6->1024, kernel (1,16,16)) -- it decomposes to
+        # im2col+matmul. Conv3D thus rides whichever 2D path fits, with no new
+        # lowering, and the dim() == 5 guard means the folded 4D op never
+        # re-triggers this branch (no infinite recursion).
+        #
+        # A non-temporal-1 Conv3D (kD > 1, or a non-trivial depth
+        # stride/pad/dilation) is genuinely 3-D and out of scope here -- it
+        # stays Unsupported.
+        N, C_in, D, H_in, W_in = input.shape
+        C_out, C_in_per_group, K_d, K_h, K_w = weight.shape
+        if not (K_d == 1 and stride[0] == 1 and padding[0] == 0 and dilation[0] == 1):
+            raise Unsupported(
+                "conv2d_via_bmm: 3D convolution is only supported when the "
+                "temporal (depth) kernel is 1 with unit depth stride, zero depth "
+                f"padding and unit depth dilation (got kD={K_d}, "
+                f"stride_d={stride[0]}, pad_d={padding[0]}, dil_d={dilation[0]})"
+            )
+        # Folding depth into batch merges N and D into one range (N*D). When both
+        # are non-unit this merge cannot be expressed as a pure view: the direct
+        # conv2d SDSC would then carry two outer ranges and codegen indexes past
+        # its dim_labels (IndexError in parse_op_spec at superdsc.py). A size-1 N
+        # or D merges for free (the fold degenerates to a squeeze), so N==1 (any
+        # D -- e.g. Prithvi's 1x6x4x224x224 patch embed) and D==1 (any N) are
+        # fine. Reject the N>1 AND D>1 case up front rather than materialising the
+        # merge with an on-device relayout copy; it is not currently supported.
+        if N > 1 and D > 1:
+            raise Unsupported(
+                "conv2d_via_bmm: temporal-1 Conv3D with both batch N>1 and "
+                f"depth D>1 is not supported (got N={N}, D={D}); only N==1 "
+                "(any D) or D==1 (any N) folds to a single batch range."
+            )
+        # A grouped (groups != 1) temporal-1 conv3d is NOT rejected: it folds
+        # through into conv2d_via_bmm_decomp's grouped im2col+matmul branch. The
+        # direct SDSC predicate requires groups==1, so a grouped conv predicts
+        # will_direct=False -> folds row-major (W on the stick), exactly the
+        # layout the 4D im2col path wants, and the recursive 4D conv lands in the
+        # `groups != 1` grouped-matmul branch. Depthwise conv3d (the
+        # C_in==groups==C_out sub-case, whose 4D exit is the channel-last
+        # spyre.conv2d_with_bias SDSC) is never exercised through this fold, so
+        # no depthwise carve-out is needed here; the binary will_direct layout
+        # decision below matches the routing the grouped recursion takes.
+        conv2d_stride = [stride[1], stride[2]]
+        conv2d_padding = [padding[1], padding[2]]
+        conv2d_dilation = [dilation[1], dilation[2]]
+
+        # The two inner 2D paths want OPPOSITE activation layouts, so the fold
+        # must lay the data out for whichever one the recursive 4D conv will
+        # take. The direct conv2d SDSC contracts over C_in and needs C_in on the
+        # Spyre stick (channel-last fold); the im2col+matmul path needs the
+        # default row-major layout (W on the stick). Get it wrong and the conv
+        # layout pass rejects the activation with an unrepresentable stick
+        # expression -- a channel-last activation into im2col yields `2*d1 + d2`,
+        # a row-major one into the direct path yields `d3 + d6`. Call the SAME
+        # decision the recursion will make (_will_lower_conv2d_direct), passing the
+        # *folded* 4D shapes it will see: not a copy of the predicate, the predicate
+        # itself, so the fold and the 4D gate can never disagree.
+        will_direct = _will_lower_conv2d_direct(
+            (N * D, C_in, H_in, W_in),
+            input.dtype,
+            (C_out, C_in_per_group, K_h, K_w),
+            conv2d_stride,
+            transposed,
+            [output_padding[1], output_padding[2]],
+            conv2d_padding,
+            conv2d_dilation,
+            groups,
+        )
+
+        if will_direct:
+            # Channel-last fold. The permute+contiguous physically lays the
+            # tensor out channel-last (C innermost -> on the Spyre stick). The
+            # following reshape only merges the two leading dims (N,D) / squeezes
+            # the unit depth tap; it never touches the innermost (stick) dim, so
+            # it is a pure view that lowers on-device -- no host round-trip. With
+            # N>1 AND D>1 already rejected above, at most one of N,D is non-unit,
+            # so the merge always degenerates to a squeeze (a true view) and no
+            # on-device relayout copy is needed. Then expose the logical NCHW /
+            # [C_out, C_in, kH, kW] shape with a permute VIEW, exactly the form
+            # the 4D direct path receives its inputs (NHWC-contiguous viewed as
+            # NCHW), so C_in / C_out stay on the stick.
+            # activation (N,C,D,H,W) -> view (N,D,H,W,C) -> (N*D,H,W,C)
+            #            -> view (N*D,C,H,W).
+            x_cl = torch.permute(input, (0, 2, 3, 4, 1)).contiguous()
+            x_cl = x_cl.reshape(N * D, H_in, W_in, C_in)
+            x4 = torch.permute(x_cl, (0, 3, 1, 2))
+            # weight (C_out,C_in,1,kH,kW) -> view (C_in,1,kH,kW,C_out)
+            #        -> (C_in,kH,kW,C_out) -> view (C_out,C_in,kH,kW). Squeezing
+            # the unit depth tap is a size-1 view; C_out stays on the stick.
+            w_cl = torch.permute(weight, (1, 2, 3, 4, 0)).contiguous()
+            w_cl = w_cl.reshape(C_in_per_group, K_h, K_w, C_out)
+            w4 = torch.permute(w_cl, (3, 0, 1, 2))
+        else:
+            # Default row-major fold (W on the stick), the layout the im2col path
+            # accepts. Permute D next to N and merge them into the batch. With
+            # N>1 AND D>1 rejected above, the N*D merge is always a squeeze view.
+            # activation (N,C,D,H,W) -> view (N,D,C,H,W) -> (N*D,C,H,W).
+            x_dchw = torch.permute(input, (0, 2, 1, 3, 4)).contiguous()
+            x4 = x_dchw.reshape(N * D, C_in, H_in, W_in)
+            # weight (C_out,C_in,1,kH,kW) -> (C_out,C_in,kH,kW).
+            w4 = weight.reshape(C_out, C_in_per_group, K_h, K_w)
+
+        # Recurse into the 4D conv path; bias is added once, on the C_out dim,
+        # inside the inner conv (folding D into the batch leaves C_out intact),
+        # so it must NOT be re-added here.
+        out4 = torch.ops.aten.convolution.default(
+            x4,
+            w4,
+            bias,
+            conv2d_stride,
+            conv2d_padding,
+            conv2d_dilation,
+            False,
+            [0, 0],
+            groups,
+        )
+        # out4 is (N*D, C_out, H_out, W_out); read H_out/W_out back rather than
+        # recomputing them from the conv geometry, then unfold in the matching
+        # layout so the returned logical NCDHW tensor is correct either way.
+        _, C_out_o, H_out, W_out = out4.shape
+        # Both inner paths return out4 as logical NCHW over NHWC-contiguous
+        # storage (C_out on the stick): the direct SDSC by construction, and
+        # _conv2d_im2col_matmul because its matmul output is channel-last. Make
+        # that explicit with a permute+contiguous, then split the leading N*D
+        # back to N,D -- a stick-preserving view -- and permute to the logical
+        # NCDHW result.
+        # view (N*D,H_out,W_out,C_out) -> (N,D,H_out,W_out,C_out)
+        # -> view (N,C_out,D,H_out,W_out).
+        out_cl = torch.permute(out4, (0, 2, 3, 1)).contiguous()
+        out_cl = out_cl.reshape(N, D, H_out, W_out, C_out_o)
+        return torch.permute(out_cl, (0, 4, 1, 2, 3))
 
     if input.dim() != 4:
         raise Unsupported(f"conv2d_via_bmm: expected 4D input, got {input.dim()}D")
@@ -3134,66 +3677,14 @@ def conv2d_via_bmm_decomp(
             input, weight, bias, stride, padding, dilation, groups
         )
 
-    stride_h, stride_w = stride[0], stride[1]
-    pad_h, pad_w = padding[0], padding[1]
-    dil_h, dil_w = dilation[0], dilation[1]
-
     if C_in != groups * C_in_per_group:
         raise Unsupported(
             f"conv2d_via_bmm: expect C_in == groups * C_in_per_group, got C_in: {C_in}, groups: {groups} C_in_per_group: {C_in_per_group}"
         )
 
-    H_out = (H_in + 2 * pad_h - dil_h * (K_h - 1) - 1) // stride_h + 1
-    W_out = (W_in + 2 * pad_w - dil_w * (K_w - 1) - 1) // stride_w + 1
-
-    patches = torch.ops.spyre.unfold(
-        input,
-        kernel_size=(K_h, K_w),
-        dilation=(dil_h, dil_w),
-        padding=(pad_h, pad_w),
-        stride=(stride_h, stride_w),
+    return _conv2d_im2col_matmul(
+        input, weight, bias, stride[:2], padding[:2], dilation[:2], groups
     )
-
-    if groups == 1:
-        # weight_2d = weight.reshape(C_out, C_in_per_group * K_h * K_w)
-        weight_2d = torch.ops.spyre.reshape_via_cpu(
-            weight, (C_out, C_in_per_group * K_h * K_w)
-        )
-        weight_2d_exp = weight_2d.unsqueeze(0).expand(N, -1, -1)
-        weight_2d_exp_cln = weight_2d_exp.clone()
-        # output = torch.matmul(weight_2d, patches)
-        output = torch.matmul(weight_2d_exp_cln, patches)
-    else:
-        C_out_per_group = C_out // groups
-        # patches = patches.reshape(N, groups, C_in_per_group * K_h * K_w, H_out * W_out)
-        patches = torch.ops.spyre.reshape_via_cpu(
-            patches, (N, groups, C_in_per_group * K_h * K_w, H_out * W_out)
-        )
-        # weight_grouped = weight.reshape(groups, C_out_per_group, C_in_per_group * K_h * K_w)
-        weight_grouped = torch.ops.spyre.reshape_via_cpu(
-            weight, (groups, C_out_per_group, C_in_per_group * K_h * K_w)
-        )
-
-        output = torch.matmul(
-            weight_grouped.unsqueeze(0),
-            patches,
-        )
-        output = output.reshape(N, C_out, H_out * W_out)
-
-    if bias is not None:
-        # Add bias while the output is still (N, C_out, H_out * W_out): the
-        # matmul lays the trailing H_out*W_out dim on the stick, and for a
-        # patch-embed conv (e.g. Prithvi's stride-16 kernel) that flat length
-        # is a multiple of 64 even when H_out/W_out individually are not. If we
-        # instead reshaped to (N, C_out, H_out, W_out) first and broadcast the
-        # bias over a sub-stick spatial width (e.g. W_out == 32), the layout
-        # solver rejects the resulting `w + 32*Mod(row, 2)` stick expression.
-        bias_shaped = torch.ops.spyre.reshape_via_cpu(bias, (1, C_out, 1))
-        output = output + bias_shaped
-
-    output = output.reshape(N, C_out, H_out, W_out)
-
-    return output
 
 
 @register_spyre_decompositions([torch.ops.spyre.conv2d_with_bias.default])
@@ -3219,11 +3710,14 @@ def spyre_conv2d_with_bias_decomp(
 
     # If bias is present, add it
     if bias is not None:
-        # Get output shape
-        N, C_out, H_out, W_out = output.shape
-        # Reshape bias to (1, C_out, 1, 1) then expand to (N, C_out, H_out, W_out)
-        # This avoids stick layout issues by expanding before adding
-        bias_expanded = bias.reshape(1, C_out, 1, 1).expand(N, C_out, H_out, W_out)
+        # Reshape bias to a channel vector with unit spatial dims, then expand to
+        # the output shape; expanding before the add avoids stick layout issues.
+        # The rank follows the output's: 4 for conv2d, 3 for a depthwise conv1d
+        # so the shapes are built from output.shape.
+        out_shape = list(output.shape)
+        C_out = out_shape[1]
+        bias_shape = [1, C_out] + [1] * (len(out_shape) - 2)
+        bias_expanded = bias.reshape(bias_shape).expand(out_shape)
         output = output + bias_expanded
 
     return output
@@ -3286,6 +3780,39 @@ def scaled_mm_decomp(
     return result
 
 
+@register_spyre_decompositions([torch.ops.spyre.scaled_bmm])
+def scaled_bmm_decomp(
+    mat1: torch.Tensor,
+    mat2: torch.Tensor,
+    scale_a: torch.Tensor = None,
+    scale_b: torch.Tensor = None,
+    out_dtype: torch.dtype = None,
+    use_fast_accum: bool = False,
+) -> torch.Tensor:
+    """
+    Decompose spyre.scaled_bmm into:
+    1. Raw FP8 batched matmul via spyre.bmm_fp8 (no scales applied)
+    2. Multiply by scale_a, if present
+    3. Multiply by scale_b, if present
+
+    The batched counterpart of scaled_mm_decomp: it keeps the scale arithmetic
+    out of lower_bmm_fp8's matmul lowering, the same separation
+    dequantize_fp8_with_scale_decomp uses for its FP8->FP16 conversion.
+    """
+    result = torch.ops.spyre.bmm_fp8(mat1, mat2, out_dtype=out_dtype)
+
+    if scale_a is not None:
+        result = result * scale_a
+    if scale_b is not None:
+        result = result * scale_b
+
+    if use_fast_accum:
+        # Spyre has no fast 8-bit accumulation path
+        logger.warning("use_fast_accum parameter in scaled_bmm is not supported")
+
+    return result
+
+
 @register_spyre_decompositions([torch.ops.aten.where.ScalarOther])
 def where_scalar_other_decomp(condition, self, other):
     other_t = torch.full_like(self, other)
@@ -3300,10 +3827,9 @@ def where_scalar_self_decomp(condition, self, other):
 
 @register_spyre_decompositions([torch.ops.aten.where.Scalar])
 def where_scalar_decomp(condition, self, other):
-    # Must use dtype float16 for spyre backend where3
-    dtype = torch.float16
-
-    # Use full.default instead of full_like to explicitly control dtype
+    # Derive the natural dtype from the two scalar values
+    # lower_where handles any necessary promotion for hardware
+    dtype = torch.result_type(self, other)
     self_t = torch.ops.aten.full.default(
         list(condition.shape),
         self,
@@ -3384,29 +3910,6 @@ def spyre_flip(input: torch.Tensor, dims: Sequence[int]) -> torch.Tensor:
     # aten.flip always returns a fresh tensor; clone so the no-op case does
     # not alias its input.
     return out if reversed_any else out.clone()
-
-
-@register_spyre_decompositions([torch.ops.aten.prod.dim_int])
-def spyre_prod_dim_int(
-    input: torch.Tensor, dim: int, keepdim: bool = False
-) -> torch.Tensor:
-    # int64 is converted to fp32 for now, so it stays on the decomposition
-    # path below.
-    if input.dtype != torch.int64:
-        return torch.ops.spyre.prod_dim_int(input, dim, keepdim)
-
-    if dim < 0:
-        dim += input.ndim
-    out_shape = list(input.shape)
-    reduce_size = out_shape.pop(dim)
-    acc = torch.ones(out_shape, dtype=input.dtype, device=input.device)
-    for i in range(reduce_size):
-        acc = acc * input.select(dim, i)
-
-    if keepdim:
-        acc = acc.unsqueeze(dim)
-
-    return acc
 
 
 @register_spyre_decompositions(
@@ -3520,12 +4023,13 @@ def spyre_masked_scatter(
         "masked_scatter: source is too short -- it has fewer rows than the "
         "number of selected (True) mask rows.",
     )
-    # Row i reads source row (prefix-count of selected rows - 1). Unselected
-    # rows would get -1, so multiply by the mask to send them to row 0 instead
-    # (in bounds, and discarded by the where). Done in fp32: Spyre has no usable
-    # int `clip`, int32 sub/mul are unsupported, and fp16 loses large indices.
+    # Row i reads source row (prefix-count of selected rows - 1). An unselected
+    # row reads the last selected row before it, or -1 before the first one;
+    # clamping to 0 keeps every index in bounds, and the where discards what the
+    # unselected rows read. Done in fp32: Spyre has no usable int `clip`, int32
+    # sub/mul are unsupported, and fp16 loses large indices.
     pos = mask_row.cumsum(0).to(torch.float32) - 1.0
-    row_idx = (pos * mask_row.to(torch.float32)).to(torch.int64)
+    row_idx = pos.clamp(min=0.0).to(torch.int64)
     # The gather stays 2D (its args are indirect, so the pointwise dim_order
     # projection skips them), but the `where` must stay at `self`'s rank:
     # that projection computes `rank_diff = len(output) - len(arg)` and only
@@ -3569,6 +4073,148 @@ def spyre_index_add(
     updated = gathered + source
     indices: list[Optional[torch.Tensor]] = [None] * dim + [index]
     return torch.index_put(self, indices, updated, accumulate=False)
+
+
+def _grouped_mm_capacity(n: int, num_experts: int) -> int:
+    """Static per-expert capacity: 2 * ceil_to_64(n / num_experts), clamped to [64, n].
+
+    Computed from static shapes only so the decomposition stays traceable.
+    compute_grouped_mm_routing_tables raises at runtime if any segment exceeds it.
+    """
+    per_expert = (n + num_experts - 1) // num_experts
+    return max(64, min(n, ((per_expert + 63) // 64) * 64 * 2))
+
+
+@register_spyre_decompositions([torch.ops.aten._grouped_mm.default])
+def spyre_grouped_mm(
+    self: torch.Tensor,
+    mat2: torch.Tensor,
+    offs: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    """Decomposition of aten._grouped_mm covering all 4 upstream shape variants:
+
+    1. 2D x 3D with offs (mat_a [T, K] x mat_b [E, K, N]):
+       On-device Pack (index_select) -> Direct 3D BMM [E, capacity, K] @ [E, K, N]
+       -> On-device Unpack (index_select) -> out [T, N].
+    2. 3D x 3D without offs (mat_a [E, M, K] x mat_b [E, K, N]):
+       Direct 3D BMM -> out [E, M, N].
+    3. 3D x 2D with offs (mat_a [E, M, K] x mat_b [K, T]):
+       On-device Pack (index_select) -> Direct 3D BMM [E, M, K] @ [E, K, capacity]
+       -> On-device Unpack (index_select) -> out [M, T].
+    4. 2D x 2D with offs (mat_a [M, K_total] x mat_b [K_total, N]):
+       On-device Pack along reduction dim K -> Direct 3D BMM [E, M, capacity] @ [E, capacity, N]
+       -> out [E, M, N].
+
+    Scope and known limitations:
+      * BF16 only (upstream's meta rejects bias, a non-default out_dtype, and
+        fp16 off CUDA).
+      * `offs` must be a Spyre tensor. Eager calls with a CPU `offs` are
+        rejected by `_OPWrapper`'s device check (upstream accepted them).
+      * Per-expert capacity is static: 2 * ceil_to_64(n / num_experts),
+        clamped to [64, n]. A segment larger than that raises RuntimeError in
+        compute_grouped_mm_routing_tables; see #5534.
+    """
+    # Upstream's meta rejects bias and any out_dtype other than the input dtype
+    # for the dtypes Spyre supports (bf16), so these are never legitimately set.
+    assert bias is None, "Spyre grouped_mm does not support bias"
+    assert out_dtype is None or out_dtype == self.dtype, (
+        "Spyre grouped_mm does not support out_dtype != input dtype"
+    )
+
+    a_is_2d = self.dim() == 2
+    b_is_2d = mat2.dim() == 2
+
+    if a_is_2d and not b_is_2d:
+        assert offs is not None, "2D x 3D grouped_mm requires offs"
+        total_tokens: int = self.shape[0]
+        K: int = self.shape[1]
+        num_experts: int = mat2.shape[0]
+        N: int = mat2.shape[-1]
+
+        capacity = _grouped_mm_capacity(total_tokens, num_experts)
+
+        packed = torch.ops.spyre.compute_grouped_mm_routing_tables(
+            offs, total_tokens, num_experts, capacity
+        )
+        src_indices = packed[: num_experts * capacity]
+        dst_indices = packed[num_experts * capacity :]
+
+        zero_row = torch.zeros(1, K, dtype=self.dtype, device=self.device)
+        self_with_zero = torch.cat([self, zero_row], dim=0)
+        padded_a = torch.index_select(self_with_zero, 0, src_indices).reshape(
+            num_experts, capacity, K
+        )
+
+        padded_out = torch.bmm(padded_a, mat2.contiguous())
+        flat_out = padded_out.reshape(num_experts * capacity, N)
+        out = torch.index_select(flat_out, 0, dst_indices)
+
+    elif not a_is_2d and not b_is_2d:
+        out = torch.bmm(self, mat2.contiguous())
+
+    elif not a_is_2d and b_is_2d:
+        assert offs is not None, "3D x 2D grouped_mm requires offs"
+        num_experts = self.shape[0]
+        M = self.shape[1]
+        K = self.shape[2]
+        T = mat2.shape[1]
+
+        capacity = _grouped_mm_capacity(T, num_experts)
+
+        packed = torch.ops.spyre.compute_grouped_mm_routing_tables(
+            offs, T, num_experts, capacity
+        )
+        src_indices = packed[: num_experts * capacity]
+        dst_indices = packed[num_experts * capacity :]
+
+        b_2d_T = mat2.transpose(0, 1).contiguous()
+        zero_row = torch.zeros(1, K, dtype=mat2.dtype, device=mat2.device)
+        b_with_zero = torch.cat([b_2d_T, zero_row], dim=0)
+        padded_b_T = torch.index_select(b_with_zero, 0, src_indices).reshape(
+            num_experts, capacity, K
+        )
+        padded_b = padded_b_T.transpose(-1, -2).contiguous()
+
+        padded_out = torch.bmm(self, padded_b)
+        flat_padded_out_T = (
+            padded_out.transpose(1, 2).reshape(num_experts * capacity, M).contiguous()
+        )
+        out_T = torch.index_select(flat_padded_out_T, 0, dst_indices)
+        out = out_T.transpose(0, 1).contiguous()
+
+    elif a_is_2d and b_is_2d:
+        assert offs is not None, "2D x 2D grouped_mm requires offs"
+        num_experts = offs.shape[0]
+        M = self.shape[0]
+        K_total = self.shape[1]
+        N = mat2.shape[1]
+
+        capacity = _grouped_mm_capacity(K_total, num_experts)
+
+        packed = torch.ops.spyre.compute_grouped_mm_routing_tables(
+            offs, K_total, num_experts, capacity
+        )
+        src_indices = packed[: num_experts * capacity]
+
+        a_T = self.transpose(0, 1).contiguous()
+        zero_row_a = torch.zeros(1, M, dtype=self.dtype, device=self.device)
+        a_with_zero = torch.cat([a_T, zero_row_a], dim=0)
+        padded_a_T = torch.index_select(a_with_zero, 0, src_indices).reshape(
+            num_experts, capacity, M
+        )
+        padded_a = padded_a_T.transpose(-1, -2).contiguous()
+
+        zero_row_b = torch.zeros(1, N, dtype=mat2.dtype, device=mat2.device)
+        b_with_zero = torch.cat([mat2, zero_row_b], dim=0)
+        padded_b = torch.index_select(b_with_zero, 0, src_indices).reshape(
+            num_experts, capacity, N
+        )
+
+        out = torch.bmm(padded_a, padded_b)
+
+    return out
 
 
 @register_spyre_decompositions([torch.ops.aten.triu.default])

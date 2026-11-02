@@ -12,15 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Parser and perf-dispatch tests for .github/scripts/ingest_xml.py.
+"""Parser and perf-dispatch tests for spyre_clickhouse_ingest.results.
 
 The script is not a package module, so it is loaded by path. clickhouse_connect
 is stubbed before import. Parse tests need no ClickHouse; dispatch tests use a
 FakeClient.
 """
 
-import importlib.util
+import argparse
+import importlib
 import json
+import os
+import subprocess
 import sys
 import types
 from datetime import UTC, datetime
@@ -29,10 +32,6 @@ from xml.etree import ElementTree
 from xml.sax.saxutils import escape
 
 import pytest
-
-INGEST_PATH = (
-    Path(__file__).resolve().parents[1] / ".github" / "scripts" / "ingest_xml.py"
-)
 
 # The ingest imports the shared library from extensions/; it is in this repo, so put it on
 # sys.path rather than requiring an install for a parse-only test.
@@ -44,10 +43,7 @@ if str(_CHLIB) not in sys.path:
 @pytest.fixture(scope="module")
 def ingest():
     sys.modules.setdefault("clickhouse_connect", types.ModuleType("clickhouse_connect"))
-    spec = importlib.util.spec_from_file_location("ingest_xml", INGEST_PATH)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return importlib.import_module("spyre_clickhouse_ingest.results")
 
 
 def _write_xml(tmp_path, testcases: str) -> Path:
@@ -131,6 +127,104 @@ def test_metrics_absent_from_the_xml_stay_null(ingest, tmp_path):
     assert row["mem_size_mb"] is None
 
 
+def test_uncaptured_zero_metrics_are_not_stored_as_measurements(ingest):
+    """A metric the harness zero-filled on every record is absent, not measured."""
+    records = [
+        {
+            "operation_name": "a",
+            "spyre_ms": 1.0,
+            "pt_util_percent": 0.0,
+            "compile_ms": 0.0,
+        },
+        {
+            "operation_name": "b",
+            "spyre_ms": 2.0,
+            "pt_util_percent": 0.0,
+            "compile_ms": 0.0,
+        },
+    ]
+    for entry in ingest._bench_entries(records):
+        assert set(entry["measurements"]) == {"spyre_ms"}
+
+
+def test_a_zero_beside_captured_values_is_kept(ingest):
+    records = [
+        {"operation_name": "a", "pt_util_percent": 0.0, "memory_transfer_mean_ms": 0.0},
+        {
+            "operation_name": "b",
+            "pt_util_percent": 42.0,
+            "memory_transfer_mean_ms": 0.0,
+        },
+    ]
+    a, b = ingest._bench_entries(records)
+    assert a["measurements"]["pt_util_percent"] == [0.0]
+    assert b["measurements"]["pt_util_percent"] == [42.0]
+    # Not a zero-filled metric: an all-zero column is still a measurement.
+    assert a["measurements"]["memory_transfer_mean_ms"] == [0.0]
+
+
+def test_torch_spyre_ms_is_not_duplicated_into_measurements(ingest):
+    (entry,) = ingest._bench_entries(
+        [
+            {
+                "operation_name": "a",
+                "metric": "spyre_kernel_ms",
+                "duration_ms": 3.0,
+                "torch_spyre_ms": 3.0,
+            }
+        ]
+    )
+    assert entry["measurements"] == {"duration_ms": [3.0]}
+    assert entry["backend"] == "spyre"
+
+
+def test_report_records_fall_back_to_the_spyre_backend(ingest):
+    (report,) = ingest._bench_entries([{"operation_name": "a", "spyre_ms": 1.0}])
+    (sendnn,) = ingest._bench_entries([{"operation_name": "a", "sendnn_ms": 1.0}])
+    assert report["backend"] == "spyre"
+    assert sendnn["backend"] == "sendnn"
+
+
+@pytest.mark.parametrize(
+    ("argv", "component"),
+    [([], "torch-spyre"), (["--component", "hf-adapters"], "hf-adapters")],
+)
+def test_benchmarks_are_stamped_with_the_callers_component(
+    ingest, monkeypatch, tmp_path, argv, component
+):
+    xml = _write_suite(
+        tmp_path,
+        _hf_case(f"perf_matmul_wall_clock_ms_{SHAPES}", "12.5"),
+        version_info=FULL_PROVENANCE,
+    )
+    written = []
+    monkeypatch.setenv("CLICKHOUSE_DB_V2", "v2")
+    monkeypatch.setattr(ingest, "benchmark_tables_present", lambda *a: True)
+    monkeypatch.setattr(ingest, "benchmarks_already_ingested", lambda *a: False)
+    monkeypatch.setattr(
+        ingest,
+        "insert_benchmarks",
+        lambda client, db, comp, run_id, entries, **kw: written.append(comp)
+        or len(entries),
+    )
+    _run_main(
+        ingest,
+        monkeypatch,
+        xml,
+        FakeClient(dict(FULL_RUN_SCHEMA)),
+        extra_argv=[
+            "--trigger-type",
+            "perf",
+            "--schema",
+            "both",
+            "--gha-run-id",
+            "7",
+            *argv,
+        ],
+    )
+    assert written == [component]
+
+
 @pytest.mark.parametrize(
     "name",
     [
@@ -164,6 +258,13 @@ FULL_PROVENANCE = {
     "flex": {"commit": "def5678", "branch": "main"},
     "deeptools": {"commit": "aaa111", "branch": "master"},
     "spyre-comms": {"commit": "bbb222", "branch": "main"},
+}
+
+RPM_PROVENANCE = {
+    "torch-spyre": {"commit": "abc1234", "branch": "main", "version": None},
+    "flex/ibm-flex": {"commit": "def5678", "branch": "main"},
+    "deeptools/ibm-deeptools": {"commit": "aaa111", "branch": "master"},
+    "spyre-comms/ibm-spyre-comms": {"commit": "bbb222", "branch": "main"},
 }
 
 
@@ -342,6 +443,33 @@ def test_full_provenance_is_valid_and_regression_eligible(ingest):
     assert eligible == 1
 
 
+def test_rpm_provenance_keys_are_valid_and_regression_eligible(ingest):
+    """Prod version_info uses flex/ibm-flex etc.; must not classify incomplete."""
+    quality, eligible = ingest.classify_run_quality(json.dumps(RPM_PROVENANCE))
+    assert quality == "valid"
+    assert eligible == 1
+
+
+def test_rpm_provenance_missing_commit_is_incomplete(ingest):
+    missing = dict(RPM_PROVENANCE)
+    missing["flex/ibm-flex"] = {"commit": "N/A"}
+    assert ingest.classify_run_quality(json.dumps(missing)) == ("incomplete", 0)
+    empty = dict(RPM_PROVENANCE)
+    empty["deeptools/ibm-deeptools"] = {"commit": ""}
+    assert ingest.classify_run_quality(json.dumps(empty)) == ("incomplete", 0)
+    absent = dict(RPM_PROVENANCE)
+    del absent["spyre-comms/ibm-spyre-comms"]
+    assert ingest.classify_run_quality(json.dumps(absent)) == ("incomplete", 0)
+
+
+def test_bare_bad_commit_falls_through_to_rpm_alias(ingest):
+    """OR semantics: bare N/A must not block a good RPM commit (#4896)."""
+    payload = dict(FULL_PROVENANCE)
+    payload["flex"] = {"commit": "N/A"}
+    payload["flex/ibm-flex"] = {"commit": "def5678"}
+    assert ingest.classify_run_quality(json.dumps(payload)) == ("valid", 1)
+
+
 def test_incomplete_version_info_is_visible_not_regression_eligible(ingest):
     missing = dict(FULL_PROVENANCE)
     del missing["spyre-comms"]
@@ -417,6 +545,174 @@ def test_quality_columns_are_omitted_when_absent(ingest):
     _, rows, columns = client.inserts[0]
     assert "quality" not in columns
     assert "regression_eligible" not in columns
+    assert len(rows[0]) == len(columns)
+
+
+BACKFILL_RUN_SCHEMA = {
+    "benchmark_runs": list(FULL_RUN_SCHEMA["benchmark_runs"])
+    + [
+        "is_backfill",
+        "historical_measurement_timestamp",
+        "replay_timestamp",
+    ],
+}
+
+
+def test_parse_historical_measurement_rejects_unpadded(ingest):
+    with pytest.raises(ValueError, match="YYYY-MM-DD"):
+        ingest.parse_historical_measurement("2026-9-6")
+
+
+def test_parse_historical_measurement_utc_midnight(ingest):
+    dt = ingest.parse_historical_measurement("2026-09-16")
+    assert dt == datetime(2026, 9, 16, tzinfo=UTC)
+
+
+def test_parse_replay_timestamp_rejects_date_only(ingest):
+    # fromisoformat would accept this as midnight — must refuse.
+    with pytest.raises(ValueError, match="time component"):
+        ingest.parse_replay_timestamp("2026-10-07")
+
+
+def test_parse_replay_timestamp_accepts_iso_with_time(ingest):
+    dt = ingest.parse_replay_timestamp("2026-10-07T15:30:00Z")
+    assert dt == datetime(2026, 10, 7, 15, 30, 0, tzinfo=UTC)
+    dt_space = ingest.parse_replay_timestamp("2026-10-07 15:30:00")
+    assert dt_space == datetime(2026, 10, 7, 15, 30, 0, tzinfo=UTC)
+
+
+def test_build_backfill_meta_rejects_before_any_xml(ingest):
+    # main() calls this before connect / file loop — invalid CLI must raise here.
+    with pytest.raises(ValueError, match="time component"):
+        ingest.build_backfill_meta(
+            is_backfill=True,
+            historical_measurement="2026-09-16",
+            replay_timestamp="2026-10-07",
+        )
+    with pytest.raises(ValueError, match="YYYY-MM-DD"):
+        ingest.build_backfill_meta(
+            is_backfill=True,
+            historical_measurement="2026-9-6",
+            replay_timestamp="2026-10-07T15:30:00Z",
+        )
+
+
+def test_build_backfill_meta_forward_empty(ingest):
+    assert ingest.build_backfill_meta() == {}
+    # Explicit None is omitted (same as not passing the flags).
+    assert (
+        ingest.build_backfill_meta(historical_measurement=None, replay_timestamp=None)
+        == {}
+    )
+
+
+def test_build_backfill_meta_rejects_supplied_blank(ingest):
+    # Blank must not look like "omitted" — that would ingest as forward and
+    # source_file-dedup a corrected retry.
+    with pytest.raises(ValueError, match="supplied blank"):
+        ingest.build_backfill_meta(historical_measurement=" ")
+    with pytest.raises(ValueError, match="supplied blank"):
+        ingest.build_backfill_meta(historical_measurement="")
+    with pytest.raises(ValueError, match="supplied blank"):
+        ingest.build_backfill_meta(replay_timestamp="\t")
+    with pytest.raises(ValueError, match="supplied blank"):
+        ingest.build_backfill_meta(is_backfill=True, replay_timestamp="   ")
+
+
+def test_apply_backfill_args_sets_scalars_without_touching_created_at(ingest):
+    created = datetime(2026, 10, 7, 12, 0, 0, tzinfo=UTC)
+    run_meta = {"source_file": "report.xml", "created_at": created}
+    ingest.apply_backfill_args(
+        run_meta,
+        is_backfill=True,
+        historical_measurement="2026-09-16",
+        replay_timestamp="2026-10-07T15:30:00Z",
+    )
+    assert run_meta["is_backfill"] == 1
+    assert run_meta["historical_measurement_timestamp"] == datetime(
+        2026, 9, 16, tzinfo=UTC
+    )
+    assert run_meta["replay_timestamp"] == datetime(2026, 10, 7, 15, 30, 0, tzinfo=UTC)
+    # Rafael: created_at is never the historical-day signal.
+    assert run_meta["created_at"] == created
+    assert run_meta["created_at"] != run_meta["historical_measurement_timestamp"]
+
+
+def test_apply_backfill_args_noop_on_forward(ingest):
+    run_meta = {"source_file": "report.xml", "created_at": datetime.now(UTC)}
+    ingest.apply_backfill_args(run_meta)
+    assert "is_backfill" not in run_meta
+    assert "historical_measurement_timestamp" not in run_meta
+    assert "replay_timestamp" not in run_meta
+
+
+def test_backfill_columns_stored_when_present(ingest):
+    client = FakeClient(dict(BACKFILL_RUN_SCHEMA))
+    created = datetime(2026, 10, 7, 12, 0, 0, tzinfo=UTC)
+    hist = datetime(2026, 9, 16, tzinfo=UTC)
+    replay = datetime(2026, 10, 7, 15, 30, 0, tzinfo=UTC)
+    ingest.insert_benchmark_run(
+        client,
+        1,
+        {
+            "source_file": "report.xml",
+            "created_at": created,
+            "version_info": json.dumps(FULL_PROVENANCE),
+            "is_backfill": 1,
+            "historical_measurement_timestamp": hist,
+            "replay_timestamp": replay,
+        },
+    )
+    _, rows, columns = client.inserts[0]
+    assert "is_backfill" in columns
+    assert "historical_measurement_timestamp" in columns
+    assert "replay_timestamp" in columns
+    assert rows[0][columns.index("is_backfill")] == 1
+    assert rows[0][columns.index("historical_measurement_timestamp")] == hist.replace(
+        tzinfo=None
+    )
+    assert rows[0][columns.index("replay_timestamp")] == replay.replace(tzinfo=None)
+    assert rows[0][columns.index("created_at")] == created.replace(tzinfo=None)
+    assert (
+        rows[0][columns.index("created_at")]
+        != rows[0][columns.index("historical_measurement_timestamp")]
+    )
+
+
+def test_backfill_refuses_insert_when_schema_absent(ingest):
+    # Soft-dropping then inserting would source_file-dedup a post-migration retry.
+    client = FakeClient(dict(FULL_RUN_SCHEMA))
+    with pytest.raises(ingest.BackfillSchemaIncomplete, match="dashboard migration"):
+        ingest.insert_benchmark_run(
+            client,
+            1,
+            {
+                "source_file": "report.xml",
+                "created_at": datetime.now(UTC),
+                "version_info": json.dumps(FULL_PROVENANCE),
+                "is_backfill": 1,
+                "historical_measurement_timestamp": datetime(2026, 9, 16, tzinfo=UTC),
+                "replay_timestamp": datetime(2026, 10, 7, 15, 30, 0, tzinfo=UTC),
+            },
+        )
+    assert client.inserts == []
+
+
+def test_forward_insert_omits_backfill_keys(ingest):
+    client = FakeClient(dict(BACKFILL_RUN_SCHEMA))
+    ingest.insert_benchmark_run(
+        client,
+        1,
+        {
+            "source_file": "report.xml",
+            "created_at": datetime.now(UTC),
+            "version_info": json.dumps(FULL_PROVENANCE),
+        },
+    )
+    _, rows, columns = client.inserts[0]
+    assert "is_backfill" not in columns
+    assert "historical_measurement_timestamp" not in columns
+    assert "replay_timestamp" not in columns
     assert len(rows[0]) == len(columns)
 
 
@@ -562,7 +858,6 @@ def test_ingest_uses_the_shared_library_not_a_local_copy(ingest):
         "component_of",
         "run_id_for",
         "cases_already_ingested",
-        "insert_gha_artifact_result",
         "insert_test_results",
         "extract_properties",
         "promote_xpass",
@@ -579,25 +874,8 @@ def test_ingest_uses_the_shared_library_not_a_local_copy(ingest):
 # These cover what the ingest side does with it.
 
 _BASE = "2b397099-6200-52fb-98c4-b603961a0582"
-_AID = "8a4c410c-320d-5711-b987-c15b50bec3fc"
+_AID = "80c2d876-ee96-5c37-a8c5-460cab0686b4"
 _RUN_ID = "1a6080e8-d061-547f-ab63-1af99b18ad0c"
-
-
-def test_artifact_record_splits_into_its_three_fields(ingest):
-    assert ingest._parse_artifact_record(
-        f"{_AID}|{_BASE}|torch-spyre@07379f50,lxml"
-    ) == (
-        _AID,
-        _BASE,
-        "torch-spyre@07379f50,lxml",
-    )
-
-
-def test_a_bare_id_still_parses(ingest):
-    # Producer and parser are versioned independently; a format bump must not lose rows.
-    assert ingest._parse_artifact_record(_AID) == (_AID, "", "")
-    assert ingest._parse_artifact_record(f"{_AID}|{_BASE}") == (_AID, _BASE, "")
-    assert ingest._parse_artifact_record("") == ("", "", "")
 
 
 def test_a_leg_with_no_cases_is_an_error_not_a_failure(ingest):
@@ -626,17 +904,27 @@ class _ArtifactClient:
         self.inserts = []
 
     def query(self, sql, parameters=None):
-        return _Result([[0]])
+        return _Result([[0]] if "count()" in sql else [])
 
     def insert(self, table, rows, column_names=None, database=None):
         self.inserts.append((table, rows, column_names))
 
 
 def _args(**kw):
-    a = types.SimpleNamespace(
+    from spyre_clickhouse_ingest.options import add_artifact_options
+
+    parser = argparse.ArgumentParser()
+    add_artifact_options(
+        parser,
+        origin="promoted",
+        platform_alias=True,
+        arch_required=False,
+    )
+    a = parser.parse_args([])
+    a.__dict__.update(
         artifact_id=f"{_AID}|{_BASE}|torch-spyre@07379f50",
         component="torch-spyre",
-        platform="x86_64",
+        arch="x86_64",
         repository="torch-spyre/torch-spyre",
         branch="main",
         sha="07379f50",
@@ -658,6 +946,238 @@ def test_a_sharded_leg_reports_one_verdict_for_the_whole_run(ingest):
     assert row["state"] == "failed"
     assert row["duration_s"] == 12.5
     assert row["artifact_id"] == _AID
+
+
+def test_a_gha_record_registers_the_delta_chained_on_its_base(ingest):
+    c = _ArtifactClient()
+    legs = {(_RUN_ID, "regression"): {"failed": 0, "total": 2, "duration_s": 1.0}}
+    ingest._write_artifact_verdicts(c, "db", _args(), legs)
+    rows = {t: [dict(zip(cols, r)) for r in rs] for t, rs, cols in c.inserts}
+    (art,) = rows["artifacts"]
+    assert (art["artifact_id"], art["origin"], art["identity_deps"]) == (
+        _AID,
+        "built",
+        [f"base={_BASE}"],
+    )
+    assert art["props"]["source"] == "gha"
+    assert "artifact_refs" not in rows
+
+
+def test_a_gha_record_minted_under_another_component_is_refused(ingest):
+    # Its fields hash to a different id: writing it would file a row its id cannot name.
+    c = _ArtifactClient()
+    legs = {(_RUN_ID, "regression"): {"failed": 0, "total": 2, "duration_s": 1.0}}
+    ingest._write_artifact_verdicts(c, "db", _args(component="hf-adapters"), legs)
+    assert c.inserts == []
+
+
+def test_a_capability_verdict_is_filed_under_the_capability_kind(ingest):
+    c = _ArtifactClient()
+    legs = {(_RUN_ID, "model_ops"): {"failed": 0, "total": 5, "duration_s": 2.0}}
+    ingest._write_artifact_verdicts(c, "db", _args(), legs)
+    (res,) = [
+        dict(zip(cols, r))
+        for t, rs, cols in c.inserts
+        if t == "artifact_results"
+        for r in rs
+    ]
+    assert (res["test_type"], res["result_kind"]) == ("model_ops", "capability")
+
+
+@pytest.mark.parametrize(
+    ("event", "branch", "pr", "tags"),
+    [
+        ("push", "main", "0", [("torch-spyre@07379f50aaaa", "main")]),
+        (
+            "pull_request",
+            "fix",
+            "5200",
+            [("torch-spyre#5200", "pr"), ("torch-spyre#5200@07379f50aaaa", "pr")],
+        ),
+        ("push", "release-0.5", "0", []),
+        ("workflow_dispatch", "main", "0", []),
+        (
+            "schedule",
+            "main",
+            "0",
+            [("torch-spyre@07379f50aaaa", "main"), ("nightly-2026-10-09", "nightly")],
+        ),
+    ],
+)
+def test_a_gha_delta_is_tagged_as_its_ci_event_built_it(
+    ingest, event, branch, pr, tags
+):
+    from datetime import date
+
+    c = _ArtifactClient()
+    legs = {(_RUN_ID, "model_ops"): {"failed": 0, "total": 5, "duration_s": 2.0}}
+    args = _args(
+        ci_event=event,
+        branch=branch,
+        pr_number=pr,
+        sha="07379f50aaaa" + "0" * 28,
+        tag_date=date(2026, 10, 9),
+    )
+    assert ingest._write_artifact_verdicts(c, "db", args, legs)
+    rows = [(t, dict(zip(cols, r))) for t, rs, cols in c.inserts for r in rs]
+    got = [(r["tag"], r["tag_family"]) for t, r in rows if t == "artifact_tags"]
+    assert got == tags
+    assert {r["artifact_id"] for t, r in rows if t == "artifact_tags"} <= {_AID}
+    assert sum(t == "artifact_results" for t, _ in rows) == 1
+
+
+def test_a_named_image_is_registered_tagged_and_judged(ingest):
+    # --artifact names what a Jenkins leg ran; the verdict lands on that image, tagged.
+    c = _ArtifactClient()
+    legs = {(_RUN_ID, "svt"): {"failed": 0, "total": 4, "duration_s": 3.0}}
+    image = "registry.example.com/team/hf-adapters-devel@sha256:" + "ab" * 32
+    args = _args(
+        artifact_id="",
+        artifact=f"image:{image}",
+        arch="s390x",
+        jenkins_run_key="job#1",
+        run_url="https://ci.example.com/job/1/",
+        tags=["release-2026-09-22"],
+        tag_family="release",
+    )
+    ingest._write_artifact_verdicts(c, "db", args, legs)
+    rows = {t: [dict(zip(cols, r)) for r in rs] for t, rs, cols in c.inserts}
+    (art,) = rows["artifacts"]
+    assert (art["component"], art["artifact_name"], art["props"]["id12"]) == (
+        "hf-adapters",
+        "hf-adapters-devel",
+        "ab" * 6,
+    )
+    assert [t["tag"] for t in rows["artifact_tags"]] == ["release-2026-09-22"]
+    assert (
+        art["props"]["source"]
+        == rows["artifact_tags"][0]["props"]["source"]
+        == "jenkins"
+    )
+    (res,) = rows["artifact_results"]
+    assert (res["artifact_id"], res["test_type"], res["state"]) == (
+        art["artifact_id"],
+        "svt",
+        "passed",
+    )
+    assert res["props"] == {
+        "run_url": "https://ci.example.com/job/1/",
+        "source": "jenkins",
+    }
+
+
+def test_an_icr_image_with_no_registry_credentials_still_gets_its_verdict(
+    ingest, monkeypatch
+):
+    # The spyre-test-framework shape: a per-arch icr.io digest, no ICR_* in the container.
+    import urllib.error
+
+    from spyre_clickhouse_ingest.registry import Registry
+
+    class Unauthorized(Registry):
+        def _get(self, repo, path, accept=""):
+            raise urllib.error.HTTPError(path, 401, "Unauthorized", {}, None)
+
+    monkeypatch.setattr(Registry, "from_env", lambda: Unauthorized())
+    c = _ArtifactClient()
+    legs = {(_RUN_ID, "fvt"): {"failed": 0, "total": 4, "duration_s": 3.0}}
+    image = "icr.io/example/2.0/prod/hf-adapters-devel@sha256:" + "ab" * 32
+    args = _args(artifact_id="", artifact=f"image:{image}", arch="s390x",
+                 jenkins_run_key="job#1", run_url="https://ci.example.com/job/1/")  # fmt: skip
+    ingest._write_artifact_verdicts(c, "db", args, legs)
+    rows = {t: [dict(zip(cols, r)) for r in rs] for t, rs, cols in c.inserts}
+    (art,) = rows["artifacts"]
+    (res,) = rows["artifact_results"]
+    assert (art["artifact_name"], art["props"]["id12"]) == (
+        "hf-adapters-devel",
+        "ab" * 6,
+    )
+    assert res["artifact_id"] == art["artifact_id"]
+
+
+def _named_image_args(**kw):
+    image = "registry.example.com/team/hf-adapters-devel@sha256:" + "ab" * 32
+    return _args(artifact_id="", artifact=f"image:{image}", arch="s390x",
+                 jenkins_run_key="job#1", **kw)  # fmt: skip
+
+
+@pytest.mark.parametrize("tag", ["v1.2", "nighlty-2026-10-08"])
+def test_a_tag_naming_no_family_is_filed_under_misc_with_a_warning(ingest, capsys, tag):
+    c = _ArtifactClient()
+    legs = {(_RUN_ID, "svt"): {"failed": 0, "total": 1, "duration_s": 1.0}}
+    args = _named_image_args(tags=[tag])
+    assert ingest._write_artifact_verdicts(c, "db", args, legs)
+    rows = {t: [dict(zip(cols, r)) for r in rs] for t, rs, cols in c.inserts}
+    assert [(t["tag"], t["tag_family"]) for t in rows["artifact_tags"]] == [
+        (tag, "misc")
+    ]
+    assert len(rows["artifact_results"]) == 1
+    assert args.misc_tags == [tag]
+    assert capsys.readouterr().err.count(f"tag {tag!r} names no tag family") == 1
+
+
+def test_an_explicit_misc_tag_is_no_fallback(ingest, capsys):
+    c = _ArtifactClient()
+    legs = {(_RUN_ID, "svt"): {"failed": 0, "total": 1, "duration_s": 1.0}}
+    args = _named_image_args(tags=["v1.2"], tag_family="misc")
+    assert ingest._write_artifact_verdicts(c, "db", args, legs)
+    rows = {t: [dict(zip(cols, r)) for r in rs] for t, rs, cols in c.inserts}
+    assert [(t["tag"], t["tag_family"]) for t in rows["artifact_tags"]] == [
+        ("v1.2", "misc")
+    ]
+    assert args.misc_tags == [] and "names no tag family" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("strict, code", [(False, None), (True, 1)])
+def test_strict_fails_on_a_misc_fallback(ingest, monkeypatch, tmp_path, strict, code):
+    xml = tmp_path / "report.xml"
+    xml.write_text("<testsuites><testsuite name='pytest'><testcase classname='tests.test_ops' "
+                   "name='test_a' time='1'/></testsuite></testsuites>", encoding="utf-8")  # fmt: skip
+
+    def verdicts(c, db, args, legs):
+        args.misc_tags = ["v1.2"]
+        return True
+
+    monkeypatch.setattr(ingest, "_write_artifact_verdicts", verdicts)
+    argv = ["--strict"] if strict else []
+    if code is None:
+        _run_main(ingest, monkeypatch, xml, FakeClient(dict(FULL_RUN_SCHEMA)), argv)
+        return
+    with pytest.raises(SystemExit) as caught:
+        _run_main(ingest, monkeypatch, xml, FakeClient(dict(FULL_RUN_SCHEMA)), argv)
+    assert caught.value.code == code
+
+
+def test_a_tag_that_cannot_be_filed_costs_the_tag_not_the_verdicts(ingest):
+    c = _ArtifactClient()
+    legs = {(_RUN_ID, "svt"): {"failed": 0, "total": 1, "duration_s": 1.0}}
+    args = _named_image_args(tags=["v1.2"], tag_family="no-such-family")
+    assert ingest._write_artifact_verdicts(c, "db", args, legs)
+    rows = {t: [dict(zip(cols, r)) for r in rs] for t, rs, cols in c.inserts}
+    assert "artifact_tags" not in rows
+    assert len(rows["artifact_results"]) == 1
+
+
+def test_a_bad_tag_costs_only_itself(ingest):
+    c = _ArtifactClient()
+    legs = {(_RUN_ID, "svt"): {"failed": 0, "total": 1, "duration_s": 1.0}}
+    args = _named_image_args(tags=["release-2026-10-08", ("v1.2", "no-such-family")])
+    assert ingest._write_artifact_verdicts(c, "db", args, legs)
+    rows = {t: [dict(zip(cols, r)) for r in rs] for t, rs, cols in c.inserts}
+    assert [(t["tag"], t["tag_family"]) for t in rows["artifact_tags"]] == [
+        ("release-2026-10-08", "release")
+    ]
+    assert len(rows["artifact_results"]) == 1
+
+
+def test_verdicts_that_were_not_recorded_are_reported_for_strict(ingest):
+    c = _ArtifactClient()
+    legs = {(_RUN_ID, "svt"): {"failed": 0, "total": 1, "duration_s": 1.0}}
+    unrecorded = "6f1ab3e2-0000-5000-8000-000000000000"
+    assert not ingest._write_artifact_verdicts(
+        c, "db", _args(artifact_id=unrecorded), legs
+    )
+    assert ingest._write_artifact_verdicts(c, "db", _args(artifact_id=""), legs)
 
 
 def test_no_artifact_id_writes_nothing(ingest):
@@ -684,3 +1204,150 @@ def test_a_write_failure_never_propagates(ingest):
 
     legs = {(_RUN_ID, "regression"): {"failed": 0, "total": 1, "duration_s": 1.0}}
     ingest._write_artifact_verdicts(Boom(), "db", _args(), legs)
+
+
+def test_a_repeated_testcase_is_one_row_and_the_last_attempt_wins(ingest, tmp_path):
+    path = tmp_path / "suite.xml"
+    path.write_text(
+        "<testsuites><testsuite name='pytest'>"
+        "<testcase classname='c' name='test_a' time='1'><failure message='x'/></testcase>"
+        "<testcase classname='c' name='test_b' time='2'/>"
+        "<testcase classname='c' name='test_a' time='3'/>"
+        "<testcase classname='c' name='test_B' time='4'/>"
+        "</testsuite></testsuites>",
+        encoding="utf-8",
+    )
+    run, cases = ingest.parse_test_xml(path)
+    by_name = {c["name"]: c for c in cases}
+    # Exact match only: test_b and test_B are different tests.
+    assert sorted(by_name) == ["test_B", "test_a", "test_b"]
+    assert by_name["test_a"]["status"] == "passed"
+    assert by_name["test_a"]["duration_s"] == 3.0
+    assert run["total_tests"] == 3
+    assert run["failed"] == 0
+
+
+def test_capability_cases_add_a_leg_per_declared_test_type(ingest):
+    def case(status, name="aten.mm"):
+        props = [
+            ("capability.test_type", "model_ops"),
+            ("capability.subject", "m"),
+            ("capability.name", name),
+        ]
+        return {"status": status, "duration_s": 1.5, "properties": props}
+
+    legs: dict = {}
+    plain = {"status": "passed", "properties": [("tag", "op__mm")]}
+    cases = [case("xfail"), case("failed"), case("skipped"), case("passed", ""), plain]
+    ingest._capability_legs(legs, "r1", cases)
+    assert legs == {("r1", "model_ops"): {"failed": 1, "total": 2, "duration_s": 3.0}}
+    assert [t for _, t, _ in ingest._admitted_legs(legs)] == ["model_ops"]
+
+
+def test_capability_legs_without_an_artifact_id_write_nothing(ingest):
+    # The verdicts themselves are written by insert_test_results; only the leg needs the id.
+    legs: dict = {}
+    props = [
+        ("capability.test_type", "model_ops"),
+        ("capability.subject", "m"),
+        ("capability.name", "aten.mm"),
+    ]
+    ingest._capability_legs(legs, _RUN_ID, [{"status": "passed", "properties": props}])
+    c = _ArtifactClient()
+    ingest._write_artifact_verdicts(c, "db", _args(artifact_id=""), legs)
+    assert legs and c.inserts == []
+
+
+def test_a_rerun_count_rides_on_the_final_attempt(ingest, tmp_path):
+    # pytest-rerunfailures' shape: each failed attempt is a bare repeat of the testcase.
+    path = tmp_path / "suite.xml"
+    path.write_text(
+        "<testsuites><testsuite name='pytest' tests='2'>"
+        "<testcase classname='c' name='test_flaky'/>"
+        "<testcase classname='c' name='test_flaky'/>"
+        "<testcase classname='c' name='test_flaky'/>"
+        "<testcase classname='c' name='test_once'/>"
+        "</testsuite></testsuites>",
+        encoding="utf-8",
+    )
+    run, cases = ingest.parse_test_xml(path)
+    props = {c["name"]: dict(c["properties"]) for c in cases}
+    assert props["test_flaky"] == {"result.reruns": "2"}
+    assert props["test_once"] == {}
+    assert run["total_tests"] == 2
+
+
+def test_the_tag_date_defaults_to_the_runs_start_day(ingest, monkeypatch, tmp_path):
+    xml = tmp_path / "report.xml"
+    xml.write_text(
+        "<testsuites><testsuite name='pytest' timestamp='2026-10-04T23:50:00+00:00'>"
+        "<testcase classname='tests.test_ops' name='test_a' time='1'/>"
+        "</testsuite></testsuites>",
+        encoding="utf-8",
+    )
+    seen = []
+    monkeypatch.setattr(
+        ingest, "_write_artifact_verdicts", lambda c, db, args, legs: seen.append(args)
+    )
+    _run_main(ingest, monkeypatch, xml, FakeClient(dict(FULL_RUN_SCHEMA)))
+    _run_main(ingest, monkeypatch, xml, FakeClient(dict(FULL_RUN_SCHEMA)),
+              ["--tag-date", "2026-09-26"])  # fmt: skip
+    assert [str(a.tag_date) for a in seen] == ["2026-10-04", "2026-09-26"]
+
+
+def test_the_deprecated_script_path_forwards_to_the_package():
+    shim = Path(__file__).resolve().parents[1] / ".github" / "scripts" / "ingest_xml.py"
+    env = {**os.environ, "PYTHONPATH": str(_CHLIB)}
+    # Run as `python <shim>`, with the driver stubbed as the in-process fixture does: the test
+    # images carry no clickhouse_connect, and --help never connects.
+    run = (
+        "import runpy, sys, types; "
+        "sys.modules.setdefault('clickhouse_connect', types.ModuleType('clickhouse_connect')); "
+        "sys.argv = sys.argv[1:]; runpy.run_path(sys.argv[0], run_name='__main__')"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", run, str(shim), "--help"],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert out.returncode == 0, out.stderr
+    assert "spyre_clickhouse_ingest results" in out.stdout
+    assert "[deprecated]" in out.stderr
+
+
+def test_capability_legs_only_leaves_the_leg_verdict_to_the_orchestrator(ingest):
+    c = _ArtifactClient()
+    legs = {
+        (_RUN_ID, "regression"): {"failed": 1, "total": 9, "duration_s": 2.0},
+        (_RUN_ID, "model_modules"): {"failed": 0, "total": 4, "duration_s": 1.0},
+    }
+    assert ingest._write_artifact_verdicts(
+        c, "db", _args(capability_legs_only=True), legs
+    )
+    rows = [
+        dict(zip(cols, r))
+        for t, rs, cols in c.inserts
+        if t == "artifact_results"
+        for r in rs
+    ]
+    assert [(r["test_type"], r["result_kind"]) for r in rows] == [
+        ("model_modules", "capability")
+    ]
+
+
+def test_capability_legs_only_with_no_capability_leg_writes_nothing(ingest):
+    c = _ArtifactClient()
+    legs = {(_RUN_ID, "regression"): {"failed": 0, "total": 9, "duration_s": 2.0}}
+    assert ingest._write_artifact_verdicts(
+        c, "db", _args(capability_legs_only=True), legs
+    )
+    assert c.inserts == []
+
+
+def test_capability_legs_only_skips_the_tier_the_orchestrator_already_judges(ingest):
+    c = _ArtifactClient()
+    legs = {(_RUN_ID, "model_ops"): {"failed": 0, "total": 4, "duration_s": 1.0}}
+    args = _args(capability_legs_only=True, trigger_type="model_ops")
+    assert ingest._write_artifact_verdicts(c, "db", args, legs)
+    assert c.inserts == []

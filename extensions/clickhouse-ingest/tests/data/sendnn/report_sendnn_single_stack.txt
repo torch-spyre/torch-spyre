@@ -1,0 +1,9 @@
+Op: softmax  Shape: [[4, 1, 4096]]
+Metric                             sendnn
+------------------------------------------
+wall_clock_ms.mean_ms                  2.000
+cpu_ms.mean_ms                         1.500
+spyre_ms.mean_ms                       0.400
+kernel_ms.mean_ms                      0.100
+memory_transfer_ms.mean_ms             0.300
+pt_util%                               0.000

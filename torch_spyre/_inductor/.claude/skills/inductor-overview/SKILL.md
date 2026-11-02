@@ -66,7 +66,7 @@ assuming from the allocation kind alone.
 
 ## `WrapperHandler` swaps must account for stride, not just name
 
-CLAUDE.md's "wrap, never reconstruct" rule for `ComputedBuffer.inner_fn`
+AGENTS.md's "wrap, never reconstruct" rule for `ComputedBuffer.inner_fn`
 covers *why* to use a `WrapperHandler`. The failure mode to watch for once
 you're using one: a plain `NameSwapHandler`-style rename forwards a
 consumer's load index **unmodified**. That's correct when the old and new
@@ -93,5 +93,5 @@ for the specific suites to run locally instead.
 
 ## Adding to this skill
 
-Follow the top-level `CLAUDE.md` conventions for `SKILL.md` frontmatter:
+Follow the top-level `AGENTS.md` conventions for `SKILL.md` frontmatter:
 a quoted single-line `description`, not a multi-line `>-` block scalar.

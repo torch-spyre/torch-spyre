@@ -62,6 +62,19 @@ inputs:
     description: Whether to pass --parallel to run_test.sh (disable for distributed torchrun tests)
     required: false
     default: 'true'
+  retried:
+    description: >
+      Set to 'pod' by the pod-level retry jobs. Every testcase in junit_xml_path is then marked
+      result.retried=pod, as it is with 'stall' when this action's own stall retry runs: a
+      retry overwrites the report, so the mark is the only record that it happened.
+    required: false
+    default: ''
+  replaced_junit_xml:
+    description: >
+      With `retried`, the report this retry replaces (the earlier attempt's). Cases that failed
+      there get result.prior_status/result.prior_message, so a failure the retry fixed is kept.
+    required: false
+    default: ''
 
 runs:
   using: composite
@@ -74,6 +87,8 @@ runs:
         STALL_TIMEOUT_SECS: ${{ inputs.stall_timeout_secs }}
         STALL_CHECK_INTERVAL: ${{ inputs.stall_check_interval }}
         CARD_RELEASE_TIMEOUT_SECS: ${{ inputs.card_release_timeout_secs }}
+        RETRIED_AS: ${{ inputs.retried }}
+        REPLACED_XML: ${{ inputs.replaced_junit_xml }}
       run: |-
         set +e
         set +o pipefail
@@ -281,6 +296,28 @@ runs:
           rm -f "$log_file" "$stall_flag" "${stall_flag}.done" "${stall_flag}.stalled"
         }
 
+        # On every exit path, innermost retry first; the exit status is left unchanged.
+        _STALL_RETRIED=0
+        _mark_retried() {
+          local _xml="${{ inputs.junit_xml_path }}"
+          # This action's own checkout first: a prebaked image's tree can predate the helper.
+          local _rel=extensions/clickhouse-ingest/spyre_clickhouse_ingest/mark_retried.py
+          local _helper="${GITHUB_ACTION_PATH}/../../../${_rel}"
+          [[ -f "$_helper" ]] || _helper="${TORCH_SPYRE_DIR}/${_rel}"
+          [[ -f "$_helper" ]] || _helper="${TORCH_SPYRE_DIR}/tests/oot_framework/utils/mark_retried.py"
+          [[ -n "$_xml" && -f "$_xml" && -f "$_helper" ]] || return 0
+          [[ $_STALL_RETRIED -eq 1 ]] && python3 "$_helper" stall "$_xml"
+          if [[ -n "${RETRIED_AS}" ]]; then
+            if [[ -f "${REPLACED_XML}" ]]; then
+              python3 "$_helper" "${RETRIED_AS}" "$_xml" "${REPLACED_XML}"
+            else
+              python3 "$_helper" "${RETRIED_AS}" "$_xml"
+            fi
+          fi
+          return 0
+        }
+        trap _mark_retried EXIT
+
         echo "=== Attempt 1/2: ${{ inputs.suite_name }} ==="
         run_attempt ""
 
@@ -332,6 +369,7 @@ runs:
         # failure signature on attempt 2 as the same transient race and give
         # it a few short-backoff device-open retries before giving up.
         _DEVICE_OPEN_RETRY_MAX=3
+        _STALL_RETRIED=1
         for ((_i = 1; _i <= _DEVICE_OPEN_RETRY_MAX; _i++)); do
           echo "=== Attempt 2/2 (stall retry, device-open try ${_i}/${_DEVICE_OPEN_RETRY_MAX}): ${{ inputs.suite_name }} ==="
           run_attempt "-n1"
