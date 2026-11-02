@@ -481,7 +481,6 @@ class CustomPreSchedulingPasses:
             # insert_restickify would have to pad a restickify output, whose
             # device layout and index expressions cannot be reconciled with a
             # grown host extent.
-            track_padding_value,
             insert_bmm_padding,
             #
             # Tensor Layout (Stickification)
@@ -491,6 +490,7 @@ class CustomPreSchedulingPasses:
             optimize_restickify_locations,
             reorder_nonstick_dims,
             finalize_layouts,
+            track_padding_value,
             # insert_restickify's advance-transfer logic (see its own
             # docstring) branches on whether old_name already has
             # `loop_info` stamped, to decide whether the per-trip advance

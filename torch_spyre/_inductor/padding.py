@@ -57,7 +57,7 @@ import math
 import operator
 
 import sympy
-from sympy import FiniteSet, Interval, S, Set, oo
+from sympy import FiniteSet, Interval, S, Set, oo, EmptySet
 
 import torch
 from sympy import Expr
@@ -65,6 +65,8 @@ from torch._inductor.dtype_propagation import DtypePropagationOpsHandler
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
+    IRNode,
+    Layout,
     Buffer,
     ComputedBuffer,
     InputBuffer,
@@ -74,6 +76,8 @@ from torch._inductor.ir import (
     Reduction,
     InputsKernel,
     MutableBox,
+    MutationLayoutSHOULDREMOVE,
+    ReinterpretView,
 )
 from torch._inductor.ops_handler import DefaultHandler, WrapperHandler
 from torch._inductor.virtualized import V
@@ -1640,16 +1644,45 @@ def _index_syms(n: int) -> tuple[sympy.Symbol, ...]:
     return tuple(sympy.Symbol(f"_i{k}") for k in range(n))
 
 
+def is_padded(node: IRNode | Layout | SpyreTensorLayout):
+    if isinstance(node, IRNode):
+        node = node.get_layout()
+    if isinstance(node, Layout):
+        assert isinstance(node, FixedTiledLayout), "Expected finalized tiled layout"
+        node = node.device_layout
+
+    total_valid_elems = math.prod(node.valid_elements.values())
+    total_size = math.prod(node.device_size)
+
+    return total_valid_elems < total_size
+
+
 def track_padding_value(graph: GraphLowering) -> None:
     operations = graph.operations
+
+    resolved_mutations: dict[str, dict[str, bool]] = {}
+    # Collect mutation buffers
+    for op in list(operations):
+        if isinstance(op, ComputedBuffer) and isinstance(
+            op.layout, MutationLayoutSHOULDREMOVE
+        ):
+            target = op.layout.target
+            while isinstance(target, ReinterpretView):
+                target = target.data
+            target_name = target.maybe_get_name()
+            if target_name is not None:
+                resolved_mutations.setdefault(target_name, {})
+                resolved_mutations[target_name][op.name] = False
 
     tracer = DomainRangeTracer()
     with V.set_ops_handler(SetDtypeTracer(tracer)):
         for op in list(operations):
+            padded = is_padded(op)
             tracer.current_op = op
             reads = op.get_read_writes().reads
 
             input_buffers = list[tuple[str, Buffer]]()
+            input_padding = list[bool]()
             for dep in reads:
                 buf = graph.get_buffer(dep.name)
                 while isinstance(buf, MutableBox):
@@ -1662,9 +1695,20 @@ def track_padding_value(graph: GraphLowering) -> None:
                         f"Nodes seen out of order, expected {dep.name} to have been visited"
                     )
 
+                if dep.name in resolved_mutations:
+                    for mut, resolved in resolved_mutations[dep.name].items():
+                        assert resolved, (
+                            f"Mutation target {dep.name} seen before mutation buffer {mut}"
+                        )
+
                 input_buffers.append((dep.name, buf))
+                input_padding.append(is_padded(buf))
+            any_input_padded = any(p for p in input_padding)
 
             if isinstance(op, InputsKernel):
+                if not padded:
+                    tracer.buffer_range[op.name] = EmptySet
+                    continue
                 if isinstance(op, SpyreConstantFallback):
                     tracer.buffer_range[op.name] = FiniteSet(op.constant_args[0])
                     continue
@@ -1691,6 +1735,12 @@ def track_padding_value(graph: GraphLowering) -> None:
 
             op.annotations["do_coord_mask"] = False
             op.annotations["do_pad"] = False
+
+            # Even if the output of this op is not padded, we need to run
+            # the input validation if there are padded inputs
+            if not padded and not any_input_padded:
+                tracer.buffer_range[op.name] = EmptySet
+                continue
 
             # Loop until we can either allow the inputs to pass unmodified or
             # find a suitable padding. So the max iteration count is 1 for the
@@ -1736,13 +1786,48 @@ def track_padding_value(graph: GraphLowering) -> None:
             else:
                 raise ValueError("Infinite loop")
 
+            if not padded:
+                tracer.buffer_range[op.name] = EmptySet
+
             if op.annotations.get("do_coord_mask", False) or op.annotations.get(
                 "do_pad", False
             ):
                 pad_set = tracer.buffer_range[op.name]
-                op.annotations["pad_value"] = float(pick_element(pad_set))
+                if not padded:
+                    # set the propagated output padding
+                    op.annotations["pad_value"] = float(pick_element(pad_set))
 
                 input_pad_values = dict[str, float]()
                 for arg_name, pad_set in tracer.buffer_input[op.name].items():
                     input_pad_values[arg_name] = float(pick_element(pad_set))
                 op.annotations["pad_values"] = input_pad_values
+
+            if isinstance(op, ComputedBuffer) and isinstance(
+                op.layout, MutationLayoutSHOULDREMOVE
+            ):
+                target = op.layout.target
+                while isinstance(target, ReinterpretView):
+                    target = target.data
+                target_name = target.maybe_get_name()
+                if target_name is not None:
+                    assert target_name in tracer.buffer_range, (
+                        f"Mutation buffer {op} seen before the buffer it mutates {target_name}"
+                    )
+
+                    if not is_padded(target):
+                        tracer.buffer_range[target_name] = EmptySet
+                        resolved_mutations[target_name][op.name] = True
+                        continue
+
+                    # If we're here it means that the target is padded.
+                    # Without deeper analysis we don't know if the values written into the
+                    # destination padding come from source padding or valid elements.
+                    # Set the resulting to all possible inputs united with what could
+                    # be in the mutation source buffer padding.
+                    user_data = S.Reals
+                    if padding_strict_mode:
+                        user_data = user_data.union(FiniteSet(S.NaN))
+                    pad_set = tracer.buffer_range[op.name]
+                    tracer.buffer_range[target_name] = user_data.union(pad_set)
+
+                    resolved_mutations[target_name][op.name] = True
