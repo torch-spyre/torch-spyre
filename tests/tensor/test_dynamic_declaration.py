@@ -185,6 +185,19 @@ class TestDynamicDeclarationValidation(TestCase):
                 dynamic={0: {"min": 70, "max": 630, "granularity": 70}},
             )
 
+    def test_reserved_transfer_warns_about_compiled_kernels(self) -> None:
+        # The buffer is reserved at max, but compiled kernels are not yet built
+        # for the reserved size. The transfer says so instead of staying silent.
+        with self.assertWarns(UserWarning) as cm:
+            self.x.to(DEVICE, dynamic={0: {"min": 70, "max": 630, "granularity": 70}})
+        self.assertIn("compiled", str(cm.warning))
+
+    def test_non_dict_spec_rejected(self) -> None:
+        # The per-dim declaration must be a dict, not a bare number/list/None.
+        for spec in (5, None, [70, 630], "max"):
+            with self.assertRaisesRegex(ValueError, "expected a dict"):
+                self.x.to(DEVICE, dynamic={0: spec})
+
     def test_bool_dim_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "must be an int"):
             self.x.to(DEVICE, dynamic={True: {"min": 70, "max": 630}})

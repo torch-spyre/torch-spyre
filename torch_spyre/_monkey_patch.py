@@ -198,6 +198,8 @@ def _parse_dynamic_to_args(self, args, kwargs):
 
 def _transfer_reserved(src, spec: _DynamicSpec) -> "torch.Tensor":
     """Allocate at the ceiling, copy the real data in, mark the dim dynamic."""
+    import warnings
+
     import torch
 
     # This path calls spyre_empty_reserved directly via pybind11, bypassing
@@ -225,16 +227,25 @@ def _transfer_reserved(src, spec: _DynamicSpec) -> "torch.Tensor":
     )
     copy_tensor(src, dst, non_blocking=False)
 
-    # mark_dynamic must be called eager, pre-compile, so Dynamo treats
-    # `dim` as symbolic from the very first trace.
+    warnings.warn(
+        'tensor.to("spyre", dynamic=...) reserves the buffer at max, but compiled '
+        "kernels are still built for the size at first compile, so running a "
+        "compiled function at another size returns wrong values without an "
+        "error. Tracked in #<issue>.",
+        UserWarning,
+        stacklevel=3,
+    )
+
+    # mark_dynamic must run eagerly, before any compile, so Dynamo treats
+    # `dim` as symbolic from the first trace.
     #
-    # Deliberately bare: no min=/max= here. Passing them installs a
-    # StrictMinMaxConstraint, which promises every value in that range is
-    # valid. The granularity check the compiler adds later (size %
-    # granularity == 0) then looks like it's violating that promise for a
-    # non-multiple size, raising ConstraintViolationError instead of a
-    # normal guard miss. The range is still declared -- just via
-    # torch._check inside the traced function, not here.
+    # Bare on purpose. min=/max= install a StrictMinMaxConstraint, and the
+    # divisibility check for_each_tile records (torch._check(length %
+    # tile_size == 0), wsr/for_each_tile.py) then raises
+    # ConstraintViolationError, because not every value in the range is a
+    # multiple. The declared range reaches the compiler through
+    # get_reserved_dims instead, read once per compile by a later compiler
+    # change, which emits the range checks inside the trace.
     torch._dynamo.mark_dynamic(dst, spec.dim)
     return dst
 
