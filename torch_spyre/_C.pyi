@@ -27,6 +27,10 @@ __all__: list[str] = [
     "stream_get_error_string",
     "synchronize",
     "as_strided_with_layout",
+    "reinterpret_tensor_with_layout",
+    "CompositeChunkInfo",
+    "CompositeAddressHandle",
+    "get_composite_address",
     "empty_with_layout",
     "copy_tensor",
     "fill_tensor",
@@ -204,6 +208,16 @@ class SpyreTensorLayout:
         stride_map: collections.abc.Sequence[typing.SupportsInt],
         device_dtype: DataFormats,
         element_arrangement: ElementArrangement = ElementArrangement.STANDARD,
+        valid_elements: dict[tuple[int, ...], int] = {},
+    ) -> None: ...
+    @typing.overload
+    def __init__(
+        self,
+        device_size: collections.abc.Sequence[typing.SupportsInt],
+        stride_map: collections.abc.Sequence[typing.SupportsInt],
+        device_dtype: DataFormats,
+        valid_elements: dict[tuple[int, ...], int],
+        element_arrangement: ElementArrangement = ElementArrangement.STANDARD,
     ) -> None: ...
     def __repr__(self) -> str: ...
     def __str__(self) -> str: ...
@@ -219,6 +233,8 @@ class SpyreTensorLayout:
     def element_arrangement(self) -> ElementArrangement: ...
     @property
     def stride_map(self) -> list[int]: ...
+    @property
+    def valid_elements(self) -> dict[tuple[int, ...], int]: ...
 
 class _SpyreStreamBase:
     """
@@ -310,6 +326,55 @@ def as_strided_with_layout(
     arg3: typing.SupportsInt | None,
     arg4: SpyreTensorLayout,
 ) -> torch.Tensor: ...
+def reinterpret_tensor_with_layout(
+    arg0: torch.Tensor,
+    arg1: tuple[int, ...],
+    arg2: tuple[int, ...],
+    arg3: typing.SupportsInt,
+    arg4: SpyreTensorLayout,
+) -> torch.Tensor: ...
+
+class CompositeChunkInfo:
+    """
+    One device chunk of a composite address
+    """
+    @property
+    def region_id(self) -> int: ...
+    @property
+    def offset(self) -> int: ...
+    @property
+    def size(self) -> int: ...
+    @property
+    def domain_id(self) -> int: ...
+
+class CompositeAddressHandle:
+    """
+    Read-only handle over the device address backing a Spyre tensor's storage
+    """
+    @property
+    def total_size(self) -> int:
+        """
+        Total physical (padded/tiled) byte size of the allocation
+        """
+    @property
+    def num_chunks(self) -> int:
+        """
+        Number of device chunks the allocation spans
+        """
+    def chunks(self) -> list[CompositeChunkInfo]:
+        """
+        Per-chunk geometry, in order
+        """
+    def __eq__(self, other: object) -> bool: ...
+    def __ne__(self, other: object) -> bool: ...
+
+def get_composite_address(tensor: torch.Tensor) -> CompositeAddressHandle:
+    """
+    Return a read-only handle over the device address backing a Spyre
+    tensor's storage; the handle keeps that allocation alive
+    """
+    ...
+
 def copy_tensor(
     self: torch.Tensor, dst: torch.Tensor, non_blocking: bool = False
 ) -> None:
@@ -500,4 +565,6 @@ def stream_get_error(stream: _SpyreStreamBase) -> SpyreStreamError: ...
 def stream_get_error_string(error: SpyreStreamError) -> str: ...
 def get_device_state() -> SpyreDeviceState: ...
 def start_runtime() -> None: ...
+def set_device(idx: int) -> None: ...
+def current_device() -> int: ...
 def to_with_layout(arg0: torch.Tensor, arg1: SpyreTensorLayout) -> torch.Tensor: ...

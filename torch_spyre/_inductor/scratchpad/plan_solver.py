@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Optional, TYPE_CHECKING
 from abc import ABC, abstractmethod
@@ -26,6 +26,11 @@ from enum import Enum
 
 if TYPE_CHECKING:
     from torch_spyre._inductor.pass_utils import PerCoreView
+    from torch_spyre._inductor.scratchpad.coarse_tiling import TileReads
+    from torch_spyre._inductor.work_division import (
+        OpSplitSpace,
+        ResidencyEdge,
+    )
     from torch_spyre._inductor.scratchpad.lx_relayout import (
         ChosenRelayout,
         LXRelayoutPlan,
@@ -88,6 +93,10 @@ class LifetimeBoundBuffer:
     # define the reason for excluding the buffer based on allocator
     # or solver logic paths.
     residency_reason: Optional[str] = None
+    # Why the buffer cannot reside while its op is untiled, set instead of
+    # ``residency_reason`` when the solve may tile the op: the solver keeps the
+    # buffer out of LX unless it chooses a tiling for it.
+    untiled_bar: Optional[str] = None
     # Optional lifetime bounds for storage reused by a counted loop. Keep these
     # separate from ``uses``: they change address overlap, but must not
     # manufacture reads or inflate residency/spill benefit.
@@ -105,6 +114,8 @@ class LifetimeBoundBuffer:
     # The physical per-core ownership accepted by the residency judge. Placement
     # writes this beside the LX address; it must never derive another view.
     lx_view: Optional["PerCoreView"] = field(default=None, repr=False, compare=False)
+    # Written by the solver: why it left the buffer out of LX, when it says.
+    spill_reason: Optional[str] = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         # Not also asserted non-empty: buffers are sometimes registered before
@@ -194,9 +205,8 @@ class TileSpec:
 
     Ordered -- where the core-division splits are dicts and so order-free --
     because tile levels *nest*: swapping two levels is a different plan. Frozen
-    and hashable so ``==`` is exactly the "same tiling shape" test the group
-    derivation keys on. The empty spec is *untiled*, and is the inert default
-    every :class:`CoreDivision` carries while ``auto_coarse_tiling`` is off.
+    and hashable. The empty spec is *untiled*, and is the inert default every
+    :class:`CoreDivision` carries unless a solver chose otherwise.
     """
 
     axes: tuple[TileAxis, ...] = ()
@@ -216,6 +226,16 @@ class TileSpec:
         return math.prod(a.count for a in self.axes)
 
     @property
+    def level_counts(self) -> tuple[int, ...]:
+        """Trip count of each level, outermost first: the loop nest alone,
+        without the dims it tiles. ``host_dim`` is positional in each op's own
+        output, so two specs can be equal and tile different dims of a buffer
+        they share, or differ and tile the same one. Ops therefore share a loop
+        group on equal nests (``derive_tiling_groups``), and whether a consumer
+        reads its producer tile by tile is checked per edge."""
+        return tuple(a.count for a in self.axes)
+
+    @property
     def output_tile_count(self) -> int:
         """Product of the split factors over output (non-reduction) axes only.
 
@@ -227,6 +247,25 @@ class TileSpec:
         :attr:`tile_count`.
         """
         return math.prod(a.count for a in self.axes if not a.is_reduction)
+
+    def count_for(self, key: tuple[int, bool]) -> int:
+        """Total split factor this spec puts on the axis ``key``, a
+        ``(host_dim, is_reduction)`` pair; 1 for an axis it does not tile."""
+        return math.prod(
+            a.count for a in self.axes if (a.host_dim, a.is_reduction) == key
+        )
+
+    @property
+    def is_clean(self) -> bool:
+        """True when no reduction axis is tiled, so every tile produces a
+        finished slice of the output rather than a partial accumulation.
+
+        Landed with stage 1 and removed again by #4519 as unused; the
+        solver-driven tiling path in ``CoOptimizingAllocator._tiling_candidates``
+        is the caller that makes it live, and it is the single filter that keeps
+        reduction tilings (numerically fragile on e.g. softmax's max/sum) out of
+        the candidate menu."""
+        return not any(a.is_reduction for a in self.axes)
 
     @property
     def label(self) -> str:
@@ -247,11 +286,16 @@ class CoreDivision:
     axis rather than an output axis.
     ``tiling`` pairs a coarse tiling onto this division as one candidate. The
     empty :class:`TileSpec` is untiled and inert.
+    ``tile_splits`` is that tiling in the keys ``splits`` uses: one
+    ``(iteration symbol, trip count)`` per level, outermost first. A tiling is
+    a split in time the way a core division is a split in space, so a view can
+    carry both and be matched the same way. Empty when untiled.
     """
 
     splits: dict[sympy.Symbol, int] = field(default_factory=dict)
     reduction_syms: frozenset[sympy.Symbol] = field(default_factory=frozenset)
     tiling: TileSpec = field(default_factory=TileSpec)
+    tile_splits: tuple[tuple[sympy.Symbol, int], ...] = ()
 
     @property
     def cores_used(self) -> int:
@@ -309,12 +353,35 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
     # consumer's slicing: the two views differ but are relayout-compatible (a
     # permutation), priced by the fitted relayout law. Sibling of
     # ``cd_parent_matches`` (which holds the free, equal-view pairs); populated
-    # only when ``lx_relayout.lx_solver_relayout()`` holds, for the CP-SAT solver's
+    # only for a solver whose ``decides_lx_relayouts()`` holds, for its
     # relayout decision variables. The record carries the views, core count,
     # group and price, so the solver and the commit path never re-derive them.
     cd_parent_relayouts: dict[str, list["RelayoutCandidate"]] = field(
         default_factory=dict
     )
+    # The same relation per candidate rather than per pair: one edge per divided
+    # producer this buffer reads, keyed as ``cd_parent_matches`` is. A solver
+    # that generates divisions asks these instead of indexing the table, and
+    # constructs the division on the other end of an edge by inverting the view.
+    # Empty where the allocator has not built them (they need the live ops).
+    residency_edges: dict[str, "ResidencyEdge"] = field(default_factory=dict)
+    # This buffer's producing op's legal divisions as a space to move in --
+    # ``core_divisions`` without materializing it. ``None`` where the allocator
+    # built none (see ``allocator._DivisionMap``).
+    division_space: Optional["OpSplitSpace"] = None
+    # Index of this buffer's producing operation in ``graph.operations``, which
+    # is what a coarse-tiling *run* is measured over: a group has to occupy one
+    # contiguous stretch of that list, and buffer order is not operation order
+    # (input clones are prepended, and an operation producing no solver buffer
+    # has no index at all). ``None`` where there is no producing operation -- an
+    # input clone -- or where the caller does not supply one, which is what a
+    # solver reads as "operation order is unknown here, so no tiling may span
+    # more than nothing".
+    op_position: Optional[int] = None
+    # Parent name -> whether this buffer's op reads that computed parent tile
+    # by tile under a pair of specs; a pair it does not breaks a run there
+    # (``derive_tiling_groups``). Filled only where the solver chooses tilings.
+    tile_reads: dict[str, "TileReads"] = field(default_factory=dict)
     chosen_division: Optional[int] = None
     # Solver-chosen relayouts feeding this consumer: parent_buf_name -> the
     # fired candidate with the destination address (bytes) of the group's copy
@@ -325,24 +392,22 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
     chosen_relayouts: dict[str, "ChosenRelayout"] = field(default_factory=dict)
     boundary: BufferType = BufferType.Intermediate
 
+    def per_core_size(self, division: int) -> int:
+        """Bytes per core after output partitioning and output tiling.
+
+        Reduction splits retain a full output part.
+        """
+        cd = self.core_divisions[division]
+        return ceil_div(self.size, cd.output_partition * cd.tiling.output_tile_count)
+
     @property
     def min_footprint(self) -> int:
-        """Smallest per-core footprint any candidate division allows. With no
+        """Smallest :meth:`per_core_size` any candidate division allows. With no
         candidates there is nothing to divide by, so it falls back to ``size``
-        (the placement-only case ``_wrap`` also dispatches on).
-
-        A tiled candidate's own buffer is per-tile scratch, so its footprint
-        shrinks by the output tile count as well as the core count -- this is
-        the LX-residency win entering the footprint math. Reduction tile levels
-        are excluded (see :attr:`TileSpec.output_tile_count`); with
-        ``auto_coarse_tiling`` off every ``cd.tiling`` is empty and this reduces
-        to the previous ``ceil_div(size, output_partition)`` exactly."""
+        (the placement-only case ``_wrap`` also dispatches on)."""
         if not self.core_divisions:
             return self.size
-        return min(
-            ceil_div(self.size, cd.output_partition * cd.tiling.output_tile_count)
-            for cd in self.core_divisions
-        )
+        return min(self.per_core_size(i) for i in range(len(self.core_divisions)))
 
     @property
     def sym_cores(self) -> sympy.Symbol:
@@ -369,7 +434,7 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
         core_divs = self.core_divisions
 
         def unique(args):
-            d = {arg: None for arg in args}
+            d = dict.fromkeys(args)
             return list(d)
 
         keys = unique(itertools.chain.from_iterable(cd.splits for cd in core_divs))
@@ -377,6 +442,37 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
         return {
             key: sympy.Symbol(f"split_{self.name}_{key}", integer=True, positive=True)
             for key in keys
+        }
+
+    @property
+    def sym_tile_counts(self) -> dict[tuple[int, bool], sympy.Symbol]:
+        """Symbolic stand-in for a chosen ``tiling``, the coarse-tiling sibling
+        of :attr:`sym_core_divs`: one symbol per tiled axis (a
+        ``(host_dim, is_reduction)`` pair) seen across this buffer's candidate
+        divisions, bound to that candidate's count on the axis, 1 where it
+        leaves the axis untiled. Keyed on the axis rather than the nesting level, so the
+        symbols do not depend on how a candidate orders its levels -- the cost
+        of a nest (a product of per-level trip counts) does not either. Empty
+        while no candidate is tiled.
+
+        The SA co-optimizer generates its tilings from :attr:`division_space`
+        instead of listing them as candidates, so every output dim that space
+        may tile is declared too."""
+        keys = dict.fromkeys(
+            (axis.host_dim, axis.is_reduction)
+            for cd in self.core_divisions
+            for axis in cd.tiling.axes
+        )
+        space = self.division_space
+        if space is not None and space.tiling is not None:
+            keys.update(dict.fromkeys((dim, False) for dim in space.tiling.output_dims))
+        return {
+            (dim, is_red): sympy.Symbol(
+                f"tile_{self.name}_{'r' if is_red else 'o'}{dim}",
+                integer=True,
+                positive=True,
+            )
+            for (dim, is_red) in keys
         }
 
 
@@ -427,13 +523,30 @@ class RelayoutCharge(sympy.Function):
         i = int(round(division))
         return is_lx * (prices[i] if 0 <= i < len(prices) else 0)
 
+    def _sympystr(self, printer):
+        """``str()`` names the priced divisions only, ``prices={4: 65, 12: 147}``:
+        the table is mostly zeros (a copy is priced on few of its source's
+        divisions), and positional prices make the reader count to find which
+        division a price belongs to. ``srepr`` is untouched, so the dump stays
+        lossless."""
+        is_lx, division, *prices = self.args
+        priced = ", ".join(
+            f"{i}: {printer._print(p)}" for i, p in enumerate(prices) if p != 0
+        )
+        return (
+            f"{self.func.__name__}({printer._print(is_lx)}, "
+            f"{printer._print(division)}, prices={{{priced}}})"
+        )
+
 
 def solved_bindings(buffers: Sequence["LifetimeBoundBuffer"]) -> dict:
     """The objective's symbols as the solved plan fixes them: ``is_lx`` is 1
     for a placed buffer and 0 for a spilled one; a core-division buffer with a
     chosen division binds its ``division`` index and each per-axis split
-    symbol to that division's split (1 for an axis it does not split). The
-    same reading the annealer applies to a candidate plan."""
+    symbol to that division's split (1 for an axis it does not split), and
+    each tile-count symbol to that division's tile count (1 for an axis it
+    does not tile). The same reading the annealer applies to a candidate
+    plan."""
     bindings: dict = {}
     for buf in buffers:
         bindings[buf.sym_is_lx] = 1 if buf.address is not None else 0
@@ -445,6 +558,9 @@ def solved_bindings(buffers: Sequence["LifetimeBoundBuffer"]) -> dict:
         splits = divisions[chosen].splits
         for key, sym in buf.sym_core_divs.items():
             bindings[sym] = splits.get(key, 1)
+        tiling = divisions[chosen].tiling
+        for key, sym in buf.sym_tile_counts.items():
+            bindings[sym] = tiling.count_for(key)
     return bindings
 
 
@@ -460,6 +576,8 @@ def cost_expr_record(
     bundle_terms: Sequence[tuple[list[str], sympy.Expr]],
     buffers: Sequence["LifetimeBoundBuffer"],
     params: object = None,
+    off_expression_ns: Mapping[str, float] | None = None,
+    score_ns: float | None = None,
     *,
     context: dict | None = None,
 ) -> dict:
@@ -468,6 +586,12 @@ def cost_expr_record(
     ``parse_expr`` restores them), the solved symbol bindings, and every term
     evaluated under them. ``buffers`` are the solver's returned buffers;
     ``buffers`` names (the graph's stores) are what a reader joins on.
+
+    ``objective_ns`` is ``cost_expr`` alone. ``off_expression_ns`` is what the
+    engine adds outside it for this plan
+    (:meth:`CoreDivisionLayoutSolver.off_expression_ns`), and ``score_ns`` the
+    total the engine minimized (:meth:`CoreDivisionLayoutSolver.score_ns`),
+    ``objective_ns`` for an engine that minimizes ``cost_expr`` itself.
 
     ``divisions`` carries each buffer's candidate core counts, the one chosen,
     its producers, its residency ``reason`` when one kept it out of LX, and the
@@ -583,6 +707,8 @@ def cost_expr_record(
         },
         "bindings": {str(k): v for k, v in bindings.items()},
         "objective_ns": objective_ns,
+        "off_expression_ns": dict(off_expression_ns or {}),
+        "score_ns": objective_ns if score_ns is None else score_ns,
     }
     # Additive only: context describes the record, it does not get to redefine
     # it. Without this a caller key named `bundles` would replace the terms.
@@ -652,7 +778,7 @@ class RelayoutCopyBuffer(CoreDivisionBuffer):
     ``destination_footprint_bytes``, the bound the committed path reserves for
     a relayout destination) times the DESTINATION's core count, and
     ``core_divisions`` holds one division sliced that many ways, so the
-    per-core footprint every engine derives (``size / output_partition``) is
+    per-core footprint every engine derives through :meth:`per_core_size` is
     exactly that span. For a broadcast the copy therefore lives on the
     consumer's cores while its source stays on fewer. ``parents`` is
     deliberately empty: the source edge is a relayout coupling, not a
@@ -678,7 +804,8 @@ class RelayoutCopyBuffer(CoreDivisionBuffer):
     def per_core_footprint(self) -> int:
         """The destination span: what one core must hold for the copy to be
         resident (``size`` is that span times the destination core count)."""
-        return ceil_div(self.size, self.num_cores)
+        # A relayout group has one untiled destination division.
+        return self.per_core_size(0)
 
     @property
     def consumers(self) -> tuple[str, ...]:
@@ -849,7 +976,98 @@ class MemoryPlanSolver(ABC):
     solvers that can also choose the division.
     """
 
-    supports_paired_buffers = False
+    # What a solver can do, asked of its class before any instance exists. Every
+    # concrete solver answers each abstract one itself; __init_subclass__ fails
+    # the class definition otherwise, or on a combination that makes no sense.
+
+    @classmethod
+    def chooses_core_divisions(cls) -> bool:
+        """Chooses each buffer's core division jointly with its placement:
+        exactly the :class:`CoreDivisionLayoutSolver` subclasses."""
+        return False
+
+    @classmethod
+    @abstractmethod
+    def supports_paired_buffers(cls) -> bool:
+        """Places a committed LX relayout's source and destination as a pair
+        (``LifetimeBoundBuffer.paired_with``). The allocator collects committed
+        relayout plans only for such a solver."""
+
+    @classmethod
+    @abstractmethod
+    def decides_lx_relayouts(cls) -> bool:
+        """Places a :class:`RelayoutCopyBuffer` under the coupling its
+        docstring lists and writes ``chosen_relayouts`` back on the consumers it
+        serves. The allocator enumerates relayout candidates only for such a
+        solver; the others never see a copy and their objective carries no
+        relayout term."""
+
+    @classmethod
+    @abstractmethod
+    def generates_divisions(cls) -> bool:
+        """Generates each buffer's candidate divisions from its op's split
+        space (``CoreDivisionBuffer.division_space``) rather than only choosing
+        among the enumerated ``core_divisions``. The allocator builds a split
+        space only for such a solver; with ``chooses_tilings`` too, the space
+        carries the op's tilings, and the allocator applies the ones chosen."""
+
+    @classmethod
+    @abstractmethod
+    def chooses_tilings(cls) -> bool:
+        """Chooses each op's coarse tiling jointly with its core division. With
+        ``linear_cost_only`` too, the allocator hands it no cost expression
+        while ``auto_coarse_tiling`` is on: the cost model cannot score tile
+        size or cut count."""
+
+    @classmethod
+    @abstractmethod
+    def tilings_from_menu(cls) -> bool:
+        """Takes each op's tiling candidates off the menu the allocator
+        enumerates, rather than generating its own. The allocator enumerates
+        tiled candidates only for such a solver."""
+
+    @classmethod
+    @abstractmethod
+    def linear_cost_only(cls) -> bool:
+        """Can only minimize a cost expression that lowers to linear terms, so
+        the objective must avoid the cost model's fractional powers."""
+
+    _CAPABILITIES = (
+        "supports_paired_buffers",
+        "decides_lx_relayouts",
+        "generates_divisions",
+        "chooses_tilings",
+        "tilings_from_menu",
+        "linear_cost_only",
+    )
+
+    def __init_subclass__(cls, **kwargs) -> None:
+        super().__init_subclass__(**kwargs)
+        abstract = {
+            name
+            for name in dir(cls)
+            if getattr(getattr(cls, name, None), "__isabstractmethod__", False)
+        }
+        if abstract - set(MemoryPlanSolver._CAPABILITIES):
+            return  # still abstract in its solve methods: not a concrete solver
+        if abstract:
+            raise TypeError(f"{cls.__name__} must answer {', '.join(sorted(abstract))}")
+        chooses = cls.chooses_core_divisions()
+        if chooses != issubclass(cls, CoreDivisionLayoutSolver):
+            raise TypeError(
+                f"{cls.__name__}.chooses_core_divisions() must be "
+                f"{not chooses}: it is exactly the CoreDivisionLayoutSolver "
+                "subclasses"
+            )
+        for implied, prerequisite in (
+            ("decides_lx_relayouts", "chooses_core_divisions"),
+            ("generates_divisions", "chooses_core_divisions"),
+            ("chooses_tilings", "chooses_core_divisions"),
+            ("linear_cost_only", "chooses_core_divisions"),
+            ("tilings_from_menu", "chooses_tilings"),
+        ):
+            if getattr(cls, implied)() and not getattr(cls, prerequisite)():
+                raise TypeError(f"{cls.__name__}.{implied}() requires {prerequisite}()")
 
     def __init__(
         self, buffers: Sequence["LifetimeBoundBuffer"], size: int, alignment: int = 128
@@ -874,17 +1092,19 @@ class MemoryPlanSolver(ABC):
                 defaults to.
         """
         self.buffers: list["LifetimeBoundBuffer"] = list(buffers)
-        assert self.supports_paired_buffers or not any(
+        assert self.supports_paired_buffers() or not any(
             buffer.paired_with for buffer in self.buffers
         ), f"{type(self).__name__} does not support paired-buffer placement"
         self.limit = size
         self.alignment = alignment
-        self.spill_reasons: dict[str, str] = {}
 
     def excluded(self, buffer: "LifetimeBoundBuffer") -> Optional[str]:
         """Why ``buffer`` may not reside in LX, or ``None`` if it may."""
         if buffer.residency_reason is not None:
             return buffer.residency_reason
+        if buffer.untiled_bar is not None and not self.tilings_from_menu():
+            # Only a solver choosing among the menu's tilings can lift it.
+            return buffer.untiled_bar
         if buffer.min_footprint > self.limit:
             return (
                 f"min footprint {buffer.min_footprint} B > LX capacity {self.limit} B"
@@ -892,26 +1112,26 @@ class MemoryPlanSolver(ABC):
         return None
 
     def record_exclusions(self) -> dict[str, str]:
-        """Compute, store, and return the ``name -> reason`` map of every buffer
-        in :attr:`buffers` barred from LX residency.
+        """Compute and return the ``name -> reason`` map of every buffer in
+        :attr:`buffers` barred from LX residency.
 
         This is the piece a solver that keeps barred buffers in its model (e.g.
         CP-SAT, which pins them non-resident rather than dropping them) needs on
         its own; :meth:`partition` layers the placeable/excluded split on top.
-        The returned map is also stored in :attr:`spill_reasons`.
+        Each reason is also written to its buffer's ``spill_reason``.
         """
-        self.spill_reasons = {
-            buffer.name: reason
-            for buffer in self.buffers
-            if (reason := self.excluded(buffer)) is not None
-        }
-        return self.spill_reasons
+        reasons: dict[str, str] = {}
+        for buffer in self.buffers:
+            buffer.spill_reason = self.excluded(buffer)
+            if buffer.spill_reason is not None:
+                reasons[buffer.name] = buffer.spill_reason
+        return reasons
 
     def partition(
         self,
     ) -> tuple[list["LifetimeBoundBuffer"], list["LifetimeBoundBuffer"]]:
         """Split :attr:`buffers` into ``(placeable, excluded)``, recording every
-        exclusion in :attr:`spill_reasons` via :meth:`record_exclusions`.
+        exclusion on its buffer via :meth:`record_exclusions`.
         """
         excluded_reasons = self.record_exclusions()
         placeable = [b for b in self.buffers if b.name not in excluded_reasons]
@@ -946,12 +1166,19 @@ class CoreDivisionLayoutSolver(MemoryPlanSolver):
     special case where there is nothing to choose.
     """
 
-    # Whether this engine decides LX relayouts: places a
-    # :class:`RelayoutCopyBuffer` under the coupling its docstring lists and
-    # writes ``chosen_relayouts`` back on the consumers it serves. The allocator
-    # enumerates candidates and builds copies only for engines that say so; the
-    # others never see a copy and their objective carries no relayout term.
-    decides_lx_relayouts: bool = False
+    @classmethod
+    def chooses_core_divisions(cls) -> bool:
+        return True
+
+    def off_expression_ns(self) -> dict[str, float]:
+        """The terms this engine's objective adds outside ``cost_expr`` for the
+        solved plan, by name, in ns as added; the cost dump reports them."""
+        return {}
+
+    def score_ns(self) -> Optional[float]:
+        """The total this engine minimized for the solved plan, in ns, where
+        that is not ``cost_expr`` alone; the cost dump reports it."""
+        return None
 
     @abstractmethod
     def plan_layout_and_core_divisions(

@@ -22,8 +22,12 @@ import json
 import uuid
 
 import pytest
+import regex as re
 from spyre_clickhouse_ingest import (
     ID_NAMESPACE,
+    LEGACY_TAG_ALIASES,
+    RESULT_TAG_NAMESPACES,
+    RUN_CONTEXT_TAG_NAMESPACES,
     artifact_id_for,
     benchmark_id_for,
     canonical_arch,
@@ -32,8 +36,11 @@ from spyre_clickhouse_ingest import (
     gha_artifact_id,
     run_id_of,
     case_id_for,
+    split_case_tags,
+    tags_for_case,
 )
-from spyre_clickhouse_ingest.identity import ArtifactId
+from spyre_clickhouse_ingest.apply_schema import SCHEMA_DIR, SchemaApplier
+from spyre_clickhouse_ingest.identity import ArtifactId, BenchmarkId
 
 
 class _Args:
@@ -77,6 +84,82 @@ def test_test_case_id_sorts_tags():
     # tags are a SET; an order-sensitive hash would make two writers disagree.
     assert case_id_for("c", "T", "n", ["b", "a"]) == case_id_for(
         "c", "T", "n", ["a", "b"]
+    )
+
+
+def test_test_case_id_ignores_run_context_tags():
+    # Arch, test type and cadence describe the run, not the test; hashed, one test got an id
+    # per arch and per test-type set and no cross-arch comparison could join on the id.
+    ident = ["op__torch_mul", "dtype__float16"]
+    base = case_id_for("c", "T", "n", ident)
+    for ctx in (
+        ["platform__x86_64", "testtype__unit"],
+        ["platform__ppc64le", "testtype__integration", "testtype__regression"],
+        ["platform__s390x", "nightly", "weekly", "fvt", "svt", "cadence__nightly"],
+        ["refcoverage__48/48"],
+    ):
+        assert case_id_for("c", "T", "n", ident + ctx) == base
+    assert case_id_for("c", "T", "n", ident + ["op__torch_add"]) != base
+
+
+def test_legacy_bare_tags_hash_as_their_namespaced_form():
+    assert case_id_for("c", "T", "n", ["torch-spyre"]) == case_id_for(
+        "c", "T", "n", ["domain__torch-spyre"]
+    )
+
+
+def test_test_case_id_golden_with_run_context():
+    # Pinned beside the migrations/006 SQL too (its header), so an edit to either is visible in review.
+    assert case_id_for(
+        "torch-spyre", "T", "test_x", ["platform__x86_64", "op__torch_mul"]
+    ) == str(uuid.uuid5(ID_NAMESPACE, "torch-spyre|t|test_x|op__torch_mul"))
+
+
+def test_test_case_id_keeps_the_name_case():
+    # Pinned beside the migrations/007 SQL too (its header).
+    assert case_id_for("Torch-Spyre", "TestViewOps", " test_T_spyre ", []) == str(
+        uuid.uuid5(ID_NAMESPACE, "torch-spyre|testviewops|test_T_spyre|")
+    )
+    assert case_id_for("c", "T", "test_T", []) != case_id_for("c", "T", "test_t", [])
+
+
+def test_tags_split_into_identity_run_context_and_results():
+    props = [
+        ("tag", "platform__x86_64"),
+        ("tag", "testtype__unit"),
+        ("tag", "op__torch_mul"),
+        ("tag", "nightly"),
+        ("tag", "svt"),
+        ("tag", "spyre-inference"),
+        ("tag", "refcoverage__48/48"),
+    ]
+    tags = tags_for_case({"properties": props})
+    assert split_case_tags(tags) == (
+        ["domain__spyre-inference", "op__torch_mul"],
+        ["cadence__nightly", "platform__x86_64", "testtype__svt", "testtype__unit"],
+        {"result.refcoverage": "48/48"},
+    )
+
+
+def _sql_array(sql, alias):
+    listed = re.search(rf"\[([^\]]*)\] AS {alias}\b", sql).group(1)
+    return re.findall(r"'([^']+)'", listed)
+
+
+def test_rekey_migration_matches_the_tag_rules():
+    # The SQL copy of the rule re-keys history; a mismatch leaves migrated ids that no writer
+    # will ever produce again.
+    sql = (SCHEMA_DIR / "migrations" / "007_case_id_keep_name_case.sql").read_text()
+    assert SchemaApplier.RERUNNABLE.search(sql)
+    assert "lowerUTF8(trimBoth(name, ws))" not in sql
+    assert not SchemaApplier.RERUNNABLE.search(
+        (SCHEMA_DIR / "migrations" / "006_case_id_without_run_context.sql").read_text()
+    )
+    assert set(_sql_array(sql, "ctx")) == set(RUN_CONTEXT_TAG_NAMESPACES)
+    assert set(_sql_array(sql, "res")) == set(RESULT_TAG_NAMESPACES)
+    assert (
+        dict(zip(_sql_array(sql, "legacy"), _sql_array(sql, "aliased")))
+        == LEGACY_TAG_ALIASES
     )
 
 
@@ -307,6 +390,13 @@ def test_benchmark_id_golden():
     ) == uuid.UUID("3a681ed6-dc5a-517a-a1c6-bc3367ce815c")
 
 
+def test_benchmark_id_still_hashes_every_tag():
+    # The run-context split is CaseId's recipe; benchmark ids keep theirs.
+    assert benchmark_id_for("c", "matmul", ["platform__x86_64"], {}, ()) != (
+        benchmark_id_for("c", "matmul", [], {}, ())
+    )
+
+
 def test_benchmark_id_normalises_component():
     # component is normalised too, else 'Torch-Spyre' is a different benchmark.
     assert benchmark_id_for("Torch-Spyre", "matmul", [], {}, ()) == benchmark_id_for(
@@ -351,3 +441,104 @@ def test_disc_key_order_is_positional():
     a = benchmark_id_for("c", "n", [], {"a": "1", "b": "2"}, ("a", "b"))
     b = benchmark_id_for("c", "n", [], {"a": "1", "b": "2"}, ("b", "a"))
     assert a != b
+
+
+# ingest_xml's _V2_BENCH_ID_KEYS, the only producer that hashes kernel_name.
+_PERF_KEYS = (
+    "record_type",
+    "config_name",
+    "input_shapes",
+    "run_mode",
+    "kernel_name",
+    "is_total",
+)
+
+
+@pytest.mark.parametrize(
+    ("raw", "stem"),
+    [
+        (
+            "spyre_kernel_v1_fused_softmax_g266zmeotllmjp5f#2",
+            "spyre_kernel_v1_fused_softmax#2",
+        ),
+        ("spyre_kernel_v1_fused_add_maprxynops5ngbzx", "spyre_kernel_v1_fused_add"),
+        ("spyre_kernel_v1_fused_add_maprxynops5ngbzx#", ""),
+        ("spyre_kernel_v1_fused_add_MAPRXYNOPS5NGBZX#2", ""),
+        ("aten::copy_", ""),
+        ("Total", ""),
+        (None, ""),
+    ],
+)
+def test_kernel_stem_drops_only_the_compile_token(raw, stem):
+    assert BenchmarkId.kernel_stem(raw) == stem
+
+
+def _kernel(raw, ms, name="pointwise_add"):
+    return {
+        "name": name,
+        "tags": [],
+        "backend": "spyre",
+        "measurements": {"duration_ms": [ms]},
+        "disc": {"record_type": "op", "kernel_name": raw},
+        "disc_keys": _PERF_KEYS,
+    }
+
+
+def test_kernel_id_survives_a_recompile():
+    first, second = (
+        BenchmarkId.rank_kernels(
+            "torch-spyre", [_kernel(f"spyre_kernel_v1_fused_add_{t}#2", 0.27)]
+        )
+        for t in ("maprxynops5ngbzx", "mp62rpe75axhxw2u")
+    )
+    ids = {
+        benchmark_id_for("torch-spyre", e["name"], e["tags"], e["disc"], _PERF_KEYS)
+        for e in first + second
+    }
+    assert len(ids) == 1
+    assert second[0]["run_props"] == {
+        "kernel_name": "spyre_kernel_v1_fused_add_mp62rpe75axhxw2u#2"
+    }
+
+
+def test_kernels_sharing_a_stem_rank_slowest_first():
+    # One op's two fused_add kernels (0.003 and 0.27 ms) are two benchmarks, not one.
+    fast, slow, other = BenchmarkId.rank_kernels(
+        "torch-spyre",
+        [
+            _kernel("spyre_kernel_v1_fused_add_aaaaaaaaaaaaaaaa#2", 0.003),
+            _kernel("spyre_kernel_v1_fused_add_bbbbbbbbbbbbbbbb#2", 0.27),
+            _kernel(
+                "spyre_kernel_v1_fused_add_cccccccccccccccc#2", 0.003, name="softmax"
+            ),
+        ],
+    )
+    assert slow["disc"]["kernel_name"] == "spyre_kernel_v1_fused_add#2@1"
+    assert slow["props"]["kernel_key"] == slow["disc"]["kernel_name"]
+    assert fast["disc"]["kernel_name"] == "spyre_kernel_v1_fused_add#2@2"
+    assert other["disc"]["kernel_name"] == "spyre_kernel_v1_fused_add#2@1"
+
+
+def test_profiler_events_keep_their_id():
+    e = _kernel("aten::copy_", 1.0)
+    assert BenchmarkId.rank_kernels("torch-spyre", [e]) == [e]
+
+
+def test_kernel_rekey_migration_matches_the_recipe():
+    # Pinned beside the migrations/012 SQL (its header); the SQL must strip the same token.
+    golden = benchmark_id_for(
+        "torch-spyre",
+        "softmax",
+        [],
+        {"kernel_name": "spyre_kernel_v1_fused_softmax#2@1"},
+        _PERF_KEYS,
+    )
+    assert golden == "d1ebd21d-1a04-5c64-9e52-5dd2c542cb36"
+    sql = (
+        SCHEMA_DIR / "migrations" / "012_benchmark_id_without_kernel_hash.sql"
+    ).read_text()
+    assert SchemaApplier.RERUNNABLE.search(sql)
+    assert golden in sql
+    assert tuple(_sql_array(sql, "keys")) == _PERF_KEYS
+    assert f"startsWith(kernel, '{BenchmarkId.KERNEL_PREFIX}')" in sql
+    assert f"'_[a-z0-9]{{{BenchmarkId.KERNEL_TOKEN}}}(#[0-9]+)?$' AS token" in sql
