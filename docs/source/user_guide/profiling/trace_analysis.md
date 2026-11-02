@@ -97,7 +97,7 @@ authoritative guide; minimum setup follows.
 Install from source:
 
 ```bash
-git clone https://github.com/IBM/aiu-trace-analyzer.git
+git clone https://github.com/torch-spyre/aiu-trace-analyzer.git
 cd aiu-trace-analyzer
 pip install --editable .
 ```
@@ -133,5 +133,5 @@ acelyzer -i <trace_file_json> -c logs.txt
 - [Performance analysis methodology](performance_analysis_methodology.md):
   using a loaded trace
 
-[ata]: https://github.com/IBM/aiu-trace-analyzer
+[ata]: https://github.com/torch-spyre/aiu-trace-analyzer
 [ctf]: https://docs.google.com/document/d/1CvAClvFfyA5R-PhYUmn5OOQtYMH4h6I0nSsKchNAySU/preview
