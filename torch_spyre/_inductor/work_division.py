@@ -2683,10 +2683,23 @@ def _cost_model_matmul_planner(
     # source elems_per_stick from the QFP8WT weight input instead (issue #4466).
     if op.data.reduction_type == BATCH_MATMUL_FP8_OP:
         fp8_weight_td = next(
-            td
-            for td in input_tds
-            if td.layout.device_layout.element_arrangement == ElementArrangement.QFP8WT
+            (
+                td
+                for td in input_tds
+                if td.layout.device_layout.element_arrangement
+                == ElementArrangement.QFP8WT
+            ),
+            None,
         )
+        if fp8_weight_td is None:
+            got = ", ".join(
+                f"{td.dep.name}:{td.layout.device_layout.element_arrangement.name}"
+                for td in input_tds
+            )
+            raise Unsupported(
+                f"{op.get_name()} ({BATCH_MATMUL_FP8_OP}): no input has "
+                f"QFP8WT layout; inputs: [{got}]"
+            )
         fp8_device_dtype = fp8_weight_td.layout.device_layout.device_dtype
         elems_per_stick = fp8_device_dtype.elems_per_stick()
     else:
