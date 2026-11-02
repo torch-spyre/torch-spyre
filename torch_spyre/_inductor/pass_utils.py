@@ -18,6 +18,7 @@ import math
 import warnings
 from dataclasses import dataclass
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
     Mapping,
@@ -27,6 +28,9 @@ from typing import (
     TypeVar,
     Union,
 )
+
+if TYPE_CHECKING:
+    from .propagate_layouts import PropArg
 
 import regex
 import torch
@@ -66,11 +70,12 @@ from torch_spyre._inductor.op_spec import IndirectAccess, TensorWorkDivision
 
 from . import config
 from .core_mapping import (
+    PerCoreView as PerCoreView,
     core_to_slice_mapping,
     decompose_fused_split_view,
-    same_owner_maps,
 )
 from .constants import (
+    BATCH_MATMUL_OP,
     ELIDED_COPY_BACK_ATTR,
     KEEP_BY_INDEX_OP,
     MATMUL_REDUCTION_OPS,
@@ -2314,9 +2319,55 @@ def restickify_stride_map(
     """Computes the new stride_map after a restickify is performed moving the stick from old_sd to new_sd."""
     new_stride_map = list(old_stride_map)
     new_stride_map[-1] = new_sd_host_stride
-    new_stride_map[old_sd_outer_dim] = new_sd_host_stride * stick_size
+    new_stride_map[old_sd_outer_dim] = (
+        -1 if new_sd_host_stride < 0 else new_sd_host_stride * stick_size
+    )
     new_stride_map[new_sd_outer_dim] = old_sd_host_stride
     return new_stride_map
+
+
+def _host_size_stride_for_expr(
+    expr: sympy.Expr,
+    host_coords: list[sympy.Expr],
+    host_size: list[int],
+    host_stride: list[int],
+    arg: "PropArg",
+    reduction_type: str,
+    label: str,
+) -> "tuple[int, int] | None":
+    """Return (host_size, host_stride) for the host dim group that expr maps to.
+
+    Uses ``_factorized_chain`` to discover all host dims that carry the
+    expression's variable.  Multi-dim results represent a factorized layout
+    (e.g. old stick variable spread across outer dims) and the collapsed size is
+    returned.  Single-dim results are validated for coord-offset compatibility
+    (rejects sliced tensors where coord and expr have different offsets).
+    """
+    if len(expr.free_symbols) != 1:
+        return None
+    var = next(iter(expr.free_symbols))
+    from .propagate_layouts import _factorized_chain  # noqa: PLC0415
+
+    if var not in arg.dep.ranges:
+        # Broadcast dimension: this tensor does not vary along var.
+        return None
+    try:
+        host_dims, _var_range, var_stride = _factorized_chain(
+            arg, host_coords, host_size, host_stride, var, reduction_type, label
+        )
+    except Unsupported:
+        return None
+    if len(host_dims) > 1:
+        # Genuine factorized layout across multiple host dims.
+        return math.prod(host_size[d] for d in host_dims), var_stride
+    # Single host dim: _factorized_chain ignores coord offsets; verify that the
+    # coord is offset-compatible with the expression (e.g. a sliced tensor with
+    # ic=[d0, d1+32] and expr=Mod(d1,64) is invalid because offsets differ: 32 vs 0).
+    d = host_dims[0]
+    coord = host_coords[d]
+    if coord.subs(var, 0) != expr.subs(var, 0):
+        return None
+    return host_size[d], host_stride[d]
 
 
 def compute_restickify_target_layout(
@@ -2325,22 +2376,128 @@ def compute_restickify_target_layout(
     target_stick_expr,
     ic: list,
     idc: list,
+    *,
+    arg: "PropArg | None" = None,
+    reduction_type: str = "",
+    label: str = "",
 ) -> "SpyreTensorLayout | None":
     """Compute the target STL that results from moving stl's stick to target_stick_expr.
+
+    A target_stick_expr of 0 is the stick of a size-1 dim, which has no host dim
+    to match; it is handled by compute_size1_restickify_layout.  Any other
+    constant is a stick offset, which cannot be targeted.
+
+    This function's contract is to *move* the stick.  The caller is responsible
+    for ensuring ``target_stick_expr`` is not already the stick expression of
+    ``stl`` — passing a layout that does not need restickifying is a misuse.
+    Use ``_find_existing_candidate`` in ``propagate_layouts.py`` to detect that
+    case first.
+
+    Returns None if the restickify is infeasible.
+
+    ``arg``, ``reduction_type``, and ``label`` are forwarded to
+    ``_host_size_stride_for_expr`` to enable resolution of factorized
+    (FloorDiv) coordinate expressions via ``_factorized_chain``.
+    """
+    if target_stick_expr == sympy.S.Zero:
+        return compute_size1_restickify_layout(stl, host_layout, ic, idc)
+    if not target_stick_expr.free_symbols:
+        return None
+    if arg is None:
+        return None
+    host_size = [concretize_expr(s) for s in host_layout.size]
+    host_stride = [concretize_expr(s) for s in host_layout.stride]
+    new_sd_size_stride = _host_size_stride_for_expr(
+        target_stick_expr, ic, host_size, host_stride, arg, reduction_type, label
+    )
+    if new_sd_size_stride is None:
+        return None
+    new_sd_host_size, new_sd_host_stride = new_sd_size_stride
+    old_stick_expr = idc[-1]
+    new_var = next(iter(target_stick_expr.free_symbols))
+    stick_size = get_elem_in_stick(host_layout.dtype)
+    if old_stick_expr.free_symbols:
+        old_sd_size_stride = _host_size_stride_for_expr(
+            old_stick_expr, ic, host_size, host_stride, arg, reduction_type, label
+        )
+        if old_sd_size_stride is None:
+            return None
+        old_sd_host_size, old_sd_host_stride = old_sd_size_stride
+        old_var = next(iter(old_stick_expr.free_symbols))
+        old_var_outer_dims = [
+            j for j in range(len(idc) - 1) if old_var in idc[j].free_symbols
+        ]
+    else:
+        # Zero stick (placeholder dim with no variable): only valid for BATCH_MATMUL_OP,
+        # where a size-1 contraction dim produces a constant stick expression.
+        # For all other ops, this layout is infeasible.
+        if reduction_type != BATCH_MATMUL_OP:
+            return None
+        old_sd_host_size, old_sd_host_stride = 1, 1
+        old_var_outer_dims = []
+        old_var = None
+    if len(old_var_outer_dims) > 1:
+        return None
+    old_device_size = list(stl.device_size)
+    old_stride_map = list(stl.stride_map)
+    old_sd_outer_dim = next(
+        iter(old_var_outer_dims),
+        next((j for j in range(len(idc) - 1) if idc[j] == sympy.S.Zero), None),
+    )
+    if old_sd_outer_dim is None:
+        return None
+    candidates = [j for j in range(len(idc) - 1) if new_var in idc[j].free_symbols]
+    if not candidates:
+        return None
+    new_sd_outer_dim = candidates[0]
+    # Swapping one device axis cannot preserve another host dimension folded
+    # into it (for example page * block_size + token in a paged cache).
+    old_sd_free = idc[old_sd_outer_dim].free_symbols - ({old_var} if old_var else set())
+    if old_sd_free or idc[new_sd_outer_dim].free_symbols - {new_var}:
+        return None
+    device_size = restickify_device_size(
+        old_device_size,
+        old_sd_outer_dim,
+        old_sd_host_size,
+        new_sd_outer_dim,
+        new_sd_host_size,
+        stick_size,
+    )
+    stride_map = restickify_stride_map(
+        old_stride_map,
+        old_sd_outer_dim,
+        old_sd_host_stride,
+        new_sd_outer_dim,
+        new_sd_host_stride,
+        stick_size,
+    )
+    return SpyreTensorLayout(device_size, stride_map, stl.device_dtype)
+
+
+def compute_size1_restickify_layout(
+    stl: SpyreTensorLayout,
+    host_layout: FixedLayout,
+    ic: list,
+    idc: list,
+) -> "SpyreTensorLayout | None":
+    """Compute the target STL that results from moving stl's stick onto a size-1 dim.
+
+    Each stick then holds one element. The size-1 dim need not exist on the host:
+    it behaves the same whether it is real or synthetic.
+
+    This is what lets _make_output_stl in propagate_layouts.py put the stick on a
+    size-1 dim: such a layout has a stick expression of the constant 0, which
+    matching_dim cannot resolve to a host dim.
+
     Returns None if the restickify is infeasible.
     """
-    new_sd = matching_dim(ic, target_stick_expr)
-    if new_sd is None:
-        return None
     host_size = [concretize_expr(s) for s in host_layout.size]
     host_stride = [concretize_expr(s) for s in host_layout.stride]
     old_sd = matching_dim(ic, idc[-1])
     if old_sd is None:
         return None
     old_stick_expr = idc[-1]
-    old_stride_map = list(stl.stride_map)
     old_var = next(iter(old_stick_expr.free_symbols))
-    new_var = next(iter(target_stick_expr.free_symbols))
     stick_size = get_elem_in_stick(host_layout.dtype)
     old_var_outer_dims = [
         j for j in range(len(idc) - 1) if old_var in idc[j].free_symbols
@@ -2356,30 +2513,37 @@ def compute_restickify_target_layout(
     )
     if old_sd_outer_dim is None:
         return None
-    candidates = [j for j in range(len(idc) - 1) if new_var in idc[j].free_symbols]
-    if not candidates:
-        return None
-    new_sd_outer_dim = candidates[0]
-    # Swapping one device axis cannot preserve another host dimension folded
-    # into it (for example page * block_size + token in a paged cache).
-    if idc[old_sd_outer_dim].free_symbols - {old_var} or idc[
-        new_sd_outer_dim
-    ].free_symbols - {new_var}:
-        return None
+    # Reuse a device dim of size 1 whose coordinate is the literal 0 (a real size-1
+    # dim, or padding). A larger dim can also read as 0 when the access is pinned
+    # to its first entry (e.g. x[0] of a [64, 128] tensor); reusing it would drop
+    # the rest of the buffer from the layout. Without one, the old stick's
+    # elements take over its own outer dim, one element per stick.
+    new_sd_outer_dim = next(
+        (
+            j
+            for j in range(len(idc) - 1)
+            if j != old_sd_outer_dim
+            and idc[j] == sympy.S.Zero
+            and stl.device_size[j] == 1
+        ),
+        old_sd_outer_dim,
+    )
+    # A size-1 dim has one element and maps to no host stride, as in
+    # dim_map_to_stride_map in spyre_tensor_impl.cpp.
     device_size = restickify_device_size(
         list(stl.device_size),
         old_sd_outer_dim,
         host_size[old_sd],
         new_sd_outer_dim,
-        host_size[new_sd],
+        1,
         stick_size,
     )
     stride_map = restickify_stride_map(
-        old_stride_map,
+        list(stl.stride_map),
         old_sd_outer_dim,
         host_stride[old_sd],
         new_sd_outer_dim,
-        host_stride[new_sd],
+        -1,
         stick_size,
     )
     return SpyreTensorLayout(device_size, stride_map, stl.device_dtype)
@@ -2564,7 +2728,7 @@ def compute_restickify_needed(
         # stick (factorized layout). The backend would see two contraction dims
         # even though the var is on the stick — stick_compatible would incorrectly
         # accept it. out_stl is the canonical collapsed target from
-        # find_stick_compatible_input_layout Pass 3; FixedInOutNode.from_args
+        # _find_existing_candidate/_rebuild_stl_for_matmul; FixedInOutNode.from_args
         # always passes [req_stl] as the target list, so the beam search only
         # queries this function with that canonical result.
         return True, out_stl
@@ -2629,9 +2793,32 @@ def compute_restickify_needed(
         if expanded:
             return True, expanded_stl
 
+    # Local import avoids circular dependency (propagate_layouts imports pass_utils).
+    from .propagate_layouts import PropArg  # noqa: PLC0415
+
+    arg = PropArg(in_dep, in_host, [in_stl])
     return True, compute_restickify_target_layout(
-        in_stl, in_host, target_stick, ic, idc
+        in_stl, in_host, target_stick, ic, idc, arg=arg
     )
+
+
+def compute_size1_restickify_target(
+    in_stl: SpyreTensorLayout,
+    in_host: FixedLayout,
+    in_dep: MemoryDep,
+    op: "ComputedBuffer | None" = None,
+) -> "SpyreTensorLayout | None":
+    """Target STL that moves in_stl's stick onto a dim of size 1.
+
+    Used when the input's stick var must leave the stick (e.g. topk's
+    reduction var) and no other dim can take it.
+    """
+    _, _, ind_sizes = indirect_info_from_op(op)
+    idc = try_device_coordinates(in_stl, in_dep, ind_sizes, op=op)
+    if idc is None:
+        return None
+    ic = host_coordinates(in_host, in_dep, ind_sizes, op=op)
+    return compute_size1_restickify_layout(in_stl, in_host, ic, idc)
 
 
 def copy_fx_custom_meta(src: "torch.fx.Node", dst: "torch.fx.Node") -> None:
@@ -3285,62 +3472,6 @@ def lower_pad_sequence(
     return padded_buf, list(new_ops)
 
 
-@dataclass(frozen=True)
-class PerCoreView:
-    """Geometric description of a buffer's per-core slicing.
-
-    - work_slice_dims: (device-dim index, split factor) pairs, one per
-      split dim.
-    - core_to_slot: (device-dim index, slice-index expression in core_id)
-      pairs giving each core's position along that split dim.
-    - num_cores: physical cores over which ``core_to_slot`` is defined. This
-      can exceed the number of logical slices when data is replicated.
-      If omitted, the split product is used. Views that omit a reduction axis
-      or describe broadcast copies must retain the explicit physical count.
-
-    The first two fields are keyed by the buffer's device-dim index — not by
-    op-local iter symbols — so the value depends only on the buffer's physical
-    slicing.
-
-    Example: a 2D buffer split 4-ways on dim 0 across 4 cores has
-        work_slice_dims = ((0, 4),)
-        core_to_slot    = ((0, Mod(core_id, 4)),)
-    so core_id=2 owns slot 2 along dim 0.
-    """
-
-    work_slice_dims: tuple[tuple[int, int], ...]
-    core_to_slot: tuple[tuple[int, Expr], ...]
-    split_product: int
-    num_cores: int | None = None
-
-    def __init__(
-        self,
-        work_slice_dims: tuple[tuple[int, int], ...],
-        core_to_slot: tuple[tuple[int, Expr], ...],
-        num_cores: int | None = None,
-        *,
-        split_product: int = 0,  # dummy arg to absorb automatically copied args
-    ):
-        object.__setattr__(self, "work_slice_dims", work_slice_dims)
-        object.__setattr__(self, "core_to_slot", core_to_slot)
-        object.__setattr__(
-            self, "split_product", math.prod(split for _, split in work_slice_dims)
-        )
-        object.__setattr__(self, "num_cores", num_cores)
-
-    def same_partition(self, other: "PerCoreView") -> bool:
-        """Whether both views assign every physical core the same buffer slice."""
-
-        return same_owner_maps(
-            dict(self.work_slice_dims),
-            dict(self.core_to_slot),
-            self.num_cores if self.num_cores is not None else self.split_product,
-            dict(other.work_slice_dims),
-            dict(other.core_to_slot),
-            other.num_cores if other.num_cores is not None else other.split_product,
-        )
-
-
 def per_core_views_equal(left: PerCoreView | None, right: PerCoreView | None) -> bool:
     """None-aware physical-partition comparison."""
 
@@ -3644,6 +3775,41 @@ def _per_core_view_from_prep(
                     f"returning empty_view"
                 )
                 return unrepresentable
+
+        # Repack can put an outer loop inside one physical stick-count axis:
+        # 2*head + floor(width/64). Head's host stride128 has no direct match
+        # in [64, 1024, 1], yet head4 owns four contiguous stick groups. The
+        # multi-axis decomposition below cannot infer a single driven axis.
+        # Reuse the relayout projector's whole-rectangle containment proof;
+        # do not infer ownership just from a divisible host stride.
+        if (
+            dev_dim is None
+            and config.lx_planner_relayout
+            and config.lx_extended_ownership
+        ):
+            from .slice_ownership import project_slice_axis
+
+            driven = [
+                axis
+                for axis, coord in enumerate(prep.dep_device_coordinates)
+                if sym in coord.free_symbols
+            ]
+            if len(driven) == 1 and driven[0] != len(device_size) - 1:
+                axis = driven[0]
+                coordinate = prep.dep_device_coordinates[axis]
+                if device_size[axis] % split == 0 and all(
+                    per_sym.get(other, 1) == 1
+                    for other in coordinate.free_symbols - {sym}
+                ):
+                    projected = project_slice_axis(
+                        coordinate,
+                        int(device_size[axis]),
+                        split,
+                        iter_space,
+                        floor_only=True,
+                    )
+                    if projected is not None and projected[0] == sym:
+                        dev_dim = axis
 
         # Multi-stick-stride rescue: a consumer view subdivides the stickified
         # axis at k sticks per step (h = k * num_stick_stride). Only safe when

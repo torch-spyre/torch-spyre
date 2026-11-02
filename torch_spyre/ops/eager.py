@@ -464,6 +464,7 @@ COMPILED_OPS = [
     aten.div,
     aten.exp,
     aten.floor,
+    aten.trunc,
     aten.index_select,
     aten.index_copy.out,
     aten.log,
@@ -485,6 +486,8 @@ COMPILED_OPS = [
     aten.le,
     aten.ne.Tensor,
     aten.ne.Tensor_out,
+    aten.ne.Scalar,
+    aten.ne.Scalar_out,
     aten.ge,
     aten.gt,
     aten.lt,
@@ -503,6 +506,7 @@ COMPILED_OPS = [
     aten.any.default,
     aten.any.dim,
     aten.any.dims,
+    aten.repeat,
 ]
 
 register_torch_compile_kernel(COMPILED_OPS)

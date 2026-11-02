@@ -65,4 +65,8 @@ at::Tensor py_empty_with_layout(
 auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
                   SpyreTensorLayout stl, bool host2device)
     -> DataConversionInfo;
+
+// True when the DCI describes a dense same-format copy (a pure memcpy); the
+// caller can then submit the DMA without a DCI and skip host-side conversion.
+bool dci_is_identity_copy(const DataConversionInfo& dci);
 }  // namespace spyre

@@ -32,7 +32,7 @@ from types import SimpleNamespace
 import pytest
 import sympy
 
-import torch_spyre._inductor.dump_cost_model as dcm
+import torch_spyre._inductor.cost_features as dcm
 from torch_spyre._inductor import cost_model, logging_utils
 from torch_spyre._inductor.cost_model import (
     ArgTraffic,
@@ -883,11 +883,13 @@ def test_the_per_arg_io_breakdown_sums_to_its_own_total():
     """``LAST_IO`` feeds ``profile_ops.py``, whose printed lines ``parse_sweep_logs.py``
     reads back. Its per-arg ``hbm_counted`` must use the same accounting as the total it
     is printed beside -- a resident boundary arg is the case where the two can diverge."""
+    from torch_spyre._inductor import dump_cost_model as reports
+
     feats = [_reader("C", "buf1", resident={"arg0_1"})]
-    dcm._record_last_io(feats)
-    counted = sum(a["hbm_counted"] for o in dcm.LAST_IO["ops"] for a in o["args"])
+    reports._record_last_io(feats)
+    counted = sum(a["hbm_counted"] for o in reports.LAST_IO["ops"] for a in o["args"])
     # The clone-in load of the resident input, plus the write of the HBM output.
-    assert counted == dcm.LAST_IO["hbm_bytes"] == 2 * BYTES
+    assert counted == reports.LAST_IO["hbm_bytes"] == 2 * BYTES
 
 
 def _indirect_store(cores=1, is_lx=False, **kwargs):

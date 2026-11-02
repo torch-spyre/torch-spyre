@@ -296,8 +296,12 @@ class TestResultWriter(RunWriter):
         cases: list,
         source_file: str = "",
         attempt: int = 0,
+        arch: str = "",
     ) -> int:
-        """Write one leg's cases; returns the number of outcome rows written."""
+        """Write one leg's cases; returns the number of outcome rows written.
+
+        `arch` is the leg's arch, used for capability verdicts whose case carries no platform tag.
+        """
         if not cases:
             return 0
         ident_rows, run_rows = {}, []
@@ -307,7 +311,7 @@ class TestResultWriter(RunWriter):
         for c in cases:
             tags, run_tags, results = CaseId.split_tags(CaseId.tags_for(c))
             measured, recorded, unrouted = cls._recorded(c)
-            cls._capability(c, run_tags, attempt, verdicts, problems)
+            cls._capability(c, run_tags, attempt, verdicts, problems, arch)
             ignored += unrouted
             classname, name = c.get("classname", ""), c.get("name", "")
             tcid = CaseId.derive(component, classname, name, tags)
@@ -405,7 +409,13 @@ class TestResultWriter(RunWriter):
 
     @classmethod
     def _capability(
-        cls, case: dict, run_tags, attempt: int, verdicts: dict, problems: Counter
+        cls,
+        case: dict,
+        run_tags,
+        attempt: int,
+        verdicts: dict,
+        problems: Counter,
+        default_arch: str = "",
     ) -> None:
         """Add the case's `capability.*` verdict, if it declares a valid one, to `verdicts`.
 
@@ -427,7 +437,7 @@ class TestResultWriter(RunWriter):
                 for t in run_tags
                 if CaseId.namespace(t) == "platform"
             ),
-            "",
+            default_arch,
         )
         key = (decl["test_type"], arch, tuple(sorted(decl["sig"])))
         verdicts.setdefault(key, []).append(
