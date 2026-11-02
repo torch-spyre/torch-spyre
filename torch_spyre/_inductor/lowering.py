@@ -55,6 +55,7 @@ from .ir import (
     BroadcastAsyncFallback,
     SpyreConstantFallback,
     SpyreEmptyFallback,
+    SpyreArangeFallback,
     SpyreReduction,
     WaitWorkFallback,
 )
@@ -1783,6 +1784,16 @@ def lower_full(size, fill_value, dtype=None, layout=None, device=None, pin_memor
         dtype=dtype,
         inner_fn=inner_fn,
         ranges=list(size),
+    )
+
+
+@register_spyre_lowering(torch.ops.spyre.arange.default, type_promotion_kind=None)
+def lower_arange(length, dtype, device, column=False):
+    op_overload = getattr(
+        torch.ops.spyre.arange, V.graph.current_node.target._overloadname
+    )
+    return ir.TensorBox.create(
+        SpyreArangeFallback(op_overload, length, dtype, device, column)
     )
 
 

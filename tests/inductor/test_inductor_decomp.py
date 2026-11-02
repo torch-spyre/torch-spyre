@@ -188,22 +188,19 @@ class <lambda>(torch.nn.Module):
         )
         assert inductor_graph_str == expected_graph_str, "Graphs are not identical"
 
-        # For `spyre`, there is NO decomposition for arange
+        # For `spyre`, arange takes the Spyre decomposition instead of `iota`
         torch.compiler.reset()
         backend = InductorAndRecordGraphs()
         cmp = torch.compile(fn, backend=backend)
         out = cmp("spyre")
         _check_out(out.cpu(), torch.arange(65))
-        expected_graph_str = """\
-class <lambda>(torch.nn.Module):
-    def forward(self):
-        arange: "i64[65]" = torch.ops.aten.arange.default(65, device = device(type='spyre'), pin_memory = False)
-        return (arange,)
-"""
         inductor_graph_str = normalize_gm(
             backend.inductor_graphs[0].print_readable(print_output=False)
         )
-        assert inductor_graph_str == expected_graph_str, "Graphs are not identical"
+        assert "torch.ops.spyre.arange.default" in inductor_graph_str, (
+            inductor_graph_str
+        )
+        assert "prims.iota" not in inductor_graph_str, inductor_graph_str
 
         # Check that `cpu` still has the decomposition registered
         torch.compiler.reset()
