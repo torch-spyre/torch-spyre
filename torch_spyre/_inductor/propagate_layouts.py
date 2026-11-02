@@ -89,6 +89,7 @@ from .pass_utils import (
     get_matmul_n_size,
     identify_matmul_inputs,
     host_coordinates,
+    host_sparse_layout,
     device_coordinates,
     try_device_coordinates,
     indirect_info_from_op,
@@ -522,12 +523,6 @@ def _qfp8wt_stl(
     )
 
 
-def _host_sparse_output(c_size, c_stride, dtype) -> SpyreTensorLayout:
-    """The output layout of an op reading a sparse input: its own host dims in
-    order, the stick on a new size-1 dim (one element per stick)."""
-    return SpyreTensorLayout(c_size, c_stride, dtype, list(range(len(c_size))) + [-1])
-
-
 def _reduction_layout(
     op: Operation,
     output: FixedLayout,
@@ -557,7 +552,7 @@ def _reduction_layout(
     if x_dev_coords is None:
         if sparse_layout_serves_read(stl, in_layout, dep) is not None:
             # As for a pointwise op below.
-            return [_host_sparse_output(c_size, c_stride, out_dtype_for_layout)]
+            return [host_sparse_layout(output, out_dtype_for_layout)]
         return []
     x_stick_expr = x_dev_coords[-1]
     reduction_var = next(
@@ -761,7 +756,7 @@ def _default_pointwise_layout(
             # A read the input's layout cannot serve (flattening [8, 65] into
             # [520] splits a stick): compute_restickify_needed moves the input to
             # its sparse layout, and the output is sparse on its own host dims.
-            return [_host_sparse_output(c_size, c_stride, out_dtype_for_layout)]
+            return [host_sparse_layout(output, out_dtype_for_layout)]
         return []
     stick_expr = in_device_coords[-1]
     stick_exprs = _compatible_output_stick_exprs(stick_expr, out_coords, dep)

@@ -2644,14 +2644,21 @@ def expand_sparse(in_stl, output: FixedLayout) -> tuple[bool, SpyreTensorLayout]
     return False, out_stl
 
 
-def host_sparse_layout(host: FixedLayout) -> SpyreTensorLayout:
+def host_sparse_layout(
+    host: FixedLayout, dtype: "torch.dtype | None" = None
+) -> SpyreTensorLayout:
     """The sparse layout a restickify of ``host`` reaches by moving the stick onto
     a new size-1 dim and leaving the other dims in place: the former stick dim
-    becomes the outermost device dim (dim_order in host order, then -1)."""
+    becomes the outermost device dim (dim_order in host order, then -1).
+
+    ``dtype`` overrides ``host.dtype`` for an op whose layout dtype differs from
+    its host dtype (for example a bool output)."""
     sizes = [int(concretize_expr(v)) for v in host.size]
     strides = [int(concretize_expr(v)) for v in host.stride]
     outer_first = sorted(range(len(sizes)), key=lambda d: -strides[d])
-    return SpyreTensorLayout(sizes, strides, host.dtype, outer_first + [-1])
+    return SpyreTensorLayout(
+        sizes, strides, host.dtype if dtype is None else dtype, outer_first + [-1]
+    )
 
 
 def sparse_layout_serves_read(
