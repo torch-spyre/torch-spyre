@@ -435,7 +435,8 @@ PYBIND11_MODULE(_C, m) {
 
   // (status, descriptor), with None for the descriptor on failure, like
   // attach_pool(). Builds Python objects, so call it with the GIL held.
-  auto descriptor_result = [](const flex::PoolDescriptorResult& result) {
+  auto descriptor_result =
+      [](const flex::PoolDescriptorResult& result) -> py::tuple {
     if (result.status != flex::PoolStatus::Ok) {
       return py::make_tuple(result.status, py::none());
     }
