@@ -225,6 +225,14 @@ sencores: int = int(os.getenv("SENCORES", "32"))
 # TODO: confirm the default with the Deeptools team.
 max_buckets: int = int(os.getenv("MAX_BUCKETS", "32"))
 
+# Floor on a tensor.to("spyre", dynamic=...) reservation's `min`. The serving
+# plugin's linear wrapper branches on a row count below this, which would
+# become a branch on a symbol once that dim is dynamic. Real minima are far
+# above it today, so this holds by luck rather than by construction --
+# enforcing it at the reservation means a future caller can't quietly drop
+# below it.
+min_reserved_dim_size: int = int(os.getenv("MIN_RESERVED_DIM_SIZE", "8"))
+
 # Soft floor on the auto-derived granularity when mark_dynamic(min=...)
 # is not provided. Keeps the picked granularity from collapsing to a
 # very small divisor when max_size has many of them.

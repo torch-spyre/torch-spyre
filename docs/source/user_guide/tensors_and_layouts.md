@@ -418,6 +418,118 @@ See the [tensor layout example](https://github.com/torch-spyre/torch-spyre/blob/
 script that builds a `SpyreTensorLayout` with an explicit `dim_order` and
 moves a tensor to the device with `.to(device_layout=...)`.
 
+### Reserving Memory for a Dynamic Dimension
+
+By default `to()` allocates exactly the memory the tensor needs, and the device
+layout is derived from the tensor's current shape. If one dimension changes size
+at run time (for example the number of tokens in a batch), every new size would
+need a new allocation and a new layout, and a compiled graph would see a layout
+change and recompile.
+
+The `dynamic=` argument of `to()` avoids this by reserving the device buffer at
+the **maximum** size of its first dimension, up front:
+
+```
+import torch
+x = torch.rand(560, 1024, dtype=torch.float16)
+y = x.to("spyre", dynamic={0: {"min": 70, "max": 630, "granularity": 70}})
+print(y.shape)  # torch.Size([560, 1024])
+```
+
+The argument maps the dimension (currently always `0`) to its declaration:
+
+- `max` (required): the largest size the dimension may ever have. The buffer and
+  the device layout are sized for it.
+- `min` (required): the smallest size the dimension may have.
+- `granularity` (optional, default 1): every legal size is a multiple of this.
+  `max` must be a multiple of it too.
+
+The call allocates the buffer and device layout for `max` and copies the real
+data into the front of the buffer. The tensor still reports its real shape
+(`560` above, not `630`), and `torch._dynamo.mark_dynamic` is applied to the
+dimension, so `torch.compile` treats it as symbolic from the first trace. The
+`min`/`max` range itself is not passed to Dynamo; it is enforced when the tensor
+is resized.
+
+#### Resizing
+
+A reserved tensor is resized in place with `resize_`. In normal use the compiled
+graph does this for you; calling it directly shows the rules:
+
+```
+y.resize_((140, 1024))  # fine: within [70, 630] and a multiple of 70
+y.resize_((630, 1024))  # fine: growing back up to max
+y.resize_((700, 1024))  # RuntimeError: outside the reservation
+y.resize_((141, 1024))  # RuntimeError: not a multiple of granularity
+```
+
+A resize within the reservation never reallocates, and the
+`SpyreTensorLayout` stays identical for every size in range. This is what keeps
+the layout part of a compiled graph's guards from changing as the size changes.
+Only the reserved dimension may change; the rank and every other dimension must
+stay the same, otherwise `resize_` raises.
+
+#### Restrictions
+
+- `dynamic=` applies only to an eager, CPU to `"spyre"` call of `to()`. Make the
+  call before compiling, not inside a compiled function. It cannot be combined
+  with `device_layout=`. `dtype=` is honoured (the conversion happens on the
+  host before the transfer); a non-default `memory_format` is rejected.
+- Only dimension 0, the outermost dimension, can be reserved, and only one
+  dimension per tensor. Negative dimensions are accepted if they resolve to
+  dimension 0 (`-2` on a 2-D tensor). Reserving any other dimension raises an
+  error: padding it changes the host stride of every dimension outside it, which
+  the host-to-device copy does not handle. This also covers the innermost (stick)
+  dimension, which additionally changes the `stride_map` of every outer
+  dimension.
+- The declaration must be valid: `min`, `max` and `granularity` are positive
+  integers, `min <= max`, and `max` is a multiple of `granularity`.
+- `min` must be at least `min_reserved_dim_size` (default 8), and
+  `max / granularity` (the number of buckets) must not exceed `max_buckets`
+  (default 32). Both live in `torch_spyre/_inductor/config.py`. Each bucket adds
+  a small host-side correction on every dispatch, which is why the count is
+  capped.
+- The tensor's current size in the reserved dimension must itself be within
+  `[min, max]` and a multiple of `granularity`.
+- **Compiled graphs do not yet follow the current size.** The reservation keeps
+  the layout fixed, so `resize_` does not trigger a recompile. However, the
+  compiled kernel's loop extents currently come from the size the graph was first
+  compiled at, not from the current size. Running the same compiled function at
+  a different size can therefore return wrong values without raising an error,
+  for example `sum(dim=0)` over the reserved dimension, or an op's results for
+  rows beyond the size at first compile. Until the compiler supports dynamic
+  extents, do not rely on compiled results from a reserved tensor after it has
+  been resized.
+
+#### Data Semantics
+
+- **Round trip:** `.to("cpu")` (or `.cpu()`) copies only the tensor's current
+  size, never the reserved space beyond it.
+- **Stale tail:** the space between the current size and `max` is never
+  zeroed. Right after `to()`, that space is not initialized. After shrinking with
+  `resize_`, the rows that fell outside the new size keep whatever they held,
+  and growing back does not restore or clear them. Treat any element above the
+  current size as undefined, and write it before reading it.
+- **Memory:** the tensor holds `max` worth of device memory for as long as it
+  lives, however small its current size is.
+
+#### Views and In-place Reshapes
+
+The reservation describes a specific dimension of a specific tensor, so it does
+not follow a reshaped view. `detach()` of the full tensor keeps it. Other views
+(`t()`, `view()`, slices) are ordinary Spyre tensors with no reservation. If a
+reserved tensor is reshaped in place (`t_()`, `squeeze_()`, `unsqueeze_()`,
+`as_strided_()`), its reservation is no longer valid: `resize_` raises an error
+instead of resizing the wrong axis.
+
+To inspect a tensor's reservation, use `get_reserved_dims` (it returns `None`
+when there is no valid reservation):
+
+```
+from torch_spyre._C import get_reserved_dims
+print(get_reserved_dims(y))  # {0: {'min': 70, 'max': 630, 'granularity': 70}}
+```
+
 ## Layout Compatibility
 
 Spyre operations impose **hard constraints** on the memory layout of
@@ -465,5 +577,7 @@ access pattern.
 
 - Gaps
 - Multiple stick dimensions
+- Reserving a dynamic dimension other than dimension 0, more than one dynamic
+  dimension, or the stick dimension
 - Multiple memory spaces
 - RoPE
