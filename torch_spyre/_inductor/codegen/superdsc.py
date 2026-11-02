@@ -1197,16 +1197,10 @@ def _get_data_format(op, device_dtype):
 
     This is metadata relabeling only; the underlying 32-bit data is unchanged.
     Native integer add/mul (``addi32toi32`` / ``muli32toi32``) use SENUINT32
-    tensor descriptors in the SDSC DDL.  Identity retains its fp32 relabeling.
+    tensor descriptors in the SDSC DDL.
     """
-    if device_dtype == DataFormats.IEEE_INT32:
-        if op in SPYRE_INT32_OPS:
-            return DataFormats.SENUINT32
-        if op == IDENTITY_OP:
-            # In the long term, SDSC should accept int32 as the data format.
-            # Such re-labeling will become unnecessary.
-            # See backend issue deeptools#4307.
-            return DataFormats.IEEE_FP32
+    if device_dtype == DataFormats.IEEE_INT32 and op in SPYRE_INT32_OPS:
+        return DataFormats.SENUINT32
     return device_dtype
 
 
@@ -1214,9 +1208,10 @@ def _get_sdsc_spec_data_format(op, arg_data_format):
     """Return the SDSC compute format for an operation.
 
     dtype-conversion ops (fp32↔int32) and native int32 ops (addi32toi32,
-    muli32toi32) must report IEEE_FP32 as the SDSC spec's compute format;
-    all other ops pass the tensor format through unchanged.
-    See backend issue deeptools#4307.
+    muli32toi32) are bound to IEEE_FP32 as their compute type in the DDL
+    templates (unary_parallel.ddl, broadcast_ops.ddl), while their int32
+    tensors keep their own descriptor format.  All other ops pass the
+    tensor format through unchanged.
     """
     if op in (FP32TOINT32_OP, INT32TOFP32_OP, *SPYRE_INT32_OPS):
         return DataFormats.IEEE_FP32
@@ -1744,7 +1739,7 @@ def _create_sdsc_tensors(
             )
 
         # Index tensors carry 32-bit integer indices; re-label as SENUINT32 since
-        # the backend doesn't yet accept IEEE_INT32 in SDSC (deeptools #4307).
+        # the backend's gather index conversion requires SENUINT32.
         arg_data_format = (
             DataFormats.SENUINT32
             if (has_indirect_access and i in index_tensor_indices)

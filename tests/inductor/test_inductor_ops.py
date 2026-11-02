@@ -11222,6 +11222,29 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # for bool tensors.  Disable eager mode for all dtypes.
         self.compare_with_cpu(lambda a: torch.clone(a).contiguous(), x, run_eager=False)
 
+    @pytest.mark.filterwarnings(
+        "ignore:Backend Spyre does not support int64:UserWarning"
+    )
+    def test_clone_int_identity_cpu(self):
+        # A copy of an integer tensor is an identity op on its int32 storage
+        # (int64 is stored as int32), which must keep every bit, including
+        # values a float32 relabeling would round. A bare clone and a same-dtype
+        # cast are elided without an op, so use the forms that emit the copy.
+        values = [0, 1, -1, 2, -3, 7, -7, 255, 2**24 - 1, 2**24 + 1, -(2**24 + 1)]
+        values += [2**30, -(2**30), 2**31 - 1, -(2**31)]
+        copies = {
+            "contiguous_clone": lambda x: torch.clone(x).contiguous(),
+            "copy_into_empty": lambda x: torch.empty_like(x).copy_(x),
+        }
+        for shape in ((256,), (44,), (7, 44), (2, 4, 64)):
+            numel = math.prod(shape)
+            x = torch.tensor((values * (numel // len(values) + 1))[:numel])
+            x = x.reshape(shape)
+            for dtype in (torch.int32, torch.int64):
+                for name, fn in copies.items():
+                    with self.subTest(shape=shape, dtype=dtype, copy=name):
+                        self._assert_conversion_on_device("identity", fn, x.to(dtype))
+
     def test_clone_lowering(self):
         """Calling the Spyre clone lowering directly (no aten.clone FX node)
         must still yield clone's standard row-major layout, matching a real
@@ -12932,6 +12955,82 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     lambda x: x.to(dst),
                     x.to(src),
                 )
+
+    def test_int32_int64_shapes_values_cpu(self):
+        # The identity cast between the two integer types is a bit copy of the
+        # int32 storage, so it must keep every value exact, including those a
+        # float32 relabeling of the data would round (2**24 + 1) or flush (small
+        # magnitudes), across stick-aligned and unaligned shapes of each rank.
+        values = [0, 1, -1, 2, -3, 7, -7, 255, 2**24 - 1, 2**24 + 1, -(2**24 + 1)]
+        values += [2**30, -(2**30), 2**31 - 1, -(2**31)]
+        for shape in ((256,), (44,), (4, 64), (7, 44), (2, 4, 64)):
+            numel = math.prod(shape)
+            x = torch.tensor((values * (numel // len(values) + 1))[:numel])
+            x = x.reshape(shape)
+            for src, dst in ((torch.int32, torch.int64), (torch.int64, torch.int32)):
+                with self.subTest(shape=shape, src=src, dst=dst):
+                    self._assert_conversion_on_device(
+                        "identity",
+                        lambda x, dst=dst: x.to(dst),
+                        x.to(src),
+                    )
+
+    def test_int32_int64_native_op_round_trip_cpu(self):
+        # The identity cast feeds the native integer add and multiply, which read
+        # their operands as SENUINT32. The result must be exact, including a
+        # sum above 2**24 that a float32 relabeling of the data would round.
+        base = torch.arange(256) * 37 % 1000 - 500
+        other = torch.arange(256) * 11 % 700 - 300
+        cases = {
+            "add": (torch.add, "addi32toi32", base + 2**24 + 1),
+            "mul": (torch.mul, "muli32toi32", base),
+        }
+        for name, (op, native_op, lhs) in cases.items():
+            for src, mid in ((torch.int32, torch.int64), (torch.int64, torch.int32)):
+                with self.subTest(op=name, src=src, mid=mid):
+
+                    def fn(x, y, op=op, src=src, mid=mid):
+                        return op(x.to(mid), y.to(mid)).to(src)
+
+                    with self.assertLogs(
+                        "spyre.inductor.spyre_kernel", level="DEBUG"
+                    ) as logs:
+                        self.compare_with_cpu(
+                            fn,
+                            lhs.to(src),
+                            other.to(src),
+                            atol=0.0,
+                            rtol=0.0,
+                            cpu_compile=False,
+                            run_eager=False,
+                        )
+                    for expected in ("identity", native_op):
+                        self.assertTrue(
+                            any(f"op_spec: {expected}," in m for m in logs.output),
+                            f"Expected a {expected} op_spec, got: {logs.output}",
+                        )
+
+    def test_int32_int64_views_cpu(self):
+        # The identity cast reads a view of the source, so it must follow the
+        # view's strides and offset without disturbing the integer values.
+        views = {
+            "select": lambda x: x.select(0, 1),
+            "transpose": lambda x: x.t(),
+            "expand": lambda x: x[:, :1].expand(4, 64),
+            "aligned_slice": lambda x: x[:, 32:64],
+            "row_slice": lambda x: x[1:3],
+        }
+        values = [0, 1, -1, 2, -3, 7, -7, 2**24 + 1, -(2**24 + 1), 2**30, 2**31 - 1]
+        x = torch.tensor((values * (4 * 64 // len(values) + 1))[: 4 * 64])
+        x = x.reshape(4, 64)
+        for name, view in views.items():
+            for src, dst in ((torch.int32, torch.int64), (torch.int64, torch.int32)):
+                with self.subTest(view=name, src=src, dst=dst):
+                    self._assert_conversion_on_device(
+                        "identity",
+                        lambda x, view=view, dst=dst: view(x).to(dst),
+                        x.to(src),
+                    )
 
     def test_int_to_bool_cpu(self):
         # A cast to bool is a test against zero, so every nonzero value maps to
