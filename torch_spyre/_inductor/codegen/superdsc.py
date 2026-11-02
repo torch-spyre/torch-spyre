@@ -48,6 +48,7 @@ from torch_spyre._inductor.constants import (
     TOPK_OPS,
     KEEP_BY_INDEX_OP,
 )
+from torch_spyre._inductor.core_mapping import matmul_reduction_dim
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
 from torch_spyre._inductor.indirect_access import (
     compute_indirect_max_dim_sizes,
@@ -1900,36 +1901,24 @@ def _extend_matmul_k_to_padded(
     - y's dev_dim_size for K == it_dim_size → backGap branch never fires for y.
     - Strides are computed against K_padded → correct for K_padded-extended iteration.
     - _get_padded_iteration_space becomes a no-op for K (already aligned).
-
-    K is identified as the symbol that appears in y's (non-stick) device_coordinates
-    but NOT in the output's device_coordinates.  This is the reduction symbol and is
-    layout-position agnostic: it works regardless of how MATMUL_DIM_LABELS maps the
-    iteration symbols for this particular ndim.
     """
-    # y is always args[1]; output is always args[-1] for matmul.
+    # y is always args[1] for matmul.
     y_arg = op_spec.args[1]
-    out_arg = op_spec.args[-1]
+    reduction = matmul_reduction_dim(op_spec.iteration_space, op_spec.args)
+    k_sym = symbol_mapping.get(reduction)
 
     # Collect non-stick symbols in y's device_coordinates (after symbol_mapping).
     y_dim_order, y_stick_dim = _get_device_dim_order(y_arg, symbol_mapping)
     # y_stick_dim is the within-stick symbol; the remaining dims include K.
     y_non_stick_syms: set = set(y_dim_order) - ({y_stick_dim} if y_stick_dim else set())
-
-    # Collect all symbols in the output's device_coordinates.
-    out_dim_order, _ = _get_device_dim_order(out_arg, symbol_mapping)
-    out_syms: set = set(out_dim_order)
-
-    # K is in y but not in the output (it's reduced).
-    k_candidates = y_non_stick_syms - out_syms
-    if not k_candidates:
+    if k_sym not in y_non_stick_syms:
         logger.warning(
-            "_extend_matmul_k_to_padded: could not identify K symbol "
-            "(y_non_stick=%s, out_syms=%s), skipping",
+            "_extend_matmul_k_to_padded: K symbol %s is not a non-stick dim of y "
+            "(y_non_stick=%s), skipping",
+            k_sym,
             y_non_stick_syms,
-            out_syms,
         )
         return
-    k_sym = min(k_candidates, key=str)
 
     if k_sym not in sdsc_iteration_space:
         logger.warning(

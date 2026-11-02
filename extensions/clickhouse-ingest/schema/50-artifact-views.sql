@@ -173,6 +173,9 @@ FROM
                 props['runner_died'] IN ('1', 'true'), 'infra_capacity',
                 -- the pre-taxonomy spelling of ingest_error/result_lost
                 dg_cat = 'infra_result_lost', 'ingest_error',
+                -- A child that only "completed with status ABORTED" was aborted, whatever its log shows.
+                position(JSONExtractString(props['diagnosis'], 'evidence'), 'status ABORTED') > 0
+                    AND dg_cat IN ('', 'unknown'), 'aborted',
                 dg_cat NOT IN ('', 'unknown'), dg_cat,
                 '') AS own_reason,
         multiIf(props['failure_reason'] != '', props['failure_subreason'],
