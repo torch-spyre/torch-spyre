@@ -687,12 +687,6 @@ Environment Variables
        edge, overlapping the two stages. Off by default, which keeps the
        single-stream FIFO ordering. On values match flex's grammar exactly:
        ``1``, ``true``, ``t``, ``yes``, ``y``
-   * - ``SPYRE_INDUCTOR_LOG=1``
-     - *Deprecated*. Use ``TORCH_LOGS='torch_spyre.inductor'``. Enables Spyre
-       Inductor logging (INFO level)
-   * - ``SPYRE_INDUCTOR_LOG_LEVEL=DEBUG``
-     - *Deprecated*. Use ``TORCH_LOGS='+torch_spyre.inductor'`` (DEBUG level).
-       Sets Spyre Inductor log verbosity
    * - ``SPYRE_LOG_FILE=path``
      - *Deprecated*. Mapped to the top-level ``spyre`` logger file handler.
        Redirects Spyre Inductor logs to a file
@@ -821,10 +815,21 @@ Environment Variables
    * - ``KTIR_DEVICE_MLIR``
      - Path to a ``.mlir`` file declaring the target device for the KTIR
        execution path (default empty)
+   * - ``SPYRE_BACKEND_COMPILE_TIMEOUT_SECONDS``
+     - Wall-clock limit on one backend-compiler (``dbo-opt``) invocation,
+       on both the SDSC bundle and KTIR paths (default ``60``;
+       non-positive values disable the limit)
    * - ``ENABLE_LX_CONTEXT_SWITCHING``
      - Bracket opaque ``FallbackKernel`` calls that have no native Spyre
        lowering with per-buffer LX dump and restore clones, so LX-resident
        buffers survive the call (default ``1``; set ``0`` to disable)
+   * - ``SPYRE_LX_SOLVER_RELAYOUT``
+     - Let a co-optimizing solver that decides LX relayouts (today only
+       CP-SAT) choose them (default ``1``). Set ``0`` to offer it no relayout
+       candidates, so an edge whose views differ spills to HBM and nothing
+       else about the plan changes. Unlike ``SPYRE_LX_PLANNER_RELAYOUT=0``,
+       restickify residency and fused-axis views stay on. Used by the
+       cost-model sweep to measure the spill side of an edge
    * - ``SPYRE_LX_SOLVER_RELAYOUT_GROUPS_PER_EDGE``
      - Number of destination views the CP-SAT relayout enumeration keeps per
        (source, consumer) edge, cheapest first (default ``4``; ``0`` keeps
