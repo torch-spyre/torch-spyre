@@ -5,13 +5,21 @@ IR, without running it. It exists so the compiler can compare two candidate plan
 different coarse tile sizes, different work divisions, different scratchpad placements —
 cheaply enough to do it during compilation.
 
-It is **off by default** and adds nothing to a normal compile.
+This page documents the **standalone reporting pass** in `cost_model_pass.py`, reached through
+`SPYRE_DUMP_COST`. It is **off by default** and adds nothing to a normal compile. Turning it on
+**prints** a prediction and does nothing else — the pass never changes what gets compiled. The
+estimate is also returned as a value, so a pass or a tool can read it during compilation and
+choose between two plans; see
+[Using it as an API during compilation](#using-it-as-an-api-during-compilation). Nothing in the
+compiler consumes that report yet.
 
-Today, turning it on **prints** a prediction and does nothing else — it never changes what
-gets compiled. The estimate is also returned as a value, so a pass or a tool can read it
-during compilation and choose between two plans; see
-[Using it as an API during compilation](#using-it-as-an-api-during-compilation). Nothing in
-the compiler consumes it yet.
+The `cost_model.py` *module* is a different matter: the co-optimizer builds a symbolic
+`cost_expr` out of `predict_by_bundle`/`predict_bundles` and minimizes it, so the pricing this
+page describes does drive compilation on that path — it is how core divisions and LX residency
+get chosen. See [The co-optimizer](co_optimizer.md#cost-model) for how each
+solver consumes the expression, [Joint core-division + LX placement](sa_co_optimization.md#the-objective)
+for the simulated-annealing path, and
+[CpSatLayoutSolver](scratchpad_planning.md#cpsatlayoutsolver) for the CP-SAT one.
 
 > **Not to be confused with** `work_division.cost_model_matmul_division`, an unrelated
 > model that chooses a matmul work division. This page describes the whole-program

@@ -207,7 +207,10 @@ the same inputs and the same cost model:
   (and, where landed, tiling candidates) are decision variables, placement is a 2D no-overlap
   packing — each resident buffer an optional `[lifetime] × [address, address+size)` rectangle —
   and producer/consumer slicing-match constraints tie divisions together across edges. CP-SAT
-  searches exactly, minimizing predicted HBM traffic.
+  searches exactly, minimizing the symbolic `cost_expr` below — predicted runtime, not HBM
+  traffic alone — and falls back to a lexicographic traffic-first ladder when no usable
+  expression reaches it (see
+  [CpSatLayoutSolver](scratchpad_planning.md#cpsatlayoutsolver) for both objectives).
 - **`SaCoOptimizingSolver`** (`config.layout_solver = "simulated_annealing"` with
   `co_optimizing_lx_planning`) anneals a single joint state heuristically. The state is the pair
   `(pi, W)`: the LX layout permutation `pi` (held in a composed `PermutationBasedLayoutSolver`)
@@ -286,7 +289,34 @@ When no cost expression is usable (symbolic shapes, serialized captures, or a co
 error), both solvers fall back to a cheaper **memory-only** objective: pure differential HBM
 traffic, where a resident buffer costs zero and only spills are summed — the compute-roofline
 term drops out entirely. This fallback is weaker — on a graph where everything already fits,
-every division scores identically and the search has nothing left to optimize on.
+every division scores identically and the search has nothing left to optimize on. On the CP-SAT
+side that traffic term is the first level of the lexicographic ladder in
+[CpSatLayoutSolver](scratchpad_planning.md#cpsatlayoutsolver), whose later levels break the
+remaining ties by cut count, parallelism, division balance and tile count; CP-SAT also takes
+that ladder when `cost_expr_to_cpsat` cannot lower the expression, and whenever
+`auto_coarse_tiling` is on, since the allocator then withholds the expression (the model is flat
+in tile size and cut count).
+
+:::{warning}
+Even when the expression survives, parts of the model go quiet. Both engines price the *same*
+expression, built once by the allocator, so both inherit the same limitation: a term cannot
+branch on a decision the solver has not made yet (issue `#4233`). Terms that would branch on a
+still-symbolic shape or residency guard themselves (`_is_sym`, or an
+`isinstance(..., sympy.Basic)` check) and return their neutral value instead — the coarse
+underfill derate (`coarse_underfill_eff`), `_lx_spill_bw_derate` (in its
+`_lx_spill_working_set` helper, not the derate itself), `_matmul_mac_peak`,
+`_reduction_bw_cores_factor`, the bundled model's split-reread term, and `_eff_bw`'s per-op
+access-pattern overrides, which a symbolic `is_lx` drops back to the default turnaround.
+Nothing raises, and nothing reports it: the plan is just ranked by a model short those
+derates. The bundled matmul's array-fill derate is a different case and not a symbolic one:
+it goes through `underfill_eff`, which a coarse-tiled matmul bypasses outright for want of
+data to fit (`_select(tiles_output_dim, ...)` takes the un-derated branch), while the
+matmul-calibrated `coarse_underfill_eff_matmul` curve reaches only the `SPYRE_DUMP_COST`
+report text, never the minimized expression. A branch that cannot guard itself costs more —
+reading `ArgTraffic.mem` raises on a symbolic `is_lx`, which the allocator catches and turns
+into the memory-only fallback for the whole graph; see the warning under [The
+objective](sa_co_optimization.md#the-objective) for the paths that still read it.
+:::
 
 ## What gets co-optimized today
 

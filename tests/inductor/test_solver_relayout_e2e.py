@@ -1614,6 +1614,83 @@ def test_v_projection_cache_handoff_preserves_persistent_alias(
     ] == [16]
 
 
+def test_gate_up_full_parent_repartition(monkeypatch):
+    """Saved TP4 geometry: one whole-parent copy, then two local half reads."""
+    import torch_spyre._inductor.spyre_kernel as sk_mod
+    import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
+    from torch_spyre._inductor import spyre_hint
+    from torch_spyre._inductor.scratchpad.lx_relayout import _core_slices
+
+    observed = _Observed(monkeypatch, force=False)
+    local_reads = []
+    normalize = sk_mod.normalize_local_lx_subrange
+
+    def capture(contract, name, argument, iteration_space, **kwargs):
+        result = normalize(contract, name, argument, iteration_space, **kwargs)
+        if result is not argument:
+            local_reads.append(
+                {
+                    "source": name,
+                    "consumer": contract.consumer_name,
+                    "parent_allocation": dict(argument.allocation),
+                    "read_allocation": dict(result.allocation),
+                    "child_allocation": dict(contract.consumer_allocation),
+                    "parent_shape": list(argument.device_size),
+                    "child_shape": list(result.device_size),
+                }
+            )
+        return result
+
+    monkeypatch.setattr(sk_mod, "normalize_local_lx_subrange", capture)
+    rows, inner, half = 512, 128, 3200
+
+    def fn(x, weight):
+        with spyre_hint(work_div={"R": 8, "F": 4}):
+            fused = torch.nn.functional.linear(x, weight)
+        with spyre_hint(work_div={"R": 32}):
+            gate, up = fused.chunk(2, dim=-1)
+            product = torch.nn.functional.silu(gate) * up
+            return -product
+
+    host = ((torch.arange(rows * inner).reshape(rows, inner) % 33) - 16).to(
+        torch.float16
+    ) / 8
+    columns = torch.arange(2 * half) % inner
+    scales = torch.where(torch.arange(2 * half) < half, 1.0, 0.5).to(torch.float16)
+    weight = torch.zeros(2 * half, inner, dtype=torch.float16)
+    weight[torch.arange(2 * half), columns] = scales
+    for name, size in (("R", rows), ("K", inner), ("F", 2 * half)):
+        _pnd.declare_tensor_dim(name, size)
+    x = _pnd.name_tensor_dims(host.to("spyre"), ["R", "K"])
+    w = _pnd.name_tensor_dims(weight.to("spyre"), ["F", "K"])
+    before = x.cpu().clone()
+    fused = before[:, columns] * scales
+    gate, up = fused.chunk(2, dim=-1)
+    expected = -(torch.nn.functional.silu(gate.float()) * up.float())
+    with config.patch({**_COOPT, "sencores": 32}):
+        out = torch.compile(fn, dynamic=False, fullgraph=True)(x, w)
+    # Sparse projection is exact; the tolerance covers the existing FP16 SiLU.
+    torch.testing.assert_close(out.cpu().float(), expected, rtol=0.01, atol=0.01)
+    assert torch.equal(x.cpu(), before)
+    observed.assert_emitted_in_lx(expected_plans=1)
+    (plan,) = observed.plans
+    assert len(plan.consumer_names) == 2
+    assert plan.source_footprint_bytes == plan.destination_footprint_bytes == 204800
+    assert len(local_reads) == 2, local_reads
+    assert sorted(
+        r["read_allocation"]["lx"] - r["parent_allocation"]["lx"] for r in local_reads
+    ) == [0, 102400]
+    for record in local_reads:
+        assert record["parent_allocation"] == {"lx": plan.destination_address}
+        assert set(record["child_allocation"]) == {"lx"}
+        assert record["parent_shape"] == [100, rows, 64]
+        assert record["child_shape"] == [50, rows, 64]
+    assert _core_slices(plan.source_view, 32) == {
+        c: {0: c // 8, 1: c % 8} for c in range(32)
+    }
+    assert _core_slices(plan.destination_view, 32) == {c: {1: c} for c in range(32)}
+
+
 def test_prefix_linear_reads_a_separate_full_backing_lx_gather(monkeypatch):
     """A 3200-wide linear reads a gathered 3328-wide physical allocation."""
     _run_prefix_linear_case(monkeypatch, mode="served")
