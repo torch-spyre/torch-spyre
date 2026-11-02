@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "one leg's verdict on the bundle's artifact. Identity fields ride in the row; ids are derived.",
+  "properties": {
+    "rows": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "arch": {
+            "type": "string"
+          },
+          "duration_s": {
+            "minimum": 0,
+            "type": "number"
+          },
+          "props": {
+            "additionalProperties": {
+              "type": [
+                "string",
+                "number"
+              ]
+            },
+            "type": "object"
+          },
+          "result_kind": {
+            "description": "Derived from test_type when omitted.",
+            "enum": [
+              "capability",
+              "functional",
+              "performance"
+            ]
+          },
+          "state": {
+            "enum": [
+              "passed",
+              "failed",
+              "error"
+            ]
+          },
+          "test_type": {
+            "enum": [
+              "fvt",
+              "fvt-dynamic",
+              "fvt-static",
+              "integration",
+              "model_modules",
+              "model_ops",
+              "model_serving",
+              "model_support",
+              "perf",
+              "quality",
+              "regression",
+              "smoke",
+              "svt",
+              "svt-dynamic",
+              "svt-static",
+              "trunk",
+              "unit"
+            ]
+          }
+        },
+        "required": [
+          "test_type",
+          "state"
+        ],
+        "type": "object"
+      },
+      "minItems": 1,
+      "type": "array"
+    }
+  },
+  "required": [
+    "rows"
+  ],
+  "title": "artifact_results upload file: results/artifact_results.json",
+  "type": "object"
+}

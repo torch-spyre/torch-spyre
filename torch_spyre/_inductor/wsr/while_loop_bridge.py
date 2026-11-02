@@ -1042,10 +1042,12 @@ def _rewire_accumulator_output(
     from torch._inductor import ir
 
     from torch_spyre._inductor.pass_utils import (
+        _repoint_mutation_targets,
         identity_load,
         redirect_computed_buffer_reads,
     )
 
+    while_out = None
     while_out_name = None
     for child in graph.operations:
         if not isinstance(child, ir.MultiOutput):
@@ -1057,6 +1059,7 @@ def _rewire_accumulator_output(
         # element is the carry index.
         indices: list[Any] = list(getattr(child, "indices", None) or ())
         if len(indices) == 1 and indices[0][1] == binding.carry_index:
+            while_out = child
             while_out_name = child.get_name()
             break
 
@@ -1160,6 +1163,9 @@ def _rewire_accumulator_output(
 
     if while_out_name is not None:
         _repoint_refs_to_buffer(graph, while_out_name, target)
+        # A copy-back into the loop result targets the MultiOutput by object; left
+        # on the dropped node, DCE removes it and the collective feeding it.
+        _repoint_mutation_targets(graph.operations, while_out, target)
     return body_ops
 
 

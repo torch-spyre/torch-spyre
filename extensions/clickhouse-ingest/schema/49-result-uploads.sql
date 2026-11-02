@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS result_uploads
     CONSTRAINT chk_state  CHECK state IN ('pending', 'rejected', 'expired', 'published', 'failed', 'retracted'),
     CONSTRAINT chk_linked CHECK artifact_id != toUUID('00000000-0000-0000-0000-000000000000')
                             AND run_id != toUUID('00000000-0000-0000-0000-000000000000'),
-    CONSTRAINT chk_format CHECK format IN ('junit', 'vllm', 'sendnn', 'benchmarks'),
+    CONSTRAINT chk_format CHECK format IN ('junit', 'vllm', 'sendnn', 'benchmarks', 'tables'),
     -- Same lists as artifact_results.chk_result_kind / chk_test_type; they move together.
     CONSTRAINT chk_result_kind CHECK result_kind IN
         ('functional','performance','capability'),

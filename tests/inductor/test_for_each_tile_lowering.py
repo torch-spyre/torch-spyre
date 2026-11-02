@@ -3994,7 +3994,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         from torch._inductor.dependencies import MemoryDep
         from torch._inductor.ir import Reduction
 
-        import torch_spyre._inductor.wsr.coarse_tile as coarse_tile_mod
+        import torch_spyre._inductor.pass_utils as pass_utils_mod
         from torch_spyre._inductor.wsr.for_each_tile_lowering import (
             _MARKER_MAPS,
             clear_marker_maps,
@@ -4036,7 +4036,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         graph.operations = operations
 
         with mock.patch.object(
-            coarse_tile_mod, "op_out_coords", return_value=[sympy.Integer(0)]
+            pass_utils_mod, "op_out_coords", return_value=[sympy.Integer(0)]
         ):
             with V.set_graph_handler(graph):
                 result = lookup_marker_dim(op, u0)
@@ -4056,7 +4056,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         # returned unconditionally.
         _MARKER_MAPS[id(operations)] = {}
         with mock.patch.object(
-            coarse_tile_mod, "op_out_coords", return_value=[sympy.Integer(0)]
+            pass_utils_mod, "op_out_coords", return_value=[sympy.Integer(0)]
         ):
             with V.set_graph_handler(graph):
                 empty_map_result = lookup_marker_dim(op, u0)
@@ -4094,7 +4094,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
 
         from torch._inductor.dependencies import MemoryDep
 
-        import torch_spyre._inductor.wsr.coarse_tile as coarse_tile_mod
+        import torch_spyre._inductor.wsr.loop_tiling_common as loop_tiling_common_mod
         from torch_spyre._inductor.propagate_hints import DimHint
         from torch_spyre._inductor.wsr.for_each_tile_lowering import (
             clear_marker_maps,
@@ -4132,7 +4132,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         graph.operations = ["sentinel_operations_list"]
 
         with mock.patch.object(
-            coarse_tile_mod, "_loop_var_to_ranges_pos", return_value=None
+            loop_tiling_common_mod, "_loop_var_to_ranges_pos", return_value=None
         ):
             with V.set_graph_handler(graph):
                 with self.assertRaises(
@@ -4142,7 +4142,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
                     "through no channel (output dim, reduction dim, or "
                     "marker map)",
                 ):
-                    coarse_tile_mod._hint_ranges_pos(
+                    loop_tiling_common_mod._hint_ranges_pos(
                         op, hint, out_coords=[sympy.Integer(0)]
                     )
 
@@ -4163,10 +4163,10 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         invariant_op.get_read_writes.return_value = invariant_rw
 
         with mock.patch.object(
-            coarse_tile_mod, "_loop_var_to_ranges_pos", return_value=None
+            loop_tiling_common_mod, "_loop_var_to_ranges_pos", return_value=None
         ):
             with V.set_graph_handler(graph):
-                result = coarse_tile_mod._hint_ranges_pos(
+                result = loop_tiling_common_mod._hint_ranges_pos(
                     invariant_op, hint, out_coords=[sympy.Integer(0)]
                 )
         self.assertEqual(
@@ -5219,7 +5219,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         """
         import sympy
 
-        import torch_spyre._inductor.wsr.coarse_tile as coarse_tile_mod
+        import torch_spyre._inductor.pass_utils as pass_utils_mod
         from torch._inductor.dependencies import MemoryDep
         from torch_spyre._inductor.wsr.for_each_tile_lowering import (
             _MARKER_MAPS,
@@ -5269,7 +5269,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         graph = mock.Mock(spec=["operations"])
         graph.operations = operations
 
-        with mock.patch.object(coarse_tile_mod, "op_out_coords", return_value=[v0, w0]):
+        with mock.patch.object(pass_utils_mod, "op_out_coords", return_value=[v0, w0]):
             with V.set_graph_handler(graph):
                 result = lookup_marker_dim(op, u0)
 

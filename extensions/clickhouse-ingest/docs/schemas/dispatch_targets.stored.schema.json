@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "The dispatcher's allow-list, one snapshot per publish; an empty list is one '' / '' row.",
+  "properties": {
+    "credential_id": {},
+    "job_run": {},
+    "published_at": {
+      "minLength": 1
+    },
+    "target_prefix": {},
+    "target_type": {}
+  },
+  "required": [
+    "target_type",
+    "target_prefix",
+    "credential_id",
+    "published_at",
+    "job_run"
+  ],
+  "title": "dispatch_targets: the stored row",
+  "type": "object",
+  "x-uploadable": false
+}
