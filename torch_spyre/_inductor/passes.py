@@ -374,9 +374,10 @@ def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
     committed every op's device layout by this point, so a read-copy here
     would only produce an HBM-to-HBM copy with no layout-reconciliation
     benefit.
+
+    With span-overflow hints off (the default) only ops taking part in an
+    indirect access are planned; see ``span_overflow_groups``.
     """
-    if config.ignore_span_overflow_hints:
-        return
     groups, dim_hint_assignments = span_overflow_groups(graph)
     if not groups:
         return

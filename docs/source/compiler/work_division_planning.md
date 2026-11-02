@@ -704,6 +704,11 @@ and the user hint asks for fewer splits, the compiler logs a warning and applies
 the strict user hint. `raise_if_per_core_overflow` then raises `Unsupported` if
 the resulting per-core span exceeds the hardware limit.
 
+`fits_span_without_tiling(op, max_cores)` answers the same question without
+committing anything: it runs the search `span_reduction` runs and applies the
+check above, and returns whether the span fits. Span-overflow tiling uses it to
+tile only what work division cannot place on its own.
+
 Set `SPYRE_INDUCTOR_IGNORE_WORK_DIV_HINTS=1` to ignore `spyre_hint(work_div={...})`
 annotations and use the automatic work-distribution planner.
 

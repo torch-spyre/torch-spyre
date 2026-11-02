@@ -40,7 +40,11 @@ from torch._inductor.ir import (
 )
 from torch_spyre._C import SpyreTensorLayout
 
-from .constants import ELIDED_COPY_BACK_ATTR, RESTICKIFY_SUPPORTED_DEVICE_DTYPES
+from .constants import (
+    ELIDED_COPY_BACK_ATTR,
+    INDIRECT_RELAYOUT_ATTR,
+    RESTICKIFY_SUPPORTED_DEVICE_DTYPES,
+)
 from .errors import Unsupported
 from .insert_restickify import (
     _fixed_tiled,
@@ -178,6 +182,7 @@ def _insert_relayout_copy(
     operations = graph.operations
     arg_name = value_buf.get_name()
     consumer_name = consumer_op.get_name()
+    before = {o.get_name() for o in operations}
     insert_restickify_on_node_inputs(
         consumer_op,
         [
@@ -190,6 +195,11 @@ def _insert_relayout_copy(
         ],
         operations,
     )
+    # Nothing about the copy itself says it feeds an indirect access, so mark it.
+    # Only the inserted copy is new; the consumer is patched in place.
+    for o in operations:
+        if isinstance(o, ComputedBuffer) and o.get_name() not in before:
+            setattr(o, INDIRECT_RELAYOUT_ATTR, True)
     logger.info(
         "enforce_indirect_access_layout: inserted relayout copy of %s before %s",
         arg_name,

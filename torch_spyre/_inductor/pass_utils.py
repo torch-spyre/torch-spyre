@@ -1726,9 +1726,25 @@ def padded_entry_output_stl(op) -> "SpyreTensorLayout | None":
     eps, out_pos, out_extent = found
     if out_extent % eps == 0:
         return None
-    out_stl = _fixed_read_layout(op).device_layout
+    out_layout = _fixed_read_layout(op)
+    out_stl = out_layout.device_layout
     device_size = list(out_stl.device_size)
     device_size[out_pos] = ((out_extent + eps - 1) // eps) * eps
+    # The span is charged for the padded extent, so padding a large entry dim
+    # can push the buffer past the limit. Leave it unpadded when it would.
+    from .work_division import MAX_SPAN_BYTES  # circular at module scope
+
+    padded_bytes = (
+        math.prod(concretize_expr(d) for d in device_size) * out_layout.dtype.itemsize
+    )
+    if padded_bytes > MAX_SPAN_BYTES:
+        logger.info(
+            "padded_entry_output_stl: %s needs %.1f MB padded, past the per-core "
+            "span limit; left unpadded",
+            op.get_name(),
+            padded_bytes / (1024 * 1024),
+        )
+        return None
     logger.info(
         "padded_entry_output_stl: %s entry dim (pos %d) %d -> %d for "
         "stick-aligned multi-core split",

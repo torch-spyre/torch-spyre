@@ -564,6 +564,33 @@ def raise_if_per_core_overflow(
             )
 
 
+def fits_span_without_tiling(op: ComputedBuffer, max_cores: int) -> bool:
+    """Whether work division alone keeps every per-core span within the limit.
+
+    Runs the search ``span_reduction_pass`` runs and the check it then applies,
+    committing nothing.
+    """
+    try:
+        ctx = work_division_context_for_op(op, max_cores)
+        assert ctx is not None  # untiled contexts always exist
+        splits = must_split_vars(
+            ctx.tensor_deps,
+            ctx.it_space,
+            ctx.it_space_adjusted,
+            ctx.stick_vars,
+            max_cores,
+            ctx.symbol_meta,
+            ctx.constraints.allowed_splits,
+            ctx.constraints.blocked,
+        )
+        raise_if_per_core_overflow(
+            ctx.tensor_deps, ctx.it_space, splits, op.get_name(), ctx.symbol_meta
+        )
+    except Unsupported:
+        return False
+    return True
+
+
 def must_split_vars(
     tensor_deps: list[TensorDep],
     it_space_orig: dict[Symbol, Expr],

@@ -167,6 +167,23 @@ def _pointwise_op(shape, name="buf0"):
     return op
 
 
+def _overflowing_candidate():
+    """An output candidate whose span is twice the limit, for planner tests."""
+    return soha.SpanOverflowCandidate(
+        ChunkingInfo(
+            total_bytes=2 * MAX_SPAN_BYTES,
+            per_core_span=2 * MAX_SPAN_BYTES,
+            core_split_estimate=1,
+            selected_device_dim_size=_E2E_SHAPE[1],
+            selected_device_span_stride_elems=256 * 64,
+            selected_host_dim=1,
+            stick_elems=64,
+            reason="output span overflow",
+        ),
+        source="output",
+    )
+
+
 def _reduction_op(shape, reduction_ranges=(64,), name="buf0", reduction_type="sum"):
     """Return a ComputedBuffer with a lightweight Reduction mock."""
     data = MagicMock(spec=Reduction)
@@ -2247,16 +2264,74 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             with self.assertRaisesRegex(Unsupported, "no combined split"):
                 plan_span_overflow_tile(op, max_cores=1)
 
-    def test_planner_skips_pointwise_with_indirect_reads(self):
+    def test_gather_candidates_move_to_data_dims(self):
+        # The index is read over H, the dim whose coordinate overflows, so the
+        # candidate moves to L, the only data dim other than the stick dim D,
+        # keeping its span.
         op = _pointwise_op(_E2E_SHAPE)
+        h = sympy.Symbol("h")
+        writes = op.get_read_writes.return_value.writes
+        op.get_read_writes.return_value = SimpleNamespace(
+            reads={MemoryDep("idx", h, (h,), (_E2E_SHAPE[1],))}, writes=writes
+        )
+        access = SimpleNamespace(args=(SimpleNamespace(name="idx"),))
+        overflow = _overflowing_candidate()
 
-        with patch(
-            "torch_spyre._inductor.wsr.span_overflow_hint_analysis.indirect_info_from_op",
-            return_value=({"arg1"}, {}, {sympy.Symbol("indirect0"): 8}),
+        with (
+            patch.object(
+                soha,
+                "indirect_access_subs_from_op",
+                return_value={sympy.Symbol("tmp0"): access},
+            ),
+            patch.object(soha, "_stick_host_dim", return_value=3),
         ):
-            plan = plan_span_overflow_tile(op, max_cores=4)
+            candidates = soha._gather_data_dim_candidates(op, [overflow])
 
-        self.assertIsNone(plan)
+        self.assertEqual([c.chunking_info.selected_host_dim for c in candidates], [2])
+        self.assertEqual(candidates[0].chunking_info.per_core_span, 2 * MAX_SPAN_BYTES)
+
+    def test_indirect_access_planned_only_for_pointwise(self):
+        # A gather is an indirect read inside a Pointwise op and is planned
+        # here; any other indirect-access op keeps its own lowering path.
+        with patch.object(soha, "_has_indirect_reads", return_value=True):
+            self.assertIsNone(
+                plan_span_overflow_tile(_reduction_op(_E2E_SHAPE), max_cores=4)
+            )
+            with (
+                patch.object(
+                    soha,
+                    "_output_span_candidates_from_op",
+                    return_value=[_overflowing_candidate()],
+                ),
+                patch.object(
+                    soha, "_plan_indirect_access_tile", return_value=None
+                ) as planned,
+            ):
+                plan_span_overflow_tile(_pointwise_op(_E2E_SHAPE), max_cores=4)
+
+        planned.assert_called_once()
+
+    def test_plain_pointwise_reaches_cost_search_without_work_division_check(self):
+        # The work-division check and the exact tile count apply to indirect
+        # access only; an ordinary overflowing Pointwise op must still reach
+        # the shared cost search directly.
+        op = _pointwise_op(_E2E_SHAPE)
+        overflowing = _overflowing_candidate()
+
+        with (
+            patch.object(
+                soha, "_output_span_candidates_from_op", return_value=[overflowing]
+            ),
+            patch.object(soha, "_has_indirect_reads", return_value=False),
+            patch.object(soha, "fits_span_without_tiling") as fits,
+            patch.object(
+                soha, "_search_min_cost_tile_plan", return_value=None
+            ) as search,
+        ):
+            plan_span_overflow_tile(op, max_cores=32)
+
+        fits.assert_not_called()
+        search.assert_called_once()
 
     def test_reduction_output_planner_selects_dim_and_split_count(self):
         op = _reduction_op(_E2E_SHAPE)
