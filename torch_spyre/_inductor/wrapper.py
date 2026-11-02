@@ -14,6 +14,7 @@
 
 from typing import Optional
 
+import regex as re
 import sympy
 from torch._inductor.codegen.wrapper import (
     BufferLike,
@@ -28,6 +29,14 @@ from torch._inductor.sizevars import SizeVarAllocator
 
 from .errors import Unsupported
 from .ir import FixedTiledLayout
+
+
+def _sanitize_fallback_arg(arg: str) -> str:
+    # PyTorch's repr(device) formats as device(type='spyre', index=0), which is invalid Python syntax.
+    # Convert device(type='x', index=y) -> torch.device('x', y) and device(type='x') -> torch.device('x')
+    arg = re.sub(r"\bdevice\(type=['\"]?([^'\",)]+)['\"]?,\s*index=([^)]+)\)", r"torch.device('\1', \2)", arg)
+    arg = re.sub(r"\bdevice\(type=['\"]?([^'\")]+)['\"]?\)", r"torch.device('\1')", arg)
+    return arg
 
 
 class _SpyreWrapperCodegenMixin(PythonWrapperCodegen):
@@ -98,8 +107,9 @@ class _SpyreWrapperCodegenMixin(PythonWrapperCodegen):
         if config.memory_planning and "view_as_complex" in kernel_name:
             ending = f".clone(){ending}"
 
-        comma = ", " if args else ""
-        call = f"_run_compiled_fallback({kernel_name}{comma}{', '.join(args)}){ending}"
+        clean_args = [_sanitize_fallback_arg(a) for a in args]
+        comma = ", " if clean_args else ""
+        call = f"_run_compiled_fallback({kernel_name}{comma}{', '.join(clean_args)}){ending}"
         if no_return:
             self.writeline(f"{self.declare}{call}")
         else:
@@ -124,7 +134,7 @@ class _SpyreWrapperCodegenMixin(PythonWrapperCodegen):
         outputs,
     ) -> None:
         """Apply the same marker to runtime-looked-up fallback overloads."""
-        args = list(get_args())
+        args = [_sanitize_fallback_arg(a) for a in get_args()]
         comma = ", " if args else ""
         self.writeline(
             f"{buf_name} = _run_compiled_fallback("
@@ -193,6 +203,24 @@ class SpyrePythonWrapperCodegen(_SpyreWrapperCodegenMixin, PythonWrapperCodegen)
                 subgraph_name, parent_wrapper, partition_signatures
             )
         return SpyrePythonWrapperCodegen()
+
+    def codegen(self):
+        res = super().codegen()
+        try:
+            with open("/tmp/last_inductor_wrapper.py", "w") as f:
+                f.write(res)
+        except Exception:
+            pass
+        return res
+
+    def generate(self, is_inference=False):
+        res = super().generate(is_inference=is_inference)
+        try:
+            with open("/tmp/last_inductor_wrapper.py", "w") as f:
+                f.write(res)
+        except Exception:
+            pass
+        return res
 
     def write_header(self) -> None:
         super().write_header()
