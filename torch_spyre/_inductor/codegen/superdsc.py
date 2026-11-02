@@ -14,7 +14,6 @@
 
 import dataclasses
 import math
-import struct
 from collections import Counter
 from collections.abc import Iterable
 from typing import Any
@@ -203,118 +202,6 @@ class SDSCSpec:
         return "SDSCSpec(\n" + "\n".join(parts) + "\n)"
 
 
-# Pointwise ops whose *output* padding lanes are seeded to a deterministic value
-# rather than left as allocator garbage. The mask covers the out-of-logical-range
-# padding lanes of every padded output dim of the op (see _get_coordinate_mask:
-# for an allowlisted op it masks each dim with padding > 0, not only the stick
-# dim), so seeding them is safe for ANY consumer:
-#   - a downstream contraction (matmul) reads them as an operand → the value is
-#     chosen contraction-neutral so they add nothing;
-#   - a downstream reduction masks its own padding anyway;
-#   - a direct host read-out never includes padding lanes.
-#
-# The motivating case is the flash-attention numerator matmul (exp_scores @
-# value): with an unpadded kv sequence (seqlen_kv % stick_size != 0) the final
-# kv-stick's padding lanes are uninitialized, exp() of that garbage overflows
-# fp16, and the overflow poisons the matmul. Value: SAMV substitutes it at the
-# masked input coordinate before the op runs (same semantics as the reduction
-# path, where "max" uses -inf), so exp(-inf) = 0 → the padded lanes contribute
-# nothing.
-#
-# BANDAGE — scope is deliberately narrow, do not read this as general support:
-#   - Only "exp" is covered: it is the one pointwise op on the SDPA kv axis that
-#     turns garbage into a non-finite value. Other overflow-prone ops
-#     (reciprocal, rsqrt, ...) are NOT handled and CANNOT be by this mechanism —
-#     SAMV masks the op's INPUT, and for those ops no finite input maps to a
-#     neutral output (there is no x with 1/x == 0). See #3290.
-#   - Multi-dim masking is UNTESTED. SDPA only pads the stick dim, so in practice
-#     _get_coordinate_mask emits a single-dim mask here. The comprehension will
-#     emit a mask per padded dim if an op ever has more than one, but that path
-#     has no test coverage — treat multi-padded-dim pointwise ops as unverified.
-#   - Masking is unconditional by op-name, not gated on whether the output
-#     actually feeds a contraction (that consumer analysis is not available at
-#     this point in codegen). Safe (padding lanes are never valid data), but
-#     broader than necessary. TODO(consumer-gating).
-#
-# STOPGAP: this op allowlist bakes a consumer-specific neutral value at
-# production time because SpyreTensorLayout carries no record of the padded-stick
-# state. The principled replacement is a padded-stick-state enum on the layout
-# (set at DMA-in and at buffer allocation), which would let the compiler pick the
-# right neutral value per consumer and elide pad/zero copies — tracked in #3290.
-# Retire this dict once that lands.
-#
-# NOTE: the mask value is a large finite negative, not -inf. encode_constant()
-# (module.cpp -> deeptools::FloatToFp16Bin) mis-encodes IEEE +-inf as a NaN bit
-# pattern instead of the fp16 infinity encoding (confirmed empirically: -inf
-# round-trips to NaN, not 0xFC00), so exp(-inf) never reaches the runtime as
-# exp(-inf) -- it reaches it as exp(NaN), which poisons the output instead of
-# masking it to 0. -1e4 is finite (encodes correctly) and still underflows
-# exp() to exactly 0 in fp16 (fp16's smallest positive value is ~6e-8; anything
-# below about -12 already underflows), so it produces the same masking effect
-# without going through the broken infinity path.
-#
-# The max/min reduction identities below have the same encode_constant bug:
-# _get_mask_value("max") fed float("-inf") through the same broken path, so a
-# max-reduction's padded lanes were seeded with NaN instead of -inf. Unlike
-# exp's poisoned-but-locally-contained NaN, max(x, NaN) == NaN -- the identity
-# failure propagates through the whole reduction result, not just the padded
-# lanes, which would poison any block_max = torch.amax(scores, dim=-1) whose
-# padded lanes get reduced over. _FP16_MAX/_FP16_MIN are the most extreme
-# finite fp16 values, so they lose (max)/win (min) against any real fp16 score
-# while still encoding correctly.
-_FP16_MAX = 65504.0
-_FP16_MIN = -65504.0
-
-# 32-bit coordinate masking uses a repeating 16-bit pattern for the mask
-# value. 0.0 (used for sum/mean) already satisfies this requirement.
-# For max and min, the largest finite values with matching upper and lower
-# 16-bit halves are constructed directly from their bit patterns.
-_FP32_MIN = struct.unpack("<f", struct.pack("<I", 0xFF7FFF7F))[0]  # -3.40279751e38
-_FP32_MAX = struct.unpack("<f", struct.pack("<I", 0x7F7F7F7F))[0]  # 3.39617752e38
-_FP32_ALMOST_1 = struct.unpack("<f", struct.pack("<I", 0x3F803F80))[
-    0
-]  # 1.0019378662109375
-
-_PADDING_MASK_VALUES: dict[str, dict[DataFormats, float]] = {
-    "max": {
-        DataFormats.SEN169_FP16: _FP16_MIN,
-        DataFormats.IEEE_FP32: _FP32_MIN,
-    },
-    "min": {
-        DataFormats.SEN169_FP16: _FP16_MAX,
-        DataFormats.IEEE_FP32: _FP32_MAX,
-    },
-    "exp": {
-        DataFormats.SEN169_FP16: -1e4,  # exp(-1e4) underflows to 0 in fp16; see NOTE above.
-        DataFormats.IEEE_FP32: _FP32_MIN,
-    },
-    "reciprocal": {
-        DataFormats.SEN169_FP16: float("inf"),
-        DataFormats.IEEE_FP32: _FP32_MAX,
-    },
-    "rsqrt": {
-        DataFormats.SEN169_FP16: float("inf"),
-        DataFormats.IEEE_FP32: _FP32_MAX,
-    },
-    "log": {
-        DataFormats.SEN169_FP16: 1,
-        DataFormats.IEEE_FP32: _FP32_ALMOST_1,
-    },
-    "realdiv": {
-        DataFormats.SEN169_FP16: float("inf"),
-        DataFormats.IEEE_FP32: _FP32_MAX,
-    },
-}
-
-_POINTWISE_PADDING_OPS: set[str] = {"exp", "reciprocal", "rsqrt", "log", "realdiv"}
-
-
-def _get_mask_value(
-    op: str, data_format: DataFormats = DataFormats.SEN169_FP16
-) -> float:
-    return _PADDING_MASK_VALUES.get(op, {}).get(data_format, 0.0)
-
-
 def _get_coordinate_mask(
     iteration_space: dict,
     arg: SDSCArgs,
@@ -327,7 +214,7 @@ def _get_coordinate_mask(
     # Pointwise path: for allowlisted ops (e.g. exp feeding a matmul), also mask
     # EVERY padded output dim so its lanes are contraction-neutral. In practice
     # SDPA pads only the stick dim, so this emits a single-dim mask; the multi-dim
-    # case is unexercised (see the BANDAGE note on _PADDING_MASK_VALUES).
+    # case is unexercised.
     #
     # Skip the pointwise mask when an input is broadcast along a padded dim
     # (scale != 1, e.g. x / x.sum(-1, keepdim=True)). SAMV then substitutes the
@@ -335,7 +222,7 @@ def _get_coordinate_mask(
     # inf / y == inf instead of 0. Worse, for some widths (e.g. 6 sticks) the
     # backend applies the mask to valid lanes and corrupts the result,
     # whatever the mask value. Unmasked, the valid lanes are correct.
-    mask_pointwise = op in _POINTWISE_PADDING_OPS and all(
+    mask_pointwise = all(
         inp.scales.get(dim) == 1
         for inp in inputs or []
         for dim, padding in dim_padding.items()
@@ -2540,15 +2427,19 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         constants = (
             dict(op_spec.op_info.get("constants", {})) if op_spec.op_info else {}
         )
-    coordinate_masking = _get_coordinate_mask(
-        sdsc_iteration_space, args[-1], padding, op_spec.op, args[:-1]
-    )
+
+    mask_value = op_spec.args[0].mask_value
+    coordinate_masking = {}
     masking_const_id = -1
-    if coordinate_masking:
-        # Constant ids follow insertion order, so capture the index here rather
-        # than assuming 0 -- ops with their own constants shift it (see #4390).
-        masking_const_id = len(constants)
-        constants["samv-maskvalue"] = _get_mask_value(op_spec.op, args[0].data_format)
+    if mask_value is not None:
+        coordinate_masking = _get_coordinate_mask(
+            sdsc_iteration_space, args[-1], padding, op_spec.op, args[:-1]
+        )
+        if coordinate_masking:
+            # Constant ids follow insertion order, so capture the index here rather
+            # than assuming 0 -- ops with their own constants shift it (see #4390).
+            masking_const_id = len(constants)
+            constants["samv-maskvalue"] = mask_value
 
     # Forward conv2d (#3284), like matmul, counts only the non-output args as
     # inputs. Depthwise conv2d (#3510) is a reduction that feeds its output

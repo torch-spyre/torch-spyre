@@ -105,6 +105,7 @@ class TensorAccess(RValue):
     name: str
     index: sympy.Expr
     layout: FixedTiledLayout
+    mask_value: float | None
 
 
 @dataclass
@@ -875,7 +876,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         # _general_tile_advance's docstring), which that method folds into
         # device_tile_advance_expr below. Pin every splice loop_var to trip
         # zero in the base coordinates so the raw unbacked symbol neither
-        # leaks into the OpSpec iteration space nor applies the same
+        # leaks into the OpSpec iteration space nor applies the same00
         # advance a second time.
         device_tile_advance_expr = self._general_tile_advance(tensor, is_input, name)
         base_index = per_trip_index(operation, tensor.index)
@@ -893,6 +894,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             it_space,
             allow_extended=_spyre_config.lx_extended_ownership,
         )
+
         tensor_arg = TensorArg(
             is_input,
             -1,
@@ -906,6 +908,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             work_division=work_division,
             kernel_local=kernel_local,
             replicated_scalar=replicated_scalar,
+            mask_value=tensor.mask_value,
         )
         if (
             "lx" not in tensor.layout.allocation
@@ -1218,13 +1221,24 @@ class SpyreKernel(Kernel[CSEVariable]):
         if "lx" not in layout.allocation and "hbm_pool" not in layout.allocation:
             _ = self.args.input(name)
 
+        # For now assume that the mask value will be the same for all
+        # arguments of an op. This works around two issues:
+        # - mapping the buffer names to argument positions (it's not 1 to 1, ex: x * x)
+        # - inputs that have been renamed
+        mask_value = None
+        ir_node = self.current_node.node
+        if input_pad_values := getattr(ir_node, "input_mask_values", None):
+            mask_values = set(input_pad_values.values())
+            assert len(mask_values) <= 1
+            mask_value = next(iter(mask_values), None)
+
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 f"kernel_load: {name}, shape={[concretize_expr(s) for s in layout.size]}, "
                 f"device_size={list(layout.device_layout.device_size)}"
             )
 
-        return TensorAccess(name, index, layout)
+        return TensorAccess(name, index, layout, mask_value)
 
     def store(
         self,
@@ -1259,7 +1273,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             # name to args.input, which does not resolve.)
             _ = self.args.output(name)
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
-        dst = TensorAccess(name, index, layout)
+        dst = TensorAccess(name, index, layout, None)
         if real_dst_name != name:
             # Skip allocating an output buffer; this name is an alias to another buffer
             V.graph.removed_buffers.add(name)
@@ -1377,7 +1391,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         if "hbm_pool" not in layout.allocation:
             _ = self.args.output(name)
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
-        dst = TensorAccess(name, index, layout)
+        dst = TensorAccess(name, index, layout, None)
         real_dst_name = V.graph.scheduler.mutation_real_name.get(name, name)
         if real_dst_name != name:
             # Skip allocating an output buffer; this name is an alias to another buffer
@@ -1406,7 +1420,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                 or (not isinstance(value.arguments[1], TensorAccess))
             ):
                 raise Unsupported(f"invalid {value.op} arguments {value.arguments}")
-            x = value.arguments[0]
+            x: TensorAccess = value.arguments[0]
             y = value.arguments[1]
             args = [
                 self.create_tensor_arg(True, x.name, x),
@@ -1757,6 +1771,10 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                                 buf.writeline("kernel_local=True,")
                             if arg.replicated_scalar:
                                 buf.writeline("replicated_scalar=True,")
+                            if arg.mask_value is not None:
+                                buf.writeline(
+                                    f"mask_value=float({str(arg.mask_value)!r}),"
+                                )
                             if arg.device_tile_advance_expr is not None:
                                 buf.writeline(
                                     "device_tile_advance_expr="

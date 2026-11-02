@@ -279,6 +279,7 @@ class TensorArg:
             one MEMORY_FILL (``spyre_constant_tensor`` -> ``spyre_fill_tensor``),
             and False everywhere else. The KTIR emitter reads it to widen a
             scalar operand's read to its whole stick; see ``_reads_every_lane``.
+        mask_value: value to be used to for coordinate masking, if not None
     """
 
     is_input: bool
@@ -295,6 +296,7 @@ class TensorArg:
     work_division: TensorWorkDivision | None = None
     kernel_local: bool = False
     replicated_scalar: bool = False
+    mask_value: float | None = None
 
 
 def is_lx_relayout_identity(

@@ -1179,6 +1179,7 @@ class DomainRangeTracer(DefaultHandler):
         # op name -> (arg name -> adjusted )
         self.buffer_input = dict[str, dict[str, Set]]()
         self.non_zero_reals = S.Reals - FiniteSet(0)
+        self.extended_non_zero_reals = self.non_zero_reals.union(FiniteSet(-oo, oo))
         self.positive_numbers = Interval(0, sympy.oo)
         self.stricty_positive_numbers = Interval(0, sympy.oo, left_open=True)
         self.booleans = FiniteSet(0, 1)
@@ -1396,9 +1397,9 @@ class DomainRangeTracer(DefaultHandler):
         return self._unary_op(operator.neg, x0, S.Reals)
 
     def reciprocal(self, x0):
-        if not x0.is_subset(self.non_zero_reals):
-            raise InvalidDomain(self.non_zero_reals, "reciprocal")
-        return self._unary_op(lambda x: 1 / x, x0, self.non_zero_reals)
+        if not x0.is_subset(self.extended_non_zero_reals):
+            raise InvalidDomain(self.extended_non_zero_reals, "reciprocal")
+        return self._unary_op(lambda x: 1 / x, x0, self.extended_non_zero_reals)
 
     def qfp8ch(self, x):
         return x
@@ -1450,9 +1451,9 @@ class DomainRangeTracer(DefaultHandler):
         return x
 
     def truediv(self, x0, x1):
-        if not x1.is_subset(self.non_zero_reals):
+        if not x1.is_subset(self.extended_non_zero_reals):
             # realdiv is the correct key in _PADDING_MASK_VALUES
-            raise InvalidDomain(self.non_zero_reals, "realdiv", arg_index=1)
+            raise InvalidDomain(self.extended_non_zero_reals, "realdiv", arg_index=1)
         return self._binary_op(operator.truediv, x0, x1)
 
     def silu(self, x0):
@@ -1626,8 +1627,25 @@ class ArgNameToIndexTracer(DefaultHandler):
         pass
 
 
-# TODO, refactor the lines below when 5409 is merged
-
+# NOTE: the mask value is a large finite negative, not -inf. encode_constant()
+# (module.cpp -> deeptools::FloatToFp16Bin) mis-encodes IEEE +-inf as a NaN bit
+# pattern instead of the fp16 infinity encoding (confirmed empirically: -inf
+# round-trips to NaN, not 0xFC00), so exp(-inf) never reaches the runtime as
+# exp(-inf) -- it reaches it as exp(NaN), which poisons the output instead of
+# masking it to 0. -1e4 is finite (encodes correctly) and still underflows
+# exp() to exactly 0 in fp16 (fp16's smallest positive value is ~6e-8; anything
+# below about -12 already underflows), so it produces the same masking effect
+# without going through the broken infinity path.
+#
+# The max/min reduction identities below have the same encode_constant bug:
+# _get_mask_value("max") fed float("-inf") through the same broken path, so a
+# max-reduction's padded lanes were seeded with NaN instead of -inf. Unlike
+# exp's poisoned-but-locally-contained NaN, max(x, NaN) == NaN -- the identity
+# failure propagates through the whole reduction result, not just the padded
+# lanes, which would poison any block_max = torch.amax(scores, dim=-1) whose
+# padded lanes get reduced over. _FP16_MAX/_FP16_MIN are the most extreme
+# finite fp16 values, so they lose (max)/win (min) against any real fp16 score
+# while still encoding correctly.
 _FP16_MAX = 65504.0
 _FP16_MIN = -65504.0
 
@@ -1890,16 +1908,24 @@ def track_padding_value(graph: GraphLowering) -> None:
             if not padded:
                 tracer.buffer_range[op.name] = EmptySet
 
-            if do_coord_mask or do_pad:
+            if do_coord_mask:
                 pad_set = tracer.buffer_range[op.name]
                 if padded:
                     # set the propagated output padding
                     op.layout.device_layout.padding_value = float(pick_element(pad_set))
 
-                input_pad_values = dict[str, float]()
+                op.input_mask_values = dict[str, float]()
                 for arg_name, pad_set in tracer.buffer_input[op.name].items():
-                    input_pad_values[arg_name] = float(pick_element(pad_set))
-                op.input_pad_values = input_pad_values
+                    op.input_mask_values[arg_name] = float(pick_element(pad_set))
+
+            if do_pad:
+                # TODO: if coord masking is not available, the padding must be overwritten.
+                # For now there are no passes to do that, so we log a warning
+                logger.warning(
+                    "Operation input buffer may contain incompatible values in the padding. "
+                    "op=%s",
+                    op.get_operation_name(),
+                )
 
             if isinstance(op, ComputedBuffer) and isinstance(
                 op.layout, MutationLayoutSHOULDREMOVE
