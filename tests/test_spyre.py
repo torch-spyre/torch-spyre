@@ -54,6 +54,15 @@ _SCALAR_ADD_XFAIL_TO_DTYPE = pytest.mark.xfail(
     "and the test asserts no warning (#5364)",
 )
 
+# Same #5364 CPU-fallback warn as int8, now that uint8 host transfers work:
+# "conversion from torch.uint8 to torch.float32 is falling back to cpu".
+_SCALAR_ADD_XFAIL_UINT8_TO_DTYPE = pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="the uint8 to float32 conversion falls back to the CPU and warns, "
+    "and the test asserts no warning (#5364)",
+)
+
 
 # A float16-format bool's float32 or integer result is staggered on device.
 _EAGER_BOOL_READBACK_XFAIL = pytest.mark.xfail(
@@ -84,11 +93,6 @@ _SCALAR_ADD_RAISES_FP8 = _expect_raise(r"add on DataFormats\.SEN143_FP8")
 # TODO: ISSUE: https://github.com/torch-spyre/torch-spyre/issues/925
 _SCALAR_ADD_SKIP_INT = pytest.mark.skip(
     reason="Spyre backend does not support int32/int16 dtype - causes segfault/crash in data format converter"
-)
-
-# TODO:ISSUE: https://github.com/torch-spyre/torch-spyre/issues/1588
-_SCALAR_ADD_SKIP_UINT8 = pytest.mark.skip(
-    reason="uint8 host transfers unsupported: host format SENUINT32 is 4 bytes, PyTorch stores 1 (#1588)"
 )
 
 _SCALAR_ADD_FALLBACK_FULL_WARN = r"torch\.ops\.spyre\.full is falling back to cpu"
@@ -639,7 +643,7 @@ class TestSpyre(TestCase):
             subtest(
                 (torch.uint8, lambda: torch.tensor(10, dtype=torch.uint8), None),
                 name="uint8",
-                decorators=[_SCALAR_ADD_SKIP_UINT8],
+                decorators=[_SCALAR_ADD_XFAIL_UINT8_TO_DTYPE],
             ),
             subtest(
                 (torch.int16, lambda: torch.tensor(10, dtype=torch.int16), None),
@@ -1093,23 +1097,50 @@ class TestSpyre(TestCase):
         scalar = torch.tensor(3.14, dtype=torch.float16, device="spyre")
         assert scalar.dim() == 0
 
-    def test_uint8_transfer_rejected_not_card_fault(self):
-        """uint8 host transfers raise a clean error in both directions."""
-        # D2H: the direction that faulted on an unfixed build.
-        with self.assertRaisesRegex(RuntimeError, "does not support dtype"):
-            torch.empty(272, dtype=torch.uint8, device="spyre").cpu()
-        # H2D: refused by this gate too, so a wrong host format cannot reach
-        # the card in either direction.
-        with self.assertRaisesRegex(RuntimeError, "does not support dtype"):
-            torch.ones(272, dtype=torch.uint8).to("spyre")
+    def test_uint8_roundtrips_full_range(self):
+        """uint8 must survive a host round trip over its whole range.
+
+        uint8's host format is now SENUINT8 (1 byte, matching PyTorch's
+        storage) while the device keeps SENUINT32, because the device has no
+        1-byte unsigned format.  Before that, the host leg declared 4 bytes
+        for a 1-byte buffer, so ConvertData's capacity read storage/4 and a
+        D2H threw "output_shape_ volume (N elem) exceeds out buffer capacity
+        (N/4 elem)", which shut the stream down for the rest of the process.
+
+        128..255 matter most: a signed 1-byte host format would map them to
+        val-256, so they are asserted explicitly rather than sampled.
+        """
+        cpu = torch.arange(256, dtype=torch.uint8)
+        dev = cpu.to("spyre")
+        self.assertEqual(dev.device.type, "spyre")
+        self.assertEqual(dev.dtype, torch.uint8)
+        self.assertEqual(dev.cpu(), cpu)
+        # The signed-overflow boundary, called out separately.
+        for v in (0, 1, 127, 128, 200, 254, 255):
+            with self.subTest(value=v):
+                t = torch.tensor([v], dtype=torch.uint8).to("spyre")
+                self.assertEqual(int(t.cpu()[0]), v)
+
+    def test_uint8_non_contiguous_roundtrip(self):
+        """17x16 uint8 round trip in contiguous, transposed and strided views."""
+        # % 251 (prime) instead of a plain arange: plain arange wraps at 256,
+        # so row 16 would equal row 0 and a row-swap bug would pass.
+        cpu = (torch.arange(272) % 251).to(torch.uint8).reshape(17, 16)
+        for name, t in (
+            ("contiguous", cpu),
+            ("transposed", cpu.t()),
+            ("strided", (torch.arange(544) % 251).to(torch.uint8)[::2].reshape(17, 16)),
+        ):
+            with self.subTest(view=name):
+                self.assertEqual(t.to("spyre").cpu(), t)
 
     def test_uint8_allocation_still_allowed(self):
         """Allocating a uint8 tensor on device must keep working.
 
-        Only the host transfer is refused.  torch.distributed allocates uint8
-        tensors internally (distributed_c10d.py, used by barrier() and the
-        object collectives), so gating is_supported_dtype() on this would
-        break the multi-Spyre barrier tests.
+        torch.distributed allocates uint8 tensors internally
+        (distributed_c10d.py, used by barrier() and the object collectives),
+        so gating is_supported_dtype() on this would break the multi-Spyre
+        barrier tests.
         """
         t = torch.empty(272, dtype=torch.uint8, device="spyre")
         self.assertEqual(t.device.type, "spyre")
