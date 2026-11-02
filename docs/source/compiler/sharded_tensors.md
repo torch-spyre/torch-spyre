@@ -3,8 +3,8 @@
 Sharding gives a Spyre tensor *one storage that is physically split
 across the accelerator's cores*, while the tensor itself keeps its global
 logical shape. A sharded tensor is created with
-`torch.spyre.distribute_tensor(x, Shard(dim))`, copied back with
-`full_tensor` / `.to("cpu")`, and consumed by compiled kernels that address
+`torch.spyre.to_sharded(x, Shard(dim))`, copied back with
+`.to("cpu")` / `.cpu()`, and consumed by compiled kernels that address
 each core's own
 shard directly. Everything that cannot honor that storage model fails
 closed — it raises instead of silently reading part of the tensor.
@@ -64,27 +64,29 @@ and the kernels that consume it agree on how many cores participate.
 import torch
 from torch.distributed.tensor import Shard
 
-y = torch.spyre.distribute_tensor(x, Shard(0))         # CPU -> sharded spyre
+y = torch.spyre.to_sharded(x, Shard(0))                # CPU -> sharded spyre
 z = y + y                                              # compiled sharded add
-x_back = torch.spyre.full_tensor(y)                    # gather every shard
+x_back = y.cpu()                                       # gather every shard
 
 torch.spyre.is_sharded(y)                              # True
 info = torch.spyre.sharding_info(y)
 info.placement, info.num_shards, info.receipt          # Shard(0), 8, entries
 ```
 
-The API is named and shaped to be recognized by users of PyTorch Tensor
-Parallel (`torch.distributed.tensor`): `distribute_tensor` and `full_tensor`
-mirror the TP entry points, the device plays the role of the mesh, and
-`placement` accepts the TP list idiom. The docstrings state the divergence at
-the point of use — the result is a plain `torch.Tensor`, with no DTensor, no
-mesh, no collectives, no autograd, and equal shards only — and the fail-closed
-design makes every wrong TP expectation fail loudly rather than silently.
+The API reuses the Tensor Parallel *vocabulary* — the `Shard(dim)` placement
+type and its single-element list idiom — but deliberately avoids the
+`torch.distributed.tensor` entry-point names: `distribute_tensor` returns a
+DTensor there and a plain `torch.Tensor` here, and sharing the name would
+invite that confusion. `to_sharded` instead follows the `to_sparse` /
+`to_mkldnn` family — a plain tensor with a different storage layout — and the
+docstrings state the divergence at the point of use: no DTensor, no mesh, no
+collectives, no autograd, equal shards only, with every wrong expectation
+failing loudly rather than silently.
 
-### `distribute_tensor`
+### `to_sharded`
 
 ```python
-torch.spyre.distribute_tensor(tensor, placement, *, num_shards=None)
+torch.spyre.to_sharded(tensor, placement, *, num_shards=None)
     -> torch.Tensor
 ```
 
@@ -119,16 +121,6 @@ supported dtype with compact storage. Degenerate shapes and out-of-range
 placement dims are rejected by the planner before allocation. If validation
 passes but allocation or any shard copy fails, no tensor is returned — the
 result is dropped and freed; nothing falls back to unified storage.
-
-### `full_tensor`
-
-```python
-torch.spyre.full_tensor(tensor) -> torch.Tensor
-```
-
-Gathers every shard of a sharded Spyre tensor into one ordinary CPU tensor.
-`.to("cpu")` and `.cpu()` on the tensor do the same thing. Raises
-`TypeError` for anything that is not a sharded Spyre tensor.
 
 ### `is_sharded`
 
@@ -302,9 +294,9 @@ The sharding suite lives in `tests/sharding/`; every file there exercises
 production code (there are no self-referential reference models). The
 load-bearing contracts, and where they are pinned:
 
-* **Validation precedes runtime.** Every rejection in `distribute_tensor`
+* **Validation precedes runtime.** Every rejection in `to_sharded`
   happens before the runtime is initialized
-  (`tests/sharding/test_distribute_tensor_api.py`, via a fixture that fails the
+  (`tests/sharding/test_to_sharded_api.py`, via a fixture that fails the
   test if the runtime is touched).
 * **Importing the API has no side effects** — no extension load, no
   `torch.distributed`, no device registration (subprocess test in the

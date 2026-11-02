@@ -14,7 +14,7 @@
 
 """Non-unified pointwise kernels over sharded storage.
 
-A sharded tensor (``torch.spyre.distribute_tensor``) keeps shard *c* in its own
+A sharded tensor (``torch.spyre.to_sharded``) keeps shard *c* in its own
 device chunk, which belongs to core *c*. A pointwise op whose operands are
 sharded compiles to a non-unified kernel: core *c* reads and writes only
 chunk *c*, each through its own start address (``nonUnifiedAllocInHBM_``).
@@ -109,7 +109,7 @@ def check_sharded_input(
     if not ok:
         raise Unsupported(
             f"{name}: non-unified kernels need sharded inputs that are base "
-            "tensors from distribute_tensor (no views, slices or reshapes)"
+            "tensors from to_sharded (no views, slices or reshapes)"
         )
 
 
@@ -117,7 +117,7 @@ def _check_core_match(placement: ShardedPlacement) -> None:
     """Non-unified kernels need one core per shard.
 
     The storage side is validated where the tensor is created:
-    ``distribute_tensor`` checks the placement receipt in Python. This checks
+    ``to_sharded`` checks the placement receipt in Python. This checks
     the compiler-side core count so the pinned work split has a core to pin
     to.
     """

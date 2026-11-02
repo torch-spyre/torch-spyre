@@ -1,7 +1,7 @@
 test_suite_config:
   labels: [unit, regression, integration, trunk]
   files:
-    - path: ${TORCH_DEVICE_ROOT}/tests/sharding/test_distribute_tensor_api.py
+    - path: ${TORCH_DEVICE_ROOT}/tests/sharding/test_to_sharded_api.py
       unlisted_test_mode: mandatory_success
     - path: ${TORCH_DEVICE_ROOT}/tests/sharding/test_segment_emulated_receipt.py
       unlisted_test_mode: mandatory_success

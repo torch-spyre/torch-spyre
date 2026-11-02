@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for torch.spyre.distribute_tensor(x, Shard(d))."""
+"""Tests for torch.spyre.to_sharded(x, Shard(d))."""
 
 from __future__ import annotations
 
@@ -26,10 +26,9 @@ import torch_spyre._sharded_api as sharded_api
 from device_env import emulation_ready
 from side_effect_utils import subprocess_import_side_effects
 from torch_spyre._sharded_api import (
-    distribute_tensor,
-    full_tensor,
     is_sharded,
     sharding_info,
+    to_sharded,
 )
 from torch_spyre.sharding import SpyreShardingSpec
 
@@ -114,25 +113,25 @@ def test_importing_sharded_api_has_no_backend_or_runtime_side_effects():
 
 def test_valid_request_reaches_the_runtime(no_runtime):
     with pytest.raises(_NativeCalled):
-        distribute_tensor(_source((16,)), Shard(0))
+        to_sharded(_source((16,)), Shard(0))
     assert no_runtime == ["init"]
 
 
 @pytest.mark.parametrize("placement", [Replicate(), Partial(), object(), None, 0])
 def test_placement_must_be_exact_shard(no_runtime, placement):
     with pytest.raises(TypeError, match="Shard"):
-        distribute_tensor(_source(), placement)
+        to_sharded(_source(), placement)
     assert no_runtime == []
 
 
 def test_spec_object_is_not_the_public_placement(no_runtime):
     # Construct a fully valid spec first: SpyreShardingSpec(Shard(0)) alone
     # raises a dataclass TypeError whose message names the class (which
-    # contains "Shard"), so that form passes even if distribute_tensor
+    # contains "Shard"), so that form passes even if to_sharded
     # accepts spec objects. A valid spec isolates the placement rejection.
     spec = SpyreShardingSpec(Shard(0), 8)
     with pytest.raises(TypeError, match="placement must be exactly"):
-        distribute_tensor(_source(), spec)
+        to_sharded(_source(), spec)
     assert no_runtime == []
 
 
@@ -140,14 +139,14 @@ def test_tp_style_single_element_list_placement_is_accepted(no_runtime):
     """``[Shard(0)]`` is the torch.distributed.tensor idiom; accept it."""
 
     with pytest.raises(_NativeCalled):
-        distribute_tensor(_source((16,)), [Shard(0)])
+        to_sharded(_source((16,)), [Shard(0)])
     assert no_runtime == ["init"]
 
 
 @pytest.mark.parametrize("placement", [[Shard(0), Shard(1)], [], [Shard(0), None]])
 def test_placement_list_must_hold_exactly_one_entry(no_runtime, placement):
     with pytest.raises(TypeError, match="single Shard"):
-        distribute_tensor(_source((16,)), placement)
+        to_sharded(_source((16,)), placement)
     assert no_runtime == []
 
 
@@ -155,7 +154,7 @@ def test_num_shards_defaults_to_the_active_core_count(no_runtime, active_cores):
     active_cores["cores"] = 16
 
     with pytest.raises(_NativeCalled):
-        distribute_tensor(_source((32,)), Shard(0))
+        to_sharded(_source((32,)), Shard(0))
     assert no_runtime == ["init"]
 
 
@@ -163,27 +162,20 @@ def test_default_count_must_be_a_supported_shard_count(no_runtime, active_cores)
     active_cores["cores"] = 32
 
     with pytest.raises(ValueError, match="8 or 16"):
-        distribute_tensor(_source((32,)), Shard(0))
+        to_sharded(_source((32,)), Shard(0))
     assert no_runtime == []
-
-
-def test_full_tensor_rejects_non_sharded_values():
-    with pytest.raises(TypeError, match="sharded"):
-        full_tensor(torch.empty(4))
-    with pytest.raises(TypeError, match="sharded"):
-        full_tensor(object())
 
 
 @pytest.mark.parametrize("num_shards", [0, 32])
 def test_unsupported_shard_counts_fail(no_runtime, num_shards):
     with pytest.raises(ValueError, match="8 or 16"):
-        distribute_tensor(_source((32,)), Shard(0), num_shards=num_shards)
+        to_sharded(_source((32,)), Shard(0), num_shards=num_shards)
     assert no_runtime == []
 
 
 def test_num_shards_is_keyword_only(no_runtime):
     with pytest.raises(TypeError):
-        distribute_tensor(_source((16,)), Shard(0), 8)
+        to_sharded(_source((16,)), Shard(0), 8)
     assert no_runtime == []
 
 
@@ -196,7 +188,7 @@ def test_shard_count_must_equal_active_cores(
     active_cores["cores"] = cores
 
     with pytest.raises(ValueError, match=f"SENCORES={cores}"):
-        distribute_tensor(_source((32,)), Shard(0), num_shards=num_shards)
+        to_sharded(_source((32,)), Shard(0), num_shards=num_shards)
     assert no_runtime == []
 
 
@@ -226,13 +218,13 @@ def test_active_core_count_reads_inductor_sencores(monkeypatch):
 )
 def test_invalid_sources_fail_before_runtime(no_runtime, source, message):
     with pytest.raises((TypeError, ValueError), match=message):
-        distribute_tensor(source, Shard(0))
+        to_sharded(source, Shard(0))
     assert no_runtime == []
 
 
 def test_tensor_subclass_fails_before_runtime(no_runtime):
     with pytest.raises(TypeError, match="torch.Tensor or torch.nn.Parameter"):
-        distribute_tensor(_source().as_subclass(_TensorSubclass), Shard(0))
+        to_sharded(_source().as_subclass(_TensorSubclass), Shard(0))
     assert no_runtime == []
 
 
@@ -240,7 +232,7 @@ def test_parameter_without_grad_reaches_runtime(no_runtime):
     source = torch.nn.Parameter(_source(), requires_grad=False)
 
     with pytest.raises(_NativeCalled):
-        distribute_tensor(source, Shard(0))
+        to_sharded(source, Shard(0))
 
 
 @pytest.mark.parametrize(
@@ -258,7 +250,7 @@ def test_planning_failures_precede_runtime(
 ):
     active_cores["cores"] = num_shards
     with pytest.raises(ValueError, match=message):
-        distribute_tensor(torch.empty(shape), Shard(dim), num_shards=num_shards)
+        to_sharded(torch.empty(shape), Shard(dim), num_shards=num_shards)
     assert no_runtime == []
 
 
@@ -297,7 +289,7 @@ def test_device_result_is_a_sharded_tensor(active_cores, shape, dim, dtype, num_
     shape = tuple(e * (2 if i == dim % len(shape) else 1) for i, e in enumerate(shape))
     source = torch.randn(shape).to(dtype)
 
-    result = torch.spyre.distribute_tensor(source, Shard(dim), num_shards=num_shards)
+    result = torch.spyre.to_sharded(source, Shard(dim), num_shards=num_shards)
 
     assert type(result) is torch.Tensor
     assert result.device.type == "spyre"
@@ -325,12 +317,11 @@ def test_device_result_is_a_sharded_tensor(active_cores, shape, dim, dtype, num_
         lambda t: t.cpu(),
         lambda t: t.to(torch.device("cpu")),
         lambda t: t.to(device="cpu"),
-        torch.spyre.full_tensor,
     ],
 )
 def test_device_gather_forms(gather):
     source = torch.randn(32, 64, dtype=torch.float32)
-    result = torch.spyre.distribute_tensor(source, Shard(0))
+    result = torch.spyre.to_sharded(source, Shard(0))
 
     assert torch.equal(gather(result), source)
 
@@ -345,9 +336,9 @@ def test_device_shards_spread_round_robin_across_domains(active_cores, num_shard
     active_cores["cores"] = num_shards
     source = torch.randn(num_shards * 4, 64, dtype=torch.float32)
 
-    # distribute_tensor initializes the Flex runtime; num_memory_domains
+    # to_sharded initializes the Flex runtime; num_memory_domains
     # reports the topology of the initialized allocator.
-    result = torch.spyre.distribute_tensor(source, Shard(0), num_shards=num_shards)
+    result = torch.spyre.to_sharded(source, Shard(0), num_shards=num_shards)
     num_domains = _C.num_memory_domains()
 
     info = torch.spyre.sharding_info(result)
@@ -362,7 +353,7 @@ def test_device_shards_spread_round_robin_across_domains(active_cores, num_shard
 @_requires_spyre
 def test_device_each_shard_is_in_its_own_chunk():
     source = torch.randn(32, 64, dtype=torch.float32)
-    result = torch.spyre.distribute_tensor(source, Shard(0))
+    result = torch.spyre.to_sharded(source, Shard(0))
     from torch_spyre import _C
 
     # Overwrite shard 3 on the device through a fresh copy: only its rows move.
@@ -379,7 +370,7 @@ def test_device_fill_fails_instead_of_writing_one_chunk(active_cores):
     # fill_ takes one device address; the runtime guard rejects sharded
     # storage. Compiled ops on sharded tensors are covered by
     # test_sharded_add.py.
-    result = torch.spyre.distribute_tensor(torch.randn(16, 64), Shard(0))
+    result = torch.spyre.to_sharded(torch.randn(16, 64), Shard(0))
 
     with pytest.raises(
         RuntimeError, match="does not support sharded Spyre tensors yet"

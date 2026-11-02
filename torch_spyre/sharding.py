@@ -129,7 +129,7 @@ def validate_sharded_receipt(
 class SpyreShardingSpec:
     """Internal sharding layout: one ``Shard`` over N placement slots.
 
-    Users call ``torch.spyre.distribute_tensor(x, Shard(d))``. This
+    Users call ``torch.spyre.to_sharded(x, Shard(d))``. This
     backend-owned record is kept so future hardware can attach topology /
     placement policy (for example a non-identity slot-to-core map) without
     changing the public API.

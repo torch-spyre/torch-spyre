@@ -232,7 +232,7 @@ def _assert_one_non_unified_kernel(runs, n: int, num_tensors: int = 3) -> None:
 
 
 def _sharded(cpu: torch.Tensor, dim: int, n: int) -> torch.Tensor:
-    return torch.spyre.distribute_tensor(cpu, Shard(dim), num_shards=n)
+    return torch.spyre.to_sharded(cpu, Shard(dim), num_shards=n)
 
 
 @_requires_emulation
@@ -270,7 +270,7 @@ def test_chained_compiled_adds(launched):
     """A compiled sharded output feeds a second compiled call.
 
     The output of a non-unified kernel is allocated by the wrapper
-    (_spyre_empty_sharded), not by distribute_tensor; if its storage differed in
+    (_spyre_empty_sharded), not by to_sharded; if its storage differed in
     anything the planner or launch binding keys on, the second call is where
     it would show.
     """

@@ -48,7 +48,7 @@ _SUPPORTED_TRANSFER_DTYPES = frozenset(
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
-class _ValidatedDistributeRequest:
+class _ValidatedShardingRequest:
     """Validated host-to-Spyre transfer request metadata."""
 
     source: torch.Tensor
@@ -107,7 +107,7 @@ def _validate_core_match(num_shards: int) -> None:
     active_cores = _active_core_count()
     if num_shards != active_cores:
         raise ValueError(
-            f"distribute_tensor(num_shards={num_shards}) requires {num_shards} "
+            f"to_sharded(num_shards={num_shards}) requires {num_shards} "
             f"active cores (one core per shard), but SENCORES={active_cores}; "
             f"set SENCORES={num_shards}"
         )
@@ -118,7 +118,7 @@ def _normalize_placement(placement: object):
 
     PyTorch's ``distribute_tensor`` takes one placement per mesh dimension;
     this device has no mesh, so exactly one placement is admitted and the
-    list form is accepted purely for familiarity.
+    list form is accepted for familiarity with that idiom.
     """
 
     if isinstance(placement, (list, tuple)):
@@ -131,9 +131,9 @@ def _normalize_placement(placement: object):
     return placement
 
 
-def _validate_distribute_request(
+def _validate_sharding_request(
     source: object, placement: object, num_shards: object
-) -> _ValidatedDistributeRequest:
+) -> _ValidatedShardingRequest:
     """Validate and plan one host-to-Spyre transfer request."""
 
     spec = SpyreShardingSpec(
@@ -147,7 +147,7 @@ def _validate_distribute_request(
     # Planning gate: degenerate shapes and out-of-range placement dims are
     # rejected here, before the runtime is touched.
     spec.plan(global_shape)
-    return _ValidatedDistributeRequest(
+    return _ValidatedShardingRequest(
         source=validated_source,
         spec=spec,
         global_shape=global_shape,
@@ -207,29 +207,29 @@ def sharding_info(tensor: torch.Tensor) -> ShardedTensorInfo:
     )
 
 
-def distribute_tensor(
+def to_sharded(
     tensor: object, placement: object, *, num_shards: object = None
 ) -> torch.Tensor:
     """Copy a CPU tensor into a sharded Spyre tensor.
 
     Example::
 
-        y = torch.spyre.distribute_tensor(x, Shard(0))
-        x_back = y.to("cpu")
+        y = torch.spyre.to_sharded(x, Shard(0))
+        x_back = y.cpu()
 
-    The name and call shape mirror ``torch.distributed.tensor.distribute_tensor``
-    so tensor-parallel users recognize the pattern, with the device playing
-    the role of the mesh. Unlike that function the result is a plain
-    ``torch.Tensor`` on the ``spyre`` device — there is no DTensor, no mesh,
-    no collectives (no ``redistribute()``, no autograd), and shards must be
-    equal.
+    The result is a plain ``torch.Tensor`` on the ``spyre`` device whose
+    storage is split across the device's cores — the same relationship
+    ``to_sparse()`` bears to strided storage, not a DTensor: there is no
+    mesh, no collectives and no autograd, and shards must be equal. The
+    name deliberately avoids ``torch.distributed.tensor.distribute_tensor``,
+    which returns a DTensor.
 
     ``placement`` is a ``Shard(dim)`` or the single-element list
     ``[Shard(dim)]``. ``num_shards`` must be 8 or 16 and must equal the
-    active core count (``SENCORES``) — like tensor parallel, the shard count
-    is a property of the hardware, not a free parameter. ``num_shards``
-    omitted means "the active core count"; since the default ``SENCORES`` is
-    32, a default environment must set ``SENCORES`` to 8 or 16 first.
+    active core count (``SENCORES``) — the shard count is a property of the
+    hardware, not a free parameter. ``num_shards`` omitted means "the active
+    core count"; since the default ``SENCORES`` is 32, a default environment
+    must set ``SENCORES`` to 8 or 16 first.
 
     The result carries the global shape and dtype of ``tensor``. Its storage
     holds ``num_shards`` (8 or 16) backend
@@ -238,16 +238,15 @@ def distribute_tensor(
     bound to core *i* (an identity slot-to-core map); the placement receipt
     records the actual binding.
 
-    Copying back to the CPU (``full_tensor``, ``.to("cpu")``, ``.cpu()``)
-    gathers every shard. Operations that do not support sharded storage
-    raise instead of reading part of the tensor. Fails closed: no tensor is
-    returned if allocation or any shard copy fails, and nothing falls back
-    to unified storage.
+    ``.to("cpu")`` / ``.cpu()`` gathers every shard back. Operations that do
+    not support sharded storage raise instead of reading part of the tensor.
+    Fails closed: no tensor is returned if allocation or any shard copy
+    fails, and nothing falls back to unified storage.
     """
 
     if num_shards is None:
         num_shards = _active_core_count()
-    request = _validate_distribute_request(tensor, placement, num_shards)
+    request = _validate_sharding_request(tensor, placement, num_shards)
     source = request.source
     dim = request.spec.placement.dim % source.dim()
 
@@ -266,16 +265,3 @@ def distribute_tensor(
     # destinations); on failure ``result`` is dropped and freed.
     _C.copy_tensor(source.detach(), result, non_blocking=False)
     return result
-
-
-def full_tensor(tensor: object) -> torch.Tensor:
-    """Return the gathered CPU copy of a sharded Spyre tensor.
-
-    The tensor-parallel counterpart of ``DTensor.full_tensor()``: it gathers
-    every shard into one ordinary CPU tensor. ``.to("cpu")`` and ``.cpu()``
-    do the same thing.
-    """
-
-    if not isinstance(tensor, torch.Tensor) or not is_sharded(tensor):
-        raise TypeError("expected a sharded Spyre tensor")
-    return tensor.to("cpu")
