@@ -130,6 +130,7 @@ them with `PARAMS`, and `pr-review` checks them.
 | `SPYRE_DUMP_COST=1` | Predicted-runtime report after pre-scheduling |
 | `TORCH_SPYRE_TIMING=1` | Structured per-compile frontend timing records |
 | `TORCH_SPYRE_TIMING_OUT` | Where to write them (pid inserted: `rec.json` -> `rec.<pid>.json`) |
+| `SPYRE_BACKEND_COMPILE_TIMEOUT_SECONDS` | Seconds allowed for each `dbo-opt` invocation (default 60; non-positive disables) |
 | `TORCH_SPYRE_FRONTEND_ONLY=1` | Stop each compile before the backend compiler; no runnable kernel, measurement only |
 
 ## Spyre Hardware Basics

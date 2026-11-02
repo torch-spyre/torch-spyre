@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "A launcher-recorded run-to-run edge: an intent first, then the resolved child run.",
+  "properties": {
+    "confidence": {
+      "enum": [
+        "exact",
+        "low",
+        "timestamp",
+        "unresolved"
+      ]
+    },
+    "dispatched_at": {},
+    "evidence_kind": {
+      "enum": [
+        "cited",
+        "inferred",
+        "recorded"
+      ]
+    },
+    "from_run_key": {
+      "minLength": 1
+    },
+    "link_id": {
+      "minLength": 1
+    },
+    "observed_at": {},
+    "props": {},
+    "recorded_by": {},
+    "relation": {
+      "enum": [
+        "launched",
+        "retry_of"
+      ]
+    },
+    "target": {},
+    "to_run_key": {}
+  },
+  "required": [
+    "link_id",
+    "observed_at",
+    "from_run_key",
+    "to_run_key",
+    "relation",
+    "evidence_kind",
+    "confidence",
+    "target",
+    "dispatched_at",
+    "recorded_by",
+    "props"
+  ],
+  "title": "pipeline_run_links: the stored row",
+  "type": "object",
+  "x-uploadable": false
+}

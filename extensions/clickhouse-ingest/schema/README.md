@@ -16,6 +16,8 @@ Applying them in filename order works from an empty database.
 | `26-dispatch-targets.sql` | `dispatch_targets` | — |
 | `30-benchmarks.sql` | `benchmarks`, `benchmark_runs` | — |
 | `40-jenkins-agents.sql` | `jenkins_agents` | — |
+| `41-ops-requests.sql` | `ops_requests` | — |
+| `42-ci-requests.sql` | `ci_requests` | — |
 | `47-pipeline-runs.sql` | `pipeline_runs`, `pipeline_run_legs` | — |
 | `48-ci-run-timings.sql` | `ci_run_timings` | — |
 | `49-result-uploads.sql` | `result_uploads`, `v_result_uploads`, `v_artifact_results_published` | 20 |
@@ -26,10 +28,17 @@ Applying them in filename order works from an empty database.
 | `54-ci-run-timing-views.sql` | `v_ci_run_timings`, `v_ci_runs`, `v_ci_runs_spyre_test`, `v_ci_runs_merge_queue`, `v_ci_runs_main_push`, `v_ci_lane_daily` | 48 |
 | `55-dispatch-views.sql` | `v_dispatch_verdicts`, `v_artifact_events`, `v_subscription_artifacts`, `v_artifact_subscribers`, `v_feed_events` (parameterized), `v_dispatch_targets` | 20, 25, 26, 49, 50 |
 | `56-pipeline-run-lineage.sql` | `pipeline_run_links`, `v_pipeline_run_links`, `v_pipeline_run_links_pending`, `v_pipeline_run_edges`, `v_pipeline_run_lineage`, `v_pipeline_run_lineage_gaps` | 47, 53 |
+| `57-failure-forensics-views.sql` | `v_result_run_context`, `v_failure_fingerprint`, `v_case_run_history`, `v_failure_recurrence`, `v_failure_first_seen`, `v_failure_groups` | 10, 20, 45, 47, 53 |
+| `58-ci-event-records.sql` | `poller_decisions`, `ci_write_failures`, `merge_queue_events` | — |
+| `59-ci-request-views.sql` | `v_ci_requests`, `v_ci_cell_durations` | 20, 42, 50 |
 | `60-benchmark-views.sql` | 5 `v_benchmark_*` views | 20, 30, 50 |
 | `62-benchmark-verdicts.sql` | `benchmark_metric_policy`, `v_benchmark_metric_verdicts`, `v_benchmark_gate`, `benchmark_metric_verdicts` + its refreshable MV | 60 |
 | `63-perf-regression-gate.sql` | `v_perf_regression_gate` | 20, 62 |
+| `64-rbac.sql` | `rbac_roles`, `rbac_bindings`, each with a `*_versions` log and MV | — |
+| `67-effect-status.sql` | `effect_status` (append-only triage events), `v_effect_status` | — |
 | `70-vllm-hud-projection.sql` | `oss_ci_benchmark_v3`, `oss_ci_benchmark_metadata`, their `_by_tag` copies + their MVs | 30, 60 |
+| `72-ops-audit-events.sql` | `ops_audit_events`, `v_ops_audit_events` | — |
+| `73-ci-access-audit.sql` | `ci_access_audit`, `v_ci_access_audit` | — |
 
 The `50`/`51`/`52` split is by what a view reads, not by taste: the artifact and functional view
 families are independent, and `v_run_coverage` is separate because it measures the join between

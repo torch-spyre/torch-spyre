@@ -30,6 +30,7 @@ from torch._inductor.codegen.common import (
     REMOVED,
 )
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
+from torch._inductor.ir import ComputedBuffer, Pointwise
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ops_handler import DefaultHandler, StoreMode
 from torch._inductor.utils import IndentedBuffer, sympy_index_symbol, sympy_subs
@@ -54,16 +55,23 @@ from . import config as _spyre_config
 from .core_mapping import (
     derive_operation_mapping,
     finalize_tensor_work_divisions,
+    matmul_reduction_dim,
     remap_work_division,
     work_division_from_view,
 )
 from .errors import Unsupported
+from .lx_read_contracts import (
+    LocalReadEmission,
+    has_partial_read,
+    normalize_local_read as normalize_local_lx_subrange,
+)
 from .ir import FixedTiledLayout, SpyreConstantFallback
 from .scratchpad.lx_relayout import (
     materialized_lx_relayout_for_destination,
 )
 from .pass_utils import (
     concretize_expr,
+    op_read_writes,
     compute_symbolic_bounds,
     finite_upper_or_none,
     iteration_space,
@@ -563,6 +571,9 @@ class SpyreKernel(Kernel[CSEVariable]):
         self.scheduled_nodes: list[SchedulerNode] = []
         self.failed_node: SchedulerNode | None = None
         self.pool_size: int = pool_size
+        self.local_read_contract_factory: (
+            Callable[[str, Any], LocalReadEmission | None] | None
+        ) = None
         # Live call args, deduped and filtered to names in spyre_kernel_args.
         # Set by codegen_kernel(); used by call_kernel() to ensure arg_index
         # values match .run() positional args.
@@ -907,6 +918,26 @@ class SpyreKernel(Kernel[CSEVariable]):
             kernel_local=kernel_local,
             replicated_scalar=replicated_scalar,
         )
+        if (
+            _spyre_config.lx_planner_relayout
+            and not _spyre_config.ktir_emitter
+            and tensor_arg.is_input
+            and "lx" in tensor_arg.allocation
+            and isinstance(operation, ComputedBuffer)
+            and isinstance(operation.data, Pointwise)
+        ):
+            reads = [dep for dep in op_read_writes(operation).reads if dep.name == name]
+            if has_partial_read(V.graph.get_buffer(name).layout.size, reads):
+                if self.local_read_contract_factory is None:
+                    raise ValueError(f"{name}: local LX contract provider is missing")
+                contract = self.local_read_contract_factory(name, operation)
+                tensor_arg = normalize_local_lx_subrange(
+                    contract,
+                    name,
+                    tensor_arg,
+                    it_space,
+                    allow_extended=_spyre_config.lx_extended_ownership,
+                )
         if (
             "lx" not in tensor.layout.allocation
             and "hbm_pool" not in tensor.layout.allocation
@@ -1967,6 +1998,8 @@ def simplify_op_spec(
                 c.xreplace(indirect_access_subs) for c in arg.device_coordinates
             ]
 
+    if op_spec.op in MATMUL_REDUCTION_OPS:
+        _restore_matmul_loop_order(op_spec)
     _finalize_tensor_work_divisions(op_spec)
     is_relayout = is_lx_relayout_identity(op_spec.op, op_spec.args, op_spec.op_info)
     if is_relayout:
@@ -1978,6 +2011,44 @@ def simplify_op_spec(
         _finalize_core_mapping(op_spec, use_tensor_constraints=True)
         for arg in op_spec.args:
             arg.work_division = None
+
+
+def _restore_matmul_loop_order(op_spec: OpSpec) -> None:
+    """Make a matmul's reduction loop K its last loop again after alignment.
+
+    Inductor orders matmul loops batch, M, N, K. The K-fast core order, the SDSC
+    dim labels and the kernel provenance take K as the last loop. Alignment adds
+    a range-1 loop after K for each elided device dimension, and it puts this
+    loop in every tensor. Such a loop is a batch loop, so this step moves it to
+    the front. ``matmul_reduction_dim`` finds K from its role. The order does not
+    change when there is no single K, or when a tensor does not index a loop
+    after K. The readers then take the last loop as K.
+    """
+    reduction = matmul_reduction_dim(op_spec.iteration_space, op_spec.args)
+    if reduction is None:
+        logger.debug("%s: no single reduction loop; loop order kept", op_spec.op)
+        return
+    dims = list(op_spec.iteration_space)
+    trailing = dims[dims.index(reduction) + 1 :]
+    if not trailing:
+        return
+    for arg in op_spec.args:
+        indexed = {
+            symbol
+            for coordinate in arg.device_coordinates
+            for symbol in sympy.sympify(coordinate).free_symbols
+        }
+        if not indexed.issuperset(trailing):
+            logger.debug(
+                "%s: loops %s after K are not in every tensor; loop order kept",
+                op_spec.op,
+                trailing,
+            )
+            return
+    op_spec.iteration_space = {
+        dim: op_spec.iteration_space[dim]
+        for dim in trailing + dims[: dims.index(reduction) + 1]
+    }
 
 
 def _finalize_tensor_work_divisions(op_spec: OpSpec) -> None:

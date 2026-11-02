@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "one test's outcome. Identity fields ride in the row; ids are derived.",
+  "properties": {
+    "rows": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "classname": {
+            "description": "The test's class or module; part of its identity.",
+            "type": "string"
+          },
+          "duration_s": {
+            "minimum": 0,
+            "type": "number"
+          },
+          "fail_message": {
+            "description": "Truncated to 8192 characters.",
+            "type": "string"
+          },
+          "measurements": {
+            "additionalProperties": {
+              "type": "number"
+            },
+            "description": "Numbers this run measured.",
+            "type": "object"
+          },
+          "name": {
+            "description": "The test's name; part of its identity.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "props": {
+            "additionalProperties": {
+              "type": [
+                "string",
+                "number"
+              ]
+            },
+            "description": "result.* values recorded verbatim.",
+            "type": "object"
+          },
+          "status": {
+            "enum": [
+              "error",
+              "failed",
+              "passed",
+              "skipped",
+              "xfail",
+              "xpass"
+            ]
+          },
+          "tags": {
+            "description": "namespace__value tags. Identity tags name the test; platform__/testtype__/cadence__ describe this run.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "name",
+          "status"
+        ],
+        "type": "object"
+      },
+      "minItems": 1,
+      "type": "array"
+    }
+  },
+  "required": [
+    "rows"
+  ],
+  "title": "test_case_runs upload file: results/test_case_runs.json",
+  "type": "object"
+}
