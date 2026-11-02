@@ -130,7 +130,11 @@ from torch_spyre._inductor.wsr.tile import (
     compute_tile_index,
     compute_tile_stride,
 )
-from utils_inductor import ir_computed_buffer, ir_input_loader
+from utils_inductor import (
+    ir_computed_buffer,
+    ir_input_loader,
+    patch_tiling_helper,
+)
 
 _FP16 = DataFormats.SEN169_FP16
 
@@ -1937,17 +1941,15 @@ class TestDivideRanges(unittest.TestCase):
         after_space = dict(zip(symbols, (Integer(64), Integer(64))))
 
         with (
-            patch(
-                "torch_spyre._inductor.wsr.coarse_tile._capture_logical_iteration_symbols",
+            patch_tiling_helper(
+                "_capture_logical_iteration_symbols",
                 side_effect=Unsupported("fused dimensions"),
             ),
-            patch(
-                "torch_spyre._inductor.wsr.coarse_tile.iteration_space_from_op",
+            patch_tiling_helper(
+                "iteration_space_from_op",
                 side_effect=(before_space, after_space),
             ),
-            patch(
-                "torch_spyre._inductor.wsr.coarse_tile.invalidate_op_read_writes"
-            ) as invalidate,
+            patch_tiling_helper("invalidate_op_read_writes") as invalidate,
         ):
             result = _divide_ranges(op, Integer(2), tiled_dims=[0])
 
@@ -1966,12 +1968,12 @@ class TestDivideRanges(unittest.TestCase):
         after_symbols = before_symbols[:1]
 
         with (
-            patch(
-                "torch_spyre._inductor.wsr.coarse_tile._capture_logical_iteration_symbols",
+            patch_tiling_helper(
+                "_capture_logical_iteration_symbols",
                 side_effect=Unsupported("fused dimensions"),
             ),
-            patch(
-                "torch_spyre._inductor.wsr.coarse_tile.iteration_space_from_op",
+            patch_tiling_helper(
+                "iteration_space_from_op",
                 side_effect=(
                     dict(zip(before_symbols, (Integer(2), Integer(64)))),
                     {after_symbols[0]: Integer(64)},
@@ -2225,86 +2227,52 @@ class TestDivideRanges(unittest.TestCase):
         expected = SpyreTensorLayout([1, 128], expected_strides, torch.float16, [0, 1])
         self.assertEqual(layout.device_layout, expected)
 
-    def test_resize_device_layout_grow_from_singleton(self):
-        """_allocate_full_buffer grow path: a device dim tiled to size 1
-        (stride_map != -1) must be grown back on the full-buffer allocation.
-
-        [1, 128] grow dim0 -> [4, 128]: the size-1 non-stick device dim must
-        update to device_size=4, not remain frozen at 1."""
+    def test_resize_device_layout_refuses_to_grow(self):
+        """Growing back is ambiguous where the tile has two host dims of
+        extent 1, so a grow raises rather than return a stale layout."""
         from torch_spyre._C import SpyreTensorLayout
         from torch_spyre._inductor.wsr.coarse_tile import _resize_device_layout
 
-        # Per-tile buffer is [1, 128] — dim0 was tiled to extent 1.
-        # device_size=[2, 1, 64], stride_map=[64, -1, 1].
         stl = SpyreTensorLayout([1, 128], [128, 1], torch.float16, [0, 1])
-        result = _resize_device_layout(stl, [1, 128], [4, 128])
+        with self.assertRaisesRegex(ValueError, "only shrinks"):
+            _resize_device_layout(stl, [1, 128], [4, 128])
 
-        expected = SpyreTensorLayout([4, 128], [128, 1], torch.float16, [0, 1])
-        self.assertEqual(result, expected)
-
-    def test_resize_device_layout_grow_from_singleton_permuted(self):
-        """The grow path on a permuted buffer: a device dim tiled to size 1
-        (stride_map -1) grows back to the full buffer's actual host stride, not
-        the contiguous one."""
+    def test_resize_device_layout_keeps_a_broadcast_stick_sparse(self):
+        """A broadcast stick compacted to stride_map -1 stays -1 when another
+        dim shrinks, so the tile's layout is the one compaction gives the tile.
+        The host stride, 0, would undo the compaction, and
+        _multi_arg_pointwise_layouts recognizes a broadcast stick only by -1.
+        Device coordinates ignore both, so either addresses the same element."""
         from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.propagate_layouts import (
+            _compact_broadcast_device_dims,
+        )
         from torch_spyre._inductor.wsr.coarse_tile import _resize_device_layout
 
-        size, stride = [8, 8, 512, 512], [512, 4096, 32768, 1]
-        order = [1, 0, 2, 3]
-        expected = SpyreTensorLayout(size, stride, torch.float16, order)
-        # The per-tile buffer's compact strides, in the full buffer's dim order.
-        for tile_size, tile_stride in (
-            ([1, 8, 512, 512], [512, 512, 4096, 1]),
-            ([8, 1, 512, 512], [512, 4096, 4096, 1]),
-        ):
-            with self.subTest(tile_size=tile_size):
-                stl = SpyreTensorLayout(tile_size, tile_stride, torch.float16, order)
-                self.assertIn(-1, list(stl.stride_map))
+        # (size, stride, tile_size): x[:, :1].expand(4, 64) tiled on dim 0, and
+        # a 3-d broadcast tiled on a non-stick dim with a smaller stride.
+        cases = (
+            ([4, 64], [64, 0], [2, 64]),
+            ([4, 8, 64], [8, 1, 0], [4, 2, 64]),
+        )
+        for size, stride, tile_size in cases:
+            with self.subTest(size=size):
+                order = list(range(len(size)))
+                stl = _compact_broadcast_device_dims(
+                    SpyreTensorLayout(size, stride, torch.float16, order)
+                )
+                self.assertEqual(stl.stride_map[-1], -1)
                 result = _resize_device_layout(
                     stl,
-                    tile_size,
                     size,
-                    stick_host_dim=3,
-                    old_host_stride=tile_stride,
+                    tile_size,
+                    old_host_stride=stride,
                     new_host_stride=stride,
+                )
+                expected = _compact_broadcast_device_dims(
+                    SpyreTensorLayout(tile_size, stride, torch.float16, order)
                 )
                 self.assertEqual(result, expected)
-
-    def test_resize_device_layout_grow_from_one_stick(self):
-        """The grow path from a tile whose stick dim is one stick long: its
-        tile-count dim has size 1 but a real stride_map, so it is grown, not
-        taken for a placeholder or for a host dim of extent 1."""
-        from torch_spyre._C import SpyreTensorLayout
-        from torch_spyre._inductor.wsr.coarse_tile import _resize_device_layout
-
-        # (size, stride, tile_size, tile_stride, dim_order, stick_host_dim)
-        cases = (
-            ([4, 128], [128, 1], [4, 64], [64, 1], [0, 1], 1),
-            # Also a host dim of extent 1, which the tile-count dim must not
-            # be matched to.
-            (
-                [512, 64, 64, 2],
-                [128, 1, 65536, 64],
-                [512, 64, 64, 1],
-                [64, 1, 32768, 64],
-                [0, 2, 3, 1],
-                None,
-            ),
-        )
-        for size, stride, tile_size, tile_stride, order, shd in cases:
-            with self.subTest(size=size):
-                stl = SpyreTensorLayout(tile_size, tile_stride, torch.float16, order)
-                result = _resize_device_layout(
-                    stl,
-                    tile_size,
-                    size,
-                    stick_host_dim=shd,
-                    old_host_stride=tile_stride,
-                    new_host_stride=stride,
-                )
-                self.assertEqual(
-                    result, SpyreTensorLayout(size, stride, torch.float16, order)
-                )
 
     def test_resize_device_layout_sub_stick_tile_count(self):
         """A stick host dim shorter than a stick: its size-1 tile-count dim
@@ -2543,8 +2511,8 @@ def _mock_iteration_space(op):
 
 class TestCoarseTile(unittest.TestCase):
     def setUp(self):
-        self._patch = patch(
-            "torch_spyre._inductor.wsr.coarse_tile.op_out_coords",
+        self._patch = patch_tiling_helper(
+            "op_out_coords",
             side_effect=_mock_op_out_coords,
         )
         self._patch.start()
@@ -2881,8 +2849,8 @@ class TestCoarseTileNested(unittest.TestCase):
     """Verify that the nested group format [(hint_id, K1), ...] works."""
 
     def setUp(self):
-        self._patch = patch(
-            "torch_spyre._inductor.wsr.coarse_tile.op_out_coords",
+        self._patch = patch_tiling_helper(
+            "op_out_coords",
             side_effect=_mock_op_out_coords,
         )
         self._patch.start()
@@ -3055,8 +3023,8 @@ class TestCoarseTileTiledDimsPerRead(unittest.TestCase):
     """
 
     def setUp(self):
-        self._patch = patch(
-            "torch_spyre._inductor.wsr.coarse_tile.op_out_coords",
+        self._patch = patch_tiling_helper(
+            "op_out_coords",
             side_effect=_mock_op_out_coords,
         )
         self._patch.start()
@@ -7412,8 +7380,8 @@ class TestDivideReductionRanges(unittest.TestCase):
             Symbol("d2"): ["E"],
         }
 
-        with patch(
-            "torch_spyre._inductor.wsr.coarse_tile._capture_logical_iteration_symbols",
+        with patch_tiling_helper(
+            "_capture_logical_iteration_symbols",
             side_effect=(before, after),
         ):
             remap = _divide_reduction_ranges(op, Integer(128), [0])
@@ -7460,11 +7428,11 @@ class TestDivideReductionRanges(unittest.TestCase):
         }
 
         with (
-            patch(
-                "torch_spyre._inductor.wsr.coarse_tile.op_read_writes",
+            patch_tiling_helper(
+                "op_read_writes",
                 side_effect=(rw_before, rw_after),
             ),
-            patch("torch_spyre._inductor.wsr.coarse_tile.invalidate_op_read_writes"),
+            patch_tiling_helper("invalidate_op_read_writes"),
         ):
             remap = _divide_reduction_ranges(op, Integer(128), [0])
         _apply_work_div_symbol_remap(op, remap)
@@ -7492,20 +7460,18 @@ class TestDivideReductionRanges(unittest.TestCase):
         }
 
         with (
-            patch(
-                "torch_spyre._inductor.wsr.coarse_tile._capture_logical_iteration_symbols",
+            patch_tiling_helper(
+                "_capture_logical_iteration_symbols",
                 side_effect=Unsupported("fused output dimensions"),
             ),
-            patch(
-                "torch_spyre._inductor.wsr.coarse_tile.iteration_space_from_op",
+            patch_tiling_helper(
+                "iteration_space_from_op",
                 side_effect=(
                     {output_sym: Integer(512 * 704), reduction_sym: Integer(128)},
                     {output_sym: Integer(512 * 704)},
                 ),
             ),
-            patch(
-                "torch_spyre._inductor.wsr.coarse_tile.invalidate_op_read_writes"
-            ) as invalidate,
+            patch_tiling_helper("invalidate_op_read_writes") as invalidate,
         ):
             remap = _divide_reduction_ranges(op, Integer(128), [0])
 
@@ -8852,8 +8818,9 @@ class TestTileSpecLoweringReduction(unittest.TestCase):
         leaked = [*reduction_loop_vars(op), sympy_index_symbol("d9")]
         spec = TileSpec((TileAxis(0, 2, is_reduction=True),))
         with (
-            patch(
-                "torch_spyre._inductor.wsr.coarse_tile.reduction_loop_vars",
+            patch_tiling_helper(
+                "reduction_loop_vars",
+                common_only=True,
                 return_value=leaked,
             ),
             patch(
@@ -9252,41 +9219,30 @@ class TestPlannedFullBufferLayout(unittest.TestCase):
         ]
         self.assertEqual(combine.loop_info.squeezed_advance_per_read, [])
 
-    def test_full_buffer_grown_back_from_a_permuted_tile(self):
-        # Where no full layout was planned, the full buffer's is grown back
-        # from the tile's. This op writes its output with dim 1 outermost and
-        # is tiled on dim 0, the inner one, so the outer dim's stride shrinks
-        # with the tile and has to grow back with the full buffer.
-        from torch_spyre._C import SpyreTensorLayout
-        from torch_spyre._inductor.ir import FixedTiledLayout
+    def test_full_buffer_without_a_planned_layout_raises(self):
+        # Post-stickify, the full buffer's layout is not grown back from the
+        # tile's: with no layout given, the allocation raises before it lowers
+        # anything into the graph.
+        from torch._inductor.ir import FlexibleLayout
+
         from torch_spyre._inductor.wsr.coarse_tile import _allocate_full_buffer
 
-        size, stride = [64, 64, 128], [128, 8192, 1]
-        op = _make_real_tiled_op("pw_permuted", size)
-        original = SpyreTensorLayout(size, stride, torch.float16, [0, 1, 2])
-        op.layout = FixedTiledLayout(
-            torch.device("cpu"),
-            torch.float16,
-            [Integer(s) for s in size],
-            [Integer(s) for s in stride],
-            original,
-        )
+        size = [64, 64, 128]
+        op = _make_real_tiled_op("pw", size)
         _divide_ranges(op, Integer(4), tiled_dims=[0])
-        self.assertEqual(
-            op.layout.device_layout,
-            SpyreTensorLayout([16, 64, 128], [128, 2048, 1], torch.float16, [0, 1, 2]),
-        )
 
         operations = V.graph.operations
         operations.append(op)
-        full = _allocate_full_buffer(
-            op,
-            [Integer(s) for s in size],
-            tuple(Integer(s) for s in stride),
-            operations,
-            0,
-        )
-        self.assertEqual(full.layout.device_layout, original)
+        before = (len(operations), len(V.graph.graph.nodes))
+        with self.assertRaisesRegex(RuntimeError, "no device_layout was given"):
+            _allocate_full_buffer(
+                op,
+                [Integer(s) for s in size],
+                tuple(Integer(s) for s in FlexibleLayout.contiguous_strides(size)),
+                operations,
+                0,
+            )
+        self.assertEqual((len(operations), len(V.graph.graph.nodes)), before)
 
 
 class TestDeriveTilingGroups(unittest.TestCase):
@@ -9441,8 +9397,8 @@ class TestApplyTilingsEquivalence(unittest.TestCase):
 
     def setUp(self):
         self.enterContext(
-            patch(
-                "torch_spyre._inductor.wsr.coarse_tile.op_out_coords",
+            patch_tiling_helper(
+                "op_out_coords",
                 side_effect=_mock_op_out_coords,
             )
         )
@@ -9572,8 +9528,8 @@ class TestApplyTilingsRegionRefusal(unittest.TestCase):
 
     def setUp(self):
         self.enterContext(
-            patch(
-                "torch_spyre._inductor.wsr.coarse_tile.op_out_coords",
+            patch_tiling_helper(
+                "op_out_coords",
                 side_effect=_mock_op_out_coords,
             )
         )
