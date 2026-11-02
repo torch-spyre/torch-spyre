@@ -63,7 +63,7 @@ pinned_dims: dict[str, set[int]]  (local to reorder_nonstick_dims, never on grap
 
 import math
 import sympy
-from typing import Literal, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
@@ -79,9 +79,14 @@ from torch._inductor.ir import (
     TensorBox,
 )
 from torch._inductor.virtualized import V
-from torch_spyre._C import DataFormats, ElementArrangement, SpyreTensorLayout
+from torch_spyre._C import (
+    DataFormats,
+    ElementArrangement,
+    SpyreTensorLayout,
+    get_device_size_in_bytes,
+)
 
-from .constants import MATMUL_REDUCTION_OPS
+from .constants import BATCH_MATMUL_FP8_OP, MATMUL_REDUCTION_OPS
 from .errors import Unsupported
 from .insert_restickify import (
     _create_restickify_node,
@@ -93,6 +98,7 @@ from . import config
 from .logging_utils import get_inductor_logger
 from .op_spec import IndirectAccess
 from .pass_utils import (
+    compute_size1_restickify_target,
     concretize_expr,
     device_coordinates,
     find_reduction_var,
@@ -102,6 +108,7 @@ from .pass_utils import (
     try_device_coordinates,
 )
 from .propagate_layouts import PropArg
+from .work_division import MAX_SPAN_BYTES
 
 # Helpers shared with enforce_indirect_access_layout.
 # enforce_indirect_access_layout does NOT import nonstick_dim_order, so this
@@ -142,6 +149,163 @@ class _DeferredReorder(NamedTuple):
     kind: Literal["copy", "producer_rewrite"]
 
 
+def _is_dense_contiguous(size: list[int], stride: list[int]) -> bool:
+    """Return True if (size, stride) describes a dense row-major contiguous tensor.
+
+    A dimension of size 1 may carry any stride value; all other dimensions must
+    carry the product of all dimensions to their right.
+    """
+    expected = 1
+    for dim_size, dim_stride in zip(reversed(size), reversed(stride)):
+        if dim_size != 1 and dim_stride != expected:
+            return False
+        expected *= dim_size
+    return True
+
+
+def _has_flat_projection_structure(
+    x: PropArg,
+    y: PropArg,
+    output: FixedLayout,
+    m_size: int,
+    n_size: int,
+) -> bool:
+    """Return True if the shapes and formats satisfy flat-MM collapse preconditions.
+
+    Checks matrix sizes, host ranks, and device format.  Does not inspect
+    strides or index expressions.
+    """
+    return (
+        m_size > 1
+        and n_size > 1
+        and len(output.size) == 2
+        and len(x.layout.size) > 2
+        and len(y.layout.size) == 2
+        and bool(x.layouts)
+        and x.layouts[0].element_arrangement == ElementArrangement.STANDARD
+        and x.layouts[0].device_dtype == DataFormats.SEN169_FP16
+    )
+
+
+class _FlatMMVars:
+    """The loop variables and their sizes for a flat-MM access pattern."""
+
+    __slots__ = (
+        "row_var",
+        "contraction_var",
+        "generated_var",
+        "row_size",
+        "contraction_size",
+        "generated_size",
+    )
+
+    def __init__(
+        self,
+        row_var: sympy.Symbol,
+        contraction_var: sympy.Symbol,
+        generated_var: sympy.Symbol,
+        row_size: int,
+        contraction_size: int,
+        generated_size: int,
+    ) -> None:
+        self.row_var = row_var
+        self.contraction_var = contraction_var
+        self.generated_var = generated_var
+        self.row_size = row_size
+        self.contraction_size = contraction_size
+        self.generated_size = generated_size
+
+
+def _extract_mm_vars(
+    x_dep: MemoryDep,
+    output_dep: MemoryDep,
+    contraction_var: sympy.Symbol,
+) -> _FlatMMVars | None:
+    """Identify row and generated loop variables from x and output dep expressions.
+
+    Given that contraction_var is the known reduction variable, finds the single
+    remaining active variable in x_dep (the row variable) and the single remaining
+    active variable in output_dep (the generated variable).  Returns None if the
+    active variable counts do not match a flat 2-D MM (exactly one row variable
+    in x, exactly one generated variable in the output that is not the row variable).
+    """
+    active_x_vars = set(x_dep.index.free_symbols) & set(x_dep.ranges)
+    row_candidates = active_x_vars - {contraction_var}
+    if contraction_var not in active_x_vars or len(row_candidates) != 1:
+        return None
+    (row_var,) = row_candidates
+
+    active_out_vars = set(output_dep.index.free_symbols) & set(output_dep.ranges)
+    generated_candidates = active_out_vars - {row_var}
+    if row_var not in active_out_vars or len(generated_candidates) != 1:
+        return None
+    (generated_var,) = generated_candidates
+
+    return _FlatMMVars(
+        row_var=row_var,
+        contraction_var=contraction_var,
+        generated_var=generated_var,
+        row_size=concretize_expr(x_dep.ranges[row_var]),
+        contraction_size=concretize_expr(x_dep.ranges[contraction_var]),
+        generated_size=concretize_expr(output_dep.ranges[generated_var]),
+    )
+
+
+def _confirms_flat_mm_access(
+    x_dep: MemoryDep,
+    y_dep: MemoryDep,
+    output_dep: MemoryDep,
+    mm_vars: _FlatMMVars,
+    x_size: list[int],
+    y_size: list[int],
+    out_size: list[int],
+    m_size: int,
+    n_size: int,
+) -> bool:
+    """Return True if sizes and index expressions confirm a flat row-major 2-D MM.
+
+    Checks two coupled properties that together answer one question — is this
+    provably a flat MM rather than a BMM:
+    - Element counts: dep-extracted sizes agree with the op's declared M/N, and
+      total elements in each tensor equal the expected matrix product.
+    - Index structure: x reads at K*row + contraction, output writes at N*row +
+      generated, and y carries no row variable.
+    """
+    if (
+        mm_vars.row_size != m_size
+        or mm_vars.generated_size != n_size
+        or math.prod(x_size) != mm_vars.row_size * mm_vars.contraction_size
+        or math.prod(y_size) != mm_vars.contraction_size * mm_vars.generated_size
+        or math.prod(out_size) != m_size * n_size
+        or mm_vars.row_var in y_dep.index.free_symbols
+        or {mm_vars.contraction_var, mm_vars.generated_var}
+        != (set(y_dep.index.free_symbols) & set(y_dep.ranges))
+    ):
+        return False
+
+    expected_x_index = (
+        mm_vars.contraction_size * mm_vars.row_var + mm_vars.contraction_var
+    )
+    expected_out_index = (
+        mm_vars.generated_size * mm_vars.row_var + mm_vars.generated_var
+    )
+    return (
+        sympy.simplify(x_dep.index - expected_x_index) == 0
+        and sympy.simplify(output_dep.index - expected_out_index) == 0
+    )
+
+
+def _build_flat_mm_stl(mm_vars: _FlatMMVars, device_dtype) -> SpyreTensorLayout:
+    """Build a canonical flat-M STL from the identified loop variables and dtype."""
+    return SpyreTensorLayout(
+        [mm_vars.row_size, mm_vars.contraction_size],
+        [mm_vars.contraction_size, 1],
+        device_dtype,
+        [0, 1],
+        ElementArrangement.STANDARD,
+    )
+
+
 def _flat_dense_projection_x_layout(
     x: PropArg,
     y: PropArg,
@@ -159,16 +323,7 @@ def _flat_dense_projection_x_layout(
     to encode the op as a BMM rather than a flat MM. Collapse only when the
     access is provably one dense row-major 2-D matrix and the weight is rank-2.
     """
-    if (
-        m_size <= 1
-        or n_size <= 1
-        or len(output.size) != 2
-        or len(x.layout.size) <= 2
-        or len(y.layout.size) != 2
-        or not x.layouts
-        or x.layouts[0].element_arrangement != ElementArrangement.STANDARD
-        or x.layouts[0].device_dtype != DataFormats.SEN169_FP16
-    ):
+    if not _has_flat_projection_structure(x, y, output, m_size, n_size):
         return None
 
     x_size = [concretize_expr(s) for s in x.layout.size]
@@ -177,61 +332,21 @@ def _flat_dense_projection_x_layout(
     out_size = [concretize_expr(s) for s in output.size]
     out_stride = [concretize_expr(s) for s in output.stride]
 
-    def is_dense_contiguous(size: list[int], stride: list[int]) -> bool:
-        expected = 1
-        for dim_size, dim_stride in zip(reversed(size), reversed(stride)):
-            if dim_size != 1 and dim_stride != expected:
-                return False
-            expected *= dim_size
-        return True
-
-    if not is_dense_contiguous(x_size, x_stride) or not is_dense_contiguous(
+    if not _is_dense_contiguous(x_size, x_stride) or not _is_dense_contiguous(
         out_size, out_stride
     ):
         return None
 
-    active_x_vars = set(x.dep.index.free_symbols) & set(x.dep.ranges)
-    row_vars = active_x_vars - {reduction_var}
-    if reduction_var not in active_x_vars or len(row_vars) != 1:
+    mm_vars = _extract_mm_vars(x.dep, output_dep, reduction_var)
+    if mm_vars is None:
         return None
-    (row_var,) = row_vars
 
-    row_size = concretize_expr(x.dep.ranges[row_var])
-    reduction_size = concretize_expr(x.dep.ranges[reduction_var])
-    active_out_vars = set(output_dep.index.free_symbols) & set(output_dep.ranges)
-    generated_vars = active_out_vars - {row_var}
-    if row_var not in active_out_vars or len(generated_vars) != 1:
-        return None
-    (generated_var,) = generated_vars
-    generated_size = concretize_expr(output_dep.ranges[generated_var])
-
-    if (
-        row_size != m_size
-        or generated_size != n_size
-        or math.prod(x_size) != row_size * reduction_size
-        or math.prod(y_size) != reduction_size * generated_size
-        or math.prod(out_size) != m_size * n_size
-        or row_var in y.dep.index.free_symbols
-        or {reduction_var, generated_var}
-        != (set(y.dep.index.free_symbols) & set(y.dep.ranges))
+    if not _confirms_flat_mm_access(
+        x.dep, y.dep, output_dep, mm_vars, x_size, y_size, out_size, m_size, n_size
     ):
         return None
 
-    expected_x_index = reduction_size * row_var + reduction_var
-    expected_out_index = generated_size * row_var + generated_var
-    if (
-        sympy.simplify(x.dep.index - expected_x_index) != 0
-        or sympy.simplify(output_dep.index - expected_out_index) != 0
-    ):
-        return None
-
-    return SpyreTensorLayout(
-        [row_size, reduction_size],
-        [reduction_size, 1],
-        x.layout.dtype,
-        [0, 1],
-        ElementArrangement.STANDARD,
-    )
+    return _build_flat_mm_stl(mm_vars, x.layout.dtype)
 
 
 def _try_flat_m_projection(
@@ -386,15 +501,6 @@ def _indirect_stride_idx(
     return None
 
 
-def _reject_stick_indexed_gather(stl: SpyreTensorLayout, stride_idx: int) -> None:
-    """Refuse a non-DL16 gather indexed along its stick dim until #4360 is fixed."""
-    if stride_idx == 0 and stl.device_dtype != DataFormats.SEN169_FP16:
-        raise Unsupported(
-            f"gather from a {stl.device_dtype} tensor indexed along its stick "
-            "dimension (#4360)"
-        )
-
-
 def _dim_order_is_compliant(value_stl: SpyreTensorLayout, stride_idx: int) -> bool:
     """Check if indirect access is at the outermost (leftmost) device position."""
     v_n = len(value_stl.stride_map)
@@ -406,7 +512,10 @@ def _ia_rotate_stl(
     stl: SpyreTensorLayout,
     indirect_device_pos: int,
 ) -> SpyreTensorLayout:
-    """Build a new STL with the indirect coordinate rotated to device position 0."""
+    """Build a new STL with the indirect coordinate rotated to device position 0.
+
+    When the indexed coordinate is the stick, use _retile_entry_per_stick.
+    """
     device_size = list(stl.device_size)
     stride_map = list(stl.stride_map)
     n = len(device_size)
@@ -415,55 +524,156 @@ def _ia_rotate_stl(
     if indirect_device_pos == 0:
         return stl
 
+    assert indirect_device_pos != stick_pos, "the indexed stick needs a re-tile"
+
     order = (
         [indirect_device_pos]
         + [i for i in range(n) if i != indirect_device_pos and i != stick_pos]
         + [stick_pos]
     )
+    new_device_size = [device_size[i] for i in order]
+    assert len(new_device_size) == n, (
+        f"rotation changed rank {n} -> {len(new_device_size)} (order={order})"
+    )
     return SpyreTensorLayout(
-        device_size=[device_size[i] for i in order],
+        device_size=new_device_size,
         stride_map=[stride_map[i] for i in order],
         device_dtype=stl.device_dtype,
     )
 
 
-def _try_gather_ia_constraint(
-    buf: ComputedBuffer,
+def _retile_entry_per_stick(
+    value_stl: SpyreTensorLayout,
+    host_layout: FixedLayout,
     dep: MemoryDep,
     op: ComputedBuffer,
-) -> tuple[SpyreTensorLayout, set[int]] | None:
-    """Rotate the indirectly-indexed dim of a gather value tensor to device position 0.
+    access_subs: dict,
+    sizes: dict | None,
+) -> SpyreTensorLayout:
+    """Re-tile a tensor whose indexed coordinate is the stick.
 
-    buf is the value tensor (indirectly-indexed buffer); dep is its read dep.
-    Returns (new_stl, {0}) if a rotation is needed, None if already compliant
-    or not applicable.
+    Rotating cannot help: it lists the stick twice and grows the rank. Instead
+    the stick moves onto a size-1 dim, so each entry sits alone on a stick and
+    the indexed coordinate becomes an outer device dim. This is the layout a
+    host ``[N, 1]`` input already receives.
     """
-    if not hasattr(buf, "committed_stl"):
-        return None
-    _, access_subs, sizes = indirect_info_from_op(op)
-    if not access_subs:
-        return None
-    stl = buf.committed_stl
-    try:
-        coords = device_coordinates(stl, dep, sizes, op=op)
-    except Unsupported:
-        return None
-    coords_substituted = [c.xreplace(access_subs) for c in coords]
-    stride_idx = _indirect_stride_idx(coords_substituted, access_subs)
-    if stride_idx is None:
-        return None
-    indirect_device_pos = len(stl.stride_map) - 1 - stride_idx
-    if _dim_order_is_compliant(stl, stride_idx):
-        return None
-    _reject_stick_indexed_gather(stl, stride_idx)
-    new_stl = _ia_rotate_stl(stl, indirect_device_pos)
-    logger.info(
-        "nonstick_dim_order: gather IA constraint on %s — indirect dim %d -> pos 0",
-        buf.get_name(),
-        indirect_device_pos,
+    retiled_stl = compute_size1_restickify_target(value_stl, host_layout, dep, op)
+    if retiled_stl is None:
+        raise Unsupported(
+            f"cannot re-tile {dep.name}: no size-1 stick target for {value_stl}"
+        )
+    stride_idx = _indirect_stride_idx(
+        device_coordinates(retiled_stl, dep, sizes), access_subs
     )
-    # right-to-left scan; only the innermost indirect dim is handled
-    return new_stl, {0}
+    if stride_idx is None or stride_idx == 0:
+        raise Unsupported(
+            f"cannot re-tile {dep.name}: the indexed coordinate of {retiled_stl} "
+            f"is not an outer device dim"
+        )
+    if not _dim_order_is_compliant(retiled_stl, stride_idx):
+        # The entries may land in a spare size-1 dim; a reorder brings them out.
+        indirect_device_pos = len(retiled_stl.stride_map) - 1 - stride_idx
+        retiled_stl = _ia_rotate_stl(retiled_stl, indirect_device_pos)
+
+    # A stick per entry, so a large table can outgrow the span limit. The
+    # whole table is the per-core span: it is a shared gather table or scatter
+    # destination, at one base address on every core, any of whose rows a core
+    # may address, and indirect_forbidden_split_syms keeps work division from
+    # splitting its data dims. raise_if_per_core_overflow skips indirectly
+    # accessed tensors, so this is the only check.
+    retiled_bytes = get_device_size_in_bytes(retiled_stl)
+    if retiled_bytes > MAX_SPAN_BYTES:
+        raise Unsupported(
+            f"cannot re-tile {dep.name}: one entry per stick would take "
+            f"{retiled_bytes / (1024 * 1024):.2f} MB, over the "
+            f"{MAX_SPAN_BYTES / (1024 * 1024):.2f} MB per-core limit. "
+            f"Give the tensor a trailing dimension so its entries already sit "
+            f"on separate sticks."
+        )
+    return retiled_stl
+
+
+def _ia_required_stl(
+    stl: SpyreTensorLayout,
+    stride_idx: int,
+    host_layout,
+    dep: MemoryDep,
+    op: ComputedBuffer,
+    access_subs: dict,
+    sizes: dict | None,
+) -> SpyreTensorLayout:
+    """Put the indexed coordinate where the indirect access can address it."""
+    if stride_idx == 0:
+        return _retile_entry_per_stick(stl, host_layout, dep, op, access_subs, sizes)
+    return _ia_rotate_stl(stl, len(stl.stride_map) - 1 - stride_idx)
+
+
+def _is_permutation_of(a: SpyreTensorLayout, b: SpyreTensorLayout) -> bool:
+    """Whether ``b`` just reorders ``a``'s device dims.
+
+    Relabelling a producer moves no bytes, so it is only safe for a reorder.
+    """
+    return sorted(zip(a.device_size, a.stride_map)) == sorted(
+        zip(b.device_size, b.stride_map)
+    )
+
+
+def _permute_stl(stl: SpyreTensorLayout, order: list[int]) -> SpyreTensorLayout:
+    """Reorder the device dims of stl; new dim i is old dim order[i].
+
+    Unlike the plain (device_size, stride_map, dtype) constructor, this keeps
+    the element arrangement and remaps valid_elements, so padded and
+    non-STANDARD layouts survive the reorder.
+    """
+    new_pos = {old: new for new, old in enumerate(order)}
+    valid_elements = {
+        tuple(sorted(new_pos[i] for i in dims)): count
+        for dims, count in stl.valid_elements.items()
+    }
+    return SpyreTensorLayout(
+        [stl.device_size[i] for i in order],
+        [stl.stride_map[i] for i in order],
+        stl.device_dtype,
+        stl.element_arrangement,
+        valid_elements,
+    )
+
+
+def _qfp8wt_k_rotation(
+    stl: SpyreTensorLayout,
+    coords: list[sympy.Expr],
+    k_sym: sympy.Symbol,
+    name: str = "",
+) -> SpyreTensorLayout | None:
+    """Move a QFP8WT tensor's K dim directly outside the stick.
+
+    The QFP8WT 2D stick pairs K with N (the stick dim), but the device layout
+    records only a 1D stick of N, so readers take K from device coordinate -2.
+    coords are the device coordinates of a matmul's read of the tensor and
+    k_sym is that matmul's reduction variable: the coordinate it appears in is
+    K. Returns the reordered layout, or None if K is already at -2.
+
+    Raises Unsupported when no non-stick reorder can place K: the matmul
+    reduces over the stick dim itself, or K does not index exactly one
+    non-stick device dim.
+    """
+    n = len(stl.device_size)
+    if k_sym in coords[-1].free_symbols:
+        raise Unsupported(
+            f"QFP8WT tensor {name}: the matmul reduces over its stick dim "
+            f"({k_sym}); the 2D stick needs K outside the stick"
+        )
+    k_positions = [i for i in range(n - 1) if k_sym in coords[i].free_symbols]
+    if len(k_positions) != 1:
+        raise Unsupported(
+            f"QFP8WT tensor {name}: the matmul reduction variable {k_sym} indexes "
+            f"device dims {k_positions}, expected exactly one non-stick dim"
+        )
+    k_pos = k_positions[0]
+    if k_pos == n - 2:
+        return None
+    order = [i for i in range(n - 1) if i != k_pos] + [k_pos, n - 1]
+    return _permute_stl(stl, order)
 
 
 def _try_scatter_ia_constraint(
@@ -519,10 +729,12 @@ def _try_scatter_ia_constraint(
     expected_pos = list(range(len(indirect_stride_idxs)))
     if indirect_device_pos == expected_pos:
         return None
-    # Rotate the last (innermost) indirect dim to position 0, reproducing the
+    # Move the last (innermost) indirect dim to position 0, reproducing the
     # pre-#5213 behavior from enforce_indirect_access_layout.py which scanned
     # write coords right-to-left and rotated the first hit.
-    new_stl = _ia_rotate_stl(stl, indirect_device_pos[-1])
+    new_stl = _ia_required_stl(
+        stl, indirect_stride_idxs[0], buf_layout, write_dep, op, access_subs, sizes
+    )
     logger.info(
         "nonstick_dim_order: scatter IA constraint on %s — indirect dim %d -> pos 0",
         buf.get_name(),
@@ -533,135 +745,326 @@ def _try_scatter_ia_constraint(
     return new_stl, set(range(len(indirect_device_pos)))
 
 
-def reorder_nonstick_dims(graph: GraphLowering) -> None:
-    """Reorder non-stick dims for correctness (phase 1) and performance (phase 2).
+def _apply_qfp8wt_k_constraint(
+    graph: GraphLowering,
+    log: dict[str, SpyreTensorLayout],
+    pinned_dims: dict[str, set[int]],
+) -> None:
+    """Place K of every QFP8WT matmul weight directly outside the stick.
 
-    Phase 1 (one backward walk) applies constraint transforms: gather IA and
-    scatter IA constraints pin device positions in pinned_dims.
-    Phase 2 (second backward walk) applies performance transforms: matmul perf
-    reorder respects pinned_dims set by phase 1.
+    For each batchmatmulfp8, K of its QFP8WT weight is the matmul's reduction
+    variable (find_reduction_var on the weight read). The weight's producer
+    layout (typically the qfp8wt output) is reordered so that dim sits at
+    device position -2, and the position is pinned. A graph-input weight
+    cannot be reordered here, and two matmuls cannot ask for different K, so
+    both raise Unsupported instead of leaving K wrong.
     """
-    V.graph.nonstick_reorder_log = {}
-    V.graph.nonstick_deferred = []  # list[_DeferredReorder]
-    log: dict[str, SpyreTensorLayout] = {}
-    pinned_dims: dict[str, set[int]] = {}
-    graph_inputs = set(V.graph.graph_input_names)
+    decided: dict[str, sympy.Symbol] = {}  # buffer -> K symbol of first matmul
+    for op in graph.operations:
+        if not isinstance(op, ComputedBuffer) or not hasattr(op, "data"):
+            continue
+        if not (
+            isinstance(op.data, Reduction)
+            and op.data.reduction_type == BATCH_MATMUL_FP8_OP
+        ):
+            continue
+        out_dep = next(iter(op.get_read_writes().writes), None)
+        if out_dep is None:
+            continue
+        for dep in op.get_read_writes().reads:
+            if not isinstance(dep, MemoryDep):
+                continue
+            buf = V.graph.get_buffer(dep.name)
+            stl = _buf_stl(buf)
+            if stl is None or stl.element_arrangement != ElementArrangement.QFP8WT:
+                continue
+            try:
+                k_sym = find_reduction_var((dep,), out_dep)
+            except Unsupported:
+                # No single reduction variable on this read: K cannot be
+                # determined here, so the propagated layout is kept.
+                logger.debug("nonstick_dim_order: no K for QFP8WT %s", dep.name)
+                continue
+            coords = try_device_coordinates(stl, dep, {}, op=op)
+            if coords is None:
+                continue
+            new_stl = _qfp8wt_k_rotation(stl, coords, k_sym, dep.name)
+            if dep.name in decided and new_stl is not None:
+                raise Unsupported(
+                    f"QFP8WT tensor {dep.name} is read by matmuls that disagree "
+                    "on which dim is K"
+                )
+            decided.setdefault(dep.name, k_sym)
+            pinned_dims.setdefault(dep.name, set()).add(len(stl.device_size) - 2)
+            if new_stl is None:
+                continue
+            if not isinstance(buf, ComputedBuffer) or not hasattr(buf, "committed_stl"):
+                raise Unsupported(
+                    f"QFP8WT weight {dep.name} is a graph input with K "
+                    f"({k_sym}) away from the stick; its layout cannot be "
+                    "reordered here. Produce it with K at device position -2."
+                )
+            buf.committed_stl = new_stl
+            log[dep.name] = new_stl
+            logger.info(
+                "nonstick_dim_order: QFP8WT K constraint on %s — K (%s) -> pos %d",
+                dep.name,
+                k_sym,
+                len(stl.device_size) - 2,
+            )
 
-    # Phase 1: constraint transforms (gather IA, scatter IA).
-    seen_p1: set[tuple[str, str]] = set()
+
+def _compute_gather_ia_constraint(
+    buf: Any,
+    dep: MemoryDep,
+    op: ComputedBuffer,
+    sizes: Any,
+    access_subs: dict[Any, Any],
+) -> tuple[SpyreTensorLayout, set[int]] | None:
+    """Compute the STL and pinned device positions required by the gather-IA constraint.
+
+    Returns (new_stl, {0}) if buf's current layout places the indirectly-indexed
+    dimension anywhere other than device position 0, None if the constraint does
+    not apply or the layout is already compliant.
+    """
+    stl = _buf_stl(buf)
+    if stl is None:
+        return None
+    try:
+        coords = device_coordinates(stl, dep, sizes, op=op)
+    except Unsupported:
+        return None
+    coords_sub = [c.xreplace(access_subs) for c in coords]
+    if not any(hasattr(c, "has") and c.has(IndirectAccess) for c in coords_sub):
+        return None
+    stride_idx = _indirect_stride_idx(coords_sub, access_subs)
+    if stride_idx is None:
+        return None
+    indirect_device_pos = len(stl.stride_map) - 1 - stride_idx
+    if _dim_order_is_compliant(stl, stride_idx):
+        return None
+    new_stl = _ia_required_stl(
+        stl, stride_idx, buf.get_layout(), dep, op, access_subs, sizes
+    )
+    logger.info(
+        "nonstick_dim_order: gather IA constraint on %s — indirect dim %d -> pos 0",
+        buf.get_name(),
+        indirect_device_pos,
+    )
+    return new_stl, {0}
+
+
+def _apply_gather_ia_constraints(
+    op: ComputedBuffer,
+    access_subs: Any,
+    sizes: Any,
+    seen: set[tuple[str, str]],
+    pinned_dims: dict[str, set[int]],
+    log: dict[str, SpyreTensorLayout],
+) -> None:
+    """Apply gather-IA constraints for all value-tensor deps of op.
+
+    For each dep whose buffer has an indirectly-indexed device coordinate,
+    rotates the buffer's layout so the indirect dim is at device position 0.
+    Graph inputs are recorded as _DeferredReorder entries (cannot update
+    committed_stl in place). ComputedBuffers are rotated immediately.
+    ComputedBuffers without committed_stl were never restickified to a Spyre
+    layout by optimize_restickify_locations, so no constraint applies; skipped.
+    """
+    for dep in op.get_read_writes().reads:
+        if not isinstance(dep, MemoryDep):
+            continue
+        key = (dep.name, op.get_name())
+        if key in seen:
+            continue
+        seen.add(key)
+        buf = V.graph.get_buffer(dep.name)
+        result = _compute_gather_ia_constraint(buf, dep, op, sizes, access_subs)
+        if result is None:
+            continue
+        new_stl, pinned = result
+        if not isinstance(buf, ComputedBuffer):
+            # Graph input: cannot update committed_stl in place —
+            # record for execution by reorder_nonstick_dims_mutation.
+            # Pinned positions not recorded: _apply_perf_reorders excludes
+            # graph inputs by name, so they are never candidates for phase 2.
+            V.graph.nonstick_deferred.append(
+                _DeferredReorder(op, dep.name, new_stl, "copy")
+            )
+        else:
+            if not hasattr(buf, "committed_stl"):
+                continue
+            if not _is_permutation_of(buf.committed_stl, new_stl):
+                # A re-tile moves bytes: copy rather than relabel.
+                V.graph.nonstick_deferred.append(
+                    _DeferredReorder(op, dep.name, new_stl, "copy")
+                )
+                continue
+            buf.committed_stl = new_stl
+            log[buf.get_name()] = new_stl
+            pinned_dims.setdefault(buf.get_name(), set()).update(pinned)
+
+
+def _apply_scatter_ia_constraint(
+    op: ComputedBuffer,
+    output_names: set[str],
+    pinned_dims: dict[str, set[int]],
+) -> None:
+    """Apply the scatter-IA constraint for a mutation scatter op.
+
+    Resolves the mutation destination buffer, checks the IA constraint, records
+    a _DeferredReorder for execution by reorder_nonstick_dims_mutation, and
+    updates pinned_dims so phase 2 does not clobber the constrained position.
+    Does not update committed_stl — the destination layout must remain as-is
+    until finalize_layouts so that _insert_mutation_relayout_copy sees the
+    original layout.
+    """
+    target = op.layout.target
+    while isinstance(target, (ReinterpretView, TensorBox, StorageBox)):
+        target = target.data
+    dest_buf = target if isinstance(target, (ComputedBuffer, InputBuffer)) else None
+    if dest_buf is None:
+        return
+    result = _try_scatter_ia_constraint(dest_buf, op)
+    if result is None:
+        return
+    new_stl, pinned = result
+    # Do NOT update dest_buf.committed_stl here: the scatter destination's
+    # layout transformation is applied at phase 2 via
+    # _insert_mutation_relayout_copy, which needs to see the original
+    # (pre-rotation) target layout from finalize_layouts. Updating
+    # committed_stl now would cause finalize_layouts to create a
+    # FixedTiledLayout with the rotated STL, making
+    # _insert_mutation_relayout_copy a no-op copy.
+    dest_stl = _buf_stl(dest_buf)
+    pinned_dims.setdefault(dest_buf.get_name(), set()).update(pinned)
+    if (
+        dest_stl is not None
+        and _is_permutation_of(dest_stl, new_stl)
+        and _can_mutate_producer_in_place(dest_buf, output_names)
+    ):
+        V.graph.nonstick_deferred.append(
+            _DeferredReorder(op, dest_buf.get_name(), new_stl, "producer_rewrite")
+        )
+    else:
+        V.graph.nonstick_deferred.append(
+            _DeferredReorder(op, dest_buf.get_name(), new_stl, "copy")
+        )
+
+
+def _apply_correctness_constraints(
+    graph: GraphLowering, log: dict[str, SpyreTensorLayout]
+) -> dict[str, set[int]]:
+    """Apply gather-IA and scatter-IA constraints to the graph.
+
+    Returns pinned_dims: a map from buffer name to device positions that phase 2
+    must not clobber. Appends to V.graph.nonstick_deferred with deferred reorder
+    work for graph inputs and scatter mutation destinations.
+    Precondition: V.graph.nonstick_deferred is already initialised by the caller.
+    """
+    pinned_dims: dict[str, set[int]] = {}
+    seen: set[tuple[str, str]] = set()
+    output_names = set(graph.get_output_names())
+    # Backward walk: consumers are visited before their producers, so all
+    # downstream constraints are recorded before a producer's layout is rotated.
     for op in reversed(graph.operations):
         if not isinstance(op, ComputedBuffer):
             continue
         if not hasattr(op, "data"):
             continue
 
-        # Gather IA: find value tensor deps with an IndirectAccess coordinate.
-        dep_names, access_subs, sizes = indirect_info_from_op(op)
-        if dep_names and not isinstance(op.data, Scatter):
-            for dep in op.get_read_writes().reads:
-                if not isinstance(dep, MemoryDep):
-                    continue
-                buf = V.graph.get_buffer(dep.name)
-                if not isinstance(buf, ComputedBuffer):
-                    # Graph input or other non-ComputedBuffer: use _buf_stl,
-                    # cannot update in place — record for phase 2 execution.
-                    stl = _buf_stl(buf)
-                    if stl is None:
-                        continue
-                    try:
-                        coords = device_coordinates(stl, dep, sizes, op=op)
-                    except Unsupported:
-                        continue
-                    coords_sub = [c.xreplace(access_subs) for c in coords]
-                    stride_idx = _indirect_stride_idx(coords_sub, access_subs)
-                    if stride_idx is None:
-                        continue
-                    indirect_device_pos = len(stl.stride_map) - 1 - stride_idx
-                    if _dim_order_is_compliant(stl, stride_idx):
-                        continue  # already compliant
-                    _reject_stick_indexed_gather(stl, stride_idx)
-                    required_stl = _ia_rotate_stl(stl, indirect_device_pos)
-                    key = (dep.name, op.get_name())
-                    if key in seen_p1:
-                        continue
-                    seen_p1.add(key)
-                    V.graph.nonstick_deferred.append(
-                        _DeferredReorder(op, dep.name, required_stl, "copy")
-                    )
-                    continue
-                # ComputedBuffer path continues below.
-                if not hasattr(buf, "committed_stl"):
-                    continue
-                try:
-                    coords = device_coordinates(buf.committed_stl, dep, sizes)
-                except Exception:
-                    continue
-                coords_sub = [c.xreplace(access_subs) for c in coords]
-                if not any(
-                    hasattr(c, "has") and c.has(IndirectAccess) for c in coords_sub
-                ):
-                    continue
-                key = (dep.name, op.get_name())
-                if key in seen_p1:
-                    continue
-                seen_p1.add(key)
-                result = _try_gather_ia_constraint(buf, dep, op)
-                if result is not None:
-                    new_stl, pinned = result
-                    buf.committed_stl = new_stl
-                    log[buf.get_name()] = new_stl
-                    pinned_dims.setdefault(buf.get_name(), set()).update(pinned)
-
-        # Scatter IA: resolve destination and apply constraint.
+        indirect_dep_names, access_subs, sizes = indirect_info_from_op(op)
+        if indirect_dep_names and not isinstance(op.data, Scatter):
+            _apply_gather_ia_constraints(op, access_subs, sizes, seen, pinned_dims, log)
         if isinstance(op.data, Scatter) and isinstance(
             op.layout, MutationLayoutSHOULDREMOVE
         ):
-            target = op.layout.target
-            while isinstance(target, (ReinterpretView, TensorBox, StorageBox)):
-                target = target.data
-            dest_buf = (
-                target if isinstance(target, (ComputedBuffer, InputBuffer)) else None
-            )
-            if dest_buf is not None:
-                dest_stl = _buf_stl(dest_buf)
-                if dest_stl is not None:
-                    result = _try_scatter_ia_constraint(dest_buf, op)
-                    if result is not None:
-                        new_stl, pinned = result
-                        # Do NOT update dest_buf.committed_stl here: the scatter
-                        # destination's layout transformation is applied at phase 2
-                        # via _insert_mutation_relayout_copy, which needs to see the
-                        # original (pre-rotation) target layout from finalize_layouts.
-                        # Updating committed_stl now would cause finalize_layouts to
-                        # create a FixedTiledLayout with the rotated STL, making
-                        # _insert_mutation_relayout_copy a no-op copy.
-                        pinned_dims.setdefault(dest_buf.get_name(), set()).update(
-                            pinned
-                        )
-                        # Decide execution strategy for phase 2.
-                        if _can_mutate_producer_in_place(
-                            dest_buf, set(graph.get_output_names())
-                        ):
-                            V.graph.nonstick_deferred.append(
-                                _DeferredReorder(
-                                    op,
-                                    dest_buf.get_name(),
-                                    new_stl,
-                                    "producer_rewrite",
-                                )
-                            )
-                        else:
-                            V.graph.nonstick_deferred.append(
-                                _DeferredReorder(
-                                    op, dest_buf.get_name(), new_stl, "copy"
-                                )
-                            )
+            _apply_scatter_ia_constraint(op, output_names, pinned_dims)
+    return pinned_dims
 
-    # Phase 2: performance transforms (matmul perf reorder).
-    # For each matmul op, reorder its non-graph-input input buffers so they
-    # read a wider contiguous region.  Optionally (SPYRE_NDO_MATMUL_OUTPUT_REORDER)
-    # also reorder the matmul's own output buffer with the same heuristic.
+
+def _try_apply_flat_projection(
+    buf: ComputedBuffer,
+    op: ComputedBuffer,
+    log: dict[str, SpyreTensorLayout],
+) -> bool:
+    """Apply flat-M projection to buf as an activation input to op.
+
+    Returns True and updates buf.committed_stl and log[buf.get_name()] if the
+    projection applies. Returns False and modifies nothing otherwise.
+    Returns False immediately if buf is not a read dependency of op.
+    """
+    if not hasattr(buf, "committed_stl"):
+        return False
+    name = buf.get_name()
+    x_dep = next(
+        (
+            d
+            for d in op.get_read_writes().reads
+            if isinstance(d, MemoryDep) and d.name == name
+        ),
+        None,
+    )
+    if x_dep is None:
+        return False
+    flat_stl = _try_flat_m_projection(buf, x_dep, op)
+    if flat_stl is None:
+        return False
+    old_device_size = list(buf.committed_stl.device_size)
+    buf.committed_stl = flat_stl
+    log[name] = flat_stl
+    logger.info(
+        "nonstick_dim_order: flat-M projection on %s — %s -> %s",
+        name,
+        old_device_size,
+        list(flat_stl.device_size),
+    )
+    return True
+
+
+def _apply_matmul_perf_reorder(
+    buf: ComputedBuffer,
+    pinned: set[int],
+    log: dict[str, SpyreTensorLayout],
+) -> None:
+    """Promote the widest nonstick loop variable in buf to improve read locality.
+
+    Respects pinned device positions set by _apply_correctness_constraints so
+    that correctness constraints are never displaced. Updates buf.committed_stl
+    in place when a beneficial swap exists; does nothing if no improvement is
+    found or buf has no committed_stl.
+    """
+    reordered_stl = _try_matmul_perf_reorder(buf, pinned)
+    if reordered_stl is not None:
+        buf.committed_stl = reordered_stl
+        log[buf.get_name()] = reordered_stl
+        logger.info("nonstick_dim_order: reordered %s", buf.get_name())
+
+
+def _apply_perf_reorders(
+    graph: GraphLowering,
+    pinned_dims: dict[str, set[int]],
+    log: dict[str, SpyreTensorLayout],
+) -> None:
+    """Apply flat-M projection and matmul perf reorder to matmul input buffers.
+
+    Respects pinned_dims from _apply_correctness_constraints. Graph inputs are
+    excluded by name; only ComputedBuffers with committed_stl are processed.
+    When config.ndo_matmul_output_reorder is set, also attempts to reorder the
+    matmul's own output buffer (but never flat-M projects it — that is only for
+    activation inputs).
+    """
+    graph_inputs = set(V.graph.graph_input_names)
+
+    # QFP8WT K constraint: a batchmatmulfp8 knows which dim of its QFP8WT
+    # weight is K (its reduction variable), so the weight's producer layout is
+    # reordered to put K directly outside the stick, where readers take it.
+    _apply_qfp8wt_k_constraint(graph, log, pinned_dims)
+
     already_reordered: set[str] = set()
+    # Backward walk: each matmul is visited before its producer inputs, so
+    # flat-M projection decisions are made at the consumer before inspecting
+    # the producer's layout.
     for op in reversed(graph.operations):
         if not isinstance(op, ComputedBuffer):
             continue
@@ -672,53 +1075,46 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
             and op.data.reduction_type in MATMUL_REDUCTION_OPS
         ):
             continue
-        input_bufs = [
+        bufs_to_reorder = [
             V.graph.get_buffer(dep.name)
             for dep in op.get_read_writes().reads
             if isinstance(dep, MemoryDep)
             and dep.name not in graph_inputs
             and isinstance(V.graph.get_buffer(dep.name), ComputedBuffer)
         ]
-        bufs_to_reorder = list(input_bufs)
         if config.ndo_matmul_output_reorder:
             bufs_to_reorder.append(op)
         for buf in bufs_to_reorder:
             name = buf.get_name()
+            # Process each buffer at most once; when a buffer feeds multiple
+            # matmuls, the last matmul in program order (encountered first
+            # in this reversed traversal) determines the reorder.
             if name in already_reordered:
                 continue
             already_reordered.add(name)
             pinned = pinned_dims.get(name, set())
+            # The matmul's own output is never a flat-M projection target
+            # (only activation inputs qualify).
+            if buf is not op and _try_apply_flat_projection(buf, op, log):
+                continue
+            _apply_matmul_perf_reorder(buf, pinned, log)
 
-            # Flat-M projection: only on activation inputs, not the matmul output.
-            if buf is not op and hasattr(buf, "committed_stl"):
-                x_dep = next(
-                    (
-                        d
-                        for d in op.get_read_writes().reads
-                        if isinstance(d, MemoryDep) and d.name == name
-                    ),
-                    None,
-                )
-                if x_dep is not None:
-                    flat_stl = _try_flat_m_projection(buf, x_dep, op)
-                    if flat_stl is not None:
-                        old_device_size = list(buf.committed_stl.device_size)
-                        buf.committed_stl = flat_stl
-                        log[name] = flat_stl
-                        logger.info(
-                            "nonstick_dim_order: flat-M projection on %s — %s -> %s",
-                            name,
-                            old_device_size,
-                            list(flat_stl.device_size),
-                        )
-                        continue
 
-            reordered_stl = _try_matmul_perf_reorder(buf, pinned)
-            if reordered_stl is not None:
-                buf.committed_stl = reordered_stl
-                log[name] = reordered_stl
-                logger.info("nonstick_dim_order: reordered %s", name)
+def reorder_nonstick_dims(graph: GraphLowering) -> None:
+    """Reorder non-stick dims for correctness then performance.
 
+    Must run after optimize_restickify_locations and before finalize_layouts.
+
+    Side effects:
+      V.graph.nonstick_reorder_log  — map of buffer name -> final STL for
+                                      each buffer whose layout was changed.
+      V.graph.nonstick_deferred     — list[_DeferredReorder] consumed by
+                                      reorder_nonstick_dims_mutation.
+    """
+    V.graph.nonstick_deferred = []
+    log: dict[str, SpyreTensorLayout] = {}
+    pinned_dims = _apply_correctness_constraints(graph, log)
+    _apply_perf_reorders(graph, pinned_dims, log)
     V.graph.nonstick_reorder_log = log
 
 

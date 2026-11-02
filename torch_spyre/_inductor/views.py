@@ -473,6 +473,12 @@ def matching_dim(coords: list[sympy.Expr], expr: sympy.Expr) -> Optional[int]:
     values (both expressed in the single free variable of expr).  Return None if
     expr does not have exactly one free variable or if there is not exactly one
     matching dimension in coords.
+
+    .. deprecated::
+        Does not handle factorized layouts where a variable spans multiple host
+        dims. New code should use ``_host_size_stride_for_expr`` in
+        ``pass_utils.py`` instead, which resolves factorized expressions via
+        ``_factorized_chain``.
     """
     if len(expr.free_symbols) != 1:
         return None
@@ -947,7 +953,8 @@ def align_tensors_pure(
     # dict.fromkeys preserves insertion order; set() does not. This matters for two
     # reasons: (1) frontend determinism; (2) backend workaround — the backend is
     # sensitive to iteration_space dim label order even though semantically it
-    # should not be.
+    # should not be. The restored size-1 loops (the synthetic vars) come after the
+    # original loops. For a matmul, simplify_op_spec moves them in front of K.
     all_vars = dict.fromkeys(var_ranges.keys())
     for terms in all_terms:
         for term in terms:

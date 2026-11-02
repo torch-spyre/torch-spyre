@@ -53,6 +53,11 @@ from .ir import (
 )
 from .logging_utils import get_inductor_logger
 from .op_spec import IndirectAccess
+from .lx_read_contracts import (
+    LocalReadGeometry,
+    has_partial_read,
+    local_read_certificate,
+)
 from .pass_utils import (
     PerCoreView,
     SchedNodeArg,
@@ -383,6 +388,16 @@ def multi_dim_iteration_space_split(
     return splits
 
 
+def _qfp8wt_stick_coords(td: TensorDep) -> list[Expr]:
+    """Coordinates spanned by a QFP8WT tensor's 2D stick: its K and N dims.
+
+    K sits directly outside the stick (placed by nonstick_dim_order for a
+    matmul weight, by ``propagate_layouts.qfp8wt_dim_order`` otherwise), so
+    these are the last two device coordinates for every rank.
+    """
+    return td.device_coords[-2:]
+
+
 def adjust_it_space_for_sticks(
     it_space: dict[Symbol, Expr],
     tensor_deps: list[TensorDep],
@@ -424,10 +439,10 @@ def adjust_it_space_for_sticks(
             hasattr(td.layout.device_layout, "element_arrangement")
             and td.layout.device_layout.element_arrangement == ElementArrangement.QFP8WT
         ):
-            # For QFP8WT, last two device dimensions are the 2D stick [2, 64]
+            # For QFP8WT, the 2D stick [2, 64] spans the weight's K and N dims.
             # Both need to be treated as atomic 128-byte units
             stick_vars = []
-            for coord in td.device_coords[-2:]:
+            for coord in _qfp8wt_stick_coords(td):
                 if len(coord.free_symbols) == 1:
                     var = next(iter(coord.free_symbols))
                     if var in adjusted_space:
@@ -1441,6 +1456,7 @@ class ResidencyEdge:
     write_dep: MemoryDep
     read_deps: tuple[MemoryDep, ...]
     prep_cache: dict
+    local_read_geometry: LocalReadGeometry | None = None
 
     def parent_view(self, division: CoreDivision) -> Optional[PerCoreView]:
         """The producer's write-view under ``division``, or ``None`` when that
@@ -1525,6 +1541,18 @@ class ResidencyEdge:
             parent_view is not None
             and consumer_view is not None
             and parent_view.same_partition(consumer_view)
+            and self._local_reads_compatible(parent_view, consumer_view)
+        )
+
+    def _local_reads_compatible(self, parent_view, consumer_view) -> bool:
+        """Interpret the planner's read facts without querying its graph state."""
+        if not self._has_partial_read():
+            return True
+        if not config.lx_extended_ownership:
+            return False
+        return (
+            local_read_certificate(self.local_read_geometry, parent_view, consumer_view)
+            is not None
         )
 
     def consumer_division_for(
@@ -1608,6 +1636,10 @@ class ResidencyEdge:
         prep = _prep_for(op, dep, self.buf_name, self.prep_cache)
         is_parent_side = op is self.parent_op
         wanted = other.tiling if space.admits_tiling(other.tiling) else UNTILED
+        if self._has_partial_read():
+            if not other.tiling.is_untiled:
+                return None
+            wanted = UNTILED
         attempts = (wanted,) if wanted.is_untiled else (wanted, UNTILED)
         for tiling in attempts:
 
@@ -1670,7 +1702,21 @@ class ResidencyEdge:
             and parent_tile.same_partition(consumer_tile)
             and self._cores_used(parent_divisions[i])
             == self._cores_used(consumer_divisions[j])
+            and self._local_reads_compatible(parent_view, consumer_view)
+            and (
+                not self._has_partial_read()
+                or (
+                    parent_divisions[i].tiling.is_untiled
+                    and consumer_divisions[j].tiling.is_untiled
+                )
+            )
         ]
+
+    def _has_partial_read(self) -> bool:
+        try:
+            return has_partial_read(self.parent_op.layout.size, self.read_deps)
+        except (AttributeError, TypeError, ValueError, NotImplementedError):
+            return True
 
 
 def build_residency_edge(
@@ -1680,6 +1726,8 @@ def build_residency_edge(
     consumer_reads: Iterable[Dep],
     residency_reason: Optional[str],
     prep_cache: dict,
+    *,
+    local_read_geometry: LocalReadGeometry | None = None,
 ) -> Optional[ResidencyEdge]:
     """The :class:`ResidencyEdge` for this producer-consumer pair, or ``None``
     when the edge can never host a residency."""
@@ -1706,6 +1754,7 @@ def build_residency_edge(
         write_dep=write_dep,
         read_deps=read_deps,
         prep_cache=prep_cache,
+        local_read_geometry=local_read_geometry,
     )
 
 

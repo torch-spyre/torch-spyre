@@ -33,9 +33,13 @@ from torch._inductor.ir import (
 )
 from torch._inductor.virtualized import V
 from torch_spyre._C import SpyreTensorLayout, get_device_size_in_bytes
-from .constants import RESTICKIFY_DEVICE_DTYPE_COST_WEIGHT
+from .constants import (
+    RESTICKIFY_DEVICE_DTYPE_COST_WEIGHT,
+    RESTICKIFY_SUPPORTED_DEVICE_DTYPES,
+)
 from .pass_utils import (
     compute_restickify_needed,
+    compute_size1_restickify_target,
     device_coordinates,
     host_coordinates,
 )
@@ -46,18 +50,16 @@ logger = get_inductor_logger("optimize_restickify")
 
 
 class EdgeCostMap:
-    """Lazy cost table mapping (in_layout, target_layout) -> restick cost for one op input.
+    """Lazy cost table mapping (in_stl, out_stl) -> restick cost for one op input.
 
-    Entries are computed on demand by compute_restickify_needed. `dep` is the
-    MemoryDep for this input; it is not used locally but is forwarded to
-    compute_restickify_needed in pass_utils.
+    target_dep is the dep whose host layout drives the output target passed to
+    compute_restickify_needed. Entries are computed on demand and cached.
     """
 
     def __init__(
         self,
         dep: "MemoryDep",
         in_layouts: list,
-        target_layouts: list,
         target_dep: "MemoryDep",
         op,
         forbidden_stick_sym: "sympy.Symbol | None" = None,
@@ -65,10 +67,8 @@ class EdgeCostMap:
         self.dep = dep
         self._op = op
         self._in_layouts = in_layouts
-        self._target_layouts = target_layouts
         self._target_dep = target_dep
         self._dep_layout = V.graph.get_buffer(dep.name).get_layout()
-        self._target_dep_layout = V.graph.get_buffer(target_dep.name).get_layout()
         self._forbidden_stick_sym = forbidden_stick_sym
 
         # _cost and _layout are parallel maps.
@@ -106,10 +106,23 @@ class EdgeCostMap:
             stick_expr = device_coordinates(in_stl, self.dep, None)[-1]
             if self._forbidden_stick_sym in stick_expr.free_symbols:
                 # Input stick contains a forbidden symbol (e.g. topk reduction
-                # var): this pairing is invalid even though stick_compatible
-                # accepted it. Mark as infeasible so the optimizer is forced to
-                # pick a different input candidate or output STL.
-                needed, tgt = True, None
+                # var): invalid even though stick_compatible accepted it, because
+                # the output stick is synthetic (zero) and carries no input var.
+                # Restickify the input onto a size-1 dim to move the var off the
+                # stick. tgt must either move the stick off the forbidden symbol
+                # or stay None, which is INFEASIBLE below; a target whose stick
+                # still carries the symbol is rejected rather than trusted.
+                needed = True
+                if in_stl.device_dtype in RESTICKIFY_SUPPORTED_DEVICE_DTYPES:
+                    tgt = compute_size1_restickify_target(
+                        in_stl, self._dep_layout, self.dep, self._op
+                    )
+                    if (
+                        tgt is not None
+                        and self._forbidden_stick_sym
+                        in device_coordinates(tgt, self.dep, None)[-1].free_symbols
+                    ):
+                        tgt = None
         if not needed:
             cost = 0.0
             self._layout[in_stl][target_stl] = None
@@ -228,9 +241,7 @@ class AllSameNode(RestickNodeCost):
         out_dep = out_deps[0]  # reference output dep for stick-compatibility checks
         co_output_deps = out_deps[1:]
         input_edge_costs = [
-            EdgeCostMap(
-                arg.dep, arg.layouts, out_layouts, out_dep, op, forbidden_stick_sym
-            )
+            EdgeCostMap(arg.dep, arg.layouts, out_dep, op, forbidden_stick_sym)
             for arg in args
         ]
         output_edge_costs = [
@@ -242,7 +253,6 @@ class AllSameNode(RestickNodeCost):
                 # list here would cause min_input_cost to return INF for all
                 # beam states with no useful error message.
                 getattr(V.graph.get_buffer(dep.name), "layouts", []),
-                out_layouts,
                 out_dep,
                 op,
             )
@@ -281,13 +291,18 @@ class AllSameNode(RestickNodeCost):
     def min_input_cost(self, dep_name, in_stl, out_stl):
         # next() takes the first match; if dep_name appears twice (x+x), both edges
         # are identical so the cost is the same either way.
-        ec = next(e for e in self.edge_costs if e.dep.name == dep_name)
+        # Co-output deps are not in _input_edge_costs; the DP may call us with one
+        # when it walks edge_costs, which includes co-output entries. Cost is 0: the
+        # co-output layout constraint is enforced in cost(), not here.
+        ec = next((e for e in self._input_edge_costs if e.dep.name == dep_name), None)
+        if ec is None:
+            return 0.0
         edge_c = ec.cost(in_stl, out_stl)
         if edge_c == INF:
             return INF
         other_ok = all(
             any(e.cost(other_c, out_stl) < INF for other_c in e._in_layouts)
-            for e in self.edge_costs
+            for e in self._input_edge_costs
             if e.dep.name != dep_name
         )
         return edge_c if other_ok else INF
@@ -315,7 +330,7 @@ class FixedInOutNode(RestickNodeCost):
     def from_args(cls, args, out_stl, req_stls, op, out_dep):
         assert req_stls, "FixedInOutNode.from_args: req_stls is empty"
         edge_costs = [
-            EdgeCostMap(arg.dep, arg.layouts, [req], arg.dep, op)
+            EdgeCostMap(arg.dep, arg.layouts, arg.dep, op)
             for arg, req in zip(args, req_stls)
         ]
         return cls(
@@ -600,11 +615,6 @@ def _reorder_any_in_nodes(operations: list) -> list:
             if insert_before == i:
                 result.append(moved_ops[old_pos])
         result.append(op)
-    # Handle any ops targeted past the end.
-    for old_pos, insert_before in sorted(to_move.items()):
-        if insert_before >= len(operations):
-            result.append(moved_ops[old_pos])
-
     return result
 
 

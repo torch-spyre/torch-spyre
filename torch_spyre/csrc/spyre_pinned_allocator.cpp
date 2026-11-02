@@ -17,7 +17,7 @@
 #include "spyre_pinned_allocator.h"
 
 #include <cstring>
-#include <flex/runtime_stream/runtime_context.hpp>
+#include <flex/flex.hpp>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
