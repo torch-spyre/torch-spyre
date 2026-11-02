@@ -45,7 +45,7 @@ SPEC = {"min": 140, "max": 630, "granularity": 70}
 # shrink but never go below it: a kernel built for more rows than its output
 # holds may write past the output buffer, which is not measured yet.
 SIZES = [140, 630, 280, 560, 210]
-FOLLOW_UP = "#<issue>"
+FOLLOW_UP = "#5937"
 
 # fp16 results of ops on values in [0, 1), against an fp32 reference: one ulp
 # is about 1e-3 near 1 and sum(dim=0) over 140 rows measured a relative error

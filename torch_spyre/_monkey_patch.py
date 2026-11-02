@@ -231,7 +231,7 @@ def _transfer_reserved(src, spec: _DynamicSpec) -> "torch.Tensor":
         'tensor.to("spyre", dynamic=...) reserves the buffer at max, but compiled '
         "kernels are still built for the size at first compile, so running a "
         "compiled function at another size returns wrong values without an "
-        "error. Tracked in #<issue>.",
+        "error. Tracked in #5937.",
         UserWarning,
         stacklevel=3,
     )
