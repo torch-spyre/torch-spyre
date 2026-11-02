@@ -518,39 +518,40 @@ whatever configurations happen to already have measurements
 (`run_cost_model_sweep.py`'s `_configs()`, driven by `_env_from_record`) — there is no
 code anywhere that checks the result for balance, so today's distribution is an artifact
 of what got measured historically, not a deliberate weighting choice. Measured directly
-from `sweep_plan.json` (1632 configs total; `run_cost_model_sweep.py --dry-run` reports
-1518 of those because `_SKIP_OPS` excludes `bmm_layout` — a non-default operand layout no
+from `sweep_plan.json` (1762 configs total; `run_cost_model_sweep.py --dry-run` reports
+1648 of those because `_SKIP_OPS` excludes `bmm_layout` — a non-default operand layout no
 released build emits — and `bmm_3d2d_k_tiling`, quarantined after a real hardware incident
 on 2026-08-07 rather than for being a bad config), grouped into
 [Accuracy](cost_model.md#accuracy)'s own reporting categories:
 
   <table>
-  <thead><tr><th>group</th><th>category</th><th>configs</th><th>% of 1632</th></tr></thead>
+  <thead><tr><th>group</th><th>category</th><th>configs</th><th>% of 1762</th></tr></thead>
   <tbody>
-  <tr><td rowspan="9"><b>matmul/bmm</b><br/>573 (35.1%)</td><td>matmul_split (<code>mmwd</code>)</td><td align="right">281</td><td align="right">17.2%</td></tr>
-  <tr><td>bmm_split</td><td align="right">113</td><td align="right">6.9%</td></tr>
-  <tr><td>matmul_row</td><td align="right">93</td><td align="right">5.7%</td></tr>
-  <tr><td>bmm</td><td align="right">23</td><td align="right">1.4%</td></tr>
-  <tr><td>matmul</td><td align="right">18</td><td align="right">1.1%</td></tr>
+  <tr><td rowspan="9"><b>matmul/bmm</b><br/>573 (32.5%)</td><td>matmul_split (<code>mmwd</code>)</td><td align="right">281</td><td align="right">15.9%</td></tr>
+  <tr><td>bmm_split</td><td align="right">113</td><td align="right">6.4%</td></tr>
+  <tr><td>matmul_row</td><td align="right">93</td><td align="right">5.3%</td></tr>
+  <tr><td>bmm</td><td align="right">23</td><td align="right">1.3%</td></tr>
+  <tr><td>matmul</td><td align="right">18</td><td align="right">1.0%</td></tr>
   <tr><td>matmul_k</td><td align="right">15</td><td align="right">0.9%</td></tr>
-  <tr><td>matmul_nested</td><td align="right">13</td><td align="right">0.8%</td></tr>
-  <tr><td>bmm_3d2d (skipped)</td><td align="right">9</td><td align="right">0.6%</td></tr>
+  <tr><td>matmul_nested</td><td align="right">13</td><td align="right">0.7%</td></tr>
+  <tr><td>bmm_3d2d (skipped)</td><td align="right">9</td><td align="right">0.5%</td></tr>
   <tr><td>bmm_nested</td><td align="right">8</td><td align="right">0.5%</td></tr>
-  <tr><td rowspan="2"><b>softmax</b><br/>138 (8.5%)</td><td>softmax</td><td align="right">113</td><td align="right">6.9%</td></tr>
-  <tr><td>softmax_unrolled</td><td align="right">25</td><td align="right">1.5%</td></tr>
-  <tr><td rowspan="2"><b>reduction</b><br/>206 (12.6%)</td><td>reduction (plain)</td><td align="right">155</td><td align="right">9.5%</td></tr>
-  <tr><td>coarse_reduction</td><td align="right">51</td><td align="right">3.1%</td></tr>
-  <tr><td colspan="2">broadcast</td><td align="right">226</td><td align="right">13.8%</td></tr>
-  <tr><td colspan="2">transport</td><td align="right">172</td><td align="right">10.5%</td></tr>
-  <tr><td colspan="2">pointwise</td><td align="right">168</td><td align="right">10.3%</td></tr>
-  <tr><td colspan="2">other (incl. <code>bmm_layout</code>, skipped)</td><td align="right">149</td><td align="right">9.1%</td></tr>
+  <tr><td rowspan="2"><b>softmax</b><br/>138 (7.8%)</td><td>softmax</td><td align="right">113</td><td align="right">6.4%</td></tr>
+  <tr><td>softmax_unrolled</td><td align="right">25</td><td align="right">1.4%</td></tr>
+  <tr><td rowspan="2"><b>reduction</b><br/>206 (11.7%)</td><td>reduction (plain)</td><td align="right">155</td><td align="right">8.8%</td></tr>
+  <tr><td>coarse_reduction</td><td align="right">51</td><td align="right">2.9%</td></tr>
+  <tr><td colspan="2">broadcast</td><td align="right">226</td><td align="right">12.8%</td></tr>
+  <tr><td colspan="2">transport</td><td align="right">172</td><td align="right">9.8%</td></tr>
+  <tr><td colspan="2">pointwise</td><td align="right">168</td><td align="right">9.5%</td></tr>
+  <tr><td colspan="2">other (incl. <code>bmm_layout</code>, skipped)</td><td align="right">149</td><td align="right">8.5%</td></tr>
+  <tr><td colspan="2"><code>relayout</code> (scored by <code>eval_model.py --relayout</code>)</td><td align="right">130</td><td align="right">7.4%</td></tr>
   </tbody>
   </table>
 
-  Summed by family, matmul/bmm+softmax together are 711/1632 (43.6%) — well under
-  broadcast+transport+pointwise+reduction's combined 921/1632 (56.4%), so "matmul-biased"
+  Summed by family, matmul/bmm+softmax together are 711/1762 (40.4%) — well under
+  broadcast+transport+pointwise+reduction's combined 921/1762 (52.3%), so "matmul-biased"
   overstates it at the top level. The real skew is *within* the matmul family: `mmwd` alone
-  (17.2%) outweighs every other single op by a wide margin, while five matmul/bmm
+  (15.9%) outweighs every other single op by a wide margin, while five matmul/bmm
   sub-categories — `matmul`, `matmul_k`, `matmul_nested`, `bmm_3d2d`, `bmm_nested` — each
   rest on under 20 configs (8 to 18). Their rows in the Accuracy table are the ones to treat
   as statistically thin regardless of how important those ops are architecturally; a
