@@ -73,7 +73,8 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 | `torch.maximum` | Y | Y | Spyre | |
 | `torch.minimum` | Y | Y | Spyre | |
 | `torch.bitwise_and` | Y | Y | Spyre | Custom decomposition; boolean inputs run on Spyre (`logical_and`), integer inputs decompose through `bitwise_or`, which falls back to CPU |
-| `torch.where` | Y | Y | Spyre | `where.self` registered eagerly; `where.Scalar*` overloads via custom decomposition; `where.default` (condition-only form) falls back to CPU |
+| `torch.where` | Y | Y | Spyre | `where.self` registered eagerly; `where.Scalar*` overloads via custom decomposition; `where.default` (condition-only form) falls back to CPU. A host bool mask with fp32 or int32 values is refused as mixed EA (#5495) |
+| `torch.masked_fill` | Y | Y | Spyre | Lowers to `where`, so the same limitation applies: a host bool mask with fp32 or int32 values is refused as mixed EA (#5495) |
 | **Comparison** | | | | |
 | `torch.eq` | Y | Y | Spyre | |
 | `torch.ne` | Y | Y | Spyre | |

@@ -7632,6 +7632,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((4, 64), dtype=torch.float16),
                     0.0,
                 ),
+                # Passes here, but the LX-planning wrappers (x + x) / 2 and
+                # sum(x, dim=0) turn the -inf result into NaN on device (#5190),
+                # so its LX copies are strict xfails in
+                # test_inductor_ops_lx_misc_compute_b_config.yaml.
                 "fp16_2d_neginf": (
                     cached_randn((5, 10), dtype=torch.float16) > 0,
                     cached_randn((5, 10), dtype=torch.float16),
