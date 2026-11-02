@@ -280,6 +280,43 @@ inline std::string runtimeCbidName(AIUpti_runtime_api_trace_cbid cbid) {
       return "aiuCommsHdmaFirmwareReset";
     case AIUPTI_RUNTIME_TRACE_CBID_WAIT_FOR_QUEUE_CAPACITY:
       return "aiuWaitForQueueCapacity";
+
+    // ResponseWorker CBIDS (79-82)
+    case AIUPTI_RUNTIME_TRACE_CBID_FETCH_RESPONSE_BLOCKS:
+      return "aiuFetchResponseBlocks";
+    case AIUPTI_RUNTIME_TRACE_CBID_RESPONSE_COMPLETION_THREAD:
+      return "aiuResponseCompletionThread";
+    case AIUPTI_RUNTIME_TRACE_CBID_PARSE_RESPONSE_BLOCKS:
+      return "aiuParseResponseBlocks";
+    case AIUPTI_RUNTIME_TRACE_CBID_ITERATION_DURATION:
+      return "aiuIterationDuration";
+
+    // CBIDS 83 to 84 are reserved
+    // P2P RDMA CBIDS (85 - 91)
+    case AIUPTI_RUNTIME_TRACE_CBID_P2P_RDMA_MULTICAST:
+      return "aiuP2PRdmaMulticast";
+    case AIUPTI_RUNTIME_TRACE_CBID_P2P_RDMA_WAIT:
+      return "aiuP2PRdmaWait";
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULE_P2P_RDMA_SEND:
+      return "aiuScheduleP2PRdmaSend";
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULE_P2P_RDMA_WAIT:
+      return "aiuScheduleP2PRdmaWait";
+    case AIUPTI_RUNTIME_TRACE_CBID_LAUNCH_P2P_RDMA_SEND:
+      return "aiuLaunchP2PRdmaSend";
+    case AIUPTI_RUNTIME_TRACE_CBID_LAUNCH_P2P_RDMA_WAIT:
+      return "aiuLaunchP2PRdmaWait";
+    case AIUPTI_RUNTIME_TRACE_CBID_INITIALIZE_P2P:
+      return "aiuInitializeP2P";
+
+    // Scheduler submit/barrier CBIDS (102-105)
+    case AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_DMA:
+      return "aiuSubmitDMA";
+    case AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_COMPUTE:
+      return "aiuSubmitCompute";
+    case AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_FILL:
+      return "aiuSubmitFill";
+    case AIUPTI_RUNTIME_TRACE_CBID_ISSUE_BARRIER:
+      return "aiuIssueBarrier";
     default:
       break;
   }
@@ -438,6 +475,29 @@ void AiuptiActivityProfilerSession::handleRuntimeActivity(
     case AIUPTI_RUNTIME_TRACE_CBID_DATA_TRANSFER_DTOH:
     case AIUPTI_RUNTIME_TRACE_CBID_DATA_TRANSFER_HTOD:
       runtime_activity->addMetadata("bytes", activity->data);
+      break;
+
+    case AIUPTI_RUNTIME_TRACE_CBID_ISSUE_BARRIER:
+      runtime_activity->addMetadata("fence_size", activity->data);
+      break;
+
+    case AIUPTI_RUNTIME_TRACE_CBID_P2P_RDMA_MULTICAST:
+      runtime_activity->addMetadata("bytes", activity->data);
+      break;
+
+    case AIUPTI_RUNTIME_TRACE_CBID_P2P_RDMA_WAIT:
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULE_P2P_RDMA_WAIT:
+    case AIUPTI_RUNTIME_TRACE_CBID_LAUNCH_P2P_RDMA_WAIT:
+      runtime_activity->addMetadata("num_sids", activity->data);
+      break;
+
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULE_P2P_RDMA_SEND:
+    case AIUPTI_RUNTIME_TRACE_CBID_LAUNCH_P2P_RDMA_SEND:
+      runtime_activity->addMetadata("num_dest_ranks", activity->data);
+      break;
+
+    case AIUPTI_RUNTIME_TRACE_CBID_INITIALIZE_P2P:
+      runtime_activity->addMetadata("world_size", activity->data);
       break;
 
     default:

@@ -53,6 +53,11 @@ from .ir import (
 )
 from .logging_utils import get_inductor_logger
 from .op_spec import IndirectAccess
+from .lx_read_contracts import (
+    LocalReadGeometry,
+    has_partial_read,
+    local_read_certificate,
+)
 from .pass_utils import (
     PerCoreView,
     SchedNodeArg,
@@ -122,6 +127,11 @@ def _collect_symbol_metadata(it_space: dict[Symbol, Expr]) -> SymbolMeta:
 
     Concrete dims (no free symbols) are also omitted, so callers can use
     ``v in meta`` to detect both cases.
+
+    Deprecated. Serves the symbolic-SDSC route, which the explicit-loop route
+    supersedes. On the loop route this returns EMPTY, because there the body op's
+    iteration space is a static tile, so callers must treat empty as normal.
+    TODO(issue#5890): remove with the rest of the symbolic-SDSC route.
     """
     meta: SymbolMeta = {}
     for sym, expr in it_space.items():
@@ -457,6 +467,9 @@ def adjust_it_space_for_sticks(
         if stick_var not in adjusted_space:
             continue
         if stick_var in symbol_meta:
+            # Deprecated with _collect_symbol_metadata: reachable only when
+            # symbol_meta is non-empty, so never on the explicit-loop route.
+            # TODO(issue#5890): remove with the symbolic-SDSC route.
             logger.info(
                 f"[work_division/symbolic] stick-dim guard raised: "
                 f"stick_var={stick_var} on tensor {td.dep.name} is symbolic"
@@ -1451,6 +1464,7 @@ class ResidencyEdge:
     write_dep: MemoryDep
     read_deps: tuple[MemoryDep, ...]
     prep_cache: dict
+    local_read_geometry: LocalReadGeometry | None = None
 
     def parent_view(self, division: CoreDivision) -> Optional[PerCoreView]:
         """The producer's write-view under ``division``, or ``None`` when that
@@ -1535,6 +1549,18 @@ class ResidencyEdge:
             parent_view is not None
             and consumer_view is not None
             and parent_view.same_partition(consumer_view)
+            and self._local_reads_compatible(parent_view, consumer_view)
+        )
+
+    def _local_reads_compatible(self, parent_view, consumer_view) -> bool:
+        """Interpret the planner's read facts without querying its graph state."""
+        if not self._has_partial_read():
+            return True
+        if not config.lx_extended_ownership:
+            return False
+        return (
+            local_read_certificate(self.local_read_geometry, parent_view, consumer_view)
+            is not None
         )
 
     def consumer_division_for(
@@ -1618,6 +1644,10 @@ class ResidencyEdge:
         prep = _prep_for(op, dep, self.buf_name, self.prep_cache)
         is_parent_side = op is self.parent_op
         wanted = other.tiling if space.admits_tiling(other.tiling) else UNTILED
+        if self._has_partial_read():
+            if not other.tiling.is_untiled:
+                return None
+            wanted = UNTILED
         attempts = (wanted,) if wanted.is_untiled else (wanted, UNTILED)
         for tiling in attempts:
 
@@ -1680,7 +1710,21 @@ class ResidencyEdge:
             and parent_tile.same_partition(consumer_tile)
             and self._cores_used(parent_divisions[i])
             == self._cores_used(consumer_divisions[j])
+            and self._local_reads_compatible(parent_view, consumer_view)
+            and (
+                not self._has_partial_read()
+                or (
+                    parent_divisions[i].tiling.is_untiled
+                    and consumer_divisions[j].tiling.is_untiled
+                )
+            )
         ]
+
+    def _has_partial_read(self) -> bool:
+        try:
+            return has_partial_read(self.parent_op.layout.size, self.read_deps)
+        except (AttributeError, TypeError, ValueError, NotImplementedError):
+            return True
 
 
 def build_residency_edge(
@@ -1690,6 +1734,8 @@ def build_residency_edge(
     consumer_reads: Iterable[Dep],
     residency_reason: Optional[str],
     prep_cache: dict,
+    *,
+    local_read_geometry: LocalReadGeometry | None = None,
 ) -> Optional[ResidencyEdge]:
     """The :class:`ResidencyEdge` for this producer-consumer pair, or ``None``
     when the edge can never host a residency."""
@@ -1716,6 +1762,7 @@ def build_residency_edge(
         write_dep=write_dep,
         read_deps=read_deps,
         prep_cache=prep_cache,
+        local_read_geometry=local_read_geometry,
     )
 
 
