@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from types import SimpleNamespace
 
 import sympy
@@ -33,7 +34,11 @@ from torch_spyre._inductor.constants import (
 )
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.pass_utils import (
+    compute_restickify_needed,
     device_coordinates,
+    host_sparse_layout,
+    is_stick_expr_offset_free,
+    sparse_layout_serves_read,
     try_device_coordinates,
 )
 from torch_spyre._inductor.nonstick_dim_order import _flat_dense_projection_x_layout
@@ -1348,6 +1353,158 @@ class TestFlatDenseProjectionLayout(TestCase):
             x, y, output, out_dep, contraction, M, N
         )
         self.assertIsNone(result)
+
+
+def _contiguous_host(shape, dtype=torch.float16):
+    strides = [math.prod(shape[i + 1 :]) for i in range(len(shape))]
+    return FixedLayout(torch.device("spyre:0"), dtype, list(shape), strides)
+
+
+def _flat_read(numel):
+    c0 = sympy.Symbol("c0", integer=True, nonnegative=True)
+    return c0, MemoryDep("arg0_1", c0, (c0,), (numel,))
+
+
+class TestHostSparseLayout(TestCase):
+    """``host_sparse_layout`` keeps the host dims and puts the former stick dim on
+    a new size-1 dim.  The former stick dim is padded at its end, so it has to be
+    the outermost device dim: only then does the padding sit at the end of the
+    buffer, and not between the slices of another dim."""
+
+    def test_2d_layout(self):
+        sp = host_sparse_layout(_contiguous_host([8, 65]))
+        self.assertEqual(list(sp.device_size), [65, 1, 8, 64])
+        self.assertEqual(list(sp.stride_map), [1, -1, 65, -1])
+
+    def test_3d_former_stick_dim_is_outermost(self):
+        sp = host_sparse_layout(_contiguous_host([2, 3, 65]))
+        self.assertEqual(list(sp.device_size), [65, 3, 1, 2, 64])
+        self.assertEqual(list(sp.stride_map), [1, 65, -1, 195, -1])
+
+    def test_former_stick_dim_outermost_for_every_rank(self):
+        for shape in ([8, 65], [2, 3, 65], [4, 2, 100], [2, 3, 4, 65]):
+            with self.subTest(shape=shape):
+                sp = host_sparse_layout(_contiguous_host(shape))
+                self.assertEqual(sp.device_size[0], shape[-1])
+                self.assertEqual(sp.stride_map[0], 1)
+
+    def test_every_host_dim_and_the_stick_stay_in_the_layout(self):
+        sp = host_sparse_layout(_contiguous_host([2, 3, 4, 65]))
+        self.assertEqual(sorted(sp.device_size), sorted([65, 3, 4, 1, 2, 64]))
+        # One device dim per host dim plus the new size-1 dim and the stick; the
+        # host strides are kept, the new dims have none.
+        self.assertEqual(sorted(sp.stride_map), sorted([1, 260, 65, -1, 780, -1]))
+
+    def test_size_one_dims_do_not_change_the_rule(self):
+        for shape in ([1, 65], [2, 1, 65], [1, 3, 65], [1, 1, 65]):
+            with self.subTest(shape=shape):
+                sp = host_sparse_layout(_contiguous_host(shape))
+                self.assertEqual(sp.device_size[0], 65)
+                self.assertEqual(sp.stride_map[0], 1)
+
+    def test_dtype_override(self):
+        host = _contiguous_host([2, 3, 65])
+        default = host_sparse_layout(host)
+        as_bool = host_sparse_layout(host, torch.bool)
+        self.assertEqual(
+            default.device_dtype, SpyreTensorLayout([1, 1], torch.float16).device_dtype
+        )
+        self.assertEqual(
+            as_bool.device_dtype, SpyreTensorLayout([1, 1], torch.bool).device_dtype
+        )
+        self.assertEqual(list(as_bool.device_size), list(default.device_size))
+
+
+class TestSparseLayoutServesRead(TestCase):
+    """A flat read that splits a stick on the dense layout is served by the input's
+    sparse layout.  Whatever form the coordinates take, they have to land on the
+    element the read names."""
+
+    def _assert_flat_read_exact(self, sp, numel):
+        c0, dep = _flat_read(numel)
+        coords = try_device_coordinates(sp, dep, None)
+        self.assertIsNotNone(coords)
+        strides = list(sp.stride_map)
+        for flat in range(numel):
+            values = [int(c.subs({c0: flat})) for c in coords]
+            # The stick and any size-1 dim sit at coordinate 0.
+            for value, stride in zip(values, strides):
+                if stride == -1:
+                    self.assertEqual(value, 0, f"c0={flat}")
+            # Contiguous host: the host offset of the element is the flat index.
+            offset = sum(v * st for v, st in zip(values, strides) if st > 0)
+            self.assertEqual(offset, flat, f"c0={flat}")
+
+    def test_flat_read_is_served_and_exact(self):
+        for shape in ([8, 65], [3, 65], [4, 130], [2, 100], [2, 3, 65], [4, 2, 100]):
+            with self.subTest(shape=shape):
+                host = _contiguous_host(shape)
+                numel = math.prod(shape)
+                dense = SpyreTensorLayout(shape, torch.float16)
+                _, dep = _flat_read(numel)
+                sparse = sparse_layout_serves_read(dense, host, dep)
+                self.assertIsNotNone(sparse)
+                self.assertEqual(
+                    list(sparse.device_size), list(host_sparse_layout(host).device_size)
+                )
+                self._assert_flat_read_exact(sparse, numel)
+
+    def test_flat_read_is_exact_for_fp32(self):
+        # fp32: 32 elements per stick, so 33 is the unaligned row length.
+        shape = [4, 33]
+        host = _contiguous_host(shape, torch.float32)
+        dense = SpyreTensorLayout(shape, torch.float32)
+        _, dep = _flat_read(math.prod(shape))
+        sparse = sparse_layout_serves_read(dense, host, dep)
+        self.assertIsNotNone(sparse)
+        self._assert_flat_read_exact(sparse, math.prod(shape))
+
+    def test_aligned_read_is_not_redirected(self):
+        for shape in ([8, 128], [2, 3, 64]):
+            with self.subTest(shape=shape):
+                host = _contiguous_host(shape)
+                dense = SpyreTensorLayout(shape, torch.float16)
+                _, dep = _flat_read(math.prod(shape))
+                self.assertIsNone(sparse_layout_serves_read(dense, host, dep))
+
+    def test_sparse_input_is_not_redirected(self):
+        host = _contiguous_host([8, 65])
+        _, dep = _flat_read(520)
+        self.assertIsNone(
+            sparse_layout_serves_read(host_sparse_layout(host), host, dep)
+        )
+
+    def test_restickify_target_for_unserved_read(self):
+        # compute_restickify_needed asks for the sparse layout instead of
+        # returning "no restickify needed" or "infeasible".
+        for shape in ([8, 65], [2, 3, 65]):
+            with self.subTest(shape=shape):
+                host = _contiguous_host(shape)
+                numel = math.prod(shape)
+                dense = SpyreTensorLayout(shape, torch.float16)
+                _, dep = _flat_read(numel)
+                needed, target = compute_restickify_needed(
+                    dense, host, dep, SpyreTensorLayout([numel], torch.float16), dep
+                )
+                self.assertTrue(needed)
+                self.assertIsNotNone(target)
+                self.assertEqual(
+                    list(target.device_size), list(host_sparse_layout(host).device_size)
+                )
+
+
+class TestStickExprOffsetFree(TestCase):
+    def test_stick_split_by_a_row_boundary_is_not_a_stick(self):
+        c0 = sympy.Symbol("c0", integer=True, nonnegative=True)
+        self.assertFalse(
+            is_stick_expr_offset_free(sympy.Mod(sympy.Mod(c0, 65), 64), 64)
+        )
+
+    def test_plain_stick_expressions_stay_supported(self):
+        c0 = sympy.Symbol("c0", integer=True, nonnegative=True)
+        self.assertTrue(is_stick_expr_offset_free(sympy.Mod(c0, 64), 64))
+        self.assertTrue(is_stick_expr_offset_free(c0, 64))
+        self.assertTrue(is_stick_expr_offset_free(sympy.S.Zero, 64))
 
 
 if __name__ == "__main__":

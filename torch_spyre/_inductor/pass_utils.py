@@ -2649,13 +2649,21 @@ def host_sparse_layout(
 ) -> SpyreTensorLayout:
     """The sparse layout a restickify of ``host`` reaches by moving the stick onto
     a new size-1 dim and leaving the other dims in place: the former stick dim
-    becomes the outermost device dim (dim_order in host order, then -1).
+    becomes the outermost device dim.
+
+    The former stick dim is the one padded to a whole number of sticks, and the
+    padding is added at the end of that dim.  Only when it is outermost does the
+    padding sit at the end of the buffer, where a consumer that reads the sparse
+    tensor as one run of sticks expects it; inside another dim larger than 1 it
+    would fall between the slices of that dim.
 
     ``dtype`` overrides ``host.dtype`` for an op whose layout dtype differs from
     its host dtype (for example a bool output)."""
     sizes = [int(concretize_expr(v)) for v in host.size]
     strides = [int(concretize_expr(v)) for v in host.stride]
     outer_first = sorted(range(len(sizes)), key=lambda d: -strides[d])
+    if len(outer_first) > 2:
+        outer_first = [outer_first[0], outer_first[-1]] + outer_first[1:-1]
     return SpyreTensorLayout(
         sizes, strides, host.dtype if dtype is None else dtype, outer_first + [-1]
     )
