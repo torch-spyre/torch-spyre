@@ -290,6 +290,14 @@ def _dma_to_spyre_fp8_kernel(
 
     Caller must ensure ``weight.ndim == 2`` and
     ``weight.dtype == torch.float8_e4m3fn``.
+
+    An unaligned K is zero-padded on device to the FP8 stick (128) and a
+    ``[K, N]`` view is returned, since ``batchmatmulfp8`` reads K in whole
+    sticks; ``insert_bmm_padding`` then skips the weight (#5524).
+
+    Limitations: a padded weight cannot be read back (``.cpu()``/``.clone()``);
+    in-graph ``qfp8wt`` weights are not covered; K is padded only when
+    N % 128 == 0 (#5924).
     """
     assert weight.ndim == 2, "FP8 KERNEL layout is for 2D weights only"
     assert weight.dtype == torch.float8_e4m3fn, (
@@ -308,18 +316,44 @@ def _dma_to_spyre_fp8_kernel(
     # (spyre_mem.cpp) derives host strides analytically from K and N — it does
     # not use the CPU tensor's actual strides. This means a non-contiguous view
     # (e.g. p.t()) is safe to pass directly, avoiding a CPU memcpy.
+    k, n = weight.shape
+    eps = SpyreTensorLayout([k, n], torch.float8_e4m3fn).elems_per_stick()
+    k_padded = -(-k // eps) * eps
+    if n % eps:
+        # The fp8 matmul is wrong for N % 128 != 0 (#5924); stay unpadded
+        # so an unaligned K still fails loudly.
+        k_padded = k
+    host = weight
+    if k_padded != k:
+        # Zero-fill rows K..K_padded-1 on the host (one CPU copy).
+        host = torch.zeros(k_padded, n, dtype=weight.dtype)
+        host[:k] = weight
     layout = SpyreTensorLayout(
-        list(weight.shape),  # host_size: [K, N] = [in_features, out_features]
-        list(weight.stride()),  # host_strides: row-major [N, 1]
+        list(host.shape),  # host_size: [K, N] = [in_features, out_features]
+        list(host.stride()),  # host_strides: row-major [N, 1]
         torch.float8_e4m3fn,
         [0, 1],  # dim_order: identity, matches _qfp8wt_stl in propagate_layouts
         ElementArrangement.QFP8WT,  # 2D stick [2, 64] for KERNEL tensor
     )
+    if k_padded != k:
+        # Mark only k of the k_padded device rows valid; insert_bmm_padding
+        # keys on this.
+        assert list(layout.device_size)[1] == k_padded, layout
+        valid = dict(layout.valid_elements)
+        (k_key,) = [key for key in valid if 1 in key]
+        valid[k_key] = k
+        layout = SpyreTensorLayout(
+            list(layout.device_size),
+            list(layout.stride_map),
+            layout.device_dtype,
+            valid,
+            ElementArrangement.QFP8WT,
+        )
     dst = spyre_empty_with_layout(
-        weight.size(), weight.stride(), torch.float8_e4m3fn, layout
+        host.size(), host.stride(), torch.float8_e4m3fn, layout
     )
-    copy_tensor(weight, dst, non_blocking=False)
-    return dst
+    copy_tensor(host, dst, non_blocking=False)
+    return dst if k_padded == k else dst.narrow(0, 0, k)
 
 
 def dma_moe_expert_weight_to_spyre(
