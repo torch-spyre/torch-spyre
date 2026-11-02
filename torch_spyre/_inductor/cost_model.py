@@ -1759,6 +1759,9 @@ def _reused_operand_stream_excess_ns(ops: list, p: "CostParams"):
     bundles only, and operands of at least ``mm_stream_min_bytes``. A
     candidate tile count keeps the single-pass condition symbolic, so its
     untiled candidate pays the same stream price as the concrete op.
+
+    A small-M shared decode weight already pays the calibrated delivery term
+    of ``_decode_weight_delivery_excess``; leave that operand to that term.
     """
     gbps = p.mm_stream_gbps_per_core
     unicast = p.mm_stream_unicast_ns_per_request
@@ -1783,7 +1786,10 @@ def _reused_operand_stream_excess_ns(ops: list, p: "CostParams"):
     for op in ops:
         if not op.is_matmul:
             continue
+        decode = _decode_weight(op) if all(_is_single_pass(o) for o in ops) else None
         for arg in op.args:
+            if decode is not None and arg is decode[0]:
+                continue
             elems = arg.elems
             # Stream prices apply only in HBM, which retains the full extent
             # when the candidate's LX allocation would hold a single tile.

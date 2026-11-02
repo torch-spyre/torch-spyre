@@ -992,6 +992,11 @@ class _SympyExprToCpSat(Printer):
         self._model.AddBoolAnd([lit.Not() for lit in lits]).OnlyEnforceIf(or_var.Not())
         return or_var
 
+    # Not memoized, unlike the condition printers: ``_print`` already caches
+    # each expression once per table mode, and a method-level cache would hand
+    # the untabled retry in ``_print_Mul`` a lowering built from wide tables,
+    # so the retry would overflow again. A condition lowers to a literal either
+    # way, so sharing those across modes adds no product terms.
     def _print_Piecewise(self, expr):
         # Over one buffer's divisions but too wide for an exact table: a
         # linear form over the division literals, not a literal per branch.

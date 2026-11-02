@@ -800,15 +800,20 @@ def _batch_symbols(op, rw, it_space) -> set:
     """Iteration symbols of a batched matmul's batch dims: written, and read by
     both operands. A plain matmul has none (M, N and K each miss one of the
     three), and so does a 3d-2d projection, whose weight has no batch dim."""
-    reads = [dep for dep in rw.reads if _dep_index(dep) is not None]
+    reads = list(rw.reads)
     if len(reads) != 2 or len(rw.writes) != 1:
         return set()
-    write = next(iter(rw.writes))
-    indexed = [set(_dep_index(dep).free_symbols) for dep in reads]
+    indices = [_dep_index(dep) for dep in reads]
+    write_index = _dep_index(next(iter(rw.writes)))
+    # Unknown dependencies cannot prove a batch axis. Do not silently drop
+    # one and classify the remaining reads as a complete pair of operands.
+    if write_index is None or any(index is None for index in indices):
+        return set()
+    indexed = [index.free_symbols for index in indices]
     return {
         symbol
         for symbol, size in it_space.items()
-        if symbol in write.index.free_symbols
+        if symbol in write_index.free_symbols
         and all(symbol in symbols for symbols in indexed)
         and sympy.sympify(size).is_Integer
         and int(size) > 1
@@ -816,14 +821,19 @@ def _batch_symbols(op, rw, it_space) -> set:
 
 
 def _read_run_bytes(op, read, work_slices=None, per_batch=False):
-    """Bytes in one core's contiguous device run of ``read``, else None.
+    runs = _read_runs_bytes(op, read, work_slices, include_batch=per_batch)
+    return runs[1 if per_batch else 0]
+
+
+def _read_runs_bytes(op, read, work_slices=None, *, include_batch=False):
+    """Plain and per-batch contiguous read runs in bytes, or None if unproven.
 
     The burst a core's DMA can issue for this operand: the run ends at the
     innermost split axis or a physical stride gap. Same geometry as
     ``_transport_read_geometry``, for any single read of any op, so the burst
     pricing reaches matmul operands and pointwise inputs too.
 
-    ``per_batch`` measures the run inside one batch element of a batched
+    ``include_batch`` also measures the run inside one batch element of a batched
     matmul (``_batch_symbols``), which the kernel loads one at a time: every
     batch dim counts as split down to one element. A value cache stored
     cache-position-first, ``[S, H, D]``, is one contiguous run across all
@@ -840,20 +850,27 @@ def _read_run_bytes(op, read, work_slices=None, per_batch=False):
         it_space = iteration_space_from_op(op)
         coords = device_coordinates(src, read, None, op=op)
         slices = _work_slices(op, write.index, read.index, it_space, work_slices)
-        if per_batch:
-            batch = _batch_symbols(op, rw, it_space)
-            if not batch:
-                return None
-            slices = {**slices, **{symbol: it_space[symbol] for symbol in batch}}
-        run = _contiguous_device_run(
-            coords, src.device_size, it_space, slices, stick_planes=True
+        itemsize = V.graph.get_buffer(read.name).get_dtype().itemsize
+
+        def run_bytes(split):
+            run = _contiguous_device_run(
+                coords, src.device_size, it_space, split, stick_planes=True
+            )
+            return None if run is None else run * itemsize
+
+        # Both estimates share the read/write trace and device coordinates.
+        # Only the contiguous-run proof differs for one batch element.
+        plain = run_bytes(slices)
+        batch = _batch_symbols(op, rw, it_space) if include_batch else set()
+        per_batch = (
+            run_bytes({**slices, **{symbol: it_space[symbol] for symbol in batch}})
+            if batch
+            else None
         )
-        if run is None:
-            return None
-        return run * V.graph.get_buffer(read.name).get_dtype().itemsize
+        return plain, per_batch
     except Exception:  # noqa: BLE001 - best-effort feature extraction
         logger.debug("read run geometry unavailable", exc_info=True)
-        return None
+        return None, None
 
 
 def _matmul_features(
@@ -1657,6 +1674,9 @@ def extract_op_features(
             and not (isinstance(replication, int) and replication == 1)
         ):
             broadcast = True
+        read_run, batch_run = _read_runs_bytes(
+            op, dep, work_slices, include_batch=is_matmul
+        )
         args.append(
             ArgTraffic(
                 name=name,
@@ -1687,16 +1707,10 @@ def extract_op_features(
                 # Proven per-trip matmul geometry takes precedence. Otherwise
                 # retain the general read-burst extraction from main.
                 read_run_bytes=(
-                    operand_geometry[0]
-                    if operand_geometry[0] is not None
-                    else _read_run_bytes(op, dep, work_slices)
+                    operand_geometry[0] if operand_geometry[0] is not None else read_run
                 ),
                 read_tile_elems=operand_geometry[1],
-                batch_run_bytes=(
-                    _read_run_bytes(op, dep, work_slices, per_batch=True)
-                    if is_matmul
-                    else None
-                ),
+                batch_run_bytes=batch_run,
             )
         )
 

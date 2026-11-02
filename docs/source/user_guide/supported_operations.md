@@ -108,7 +108,7 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 | `torch.flatten` | | Y | Spyre | Compiled only (lowers via `reshape`) |
 | `torch.cat` | Y | Y | Spyre | |
 | `torch.stack` | Y | Y | Spyre | Registered on the compiled path (`ops/eager.py` `COMPILED_OPS`); the eager kernel dispatches through `torch.compile` |
-| `torch.repeat` | | Y | Spyre | Compiled only. `repeat.out` is available as a CPU fallback |
+| `torch.repeat` | Y | Y | Spyre | Registered on the compiled path (`ops/eager.py` `COMPILED_OPS`); the eager kernel dispatches through `torch.compile` |
 | `torch.unbind` | Y | Y | Spyre | |
 | `torch.Tensor.unfold` | Y | Y | Spyre | View op |
 | `torch.flip` | Y | Y | Spyre | Custom decomposition to `index_select` gathers; reversing the last (stick) dimension is unsupported and raises |

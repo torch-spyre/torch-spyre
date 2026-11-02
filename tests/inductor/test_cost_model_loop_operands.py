@@ -859,7 +859,7 @@ def test_stick_plane_geometry_measures_the_source_burst():
     assert dcm._contiguous_device_run(coords, dims, space, {}) is None
 
 
-def test_a_batched_operand_runs_one_batch_element_at_a_time():
+def test_a_batched_operand_runs_one_batch_element_at_a_time(monkeypatch):
     """A cache-position-first value cache [S, H, D] is one contiguous run over
     every head, but a batched matmul loads one head's [S, D] block at a time:
     rows of D elements."""
@@ -891,6 +891,42 @@ def test_a_batched_operand_runs_one_batch_element_at_a_time():
     # A plain matmul, or a 3d-2d projection whose weight has no batch dim.
     mm = SimpleNamespace(reads=[dep(m * 512 + s), dep(s * 128 + d)], writes=[write])
     assert dcm._batch_symbols(op, mm, space) == set()
+
+    # Unknown reads (e.g. StarDep) must not leave a partial operand pair
+    # that proves a batch dimension. Exercise both two and three reads.
+    from torch._inductor.dependencies import StarDep
+    from torch._inductor.virtualized import V
+    from unittest.mock import Mock
+
+    unknown = StarDep("unknown")
+    for reads in ([p_read, unknown], [p_read, v_read, unknown]):
+        assert (
+            dcm._batch_symbols(op, SimpleNamespace(reads=reads, writes=[write]), space)
+            == set()
+        )
+
+    # The extraction shares the expensive trace/coordinate work and preserves
+    # the independently calculated full-cache and per-head run lengths above.
+    v_read.name = "values"
+    layout = SimpleNamespace(device_size=dims)
+    buffer = SimpleNamespace(
+        get_layout=lambda: SimpleNamespace(device_layout=layout),
+        get_dtype=lambda: torch.float16,
+    )
+    op.get_read_writes = Mock(return_value=bmm)
+    coordinates = Mock(return_value=coords)
+    monkeypatch.setattr(dcm, "iteration_space_from_op", lambda _: space)
+    monkeypatch.setattr(dcm, "_work_slices", lambda *args: {})
+    monkeypatch.setattr(
+        "torch_spyre._inductor.pass_utils.device_coordinates", coordinates
+    )
+    with V.set_graph_handler(SimpleNamespace(get_buffer=lambda _: buffer)):
+        assert dcm._read_runs_bytes(op, v_read, include_batch=True) == (
+            2 * 512 * 8 * 128,
+            2 * 128,
+        )
+    op.get_read_writes.assert_called_once_with()
+    coordinates.assert_called_once()
 
 
 # ---------------------------------------------------- batched matmul splits
