@@ -1539,6 +1539,93 @@ class SetDtypeTracer(DefaultHandler):
         return self._default("exp", args=(x0,), kwargs={})
 
 
+@dataclasses.dataclass(frozen=True)
+class ArgName:
+    name: str
+
+
+class ArgNameToIndexTracer(DefaultHandler):
+    """Helper to map argument names to operand indices
+
+    For an operation like x * y, op.read_wites().reads will contain
+    2 dependencies which means that we should be able to match the argument
+    index to the argument name. But for example, x * x has only one read
+    dependency. This tracer is meant to build this mapping.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.name2inx = dict[str, list[int]]()
+
+    def get_inx2arg(self) -> list[str]:
+        for name, indices in self.name2inx.items():
+            assert len(indices) > 0, f"Could not resolve index of arg {name}"
+
+        index_entries = [
+            (index, name)
+            for name, indices in self.name2inx.items()
+            for index in indices
+        ]
+        index_entries.sort(key=lambda pair: pair[0])
+
+        inx2arg = []
+
+        for i, (index, name) in enumerate(index_entries):
+            if i > 1:
+                assert index_entries[i - 1][0] in [index, index - 1], "Skipped argument"
+            inx2arg.append(name)
+
+        return inx2arg
+
+    def _default(self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]):
+        for argname, arg in kwargs.items():
+            assert not isinstance(arg, ArgName), (
+                f"Can't determine order of kwargs. Found kwarg {argname}"
+            )
+
+        counter = 0
+        for arg in args:
+            if isinstance(arg, ArgName):
+                self.name2inx.setdefault(arg.name, [])
+                self.name2inx[arg.name].append(counter)
+                counter = counter + 1
+
+    def load(self, name: str, index: sympy.Expr) -> ArgName:
+        return ArgName(name)
+
+    def store(
+        self,
+        name: str,
+        index: sympy.Expr,
+        value: Set,
+        mode=None,
+    ) -> None:
+        pass
+
+    def reduction(
+        self,
+        dtype: torch.dtype,
+        src_dtype: torch.dtype,
+        reduction_type,
+        value: Set | tuple[Set, Set],
+    ) -> None:
+        if reduction_type != "batchmatmul":
+            assert isinstance(value, ArgName)
+            self.name2inx[value.name] = [0]
+        else:
+            assert isinstance(value, tuple) and len(value) == 2
+            assert isinstance(value[0], ArgName) and isinstance(value[1], ArgName)
+
+            self.name2inx[value[0].name] = [0]
+            self.name2inx[value[1].name] = [1]
+
+    def store_reduction(self, name: str, index: sympy.Expr, value: Set) -> None:
+        pass
+
+    def constant(self, value: Union[bool, float, int], dtype: torch.dtype):
+        pass
+
+
 # TODO, refactor the lines below when 5409 is merged
 
 _FP16_MAX = 65504.0
@@ -1644,11 +1731,33 @@ def _index_syms(n: int) -> tuple[sympy.Symbol, ...]:
     return tuple(sympy.Symbol(f"_i{k}") for k in range(n))
 
 
-def is_padded(node: IRNode | Layout | SpyreTensorLayout):
+def _call_innner(op):
+    ranges = op.data.ranges
+    syms = _index_syms(len(ranges))
+    store_fn = op.get_store_function()
+    if isinstance(op.data, Reduction):
+        r_ranges = op.data.reduction_ranges
+        r_syms = tuple(sympy.Symbol(f"_r{k}") for k in range(len(r_ranges)))
+        store_fn(syms, r_syms)
+    else:
+        store_fn(syms)
+
+
+def is_padded(graph: GraphLowering, node: IRNode | Layout | SpyreTensorLayout):
+    if isinstance(node, ComputedBuffer) and isinstance(
+        node.layout, MutationLayoutSHOULDREMOVE
+    ):
+        target = node.layout.target
+        while isinstance(target, ReinterpretView):
+            target = target.data
+        target_name = target.get_name()
+        node = graph.get_buffer(target_name)
     if isinstance(node, IRNode):
         node = node.get_layout()
     if isinstance(node, Layout):
-        assert isinstance(node, FixedTiledLayout), "Expected finalized tiled layout"
+        assert isinstance(node, FixedTiledLayout), (
+            f"Expected finalized tiled layout, got {node}"
+        )
         node = node.device_layout
 
     total_valid_elems = math.prod(node.valid_elements.values())
@@ -1677,12 +1786,12 @@ def track_padding_value(graph: GraphLowering) -> None:
     tracer = DomainRangeTracer()
     with V.set_ops_handler(SetDtypeTracer(tracer)):
         for op in list(operations):
-            padded = is_padded(op)
             tracer.current_op = op
-            reads = op.get_read_writes().reads
+            padded = is_padded(graph, op)
 
-            input_buffers = list[tuple[str, Buffer]]()
-            input_padding = list[bool]()
+            reads = op.get_read_writes().reads
+            input_buffers = dict[str, Buffer]()
+            any_input_padded = False
             for dep in reads:
                 buf = graph.get_buffer(dep.name)
                 while isinstance(buf, MutableBox):
@@ -1701,9 +1810,8 @@ def track_padding_value(graph: GraphLowering) -> None:
                             f"Mutation target {dep.name} seen before mutation buffer {mut}"
                         )
 
-                input_buffers.append((dep.name, buf))
-                input_padding.append(is_padded(buf))
-            any_input_padded = any(p for p in input_padding)
+                input_buffers[dep.name] = buf
+                any_input_padded = any_input_padded or is_padded(graph, buf)
 
             if isinstance(op, InputsKernel):
                 if not padded:
@@ -1733,44 +1841,37 @@ def track_padding_value(graph: GraphLowering) -> None:
                 else:
                     raise ValueError(f"Unhandled kind of node {op}")
 
-            op.annotations["do_coord_mask"] = False
-            op.annotations["do_pad"] = False
+            arg_pos_tracer = ArgNameToIndexTracer()
+            with V.set_ops_handler(arg_pos_tracer):
+                _call_innner(op)
+            index2arg = arg_pos_tracer.get_inx2arg()
 
-            # Even if the output of this op is not padded, we need to run
-            # the input validation if there are padded inputs
-            if not padded and not any_input_padded:
-                tracer.buffer_range[op.name] = EmptySet
-                continue
-
+            do_coord_mask = False
+            do_pad = False
             # Loop until we can either allow the inputs to pass unmodified or
             # find a suitable padding. So the max iteration count is 1 for the
             # first try and 1 retry for each argument
             for i in range(100):
-                ranges = op.data.ranges
-                syms = _index_syms(len(ranges))
+                # Even if the output of this op is not padded, we need to run
+                # the input validation if there are padded inputs
+                if not padded and not any_input_padded:
+                    break
                 try:
-                    store_fn = op.get_store_function()
-                    if isinstance(op.data, Reduction):
-                        r_ranges = op.data.reduction_ranges
-                        r_syms = tuple(
-                            sympy.Symbol(f"_r{k}") for k in range(len(r_ranges))
-                        )
-                        store_fn(syms, r_syms)
-                    else:
-                        store_fn(syms)
+                    _call_innner(op)
                     break
                 except InvalidDomain as inv_domain:
-                    name, buf = input_buffers[inv_domain.arg_index]
+                    name = index2arg[inv_domain.arg_index]
+                    buf = input_buffers[name]
 
                     if can_coord_mask(inv_domain.func, buf.layout.dtype):
-                        op.annotations["do_coord_mask"] = True
+                        do_coord_mask = True
                         # For now this is true for all operations that are padded
                         if op.layout.dtype == torch.float16:
                             tracer.buffer_range[op.name] = FiniteSet(0)
                         else:
                             tracer.buffer_range[op.name] = Interval(0, 1e-2)
                     else:
-                        op.annotations["do_pad"] = True
+                        do_pad = True
 
                     pad_value = get_pad_value(inv_domain.func, buf.layout.dtype)
                     if pad_value is None or not inv_domain.domain.contains(pad_value):
@@ -1789,18 +1890,16 @@ def track_padding_value(graph: GraphLowering) -> None:
             if not padded:
                 tracer.buffer_range[op.name] = EmptySet
 
-            if op.annotations.get("do_coord_mask", False) or op.annotations.get(
-                "do_pad", False
-            ):
+            if do_coord_mask or do_pad:
                 pad_set = tracer.buffer_range[op.name]
-                if not padded:
+                if padded:
                     # set the propagated output padding
-                    op.annotations["pad_value"] = float(pick_element(pad_set))
+                    op.layout.device_layout.padding_value = float(pick_element(pad_set))
 
                 input_pad_values = dict[str, float]()
                 for arg_name, pad_set in tracer.buffer_input[op.name].items():
                     input_pad_values[arg_name] = float(pick_element(pad_set))
-                op.annotations["pad_values"] = input_pad_values
+                op.input_pad_values = input_pad_values
 
             if isinstance(op, ComputedBuffer) and isinstance(
                 op.layout, MutationLayoutSHOULDREMOVE
@@ -1814,7 +1913,7 @@ def track_padding_value(graph: GraphLowering) -> None:
                         f"Mutation buffer {op} seen before the buffer it mutates {target_name}"
                     )
 
-                    if not is_padded(target):
+                    if not is_padded(graph, target):
                         tracer.buffer_range[target_name] = EmptySet
                         resolved_mutations[target_name][op.name] = True
                         continue
