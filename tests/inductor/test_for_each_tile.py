@@ -109,7 +109,7 @@ from unittest import mock
 import torch
 from torch._inductor.utils import run_and_get_code
 
-from torch_spyre._inductor.wsr import Gather, for_each_tile
+from torch_spyre._inductor.wsr import Gather, Slice, for_each_tile
 from torch_spyre._monkey_patch import _patch_scan_input_aliasing
 
 DUMP_DIR = os.environ.get("SPYRE_FOR_EACH_TILE_DUMP")
@@ -608,6 +608,46 @@ class TestForEachTileLowering(unittest.TestCase):
         self._assert_lowers(
             fn, args, ref, name="A_split_m", loops=1, materializations=1
         )
+
+    def test_slice_extent_differs_from_tile_size(self):
+        """Slice(dim, extent): a per-operand tile width decoupled from tile_size.
+
+        x/w are tiled at tile_size=2 along K; sw needs one row per K-step instead --
+        narrower than tile_size, which a plain `int` dims entry can't express since
+        tile_size is shared by every such entry in the same call. `Slice(0, extent=1)`
+        gives sw its own extent, avoiding the bare per-trip-row `Gather(axis, index)`
+        this case would otherwise need -- and that Gather can never compile for more
+        than one trip on Spyre (torch-spyre#5763): its per-trip index read is exactly
+        one element, never a multiple of the physical stick size (see
+        SpyreKernel._check_indirect_index_step and docs/source/compiler/
+        working_set_reduction.md's counted-loop index-table note). No
+        materialization: sw's one-row tile is a plain `narrow`, same as X/Y's.
+        """
+        M, K, N, T = 4, 8, 6, 2
+        x = torch.randn(M, K)
+        w = torch.randn(K, N)
+        sw = torch.rand(K // T, N)
+
+        def fn(x, w, sw):
+            def body(acc, tiles):
+                x_t, w_t, s = tiles
+                return acc + torch.matmul(x_t, w_t) * s, None
+
+            acc, _ = for_each_tile(
+                body,
+                (x, w, sw),
+                dims=(1, 0, Slice(0, extent=1)),
+                tile_size=T,
+                init=torch.zeros(M, N),
+            )
+            return acc
+
+        ref = torch.zeros(M, N)
+        for i in range(K // T):
+            x_t, w_t = x[:, i * T : (i + 1) * T], w[i * T : (i + 1) * T, :]
+            ref = ref + torch.matmul(x_t, w_t) * sw[i : i + 1]
+
+        self._assert_lowers(fn, (x, w, sw), ref, name="Slice_scale_table", loops=1)
 
     def test_split_n(self):
         """B: tile N as a map -- case A with the output axis moved, X invariant.
@@ -1934,6 +1974,82 @@ class TestTraceUnderMakeFx(unittest.TestCase):
             self._trace(fn, torch.ones(0, 4))
         with self.assertRaisesRegex(TypeError, "reverse must be a bool"):
             self._trace(lambda x: fn(x, reverse=1), torch.ones(3, 4))
+
+
+class TestSliceTileSpecValidation(unittest.TestCase):
+    """Slice(dim, extent)'s own validation in _normalize_in_specs (#5763).
+
+    Eager, no torch.compile: _normalize_in_specs raises before for_each_tile ever
+    reaches scan, so these are plain Python checks, not compiled-path failures.
+    """
+
+    def setUp(self):
+        torch._dynamo.reset()
+
+    def test_extent_must_be_a_positive_int(self):
+        x = torch.randn(4, 8)
+        for bad_extent in (0, -1, 1.5, True):
+            with self.subTest(extent=bad_extent):
+                with self.assertRaisesRegex(
+                    ValueError, "Slice extent.*must be a positive int"
+                ):
+                    for_each_tile(
+                        lambda c, t: (c + t[0], None),
+                        (x,),
+                        dims=(Slice(0, extent=bad_extent),),
+                        tile_size=1,
+                        init=torch.zeros(1, 8),
+                    )
+
+    def test_rejects_ragged_tiles(self):
+        x = torch.randn(5, 8)  # 5 is not a multiple of extent=2
+        with self.assertRaisesRegex(ValueError, "not a multiple of Slice extent=2"):
+            for_each_tile(
+                lambda c, t: (c + t[0], None),
+                (x,),
+                dims=(Slice(0, extent=2),),
+                tile_size=1,
+                init=torch.zeros(2, 8),
+            )
+
+    def test_num_tiles_must_match_other_operands(self):
+        x = torch.randn(4, 8)  # tile_size=1 on a plain int dims entry -> 4 trips
+        y = torch.randn(6, 8)  # Slice(extent=3) -> 2 trips, mismatched
+        with self.assertRaisesRegex(
+            ValueError, "operands must yield the same number of tiles"
+        ):
+            for_each_tile(
+                lambda c, t: (c, None),
+                (x, y),
+                dims=(0, Slice(0, extent=3)),
+                tile_size=1,
+                init=torch.zeros(1, 8),
+            )
+
+    def test_extent_differing_from_tile_size_runs_in_eager(self):
+        """The validated case actually runs end to end outside Dynamo too."""
+        M, K, N, T = 4, 8, 6, 2
+        x = torch.randn(M, K)
+        w = torch.randn(K, N)
+        sw = torch.rand(K // T, N)
+
+        def body(acc, tiles):
+            x_t, w_t, s = tiles
+            return acc + torch.matmul(x_t, w_t) * s, None
+
+        acc, _ = for_each_tile(
+            body,
+            (x, w, sw),
+            dims=(1, 0, Slice(0, extent=1)),
+            tile_size=T,
+            init=torch.zeros(M, N),
+        )
+
+        ref = torch.zeros(M, N)
+        for i in range(K // T):
+            x_t, w_t = x[:, i * T : (i + 1) * T], w[i * T : (i + 1) * T, :]
+            ref = ref + torch.matmul(x_t, w_t) * sw[i : i + 1]
+        torch.testing.assert_close(acc, ref)
 
 
 if __name__ == "__main__":

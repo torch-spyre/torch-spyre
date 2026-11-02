@@ -990,7 +990,16 @@ class SpyreKernel(Kernel[CSEVariable]):
                 continue
             if int(step) % elems_per_stick != 0:
                 raise UnalignedStickSplit(
-                    idx_arg.arg_index, sym, int(step), elems_per_stick
+                    idx_arg.arg_index,
+                    sym,
+                    int(step),
+                    elems_per_stick,
+                    hint=(
+                        "A bare index is read one element per trip, which can't be "
+                        "stick-aligned. Build a [trips, stick_size] stick-wide table "
+                        "instead, real index in column 0, and select from it inside "
+                        "body."
+                    ),
                 )
 
     def create_op_spec(

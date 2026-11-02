@@ -46,7 +46,7 @@ from torch.utils._pytree import (
 
 from ..errors import Unsupported
 
-__all__ = ["Gather", "for_each_tile"]
+__all__ = ["Gather", "Slice", "for_each_tile"]
 
 
 @dataclass(frozen=True)
@@ -59,6 +59,23 @@ class Gather:
 
     axis: int
     index: torch.Tensor
+
+
+@dataclass(frozen=True)
+class Slice:
+    """Tile spec for a SLICED operand with its own extent, decoupled from `tile_size`.
+
+    A plain `int` `dims` entry narrows the operand into `tile_size`-wide contiguous
+    views, `tile_size` shared by every such entry in the same `for_each_tile()` call.
+    `Slice(dim, extent)` is the same narrowing, but with its own `extent` -- for an
+    operand that needs a different per-trip width than the rest, e.g. one row of a
+    per-step scale/lookup table alongside operands tiled at a much larger `tile_size`.
+    Trip count is still `shape[dim] // extent`, and must still agree with every other
+    tiled operand's trip count.
+    """
+
+    dim: int
+    extent: int
 
 
 class Kind(enum.Enum):
@@ -100,7 +117,7 @@ class TileSpec:
         return self.tile_size[self.dim] if self.tile_size else 1
 
 
-DimSpec = Union[int, None, Gather]  # noqa: UP007  # `int | None | Gather` needs Gather at runtime
+DimSpec = Union[int, None, Gather, Slice]  # noqa: UP007  # needs runtime presence
 
 
 def _check_combine_graph(gm: torch.fx.GraphModule, name: str) -> None:
@@ -357,10 +374,35 @@ def _normalize_in_specs(operands, dims, tile_size: int) -> tuple[list[TileSpec],
                 _tile_size_vector(o.shape, axis, tile_size),
                 length // tile_size,
             )
+        elif isinstance(d, Slice):
+            bad_extent = (
+                not isinstance(d.extent, int)
+                or isinstance(d.extent, bool)
+                or d.extent <= 0
+            )
+            if bad_extent:
+                raise ValueError(
+                    f"for_each_tile() Slice extent for operand {k} must be a "
+                    f"positive int, got {d.extent!r}"
+                )
+            axis = utils.canonicalize_dim(o.ndim, d.dim)
+            length = o.shape[axis]
+            if length % d.extent != 0:
+                raise ValueError(
+                    f"for_each_tile() operand {k} has size {length} along dim "
+                    f"{d.dim}, which is not a multiple of Slice extent={d.extent} "
+                    f"(ragged tiles are not supported)"
+                )
+            spec = TileSpec(
+                Kind.SLICE,
+                axis,
+                _tile_size_vector(o.shape, axis, d.extent),
+                length // d.extent,
+            )
         else:
             raise ValueError(
-                f"for_each_tile() dims entry {k} must be an int, None or Gather, "
-                f"got {d!r}"
+                f"for_each_tile() dims entry {k} must be an int, None, Gather or "
+                f"Slice, got {d!r}"
             )
 
         if num_tiles is None:
@@ -463,11 +505,16 @@ def for_each_tile(
         operands: flat sequence of every input -- sliced, gathered and invariant.
         dims: per-operand tile spec as a tuple, or a single spec broadcast to all of
             them. ``int d`` slices the operand into ``tile_size``-wide contiguous views
-            along ``d``; ``None`` passes it whole every step; ``Gather(axis, index)``
-            takes one pool row per step.
-        tile_size: the tile's size along each tiled axis. The loop's trip count is
-            derived: ``shape[dim] // tile_size`` per sliced operand, ``len(index)`` per
-            gathered one. All of them must agree.
+            along ``d``, ``tile_size`` shared by every such entry; ``None`` passes it
+            whole every step; ``Gather(axis, index)`` takes one pool row per step;
+            ``Slice(dim, extent)`` is the same contiguous slicing as ``int d``, but
+            with its own ``extent`` instead of sharing ``tile_size`` -- for an operand
+            that needs a different per-trip width than the rest, e.g. one row of a
+            per-step scale/lookup table alongside operands tiled much wider.
+        tile_size: the tile's size along each tiled axis for every plain ``int d`` dims
+            entry. The loop's trip count is derived: ``shape[dim] // tile_size`` per
+            such sliced operand, ``shape[dim] // extent`` per ``Slice``, ``len(index)``
+            per gathered one. All of them must agree.
         init: carry init (tensor or pytree of tensors); ``None`` means no carry.
         out_dim: ``int d`` lays step ``i``'s tile at ``narrow(d, i*extent, extent)``
             of each returned output leaf. Output tiles may be a tensor or a
