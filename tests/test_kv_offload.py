@@ -128,6 +128,12 @@ class TestSpyre(TestCase):
         """One page of 1024 tokens, 2 MiB, to cover a multi MB transfer."""
         self._kv_page_round_trip((NUM_BLOCKS, 1024, NUM_KV_HEADS, HEAD_DIM))
 
+    def test_head_major_page(self):
+        """Head major cache, logical [pages, heads, slots, head_size]. Either
+        ordering of the two middle dims is accepted.
+        """
+        self._kv_page_round_trip((NUM_BLOCKS, NUM_KV_HEADS, 16, HEAD_DIM))
+
     def test_first_and_last_page(self):
         """Offset 0 and the final page, the two ends of the range arithmetic."""
         shape = (NUM_BLOCKS, 16, NUM_KV_HEADS, HEAD_DIM)
