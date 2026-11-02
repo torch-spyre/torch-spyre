@@ -71,3 +71,10 @@ def test_check_ci_groups_rejects_singleton_but_not_same_name_elsewhere():
     # Same name in two directories is two singletons, not one group.
     both = {Path("d1/a.yaml"): ("g", {}), Path("d2/b.yaml"): ("g", {})}
     assert check_ci_groups(both) == 2
+
+
+def test_check_ci_groups_ignores_global_key_order():
+    d = Path("d")
+    a = {"alpha": 1, "supported_dtypes": [{"name": "float16"}]}
+    b = {"supported_dtypes": [{"name": "float16"}], "alpha": 1}
+    assert check_ci_groups({d / "a.yaml": ("g", a), d / "b.yaml": ("g", b)}) == 0

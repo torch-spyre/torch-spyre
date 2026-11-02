@@ -78,52 +78,6 @@ def check_missing_labels(labels_by_file: dict[Path, list | None]) -> int:
 # Values platform.machine() is known to return across this project's CI/Jenkins
 # fleet. Keep in sync with the exclude__plat_* tag convention in
 # oot_test_base_common.py's OOTTestBase._should_run().
-def check_ci_groups(groups_by_file: dict[Path, tuple[str, dict]]) -> int:
-    """
-    Verify ci_group declarations can be folded into one CI job.
-
-    A group is the set of configs in one directory sharing a ci_group name.
-    Two things make a group wrong:
-      * members with different `global:` blocks -- run_test.sh unions global list
-        keys across merged configs, which would widen each member's coverage;
-      * a group of one -- it saves nothing and is almost certainly a typo'd name.
-    Runner/flag mismatches are caught by filter_configs.py when the matrix is
-    built, which every CI run does.
-
-    Returns
-    -------
-    int
-        Number of problems found.
-    """
-    members: dict[tuple[Path, str], list[Path]] = {}
-    for path, (group, _) in groups_by_file.items():
-        members.setdefault((path.parent, group), []).append(path)
-
-    problems: list[str] = []
-    for (parent, group), paths in sorted(members.items(), key=str):
-        blocks = {repr(groups_by_file[p][1]) for p in paths}
-        if len(blocks) > 1:
-            problems.append(
-                f"ci_group {group!r} in {parent}: members declare different "
-                "'global:' blocks (merging would widen coverage): "
-                + ", ".join(sorted(p.name for p in paths))
-            )
-    for (parent, group), paths in sorted(members.items(), key=str):
-        if len(paths) == 1:
-            problems.append(
-                f"{paths[0]}: ci_group {group!r} has no other member in {parent}"
-            )
-
-    if not problems:
-        print(green(f"  [ci_group] {len(members)} group(s) OK.\n"))
-        return 0
-    print(red(f"  [ci_group] {len(problems)} problem(s):\n"))
-    for msg in problems:
-        print(f"    {red('INVALID')}  {msg}")
-    print()
-    return len(problems)
-
-
 KNOWN_PLATFORMS = {"x86_64", "ppc64le", "s390x"}
 
 
@@ -170,6 +124,64 @@ def check_invalid_platforms(excluded_by_file: dict[Path, list]) -> int:
         print(f"          known values: {sorted(KNOWN_PLATFORMS)}")
     print()
     return len(bad)
+
+
+# ----------------------
+# CHECK 0c: CI groups
+# ----------------------
+
+
+def check_ci_groups(groups_by_file: dict[Path, tuple[str, dict]]) -> int:
+    """
+    Verify ci_group declarations can be folded into one CI job.
+
+    A group is the set of configs in one directory sharing a ci_group name.
+    Two things make a group wrong:
+      * members with different `global:` blocks -- run_test.sh unions global list
+        keys across merged configs, which would widen each member's coverage;
+      * a group of one -- it saves nothing and is almost certainly a typo'd name.
+
+    Runner and flag mismatches are not checked here: they depend on the CI
+    runner/flags maps, and filter_configs.py rejects them when it builds the
+    matrix. That scan covers tests/configs/torch_spyre_tests on PR runs and the
+    whole of tests/configs on trunk, so a mismatch in another directory is only
+    caught there. Point this checker at that directory (--config-dir) to get the
+    `global:` check for it on a PR.
+
+    Returns
+    -------
+    int
+        Number of problems found.
+    """
+    members: dict[tuple[Path, str], list[Path]] = {}
+    for path, (group, _) in groups_by_file.items():
+        members.setdefault((path.parent, group), []).append(path)
+
+    problems: list[str] = []
+    for (parent, group), paths in sorted(members.items(), key=str):
+        # Pairwise against the first member, with ==, which ignores key order --
+        # the same comparison filter_configs.py makes, so the two cannot disagree.
+        first = groups_by_file[paths[0]][1]
+        if any(groups_by_file[p][1] != first for p in paths[1:]):
+            problems.append(
+                f"ci_group {group!r} in {parent}: members declare different "
+                "'global:' blocks (merging would widen coverage): "
+                + ", ".join(sorted(p.name for p in paths))
+            )
+    for (parent, group), paths in sorted(members.items(), key=str):
+        if len(paths) == 1:
+            problems.append(
+                f"{paths[0]}: ci_group {group!r} has no other member in {parent}"
+            )
+
+    if not problems:
+        print(green(f"  [ci_group] {len(members)} group(s) OK.\n"))
+        return 0
+    print(red(f"  [ci_group] {len(problems)} problem(s):\n"))
+    for msg in problems:
+        print(f"    {red('INVALID')}  {msg}")
+    print()
+    return len(problems)
 
 
 # -----------------------

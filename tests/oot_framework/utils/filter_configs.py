@@ -168,7 +168,7 @@ def _fold_groups(results: list) -> list:
         if not r["group"]:
             out.append(r)
             continue
-        key = (str(Path(r["config"]).parent), r["group"])
+        key = (tuple(_group_dir_parts(r["config"])), r["group"])
         if key not in groups:
             first = dict(r, members=[r["config"]])
             groups[key] = first
@@ -192,16 +192,33 @@ def _fold_groups(results: list) -> list:
         g["members"].append(r["config"])
     for g in out:
         if g["group"]:
-            # Directory-qualified so groups in different directories cannot collide.
-            parent = Path(g["config"]).parent
-            g["name"] = _title_words(parent.name) + " / " if parent.name else ""
-            g["name"] += _title_words(g["group"]) + f" ({len(g['members'])} suites)"
-            # "group_" keeps a report from colliding with a config stem, and the
-            # directory with a same-named group elsewhere.
-            g["report"] = "_".join(["group", parent.name, g["group"]]).replace(
-                "__", "_"
+            parts = _group_dir_parts(g["config"])
+            # The name carries no member count: adding a suite to a group must not
+            # rename its job (hw_diagnostics.suite_name is parsed from it).
+            g["name"] = " / ".join(
+                [_title_words(x) for x in (parts[-1:] or [])]
+                + [_title_words(g["group"])]
             )
+            # "group_" keeps a report from colliding with a config stem. The whole
+            # directory path is used, not just its last component, so a/inductor
+            # and b/inductor cannot collide, and only non-empty parts are joined so
+            # a group name containing "__" is left alone.
+            g["report"] = "_".join(["group", *parts, g["group"]])
     return out
+
+
+# Directory components of the tree the config tiers share. A trunk scan roots at
+# tests/configs and a PR scan at tests/configs/torch_spyre_tests, so the same
+# config is "torch_spyre_tests/x.yaml" on one and "x.yaml" on the other.
+_SHARED_TREE = "torch_spyre_tests"
+
+
+def _group_dir_parts(config: str) -> list:
+    """Directory parts of a config path, independent of which tree was scanned."""
+    parts = list(Path(config).parent.parts)
+    if parts and parts[0] == _SHARED_TREE:
+        parts = parts[1:]
+    return parts
 
 
 def _title_words(s: str) -> str:

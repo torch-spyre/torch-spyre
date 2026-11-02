@@ -74,7 +74,7 @@ def test_group_folds_into_one_entry(tmp_path):
         "d/test_a_config.yaml d/test_b_config.yaml d/test_c_config.yaml"
     )
     assert g["report"] == "group_d_logging"
-    assert "3 suites" in g["name"]
+    assert g["name"] == "D / Logging"
 
 
 def test_group_is_scoped_to_directory(tmp_path):
@@ -151,21 +151,105 @@ def test_multi_card_matrix_matches_distributed_ci_groups():
 
     That job lists its suites in _test_matrix.yaml rather than generating them, so a
     new distributed config, or a changed ci_group, would otherwise silently run
-    ungrouped or not at all.
+    ungrouped or not at all. make check-all-configs and the PR matrix scan only look
+    at tests/configs/torch_spyre_tests, so this is also the only PR-time check that
+    the members of a distributed group declare identical `global:` blocks (a
+    mismatch would otherwise first fail on trunk, when filter_configs.py scans
+    tests/configs).
     """
     import yaml
 
     repo = Path(__file__).resolve().parents[2]
     wf = yaml.safe_load((repo / ".github/workflows/_test_matrix.yaml").read_text())
     listed = wf["jobs"]["test_multi_spyre"]["strategy"]["matrix"]["suite"]
+    # `config` repeats the first member of `configs`; keep the two from drifting.
+    for entry in listed:
+        assert entry["config"] == entry["configs"].split()[0], entry["name"]
     in_workflow = sorted(sorted(s["configs"].split()) for s in listed)
 
     groups: dict = {}
     for f in sorted((repo / "tests/configs/distributed_tests").glob("*.yaml")):
         tsc = yaml.safe_load(f.read_text())["test_suite_config"]
         key = tsc.get("ci_group") or f.stem
-        groups.setdefault(key, []).append(f"distributed_tests/{f.name}")
-    assert in_workflow == sorted(sorted(v) for v in groups.values())
+        groups.setdefault(key, []).append(
+            (f"distributed_tests/{f.name}", tsc.get("global") or {})
+        )
+    assert in_workflow == sorted(sorted(m for m, _ in v) for v in groups.values())
+    for name, members in groups.items():
+        first = members[0][1]
+        for member, glob in members[1:]:
+            assert glob == first, (
+                f"ci_group {name!r}: {member} has a different global: block"
+            )
+
+
+def test_distributed_scan_rejects_differing_globals(tmp_path):
+    """The trunk scan roots at tests/configs, so it must reject a bad distributed group."""
+    _write(
+        tmp_path, "distributed_tests/test_a.yaml", "regression", "g", extra=GLOBAL_F16
+    )
+    _write(
+        tmp_path, "distributed_tests/test_b.yaml", "regression", "g", extra=GLOBAL_F32
+    )
+    r = _run(tmp_path, "--test-type", "regression")
+    assert r.returncode != 0
+    assert "different 'global:' blocks" in r.stderr
+
+
+def test_report_name_does_not_depend_on_scan_root(tmp_path):
+    """Trunk scans tests/configs, PR scans tests/configs/torch_spyre_tests."""
+    _write(tmp_path, "torch_spyre_tests/test_a_config.yaml", "regression", "rt")
+    _write(tmp_path, "torch_spyre_tests/test_b_config.yaml", "regression", "rt")
+    _write(
+        tmp_path, "torch_spyre_tests/inductor/test_c_config.yaml", "regression", "rt"
+    )
+    _write(
+        tmp_path, "torch_spyre_tests/inductor/test_d_config.yaml", "regression", "rt"
+    )
+    trunk = {s["report"] for s in _suites(tmp_path, "--test-type", "regression")}
+    pr = {
+        s["report"]
+        for s in _suites(tmp_path / "torch_spyre_tests", "--test-type", "regression")
+    }
+    assert trunk == pr == {"group_rt", "group_inductor_rt"}
+
+
+def test_report_name_keeps_the_whole_directory_path(tmp_path):
+    """a/inductor and b/inductor with one group name must not share a report."""
+    for top in ("a", "b"):
+        _write(tmp_path, f"{top}/inductor/test_x_config.yaml", "regression", "g")
+        _write(tmp_path, f"{top}/inductor/test_y_config.yaml", "regression", "g")
+    reports = sorted(
+        s["report"] for s in _suites(tmp_path, "--test-type", "regression")
+    )
+    assert reports == ["group_a_inductor_g", "group_b_inductor_g"]
+
+
+def test_group_name_with_double_underscore_is_left_alone(tmp_path):
+    _write(tmp_path, "d/test_x_config.yaml", "regression", "my__group")
+    _write(tmp_path, "d/test_y_config.yaml", "regression", "my__group")
+    (s,) = _suites(tmp_path, "--test-type", "regression")
+    assert s["report"] == "group_d_my__group"
+
+
+def test_job_name_does_not_carry_a_member_count(tmp_path):
+    """Adding a member must not rename the job (hw_diagnostics.suite_name)."""
+    _write(tmp_path, "d/test_x_config.yaml", "regression", "g")
+    _write(tmp_path, "d/test_y_config.yaml", "regression", "g")
+    (two,) = _suites(tmp_path, "--test-type", "regression")
+    _write(tmp_path, "d/test_z_config.yaml", "regression", "g")
+    (three,) = _suites(tmp_path, "--test-type", "regression")
+    assert two["name"] == three["name"]
+    assert "suites" not in two["name"]
+
+
+def test_global_key_order_does_not_matter(tmp_path):
+    a = "  global:\n    alpha: 1\n    supported_dtypes:\n      - name: float16\n"
+    b = "  global:\n    supported_dtypes:\n      - name: float16\n    alpha: 1\n"
+    _write(tmp_path, "d/test_x_config.yaml", "regression", "g", extra=a)
+    _write(tmp_path, "d/test_y_config.yaml", "regression", "g", extra=b)
+    (s,) = _suites(tmp_path, "--test-type", "regression")
+    assert s["configs"].count(" ") == 1
 
 
 if __name__ == "__main__":

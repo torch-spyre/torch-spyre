@@ -3257,6 +3257,10 @@ if [[ ${#YAML_CONFIGS[@]} -ge 2 ]]; then
             [[ "${_cxp:-0}" -gt 0 ]] && _parts+=("${_cxp} xpassed")
             if [[ ${#_parts[@]} -eq 0 ]]; then
                 _summary="0 tests"
+                # A member that ran nothing is hidden when configs share one JUnit
+                # report (a ci_group): the other members' cases fill it, so the
+                # empty-suite check never sees it. Say so here instead.
+                echo "::warning title=Empty suite in a merged run::${_lbl} ran 0 tests (its patterns match nothing?)"
             else
                 _summary="$(IFS=', '; echo "${_parts[*]}")"
             fi

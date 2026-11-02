@@ -5,7 +5,7 @@
 # class for CI wall-clock balance: this file runs the reduction wrap
 # (LxPlanningTwoOpReductionTest,
 # 'torch.sum(x, dim=0)'); test_inductor_ops_lx_misc_compute_c_pointwise_config.yaml
-# runs the other. Each half is about 9-10 minutes.
+# runs the other. Each half is about 12 minutes on CI.
 #
 # Auto-split of test_inductor_ops_lx_planning.py, mirroring the
 # test_inductor_ops.py config sharding. The full (non-truncated) test

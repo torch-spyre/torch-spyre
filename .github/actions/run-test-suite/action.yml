@@ -1,6 +1,6 @@
 name: Run test suite (single attempt + stall-triggered xdist retry)
 description: >
-  Runs a single run_test.sh config once. A stall (no stdout for
+  Runs run_test.sh once, on one config or on several that it merges (a ci_group). A stall (no stdout for
   stall_timeout_secs) kills the attempt and retries it once, in the same
   pod, with -n1 (pytest-xdist worker isolation). Any other failure is left
   for pod-level retry (_test_matrix.yaml's test_retry/test_multi_spyre_retry
@@ -24,7 +24,10 @@ inputs:
     description: Human-readable label (used in echo/log output)
     required: true
   config:
-    description: Path passed to run_test.sh (e.g. tests/configs/...); several space-separated paths are merged into one run
+    description: >-
+      Path passed to run_test.sh (e.g. tests/configs/...); several space-separated
+      paths are merged into one run. Paths must not contain whitespace or glob
+      characters, because this is expanded unquoted so that it splits.
     required: true
   extra_test_flags:
     description: Extra flags forwarded to run_test.sh (e.g. "-v")
@@ -266,6 +269,8 @@ runs:
             ${_PARALLEL_FLAG} ${{ inputs.extra_test_flags }} ${_SLOW_FLAG} ${_JUNIT_FLAG} ${xdist_flag}
           printf '\n'
 
+          # $CONFIG is deliberately unquoted: it may hold several config paths, which
+          # must not contain whitespace or glob characters.
           env ${_DTLOG_PREFIX} bash tests/run_test.sh $CONFIG ${_PARALLEL_FLAG} ${{ inputs.extra_test_flags }} ${_SLOW_FLAG} ${_JUNIT_FLAG} ${xdist_flag} \
             >&"$FIFO_FD" 2>&1 &
           test_pid=$!

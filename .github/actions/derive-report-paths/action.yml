@@ -1,0 +1,42 @@
+name: Derive report paths
+description: >
+  Names a suite's JUnit report and lists the config paths run_test.sh is given.
+  A ci_group entry carries every member in `configs` and names its report after the
+  group; an ungrouped entry has one config and is named after it. Exports
+  REPORT_NAME, REPORT_PATH and CONFIG_PATHS (space-separated) to the job environment.
+  Config paths must not contain whitespace or glob characters, because
+  run-test-suite passes CONFIG_PATHS to run_test.sh unquoted so that it splits.
+
+inputs:
+  config:
+    description: The matrix entry's `config` (its first member).
+    required: true
+  configs:
+    description: The matrix entry's `configs` (space-separated members); empty for an ungrouped entry.
+    required: false
+    default: ''
+  report:
+    description: The matrix entry's `report` stem; empty to derive it from `config`.
+    required: false
+    default: ''
+  root:
+    description: Directory that the entry's config paths are relative to.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Derive report paths
+      shell: bash
+      env:
+        CONFIG: ${{ inputs.config }}
+        MEMBERS: ${{ inputs.configs }}
+        REPORT_STEM: ${{ inputs.report }}
+        ROOT: ${{ inputs.root }}
+      run: |
+        REPORT_NAME="${REPORT_STEM:-$(basename "${CONFIG%.yaml}")}.xml"
+        echo "REPORT_NAME=${REPORT_NAME}" >> "$GITHUB_ENV"
+        echo "REPORT_PATH=${GITHUB_WORKSPACE}/${REPORT_NAME}" >> "$GITHUB_ENV"
+        CONFIG_PATHS=""
+        for m in ${MEMBERS:-$CONFIG}; do CONFIG_PATHS="${CONFIG_PATHS:+$CONFIG_PATHS }${ROOT}/${m}"; done
+        echo "CONFIG_PATHS=${CONFIG_PATHS}" >> "$GITHUB_ENV"

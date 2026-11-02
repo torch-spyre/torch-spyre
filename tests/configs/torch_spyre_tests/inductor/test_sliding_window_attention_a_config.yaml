@@ -1,7 +1,7 @@
 # Sliding-window-attention shard A. The test file is split three ways for CI
-# wall-clock balance: the prefill tests below each take 90-130s to compile, and
+# wall-clock balance: the eight slowest tests each take 90-130s to compile, and
 # together with the rest they made one ~21 minute job. Shards _a and _b each take
-# four of the slow tests; test_sliding_window_attention_config.yaml runs the rest.
+# four of them; test_sliding_window_attention_config.yaml runs the rest.
 # Every test is named in exactly one of the three files, as make check-all-configs
 # requires: a test added to the SWA test file must be added to one of them.
 test_suite_config:

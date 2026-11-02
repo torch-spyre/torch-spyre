@@ -688,19 +688,12 @@ jobs:
           artifact_name: ${{ inputs.pytorch_wheel_artifact_name }}
 
       - name: Derive report paths
-        run: |
-          CONFIG="${{ matrix.suite.config }}"
-          # A grouped entry names its report after the group; others after the config.
-          REPORT_STEM="${{ matrix.suite.report }}"
-          REPORT_NAME="${REPORT_STEM:-$(basename "${CONFIG%.yaml}")}.xml"
-          echo "REPORT_NAME=${REPORT_NAME}" >> "$GITHUB_ENV"
-          echo "REPORT_PATH=${GITHUB_WORKSPACE}/${REPORT_NAME}" >> "$GITHUB_ENV"
-          # Every member of a ci_group, root-qualified; one path for an ungrouped suite.
-          MEMBERS="${{ matrix.suite.configs }}"
-          ROOT="${{ needs.generate_matrix.outputs.config_root }}"
-          CONFIG_PATHS=""
-          for m in ${MEMBERS:-$CONFIG}; do CONFIG_PATHS="${CONFIG_PATHS:+$CONFIG_PATHS }${ROOT}/${m}"; done
-          echo "CONFIG_PATHS=${CONFIG_PATHS}" >> "$GITHUB_ENV"
+        uses: ./.github/actions/derive-report-paths
+        with:
+          config: ${{ matrix.suite.config }}
+          configs: ${{ matrix.suite.configs }}
+          report: ${{ matrix.suite.report }}
+          root: ${{ needs.generate_matrix.outputs.config_root }}
 
       - name: Run ${{ matrix.suite.name }} tests
         id: run_tests
@@ -1289,18 +1282,12 @@ jobs:
           artifact_name: ${{ inputs.pytorch_wheel_artifact_name }}
 
       - name: Derive report paths
-        run: |
-          CONFIG="${{ matrix.suite.config }}"
-          # A grouped entry names its report after the group; others after the config.
-          REPORT_STEM="${{ matrix.suite.report }}"
-          REPORT_NAME="${REPORT_STEM:-$(basename "${CONFIG%.yaml}")}.xml"
-          echo "REPORT_NAME=${REPORT_NAME}" >> "$GITHUB_ENV"
-          echo "REPORT_PATH=${GITHUB_WORKSPACE}/${REPORT_NAME}" >> "$GITHUB_ENV"
-          # Every member of a ci_group, root-qualified; one path for an ungrouped suite.
-          MEMBERS="${{ matrix.suite.configs }}"
-          CONFIG_PATHS=""
-          for m in ${MEMBERS:-$CONFIG}; do CONFIG_PATHS="${CONFIG_PATHS:+$CONFIG_PATHS }tests/configs/${m}"; done
-          echo "CONFIG_PATHS=${CONFIG_PATHS}" >> "$GITHUB_ENV"
+        uses: ./.github/actions/derive-report-paths
+        with:
+          config: ${{ matrix.suite.config }}
+          configs: ${{ matrix.suite.configs }}
+          report: ${{ matrix.suite.report }}
+          root: tests/configs
 
       - name: Run ${{ matrix.suite.name }} tests
         uses: ./.github/actions/run-test-suite
@@ -1525,19 +1512,12 @@ jobs:
           artifact_name: ${{ inputs.pytorch_wheel_artifact_name }}
 
       - name: Derive report paths
-        run: |
-          CONFIG="${{ matrix.suite.config }}"
-          # A grouped entry names its report after the group; others after the config.
-          REPORT_STEM="${{ matrix.suite.report }}"
-          REPORT_NAME="${REPORT_STEM:-$(basename "${CONFIG%.yaml}")}.xml"
-          echo "REPORT_NAME=${REPORT_NAME}" >> "$GITHUB_ENV"
-          echo "REPORT_PATH=${GITHUB_WORKSPACE}/${REPORT_NAME}" >> "$GITHUB_ENV"
-          # Every member of a ci_group, root-qualified; one path for an ungrouped suite.
-          MEMBERS="${{ matrix.suite.configs }}"
-          ROOT="${{ needs.generate_matrix.outputs.config_root }}"
-          CONFIG_PATHS=""
-          for m in ${MEMBERS:-$CONFIG}; do CONFIG_PATHS="${CONFIG_PATHS:+$CONFIG_PATHS }${ROOT}/${m}"; done
-          echo "CONFIG_PATHS=${CONFIG_PATHS}" >> "$GITHUB_ENV"
+        uses: ./.github/actions/derive-report-paths
+        with:
+          config: ${{ matrix.suite.config }}
+          configs: ${{ matrix.suite.configs }}
+          report: ${{ matrix.suite.report }}
+          root: ${{ needs.generate_matrix.outputs.config_root }}
 
       # The first attempt's report, which this job's upload overwrites; kept as prior_* props.
       - name: Download the first attempt's JUnit XML report
@@ -1651,18 +1631,12 @@ jobs:
           artifact_name: ${{ inputs.pytorch_wheel_artifact_name }}
 
       - name: Derive report paths
-        run: |
-          CONFIG="${{ matrix.suite.config }}"
-          # A grouped entry names its report after the group; others after the config.
-          REPORT_STEM="${{ matrix.suite.report }}"
-          REPORT_NAME="${REPORT_STEM:-$(basename "${CONFIG%.yaml}")}.xml"
-          echo "REPORT_NAME=${REPORT_NAME}" >> "$GITHUB_ENV"
-          echo "REPORT_PATH=${GITHUB_WORKSPACE}/${REPORT_NAME}" >> "$GITHUB_ENV"
-          # Every member of a ci_group, root-qualified; one path for an ungrouped suite.
-          MEMBERS="${{ matrix.suite.configs }}"
-          CONFIG_PATHS=""
-          for m in ${MEMBERS:-$CONFIG}; do CONFIG_PATHS="${CONFIG_PATHS:+$CONFIG_PATHS }tests/configs/${m}"; done
-          echo "CONFIG_PATHS=${CONFIG_PATHS}" >> "$GITHUB_ENV"
+        uses: ./.github/actions/derive-report-paths
+        with:
+          config: ${{ matrix.suite.config }}
+          configs: ${{ matrix.suite.configs }}
+          report: ${{ matrix.suite.report }}
+          root: tests/configs
 
       # The first attempt's report, which this job's upload overwrites; kept as prior_* props.
       - name: Download the first attempt's JUnit XML report
