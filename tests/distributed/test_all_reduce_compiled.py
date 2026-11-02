@@ -132,6 +132,24 @@ def _split_k_then_allreduce(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return torch.ops._c10d_functional.wait_tensor(reduced) * 2.0
 
 
+def _split_k_then_flat_allreduce(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """vLLM's TP all_reduce of a loop result: flatten, reduce, wait, reshape."""
+
+    def body(acc, ops):
+        x_tile, y_tile = ops
+        return acc + x_tile @ y_tile, None
+
+    acc, _ = for_each_tile(
+        body,
+        (x, y),
+        dims=(-1, 0),
+        tile_size=64,
+        init=torch.zeros(_CARRY_M, _CARRY_N, device=x.device, dtype=x.dtype),
+    )
+    reduced = torch.ops._c10d_functional.all_reduce(acc.reshape(-1), "sum", _GROUP_NAME)
+    return torch.ops._c10d_functional.wait_tensor(reduced).reshape(acc.shape)
+
+
 def _loop_update_allocations(source: str) -> list[str]:
     """Allocation kinds of the carry update, the first ``add`` in the LoopSpec."""
     loop = source[source.index("LoopSpec(") :]
@@ -416,6 +434,24 @@ class TestAllReduceCompiled(TestCase):
         source = "\n".join(sources)
         self.assertIn("allreduce_run(", source)
         self.assertEqual(_loop_update_allocations(source), ["lx", "lx", "lx"])
+
+    def test_allreduce_of_loop_carry_view(self):
+        """The copy-back of an all_reduce_ on a view of a loop result survives the
+        splice; dropped, each rank returns its own partial."""
+        g = torch.Generator().manual_seed(0)
+        x = torch.randint(0, 2, (_CARRY_M, _CARRY_K), generator=g).half()
+        y = torch.randint(0, 2, (_CARRY_K, _CARRY_N), generator=g).half()
+        scale = self.comm_rank + 1
+        rank_sum = self.comm_size * (self.comm_size + 1) / 2
+        expected = (x.float() @ y.float()) * rank_sum
+
+        compiled = torch.compile(_split_k_then_flat_allreduce, fullgraph=True)
+        result, sources = run_and_get_code(
+            compiled, (x * scale).to(DEVICE), y.to(DEVICE)
+        )
+
+        torch.testing.assert_close(result.cpu().float(), expected, atol=0, rtol=0)
+        self.assertIn("allreduce_run(", "\n".join(sources))
 
     @parametrize("shape", [(128,), (4, 96)])
     def test_allreduce_compiled_bfloat16(self, shape):
