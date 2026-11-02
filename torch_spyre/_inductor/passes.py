@@ -113,7 +113,12 @@ from .dump_cost_model import dump_cost_model
 # ``from .cost_model_pass import LAST_REPORT`` would bind one thread's value forever.
 from . import cost_model_pass as cost_model_pass_module
 from .cost_model_pass import CostReport, cost_model_pass
-from .split_multi_ops import split_multi_ops, validate_ops, optimize_shuffling
+from .split_multi_ops import split_multi_ops
+from .element_arrangement import (
+    insert_ea_shuffle,
+    optimize_shuffling,
+    validate_ops,
+)
 
 
 logger = get_inductor_logger("passes")
@@ -588,7 +593,6 @@ class CustomPreSchedulingPasses:
             split_multi_ops,
             propagate_spyre_tensor_layouts,
             validate_ops,
-            optimize_shuffling,
             optimize_restickify_locations,
             reorder_nonstick_dims,
             finalize_layouts,
@@ -605,6 +609,11 @@ class CustomPreSchedulingPasses:
             # tiled_dims_per_read for a stage that is actually tiled -- a
             # wrong-answer, not a crash.
             insert_restickify,
+            # Shuffle staggered operands of mixed-EA pointwise ops to STANDARD.
+            # Decided from the committed layouts, so it follows finalize_layouts
+            # (and insert_restickify, which never touches a staggered operand).
+            insert_ea_shuffle,
+            optimize_shuffling,
             validate_no_restickify_on_mutation_targets,
             enforce_indirect_access_layout,
             reorder_nonstick_dims_mutation,

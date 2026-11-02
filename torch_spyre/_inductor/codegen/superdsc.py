@@ -96,12 +96,17 @@ class SDSCArgs:
     element_arrangement: ElementArrangement = dataclasses.field(
         default_factory=lambda: ElementArrangement.STANDARD
     )
+    # Elements in the tensor's stick dim as laid out on the device (padded to
+    # whole sticks, and to whole stick pairs for DL16_TO_FP32), summed over all
+    # cores. None when the stick dim is not part of dim_order.
+    stick_device_size: int | None = None
     # Sharded storage: each core addresses its own chunk (see sharded_hbm.py).
     non_unified_shard_bytes: int = 0
 
     @property
     def non_unified(self) -> bool:
         return self.non_unified_shard_bytes > 0
+
 
     def __str__(self) -> str:
         scales = ", ".join(f"{k}={v}" for k, v in self.scales.items())
@@ -1468,6 +1473,7 @@ def _create_sdsc_tensors(
             d for d in dim_order if d not in reduced_dims
         ] + reduced_dims
 
+        stick_device_size = None
         for dim in dim_order:
             stride_idx = stride_dim_order.index(dim)
             # A tiled-away loop role may survive as a constant physical axis.
@@ -1560,6 +1566,8 @@ def _create_sdsc_tensors(
                     stick_size = arg.device_dtype.elems_per_stick()
                     dev_dim_size *= stick_size
                     it_dim_size = ((it_dim_size - 1) // stick_size + 1) * stick_size
+            if dim is stick_dim:
+                stick_device_size = dev_dim_size
 
             if has_indirect_access:
                 max_dim_sizes[dim] = compute_indirect_max_dim_sizes(
@@ -1793,6 +1801,7 @@ def _create_sdsc_tensors(
             related_value_tensor_idx=related_val_idx,
             device_tile_advance_expr=arg.device_tile_advance_expr,
             element_arrangement=arg.element_arrangement,
+            stick_device_size=stick_device_size,
             non_unified_shard_bytes=arg.non_unified_shard_bytes,
         )
         if arg.work_division is not None:

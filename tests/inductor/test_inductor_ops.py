@@ -9547,19 +9547,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "true_div": lambda a, b: torch.div(a, b),
                 "floor_div": _floor_div,
             },
-            # TODO: remove when multi-arg pointwise with mixed EA is supported
+            # Mixed staggered/STANDARD operands are shuffled by insert_ea_shuffle.
+            # TODO: the floor correction compares an fp16 and an fp32 operand,
+            # which propagate_layouts rejects; remove when that is supported
             "expect_raise": {
-                "fp16_fp32_1d256": "Multi-arg pointwise with mixed EA",
-                "fp32_fp16_1d256": "Multi-arg pointwise with mixed EA",
-                "fp16_fp32_2d4x64": "Multi-arg pointwise with mixed EA",
-                "fp32_fp16_2d4x64": "Multi-arg pointwise with mixed EA",
-                # int32/int64 -> fp16 is stick-reordering, so the converted
-                # operand is staggered and meets the STANDARD fp16 one.
-                "int32_fp16_1d256": "Multi-arg pointwise with mixed EA",
-                "fp16_int32_1d256": "Multi-arg pointwise with mixed EA",
-                "int32_fp16_2d4x64": "Multi-arg pointwise with mixed EA",
-                "int64_fp16_1d256": "Multi-arg pointwise with mixed EA",
-                "fp16_int64_1d256": "Multi-arg pointwise with mixed EA",
+                "floor_div_fp16_int32_1d256": (
+                    "torch.bool result from operands with device format(s)"
+                ),
+                "floor_div_fp16_int64_1d256": (
+                    "torch.bool result from operands with device format(s)"
+                ),
             },
             "expect_fail": {
                 # fp16 intermediate product rounding can zero the residual and
@@ -9575,7 +9572,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
             "param_sets": {
-                # fp16 -> fp32 is stick-reordering: blocked by mixed EA
+                # fp16 -> fp32 is stick-reordering: the staggered operand is
+                # shuffled to STANDARD before it meets the other one
                 "fp16_fp32_1d256": (
                     cached_randn((256,), abs=True, scale=10.0, dtype=torch.float16),
                     cached_randn((256,), abs=True, scale=9.9, dtype=torch.float32),
