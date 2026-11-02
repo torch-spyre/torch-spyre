@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "One CI execution (Jenkins build or GHA run attempt / job), upserted start -> end.",
+  "properties": {
+    "agent": {},
+    "arches": {},
+    "attempt": {},
+    "build_mode": {},
+    "build_ms": {},
+    "build_number": {},
+    "build_url": {},
+    "ch_write_failures": {},
+    "component": {},
+    "duration_ms": {},
+    "ended_at": {},
+    "fail_log_tail": {},
+    "failed_stage": {},
+    "failure_evidence": {},
+    "failure_is_infra": {},
+    "failure_reason": {},
+    "job_name": {
+      "minLength": 1
+    },
+    "lane_results": {},
+    "nodes_built": {},
+    "nodes_dropped": {},
+    "nodes_reused": {},
+    "parent_run_key": {},
+    "pipeline_type": {
+      "enum": [
+        "component-build",
+        "gha-job",
+        "gha-workflow",
+        "orchestrator",
+        "product-test"
+      ]
+    },
+    "pr_number": {},
+    "preset": {},
+    "props": {},
+    "queue_ms": {},
+    "reached_normal_completion": {},
+    "repo": {},
+    "result": {},
+    "run_key": {
+      "minLength": 1
+    },
+    "sha": {},
+    "source": {
+      "enum": [
+        "gha",
+        "jenkins"
+      ]
+    },
+    "started_at": {},
+    "state": {
+      "enum": [
+        "finished",
+        "running"
+      ]
+    },
+    "superseded": {},
+    "test_ms": {},
+    "test_with": {},
+    "tests_failed": {},
+    "tests_total": {},
+    "trigger_kind": {},
+    "trigger_source": {},
+    "updated_at": {},
+    "verdict": {}
+  },
+  "required": [
+    "run_key",
+    "updated_at",
+    "source",
+    "pipeline_type",
+    "state",
+    "job_name",
+    "build_number",
+    "attempt",
+    "build_url",
+    "agent",
+    "parent_run_key",
+    "started_at",
+    "ended_at",
+    "queue_ms",
+    "duration_ms",
+    "build_ms",
+    "test_ms",
+    "trigger_kind",
+    "trigger_source",
+    "preset",
+    "build_mode",
+    "repo",
+    "pr_number",
+    "sha",
+    "test_with",
+    "component",
+    "arches",
+    "result",
+    "verdict",
+    "superseded",
+    "reached_normal_completion",
+    "lane_results",
+    "nodes_built",
+    "nodes_reused",
+    "nodes_dropped",
+    "tests_total",
+    "tests_failed",
+    "ch_write_failures",
+    "failure_reason",
+    "failure_is_infra",
+    "failure_evidence",
+    "failed_stage",
+    "fail_log_tail",
+    "props"
+  ],
+  "title": "pipeline_runs: the stored row",
+  "type": "object",
+  "x-uploadable": false
+}
