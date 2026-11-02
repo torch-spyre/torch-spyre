@@ -1284,20 +1284,25 @@ def _find_quantized_candidate(
     stick_var: sympy.Symbol,
     reduction_type: str,
 ) -> "SpyreTensorLayout | None":
-    """Return the first quantized (FP8/QFP8) candidate that is usable, or None.
+    """Return the first non-STANDARD candidate that is usable, or None.
 
     Quantized arrangements carry their own contraction structure and are
     returned immediately without restickify logic.
-    Exception: BATCH_MATMUL_FP8_OP requires stick_var on the stick — a sparse
-    QFP8CH candidate without it is skipped so the dense candidate can be used.
+    Exceptions that require stick_var on the stick:
+    - BATCH_MATMUL_FP8_OP: a sparse QFP8CH candidate without it is skipped so
+      the dense candidate can be used.
+    - Staggered arrangements: the later strategies skip non-STANDARD
+      candidates, so one without stick_var on the stick would be used as is.
     """
     for stl, dev_coords in candidates:
-        if stl.element_arrangement == ElementArrangement.STANDARD:
+        ea = stl.element_arrangement
+        if ea == ElementArrangement.STANDARD:
             continue
-        if reduction_type != BATCH_MATMUL_FP8_OP or (
-            stick_var in dev_coords[-1].free_symbols
-        ):
-            return stl
+        if (
+            reduction_type == BATCH_MATMUL_FP8_OP or ea in STAGGERED_EAS
+        ) and stick_var not in dev_coords[-1].free_symbols:
+            continue
+        return stl
     return None
 
 
