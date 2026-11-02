@@ -4,6 +4,11 @@ defaults:
   seed: 123
   atol: 0.005
   rtol: 0.005
+dtypes:
+  - name: bfloat16
+    precision:
+      atol: 0.008
+      rtol: 0.008
 cases:
   - name: torch.nn.functional.embedding.1
     op: torch.nn.functional.embedding
