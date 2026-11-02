@@ -36,7 +36,7 @@ import json
 import os
 import platform as _platform
 import sys
-
+import tempfile
 import uuid
 import xml.etree.ElementTree as etree
 from collections import Counter, defaultdict
@@ -125,6 +125,32 @@ _PERF_NAME_RE = re.compile(
 )
 
 _GRANITE_CONFIG_RE = re.compile(r"bs(?P<batch_size>\d+)(?:_pl(?P<prompt_length>\d+))?")
+
+
+def _is_model_record(op_name: str, tags: dict) -> bool:
+    # The explicit model tag wins; the granite_ prefix covers reports that predate it.
+    return bool(tags.get("model")) or op_name.startswith("granite_")
+
+
+def _model_operation_name(op_name: str, tags: dict) -> str:
+    # granite_ ops keep the single "granite" series so existing history stays continuous.
+    return "granite" if op_name.startswith("granite_") else tags["model"]
+
+
+def _model_shape(op_name: str, tags: dict):
+    """batch_size, prompt_length: explicit tags first, else parsed from the granite_ op name."""
+    batch = _opt_float(tags, "batch_size")
+    prompt = _opt_float(tags, "prompt_length")
+    if batch is None and prompt is None:
+        m = _GRANITE_CONFIG_RE.search(op_name)
+        if m:
+            batch = float(m.group("batch_size"))
+            pl_raw = m.group("prompt_length")
+            prompt = float(pl_raw) if pl_raw and pl_raw.isdigit() else None
+    return (
+        int(batch) if batch is not None else None,
+        int(prompt) if prompt is not None else None,
+    )
 
 
 KERNEL_CLASSNAME = "kernel_benchmark"
@@ -285,12 +311,9 @@ def parse_benchmark_xml(
             if regression_status == "N/A":
                 regression_status = None
 
-        is_granite = op_name.startswith("granite_")
+        is_granite = _is_model_record(op_name, tags)
         if is_granite:
-            config_m = _GRANITE_CONFIG_RE.search(op_name)
-            batch_size = int(config_m.group("batch_size")) if config_m else None
-            pl_raw = config_m.group("prompt_length") if config_m else None
-            prompt_length = int(pl_raw) if pl_raw and pl_raw.isdigit() else None
+            batch_size, prompt_length = _model_shape(op_name, tags)
             config_name = tags.get("config")
             run_mode = tags.get("mode")
             pt_util = _opt_float(tags, "pt_util")
@@ -309,7 +332,9 @@ def parse_benchmark_xml(
             {
                 "benchmark_id": uuid.uuid4().int >> 64,
                 "record_type": "model" if is_granite else "op",
-                "operation_name": "granite" if is_granite else op_name,
+                "operation_name": _model_operation_name(op_name, tags)
+                if is_granite
+                else op_name,
                 "config_name": config_name,
                 "input_shapes": None if is_granite else (shapes_str or None),
                 "batch_size": batch_size,
@@ -392,24 +417,22 @@ def parse_kernel_xml(
             continue
 
         operation_name = tags.get("op", "")
-        is_granite = operation_name.startswith("granite_")
+        is_granite = _is_model_record(operation_name, tags)
         num_runs = _opt_float(tags, "num_runs")
 
         # config__/mode__ carry only full_model|one_block and prefill|decode, so
         # without bs/pl two Granite configs would be indistinguishable here.
         batch_size = prompt_length = None
         if is_granite:
-            config_m = _GRANITE_CONFIG_RE.search(operation_name)
-            if config_m:
-                batch_size = int(config_m.group("batch_size"))
-                pl_raw = config_m.group("prompt_length")
-                prompt_length = int(pl_raw) if pl_raw and pl_raw.isdigit() else None
+            batch_size, prompt_length = _model_shape(operation_name, tags)
 
         kernels.append(
             {
                 "kernel_id": uuid.uuid4().int >> 64,
                 "record_type": "model" if is_granite else "op",
-                "operation_name": "granite" if is_granite else (operation_name or None),
+                "operation_name": _model_operation_name(operation_name, tags)
+                if is_granite
+                else (operation_name or None),
                 "kernel_name": kernel_name,
                 # A section's Total is the sum of its siblings; flagged so
                 # queries can aggregate without double-counting.
@@ -1781,6 +1804,22 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _ingest_kind(argv, args) -> int:
+    """vllm, sendnn and benchmarks, connected: the bundle `--offline` would write, recorded as
+    the relay records it, so a direct run and an uploaded bundle leave the same v2 rows."""
+    from spyre_clickhouse_ingest import bundle, offline
+
+    off, _ = offline.parser().parse_known_args(argv)
+    with tempfile.TemporaryDirectory(prefix="results-") as tmp:
+        off.out = str(Path(tmp) / "bundle")
+        try:
+            args.from_bundle = str(offline.write(off))
+        except offline.BundleError as err:
+            print(json.dumps({"status": offline.STATUS[err.code], "reason": str(err)}))
+            return err.code
+        return bundle.ingest(args)
+
+
 def main(argv=None):
     args = build_parser().parse_args(argv)
     if args.offline or args.validate_only or args.upload:
@@ -1789,6 +1828,13 @@ def main(argv=None):
         from spyre_clickhouse_ingest.bundle import ingest
 
         return ingest(args)
+    if (
+        args.kind != "junit"
+        or args.vllm_results_dir
+        or args.sendnn_report
+        or args.benchmarks_dir
+    ):
+        return _ingest_kind(argv, args)
     args.arch = args.arch or _platform.machine() or ""
     args.platform = args.arch
     # Resolved once here rather than re-tested at each call site, so the two paths cannot
@@ -2174,6 +2220,7 @@ def main(argv=None):
                             cases,
                             xml_path.name,
                             attempt=args.run_attempt,
+                            arch=args.platform or run["platform"],
                         )
                         print(f"  v2: {_n} test_case_runs under run_id={_v2_run_id}")
 

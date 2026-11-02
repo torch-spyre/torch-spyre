@@ -6,7 +6,7 @@
 # test_inductor_ops.py config sharding. The full (non-truncated) test
 # set is enabled in CI via TEST_LX_PLANNING_FULL=1 + TEST_LX_PLANNING_RUN_SKIPS=1
 # (see .github/workflows/_test_matrix.yaml). Known LX-planning failures are
-# listed as `mode: xfail` blocks (none at present; the in-file .py
+# listed as `mode: xfail_strict` blocks (none at present; the in-file .py
 # skip-lists were removed as duplicates).
 test_suite_config:
   labels: [regression, trunk]
@@ -14,6 +14,15 @@ test_suite_config:
     - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops_lx_planning.py
       unlisted_test_mode: skip
       tests:
+        # Known LX-planning failures -- run and must fail (strict). An
+        # unexpected pass (XPASS) fails CI so fixed bugs are noticed. Entries
+        # failing in both wraps collapse to (pointwise|reduction).
+        - names:
+            # fp16_fp32_1d256: mixed EA, stick reordering unsupported (#TODO:
+            # remove when multi-arg pointwise with mixed EA is supported)
+            - LxPlanning.*::test_div_mixed_dtype_true_div_fp16_fp32_1d256_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_div_mixed_dtype_floor_div_fp16_fp32_1d256_lx_planning_(pointwise|reduction)
+          mode: xfail_strict
         - names:
             - LxPlanning.*::test_layernorm.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_rmsnorm.*_lx_planning_(pointwise|reduction)
@@ -45,5 +54,9 @@ test_suite_config:
             - LxPlanning.*::test_random_from_cpu.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_where.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_restickify_add_transpose.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_restickify_clone.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_prod.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_div_rounding_mode_floor_fp16_rand_2d_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_div_scalar_dtypes_true_div_bool_int_scalar_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_div_scalar_dtypes_floor_div_bool_int_scalar_lx_planning_(pointwise|reduction)
           mode: mandatory_success

@@ -66,7 +66,7 @@ provenance/
 Requires a working Spyre device.
 
 ```bash
-cd docs/source/user_guide/examples/provenance
+cd docs/source/user_guide/debugging/provenance
 python audit.py                         # default outputs (below)
 python audit.py --output /tmp/report.md --raw /tmp/raw.json
 ```

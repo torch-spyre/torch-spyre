@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "One built artifact; no `identity` -- a dup artifact_id is a producer bug.",
+  "properties": {
+    "arch": {
+      "minLength": 1
+    },
+    "artifact_id": {},
+    "artifact_name": {},
+    "component": {
+      "minLength": 1
+    },
+    "context_deps": {},
+    "identity_deps": {},
+    "kind": {
+      "enum": [
+        "generic",
+        "image",
+        "rpm",
+        "wheel"
+      ]
+    },
+    "origin": {
+      "enum": [
+        "built",
+        "copied",
+        "promoted",
+        "upstream"
+      ]
+    },
+    "props": {},
+    "sources": {}
+  },
+  "required": [
+    "artifact_id",
+    "component",
+    "arch",
+    "kind",
+    "artifact_name",
+    "origin",
+    "identity_deps",
+    "context_deps",
+    "sources",
+    "props"
+  ],
+  "title": "artifacts: the stored row",
+  "type": "object",
+  "x-uploadable": false
+}

@@ -119,9 +119,7 @@ void AiuptiActivityProfilerSession::processTrace(
 void AiuptiActivityProfilerSession::processTrace(
     libkineto::ActivityLogger& logger,
     libkineto::getLinkedActivityCallback get_linked_activity,
-    int64_t captureWindowStartTime, int64_t captureWindowEndTime) {
-  captureWindowStartTime_ = captureWindowStartTime;
-  captureWindowEndTime_ = captureWindowEndTime;
+    int64_t /*captureWindowStartTime*/, int64_t /*captureWindowEndTime*/) {
   cpuActivity_ = get_linked_activity;
   processTrace(logger);
 }

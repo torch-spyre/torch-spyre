@@ -59,6 +59,7 @@
 #include "spyre_guard.h"
 #include "spyre_kernel.h"
 #include "spyre_mem.h"
+#include "spyre_pinned_allocator.h"
 #include "spyre_stream.h"
 #include "spyre_tensor_impl.h"
 #include "spyre_views.h"
@@ -230,6 +231,14 @@ PYBIND11_MODULE(_C, m) {
       }
       at::Generator getNewGenerator(c10::DeviceIndex device) const override {
         return spyre::detail::createSpyreGenerator(device);
+      }
+      at::Allocator* getPinnedMemoryAllocator() const override {
+        return spyre::GetSpyrePinnedAllocator();
+      }
+      bool isPinnedPtr(const void* data) const override {
+        auto* allocator = static_cast<spyre::SpyrePinnedAllocator*>(
+            spyre::GetSpyrePinnedAllocator());
+        return allocator->isPinnedPtr(data);
       }
     };
     static auto* hooks = new SpyreHooksInterface();
@@ -470,9 +479,14 @@ PYBIND11_MODULE(_C, m) {
         py::arg("device") = -1);
 
   // Memory copy function
+  // Lets go of the GIL while it runs, so other Python threads (for example
+  // the threaded weight upload in model_utils) can run at the same time. Most
+  // of the time goes to turning the host data into the device format.
+  // spyre_copy_from does not use any Python object.
   m.def("copy_tensor", &spyre::spyre_copy_from,
         "Copy tensor between host and device using DMA", py::arg("self"),
-        py::arg("dst"), py::arg("non_blocking") = false);
+        py::arg("dst"), py::arg("non_blocking") = false,
+        py::call_guard<py::gil_scoped_release>());
 
   // Device-side fill using FillDMA (no host buffer or H2D copy)
   m.def("fill_tensor", &spyre::spyre_fill_tensor,
@@ -692,6 +706,38 @@ PYBIND11_MODULE(_C, m) {
       "        JobPlanStepHostCompute resolves each correction slot by kind\n"
       "        rather than blindly iterating tensors. Empty (default)\n"
       "        preserves today's legacy behavior.");
+
+  // Test-only seam: runs a single HostCompute on the current stream and returns
+  // the produced correction bytes. A HostCompute-only plan cannot go through
+  // prepare_kernel (the validator requires a following Compute, and executing
+  // a Compute from a mock SpyreCode faults the device), so this drives the
+  // same flex path JobPlanStepHostCompute::construct uses (Case 2: no input
+  // buffer, no address args) directly. The "_" prefix signals this is not part
+  // of the stable public API.
+  m.def(
+      "_host_compute_bytes",
+      [](const std::string& hcm_json, size_t correction_size) {
+        auto hcm = std::make_unique<Hcm>();
+        TORCH_CHECK(hcm->importJsonStr(hcm_json), "Failed to import Hcm");
+        auto handle = flex::createHostComputeHandle(std::move(hcm));
+        auto* params = flex::createHostComputeParams(
+            handle.get(), correction_size, /*input_buffer=*/nullptr, {});
+        struct Guard {
+          flex::HostComputeParams* p;
+          ~Guard() {
+            flex::destroyHostComputeParams(p);
+          }
+        } guard{params};
+        std::unique_ptr<flex::HostComputeBuffer,
+                        decltype(&flex::destroyHostComputeBuffer)>
+            buffer(spyre::getCurrentStream().launchHostCompute(params),
+                   flex::destroyHostComputeBuffer);
+        return py::bytes(static_cast<const char*>(buffer->data()),
+                         buffer->size());
+      },
+      py::arg("hcm_json"), py::arg("correction_size"),
+      "Test-only: run one HostCompute (no args) and return the produced "
+      "bytes.");
 
   // Test-only seam: exposes JobPlanStepHostCompute::resolveSymbolicArgs so
   // that Python tests can verify the HostComputeArg ordering without needing

@@ -14,10 +14,11 @@
 
 from collections.abc import Callable, Sequence
 
-from torch._inductor.ir import ComputedBuffer
+from torch._inductor.ir import ComputedBuffer, NopKernel
 from torch._inductor.scheduler import (
     BaseSchedulerNode,
     FusedSchedulerNode,
+    NopKernelSchedulerNode,
     SchedulerNode,
 )
 from . import config
@@ -52,9 +53,64 @@ def _is_fusable_node(node: BaseSchedulerNode) -> bool:
     )
 
 
-def group_contiguous_fusable(items: list, is_fusable: Callable) -> list[list]:
+def _is_vetted_nop(op) -> bool:
+    """True if the IR operation ``op`` is a no-op whose codegen only allocates.
+
+    The scheduler makes a ``NopKernelSchedulerNode`` from every operation whose
+    ``is_no_op()`` is true, and emits it as ``mark_run()``: an allocation of its
+    outputs, with none of its inputs read. Two kinds of operation take that path
+    today, and only these are accepted:
+
+    - a zero-element ``ComputedBuffer`` -- notably every ``empty``/
+      ``empty_strided`` result, the buffer that Spyre's ``cat`` and padding
+      lowerings then fill with ordinary copy kernels;
+    - a ``NopKernel`` (in practice ``ConcatKernel``), whose inputs are views
+      into its own storage.
+
+    A future ``is_no_op()`` kind is rejected until it is checked, so it falls
+    back to being a bundle boundary instead of being reordered.
+    """
+    if isinstance(op, NopKernel):
+        return True
+    return isinstance(op, ComputedBuffer) and op.is_no_op()
+
+
+def _is_hoistable_node(node: BaseSchedulerNode) -> bool:
+    """True if ``node`` may be moved ahead of the run being fused without
+    changing the program semantics.
+
+    A nop (see :func:`_is_vetted_nop`) generates no kernel, so emitting it before
+    the pending run keeps it from splitting the nodes before and after it into
+    separate bundles.
+
+    Moving a nop earlier never puts it after one of its consumers. It may put it
+    ahead of a node it formally depends on -- a ``ConcatKernel`` carries a
+    ``StarDep`` on each buffer it concatenates -- so the result is not strictly
+    topological in the dependency graph. That is safe because no data flows
+    along those edges: a nop's codegen only allocates its outputs, and a
+    concat's inputs are views into that very allocation, so it has to come first
+    anyway. A zero-element buffer reads nothing at all. Buffer lifetimes are
+    recomputed from the new order afterwards (``Scheduler.compute_last_usage``
+    runs after the post-fusion passes).
+    """
+    return isinstance(node, NopKernelSchedulerNode) and _is_vetted_nop(node.node)
+
+
+def _never_hoistable(item) -> bool:
+    return False
+
+
+def group_contiguous_fusable(
+    items: list,
+    is_fusable: Callable,
+    is_hoistable: Callable = _never_hoistable,
+) -> list[list]:
     """Split ``items`` into maximal contiguous runs of fusable entries, with each
     non-fusable entry its own single-element run.
+
+    A non-fusable entry for which ``is_hoistable`` is true does not end the
+    current run: it is emitted as its own group ahead of the run, which then
+    continues past it.
 
     This is the *policy* behind :func:`spyre_fuse_nodes` -- one SuperDSC bundle
     per maximal run of fusable ops, order preserved -- factored out so that
@@ -70,6 +126,9 @@ def group_contiguous_fusable(items: list, is_fusable: Callable) -> list[list]:
     for item in items:
         if is_fusable(item):
             run.append(item)
+            continue
+        if run and is_hoistable(item):
+            groups.append([item])
             continue
         if run:
             groups.append(run)
@@ -97,7 +156,7 @@ def spyre_fuse_nodes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     # comes back as a single-element run, and ``_make_fused`` returns it
     # unchanged, so this preserves the previous behaviour exactly.
     fused_nodes: list[BaseSchedulerNode] = []
-    for group in group_contiguous_fusable(nodes, _is_fusable_node):
+    for group in group_contiguous_fusable(nodes, _is_fusable_node, _is_hoistable_node):
         if fused := _make_fused(group):
             fused_nodes.append(fused)
     return fused_nodes
@@ -111,11 +170,20 @@ def _is_fusable_operation(op) -> bool:
     op -- forces a bundle boundary. This is an *estimate*: whether a given
     operation ends up fused or extern is a scheduling decision that has not been
     made yet at this point in the pipeline.
+
+    A zero-element ``ComputedBuffer`` is excluded: the scheduler turns it into a
+    ``NopKernelSchedulerNode`` (see :func:`_is_vetted_nop`).
     """
-    if not isinstance(op, ComputedBuffer):
+    if not isinstance(op, ComputedBuffer) or op.is_no_op():
         return False
     device = op.get_device()
     return device is not None and device.type == DEVICE_NAME
+
+
+def _is_hoistable_operation(op) -> bool:
+    """The IR-operation analogue of :func:`_is_hoistable_node`: the operations
+    that will become a hoisted ``NopKernelSchedulerNode``."""
+    return _is_vetted_nop(op)
 
 
 def estimate_bundles(operations: Sequence) -> list[list]:
@@ -148,4 +216,6 @@ def estimate_bundles(operations: Sequence) -> list[list]:
     """
     if not config.bundle_symbolic_args:
         return [[op] for op in operations]
-    return group_contiguous_fusable(list(operations), _is_fusable_operation)
+    return group_contiguous_fusable(
+        list(operations), _is_fusable_operation, _is_hoistable_operation
+    )

@@ -69,7 +69,7 @@ from torch._inductor.ir import ComputedBuffer
 from . import config
 from .constants import DEVICE_NAME
 from .cost_model import CostParams, _loop_reread_bytes, predict_ops, relayout_ns
-from .dump_cost_model import extract_op_features
+from .cost_features import extract_op_features
 from .logging_utils import get_inductor_logger
 
 logger = get_inductor_logger("cost_model_pass")

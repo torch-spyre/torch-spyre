@@ -4,12 +4,6 @@ test_suite_config:
     - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops.py
       unlisted_test_mode: skip
       tests:
-        # DeepTools 092f4e79 coordinate masking miscomputes this padded
-        # fp16 sum over (63, 129): 0.58984375 instead of -0.468017578125.
-        # https://github.com/torch-spyre/torch-spyre/issues/5515
-        - names:
-            - TestOps::test_reduce_multidim_keepdim0_sum_pad_2d_dim_01_all
-          mode: xfail_strict
         - names:
             - TestOps::test_reduce_multidim_keepdim0.*
             - TestOps::test_reduce_edge_multidim_keepdim0.*

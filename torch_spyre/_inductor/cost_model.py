@@ -187,9 +187,13 @@ import dataclasses
 import math
 from collections.abc import Mapping, Sequence
 
+import regex
 import sympy
+from sympy.utilities.lambdify import implemented_function
 
 from .work_division import (
+    _DECODE_MAX_ROWS,
+    _decode_weight_delivery_gbps,
     _matmul_execution_cost,
     _matmul_multicast_penalty,
     # These wrappers dispatch symbolic operands to SymPy.
@@ -413,9 +417,8 @@ class OpFeatures:
     # producer and its consumers own an LX buffer under different per-core divisions.
     # Its traffic is entirely LX, which this model charges at zero -- calibrated for
     # ops whose LX traffic rides beside a larger HBM stream, and exactly wrong for the
-    # one op that is nothing but LX traffic. Measured on 53 configurations it costs
-    # 2.3-24.2 us at 2.1 MB / 8 cores depending on slice geometry alone, so it gets an
-    # additive term (see ``relayout_ns`` in predict_ops) keyed on these features.
+    # one op that is nothing but LX traffic. Use an additive term
+    # (see ``relayout_ns`` in predict_ops) keyed on these features.
     # ``is_lx_relayout`` derives from the planner's materialization registry, never
     # inferred; the other two are 0 when it is False. The bytes moved are NOT a
     # separate feature: a relayout copy is an identity clone, so they are exactly
@@ -423,6 +426,9 @@ class OpFeatures:
     # ``cores / owners`` via a future ``relayout_owners`` feature, not by a bytes
     # field).
     is_lx_relayout: bool = False
+    # Pricing domain for an LX copy. Zero uses the operation's core count.
+    # Keep this separate from cores, which also feeds other cost terms.
+    relayout_cores: int = 0
     # Stores with a known contiguous, indirect row write.
     is_indirect_store: bool = False
     # Per-core contiguous run, in ELEMENTS, of the finer (governing) of the two
@@ -688,34 +694,18 @@ class CostParams:
     # This is compute-side execution throughput, not another byte stream: applying
     # the LX spill/underfill derates to it would count the same bottleneck twice.
     fused_reduction_elems_per_core_ns: float = 1.5
-    # LX RELAYOUT (shuffle) term: per-core serial descriptor cost plus a stride-limited
-    # walk. Fitted 2026-08-17 on 21 direct per-kernel rows (main @ 65508a02, fp16,
-    # BUNDLE_SYMBOLIC_ARGS=0 -- a method #3741 has since removed; re-measuring needs
-    # the fused swap estimator at ~+/-8%): mean +2.5%, RMS 10.0% over bytes 0.52-4.19
-    # MB, cores 4-32, run 128-4096 B, split 2-8.
-    #
-    #   relayout_ns = runs_per_core * (a + b*log2(split)) + span_per_core / K
-    #     runs_per_core = bytes/cores / run_bytes
-    #     span_per_core = bytes/cores * split   (the engine walks the whole strided
-    #                                            span; a core keeps 1/split of it --
-    #                                            BW*split measured 588/540/549, so K
-    #                                            is per-core and split-invariant)
-    #
-    # The log2 in the per-run cost is FITTED, no mechanism behind it. VALID FOR SPLITS
-    # 2..8 ONLY: past 8 the law over-predicts 12-40% (measured at split 16), so the
-    # term clamps split into [2, 8] rather than extrapolate. Carries a +/-25% error
-    # bar from the non-governing side of the view pair -- reproducible scatter with no
-    # consistent direction (destination sweep, 10 pairs x 15 reps), so it is an error
-    # bar and not a term. Fanout was measured NOT to be a term (2/4/8 at fixed
-    # geometry, no trend). NO loop_trip factor: a relayout inside a coarse-tiling loop
-    # is structurally impossible today (the planner rejects coarse_tile_copy
-    # consumers).
-    # The negative intercept is the fitted value, not a typo: a small-run
-    # extrapolation artifact of the linear-in-log2(split) per-run form. The
-    # split clamp to [2, 8] keeps the per-run term positive over its domain.
+    # LX relayout cost: serial descriptor cost plus a stride-limited walk.
+    # relayout_ns = runs_per_core * (a + b*log2(split)) + span_per_core / K
+    # runs_per_core = bytes/cores / run_bytes
+    # span_per_core = bytes/cores * split
+    # Permutations use measured splits 2..32. Grouped movements keep the solver's
+    # existing split limit; their cost was not fitted.
+    # The fitted negative intercept is valid with the split floor of 2.
     relayout_run_a_ns: float = -1.14  # per-run cost intercept
     relayout_run_b_ns: float = 3.92  # per-run cost log2(split) slope
     relayout_span_gbps: float = 547.0  # per-core stride-limited walk rate
+    relayout_split_min: int = 2  # measured governing split range, low end
+    relayout_split_max: int = 32  # measured governing split range, high end
     # Matmul operand RE-READ (tile spill): the per-core OUTPUT-accumulator tile has area
     # (M/m)*(N/n); once it exceeds the on-chip capacity (~64K fp16 elems/core) it no
     # longer stays resident, so the operands are re-streamed from HBM. The re-read
@@ -1331,21 +1321,22 @@ def relayout_ns(o: "OpFeatures", params: "CostParams | None" = None) -> float:
     evaluates THIS function per candidate division and folds the result into an
     AddElement table -- one source of truth for both paths.
 
-    The split is clamped into [2, 8], the fitted range. Below 2 cannot occur for a
-    real ownership change (and would turn the fitted intercept negative); above 8
-    the law over-predicts by 12-40% (measured at split 16), so the clamp bounds the
-    error instead of extrapolating an unmeasured log2.
+    The split is clamped into the measured range [``relayout_split_min``,
+    ``relayout_split_max``] = [2, 32]. Below 2 cannot occur for a real ownership
+    change (and would turn the fitted intercept negative). Inside the range the law
+    is evaluated at the true split.
     """
     if not o.is_lx_relayout or o.out_elems <= 0:
         return 0.0
-    if o.relayout_run_elems <= 0 or o.cores <= 0:
+    cores = o.relayout_cores or o.cores
+    if o.relayout_run_elems <= 0 or cores <= 0:
         return 0.0
-    # Bytes moved == the copy's device bytes: a relayout is an identity clone.
-    per_core = o.out_elems * o.dtype_bytes / o.cores
-    run_bytes = o.relayout_run_elems * o.dtype_bytes
-    split = min(8, max(2, o.relayout_split))
-    runs = per_core / run_bytes
     p = params or CostParams()
+    # Bytes moved == the copy's device bytes: a relayout is an identity clone.
+    per_core = o.out_elems * o.dtype_bytes / cores
+    run_bytes = o.relayout_run_elems * o.dtype_bytes
+    split = min(p.relayout_split_max, max(p.relayout_split_min, o.relayout_split))
+    runs = per_core / run_bytes
     return (
         runs * (p.relayout_run_a_ns + p.relayout_run_b_ns * math.log2(split))
         + per_core * split / p.relayout_span_gbps
@@ -1432,19 +1423,133 @@ def _replicated_operand_reads(ops: list, p: "CostParams") -> tuple:
     return total_bytes, ns
 
 
+def _decode_delivery_price(weight_bytes, p: "CostParams"):
+    """A decode weight's delivery price as a functor of the work division: an
+    implemented function (``sympy.utilities.lambdify.implemented_function``) of the
+    op's M split, K split and core count whose ``_imp_`` is the ns to stream
+    ``weight_bytes`` at the delivery rate of that ``(m, k, cores)`` beyond their
+    time at the peak, clamped at zero and rounded to an integer.
+
+    As a Piecewise over the splits the price took ~30 s to rewrite and lower per
+    matmul; as a functor each engine evaluates it at the divisions it considers:
+    CP-SAT calls it once per candidate of the owning buffer to build one
+    ``element`` lookup (``_SympyExprToCpSat._print_AppliedUndef``), ``lambdify``
+    and ``evalf`` call it at the chosen splits. Named by its two parameters, so
+    equal functors compare (and cache) equal."""
+
+    def price(m, k, cores):
+        bw = _decode_weight_delivery_gbps(round(cores), round(m), round(k))
+        return int(round(weight_bytes * max(0.0, 1.0 / bw - 1.0 / p.bw_peak_gbps)))
+
+    # lambdify prints the name as a Python identifier.
+    tag = regex.sub(r"\W", "_", f"{weight_bytes}_{p.bw_peak_gbps!r}")
+    name = f"decode_delivery_price_{tag}"
+    return implemented_function(
+        sympy.Function(name, integer=True, nonnegative=True), price
+    )
+
+
+def _decode_weight(op) -> tuple | None:
+    """``(arg, rows)`` for a matmul's shared 2D weight reused over 2..32 rows.
+
+    That is the small-M decode projection ``work_division._decode_weight_delivery_us``
+    was measured on. The extractor's A/B byte counts exclude batch, while MACs
+    and output elements include it. Require one K*N weight slice, then check
+    K*N = (A / rows) * (out / rows), with rows = MACs / weight elements. Together
+    these exclude both per-batch weights and shared weights under B > 1.
+    Symbolic or unknown counts do not qualify."""
+    if (
+        not op.is_matmul
+        or op.dtype_bytes != 2  # the sweep measured fp16 weights only
+        or _is_sym(op.matmul_macs, op.out_elems, op.matmul_a_bytes, op.matmul_b_bytes)
+        or op.matmul_b_bytes <= 0
+    ):
+        return None
+    a_elems = op.matmul_a_bytes / max(1, op.dtype_bytes)
+    b_elems = op.matmul_b_bytes / op.dtype_bytes
+    for arg in op.args:
+        if arg.role != "input" or _is_sym(arg.elems) or arg.elems <= 0:
+            continue
+        # A per-batch [B,K,N] input has B times this footprint. Its extra batch
+        # factor otherwise cancels against the batch-inclusive MAC/output counts.
+        if abs(arg.elems - b_elems) > 0.05 * b_elems:
+            continue
+        rows = round(op.matmul_macs / arg.elems)
+        if not 1 < rows <= _DECODE_MAX_ROWS:
+            continue
+        shared_elems = (a_elems / rows) * (op.out_elems / rows)
+        if abs(shared_elems - arg.elems) <= 0.05 * arg.elems:
+            return arg, rows
+    return None
+
+
+def _decode_weight_delivery_excess(ops: list, p: "CostParams"):
+    """Extra time for a decode projection to stream its shared weight.
+
+    The base memory term charges the weight's bytes B at the shared peak. Under a
+    split, ``m`` cores splitting M share each slice and the ``n * k`` distinct
+    slices stream in parallel; the measured rate is
+    ``work_division._decode_weight_delivery_gbps(cores, m, k)``. Add B at that rate
+    minus B at the peak, clamped at zero, so the co-optimizer prices the split the
+    way the work-division planner ranks it. It replaces the cohort excess of
+    ``_shared_operand_read_excess`` for this arg. Scope as ``_decode_weight``;
+    single-pass bundles only, as for ``_partitioned_operand_read_excess``.
+
+    Under symbolic splits the price is a functor of the work division
+    (``_decode_delivery_price``), gated by residency; the engine evaluates it at
+    the op's candidate divisions. Resident weights pay nothing."""
+    if not all(_is_single_pass(op) for op in ops):
+        return 0.0
+    total = 0.0
+    external: dict[str, float | sympy.Expr] = {}
+    for op in ops:
+        found = _decode_weight(op)
+        if found is None:
+            continue
+        arg, rows = found
+        # Single-pass decode weights have loop_factor == 1. With replication
+        # removed, b == full * (1 - is_lx); the symbolic path applies this
+        # residency gate outside the division-price functor.
+        b = dataclasses.replace(arg, replication=1).hbm_elems() * op.dtype_bytes
+        full = arg.elems * arg.loop_factor * op.dtype_bytes
+        m_split, k_split, cores = op.matmul_m_split, op.reduction_cores, op.cores
+
+        def per_byte(m, k, c):
+            bw = _decode_weight_delivery_gbps(c, m, k)
+            return max(0.0, 1.0 / bw - 1.0 / p.bw_peak_gbps)
+
+        if not _is_sym(m_split, k_split, cores):
+            excess = b * per_byte(m_split, k_split, cores)
+        else:
+            is_lx = int(arg.is_lx) if isinstance(arg.is_lx, bool) else arg.is_lx
+            price = _decode_delivery_price(full, p)
+            excess = (1 - is_lx) * price(m_split, k_split, cores)
+        if arg.is_graph_boundary:
+            external[arg.name] = (
+                max(external[arg.name], excess) if arg.name in external else excess
+            )
+        else:
+            total += excess
+    return total + sum(external.values())
+
+
 def _shared_operand_read_excess(ops: list, p: "CostParams"):
     """Extra delivery time for a shared HBM load, beyond its one base read.
 
     Keep physical bytes unchanged and price each operand's own consumer degree.
     Resident operands vanish through hbm_elems; boundary clone loads stay separate.
+    A small-M decode weight is priced by ``_decode_weight_delivery_excess`` instead.
     """
     total = 0
     external: dict[str, float | sympy.Expr] = {}
     for op in ops:
         if not op.is_matmul:
             continue
+        decode = _decode_weight(op) if all(_is_single_pass(o) for o in ops) else None
         for arg in op.args:
             if arg.role != "input" or not arg.broadcast or arg.replication == 1:
+                continue
+            if decode is not None and arg is decode[0]:
                 continue
             excess = (
                 arg.hbm_elems()
@@ -2696,6 +2801,7 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
         + rep_ns
         + _shared_operand_read_excess(ops, p)
         + _partitioned_operand_read_excess(ops, p)
+        + _decode_weight_delivery_excess(ops, p)
     )
     # NOTE: a multi-op dependent chain (e.g. add3/add4 = chained binary adds) runs
     # slower than its byte count because the intermediate is written then read back
@@ -2778,8 +2884,7 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
     # allocator's half-tick lifetime scheme depends on exactly that) -- so it ADDS to
     # the kernel time rather than overlapping, and sits OUTSIDE the compute/memory
     # overlap term below. Measured directly: fusing never recovers it (fused total
-    # == unfused sum +/- 2%), and it costs its full time beside a 223 us bmm exactly
-    # as beside a 25 us relu, so it does not hide behind PT-array work either. See
+    # == unfused sum +/- 2%), so it does not hide behind PT-array work either. See
     # relayout_ns() and the CostParams note for the fitted law and its validity range.
     rel_ns = sum(relayout_ns(o, p) for o in ops)
     # INPUT CLONE-IN: the clone of a resident graph input is likewise its own DSC, a
@@ -3087,6 +3192,12 @@ def explain(ops: list, params: CostParams | None = None) -> str:
             f"     partitioned-read core limit: +{partitioned_extra / 1000:.2f} us "
             f"({p.mm_partitioned_read_gbps_per_core:g} GB/s per reading core; "
             "before compute overlap)"
+        )
+    decode_extra = _decode_weight_delivery_excess(ops, p)
+    if decode_extra:
+        lines.append(
+            f"     decode weight delivery: +{decode_extra / 1000:.2f} us "
+            "(shared-weight split rate, before compute overlap)"
         )
     batch_split_extra = (
         0.0 if p.use_bundled_cost_model else _matmul_batch_split_ns(ops, p)

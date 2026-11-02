@@ -68,11 +68,14 @@ from oot_framework.oot_test_utilities import (
     _get_privateuse1_device_type,
     _log_warning,
     _log_error,
+    _platform_excluded,
+    _platform_tags,
     _regex_entries_for_name,
     _build_test_entry_map,
     _select_entry_by_op_index,
     _select_entry_for_variant,
     _extract_op_name_from_method,
+    _OOT_PLATFORM_ARCH,
 )
 
 warnings.filterwarnings("ignore", category=pytest.PytestUnknownMarkWarning)
@@ -456,6 +459,12 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
             ):
                 return False, f"Excluded by TEST_TYPE={test_type!r}", False, False
 
+        # Per-entry platform exclusion -- an entry tagged exclude__plat_<arch> is
+        # disabled only on that arch, even when other entries share this file
+        # (e.g. a merged multi-model run on Power).
+        if entry is not None and _platform_excluded(entry):
+            return False, f"Excluded on platform {_OOT_PLATFORM_ARCH!r}", False, False
+
         # dtype filtering — extract dtype from method_name and check against supported
         dtype_str = extract_dtype_from_name(method_name)
 
@@ -760,6 +769,15 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
                         method_name,
                         cls.GLOBAL_SUPPORTED_DTYPES,
                     )
+                # A later YAML block tagged platform__<arch> (e.g. s390x /
+                # ppc64le xfail) must override the untagged mandatory_success
+                # sibling. Dtype matching alone keeps the first entry and the
+                # extra xfail never applies (#3902).
+                current_plat = f"platform__{_OOT_PLATFORM_ARCH}"
+                for _pe in all_entries_for_name:
+                    if current_plat in _platform_tags(_pe):
+                        resolved_entry = _pe
+                        break
 
             # Tags for this specific variant = tags from the resolved entry only
             variant_tags: List[str] = (

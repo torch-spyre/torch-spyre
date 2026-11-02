@@ -134,3 +134,5 @@ runs:
         path: ${{ inputs.output-file }}
         if-no-files-found: error
         retention-days: 14
+        # integration-tests' upstream leg calls _test_matrix again in the same run; on the prebaked path it derives the same identity.
+        overwrite: true
