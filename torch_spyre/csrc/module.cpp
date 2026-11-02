@@ -539,6 +539,9 @@ PYBIND11_MODULE(_C, m) {
            [](const spyre::SpyreTensorLayout& c) { return c.toString(); })
       .def("elems_per_stick", &spyre::SpyreTensorLayout::elems_per_stick)
       .def(py::self == py::self)
+      .def("equals_ignoring_valid_elements",
+           &spyre::SpyreTensorLayout::equals_ignoring_valid_elements,
+           py::arg("other"))
       .def("__hash__",
            [](const spyre::SpyreTensorLayout& c) {
              return std::hash<spyre::SpyreTensorLayout>{}(c);
