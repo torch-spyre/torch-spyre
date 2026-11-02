@@ -427,7 +427,10 @@ need a new allocation and a new layout, and a compiled graph would see a layout
 change and recompile.
 
 The `dynamic=` argument of `to()` avoids this by reserving the device buffer at
-the **maximum** size of its first dimension, up front:
+the **maximum** size of its first dimension, up front. This is the allocation
+half of dynamic-shape support: it keeps the buffer and the device layout fixed
+across sizes. Compiled kernels do not yet follow the current size (see
+Restrictions below).
 
 ```
 import torch
@@ -453,8 +456,7 @@ is resized.
 
 #### Resizing
 
-A reserved tensor is resized in place with `resize_`. In normal use the compiled
-graph does this for you; calling it directly shows the rules:
+A reserved tensor is resized in place with `resize_`:
 
 ```
 y.resize_((140, 1024))  # fine: within [70, 630] and a multiple of 70
@@ -475,6 +477,7 @@ stay the same, otherwise `resize_` raises.
   call before compiling, not inside a compiled function. It cannot be combined
   with `device_layout=`. `dtype=` is honoured (the conversion happens on the
   host before the transfer); a non-default `memory_format` is rejected.
+  `non_blocking=True` is accepted, but the transfer is always synchronous.
 - Only dimension 0, the outermost dimension, can be reserved, and only one
   dimension per tensor. Negative dimensions are accepted if they resolve to
   dimension 0 (`-2` on a 2-D tensor). Reserving any other dimension raises an
@@ -486,9 +489,7 @@ stay the same, otherwise `resize_` raises.
   integers, `min <= max`, and `max` is a multiple of `granularity`.
 - `min` must be at least `min_reserved_dim_size` (default 8), and
   `max / granularity` (the number of buckets) must not exceed `max_buckets`
-  (default 32). Both live in `torch_spyre/_inductor/config.py`. Each bucket adds
-  a small host-side correction on every dispatch, which is why the count is
-  capped.
+  (default 32). Both live in `torch_spyre/_inductor/config.py`.
 - The tensor's current size in the reserved dimension must itself be within
   `[min, max]` and a multiple of `granularity`.
 - **Compiled graphs do not yet follow the current size.** The reservation keeps

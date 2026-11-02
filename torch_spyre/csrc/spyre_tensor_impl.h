@@ -351,10 +351,10 @@ std::vector<int64_t> get_spyre_tensor_strides(const at::Tensor& tensor);
  * module.cpp does the dict-of-strings conversion for the Python side.
  *
  * Unlike the accessors above, this never throws: it returns nullopt for a
- * non-Spyre tensor instead of requiring the caller to check first. It is
- * called from the compiler's lowering pass over every graph input of every
- * compile, Spyre or not, so a throw here would turn an ordinary CPU input
- * into a compile crash.
+ * non-Spyre tensor instead of requiring the caller to check first. It has no
+ * caller in the compiler yet. It is written to be safe to call from a pass
+ * that visits every graph input of every compile, Spyre or not, where a throw
+ * would turn an ordinary CPU input into a compile crash.
  */
 std::optional<std::map<int64_t, ReservedDimInfo>> get_reserved_dims(
     const at::Tensor& tensor);

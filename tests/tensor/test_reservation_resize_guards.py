@@ -28,7 +28,11 @@ import torch
 from torch.testing._internal.common_utils import run_tests, TestCase
 
 import torch_spyre  # noqa: F401
-from torch_spyre._C import get_reserved_dims, get_spyre_tensor_layout
+from torch_spyre._C import (
+    get_device_size_in_bytes,
+    get_reserved_dims,
+    get_spyre_tensor_layout,
+)
 
 DEVICE = torch.device("spyre")
 
@@ -50,9 +54,12 @@ class TestReservationResizeGuard(TestCase):
         # device_size[0] at allocation time is DIM_MAX, so storage bytes
         # reflect the ceiling, not the 560 rows actually copied in.
         expected_min_bytes = DIM_MAX * 1024 * self.x_dev.element_size()
-        self.assertGreaterEqual(
-            self.x_dev.untyped_storage().nbytes(), expected_min_bytes
-        )
+        nbytes = self.x_dev.untyped_storage().nbytes()
+        self.assertGreaterEqual(nbytes, expected_min_bytes)
+        # Upper bound: storage is no larger than the device layout at the
+        # ceiling needs, so the reservation is not silently over-allocated.
+        layout = get_spyre_tensor_layout(self.x_dev)
+        self.assertLessEqual(nbytes, get_device_size_in_bytes(layout))
 
     def test_logical_size_stays_real(self) -> None:
         # The split this whole feature depends on: the buffer is padded,

@@ -49,13 +49,12 @@ def _parse_dynamic_spec(dynamic, size) -> _DynamicSpec:
     tensor.to("spyre", dynamic={0: {"min": 32, "max": 576, "granularity":
     16}}): reserve the destination buffer at `max` along `dim` instead of
     the current (warmup) shape, so a later in-place resize up to `max`
-    (done by the compiled graph via aten::resize_ / spyre_resize_) never
-    reallocates and never changes the SpyreTensorLayout the recompile
-    guard compares against. Scope for now: exactly one dim, and it must be
-    dim 0 (the native allocator rejects any other) -- reserving other or
-    several dims is a later layer. `granularity` is
-    optional; omitting it means "no step restriction" (equivalent to
-    granularity=1).
+    (via aten::resize_ / spyre_resize_) never reallocates and never
+    changes the SpyreTensorLayout the recompile guard compares against.
+    Scope for now: exactly one dim, and it must be dim 0 (the native
+    allocator rejects any other) -- reserving other or several dims is a
+    later layer. `granularity` is optional; omitting it means "no step
+    restriction" (equivalent to granularity=1).
 
     A pure function of its arguments -- no device, no real tensor beyond
     its size -- so it can be unit-tested without hardware.
@@ -72,6 +71,12 @@ def _parse_dynamic_spec(dynamic, size) -> _DynamicSpec:
     # bool is a subclass of int, so True would otherwise pass as dim=1.
     if not isinstance(dim, int) or isinstance(dim, bool):
         raise ValueError(f"dynamic={{...}}: dim={dim!r} must be an int")
+
+    if not isinstance(spec, dict):
+        raise ValueError(
+            f"dynamic={{{original_dim}: ...}}: expected a dict with min, max and "
+            f"optionally granularity, got {type(spec).__name__}"
+        )
 
     unknown = set(spec) - _DYNAMIC_SPEC_KEYS
     if unknown:
@@ -133,8 +138,7 @@ def _parse_dynamic_spec(dynamic, size) -> _DynamicSpec:
         raise ValueError(
             f"dynamic={{{dim}: ...}}: max={dim_max} / granularity={granularity} = "
             f"{num_buckets} buckets, exceeding the cap of "
-            f"{inductor_config.max_buckets} (each bucket costs roughly 5us of "
-            "host correction on every dispatch)"
+            f"{inductor_config.max_buckets} (config.max_buckets)"
         )
 
     if not (0 <= dim < len(size)):
@@ -163,10 +167,14 @@ def _parse_dynamic_to_args(self, args, kwargs):
     unless this is an eager CPU -> "spyre" transfer. The returned dtype is
     None when the caller didn't ask for a conversion. Parsed with torch's own
     ``.to()`` parser so dtype is honoured whether it is passed positionally or
-    by keyword; options this path can't honour are rejected, not ignored.
+    by keyword. A non-default memory_format is rejected; non_blocking is
+    accepted (the transfer is always synchronous).
     """
     import torch
 
+    # non_blocking is a hint: the transfer below is always synchronous, which
+    # is a valid way to honour non_blocking=True, so it is accepted and
+    # deliberately not forwarded.
     device, dtype, _non_blocking, memory_format = torch._C._nn._parse_to(
         *args, **kwargs
     )
