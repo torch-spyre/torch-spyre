@@ -802,23 +802,47 @@ def test_same_group_coarse_tiled_edge_is_offered_and_priced_per_trip(monkeypatch
     main after confirming the #3810 crash it cited was gone, and the
     invariant genuinely held on main as it stood then; #5057 is what
     deliberately narrows it to the cross-group case covered by
-    test_cross_group_coarse_tiled_edges_are_never_offered above."""
+    test_cross_group_coarse_tiled_edges_are_never_offered above.
+
+    The #5632 follow-up narrows the same-group exception further, to only a
+    matmul consumer fed by a producer whose own work_div hint actually
+    resolved (``has_resolved_work_div_hint``) -- the shape spyre-inference's
+    K/V page gather takes feeding its QK^T/PV matmuls, which is what this
+    exception was actually measured against. That is deliberately one named
+    special case, not a general rule: a pointwise consumer (this test's
+    original graph, plain elementwise ops with no matmul), or a matmul
+    consumer fed by an unhinted producer, no longer qualifies, because
+    pricing either was most of the exception's enumeration cost on the real
+    kernel with none of its own residency benefit. Add special cases here as
+    real ones turn up, generalizing the rule only once several exist -- and
+    re-measure compile time (attn_compile_repro.py, TORCH_SPYRE_TIMING=1)
+    each time this gate is relaxed, the same way #5632 did, since every edge
+    this gate admits is priced whether or not the solver ends up using it."""
+    from torch_spyre._inductor import spyre_hint
     from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 
     tile_size = 128
 
-    def fn(t, u):
+    def fn(t, w):
         def body(_, ops):
-            t_tile, u_tile = ops
-            return None, (torch.abs(t_tile) + u_tile) * 2
+            (t_tile,) = ops
+            # The relayout producer's own work_div hint must resolve
+            # (has_resolved_work_div_hint) -- plain abs(t_tile) under
+            # spyre_hint, named_dims required the same way the real kernel's
+            # K/V gather hint names its own dims (see
+            # page_attn_head_major_prefill.py): work_div can only split a
+            # dim that's already named somewhere in the op's own input
+            # chain. Feeding it into a matmul is what the narrowed gate
+            # requires -- see the docstring above.
+            with spyre_hint(named_dims=["B", "M"], work_div={"B": 2}):
+                abs_tile = torch.abs(t_tile)
+            return None, torch.matmul(abs_tile, w)
 
-        return for_each_tile(body, (t, u), dims=(0, 0), tile_size=tile_size, out_dim=0)[
-            1
-        ]
+        return for_each_tile(body, (t,), dims=(0,), tile_size=tile_size, out_dim=0)[1]
 
     torch.manual_seed(0)
     ha = torch.randn(512, 256, dtype=torch.float16)
-    hb = torch.randn(512, 256, dtype=torch.float16)
+    hw = torch.randn(256, 128, dtype=torch.float16) * 0.05
     loop_trip_count = ha.shape[0] // tile_size
 
     def run_and_collect_candidates():
@@ -838,15 +862,34 @@ def test_same_group_coarse_tiled_edge_is_offered_and_priced_per_trip(monkeypatch
             torch._inductor.codecache.FxGraphCache.clear()
             torch._dynamo.reset()
             a = ha.to("spyre")
-            b = hb.to("spyre")
+            w = hw.to("spyre")
             with config.patch(
                 {
                     "co_optimizing_lx_planning": True,
                     "layout_solver": "cpsat",
                     "lx_same_tile_group_relayout": True,
+                    # This fixture's one hinted edge prices 17 candidates across
+                    # 13 distinct destination-view groups -- over
+                    # lx_solver_relayout_groups_per_edge's default cap of 4.
+                    # _cap_relayout_groups keeps only the cheapest groups past
+                    # that cap, ranked by cost_ns (which carries the very
+                    # loop-trip multiplier this test is isolating) plus the
+                    # consumer's own (trip-count-independent) execution cost --
+                    # so which groups survive the cap can itself depend on the
+                    # trip count, which would make the scaled-vs-unscaled
+                    # comparison below compare different candidate sets instead
+                    # of the same candidates at two different costs. 0 keeps
+                    # every view uncapped (see the config's own docstring),
+                    # the same way test_complete_partition_expansion_fires_and_preserves_values's
+                    # "no_copy" mode uses it to see every candidate the
+                    # enumerator built; safe here since this fixture is one
+                    # small hinted edge, nowhere near the unbounded-enumeration
+                    # scale (5789 copies on the real decode graph) the default
+                    # cap exists to bound.
+                    "lx_solver_relayout_groups_per_edge": 0,
                 }
             ):
-                out = torch.compile(fn, dynamic=False, fullgraph=True)(a, b)
+                out = torch.compile(fn, dynamic=False, fullgraph=True)(a, w)
         candidates = [c for table in tables for cs in table.values() for c in cs]
         return out, candidates
 
@@ -880,8 +923,9 @@ def test_same_group_coarse_tiled_edge_is_offered_and_priced_per_trip(monkeypatch
             f"{unscaled_cost} scaled by the loop trip count ({loop_trip_count})"
         )
 
-    ref = ((torch.abs(ha.float()) + hb.float()) * 2).to(torch.float16)
-    torch.testing.assert_close(out.cpu(), ref, rtol=2**-8, atol=2**-6)
+    ref = torch.matmul(torch.abs(ha.float()), hw.float())
+    # fp16 K=256 accumulation on device vs fp32 reference.
+    torch.testing.assert_close(out.cpu().float(), ref, rtol=2e-2, atol=2e-1)
 
 
 def test_sa_cooptimizer_keeps_its_objective_and_decides_no_relayout(monkeypatch):

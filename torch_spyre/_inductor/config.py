@@ -482,11 +482,17 @@ enable_uniqueness_check: bool = (
 # path (scratchpad/coarse_tiling.py, wsr/coarse_tile.py), so the flag affects
 # any graph with coarse-tiled ops sharing a loop_group_id with their consumer,
 # through either mechanism.
-# This trades a device-runtime boost for a compile-time slow-down. While
-# investigating ways to speed up the compile side (#5609), we leave it off by
-# default for now. Set SPYRE_LX_SAME_TILE_GROUP_RELAYOUT=1 to opt in.
+# solver_relayout_edge_context's own gate (lx_relayout.py) narrows what this
+# flag actually admits to a specific, named case (a matmul consumer fed by a
+# producer whose own work_div hint resolved) rather than every same-group
+# edge, which recovers most of the compile-time cost without losing the
+# device-time win. allocator.py's _division_map further relaxes that
+# producer's own division pin, for a for_each_tile body specifically, so the
+# solver can widen it past the hint's own split when cheaper -- see both
+# functions' own comments for the measured numbers. On by default as of the
+# relaxed pin; set SPYRE_LX_SAME_TILE_GROUP_RELAYOUT=0 to opt out.
 lx_same_tile_group_relayout: bool = (
-    os.environ.get("SPYRE_LX_SAME_TILE_GROUP_RELAYOUT", "0") == "1"
+    os.environ.get("SPYRE_LX_SAME_TILE_GROUP_RELAYOUT", "1") == "1"
 )
 
 # Allow post-solve matmul output staging before an all-reduce's HBM copy.
