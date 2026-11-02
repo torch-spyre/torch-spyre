@@ -241,7 +241,7 @@ BUFFER_RESIDENCY_RULES = (
                 lambda c: c.local_subrange(),
                 (
                     "rollout enabled",
-                    "existing compact materializer",
+                    "compact materializer or certified cache scatter",
                     "storage and lifetime permission",
                     "exact local byte coverage",
                 ),
@@ -423,6 +423,18 @@ TRANSFER_CERTIFICATES = (
         "scatter read; persistent-scatter storage, alias and ordering checks",
         (
             "test_solver_relayout_candidates.py::test_pointwise_scatter_materializer_admission",
+        ),
+        (),
+    ),
+    TransferCertificate(
+        "Direct cache-snapshot subrange read",
+        "torch_spyre._inductor.scratchpad.lx_relayout._local_lx_scatter_geometry",
+        "single-writer complete immutable snapshot; one direct partial read; "
+        "other reads are scatter indices; standard 128-byte sticks; "
+        "zero inner origin and exact rectangle size; external mutation target "
+        "and final same-core ownership checks preserved",
+        (
+            "test_solver_relayout_candidates.py::test_direct_cache_snapshot_scatter_geometry",
         ),
         (),
     ),

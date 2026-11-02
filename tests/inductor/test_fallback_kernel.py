@@ -413,6 +413,9 @@ class TestInGraphCpuComputedBuffers(unittest.TestCase):
             return y_s * 2.0
 
         x = torch.randn(num_tokens, hidden, dtype=DTYPE)
+        # `fn`'s code object is shared across tests; without a reset Dynamo
+        # reuses the first test's compile and the allocator under test never runs.
+        torch.compiler.reset()
         compiled = torch.compile(fn, fullgraph=True, dynamic=False, backend="inductor")
         out = compiled(x.to(spyre))
         test.assertEqual(out.device.type, DEVICE)
@@ -443,6 +446,14 @@ class TestInGraphCpuComputedBuffers(unittest.TestCase):
         """Co-optimizing allocator: `mem_usage_by_buf` runs on the RAW graph in
         `_build_cd_bound_buffers` / `_determine_in_place_division_invariant`,
         bypassing the gate -> exercises the defensive sentinel."""
+        self._run_and_check(self)
+
+    @config.patch(
+        {"co_optimizing_lx_planning": True, "layout_solver": "simulated_annealing"}
+    )
+    def test_cpu_pointwise_chain_compiles_co_optimizing_sa(self):
+        """Co-optimizing allocator over `SaCoOptimizingSolver`, which reaches
+        the footprint accounting by a different route than the greedy case."""
         self._run_and_check(self)
 
 

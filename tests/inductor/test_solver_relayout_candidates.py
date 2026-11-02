@@ -665,8 +665,9 @@ def test_persistent_scatter_requires_independent_immutable_source(
     from types import SimpleNamespace
     from torch_spyre._inductor.scratchpad import utils as scratchpad_utils
 
-    class Input(SimpleNamespace):
-        pass
+    import torch
+    from torch._inductor.ir import FixedLayout, InputBuffer, MutationLayoutSHOULDREMOVE
+    from torch._inductor.virtualized import V
 
     class Pointwise(SimpleNamespace):
         pass
@@ -679,11 +680,17 @@ def test_persistent_scatter_requires_independent_immutable_source(
             return self.indirect
 
     source = SimpleNamespace(layout=Fixed(), get_name=lambda: "value")
-    cache = Input(
-        get_name=lambda: "cache", get_layout=lambda: Fixed(allocation={"hbm": 0})
+    cache = InputBuffer(
+        name="cache",
+        layout=FixedLayout(device=torch.device("cpu"), dtype=torch.float16, size=[64]),
     )
+    mutated = []
+    with V.set_graph_handler(SimpleNamespace(mark_buffer_mutated=mutated.append)):
+        mutation_layout = MutationLayoutSHOULDREMOVE(target=cache)
+    assert mutated == ["cache"]
+    cache.get_layout = lambda: Fixed(allocation={"hbm": 0})
     update = SimpleNamespace(
-        layout=SimpleNamespace(target=cache),
+        layout=mutation_layout,
         data=Pointwise(),
         get_name=lambda: "update",
     )
@@ -732,7 +739,6 @@ def test_persistent_scatter_requires_independent_immutable_source(
             raise NotImplementedError
 
         later.get_inputs_that_alias_output = unknown
-    monkeypatch.setattr(lx_relayout, "InputBuffer", Input)
     monkeypatch.setattr(lx_relayout, "Pointwise", Pointwise)
     monkeypatch.setattr(lx_relayout, "FixedTiledLayout", Fixed)
     monkeypatch.setattr(lx_relayout, "MemoryDep", Dep)
@@ -992,3 +998,121 @@ def test_pointwise_scatter_materializer_admission(monkeypatch, violation):
             assert lx_relayout._persistent_scatter_consumer(
                 graph, source, update, "value"
             ) is (violation is None)
+
+
+@pytest.mark.parametrize(
+    "scheduled,violation",
+    [
+        (False, None),
+        (True, None),
+        (False, "extra_read"),
+        (False, "partial_write"),
+        (True, "unresolved_target"),
+    ],
+)
+def test_direct_cache_snapshot_scatter_geometry(scheduled, violation):
+    """Certify a real snapshot subrange without changing the cache mutation."""
+    import torch
+    from torch._inductor.dependencies import MemoryDep, ReadWrites
+    from torch._inductor.ir import (
+        ComputedBuffer,
+        FixedLayout,
+        InputBuffer,
+        MutationLayoutSHOULDREMOVE,
+        Pointwise,
+        Scatter,
+    )
+    from torch._inductor.sizevars import SizeVarAllocator
+    from torch._inductor.virtualized import V, ops
+    from torch.utils._ordered_set import OrderedSet
+    from torch_spyre._C import ElementArrangement
+    from torch_spyre._inductor.ir import FixedTiledLayout
+
+    row, feature = [
+        Symbol(name, integer=True, nonnegative=True) for name in ("row", "feature")
+    ]
+    indirect = Symbol("tmp0", integer=True)
+    device, dtype = torch.device("cpu"), torch.float16
+    physical = SimpleNamespace(
+        device_size=[2, 4, 64],
+        stride_map=[64, 128, 1],
+        device_dtype=dtype,
+        element_arrangement=ElementArrangement.STANDARD,
+        elems_per_stick=lambda: 64,
+    )
+    layout = FixedTiledLayout(device, dtype, [4, 128], [128, 1], physical)
+    source = ComputedBuffer(
+        name="snapshot",
+        layout=layout,
+        data=Pointwise(
+            device=device,
+            dtype=dtype,
+            inner_fn=lambda idx: ops.load("cache", 128 * idx[0] + idx[1]),
+            ranges=[4, 128],
+        ),
+    )
+    cache = InputBuffer(
+        name="cache", layout=FixedLayout(device, dtype, [4, 128], [128, 1])
+    )
+    indices = InputBuffer(
+        name="indices", layout=FixedLayout(device, torch.int64, [2], [1])
+    )
+    with V.set_graph_handler(SimpleNamespace(mark_buffer_mutated=lambda name: None)):
+        mutation = MutationLayoutSHOULDREMOVE(cache)
+    update = ComputedBuffer(
+        name="update",
+        layout=layout.unallocated_copy() if scheduled else mutation,
+        data=Scatter(
+            device=device,
+            dtype=dtype,
+            ranges=[2, 128],
+            inner_fn=lambda idx: ops.load("snapshot", 128 * (idx[0] + 1) + idx[1]),
+            output_indexer=lambda idx: [
+                ops.indirect_indexing(ops.load("indices", idx[0]), 4, check=False),
+                idx[1],
+            ],
+        ),
+    )
+
+    def dependencies(reads, write):
+        return ReadWrites(OrderedSet(reads), OrderedSet([write]), OrderedSet())
+
+    written_rows = 3 if violation == "partial_write" else 4
+    source.get_read_writes = lambda: dependencies(
+        [MemoryDep("cache", 128 * row + feature, (row, feature), (4, 128))],
+        MemoryDep("snapshot", 128 * row + feature, (row, feature), (written_rows, 128)),
+    )
+    reads = [
+        MemoryDep("snapshot", 128 * (row + 1) + feature, (row, feature), (2, 128)),
+        MemoryDep("indices", row, (row,), (2,)),
+    ]
+    if violation == "extra_read":
+        reads.append(MemoryDep("other_tensor", row, (row,), (2,)))
+    update.get_read_writes = lambda: dependencies(
+        reads, MemoryDep("update", 128 * indirect + feature, (row, feature), (2, 128))
+    )
+    buffers = {op.get_name(): op for op in (source, update, cache, indices)}
+    graph = SimpleNamespace(
+        sizevars=SizeVarAllocator(),
+        operations=[source, update],
+        graph_inputs={"cache": cache, "indices": indices},
+        get_buffer=buffers.__getitem__,
+        try_get_buffer=buffers.get,
+        get_output_names=lambda: [],
+        scheduler=SimpleNamespace(
+            mutation_real_name={
+                "update": "missing" if violation == "unresolved_target" else "cache"
+            }
+        ),
+    )
+    with V.set_graph_handler(graph):
+        if scheduled:
+            assert not update.get_mutation_names()
+        assert lx_relayout._persistent_scatter_storage_safe(
+            graph, source, update, "snapshot"
+        ) is (violation != "unresolved_target")
+        assert lx_relayout._local_lx_scatter_geometry(graph, source, update) == (
+            ((0, 1, 0), (2, 2, 64)) if violation is None else None
+        )
+        assert update.get_read_writes().reads == OrderedSet(reads)
+        assert graph.operations == [source, update]
