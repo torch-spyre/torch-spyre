@@ -97,6 +97,7 @@ from .pass_utils import (
     is_topk,
     iter_var_id,
     rescale_stl_for_dtype,
+    sparse_layout_serves_read,
 )
 from .optimize_restickify import AllSameNode, AnyInNode, FixedInOutNode
 from .views import compute_coordinates, matching_dim
@@ -521,6 +522,12 @@ def _qfp8wt_stl(
     )
 
 
+def _host_sparse_output(c_size, c_stride, dtype) -> SpyreTensorLayout:
+    """The output layout of an op reading a sparse input: its own host dims in
+    order, the stick on a new size-1 dim (one element per stick)."""
+    return SpyreTensorLayout(c_size, c_stride, dtype, list(range(len(c_size))) + [-1])
+
+
 def _reduction_layout(
     op: Operation,
     output: FixedLayout,
@@ -543,16 +550,19 @@ def _reduction_layout(
     )
     stick_size = get_elem_in_stick(out_dtype_for_layout)
 
+    c_size = [concretize_expr(s) for s in output.size]
+    c_stride = [concretize_expr(s) for s in output.stride]
+
     x_dev_coords = try_device_coordinates(stl, dep, None)
     if x_dev_coords is None:
+        if sparse_layout_serves_read(stl, in_layout, dep) is not None:
+            # As for a pointwise op below.
+            return [_host_sparse_output(c_size, c_stride, out_dtype_for_layout)]
         return []
     x_stick_expr = x_dev_coords[-1]
     reduction_var = next(
         iter(dep.index.free_symbols - output_dep.index.free_symbols), None
     )
-
-    c_size = [concretize_expr(s) for s in output.size]
-    c_stride = [concretize_expr(s) for s in output.stride]
 
     # Do not preserve the input layout for reduction ops listed in
     # REDUCTIONS_NON_STICK_DIM_ONLY when reducing along the stick
@@ -747,6 +757,11 @@ def _default_pointwise_layout(
     c_stride = [concretize_expr(s) for s in output.stride]
     in_device_coords = try_device_coordinates(stl, dep, None)
     if in_device_coords is None:
+        if sparse_layout_serves_read(stl, in_layout, dep) is not None:
+            # A read the input's layout cannot serve (flattening [8, 65] into
+            # [520] splits a stick): compute_restickify_needed moves the input to
+            # its sparse layout, and the output is sparse on its own host dims.
+            return [_host_sparse_output(c_size, c_stride, out_dtype_for_layout)]
         return []
     stick_expr = in_device_coords[-1]
     stick_exprs = _compatible_output_stick_exprs(stick_expr, out_coords, dep)
