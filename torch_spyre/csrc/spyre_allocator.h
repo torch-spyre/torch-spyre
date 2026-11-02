@@ -17,6 +17,7 @@
 
 #include <c10/core/CachingDeviceAllocator.h>
 #include <c10/core/Device.h>
+#include <c10/core/ScalarType.h>
 #include <c10/core/Stream.h>
 
 #include <flex/flex.hpp>
@@ -32,16 +33,19 @@ namespace spyre {
 // SharedOwnerCtx below. Forward-declared so the ctx can point back at it.
 struct ShardViewCtx;
 
-// Sharding of a tensor's storage: shard i lives in the chunk whose
-// segment-emulated placement has logical_chunk_id == i, encoded in that
-// shard's own device layout (shard_device_bytes). Address-free.
+// Sharding of a tensor's storage: shard i (the i-th equal slice along
+// shard_dim) lives in that shard's own allocation, encoded in the
+// shard-local device layout (shard_device_bytes). Address-free.
 struct ShardedStorageInfo {
   int64_t shard_dim;
   uint32_t num_shards;
   uint64_t shard_device_bytes;
-  // Shape the storage was allocated for; the copy path checks tensor
-  // metadata against it. Filled in by spyre_empty_sharded.
+  // Shape and dtype the storage was allocated for; the copy path checks
+  // tensor metadata against them. Filled in by spyre_empty_sharded; the
+  // dtype default makes a future caller that forgets to set it fail the
+  // copy check instead of reading an indeterminate value.
   std::vector<int64_t> global_shape;
+  c10::ScalarType dtype = c10::ScalarType::Undefined;
 };
 
 struct SharedOwnerCtx {

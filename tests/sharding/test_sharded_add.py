@@ -17,11 +17,10 @@
 Core c reads and writes only chunk c through its own start address.
 
 The device tests need ``SENCORES`` in (8, 16) and a Flex device mode that
-admits sharded allocations (``FLEX_DEVICE=EMUL1p5``, or ``FLEX_DEVICE=VF``
-with ``FLEX_VF_ADMIT_SHARDED_ALLOCATIONS=1``), both fixed at process start.
-``test_device_suite_in_emulation_shape`` runs this file in a subprocess for
-each shape and mode, so a plain ``pytest`` run (and CI) covers all of them;
-the per-shape tests skip in a process without that environment.
+admits sharded allocations (``FLEX_DEVICE=EMUL1p5``), fixed at process
+start. ``test_device_suite_in_emulation_shape`` runs this file in a
+subprocess for each shape, so a plain ``pytest`` run (and CI) covers all of
+them; the per-shape tests skip in a process without that environment.
 
 Results are compared with the same add on unsharded device tensors. A CPU
 comparison is not exact: fp16 goes through the device fp16 format (L9), and
@@ -60,17 +59,16 @@ def _num_shards() -> int:
 _requires_emulation = pytest.mark.skipif(
     not emulation_ready(),
     reason="needs SENCORES in (8, 16) and a sharded-admitting Flex device mode "
-    "(FLEX_DEVICE=EMUL1p5, or VF with FLEX_VF_ADMIT_SHARDED_ALLOCATIONS=1) at "
+    "(FLEX_DEVICE=EMUL1p5) at "
     "process start; test_device_suite_in_emulation_shape runs these in that shape",
 )
 
 
-# Both Flex device modes that admit sharded allocations (the scheduler
-# factory routes them to the same multi-chunk scheduler): the EMUL1p5 device
-# always admits, a plain VF device only with the opt-in flag.
+# The Flex device mode that admits sharded allocations (the scheduler
+# factory routes it to the multi-chunk scheduler): the EMUL1p5 device
+# always admits.
 _DEVICE_MODES = {
     "EMUL1p5": {"FLEX_DEVICE": "EMUL1p5"},
-    "VF": {"FLEX_DEVICE": "VF", "FLEX_VF_ADMIT_SHARDED_ALLOCATIONS": "1"},
 }
 
 
@@ -94,7 +92,7 @@ def test_device_suite_in_emulation_shape(mode, shards, tmp_path):
     env.update(_DEVICE_MODES[mode])
     env.pop("PYTEST_ADDOPTS", None)
     # A device being present is not enough: the mode must be able to open it
-    # (a PF-only host has no VFs, so EMUL1p5/VF children die opening the PCI
+    # (a PF-only host has no VFs, so EMUL1p5 children die opening the PCI
     # path). Probe in a throwaway process and skip rather than fail there.
     usable, reason = mode_usable(_DEVICE_MODES[mode], shards)
     if not usable:
@@ -261,6 +259,55 @@ def test_compiled_add_runs_one_shard_per_core(launched, shape_per_shard, dim, dt
     assert torch.spyre.is_sharded(c)
     info = torch.spyre.sharding_info(c)
     assert info.placement == Shard(dim) and info.num_shards == n
+    expected = (a_cpu.to("spyre") + b_cpu.to("spyre")).cpu()
+    assert torch.equal(c.cpu(), expected)
+
+
+@_requires_emulation
+@pytest.mark.parametrize(
+    "op,num_args",
+    [(lambda x, y: x * y, 2), (lambda x: torch.abs(x), 1)],
+)
+def test_compiled_pointwise_ops_run_one_shard_per_core(launched, op, num_args):
+    """The admission check is on the op kind, not on add specifically.
+
+    One binary and one unary representative; the doc promises any
+    same-shape pointwise op.
+    """
+
+    n = _num_shards()
+    torch.manual_seed(0)
+    a_cpu = torch.randn(4 * n, 64, dtype=torch.float16)
+    b_cpu = torch.randn(4 * n, 64, dtype=torch.float16)
+    a, b = _sharded(a_cpu, 0, n), _sharded(b_cpu, 0, n)
+
+    args = (a, b) if num_args == 2 else (a,)
+    c = torch.compile(op, dynamic=False)(*args)
+    _assert_one_non_unified_kernel(launched, n, num_tensors=num_args + 1)
+
+    assert torch.spyre.is_sharded(c)
+    ref_args = (
+        (a_cpu.to("spyre"), b_cpu.to("spyre"))
+        if num_args == 2
+        else (a_cpu.to("spyre"),)
+    )
+    expected = torch.compile(op, dynamic=False)(*ref_args).cpu()
+    assert torch.equal(c.cpu(), expected)
+
+
+@_requires_emulation
+def test_eager_add_on_sharded_inputs():
+    """The eager path also computes sharded add correctly (no torch.compile)."""
+
+    n = _num_shards()
+    torch.manual_seed(3)
+    a_cpu = torch.randn(4 * n, 64, dtype=torch.float16)
+    b_cpu = torch.randn(4 * n, 64, dtype=torch.float16)
+    a, b = _sharded(a_cpu, 0, n), _sharded(b_cpu, 0, n)
+
+    c = a + b
+
+    assert torch.spyre.is_sharded(c)
     expected = (a_cpu.to("spyre") + b_cpu.to("spyre")).cpu()
     assert torch.equal(c.cpu(), expected)
 
@@ -611,6 +658,28 @@ def test_dtype_casting_copy_fails_closed():
 
     with pytest.raises(RuntimeError, match="without a dtype change"):
         a.to("cpu", torch.float32)
+
+
+@_requires_emulation
+@expects_raise
+def test_dtype_view_of_sharded_fails_closed():
+    """A same-size view(dtype) must not reach the copy path.
+
+    view(dtype) is CompositeExplicitAutograd and never passes through
+    check_sharded_view; the fp16 -> bf16 view keeps sizes, strides and
+    offset, so it looks like an identity view, but its dtype disagrees
+    with the recorded shard layout. TODO: reject at construction instead
+    of at copy time.
+    """
+
+    n = _num_shards()
+    torch.manual_seed(0)
+    a = _sharded(torch.randn(4 * n, 64, dtype=torch.float16), 0, n)
+
+    with pytest.raises(
+        RuntimeError, match="dtype no longer matches the sharded allocation"
+    ):
+        a.view(torch.bfloat16).cpu()
 
 
 @_requires_emulation

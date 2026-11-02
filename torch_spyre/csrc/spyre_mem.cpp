@@ -1114,6 +1114,7 @@ at::Tensor spyre_empty_sharded(c10::IntArrayRef size, c10::ScalarType dtype,
       shard_dim, static_cast<uint32_t>(num_shards), shard_device_bytes);
   static_cast<SharedOwnerCtx*>(data_ptr.get_context())->sharding->global_shape =
       size.vec();
+  static_cast<SharedOwnerCtx*>(data_ptr.get_context())->sharding->dtype = dtype;
   const size_t total_bytes =
       static_cast<SharedOwnerCtx*>(data_ptr.get_context())
           ->composite_addr.total_size();
@@ -1275,6 +1276,13 @@ void copy_sharded(const at::Tensor& self, const at::Tensor& dst) {
               "sharded Spyre tensors only support whole-tensor copies: tensor "
               "metadata no longer matches the sharded allocation (",
               sharded.sizes(), " vs ", info.global_shape, ")");
+  // A same-size view(dtype) passes the identity view check but leaves a
+  // tensor whose dtype disagrees with the recorded shard layout; reject it
+  // before the copy misinterprets the bytes.
+  TORCH_CHECK(sharded.scalar_type() == info.dtype,
+              "sharded Spyre tensors only support whole-tensor copies: tensor "
+              "dtype no longer matches the sharded allocation (",
+              sharded.scalar_type(), " vs ", info.dtype, ")");
   const int64_t extent = sharded.size(info.shard_dim) / info.num_shards;
 
   SpyreStream stream = getCurrentStream(sharded.device());

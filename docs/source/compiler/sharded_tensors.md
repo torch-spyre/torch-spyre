@@ -44,14 +44,18 @@ everything outside it fails at compile time with a specific message:
 * Shard-local strides must equal the global ones (DeepTools strides each
   core's tiles from the global shape): the shard boundary must fall on
   whole sticks for a last-dim shard, exactly one (the shard) dim may be
-  divided, and rows may not span multiple sticks — a 32×128 fp16
-  `Shard(0)` tensor fails because the second stick of every row would go
-  unwritten (`_check_local_strides` in `sharded_hbm.py`).
+  divided, and for a shard on a non-last dim rows may not span multiple
+  sticks — a 32×128 fp16 `Shard(0)` tensor fails because the second stick
+  of every row would go unwritten (`_check_local_strides` in
+  `sharded_hbm.py`).
 * Static shapes only (`dynamic=False`), one dtype across operands and
-  output, `BUNDLE_SYMBOLIC_ARGS=1` (each core's start address is a bundle
-  `input_arg`), and each input must be a base tensor carrying its
-  shard-local `SpyreTensorLayout` (a tiled kernel argument whose layout is
-  not the shard-local one is rejected).
+  output, and `BUNDLE_SYMBOLIC_ARGS=1` (each core's start address is a
+  bundle `input_arg`).
+* Each sharded input must be a base tensor (`check_sharded_input` in
+  `sharded_hbm.py`) whose kernel-argument layout is the shard-local
+  `SpyreTensorLayout`, and the committed device layout must be the default
+  global one — a restickified or otherwise relaid tensor cannot use chunk
+  addressing (`_non_unified_shard_bytes` in `spyre_kernel.py`).
 * Sharded intermediates and in-place writes into sharded storage are
   rejected — only graph inputs and outputs may be sharded.
 
@@ -318,11 +322,10 @@ load-bearing contracts, and where they are pinned:
 
 `test_sharded_add.py` needs a device or the emulation shape (`SENCORES`
 in (8, 16) and a Flex device mode that admits sharded allocations —
-`FLEX_DEVICE=EMUL1p5`, or `FLEX_DEVICE=VF` with
-`FLEX_VF_ADMIT_SHARDED_ALLOCATIONS=1` — at process start);
-`test_device_suite_in_emulation_shape` re-runs the file in each shape and
-mode via a child pytest. Both modes open the card through the VF PCI path,
-so the wrapper probes the mode in a throwaway process first and skips with
+`FLEX_DEVICE=EMUL1p5` — at process start);
+`test_device_suite_in_emulation_shape` re-runs the file in each shape via
+a child pytest. The mode opens the card through the VF PCI path, so the
+wrapper probes it in a throwaway process first and skips with
 the underlying error on a host that cannot back it. Each test file must be
 listed in a config under `tests/configs/torch_spyre_tests/sharding/` (see
 `tests/scripts/check_test_coverage.sh`).

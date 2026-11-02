@@ -16,8 +16,7 @@
 
 A device test in this suite needs Flex to admit sharded allocations:
 ``SENCORES`` in (8, 16) plus a device mode that routes to the multi-chunk
-scheduler (``FLEX_DEVICE=EMUL1p5``, or ``FLEX_DEVICE=VF`` with
-``FLEX_VF_ADMIT_SHARDED_ALLOCATIONS=1``) — mirroring flex's
+scheduler (``FLEX_DEVICE=EMUL1p5``) — mirroring flex's
 ``admitsShardedAllocations()``. Both are fixed at process start, so the
 check is only meaningful in a process launched with that environment (see
 ``test_sharded_add.test_device_suite_in_emulation_shape``).
@@ -88,13 +87,8 @@ def num_shards() -> int:
 
 def device_mode_admits_sharded() -> bool:
     # Mirror of flex's admitsShardedAllocations() (runtime_scheduler_factory):
-    # EMUL1p5 always admits; VF only with the opt-in flag; anything else no.
-    device = os.environ.get("FLEX_DEVICE")
-    if device == "EMUL1p5":
-        return True
-    return device == "VF" and os.environ.get(
-        "FLEX_VF_ADMIT_SHARDED_ALLOCATIONS", ""
-    ).lower() in ("1", "true", "on")
+    # the EMUL1p5 device always admits; anything else no.
+    return os.environ.get("FLEX_DEVICE") == "EMUL1p5"
 
 
 def emulation_ready() -> bool:
