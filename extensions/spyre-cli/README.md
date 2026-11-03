@@ -33,9 +33,9 @@ a = torch.ones([512, 1024], device="spyre", dtype=torch.float16)
 b = torch.ones([512, 1024], device="spyre", dtype=torch.float16)
 c = torch.empty([512, 1024], device="spyre", dtype=torch.float16)
 
-spyre_cli.launch(a, b, c)
+runner = spyre_cli.launch(a, b, c)
 
-print(c)
+print(c.cpu())
 ```
 
 However, you have the following constraints:

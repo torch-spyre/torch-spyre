@@ -23,6 +23,75 @@ The explorer avoids that. It reads the structure directly from the code
 with Python's `ast` module at build time, so the graph shows the current
 code rather than a description of it.
 
+## How to read each view
+
+Every view uses the same grammar: nodes are things, edges are the relationship
+between them, and each edge is labeled with its relationship name. A node's
+color encodes its type, and the legend above the graph lists the colors for the
+current view. The four views below each have one worked example.
+
+### Operations
+
+:::{figure} ../_static/images/decomposition-chain.svg
+:alt: aten.bitwise_and has a decomposed_by edge to the bitwise_and decomposition, which has decomposes_into edges to aten.logical_and, aten.bitwise_not, and aten.bitwise_or.
+:width: 100%
+:align: center
+
+The decomposition chain for `aten.bitwise_and`. The `decomposed_by` edge
+reaches the decomposition function, and the `decomposes_into` edges reach the
+ops it rewrites into.
+:::
+
+Start at the op node `aten.bitwise_and`, follow its `decomposed_by` edge to the
+decomposition `bitwise_and`, then follow the `decomposes_into` edges to see that
+it rewrites into `aten.logical_and`, `aten.bitwise_not`, and `aten.bitwise_or`.
+A different op might instead carry a `lowered_by` edge to a lowering, a
+`falls_back_to` edge (dashed) to a CPU fallback, or an `eager_via` edge to an
+eager kernel; the outgoing edge is how the backend handles that op. In the live
+graph the `decomposes_into` edges are drawn in green, so the expansion stands
+apart from the `decomposed_by` link.
+
+This answers two questions for a user at once: whether `bitwise_and` runs on the
+accelerator and what it actually becomes, which matters when a result or a
+performance number is surprising. For a developer adding a related op, it shows
+the existing rewrite to follow.
+
+### Compiler Passes
+
+A pass-group node such as `CustomPreSchedulingPasses` has a `contains_pass` edge
+to each pass it runs, for example `splice_while_loops`, `deadcode_elimination`,
+and `propagate_named_dims`, laid out top to bottom in execution order.
+
+The group is the pipeline and each child is one pass; top to bottom is the order
+they run. This is mostly a developer view. Use it to see where a transformation
+happens and what runs before it, before adding or reordering a pass.
+
+### Architecture
+
+Class nodes carry `inherits_from` edges to their base classes, for example
+`CustomPreFusionPasses` inherits from `_SpyreNodePassPipeline`, which in turn
+inherits from `CustomSchedulerPass`. Module nodes carry `imports` edges to the
+modules they import, and dataclass nodes carry `contains_field` edges to the
+dataclasses they reference.
+
+Follow `inherits_from` up to find the base class a change would affect, and
+trace `imports` inbound to find the modules that depend on the one you are
+changing. This is the view for learning an unfamiliar subsystem and for judging
+the reach of a refactor before starting it.
+
+### Configuration
+
+An environment-variable node such as `LX_PLANNING` is connected by a
+`reads_env` edge to each module that reads it, for example the `config` module.
+
+Pick the variable, follow `reads_env` to the module, then open the source link
+to see the accepted values and the default. For a user this is the fastest way
+to find the knob that controls a behavior; for a developer it shows which
+modules depend on a variable before renaming or retiring it.
+
+The sections below put these views to work for specific user and developer
+tasks.
+
 ## For users
 
 If you run models through `torch.compile`, the two most useful views are

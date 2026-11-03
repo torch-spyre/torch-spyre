@@ -10,11 +10,19 @@ test_suite_config:
             #
             - TestOps::test_(addmm|mm|bmm|einsum|matmul|linear).*
             - TestOps::test_fp8_scaled_mm.*
+            - TestOps::test_fp8_scaled_bmm.*
+            - TestOps::test_fp8_chained_scaled_mm.*
+            - TestOps::test_fp8_3d_activation_reshape.*
           mode: mandatory_success
           tags:
             - ops__inductor-matmul
         - names:
             - TestOps::test_large_matmul.*
+          mode: mandatory_success
+          tags:
+            - ops__inductor-matmul
+        - names:
+            - TestOps::test_grouped_mm.*
           mode: mandatory_success
           tags:
             - ops__inductor-matmul

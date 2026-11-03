@@ -22,6 +22,7 @@ from torch_spyre._C import DataFormats, encode_constant
 from torch_spyre._inductor.constants import (
     CONV2D_DIM_LABELS,
     DEPTHWISE_CONV2D_OP,
+    DLFLOAT16_MAX,
     FP8_2D_STICK_OPS,
 )
 from torch_spyre._inductor.errors import Unsupported
@@ -226,7 +227,14 @@ def generate_constant_info(
     constant_info: dict[str, Any] = {}
     for name, value in constants.items():
         try:
-            encoded_value = encode_constant(value, data_format)
+            # The host converter saturates DLFloat16 constants at 2**32.
+            # Preserve the exact finite limits used for missing clip bounds.
+            if data_format == DataFormats.SEN169_FP16 and value == DLFLOAT16_MAX:
+                encoded_value = 0x7FFE
+            elif data_format == DataFormats.SEN169_FP16 and value == -DLFLOAT16_MAX:
+                encoded_value = 0xFFFE
+            else:
+                encoded_value = encode_constant(value, data_format)
         except (ValueError, TypeError) as e:
             raise ValueError(
                 f"Cannot encode constant '{name}' with value {value} "

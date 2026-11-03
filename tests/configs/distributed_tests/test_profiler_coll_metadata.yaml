@@ -1,0 +1,21 @@
+# Configuration file for torch-spyre distributed profiler tests
+# Checks collective metadata (coll_*) on AIUPTI kernel/memcpy trace events
+#
+# Usage:
+#   cd torch-spyre/tests
+#   ./run_test.sh configs/distributed_tests/test_profiler_coll_metadata.yaml
+#
+# The run_test.sh script automatically detects tests in the distributed/
+# directory and launches them with: torchrun --nproc-per-node $AIU_WORLD_SIZE
+
+test_suite_config:
+  labels: [regression, trunk, integration]
+  files:
+    # Profiler collective metadata tests
+    - path: ${TORCH_DEVICE_ROOT}/tests/distributed/test_profiler_coll_metadata.py
+      unlisted_test_mode: mandatory_success
+
+  global:
+    # These tests use the spyreccl backend for distributed operations
+    supported_dtypes:
+      - name: float16

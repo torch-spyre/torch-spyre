@@ -29,8 +29,7 @@ work-division planner. See MULTICORE_SENCORES in indirect_access_common.
 
 There is one test per scenario -- no separate e2e variants. Each scenario
 validates the capture path and then runs the kernel on the real backend,
-validating the result and warning that the device values diverge from the CPU
-reference (the backend does not yet implement indirect gather). Scenarios route
+asserting the result matches the CPU reference. Scenarios route
 their compile through _stage_and_e2e (stage check + e2e run); capture-based
 tests call run_e2e directly after their own assertions. The three structural
 tests (sdsc_fields, sdsc_handoff, python_bundle_generation) stay capture-only.
@@ -78,6 +77,7 @@ from torch_spyre._C import (  # noqa: E402
 )
 from torch_spyre._inductor.constants import IDENTITY_OP, RESTICKIFY_OP  # noqa: E402
 from torch_spyre._inductor.op_spec import find_unimplemented  # noqa: E402
+from torch_spyre._inductor.work_division_constraints import ConstraintResult  # noqa: E402
 from utils_inductor import mock_backend_compiler
 
 
@@ -123,9 +123,9 @@ class _GatherScenarios:
         index arg matching the IndirectAccess target, one output, a well-formed
         iteration space and TensorArg metadata, and the index is detected."""
         x, i = self._xi(P=3, two_d=True)
-        # Stage check first (and all the detailed op-spec assertions below) so
-        # they always run; the e2e at the end xfails on the expected
-        # device-side divergence/abort, which would otherwise stop the test.
+        # Stage check and the detailed op-spec assertions run before the e2e at
+        # the end, so a structural regression is reported as itself rather than
+        # as an e2e failure.
         r = self.check(
             lambda x, i: x[i].exp(),
             x,
@@ -207,8 +207,8 @@ class _GatherScenarios:
         }
         # Validate every unary's stage encoding first (all subtests run), then
         # run one representative end-to-end. They share the same gather
-        # structure, and run_e2e xfails on the expected device-side divergence,
-        # which would otherwise stop the loop before later unaries are checked.
+        # structure, and an e2e failure would stop the loop before the later
+        # unaries are checked.
         for label, fn in unaries.items():
             with self.subTest(unary=label):
                 torch._dynamo.reset()
@@ -842,15 +842,13 @@ class _GatherScenarios:
         M, N = 128, 256
         x = self.to_spyre(torch.rand(M, N, dtype=torch.float16))
         self.name_dims(x, {"M": M, "N": N})
-        # x.exp() is a supported direct op, so its e2e result must match the CPU
-        # reference (expect_close=True) -- unlike the indirect gathers.
+        # x.exp() is a supported direct op, not an indirect gather.
         r = self._stage_and_e2e(
             lambda x: x.exp(),
             x,
             expect=DIRECT_OP_SPEC,
             op="exp",
             detected=False,
-            expect_close=True,
         )
         self.assertFalse(any(op_spec_has_indirect_access(s) for s in r.op_specs))
         self.assertFalse(
@@ -1011,13 +1009,6 @@ class _GatherScenarios:
             result = torch.compile(lambda x, i: x[i].exp())(x, i)
         self.assertIsNotNone(result, "gather compile returned nothing")
 
-    @pytest.mark.skip(
-        reason=(
-            "backend compiler crash: std::out_of_range (map::at) — "
-            "multiple gathers sharing the same index tensor in one kernel "
-            "are not yet supported"
-        )
-    )
     def test_gather_multiple_indices_same_kernel(self):
         """Test x[i] + y[i] - multiple gathers with same index in one kernel.
 
@@ -1034,13 +1025,6 @@ class _GatherScenarios:
 
         self._stage_and_e2e(kernel, x, y, i, expect=GATHER_OP_SPEC)
 
-    @pytest.mark.skip(
-        reason=(
-            "RuntimeError: StreamInErrorState — cannot launch D2H; "
-            "multiple gathers with different index tensors in one kernel "
-            "are not yet supported"
-        )
-    )
     def test_gather_different_indices_same_kernel(self):
         """Test x[i] + y[j] - multiple gathers with different indices in one kernel.
 
@@ -1115,7 +1099,8 @@ class _GatherMulticoreScenarios:
     # table, silently returning wrong results. Shapes are chosen so the planner
     # *would* prefer K (its largest output-coordinate dim) if the guard were
     # absent. Aligned c0 sizes split in whole sticks; partial-stick c0 sizes stay
-    # unsplit because restickify must pad them. c1 always stays unsplit.
+    # unsplit, since the last core would read the index's padding lanes as rows.
+    # c1 always stays unsplit.
     #
     # After the work-division check each scenario runs through the shared
     # _stage_and_e2e path (fresh inputs, since run_and_get_code has already
@@ -1198,7 +1183,7 @@ class _GatherMulticoreScenarios:
 
     def test_work_division_index_split_partial_stick(self):
         """Non-stick-aligned index (P=40 = one full stick + a partial second):
-        restickify pads the entry dim, so planning keeps it on one core."""
+        the entry dim stays on one core."""
 
         def make():
             x = torch.rand(128, 64, 256, dtype=torch.float16).to("spyre")
@@ -1236,6 +1221,60 @@ class _GatherMulticoreScenarios:
         self.assert_entry_dim_unsplit(source_codes[0], index_size=1000, data_size=64)
         self._stage_and_e2e(fn, *make(), expect=GATHER_OP_SPEC)
 
+    def test_work_division_partial_stick_unsplit_by_indirect_rule(self):
+        """The indirect-access rule alone keeps a partial-stick entry dim unsplit.
+
+        The planner sees a gather's only direct input, the index, whose stick dim
+        differs from the output's, so the restickify-padding rule also blocks the
+        dim. With that rule disabled the entry dim must still stay on one core.
+        """
+
+        def make():
+            x = torch.rand(128, 64, 256, dtype=torch.float16).to("spyre")
+            i = (torch.arange(40) % 128).int().to("spyre")
+            return x, i
+
+        no_restickify_rule = patch(
+            "torch_spyre._inductor.work_division_constraints."
+            "restickify_padding_blocked_vars",
+            return_value=ConstraintResult(),
+        )
+        with no_restickify_rule:
+            _, source_codes = run_and_get_code(
+                torch.compile(self._gather_fn, dynamic=False), *make()
+            )
+        self.assert_entry_dim_unsplit(source_codes[0], index_size=40, data_size=64)
+
+    # -- index padding: lanes past the index length are never dereferenced --
+    def _gather_with_index_padding(self, dtype, pad):
+        """A partial-stick index whose padding lanes hold ``pad`` gathers exactly.
+
+        The index is the first 67 entries of a 96-entry device tensor, so its
+        third stick holds 29 padding lanes set to ``pad``. A gather that iterated
+        the whole last index stick would take them as table rows and, for an
+        invalid row, fault the card. The table values are exact in DLFloat16,
+        so the result is compared exactly.
+        """
+        n, cols = 67, 64
+        table = (torch.arange(n * cols) % 251).to(dtype).reshape(n, cols)
+        logical = torch.arange(n - 1, -1, -1, dtype=torch.int32)
+        padded = torch.cat([logical, torch.full((96 - n,), pad, dtype=torch.int32)])
+        fn = torch.compile(lambda t, i: torch.index_select(t, 0, i[:n]), dynamic=False)
+        got = fn(table.to("spyre"), padded.to("spyre")).cpu()
+        torch.testing.assert_close(got, table[logical.long()], atol=0, rtol=0)
+
+    def test_gather_index_padding_negative_fp16(self):
+        self._gather_with_index_padding(torch.float16, -1)
+
+    def test_gather_index_padding_past_table_fp16(self):
+        self._gather_with_index_padding(torch.float16, 1000)
+
+    def test_gather_index_padding_negative_fp32(self):
+        self._gather_with_index_padding(torch.float32, -1)
+
+    def test_gather_index_padding_past_table_fp32(self):
+        self._gather_with_index_padding(torch.float32, 1000)
+
     # -- shared value table: cross-core read correctness ------------------
     def test_gather_cross_core_shared_value(self):
         """Every output row gathers a value row in a DIFFERENT core's work slice,
@@ -1245,7 +1284,7 @@ class _GatherMulticoreScenarios:
         r < 2048), and the index maps output row i -> value row (i + V/2) % V:
         always a half-table hop, so under any multi-core split the fetched row
         belongs to another core's slice. The gather must match the CPU reference
-        exactly (expect_close=True) -- if the shared value tensor's per-core base
+        exactly -- if the shared value tensor's per-core base
         ever drifted with the work-division slice, a core would read a shifted
         row and diverge. Runs at 32 cores, where the indirect uint32 address cap
         holds the split to 16-way (still cross-core: a V/2 hop lands 8 cores
@@ -1263,7 +1302,6 @@ class _GatherMulticoreScenarios:
             weight,
             idx,
             expect=GATHER_OP_SPEC,
-            expect_close=True,
         )
 
 
@@ -1283,12 +1321,10 @@ class _EmbeddingAllIndexBucketsScenario:
     """torch.embedding over every partial-stick index-stick count at sencores=32.
 
     The index is int32 (32 entries/stick), so ceil(N/32) is the number of index
-    sticks -- and at SENCORES=32 the entry dim splits core_split(sticks, 32) ==
-    sticks ways, i.e. the stick count is also the core count.
-    For each count s:
+    sticks. For each count s:
       N = s*32 - offset  (offset ∈ [1,31] seeded from s)
       → N is non-stick-aligned, _pad_output_for_stick_aligned_split fires
-      → entry dim and hidden dim are co-split to keep per-core span ≤ 256 MB
+      → the partial-stick entry dim stays on one core
       → classified as GATHER_OP_SPEC, then validated end-to-end on the backend.
     """
 
@@ -1324,11 +1360,9 @@ def _make_index_sticks_test(sticks: int):
     def test(self):
         self._run_for_index_sticks(sticks)
 
-    # `sticks` index sticks == `sticks` cores at SENCORES=32 (core_split == sticks).
     test.__name__ = test.__qualname__ = f"test_gather_{sticks:02d}_index_sticks"
     test.__doc__ = (
-        f"Classify + e2e torch.embedding across {sticks} partial index stick(s) "
-        f"({sticks} cores at SENCORES=32)."
+        f"Classify + e2e torch.embedding across {sticks} partial index stick(s)."
     )
     return test
 
@@ -1349,6 +1383,286 @@ register_multicore_variants(
     globals(),
     counts=(32,),
 )
+
+
+# ---------------------------------------------------------------------------
+# 1-D value table. Registered separately from the main gather scenarios because
+# these assert exact values (expect_close=True) rather than allowing the
+# known-gap xfail, and two core counts are enough to cover the work division.
+# ---------------------------------------------------------------------------
+class _Gather1DTableScenario:
+    """x[i] where x is a 1-D table, on its own and feeding other ops.
+
+    A 1-D table has only its stick dimension to be indexed on, so the value
+    tensor is re-tiled to one entry per stick. That leaves the gather output
+    with one element per stick, which an ordinary operand does not match, so a
+    fused op needs the operand restickified to agree.
+
+    A bare gather is a pure copy and must match CPU exactly. Anything doing
+    arithmetic rounds, so those use the default float tolerance.
+    """
+
+    to_spyre = staticmethod(plain_to_spyre)
+
+    # --- table lengths ----------------------------------------------------
+
+    # Lengths either side of a stick boundary (64 elements at float16). The
+    # device extent rounds up to whole sticks, so these catch an entry count
+    # taken from the device dims rather than from the table.
+    LENGTHS = (2, 63, 64, 65, 100, 127, 128, 129, 192, 256)
+
+    # Larger tables, where the stick-per-entry cost starts to show.
+    LARGE_LENGTHS = (1000, 4096, 65536)
+
+    # --- operand shapes against a [24, 8] result --------------------------
+
+    # [24, 8] needs no broadcast. The rest each drop a dim the result has, so
+    # the operand's target layout has to collapse that dim rather than copy it.
+    OPERAND_SHAPES = ((24, 8), (24, 1), (1, 8), (8,), (1, 1))
+
+    # --- helpers ----------------------------------------------------------
+
+    def _table(self, entries):
+        # arange is exact in float16 to 2048, so each entry equals its own
+        # index and a wrong address shows up as an obviously wrong number.
+        if entries <= 2048:
+            return self.to_spyre(torch.arange(entries, dtype=torch.float16))
+        return self.to_spyre(torch.rand(entries, dtype=torch.float16))
+
+    def _index(self, entries=128, shape=(24, 8)):
+        return torch.randint(0, entries, shape, dtype=torch.int32).to("spyre")
+
+    def _operand(self, shape):
+        # Away from zero so a division stays well conditioned.
+        return self.to_spyre(torch.rand(*shape, dtype=torch.float16) + 0.5)
+
+    def _run(self, x, i):
+        run_e2e(self, lambda x, i: x[i], x, i, expect_close=True, atol=0, rtol=0)
+
+    def _run_fused(self, fn, *args):
+        run_e2e(self, fn, *args, expect_close=True)
+
+    # --- the gather on its own --------------------------------------------
+
+    def test_gather_1d_table(self):
+        """A per-expert scale table indexed by top-k ids."""
+        self._run(self._table(128), self._index())
+
+    def test_gather_1d_table_across_stick_boundaries(self):
+        """Indices either side of a stick edge."""
+        i = torch.tensor([0, 1, 63, 64, 65, 127], dtype=torch.int32).to("spyre")
+        self._run(self._table(128), i)
+
+    def test_gather_1d_table_more_reads_than_entries(self):
+        """192 tokens picking 8 experts each: 1536 reads from 128 entries."""
+        self._run(self._table(128), self._index(shape=(192, 8)))
+
+    def test_gather_1d_table_every_read_the_same_entry(self):
+        """Every read on entry 99, in the partly used last stick."""
+        i = torch.full((24, 8), 99, dtype=torch.int32).to("spyre")
+        self._run(self._table(100), i)
+
+    def test_gather_1d_table_bfloat16(self):
+        """bfloat16, the dtype the reported model uses."""
+        for entries in (63, 100, 128, 192, 256):
+            with self.subTest(entries=entries):
+                x = self.to_spyre(torch.arange(entries, dtype=torch.bfloat16))
+                i = torch.arange(entries, dtype=torch.int32).to("spyre")
+                self._run(x, i)
+
+    def test_gather_1d_table_int64_index(self):
+        """An int64 index, which is what ordinary PyTorch produces."""
+        i = torch.arange(128, dtype=torch.int64).to("spyre")
+        self._run(self._table(128), i)
+
+    # --- table lengths ----------------------------------------------------
+
+    def test_gather_1d_table_lengths_read_exhaustively(self):
+        """Every entry read once, at each length."""
+        for entries in self.LENGTHS:
+            with self.subTest(entries=entries):
+                i = torch.arange(entries, dtype=torch.int32).to("spyre")
+                self._run(self._table(entries), i)
+
+    def test_gather_1d_table_lengths_read_randomly(self):
+        """The same lengths plus larger ones, read by a short random index."""
+        for entries in self.LENGTHS + self.LARGE_LENGTHS:
+            with self.subTest(entries=entries):
+                i = torch.randint(0, entries, (24, 8), dtype=torch.int32)
+                self._run(self._table(entries), i.to("spyre"))
+
+    # --- arithmetic on the gathered values --------------------------------
+
+    def test_gather_1d_table_times_tensor(self):
+        """The model expression: weights * scale[index]."""
+        self._run_fused(
+            lambda x, i, w: x[i] * w,
+            self._table(128),
+            self._index(),
+            self._operand((24, 8)),
+        )
+
+    def test_gather_1d_table_plus_tensor(self):
+        self._run_fused(
+            lambda x, i, w: x[i] + w,
+            self._table(128),
+            self._index(),
+            self._operand((24, 8)),
+        )
+
+    def test_gather_1d_table_divided_by_tensor(self):
+        self._run_fused(
+            lambda x, i, w: x[i] / w,
+            self._table(128),
+            self._index(),
+            self._operand((24, 8)),
+        )
+
+    def test_gather_1d_table_maximum_with_tensor(self):
+        """A binary op that is not plain arithmetic."""
+        self._run_fused(
+            lambda x, i, w: torch.maximum(x[i], w),
+            self._table(128),
+            self._index(),
+            self._operand((24, 8)),
+        )
+
+    def test_gather_1d_table_operand_first(self):
+        """The gather on the right-hand side of the op."""
+        self._run_fused(
+            lambda x, i, w: w * x[i],
+            self._table(128),
+            self._index(),
+            self._operand((24, 8)),
+        )
+
+    def test_gather_1d_table_chained_ops(self):
+        """Several operations over the gathered values."""
+        self._run_fused(
+            lambda x, i, w, v: (x[i] + w) * v * 2.0,
+            self._table(128),
+            self._index(),
+            self._operand((24, 8)),
+            self._operand((24, 8)),
+        )
+
+    def test_gather_1d_table_two_tables(self):
+        """Two 1-D gathers feeding the same op."""
+        y = self.to_spyre(torch.arange(128, dtype=torch.float16) * 0.5)
+        self._run_fused(
+            lambda x, i, y, j: x[i] * y[j],
+            self._table(128),
+            self._index(),
+            y,
+            self._index(),
+        )
+
+    def test_gather_1d_table_unary(self):
+        """A unary on the gathered values.
+
+        The table is scaled down because exp of an index-valued table overflows
+        float16 long before it says anything about the layout.
+        """
+        small = self.to_spyre(torch.arange(128, dtype=torch.float16) / 64.0)
+        self._run_fused(lambda x, i: x[i].exp(), small, self._index())
+
+    # --- operands that broadcast ------------------------------------------
+
+    def test_gather_1d_table_operand_shapes(self):
+        """Every operand shape that broadcasts into a [24, 8] result."""
+        for shape in self.OPERAND_SHAPES:
+            with self.subTest(operand=shape):
+                self._run_fused(
+                    lambda x, i, w: x[i] * w,
+                    self._table(128),
+                    self._index(),
+                    self._operand(shape),
+                )
+
+    def test_gather_1d_table_operand_shapes_other_result(self):
+        """The same sharing patterns against a differently shaped result."""
+        for shape in ((12, 4), (12, 1), (1, 4), (4,)):
+            with self.subTest(operand=shape):
+                self._run_fused(
+                    lambda x, i, w: x[i] * w,
+                    self._table(128),
+                    self._index(shape=(12, 4)),
+                    self._operand(shape),
+                )
+
+    def test_gather_1d_table_operand_shapes_1d_result(self):
+        """A one-dimensional result, so there is a single dim to share over."""
+        for shape in ((192,), (1,)):
+            with self.subTest(operand=shape):
+                self._run_fused(
+                    lambda x, i, w: x[i] * w,
+                    self._table(128),
+                    self._index(shape=(192,)),
+                    self._operand(shape),
+                )
+
+    def test_gather_1d_table_zero_dim_operand(self):
+        """A 0-d tensor operand, which shares over every dim at once."""
+        self._run_fused(
+            lambda x, i, w: x[i] * w,
+            self._table(128),
+            self._index(),
+            self.to_spyre(torch.tensor(2.5, dtype=torch.float16)),
+        )
+
+    def test_gather_1d_table_scalar(self):
+        """A plain Python scalar, which brings no layout of its own."""
+        self._run_fused(lambda x, i: x[i] * 2.0, self._table(128), self._index())
+
+    # --- reductions over the gathered values ------------------------------
+
+    def test_gather_1d_table_summed_over_experts(self):
+        self._run_fused(lambda x, i: x[i].sum(dim=1), self._table(128), self._index())
+
+    def test_gather_1d_table_summed_over_tokens(self):
+        self._run_fused(lambda x, i: x[i].sum(dim=0), self._table(128), self._index())
+
+    def test_gather_1d_table_max_over_tokens(self):
+        self._run_fused(lambda x, i: x[i].amax(dim=0), self._table(128), self._index())
+
+    def test_gather_1d_table_mean_keepdim(self):
+        """A reduction that keeps the reduced dim as size 1."""
+        self._run_fused(
+            lambda x, i: x[i].mean(dim=1, keepdim=True),
+            self._table(128),
+            self._index(),
+        )
+
+    def test_gather_1d_table_fused_then_reduced(self):
+        """Multiply and then reduce, as a router does."""
+        self._run_fused(
+            lambda x, i, w: (x[i] * w).sum(dim=1),
+            self._table(128),
+            self._index(),
+            self._operand((24, 8)),
+        )
+
+
+register_multicore_variants(
+    _Gather1DTableScenario,
+    "TestGather1DTable",
+    globals(),
+    counts=(1, 32),
+)
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.int32, torch.int64], ids=lambda d: str(d)[6:]
+)
+def test_gather_stick_indexed_32bit(dtype):
+    """A 1-D 32-bit gather indexes along the stick dim (#4360). The table is
+    re-tiled to one entry per stick, so it reads back exactly."""
+    torch._dynamo.reset()
+    x = torch.arange(64).to(dtype)
+    idx = torch.tensor([3, 17, 40, 5], dtype=torch.int32)
+    out = torch.compile(lambda x, i: x[i])(x.to("spyre"), idx.to("spyre"))
+    torch.testing.assert_close(out.cpu(), x[idx], atol=0, rtol=0)
+
 
 if __name__ == "__main__":
     from torch._inductor.test_case import run_tests

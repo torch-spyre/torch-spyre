@@ -246,17 +246,18 @@ def test_the_package_init_is_never_run(derive_mod):
     assert sys.modules[derive_mod._PKG].__name__ != "spyre_clickhouse_ingest"
 
 
-def test_it_derives_with_no_clickhouse_driver_installed(tmp_path):
+def test_it_derives_with_no_third_party_modules_installed(tmp_path):
     # The regression this guards: importing the package __init__ pulled in clickhouse_connect,
     # so on a runner without it the script exited 0 having derived NOTHING -- silently, which
     # is the exact failure mode this whole chain exists to remove.
+    # `regex` too: the action runs on the runner's bare python3, which does not have it.
     base = tmp_path / "spyre_artifact_id.txt"
     base.write_text(BASE)
     blocker = (
         "import sys\n"
         "class B:\n"
         "    def find_spec(self, name, path=None, target=None):\n"
-        "        if name.split('.')[0] == 'clickhouse_connect':\n"
+        "        if name.split('.')[0] in ('clickhouse_connect', 'regex'):\n"
         "            raise ModuleNotFoundError(name)\n"
         "sys.meta_path.insert(0, B())\n"
         f"sys.argv = ['x', '--component', 'torch-spyre', '--arch', 'x86_64',\n"

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Kernel-XML tests for .github/scripts/ingest_xml.py.
+"""Kernel-XML tests for spyre_clickhouse_ingest.results.
 
 The script is not importable as a module (it lives outside the package and pulls
 in clickhouse_connect at import time), so it is loaded by path with the driver
@@ -20,7 +20,7 @@ stubbed out. No ClickHouse required: the client is a fake that records what the
 script asked for.
 """
 
-import importlib.util
+import importlib
 import sys
 import types
 from datetime import UTC, datetime
@@ -28,10 +28,6 @@ from pathlib import Path
 from xml.etree import ElementTree
 
 import pytest
-
-INGEST_PATH = (
-    Path(__file__).resolve().parents[1] / ".github" / "scripts" / "ingest_xml.py"
-)
 
 # The ingest imports the shared library from extensions/; it is in this repo, so put it on
 # sys.path rather than requiring an install for a parse-only test.
@@ -51,10 +47,7 @@ def ingest():
     had = "clickhouse_connect" in sys.modules
     sys.modules.setdefault("clickhouse_connect", types.ModuleType("clickhouse_connect"))
     try:
-        spec = importlib.util.spec_from_file_location("ingest_xml", INGEST_PATH)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        yield module
+        yield importlib.import_module("spyre_clickhouse_ingest.results")
     finally:
         if not had:
             sys.modules.pop("clickhouse_connect", None)

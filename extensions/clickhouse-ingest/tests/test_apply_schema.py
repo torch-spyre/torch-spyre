@@ -17,7 +17,7 @@ recreate a changed view, and refuse to touch a drifted table."""
 
 import pytest
 import regex as re
-from spyre_clickhouse_ingest.apply_schema import SchemaApplier, SchemaDrift
+from spyre_clickhouse_ingest.apply_schema import SCHEMA_DIR, SchemaApplier, SchemaDrift
 
 DB = "db"
 
@@ -37,7 +37,7 @@ class FakeServer:
         if sql.startswith("SELECT version()"):
             return "26.3.12.3"
         if sql.startswith("EXISTS TABLE"):
-            return int(sql.split(".")[-1] in self.live)
+            return int(sql.split()[-1].split(".")[-1] in self.live)
         if sql.startswith("DROP VIEW IF EXISTS"):
             self.live.pop(sql.split()[-1], None)
             return None
@@ -123,6 +123,41 @@ def test_changed_view_is_dropped_and_recreated(tmp_path):
     assert "a + 1" in server.live["v"]
 
 
+REFRESH_MV = (
+    "CREATE MATERIALIZED VIEW IF NOT EXISTS r REFRESH EVERY 30 MINUTE APPEND TO t "
+    "AS SELECT a FROM v"
+)
+
+
+def test_refreshable_mv_is_created_after_the_views_it_reads(tmp_path):
+    d = _schema(tmp_path, {"10-t.sql": TABLE + ";\n" + REFRESH_MV, "50-v.sql": VIEW})
+    files = SchemaApplier.selected_files(d)
+    assert [o.kind for p, t in files for o in SchemaApplier.objects(p, t)] == [
+        "table",
+        "refresh",
+        "view",
+    ]
+    planned = SchemaApplier.plan(FakeServer(), DB, files, [])
+    server = FakeServer()
+    steps = _run(server, d)
+    assert [(a, n) for a, n, _ in steps] == [
+        ("create", "t"),
+        ("create", "v"),
+        ("create", "r"),
+    ]
+    assert [(a, n) for a, n, _ in planned] == [(a, n) for a, n, _ in steps]
+    assert _run(server, d) == []
+
+
+def test_stored_refreshable_mv_compares_without_its_column_list():
+    stored = (
+        "CREATE MATERIALIZED VIEW db.r REFRESH EVERY 30 MINUTE APPEND TO db.t (`a` UInt8) "
+        "DEFINER = someone SQL SECURITY DEFINER AS SELECT a FROM db.v"
+    )
+    want = SchemaApplier.canonical(FakeServer(), REFRESH_MV, DB)
+    assert SchemaApplier.canonical(FakeServer(), stored, DB) == want
+
+
 def test_drifted_table_fails_without_altering(tmp_path):
     d = _schema(tmp_path, {"10-t.sql": TABLE})
     server = FakeServer(
@@ -180,6 +215,54 @@ def test_plan_labels_only_what_a_pending_migration_adds(tmp_path):
     ]
 
 
+def test_an_mv_a_pending_migration_recreates_is_not_drift(tmp_path):
+    mv = "CREATE MATERIALIZED VIEW IF NOT EXISTS m TO t AS SELECT {} AS a FROM t"
+    d = _schema(
+        tmp_path,
+        {"10-t.sql": TABLE + ";\n" + mv.format("a + 1")},
+        {
+            "001_mv.sql": "DROP VIEW IF EXISTS m;\n"
+            + mv.format("a + 1").replace("IF NOT EXISTS ", "")
+        },
+    )
+    live = {
+        "t": TABLE.replace("IF NOT EXISTS ", ""),
+        "m": mv.format("a").replace("IF NOT EXISTS ", ""),
+    }
+    files = SchemaApplier.selected_files(d)
+    steps = SchemaApplier.plan(
+        FakeServer(live), DB, files, SchemaApplier.migration_files(d)
+    )
+    assert ("migrates", "m") in [(a, n) for a, n, _ in steps]
+    steps = _run(FakeServer(live), d)
+    assert ("migrate", "001_mv.sql") in [(a, n) for a, n, _ in steps]
+
+
+def test_a_constraint_a_pending_migration_replaces_is_not_drift(tmp_path):
+    new = (
+        "CREATE TABLE IF NOT EXISTS {} (\n    a String,\n"
+        "    CONSTRAINT chk_a CHECK a IN ('x', 'y')\n) ENGINE = MergeTree ORDER BY a"
+    )
+    old = "CREATE TABLE {} ( a String, CONSTRAINT chk_a CHECK a IN ('x') ) ENGINE = MergeTree ORDER BY a"
+    d = _schema(
+        tmp_path,
+        {"10-t.sql": new.format("t"), "20-u.sql": new.format("u")},
+        {
+            "001_chk.sql": "ALTER TABLE t DROP CONSTRAINT IF EXISTS chk_a;\n"
+            "ALTER TABLE t ADD CONSTRAINT chk_a CHECK a IN ('x', 'y')"
+        },
+    )
+    # u's CHECK differs too, but no migration replaces it.
+    server = FakeServer({"t": old.format("t"), "u": old.format("u")})
+    files = SchemaApplier.selected_files(d)
+    steps = SchemaApplier.plan(server, DB, files, SchemaApplier.migration_files(d))
+    assert [(a, n) for a, n, _ in steps] == [
+        ("migrates", "t"),
+        ("drift", "u"),
+        ("migrate", "001_chk.sql"),
+    ]
+
+
 def test_an_addition_the_live_table_already_has_is_not_left_out(tmp_path):
     d = _schema(
         tmp_path,
@@ -233,3 +316,75 @@ def test_repo_schema_parses_as_create_only():
     d = SchemaApplier.schema_dir()
     for path, text in SchemaApplier.selected_files(d, include=["80-otel.sql"]):
         assert SchemaApplier.objects(path, text)
+
+
+def test_the_writer_checks_the_values_the_ddl_and_last_migration_allow():
+    from spyre_clickhouse_ingest.schema import (
+        CAPABILITY_STATUS_VALUES,
+        RESULT_KIND_VALUES,
+        TEST_TYPE_VALUES,
+    )
+
+    def check(text, name, table=None):
+        prefix = rf"ALTER TABLE {table} ADD CONSTRAINT " if table else ""
+        found = re.findall(rf"{prefix}{name}\s+CHECK\s+\w+\s+IN\s*\(([^)]*)\)", text)
+        return set(re.findall(r"'([^']+)'", found[-1])) if found else None
+
+    d = SchemaApplier.schema_dir()
+    migs = [p.read_text() for p in SchemaApplier.migration_files(d)]
+    for ddl, table, name, values in (
+        ("20-artifacts.sql", "artifact_results", "chk_test_type", TEST_TYPE_VALUES),
+        ("20-artifacts.sql", "artifact_results", "chk_result_kind", RESULT_KIND_VALUES),
+        (
+            "46-capabilities.sql",
+            "capability_runs",
+            "chk_status",
+            CAPABILITY_STATUS_VALUES,
+        ),
+    ):
+        # A live database carries the last migration's CHECK, a fresh one the DDL's.
+        last = next(v for v in (check(m, name, table) for m in reversed(migs)) if v)
+        assert check((d / ddl).read_text(), name) == last == set(values), name
+
+
+def test_a_guarded_statement_runs_only_when_its_table_exists(tmp_path):
+    mig = "-- RERUNNABLE\nSELECT 1;\n-- IF TABLE EXISTS: v\nINSERT INTO v SELECT 2;\nSELECT 3"
+    d = _schema(tmp_path, {"10-t.sql": TABLE}, {"001_x.sql": mig})
+    absent = FakeServer()
+    _run(absent, d)
+    assert "INSERT INTO v SELECT 2" not in absent.log
+    assert {"SELECT 1", "SELECT 3"} <= set(absent.log)
+    present = FakeServer({"v": "CREATE TABLE v (a UInt8)"})
+    SchemaApplier.rerun(present, d / "migrations" / "001_x.sql")
+    assert present.log == [
+        "SELECT 1",
+        "EXISTS TABLE v",
+        "INSERT INTO v SELECT 2",
+        "SELECT 3",
+    ]
+
+
+def test_kernel_rekey_guards_every_verdict_statement():
+    # 012 may run before or after the file that creates benchmark_metric_verdicts.
+    text = (
+        SCHEMA_DIR / "migrations" / "012_benchmark_id_without_kernel_hash.sql"
+    ).read_text()
+    marked = SchemaApplier.IF_TABLE.sub(lambda m: f"\0{m.group(1)}\0", text)
+    touching = [
+        s for s in SchemaApplier.statements(marked) if "benchmark_metric_verdicts" in s
+    ]
+    assert len(touching) == 2
+    assert all(s.startswith("\0benchmark_metric_verdicts\0") for s in touching)
+
+
+def test_rerun_repeats_only_a_rerunnable_migration(tmp_path):
+    d = _schema(
+        tmp_path,
+        {"10-t.sql": TABLE},
+        {"001_x.sql": "SELECT 1", "002_y.sql": "-- RERUNNABLE\nSELECT 2"},
+    )
+    server = FakeServer()
+    SchemaApplier.rerun(server, d / "migrations" / "002_y.sql")
+    assert server.log == ["SELECT 2"]
+    with pytest.raises(ValueError, match="RERUNNABLE"):
+        SchemaApplier.rerun(server, d / "migrations" / "001_x.sql")

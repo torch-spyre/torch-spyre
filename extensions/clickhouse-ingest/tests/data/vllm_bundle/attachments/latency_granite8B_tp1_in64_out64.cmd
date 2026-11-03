@@ -1,0 +1,1 @@
+vllm bench latency --model ibm-ai-platform/micro-g3.3-8b-instruct-1b --tensor-parallel-size 1 --input-len 64 --output-len 64 --batch-size 1 --num-iters 2 --output-json latency_granite8B_tp1_in64_out64.json
