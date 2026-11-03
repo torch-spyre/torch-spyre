@@ -1423,15 +1423,18 @@ def lookup_marker_dim(
     from torch._inductor.ir import Reduction
     from torch._inductor.virtualized import V
 
-    from torch_spyre._inductor.wsr.coarse_tile import (
+    from torch_spyre._inductor.pass_utils import op_out_coords
+    from torch_spyre._inductor.wsr.loop_tiling_common import (
         _loop_var_to_ranges_pos,
-        op_out_coords,
         reduction_loop_vars,
     )
 
     rw = op.get_read_writes()
     op_name = op.get_name()
-    marker_map = _MARKER_MAPS.get(id(V.graph.operations))
+    # During a pass run against loop_node.OpsView, V.graph.operations is the
+    # view; the map is keyed by the real list it wraps.
+    operations = V.graph.operations
+    marker_map = _MARKER_MAPS.get(id(getattr(operations, "real", operations)))
     if marker_map is not None:
         for dep in rw.reads:
             if not isinstance(dep, Dep):
@@ -1595,9 +1598,9 @@ def _stamp_direct_loop_info(
     from torch_spyre._inductor.errors import Unsupported
     from torch_spyre._inductor.loop_info import CoarseTileInfo
     from torch_spyre._inductor.propagate_hints import DimHint
-    from torch_spyre._inductor.wsr.coarse_tile import (
+    from torch_spyre._inductor.pass_utils import op_out_coords
+    from torch_spyre._inductor.wsr.loop_tiling_common import (
         _loop_var_to_ranges_pos,
-        op_out_coords,
         reduction_loop_vars,
     )
 
@@ -2417,7 +2420,7 @@ def _contract_cross_scope_input_materializations(
         ReadCopyElisionRecord,
     )
     from torch_spyre._inductor.pass_utils import replace_computed_buffer_body
-    from torch_spyre._inductor.wsr.coarse_tile import (
+    from torch_spyre._inductor.wsr.loop_tiling_common import (
         _LoopVarRebaseHandler,
         _rescale_index,
     )
@@ -2851,7 +2854,7 @@ def _contract_exact_stride_input_materializations(
     from torch._inductor.ir import FixedLayout
 
     from torch_spyre._inductor.loop_info import ReadCopyElisionRecord
-    from torch_spyre._inductor.wsr.coarse_tile import (
+    from torch_spyre._inductor.wsr.loop_tiling_common import (
         _LoopVarRebaseHandler,
         _NameSwapHandler,
         _divide_ranges,
@@ -3353,7 +3356,7 @@ def splice_while_loops(graph) -> None:
     from torch._inductor import ir
 
     from torch_spyre._inductor.errors import Unsupported
-    from torch_spyre._inductor.wsr.coarse_tile import _rebase_point_splice_reads
+    from torch_spyre._inductor.wsr.loop_tiling_common import _rebase_point_splice_reads
     from torch_spyre._inductor.wsr.while_loop_bridge import (
         carry_bindings_for,
         splice_while_loop,
@@ -3510,3 +3513,21 @@ def splice_while_loops(graph) -> None:
                 )
         else:
             logger.info("SPLICE_WHILE_LOOPS: no while_loops spliced")
+
+    # Final step: wrap each spliced loop's ops into a LoopNode (nested per
+    # level), so every later pass sees the loop as one structural unit. Built
+    # here, after the stamp phase, because only then does every op of every
+    # level exist and carry its complete loop_group_id (see the docstring).
+    # The loop variable of each level is the body's own counter symbol that
+    # the stamp phase consumed; the node keeps it. Later passes run against
+    # loop_node.OpsView and the nodes are expanded again before scheduling.
+    if pending_levels:
+        from torch_spyre._inductor.loop_node import collapse
+
+        collapse(
+            graph,
+            inductions={
+                level_group_idx: loop_var
+                for loop_var, _trip, level_group_idx, _names in pending_levels
+            },
+        )
