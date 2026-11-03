@@ -2392,6 +2392,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     0.0,
                 ),
             },
+            # A backend regression makes these cases fail their correctness check.
+            # Non-strict, so an unexpected pass does not fail the run. Remove the
+            # entries when #5950 is fixed.
+            "expect_fail_unstable": {
+                "2d_dim1": "keep_by_index result fails the correctness check, #5950",
+                "4d_dim2": "keep_by_index result fails the correctness check, #5950",
+            },
         },
         ("test_reduce_keepdim0", "test_reduce_keepdim0_cpu"): {
             "ops_dict": CORE_REDUCTION_OPS_DICT,
@@ -10959,33 +10966,23 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ):
             self.compare_with_cpu(lambda x: torch.cummin(x, dim=0), x, run_eager=False)
 
-    @pytest.mark.xfail(
-        reason=(
-            "Spyre compiled backend does not support torch.quantile yet "
-            "(stable error signature: InductorError: KeyError: "
-            "'No FX node for buf...', the failure of #3287)"
-        ),
-        raises=InductorError,
-        strict=True,
-    )
-    def test_quantile_q050_dim0_known_xfail(self):
+    @expects_raise
+    def test_quantile_q050_dim0_rejected(self):
+        # TODO(#1228): 2.14 constant folding materializes quantile's internal
+        # float64 conversion of q on device. When Double is supported, replace
+        # this rejection assertion with a numerical check.
         x = cached_randn((67, 256), dtype=torch.float32)
-        self.compare_with_cpu(
-            lambda x: torch.quantile(x, 0.5, dim=0, keepdim=False),
-            x,
-            run_eager=False,
-        )
+        with pytest.raises(RuntimeError, match="does not support dtype Double"):
+            self.compare_with_cpu(
+                lambda x: torch.quantile(x, 0.5, dim=0, keepdim=False),
+                x,
+                run_eager=False,
+            )
 
-    @pytest.mark.xfail(
-        reason=(
-            "Spyre compiled backend does not support torch.nanquantile yet "
-            "(stable error signature: InductorError: KeyError: "
-            "'No FX node for buf...', the failure of #3287)"
-        ),
-        raises=InductorError,
-        strict=True,
-    )
-    def test_nanquantile_q050_dim0_known_xfail(self):
+    @expects_raise
+    def test_nanquantile_q050_dim0_rejected(self):
+        # TODO(#1228): nanquantile has the same internal float64 conversion of
+        # q as quantile. Make this a numerical check once Double is supported.
         x = torch.tensor(
             [
                 [float("nan"), 1.0, -2.0, 3.0],
@@ -10995,11 +10992,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             ],
             dtype=torch.float32,
         )
-        self.compare_with_cpu(
-            lambda x: torch.nanquantile(x, 0.5, dim=0, keepdim=False),
-            x,
-            run_eager=False,
-        )
+        with pytest.raises(RuntimeError, match="does not support dtype Double"):
+            self.compare_with_cpu(
+                lambda x: torch.nanquantile(x, 0.5, dim=0, keepdim=False),
+                x,
+                run_eager=False,
+            )
 
     @expects_raise
     def test_median_dim1_rejected(self):
