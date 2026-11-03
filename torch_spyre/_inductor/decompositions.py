@@ -50,7 +50,12 @@ from .logging_utils import get_inductor_logger
 
 from . import customops  # noqa: F401
 from .wsr import for_each_tile
-from torch_spyre._C import DataFormats, get_device_dtype, get_elem_in_stick
+from torch_spyre._C import (
+    DataFormats,
+    ElementArrangement,
+    get_device_dtype,
+    get_elem_in_stick,
+)
 import torch_spyre._inductor.customops  # noqa: F401
 
 logger = get_inductor_logger("decompositions")
@@ -2807,6 +2812,82 @@ def spyre_max_dim_decomp(input, dim, keepdim=False):
         values = torch.ops.aten.amax(input, dim=dim, keepdim=keepdim)
         indices = torch.ops.aten.argmax(input, dim=dim, keepdim=keepdim)
         return torch.return_types.max((values, indices))
+
+
+def _argmax_last_dim(x: torch.Tensor, keepdim: bool) -> torch.Tensor:
+    """Index of the max along the last dim of an fp32 tensor, as PyTorch picks it.
+
+    The lowest index wins among equal values, and a NaN wins over any number.
+    Each position is scored so that the winner has the unique largest score,
+    ``2V - i`` for a NaN, ``V - i`` for a max, 0 otherwise, and the index is
+    recovered from the largest score. Reducing scores rather than values leaves
+    no tie for the device reduction to break.
+
+    Device comparisons do not follow IEEE for a NaN (``x == x`` holds), and
+    device ``amax``/``amin`` do not propagate it reliably, so a NaN is found
+    with ``abs(x) <= inf``, false only for NaN as on the host, and replaced
+    before the reduction.
+    Each comparison feeds a ``where`` of its own: combining two bool masks
+    fails layout propagation.
+    """
+    v = x.shape[-1]
+    iota = torch.arange(v, dtype=torch.float32, device=x.device)
+    lowest = torch.finfo(torch.float32).min
+    is_number = x.abs() <= float("inf")
+    x = torch.where(is_number, x, lowest)
+    # The device amax of an all -inf row is -FLT_MAX, so map -inf there too.
+    x = torch.where(x == float("-inf"), lowest, x)
+    is_max = x == torch.amax(x, dim=-1, keepdim=True)
+    score = torch.where(is_number, torch.where(is_max, v - iota, 0.0), 2 * v - iota)
+    best = torch.amax(score, dim=-1, keepdim=keepdim)
+    index = torch.where(best > v, 2 * v - best, v - best)
+    return index.to(torch.int64)
+
+
+def _arg_reduce_unsupported(input: torch.Tensor, dim: Optional[int]) -> bool:
+    """Whether argmax/argmin keep the CPU fallback for this input."""
+    # TODO: dim=None needs a reshape feeding the reduction, which fails to
+    # compile today.
+    if input.dtype not in _ARG_REDUCE_DTYPES or dim is None or input.dim() == 0:
+        return True
+    # Scores up to 2V must be exact in fp32.
+    return dim % input.dim() != input.dim() - 1 or 2 * input.shape[-1] > 2**24
+
+
+_ARG_REDUCE_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
+
+
+def _arg_reduce_input(input: torch.Tensor) -> torch.Tensor:
+    """The float32 values argmax/argmin score, in host element order.
+
+    A float16/bfloat16 upcast on the device is staggered, its elements permuted
+    within each stick pair, so it is shuffled back to STANDARD before the score
+    reads positions from it.
+    """
+    if input.dtype == torch.float32:
+        return input
+    return torch.ops.spyre.shuffle(
+        input.to(torch.float32), ElementArrangement.STANDARD.value
+    )
+
+
+@register_spyre_decompositions([torch.ops.aten.argmax.default])
+def spyre_argmax(
+    input: torch.Tensor, dim: Optional[int] = None, keepdim: bool = False
+) -> torch.Tensor:
+    if _arg_reduce_unsupported(input, dim):
+        return torch.ops.spyre.argmax_cpu(input, dim, keepdim)
+    return _argmax_last_dim(_arg_reduce_input(input), keepdim)
+
+
+@register_spyre_decompositions([torch.ops.aten.argmin.default])
+def spyre_argmin(
+    input: torch.Tensor, dim: Optional[int] = None, keepdim: bool = False
+) -> torch.Tensor:
+    if _arg_reduce_unsupported(input, dim):
+        return torch.ops.spyre.argmin_cpu(input, dim, keepdim)
+    # Negation keeps NaN a NaN and the order of ties.
+    return _argmax_last_dim(-_arg_reduce_input(input), keepdim)
 
 
 @register_spyre_decompositions([torch.ops.aten.min.dim])
