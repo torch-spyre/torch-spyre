@@ -1181,7 +1181,10 @@ class DomainRangeTracer(DefaultHandler):
         self.non_zero_reals = S.Reals - FiniteSet(0)
         self.extended_non_zero_reals = self.non_zero_reals.union(FiniteSet(-oo, oo))
         self.positive_numbers = Interval(0, sympy.oo)
-        self.stricty_positive_numbers = Interval(0, sympy.oo, left_open=True)
+        self.strictly_positive_numbers = Interval(0, sympy.oo, left_open=True)
+        self.extended_strictly_positive_numbers = self.strictly_positive_numbers.union(
+            FiniteSet(-oo, oo)
+        )
         self.booleans = FiniteSet(0, 1)
 
     def constant(self, value: Union[bool, float, int], dtype: torch.dtype) -> Set:
@@ -1365,8 +1368,8 @@ class DomainRangeTracer(DefaultHandler):
         return self.positive_numbers
 
     def log(self, x0):
-        if not x0.is_subset(self.stricty_positive_numbers):
-            raise InvalidDomain(self.stricty_positive_numbers, "log")
+        if not x0.is_subset(self.extended_strictly_positive_numbers):
+            raise InvalidDomain(self.extended_strictly_positive_numbers, "log")
         return S.Reals
 
     def le(self, x0, x1):
@@ -1414,10 +1417,10 @@ class DomainRangeTracer(DefaultHandler):
         return self._unary_op(lambda x: max(x, 0.0), x0, self.positive_numbers)
 
     def rsqrt(self, x0):
-        if not x0.is_subset(self.stricty_positive_numbers):
-            raise InvalidDomain(self.stricty_positive_numbers, "rsqrt")
+        if not x0.is_subset(self.extended_strictly_positive_numbers):
+            raise InvalidDomain(self.extended_strictly_positive_numbers, "rsqrt")
         return self._unary_op(
-            lambda x: 1 / math.sqrt(x), x0, self.stricty_positive_numbers
+            lambda x: 1 / math.sqrt(x), x0, self.extended_strictly_positive_numbers
         )
 
     def sigmoid(self, x0):
@@ -1784,6 +1787,24 @@ def is_padded(graph: GraphLowering, node: IRNode | Layout | SpyreTensorLayout):
     return total_valid_elems < total_size
 
 
+def _user_values():
+    values = S.Reals
+    if padding_strict_mode:
+        values = values.union(FiniteSet(S.NaN))
+    return values
+
+
+_ASSUMED_PADDING: dict[type, Set] = {
+    # input buffers are zero paddded in DMA transfer to the device
+    InputBuffer: FiniteSet(0),
+    BroadcastAsyncFallback: _user_values(),
+    AllGatherAsyncFallback: _user_values(),
+    AllReduceAsyncFallback: _user_values(),
+    WaitWorkFallback: _user_values(),
+    SpyreEmptyFallback: _user_values(),
+}
+
+
 def track_padding_value(graph: GraphLowering) -> None:
     operations = graph.operations
 
@@ -1815,8 +1836,7 @@ def track_padding_value(graph: GraphLowering) -> None:
                 while isinstance(buf, MutableBox):
                     buf = buf.data
                 if isinstance(buf, InputBuffer):
-                    # input buffers are zero paddded in DMA transfer to the device
-                    tracer.buffer_range[dep.name] = FiniteSet(0)
+                    tracer.buffer_range[dep.name] = _ASSUMED_PADDING[InputBuffer]
                 else:
                     assert dep.name in tracer.buffer_range, (
                         f"Nodes seen out of order, expected {dep.name} to have been visited"
@@ -1851,10 +1871,14 @@ def track_padding_value(graph: GraphLowering) -> None:
                     # Each collective behaves a bit differently wrt. to padding,
                     # but the fact is that we don't know what is being read from
                     # other processes, so for now it's better to be conservative.
-                    _range = S.Reals
-                    if padding_strict_mode:
-                        _range = _range.union(FiniteSet(S.NaN))
-                    tracer.buffer_range[op.name] = _range
+                    for _class, pad in _ASSUMED_PADDING.items:
+                        if isinstance(op, _class):
+                            tracer.buffer_range[op.name] = pad
+                            break
+                    else:
+                        raise ValueError(
+                            f"Couldn't find entry for {op} in _ASSUMED_PADDING"
+                        )
                     continue
                 else:
                     raise ValueError(f"Unhandled kind of node {op}")
@@ -1866,10 +1890,10 @@ def track_padding_value(graph: GraphLowering) -> None:
 
             do_coord_mask = False
             do_pad = False
-            # Loop until we can either allow the inputs to pass unmodified or
+            # Fixed point loop until we can either allow the inputs to pass unmodified or
             # find a suitable padding. So the max iteration count is 1 for the
             # first try and 1 retry for each argument
-            for i in range(100):
+            for i in range(1 + len(input_buffers)):
                 # Even if the output of this op is not padded, we need to run
                 # the input validation if there are padded inputs
                 if not padded and not any_input_padded:
@@ -1949,9 +1973,7 @@ def track_padding_value(graph: GraphLowering) -> None:
                     # destination padding come from source padding or valid elements.
                     # Set the resulting to all possible inputs united with what could
                     # be in the mutation source buffer padding.
-                    user_data = S.Reals
-                    if padding_strict_mode:
-                        user_data = user_data.union(FiniteSet(S.NaN))
+                    user_data = _user_values()
                     pad_set = tracer.buffer_range[op.name]
                     tracer.buffer_range[target_name] = user_data.union(pad_set)
 

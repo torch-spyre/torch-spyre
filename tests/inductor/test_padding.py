@@ -53,11 +53,11 @@ from torch_spyre._inductor.padding import (
     _is_dense_flattened_coordinate,
     _is_nonoverlapping_aligned_stick_coordinate,
     _restickify_input_required_extent,
+    _ASSUMED_PADDING,
 )
 from torch_spyre._inductor.scratchpad import allocator
 from torch_spyre._inductor.scratchpad import utils as scratchpad_utils
 from utils_inductor import try_reinterpret_host_shape
-
 
 Ts = TypeVarTuple("Ts")
 
@@ -1280,20 +1280,21 @@ class TestCoordinateMasking(unittest.TestCase):
     @parametrize("dtype", COORD_MASK_DTYPES)
     @parametrize("shape", SHAPES)
     def test_exp(self, shape, dtype) -> None:
-        unpadded = unpad_shape(shape, dtype)
-        a_spyre_full = torch.full(unpadded, 222, dtype=dtype, device="spyre")
-        a_spyre = try_reinterpret_host_shape(a_spyre_full, shape)
+        with patch.dict(_ASSUMED_PADDING, {InputBuffer: sympy.S.Reals}):
+            unpadded = unpad_shape(shape, dtype)
+            a_spyre_full = torch.full(unpadded, 222, dtype=dtype, device="spyre")
+            a_spyre = try_reinterpret_host_shape(a_spyre_full, shape)
 
-        def fn(x):
-            return torch.exp(x)
+            def fn(x):
+                return torch.exp(x)
 
-        compiled = torch.compile(fn, fullgraph=True, dynamic=False)
-        result = compiled(a_spyre)
+            compiled = torch.compile(fn, fullgraph=True, dynamic=False)
+            result = compiled(a_spyre)
 
-        exposed_padding = try_reinterpret_host_shape(result, unpadded).cpu()[
-            :, shape[-1] :
-        ]
-        assert (exposed_padding == 0).all().item()
+            exposed_padding = try_reinterpret_host_shape(result, unpadded).cpu()[
+                :, shape[-1] :
+            ]
+            assert (exposed_padding == 0).all().item()
 
     @parametrize("dtype", COORD_MASK_DTYPES)
     @parametrize("shape", SHAPES)
