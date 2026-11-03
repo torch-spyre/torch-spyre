@@ -235,10 +235,11 @@ class _ScatterScenarios:
 
         A pinned [B, H, max_seq, D] FP8 cache (max_seq at device position 0,
         D=128 is one FP8 stick) takes a 128-token prefill write and then a
-        1-token decode write on dim 2. The scatter lowers to an identity copy,
-        which create_op_spec allows for every dtype, so no SPYRE_FP8_OPS entry
-        is needed. CPU has no float8 index_copy_, so the reference runs in fp32;
-        small integers are exact in E4M3, so the compare is exact.
+        1-token decode write on dim 2, both into the same device tensor. The
+        scatter lowers to an identity copy, which create_op_spec allows for
+        every dtype, so no SPYRE_FP8_OPS entry is needed. CPU has no float8
+        index_copy_, so the reference runs in fp32; small integers are exact in
+        E4M3, so the compare is exact.
         """
         Bn, H, L, D, M = 1, 8, 128, 128, 512
         dtype = torch.float8_e4m3fn
@@ -256,17 +257,14 @@ class _ScatterScenarios:
 
         compiled = torch.compile(store, dynamic=False)
         expected = torch.zeros(Bn, H, M, D)
-        actual = expected.to(dtype)
-        # Prefill writes positions [0, L); decode then appends position L.
+        # One device-resident cache takes both writes, as a real KV cache does:
+        # prefill writes positions [0, L), then decode appends position L.
+        cache = expected.to(dtype).to("spyre", device_layout=cache_layout)
         for idx in (torch.arange(L), torch.tensor([L])):
             src = torch.randint(-10, 10, (Bn, H, len(idx), D)).float()
-            expected = store(expected.clone(), src, idx)
-            actual = compiled(
-                actual.to("spyre", device_layout=cache_layout),
-                src.to(dtype).to("spyre"),
-                idx.to("spyre"),
-            ).cpu()
-            torch.testing.assert_close(actual.float(), expected, atol=0, rtol=0)
+            expected = store(expected, src, idx)
+            compiled(cache, src.to(dtype).to("spyre"), idx.to("spyre"))
+            torch.testing.assert_close(cache.cpu().float(), expected, atol=0, rtol=0)
 
     def test_index_copy_fp8_e4m3_paged_kv_cache_e2e(self):
         """FP8 index_copy into a paged-KV-cache-shaped destination (#4710).
@@ -303,6 +301,57 @@ class _ScatterScenarios:
                     idx.to("spyre"),
                 ).cpu()
                 torch.testing.assert_close(actual.float(), expected, atol=0, rtol=0)
+
+    def test_fp8_kv_cache_write_then_read_e2e(self):
+        """FP8 KV-cache round trip: quantize, scatter, gather pages, dequantize.
+
+        The path paged attention uses with an FP8 cache (#4710, #4711): new
+        tokens are quantized on device (qfp8ch), written into the paged cache
+        by slot with index_copy_, then whole pages are read with index_select
+        and dequantized. The cache stays on device across the two graphs.
+
+        The cache starts as zeros on purpose: a nonzero host-loaded FP8 cache
+        decodes wrongly today, because the gather/scatter writes the QFP8CH
+        bytes under a STANDARD tag and fp8todl16 assumes QFP8CH order for any
+        FP8 input (#QFP8CH_ISSUE). This test must keep passing once that is fixed.
+        Small integers with scale 1.0 are exact, so the compare is exact.
+        """
+        dtype = torch.float8_e4m3fn
+        NP, BLK, H, D, P = 16, 64, 8, 128, 5
+        L = NP * BLK
+        eps = get_elem_in_stick(dtype)
+        stl = SpyreTensorLayout(
+            device_size=[L, H, (D + eps - 1) // eps, eps],
+            stride_map=[H * D, D, eps, 1],
+            device_dtype=get_device_dtype(dtype),
+            valid_elements={(0,): L, (1,): H, (2, 3): D},
+        )
+        scale = torch.tensor([1.0], dtype=torch.float16)
+
+        def write(cache, k, scale, slots):
+            q = torch.ops.spyre.quantize_fp8_with_scale(k, scale)
+            cache.index_copy_(0, slots, q)
+            return cache
+
+        def read(cache, scale, page_ids):
+            pages = cache.view(NP, BLK, H, D).index_select(0, page_ids)
+            return torch.ops.spyre.dequantize_fp8_with_scale(pages, scale)
+
+        k = torch.randint(-10, 10, (P, H, D)).to(torch.float16)
+        slots = torch.randperm(L, dtype=torch.int64)[:P]
+        page_ids = torch.randperm(NP).to(torch.int32)
+        expected = torch.zeros(L, H, D, dtype=torch.float16).index_copy(0, slots, k)
+        expected = expected.view(NP, BLK, H, D).index_select(0, page_ids)
+
+        cache = torch.zeros(L, H, D).to(dtype).to("spyre", device_layout=stl)
+        scale_dev = scale.to("spyre")
+        torch.compile(write, dynamic=False)(
+            cache, k.to("spyre"), scale_dev, slots.to("spyre")
+        )
+        actual = torch.compile(read, dynamic=False)(
+            cache, scale_dev, page_ids.to("spyre")
+        ).cpu()
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
     def test_index_put_p7(self):
         """y[idx] = src -- 1-D scatter with an odd (non-power-of-2) P=7."""

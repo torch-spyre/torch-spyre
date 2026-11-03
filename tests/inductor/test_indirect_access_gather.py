@@ -333,9 +333,10 @@ class _GatherScenarios:
 
         The gather lowers to an identity copy with IndirectAccess on the input,
         which create_op_spec allows for every dtype, so no SPYRE_FP8_OPS entry
-        is needed. N=256 is two 128-element FP8 sticks per row, so the source
-        relayout that puts the indexed dim outermost also runs on FP8 data.
-        Small integers are exact in E4M3, so the e2e compare is exact.
+        is needed. N=256 is two 128-element FP8 sticks per row; check() asserts
+        that the indexed dim ends up outermost in the FP8 source's device
+        coordinates. Small integers are exact in E4M3, so the e2e compare is
+        exact.
         """
         M, N, P = 128, 256, 32
         dtype = torch.float8_e4m3fn
@@ -368,18 +369,17 @@ class _GatherScenarios:
         )
 
     def test_index_select_fp8_qfp8ch_source(self):
-        """index_select from FP8 pages quantized on device by qfp8ch (#4711).
+        """Device round trip: qfp8ch quantize, index_select, dequantize (#4711).
 
-        quantize_fp8_with_scale produces the QFP8CH element arrangement, which
-        is what an FP8 KV cache holds when K/V are quantized on device. The
-        pages are gathered and dequantized back to fp16 on device, the
-        attention read path. Inputs are small integers and the scale is 1.0,
-        so quantize and dequantize are exact and the compare is exact.
+        Pins the read path attention uses today with pages quantized on device:
+        the values that come back after dequantize are exact.
 
-        The gathered FP8 is not read back to the host directly: a QFP8CH tensor
-        copied to the host comes back in device element order with or without a
-        gather (the device-to-host conversion special-cases only QFP8WT), so
-        that check would test the host copy, not the gather.
+        This does not show that the gather keeps the QFP8CH arrangement. It
+        does not: the gather writes the QFP8CH bytes unchanged under a STANDARD
+        tag, and fp8todl16 assumes QFP8CH order for any FP8 input, so the two
+        cancel here. A STANDARD FP8 tensor from the host dequantizes wrongly,
+        with or without a gather (#QFP8CH_ISSUE). Inputs are small integers and
+        the scale is 1.0, so quantize and dequantize are exact.
         """
         NP, BLK, KVH, HD, P = 64, 64, 8, 128, 32
         x = torch.randint(-10, 10, (NP, BLK, KVH, HD)).to(torch.float16)
