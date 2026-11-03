@@ -488,6 +488,106 @@ def test_low_core_pointwise_price_is_symbolic_in_the_split():
             assert actual == pytest.approx(float(concrete))
 
 
+@pytest.mark.parametrize("boundary", [False, True])
+@pytest.mark.parametrize("second_cores", [1, 2])
+def test_pointwise_shared_input_excess_follows_boundary_ownership(
+    boundary, second_cores
+):
+    from torch_spyre._inductor.cost_model import (
+        _fused_hbm_bytes,
+        _pointwise_core_excess_ns,
+    )
+
+    p = CostParams()
+    resident = sympy.Symbol("is_lx_shared", integer=True, nonnegative=True)
+    full = 1 << 20
+    ops = []
+    prices = []
+    for i, cores in enumerate((1, second_cores)):
+        op = _pointwise(cores, resident=resident, out_resident=True, elems=full)
+        op.name = f"reader{i}"
+        op.args[0].name = f"out{i}"
+        op.args[1].is_boundary = boundary
+        ops.append(op)
+        prices.append(
+            full * 2 * (1 / (cores * p.pointwise_gbps_per_core) - 1 / p.bw_peak_gbps)
+        )
+    expected_hbm = full * 2 * (1 if boundary else 2)
+    expected_price = max(prices) if boundary else sum(prices)
+    for readers in (ops, list(reversed(ops))):
+        expr = sympy.sympify(_pointwise_core_excess_ns(readers, p))
+        hbm = sympy.sympify(_fused_hbm_bytes(readers)[0])
+        for lx in (0, 1):
+            assert float(hbm.subs(resident, lx)) == expected_hbm * (1 - lx)
+            assert float(expr.subs(resident, lx)) == pytest.approx(
+                expected_price * (1 - lx)
+            )
+
+
+@pytest.mark.parametrize("boundary", [False, True])
+def test_pointwise_output_excess_is_separate_from_shared_inputs(boundary):
+    from torch_spyre._inductor.cost_model import _pointwise_core_excess_ns
+
+    p = CostParams()
+    resident = sympy.Symbol("is_lx_output", integer=True, nonnegative=True)
+    ops = []
+    full = 1 << 20
+    for i in range(2):
+        op = _pointwise(1, resident=True, out_resident=resident, elems=full)
+        op.name = f"writer{i}"
+        op.args[0].name = f"out{i}"
+        op.args[0].is_boundary = boundary
+        ops.append(op)
+    expr = sympy.sympify(_pointwise_core_excess_ns(ops, p))
+    expected = 2 * full * 2 * (1 / p.pointwise_gbps_per_core - 1 / p.bw_peak_gbps)
+    for lx in (0, 1):
+        assert float(expr.subs(resident, lx)) == pytest.approx(
+            expected * (1 if boundary else 1 - lx)
+        )
+
+
+@pytest.mark.parametrize("full", [(1 << 18), (1 << 19), (1 << 20)])
+@pytest.mark.parametrize("fixed_read", [False, True])
+@pytest.mark.parametrize(
+    "role,boundary", [("input", True), ("output", False), ("output", True)]
+)
+def test_pointwise_candidate_tiling_matches_committed_price(
+    full, fixed_read, role, boundary
+):
+    from torch_spyre._inductor.cost_features import _per_tile_elems
+    from torch_spyre._inductor.cost_model import _pointwise_core_excess_ns
+
+    p = CostParams()
+    resident = sympy.Symbol("is_lx_candidate", integer=True, nonnegative=True)
+    tiles = sympy.Symbol("tile_buf1_d0", integer=True, positive=True)
+    op = _pointwise(1, resident=True, out_resident=True, elems=full)
+    index = 1 if role == "input" else 0
+    arg = op.args[index]
+    arg.is_boundary = boundary
+    arg.is_lx = resident
+    arg.elems = _per_tile_elems(full, resident, tiles)
+    arg.loop_factor = tiles if fixed_read else 1
+    expr = sympy.sympify(_pointwise_core_excess_ns([op], p))
+    for count in (1, 4):
+        for lx in (False, True):
+            concrete_arg = dataclasses.replace(
+                arg,
+                is_lx=lx,
+                elems=full // count if lx else full,
+                loop_factor=count if fixed_read else 1,
+            )
+            concrete = dataclasses.replace(op, args=list(op.args))
+            concrete.args[index] = concrete_arg
+            expected = float(_pointwise_core_excess_ns([concrete], p))
+            actual = float(expr.subs({resident: int(lx), tiles: count}))
+            assert actual == pytest.approx(expected)
+            nbytes = concrete_arg.elems * concrete_arg.loop_factor * 2
+            charged = (
+                not lx or (role == "output" and boundary)
+            ) and nbytes >= p.pointwise_core_min_bytes
+            assert (expected > 0) == charged
+
+
 def test_uncalibrated_core_counts_take_the_next_lower_burst_rate():
     """A 12- or 24-core division is priced like 8 or 16 cores, not for free."""
     p = CostParams()
@@ -507,6 +607,88 @@ def test_uncalibrated_core_counts_take_the_next_lower_burst_rate():
     )
     for cores in (3, 6, 12, 24, 32):
         assert float(expr.xreplace({split: cores})) == pytest.approx(float(at(cores)))
+
+
+@pytest.mark.parametrize("boundary", [False, True])
+def test_cpsat_preserves_shared_pointwise_cost_across_tile_candidates(boundary):
+    cp_model = pytest.importorskip("ortools.sat.python.cp_model")
+    from torch_spyre._inductor.cost_features import _per_tile_elems
+    from torch_spyre._inductor.cost_model import _pointwise_core_excess_ns
+    from torch_spyre._inductor.scratchpad.cpsat_expr_printer import _SympyExprToCpSat
+    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
+        _CoreDivisionBufferWithCpVars,
+    )
+    from torch_spyre._inductor.scratchpad.plan_solver import (
+        CoreDivision,
+        CoreDivisionBuffer,
+        TileAxis,
+        TileSpec,
+    )
+
+    p = CostParams()
+    full = 1 << 18  # One read is below the cutoff; four fixed reads exceed it.
+    d0 = sympy.Symbol("d0")
+    resident = sympy.Symbol("is_lx_shared", integer=True, nonnegative=True)
+    model = cp_model.CpModel()
+    is_lx = model.new_bool_var(resident.name)
+    sym_map, buffer_map = {resident.name: is_lx}, {}
+    choices = ((1, 1), (2, 1), (1, 4), (2, 4))
+    wrappers, ops = [], []
+    for i in range(2):
+        buffer = CoreDivisionBuffer(
+            f"reader{i}",
+            full,
+            [0, 1],
+            core_divisions=[
+                CoreDivision(splits={d0: cores}, tiling=TileSpec((TileAxis(0, tiles),)))
+                for cores, tiles in choices
+            ],
+        )
+        wrapper = _CoreDivisionBufferWithCpVars(
+            buffer=buffer, model=model, capacity_units=full
+        )
+        wrappers.append(wrapper)
+        for symbols, variables, raw in (
+            (buffer.sym_core_divs, wrapper.cp_core_divs, wrapper.cp_core_divs_raw),
+            (
+                buffer.sym_tile_counts,
+                wrapper.cp_tile_counts,
+                wrapper.cp_tile_counts_raw,
+            ),
+        ):
+            for key, symbol in symbols.items():
+                sym_map[symbol.name] = variables[key]
+                buffer_map[symbol.name] = (wrapper, raw[key])
+        tiles = buffer.sym_tile_counts[(0, False)]
+        op = _pointwise(
+            buffer.sym_core_divs[d0], resident=resident, out_resident=True, elems=full
+        )
+        op.args[1].is_boundary = boundary
+        op.args[1].elems = _per_tile_elems(full, resident, tiles)
+        op.args[1].loop_factor = tiles
+        ops.append(op)
+    expression = _pointwise_core_excess_ns(ops, p)
+    model.minimize(_SympyExprToCpSat(model, sym_map, buffer_map).convert(expression))
+    solver = cp_model.CpSolver()
+    for first, (cores1, tiles1) in enumerate(choices):
+        for second, (cores2, tiles2) in enumerate(choices):
+            prices = [
+                full
+                * 2
+                * tiles
+                * (1 / (cores * p.pointwise_gbps_per_core) - 1 / p.bw_peak_gbps)
+                if full * 2 * tiles >= p.pointwise_core_min_bytes
+                else 0
+                for cores, tiles in ((cores1, tiles1), (cores2, tiles2))
+            ]
+            for lx in (0, 1):
+                fixed = model.clone()
+                fixed.add(wrappers[0].division == first)
+                fixed.add(wrappers[1].division == second)
+                fixed.add(is_lx == lx)
+                assert solver.solve(fixed) == cp_model.OPTIMAL
+                expected = (max(prices) if boundary else sum(prices)) * (1 - lx)
+                assert solver.objective_value == pytest.approx(expected, abs=1e-3)
 
 
 def _decode_pv(cores, replication, *, reuse=2, loop_factor=1, run=256):
@@ -689,6 +871,41 @@ def test_an_m_only_split_pays_for_every_core_streaming_the_whole_weight():
     # Past the cohort limit the multicast penalty already charges part of it.
     wide = _reused_operand_stream_excess_ns([_gemm(16, 1)], p)
     assert 0 < wide < m_only
+
+
+@pytest.mark.parametrize("boundary", [False, True])
+@pytest.mark.parametrize("second_split", [8, 16])
+def test_stream_shared_input_excess_follows_boundary_ownership(boundary, second_split):
+    from torch_spyre._inductor.cost_model import (
+        _fused_hbm_bytes,
+        _reused_operand_stream_excess_ns,
+    )
+
+    p = CostParams()
+    resident = sympy.Symbol("is_lx_arg5_1", integer=True, nonnegative=True)
+    ops = []
+    prices = []
+    for i, split in enumerate((8, second_split)):
+        op = _gemm(split, 1)
+        op.name = f"matmul{i}"
+        op.args[0].name = f"out{i}"
+        weight = op.args[2]
+        weight.is_boundary = boundary
+        prices.append(float(_reused_operand_stream_excess_ns([op], p)))
+        weight.is_lx = resident
+        ops.append(op)
+    assert all(price > 0 for price in prices)
+    if second_split == 16:
+        assert prices[0] > prices[1]
+    expected = max(prices) if boundary else sum(prices)
+    for readers in (ops, list(reversed(ops))):
+        expr = sympy.sympify(_reused_operand_stream_excess_ns(readers, p))
+        hbm = sympy.sympify(_fused_hbm_bytes(readers)[0])
+        for lx in (0, 1):
+            assert float(hbm.subs(resident, lx)) == 768 * 768 * 2 * (
+                1 if boundary else 2
+            ) * (1 - lx)
+            assert float(expr.subs(resident, lx)) == pytest.approx(expected * (1 - lx))
 
 
 def test_reused_operand_stream_price_is_symbolic_in_the_split():

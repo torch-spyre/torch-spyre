@@ -1762,6 +1762,8 @@ def _reused_operand_stream_excess_ns(ops: list, p: "CostParams"):
 
     A small-M shared decode weight already pays the calibrated delivery term
     of ``_decode_weight_delivery_excess``; leave that operand to that term.
+    Like the base HBM read, a shared boundary input pays the maximum of its
+    readers' excesses once. Internal reads retain their separate charges.
     """
     gbps = p.mm_stream_gbps_per_core
     unicast = p.mm_stream_unicast_ns_per_request
@@ -1783,6 +1785,7 @@ def _reused_operand_stream_excess_ns(ops: list, p: "CostParams"):
     if single_pass is sympy.false:
         return 0.0
     total = 0.0
+    external: dict[str, float | sympy.Expr] = {}
     for op in ops:
         if not op.is_matmul:
             continue
@@ -1842,8 +1845,14 @@ def _reused_operand_stream_excess_ns(ops: list, p: "CostParams"):
                 )
             bursts = _read_burst_arg_excess(op, arg, p)
             price = t - nbytes / p.bw_peak_gbps - (0 if bursts is None else bursts)
-            total += (1 - arg.is_lx) * max(0.0, price)
-    return _select(single_pass, total, 0.0)
+            excess = (1 - arg.is_lx) * max(0.0, price)
+            if arg.is_graph_boundary:
+                external[arg.name] = (
+                    max(external[arg.name], excess) if arg.name in external else excess
+                )
+            else:
+                total += excess
+    return _select(single_pass, total + sum(external.values()), 0.0)
 
 
 def _loop_reread_bytes(ops: list) -> float:
@@ -2516,11 +2525,14 @@ def _pointwise_core_excess_ns(ops: list, p: "CostParams"):
     than ``pointwise_core_min_bytes``. Matmuls, reductions, indirect stores
     and plain copies keep their own core-count terms; a one-input arithmetic
     op pays this as well as its request-law read.
+    Shared boundary inputs use the same per-name maximum as the base HBM
+    load. Internal reads and output writes are charged separately.
     """
     rate, peak = p.pointwise_gbps_per_core, p.bw_peak_gbps
     if rate <= 0 or rate >= peak:
         return 0.0
     total = 0.0
+    external: dict[str, float | sympy.Expr] = {}
     for op in ops:
         if op.is_matmul or op.is_reduction or op.is_indirect_store:
             continue
@@ -2537,13 +2549,27 @@ def _pointwise_core_excess_ns(ops: list, p: "CostParams"):
             if arg.role == "input" and arg.broadcast:
                 continue
             nbytes = arg.elems * (arg.loop_factor or 1) * op.dtype_bytes
-            if _is_sym(nbytes) or nbytes < p.pointwise_core_min_bytes:
-                continue
             is_lx = arg.is_lx
             if arg.role == "output" and arg.is_graph_boundary:
                 is_lx = 0  # the clone-out still writes it
-            total += (1 - is_lx) * nbytes * per_byte
-    return total
+            elif _is_sym(is_lx):
+                # Candidate tiling shrinks LX allocations, but HBM retains
+                # the full extent. Keep that extent inside the residency gate.
+                nbytes = sympy.sympify(nbytes).subs(is_lx, 0)
+            elif is_lx:
+                continue
+            # A candidate can also vary the loop factor or a clone-out's
+            # extent. Apply the cutoff to its chosen size in either form.
+            excess = (1 - is_lx) * _select(
+                nbytes >= p.pointwise_core_min_bytes, nbytes * per_byte, 0.0
+            )
+            if arg.role == "input" and arg.is_graph_boundary:
+                external[arg.name] = (
+                    max(external[arg.name], excess) if arg.name in external else excess
+                )
+            else:
+                total += excess
+    return total + sum(external.values())
 
 
 def transport_dma_cost_available(op: OpFeatures, p: "CostParams") -> bool:
