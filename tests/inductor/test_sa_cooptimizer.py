@@ -44,11 +44,10 @@ import sympy
 
 from torch_spyre._inductor import config as ts_config
 from torch_spyre._inductor.scratchpad import allocator as allocator_module
+from torch_spyre._inductor.scratchpad import sa_cooptimizer as sa_module
 from torch_spyre._inductor.scratchpad import utils
 from torch_spyre._inductor.scratchpad.sa_cooptimizer import (
     _MAX_STEPS,
-    _MIN_STEPS,
-    _STEPS_PER_BUFFER,
     DivisionConfig,
     SaCoOptimizingSolver,
     _canonical_key,
@@ -57,6 +56,7 @@ from torch_spyre._inductor.scratchpad.sa_cooptimizer import (
     _TableRelation,
     _ViewRelation,
     _one_axis_apart,
+    _step_budget,
     _table_relation,
 )
 from torch_spyre._C import NativePermutationLayoutSolver
@@ -69,6 +69,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionBuffer,
     TileAxis,
     TileSpec,
+    cost_expr_record,
 )
 from synthetic_cooptimization_graphs import synthetic_graphs
 from utils_inductor import (
@@ -759,27 +760,20 @@ class SnapshotRestoreTest(TestCase):
 
 
 class StepBudgetTest(TestCase):
-    """``clamp(_STEPS_PER_BUFFER * n, _MIN_STEPS, _MAX_STEPS)`` -- the same shape
-    the layout-only annealer's schedule uses, so neither engine grows without
-    bound."""
+    """``min(200 n, 50000)``. The literals pin the tuned constants: a retune
+    has to update them here."""
 
-    @staticmethod
-    def _budget(n):
-        """The budget ``_anneal`` computes for ``n`` buffers."""
-        return min(_MAX_STEPS, max(_MIN_STEPS, _STEPS_PER_BUFFER * n))
+    def test_no_buffers_get_no_steps(self):
+        self.assertEqual(_step_budget(0), 0)
 
-    def test_rate_applies_between_the_floor_and_the_ceiling(self):
-        self.assertEqual(self._budget(100), _STEPS_PER_BUFFER * 100)
-
-    def test_floor_applies_to_tiny_graphs(self):
-        self.assertEqual(self._budget(1), _MIN_STEPS)
+    def test_rate_applies_below_the_ceiling(self):
+        self.assertEqual(_step_budget(1), 200)
+        # The largest captured graph: the ceiling is inert across the corpus.
+        self.assertEqual(_step_budget(79), 15_800)
 
     def test_ceiling_caps_large_graphs(self):
-        binds_at = _MAX_STEPS // _STEPS_PER_BUFFER
-        self.assertEqual(self._budget(binds_at * 4), _MAX_STEPS)
-        # Inert across the validated corpus: the largest captured graph is n=79,
-        # far below where the ceiling starts binding.
-        self.assertGreater(binds_at, 79)
+        self.assertEqual(_step_budget(250), 50_000)
+        self.assertEqual(_step_budget(251), 50_000)
 
     def test_ceiling_is_higher_than_the_layout_only_annealer(self):
         """The joint engine searches divisions too, so it wants a larger budget
@@ -1302,6 +1296,38 @@ class CostExprScoringTest(TestCase):
             utils.to_fixed_us((4 * 10 + 2 * 100 + 2 * 1000) / 1000),
         )
 
+    def test_the_tile_count_symbol_drives_the_score(self):
+        # The tiling half of the two tests above: a chosen ``TileSpec`` reaches
+        # the scorer through the per-axis symbol its buffer declares, and an
+        # axis no level cuts values at 1 rather than dropping out.
+        buf = _cdbuf("A", [], {})
+        buf.division_space = _two_axis_space(tiling=_tiling_space({0: [2, 4], 1: [2]}))
+        solver = SaCoOptimizingSolver([buf], 1 << 30, 128)
+        syms = buf.sym_tile_counts
+        # One per dim the space offers a level on, not one per axis: an axis
+        # nothing can tile carries no decision to price.
+        self.assertEqual(set(syms), {(0, False), (1, False)})
+        cost_expr = syms[0, False] * 10 + syms[1, False] * 100
+        solver.plan_layout_and_core_divisions(cost_expr)
+        self.assertIsNotNone(solver._score_fn)
+        untiled = _config(CoreDivision(splits={_AXIS_0: 2}))
+        tiled = _config(CoreDivision(splits={_AXIS_0: 2}, tiling=_TILE_4))
+        self.assertEqual(
+            solver._score_fn([untiled], frozenset()),
+            utils.to_fixed_us((10 + 100) / 1000),
+        )
+        self.assertEqual(
+            solver._score_fn([tiled], frozenset()),
+            utils.to_fixed_us((4 * 10 + 100) / 1000),
+        )
+
+    def test_a_space_without_tilings_declares_no_tile_symbol(self):
+        # Every engine but this one, and this one with auto_coarse_tiling off.
+        plain = _cdbuf("A", [], {})
+        self.assertEqual(plain.sym_tile_counts, {})
+        plain.division_space = _two_axis_space()
+        self.assertEqual(plain.sym_tile_counts, {})
+
     def test_unrecognized_free_symbol_falls_back_to_memory_only(self):
         # A dynamic-shape symbol (or anything else the allocator's build could
         # have left in) that isn't one of these buffers' own symbols must not
@@ -1529,6 +1555,44 @@ class DivisionSourceTest(TestCase):
 
 _TILE_2 = TileSpec((TileAxis(host_dim=0, count=2),))
 _TILE_4 = TileSpec((TileAxis(host_dim=0, count=4),))
+
+
+class TilingBoundaryResidencyTest(TestCase):
+    """``SaCoOptimizingSolver._read_across_a_tiling_boundary``."""
+
+    def _pair(self, parent_tiling=TileSpec(), child_tiling=TileSpec()):
+        parent = _cdbuf("P", [], {}, divisions=_TWO_AXIS_MENU)
+        child = _cdbuf("C", ["P"], {"P": [(0, 0)]}, divisions=_TWO_AXIS_MENU)
+        for buf in (parent, child):
+            buf.division_space = _two_axis_space(tiling=_tiling_space())
+        solver = _primed([parent, child], 1 << 30)
+        solver.chosen[0] = _config(CoreDivision(tiling=parent_tiling))
+        solver.chosen[1] = _config(CoreDivision(tiling=child_tiling))
+        return solver
+
+    def test_an_untiled_producer_read_by_a_tiled_consumer_is_refused(self):
+        solver = self._pair(child_tiling=_TILE_2)
+        self.assertTrue(solver._read_across_a_tiling_boundary(0, solver.chosen[0]))
+        self.assertFalse(solver._eligible(0))
+
+    def test_an_untiled_pair_is_untouched(self):
+        solver = self._pair()
+        self.assertFalse(solver._read_across_a_tiling_boundary(0, solver.chosen[0]))
+        self.assertTrue(solver._eligible(0))
+
+    def test_a_tiled_producer_keeps_its_residency(self):
+        for child_tiling in (_TILE_2, _TILE_4, TileSpec()):
+            solver = self._pair(parent_tiling=_TILE_2, child_tiling=child_tiling)
+            self.assertFalse(
+                solver._read_across_a_tiling_boundary(0, solver.chosen[0]),
+                child_tiling.label,
+            )
+
+    def test_the_consumer_side_is_not_refused(self):
+        # The gate is about being *read* across the boundary, not about reading
+        # across it: the tiled consumer's own output is per-tile scratch.
+        solver = self._pair(child_tiling=_TILE_2)
+        self.assertFalse(solver._read_across_a_tiling_boundary(1, solver.chosen[1]))
 
 
 def _menu_seed():
@@ -1852,7 +1916,12 @@ class TestCoarseTilingIsGatedOnTheFlag(TestCase):
         )
 
     def test_only_the_annealer_is_offered_them_and_only_with_the_flag_on(self):
-        """Only a search that generates divisions can carry a ``TileSpec``."""
+        """Only a search that generates divisions can carry a ``TileSpec``:
+        CP-SAT chooses tilings too, but off the menu."""
+        from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
+            CpSatLayoutSolver,
+        )
+
         for flag in (False, True):
             with (
                 self.subTest(auto_coarse_tiling=flag),
@@ -1863,7 +1932,7 @@ class TestCoarseTilingIsGatedOnTheFlag(TestCase):
                     flag,
                 )
                 self.assertFalse(
-                    self._allocator(mock.MagicMock())._solver_chooses_tilings
+                    self._allocator(CpSatLayoutSolver)._solver_chooses_tilings
                 )
 
 
@@ -1877,19 +1946,22 @@ def _run_buffer(name, position, space=None):
     return buf
 
 
-def _run_solver(names, untiled=()):
+def _run_solver(names, untiled=(), parents=None):
     """A primed solver over ``names`` at consecutive operation positions, each
-    with a tiling space unless named in ``untiled``. A ``None`` name leaves its
-    position to an operation with no buffer."""
-    bufs = [
-        _run_buffer(
+    with a tiling space unless named in ``untiled``; ``parents`` maps a name to
+    the producers it reads. A ``None`` name leaves its position to an operation
+    with no buffer."""
+    bufs = []
+    for position, name in enumerate(names):
+        if name is None:
+            continue
+        buf = _run_buffer(
             name,
             position,
             _two_axis_space(tiling=None if name in untiled else _tiling_space()),
         )
-        for position, name in enumerate(names)
-        if name is not None
-    ]
+        buf.parents = list((parents or {}).get(name, ()))
+        bufs.append(buf)
     return _primed(bufs, 1 << 30)
 
 
@@ -2143,3 +2215,186 @@ class ApplyGroupAgreementTest(TestCase):
         relation = _primed([parent, child], 1 << 30)._relations[(0, 1)]
         self.assertFalse(relation.carries(_TILE_2))
         self.assertTrue(relation.carries(TileSpec((TileAxis(host_dim=1, count=2),))))
+
+    def test_the_companions_are_the_applied_groups(self):
+        # [KT] [S, V] [O]: KT escapes to S, S and V to O; each pays the copy's
+        # write and one full-extent read while resident. One run would pay 0.
+        solver = self._solver(_attention_ops())
+        self.assertEqual(solver._companion_bytes([0] * 4), 3 * 2 * 1024)
+
+
+class CompanionBufferPricingTest(TestCase):
+    """A tiling shrinks what a buffer holds, not what it moves. For an op whose
+    output leaves its tiling group the apply allocates a full-extent companion,
+    drains one tile into it per iteration and repoints the outside consumers at
+    it -- none of which is in features extracted from the untiled graph. Priced
+    honestly, tiling pays for an op whose consumers stay inside its own run and
+    costs a full HBM round trip for one that is not resident."""
+
+    SIZE = 1024  # ``_cdbuf``'s
+
+    @staticmethod
+    def _addresses(solver, resident):
+        return [0 if i in resident else None for i in range(len(solver._bufs))]
+
+    def test_an_untiled_state_prices_no_companions(self):
+        solver = _run_solver("AB", parents={"B": ["A"]})
+        self.assertEqual(solver._companion_bytes(self._addresses(solver, {0, 1})), 0)
+
+    def test_a_search_with_no_tiling_space_prices_no_companions(self):
+        solver = _run_solver("AB", parents={"B": ["A"]}, untiled="AB")
+        self.assertEqual(solver._companion_bytes(self._addresses(solver, {0, 1})), 0)
+
+    def test_a_consumer_inside_the_run_costs_nothing(self):
+        # Nothing escapes, so the apply keeps the buffer as loop-internal
+        # scratch and allocates no companion -- the shape the recolor flood
+        # exists to build, and the only one where tiling is free.
+        solver = _run_solver("AB", parents={"B": ["A"]})
+        for idx in (0, 1):
+            solver.chosen[idx] = _tiled(solver, idx)
+        self.assertEqual(solver._run_bounds(0), (0, 1))
+        self.assertEqual(solver._companion_bytes(self._addresses(solver, {0, 1})), 0)
+
+    def test_the_search_tiles_a_run_its_output_stays_inside(self):
+        # A feeds B and nothing else. Untiled, no per-core footprint fits beside
+        # the other (8192 / 8 cores = 1024 > 512), so both spill; tiled 4 ways
+        # in one run, both fit and A's output never leaves the run. The search
+        # has to find that on its own, and the objective has to let it pay.
+        # The seeded search depends on _SEED, _MOVE_WEIGHTS and the step budget.
+        # It finds the tiling on seeds 0-19 under several weight mixes with 200
+        # or more steps (it gets 400), but on only 13 of 20 seeds with 80, so a
+        # retune that cuts a two-buffer budget may need to touch this test.
+        bufs = [self._sized_run_buffer("A", 0), self._sized_run_buffer("B", 1)]
+        bufs[1].parents = ["A"]
+        bufs[1].residency_edges = {"A": self._identity_edge()}
+        solver = SaCoOptimizingSolver(bufs, 512, 128)
+        with self.assertLogs(sa_module.logger, level="DEBUG") as logs:
+            solver.plan_layout_and_core_divisions()
+        self.assertEqual([config.tiling for config in solver.chosen], [_TILE_4] * 2)
+        self.assertEqual(solver._run_bounds(0), (0, 1))
+        self.assertTrue(all(buf.address is not None for buf in bufs))
+        self.assertEqual(solver.best_score, 0)
+        self.assertIn(
+            f"tiled A, B at {_TILE_4.label}; companion HBM traffic 0 bytes",
+            "\n".join(logs.output),
+        )
+
+    def test_a_search_that_keeps_no_tiling_says_so(self):
+        # Everything fits untiled, so no tiling pays.
+        solver = _run_solver("AB", parents={"B": ["A"]})
+        with self.assertLogs(sa_module.logger, level="INFO") as logs:
+            solver.plan_layout_and_core_divisions()
+        self.assertIn(
+            "kept no coarse tiling; 2 buffer(s) could tile", "\n".join(logs.output)
+        )
+
+    @staticmethod
+    def _sized_run_buffer(name, position):
+        buf = _run_buffer(name, position, _two_axis_space(tiling=_tiling_space()))
+        buf.size = 8192
+        return buf
+
+    @staticmethod
+    def _identity_edge():
+        """A residency edge whose consumer reads the producer's view as written,
+        so the two ends agree exactly when their splits do."""
+        edge = mock.MagicMock()
+        edge.compatible.side_effect = lambda parent, child: parent == child
+        edge.consumer_division_for.side_effect = lambda division, _space: division
+        edge.parent_division_for.side_effect = lambda division, _space: division
+        return edge
+
+    def test_a_resident_buffer_pays_the_copy_out_and_its_outside_readers(self):
+        # A tiled, B and C untiled and reading it: A's run is itself alone, so
+        # both readers take the full buffer from HBM, and residency of the
+        # per-tile scratch no longer serves them.
+        solver = _run_solver("ABC", parents={"B": ["A"], "C": ["A"]})
+        solver.chosen[0] = _tiled(solver, 0)
+        self.assertEqual(solver._run_bounds(0), (0, 0))
+        self.assertEqual(
+            solver._companion_bytes(self._addresses(solver, {0})),
+            3 * self.SIZE,  # the copy's write + two full-extent reads
+        )
+
+    def test_a_spilled_buffer_pays_the_scratch_round_trip_instead(self):
+        # Not resident, the per-tile scratch is itself in HBM: the copy reads it
+        # back and writes the full buffer, and the readers were already charged.
+        # Independent of how many readers there are.
+        solver = _run_solver("ABC", parents={"B": ["A"], "C": ["A"]})
+        solver.chosen[0] = _tiled(solver, 0)
+        self.assertEqual(
+            solver._companion_bytes(self._addresses(solver, set())), 2 * self.SIZE
+        )
+
+    def test_a_resident_tiled_graph_output_pays_nothing(self):
+        # The copy's write IS the externally visible write, which the model
+        # charges whether or not the buffer is resident (#4271), so it replaces
+        # a write already counted rather than adding one.
+        solver = _run_solver("A")
+        solver._bufs[0].boundary = BufferType.Output
+        solver.chosen[0] = _tiled(solver, 0)
+        self.assertEqual(solver._companion_bytes(self._addresses(solver, {0})), 0)
+
+    def test_a_consumer_with_no_operation_position_counts_as_outside(self):
+        # Nothing can carry a tiling to a buffer in no run, so a group
+        # containing it is not known to be contiguous; charging is the safe
+        # direction, matching what ``_trim_tilings_to_anchor_run`` refuses.
+        solver = _run_solver("AB", parents={"B": ["A"]})
+        solver._bufs[1].op_position = None
+        solver._precompute_topology()
+        solver.chosen = solver._seed_configs()
+        solver.chosen[0] = _tiled(solver, 0)
+        self.assertEqual(
+            solver._companion_bytes(self._addresses(solver, {0})), 2 * self.SIZE
+        )
+
+    def test_the_score_carries_the_companion_traffic(self):
+        solver = _run_solver("AB", parents={"B": ["A"]})
+        before = solver._score()
+        with mock.patch.object(solver, "_companion_bytes", return_value=4096):
+            after = solver._score()
+        self.assertEqual(
+            after - before, utils.to_fixed_us(4096 / solver._hbm_bytes_per_us)
+        )
+
+
+class CostDumpScoreTest(TestCase):
+    """The cost dump's ``score_ns`` is what the search minimized: ``cost_expr``
+    plus the terms :meth:`SaCoOptimizingSolver._score` adds outside it."""
+
+    def _solved(self):
+        # A tiled alone with two untiled readers, so its output escapes.
+        bufs = [_run_buffer("A", 0, _two_axis_space(tiling=_tiling_space()))]
+        for position, name in ((1, "B"), (2, "C")):
+            bufs.append(_run_buffer(name, position, _two_axis_space()))
+            bufs[-1].parents = ["A"]
+        cost_expr = 1e6 / bufs[0].sym_tile_counts[0, False]
+        solver = SaCoOptimizingSolver(bufs, 1 << 30, 128)
+        result = solver.plan_layout_and_core_divisions(cost_expr)
+        return solver, cost_expr, result
+
+    def _record(self, solver, cost_expr, result):
+        return cost_expr_record(
+            cost_expr,
+            [],
+            result,
+            off_expression_ns=solver.off_expression_ns(),
+            score_ns=solver.score_ns(),
+        )
+
+    def _assert_score(self, record, solver):
+        self.assertAlmostEqual(record["score_ns"], solver.best_score / 1000, places=2)
+        self.assertAlmostEqual(
+            record["score_ns"],
+            record["objective_ns"] + sum(record["off_expression_ns"].values()),
+            places=2,
+        )
+
+    def test_score_ns_is_the_best_score_with_a_companion(self):
+        solver, cost_expr, result = self._solved()
+        record = self._record(solver, cost_expr, result)
+        self.assertGreater(record["off_expression_ns"]["companions"], 0)
+        self.assertNotAlmostEqual(
+            record["objective_ns"], solver.best_score / 1000, places=2
+        )
+        self._assert_score(record, solver)

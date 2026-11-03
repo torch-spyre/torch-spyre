@@ -62,7 +62,7 @@ to change an id; if it ever does, those tests are the thing that must stop it.
 | `vllm.py` | vLLM bench JSON -> `benchmarks`/`benchmark_runs` (`report_kind=vllm`): spyre-inference's live perf ingest and vLLM bundles |
 | `sendnn.py` | the perf suite's report_sendnn.txt -> `benchmark_runs` on backend `sendnn` (`report_kind=perf-suite-sendnn-txt`): sendnn bundles |
 | `offline.py`, `bundle.schema.json` | `results --offline` / `--upload` / `--validate-only`: write, check and upload a results bundle, standard library only ([below](#offline-results-bundles)) |
-| `bundle.py` | `results --from-bundle`: record a bundle in spyre_v2 (the relay) |
+| `bundle.py` | `results --from-bundle`: record a bundle in spyre_v2 (the relay, and a connected vllm / sendnn / benchmarks run) |
 | `gha_runs.py` | polls GitHub Actions runs and jobs into `pipeline_runs` (`source='gha'`); the Jenkins rows come from spyre-frameworks |
 | `ci_run_timings.py` | one orchestrator run's timeline into `ci_run_timings`, a row per build and test leg (`python -m spyre_clickhouse_ingest ci-run-timings write`); the batch comes from spyre-frameworks |
 | `dispatch.py` | artifact subscriptions, requests and the dispatch ledger: derived ids, template rendering, the rate-limit/coalescing `decide`, and `python -m spyre_clickhouse_ingest dispatch request\|preview`; the trigger loop is spyre-frameworks' artifact-dispatch job |
@@ -255,6 +255,20 @@ results only: its artifact must already be in spyre_v2, and a manual bundle adds
 | check one | `results --from-bundle <dir\|tgz> --validate-only` |
 | record one (the relay) | `results --from-bundle <dir\|tgz> --strict` |
 
+A **connected** run records every kind directly with the same flags, no `--offline`:
+
+| kind | direct (connected) command |
+|---|---|
+| junit | `results --schema v2 --xml-dir <dir> <the usual flags>` |
+| vllm | `results --vllm-results-dir <dir> [--perf k=v] <the usual flags>` |
+| sendnn | `results --kind sendnn --sendnn-report report_sendnn.txt --triggered-at <ISO-8601> <the usual flags>` |
+| benchmarks | `results --benchmarks-dir <dir> --trigger-type perf\|quality --component <suite owner> <the usual flags>` |
+
+vllm, sendnn and benchmarks are v2-only. A direct run writes the bundle `--offline` would, in a
+temporary folder, and records it as the relay does (`--strict` applies). So its rows match an
+uploaded bundle's, `source=bundle` included. It needs `CLICKHOUSE_DB_V2`, and the run key is
+`--jenkins-run-key` when given, else `manual:<user>:<bundle sha256>`.
+
 The usual flags are `--artifact id:<uuid>`, or `image:<repo>@sha256:<digest>` (and
 `--artifact-id <uuid>` beside an image), plus:
 - `--arch` (default: this host);
@@ -279,7 +293,7 @@ A folder, or a `.tgz` of one:
 
 ```
 bundle.json        # bundle.schema.json
-results/           # JUnit *.xml, (kind vllm) vLLM bench *.json, (kind sendnn) report_sendnn.txt, or (kind benchmarks) *.json; flat
+results/           # JUnit *.xml, (kind vllm) vLLM bench *.json, (kind sendnn) report_sendnn.txt, (kind benchmarks) *.json, or (kind tables) <table>.json; flat
 attachments/...    # optional: logs, .cmd files; kept with the bundle, not ingested
 ```
 
@@ -291,6 +305,7 @@ The **minimal** bundle.json is the artifact and the tier, beside at least one re
 {"kind": "vllm", "artifact_id": "<uuid>"}
 {"kind": "sendnn", "artifact_id": "<uuid>", "started_at": "2026-10-06T11:56:00Z"}
 {"kind": "benchmarks", "artifact_id": "<uuid>", "test_type": "quality", "component": "spyre-inference"}
+{"kind": "tables", "artifact_id": "<uuid>", "test_type": "regression", "component": "my-suite"}
 ```
 
 Everything else is optional (`--offline` writes most of it):
@@ -315,7 +330,11 @@ run_key that already has another run's or bundle's results. The verdict's `props
 **vLLM bundles** hold the runner's `results/`: `<test_name>.json` from
 `vllm bench latency|throughput|serve`, and `<test_name>.pytorch.json` when
 `SAVE_TO_PYTORCH_BENCHMARK_FORMAT=1`. Keep the latter: the `latency` samples and the model name
-come from it.
+come from it. The runner's host resource sampler also writes `<test_name>.host_resources.json`:
+JSON lines of `{"test_name", "metric", "value"[, "model"]}`, e.g. `host_cpu_pct_total_mean` (%)
+or `compile_host_mem_mb_peak` (MB). A bundle need not include it. The record's
+`test_name` and `model` take precedence over the file name and the sibling
+`.pytorch.json`.
 - `test_name` is `<latency|throughput|serve>_<model>_tp<N>_in<N>_out<N>`, as in spyre-inference's
   `vllm-benchmarks/` configs. The mode and shapes are the benchmark's identity, and must agree
   with `perf` when it gives them. A concurrency sweep, `serving_<model>_c<N>_n<N>_..._len<N>_seqs<N>`,
@@ -344,6 +363,14 @@ own: accuracy evals (lm-eval tasks, MTEB, RAG) and other harnesses. Each `result
   bundle the verdict links (`bundle_url`) keeps them.
 - Accuracy metrics (`exact_match`, `acc_norm`, `ndcg_at_10`, `spearman`, `rouge*`, ...) are
   higher-is-better in `benchmark_metric_policy`, advisory.
+
+**tables bundles** hold one JSON file per results table, named after it: `results/test_case_runs.json`,
+`benchmark_runs.json`, `capability_runs.json`, `artifact_results.json`, each `{"rows": [...]}`. Rows
+carry the identity fields their table hashes (a test's `classname`/`name`, a benchmark's `name`/`props`),
+never ids; the same writers a CI run uses derive the ids and fill `test_cases`, `benchmarks` and
+`capabilities`. A benchmark row may list which `props` are identity (`"identity": []` keys it by name
+alone). The formats, fields and examples for every table are in
+[docs/table-formats.md](docs/table-formats.md); JSON Schemas are in [docs/schemas/](docs/schemas).
 
 **An image no pipeline of ours built** (a partner's image, say) has no artifact to attach a
 verdict to. `"create_artifact": {"component": "<owner>", "name": "<optional>"}` with `image` (by

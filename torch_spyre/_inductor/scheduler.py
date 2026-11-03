@@ -38,8 +38,10 @@ from .spyre_kernel import SpyreKernel
 from .ir import FixedTiledLayout
 from .pass_utils import iteration_space
 from .logging_utils import get_inductor_logger
+from .loop_facts import scheduler_enclosing_loops
 from .scratchpad.lx_relayout import (
     demote_lx_relayout_group,
+    local_lx_emission_contract,
     materialized_lx_relayout_for_destination,
 )
 from .op_spec import LoopSpec
@@ -97,12 +99,8 @@ class CountedLoopSchedulerNode(FusedSchedulerNode):
 
 def _loop_group_id(node: BaseSchedulerNode):
     """Return the loop_group_id of the ir.Operation inside node, or None."""
-    for snode in node.get_nodes():
-        if isinstance(snode, SchedulerNode) and snode.node is not None:
-            loop_info = getattr(snode.node, "loop_info", None)
-            if loop_info is not None:
-                return loop_info.loop_group_id
-    return None
+    levels = scheduler_enclosing_loops(node)
+    return levels[-1].group_path if levels else None
 
 
 def _loop_count(node: BaseSchedulerNode, depth: int) -> sympy.Expr:
@@ -110,26 +108,16 @@ def _loop_count(node: BaseSchedulerNode, depth: int) -> sympy.Expr:
 
     ``loop_count`` on the ir.Operation is a list of trip counts, one per
     nesting level from outermost to innermost (stamped by
-    coarse_tile_pre_stickify()/coarse_tile_post_stickify()).
+    coarse_tile_post_stickify() or the for_each_tile lowering).
     ``depth`` is the absolute nesting depth being queried (0 = outermost).
 
     For a flat (depth-1) op, ``loop_count = [K]`` and only depth 0 is valid.
     For a nested op with ``loop_group_id = (g, 0)``, ``loop_count = [K1, K2]``
     and depth 0 → K1, depth 1 → K2.
     """
-    for snode in node.get_nodes():
-        if isinstance(snode, SchedulerNode) and snode.node is not None:
-            loop_info = getattr(snode.node, "loop_info", None)
-            if loop_info is not None:
-                counts: list = loop_info.loop_count
-                gid = loop_info.loop_group_id
-                # coarse_tile stamps one count per nesting level, so
-                # len(counts) == len(gid) always holds.
-                assert len(counts) == len(gid), (
-                    f"loop_count length {len(counts)} != loop_group_id depth {len(gid)}"
-                )
-                if 0 <= depth < len(counts):
-                    return counts[depth]
+    levels = scheduler_enclosing_loops(node)
+    if 0 <= depth < len(levels):
+        return levels[depth].trip_count
     raise AssertionError(f"Node {node.get_name()} has no loop_count for depth {depth}")
 
 
@@ -547,6 +535,9 @@ class SuperDSCScheduling(BaseScheduling):
         # _codegen_into_kernel may reach further inner nodes, so the set can be a
         # subset -- which errs towards declining.
         kernel.fused_node_names = OrderedSet(n.get_name() for n in nodes)
+        kernel.local_read_contract_factory = lambda name, consumer: (
+            local_lx_emission_contract(V.graph, name, consumer)
+        )
         with kernel:
             self._codegen_into_kernel(nodes, kernel)
         if isinstance(node, CountedLoopSchedulerNode):

@@ -138,8 +138,6 @@ class TestLxPlanningSuiteGeneration(unittest.TestCase):
         "test_single_dim_reduction_invalid_dims_api",
         "test_single_dim_reduction_invalid_dims_spyre",
         "test_is_nonzero_error_cases",
-        "test_restickify_fp32_unsupported",
-        "test_restickify_int64_unsupported",
         "test_slice_scatter_step_raises",
         "test_slice_stick_mutation_no_alt_dim_raises",
     )

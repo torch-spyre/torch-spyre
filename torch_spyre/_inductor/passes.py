@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import inspect
 import logging
 import time
+from collections.abc import Iterator
 from typing import Optional, Any, Callable
 
 import torch
@@ -36,6 +38,7 @@ from torch._inductor.scheduler import BaseSchedulerNode
 
 from . import timing_recorder
 from .logging_utils import get_inductor_logger
+from .pass_counters import COUNTERS
 from .provenance import SpyreGraphTransformObserver, reset_provenance_warnings
 
 from .padding import insert_bmm_padding, insert_restickify_padding
@@ -87,8 +90,10 @@ from .scheduler import (
 )
 from .constants import DEVICE_NAME
 from .deadcode_elimination import deadcode_elimination
+from .loop_node import OpsView, all_ops, expand, expanded, has_loop_nodes
 from .dedup_constants import dedup_and_promote_constants
 from .read_copy_elision import elide_proven_read_copies
+from .materialize_hinted_views import materialize_hinted_views
 from .wsr.coarse_tile import coarse_tile_post_stickify
 from .dump_cost_model import dump_cost_model
 
@@ -151,6 +156,11 @@ def _operations_have_spyre_device(operations: list[Operation]) -> bool:
     )
 
 
+def _count_ops(operations) -> int:
+    """Leaf op count; the splice leaves LoopNodes in the real list it returns."""
+    return sum(1 for _ in all_ops(operations))
+
+
 def _uuid(passes: list[Callable]) -> Optional[Any]:
     # A pass is hashed by its own source file, unless it is a wrapper that
     # declares the real passes it runs via @_runs — then we hash those.
@@ -181,6 +191,10 @@ class _SpyreGraphPassPipeline(CustomGraphPass):
         # FX-graph passes are already observed by upstream Inductor's
         # GraphTransformObserver (populates node.meta["from_node"]); no Spyre
         # observer is wrapped here.
+        #
+        # Counter deltas are attached like the node counts are, and nest the way
+        # inclusive_ns does: a pipeline's counts include its passes'.
+        pipeline_counts = COUNTERS.snapshot()
         with timing_recorder.stage(
             f"pipeline:{pipeline}",
             passes=len(self.passes),
@@ -188,6 +202,7 @@ class _SpyreGraphPassPipeline(CustomGraphPass):
         ) as pipeline_event:
             for p in self.passes:
                 name = _get_pass_name(p) if counting else ""
+                pass_counts = COUNTERS.snapshot()
                 with timing_recorder.stage(
                     f"pass:{pipeline}:{name}",
                     input_nodes=len(graph.nodes) if counting else 0,
@@ -195,8 +210,10 @@ class _SpyreGraphPassPipeline(CustomGraphPass):
                     p(graph)
                 if counting:
                     event.meta["output_nodes"] = len(graph.nodes)
+                    event.meta.update(COUNTERS.since(pass_counts))
         if counting:
             pipeline_event.meta["output_nodes"] = len(graph.nodes)
+            pipeline_event.meta.update(COUNTERS.since(pipeline_counts))
 
     def uuid(self) -> Any | None:
         return _uuid(self.passes)
@@ -218,6 +235,7 @@ class _SpyreNodePassPipeline(CustomSchedulerPass):
         # so clear the dedup here so each compile warns afresh.
         reset_provenance_warnings()
         pipeline = type(self).__name__
+        pipeline_counts = COUNTERS.snapshot()
         with timing_recorder.stage(
             f"pipeline:{pipeline}", passes=len(self.passes), input_nodes=len(target)
         ) as pipeline_event:
@@ -225,15 +243,18 @@ class _SpyreNodePassPipeline(CustomSchedulerPass):
                 name = _get_pass_name(pass_fn)
                 observer = SpyreGraphTransformObserver(target, name, kind="node")
                 with observer:
+                    pass_counts = COUNTERS.snapshot()
                     with timing_recorder.stage(
                         f"pass:{pipeline}:{name}", input_nodes=len(target)
                     ) as event:
                         target = pass_fn(target)
                     event.meta["output_nodes"] = len(target)
+                    event.meta.update(COUNTERS.since(pass_counts))
                     # Reconcile the returned list while recursively inspecting
                     # the underlying buffers through scheduler get_nodes().
                     observer.target = target
         pipeline_event.meta["output_nodes"] = len(target)
+        pipeline_event.meta.update(COUNTERS.since(pipeline_counts))
         return target
 
     def uuid(self) -> Any | None:
@@ -257,7 +278,7 @@ class CustomPrePasses(_SpyreGraphPassPipeline):
     """
 
     def __init__(self):
-        super().__init__([collect_spyre_hints])
+        super().__init__([materialize_hinted_views, collect_spyre_hints])
 
 
 class CustomPostPasses(_SpyreGraphPassPipeline):
@@ -411,6 +432,50 @@ def _maybe_scratchpad_planning(graph: GraphLowering) -> None:
     scratchpad_planning(graph, lx_relayout_plans=plans)
 
 
+# Passes the flat view cannot run as they run today, so they run on the
+# expanded list and the nodes are rebuilt after them.
+# ``dedup_and_promote_constants`` ends with ``operations[:] = constants +
+# non_constants``: it hoists every constant to the head of the WHOLE list. The
+# view keeps a constant that sits in a body inside that body (it cannot tell
+# whether a reorder means to cross a node boundary), and the node then sorts by
+# that constant, ahead of top-level ops it used to follow. On nested graphs that
+# changes the op order and the kernel (spec B.7, pass 18).
+_PASSES_RUN_EXPANDED = frozenset({"dedup_and_promote_constants"})
+
+
+@contextlib.contextmanager
+def _flat_operations(graph: GraphLowering, pass_name: str) -> Iterator[None]:
+    """For one pre-scheduling pass: if the graph holds LoopNodes, show the pass
+    (and the observer, timing and logging around it) a flat view of them.
+
+    No pass is node-aware yet. While the pass runs, ``graph.operations`` is a
+    ``loop_node.OpsView`` over the real nested list: it iterates the leaf ops
+    in program order and forwards each edit to the list that owns the op. The
+    real list is put back afterwards. A pass that rebinds ``graph.operations``
+    to a new list would silently drop the nodes, so that raises.
+    """
+    real = graph.operations
+    if not has_loop_nodes(real):
+        yield
+        return
+    if pass_name in _PASSES_RUN_EXPANDED:
+        with expanded(graph):
+            yield
+        return
+    view = OpsView(real)
+    graph.operations = view
+    try:
+        yield
+    finally:
+        rebound = graph.operations
+        graph.operations = real
+    if rebound is not view:
+        raise RuntimeError(
+            f"pre-scheduling pass {pass_name} rebound graph.operations while "
+            "LoopNodes were present; edit it in place"
+        )
+
+
 class CustomPreSchedulingPasses:
     """
     Spyre-specific passes that run on the GraphLowering immediately before the
@@ -532,6 +597,7 @@ class CustomPreSchedulingPasses:
         clear_marker_maps()
 
         pipeline = type(self).__name__
+        pipeline_counts = COUNTERS.snapshot()
         with timing_recorder.stage(
             f"pipeline:{pipeline}",
             passes=len(self.passes),
@@ -546,7 +612,14 @@ class CustomPreSchedulingPasses:
                     )
 
             with timing_recorder.stage(f"stage:{pipeline}:pass_loop"):
-                self._run_pass_loop(graph)
+                try:
+                    self._run_pass_loop(graph)
+                finally:
+                    # splice_while_loops wraps each loop into a LoopNode; flatten
+                    # them again so the cost model, the scheduler and codegen see
+                    # today's flat list. In a finally so an error in a pass does
+                    # not leave nodes behind for an error handler to trip over.
+                    expand(graph)
 
             if logger.isEnabledFor(logging.INFO):
                 with timing_recorder.stage(f"stage:{pipeline}:log_after"):
@@ -575,37 +648,52 @@ class CustomPreSchedulingPasses:
                 finalize_work_division_for_scheduler(graph)
 
         pipeline_event.meta["output_operations"] = len(graph.operations)
+        pipeline_event.meta.update(COUNTERS.since(pipeline_counts))
 
     def _run_pass_loop(self, graph: GraphLowering) -> None:
         """Run the pass list. Split out so it gets its own timed region."""
         pipeline = type(self).__name__
         for pass_fn in self.passes:
             pass_name = _get_pass_name(pass_fn)
-            # `graph` is the same object throughout -- passes mutate
-            # `graph.operations` in place -- so before/after reconciliation
-            # is exact here.
-            with SpyreGraphTransformObserver(graph, pass_name, kind="graphlowering"):
-                with timing_recorder.stage(
-                    f"pass:{pipeline}:{pass_name}",
-                    input_operations=len(graph.operations),
-                ) as event:
-                    t0 = time.perf_counter()
-                    pass_fn(graph)
-                    elapsed_ms = (time.perf_counter() - t0) * 1000
-                # Counted after the region closes, so counting is never charged
-                # to the work it describes.
-                event.meta["output_operations"] = len(graph.operations)
+            with _flat_operations(graph, pass_name):
+                self._run_one_pass(graph, pipeline, pass_fn, pass_name)
 
-            if logger.isEnabledFor(logging.INFO):
-                logger.info(
-                    "elapsed %5dms  %s",
-                    elapsed_ms,
-                    pass_name,
-                )
-            if logger.isEnabledFor(logging.DEBUG) and _should_log_pass(pass_name):
-                logger.debug(
-                    "AFTER %s\n%s", pass_name, format_operations(graph.operations)
-                )
+    def _run_one_pass(
+        self,
+        graph: GraphLowering,
+        pipeline: str,
+        pass_fn: Callable,
+        pass_name: str,
+    ) -> None:
+        # `graph` is the same object throughout -- passes mutate
+        # `graph.operations` in place -- so before/after reconciliation
+        # is exact here.
+        with SpyreGraphTransformObserver(graph, pass_name, kind="graphlowering"):
+            pass_counts = COUNTERS.snapshot()
+            with timing_recorder.stage(
+                f"pass:{pipeline}:{pass_name}",
+                input_operations=len(graph.operations),
+            ) as event:
+                t0 = time.perf_counter()
+                pass_fn(graph)
+                elapsed_ms = (time.perf_counter() - t0) * 1000
+            # Counted after the region closes, so counting is never charged
+            # to the work it describes.
+            event.meta["output_operations"] = _count_ops(graph.operations)
+            event.meta.update(COUNTERS.since(pass_counts))
+
+        if logger.isEnabledFor(logging.INFO):
+            logger.info(
+                "elapsed %5dms  %s",
+                elapsed_ms,
+                pass_name,
+            )
+        if logger.isEnabledFor(logging.DEBUG) and _should_log_pass(pass_name):
+            logger.debug(
+                "AFTER %s\n%s",
+                pass_name,
+                format_operations(list(all_ops(graph.operations))),
+            )
 
     def uuid(self) -> Any | None:
         return _uuid(self.passes)

@@ -23,6 +23,12 @@ from pathlib import Path
 
 import regex as re
 
+from .paging import (
+    JOB_PAGE_SIZES,
+    ListingFailed,
+    at_smaller_pages,
+)
+
 TRANSIENT_HTTP_CODES = ("502", "503", "504")
 
 
@@ -66,6 +72,69 @@ class GhCli:
 
 class JobLogs:
     """Listing, deduping and downloading GHA job logs."""
+
+    @staticmethod
+    def list_jobs(
+        repo: str,
+        run_id: str,
+        out_path,
+        name_prefix: str = "",
+        sizes: tuple = JOB_PAGE_SIZES,
+    ) -> int:
+        """Write the latest attempt's jobs as JSONL ({id, name}); returns how many.
+
+        A listing that keeps failing at one page size is retried from page 1 at the next smaller
+        one, so pages of different sizes are never combined. name_prefix keeps only matching
+        jobs and is dropped from their names.
+        """
+
+        def fetch(size, attempts):
+            result = GhCli.run_with_retry(
+                [
+                    "gh",
+                    "api",
+                    "--method",
+                    "GET",
+                    f"/repos/{repo}/actions/runs/{run_id}/jobs",
+                    "--paginate",
+                    "-f",
+                    "filter=latest",
+                    "-f",
+                    f"per_page={size}",
+                    "--jq",
+                    ".jobs[] | {id: .id, name: .name}",
+                ],
+                max_attempts=attempts,
+            )
+            if result.returncode != 0:
+                raise ListingFailed(result.stderr.decode("utf-8", "replace").strip())
+            return result
+
+        try:
+            result = at_smaller_pages(
+                fetch,
+                sizes,
+                on_failure=lambda size, err: print(
+                    f"[warn] listing jobs at per_page={size} failed: {err}"
+                ),
+            )
+        except ListingFailed:
+            print(f"::error::listing jobs of run {run_id} failed at every page size")
+            sys.exit(1)
+        jobs = [
+            json.loads(line)
+            for line in result.stdout.decode().splitlines()
+            if line.strip()
+        ]
+        if name_prefix:
+            jobs = [
+                {"id": j["id"], "name": j["name"][len(name_prefix) :]}
+                for j in jobs
+                if j["name"].startswith(name_prefix)
+            ]
+        with open(out_path, "w") as fh:
+            fh.writelines(json.dumps(j) + "\n" for j in jobs)
+        return len(jobs)
 
     @staticmethod
     def dedupe(jobs: list) -> list:
@@ -127,6 +196,7 @@ class JobLogs:
 escape_sequence_flag = GhCli.escape_sequence_flag
 run_with_retry = GhCli.run_with_retry
 dedupe_jobs = JobLogs.dedupe
+list_jobs = JobLogs.list_jobs
 load_jobs = JobLogs.load
 download_job_logs = JobLogs.download
 download_job_logs_or_die = JobLogs.download_or_die
