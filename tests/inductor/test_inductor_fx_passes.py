@@ -295,11 +295,15 @@ class TestStickReshapePivot(unittest.TestCase):
         import torch._inductor.config as config
         from torch_spyre._inductor import config as spyre_config
 
-        config.force_disable_caches = True
         torch.compiler.reset()
         backend = InductorAndRecordGraphs()
         ref = fn(*[a.float() for a in args])
-        with spyre_config.patch(stick_reshape_on_device=on_device):
+        # Patched rather than assigned, so a disabled cache cannot leak into
+        # whichever test happens to run next.
+        with (
+            config.patch(force_disable_caches=True),
+            spyre_config.patch(stick_reshape_on_device=on_device),
+        ):
             out = torch.compile(fn, backend=backend)(*[a.to("spyre") for a in args])
         # fp16 SiLU/add on randn inputs; errors stay well under 5e-2.
         torch.testing.assert_close(out.cpu().float(), ref, atol=5e-2, rtol=1e-2)
@@ -440,6 +444,28 @@ class TestStickReshapePivot(unittest.TestCase):
             on_device=True,
             expect=None,
         )
+
+    @pytest.mark.filterwarnings("ignore::UserWarning")  # forced cache disabling
+    def test_escaping_alias_is_left_alone(self):
+        """A reshape is not repaired when that would break a visible alias.
+
+        Both ``y`` and its view escape and share storage, so mutating one
+        must still be visible through the other. Every repair in this pass
+        materialises the view, so the reshape has to be left as it is.
+        """
+        import torch._inductor.config as config
+
+        def fn(x):
+            y = x * 2
+            return y, y.view(4, 8, 8)
+
+        torch.compiler.reset()
+        with config.patch(force_disable_caches=True):
+            y, view = torch.compile(fn, dynamic=False)(
+                torch.ones(4, 64, dtype=torch.float16).to("spyre")
+            )
+        y.fill_(7)
+        self.assertEqual(view.cpu().flatten()[:4].tolist(), [7.0] * 4)
 
 
 class TestPassUtils(unittest.TestCase):

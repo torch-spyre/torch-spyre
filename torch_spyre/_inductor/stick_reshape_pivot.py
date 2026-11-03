@@ -153,6 +153,50 @@ def _feeds_stick_dim_cat(node: torch.fx.Node) -> bool:
     return False
 
 
+def _escaping_nodes(graph: torch.fx.Graph) -> set:
+    """Every node the graph returns, flattened out of the output structure."""
+    out = next((n for n in graph.nodes if n.op == "output"), None)
+    if out is None:
+        return set()
+    seen: set = set()
+    stack = [out.args]
+    while stack:
+        a = stack.pop()
+        if isinstance(a, torch.fx.Node):
+            seen.add(a)
+        elif isinstance(a, (list, tuple)):
+            stack.extend(a)
+        elif isinstance(a, dict):
+            stack.extend(a.values())
+    return seen
+
+
+def _breaks_escaping_alias(node: torch.fx.Node, escaping: set) -> bool:
+    """True when rewriting would turn an alias the caller can see into a copy.
+
+    A reshape left as a view shares storage with its base. Every repair here
+    materialises it instead, so if the view *and* something else aliasing the
+    same base both leave the graph, a caller that mutates one no longer sees
+    the change through the other::
+
+        def fn(x):
+            y = x * 2
+            return y, y.view(4, 8, 8)   # both escape, both alias
+
+    Leaving such a reshape alone reproduces the base compiler exactly, which
+    is the conservative choice: correctness of aliasing beats repairing the
+    layout.
+    """
+    if node not in escaping:
+        return False
+    src = node.args[0]
+    if src in escaping:
+        return True
+    return any(
+        u is not node and u in escaping and u.target in _RESHAPE_OPS for u in src.users
+    )
+
+
 def _call(graph, target, args, kwargs, src_node, fake_mode):
     node = graph.call_function(target, args=args, kwargs=kwargs)
     arg_vals = [a.meta["val"] if isinstance(a, torch.fx.Node) else a for a in args]
@@ -301,11 +345,14 @@ def _rewrite(
 
 def pivot_unaligned_stick_reshapes(graph: torch.fx.Graph) -> None:
     """Rewrite every Spyre reshape that cuts the stick dim off a stick boundary."""
+    escaping = _escaping_nodes(graph)
     for node in list(graph.nodes):
         if node.op != "call_function" or node.target not in _RESHAPE_OPS:
             continue
         src = node.args[0]
         if not isinstance(src, torch.fx.Node):
+            continue
+        if _breaks_escaping_alias(node, escaping):
             continue
         src_val = src.meta.get("val")
         out_val = node.meta.get("val")
