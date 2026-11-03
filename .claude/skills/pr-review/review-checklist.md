@@ -40,7 +40,7 @@ Quick reference for reviewing torch-spyre pull requests.
 ## Test Expectations
 
 For a PR that touches `xfail`, `skip`, `expect_*` or `pytest.raises` in tests
-(see "Test Invariants" in `CLAUDE.md`):
+(see "Test Invariants" in `AGENTS.md`):
 
 - [ ] No `pytest.xfail(...)` in a body or helper, no `try`/`except` that turns an
   error into an xfail or skip (**BLOCKER**)

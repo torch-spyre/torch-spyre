@@ -181,7 +181,7 @@ make_param_dict([
 A case that does not work today is recorded as an expectation. It is never recorded by
 calling `pytest.xfail` or by catching the error, because then the body does not run
 and the test can never tell you the problem is gone. The rules are in the
-**Test Invariants** section of `CLAUDE.md`; this section shows how to apply them.
+**Test Invariants** section of `AGENTS.md`; this section shows how to apply them.
 
 First run the case with the expectation off (`--runxfail`; an OOT-wrapped test still
 reports an xfail, with the original message in `wasxfail`) and see what it does:

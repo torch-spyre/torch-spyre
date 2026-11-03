@@ -64,6 +64,7 @@ test coverage, bug classification), see :doc:`/contributing/op_enablement`.
    span_overflow_hint_analysis
    work_division_planning
    scratchpad_planning
+   co_optimizer
    simulated_annealing_layout
    sa_co_optimization
    native_packer_performance

@@ -29,9 +29,13 @@ namespace spyre {
 struct SharedOwnerCtx {
   flex::CompositeAddress composite_addr;
   signed char device_id;
+  flex::MemoryType memory_type;
 
-  SharedOwnerCtx(flex::CompositeAddress addr, signed char dev_id)
-      : composite_addr(std::move(addr)), device_id(dev_id) {}
+  SharedOwnerCtx(flex::CompositeAddress addr, signed char dev_id,
+                 flex::MemoryType mem_type)
+      : composite_addr(std::move(addr)),
+        device_id(dev_id),
+        memory_type(mem_type) {}
 };
 
 // A custom allocator for our custom device, which returns a handle to the
@@ -62,13 +66,17 @@ struct SpyreAllocator final : public c10::DeviceAllocator {
   c10::CachingDeviceAllocator::DeviceStats getDeviceStats(
       c10::DeviceIndex device) override;
 
+  std::pair<size_t, size_t> getMemoryInfo(c10::DeviceIndex device) override;
+
   void resetAccumulatedStats(c10::DeviceIndex device) override;
 
   void resetPeakStats(c10::DeviceIndex device) override;
 
-  void recordAlloc(size_t nbytes, void* data, int device);
+  void recordAlloc(size_t nbytes, void* data, int device,
+                   flex::MemoryType memory_type);
 
-  void recordRelease(size_t nbytes, void* data, int device);
+  void recordRelease(size_t nbytes, void* data, int device,
+                     flex::MemoryType memory_type);
 
   c10::DataPtr allocate(size_t nbytes) override;
 

@@ -82,6 +82,17 @@ jobs:
       pytorch_build_seconds: ${{ steps.compute_durations.outputs.pytorch_build_seconds }}
       torch_spyre_build_seconds: ${{ steps.compute_durations.outputs.torch_spyre_build_seconds }}
     steps:
+      # First, and independent of every checkout/build step, so rh_job_name in the
+      # always-run "Report build completed" step is populated even when an
+      # earlier step (e.g. the pytorch checkout) fails.
+      - name: Detect RHEL and GCC versions
+        id: os_info
+        run: |
+          RHEL_VERSION=$(source /etc/os-release && echo "$VERSION_ID")
+          GCC_VERSION=$(gcc -dumpversion | cut -d. -f1)
+          echo "rhel_version=$RHEL_VERSION" >> "$GITHUB_OUTPUT"
+          echo "gcc_version=$GCC_VERSION" >> "$GITHUB_OUTPUT"
+
       - name: Checkout composite actions
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -108,14 +119,6 @@ jobs:
       - uses: ./.github/actions/gather-runner-info
         with:
           verbose: 'true'
-
-      - name: Detect RHEL and GCC versions
-        id: os_info
-        run: |
-          RHEL_VERSION=$(source /etc/os-release && echo "$VERSION_ID")
-          GCC_VERSION=$(gcc -dumpversion | cut -d. -f1)
-          echo "rhel_version=$RHEL_VERSION" >> "$GITHUB_OUTPUT"
-          echo "gcc_version=$GCC_VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Install uv
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1

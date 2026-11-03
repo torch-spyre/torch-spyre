@@ -4,6 +4,9 @@ test_suite_config:
     - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_dtype_conversion.py
       unlisted_test_mode: skip
       tests:
+        # Tests that are known to fail or to be rejected still run here as
+        # mandatory_success: their expected outcome (strict xfail with raises=, or an
+        # asserted rejection) is declared on the test itself, so a skip here would hide it.
         - names:
             - TestImplicitPromotion::test_implicit_add_fp16_3d_stick_aligned
             - TestImplicitPromotion::test_true_divide_fp16_fp16_stays_fp16
@@ -18,10 +21,6 @@ test_suite_config:
             - TestImplicitPromotion::test_wa_cat_both_fp16
             - TestImplicitPromotion::test_sum_fp16_with_dtype_fp32
             - TestImplicitPromotion::test_sum_bf16_dtype_fp32
-          mode: mandatory_success
-
-        # SKIP #2252 — anywhere-valid: mixed arrangements rejected at SDSC validation
-        - names:
             - TestImplicitPromotion::test_working_implicit_add_fp16_to_fp32
             - TestImplicitPromotion::test_direct_mixed_dtype_add_arrangement_error
             - TestImplicitPromotion::test_direct_mixed_dtype_add_4d_stick_aligned
@@ -35,14 +34,10 @@ test_suite_config:
             - TestImplicitPromotion::test_stack_fp16_fp32_implicit_promotion
             - TestImplicitPromotion::test_cat_fp16_fp32_implicit_promotion
             - TestImplicitPromotion::test_implicit_tensor_add_non_contiguous_fp16_fp32
-          mode: skip
-
-        # SKIP #2204 — unaligned shapes: padding propagation failure
-        - names:
             - TestImplicitPromotion::test_implicit_add_fp16_2d_unaligned
             - TestImplicitPromotion::test_implicit_add_fp16_3d_unaligned
             - TestImplicitPromotion::test_implicit_add_fp16_4d_unaligned
-          mode: skip
+          mode: mandatory_success
 
         # SKIP #2205 — DL16_TO_FP32 arrangement on reduction output; D2H reads garbled values
         - names:
@@ -53,7 +48,6 @@ test_suite_config:
         - names:
             - TestImplicitPromotion::test_fp16_plus_0dim_fp32_tensor_implicit_promotion
           mode: skip
-
 
   global:
     supported_dtypes:

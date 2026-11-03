@@ -158,7 +158,7 @@ Every new op requires two levels of validation:
    - **Default dtype:** `torch.float16`
    - **Cases that do not work yet** are recorded as expectations (`expect_raise`,
      strict `expect_fail`), each with an open issue; see "Test Invariants" in
-     `CLAUDE.md`
+     `AGENTS.md`
 
 ---
 

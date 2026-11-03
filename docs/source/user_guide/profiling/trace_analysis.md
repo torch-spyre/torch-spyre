@@ -62,6 +62,32 @@ trace by hand:
 Filtering `traceEvents` to `cat == "kernel"` isolates device-side work
 for scripted analysis.
 
+### Collective metadata args
+
+Device-side `kernel` and `gpu_memcpy` events that belong to a collective carry extra `args` naming the collective they serve:
+
+| Arg | Type | Meaning |
+|---|---|---|
+| `coll_group` | string | Collective type, such as `"Allreduce"` or `"Allgather"`. |
+| `coll_algo` | string | Collective algorithm, such as `"Ring"`. |
+| `coll_bytes` | number or `""` | Total transfer size of the collective, in bytes; `""` when unknown. |
+
+```json
+{"ph": "X", "cat": "kernel", "name": "...",
+ "args": {"coll_group": "Allreduce", "coll_algo": "Ring", "coll_bytes": 256}}
+```
+
+When each arg appears:
+
+- Events outside a collective carry none of the `coll_*` args.
+- Every collective event carries `coll_group` and `coll_bytes`.
+- `coll_algo` is present only when the control block carried the full
+  `[Coll,Algo,Bytes]` annotation. A control block labelled with a bare
+  collective name has no `coll_algo`, and its `coll_bytes` is `""`
+  because the runtime cannot recover the size.
+- A numeric `coll_bytes` of `0` is a real zero-byte transfer, not an
+  unknown size.
+
 ## `aiu-trace-analyzer`
 
 [`aiu-trace-analyzer`][ata] is an open-source post-processing tool for
@@ -71,7 +97,7 @@ authoritative guide; minimum setup follows.
 Install from source:
 
 ```bash
-git clone https://github.com/IBM/aiu-trace-analyzer.git
+git clone https://github.com/torch-spyre/aiu-trace-analyzer.git
 cd aiu-trace-analyzer
 pip install --editable .
 ```
@@ -107,5 +133,5 @@ acelyzer -i <trace_file_json> -c logs.txt
 - [Performance analysis methodology](performance_analysis_methodology.md):
   using a loaded trace
 
-[ata]: https://github.com/IBM/aiu-trace-analyzer
+[ata]: https://github.com/torch-spyre/aiu-trace-analyzer
 [ctf]: https://docs.google.com/document/d/1CvAClvFfyA5R-PhYUmn5OOQtYMH4h6I0nSsKchNAySU/preview

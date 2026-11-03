@@ -332,11 +332,15 @@ FFDC (First Failure Data Capture)
    Retrieval does not require that variable, even if it was unset in a
    later session. The directory **does** have to match: if
    ``TORCHINDUCTOR_CACHE_DIR`` (or ``TMPDIR``) differs between capture
-   and retrieval, pass the original ``output_dir`` explicitly.
+   and retrieval, pass the original **report** directory as
+   ``output_dir`` — ``<cache-root>/torch-spyre/ffdc_reports`` (or
+   ``<tempdir>/torch-spyre-ffdc`` on the fallback path), **not** the
+   cache or ``TMPDIR`` root. This function searches ``output_dir`` for
+   JSON files; it does not append ``torch-spyre/ffdc_reports``.
 
-   :param output_dir: Directory to search. If ``None``, uses
-       ``<Inductor cache root>/torch-spyre/ffdc_reports``, where the cache
-       root is ``$TORCHINDUCTOR_CACHE_DIR`` or else
+   :param output_dir: Directory containing FFDC JSON files. If ``None``,
+       uses ``<Inductor cache root>/torch-spyre/ffdc_reports``, where the
+       cache root is ``$TORCHINDUCTOR_CACHE_DIR`` or else
        ``<tempdir>/torchinductor_<user>`` from Inductor ``cache_dir()``
        (not ``~/.cache/torch/inductor``). ``<tempdir>`` is
        ``tempfile.gettempdir()``, typically ``/tmp`` on Linux, or
@@ -357,8 +361,9 @@ FFDC (First Failure Data Capture)
           print(report["_report_path"])
 
    The same function is also available as
-   ``torch_spyre.profiler.get_diagnostic_report``. For usage workflow,
-   report locations, and JSON triage, see
+   ``torch_spyre.profiler.get_diagnostic_report``. For the enable →
+   fail → retrieve → triage workflow, report schema, and
+   interpretation notes, see
    :doc:`../user_guide/profiling/ffdc`.
 
 Tensor Operations
@@ -687,12 +692,6 @@ Environment Variables
        edge, overlapping the two stages. Off by default, which keeps the
        single-stream FIFO ordering. On values match flex's grammar exactly:
        ``1``, ``true``, ``t``, ``yes``, ``y``
-   * - ``SPYRE_INDUCTOR_LOG=1``
-     - *Deprecated*. Use ``TORCH_LOGS='torch_spyre.inductor'``. Enables Spyre
-       Inductor logging (INFO level)
-   * - ``SPYRE_INDUCTOR_LOG_LEVEL=DEBUG``
-     - *Deprecated*. Use ``TORCH_LOGS='+torch_spyre.inductor'`` (DEBUG level).
-       Sets Spyre Inductor log verbosity
    * - ``SPYRE_LOG_FILE=path``
      - *Deprecated*. Mapped to the top-level ``spyre`` logger file handler.
        Redirects Spyre Inductor logs to a file
@@ -773,8 +772,8 @@ Environment Variables
        op-spec IR at pipeline stage boundaries (default empty)
    * - ``TORCH_SPYRE_TIMING``
      - Record structured per-compile frontend timings: one JSON event per
-       pass pipeline and per pass, with input/output graph sizes
-       (default ``0``)
+       pass pipeline and per pass, with input/output graph sizes and
+       analysis-call counts (default ``0``)
    * - ``TORCH_SPYRE_TIMING_OUT``
      - Destination for the ``TORCH_SPYRE_TIMING`` record. The pid is
        inserted before the suffix, so ``rec.json`` is written as
@@ -787,25 +786,17 @@ Environment Variables
      - Print the predicted-runtime report after pre-scheduling: one total
        plus a per-kernel breakdown (default ``0``).
        See :doc:`/compiler/cost_model`
-   * - ``TORCH_SPYRE_NATIVE_PACKER``
-     - Use the C++ permutation-layout packer accelerator in the
-       simulated-annealing layout solver (default ``1``; set ``0`` to force
-       the pure-Python packer). No effect unless
-       ``LAYOUT_SOLVER=simulated_annealing``.
-       See :doc:`/compiler/simulated_annealing_layout`
    * - ``MAX_BUCKETS``
      - Maximum number of work division buckets (default ``32``)
    * - ``MIN_DEFAULT_GRANULARITY``
      - Minimum default granularity for work division (default ``4``)
-   * - ``SPYRE_INDUCTOR_IGNORE_HINTS``
-     - Ignore ``spyre_hint`` annotations: ``work_div={...}``
-       work-division hints, hint-based working-set reduction, and
-       span-overflow coarse-tiling hints (default ``0``)
+   * - ``SPYRE_INDUCTOR_IGNORE_WORK_DIV_HINTS``
+     - Ignore ``spyre_hint(work_div={...})`` work-division hints and use
+       the automatic work-distribution planner (default ``0``)
    * - ``SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS``
-     - Ignore only span-overflow coarse-tiling hints; a narrower
-       alternative to ``SPYRE_INDUCTOR_IGNORE_HINTS``.  Defaults to
-       ``1`` (disabled/opt-in): set to ``0`` to enable automatic
-       span-overflow coarse tiling.
+     - Ignore the compiler-generated span-overflow coarse-tiling hints.
+       Defaults to ``1`` (disabled/opt-in): set to ``0`` to enable
+       automatic span-overflow coarse tiling.
    * - ``SPYRE_INDUCTOR_SDSC_CACHE``
      - Cache and reuse ``sdsc.json`` files during codegen when two OpSpecs
        produce identical SuperDSC content, reducing bundle size for
@@ -829,10 +820,21 @@ Environment Variables
    * - ``KTIR_DEVICE_MLIR``
      - Path to a ``.mlir`` file declaring the target device for the KTIR
        execution path (default empty)
+   * - ``SPYRE_BACKEND_COMPILE_TIMEOUT_SECONDS``
+     - Wall-clock limit on one backend-compiler (``dbo-opt``) invocation,
+       on both the SDSC bundle and KTIR paths (default ``60``;
+       non-positive values disable the limit)
    * - ``ENABLE_LX_CONTEXT_SWITCHING``
      - Bracket opaque ``FallbackKernel`` calls that have no native Spyre
        lowering with per-buffer LX dump and restore clones, so LX-resident
        buffers survive the call (default ``1``; set ``0`` to disable)
+   * - ``SPYRE_LX_SOLVER_RELAYOUT``
+     - Let a co-optimizing solver that decides LX relayouts (today only
+       CP-SAT) choose them (default ``1``). Set ``0`` to offer it no relayout
+       candidates, so an edge whose views differ spills to HBM and nothing
+       else about the plan changes. Unlike ``SPYRE_LX_PLANNER_RELAYOUT=0``,
+       restickify residency and fused-axis views stay on. Used by the
+       cost-model sweep to measure the spill side of an edge
    * - ``SPYRE_LX_SOLVER_RELAYOUT_GROUPS_PER_EDGE``
      - Number of destination views the CP-SAT relayout enumeration keeps per
        (source, consumer) edge, cheapest first (default ``4``; ``0`` keeps
@@ -845,8 +847,9 @@ Environment Variables
        leaves the graph unchanged (default ``1``; set ``0`` to disable)
    * - ``SPYRE_DUMP_COST_EXPR_FILE``
      - Append one JSON record per co-optimized graph with the symbolic cost
-       objective the solver minimizes, the chosen symbol values, and each
-       term evaluated under them (default empty)
+       objective, the chosen symbol values, each term evaluated under them,
+       the terms the solver adds outside the expression, and the total it
+       minimized (default empty)
    * - ``SPYRE_DUMP_COST_FILE``
      - Destination file for the ``SPYRE_DUMP_COST`` output. Empty writes to
        stderr (default empty)
@@ -863,10 +866,20 @@ Environment Variables
      - Path to the compiler version file read to form the kernel-cache key.
        Used when ``SPYRE_KERNEL_CACHE=1``; if it is unset while caching is on,
        that kernel is compiled without caching and a warning is logged
+   * - ``TORCH_SPYRE_CACHE_SCAN``
+     - Let the FX graph and AOTAutograd caches keep graphs that use the
+       ``scan`` op, such as attention built on ``for_each_tile`` (default
+       ``1``; set ``0`` to disable). Without it, these graphs compile again in
+       every process. It uses Inductor's ``unsafe_marked_cacheable_functions``
+       (see ``_allow_scan_graph_caching``). With ``SPYRE_KERNEL_CACHE=1`` too,
+       a restart also reuses the compiled Spyre kernels for these graphs
    * - ``SPYRE_NUM_CPUS``
-     - Override the CPU count CP-SAT uses to size its search worker pool.
-       When unset the count is derived from the cgroup v2 quota, then
-       ``psutil``, then ``os.cpu_count()``
+     - CPUs CP-SAT uses to size its search worker pool (config
+       ``num_cpus``; ``config.patch(num_cpus=1)`` gives one worker). When
+       unset, or not a positive integer, ``num_cpus`` is ``None`` and the
+       count is derived from the cgroup v2 quota, then ``psutil``, then
+       ``os.cpu_count()``. Not part of the compile cache key, so a cached
+       compile is reused whatever the value
 
 **Device enumeration** (``torch_spyre/csrc/spyre_device_enum.cpp``):
 

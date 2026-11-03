@@ -16,6 +16,7 @@ import torch
 from torch_spyre._C import fill_tensor, copy_tensor, SpyreTensorLayout
 import torch_spyre.ops.fallbacks  # noqa: F401
 from .fallbacks import _get_op_overloads
+from .warning_types import RetileWarning
 import warnings
 import contextlib
 import functools
@@ -155,11 +156,6 @@ def _materialize_offset_view(x):
     if isinstance(x, (list, tuple)):
         return type(x)(_materialize_offset_view(e) for e in x)
     return x
-
-
-class RetileWarning(UserWarning):
-    """Warning issued when an eager result had to be re-tiled to the layout a
-    compiled graph assumes for it."""
 
 
 warnings.simplefilter("once", RetileWarning)
@@ -468,7 +464,9 @@ COMPILED_OPS = [
     aten.div,
     aten.exp,
     aten.floor,
+    aten.trunc,
     aten.index_select,
+    aten.index_copy.out,
     aten.log,
     aten.mean,
     aten.mul,
@@ -488,10 +486,13 @@ COMPILED_OPS = [
     aten.le,
     aten.ne.Tensor,
     aten.ne.Tensor_out,
+    aten.ne.Scalar,
+    aten.ne.Scalar_out,
     aten.ge,
     aten.gt,
     aten.lt,
     aten.amax,
+    aten.amin,
     aten.maximum,
     aten.minimum,
     aten.pow,
@@ -505,6 +506,7 @@ COMPILED_OPS = [
     aten.any.default,
     aten.any.dim,
     aten.any.dims,
+    aten.repeat,
 ]
 
 register_torch_compile_kernel(COMPILED_OPS)
@@ -763,15 +765,23 @@ def spyre__copy_from(self, dst, non_blocking=False):
         return dst
     elif self.device.type == "spyre" and self.device == dst.device:
         # copy_from_d2d requires torch.compile, which cannot run inside
-        # no_dispatch() (e.g. during FakeTensorMode constant propagation).
-        # Fall back to a CPU roundtrip copy in that case.
+        # no_dispatch() or 2.14's eager-on-nested-compile tracing regions
+        # (e.g. during FakeTensorMode constant propagation). Use a CPU
+        # roundtrip in those regions so the copy does not re-enter its kernel.
         #
         # Detecting "am I inside no_dispatch()" uses the private
         # ``torch._C._dispatch_tls_is_dispatch_key_excluded("Python")`` (no
         # public predicate exists — no_dispatch() excludes the Python dispatch
         # key). Revisit if upstream exposes a stable API; the alternative
         # (attempt copy_from_d2d and catch the re-entrancy failure) is worse.
-        if torch._C._dispatch_tls_is_dispatch_key_excluded("Python"):
+        # Dynamo's private predicate covers the separate tracing flag added in
+        # 2.14; the Python dispatch key can remain enabled in that region.
+        from torch._dynamo.eval_frame import _is_eager_on_nested_compile
+
+        if (
+            torch._C._dispatch_tls_is_dispatch_key_excluded("Python")
+            or _is_eager_on_nested_compile()
+        ):
             cpu_tmp = self.to("cpu")
             copy_tensor(cpu_tmp, dst, non_blocking)
         else:

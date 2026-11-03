@@ -173,6 +173,9 @@ FROM
                 props['runner_died'] IN ('1', 'true'), 'infra_capacity',
                 -- the pre-taxonomy spelling of ingest_error/result_lost
                 dg_cat = 'infra_result_lost', 'ingest_error',
+                -- A child that only "completed with status ABORTED" was aborted, whatever its log shows.
+                position(JSONExtractString(props['diagnosis'], 'evidence'), 'status ABORTED') > 0
+                    AND dg_cat IN ('', 'unknown'), 'aborted',
                 dg_cat NOT IN ('', 'unknown'), dg_cat,
                 '') AS own_reason,
         multiIf(props['failure_reason'] != '', props['failure_subreason'],
@@ -194,7 +197,7 @@ FROM
         -- A writer's props rank 3 unless it marked them a default (results' failure_confidence=1).
         toUInt8(multiIf(props['failure_reason'] != '', toUInt8OrDefault(props['failure_confidence'], toUInt8(3)),
                         own_reason != '', 2, 0)) AS own_conf
-    FROM artifact_results
+    FROM v_artifact_results_published
     ORDER BY ts DESC, audit_timestamp DESC
     LIMIT 1 BY artifact_id, run_id, result_kind, test_type
 ) AS r
@@ -238,19 +241,51 @@ LEFT JOIN (
 -- LEFT JOIN, not INNER: a run with no case rows must still appear, with total_tests = 0.
 LEFT JOIN (
     -- run_case_counters, not test_case_runs: pre-aggregated, one row per run; sum() is still
-    -- required since SummingMergeTree collapses on merge, not on read.
+    -- required since SummingMergeTree collapses on merge, not on read. A retracted appended
+    -- round's cases are taken back out (d), as the counters were summed on insert.
     SELECT
-        run_id,
-        sum(total_tests) AS total_tests,
-        sum(passed)      AS passed,
-        sum(failed)      AS failed,
-        sum(errors)      AS errors,
-        sum(skipped)     AS skipped,
-        sum(xfail)       AS xfail,
-        sum(xpass)       AS xpass,
-        sum(recovered)   AS recovered
-    FROM run_case_counters
-    GROUP BY run_id
+        rc.run_id                                  AS run_id,
+        rc.total_tests - coalesce(d.total_tests, 0) AS total_tests,
+        rc.passed      - coalesce(d.passed, 0)      AS passed,
+        rc.failed      - coalesce(d.failed, 0)      AS failed,
+        rc.errors      - coalesce(d.errors, 0)      AS errors,
+        rc.skipped     - coalesce(d.skipped, 0)     AS skipped,
+        rc.xfail       - coalesce(d.xfail, 0)       AS xfail,
+        rc.xpass       - coalesce(d.xpass, 0)       AS xpass,
+        rc.recovered   - coalesce(d.recovered, 0)   AS recovered
+    FROM
+    (
+        SELECT
+            run_id,
+            sum(total_tests) AS total_tests,
+            sum(passed)      AS passed,
+            sum(failed)      AS failed,
+            sum(errors)      AS errors,
+            sum(skipped)     AS skipped,
+            sum(xfail)       AS xfail,
+            sum(xpass)       AS xpass,
+            sum(recovered)   AS recovered
+        FROM run_case_counters
+        GROUP BY run_id
+    ) AS rc
+    LEFT JOIN
+    (
+        SELECT
+            run_id,
+            count()                        AS total_tests,
+            countIf(status = 'passed')     AS passed,
+            countIf(status = 'failed')     AS failed,
+            countIf(status = 'error')      AS errors,
+            countIf(status = 'skipped')    AS skipped,
+            countIf(status = 'xfail')      AS xfail,
+            countIf(status = 'xpass')      AS xpass,
+            countIf(status = 'passed' AND (props['result.prior_status'] IN ('failed', 'error')
+                    OR toUInt32OrZero(props['result.reruns']) > 0)) AS recovered
+        FROM test_case_runs
+        WHERE run_id IN (SELECT run_id FROM v_retracted_rounds)
+          AND props['upload_id'] IN (SELECT toString(upload_id) FROM v_retracted_rounds)
+        GROUP BY run_id
+    ) AS d ON d.run_id = rc.run_id
 ) AS c ON c.run_id = r.run_id;
 
 -- Combined functional + performance results for every artifact in one tag. INNER JOIN on the

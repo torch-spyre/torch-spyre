@@ -41,7 +41,7 @@ def _run(n, source, **over):
         "trigger_source": source,
         "preset": "trigger-pr-validation",
         "build_mode": "pr",
-        "trigger_pr": f"github.ibm.com/ai-chip-toolchain/deeptools#{n}",
+        "trigger_pr": f"ghe.example.com/example-org/deeptools#{n}",
         "base_ref": "main",
         "verdict": "green",
         "result": "SUCCESS",

@@ -26,10 +26,12 @@ Tests all 4 conversion cases:
 
 import pytest
 import torch
+from torch._inductor.exc import InductorError
 from torch_spyre._C import ElementArrangement, get_spyre_tensor_layout
 from torch_spyre._inductor import config
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
 from torch_spyre._inductor.constants import DEVICE_NAME
+from utils_inductor import expects_raise
 
 
 def _run(fn, *args, mode="compile"):
@@ -544,6 +546,214 @@ def test_eager_ea(src_dev, dst_dev, fp16, eager_to):
 
     z32 = eager_to(y16, src_dev, torch.float32)
     assert_ea(z32, ea_of(src_dev))
+
+
+# (input dtype, on-device conversion, its staggered arrangement, conversion back)
+_STAGGERING_CONVERSIONS = {
+    "dl16_to_fp32": (
+        torch.float16,
+        lambda t: t.float(),
+        ElementArrangement.DL16_TO_FP32,
+        lambda y: y.half(),
+    ),
+    "fp32_to_dl16": (
+        torch.float32,
+        lambda t: t.half(),
+        ElementArrangement.FP32_TO_DL16,
+        lambda y: y.float(),
+    ),
+}
+
+_FRESH_ALLOCATION_PROGRAMS = {
+    "cat_dim0": lambda a, b: torch.cat([a, b]),
+    "cat_stick_dim": lambda a, b: torch.cat([a, b], dim=1),
+    "stack": lambda a, b: torch.stack([a, b]),
+    "pad_rows": lambda a, b: torch.nn.functional.pad(a, (0, 0, 0, 4)),
+}
+
+
+def _small_int_fp16(shape, modulus, base=0):
+    # Integers <= 1024 are exact in DLFloat16, so results compare bit-exact.
+    return (torch.arange(shape[0] * shape[1]) % modulus + base).reshape(shape).half()
+
+
+@pytest.mark.parametrize("conversion", list(_STAGGERING_CONVERSIONS))
+@pytest.mark.parametrize("program", list(_FRESH_ALLOCATION_PROGRAMS))
+def test_staggered_into_fresh_allocation(program, conversion):
+    """cat, stack and F.pad of converted tensors keep the staggered arrangement."""
+    combine = _FRESH_ALLOCATION_PROGRAMS[program]
+    dtype, convert, expected_ea, restore = _STAGGERING_CONVERSIONS[conversion]
+    a = _small_int_fp16((4, 64), 7).to(dtype)
+    b = _small_int_fp16((4, 64), 5, base=10).to(dtype)
+
+    def fn(a, b):
+        return combine(convert(a), convert(b))
+
+    out = torch.compile(fn)(a.to(DEVICE_NAME), b.to(DEVICE_NAME))
+    assert_ea(out, expected_ea)
+
+    def round_trip(a, b):
+        return restore(fn(a, b))
+
+    restored = torch.compile(round_trip)(a.to(DEVICE_NAME), b.to(DEVICE_NAME))
+    assert_ea(restored, ElementArrangement.STANDARD)
+    assert torch.equal(restored.cpu(), round_trip(a, b))
+
+
+_WHOLE_STICK_DIM_PROGRAMS = {
+    # Width 100 is not a multiple of 64, but each write covers the whole stick dim.
+    "dl16_to_fp32_cat_rows": (
+        torch.float16,
+        lambda a, b: torch.cat([a.float(), b.float()]),
+        ElementArrangement.DL16_TO_FP32,
+        lambda y: y.half(),
+    ),
+    "fp32_to_dl16_pad_rows": (
+        torch.float32,
+        lambda a, b: torch.nn.functional.pad(a.half(), (0, 0, 0, 4)),
+        ElementArrangement.FP32_TO_DL16,
+        lambda y: y.float(),
+    ),
+}
+
+
+@pytest.mark.parametrize("program", list(_WHOLE_STICK_DIM_PROGRAMS))
+def test_staggered_whole_stick_dim_write(program):
+    """A write of the whole stick dim keeps the arrangement at a width not a
+    multiple of 64, when its last stagger unit is allocated whole."""
+    dtype, fn, expected_ea, restore = _WHOLE_STICK_DIM_PROGRAMS[program]
+    a = _small_int_fp16((4, 100), 7).to(dtype)
+    b = _small_int_fp16((4, 100), 5, base=10).to(dtype)
+
+    out = torch.compile(fn)(a.to(DEVICE_NAME), b.to(DEVICE_NAME))
+    assert_ea(out, expected_ea)
+
+    def round_trip(a, b):
+        return restore(fn(a, b))
+
+    restored = torch.compile(round_trip)(a.to(DEVICE_NAME), b.to(DEVICE_NAME))
+    assert_ea(restored, ElementArrangement.STANDARD)
+    assert torch.equal(restored.cpu(), round_trip(a, b))
+
+
+@pytest.mark.parametrize("conversion", list(_STAGGERING_CONVERSIONS))
+def test_cat_of_staggered_along_stick_dim_with_tail(conversion):
+    """A write at a whole-unit offset may end the stick dim in a partial unit."""
+    dtype, convert, expected_ea, restore = _STAGGERING_CONVERSIONS[conversion]
+    a = _small_int_fp16((4, 64), 7).to(dtype)
+    b = _small_int_fp16((4, 100), 5, base=10).to(dtype)
+
+    def fn(a, b):
+        return torch.cat([convert(a), convert(b)], dim=1)
+
+    out = torch.compile(fn)(a.to(DEVICE_NAME), b.to(DEVICE_NAME))
+    assert_ea(out, expected_ea)
+
+    def round_trip(a, b):
+        return restore(fn(a, b))
+
+    restored = torch.compile(round_trip)(a.to(DEVICE_NAME), b.to(DEVICE_NAME))
+    assert_ea(restored, ElementArrangement.STANDARD)
+    assert torch.equal(restored.cpu(), round_trip(a, b))
+
+
+@pytest.mark.parametrize("conversion", list(_STAGGERING_CONVERSIONS))
+def test_staggered_pad_fills_partial_last_unit(conversion):
+    """A non-zero pad fill ending in a partial stagger unit lands on its elements."""
+    dtype, convert, expected_ea, restore = _STAGGERING_CONVERSIONS[conversion]
+    a = _small_int_fp16((4, 64), 7).to(dtype)
+
+    def fn(a):
+        return torch.nn.functional.pad(convert(a), (0, 36), value=5.0)
+
+    out = torch.compile(fn)(a.to(DEVICE_NAME))
+    assert_ea(out, expected_ea)
+
+    def round_trip(a):
+        return restore(fn(a))
+
+    restored = torch.compile(round_trip)(a.to(DEVICE_NAME))
+    assert_ea(restored, ElementArrangement.STANDARD)
+    assert torch.equal(restored.cpu(), round_trip(a))
+
+
+def _index_write(a, b, idx):
+    # The value is computed before the allocation, so it is laid out by then.
+    value = a.float() * 2
+    out = torch.empty(4, 64, dtype=torch.float32, device=a.device)
+    out[idx] = value
+    return out
+
+
+_ORDERLESS_READ_PROGRAMS = {
+    # The STANDARD reads here carry no element arrangement: a fill, an index.
+    "cat_zeros": lambda a, b, idx: torch.cat(
+        [a.float(), torch.zeros(4, 64, dtype=torch.float32, device=a.device)]
+    ),
+    "cat_full": lambda a, b, idx: torch.cat(
+        [a.float(), torch.full((4, 64), 3.0, dtype=torch.float32, device=a.device)]
+    ),
+    "index_write": _index_write,
+}
+
+
+@pytest.mark.parametrize("program", list(_ORDERLESS_READ_PROGRAMS))
+def test_staggered_write_with_orderless_reads(program):
+    """A constant fill or an index read does not mix arrangements."""
+    fn = _ORDERLESS_READ_PROGRAMS[program]
+    a = _small_int_fp16((4, 64), 7)
+    b = _small_int_fp16((4, 64), 5, base=10)
+    idx = torch.tensor([2, 0, 3, 1])
+
+    out = torch.compile(fn)(a.to(DEVICE_NAME), b.to(DEVICE_NAME), idx.to(DEVICE_NAME))
+    assert_ea(out, ElementArrangement.DL16_TO_FP32)
+
+    def round_trip(a, b, idx):
+        return fn(a, b, idx).half()
+
+    restored = torch.compile(round_trip)(
+        a.to(DEVICE_NAME), b.to(DEVICE_NAME), idx.to(DEVICE_NAME)
+    )
+    assert_ea(restored, ElementArrangement.STANDARD)
+    assert torch.equal(restored.cpu(), round_trip(a, b, idx))
+
+
+@expects_raise
+def test_pad_of_staggered_with_odd_fp32_sticks_raises():
+    """A DL16_TO_FP32 stick dim of 3 fp32 sticks has no room for its last pair."""
+    a = _small_int_fp16((4, 96), 7)
+
+    def fn(a):
+        return torch.nn.functional.pad(a.float(), (0, 0, 0, 4))
+
+    with pytest.raises(InductorError, match="not whole units"):
+        torch.compile(fn)(a.to(DEVICE_NAME))
+
+
+@expects_raise
+def test_cat_of_staggered_and_standard_raises():
+    """One allocation cannot hold a staggered and a STANDARD writer."""
+    a = _small_int_fp16((4, 64), 7)
+    c = torch.ones(4, 64, dtype=torch.float32)
+
+    def fn(a, c):
+        return torch.cat([a.float(), c])
+
+    with pytest.raises(InductorError, match="mixed element arrangements"):
+        torch.compile(fn)(a.to(DEVICE_NAME), c.to(DEVICE_NAME))
+
+
+@expects_raise
+def test_pad_of_staggered_inside_stick_pair_raises():
+    """A pad that splits DL16_TO_FP32 stick pairs cannot keep the stagger."""
+    a = _small_int_fp16((4, 64), 7)
+
+    def fn(a):
+        # Width 128 leaves room for whole pairs; both fills and the copy split one.
+        return torch.nn.functional.pad(a.float(), (32, 32))
+
+    with pytest.raises(InductorError, match="not whole units"):
+        torch.compile(fn)(a.to(DEVICE_NAME))
 
 
 # Made with Bob

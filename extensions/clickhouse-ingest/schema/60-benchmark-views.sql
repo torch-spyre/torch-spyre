@@ -54,10 +54,14 @@ LEFT JOIN (
            argMax(arch, (ts, audit_timestamp))        AS arch,
            argMax(test_type, (ts, audit_timestamp))   AS test_type,
            argMax(state, (ts, audit_timestamp))       AS state
-    FROM artifact_results
+    FROM v_artifact_results_published
     WHERE result_kind = 'performance'
     GROUP BY run_id
-) AS ar USING (run_id);
+) AS ar USING (run_id)
+-- The LEFT JOIN above keeps a retracted upload's rows (with a nil artifact), so drop its run here,
+-- and a retracted round's rows.
+WHERE r.run_id NOT IN (SELECT run_id FROM v_result_uploads WHERE state = 'retracted' AND NOT is_round)
+  AND r.props['upload_id'] NOT IN (SELECT toString(upload_id) FROM v_retracted_rounds);
 
 -- The wide projection the dashboard's METRIC_LABELS dict expects: Map keys become named
 -- columns. Every metric is NULL when absent, never 0 (Map's zero-default), since a dashboard
@@ -175,7 +179,7 @@ INNER JOIN
            argMax(artifact_id, (ts, audit_timestamp))      AS artifact_id,
            argMax(arch, (ts, audit_timestamp))             AS arch,
            argMax(props['run_url'], (ts, audit_timestamp)) AS run_url
-    FROM artifact_results
+    FROM v_artifact_results_published
     WHERE result_kind = 'performance'
     GROUP BY run_id
 ) AS ar USING (run_id)

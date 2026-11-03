@@ -33,7 +33,9 @@ Knobs: BENCH_OP, BENCH_ROWS, BENCH_COLS, BENCH_WARMUP. BENCH_EMIT_RECORDS=1 adds
 machine-readable IO/MODEL/FEATS block the sweep folds into the cost-model database;
 it is off by default because it restates the cost-model dump. BENCH_OP is any of the
 bench_ops/bench_bandwidth ops: neg copy gelu relu sigmoid exp | mul add | add3 add4 |
-read sumrow sumall amax mean | bcast mulbcast | write.
+read sumrow sumall amax mean | bcast mulbcast | write. ``relayout`` (knobs RL_SRC,
+RL_DST, RL_MODE) measures one LX relayout between two hinted ops; see
+``_relayout_workload``.
 
 Examples:
     # one op (prints the table + a parseable SUMMARY line with kernel_us / memset_us)
@@ -73,13 +75,20 @@ WARMUP = int(os.environ.get("BENCH_WARMUP", "5"))
 # adds at most ~3x, so extra reps are nearly free. kernel_us in the SUMMARY = the median.
 REPS = max(1, int(os.environ.get("BENCH_REPS", "7")))
 SENCORES = os.environ.get("SENCORES", "")  # core count (read only to tag the SUMMARY)
-TILES = int(os.environ.get("BENCH_TILES", "0"))  # coarse-tile dim0 into K (>=2 on)
+TILES = int(os.environ.get("BENCH_TILES", "0"))  # tile dim0 into K chunks (>=2 on)
 LX = os.environ.get("LX_PLANNING", "1")  # scratchpad planning on(1)/off(0); SUMMARY tag
 NCOLS = int(os.environ.get("BENCH_N", str(COLS)))  # matmul N dim (M=ROWS, K=COLS, N)
 BB = int(os.environ.get("BENCH_B", "8"))  # batch dim for bmm ops (a[B,M,K] @ b[B,K,N])
 STAGES = int(
     os.environ.get("BENCH_STAGES", "0")
 )  # extra LX-resident pointwise stages for `softmax_stages` (see that op)
+# `relayout`: the producer's and the consumer's work divisions over the named dims R
+# (ROWS) and H (COLS), as `spyre_hint(work_div=...)` specs ("R:32", "R:4,H:8"), and
+# whether the solver may relayout between them (`on`) or must spill the edge to HBM
+# (`off`). See _relayout_workload.
+RL_SRC = os.environ.get("RL_SRC", "R:32")
+RL_DST = os.environ.get("RL_DST", "R:4,H:8")
+RL_MODE = os.environ.get("RL_MODE", "on")
 # The IO/MODEL/FEATS blocks are the machine-readable record the sweep folds into the
 # database (tools/cost_model/parse_sweep_logs.py). They restate what the cost-model dump
 # already printed, so for a human running one op they are pure noise -- emitted only when
@@ -220,99 +229,102 @@ _TRANSPORT = {
     "cat0": lambda x: torch.cat([x, x], dim=0),  # append rows (non-stick dim)
     "cat1": lambda x: torch.cat([x, x], dim=1),  # append cols (stick dim -> interleave)
 }
-# Coarse-tiled dim0 reductions (mirror the coarse-tiling harness{sum,amax,amin}_dim0_tiled.py):
+# Tiled dim0 reductions (``for_each_tile`` with a carry):
 # reduce a [B=ROWS, D=COLS] tensor over B, tiling B into BENCH_TILES chunks. With
-# BENCH_TILES>=2 a spyre_hint wraps it in a K-iteration loop (fill + K x reduce/combine)
+# BENCH_TILES>=2 a for_each_tile loop runs K iterations (fill + K x reduce/combine)
 # BENCH_TILES<=1 is the plain untiled baseline. Run each under LX_PLANNING=0/1.
 _CT_REDUCE = {"ctsum": "sum", "ctamax": "amax", "ctamin": "amin"}
 
 
-# Per-call setup hook: the coarse-tile path sets this to re-declare its named dims
-# before every traced invocation (the example declares once + compiles once; this
-# profiling harness traces repeatedly). None for all non-tiled ops.
+# Per-call setup hook: the workloads that resolve a ``spyre_hint(work_div=...)`` by dim
+# name set this to re-declare those named dims before every traced invocation (the
+# example declares once + compiles once; this profiling harness traces repeatedly).
+# None for the ``for_each_tile`` workloads and every other op.
 _PREPARE = None
 
 
+def _tile_size(extent: int, tiles: int, what: str) -> int:
+    """Width of one tile when ``extent`` is split into ``tiles`` equal chunks."""
+    if extent % tiles:
+        raise ValueError(f"BENCH_TILES={tiles} must divide {what}={extent}")
+    return extent // tiles
+
+
 def _ct_workload(rtype: str):
-    """Coarse-tiled dim0 reduction, mirroring the coarse-tiling harness*_dim0_tiled.py + utils.py
-    ``_compile_and_run``: a CPU input (sum scaled 0.1 as the example does), eager
-    ``declare_tensor_dim``, ``name_tensor_dims`` + ``spyre_hint`` inside fn, an eager
-    reference call of fn, then a dynamo/Fx cache reset right before compile.
+    """Dim-0 reduction of a [B=ROWS, D=COLS] tensor, tiled into BENCH_TILES chunks.
+
+    Built with ``for_each_tile``: each trip reduces one chunk of B and folds it into a
+    loop carry (sum: add, amax: maximum, amin: minimum), so the loop is a fill plus K x
+    reduce/combine. The sum input is scaled 0.1 to avoid fp16 growth. BENCH_TILES<=1 is
+    the plain untiled baseline. ``for_each_tile`` needs ``fullgraph=True``.
     """
-    import torch_spyre._inductor.wsr.propagate_named_dims as pnd
     from torch._inductor.codecache import FxGraphCache
-    from torch_spyre._inductor import spyre_hint
+    from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 
-    global _PREPARE
     b, d = ROWS, COLS
-    scale = 0.1 if rtype == "sum" else 1.0  # example scales sum to avoid fp16 growth
+    scale = 0.1 if rtype == "sum" else 1.0
     x_cpu = torch.randn(b, d, dtype=torch.float16) * scale
-
-    def _declare():
-        pnd.declare_tensor_dim("B", b)
-        pnd.declare_tensor_dim("D", d)
-
-    _declare()  # eager, as the example does in main() before compiling
 
     def reduce_fn(x):
         return getattr(x, rtype)(dim=0)
 
     if TILES >= 2:
+        tile = _tile_size(b, TILES, "BENCH_ROWS")
+        fp16 = torch.finfo(torch.float16)
+        combine, init_value = {
+            "sum": (lambda acc, chunk: acc + chunk.sum(0), 0.0),
+            "amax": (lambda acc, chunk: torch.maximum(acc, chunk.amax(0)), fp16.min),
+            "amin": (lambda acc, chunk: torch.minimum(acc, chunk.amin(0)), fp16.max),
+        }[rtype]
 
         def fn(x):
-            pnd.name_tensor_dims(x, ["B", "D"])
-            with spyre_hint(num_tiles_per_dim={"B": TILES}):
-                return reduce_fn(x)
+            def body(acc, ops):
+                (chunk,) = ops
+                return combine(acc, chunk), None
 
-        # Re-declare EAGERLY (not inside fn -> no trace perturbation) before each traced
-        # call so propagate_named_dims always resolves the named-dim sizes.
-        _PREPARE = _declare
+            init = torch.full((d,), init_value, dtype=x.dtype, device=x.device)
+            return for_each_tile(body, (x,), dims=(0,), tile_size=tile, init=init)[0]
+
     else:
         fn = reduce_fn
 
-    fn(x_cpu)  # eager reference call (mirror compare_with_cpu's cpu_result = fn(...))
+    reduce_fn(x_cpu)  # eager reference call
     torch._dynamo.reset_code_caches()
     FxGraphCache.clear()
-    return torch.compile(fn), (x_cpu.to(DEVICE),)
+    return torch.compile(fn, fullgraph=TILES >= 2), (x_cpu.to(DEVICE),)
 
 
 def _softmax_row_tiling():
-    """Softmax over dim=-1, row-tiled over NROW (
-    tiling.py + the new_coarse_tiling IR): the 5 softmax ops (max, sub, exp, sum, div)
-    fuse into ONE NROW-tiled loop with the intermediates LX-resident. BENCH_TILES>=2
-    tiles NROW into that many chunks; else untiled. Measured via the harness AIU
-    profiler (torch.profiler "Self SPYRE"), NOT the SPYRE_PROFILE host-launch path."""
-    import torch_spyre._inductor.wsr.propagate_named_dims as pnd
+    """Softmax over dim=-1, row-tiled over NROW with ``for_each_tile``: the 5 softmax
+    ops (max, sub, exp, sum, div) fuse into ONE NROW-tiled loop with the intermediates
+    LX-resident. BENCH_TILES>=2 tiles NROW into that many chunks; else untiled.
+    Measured via the harness AIU profiler (torch.profiler "Self SPYRE"), NOT the
+    SPYRE_PROFILE host-launch path."""
     from torch._inductor.codecache import FxGraphCache
-    from torch_spyre._inductor import spyre_hint
+    from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 
-    global _PREPARE
     nrow, ncol = ROWS, COLS
     x_cpu = torch.randn(nrow, ncol, dtype=torch.float16)
 
-    def _declare():
-        pnd.declare_tensor_dim("NROW", nrow)
-        pnd.declare_tensor_dim("NCOL", ncol)
-
-    _declare()
-
     if TILES >= 2:
+        tile = _tile_size(nrow, TILES, "BENCH_ROWS")
 
         def fn(x):
-            pnd.name_tensor_dims(x, ["NROW", "NCOL"])
-            with spyre_hint(num_tiles_per_dim={"NROW": TILES}):
-                return torch.softmax(x, dim=-1)
+            def body(_, ops):
+                (rows,) = ops
+                return None, torch.softmax(rows, dim=-1)
 
-        _PREPARE = _declare
+            return for_each_tile(body, (x,), dims=(0,), tile_size=tile, out_dim=0)[1]
+
     else:
 
         def fn(x):
             return torch.softmax(x, dim=-1)
 
-    fn(x_cpu)  # eager reference call
+    torch.softmax(x_cpu, dim=-1)  # eager reference call
     torch._dynamo.reset_code_caches()
     FxGraphCache.clear()
-    return torch.compile(fn), (x_cpu.to(DEVICE),)
+    return torch.compile(fn, fullgraph=TILES >= 2), (x_cpu.to(DEVICE),)
 
 
 def _softmax_stages():
@@ -339,20 +351,12 @@ def _softmax_stages():
     CHECK THE CONTROL when reading results -- if HBM bytes move with BENCH_STAGES the
     intermediates have spilled and the comparison is confounded.
     """
-    import torch_spyre._inductor.wsr.propagate_named_dims as pnd
     from torch._inductor.codecache import FxGraphCache
-    from torch_spyre._inductor import spyre_hint
+    from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 
-    global _PREPARE
     nrow, ncol = ROWS, COLS
     x_cpu = torch.randn(nrow, ncol, dtype=torch.float16)
     extra = max(0, STAGES)
-
-    def _declare():
-        pnd.declare_tensor_dim("NROW", nrow)
-        pnd.declare_tensor_dim("NCOL", ncol)
-
-    _declare()
 
     def _chain(x):
         m = torch.amax(x, dim=-1, keepdim=True)
@@ -363,25 +367,27 @@ def _softmax_stages():
         s = torch.sum(e, dim=-1, keepdim=True)
         return e / s
 
-    # COARSE TILING IS REQUIRED, not optional. Untiled, every intermediate is the FULL
+    # TILING IS REQUIRED, not optional. Untiled, every intermediate is the FULL
     # tensor (16.8 MB at 4096x2048) and cannot be LX-resident, so each added stage does a
     # full HBM round trip instead -- which moves the HBM traffic and destroys the control.
     # Tiling is what makes the intermediates per-tile and LX-resident in the first place.
     if TILES >= 2:
+        tile = _tile_size(nrow, TILES, "BENCH_ROWS")
 
         def fn(x):
-            pnd.name_tensor_dims(x, ["NROW", "NCOL"])
-            with spyre_hint(num_tiles_per_dim={"NROW": TILES}):
-                return _chain(x)
+            def body(_, ops):
+                (rows,) = ops
+                return None, _chain(rows)
 
-        _PREPARE = _declare
+            return for_each_tile(body, (x,), dims=(0,), tile_size=tile, out_dim=0)[1]
+
     else:
         fn = _chain
 
-    fn(x_cpu)  # eager reference call
+    _chain(x_cpu)  # eager reference call
     torch._dynamo.reset_code_caches()
     FxGraphCache.clear()
-    return torch.compile(fn), (x_cpu.to(DEVICE),)
+    return torch.compile(fn, fullgraph=TILES >= 2), (x_cpu.to(DEVICE),)
 
 
 def _mm_workload():
@@ -389,8 +395,8 @@ def _mm_workload():
     (m, n, k) core split is controlled instead of planner-chosen -- for term isolation
     (compute / hbm / psum). M=ROWS, K=COLS, N=BENCH_N; WD_M/WD_N/WD_K give the per-dim
     split (cores = product, FINAL). Mirrors tests/inductor/test_work_division_hint.py:
-    eager declare_tensor_dim, name the inputs' dims, hint inside fn; the coarse-tile
-    _PREPARE hook re-declares before each traced call.
+    eager declare_tensor_dim, name the inputs' dims, hint inside fn; the _PREPARE hook
+    re-declares before each traced call.
     """
     import torch_spyre._inductor.wsr.propagate_named_dims as pnd
     from torch._inductor.codecache import FxGraphCache
@@ -433,19 +439,11 @@ def _softmax_noexp_row_tiling():
     tiling, same fusion depth, same LX-resident intermediates; the ONLY difference is exp.
     So (softmax_time - softmax_noexp_time) at matched [ROWS,COLS,TILES] isolates the exp
     cost -- the design-review-mandated control that an untiled copy cannot provide."""
-    import torch_spyre._inductor.wsr.propagate_named_dims as pnd
     from torch._inductor.codecache import FxGraphCache
-    from torch_spyre._inductor import spyre_hint
+    from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 
-    global _PREPARE
     nrow, ncol = ROWS, COLS
     x_cpu = torch.randn(nrow, ncol, dtype=torch.float16)
-
-    def _declare():
-        pnd.declare_tensor_dim("NROW", nrow)
-        pnd.declare_tensor_dim("NCOL", ncol)
-
-    _declare()
 
     def _sm_noexp(x):  # amax, sub, mul (<- exp), sum, div : softmax minus the exp
         y = x - x.amax(dim=-1, keepdim=True)
@@ -453,141 +451,141 @@ def _softmax_noexp_row_tiling():
         return z / z.sum(dim=-1, keepdim=True)
 
     if TILES >= 2:
+        tile = _tile_size(nrow, TILES, "BENCH_ROWS")
 
         def fn(x):
-            pnd.name_tensor_dims(x, ["NROW", "NCOL"])
-            with spyre_hint(num_tiles_per_dim={"NROW": TILES}):
-                return _sm_noexp(x)
+            def body(_, ops):
+                (rows,) = ops
+                return None, _sm_noexp(rows)
 
-        _PREPARE = _declare
+            return for_each_tile(body, (x,), dims=(0,), tile_size=tile, out_dim=0)[1]
+
     else:
 
         def fn(x):
             return _sm_noexp(x)
 
-    fn(x_cpu)  # eager reference call
+    _sm_noexp(x_cpu)  # eager reference call
     torch._dynamo.reset_code_caches()
     FxGraphCache.clear()
-    return torch.compile(fn), (x_cpu.to(DEVICE),)
+    return torch.compile(fn, fullgraph=TILES >= 2), (x_cpu.to(DEVICE),)
 
 
 def _matmul_row_tiling():
-    """Matmul ``a @ b`` COARSE-TILED over the M (row) dim via
-    spyre_hint(num_tiles_per_dim={"M": TILES}) DISTINCT from `mmwd`, which forces a
-    work-division CORE split: this creates a sequential M-tile LOOP. M=ROWS, K=COLS,
-    N=BENCH_N; BENCH_TILES>=2 tiles M, else untiled. Measured via the AIU profiler."""
-    import torch_spyre._inductor.wsr.propagate_named_dims as pnd
+    """Matmul ``a @ b`` tiled over the M (row) dim with ``for_each_tile`` (b is
+    invariant). DISTINCT from `mmwd`, which forces a work-division CORE split: this
+    creates a sequential M-tile LOOP. M=ROWS, K=COLS, N=BENCH_N; BENCH_TILES>=2 tiles M,
+    else untiled. Measured via the AIU profiler."""
     from torch._inductor.codecache import FxGraphCache
-    from torch_spyre._inductor import spyre_hint
+    from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 
-    global _PREPARE
     m, k, n = ROWS, COLS, NCOLS
     xa = torch.rand(m, k, dtype=torch.float16)  # CPU; timing only, values irrelevant
     yb = torch.rand(k, n, dtype=torch.float16)
 
-    def _declare():
-        pnd.declare_tensor_dim("M", m)
-        pnd.declare_tensor_dim("K", k)
-        pnd.declare_tensor_dim("N", n)
-
-    _declare()
-
     if TILES >= 2:
+        tile = _tile_size(m, TILES, "BENCH_ROWS")
 
         def fn(a, b):
-            pnd.name_tensor_dims(a, ["M", "K"])
-            pnd.name_tensor_dims(b, ["K", "N"])
-            with spyre_hint(num_tiles_per_dim={"M": TILES}):
-                return a @ b
+            def body(_, ops):
+                a_rows, b_whole = ops
+                return None, a_rows @ b_whole
 
-        _PREPARE = _declare
+            return for_each_tile(
+                body, (a, b), dims=(0, None), tile_size=tile, out_dim=0
+            )[1]
+
     else:
 
         def fn(a, b):
             return a @ b
 
-    fn(xa, yb)  # eager reference call
+    xa @ yb  # eager reference call
     torch._dynamo.reset_code_caches()
     FxGraphCache.clear()
-    return torch.compile(fn), (xa.to(DEVICE), yb.to(DEVICE))
+    return torch.compile(fn, fullgraph=TILES >= 2), (xa.to(DEVICE), yb.to(DEVICE))
 
 
 def _matmul_k_tiling():
-    """`a @ b` [M,K]@[K,N] COARSE-TILED over the K (reduction) dim via
-    spyre_hint(num_tiles_per_dim={"K": TILES}) and run_mm_k_tiled.py. M=ROWS, K=COLS, N=BENCH_N; TILES>=2 tiles K, else untiled."""
-    import torch_spyre._inductor.wsr.propagate_named_dims as pnd
+    """`a @ b` [M,K]@[K,N] tiled over the K (reduction) dim with ``for_each_tile``:
+    a split-K loop whose carry accumulates the partial products. M=ROWS, K=COLS,
+    N=BENCH_N; TILES>=2 tiles K, else untiled."""
     from torch._inductor.codecache import FxGraphCache
-    from torch_spyre._inductor import spyre_hint
+    from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 
-    global _PREPARE
     m, k, n = ROWS, COLS, NCOLS
     xa = torch.rand(m, k, dtype=torch.float16)
     yb = torch.rand(k, n, dtype=torch.float16)
 
-    def _declare():
-        pnd.declare_tensor_dim("M", m)
-        pnd.declare_tensor_dim("K", k)
-        pnd.declare_tensor_dim("N", n)
-
-    _declare()
-
     if TILES >= 2:
+        tile = _tile_size(k, TILES, "BENCH_COLS")
 
         def fn(a, b):
-            pnd.name_tensor_dims(a, ["M", "K"])
-            pnd.name_tensor_dims(b, ["K", "N"])
-            with spyre_hint(num_tiles_per_dim={"K": TILES}):
-                return a @ b
+            def body(acc, ops):
+                a_cols, b_rows = ops
+                return acc + a_cols @ b_rows, None
 
-        _PREPARE = _declare
+            init = torch.zeros(m, n, dtype=a.dtype, device=a.device)
+            return for_each_tile(body, (a, b), dims=(1, 0), tile_size=tile, init=init)[
+                0
+            ]
+
     else:
 
         def fn(a, b):
             return a @ b
 
-    fn(xa, yb)  # eager reference call
+    xa @ yb  # eager reference call
     torch._dynamo.reset_code_caches()
     FxGraphCache.clear()
-    return torch.compile(fn), (xa.to(DEVICE), yb.to(DEVICE))
+    return torch.compile(fn, fullgraph=TILES >= 2), (xa.to(DEVICE), yb.to(DEVICE))
 
 
 def _mm_nested_m_k():
-    """torch.mm [M,K]@[K,N] with NESTED tiling -- outer M x2, inner K x TILES M=ROWS, K=COLS, N=BENCH_N."""
-    import torch_spyre._inductor.wsr.propagate_named_dims as pnd
+    """torch.mm [M,K]@[K,N] with NESTED tiling -- outer M x2 (map), inner K x TILES
+    (split-K carry). M=ROWS, K=COLS, N=BENCH_N."""
     from torch._inductor.codecache import FxGraphCache
-    from torch_spyre._inductor import spyre_hint
+    from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 
-    global _PREPARE
     m, k, n = ROWS, COLS, NCOLS
     xa = torch.rand(m, k, dtype=torch.float16)
     yb = torch.rand(k, n, dtype=torch.float16)
 
-    def _declare():
-        pnd.declare_tensor_dim("M", m)
-        pnd.declare_tensor_dim("K", k)
-        pnd.declare_tensor_dim("N", n)
-
-    _declare()
-
     if TILES >= 2:
+        m_tile = _tile_size(m, 2, "BENCH_ROWS")
+        k_tile = _tile_size(k, TILES, "BENCH_COLS")
 
         def fn(a, b):
-            pnd.name_tensor_dims(a, ["M", "K"])
-            pnd.name_tensor_dims(b, ["K", "N"])
-            with spyre_hint(num_tiles_per_dim={"M": 2}):
-                with spyre_hint(num_tiles_per_dim={"K": TILES}):
-                    return torch.mm(a, b)
+            def outer_body(_, outer_ops):
+                a_rows, b_whole = outer_ops
 
-        _PREPARE = _declare
+                def inner_body(acc, inner_ops):
+                    a_cols, b_rows = inner_ops
+                    return acc + a_cols @ b_rows, None
+
+                init = torch.zeros(m_tile, n, dtype=a.dtype, device=a.device)
+                final, _ = for_each_tile(
+                    inner_body,
+                    (a_rows, b_whole),
+                    dims=(1, 0),
+                    tile_size=k_tile,
+                    init=init,
+                )
+                return None, final
+
+            return for_each_tile(
+                outer_body, (a, b), dims=(0, None), tile_size=m_tile, out_dim=0
+            )[1]
+
     else:
 
         def fn(a, b):
             return torch.mm(a, b)
 
-    fn(xa, yb)  # eager reference call
+    torch.mm(xa, yb)  # eager reference call
     torch._dynamo.reset_code_caches()
     FxGraphCache.clear()
-    return torch.compile(fn), (xa.to(DEVICE), yb.to(DEVICE))
+    return torch.compile(fn, fullgraph=TILES >= 2), (xa.to(DEVICE), yb.to(DEVICE))
 
 
 def _to_dev(t: torch.Tensor, layout_spec):
@@ -609,7 +607,7 @@ def _to_dev(t: torch.Tensor, layout_spec):
 
 def _bmm_workload(kind: str):
     """Batched matmul *.py. B=BENCH_B, M=ROWS, K=COLS,
-    N=BENCH_N; TILES>=2 tiles K (else untiled). ``kind``:
+    N=BENCH_N; TILES>=2 tiles K with ``for_each_tile`` (else untiled). ``kind``:
       "k"      -> torch.bmm(a[B,M,K], b[B,K,N])       tiled over K
       "3d2d"   -> torch.matmul(a[B,M,K], b[K,N])      2-D weight shared over the batch
       "nested" -> torch.bmm(a[B,M,K], b[B,K,N])       outer B x2, inner K x TILES
@@ -621,6 +619,7 @@ def _bmm_workload(kind: str):
     import torch_spyre._inductor.wsr.propagate_named_dims as pnd
     from torch._inductor.codecache import FxGraphCache
     from torch_spyre._inductor import spyre_hint
+    from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 
     global _PREPARE
     b_n, m, k, n = BB, ROWS, COLS, NCOLS
@@ -662,107 +661,93 @@ def _bmm_workload(kind: str):
 
         _PREPARE = _declare
     elif TILES >= 2 and kind == "nested":
+        b_tile = _tile_size(b_n, 2, "BENCH_B")
+        k_tile = _tile_size(k, TILES, "BENCH_COLS")
 
         def fn(a, b):
-            _name(a, b)
-            with spyre_hint(num_tiles_per_dim={"B": 2}):
-                with spyre_hint(num_tiles_per_dim={"K": TILES}):
-                    return mm(a, b)
+            def outer_body(_, outer_ops):
+                a_batch, b_batch = outer_ops
 
-        _PREPARE = _declare
+                def inner_body(acc, inner_ops):
+                    a_cols, b_rows = inner_ops
+                    return acc + mm(a_cols, b_rows), None
+
+                init = torch.zeros(b_tile, m, n, dtype=a.dtype, device=a.device)
+                final, _ = for_each_tile(
+                    inner_body,
+                    (a_batch, b_batch),
+                    dims=(2, 1),
+                    tile_size=k_tile,
+                    init=init,
+                )
+                return None, final
+
+            return for_each_tile(
+                outer_body, (a, b), dims=(0, 0), tile_size=b_tile, out_dim=0
+            )[1]
+
     elif TILES >= 2:
+        k_tile = _tile_size(k, TILES, "BENCH_COLS")
+        b_k_dim = 0 if kind == "3d2d" else 1  # the K axis of b
 
         def fn(a, b):
-            _name(a, b)
-            with spyre_hint(num_tiles_per_dim={"K": TILES}):
-                return mm(a, b)
+            def body(acc, ops):
+                a_cols, b_rows = ops
+                return acc + mm(a_cols, b_rows), None
 
-        _PREPARE = _declare
+            init = torch.zeros(b_n, m, n, dtype=a.dtype, device=a.device)
+            return for_each_tile(
+                body, (a, b), dims=(2, b_k_dim), tile_size=k_tile, init=init
+            )[0]
+
     else:
 
         def fn(a, b):
             return mm(a, b)
 
-    fn(xa, yb)  # eager reference call
+    tiled = not wd and TILES >= 2
+    (mm(xa, yb) if tiled else fn(xa, yb))  # eager reference call
     torch._dynamo.reset_code_caches()
     FxGraphCache.clear()
     # Operand placement: default `.to(DEVICE)`, or a chosen device dim_order when
     # WD_LAYOUT_A/B is set (op `bmm_layout`) -- see `_to_dev`.
-    return torch.compile(fn), (_to_dev(xa, WD_LAYOUT_A), _to_dev(yb, WD_LAYOUT_B))
-
-
-def _softmax_unrolled():
-    """Manual softmax chain (amax/sub/exp/sum/div) over [B,D]=[ROWS,COLS], tiled over B
-    with the tile loop UNROLLED (config.unroll_loops=True, sencores=1) The unrolled IR has NO CoarseTileInfo (tiling
-    shows only as dim_hints), so it exercises the extractor's non-loop coarse path."""
-    import torch_spyre._inductor.wsr.propagate_named_dims as pnd
-    from torch._inductor.codecache import FxGraphCache
-    from torch_spyre._inductor import config, spyre_hint
-
-    global _PREPARE
-    b_n, d = ROWS, COLS
-    x_cpu = torch.randn(b_n, d, dtype=torch.float16)
-
-    def _declare():
-        pnd.declare_tensor_dim("B", b_n)
-        pnd.declare_tensor_dim("D", d)
-
-    _declare()
-
-    def _softmax(x):
-        mx = x.amax(dim=-1, keepdim=True)
-        e = (x - mx).exp()
-        return e / e.sum(dim=-1, keepdim=True)
-
-    if TILES >= 2:
-
-        def fn(x):
-            pnd.name_tensor_dims(x, ["B", "D"])
-            with spyre_hint(num_tiles_per_dim={"B": TILES}):
-                return _softmax(x)
-
-        _PREPARE = _declare
-    else:  # TILES<=1: the UNTILED single-core reference (no B-tiling)
-        fn = _softmax
-
-    # Match the example's config: unroll the tile loop, single core, LX planning on.
-    config.unroll_loops = True
-    config.sencores = 1
-    config.lx_planning = True
-    config.allow_all_ops_in_lx_planning = True
-
-    fn(x_cpu)  # eager reference call
-    torch._dynamo.reset_code_caches()
-    FxGraphCache.clear()
-    return torch.compile(fn), (x_cpu.to(DEVICE),)
+    return torch.compile(fn, fullgraph=tiled), (
+        _to_dev(xa, WD_LAYOUT_A),
+        _to_dev(yb, WD_LAYOUT_B),
+    )
 
 
 def _flash_attn_workload():
-    """Spyre flash-attention with the coarse-tiling and work-division HINTS made
-    env-configurable, so a sweep can vary the block sizes and read the measured time for
-    each. A MULTI-OP coarse-tiled program (~28 ops): two batched matmuls (QK^T reduces
-    over D, PV reduces over Lk) glued by the online-softmax reductions, fused under one
-    tiled loop nest.
+    """Spyre flash-attention built with ``for_each_tile`` loops and work-division HINTS
+    made env-configurable, so a sweep can vary the block sizes and read the measured time
+    for each. A MULTI-OP tiled program (~28 ops per block): two batched matmuls (QK^T
+    reduces over D, PV reduces over Lk) glued by the online-softmax reductions, under one
+    tiled loop nest: B, H and Lq are map loops, Lk is the online-softmax carry loop.
     Knobs: FA_B/FA_H/FA_LQ/FA_LK/FA_D (shape); FA_B_TILES/FA_H_TILES/FA_LQ_TILES/
-    FA_LK_TILES (coarse tile COUNTS per dim -> loop nest); FA_WD ("H:4,Lq:8,Lk:8" work_div
-    -> intra-tile cores). We are NOT modeling flash attn yet; this is data capture: the
-    model over-predicts it by more than 10x, so it is excluded from every scored figure."""
+    FA_LK_TILES (tile COUNTS per dim -> loop nest; a count of 1 adds no loop at that
+    level); FA_WD ("H:4,Lq:8,Lk:8" work_div -> intra-tile cores); FA_CAUSAL (default 1; 0
+    uses an all-zero mask, which stays finite when Lk is tiled -- a causal -inf mask
+    leaves fully masked Lk blocks whose running max is -inf, giving NaN values; timing is
+    unaffected). We are NOT modeling flash attn yet; this is data capture: the model
+    over-predicts it by more than 10x, so it is excluded from every scored figure."""
     import math as _math
 
     import torch_spyre._inductor.wsr.propagate_named_dims as pnd
     from torch._inductor.codecache import FxGraphCache
     from torch_spyre._inductor import spyre_hint
+    from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 
     global _PREPARE
     B = int(os.environ.get("FA_B", "1"))
     H = int(os.environ.get("FA_H", "32"))
-    Lq = int(os.environ.get("FA_LQ", "4096"))
+    Lq = int(os.environ.get("FA_LQ", "512"))
     Lk = int(os.environ.get("FA_LK", "4096"))
     D = int(os.environ.get("FA_D", "128"))
     bt = int(os.environ.get("FA_B_TILES", "1"))
     ht = int(os.environ.get("FA_H_TILES", "8"))
     qt = int(os.environ.get("FA_LQ_TILES", "4"))
     kt = int(os.environ.get("FA_LK_TILES", "1"))
+    causal_mask = os.environ.get("FA_CAUSAL", "1") != "0"
     wd = {}
     for part in os.environ.get("FA_WD", "H:4,Lq:8,Lk:8").split(","):
         nm, val = part.split(":")
@@ -775,6 +760,8 @@ def _flash_attn_workload():
         pnd.declare_tensor_dim("Lq", Lq)
         pnd.declare_tensor_dim("Lk", Lk)
         pnd.declare_tensor_dim("D", D)
+        pnd.declare_tensor_dim("_b", 1)  # unit dims of the broadcast mask
+        pnd.declare_tensor_dim("_h", 1)
 
     _declare()
 
@@ -782,52 +769,223 @@ def _flash_attn_workload():
         pnd.name_tensor_dims(q, ["B", "H", "Lq", "D"])
         pnd.name_tensor_dims(k, ["B", "H", "Lk", "D"])
         pnd.name_tensor_dims(v, ["B", "H", "Lk", "D"])
-        pnd.name_tensor_dims(m, ["B", "H", "Lq", "Lk"])
+        # The mask is [1, 1, Lq, Lk]: its unit dims get throwaway names ("_b", "_h").
+        pnd.name_tensor_dims(m, ["_b", "_h", "Lq", "Lk"])
+
+    def _block(queries, keys, values, mask, state):
+        """One online-softmax update of (running max, denominator, output)."""
+        real_max, denominator, output = state
+        keys_t = (keys * scale).transpose(-1, -2)
+        scores = torch.matmul(queries * scale, keys_t) + mask
+        block_max = torch.amax(scores, dim=-1, keepdim=True)
+        running_max = torch.maximum(real_max, block_max)
+        exp_scores = torch.exp(scores - running_max)
+        correction = torch.exp(real_max - running_max)
+        denominator = denominator * correction + exp_scores.sum(dim=-1, keepdim=True)
+        output = output * correction + torch.matmul(exp_scores, values)
+        return running_max, denominator, output
+
+    def _attend(queries, keys, values, mask):
+        """Attention for one (B, H, Lq) block: Lk is a carry loop when kt > 1."""
+        stat = (*queries.shape[:-1], 1)
+        init = (
+            torch.full(stat, float("-inf"), device=queries.device, dtype=queries.dtype),
+            torch.zeros(stat, device=queries.device, dtype=queries.dtype),
+            torch.zeros_like(queries),
+        )
+        if kt == 1:
+            _, denominator, output = _block(queries, keys, values, mask, init)
+            return output / denominator
+
+        def kv_body(state, tiles):
+            k_tile, v_tile, m_tile = tiles
+            return _block(queries, k_tile, v_tile, m_tile, state), None
+
+        (_, denominator, output), _ = for_each_tile(
+            kv_body,
+            (keys, values, mask),
+            dims=(2, 2, 3),
+            tile_size=_tile_size(Lk, kt, "FA_LK"),
+            init=init,
+        )
+        return output / denominator
+
+    def _map_level(inner, count, extent, name, dims, out_dim):
+        """Wrap ``inner(q, k, v, m)`` in a map loop over ``count`` tiles, if count > 1."""
+        if count <= 1:
+            return inner
+        tile = _tile_size(extent, count, name)
+
+        def level(q, k, v, m):
+            def body(_, tiles):
+                return None, inner(*tiles)
+
+            return for_each_tile(
+                body, (q, k, v, m), dims=dims, tile_size=tile, out_dim=out_dim
+            )[1]
+
+        return level
+
+    # Innermost first: Lq (q and its mask rows), then H, then B. The mask is [1, 1, Lq, Lk],
+    # so it is invariant over B and H.
+    attend = _map_level(_attend, qt, Lq, "FA_LQ", (2, None, None, 2), 2)
+    attend = _map_level(attend, ht, H, "FA_H", (1, 1, 1, None), 1)
+    attend = _map_level(attend, bt, B, "FA_B", (0, 0, 0, None), 0)
 
     def flash(queries, keys, values, mask):
-        _name(queries, keys, values, mask)
-        output = torch.zeros_like(queries)
-        # sparse running max / denominator (the example's reduction hack)
-        real_max = torch.full(
-            (B, H, Lq, 64), float("-inf"), device=queries.device, dtype=torch.float16
-        ).amax(dim=-1)
-        denominator = torch.zeros(
-            (B, H, Lq, 64), device=queries.device, dtype=torch.float16
-        ).amax(dim=-1)
-        with spyre_hint(tiles={"B": bt}):
-            with spyre_hint(tiles={"H": ht}):
-                with spyre_hint(tiles={"Lq": qt}):
-                    with spyre_hint(tiles={"Lk": kt}):
-                        with spyre_hint(work_div=wd):
-                            keys_t = (keys * scale).transpose(-1, -2)
-                            scores = torch.matmul(queries * scale, keys_t) + mask
-                            block_max = torch.amax(scores, dim=-1)
-                            running_max = torch.maximum(real_max, block_max)
-                            exp_scores = torch.exp(scores - running_max.unsqueeze(-1))
-                            correction = torch.exp(real_max - running_max)
-                            denominator.copy_(
-                                denominator * correction + exp_scores.sum(dim=-1)
-                            )
-                            output.copy_(
-                                output * correction.unsqueeze(-1)
-                                + torch.matmul(exp_scores, values)
-                            )
-                            real_max.copy_(running_max)
-        return output / denominator.unsqueeze(-1)
+        with spyre_hint(work_div=wd):
+            return attend(queries, keys, values, mask)
 
     q = torch.randn(B, H, Lq, D, dtype=torch.float16)
     k = torch.randn(B, H, Lk, D, dtype=torch.float16)
     v = torch.randn(B, H, Lk, D, dtype=torch.float16)
-    causal = torch.tril(torch.ones(Lq, Lk, dtype=torch.bool))
     m = torch.zeros(1, 1, Lq, Lk, dtype=torch.float16)
-    m.masked_fill_(~causal, float("-inf"))
-    flash(q, k, v, m)  # eager reference call
+    if causal_mask:
+        causal = torch.tril(torch.ones(Lq, Lk, dtype=torch.bool))
+        m.masked_fill_(~causal, float("-inf"))
+    dev_args = (q.to(DEVICE), k.to(DEVICE), v.to(DEVICE), m.to(DEVICE))
+    _name(*dev_args)  # outside the compiled fn: fullgraph tracing cannot call it
     torch._dynamo.reset_code_caches()
     FxGraphCache.clear()
     _PREPARE = _declare
+    return torch.compile(flash, fullgraph=True), dev_args
+
+
+def _parse_work_div(spec: str) -> dict:
+    """``"R:4,H:8"`` -> ``{"R": 4, "H": 8}``."""
+    out = {}
+    for part in spec.split(","):
+        name, sep, n = part.partition(":")
+        if not sep or not name.strip() or not n.strip().isdigit():
+            raise SystemExit(f"bad work_div spec {spec!r} (want e.g. 'R:4,H:8')")
+        out[name.strip()] = int(n)
+    return out
+
+
+def _relayout_workload():
+    """One LX relayout: ``neg`` hinted to RL_SRC feeds ``relu`` hinted to RL_DST.
+
+    The pair fuses into one kernel, so the shuffle never gets a profiler event of its
+    own. (A build used to emit one kernel per op under BUNDLE_SYMBOLIC_ARGS=0, the
+    baked-address bundle path; #3741 removed that path.) It is isolated instead by
+    the four-run swap estimator, each run its own configuration over the same
+    [ROWS, COLS] fp16 tensor, with A and B two divisions::
+
+        shuffle ~= (T[A->B] + T[B->A] - T[A->A] - T[B->B]) / 2
+
+    The two cross runs carry one relayout each plus the same producer and consumer work
+    as the two matched runs, so the compute cancels; the law is symmetric in the two
+    views, so the halving is exact for it. ``eval_model.py --relayout`` pairs the runs.
+
+    RL_MODE=off keeps A->B but turns off ``config.lx_solver_relayout``, so the solver
+    is offered no relayout and the edge spills to HBM: the off-minus-on difference is
+    the quantity the layout solver decides on.
+
+    Whether a relayout fired is checked after the compile (``_check_relayout``): a run
+    whose relayout count is not what its divisions ask for is reported FAILED rather
+    than stored under a label that says otherwise. That also catches an `off` run
+    whose solve failed: the greedy fallback plans relayouts under
+    SPYRE_LX_PLANNER_RELAYOUT, which this flag does not gate.
+    """
+    import torch_spyre._inductor.wsr.propagate_named_dims as pnd
+    from torch._inductor.codecache import FxGraphCache
+    from torch_spyre._inductor import config, spyre_hint
+    from torch_spyre._inductor.scratchpad.allocator import (
+        CoOptimizingAllocator,
+        select_allocator,
+    )
+
+    global _PREPARE
+    if RL_MODE not in ("on", "off"):
+        raise SystemExit(f"RL_MODE={RL_MODE!r} (want on or off)")
+    if not config.lx_planning or not config.co_optimizing_lx_planning:
+        raise SystemExit(
+            "relayout needs LX_PLANNING=1 and CO_OPTIMIZING_LX_PLANNING=1: only a "
+            "co-optimizing allocator offers its solver relayouts"
+        )
+    # Ask the allocator the compile will use, so a solver that does not decide
+    # relayouts stops here with its name rather than as a FAILED run per config.
+    allocator = select_allocator()
+    if not (
+        isinstance(allocator, CoOptimizingAllocator)
+        and allocator.layout_planning.decides_lx_relayouts()
+    ):
+        raise SystemExit(
+            f"relayout needs a layout solver that decides LX relayouts; "
+            f"LAYOUT_SOLVER={config.layout_solver!r} does not (use cpsat)"
+        )
+    # Set from RL_MODE, not left to SPYRE_LX_SOLVER_RELAYOUT, so the mode the record
+    # carries is the mode that was measured.
+    config.lx_solver_relayout = RL_MODE == "on"
+    src_wd, dst_wd = _parse_work_div(RL_SRC), _parse_work_div(RL_DST)
+    rows, cols = ROWS, COLS
+
+    def _declare():
+        pnd.declare_tensor_dim("R", rows)
+        pnd.declare_tensor_dim("H", cols)
+
+    _declare()
+
+    def fn(t):
+        pnd.name_tensor_dims(t, ["R", "H"])
+        with spyre_hint(work_div=src_wd):
+            hidden = torch.neg(t)
+        with spyre_hint(work_div=dst_wd):
+            return torch.relu(hidden)
+
+    _PREPARE = _declare
+    torch._dynamo.reset_code_caches()
+    FxGraphCache.clear()
+    x = torch.rand(rows, cols, dtype=torch.float16).to(DEVICE)
+    return torch.compile(fn, dynamic=False), (x,)
+
+
+def _relayout_copies(feats: list) -> list:
+    """The LX relayout copies in the compiled bundle's cost-model features: one per
+    relayout the allocator materialized."""
+    return [o for o in feats if getattr(o, "is_lx_relayout", False)]
+
+
+def _check_relayout(feats: list) -> str:
+    """Why the `relayout` run does not measure what its configuration says, or "".
+
+    A relayout fires only between two different divisions with RL_MODE=on, and then
+    exactly once (one edge). Anything else -- the solver declining, or a matched pair
+    planning a copy -- would file the measurement under the wrong label."""
+    want = int(RL_MODE == "on" and _parse_work_div(RL_SRC) != _parse_work_div(RL_DST))
+    got = len(_relayout_copies(feats))
+    if got == want:
+        return ""
+    return f"relayout_copies={got} (want {want})"
+
+
+def _relayout_config_fields() -> str:
+    """The `relayout` configuration as SUMMARY fields, "" for every other op. On every
+    SUMMARY, FAILED ones included, so ``run_cost_model_sweep.py --from-records`` can
+    rebuild the configuration of a run that failed."""
+    if OP != "relayout":
+        return ""
+    # `sencores`: the budget, which `cores` (the widest division's count) is not.
     return (
-        torch.compile(flash),
-        (q.to(DEVICE), k.to(DEVICE), v.to(DEVICE), m.to(DEVICE)),
+        f" rl_src={RL_SRC} rl_dst={RL_DST} rl_mode={RL_MODE} sencores={SENCORES or '-'}"
+    )
+
+
+def _relayout_summary(feats: list) -> str:
+    """The `relayout` SUMMARY fields: the configuration, and the governing features and
+    the cost-model price of each relayout the compile emitted (0 when none did)."""
+    if OP != "relayout":
+        return ""
+    copies = _relayout_copies(feats)
+    split = max((o.relayout_split for o in copies), default=0)
+    run = max((o.relayout_run_elems for o in copies), default=0)
+    cores = max((o.relayout_cores or o.cores for o in copies), default=0)
+    nbytes = sum(o.out_elems * o.dtype_bytes for o in copies)
+    rl_us = sum(cost_model.relayout_ns(o) for o in copies) / 1000
+    return (
+        f"{_relayout_config_fields()} rl_copies={len(copies)} "
+        f"rl_split={split} rl_run_elems={run} rl_cores={cores} rl_bytes={nbytes} "
+        f"rl_pred_us={rl_us:.3f}"
     )
 
 
@@ -879,7 +1037,7 @@ def make_workload():
             return acc
 
         return chain, tuple(_rand(ROWS, COLS) for _ in range(n))
-    if OP in _CT_REDUCE:  # coarse-tiled dim0 reduction (BENCH_TILES, LX_PLANNING)
+    if OP in _CT_REDUCE:  # tiled dim0 reduction (BENCH_TILES, LX_PLANNING)
         return _ct_workload(_CT_REDUCE[OP])
     if OP == "softmax_stages":  # discriminator: LX traffic vs element count
         return _softmax_stages()
@@ -887,9 +1045,9 @@ def make_workload():
         return _softmax_row_tiling()
     if OP == "softmax_noexp_row_tiling":  # matched control: softmax structure, exp->mul
         return _softmax_noexp_row_tiling()
-    if OP == "matmul_row_tiling":  # a@b coarse-tiled over M (num_tiles, not core split)
+    if OP == "matmul_row_tiling":  # a@b tiled over M (a tile loop, not a core split)
         return _matmul_row_tiling()
-    if OP == "matmul_k_tiling":  # a@b coarse-tiled over K (reduction dim)
+    if OP == "matmul_k_tiling":  # a@b tiled over K (reduction dim)
         return _matmul_k_tiling()
     if OP == "mm_nested_m_k":  # mm nested: outer M x2, inner K x TILES
         return _mm_nested_m_k()
@@ -905,10 +1063,10 @@ def make_workload():
         return _bmm_workload("3d2d")
     if OP == "bmm_layout":  # full bmm with a chosen device dim_order (WD_LAYOUT_A/B), +
         return _bmm_workload("k")  # optional forced split (WD_B/M/N/K) -- see _to_dev
-    if OP == "flash_attn":  # multi-op coarse-tiled flash attention (FA_* hint knobs)
+    if OP == "flash_attn":  # multi-op tiled flash attention (FA_* knobs)
         return _flash_attn_workload()
-    if OP == "softmax_unrolled":  # unrolled softmax chain over B (no CoarseTileInfo)
-        return _softmax_unrolled()
+    if OP == "relayout":  # one LX relayout between two hinted ops (RL_* knobs)
+        return _relayout_workload()
     if OP == "mm":  # matmul [M=ROWS, K=COLS] @ [K=COLS, N=BENCH_N]: a Reduction over K
         # -> work-division Pass 2 (cost_model_matmul_division) picks the (m,n,k) split.
         mm = lambda a, b: a @ b  # noqa: E731
@@ -933,7 +1091,6 @@ def make_workload():
             "softmax_row_tiling",
             "softmax_stages",
             "softmax_noexp_row_tiling",
-            "softmax_unrolled",
             "matmul_row_tiling",
             "matmul_k_tiling",
             "mm_nested_m_k",
@@ -944,6 +1101,7 @@ def make_workload():
             "bmm_wd_3d2d",
             "bmm_layout",
             "flash_attn",
+            "relayout",
             "mm",
             "mmwd",
             "transpose_outer",
@@ -1061,7 +1219,7 @@ def _run():
     guard = _SpanOverflowGuard.install()
     compiled, args = make_workload()
     for i in range(WARMUP):  # compile (-> cost-model dump fires) + warm the kernel
-        if _PREPARE is not None:  # coarse-tile: re-declare named dims before each trace
+        if _PREPARE is not None:  # work_div: re-declare named dims before each trace
             _PREPARE()
         _sync(compiled(*args))
         if i == 0 and guard.hits:
@@ -1077,20 +1235,29 @@ def _run():
             return
     io = dict(dump_cost_model.LAST_IO)  # device-layout I/O the model computed
     feats = list(dump_cost_model.LAST_FEATS)  # raw OpFeatures for predict_ops()
+    if OP == "relayout" and (why := _check_relayout(feats)):
+        print(
+            f"SUMMARY op={OP} rows={ROWS} cols={COLS} tiles={TILES} lx={LX}"
+            f"{_relayout_config_fields()} FAILED reason={why}"
+        )
+        return
     io_hbm_bytes = io.get("hbm_bytes", 0)
 
     def _profile_once():
         """One profiled trace -> (kernel_us, memset_us, other_us), classified by
         EXCLUSION (a Memset / Memcpy is NOT the fused compute kernel; the new image
-        leaves the kernel event name BLANK, so a name match silently reports 0)."""
+        leaves the kernel event name BLANK, so a name match silently reports 0).
+
+        Only DEVICE events count. The host-side ``launch::Compute`` / ``launch::D2H``
+        / ``launch::H2D`` markers (``RECORD_FUNCTION`` in spyre_stream.cpp) are CPU
+        events, yet the profiler credits each with its device twin's time as "Self
+        SPYRE"; counted, they doubled the kernel and added the output read-back."""
         with profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
             record_shapes=True,
             profile_memory=True,
         ) as prof:
-            if (
-                _PREPARE is not None
-            ):  # coarse-tile: re-declare before the profiled trace
+            if _PREPARE is not None:  # work_div: re-declare before the profiled trace
                 _PREPARE()
             _sync(compiled(*args))
         kernel = memset = other = 0.0
@@ -1098,7 +1265,7 @@ def _run():
             us = getattr(ev, "self_device_time_total", 0) or getattr(
                 ev, "self_cuda_time_total", 0
             )
-            if not us or us <= 0:
+            if not us or us <= 0 or ev.device_type == torch.autograd.DeviceType.CPU:
                 continue
             key = ev.key or ""
             if "Memset" in key:
@@ -1192,6 +1359,10 @@ def _run():
         f"kernel_us_min={k_min:.3f} kernel_us_median={k_med:.3f} "
         f"kernel_us_mean={k_mean:.3f} kernel_us_std={k_std:.3f} "
         f"kernel_us_cv={k_cv:.2f} reps={len(kernels)}"
+        # `timing=device`: kernel_us counts device events only (see _profile_once).
+        # Earlier harnesses also counted the launch::* host markers, so eval_model
+        # scores an unmarked row only if it predates them.
+        " timing=device" + _relayout_summary(feats)
     )
 
 
@@ -1206,7 +1377,8 @@ def main():
 
         traceback.print_exc()
         print(
-            f"SUMMARY op={OP} rows={ROWS} cols={COLS} tiles={TILES} lx={LX} "
+            f"SUMMARY op={OP} rows={ROWS} cols={COLS} tiles={TILES} lx={LX}"
+            f"{_relayout_config_fields()} "
             f"FAILED reason={type(exc).__name__}: {str(exc)[:140]}"
         )
 
