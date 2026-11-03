@@ -4508,6 +4508,29 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
         },
         (
+            "test_cat_reduce_size1_trailing_dim",
+            "test_cat_reduce_size1_trailing_dim_cpu",
+        ): {
+            # Regression test for #5196: cat on a trailing size-1 dim writes a
+            # bare constant (e.g. 1) as the stick coordinate, with no loop
+            # variable to make it offset-free; a downstream reduction forces
+            # layout propagation to resolve that write.
+            "param_sets": {
+                "fp16": (
+                    cached_randn((32, 8, 16, 1), dtype=torch.float16),
+                    cached_randn((32, 8, 16, 1), dtype=torch.float16),
+                ),
+                "bfloat16": (
+                    cached_randn((32, 8, 16, 1), dtype=torch.bfloat16),
+                    cached_randn((32, 8, 16, 1), dtype=torch.bfloat16),
+                ),
+                "fp32": (
+                    cached_randn((32, 8, 16, 1), dtype=torch.float32),
+                    cached_randn((32, 8, 16, 1), dtype=torch.float32),
+                ),
+            },
+        },
+        (
             "test_pad",
             "test_pad_cpu",
         ): {
@@ -11450,6 +11473,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return torch.cat(tensors, dim=dim)
 
         self.compare_with_cpu(fn, *tensors)
+
+    def test_cat_reduce_size1_trailing_dim_cpu(self, a, b):
+        def fn(a, b):
+            return torch.cat([a, b], dim=-1).sum(dim=-1)
+
+        self.compare_with_cpu(fn, a, b)
 
     def test_pad_cpu(self, x, pad):
         """Compiled torch.nn.functional.pad (constant zero) on Spyre matches CPU."""

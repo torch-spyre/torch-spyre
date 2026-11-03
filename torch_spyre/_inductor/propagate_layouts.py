@@ -308,8 +308,8 @@ def _make_output_stl(
     stick_size = get_elem_in_stick(dtype)
     dim_order = _compute_dim_order(stick_dim, c_size, out_coords)
     stl = SpyreTensorLayout(c_size, c_stride, dtype, dim_order)
-    coords = device_coordinates(stl, output_dep, None)
-    if is_stick_expr_offset_free(coords[-1], stick_size):
+    coords = try_device_coordinates(stl, output_dep, None)
+    if coords is not None and is_stick_expr_offset_free(coords[-1], stick_size):
         return stl
     return None
 
@@ -2825,7 +2825,13 @@ def _find_alt_target_stl(
     """
     dtype_for_layout = _mutation_layout_dtype(target_layout, target_stl)
     stick_size = get_elem_in_stick(dtype_for_layout)
-    write_stick = device_coordinates(target_stl, output_dep, None)[-1]
+    # check_stick_expr=False: an unsupported stick expression here (e.g. a bare
+    # constant offset from writing a size-1 slice) is this function's reason for
+    # being -- it is the signal to search for an alternate stick dim below, not
+    # a program error. The strict check is for call sites that have no fallback.
+    write_stick = device_coordinates(
+        target_stl, output_dep, None, check_stick_expr=False
+    )[-1]
     if is_stick_expr_offset_free(write_stick, stick_size) and not (
         _is_substick_write(write_stick, target_layout, output_dep, stick_size)
     ):
