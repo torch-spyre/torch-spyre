@@ -245,6 +245,25 @@ class TestCoordinates(TestCase):
         coords = compute_coordinates([2, 8, 64], [64, 128, 1], {c0: 1024}, c0)
         self.assertEqual(coords[-1], sympy.Mod(c0, 64))
 
+    def test_wrap_chain_drops_strides_that_a_later_one_divides(self):
+        # Device [3, 4, 1, 2, 64], strides [256, 64, 64, 768, 1] (a 4-D aligned
+        # tensor): d0 crosses the strides 768 and 256, and 256 divides 768.  The
+        # chain Mod(Mod(64*d0, 768), 256) must stay a single wrap.  sympy folds
+        # it to 64*Mod(Mod(d0, 12)**2, 4), which is not the same function.
+        d0, d2 = sympy.symbols("d0 d2", integer=True, nonnegative=True)
+        coords = compute_coordinates(
+            [3, 4, 1, 2, 64],
+            [256, 64, 64, 768, 1],
+            {d0: 24, d2: 64},
+            64 * d0 + d2,
+        )
+        self.assertEqual(coords[1], sympy.Mod(d0, 4))
+        self.assertFalse(any(c.has(sympy.Pow) for c in coords))
+        for value in range(24):
+            actual = [int(c.subs({d0: value, d2: 0})) for c in coords]
+            self.assertEqual(actual[:2], [(value % 12) // 4, value % 4], f"d0={value}")
+            self.assertEqual(actual[3], value // 12, f"d0={value}")
+
     def test_compute_coordinates_mixed_radix_flattened_dim(self):
         """A flattened H*D loop maps back to separate H and D coordinates."""
         lq, hd = sympy.symbols("lq hd", integer=True, nonnegative=True)

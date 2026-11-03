@@ -364,8 +364,19 @@ def compute_coordinates(
                 },
                 reverse=True,
             )
-            term = var * step
+            # Mod(Mod(x, a), b) == Mod(x, b) when b divides a, so a stride that a
+            # later one divides adds nothing.  Dropping it keeps the chain minimal
+            # and does not rely on sympy folding it: sympy turns
+            # Mod(64*Mod(d0, 12), 256) into 64*Mod(Mod(d0, 12)**2, 4), which is
+            # wrong.
+            wraps: list = []
             for s in enclosing:
+                if wraps and wraps[-1] % s == 0:
+                    wraps[-1] = s
+                else:
+                    wraps.append(s)
+            term = var * step
+            for s in wraps:
                 term = term % s
             return term // target_stride
 
