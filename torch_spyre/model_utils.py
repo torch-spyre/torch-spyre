@@ -213,7 +213,7 @@ def _embedding_stick_size(weight: torch.Tensor, dev_dtype: torch.dtype) -> int |
     eps = SpyreTensorLayout(list(weight.shape), dev_dtype).elems_per_stick()
     if d % eps == 0:
         return eps
-    warnings.warn(
+    warnings.warn(  # type: ignore[call-overload]
         f"Embedding hidden dim {d} is not a multiple of the Spyre stick "
         f"size {eps} for dtype {dev_dtype}; falling back to the default "
         "layout (no gather optimization) for this embedding table.",
