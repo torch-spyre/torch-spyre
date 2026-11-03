@@ -134,6 +134,7 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 | `torch.embedding` | Y | Y | Spyre | Registered on the compiled path (`ops/eager.py`) |
 | `torch.index_select` | Y | Y | Spyre | Registered on the compiled path (`ops/eager.py`) |
 | `torch.index_add` | | Y | Spyre | Compiled only; custom decomposition (gather + add + overwrite-scatter); requires unique indices |
+| `torch.index_fill` | Y | Y | Spyre | Custom decomposition (`full` block + `index_copy` scatter); `index_fill.int_Scalar`/`int_Tensor` and their `_out` overloads are registered on the compiled path (`ops/eager.py` `COMPILED_OPS`). `index_fill_` writes through `index_fill.out(out=self)`, so it allocates no `self`-sized temporary. Requires an int64 index; filling along the last (stick) dimension raises |
 | `torch.masked_scatter` | Y | Y | Spyre | Custom decomposition; supported for masks that broadcast along the last (stick) dimension, other masks raise `Unsupported` |
 | **Utility** | | | | |
 | `torch.item` | Y | Y | Spyre | Copies to CPU, returns Python scalar |
