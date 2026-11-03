@@ -13,11 +13,15 @@
 # limitations under the License.
 import argparse
 from datetime import timedelta
+import json
 import math
 import os
+import tempfile
 from typing import Tuple
+import regex as re
 import torch
 import torch.distributed as dist
+from torch.profiler import ProfilerActivity, profile
 
 DEVICE = torch.device(f"spyre:{os.getenv('RANK', '0')}")
 C10D_BACKEND = "spyreccl"
@@ -26,16 +30,17 @@ C10D_BACKEND = "spyreccl"
 # spyre-comms picks the allreduce algorithm (COLL_ALLREDUCE_ALGO forces one).
 # Offload_AllGatherSum is the default (<= 512 KB per rank on x86); most are trees
 # of depth ceil(log2 N). LinearBcast passes a running sum rank to rank, so its
-# chain of float16 additions is N - 1 deep.
+# chain of DLFloat16 additions is N - 1 deep.
 SEQUENTIAL_ALGOS = frozenset({"LinearBcast"})
 STICK_ELEMENTS = 64  # 128 B stick / 2 B per float16
-# 262144 float16 = 512 KB, the Offload_AllGatherSum cutoff on x86 (inclusive);
-# 262208 is the first size past it.
-SWEEP_SIZES = (4096, 65536, 262144, 262208)
+# 262144 float16 = 512 KB, the largest size verified to compile. 262208 (one
+# stick more) fails in deeptools ("sbf-ddc: There must be at least one valid
+# candidate"), so it is not swept.
+SWEEP_SIZES = (4096, 65536, 262144)
 
 
 def accumulation_depth(comm_size: int) -> int:
-    """Longest chain of float16 additions for the selected algorithm."""
+    """Longest chain of DLFloat16 additions for the selected algorithm."""
     if comm_size <= 1:
         return 1
     if os.environ.get("COLL_ALLREDUCE_ALGO") in SEQUENTIAL_ALGOS:
@@ -44,15 +49,17 @@ def accumulation_depth(comm_size: int) -> int:
 
 
 def calculate_value_tolerance(comm_size: int, max_expected: float) -> float:
-    """Tolerance of ``accumulation_depth`` float16 ULPs at ``max_expected``.
+    """Tolerance of ``accumulation_depth`` DLFloat16 ULPs at ``max_expected``.
 
-    Each level of the addition chain introduces at most 1 ULP of float16 rounding
-    error at the running partial-sum magnitude. ULP of float16 at value v is
-    2^(floor(log2(v)) - 10).
+    Each level of the addition chain introduces at most 1 ULP of DLFloat16 rounding
+    error at the running partial-sum magnitude. DLFloat16 uses a 1-6-9 format:
+    X = (-1)^s * 2^(e - 31) * (1 + m / 512) with 1 sign bit, 6 exponent bits (bias 31),
+    and 9 fraction/mantissa bits. ULP of DLFloat16 at value v is 2^(floor(log2(v)) - 9),
+    unlike IEEE Float16 which is 1-5-10 (10 mantissa bits, bias 15).
     """
     if max_expected <= 0.0:
         return 0.0
-    ulp = 2.0 ** (math.floor(math.log2(max_expected)) - 10)
+    ulp = dlfloat16_ulp(max_expected)
     return accumulation_depth(comm_size) * ulp
 
 
@@ -69,7 +76,7 @@ def calculate_allreduce_tolerance(comm_size: int, num_elements: int) -> float:
         num_elements: Number of elements per rank tensor
 
     Returns:
-        atol: Absolute tolerance scaled by accumulation depth and float16 ULP
+        atol: Absolute tolerance scaled by accumulation depth and DLFloat16 ULP
     """
     max_single_element = float((comm_size - 1) * num_elements + (num_elements - 1))
     return calculate_value_tolerance(comm_size, comm_size * max_single_element)
@@ -136,10 +143,21 @@ def check_close(
         )
 
 
-def fp16_ulp(value: float) -> float:
-    """Spacing between adjacent float16 values at the magnitude of ``value``."""
-    magnitude = max(abs(value), 2.0**-14)  # smallest normal; subnormals share its ULP
-    return 2.0 ** (math.floor(math.log2(magnitude)) - 10)
+def dlfloat16_ulp(value: float) -> float:
+    """Spacing between adjacent DLFloat16 values at the magnitude of ``value``.
+
+    DLFloat16 specification (IBM Research):
+    - Format: X = (-1)^s * 2^(e - 31) * (1 + m / 512)
+    - 1 sign bit (s)
+    - 6 exponent bits (e), exponent bias b = 31 (smallest magnitude 2^-31)
+    - 9 fraction/mantissa bits (m), giving 512 steps per binade
+    - ULP spacing is 2^(floor(log2(magnitude)) - 9)
+    - Smallest non-zero magnitude is 2^-31 * (1 + 1/512)
+    - Largest finite magnitude is 2^32 * (1 + 510/512) (~8.573e9, 0x7FFE / 0xFFFE)
+    - Merged NaN-Infinity is encoded as e=63, m=511 (0x7FFF / 0xFFFF)
+    """
+    magnitude = max(abs(value), 2.0**-31)
+    return 2.0 ** (math.floor(math.log2(magnitude)) - 9)
 
 
 def verify_negative_rejection(
@@ -154,9 +172,9 @@ def verify_negative_rejection(
     Ensures the test suite does not produce false passes when outputs violate
     numerical bounds.
 
-    The check stays in float16 (same dtype path as check_close). The perturbation
-    must survive float16 rounding, so it is sized from the tolerance and the
-    float16 ULP at the largest expected magnitude (both grow with world size):
+    The check stays in float16 (DLFloat16 on device, 1-6-9 format). The perturbation
+    must survive DLFloat16 rounding, so it is sized from the tolerance and the
+    DLFloat16 ULP at the largest expected magnitude (both grow with world size):
 
         perturbation = 2 * atol + 2 * ULP
 
@@ -167,11 +185,11 @@ def verify_negative_rejection(
     corrupted = result.clone().flatten()
     flat_expected = expected.flatten()
     max_magnitude = max(float(flat_expected.abs().max()), 1.0)
-    perturbation = 2.0 * atol + 2.0 * fp16_ulp(max_magnitude)
+    perturbation = 2.0 * atol + 2.0 * dlfloat16_ulp(max_magnitude)
     corrupted[0] += perturbation
 
     # Guard against a vacuous test: the perturbation must remain outside
-    # tolerance after float16 rounding.
+    # tolerance after DLFloat16 rounding.
     realized = abs(float(corrupted[0]) - float(flat_expected[0]))
     if not realized > atol:
         raise RuntimeError(
@@ -190,9 +208,9 @@ def random_rank_ints(num_elements: int, rank: int) -> torch.Tensor:
     """Deterministic per-rank integers in [0, 512) as int64.
 
     Every rank can regenerate every other rank's data, so the reference is built
-    from the actual inputs. Integers below 512 are exact in float16 and
-    DLFloat16, so only the reduction itself rounds, and the reference is the
-    correctly rounded exact sum (no float16 overflow up to 128 ranks).
+    from the actual inputs. Integers in [0, 512) are exact in DLFloat16 (1-6-9
+    format, 9 mantissa bits), so only the reduction itself rounds, and the
+    reference is the correctly rounded exact sum (no float16 overflow up to 128 ranks).
     """
     gen = torch.Generator().manual_seed(1_234_567 + 7_919 * rank + num_elements)
     return torch.randint(0, 512, (num_elements,), generator=gen, dtype=torch.int64)
@@ -204,7 +222,7 @@ def generate_test_tensors(
     """Generate input and golden expected tensors for all ranks.
 
     Follows the comprehensive test matrix patterns used in torch_nnpa/tests/
-    covering small, medium, large, multidimensional (1D, 2D, 3D), exact invariants,
+    covering small, medium, large, multidimensional (1D, 2D, 3D, 4D), exact invariants,
     and calibrated dynamic ranges.
     """
     shape = test_spec["shape"]
@@ -237,16 +255,17 @@ def generate_test_tensors(
 
     elif pattern == "single_rank":
         # Impulse: Only rank 0 contributes non-zero values, others contribute 0.0
+        # Values wrap in 1..1021 (prime): exact in fp16/DLFloat16, and never
+        # aligned with power-of-two chunk sizes.
+        impulse = (
+            (torch.arange(num_elements) % 1021 + 1).to(torch.float16).reshape(shape)
+        )
         if comm_rank == 0:
-            input_tensor = torch.arange(
-                1, num_elements + 1, dtype=torch.float16
-            ).reshape(shape)
+            input_tensor = impulse.clone()
         else:
             input_tensor = torch.zeros(shape, dtype=torch.float16)
 
-        expected_tensor = torch.arange(
-            1, num_elements + 1, dtype=torch.float16
-        ).reshape(shape)
+        expected_tensor = impulse
         atol = 0.0
 
     elif pattern == "cancellation":
@@ -298,6 +317,41 @@ def generate_test_tensors(
     return input_tensor, expected_tensor, atol
 
 
+def execute_with_algo(step, show_algo: bool):
+    """Run ``step()``; with ``show_algo`` also return the algorithms that ran.
+
+    The Spyre profiler tags each collective's device activities with the
+    spyre-comms algorithm that executed (``coll_algo``), so this also reports
+    the cost-based default choice, not just a forced COLL_*_ALGO. Returns
+    ``(result, algos)``; ``algos`` is None when not requested, and an empty list
+    when the profiler build does not emit coll metadata.
+
+    Fallback: spyre-comms prefixes compute kernel names with
+    ``[Coll,Algo,Bytes,CollId]``. When that prefix is not stripped into
+    ``coll_algo`` (e.g. a leading space defeats flex's parser), the algorithm
+    is read from the event name instead.
+    """
+    if not show_algo:
+        return step(), None
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]
+    ) as prof:
+        result = step()
+        torch.spyre.synchronize()
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        trace_path = os.path.join(tmp_dir, "trace.json")
+        prof.export_chrome_trace(trace_path)
+        with open(trace_path) as f:
+            events = json.load(f)["traceEvents"]
+    algos = {e["args"]["coll_algo"] for e in events if "coll_algo" in e.get("args", {})}
+    if not algos:
+        for e in events:
+            m = re.match(r"\s*\[[^,\]]+,([^,\]]+),\d+", e.get("name", ""))
+            if m:
+                algos.add(m.group(1))
+    return result, sorted(algos)
+
+
 def execute_allreduce_step(input_tensor: torch.Tensor, async_op: bool = False):
     """Execute a single allreduce collective across all ranks."""
     input_device = input_tensor.to(DEVICE)
@@ -307,6 +361,23 @@ def execute_allreduce_step(input_tensor: torch.Tensor, async_op: bool = False):
     else:
         dist.all_reduce(input_device, op=dist.ReduceOp.SUM)
     return input_device.to("cpu")
+
+
+def range_fits_float16(num_elements: int, comm_size: int) -> bool:
+    """Whether a ``range`` case is exact on input and finite on output.
+
+    Inputs are the integers 0 .. comm_size * num_elements - 1. DLFloat16 (9
+    mantissa bits) holds integers exactly only up to 1024, so larger inputs
+    would be rounded on upload, an error the depth * ULP tolerance does not
+    cover. The reference tensor is built in float16, so a sum above 65504
+    becomes inf.
+    """
+    if comm_size * num_elements - 1 > 1024:
+        return False
+    largest = (num_elements - 1) * comm_size + (
+        num_elements * comm_size * (comm_size - 1) / 2
+    )
+    return largest <= 65504.0
 
 
 def get_test_matrix(
@@ -319,6 +390,9 @@ def get_test_matrix(
     rows_2d = max(2, num_elements // inner_dim)
     d1_3d = 2
     d2_3d = max(2, num_elements // (d1_3d * inner_dim))
+    d1_4d = 2
+    d2_4d = 2
+    d3_4d = max(2, num_elements // (d1_4d * d2_4d * inner_dim))
     # Shard-per-rank size: a whole number of sticks per rank.
     sticks_per_rank = max(1, num_elements // (STICK_ELEMENTS * comm_size))
     shard_len = STICK_ELEMENTS * comm_size * sticks_per_rank
@@ -358,6 +432,12 @@ def get_test_matrix(
         {
             "id": "EXACT_ONES_3D",
             "shape": (d1_3d, d2_3d, inner_dim),
+            "pattern": "ones",
+            "category": "exact",
+        },
+        {
+            "id": "EXACT_ONES_4D",
+            "shape": (d1_4d, d2_4d, d3_4d, inner_dim),
             "pattern": "ones",
             "category": "exact",
         },
@@ -411,6 +491,12 @@ def get_test_matrix(
             "pattern": "range",
             "category": "tolerance",
         },
+        {
+            "id": "TOLERANCE_RANGE_4D",
+            "shape": (d1_4d, d2_4d, d3_4d, inner_dim),
+            "pattern": "range",
+            "category": "tolerance",
+        },
         # --- One logical tensor spread across ranks (size scales, tensor count doesn't) ---
         # Each rank owns one disjoint slice; summing with zeros is exact, so any
         # wrong chunk boundary or offset shows up as a wrong value (atol=0).
@@ -446,7 +532,18 @@ def get_test_matrix(
             }
             for n in SWEEP_SIZES
         ]
-    return matrix
+    fitting = []
+    for spec in matrix:
+        n = math.prod(spec["shape"])
+        if spec["pattern"] == "range" and not range_fits_float16(n, comm_size):
+            if os.environ.get("RANK", "0") == "0":
+                print(
+                    f"SKIP [{spec['id']}] range inputs/sums not exact in "
+                    f"DLFloat16/float16 at {comm_size} ranks"
+                )
+            continue
+        fitting.append(spec)
+    return fitting
 
 
 def run_test(
@@ -456,6 +553,7 @@ def run_test(
     num_elements=128,
     test_case="all",
     size_sweep=False,
+    show_algo=False,
 ):
     """Run allreduce test matrix with exact invariant and tolerance verification."""
     global DEVICE
@@ -489,21 +587,50 @@ def run_test(
             test_spec, comm_rank, comm_size
         )
 
-        result = execute_allreduce_step(input_tensor, async_op=async_op)
+        result, algos = execute_with_algo(
+            lambda: execute_allreduce_step(input_tensor, async_op=async_op),
+            show_algo,
+        )
+        if comm_rank == 0 and algos is not None:
+            print(
+                f"[{comm_rank} of {comm_size}] [{test_id:<28}] algo="
+                f"{', '.join(algos) if algos else 'unknown (no coll_algo in profiler trace)'}"
+            )
 
-        check_close(
-            result,
-            expected_tensor,
-            atol=atol,
-            rtol=0.0,
-            test_id=test_id,
-            comm_rank=comm_rank,
-            comm_size=comm_size,
-        )
-        # Perform negative validation across all ranks
-        verify_negative_rejection(
-            result, expected_tensor, atol=atol, test_id=test_id, comm_rank=comm_rank
-        )
+        failure = None
+        try:
+            check_close(
+                result,
+                expected_tensor,
+                atol=atol,
+                rtol=0.0,
+                test_id=test_id,
+                comm_rank=comm_rank,
+                comm_size=comm_size,
+            )
+            # Perform negative validation across all ranks
+            verify_negative_rejection(
+                result,
+                expected_tensor,
+                atol=atol,
+                test_id=test_id,
+                comm_rank=comm_rank,
+            )
+        except RuntimeError as exc:
+            failure = exc
+
+        # Every rank verifies its own result, but a failure on one rank must
+        # stop all of them: otherwise the passing ranks enter the next
+        # collective alone and hang until the launcher timeout.
+        verdict = torch.tensor([0 if failure is None else 1], dtype=torch.int32)
+        dist.all_reduce(verdict, op=dist.ReduceOp.MAX)
+        if failure is not None:
+            raise failure
+        if verdict.item():
+            raise RuntimeError(
+                f"[{comm_rank} of {comm_size}] [{test_id}] FAILED: "
+                "another rank reported a mismatch"
+            )
         passed_count += 1
 
     print("=" * 80)
@@ -544,8 +671,15 @@ if __name__ == "__main__":
         dest="size_sweep",
         action="store_true",
         default=False,
-        help="Also run large-tensor cases, including sizes either side of the "
-        "512 KB Offload_AllGatherSum cutoff",
+        help="Also run large-tensor cases up to 512 KB per rank",
+    )
+    parser.add_argument(
+        "--show-algo",
+        dest="show_algo",
+        action="store_true",
+        default=False,
+        help="Profile each collective and print the spyre-comms algorithm that "
+        "ran (needs a profiler build that emits coll_algo)",
     )
     args = parser.parse_args()
 
@@ -574,6 +708,7 @@ if __name__ == "__main__":
         num_elements=args.num_elements,
         test_case=args.test_case,
         size_sweep=args.size_sweep,
+        show_algo=args.show_algo,
     )
 
     dist.destroy_process_group()
