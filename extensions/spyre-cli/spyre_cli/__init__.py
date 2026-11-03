@@ -15,7 +15,7 @@
 from .core import launch
 
 __all__ = [
-    "check_kernelspec",
+    "check_tensors_against_spec",
     "default_tensors",
     "launch",
     "load_kernelspec",
@@ -33,7 +33,7 @@ def __getattr__(name):
     """
     if name in (
         "load_kernelspec",
-        "check_kernelspec",
+        "check_tensors_against_spec",
         "tensors_from_spec",
         "default_tensors",
     ):

@@ -51,6 +51,25 @@ from torch_spyre._inductor.codegen.kernel_launchspec import (
 )
 
 
+# ---------------------------------------------------------------------------
+# Two ways to get tensors a kernel will accept, for the two things a caller
+# might already have.
+#
+# With only the folder: ``load_kernelspec`` reads what it requires and
+# ``tensors_from_spec`` allocates to match. Nothing needs checking afterwards,
+# since the spec is what they were built from.
+#
+# With tensors of its own -- loaded from a file, carried over from an eager
+# run, or allocated before the spec was consulted -- ``check_tensors_against_spec``
+# says whether the kernel will accept them. That is the case worth checking:
+# shape and dtype can look right while the packing along the sticks is wrong,
+# which launches and returns wrong data.
+#
+# Problems come back as a list rather than an exception, so a script can print
+# them, assert on them, or ignore the ones it knows are harmless.
+# ---------------------------------------------------------------------------
+
+
 def load_kernelspec(path):
     """``path``'s launch spec as a ``LaunchSpec``, or None when it has none.
 
@@ -76,7 +95,7 @@ def tensors_from_spec(spec, bindings: Optional[dict] = None) -> list:
 
     Each tensor gets the recorded device layout, which is the part that cannot
     be reconstructed from shape and dtype.
- 
+
        The pool tensor, when the kernel takes one, is prepended exactly as
     inductor's ``call_kernel`` does; it is not one of ``spec.args``, so the
     returned list is longer than ``spec.args`` by ``spec.arg_offset``.
@@ -201,7 +220,7 @@ def _layout_mismatch(arg, tensor) -> Optional[str]:
     )
 
 
-def check_kernelspec(
+def check_tensors_against_spec(
     spec, tensors: Sequence, bindings: Optional[dict] = None
 ) -> list[str]:
     """Return the ways ``tensors`` disagree with ``spec``; empty means well-formed.
