@@ -125,16 +125,16 @@ spec = spyre_cli.load_kernelspec(folder)     # None when the folder has no spec
 for arg in spec.args:
     print(arg.arg_index, arg.role, arg.shape, arg.dtype, arg.layout)
 
-problems = spyre_cli.check_kernelspec(spec, [a, b, c])
+problems = spyre_cli.check_tensors_against_spec(spec, [a, b, c])
 if problems:
     raise ValueError("\n".join(problems))
 ```
 
-These are two calls because they take different things at different times.
-`load_kernelspec` takes a path and is what you read to decide what tensors to
-build, so at that point none exist to validate; `check_kernelspec` takes those
-tensors once they do. Problems come back as a list rather than an exception, so
-the policy stays with you.
+`check_tensors_against_spec` is for tensors you made yourself — loaded from a
+file, carried over from an eager run, or allocated before you consulted the
+spec. Tensors that came from `tensors_from_spec` need no check, since the spec
+is what they were built from. Problems come back as a list rather than an
+exception, so the policy stays with you.
 
 ### Letting the spec allocate, while you supply the data
 
