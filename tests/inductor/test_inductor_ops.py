@@ -2028,13 +2028,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             # (op, operand dtype, x shape, y shape)
             "param_sets": {
                 "mm_aligned": (torch.mm, torch.float32, (64, 128), (128, 96)),
-                "mm_unaligned": (torch.mm, torch.float32, (67, 255), (255, 99)),
+                "mm_unaligned_mn": (torch.mm, torch.float32, (67, 128), (128, 99)),
                 "mm_k1": (torch.mm, torch.float32, (99, 1), (1, 55)),
-                "bmm_unaligned": (
+                "bmm_unaligned_mn": (
                     torch.bmm,
                     torch.float32,
-                    (2, 99, 65),
-                    (2, 65, 55),
+                    (2, 99, 128),
+                    (2, 128, 55),
                 ),
                 "matmul_3d_2d": (
                     torch.matmul,
@@ -2046,19 +2046,42 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 # A 512 MiB [M, N, K] product, computed in eight 64 MiB M tiles.
                 "mm_tiled": (torch.mm, torch.float32, (512, 512), (512, 512)),
                 "upcast_mm": (_upcast_matmul, torch.float16, (64, 2048), (2048, 256)),
-                "upcast_bmm_unaligned": (
+                "upcast_bmm_unaligned_n": (
                     _upcast_matmul,
                     torch.float16,
                     (4, 64, 128),
                     (4, 128, 96),
                 ),
                 "mm_out_dtype": (_mm_fp32_out, torch.float16, (64, 2048), (2048, 256)),
-                "bmm_out_dtype_unaligned": (
+                "bmm_out_dtype_unaligned_n": (
                     _bmm_fp32_out,
                     torch.float16,
                     (4, 64, 128),
                     (4, 128, 96),
                 ),
+                "mm_unaligned_k": (torch.mm, torch.float32, (67, 255), (255, 99)),
+                "bmm_unaligned_k": (torch.bmm, torch.float32, (2, 99, 65), (2, 65, 55)),
+                "upcast_mm_unaligned_k": (
+                    _upcast_matmul,
+                    torch.float16,
+                    (64, 96),
+                    (96, 64),
+                ),
+                "mm_out_dtype_unaligned_k": (
+                    _mm_fp32_out,
+                    torch.float16,
+                    (64, 100),
+                    (100, 64),
+                ),
+            },
+            # TODO: support a K that is not a multiple of 64; needs the reduction
+            # of a staggered, stick-unaligned dim (#4014). Until then these must
+            # raise rather than return wrong values.
+            "expect_raise": {
+                "mm_unaligned_k": "is not a multiple of 64",
+                "bmm_unaligned_k": "is not a multiple of 64",
+                "upcast_mm_unaligned_k": "is not a multiple of 64",
+                "mm_out_dtype_unaligned_k": "is not a multiple of 64",
             },
         },
         ("test_matmul_noncontiguous", "test_mm_relaxed"): {
