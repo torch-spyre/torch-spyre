@@ -287,6 +287,9 @@ class TestCollectivesAreNotBracketed(unittest.TestCase):
         self.addCleanup(stack.close)
         stack.enter_context(V.set_fake_mode(FakeTensorMode()))
         stack.enter_context(V.set_graph_handler(GraphLowering(gm)))
+        # process_kernel reads the FX node being lowered (newer torch checks
+        # its target); a lowering always has one, so provide the graph's own.
+        stack.enter_context(V.set_current_node(next(iter(gm.graph.nodes))))
 
     def test_collectives_are_skipped(self):
         from torch._inductor.ir import FixedLayout, InputBuffer, StorageBox, TensorBox

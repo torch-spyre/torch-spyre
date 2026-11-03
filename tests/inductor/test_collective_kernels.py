@@ -77,6 +77,9 @@ class _CollectiveGraphTest(unittest.TestCase):
         # The factories run the op's Meta impl under the graph's fake mode.
         stack.enter_context(V.set_fake_mode(FakeTensorMode()))
         stack.enter_context(V.set_graph_handler(GraphLowering(gm)))
+        # process_kernel reads the FX node being lowered (newer torch checks
+        # its target); a lowering always has one, so provide the graph's own.
+        stack.enter_context(V.set_current_node(next(iter(gm.graph.nodes))))
 
     @staticmethod
     def _input(name="x"):

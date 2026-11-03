@@ -10122,10 +10122,14 @@ class TestDrainedCollective(unittest.TestCase):
         )
         from torch_spyre._inductor.scratchpad.utils import calculate_liveness
 
-        # create_inplace runs the op's Meta impl under the graph's fake mode.
+        # create_inplace runs the op's Meta impl under the graph's fake mode,
+        # and process_kernel reads the FX node being lowered (newer torch
+        # checks its target); a lowering always has one, so provide the graph's.
+        gm = fx.symbolic_trace(lambda: None)
         with (
-            V.set_graph_handler(GraphLowering(fx.symbolic_trace(lambda: None))),
+            V.set_graph_handler(GraphLowering(gm)),
             V.set_fake_mode(FakeTensorMode()),
+            V.set_current_node(next(iter(gm.graph.nodes))),
         ):
 
             def constant(name):
