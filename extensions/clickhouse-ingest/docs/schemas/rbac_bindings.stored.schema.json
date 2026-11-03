@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "A role given to a user or OpenShift group, limited to a scope; the newest updated_at wins.",
+  "properties": {
+    "active": {},
+    "binding_id": {
+      "minLength": 1
+    },
+    "expires_at": {},
+    "notes": {},
+    "props": {},
+    "role_id": {
+      "minLength": 1
+    },
+    "scope": {},
+    "subject": {
+      "minLength": 1
+    },
+    "subject_type": {
+      "enum": [
+        "group",
+        "user"
+      ]
+    },
+    "updated_at": {},
+    "updated_by": {}
+  },
+  "required": [
+    "binding_id",
+    "updated_at",
+    "active",
+    "subject_type",
+    "subject",
+    "role_id",
+    "scope",
+    "expires_at",
+    "updated_by",
+    "notes",
+    "props"
+  ],
+  "title": "rbac_bindings: the stored row",
+  "type": "object",
+  "x-uploadable": false
+}

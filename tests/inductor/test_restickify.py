@@ -184,8 +184,8 @@ def _make_2d_tensors(s1, s2):
     return A, B, X, Y
 
 
-def _arange(*shape, base=0, span=1000):
-    """A distinct-value ramp that is EXACT in fp16.
+def _arange(*shape, base=0, span=1000, dtype=torch.float16):
+    """A distinct-value ramp that is EXACT in the requested dtype.
 
     Build the ramp in int64 and take the modulo BEFORE casting: fp16 cannot
     represent integers above 2048 exactly (``torch.arange`` itself overflows to
@@ -193,17 +193,23 @@ def _arange(*shape, base=0, span=1000):
     a direct fp16 arange — or any band reaching past 1023 — silently rounds and
     turns the oracle's exact-equality check into a lie.
 
-    ``base + span`` must stay <= 1024 so every value lands on an exact fp16
-    integer (ULP < 1); a misplaced stick then shows up as a wrong value, never a
-    rounding artifact.  ``base`` lets a second argument occupy a disjoint band
-    from the first, so a swapped element is caught even between two cat inputs.
+    For ``dtype=torch.float16`` ``base + span`` must stay <= 1024 so every value
+    lands on an exact fp16 integer (ULP < 1); a misplaced stick then shows up as
+    a wrong value, never a rounding artifact.  ``base`` lets a second argument
+    occupy a disjoint band from the first, so a swapped element is caught even
+    between two cat inputs.  For non-fp16 dtypes (fp32, int32, int64) all
+    integers in the span are representable exactly, so the 1024 limit does not
+    apply.
     """
-    assert base + span <= 1024, f"band [{base}, {base + span}) exceeds fp16-exact 1024"
+    if dtype == torch.float16:
+        assert base + span <= 1024, (
+            f"band [{base}, {base + span}) exceeds fp16-exact 1024"
+        )
     n = 1
     for s in shape:
         n *= s
     ramp = (torch.arange(n, dtype=torch.int64) % span) + base
-    return ramp.to(torch.float16).reshape(shape)
+    return ramp.to(dtype).reshape(shape)
 
 
 def _strict(fn, *args):
@@ -1545,12 +1551,32 @@ def test_shared_producer_gets_two_restickify_nodes():
 # likely: an unaligned stick split across blocks, multiple leading batch dims,
 # and size-1 dims in or around the stick.
 
-SPLIT_2D = [(65, 4), (67, 4), (128, 67), (130, 33), (67, 128)]
+SPLIT_2D = [
+    (65, 4),
+    (67, 4),
+    (128, 67),
+    (130, 33),
+    (67, 128),
+    # 32-element stick boundary (fp32/int32/int64 have 32 elems/stick) and
+    # size-1 shapes; valid for fp16 as well.
+    (33, 4),
+    (31, 4),
+    (64, 33),
+    (66, 17),
+    (5, 1),
+    (1, 40),
+    (100, 1),
+]
 
 
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.float16, torch.float32, torch.int32, torch.int64],
+    ids=lambda d: str(d).split(".")[-1],
+)
 @pytest.mark.parametrize("shape", SPLIT_2D, ids=lambda p: f"{p[0]}x{p[1]}")
-def test_strict_2d_transpose_clone(shape):
-    x = _arange(*shape)
+def test_strict_2d_transpose_clone(shape, dtype):
+    x = _arange(*shape, dtype=dtype)
     _strict(lambda x: x.transpose(0, 1).clone(), x)
 
 
@@ -1567,35 +1593,98 @@ SPLIT_ND = [
     (2, 2, 3, 65, 4),
     (2, 67, 128),  # single leading batch, unaligned new stick
     (2, 2, 67, 128),  # two leading batch dims, unaligned new stick
+    # 32-element stick boundary and batch-plane / size-1 shapes.
+    (2, 1, 40),
+    (2, 40, 1),
+    (3, 5, 20),
+    (3, 33, 40),
+    (4, 7, 129),
 ]
 
 
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.float16, torch.float32, torch.int32, torch.int64],
+    ids=lambda d: str(d).split(".")[-1],
+)
 @pytest.mark.parametrize("shape", SPLIT_ND, ids=lambda p: "x".join(map(str, p)))
-def test_strict_nd_transpose_clone(shape):
-    x = _arange(*shape)
+def test_strict_nd_transpose_clone(shape, dtype):
+    x = _arange(*shape, dtype=dtype)
     _strict(lambda x: x.transpose(-2, -1).clone(), x)
+
+
+def test_strict_senuint32_transpose_clone():
+    """Cover the SENUINT32 entry of RESTICKIFY_SUPPORTED_DEVICE_DTYPES.
+
+    fp32 arrives at the restickify check as IEEE_FP32, and int32/int64 both as
+    IEEE_INT32, so none of the dtype-parametrized tests reach SENUINT32.  An
+    int64 tensor can be placed as SENUINT32 with an explicit layout (the
+    IEEE_INT64 -> SENUINT32 DCI conversion).
+    """
+    from torch_spyre._C import DataFormats, SpyreTensorLayout as _CSTL
+
+    x = torch.randint(0, 1000, (64, 64), dtype=torch.int64)
+    base = _CSTL(list(x.size()), torch.int64)
+    stl = _CSTL(list(base.device_size), list(base.stride_map), DataFormats.SENUINT32)
+    xd = x.to("spyre", device_layout=stl)
+    assert torch.equal(xd.cpu(), x), "SENUINT32 round trip is not exact"
+
+    torch._dynamo.reset_code_caches()
+    y = torch.compile(lambda a: a.t().clone())(xd)
+    assert torch.equal(y.cpu(), x.t())
+
+
+def test_restickify_int8_is_unsupported():
+    """Only RESTICKIFY_SUPPORTED_DEVICE_DTYPES waive the dtype check: an int8
+    restickify must stop with Unsupported, not reach the backend scheduler."""
+    x = torch.randint(-128, 127, (64, 64), dtype=torch.int8)
+    with pytest.raises(Exception, match=r"ReStickifyOpHBM on DataFormats\.SENINT8"):
+        _compile_and_run(lambda x: x.t().clone(), (x,), DEVICE)
 
 
 # transpose(1, -1).clone() swaps an inner batch dim with the stick dim, a
 # different demoted-middle geometry than transpose(-2, -1).
-SPLIT_T1_LAST = [(2, 4, 67, 128), (2, 3, 65, 4), (2, 2, 67, 128)]
+SPLIT_T1_LAST = [
+    (2, 4, 67, 128),
+    (2, 3, 65, 4),
+    (2, 2, 67, 128),
+    # 32-element stick boundary shape.
+    (2, 3, 33, 4),
+]
 
 
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.float16, torch.float32, torch.int32, torch.int64],
+    ids=lambda d: str(d).split(".")[-1],
+)
 @pytest.mark.parametrize("shape", SPLIT_T1_LAST, ids=lambda p: "x".join(map(str, p)))
-def test_strict_nd_transpose_1_last_clone(shape):
-    x = _arange(*shape)
+def test_strict_nd_transpose_1_last_clone(shape, dtype):
+    x = _arange(*shape, dtype=dtype)
     _strict(lambda x: x.transpose(1, -1).clone(), x)
 
 
 # transpose(0, -1).clone() swaps the OUTERMOST dim with the stick dim, with both
 # the source and destination stick dims sub-64 (e.g. 2 and 7) so neither fills a
 # full stick.  Must still place every element exactly.
-SPLIT_T0_LAST = [(7, 67, 2), (7, 65, 2), (5, 3, 2), (7, 67, 63)]
+SPLIT_T0_LAST = [
+    (7, 67, 2),
+    (7, 65, 2),
+    (5, 3, 2),
+    (7, 67, 63),
+    # 32-element stick boundary shape.
+    (7, 33, 2),
+]
 
 
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.float16, torch.float32, torch.int32, torch.int64],
+    ids=lambda d: str(d).split(".")[-1],
+)
 @pytest.mark.parametrize("shape", SPLIT_T0_LAST, ids=lambda p: "x".join(map(str, p)))
-def test_strict_transpose_0_last_clone(shape):
-    x = _arange(*shape)
+def test_strict_transpose_0_last_clone(shape, dtype):
+    x = _arange(*shape, dtype=dtype)
     _strict(lambda x: x.transpose(0, -1).clone(), x)
 
 
@@ -1697,13 +1786,18 @@ def test_size1_input_stick_transpose_0_last_clone(shape):
 # so its unaligned new-stick dim must be padded to a stick boundary, and inductor
 # keeps the pointwise producer as a real ComputedBuffer we own and grow in place
 # (.clone() would fold to a reinterpret_tensor instead).  Ramp span 511 doubled by
-# x + x stays < 1024 (fp16-exact), so torch.equal catches a mis-placed or
-# uninitialised row precisely.
+# x + x stays well within the exact range for all supported dtypes, so torch.equal
+# catches a mis-placed or uninitialised row precisely.
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.float16, torch.float32, torch.int32, torch.int64],
+    ids=lambda d: str(d).split(".")[-1],
+)
 @pytest.mark.parametrize(
     "shape", SIZE1_INPUT_STICK, ids=lambda p: "x".join(map(str, p))
 )
-def test_size1_input_stick_transpose_0_last_contiguous_producer(shape):
-    x = _arange(*shape, span=511)
+def test_size1_input_stick_transpose_0_last_contiguous_producer(shape, dtype):
+    x = _arange(*shape, span=511, dtype=dtype)
     _strict(lambda x: (x + x).transpose(0, -1).contiguous(), x)
 
 
@@ -1711,16 +1805,21 @@ def test_size1_input_stick_transpose_0_last_contiguous_producer(shape):
 # stick is > 64, so the restored output stick CROSSES a stick boundary (out=67 ->
 # 64 + 3).  This forces the output-buffer grow that covers the full 64-plane
 # sweep; its geometry is asserted device-free by the white-box size-1 tests at the
-# end of this file.  Ramp span 511 doubled by x + x stays < 1024 (fp16-exact), so
-# torch.equal catches a displaced lane.
+# end of this file.  Ramp span 511 doubled by x + x stays well within the exact
+# range for all supported dtypes, so torch.equal catches a displaced lane.
 SIZE1_INPUT_STICK_CROSSING = [(7, 67, 1), (5, 67, 1), (3, 130, 1)]
 
 
 @pytest.mark.parametrize(
+    "dtype",
+    [torch.float16, torch.float32, torch.int32, torch.int64],
+    ids=lambda d: str(d).split(".")[-1],
+)
+@pytest.mark.parametrize(
     "shape", SIZE1_INPUT_STICK_CROSSING, ids=lambda p: "x".join(map(str, p))
 )
-def test_size1_input_stick_crossing_transpose_0_last_contiguous_producer(shape):
-    x = _arange(*shape, span=511)
+def test_size1_input_stick_crossing_transpose_0_last_contiguous_producer(shape, dtype):
+    x = _arange(*shape, span=511, dtype=dtype)
     _strict(lambda x: (x + x).transpose(0, -1).contiguous(), x)
 
 
@@ -1806,8 +1905,8 @@ def test_multistage_producer_transpose_contiguous(builder, shape):
 #
 # Each entry is (shape, transpose_dims); .contiguous() (not .clone(), which folds
 # to reinterpret_tensor) keeps a real producer ComputedBuffer and forces the
-# restickify.  Ramp span 511 doubled by x + x stays < 1024 (fp16-exact), so
-# torch.equal catches a mis-placed lane precisely.
+# restickify.  Ramp span 511 doubled by x + x stays well within the exact range
+# for all supported dtypes, so torch.equal catches a mis-placed lane precisely.
 SIZE1_NEW_STICK = [
     ((1, 1, 5, 67), (1, 3)),  # size-1 dim 1 moves into stick; real 5 survives
     ((1, 3, 1, 67), (0, 3)),  # size-1 dim 0 moves into stick; real 3 survives
@@ -1815,14 +1914,19 @@ SIZE1_NEW_STICK = [
 
 
 @pytest.mark.parametrize(
+    "dtype",
+    [torch.float16, torch.float32, torch.int32, torch.int64],
+    ids=lambda d: str(d).split(".")[-1],
+)
+@pytest.mark.parametrize(
     "shape,dims",
     SIZE1_NEW_STICK,
     ids=[
         f"{'x'.join(map(str, s))}_t{'_'.join(map(str, d))}" for s, d in SIZE1_NEW_STICK
     ],
 )
-def test_size1_new_stick_transpose_contiguous(shape, dims):
-    x = _arange(*shape, span=511)
+def test_size1_new_stick_transpose_contiguous(shape, dims, dtype):
+    x = _arange(*shape, span=511, dtype=dtype)
     _strict(lambda x: (x + x).transpose(*dims).contiguous(), x)
 
 
@@ -1996,10 +2100,15 @@ REAL_DIM_INTO_STICK_PERMS = [
 
 
 @pytest.mark.parametrize(
+    "dtype",
+    [torch.float16, torch.float32, torch.int32, torch.int64],
+    ids=lambda d: str(d).split(".")[-1],
+)
+@pytest.mark.parametrize(
     "perm", REAL_DIM_INTO_STICK_PERMS, ids=lambda p: "".join(map(str, p))
 )
-def test_real_dim_into_stick_transpose_clone_graph_input(perm):
-    x = _arange(3, 2, 5, 67, span=511)
+def test_real_dim_into_stick_transpose_clone_graph_input(perm, dtype):
+    x = _arange(3, 2, 5, 67, span=511, dtype=dtype)
     _strict(lambda x: x.permute(*perm).contiguous(), x)
 
 
@@ -2010,8 +2119,8 @@ def test_real_dim_into_stick_transpose_clone_graph_input(perm):
 #
 #   clone arm:    x.permute(p).contiguous()            -- restickify reads a bare
 #                 graph input; the pass inserts + grows an identity clone.
-#   producer arm: (x + x * 3.0).permute(p).contiguous() -- a pointwise op
-#                 materialises a ComputedBuffer the pass grows in place.  x * 3.0
+#   producer arm: (x + x * 3).permute(p).contiguous() -- a pointwise op
+#                 materialises a ComputedBuffer the pass grows in place.  x * 3
 #                 keeps the producer from folding away, so this exercises a path
 #                 the clone arm does not.
 #
@@ -2026,11 +2135,16 @@ _SWEEP_SHAPE = (3, 1, 5, 67)
 _ALL_PERMS = [p for p in itertools.permutations(range(4)) if p != (0, 1, 2, 3)]
 
 
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.float16, torch.float32, torch.int32, torch.int64],
+    ids=lambda d: str(d).split(".")[-1],
+)
 @pytest.mark.parametrize("perm", _ALL_PERMS, ids=lambda p: "".join(map(str, p)))
-def test_full_perm_sweep_transpose_clone_graph_input(perm):
-    # Clone arm copies the input through unchanged, so any band <= 1024 is
-    # fp16-exact; span 511 widens distinct-lane coverage.
-    x = _arange(*_SWEEP_SHAPE, span=511)
+def test_full_perm_sweep_transpose_clone_graph_input(perm, dtype):
+    # Clone arm copies the input through unchanged; span 511 widens
+    # distinct-lane coverage and is exact for all supported dtypes.
+    x = _arange(*_SWEEP_SHAPE, span=511, dtype=dtype)
     _strict(lambda x: x.permute(*perm).contiguous(), x)
 
 
@@ -2039,12 +2153,17 @@ def test_full_perm_sweep_transpose_clone_graph_input(perm):
 # removes work-division, so the LX transpose-crossing defect cannot fire and the
 # result is purely the padding restickify -- which is bit-exact for every perm.
 @config.patch({"sencores": 1})
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.float16, torch.float32, torch.int32, torch.int64],
+    ids=lambda d: str(d).split(".")[-1],
+)
 @pytest.mark.parametrize("perm", _ALL_PERMS, ids=lambda p: "".join(map(str, p)))
-def test_full_perm_sweep_transpose_contiguous_producer(perm):
-    # t + t * 3.0 == 4 * t, so the input band must satisfy 4 * span <= 1024 to stay
-    # fp16-exact (else CPU-fp16 vs device-DLFloat16 rounding is a false mismatch).
-    x = _arange(*_SWEEP_SHAPE, span=255)
-    _strict(lambda x: (x + x * 3.0).permute(*perm).contiguous(), x)
+def test_full_perm_sweep_transpose_contiguous_producer(perm, dtype):
+    # t + t * 3 == 4 * t.  For fp16, 4 * span <= 1024 is required; span=255
+    # satisfies this.  For non-fp16 dtypes all values are exact regardless.
+    x = _arange(*_SWEEP_SHAPE, span=255, dtype=dtype)
+    _strict(lambda x: (x + x * 3).permute(*perm).contiguous(), x)
 
 
 # The producer arm on the aligned shape [3,1,5,64] at the default core count, so
@@ -2055,10 +2174,15 @@ def test_full_perm_sweep_transpose_contiguous_producer(perm):
 _ALIGNED_SWEEP_SHAPE = (3, 1, 5, 64)
 
 
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.float16, torch.float32, torch.int32, torch.int64],
+    ids=lambda d: str(d).split(".")[-1],
+)
 @pytest.mark.parametrize("perm", _ALL_PERMS, ids=lambda p: "".join(map(str, p)))
-def test_full_perm_sweep_aligned_producer(perm):
-    x = _arange(*_ALIGNED_SWEEP_SHAPE, span=255)
-    _strict(lambda x: (x + x * 3.0).permute(*perm).contiguous(), x)
+def test_full_perm_sweep_aligned_producer(perm, dtype):
+    x = _arange(*_ALIGNED_SWEEP_SHAPE, span=255, dtype=dtype)
+    _strict(lambda x: (x + x * 3).permute(*perm).contiguous(), x)
 
 
 # Producer-arm restickify at the DEFAULT core count on the unaligned shape
@@ -2079,14 +2203,20 @@ _INTO_SWEEP_SHAPE = (5, 3, 66)
 
 
 @pytest.mark.parametrize(
+    "dtype",
+    [torch.float16, torch.float32, torch.int32, torch.int64],
+    ids=lambda d: str(d).split(".")[-1],
+)
+@pytest.mark.parametrize(
     "perm",
     [p for p in itertools.permutations(range(3)) if p != (0, 1, 2)],
     ids=lambda p: "".join(map(str, p)),
 )
-def test_full_perm_sweep_into_producer_default_cores(perm):
-    # t + t * 3.0 == 4 * t, so span must satisfy 4 * span <= 1024 for fp16 exactness.
-    x = _arange(*_INTO_SWEEP_SHAPE, span=255)
-    _strict(lambda x: (x + x * 3.0).permute(*perm).contiguous(), x)
+def test_full_perm_sweep_into_producer_default_cores(perm, dtype):
+    # t + t * 3 == 4 * t.  span=255 satisfies fp16's 4*span<=1024 limit and
+    # is exact for all non-fp16 dtypes.
+    x = _arange(*_INTO_SWEEP_SHAPE, span=255, dtype=dtype)
+    _strict(lambda x: (x + x * 3).permute(*perm).contiguous(), x)
 
 
 # A size-1 dim in the input stick whose NEW stick dim spans >=2 stick blocks
@@ -2839,18 +2969,21 @@ def test_matmul_weight_with_factorized_contraction_dim():
 
 
 def test_restickify_target_is_infeasible_when_the_old_stick_is_factorized():
-    """Moving the stick off a factorized contraction var is not computable.
+    """Restickify returns None when the old-stick var spans multiple outer dims
+    and the reduction type is not BATCH_MATMUL_OP.
 
-    The weight ``[N, 8, 128]`` has its K var ``d1`` on the heads dim, the D-high
-    dim and the stick.  There is no single outer dim to repurpose when the stick
-    moves to N, and repurposing the first one overwrites the heads dim.  The
-    target must be reported infeasible (``None``) instead of a layout whose device
-    size no longer matches the tensor (issue #5550).
+    The weight ``[N, 8, 128]`` has its K var ``d1`` factorized across outer dims 0
+    and 1. For BATCH_MATMUL_OP, _prepare_for_restickify would collapse those dims
+    before calling compute_restickify_target_layout. For other reduction types,
+    no collapse is attempted and compute_restickify_target_layout returns None
+    (old_var_outer_dims > 1). Ensures the fix does not regress issue #5550.
     """
     import sympy
+    from torch._inductor.dependencies import MemoryDep
     from torch._inductor.ir import FixedLayout
     from torch_spyre._C import DataFormats, SpyreTensorLayout as _CSTL
     from torch_spyre._inductor.pass_utils import compute_restickify_target_layout
+    from torch_spyre._inductor.propagate_layouts import PropArg
 
     d0, d1 = sympy.symbols("d0 d1", integer=True, nonnegative=True)
     host = FixedLayout(DEVICE, torch.float16, [4096, 8, 128], [1024, 128, 1])
@@ -2867,7 +3000,76 @@ def test_restickify_target_is_infeasible_when_the_old_stick_is_factorized():
         d0,
         sympy.Mod(d1, 64),
     ]
+    dep = MemoryDep("w", d0 * 1024 + d1, (d0, d1), (4096, 1024))
+    arg = PropArg(dep, host, [stl])
     assert (
-        compute_restickify_target_layout(stl, host, d0, host_coords, device_coords)
+        compute_restickify_target_layout(
+            stl, host, d0, host_coords, device_coords, arg=arg
+        )
         is None
+    )
+
+
+def test_compute_restickify_target_layout_factorized_new_sd():
+    """compute_restickify_target_layout must handle a factorized target_stick_expr.
+
+    When ``target_stick_expr`` is a FloorDiv expression such as ``floor(k/128)``,
+    ``matching_dim`` returns None and the old code immediately returned None.
+    The new code must resolve the host size/stride via ``_factorized_chain`` and
+    return a valid STL moving the stick to the K variable.
+
+    Scenario: host ``[L=4, H=8, D=128]`` with the current stick on ``lq`` (the
+    sequence dim).  We want to move the stick to ``k`` (the contraction dim)
+    whose target coord is ``floor(k/128)`` — a FloorDiv that ``matching_dim``
+    cannot resolve.
+    """
+    import sympy
+    from torch._inductor.dependencies import MemoryDep
+    from torch._inductor.ir import FixedLayout
+    from torch_spyre._C import DataFormats, SpyreTensorLayout as _CSTL
+    from torch_spyre._inductor.pass_utils import compute_restickify_target_layout
+    from torch_spyre._inductor.propagate_layouts import PropArg
+
+    lq, k = sympy.symbols("lq k", integer=True, nonnegative=True)
+    # Host layout: [L=4, H=8, D=128], row-major strides.
+    host = FixedLayout(DEVICE, torch.float16, [4, 8, 128], [1024, 128, 1])
+    # dep: index 1024*lq + k iterates L (range 4) and the collapsed H*D (range 1024).
+    dep = MemoryDep("x", 1024 * lq + k, (lq, k), (4, 1024))
+    # STL with lq on the stick: H outer (stride 128), D-high outer (stride 64),
+    # L-sticks outer (stride 1024, 1 stick for L=4), stick (64 elements).
+    stl = _CSTL(
+        [8, 2, 1, 64],
+        [128, 64, 1024, 1],
+        DataFormats.SEN169_FP16,
+    )
+    # host_coords (ic): L maps to lq, H to floor(k/128), D to Mod(k, 128).
+    ic = [lq, sympy.floor(k / 128), sympy.Mod(k, 128)]
+    # device_coords (idc): H outer, D-high outer, L-sticks (=0 since L<64), stick.
+    idc = [
+        sympy.floor(k / 128),
+        sympy.floor(sympy.Mod(k, 128) / 64),
+        sympy.S.Zero,
+        sympy.Mod(lq, 64),
+    ]
+    # PropArg so the slow path in _host_size_stride_for_expr can call
+    # _factorized_chain for the factorized floor(k/128) expression.
+    arg = PropArg(dep, host, [stl])
+    # target_stick_expr = floor(k/128): matching_dim returns None for FloorDiv,
+    # so the old code returned None here.  The new code must succeed.
+    target_stick_expr = sympy.floor(k / 128)
+    result = compute_restickify_target_layout(
+        stl, host, target_stick_expr, ic, idc, arg=arg, reduction_type="test", label="x"
+    )
+    assert result is not None, (
+        "compute_restickify_target_layout returned None for factorized "
+        "target_stick_expr=floor(k/128); expected a valid STL"
+    )
+    # After the fix: K on the stick with 16 sticks of 64 = 1024 K elements.
+    # L (size 4) occupies the old L-outer dim; the old H-outer dim gets the
+    # number of K-sticks.
+    assert list(result.device_size) == [4, 2, 16, 64], (
+        f"Unexpected device_size: {list(result.device_size)}"
+    )
+    assert list(result.stride_map) == [1024, 64, 64, 1], (
+        f"Unexpected stride_map: {list(result.stride_map)}"
     )

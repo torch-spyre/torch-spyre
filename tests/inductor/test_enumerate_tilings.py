@@ -577,7 +577,7 @@ class TestTilingSpace(unittest.TestCase):
         self.assertEqual(space.neighbours(TileSpec()), [])
 
     def test_an_op_the_hint_passes_already_tiled_is_offered_nothing(self):
-        # ``CoarseTilingPass`` stamps ``op.dim_hints`` wholesale, so a tiling
+        # ``apply_tilings`` stamps ``op.dim_hints`` wholesale, so a tiling
         # chosen here for an already-hinted op would clobber the group it is
         # part of. The marker both earlier passes leave set is the guard.
         op = _pointwise_op((512, 256, 128))

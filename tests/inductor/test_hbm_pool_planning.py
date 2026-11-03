@@ -771,7 +771,7 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
             f"{seen_pool_sizes}",
         )
 
-    @config.patch({"lx_planning": False})
+    @config.patch({"lx_planning": False, "frontend_pool_allocation": False})
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_pool_alloc_scoped_per_bundle_across_fallback_boundary(self):
         """A CPU-fallback op (torch.tril) splits the graph into multiple
@@ -854,7 +854,7 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
             f"kernels were {kernel_names}",
         )
 
-    @config.patch({"lx_planning": False})
+    @config.patch({"lx_planning": False, "frontend_pool_allocation": False})
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_no_python_side_pool_tensor_allocated(self):
         """With frontend_pool_allocation at its default (False), no bundle
@@ -925,8 +925,7 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
         # positive one -- pool_size=0 must never be emitted explicitly.
         self.assertNotIn("pool_size=0", src)
 
-    @config.patch({"lx_planning": True})
-    def test_pool_size_kwarg_omitted_when_no_pool(self):
+    def _check_pool_size_kwarg_omitted(self) -> None:
         """A kernel with no pool usage gets no pool_size kwarg at all.
 
         With lx_planning enabled, the `a = x + y` intermediate is claimed by
@@ -954,6 +953,15 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
 
         self.assertIn("async_compile.sdsc(", src)
         self.assertNotIn("pool_size", src)
+
+    @config.patch({"lx_planning": True})
+    def test_pool_size_kwarg_omitted_when_no_pool(self):
+        self._check_pool_size_kwarg_omitted()
+
+    @config.patch({"lx_planning": True, "layout_solver": "simulated_annealing"})
+    def test_pool_size_kwarg_omitted_when_no_pool_sa(self):
+        """As above, with the simulated annealing solver placing `a` in LX."""
+        self._check_pool_size_kwarg_omitted()
 
     @config.patch({"lx_planning": False})
     def test_alias_read_in_another_bundle_blocks_pool_eligibility(self):
