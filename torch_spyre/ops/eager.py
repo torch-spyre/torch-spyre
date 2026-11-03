@@ -718,6 +718,59 @@ def spyre__random_from(self, from_=0, to=1, generator=None) -> torch.Tensor:
     return self
 
 
+def _row_index(self, indices):
+    """The int32 Spyre row index for ``self[index]``, or raise for any other form.
+
+    Only one 1-D integer index on dim 0 is supported (row selection, e.g. the
+    sampled rows of a decoder's hidden states). The index is bounds-checked and
+    its negative entries wrapped on the host, as eager CPU indexing does, so an
+    index already on Spyre takes a D2H round trip.
+    """
+    if (
+        len(indices) != 1
+        or indices[0] is None
+        or indices[0].dim() != 1
+        or indices[0].dtype not in (torch.int32, torch.int64)
+    ):
+        raise NotImplementedError(
+            "Spyre aten::index.Tensor supports only x[index] with a single 1-D "
+            "int32/int64 index tensor on dim 0"
+        )
+    index = indices[0]
+    if index.device.type != "cpu" and index.device != self.device:
+        raise RuntimeError(
+            "indices should be either on cpu or on the same device as the "
+            f"indexed tensor ({self.device})"
+        )
+    if self.dim() == 0:
+        raise IndexError("too many indices for tensor of dimension 0")
+    index = index.cpu()
+    rows = self.shape[0]
+    if index.numel() and (index.min() < -rows or index.max() >= rows):
+        raise IndexError(f"index out of range for dimension 0 with size {rows}")
+    index = torch.where(index < 0, index + rows, index)
+    # Spyre has no int64 index kernel.
+    return index.to(torch.int32).to(self.device)
+
+
+@torch.library.register_kernel("aten::index.Tensor", ["spyre"])  # type:ignore
+def spyre__index_tensor(self, indices):
+    """``self[index]`` for a 1-D integer index, as an ``index_select`` on dim 0.
+
+    ``index_select`` compiles once per index length and source shape and layout
+    (``dynamic=False``), so a caller that sees many lengths should pad the index
+    onto a fixed set of them.
+    """
+    index = _row_index(self, indices)
+    if index.numel() == 0:
+        return torch.empty((0, *self.shape[1:]), dtype=self.dtype, device=self.device)
+    if self.shape[0] == 1 and index.numel() == 1:
+        # A one-row gather from a one-row source lowers to an identity op the
+        # backend cannot schedule, and the only valid index is 0.
+        return self.clone()
+    return torch.index_select(self, 0, index)
+
+
 @torch.library.register_kernel("aten::_local_scalar_dense", "spyre")
 def spyre__local_scalar_dense(self):
     return self.cpu().item()
