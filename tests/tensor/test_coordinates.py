@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import itertools
 import math
 from types import SimpleNamespace
 
+import pytest
 import sympy
 
 import torch
@@ -1524,6 +1526,140 @@ class TestStickExprOffsetFree(TestCase):
         self.assertTrue(is_stick_expr_offset_free(sympy.Mod(c0, 64), 64))
         self.assertTrue(is_stick_expr_offset_free(c0, 64))
         self.assertTrue(is_stick_expr_offset_free(sympy.S.Zero, 64))
+
+
+def _reshape_read(rows, cols, a_n, b_n):
+    """Dense fp16 ``x[rows, cols]`` read as ``reshape(a_n, b_n)`` (``a_n == 1``: flat).
+
+    Returns the coordinates, the loop ranges, and every point where the
+    coordinates differ from the true (tile, row, stick position).
+    """
+    tiles = math.ceil(cols / 64)
+    if tiles > 1:
+        size, stride = [tiles, rows, 64], [64, cols, 1]
+    else:
+        size, stride = [rows, 64], [cols, 1]
+    c0, c1 = sympy.symbols("c0 c1", integer=True, nonnegative=True)
+    if a_n == 1:
+        var_ranges, index, names = {c0: b_n}, c0, (c0,)
+    else:
+        var_ranges, index, names = {c0: a_n, c1: b_n}, b_n * c0 + c1, (c0, c1)
+    coords = compute_coordinates(size, stride, var_ranges, index)
+    wrong = []
+    for point in itertools.product(*(range(var_ranges[v]) for v in names)):
+        subs = dict(zip(names, point))
+        row, col = divmod(int(index.subs(subs)), cols)
+        want = (col // 64, row, col % 64) if tiles > 1 else (row, col)
+        got = tuple(int(sympy.floor(c.subs(subs))) for c in coords)
+        if got != want:
+            wrong.append((point, got, want))
+    return size, coords, var_ranges, wrong
+
+
+class TestReshapeReadCoordinates(TestCase):
+    """The coordinates of reshaped reads of an unaligned dense tensor (issue #5872).
+
+    Every point is checked against the true (tile, row, position) of the element.
+    The classes below record the scope: exact and accepted, exact but not yet
+    expressible by the frontend, and not exact (missing carry).
+    """
+
+    def test_flat_and_reshaped_reads_are_exact(self):
+        for rows, cols, a_n, b_n in (
+            (8, 65, 1, 520),
+            (3, 65, 1, 195),
+            (4, 130, 1, 520),
+            (2, 100, 1, 200),
+            (16, 30, 1, 480),
+            (8, 96, 1, 768),
+            (8, 65, 4, 130),
+            (8, 65, 2, 260),
+            (3, 128, 2, 192),
+        ):
+            with self.subTest(read=(rows, cols, a_n, b_n)):
+                self.assertEqual(_reshape_read(rows, cols, a_n, b_n)[3], [])
+
+    def test_misaligned_step_read_is_exact(self):
+        # Issue #5872 case 2: [3, 128].reshape(-1, 96), step 96 is not a multiple
+        # of the stride 64 it lands on.
+        self.assertEqual(_reshape_read(3, 128, 4, 96)[3], [])
+
+    # The reads below are exact, but ``Term.from_coordinate`` cannot express the
+    # coordinate, so the frontend rejects them.
+    # TODO: when it can, these become positive tests (and join the list above).
+    def _assert_frontend_rejects(self, read, error, match):
+        size, coords, var_ranges, wrong = _reshape_read(*read)
+        self.assertEqual(wrong, [])
+        counter = [0]
+
+        def synthetic_var():
+            counter[0] += 1
+            return sympy.Symbol(f"z{counter[0]}", integer=True, nonnegative=True)
+
+        with self.assertRaisesRegex(error, match):
+            normalize_coordinates(dict(var_ranges), size, coords, synthetic_var)
+
+    def test_stepped_modular_coordinate_is_rejected_by_the_frontend(self):
+        # [3, 128].reshape(4, 96): the coordinate is Mod(3*c0, 4).
+        self._assert_frontend_rejects(
+            (3, 128, 4, 96),
+            Unsupported,
+            r"Unsupported modular coordinate expression Mod\(3\*c0, 4\)",
+        )
+
+    def test_non_unit_fraction_is_rejected_by_the_frontend(self):
+        # [8, 96].reshape(6, 128): the coordinate has 4*c0/3 (issue #1353).
+        self._assert_frontend_rejects(
+            (8, 96, 6, 128), AssertionError, "Unsupported coordinate expression"
+        )
+
+    def test_non_unit_fraction_with_modulus_is_rejected_by_the_frontend(self):
+        # [8, 65].reshape(5, 104): the coordinate has 13*Mod(3*c0, 5)/64.
+        self._assert_frontend_rejects(
+            (8, 65, 5, 104), AssertionError, "Unsupported coordinate expression"
+        )
+
+    # LIMIT: several loop variables add into one device dim and the sum can exceed
+    # it, but the carry into the next dim is not computed, so the coordinates are
+    # wrong.  The frontend rejects all of them today (no wrong value reaches the
+    # device); this will matter once it can express Mod(3*c0, 8).
+    # TODO: file an issue for the missing carry and cite it in these reasons.
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason="[3,128].reshape(8,48): stick coordinate c1 + 16*Mod(3*c0, 4) reaches "
+        "95 > 64 and the carry is lost (96 of 384 elements wrong)",
+    )
+    def test_carry_between_variables_3x128_to_8x48(self):
+        self.assertEqual(_reshape_read(3, 128, 8, 48)[3], [])
+
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason="[8,65].reshape(65,8): stick coordinate c1 + Mod(Mod(8*c0, 65), 64) "
+        "lacks the carry (35 of 520 elements wrong)",
+    )
+    def test_carry_between_variables_8x65_to_65x8(self):
+        self.assertEqual(_reshape_read(8, 65, 65, 8)[3], [])
+
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason="[2,100].reshape(4,50): sympy squares the inner Mod, "
+        "Mod(25*Mod(c0, 2)**2, 32) (72 of 200 elements wrong; the device result is "
+        "right only because the operator reads the sparse layout)",
+    )
+    def test_carry_between_variables_2x100_to_4x50(self):
+        self.assertEqual(_reshape_read(2, 100, 4, 50)[3], [])
+
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason="[8,96].reshape(12,64): the row coordinate floor(2*c0/3) and the "
+        "carry are wrong (384 of 768 elements wrong)",
+    )
+    def test_carry_between_variables_8x96_to_12x64(self):
+        self.assertEqual(_reshape_read(8, 96, 12, 64)[3], [])
 
 
 if __name__ == "__main__":
