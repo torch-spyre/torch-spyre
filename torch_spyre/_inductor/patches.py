@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager
 from functools import wraps
 
 import torch
@@ -272,10 +272,10 @@ def enable_spyre_context(example_inputs: list[InputType]):
     # release, so only a LoopNode handed to the scheduler is refused there
     # (CustomPreSchedulingPasses refuses one earlier, naming the release).
     # On a graph with no LoopNode each patched method takes its original path.
-    loop_scheduler_patches = ExitStack()
-    loop_scheduler_patches.enter_context(loop_scheduler_patches_for_compile())
-
     with (
+        # First in the header: the same ``with`` closes it however the body, or
+        # the entry of a later manager, exits.
+        loop_scheduler_patches_for_compile(),
         spyre_data_types(),
         _preserve_spyre_input_storage_offsets(),
         _unique_operation_names(),
@@ -294,7 +294,6 @@ def enable_spyre_context(example_inputs: list[InputType]):
             Loops.has_large_inner_fn = old_loop
             GraphLowering._update_scheduler = old_update_scheduler  # type: ignore[method-assign]
             SchedulerNode.has_side_effects = old_scheduler_node_has_side_effects  # type: ignore[method-assign]
-            loop_scheduler_patches.close()
 
 
 OBSERVER_HOOKS_KEY = "__spyre_hooks_meta"

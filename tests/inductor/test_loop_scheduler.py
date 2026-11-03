@@ -22,7 +22,9 @@ creation through ``compute_ancestors``) is driven step by step in the order
 scheduler a ``LoopNode`` yet (``passes.py`` still expands the nodes).
 """
 
+import importlib.util
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -53,6 +55,7 @@ from torch_spyre._inductor import loop_scheduler as ls
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.loop_node import LoopNode
 from torch_spyre._inductor.loop_scheduler import (
+    SUPPORTED_RELEASES,
     LoopSchedulerNode,
     apply_loop_scheduler_patches,
     loop_scheduler_patches_for_compile,
@@ -270,6 +273,29 @@ class TestReleaseGate(_Graph):
         ):
             with self.subTest(text), _version(text):
                 self.assertIs(loop_scheduler_supported(), expected)
+
+    def test_supported_release_is_the_one_pyproject_pins(self):
+        # SUPPORTED_RELEASES is a literal, so bumping the torch pin without
+        # moving it would turn every counted loop off.  Make that fail in the
+        # change that bumps the pin.  tools/get_torch_minor.py is the helper the
+        # CI image build uses to read the same pin.
+        root = Path(__file__).resolve().parents[2]
+        spec = importlib.util.spec_from_file_location(
+            "get_torch_minor", root / "tools" / "get_torch_minor.py"
+        )
+        assert spec is not None and spec.loader is not None
+        tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(tool)
+        major, minor = tool.extract_torch_minor(
+            (root / "pyproject.toml").read_bytes()
+        ).split(".")
+        self.assertEqual(
+            [(int(major), int(minor))],
+            list(SUPPORTED_RELEASES),
+            "pyproject.toml pins a different torch than SUPPORTED_RELEASES: "
+            "update loop_scheduler.SUPPORTED_RELEASES (Step 10.6a of the "
+            "upgrade-pytorch-version skill)",
+        )
 
     def test_apply_raises_on_unsupported_and_patches_nothing(self):
         before = _current()
