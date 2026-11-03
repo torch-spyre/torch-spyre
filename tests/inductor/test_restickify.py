@@ -2836,9 +2836,13 @@ def test_nonstick_reorder_pointwise_into_matmul():
     x = torch.randn(2, 55, 99, dtype=torch.float16)
     w = torch.randn(2, 99, 128, dtype=torch.float16)
 
+    # Transfer x with identity dim order so device_size=[55, 2, 2, 64] —
+    # the NDO pass must move 55 into the sandwich slot rather than the
+    # default layout doing it automatically.
+    x_layout = SpyreTensorLayout([2, 55, 99], [55 * 99, 99, 1], torch.float16, [0, 1, 2])
     spyre_result, _, nonstick_log = _compile_and_run_nonstick_capture(
         fn,
-        x.to(DEVICE),
+        x.to(device_layout=x_layout),
         w.to(DEVICE),
     )
     cpu_result = fn(x, w)
