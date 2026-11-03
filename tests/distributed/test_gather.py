@@ -17,9 +17,19 @@ import os
 import pytest
 import torch
 import torch.distributed as dist
-from torch.testing._internal.common_utils import TestCase, run_tests
+from torch.testing._internal.common_utils import (
+    TestCase,
+    instantiate_parametrized_tests,
+    parametrize,
+    run_tests,
+)
 
-from utils import _assert_tensor_equal
+from utils import (
+    _assert_tensor_equal,
+    _collective_expected,
+    _collective_rank_input,
+    _native_bfloat16_tensor,
+)
 
 # Skip all tests if RANK is not defined, or WORLD_SIZE is not set or less than 2
 if "RANK" not in os.environ:
@@ -51,6 +61,7 @@ DEVICE = torch.device(f"spyre:{os.getenv('RANK', '0')}")
 C10D_BACKEND = "spyreccl"
 
 
+@instantiate_parametrized_tests
 class TestGather(TestCase):
     @classmethod
     def setUpClass(cls):
@@ -139,6 +150,40 @@ class TestGather(TestCase):
             )
         else:
             self.assertTrue(True, "Non-destination rank completed gather successfully")
+
+    @parametrize("dtype", [torch.float16, torch.bfloat16])
+    @parametrize("shape", [(128,), (4, 96)])
+    @parametrize("async_op", [False, True])
+    @parametrize("last_rank", [False, True])
+    def test_gather_dl16_storage(self, dtype, shape, async_op, last_rank):
+        dst = self.comm_size - 1 if last_rank else 0
+        x = _collective_rank_input(self.comm_rank, shape, dtype).to(DEVICE)
+        outputs = (
+            [torch.empty_like(x) for _ in range(self.comm_size)]
+            if self.comm_rank == dst
+            else None
+        )
+        work = dist.gather(x, gather_list=outputs, dst=dst, async_op=async_op)
+        if async_op:
+            self.assertIsNotNone(work)
+            work.wait()
+        else:
+            self.assertIsNone(work)
+        if outputs is not None:
+            self.assertEqual(
+                torch.cat([part.cpu() for part in outputs]),
+                _collective_expected("gather", shape, self.comm_size, dtype),
+                rtol=0,
+                atol=0,
+            )
+
+    def test_gather_bfloat16_rejects_non_dl16_storage(self):
+        x = _native_bfloat16_tensor(DEVICE)
+        outputs = [torch.empty_like(x) for _ in range(self.comm_size)]
+        with self.assertRaisesRegex(
+            RuntimeError, "BF16 collectives require DL16 device storage"
+        ):
+            dist.gather(x, gather_list=outputs if self.comm_rank == 0 else None, dst=0)
 
     def test_gather_float16(self):
         """Test gather to rank 0 with float16 tensors."""

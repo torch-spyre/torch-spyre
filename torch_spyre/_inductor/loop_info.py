@@ -28,30 +28,9 @@ import sympy
 if TYPE_CHECKING:
     import torch.fx
 
-    from torch._inductor.dependencies import MemoryDep
     from torch._inductor.ir import ComputedBuffer
 
     from torch_spyre._C import SpyreTensorLayout
-
-
-@dataclass(frozen=True)
-class CarriedReductionSpec:
-    """Planning-time requirement for one value carried through a tiled loop."""
-
-    row_dim_name: str
-    required_row_split: int
-
-
-@dataclass(frozen=True)
-class CarriedReductionRecord:
-    """Shared identity and ownership contract for a realized carried sum."""
-
-    accumulator_name: str
-    row_dim_name: str
-    required_row_split: int
-    fill_name: str
-    combine_name: str
-    drain_name: str
 
 
 @dataclass(frozen=True)
@@ -138,7 +117,6 @@ class ReductionPlan:
     outer_fill_loop_info: "CoarseTileInfo | None"
     full_output_strides: tuple[sympy.Expr, ...]
     per_tile_strides: tuple[sympy.Expr, ...]
-    carried: CarriedReductionSpec | None = None
     full_output_device_layout: SpyreTensorLayout | None = None
 
 
@@ -219,73 +197,6 @@ class PropagationPlan:
     is_graph_output: bool = False
     graph_output_name: str | None = None
     consumer_lookup_name: str | None = None
-
-
-@dataclass(frozen=True)
-class ReadCopyEntry:
-    """One shared copy to insert for a cross-group buffer read.
-
-    Attributes
-    ----------
-    copy_name:
-        Qualified name to assign the inserted copy ComputedBuffer.
-    dep:
-        The canonical MemoryDep (buffer name + index + var_names + size)
-        every equivalent read in the group shares -- the same object one of
-        the consuming ops' own full_deps produced, used to size/index the
-        copy exactly as _insert_all_read_copy_ops does today.
-    insert_before_op_name:
-        get_operation_name() of the first (operations order) consuming op
-        in the group -- where the copy is inserted.
-    sizing_op_name:
-        get_operation_name() of the op supplying tiled_op.loop_info for
-        the copy's own read/write-level-extent computation (the first
-        consuming op, per the sizing-invariant in the design doc).
-    sizing_read_index:
-        Position of ``dep`` in the sizing op's original MemoryDep list.
-        Recorded before copy insertion rewrites any of those reads.
-    consumer_op_names:
-        Names of every op in the group that must have this dep's buffer
-        name patched (via _NameSwapHandler) to load from copy_name instead.
-    predivision_unit_steps:
-        Per-loop-level ``(op_dim_index, host_stride, tile_extent)`` facts
-        captured before division squeezes a size-one tiled dimension away.
-        ``_plan_read_copies`` attaches the selected sizing read's facts here;
-        this entry is their authority during copy construction.
-    loop_invariant:
-        True only when every consumer reads the same source slice on every
-        trip of the surrounding counted loop.  Such a copy is a preheader
-        operation, not part of the loop body.
-    """
-
-    copy_name: str
-    dep: "MemoryDep"
-    insert_before_op_name: str
-    sizing_op_name: str
-    sizing_read_index: int
-    consumer_op_names: tuple[str, ...]
-    predivision_unit_steps: tuple[
-        tuple[tuple[int, sympy.Expr, sympy.Expr], ...], ...
-    ] = ()
-    loop_invariant: bool = False
-
-
-@dataclass(frozen=True)
-class ReadCopyPlan:
-    """Per-group plan for Pass 1 (read-copy insertion).
-
-    Computed once during planning (_plan_read_copies, run after every
-    group's _apply_plan) and consumed by a slimmed _insert_all_read_copy_ops
-    that only executes these decisions.
-
-    Attributes
-    ----------
-    entries:
-        One ReadCopyEntry per distinct (buffer name, canonical index expr)
-        pair read cross-group by at least one op in this group.
-    """
-
-    entries: tuple["ReadCopyEntry", ...]
 
 
 @dataclass(frozen=True)
@@ -438,9 +349,6 @@ _SPYRE_METADATA_ATTRS = (
     # coarse_tile._propagate_tiled_reduction_op, read by finalize_layouts in
     # insert_restickify.py to promote accum_full to FixedTiledLayout when needed.
     "_tiled_reduction_accum_name",
-    # One immutable record shared by the fill, loop combine, and final drain
-    # of a loop-carried reduction.  Post-fusion verification consumes it.
-    "_carried_reduction_record",
     # One immutable record shared by a for_each_tile carry's persistent
     # storage and its in-loop update operation.
     "_loop_carry_record",
@@ -455,6 +363,9 @@ _SPYRE_METADATA_ATTRS = (
     # added to this tuple, because copy_op_metadata only copies attrs
     # listed here.
     "tile_marker_dim",
+    # work_division_constraints.JOINT_TILING_AND_DIVISION_ATTR, spelled out
+    # since that module imports this one (through pass_utils).
+    "_work_division_chosen_with_tiling",
 )
 
 

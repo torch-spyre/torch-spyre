@@ -39,6 +39,7 @@ from torch_spyre._inductor.codegen.compute_ops import (
     _per_core_symbolic_dim_info,
     _symbolic_split_info,
     _tensor_has_symbolic_split,
+    core_idx_to_slice_offset,
     generate_constant_info,
 )
 from torch_spyre._inductor.codegen.superdsc import (
@@ -50,6 +51,7 @@ from torch_spyre._inductor.codegen.superdsc import (
 from torch_spyre._inductor.core_mapping import derive_operation_mapping
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.op_spec import OpSpec, TensorArg
+from utils_inductor import mock_backend_compiler
 from torch_spyre._inductor.work_division import (
     _collect_symbol_metadata,
     _effective_size,
@@ -583,6 +585,147 @@ class TestSdscJsonSymbolicDimSmoke(InductorTestCase):
             self.assertEqual(sym_info, {"mb": {"maxSize_": 512, "granularity_": 64}})
 
 
+class TestOverlappingWindowCoreOffsets(InductorTestCase):
+    def test_restickify_preserves_negative_window_gap(self):
+        """Restickify must not replace an unfold gap with a padding gap."""
+        position, feature, window, batch = sympy.symbols("c0:4")
+        iteration_space = {
+            position: (sympy.Integer(7), 7),
+            feature: (sympy.Integer(64), 1),
+            window: (sympy.Integer(4), 2),
+            batch: (sympy.Integer(64), 1),
+        }
+        spec = OpSpec(
+            op="restickify",
+            is_reduction=False,
+            iteration_space=iteration_space,
+            core_id_to_work_slice=derive_operation_mapping(iteration_space),
+            args=[
+                TensorArg(
+                    is_input=True,
+                    arg_index=0,
+                    device_dtype=DataFormats.SEN169_FP16,
+                    device_size=[1, 8, 2, 64, 64],
+                    device_coordinates=[
+                        sympy.floor(feature / 64),
+                        position,
+                        window,
+                        batch,
+                        sympy.Mod(feature, 64),
+                    ],
+                    allocation={"hbm": 0},
+                ),
+                TensorArg(
+                    is_input=False,
+                    arg_index=1,
+                    device_dtype=DataFormats.SEN169_FP16,
+                    device_size=[1, 7, 4, 64, 64],
+                    device_coordinates=[
+                        sympy.floor(batch / 64),
+                        position,
+                        window,
+                        feature,
+                        sympy.Mod(batch, 64),
+                    ],
+                    allocation={"hbm": 1},
+                ),
+            ],
+            op_info={},
+        )
+        sdsc, mapping = parse_op_spec(spec)
+        self.assertEqual(sdsc.args[0].backGap[mapping[window]], -2)
+
+    def test_unfold_window_split(self):
+        """Core slices address x.unfold(1, 4, 2).sum(0) at the full window stride."""
+        position, feature, window, batch = sympy.symbols("c0:4")
+        for window_splits in (1, 2, 4):
+            with self.subTest(window_splits=window_splits):
+                iteration_space = {
+                    position: (sympy.Integer(7), 7),
+                    feature: (sympy.Integer(6), 1),
+                    window: (sympy.Integer(4), window_splits),
+                    batch: (sympy.Integer(8), 1),
+                }
+                spec = OpSpec(
+                    op="sum",
+                    is_reduction=True,
+                    iteration_space=iteration_space,
+                    core_id_to_work_slice=derive_operation_mapping(iteration_space),
+                    args=[
+                        TensorArg(
+                            is_input=True,
+                            arg_index=0,
+                            device_dtype=DataFormats.SEN169_FP16,
+                            # The step is two rows; the window reads four.
+                            device_size=[1, 8, 2, 8, 64],
+                            device_coordinates=[
+                                sympy.floor(feature / 64),
+                                position,
+                                window,
+                                batch,
+                                sympy.Mod(feature, 64),
+                            ],
+                            allocation={"hbm": 0},
+                        ),
+                        TensorArg(
+                            is_input=False,
+                            arg_index=1,
+                            device_dtype=DataFormats.SEN169_FP16,
+                            device_size=[1, 1, 4, 7, 64],
+                            device_coordinates=[
+                                sympy.floor(feature / 64),
+                                sympy.S.Zero,
+                                window,
+                                position,
+                                sympy.Mod(feature, 64),
+                            ],
+                            allocation={"hbm": 1},
+                        ),
+                    ],
+                    op_info={},
+                )
+                sdsc, mapping = parse_op_spec(spec)
+                # With at most two window rows per core, a negative backGap
+                # brings the window dim back to its two physical rows, so the
+                # outer dims keep their real strides (issue #5347). With
+                # window_splits == 1, ceil(4 / 1) = 4 exceeds the physical
+                # extent 2, so the negative-backGap branch is inactive.
+                self.assertEqual(
+                    sdsc.args[0].backGap.get(mapping[window]),
+                    -2 if window_splits > 1 else None,
+                )
+                for pos in range(7):
+                    for part in range(window_splits):
+                        slices = {str(dim): 0 for dim in sdsc.work_slices}
+                        slices[str(mapping[position])] = pos
+                        slices[str(mapping[window])] = part
+                        # One physical row spans eight batches of 64 elements.
+                        expected = (2 * pos + part * (4 // window_splits)) * 8 * 64
+                        self.assertEqual(
+                            core_idx_to_slice_offset(
+                                sdsc.args[0], slices, sdsc.work_slices
+                            ),
+                            expected,
+                        )
+                if window_splits > 1:
+                    # Slicing the source by one row adds a constant to the
+                    # normalized window coordinate. The negative gap and
+                    # per-core base must both survive that offset.
+                    spec.args[0].device_size[1] = 9
+                    spec.args[0].device_coordinates[2] = window + 1
+                    sliced_sdsc, sliced_mapping = parse_op_spec(spec)
+                    self.assertEqual(
+                        sliced_sdsc.args[0].backGap[sliced_mapping[window]], -2
+                    )
+                    slices = {str(dim): 0 for dim in sliced_sdsc.work_slices}
+                    self.assertEqual(
+                        core_idx_to_slice_offset(
+                            sliced_sdsc.args[0], slices, sliced_sdsc.work_slices
+                        ),
+                        8 * 64,
+                    )
+
+
 class TestTiledAwayPhysicalAxis(InductorTestCase):
     def test_tiled_group_gap_before_stick_axis(self):
         """Decode must skip the other GQA groups when one core reads many heads."""
@@ -1110,3 +1253,54 @@ class TestConversionPaddingAcrossStickWidths(InductorTestCase):
                 (stick,) = sdsc_spec.padding
                 self.assertEqual(sdsc_spec.iteration_space[stick], 64)
                 self.assertEqual(sdsc_spec.padding[stick], 63)
+
+
+class TestMatmulReuseDims(InductorTestCase):
+    """superdsc reuse-dim handling for a broadcast matmul."""
+
+    def test_unsqueeze_broadcast_matmul_reuse_dim_scale(self):
+        """[1,T,H]@[E,H,F] -> [E,T,F] in a single kernel invocation.
+
+        With nothing tiling E, it is never constant-folded away before SDSC
+        generation, so x's emitted SDSCArgs must carry E as a genuine "reuse
+        dim" (present in w/output, absent from x) with scale == -1, the same
+        way any other op's Step 2 broadcast-dim handling would.  See
+        _matmul_reuse_dims in superdsc.py.
+        """
+        from torch_spyre._inductor.codegen import superdsc
+
+        E, T, H, F = 4, 64, 64, 64
+        x = torch.randn(T, H, dtype=torch.float16) * 0.01
+        w = torch.randn(E, H, F, dtype=torch.float16) * 0.01
+
+        def fn(x, w):
+            return torch.matmul(x.unsqueeze(0), w)
+
+        captured = []
+        real_create_sdsc_tensors = superdsc._create_sdsc_tensors
+
+        def _spy(*args, **kwargs):
+            result = real_create_sdsc_tensors(*args, **kwargs)
+            captured.append(result[0])
+            return result
+
+        with (
+            patch("torch_spyre.execution.kernel_runner.launch_jobplan"),
+            patch("torch_spyre.execution.kernel_runner.prepare_kernel"),
+            mock_backend_compiler(),
+            patch.object(superdsc, "_create_sdsc_tensors", side_effect=_spy),
+        ):
+            run_and_get_code(torch.compile(fn), x.to("spyre"), w.to("spyre"))
+
+        self.assertTrue(captured, "no SDSC generated")
+        found_reuse_dim = False
+        for sdsc_args_list in captured:
+            x_arg = sdsc_args_list[0]
+            for dim, scale in x_arg.scales.items():
+                if scale == -1 and str(dim) not in ("H",):
+                    found_reuse_dim = True
+        self.assertTrue(
+            found_reuse_dim,
+            "expected x's SDSCArgs to include a reuse dim (scale == -1) for "
+            "the broadcast batch dim E",
+        )

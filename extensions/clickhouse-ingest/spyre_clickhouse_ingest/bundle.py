@@ -28,14 +28,16 @@ import json
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
-from . import vllm
+from . import sendnn, vllm
 from .identity import DerivedId, RunId
 from .offline import (
     FAILED,
     MANUAL_PREFIX,
     STATUS,
     BundleError,
+    benchmark_entries,
     check,
     digest,
     inbox_keys,
@@ -82,6 +84,25 @@ def resolve_artifact(client, db: str, meta: dict):
     if not found:
         raise BundleError("artifact not recorded: " + "; ".join(missed))
     return next(iter(found.values()))
+
+
+def create_artifact(client, db: str, meta: dict, dry_run: bool):
+    """The bundle's image recorded as an upstream artifact, for an image no pipeline of ours
+    built (a dry run records nothing). Its identity is the image digest, as for any image."""
+    from .resolver import ensure
+
+    want = meta["create_artifact"]
+    name = want.get("name") or meta["image"].split("@")[0].rsplit("/", 1)[-1]
+    spec = f"image:{meta['image']};component={want['component']};name={name}"
+    try:
+        res = ensure(client, db, spec, meta["arch"], origin="upstream", registry="off",
+                     props={"created_by": "results-upload"}, dry_run=dry_run)  # fmt: skip
+    except ValueError as err:
+        raise BundleError(f"create_artifact: {err}") from None
+    ident = res.identity
+    return SimpleNamespace(
+        artifact_id=ident.artifact_id, arch=ident.arch, component=ident.component
+    )
 
 
 def existing_run(client, db: str, rid: str, component: str) -> tuple:
@@ -185,7 +206,12 @@ def _ingest(root: Path, args) -> dict:
             client.set_client_setting("readonly", "2")
     except Exception as err:  # noqa: BLE001 -- unreachable is a retry, not a verdict on the bundle
         raise BundleError(f"spyre_v2 unreachable: {err}", FAILED) from None
-    r, via = resolve_artifact(client, db, meta)
+    try:
+        r, via = resolve_artifact(client, db, meta)
+    except BundleError:
+        if not meta.get("create_artifact"):
+            raise
+        r, via = create_artifact(client, db, meta, args.dry_run), "create_artifact"
     sha = digest(root)
     uploader = args.uploader or meta.get("uploader") or getpass.getuser()
     meta.setdefault("arch", DerivedId.arch(r.arch))
@@ -197,7 +223,7 @@ def _ingest(root: Path, args) -> dict:
         )
     aid, rid = r.artifact_id, run_id(meta)
     report = {"run_key": meta["run_key"], "run_id": rid, "artifact_id": aid, "artifact_from": via,
-              "test_type": meta["test_type"], "bundle_sha256": sha}  # fmt: skip
+              "test_type": meta["test_type"], "arch": meta["arch"], "bundle_sha256": sha}  # fmt: skip
     seen, files = existing_run(client, db, rid, meta["component"])
     if seen == {sha}:
         return {**report, "status": "duplicate"}
@@ -210,10 +236,18 @@ def _ingest(root: Path, args) -> dict:
         raise BundleError(f"run {rid} already has cases from {sorted(files - names)}")
     if args.dry_run:
         return {**report, "status": "would-ingest"}
-    props = {"source": SOURCE, "uploader": uploader, "bundle_sha256": sha,
-             "bundle_url": args.bundle_url}  # fmt: skip
+    props = {**dict(getattr(args, "bundle_prop", None) or []), "source": SOURCE,
+             "uploader": uploader, "bundle_sha256": sha, "bundle_url": args.bundle_url}  # fmt: skip
     if meta.get("kind") == "vllm":
         report["benchmark_runs"] = write_vllm(client, db, root, meta, aid, rid, props)
+    elif meta.get("kind") == "sendnn":
+        report["benchmark_runs"] = write_sendnn(client, db, root, meta, aid, rid, props)
+    elif meta.get("kind") == "benchmarks":
+        report["benchmark_runs"] = write_generic(
+            client, db, root, meta, aid, rid, props
+        )
+    elif meta.get("kind") == "tables":
+        report["rows"] = write_tables(client, db, root, meta, aid, rid, props)
     else:
         write_junit(db, root, meta, aid, rid, props, args.strict)
     if not verdict_recorded(client, db, aid, rid, meta["test_type"]):
@@ -262,4 +296,183 @@ def write_vllm(client, db, root, meta, aid, rid, props) -> int:
         )  # fmt: skip
     except Exception as err:  # noqa: BLE001 -- a write error is a retry; the writes dedup
         raise BundleError(f"vLLM write failed: {err!r}", FAILED) from None
+    return n
+
+
+GENERIC_KIND = "benchmarks"
+
+
+def generic_entries(rows: list) -> list:
+    """A benchmarks file's rows in insert_benchmarks' entry shape: every prop is an identity key,
+    hashed in sorted order, so two rows differing in any prop are two benchmarks."""
+    out = []
+    for b in rows:
+        props = {k: str(v) for k, v in (b.get("props") or {}).items()}
+        out.append({
+            "name": b["name"].strip(), "tags": b.get("tags") or [], "backend": b.get("backend", ""),
+            "props": props, "disc": props, "disc_keys": tuple(sorted(props)),
+            "measurements": {k: [float(x) for x in (v if isinstance(v, list) else [v])]
+                             for k, v in b["measurements"].items()},
+            "iterations": b.get("iterations", 0), "run_props": b.get("run_props") or {},
+        })  # fmt: skip
+    return out
+
+
+def write_generic(client, db, root, meta, aid, rid, props) -> int:
+    """Generic benchmark rows (evals, harnesses with no runner format) under the bundle's own
+    component, then its verdict: the tier is perf or quality, the result_kind performance."""
+    from .client import tables_present
+    from .schema import ARTIFACT_RESULTS, BENCHMARK_RUNS, BENCHMARKS
+    from .writer import (
+        benchmarks_already_ingested,
+        insert_artifact_result,
+        insert_benchmarks,
+    )
+
+    if not tables_present(
+        client, db, tables=(BENCHMARKS, BENCHMARK_RUNS, ARTIFACT_RESULTS)
+    ):
+        raise BundleError(f"{db} lacks the benchmark tables", FAILED)
+    component = meta["component"]
+    try:
+        n = 0
+        for path in sorted((root / "results").glob("*.json")):
+            # Per file, as a retry after a failed verdict insert must not double the rows.
+            if benchmarks_already_ingested(
+                client, db, rid, component, GENERIC_KIND, path.name
+            ):
+                continue
+            n += insert_benchmarks(client, db, component, rid, generic_entries(benchmark_entries(path)),
+                                   report_kind=GENERIC_KIND, source_file=path.name)  # fmt: skip
+        insert_artifact_result(
+            client, db, artifact_id=aid, run_id=rid, test_type=meta["test_type"],
+            state="passed", arch=meta["arch"], result_kind="performance", duration_s=0.0,
+            props={**{k: v for k, v in props.items() if v},
+                   "run_url": meta.get("run_url") or props.get("bundle_url", "")},
+        )  # fmt: skip
+    except Exception as err:  # noqa: BLE001 -- a write error is a retry; the writes dedup
+        raise BundleError(f"benchmarks write failed: {err!r}", FAILED) from None
+    return n
+
+
+def _case(row: dict) -> dict:
+    """A test_case_runs row as the writer's case dict: its tags, measurements and result.* props
+    ride as the JUnit properties the writer already reads."""
+    props = [("tag", t) for t in row.get("tags", [])]
+    props += [(f"metric.{k}", v) for k, v in row.get("measurements", {}).items()]
+    props += [(k, v) for k, v in row.get("props", {}).items()]
+    return {"classname": row.get("classname", ""), "name": row["name"], "status": row["status"],
+            "duration_s": row.get("duration_s", 0), "fail_message": row.get("fail_message", ""),
+            "properties": props}  # fmt: skip
+
+
+def _capability_case(row: dict) -> dict:
+    """A capability_runs row as the case that declares it: a passed case for a passed verdict, the
+    outcome the writer maps to the same status otherwise."""
+    outcome = {
+        "passed": "passed",
+        "failed": "failed",
+        "not_implemented": "xfail",
+        "undetermined": "error",
+    }
+    props = [("capability.test_type", row["test_type"]), ("capability.subject", row["subject"]),
+             ("capability.name", row["name"]), ("capability.backend", row.get("backend", ""))]  # fmt: skip
+    props += [(f"capability.sig.{k}", v) for k, v in row.get("sig", {}).items()]
+    props += [("capability.tag", t) for t in row.get("tags", [])]
+    props += [(f"capability.prop.{k}", v) for k, v in row.get("props", {}).items()]
+    if row.get("arch"):
+        props.append(("tag", f"platform__{DerivedId.arch(row['arch'])}"))
+    return {"classname": "", "name": f"{row['subject']}/{row['name']}", "status": outcome[row["status"]],
+            "duration_s": 0, "fail_message": row.get("fail_reason", ""), "properties": props}  # fmt: skip
+
+
+def _bench_entry(row: dict) -> dict:
+    """A benchmark_runs row as insert_benchmarks' entry. Every prop is identity unless the row
+    names a subset, so `identity: []` keys a benchmark by name alone."""
+    props = {k: str(v) for k, v in (row.get("props") or {}).items()}
+    keys = props if "identity" not in row else {k: props[k] for k in row["identity"]}
+    return {"name": row["name"].strip(), "tags": row.get("tags") or [], "backend": row.get("backend", ""),
+            "props": props, "disc": keys, "disc_keys": tuple(sorted(keys)),
+            "measurements": {k: [float(x) for x in (v if isinstance(v, list) else [v])]
+                             for k, v in row["measurements"].items()},
+            "iterations": row.get("iterations", 0), "run_props": row.get("run_props") or {}}  # fmt: skip
+
+
+def write_tables(client, db, root, meta, aid, rid, props) -> dict:
+    """results/<table>.json files as rows of those tables, through the same writers a connected
+    run uses, then the leg's verdict: the file's own, else one derived from the rows."""
+    from .client import tables_present
+    from . import schema
+    from .tables import load_rows
+    from .writer import insert_artifact_result, insert_benchmarks, insert_test_results
+
+    test_type, component = meta["test_type"], meta["component"]
+    loaded = dict(load_rows(f) for f in sorted((root / "results").iterdir()))
+    needed = {"test_case_runs": (schema.TestCases, schema.TestCaseRuns),
+              "capability_runs": (schema.TestCases, schema.TestCaseRuns, schema.Capabilities, schema.CapabilityRuns),
+              "benchmark_runs": (schema.Benchmarks, schema.BenchmarkRuns)}  # fmt: skip
+    wanted = {t for name in loaded for t in needed.get(name, ())} | {
+        schema.ArtifactResults
+    }
+    if not tables_present(client, db, tables=tuple(wanted)):
+        raise BundleError(f"{db} lacks the tables this bundle writes", FAILED)
+    out, failed, total = {}, 0, 0
+    try:
+        if "test_case_runs" in loaded:
+            cases = [_case(r) for r in loaded["test_case_runs"]]
+            out["test_case_runs"] = insert_test_results(client, db, component, rid, cases, "test_case_runs.json",
+                                                         arch=meta["arch"])  # fmt: skip
+            failed += sum(c["status"] in ("failed", "error") for c in cases)
+            total += len(cases)
+        if "benchmark_runs" in loaded:
+            out["benchmark_runs"] = insert_benchmarks(
+                client, db, component, rid, [_bench_entry(r) for r in loaded["benchmark_runs"]],
+                report_kind="tables", source_file="benchmark_runs.json")  # fmt: skip
+        if "capability_runs" in loaded:
+            cases = [_capability_case(r) for r in loaded["capability_runs"]]
+            out["capability_runs"] = insert_test_results(client, db, component, rid, cases, "capability_runs.json",
+                                                          arch=meta["arch"])  # fmt: skip
+            failed += sum(r["status"] == "failed" for r in loaded["capability_runs"])
+            total += len(cases)
+        verdict = (loaded.get("artifact_results") or [{}])[0]
+        state = verdict.get("state") or ("failed" if failed else "passed")
+        insert_artifact_result(
+            client, db, artifact_id=aid, run_id=rid, test_type=test_type, state=state, arch=verdict.get("arch") or meta["arch"],
+            result_kind=verdict.get("result_kind") or ("performance" if "benchmark_runs" in loaded else ""), duration_s=verdict.get("duration_s", 0.0),
+            props={**verdict.get("props", {}), **{k: v for k, v in props.items() if v},
+                   "run_url": meta.get("run_url") or props.get("bundle_url", "")},
+        )  # fmt: skip
+    except Exception as err:  # noqa: BLE001 -- a write error is a retry; the writes dedup
+        raise BundleError(f"tables write failed: {err!r}", FAILED) from None
+    return out
+
+
+def write_sendnn(client, db, root, meta, aid, rid, props) -> int:
+    """report_sendnn.txt as benchmark_runs on torch-spyre's own benchmark ids, then the verdict."""
+    from .client import tables_present
+    from .schema import ARTIFACT_RESULTS, BENCHMARK_RUNS, BENCHMARKS
+    from .writer import insert_artifact_result
+
+    if not tables_present(
+        client, db, tables=(BENCHMARKS, BENCHMARK_RUNS, ARTIFACT_RESULTS)
+    ):
+        raise BundleError(f"{db} lacks the benchmark tables", FAILED)
+    run_props = {"platform": meta["arch"]}
+    if meta.get("started_at"):
+        run_props["run_utc"] = sendnn.run_utc(meta["started_at"])
+    reports = sorted((root / "results").glob("*.txt"))
+    # Judged on what parses, not on what is written: a retry after a failed verdict insert
+    # writes nothing new, since the benchmark rows are already in.
+    if not any(sendnn.parse(p) for p in reports):
+        raise BundleError("no sendnn metric parsed from results/")
+    try:
+        n = sum(sendnn.write(client, db, rid, p, run_props) for p in reports)
+        insert_artifact_result(
+            client, db, artifact_id=aid, run_id=rid, test_type=meta["test_type"],
+            state="passed", arch=meta["arch"], result_kind="performance", duration_s=0.0,
+            props={**{k: v for k, v in props.items() if v},
+                   "run_url": meta.get("run_url") or props.get("bundle_url", "")},
+        )  # fmt: skip
+    except Exception as err:  # noqa: BLE001 -- a write error is a retry; the writes dedup
+        raise BundleError(f"sendnn write failed: {err!r}", FAILED) from None
     return n

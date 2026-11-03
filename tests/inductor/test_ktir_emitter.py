@@ -32,10 +32,11 @@ from test_ktir_validate import (
     make_onstick_sum_specs,
     make_op_spec,
     make_pooled_chain,
+    make_scalar_operand_op_spec,
     make_statistic_reader_specs,
     make_two_element_type_specs,
 )
-from torch_spyre._C import ElementArrangement
+from torch_spyre._C import DataFormats, ElementArrangement
 
 
 def _mlir_ktdp_available() -> bool:
@@ -908,6 +909,158 @@ class TestBroadcastOperandEmission(unittest.TestCase):
 
         emitted = generate_ktir("ktir_fused_add_0", [make_op_spec()])
         self.assertEqual(emitted, TestKtirEmitter.EXPECTED_ADD_KTIR)
+
+
+@unittest.skipUnless(
+    _mlir_ktdp_available(),
+    "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
+)
+class TestReplicatedScalarOperandEmission(unittest.TestCase):
+    """A degenerate ``spyre.constant`` operand, read as a whole lane-walking stick."""
+
+    def test_the_scalar_is_read_as_its_whole_stick_at_both_formats(self):
+        """The one form dbo-opt lowers: full rank, full stick, lane axis walking.
+
+        The refused form is rank 1 at one element with an all-constant row -- and
+        so is the form that only raises the rank, ``1x1x1`` at ``(0, 0, 0)``.  Both
+        numbers here are therefore load-bearing: the STICK on the operand's
+        innermost axis, and a ``d`` (not a ``0``) in the map's last position.
+        """
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        for dtype, stick, out in (
+            (DataFormats.SEN169_FP16, 64, "1x256x64"),
+            (DataFormats.IEEE_FP32, 32, "2x256x32"),
+        ):
+            with self.subTest(dtype=dtype):
+                emitted = generate_ktir(
+                    "k_scalar", [make_scalar_operand_op_spec(dtype)]
+                )
+                elem = "f16" if stick == 64 else "f32"
+                self.assertIn(
+                    f"ktdp.construct_memory_view %arg1, sizes: [1, 1, {stick}], "
+                    f"strides: [{stick}, {stick}, 1]",
+                    emitted,
+                )
+                self.assertIn(f"-> !ktdp.access_tile<1x1x{stick}xindex>", emitted)
+                self.assertIn(f"tensor<1x1x{stick}x{elem}>", emitted)
+                self.assertIn("affine_map<(d0, d1, d2) -> (0, 0, d2)>", emitted)
+                self.assertIn(
+                    f"ins(%2, %5 : tensor<{out}x{elem}>, tensor<1x1x{stick}x{elem}>)",
+                    emitted,
+                )
+
+    def test_the_producers_claim_and_not_the_shape_is_what_widens_the_read(self):
+        """Without ``replicated_scalar`` the identical shape keeps the old read.
+
+        The shape cannot answer whether the padding holds the value -- a full
+        reduction's 0-dim output has this exact description and holds the answer at
+        lane 0 only -- so the same spec minus the producer's claim must take the
+        stick-head route it always took, and reach the refusal rather than read
+        lanes nobody vouched for.
+        """
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir(
+            "k_scalar_unclaimed",
+            [make_scalar_operand_op_spec(replicated=False)],
+        )
+        self.assertIn("ktdp.load %4 : <1xindex> -> tensor<1xf16>", emitted)
+        self.assertIn("affine_map<(d0, d1, d2) -> (0)>", emitted)
+        self.assertNotIn("affine_map<(d0, d1, d2) -> (0, 0, d2)>", emitted)
+
+
+@unittest.skipUnless(
+    _mlir_ktdp_available(),
+    "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
+)
+class TestFourByteHeadReadRefusal(unittest.TestCase):
+    """One element per row spread across the lanes is refused at four bytes.
+
+    The lane spread moves two bytes, so on the device a four-byte operand reaches
+    every fourth lane and the rest read zero -- a silent wrong result, which is why
+    it is refused here and not left to the backend compiler, which accepts it.
+    """
+
+    @staticmethod
+    def _per_row_operand_spec(dtype):
+        """``realdiv`` of a tile by a ``(512, stick)`` statistic read at its head."""
+        import sympy
+
+        d0, d1, d2 = sympy.symbols("d0 d1 d2")
+        stick = 64 if dtype == DataFormats.SEN169_FP16 else 32
+        return make_op_spec(
+            "realdiv",
+            dtype=dtype,
+            sizes=[[16, 512, stick], [512, stick], [16, 512, stick]],
+            coords_per_arg=[[d0, d1, d2], [d1, sympy.Integer(0)], [d0, d1, d2]],
+        )
+
+    def test_a_per_row_operand_at_fp32_is_refused(self):
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        with self.assertRaisesRegex(
+            NotImplementedError,
+            "one element per row spread across the lanes of a 4-byte",
+        ):
+            generate_ktir(
+                "k_per_row_fp32",
+                [self._per_row_operand_spec(DataFormats.IEEE_FP32)],
+            )
+
+    def test_the_same_shape_at_fp16_is_still_emitted(self):
+        """The control: only the width differs, so the width is what decides."""
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir(
+            "k_per_row_fp16",
+            [self._per_row_operand_spec(DataFormats.SEN169_FP16)],
+        )
+        self.assertIn("affine_map<(d0, d1, d2) -> (d1, 0)>", emitted)
+
+    def test_lifting_the_refusal_emits_the_head_read_the_device_gets_wrong(self):
+        """What the emitter hands the backend if the refusal is removed.
+
+        The refusal is a stopgap for a gap in the backend compiler's lane spread,
+        and is meant to go when that is fixed.  This pins the KTIR it stands in
+        front of, so lifting it is a visible, deliberate step: the head read is the
+        ``(d1, 0)`` map over a one-element-per-row tile, spelled at four bytes.  It
+        is the form the backend accepts and the device runs wrong -- the operand
+        in every fourth lane and zeros in the rest -- so this test passing says
+        what is emitted, not that it is correct.
+
+        When the backend's four-byte lane spread is fixed:
+
+        * delete ``_spreads_head_per_row`` and its check in the pointwise plan;
+        * delete the refusal test above and this one;
+        * keep the fp16 and single-value tests, which are about forms that never
+          went through it, and re-measure ``(256, 1)`` at fp32 on the device.
+        """
+        from unittest import mock
+
+        from torch_spyre._inductor.codegen import ktir
+
+        with mock.patch.object(ktir, "_spreads_head_per_row", return_value=False):
+            emitted = ktir.generate_ktir(
+                "k_per_row_fp32_lifted",
+                [self._per_row_operand_spec(DataFormats.IEEE_FP32)],
+            )
+        self.assertIn("affine_map<(d0, d1, d2) -> (d1, 0)>", emitted)
+        self.assertIn("tensor<512x1xf32>", emitted)
+
+    def test_a_single_value_at_fp32_is_still_read(self):
+        """A scalar is one value, not one per row, and is measured exact at fp32.
+
+        ``x / x.sum()`` hands ``realdiv`` an operand of exactly this description
+        and passes on the device, so it keeps the head read it always had.
+        """
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir(
+            "k_scalar_fp32",
+            [make_scalar_operand_op_spec(DataFormats.IEEE_FP32, replicated=False)],
+        )
+        self.assertIn("tensor<1xf32>", emitted)
 
 
 @unittest.skipUnless(

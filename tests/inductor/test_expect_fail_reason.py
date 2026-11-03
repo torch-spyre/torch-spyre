@@ -90,6 +90,14 @@ class TestExpectFailReason(unittest.TestCase):
             ):
                 _make({"param_sets": {"c": ("x",)}, "expect_fail": {"c": reason}})
 
+    def test_entry_that_matches_no_test_is_rejected(self):
+        for expect_fail in (["typo"], {"typo": "why"}):
+            with (
+                self.subTest(expect_fail=expect_fail),
+                pytest.raises(AssertionError, match=r"\['typo'\] match no test"),
+            ):
+                _make({"param_sets": {"c": ("x",)}, "expect_fail": expect_fail})
+
     def test_mapping_entry_also_in_expect_raise_is_rejected(self):
         with pytest.raises(AssertionError, match="expect_raise"):
             _make(

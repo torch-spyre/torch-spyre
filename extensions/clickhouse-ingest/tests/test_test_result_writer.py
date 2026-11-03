@@ -176,6 +176,25 @@ def _rows(client, table):
     return [dict(zip(cols, r)) for r in rows]
 
 
+def test_capability_arch_falls_back_to_the_leg_arch_without_a_platform_tag():
+    from spyre_clickhouse_ingest.schema import CAPABILITY_RUNS
+
+    untagged = _declared("a")
+    untagged["properties"] = [p for p in untagged["properties"] if p[0] != "tag"]
+    tagged = _declared("b")
+    c = FakeClient()
+    insert_test_results(
+        c, "db", "torch-spyre", RUN, [untagged, tagged], "a.xml", arch="s390x"
+    )
+    runs = {
+        dict(zip(cols, r))["props"]["test_name"]: dict(zip(cols, r))["arch"]
+        for (table, rows, cols) in c.inserts
+        if table == CAPABILITY_RUNS.name
+        for r in rows
+    }
+    assert runs == {"a": "s390x", "b": "ppc64le"}
+
+
 def test_a_declared_capability_is_written_alongside_the_outcome():
     from spyre_clickhouse_ingest.identity import CapabilityId
     from spyre_clickhouse_ingest.schema import CAPABILITIES, CAPABILITY_RUNS
@@ -312,7 +331,7 @@ def test_an_unregistered_capability_type_is_skipped_before_any_insert(capsys):
     ]
     err = capsys.readouterr().err
     assert "unregistered capability.test_type 'module_ops'" in err
-    assert "model_modules, model_ops, model_support" in err
+    assert "model_modules, model_ops, model_serving, model_support" in err
 
 
 def test_unknown_capability_keys_are_reported_and_dropped(capsys):

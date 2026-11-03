@@ -42,6 +42,27 @@ def _xfail_var_unsupported(request, execution_mode):
         )
 
 
+def _xfail_round_unsupported(request, execution_mode):
+    """Strict xfail for a body that calls ``torch.round`` (#1723).
+
+    Eager has no ``aten::round.out`` kernel; compiled generates a kernel module
+    that is not valid Python, because round has no lowering.
+    """
+    if execution_mode == "eager":
+        strict_xfail(
+            request,
+            NotImplementedError,
+            "aten::round.out has no Spyre kernel (#1723)",
+        )
+    else:
+        strict_xfail(
+            request,
+            torch._inductor.exc.InductorError,
+            "the generated kernel is not valid Python, because round has no "
+            "lowering (#1723)",
+        )
+
+
 def _compare_modes(execution_mode, fn, *args, atol=0.1, rtol=0.1):
     compare_with_cpu(
         fn,
@@ -259,15 +280,42 @@ class TestNormalizationScalarOperations:
         x = cached_randn((32, 768), dtype=torch.float32)
         _compare_modes(execution_mode, batchnorm_1d_inference, x, atol=1e-4, rtol=1e-3)
 
-    # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1377
+    # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1377 (eager)
+    # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/2544 (compiled)
     def test_batchnorm_identity_affine_2d(self, execution_mode, request):
         """2D norm with identity running stats plus gamma/beta."""
         if execution_mode == "eager":
-            # Only the eager variant still fails; compiled passes.
             request.applymarker(
                 pytest.mark.xfail(
                     reason="Spyre: Broadcasting size-1 dimensions - cannot map "
                     "stick expr to host dimension"
+                )
+            )
+        else:
+            # Constant folding reduces the graph (x: fp32 [32, 64, 224, 224]) to:
+            #
+            #   c   = full([1, 64, 1, 1], sqrt(1 + eps))   # = 1.0000050067901611
+            #   out = div(x, c)
+            #
+            # c gets a single layout whose stick is on the channel dim, while x
+            # has its stick on the last dim. An elementwise op needs one stick
+            # variable, and fp32 restickify is not supported (#2544), so
+            # compilation raises "no mechanism to resolve stick incompatibility".
+            #
+            # Before PR #4462 (which stopped using with_int64_fallback), this
+            # passed by accident. `int64 + eps` was cast back to int64 (== 1),
+            # which is wrong: PyTorch promotes int64 + float to float32. Then
+            # sqrt(1) == 1.0 made Inductor fold `div(x, 1.0)` away, so no kernel
+            # was compiled:
+            #
+            #   out = x
+            #
+            # This test is expected to pass once #2544 (fp32 restickify) is fixed.
+            request.applymarker(
+                pytest.mark.xfail(
+                    reason="Spyre: no mechanism to resolve stick incompatibility "
+                    "for fp32 x / [1, C, 1, 1] constant (fp32 restickify, #2544)",
+                    strict=False,
                 )
             )
 
@@ -361,12 +409,9 @@ class TestNormalizationScalarOperations:
         tol = (1e-4, 1e-4) if dtype == torch.float32 else (1e-3, 1e-2)
         _compare_modes(execution_mode, instancenorm, x, atol=tol[0], rtol=tol[1])
 
-    # TODO: Issue https://github.com/torch-spyre/torch-spyre/issues/2534
-    @pytest.mark.xfail(
-        reason="FP32 reductions on padded sticks currently unsupported (backend masking issue)"
-    )
-    def test_instancenorm_1d(self, execution_mode):
+    def test_instancenorm_1d(self, request, execution_mode):
         """Test 1D InstanceNorm variant."""
+        _xfail_var_unsupported(request, execution_mode)
 
         eps = 1e-5
 
@@ -378,12 +423,9 @@ class TestNormalizationScalarOperations:
         x = cached_randn((32, 768, 100), dtype=torch.float32)
         _compare_modes(execution_mode, instancenorm_1d, x, atol=1e-4, rtol=1e-3)
 
-    # TODO: Issue https://github.com/torch-spyre/torch-spyre/issues/2534
-    @pytest.mark.xfail(
-        reason="FP32 reductions on padded sticks currently unsupported (backend masking issue)"
-    )
-    def test_instancenorm_3d(self, execution_mode):
+    def test_instancenorm_3d(self, request, execution_mode):
         """Test 3D InstanceNorm variant."""
+        _xfail_var_unsupported(request, execution_mode)
 
         eps = 1e-5
 
@@ -451,12 +493,9 @@ class TestModelScalarOperations:
         )
         _compare_modes(execution_mode, scaled_qk_logits, q, k, atol=1e-1, rtol=1e-1)
 
-    # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1688
-    @pytest.mark.xfail(
-        reason="Variance (aten::var.correction) operation not implemented"
-    )
-    def test_layernorm_last_dim_eps1e12(self, execution_mode):
+    def test_layernorm_last_dim_eps1e12(self, request, execution_mode):
         """Last-dim layernorm with ``eps=1e-12`` (BERT-like 3D shape); not ``nn.LayerNorm``."""
+        _xfail_var_unsupported(request, execution_mode)
 
         eps = 1e-12
 
@@ -588,10 +627,9 @@ class TestModelScalarOperations:
         x = cached_randn((256, 256))
         _compare_modes(execution_mode, power_of_2_scale, x, atol=1e-3, rtol=1e-2)
 
-    # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1723
-    @pytest.mark.xfail(reason="Round (aten::round.out) operation not implemented")
-    def test_symmetric_quantization(self, execution_mode):
+    def test_symmetric_quantization(self, request, execution_mode):
         """Symmetric quantization: round(x / scale) * scale."""
+        _xfail_round_unsupported(request, execution_mode)
 
         scale = 0.1
 
@@ -601,10 +639,9 @@ class TestModelScalarOperations:
         x = cached_randn((256, 256))
         _compare_modes(execution_mode, symmetric_quant, x, atol=0.1, rtol=1e-3)
 
-    # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1723
-    @pytest.mark.xfail(reason="Round (aten::round.out) operation not implemented")
-    def test_asymmetric_quantization(self, execution_mode):
+    def test_asymmetric_quantization(self, request, execution_mode):
         """Test asymmetric quantization pattern."""
+        _xfail_round_unsupported(request, execution_mode)
 
         scale = 0.1
         zero_point = 128.0

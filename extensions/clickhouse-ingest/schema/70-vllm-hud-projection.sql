@@ -18,6 +18,11 @@
 --
 -- MVs FIRE ON INSERT ONLY, so a definition change means re-inserting (upstream's own recipe: a
 -- backfill INSERT beside the MV).
+--
+-- KNOWN LIMIT: a retracted upload stays on the HUD. Its rows remain in oss_ci_benchmark_v3, and in
+-- the _by_tag copy if it was retracted after a refresh appended them; the metadata dropdown entries
+-- remain too. Every view filters retracted runs, but the HUD reads these tables with PREWHERE, which
+-- a view cannot serve.
 
 -- ── upstream's record table ─────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS oss_ci_benchmark_v3
@@ -127,7 +132,9 @@ SELECT
 FROM benchmark_runs AS r
 INNER JOIN benchmarks AS b USING (benchmark_id)
 ARRAY JOIN arrayZip(mapKeys(r.measurements), mapValues(r.measurements)) AS m
-WHERE r.component = 'spyre-inference';
+-- Measured model-level rows only: predicted backends and experiment subjects share these tables.
+WHERE r.component = 'spyre-inference' AND r.backend = 'spyre' AND b.props['record_type'] = 'model'
+  AND NOT startsWith(r.props['source_file'], 'optbench-');
 
 -- ── upstream's dropdown table, its own definition ───────────────────────────────────────────
 -- Keeps oss_ci_benchmark_names/_branches fast, and is where the PREWHERE lands. Copied from

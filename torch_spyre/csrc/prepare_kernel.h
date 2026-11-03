@@ -17,6 +17,7 @@
 #pragma once
 
 #include <filesystem>  // NOLINT
+#include <flex/flex.hpp>
 #include <memory>
 #include <nlohmann/json.hpp>
 #include <optional>
@@ -24,7 +25,6 @@
 #include <unordered_map>
 #include <vector>
 
-#include "flex/flex.hpp"
 #include "job_plan.h"
 #include "spyre_stream.h"
 

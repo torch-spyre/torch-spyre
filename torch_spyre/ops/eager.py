@@ -16,6 +16,7 @@ import torch
 from torch_spyre._C import fill_tensor, copy_tensor, SpyreTensorLayout
 import torch_spyre.ops.fallbacks  # noqa: F401
 from .fallbacks import _get_op_overloads
+from .warning_types import RetileWarning
 import warnings
 import contextlib
 import functools
@@ -155,11 +156,6 @@ def _materialize_offset_view(x):
     if isinstance(x, (list, tuple)):
         return type(x)(_materialize_offset_view(e) for e in x)
     return x
-
-
-class RetileWarning(UserWarning):
-    """Warning issued when an eager result had to be re-tiled to the layout a
-    compiled graph assumes for it."""
 
 
 warnings.simplefilter("once", RetileWarning)
@@ -468,7 +464,9 @@ COMPILED_OPS = [
     aten.div,
     aten.exp,
     aten.floor,
+    aten.trunc,
     aten.index_select,
+    aten.index_copy.out,
     aten.log,
     aten.mean,
     aten.mul,
@@ -488,10 +486,13 @@ COMPILED_OPS = [
     aten.le,
     aten.ne.Tensor,
     aten.ne.Tensor_out,
+    aten.ne.Scalar,
+    aten.ne.Scalar_out,
     aten.ge,
     aten.gt,
     aten.lt,
     aten.amax,
+    aten.amin,
     aten.maximum,
     aten.minimum,
     aten.pow,
@@ -505,6 +506,7 @@ COMPILED_OPS = [
     aten.any.default,
     aten.any.dim,
     aten.any.dims,
+    aten.repeat,
 ]
 
 register_torch_compile_kernel(COMPILED_OPS)

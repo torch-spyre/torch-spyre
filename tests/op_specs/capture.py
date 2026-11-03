@@ -100,7 +100,7 @@ def _fake_backend_compile(cmd, *args, **kwargs):
     return subprocess.CompletedProcess(cmd, 0, "", "")
 
 
-# Mock targets for --no-execute, matching docs/tools/capture_coarse_tile_ir.py.
+# Mock targets for --no-execute, matching docs/tools/capture_for_each_tile_ir.py.
 _PREPARE_KERNEL = "torch_spyre.execution.kernel_runner.prepare_kernel"
 _LAUNCH_JOBPLAN = "torch_spyre.execution.kernel_runner.launch_jobplan"
 # The KTIR path's two extra --no-execute targets. dbo-opt is invoked through a
