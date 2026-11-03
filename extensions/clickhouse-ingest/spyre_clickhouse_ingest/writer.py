@@ -118,6 +118,15 @@ class DryRunClient:
         return "\n".join(lines) or "    nothing"
 
 
+# Per-upload tags a dashboard upload puts on every row it adds; never part of a row's identity.
+UPLOAD_ROW_PROPS = ("upload_id", "round")
+
+
+def upload_row_props(props) -> dict:
+    """The upload tags among `props`, for the fact rows of one upload."""
+    return {k: str(props[k]) for k in UPLOAD_ROW_PROPS if (props or {}).get(k)}
+
+
 class _Rows:
     def __init__(self, rows):
         self.result_rows = rows
@@ -297,10 +306,12 @@ class TestResultWriter(RunWriter):
         source_file: str = "",
         attempt: int = 0,
         arch: str = "",
+        row_props: dict | None = None,
     ) -> int:
         """Write one leg's cases; returns the number of outcome rows written.
 
         `arch` is the leg's arch, used for capability verdicts whose case carries no platform tag.
+        `row_props` are tags added to every outcome row (an upload's id); not hashed into any id.
         """
         if not cases:
             return 0
@@ -340,6 +351,7 @@ class TestResultWriter(RunWriter):
                 # carries the original executor's), the filter for "how much did we
                 # execute"; source_file is the shard discriminator the dedup reads.
                 "props": {
+                    **(row_props or {}),
                     **results,
                     **recorded,
                     "ran_in": run_id,
@@ -374,6 +386,7 @@ class TestResultWriter(RunWriter):
                     arch=arch,
                     disc_keys=disc_keys,
                     shard=source_file,
+                    row_props=row_props,
                 )
         if superseded:
             # After the insert, so a failed insert never loses the outcome it would replace.
@@ -621,8 +634,12 @@ class BenchmarkWriter(RunWriter):
         benchmarks: list,
         report_kind: str = "",
         source_file: str = "",
+        row_props: dict | None = None,
     ) -> int:
-        """Write one leg's benchmarks, one row per (benchmark, backend)."""
+        """Write one leg's benchmarks, one row per (benchmark, backend).
+
+        `row_props` are tags added to every run row (an upload's id); not hashed into any id.
+        """
         if not benchmarks:
             return 0
         ident_rows: dict[str, schema.BenchmarkRow] = {}
@@ -657,6 +674,8 @@ class BenchmarkWriter(RunWriter):
         # The DDL's CHECK refuses an empty map, so one unmeasured benchmark would fail
         # the whole insert; dropped with a warning rather than losing a long perf leg.
         run_rows = [f for f in facts.values() if f["measurements"]]
+        for f in run_rows:
+            f["props"].update(row_props or {})
         dropped = len(facts) - len(run_rows)
         kept = {f["benchmark_id"] for f in run_rows}
         written = cls._flush(
@@ -745,6 +764,7 @@ class CapabilityWriter(RunWriter):
         arch: str = "",
         disc_keys=(),
         shard: str = "",
+        row_props: dict | None = None,
     ) -> int:
         """Write one analysis's verdicts; `backend` is a column, not part of the id."""
         if not results:
@@ -784,6 +804,7 @@ class CapabilityWriter(RunWriter):
                 # shard is applied LAST: it is the dedup scope, so a producer prop
                 # of the same name must not redefine it and let a re-ingest through.
                 "props": {
+                    **(row_props or {}),
                     **{k: str(v) for k, v in (r.get("props") or {}).items()},
                     **({"shard": shard} if shard else {}),
                 },
@@ -1013,8 +1034,12 @@ class ArtifactWriter:
         duration_s: float = 0.0,
         props=None,
         attempt: int = 0,
+        supersede: bool = False,
     ) -> bool:
         """One verdict of one leg on one artifact; refuses a partial key, skips a repeat.
+
+        `supersede` writes a new row even when the key holds a verdict: an appended round's
+        verdict over the whole run, which every view reads as the latest.
 
         Given an attempt, the verdict replaces any from an earlier attempt of the same run. A
         repeat that explains a failure lands its reason in artifact_result_reasons instead.
@@ -1033,7 +1058,9 @@ class ArtifactWriter:
                 file=sys.stderr,
             )
             return False
-        if cls.result_recorded(client, db, aid, rid, kind, test_type, attempt):
+        if not supersede and cls.result_recorded(
+            client, db, aid, rid, kind, test_type, attempt
+        ):
             if props.get("failure_reason"):
                 cls.insert_reason(
                     client,
@@ -1069,6 +1096,28 @@ class ArtifactWriter:
         }
         cls.result_table.insert(client, [result_row], db=db)
         return True
+
+    @classmethod
+    def latest_result(cls, client, db: str, artifact_id, run_id, test_type: str):
+        """(state, duration_s) of the run's latest published verdict at this key, else None."""
+        kind = cls._result_kind(test_type)
+        where, params = cls._verdict_key(artifact_id, run_id, kind, test_type)
+        rows = client.query(
+            f"SELECT state, duration_s FROM {db}.v_artifact_results_published WHERE {where} "
+            "ORDER BY ts DESC, audit_timestamp DESC LIMIT 1",
+            parameters=params,
+        ).result_rows
+        return (rows[0][0], float(rows[0][1] or 0)) if rows else None
+
+    @classmethod
+    def over_prior(cls, client, db, artifact_id, run_id, test_type, state, duration_s):
+        """(state, duration_s) of a round's verdict over the whole run: durations add, and a
+        failed or error round before it is not undone by a passing one."""
+        prior = cls.latest_result(client, db, artifact_id, run_id, test_type)
+        if not prior:
+            return state, duration_s
+        worst = next((s for s in ("error", "failed") if s in (state, prior[0])), state)
+        return worst, duration_s + prior[1]
 
     @staticmethod
     def _result_kind(test_type: str, result_kind: str = "") -> str:
