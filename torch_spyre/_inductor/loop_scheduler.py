@@ -22,6 +22,14 @@ applied by :func:`loop_scheduler_patches_for_compile`, which ``patches.py``
 enters for every Spyre compile and leaves in the same ``finally`` as its other
 per-compile patches, so a CPU compile in the same process is untouched.
 
+``CustomPreSchedulingPasses`` hands the scheduler the real nested list (it no
+longer expands the nodes), so on a compiled graph every ``LoopNode`` reaches
+``Scheduler.__init__``.  A ``LoopSchedulerNode`` is a
+``CountedLoopSchedulerNode``, so the pre-fusion pass
+``build_loop_scheduler_nodes`` passes it through unchanged (its
+``_loop_group_id`` is None) and everything after it (fusion, kernel
+preparation, HBM-pool planning, codegen) sees the counted loop it always saw.
+
 The patch reaches into private Inductor code.  It is supported only on the
 torch releases in ``SUPPORTED_RELEASES`` and is refused with ``Unsupported``
 on any other: it is required for a loop to compile, so it neither warns nor
@@ -52,6 +60,12 @@ from .loop_node import LoopNode
 from .scheduler import CountedLoopSchedulerNode
 
 SUPPORTED_RELEASES: tuple[tuple[int, int], ...] = ((2, 13), (2, 14))
+
+# Set to False only by the equivalence test, to compare the flow-through path
+# with the path it replaced: ``CustomPreSchedulingPasses`` then expands every
+# ``LoopNode`` after the pass loop, as before, and ``build_loop_scheduler_nodes``
+# rebuilds the loops from the flat ops' ``loop_info``.
+SCHEDULE_LOOP_NODES = True
 
 # The Inductor surface this module depends on.  "patched": replaced for the
 # compile by this module.  Every other entry is read, called or inherited and
@@ -91,6 +105,13 @@ PATCHED_SURFACE: tuple[str, ...] = (
     "SchedulerBuffer -- defining_op, users, set_users",
     "ir.Operation.get_stream_idx / get_origin_node / get_mempool / get_origins "
     "-- assert the attribute exists on the LoopNode",
+    "Scheduler._init after compute_ancestors, with a LoopSchedulerNode in "
+    "self.nodes: compute_input_distances (unmet_dependencies, "
+    "name_to_buf[...].defining_op_name()), create_foreach_nodes, the second "
+    "topological_sort_schedule, the _pre_fusion_custom_pass, fuse_nodes "
+    "(Spyre's can_fuse_* are False), merge_loops, compute_last_usage "
+    "(FusedSchedulerNode.set_last_usage) and _codegen -- run on 2.13 by "
+    "test_loop_scheduler_equivalence.py",
 )
 
 
@@ -103,7 +124,7 @@ def loop_scheduler_supported() -> bool:
     return _release() in SUPPORTED_RELEASES
 
 
-def _refuse_release() -> Unsupported:
+def refuse_release() -> Unsupported:
     return Unsupported(
         f"counted loops on torch {torch.__version__}: the LoopNode scheduler "
         f"patch supports only torch releases {SUPPORTED_RELEASES}"
@@ -344,7 +365,7 @@ def apply_loop_scheduler_patches() -> Iterator[None]:
     patched method takes the original path.
     """
     if not loop_scheduler_supported():
-        raise _refuse_release()
+        raise refuse_release()
     orig = {name: Scheduler.__dict__[name] for name in _PATCHED}
 
     def create_scheduler_node(self, node):
@@ -432,7 +453,7 @@ def _refuse_loop_nodes() -> Iterator[None]:
 
     def create_scheduler_node(self, node):
         if isinstance(node, LoopNode):
-            raise _refuse_release()
+            raise refuse_release()
         return orig(self, node)
 
     with _replace({"create_scheduler_node": create_scheduler_node}):

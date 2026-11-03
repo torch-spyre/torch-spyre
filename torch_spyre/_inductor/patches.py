@@ -269,9 +269,9 @@ def enable_spyre_context(example_inputs: list[InputType]):
     # A LoopNode reaching the scheduler becomes one LoopSchedulerNode
     # (loop_scheduler.py).  On a torch release the patch does not support,
     # entering does NOT raise: a compile with no loop must keep working on any
-    # release, so only a LoopNode handed to the scheduler is refused there.
-    # While passes.py expands every LoopNode before the scheduler, each patched
-    # method only ever takes its original path.
+    # release, so only a LoopNode handed to the scheduler is refused there
+    # (CustomPreSchedulingPasses refuses one earlier, naming the release).
+    # On a graph with no LoopNode each patched method takes its original path.
     loop_scheduler_patches = ExitStack()
     loop_scheduler_patches.enter_context(loop_scheduler_patches_for_compile())
 

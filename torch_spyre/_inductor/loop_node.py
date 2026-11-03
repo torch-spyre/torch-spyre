@@ -23,9 +23,11 @@ count, carries) but replaces nothing yet.
 
 Passes that know nothing about nodes run against :class:`OpsView`, which
 iterates the leaf ops in program order and forwards every mutation to the list
-that owns the op.  At the end of pre-scheduling :func:`expand` flattens the
-nodes away again, so the cost model, the scheduler and codegen see exactly
-the flat list they saw before nodes existed.
+that owns the op.  After the pass loop the nodes stay: each reaches
+Inductor's scheduler as one ``LoopSchedulerNode`` (``loop_scheduler.py``), and
+the readers in between descend into them.  :func:`expand` flattens them only
+on a pass error, for the passes in ``passes._PASSES_RUN_EXPANDED``, and in the
+equivalence tests that compare against the flat path.
 """
 
 from __future__ import annotations
