@@ -131,6 +131,16 @@ def test_groups_differing_only_in_global_get_distinct_bucket_names():
     assert out["d/test_a_config.yaml"] != out["d/test_c_config.yaml"]
 
 
+def test_config_sharing_a_test_file_with_another_config_runs_alone():
+    configs = [rec(f"inductor/test_{c}_config.yaml") for c in "abc"]
+    configs[0]["shared_file"] = True
+    out = L.plan(configs, POLICY, T({c["key"]: 0.5 for c in configs}))
+    assert out["inductor/test_a_config.yaml"] == ""
+    assert (
+        out["inductor/test_b_config.yaml"] == out["inductor/test_c_config.yaml"] != ""
+    )
+
+
 def test_exclude_keeps_a_directory_out_of_buckets():
     configs = [
         rec("distributed_tests/test_a_config.yaml"),
@@ -295,6 +305,42 @@ def test_filter_configs_folds_a_bucket_into_one_matrix_entry(tmp_path):
     assert bucket[0]["report"].startswith("bucket_")
     assert [s["config"] for s in suites if not s.get("configs")] == [
         "inductor/test_big_config.yaml"
+    ]
+
+
+def test_filter_configs_never_buckets_a_test_file_split_across_configs(tmp_path):
+    cfgdir = tmp_path / "configs"
+    shared = "${TORCH_DEVICE_ROOT}/tests/inductor/test_ops.py"
+    _write_tree(
+        cfgdir,
+        {
+            "inductor/test_ops_a_config.yaml": _cfg(shared),
+            "inductor/test_ops_b_config.yaml": _cfg(shared),
+            "inductor/test_x_config.yaml": _cfg(
+                "${TORCH_DEVICE_ROOT}/tests/inductor/test_x.py"
+            ),
+            "inductor/test_y_config.yaml": _cfg(
+                "${TORCH_DEVICE_ROOT}/tests/inductor/test_y.py"
+            ),
+        },
+    )
+    rc, suites, err = _run(
+        tmp_path,
+        cfgdir,
+        {"target_job_minutes": 8},
+        {
+            k: {"p50_min": 0.5, "runs": 9}
+            for k in (
+                "inductor/test_ops_a_config.yaml",
+                "inductor/test_ops_b_config.yaml",
+                "inductor/test_x_config.yaml",
+                "inductor/test_y_config.yaml",
+            )
+        },
+    )
+    assert rc == 0, err
+    assert [s["configs"].split() for s in suites if s.get("configs")] == [
+        ["inductor/test_x_config.yaml", "inductor/test_y_config.yaml"]
     ]
 
 

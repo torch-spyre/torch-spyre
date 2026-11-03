@@ -10,7 +10,9 @@ never written into the test configs. Two files feed it:
 Each config the tier filter selected is either `alone` (its own job, as today) or in a `bucket`
 with other short configs. A config at or above the policy's threshold always runs alone, and so does
 a config with fewer than `min_runs` recorded runs (a new one, say): it runs on its own until its
-median is worth trusting, then the next refresh of the timings bins it. Members of
+median is worth trusting, then the next refresh of the timings bins it. A config that shares a test
+file with another config also runs alone: a bucket reports under the bucket's name, and the refresh
+can only credit its cases back to a config through a test file that config alone lists. Members of
 a bucket share a runner, directory, flags and `global:` block, and never two of them name the same
 test file, so a bucket runs exactly the tests its members would run on their own.
 
@@ -104,7 +106,8 @@ def plan(
 ) -> Dict[str, str]:
     """{config key: bucket name, or "" to run alone} for the configs one matrix will run.
 
-    `configs` are the tier-filtered records: key, dir, runner, flags, global, files.
+    `configs` are the tier-filtered records: key, dir, runner, flags, global, files, and
+    shared_file (some test file of it is also listed by another config on disk).
     """
     if policy is None:
         return {c["key"]: "" for c in configs}
@@ -121,6 +124,7 @@ def plan(
         # Too few runs to size it: alone, exactly as it would run without grouping.
         if (
             excluded
+            or c.get("shared_file")
             or rec is None
             or rec["runs"] < policy["min_runs"]
             or rec["p50_min"] >= float(policy["threshold_minutes"])

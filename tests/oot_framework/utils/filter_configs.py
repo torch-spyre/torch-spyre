@@ -351,6 +351,18 @@ def main() -> None:
         runner_map = _load_path_map(args.runner_map)
     flags_map: dict = _load_path_map(args.flags_map) if args.flags_map else {}
 
+    # Test files more than one config on disk lists (e.g. test_inductor_ops.py, split across many
+    # configs by test class). A bucket's JUnit report is named after the bucket, so the timings
+    # refresh credits its cases to a config by test file; a shared file makes that ambiguous, and
+    # those configs therefore always run alone (test_layout.plan) to keep their timings fresh.
+    owners: dict = {}
+    for cfg in config_dir.rglob("*.yaml"):
+        try:
+            for f in _config_facts(cfg)[1]:
+                owners.setdefault(Path(f).stem, set()).add(cfg)
+        except Exception:  # noqa: BLE001  (unreadable configs are reported below)
+            continue
+
     results = []
     skipped_covered = 0
     for cfg in sorted(config_dir.rglob("*.yaml")):
@@ -377,6 +389,9 @@ def main() -> None:
                 "dir": str(Path(_layout_key(rel)).parent),
                 "global": glob,
                 "files": files,
+                "shared_file": any(
+                    len(owners.get(Path(f).stem, ())) > 1 for f in files
+                ),
             }
         )
 
