@@ -49,23 +49,6 @@ int64_t elems_per_stick(const DataFormats& df) {
   return 0;
 }
 
-std::vector<int32_t> generic_stick_dim_order(c10::IntArrayRef host_size) {
-  std::vector<int32_t> dim_order(host_size.size());
-  std::iota(dim_order.begin(), dim_order.end(), 0);
-  // init() places dim_order[0] between the two stick dims on the device. For
-  // rank >= 3 put the largest non-stick dim there, as
-  // _try_matmul_perf_reorder in _inductor/nonstick_dim_order.py does for
-  // compiled layouts. Rank < 3: identity.
-  if (host_size.size() >= 3) {
-    // max_element returns the first maximum, so ties go to the lowest index.
-    auto largest = std::max_element(host_size.begin(), host_size.end() - 1);
-    auto between = dim_order.begin() + (largest - host_size.begin());
-    // Move `between` to the front; the other dims keep their host order.
-    std::rotate(dim_order.begin(), between, between + 1);
-  }
-  return dim_order;
-}
-
 std::vector<int32_t> default_dim_order(c10::IntArrayRef host_size) {
   std::vector<int32_t> dim_order(host_size.size());
   std::iota(dim_order.begin(), dim_order.end(), 0);
