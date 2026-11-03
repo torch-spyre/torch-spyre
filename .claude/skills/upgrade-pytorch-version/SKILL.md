@@ -613,6 +613,13 @@ After upgrading, watch for:
    `TestCopyFromD2DNestedCompile` in `test_copy_from_d2d_offsets.py` on supported
    patch releases; it exercises the private `_use_eager_on_nested_compile`
    context as well as the predicate.
+   Re-check `_patch_scan_input_aliasing` and its version guard. PyTorch 2.15
+   made the HOP check's policy arguments keyword-only and added
+   `supports_input_input_aliasing`. The patch now uses that flag instead of
+   replacing `SubgraphTracer.has_aliasing`; preserve the native policy for
+   other HOPs, including FlexAttention masks that already allow aliased inputs.
+   Run `TestScanInputAliasing` and the fused-QKV SDPA regression, and confirm
+   the scan tests actually run rather than skip behind the version guard.
 6. **Skipped-version accumulation** — If skipping versions, multiple breaking
    changes may compound. Consider reading PyTorch release notes for each
    skipped version to anticipate issues.

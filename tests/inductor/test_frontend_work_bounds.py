@@ -37,13 +37,13 @@ a 534x ratio below any useful threshold.
 Bounds are calibrated on the two graphs below rather than on the sweep, because
 the sweep measures the pre-scheduling pipeline over model shapes while these
 tests count a whole ``torch.compile`` of a small graph. Measured per operation
-(``_calibrate``, torch 2.14.1 and the upgrade on main ``349135c9`` on a Spyre pod):
+(``_calibrate``, torch 2.15.0+cpu and the upgrade on main ``c88b6d46`` on x86_64):
 
 =================  ====  ========  ============  ==================  ========
 workload            ops    misses   extractions  device coordinates  requests
 =================  ====  ========  ============  ==================  ========
-matmul_chain          4      1.50        139.75               57.50    286.50
-elementwise_chain    32      1.03        156.28               57.94    300.22
+matmul_chain          4      1.50        123.75               49.00    291.50
+elementwise_chain    32      1.03        143.22               51.44    457.50
 =================  ====  ========  ============  ==================  ========
 
 Taken with ``sencores=32``, ``lx_planning=True``, ``hbm_pool_planning=True``
@@ -51,9 +51,10 @@ and ``layout_solver="cpsat"``, which ``_counted_compile`` pins so the bounds do
 not float on the shell's environment. These tests run with normal memoization
 enabled.
 
-The previous torch 2.13 calibration used main ``c30e6bc0``; differences from
-those historical counts include changes to both torch and torch-spyre, so they
-do not isolate the cost of the torch upgrade.
+The previous torch 2.14.1 calibration used main ``349135c9``. Extractions were
+139.75 and 156.28 per operation; the existing limits also cover the lower 2.15
+measurements. Differences from historical counts include changes to both torch
+and torch-spyre, so they do not isolate the cost of the torch upgrade.
 
 At the first calibration (main ``1a56c846``), the sweep's figures over 4,443
 operations counted at pre-scheduling-pipeline entry -- 1.32 misses, 90.7
@@ -88,11 +89,11 @@ WORKLOADS = ("matmul_chain", "elementwise_chain")
 
 #: Measured 1.03-1.50 here, 1.32 on the sweep, against a cold-cache floor of 1.0.
 MAX_MISSES_PER_OP = 4.0
-#: Per-workload limits above the normal 2.14.1 measurements of 139.75 and 156.28.
+#: Per-workload limits retained from 2.14.1, above the 2.15 counts of 123.75/143.22.
 #: See the module docstring for calibration.
 #: Re-measure legitimate work increases before adjusting these limits.
 MAX_EXTRACTIONS_PER_OP = {"matmul_chain": 150.0, "elementwise_chain": 175.0}
-#: Measured 57-58 here. Unmemoized, so the count is the work.
+#: Measured 49-52 here. Unmemoized, so the count is the work.
 MAX_DEVICE_COORDS_PER_OP = 100.0
 
 
