@@ -1594,6 +1594,8 @@ class ArgNameToIndexTracer(DefaultHandler):
         return inx2arg
 
     def _default(self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]):
+        if name == "indirect_indexing":
+            return sympy.Symbol("dummy")
         for argname, arg in kwargs.items():
             assert not isinstance(arg, ArgName), (
                 f"Can't determine order of kwargs. Found kwarg {argname}"
