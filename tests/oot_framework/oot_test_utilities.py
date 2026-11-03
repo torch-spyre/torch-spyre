@@ -370,6 +370,18 @@ def _filter_entries_by_platform(entries: Sequence[Any]) -> List[Any]:
     return matching_specific or unrestricted
 
 
+def _platform_excluded(entry: Any) -> bool:
+    """True when *entry* carries an ``exclude__plat_<arch>`` tag for this arch.
+
+    Unlike ``platform__<arch>`` (which picks between sibling entries), this
+    disables the tagged entry outright on that one arch -- used by
+    ``OOTTestBase._should_run`` so the exclusion stays scoped to the tagged
+    entry even when other entries share the same merged test file.
+    """
+    tag = f"exclude__plat_{_OOT_PLATFORM_ARCH}"
+    return tag in (getattr(entry, "tags", None) or [])
+
+
 def _select_entry_for_variant(
     entries: List[Any],
     method_name: str,

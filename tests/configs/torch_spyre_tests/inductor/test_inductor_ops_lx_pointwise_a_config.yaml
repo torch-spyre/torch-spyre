@@ -22,11 +22,11 @@ test_suite_config:
         # Known LX-planning failures -- run and expected to fail. Non-strict
         # xfail: an unexpected pass (XPASS) does not fail CI. Entries failing
         # in both wraps collapse to (pointwise|reduction).
-        # clamp_mixed_dtype fp16: sum(dim=0) wrap error at |sum|~1e4 (3-5 ULP > atol 1.0), not a clamp bug.
+        # div: one column of the sum(dim=0) wrap nearly cancels (|sum| ~1.6), so its fp16 accumulation error exceeds atol 1.0 (#5719).
+        # log zero_val: log(0) = -inf, which the wrap's second op turns into NaN.
         - names:
             - LxPlanning.*::test_pointwise_binary_op_div_67x71x256_67x71x256_lx_planning_reduction
             - LxPlanning.*::test_log_log_zero_val_lx_planning_(pointwise|reduction)
-            - LxPlanning.*::test_clamp_mixed_dtype_.*fp16.*_lx_planning_reduction
           mode: xfail
         - names:
             - LxPlanning.*::test_(pointwise|sqrt|rsqrt|log_|pow_|alias_operands|logical_not|bool|eq_scalar|scalar_(comparison|multidim|vs_tensor)_base|scalar_comparison_simple1|eq_scalar_constant_int|clamp).*_lx_planning_(pointwise|reduction)

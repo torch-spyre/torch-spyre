@@ -957,6 +957,45 @@ class TestSpyreTensorLayout(TestCase):
             list(_qfp8ch_stl(two_sticks, torch.float8_e4m3fn).device_size), [1, 4, 128]
         )
 
+    def test_qfp8wt_layout_puts_k_next_to_the_stick(self):
+        """qfp8wt's QFP8WT output pairs K with N in a 2D stick, but the device
+        layout records only a 1D stick of N. The layout places K directly
+        outside the stick, so K is device dim -2 at every rank and readers can
+        take it from there. Rank 2 keeps its existing layout."""
+        from torch._inductor.ir import FixedLayout
+
+        from torch_spyre._C import ElementArrangement
+        from torch_spyre._inductor.propagate_layouts import _qfp8wt_stl
+
+        def contiguous(size):
+            stride, acc = [], 1
+            for s in reversed(size):
+                stride.insert(0, acc)
+                acc *= s
+            return stride
+
+        cases = {
+            # host [..., K, N]: (expected device_size, expected stride_map)
+            (128, 256): ([2, 128, 128], [128, 256, 1]),
+            (4, 128, 64): ([4, 1, 128, 128], [8192, 64, 64, 1]),
+            (2, 12, 128, 128): ([2, 12, 1, 128, 128], [196608, 16384, 128, 128, 1]),
+            (1, 12, 256, 384): ([1, 12, 3, 256, 128], [-1, 98304, 128, 384, 1]),
+        }
+        cpu = torch.device("cpu")
+        for size, (device_size, stride_map) in cases.items():
+            with self.subTest(size=size):
+                size = list(size)
+                out = _qfp8wt_stl(
+                    FixedLayout(cpu, torch.float8_e4m3fn, size, contiguous(size)),
+                    FixedLayout(cpu, torch.float16, size, contiguous(size)),
+                )
+                self.assertEqual(out.element_arrangement, ElementArrangement.QFP8WT)
+                self.assertEqual(list(out.device_size), device_size)
+                self.assertEqual(list(out.stride_map), stride_map)
+                # K: device dim -2, with K's host stride.
+                self.assertEqual(out.device_size[-2], size[-2])
+                self.assertEqual(out.stride_map[-2], contiguous(size)[-2])
+
     def test_explicit_layout_rejects_malformed_device_size(self):
         """The explicit (device_size, stride_map) constructor validates the one
         invariant every consumer assumes: non-negative device dims, one
