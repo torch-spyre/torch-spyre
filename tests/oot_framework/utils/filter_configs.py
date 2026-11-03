@@ -91,9 +91,6 @@ import json
 import sys
 from pathlib import Path
 
-# Run as a script by the matrix job, and imported as a module by tests: find test_layout either way.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import test_layout  # noqa: E402
 
 try:
     import yaml
@@ -399,17 +396,26 @@ def main() -> None:
     if args.format == "paths":
         print(" ".join(r["path"] for r in results))
     else:
+        # Imported only when grouping is asked for: callers that sparse-check-out filter_configs.py
+        # alone (upstream_tests.yaml, integration-tests.yaml) never pass --layout-policy.
+        if args.layout_policy:
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            import test_layout
+        else:
+            test_layout = None
         try:
-            policy = test_layout.load_policy(args.layout_policy)
-            timings = test_layout.load_timings(args.timings)
-        except test_layout.LayoutError as exc:
+            policy = (
+                test_layout.load_policy(args.layout_policy) if test_layout else None
+            )
+            timings = test_layout.load_timings(args.timings) if test_layout else {}
+        except ValueError as exc:  # test_layout.LayoutError
             sys.exit(f"ERROR: {exc}")
         if args.layout_policy and policy is None:
             print(
                 f"WARNING: {args.layout_policy} not found; every config runs as its own job",
                 file=sys.stderr,
             )
-        buckets = test_layout.plan(results, policy, timings)
+        buckets = test_layout.plan(results, policy, timings) if test_layout else {}
         for r in results:
             r["bucket"] = buckets.get(r["key"], "")
         results = _fold_buckets(results)
