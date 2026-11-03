@@ -393,7 +393,7 @@ inline void addCollMetadata(trace_activity_type& trace_activity,
 template <class trace_activity_type, class aiupti_activity_type>
 inline void addCbHardwareMetadata(trace_activity_type& trace_activity,
                                   const aiupti_activity_type* activity) {
-  trace_activity->addMetadata("power", activity->power);
+  trace_activity->addMetadata("power_consumed", activity->power_consumed);
   trace_activity->addMetadata("fw_begin_time", activity->fw_begin_time);
   trace_activity->addMetadata("fw_end_time", activity->fw_end_time);
   trace_activity->addMetadata("cb_idx", activity->cb_idx);
