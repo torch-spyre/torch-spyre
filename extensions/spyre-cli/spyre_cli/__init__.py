@@ -14,7 +14,13 @@
 
 from .core import launch
 
-__all__ = ["check_kernelspec", "launch", "load_kernelspec"]
+__all__ = [
+    "check_kernelspec",
+    "default_tensors",
+    "launch",
+    "load_kernelspec",
+    "tensors_from_spec",
+]
 
 
 def __getattr__(name):
@@ -25,7 +31,12 @@ def __getattr__(name):
     cost and the dependency at the point of use, while
     ``spyre_cli.load_kernelspec`` still reads as a plain attribute.
     """
-    if name in ("load_kernelspec", "check_kernelspec"):
+    if name in (
+        "load_kernelspec",
+        "check_kernelspec",
+        "tensors_from_spec",
+        "default_tensors",
+    ):
         from . import launch_spec
 
         return getattr(launch_spec, name)

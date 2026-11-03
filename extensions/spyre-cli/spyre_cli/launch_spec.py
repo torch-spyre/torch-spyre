@@ -22,7 +22,9 @@ reading a spec into tensors, and checking tensors against one. Both need a
 *live* tensor and so need ``_C``, which is why they sit on this side; the
 producer stays stdlib-only.
 
-TODO: prevent drift risk on LaunchArgLayout -- its fields are serialized by from_device_layout over there and compared here, so a new field is silently unchecked.
+TODO: prevent drift risk on LaunchArgLayout
+      its fields are serialized by from_device_layout over there and compared here,
+      so a new field is silently unchecked.
 
 ``torch_spyre`` is imported at module level here. ``pyproject.toml`` does not
 list it as an install dependency, but every function in this module needs it,
@@ -49,20 +51,6 @@ from torch_spyre._inductor.codegen.kernel_launchspec import (
 )
 
 
-# ---------------------------------------------------------------------------
-# The two halves of the public API are separate because they take different
-# things at different times. ``load_kernelspec`` takes only a path: it is what
-# a caller reads to find out what tensors to build, so at that point no tensors
-# exist yet and there is nothing to validate. ``check_kernelspec`` takes the
-# tensors, which exist only after the caller has built them from what the spec
-# said. Folding the check into the load would mean validating nothing.
-#
-# Keeping them apart also leaves the caller the choice of policy: the checks
-# come back as a list of problems rather than an exception, so a script can
-# print them, assert on them, or ignore the ones it knows are harmless.
-# ---------------------------------------------------------------------------
-
-
 def load_kernelspec(path):
     """``path``'s launch spec as a ``LaunchSpec``, or None when it has none.
 
@@ -79,19 +67,19 @@ def load_kernelspec(path):
     return None if raw is None else LaunchSpec.from_dict(raw)
 
 
-def _tensors_from_spec(spec, bindings):
-    """Build every tensor ``spec`` says the kernel expects.
+def tensors_from_spec(spec, bindings: Optional[dict] = None) -> list:
+    """Allocate every tensor ``spec`` says the kernel expects, uninitialised.
 
-    Inputs are filled with ones and outputs left uninitialised, matching the
-    explicit path. The pool tensor, when the kernel takes one, is prepended
-    exactly as inductor's ``call_kernel`` does -- it is not one of ``args``.
+    Allocation only: the values are the caller's business. An SDK caller fills
+    the inputs however it likes and launches, and the CLI is one such caller --
+    :func:`default_tensors` is what gives it torch.ones.
 
-    Each tensor is allocated with the recorded device layout. Shape and dtype
-    alone are not the contract: an op can be compiled against a particular
-    packing along the sticks -- a depthwise conv2d puts its channels in one
-    stick -- and a tensor in the default arrangement then has the right shape
-    and dtype while being laid out wrongly, which launches and returns wrong
-    data.
+    Each tensor gets the recorded device layout, which is the part that cannot
+    be reconstructed from shape and dtype.
+ 
+       The pool tensor, when the kernel takes one, is prepended exactly as
+    inductor's ``call_kernel`` does; it is not one of ``spec.args``, so the
+    returned list is longer than ``spec.args`` by ``spec.arg_offset``.
     """
     tensors = []
     if spec.caller_passes_pool:
@@ -108,9 +96,23 @@ def _tensors_from_spec(spec, bindings):
         tensors.append(
             _alloc(shape, getattr(torch, arg.dtype), spyre_layout(arg.layout))
         )
-        if arg.role == "input":
-            tensors[-1].fill_(1.0)
     return tensors
+
+
+def default_tensors(spec, tensors: Sequence) -> None:
+    """Fill ``spec``'s input tensors with ones, in place.
+
+    Torch.ones, always: this is the smoke-test fill, and it says whether a folder
+    loads and runs and nothing about whether it computes.
+    A caller that cares about numerics allocates with
+    :func:`tensors_from_spec` and writes its own values instead.
+
+    Outputs are left alone, and so are ``input_output`` arguments, whose
+    starting value is part of what is being tested.
+    """
+    for arg in spec.args:
+        if arg.role == "input":
+            tensors[arg.arg_index + spec.arg_offset].fill_(1.0)
 
 
 def _alloc(shape, dtype, layout):

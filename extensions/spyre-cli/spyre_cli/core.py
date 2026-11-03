@@ -84,7 +84,12 @@ def launch_from_cli(path, inputs, outputs, bindings=None):
 
     # Deferred, like the other torch-spyre imports here: launch_spec imports
     # torch at module level, and `spyre --help` must work without it.
-    from .launch_spec import _tensors_from_spec, check_kernelspec, load_kernelspec
+    from .launch_spec import (
+        check_kernelspec,
+        default_tensors,
+        load_kernelspec,
+        tensors_from_spec,
+    )
 
     bindings = bindings or {}
     spec = load_kernelspec(path)
@@ -100,8 +105,12 @@ def launch_from_cli(path, inputs, outputs, bindings=None):
         )
 
     if spec is not None and not inputs and not outputs:
-        # The folder describes itself, so there is nothing to retype.
-        tensors = _tensors_from_spec(spec, bindings)
+        # The folder describes itself, so there is nothing to retype. Ones
+        # are a smoke test and said to be one: this path answers "does it
+        # run", not "is it right". A caller with real data allocates with
+        # tensors_from_spec and writes its own values.
+        tensors = tensors_from_spec(spec, bindings)
+        default_tensors(spec, tensors)
         # By role, not by position: an output need not be a trailing argument,
         # and an in-place arg is both. ``arg_offset`` skips the pool, which sits
         # at 0 and is not one of ``args``.
