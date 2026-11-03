@@ -20,6 +20,8 @@ from torch._inductor.ir import (
 )
 from torch._inductor.graph import GraphLowering
 
+from .loop_node import LoopNode, all_ops
+
 
 def live_operations(graph: GraphLowering) -> frozenset[str]:
     """Return the names of the operations whose effect the caller can observe.
@@ -74,8 +76,7 @@ def _walk_once(
         # target's storage, so the target has to survive with it.
         for dep in rw.reads:
             live_bufs.add(dep.name)
-        target = _mutation_target(op)
-        if target is not None:
+        for target in _mutation_targets(op):
             live_bufs.add(target)
 
 
@@ -88,12 +89,28 @@ def _mutation_target(op: Operation) -> str | None:
     return None
 
 
+def _mutation_targets(op: Operation) -> list[str]:
+    """Every buffer ``op`` writes in place: its own target, or for a
+    ``LoopNode`` the targets of its body's mutations."""
+    if isinstance(op, LoopNode):
+        return op.mutation_targets()
+    target = _mutation_target(op)
+    return [] if target is None else [target]
+
+
 def _mutation_target_is_live(op: Operation, live_bufs: set[str]) -> bool:
     """Whether a side-effecting op's write can still be observed.
 
     Only a ``MutationLayoutSHOULDREMOVE`` names a target, so anything else
-    side-effecting (an impure ``FallbackKernel``) is assumed observable.
+    side-effecting (an impure ``FallbackKernel``) is assumed observable.  A
+    ``LoopNode`` is observable when any side-effecting op of its body is:
+    one whose mutation target is live, or an impure fallback.
     """
+    if isinstance(op, LoopNode):
+        return any(
+            _has_side_effects(leaf) and _mutation_target_is_live(leaf, live_bufs)
+            for leaf in all_ops(op.body)
+        )
     target = _mutation_target(op)
     return target is None or target in live_bufs
 
@@ -105,8 +122,11 @@ def _has_side_effects(op: Operation) -> bool:
     A mutation writes into a buffer it does not own, so it has side effects;
     whether that write can still be observed is ``_mutation_target_is_live``'s
     call.  FallbackKernel delegates to is_impure on the underlying op overload.
-    All other op types are pure.
+    A ``LoopNode`` has side effects when any op of its body has.  All other op
+    types are pure.
     """
+    if isinstance(op, LoopNode):
+        return op.has_side_effects()
     if _mutation_target(op) is not None:
         return True
     if isinstance(op, FallbackKernel):
@@ -138,7 +158,11 @@ def deadcode_elimination(graph: GraphLowering) -> None:
         dead.append(op)
 
     for op in dead:
-        rw = op.get_read_writes()
-        for dep in rw.writes:
-            graph.removed_buffers.add(dep.name)
+        # A dead LoopNode takes its whole body with it; record each leaf's own
+        # writes, as removing those leaves one by one would (the node's
+        # summary also names its mutation targets, which it does not own).
+        for leaf in all_ops([op]):
+            rw = leaf.get_read_writes()
+            for dep in rw.writes:
+                graph.removed_buffers.add(dep.name)
         operations.remove(op)
