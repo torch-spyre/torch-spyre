@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from functools import wraps
 
 import torch
@@ -173,6 +173,9 @@ def enable_spyre_context(example_inputs: list[InputType]):
         CustomPreSchedulingPasses,
     )
     from torch_spyre._inductor import timing_recorder
+    from torch_spyre._inductor.loop_scheduler import (
+        loop_scheduler_patches_for_compile,
+    )
     from torch_spyre._inductor.propagate_hints import recover_spyre_hints
 
     # *) Inductor config tweaks (saved/restored)
@@ -263,6 +266,15 @@ def enable_spyre_context(example_inputs: list[InputType]):
 
     SchedulerNode.has_side_effects = _spyre_scheduler_node_has_side_effects  # type: ignore[method-assign]
 
+    # A LoopNode reaching the scheduler becomes one LoopSchedulerNode
+    # (loop_scheduler.py).  On a torch release the patch does not support,
+    # entering does NOT raise: a compile with no loop must keep working on any
+    # release, so only a LoopNode handed to the scheduler is refused there.
+    # While passes.py expands every LoopNode before the scheduler, each patched
+    # method only ever takes its original path.
+    loop_scheduler_patches = ExitStack()
+    loop_scheduler_patches.enter_context(loop_scheduler_patches_for_compile())
+
     with (
         spyre_data_types(),
         _preserve_spyre_input_storage_offsets(),
@@ -282,6 +294,7 @@ def enable_spyre_context(example_inputs: list[InputType]):
             Loops.has_large_inner_fn = old_loop
             GraphLowering._update_scheduler = old_update_scheduler  # type: ignore[method-assign]
             SchedulerNode.has_side_effects = old_scheduler_node_has_side_effects  # type: ignore[method-assign]
+            loop_scheduler_patches.close()
 
 
 OBSERVER_HOOKS_KEY = "__spyre_hooks_meta"
