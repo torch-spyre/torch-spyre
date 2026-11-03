@@ -70,7 +70,6 @@ jobs:
             .github/actions
             tests/configs/upstream_tests
             tests/oot_framework/utils/filter_configs.py
-            tests/oot_framework/utils/test_layout.py
           sparse-checkout-cone-mode: false
 
       - name: Check which paths changed
