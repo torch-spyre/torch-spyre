@@ -4125,30 +4125,6 @@ def spyre_scatter_value(
     return torch.ops.aten.scatter.src(self, dim, index, src)
 
 
-@register_spyre_decompositions([torch.ops.aten.scatter.value_reduce])
-def spyre_scatter_value_reduce(
-    self: torch.Tensor,
-    dim: int,
-    index: torch.Tensor,
-    value: Union[int, float, bool],
-    *,
-    reduce: str,
-) -> torch.Tensor:
-    """`scatter.value_reduce` as `scatter.reduce` with the scalar materialized.
-
-    The reducing form of :func:`spyre_scatter_value`: ``value`` is built to
-    ``index``'s shape and forwarded to ``scatter.reduce`` with ``reduce``
-    unchanged, so the scalar and tensor spellings take the same path.
-
-    Unlike the two above, duplicate index entries are NOT equivalent here: the
-    reduction combines every writer to a slot, so a repeated index applies the
-    fill value more than once.
-    """
-    dim = dim % self.dim()
-    src = self.new_full(list(index.shape), value)
-    return torch.ops.aten.scatter.reduce(self, dim, index, src, reduce=reduce)
-
-
 def _grouped_mm_capacity(n: int, num_experts: int) -> int:
     """Static per-expert capacity: 2 * ceil_to_64(n / num_experts), clamped to [64, n].
 
