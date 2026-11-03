@@ -27,7 +27,7 @@ from torch._inductor.codecache import code_hash
 from torch._inductor.runtime.runtime_utils import cache_dir
 
 from torch_spyre._inductor.codegen.compute_ops import SymbolKind
-from torch_spyre._inductor.logging_utils import get_inductor_logger
+from torch_spyre._inductor.logging_utils import get_inductor_logger, warn_once
 
 
 logger = get_inductor_logger("kernel_cache")
@@ -259,6 +259,61 @@ def _strip_debug_handles(obj):
     return obj
 
 
+# Config values that compile_op_spec() reads (sencores,
+# disable_conv2d_spatial_split) or that select which parts compute_specs_hash()
+# hashes (bundle_symbolic_args). They change the key through the SDSC JSON, not
+# as fields of their own, so a stored key that skips that work must have them
+# in its fingerprint. Add a setting here when compile_op_spec() starts reading
+# one; the verify-mode shard (tests/inductor/test_kernel_key_verify.py) catches
+# a key that changed while its fingerprint did not.
+_SPEC_COMPILE_CONFIG = (
+    "bundle_symbolic_args",
+    "sencores",
+    "disable_conv2d_spatial_split",
+)
+
+
+def _key_context(
+    pool_size: int, backend_loop_unroll: bool, ktir_device_mlir: str
+) -> tuple[list[str], list[str]]:
+    """The inputs of the kernel-cache key other than the specs.
+
+    Returns ``(fields, versions)``: compute_specs_hash() appends ``fields`` to
+    the hashed content and passes ``versions`` to code_hash() as ``extra``.
+    kernel_key_fingerprint() hashes the same two lists, so an input added here
+    is part of both the key and the fingerprint of a stored key.
+    """
+    from torch_spyre._inductor import config as _spyre_config
+
+    fields = [
+        # Emitted as sdscbundle.device_mem_allocate <pool_size> bytes in
+        # bundle.mlir.
+        f"pool_size:{pool_size}",
+        # frontend_pool_allocation changes both the bundle signature (adds a
+        # pool base-address parameter as the first MLIR input) and the .run()
+        # argument ABI (tensor_id indices are offset by 1 when the pool param
+        # is present). A cached kernel compiled without it must never be
+        # reused when the flag is on, and vice-versa.
+        f"frontend_pool_allocation:{int(_spyre_config.frontend_pool_allocation)}",
+        f"loop_unroll:{int(backend_loop_unroll)}",
+        f"ktir_device_mlir:{ktir_device_mlir}",
+    ]
+    versions = [
+        torch.__version__,
+        _get_torch_spyre_version(),
+        _get_backend_compiler_version(),
+        # Bundles are compiled by dbo-opt, not dxp_standalone.
+        # _get_backend_compiler_version() reports the deeptools package
+        # version, which ships both binaries and so does not change when
+        # the backend does.
+        # Without this tag, entries produced by dxp_standalone stay
+        # indistinguishable -- _REQUIRED_ARTIFACTS are the same filenames --
+        # and would be served as hits, so dbo-opt would never run.
+        "backend=dbo-opt",
+    ]
+    return fields, versions
+
+
 def compute_specs_hash(
     specs: Sequence,
     kernel_name: str = "",
@@ -413,37 +468,10 @@ def compute_specs_hash(
 
     _collect(specs_list)
 
-    # Include the total pool allocation: it is emitted as
-    # sdscbundle.device_mem_allocate <pool_size> bytes in bundle.mlir.
-    content_parts.append(f"pool_size:{pool_size}".encode())
-
-    # Include frontend_pool_allocation: this flag changes both the bundle
-    # signature (adds a pool base-address parameter as the first MLIR input)
-    # and the .run() argument ABI (tensor_id indices are offset by 1 when the
-    # pool param is present).  A cached kernel compiled without it must never
-    # be reused when the flag is on, and vice-versa.
-    content_parts.append(
-        f"frontend_pool_allocation:{int(_spyre_config.frontend_pool_allocation)}".encode()
-    )
-    content_parts.append(f"loop_unroll:{int(backend_loop_unroll)}".encode())
-    content_parts.append(f"ktir_device_mlir:{ktir_device_mlir}".encode())
-
+    fields, versions = _key_context(pool_size, backend_loop_unroll, ktir_device_mlir)
+    content_parts.extend(field.encode() for field in fields)
     content = b"||".join(content_parts)
-    extra = "||".join(
-        [
-            torch.__version__,
-            _get_torch_spyre_version(),
-            _get_backend_compiler_version(),
-            # Bundles are compiled by dbo-opt, not dxp_standalone.
-            # _get_backend_compiler_version() reports the deeptools package
-            # version, which ships both binaries and so does not change when
-            # the backend does.
-            # Without this tag, entries produced by dxp_standalone stay
-            # indistinguishable -- _REQUIRED_ARTIFACTS are the same filenames --
-            # and would be served as hits, so dbo-opt would never run.
-            "backend=dbo-opt",
-        ]
-    )
+    extra = "||".join(versions)
 
     cache_key = code_hash(content, extra=extra)
     # Codegen precomputation (register=False) logs at DEBUG: sdsc() logs the
@@ -510,14 +538,29 @@ def _get_key_source_digest() -> str:
     changes when that code changes the SDSC JSON -- but the torch_spyre version
     string does not change with local edits. A precomputed key is therefore
     only trusted by a process running byte-identical sources.
+
+    It covers all of torch_spyre._inductor (passes, distributed/, scratchpad/,
+    ...), much more than the key path needs. That is the safe choice: any edit
+    under _inductor invalidates every stored key, so a process with local edits
+    computes its keys again (slower, never wrong).
     """
     import torch_spyre._inductor as _inductor_pkg
 
     root = os.path.dirname(os.path.abspath(_inductor_pkg.__file__))
-    paths = [os.path.abspath(__file__)]
+    return _digest_sources(root, [os.path.abspath(__file__)])
+
+
+def _digest_sources(root: str, extra_paths: Sequence[str]) -> str:
+    """SHA-256 over ``extra_paths`` and every ``.py`` file under ``root``.
+
+    Only regular files count: os.walk also lists symlinks and other entries
+    whose names end in ``.py``, such as editor lock files (``.#foo.py``).
+    """
+    paths = list(extra_paths)
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d != "__pycache__"]
         paths.extend(os.path.join(dirpath, f) for f in filenames if f.endswith(".py"))
+    paths = [p for p in paths if os.path.isfile(p)]
     digest = hashlib.sha256()
     for path in sorted(paths):
         digest.update(os.path.relpath(path, root).encode())
@@ -535,8 +578,8 @@ def _get_native_extension_digest() -> str:
     compute_specs_hash() depends on native code (DataFormats enum values,
     encode_constant in codegen/compute_ops.py, get_device_dtype in
     dtype_ops.py), which the version string does not track. Hashed by content
-    rather than size + st_mtime_ns: read once per process (~80 MB, estimated
-    ~0.1 s, not measured), and a byte-identical copy of _C.so keeps its keys
+    rather than size + st_mtime_ns: read once per process (0.06 s for the
+    86 MB _C.so we measured), and a byte-identical copy of _C.so keeps its keys
     valid.
     """
     import torch_spyre._C as _C
@@ -556,14 +599,11 @@ def kernel_key_fingerprint(
 ) -> str:
     """Fingerprint of everything compute_specs_hash() depends on besides specs.
 
-    That is: the ``extra`` versions (torch, torch_spyre, deeptools/flex,
-    backend tag), pool_size, backend_loop_unroll, ktir_device_mlir,
-    frontend_pool_allocation,
-    bundle_symbolic_args (selects which symbol offsets are hashed), the config
-    compile_op_spec reads (sencores, disable_conv2d_spatial_split) and the
-    source digest above, the digest of the native extension and the sympy
-    version (the specs are sympy expressions). Raises RuntimeError like
-    compute_specs_hash() when a version cannot be determined.
+    That is: the fields and versions of _key_context(), the same lists the key
+    is built from; the config values in _SPEC_COMPILE_CONFIG; the source digest
+    above; the digest of the native extension; and the sympy version (the
+    specs are sympy expressions). Raises like compute_specs_hash() when a
+    version cannot be determined.
     """
     import sympy
 
@@ -573,27 +613,56 @@ def kernel_key_fingerprint(
         backend_loop_unroll = _spyre_config.backend_loop_unroll
     if ktir_device_mlir is None:
         ktir_device_mlir = _spyre_config.ktir_device_mlir
-    fields = "||".join(
-        [
-            torch.__version__,
-            _get_torch_spyre_version(),
-            _get_backend_compiler_version(),
-            "backend=dbo-opt",
-            f"pool_size:{int(pool_size)}",
-            f"loop_unroll:{int(bool(backend_loop_unroll))}",
-            f"ktir_device_mlir:{ktir_device_mlir}",
-            "frontend_pool_allocation:"
-            f"{int(bool(_spyre_config.frontend_pool_allocation))}",
-            f"bundle_symbolic_args:{int(bool(_spyre_config.bundle_symbolic_args))}",
-            f"sencores:{int(_spyre_config.sencores)}",
-            "disable_conv2d_spatial_split:"
-            f"{int(bool(_spyre_config.disable_conv2d_spatial_split))}",
-            f"src:{_get_key_source_digest()}",
-            f"native:{_get_native_extension_digest()}",
-            f"sympy:{sympy.__version__}",
-        ]
+    fields, versions = _key_context(
+        int(pool_size), bool(backend_loop_unroll), ktir_device_mlir
     )
-    return hashlib.sha256(fields.encode()).hexdigest()[:32]
+    parts = [
+        *versions,
+        *fields,
+        *(f"{name}:{getattr(_spyre_config, name)}" for name in _SPEC_COMPILE_CONFIG),
+        f"src:{_get_key_source_digest()}",
+        f"native:{_get_native_extension_digest()}",
+        f"sympy:{sympy.__version__}",
+    ]
+    return hashlib.sha256("||".join(parts).encode()).hexdigest()[:32]
+
+
+# Set by the first fingerprint that cannot be computed in this process.
+_fingerprint_failure: Optional[str] = None
+
+
+def _current_fingerprint(
+    pool_size: int,
+    *,
+    backend_loop_unroll: bool | None,
+    ktir_device_mlir: str | None,
+) -> Optional[str]:
+    """kernel_key_fingerprint(), or None when it cannot be computed.
+
+    Never raises: an input that cannot be read (an unreadable source file, a
+    version that cannot be determined) must send the caller down the
+    computed-key path, not fail it. The first failure is logged as a warning
+    and remembered, so the process does not walk the sources again for every
+    kernel.
+    """
+    global _fingerprint_failure
+    if _fingerprint_failure is not None:
+        return None
+    try:
+        return kernel_key_fingerprint(
+            pool_size,
+            backend_loop_unroll=backend_loop_unroll,
+            ktir_device_mlir=ktir_device_mlir,
+        )
+    except Exception as e:  # noqa: BLE001 - any failure means "do not trust"
+        _fingerprint_failure = repr(e)
+        logger.warning(
+            "Precomputed kernel keys are not used in this process: the key "
+            "fingerprint could not be computed (%r). Kernel-cache keys are "
+            "computed instead.",
+            e,
+        )
+        return None
 
 
 def precompute_kernel_key(
@@ -618,12 +687,19 @@ def precompute_kernel_key(
 
     if not _spyre_config.spyre_kernel_cache:
         return None
+    backend_loop_unroll = _spyre_config.backend_loop_unroll
+    ktir_device_mlir = _spyre_config.ktir_device_mlir
+    fingerprint = _current_fingerprint(
+        pool_size,
+        backend_loop_unroll=backend_loop_unroll,
+        ktir_device_mlir=ktir_device_mlir,
+    )
+    if fingerprint is None:
+        return None
     try:
         specs = eval(src_code, spec_eval_namespace())  # noqa: S307
         if find_unimplemented(list(specs)) is not None:
             return None  # sdsc() returns before hashing
-        backend_loop_unroll = _spyre_config.backend_loop_unroll
-        ktir_device_mlir = _spyre_config.ktir_device_mlir
         with V.set_graph_handler(NullHandler()):  # type: ignore[arg-type]
             cache_key = compute_specs_hash(
                 specs,
@@ -633,12 +709,18 @@ def precompute_kernel_key(
                 ktir_device_mlir=ktir_device_mlir,
                 register=False,
             )
-        fingerprint = kernel_key_fingerprint(
-            pool_size,
-            backend_loop_unroll=backend_loop_unroll,
-            ktir_device_mlir=ktir_device_mlir,
-        )
     except Exception as e:  # noqa: BLE001 - the runtime falls back to hashing
+        # The first failure is a warning: if every kernel fails the same way
+        # (for example a name missing from SPYRE_WRAPPER_IMPORTS), the switch
+        # silently stops saving time.
+        warn_once(
+            logger,
+            "precompute_kernel_key",
+            "No precomputed kernel key for %s: %r. Its key is computed at load "
+            "time instead; later failures are logged at DEBUG.",
+            kernel_name,
+            e,
+        )
         logger.debug("No precomputed kernel key for %s: %r", kernel_name, e)
         return None
     return f"{cache_key}{_PRECOMPUTED_KEY_SEP}{fingerprint}"
@@ -653,21 +735,21 @@ def resolve_precomputed_key(
 ) -> Optional[str]:
     """Runtime side: the stored key if its fingerprint matches this process.
 
-    Returns None when there is no stored key, it is malformed, or any
-    fingerprint input differs (the caller then runs compute_specs_hash()).
+    Returns None when there is no stored key, it is malformed, any
+    fingerprint input differs, or the fingerprint cannot be computed (the
+    caller then runs compute_specs_hash()). Never raises.
     """
     if not precomputed_key:
         return None
     cache_key, sep, fingerprint = precomputed_key.rpartition(_PRECOMPUTED_KEY_SEP)
     if not sep or not cache_key or not fingerprint:
         return None
-    try:
-        current = kernel_key_fingerprint(
-            pool_size,
-            backend_loop_unroll=backend_loop_unroll,
-            ktir_device_mlir=ktir_device_mlir,
-        )
-    except RuntimeError:
+    current = _current_fingerprint(
+        pool_size,
+        backend_loop_unroll=backend_loop_unroll,
+        ktir_device_mlir=ktir_device_mlir,
+    )
+    if current is None:
         return None
     if fingerprint != current:
         logger.debug(

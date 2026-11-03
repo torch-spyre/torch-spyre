@@ -542,10 +542,8 @@ def _precomputed_kernel_key_from_env() -> str:
 # Every async_compile.sdsc(...) call carries precomputed_key="<key>|<fp>"
 # (None when it could not be computed): <key> is compute_specs_hash() of the
 # call's specs and pool_size, <fp> a fingerprint of everything else that key
-# depends on (torch / torch_spyre / deeptools / flex versions, the
-# torch_spyre._inductor sources, pool_size, backend_loop_unroll,
-# bundle_symbolic_args, frontend_pool_allocation, sencores,
-# disable_conv2d_spatial_split). With the kernel cache on and this set to "1",
+# depends on (see kernel_key_fingerprint in torch_spyre.execution.kernel_cache
+# for the list). With the kernel cache on and this set to "1",
 # sdsc() uses <key> when <fp> matches the running process instead of
 # regenerating the SDSC JSON of every OpSpec just to rebuild the key; any
 # mismatch falls back to compute_specs_hash(). "verify" computes both and

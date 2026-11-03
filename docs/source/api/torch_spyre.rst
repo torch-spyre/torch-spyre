@@ -868,7 +868,9 @@ Environment Variables
        ``1``, ``true`` or ``yes`` to enable). Needs ``SPYRE_KERNEL_CACHE=1``.
        The stored key is used only when its fingerprint (versions, config,
        torch-spyre sources and ``_C`` file) matches the running process;
-       otherwise the key is computed as usual. ``verify`` computes both and
+       otherwise the key is computed as usual. Any edit under
+       ``torch_spyre/_inductor`` changes the fingerprint, so a build with
+       local edits computes its keys again. ``verify`` computes both and
        raises ``PrecomputedKernelKeyMismatch`` if they differ. Any other value
        warns and leaves it off. Generated wrappers now pass a
        ``precomputed_key`` keyword to ``async_compile.sdsc()``, so code that

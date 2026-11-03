@@ -22,7 +22,7 @@ import inspect
 import unittest
 
 import sympy
-from sympy.core.parameters import evaluate
+from sympy.core.parameters import distribute, evaluate
 
 from torch_spyre._inductor import wrapper
 from torch_spyre._inductor.op_spec import _cached_sympify, wrapper_sympify
@@ -113,6 +113,15 @@ class TestWrapperSympify(unittest.TestCase):
         self.assertEqual(sympy.srepr(unevaluated), sympy.srepr(ref))
         self.assertEqual(evaluated, sympy.sympify(text))
         self.assertNotEqual(sympy.srepr(evaluated), sympy.srepr(unevaluated))
+
+    def test_distribute_flag_is_honoured(self):
+        text = "2*(x + y)"
+        wrapper_sympify(text)  # cache the default parse first
+        with distribute(False):
+            got = wrapper_sympify(text)
+            ref = sympy.sympify(text)
+        self.assertEqual(sympy.srepr(got), sympy.srepr(ref))
+        self.assertNotEqual(sympy.srepr(got), sympy.srepr(wrapper_sympify(text)))
 
     def test_generated_fragment_equals_sympy(self):
         results = []

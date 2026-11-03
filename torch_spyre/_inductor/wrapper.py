@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import textwrap
 from typing import Optional
 
@@ -42,13 +43,21 @@ SPYRE_WRAPPER_IMPORTS = """
             """
 
 
-def spec_eval_namespace() -> dict:
-    """Return a namespace in which OpSpec source text emitted by
-    ``SpyreKernel.codegen_kernel`` evaluates to the same objects as in the
-    generated wrapper module (same names from SPYRE_WRAPPER_IMPORTS)."""
+@functools.lru_cache(maxsize=1)
+def _wrapper_import_namespace() -> dict:
     namespace: dict = {}
     exec(textwrap.dedent(SPYRE_WRAPPER_IMPORTS), namespace)
     return namespace
+
+
+def spec_eval_namespace() -> dict:
+    """Return a namespace in which OpSpec source text emitted by
+    ``SpyreKernel.codegen_kernel`` evaluates to the same objects as in the
+    generated wrapper module (same names from SPYRE_WRAPPER_IMPORTS).
+
+    The imports run once per process; each call returns a fresh copy, so a
+    caller may add names to it."""
+    return dict(_wrapper_import_namespace())
 
 
 class _SpyreWrapperCodegenMixin(PythonWrapperCodegen):

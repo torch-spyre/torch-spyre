@@ -524,6 +524,12 @@ class SpyreAsyncCompile(AsyncCompile):
         if trusted_key is not None and mode == "1":
             register_precomputed_key(trusted_key, kernel_name, specs)
             return trusted_key
+        if trusted_key is None and mode == "verify" and precomputed_key:
+            logger.debug(
+                "Precomputed kernel key not verified  kernel=%s: its fingerprint "
+                "does not match this process",
+                kernel_name,
+            )
 
         cache_key = None
         try:
@@ -541,12 +547,14 @@ class SpyreAsyncCompile(AsyncCompile):
                 kernel_name,
                 e,
             )
-        if trusted_key is not None and trusted_key != cache_key:
-            raise PrecomputedKernelKeyMismatch(
-                f"precomputed kernel key {trusted_key} for {kernel_name} differs "
-                f"from compute_specs_hash() = {cache_key}"
-            )
-        if trusted_key is not None:
+        # A key that could not be computed (warned above) leaves nothing to
+        # compare with; that is not a mismatch.
+        if trusted_key is not None and cache_key is not None:
+            if trusted_key != cache_key:
+                raise PrecomputedKernelKeyMismatch(
+                    f"precomputed kernel key {trusted_key} for {kernel_name} "
+                    f"differs from compute_specs_hash() = {cache_key}"
+                )
             logger.info(
                 "Precomputed kernel key verified  kernel=%s  key=%s",
                 kernel_name,

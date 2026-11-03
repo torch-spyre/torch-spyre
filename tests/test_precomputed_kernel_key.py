@@ -37,6 +37,7 @@ from torch._inductor.utils import IndentedBuffer
 from torch._inductor.virtualized import NullHandler, V
 
 import torch_spyre._inductor.config as spyre_config
+from torch_spyre._inductor import logging_utils
 from torch_spyre._inductor import scheduler as scheduler_mod
 from torch_spyre._inductor.spyre_kernel import _codegen_op_spec_list
 from torch_spyre._inductor.wrapper import spec_eval_namespace
@@ -130,6 +131,9 @@ def _env(**config):
         stack.enter_context(
             patch.object(kernel_cache, "_registry", _KernelHashRegistry())
         )
+        # Per-process state: a remembered fingerprint failure and warn_once.
+        stack.enter_context(patch.object(kernel_cache, "_fingerprint_failure", None))
+        stack.enter_context(patch.object(logging_utils, "_warned_once", set()))
         settings = {"spyre_kernel_cache": True}
         settings.update(config)
         stack.enter_context(spyre_config.patch(settings))
@@ -277,6 +281,50 @@ class TestFingerprint(unittest.TestCase):
                 changed["sympy"] = kernel_key_fingerprint(0)
         for field, value in changed.items():
             self.assertNotEqual(value, base, field)
+
+    def test_key_and_fingerprint_share_inputs(self):
+        # A non-spec input added to the key must reach the fingerprint too.
+        specs = _spec_sets()["single"]
+        real = kernel_cache._key_context
+
+        def with_probe(*args):
+            fields, versions = real(*args)
+            return [*fields, "probe:1"], versions
+
+        with _env():
+            key = compute_specs_hash(specs, kernel_name="k")
+            fingerprint = kernel_key_fingerprint(0)
+            with patch.object(kernel_cache, "_key_context", side_effect=with_probe):
+                self.assertNotEqual(compute_specs_hash(specs, kernel_name="k"), key)
+                self.assertNotEqual(kernel_key_fingerprint(0), fingerprint)
+
+    def test_unreadable_source_falls_back_without_raising(self):
+        with _env():
+            stored = f"k|{kernel_key_fingerprint(0)}"
+            src = _src(_spec_sets()["single"])
+            with (
+                patch.object(
+                    kernel_cache,
+                    "_get_key_source_digest",
+                    side_effect=PermissionError("unreadable .py"),
+                ) as digest,
+                self.assertLogs(kernel_cache.logger, "WARNING") as logs,
+            ):
+                self.assertIsNone(resolve_precomputed_key(stored, 0))
+                self.assertIsNone(resolve_precomputed_key(stored, 0))
+                self.assertIsNone(precompute_kernel_key(src, "k", 0))
+            # Tried once and remembered: one warning, no walk per kernel.
+            self.assertEqual(digest.call_count, 1)
+            self.assertEqual(len(logs.records), 1)
+
+    def test_source_digest_skips_non_regular_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "a.py"), "w") as f:
+                f.write("x = 1\n")
+            clean = kernel_cache._digest_sources(tmp, [])
+            # An editor lock file: a dangling symlink named like a source file.
+            os.symlink(os.path.join(tmp, "gone.py"), os.path.join(tmp, ".#a.py"))
+            self.assertEqual(kernel_cache._digest_sources(tmp, []), clean)
 
     def test_source_digest_is_stable(self):
         digest = kernel_cache._get_key_source_digest()
@@ -471,6 +519,23 @@ class TestSdscPrecomputedKey(unittest.TestCase):
     def test_verify_mismatch_raises(self):
         with self.assertRaises(PrecomputedKernelKeyMismatch):
             self._sdsc("verify", self._stored(), cached_dir="/c", computed="other")
+
+    def test_verify_key_not_computable_is_not_a_mismatch(self):
+        with (
+            _env(precomputed_kernel_key="verify"),
+            patch.object(
+                async_compile_mod, "resolve_precomputed_key", return_value="pkey"
+            ),
+            patch.object(
+                async_compile_mod,
+                "compute_specs_hash",
+                side_effect=RuntimeError("no versions"),
+            ),
+        ):
+            got = async_compile_mod.SpyreAsyncCompile._kernel_cache_key(
+                MagicMock(), "k", [], 0, False, "", "pkey|fp"
+            )
+        self.assertIsNone(got)
 
     def test_verify_without_stored_key_hashes(self):
         _, mocks, _ = self._sdsc("verify", None, cached_dir="/c")

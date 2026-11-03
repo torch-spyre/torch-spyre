@@ -51,8 +51,9 @@ class IndirectAccess(Function):
 # Bounded so that a long-lived process compiling many shapes cannot grow it
 # without limit; a Granite 3.3 8B start parses about 105 distinct strings.
 @functools.lru_cache(maxsize=4096)
-def _cached_sympify(text: str, evaluate: bool) -> Any:
-    # ``evaluate`` only keys the cache: sympify reads the same global flag.
+def _cached_sympify(text: str, flags: tuple[bool, bool, bool]) -> Any:
+    # ``flags`` only keys the cache: sympify reads the same global parameters
+    # (evaluate, distribute, exp_is_pow), and each one changes its result.
     return sympify(text)
 
 
@@ -66,7 +67,14 @@ def wrapper_sympify(a: Any, *args: Any, **kwargs: Any) -> Any:
     goes straight to ``sympy.sympify``.
     """
     if not args and not kwargs and type(a) is str:
-        return _cached_sympify(a, global_parameters.evaluate)
+        return _cached_sympify(
+            a,
+            (
+                global_parameters.evaluate,
+                global_parameters.distribute,
+                global_parameters.exp_is_pow,
+            ),
+        )
     return sympify(a, *args, **kwargs)
 
 
