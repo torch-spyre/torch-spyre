@@ -211,6 +211,18 @@ def infer_bool_device_dtype(args: list[PropArg]) -> DataFormats:
     return device_dtype
 
 
+def arg_dtype_for_layout(arg: PropArg) -> torch.dtype:
+    """Logical dtype whose stick size matches ``arg``'s physical format.
+
+    A torch.bool operand takes it from its producer's format (fp32-backed bools
+    hold 32 elements per stick, not the 64 that ``torch.bool`` implies).
+    Reads only ``arg.layouts[0]``: both callers handle single-layout operands only.
+    """
+    if arg.layout.dtype != torch.bool or not arg.layouts:
+        return arg.layout.dtype
+    return bool_layout_dtype(arg.layouts[0].device_dtype, "operand")
+
+
 def _compute_dim_order(stick_dim, size, coords):
     """Order dimensions with stick_dim last, placing size-one dimensions to the right to avoid tiling."""
     dim_order = [d for d in range(len(size)) if d != stick_dim and coords[d] != 0]
@@ -1961,7 +1973,7 @@ def _multi_arg_pointwise_layouts(
                 arg_coors != out_coords
                 or arg.layout.size != output.size
                 or arg.dep.index != output_dep.index
-                or not same_device_size(arg.layout.dtype, out_dtype_for_layout)
+                or not same_device_size(arg_dtype_for_layout(arg), out_dtype_for_layout)
             ):
                 can_use_same_layout = False
                 break
@@ -2059,14 +2071,14 @@ def _multi_arg_pointwise_layouts(
             # whose index is exactly the same expression as the output's qualify
             # as same-frame candidates for in-place layout reuse.
             or arg.dep.index != output_dep.index
-            or not same_device_size(arg.layout.dtype, output.dtype)
+            or not same_device_size(arg_dtype_for_layout(arg), out_dtype_for_layout)
         ):
             continue
         src_stl = next(iter(arg.layouts))
         candidate = SpyreTensorLayout(
             src_stl.device_size,
             src_stl.stride_map,
-            get_device_dtype(output.dtype),
+            out_device_dtype,
         )
         if (
             math.prod([s for s in candidate.device_size if s > 0])
@@ -3489,13 +3501,18 @@ def propagate_spyre_tensor_layouts(
                 logger.warning(f"unhandled collective type {type(op)}")
         elif isinstance(op, FallbackKernel):
             # FallbackKernel.create in PyTorch produces three cases:
-            #   Case 1 (single tensor)  -> MultiOutputLayout + 1 MultiOutput
+            #   Case 1 (single tensor)  -> FixedLayout on the FallbackKernel itself
+            #                              (PT >= 2.14, pytorch#184279; older
+            #                              versions used MultiOutputLayout + 1
+            #                              MultiOutput)
             #   Case 2 (tuple of N)     -> MultiOutputLayout + N MultiOutputs
             #   Case 3 (void/in-place)  -> NoneLayout       + 0 MultiOutputs
-            # The FallbackKernel itself never carries a real tensor layout
-            # (MultiOutputLayout / NoneLayout both raise from get_layout()).
-            # The trailing MultiOutputs are handled in their own branch below.
-            pass
+            # Case 1 is laid out like a MultiOutput; in cases 2 and 3 the
+            # FallbackKernel carries no real tensor layout and the trailing
+            # MultiOutputs are handled in their own branch below.
+            if isinstance(op.layout, FixedLayout):
+                op.layouts = [generic_layout(op)]
+                op.restick_cost_fn = AnyInNode.from_args()
         elif isinstance(op, MultiOutput):
             op.layouts = [generic_layout(op)]
             op.restick_cost_fn = AnyInNode.from_args()
