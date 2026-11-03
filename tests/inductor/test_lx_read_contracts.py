@@ -79,6 +79,18 @@ def test_facts_rebase_only_the_final_argument():
         geometry.origin = (0, 0, 0)
 
 
+@pytest.mark.parametrize("consumer_allocation", [(), (("hbm_pool", 0),)])
+def test_external_consumer_allocation_is_not_rewritten(consumer_allocation):
+    _, contract, argument, space = _local_read()
+    contract = replace(contract, consumer_allocation=consumer_allocation)
+    result = normalize_local_read(
+        contract, "parent", argument, space, allow_extended=True
+    )
+    assert result.allocation == {"lx": 4096}
+    assert contract.consumer_allocation == consumer_allocation
+    assert argument.allocation == {"lx": 0}
+
+
 @pytest.mark.parametrize(
     "case",
     [

@@ -16,7 +16,7 @@ test_suite_config:
       tests:
         - names:
             - LxPlanning.*::test_(addmm|mm|bmm|einsum|matmul|linear).*_lx_planning_(pointwise|reduction)
-            - LxPlanning.*::test_fp8_scaled_mm_128x128x128_1.0_1.0_0.0_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_fp8_scaled_mm_128x128x128_1p0_1p0_0p0_lx_planning_(pointwise|reduction)
           mode: mandatory_success
           tags:
             - ops__inductor-matmul

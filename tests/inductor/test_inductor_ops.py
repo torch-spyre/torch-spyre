@@ -2546,6 +2546,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     0.0,
                 ),
             },
+            # A backend regression makes these cases fail their correctness check.
+            # Non-strict, so an unexpected pass does not fail the run. Remove the
+            # entries when #5950 is fixed.
+            "expect_fail_unstable": {
+                "2d_dim1": "keep_by_index result fails the correctness check, #5950",
+                "4d_dim2": "keep_by_index result fails the correctness check, #5950",
+            },
         },
         ("test_reduce_keepdim0", "test_reduce_keepdim0_cpu"): {
             "ops_dict": CORE_REDUCTION_OPS_DICT,
@@ -5051,6 +5058,48 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     torch.randint(-128, 127, (2, 8, 32, 64), dtype=torch.int8),
                     torch.randint(-128, 127, (2, 8, 32, 64), dtype=torch.int8),
                 ),
+            },
+        },
+        (
+            # Integer comparisons give fp32-backed bools (32 elems/stick); combining
+            # two of them must not assume the 64-elem stick of an fp16 bool.
+            "test_logical_int_mask",
+            "test_logical_int_mask_compiled",
+        ): {
+            "ops_dict": {
+                "and": lambda a, b: torch.logical_and(a >= 0, a < b),
+                "or": lambda a, b: torch.logical_or(a < 0, a >= b),
+                "where_and": lambda a, b: torch.where(
+                    torch.logical_and(a >= 0, a < b), a, torch.zeros_like(a)
+                ),
+            },
+            "param_sets": {
+                f"{str(dtype).split('.')[-1]}_{n}": (
+                    torch.randint(-50, 1050, (n,), dtype=dtype),
+                    torch.full((n,), 1000, dtype=dtype),
+                )
+                for dtype in (torch.int64, torch.int32)
+                for n in (1, 7, 64, 512)
+            },
+        },
+        (
+            # An fp16-backed and an fp32-backed bool share no stick size.
+            "test_logical_mixed_bool_mask",
+            "test_logical_int_mask_compiled",
+        ): {
+            "ops_dict": {
+                "and": lambda x, a: torch.logical_and(x >= 0, a < 1000),
+            },
+            "param_sets": {
+                "fp16_int32_64": (
+                    cached_randn((64,), dtype=torch.float16),
+                    torch.randint(-50, 1050, (64,), dtype=torch.int32),
+                ),
+            },
+            # TODO: a missing feature. When mixed bool formats are converted to one
+            # format this stops raising, and the case has to become a positive one.
+            "expect_raise": {
+                "and_fp16_int32_64": "torch.bool result from operands with device",
             },
         },
         (
@@ -8860,15 +8909,32 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
         },
         ("test_repeat", "test_repeat_cpu"): {
+            "ops_dict": {
+                "default": lambda x, repeats, shape: x.repeat(*repeats),
+                "out": lambda x, repeats, shape: torch.ops.aten.repeat.out(
+                    x, list(repeats), out=x.new_empty(shape)
+                ),
+            },
             "param_sets": {
-                "1d_1": (cached_randn((64), dtype=torch.float16), 1),
-                "1d_1_int32": (torch.randint(0, 100, (64,), dtype=torch.int32), 1),
-                "1d_1_size1": (cached_randn((1), dtype=torch.float16), 1),
-                "1d_1_size1_int32": (torch.randint(0, 100, (1,), dtype=torch.int32), 1),
-                "2d_3x2": (cached_randn((2, 64), dtype=torch.float16), 3, 2),
-                "2d_4x6": (cached_randn((2, 64), dtype=torch.float16), 4, 6),
-                "2d_1x1": (cached_randn((2, 64), dtype=torch.float16), 1, 1),
-                "3d_8x6x4": (cached_randn((2, 3, 64), dtype=torch.float16), 8, 6, 4),
+                "1d_1": (cached_randn((64), dtype=torch.float16), (1,)),
+                "1d_1_int32": (torch.randint(0, 100, (64,), dtype=torch.int32), (1,)),
+                "1d_1_size1": (cached_randn((1), dtype=torch.float16), (1,)),
+                "1d_1_size1_int32": (
+                    torch.randint(0, 100, (1,), dtype=torch.int32),
+                    (1,),
+                ),
+                "1d_fp32": (cached_randn((64), dtype=torch.float32), (4,)),
+                "2d_3x2": (cached_randn((2, 64), dtype=torch.float16), (3, 2)),
+                "2d_4x6": (cached_randn((2, 64), dtype=torch.float16), (4, 6)),
+                "2d_1x1": (cached_randn((2, 64), dtype=torch.float16), (1, 1)),
+                "2d_fp32": (cached_randn((2, 64), dtype=torch.float32), (3, 2)),
+                "2d_int64": (
+                    torch.randint(0, 100, (2, 64), dtype=torch.int64),
+                    (3, 2),
+                ),
+                # A single position id repeated along the stick (fms positions).
+                "2d_1x1_int64": (torch.tensor([[382]], dtype=torch.int64), (1, 64)),
+                "3d_8x6x4": (cached_randn((2, 3, 64), dtype=torch.float16), (8, 6, 4)),
             },
         },
         # TODO: torch.prod(x) (reduction over all tensor elements) is not yet
@@ -9917,6 +9983,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_fallback_unary_op_cpu(self, op, x):
         self.compare_with_cpu(op, x)
+
+    def test_logical_int_mask_compiled(self, op, a, b):
+        # Exercise compiled layouts without requiring eager logical kernels.
+        # LX wrappers leave bool/int outputs unchanged, but the reduction wrapper
+        # relaxes atol. Bypass them to keep these checks exact under LX too.
+        utils_inductor.compare_with_cpu(op, a, b, atol=0, rtol=0, run_eager=False)
 
     def test_binary_op(self, op, a, b):
         if op == torch.div:
@@ -11125,33 +11197,23 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ):
             self.compare_with_cpu(lambda x: torch.cummin(x, dim=0), x, run_eager=False)
 
-    @pytest.mark.xfail(
-        reason=(
-            "Spyre compiled backend does not support torch.quantile yet "
-            "(stable error signature: InductorError: KeyError: "
-            "'No FX node for buf...', the failure of #3287)"
-        ),
-        raises=InductorError,
-        strict=True,
-    )
-    def test_quantile_q050_dim0_known_xfail(self):
+    @expects_raise
+    def test_quantile_q050_dim0_rejected(self):
+        # TODO(#1228): 2.14 constant folding materializes quantile's internal
+        # float64 conversion of q on device. When Double is supported, replace
+        # this rejection assertion with a numerical check.
         x = cached_randn((67, 256), dtype=torch.float32)
-        self.compare_with_cpu(
-            lambda x: torch.quantile(x, 0.5, dim=0, keepdim=False),
-            x,
-            run_eager=False,
-        )
+        with pytest.raises(RuntimeError, match="does not support dtype Double"):
+            self.compare_with_cpu(
+                lambda x: torch.quantile(x, 0.5, dim=0, keepdim=False),
+                x,
+                run_eager=False,
+            )
 
-    @pytest.mark.xfail(
-        reason=(
-            "Spyre compiled backend does not support torch.nanquantile yet "
-            "(stable error signature: InductorError: KeyError: "
-            "'No FX node for buf...', the failure of #3287)"
-        ),
-        raises=InductorError,
-        strict=True,
-    )
-    def test_nanquantile_q050_dim0_known_xfail(self):
+    @expects_raise
+    def test_nanquantile_q050_dim0_rejected(self):
+        # TODO(#1228): nanquantile has the same internal float64 conversion of
+        # q as quantile. Make this a numerical check once Double is supported.
         x = torch.tensor(
             [
                 [float("nan"), 1.0, -2.0, 3.0],
@@ -11161,11 +11223,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             ],
             dtype=torch.float32,
         )
-        self.compare_with_cpu(
-            lambda x: torch.nanquantile(x, 0.5, dim=0, keepdim=False),
-            x,
-            run_eager=False,
-        )
+        with pytest.raises(RuntimeError, match="does not support dtype Double"):
+            self.compare_with_cpu(
+                lambda x: torch.nanquantile(x, 0.5, dim=0, keepdim=False),
+                x,
+                run_eager=False,
+            )
 
     @expects_raise
     def test_median_dim1_rejected(self):
@@ -13877,11 +13940,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=True,
         )
 
-    def test_repeat_cpu(self, x, *repeat_args):
-        def fn(a):
-            return a.repeat(*repeat_args)
-
-        self.compare_with_cpu(fn, x, run_eager=False)
+    def test_repeat_cpu(self, op, x, repeats):
+        shape = x.repeat(*repeats).shape
+        self.compare_with_cpu(lambda a: op(a, repeats, shape), x)
 
     def test_unfold_cpu(self, dimension, size, step, x):
         """Test unfold operation (view only, no contiguous).

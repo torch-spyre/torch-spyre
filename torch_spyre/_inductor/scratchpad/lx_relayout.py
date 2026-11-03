@@ -66,6 +66,7 @@ from ..pass_utils import (
     _per_core_view_on_buf,
     commit_tensor_work_division,
     completed_reduction_split_on_buf,
+    indirect_info_from_op,
     iteration_space_from_op,
     iteration_space_with_splits,
     make_iteration_space_ownership,
@@ -784,12 +785,38 @@ def _persistent_scatter_consumer(
         or getattr(consumer, "loop_info", None) is not None
     ):
         return False
+    return _persistent_scatter_storage_safe(graph, producer, consumer, source_name)
+
+
+def _persistent_scatter_storage_safe(graph, producer, consumer, source_name):
+    """Keep cache target, source storage, order and dependencies unchanged."""
     try:
         if producer.get_mutation_names() or producer.get_inputs_that_alias_output():
             return False
     except NotImplementedError:
         return False
-    target = consumer.layout.target
+    scheduled_target = False
+    if isinstance(consumer.layout, MutationLayoutSHOULDREMOVE):
+        target = consumer.layout.target
+    else:
+        # The scheduler replaces mutation layouts with fixed layouts. Use the
+        # same target map as SpyreKernel.store: a buffer name alone does not
+        # prove that a fresh scatter output is the external cache.
+        scheduler = getattr(graph, "scheduler", None)
+        target_name = getattr(scheduler, "mutation_real_name", {}).get(
+            consumer.get_name()
+        )
+        if (
+            not isinstance(consumer.layout, FixedTiledLayout)
+            or not isinstance(consumer.data, Scatter)
+            or target_name is None
+            or target_name == consumer.get_name()
+        ):
+            return False
+        target = graph.try_get_buffer(target_name)
+        scheduled_target = True
+    # After scheduling, the target can keep TensorBox or StorageBox wrappers.
+    # Unwrap them as before scheduling. Do not unwrap a ReinterpretView.
     while isinstance(target, MutableBox):
         target = target.data
     if not isinstance(target, InputBuffer):
@@ -821,7 +848,10 @@ def _persistent_scatter_consumer(
         # layout binds that name to the external target.
         or writes[0].name not in (consumer.get_name(), target_name)
         or not writes[0].is_indirect()
-        or set(consumer.get_mutation_names()) != {target_name}
+        or (
+            set(consumer.get_mutation_names()) != {target_name}
+            and not (scheduled_target and not consumer.get_mutation_names())
+        )
         or any(dep.name == target_name for dep in deps.reads)
     ):
         return False
@@ -1163,6 +1193,85 @@ def _local_lx_pointwise_read(graph, producer, consumer):
     return parent[0]
 
 
+def _local_lx_scatter_geometry(graph, producer, consumer):
+    """A direct same-core rectangle read from a complete immutable snapshot.
+
+    The output is the existing external cache, not fresh compact storage.
+    Only the input frame may change; the cache write and index dependencies
+    stay intact. Candidate and final-emission checks still prove equal owners.
+    """
+    if (
+        not isinstance(producer, ComputedBuffer)
+        or not isinstance(producer.data, Pointwise)
+        or not isinstance(producer.layout, FixedTiledLayout)
+        or not isinstance(consumer, ComputedBuffer)
+        or not isinstance(consumer.data, Scatter)
+        or consumer.data.scatter_mode is not None
+        or not isinstance(
+            consumer.layout, (MutationLayoutSHOULDREMOVE, FixedTiledLayout)
+        )
+        or producer.get_name() in graph.get_output_names()
+        or producer.get_device() != consumer.get_device()
+        or producer.get_dtype() != consumer.get_dtype()
+        or producer.layout.offset != 0
+        or any(
+            getattr(op, "loop_info", None) is not None
+            or getattr(op, "_input_layout_overrides", None)
+            for op in (producer, consumer)
+        )
+        or not storage_has_single_writer(graph, producer)
+        or not _persistent_scatter_storage_safe(
+            graph, producer, consumer, producer.get_name()
+        )
+    ):
+        return None
+    rw = op_read_writes(consumer)
+    reads = [dep for dep in rw.reads if dep.name == producer.get_name()]
+    write = _single_write(producer, producer.get_name())
+    index_names, _, _ = indirect_info_from_op(consumer)
+    if (
+        write is None
+        or len(reads) != 1
+        or not isinstance(reads[0], MemoryDep)
+        or reads[0].is_indirect()
+        or not is_partial_lx_read(producer, reads[0])
+        or not index_names
+        or any(
+            dep.name != producer.get_name() and dep.name not in index_names
+            for dep in rw.reads
+        )
+    ):
+        return None
+    source = producer.layout.device_layout
+    if (
+        source.element_arrangement != ElementArrangement.STANDARD
+        or source.elems_per_stick() * producer.get_dtype().itemsize != 128
+    ):
+        return None
+    try:
+        shape = tuple(map(int, source.device_size))
+        written = try_device_coordinates(source, write, None)
+        coordinates = try_device_coordinates(source, reads[0], None)
+        if (
+            written is None
+            or coordinates is None
+            or _dense_read_rectangle(shape, written, write.ranges)
+            != ((0,) * len(shape), shape)
+        ):
+            return None
+        rectangle = _dense_read_rectangle(shape, coordinates, reads[0].ranges)
+        origin, extent = rectangle
+        if (
+            origin[-1] != 0
+            or extent[-1] != source.elems_per_stick()
+            or math.prod(extent) != reads[0].get_numel()
+        ):
+            return None
+        return rectangle
+    except (*_EVALUATION_ERRORS, NotImplementedError):
+        return None
+
+
 def local_lx_subrange_geometry(graph, producer, consumer):
     """A fresh compact pointwise output reading one dense parent subrange.
 
@@ -1172,6 +1281,8 @@ def local_lx_subrange_geometry(graph, producer, consumer):
     """
     if not config.lx_planner_relayout or config.ktir_emitter:
         return None
+    if isinstance(consumer, ComputedBuffer) and isinstance(consumer.data, Scatter):
+        return _local_lx_scatter_geometry(graph, producer, consumer)
     if (
         not isinstance(producer, ComputedBuffer)
         or not isinstance(consumer, ComputedBuffer)
@@ -1276,7 +1387,7 @@ def local_lx_subrange_certificate(
 
 
 def local_lx_subrange_source(graph, name: str, uses: list[int]) -> bool:
-    """Every partial reader must already have a fresh compact materializer."""
+    """Every partial reader needs a certified same-core access."""
     if not config.lx_extended_ownership:
         return False
     producer = graph.get_buffer(name)
@@ -1357,7 +1468,7 @@ def local_lx_emission_contract(graph, name, consumer) -> LocalReadEmission | Non
         element_arrangement=ElementArrangement.STANDARD,
         source_allocation=tuple(layout.allocation.items()),
         consumer_name=consumer.get_name(),
-        consumer_allocation=tuple(consumer.layout.allocation.items()),
+        consumer_allocation=tuple(getattr(consumer.layout, "allocation", {}).items()),
     )
 
 
