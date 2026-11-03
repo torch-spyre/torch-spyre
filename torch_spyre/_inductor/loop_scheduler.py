@@ -65,7 +65,12 @@ from .loop_facts import counted_loop_path
 from .loop_node import LoopNode, expand
 from .scheduler import CountedLoopSchedulerNode
 
-SUPPORTED_RELEASES: tuple[tuple[int, int], ...] = ((2, 13), (2, 14))
+# One torch release at a time: the one ``pyproject.toml`` pins (``torch~=2.14.0``).
+# A torch upgrade moves this with the pin; the upgrade-pytorch-version skill has a step
+# that re-verifies ``PATCHED_SURFACE`` and updates this tuple.  Keep it a literal, not a
+# value parsed from package metadata: a patch whose failure mode is "refuse to compile a
+# loop" should not depend on metadata lookups that can fail at import.
+SUPPORTED_RELEASES: tuple[tuple[int, int], ...] = ((2, 14),)
 
 # Set to False only by the equivalence test, to compare the flow-through path
 # with the path it replaced: ``CustomPreSchedulingPasses`` then expands every
@@ -119,8 +124,8 @@ PATCHED_SURFACE: tuple[str, ...] = (
     "name_to_buf[...].defining_op_name()), create_foreach_nodes, the second "
     "topological_sort_schedule, the _pre_fusion_custom_pass, fuse_nodes "
     "(Spyre's can_fuse_* are False), merge_loops, compute_last_usage "
-    "(FusedSchedulerNode.set_last_usage) and _codegen -- run on 2.13 by "
-    "test_loop_scheduler_equivalence.py",
+    "(FusedSchedulerNode.set_last_usage) and _codegen -- run on the supported "
+    "release by test_loop_scheduler_equivalence.py",
 )
 
 
@@ -134,9 +139,10 @@ def loop_scheduler_supported() -> bool:
 
 
 def refuse_release() -> Unsupported:
+    supported = ", ".join(f"{major}.{minor}" for major, minor in SUPPORTED_RELEASES)
     return Unsupported(
         f"counted loops on torch {torch.__version__}: the LoopNode scheduler "
-        f"patch supports only torch releases {SUPPORTED_RELEASES}"
+        f"patch supports only torch {supported}.x"
     )
 
 
