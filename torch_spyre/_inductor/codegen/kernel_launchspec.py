@@ -30,33 +30,14 @@ from typing import Any, Optional
 LAUNCH_SPEC_FILE = "launch_spec.json"
 LAUNCH_SPEC_VERSION = 1
 
-# this is not defined anywhere rather just used by name which has a chance
-# of diverging from launchspec implementation.
+# this is not defined anywhere its just used by name which has a chance
+# of diverging
 # TODO: define a common SPYRECODE_DIR somewhere which compiler uses
 SPYRECODE_DIR = "spyreCodeDir"
 
 
-# ---------------------------------------------------------------------------
-# What the producer builds. These exist so the compile side is typed rather
-# than assembling dicts by hand; the wire format is still plain JSON, and the
-# reader stays dict-based (see the module docstring).
-#
-# They reach the compile step through generated wrapper source via repr(), the
-# same way OpSpec and TensorArg do, so ``wrapper.py`` imports them into that
-# namespace alongside those. Keep both reprs eval-able: no computed defaults,
-# no types that do not round-trip through repr().
-# ---------------------------------------------------------------------------
-
-
 @dataclasses.dataclass
 class LaunchArgLayout:
-    """The device arrangement one argument's tensor must have.
-
-    Part of the execution contract, not a diagnostic: an op can be compiled
-    against a particular packing along the sticks, and a tensor in the default
-    arrangement then has the right shape and dtype while being laid out wrongly.
-    """
-
     device_size: list[int]
     stride_map: list[int]
     device_dtype: str
@@ -64,7 +45,6 @@ class LaunchArgLayout:
 
     @classmethod
     def from_dict(cls, raw: dict) -> "LaunchArgLayout":
-        """Parse a spec's ``layout`` block, ignoring keys this build predates."""
         known = {f.name for f in dataclasses.fields(cls)}
         return cls(**{k: v for k, v in raw.items() if k in known})
 
@@ -115,7 +95,7 @@ class LaunchArg:
 
 
 def _enum_name(value) -> str:
-    """``DataFormats.SEN169_FP16`` -> ``"SEN169_FP16"``."""
+    # Peforms operation like DataFormats.SEN169_FP16 -> "SEN169_FP16
     return getattr(value, "name", None) or str(value).rsplit(".", 1)[-1]
 
 
@@ -127,9 +107,6 @@ class LaunchSpec:
     it passes none -- not the kernel's own pool extent, since a bundle can
     allocate scratch internally and so have a pool with no parameter for one.
     ``for_kernel`` takes the resolved value.
-
-    Unlike ``LaunchArg`` this never crosses the generated-wrapper boundary, so
-    nothing here has to stay repr-eval-able.
     """
 
     kernel_name: str
@@ -252,8 +229,6 @@ def resolve_shape(shape: Sequence, bindings: Optional[dict] = None) -> list[int]
 def launch_args_to_dicts(args: Sequence[LaunchArg]) -> list[dict]:
     """``LaunchArg`` records as the plain dicts the spec is written from.
 
-    ``json`` cannot serialize a dataclass, and the reader does not import our
-    types, so the conversion happens here -- the same boundary
     ``save_symbol_kinds`` crosses with ``dataclasses.asdict``.
     """
     return [dataclasses.asdict(a) for a in args]
@@ -290,11 +265,6 @@ def load_launch_spec(code_dir: str) -> Optional[dict]:
     ``code_dir`` may be either the folder holding ``spyreCodeDir/`` -- what a
     runner is given -- or that directory itself, since the folder is meant to
     stand alone. Both are tried.
-
-    Absent is not an error: folders compiled before this existed have no spec,
-    and callers fall back to their old behaviour. A spec that is present but
-    unreadable, or newer than this build, *is* an error -- ignoring it would put
-    the caller back to guessing, which is what the spec exists to stop.
     """
     for path in (spec_path(code_dir), os.path.join(code_dir, LAUNCH_SPEC_FILE)):
         if os.path.isfile(path):
@@ -317,131 +287,3 @@ def load_launch_spec(code_dir: str) -> Optional[dict]:
             "this folder."
         )
     return spec
-
-
-def spyre_layout(layout: Optional[LaunchArgLayout]):
-    """Build a ``SpyreTensorLayout`` from a spec's ``layout`` block.
-
-    Returns None when the block cannot be turned into a layout (an older spec
-    missing a field, or an enum spelling this build does not know), so a caller
-    can fall back to the default arrangement rather than fail.
-    """
-    if layout is None:
-        return None
-    from torch_spyre._C import DataFormats, ElementArrangement, SpyreTensorLayout
-
-    try:
-        return SpyreTensorLayout(
-            [int(d) for d in layout.device_size],
-            [int(x) for x in layout.stride_map],
-            getattr(DataFormats, layout.device_dtype),
-            getattr(ElementArrangement, layout.element_arrangement or "STANDARD"),
-        )
-    except (AttributeError, TypeError, ValueError):
-        # An enum spelling this build does not know, or a field it predates:
-        # fall back to the default arrangement rather than fail the launch.
-        return None
-
-
-def _layout_mismatch(arg: LaunchArg, tensor) -> Optional[str]:
-    """How ``tensor``'s device layout differs from what ``arg`` records.
-
-    None when they agree, or when the comparison cannot be made. A tensor whose
-    layout differs is packed differently along the sticks: the launch will
-    succeed and return wrong data, which is exactly what the spec exists to
-    prevent, so this is reported like any other mismatch.
-    """
-    want = spyre_layout(arg.layout)
-    if want is None:
-        return None
-    try:
-        from torch_spyre._C import get_spyre_tensor_layout
-
-        got = get_spyre_tensor_layout(tensor)
-    except Exception:  # noqa: BLE001 - a CPU tensor has no device layout to read
-        return None
-    if list(got.device_size) == list(want.device_size) and list(got.stride_map) == list(
-        want.stride_map
-    ):
-        return None
-
-    def describe_layout(layout) -> str:
-        return (
-            f"device_size={list(layout.device_size)} "
-            f"stride_map={list(layout.stride_map)}"
-        )
-
-    return (
-        f"expected layout {describe_layout(want)}, "
-        f"got {describe_layout(got)} -- the tensor is packed differently "
-        "along the sticks, so the launch would return wrong data"
-    )
-
-
-def check_launch_spec(
-    spec, tensors: Sequence, bindings: Optional[dict] = None
-) -> list[str]:
-    """Return the ways ``tensors`` disagree with ``spec``; empty means well-formed.
-
-    ``spec`` may be a ``LaunchSpec`` or the dict read off disk. Reports every
-    problem rather than the first, so one run tells the caller everything to
-    fix. Well-formed is not correct: this checks count, shape, dtype and layout,
-    and says nothing about the values in the tensors.
-    """
-    if not isinstance(spec, LaunchSpec):
-        spec = LaunchSpec.from_dict(spec)
-
-    problems: list[str] = []
-    offset = spec.arg_offset
-    expected_n = len(spec.args) + offset
-
-    if len(tensors) != expected_n:
-        note = ""
-        if offset:
-            note = (
-                f" ({len(spec.args)} kernel args + 1 caller-supplied pool "
-                f"tensor of {spec.pool_size} bytes)"
-            )
-        # Positions no longer line up, so per-arg checks would be noise.
-        return [f"expected {expected_n} tensors{note}, got {len(tensors)}"]
-
-    if offset:
-        pool = tensors[0]
-        got_bytes = pool.numel() * pool.element_size()
-        if got_bytes != spec.pool_size:
-            problems.append(
-                f"pool tensor (position 0): expected {spec.pool_size} bytes, "
-                f"got {got_bytes}"
-            )
-
-    for arg in spec.args:
-        tensor = tensors[arg.arg_index + offset]
-        where = f"arg {arg.arg_index} ({arg.role})"
-
-        try:
-            want_shape = arg.resolved_shape(bindings)
-        except UnboundSymbol as e:
-            problems.append(
-                f"{where}: dimension '{e}' is symbolic and unbound "
-                f"(known symbols: {sorted(spec.symbols) or 'none recorded'})"
-            )
-            continue
-
-        got_shape = list(tensor.shape)
-        if got_shape != want_shape:
-            hint = ""
-            if sorted(got_shape) == sorted(want_shape):
-                hint = " -- same extents in a different order (transposed?)"
-            problems.append(
-                f"{where}: expected shape {want_shape}, got {got_shape}{hint}"
-            )
-
-        got_dtype = str(tensor.dtype).removeprefix("torch.")
-        if got_dtype != arg.dtype:
-            problems.append(f"{where}: expected dtype {arg.dtype}, got {got_dtype}")
-
-        mismatch = _layout_mismatch(arg, tensor)
-        if mismatch:
-            problems.append(f"{where}: {mismatch}")
-
-    return problems

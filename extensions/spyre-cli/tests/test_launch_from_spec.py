@@ -29,7 +29,8 @@ from unittest import mock
 
 import pytest
 
-from spyre_cli.core import _tensors_from_spec, launch_from_cli
+from spyre_cli.core import launch_from_cli
+from spyre_cli.launch_spec import _tensors_from_spec
 
 torch = pytest.importorskip("torch")
 

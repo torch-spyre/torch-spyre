@@ -36,7 +36,6 @@ from torch_spyre._inductor.codegen.kernel_launchspec import (
     SPYRECODE_DIR,
     LaunchArg,
     LaunchArgLayout,
-    check_launch_spec,
     load_launch_spec,
 )
 
@@ -124,14 +123,6 @@ class TestLaunchSpecEmission(unittest.TestCase):
             self.assertEqual(arg["shape"], [10, 512])
             self.assertEqual(arg["dtype"], "float16")
             self.assertNotEqual(arg["layout"]["device_size"], [10, 512])
-
-        # The round trip that matters: the spec accepts the tensors the kernel
-        # actually ran on, and rejects a transposed one.
-        self.assertEqual(check_launch_spec(spec, tensors), [])
-        bad = [torch.empty((512, 10), dtype=torch.float16)] + tensors[1:]
-        problems = check_launch_spec(spec, bad)
-        self.assertEqual(len(problems), 1)
-        self.assertIn("transposed", problems[0])
 
 
 class TestLaunchSpecPoolSize(unittest.TestCase):
