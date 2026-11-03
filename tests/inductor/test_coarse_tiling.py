@@ -55,6 +55,7 @@ from torch._inductor.graph import GraphLowering
 from torch._inductor.utils import IndentedBuffer, sympy_index_symbol
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
+from torch.utils._sympy.functions import ModularIndexing
 
 from torch_spyre._C import DataFormats
 from torch_spyre._inductor import config
@@ -79,6 +80,7 @@ from torch_spyre._inductor.wsr.coarse_tile import (
     _apply_plan,
     _compute_fill_loop_info_planned,
     _consumer_own_dim_symbol,
+    _dims_read_along,
     _divide_ranges,
     _index_var_prefix,
     _loop_var_to_reduction_ranges_pos,
@@ -1172,6 +1174,51 @@ def _make_consumer_with_ranges(ranges):
     return _make_op(_make_pointwise(ranges))
 
 
+def _tiled_consumer(ranges, loop_count, loop_tiled_dims):
+    """A fake consumer running a coarse-tile nest of its own: ``ranges`` are
+    its live, divided ranges, ``loop_count`` trips per level over
+    ``loop_tiled_dims``."""
+    consumer = _make_consumer_with_ranges(ranges)
+    consumer.dim_hints = ()
+    consumer.loop_info = CoarseTileInfo(
+        loop_group_id=(1,),
+        loop_count=[Integer(count) for count in loop_count],
+        loop_tiled_dims=loop_tiled_dims,
+        loop_tiled_reduction_dims=[[] for _ in loop_count],
+    )
+    return consumer
+
+
+class TestDimsReadAlong(unittest.TestCase):
+    """Which dims of a buffer a read's index moves along, charged by stride."""
+
+    STRIDES = (Integer(524288), Integer(2048), Integer(1))
+
+    def test_an_in_step_read_moves_along_every_dim(self):
+        d0, d1, d2 = (sympy_index_symbol(f"d{i}") for i in range(3))
+
+        dims = _dims_read_along(524288 * d0 + 2048 * d1 + d2, self.STRIDES)
+
+        self.assertEqual(dims, {0, 1, 2})
+
+    def test_a_broadcast_read_has_no_term_for_the_dim(self):
+        d1, d2 = sympy_index_symbol("d1"), sympy_index_symbol("d2")
+
+        self.assertEqual(_dims_read_along(2048 * d1 + d2, self.STRIDES), {1, 2})
+
+    def test_offset_stepped_and_modular_reads_count_as_in_step(self):
+        d0, d1, d2 = (sympy_index_symbol(f"d{i}") for i in range(3))
+
+        offset_and_stepped = 524288 * (d0 + 32) + 2 * 2048 * d1 + d2
+        modular = 2048 * ModularIndexing(d1, 1, 128) + d2
+
+        self.assertEqual(_dims_read_along(offset_and_stepped, self.STRIDES), {0, 1, 2})
+        self.assertEqual(_dims_read_along(modular, self.STRIDES), {1, 2})
+
+    def test_a_constant_index_moves_along_nothing(self):
+        self.assertEqual(_dims_read_along(Integer(5), self.STRIDES), frozenset())
+
+
 class TestSqueezedRetileDims(unittest.TestCase):
     """Unit tests for which raw dims need a re-minted symbol on redirect.
 
@@ -1308,6 +1355,24 @@ class TestConsumerOwnDimSymbol(unittest.TestCase):
 
         self.assertEqual(sym, sympy_index_symbol("q0"))
 
+    def test_a_tiled_consumer_is_compared_before_its_division(self):
+        # The consumer runs a nest of its own, two trips over dim 0, so its
+        # live ranges are a tile of the producer's shape: the shape test
+        # takes the ranges before division.
+        info = _RetiledBufferInfo(
+            old_stride=(Integer(256), Integer(1)),
+            new_stride=(Integer(256), Integer(1)),
+            old_size=(Integer(1), Integer(256)),
+            new_size=(Integer(4), Integer(256)),
+        )
+        consumer = _tiled_consumer([2, 256], loop_count=[2], loop_tiled_dims=[[0]])
+
+        self.assertEqual(_squeezed_retile_dims(info, consumer), [0])
+
+        narrower = _tiled_consumer([2, 128], loop_count=[2], loop_tiled_dims=[[0]])
+        with self.assertRaisesRegex(Unsupported, "shape-changing"):
+            _squeezed_retile_dims(info, narrower)
+
 
 class TestRetileLoadIndexWithConsumer(unittest.TestCase):
     """End-to-end unit tests for _retile_load_index's consumer-aware path.
@@ -1353,6 +1418,58 @@ class TestRetileLoadIndexWithConsumer(unittest.TestCase):
         result = _retile_load_index("buf", q1, info, consumer)
 
         self.assertEqual(result, q1)
+
+    def test_squeezed_dim_restored_for_a_consumer_in_another_nest(self):
+        # The producer's tile took dim 0 whole, so its strides are the full
+        # buffer's and the consumer, traced against the tile, lost the term
+        # all the same. Its read moved along dim 0 before the division, so
+        # the term comes back, loop nest or not.
+        info = _RetiledBufferInfo(
+            old_stride=(Integer(256), Integer(1)),
+            new_stride=(Integer(256), Integer(1)),
+            old_size=(Integer(1), Integer(256)),
+            new_size=(Integer(4), Integer(256)),
+        )
+        q1 = sympy.Symbol("q1")
+        consumer = _tiled_consumer([2, 256], loop_count=[2], loop_tiled_dims=[[0]])
+
+        result = _retile_load_index(
+            "buf", q1, info, consumer, restore_dims=frozenset({0})
+        )
+
+        self.assertEqual(simplify(result - (256 * sympy_index_symbol("q0") + q1)), 0)
+
+    def test_a_read_that_did_not_move_along_the_dim_keeps_its_index(self):
+        # A broadcast read never had the term, so none is added.
+        info = _RetiledBufferInfo(
+            old_stride=(Integer(256), Integer(1)),
+            new_stride=(Integer(256), Integer(1)),
+            old_size=(Integer(1), Integer(256)),
+            new_size=(Integer(4), Integer(256)),
+        )
+        q1 = sympy.Symbol("q1")
+        consumer = _tiled_consumer([2, 256], loop_count=[2], loop_tiled_dims=[[0]])
+
+        result = _retile_load_index("buf", q1, info, consumer, restore_dims=frozenset())
+
+        self.assertEqual(result, q1)
+
+    def test_a_permuted_read_of_a_unit_row_producer_is_refused(self):
+        # A 4x4 producer read as a[d1, d0]: the tile cost the read its 4*d1
+        # term, and the positional symbol for dim 0 is d0, which already
+        # addresses dim 1. Raw positions cannot restore that, so it is refused
+        # rather than read wrong.
+        info = _RetiledBufferInfo(
+            old_stride=(Integer(4), Integer(1)),
+            new_stride=(Integer(4), Integer(1)),
+            old_size=(Integer(1), Integer(4)),
+            new_size=(Integer(4), Integer(4)),
+        )
+        d0 = sympy_index_symbol("d0")
+        consumer = _make_consumer_with_ranges([4, 4])
+
+        with self.assertRaisesRegex(Unsupported, "already addresses"):
+            _retile_load_index("buf", d0, info, consumer, restore_dims=frozenset({0}))
 
     def test_unit_consumer_dim_adds_no_term_and_does_not_collide(self):
         # Same squeeze shape as above, but the consumer's own dim 0 is ALSO

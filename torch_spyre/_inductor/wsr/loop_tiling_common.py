@@ -22,6 +22,7 @@ from here so they do not depend on the coarse-tiling pass itself.
 from __future__ import annotations
 
 
+from collections.abc import Sequence
 from typing import NamedTuple
 
 import sympy
@@ -1171,6 +1172,34 @@ def _rescale_index(
     return new_index
 
 
+def _dims_read_along(index: Expr, strides: Sequence[Expr]) -> frozenset[int]:
+    """The dims of a buffer laid out with ``strides`` that ``index`` moves along.
+
+    Each term carrying a loop symbol is charged to the widest stride dividing
+    its coefficient, so a stepped or offset read counts like an in-step one,
+    and a broadcast read, which has no term for the dim, does not.
+    """
+    widest_first = sorted(
+        (
+            d
+            for d, s in enumerate(strides)
+            if s != 0 and getattr(sympy.sympify(s), "is_number", False)
+        ),
+        key=lambda d: strides[d],
+        reverse=True,
+    )
+    found: set[int] = set()
+    for term in sympy.Add.make_args(sympy.expand(index)):
+        if not term.free_symbols:
+            continue
+        coefficient = term.as_coeff_Mul()[0]
+        for d in widest_first:
+            if sympy.Mod(coefficient, strides[d]) == 0:
+                found.add(d)
+                break
+    return frozenset(found)
+
+
 def _squeezed_retile_dims(
     info: _RetiledBufferInfo, consumer: ComputedBuffer
 ) -> list[int]:
@@ -1219,17 +1248,24 @@ def _squeezed_retile_dims(
 
     # A unit consumer axis selects coordinate zero and needs no symbol.  For
     # every axis that does need a symbol, require the complete output shape to
-    # match the producer shape before treating raw positions as identities.
+    # match the producer shape before treating raw positions as identities. A
+    # consumer tiled in a nest of its own iterates a tile of its ranges, so its
+    # shape is the one before division.
     result = [d for d in grown_dims if int(consumer_ranges[d]) != 1]
+    full_ranges = (
+        _undivided_ranges(consumer)[0]
+        if getattr(consumer, "loop_info", None) is not None
+        else consumer_ranges
+    )
     if result and any(
         sympy.simplify(actual - expected) != 0
-        for actual, expected in zip(consumer_ranges, info.new_size)
+        for actual, expected in zip(full_ranges, info.new_size)
     ):
         raise Unsupported(
             "coarse_tile: cannot restore dimensions squeezed from a retiled "
             "producer through a shape-changing consumer view; "
             f"producer old_size={info.old_size}, new_size={info.new_size}, "
-            f"consumer ranges={consumer_ranges}, grown_dims={grown_dims}"
+            f"consumer ranges={full_ranges}, grown_dims={grown_dims}"
         )
     return result
 
@@ -1483,6 +1519,7 @@ def _retile_load_index(
     info: _RetiledBufferInfo,
     consumer: "ComputedBuffer | None" = None,
     preserve_target_stride_atoms: bool = False,
+    restore_dims: frozenset[int] | None = None,
 ) -> Expr:
     """Rewrite a load index using compute_tile_index.  Raises Unsupported if
     the index cannot be decomposed (non-affine, or stride not in info.old_stride).
@@ -1513,6 +1550,14 @@ def _retile_load_index(
     full->tile direction (_RetileLoadIndexHandler) never needs this --
     shrinking a buffer's own layout for a group-internal consumer doesn't
     lose dims from its index.
+
+    ``restore_dims`` names the dims of the old buffer the consumer's reads
+    moved along before the producer was divided (``_dims_read_along``). With
+    it the term is added back whether or not the consumer has a loop nest: a
+    consumer in another loop group is traced against the producer's
+    tile-local layout as well, and a dim the tile consumed whole leaves its
+    index just like a squeezed one. Only the dims named are restored, so a
+    broadcast read keeps its missing term.
 
     The two handlers run in opposite directions:
     - _RetileLoadIndexHandler: full→tile (old_stride are the full strides,
@@ -1616,10 +1661,12 @@ def _retile_load_index(
     # at full scale.
     if (
         consumer is not None
-        and not hasattr(consumer, "loop_info")
+        and (restore_dims is not None or not hasattr(consumer, "loop_info"))
         and not dense_full_view
     ):
         for d in _squeezed_retile_dims(info, consumer):
+            if restore_dims is not None and d not in restore_dims:
+                continue
             # A consumer read by multiple _patch_consumers redirects (e.g.
             # buf24 reading both a _divide_ranges-mutated buffer and a
             # reduction accumulator) has its inner_fn wrapped more than
@@ -1640,10 +1687,21 @@ def _retile_load_index(
             already_present = any(
                 new_index.coeff(s) == info.new_stride[d] for s in new_index.free_symbols
             )
-            if not already_present:
-                prefix = _index_var_prefix(new_index.free_symbols)
-                sym = _consumer_own_dim_symbol(consumer, d, prefix)
-                new_index += sym * info.new_stride[d]
+            if already_present:
+                continue
+            prefix = _index_var_prefix(new_index.free_symbols)
+            sym = _consumer_own_dim_symbol(consumer, d, prefix)
+            if sym in new_index.free_symbols:
+                # The positional symbol already addresses another dim of the
+                # buffer: a permuted read of the same shape, which raw
+                # positions cannot restore.
+                raise Unsupported(
+                    f"coarse_tile: cannot restore dim {d} of {buf_name}, which "
+                    f"its producer's tile consumed whole, for a consumer whose "
+                    f"own symbol {sym} already addresses another dim of it "
+                    f"({index})"
+                )
+            new_index += sym * info.new_stride[d]
 
     logger.debug(
         "coarse_tile: retiled load index for %s: %s -> %s "
