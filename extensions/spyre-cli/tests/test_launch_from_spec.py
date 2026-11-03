@@ -30,7 +30,7 @@ from unittest import mock
 import pytest
 
 from spyre_cli.core import launch_from_cli
-from spyre_cli.launch_spec import _tensors_from_spec
+from spyre_cli.launch_spec import default_tensors, tensors_from_spec
 
 torch = pytest.importorskip("torch")
 
@@ -85,7 +85,7 @@ class _FakeTensor:
 
 @pytest.fixture
 def made():
-    """Capture every tensor ``_tensors_from_spec`` allocates.
+    """Capture every tensor ``tensors_from_spec`` allocates.
 
     It reaches for ``torch.empty`` inside the function, so patching the module
     attribute is enough -- no import-order games. ``_alloc`` also asks torch for
@@ -124,20 +124,26 @@ def test_builds_the_tensors_the_spec_describes(made):
     raw["args"] = list(reversed(raw["args"]))
     from torch_spyre._inductor.codegen.kernel_launchspec import LaunchSpec
 
-    tensors = _tensors_from_spec(LaunchSpec.from_dict(raw), {})
+    spec = LaunchSpec.from_dict(raw)
+    tensors = tensors_from_spec(spec, {})
 
     assert len(tensors) == 3
     assert [t.shape for t in tensors] == [(10, 512)] * 3
     assert all(t.dtype is torch.float16 for t in tensors)
-    # Inputs arrive filled, the output untouched.
+    # Allocation does not touch the values: that is the caller's business.
+    assert [t.filled for t in tensors] == [None, None, None]
+
+    # The smoke-test fill is a separate, explicit step, and it leaves the
+    # output alone.
+    default_tensors(spec, tensors)
     assert [t.filled for t in tensors] == [1.0, 1.0, None]
 
 
 def test_pool_tensor_is_prepended_only_when_the_caller_supplies_one(made):
     """pool_size is the caller's tensor, so 0 means prepend nothing."""
-    assert len(_tensors_from_spec(_spec(pool_size=0), {})) == 3
+    assert len(tensors_from_spec(_spec(pool_size=0), {})) == 3
 
-    tensors = _tensors_from_spec(_spec(pool_size=32768), {})
+    tensors = tensors_from_spec(_spec(pool_size=32768), {})
     assert len(tensors) == 4, "3 kernel args + 1 pool"
     assert tensors[0].shape == (32768,)
     assert tensors[0].dtype is torch.uint8
@@ -149,11 +155,11 @@ def test_symbolic_dim_needs_a_binding(made):
     for arg in symbolic.args:
         arg.shape = ["s0", 512]
 
-    tensors = _tensors_from_spec(symbolic, {"s0": 128})
+    tensors = tensors_from_spec(symbolic, {"s0": 128})
     assert [t.shape for t in tensors] == [(128, 512)] * 3
 
     with pytest.raises(ValueError, match="symbolic"):
-        _tensors_from_spec(symbolic, {})
+        tensors_from_spec(symbolic, {})
 
 
 # --------------------------------------------------------------------------
