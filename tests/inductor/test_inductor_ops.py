@@ -1497,9 +1497,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     torch.full((1, 1, 4, 4, 4), float("inf"), dtype=torch.float32),
                 ),
             },
-            # "expect_fail": {
-            #     "5d_nan": "Issue #4700",
-            # },
         },
         (
             "test_pointwise_binary_op",
@@ -4301,9 +4298,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     FP16_EPS,
                 ),
             },
-            # "expect_fail": {
-            #     "clamp_5d_nan": "Issue #1833",
-            # },
         },
         (
             "test_pointwise_clamp_preserves_unspecified_bound",
