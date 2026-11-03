@@ -129,16 +129,17 @@ void JobPlanStepCompute::construct(LaunchContext& ctx,
   }
 
   std::unique_ptr<flex::ComputeParams, decltype(&flex::destroyComputeParams)>
-      params(flex::createComputeParams(&program_address_,
-                                       std::move(tensor_allocs), name_,
-                                       bootstrap_offset_, {}, dynamic_address),
+      params(flex::createComputeParams(
+                 &program_address_, std::move(tensor_allocs), name_,
+                 bootstrap_offset_, {}, /*op_name=*/"", dynamic_address),
              flex::destroyComputeParams);
   params->program_corrections = std::move(ctx.program_corrections);
   params->pipeline_barrier = pipeline_barrier_;
   if (ctx.dynamic_alloc) {
     // Keeps the allocation alive until flex runs the completion callback for
     // this op.
-    params->callback = [alloc = ctx.dynamic_alloc](void*) {};
+    params->callback = [alloc = ctx.dynamic_alloc](
+                           void*, const flex::FlexCallbackMetadata*) {};
   }
   stream.launchCompute(params.get());
 }
