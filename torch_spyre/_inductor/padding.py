@@ -1816,6 +1816,7 @@ _ASSUMED_PADDING: dict[type, Set] = {
 
 def track_padding_value(graph: GraphLowering) -> None:
     operations = graph.operations
+    tracer = DomainRangeTracer()
 
     resolved_mutations: dict[str, dict[str, bool]] = {}
     # Collect mutation buffers
@@ -1824,14 +1825,15 @@ def track_padding_value(graph: GraphLowering) -> None:
             op.layout, MutationLayoutSHOULDREMOVE
         ):
             target = op.layout.target
-            while isinstance(target, ReinterpretView):
+            while isinstance(target, (MutableBox, ReinterpretView)):
                 target = target.data
             target_name = target.maybe_get_name()
             if target_name is not None:
                 resolved_mutations.setdefault(target_name, {})
                 resolved_mutations[target_name][op.name] = False
+                if isinstance(target, InputBuffer):
+                    tracer.buffer_range[target_name] = _ASSUMED_PADDING[InputBuffer]
 
-    tracer = DomainRangeTracer()
     with V.set_ops_handler(SetDtypeTracer(tracer)):
         for op in list(operations):
             tracer.current_op = op
