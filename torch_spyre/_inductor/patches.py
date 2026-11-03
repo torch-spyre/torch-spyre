@@ -158,11 +158,13 @@ def _resolve_scan_shapes_by_expression():
     That fires exactly when the body is fully static and only the trip count is
     derived from a dynamic dim, which is the shape a symbolic loop bound has.
     The proxy for the whole expression is already in the dict as the scan
-    length, so matching the expression before upstream's symbol walk covers a
-    scan over the leading dim, the form for_each_tile produces. A size that
-    contains the bare base symbol, such as the tile extent ``s//(s//64)`` of a
-    scan over a non-leading dim, still goes to upstream and raises: the base
-    symbol is never bound, which is the root cause the upstream issue tracks.
+    length, so matching the expression before upstream's symbol walk covers
+    every for_each_tile loop: it moves the tiled dim to 0, trims to whole tiles
+    and scans along dim 0, whichever operand dim it tiles. A size that contains
+    the bare base symbol, such as the extent ``s//(s//64)`` of a ``scan`` called
+    directly along dim 1 on an untrimmed unflatten, still goes to upstream and
+    raises: the base symbol is never bound, the root cause the upstream issue
+    tracks.
 
     An upstream gap, not a Spyre one, tracked as RESOLVE_SHAPE_ISSUE. Remove it
     once that is fixed. Everything else takes the original path, one element at
