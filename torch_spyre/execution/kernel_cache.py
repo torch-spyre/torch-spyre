@@ -265,6 +265,7 @@ def compute_specs_hash(
     pool_size: int = 0,
     *,
     backend_loop_unroll: bool | None = None,
+    ktir_device_mlir: str | None = None,
     register: bool = True,
 ) -> str:
     """Compute a cache key from OpSpec objects without any disk I/O.
@@ -285,6 +286,8 @@ def compute_specs_hash(
                      their pool size get different cache keys.
         backend_loop_unroll: Resolved setting passed to the backend compiler.
                              Defaults to the active Spyre config.
+        ktir_device_mlir: Resolved device override passed to the backend compiler.
+                          Defaults to the active Spyre config.
         register:    Record the key in the process-global registry (codegen
                      precomputation passes False: no kernel is loaded there).
     """
@@ -294,6 +297,8 @@ def compute_specs_hash(
 
     if backend_loop_unroll is None:
         backend_loop_unroll = _spyre_config.backend_loop_unroll
+    if ktir_device_mlir is None:
+        ktir_device_mlir = _spyre_config.ktir_device_mlir
     use_symbols = _spyre_config.bundle_symbolic_args
 
     specs_list = list(specs)
@@ -421,6 +426,7 @@ def compute_specs_hash(
         f"frontend_pool_allocation:{int(_spyre_config.frontend_pool_allocation)}".encode()
     )
     content_parts.append(f"loop_unroll:{int(backend_loop_unroll)}".encode())
+    content_parts.append(f"ktir_device_mlir:{ktir_device_mlir}".encode())
 
     content = b"||".join(content_parts)
     extra = "||".join(
@@ -543,12 +549,16 @@ def _get_native_extension_digest() -> str:
 
 
 def kernel_key_fingerprint(
-    pool_size: int = 0, *, backend_loop_unroll: bool | None = None
+    pool_size: int = 0,
+    *,
+    backend_loop_unroll: bool | None = None,
+    ktir_device_mlir: str | None = None,
 ) -> str:
     """Fingerprint of everything compute_specs_hash() depends on besides specs.
 
     That is: the ``extra`` versions (torch, torch_spyre, deeptools/flex,
-    backend tag), pool_size, backend_loop_unroll, frontend_pool_allocation,
+    backend tag), pool_size, backend_loop_unroll, ktir_device_mlir,
+    frontend_pool_allocation,
     bundle_symbolic_args (selects which symbol offsets are hashed), the config
     compile_op_spec reads (sencores, disable_conv2d_spatial_split) and the
     source digest above, the digest of the native extension and the sympy
@@ -561,6 +571,8 @@ def kernel_key_fingerprint(
 
     if backend_loop_unroll is None:
         backend_loop_unroll = _spyre_config.backend_loop_unroll
+    if ktir_device_mlir is None:
+        ktir_device_mlir = _spyre_config.ktir_device_mlir
     fields = "||".join(
         [
             torch.__version__,
@@ -569,6 +581,7 @@ def kernel_key_fingerprint(
             "backend=dbo-opt",
             f"pool_size:{int(pool_size)}",
             f"loop_unroll:{int(bool(backend_loop_unroll))}",
+            f"ktir_device_mlir:{ktir_device_mlir}",
             "frontend_pool_allocation:"
             f"{int(bool(_spyre_config.frontend_pool_allocation))}",
             f"bundle_symbolic_args:{int(bool(_spyre_config.bundle_symbolic_args))}",
@@ -610,16 +623,20 @@ def precompute_kernel_key(
         if find_unimplemented(list(specs)) is not None:
             return None  # sdsc() returns before hashing
         backend_loop_unroll = _spyre_config.backend_loop_unroll
+        ktir_device_mlir = _spyre_config.ktir_device_mlir
         with V.set_graph_handler(NullHandler()):  # type: ignore[arg-type]
             cache_key = compute_specs_hash(
                 specs,
                 kernel_name=kernel_name,
                 pool_size=pool_size,
                 backend_loop_unroll=backend_loop_unroll,
+                ktir_device_mlir=ktir_device_mlir,
                 register=False,
             )
         fingerprint = kernel_key_fingerprint(
-            pool_size, backend_loop_unroll=backend_loop_unroll
+            pool_size,
+            backend_loop_unroll=backend_loop_unroll,
+            ktir_device_mlir=ktir_device_mlir,
         )
     except Exception as e:  # noqa: BLE001 - the runtime falls back to hashing
         logger.debug("No precomputed kernel key for %s: %r", kernel_name, e)
@@ -632,6 +649,7 @@ def resolve_precomputed_key(
     pool_size: int = 0,
     *,
     backend_loop_unroll: bool | None = None,
+    ktir_device_mlir: str | None = None,
 ) -> Optional[str]:
     """Runtime side: the stored key if its fingerprint matches this process.
 
@@ -645,7 +663,9 @@ def resolve_precomputed_key(
         return None
     try:
         current = kernel_key_fingerprint(
-            pool_size, backend_loop_unroll=backend_loop_unroll
+            pool_size,
+            backend_loop_unroll=backend_loop_unroll,
+            ktir_device_mlir=ktir_device_mlir,
         )
     except RuntimeError:
         return None

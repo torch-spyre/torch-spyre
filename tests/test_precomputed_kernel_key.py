@@ -233,6 +233,9 @@ class TestFingerprint(unittest.TestCase):
                 "loop_unroll": kernel_key_fingerprint(
                     0, backend_loop_unroll=not spyre_config.backend_loop_unroll
                 ),
+                "device": kernel_key_fingerprint(
+                    0, ktir_device_mlir="/other/device.mlir"
+                ),
             }
             for field, value in (
                 ("bundle_symbolic_args", not spyre_config.bundle_symbolic_args),
@@ -246,6 +249,7 @@ class TestFingerprint(unittest.TestCase):
                     not spyre_config.disable_conv2d_spatial_split,
                 ),
                 ("backend_loop_unroll", not spyre_config.backend_loop_unroll),
+                ("ktir_device_mlir", "/other/device.mlir"),
             ):
                 with spyre_config.patch({field: value}):
                     changed[field] = kernel_key_fingerprint(0)
