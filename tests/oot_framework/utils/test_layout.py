@@ -8,9 +8,9 @@ never written into the test configs. Two files feed it:
                                    (tests/scripts/refresh_test_timings.py)
 
 Each config the tier filter selected is either `alone` (its own job, as today) or in a `bucket`
-with other short configs. A config at or above the policy's threshold always runs alone, and so does
-a config with fewer than `min_runs` recorded runs (a new one, say): it runs on its own until its
-median is worth trusting, then the next refresh of the timings bins it. A config that shares a test
+with other short configs. A config too long to share a job under `target_job_minutes` simply ends
+up alone. So does a config with fewer than `min_runs` recorded runs (a new one, say): it runs on
+its own until its median is worth trusting, then the next refresh of the timings bins it. A config that shares a test
 file with another config also runs alone: a bucket reports under the bucket's name, and the refresh
 can only credit its cases back to a config through a test file that config alone lists. Members of
 a bucket share a runner, directory, flags and `global:` block, and never two of them name the same
@@ -29,7 +29,6 @@ DEFAULT_POLICY: dict = {
     "version": 1,
     "target_job_minutes": 8.0,
     "max_members": 16,
-    "threshold_minutes": 4.0,
     "min_runs": 5,
     "exclude": [],
 }
@@ -53,10 +52,11 @@ def load_policy(path: Optional[str]) -> Optional[dict]:
     if unknown:
         raise LayoutError(f"{path}: unknown key(s) {sorted(unknown)}")
     policy = {**DEFAULT_POLICY, **{k: v for k, v in raw.items() if k != "_comment"}}
-    for name in ("target_job_minutes", "threshold_minutes"):
-        v = policy[name]
-        if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
-            raise LayoutError(f"{path}: {name} must be a positive number, got {v!r}")
+    v = policy["target_job_minutes"]
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
+        raise LayoutError(
+            f"{path}: target_job_minutes must be a positive number, got {v!r}"
+        )
     for name, low in (("max_members", 2), ("min_runs", 1)):
         v = policy[name]
         if isinstance(v, bool) or not isinstance(v, int) or v < low:
@@ -127,7 +127,6 @@ def plan(
             or c.get("shared_file")
             or rec is None
             or rec["runs"] < policy["min_runs"]
-            or rec["p50_min"] >= float(policy["threshold_minutes"])
         ):
             out[key] = ""
             continue

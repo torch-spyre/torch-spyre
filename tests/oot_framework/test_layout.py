@@ -32,7 +32,6 @@ def T(minutes, runs=10):
 POLICY = {
     **L.DEFAULT_POLICY,
     "target_job_minutes": 8.0,
-    "threshold_minutes": 4.0,
     "max_members": 16,
 }
 
@@ -196,7 +195,8 @@ def test_plan_is_deterministic_whatever_the_input_order():
         '{"target_job_minutes": 0}',
         '{"max_members": 1}',
         '{"min_runs": 0}',
-        '{"threshold_minutes": "x"}',
+        '{"target_job_minutes": "x"}',
+        '{"threshold_minutes": 4.0}',
         '{"unknown_knob": 3}',
         '{"exclude": "distributed_tests/"}',
         "not json",
