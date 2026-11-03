@@ -522,6 +522,23 @@ def restickify(  # type: ignore[empty-body]
     pass
 
 
+@torch.library.custom_op("spyre::rebase_copy", mutates_args=(), device_types="spyre")
+def rebase_copy(x: torch.Tensor) -> torch.Tensor:
+    """Materialize a view of ``x`` as a fresh dense buffer, keeping its stick.
+
+    Unlike restickify (which copies the base buffer), this reads *through* the
+    view, so a split or merge of non-stick dims becomes a separate dense
+    buffer. Used by the stick pivot (stick_reshape_pivot.py) so the following
+    restickify sees separate, dense dims instead of a flattened coordinate.
+    """
+    return x.contiguous().clone()
+
+
+@rebase_copy.register_fake
+def _(x: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(x, memory_format=torch.contiguous_format)
+
+
 @torch.library.custom_op("spyre::max_dim_int64_fallback", mutates_args=())
 def max_dim_int64_fallback(
     input: torch.Tensor, dim: int, keepdim: bool = False

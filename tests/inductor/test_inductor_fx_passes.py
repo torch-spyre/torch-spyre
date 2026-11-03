@@ -242,6 +242,210 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             assert result == index, f"Expected {index}, got {result}"
 
 
+class TestStickReshapePivot(unittest.TestCase):
+    """pivot_unaligned_stick_reshapes: reshapes that cut the stick dim off a
+    stick boundary (W=160 rows of 2.5 sticks, issue #1353) are rewritten into
+    an on-device stick pivot instead of failing (split) or miscompiling
+    (merge)."""
+
+    def test_kind_classification(self):
+        from torch_spyre._inductor.stick_reshape_pivot import _stick_reshape_kind
+
+        kind = _stick_reshape_kind
+        self.assertEqual(
+            kind([1, 32, 25600], [1, 32, 160, 160], 64), ("split", [1, 32])
+        )
+        self.assertEqual(
+            kind([1, 32, 160, 160], [1, 32, 25600], 64), ("merge", [1, 32])
+        )
+        self.assertEqual(
+            kind([2, 16, 3200], [2, 16, 4, 20, 40], 64), ("split", [2, 16])
+        )
+        self.assertEqual(kind([6400], [80, 80], 64), ("split", []))
+        # Outer dims reshaped too: handled as a separate plain view.
+        self.assertEqual(kind([32, 25600], [1, 32, 160, 160], 64), ("split", [1, 32]))
+        self.assertEqual(kind([2, 16, 25600], [32, 160, 160], 64), ("split", [32]))
+        self.assertEqual(kind([32, 160, 160], [1, 32, 25600], 64), ("merge", [32]))
+        # Sub-stick reshape (64 -> 8x8) is not free either: the destination
+        # pads each row to a whole stick, so (8, 8) spans 8 sticks where (64,)
+        # spans 1. Rewritten like any other unaligned reshape.
+        self.assertEqual(kind([64], [8, 8], 64), ("split", []))
+        self.assertEqual(kind([8, 8], [64], 64), ("merge", []))
+        self.assertEqual(kind([4, 64], [4, 8, 8], 64), ("split", [4]))
+        # Inside one stick but 7 does not divide 64 (#5198/#5214): rewritten.
+        self.assertEqual(kind([1, 2, 4, 8, 7], [1, 8, 56], 64), ("merge", [1, 2, 4]))
+        # 6-dim merge: the shape that exposed the #5804 coordinate bug.
+        self.assertEqual(
+            kind([1, 2, 4, 8, 4, 7], [1, 8, 224], 64), ("merge", [1, 2, 4])
+        )
+        # Stick-aligned innermost piece: an ordinary view, left alone.
+        self.assertIsNone(kind([1, 32, 16384], [1, 32, 128, 128], 64))
+        self.assertIsNone(kind([1, 32, 128, 128], [1, 32, 16384], 64))
+        # Stick dim untouched (only outer dims reshaped).
+        self.assertIsNone(kind([4, 8, 160], [32, 160], 64))
+        # Stick dim regrouped, neither a split nor a merge of it.
+        self.assertIsNone(kind([6, 160], [4, 240], 64))
+
+    def _compile_and_check(self, fn, *args, on_device, expect):
+        """Compile on Spyre, compare with fp32 CPU, and check which repair ran.
+
+        ``expect`` is "pivot", "cpu" or None (reshape left alone).
+        """
+        from torch._dynamo.testing import InductorAndRecordGraphs, normalize_gm
+        import torch._inductor.config as config
+        from torch_spyre._inductor import config as spyre_config
+
+        config.force_disable_caches = True
+        torch.compiler.reset()
+        backend = InductorAndRecordGraphs()
+        ref = fn(*[a.float() for a in args])
+        with spyre_config.patch(stick_reshape_on_device=on_device):
+            out = torch.compile(fn, backend=backend)(*[a.to("spyre") for a in args])
+        # fp16 SiLU/add on randn inputs; errors stay well under 5e-2.
+        torch.testing.assert_close(out.cpu().float(), ref, atol=5e-2, rtol=1e-2)
+        graph = normalize_gm(
+            backend.inductor_graphs[0].print_readable(print_output=False)
+        )
+        self.assertEqual("spyre.rebase_copy" in graph, expect == "pivot")
+        self.assertEqual("spyre.reshape_via_cpu" in graph, expect == "cpu")
+
+    @pytest.mark.filterwarnings("ignore::UserWarning")  # forced cache disabling
+    def test_split_unaligned_stick(self):
+        for w in (160, 40, 20):
+            for on_device in (True, False):
+                with self.subTest(w=w, on_device=on_device):
+                    a = torch.randn(1, 32, w * w, dtype=torch.float16)
+                    self._compile_and_check(
+                        lambda a, w=w: torch.nn.functional.silu(a * 2).reshape(
+                            1, 32, w, w
+                        )
+                        + 1,
+                        a,
+                        on_device=on_device,
+                        expect="pivot" if on_device else "cpu",
+                    )
+
+    @pytest.mark.filterwarnings("ignore::UserWarning")  # forced cache disabling
+    def test_merge_unaligned_stick(self):
+        # Used to compile and silently read every row after the first from the
+        # wrong address.
+        for w in (160, 40, 20):
+            for on_device in (True, False):
+                with self.subTest(w=w, on_device=on_device):
+                    x = torch.randn(1, 32, w, w, dtype=torch.float16)
+                    self._compile_and_check(
+                        lambda x, w=w: torch.nn.functional.silu(x * 2).reshape(
+                            1, 32, w * w
+                        )
+                        + 1,
+                        x,
+                        on_device=on_device,
+                        expect="pivot" if on_device else "cpu",
+                    )
+
+    @pytest.mark.filterwarnings("ignore::UserWarning")  # forced cache disabling
+    def test_deep_merge_six_dims(self):
+        # (1,2,4,8,4,7) -> (1,8,224): deeper stride chain than the 5-dim case.
+        # Compiles to wrong values under PR #5804's _wrap_and_project.
+        x = torch.randn(1, 2, 4, 8, 4, 7, dtype=torch.float16)
+        self._compile_and_check(
+            lambda x: x.reshape(1, 8, 224) * 1.0, x, on_device=True, expect="pivot"
+        )
+
+    @pytest.mark.filterwarnings("ignore::UserWarning")  # forced cache disabling
+    def test_sub_stick_reshape(self):
+        # 64 -> 8x8 splits one stick into 8 rows, each padded back up to a
+        # whole stick. Not free, and unsupported upstream.
+        with self.subTest("no pivot dim -> host"):
+            self._compile_and_check(
+                lambda a: a.reshape(8, 8) * 1.0,
+                torch.randn(64, dtype=torch.float16),
+                on_device=True,
+                expect="cpu",
+            )
+        with self.subTest("spare dim -> pivot"):
+            self._compile_and_check(
+                lambda a: a.reshape(4, 8, 8) * 1.0,
+                torch.randn(4, 64, dtype=torch.float16),
+                on_device=True,
+                expect="pivot",
+            )
+
+    @pytest.mark.filterwarnings("ignore::UserWarning")  # forced cache disabling
+    def test_multi_stick_pivot_alone_falls_back(self):
+        # A pivot spanning more than one stick with no other non-unit dim to
+        # sit in front of the body: the restickify back reads it wrongly, so
+        # the host path is taken. P <= 64 stays on device.
+        for P, expect in ((64, "pivot"), (100, "cpu"), (128, "cpu")):
+            with self.subTest(P=P):
+                self._compile_and_check(
+                    lambda a, P=P: a.reshape(P, 21) * 1.0,
+                    torch.randn(P, 3, 7, dtype=torch.float16),
+                    on_device=True,
+                    expect=expect,
+                )
+        # ... but a real outer dim in front makes the same pivot safe.
+        self._compile_and_check(
+            lambda a: a.reshape(3, 100, 21) * 1.0,
+            torch.randn(3, 100, 3, 7, dtype=torch.float16),
+            on_device=True,
+            expect="pivot",
+        )
+
+    @pytest.mark.filterwarnings("ignore::UserWarning")  # forced cache disabling
+    def test_stick_dim_cat_falls_back(self):
+        # A pivoted reshape read by a cat along the stick dim trips the cat
+        # lowering's restickify restore (the operand's stick dim is padded,
+        # 56 of 64), so the host path is used. A cat on any other dim, and an
+        # aligned reshape, stay on device.
+        a = torch.randn(1, 2, 4, 8, 7, dtype=torch.float16)
+        b = torch.randn(1, 2, 4, 8, 7, dtype=torch.float16)
+        with self.subTest("cat on stick dim -> host"):
+            self._compile_and_check(
+                lambda a, b: torch.cat(
+                    [a.reshape(1, 8, 56), b.reshape(1, 8, 56)], -1
+                )
+                * 1.0,
+                a,
+                b,
+                on_device=True,
+                expect="cpu",
+            )
+        with self.subTest("cat on another dim -> pivot"):
+            self._compile_and_check(
+                lambda a, b: torch.cat(
+                    [a.reshape(1, 8, 56), b.reshape(1, 8, 56)], 1
+                )
+                * 1.0,
+                a,
+                b,
+                on_device=True,
+                expect="pivot",
+            )
+
+    @pytest.mark.filterwarnings("ignore::UserWarning")  # forced cache disabling
+    def test_outer_dims_reshaped_too(self):
+        # (2, 16, L) -> (32, H, W): the outer merge runs after the pivot; a view
+        # in front of the first restickify fails in the backend.
+        b = torch.randn(2, 16, 160 * 160, dtype=torch.float16)
+        self._compile_and_check(
+            lambda b: torch.nn.functional.silu(b * 2).reshape(32, 160, 160) + 1,
+            b,
+            on_device=True,
+            expect="pivot",
+        )
+
+    @pytest.mark.filterwarnings("ignore::UserWarning")  # forced cache disabling
+    def test_aligned_stick_reshape_is_left_alone(self):
+        a = torch.randn(1, 32, 128 * 128, dtype=torch.float16)
+        self._compile_and_check(
+            lambda a: torch.nn.functional.silu(a * 2).reshape(1, 32, 128, 128) + 1,
+            a,
+            on_device=True,
+            expect=None,
+        )
+
+
 class TestPassUtils(unittest.TestCase):
     """Unit tests for helpers in ``torch_spyre._inductor.pass_utils``."""
 

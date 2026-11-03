@@ -98,6 +98,18 @@ def pool_allocated_by_frontend() -> bool:
 # lowering does not yet support (grouped/transposed/non-fp16).
 conv2d_direct_lowering: bool = os.environ.get("SPYRE_CONV2D_DIRECT", "0") == "1"
 
+# How pivot_unaligned_stick_reshapes repairs a reshape that splits/merges the
+# stick dim off a stick boundary (W=160 rows of 2.5 sticks, #1353). On (the
+# default): an on-device stick pivot (two restickifies + a rebase copy per
+# reshape). Off: spyre.reshape_via_cpu, a host round trip. In interleaved
+# measurements (host transfers included, 0.1-13 MB tensors) the pivot took
+# about half the time of the host round trip (e.g. 8.3 ms vs 16.2 ms at
+# 3.3 MB). The pass still uses the host path when no dim can pivot, the dtype
+# is not fp16, or the pivot would exceed the per-core span limit.
+stick_reshape_on_device: bool = (
+    os.environ.get("SPYRE_STICK_RESHAPE_ON_DEVICE", "1") == "1"
+)
+
 # Extend the phase-2 matmul perf reorder (NDO) to the matmul's own output
 # buffer in addition to its input buffers. Off by default until the
 # interaction with downstream span limits is fully validated.
