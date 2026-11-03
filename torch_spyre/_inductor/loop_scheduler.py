@@ -319,6 +319,12 @@ def _check_members(loop_node: LoopNode, kernels: Sequence[ir.Operation]) -> None
     accumulator's zero-fill re-run each trip, a wrong answer.  Every direct
     kernel child must therefore share one group path, and so be in the loop
     on both paths; a nested loop's members are checked at their own level.
+
+    No pass produces such an op today: across the seven graphs of
+    ``test_loop_scheduler_equivalence.py`` this check never fires.  It guards a
+    future pass that places an op between two members without stamping its
+    ``loop_info``.  Ops at the head or tail of a body are not refused: they
+    are moved out at the hand-off (``loop_node.peel_non_members``).
     """
     paths = {op.get_name(): counted_loop_path(op) for op in kernels}
     # ``collapse`` wraps the ops sharing ``path[: depth + 1]`` and recurses on

@@ -260,6 +260,18 @@ class OpsView(MutableSequence):
         self.real.append(op)
 
     def insert(self, i: int, op: ir.Operation) -> None:
+        """``list.insert`` over the flat view, into the list that owns ``flat[i]``.
+
+        An op inserted at the flat index of a loop's FIRST member therefore lands
+        inside that loop's body, although a pass that means "just before the
+        loop" (the LX allocator's clone insert) wants it outside.
+        ``peel_non_members`` moves such an op out at the hand-off, once its
+        ``loop_info`` is final.  Nothing inside the pass loop reads structural
+        membership (which ``LoopNode.body`` an op is in): every pass sees the
+        flat view and reads the per-op ``loop_info``, which this placement
+        does not change.  A future pass that reads structural membership
+        before the hand-off would see such an op inside the body.
+        """
         flat = self._flat()
         n = len(flat)
         if i < 0:
