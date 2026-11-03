@@ -566,6 +566,7 @@ class TestEmittedSdscCall(unittest.TestCase):
                                 specs,
                                 passed_pool,
                                 spyre_config.backend_loop_unroll,
+                                spyre_config.ktir_device_mlir,
                                 stored,
                             )
                         self.assertEqual(got, expected)
