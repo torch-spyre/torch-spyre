@@ -2394,7 +2394,16 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             for pos, coord in enumerate(out_arg.device_coordinates[:-1]):
                 if coord.free_symbols == {entry_c}:
                     entry_mb = symbol_mapping.get(entry_c)
-                    dev = int(out_arg.device_size[pos])
+                    # Never iterate past the index's allocated entries: the padding
+                    # lanes past them are uninitialized and read as indices.
+                    idx_pos = next(
+                        i
+                        for i, c in enumerate(idx_arg.device_coordinates[:-1])
+                        if c.free_symbols == {entry_c}
+                    )
+                    idx_eps = idx_arg.device_dtype.elems_per_stick()
+                    idx_extent = int(idx_arg.device_size[idx_pos]) * idx_eps
+                    dev = min(int(out_arg.device_size[pos]), idx_extent)
                     if (
                         entry_mb in sdsc_iteration_space
                         and dim_splits[entry_mb] > 1
