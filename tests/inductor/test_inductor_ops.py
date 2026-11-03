@@ -1281,7 +1281,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "expect_fail": {
                 "rsqrt_4d_zero": "Issue #707",
                 "rsqrt_4d_nan": "Issue #707",
-                "rsqrt_5d_neg": "Issue #707",
             },
         },
         (
@@ -1439,11 +1438,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     torch.full((1, 1, 2, 2, 3), float("nan"), dtype=torch.float16),
                 ),
             },
-            "expect_fail": {
-                "log_5d_inf": "Issue #1851",
-                "log_5d_nan": "Issue #1851",
-                "log_5d_neg": "Issue #1851",
-            },
         },
         (
             "test_pointwise_unary_op",
@@ -1497,17 +1491,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "5d_zeros": (torch.zeros((1, 1, 1, 1, 1)) + FP16_EPS,),
                 "5d_neg": (-torch.randn((1, 3, 1, 64, 64), dtype=torch.float32),),
                 "5d_nan": (
-                    torch.full(
-                        (16, 64, 64, 128, 128), float("nan"), dtype=torch.float16
-                    ),
+                    torch.full((2, 3, 4, 5, 6), float("nan"), dtype=torch.float16),
                 ),
                 "5d_inf": (
                     torch.full((1, 1, 4, 4, 4), float("inf"), dtype=torch.float32),
                 ),
             },
-            "expect_fail": {
-                "5d_nan": "Issue #4700",
-            },
+            # "expect_fail": {
+            #     "5d_nan": "Issue #4700",
+            # },
         },
         (
             "test_pointwise_binary_op",
@@ -4309,9 +4301,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     FP16_EPS,
                 ),
             },
-            "expect_fail": {
-                "clamp_5d_nan": "Issue #1833",
-            },
+            # "expect_fail": {
+            #     "clamp_5d_nan": "Issue #1833",
+            # },
         },
         (
             "test_pointwise_clamp_preserves_unspecified_bound",
@@ -4452,8 +4444,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
             "expect_fail": {
                 "silu_5d_neg_inf": "Issue #1831",
-                "mish_5d_neg_inf": "Issue #1893",
-                "mish_5d_neg": "Issue #1893",
+                "mish_5d_neg_inf": "Issue #1831",
                 "sigmoid_4d_nan": "Issue #1774",
             },
         },
