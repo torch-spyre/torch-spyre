@@ -308,7 +308,7 @@ CUMSUM_PARAM_SETS = {
     "pad_5d_dim_2": (2, cached_randn((2, 3, 7, 4, 128))),
     "pad_5d_dim_neg1": (-1, cached_randn((2, 3, 4, 5, 129))),
     # -----------------------------------------------------------------------
-    # bf16 (same device format as fp16, so the same BMM path)
+    # bf16 (same device format as fp16, so the same matmul path)
     "1d_256_bf16": (0, cached_randn((256,), dtype=torch.bfloat16)),
     "2d_dim_0_bf16": (0, cached_randn((67, 256), dtype=torch.bfloat16)),
     "2d_dim_1_b2_bf16": (1, cached_randn((2, 256), dtype=torch.bfloat16)),
@@ -347,6 +347,7 @@ CUMSUM_PARAM_SETS = {
     "pad_2d_dim_1_fp32": (1, cached_randn((4, 17), dtype=torch.float32)),
     "pad_3d_dim_1_fp32": (1, cached_randn((3, 7, 17), dtype=torch.float32)),
     "pad_3d_dim_2_fp32": (2, cached_randn((3, 7, 17), dtype=torch.float32)),
+    "2d_dim_0_b1_fp32": (0, cached_randn((17, 1), dtype=torch.float32)),
     # -----------------------------------------------------------------------
     # int32 (accumulates in int64; int32 -> int64 converts on Spyre)
     "2d_dim_0_int32": (0, cached_randint((9, 64))),
@@ -362,6 +363,7 @@ CUMSUM_PARAM_SETS = {
     "pad_2d_dim_1_int32": (1, cached_randint((4, 17))),
     "pad_3d_dim_1_int32": (1, cached_randint((3, 7, 17))),
     "pad_3d_dim_2_int32": (2, cached_randint((3, 7, 17))),
+    "1d_17_int32": (0, cached_randint((17,))),
     # -----------------------------------------------------------------------
     # int64 (stored as IEEE_INT32 on Spyre; prefix scan uses addi32toi32)
     "2d_dim_0_int64": (0, cached_randint((9, 64), dtype=torch.int64)),
@@ -4818,8 +4820,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             # (~0.34 abs, 1/32768 elems) past tolerance and was xfailed in
             # commit 3a2d482 as a PT 2.12 CPU-reference numerics change. That
             # drift came from the ``sin`` in the chain; the fallback vehicle is
-            # ``cumsum`` now (``sin`` has a Spyre decomposition and no longer
-            # falls back), and all three shapes pass, so the entry is gone.
+            # ``isin`` now (``sin`` and ``cumsum`` both have Spyre decompositions
+            # and no longer fall back), and all three shapes pass, so the entry
+            # is gone.
         },
         (
             "test_arange",
@@ -10645,6 +10648,46 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ]
         assert not any("cumsum_cpu_fallback" in m for m in fallbacks), fallbacks
 
+    def test_cumsum_permuted_view(self):
+        # cumsum over a permuted view, scanning a leading dim and the
+        # innermost one.
+        exact = {"atol": 0, "rtol": 0}
+        for x, tol in (
+            (cached_randn((4, 64, 32)), {}),
+            (cached_randn((4, 64, 32), dtype=torch.float32), {}),
+            (cached_randint((4, 64, 32), dtype=torch.int64), exact),
+        ):
+            for dim in (0, 2):
+
+                def fn(t, dim=dim):
+                    # (4, 64, 32) -> (64, 32, 4)
+                    return torch.cumsum(t.permute(1, 2, 0), dim=dim)
+
+                self.compare_with_cpu(fn, x, run_eager=False, **tol)
+
+    def test_cumsum_sliced_view(self):
+        # cumsum over sliced views: an offset on the innermost dim, a
+        # stick-aligned offset, an offset on an outer dim, and a narrow.
+        exact = {"atol": 0, "rtol": 0}
+        views = {
+            "inner": lambda t: t[:, 2:],
+            "inner_stick_aligned": lambda t: t[:, 32:],
+            "outer": lambda t: t[2:, :],
+            "narrow": lambda t: t.narrow(1, 2, 32),
+        }
+        for x, tol in (
+            (cached_randn((64, 64)), {}),
+            (cached_randn((64, 64), dtype=torch.float32), {}),
+            (cached_randint((64, 64), dtype=torch.int64), exact),
+        ):
+            for dim in (0, 1):
+                for slicer in views.values():
+
+                    def fn(t, dim=dim, slicer=slicer):
+                        return torch.cumsum(slicer(t), dim=dim)
+
+                    self.compare_with_cpu(fn, x, run_eager=False, **tol)
+
     def test_cumsum_out(self):
         exact = {"atol": 0, "rtol": 0}
         for x, tol in (
@@ -11624,18 +11667,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_fallback_cpu(self, x):
         """
-        Verify that cumsum emits FallbackWarnings and produces correct results.
+        Verify that a CPU-fallback op emits a FallbackWarning and still gives
+        correct results in the middle of an otherwise on-device graph.
 
-        For fp16 inputs, cumsum uses the on-device BMM decomposition (spyre_cumsum)
-        which internally calls three CPU-side ops: reshape_and_pad_via_cpu,
-        aten.tril, and slice_and_reshape_via_cpu.
+        aten.isin has no Spyre lowering (torch_spyre/ops/fallbacks.py). cumsum
+        used to be the vehicle here; its Spyre decomposition now stays on device.
         """
 
         def fn(t):
-            t = torch.exp(t)
-            t = torch.cumsum(t.clamp(-1, 1), dim=-1)
-            t = torch.exp(t.clamp(-1, 1))
-            return t
+            # Every element of t is in t, so hits is all ones however the values
+            # round -- the check stays exact while isin still runs on CPU.
+            hits = torch.isin(t, t).to(t.dtype)
+            return torch.exp(t.clamp(-1, 1)) + hits
 
         with warnings.catch_warnings(record=True) as captured:
             warnings.simplefilter("always")
@@ -11644,12 +11687,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         fallback_warnings = [
             w
             for w in captured
-            if issubclass(w.category, FallbackWarning)
-            and "reshape_and_pad_via_cpu" in str(w.message)
+            if issubclass(w.category, FallbackWarning) and "isin" in str(w.message)
         ]
         assert len(fallback_warnings) > 0, (
-            f"Expected FallbackWarning from spyre_cumsum fp16 BMM path "
-            f"(reshape_and_pad_via_cpu). "
+            f"Expected FallbackWarning from aten.isin. "
             f"All captured: {[str(w.message) for w in captured]}"
         )
 
