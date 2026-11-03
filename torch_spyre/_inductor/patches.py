@@ -140,8 +140,7 @@ def _unique_operation_names():
 
 # The upstream report for the gap _resolve_scan_shapes_by_expression patches,
 # and the signature the patch was written against.
-# TODO(Vivek1258): file the PyTorch issue for this gap and put its URL here.
-RESOLVE_SHAPE_ISSUE = "upstream PyTorch issue not yet filed"
+RESOLVE_SHAPE_ISSUE = "https://github.com/pytorch/pytorch/issues/203212"
 RESOLVE_SHAPE_PARAMS = ("shape", "bound_symbols")
 
 
@@ -159,7 +158,11 @@ def _resolve_scan_shapes_by_expression():
     That fires exactly when the body is fully static and only the trip count is
     derived from a dynamic dim, which is the shape a symbolic loop bound has.
     The proxy for the whole expression is already in the dict as the scan
-    length, so matching the expression before upstream's symbol walk is enough.
+    length, so matching the expression before upstream's symbol walk covers a
+    scan over the leading dim, the form for_each_tile produces. A size that
+    contains the bare base symbol, such as the tile extent ``s//(s//64)`` of a
+    scan over a non-leading dim, still goes to upstream and raises: the base
+    symbol is never bound, which is the root cause the upstream issue tracks.
 
     An upstream gap, not a Spyre one, tracked as RESOLVE_SHAPE_ISSUE. Remove it
     once that is fixed. Everything else takes the original path, one element at
@@ -209,6 +212,10 @@ def _resolve_scan_shapes_by_expression():
         resolved = []
         for size in shape:
             expr = getattr(getattr(size, "node", None), "expr", None)
+            # A dict lookup on sympy structural equality, the same equality
+            # upstream's own env keys use. An equal value built another way
+            # (FloorDiv(s97, 64) against a simplified form) misses and goes to
+            # upstream, which raises KeyError exactly as it would unpatched.
             if expr is not None and expr in bound_symbols:
                 resolved.append(bound_symbols[expr])
             else:
