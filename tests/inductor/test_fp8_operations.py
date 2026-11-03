@@ -450,6 +450,45 @@ class TestFP8Operations:
 
         compare_with_pytorch(spyre_fn, pytorch_fn, x, scale, atol=0.5, rtol=0.1)
 
+    def test_quantscalepertokenfp8_eager_mode(self):
+        """Test quantscalepertokenfp8 in eager mode via compile_once.
+
+        Validates that quantscalepertokenfp8 can be called directly without
+        torch.compile and returns a numerically correct per-token scale tensor.
+
+        The CPU reference is ``amax(|x|, dim=-1, keepdim=True) / FP8_E4M3FN_MAX``,
+        clipped from below by ``QUANTSCALEPERTOKENFP8_CLIP_MIN`` to match the
+        hardware's clipMin guard.  FP16 encoding of ``mulConst = 1 / 448.0``
+        introduces up to one ULP of rounding (≈ 9.8e-4 relative), so atol=1e-3
+        is sufficient.
+        """
+        x = cached_randn((2, 4, 128), dtype=torch.float16, scale=1.0)
+        x_d = x.to(DEVICE)
+
+        # Call directly without torch.compile — exercises the compile_once eager path.
+        scale_d = torch.ops.spyre.quantscalepertokenfp8(x_d)
+
+        # Shape: last dim collapsed to 1.
+        assert scale_d.shape == (2, 4, 1), (
+            f"Expected shape (2, 4, 1), got {scale_d.shape}"
+        )
+        assert scale_d.dtype == torch.float16, (
+            f"Expected dtype torch.float16, got {scale_d.dtype}"
+        )
+
+        # Numerical reference: amax / FP8_E4M3FN_MAX, clipped at QUANTSCALEPERTOKENFP8_CLIP_MIN.
+        scale_ref = (
+            x.abs().amax(dim=-1, keepdim=True).to(torch.float16) / FP8_E4M3FN_MAX
+        ).clamp(min=QUANTSCALEPERTOKENFP8_CLIP_MIN)
+
+        torch.testing.assert_close(
+            scale_d.cpu(),
+            scale_ref,
+            atol=1e-3,
+            rtol=0.0,
+            msg="quantscalepertokenfp8 eager mode: scale mismatch vs CPU reference",
+        )
+
     def _run_quantize_dequantize_fp8_test(
         self,
         shape,

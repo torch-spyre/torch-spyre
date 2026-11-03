@@ -1213,3 +1213,56 @@ def patch_row_major_out_coords() -> Any:
         "torch_spyre._inductor.scratchpad.coarse_tiling.op_out_coords",
         side_effect=lambda op: list(next(iter(op.get_read_writes().writes)).var_names),
     )
+
+
+class patch_tiling_helper:
+    """Patch a helper that lives in ``loop_tiling_common`` and is re-exported.
+
+    ``coarse_tile`` re-exports the helpers it moved to ``loop_tiling_common``
+    (and, for ``op_read_writes`` and friends, the ``pass_utils`` functions they
+    both import).  A moved function looks a global up in its *new* module, so a
+    patch on ``coarse_tile.<name>`` alone no longer reaches it and the test can
+    pass vacuously.  This patches the same mock into both modules, so callers
+    that stayed in ``coarse_tile`` and callers that moved are both covered.
+
+    Pass ``common_only=True`` for a name that no function left in
+    ``coarse_tile`` uses (``reduction_loop_vars``, ``_loop_var_to_ranges_pos``).
+
+    Usable as a context manager (yielding the mock) or via ``start``/``stop``.
+    """
+
+    _MODULES = (
+        "torch_spyre._inductor.wsr.loop_tiling_common",
+        "torch_spyre._inductor.wsr.coarse_tile",
+    )
+
+    def __init__(self, name: str, *, common_only: bool = False, **mock_kwargs: Any):
+        from unittest.mock import MagicMock
+
+        self._mock = MagicMock(**mock_kwargs)
+        modules = self._MODULES[:1] if common_only else self._MODULES
+        self._patchers = [
+            mock_patch(f"{module}.{name}", new=self._mock) for module in modules
+        ]
+
+    def start(self) -> Any:
+        started = []
+        try:
+            for patcher in self._patchers:
+                patcher.start()
+                started.append(patcher)
+        except BaseException:
+            for patcher in reversed(started):
+                patcher.stop()
+            raise
+        return self._mock
+
+    def stop(self) -> None:
+        for patcher in reversed(self._patchers):
+            patcher.stop()
+
+    def __enter__(self) -> Any:
+        return self.start()
+
+    def __exit__(self, *exc_info: Any) -> None:
+        self.stop()
