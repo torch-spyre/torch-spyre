@@ -58,13 +58,24 @@ SELECT
     argMin(content_sha256, ts) AS content_sha256,
     argMin(bundle_url, ts)     AS bundle_url,
     argMax(reason, ts)         AS reason,
+    -- An append to an existing run: same run_id as the upload that made the run, and its rows
+    -- carry props['upload_id'] = this upload_id. Retracting one hides those rows, never the run.
+    toUInt8(argMin(r.props['append_to_run'], ts) = '1') AS is_round,
     min(ts)                    AS uploaded_at,
     max(ts)                    AS updated_at
 FROM result_uploads AS r  -- qualified: the actor alias would shadow the column
 GROUP BY upload_id;
 
--- artifact_results minus retracted uploads' runs.
+-- The retracted appended rounds. Every row view hides a row whose props['upload_id'] is listed.
+CREATE VIEW IF NOT EXISTS v_retracted_rounds AS
+SELECT upload_id, run_id
+FROM v_result_uploads
+WHERE state = 'retracted' AND is_round;
+
+-- artifact_results minus retracted uploads' runs and retracted rounds' verdicts. A round writes a
+-- new verdict over the whole run, so with its rows gone the views read the previous one.
 CREATE VIEW IF NOT EXISTS v_artifact_results_published AS
 SELECT *
 FROM artifact_results
-WHERE run_id NOT IN (SELECT run_id FROM v_result_uploads WHERE state = 'retracted');
+WHERE run_id NOT IN (SELECT run_id FROM v_result_uploads WHERE state = 'retracted' AND NOT is_round)
+  AND props['upload_id'] NOT IN (SELECT toString(upload_id) FROM v_retracted_rounds);
