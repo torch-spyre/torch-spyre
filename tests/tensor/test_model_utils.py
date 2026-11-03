@@ -361,6 +361,72 @@ class TestLoadModelToSpyre(TestCase):
 
     # ── idempotency ────────────────────────────────────────────────
 
+    # ── parameter identity (matches nn.Module.to) ──────────────────
+
+    @requires_spyre
+    def test_parameter_keeps_its_object(self):
+        """A caller holding a parameter sees the device tensor after the move, and a
+        later in-place write (a weight reload) reaches the module. A vLLM attention
+        impl holds its sinks this way; a new Parameter would leave it the host copy."""
+
+        class Tagged(nn.Parameter):
+            pass
+
+        model = nn.Linear(64, 128, dtype=torch.float16)
+        model.sinks = Tagged(torch.randn(8, dtype=torch.float16), requires_grad=False)
+        model.sinks.weight_loader = "loader"
+        held_weight, held_sinks = model.weight, model.sinks
+        load_model_to_spyre(model)
+
+        self.assertIs(model.weight, held_weight)
+        self.assertIs(model.sinks, held_sinks)
+        self.assertEqual(held_sinks.device.type, "spyre")
+        self.assertIsInstance(held_sinks, Tagged)
+        self.assertEqual(held_sinks.weight_loader, "loader")
+        self.assertTrue(held_weight.requires_grad)
+        self.assertFalse(held_sinks.requires_grad)
+
+        new = torch.full((8,), 3.0, dtype=torch.float16)
+        held_sinks.data.copy_(new.to("spyre"))
+        torch.testing.assert_close(model.sinks.cpu(), new)
+
+    @parametrize("num_threads", [1, 8])
+    @requires_spyre
+    def test_tied_weights_stay_tied(self, num_threads):
+        """An embedding table shared with the LM head stays one tensor, as with
+        ``nn.Module.to``, uploaded once in the layout of the module listed first,
+        however many threads upload."""
+        from torch_spyre._C import get_spyre_tensor_layout
+
+        model = nn.Module()
+        model.embed = nn.Embedding(256, 128, dtype=torch.float16)
+        model.head = nn.Linear(128, 256, bias=False, dtype=torch.float16)
+        model.head.weight = model.embed.weight
+        host = model.embed.weight.detach().clone()
+        load_model_to_spyre(model, num_threads=num_threads)
+
+        self.assertIs(model.embed.weight, model.head.weight)
+        # Indirect-access layout: vocab outermost.
+        self.assertEqual(
+            get_spyre_tensor_layout(model.embed.weight).device_size[0], 256
+        )
+        torch.testing.assert_close(
+            model.embed.weight.cpu(), host, rtol=DLFLOAT16_RTOL, atol=DLFLOAT16_ATOL
+        )
+
+    def test_tied_parameter_is_listed_once(self):
+        from torch_spyre.model_utils import _transfer_module
+
+        model = nn.Module()
+        model.embed = nn.Embedding(16, 8)
+        model.head = nn.Linear(8, 16, bias=False)
+        model.head.weight = model.embed.weight
+        uploads = []
+        _transfer_module(model, None, uploads)
+        self.assertEqual(
+            [(u.module, u.name) for u in uploads], [(model.embed, "weight")]
+        )
+
     @requires_spyre
     def test_load_model_idempotent(self):
         """Second call on an already-loaded model is a no-op
@@ -486,14 +552,14 @@ class TestLoadModelToSpyre(TestCase):
         ):
             uploads = uploads_for()
             counts = {"linear": 0}
-            before = [m.weight for m in modules]
+            before = [(m.weight, m.weight.detach().clone()) for m in modules]
             model_utils._run_uploads(uploads, counts, 4)
             self.assertEqual(uploads, [])
             self.assertEqual(counts["linear"], 6)
             self.assertEqual(set(put_on), {caller})
-            for m, old in zip(modules, before):
-                self.assertIsNot(m.weight, old)
-                torch.testing.assert_close(m.weight.data, old.data + 1)
+            for m, (param, old) in zip(modules, before):
+                self.assertIs(m.weight, param)
+                torch.testing.assert_close(m.weight.data, old + 1)
 
             with self.assertRaisesRegex(RuntimeError, "upload failed"):
                 model_utils._run_uploads(uploads_for(fail_at=3), {"linear": 0}, 4)
