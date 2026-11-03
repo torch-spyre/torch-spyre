@@ -531,7 +531,9 @@ def rebase_copy(x: torch.Tensor) -> torch.Tensor:
     buffer. Used by the stick pivot (stick_reshape_pivot.py) so the following
     restickify sees separate, dense dims instead of a flattened coordinate.
     """
-    return x.contiguous().clone()
+    # One copy: clone() already returns a fresh buffer, so a .contiguous() in
+    # front of it copies a second time whenever x is not contiguous.
+    return x.clone(memory_format=torch.contiguous_format)
 
 
 @rebase_copy.register_fake

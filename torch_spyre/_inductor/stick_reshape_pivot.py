@@ -51,6 +51,7 @@ Either way the reshape is caught here instead of failing (split) or
 miscompiling (merge) downstream.
 """
 
+import operator
 from math import prod
 from typing import Optional
 
@@ -93,6 +94,14 @@ def _trailing_group(shape: list[int], extent: int) -> Optional[int]:
     return None
 
 
+def _strip_trailing_ones(shape: list[int]) -> list[int]:
+    """``shape`` without its trailing size-1 dims, keeping at least one dim."""
+    end = len(shape)
+    while end > 1 and shape[end - 1] == 1:
+        end -= 1
+    return shape[:end]
+
+
 def _stick_reshape_kind(
     in_shape: list[int], out_shape: list[int], eps: int
 ) -> Optional[tuple[str, list[int]]]:
@@ -107,6 +116,11 @@ def _stick_reshape_kind(
     """
     if in_shape[-1:] == out_shape[-1:]:
         return None  # stick dim untouched
+    if _strip_trailing_ones(in_shape) == _strip_trailing_ones(out_shape):
+        # Only trailing size-1 dims differ, as in a keepdim view
+        # ``(B, L) <-> (B, L, 1)``. No element moves and the backend already
+        # handles these, so repairing them would be pure overhead.
+        return None
     # A sub-stick reshape (64 -> 8x8) is NOT free either: the destination pads
     # every row to a whole stick, so (8, 8) occupies 8 sticks where (64,)
     # occupies 1. Measured on upstream: every split of one stick, and every
@@ -180,6 +194,15 @@ def _alias_source(node: torch.fx.Node) -> Optional[torch.fx.Node]:
     """
     if node.op != "call_function":
         return None
+    if node.target is operator.getitem:
+        # split/unbind/chunk hand back their pieces through getitem, and those
+        # pieces alias the tensor they came from. getitem has no schema of its
+        # own, so defer to the producer: it aliases for those three, and not
+        # for a multi-value op such as max.dim.
+        parent = node.args[0] if node.args else None
+        if isinstance(parent, torch.fx.Node) and _alias_source(parent) is not None:
+            return parent
+        return None
     schema = getattr(node.target, "_schema", None)
     if schema is None or not schema.returns:
         return None
@@ -212,7 +235,7 @@ def _alias_closure(node: torch.fx.Node) -> set:
     return out
 
 
-def _breaks_escaping_alias(node: torch.fx.Node, escaping: set) -> bool:
+def _breaks_escaping_alias(node: torch.fx.Node, escaping: dict) -> bool:
     """True when rewriting would turn an alias the caller can see into a copy.
 
     A reshape left as a view shares storage with its base. Every repair here
@@ -239,7 +262,7 @@ def _breaks_escaping_alias(node: torch.fx.Node, escaping: set) -> bool:
     if closure.isdisjoint(escaping):
         return False
     base = _alias_base(node)
-    return any(e not in closure and _alias_base(e) is base for e in escaping)
+    return any(e not in closure and b is base for e, b in escaping.items())
 
 
 def _call(graph, target, args, kwargs, src_node, fake_mode):
@@ -294,11 +317,18 @@ def _rewrite(
         # each core spans about the whole intermediate. Past the per-core
         # span limit (e.g. a 1024-channel 379x519 conv output, ~400 MB) take
         # the host round trip instead of failing work division.
+        #
+        # Both intermediates are sized, not just the first: the restickify out
+        # pads the pivot dim to a stick, and the rebase_copy and restickify
+        # back pad the new innermost dim instead. A small innermost dim is the
+        # bigger of the two by far -- 7 padded to 64 is 9x -- so checking only
+        # the pivot would let work division fail where this means to fall back.
+        esize = src_val.element_size()
         padded_pivot = -(-prefix[p] // eps) * eps
-        pivot_bytes = (
-            prod(in_shape) // prefix[p] * padded_pivot * src_val.element_size()
-        )
-        if pivot_bytes > MAX_SPAN_BYTES:
+        pivot_bytes = prod(in_shape) // prefix[p] * padded_pivot * esize
+        padded_body = -(-body[-1] // eps) * eps
+        body_bytes = prod(in_shape) // body[-1] * padded_body * esize
+        if max(pivot_bytes, body_bytes) > MAX_SPAN_BYTES:
             p = None
 
     with graph.inserting_before(node):
@@ -390,14 +420,12 @@ def _rewrite(
 
 def pivot_unaligned_stick_reshapes(graph: torch.fx.Graph) -> None:
     """Rewrite every Spyre reshape that cuts the stick dim off a stick boundary."""
-    escaping = _escaping_nodes(graph)
+    escaping: Optional[dict] = None  # built once, only if a candidate survives
     for node in list(graph.nodes):
         if node.op != "call_function" or node.target not in _RESHAPE_OPS:
             continue
         src = node.args[0]
         if not isinstance(src, torch.fx.Node):
-            continue
-        if _breaks_escaping_alias(node, escaping):
             continue
         src_val = src.meta.get("val")
         out_val = node.meta.get("val")
@@ -419,6 +447,12 @@ def pivot_unaligned_stick_reshapes(graph: torch.fx.Graph) -> None:
             continue  # dtype without a stick layout
         found = _stick_reshape_kind(in_shape, out_shape, eps)
         if found is None:
+            continue
+        # Last, because it is the only check that walks the graph: the cheap
+        # shape and device filters reject almost everything before this.
+        if escaping is None:
+            escaping = {e: _alias_base(e) for e in _escaping_nodes(graph)}
+        if _breaks_escaping_alias(node, escaping):
             continue
         kind, prefix = found
         _rewrite(node, kind, prefix, out_shape)
