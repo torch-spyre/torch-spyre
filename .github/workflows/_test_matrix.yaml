@@ -708,6 +708,13 @@ jobs:
           CONFIG_PATHS=""
           for m in ${MEMBERS:-$CONFIG}; do CONFIG_PATHS="${CONFIG_PATHS:+$CONFIG_PATHS }${ROOT}/${m}"; done
           echo "CONFIG_PATHS=${CONFIG_PATHS}" >> "$GITHUB_ENV"
+          # The job name lists only the first few members; the summary lists them all.
+          if [ -n "${MEMBERS}" ]; then
+            {
+              echo "### ${REPORT_STEM}: $(wc -w <<< "${MEMBERS}") configs in this job"
+              for m in ${MEMBERS}; do echo "- \`${m}\`"; done
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Run ${{ matrix.suite.name }} tests
         id: run_tests
@@ -1535,6 +1542,13 @@ jobs:
           CONFIG_PATHS=""
           for m in ${MEMBERS:-$CONFIG}; do CONFIG_PATHS="${CONFIG_PATHS:+$CONFIG_PATHS }${ROOT}/${m}"; done
           echo "CONFIG_PATHS=${CONFIG_PATHS}" >> "$GITHUB_ENV"
+          # The job name lists only the first few members; the summary lists them all.
+          if [ -n "${MEMBERS}" ]; then
+            {
+              echo "### ${REPORT_STEM}: $(wc -w <<< "${MEMBERS}") configs in this job"
+              for m in ${MEMBERS}; do echo "- \`${m}\`"; done
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       # The first attempt's report, which this job's upload overwrites; kept as prior_* props.
       - name: Download the first attempt's JUnit XML report

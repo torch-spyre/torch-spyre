@@ -170,6 +170,22 @@ def _config_facts(path: Path) -> tuple:
     return tsc.get("global"), [str(f.get("path", "")) for f in tsc.get("files") or []]
 
 
+def _bucket_name(members: list) -> str:
+    """Job name for a bucket that says what is in it: "Inductor / Cache, Codegen +14 more (16)".
+
+    Members' own display names, with the shared directory and "Test" prefix said once.
+    """
+    head, _, _ = members[0]["name"].rpartition(" / ")
+    short = []
+    for m in members:
+        n = m["name"].rpartition(" / ")[2]
+        short.append(n[len("Test ") :] if n.startswith("Test ") else n)
+    shown = ", ".join(short[:3])
+    if len(short) > 3:
+        shown += f" +{len(short) - 3} more"
+    return f"{head + ' / ' if head else ''}{shown} ({len(members)})"
+
+
 def _fold_buckets(results: list) -> list:
     """Fold configs that share a bucket into one matrix entry, after tier filtering.
 
@@ -205,7 +221,7 @@ def _fold_buckets(results: list) -> list:
         if members and len(members) > 1:
             g["configs"] = " ".join(m["config"] for m in members)
             g["report"] = f"bucket_{g['bucket']}"
-            g["name"] = f"Bucket {g['bucket']} ({len(members)} suites)"
+            g["name"] = _bucket_name(members)
     return out
 
 

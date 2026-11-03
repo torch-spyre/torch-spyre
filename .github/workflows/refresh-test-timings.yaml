@@ -24,7 +24,8 @@ permissions:
 
 jobs:
   refresh:
-    if: github.repository == 'torch-spyre/torch-spyre'
+    # On main only: the bot PR is based on the checked-out commit.
+    if: github.repository == 'torch-spyre/torch-spyre' && github.ref == 'refs/heads/main'
     # The ingest pool: it is the one that reaches ClickHouse.
     runs-on:
       - x86_64
@@ -110,14 +111,30 @@ jobs:
                   print(f"| `{k}` | {old[k]['p50_min']} | {new[k]['p50_min']} |")
           PYEOF
           )"
-          git config user.name "spyre-bot[bot]"
-          git config user.email "spyre-bot[bot]@users.noreply.github.com"
-          git checkout -B "${BRANCH}"
-          git add .github/test_timings.json
-          git commit -s -m "ci(tests): refresh test_timings.json from ClickHouse"
-          git push --force origin "${BRANCH}"
-          BODY="$(printf 'Weekly regeneration of `.github/test_timings.json` by `tests/scripts/refresh_test_timings.py` (run %s).\n\n%s\n' \
-            "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" "${SUMMARY}")"
+          # The commit is made through the API, not `git commit`: the runner has no signing key,
+          # and GitHub signs a commit it creates for the app token (shown Verified, as main's
+          # required_signatures expects). The branch is reset to main's head each week.
+          BASE_SHA="$(git rev-parse HEAD)"
+          BLOB_SHA="$(gh api "repos/${GITHUB_REPOSITORY}/git/blobs" -f encoding=base64 \
+            -f content="$(base64 -w0 .github/test_timings.json)" --jq .sha)"
+          TREE_SHA="$(gh api "repos/${GITHUB_REPOSITORY}/git/trees" -f base_tree="${BASE_SHA}" \
+            -f 'tree[][path]=.github/test_timings.json' -f 'tree[][mode]=100644' \
+            -f 'tree[][type]=blob' -f "tree[][sha]=${BLOB_SHA}" --jq .sha)"
+          COMMIT_SHA="$(gh api "repos/${GITHUB_REPOSITORY}/git/commits" -f tree="${TREE_SHA}" \
+            -f 'parents[]='"${BASE_SHA}" \
+            -f message="$(printf 'ci(tests): refresh test_timings.json from ClickHouse\n\nSigned-off-by: spyre-bot[bot] <spyre-bot[bot]@users.noreply.github.com>')" \
+            --jq .sha)"
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${BRANCH}" >/dev/null 2>&1; then
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/git/refs/heads/${BRANCH}" \
+              -f sha="${COMMIT_SHA}" -F force=true >/dev/null
+          else
+            gh api "repos/${GITHUB_REPOSITORY}/git/refs" -f ref="refs/heads/${BRANCH}" \
+              -f sha="${COMMIT_SHA}" >/dev/null
+          fi
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          BODY="Weekly regeneration of \`.github/test_timings.json\` by \`tests/scripts/refresh_test_timings.py\` (run ${RUN_URL}).
+
+          ${SUMMARY}"
           if gh pr view "${BRANCH}" --json state --jq .state 2>/dev/null | grep -q OPEN; then
             gh pr edit "${BRANCH}" --body "${BODY}"
           else
