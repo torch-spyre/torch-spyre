@@ -455,17 +455,26 @@ class TestStickReshapePivot(unittest.TestCase):
         """
         import torch._inductor.config as config
 
-        def fn(x):
-            y = x * 2
-            return y, y.view(4, 8, 8)
-
-        torch.compiler.reset()
-        with config.patch(force_disable_caches=True):
-            y, view = torch.compile(fn, dynamic=False)(
-                torch.ones(4, 64, dtype=torch.float16).to("spyre")
-            )
-        y.fill_(7)
-        self.assertEqual(view.cpu().flatten()[:4].tolist(), [7.0] * 4)
+        # Either end of the alias may be reached through further views, so
+        # cover the base itself, a sibling view of it, and a view of the
+        # reshape's own result.
+        cases = {
+            "base and view": lambda y: (y, y.view(4, 8, 8)),
+            "sibling view and view": lambda y: (y.t(), y.view(4, 8, 8)),
+            "base and view of view": lambda y: (
+                y,
+                y.view(4, 8, 8).transpose(1, 2),
+            ),
+        }
+        for name, tail in cases.items():
+            with self.subTest(name):
+                torch.compiler.reset()
+                with config.patch(force_disable_caches=True):
+                    first, second = torch.compile(
+                        lambda x, tail=tail: tail(x * 2), dynamic=False
+                    )(torch.ones(4, 64, dtype=torch.float16).to("spyre"))
+                first.fill_(7)
+                self.assertEqual(second.cpu().flatten()[:4].tolist(), [7.0] * 4)
 
 
 class TestPassUtils(unittest.TestCase):

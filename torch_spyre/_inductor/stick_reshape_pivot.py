@@ -171,30 +171,75 @@ def _escaping_nodes(graph: torch.fx.Graph) -> set:
     return seen
 
 
+def _alias_source(node: torch.fx.Node) -> Optional[torch.fx.Node]:
+    """The tensor ``node`` is a view of, or None if it owns its storage.
+
+    Read off the operator schema rather than a hand-kept list of view ops, so
+    permute, transpose, squeeze, slice, detach and anything added later are all
+    covered: a return that aliases without writing is exactly a view.
+    """
+    if node.op != "call_function":
+        return None
+    schema = getattr(node.target, "_schema", None)
+    if schema is None or not schema.returns:
+        return None
+    info = schema.returns[0].alias_info
+    if info is None or info.is_write:
+        return None
+    src = node.args[0] if node.args else None
+    return src if isinstance(src, torch.fx.Node) else None
+
+
+def _alias_base(node: torch.fx.Node) -> torch.fx.Node:
+    """Follow views up to the node that actually owns the storage."""
+    seen = {node}
+    while (src := _alias_source(node)) is not None and src not in seen:
+        seen.add(src)
+        node = src
+    return node
+
+
+def _alias_closure(node: torch.fx.Node) -> set:
+    """``node`` plus every view derived from it, transitively."""
+    out = {node}
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        for u in n.users:
+            if u not in out and _alias_source(u) is n:
+                out.add(u)
+                stack.append(u)
+    return out
+
+
 def _breaks_escaping_alias(node: torch.fx.Node, escaping: set) -> bool:
     """True when rewriting would turn an alias the caller can see into a copy.
 
     A reshape left as a view shares storage with its base. Every repair here
-    materialises it instead, so if the view *and* something else aliasing the
-    same base both leave the graph, a caller that mutates one no longer sees
-    the change through the other::
+    materialises it instead, so if the reshape reaches an output *and* some
+    other alias of the same storage also reaches an output, a caller that
+    mutates one no longer sees the change through the other::
 
         def fn(x):
             y = x * 2
-            return y, y.view(4, 8, 8)   # both escape, both alias
+            return y, y.view(4, 8, 8)             # base and view
+            return y.t(), y.view(4, 8, 8)         # sibling view and view
+            return y, y.view(4, 8, 8).transpose(1, 2)   # base and view-of-view
+
+    Both ends are followed through views, so the reshape may reach the output
+    indirectly and the other alias may be any view of the same base. Views
+    derived from the reshape itself do not count: materialising it moves them
+    all together, so nothing observable changes between them.
 
     Leaving such a reshape alone reproduces the base compiler exactly, which
     is the conservative choice: correctness of aliasing beats repairing the
     layout.
     """
-    if node not in escaping:
+    closure = _alias_closure(node)
+    if closure.isdisjoint(escaping):
         return False
-    src = node.args[0]
-    if src in escaping:
-        return True
-    return any(
-        u is not node and u in escaping and u.target in _RESHAPE_OPS for u in src.users
-    )
+    base = _alias_base(node)
+    return any(e not in closure and _alias_base(e) is base for e in escaping)
 
 
 def _call(graph, target, args, kwargs, src_node, fake_mode):
