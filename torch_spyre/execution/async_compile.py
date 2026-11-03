@@ -35,6 +35,7 @@ from torch_spyre._inductor.op_spec import (
     UnimplementedOp,
     find_unimplemented,
 )
+from torch_spyre._inductor.kernel_cost import record_kernel_cost
 from torch_spyre._inductor.kernel_provenance import (
     build_kernel_provenance_descriptor,
 )
@@ -529,6 +530,9 @@ class SpyreAsyncCompile(AsyncCompile):
                     exc_info=True,
                 )
             kernel_provenance = None
+
+        if _spyre_config.kernel_cost_dir:
+            record_kernel_cost(kernel_name, specs, kernel_provenance)
 
         # Keep cache identity and the worker's compiler argument on the same
         # config snapshot, including overrides made with config.patch.

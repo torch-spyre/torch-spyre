@@ -208,6 +208,31 @@ the other compile's work, and a negative delta means another compile reset the
 store mid-pass. Profile with a single compiling thread to get per-compile
 figures.
 
+## Kernel cost sidecar and compile summary
+
+Two opt-in outputs that let a benchmark run be profiled without patching the compiler.
+Both are off by default.
+
+| Variable | Effect |
+|---|---|
+| `TORCH_SPYRE_KERNEL_COST_DIR=dir` | Append one JSON line per compiled kernel to `dir/kernel_cost.<pid>.jsonl` |
+| `TORCH_SPYRE_COMPILE_SUMMARY_DIR=dir` | Write `dir/compile_summary.<pid>.json` at exit (also enables the timing recorder) |
+
+Each sidecar line joins the kernel's `provenance_key` (the key the device trace carries) to the
+analytical cost model's prediction for it: `aten_ops`, and under `cost` the `predicted_us`,
+`hbm_read_bytes`, `hbm_write_bytes`, `lx_bytes`, `macs`, `cores` and `floor_inputs`
+(`bw_peak_gbps`, `mac_peak_per_core_ns`, `fill_ns`, the roofline constants). These are model
+outputs, not measurements. `cost` is `null` for a kernel replayed from the FX graph cache. Setting the
+directory runs the cost model quietly; `SPYRE_DUMP_COST` still controls the printed report.
+
+```json
+{"total_s": 0.87, "passes": {"CustomPreSchedulingPasses:span_reduction": 0.026},
+ "cache": {"entries": 4, "hits": 3, "misses": 1}}
+```
+
+`total_s` sums the `stage:compile_fx:spyre_compile` regions, `passes` is each pass's self time, and
+`cache` counts the kernel cache. `compile_summary.dump(dir)` writes it earlier than exit.
+
 ## FFDC (First Failure Data Capture)
 
 | Variable | Effect |

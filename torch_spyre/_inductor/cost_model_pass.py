@@ -68,7 +68,13 @@ from torch._inductor.ir import ComputedBuffer
 
 from . import config
 from .constants import DEVICE_NAME
-from .cost_model import CostParams, _loop_reread_bytes, predict_ops, relayout_ns
+from .cost_model import (
+    CostParams,
+    _fused_hbm_bytes,
+    _loop_reread_bytes,
+    predict_ops,
+    relayout_ns,
+)
 from .cost_features import extract_op_features
 from .logging_utils import get_inductor_logger
 from .loop_facts import counted_loop_path
@@ -111,6 +117,11 @@ def _enabled() -> bool:
     return str(config.cost_model or "").strip().lower() in _ON
 
 
+def _wanted() -> bool:
+    """The report is also needed, silently, to price the kernel cost sidecar."""
+    return _enabled() or bool(config.kernel_cost_dir)
+
+
 @dataclasses.dataclass
 class OpCost:
     """One operation's share of its group's predicted time.
@@ -147,6 +158,13 @@ class GroupCost:
     loop_trip: int
     predicted_us: float
     ops: list[OpCost]
+    #: Inductor buffer names of the ops, to join a compiled kernel back to its group.
+    buffers: list[str] = dataclasses.field(default_factory=list)
+    #: Bundle totals as ``predict_ops`` sees them: shared external inputs counted once.
+    hbm_read_bytes: int = 0
+    hbm_write_bytes: int = 0
+    macs: int = 0
+    cores: int = 1
 
     @property
     def has_loop(self) -> bool:
@@ -383,6 +401,10 @@ def _price(feats, index, params) -> GroupCost | None:
         gid = getattr(f, "_loop_group_id", None)
         if gid is not None and gid not in gids:
             gids.append(gid)
+    try:
+        hbm_read, hbm_write = (int(b) for b in _fused_hbm_bytes(feats))
+    except Exception:  # noqa: BLE001 - totals are extra detail on a priced kernel
+        hbm_read = hbm_write = 0
     return GroupCost(
         index=index,
         op_names=[f.name for f in feats],
@@ -390,6 +412,11 @@ def _price(feats, index, params) -> GroupCost | None:
         loop_trip=int(max((getattr(f, "loop_trip", 1) or 1) for f in feats)),
         predicted_us=predicted_us,
         ops=ops,
+        buffers=[b for f in feats if (b := getattr(f, "_buffer", None))],
+        hbm_read_bytes=hbm_read,
+        hbm_write_bytes=hbm_write,
+        macs=sum(int(f.matmul_macs) for f in feats if f.is_matmul),
+        cores=max(int(f.cores) for f in feats),
     )
 
 
@@ -415,6 +442,7 @@ def build_report(operations: list, params: CostParams | None = None) -> CostRepo
             try:
                 feats = extract_op_features(op)
                 feats._loop_group_id = _loop_group_id(op)
+                feats._buffer = getattr(op, "get_name", lambda: None)()
             except Exception:  # noqa: BLE001 - skip ops the extractor cannot model
                 feats = None
         if feats is None:
@@ -445,7 +473,7 @@ def cost_model_pass(graph) -> CostReport | None:
     it as ``last_cost_report`` for exactly that reason.
     """
     _STATE.report = None
-    if not _enabled():
+    if not _wanted():
         return None
 
     try:
@@ -457,6 +485,9 @@ def cost_model_pass(graph) -> CostReport | None:
         return None
 
     try:
+        if not _enabled():
+            _STATE.report = report
+            return report
         from .dump_common import banner, emit
 
         emit(

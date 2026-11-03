@@ -88,7 +88,8 @@ def enable_spyre_compile_fx_wrapper():
         patch_inductor_fusions()
 
         _orig = cfx.compile_fx
-        from torch_spyre._inductor import timing_recorder
+        from torch_spyre._inductor import cost_model_pass, timing_recorder
+        from torch_spyre._inductor import compile_summary  # noqa: F401  (atexit dump)
         from torch_spyre._inductor.logging_utils import get_inductor_logger
 
         logger = get_inductor_logger("compile_fx_wrapper")
@@ -188,6 +189,10 @@ def enable_spyre_compile_fx_wrapper():
                                 return _orig(gm, example_inputs, *args, **kwargs)
                     finally:
                         _compile_state.in_spyre_compile = _prev_in_spyre
+                        if not _prev_in_spyre:
+                            # Kernel cost records match on buffer names, which repeat
+                            # across graphs, so a report must not outlive its compile.
+                            cost_model_pass._STATE.report = None
 
                 # Non-Spyre graphs: no FFDC — avoids capturing unrelated CPU
                 # compiles.
