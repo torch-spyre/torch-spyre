@@ -322,6 +322,17 @@ def compute_specs_hash(
                 # bundle.mlir.  Two ops with identical SDSC JSON but different
                 # tile strides produce different compiled kernels and must not
                 # share a cache entry.
+                #
+                # Hash only what bundle.py consumes: per tensor (outer
+                # position), per level outermost-first (inner position, empty
+                # levels kept as []), the stride ints in .values() order --
+                # the same order _collect_affine_maps / _emit_specs flatten
+                # them in.  The dict keys are deliberately dropped: they are
+                # the minted level symbols _tile_adv_{op_name}_lvl{n}
+                # (spyre_kernel._get_or_mint_level_symbol), whose op name
+                # never reaches bundle.mlir but would otherwise give
+                # structurally identical kernels from different ops different
+                # keys.
                 if any(
                     any(level_strides for level_strides in per_level)
                     for per_level in affine_strides
@@ -329,13 +340,9 @@ def compute_specs_hash(
                     content_parts.append(
                         json.dumps(
                             [
-                                [
-                                    {str(k): v for k, v in level.items()}
-                                    for level in per_level
-                                ]
+                                [list(level.values()) for level in per_level]
                                 for per_level in affine_strides
-                            ],
-                            sort_keys=True,
+                            ]
                         ).encode()
                     )
                 _debug_ops.append(entry.op)
