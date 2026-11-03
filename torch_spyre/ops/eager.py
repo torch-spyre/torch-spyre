@@ -158,6 +158,63 @@ def _materialize_offset_view(x):
     return x
 
 
+def _layout_serves_own_view(x) -> bool:
+    """Whether ``x``'s device layout can express reads of ``x``'s own host view.
+
+    A view shares its base's device layout.  ``x[8, 65].reshape(-1)`` or
+    ``x[1, 2, 4, 8, 7].reshape(1, 8, 56)`` keep a layout whose stick coordinate
+    for the new shape is ``Mod(Mod(c0, 65), 64)`` or ``Mod(d1, 7)``, which the
+    compiler cannot represent, so every op reading the view fails.
+    """
+    # Imported here: torch_spyre._inductor imports this module's package.
+    import sympy
+
+    from torch_spyre._C import get_spyre_tensor_layout
+    from torch_spyre._inductor.errors import Unsupported
+    from torch_spyre._inductor.pass_utils import _check_stick_expr_supported
+    from torch_spyre._inductor.views import compute_coordinates
+
+    stl = get_spyre_tensor_layout(x)
+    syms = [
+        sympy.Symbol(f"d{i}", integer=True, nonnegative=True) for i in range(x.dim())
+    ]
+    ranges = {s: n for s, n in zip(syms, x.shape) if n > 1}
+    index = sum(
+        (s * st for s, st in zip(syms, x.stride()) if s in ranges), sympy.S.Zero
+    )
+    try:
+        coords = compute_coordinates(
+            list(stl.device_size), list(stl.stride_map), ranges, index
+        )
+        _check_stick_expr_supported(coords[-1], stl.elems_per_stick())
+    except Unsupported:
+        return False
+    return True
+
+
+def _materialize_unservable_view(x):
+    """Return a canonical-layout copy of a Spyre view whose inherited device
+    layout cannot serve its own shape; pass everything else through unchanged.
+
+    The copy goes through the host, as in ``_normalize_result_layout``, because a
+    device-to-device ``copy_`` would compile the same unsupported read.
+    """
+    if isinstance(x, torch.Tensor):
+        if (
+            x.device.type == "spyre"
+            and x._base is not None
+            and x.dim() > 0
+            and not _layout_serves_own_view(x)
+        ):
+            out = torch.zeros(x.shape, dtype=x.dtype, device=x.device)
+            out.copy_(x.to("cpu"))
+            return out
+        return x
+    if isinstance(x, (list, tuple)):
+        return type(x)(_materialize_unservable_view(e) for e in x)
+    return x
+
+
 warnings.simplefilter("once", RetileWarning)
 
 
@@ -403,12 +460,15 @@ def _make_offset_safe_dispatch(op):
                 return type(x)(prep_write(e) for e in x)
             return x
 
+        def prep_read(x):
+            return _materialize_unservable_view(_materialize_offset_view(x))
+
         args = tuple(
-            prep_write(a) if i in write_positions else _materialize_offset_view(a)
+            prep_write(a) if i in write_positions else prep_read(a)
             for i, a in enumerate(args)
         )
         kwargs = {
-            k: (prep_write(v) if k in write_names else _materialize_offset_view(v))
+            k: (prep_write(v) if k in write_names else prep_read(v))
             for k, v in kwargs.items()
         }
 
