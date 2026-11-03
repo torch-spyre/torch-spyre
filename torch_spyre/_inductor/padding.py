@@ -83,7 +83,7 @@ from torch._inductor.ir import (
 from torch._inductor.ops_handler import DefaultHandler, WrapperHandler
 from torch._inductor.virtualized import V
 
-from .constants import BATCH_MATMUL_FP8_OP, BATCH_MATMUL_OP
+from .constants import BATCH_MATMUL_FP8_OP, BATCH_MATMUL_OP, DEVICE_NAME
 from .errors import Unsupported
 from .ir import (
     FixedTiledLayout,
@@ -1781,9 +1781,10 @@ def is_padded(graph: GraphLowering, node: IRNode | Layout | SpyreTensorLayout):
             return False
         node = layout
     if isinstance(node, Layout):
-        assert isinstance(node, FixedTiledLayout), (
-            f"Expected finalized tiled layout, got {node}"
-        )
+        assert isinstance(node, FixedLayout), f"Expected finalized layout, got {node}"
+        if not isinstance(node, FixedTiledLayout):
+            assert node.device.type != DEVICE_NAME
+            return False
         node = node.device_layout
 
     total_valid_elems = math.prod(node.valid_elements.values())
