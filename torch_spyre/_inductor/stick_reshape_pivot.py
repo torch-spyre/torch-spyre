@@ -181,7 +181,9 @@ def _rewrite(
     else:
         body = [out_shape[-1]]
     pivot_out = prefix + body
-    restickifiable = get_device_dtype(src_val.dtype) in RESTICKIFY_SUPPORTED_DEVICE_DTYPES
+    restickifiable = (
+        get_device_dtype(src_val.dtype) in RESTICKIFY_SUPPORTED_DEVICE_DTYPES
+    )
     on_device = (
         config.stick_reshape_on_device
         and restickifiable
@@ -196,9 +198,7 @@ def _rewrite(
         # values, whether or not the pivot is stick-aligned (128 and 192 fail
         # too), and a size-1 outer dim does not help. Take the host path.
         # TODO(issue#TBD): lift once the restickify restore is understood.
-        if prefix[p] > eps and not any(
-            s > 1 for i, s in enumerate(prefix) if i != p
-        ):
+        if prefix[p] > eps and not any(s > 1 for i, s in enumerate(prefix) if i != p):
             p = None
     if p is not None:
         # The pivot restickify splits work only along the new stick dim, so

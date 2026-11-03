@@ -402,9 +402,7 @@ class TestStickReshapePivot(unittest.TestCase):
         b = torch.randn(1, 2, 4, 8, 7, dtype=torch.float16)
         with self.subTest("cat on stick dim -> host"):
             self._compile_and_check(
-                lambda a, b: torch.cat(
-                    [a.reshape(1, 8, 56), b.reshape(1, 8, 56)], -1
-                )
+                lambda a, b: torch.cat([a.reshape(1, 8, 56), b.reshape(1, 8, 56)], -1)
                 * 1.0,
                 a,
                 b,
@@ -413,9 +411,7 @@ class TestStickReshapePivot(unittest.TestCase):
             )
         with self.subTest("cat on another dim -> pivot"):
             self._compile_and_check(
-                lambda a, b: torch.cat(
-                    [a.reshape(1, 8, 56), b.reshape(1, 8, 56)], 1
-                )
+                lambda a, b: torch.cat([a.reshape(1, 8, 56), b.reshape(1, 8, 56)], 1)
                 * 1.0,
                 a,
                 b,
