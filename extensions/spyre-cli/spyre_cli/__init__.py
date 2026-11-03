@@ -14,4 +14,19 @@
 
 from .core import launch
 
-__all__ = ["launch"]
+__all__ = ["check_kernelspec", "launch", "load_kernelspec"]
+
+
+def __getattr__(name):
+    """Resolve the kernelspec API on first use.
+
+    ``launch_spec`` imports torch at module level, so importing it here would
+    make ``spyre --help`` need torch-spyre present. Deferring keeps the import
+    cost and the dependency at the point of use, while
+    ``spyre_cli.load_kernelspec`` still reads as a plain attribute.
+    """
+    if name in ("load_kernelspec", "check_kernelspec"):
+        from . import launch_spec
+
+        return getattr(launch_spec, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

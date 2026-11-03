@@ -84,10 +84,10 @@ def launch_from_cli(path, inputs, outputs, bindings=None):
 
     # Deferred, like the other torch-spyre imports here: launch_spec imports
     # torch at module level, and `spyre --help` must work without it.
-    from .launch_spec import _load_spec, _tensors_from_spec, check_launch_spec
+    from .launch_spec import _tensors_from_spec, check_kernelspec, load_kernelspec
 
     bindings = bindings or {}
-    spec = _load_spec(path)
+    spec = load_kernelspec(path)
 
     if spec is None and not inputs and not outputs:
         # Nothing to launch with: no spec to read the arguments from, and none
@@ -134,7 +134,7 @@ def launch_from_cli(path, inputs, outputs, bindings=None):
         if spec is not None:
             # Explicit arguments AND a spec: check them rather than trusting
             # them. This is the case that used to launch and return wrong data.
-            problems = check_launch_spec(spec, tensors, bindings)
+            problems = check_kernelspec(spec, tensors, bindings)
             if problems:
                 raise ValueError(
                     "the tensors given do not match what this kernel expects:\n"

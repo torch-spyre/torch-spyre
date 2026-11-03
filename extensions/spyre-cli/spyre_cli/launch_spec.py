@@ -49,8 +49,28 @@ from torch_spyre._inductor.codegen.kernel_launchspec import (
 )
 
 
-def _load_spec(path):
+# ---------------------------------------------------------------------------
+# The two halves of the public API are separate because they take different
+# things at different times. ``load_kernelspec`` takes only a path: it is what
+# a caller reads to find out what tensors to build, so at that point no tensors
+# exist yet and there is nothing to validate. ``check_kernelspec`` takes the
+# tensors, which exist only after the caller has built them from what the spec
+# said. Folding the check into the load would mean validating nothing.
+#
+# Keeping them apart also leaves the caller the choice of policy: the checks
+# come back as a list of problems rather than an exception, so a script can
+# print them, assert on them, or ignore the ones it knows are harmless.
+# ---------------------------------------------------------------------------
+
+
+def load_kernelspec(path):
     """``path``'s launch spec as a ``LaunchSpec``, or None when it has none.
+
+    The artifact's requirements, for a caller who wants to inspect or satisfy
+    them before launching: ``spec.args`` gives each argument's host shape and
+    dtype plus the device layout it must have, ``spec.symbols`` the dimensions
+    that are only known at launch, and ``spec.caller_passes_pool`` whether a
+    pool tensor must be prepended.
 
     Imported lazily, like ``_launch``: this package does not list torch-spyre
     as an install dependency, though a launch needs it present.
@@ -179,7 +199,7 @@ def _layout_mismatch(arg, tensor) -> Optional[str]:
     )
 
 
-def check_launch_spec(
+def check_kernelspec(
     spec, tensors: Sequence, bindings: Optional[dict] = None
 ) -> list[str]:
     """Return the ways ``tensors`` disagree with ``spec``; empty means well-formed.
