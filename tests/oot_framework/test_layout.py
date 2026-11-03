@@ -24,6 +24,11 @@ def rec(key, t_files=None, runner="spyre_pf_x1", flags="", glob=None):
     }
 
 
+def T(minutes, runs=10):
+    """Timings as load_timings returns them, every config with `runs` recorded runs."""
+    return {k: {"p50_min": float(v), "runs": runs} for k, v in minutes.items()}
+
+
 POLICY = {
     **L.DEFAULT_POLICY,
     "target_job_minutes": 8.0,
@@ -51,7 +56,7 @@ def test_short_configs_share_a_bucket_and_long_ones_run_alone():
         "inductor/test_b_config.yaml": 2.0,
         "inductor/test_long_config.yaml": 9.0,
     }
-    out = L.plan(configs, POLICY, timings)
+    out = L.plan(configs, POLICY, T(timings))
     assert (
         out["inductor/test_a_config.yaml"] == out["inductor/test_b_config.yaml"] != ""
     )
@@ -61,7 +66,7 @@ def test_short_configs_share_a_bucket_and_long_ones_run_alone():
 def test_bucket_stays_under_the_time_cap():
     configs = [rec(f"inductor/test_{i}_config.yaml") for i in range(10)]
     timings = {c["key"]: 3.0 for c in configs}
-    out = L.plan(configs, POLICY, timings)
+    out = L.plan(configs, POLICY, T(timings))
     buckets = {}
     for k, b in out.items():
         if b:
@@ -74,7 +79,7 @@ def test_bucket_stays_under_the_time_cap():
 def test_bucket_respects_max_members():
     configs = [rec(f"inductor/test_{i}_config.yaml") for i in range(40)]
     timings = {c["key"]: 0.01 for c in configs}
-    out = L.plan(configs, {**POLICY, "max_members": 5}, timings)
+    out = L.plan(configs, {**POLICY, "max_members": 5}, T(timings))
     counts = {}
     for b in out.values():
         counts[b] = counts.get(b, 0) + 1
@@ -92,7 +97,7 @@ def test_bucket_respects_max_members():
 def test_never_mixes_runner_flags_or_global(field, a, b):
     x, y = rec("inductor/test_a_config.yaml"), rec("inductor/test_b_config.yaml")
     x[field], y[field] = a, b
-    out = L.plan([x, y], POLICY, {x["key"]: 0.5, y["key"]: 0.5})
+    out = L.plan([x, y], POLICY, T({x["key"]: 0.5, y["key"]: 0.5}))
     assert out[x["key"]] == "" and out[y["key"]] == ""
 
 
@@ -102,7 +107,7 @@ def test_never_puts_two_configs_on_one_test_file_together():
         rec("inductor/test_a_config.yaml", shared),
         rec("inductor/test_b_config.yaml", shared),
     ]
-    out = L.plan(configs, POLICY, {c["key"]: 0.5 for c in configs})
+    out = L.plan(configs, POLICY, T({c["key"]: 0.5 for c in configs}))
     assert (
         out["inductor/test_a_config.yaml"] == ""
         or out["inductor/test_a_config.yaml"] != out["inductor/test_b_config.yaml"]
@@ -120,7 +125,7 @@ def test_groups_differing_only_in_global_get_distinct_bucket_names():
         rec("d/test_c_config.yaml", glob=g2),
         rec("d/test_e_config.yaml", glob=g2),
     ]
-    out = L.plan(configs, POLICY, {c["key"]: 0.5 for c in configs})
+    out = L.plan(configs, POLICY, T({c["key"]: 0.5 for c in configs}))
     assert out["d/test_a_config.yaml"] == out["d/test_b_config.yaml"]
     assert out["d/test_c_config.yaml"] == out["d/test_e_config.yaml"]
     assert out["d/test_a_config.yaml"] != out["d/test_c_config.yaml"]
@@ -134,24 +139,44 @@ def test_exclude_keeps_a_directory_out_of_buckets():
     out = L.plan(
         configs,
         {**POLICY, "exclude": ["distributed_tests/"]},
-        {c["key"]: 0.5 for c in configs},
+        T({c["key"]: 0.5 for c in configs}),
     )
     assert set(out.values()) == {""}
 
 
-def test_unknown_config_uses_the_default_and_is_still_grouped():
-    configs = [rec("inductor/test_new_config.yaml"), rec("inductor/test_a_config.yaml")]
-    out = L.plan(configs, POLICY, {"inductor/test_a_config.yaml": 1.0})
-    assert (
-        out["inductor/test_new_config.yaml"] == out["inductor/test_a_config.yaml"] != ""
+def test_config_with_no_timing_runs_alone():
+    configs = [
+        rec("inductor/test_new_config.yaml"),
+        rec("inductor/test_a_config.yaml"),
+        rec("inductor/test_b_config.yaml"),
+    ]
+    out = L.plan(
+        configs,
+        POLICY,
+        T({"inductor/test_a_config.yaml": 1.0, "inductor/test_b_config.yaml": 1.0}),
     )
+    assert out["inductor/test_new_config.yaml"] == ""
+    assert (
+        out["inductor/test_a_config.yaml"] == out["inductor/test_b_config.yaml"] != ""
+    )
+
+
+@pytest.mark.parametrize("runs,grouped", [(0, False), (4, False), (5, True), (6, True)])
+def test_config_runs_alone_until_it_has_min_runs(runs, grouped):
+    configs = [rec("inductor/test_new_config.yaml"), rec("inductor/test_a_config.yaml")]
+    timings = {
+        **T({"inductor/test_a_config.yaml": 1.0}),
+        **T({"inductor/test_new_config.yaml": 1.0}, runs=runs),
+    }
+    out = L.plan(configs, {**POLICY, "min_runs": 5}, timings)
+    assert (out["inductor/test_new_config.yaml"] != "") is grouped
 
 
 def test_plan_is_deterministic_whatever_the_input_order():
     configs = [rec(f"inductor/test_{i}_config.yaml") for i in range(30)]
     timings = {c["key"]: (i % 7) * 0.4 for i, c in enumerate(configs)}
-    assert L.plan(configs, POLICY, timings) == L.plan(
-        list(reversed(configs)), POLICY, timings
+    assert L.plan(configs, POLICY, T(timings)) == L.plan(
+        list(reversed(configs)), POLICY, T(timings)
     )
 
 
@@ -160,6 +185,7 @@ def test_plan_is_deterministic_whatever_the_input_order():
     [
         '{"target_job_minutes": 0}',
         '{"max_members": 1}',
+        '{"min_runs": 0}',
         '{"threshold_minutes": "x"}',
         '{"unknown_knob": 3}',
         '{"exclude": "distributed_tests/"}',
@@ -177,9 +203,13 @@ def test_missing_policy_turns_grouping_off(tmp_path):
     assert L.load_policy(str(tmp_path / "absent.json")) is None
 
 
-def test_malformed_timings_is_an_error(tmp_path):
+@pytest.mark.parametrize(
+    "entry",
+    [{"p50_min": -1, "runs": 9}, {"p50_min": 1.0}, {"p50_min": 1.0, "runs": "9"}, 3],
+)
+def test_malformed_timings_is_an_error(tmp_path, entry):
     p = tmp_path / "t.json"
-    p.write_text(json.dumps({"configs": {"a.yaml": {"p50_min": -1}}}))
+    p.write_text(json.dumps({"configs": {"a.yaml": entry}}))
     with pytest.raises(L.LayoutError):
         L.load_timings(str(p))
 
@@ -250,9 +280,9 @@ def test_filter_configs_folds_a_bucket_into_one_matrix_entry(tmp_path):
         cfgdir,
         {"target_job_minutes": 8},
         {
-            "inductor/test_a_config.yaml": {"p50_min": 1},
-            "inductor/test_b_config.yaml": {"p50_min": 1},
-            "inductor/test_big_config.yaml": {"p50_min": 12},
+            "inductor/test_a_config.yaml": {"p50_min": 1, "runs": 9},
+            "inductor/test_b_config.yaml": {"p50_min": 1, "runs": 9},
+            "inductor/test_big_config.yaml": {"p50_min": 12, "runs": 9},
         },
     )
     assert rc == 0, err
@@ -324,8 +354,8 @@ def test_filter_configs_applies_on_the_trunk_scan_root(tmp_path):
         cfgdir,
         {"target_job_minutes": 8},
         {
-            "inductor/test_a_config.yaml": {"p50_min": 1},
-            "inductor/test_b_config.yaml": {"p50_min": 1},
+            "inductor/test_a_config.yaml": {"p50_min": 1, "runs": 9},
+            "inductor/test_b_config.yaml": {"p50_min": 1, "runs": 9},
         },
     )
     assert rc == 0, err

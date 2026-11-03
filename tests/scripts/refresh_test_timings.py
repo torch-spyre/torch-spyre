@@ -7,8 +7,9 @@ schedule and review the data diff in a PR.
 
 Each config's time is the median, over the window, of its summed test-case durations per run, on
 first attempts. Keys are config paths relative to tests/configs/torch_spyre_tests/, the same as
-.github/runner_overrides.yaml. Configs on disk with no runs in the window are left out, and the
-grouping then sizes them with the policy's default_minutes.
+.github/runner_overrides.yaml. Every config with at least one run is written with its run count;
+the grouping trusts a median only from the policy's min_runs on, and runs a config with fewer (or
+with no entry at all, i.e. new) as its own job until then.
 
 Connection: by default the repo's ClickHouse client (CLICKHOUSE_HOST / CLICKHOUSE_USER /
 CLICKHOUSE_PASS, see extensions/clickhouse-ingest). For a laptop, --http-url plus --token-file
@@ -42,7 +43,7 @@ FROM (
     AND props['source_file'] != '' AND duration_s >= 0
   GROUP BY stem, run_id
 )
-GROUP BY stem HAVING runs >= {min_runs}
+GROUP BY stem
 FORMAT JSONEachRow
 """
 
@@ -79,7 +80,6 @@ def main(argv=None) -> int:
     )
     ap.add_argument("--out", default=".github/test_timings.json")
     ap.add_argument("--days", type=int, default=30)
-    ap.add_argument("--min-runs", type=int, default=5)
     ap.add_argument("--db", default="spyre_v2")
     ap.add_argument(
         "--http-url", default="", help="ClickHouse HTTP endpoint (laptop use)"
@@ -87,7 +87,7 @@ def main(argv=None) -> int:
     ap.add_argument("--token-file", default="", help="file holding the HTTP password")
     args = ap.parse_args(argv)
 
-    sql = QUERY.format(db=args.db, days=args.days, min_runs=args.min_runs)
+    sql = QUERY.format(db=args.db, days=args.days)
     if args.http_url:
         token = Path(args.token_file).expanduser().read_text().strip()
         rows = query_http(args.http_url, token, sql)

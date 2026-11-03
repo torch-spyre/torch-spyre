@@ -8,7 +8,9 @@ never written into the test configs. Two files feed it:
                                    (tests/scripts/refresh_test_timings.py)
 
 Each config the tier filter selected is either `alone` (its own job, as today) or in a `bucket`
-with other short configs. A config at or above the policy's threshold always runs alone. Members of
+with other short configs. A config at or above the policy's threshold always runs alone, and so does
+a config with fewer than `min_runs` recorded runs (a new one, say): it runs on its own until its
+median is worth trusting, then the next refresh of the timings bins it. Members of
 a bucket share a runner, directory, flags and `global:` block, and never two of them name the same
 test file, so a bucket runs exactly the tests its members would run on their own.
 
@@ -26,7 +28,7 @@ DEFAULT_POLICY: dict = {
     "target_job_minutes": 8.0,
     "max_members": 16,
     "threshold_minutes": 4.0,
-    "default_minutes": 1.0,
+    "min_runs": 5,
     "exclude": [],
 }
 
@@ -49,13 +51,14 @@ def load_policy(path: Optional[str]) -> Optional[dict]:
     if unknown:
         raise LayoutError(f"{path}: unknown key(s) {sorted(unknown)}")
     policy = {**DEFAULT_POLICY, **{k: v for k, v in raw.items() if k != "_comment"}}
-    for name in ("target_job_minutes", "threshold_minutes", "default_minutes"):
+    for name in ("target_job_minutes", "threshold_minutes"):
         v = policy[name]
         if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
             raise LayoutError(f"{path}: {name} must be a positive number, got {v!r}")
-    v = policy["max_members"]
-    if isinstance(v, bool) or not isinstance(v, int) or v < 2:
-        raise LayoutError(f"{path}: max_members must be an integer >= 2, got {v!r}")
+    for name, low in (("max_members", 2), ("min_runs", 1)):
+        v = policy[name]
+        if isinstance(v, bool) or not isinstance(v, int) or v < low:
+            raise LayoutError(f"{path}: {name} must be an integer >= {low}, got {v!r}")
     if not isinstance(policy["exclude"], list) or not all(
         isinstance(e, str) for e in policy["exclude"]
     ):
@@ -65,8 +68,8 @@ def load_policy(path: Optional[str]) -> Optional[dict]:
     return policy
 
 
-def load_timings(path: Optional[str]) -> Dict[str, float]:
-    """{config key: median minutes of tests}; {} when absent (every config then counts as unknown)."""
+def load_timings(path: Optional[str]) -> Dict[str, dict]:
+    """{config key: {"p50_min", "runs"}}; {} when absent (every config then runs alone)."""
     if not path or not Path(path).is_file():
         return {}
     try:
@@ -78,12 +81,16 @@ def load_timings(path: Optional[str]) -> Dict[str, float]:
         raise LayoutError(f'{path}: expected a "configs" object')
     out = {}
     for key, rec in configs.items():
-        t = rec.get("p50_min") if isinstance(rec, dict) else None
+        if not isinstance(rec, dict):
+            raise LayoutError(f"{path}: {key}: expected an object, got {rec!r}")
+        t, n = rec.get("p50_min"), rec.get("runs")
         if isinstance(t, bool) or not isinstance(t, (int, float)) or t < 0:
             raise LayoutError(
                 f"{path}: {key}: p50_min must be a number >= 0, got {t!r}"
             )
-        out[key] = float(t)
+        if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+            raise LayoutError(f"{path}: {key}: runs must be an integer >= 0, got {n!r}")
+        out[key] = {"p50_min": float(t), "runs": n}
     return out
 
 
@@ -93,7 +100,7 @@ def step_overhead(minutes: float) -> float:
 
 
 def plan(
-    configs: List[dict], policy: Optional[dict], timings: Dict[str, float]
+    configs: List[dict], policy: Optional[dict], timings: Dict[str, dict]
 ) -> Dict[str, str]:
     """{config key: bucket name, or "" to run alone} for the configs one matrix will run.
 
@@ -106,14 +113,21 @@ def plan(
     groups: Dict[tuple, List[dict]] = {}
     for c in configs:
         key = c["key"]
-        t = timings.get(key, float(policy["default_minutes"]))
+        rec = timings.get(key)
         excluded = any(
             key == e or (e.endswith("/") and key.startswith(e))
             for e in policy["exclude"]
         )
-        if excluded or t >= float(policy["threshold_minutes"]):
+        # Too few runs to size it: alone, exactly as it would run without grouping.
+        if (
+            excluded
+            or rec is None
+            or rec["runs"] < policy["min_runs"]
+            or rec["p50_min"] >= float(policy["threshold_minutes"])
+        ):
             out[key] = ""
             continue
+        t = rec["p50_min"]
         group = (
             c["runner"],
             c["dir"],
