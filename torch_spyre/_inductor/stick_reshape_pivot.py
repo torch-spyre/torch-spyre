@@ -57,12 +57,14 @@ from typing import Optional
 
 import torch
 import torch.fx
+from torch.utils import _pytree as pytree
 
 from torch_spyre._C import get_device_dtype, get_elem_in_stick
 
 from . import config
 from .constants import RESTICKIFY_SUPPORTED_DEVICE_DTYPES
 from .logging_utils import get_inductor_logger
+from .padding import round_up_to_stick
 from .pass_utils import copy_fx_custom_meta
 from .work_division import MAX_SPAN_BYTES
 
@@ -114,13 +116,8 @@ def _stick_reshape_kind(
     reshaped too (``(C, L) -> (1, C, H, W)``); that part never touches the
     stick and is done as a separate plain view. Returns None otherwise.
     """
-    if in_shape[-1:] == out_shape[-1:]:
+    if in_shape == out_shape or in_shape[-1:] == out_shape[-1:]:
         return None  # stick dim untouched
-    if _strip_trailing_ones(in_shape) == _strip_trailing_ones(out_shape):
-        # Only trailing size-1 dims differ, as in a keepdim view
-        # ``(B, L) <-> (B, L, 1)``. No element moves and the backend already
-        # handles these, so repairing them would be pure overhead.
-        return None
     # A sub-stick reshape (64 -> 8x8) is NOT free either: the destination pads
     # every row to a whole stick, so (8, 8) occupies 8 sticks where (64,)
     # occupies 1. Measured on upstream: every split of one stick, and every
@@ -169,20 +166,11 @@ def _feeds_stick_dim_cat(node: torch.fx.Node) -> bool:
 
 def _escaping_nodes(graph: torch.fx.Graph) -> set:
     """Every node the graph returns, flattened out of the output structure."""
-    out = next((n for n in graph.nodes if n.op == "output"), None)
-    if out is None:
+    try:
+        out = graph.output_node()
+    except (AssertionError, RuntimeError, StopIteration):
         return set()
-    seen: set = set()
-    stack = [out.args]
-    while stack:
-        a = stack.pop()
-        if isinstance(a, torch.fx.Node):
-            seen.add(a)
-        elif isinstance(a, (list, tuple)):
-            stack.extend(a)
-        elif isinstance(a, dict):
-            stack.extend(a.values())
-    return seen
+    return {a for a in pytree.tree_leaves(out.args) if isinstance(a, torch.fx.Node)}
 
 
 def _alias_source(node: torch.fx.Node) -> Optional[torch.fx.Node]:
@@ -275,13 +263,19 @@ def _call(graph, target, args, kwargs, src_node, fake_mode):
 
 
 def _rewrite(
-    node: torch.fx.Node, kind: str, prefix: list[int], out_shape: list[int]
+    node: torch.fx.Node,
+    kind: str,
+    prefix: list[int],
+    out_shape: list[int],
+    final_shape: list[int],
 ) -> None:
+    """Rewrite ``node``. ``out_shape`` has trailing size-1 dims stripped and
+    drives the pivot; ``final_shape`` is what the node's users expect."""
     graph = node.graph
     src = node.args[0]
     src_val = src.meta["val"]
     fake_mode = src_val.fake_mode
-    in_shape = list(src_val.shape)
+    in_shape = _strip_trailing_ones(list(src_val.shape))
     # The pivot always runs on the input's own outer dims and produces
     # ``pivot_out``; any reshape of the outer dims happens afterwards, as a
     # plain view of the pivot's contiguous result. (A view in front of the
@@ -324,19 +318,25 @@ def _rewrite(
         # bigger of the two by far -- 7 padded to 64 is 9x -- so checking only
         # the pivot would let work division fail where this means to fall back.
         esize = src_val.element_size()
-        padded_pivot = -(-prefix[p] // eps) * eps
+        dt = src_val.dtype
+        padded_pivot = round_up_to_stick(prefix[p], dt)
         pivot_bytes = prod(in_shape) // prefix[p] * padded_pivot * esize
-        padded_body = -(-body[-1] // eps) * eps
+        padded_body = round_up_to_stick(body[-1], dt)
         body_bytes = prod(in_shape) // body[-1] * padded_body * esize
         if max(pivot_bytes, body_bytes) > MAX_SPAN_BYTES:
             p = None
 
     with graph.inserting_before(node):
+        if list(src_val.shape) != in_shape:
+            # Drop the input's trailing size-1 dims first: they carry no
+            # elements but would otherwise land on the stick and be padded to
+            # a whole one. Re-added by the view to final_shape at the end.
+            src = _call(graph, aten.view.default, (src, in_shape), {}, node, fake_mode)
         if p is None:
             new = _call(
                 graph,
                 torch.ops.spyre.reshape_via_cpu.default,
-                (src, out_shape),
+                (src, final_shape),
                 {},
                 node,
                 fake_mode,
@@ -390,9 +390,9 @@ def _rewrite(
                 node,
                 fake_mode,
             )
-            if pivot_out != out_shape:
+            if pivot_out != final_shape:
                 new = _call(
-                    graph, aten.view.default, (new, out_shape), {}, node, fake_mode
+                    graph, aten.view.default, (new, final_shape), {}, node, fake_mode
                 )
                 # Materialise the outer merge. Left as a plain view, Inductor
                 # folds it away and consumers see the pivot's higher-rank
@@ -445,7 +445,12 @@ def pivot_unaligned_stick_reshapes(graph: torch.fx.Graph) -> None:
             eps = get_elem_in_stick(src_val.dtype)
         except Exception:
             continue  # dtype without a stick layout
-        found = _stick_reshape_kind(in_shape, out_shape, eps)
+        # Classify on shapes without trailing size-1 dims. They hold no
+        # elements, but an innermost 1 is never a multiple of the stick, so
+        # leaving them on makes every keepdim view look unaligned.
+        work_in = _strip_trailing_ones(in_shape)
+        work_out = _strip_trailing_ones(out_shape)
+        found = _stick_reshape_kind(work_in, work_out, eps)
         if found is None:
             continue
         # Last, because it is the only check that walks the graph: the cheap
@@ -455,5 +460,5 @@ def pivot_unaligned_stick_reshapes(graph: torch.fx.Graph) -> None:
         if _breaks_escaping_alias(node, escaping):
             continue
         kind, prefix = found
-        _rewrite(node, kind, prefix, out_shape)
+        _rewrite(node, kind, prefix, work_out, out_shape)
     graph.lint()
