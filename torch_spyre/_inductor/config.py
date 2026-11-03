@@ -98,6 +98,14 @@ def pool_allocated_by_frontend() -> bool:
 # lowering does not yet support (grouped/transposed/non-fp16).
 conv2d_direct_lowering: bool = os.environ.get("SPYRE_CONV2D_DIRECT", "0") == "1"
 
+# Largest fp32 product, in bytes, one step of the fp32 matmul decomposition
+# materializes. An fp32 mm/bmm multiplies on the vector unit and writes its whole
+# [..., M, N, K] product before summing over K; a larger product is computed in
+# M tiles that each fit this budget.
+fp32_matmul_product_bytes: int = int(
+    os.environ.get("SPYRE_FP32_MATMUL_PRODUCT_BYTES", str(64 * 1024**2))
+)
+
 # Extend the phase-2 matmul perf reorder (NDO) to the matmul's own output
 # buffer in addition to its input buffers. Off by default until the
 # interaction with downstream span limits is fully validated.
