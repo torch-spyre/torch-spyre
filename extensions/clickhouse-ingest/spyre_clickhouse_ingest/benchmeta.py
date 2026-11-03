@@ -15,9 +15,10 @@
 """Run context beside a vLLM bench's results, flattened to benchmark_runs.props.
 
 `env.json`, `phases.json`, `host_resources.json`, `outputs.json` and `compile_summary.json`
-sit in the results dir (shared by every test) or as `<test_name>.<kind>.json` (that test only,
-taking precedence). Each is optional and a malformed one is skipped: they describe a run, they
-never decide whether it is ingested.
+are read from `<results>/<test_name>/<kind>.json`, else `<results>/<test_name>.<kind>.json`, else a
+shared `<results>/<kind>.json`. `repeats/` is never read: only the first run is ingested.
+Each is optional and a malformed one is skipped: they describe a run, they never decide
+whether it is ingested.
 """
 
 import hashlib
@@ -44,9 +45,9 @@ def is_sidecar(filename: str) -> bool:
 
 def _load(results_dir: str, test_name: str, kind: str) -> dict[str, Any]:
     # <test_name>.host_resources.json is already the sampler's per-record file.
-    names = [f"{kind}.json"]
+    names = [os.path.join(test_name, f"{kind}.json"), f"{kind}.json"]
     if kind != "host_resources":
-        names.insert(0, f"{test_name}.{kind}.json")
+        names.insert(1, f"{test_name}.{kind}.json")
     for name in names:
         path = os.path.join(results_dir, name)
         if not os.path.isfile(path):
