@@ -43,7 +43,7 @@ from .span_overflow_hint_analysis import (
     plan_span_overflow_tile,
 )
 
-logger = get_inductor_logger("coarse_tile")
+logger = get_inductor_logger("wsr.coarse_tile")
 
 _SPAN_OVERFLOW_HINT_ID = 10000
 
@@ -248,27 +248,34 @@ def _dims_to_hints(
     for (host_dim, split_count, is_reduction), hint_id in zip(dims, hint_ids):
         if is_reduction:
             reduction_ranges = list(getattr(op.data, "reduction_ranges", []))
-            if host_dim >= len(reduction_ranges):
+            # host_dim counts the non-size-1 reduction dims (the squeezed
+            # frame _supports_reduction_range_tiling documents), while the
+            # applier divides the reduction_ranges entry that dim sits at.
+            not_one = [i for i, r in enumerate(reduction_ranges) if r != 1]
+            if host_dim >= len(not_one):
                 raise Unsupported(
                     f"Cannot adapt span-overflow reduction plan for {op.get_name()}: "
-                    f"host_dim={host_dim} is out of bounds for reduction ranges "
-                    f"{reduction_ranges}."
+                    f"host_dim={host_dim} is out of bounds for the {len(not_one)} "
+                    f"non-size-1 dims of reduction ranges {reduction_ranges}."
                 )
+            # _bmm_k_symbol resolves the single reduction-only symbol for BMM K
+            # and, since span_overflow_hint_analysis widened its gate, for a
+            # supported non-matmul reduction (sum/prod/max/min) too.
             loop_var = _bmm_k_symbol(op)
             if loop_var is None:
                 raise Unsupported(
                     f"Cannot adapt span-overflow reduction plan for {op.get_name()}: "
-                    "could not identify the BMM K loop variable."
+                    "could not identify the reduction loop variable."
                 )
             try:
                 reduction_pos = _loop_var_to_reduction_ranges_pos(op, loop_var)
             except (StopIteration, AttributeError, TypeError, ValueError):
                 reduction_pos = None
-            if reduction_pos != host_dim:
+            if reduction_pos != not_one[host_dim]:
                 raise Unsupported(
                     f"Cannot adapt span-overflow reduction plan for {op.get_name()}: "
-                    f"BMM K loop variable {loop_var} maps to reduction range "
-                    f"position {reduction_pos}, expected {host_dim}."
+                    f"reduction loop variable {loop_var} maps to reduction range "
+                    f"position {reduction_pos}, expected {not_one[host_dim]}."
                 )
             coord = loop_var
         else:
@@ -361,9 +368,9 @@ def span_overflow_groups(
     """Build coarse_tile_post_stickify() groups from automatic span-overflow
     plans.
 
-    This adapter converts SpanOverflowTilePlans into the same group shape as
-    user spyre_hint annotations: ``[(ops, [(hint_id, count)])]``.  Ops that
-    already carry user dim hints are left for the user-hint grouping path.
+    This adapter converts SpanOverflowTilePlans into the same group shape that
+    for_each_tile's lowering builds: ``[(ops, [(hint_id, count)])]``.  Ops that
+    a for_each_tile loop already tiles (they carry dim hints) are left alone.
     ``is_reduction`` is not carried in the group-level ``levels`` list; it
     lives on each op's own ``DimHint`` and is consulted directly by
     ``plan_coarse_tile_groups``.
@@ -433,10 +440,9 @@ def span_overflow_groups(
     """
     from .. import config
 
-    if config.ignore_wsr_hints or config.ignore_span_overflow_hints:
+    if config.ignore_span_overflow_hints:
         logger.debug(
-            "[span-overflow groups] disabled ignore_wsr_hints=%s ignore_span_overflow_hints=%s",
-            config.ignore_wsr_hints,
+            "[span-overflow groups] disabled ignore_span_overflow_hints=%s",
             config.ignore_span_overflow_hints,
         )
         return [], []
@@ -456,12 +462,13 @@ def span_overflow_groups(
     # reading such a producer gets a precise "multi-consumer not yet supported"
     # error rather than the generic pointwise-only conflict message.
     reduction_joined_producers: set[str] = set()
-    # Producers already tiled by a user spyre_hint (assign_dim_hints runs
-    # before this pass and leaves dim_hints set; hints_to_coarse_tile_groups
-    # only reads it, it never clears it). An op reading one of these has the
+    # Producers already tiled by a for_each_tile loop: splice_while_loops runs
+    # earlier and stamps their dim_hints, and this pass never clears them (it
+    # applies span-overflow hints only after planning, so any dim_hints seen
+    # here came from a for_each_tile loop). An op reading one of these has the
     # same unsynchronized-loop-nest risk as reading an auto_tiled_producers
     # entry, so both sets guard the same conflict checks below.
-    manually_hinted_producers: set[str] = {
+    loop_tiled_producers: set[str] = {
         op.get_name()
         for op in graph.operations
         if isinstance(op, ComputedBuffer) and getattr(op, "dim_hints", [])
@@ -482,8 +489,15 @@ def span_overflow_groups(
     # join branch is deliberately *not* keyed on this flag.
     current_root_is_reduction = False
 
+    def allocate_hint_ids(signature: _PwDims) -> list[int]:
+        """Reserve one contiguous hint-ID range for a coarse-tile group."""
+        nonlocal next_hint_id
+        hint_ids = list(range(next_hint_id, next_hint_id + len(signature)))
+        next_hint_id += len(signature)
+        return hint_ids
+
     def flush_current_group() -> None:
-        nonlocal next_hint_id, current_group, current_signature
+        nonlocal current_group, current_signature
         nonlocal current_root_is_reduction
         if not current_group:
             current_root_is_reduction = False
@@ -491,8 +505,7 @@ def span_overflow_groups(
 
         signature = current_signature
         assert signature is not None
-        hint_ids = list(range(next_hint_id, next_hint_id + len(signature)))
-        next_hint_id += len(signature)
+        hint_ids = allocate_hint_ids(signature)
         levels = [
             (hint_id, sympy.Integer(split_count))
             for hint_id, (_host_dim, split_count, _is_reduction) in zip(
@@ -542,7 +555,7 @@ def span_overflow_groups(
         plan = plan_span_overflow_tile(op, config.sencores)
         if plan is None:
             # op needs no coarse tiling of its own.  It's always safe to leave
-            # it outside any loop: Pass 3's outside-consumer path
+            # it outside any loop: Pass 2's outside-consumer path
             # (coarse_tile.py) already patches consumers of a tiled producer
             # to read a full, reassembled buffer, and plan_span_overflow_tile
             # returning None here means that op's own full-size reads/writes
@@ -552,7 +565,7 @@ def span_overflow_groups(
             continue
 
         signature = _auto_span_plan_signature(plan)
-        reduction_only_plan = bool(signature) and all(
+        has_reduction_range = any(
             is_reduction for _host_dim, _split, is_reduction in signature
         )
         logger.debug(
@@ -571,7 +584,7 @@ def span_overflow_groups(
         )
 
         completed_conflicts = sorted(
-            read_deps & (auto_tiled_producers | manually_hinted_producers)
+            read_deps & (auto_tiled_producers | loop_tiled_producers)
         )
         joined_conflicts = sorted(set(completed_conflicts) & reduction_joined_producers)
         if joined_conflicts:
@@ -595,8 +608,8 @@ def span_overflow_groups(
                 f"Cannot auto-tile {op.get_name()}: it reads already-tiled "
                 f"producer(s) {completed_conflicts} that are not in an open "
                 "group this op can join — either their coarse-tile group has "
-                "already been flushed, or they were tiled by a user "
-                "spyre_hint. Automatic span-overflow grouping can only fuse a "
+                "already been flushed, or they are tiled by a for_each_tile "
+                "loop. Automatic span-overflow grouping can only fuse a "
                 "consumer into a producer's group while that group is still "
                 "open (the producers must be contiguous with the consumer), so "
                 "tiling this producer and consumer independently can produce "
@@ -768,13 +781,12 @@ def span_overflow_groups(
             continue
 
         # A Reduction/BMM op that did not join an open producer group (above)
-        # either opens a run of its own (for output-range tiles) or stays as an
-        # independent singleton (for reduction-range/K-only tiles).  K-only
-        # plans cannot join or root a producer-consumer run because each K tile
-        # is only a partial accumulation.
-        if reduction_only_plan:
-            hint_ids = list(range(next_hint_id, next_hint_id + len(signature)))
-            next_hint_id += len(signature)
+        # either opens a run of its own (for output-only tiles) or stays as an
+        # independent singleton (for any plan containing a reduction-range tile).
+        # A K level is a partial accumulation, so K-only and combined output+K
+        # plans cannot join or root a producer-consumer run.
+        if has_reduction_range:
+            hint_ids = allocate_hint_ids(signature)
             dim_hint_assignments.append((op, _dims_to_hints(op, signature, hint_ids)))
             levels = [
                 (hint_id, sympy.Integer(split_count))
@@ -783,6 +795,7 @@ def span_overflow_groups(
                 )
             ]
             groups.append(([op], levels))
+            auto_tiled_producers.add(op.get_name())
             logger.debug(
                 "[span-overflow groups] created group_index=%d op=%s levels=%s",
                 len(groups) - 1,

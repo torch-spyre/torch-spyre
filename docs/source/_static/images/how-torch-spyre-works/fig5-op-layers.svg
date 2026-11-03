@@ -41,6 +41,6 @@
   <rect x="220" y="356" width="760" height="70" rx="4"
         fill="#F8FAFF" stroke="#B0BDD8" stroke-width="1" stroke-dasharray="5 3"/>
   <text x="600" y="374" text-anchor="middle" font-size="14" font-weight="600" fill="#1f2937">CPU Fallback (infrequent ops, off the critical path)</text>
-  <text x="600" y="393" text-anchor="middle" font-size="12" fill="#1f2937">arange · cumsum · repeat · sin · cos · tril · triu · isin · where · index_copy · any · normal_ · random_ · argmax · argmin · bitwise_or · bitwise_xor · int64 max/min</text>
+  <text x="600" y="393" text-anchor="middle" font-size="12" fill="#1f2937">arange · cumsum · repeat · sin · cos · tril · isin · where · index_copy · any · normal_ · random_ · argmax · argmin · bitwise_or · bitwise_xor · int64 max/min</text>
   <text x="600" y="411" text-anchor="middle" font-size="12" fill="#1f2937" font-style="italic">auto-transfer to CPU, transparent to the user</text>
 </svg>

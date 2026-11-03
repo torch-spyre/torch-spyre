@@ -102,10 +102,10 @@ Spyre-specific but affects what reaches the Spyre backend.
 
 ---
 
-## dxp\_standalone Compilation Failure
+## dbo-opt Compilation Failure
 
-**Error:** Non-zero exit code from `dxp_standalone`, timeout, or CBOR
-errors
+**Error:** Non-zero exit code from `dbo-opt`, timeout, or exit 0 with no
+`spyreCodeDir/spyrecode.json` written
 
 **Cause:** The generated SuperDSC JSON is invalid or uses unsupported
 features.
@@ -113,7 +113,8 @@ features.
 **Fix:**
 
 - Use `TORCH_COMPILE_DEBUG=1` to find the JSON in `torch_compile_debug/`
-- Run `dxp_standalone` manually with the JSON to get detailed output
+- Re-run `dbo-opt --export-dir=<dir> -kEmitSpyreCode <dir>/bundle.mlir`
+  manually; add `DBO_DEBUG=1` for numbered per-pass dumps
 - Check `torch_spyre/_inductor/codegen/superdsc.py` for the generated
   descriptor
 - Verify op parameters in `torch_spyre/_inductor/codegen/compute_ops.py`

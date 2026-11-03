@@ -1,0 +1,5 @@
+test_suite_config:
+  labels: [unit, regression, trunk]
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_qfp8wt_k_constraint.py
+      unlisted_test_mode: mandatory_success

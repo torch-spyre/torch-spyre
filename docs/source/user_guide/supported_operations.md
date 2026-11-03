@@ -6,6 +6,13 @@ This page lists the PyTorch operations that Torch-Spyre supports via
 For details on how operations are implemented and how to add new ones,
 see [Adding Operations](../compiler/adding_operations.md).
 
+Runnable scripts for several of these operations are in the examples
+directory. See the [attention example](https://github.com/torch-spyre/torch-spyre/blob/main/docs/source/user_guide/examples/attention.py) and the
+[flash attention example](https://github.com/torch-spyre/torch-spyre/blob/main/docs/source/user_guide/examples/flash_attention.py) for scaled
+dot-product attention, the [RMS norm example](https://github.com/torch-spyre/torch-spyre/blob/main/docs/source/user_guide/examples/rms_norm.py), the
+[embedding example](https://github.com/torch-spyre/torch-spyre/blob/main/docs/source/user_guide/examples/embedding.py), and the
+[FP8 quantization example](https://github.com/torch-spyre/torch-spyre/blob/main/docs/source/user_guide/examples/fp8.py).
+
 ## Operations Table
 
 | Operation | Eager | Compiled | Execution | Notes |
@@ -15,10 +22,16 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.matmul` | Y | Y | Spyre | Decomposes to `mm`/`bmm`, both of which have eager kernels |
 | `torch.addmm` | Y | Y | Spyre | Decomposed to `mm` + `add` |
 | `torch.bmm` | Y | Y | Spyre | |
-| `torch._scaled_mm` | | Y | Spyre | Compiled only; decomposed to `spyre.scaled_mm` (decomposition in `_inductor/decompositions.py`, lowering in `_inductor/lowering.py`) |
+| `torch._grouped_mm` | Y | Y | Spyre | All four upstream shape variants; the ragged ones pack/`bmm`/unpack with host-computed routing tables. BF16 only; `offs` must be a Spyre tensor; raises if routing is too skewed for the static per-expert capacity. |
+| `torch._scaled_mm` | Y | Y | Spyre | Decomposed to `spyre.scaled_mm` (decomposition in `_inductor/decompositions.py`, lowering in `_inductor/lowering.py`); eager dispatch compiles the op through the `COMPILED_OPS` kernel in `ops/eager.py` |
+| `torch.ops.spyre.quantscalepertokenfp8` | | Y | Spyre | Compiled only; no eager fallback. Fused per-token amax + scale computation for FP8 activation quantization |
+| `torch.ops.spyre.quantize_fp8_with_scale` | Y | Y | Spyre | Quantize FP16 activation to FP8 using a pre-computed scale (`qfp8ch` layout) |
+| `torch.ops.spyre.quantize_weight_fp8_with_scale` | Y | Y | Spyre | Quantize FP16 weight to FP8 using a pre-computed scale (`qfp8wt` layout) |
+| `torch.ops.spyre.dequantize_fp8_with_scale` | Y | Y | Spyre | Dequantize FP8 tensor to FP16 using a pre-computed scale |
 | `torch.nn.functional.linear` | Y | Y | Spyre | Decomposed to `matmul` + `add` |
 | `torch.nn.functional.conv2d` | Y | Y | Spyre | Custom decomposition (`conv2d_via_bmm`); CPU fallback for the im2col step |
 | `torch.nn.functional.avg_pool2d` | | Y | Spyre | Compiled only; custom lowering |
+| `torch.triu` | Y | Y | Spyre | Compiled via mask-multiply decomposition; integer dtypes and `out=` variant fall back to CPU |
 | **Activation Functions** | | | | |
 | `torch.nn.functional.softmax` | Y | Y | Spyre | |
 | `torch.nn.functional.layer_norm` | Y | Y | Spyre | Custom decomposition |
@@ -29,7 +42,8 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.nn.functional.sigmoid` | Y | Y | Spyre | |
 | `torch.nn.functional.softplus` | Y | Y | Spyre | Custom op + lowering |
 | `torch.nn.functional.dropout` | Y | Y | Spyre | |
-| `torch.nn.functional.scaled_dot_product_attention` | Y | Y | Spyre | Custom decomposition (flash-attention-style tiled online softmax); auto-registers a PrivateUse1 kernel for eager dispatch |
+| `torch.nn.functional.scaled_dot_product_attention` | Y | Y | Spyre | Custom decomposition (flash-attention-style tiled online softmax) with native grouped-query attention: K/V keep their head count and gain a unit broadcast axis rather than materializing `Hq` copies; auto-registers a PrivateUse1 kernel for eager dispatch |
+| `torch.ops.spyre.sliding_window_attention` | | Y | Spyre | Compiled-only custom op; runtime additive mask, causal and non-causal paths, native GQA |
 | **Pointwise Unary** | | | | |
 | `torch.abs` | Y | Y | Spyre | |
 | `torch.neg` | Y | Y | Spyre | |
@@ -40,18 +54,22 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.reciprocal` | Y | Y | Spyre | |
 | `torch.tanh` | Y | Y | Spyre | |
 | `torch.floor` | Y | Y | Spyre | |
+| `torch.trunc` | Y | Y | Spyre | Custom lowering `floor(\|x\|) * clip(x, -1, 1)`, since the device has no native trunc op; a negative fraction gives `0.0`, not `-0.0` |
 | `torch.ceil` | Y | Y | Spyre | Custom decomposition |
 | `torch.sign` | Y | Y | Spyre | Custom decomposition |
 | `torch.logical_not` | Y | Y | Spyre | Custom decomposition |
 | `torch.bitwise_not` | Y | Y | Spyre | Custom decomposition |
+| `torch.sin` | Y | Y | Spyre | Custom decomposition (Cody-Waite range reduction + degree-9 Taylor); max abs error ~5e-5 in fp32 |
+| `torch.cos` | Y | Y | Spyre | Custom decomposition (Cody-Waite range reduction + degree-9 Taylor); max abs error ~5e-5 in fp32 |
 | `torch.clamp` | Y | Y | Spyre | Custom op + lowering |
-| `torch.pow` | Y | Y | Spyre | |
+| `torch.pow` | Y | Y | Spyre | `pow.Tensor_Scalar` custom decomposition (`exp(n·log(x))` with an integer fast path); an integer base raises |
 | `torch.nn.functional.mish` | Y | Y | Spyre | Eager via `aten.mish.out` |
 | **Pointwise Binary** | | | | |
-| `torch.add` | Y | Y | Spyre | Supports `alpha` parameter |
+| `torch.add` | Y | Y | Spyre | Supports `alpha` parameter; int32 runs natively via `addi32toi32` |
 | `torch.sub` | Y | Y | Spyre | Supports `alpha` parameter |
-| `torch.mul` | Y | Y | Spyre | |
-| `torch.div` | Y | Y | Spyre | |
+| `torch.mul` | Y | Y | Spyre | int32 runs natively via `muli32toi32` |
+| `torch.div` / `torch.true_divide` | Y | Y | Spyre | `rounding_mode="floor"` supported with limits: quotient magnitude ≤1024 (fp16) or ≤2²⁴ (fp32); ~2.7% fp16 residual-blinding class (#5605); DL16 host input rounding applies. `rounding_mode="trunc"` not yet implemented (#3610). |
+| `torch.floor_divide` | Y | Y | Spyre | Alias for `torch.div(..., rounding_mode="floor")`; same limits apply. |
 | `torch.maximum` | Y | Y | Spyre | |
 | `torch.minimum` | Y | Y | Spyre | |
 | `torch.bitwise_and` | Y | Y | Spyre | Custom decomposition; boolean inputs run on Spyre (`logical_and`), integer inputs decompose through `bitwise_or`, which falls back to CPU |
@@ -70,12 +88,14 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.amin` | | Y | Spyre | Custom decomposition |
 | `torch.prod` | | Y | Spyre | Requires `dim` argument; custom decomposition + lowering |
 | `torch.max` | Y | Y | Spyre | `max.dim` via custom decomposition; int64 falls back to CPU |
-| `torch.min` | Y | Y | Spyre | `min.dim` via custom decomposition (fp16 eager); int64 falls back to CPU |
+| `torch.min` | | Y | Spyre | `min.dim` via custom decomposition; eager `aten::min.dim_min` is not yet supported; int64 falls back to CPU |
 | `torch.topk` | | Y | Spyre | Custom decomposition + custom ops (`spyre::topkvalue`, `spyre::topkindex`) |
 | `torch.linalg.vector_norm` | | Y | Spyre | Compiled only; eager misroutes the `ord` argument |
 | `torch.linalg.matrix_norm` | | Y | Spyre | Compiled only; eager misroutes the `ord` argument |
 | `torch.linalg.norm` | | Y | Spyre | Compiled only; eager misroutes the `ord` argument |
 | `torch.aminmax` | | Y | Spyre | Compiled only; eager not yet supported |
+| `torch.any` | Y | Y | Spyre | Custom lowering; reduces over `dim`/`dims` or the full tensor |
+| `torch.all` | Y | Y | Spyre | Custom decomposition (`abs` + `amin`) |
 | **View Ops** [^views] | | | | |
 | `torch.reshape` / `torch.view` | | Y | Spyre | Includes `_reshape_alias` (a C++ device view, not an Inductor lowering) |
 | `torch.transpose` | Y | Y | Spyre | |
@@ -87,11 +107,12 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.unsqueeze` | | Y | Spyre | Partial; some shapes trigger internal recompile |
 | `torch.flatten` | | Y | Spyre | Compiled only (lowers via `reshape`) |
 | `torch.cat` | Y | Y | Spyre | |
-| `torch.stack` | Y | | Spyre | Eager only |
-| `torch.repeat` | | Y | Spyre | Compiled only. `repeat.out` is available as a CPU fallback |
+| `torch.stack` | Y | Y | Spyre | Registered on the compiled path (`ops/eager.py` `COMPILED_OPS`); the eager kernel dispatches through `torch.compile` |
+| `torch.repeat` | Y | Y | Spyre | Registered on the compiled path (`ops/eager.py` `COMPILED_OPS`); the eager kernel dispatches through `torch.compile` |
 | `torch.unbind` | Y | Y | Spyre | |
 | `torch.Tensor.unfold` | Y | Y | Spyre | View op |
 | `torch.flip` | Y | Y | Spyre | Custom decomposition to `index_select` gathers; reversing the last (stick) dimension is unsupported and raises |
+| `torch.index_copy` | Y | Y | Spyre | `index_copy.out` is registered on the compiled path (`ops/eager.py` `COMPILED_OPS`), which also serves `index_copy` and `index_copy_`. Scattering along the last (stick) dimension is unsupported and raises |
 | `torch.split` | | Y | Spyre | Compiled only (lowers via `aten.slice`) |
 | `torch.slice_scatter` | | Y | Spyre | Compiled only (`lower_slice_scatter`); unit-step slices only, strided writes raise `Unsupported` |
 | `torch.expand` | | Y | Spyre | Compiled only; supported when followed by a materializing op (e.g. `clone`, `contiguous`). Used internally by `ones`, `pad`, and SDPA decompositions |
@@ -112,38 +133,34 @@ see [Adding Operations](../compiler/adding_operations.md).
 | **Indexing** | | | | |
 | `torch.embedding` | Y | Y | Spyre | Registered on the compiled path (`ops/eager.py`) |
 | `torch.index_select` | Y | Y | Spyre | Registered on the compiled path (`ops/eager.py`) |
+| `torch.index_add` | | Y | Spyre | Compiled only; custom decomposition (gather + add + overwrite-scatter); requires unique indices |
 | `torch.masked_scatter` | Y | Y | Spyre | Custom decomposition; supported for masks that broadcast along the last (stick) dimension, other masks raise `Unsupported` |
 | **Utility** | | | | |
 | `torch.item` | Y | Y | Spyre | Copies to CPU, returns Python scalar |
-| `torch.Tensor.to` (dtype cast) | | Y | Spyre | Compiled only; eager dtype casts not yet supported |
+| `torch.Tensor.to` (dtype cast) | | Y | Spyre | Compiled only; eager dtype casts not yet supported. Converts fp16, bf16, int32, int64, and bool on device; int32 and int64 share one storage layout, so a cast between them is an identity |
 | **CPU Fallback** | | | | |
 | `torch.arange` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
-| `torch.sin` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
-| `torch.cos` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.tril` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
-| `torch.triu` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.isin` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.bitwise_xor` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.bitwise_or` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.argmax` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.argmin` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.cumsum` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
-| `torch.any` | Y | | CPU fallback | `all_out` overload only; runs on CPU |
-| `torch.index_copy` | Y | | CPU fallback | Eager only; runs on CPU |
 
 > **Column key:**
 >
-> - **Eager** — supported when running operations directly on a Spyre
+> - **Eager**: supported when running operations directly on a Spyre
 >   tensor without `torch.compile`. Eager ops are registered via
 >   `torch_spyre/ops/eager.py`, `torch_spyre/ops/fallbacks.py`, and the
 >   Spyre decomposition table, which installs a PrivateUse1 eager kernel
 >   for every aten-namespace decomposition (`decompositions.py`).
-> - **Compiled** — supported when using `torch.compile(model)` with the
+> - **Compiled**: supported when using `torch.compile(model)` with the
 >   model on a Spyre device (Inductor routes to the Spyre backend
 >   automatically).
-> - **Execution** — whether the op runs natively on the Spyre accelerator
+> - **Execution**: whether the op runs natively on the Spyre accelerator
 >   or falls back to CPU. CPU fallback ops are automatically handled by
->   the compiler — a warning is emitted when fallback occurs.
+>   the compiler; a warning is emitted when fallback occurs.
 >
 > View ops have **partial support**: some shapes and dimension
 > combinations may trigger internal recompilation, and a few
@@ -153,7 +170,7 @@ see [Adding Operations](../compiler/adding_operations.md).
 >
 > This table reflects the operations validated in the torch-spyre test
 > suite (`tests/inductor/test_inductor_ops.py`). Coverage
-> grows continuously — check the
+> grows continuously; check the
 > [test suite](https://github.com/torch-spyre/torch-spyre/tree/main/tests)
 > for the latest state.
 
@@ -164,12 +181,43 @@ see [Adding Operations](../compiler/adding_operations.md).
     of the [Inductor Front-End](../compiler/inductor_frontend.md) walks
     through how this works.
 
+## Sliding-window attention custom op
+
+`torch.ops.spyre.sliding_window_attention` has the schema:
+
+```python
+sliding_window_attention(
+    query, key, value, attention_mask, window_size, is_causal, scale=None
+) -> Tensor
+```
+
+The query shape is `[B, Hq, Lq, D]`; key and value are
+`[B, Hkv, Lk, D]`; and the additive attention mask is
+`[B, 1, Lq, Lk]`, with the same dtype and device as the query. `Hq` must be a
+whole multiple of `Hkv`. Grouped-query attention keeps K/V at their native
+head count and broadcasts them over query-head groups inside the kernel.
+`window_size`, `is_causal`, and `scale` are static model configuration, while
+all position-dependent state belongs in `attention_mask`. Changing mask values
+therefore reuses the compiled graph.
+
+For causal square prefill, the kernel uses static narrow K/V reads.
+Non-causal attention, decode, and chunked prefill scan the full physical cache
+allocation in bounded chunks and let the mask select valid tokens. Decode
+caches should consequently be compact and approximately window-sized; a
+full-context allocation is correct but makes work proportional to its full
+capacity. Unwritten cache rows must be zero-filled because their masked scores
+are still computed before the additive mask is applied.
+
+The cache capacity must be positive and a multiple of 64, and `Lq` must be in
+`[1, Lk]`. The op has no eager implementation and must be called on Spyre under
+`torch.compile(backend="inductor")`.
+
 ## Unsupported Operations
 
 Operations not listed above will either:
-- **Fall back to CPU** — if Inductor cannot lower the op to a Spyre
+- **Fall back to CPU**: if Inductor cannot lower the op to a Spyre
   kernel, it falls back to CPU execution. A warning is emitted.
-- **Raise a compile-time error** — if the op produces a tensor layout
+- **Raise a compile-time error**: if the op produces a tensor layout
   that is incompatible with downstream Spyre ops.
 
 To request support for a new operation or to contribute one yourself,

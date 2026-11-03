@@ -248,7 +248,7 @@ class SelfCalibratingReheatingSchedule(CoolingSchedule):
         if self._cycle_len == 0:
             raise ValueError(
                 "SelfCalibratingReheatingSchedule must be given buffers before "
-                "use; run it through SimulatedAnnealingSolverWithBuffers, or call "
+                "use; run it through SimulatedAnnealingLayoutSolver, or call "
                 "set_buffers() first."
             )
         self._i = 0

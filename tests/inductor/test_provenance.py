@@ -31,6 +31,7 @@ from torch._inductor.utils import IndentedBuffer
 from torch_spyre._C import DataFormats
 from torch_spyre._inductor.codegen.compute_ops import generate_sdsc
 from torch_spyre._inductor.codegen.superdsc import SDSCSpec, parse_op_spec
+from torch_spyre._inductor.core_mapping import derive_operation_mapping
 from torch_spyre._inductor.op_spec import (
     DebugHandle,
     OpSpec,
@@ -445,10 +446,12 @@ def _threadable_op_spec(debug_handle=None):
         device_coordinates=[Integer(0), c0],
         allocation={"hbm": 0x2000},
     )
+    iteration_space = {c0: (Integer(128), 1)}
     return OpSpec(
         op="add",
         is_reduction=False,
-        iteration_space={c0: (Integer(128), 1)},
+        iteration_space=iteration_space,
+        core_id_to_work_slice=derive_operation_mapping(iteration_space),
         args=[tin, tout],
         op_info={},
         tiled_symbols=[[c0]],

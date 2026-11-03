@@ -21,8 +21,10 @@
 #include <util/sendefs/sendefs.h>
 
 #include <functional>
+#include <map>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "spyre_storage_impl.h"
@@ -31,7 +33,6 @@ namespace spyre {
 
 int64_t elems_per_stick(const DataFormats& df);
 std::vector<int32_t> generic_stick_dim_order(int32_t num_dims);
-
 /* Describes how device coordinates are arranged in memory.
  * Certain on-device type conversions result in non-sequential device
  * coordinates and some stick reduction operations (e.g., exx2) result in
@@ -92,6 +93,13 @@ class SpyreTensorLayout {
 
   ElementArrangement element_arrangement = ElementArrangement::STANDARD;
 
+  /**
+   * Maps groups of device dimensions to their valid (non-padded) element
+   * count. This field maps disjoint ordered lists of device dimensions to
+   * sizes.
+   */
+  std::map<std::vector<int64_t>, int64_t> valid_elements;
+
   SpyreTensorLayout() = default;
   ~SpyreTensorLayout() = default;
 
@@ -124,15 +132,86 @@ class SpyreTensorLayout {
    * or the expert programmer. It enables complete control over the
    * device memory layout, but callers are responsible for ensuring
    * that all device layout invariants are satisfied.
+   *
+   * When valid_elements is omitted, it defaults to
+   * compute_valid_elements(device_size), which conservatively treats every
+   * device element as valid. This is incorrect for padded tensors and should
+   * not be relied upon until the caller supplies accurate valid_elements.
+   *
+   * @deprecated Use the overload that takes valid_elements as a required
+   * parameter (before element_arrangement) to ensure accurate padding
+   * information is always provided.
+   */
+  [[deprecated(
+      "Pass valid_elements explicitly using the "
+      "SpyreTensorLayout(device_size, stride_map, device_dtype, valid_elements"
+      "[, element_arrangement]) overload.")]]
+  SpyreTensorLayout(
+      std::vector<int64_t> device_size, std::vector<int64_t> stride_map,
+      DataFormats device_dtype,
+      ElementArrangement element_arrangement = ElementArrangement::STANDARD,
+      std::map<std::vector<int64_t>, int64_t> valid_elements = {})
+      : device_size(device_size),
+        stride_map(stride_map),
+        device_dtype(device_dtype),
+        element_arrangement(element_arrangement),
+        valid_elements(std::move(valid_elements)) {
+    validate_shape();
+  }
+
+  /**
+   * Construct a SpyreTensorLayout with the specified device_size, stride_map,
+   * and valid_elements. Unlike the overload above, valid_elements is required
+   * here, so callers must supply accurate padding information rather than
+   * relying on the conservative compute_valid_elements(device_size) default.
    */
   SpyreTensorLayout(
       std::vector<int64_t> device_size, std::vector<int64_t> stride_map,
       DataFormats device_dtype,
+      std::map<std::vector<int64_t>, int64_t> valid_elements,
       ElementArrangement element_arrangement = ElementArrangement::STANDARD)
       : device_size(device_size),
         stride_map(stride_map),
         device_dtype(device_dtype),
-        element_arrangement(element_arrangement) {}
+        element_arrangement(element_arrangement),
+        valid_elements(std::move(valid_elements)) {
+    validate_shape();
+  }
+
+  /**
+   * Reject a device layout that cannot describe any tensor: every device
+   * dimension must be non-negative and stride_map must have one entry per
+   * device dimension. Validating in the constructor means no producer can
+   * hand such a layout downstream.
+   *
+   * A size-0 device dimension is deliberately accepted: it is how an empty
+   * tensor is laid out (an empty host dim maps to a zero device extent, and a
+   * zero-element host stick dim maps to zero sticks), and every consumer
+   * already handles that geometry. The size-0 dim that reached
+   * get_device_stride_infos and terminated the process with SIGFPE (issue
+   * #3604) came from flooring an inexact stick rescale on a non-empty tensor;
+   * rescale_stl_for_dtype now rejects that upstream of the constructor, and
+   * get_device_stride_infos checks every divisor before use.
+   *
+   * stride_map entries are deliberately not range-checked here: -1 marks a
+   * size-1 or sparse dimension and 0 a broadcast dimension, both legitimate.
+   * Consistency between stride_map and the host strides is only knowable at
+   * use time and is checked in get_device_stride_infos.
+   */
+  void validate_shape() const {
+    TORCH_CHECK(!device_size.empty(),
+                "Invalid SpyreTensorLayout: device_size is empty");
+    TORCH_CHECK(stride_map.size() == device_size.size(),
+                "Invalid SpyreTensorLayout: stride_map has ", stride_map.size(),
+                " entries for ", device_size.size(), " device dimensions");
+    for (size_t i = 0; i < device_size.size(); i++) {
+      TORCH_CHECK(device_size[i] >= 0,
+                  "Invalid SpyreTensorLayout: device dimension ", i,
+                  " has negative size ", device_size[i],
+                  "; every device dimension must be non-negative (device_size=",
+                  c10::ArrayRef<int64_t>(device_size), ")");
+    }
+  }
 
   /**
    * Return a copy of this layout with element_arrangement overridden.
@@ -150,11 +229,13 @@ class SpyreTensorLayout {
 
   std::string toString() const;
 
-  int64_t elems_per_stick() {
+  int64_t elems_per_stick() const {
     return spyre::elems_per_stick(this->device_dtype);
   }
 
   bool operator==(const SpyreTensorLayout& other) const {
+    // Include valid_elements (and update std::hash) after deprecated
+    // constructor call sites have migrated to the valid_elements overload.
     return this->device_size == other.device_size &&
            this->stride_map == other.stride_map &&
            this->device_dtype == other.device_dtype &&
@@ -203,10 +284,14 @@ class SpyreTensorImpl : public at::TensorImpl {
       const c10::intrusive_ptr<at::TensorImpl>& impl) override;
 };
 
-uint64_t get_device_size_in_bytes(SpyreTensorLayout stl);
+uint64_t get_device_size_in_bytes(const SpyreTensorLayout& stl);
+uint64_t get_device_size_in_bytes(const std::vector<int64_t>& device_size,
+                                  const DataFormats& device_dtype);
 SpyreTensorLayout get_spyre_tensor_layout(const at::Tensor& tensor);
 void set_spyre_tensor_layout(const at::Tensor& tensor,
                              const SpyreTensorLayout& stl);
+std::vector<int64_t> get_spyre_tensor_sizes(const at::Tensor& tensor);
+std::vector<int64_t> get_spyre_tensor_strides(const at::Tensor& tensor);
 
 }  // namespace spyre
 

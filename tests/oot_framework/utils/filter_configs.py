@@ -21,7 +21,7 @@ Selection rules
   "unit"             Configs whose test_suite_config.labels contains "unit".
   "integration"      Configs whose test_suite_config.labels contains
                      "integration" -- the device-layer surfaces flex and
-                     deeptools/dxp_standalone exercise most (streams, job
+                     deeptools exercise most (streams, job
                      launch plans, codegen, LX/scratchpad planning, tensor
                      layout, allocator/GC, D2D copies). Used as the default
                      test_type for integration-tests.yaml.
@@ -55,7 +55,8 @@ Output formats
   paths         Space-separated list of absolute paths (Makefile / bash use).
   matrix-json   JSON object {"suite": [{name, config, runner}, ...]} for
                 GitHub Actions dynamic-matrix consumption.  "config" is the
-                path relative to --config-dir.
+                path relative to --config-dir.  A suite named in --flags-map
+                also carries "extra_test_flags".
 
 Runner overrides
 ----------------
@@ -64,6 +65,10 @@ Runner overrides
   a mapping of {config-relative-path: runner-label}.  Suites not listed in the
   map use the default runner (spyre_pf_x1).  This argument is optional and only
   relevant for matrix-json output.
+
+  --flags-map <yaml-file> likewise maps a config path, or a directory prefix
+  ending in "/", to the pytest flags that suite runs with instead of the
+  caller's extra_test_flags.
 
 Usage
 -----
@@ -128,14 +133,27 @@ def _load_labels(path: Path) -> list:
     return list(tsc.get("labels") or [])
 
 
-def _load_runner_map(runner_map_path: str) -> dict:
-    """Load {config-relative-path: runner-label} from a YAML file."""
-    path = Path(runner_map_path)
+def _load_path_map(map_path: str) -> dict:
+    """Load a {config-relative-path: value} YAML file (--runner-map, --flags-map)."""
+    path = Path(map_path)
     if not path.is_file():
-        sys.exit(f"ERROR: --runner-map file not found: {path}")
+        sys.exit(f"ERROR: map file not found: {path}")
     with path.open() as fh:
         data = yaml.safe_load(fh) or {}
     return {k: str(v) for k, v in data.items()}
+
+
+def _suite_flags(flags_map: dict, rel: str) -> str:
+    """The flags --flags-map gives this config: an exact path, else the longest prefix."""
+    if rel in flags_map:
+        return flags_map[rel]
+    prefixes = [k for k in flags_map if k.endswith("/") and rel.startswith(k)]
+    return flags_map[max(prefixes, key=len)] if prefixes else ""
+
+
+# The tier ladder. A config's labels also carry suite groups and one-off markers;
+# those are not tiers and must never make a config look already-covered.
+TIER_LABELS = ("smoke", "unit", "integration", "regression", "trunk")
 
 
 def _matches(labels: list, config_path: Path, test_type: str) -> bool:
@@ -157,6 +175,27 @@ def _matches(labels: list, config_path: Path, test_type: str) -> bool:
         return stem.startswith(group + "_") or stem == group
 
     return test_type in labels
+
+
+def _already_covered(labels: list, exclude_tiers: list) -> bool:
+    """True when this config was already executed by one of the covered tiers.
+
+    The test is whether any ALREADY-COVERED tier selects this config -- not whether
+    every tier it declares is covered. A config labeled
+    [unit, regression, integration, trunk] was already run by the integration run,
+    so a later regression run re-executes identical work; its `trunk` label is
+    irrelevant because no trunk run happened.
+
+    Set difference over DECLARED labels, never a ladder. Measured on the 213 live
+    configs: all 59 integration configs also declare regression, so integration is
+    an exact subset here and the regression delta is 73 configs. That is a property
+    of these files, NOT a rule -- prod showed 616 case-level
+    integration-not-in-trunk violations, so inferring the ladder instead of reading
+    the labels would silently drop real tests.
+    """
+    if not exclude_tiers:
+        return False
+    return any(t in labels for t in exclude_tiers)
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +234,27 @@ def main() -> None:
         ),
     )
     ap.add_argument(
+        "--flags-map",
+        default=None,
+        metavar="FILE",
+        help=(
+            "Optional YAML file mapping config-relative paths (or 'dir/' prefixes) "
+            "to the pytest flags that suite runs with. Only used with --format "
+            "matrix-json."
+        ),
+    )
+    ap.add_argument(
+        "--exclude-tiers",
+        default="",
+        help=(
+            "Comma-separated tiers whose results already exist for this artifact. "
+            "A config is dropped when ANY tier it declares is in this list: that tier "
+            "already covered the config, so re-running it adds nothing. Empty (the "
+            "default) runs the full tier -- which is what an unreachable ClickHouse "
+            "degrades to."
+        ),
+    )
+    ap.add_argument(
         "--format",
         choices=["paths", "matrix-json"],
         default="paths",
@@ -210,28 +270,47 @@ def main() -> None:
         sys.exit(f"ERROR: --config-dir does not exist: {config_dir}")
 
     test_type = args.test_type.strip()
+    exclude_tiers = [
+        t.strip() for t in (args.exclude_tiers or "").split(",") if t.strip()
+    ]
+    # Never let a tier suppress itself: an explicit rerun of a tier must re-execute.
+    exclude_tiers = [t for t in exclude_tiers if t != test_type]
 
     runner_map: dict = {}
     if args.runner_map:
-        runner_map = _load_runner_map(args.runner_map)
+        runner_map = _load_path_map(args.runner_map)
+    flags_map: dict = _load_path_map(args.flags_map) if args.flags_map else {}
 
     results = []
+    skipped_covered = 0
     for cfg in sorted(config_dir.rglob("*.yaml")):
         try:
             labels = _load_labels(cfg)
         except Exception as exc:  # noqa: BLE001
             print(f"WARNING: skipping {cfg} ({exc})", file=sys.stderr)
             continue
-        if _matches(labels, cfg, test_type):
-            rel = str(cfg.relative_to(config_dir))
-            results.append(
-                {
-                    "name": _display_name(cfg, config_dir),
-                    "config": rel,
-                    "runner": runner_map.get(rel, "spyre_pf_x1"),
-                    "path": str(cfg),
-                }
-            )
+        if not _matches(labels, cfg, test_type):
+            continue
+        if _already_covered(labels, exclude_tiers):
+            skipped_covered += 1
+            continue
+        rel = str(cfg.relative_to(config_dir))
+        results.append(
+            {
+                "name": _display_name(cfg, config_dir),
+                "config": rel,
+                "runner": runner_map.get(rel, "spyre_pf_x1"),
+                "flags": _suite_flags(flags_map, rel),
+                "path": str(cfg),
+            }
+        )
+
+    if skipped_covered:
+        print(
+            f"delta: skipped {skipped_covered} config(s) whose tiers are all already "
+            f"covered ({','.join(exclude_tiers)})",
+            file=sys.stderr,
+        )
 
     if not results:
         print(
@@ -243,7 +322,12 @@ def main() -> None:
         print(" ".join(r["path"] for r in results))
     else:
         matrix = [
-            {"name": r["name"], "config": r["config"], "runner": r["runner"]}
+            {
+                "name": r["name"],
+                "config": r["config"],
+                "runner": r["runner"],
+                **({"extra_test_flags": r["flags"]} if r["flags"] else {}),
+            }
             for r in results
         ]
         print(json.dumps({"suite": matrix}))

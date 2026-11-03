@@ -24,6 +24,13 @@ The report is a *value*, not just a printout, so another pass or an external too
 compare two candidate plans without compiling and running either. That is the point:
 ``report_a.total_us`` vs ``report_b.total_us`` is a cheap plan comparison.
 
+This reporting pass has no candidate menu. It therefore omits the menu-dependent
+loop-delivery estimate, so looped-matmul totals can differ from the allocator's
+objective. It does not reconstruct candidate divisions from the committed plan.
+The DMA requests of a looped matmul's operand reads need no menu; with the delivery
+estimate omitted, the report charges their whole excess over the byte time, where
+the allocator charges only the part beyond that estimate.
+
 NOT related to ``work_division.cost_model_matmul_division``, which is a separate model
 used to choose a matmul work division. This module is the analytical whole-program
 runtime model documented in ``docs/source/compiler/cost_model.md``.
@@ -61,9 +68,10 @@ from torch._inductor.ir import ComputedBuffer
 
 from . import config
 from .constants import DEVICE_NAME
-from .cost_model import CostParams, _loop_reread_bytes, predict_ops
-from .dump_cost_model import extract_op_features
+from .cost_model import CostParams, _loop_reread_bytes, predict_ops, relayout_ns
+from .cost_features import extract_op_features
 from .logging_utils import get_inductor_logger
+from .loop_facts import counted_loop_path
 
 logger = get_inductor_logger("cost_model_pass")
 
@@ -151,6 +159,10 @@ class CostReport:
 
     ``total_us`` is the headline: the sum over kernels. It is the number another
     component should compare between two candidate plans.
+
+    Every number here is a plain Python one, coerced where it is built: the model itself
+    computes in sympy, and a sympy number survives neither ``format()``'s aligned specs
+    nor ``json``.
     """
 
     total_us: float
@@ -276,11 +288,8 @@ def _traffic(o: "OpCost", width: int = 12) -> str:
 
 
 def _loop_group_id(op) -> tuple[int, ...] | None:
-    gid = getattr(getattr(op, "loop_info", None), "loop_group_id", None)
-    try:
-        return tuple(gid) if gid else None
-    except TypeError:  # a malformed id (e.g. a bare int) must not sink the report
-        return None
+    # A malformed id (e.g. a bare int) reads as "no loop" and must not sink the report.
+    return counted_loop_path(op, include_extern=True) or None
 
 
 def _per_iteration(f) -> dict:
@@ -310,7 +319,7 @@ def _per_iteration(f) -> dict:
     trip = max(1, int(getattr(f, "loop_trip", 1) or 1))
     return {
         "trip": trip,
-        "hbm_per_iter": max(0, f.hbm_bytes()) // trip,
+        "hbm_per_iter": max(0, int(f.hbm_bytes())) // trip,
         "reread_bytes": int(_loop_reread_bytes([f])),
     }
 
@@ -318,7 +327,14 @@ def _per_iteration(f) -> dict:
 def _price(feats, index, params) -> GroupCost | None:
     """Price one kernel. Returns None if the model cannot price it."""
     try:
-        predicted_us = predict_ops(feats, params) / 1000.0
+        # float(): Inductor buffer sizes are sympy Integers, so the model propagates
+        # sympy numbers out of them. Those neither format against the aligned specs
+        # format() uses (`Zero.__format__` rejects ">13.1f") nor serialize to JSON, so
+        # no sympy may reach a report field. A genuinely SYMBOLIC price does not
+        # convert -- the co-optimizing allocator builds symbolic features on purpose,
+        # this path does not -- and raising here drops the kernel like any other one
+        # the model cannot price.
+        predicted_us = float(predict_ops(feats, params)) / 1000.0
     except Exception:  # noqa: BLE001 - a bad group must not lose the whole report
         logger.warning("cost model could not price kernel %d; skipping", index)
         return None
@@ -334,17 +350,28 @@ def _price(feats, index, params) -> GroupCost | None:
     # here costs the breakdown for this kernel and nothing else.
     ops = []
     try:
-        weights = [max(0, f.hbm_bytes()) for f in feats]
+        # int() for the same reason as the price above, and because OpCost declares
+        # these int: a share weighted by a sympy byte count comes back sympy, and a
+        # zero-HBM op's share comes back sympy Zero -- the value format() choked on.
+        weights = [max(0, int(f.hbm_bytes())) for f in feats]
         total = sum(weights)
-        for f, w in zip(feats, weights):
+        # An LX relayout op's cost is ADDITIVE and PER-OP (its own term in
+        # predict_ops), not part of the bundle's HBM price -- and it moves no HBM
+        # bytes, so the byte-share split alone would show the one op that added
+        # real time as 0.0 (exactly the misleading display that motivated the
+        # term). Attribute each op its own relayout cost, and split only the
+        # remainder by HBM share; parts still sum to the kernel total.
+        rel_us = [float(relayout_ns(f, params)) / 1000.0 for f in feats]
+        base_us = predicted_us - sum(rel_us)
+        for f, w, r in zip(feats, weights, rel_us):
             ops.append(
                 OpCost(
                     name=f.name,
                     loop_group_id=getattr(f, "_loop_group_id", None),
                     hbm_bytes=w,
-                    lx_bytes=max(0, f.lx_bytes()),
-                    predicted_us=predicted_us
-                    * (w / total if total > 0 else 1.0 / max(1, len(feats))),
+                    lx_bytes=max(0, int(f.lx_bytes())),
+                    predicted_us=r
+                    + base_us * (w / total if total > 0 else 1.0 / max(1, len(feats))),
                     **_per_iteration(f),
                 )
             )
@@ -360,7 +387,7 @@ def _price(feats, index, params) -> GroupCost | None:
         index=index,
         op_names=[f.name for f in feats],
         loop_group_ids=gids,
-        loop_trip=max((getattr(f, "loop_trip", 1) or 1) for f in feats),
+        loop_trip=int(max((getattr(f, "loop_trip", 1) or 1) for f in feats)),
         predicted_us=predicted_us,
         ops=ops,
     )
@@ -403,14 +430,16 @@ def build_report(operations: list, params: CostParams | None = None) -> CostRepo
         runs.append(current)
 
     groups = [g for i, r in enumerate(runs) if (g := _price(r, i, params)) is not None]
-    return CostReport(total_us=sum(g.predicted_us for g in groups), groups=groups)
+    return CostReport(
+        total_us=float(sum(g.predicted_us for g in groups)), groups=groups
+    )
 
 
 def cost_model_pass(graph) -> CostReport | None:
     """Predict this graph's runtime; ``None`` when the model is disabled.
 
-    Read-only: the graph is never mutated. Called after the pre-scheduling pipeline,
-    where the loop-level IR is final.
+    Read-only: the graph is never mutated. Called after LX planning and before
+    Scheduler-boundary work-division conversion, where the loop-level IR is final.
 
     Returns the report so a caller can use it -- ``CustomPreSchedulingPasses`` exposes
     it as ``last_cost_report`` for exactly that reason.

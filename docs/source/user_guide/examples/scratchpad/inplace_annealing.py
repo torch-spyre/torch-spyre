@@ -40,7 +40,7 @@ from torch_spyre._inductor.scratchpad.cooling_schedules import (
     ExponentialCoolingSchedule,
 )
 from torch_spyre._inductor.scratchpad.simulated_annealing import (
-    SimulatedAnnealingSolverWithBuffers,
+    SimulatedAnnealingLayoutSolver,
 )
 from torch_spyre._inductor.scratchpad.utils import plot_buffers, quality_plot
 
@@ -84,11 +84,11 @@ def _schedule() -> ExponentialCoolingSchedule:
 
 rng = rnd.Random(0)
 all_logs: list[list[int]] = []
-last_solver: SimulatedAnnealingSolverWithBuffers | None = None
+last_solver: SimulatedAnnealingLayoutSolver | None = None
 
 t0 = time.perf_counter()
 for _ in range(N_RUNS):
-    solver = SimulatedAnnealingSolverWithBuffers(
+    solver = SimulatedAnnealingLayoutSolver(
         buffers,
         size=CAPACITY,
         alignment=1,

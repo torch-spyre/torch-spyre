@@ -27,6 +27,10 @@ __all__: list[str] = [
     "stream_get_error_string",
     "synchronize",
     "as_strided_with_layout",
+    "reinterpret_tensor_with_layout",
+    "CompositeChunkInfo",
+    "CompositeAddressHandle",
+    "get_composite_address",
     "empty_with_layout",
     "copy_tensor",
     "fill_tensor",
@@ -37,6 +41,7 @@ __all__: list[str] = [
     "get_downcast_warning",
     "get_elem_in_stick",
     "get_spyre_tensor_layout",
+    "get_device_size_in_bytes",
     "kernel_provenance_registry_stats",
     "launch_jobplan",
     "lookup_kernel_provenance",
@@ -47,6 +52,17 @@ __all__: list[str] = [
     "spyre_empty_with_layout",
     "start_runtime",
     "to_with_layout",
+    "PoolBackend",
+    "PoolConfig",
+    "PoolDescriptor",
+    "PoolState",
+    "PoolStatus",
+    "SharedPool",
+    "attach_pool",
+    "create_pool",
+    "destroy_pool",
+    "detach_pool",
+    "open_pool",
 ]
 
 AIUPTI_ACTIVITY_NAME_MAX_BYTES: int
@@ -203,6 +219,16 @@ class SpyreTensorLayout:
         stride_map: collections.abc.Sequence[typing.SupportsInt],
         device_dtype: DataFormats,
         element_arrangement: ElementArrangement = ElementArrangement.STANDARD,
+        valid_elements: dict[tuple[int, ...], int] = {},
+    ) -> None: ...
+    @typing.overload
+    def __init__(
+        self,
+        device_size: collections.abc.Sequence[typing.SupportsInt],
+        stride_map: collections.abc.Sequence[typing.SupportsInt],
+        device_dtype: DataFormats,
+        valid_elements: dict[tuple[int, ...], int],
+        element_arrangement: ElementArrangement = ElementArrangement.STANDARD,
     ) -> None: ...
     def __repr__(self) -> str: ...
     def __str__(self) -> str: ...
@@ -218,6 +244,8 @@ class SpyreTensorLayout:
     def element_arrangement(self) -> ElementArrangement: ...
     @property
     def stride_map(self) -> list[int]: ...
+    @property
+    def valid_elements(self) -> dict[tuple[int, ...], int]: ...
 
 class _SpyreStreamBase:
     """
@@ -309,6 +337,55 @@ def as_strided_with_layout(
     arg3: typing.SupportsInt | None,
     arg4: SpyreTensorLayout,
 ) -> torch.Tensor: ...
+def reinterpret_tensor_with_layout(
+    arg0: torch.Tensor,
+    arg1: tuple[int, ...],
+    arg2: tuple[int, ...],
+    arg3: typing.SupportsInt,
+    arg4: SpyreTensorLayout,
+) -> torch.Tensor: ...
+
+class CompositeChunkInfo:
+    """
+    One device chunk of a composite address
+    """
+    @property
+    def region_id(self) -> int: ...
+    @property
+    def offset(self) -> int: ...
+    @property
+    def size(self) -> int: ...
+    @property
+    def domain_id(self) -> int: ...
+
+class CompositeAddressHandle:
+    """
+    Read-only handle over the device address backing a Spyre tensor's storage
+    """
+    @property
+    def total_size(self) -> int:
+        """
+        Total physical (padded/tiled) byte size of the allocation
+        """
+    @property
+    def num_chunks(self) -> int:
+        """
+        Number of device chunks the allocation spans
+        """
+    def chunks(self) -> list[CompositeChunkInfo]:
+        """
+        Per-chunk geometry, in order
+        """
+    def __eq__(self, other: object) -> bool: ...
+    def __ne__(self, other: object) -> bool: ...
+
+def get_composite_address(tensor: torch.Tensor) -> CompositeAddressHandle:
+    """
+    Return a read-only handle over the device address backing a Spyre
+    tensor's storage; the handle keeps that allocation alive
+    """
+    ...
+
 def copy_tensor(
     self: torch.Tensor, dst: torch.Tensor, non_blocking: bool = False
 ) -> None:
@@ -347,6 +424,12 @@ def get_downcast_warning() -> bool:
     """
 
 def get_elem_in_stick(arg0: torch.dtype) -> int: ...
+@typing.overload
+def get_device_size_in_bytes(layout: SpyreTensorLayout) -> int: ...
+@typing.overload
+def get_device_size_in_bytes(
+    device_size: typing.Sequence[int], device_dtype: DataFormats
+) -> int: ...
 def get_spyre_tensor_layout(arg0: torch.Tensor) -> SpyreTensorLayout: ...
 
 class SymbolicArgKind:
@@ -449,10 +532,11 @@ def set_downcast_warning(arg0: bool) -> None:
 
 def set_spyre_tensor_layout(arg0: torch.Tensor, arg1: SpyreTensorLayout) -> None: ...
 def spyre_empty_with_layout(
-    arg0: tuple[int, ...],
-    arg1: tuple[int, ...],
-    arg2: torch.dtype,
-    arg3: SpyreTensorLayout,
+    size: tuple[int, ...],
+    stride: tuple[int, ...],
+    dtype: torch.dtype,
+    device_layout: SpyreTensorLayout,
+    device: torch.device | None = None,
 ) -> torch.Tensor: ...
 
 class SpyreStreamError:
@@ -492,4 +576,66 @@ def stream_get_error(stream: _SpyreStreamBase) -> SpyreStreamError: ...
 def stream_get_error_string(error: SpyreStreamError) -> str: ...
 def get_device_state() -> SpyreDeviceState: ...
 def start_runtime() -> None: ...
+def set_device(idx: int) -> None: ...
+def current_device() -> int: ...
 def to_with_layout(arg0: torch.Tensor, arg1: SpyreTensorLayout) -> torch.Tensor: ...
+
+class SharedPool:
+    def slot_count(self) -> int: ...
+    def slot_bytes(self) -> int: ...
+    def name(self) -> str: ...
+    def total_bytes(self) -> int: ...
+
+class PoolBackend:
+    HostDram: typing.ClassVar[PoolBackend]
+
+class PoolState:
+    Initializing: typing.ClassVar[PoolState]
+    Ready: typing.ClassVar[PoolState]
+    Destroying: typing.ClassVar[PoolState]
+
+class PoolStatus:
+    Ok: typing.ClassVar[PoolStatus]
+    NotFound: typing.ClassVar[PoolStatus]
+    AlreadyExists: typing.ClassVar[PoolStatus]
+    Initializing: typing.ClassVar[PoolStatus]
+    Destroying: typing.ClassVar[PoolStatus]
+    PoolBusy: typing.ClassVar[PoolStatus]
+    StaleGeneration: typing.ClassVar[PoolStatus]
+    ConfigurationMismatch: typing.ClassVar[PoolStatus]
+    ResourceError: typing.ClassVar[PoolStatus]
+
+class PoolConfig:
+    name: str
+    backend: PoolBackend
+    num_slots: int
+    slot_bytes: int
+    compatibility: bytes
+    def __init__(
+        self,
+        name: str,
+        num_slots: int,
+        slot_bytes: int,
+        backend: PoolBackend = ...,
+        compatibility: bytes = ...,
+    ) -> None: ...
+
+class PoolDescriptor:
+    @property
+    def name(self) -> str: ...
+    @property
+    def generation(self) -> int: ...
+    @property
+    def state(self) -> PoolState: ...
+    @property
+    def config(self) -> PoolConfig: ...
+    def __getstate__(self) -> tuple[typing.Any, ...]: ...
+    def __setstate__(self, state: tuple[typing.Any, ...]) -> None: ...
+
+def create_pool(config: PoolConfig) -> tuple[PoolStatus, PoolDescriptor | None]: ...
+def open_pool(name: str) -> tuple[PoolStatus, PoolDescriptor | None]: ...
+def destroy_pool(descriptor: PoolDescriptor) -> PoolStatus: ...
+def attach_pool(
+    descriptor: PoolDescriptor,
+) -> tuple[PoolStatus, SharedPool | None]: ...
+def detach_pool(pool: SharedPool) -> None: ...

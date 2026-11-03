@@ -17,14 +17,37 @@ from functools import wraps
 
 import torch
 from torch._inductor.graph import GraphLowering
-from torch._inductor.ir import ComputedBuffer, MutationLayoutSHOULDREMOVE
+from torch._inductor.ir import (
+    ComputedBuffer,
+    FixedLayout,
+    MutationLayoutSHOULDREMOVE,
+    TensorBox,
+)
 from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.utils import InputType
 from torch._inductor.virtualized import V
 
+from . import pass_counters
+from .constants import DEVICE_NAME
+
 
 @contextmanager
 def spyre_data_types():
+    """Keep elementwise computation at the input width for the whole compile.
+
+    Upstream ``_computation_dtype_map`` sends fp16 / bf16 / complex32 to a wider
+    computation dtype, so aten refs upcast to fp32 before computing.  Spyre
+    lowers these widths natively and does not want that implicit upcast, so the
+    map is replaced with identity entries for the duration of the compile:
+    inside this CM ``get_computation_dtype(torch.float16)`` is fp16, not fp32.
+
+    Action at a distance worth knowing before you touch this: a decomposition
+    that genuinely needs a wider evaluation width can no longer get it from
+    ``elementwise_dtypes(...)[0]`` here, and must spell it with an explicit
+    ``.to(...)``.  ``_taylor_dtypes`` in ``decompositions.py`` (cos / sin) does
+    exactly that and documents why -- its Cody-Waite range reduction resolves
+    the argument against pi and loses ~0.75 absolute at a 10-bit mantissa.
+    """
     saved = torch._prims_common._computation_dtype_map
     torch._prims_common._computation_dtype_map = {
         torch.bfloat16: torch.bfloat16,
@@ -35,6 +58,80 @@ def spyre_data_types():
         yield
     finally:
         torch._prims_common._computation_dtype_map = saved
+
+
+@contextmanager
+def _preserve_spyre_input_storage_offsets():
+    """Attach graph-input offsets before lowering creates dependent views.
+
+    Upstream ``GraphLowering.placeholder`` records ``storage_offset`` beside
+    the graph input, but initializes the input's ``FixedLayout`` with offset
+    zero.  Spyre repairs that layout during pre-scheduling layout propagation;
+    by then, however, a view lowered from the input has already copied the
+    zero offset into its own ``FixedLayout``.  Put the recorded offset on the
+    input immediately so every subsequently constructed view inherits it.
+    """
+    old_placeholder = GraphLowering.placeholder
+
+    def _spyre_placeholder(self: GraphLowering, target, args, kwargs):
+        result = old_placeholder(self, target, args, kwargs)
+        if not isinstance(result, TensorBox):
+            return result
+
+        input_buffer = result.data.data
+        layout = input_buffer.layout
+        if not isinstance(layout, FixedLayout) or layout.device.type != DEVICE_NAME:
+            return result
+
+        name = self.graph_input_names[-1]
+        input_buffer.layout = FixedLayout(
+            layout.device,
+            layout.dtype,
+            layout.size,
+            layout.stride,
+            self.graph_input_storage_offsets[name],
+        )
+        return result
+
+    GraphLowering.placeholder = _spyre_placeholder  # type: ignore[method-assign]
+    try:
+        yield
+    finally:
+        GraphLowering.placeholder = old_placeholder  # type: ignore[method-assign]
+
+
+@contextmanager
+def _unique_operation_names():
+    """Name every operation as ``register_operation_after_graph_edit`` does.
+
+    Upstream ``GraphLowering.register_operation`` names an op
+    ``op{len(graph.operations)}``.  Pre-scheduling passes that lower new nodes
+    (``insert_restickify``, ``insert_bmm_padding``, ``coarse_tile``) register
+    them after earlier passes have shortened the list, so the name can already
+    belong to a live op and ``name_to_op`` is overwritten.  Anything that then
+    looks the op up by name gets the newcomer.  While lowering only appends, the
+    first free name is the upstream one.
+
+    Additionally, ``dedup_and_promote_constants`` pops merged constants from
+    ``name_to_op`` entirely, freeing their name slots.  Checking ``name_to_op``
+    alone would allow those freed names to be reissued.  This wrapper stamps
+    ``_spyre_issued_op_names`` on the graph at first registration; that set
+    accumulates every name ever handed out and is never pruned by graph passes.
+    """
+    from torch_spyre._inductor.pass_utils import register_operation_after_graph_edit
+
+    old_register_operation = GraphLowering.register_operation
+
+    def _register(graph, op):
+        if not hasattr(graph, "_spyre_issued_op_names"):
+            graph._spyre_issued_op_names = set(graph.name_to_op.keys())
+        return register_operation_after_graph_edit(graph, op)
+
+    GraphLowering.register_operation = _register  # type: ignore[method-assign]
+    try:
+        yield
+    finally:
+        GraphLowering.register_operation = old_register_operation  # type: ignore[method-assign]
 
 
 @contextmanager
@@ -75,6 +172,7 @@ def enable_spyre_context(example_inputs: list[InputType]):
         CustomPostFusionPasses,
         CustomPreSchedulingPasses,
     )
+    from torch_spyre._inductor import timing_recorder
     from torch_spyre._inductor.propagate_hints import recover_spyre_hints
 
     # *) Inductor config tweaks (saved/restored)
@@ -92,6 +190,10 @@ def enable_spyre_context(example_inputs: list[InputType]):
         # Disable fusing of mm + permute/transpose for now.
         "permute_fusion": False,
         "allow_buffer_reuse": False,  # For now, as buffer reuse does not consider stride_map.
+        "reorder_for_locality": False,  # Prevents unhinted ops from being moved into hinted regions.
+        # Spyre has no device-side RNG: replace_random would rewrite aten RNG ops
+        # into prims.inductor_random, whose index_expr lowering Spyre cannot codegen.
+        "fallback_random": True,
     }
 
     from torch._inductor.ir import Loops
@@ -125,7 +227,10 @@ def enable_spyre_context(example_inputs: list[InputType]):
                 recover_spyre_hints(self.graph)
             _pre_scheduling_pass(self)
             setattr(self, "_spyre_pre_scheduling_complete", True)
-        old_update_scheduler(self)
+        # Upstream scheduler construction, which the pre-scheduling pipeline runs
+        # immediately before. Timed separately so the two are not conflated.
+        with timing_recorder.stage("stage:GraphLowering:update_scheduler"):
+            old_update_scheduler(self)
 
     GraphLowering._update_scheduler = _spyre_update_scheduler  # type: ignore[method-assign]
 
@@ -160,7 +265,12 @@ def enable_spyre_context(example_inputs: list[InputType]):
 
     with (
         spyre_data_types(),
+        _preserve_spyre_input_storage_offsets(),
+        _unique_operation_names(),
         enable_spyre_lowerings(),
+        # Analysis-call counters ride the timing gate: they exist to annotate
+        # timing records, and a second knob would let the two disagree.
+        pass_counters.counting(install=timing_recorder.is_enabled()),
         V.set_real_inputs(example_inputs),
         V.set_choices_handler(SpyreHeuristics()),
         torch._inductor.config.patch(new_config),

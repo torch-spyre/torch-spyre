@@ -102,7 +102,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                         )
 
         def fn(t):
-            t = torch.sin(t)  # fallback op
+            # aten.cumsum is a CPU fallback (torch_spyre/ops/fallbacks.py);
+            # aten.sin no longer is -- it has a Spyre decomposition now.
+            t = torch.cumsum(t, dim=0)  # fallback op
             return t
 
         before_decomps = copy.deepcopy(decompositions)
@@ -115,7 +117,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         with pytest.warns(torch_spyre.ops.fallbacks.FallbackWarning) as record:
             # run_eager=False: the eager path also triggers a FallbackWarning
-            # (sin dispatches to the CPU fallback kernel), and pytest.warns
+            # (cumsum dispatches to the CPU fallback kernel), and pytest.warns
             # overrides the module-level "once" filter, so we'd capture 2
             # warnings instead of 1.  This test only cares about decomposition
             # table integrity, so skip eager.

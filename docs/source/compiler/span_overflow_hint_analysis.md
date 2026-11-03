@@ -3,19 +3,19 @@
 ## Background
 
 Spyre kernels must keep each core's memory-address span within the hardware
-limit (`MAX_SPAN_BYTES`, (255.996 MiB)).  Normal `work_division` splits work
+limit (`MAX_SPAN_BYTES`, (256 MB)).  Normal `work_division` splits work
 across cores, but some physical layouts still expose a span that is too large
 for one core.  When that happens, backend compilation can fail with Work
 Division warnings, deeptools mutable-address failures, or immediate/EAR boundary
 errors.
 
-`span_overflow_hint_analysis.py` is the compiler-generated version of a user
-`spyre_hint`: it detects span-risky `ComputedBuffer` ops and asks existing
+`span_overflow_hint_analysis.py` is the compiler-generated counterpart of a user-written
+`for_each_tile` loop: it detects span-risky `ComputedBuffer` ops and asks existing
 coarse tiling to run those ops in smaller output-range tiles.
 
 The planner does not mutate IR directly.  It computes a `SpanOverflowTilePlan`.
 The adapter in `coarse_tile_span_overflow.py` converts that plan into the same
-`DimHint` and coarse-tile group format used by manual `spyre_hint`.
+`DimHint` and coarse-tile group format that `for_each_tile` loops use.
 
 ```text
 span_overflow_hint_analysis
@@ -52,6 +52,7 @@ Example operation:
 def fn(x, y):
     return x + y
 
+
 x.shape == y.shape == (1, 8195, 256, 64)
 ```
 
@@ -64,11 +65,14 @@ selected_host_dim = 1
 split_count       = 5
 ```
 
-Conceptually this is equivalent to:
+Conceptually this is equivalent to tiling the add by hand with `for_each_tile`:
 
 ```python
-with spyre_hint(num_tiles_per_dim={"H": 5}):
-    out = x + y
+def body(_, tiles):
+    x_tile, y_tile = tiles
+    return None, x_tile + y_tile
+
+_, out = for_each_tile(body, (x, y), dims=(1, 1), tile_size=8195 // 5, out_dim=1)
 ```
 
 Code flow:
@@ -114,6 +118,7 @@ Example operation:
 def fn(x):
     return x.sum(dim=-1)
 
+
 x.shape == (1, 8195, 256, 64)
 out.shape == (1, 8195, 256)
 ```
@@ -142,7 +147,8 @@ Example operation:
 def fn(x):
     return x.sum(dim=0)
 
-x.shape   == (2, 20, 16, 64)
+
+x.shape == (2, 20, 16, 64)
 out.shape == (20, 16, 64)
 ```
 
@@ -181,9 +187,10 @@ Example operation:
 def lm_head(x, weight):
     return torch.nn.functional.linear(x, weight)
 
-x.shape      == (2, 64)
+
+x.shape == (2, 64)
 weight.shape == (1024, 64)
-out.shape    == (2, 1024)
+out.shape == (2, 1024)
 ```
 
 Lowering can represent this as a restickify producer followed by a
@@ -301,8 +308,8 @@ Code flow:
 
 ```text
 _output_span_candidates_from_op -> candidates for dim 0 and dim 1
-_candidate_host_dims            -> order by span pressure
-_split_candidates_for_host_dim  -> legal divisors per dim
+_candidate_axes                 -> order output/reduction axes by pressure
+_split_candidates_for_axis     -> legal divisors per axis
 _iter_split_combos              -> cheapest combos first
 _remaining_span_candidates_after_tile -> accept only if all spans are safe
 ```
@@ -350,33 +357,53 @@ _split_candidates_for_host_dim
           _post_tile_stick_alignment_error -> _within_stick_host_dim
 ```
 
-### 8. Reduction-Controlled Span: Known Unsupported Case
+### 8. Reduction-Controlled Span: Reduction-Range Tiling
 
 Example operation:
 
 ```python
 def fn(x):
-    return x.sum(dim=-1)
+    return x.sum(dim=1)  # x.shape == (1, 65536, 16, 64); reads all of x
 ```
 
-If the only overflowing input coordinate is controlled by a generic reduction
-symbol, output-range tiling cannot fix it and the output-range input scan skips
-that candidate.  BMM is the special case: when the reduction symbol is the
-single identifiable matmul `k`, the planner can use the BMM K fallback to emit
-an independent reduction-range tile plan.
+When the only overflowing input coordinate is controlled by the reduced axis,
+no output-range tile can shrink it -- the reduction range itself must be split
+and accumulated in rounds.  This is supported for:
 
-Code flow for generic reductions:
+- batch-matmul `k` (the original case); and
+- a non-matmul `Reduction` whose `reduction_type` is one of `sum`, `prod`,
+  `max`, `min` **and** which has exactly one reduction range
+  (`_supports_reduction_range_tiling`).  These recombine associatively through
+  coarse tiling's identity-fill + per-tile combine + drain path
+  (`coarse_tile._reduction_identity_value` / `_insert_combine_op`).
+
+The planner emits a `SpanOverflowTileLevel(selected_host_dim=0,
+is_reduction=True)` -- `selected_host_dim` is the reduction-range position,
+always `0` here.  It joins the same bounded search as the output axes, so the
+result can be reduction-only or a nested output+reduction plan.
+
+Code flow:
 
 ```text
-_input_span_infos_controlled_by_output_dims
-  -> coordinate free symbols include reduction-only symbol
-  -> symbol is not in output_symbol_to_dim
-  -> reduction_syms is non-empty and not the BMM K special case
-  -> continue
+_input_span_candidates
+  -> _supports_reduction_range_tiling(op) == True
+  -> _bmm_k_span_infos  (name retained; now covers sum/prod/max/min too)
+       -> reduction-only coordinate span > MAX_SPAN_BYTES
+       -> SpanOverflowCandidate(is_reduction=True)
+  -> _search_min_cost_tile_plan
+       -> _split_candidates_for_axis -> _bmm_k_split_candidates (exact divisors)
 ```
 
-Generic reduction-range tiling and combined output+reduction tiling remain
-future work.
+Still unsupported (raise `Unsupported` with a clear message rather than
+silently dropping the overflow -- `_has_untileable_reduction_span`):
+
+- `mean` (its per-tile scale factor needs separate handling);
+- more than one reduction range on one op (coarse tiling tiles at most one
+  reduction dim per level).
+
+`xor_sum` / `any` / welford (no Spyre kernel lowering) are outside this raise's
+scope (`_REDUCTION_RANGE_FAMILY`) entirely -- a reduction-only overflow on one
+of these is still silently skipped, the same as before this feature existed.
 
 ### 9. Coordinate Jointly Controlled by Two Output Symbols
 
@@ -460,17 +487,18 @@ op.
 
 `span_overflow_groups(graph)` consumes the plan, decides synthetic `DimHint`s
 for each op (without assigning them — that is left to the caller, see
-"Adapter and Coarse Tiling" below), and returns groups shaped like user hint
-groups:
+"Adapter and Coarse Tiling" below), and returns groups in the standard
+coarse-tile group format:
 
 ```python
 [([op], [(hint_id, split_count), ...])]
 ```
 
-Whether a level tiles an output range or the BMM K reduction range is stored on
-the per-op `DimHint` (`is_reduction`), not in the group-level `levels` list.
-Output-range automatic hints have `is_reduction=False`; BMM K fallback hints
-have `is_reduction=True` and are emitted as independent singleton groups.
+Whether a level tiles an output range or a reduction range is stored on the
+per-op `DimHint` (`is_reduction`), not in the group-level `levels` list.
+Output-range automatic hints have `is_reduction=False`; reduction-range hints
+have `is_reduction=True`. Plans containing a reduction-range level are emitted
+as independent singleton groups, including combined output+reduction plans.
 
 ## Scope
 
@@ -481,8 +509,10 @@ The production planner handles:
 - output layout span overflow;
 - reduction/BMM input span overflow when the span is controlled by output
   symbols;
-- BMM input span overflow controlled only by the single K reduction symbol,
-  using an independent K-only fallback plan;
+- input span overflow controlled by the single reduction symbol -- BMM `k`, or
+  a `sum`/`prod`/`max`/`min` reduction with one reduction range -- searched
+  together with the output dimensions to allow reduction-only or combined
+  plans;
 - one or more output host dimensions per op, bounded by `_MAX_TILE_DIMS`;
 - static `FixedTiledLayout` metadata only.
 
@@ -492,9 +522,12 @@ The planner skips:
 - non-`FixedTiledLayout` ops, including mutation/copy-back intermediate layouts;
 - symbolic/dynamic layout metadata;
 - scalar/full reductions where `op.data.ranges` is empty;
-- Pointwise or Reduction ops with indirect/gather/scatter-style reads;
-- input spans controlled only by reduction symbols for non-BMM reductions;
-- combined output-range plus reduction-range tiling, such as M+K.
+- Pointwise or Reduction ops with indirect/gather/scatter-style reads.
+
+It raises `Unsupported` (rather than skipping) when a reduction-only input span
+overflows but the op cannot be reduction-range tiled -- `mean` or more than one
+reduction range.  `xor_sum` / `any` / welford overflows are not covered by this
+raise (see Known Limitations) and are silently skipped instead.
 
 ### Support Matrix
 
@@ -505,16 +538,18 @@ The planner skips:
 | Reduction output span overflow | Yes | Emit output-range tile levels if post-tile layout validates |
 | Reduction input span controlled by output dim | Yes | Emit tile for the matching output dim |
 | Coordinate jointly controlled by 2+ output symbols | Yes | Emit a candidate for each contributing dim |
-| Reduction input span controlled by reduction dim | No | Skip candidate; generic reduction-range tiling is future work |
+| `sum`/`prod`/`max`/`min` input span controlled by the single reduction dim | Yes | Emit reduction-range level (`is_reduction=True`); reduction-only or combined output+reduction |
+| `mean` / multi-reduction-range input span on the reduction dim | No | Raise `Unsupported` with a clear message |
+| `xor_sum` / `any` / welford input span on the reduction dim | No | Skip silently (outside `_REDUCTION_RANGE_FAMILY`); span may still overflow |
 | BMM input span controlled by `b`, `m`, or `n` | Yes | Emit tile for matching output dim |
-| BMM input span controlled by `k` | Yes | Emit independent K reduction-range tile if K-only validation clears every span |
-| BMM input spans needing both output dim and `k` tiling | No | Raise `Unsupported`; combined output+K plans are future work |
+| BMM input span controlled by `k` | Yes | Emit reduction-only or combined output+`k` levels when full validation clears every span |
+| BMM input spans needing both output dim and `k` tiling | Yes | Search and validate output+`k` split combinations together |
 | BMM with ambiguous reduction symbols | No | Return no BMM input candidates |
 | Scalar/full reduction | No | Return `None` |
 | Symbolic layout metadata | No | Return `None` |
 | More than `_MAX_TILE_DIMS` overflowing host dims | No | Raise `Unsupported` |
 | No legal exact divisor / stick-safe split | No | Raise `Unsupported` |
-| User already supplied `spyre_hint` for op | Manual wins | Auto hint is not added for that op |
+| Op already tiled by a `for_each_tile` loop | Manual wins | Auto hint is not added for that op |
 
 ## Pointwise Flow
 
@@ -554,8 +589,9 @@ For `Reduction` ops, `plan_span_overflow_tile` does:
 check op/layout eligibility
 check _has_indirect_reads(op); skip if true
 skip scalar reductions
+_has_untileable_reduction_span(op); raise Unsupported if true
 collect output span candidates
-collect input span candidates controlled by output dims
+collect input span candidates (output-controlled + reduction-range)
 search for cheapest valid tile combination
 ```
 
@@ -581,11 +617,16 @@ scanning later device coordinates.  That `continue` behavior is important: a
 reduction-controlled outer coordinate must not prevent discovery of a
 more-inner output-controlled overflowing coordinate.
 
-BMM `k` is the special supported reduction symbol.  The output-range scan does
-not create B/M/N candidates for pure K-controlled spans; instead the later BMM
-K fallback can emit an independent reduction-range plan.  Generic
-reduction-only input span overflow remains a known limitation because it needs
-reduction-range tiling and partial accumulation outside the BMM-specific path.
+The output-range scan does not create B/M/N candidates for a coordinate
+controlled only by a reduction symbol.  Instead `_bmm_k_span_infos` collects
+those as `is_reduction=True` candidates for the reduction-range search -- for
+BMM `k`, or for a `sum`/`prod`/`max`/`min` reduction with one reduction range.
+`mean` and multi-reduction-range ops cannot be reduction-range tiled;
+`_has_untileable_reduction_span` detects an overflow they cannot fix and the
+planner raises `Unsupported` rather than emitting a plan that still overflows.
+`welford` (and `xor_sum` / `any`) fall outside `_REDUCTION_RANGE_FAMILY`
+altogether, so this guard does not see them at all -- an overflow on one of
+these is silently skipped, unchanged from before this feature existed.
 
 ## BMM-Specific Symbol Mapping
 
@@ -601,9 +642,15 @@ input dependencies to identify exactly one reduction-only symbol (`k`).  If
 there is not exactly one such symbol, it returns `{}` and the BMM input-span
 path produces no candidates.
 
+The reduction-symbol derivation itself is not BMM-specific -- `_bmm_k_symbol`
+(name retained) resolves the single reduction-only input symbol for any op
+`_supports_reduction_range_tiling` accepts.  For a non-matmul reduction the
+output-symbol map is plain `_output_symbol_to_dim`; only the B/M/N naming above
+is matmul-specific.
+
 BMM input spans controlled by `b`, `m`, or `n` can be fixed by output-range
-tiling.  Pure `k` spans are handled by the BMM K fallback, which emits an
-independent reduction-range tile only when K-only validation clears every span.
+tiling.  Pure `k` spans are handled by the reduction-range search, which emits
+a reduction-range tile only when validation clears every span.
 
 ## Span Calculation
 
@@ -611,9 +658,7 @@ For a physical device coordinate at `device_dim`, span is computed as:
 
 ```python
 per_core_span = (
-    coord_span_elems
-    * math.prod(device_size[device_dim + 1:])
-    * dtype.itemsize
+    coord_span_elems * math.prod(device_size[device_dim + 1 :]) * dtype.itemsize
 )
 ```
 
@@ -668,14 +713,16 @@ must clear the whole joint span -- but it only seeds the bounded divisor
 search; the post-tile combo is always validated exactly, so an imprecise
 estimate costs extra combo attempts, not correctness.
 
-`_candidate_host_dims` merges candidates by host dim and orders dims by
+`_candidate_axes` merges candidates by `(host dim, is_reduction)` and orders dims by
 decreasing span pressure.  This ordering affects the bounded combo search when
 costs tie.
 
 ## Split Candidates and Cost Search
 
-For each candidate host dim, `_split_candidates_for_host_dim` enumerates legal
-split counts from exact divisors of `op.data.ranges[host_dim]`.
+For each candidate axis, `_split_candidates_for_axis` dispatches output axes to
+`_split_candidates_for_host_dim` and the reduction axis to
+`_bmm_k_split_candidates` (exact divisors of the reduction range; gated on
+`_supports_reduction_range_tiling`).
 
 A split candidate is legal only if:
 
@@ -703,9 +750,9 @@ construction, and automatic split counts above `_MAX_AUTO_TILE_SPLIT_COUNT` are
 rejected because current automatic `LoopSpec` lowering can materialize one SDSC
 spec per coarse tile.  A plan such as `split_count=769` can therefore generate
 `sdsc_0.json` through `sdsc_768.json` instead of one compact symbolic tile loop.
-Manual `spyre_hint` remains explicit/user-controlled and can rely on the more
-mature user-hint grouping path; the automatic pass is intentionally capped until
-auto groups can reuse the same compact grouped lowering.
+A user-written `for_each_tile` loop is explicit and uses the compact loop
+lowering; the automatic pass is intentionally capped until auto groups can
+reuse the same compact grouped lowering.
 Combinations are tried in increasing cost order:
 
 ```python
@@ -771,9 +818,8 @@ synthetic `DimHint` per level.  `coarse_tile` then stamps a multi-level
 
 `coarse_tile_span_overflow.span_overflow_groups(graph)`:
 
-1. skips auto groups if `config.ignore_wsr_hints` or
-   `config.ignore_span_overflow_hints` is enabled;
-2. skips ops that already have user dim hints;
+1. skips auto groups if `config.ignore_span_overflow_hints` is enabled;
+2. skips ops that a `for_each_tile` loop already tiles (they carry dim hints);
 3. calls `plan_span_overflow_tile`;
 4. maps each `selected_host_dim` to a concrete output loop symbol via
    `op_out_coords(op)`;
@@ -812,8 +858,8 @@ synthetic `DimHint` per level.  `coarse_tile` then stamps a multi-level
    through that check on the join branch. If nothing joins, the run flushes to
    exactly the singleton group an unjoined Reduction produced before;
 6. rejects any op that reads a buffer from an already-closed auto-tiled
-   group, from a producer already tiled by a user `spyre_hint` (checked via
-   the same `dim_hints` attribute `assign_dim_hints` leaves behind, since
+   group, from a producer already tiled by a `for_each_tile` loop (checked via
+   the `dim_hints` attribute carrying its `loop_var_range`, since
    this pass never clears it), or from the open run without being fusable
    into it (mismatched signature and conform fails, or a Reduction that
    cannot join per step 5), since two independent loop nests over the same
@@ -825,13 +871,13 @@ synthetic `DimHint` per level.  `coarse_tile` then stamps a multi-level
 7. creates synthetic `DimHint`s with ids starting at
    `_SPAN_OVERFLOW_HINT_ID = 10000`, shared across every op in a fused group;
 8. returns `(groups, dim_hint_assignments)` — coarse-tile groups in the same
-   format as user hints, plus the `(op, dim_hints)` pairs decided in step 7.
+   format as `for_each_tile` loops, plus the `(op, dim_hints)` pairs decided in step 7.
    `span_overflow_groups` itself never assigns `op.dim_hints`: it is a pure
    planning step, and the caller (`_maybe_coarse_tile_span_overflow` in
    `passes.py`) applies the assignments immediately before
-   `validate_coarse_tile_groups`/`coarse_tile` run.
+   `validate_coarse_tile_groups`/`coarse_tile_post_stickify` run.
 
-From `coarse_tile` onward, automatic and manual hints share the same path:
+From `coarse_tile` onward, automatic span-overflow groups and `for_each_tile` loops share the same path:
 
 - rewrite `op.data.ranges` and `op.layout.size` per tile;
 - stamp `CoarseTileInfo`;
@@ -853,12 +899,8 @@ pass with:
 SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS=0
 ```
 
-The broader working-set-reduction hint switch also suppresses this path when
-set: `SPYRE_INDUCTOR_IGNORE_HINTS=1` (which populates `config.ignore_wsr_hints`,
-default off) disables both manual and automatic hints with one switch.
-
-User-authored `spyre_hint` groups take precedence per op.  Automatic hints are
-not added to ops that already carry user dim hints.
+Ops that a `for_each_tile` loop already tiles take precedence.  Automatic hints
+are not added to ops that already carry dim hints.
 
 When span-overflow hints are explicitly enabled, copy-back elision preserves
 Pointwise `FixedTiledLayout` producers instead of rewriting them to mutation
@@ -881,7 +923,10 @@ automatic output-range tile plan.  Common reasons:
 - selected host dim is not in `op.data.ranges`;
 - selected range is size 1 or non-integral;
 - no legal exact divisor exists;
-- BMM K-only candidates still leave non-K span overflows;
+- a reduction-only input span overflows but the op cannot be reduction-range
+  tiled (`mean`, more than one reduction range -- see Known Limitations for why
+  `xor_sum` / `any` / welford are not included here);
+- reduction-only candidates still leave non-reduction span overflows;
 - stick alignment rejects all candidates;
 - `_resize_device_layout` cannot reconstruct the post-tile layout;
 - every tried combination still leaves output/input spans above the limit;
@@ -898,10 +943,16 @@ violates the hardware span limit or silently creates unsynchronized tile loops.
 
 ## Known Limitations
 
-- Reduction-range tiling is not implemented.  Input spans controlled only by
-  reduction symbols are skipped.  If such a skipped span still exceeds the
-  hardware limit, downstream Work Division currently logs a critical overflow
-  diagnostic but does not raise before backend compilation.
+- Reduction-range tiling covers BMM `k` and single-range `sum`/`prod`/`max`/
+  `min` only.  `mean` needs per-tile scale-factor handling; more than one
+  reduction range on one op is not searched (coarse tiling tiles at most one
+  reduction dim per level).  A reduction-only overflow on `mean` or a
+  multi-range op raises `Unsupported` (`_REDUCTION_RANGE_FAMILY` covers both).
+  `xor_sum`, `any`, and welford have no Spyre kernel lowering and are outside
+  that family entirely -- a reduction-only overflow on one of these is still
+  silently skipped, not raised.
+- Combined output+reduction plans are emitted as nested levels only (outer
+  output, inner reduction) -- never a single mixed level.
 - Scalar/full reductions are skipped.
 - Indirect/gather/scatter-style Pointwise and Reduction ops are skipped because
   they require the indirect-access SDSC path.
@@ -912,8 +963,8 @@ violates the hardware span limit or silently creates unsynchronized tile loops.
   mathematical span limit: current automatic coarse tiling can unroll a large
   tile count into many generated SDSC specs, which is expensive and can appear
   to hang compilation.  For example, an automatic split of `769` may emit 769
-  per-tile specs.  Manual `spyre_hint` is still user-controlled and may be able
-  to use existing grouped hint lowering more effectively; automatic
+  per-tile specs.  A user-written `for_each_tile` loop is explicit and may be able
+  to use the compact loop lowering more effectively; automatic
   span-overflow should grow producer-consumer/grouped loop lowering before this
   cap is relaxed.
 - Reduction auto-tiling rejects splits that shrink the selected output dim's
@@ -967,13 +1018,13 @@ violates the hardware span limit or silently creates unsynchronized tile loops.
   span-overflow-sized data can desynchronize, and materializing a tiled
   producer's full buffer for such an unfused consumer can reintroduce the
   exact span violation tiling was meant to prevent. A producer and consumer
-  that are both inside the same manual `spyre_hint` group are unaffected,
-  since users can explicitly group them into one shared coarse-tile group; the
+  that are both inside the same `for_each_tile` loop are unaffected,
+  since users can explicitly group them into one shared loop; the
   conflict check only fires when an *automatically*-tiled op reads a
-  manually-hinted producer that it was not itself grouped with.
+  `for_each_tile`-tiled producer that it was not itself grouped with.
 
   Two distinct rejection messages tell these cases apart. Reading a producer
-  whose group has already been flushed — or one tiled by a user `spyre_hint` —
+  whose group has already been flushed — or one tiled by a `for_each_tile` loop —
   gives `it reads already-tiled producer(s) [...] that are not in an open group
   this op can join`. Reading a producer in the *open* group but failing a join
   condition gives `it reads auto-tiled producer(s) [...] in the open group but
@@ -1025,9 +1076,14 @@ Current coverage includes:
 - Pointwise output span tiling;
 - Reduction output span tiling;
 - Reduction/BMM input span tiling;
+- generic reduction-range tiling for `sum`/`prod`/`max`/`min` (planner emits an
+  `is_reduction=True` level), combined output+reduction plans, a clear
+  `Unsupported` for `mean` / multi-reduction-range overflows, and the silent
+  skip (no raise) for reduction types outside `_REDUCTION_RANGE_FAMILY` such
+  as welford / `xor_sum` / `any`
+  (`TestSpanOverflowGenericReductionRangeTiling`);
 - scalar reduction skip;
 - indirect-read guards for Pointwise and Reduction;
-- reduction-controlled span known limitation;
 - BMM reduction-symbol validation;
 - input-layout stick alignment, including a symbol that jointly controls an
   input dimension together with another symbol rather than controlling it
@@ -1060,74 +1116,44 @@ Current coverage includes:
 - codegen `LoopSpec` tests for Pointwise, Reduction, and LM-head restickify
   shapes;
 - real end-to-end hardware execution and numeric validation (no kernel-launch
-  mocking) for both join cases, comparing against a CPU reference:
-  `test_pointwise_to_non_matmul_reduction_join_numeric` (forces a matching
-  plan for a `sum` reduction and its pointwise producer, since the real
-  planner's independently-chosen plans did not happen to agree for this toy
-  shape) and `test_lm_head_matmul_join_numeric` (the real
-  `vocab=49152`/`sencores=32` shape, comparing tiled vs. untiled mismatch
-  rates against the same CPU reference to separate ordinary fp16
-  accumulation noise from join-introduced error), in
-  `TestSpanOverflowNumericValidation`.
+  mocking), all in `TestSpanOverflowNumericValidation`:
+  - every producer/consumer join direction (see the matrix below), each
+    asserting the tiled result is no worse than the same graph run untiled
+    against the same CPU reference;
+  - `test_lm_head_matmul_join_numeric`, the real `vocab=49152`/`sencores=32`
+    LM-head shape;
+  - `test_generic_{sum,max,min}_reduction_range_tile_numeric` -- a forced
+    reduction-range tile on `sum`/`amax`/`amin` executed and compared to CPU,
+    exercising each identity/combine path;
+  - `test_generic_sum_reduction_range_tile_numeric_organic` -- the real
+    planner picking a reduction-range tile from a genuine (lowered-limit)
+    overflow, with no plan forcing;
+  - `test_mean_reduction_range_overflow_raises_at_compile` -- a `mean`
+    overflow fails the compile with the clear "not supported" message.
 
 Producer/consumer grouping is covered at three depths -- the grouping decision
 (mocked), codegen (compiled with kernel launch mocked, asserting one shared
-`LoopSpec`), and execution (run against a CPU reference):
+`LoopSpec`), and execution (run against a CPU reference).  All directions
+below pass; the numeric tests assert the tiled run is no worse than the same
+graph run untiled against the same CPU reference, so ordinary fp16
+accumulation noise is not mistaken for a tiling bug.
 
 | Producer -> Consumer | Grouping | Codegen | Execution |
 |---|---|---|---|
 | pointwise -> pointwise | pass | pass | pass |
 | pointwise -> reduction | pass | pass | pass |
 | reduction -> pointwise | pass | pass | pass |
-| reduction -> reduction | pass | xfail (wrong write) | xfail |
+| reduction -> reduction | pass | pass | pass |
 | reduction -> matmul | pass | pass | pass |
-| pointwise -> matmul | pass | pass | xfail (wrong numbers) |
-| matmul -> pointwise | pass | pass | xfail (wrong numbers) |
-| matmul -> reduction | pass | pass | xfail (wrong numbers) |
+| pointwise -> matmul | pass | pass | pass |
+| matmul -> pointwise | pass | pass | pass |
+| matmul -> reduction | pass | pass | pass |
 | matmul -> matmul | pass | n/a | n/a |
 | matmul -> pointwise -> matmul | pass | not tested | not tested |
 
-Each remaining xfail carries a `TODO` naming its own cause.  **#3612 ("coarse
-tiling: optional read copy") changed this picture materially and the table
-above reflects the post-#3612 state.**  Five directions that previously xfailed
-now pass: all three matmul codegen cells, and execution for
-`reduction -> pointwise` and `reduction -> matmul`.
-
-What survives is a *different* failure, and a worse-shaped one.  The three
-matmul execution cells no longer fail to compile — they compile, run, and
-return wrong numbers.  `test_lm_head_matmul_join_numeric` reports tiled
-mismatches of 48727/49152 (99.14%) against 781/49152 (1.59%) untiled on the
-same reference, which is far outside fp16 accumulation noise.  The prime
-suspect is the positional walk in the read-copy path, which pairs the buffer's
-non-unit dims against iteration extents by position: instrumenting
-`_resize_device_layout` on the `reduction -> matmul` shape shows it building
-`tile_size=[1,4,32,64]` for a buffer of `[1,20,64,32]`, i.e. with the trailing
-dims transposed.  That walk predates this branch (it comes from #3381) and is
-unchanged by it, but it should be ruled out before any of these are blamed on
-the backend again.
-
-`reduction -> reduction` codegen is also xfailed, on a *known wrong write*
-rather than an unexplained failure.  `validate_writer_tile_advance` (#3678)
-rejects the group because the synthesized copy-out writer never advances:
-`_insert_copy_op` keys its per-level extents by raw dim index, while
-`_tiled_dims_for_dep` matches those keys against the squeezed `dN` symbols of
-`dep.index`.  For a terminal reduction whose output is `[1, 20]` the leading
-unit dim squeezes away, the raw key matches nothing, and every tile is written
-on top of tile 0.  It is not gated in the pass because the same code path
-serves `reduction -> matmul`, which works; what separates them is output shape,
-not direction.  Tagged `TODO(copy-out-writer-advance)`.
-
-Only one backend-attributed xfail remains, `reduction -> reduction` execution.
-Given
-that two of the three cases originally filed under the same
-`DtException: Could not find any suitable dimension mapping` diagnosis turned
-out to be unblocked by a read-copy change rather than a backend fix, that
-attribution has not been re-established and should not be assumed.
-
-`matmul -> matmul` is marked n/a rather
-than xfail because it is refused by design -- a Reduction consumer has no
-conform path, so both plans must independently agree
-(`TODO(span-overflow-reduction-conform)`,
+`matmul -> matmul` is marked n/a rather than xfail because it is refused by
+design -- a Reduction consumer has no conform path, so both plans must
+independently agree (`TODO(span-overflow-reduction-conform)`,
 [#3625](https://github.com/torch-spyre/torch-spyre/issues/3625) — the same tag
 as the `can_conform_reduction_tile` limitation above; retire both together).
 
@@ -1147,7 +1173,7 @@ terminating its group.
 | `torch_spyre/_inductor/wsr/span_overflow_hint_analysis.py` | Candidate collection, combo search, post-tile validation, tile-plan dataclasses |
 | `torch_spyre/_inductor/wsr/coarse_tile_span_overflow.py` | `span_overflow_groups`: adapter from tile plans to synthetic `DimHint`s |
 | `torch_spyre/_inductor/wsr/coarse_tile.py` | Coarse-tile IR stamping (`coarse_tile`, `CoarseTileInfo`) |
-| `torch_spyre/_inductor/passes.py` | Combines user hint groups and automatic span-overflow groups |
+| `torch_spyre/_inductor/passes.py` | Wires `splice_while_loops` (`for_each_tile`) and automatic span-overflow tiling into the pipeline |
 | `torch_spyre/_inductor/propagate_layouts.py` | Preserves pointwise producer layouts from copy-back elision when automatic span-overflow is explicitly enabled |
 | `torch_spyre/_inductor/ir.py` | Spyre layout resize/reconstruction helpers |
 | `torch_spyre/_inductor/work_division.py` | Span limit constants and downstream per-core span diagnostics |

@@ -4,9 +4,9 @@
 Three components are involved. Each has a distinct role:
 
 ### flex::RuntimeContext
-`flex::RuntimeContext` (via `GlobalRuntime`) creates and owns all `flex::RuntimeStream` instances. torch-spyre accesses this through `GlobalRuntime::get()`, which returns a `const std::shared_ptr<flex::RuntimeContext>&` — callers copy this reference to take shared ownership. torch-spyre never destroys a `flex::RuntimeStream`.
+`flex::RuntimeContext` (via `GlobalRuntime`) creates and owns all `flex::RuntimeStream` instances. torch-spyre accesses this through `GlobalRuntime::get()`, which returns a `flex::RuntimeContext*`. torch-spyre never destroys a `flex::RuntimeStream`.
 
-The runtime context is stored in a function-local static `std::shared_ptr<flex::RuntimeContext>`. It persists for the lifetime of the process unless explicitly replaced or reset via `GlobalRuntime::set()` or `GlobalRuntime::reset()`.
+The runtime context is stored in a function-local static `flex::RuntimeContext*`. It persists for the lifetime of the process unless explicitly replaced or reset via `GlobalRuntime::set()` or `GlobalRuntime::reset()`.
 
 torch-spyre never allocates, deallocates, or manages the lifetime of a `flex::RuntimeStream`. The flex runtime is solely responsible for stream lifecycle.
 
@@ -28,7 +28,7 @@ torch-spyre never allocates, deallocates, or manages the lifetime of a `flex::Ru
 │ TORCH-SPYRE                                                 │
 │                                                             │
 │  GlobalRuntime::get() ──returns──►                          │
-│         const std::shared_ptr<flex::RuntimeContext>&        │
+│         flex::RuntimeContext*                               │
 │         │                                                   │
 │         │ calls getDefaultStream() / createStream()         │
 │         ▼                                                   │
@@ -94,7 +94,7 @@ Handle resolution calls `TORCH_CHECK` and throw if the requested stream ID has n
 
 ## Invariants
 
-**Single device per process.** torch-spyre follows a one-process-one-device model. `startRuntime()` calls `flex::initializeRuntime` exactly once per process (via `std::call_once`) and binds `GlobalRuntime` to a single logical device, selected from `tls_idx`, `LOCAL_RANK`, or defaulting to `0`. Multi-device workloads are handled by `torchrun`, which spawns one process per device. This is why `stream_handle_map` is keyed by `c10::StreamId` alone with no device dimension — there is only ever one device's worth of stream IDs in the map.
+**Single device per process.** torch-spyre follows a one-process-one-device model. `startRuntime()` calls `flex::RuntimeContext::create()` exactly once per process (via `std::call_once`) and binds `GlobalRuntime` to a single logical device, selected from `tls_idx`, `LOCAL_RANK`, or defaulting to `0`. Multi-device workloads are handled by `torchrun`, which spawns one process per device. This is why `stream_handle_map` is keyed by `c10::StreamId` alone with no device dimension — there is only ever one device's worth of stream IDs in the map.
 
 `stream_handle_map` is append-only. Once a `c10::StreamId` is mapped to a `flex::RuntimeStream*`, that entry is never mutated or removed. This is what makes concurrent `shared_lock` reads safe — readers never observe a partial update or a removed entry.
 
@@ -104,4 +104,4 @@ Stream IDs are never reassigned. A given `c10::StreamId` always maps to the same
 
 ## Runtime Shutdown
 
-`freeRuntime()` calls `GlobalRuntime::reset()`, which drops torch-spyre's `shared_ptr<flex::RuntimeContext>`. Flex manages the context's actual lifetime independently, so stream handles are not immediately invalidated by this call. However, `StreamPool` is not cleared and `device_init_flags` are not reset, and `startRuntime()` cannot be called again because its `std::once_flag` is already spent. **Runtime reset after stream initialization is not supported.**
+`freeRuntime()` calls `GlobalRuntime::reset()`, which drops torch-spyre's `flex::RuntimeContext*`. Flex manages the context's actual lifetime independently, so stream handles are not immediately invalidated by this call. However, `StreamPool` is not cleared and `device_init_flags` are not reset, and `startRuntime()` cannot be called again because its `std::once_flag` is already spent. **Runtime reset after stream initialization is not supported.**

@@ -47,11 +47,14 @@ the Spyre device to guard against regressions.
 """
 
 import unittest
+import warnings
 
 import torch
 import torch.nn.functional as F
 
 from torch_spyre._inductor import config
+from torch_spyre._C import SpyreTensorLayout
+from torch_spyre.ops.eager import RetileWarning
 
 
 DEVICE = "spyre"
@@ -372,11 +375,11 @@ class TestInGraphCpuComputedBuffers(unittest.TestCase):
     """CPU pointwise ComputedBuffers in a mixed graph must not crash scratchpad planning.
 
     A convert fallback returns a CPU tensor; a chain of pointwise ops
-    (add/sub/mul -- all in OP_OUTPUT_GOOD_FOR_LX_REUSE) then runs on it inside
-    the same graph, before converting back to Spyre. propagate_layouts SKIPS
-    those CPU ComputedBuffers (device != spyre), leaving them a plain
+    (add/sub/mul -- none in OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE) then runs on it
+    inside the same graph, before converting back to Spyre. propagate_layouts
+    SKIPS those CPU ComputedBuffers (device != spyre), leaving them a plain
     `FixedLayout` with no `device_layout`. The scratchpad planner's op gate
-    (`_op_output_good_for_lx_reuse`) whitelisted by op NAME only, so a CPU
+    (`_op_output_good_for_lx_reuse`) filtered by op NAME only, so a CPU
     add/sub/mul passed the gate, entered graph_view, and reached
     `mem_usage_by_buf`, which read `layout.device_layout` and raised
     `'FixedLayout' object has no attribute 'device_layout'`. The gate now also
@@ -410,6 +413,9 @@ class TestInGraphCpuComputedBuffers(unittest.TestCase):
             return y_s * 2.0
 
         x = torch.randn(num_tokens, hidden, dtype=DTYPE)
+        # `fn`'s code object is shared across tests; without a reset Dynamo
+        # reuses the first test's compile and the allocator under test never runs.
+        torch.compiler.reset()
         compiled = torch.compile(fn, fullgraph=True, dynamic=False, backend="inductor")
         out = compiled(x.to(spyre))
         test.assertEqual(out.device.type, DEVICE)
@@ -423,11 +429,31 @@ class TestInGraphCpuComputedBuffers(unittest.TestCase):
         gate (mem_usage_by_buf over the filtered graph_view)."""
         self._run_and_check(self)
 
-    @config.patch({"co_optimizing_lx_planning": True})
+    # Pin greedy: this covers the co-opt allocator over the greedy inner solver
+    # (ExhaustiveSearchSolver-wrapped), the path this CPU-buffer guard was written
+    # for. The cpsat *joint* co-opt path does not yet apply the same guard;
+    # enabling cpsat co-opt is deferred to the co-opt follow-up. greedy has no
+    # core-division-capable solver, so this must opt into the
+    # ExhaustiveSearchSolver fallback via allow_exhaustive_search=True.
+    @config.patch(
+        {
+            "co_optimizing_lx_planning": True,
+            "layout_solver": "greedy",
+            "allow_exhaustive_search": True,
+        }
+    )
     def test_cpu_pointwise_chain_compiles_co_optimizing(self):
         """Co-optimizing allocator: `mem_usage_by_buf` runs on the RAW graph in
         `_build_cd_bound_buffers` / `_determine_in_place_division_invariant`,
         bypassing the gate -> exercises the defensive sentinel."""
+        self._run_and_check(self)
+
+    @config.patch(
+        {"co_optimizing_lx_planning": True, "layout_solver": "simulated_annealing"}
+    )
+    def test_cpu_pointwise_chain_compiles_co_optimizing_sa(self):
+        """Co-optimizing allocator over `SaCoOptimizingSolver`, which reaches
+        the footprint accounting by a different route than the greedy case."""
         self._run_and_check(self)
 
 
@@ -491,6 +517,34 @@ class TestFallbackResultNonCanonicalTiling(unittest.TestCase):
     def test_multi_token_gather(self):
         """T == 8: they coincide -- guards the control arm too."""
         self._run(8)
+
+    def test_direct_eager_result_preserves_noncanonical_layout(self):
+        """A true eager boundary exposes its real layout to the next graph."""
+        num_tokens = 1
+        cache = torch.randn(self.MAXPOS, 2, 2, self.INNER, dtype=DTYPE)
+        pos = torch.arange(num_tokens, dtype=torch.int64)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            rot = torch.ops.test_fk_gather.gather(cache.to(DEVICE), pos.to(DEVICE))
+
+        canonical = SpyreTensorLayout([int(s) for s in rot.shape], rot.dtype)
+        self.assertNotEqual(rot.device_tensor_layout(), canonical)
+        self.assertFalse(any(isinstance(w.message, RetileWarning) for w in caught))
+
+        # The next compiled graph specializes on the real layout of ``rot`` at
+        # its eager input boundary and must consume it without a re-tile.
+        scale = torch.randn_like(cache[:num_tokens])
+
+        def consume(x, y):
+            return x * y
+
+        out = torch.compile(consume, fullgraph=True, dynamic=False, backend="inductor")(
+            rot, scale.to(DEVICE)
+        )
+        torch.testing.assert_close(
+            out.cpu(), cache.index_select(0, pos) * scale, atol=0.01, rtol=0.01
+        )
 
     def test_cat_disagrees_in_rank_without_size_one_dim(self):
         """`aten.cat(dim=0)` at (8, 2, 2, 64): a second, distinct instance.

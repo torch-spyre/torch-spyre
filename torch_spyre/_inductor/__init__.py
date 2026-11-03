@@ -16,6 +16,7 @@ from .constants import DEVICE_NAME
 from .patches import enable_spyre_context, patch_inductor_fusions
 from . import config
 
+import os
 import threading
 from functools import wraps
 from typing import Any
@@ -24,6 +25,22 @@ from .propagate_hints import spyre_hint, get_op_hints  # noqa: F401
 from torch_spyre.profiler._ffdc import CATEGORY_COMPILE_FRONTEND, try_collect
 
 _autoload_lock = threading.Lock()
+
+# Set for the duration of a Spyre ``compile_fx`` call (the ``_wrapper`` Spyre
+# branch below). Read by the invoke_subgraph decomposition monkey-patch
+# (torch_spyre/_monkey_patch.py) to decide whether a nested_compile_region /
+# invoke_subgraph HOP body that inherits its decompositions (config is None)
+# should be re-traced with the Spyre decomp table. The HOP body is re-traced
+# INSIDE the compile_fx call (AOTAutograd / proxy tracing), so this flag is
+# active exactly when the extract runs. Thread-local because compiles can run
+# concurrently and this must not leak the Spyre table into an unrelated
+# CPU-only compile on another thread.
+_compile_state = threading.local()
+
+
+def in_spyre_compile() -> bool:
+    """True while a Spyre ``compile_fx`` is on the stack for this thread."""
+    return getattr(_compile_state, "in_spyre_compile", False)
 
 
 def _spyre_inner_compile(*args: Any, **kwargs: Any) -> Any:
@@ -71,6 +88,7 @@ def enable_spyre_compile_fx_wrapper():
         patch_inductor_fusions()
 
         _orig = cfx.compile_fx
+        from torch_spyre._inductor import timing_recorder
         from torch_spyre._inductor.logging_utils import get_inductor_logger
 
         logger = get_inductor_logger("compile_fx_wrapper")
@@ -138,6 +156,7 @@ def enable_spyre_compile_fx_wrapper():
             try:
                 if uses_spyre:
                     torch.spyre._impl._lazy_init()
+
                     # AOTAutograd uses the dict passed via ``decompositions=``
                     # to decompose the joint graph; Spyre-specific
                     # decompositions must be applied at this stage so ops like
@@ -153,8 +172,22 @@ def enable_spyre_compile_fx_wrapper():
                     # module-level callable so the FX graph cache key stays
                     # serializable.
                     kwargs.setdefault("inner_compile", _spyre_inner_compile)
-                    with enable_spyre_context(example_inputs):
-                        return _orig(gm, example_inputs, *args, **kwargs)
+                    # Mark this thread as inside a Spyre compile so the
+                    # invoke_subgraph HOP re-trace (which happens within this
+                    # _orig call) threads the Spyre decomp table into its
+                    # subgraph bodies. Save/restore to stay correct under
+                    # nested compile_fx calls.
+                    _prev_in_spyre = getattr(_compile_state, "in_spyre_compile", False)
+                    _compile_state.in_spyre_compile = True
+                    try:
+                        # The outermost region of one Spyre compile: every other
+                        # timed region nests inside it, so a frontend total is
+                        # this minus the per-kernel backend calls.
+                        with timing_recorder.stage("stage:compile_fx:spyre_compile"):
+                            with enable_spyre_context(example_inputs):
+                                return _orig(gm, example_inputs, *args, **kwargs)
+                    finally:
+                        _compile_state.in_spyre_compile = _prev_in_spyre
 
                 # Non-Spyre graphs: no FFDC — avoids capturing unrelated CPU
                 # compiles.
@@ -175,6 +208,38 @@ def _light_autoload():
     from . import distributed as _distributed_init  # noqa: F401  registers spyre::broadcast_async/wait_work
 
     enable_spyre_compile_fx_wrapper()
+
+
+# Name of the ``scan`` higher-order op as PyTorch's cache checks see it.
+_SCAN_HOP_NAME = "torch.ops.higher_order.scan"
+# Salt for the cache key of graphs that contain ``scan``. Change it to drop
+# every cached graph that has a ``scan`` in it.
+_SCAN_CACHE_SALT = "torch-spyre-scan-v1"
+
+
+def _allow_scan_graph_caching() -> None:
+    """Let the FX graph and AOTAutograd caches keep graphs that use ``scan``.
+
+    On by default; turn off with ``TORCH_SPYRE_CACHE_SCAN=0``. ``for_each_tile`` (used by the
+    SDPA K/V loop) is the ``scan`` op, and PyTorch skips the caches for any
+    graph with a higher-order op it does not know is cacheable. So every
+    SDPA with more than one K/V block is compiled again in every process.
+    The ``scan`` body is a subgraph of the cached graph and is part of the
+    cache key like the rest of the graph; the salt is added to the key too.
+
+    What "unsafe" leaves to us: PyTorch does not check that ``scan`` itself
+    is safe to cache. Tensors used inside the body are hashed by value (or
+    are graph inputs), except non-inlined frozen parameters, which are hashed
+    by metadata only, as for any other graph. A change to ``scan`` in PyTorch
+    is not in the key: bump ``_SCAN_CACHE_SALT`` to drop old entries.
+    """
+    if os.environ.get("TORCH_SPYRE_CACHE_SCAN", "1") != "1":
+        return
+    import torch._inductor.config as inductor_config
+
+    marked = dict(inductor_config.unsafe_marked_cacheable_functions)
+    marked.setdefault(_SCAN_HOP_NAME, _SCAN_CACHE_SALT)
+    inductor_config.unsafe_marked_cacheable_functions = marked
 
 
 def _autoload():
@@ -214,5 +279,7 @@ def _autoload():
             SpyrePythonWrapperCodegen,
             device_custom_config=config,
         )
+
+        _allow_scan_graph_caching()
 
         _autoload._ran = True

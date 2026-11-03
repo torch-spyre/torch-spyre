@@ -295,15 +295,13 @@ active dep. Diff the script carefully.
 
 **File:** `$DOCS_DIR/docs/profiling_tools.md`
 
-Update the kineto-spyre wheel URL and version references:
-```
-torch-$OLD.0  →  torch-$NEW.0
-```
-
-**Warning:** The kineto-spyre wheel for the new version may not yet be
-published. If unsure, update the URL pattern but flag to the user that
-they should verify the wheel exists at
-`https://github.com/IBM/kineto-spyre/releases`.
+As of PyTorch 2.13, `ProfilerActivity.PrivateUse1` profiling no longer
+needs a separate `kineto-spyre` wheel — Kineto headers ship with PyTorch
+itself, and the AIUPTI activity-tracing support is built directly into
+`torch_spyre`'s native extension (`USE_SPYRE_PROFILER`, on by default,
+linking `libaiupti`). If this page still documents a `kineto-spyre`
+wheel install for the new version, remove that section rather than
+bumping its URL; there is no wheel to point at anymore.
 
 ---
 
@@ -467,7 +465,20 @@ After all changes:
 5. **Run tests:**
    ```bash
    cd $TORCH_SPYRE_DIR
-   python -m pytest tests/_inductor/test_inductor_ops.py -v
+   python -m pytest tests/inductor/test_inductor_ops.py -v
+   ```
+
+6. **Re-calibrate the frontend work bounds** (needs a Spyre device).
+   `tests/inductor/test_frontend_work_bounds.py` bounds read-writes
+   extractions per operation, and upstream's own `get_read_writes` calls
+   are part of that count, so a torch bump can move it. Re-measure, then
+   update `MAX_EXTRACTIONS_PER_OP` and the calibration table in the
+   module docstring if the figures moved:
+   ```bash
+   cd $TORCH_SPYRE_DIR
+   python3 -c "import sys; sys.argv=[sys.argv[0]]; \
+       sys.path.insert(0, 'tests/inductor'); import torch, torch_spyre; \
+       from test_frontend_work_bounds import _calibrate; _calibrate()"
    ```
 
 ---
@@ -486,14 +497,14 @@ After completing all steps, report:
    - checkout-pytorch-src.sh: comment + branch updated
    - build-torch-spyre.sh: sed patterns updated (both forward + trap)
    - dev_install.md: version references updated
-   - profiling_tools.md: kineto wheel URL updated
+   - profiling_tools.md: stale kineto-spyre wheel section removed (not needed since PyTorch 2.13)
    - libgomp shim symlinks created under $PYTORCH_DIR/torch/lib/
 
 ⏳ Remaining (manual/network-dependent):
    - [ ] Regenerate uv.lock + requirements/*.txt via `./tools/update-requirements.sh` (needs wheels on index)
-   - [ ] Verify kineto-spyre wheel exists for $NEW
    - [ ] Rebuild torch-spyre + any downstream C++ extensions (vllm, ...)
    - [ ] Run test suite
+   - [ ] Re-calibrate test_frontend_work_bounds.py (Step 10.6)
    - [ ] Check torch_spyre/_monkey_patch.py & torch_spyre/ops/eager.py
          for API drift against the new PyTorch (Dynamo guards, ATen ops)
 ```

@@ -24,7 +24,7 @@ from dataclasses import dataclass
 
 import sympy
 from torch._inductor.dependencies import MemoryDep
-from torch._inductor.ir import ComputedBuffer, FlexibleLayout, Pointwise, Reduction
+from torch._inductor.ir import ComputedBuffer, Pointwise, Reduction
 from torch._inductor.virtualized import V
 
 from .. import config
@@ -33,17 +33,19 @@ from ..errors import Unsupported
 from ..ir import FixedTiledLayout, _resize_device_layout
 from ..logging_utils import get_inductor_logger
 from ..pass_utils import (
+    concretize_expr,
+    device_coordinates,
     _fixed_read_layout,
-    concretize_index,
     host_coordinates,
     indirect_info_from_op,
     op_out_coords,
 )
-from ..views import compute_coordinates
 from ..work_division import MAX_SPAN_BYTES
+from .coarse_tile import _loop_var_hinted_ranges, _stick_host_dim
+from .tile import compute_tile_stride
 
 
-logger = get_inductor_logger("span_overflow_hint_analysis")
+logger = get_inductor_logger("wsr.span_overflow_hint_analysis")
 
 
 @dataclass(frozen=True)
@@ -85,7 +87,12 @@ class InputSpanInfo:
 
 @dataclass(frozen=True)
 class BMMKSpanInfo:
-    """Input span facts controlled by BMM's single reduction range K."""
+    """Input span facts controlled by an op's single reduction range.
+
+    ``k_symbol`` is BMM K, or the sole reduced axis of a supported non-matmul
+    reduction (sum/prod/max/min); ``chunking_info.selected_host_dim`` is its
+    reduction-range position, always ``0``.
+    """
 
     chunking_info: ChunkingInfo
     dep_name: str
@@ -101,8 +108,9 @@ class SpanOverflowTileLevel:
     ``selected_host_dim=1`` tiles ``N``.  ``split_count`` is the number of
     equal-sized chunks to create for that dimension, so the dimension size must
     be divisible by it.  ``is_reduction`` distinguishes an output range from a
-    reduction range. The automatic planner's BMM-only fallback can emit
-    ``selected_host_dim=0, is_reduction=True`` for K.
+    reduction range. The automatic planner can emit
+    ``selected_host_dim=0, is_reduction=True`` for the single reduction range of
+    a batch-matmul (K) or a supported non-matmul reduction (sum/prod/max/min).
     """
 
     selected_host_dim: int
@@ -148,6 +156,7 @@ class SpanOverflowCandidate:
 
     chunking_info: ChunkingInfo
     source: str
+    is_reduction: bool = False
 
 
 # Keep the search bounded; most real cases should need one or two tiled dims.
@@ -158,6 +167,24 @@ _MAX_SPLITS_PER_DIM = 16
 # keep automatic plans conservative.  Manual spyre_hint remains user-controlled
 # and can request larger counts explicitly.
 _MAX_AUTO_TILE_SPLIT_COUNT = 64
+
+# Non-matmul reduction types whose partial results recombine associatively
+# through coarse_tile's identity-fill + per-tile combine + drain path
+# (see coarse_tile._reduction_identity_value / _insert_combine_op).  A
+# reduction whose type is in this set and which has exactly one reduction
+# range is eligible for an automatic reduction-range ("K-style") coarse tile,
+# the same mechanism BMM K already uses.  Intentionally excluded: ``mean``
+# (needs per-tile scale-factor handling), ``xor_sum`` / ``any`` (no Spyre
+# kernel lowering), and welford (var/std, no Spyre lowering).
+_GENERIC_REDUCTION_TILING_TYPES = frozenset({"sum", "prod", "max", "min"})
+
+# The reduction_type family the "fail loudly instead of silently dropping"
+# guard (``_has_untileable_reduction_span``) is scoped to.  Anything outside it
+# -- matmul (incl. fp8), conv, top-k, welford, ... -- is owned by other passes
+# (work division splits matmul K; dedicated lowerings own conv/top-k), so the
+# guard must not convert their silent-skip into a compile abort.  ``mean`` is
+# included: it is the concrete case the guard exists to catch loudly.
+_REDUCTION_RANGE_FAMILY = frozenset({"sum", "prod", "max", "min", "mean"})
 
 
 def _layout_has_static_span_metadata(layout: FixedTiledLayout) -> bool:
@@ -187,6 +214,7 @@ def _post_tile_layout_for_splits(
     original_layout: FixedTiledLayout,
     split_by_host_dim: dict[int, int],
     op_name: str,
+    stick_host_dim: int | None,
 ) -> FixedTiledLayout:
     """Build the actual per-tile Spyre layout for one or more host splits.
 
@@ -226,13 +254,21 @@ def _post_tile_layout_for_splits(
             )
         new_size[selected_host_dim] = full_size // split_count
 
-    new_stride = list(FlexibleLayout.contiguous_strides(new_size))
+    try:
+        new_stride = compute_tile_stride(
+            original_layout.size, original_layout.stride, new_size
+        )
+    except Unsupported as exc:
+        raise Unsupported(f"Cannot auto-tile {op_name}: {exc}") from exc
 
     try:
         device_layout = _resize_device_layout(
             original_layout.device_layout,
             [int(s) for s in original_layout.size],
             [int(s) for s in new_size],
+            stick_host_dim=stick_host_dim,
+            old_host_stride=[int(s) for s in original_layout.stride],
+            new_host_stride=[int(s) for s in new_stride],
         )
     except RuntimeError as exc:
         raise Unsupported(
@@ -315,6 +351,45 @@ def _post_tile_stick_alignment_error(
     )
 
 
+def _post_tile_resize_error(
+    op: ComputedBuffer, host_dim: int, split_count: int, stick_host_dim: int | None
+) -> str | None:
+    """Why the apply could not lay out ``op``'s tile for ``host_dim`` split
+    ``split_count`` ways, or ``None``. Makes ``_divide_ranges``'s
+    ``_resize_device_layout`` call, which raises on e.g. a device dim folding
+    two host dims. The full buffer the tiles are gathered into needs no check:
+    it is not grown back from the tile, it takes the layout planning recorded
+    (``PropagationPlan.full_device_layout`` for a copy-out,
+    ``ReductionPlan.full_output_device_layout`` for an accumulator). A symbolic
+    size is read at its compile-time value, which the device layout was built
+    from."""
+    layout = op.layout
+    if (
+        split_count <= 1
+        or not isinstance(layout, FixedTiledLayout)
+        or len(layout.size) != len(op.data.ranges)
+        or host_dim in _loop_var_hinted_ranges(op)
+    ):
+        return None
+    full_size = [concretize_expr(s) for s in layout.size]
+    full_stride = [concretize_expr(s) for s in layout.stride]
+    tile_size = list(full_size)
+    tile_size[host_dim] //= split_count
+    try:
+        tile_stride = compute_tile_stride(full_size, full_stride, tile_size)
+        _resize_device_layout(
+            layout.device_layout,
+            full_size,
+            tile_size,
+            stick_host_dim=stick_host_dim,
+            old_host_stride=full_stride,
+            new_host_stride=[int(s) for s in tile_stride],
+        )
+    except RuntimeError as exc:
+        return str(exc)
+    return None
+
+
 def _is_batch_matmul_reduction(op: ComputedBuffer) -> bool:
     """Return True for matmul/BMM reductions with span-overflow tiling policy.
 
@@ -326,6 +401,100 @@ def _is_batch_matmul_reduction(op: ComputedBuffer) -> bool:
         isinstance(op.data, Reduction)
         and getattr(op.data, "reduction_type", None) == BATCH_MATMUL_OP
     )
+
+
+def _sole_real_reduction_range_pos(op: ComputedBuffer) -> int | None:
+    """Return the position of the lone non-unit entry in ``reduction_ranges``.
+
+    A ``reduction_ranges`` entry of extent 1 gets no loop symbol at all --
+    ``index_vars_squeeze`` drops it during dep tracking, which is exactly why
+    ``coarse_tile.reduction_loop_vars`` and ``coarse_tile._divide_reduction_ranges``
+    both key off ``extent != 1`` rather than counting raw entries.  Counting
+    every raw entry here would misclassify e.g. ``x.sum(dim=(1, 2))`` with a
+    size-1 dim 1 (``reduction_ranges == (1, 65536)``) as a two-reduction-dim
+    op, when there is really only one reduction loop variable to reason
+    about.  Returns None unless there is exactly one non-unit entry (this
+    planner only ever plans a single reduction-range tile level; see
+    ``_supports_reduction_range_tiling``).
+    """
+    reduction_ranges = list(getattr(op.data, "reduction_ranges", []))
+    real_positions = []
+    for i, extent in enumerate(reduction_ranges):
+        try:
+            is_unit = sympy.sympify(extent) == 1
+        except (TypeError, ValueError):
+            is_unit = False
+        if not is_unit:
+            real_positions.append(i)
+    return real_positions[0] if len(real_positions) == 1 else None
+
+
+def _supports_reduction_range_tiling(op: ComputedBuffer) -> bool:
+    """Return True when an automatic reduction-range coarse tile is legal here.
+
+    Two families qualify:
+
+    * batch-matmul reductions, whose single K range recombines by addition
+      (the original supported case); and
+    * non-matmul ``Reduction`` ops whose ``reduction_type`` is in
+      ``_GENERIC_REDUCTION_TILING_TYPES`` and which have exactly one *real*
+      (non-unit) reduction range, so coarse tiling can lower one
+      reduction-range tile level as identity-fill + per-tile combine + drain.
+      Extent-1 reduction-range entries do not count -- see
+      ``_sole_real_reduction_range_pos``.
+
+    Ops with more than one real reduction range are excluded: coarse tiling
+    tiles at most one reduction dim per level
+    (``_validate_planned_reduction_tiling``), and this planner does not yet
+    search nested reduction levels.  The reduction position is therefore
+    always ``0`` wherever this returns True (the squeezed position among real
+    reduction symbols, not necessarily its raw index in ``reduction_ranges``).
+
+    ``max``/``min`` are restricted to floating-point dtypes:
+    ``coarse_tile._reduction_identity_value`` seeds the accumulator with
+    ``-/+inf``, and ``float(inf)`` cast into an integer ``spyre.constant``
+    saturates to the wrong bound (silent wrong numerics).  ``sum``/``prod``
+    seed with ``0``/``1`` and are dtype-safe.
+    """
+    if not isinstance(op.data, Reduction):
+        return False
+    if _is_batch_matmul_reduction(op):
+        return True
+    reduction_type = getattr(op.data, "reduction_type", None)
+    if reduction_type not in _GENERIC_REDUCTION_TILING_TYPES:
+        return False
+    if _sole_real_reduction_range_pos(op) is None:
+        return False
+    if reduction_type in ("max", "min"):
+        try:
+            return bool(op.get_dtype().is_floating_point)
+        except (AttributeError, TypeError):
+            return False
+    return True
+
+
+def _reduction_range_tiling_active(op: ComputedBuffer) -> bool:
+    """Return True when reduction-range tiling should actually be attempted.
+
+    Wraps ``_supports_reduction_range_tiling`` with the
+    ``config.enable_reduction_tiling`` kill switch.  BMM's own post-search
+    kill-switch handling (in ``plan_span_overflow_tile``) is unaffected --
+    this always returns True for BMM so that path keeps deciding for itself.
+
+    Every site that can make a non-BMM reduction-controlled coordinate visible
+    to the search -- generating an ``is_reduction=True`` candidate for it, or
+    keeping a mixed output+reduction coordinate un-skipped so it becomes an
+    output candidate the search cannot actually satisfy -- must use this,
+    not the bare ``_supports_reduction_range_tiling``, or turning the switch
+    off stops being a real escape hatch: candidate generation still surfaces
+    a span only a reduction split could clear, and the search exhausts every
+    output-only combo and raises a generic "no combined split" error instead
+    of either falling back cleanly or emitting the dedicated kill-switch
+    message.
+    """
+    if not _supports_reduction_range_tiling(op):
+        return False
+    return _is_batch_matmul_reduction(op) or config.enable_reduction_tiling
 
 
 def _output_symbol_to_dim(op: ComputedBuffer) -> dict[sympy.Symbol, int]:
@@ -397,10 +566,17 @@ def _bmm_k_symbol(
     op: ComputedBuffer,
     input_deps: Sequence[tuple[MemoryDep, FixedTiledLayout | None]] | None = None,
 ) -> sympy.Symbol | None:
-    """Return BMM's unique reduction-only input symbol, or ``None``."""
-    if not _is_batch_matmul_reduction(op):
+    """Return the op's unique reduction-only input symbol, or ``None``.
+
+    This is BMM K for a batch-matmul reduction, or the single reduced axis for
+    a supported non-matmul reduction (see ``_supports_reduction_range_tiling``).
+    ``_bmm_symbol_partition`` already derives the reduction symbol generically
+    by subtracting output symbols from input symbols; the only BMM-specific
+    part was the caller gate, now widened.
+    """
+    if not _supports_reduction_range_tiling(op):
         return None
-    if len(list(getattr(op.data, "reduction_ranges", []))) != 1:
+    if _sole_real_reduction_range_pos(op) is None:
         return None
     if input_deps is None:
         layout_input_deps = _input_read_deps(op)
@@ -509,7 +685,7 @@ def _coordinate_span_elems(
         if range_size % split_count != 0:
             return None
         range_size //= split_count
-        term = coord.subs({other: 0 for other in coord.free_symbols - {sym}})
+        term = coord.subs(dict.fromkeys(coord.free_symbols - {sym}, 0))
         if term.has(sympy.Mod):
             mod_atoms = term.atoms(sympy.Mod)
             if any(mod.args[0] != sym for mod in mod_atoms):
@@ -591,28 +767,6 @@ def _tile_aware_inner_stride_elems(
     return stride_elems
 
 
-def _device_coordinates_for_span(
-    layout: FixedTiledLayout,
-    dep: MemoryDep,
-) -> list[sympy.Expr]:
-    """Return physical coordinates for span planning.
-
-    This pass analyzes only non-stick coordinates and all callers ignore
-    ``coords[-1]``.  Use the same index concretization and coordinate
-    decomposition as ``device_coordinates()``, but skip its final stick-expression
-    validation so an unsupported stick form does not reject an otherwise valid
-    non-stick span candidate.
-    """
-    index = concretize_index(dep.index, set(dep.ranges.keys()))
-    return compute_coordinates(
-        layout.device_layout.device_size,
-        layout.device_layout.stride_map,
-        dep.ranges,
-        index,
-        None,
-    )
-
-
 def _input_span_infos_controlled_by_output_dims(
     op: ComputedBuffer,
     max_cores: int,
@@ -637,7 +791,9 @@ def _input_span_infos_controlled_by_output_dims(
         )
 
     input_deps = _input_read_deps(op)
-    k_symbol = _bmm_k_symbol(op, input_deps) if _is_batch_matmul_reduction(op) else None
+    k_symbol = (
+        _bmm_k_symbol(op, input_deps) if _reduction_range_tiling_active(op) else None
+    )
     symbol_to_dim = (
         _bmm_output_symbol_to_dim(op, input_deps)
         if _is_batch_matmul_reduction(op)
@@ -655,7 +811,9 @@ def _input_span_infos_controlled_by_output_dims(
         itemsize = layout.dtype.itemsize
         stick_elems = layout.device_layout.elems_per_stick()
         try:
-            device_coords = _device_coordinates_for_span(layout, dep)
+            device_coords = device_coordinates(
+                layout.device_layout, dep, check_stick_expr=False
+            )
         except (TypeError, ValueError, RuntimeError, Unsupported):
             continue
 
@@ -663,10 +821,9 @@ def _input_span_infos_controlled_by_output_dims(
             if not coord.free_symbols:
                 continue
 
-            output_syms = [sym for sym in coord.free_symbols if sym in symbol_to_dim]
-            reduction_syms = [
-                sym for sym in coord.free_symbols if sym not in symbol_to_dim
-            ]
+            coord_syms = sorted(coord.free_symbols, key=str)
+            output_syms = [sym for sym in coord_syms if sym in symbol_to_dim]
+            reduction_syms = [sym for sym in coord_syms if sym not in symbol_to_dim]
             if reduction_syms and not (
                 k_symbol is not None and set(reduction_syms) == {k_symbol}
             ):
@@ -757,7 +914,12 @@ def _bmm_k_span_infos(
     *,
     split_by_host_dim: dict[int, int] | None = None,
 ) -> list[BMMKSpanInfo]:
-    """Return BMM input overflows that shrink when K is split."""
+    """Return input overflows that shrink when the sole reduction range is split.
+
+    Covers BMM K and the single reduced axis of a supported non-matmul
+    reduction (sum/prod/max/min); ``selected_host_dim`` on the emitted
+    ``ChunkingInfo`` is the reduction-range position, always ``0`` here.
+    """
     del max_cores  # Conservatively assume no work-division help.
     input_deps = _input_read_deps(op)
     k_symbol = _bmm_k_symbol(op, input_deps)
@@ -765,7 +927,11 @@ def _bmm_k_span_infos(
         return []
     if split_by_host_dim is None:
         split_by_host_dim = {}
-    output_symbol_to_dim = _bmm_output_symbol_to_dim(op, input_deps)
+    output_symbol_to_dim = (
+        _bmm_output_symbol_to_dim(op, input_deps)
+        if _is_batch_matmul_reduction(op)
+        else _output_symbol_to_dim(op)
+    )
     span_symbol_to_dim = {**output_symbol_to_dim, k_symbol: -1}
     span_split_by_host_dim = {**split_by_host_dim, -1: k_split}
 
@@ -774,7 +940,9 @@ def _bmm_k_span_infos(
         if not _layout_has_static_span_metadata(layout):
             continue
         try:
-            device_coords = _device_coordinates_for_span(layout, dep)
+            device_coords = device_coordinates(
+                layout.device_layout, dep, check_stick_expr=False
+            )
         except (TypeError, ValueError, RuntimeError, Unsupported):
             continue
         device_size = [int(s) for s in layout.device_layout.device_size]
@@ -826,7 +994,11 @@ def _bmm_k_span_infos(
                         selected_device_span_stride_elems=inner_stride_elems,
                         selected_host_dim=0,
                         stick_elems=stick_elems,
-                        reason=f"BMM K input span overflow for {dep.name}",
+                        reason=(
+                            f"BMM K input span overflow for {dep.name}"
+                            if _is_batch_matmul_reduction(op)
+                            else f"reduction-range input span overflow for {dep.name}"
+                        ),
                     ),
                     dep_name=dep.name,
                     k_symbol=k_symbol,
@@ -835,13 +1007,155 @@ def _bmm_k_span_infos(
     return infos
 
 
+def _best_case_inner_span(
+    inner_coords: list[sympy.Expr],
+    inner_sizes: list[int],
+    dep: MemoryDep,
+    symbol_to_dim: dict[sympy.Symbol, int],
+) -> int | None:
+    """Return the best-case (smallest) inner span for one outer coordinate.
+
+    Every output symbol in an inner coordinate is modelled as tiled down to a
+    single element (the most an output-range tile could do); a reduction
+    symbol, or the stick, stays at its true extent.  A coordinate mixing both
+    -- an interleaved/collapsed stride -- is charged only its reduction part,
+    not its full extent.
+
+    Returns ``None`` -- "cannot determine, do not trust an assumed bound" --
+    if any contributing coordinate's span cannot be computed (the same
+    fail-safe ``_coordinate_span_elems`` itself documents), rather than
+    substituting a value.  A caller deciding untileability must not treat this
+    as the worst case: that would inflate the *best*-case estimate and can
+    raise on a coordinate the pass never actually proved was too large.
+    """
+    best_inner = 1
+    for idx, (inner_coord, dim_size) in enumerate(zip(inner_coords, inner_sizes)):
+        inner_syms = inner_coord.free_symbols
+        is_stick = idx == len(inner_coords) - 1
+        if not inner_syms:
+            best_inner *= dim_size
+            continue
+        split_by_symbol: dict[sympy.Symbol, int] = {}
+        for sym in inner_syms:
+            rng = _range_size_for_symbol(dep, sym)
+            if not is_stick and sym in symbol_to_dim and rng:
+                split_by_symbol[sym] = rng  # -> per-tile extent 1
+            else:
+                split_by_symbol[sym] = 1
+        inner_span = _coordinate_span_elems(inner_coord, dep, split_by_symbol)
+        if inner_span is None:
+            return None
+        best_inner *= min(inner_span, dim_size)
+    return best_inner
+
+
+def _has_untileable_reduction_span(op: ComputedBuffer, max_cores: int) -> bool:
+    """Return True when a reduction-only input span overflows unfixably.
+
+    Pre-work-division heuristic.  It fires only when no mechanism available to
+    this op could bring the span under the limit:
+
+    * reduction-range tiling for this op is disabled
+      (``config.enable_reduction_tiling``) or was never supported for its
+      ``reduction_type``/range-count in the first place -- checked by
+      ``_supports_reduction_range_tiling`` returning False for a reason other
+      than the config, below;
+    * ``reduction_type`` is in the sum/prod/max/min/mean family.  This is
+      dtype-agnostic on purpose: ``_supports_reduction_range_tiling``
+      restricts *tiling* ``max``/``min`` to floating point (their identity is
+      +/-inf, which cast wrong into an integer accumulator), but an integer
+      max/min's reduction-only overflow is exactly as unfixable as a float
+      one's -- ``plain_reduction_k_split_domains`` pins multi-axis plain
+      reduction vars to split=1 regardless of dtype -- so this check must
+      still fire for it, or that overflow is silently dropped instead.
+      Everything outside the family -- matmul (incl. fp8), conv, top-k,
+      welford -- is owned by another pass (work division cross-core splits
+      matmul/conv/pool/top-k K) or has its own span accounting, and must
+      keep its historical silent-skip;
+    * the overflowing coordinate itself is controlled only by reduction
+      symbols, so no output-range tile touches it;
+    * the span still exceeds the limit in the *best case* computed by
+      ``_best_case_inner_span``, which is more aggressive than any
+      output-range coarse tile or any N-way work-division core split, so if
+      even that leaves the span over the limit, no output mechanism can close
+      it -- only a reduction-range split, which this op cannot do.
+
+    Reduction-range coarse tiling is distinct from a cross-core K-split.
+    Types supported by WSR (``sum``, ``prod``, float ``max``/``min``) exit via
+    ``_supports_reduction_range_tiling`` at the top of this function. The
+    types that do reach here (``mean``, integer ``max``/``min``) have no such
+    recovery path.
+
+    ``max_cores`` is therefore not consulted: the best case already bounds
+    every core-split outcome.
+
+    Every op reaching the family/dtype checks below is guaranteed non-BMM:
+    ``_supports_reduction_range_tiling`` always returns True for
+    ``BATCH_MATMUL_OP`` regardless of dtype or range count, so a real BMM op
+    always returns False at the first line: BMM keeps its own, separately
+    tested kill-switch handling (the post-search retry in
+    ``plan_span_overflow_tile``), unaffected by the config check here.
+
+    Without this check (and when not disabled) the span is silently dropped,
+    ``span_reduction_pass`` cannot split the reduced axis either (multi-axis
+    plain reductions are pinned to split=1), and the op reaches the backend
+    over the limit.
+    """
+    if not isinstance(op.data, Reduction) or _supports_reduction_range_tiling(op):
+        return False
+    if not config.enable_reduction_tiling:
+        # Escape hatch: with the feature disabled, do not second-guess that
+        # choice with a compile abort -- fall back to the historical
+        # silent-skip for every non-BMM reduction (see the docstring for why
+        # this is always non-BMM).
+        return False
+    if getattr(op.data, "reduction_type", None) not in _REDUCTION_RANGE_FAMILY:
+        return False
+    symbol_to_dim = _output_symbol_to_dim(op)
+    if not symbol_to_dim:
+        return False
+    del max_cores  # Best case below already bounds every core-split outcome.
+    for dep, layout in _input_read_deps(op):
+        if not _layout_has_static_span_metadata(layout):
+            continue
+        try:
+            device_coords = device_coordinates(
+                layout.device_layout, dep, check_stick_expr=False
+            )
+        except (TypeError, ValueError, RuntimeError, Unsupported):
+            continue
+        device_size = [int(s) for s in layout.device_layout.device_size]
+        itemsize = layout.dtype.itemsize
+        for device_dim, coord in enumerate(device_coords[:-1]):
+            syms = coord.free_symbols
+            if not syms or any(sym in symbol_to_dim for sym in syms):
+                continue
+            span_elems = _coordinate_span_elems(coord, dep, dict.fromkeys(syms, 1))
+            if span_elems is None:
+                continue
+            best_inner = _best_case_inner_span(
+                device_coords[device_dim + 1 :],
+                device_size[device_dim + 1 :],
+                dep,
+                symbol_to_dim,
+            )
+            if best_inner is None:
+                # Cannot prove this coordinate's best case either way -- do
+                # not assume untileable from it.
+                continue
+            if span_elems * best_inner * itemsize > MAX_SPAN_BYTES:
+                return True
+    return False
+
+
 def _bmm_k_alignment_error(op: ComputedBuffer, split_count: int) -> str | None:
     """Return why a BMM K split violates an input layout boundary."""
     reduction_ranges = list(getattr(op.data, "reduction_ranges", []))
-    if len(reduction_ranges) != 1:
+    pos = _sole_real_reduction_range_pos(op)
+    if pos is None:
         return "BMM K tiling requires exactly one reduction range"
     try:
-        k_size = int(reduction_ranges[0])
+        k_size = int(reduction_ranges[pos])
     except (TypeError, ValueError):
         return "BMM K tiling requires a static integral K range"
     if split_count <= 1 or split_count > _MAX_AUTO_TILE_SPLIT_COUNT:
@@ -872,10 +1186,11 @@ def _bmm_k_split_candidates(op: ComputedBuffer, required_split: int) -> list[int
     reason for the final Unsupported diagnostic.
     """
     reduction_ranges = list(getattr(op.data, "reduction_ranges", []))
-    if len(reduction_ranges) != 1:
+    pos = _sole_real_reduction_range_pos(op)
+    if pos is None:
         return []
     try:
-        k_size = int(reduction_ranges[0])
+        k_size = int(reduction_ranges[pos])
     except (TypeError, ValueError):
         return []
     if k_size <= 1:
@@ -991,7 +1306,9 @@ def _output_span_candidates_from_op(
         return []
 
     try:
-        device_coords = _device_coordinates_for_span(layout, out_dep)
+        device_coords = device_coordinates(
+            layout.device_layout, out_dep, check_stick_expr=False
+        )
     except (TypeError, ValueError, RuntimeError, Unsupported) as exc:
         logger.debug(
             "span_overflow_output: op=%s skipped; device-coordinate analysis failed: %s",
@@ -1006,7 +1323,9 @@ def _output_span_candidates_from_op(
     for device_dim, coord in enumerate(device_coords[:-1]):
         if not coord.free_symbols:
             continue
-        output_syms = [sym for sym in coord.free_symbols if sym in symbol_to_dim]
+        output_syms = sorted(
+            [sym for sym in coord.free_symbols if sym in symbol_to_dim], key=str
+        )
         # A coordinate can be jointly controlled by more than one output
         # symbol, for example two interleaved dims sharing one physical
         # stride -- ``floor(d1 / 64)`` maps cleanly to the output dim for
@@ -1100,7 +1419,7 @@ def _input_span_candidates(
     *,
     split_by_host_dim: dict[int, int] | None = None,
 ) -> list[SpanOverflowCandidate]:
-    """Collect Reduction/BMM input spans controlled by output dimensions.
+    """Collect input spans controlled by output or supported reduction dims.
 
     This wraps the lower-level input scan and filters out host dims that have no
     legal nontrivial coarse split after output/input stick-alignment checks.
@@ -1124,31 +1443,52 @@ def _input_span_candidates(
         candidates.append(
             SpanOverflowCandidate(info.chunking_info, source=f"input:{info.dep_name}")
         )
+    if _reduction_range_tiling_active(op):
+        # Non-BMM reduction-range candidates are gated on the config (see
+        # _reduction_range_tiling_active) so disabling it is a real escape
+        # hatch: with no reduction candidate ever created, the search cannot
+        # emit a reduction-level plan for this op and the post-search
+        # kill-switch check below never fires.  BMM is unaffected -- its kill
+        # switch is enforced after the search (plan_span_overflow_tile), as
+        # before.
+        candidates.extend(
+            SpanOverflowCandidate(
+                info.chunking_info,
+                source=f"input:{info.dep_name}",
+                is_reduction=True,
+            )
+            for info in _bmm_k_span_infos(
+                op,
+                max_cores,
+                split_by_host_dim=split_by_host_dim,
+            )
+        )
     return candidates
 
 
-def _candidate_host_dims(
-    candidates: list[SpanOverflowCandidate],
-) -> list[int]:
-    """Return unique candidate host dims ordered by strongest span pressure.
+def _candidate_axis(candidate: SpanOverflowCandidate) -> tuple[int, bool]:
+    """Return the output or reduction axis represented by ``candidate``."""
+    return (
+        candidate.chunking_info.selected_host_dim,
+        candidate.is_reduction,
+    )
 
-    Multiple output/input span candidates can point at the same logical output
-    dim.  The search only needs to split that dim once, so this collapses
-    candidates by ``selected_host_dim`` and orders dims by their largest
-    observed byte span.  This ordering does not decide correctness; it only
-    gives the combo search a stable pressure-first dim order.
-    """
-    max_span_by_dim: dict[int, int] = {}
-    first_seen: dict[int, int] = {}
+
+def _candidate_axes(
+    candidates: list[SpanOverflowCandidate],
+) -> list[tuple[int, bool]]:
+    """Return unique output/reduction axes ordered by span pressure."""
+    max_span_by_axis: dict[tuple[int, bool], int] = {}
+    first_seen: dict[tuple[int, bool], int] = {}
     for idx, candidate in enumerate(candidates):
-        dim = candidate.chunking_info.selected_host_dim
-        first_seen.setdefault(dim, idx)
-        max_span_by_dim[dim] = max(
-            max_span_by_dim.get(dim, 0), candidate.chunking_info.per_core_span
+        axis = _candidate_axis(candidate)
+        first_seen.setdefault(axis, idx)
+        max_span_by_axis[axis] = max(
+            max_span_by_axis.get(axis, 0), candidate.chunking_info.per_core_span
         )
     return sorted(
-        max_span_by_dim,
-        key=lambda dim: (-max_span_by_dim[dim], first_seen[dim]),
+        max_span_by_axis,
+        key=lambda axis: (-max_span_by_axis[axis], first_seen[axis]),
     )
 
 
@@ -1165,7 +1505,7 @@ def _candidate_required_split_count(candidate: SpanOverflowCandidate) -> int:
     """Return the minimum split needed if this candidate's dim tiled alone.
 
     This is ``ceil(per_core_span / MAX_SPAN_BYTES)``: if a dim creates a
-    384 MB span and the limit is 255.996 MB it needs at least split ``2`` when
+    384 MB span and the limit is 256 MB it needs at least split ``2`` when
     considered by itself.
 
     The combined search can still choose a different legal divisor or combine
@@ -1175,24 +1515,18 @@ def _candidate_required_split_count(candidate: SpanOverflowCandidate) -> int:
     return max(1, math.ceil(candidate.chunking_info.per_core_span / MAX_SPAN_BYTES))
 
 
-def _required_split_counts_by_host_dim(
+def _required_split_counts_by_axis(
     candidates: list[SpanOverflowCandidate],
-) -> dict[int, int]:
-    """Return the strongest required split count for each logical host dim.
-
-    If output and input analysis both say host dim ``0`` can overflow, keep the
-    larger split requirement.  Example: output needs split ``2`` but an input
-    span controlled by the same dim needs split ``4``; the combo search should
-    generate dim-0 divisors around ``4`` rather than around ``2``.
-    """
-    required_by_dim: dict[int, int] = {}
+) -> dict[tuple[int, bool], int]:
+    """Return the strongest required split for each output/reduction axis."""
+    required_by_axis: dict[tuple[int, bool], int] = {}
     for candidate in candidates:
-        dim = candidate.chunking_info.selected_host_dim
-        required_by_dim[dim] = max(
-            required_by_dim.get(dim, 1),
+        axis = _candidate_axis(candidate)
+        required_by_axis[axis] = max(
+            required_by_axis.get(axis, 1),
             _candidate_required_split_count(candidate),
         )
-    return required_by_dim
+    return required_by_axis
 
 
 def _cap_split_candidates(
@@ -1327,7 +1661,9 @@ def _split_candidates_for_host_dim(
     because coarse tiling emits equal-sized loop tiles.  Then the candidates are
     filtered for output and input stick alignment: a split is legal only if the
     resulting tile boundary does not cut through physical sticks in the output
-    layout or any direct input layout controlled by the same output symbol.
+    layout or any direct input layout controlled by the same output symbol,
+    and only if the apply can resize the output's device layout to the tile
+    (:func:`_post_tile_resize_error`).
     """
     ranges = list(op.data.ranges)
     if host_dim >= len(ranges):
@@ -1355,6 +1691,11 @@ def _split_candidates_for_host_dim(
             for d in (i, full_size // i)
         }
     )
+    stick_host_dim = (
+        _stick_host_dim(op, op.layout.device_layout)
+        if isinstance(op.layout, FixedTiledLayout)
+        else None
+    )
     legal_candidates = [
         split
         for split in candidates
@@ -1372,6 +1713,7 @@ def _split_candidates_for_host_dim(
             and split <= _MAX_AUTO_TILE_SPLIT_COUNT
             and _post_tile_stick_alignment_error(op.layout, host_dim, split) is None
             and _input_stick_alignment_error(op, host_dim, split) is None
+            and _post_tile_resize_error(op, host_dim, split, stick_host_dim) is None
         )
     ]
     capped_candidates = _cap_split_candidates(legal_candidates, required_count)
@@ -1395,6 +1737,31 @@ def _split_candidates_for_host_dim(
             required_count,
         )
     return capped_candidates
+
+
+def _split_candidates_for_axis(
+    op: ComputedBuffer,
+    axis: tuple[int, bool],
+    required_count: int = 1,
+) -> list[int]:
+    """Return legal split counts for one output or reduction axis."""
+    host_dim, is_reduction = axis
+    if not is_reduction:
+        return _split_candidates_for_host_dim(op, host_dim, required_count)
+    if not _supports_reduction_range_tiling(op) or host_dim != 0:
+        raise Unsupported(
+            f"Cannot auto-tile {op.get_name()}: reduction-range tiling is only "
+            "supported for the single reduction range (dim 0) of a batch-matmul "
+            "or sum/prod/max/min reduction."
+        )
+    k_candidates = _bmm_k_split_candidates(op, required_count)
+    if not k_candidates:
+        raise Unsupported(
+            f"Cannot auto-tile {op.get_name()}: a K-controlled input span "
+            "exceeds the hardware limit, but the reduction range has no legal "
+            "nontrivial split."
+        )
+    return [1, *k_candidates]
 
 
 def _combo_cost(combo: tuple[int, ...]) -> tuple[int, int, int, tuple[int, ...]]:
@@ -1435,6 +1802,7 @@ def _combined_tile_stick_alignment_error(
     op: ComputedBuffer,
     original_layout: FixedTiledLayout,
     split_by_host_dim: dict[int, int],
+    split_by_reduction_dim: dict[int, int] | None = None,
 ) -> str | None:
     """Return the first stick-alignment error for a multi-dim tile plan.
 
@@ -1447,6 +1815,16 @@ def _combined_tile_stick_alignment_error(
         if error is not None:
             return error
         error = _input_stick_alignment_error(op, host_dim, split_count)
+        if error is not None:
+            return error
+    for reduction_dim, split_count in (split_by_reduction_dim or {}).items():
+        if not _supports_reduction_range_tiling(op) or reduction_dim != 0:
+            return (
+                "reduction-range tiling is only supported for the single "
+                "reduction range (dim 0) of a batch-matmul or sum/prod/max/min "
+                "reduction"
+            )
+        error = _bmm_k_alignment_error(op, split_count)
         if error is not None:
             return error
     return None
@@ -1471,6 +1849,7 @@ def _remaining_span_candidates_after_tile(
         op.layout,
         split_by_host_dim,
         op.get_name(),
+        _stick_host_dim(op, op.layout.device_layout),
     )
     remaining = _output_span_candidates_from_op(
         op,
@@ -1497,10 +1876,12 @@ def _remaining_span_candidates_after_tile(
                     k_split=k_split,
                 )
             ]
-        if k_split is not None and _is_batch_matmul_reduction(op):
+        if k_split is not None and _supports_reduction_range_tiling(op):
             remaining += [
                 SpanOverflowCandidate(
-                    info.chunking_info, source=f"input:{info.dep_name}"
+                    info.chunking_info,
+                    source=f"input:{info.dep_name}",
+                    is_reduction=True,
                 )
                 for info in _bmm_k_span_infos(
                     op,
@@ -1516,113 +1897,140 @@ def _search_min_cost_tile_plan(
     op: ComputedBuffer,
     max_cores: int,
     candidates: list[SpanOverflowCandidate],
+    *,
+    ignore_reduction_spans: bool = False,
+    validation_cache: (
+        dict[
+            tuple[tuple[tuple[int, int], ...], int | None],
+            list[SpanOverflowCandidate],
+        ]
+        | None
+    ) = None,
 ) -> SpanOverflowTilePlan | None:
-    """Find the cheapest combined coarse-tile plan that clears all candidates.
-
-    The incoming candidates say which logical output dims can reduce an
-    overflowing physical span.  This function converts those dims into legal
-    split divisors, tries split combinations in cost order, validates each
-    combination against reconstructed post-tile layouts, and returns the first
-    plan that leaves no output/input span overflow.
-    """
-    host_dims = _candidate_host_dims(candidates)
+    """Find the cheapest output/reduction tile plan that clears enabled spans."""
+    axes = _candidate_axes(candidates)
     logger.debug(
-        "[span-overflow search] op=%s candidates=%s host_dims=%s",
+        "[span-overflow search] op=%s candidates=%s axes=%s",
         op.get_name(),
         [
             {
                 "source": candidate.source,
-                "host_dim": candidate.chunking_info.selected_host_dim,
-                "device_dim_size": candidate.chunking_info.selected_device_dim_size,
-                "stride_elems": candidate.chunking_info.selected_device_span_stride_elems,
+                "host_dim": _candidate_axis(candidate)[0],
+                "is_reduction": _candidate_axis(candidate)[1],
                 "span_mb": candidate.chunking_info.per_core_span / (1024**2),
                 "reason": candidate.chunking_info.reason,
             }
             for candidate in candidates
         ],
-        host_dims,
+        axes,
     )
-    if not host_dims:
-        logger.debug(
-            "[span-overflow search] op=%s no candidate host dims", op.get_name()
-        )
+    if not axes:
         return None
-    if len(host_dims) > _MAX_TILE_DIMS:
+    if len(axes) > _MAX_TILE_DIMS:
         raise Unsupported(
             f"Cannot auto-tile {op.get_name()}: span-overflow planning found "
-            f"{len(host_dims)} candidate host dims {host_dims}, exceeding the "
-            f"bounded search limit {_MAX_TILE_DIMS}."
+            f"{len(axes)} candidate axes {axes}, exceeding the bounded search "
+            f"limit {_MAX_TILE_DIMS}."
         )
 
-    required_by_dim = _required_split_counts_by_host_dim(candidates)
+    required_by_axis = _required_split_counts_by_axis(candidates)
     split_candidates = [
-        _split_candidates_for_host_dim(op, dim, required_by_dim.get(dim, 1))
-        for dim in host_dims
+        _split_candidates_for_axis(op, axis, required_by_axis.get(axis, 1))
+        for axis in axes
     ]
     logger.debug(
-        "[span-overflow search] op=%s required_by_dim=%s split_candidates=%s",
+        "[span-overflow search] op=%s required_by_axis=%s split_candidates=%s",
         op.get_name(),
-        required_by_dim,
-        dict(zip(host_dims, split_candidates)),
+        required_by_axis,
+        dict(zip(axes, split_candidates)),
     )
     first_stick_error: str | None = None
     for combo in _iter_split_combos(split_candidates):
         split_by_host_dim = {
-            dim: split for dim, split in zip(host_dims, combo) if split > 1
+            dim: split
+            for (dim, is_reduction), split in zip(axes, combo)
+            if not is_reduction and split > 1
         }
-        if not split_by_host_dim:
+        split_by_reduction_dim = {
+            dim: split
+            for (dim, is_reduction), split in zip(axes, combo)
+            if is_reduction and split > 1
+        }
+        if not split_by_host_dim and not split_by_reduction_dim:
             continue
 
         stick_error = _combined_tile_stick_alignment_error(
-            op, op.layout, split_by_host_dim
+            op, op.layout, split_by_host_dim, split_by_reduction_dim
         )
         if stick_error is not None:
             first_stick_error = first_stick_error or stick_error
             logger.debug(
-                "[span-overflow search] op=%s combo=%s rejected_stick=%s",
+                "[span-overflow search] op=%s output=%s reduction=%s rejected_stick=%s",
                 op.get_name(),
                 split_by_host_dim,
+                split_by_reduction_dim,
                 stick_error,
             )
             continue
 
+        k_split = split_by_reduction_dim.get(0)
+        validation_key = (tuple(sorted(split_by_host_dim.items())), k_split)
         try:
-            remaining = _remaining_span_candidates_after_tile(
-                op,
-                max_cores,
-                split_by_host_dim,
-            )
+            if validation_cache is not None and validation_key in validation_cache:
+                remaining = validation_cache[validation_key]
+            elif k_split is None:
+                remaining = _remaining_span_candidates_after_tile(
+                    op, max_cores, split_by_host_dim
+                )
+            else:
+                remaining = _remaining_span_candidates_after_tile(
+                    op,
+                    max_cores,
+                    split_by_host_dim,
+                    k_split=k_split,
+                )
+            if validation_cache is not None:
+                validation_cache[validation_key] = remaining
         except Unsupported as exc:
             logger.debug(
-                "span_overflow_tile_search: op=%s combo=%s rejected: %s",
+                "span_overflow_tile_search: op=%s output=%s reduction=%s rejected: %s",
                 op.get_name(),
                 split_by_host_dim,
+                split_by_reduction_dim,
                 exc,
             )
             continue
+        if ignore_reduction_spans:
+            remaining = [
+                candidate for candidate in remaining if not candidate.is_reduction
+            ]
         if remaining:
             logger.debug(
-                "span_overflow_tile_search: op=%s combo=%s leaves %d spans",
+                "span_overflow_tile_search: op=%s output=%s reduction=%s "
+                "leaves %d spans",
                 op.get_name(),
                 split_by_host_dim,
+                split_by_reduction_dim,
                 len(remaining),
             )
             continue
 
-        # Emit loop levels outer-to-inner by host dimension; the search order can
-        # differ because it is driven by span pressure.
         levels = tuple(
-            SpanOverflowTileLevel(
-                selected_host_dim=dim,
-                split_count=split_by_host_dim[dim],
-            )
+            SpanOverflowTileLevel(dim, split_by_host_dim[dim])
             for dim in sorted(split_by_host_dim)
+        ) + tuple(
+            SpanOverflowTileLevel(dim, split_by_reduction_dim[dim], is_reduction=True)
+            for dim in sorted(split_by_reduction_dim)
         )
         logger.info(
-            "[span-overflow search] op=%s selected_split=%s levels=%s",
+            "[span-overflow search] op=%s output_split=%s reduction_split=%s levels=%s",
             op.get_name(),
             split_by_host_dim,
-            [(level.selected_host_dim, level.split_count) for level in levels],
+            split_by_reduction_dim,
+            [
+                (level.selected_host_dim, level.split_count, level.is_reduction)
+                for level in levels
+            ],
         )
         return SpanOverflowTilePlan(
             levels=levels,
@@ -1637,112 +2045,51 @@ def _search_min_cost_tile_plan(
             ),
         )
 
+    if all(is_reduction for _dim, is_reduction in axes):
+        logger.debug(
+            "[span-overflow search] op=%s no legal reduction-range plan",
+            op.get_name(),
+        )
+        return None
     if first_stick_error is not None:
         raise Unsupported(
             f"Cannot auto-tile {op.get_name()}: no legal combined split preserves "
             f"Spyre stick alignment. First rejected candidate: {first_stick_error}."
         )
     raise Unsupported(
-        f"Cannot auto-tile {op.get_name()}: no combined split among host dims "
-        f"{host_dims} makes all spans fit within "
-        f"{MAX_SPAN_BYTES / (1024**2):.3f} MB after trying at most "
-        f"{_MAX_TILE_COMBOS} combinations."
+        f"Cannot auto-tile {op.get_name()}: no combined split among axes {axes} "
+        f"makes all spans fit within {MAX_SPAN_BYTES / (1024**2):.3f} MB "
+        f"after trying at most {_MAX_TILE_COMBOS} combinations."
     )
 
 
-def _search_bmm_k_tile_plan(
+def _search_output_only_tile_plan(
     op: ComputedBuffer,
     max_cores: int,
+    candidates: list[SpanOverflowCandidate],
+    *,
+    ignore_reduction_spans: bool = True,
+    validation_cache: (
+        dict[
+            tuple[tuple[tuple[int, int], ...], int | None],
+            list[SpanOverflowCandidate],
+        ]
+        | None
+    ) = None,
 ) -> SpanOverflowTilePlan | None:
-    """Find a BMM-only reduction-range plan after B/M/N planning fails."""
-    if not config.enable_reduction_tiling:
+    """Retry span planning without reduction axes."""
+    output_candidates = [
+        candidate for candidate in candidates if not candidate.is_reduction
+    ]
+    if not output_candidates:
         return None
-
-    initial_infos = _bmm_k_span_infos(op, max_cores)
-    if not initial_infos:
-        return None
-    required_split = max(
-        math.ceil(info.chunking_info.per_core_span / MAX_SPAN_BYTES)
-        for info in initial_infos
+    return _search_min_cost_tile_plan(
+        op,
+        max_cores,
+        output_candidates,
+        ignore_reduction_spans=ignore_reduction_spans,
+        validation_cache=validation_cache,
     )
-    split_candidates = _bmm_k_split_candidates(op, required_split)
-    logger.debug(
-        "[span-overflow BMM K search] op=%s required=%d candidates=%s",
-        op.get_name(),
-        required_split,
-        split_candidates,
-    )
-    first_alignment_error: str | None = None
-    latest_remaining: tuple[int, list[str]] | None = None
-    for split_count in split_candidates:
-        alignment_error = _bmm_k_alignment_error(op, split_count)
-        if alignment_error is not None:
-            first_alignment_error = first_alignment_error or alignment_error
-            continue
-        try:
-            remaining = _remaining_span_candidates_after_tile(
-                op,
-                max_cores,
-                {},
-                k_split=split_count,
-            )
-        except Unsupported as exc:
-            logger.debug(
-                "span_overflow_bmm_k_search: op=%s split=%d rejected: %s",
-                op.get_name(),
-                split_count,
-                exc,
-            )
-            continue
-        if remaining:
-            latest_remaining = (
-                split_count,
-                [candidate.source for candidate in remaining],
-            )
-            continue
-        level = SpanOverflowTileLevel(
-            selected_host_dim=0,
-            split_count=split_count,
-            is_reduction=True,
-        )
-        logger.info(
-            "[span-overflow BMM K search] op=%s selected_split=%d level=%s",
-            op.get_name(),
-            split_count,
-            level,
-        )
-        return SpanOverflowTilePlan(
-            levels=(level,),
-            chunking_infos=tuple(info.chunking_info for info in initial_infos),
-            reason="; ".join(
-                sorted(
-                    {
-                        info.chunking_info.reason
-                        for info in initial_infos
-                        if info.chunking_info.reason is not None
-                    }
-                )
-            ),
-        )
-
-    if latest_remaining is not None:
-        split_count, remaining_sources = latest_remaining
-        logger.debug(
-            "[span-overflow BMM K search] op=%s no plan; K split %d still "
-            "leaves candidates=%s first_alignment_error=%s",
-            op.get_name(),
-            split_count,
-            remaining_sources,
-            first_alignment_error,
-        )
-    else:
-        logger.debug(
-            "[span-overflow BMM K search] op=%s no legal exact divisor; "
-            "first_alignment_error=%s",
-            op.get_name(),
-            first_alignment_error,
-        )
-    return None
 
 
 def _has_indirect_reads(op: ComputedBuffer) -> bool:
@@ -1821,7 +2168,7 @@ def plan_span_overflow_tile(
     op: ComputedBuffer,
     max_cores: int,
 ) -> SpanOverflowTilePlan | None:
-    """Return an automatic output-range coarse-tile plan for supported ops.
+    """Return an automatic output/reduction-range coarse-tile plan for supported ops.
 
     Supported inputs are static ``FixedTiledLayout`` ``ComputedBuffer`` ops whose
     data is ``Pointwise`` or ``Reduction``.  The planner skips non-computed ops,
@@ -1829,9 +2176,10 @@ def plan_span_overflow_tile(
     indirect-access ops because those are handled outside this automatic
     span-overflow coarse-tiling path.
 
-    The returned plan contains one or more output-range tile levels plus the
-    physical span facts that caused them.  ``None`` means this op either is not
-    eligible for this pass or has no output/input span that needs coarse tiling.
+    The returned plan contains one or more output- or reduction-range tile levels
+    plus the physical span facts that caused them.  ``None`` means this op either
+    is not eligible for this pass or has no output/input span that needs coarse
+    tiling.
 
     ``max_cores`` is threaded through this function and everything it calls,
     but it has no effect on the emitted split today: every candidate's
@@ -1903,14 +2251,26 @@ def plan_span_overflow_tile(
     if isinstance(op.data, Reduction):
         # Scalar/full reductions have no output range to coarse-tile.
         # Non-scalar reductions combine output-span candidates with input spans
-        # controlled by output symbols; BMM K-only input spans are handled
-        # by the reduction-range fallback.
+        # controlled by output symbols. Reduction-range candidates (BMM k, or a
+        # supported non-matmul reduction's axis) join the same bounded search,
+        # allowing output-only, reduction-only, or combined plans.
         if not list(op.data.ranges):
             logger.debug(
                 "[span-overflow planner] skip op=%s reason=scalar_reduction",
                 op.get_name(),
             )
             return None
+        if _has_untileable_reduction_span(op, max_cores):
+            raise Unsupported(
+                f"Cannot auto-tile {op.get_name()}: an input span controlled "
+                "only by the reduction dimension exceeds the hardware span "
+                "limit, but reduction-dimension tiling is not supported for "
+                f"this op (reduction_type={op.data.reduction_type!r}, "
+                f"dtype={op.get_dtype()}, "
+                f"{len(list(op.data.reduction_ranges))} reduction range(s); "
+                "supported: single-range sum, prod, max, min -- max/min "
+                "additionally require a floating-point dtype)."
+            )
         output_candidates = _output_span_candidates_from_op(op, op_name=op.get_name())
         input_candidates = _input_span_candidates(op, max_cores)
         candidates = output_candidates + input_candidates
@@ -1920,61 +2280,89 @@ def plan_span_overflow_tile(
             len(output_candidates),
             len(input_candidates),
         )
-        if not _is_batch_matmul_reduction(op):
-            return _search_min_cost_tile_plan(op, max_cores, candidates)
-
-        # Preserve the existing B/M/N policy. K is tried only as an independent
-        # fallback, and only when the output itself already fits because K tiling
-        # cannot reduce the C[B, M, N] write span.
-        output_failure: Unsupported | None = None
+        validation_cache: dict[
+            tuple[tuple[tuple[int, int], ...], int | None],
+            list[SpanOverflowCandidate],
+        ] = {}
         try:
-            output_plan = _search_min_cost_tile_plan(op, max_cores, candidates)
-        except Unsupported as exc:
-            output_failure = exc
-            output_plan = None
-        if output_plan is not None:
-            split_by_host_dim = {
-                level.selected_host_dim: level.split_count
-                for level in output_plan.levels
-                if not level.is_reduction
-            }
-            remaining_k_infos = _bmm_k_span_infos(
+            plan = _search_min_cost_tile_plan(
                 op,
                 max_cores,
-                split_by_host_dim=split_by_host_dim,
+                candidates,
+                validation_cache=validation_cache,
             )
-            if remaining_k_infos:
-                if not config.enable_reduction_tiling:
-                    return output_plan
+        except Unsupported as original_failure:
+            if any(candidate.is_reduction for candidate in candidates):
                 try:
-                    k_plan = _search_bmm_k_tile_plan(op, max_cores)
-                except Unsupported as exc:
-                    raise Unsupported(
-                        f"Cannot auto-tile {op.get_name()}: the selected B/M/N plan "
-                        "leaves a K-controlled input span over the hardware limit, "
-                        "and no K-only fallback plan can fully resolve the op; "
-                        "combined output-range and reduction-range tiling is not yet "
-                        f"supported. K-only failure: {exc}"
-                    ) from exc
-                if k_plan is not None:
-                    return k_plan
-                raise Unsupported(
-                    f"Cannot auto-tile {op.get_name()}: the selected B/M/N plan "
-                    "leaves a K-controlled input span over the hardware limit, "
-                    "and no K-only fallback plan is available; combined "
-                    "output-range and reduction-range tiling is not yet supported."
-                )
-            return output_plan
-        try:
-            k_plan = _search_bmm_k_tile_plan(op, max_cores)
-        except Unsupported:
-            if output_failure is not None:
-                raise output_failure
-            raise
-        if k_plan is not None:
-            return k_plan
-        if output_failure is not None:
-            raise output_failure
-        return None
+                    output_only_plan = _search_output_only_tile_plan(
+                        op,
+                        max_cores,
+                        candidates,
+                        # An output-only split is still valid when it also
+                        # clears every K-controlled span. Never hide a real K
+                        # overflow merely because reduction tiling is disabled.
+                        ignore_reduction_spans=False,
+                        validation_cache=validation_cache,
+                    )
+                except Unsupported:
+                    # The retry is a best-effort fallback. Its narrower search
+                    # must not replace the original, more informative failure.
+                    raise original_failure
+                if output_only_plan is not None:
+                    return output_only_plan
+            raise original_failure
+        if (
+            plan is not None
+            and not config.enable_reduction_tiling
+            and any(level.is_reduction for level in plan.levels)
+        ):
+            # The cheapest unrestricted plan may combine an output tile with a
+            # reduction tile. With reduction tiling disabled, retry using only
+            # output-controlled candidates before concluding that reduction-range
+            # tiling is required. This keeps useful output tiling behind the kill
+            # switch while still rejecting a reduction-only overflow.
+            output_only_candidates = [
+                candidate for candidate in candidates if not candidate.is_reduction
+            ]
+            output_only_plan = _search_output_only_tile_plan(
+                op,
+                max_cores,
+                output_only_candidates,
+                ignore_reduction_spans=False,
+                validation_cache=validation_cache,
+            )
+            if output_only_plan is not None:
+                return output_only_plan
+            raise Unsupported(
+                f"Cannot auto-tile {op.get_name()}: reduction-range tiling "
+                "is required but disabled via enable_reduction_tiling"
+            )
+        if (
+            plan is None
+            and not _is_batch_matmul_reduction(op)
+            and config.enable_reduction_tiling
+            and any(candidate.is_reduction for candidate in candidates)
+        ):
+            # A non-matmul reduction produced reduction-range candidates but the
+            # search found no plan: the reduced axis overflows and no legal,
+            # stick-aligned split within _MAX_AUTO_TILE_SPLIT_COUNT clears it
+            # (the search's all-reduction branch returns None without
+            # distinguishing the two).  Fail loudly rather than silently drop
+            # it.
+            #
+            # The BMM exemption is not arbitrary: work division cross-core
+            # splits a matmul's K range, so a BMM K-only rejection here is
+            # genuinely recoverable downstream and keeps its historical None.
+            # Plain sum/prod/max/min that support reduction-range tiling are
+            # handled by _has_untileable_reduction_span returning False early.
+            # The types that reach here (mean, integer max/min) have no K-split
+            # recovery, so dropping their overflow just defers the failure to
+            # the backend.
+            raise Unsupported(
+                f"Cannot auto-tile {op.get_name()}: the reduced axis overflows "
+                "and no legal, stick-aligned reduction-range split within "
+                f"{_MAX_AUTO_TILE_SPLIT_COUNT} clears the span."
+            )
+        return plan
 
     return None

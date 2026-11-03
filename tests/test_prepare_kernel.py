@@ -365,32 +365,128 @@ class TestPrepareKernel:
             with pytest.raises(RuntimeError, match="Step index out of range"):
                 job_plan.get_step_type(999)
 
-    def test_compute_on_host_valid(self):
-        """Test that a valid ComputeOnHost command builds successfully.
+    @pytest.mark.parametrize("num_corrections", [1, 2, 3])
+    @pytest.mark.parametrize(
+        "following_step", ["ComputeOnDevice", "DataTransfer", None]
+    )
+    def test_prepare_host_compute_sequence(self, num_corrections, following_step):
+        """Multiple correction blobs must prepare before the device compute."""
+        job_exec_plan = []
+        for i in range(num_corrections):
+            job_exec_plan.extend(
+                [
+                    {
+                        "command": "ComputeOnHost",
+                        "properties": {
+                            "ohandle": f"correction{i}",
+                            "size": "256",
+                            "ishape": ["0"],
+                            "ihandle": "",
+                            "hcm": {"vdci": {}, "senConstants": []},
+                        },
+                    },
+                    {
+                        "command": "DataTransfer",
+                        "properties": {
+                            "dirn": "false",
+                            "host_handle": f"correction{i}",
+                            "dev_ptr": str(120259084288 + i * 256),
+                            "size": "256",
+                        },
+                    },
+                ]
+            )
 
-        Verifies that a well-formed ComputeOnHost entry with all required
-        fields (ohandle, size, ishape, ihandle, hcm) successfully builds
-        a JobPlan.
+        if following_step == "ComputeOnDevice":
+            job_exec_plan.append(
+                {
+                    "command": "ComputeOnDevice",
+                    "properties": {"job_bin_ptr": "120259084288"},
+                }
+            )
+        elif following_step == "DataTransfer":
+            job_exec_plan.append(
+                {
+                    "command": "DataTransfer",
+                    "properties": {
+                        "dirn": "true",
+                        "host_handle": "result",
+                        "dev_ptr": "120259084288",
+                        "size": "256",
+                    },
+                }
+            )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir, job_exec_plan=job_exec_plan
+            )
+            if following_step != "ComputeOnDevice":
+                error = (
+                    "Incomplete step sequence"
+                    if following_step is None
+                    else f"Step ordering violation at step {num_corrections}:"
+                )
+                with pytest.raises(RuntimeError, match=error):
+                    torch_spyre._C.prepare_kernel(spyrecode_dir)
+                return
+
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+            assert job_plan.num_steps() == num_corrections + 1
+            assert [job_plan.get_step_type(i) for i in range(job_plan.num_steps())] == [
+                "HostCompute"
+            ] * num_corrections + ["Compute"]
+            assert [
+                job_plan.get_step_stream_role(i) for i in range(job_plan.num_steps())
+            ] == ["Prep"] * num_corrections + ["Dev"]
+            assert all(
+                job_plan.get_step_pipeline_barrier(i)
+                for i in range(job_plan.num_steps())
+            )
+
+    def test_prepare_emits_bare_split_triple(self):
+        """prepare emits the bare split triple, independent of the flag.
+
+        PrepareKernel emits the plain [HostCompute, H2D, Compute] triple with
+        NO cross-stream event steps, carrying its by-type roles [Prep, Prep,
+        Dev] -- so the launch router splits it across S_prep/S_dev while flex
+        inserts the cross-stream RAW/WAR edges dynamically at enqueue. There is
+        no plan rewrite and no event-step emission (3 steps, never 7).
+
+        SPYRE_HAZARD_TRACKER only affects launch-time routing (whether the
+        S_prep/S_dev split engages), never the prepared plan's shape, so this
+        holds regardless of the flag.
         """
         with tempfile.TemporaryDirectory() as tmpdir:
             spyrecode_dir = self.create_mock_spyrecode(
                 tmpdir, exec_command="ComputeOnHost"
             )
-
-            # Should succeed without exceptions
+            # Must NOT raise: prepare emits the plain triple unconditionally
+            # (the static-edge block and its region-count TORCH_CHECK are
+            # gone), so nothing here depends on the program-region count.
             job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
 
-            # Verify JobPlan was created
-            assert job_plan is not None
-            assert isinstance(job_plan, torch_spyre._C.JobPlan)
-
-            # Verify it has 3 steps (HostCompute, H2D, Compute)
-            assert job_plan.num_steps() == 3
-
-            # Verify the step types
-            assert job_plan.get_step_type(0) == "HostCompute"
-            assert job_plan.get_step_type(1) == "H2D"
-            assert job_plan.get_step_type(2) == "Compute"
+            # Verify it has 2 steps (HostCompute-with-H2D merged, Compute)
+            # The adjacent DataTransfer H2D is collapsed into the HostCompute step
+            # by translateComputeOnHostWithH2D
+            assert job_plan.num_steps() == 2
+            assert [job_plan.get_step_type(i) for i in range(2)] == [
+                "HostCompute",
+                "Compute",
+            ]
+            # Roles are assigned by step type in the ctors, so the bare triple
+            # already carries the split roles -- the split is real.
+            assert [job_plan.get_step_stream_role(i) for i in range(2)] == [
+                "Prep",
+                "Dev",
+            ]
+            # pipeline_barrier stays True on EVERY step of the bare split:
+            # overlap comes only from the S_prep/S_dev split + flex's dynamic
+            # cross-stream events, never from relaxing a barrier.
+            assert [job_plan.get_step_pipeline_barrier(i) for i in range(2)] == [
+                True,
+                True,
+            ]
 
     def test_compute_on_host_missing_ohandle(self):
         """Test that missing ohandle field raises RuntimeError."""
@@ -719,15 +815,20 @@ class TestPrepareKernel:
     def test_pipeline_barrier_dma_steps_default_true(self):
         """H2D and D2H steps must carry pipeline_barrier=True by default."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            # H2D: produced inside the correction sequence at step index 1
             spyrecode_dir = self.create_mock_spyrecode(
                 tmpdir, exec_command="ComputeOnHost"
             )
             job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
 
-            assert job_plan.get_step_type(1) == "H2D"
+            # After merge: HostCompute(0) → Compute(1); no standalone H2D step.
+            assert job_plan.num_steps() == 2
+            assert job_plan.get_step_type(0) == "HostCompute"
+            assert job_plan.get_step_type(1) == "Compute"
+            assert job_plan.get_step_pipeline_barrier(0) is True, (
+                "HostCompute (merged) must must carry pipeline_barrier=True by default"
+            )
             assert job_plan.get_step_pipeline_barrier(1) is True, (
-                "H2D step must carry pipeline_barrier=True by default"
+                "Compute step must carry pipeline_barrier=True by default"
             )
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -754,11 +855,14 @@ class TestPrepareKernel:
             )
 
     def test_pipeline_barrier_correction_sequence(self):
-        """Correction sequence: HostCompute=False, H2D=True, Compute=True.
+        """Every step of the correction triple keeps barrier=True.
 
-        HostCompute opts out (overlap-eligible: runs while prior device compute
-        is in flight). H2D and Compute inherit the safe default True. Compute
-        must wait for H2D to close the RAW hazard on the seg-7 correction region.
+        The two-stream PoC preserves STRICT per-stream FIFO for ALL ops,
+        including HostCompute: overlap comes from the S_prep/S_dev stream split
+        plus flex's dynamic cross-stream RAW/WAR edges, NOT from relaxing any
+        op's pipeline_barrier. So no step in the correction triple
+        ([HostCompute, H2D, Compute]) may opt out of the barrier -- in
+        particular HostCompute must NOT carry the old barrier=False.
         """
         with tempfile.TemporaryDirectory() as tmpdir:
             spyrecode_dir = self.create_mock_spyrecode(
@@ -766,26 +870,23 @@ class TestPrepareKernel:
             )
             job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
 
-            # Correction sequence: HostCompute(0) → H2D(1) → Compute(2)
-            assert job_plan.num_steps() == 3
+            # After the HC+H2D merge: HostCompute(0) → Compute(1)
+            # The adjacent DataTransfer H2D is collapsed into the HostCompute step.
+            assert job_plan.num_steps() == 2
             assert job_plan.get_step_type(0) == "HostCompute"
-            assert job_plan.get_step_type(1) == "H2D"
-            assert job_plan.get_step_type(2) == "Compute"
+            assert job_plan.get_step_type(1) == "Compute"
 
-            assert job_plan.get_step_pipeline_barrier(0) is False, (
-                "HostCompute step must carry pipeline_barrier=False to preserve "
-                "host/device overlap (correction callback runs while prior device "
-                "compute is still in flight)"
+            assert job_plan.get_step_pipeline_barrier(0) is True, (
+                "HostCompute step must carry pipeline_barrier=True: it is a "
+                "consumer of the correction H2D's seg-7 write (RAW hazard); "
+                "Compute must wait for H2D. Inert under STRICT_ORDERING; "
+                "load-bearing under OP_ORDERING."
             )
             assert job_plan.get_step_pipeline_barrier(1) is True, (
-                "H2D step must carry pipeline_barrier=True (safe default: "
-                "inherited from base class)"
-            )
-            assert job_plan.get_step_pipeline_barrier(2) is True, (
                 "Compute step must carry pipeline_barrier=True: it is a "
-                "consumer of H2D's seg-7 write (RAW hazard); Compute must "
-                "wait for H2D. Inert under STRICT_ORDERING; load-bearing "
-                "under OP_ORDERING."
+                "consumer of the correction H2D's seg-7 write (RAW hazard); "
+                "Compute must wait for H2D. Inert under STRICT_ORDERING; "
+                "load-bearing under OP_ORDERING."
             )
 
     def test_pipeline_barrier_pure_compute_true(self):
@@ -810,6 +911,25 @@ class TestPrepareKernel:
 
             with pytest.raises(RuntimeError, match="Step index out of range"):
                 job_plan.get_step_pipeline_barrier(999)
+
+    def test_dev_only_plan_has_all_dev_roles(self):
+        """A pure ComputeOnDevice plan assigns Dev role to every step.
+
+        Guards that the two-stream role assignment never bleeds into legacy
+        single-stream plans: every step of a plain ComputeOnDevice plan must
+        carry role=Dev, never Prep.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir, exec_command="ComputeOnDevice"
+            )
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+            n = job_plan.num_steps()
+            assert n >= 1
+            roles = [job_plan.get_step_stream_role(i) for i in range(n)]
+            assert all(r == "Dev" for r in roles), (
+                f"Expected all Dev roles for a pure Compute plan, got {roles}"
+            )
 
 
 if __name__ == "__main__":

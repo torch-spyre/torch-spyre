@@ -14,7 +14,10 @@
 
 # This file contains inductor passes that are only needed as temp fixes
 
+from math import prod
+
 import torch
+from torch.fx.experimental.symbolic_shapes import statically_known_true, sym_eq
 from torch._inductor.pattern_matcher import (
     Arg,
     CallFunction,
@@ -23,7 +26,6 @@ from torch._inductor.pattern_matcher import (
     register_graph_pattern,
 )
 from .logging_utils import get_inductor_logger
-from .constants import SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY
 from .pass_utils import copy_fx_custom_meta
 
 aten = torch.ops.aten
@@ -40,113 +42,20 @@ mm_to_bmm_pass = PatternMatcherPass(pass_name="unflatten_mm_to_bmm")
 bmm_unflatten_pass = PatternMatcherPass(pass_name="unflatten_bmm_batch_dims")
 
 
-def _is_static_one(value) -> bool:
-    try:
-        return int(value) == 1
-    except (TypeError, ValueError):
-        return False
-
-
-def _is_static_multiple(value, divisor: int) -> bool:
-    try:
-        return int(value) % divisor == 0
-    except (TypeError, ValueError):
-        return False
-
-
-def _has_stick_aligned_matmul_dims(k, n) -> bool:
-    return _is_static_multiple(k, 64) and _is_static_multiple(n, 64)
-
-
-def _node_shape(node: torch.fx.Node) -> list[int] | None:
+def _node_shape(node: torch.fx.Node) -> tuple | None:
+    """Return an FX node's fake/meta shape, if one is available."""
+    if not isinstance(node, torch.fx.Node):
+        return None
     val = node.meta.get("val")
     shape = getattr(val, "shape", None)
-    if shape is None:
-        return None
-    return list(shape)
+    return tuple(shape) if shape is not None else None
 
 
-def _mark_static_unit_batch_bmm(
-    bmm_node: torch.fx.Node, lhs_node: torch.fx.Node, rhs_node: torch.fx.Node
-) -> None:
-    lhs_shape = _node_shape(lhs_node)
-    rhs_shape = _node_shape(rhs_node)
-    out_shape = _node_shape(bmm_node)
-    if lhs_shape is None or rhs_shape is None or out_shape is None:
-        return
-    if len(lhs_shape) != 3 or len(rhs_shape) != 3 or len(out_shape) != 3:
-        return
-    if not (
-        _is_static_one(lhs_shape[0])
-        and _is_static_one(rhs_shape[0])
-        and _is_static_one(out_shape[0])
-    ):
-        return
-    if not (
-        lhs_shape[1] == out_shape[1]
-        and lhs_shape[2] == rhs_shape[1]
-        and rhs_shape[2] == out_shape[2]
-    ):
-        return
-    if not _has_stick_aligned_matmul_dims(lhs_shape[2], rhs_shape[2]):
-        return
-    custom = dict(bmm_node.meta.get("custom") or {})
-    custom[SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY] = {"batch_dim": 0}
-    bmm_node.meta["custom"] = custom
-
-
-def _is_direct_unit_bmm_operand(node: torch.fx.Node) -> bool:
-    if not isinstance(node, torch.fx.Node):
-        return False
-    if node.op in ("placeholder", "get_attr"):
-        return True
-    if node.op == "call_function" and node.target == aten.expand.default:
-        base = node.args[0]
-        return isinstance(base, torch.fx.Node) and base.op in (
-            "placeholder",
-            "get_attr",
-        )
-    return False
-
-
-def _mark_direct_static_unit_batch_bmm(
-    bmm_node: torch.fx.Node, lhs_node: torch.fx.Node, rhs_node: torch.fx.Node
-) -> None:
-    """Mark direct rank-3 B=1 BMMs without catching unflattened attention views."""
-    if not _is_direct_unit_bmm_operand(rhs_node):
-        return
-
-    for arg in (lhs_node, rhs_node):
-        if (
-            isinstance(arg, torch.fx.Node)
-            and arg.op == "call_function"
-            and arg.target in _RESHAPE_OPS
-        ):
-            return
-
-    bmm_users = list(bmm_node.users.keys())
-    if len(bmm_users) == 1:
-        output_view = bmm_users[0]
-        if (
-            isinstance(output_view, torch.fx.Node)
-            and output_view.op == "call_function"
-            and output_view.target in _RESHAPE_OPS
-        ):
-            output_shape = output_view.args[1]
-            if isinstance(output_shape, (list, tuple)) and len(output_shape) > 3:
-                return
-
-    _mark_static_unit_batch_bmm(bmm_node, lhs_node, rhs_node)
-
-
-def mark_direct_unit_bmm_pass(graph: torch.fx.Graph) -> None:
-    for node in graph.nodes:
-        if node.op != "call_function" or node.target != aten.bmm.default:
-            continue
-        if len(node.args) != 2:
-            continue
-        lhs_node, rhs_node = node.args
-        _mark_direct_static_unit_batch_bmm(node, lhs_node, rhs_node)
+def _shapes_statically_equal(lhs, rhs) -> bool:
+    """Whether two shape sequences are provably equal without adding guards."""
+    return len(lhs) == len(rhs) and statically_known_true(
+        sym_eq(tuple(lhs), tuple(rhs))
+    )
 
 
 @register_graph_pattern(
@@ -251,7 +160,6 @@ def _unflatten_mm_to_bmm(
         )
         bmm_node.meta["val"] = torch.empty(output_shape, dtype=rhs_dtype, device="meta")
         copy_fx_custom_meta(node, bmm_node)
-        _mark_static_unit_batch_bmm(bmm_node, lhs_input, expanded)
 
     # Replace all uses of mm and output view with the bmm
     node.replace_all_uses_with(bmm_node)
@@ -326,13 +234,58 @@ def _unflatten_bmm_batch_dims(
     if not (output_view.op == "call_function" and output_view.target in _RESHAPE_OPS):
         return
 
-    output_shape = output_view.args[1]
-    if len(output_shape) <= 3:
-        return
-
     # Get the original (pre-reshape) tensors
     lhs_orig = lhs_reshape.args[0]  # the expand or original tensor
     rhs_orig = rhs_reshape.args[0]
+
+    # Prove the entire reshape sandwich before removing it.  Equal element
+    # counts are not enough: a reshape can collapse different logical batch
+    # prefixes, interchange M/K/N, or restore the result in a different order.
+    # Reusing those operands directly would then make lower_bmm index one
+    # producer with another operand's matrix domain.
+    lhs_orig_shape = _node_shape(lhs_orig)
+    rhs_orig_shape = _node_shape(rhs_orig)
+    lhs_flat_shape = _node_shape(lhs_reshape)
+    rhs_flat_shape = _node_shape(rhs_reshape)
+    bmm_shape = _node_shape(node)
+    output_shape = _node_shape(output_view)
+    if (
+        lhs_orig_shape is None
+        or rhs_orig_shape is None
+        or lhs_flat_shape is None
+        or rhs_flat_shape is None
+        or bmm_shape is None
+        or output_shape is None
+    ):
+        return
+
+    # lower_bmm currently has a native contract for exactly two batch axes.
+    # Leave other ranks as the original, semantically valid flattened bmm.
+    if len(lhs_orig_shape) != 4 or len(rhs_orig_shape) != 4:
+        return
+
+    lhs_batch = lhs_orig_shape[:-2]
+    rhs_batch = rhs_orig_shape[:-2]
+    lhs_rows, lhs_contraction = lhs_orig_shape[-2:]
+    rhs_contraction, rhs_columns = rhs_orig_shape[-2:]
+    flat_batch = prod(lhs_batch)
+
+    if not _shapes_statically_equal(lhs_batch, rhs_batch):
+        return
+    if not statically_known_true(sym_eq(lhs_contraction, rhs_contraction)):
+        return
+    if not _shapes_statically_equal(
+        lhs_flat_shape, (flat_batch, lhs_rows, lhs_contraction)
+    ):
+        return
+    if not _shapes_statically_equal(
+        rhs_flat_shape, (flat_batch, rhs_contraction, rhs_columns)
+    ):
+        return
+    if not _shapes_statically_equal(bmm_shape, (flat_batch, lhs_rows, rhs_columns)):
+        return
+    if not _shapes_statically_equal(output_shape, (*lhs_batch, lhs_rows, rhs_columns)):
+        return
 
     # Replace the 3D bmm with a spyre.batched_matmul that accepts N-D inputs.
     # Using aten.bmm.default with >3D args would crash FakeTensorUpdater.

@@ -53,8 +53,9 @@ emitted file is one kernel, not one operation. The softmax above is six.
 | Option | Use it when |
 |---|---|
 | `--kernel NAME` | Only emit kernels whose name contains `NAME` |
-| `--save-inputs` | Dump recorded argument values to a `.pt`, for a replay whose inputs are the real ones. Pool contents are not captured; integer args otherwise replay as zeros |
+| `--save-inputs` | Dump recorded argument values to a `.pt`, for a replay whose inputs are the real ones. Without it, integer args replay as zeros |
 | `--no-execute` | Stub the backend compile and launch, so no device is needed |
+| `--emitter ktir` | Target the KTIR emitter instead of SuperDSC. See [Capturing for KTIR](#capturing-for-ktir) |
 | `--no-explain-header` | Omit the decoded explanation from each emitted file |
 
 The stale-`fxgraph`-cache trap is handled for you: `capture.py` patches
@@ -84,6 +85,7 @@ torch-spyre installed. This is the header of
 # Source program:  <your checkout>/tests/op_specs/programs/01_add.py
 # Kernel:          1 of 1 compiled from that program
 # Environment:     torch 2.13.0+cpu, SENCORES=32, bundle_symbolic_args=True
+# Emitter:         sdsc (generate_bundle)
 # Kernel args:     3 in the spec, 3 observed at .run()
 #
 # Run it:
@@ -136,12 +138,52 @@ python captured/sdsc_fused__softmax_0.py --stage bundle  # artifacts only
 ```
 
 `--stage bundle` writes `sdsc_N.json` and `bundle.mlir` and stops. It needs no
-device and no `dxp_standalone`, so it is the stage to use when the question is
+device and no backend compiler, so it is the stage to use when the question is
 *"what did my OpSpec turn into?"* rather than *"what does it compute?"*.
 
 Then edit a field and re-run. That is the whole point of the file being
 standalone: change a `device_size`, a work division or a coordinate expression,
 diff the resulting `bundle.mlir`, and you are probing the backend directly.
+
+### Capturing for KTIR
+
+`--stage ktir` is the same stage for the other emitter: it writes
+`<kernel>.ktir` — the [KTDP-dialect MLIR](../../compiler/ktir.md) that
+`generate_ktir` produces from the same OpSpec list — and stops. It needs no
+device and no `dbo-opt`, only the `mlir_ktdp` bindings, which are a from-source
+build rather than a declared dependency: install them with
+`tools/install-ktir.sh`.
+
+A script captured on the default path cannot use it. The buffer names
+`generate_ktir` keys its register threading on are populated by
+`create_tensor_arg` only under `config.ktir_emitter`, so an SDSC capture carries
+`name=None` everywhere and emission refuses it. Capture with `--emitter ktir`
+instead, which turns that config on for the run:
+
+```bash
+python tests/op_specs/capture.py my_repro.py --emitter ktir --no-execute --out captured/
+python captured/ktir_fused_add_0.py --stage ktir
+```
+
+The header names which emitter compiled each kernel, and the emitted script pins
+it: a KTIR capture's `--stage run` goes through `async_compile.ktir`, never
+`sdsc`. That is not a preference. Under the KTIR emitter a spec's HBM addresses
+may be baked absolute rather than symbolic, and `generate_bundle` rejects those
+outright rather than miscompile them — so the emitter that built a spec is the
+one certain to accept it, and the header offers that stage alone. Both stages
+stay on the CLI for the cases where the other emitter does accept the spec.
+
+Two things follow from `--emitter ktir` being a *capture-time* choice:
+
+- **It works with no device and no backend compiler at all.** Canonical KTIR
+  spells base addresses as func arguments and never reads `allocation["hbm"]`, so
+  `BUNDLE_SYMBOLIC_ARGS=1` — the default — is fine. With `--no-execute` the whole
+  loop runs on a laptop.
+- **Expect refusals.** The emitter is narrower than SuperDSC today: LX and
+  HBM-pool intermediates are either threaded as SSA values or refused, and one
+  kernel whose ops disagree about work division cannot share a grid. Those arrive
+  as `Unimplemented` with a label naming the capability, which is the emitter
+  telling you what it does not build yet — not a broken capture.
 
 ### 4. Interpret
 
@@ -204,7 +246,7 @@ capture time, so `KERNEL ARGS` shows them in the frozen header but not under
 | Field | Meaning |
 |---|---|
 | `is_input` | Read or written by *this op*. The same `arg_index` can be both across a kernel. |
-| `arg_index` | Position in the kernel's argument list. Negative means it is not a kernel arg. Not the `.run()` position when there is a pool: the pool is prepended and uncounted, so `arg0` is `.run()`'s second argument. |
+| `arg_index` | Position in the kernel's argument list, and in `.run()`'s, including when the kernel uses an HBM pool -- the pool is allocated inside the bundle, not passed in. Negative means it is not a kernel arg. |
 | `device_dtype` | On-device format, e.g. `SEN169_FP16`. This is what sets the stick size. |
 | `device_size` | The tiled device shape, `[..., sticks, rows, elems_per_stick]`. The last dim is always elements per stick. |
 | `device_coordinates` | One sympy expression per device dim, mapping an iteration point to a position. An `IndirectAccess` here means the coordinate is a runtime-loaded value. |
@@ -213,7 +255,7 @@ capture time, so `KERNEL ARGS` shows them in the frozen header but not under
 ### `LoopSpec`
 
 Wraps a body of specs in a `count` trip count. Only coarse tiling produces
-these, and only via `spyre_hint(num_tiles_per_dim=...)` — see
+these: a `for_each_tile` loop, or the automatic span-overflow tiling — see
 [Coarse Tiling Loops](../../compiler/coarse_tiling_loops.md).
 
 ## Walkthrough: four worked examples
@@ -489,7 +531,7 @@ a line the first three do not have:
 
 ```
 # Kernel args:     4 in the spec, 4 observed at .run()
-# Pool:            32768 bytes, passed to .run() ahead of the args
+# Pool:            32768 bytes, allocated by the bundle
 ```
 
 **3. Read the header.** Seven OpSpecs this time, and the intermediates that could
@@ -542,10 +584,11 @@ the tensors buys a smaller pool rather than no pool.
 
 **What to notice**
 
-- *Ahead of* is the part to internalise: the pool is `.run()`'s first argument and
-  is **not** `arg0`. The kernel args keep their own numbering.
-- A replay needs only `POOL_BYTES`, never the offset map. `make_pool` allocates a
-  flat 1-D uint8 tensor of that size and the offsets take care of themselves.
+- The pool is **not** an argument. The bundle allocates it itself, as
+  `%pool = sdscbundle.device_mem_allocate 32768 bytes` on the first line of
+  `bundle.mlir`, so `.run()` receives the four kernel args and nothing else.
+- A replay needs only `POOL_SIZE`, never the offset map: the size reaches
+  `sdsc()` and the offsets in the spec take care of themselves.
 - Three allocation kinds have now appeared across the four examples: `hbm @ n` for
   a kernel arg (01), `lx @ offset` for a scratchpad intermediate (02), and
   `hbm_pool @ offset` for one that spilled (04).

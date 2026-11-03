@@ -26,8 +26,36 @@ from typing import TYPE_CHECKING, Literal
 import sympy
 
 if TYPE_CHECKING:
-    from torch._inductor.dependencies import MemoryDep
+    import torch.fx
+
     from torch._inductor.ir import ComputedBuffer
+
+    from torch_spyre._C import SpyreTensorLayout
+
+
+@dataclass(frozen=True)
+class LoopCarryRecord:
+    """Identity contract for one accumulator carried through a counted loop.
+
+    ``for_each_tile`` lowering rewrites the carry update as an in-place write
+    into the carry's initial storage.  Recording both ends lets scratchpad
+    planning distinguish that closed, compiler-created mutation from an
+    arbitrary user mutation, which must remain in HBM.
+
+    ``loop_origin`` is the exact FX ``while_loop`` HOP node the carry belonged
+    to, captured and validated at the splice site (see
+    ``wsr/while_loop_bridge._validated_loop_origin``) before the WhileLoop IR
+    node is deleted.  It is optional internal compiler metadata: ``None``
+    whenever the origin could not be proven (nested loops, loops inside an
+    ``invoke_subgraph``, or a chained carry whose origins gather an earlier
+    loop's node), in which case the post-loop materialization plan declines
+    and the carry keeps today's HBM behavior.  No other consumer of this
+    record reads the field.
+    """
+
+    storage_name: str
+    update_name: str
+    loop_origin: "torch.fx.Node | None" = None
 
 
 @dataclass(frozen=True)
@@ -74,6 +102,11 @@ class ReductionPlan:
     per_tile_strides:
         Host strides of the per-outer-tile accumulation buffer, derived from
         ``full_output_strides`` via ``compute_tile_stride`` at planning time.
+    full_output_device_layout:
+        Original (pre-division) device layout of the op's output, which the
+        full-sized accumulation buffer takes as its own -- see
+        ``PropagationPlan.full_device_layout``, the copy-out's counterpart.
+        ``None`` under the same conditions.
     """
 
     reduction_type: str
@@ -84,6 +117,7 @@ class ReductionPlan:
     outer_fill_loop_info: "CoarseTileInfo | None"
     full_output_strides: tuple[sympy.Expr, ...]
     per_tile_strides: tuple[sympy.Expr, ...]
+    full_output_device_layout: SpyreTensorLayout | None = None
 
 
 @dataclass(frozen=True)
@@ -115,6 +149,14 @@ class PropagationPlan:
         Original (pre-division) strides of the tiled op's layout, captured at
         planning time before ``_divide_ranges`` mutates the op.  Only set when
         ``kind == "copy_out"``.
+    full_device_layout:
+        Original (pre-division) device layout of the tiled op's output, which
+        the copy-out's full buffer takes as its own.  Captured at planning time
+        because it cannot always be recovered from the tile: once two host
+        dims of the tile have extent 1, their device dims are
+        indistinguishable.  ``None`` when the op has no device layout yet
+        (pre-stickify) or when the full buffer is larger than the op's own
+        output (a WhileLoop-splice dim).
     reduction:
         Shape/identity/nesting decisions for the reduction machinery. Only
         set when ``kind == "reduction"``.
@@ -134,65 +176,55 @@ class PropagationPlan:
         ``copy_forced(src, c)`` where ``c`` is a locally-created buffer that is
         also the function's return value). ``None`` otherwise, meaning the
         op's own name should be used to patch ``V.graph.graph_outputs``.
+    consumer_lookup_name:
+        Only set (and only differs from the op's own name) when this op is
+        a ``MutationLayoutSHOULDREMOVE`` write whose mutation *target* --
+        not the op's own buffer -- is what outside ops actually read (e.g.
+        ``copy_forced(src, c)`` where ``c`` is a locally-created buffer read
+        later by another op). Transform-time consumer re-resolution
+        (``_propagate_tiled_op``) and the read-redirect it performs
+        (``_patch_consumers``) must search for reads of this name instead of
+        the op's own name. ``None`` otherwise, meaning the op's own name
+        should be used, as for ordinary (non-mutation) copy-out ops.
     """
 
     kind: Literal["loop_internal", "copy_out", "reduction", "mutation_write_back"]
     full_ranges: list[sympy.Expr] | None = None
     full_strides: tuple[sympy.Expr, ...] | None = None
+    full_device_layout: SpyreTensorLayout | None = None
     reduction: ReductionPlan | None = None
     outside_consumer_names: tuple[str, ...] = ()
     is_graph_output: bool = False
     graph_output_name: str | None = None
+    consumer_lookup_name: str | None = None
 
 
 @dataclass(frozen=True)
-class ReadCopyEntry:
-    """One shared copy to insert for a cross-group buffer read.
+class ReadCopyElisionRecord:
+    """Direct-read form saved while a consumer is redirected through a copy.
 
-    Attributes
-    ----------
-    copy_name:
-        Qualified name to assign the inserted copy ComputedBuffer.
-    dep:
-        The canonical MemoryDep (buffer name + index + var_names + size)
-        every equivalent read in the group shares -- the same object one of
-        the consuming ops' own full_deps produced, used to size/index the
-        copy exactly as _insert_all_read_copy_ops does today.
-    insert_before_op_name:
-        get_operation_name() of the first (operations order) consuming op
-        in the group -- where the copy is inserted.
-    sizing_op_name:
-        get_operation_name() of the op supplying tiled_op.loop_info for
-        the copy's own read/write-level-extent computation (the first
-        consuming op, per the sizing-invariant in the design doc).
-    consumer_op_names:
-        Names of every op in the group that must have this dep's buffer
-        name patched (via _NameSwapHandler) to load from copy_name instead.
+    Coarse tiling keeps the copy authoritative until layout selection, work
+    division, and LX planning finish.  A later pass may restore
+    ``direct_inner_fn`` only when the final physical plan proves that reading
+    ``source_name`` directly is equivalent.  The record is deliberately not
+    copied by :func:`copy_op_metadata`: rebuilding the consumer body
+    invalidates the saved direct form unless that pass explicitly recreates
+    the record.
     """
 
+    consumer_name: str
     copy_name: str
-    dep: "MemoryDep"
-    insert_before_op_name: str
-    sizing_op_name: str
-    consumer_op_names: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class ReadCopyPlan:
-    """Per-group plan for Pass 1 (read-copy insertion).
-
-    Computed once during planning (_plan_read_copies, run after every
-    group's _apply_plan) and consumed by a slimmed _insert_all_read_copy_ops
-    that only executes these decisions.
-
-    Attributes
-    ----------
-    entries:
-        One ReadCopyEntry per distinct (buffer name, canonical index expr)
-        pair read cross-group by at least one op in this group.
-    """
-
-    entries: tuple["ReadCopyEntry", ...]
+    source_name: str
+    direct_inner_fn: object
+    direct_tiled_dims_per_level: (
+        tuple[tuple[tuple[int, sympy.Expr], ...], ...] | None
+    ) = None
+    direct_squeezed_advance_per_level: (
+        tuple[tuple[tuple[sympy.Expr, sympy.Expr], ...], ...] | None
+    ) = None
+    # Intermediate copies that become dead only if the deferred proposal is
+    # accepted, ordered from the replacement consumer back toward the source.
+    orphaned_copy_names: tuple[str, ...] = ()
 
 
 @dataclass
@@ -230,9 +262,11 @@ class CoarseTileInfo:
         level's extent equals the final (innermost) extent times the
         product of every more-inner level's own count that also tiles that
         dim.
-        An empty per-level list means the dep is loop-invariant at that
-        level. This is a tiling *decision*, not a substituted index
-        expression -- deferred substitution into the dependency's actual
+        An empty per-level list means this read's address does not advance at
+        that level. It does not by itself prove value invariance: a producer
+        may rewrite fixed-address scratch on every trip. This is a tiling
+        *decision*, not a substituted index expression -- deferred
+        substitution into the dependency's actual
         (possibly later-rewritten) index expression happens in
         spyre_kernel.py at OpSpec/TensorArg construction time, when the
         index is guaranteed final.
@@ -266,8 +300,10 @@ class CoarseTileInfo:
         ``test_flash_tile_B``). Independent of ``dep.index`` entirely, so
         ``SpyreKernel._general_tile_advance`` can add its device-address
         contribution as an extra term via ``tiling_expr_to_device_expr``
-        rather than by substitution. Empty list means no such dims for this
-        read (the common case).
+        rather than by substitution. An empty per-read list means that read
+        has no such dims. The outer list may also be empty when no read in the
+        operation needs squeezed-dimension metadata; that is complete "none
+        needed" metadata, not a missing entry for every read.
     squeezed_advance_output:
         The analogous per-level ``(host_stride, extent)`` list for this op's
         own write dependency, parallel to ``output_tiled_dims`` the same way
@@ -303,14 +339,33 @@ class CoarseTileInfo:
 _SPYRE_METADATA_ATTRS = (
     "dim_hints",
     "work_div_loop_info",
+    "iteration_space_ownership",
+    "_work_division_span_min_splits",
     "loop_info",
     "_restickify_plan",
     "_input_layout_overrides",
     "_emit_set_layout",
     # Links a tiled reduction op to its accumulation buffer; set by
     # coarse_tile._propagate_tiled_reduction_op, read by finalize_layouts in
-    # insert_restickify.py to overwrite accum_full's generic layout.
+    # insert_restickify.py to promote accum_full to FixedTiledLayout when needed.
     "_tiled_reduction_accum_name",
+    # One immutable record shared by a for_each_tile carry's persistent
+    # storage and its in-loop update operation.
+    "_loop_carry_record",
+    # Ground-truth tiled-dim tag stamped by lower_tile_dim_marker
+    # (lowering.py) on a for_each_tile tile read; consumed and erased by
+    # _consume_tile_dim_markers (for_each_tile_lowering.py). Must survive
+    # while_loop_bridge.splice_while_loop's own redirect_computed_buffer_
+    # reads calls (e.g. "redirect while_loop carry/tile reads to persistent
+    # scratch"), which reconstruct the marker op before
+    # _consume_tile_dim_markers ever sees it -- confirmed empirically: the
+    # marker attribute was silently dropped there before this attr was
+    # added to this tuple, because copy_op_metadata only copies attrs
+    # listed here.
+    "tile_marker_dim",
+    # work_division_constraints.JOINT_TILING_AND_DIVISION_ATTR, spelled out
+    # since that module imports this one (through pass_utils).
+    "_work_division_chosen_with_tiling",
 )
 
 

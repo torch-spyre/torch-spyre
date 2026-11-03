@@ -1,5 +1,5 @@
 test_suite_config:
-  labels: [unit, regression, trunk]
+  labels: [unit, regression, integration, trunk]
   files:
     - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops.py
       unlisted_test_mode: skip
@@ -10,6 +10,9 @@ test_suite_config:
             #
             - TestOps::test_(addmm|mm|bmm|einsum|matmul|linear).*
             - TestOps::test_fp8_scaled_mm.*
+            - TestOps::test_fp8_scaled_bmm.*
+            - TestOps::test_fp8_chained_scaled_mm.*
+            - TestOps::test_fp8_3d_activation_reshape.*
           mode: mandatory_success
           tags:
             - ops__inductor-matmul
@@ -18,5 +21,8 @@ test_suite_config:
           mode: mandatory_success
           tags:
             - ops__inductor-matmul
-            - slow__plat_ppc64
-            - slow__plat_s390x
+        - names:
+            - TestOps::test_grouped_mm.*
+          mode: mandatory_success
+          tags:
+            - ops__inductor-matmul

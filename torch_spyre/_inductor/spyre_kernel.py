@@ -13,58 +13,81 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
+import itertools
 import math
 from typing import Any, Callable, Self, Sequence, Tuple, Union
 from abc import ABC
-import itertools
 
 import torch
 import sympy
 
 from torch_spyre._C import DataFormats, ElementArrangement
 
+from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.codegen.common import (
     CSEVariable,
     Kernel,
+    REMOVED,
 )
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
+from torch._inductor.ir import ComputedBuffer, Pointwise
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ops_handler import DefaultHandler, StoreMode
 from torch._inductor.utils import IndentedBuffer, sympy_index_symbol, sympy_subs
+from torch.utils._ordered_set import OrderedSet
 from torch._inductor.virtualized import V
 
 
 from .constants import (
     SPYRE_FP32_OPS,
-    BATCH_MATMUL_OP,
-    BATCH_MATMUL_FP8_OP,
+    SPYRE_INT32_OPS,
     CONV_OPS,
     DEPTHWISE_CONV_REDUCTION_OPS,
     IDENTITY_OP,
+    MATMUL_REDUCTION_OPS,
     POOL_OPS,
     RESTICKIFY_OP,
+    RESTICKIFY_SUPPORTED_DEVICE_DTYPES,
     SEGMENT_OFFSETS,
     TWO_INPUT_REDUCTION_OPS,
-    SHARED_WEIGHT_UNIT_BMM_INFO_KEY,
 )
 from . import config as _spyre_config
+from .core_mapping import (
+    derive_operation_mapping,
+    finalize_tensor_work_divisions,
+    matmul_reduction_dim,
+    remap_work_division,
+    work_division_from_view,
+)
 from .errors import Unsupported
-from .ir import FixedTiledLayout
-from .scratchpad.lx_relayout import work_division_from_view
+from .lx_read_contracts import (
+    LocalReadEmission,
+    has_partial_read,
+    normalize_local_read as normalize_local_lx_subrange,
+)
+from .ir import FixedTiledLayout, SpyreConstantFallback
+from .scratchpad.lx_relayout import (
+    materialized_lx_relayout_for_destination,
+)
 from .pass_utils import (
     concretize_expr,
-    concretize_index,
+    op_read_writes,
     compute_symbolic_bounds,
     finite_upper_or_none,
-    apply_splits_from_index_coeff,
     iteration_space,
+    iteration_space_with_splits,
     indirect_access_subs_from_kernel,
+    input_layout_for_operation,
     is_restickify_coords,
+    alignment_coordinates,
+    per_trip_index,
 )
-from .views import compute_coordinates, align_tensors, tiling_expr_to_device_expr
+from .views import align_tensors, tiling_expr_to_device_expr
 from .logging_utils import get_inductor_logger
+from .loop_facts import enclosing_loops
 from .op_spec import (
     IndirectAccess,
+    LX_RELAYOUT_INFO_KEY,
     LoopSpec,
     OpSpec,
     TensorArg,
@@ -91,76 +114,6 @@ class TensorAccess(RValue):
     name: str
     index: sympy.Expr
     layout: FixedTiledLayout
-
-
-def _preserve_shared_weight_unit_bmm_dim(
-    op: str,
-    it_space: dict[sympy.Symbol, tuple[sympy.Expr, int]],
-    args: Sequence[TensorArg],
-    op_info: dict[str, Any],
-) -> dict[sympy.Symbol, tuple[sympy.Expr, int]]:
-    # TensorArg layout is normalized in-place below to match the surrounding
-    # OpSpec construction helpers.
-    if SHARED_WEIGHT_UNIT_BMM_INFO_KEY not in op_info:
-        return it_space
-    if op not in [BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP]:
-        return it_space
-    if len(it_space) != 3 or len(args) < 3:
-        return it_space
-    info = op_info.get(SHARED_WEIGHT_UNIT_BMM_INFO_KEY)
-    if not isinstance(info, dict) or info.get("batch_dim") != 0:
-        return it_space
-
-    unit_sym = sympy.Symbol("_spyre_bmm_unit")
-    suffix = 0
-    while unit_sym in it_space:
-        suffix += 1
-        unit_sym = sympy.Symbol(f"_spyre_bmm_unit_{suffix}")
-
-    def _unit_indices(arg: TensorArg) -> list[int]:
-        return [
-            idx
-            for idx, (size, coord) in enumerate(
-                zip(arg.device_size[:-1], arg.device_coordinates[:-1])
-            )
-            if concretize_expr(size) == 1 and coord == 0
-        ]
-
-    target_args = (args[0], args[-1])
-    # The unit-BMM marker is only valid for plain rank-3 BMMs after layout
-    # construction. If a target tensor still carries extra physical axes, such
-    # as attention heads from SDPA, rewriting one axis into the BMM iteration
-    # space can produce an illegal SDSC layout.
-    if any(len(arg.device_size) > 4 for arg in target_args):
-        return it_space
-    unit_idxs_by_arg = [_unit_indices(arg) for arg in target_args]
-
-    if all(len(unit_idxs) == 0 for unit_idxs in unit_idxs_by_arg):
-        for arg in target_args:
-            if len(arg.device_size) < 2:
-                return it_space
-            insert_at = len(arg.device_size) - 1
-            arg.device_size.insert(insert_at, 1)
-            arg.device_coordinates.insert(insert_at, sympy.S.Zero)
-        unit_idxs_by_arg = [_unit_indices(arg) for arg in target_args]
-
-    if not all(len(unit_idxs) == 1 for unit_idxs in unit_idxs_by_arg):
-        return it_space
-
-    rewrite_targets = [
-        (arg, unit_idxs[0]) for arg, unit_idxs in zip(target_args, unit_idxs_by_arg)
-    ]
-
-    for arg, unit_idx in rewrite_targets:
-        arg.device_coordinates[unit_idx] = unit_sym
-        nonstick = list(range(len(arg.device_size) - 1))
-        order = [unit_idx] + [i for i in reversed(nonstick) if i != unit_idx]
-        order.append(len(arg.device_size) - 1)
-        arg.device_size[:] = [arg.device_size[i] for i in order]
-        arg.device_coordinates[:] = [arg.device_coordinates[i] for i in order]
-
-    logger.info("Preserving shared-weight unit BMM dim %s", unit_sym)
-    return {unit_sym: (sympy.S.One, 1), **it_space}
 
 
 @dataclass
@@ -233,6 +186,27 @@ def _serialize_value(v):
         return repr(v)
 
 
+def _has_int32_operands(*operands: RValue) -> bool:
+    """Whether the operands are loaded IEEE_INT32 tensors.
+
+    The add/mul lowerings apply default type promotion, so int32 never meets
+    another format here; a mix means that invariant was broken upstream.
+    """
+    kinds = [
+        x.layout.device_layout.device_dtype if isinstance(x, TensorAccess) else None
+        for x in operands
+    ]
+    if DataFormats.IEEE_INT32 not in kinds:
+        return False
+    if any(kind != DataFormats.IEEE_INT32 for kind in kinds):
+        described = [
+            str(kind) if kind is not None else f"non-tensor {type(x).__name__}"
+            for kind, x in zip(kinds, operands)
+        ]
+        raise Unsupported(f"IEEE_INT32 operand mixed with other operands: {described}")
+    return True
+
+
 class SpyreOpFuncs:
     """
     Pointwise torch ops that are directly supported by the backend compiler for the Spyre device.
@@ -246,6 +220,8 @@ class SpyreOpFuncs:
 
     @staticmethod
     def add(a, b):
+        if _has_int32_operands(a, b):
+            return PointwiseOp("addi32toi32", [a, b])
         return PointwiseOp("add", [a, b])
 
     @staticmethod
@@ -287,6 +263,10 @@ class SpyreOpFuncs:
         return PointwiseOp("greaterthan", [a, b])
 
     @staticmethod
+    def keep_by_index(x, indices):
+        return ReductionOp("keepbyindex", [x, indices])
+
+    @staticmethod
     def layernormnorm(*args):
         return PointwiseOp("layernormnorm", list(args))
 
@@ -308,6 +288,13 @@ class SpyreOpFuncs:
         return PointwiseOp("mul", [x, y])
 
     @staticmethod
+    def logical_or(x, y):
+        # Upstream Inductor's logical_or lowering casts operands to 0/1 bool
+        # (convert_input_to_bool=True), and on 0/1 values maximum(a, b) == a OR b.
+        # This mirrors logical_and above, which uses mul for the same reason.
+        return PointwiseOp("maximum", [x, y])
+
+    @staticmethod
     def lt(a, b):
         return PointwiseOp("lesserthan", [a, b])
 
@@ -321,6 +308,8 @@ class SpyreOpFuncs:
 
     @staticmethod
     def mul(a, b):
+        if _has_int32_operands(a, b):
+            return PointwiseOp("muli32toi32", [a, b])
         return PointwiseOp("mul", [a, b])
 
     @staticmethod
@@ -329,6 +318,9 @@ class SpyreOpFuncs:
 
     @staticmethod
     def neg(a):
+        # NOTE (follow-up): int64 neg has the same fp32 round-trip limitation as
+        # sub (see lower_sub); it could be expressed as mul by -1 on the native
+        # muli32toi32 path together with the sub rewrite.
         return PointwiseOp("neg", [a])
 
     @staticmethod
@@ -342,6 +334,19 @@ class SpyreOpFuncs:
     @staticmethod
     def qfp8wt(x):
         return PointwiseOp("qfp8wt", [x])
+
+    @staticmethod
+    def quantscalepertokenfp8(x, scale_ub):
+        # scale_ub must remain in the signature: Inductor dispatches this method via
+        # SpyreKernelOpsHandler._default(name, args, kwargs) passing all op arguments,
+        # so dropping it would cause a TypeError at codegen time.
+        #
+        # It is intentionally unused here: scale_ub is already baked into `mulConst`
+        # inside SpyreReduction.op_info at lowering time (lower_quantscalepertokenfp8).
+        # For reductions, kernel_store_reduction reads op_info exclusively from
+        # ir_node.data.op_info (the SpyreReduction), not from ReductionOp.op_info.
+        _ = scale_ub
+        return ReductionOp("quantscalepertokenfp8", [x])
 
     @staticmethod
     def relu(x):
@@ -371,7 +376,7 @@ class SpyreOpFuncs:
 
     @staticmethod
     def square(x):
-        return PointwiseOp("mul", [x, x])
+        return SpyreOpFuncs.mul(x, x)
 
     @staticmethod
     def sub(a, b):
@@ -391,6 +396,16 @@ class SpyreOpFuncs:
         if src_dtype == torch.bool:
             # A bool's physical format (fp16 vs fp32) depends on how it was
             # produced, so resolve the op from its propagated device dtype.
+            # That format only survives on a materialized buffer's layout, so an
+            # inlined bool producer has no format to read. Unreachable today
+            # (nothing fuses into this position), but vertical fusion (#826)
+            # would make it reachable, and the invariant is not locally obvious.
+            if not isinstance(x, TensorAccess):
+                raise Unsupported(
+                    f"conversion from an inlined torch.bool value to {dtype}: "
+                    f"a bool's physical format is only recoverable from a "
+                    f"materialized buffer's layout"
+                )
             op = DtypeOpTable.get_bool_src_operator(
                 x.layout.device_layout.device_dtype, dtype
             )
@@ -465,7 +480,6 @@ class SpyreKernelOpsHandler(DefaultHandler):
         if reduction_type in [
             "welford_reduce",
             "welford_combine",
-            "any",
             "xor_sum",
         ]:
             return UnimplementedOp(reduction_type)
@@ -554,7 +568,22 @@ class SpyreKernel(Kernel[CSEVariable]):
         self._indirect_var_count: int = 0
         self._general_tile_advance_seen: dict[str, int] = {}
         self._tile_advance_symbols: dict[int, sympy.Symbol] = {}
+        self._alignment_repeat_info: dict[sympy.Symbol, dict[str, Any]] = {}
+        self.scheduled_nodes: list[SchedulerNode] = []
+        self.failed_node: SchedulerNode | None = None
         self.pool_size: int = pool_size
+        self.local_read_contract_factory: (
+            Callable[[str, Any], LocalReadEmission | None] | None
+        ) = None
+        # Live call args, deduped and filtered to names in spyre_kernel_args.
+        # Set by codegen_kernel(); used by call_kernel() to ensure arg_index
+        # values match .run() positional args.
+        self._live_call_arg_names: list[str] | None = None
+        # The op names of the scheduler nodes codegenned into this kernel, set by
+        # the scheduler before any spec is built; empty means "unknown", which
+        # makes every buffer look non-local.  Read by create_tensor_arg for
+        # TensorArg.kernel_local.
+        self.fused_node_names: OrderedSet[str] = OrderedSet()
 
     def indirect_var_names(self) -> "frozenset[str] | None":
         if not self.indirect_vars:
@@ -687,7 +716,25 @@ class SpyreKernel(Kernel[CSEVariable]):
                 for dep in ir_node.get_read_writes().reads
                 if isinstance(dep, MemoryDep)
             ]
-            matching_idx = [i for i, dep in enumerate(read_deps) if dep.name == name]
+            # `name` has already been resolved through mutation_real_name by
+            # load() (e.g. coarse_tile_copy_buf19's dep is named "buf19" --
+            # tiled_op's own output identity -- but load() passes in "buf2",
+            # buf19's MutationLayoutSHOULDREMOVE target, since that's the
+            # actual underlying buffer). dep.name is the pre-resolution
+            # identity, so it must go through the same resolution before
+            # comparing, or a dep on a mutation alias never matches its own
+            # resolved name and this falls through to "no advance" every
+            # time (issue: flash-v2's B-tiled denominator/output copy-out
+            # reads silently pinned to tile 0).
+            scheduler = getattr(V.graph, "scheduler", None)
+            mutation_real_name = (
+                scheduler.mutation_real_name if scheduler is not None else {}
+            )
+            matching_idx = [
+                i
+                for i, dep in enumerate(read_deps)
+                if mutation_real_name.get(dep.name, dep.name) == name
+            ]
             if not matching_idx:
                 return None
             # Positional tie-break: if this buffer is read more than once,
@@ -775,6 +822,10 @@ class SpyreKernel(Kernel[CSEVariable]):
         tensor: TensorAccess,
         opspec_name: "str | None" = None,
     ) -> TensorArg:
+        current_node = self.current_node
+        if current_node is None or current_node.node is None:
+            raise RuntimeError("TensorArg construction requires a current operation")
+        operation = current_node.node
         # OpSpec->KTIR needs a stable per-buffer identity for register-threaded
         # fused intermediates (all arg_index == -1): _buf_id keys on TensorArg.name,
         # which is serialized into the emitted op-spec literal and read back by
@@ -785,33 +836,75 @@ class SpyreKernel(Kernel[CSEVariable]):
         # SDSC literal byte-identical.
         if opspec_name is None and _spyre_config.ktir_emitter:
             opspec_name = name
-        it_space = iteration_space(self.current_node)
+        # Same gate, and for the same reason: the KTIR plan-time fuser deletes a
+        # producer op only for a buffer nothing outside this kernel reads, and
+        # the emitter is handed one kernel's specs and cannot ask.  The upstream
+        # predicate covers every user; a graph output can have no user at all,
+        # which it does not cover.  False without a scheduler, so the fuser
+        # declines.
+        #
+        # This resolves to Scheduler.can_buffer_be_removed_through_fusion, NOT to
+        # SuperDSCScheduling's same-named override, which answers a different
+        # question (may the allocation be elided -- always no here, issue #1266).
+        kernel_local = bool(
+            _spyre_config.ktir_emitter
+            and (sched := getattr(V.graph, "scheduler", None))
+            and sched.can_buffer_be_removed_through_fusion(name, self.fused_node_names)
+            and name not in V.graph.get_output_names()
+        )
+        # Same gate again, and the same reason as ``kernel_local``: the fact is
+        # only read by the KTIR emitter, so the SDSC literal stays byte-identical.
+        #
+        # It is asked of the BUFFER, not of the arg's shape, because the shape
+        # cannot answer it -- see TensorArg.replicated_scalar.  A
+        # ``SpyreConstantFallback`` is the one producer that fills a whole stick
+        # with one value (``spyre_constant_tensor`` allocates ``torch.empty(())``,
+        # one stick, and ``spyre_fill_tensor`` covers it with a single
+        # MEMORY_FILL over the composite address), so it is the one producer
+        # that may claim this.
+        replicated_scalar = bool(
+            _spyre_config.ktir_emitter
+            and isinstance(V.graph.try_get_buffer(name), SpyreConstantFallback)
+        )
+        it_space = iteration_space(current_node)
         # With dynamic=True the host index may contain symbolic strides
         # (e.g. x0*s1+x1).  Concretize size symbols so normalize_coordinates
         # can correctly isolate each loop variable's contribution.
 
-        index = concretize_index(tensor.index, set(it_space.keys()))
-
         # insert_post_mutation_restickify may override the input layout for this input tensor.
         # Restore it here because the tensor data was uploaded as orig_stl.
         if is_input:
-            overrides = getattr(self.current_node.node, "_input_layout_overrides", {})
-            if (layout := overrides.get(name)) is not None:
-                tensor.layout = layout
+            tensor.layout = input_layout_for_operation(operation, name, tensor.layout)
 
-        device_coords = compute_coordinates(
-            tensor.layout.device_layout.device_size,
-            tensor.layout.device_layout.stride_map,
+        if "lx" in tensor.layout.allocation and tensor.layout.lx_view is None:
+            raise ValueError(f"LX buffer {name} has no physical ownership")
+
+        # A WhileLoop-splice loop variable describes the address advance from
+        # one counted-loop trip to the next, not an in-tile iteration axis.
+        # Its advance is already explicit in loop_info (tiled_dims_per_read/
+        # output_tiled_dims or squeezed_advance_per_read/squeezed_advance_
+        # output, stamped by the WhileLoop-lowering pass -- see
+        # _general_tile_advance's docstring), which that method folds into
+        # device_tile_advance_expr below. Pin every splice loop_var to trip
+        # zero in the base coordinates so the raw unbacked symbol neither
+        # leaks into the OpSpec iteration space nor applies the same
+        # advance a second time.
+        device_tile_advance_expr = self._general_tile_advance(tensor, is_input, name)
+        base_index = per_trip_index(operation, tensor.index)
+        device_coords = alignment_coordinates(
+            tensor.layout.device_layout,
+            base_index,
             it_space,
-            index,
             self.indirect_sizes,
+            repeat_info_out=self._alignment_repeat_info,
         )
         work_division = work_division_from_view(
             tensor.layout.lx_view if "lx" in tensor.layout.allocation else None,
+            tensor.layout.device_layout.device_size,
             device_coords,
-            tuple(it_space),
+            it_space,
+            allow_extended=_spyre_config.lx_extended_ownership,
         )
-        device_tile_advance_expr = self._general_tile_advance(tensor, is_input, name)
         tensor_arg = TensorArg(
             is_input,
             -1,
@@ -823,13 +916,83 @@ class SpyreKernel(Kernel[CSEVariable]):
             name=opspec_name,
             device_tile_advance_expr=device_tile_advance_expr,
             work_division=work_division,
+            kernel_local=kernel_local,
+            replicated_scalar=replicated_scalar,
         )
+        if (
+            _spyre_config.lx_planner_relayout
+            and not _spyre_config.ktir_emitter
+            and tensor_arg.is_input
+            and "lx" in tensor_arg.allocation
+            and isinstance(operation, ComputedBuffer)
+            and isinstance(operation.data, Pointwise)
+        ):
+            reads = [dep for dep in op_read_writes(operation).reads if dep.name == name]
+            if has_partial_read(V.graph.get_buffer(name).layout.size, reads):
+                if self.local_read_contract_factory is None:
+                    raise ValueError(f"{name}: local LX contract provider is missing")
+                contract = self.local_read_contract_factory(name, operation)
+                tensor_arg = normalize_local_lx_subrange(
+                    contract,
+                    name,
+                    tensor_arg,
+                    it_space,
+                    allow_extended=_spyre_config.lx_extended_ownership,
+                )
         if (
             "lx" not in tensor.layout.allocation
             and "hbm_pool" not in tensor.layout.allocation
         ):
             self.spyre_kernel_args.append((name, tensor_arg))
         return tensor_arg
+
+    def _check_indirect_index_step(self, idx_arg: TensorArg) -> None:
+        """Require aligned starts and adjacent sticks in counted-loop index rows.
+
+        Scoped to indirect index operands: their per-trip start must remain
+        stick-aligned. Reuses ``coeff_through_floor`` on
+        ``device_tile_advance_expr`` -- the same device-element per-trip step the
+        emitted byte stride is built from -- so there is no second address
+        calculation. ``coeff_through_floor`` already raises ``Unsupported`` for a
+        non-integer (sub-stick) coefficient, so an unknown advance is never
+        silently accepted. Whole-stick advances pass untouched.
+        """
+        from torch_spyre._inductor.pass_utils import coeff_through_floor
+        from torch_spyre._inductor.views import UnalignedStickSplit
+
+        expr = idx_arg.device_tile_advance_expr
+        if expr is None:
+            return
+        # The indirect row walker advances through adjacent physical sticks.
+        # An interleaved trip/batch axis between the row's outer-stick and
+        # inner-stick axes introduces a gap that the walker does not encode.
+        coords = idx_arg.device_coordinates
+        if coords:
+            for axis, coord in enumerate(coords[:-1]):
+                for symbol in coord.free_symbols & coords[-1].free_symbols:
+                    if any(
+                        size != 1 and symbol not in middle.free_symbols
+                        for size, middle in zip(
+                            idx_arg.device_size[axis + 1 : -1],
+                            coords[axis + 1 : -1],
+                        )
+                    ):
+                        raise Unsupported(
+                            "counted-loop indirect index rows require adjacent "
+                            "physical sticks; put the trip/batch axes outside "
+                            "all index-row axes in SpyreTensorLayout"
+                        )
+        # Read the index's committed device format rather than assuming int32
+        # (same query as pass_utils' dev_layout.device_dtype.elems_per_stick()).
+        elems_per_stick = idx_arg.device_dtype.elems_per_stick()
+        for sym in sorted(expr.free_symbols, key=str):
+            step = coeff_through_floor(expr, sym)
+            if step == 0:
+                continue
+            if int(step) % elems_per_stick != 0:
+                raise UnalignedStickSplit(
+                    idx_arg.arg_index, sym, int(step), elems_per_stick
+                )
 
     def create_op_spec(
         self,
@@ -847,8 +1010,15 @@ class SpyreKernel(Kernel[CSEVariable]):
             # Check if operation supports the argument's dtype
             if not (
                 op == IDENTITY_OP
+                or (
+                    op == RESTICKIFY_OP
+                    and arg.device_dtype in RESTICKIFY_SUPPORTED_DEVICE_DTYPES
+                )
                 or DtypeOpTable.is_dtype_op(op)
                 or (op in SPYRE_FP32_OPS and arg.device_dtype == DataFormats.IEEE_FP32)
+                or (
+                    op in SPYRE_INT32_OPS and arg.device_dtype == DataFormats.IEEE_INT32
+                )
                 or arg.device_dtype == DataFormats.SEN169_FP16
                 or (
                     op in SPYRE_FP8_OPS
@@ -861,33 +1031,9 @@ class SpyreKernel(Kernel[CSEVariable]):
         it_space = iteration_space(self.current_node)
 
         ir_node = self.current_node.node  # ComputedBuffer
-        work_division: dict[sympy.Symbol, int] = {}
-        if hasattr(ir_node, "op_it_space_splits"):
-            write_index = next(iter(self.current_node.read_writes.writes)).index
-            # Match the encoding in work_division.apply_splits: an indirect
-            # (gather) read carries data-dependent symbols whose coefficients are
-            # not a stable identity key, so prefer the first non-indirect read as
-            # the reduction-split reference index.
-            reads = self.current_node.read_writes.reads
-            read_dep = next(
-                (d for d in reads if isinstance(d, MemoryDep) and not d.is_indirect()),
-                next(iter(reads), None),
-            )
-            read_index = read_dep.index if read_dep is not None else write_index
-            work_division = apply_splits_from_index_coeff(
-                ir_node.op_it_space_splits,
-                write_index,
-                read_index,
-                it_space,
-            )
-
-        it_space_extended = {
-            k: (v, work_division.get(k, 1)) for k, v in it_space.items()
-        }
-        it_space_extended = _preserve_shared_weight_unit_bmm_dim(
-            op, it_space_extended, args, op_info
+        it_space_extended = iteration_space_with_splits(
+            ir_node, self.current_node.read_writes, it_space
         )
-
         # Build per-level tiled_symbols (innermost first) for this op.
         # loop_tiled_dims / loop_tiled_reduction_dims are lists of per-level
         # dim-index lists, outermost first — so we build outermost-first then
@@ -900,29 +1046,59 @@ class SpyreKernel(Kernel[CSEVariable]):
         # device_tile_advance_expr.coeff(sym) resolves to that level's own
         # contribution regardless of how many host dims it tiles.
         li = getattr(ir_node, "loop_info", None)
-        raw_tiled_dims: list[list[int]] = li.loop_tiled_dims if li is not None else []
-        raw_tiled_red_dims: list[list[int]] = (
-            li.loop_tiled_reduction_dims if li is not None else []
+        loops = enclosing_loops(ir_node)
+        raw_tiled_dims = [loop.tiled_dims for loop in loops]
+        raw_tiled_red_dims = [loop.tiled_reduction_dims for loop in loops]
+        # A dim tiled down to a per-tile extent of 1 is squeezed out of the
+        # op's own iteration space entirely (no d{i} symbol survives), so it
+        # is invisible to loop_tiled_dims/loop_tiled_reduction_dims and can
+        # only advance via squeezed_advance_per_read/squeezed_advance_output
+        # (see coarse_tile.py's _insert_copy_op, the "d not in
+        # squeeze_pos" branch). _general_tile_advance already mints/uses a
+        # level symbol from squeezed_advance_per_level regardless of
+        # loop_tiled_dims, so has_any_tiled_dim must check the same fields —
+        # otherwise the minted symbol shows up in device_tile_advance_expr
+        # but never in OpSpec.tiled_symbols, and superdsc.py's affine-stride
+        # extraction (which only walks tiled_symbols) silently drops the
+        # advance, leaving the tensor's address pinned across that level's
+        # iterations instead of stepping through it.
+        raw_squeezed_advance_reads: list[list[list[tuple]]] = (
+            li.squeezed_advance_per_read if li is not None else []
         )
-        # CoarseTileInfo always constructs loop_tiled_dims and
-        # loop_tiled_reduction_dims with the same length (one sublist per
-        # nesting level), so max() is just a safety net; in practice both
-        # lists have the same length and the per-level loop below never
-        # silently drops an entry from the shorter one.
-        n_levels = max(len(raw_tiled_dims), len(raw_tiled_red_dims))
+        raw_squeezed_advance_output: list[list[tuple]] = (
+            li.squeezed_advance_output if li is not None else []
+        )
+        # enclosing_loops gives one entry per nesting level, so the first two
+        # terms are both the loop depth; max() keeps a squeezed record that
+        # (malformed) runs deeper than the loop nest from being dropped.
+        n_levels = max(
+            len(raw_tiled_dims),
+            len(raw_tiled_red_dims),
+            max((len(levels) for levels in raw_squeezed_advance_reads), default=0),
+            len(raw_squeezed_advance_output),
+        )
 
         tiled_symbol_trip_counts: dict = {}
         tiled_syms: list[list] = []
         if n_levels > 0:
-            loop_count = li.loop_count if li is not None else []
+            loop_count = [loop.trip_count for loop in loops]
 
             op_name = ir_node.get_operation_name()
             tiled_syms_per_level_outermost: list[list] = []
             for lvl in range(n_levels):
                 level_syms: list = []
                 has_any_tiled_dim = (
-                    lvl < len(raw_tiled_dims) and raw_tiled_dims[lvl]
-                ) or (lvl < len(raw_tiled_red_dims) and raw_tiled_red_dims[lvl])
+                    (lvl < len(raw_tiled_dims) and raw_tiled_dims[lvl])
+                    or (lvl < len(raw_tiled_red_dims) and raw_tiled_red_dims[lvl])
+                    or any(
+                        lvl < len(levels) and levels[lvl]
+                        for levels in raw_squeezed_advance_reads
+                    )
+                    or (
+                        lvl < len(raw_squeezed_advance_output)
+                        and raw_squeezed_advance_output[lvl]
+                    )
+                )
                 if has_any_tiled_dim:
                     level_syms.append(self._get_or_mint_level_symbol(lvl, op_name))
                 tiled_syms_per_level_outermost.append(level_syms)
@@ -965,23 +1141,6 @@ class SpyreKernel(Kernel[CSEVariable]):
             )
             debug_handle = None
 
-        if not is_reduction and op != "ReStickifyOpHBM" and not indirect_var_names:
-            stick_vars = {
-                next(iter(arg.device_coordinates[-1].free_symbols))
-                for arg in args
-                if arg.device_coordinates and arg.device_coordinates[-1].free_symbols
-            }
-            assert len(stick_vars) <= 1, (
-                f"create_op_spec: stick mismatch for op={op!r} "
-                f"ir_chain={getattr(debug_handle, 'ir_chain', '?')}: "
-                f"args have different stick loop variables: "
-                + ", ".join(
-                    str(arg.device_coordinates[-1])
-                    for arg in args
-                    if arg.device_coordinates
-                )
-            )
-
         # Carry the node's full logical output ranges (NCHW, incl. unit dims)
         # so codegen can derive surviving dim roles and the channel count from
         # live IR instead of a lowering-time size snapshot.  Store raw ranges
@@ -995,11 +1154,29 @@ class SpyreKernel(Kernel[CSEVariable]):
             and hasattr(ir_node.data, "ranges")
             else None
         )
-        if not is_lx_relayout_identity(op, args):
-            for arg in args:
-                arg.work_division = None
+        # The registry is keyed by the inserted destination buffer (``buf3``),
+        # while scheduler nodes have operation names (``op3``). Certify the
+        # identity from its write, which is the stable link between them.
+        written = V.graph.scheduler.mutation_real_name
+        relayout_plans = [
+            plan
+            for dep in self.current_node.read_writes.writes
+            if isinstance(dep, MemoryDep)
+            and (
+                plan := materialized_lx_relayout_for_destination(
+                    V.graph, written.get(dep.name, dep.name)
+                )
+            )
+            is not None
+        ]
+        if len(relayout_plans) > 1:
+            raise RuntimeError("one operation writes multiple LX relayout destinations")
+        if LX_RELAYOUT_INFO_KEY in op_info and not relayout_plans:
+            raise RuntimeError("LX relayout marker has no matching registered plan")
+        if relayout_plans:
+            op_info = {**op_info, LX_RELAYOUT_INFO_KEY: True}
 
-        return OpSpec(
+        op_spec = OpSpec(
             op,
             is_reduction,
             it_space_extended,
@@ -1009,12 +1186,39 @@ class SpyreKernel(Kernel[CSEVariable]):
             tiled_symbol_trip_counts=tiled_symbol_trip_counts,
             symbolic_dim_bounds=symbolic_dim_bounds,
             node_output_ranges=node_output_ranges,
+            completed_producer_cores=(
+                relayout_plans[0].completed_producer_cores if relayout_plans else ()
+            ),
             debug_handle=debug_handle,
         )
+        # Finish the operation here, while its inputs and its node are live.
+        # Every indirect symbol it can reference was bound by its own loads,
+        # so the substitution known now is the one it needs.
+        simplify_op_spec(
+            op_spec,
+            self.indirect_sizes,
+            indirect_access_subs_from_kernel(self.indirect_vars)
+            if self.indirect_vars
+            else None,
+            repeat_info=self._alignment_repeat_info,
+        )
+        return op_spec
 
     def remove_kernel_local_buffers(self) -> None:
-        """Remove buffers that have a scratchpad or temporary allocation from the kernel's arg list."""
-        for name in list(self.store_buffer_names):
+        """Remove scratchpad and pool buffers from the kernel's argument list.
+
+        HBM pooling runs after the kernel is prepared, so this runs again at
+        emission for the intermediates pooled in between. ``KernelArgs.output``
+        resolves mutation aliases, so its real destination may appear only in
+        ``output_buffers``, not in the recorded stores or inputs.
+        """
+        for name in OrderedSet(
+            [
+                *self.store_buffer_names,
+                *self.args.input_buffers,
+                *self.args.output_buffers,
+            ]
+        ):
             buf = V.graph.get_buffer(name)
             if buf is None:
                 continue
@@ -1022,7 +1226,13 @@ class SpyreKernel(Kernel[CSEVariable]):
             if isinstance(layout, FixedTiledLayout) and (
                 "lx" in layout.allocation or "hbm_pool" in layout.allocation
             ):
-                self.remove_buffer(name)
+                # A name can be registered on several legs; each is pruned alone.
+                if name in self.store_buffer_names:
+                    self.remove_buffer(name)
+                if name in self.args.input_buffers:
+                    self.args.input_buffers[name] = REMOVED  # type: ignore[assignment]
+                if name in self.args.output_buffers:
+                    self.args.output_buffers[name] = REMOVED
 
     def load(self, name: str, index: sympy.Expr):
         """Codegen a load from an InputBuffer"""
@@ -1054,6 +1264,7 @@ class SpyreKernel(Kernel[CSEVariable]):
     ) -> None:
         self._general_tile_advance_seen = {}
         self._tile_advance_symbols = {}
+        self._alignment_repeat_info = {}
         # mutation_real_name maps mutation aliases to their real destination buffer. Resolve that here,
         # and mark the buf name as removed so the wrapper does not allocate it separately.
         real_dst_name = V.graph.scheduler.mutation_real_name.get(name, name)
@@ -1096,16 +1307,16 @@ class SpyreKernel(Kernel[CSEVariable]):
             args: list[TensorArg] = []
             indirect_syms = _indirect_syms_used(value, self.indirect_vars)
             if indirect_syms:
-                args += [
-                    self.create_tensor_arg(
+                for sym in sorted(indirect_syms, key=str):
+                    idx_tensor = self.indirect_vars[sym]
+                    idx_arg = self.create_tensor_arg(
                         True,
                         idx_tensor.name,
                         idx_tensor,
                         opspec_name=idx_tensor.name,
                     )
-                    for sym in sorted(indirect_syms, key=str)
-                    for idx_tensor in [self.indirect_vars[sym]]
-                ]
+                    self._check_indirect_index_step(idx_arg)
+                    args.append(idx_arg)
             for input in value.arguments:
                 if isinstance(input, TensorAccess):
                     args.append(self.create_tensor_arg(True, input.name, input))
@@ -1137,18 +1348,19 @@ class SpyreKernel(Kernel[CSEVariable]):
 
             if indirect_syms_used:
                 # Gather/scatter: coordinates are built with raw indirect symbols here;
-                # indirect_access_subs is applied later in codegen_kernel → simplify_op_spec.
+                # create_op_spec applies indirect_access_subs during simplification.
                 # Only add the indirect tensors that this specific operation uses.
-                args = [
-                    self.create_tensor_arg(
+                args = []
+                for sym in sorted(indirect_syms_used, key=str):
+                    idx_tensor = self.indirect_vars[sym]
+                    idx_arg = self.create_tensor_arg(
                         True,
                         idx_tensor.name,
                         idx_tensor,
                         opspec_name=idx_tensor.name,
                     )
-                    for sym in sorted(indirect_syms_used, key=str)
-                    for idx_tensor in [self.indirect_vars[sym]]
-                ]
+                    self._check_indirect_index_step(idx_arg)
+                    args.append(idx_arg)
                 args += [
                     self.create_tensor_arg(True, value.name, value),
                     self.create_tensor_arg(False, real_dst_name, dst),
@@ -1163,6 +1375,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                     self.create_tensor_arg(False, real_dst_name, dst),
                 ]
                 op_indirect_var_names = None
+
             in_coords = args[-2].device_coordinates
             out_coords = args[-1].device_coordinates
             if is_restickify_coords(in_coords, out_coords):
@@ -1182,6 +1395,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         """Convert an RValue"""
         self._general_tile_advance_seen = {}
         self._tile_advance_symbols = {}
+        self._alignment_repeat_info = {}
         buf = V.graph.get_buffer(name)
         layout = buf.get_layout()
         if not isinstance(layout, FixedTiledLayout):
@@ -1264,25 +1478,8 @@ class SpyreKernel(Kernel[CSEVariable]):
         body = self.op_specs
         self.op_specs = [LoopSpec(count=count, body=body)]
 
-    def codegen_kernel(self):
-        """Codegen the body of this kernel by pretty printing its list of OpSpecs"""
-
-        indirect_access_subs = (
-            indirect_access_subs_from_kernel(self.indirect_vars)
-            if self.indirect_vars
-            else None
-        )
-
-        if _spyre_config.validate_op_specs:
-            validate_op_specs(self.op_specs, stage="after_creation_loop_wrapping")
-        if logger.isEnabledFor(logging.INFO):
-            logger.info(
-                "OP SPECS AFTER CREATION/LOOP-WRAPPING\n%s",
-                format_op_spec_list(self.op_specs),
-            )
-
-        for op_spec in _iter_op_specs(self.op_specs):
-            simplify_op_spec(op_spec, self.indirect_sizes, indirect_access_subs)
+    def check_op_specs(self) -> None:
+        """Validate and log the finished operation sequence after loop wrapping."""
 
         if _spyre_config.validate_op_specs:
             validate_op_specs(self.op_specs, stage="after_simplification")
@@ -1292,17 +1489,38 @@ class SpyreKernel(Kernel[CSEVariable]):
                 format_op_spec_list(self.op_specs),
             )
 
+    def codegen_kernel(self):
+        """Bind the argument list and HBM addresses, then print the finalized OpSpecs.
+
+        Everything else was final at preparation; only what HBM pooling decided
+        afterwards is bound here.
+        """
+
         def sympy_str(x: sympy.Expr) -> str:
             if isinstance(x, IndirectAccess):
                 name_sym = x.args[0]
                 return f"IndirectAccess('{name_sym}')"
             return "sympify('" + str(x) + "')"
 
-        # Now that all loads/stores have been processed we know the final kernel_args and can map names to indices
-        actuals = self.args.python_argdefs()[1]
+        self.remove_kernel_local_buffers()
+        # Compute live, deduped call-arg list from names in spyre_kernel_args.
+        # python_argdefs() includes all registered names from load()/store(),
+        # but spyre_kernel_args only has those surviving to the final op specs
+        # (excludes dead names like gather indices folded away by simplify_op_spec).
+        # Use this list for arg_index assignment so positional .run() args match.
+        live_names = {name for name, _ in self.spyre_kernel_args}
+        actuals = []
+        seen_actuals: set[str] = set()
+        for name in self.args.python_argdefs()[1]:
+            if name in live_names and name not in seen_actuals:
+                seen_actuals.add(name)
+                actuals.append(name)
+        self._live_call_arg_names = actuals
         has_pool_allocations = self.pool_size > 0
 
         for name, tensor_arg in self.spyre_kernel_args:
+            if "hbm_pool" in tensor_arg.allocation:
+                continue  # pooled after preparation; addressed inside the pool
             tensor_arg.arg_index = actuals.index(name)
             if _spyre_config.bundle_symbolic_args:
                 # On the symbolic path the HBM address is provided at runtime
@@ -1330,26 +1548,52 @@ class SpyreKernel(Kernel[CSEVariable]):
         return uses_hbm_pool(self.op_specs)
 
     def call_kernel(self, name: str, node=None):
-        """Codegen a call to this kernel. This kernel's own HBM pool tensor
-        (if any) is allocated by the generated MLIR itself, via
-        sdscbundle.device_mem_allocate -- there is no Python-side pool
-        tensor to allocate or free here."""
+        """Codegen a call to this kernel.
+
+        When config.frontend_pool_allocation is False (default), this
+        kernel's own HBM pool tensor (if any) is allocated by the generated
+        MLIR itself, via sdscbundle.device_mem_allocate -- there is no
+        Python-side pool tensor to allocate or free here. When True, a
+        real pool tensor is allocated immediately before and freed
+        immediately after this kernel's .run() call, scoping its lifetime
+        tightly to this one bundle's execution.
+
+        The pool tensor, when there is one, is call argument 0, ahead of the
+        tensor arguments. The KTIR emitter opens the kernel's signature with a
+        matching leading slot (``KernelPlan.parameters``).
+        """
         wrapper = V.graph.wrapper_code
         call_args = []
 
-        # Add kernel arguments, deduplicating tensors that appear as both
-        # input and output (e.g. in-place ops like x *= 2).  With symbolic
-        # args the MLIR bundle emits one !sdscbundle.input_arg<index> per unique
-        # arg_index; passing the same tensor twice would cause a runtime
-        # "Number of inputs mismatches" error in processComputeOnHostCommand.
-        seen: set[str] = set()
-        for arg in self.args.python_argdefs()[1]:
-            if arg not in seen:
-                seen.add(arg)
-                call_args.append(arg)
+        uses_pool = self._kernel_uses_hbm_pool()
+        # name is unique across kernels per Inductor's wrapper codegen --
+        # kernels are deduped by src_code, but each kept kernel still gets
+        # its own unique name -- so deriving the pool variable name from it
+        # is collision-free without any extra bookkeeping here.
+        pool_var_name = f"_pool_{name}"
+        emit_pool_tensor = uses_pool and _spyre_config.pool_allocated_by_frontend()
+        if emit_pool_tensor:
+            device = V.graph.get_current_device_or_throw()
+            wrapper.writeline(
+                f"{pool_var_name} = spyre_empty_with_layout("
+                f"({self.pool_size},), (1,), torch.uint8, "
+                f"SpyreTensorLayout(device_size=[{self.pool_size}], "
+                f"stride_map=[1], device_dtype=DataFormats.SENINT8), "
+                f"device=torch.device('{device}'))"
+            )
+            call_args.append(pool_var_name)
+
+        # Use live call args computed in codegen_kernel() to keep positional
+        # .run() args in sync with arg_index values baked into op specs.
+        assert self._live_call_arg_names is not None, (
+            "call_kernel() requires codegen_kernel() to have run first"
+        )
+        call_args.extend(self._live_call_arg_names)
 
         call_args_str = ", ".join(call_args)
         wrapper.writeline(f"{name}.run({call_args_str})")
+        if emit_pool_tensor:
+            wrapper.writeline(f"del {pool_var_name}")
 
     def emit_layout_restores(self, restores) -> None:
         """Emit set_spyre_tensor_layout wrapper calls after this kernel's run.
@@ -1417,8 +1661,9 @@ def uses_hbm_pool(specs) -> bool:
     """Return True if any op in ``specs`` references an HBM-pool-allocated tensor.
 
     This decides whether ``call_kernel`` passes the pool ahead of the kernel
-    args, so anything reading a kernel's ``.run()`` arguments has to agree with
-    it -- hence a shared function rather than a copy per caller.
+    args when ``config.frontend_pool_allocation`` is set, so anything reading
+    a kernel's ``.run()`` arguments has to agree with it -- hence a shared
+    function rather than a copy per caller.
     """
     return any(
         "hbm_pool" in arg.allocation
@@ -1487,6 +1732,12 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                         for sym, count in op_spec.tiled_symbol_trip_counts.items()
                     )
                     buf.writeline(f"tiled_symbol_trip_counts={{{trip_counts_str}}},")
+                if op_spec.core_id_to_work_slice is not None:
+                    core_map = ", ".join(
+                        f"{sympy_str(dim)}: {sympy_str(slot)}"
+                        for dim, slot in op_spec.core_id_to_work_slice.items()
+                    )
+                    buf.writeline(f"core_id_to_work_slice={{{core_map}}},")
                 buf.writeline(
                     f"symbolic_dim_bounds={_serialize_value(op_spec.symbolic_dim_bounds)},"
                 )
@@ -1501,6 +1752,10 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                             sympy_str(r) + ", " for r in op_spec.node_output_ranges
                         )
                         + "),"
+                    )
+                if op_spec.completed_producer_cores:
+                    buf.writeline(
+                        f"completed_producer_cores={op_spec.completed_producer_cores!r},"
                     )
                 if op_spec.debug_handle is not None:
                     # Source-to-kernel provenance must survive the OpSpec ->
@@ -1527,6 +1782,10 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                             buf.writeline(f"allocation={arg.allocation!r},")
                             if arg.name is not None:
                                 buf.writeline(f"name={arg.name!r},")
+                            if arg.kernel_local:
+                                buf.writeline("kernel_local=True,")
+                            if arg.replicated_scalar:
+                                buf.writeline("replicated_scalar=True,")
                             if arg.device_tile_advance_expr is not None:
                                 buf.writeline(
                                     "device_tile_advance_expr="
@@ -1548,51 +1807,17 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                                 buf.writeline(
                                     "work_division=TensorWorkDivision("
                                     f"work_slices={{{splits}}}, "
-                                    f"core_id_to_work_slice={{{core_map}}}),"
+                                    f"core_id_to_work_slice={{{core_map}}}"
+                                    + (
+                                        f", num_cores={arg.work_division.num_cores}"
+                                        if arg.work_division.num_cores is not None
+                                        else ""
+                                    )
+                                    + "),"
                                 )
                         buf.writeline("),")
                 buf.writeline("]")
             buf.writeline("),")
-
-
-def _remap_work_division(arg: TensorArg, work_division_remap) -> None:
-    """Carry tensor ownership through iteration-space normalization."""
-
-    if arg.work_division is None:
-        return
-    new_splits: dict[sympy.Symbol, int] = {}
-    new_core_map: dict[sympy.Symbol, sympy.Expr] = {}
-    for old_dim, split in arg.work_division.work_slices.items():
-        new_dims = work_division_remap[old_dim]
-        remaining_split = int(split)
-        split_factors = []
-        if len(new_dims) == 1:
-            split_factors = [(new_dims[0][0], remaining_split)]
-            remaining_split = 1
-        else:
-            for new_dim, basis in reversed(new_dims):
-                factor = math.gcd(remaining_split, basis)
-                split_factors.append((new_dim, factor))
-                remaining_split //= factor
-            split_factors.reverse()
-        if remaining_split != 1:
-            raise ValueError(f"cannot normalize {split}-way split on {old_dim}")
-
-        slot = arg.work_division.core_id_to_work_slice[old_dim]
-        slot_stride = 1
-        for new_dim, factor in split_factors:
-            if factor == 1:
-                continue
-            new_slot = sympy.Mod(sympy.floor(slot / slot_stride), factor)
-            if new_dim in new_splits and (
-                new_splits[new_dim],
-                new_core_map[new_dim],
-            ) != (factor, new_slot):
-                raise ValueError(f"conflicting normalized ownership on {new_dim}")
-            new_splits[new_dim] = factor
-            new_core_map[new_dim] = new_slot
-            slot_stride *= factor
-    arg.work_division = TensorWorkDivision(new_splits, new_core_map)
 
 
 def _restickify_restore_elided_dim(op_spec) -> None:
@@ -1692,7 +1917,51 @@ def _restickify_restore_elided_dim(op_spec) -> None:
         _restore(new_sym, out_arg, in_arg)
 
 
-def simplify_op_spec(op_spec, indirect_sizes=None, indirect_access_subs=None):
+def _check_relayout_boundary(
+    iteration_space: dict, source: TensorWorkDivision, destination: TensorWorkDivision
+) -> None:
+    """Domain divisibility and extent limits stay at the preparation boundary."""
+    logical_cores = math.prod(int(split) for _, split in iteration_space.values())
+    domains = {
+        "operation": logical_cores,
+        "source": source.physical_core_count,
+        "destination": destination.physical_core_count,
+    }
+    execution_cores = max(domains.values())
+    owners = {
+        "source": math.prod(int(s) for s in source.work_slices.values()),
+        "destination": math.prod(int(s) for s in destination.work_slices.values()),
+    }
+    if any(d <= 0 or execution_cores % d for d in domains.values()) or any(
+        n <= 0 or domains[name] % n for name, n in owners.items()
+    ):
+        raise ValueError(
+            "LX relayout operation and tensor core domains must divide the "
+            f"execution domain; domains={domains}, owners={owners}"
+        )
+    oversized = {
+        name: {
+            str(dim): (int(split), int(iteration_space[dim][0]))
+            for dim, split in division.work_slices.items()
+            if sympy.sympify(iteration_space[dim][0]).is_number
+            and int(split) > int(iteration_space[dim][0])
+        }
+        for name, division in (("source", source), ("destination", destination))
+    }
+    oversized = {name: dims for name, dims in oversized.items() if dims}
+    if oversized:
+        raise ValueError(
+            f"LX relayout tensor split exceeds its aligned extent: {oversized}"
+        )
+
+
+def simplify_op_spec(
+    op_spec,
+    indirect_sizes=None,
+    indirect_access_subs=None,
+    *,
+    repeat_info=None,
+):
     # Both parameters must be provided together for gather kernels — indirect_sizes
     # decomposes symbols in align_tensors; indirect_access_subs replaces them with IndirectAccess.
 
@@ -1701,19 +1970,22 @@ def simplify_op_spec(op_spec, indirect_sizes=None, indirect_access_subs=None):
         # symbol on both operands, so align_tensors matches them by that symbol.
         _restickify_restore_elided_dim(op_spec)
 
-    it_space = op_spec.iteration_space
     new_op_space_splits, new_tensors, work_division_remap = align_tensors(
-        it_space,
+        op_spec.iteration_space,
         [
             {"size": arg.device_size, "coordinates": arg.device_coordinates}
             for arg in op_spec.args
         ],
         indirect_sizes,
+        repeat_info=repeat_info,
     )
     op_spec.iteration_space = new_op_space_splits
 
     for arg, t in zip(op_spec.args, new_tensors):
-        _remap_work_division(arg, work_division_remap)
+        if arg.work_division is not None:
+            arg.work_division = remap_work_division(
+                arg.work_division, work_division_remap
+            )
         arg.device_size = t["size"]
         arg.device_coordinates = t["coordinates"]
 
@@ -1723,3 +1995,84 @@ def simplify_op_spec(op_spec, indirect_sizes=None, indirect_access_subs=None):
             arg.device_coordinates = [
                 c.xreplace(indirect_access_subs) for c in arg.device_coordinates
             ]
+
+    if op_spec.op in MATMUL_REDUCTION_OPS:
+        _restore_matmul_loop_order(op_spec)
+    _finalize_tensor_work_divisions(op_spec)
+    is_relayout = is_lx_relayout_identity(op_spec.op, op_spec.args, op_spec.op_info)
+    if is_relayout:
+        source, destination = (arg.work_division for arg in op_spec.args)
+        assert source is not None and destination is not None
+        _check_relayout_boundary(op_spec.iteration_space, source, destination)
+        op_spec.core_id_to_work_slice = dict(destination.core_id_to_work_slice)
+    else:
+        _finalize_core_mapping(op_spec, use_tensor_constraints=True)
+        for arg in op_spec.args:
+            arg.work_division = None
+
+
+def _restore_matmul_loop_order(op_spec: OpSpec) -> None:
+    """Make a matmul's reduction loop K its last loop again after alignment.
+
+    Inductor orders matmul loops batch, M, N, K. The K-fast core order, the SDSC
+    dim labels and the kernel provenance take K as the last loop. Alignment adds
+    a range-1 loop after K for each elided device dimension, and it puts this
+    loop in every tensor. Such a loop is a batch loop, so this step moves it to
+    the front. ``matmul_reduction_dim`` finds K from its role. The order does not
+    change when there is no single K, or when a tensor does not index a loop
+    after K. The readers then take the last loop as K.
+    """
+    reduction = matmul_reduction_dim(op_spec.iteration_space, op_spec.args)
+    if reduction is None:
+        logger.debug("%s: no single reduction loop; loop order kept", op_spec.op)
+        return
+    dims = list(op_spec.iteration_space)
+    trailing = dims[dims.index(reduction) + 1 :]
+    if not trailing:
+        return
+    for arg in op_spec.args:
+        indexed = {
+            symbol
+            for coordinate in arg.device_coordinates
+            for symbol in sympy.sympify(coordinate).free_symbols
+        }
+        if not indexed.issuperset(trailing):
+            logger.debug(
+                "%s: loops %s after K are not in every tensor; loop order kept",
+                op_spec.op,
+                trailing,
+            )
+            return
+    op_spec.iteration_space = {
+        dim: op_spec.iteration_space[dim]
+        for dim in trailing + dims[: dims.index(reduction) + 1]
+    }
+
+
+def _finalize_tensor_work_divisions(op_spec: OpSpec) -> None:
+    """Verify committed tensor owners in the final aligned iteration space."""
+    finalized = finalize_tensor_work_divisions(
+        op_spec.iteration_space,
+        [arg.work_division for arg in op_spec.args],
+    )
+    for arg, division in zip(op_spec.args, finalized):
+        arg.work_division = division
+
+
+def _finalize_core_mapping(
+    op_spec: OpSpec, *, use_tensor_constraints: bool = False
+) -> None:
+    """Assign physical cores from an OpSpec's final aligned dimensions."""
+
+    contiguous_dim = (
+        next(reversed(op_spec.iteration_space))
+        if op_spec.iteration_space
+        and op_spec.op in MATMUL_REDUCTION_OPS
+        and _spyre_config.core_id_k_fast_emission
+        else None
+    )
+    op_spec.core_id_to_work_slice = derive_operation_mapping(
+        op_spec.iteration_space,
+        [arg.work_division for arg in op_spec.args] if use_tensor_constraints else (),
+        contiguous_dim=contiguous_dim,
+    )

@@ -47,19 +47,36 @@ class Stream:
 
         # Get stream from pool via C++ binding
         self._cdata = _C.get_stream_from_pool(device, priority)
+        # Stack of streams displaced by __enter__, restored in __exit__.
+        # A stack (rather than a single slot) makes the context manager safe
+        # to re-enter with the same Stream instance, e.g. via
+        # `with s: with s: ...` or `torch_spyre.stream(s)`, which hands back
+        # the same object rather than a fresh context manager.
+        self._prev_streams: list[_C._SpyreStreamBase] = []
+
+    @classmethod
+    def _from_cdata(cls, cdata) -> "Stream":
+        """Wrap an existing C++ stream handle without going through
+        __init__ (which would allocate a new stream from the pool)."""
+        stream_obj = cls.__new__(cls)
+        stream_obj._cdata = cdata
+        stream_obj._prev_streams = []
+        return stream_obj
 
     def __enter__(self):
         """Enter stream context - set as current stream"""
         # Save previous stream
-        self._prev_stream = _C.current_stream(self.device())
+        self._prev_streams.append(_C.current_stream(self.device()))
         # Set this stream as current
         _C.set_current_stream(self._cdata)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Exit stream context - restore previous stream"""
+        if not self._prev_streams:
+            raise RuntimeError("Stream.__exit__ called without a matching __enter__")
         # Restore previous stream
-        _C.set_current_stream(self._prev_stream)
+        _C.set_current_stream(self._prev_streams.pop())
         return False
 
     def synchronize(self):
@@ -136,9 +153,7 @@ def current_stream(device: Optional[torch.device] = None) -> Stream:
     cdata = _C.current_stream(device)
 
     # Wrap in Python Stream object
-    stream_obj = Stream.__new__(Stream)
-    stream_obj._cdata = cdata
-    return stream_obj
+    return Stream._from_cdata(cdata)
 
 
 def default_stream(device: Optional[torch.device] = None) -> Stream:
@@ -158,9 +173,7 @@ def default_stream(device: Optional[torch.device] = None) -> Stream:
 
     cdata = _C.default_stream(device)
 
-    stream_obj = Stream.__new__(Stream)
-    stream_obj._cdata = cdata
-    return stream_obj
+    return Stream._from_cdata(cdata)
 
 
 def synchronize(device: Optional[torch.device] = None):

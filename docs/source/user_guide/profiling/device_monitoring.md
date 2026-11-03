@@ -12,9 +12,8 @@ tool directly — `aiu-smi --help` or `aiu-smi dmon --help`.
 
 ## Install
 
-`aiu-monitor` ships as a pre-built wheel from your internal IBM package
-mirror. Ask your Spyre enablement contact for the mirror location and
-access. The steps here describe the install pattern. They do not pin a
+`aiu-monitor` ships as a pre-built wheel through IBM distribution
+channels. The steps here describe the install pattern. They do not pin a
 specific URL.
 
 Wheel versions, package names, Python tags, and supported architectures

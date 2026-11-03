@@ -1,0 +1,142 @@
+name: Setup spyre-clickhouse-ingest
+description: >
+  The ONE place that locates (or sparse-checks-out) extensions/clickhouse-ingest plus a
+  caller's own ingest scripts, and installs them into a job-local venv. Extracted so the
+  push-*-to-clickhouse workflows stop each carrying their own near-identical copy of this
+  checkout+venv+pip-install sequence -- previously duplicated verbatim in three workflows,
+  none of which another repo could call without copying the whole job. Mirrors the
+  locate-then-sparse-checkout pattern ingest-xml-to-clickhouse and derive-gha-artifact-id
+  already use, so a caller in ANOTHER repo gets the same cross-repo path those two do.
+
+inputs:
+  extra-scripts:
+    description: >
+      Newline-separated .github/scripts/*.py paths the caller needs, beyond
+      extensions/clickhouse-ingest itself (which is always fetched). Determines both what
+      `locate` checks for on disk and what a fallback sparse-checkout lists.
+    required: true
+  extra-deps:
+    description: >
+      Extra space-separated pip packages beyond clickhouse-connect and regex, the two every
+      ingest script needs (clickhouse-ingest's own runtime deps -- see its pyproject.toml).
+    required: false
+    default: ''
+  script-repo:
+    description: >
+      Repository holding the canonical scripts and library, for the sparse-checkout fallback.
+      Consumers outside torch-spyre must keep this default -- without it the fallback checks
+      out the CALLING repo and finds no script.
+    required: false
+    default: torch-spyre/torch-spyre
+  script-ref:
+    description: >
+      Ref of script-repo to check out. Pin to a tag from another repo; the default tracks
+      that repo's default branch.
+    required: false
+    default: ''
+  torch-spyre-dir:
+    description: >
+      Fallback directory holding a torch-spyre checkout when the workspace does not already
+      have this ref's copy. Searched before a sparse-checkout, after $GITHUB_WORKSPACE.
+    required: false
+    default: ''
+
+outputs:
+  root:
+    description: >
+      Directory containing .github/scripts/... and extensions/clickhouse-ingest for this
+      call -- $GITHUB_WORKSPACE, torch-spyre-dir, or the fallback sparse-checkout. A caller
+      builds its own script paths as `$ {{ steps.X.outputs.root }}/.github/scripts/<name>.py`.
+    value: ${{ steps.locate.outputs.root || steps.fallback-root.outputs.root }}
+
+runs:
+  using: composite
+  steps:
+    # $GITHUB_WORKSPACE first, then torch-spyre-dir, never a prebaked tree ahead of either:
+    # a baked copy would pin the scripts to whatever commit built the image. All required
+    # paths must come from ONE candidate, or the scripts and the library could be different refs.
+    - name: Locate scripts and library
+      id: locate
+      shell: bash
+      env:
+        EXTRA_SCRIPTS: ${{ inputs.extra-scripts }}
+        TS_DIR: ${{ inputs.torch-spyre-dir }}
+      run: |
+        set -euo pipefail
+        FOUND=""
+        for base in "${GITHUB_WORKSPACE}" "${TS_DIR}"; do
+          [ -n "${base}" ] || continue
+          ok=true
+          [ -f "${base}/extensions/clickhouse-ingest/pyproject.toml" ] || ok=false
+          while IFS= read -r rel; do
+            [ -n "${rel}" ] || continue
+            [ -f "${base}/${rel}" ] || ok=false
+          done <<< "${EXTRA_SCRIPTS}"
+          if [ "${ok}" = "true" ]; then
+            FOUND="${base}"
+            break
+          fi
+        done
+        if [ -n "${FOUND}" ]; then
+          echo "Found scripts + library at ${FOUND}"
+          echo "root=${FOUND}" >> "$GITHUB_OUTPUT"
+          echo "need-checkout=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "Scripts/library not on disk — will sparse-checkout."
+          echo "need-checkout=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    # `path:` is load-bearing for callers outside torch-spyre: without it this overwrites the
+    # calling job's workspace, XML/logs it may already hold included.
+    - name: Checkout scripts and library (fallback)
+      if: steps.locate.outputs.need-checkout == 'true'
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      with:
+        repository: ${{ inputs.script-repo }}
+        ref: ${{ inputs.script-ref }}
+        path: .clickhouse-ingest-src
+        sparse-checkout: |
+          ${{ inputs.extra-scripts }}
+          extensions/clickhouse-ingest
+        sparse-checkout-cone-mode: false
+
+    - name: Set root (fallback)
+      if: steps.locate.outputs.need-checkout == 'true'
+      shell: bash
+      run: echo "root=${GITHUB_WORKSPACE}/.clickhouse-ingest-src" >> "$GITHUB_OUTPUT"
+      id: fallback-root
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      with:
+        # latest-known, not "latest": it resolves to the newest uv whose checksum is
+        # bundled INTO this setup-uv pin, resolved locally with no release lookup. A
+        # just-published release is not yet mirrored on releases.astral.sh, so "latest"
+        # 404s there and falls back to GitHub Releases, which rate-limits (429) once the
+        # fleet requests it concurrently. Bumping setup-uv moves this version forward.
+        version: latest-known
+
+    - name: Setup venv and install spyre-clickhouse-ingest
+      shell: bash
+      env:
+        ROOT: ${{ steps.locate.outputs.root }}
+        FALLBACK_ROOT: ${{ steps.fallback-root.outputs.root }}
+        EXTRA_DEPS: ${{ inputs.extra-deps }}
+      run: |
+        set -euo pipefail
+        ROOT="${ROOT:-${FALLBACK_ROOT}}"
+        CHLIB="${ROOT}/extensions/clickhouse-ingest"
+        if [ ! -f "${CHLIB}/pyproject.toml" ]; then
+          echo "::error::spyre-clickhouse-ingest not found at ${CHLIB} -- extra-scripts or" \
+               "script-repo/script-ref must resolve a tree that carries" \
+               "extensions/clickhouse-ingest alongside the requested scripts."
+          exit 1
+        fi
+        # Created in the workspace, NOT a baked shared venv, so this ingest's deps never
+        # perturb a dev image's own environment.
+        uv venv
+        source .venv/bin/activate
+        # Installed from the checkout, not a git URL, so the library is always the same
+        # commit as the scripts importing it.
+        # shellcheck disable=SC2086
+        uv pip install clickhouse-connect regex ${EXTRA_DEPS} "${CHLIB}"

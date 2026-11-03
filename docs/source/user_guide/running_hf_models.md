@@ -31,7 +31,7 @@ The loader reads the checkpoint's config, picks the adapter for that model
 family, and patches one live HF model instance. Everything Spyre executes
 natively stays as it is in `transformers`. Only the operations Spyre cannot
 run natively are swapped: RoPE becomes a precomputed rotation matmul because
-Spyre has no `sin`/`cos`, RMSNorm is patched to compute in the model's device
+Spyre has no native `sin`/`cos` instruction, RMSNorm is patched to compute in the model's device
 dtype rather than the float32 upcast stock HF uses, the LM head is padded to a
 stick-aligned vocab so work division fits the 256 MB per-core span limit, the
 decoder blocks become compiled `block_forward` functions with raw-tensor KV
@@ -52,6 +52,29 @@ vision tower and the text decoder for Spyre, so it accepts image input;
 vision tower, for text-only inference on the same checkpoint. The canonical
 per-adapter list of verified checkpoints is in the project's
 [ARCHITECTURE.md](https://github.com/torch-spyre/hf-adapters/blob/main/ARCHITECTURE.md#verified-checkpoints).
+
+## Weight loading and on-device layout
+
+Importing `torch_spyre` installs a wrapper around `safetensors.safe_open`
+(and the `get_tensor`/`get_tensors` accessors it returns). When a checkpoint
+is opened with `device="spyre"`, the wrapper assigns each weight a
+Spyre-aware on-device layout as it is read, rather than materializing a
+default-layout tensor on the host and restickifying it later. The layout is
+selected from the tensor's role, which the wrapper infers from its
+checkpoint key and shape:
+
+- Two-dimensional embedding weights whose hidden dimension is a multiple of
+  the dtype's stick width receive a gather-optimal layout for indirect access.
+  Tables that are not stick-aligned instead receive the default Spyre layout.
+- Two-dimensional Linear weights receive a matmul-optimal layout with
+  `dim_order=[1, 0]`.
+- Every other tensor receives the default Spyre layout.
+
+Weights load in `torch.float16` by default, which the host-to-device
+transfer requires. Pass an explicit `target_dtype` to override it. Because
+this path is on by default, a stock `transformers` or hf-adapters loader that
+opens a safetensors checkpoint with `device="spyre"` gets these layouts with
+no further configuration.
 
 ## Install
 
@@ -79,32 +102,37 @@ uv sync --group test
 
 Load a causal-LM with `AutoSpyreModelForCausalLM`. It reads the checkpoint's
 config, selects the matching adapter, prepares the model for Spyre, and moves
-it to the device. The tokenizer is the stock HF one.
+it to the device. The tokenizer is the stock HF one. See the
+[HuggingFace model example](https://github.com/torch-spyre/torch-spyre/blob/main/docs/source/user_guide/examples/hf_model.py) for a runnable version of
+the script below.
 
 ```python
 from hf_adapters import AutoSpyreModelForCausalLM
 from transformers import AutoTokenizer
 
-model = AutoSpyreModelForCausalLM.from_pretrained(
-    "ibm-granite/granite-3.3-8b-instruct"
-)
-tokenizer = AutoTokenizer.from_pretrained("ibm-granite/granite-3.3-8b-instruct")
+model_id = "ibm-granite/granite-3.3-8b-instruct"
+model = AutoSpyreModelForCausalLM.from_pretrained(model_id)
+tokenizer = AutoTokenizer.from_pretrained(model_id)
 
-outputs = model.generate(tokenizer, ["What is 2+2?"], max_new_tokens=128)
+inputs = tokenizer(["What is 2+2?"], return_tensors="pt", padding=True)
+sequences = model.generate(**inputs, max_new_tokens=128)
+outputs = tokenizer.batch_decode(
+    sequences[:, inputs["input_ids"].shape[1] :],
+    skip_special_tokens=True,
+)
 print(outputs[0])
 ```
 
-The `generate` method attached to the model is not the stock HF one. It runs a
-64-block padded decode loop and takes the tokenizer and a list of prompts
-rather than pre-tokenized `input_ids`. Its signature is
-`generate(tokenizer, prompts, max_new_tokens, do_sample=None,
-temperature=None, top_k=None, top_p=None, eos_token_id=..., timing=False)`.
-`max_new_tokens` is required. The sampling parameters default to `None` and
-resolve from the model's `generation_config` at call time, so the effective
-default follows `explicit kwarg > generation_config > HF global default`. See
+The only change from a stock Hugging Face script is the model class:
+`AutoSpyreModelForCausalLM` replaces `AutoModelForCausalLM`. Tokenization,
+generation arguments, and decoding follow the stock API. `model.generate()`
+takes pre-tokenized `input_ids` and an optional `attention_mask`, and returns a
+token tensor containing the input prefix followed by the generated tokens.
+`hf_adapters.encode_prompts()` is also available for model-aware tokenization;
+it applies the checkpoint's chat template for instruct models. See
 [docs/generate_vs_stock_hf.md](https://github.com/torch-spyre/hf-adapters/blob/main/docs/generate_vs_stock_hf.md)
-in the project for the full contract and how it differs from
-`transformers.generate`.
+in the project for the supported generation features and remaining differences
+from `transformers.generate`.
 
 ## Embedding models
 
@@ -163,24 +191,22 @@ batch = processor.apply_chat_template(
     return_tensors="pt",
 )
 
-texts = model.generate(
-    processor,
-    batch["input_ids"],
-    batch["attention_mask"],
-    batch["pixel_values"],
-    batch["image_sizes"],
-    max_new_tokens=64,
+sequences = model.generate(**batch, max_new_tokens=64)
+prompt_length = batch["input_ids"].shape[1]
+texts = processor.batch_decode(
+    sequences[:, prompt_length:],
+    skip_special_tokens=True,
 )
 print(texts[0])
 ```
 
-The multimodal `generate` takes the processor, the tokenized `input_ids` and
-`attention_mask`, and the image tensors, then runs the same padded decode loop
-as the text path. The extra image inputs vary by model: Granite Vision and
-Mistral3 Vision take `image_sizes` for anyres tiling, and Gemma 4 takes
-`image_position_ids` and `mm_token_type_ids`. Pass whatever the processor
-produced. To run only the text backbone of a multimodal checkpoint, load it
-with `AutoSpyreModelForCausalLM` instead, which discards the vision tower.
+The multimodal `generate` takes the processor's tokenized batch as keyword
+arguments and returns token sequences, following the same input and output
+conventions as the text path. Forward the entire batch so the model receives
+the inputs appropriate to that checkpoint, then decode the generated
+continuation with the processor. To run only the text backbone of a multimodal
+checkpoint, load it with `AutoSpyreModelForCausalLM` instead, which discards
+the vision tower.
 
 ## A note on numerical accuracy
 

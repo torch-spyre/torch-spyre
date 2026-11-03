@@ -60,11 +60,6 @@ ATOL = 0.05
 
 aten = torch.ops.aten
 
-# The compile-time failure the backend raises for an unsupported rounding mode.
-# Narrower than ``Exception`` so the rounding-mode xfails cannot mask an
-# unrelated break; see :func:`test_div_rounding_mode`.
-_DIV_MODE_ERROR = torch._inductor.exc.InductorError
-
 # (in-place packet, overload, scalar operand) for each registered arithmetic op.
 INPLACE_SCALAR = [
     (aten.mul_, "Scalar", 3.0),
@@ -198,10 +193,10 @@ def test_pow_inplace_is_not_paired_by_name():
     *swapped* operands, so pairing on the name alone would build a kernel that
     computes ``other ** self``. ``_functional_sibling``'s signature check
     rejects it. (Matching ``pow_.Scalar`` to ``pow.Tensor_Scalar`` by signature
-    would be operand-correct, but the device's functional ``pow`` is itself
-    wrong today -- ``torch.pow(2.0, 3.0)`` returns 16.0, and
-    ``pow.Tensor_Tensor`` raises "unimplemented operation pow" -- so the
-    conservative name requirement stays.)
+    would be operand-correct, but the other functional overloads are not usable:
+    ``pow.Scalar`` computes ``other ** self`` (``torch.pow(2.0, 3.0)`` returns
+    16.0) and ``pow.Tensor_Tensor`` raises "unimplemented operation pow" -- so
+    the conservative name requirement stays.)
     """
     from torch_spyre.ops import eager
 
@@ -212,7 +207,10 @@ def test_pow_inplace_is_not_paired_by_name():
         )
         assert not torch._C._dispatch_has_kernel_for_dispatch_key(
             op.name(), "PrivateUse1"
-        ), f"{op.name()} must not get a Spyre kernel while functional pow is wrong"
+        ), (
+            f"{op.name()} must not get a Spyre kernel; its same-named functional "
+            "overload has swapped operands"
+        )
 
 
 def test_relu_inplace_is_not_a_compiled_kernel():
@@ -290,22 +288,17 @@ def test_inplace_tensor_operand(packet):
     "rounding_mode",
     [
         None,
-        # 'floor'/'trunc' fail in the *functional* div kernel, independently of
-        # any in-place wrapper: torch.div(x, 3.0, rounding_mode='floor') raises
-        # InductorError("No FX node for buf1") for a scalar operand and
-        # "Cannot resolve target for 'div_rn'/'truediv'" for a tensor one. The
-        # in-place kernel inherits that gap; it does not introduce it.
-        #
-        # ``raises`` is the specific compile failure, not bare ``Exception``:
-        # these xfails must not double as a blanket licence for this path to
-        # break some other way. A wrong *value* or a failure in the derivation
-        # or ``copy_`` wrapper raises something else and still fails the suite,
+        "floor",
+        # 'trunc' fails in the *functional* div kernel, independently of any
+        # in-place wrapper. The in-place kernel inherits that gap; it does not
+        # introduce it.
+        # ``raises`` names the expected failure, not bare ``Exception``: these
+        # xfails must not double as a blanket licence for this path to break
+        # some other way. A wrong *value* or a failure in the derivation or
+        # ``copy_`` wrapper raises something else and still fails the suite,
         # while ``strict=True`` catches the day the kernel starts working.
         pytest.param(
-            "floor", marks=pytest.mark.xfail(raises=_DIV_MODE_ERROR, strict=True)
-        ),
-        pytest.param(
-            "trunc", marks=pytest.mark.xfail(raises=_DIV_MODE_ERROR, strict=True)
+            "trunc", marks=pytest.mark.xfail(raises=RuntimeError, strict=True)
         ),
     ],
     ids=lambda m: str(m),
@@ -318,10 +311,10 @@ def test_div_rounding_mode(rounding_mode, scalar_operand):
 
     These take a kwarg-only ``rounding_mode``; the kernel forwards ``**kwargs``
     to the functional op, and nothing else in this module exercises that path.
-    The ``rounding_mode=None`` case is the one the backend supports today; the
-    rounding modes are strict-xfail on the specific compile error so this starts
-    passing (and tells us) once the functional kernel gains support, while any
-    *other* failure on this path still fails the suite.
+    ``None`` and ``floor`` are supported by the backend today; ``trunc`` is
+    strict-xfail on the specific compile error so this starts passing (and tells
+    us) once the functional kernel gains support, while any *other* failure on
+    this path still fails the suite.
     """
     op = "div_"
     torch.manual_seed(4)

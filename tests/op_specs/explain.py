@@ -201,11 +201,11 @@ def _table(rows: list, headers: list, indent: str, pad: str = "") -> list:
 # ---------------------------------------------------------------------------
 
 
-def _title(kernel_name, specs, args, pool_bytes) -> list:
+def _title(kernel_name, specs, args, pool_size) -> list:
     n_ops = sum(1 for _ in _iter_op_specs(specs))
     n_args = len(args) if args else len(_kernel_arg_roles(specs))
     facts = f"{n_ops} OpSpec{'s' if n_ops != 1 else ''} - {n_args} kernel args"
-    facts += " - no pool" if not pool_bytes else f" - {pool_bytes}-byte pool"
+    facts += " - no pool" if not pool_size else f" - {pool_size}-byte pool"
     name = kernel_name or "(unnamed OpSpec list)"
     gap = WIDTH - 2 - len(name) - len(facts)
     if gap < 1:
@@ -218,23 +218,23 @@ def _title(kernel_name, specs, args, pool_bytes) -> list:
     return ["=" * WIDTH, *header, "=" * WIDTH, ""]
 
 
-def _kernel_args_section(specs, args, pool_bytes) -> list:
+def _kernel_args_section(specs, args, pool_size) -> list:
     """The tensors .run() receives, in arg_index order.
 
     ``args`` is optional: capture.py has the host shapes observed at launch,
     where a hand-written spec has only what the TensorArgs carry.
     """
     roles = _kernel_arg_roles(specs)
-    if not roles and not pool_bytes:
+    if not roles and not pool_size:
         return []
 
     caption = "what .run() receives, in arg_index order"
     header = "KERNEL ARGS" + " " * max(WIDTH - 11 - len(caption), 1) + caption
     lines = [header]
 
-    if pool_bytes:
+    if pool_size:
         lines.append(
-            f"  pool           {pool_bytes} bytes (uint8) -- passed first to .run()"
+            f"  pool           {pool_size} bytes -- allocated by the bundle, not an arg"
         )
 
     # Fall back to the TensorArgs when no observed-launch info was supplied.
@@ -577,7 +577,7 @@ def _walk(specs, depth, counter, n_ops, verbose) -> list:
     return lines
 
 
-def render(specs, *, kernel_name=None, args=None, pool_bytes=0, verbose=False) -> str:
+def render(specs, *, kernel_name=None, args=None, pool_size=0, verbose=False) -> str:
     """Return a human-readable explanation of an OpSpec list.
 
     ``specs`` is a list of OpSpec / LoopSpec / UnimplementedOp.  ``args``
@@ -586,8 +586,8 @@ def render(specs, *, kernel_name=None, args=None, pool_bytes=0, verbose=False) -
     """
     specs = list(specs)
     n_ops = sum(1 for _ in _iter_op_specs(specs))
-    lines = _title(kernel_name, specs, args, pool_bytes)
-    lines += _kernel_args_section(specs, args, pool_bytes)
+    lines = _title(kernel_name, specs, args, pool_size)
+    lines += _kernel_args_section(specs, args, pool_size)
     # 1-based: "OP 0/7" against an "of 7" denominator reads as an off-by-one.
     lines += _walk(specs, 0, [1], n_ops, verbose)
     return "\n".join(lines).rstrip() + "\n"

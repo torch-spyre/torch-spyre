@@ -12,17 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import math
 import time
 from collections.abc import Sequence
-from typing import Callable, Optional, cast
+from typing import ClassVar, Optional, cast
 
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionBuffer,
     CoreDivisionLayoutSolver,
     LifetimeBoundBuffer,
     MemoryPlanSolver,
-    ceil_div,
 )
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 
@@ -47,17 +47,64 @@ class ExhaustiveSearchSolver(CoreDivisionLayoutSolver):
     :meth:`plan_layout` call; ``cd_parent_matches`` (precomputed by
     :class:`CoOptimizingAllocator`) replaces the graph-level ``get_ncores`` check
     that was previously rerun per leaf on graph mutations.
+
+    The inner solver is a class parameter, so that the wrapper is a class the
+    allocator can ask about capabilities: build one with :meth:`wrapping`.
     """
+
+    _inner_factory: ClassVar[type[MemoryPlanSolver]]
+
+    @classmethod
+    @functools.cache
+    def wrapping(cls, inner: type[MemoryPlanSolver]) -> type["ExhaustiveSearchSolver"]:
+        """The exhaustive search over placements by ``inner``; one class per
+        ``inner``."""
+        name = f"{cls.__name__}[{inner.__name__}]"
+        namespace = {
+            "_inner_factory": inner,
+            # type() would take these from the frame creating the class,
+            # ABCMeta.__new__ in abc.py.
+            "__module__": cls.__module__,
+            "__qualname__": name,
+        }
+        return cast("type[ExhaustiveSearchSolver]", type(name, (cls,), namespace))
+
+    @classmethod
+    def supports_paired_buffers(cls) -> bool:
+        return False
+
+    @classmethod
+    def decides_lx_relayouts(cls) -> bool:
+        return False
+
+    @classmethod
+    def generates_divisions(cls) -> bool:
+        return False
+
+    @classmethod
+    def chooses_tilings(cls) -> bool:
+        return False
+
+    @classmethod
+    def tilings_from_menu(cls) -> bool:
+        return False
+
+    @classmethod
+    def linear_cost_only(cls) -> bool:
+        return False
 
     def __init__(
         self,
         buffers: Sequence[LifetimeBoundBuffer],
         size: int,
-        inner_factory: Callable[[Sequence[LifetimeBoundBuffer], int], MemoryPlanSolver],
         alignment: int = 128,
     ):
+        if not hasattr(type(self), "_inner_factory"):
+            raise TypeError(
+                "ExhaustiveSearchSolver needs an inner solver: use "
+                "ExhaustiveSearchSolver.wrapping(inner)"
+            )
         super().__init__(buffers, size, alignment)
-        self._inner_factory = inner_factory
 
     # ------------------------------------------------------------------
     # MemoryPlanSolver contract
@@ -76,10 +123,28 @@ class ExhaustiveSearchSolver(CoreDivisionLayoutSolver):
     # CoreDivisionLayoutSolver contract
     # ------------------------------------------------------------------
 
-    def plan_layout_and_core_divisions(self) -> list[CoreDivisionBuffer]:
+    def plan_layout_and_core_divisions(
+        self, cost_expr=None
+    ) -> list[CoreDivisionBuffer]:
+        # TODO: use cost_expr here
         buffers_list = cast("list[CoreDivisionBuffer]", self.buffers)
+        # This solver does not apply graph tiling. Direct callers must follow
+        # the allocator's untiled-only menu so reserved sizes match the graph.
+        if any(
+            not cd.tiling.is_untiled for b in buffers_list for cd in b.core_divisions
+        ):
+            raise ValueError("Exhaustive search requires untiled candidates")
 
         buf_by_name: dict[str, CoreDivisionBuffer] = {b.name: b for b in buffers_list}
+        children_by_parent: dict[
+            str, list[tuple[CoreDivisionBuffer, list[tuple[int, int]]]]
+        ] = {}
+        for child in buffers_list:
+            for parent_name in child.parents:
+                if parent_name in buf_by_name:
+                    children_by_parent.setdefault(parent_name, []).append(
+                        (child, child.cd_parent_matches.get(parent_name, []))
+                    )
 
         # CoreDivisionBuffer.size is the total device footprint (pre-division); that
         # is exactly the HBM cost when a buffer is not pinned to LX.
@@ -99,19 +164,20 @@ class ExhaustiveSearchSolver(CoreDivisionLayoutSolver):
 
             Starts from the pre-computed ``b.residency_reason`` (computed by
             :class:`CoOptimizingAllocator` with ``division_is_fixed=False``), then
-            adds the division-compatibility check via ``cd_parent_matches``: if no
-            (parent_div, ci) pair in ``cd_parent_matches[parent]`` matches the
-            parent's currently-chosen division, the per-core views disagree and the
-            buffer must spill.
+            adds the division-compatibility check via ``cd_parent_matches``. A
+            resident producer must match every consumer: if no
+            ``(producer_div, consumer_div)`` pair matches the selected divisions,
+            the producer spills so the consumer reads it correctly from HBM. This
+            is the same direction used by the CP-SAT and annealing solvers.
             """
             if b.residency_reason is not None:
                 return b.residency_reason
-            for p_name in b.parents:
-                if p_name not in buf_by_name:
-                    continue
-                pi = chosen[p_name]
-                pairs = b.cd_parent_matches.get(p_name, [])
-                if not any(pp == pi and pc == ci for pp, pc in pairs):
+            for child, pairs in children_by_parent.get(b.name, []):
+                child_division = chosen[child.name]
+                if not any(
+                    producer_division == ci and consumer_division == child_division
+                    for producer_division, consumer_division in pairs
+                ):
                     return "core div mismatch"
             return None
 
@@ -123,7 +189,7 @@ class ExhaustiveSearchSolver(CoreDivisionLayoutSolver):
             Only include parents whose per-core size is >= the child's under the
             respective chosen divisions so the assertion in the inner solver holds.
             """
-            b_per_core = ceil_div(b.size, b.core_divisions[ci].output_partition)
+            b_per_core = b.per_core_size(ci)
             valid = []
             for p_name in b.in_place_parents:
                 p = buf_by_name.get(p_name)
@@ -131,7 +197,7 @@ class ExhaustiveSearchSolver(CoreDivisionLayoutSolver):
                     valid.append(p_name)
                     continue
                 pi = chosen[p_name]
-                p_per_core = ceil_div(p.size, p.core_divisions[pi].output_partition)
+                p_per_core = p.per_core_size(pi)
                 if b_per_core <= p_per_core:
                     valid.append(p_name)
             return valid
@@ -140,13 +206,13 @@ class ExhaustiveSearchSolver(CoreDivisionLayoutSolver):
             return [
                 LifetimeBoundBuffer(
                     name=b.name,
-                    size=ceil_div(
-                        b.size, b.core_divisions[chosen[b.name]].output_partition
-                    ),
+                    size=b.per_core_size(chosen[b.name]),
                     uses=b.uses,
                     first_use_is_read=b.first_use_is_read,
                     in_place_parents=_valid_inplace_parents(b, chosen[b.name]),
                     residency_reason=_residency_reason(b, chosen[b.name]),
+                    lifetime_start_override=b.lifetime_start_override,
+                    lifetime_end_override=b.lifetime_end_override,
                 )
                 for b in buffers_list
             ]
@@ -178,6 +244,7 @@ class ExhaustiveSearchSolver(CoreDivisionLayoutSolver):
         t_search = time.perf_counter() - t1
 
         n_paths = math.prod(len(b.core_divisions) for b in buffers_list)
+
         winner = {
             b.name: b.core_divisions[best_chosen[b.name]].label
             for b in variable_buffers
@@ -198,8 +265,9 @@ class ExhaustiveSearchSolver(CoreDivisionLayoutSolver):
         final_solver = self._inner_factory(_make_temp_bufs(), self.limit)
         final_alloc = final_solver.plan_layout()
         addr_by_name = {a.name: a.address for a in final_alloc}
+        reason_by_name = {a.name: a.spill_reason for a in final_alloc}
         for b in buffers_list:
             b.address = addr_by_name.get(b.name)
+            b.spill_reason = reason_by_name.get(b.name)
 
-        self.spill_reasons = dict(final_solver.spill_reasons)
         return buffers_list

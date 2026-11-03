@@ -174,10 +174,10 @@ that the Deeptools backend turns into a device binary.
 import torch
 import torch_spyre  # registers the device
 
-model = ...                     # any nn.Module
+model = ...  # any nn.Module
 model = model.to("spyre")
 compiled = torch.compile(model)  # routed to the Spyre backend by device
-out = compiled(x.to("spyre"))   # this is the fast path
+out = compiled(x.to("spyre"))  # this is the fast path
 ```
 
 If you only want to *test that something runs*, the eager path is fine.
@@ -214,9 +214,10 @@ ops; custom ops lower to SuperDSC; everything else falls back to the CPU.
    `spyre::layer_norm`, `spyre::gelu`).
 3. **Decompositions** — FX rewrites that turn an ATen op into a
    sequence of native or custom ops (e.g. `aten.addmm` →
-   `matmul + scale + add`).
+   `matmul + scale + add`, `aten.cos`/`aten.sin` → range reduction
+   plus a Taylor polynomial).
 4. **CPU fallback** — auto-transfer for the long tail (`embedding`,
-   `arange`, `sin`, `cos`, `tril`, `triu`, ...). Transparent, but
+   `arange`, `cumsum`, `tril`, ...). Transparent, but
    off the hot path only.
 
 When debugging slow models, the first question to ask is whether
@@ -272,14 +273,20 @@ Each box is a distinct IR. The pass between two boxes is named above the arrow: 
   consumes. SpyreCode is the runtime interface that turns a compiled
   kernel IR into device execution. See [Runtime](../runtime/index.md).
 
-### Named dimensions and tiling hints
+### Tiling loops and named dimensions
 
-Working set reduction is driven by **named dimensions**. User code
-declares dimension names with `declare_tensor_dim`, attaches them to
-input tensors with `name_tensor_dims`, and tiles them inside a
-`with spyre_hint(tiles={...}):` scope. Hints are lexically scoped, can
-be nested, and compose by intersection of the op's iteration dimensions
-with each enclosing hint's tile dict. Full details and examples are in
+Working set reduction is expressed with `for_each_tile`: one explicit,
+co-indexed tiling loop whose body sees one tile of each operand per trip.
+A loop that only maps (each trip writes its own slice of the result)
+and a loop that carries a value (a split-K accumulation, an online softmax)
+use the same call, and two calls compose into a nested loop. `for_each_tile`
+needs the enclosing function compiled with `fullgraph=True`.
+
+Named dimensions are separate and optional. User code declares dimension
+names with `declare_tensor_dim` and attaches them to input tensors with
+`name_tensor_dims` so that a `with spyre_hint(work_div={...}):` scope can
+control how an operation's iteration space is divided across cores.
+Full details and examples are in
 [Working Set Reduction](../compiler/working_set_reduction.md).
 
 For the full pipeline reference, see
@@ -315,6 +322,7 @@ implementations. Granite 3.3 8B runs in production this way:
 
 ```python
 from fms.models import get_model
+
 model = get_model("granite", "3.3-8b-instruct", device_type="spyre")
 compiled = torch.compile(model)
 ```
@@ -343,7 +351,7 @@ Constraints that show up as compile-time errors or unexpected behavior:
 | **No HW scalar immediates** | Scalar constants in the FX graph are rewritten to size-1 tensors via `spyre::constant`. |
 | **Indivisible reduction dims** | Some reduction dimensions cannot be split across cores; work distribution honors this. |
 | **Static shapes** | Dynamic shapes are work-in-progress. Shape-polymorphic models may recompile per shape. |
-| **Per-core memory span (255.996 MiB)** | Each core's contiguous device-memory footprint must fit within 255.996 MiB of addressable range. Separate from the 2 MB LX scratchpad capacity. |
+| **Per-core memory span (256 MB)** | Each core's contiguous device-memory footprint must fit within 256 MB of addressable range. Separate from the 2 MB LX scratchpad capacity. |
 | **fp16 default** | int64 is down-cast to int32 with a warning. Set `TORCH_SPYRE_DOWNCAST_WARN=0` to suppress. |
 | **`SENCORES=32`** | Default core count; lowering it for debugging changes work-division decisions. |
 

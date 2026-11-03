@@ -35,6 +35,19 @@ DTYPE_MAP = {
 }
 
 
+# Ops whose output holds uninitialized memory. Their element values are
+# non-deterministic, so CPU and Spyre results can never be compared by value;
+# only tensor metadata (shape, dtype, layout) is checked for these.
+UNINITIALIZED_OUTPUT_OPS = {
+    "torch.empty",
+    "torch.empty_like",
+    "torch.empty_strided",
+    "torch.empty_permuted",
+    "torch.new_empty",
+    "torch.new_empty_strided",
+}
+
+
 def parse_py_value(expr: str):
     """
     Safely parse a restricted Python literal expression used in YAML.
@@ -85,9 +98,12 @@ def make_tensor_from_conf(
     init_args = dict(tconf.get("init_args", {}))
 
     with torch.random.fork_rng(devices=[]):
-        assert init == "rand" or init == "randint" or init == "xavier", (
-            f"Unknown init: {init}"
-        )
+        assert (
+            init == "rand"
+            or init == "randint"
+            or init == "xavier"
+            or init == "cumsum_offsets"
+        ), f"Unknown init: {init}"
         if seed is not None:
             torch.manual_seed(int(seed))
         if init == "rand":
@@ -114,6 +130,19 @@ def make_tensor_from_conf(
             t = torch.nn.init.xavier_uniform_(
                 torch.empty(tuple(shape), dtype=dtype, device="cpu")
             )
+        elif init == "cumsum_offsets":
+            # for torch._grouped_mm
+            total = int(init_args.get("total", -1))
+            if total < 0:
+                raise ValueError(
+                    "Invalid value (total for cumsum_offsets): must be provided (via init_args) and must be positive"
+                )
+            counts = torch.zeros(shape[0], dtype=dtype, device="cpu")
+            counts.scatter_add_(
+                0, torch.randint(0, shape[0], (total,)), torch.ones(total, dtype=dtype)
+            )
+            t = torch.cumsum(counts, dim=0, dtype=dtype)
+            assert t[-1] == total
         else:
             raise ValueError(f"Unknown init: {init}")
 
@@ -168,6 +197,41 @@ def _normalize_out(out: Any) -> Any:
     return out
 
 
+def _assert_same_metadata(
+    testCase,
+    ref_out: torch.Tensor,
+    test_out: torch.Tensor,
+    *,
+    case_name: str,
+    description,
+) -> None:
+    """
+    Compare tensor metadata only, ignoring the element values.
+
+    Used for ops such as ``torch.empty_like`` whose output holds
+    uninitialized memory: the values are non-deterministic by definition, so
+    only shape/dtype/layout are meaningful to check.
+    """
+    mismatches = []
+    if tuple(test_out.shape) != tuple(ref_out.shape):
+        mismatches.append(
+            f"shape: expected {tuple(ref_out.shape)}, got {tuple(test_out.shape)}"
+        )
+    if test_out.dtype != ref_out.dtype:
+        mismatches.append(f"dtype: expected {ref_out.dtype}, got {test_out.dtype}")
+    if test_out.layout != ref_out.layout:
+        mismatches.append(f"layout: expected {ref_out.layout}, got {test_out.layout}")
+
+    if mismatches:
+        details = "\n".join(mismatches)
+        raise AssertionError(
+            f"{case_name} FAILED since output metadata does not match the "
+            f"expected result\n"
+            f"{details}\n"
+            f"location in a model: {description}\n"
+        )
+
+
 def _assert_same(
     testCase,
     ref_out: Any,
@@ -177,11 +241,21 @@ def _assert_same(
     atol: float,
     case_name: str,
     description,
+    metadata_only: bool = False,
 ) -> None:
     ref_out = _normalize_out(ref_out)
     test_out = _normalize_out(test_out)
 
     if torch.is_tensor(ref_out):
+        if metadata_only:
+            _assert_same_metadata(
+                testCase,
+                ref_out,
+                test_out,
+                case_name=case_name,
+                description=description,
+            )
+            return
         try:
             testCase.assertEqual(test_out, ref_out, atol=atol, rtol=rtol)
         except AssertionError as e:
@@ -204,7 +278,12 @@ def _assert_same(
                 atol=atol,
                 case_name=case_name,
                 description=description,
+                metadata_only=metadata_only,
             )
+        return
+
+    if metadata_only:
+        assert type(test_out) is type(ref_out)
         return
 
     assert test_out == ref_out
@@ -265,6 +344,11 @@ def parse_dtype(spec) -> torch.dtype:
     )
 
 
+# Seed offset for kwmap tensors, kept clear of the per-input seed range
+# (seed + i * 1000) so kwmap and inputs never draw identical data.
+KWMAP_SEED_OFFSET = 1_000_000
+
+
 def make_SampleInput(
     case: Dict[str, Any], seed, dtype: torch.dtype, test_device: torch.device
 ) -> SampleInput:
@@ -293,15 +377,22 @@ def make_SampleInput(
         elif "value" in inp:
             val = inp["value"]
             if isinstance(val, str):
-                try:
-                    val = ast.literal_eval(val)
-                except (ValueError, SyntaxError):
-                    pass
-                # if test target is tensor.to("cuda:0"), replace "cuda:0" with test_device
                 op_name = case.get("op")
-                if test_device is not None and op_name == "torch.to":
-                    if "cuda" in val:
+                # For tensor.to(...), a string value is either a device
+                # ("cuda:0") or a dtype ("torch.float32"). ast.literal_eval
+                # cannot parse either, so resolve them explicitly.
+                if op_name == "torch.to":
+                    if val.startswith("torch.") and not val.startswith(
+                        ("torch.cuda", "torch.cpu")
+                    ):
+                        val = parse_dtype(val)
+                    elif test_device is not None and "cuda" in val:
                         val = test_device
+                else:
+                    try:
+                        val = ast.literal_eval(val)
+                    except (ValueError, SyntaxError):
+                        pass
             cpu_args.append(val)  # python scalar or list, etc.
         elif "py" in inp:
             cpu_args.append(parse_py_value(inp["py"]))
@@ -309,8 +400,38 @@ def make_SampleInput(
             raise ValueError(f"Unknown input entry: {inp}")
 
     attrs: dict[Any, Any] = dict(case.get("attrs", {}))
-    for key, value in case.get("kwmap", {}).items():
-        if key == "dtype":
+    # kwmap tensors get seeds from a separate block so they never collide with
+    # the per-input seeds derived above (seed + i * 1000).
+    kwmap_seed_base = None if seed is None else int(seed) + KWMAP_SEED_OFFSET
+    for k, (key, value) in enumerate(case.get("kwmap", {}).items()):
+        kw_seed = None if kwmap_seed_base is None else kwmap_seed_base + k * 1000
+
+        # A kwmap value may be a tensor spec using the same schema as an
+        # "inputs" entry, e.g.
+        #   kwmap:
+        #     offs:
+        #       tensor:
+        #         shape: [1, 24]
+        #         stride: [24, 1]
+        #         dtype: torch.float32
+        #         init: rand
+        if isinstance(value, dict) and "tensor" in value:
+            tensor_conf = value["tensor"]
+            value = make_tensor_from_conf(
+                tensor_conf,
+                dtype=parse_dtype(tensor_conf.get("dtype", dtype_str)),
+                seed=kw_seed,
+            )
+        elif isinstance(value, dict) and "tensor_list" in value:
+            value = [
+                make_tensor_from_conf(
+                    t,
+                    dtype=parse_dtype(t.get("dtype", dtype_str)),
+                    seed=(None if kw_seed is None else kw_seed + j),
+                )
+                for j, t in enumerate(value["tensor_list"])
+            ]
+        elif key == "dtype":
             value = parse_dtype(value)
         else:
             if isinstance(value, str):
@@ -426,4 +547,5 @@ def run_test(
         atol=atol,
         case_name=case_name,
         description=description,
+        metadata_only=op_name in UNINITIALIZED_OUTPUT_OPS,
     )

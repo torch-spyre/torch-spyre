@@ -7,8 +7,10 @@ Two modes are available:
 
 1. **CPU-only** — no extra install; measures host-side Python and
    `torch.compile` activity.
-2. **CPU + PrivateUse1** — measures CPU *and* Spyre-side kernel activity;
-   requires the [`kineto-spyre`][kineto-spyre] PyTorch wheel.
+2. **CPU + PrivateUse1** — measures CPU *and* Spyre-side kernel activity.
+   No extra install either: the AIUPTI/Kineto activity-tracing support is
+   built directly into `torch_spyre`'s native extension (gated by the
+   `USE_SPYRE_PROFILER` build flag, on by default).
 
 ## CPU-only (no extra install)
 
@@ -29,16 +31,7 @@ Inductor stage.
 
 ## CPU + PrivateUse1
 
-Install a matching [`kineto-spyre`][kineto-spyre] wheel for your
-PyTorch version (check the [releases page][kineto-spyre-releases] for
-the current combination). Example URL for PyTorch 2.10.0:
-
-```bash
-uv pip install --no-deps --force-reinstall \
-  https://github.com/IBM/kineto-spyre/releases/download/torch-2.10.0.aiu.kineto.1.1.1/torch-2.10.0+aiu.kineto.1.1.1-cp312-cp312-linux_x86_64.whl
-```
-
-Then profile with `ProfilerActivity.PrivateUse1`:
+Profile with `ProfilerActivity.PrivateUse1`:
 
 ```python
 import torch
@@ -56,19 +49,62 @@ with profile(
 ### Print aggregates
 
 ```python
-print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=10).replace("CUDA", "AIU"))
-print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10).replace("CUDA", "AIU"))
+print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=10))
+print(prof.key_averages().table(sort_by="device_time_total", row_limit=10))
 ```
 
-The `.replace("CUDA", "AIU")` is a cosmetic workaround — the profiler's
-internal column category is still named after CUDA; native renaming is
-on the roadmap.
+The table groups time by operator. `Self CPU` is host-side time spent
+in the operator itself. `SPYRE total` is the device-side time attributed
+to it. The layout looks like this:
+
+```text
+---------------------------  ------------  ------------  ------------  ------------
+                       Name     Self CPU     CPU total   SPYRE total    # of Calls
+---------------------------  ------------  ------------  ------------  ------------
+             aten::mm          1.20ms         4.80ms        9.30ms            96
+      aten::scaled_dot_...     0.40ms         2.10ms        3.70ms            48
+             aten::add         0.30ms         0.90ms        0.80ms           192
+    TorchDynamo Cache Lookup   0.05ms         0.05ms        0.00ms             1
+---------------------------  ------------  ------------  ------------  ------------
+Self CPU time total: 6.40ms
+Self SPYRE time total: 14.10ms
+```
+
+The values above are illustrative. Absolute numbers depend on the model,
+the batch and sequence configuration, and the build. Read the shape, not
+the magnitudes: a large `SPYRE total` next to a small `Self CPU` marks a
+device-bound operator (`aten::mm` here), which is the expected profile
+for compute-heavy matmul layers.
 
 ### Export a trace for viewers
 
 ```python
 prof.export_chrome_trace("spyre_trace.json")
 ```
+
+The standard Kineto export includes CPU-to-`aiuSubmitToHardware` flow arrows,
+using external correlation IDs carried through the runtime queue. Each
+submission has a zero-duration `aiuCpuLaunch` marker on its originating CPU
+operation's lane and timestamp. These markers allow one CPU operation to link
+to multiple hardware batches without changing the CPU operation or its timing.
+Separate flows connect the nested `aiuLaunchControlBlocks` (or DMI/DMO launch)
+to the device activity.
+
+Missing CPU origins, calibration traffic, and correlation IDs that Kineto's
+32-bit lookup cannot represent do not receive CPU-to-submit arrows. The full
+external correlation ID remains in the runtime event metadata. No links are
+inferred from timestamp proximity.
+
+JSON, `.json.gz`, and scheduled exports all use the normal PyTorch API, for
+example `on_trace_ready=lambda p: p.export_chrome_trace(f"trace-{p.step_num}.json")`.
+
+Runtime activities use OS thread IDs, matching PyTorch's CPU lanes. Calibration
+activities share a logical `Spyre calibration (device N)` lane; their
+`host_thread` metadata preserves the actual emitting thread. Its DMA activity
+is calibration traffic, not model input transfer.
+
+These runtime records require matching Flex, libaiupti, and torch-spyre builds.
+Rebuild all three together after changing the activity record layout.
 
 See [Trace analysis](trace_analysis.md) for viewing.
 
@@ -126,6 +162,49 @@ metadata:
   IDs are strings, and JavaScript consumers must keep them as strings rather
   than coercing them to numbers.
 
+Kernel and memcpy events include `args.timestamp_source`, with the value
+`calibrated` or `estimated (host completion, 1 ns/tick)`. Before device clock
+calibration is ready, the decoder estimates placement by anchoring elapsed device
+ticks (assuming 1 ns per tick) at host completion; absolute placement is approximate.
+Use `FLEX_TIMESTAMP_CALIBRATION=always` before initializing the device to start
+calibration during model loading/warmup when calibrated timings are needed from
+the beginning of the capture. The default starts calibration on a profiling session.
+
+Memory management events use `args.timestamp_source = "host"`. This includes
+`Memset (Device)` (libaiupti's representation of memory allocation),
+`Memory (Release)`, and the `[memory]` instant events. Their timestamps come from
+the host clock and do not depend on device-clock calibration. Libaiupti's memset
+and memory records therefore do not carry the `timestamps_estimated` flag used
+by compute and memcpy records.
+
+Kernel events (and, once counters are available, memcpy events) carry
+`args.cycles_ts`, a JSON array of five raw device timestamps
+`[TS1, TS2, TS3, TS4, TS5]` recorded at the pipeline stage boundaries:
+
+| Slot | Stage boundary |
+|---|---|
+| TS1 | DMI begin |
+| TS2 | DMI end / PREP begin |
+| TS3 | CMPT begin |
+| TS4 | CMPT end / DMO begin |
+| TS5 | DMO end |
+
+- Values are raw readings of a 32-bit free-running device counter. The
+  counter wraps and is not reset per job. Values are not calibrated to host
+  time, so they fit exactly in a JSON number.
+- A slot reads 0 when the pipeline does not fill it. A compute pipeline fills
+  TS1–TS5, an async DMAI fills only TS1–TS2, and an async DMAO fills only
+  TS4–TS5.
+- Kernel events always carry the key. An all-zero array on a kernel event
+  means the counters failed, not that they are unavailable.
+- On memcpy events the key is optional: it is present only when the record
+  has counters, and omitted when all five slots are 0. flex currently
+  reports DMA transfers without counters, so memcpy events do not carry it
+  yet. Memset and memory-release events never carry it.
+- Do not assume raw ordering. Skip zero slots and compare the remaining
+  slots modulo 2^32, because a later stage can read a smaller value after a
+  wrap.
+
 The key-bearing event name remains the compatibility join for raw traces and
 name-only consumers. The trace does not embed source locations or full
 transformation lineage. Durable source attribution requires pairing it with
@@ -140,17 +219,26 @@ wrong attribution rather than an explicit missing join.
 
 ## Advanced features
 
-Full reference lives in the upstream
+The full reference is in the upstream
 [PyTorch profiler documentation][torch-profiler-docs]:
 
-- `record_function` — annotate named spans
-- `schedule` — skip warmup, sample a bounded window
-- `on_trace_ready` — stream to TensorBoard-compatible JSON
-- `with_stack` — include file and line for Python ops
+- `record_function`: annotate named spans
+- `schedule`: skip warmup, sample a bounded window
+- `on_trace_ready`: stream to TensorBoard-compatible JSON
+- `with_stack`: include file and line for Python ops
 
-## Known issues (from torch-spyre-docs)
+## Communication events
 
-- **Multi-AIU communication profiling is not supported yet.**
+Queue waits, manager setup, HDMA resets, and socket barriers have separate
+`aiuComms*` spans.
+
+Host-side communication spans emitted by spyre-comms appear in the trace
+under `aiuComms*` names. Collectives such as allreduce, allgather, and
+broadcast, together with the send, receive, and transfer operations beneath
+them, are recorded alongside compute kernels on multi-AIU runs. These spans and
+the per-launch `aiuSubmitToHardware` marker are host-side runtime activities, so
+they render on `Thread {N}` rows rather than the `Stream {N}` compute rows; see
+[Trace analysis](trace_analysis.md) for the row layout.
 
 ## See also
 
@@ -158,6 +246,4 @@ Full reference lives in the upstream
 - [Device monitoring](device_monitoring.md) — `aiu-smi` telemetry
   alongside `torch.profiler`
 
-[kineto-spyre]: https://github.com/IBM/kineto-spyre
-[kineto-spyre-releases]: https://github.com/IBM/kineto-spyre/releases
 [torch-profiler-docs]: https://pytorch.org/docs/stable/profiler.html

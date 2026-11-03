@@ -1,0 +1,1354 @@
+# Copyright 2026 The Torch-Spyre Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Tests for the SDPA decomposition and its tiling cost model."""
+
+import dataclasses
+import sys
+import unittest
+from unittest import mock
+
+import torch
+import torch.nn.functional as F
+from torch._inductor.test_case import fresh_cache
+from torch._inductor.utils import run_and_get_code
+
+from torch_spyre._C import SpyreTensorLayout, get_device_dtype
+
+_decompositions = sys.modules["torch_spyre._inductor.decompositions"]
+_select_sdpa_tiling = _decompositions._select_sdpa_tiling
+_axis_slice_is_dense = _decompositions._axis_slice_is_dense
+_sdpa_kv_candidates = _decompositions._sdpa_kv_candidates
+_sdpa_mask_hbm_bytes = _decompositions._sdpa_mask_hbm_bytes
+_sdpa_estimated_live_bytes_per_core = (
+    _decompositions._sdpa_estimated_live_bytes_per_core
+)
+_sdpa_has_loop_boundary = _decompositions._sdpa_has_loop_boundary
+_num_tiles_for_max_extent = _decompositions._num_tiles_for_max_extent
+_sdpa_num_batch_tiles = _decompositions._sdpa_num_batch_tiles
+
+
+class TestSDPATiling(unittest.TestCase):
+    _LX_BUDGET = 1_625_344
+
+    def _select(
+        self,
+        *,
+        batch_size=1,
+        num_heads=12,
+        num_kvheads=12,
+        max_seqlen_q=512,
+        max_seqlen_kv=512,
+        head_dim=128,
+        element_size=2,
+        num_cores=32,
+        lx_budget_bytes=_LX_BUDGET,
+        mask_shapes=(),
+        head_tile_staging_bytes=0,
+    ):
+        return _select_sdpa_tiling(
+            batch_size=batch_size,
+            num_heads=num_heads,
+            num_kvheads=num_kvheads,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_kv=max_seqlen_kv,
+            head_dim=head_dim,
+            element_size=element_size,
+            num_cores=num_cores,
+            lx_budget_bytes=lx_budget_bytes,
+            mask_shapes=mask_shapes,
+            head_tile_staging_bytes=head_tile_staging_bytes,
+        )
+
+    def _select_production_gqa(
+        self,
+        *,
+        num_heads,
+        num_kvheads,
+        max_seqlen_q,
+        max_seqlen_kv,
+        head_dim,
+        batch_size=1,
+        element_size=2,
+    ):
+        """Model the adapter's broadcast mask and interleaved B/S/H/D inputs."""
+        mask_shape = (
+            batch_size,
+            1,
+            1,
+            max_seqlen_q,
+            max_seqlen_kv,
+        )
+        query_bytes = batch_size * num_heads * max_seqlen_q * head_dim * element_size
+        one_kv_bytes = (
+            batch_size * num_kvheads * max_seqlen_kv * head_dim * element_size
+        )
+        # A head tile of an interleaved input needs a read and a staging write
+        # for K and V; restoring the output query layout has the same two sides.
+        head_tile_staging_bytes = 2 * (2 * one_kv_bytes + query_bytes)
+        return self._select(
+            batch_size=batch_size,
+            num_heads=num_heads,
+            num_kvheads=num_kvheads,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_kv=max_seqlen_kv,
+            head_dim=head_dim,
+            element_size=element_size,
+            mask_shapes=(mask_shape,),
+            head_tile_staging_bytes=head_tile_staging_bytes,
+        )
+
+    def test_exact_tile_search_is_bounded_and_returns_a_valid_split(self):
+        sequence_lengths = (*range(1, 258), 509, 512, 9973)
+        max_extents = (1, 2, 3, 7, 31, 63, 64, 65, 127, 128, 511, 512)
+        alignments = (1, 2, 3, 32, 64, 128, 1024)
+
+        for sequence_length in sequence_lengths:
+            for max_extent in max_extents:
+                for alignment in alignments:
+                    num_tiles = _num_tiles_for_max_extent(
+                        sequence_length,
+                        max_extent,
+                        tile_alignment=alignment,
+                    )
+                    tile_size = sequence_length // num_tiles
+                    alignment_is_possible = (
+                        sequence_length % alignment == 0 and max_extent >= alignment
+                    )
+
+                    self.assertLessEqual(num_tiles, sequence_length)
+                    self.assertEqual(sequence_length % num_tiles, 0)
+                    self.assertLessEqual(tile_size, max_extent)
+                    if alignment_is_possible:
+                        self.assertEqual(tile_size % alignment, 0)
+
+    def test_exact_tile_search_rejects_nonpositive_inputs(self):
+        for sequence_length, max_extent, alignment in (
+            (0, 64, 64),
+            (-1, 64, 64),
+            (64, 0, 64),
+            (64, -1, 64),
+            (64, 64, 0),
+            (64, 64, -1),
+        ):
+            with self.assertRaises(ValueError):
+                _num_tiles_for_max_extent(
+                    sequence_length,
+                    max_extent,
+                    tile_alignment=alignment,
+                )
+
+    def test_mha_uses_one_block_and_all_available_cores(self):
+        config = self._select(head_dim=64)
+
+        self.assertEqual(config.strategy, "work_divided")
+        self.assertEqual(config.kv_block_size, 512)
+        self.assertEqual(config.num_kv_blocks, 1)
+        self.assertEqual(config.num_q_tiles, 1)
+        self.assertEqual(config.num_head_tiles, 1)
+        self.assertEqual(config.num_group_tiles, 1)
+        self.assertEqual(config.estimated_active_cores, 32)
+        self.assertEqual(config.estimated_load_bursts, 2)
+        self.assertEqual(config.score_bytes_per_core, 192 * 1024)
+        # The direct prefill body keeps QK^T and its exponentials co-live.
+        self.assertEqual(config.estimated_live_bytes_per_core, 336640 + 192 * 1024)
+
+    def test_encoder_pooling_shape_avoids_serial_hop_tiling(self):
+        # Issue #4784: granite-embedding-278m's pooling path supplies
+        # interleaved B/L/H/D inputs and a broadcast key-padding mask.
+        tensor_bytes = 4 * 12 * 512 * 64 * 2
+        config = self._select(
+            batch_size=4,
+            head_dim=64,
+            mask_shapes=((4, 1, 1, 512),),
+            # Read+write staging for Q, K, and V when H is tiled.
+            head_tile_staging_bytes=6 * tensor_bytes,
+        )
+
+        self.assertEqual(config.strategy, "work_divided")
+        self.assertEqual(config.kv_block_size, 512)
+        self.assertEqual(config.num_kv_blocks, 1)
+        self.assertEqual(config.num_batch_tiles, 1)
+        self.assertEqual(config.num_head_tiles, 1)
+        self.assertEqual(config.num_group_tiles, 1)
+        self.assertEqual(config.num_q_tiles, 1)
+        self.assertEqual(config.estimated_active_cores, 32)
+        self.assertEqual(config.score_bytes_per_core, 768 * 1024)
+        self.assertEqual(config.estimated_live_bytes_per_core, 1182720 + 768 * 1024)
+        # Both scores fit LX, so the direct body stays admissible.
+        self.assertEqual(config.estimated_spill_buffers, 0)
+
+    def test_loop_free_live_set_is_independent_of_attention_geometry(self):
+        kwargs = dict(
+            batch_size=1,
+            heads_per_core=2,
+            query_rows_per_core=1,
+            kv_block_size=512,
+            head_dim=256,
+            element_size=2,
+            has_loop_boundary=False,
+        )
+        score_bytes, direct_live_bytes = _sdpa_estimated_live_bytes_per_core(
+            **kwargs,
+            full_sdpa_prefill=False,
+        )
+        _, prefill_live_bytes = _sdpa_estimated_live_bytes_per_core(
+            **kwargs,
+            full_sdpa_prefill=True,
+        )
+        query_bytes = 2 * 1 * 256 * 2
+        accumulator_bytes = 2 * 1 * 2
+
+        self.assertEqual(
+            direct_live_bytes,
+            score_bytes + 3 * query_bytes + 2 * accumulator_bytes,
+        )
+        # Full prefill keeps QK^T and its exponentials co-live.
+        self.assertEqual(prefill_live_bytes, direct_live_bytes + score_bytes)
+
+    def test_grouped_decode_uses_effective_loop_counts(self):
+        for num_heads, num_kvheads, kv_length, head_dim in (
+            (32, 8, 128, 128),
+            (16, 8, 512, 256),
+        ):
+            with self.subTest(
+                num_heads=num_heads,
+                num_kvheads=num_kvheads,
+                kv_length=kv_length,
+            ):
+                config = self._select(
+                    num_heads=num_heads,
+                    num_kvheads=num_kvheads,
+                    max_seqlen_q=1,
+                    max_seqlen_kv=kv_length,
+                    head_dim=head_dim,
+                )
+
+                self.assertGreater(config.num_group_tiles, 1)
+                self.assertEqual(config.num_kv_blocks, 1)
+                self.assertFalse(
+                    _sdpa_has_loop_boundary(
+                        num_non_group_outer_tiles=(
+                            config.num_batch_tiles
+                            * config.num_head_tiles
+                            * config.num_q_tiles
+                        ),
+                        num_group_tiles=config.num_group_tiles,
+                        num_q_tiles=config.num_q_tiles,
+                        num_kv_blocks=config.num_kv_blocks,
+                    )
+                )
+                _, direct_live_bytes = _sdpa_estimated_live_bytes_per_core(
+                    batch_size=1,
+                    heads_per_core=num_heads,
+                    query_rows_per_core=1,
+                    kv_block_size=config.kv_block_size,
+                    head_dim=head_dim,
+                    element_size=2,
+                    has_loop_boundary=False,
+                )
+                self.assertEqual(
+                    config.estimated_live_bytes_per_core, direct_live_bytes
+                )
+                self.assertEqual(config.estimated_load_bursts, 2)
+
+        tiled = self._select(
+            num_heads=4,
+            num_kvheads=1,
+            max_seqlen_q=1,
+            max_seqlen_kv=512,
+            head_dim=128,
+        )
+        self.assertEqual(tiled.num_kv_blocks, 2)
+        self.assertTrue(
+            _sdpa_has_loop_boundary(
+                num_non_group_outer_tiles=(
+                    tiled.num_batch_tiles * tiled.num_head_tiles * tiled.num_q_tiles
+                ),
+                num_group_tiles=tiled.num_group_tiles,
+                num_q_tiles=tiled.num_q_tiles,
+                num_kv_blocks=tiled.num_kv_blocks,
+            )
+        )
+
+    def test_batch_tiles_are_exact_for_odd_extents(self):
+        for batch_size, expected_tiles in ((1, 1), (2, 1), (3, 3), (4, 2), (7, 7)):
+            with self.subTest(batch_size=batch_size):
+                num_tiles = _sdpa_num_batch_tiles(batch_size)
+                self.assertEqual(num_tiles, expected_tiles)
+                self.assertEqual(batch_size % num_tiles, 0)
+
+    def test_low_head_long_mha_uses_all_available_cores(self):
+        for num_heads in (2, 4, 8):
+            with self.subTest(num_heads=num_heads):
+                config = self._select(
+                    num_heads=num_heads,
+                    num_kvheads=num_heads,
+                    max_seqlen_q=64,
+                    max_seqlen_kv=8192,
+                )
+
+                self.assertEqual(config.estimated_active_cores, 32)
+
+    def test_low_head_short_mha_uses_all_available_cores(self):
+        config = self._select(
+            num_heads=2,
+            num_kvheads=2,
+            max_seqlen_q=64,
+            max_seqlen_kv=512,
+        )
+
+        self.assertEqual(config.estimated_active_cores, 32)
+
+    def test_wide_head_long_mha_uses_all_available_cores(self):
+        config = self._select(
+            num_heads=16,
+            num_kvheads=16,
+            max_seqlen_q=64,
+            max_seqlen_kv=8192,
+        )
+
+        self.assertEqual(config.estimated_active_cores, 32)
+
+    def test_prefill_search_can_tile_every_outer_axis(self):
+        # The selector enumerates exact B/H/G/Lq/K plans; check that each outer
+        # axis is offered, independent of which plan the cost model prefers.
+        for num_heads, num_kvheads, head_dim in (
+            (32, 8, 128),
+            (16, 8, 256),
+            (16, 2, 512),
+            (16, 1, 512),
+        ):
+            with self.subTest(
+                num_heads=num_heads, num_kvheads=num_kvheads, head_dim=head_dim
+            ):
+                calls = []
+
+                def record(**kwargs):
+                    calls.append(kwargs)
+                    return _sdpa_kv_candidates(**kwargs)
+
+                with mock.patch.object(
+                    _decompositions, "_sdpa_kv_candidates", side_effect=record
+                ):
+                    config = self._select(
+                        batch_size=2,
+                        num_heads=num_heads,
+                        num_kvheads=num_kvheads,
+                        head_dim=head_dim,
+                        max_seqlen_kv=8192,
+                    )
+                group = num_heads // num_kvheads
+                self.assertTrue(any(c["batch_size"] < 2 for c in calls))
+                # GQA tiles the Hkv axis as heads; one KV head has no H split.
+                self.assertEqual(
+                    any(c["num_kvheads"] < num_kvheads for c in calls),
+                    num_kvheads > 1,
+                )
+                self.assertTrue(any(c["group_tile_size"] < group for c in calls))
+                self.assertTrue(any(c["num_q_tiles"] > 1 for c in calls))
+                self.assertEqual(config.strategy, "work_divided_tiled")
+                self.assertEqual(config.estimated_active_cores, 32)
+
+    def test_short_gqa_chunks_use_available_head_query_parallelism(self):
+        for query_length in (2, 8, 16, 64):
+            with self.subTest(query_length=query_length):
+                config = self._select(
+                    num_heads=32,
+                    num_kvheads=8,
+                    max_seqlen_q=query_length,
+                    max_seqlen_kv=8192,
+                )
+
+                # Measured: a short chunk is fastest as one direct K/V block
+                # (Lq2/S8192: 0.36 ms vs 0.51 ms for K2x4096); at Lq64 two
+                # blocks keep the co-live scores inside LX.
+                self.assertEqual(
+                    config.strategy,
+                    "work_divided" if query_length <= 16 else "work_divided_tiled",
+                )
+                self.assertEqual(
+                    config.kv_block_size,
+                    8192 if query_length <= 16 else 4096,
+                )
+                self.assertEqual(config.num_head_tiles, 1)
+                self.assertEqual(config.num_group_tiles, 1)
+                self.assertEqual(config.estimated_active_cores, 32)
+
+    def test_gqa_core_estimate_uses_the_inner_hkv_and_query_axes(self):
+        config = self._select(
+            num_heads=24,
+            num_kvheads=3,
+            max_seqlen_q=96,
+            max_seqlen_kv=2048,
+            head_dim=128,
+        )
+
+        self.assertEqual(config.estimated_active_cores, 32)
+
+    def test_short_chunk_does_not_overweight_gqa_reuse(self):
+        for num_kvheads in (1, 2):
+            with self.subTest(num_kvheads=num_kvheads):
+                config = self._select(
+                    num_heads=16,
+                    num_kvheads=num_kvheads,
+                    max_seqlen_q=16,
+                    max_seqlen_kv=8192,
+                    head_dim=512,
+                )
+
+                # Measured best for Hkv=1 (0.76 ms vs 1.11 ms for K8x1024).
+                self.assertEqual(config.kv_block_size, 8192)
+                self.assertEqual(config.estimated_active_cores, 32)
+
+    def test_decode_selects_lx_resident_k_when_block_count_is_small(self):
+        cases = (
+            # Hq, Hkv, D, expected K block
+            (16, 2, 512, 256),
+            (8, 1, 512, 256),
+            (16, 2, 256, 512),
+            (16, 4, 256, 1024),
+            (16, 4, 512, 1024),
+            (32, 4, 512, 1024),
+            (16, 1, 512, 1024),
+        )
+        for num_heads, num_kvheads, head_dim, expected_block in cases:
+            with self.subTest(
+                num_heads=num_heads, num_kvheads=num_kvheads, head_dim=head_dim
+            ):
+                config = self._select(
+                    num_heads=num_heads,
+                    num_kvheads=num_kvheads,
+                    max_seqlen_q=1,
+                    max_seqlen_kv=1024,
+                    head_dim=head_dim,
+                )
+
+                self.assertEqual(config.kv_block_size, expected_block)
+                self.assertEqual(config.num_kv_blocks, 1024 // expected_block)
+                self.assertEqual(config.num_head_tiles, 1)
+                self.assertEqual(config.num_group_tiles, num_heads // num_kvheads)
+                self.assertIsNone(config.estimated_active_cores)
+
+    def test_decode_uses_full_feasible_block_when_execution_count_dominates(self):
+        for sequence_length in (2048, 4096, 8192):
+            with self.subTest(sequence_length=sequence_length):
+                config = self._select(
+                    num_heads=16,
+                    num_kvheads=2,
+                    max_seqlen_q=1,
+                    max_seqlen_kv=sequence_length,
+                    head_dim=512,
+                )
+
+                self.assertEqual(config.strategy, "decode")
+                self.assertEqual(config.kv_block_size, sequence_length)
+                self.assertEqual(config.num_kv_blocks, 1)
+                self.assertIn("fewest DSC executes", config.reason)
+
+        # Four K1024 blocks keep restickified K in LX for this geometry, but
+        # their BMM and online-softmax overhead exceeds one long K4096 block.
+        config = self._select(
+            num_heads=16,
+            num_kvheads=1,
+            max_seqlen_q=1,
+            max_seqlen_kv=4096,
+            head_dim=512,
+        )
+        self.assertEqual(config.kv_block_size, 4096)
+        self.assertEqual(config.num_kv_blocks, 1)
+        self.assertIn("fewest DSC executes", config.reason)
+
+    def test_unknown_decode_geometry_is_not_forced_to_a_model_policy(self):
+        config = self._select(
+            num_heads=12,
+            num_kvheads=12,
+            max_seqlen_q=1,
+            max_seqlen_kv=8192,
+            head_dim=64,
+        )
+
+        self.assertEqual(config.strategy, "decode")
+        self.assertEqual(config.kv_block_size, 8192)
+        self.assertEqual(config.num_kv_blocks, 1)
+        self.assertIsNone(config.estimated_active_cores)
+
+    def test_non_power_of_two_query_estimates_exact_active_cores(self):
+        config = self._select(max_seqlen_q=500, max_seqlen_kv=500)
+
+        self.assertEqual(config.strategy, "work_divided")
+        self.assertEqual(config.kv_block_size, 500)
+        self.assertEqual(config.estimated_active_cores, 30)
+
+    def test_long_queries_are_tiled_by_lx_and_burst_costs(self):
+        for sequence_length in (8 * 1024, 32 * 1024):
+            with self.subTest(sequence_length=sequence_length):
+                config = self._select(
+                    max_seqlen_q=sequence_length,
+                    max_seqlen_kv=sequence_length,
+                )
+
+                self.assertEqual(config.strategy, "work_divided_tiled")
+                self.assertEqual(
+                    config.reason,
+                    "lowest predicted map-tile, K/V scan, and HBM traffic time",
+                )
+                self.assertGreater(config.num_kv_blocks, 1)
+                self.assertGreater(config.num_head_tiles * config.num_q_tiles, 1)
+                self.assertEqual(config.estimated_spill_buffers, 0)
+                self.assertEqual(
+                    config.kv_blocks_per_loop_group,
+                    min(config.num_kv_blocks, max(1, 16 // config.num_q_tiles)),
+                )
+
+    def test_production_chunks_account_for_mask_and_interleaved_layout(self):
+        cases = (
+            # Hq, Hkv, Lq, Lk, D, Q tiles, G tiles, expected K block, spills
+            # With interleaved inputs and a causal mask (relayout on), the
+            # untiled-Q K512 scan measured 3.20 ms vs 4.99 ms for the former
+            # Q2 plan at Lk 8192, and 9.54 vs 15.83 ms at Lk 32768. At head_dim
+            # 256 a G2 K1024 scan measured 6.93 ms vs 7.93 ms for K256.
+            (32, 8, 512, 8192, 128, 1, 1, 512, 0),
+            (32, 8, 512, 32768, 128, 1, 1, 512, 0),
+            (16, 8, 1024, 8192, 256, 1, 2, 1024, 0),
+            (16, 8, 1024, 32768, 256, 1, 2, 1024, 0),
+        )
+        for (
+            num_heads,
+            num_kvheads,
+            query_length,
+            kv_length,
+            head_dim,
+            query_tiles,
+            group_tiles,
+            kv_block,
+            spill_buffers,
+        ) in cases:
+            with self.subTest(
+                num_heads=num_heads,
+                num_kvheads=num_kvheads,
+                query_length=query_length,
+                head_dim=head_dim,
+            ):
+                config = self._select_production_gqa(
+                    num_heads=num_heads,
+                    num_kvheads=num_kvheads,
+                    max_seqlen_q=query_length,
+                    max_seqlen_kv=kv_length,
+                    head_dim=head_dim,
+                )
+
+                self.assertEqual(config.strategy, "work_divided_tiled")
+                self.assertEqual(config.num_q_tiles, query_tiles)
+                self.assertEqual(config.q_tile_size, query_length // query_tiles)
+                self.assertEqual(config.num_batch_tiles, 1)
+                self.assertEqual(config.num_head_tiles, 1)
+                self.assertEqual(config.num_group_tiles, group_tiles)
+                self.assertEqual(config.kv_block_size, kv_block)
+                self.assertEqual(config.estimated_spill_buffers, spill_buffers)
+                self.assertEqual(config.estimated_active_cores, 32)
+
+    def test_selected_kv_tiles_are_exact_and_stick_aligned(self):
+        config = self._select(
+            num_heads=16,
+            num_kvheads=16,
+            max_seqlen_q=3520,
+            max_seqlen_kv=3520,
+        )
+
+        self.assertEqual(config.kv_block_size % 64, 0)
+        self.assertEqual(
+            config.num_kv_blocks * config.kv_block_size,
+            3520,
+        )
+
+    def test_lx_budget_admits_plans_whose_resident_floor_fits(self):
+        for budget in (200 * 1024, 300 * 1024):
+            with self.subTest(budget=budget):
+                config = self._select(batch_size=2, lx_budget_bytes=budget)
+
+                self.assertEqual(config.strategy, "work_divided_tiled")
+                self.assertEqual(config.estimated_spill_buffers, 0)
+                # Both co-live scores stay resident; the rest may overflow.
+                self.assertLessEqual(2 * config.score_bytes_per_core, budget)
+                self.assertGreater(config.estimated_live_bytes_per_core, budget)
+
+    def test_broadcast_mask_replay_is_charged_on_outer_map_axes(self):
+        one_mask_pass = 512 * 8192 * 2
+        estimated = _sdpa_mask_hbm_bytes(
+            mask_shapes=((1, 1, 1, 512, 8192),),
+            axis_extents=(1, 8, 4, 512, 8192),
+            axis_tile_counts=(1, 2, 4, 2, 16),
+            element_size=2,
+        )
+
+        # Q and K slice the mask, while its broadcast H/G axes replay it.
+        self.assertEqual(estimated, one_mask_pass * 2 * 4)
+
+    def test_interleaved_head_staging_is_charged(self):
+        kwargs = dict(
+            num_heads=32,
+            num_kvheads=32,
+            max_seqlen_q=2048,
+            max_seqlen_kv=2048,
+            head_dim=128,
+            mask_shapes=((1, 1, 2048, 2048),),
+        )
+        without_staging = self._select(**kwargs)
+        # Read+write staging for Q, K, and V when H is tiled.
+        with_staging = self._select(
+            **kwargs,
+            head_tile_staging_bytes=2 * 3 * 32 * 2048 * 128 * 2,
+        )
+
+        # Contiguous MHA measured faster with more head tiles (H16 5.74 ms,
+        # Q16 9.14 ms). With interleaved inputs, H4 K512 measured 8.62 ms
+        # against 9.18 ms for the former Q8 plan; staging is priced but does
+        # not outweigh the head split.
+        self.assertGreater(without_staging.num_head_tiles, 1)
+        self.assertEqual(without_staging.num_q_tiles, 1)
+        self.assertGreater(with_staging.num_head_tiles, 1)
+        self.assertGreater(
+            with_staging.estimated_hbm_bytes, without_staging.estimated_hbm_bytes
+        )
+
+    def test_interleaved_gqa_chunk_does_not_head_tile(self):
+        # The adapter's GQA chunk: a broadcast mask and interleaved B/S/H/D
+        # inputs. The untiled-Q K512 scan measured 3.20 ms vs 4.99 ms for the
+        # former Q2 plan; head-tile staging must not change it.
+        kwargs = dict(
+            num_heads=32,
+            num_kvheads=8,
+            max_seqlen_q=512,
+            max_seqlen_kv=8192,
+            head_dim=128,
+            mask_shapes=((1, 1, 1, 512, 8192),),
+        )
+        # Contiguous inputs (no staging) pick H2 K1024, a known regression
+        # tracked in #5087; only the adapter's interleaved case is pinned.
+        for staging in (75_497_472,):
+            with self.subTest(head_tile_staging_bytes=staging):
+                config = self._select(**kwargs, head_tile_staging_bytes=staging)
+
+                self.assertEqual(config.num_head_tiles, 1)
+                self.assertEqual(config.num_group_tiles, 1)
+                self.assertEqual(config.num_q_tiles, 1)
+                self.assertEqual(config.kv_block_size, 512)
+                self.assertEqual(config.num_kv_blocks, 16)
+
+    def test_interleaved_head_axis_is_not_dense(self):
+        shape = (1, 8, 8192, 128)
+        self.assertTrue(
+            _axis_slice_is_dense(shape, (8 * 8192 * 128, 8192 * 128, 128, 1), 1)
+        )
+        self.assertFalse(
+            _axis_slice_is_dense(shape, (8192 * 8 * 128, 128, 8 * 128, 1), 1)
+        )
+
+    def test_conservative_restick_estimate_rejects_near_budget_plan(self):
+        candidates = _sdpa_kv_candidates(
+            batch_size=1,
+            num_heads=32,
+            num_kvheads=8,
+            max_seqlen_q=512,
+            max_seqlen_kv=8192,
+            head_dim=128,
+            element_size=2,
+            num_cores=32,
+            query_tile_size=512,
+            group_tile_size=4,
+            num_non_group_outer_tiles=1,
+            full_sdpa_prefill=True,
+        )
+        k256 = next(
+            candidate for candidate in candidates if candidate.block_size == 256
+        )
+
+        self.assertEqual(k256.estimated_restick_active_cores, 8)
+        self.assertEqual(k256.estimated_live_bytes_per_core, 2_033_664)
+        self.assertGreater(k256.estimated_live_bytes_per_core, self._LX_BUDGET)
+
+    def test_mapped_single_block_has_direct_live_set_and_dispatch_cost(self):
+        kwargs = {
+            "batch_size": 1,
+            "num_heads": 4,
+            "num_kvheads": 4,
+            "max_seqlen_q": 64,
+            "max_seqlen_kv": 512,
+            "head_dim": 64,
+            "element_size": 2,
+            "num_cores": 32,
+            "query_tile_size": 64,
+            "group_tile_size": 1,
+            "full_sdpa_prefill": True,
+        }
+        direct = next(
+            c
+            for c in _sdpa_kv_candidates(**kwargs, num_non_group_outer_tiles=1)
+            if c.num_blocks == 1
+        )
+        mapped = next(
+            c
+            for c in _sdpa_kv_candidates(**kwargs, num_non_group_outer_tiles=2)
+            if c.num_blocks == 1
+        )
+        scanned = next(
+            c
+            for c in _sdpa_kv_candidates(**kwargs, num_non_group_outer_tiles=2)
+            if c.num_blocks == 2
+        )
+
+        self.assertEqual(
+            mapped.estimated_dsc_executions, 2 * direct.estimated_dsc_executions
+        )
+        self.assertEqual(direct.estimated_dsc_executions, 10)
+        self.assertEqual(
+            mapped.estimated_live_bytes_per_core - direct.estimated_live_bytes_per_core,
+            2 * mapped.query_bytes_per_core,
+        )
+        self.assertGreater(
+            scanned.estimated_dsc_executions, mapped.estimated_dsc_executions
+        )
+
+    def test_map_carry_residency_preserves_the_right_production_split(self):
+        def candidate(*, query_tile_size, group_tile_size, block_size, head_dim):
+            candidates = _sdpa_kv_candidates(
+                batch_size=1,
+                num_heads=8 * group_tile_size,
+                num_kvheads=8,
+                max_seqlen_q=query_tile_size,
+                max_seqlen_kv=8192,
+                head_dim=head_dim,
+                element_size=2,
+                num_cores=32,
+                query_tile_size=query_tile_size,
+                group_tile_size=group_tile_size,
+                num_non_group_outer_tiles=1,
+                full_sdpa_prefill=True,
+            )
+            return next(item for item in candidates if item.block_size == block_size)
+
+        granite_q2_k512 = candidate(
+            query_tile_size=256,
+            group_tile_size=4,
+            block_size=512,
+            head_dim=128,
+        )
+        granite_q4_k1024 = candidate(
+            query_tile_size=128,
+            group_tile_size=4,
+            block_size=1024,
+            head_dim=128,
+        )
+        gemma_q2_k256 = candidate(
+            query_tile_size=512,
+            group_tile_size=2,
+            block_size=256,
+            head_dim=256,
+        )
+
+        self.assertGreater(
+            granite_q2_k512.estimated_live_bytes_per_core,
+            self._LX_BUDGET,
+        )
+        self.assertLessEqual(
+            granite_q4_k1024.estimated_live_bytes_per_core,
+            self._LX_BUDGET,
+        )
+        self.assertLessEqual(
+            gemma_q2_k256.estimated_live_bytes_per_core,
+            self._LX_BUDGET,
+        )
+
+    def test_direct_body_needs_both_score_tiles_in_lx(self):
+        # Issue #4912: at B4/S512/D64 the direct body's two co-live scores fit
+        # LX at H12 (2 x 786,432 B) but not at H13 or H14, which scan K/V.
+        for num_heads, strategy, num_kv_blocks in (
+            (12, "work_divided", 1),
+            (13, "work_divided_tiled", 2),
+            (14, "work_divided_tiled", 2),
+        ):
+            with self.subTest(num_heads=num_heads):
+                config = self._select(
+                    batch_size=4,
+                    num_heads=num_heads,
+                    num_kvheads=num_heads,
+                    head_dim=64,
+                )
+
+                self.assertEqual(config.strategy, strategy)
+                self.assertEqual(config.num_kv_blocks, num_kv_blocks)
+                self.assertEqual(config.num_head_tiles, 1)
+                self.assertEqual(config.num_q_tiles, 1)
+                self.assertEqual(config.estimated_spill_buffers, 0)
+                self.assertLessEqual(
+                    2 * config.score_bytes_per_core, config.lx_budget_bytes
+                )
+
+    def test_compile_caps_decide_between_buildable_and_resident_plans(self):
+        kwargs = dict(
+            num_heads=64,
+            num_kvheads=8,
+            max_seqlen_q=8192,
+            max_seqlen_kv=32768,
+            head_dim=64,
+        )
+
+        def iterations_and_maps(config):
+            group = _decompositions._sdpa_effective_group_tiles(
+                config.num_group_tiles, config.num_q_tiles, config.num_kv_blocks
+            )
+            maps = (config.num_batch_tiles, config.num_head_tiles, group)
+            maps += (config.num_q_tiles,)
+            iterations = config.num_kv_blocks
+            for count in maps:
+                iterations *= count
+            return iterations, sum(count > 1 for count in maps)
+
+        capped = self._select(**kwargs)
+        with (
+            mock.patch.object(
+                _decompositions, "_SDPA_MAX_UNROLLED_TILE_ITERATIONS", 1 << 30
+            ),
+            mock.patch.object(_decompositions, "_SDPA_MAX_NESTED_MAP_LEVELS", 8),
+        ):
+            uncapped = self._select(**kwargs)
+
+        # Every plan that keeps both scores resident needs more than 1024
+        # unrolled iterations, so the caps select the buildable plan that
+        # spills the fewest scores instead.
+        iterations, maps = iterations_and_maps(capped)
+        self.assertLessEqual(iterations, 1024)
+        self.assertLessEqual(maps, 2)
+        self.assertEqual(capped.estimated_spill_buffers, 1)
+        self.assertEqual(
+            capped.reason,
+            "no buildable plan keeps both score tiles in LX; fewest spilled "
+            "scores within the compile limits",
+        )
+        self.assertEqual(uncapped.estimated_spill_buffers, 0)
+        self.assertGreater(iterations_and_maps(uncapped)[0], 1024)
+
+    def test_no_buildable_plan_falls_back_to_coarse_tiling(self):
+        with mock.patch.object(
+            _decompositions, "_SDPA_MAX_UNROLLED_TILE_ITERATIONS", 0
+        ):
+            config = self._select()
+
+        self.assertEqual(config.strategy, "coarse_tiled")
+        self.assertEqual(config.reason, "no enumerated plan fits the compile limits")
+
+    def test_live_footprint_over_budget_spills_fewest_scores(self):
+        # No plan keeps two score tiles in a 1 KiB budget. A buildable plan that
+        # spills the fewest scores is preferred over the coarse fallback, which
+        # is reserved for shapes where nothing fits the compile limits.
+        config = self._select(batch_size=2, lx_budget_bytes=1024)
+
+        self.assertEqual(config.strategy, "work_divided_tiled")
+        self.assertGreater(config.estimated_spill_buffers, 0)
+        self.assertGreater(config.estimated_live_bytes_per_core, 1024)
+        self.assertEqual(
+            config.reason,
+            "no buildable plan keeps both score tiles in LX; fewest spilled "
+            "scores within the compile limits",
+        )
+
+    def test_estimated_active_cores_scales_with_available_cores(self):
+        config = self._select(num_cores=16)
+
+        self.assertEqual(config.estimated_active_cores, 16)
+
+    def test_geometry_grid_preserves_tiling_invariants(self):
+        geometries = (
+            (8, 1, 512),
+            (12, 12, 64),
+            (16, 2, 256),
+            (16, 4, 512),
+            (24, 3, 128),
+            (32, 8, 128),
+        )
+        for num_heads, num_kvheads, head_dim in geometries:
+            for query_length in (1, 2, 16, 96, 500, 1024):
+                for kv_length in (512, 1024, 8192):
+                    with self.subTest(
+                        num_heads=num_heads,
+                        num_kvheads=num_kvheads,
+                        head_dim=head_dim,
+                        query_length=query_length,
+                        kv_length=kv_length,
+                    ):
+                        config = self._select(
+                            num_heads=num_heads,
+                            num_kvheads=num_kvheads,
+                            head_dim=head_dim,
+                            max_seqlen_q=query_length,
+                            max_seqlen_kv=kv_length,
+                        )
+
+                        self.assertGreaterEqual(config.kv_block_size, 64)
+                        self.assertEqual(config.kv_block_size % 64, 0)
+                        self.assertEqual(
+                            config.num_kv_blocks,
+                            (kv_length + config.kv_block_size - 1)
+                            // config.kv_block_size,
+                        )
+                        self.assertEqual(
+                            config.num_q_tiles * config.q_tile_size,
+                            query_length,
+                        )
+                        self.assertEqual(num_heads % config.num_head_tiles, 0)
+                        self.assertEqual(1 % config.num_batch_tiles, 0)
+                        group_size = num_heads // num_kvheads
+                        self.assertEqual(group_size % config.num_group_tiles, 0)
+                        if config.estimated_active_cores is not None:
+                            self.assertGreaterEqual(config.estimated_active_cores, 1)
+                            self.assertLessEqual(config.estimated_active_cores, 32)
+                        if config.strategy != "coarse_tiled":
+                            self.assertIsNotNone(config.estimated_live_bytes_per_core)
+                            assert config.estimated_live_bytes_per_core is not None
+                            self.assertIsNotNone(config.estimated_spill_buffers)
+                            # Selected plans keep their resident floor in LX.
+                            self.assertEqual(config.estimated_spill_buffers, 0)
+                            if query_length > 1:
+                                self.assertLessEqual(
+                                    2 * config.score_bytes_per_core,
+                                    config.lx_budget_bytes,
+                                )
+                            self.assertGreaterEqual(config.estimated_load_bursts, 2)
+
+
+class TestSDPAForEachTileIntegration(unittest.TestCase):
+    # (query heads, kv heads, head tiles): the geometries on which hint-driven q_h
+    # tiling over fused SDPA silently returned wrong values (errors up to NaN) or
+    # failed to compile, while the for_each_tile decomposition was correct (#5441).
+    GQA_HEAD_TILED = (
+        (12, 12, 3),
+        (12, 2, 2),
+        (8, 2, 2),
+        (16, 4, 2),
+        (16, 4, 4),
+        (2, 2, 2),
+        (4, 2, 2),
+        (6, 3, 3),
+    )
+
+    def test_gqa_head_tiled_numerics_across_group_sizes(self):
+        """Head-tiled fused GQA attention is right for every group size.
+
+        Lq=Lk=64, D=128 at fp16 against an fp32 reference.  The group size runs
+        from 1 to 6 and the head counts include ones that are not powers of two.
+        The default strategy does not tile these shapes, so the head tiling is
+        forced, and each case asserts a loop really formed.
+        """
+        B, LQ, LK, D = 1, 64, 64, 128
+
+        def sdpa(q, k, v):
+            return F.scaled_dot_product_attention(
+                q, k, v, scale=D**-0.5, enable_gqa=True
+            )
+
+        for hq, hkv, tiles in self.GQA_HEAD_TILED:
+            with self.subTest(query_heads=hq, kv_heads=hkv, head_tiles=tiles):
+                generator = torch.Generator().manual_seed(0)
+                q = torch.randn(B, hq, LQ, D, dtype=torch.float16, generator=generator)
+                k = torch.randn(B, hkv, LK, D, dtype=torch.float16, generator=generator)
+                v = torch.randn(B, hkv, LK, D, dtype=torch.float16, generator=generator)
+                expected = sdpa(q.float(), k.float(), v.float())
+
+                def force_head_tiles(tiles=tiles, **kwargs):
+                    return dataclasses.replace(
+                        _select_sdpa_tiling(**kwargs), num_head_tiles=tiles
+                    )
+
+                # A fresh cache: the patched selector is not part of the compile
+                # cache key, so a cached compile of the same graph would be reused.
+                with (
+                    fresh_cache(),
+                    mock.patch.object(
+                        _decompositions,
+                        "_select_sdpa_tiling",
+                        side_effect=force_head_tiles,
+                    ),
+                ):
+                    torch._dynamo.reset()
+                    actual, sources = run_and_get_code(
+                        torch.compile(sdpa, fullgraph=True, dynamic=False),
+                        q.to("spyre"),
+                        k.to("spyre"),
+                        v.to("spyre"),
+                    )
+                self.assertIn("LoopSpec(", "\n".join(sources))
+                torch.testing.assert_close(
+                    actual.cpu().float(), expected, atol=0.05, rtol=0.05
+                )
+
+    def test_mapped_single_block_gqa_with_broadcast_mask(self):
+        """Outer maps must preserve stable SDPA across query and head tiles."""
+
+        def sdpa(q, k, v, mask):
+            return F.scaled_dot_product_attention(
+                q, k, v, attn_mask=mask, enable_gqa=True
+            )
+
+        generator = torch.Generator().manual_seed(4960)
+        query = torch.randn(2, 4, 64, 64, dtype=torch.float16, generator=generator)
+        key = torch.randn(2, 2, 64, 64, dtype=torch.float16, generator=generator)
+        value = torch.randn(2, 2, 64, 64, dtype=torch.float16, generator=generator)
+        mask = torch.zeros(2, 1, 1, 64, dtype=torch.float16)
+        mask[..., :32] = float("-inf")
+
+        def mapped_single_block(**kwargs):
+            selected = _select_sdpa_tiling(**kwargs)
+            return dataclasses.replace(
+                selected,
+                strategy="work_divided_tiled",
+                kv_block_size=64,
+                num_kv_blocks=1,
+                num_batch_tiles=2,
+                num_head_tiles=2,
+                num_group_tiles=2,
+                num_q_tiles=2,
+                q_tile_size=32,
+            )
+
+        expected = sdpa(query.float(), key.float(), value.float(), mask.float())
+        with mock.patch.object(
+            _decompositions, "_select_sdpa_tiling", side_effect=mapped_single_block
+        ):
+            actual = torch.compile(sdpa, fullgraph=True, dynamic=False)(
+                query.to("spyre"), key.to("spyre"), value.to("spyre"), mask.to("spyre")
+            )
+        torch.testing.assert_close(actual.cpu().float(), expected, atol=0.05, rtol=0.05)
+
+    def test_gqa_decode_with_interleaved_kv_cache(self):
+        """A tiled-away group must preserve query strides across KV heads."""
+        generator = torch.Generator().manual_seed(123)
+        dtype = torch.bfloat16
+        query = torch.randn(1, 16, 1, 128, dtype=dtype, generator=generator)
+        key = torch.randn(1, 4, 512, 128, dtype=dtype, generator=generator)
+        value = torch.randn(1, 4, 512, 128, dtype=dtype, generator=generator)
+        mask = torch.full((1, 16, 1, 512), float("-inf"), dtype=dtype)
+        # Include values on both sides of the 256-token KV tile boundary.
+        mask[..., 246:257] = 0
+
+        def sdpa(q, k, v, mask):
+            return F.scaled_dot_product_attention(
+                q, k, v, attn_mask=mask, scale=1 / 128, enable_gqa=True
+            )
+
+        query_device = query.to("spyre")
+        # Position-first cache layout used by decode: [L, Hkv, D/64, B, D%64].
+        cache_layout = SpyreTensorLayout(
+            device_size=[512, 4, 2, 1, 64],
+            stride_map=[128, 512 * 128, 64, 4 * 512 * 128, 1],
+            device_dtype=get_device_dtype(dtype),
+        )
+        caches = [
+            torch.empty(
+                tensor.shape,
+                dtype=dtype,
+                device=torch.device("spyre"),
+                device_layout=cache_layout,
+            ).copy_(tensor)
+            for tensor in (key, value)
+        ]
+        expected = sdpa(query.float(), key.float(), value.float(), mask.float())
+        actual = torch.compile(sdpa, fullgraph=True, dynamic=False)(
+            query_device, *caches, mask.to("spyre")
+        )
+        torch.testing.assert_close(actual.cpu().float(), expected, atol=0.03, rtol=0.03)
+
+    def test_gqa_decode_direct_body_tracks_effective_group_loop(self):
+        """A nominal G split is a real loop only when a sequence axis is tiled."""
+
+        def sdpa(q, k, v):
+            return F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                dropout_p=0.0,
+                scale=128**-0.5,
+                enable_gqa=True,
+            )
+
+        generator = torch.Generator().manual_seed(0)
+        for kv_length, expect_loop in ((128, False), (512, True)):
+            with self.subTest(kv_length=kv_length):
+                query = torch.randn(
+                    1, 4, 1, 128, dtype=torch.float16, generator=generator
+                )
+                key = torch.randn(
+                    1, 1, kv_length, 128, dtype=torch.float16, generator=generator
+                )
+                value = torch.randn(
+                    1, 1, kv_length, 128, dtype=torch.float16, generator=generator
+                )
+                expected = sdpa(query, key, value)
+                actual, sources = run_and_get_code(
+                    torch.compile(
+                        sdpa, backend="inductor", fullgraph=True, dynamic=False
+                    ),
+                    query.to("spyre"),
+                    key.to("spyre"),
+                    value.to("spyre"),
+                )
+                source = "\n".join(sources)
+
+                torch.testing.assert_close(
+                    actual.cpu().float(), expected.float(), atol=0.1, rtol=0.1
+                )
+                self.assertEqual("LoopSpec(" in source, expect_loop)
+                self.assertEqual("op='maximum'" in source, expect_loop)
+
+    def test_complete_gqa_tile_nest(self):
+        """The actual decomposition lowers B/Hkv/G/Lq maps around an Lk scan."""
+        batch = 2
+        query_heads = 4
+        kv_heads = 2
+        query_length = 32
+        kv_length = 256
+        head_dim = 128
+        generator = torch.Generator().manual_seed(0)
+        query = torch.randn(
+            batch,
+            query_heads,
+            query_length,
+            head_dim,
+            dtype=torch.float16,
+            generator=generator,
+        )
+        key = torch.randn(
+            batch,
+            kv_heads,
+            kv_length,
+            head_dim,
+            dtype=torch.float16,
+            generator=generator,
+        )
+        value = torch.randn(
+            batch,
+            kv_heads,
+            kv_length,
+            head_dim,
+            dtype=torch.float16,
+            generator=generator,
+        )
+        bias = (
+            torch.randn(
+                batch,
+                query_heads,
+                query_length,
+                kv_length,
+                dtype=torch.float16,
+                generator=generator,
+            )
+            * 0.01
+        )
+
+        def sdpa(q, k, v, b):
+            return F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=b,
+                dropout_p=0.0,
+                scale=head_dim**-0.5,
+                enable_gqa=True,
+            )
+
+        def force_every_loop(**kwargs):
+            selected = _select_sdpa_tiling(**kwargs)
+            return dataclasses.replace(
+                selected,
+                strategy="work_divided_tiled",
+                kv_block_size=128,
+                num_kv_blocks=2,
+                num_q_tiles=2,
+                q_tile_size=16,
+                num_batch_tiles=2,
+                num_head_tiles=2,
+                num_group_tiles=2,
+                kv_blocks_per_loop_group=2,
+            )
+
+        expected = sdpa(query, key, value, bias)
+        with mock.patch.object(
+            _decompositions,
+            "_select_sdpa_tiling",
+            side_effect=force_every_loop,
+        ):
+            actual, sources = run_and_get_code(
+                torch.compile(sdpa, backend="inductor", fullgraph=True, dynamic=False),
+                query.to("spyre"),
+                key.to("spyre"),
+                value.to("spyre"),
+                bias.to("spyre"),
+            )
+
+        torch.testing.assert_close(
+            actual.cpu().float(), expected.float(), atol=0.1, rtol=0.1
+        )
+        self.assertEqual(sum(source.count("LoopSpec(") for source in sources), 5)
+
+    def test_fused_qkv_views_under_query_tiling(self):
+        """K and V split from one projection alias, and are invariant in the Lq map.
+
+        Mirrors an encoder's fused QKV path (bge-reranker-v2-m3, #4893), with the
+        Lq-map-around-Lk-scan nest forced at a small shape.
+        """
+        heads, head_dim, length = 2, 64, 256
+        hidden = heads * head_dim
+        generator = torch.Generator().manual_seed(0)
+        qkv = torch.randn(length, 3 * hidden, dtype=torch.float16, generator=generator)
+        mask = torch.zeros(1, 1, 1, length, dtype=torch.float16)
+
+        def sdpa(qkv, mask):
+            q, k, v = (
+                t.view(1, length, heads, head_dim).transpose(1, 2)
+                for t in qkv.split(hidden, dim=-1)
+            )
+            return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=0.125)
+
+        def force_lq_map_around_lk_scan(**kwargs):
+            return dataclasses.replace(
+                _select_sdpa_tiling(**kwargs),
+                strategy="work_divided_tiled",
+                kv_block_size=128,
+                num_kv_blocks=2,
+                num_q_tiles=2,
+                q_tile_size=128,
+                num_batch_tiles=1,
+                num_head_tiles=1,
+                num_group_tiles=1,
+            )
+
+        expected = sdpa(qkv, mask)
+        with mock.patch.object(
+            _decompositions,
+            "_select_sdpa_tiling",
+            side_effect=force_lq_map_around_lk_scan,
+        ):
+            actual = torch.compile(sdpa, fullgraph=True, dynamic=False)(
+                qkv.to("spyre"), mask.to("spyre")
+            )
+
+        torch.testing.assert_close(
+            actual.cpu().float(), expected.float(), atol=1e-2, rtol=1e-2
+        )
+
+    def test_decode_o_proj_after_sdpa(self):
+        """M=1 SDPA decode with head tiling, followed by the o_proj linear.
+
+        Head-tiled SDPA leaves its output [B, H, 1, D] in a factorized layout.
+        After transpose+reshape to [B, 1, H*D], the combined H*D dim is the K
+        dimension of the o_proj bmm, whose x then reads a mixed-radix function
+        of the contraction variable alone, here ``[floor(d1/512),
+        floor(Mod(d1, 512)/128), 0, Mod(d1, 128)]`` for eight head tiles, which
+        ``_canonical_stl_from_collapsed_host`` must collapse into one logical K
+        dimension.
+
+        The default ``decode`` strategy no longer tiles the heads of this shape,
+        so the test forces eight head tiles, and asserts that a loop really
+        formed so a strategy change cannot quietly turn it back into a plain
+        compile-and-numerics check.
+
+        This test does NOT guard the case it was first written for, where an
+        outer tile variable appears alongside the contraction variable
+        (``[0, 32*d0 + floor(d1/D), 0, Mod(d1, D)]``, which needed o_proj to
+        sit inside SDPA's loop).  SDPA no longer places o_proj there, so
+        restoring the strict pre-fix check in ``propagate_layouts`` does not
+        fail this test.  That relaxation is guarded at the layout level by
+        ``test_outer_loop_var_in_the_head_coordinate_collapses_the_whole_chain``
+        in ``tests/tensor/test_coordinates.py``, and a split-K-over-heads
+        ``for_each_tile`` is covered by ``test_split_k_over_head_groups`` in
+        ``test_for_each_tile_e2e.py``.
+        """
+        B, H, Lq, Lk, D = 1, 32, 1, 2048, 128
+        hidden = H * D
+        generator = torch.Generator().manual_seed(0x4331)
+        q = torch.randn(B, H, Lq, D, dtype=torch.float16, generator=generator)
+        k = torch.randn(B, H, Lk, D, dtype=torch.float16, generator=generator)
+        v = torch.randn(B, H, Lk, D, dtype=torch.float16, generator=generator)
+        w = torch.randn(hidden, hidden, dtype=torch.float16, generator=generator)
+
+        def fn(q, k, v, w):
+            attn_out = F.scaled_dot_product_attention(q, k, v, scale=D**-0.5)
+            x = attn_out.transpose(1, 2).reshape(B, Lq, hidden)
+            return F.linear(x, w)
+
+        def force_head_tiles(**kwargs):
+            return dataclasses.replace(_select_sdpa_tiling(**kwargs), num_head_tiles=8)
+
+        expected = fn(q, k, v, w)
+        # A fresh cache: the patched selector is not part of the compile cache
+        # key, so a cached unforced compile of the same graph would be reused.
+        with (
+            fresh_cache(),
+            mock.patch.object(
+                _decompositions, "_select_sdpa_tiling", side_effect=force_head_tiles
+            ),
+        ):
+            actual, sources = run_and_get_code(
+                torch.compile(fn, fullgraph=True, dynamic=False),
+                q.to("spyre"),
+                k.to("spyre"),
+                v.to("spyre"),
+                w.to("spyre"),
+            )
+
+        self.assertIn("LoopSpec(", "\n".join(sources))
+        torch.testing.assert_close(
+            actual.cpu().float(), expected.float(), atol=0.2, rtol=0.2
+        )
+
+    def test_packed_qkv_input_offsets_h8(self):
+        """Read copies preserve offsets of QKV views repaired after pre-stickify.
+
+        Eight heads trigger SDPA's H coarse tiling.  K and V are non-contiguous
+        views into one packed allocation, with nonzero storage offsets.  Before
+        issue #4331's fix the generated per-tile read copies silently read Q's
+        slice for both tensors.
+        """
+        B, H, L, D = 1, 8, 64, 64
+        generator = torch.Generator().manual_seed(0x4331)
+        packed = torch.randn(B, L, 3 * H * D, dtype=torch.float16, generator=generator)
+
+        def split_qkv(x):
+            return tuple(
+                part.reshape(B, L, H, D).transpose(1, 2) for part in x.chunk(3, dim=-1)
+            )
+
+        q_cpu, k_cpu, v_cpu = split_qkv(packed)
+        mask = torch.zeros(L, L, dtype=torch.float16).masked_fill(
+            ~torch.ones(L, L, dtype=torch.bool).tril(),
+            torch.finfo(torch.float16).min,
+        )[None, None]
+        expected = F.scaled_dot_product_attention(
+            q_cpu, k_cpu, v_cpu, attn_mask=mask, scale=D**-0.5
+        )
+
+        q, k, v = split_qkv(packed.to("spyre"))
+        self.assertEqual(
+            (q.storage_offset(), k.storage_offset(), v.storage_offset()),
+            (0, H * D, 2 * H * D),
+        )
+        actual = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=mask.to("spyre"), scale=D**-0.5
+        )
+
+        torch.testing.assert_close(actual.cpu(), expected, atol=0.01, rtol=0.1)
+
+
+if __name__ == "__main__":
+    unittest.main()

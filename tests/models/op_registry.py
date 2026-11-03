@@ -314,11 +314,13 @@ def _tensor_add_(x: torch.Tensor, other, alpha=1):
 
 
 def _tensor_and_(x: torch.Tensor, other):
-    return x.and_(other)
+    x &= other
+    return x
 
 
 def _tensor_or_(x: torch.Tensor, other):
-    return x.or_(other)
+    x |= other
+    return x
 
 
 def _tensor_copy_(x: torch.Tensor, source: torch.Tensor):
@@ -461,6 +463,7 @@ OP_REGISTRY: Dict[str, OpAdapter] = {
     "torch.histc": OpAdapter("torch.histc", torch.histc),
     "torch.clamp_": OpAdapter("torch.clamp_", _tensor_clamp_, is_inplace=True),
     "torch.Tensor.truediv": OpAdapter("torch.Tensor.truediv", _tensor_truediv),
+    "torch._grouped_mm": OpAdapter("torch._grouped_mm", torch._grouped_mm),
     "torch.ops.transformers.grouped_mm_fallback": OpAdapter(
         "torch.ops.transformers.grouped_mm_fallback", _grouped_mm_fallback
     ),

@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "One capability's verdict; `backend` is a column, never part of the id.",
+  "properties": {
+    "arch": {},
+    "backend": {},
+    "capability_id": {},
+    "component": {
+      "minLength": 1
+    },
+    "fail_reason": {},
+    "props": {},
+    "run_id": {},
+    "status": {
+      "enum": [
+        "failed",
+        "not_implemented",
+        "passed",
+        "undetermined"
+      ]
+    },
+    "test_type": {
+      "minLength": 1
+    }
+  },
+  "required": [
+    "run_id",
+    "capability_id",
+    "component",
+    "test_type",
+    "arch",
+    "status",
+    "backend",
+    "fail_reason",
+    "props"
+  ],
+  "title": "capability_runs: the stored row",
+  "type": "object",
+  "x-uploadable": true
+}

@@ -1,13 +1,15 @@
 test_suite_config:
   labels: [trunk]
   files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/profiler/test_trace_export.py
+      unlisted_test_mode: mandatory_success
     - path: ${TORCH_DEVICE_ROOT}/tests/profiler/test_spyre_profiler.py
       unlisted_test_mode: mandatory_success
       tests:
         # Temporarily skipped: UnicodeDecodeError from a garbage kernel-event
         # name, traced to an ABI/stride mismatch between libaiupti (struct grew
-        # +40 bytes in libaiupti #114) and the kineto-spyre build. Re-enable once
-        # both are rebuilt in lockstep.
+        # +40 bytes in libaiupti #114) and the AIUPTI/Kineto bridge built into
+        # torch_spyre. Re-enable once they are rebuilt against a matching ABI.
         - names: [TestSpyreProfiler::test_basic_profile]
           mode: mandatory_success
         # Listed explicitly so the config-coverage checker (CHECK 2) sees full
@@ -15,8 +17,26 @@ test_suite_config:
         - names:
             - TestSpyreProfiler::test_event_list
             - TestSpyreProfiler::test_profiler_timestamp_consistency
+            - TestSpyreProfiler::test_kernel_timestamp_after_cpu_dispatch
+            - TestSpyreProfiler::test_no_zero_timestamp_or_duration
           mode: mandatory_success
         - names:
             - TestMemoryProfilerTimeline::test_memory_timeline_no_id_spyre
             - TestMemoryProfilerTimeline::test_memory_timeline_no_id_cpu
+          mode: mandatory_success
+        - names:
+            - TestOverExtendedKernelDurations::test_find_over_extended_activities
+            - TestOverExtendedKernelDurations::test_find_over_extended_activities_invalid_events
+            - TestOverExtendedKernelDurations::test_activity_duration_limit
+            - test_find_device_overlaps
+            - test_find_device_overlaps_invalid_events
+            - test_kernel_time_overlap
+            - test_runtime_device_correlation_pairs
+            - test_runtime_device_correlation_pair_errors
+            - test_runtime_device_correlation_on_trace
+            - test_trace_analyzer_device_overlap
+            - test_find_duplicate_kernel_start_timestamps
+            - test_find_duplicate_kernel_start_timestamps_invalid_events
+            - test_duplicate_kernel_start_timestamps
+            - test_non_collective_activities_have_no_coll_args
           mode: mandatory_success

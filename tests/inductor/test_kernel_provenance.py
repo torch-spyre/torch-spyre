@@ -16,6 +16,7 @@
 
 import ctypes
 import dataclasses
+import os
 import types
 from unittest.mock import patch
 
@@ -29,7 +30,9 @@ from torch_spyre._C import (
     DataFormats,
     ElementArrangement,
     extract_kernel_provenance_key as extract_kernel_provenance_key_cpp,
+    SymbolicArgKind,
 )
+from torch_spyre._inductor.codegen.compute_ops import SymbolKind
 from torch_spyre._inductor.op_spec import (
     DebugHandle,
     IndirectAccess,
@@ -50,8 +53,10 @@ from torch_spyre._inductor.profiler_event import (
     format_kernel_provenance_event_name,
 )
 from torch_spyre._inductor.spyre_kernel import _codegen_op_spec_list
+from torch_spyre.execution import async_compile
 from torch_spyre.execution.async_compile import SpyreAsyncCompile
 from torch_spyre.execution.kernel_runner import SpyreSDSCKernelRunner
+from utils_inductor import mock_backend_compiler
 
 
 def _handle(
@@ -81,6 +86,7 @@ def _op(
     tiled_symbol_trip_counts=None,
     symbolic_dim_bounds=None,
     node_output_ranges=None,
+    completed_producer_cores=(),
 ) -> OpSpec:
     return OpSpec(
         op=op,
@@ -96,6 +102,7 @@ def _op(
             {} if symbolic_dim_bounds is None else symbolic_dim_bounds
         ),
         node_output_ranges=node_output_ranges,
+        completed_producer_cores=completed_producer_cores,
         debug_handle=handle,
     )
 
@@ -135,6 +142,23 @@ def _generated_wrapper_roundtrip(specs):
 
 
 class TestKernelProvenanceDescriptor:
+    def test_completed_reduction_route_changes_bundle_identity(self):
+        ordinary = build_kernel_provenance_descriptor([_op(None)])
+        routed = build_kernel_provenance_descriptor(
+            [_op(None, completed_producer_cores=(3,))]
+        )
+
+        assert ordinary.key != routed.key
+
+    def test_completed_reduction_route_survives_generated_wrapper(self):
+        producers = (3, 7)
+
+        (result,) = _generated_wrapper_roundtrip(
+            [_op(None, completed_producer_cores=producers)]
+        )
+
+        assert result.completed_producer_cores == producers
+
     def test_builds_bundle_identity_without_handles(self):
         specs = [
             _op(None),
@@ -243,6 +267,23 @@ class TestKernelProvenanceDescriptor:
             work_division=TensorWorkDivision({c0: 2}, {c0: Symbol("core_id")}),
         )
         changed_owner = dataclasses.replace(first, args=[owned_arg])
+        changed_owner_cores = dataclasses.replace(
+            first,
+            args=[
+                dataclasses.replace(
+                    arg,
+                    work_division=TensorWorkDivision(
+                        {c0: 2}, {c0: Symbol("core_id")}, num_cores=4
+                    ),
+                )
+            ],
+        )
+        changed_core_mapping = dataclasses.replace(
+            first, core_id_to_work_slice={c0: Integer(1)}
+        )
+        canonical_core_mapping = dataclasses.replace(
+            first, core_id_to_work_slice={c0: Integer(0)}
+        )
 
         first_descriptor = build_kernel_provenance_descriptor([first])
         reordered_descriptor = build_kernel_provenance_descriptor([reordered_metadata])
@@ -251,6 +292,15 @@ class TestKernelProvenanceDescriptor:
             [changed_arrangement]
         )
         changed_owner_descriptor = build_kernel_provenance_descriptor([changed_owner])
+        changed_owner_cores_descriptor = build_kernel_provenance_descriptor(
+            [changed_owner_cores]
+        )
+        changed_core_mapping_descriptor = build_kernel_provenance_descriptor(
+            [changed_core_mapping]
+        )
+        canonical_core_mapping_descriptor = build_kernel_provenance_descriptor(
+            [canonical_core_mapping]
+        )
 
         assert first_descriptor is not None
         assert reordered_descriptor is not None
@@ -261,6 +311,9 @@ class TestKernelProvenanceDescriptor:
         assert changed_descriptor.key != first_descriptor.key
         assert changed_arrangement_descriptor.key != first_descriptor.key
         assert changed_owner_descriptor.key != first_descriptor.key
+        assert changed_owner_cores_descriptor.key != changed_owner_descriptor.key
+        assert changed_core_mapping_descriptor.key != first_descriptor.key
+        assert canonical_core_mapping_descriptor.key == first_descriptor.key
 
     def test_pins_rich_canonical_bundle_key(self):
         c0 = Symbol("c0")
@@ -557,7 +610,7 @@ class TestKernelProvenancePropagation:
                 return_value="/tmp/kernel",
             ),
             patch("torch_spyre.execution.async_compile.generate_bundle"),
-            patch("torch_spyre.execution.async_compile.subprocess.run"),
+            mock_backend_compiler(),
             patch(
                 "torch_spyre.execution.async_compile.SpyreSDSCKernelRunner",
                 return_value=runner,
@@ -580,7 +633,7 @@ class TestKernelProvenancePropagation:
                 return_value="/tmp/kernel",
             ),
             patch("torch_spyre.execution.async_compile.generate_bundle"),
-            patch("torch_spyre.execution.async_compile.subprocess.run"),
+            mock_backend_compiler(),
             patch(
                 "torch_spyre.execution.async_compile.SpyreSDSCKernelRunner",
                 return_value=runner,
@@ -605,7 +658,7 @@ class TestKernelProvenancePropagation:
                 return_value="/tmp/kernel",
             ),
             patch("torch_spyre.execution.async_compile.generate_bundle"),
-            patch("torch_spyre.execution.async_compile.subprocess.run"),
+            mock_backend_compiler(),
             patch(
                 "torch_spyre.execution.async_compile.SpyreSDSCKernelRunner",
                 return_value=runner,
@@ -641,13 +694,14 @@ class TestKernelProvenancePropagation:
                 "torch_spyre.execution.kernel_runner.prepare_kernel",
                 return_value="jobplan",
             ) as prepare_kernel,
+            patch("torch_spyre.execution.kernel_runner.torch.spyre._impl._lazy_init"),
         ):
             runner = SpyreSDSCKernelRunner(
                 "sdsc_fused_mm_0",
                 "/tmp/kernel",
                 kernel_provenance=descriptor,
             )
-
+            assert runner.jobplan == "jobplan"
         assert runner.kernel_provenance is descriptor
         assert runner.profiler_event_name == _event_name(descriptor)
         assert runner.jobplan == "jobplan"
@@ -668,10 +722,89 @@ class TestKernelProvenancePropagation:
                 "torch_spyre.execution.kernel_runner.prepare_kernel",
                 return_value="jobplan",
             ) as prepare_kernel,
+            patch("torch_spyre.execution.kernel_runner.torch.spyre._impl._lazy_init"),
         ):
             runner = SpyreSDSCKernelRunner("sdsc_fused_mm_0", "/tmp/kernel")
-
+            assert runner.jobplan == "jobplan"
         assert runner.kernel_provenance is None
         assert runner.profiler_event_name is None
         prepare_kernel.assert_called_once_with("/tmp/kernel/spyreCodeDir")
         register_kernel_provenance.assert_not_called()
+
+
+class TestSpyreSDSCKernelRunnerSymbolicArgs:
+    """Unit tests for the _symbolic_args payload built at construction time.
+
+    No device or C++ RuntimeContext required — construction does not call
+    prepare_kernel.
+    """
+
+    def _make_runner(self, symbol_kinds):
+        return SpyreSDSCKernelRunner(
+            "test_kernel", "/tmp/kernel", symbol_kinds=symbol_kinds
+        )
+
+    def test_no_symbol_kinds_leaves_symbolic_args_none(self):
+        """Without symbol_kinds, _symbolic_args must be None (no payload)."""
+        runner = self._make_runner([])
+        assert runner._symbolic_args is None
+
+    def test_non_pool_symbol_kinds_map_arg_index_directly(self):
+        """Non-pool symbol_kinds: tensor_id == sk.arg_index for each entry."""
+        symbol_kinds = [SymbolKind.kernel(0), SymbolKind.kernel(2)]
+        runner = self._make_runner(symbol_kinds)
+
+        assert runner._symbolic_args is not None
+        assert len(runner._symbolic_args) == 2
+        assert runner._symbolic_args[0].kind == SymbolicArgKind.kAddress
+        assert runner._symbolic_args[0].tensor_id == 0
+        assert runner._symbolic_args[1].kind == SymbolicArgKind.kAddress
+        assert runner._symbolic_args[1].tensor_id == 2
+
+    def test_pool_first_symbol_kinds_offsets_kernel_tensor_ids(self):
+        """Pool-first symbol_kinds: pool entry gets tensor_id=0; remaining
+        entries get tensor_id=sk.arg_index+1 to account for the pool tensor
+        that call_kernel prepends to args.
+        """
+        symbol_kinds = [SymbolKind.pool(), SymbolKind.kernel(0)]
+        runner = self._make_runner(symbol_kinds)
+
+        assert runner._symbolic_args is not None
+        assert len(runner._symbolic_args) == 2
+        # Pool slot → tensor_id=0 (the pool tensor prepended by call_kernel).
+        assert runner._symbolic_args[0].kind == SymbolicArgKind.kAddress
+        assert runner._symbolic_args[0].tensor_id == 0
+        # Kernel tensor at arg_index=0 → tensor_id=1 (+1 for pool offset).
+        assert runner._symbolic_args[1].kind == SymbolicArgKind.kAddress
+        assert runner._symbolic_args[1].tensor_id == 1
+
+
+class TestOutputDirNameLength:
+    """Per-kernel path components must stay within NAME_MAX (regression).
+
+    A deeply fused kernel (e.g. Gemma-4 MoE decode) produces a kernel name of
+    >250 chars; left whole in the mkdtemp prefix it overflowed the 255-byte
+    Linux limit on one path component and raised ``[Errno 36]`` ENAMETOOLONG.
+    """
+
+    def test_safe_kernel_name_short_passthrough(self):
+        assert async_compile._safe_kernel_name("sdsc_fused_mm_0") == "sdsc_fused_mm_0"
+
+    def test_safe_kernel_name_truncates_long(self):
+        long_name = "sdsc_fused_" + "_".join(["view"] * 80)
+        assert len(long_name) > async_compile._NAME_MAX
+        safe = async_compile._safe_kernel_name(long_name)
+        assert len(safe) == async_compile._KERNEL_NAME_BUDGET
+        assert long_name.startswith(safe)
+
+    def test_get_output_dir_bounds_long_kernel_name(self, tmp_path):
+        long_name = "sdsc_fused_" + "_".join(["view"] * 80)
+        with patch(
+            "torch_spyre.execution.async_compile.cache_dir",
+            return_value=str(tmp_path),
+        ):
+            out = async_compile.get_output_dir(long_name)
+        try:
+            assert len(os.path.basename(out).encode()) <= async_compile._NAME_MAX
+        finally:
+            os.rmdir(out)

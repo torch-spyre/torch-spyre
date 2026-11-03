@@ -62,6 +62,7 @@ class InputInitArgs(BaseModel):
 
     low: int = 0  # randint: lower bound
     high: Optional[int] = None  # randint: upper bound (required)
+    total: Optional[int] = None  # cumsum_offsets: total (required)
     fill_value: Optional[float] = None  # full: fill value (required)
     path: Optional[str] = None  # file: path to .pt / .npy / .safetensors
     key: Optional[str] = None  # file: key within file (dict/.safetensors)
@@ -147,6 +148,8 @@ class InputTensorSpec(BaseModel):
     def validate_cross_fields(self) -> "InputTensorSpec":
         if self.init == "randint" and self.init_args.high is None:
             raise ValueError("init_args.high is required when init: randint")
+        if self.init == "cumsum_offsets" and self.init_args.total is None:
+            raise ValueError("init_args.total is required when init: cumsum_offsets")
         if self.init == "full" and self.init_args.fill_value is None:
             raise ValueError("init_args.fill_value is required when init: full")
         if self.init == "file" and self.init_args.path is None:
@@ -305,6 +308,23 @@ class InputTensorSpec(BaseModel):
             return torch.eye(shape[0], dtype=dtype)
         elif init == "xavier":
             return torch.nn.init.xavier_uniform_(torch.empty(shape, dtype=dtype))
+        elif init == "cumsum_offsets":
+            # Group offsets for torch._grouped_mm: a non-decreasing cumulative
+            # partition of `total` rows over shape[0] groups, ending at `total`.
+            # Seeded here (rather than in the make_tensor block below) so the
+            # partition is identical for the CPU reference and the device run.
+            assert ia.total is not None  # enforced by validate_cross_fields
+            total = ia.total
+            with torch.random.fork_rng(devices=[]):
+                if seed is not None:
+                    torch.manual_seed(int(seed))
+                counts = torch.zeros(shape[0], dtype=dtype)
+                counts.scatter_add_(
+                    0,
+                    torch.randint(0, shape[0], (total,)),
+                    torch.ones(total, dtype=dtype),
+                )
+            return torch.cumsum(counts, dim=0, dtype=dtype)
         elif init == "full":
             return torch.full(shape, ia.fill_value, dtype=dtype)
         elif init == "zeros":
@@ -391,6 +411,16 @@ class InputTensorSpec(BaseModel):
                 t = torch.ones(shape, dtype=dtype)
             elif init == "randint":
                 t = torch.randint(ia.low, ia.high, shape, dtype=dtype)
+            elif init == "cumsum_offsets":
+                assert ia.total is not None  # enforced by validate_cross_fields
+                total = ia.total
+                counts = torch.zeros(shape[0], dtype=dtype)
+                counts.scatter_add_(
+                    0,
+                    torch.randint(0, shape[0], (total,)),
+                    torch.ones(total, dtype=dtype),
+                )
+                t = torch.cumsum(counts, dim=0, dtype=dtype)
             elif init == "arange":
                 t = torch.arange(shape[0], dtype=dtype)
             elif init == "eye":
@@ -953,6 +983,19 @@ class InputsEdits(BaseModel):
                         f"config so the constructor arg uses 'config_path' + "
                         f"'config_kwargs' instead of a bare '<config:...>' value."
                     )
+                # A dtype recorded as its repr (e.g. 'torch.bfloat16'). Left as
+                # a string it reaches the op as a positional arg and is
+                # misinterpreted -- x.to('torch.bfloat16') parses it as a
+                # DEVICE string and raises. kwargs already resolve dtypes;
+                # positional values get the same treatment. Gated on a known
+                # dtype name so device strings ('cpu', 'cuda:0') and any other
+                # 'torch.'-prefixed value fall through unchanged.
+                if (
+                    isinstance(val, str)
+                    and val.startswith("torch.")
+                    and val.removeprefix("torch.") in _VALID_DTYPE_STRINGS
+                ):
+                    val = _resolve_dtype_str(val)
                 if (
                     test_device is not None
                     and op_name == "torch.to"
@@ -984,6 +1027,29 @@ class InputsEdits(BaseModel):
                 raise ValueError(f"Unknown InputArg type: {type(arg)}")
 
         return cpu_args
+
+    def resolved_device_args(
+        self,
+        *,
+        test_device: Optional[torch.device],
+        op_name: str = "",
+    ) -> Dict[int, Any]:
+        """Return {arg_index: test_device} for positional device args.
+
+        ``torch.to("cuda:0")`` names its destination positionally, so it takes
+        the same substitution ``resolved_kwargs`` rule 2 applies to a ``device``
+        kwarg. Only indices holding a device are returned, so callers can overlay
+        them onto CPU-built args without disturbing other values.
+        """
+        out: Dict[int, Any] = {}
+        if test_device is None or op_name != "torch.to":
+            return out
+        for i, raw in enumerate(self.args):
+            arg = _parse_input_arg(raw) if isinstance(raw, dict) else raw
+            val = getattr(arg, "value", None)
+            if isinstance(val, str) and "cuda" in val:
+                out[i] = test_device
+        return out
 
     def resolved_kwargs(
         self,
@@ -1023,7 +1089,10 @@ class InputsEdits(BaseModel):
         3. ast.literal_eval fallback                 -> Python literal (tuple, int, etc.)
         4. pass through as-is
 
-        None, bool, and numeric values pass through unchanged.
+        None, bool, and numeric values pass through unchanged. A scalar wrapped
+        in the ``{value: X}`` spec form (``position_ids: {value: null}``,
+        ``use_cache: {value: true}``) is unwrapped to bare ``X``, matching how
+        ``build_cpu_args`` treats the same spec positionally.
 
         A bare ``device_layout`` dict with no ``tensor`` wrapper isn't a shape
         _parse_input_arg understands (device_layout only exists nested inside
@@ -1042,6 +1111,7 @@ class InputsEdits(BaseModel):
             "model_id",
             "cache",
             "py",
+            "value",
         }
 
         out: Dict[str, Any] = {}
@@ -1077,6 +1147,15 @@ class InputsEdits(BaseModel):
                     out[k] = _build_cache(arg, seed=inp_seed, test_device=test_device)
                 elif isinstance(arg, InputArgPy):
                     out[k] = _eval_py_literal(arg.py)
+                elif isinstance(arg, InputArgValue):
+                    # A plain scalar / None / bool wrapper, the kwarg spelling of
+                    # the positional {'value': X} form. Unwrapped here so that
+                    # e.g. ``position_ids: {value: null}`` reaches forward() as
+                    # None rather than as the literal dict {'value': None} --
+                    # which a module would take as a real (truthy) argument and
+                    # then fail on, or silently mis-handle in the case of
+                    # ``use_cache: {value: true}``.
+                    out[k] = arg.value
                 continue
 
             if isinstance(v, dict) and "device_layout" in v:
@@ -1152,6 +1231,13 @@ class ModulesNamedItem(BaseModel):
     # Consumed by the out-of-tree custom module tests; ignored on devices with no
     # layout concept (e.g. CPU).
     apply_device_layout: bool = False
+
+    # FP8 matmul support for the out-of-tree custom module tests, which interpret
+    # both; the framework only carries them. ``fp8_linears``: submodule paths
+    # (relative; "" = this module) production runs as FP8 linears. ``precision``:
+    # a per-module tolerance, as upstream's overrides are keyed by dtype only.
+    fp8_linears: List[str] = []
+    precision: Optional[Precision] = None
 
     sample_inputs_func: InputsEdits = InputsEdits()  # Legacy: forward inputs only
     constructor_inputs: Optional[InputsEdits] = None  # New: explicit constructor inputs
@@ -1295,7 +1381,9 @@ class OpsNamedItem(BaseModel):
             op_name=self.name,
             test_device=test_device,
         )
-        resolved_kw = self.sample_inputs_func.resolved_kwargs(test_device=test_device)
+        resolved_kw = self.sample_inputs_func.resolved_kwargs(
+            seed=seed, test_device=test_device
+        )
         inp = cpu_args[0] if cpu_args else None
         rest = tuple(cpu_args[1:]) if len(cpu_args) > 1 else ()
         return SampleInput(inp, args=rest, kwargs=resolved_kw)

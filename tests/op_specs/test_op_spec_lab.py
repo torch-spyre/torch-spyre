@@ -21,6 +21,7 @@ that it still works when someone reaches for it.  Everything here is pure Python
 
 import ast
 import builtins
+import inspect
 import os
 import sys
 import types
@@ -30,9 +31,11 @@ import pytest
 from sympy import sympify
 
 import torch
+from torch._inductor.codecache import CodeCacheFuture
 
 from torch_spyre._C import DataFormats, ElementArrangement
 from torch_spyre._inductor import config as spyre_config
+from torch_spyre._inductor.core_mapping import derive_operation_mapping
 from torch_spyre._inductor.op_spec import (
     DebugHandle,
     LoopSpec,
@@ -52,13 +55,15 @@ import runner  # noqa: E402
 
 def _add_op(debug_handle=None):
     """A 128x256 fp16 elementwise add -- the shape verified on hardware."""
+    iteration_space = {
+        sympify("c0"): (sympify("128"), 32),
+        sympify("c1"): (sympify("256"), 1),
+    }
     return OpSpec(
         op="add",
         is_reduction=False,
-        iteration_space={
-            sympify("c0"): (sympify("128"), 32),
-            sympify("c1"): (sympify("256"), 1),
-        },
+        iteration_space=iteration_space,
+        core_id_to_work_slice=derive_operation_mapping(iteration_space),
         op_info={},
         debug_handle=debug_handle,
         args=[
@@ -78,9 +83,16 @@ def _add_op(debug_handle=None):
 
 
 def _pool_op():
-    """An add whose output spilled to the HBM pool, so .run() gets a pool first."""
+    """An add whose output spilled to the HBM pool, leaving two kernel args.
+
+    ``arg_index=-1`` is what makes this a *real* pool spec rather than one that
+    only looks like it: ``generate_bundle`` keys its ``device_mem_allocate`` on
+    the pooled tensor being an intermediate, so with a non-negative arg_index it
+    emits no pool at all and accepts ``pool_size=0`` without complaint.
+    """
     op = _add_op()
     op.args[2].allocation = {"hbm_pool": 0}
+    op.args[2].arg_index = -1
     return op
 
 
@@ -95,12 +107,7 @@ class _FakeLayout:
 
 
 class _FakeTensor:
-    """A stand-in for a device tensor, counting the .cpu() calls it receives.
-
-    The pool must never get one: per _record_args, ``pool.cpu()`` on the flat
-    SENINT8 pool aborts the process, so "was .cpu() called" is the assertion that
-    matters and a real tensor could not make it.
-    """
+    """A stand-in for a device tensor, counting the .cpu() calls it receives."""
 
     def __init__(self, shape=(128, 256), dtype=torch.float16, numel=32768):
         self.shape = shape
@@ -130,6 +137,39 @@ class _FakeRunner:
         self.launches.append(args)
 
 
+def _fake_sdsc(self, kernel_name, specs, pool_size=0):
+    """Stand in for sdsc() with its real signature, so the spy is called as it is."""
+    return _FakeRunner()
+
+
+def _fake_ktir(self, kernel_name, specs):
+    """The same for ktir(), whose signature carries no pool_size."""
+    return _FakeRunner()
+
+
+class _FakeCompiler:
+    """A SpyreAsyncCompile recording which emitter it was asked for.
+
+    Patched in as the class rather than the method: the real constructor starts
+    AsyncCompile's worker pool, which a test that compiles nothing has no use for.
+    """
+
+    def __init__(self):
+        self.calls = []
+
+    def sdsc(self, name, specs, pool_size=0):
+        self.calls.append("sdsc")
+        return _FakeRunner()
+
+    def ktir(self, name, specs):
+        self.calls.append("ktir")
+        return _FakeRunner()
+
+    def wait(self, scope):
+        # The real one resolves futures here; these fakes are already runners.
+        return None
+
+
 def _arg_record(dtype=torch.float16):
     return capture.ArgRecord(
         shape=(128, 256),
@@ -141,17 +181,17 @@ def _arg_record(dtype=torch.float16):
     )
 
 
-def _record(name="sdsc_add_0", pool_bytes=0):
+def _record(name="sdsc_add_0", pool_size=0):
     return capture.KernelRecord(
         name=name,
         specs=[_add_op()],
         index=0,
         sencores=32,
         bundle_symbolic_args=True,
+        pool_size=pool_size,
         # A distinct record per arg: sharing one object made a test that retyped
         # arg0 silently retype all three.
         args=[_arg_record() for _ in range(3)],
-        pool_bytes=pool_bytes,
         observed_run=True,
     )
 
@@ -196,9 +236,10 @@ def test_render_discloses_that_a_layout_label_is_not_a_role():
 
 
 def test_render_reports_the_pool_it_was_given():
-    out = explain.render([_add_op()], kernel_name="k", pool_bytes=32768)
+    out = explain.render([_add_op()], kernel_name="k", pool_size=32768)
     assert "32768-byte pool" in out  # title
-    assert "32768 bytes (uint8) -- passed first to .run()" in out
+    # The bundle emits its own device_mem_allocate, so the pool is not an arg.
+    assert "32768 bytes -- allocated by the bundle, not an arg" in out
     assert "no pool" in explain.render([_add_op()], kernel_name="k")
 
 
@@ -301,16 +342,65 @@ def test_emitted_script_executes_its_definitions():
     break every future capture at *its* import time.  ``__main__`` does not fire
     under exec, so nothing is compiled or launched.
     """
-    src = capture.emit_script(_record(pool_bytes=32768), "prog.py", 1, False)
+    src = capture.emit_script(_record(pool_size=32768), "prog.py", 1, False)
     namespace: dict = {"__file__": "/tmp/captured/sdsc_add_0.py"}
     exec(compile(src, "<emitted>", "exec"), namespace)  # noqa: S102
     assert namespace["KERNEL_NAME"] == "sdsc_add_0"
-    assert namespace["POOL_BYTES"] == 32768
+    assert namespace["POOL_SIZE"] == 32768
     assert len(namespace["ops"]) == 1
     assert len(namespace["LAYOUTS"]) == 3
     # Keyed on the script, not the kernel: two graphs can share a fused name, and
     # a kernel-keyed .pt would be clobbered by the second capture.
     assert namespace["INPUTS_PT"] == "/tmp/captured/sdsc_add_0.inputs.pt"
+
+
+def test_emitted_script_forwards_the_pool_size():
+    """A pool kernel bundles only if pool_size reaches sdsc().
+
+    ``generate_bundle`` asserts ``0 < pool_size`` whenever a pool symbol is
+    present, so an emitted script that drops it fails in codegen -- no device
+    needed to get it wrong.
+    """
+    src = capture.emit_script(_record(pool_size=32768), "prog.py", 1, False)
+    assert "POOL_SIZE = 32768" in src
+    assert "pool_size=POOL_SIZE" in src
+
+
+def test_bundling_a_pool_spec_emits_the_pool_allocation(tmp_path):
+    """Bundle a pool spec for real -- no device, no mock, no backend compiler.
+
+    The unmocked call is the point: ``generate_bundle`` is where a dropped
+    pool_size actually bites, and it asserts ``0 < pool_size`` only when it sees
+    a pool symbol. So this fails on a lab that forgets to forward the size, where
+    a mocked ``generate_bundle`` would happily record the call and pass.
+    """
+    with spyre_config.patch(  # type: ignore[attr-defined]
+        bundle_symbolic_args=True, frontend_pool_allocation=False
+    ):
+        listing = runner.bundle_op_specs(
+            "k", [_pool_op()], str(tmp_path), pool_size=32768
+        )
+        assert "bundle.mlir" in listing
+        mlir = (tmp_path / "bundle.mlir").read_text()
+        assert "sdscbundle.device_mem_allocate 32768 bytes" in mlir
+
+        with pytest.raises(AssertionError, match="pool_size=0 out of range"):
+            runner.bundle_op_specs("k", [_pool_op()], str(tmp_path / "dropped"))
+
+
+def test_run_op_specs_forwards_the_pool_size():
+    """The replay path, which is where a dropped pool_size would go unnoticed."""
+    tensors = [torch.zeros(4, dtype=torch.float16) for _ in range(2)]
+    fake = _FakeRunner()
+    with (
+        patch.object(runner, "to_device", lambda ts, layouts=None: list(ts)),
+        patch.object(SpyreAsyncCompile, "sdsc", return_value=fake) as sdsc,
+    ):
+        runner.run_op_specs("k", [_pool_op()], tensors, pool_size=32768)
+
+    assert sdsc.call_args.kwargs["pool_size"] == 32768
+    # The pool is not an argument any more, so only the kernel args reach .run().
+    assert len(fake.launches[0]) == 2
 
 
 def test_runner_template_is_self_contained():
@@ -362,36 +452,45 @@ def test_write_kernel_disambiguates_script_and_pt_together(tmp_path):
         assert os.path.exists(os.path.splitext(path)[0] + ".inputs.pt")
 
 
-def test_record_args_pops_the_pool_and_never_reads_it():
-    """The pool is .run()'s first argument, identified by the shared predicate.
+def test_spy_accepts_everything_sdsc_accepts():
+    """The spy stands in for sdsc(), so it must take sdsc()'s parameters.
 
-    ``uses_hbm_pool`` is what ``call_kernel`` used to prepend the pool, so
-    _record_args has to reach the same verdict. Getting it wrong is not a bad
-    label: it means calling .cpu() on the flat pool tensor, which aborts the
-    process rather than failing an assertion.
+    #3707 added ``pool_size`` and the spy did not follow, which left every
+    pool-using program uncapturable -- a TypeError raised through the Inductor
+    backend -- while this suite stayed green, because every other test here
+    patches sdsc itself and never exercises the real signature.
+    """
+    real = inspect.signature(SpyreAsyncCompile.sdsc)
+    with capture.capture_kernels():
+        spy = inspect.signature(SpyreAsyncCompile.sdsc)
+
+    assert list(spy.parameters) == list(real.parameters)
+
+
+def test_record_args_keeps_every_arg_for_a_pool_kernel():
+    """Nothing is skipped even when the kernel spills to the pool.
+
+    Since #3707 the bundle allocates its own pool via ``device_mem_allocate``, so
+    no pool tensor is passed at launch and ``arg_index`` is the ``.run()``
+    position for every arg. Popping one here would silently drop arg0 from the
+    capture and record its ``numel()`` as a byte count.
     """
     rec = capture.KernelRecord(
         name="k", specs=[_pool_op()], index=0, sencores=32, bundle_symbolic_args=True
     )
-    pool = _FakeTensor(shape=(32768,), dtype=torch.uint8, numel=32768)
-    args = (pool, _FakeTensor(), _FakeTensor(), _FakeTensor())
+    capture._record_args(rec, tuple(_FakeTensor() for _ in range(2)), save_inputs=True)
 
-    capture._record_args(rec, args, save_inputs=True)
-
-    assert rec.pool_bytes == 32768
-    assert len(rec.args) == 3
-    assert pool.cpu_calls == 0
+    assert rec.pool_size == 0  # only the sdsc() keyword sets this
+    assert len(rec.args) == 2
     assert all(a.values is not None for a in rec.args)
 
 
-def test_record_args_keeps_every_arg_when_there_is_no_pool():
-    """Nothing is popped for a pool-free kernel, so arg0 stays arg0."""
+def test_record_args_records_the_layout_of_every_arg():
     rec = capture.KernelRecord(
         name="k", specs=[_add_op()], index=0, sencores=32, bundle_symbolic_args=True
     )
     capture._record_args(rec, tuple(_FakeTensor() for _ in range(3)), save_inputs=False)
 
-    assert rec.pool_bytes == 0
     assert len(rec.args) == 3
     assert rec.args[0].device_dtype_name == "SEN169_FP16"
     assert rec.args[0].element_arrangement_name == "STANDARD"
@@ -413,6 +512,36 @@ def test_run_recorder_records_the_first_launch_only():
     assert len(rec.args) == 3  # not 6
     assert len(inner.launches) == 2  # both still reached the real runner
     assert proxy.code_dir == inner.code_dir  # unknown attributes forward
+
+
+def test_capture_preserves_compile_future_until_runner_resolution():
+    class _FakeCompileFuture(CodeCacheFuture):
+        def __init__(self, runner):
+            self.runner = runner
+            self.timeout = None
+
+        def result(self, timeout=None):
+            self.timeout = timeout
+            return self.runner
+
+    inner = _FakeRunner()
+    future = _FakeCompileFuture(inner)
+    compiler = SpyreAsyncCompile()
+    with patch.object(SpyreAsyncCompile, "sdsc", return_value=future):
+        with capture.capture_kernels() as records:
+            scope = {"kernel": compiler.sdsc("sdsc_stub_0", [_add_op()])}
+
+    assert isinstance(scope["kernel"], CodeCacheFuture)
+    with torch._inductor.config.patch(
+        {"compile_threads": 2, "compile_worker_wait_timeout": 17}
+    ):
+        compiler.wait(scope)
+
+    assert future.timeout == 17
+    recorder = scope["kernel"]
+    assert isinstance(recorder, capture._RunRecorder)
+    assert recorder._inner is inner
+    assert recorder._rec is records[0]
 
 
 def _stub_sdsc_program(tmp_path, body):
@@ -437,7 +566,7 @@ def test_capture_writes_what_it_recorded_before_the_target_crashed(tmp_path, cap
     )
     out_dir = tmp_path / "captured"
 
-    with patch.object(SpyreAsyncCompile, "sdsc", lambda self, n, s: _FakeRunner()):
+    with patch.object(SpyreAsyncCompile, "sdsc", _fake_sdsc):
         status = capture.main([str(program), "--out", str(out_dir)])
 
     # Not 0: a caller has to be able to tell a partial capture from a whole one
@@ -454,7 +583,7 @@ def test_capture_of_a_clean_program_exits_zero(tmp_path):
     program = _stub_sdsc_program(tmp_path, body)
     out_dir = tmp_path / "captured"
 
-    with patch.object(SpyreAsyncCompile, "sdsc", lambda self, n, s: _FakeRunner()):
+    with patch.object(SpyreAsyncCompile, "sdsc", _fake_sdsc):
         assert capture.main([str(program), "--out", str(out_dir)]) == 0
 
     assert (out_dir / "sdsc_ok_0.py").exists()
@@ -502,7 +631,7 @@ def test_build_tensors_synthesizes_fp8_args():
     src = capture.emit_script(rec, "prog.py", 1, False)
     exec(compile(src, "<emitted>", "exec"), namespace)  # noqa: S102
 
-    tensors, _ = namespace["build_tensors"]()
+    tensors = namespace["build_tensors"]()
 
     assert tensors[0].dtype == torch.float8_e4m3fn
     assert tuple(tensors[0].shape) == (128, 256)
@@ -521,6 +650,137 @@ def test_pin_bundle_symbolic_args_ignores_an_unrecorded_value():
     with spyre_config.patch(bundle_symbolic_args=True):  # type: ignore[attr-defined]
         runner.pin_bundle_symbolic_args(None)
         assert spyre_config.bundle_symbolic_args is True
+
+
+def _ktir_stage(tmp_path, emitted="module {}\n", available=True):
+    """Drive ``--stage ktir`` with the emitter stubbed; return (calls, out_dir).
+
+    The emitter itself is covered by test_ktir_emitter.py against real dialect
+    bindings; what is under test here is the stage -- the filename it writes and
+    the ``bake_addresses`` it derives -- so ``generate_ktir`` is a spy and this
+    runs with no mlir_ktdp installed.
+    """
+    calls: list = []
+
+    def fake_generate_ktir(name, specs, **options):
+        calls.append((name, list(specs), options))
+        return emitted
+
+    out_dir = str(tmp_path / "ktir_out")
+    argv = ["--stage", "ktir", "--out-dir", out_dir]
+    with (
+        patch.object(runner, "generate_ktir", fake_generate_ktir),
+        patch.object(runner, "dialect_available", lambda: available),
+    ):
+        runner.main("ktir_add_0", [_add_op()], [], argv=argv)
+    return calls, out_dir
+
+
+def test_ktir_stage_writes_the_dialect_text(tmp_path):
+    """``--stage ktir`` is the KTIR counterpart of ``--stage bundle``."""
+    calls, out_dir = _ktir_stage(tmp_path, emitted="module { /* kernel */ }\n")
+
+    assert len(calls) == 1
+    assert calls[0][0] == "ktir_add_0"
+    with open(os.path.join(out_dir, "ktir_add_0.ktir")) as fh:
+        assert fh.read() == "module { /* kernel */ }\n"
+
+
+@pytest.mark.parametrize("symbolic", [True, False])
+def test_ktir_stage_bakes_addresses_iff_the_capture_did(tmp_path, symbolic):
+    """The two forms read different fields, so this cannot be a free choice.
+
+    A baked emission resolves ``allocation["hbm"]`` as a byte address, which the
+    spec only holds under ``bundle_symbolic_args=False``; the symbolic form never
+    reads it. Deriving the option from the pinned flag is what keeps a captured
+    script off the ambient environment here too.
+    """
+    with spyre_config.patch(bundle_symbolic_args=symbolic):  # type: ignore[attr-defined]
+        calls, _ = _ktir_stage(tmp_path)
+
+    assert calls[0][2] == {"bake_addresses": not symbolic}
+
+
+def test_ktir_stage_names_the_missing_bindings(tmp_path):
+    """mlir_ktdp is an extra, so its absence is a setup step, not a traceback."""
+    with pytest.raises(SystemExit) as exc:
+        _ktir_stage(tmp_path, available=False)
+
+    assert "tools/install-ktir.sh" in str(exc.value)
+
+
+def test_run_stage_compiles_through_the_emitter_that_built_the_spec():
+    """A KTIR spec's baked addresses make generate_bundle refuse it outright.
+
+    So the choice cannot come from the ambient config: it has to be the value the
+    capture recorded, or a replay of a KTIR kernel fails in the SDSC emitter with
+    a message about a flag rather than about the wrong backend.
+    """
+    compiler = _FakeCompiler()
+    tensors = [torch.zeros(2, 2, dtype=torch.float16)]
+    with (
+        patch.object(runner, "SpyreAsyncCompile", lambda: compiler),
+        patch.object(runner, "to_device", lambda ts, layouts=None: list(ts)),
+    ):
+        runner.run_op_specs("k", [_add_op()], tensors, ktir_emitter=True)
+        runner.run_op_specs("k", [_add_op()], tensors, ktir_emitter=False)
+
+    assert compiler.calls == ["ktir", "sdsc"]
+
+
+def test_emitted_script_pins_the_emitter():
+    """Same reason as BUNDLE_SYMBOLIC_ARGS: the ambient config may disagree."""
+    rec = _record()
+    rec.ktir_emitter = True
+    src = capture.emit_script(rec, "prog.py", 1, False)
+    namespace: dict = {"__file__": "/tmp/captured/ktir_add_0.py"}
+    exec(compile(src, "<emitted>", "exec"), namespace)  # noqa: S102
+
+    assert namespace["KTIR_EMITTER"] is True
+    assert "ktir_emitter=KTIR_EMITTER" in src
+    # The stage that cannot work on this spec is not advertised: a KTIR spec's
+    # addresses are baked, and generate_bundle rejects those.  Matched on the
+    # invocation, since the inlined main() documents both stages either way.
+    assert "<this file> --stage ktir" in src
+    assert "<this file> --stage bundle" not in src
+
+
+def test_capture_sees_the_ktir_emitter(tmp_path):
+    """Spying sdsc alone made a KTIR-mode capture record nothing at all.
+
+    Which surfaces as "no kernels captured: check the script calls torch.compile"
+    -- a hint that sends the reader to look at their program instead of at the
+    emitter their environment selected.
+    """
+    program = _stub_sdsc_program(
+        tmp_path, "SpyreAsyncCompile().ktir('ktir_stub_0', [])\n"
+    )
+    out_dir = tmp_path / "captured"
+    argv = [str(program), "--out", str(out_dir), "--emitter", "ktir"]
+
+    with patch.object(SpyreAsyncCompile, "ktir", _fake_ktir):
+        status = capture.main(argv)
+
+    assert status == 0
+    assert "KTIR_EMITTER = True" in (out_dir / "ktir_stub_0.py").read_text()
+
+
+def test_no_execute_stubs_every_backend_hook(tmp_path):
+    """--no-execute's mock targets are only resolved when --no-execute is used.
+
+    ``patch()`` raises AttributeError on a target that has been renamed, so the
+    KTIR pair -- reached by no other test -- would rot unnoticed otherwise.
+    """
+    program = _stub_sdsc_program(
+        tmp_path, "SpyreAsyncCompile().sdsc('sdsc_stub_0', [])\n"
+    )
+    out_dir = tmp_path / "captured"
+
+    with patch.object(SpyreAsyncCompile, "sdsc", _fake_sdsc):
+        status = capture.main([str(program), "--out", str(out_dir), "--no-execute"])
+
+    assert status == 0
+    assert (out_dir / "sdsc_stub_0.py").exists()
 
 
 def test_dedup_ignores_provenance_only_differences():
