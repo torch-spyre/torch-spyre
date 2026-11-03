@@ -1316,7 +1316,8 @@ SUBSTICK_POOL, SUBSTICK_WIDTH, SUBSTICK_TRIPS, SUBSTICK_TILE = 256, 128, 4, 2
 
 class TestForEachTileSubStickAdvanceE2E(_DynamoResetTestCase):
     """A ``for_each_tile`` whose per-trip indirect-index advance is narrower
-    than one physical stick must not be silently compiled to a wrong answer.
+    than one physical stick must be refused at compile time, not silently
+    compiled to a wrong answer.
 
     ``ids`` is an int32 tile-advancing (``Kind.SLICE``) operand tiled with
     ``tile_size=SUBSTICK_TILE=2``; each trip therefore advances the index
@@ -1327,45 +1328,28 @@ class TestForEachTileSubStickAdvanceE2E(_DynamoResetTestCase):
     trip. #4829's own regression coverage of that guard
     (``TestIndirectIndexStepGuard`` in test_for_each_tile_lowering.py) only
     exercises it via a synthetic CPU ``sympy`` expression; no test compiles
-    an actual sub-stick advance on device. This test closes that gap.
-
-    It originally asserted that compiling ``substick_gather_fn`` *raises*
-    ``UnalignedStickSplit`` (through the wrapping ``InductorError``), since
-    refusing was then the only alternative to a plausible-looking wrong
-    answer. The stick-reshape pivot pass now relays this graph out to a
-    layout the backend can address, so it compiles and returns the right
-    values, and the assertion checks those values instead. What the test
-    guards is unchanged: a sub-stick advance must never return the #4835
-    answer, where the first tile's gather is repeated on every trip. The
-    guard itself is still covered by ``TestIndirectIndexStepGuard``.
-
-    See issue #4835 and the parent issue #4828.
+    an actual sub-stick advance on device. This test closes that gap: it
+    asserts that compiling ``substick_gather_fn`` raises the documented
+    ``UnalignedStickSplit`` failure (surfaced through the wrapping
+    ``InductorError``) instead of returning a plausible-looking wrong
+    answer. See issue #4835 and the parent issue #4828.
     """
 
-    def test_substick_indirect_advance_is_correct(self):
-        ids_cpu = torch.arange(SUBSTICK_TRIPS, dtype=torch.int32)
-        pool_cpu = torch.randn(SUBSTICK_POOL, SUBSTICK_WIDTH, dtype=torch.float16)
-        init_cpu = torch.zeros(SUBSTICK_TILE, SUBSTICK_WIDTH, dtype=torch.float16)
+    def test_substick_indirect_advance_is_refused(self):
+        import pytest
+        from torch._inductor.exc import InductorError
 
-        # One accumulation per trip, which is what for_each_tile computes.
-        want = init_cpu.float()
-        for start in range(0, SUBSTICK_TRIPS, SUBSTICK_TILE):
-            want = want + pool_cpu[ids_cpu[start : start + SUBSTICK_TILE]].float()
+        ids = torch.arange(SUBSTICK_TRIPS, dtype=torch.int32).to(DEVICE_NAME)
+        pool = torch.randn(SUBSTICK_POOL, SUBSTICK_WIDTH, dtype=torch.float16).to(
+            DEVICE_NAME
+        )
+        init = torch.zeros(SUBSTICK_TILE, SUBSTICK_WIDTH, dtype=torch.float16).to(
+            DEVICE_NAME
+        )
 
         compiled = torch.compile(substick_gather_fn, backend="inductor", fullgraph=True)
-        got = compiled(
-            pool_cpu.to(DEVICE_NAME), ids_cpu.to(DEVICE_NAME), init_cpu.to(DEVICE_NAME)
-        )
-        torch.testing.assert_close(got.cpu().float(), want, atol=1e-2, rtol=1e-2)
-
-        # Guard the specific #4835 failure: the first tile repeated every trip.
-        repeated = (SUBSTICK_TRIPS // SUBSTICK_TILE) * pool_cpu[
-            ids_cpu[:SUBSTICK_TILE]
-        ].float()
-        self.assertFalse(
-            torch.allclose(got.cpu().float(), repeated, atol=1e-2, rtol=1e-2),
-            "sub-stick advance repeated the first tile's gather (#4835)",
-        )
+        with pytest.raises(InductorError, match="cuts tensor.*physical stick"):
+            compiled(pool, ids, init)
 
 
 class TestForEachTileGraphShapesE2E(_DynamoResetTestCase):
