@@ -2360,13 +2360,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     0.0,
                 ),
             },
-            # A backend regression makes these cases fail their correctness check.
-            # Non-strict, so an unexpected pass does not fail the run. Remove the
-            # entries when #5950 is fixed.
-            "expect_fail_unstable": {
-                "2d_dim1": "keep_by_index result fails the correctness check, #5950",
-                "4d_dim2": "keep_by_index result fails the correctness check, #5950",
-            },
         },
         ("test_reduce_keepdim0", "test_reduce_keepdim0_cpu"): {
             "ops_dict": CORE_REDUCTION_OPS_DICT,
