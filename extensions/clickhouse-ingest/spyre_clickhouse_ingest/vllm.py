@@ -33,7 +33,7 @@ from typing import Any
 
 from .client import tables_present
 from .writer import benchmarks_already_ingested, insert_benchmarks
-from . import schema
+from . import benchmeta, schema
 
 log = logging.getLogger(__name__)
 
@@ -264,7 +264,8 @@ def extract_rows(
     all_json = set(glob.glob(f"{results_dir}/*.json"))
     pytorch_files = set(glob.glob(f"{results_dir}/*.pytorch.json"))
     host_resource_files = set(glob.glob(f"{results_dir}/*.host_resources.json"))
-    native_files = sorted(all_json - pytorch_files - host_resource_files)
+    sidecars = {f for f in all_json if benchmeta.is_sidecar(os.path.basename(f))}
+    native_files = sorted(all_json - pytorch_files - host_resource_files - sidecars)
     log.info(
         "Found %d vLLM-native, %d PyTorch-format, and %d host-resource JSON files in %s",
         len(native_files),
@@ -396,6 +397,16 @@ def extract_rows(
             r["extra"] = json.dumps(extra)
             counted.add(name)
 
+    meta: dict[str, dict[str, str]] = {}
+    for r in rows:
+        extra = json.loads(r["extra"])
+        name = extra.get("test_name") or ""
+        if name not in meta:
+            meta[name] = benchmeta.props_for(results_dir, name)
+        if meta[name]:
+            extra["run_props"] = meta[name]
+            r["extra"] = json.dumps(extra)
+
     log.info("Total rows extracted: %d", len(rows))
     return rows
 
@@ -441,6 +452,7 @@ def bench_entries(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             props["model"] = model
         run_props = {k: str(r.get(k, "")) for k in _RUN_PROP_COLUMNS}
         run_props.update({k: str(extra.get(k, "")) for k in _RUN_PROP_EXTRA_KEYS})
+        run_props.update(extra.get("run_props") or {})
         # One key per metric: the writer merges run_props by update.
         unit = metric_unit(r["metric"])
         if unit:
