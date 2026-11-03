@@ -72,6 +72,7 @@ Usage::
 """
 
 import functools
+import os
 import warnings
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -216,7 +217,9 @@ def _embedding_stick_size(weight: torch.Tensor, dev_dtype: torch.dtype) -> int |
         f"Embedding hidden dim {d} is not a multiple of the Spyre stick "
         f"size {eps} for dtype {dev_dtype}; falling back to the default "
         "layout (no gather optimization) for this embedding table.",
-        stacklevel=3,
+        # Point at the first caller outside torch_spyre: the walk is recursive,
+        # so a fixed stacklevel would land inside it.
+        skip_file_prefixes=(os.path.dirname(__file__) + os.sep,),
     )
     return None
 
@@ -423,7 +426,7 @@ def _transfer_module(
     uploads: list[_Upload],
     prefix: str = "",
     use_fp8_weights: bool = False,
-    seen: set[nn.Module] | None = None,
+    seen: set[int] | None = None,
 ) -> None:
     """Recursively list ``module``'s params/buffers to move to Spyre.
 
@@ -435,11 +438,12 @@ def _transfer_module(
     Tensors already on Spyre are skipped (idempotent). ``prefix`` is the
     module's dotted path (as in ``named_modules``) for logs.
     """
+    # Keyed on id(): a module that overrides __eq__ must not hide a sibling.
     if seen is None:
         seen = set()
-    if module in seen:
+    if id(module) in seen:
         return
-    seen.add(module)
+    seen.add(id(module))
     if _module_overrides_apply(module):
         module._apply(
             lambda t: (
@@ -492,7 +496,7 @@ def _upload_parameter(
     p: torch.Tensor,
     name: str,
     is_linear: bool,
-    is_embedding: bool,
+    indirect: bool,
     dtype: torch.dtype | None,
     prefix: str,
     use_fp8_weights: bool,
@@ -500,8 +504,9 @@ def _upload_parameter(
     """Upload one parameter in its best layout; return (device tensor, kind).
 
     Normal modules get the optimal ``dim_order=[1, 0]`` layout for 2D
-    ``nn.Linear`` weights, the gather-optimal indirect-access layout for 2D
-    ``nn.Embedding`` tables, and the default layout for everything else. When
+    ``nn.Linear`` weights, the gather-optimal indirect-access layout when
+    ``indirect`` (a 2D ``nn.Embedding`` table whose hidden dim tiles into
+    sticks, checked by the walk), and the default layout for everything else. When
     ``use_fp8_weights=True``, ``torch.float8_e4m3fn`` Linear weights are loaded
     with KERNEL layout and ``ElementArrangement.QFP8WT`` for direct use with
     ``_scaled_mm``.
@@ -538,18 +543,16 @@ def _upload_parameter(
             list(p.shape),
         )
         return _dma_to_spyre_dim_order_swapped(p, target_dtype=dtype), "linear"
-    if is_embedding and name == "weight" and p.ndim == 2:
+    if indirect:
         dev = _dma_to_spyre_indirect_access(p, target_dtype=dtype)
-        # dev is None if the hidden dim doesn't tile into sticks; the helper
-        # has already warned, so fall through to the default layout below.
-        if dev is not None:
-            logger.debug(
-                "  %s.%s: shape=%s -> Spyre indirect-access (gather) layout",
-                prefix,
-                name,
-                list(p.shape),
-            )
-            return dev, "embedding"
+        assert dev is not None, "the walk checked that the hidden dim tiles"
+        logger.debug(
+            "  %s.%s: shape=%s -> Spyre indirect-access (gather) layout",
+            prefix,
+            name,
+            list(p.shape),
+        )
+        return dev, "embedding"
     logger.debug(
         "  %s.%s: shape=%s -> Spyre default layout",
         prefix,
@@ -666,7 +669,10 @@ def load_model_to_spyre(
 
     The uploads run on ``num_threads`` threads (default: min(8,
     ``torch.get_num_threads()``); at most 16); ``1`` uploads one tensor at a
-    time. Each host tensor can be freed as soon as its upload is done.
+    time. A vLLM TP>1 run with ``SPYRE_UPDATE_THREAD_CONFIG=0`` has
+    ``OMP_NUM_THREADS=1``, so it uploads on one thread unless ``num_threads``
+    is given; the info log shows the count. Each host tensor can be freed as
+    soon as its upload is done.
     Submodules that override ``_apply`` are moved by that ``_apply`` while the
     model is walked, one tensor at a time, before the other uploads start. If
     an upload fails, those and the uploads already done stay on Spyre.
@@ -689,17 +695,20 @@ def load_model_to_spyre(
     counts = {"linear": 0, "fp8_kernel": 0, "embedding": 0, "other": 0, "buffer": 0}
     uploads: list[_Upload] = []
     _transfer_module(model, dtype, uploads, use_fp8_weights=use_fp8_weights)
-    _run_uploads(uploads, counts, _upload_thread_count(num_threads))
+    threads = _upload_thread_count(num_threads)
+    _run_uploads(uploads, counts, threads)
     logger.info(
         "load_model_to_spyre: %d Linear weights (dim_order=[1,0]), "
         "%d FP8 KERNEL weights, "
         "%d Embedding tables (indirect-access layout), %d other "
-        "params and %d buffers transferred with default layout",
+        "params and %d buffers transferred with default layout, "
+        "on up to %d upload threads",
         counts["linear"],
         counts["fp8_kernel"],
         counts["embedding"],
         counts["other"],
         counts["buffer"],
+        threads,
     )
     return model
 

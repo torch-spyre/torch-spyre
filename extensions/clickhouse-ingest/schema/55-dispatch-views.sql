@@ -8,8 +8,8 @@ SELECT
     r.artifact_id                     AS artifact_id,
     r.run_id                          AS run_id,
     r.test_type                       AS test_type,
-    argMax(r.state, r.ts)             AS state,
-    argMax(r.arch, r.ts)              AS arch,
+    argMax(r.state, (r.ts, r.audit_timestamp)) AS state,
+    argMax(r.arch, (r.ts, r.audit_timestamp))  AS arch,
     min(r.ts)                         AS ts,
     max(r.audit_timestamp)            AS seen_at
 FROM v_artifact_results_published AS r

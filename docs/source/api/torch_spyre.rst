@@ -815,10 +815,21 @@ Environment Variables
    * - ``KTIR_DEVICE_MLIR``
      - Path to a ``.mlir`` file declaring the target device for the KTIR
        execution path (default empty)
+   * - ``SPYRE_BACKEND_COMPILE_TIMEOUT_SECONDS``
+     - Wall-clock limit on one backend-compiler (``dbo-opt``) invocation,
+       on both the SDSC bundle and KTIR paths (default ``60``;
+       non-positive values disable the limit)
    * - ``ENABLE_LX_CONTEXT_SWITCHING``
      - Bracket opaque ``FallbackKernel`` calls that have no native Spyre
        lowering with per-buffer LX dump and restore clones, so LX-resident
        buffers survive the call (default ``1``; set ``0`` to disable)
+   * - ``SPYRE_LX_SOLVER_RELAYOUT``
+     - Let a co-optimizing solver that decides LX relayouts (today only
+       CP-SAT) choose them (default ``1``). Set ``0`` to offer it no relayout
+       candidates, so an edge whose views differ spills to HBM and nothing
+       else about the plan changes. Unlike ``SPYRE_LX_PLANNER_RELAYOUT=0``,
+       restickify residency and fused-axis views stay on. Used by the
+       cost-model sweep to measure the spill side of an edge
    * - ``SPYRE_LX_SOLVER_RELAYOUT_GROUPS_PER_EDGE``
      - Number of destination views the CP-SAT relayout enumeration keeps per
        (source, consumer) edge, cheapest first (default ``4``; ``0`` keeps

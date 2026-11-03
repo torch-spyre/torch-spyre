@@ -51,7 +51,7 @@ from torch_spyre._inductor.cost_model import (
     explain,
     predict_ops,
 )
-from torch_spyre._inductor.dump_cost_model import _replication
+from torch_spyre._inductor.cost_features import _replication
 from torch_spyre._inductor.scratchpad.allocator import _COST_PARAMS
 
 ELEMS = 4096

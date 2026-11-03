@@ -12,8 +12,8 @@ requires = [
     "regex",
     "setuptools>=77.0.3",  # match upstream torch dependency range
     "setuptools_scm>=10",
-    "torch~=2.13.0",
-#    "torch>=2.13.0",
+    "torch~=2.14.0",
+#    "torch>=2.14.0",
     "wheel"
 ]
 build-backend = "build_backend"
@@ -28,8 +28,8 @@ description = "Torch-Spyre out of tree registration"
 dependencies = [
     "numpy",
     "regex",
-    "torch~=2.13.0",
-#    "torch>=2.13.0",
+    "torch~=2.14.0",
+#    "torch>=2.14.0",
     "psutil",
     # CP-SAT LX layout solver. `layout_solver` defaults to "cpsat" (see config.py),
     # so a base install needs ortools to actually get it -- without this, every
@@ -58,6 +58,16 @@ dynamic = ["version"]
 cpsat = [
     "ortools>=9.0; platform_machine != 's390x' and platform_machine != 'ppc64le'",
 ]
+# ortools' runtime deps, for arches where ortools is installed out-of-band (--no-deps).
+# Unmarked: a platform_machine marker here flips torch's p/z lock read to 2.13.0+cpu.
+ortools-oob = [
+    "absl-py",
+    "immutabledict",
+    "protobuf",
+    "typing-extensions",
+    # pandas 3.1.0's sdist does not compile on s390x: xtensor-stack/xsimd#954
+    "pandas<3.1.0",
+]
 build = [ # no-isolation build
     # any change here should be reflected in the build system above
     "build",  # only required to build torch_sendnn
@@ -75,8 +85,8 @@ build = [ # no-isolation build
     # this extra, and in uv.lock, or the version falls back to 0.0.0 and
     # version_file is silently never written.
     "setuptools_scm>=10",
-    "torch~=2.13.0",
-#    "torch>=2.13.0",
+    "torch~=2.14.0",
+#    "torch>=2.14.0",
     "wheel"
 ]
 test = [
