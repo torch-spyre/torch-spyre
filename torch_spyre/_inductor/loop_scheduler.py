@@ -29,6 +29,11 @@ longer expands the nodes), so on a compiled graph every ``LoopNode`` reaches
 ``build_loop_scheduler_nodes`` passes it through unchanged (its
 ``_loop_group_id`` is None) and everything after it (fusion, kernel
 preparation, HBM-pool planning, codegen) sees the counted loop it always saw.
+Once the scheduler nodes exist, ``graph.operations`` is the flat leaf list
+again (the structure lives in the scheduler nodes): kernel preparation's LX
+read contracts read it and expect leaf ops.  A kernel op inside a node that
+is not a member of that loop (no matching ``loop_info``) is refused, since it
+would run every trip here and once on the flat path.
 
 The patch reaches into private Inductor code.  It is supported only on the
 torch releases in ``SUPPORTED_RELEASES`` and is refused with ``Unsupported``
@@ -43,7 +48,7 @@ import contextlib
 from collections.abc import Iterator, Sequence
 
 import torch
-from torch._inductor import dependencies
+from torch._inductor import dependencies, ir
 from torch._inductor.scheduler import (
     BaseSchedulerNode,
     ExternKernelSchedulerNode,
@@ -56,7 +61,8 @@ from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 
 from .errors import Unsupported
-from .loop_node import LoopNode
+from .loop_facts import counted_loop_path
+from .loop_node import LoopNode, expand
 from .scheduler import CountedLoopSchedulerNode
 
 SUPPORTED_RELEASES: tuple[tuple[int, int], ...] = ((2, 13), (2, 14))
@@ -75,7 +81,10 @@ PATCHED_SURFACE: tuple[str, ...] = (
     "patched: Scheduler.create_scheduler_node -- a LoopNode becomes one "
     "LoopSchedulerNode; no-op and extern body ops are hoisted",
     "patched: Scheduler.update_zero_dim_cpu_tensor -- first call after "
-    "Scheduler._init builds self.nodes; splices the hoisted ops in",
+    "Scheduler._init builds self.nodes; splices the hoisted ops in and puts "
+    "graph.operations back to the leaf ops",
+    "Scheduler._init -- reads graph.operations only to build self.nodes "
+    "(the scheduler-time Spyre readers after it expect leaf ops)",
     "patched: Scheduler.compute_ancestors -- registers children in "
     "name_to_fused_node, copies order and ancestors down to them",
     "patched: Scheduler.dead_node_elimination -- a buffer a child of the same "
@@ -291,6 +300,41 @@ def _forward_additional_deps(loop: LoopSchedulerNode) -> None:
             table[loop.get_name()].update(names)
 
 
+def _check_members(loop_node: LoopNode, kernels: Sequence[ir.Operation]) -> None:
+    """Refuse a kernel op directly in ``loop_node``'s body that is not a
+    member of that loop.
+
+    A ``LoopSchedulerNode`` runs every kernel child ``trip_count`` times.  The
+    path it replaced decided membership op by op, from ``loop_info``
+    (``build_loop_scheduler_nodes``): an op without this loop's group path ran
+    outside the loop, once.  ``collapse`` keeps an op that sits between two
+    members inside the span, so such an op (an op a pass placed there without
+    ``loop_info``) would silently run every trip on this path -- an
+    accumulator's zero-fill re-run each trip, a wrong answer.  Every direct
+    kernel child must therefore share one group path, and so be in the loop
+    on both paths; a nested loop's members are checked at their own level.
+    """
+    paths = {op.get_name(): counted_loop_path(op) for op in kernels}
+    # ``collapse`` wraps the ops sharing ``path[: depth + 1]`` and recurses on
+    # longer paths, so the direct kernel children of a node built from
+    # ``loop_info`` all have the SAME full path, and a node always starts at
+    # a member.  (A node built by hand from ops without ``loop_info``, as the
+    # unit tests do, has only empty paths and is not checked.)
+    if len(set(paths.values())) <= 1:
+        return
+    outsiders = sorted(name for name, path in paths.items() if not path)
+    detail = (
+        f"{outsiders} are in no counted loop"
+        if outsiders
+        else f"their loop_group_ids differ: {sorted(set(paths.items()))}"
+    )
+    raise Unsupported(
+        f"counted loop {loop_node.get_name()} holds kernel ops that are not all "
+        f"members of it ({detail}); they would run every trip here and "
+        "differently on the flat path"
+    )
+
+
 def _build_loop_scheduler_node(
     scheduler: Scheduler, loop_node: LoopNode
 ) -> LoopSchedulerNode:
@@ -305,6 +349,7 @@ def _build_loop_scheduler_node(
     """
     children: list[BaseSchedulerNode] = []
     hoisted: list[BaseSchedulerNode] = []
+    kernels: list[ir.Operation] = []
     for op in loop_node.body:
         if isinstance(op, LoopNode):
             inner = _build_loop_scheduler_node(scheduler, op)
@@ -317,6 +362,8 @@ def _build_loop_scheduler_node(
             hoisted.append(snode)
         else:
             children.append(snode)
+            kernels.append(op)
+    _check_members(loop_node, kernels)
     loop = LoopSchedulerNode(scheduler, children, loop_node, hoisted)
     inner_names = loop.get_buffer_names()
     for snode in hoisted:
@@ -384,6 +431,16 @@ def apply_loop_scheduler_patches() -> Iterator[None]:
                     node.hoisted = []
                 spliced.append(node)
             self.nodes = spliced
+            # The loop structure now lives in the scheduler nodes, and
+            # Scheduler._init has read graph.operations for the last time.
+            # Everything that reads it from here on (kernel preparation's LX
+            # read contracts: storage_has_single_writer,
+            # _is_activation_source; Inductor's replace_operation_buffer)
+            # expects leaf ops: a LoopNode has no get_mutation_names
+            # (AttributeError), and its get_read_writes, the union of its
+            # body's, would make a body op's buffer look written by another
+            # op.  So put the leaf list back; each LoopNode keeps its body.
+            expand(V.graph)
         return orig["update_zero_dim_cpu_tensor"](self)
 
     def compute_ancestors(self):

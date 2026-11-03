@@ -25,7 +25,10 @@ Passes that know nothing about nodes run against :class:`OpsView`, which
 iterates the leaf ops in program order and forwards every mutation to the list
 that owns the op.  After the pass loop the nodes stay: each reaches
 Inductor's scheduler as one ``LoopSchedulerNode`` (``loop_scheduler.py``), and
-the readers in between descend into them.  :func:`expand` flattens them only
+the readers in between descend into them; at that hand-off
+:func:`peel_non_members` moves an op a pass left at the edge of a body
+without the loop's ``loop_info`` back out of the node.  :func:`expand`
+flattens them only
 on a pass error, for the passes in ``passes._PASSES_RUN_EXPANDED``, and in the
 equivalence tests that compare against the flat path.
 """
@@ -444,6 +447,60 @@ def expand(graph: Any) -> None:
         return
     with building_loop():
         operations[:] = list(all_ops(operations))
+
+
+def _node_key(node: LoopNode, depth: int) -> tuple[int, ...] | None:
+    """The group path prefix every member of ``node`` (at ``depth``) shares."""
+    for leaf in all_ops(node.body):
+        path = _group_path(leaf)
+        if len(path) > depth:
+            return path[: depth + 1]
+    return None
+
+
+def _belongs(op: ir.Operation, key: tuple[int, ...]) -> bool:
+    if isinstance(op, LoopNode):
+        return True
+    return _group_path(op)[: len(key)] == key
+
+
+def _peel(operations: list[ir.Operation], depth: int) -> None:
+    for i in range(len(operations) - 1, -1, -1):
+        node = operations[i]
+        if not isinstance(node, LoopNode):
+            continue
+        key = _node_key(node, depth)
+        if key is None:
+            continue
+        lead: list[ir.Operation] = []
+        while node.body and not _belongs(node.body[0], key):
+            lead.append(node.body.pop(0))
+        trail: list[ir.Operation] = []
+        while node.body and not _belongs(node.body[-1], key):
+            trail.insert(0, node.body.pop())
+        _peel(node.body, depth + 1)
+        operations[i : i + 1] = [*lead, node, *trail]
+
+
+def peel_non_members(graph: Any) -> None:
+    """Move every op at the head or tail of a ``LoopNode``'s body that is not
+    a member of that loop (by its ``loop_info``) out of the node, to the level
+    it belongs to, keeping the program order.
+
+    A pass running against :class:`OpsView` that inserts an op "before the
+    loop" at the flat position of the loop's first member puts it IN the body
+    (``insert`` places an op beside the op at that position): e.g. the LX
+    allocator's hoisted input clone (``push_allocation_with_clone``), which
+    carries no ``loop_info``.  The flat path rebuilt loops from ``loop_info``,
+    so such an op ran once, before the loop; inside a node it would run every
+    trip.  Peeling it gives the node exactly the flat path's members.  An
+    op that is not a member BETWEEN two members is left where it is (the
+    scheduler refuses it).
+    """
+    if not has_loop_nodes(graph.operations):
+        return
+    with building_loop():
+        _peel(graph.operations, 0)
 
 
 def _inductions_of(

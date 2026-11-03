@@ -40,7 +40,7 @@ from torch._inductor.ir import (
     StorageBox,
     TensorBox,
 )
-from torch._inductor.scheduler import Scheduler, SchedulerNode
+from torch._inductor.scheduler import FusedSchedulerNode, Scheduler, SchedulerNode
 from torch._inductor.virtualized import V
 
 from torch_spyre._inductor import cost_model_pass as cmp
@@ -66,6 +66,11 @@ from torch_spyre._inductor.scheduler import (
     _regroup_by_outer_loop_key,
     build_loop_scheduler_nodes,
 )
+from torch_spyre._inductor.scratchpad.utils import storage_has_single_writer
+from torch_spyre._C import ElementArrangement, SpyreTensorLayout
+from torch_spyre._inductor import config
+from torch_spyre._inductor.hbm_pool_planning import hbm_pool_planning
+from torch_spyre._inductor.ir import FixedTiledLayout
 
 i0, i1 = sympy.symbols("i0 i1", integer=True, nonnegative=True)
 
@@ -421,6 +426,26 @@ class TestSchedulerPassThrough(_Graph):
         with self.assertRaisesRegex(RuntimeError, "not contiguous"):
             build_loop_scheduler_nodes(list(nodes))
 
+    def test_scheduler_time_readers_see_leaf_ops(self):
+        # Scheduler._init reads graph.operations once, to make the scheduler
+        # nodes; kernel preparation reads it again (the LX read contracts:
+        # storage_has_single_writer, _is_activation_source).  Those readers
+        # expect leaf ops: a LoopNode has no get_mutation_names.
+        pre = self._buf("pre")
+        b = self._buf("b", reads="pre", gid=(0,))
+        c = self._buf("c", reads="b", gid=(0, 0))
+        post = self._buf("post", reads="b")
+        self.outputs = ["post", "c"]
+        loop = self._loop("loopnode0", [b, self._loop("loopnode1", [c], trip=2)])
+        V.graph.operations = [pre, loop, post]
+        nodes = self._front_half(list(V.graph.operations))
+        self.assertIsInstance(nodes[1], LoopSchedulerNode)
+        self.assertEqual(V.graph.operations, [pre, b, c, post])
+        # The body is still the node's: the structure lives in the scheduler.
+        self.assertEqual(loop.body[0], b)
+        for producer in (pre, b, c):
+            self.assertTrue(storage_has_single_writer(V.graph, producer))
+
     def test_propagate_mutation_layouts_reaches_a_body_op(self):
         # A body op that mutates ``acc`` keeps its MutationLayoutSHOULDREMOVE
         # through Scheduler.__init__; the pre-fusion pass then resolves it to
@@ -456,6 +481,95 @@ class TestSchedulerPassThrough(_Graph):
         ):
             propagate_layouts.propagate_mutation_layouts(nodes)
         self.assertIs(upd.layout, acc.layout)
+
+    def _pool_layout(self, buf):
+        # The pool planner sizes and places FixedTiledLayout buffers only.
+        stl = SpyreTensorLayout(
+            [8], [1], torch.float16, [0], ElementArrangement.STANDARD
+        )
+        buf.layout = FixedTiledLayout(torch.device("cpu"), torch.float16, [8], [1], stl)
+
+    def test_hbm_pool_never_frees_a_body_buffer_before_its_loop_ends(self):
+        # A LoopSchedulerNode keeps only EXTERNAL reads, so a buffer written
+        # and read only inside the loop (``t``, read by ``u``) shows no read
+        # at the loop's timestep.  hbm_pool_planning must then keep it live
+        # for the rest of the bundle.  Ending its range at its last read in
+        # the body (step 1) would free it before ``w`` (step 2) is placed and
+        # hand ``w`` the same offset, but the body runs trip_count times:
+        # the next trip writes ``w`` while ``t`` is still to be read.  Checked
+        # with the loop inside a fused bundle and as a bare bundle.
+        for bare in (False, True):
+            with self.subTest(bare=bare):
+                V.graph.removed_buffers.clear()
+                t = self._buf("t", reads="x", gid=(0,))
+                u = self._buf("u", reads="t", gid=(0,))
+                w = self._buf("w", reads="x", gid=(0,))
+                # ``u2`` keeps ``u`` an intermediate (read inside the bundle).
+                u2 = self._buf("u2", reads="u", gid=(0,))
+                w2 = self._buf("w2", reads="w", gid=(0,))
+                body = [t, u, w, u2, w2]
+                final = self._buf("final", reads="w2")
+                outer = self._buf("outer", reads="u2")
+                # Something outside reads the loop, so it survives DNE.
+                self.outputs = ["u2", "w2"] if bare else ["final", "outer"]
+                ops = [self._loop("loopnode0", body)]
+                ops += [] if bare else [final, outer]
+                nodes = self._front_half(ops)
+                loop = nodes[0]
+                self.assertIsInstance(loop, LoopSchedulerNode)
+                self.assertNotIn("t", {d.name for d in loop.read_writes.reads})
+                for buf in (*body, final, outer):
+                    self._pool_layout(buf)
+                if bare:
+                    bundle = loop
+                else:
+                    bundle = FusedSchedulerNode(loop.scheduler, list(nodes))
+                with config.patch({"hbm_pool_planning": True}):
+                    hbm_pool_planning([bundle])
+                offsets = {
+                    b.get_name(): b.get_layout().allocation.get("hbm_pool")
+                    for b in body
+                }
+                self.assertIsNotNone(offsets["t"], offsets)
+                self.assertIsNotNone(offsets["w"], offsets)
+                pooled = [o for o in offsets.values() if o is not None]
+                self.assertEqual(len(pooled), len(set(pooled)), offsets)
+
+    def test_hbm_pool_reuses_a_finished_loops_body_buffer(self):
+        # Two sibling loops in one bundle.  A LoopSchedulerNode keeps only
+        # external reads, so its body-only buffers showed no read; their
+        # range ran to the end of the bundle and the second loop could not
+        # reuse the first loop's space (the paged-gather graph: pool 163840
+        # bytes vs 90112 on the flat path).  A buffer a loop writes is live
+        # through that loop's step, and no longer unless read later.
+        t1 = self._buf("t1", reads="x", gid=(0,))
+        o1 = self._buf("o1", reads="t1", gid=(0,))
+        t2 = self._buf("t2", reads="x", gid=(1,))
+        o2 = self._buf("o2", reads="t2", gid=(1,))
+        out = self._buf("out", reads="o1")
+        out2 = self._buf("out2", reads="o2")
+        self.outputs = ["out", "out2"]
+        nodes = self._front_half(
+            [
+                self._loop("loopnode0", [t1, o1]),
+                self._loop("loopnode1", [t2, o2]),
+                out,
+                out2,
+            ]
+        )
+        for buf in (t1, o1, t2, o2, out, out2):
+            self._pool_layout(buf)
+        bundle = FusedSchedulerNode(nodes[0].scheduler, list(nodes))
+        with config.patch({"hbm_pool_planning": True}):
+            hbm_pool_planning([bundle])
+        offset = {
+            b.get_name(): b.get_layout().allocation.get("hbm_pool")
+            for b in (t1, o1, t2, o2)
+        }
+        # t1 is dead once loopnode0 ends; t2 (written by loopnode1) reuses it.
+        self.assertEqual(offset["t2"], offset["t1"], offset)
+        # o1 is read after both loops: never shared with anything in loopnode1.
+        self.assertNotIn(offset["o1"], (offset["t2"], offset["o2"]), offset)
 
 
 # ---------------------------------------------------------------------------
