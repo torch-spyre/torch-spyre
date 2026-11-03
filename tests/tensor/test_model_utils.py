@@ -414,6 +414,28 @@ class TestLoadModelToSpyre(TestCase):
             model.embed.weight.cpu(), host, rtol=DLFLOAT16_RTOL, atol=DLFLOAT16_ATOL
         )
 
+        # The LM head still computes correctly from the shared indirect-layout table.
+        x = torch.randn(4, 128, dtype=torch.float16)
+        expected = x.float() @ host.float().t()
+        torch.testing.assert_close(
+            model.head(x.to("spyre")).cpu().float(), expected, atol=1e-1, rtol=5e-2
+        )
+
+    @requires_spyre
+    def test_parameter_with_a_cpp_weakref_is_replaced_with_a_warning(self):
+        """The impl swap refuses a parameter with a C++ weakref. That one falls back to a
+        new Parameter, as before, instead of failing the load with the model half moved."""
+        model = nn.Linear(64, 128, dtype=torch.float16)
+        held = model.weight
+        ref = torch._C._WeakTensorRef(held)  # noqa: F841 -- kept alive through the move
+        with self.assertLogs("spyre.inductor.model_utils", "WARNING") as logs:
+            load_model_to_spyre(model)
+
+        self.assertIsNot(model.weight, held)
+        self.assertEqual(model.weight.device.type, "spyre")
+        self.assertEqual(model.bias.device.type, "spyre")
+        self.assertIn("Linear.weight", "".join(logs.output))
+
     def test_tied_parameter_is_listed_once(self):
         from torch_spyre.model_utils import _transfer_module
 
