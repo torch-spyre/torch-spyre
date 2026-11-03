@@ -33,10 +33,24 @@ if TYPE_CHECKING:
 
 import torch
 import torch._prims_common as utils
-from torch._higher_order_ops.scan import scan
-from torch.utils._pytree import keystr, tree_leaves, tree_map_with_path
+from torch._higher_order_ops.scan import scan, scan_op
+from torch.fx.experimental.proxy_tensor import get_proxy_mode
+from torch.fx.experimental.symbolic_shapes import statically_known_true
+from torch.multiprocessing.reductions import StorageWeakRef
+from torch.utils._pytree import (
+    keystr,
+    tree_flatten,
+    tree_leaves,
+    tree_map_with_path,
+    tree_unflatten,
+)
+
+from ..errors import Unsupported
+from ..logging_utils import get_inductor_logger
 
 __all__ = ["Gather", "for_each_tile"]
+
+logger = get_inductor_logger("wsr.for_each_tile")
 
 
 @dataclass(frozen=True)
@@ -91,6 +105,129 @@ class TileSpec:
 
 
 DimSpec = Union[int, None, Gather]  # noqa: UP007  # `int | None | Gather` needs Gather at runtime
+
+
+def _check_combine_graph(gm: torch.fx.GraphModule, name: str) -> None:
+    """Validate the graph already traced by scan, without executing it again.
+
+    Read-only operands may share storage. Writes through views, keyword ``out=``
+    arguments and Tensor[] arguments must all be checked; the upstream helper
+    only examines positional Tensor arguments. Check nested HOP bodies too.
+    """
+
+    def values(arg):
+        return tree_leaves(torch.fx.node.map_arg(arg, lambda n: n.meta.get("val")))
+
+    def storage(t):
+        return StorageWeakRef(t._typed_storage())
+
+    inputs = {
+        storage(t)
+        for n in gm.graph.find_nodes(op="placeholder")
+        for t in values(n)
+        if isinstance(t, torch.Tensor)
+    }
+    outputs = set()
+    for node in gm.graph.nodes:
+        if node.op == "get_attr":
+            attr = gm
+            for part in node.target.split("."):
+                attr = getattr(attr, part)
+            if isinstance(attr, torch.Tensor):
+                # Real-mode captures are just as unsafe as FakeTensor captures.
+                # Also reject literal tensor constants: the graph cannot tell
+                # them apart from external tensors. Factories such as full/ones
+                # emit operators instead and remain supported.
+                raise Unsupported(
+                    "for_each_tile() body closes over a tensor or creates a "
+                    f"literal tensor constant ({name}.{node.target}); pass it "
+                    "as an operand (dims=None), or use a tensor factory such as "
+                    "torch.full instead of torch.tensor"
+                )
+            if isinstance(attr, torch.fx.GraphModule):
+                _check_combine_graph(attr, f"{name}.{node.target}")
+        elif node.op == "output":
+            for t in values(node.args[0]):
+                if not isinstance(t, torch.Tensor):
+                    continue
+                st = storage(t)
+                if st in inputs or st in outputs:
+                    raise Unsupported(
+                        f"for_each_tile() body in {name} returns an input, a view "
+                        "of one, or outputs sharing storage; return a clone instead"
+                    )
+                outputs.add(st)
+        elif node.op == "call_function" and isinstance(
+            node.target, torch._ops.OpOverload
+        ):
+            for i, arg in enumerate(node.target._schema.arguments):
+                if not arg.is_write:
+                    continue
+                value = (
+                    node.args[i] if i < len(node.args) else node.kwargs.get(arg.name)
+                )
+                if any(
+                    isinstance(t, torch.Tensor) and storage(t) in inputs
+                    for t in values(value)
+                ):
+                    raise Unsupported(
+                        f"for_each_tile() body in {name} writes to an input in place "
+                        f"through {node.target}; write to a new tensor instead"
+                    )
+
+
+def _scan_in_make_fx(combine_fn, init, xs, lifted, reverse):
+    """Emit the ``scan`` HOP straight into the active make_fx trace.
+
+    ``scan()`` called outside Dynamo re-enters ``torch.compile``. A
+    ``for_each_tile`` reached from an AOT decomposition is exactly that case, and
+    every nested level then costs a full Dynamo inline stack (~180 C-recursion
+    levels each on CPython 3.12), on top of the outer compile's stack. CPython
+    caps the C budget at 800 on s390x, so a GQA SDPA nest raises
+    ``RecursionError`` there. Under make_fx, ``scan_op``'s proxy-mode rule traces
+    ``combine_fn`` itself, at ~16 levels per nest level, so skip Dynamo.
+
+    Unlike Dynamo, make_fx does not lift closures: a tensor ``combine_fn`` reads
+    from an enclosing trace would be baked into the subgraph as a constant. Every
+    operand read whole each step is therefore passed in ``lifted`` as an
+    ``additional_input``, and ``_check_combine_graph`` rejects a body that still
+    closes over a traced tensor.
+    """
+    leaves_init, spec_init = tree_flatten(init)
+    leaves_xs, spec_xs = tree_flatten(xs)
+    if reverse:
+        leaves_xs = [x.flip(0) for x in leaves_xs]
+    num_init, num_xs = len(leaves_init), len(leaves_xs)
+    y_spec = []
+
+    def flat_combine_fn(*args):
+        carry = tree_unflatten(list(args[:num_init]), spec_init)
+        sliced = tree_unflatten(list(args[num_init : num_init + num_xs]), spec_xs)
+        next_carry, y = combine_fn(carry, sliced, args[num_init + num_xs :])
+        carry_leaves, carry_spec = tree_flatten(next_carry)
+        if carry_spec != spec_init:
+            raise Unsupported(
+                "for_each_tile() next_carry must have the same pytree structure "
+                f"as init; got {carry_spec}, expected {spec_init}"
+            )
+        y_leaves, spec = tree_flatten(y)
+        if any(not isinstance(t, torch.Tensor) for t in (*carry_leaves, *y_leaves)):
+            raise Unsupported("for_each_tile() carry and output leaves must be Tensors")
+        y_spec[:] = [spec]
+        return [*carry_leaves, *y_leaves]
+
+    tracer = get_proxy_mode().tracer
+    flat_out = scan_op(flat_combine_fn, leaves_init, leaves_xs, tuple(lifted))
+    # trace_scan has just appended this node; its first argument is the body graph.
+    scan_node = next(n for n in reversed(tracer.graph.nodes) if n.target is scan_op)
+    name = scan_node.args[0].target
+    _check_combine_graph(getattr(tracer.root, name), name)
+
+    final_carry = tree_unflatten(list(flat_out[:num_init]), spec_init)
+    ys = list(flat_out[num_init:])
+    if reverse:
+        ys = [y.flip(0) for y in ys]
+    return final_carry, tree_unflatten(ys, y_spec[0])
 
 
 # CPython 3.12/3.13 C recursion cap on s390x (10000 on x86).
@@ -218,6 +355,12 @@ def _normalize_in_specs(operands, dims, tile_size: int) -> tuple[list[TileSpec],
                     f"which is not a multiple of tile_size={tile_size} (ragged tiles "
                     f"are not supported)"
                 )
+            # Also state it as a fact. The check above guards it, but recording
+            # Mod(length, tile_size) in the shape env is what lets the
+            # simplifier fold tile_size * (length // tile_size) back to length
+            # when the length is symbolic. A SymInt passes isinstance(length,
+            # int), so this must not be guarded by it.
+            torch._check(length % tile_size == 0)
             spec = TileSpec(
                 Kind.SLICE,
                 axis,
@@ -272,14 +415,22 @@ def _xs_leaf(operand: torch.Tensor, spec: TileSpec) -> torch.Tensor:
             raise AssertionError("GATHER spec without an index table")
         return spec.index
     moved = _movedim(operand, spec.dim, 0)
-    # Splitting dim 0 is always expressible in strides, so this is a view.
+    # Trim to a whole number of tiles, then split. Both are views, so nothing
+    # copies, and for a concrete length the trim drops nothing.
+    #
+    # The trim is what keeps the extent a literal when the length is symbolic:
+    # given S a view cannot prove (S // G) * G == S and re-derives the extent as
+    # S // (S // G), which is 100 at S=100. Given G * (S // G) the trailing
+    # factor cancels by gcd to the literal G.
     #
     # `torch.unflatten`, not `Tensor.unflatten`: the method has a Python body
     # (`return super().unflatten(...)`, torch/_tensor.py) that dynamo normally
     # never reaches. Under an active `torch.device` mode -- vLLM runs its model
     # inside one -- DeviceContext.__torch_function__ re-dispatches into that body
     # and dynamo cannot trace the `super()` call. The free function has no body.
-    return torch.unflatten(moved, 0, (moved.shape[0] // spec.extent, spec.extent))
+    tiles = spec.num_tiles
+    trimmed = moved.narrow(0, 0, tiles * spec.extent)
+    return torch.unflatten(trimmed, 0, (tiles, spec.extent))
 
 
 def _tile(operand: torch.Tensor, spec: TileSpec, sliced: torch.Tensor) -> torch.Tensor:
@@ -305,7 +456,37 @@ def _stacked_to_full(ys: torch.Tensor, dim: int) -> torch.Tensor:
     flatten crosses the moved axis, which strides cannot express, so it copies the whole
     output ((3, 8, 2) -> (8, 6)). Avoiding this copy requires destination-aware
     lowering that writes tile i into its final slice, separately for each output leaf.
+
+    For dim == 0 this folds with `as_strided` rather than `flatten`. Both give
+    the identical tensor, but on a symbolic leading extent `flatten` (and
+    `reshape`, and `view`) walk the dims and add `Ne(count, 1)`, which splits the
+    compiled artifact at a single tile. `as_strided` does not.
+
+    That removes one source of the split, not the split itself: torch's own
+    tensor-metadata extraction evaluates the same predicate eagerly further down,
+    so a single-tile call still compiles separately.
     """
+    # as_strided takes the strides on trust, so only take it when the leading
+    # axes are PROVABLY contiguous. statically_known_true so the test itself
+    # installs no guard. Otherwise flatten: slower to specialise, never wrong.
+    # as_strided keeps the storage offset, and a fold that only merges the two
+    # leading axes is an ordinary view, so eager and autograd see the same
+    # tensor either way.
+    if dim == 0:
+        if statically_known_true(ys.stride(0) == ys.size(1) * ys.stride(1)):
+            folded = (ys.size(0) * ys.size(1), *ys.shape[2:])
+            return ys.as_strided(folded, ys.stride()[1:])
+        # Eager only: a logger call while Dynamo traces is a graph break, which a
+        # fullgraph compile turns into an error. A traced fold of scan's stacked
+        # output always has provably contiguous leading axes, so the traced path
+        # does not reach this branch for an output for_each_tile builds itself.
+        if not torch.compiler.is_dynamo_compiling():
+            logger.debug(
+                "for_each_tile output fold: leading axes of shape %s, strides %s "
+                "are not provably contiguous, folding with flatten",
+                tuple(ys.shape),
+                tuple(ys.stride()),
+            )
     return _movedim(ys, 0, dim).flatten(dim, dim + 1)
 
 
@@ -343,6 +524,26 @@ def for_each_tile(
 
     Returns:
         ``(final_carry, out)``, either of which is ``None`` for the unused mode.
+
+    Tracing contract:
+        In a decomposition (under make_fx, outside Dynamo), tensor dependencies
+        must be explicit operands, using ``dims=None`` for invariants. Captured
+        tensors, including module parameters and literal ``torch.tensor`` constants,
+        are rejected; construct constants before the loop and pass them in, or use
+        factories such as ``torch.full`` inside the body. Python scalar constants
+        are specialized at trace time. Derive symbolic sizes from the body inputs.
+
+        The carry must retain init's pytree structure and tensor metadata. Inputs
+        to the scan may share storage but may not be written; outputs must not
+        alias them or each other. Checks include views, keyword ``out=`` writes,
+        tensor-list writes, and nested body graphs. Fresh local temporaries may be
+        mutated. All used carry/output leaves must be tensors.
+
+        The body must be a pure tensor computation. Arbitrary Python side effects
+        (e.g. changing a counter, list or object attribute) are NOT checked or
+        replayed per iteration by make_fx, and can silently change results. Use a
+        tensor carry for evolving state, and tensor operations for runtime control
+        flow. These graph checks also rely on operators declaring accurate schemas.
     """
     operands = tuple(operands)
     # A for_each_tile introduced by an AOT decomposition inherits the existing
@@ -356,6 +557,15 @@ def for_each_tile(
         if fake_mode is not None:
             fake_mode.allow_scalar_outputs = True
     specs, num_tiles = _normalize_in_specs(operands, dims, tile_size)
+    if num_tiles == 0:
+        raise ValueError("for_each_tile() requires at least one tile")
+    if not isinstance(reverse, bool):
+        raise TypeError("for_each_tile() reverse must be a bool")
+    if init is not None and (
+        not tree_leaves(init)
+        or any(not isinstance(t, torch.Tensor) for t in tree_leaves(init))
+    ):
+        raise ValueError("for_each_tile() init must be a non-empty pytree of Tensors")
 
     if isinstance(out_dim, Gather):
         # A scattered write is only meaningful with a destination to scatter into.
@@ -394,16 +604,22 @@ def for_each_tile(
         _xs_leaf(o, s) for o, s in zip(operands, specs) if s.kind is not Kind.INVARIANT
     )
 
-    def combine_fn(carry, sliced):
+    # Operands every step reads whole: invariants, and the pools Gather rows index.
+    lifted_idx = [i for i, s in enumerate(specs) if s.kind is not Kind.SLICE]
+
+    def combine_fn(carry, sliced, lifted):
         # In map mode, the step counter is the whole carry.
         if count_mode:
             step, carry = carry
         elif map_mode:
             step, carry = carry, None
+        whole = dict(zip(lifted_idx, lifted))
         it = iter(sliced)
         tiles = tuple(
-            o if s.kind is Kind.INVARIANT else _tile(o, s, next(it))
-            for o, s in zip(operands, specs)
+            whole[i]
+            if s.kind is Kind.INVARIANT
+            else _tile(whole.get(i, o), s, next(it))
+            for i, (o, s) in enumerate(zip(operands, specs))
         )
         next_carry, y = body(carry, tiles)
         if map_mode:
@@ -412,16 +628,27 @@ def for_each_tile(
             next_carry = (step + 1, next_carry)
         return next_carry, (() if out_dim is None else y)
 
-    # specialize_float: a Python float closed over by the body
-    # is generalized to a SymFloat and scan_op's validate_subgraph_args_types
-    # currently only accepts Tensor, int, SymInt.
-    # Note: This is currently a shortcoming of `scan`,
-    # but shouldn't be any concern for Spyre.
-    with contextlib.ExitStack() as ctx:
-        if not torch.compiler.is_dynamo_compiling():
-            ctx.enter_context(torch._dynamo.config.patch(specialize_float=True))
-            ctx.enter_context(_fresh_c_recursion_budget())
-        final_carry, ys = scan(combine_fn, scan_init, xs, dim=0, reverse=reverse)
+    lifted = [operands[i] for i in lifted_idx]
+    if not torch.compiler.is_dynamo_compiling() and get_proxy_mode() is not None:
+        # Reached from an AOT decomposition: trace the HOP without Dynamo.
+        final_carry, ys = _scan_in_make_fx(combine_fn, scan_init, xs, lifted, reverse)
+    else:
+        # specialize_float: a Python float closed over by the body
+        # is generalized to a SymFloat and scan_op's validate_subgraph_args_types
+        # currently only accepts Tensor, int, SymInt.
+        # Note: This is currently a shortcoming of `scan`,
+        # but shouldn't be any concern for Spyre.
+        with contextlib.ExitStack() as ctx:
+            if not torch.compiler.is_dynamo_compiling():
+                ctx.enter_context(torch._dynamo.config.patch(specialize_float=True))
+                ctx.enter_context(_fresh_c_recursion_budget())
+            final_carry, ys = scan(
+                lambda carry, sliced: combine_fn(carry, sliced, lifted),
+                scan_init,
+                xs,
+                dim=0,
+                reverse=reverse,
+            )
 
     if count_mode:
         _, final_carry = final_carry
