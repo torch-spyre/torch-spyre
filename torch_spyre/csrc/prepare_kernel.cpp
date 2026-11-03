@@ -100,8 +100,8 @@ static flex::CompositeAddress compute_offset_address(
   const auto [segment_id, segment_offset, segment_type] =
       flex::decodeDevicePointer(dev_ptr);
   // Validate device pointer is within program segment bounds
-  TORCH_CHECK(segment_type == flex::MemoryType::ProgramStatic,
-              "Device pointer 0x", std::hex, dev_ptr, " has memory type ",
+  TORCH_CHECK(segment_type == flex::MemoryType::Program, "Device pointer 0x",
+              std::hex, dev_ptr, " has memory type ",
               static_cast<int>(segment_type),
               " but must be in segment 7 (Program) for ComputeOnDevice");
 
@@ -271,8 +271,7 @@ void JobPlanBuilder::executeAllocate(const nlohmann::json& cmd) {
 
   auto& allocator = SpyreAllocator::instance();
   flex::AllocationDirective directive(flex::PlacementPolicy::Bind, {0},
-                                      std::nullopt,
-                                      flex::MemoryType::ProgramStatic);
+                                      std::nullopt, flex::MemoryType::Program);
   c10::DataPtr allocated_ptr = allocator.allocate(static_size, directive);
 
   job_allocation_.emplace_back(
@@ -382,10 +381,10 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnDevice(
   // instructions begin (after the program-correction region). Validate it is in
   // segment 7 and derive the offset of that entry point within the program
   // allocation (0 when the binary starts at the allocation base).
-  TORCH_CHECK(segment_type == flex::MemoryType::ProgramStatic, "job_bin_ptr 0x",
+  TORCH_CHECK(segment_type == flex::MemoryType::Program, "job_bin_ptr 0x",
               std::hex, job_bin_ptr, " has memory type ",
               static_cast<int>(segment_type), ", expected type ",
-              static_cast<int>(flex::MemoryType::ProgramStatic),
+              static_cast<int>(flex::MemoryType::Program),
               " (Program segment)");
 
   // Hand flex the program's FULL allocation as a non-owning descriptor over the
@@ -604,7 +603,7 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateDataTransfer(
       // device_ptr
       const auto segment_type =
           std::get<2>(flex::decodeDevicePointer(device_ptr));
-      if (segment_type == flex::MemoryType::ProgramStatic) {
+      if (segment_type == flex::MemoryType::Program) {
         // Compute CompositeAddress with offset from device_addr
         flex::CompositeAddress comp_addr = compute_offset_address(
             job_allocation_.at(0), device_ptr, transfer_size);

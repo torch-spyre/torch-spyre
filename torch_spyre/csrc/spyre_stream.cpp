@@ -531,13 +531,13 @@ void SpyreStream::launch(const JobPlan& plan,
   // device is done with it — each Compute step keeps a refcount through its
   // flex completion callback, so the last one to finish frees it.
   //
-  // ProgramDynamic selects flex's dedicated segment-6 region; ProgramStatic
-  // uses the separate segment-7 region.
+  // CompilerReserved selects flex's dedicated segment-6 region, which holds the
+  // dynamic program; Program uses the separate segment-7 region.
   if (plan.dynamic_size > 0) {
     auto& allocator = SpyreAllocator::instance();
     flex::AllocationDirective directive(flex::PlacementPolicy::Bind, {},
                                         std::nullopt,
-                                        flex::MemoryType::ProgramDynamic);
+                                        flex::MemoryType::CompilerReserved);
     ctx.dynamic_alloc = std::make_shared<c10::DataPtr>(
         allocator.allocate(plan.dynamic_size, directive));
   }
