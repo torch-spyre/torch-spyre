@@ -22,6 +22,7 @@ Each test class covers one category from the Hash Coverage Table:
   TestIterationSpaceHashed     — different iter-space sizes → different hash
   TestOpFuncHashed             — different op names → different hash
   TestDebugHandleStripped      — debug_handle_ is stripped before hashing
+  TestLoopBoundaryHashed       — where a LoopSpec ends changes the hash
 """
 
 import json
@@ -180,6 +181,72 @@ class TestLoopSpecTripCount(unittest.TestCase):
             _hash([outer_b]),
             "Changing inner loop count must change the hash.",
         )
+
+
+class TestLoopBoundaryHashed(unittest.TestCase):
+    """The extent of each LoopSpec must be part of the hash. Ops after a loop
+    run once; ops inside it run count times (bundle.py emits them outside vs
+    inside the scf.for), so trees that differ only in where a loop ends must
+    produce different keys."""
+
+    def _ops(self):
+        # A and B are distinct and untiled; B is the op whose position moves.
+        return _make_op_spec(op="add"), _make_op_spec(op="mul")
+
+    def _assert_differs(self, left, right, msg):
+        for use_symbols in (False, True):
+            with self.subTest(use_symbols=use_symbols):
+                self.assertNotEqual(
+                    _hash(left, use_symbols=use_symbols),
+                    _hash(right, use_symbols=use_symbols),
+                    msg,
+                )
+
+    def test_op_after_loop_vs_inside_loop(self):
+        from torch_spyre._inductor.op_spec import LoopSpec
+
+        a, b = self._ops()
+        self._assert_differs(
+            [LoopSpec(count=4, body=[a]), b],
+            [LoopSpec(count=4, body=[a, b])],
+            "[Loop(4,[A]), B] and [Loop(4,[A,B])] must hash differently.",
+        )
+
+    def test_nested_inner_loop_boundary(self):
+        from torch_spyre._inductor.op_spec import LoopSpec
+
+        a, b = self._ops()
+        self._assert_differs(
+            [LoopSpec(count=2, body=[LoopSpec(count=3, body=[a]), b])],
+            [LoopSpec(count=2, body=[LoopSpec(count=3, body=[a, b])])],
+            "Moving B out of an inner loop (still inside the outer) must change "
+            "the hash.",
+        )
+
+    def test_sibling_loops_vs_nested_loops(self):
+        # Prefix variant: identical token prefix loop_count:4||A||loop_count:2||B
+        from torch_spyre._inductor.op_spec import LoopSpec
+
+        a, b = self._ops()
+        self._assert_differs(
+            [LoopSpec(count=4, body=[a]), LoopSpec(count=2, body=[b])],
+            [LoopSpec(count=4, body=[a, LoopSpec(count=2, body=[b])])],
+            "Sibling loops and nested loops must hash differently.",
+        )
+
+    def test_identical_trees_still_hash_equal(self):
+        from torch_spyre._inductor.op_spec import LoopSpec
+
+        def tree():
+            a, b = self._ops()
+            return [LoopSpec(count=4, body=[a]), b]
+
+        for use_symbols in (False, True):
+            with self.subTest(use_symbols=use_symbols):
+                self.assertEqual(
+                    _hash(tree(), use_symbols=use_symbols),
+                    _hash(tree(), use_symbols=use_symbols),
+                )
 
 
 class TestSymbolKindTagging(unittest.TestCase):
