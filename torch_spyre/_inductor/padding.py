@@ -78,6 +78,7 @@ from torch._inductor.ir import (
     MutableBox,
     MutationLayoutSHOULDREMOVE,
     ReinterpretView,
+    MultiOutput,
 )
 from torch._inductor.ops_handler import DefaultHandler, WrapperHandler
 from torch._inductor.virtualized import V
@@ -1774,7 +1775,11 @@ def is_padded(graph: GraphLowering, node: IRNode | Layout | SpyreTensorLayout):
         target_name = target.get_name()
         node = graph.get_buffer(target_name)
     if isinstance(node, IRNode):
-        node = node.get_layout()
+        layout = node.maybe_get_layout()
+        if layout is None:
+            # FallbackKernels and others
+            return False
+        node = layout
     if isinstance(node, Layout):
         assert isinstance(node, FixedTiledLayout), (
             f"Expected finalized tiled layout, got {node}"
@@ -1797,11 +1802,15 @@ def _user_values():
 _ASSUMED_PADDING: dict[type, Set] = {
     # input buffers are zero paddded in DMA transfer to the device
     InputBuffer: FiniteSet(0),
+    # Each collective behaves a bit differently wrt. to padding,
+    # but the fact is that we don't know what is being read from
+    # other processes, so for now it's better to be conservative.
     BroadcastAsyncFallback: _user_values(),
     AllGatherAsyncFallback: _user_values(),
     AllReduceAsyncFallback: _user_values(),
     WaitWorkFallback: _user_values(),
     SpyreEmptyFallback: _user_values(),
+    MultiOutput: _user_values(),
 }
 
 
@@ -1858,30 +1867,16 @@ def track_padding_value(graph: GraphLowering) -> None:
                 if isinstance(op, SpyreConstantFallback):
                     tracer.buffer_range[op.name] = FiniteSet(op.constant_args[0])
                     continue
-                elif isinstance(
-                    op,
-                    (
-                        BroadcastAsyncFallback,
-                        AllGatherAsyncFallback,
-                        AllReduceAsyncFallback,
-                        WaitWorkFallback,
-                        SpyreEmptyFallback,
-                    ),
-                ):
-                    # Each collective behaves a bit differently wrt. to padding,
-                    # but the fact is that we don't know what is being read from
-                    # other processes, so for now it's better to be conservative.
-                    for _class, pad in _ASSUMED_PADDING.items:
-                        if isinstance(op, _class):
-                            tracer.buffer_range[op.name] = pad
-                            break
-                    else:
-                        raise ValueError(
-                            f"Couldn't find entry for {op} in _ASSUMED_PADDING"
-                        )
-                    continue
+
+                for _class, pad in _ASSUMED_PADDING.items():
+                    if isinstance(op, _class):
+                        tracer.buffer_range[op.name] = pad
+                        break
                 else:
-                    raise ValueError(f"Unhandled kind of node {op}")
+                    raise ValueError(
+                        f"Couldn't find entry for {op} in _ASSUMED_PADDING"
+                    )
+                continue
 
             arg_pos_tracer = ArgNameToIndexTracer()
             with V.set_ops_handler(arg_pos_tracer):
