@@ -670,10 +670,20 @@ class SuperDSCScheduling(BaseScheduling):
                 buf.splice(f"{src_code}")
             if method == "sdsc" and kernel._kernel_uses_hbm_pool():
                 buf.writeline(f", pool_size={kernel.pool_size}")
-            # Per-argument host shape/dtype for the launch spec. Passed through
-            # the generated wrapper so it survives a wrapper-cache replay in a
-            # later process, where V.graph no longer exists. Emitted outside
-            # src_code, which is the cache-key and dedup input.
+            # Per-argument host shape/dtype for the launch spec, which nothing
+            # else records: TensorArg keeps only the device half, and the host
+            # view lives on the buffer's FixedTiledLayout -- visible here, not
+            # at the write site.
+            #
+            # A keyword rather than a TensorArg field because the op-spec
+            # literal is hashed into the kernel cache key and is the
+            # src_to_kernel dedup key, keyed on src_code text: adding fields
+            # would invalidate every cached kernel and could split kernels
+            # identical in compiled form (_EXPECTED_TENSOR_ARG_SCHEMA pins the
+            # field set for the same reason). Appended after src_code is
+            # formed, so a launch-time descriptor cannot perturb compile-time
+            # identity, and it survives a wrapper-cache replay in a later
+            # process where V.graph is gone.
             launch_args = kernel.launch_args()
             if launch_args:
                 buf.writeline(f", launch_args={launch_args!r}")
