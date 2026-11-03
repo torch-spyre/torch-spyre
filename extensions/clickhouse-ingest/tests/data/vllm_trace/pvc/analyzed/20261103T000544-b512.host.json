@@ -1,0 +1,81 @@
+[
+ {
+  "audit": {
+   "device_overlaps": 14,
+   "kernel_ms": 13.0,
+   "launch_marker_ms": 14.5,
+   "memcpy_ms": 16.0,
+   "memset_ms": 17.5,
+   "runtime_barrier_ms": 19.0,
+   "runtime_fetch_ms": 20.5
+  },
+  "decode_summary": {
+   "busy_ms": 22.0,
+   "busy_pct": 23.5,
+   "corr_kb_per_step": 25.0,
+   "corr_per_step": 26.5,
+   "d2h_kb_per_step": 28.0,
+   "d2h_per_step": 29.5,
+   "fallback_ms_per_step": 0.0,
+   "fallback_ops": {},
+   "fallback_per_step": 32.5,
+   "gaps_per_step": 34.0,
+   "h2d_kb_per_step": 10.0,
+   "h2d_per_step": 11.5,
+   "host_exposed_ms": 13.0,
+   "jobplan_us_per_launch": 14.5,
+   "launch_marker_us_per_launch": 16.0,
+   "launches_per_step": 100.0,
+   "n": 5,
+   "sync_ms_per_step": 20.5,
+   "sync_n_per_step": 22.0,
+   "wall_ms": 23.5,
+   "waterfall_ms_per_step": {
+    "attn_host": 25.0,
+    "correction_upload": 26.5,
+    "d2h_copy": 28.0,
+    "dynamo_guard": 29.5,
+    "h2d_copy": 31.0,
+    "launch": 32.5,
+    "python": 34.0,
+    "sync_wait": 10.0,
+    "torch_op": 11.5
+   }
+  },
+  "prefill_summary": {
+   "busy_ms": 13.0,
+   "busy_pct": 14.5,
+   "corr_kb_per_step": 16.0,
+   "corr_per_step": 17.5,
+   "d2h_kb_per_step": 19.0,
+   "d2h_per_step": 20.5,
+   "fallback_ms_per_step": 0.0,
+   "fallback_ops": {},
+   "fallback_per_step": 23.5,
+   "gaps_per_step": 25.0,
+   "h2d_kb_per_step": 26.5,
+   "h2d_per_step": 28.0,
+   "host_exposed_ms": 29.5,
+   "jobplan_us_per_launch": 31.0,
+   "launch_marker_us_per_launch": 32.5,
+   "launches_per_step": 34.0,
+   "n": 1,
+   "sync_ms_per_step": 11.5,
+   "sync_n_per_step": 13.0,
+   "wall_ms": 14.5,
+   "waterfall_ms_per_step": {
+    "attn_host": 16.0,
+    "correction_upload": 17.5,
+    "d2h_copy": 19.0,
+    "dynamo_guard": 20.5,
+    "h2d_copy": 22.0,
+    "launch": 23.5,
+    "python": 25.0,
+    "sync_wait": 26.5,
+    "torch_op": 28.0
+   }
+  },
+  "steps": [],
+  "trace": "traces/example.json"
+ }
+]

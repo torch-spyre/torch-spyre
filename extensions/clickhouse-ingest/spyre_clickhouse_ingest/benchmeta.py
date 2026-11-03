@@ -25,7 +25,7 @@ import hashlib
 import json
 import logging
 import os
-import re
+import regex as re
 from typing import Any
 
 log = logging.getLogger(__name__)
@@ -151,6 +151,13 @@ _READERS = {
     "outputs": _outputs,
     "compile_summary": _compile,
 }
+
+
+def flatten(kind: str, data: dict[str, Any]) -> dict[str, str]:
+    """The run props one sidecar `kind` contributes, for a caller that already holds its data."""
+    out: dict[str, str] = {}
+    _READERS[kind](data, out)
+    return out
 
 
 def props_for(results_dir: str, test_name: str) -> dict[str, str]:
