@@ -2360,6 +2360,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     0.0,
                 ),
             },
+            # A backend regression makes these cases fail their correctness check.
+            # Non-strict, so an unexpected pass does not fail the run. Remove the
+            # entries when #5950 is fixed.
+            "expect_fail_unstable": {
+                "2d_dim1": "keep_by_index result fails the correctness check, #5950",
+                "4d_dim2": "keep_by_index result fails the correctness check, #5950",
+            },
         },
         ("test_reduce_keepdim0", "test_reduce_keepdim0_cpu"): {
             "ops_dict": CORE_REDUCTION_OPS_DICT,
@@ -4860,6 +4867,48 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     torch.randint(-128, 127, (2, 8, 32, 64), dtype=torch.int8),
                     torch.randint(-128, 127, (2, 8, 32, 64), dtype=torch.int8),
                 ),
+            },
+        },
+        (
+            # Integer comparisons give fp32-backed bools (32 elems/stick); combining
+            # two of them must not assume the 64-elem stick of an fp16 bool.
+            "test_logical_int_mask",
+            "test_logical_int_mask_compiled",
+        ): {
+            "ops_dict": {
+                "and": lambda a, b: torch.logical_and(a >= 0, a < b),
+                "or": lambda a, b: torch.logical_or(a < 0, a >= b),
+                "where_and": lambda a, b: torch.where(
+                    torch.logical_and(a >= 0, a < b), a, torch.zeros_like(a)
+                ),
+            },
+            "param_sets": {
+                f"{str(dtype).split('.')[-1]}_{n}": (
+                    torch.randint(-50, 1050, (n,), dtype=dtype),
+                    torch.full((n,), 1000, dtype=dtype),
+                )
+                for dtype in (torch.int64, torch.int32)
+                for n in (1, 7, 64, 512)
+            },
+        },
+        (
+            # An fp16-backed and an fp32-backed bool share no stick size.
+            "test_logical_mixed_bool_mask",
+            "test_logical_int_mask_compiled",
+        ): {
+            "ops_dict": {
+                "and": lambda x, a: torch.logical_and(x >= 0, a < 1000),
+            },
+            "param_sets": {
+                "fp16_int32_64": (
+                    cached_randn((64,), dtype=torch.float16),
+                    torch.randint(-50, 1050, (64,), dtype=torch.int32),
+                ),
+            },
+            # TODO: a missing feature. When mixed bool formats are converted to one
+            # format this stops raising, and the case has to become a positive one.
+            "expect_raise": {
+                "and_fp16_int32_64": "torch.bool result from operands with device",
             },
         },
         (
@@ -9743,6 +9792,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_fallback_unary_op_cpu(self, op, x):
         self.compare_with_cpu(op, x)
+
+    def test_logical_int_mask_compiled(self, op, a, b):
+        # Exercise compiled layouts without requiring eager logical kernels.
+        # LX wrappers leave bool/int outputs unchanged, but the reduction wrapper
+        # relaxes atol. Bypass them to keep these checks exact under LX too.
+        utils_inductor.compare_with_cpu(op, a, b, atol=0, rtol=0, run_eager=False)
 
     def test_binary_op(self, op, a, b):
         if op == torch.div:
