@@ -41,6 +41,7 @@ Applying them in filename order works from an empty database.
 | `70-vllm-hud-projection.sql` | `oss_ci_benchmark_v3`, `oss_ci_benchmark_metadata`, their `_by_tag` copies + their MVs | 30, 60 |
 | `72-ops-audit-events.sql` | `ops_audit_events`, `v_ops_audit_events` | — |
 | `73-ci-access-audit.sql` | `ci_access_audit`, `v_ci_access_audit` | — |
+| `74-model-priority-events.sql` | `model_priority_events`, `v_model_priority` | — |
 
 Column names `chat_turns` shares with `vigil_ops.analyst_turns`, so one `UNION ALL` view can read both:
 
