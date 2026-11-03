@@ -134,3 +134,23 @@ def test_sampler_record_file_is_not_a_host_resources_summary(tmp_path):
     assert not any(
         k.startswith("res_") for k in benchmeta.props_for(str(tmp_path), TEST)
     )
+
+
+def test_per_test_subdir_is_read_first_and_repeats_ignored(tmp_path):
+    _bench(tmp_path)
+    (tmp_path / "env.json").write_text(json.dumps(ENV))
+    sub = tmp_path / TEST
+    sub.mkdir()
+    (sub / "env.json").write_text(json.dumps({"host": "subdir"}))
+    (sub / "host_resources.json").write_text(json.dumps({"load": {"cpu_s": 2}}))
+    (sub / "compile_summary.json").write_text(json.dumps({"total_s": 4}))
+    rep = tmp_path / "repeats" / "r1" / TEST
+    rep.mkdir(parents=True)
+    (rep / "outputs.json").write_text(json.dumps({"prompts": 9}))
+    (rep / "env.json").write_text(json.dumps({"host": "repeat"}))
+    p = _run_props(tmp_path)
+    assert p["env_host"] == "subdir"
+    assert p["res_load_cpu_s"] == "2"
+    assert p["compile_total_s"] == "4"
+    assert "outputs_prompts" not in p
+    assert len(_rows(tmp_path)) == 1
