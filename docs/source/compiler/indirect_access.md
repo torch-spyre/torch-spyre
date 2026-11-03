@@ -329,6 +329,8 @@ batch dimensions in its allocation. The descriptor therefore uses
 `maxDimSizes = 1` for value-tensor axes contributed only by the index
 coordinates. Dimensions present in the value's physical coordinates retain
 their full extent (`-1`), including a real batch axis in a batched table.
+The exception is a singleton physical axis used by a counted index-table
+visit: it retains the loop's per-trip bound so that visit can cover the table.
 This distinction also applies when the indices occupy one scalar per stick;
 using their device sizes as table bounds can generate invalid per-core bases.
 

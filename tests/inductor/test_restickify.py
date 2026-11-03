@@ -1270,7 +1270,6 @@ def test_packed_broadcast_infeasible_edge(dtype, packed_axes):
         edge = _optimize_restickify.EdgeCostMap(
             MemoryDep("input", index, variables, sizes),
             [source],
-            [target],
             MemoryDep("output", out_index, variables, sizes),
             None,
         )

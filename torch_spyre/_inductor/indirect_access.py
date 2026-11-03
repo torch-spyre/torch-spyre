@@ -139,6 +139,7 @@ def compute_indirect_max_dim_sizes(
       - stick dim → -1 (always dynamic)
       - dimension not in index tensor → -1 (data dimension, full range)
       - dimension present in physical value coordinates → -1 (full range)
+        except a counted singleton index-table axis → per-trip bound
       - dimension contributed only by index coordinates → 1 (shared table)
 
     Index tensor:
@@ -161,13 +162,24 @@ def compute_indirect_max_dim_sizes(
         # Axes contributed only by the indices choose pages of one shared
         # table; they do not add physical batch dimensions to that table.
         # Keep actual value coordinates (e.g. a batched gather) at full extent.
-        for coord in arg.device_coordinates:
+        for device_dim, coord in enumerate(arg.device_coordinates):
             if not hasattr(coord, "atoms"):
                 continue
             physical = coord.xreplace(
                 {node: S.Zero for node in coord.atoms(IndirectAccess)}
             )
             if dim in physical.subs(symbol_mapping).free_symbols:
+                # A singleton physical axis used by a counted index-table
+                # visit still needs the per-trip bound from the loop. Its
+                # descriptor can grow to that bound without treating an
+                # index-only axis as a physical table batch.
+                if arg.device_size[device_dim] == 1:
+                    for symbol, (extent, _) in op_spec.iteration_space.items():
+                        if (
+                            symbol_mapping.get(symbol, symbol) == dim
+                            and extent == original_dev_dim_size
+                        ):
+                            return original_dev_dim_size
                 return -1
         return 1
 
