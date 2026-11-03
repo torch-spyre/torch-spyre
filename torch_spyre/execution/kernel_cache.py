@@ -344,11 +344,11 @@ def compute_specs_hash(
     """Compute a cache key from OpSpec objects without any disk I/O.
 
     The key is a SHA-256 hash covering: the JSON of every sdsc_N.json dict
-    (op structure, iteration space, tiling, shapes, dtypes), the trip count of
-    every LoopSpec, all baked symbol offsets (pool, kernel_slice, derived),
-    the total pool allocation size, the versions of torch, torch_spyre and
-    the deeptools/flex toolchain, the backend compiler in use, and the active
-    compile config.
+    (op structure, iteration space, tiling, shapes, dtypes), the trip count
+    and extent of every LoopSpec, all baked symbol offsets (pool,
+    kernel_slice, derived), the total pool allocation size, the versions of
+    torch, torch_spyre and the deeptools/flex toolchain, the backend compiler
+    in use, and the active compile config.
 
     Args:
         specs:       The OpSpec/LoopSpec tree to hash.
@@ -437,6 +437,12 @@ def compute_specs_hash(
                     content_parts.append(f"loop_count_sources:{sources}".encode())
                     logger.debug("  [hash] LoopSpec  sources=%s", sources)
                 _collect(entry.body)
+                # Close the loop scope. Without an end marker the stream is
+                # flat: [Loop(N,[A]), B] and [Loop(N,[A,B])] both serialize to
+                # loop_count:N||A||B, yet bundle.py emits B outside vs inside
+                # the scf.for (bundle.py _emit_specs), so B runs once vs N
+                # times. A cache hit between them would serve the wrong binary.
+                content_parts.append(b"loop_end")
             elif isinstance(entry, OpSpec):
                 sdsc_json, local_sym_values, affine_strides, local_symbol_kinds = (
                     compile_op_spec(
