@@ -1543,6 +1543,17 @@ class SetDtypeTracer(DefaultHandler):
             raise InvalidDomain(domain, "exp")
         return self._default("exp", args=(x0,), kwargs={})
 
+    def to_dtype(
+        self,
+        x: SetDtype,
+        dtype: torch.dtype,
+        src_dtype: torch.dtype | None = None,
+        use_compute_types: bool = True,
+    ) -> SetDtype:
+        return SetDtype(
+            self.tracer.to_dtype(x.set, dtype, src_dtype, use_compute_types), dtype
+        )
+
 
 @dataclasses.dataclass(frozen=True)
 class ArgName:
