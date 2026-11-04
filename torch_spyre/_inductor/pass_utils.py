@@ -85,6 +85,7 @@ from .constants import (
 from .ir import FixedTiledLayout, SpyreConstantFallback
 from .logging_utils import get_inductor_logger
 from .loop_info import copy_op_metadata
+from .loop_node import LoopNode, all_ops
 from .pass_counters import (
     COUNTERS,
     DEVICE_COORDINATES,
@@ -2159,8 +2160,13 @@ def finalize_work_division_for_scheduler(graph: GraphLowering) -> None:
 
     Coefficient keys cannot distinguish every symbol.  Preserve the established
     iteration-order last-wins behavior, but warn once per affected operation.
+
+    Runs after the pass loop, where ``graph.operations`` may hold LoopNodes
+    (they reach the Scheduler as one node each). The ops inside a loop are
+    finalized like any other: a LoopNode has no ownership of its own, so a
+    loop over the top level would skip its whole body without an error.
     """
-    for op in graph.operations:
+    for op in all_ops(graph.operations):
         ownership = getattr(op, "iteration_space_ownership", None)
         if ownership is None:
             continue
@@ -4292,15 +4298,34 @@ _STACK_TRACES_BLOCK_RE = regex.compile(
 )
 
 
+def _indent(text: str) -> str:
+    """``text`` with two spaces before every non-blank line."""
+    return "".join(
+        line if line == "\n" else f"  {line}" for line in text.splitlines(keepends=True)
+    )
+
+
 def _strip_stack_traces(text: str) -> str:
     """Remove IRNode "stack_traces = { ... }" blocks from formatted op text."""
     return _STACK_TRACES_BLOCK_RE.sub("", text)
 
 
 def format_operations(operations: list[Operation]) -> str:
-    """Format LLIR operations including torch-spyre custom metadata"""
+    """Format LLIR operations including torch-spyre custom metadata.
+
+    A LoopNode prints as a header line followed by its body, each body line
+    indented by two spaces per nesting level. A list with no LoopNode prints
+    exactly as it did before nodes existed.
+    """
     buf = io.StringIO()
     for op in operations:
+        if isinstance(op, LoopNode):
+            buf.write(
+                f"{op.get_operation_name()}: LoopNode trip_count={op.trip_count} "
+                f"induction={op.induction} carries={len(op.carries)}\n\n"
+            )
+            buf.write(_indent(format_operations(op.body)))
+            continue
         buf.write(f"{op.get_operation_name()}: {type(op).__name__}")
         if isinstance(op, ComputedBuffer):
             buf.write(f"\n  buffer={op.get_name()}")
