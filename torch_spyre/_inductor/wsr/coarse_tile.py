@@ -2695,7 +2695,6 @@ def _propagate_tiled_op(
 
     # Capture before _insert_copy_op overwrites op.layout.
     old_stride = tuple(op.layout.stride)
-    old_size = tuple(op.layout.size)
     # The layout object every outside consumer's loader is bound to -- the one
     # _divide_ranges shrank to the tile. Their reads are derived from full_buf
     # through it (see _patch_consumers).

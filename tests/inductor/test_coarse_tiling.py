@@ -1526,8 +1526,8 @@ class TestPatchConsumersReadsThroughFullBuffer(unittest.TestCase):
     index from that buffer's layout, not from the producer's tile.
 
     The producer, 64 x 64 x 128, is divided to one row per trip, so its own
-    layout becomes (1, 64, 128) with the full buffer's strides, and a consumer
-    traced against it would lose its row term. After the redirect each
+    layout becomes (1, 64, 128), and a consumer traced against it would lose
+    its row term. After the redirect each
     consumer's index must equal its index before the division, on the full
     buffer's name, and the producer must be the tile again afterwards.
     """

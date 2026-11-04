@@ -1121,9 +1121,6 @@ class TileOwnershipGroupingTests(unittest.TestCase):
         # re-traced against the producer's one-row tile on the way. A size-1
         # dim has no term in an index, so the consumer's row vanished from
         # its read and every row of a consumer tile read the first of its 16.
-        # The producer's tile is the full buffer's outermost dim, where the
-        # tile's strides are the full buffer's, so the stride check alone did
-        # not catch it.
         x = torch.randn(64, 64, 128, dtype=torch.float16)
         y = torch.randn(64, 64, 128, dtype=torch.float16)
         unit_rows = TileSpec((TileAxis(host_dim=0, count=64),))
