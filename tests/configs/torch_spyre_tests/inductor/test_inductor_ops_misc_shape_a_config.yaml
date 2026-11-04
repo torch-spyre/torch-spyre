@@ -37,6 +37,9 @@ test_suite_config:
             # stride D, incl. rotate_half on a transposed q/k (issue #4050)
             - TestOps::test_view_split_stick_slice.*
             - TestOps::test_rope_on_split_stick_view.*
+            # reads whose row or slice boundary falls inside a stick (issues
+            # #5197, #5198, #5227, #5872)
+            - TestOps::test_stick_splitting_read.*
           mode: mandatory_success
           tags:
             - ops__inductor_misc_shape
