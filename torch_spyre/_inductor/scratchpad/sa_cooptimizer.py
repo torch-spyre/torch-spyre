@@ -456,9 +456,14 @@ class _GeneratedDivisions(_DivisionSource):
         the redraw that would supply them. Splits the drawn tiling cannot take
         are dropped to all-ones first, so the redraw climbs out of a legal
         state rather than never starting. If even all-ones is illegal there
-        (a committed span floor), the tiling is given up instead, where the
-        incoming splits are legal untiled -- splits legal under a tiling need
-        not be (see ``OpSplitSpace``) -- and the anchor otherwise.
+        (a span floor in the tiling's frame), the tiling is given up instead,
+        where the incoming splits are legal untiled -- splits legal under a
+        tiling need not be (see ``OpSplitSpace``) -- and the anchor otherwise.
+
+        Each axis is redrawn from the domain of the tiling that was kept
+        (``OpSplitSpace.factor_domains_at``). A tiling can lower an axis's span
+        floor, so its domain can hold factors the untiled one lacks, and the
+        smaller splits a tiling admits are only reachable this way.
         """
         splits = self.space.splits(config.division)
         tiling = self._draw_tiling(rng)
@@ -470,11 +475,14 @@ class _GeneratedDivisions(_DivisionSource):
                 tiling = _UNTILED
             else:
                 return None
+        domains = self.space.factor_domains_at(tiling)
         axes = list(self.space.axes)
         rng.shuffle(axes)
         for axis in axes:
+            if not domains[axis]:
+                continue
             candidate = dict(splits)
-            candidate[axis] = rng.choice(self.space.factor_domains[axis])
+            candidate[axis] = rng.choice(domains[axis])
             if self.space.admits(candidate, tiling):
                 splits = candidate
         division = self.space.division(splits, tiling)

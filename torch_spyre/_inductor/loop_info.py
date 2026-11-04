@@ -347,7 +347,6 @@ _SPYRE_METADATA_ATTRS = (
     "dim_hints",
     "work_div_loop_info",
     "iteration_space_ownership",
-    "_work_division_span_min_splits",
     "loop_info",
     "_restickify_plan",
     "_input_layout_overrides",

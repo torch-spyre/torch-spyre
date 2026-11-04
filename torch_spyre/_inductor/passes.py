@@ -76,7 +76,6 @@ from .enforce_indirect_access_layout import enforce_indirect_access_layout
 from .hbm_pool_planning import hbm_pool_planning
 from .sharded_hbm import plan_sharded_hbm
 from .work_division import (
-    span_reduction,
     work_distribution,
     cost_model_matmul_division,
     defer_work_division,
@@ -648,9 +647,8 @@ class CustomPreSchedulingPasses:
             # Invariant: this must run before any pass that could insert a
             # consumer of a sharded buffer (its rejection loops only see the
             # graph as of this point); compute_ops' all-sharded check is the
-            # second net.
+            # second net. Every division computes the op's span floors itself.
             plan_sharded_hbm,
-            span_reduction,
             _distribute_work,
             #
             # LX Planning
