@@ -1496,9 +1496,6 @@ class TestSpliceWhileLoops(unittest.TestCase):
                 with V.set_graph_handler(graph):
                     with self.assertRaisesRegex(Unsupported, expected):
                         splice_while_loops(graph)
-                        # The splice now ends by wrapping each loop into a LoopNode; these
-                        # assertions read the flat post-splice list.
-                        expand(graph)
 
     def test_loop_without_a_counter_read_raises_unsupported(self):
         # The prover accepts, but the body has no scalar read of its counter to
@@ -1519,7 +1516,6 @@ class TestSpliceWhileLoops(unittest.TestCase):
                     Unsupported, "no scalar read of its counter"
                 ):
                     lowering.splice_while_loops(graph)
-                    expand(graph)
 
     def test_every_nested_level_is_checked(self):
         # Break only the INNER loop's step: the outer loop splices fine, then the
@@ -1547,7 +1543,6 @@ class TestSpliceWhileLoops(unittest.TestCase):
             with mock.patch.object(lowering, "try_prove_for_each_tile", prove):
                 with self.assertRaisesRegex(Unsupported, "inner broken"):
                     lowering.splice_while_loops(graph)
-                    expand(graph)
         self.assertEqual(len(calls), 2)
 
     def test_map_mode_group_gets_loop_info(self):
