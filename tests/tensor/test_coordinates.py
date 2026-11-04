@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import itertools
 import math
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import sympy
@@ -36,6 +38,7 @@ from torch_spyre._inductor.constants import (
 )
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.pass_utils import (
+    _check_stick_expr_supported,
     compute_restickify_needed,
     device_coordinates,
     host_sparse_layout,
@@ -50,6 +53,7 @@ from torch_spyre._inductor.propagate_layouts import (
     _find_alt_target_stl,
     generate_stl_with_required_stick,
 )
+from torch_spyre._inductor import views as views_module
 from torch_spyre._inductor.views import (
     _decompose_constant_offset,
     align_tensors,
@@ -1540,17 +1544,18 @@ class TestStickExprOffsetFree(TestCase):
         self.assertTrue(is_stick_expr_offset_free(sympy.S.Zero, 64))
 
 
-def _reshape_read(rows, cols, a_n, b_n):
-    """Dense fp16 ``x[rows, cols]`` read as ``reshape(a_n, b_n)`` (``a_n == 1``: flat).
+def _reshape_read(rows, cols, a_n, b_n, stick=64):
+    """Dense ``x[rows, cols]`` read as ``reshape(a_n, b_n)`` (``a_n == 1``: flat).
 
-    Returns the coordinates, the loop ranges, and every point where the
-    coordinates differ from the true (tile, row, stick position).
+    ``stick`` is the number of elements per stick (64 for fp16, 32 for fp32).
+    Returns the device size, the coordinates, the loop ranges, and every point
+    where the coordinates differ from the true (tile, row, stick position).
     """
-    tiles = math.ceil(cols / 64)
+    tiles = math.ceil(cols / stick)
     if tiles > 1:
-        size, stride = [tiles, rows, 64], [64, cols, 1]
+        size, stride = [tiles, rows, stick], [stick, cols, 1]
     else:
-        size, stride = [rows, 64], [cols, 1]
+        size, stride = [rows, stick], [cols, 1]
     c0, c1 = sympy.symbols("c0 c1", integer=True, nonnegative=True)
     if a_n == 1:
         var_ranges, index, names = {c0: b_n}, c0, (c0,)
@@ -1559,10 +1564,10 @@ def _reshape_read(rows, cols, a_n, b_n):
     coords = compute_coordinates(size, stride, var_ranges, index)
     wrong = []
     for point in itertools.product(*(range(var_ranges[v]) for v in names)):
-        subs = dict(zip(names, point))
-        row, col = divmod(int(index.subs(subs)), cols)
-        want = (col // 64, row, col % 64) if tiles > 1 else (row, col)
-        got = tuple(int(sympy.floor(c.subs(subs))) for c in coords)
+        subs = {v: sympy.Integer(p) for v, p in zip(names, point)}
+        row, col = divmod(int(index.xreplace(subs)), cols)
+        want = (col // stick, row, col % stick) if tiles > 1 else (row, col)
+        got = tuple(int(sympy.floor(c.xreplace(subs))) for c in coords)
         if got != want:
             wrong.append((point, got, want))
     return size, coords, var_ranges, wrong
@@ -1635,12 +1640,12 @@ class TestReshapeReadCoordinates(TestCase):
     # it, but the carry into the next dim is not computed, so the coordinates are
     # wrong.  The frontend rejects all of them today (no wrong value reaches the
     # device); this will matter once it can express Mod(3*c0, 8).
-    # TODO: file an issue for the missing carry and cite it in these reasons.
+    # TODO(#5872): a coordinate method that is exact for every read replaces these.
     @pytest.mark.xfail(
         strict=True,
         raises=AssertionError,
-        reason="[3,128].reshape(8,48): stick coordinate c1 + 16*Mod(3*c0, 4) reaches "
-        "95 > 64 and the carry is lost (96 of 384 elements wrong)",
+        reason="#5872: [3,128].reshape(8,48): stick coordinate c1 + 16*Mod(3*c0, 4) "
+        "reaches 95 > 64 and the carry is lost (96 of 384 elements wrong)",
     )
     def test_carry_between_variables_3x128_to_8x48(self):
         self.assertEqual(_reshape_read(3, 128, 8, 48)[3], [])
@@ -1648,8 +1653,8 @@ class TestReshapeReadCoordinates(TestCase):
     @pytest.mark.xfail(
         strict=True,
         raises=AssertionError,
-        reason="[8,65].reshape(65,8): stick coordinate c1 + Mod(Mod(8*c0, 65), 64) "
-        "lacks the carry (35 of 520 elements wrong)",
+        reason="#5872: [8,65].reshape(65,8): stick coordinate "
+        "c1 + Mod(Mod(8*c0, 65), 64) lacks the carry (35 of 520 elements wrong)",
     )
     def test_carry_between_variables_8x65_to_65x8(self):
         self.assertEqual(_reshape_read(8, 65, 65, 8)[3], [])
@@ -1657,7 +1662,7 @@ class TestReshapeReadCoordinates(TestCase):
     @pytest.mark.xfail(
         strict=True,
         raises=AssertionError,
-        reason="[2,100].reshape(4,50): sympy squares the inner Mod, "
+        reason="#5872: [2,100].reshape(4,50): sympy squares the inner Mod, "
         "Mod(25*Mod(c0, 2)**2, 32) (72 of 200 elements wrong; the device result is "
         "right only because the operator reads the sparse layout)",
     )
@@ -1667,11 +1672,143 @@ class TestReshapeReadCoordinates(TestCase):
     @pytest.mark.xfail(
         strict=True,
         raises=AssertionError,
-        reason="[8,96].reshape(12,64): the row coordinate floor(2*c0/3) and the "
+        reason="#5872: [8,96].reshape(12,64): the row coordinate floor(2*c0/3) and the "
         "carry are wrong (384 of 768 elements wrong)",
     )
     def test_carry_between_variables_8x96_to_12x64(self):
         self.assertEqual(_reshape_read(8, 96, 12, 64)[3], [])
+
+
+# The reads of ``x[R, C].reshape(-1, K)`` swept below.  Rows and columns include
+# unaligned (65, 100), partly aligned (96, 192) and aligned (128) cases; K covers
+# a divisor of a stick (32), a whole stick (64), and rows that do not divide it.
+_SWEEP_GRID = [
+    (rows, cols, k, stick)
+    for rows, cols, stick in itertools.product(
+        (2, 3, 8), (65, 96, 100, 128, 192), (64, 32)
+    )
+    for k in (32, 64, 96, 128)
+    if (rows * cols) % k == 0 and k < rows * cols
+]
+
+# Reads whose coordinates are wrong although ``_check_stick_expr_supported``
+# accepts the stick coordinate, so layout selection trusts them (they fail later,
+# in codegen).  Several loop variables carry across a row stride that does not
+# divide them, which ``_has_misaligned_step`` does not see.
+# TODO(#5872): one method that is exact for every read empties these sets.
+_WRONG_AND_ACCEPTED = {
+    "default": {
+        (2, 96, 64, 32),
+        (2, 96, 64, 64),
+        (2, 192, 128, 32),
+        (2, 192, 128, 64),
+        (3, 128, 96, 32),
+        (8, 96, 64, 32),
+        (8, 96, 64, 64),
+        (8, 100, 32, 32),
+        (8, 192, 128, 32),
+        (8, 192, 128, 64),
+    },
+    "per_variable": {
+        (2, 96, 64, 32),
+        (2, 96, 64, 64),
+        (2, 192, 96, 64),
+        (2, 192, 128, 32),
+        (2, 192, 128, 64),
+        (3, 128, 96, 32),
+        (3, 128, 96, 64),
+        (3, 192, 96, 64),
+        (8, 96, 64, 32),
+        (8, 96, 64, 64),
+        (8, 96, 128, 32),
+        (8, 100, 32, 32),
+        (8, 192, 96, 64),
+        (8, 192, 128, 32),
+        (8, 192, 128, 64),
+    },
+    "whole_index": set(),
+}
+
+
+class TestReshapeSweepCoordinates(TestCase):
+    """Every read of ``x[R, C].reshape(-1, K)`` (issue #5872), at both stick sizes,
+    compared with the true position of each element, for each way of building
+    the coordinates:
+
+    - ``default``: ``compute_coordinates`` as it is, which builds the coordinates
+      per loop variable and switches to the whole index when
+      ``_has_misaligned_step`` fires;
+    - ``per_variable``: never switches;
+    - ``whole_index``: always decomposes the whole index.
+
+    A read is "accepted" when ``_check_stick_expr_supported`` takes its stick
+    coordinate, which is all layout selection checks.  The dangerous reads are
+    the wrong ones that are accepted; they are listed in ``_WRONG_AND_ACCEPTED``,
+    so a read that becomes exact makes the test fail until it is removed.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        forced = {"default": None, "per_variable": False, "whole_index": True}
+        cls.reads = {}
+        for mode, force in forced.items():
+            patch = (
+                mock.patch.object(
+                    views_module, "_has_misaligned_step", return_value=force
+                )
+                if force is not None
+                else contextlib.nullcontext()
+            )
+            with patch:
+                cls.reads[mode] = {read: cls._classify(*read) for read in _SWEEP_GRID}
+
+    @staticmethod
+    def _classify(rows, cols, k, stick):
+        _, coords, _, wrong = _reshape_read(rows, cols, rows * cols // k, k, stick)
+        try:
+            _check_stick_expr_supported(coords[-1], stick)
+            accepted = True
+        except Unsupported:
+            accepted = False
+        return not wrong, accepted
+
+    def _wrong_and_accepted(self, mode):
+        return {r for r, (exact, ok) in self.reads[mode].items() if ok and not exact}
+
+    def test_default_wrong_reads_accepted_by_the_stick_check_are_known(self):
+        self.assertEqual(
+            self._wrong_and_accepted("default"), _WRONG_AND_ACCEPTED["default"]
+        )
+
+    def test_per_variable_wrong_reads_accepted_by_the_stick_check_are_known(self):
+        self.assertEqual(
+            self._wrong_and_accepted("per_variable"),
+            _WRONG_AND_ACCEPTED["per_variable"],
+        )
+
+    def test_whole_index_is_exact_for_every_read(self):
+        reads = self.reads["whole_index"]
+        inexact = [r for r, (exact, _) in reads.items() if not exact]
+        self.assertEqual(inexact, [])
+
+    def test_default_is_never_worse_than_per_variable(self):
+        # The switch to the whole index only ever fixes a read.
+        worse = [
+            r
+            for r, (exact, _) in self.reads["default"].items()
+            if self.reads["per_variable"][r][0] and not exact
+        ]
+        self.assertEqual(worse, [])
+
+    def test_whole_index_gives_up_reads_the_stick_check_accepts(self):
+        # Exact, but not in a form the stick check recognizes: why it cannot
+        # simply replace the per-variable construction.
+        default, whole = self.reads["default"], self.reads["whole_index"]
+        lost = [
+            r for r, (exact, ok) in default.items() if exact and ok and not whole[r][1]
+        ]
+        self.assertGreater(len(lost), 0)
 
 
 if __name__ == "__main__":

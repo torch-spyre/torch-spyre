@@ -565,6 +565,9 @@ def _reduction_layout(
     if x_dev_coords is None:
         if sparse_layout_serves_read(stl, in_layout, dep) is not None:
             # As for a pointwise op below.
+            # TODO(#5872): return the sparse output as one candidate next to the
+            # normal ones, not early; compute_restickify_needed does not check
+            # that its sparse target is stick_compatible with the output.
             return [host_sparse_layout(output, out_dtype_for_layout)]
         return []
     x_stick_expr = x_dev_coords[-1]
@@ -769,6 +772,10 @@ def _default_pointwise_layout(
             # A read the input's layout cannot serve (flattening [8, 65] into
             # [520] splits a stick): compute_restickify_needed moves the input to
             # its sparse layout, and the output is sparse on its own host dims.
+            # TODO(#5872): return the sparse output as one candidate next to the
+            # normal ones, not early. A rule that also offers a dense output for
+            # this read would get a sparse target that cannot feed it, because
+            # compute_restickify_needed does not check stick_compatible.
             return [host_sparse_layout(output, out_dtype_for_layout)]
         return []
     stick_expr = in_device_coords[-1]

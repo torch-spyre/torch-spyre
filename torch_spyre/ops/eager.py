@@ -15,7 +15,7 @@
 import torch
 from torch_spyre._C import fill_tensor, copy_tensor, SpyreTensorLayout
 import torch_spyre.ops.fallbacks  # noqa: F401
-from .fallbacks import _get_op_overloads
+from .fallbacks import _get_op_overloads, warn_fallback
 from .warning_types import RetileWarning
 import warnings
 import contextlib
@@ -158,6 +158,43 @@ def _materialize_offset_view(x):
     return x
 
 
+# Compiled view rebuilders by (base shape, base dtype, view geometry).
+_view_rebuilders: dict = {}
+
+
+def _rebuild_view_on_device(x):
+    """Copy the Spyre view ``x`` into a fresh tensor with the canonical layout,
+    without leaving the device.
+
+    ``x.clone()``, ``copy_`` and ``contiguous()`` read the view through its base's
+    layout, which is the read that fails, so they cannot be used.  Compiling
+    ``base.as_strided(...)`` followed by a real pointwise op reads the BASE buffer,
+    as the compiled path does.  ``-(-t)`` flips the sign twice: it is exact in any
+    float format (``t * 2 * 0.5`` turns ``inf`` into ``nan`` on the device), and a
+    plain copy such as ``+ 0`` or ``* 1.0`` is folded away and fails like
+    ``clone()``.  ``bool`` has no ``neg``, so it uses ``logical_not`` twice.
+
+    One compiled function per geometry, each with its own code object so dynamo
+    gives it its own cache line (see ``_op_frame``).
+    """
+    base = x._base
+    size, stride, offset = tuple(x.shape), tuple(x.stride()), x.storage_offset()
+    key = (tuple(base.shape), base.dtype, size, stride, offset)
+    rebuild = _view_rebuilders.get(key)
+    if rebuild is None:
+        twice = torch.logical_not if x.dtype == torch.bool else torch.neg
+
+        def view_copy(b):
+            return twice(twice(b.as_strided(size, stride, offset)))
+
+        view_copy.__code__ = view_copy.__code__.replace(
+            co_varnames=view_copy.__code__.co_varnames
+        )
+        rebuild = torch.compile(view_copy, dynamic=False)
+        _view_rebuilders[key] = rebuild
+    return rebuild(base)
+
+
 def _layout_serves_own_view(x) -> bool:
     """Whether ``x``'s device layout can express reads of ``x``'s own host view.
 
@@ -196,8 +233,17 @@ def _materialize_unservable_view(x):
     """Return a canonical-layout copy of a Spyre view whose inherited device
     layout cannot serve its own shape; pass everything else through unchanged.
 
-    The copy goes through the host, as in ``_normalize_result_layout``, because a
-    device-to-device ``copy_`` would compile the same unsupported read.
+    The eager op gets the view as a graph input with its base's layout, and the
+    restickify that ``insert_restickify`` adds has to read the input through that
+    same view, which ``device_coordinates`` rejects in ``insert_restickify_padding``.
+    The compiled path restickifies the base buffer, so the copy is made the same
+    way, on the device (``_rebuild_view_on_device``).
+
+    Inside a compiled graph's fallback (``_in_compiled_fallback``) the copy goes
+    through the host instead, as in ``_normalize_result_layout``: compiling again
+    from there nests ``torch.compile`` inside the kernel being compiled. That costs
+    a device-to-host and a host-to-device transfer, so it emits a
+    ``FallbackWarning``.
     """
     if isinstance(x, torch.Tensor):
         if (
@@ -206,6 +252,9 @@ def _materialize_unservable_view(x):
             and x.dim() > 0
             and not _layout_serves_own_view(x)
         ):
+            if not _in_compiled_fallback():
+                return _rebuild_view_on_device(x)
+            warn_fallback("reading an unaligned view of a Spyre tensor")
             out = torch.zeros(x.shape, dtype=x.dtype, device=x.device)
             out.copy_(x.to("cpu"))
             return out

@@ -2702,6 +2702,10 @@ def compute_restickify_needed(
     if idc is None:
         # A read the input cannot serve (flattening [8, 65] into [520] splits a
         # stick) may be served by the input's host shape in a sparse layout.
+        # TODO(#5872): this returns the sparse target for any output, without
+        # checking that it is stick_compatible with the output. That is safe only
+        # because _default_pointwise_layout and _reduction_layout return a sparse
+        # output early. Return the target only for an output it can feed.
         sparse = sparse_layout_serves_read(in_stl, in_host, in_dep, ind_sizes, op=op)
         if sparse is not None:
             return True, sparse
