@@ -79,6 +79,7 @@ from torch._inductor.ir import (
     MutationLayoutSHOULDREMOVE,
     ReinterpretView,
     MultiOutput,
+    FallbackKernel,
 )
 from torch._inductor.ops_handler import DefaultHandler, WrapperHandler
 from torch._inductor.virtualized import V
@@ -1217,7 +1218,12 @@ class DomainRangeTracer(DefaultHandler):
         if padding_range is None:
             padding_range = self.buffer_range.get(name)
         if padding_range is None:
-            raise ValueError(f"Expected range of buffer {name} to be known")
+            current_op_name = (
+                self.current_op.name if self.current_op is not None else None
+            )
+            raise ValueError(
+                f"Expected range of buffer {name} to be known. Current op is {current_op_name}"
+            )
         return padding_range
 
     def store(
@@ -1260,7 +1266,7 @@ class DomainRangeTracer(DefaultHandler):
         self.buffer_range[name] = value
 
     # only valid for monotonic functions
-    def _unary_op(self, op, x0, fallback_set=None):
+    def _unary_op(self, op, x0, fallback_set=None) -> Set:
         if isinstance(x0, FiniteSet):
             return FiniteSet(*(op(e) for e in x0))
         elif isinstance(x0, Interval):
@@ -1273,7 +1279,7 @@ class DomainRangeTracer(DefaultHandler):
             return fallback_set
         return x0
 
-    def _singleton_set_binary(self, op, x0, x1, fallback_set):
+    def _singleton_set_binary(self, op, x0, x1, fallback_set) -> Set:
         if (
             isinstance(x0, FiniteSet)
             and len(x0) == 1
@@ -1281,8 +1287,9 @@ class DomainRangeTracer(DefaultHandler):
             and len(x1) == 1
         ):
             return FiniteSet(op(x0.args[0], x1.args[0]))
+        return fallback_set
 
-    def _binary_op(self, op, x0, x1, output_set=None):
+    def _binary_op(self, op, x0, x1, output_set=None) -> Set:
         # Like _unary_op, assumes op is monotonic in each argument, so the
         # extremes of the result lie at the corners of the input bounds.
         if isinstance(x0, FiniteSet) and isinstance(x1, FiniteSet):
@@ -1817,6 +1824,7 @@ _ASSUMED_PADDING: dict[type, Set] = {
     WaitWorkFallback: _user_values(),
     SpyreEmptyFallback: _user_values(),
     MultiOutput: _user_values(),
+    FallbackKernel: _user_values(),
 }
 
 
