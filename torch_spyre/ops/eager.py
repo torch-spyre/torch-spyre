@@ -771,6 +771,19 @@ def _row_index(self, indices):
     return index.to(torch.int32).to(self.device)
 
 
+def _stick_runs_along_a_row(self):
+    """Whether the device stick of ``self`` lies along a non-singleton dim past 0.
+
+    Decided from the physical layout: the stride of a size-1 dim says nothing
+    about it, so equal views can carry different strides there.
+    """
+    stick_stride = self.device_tensor_layout().stride_map[-1]
+    return any(
+        self.shape[d] > 1 and self.stride(d) == stick_stride
+        for d in range(1, self.dim())
+    )
+
+
 @torch.library.register_kernel("aten::index.Tensor", ["spyre"])  # type:ignore
 def spyre__index_tensor(self, indices):
     """``self[index]`` for a 1-D integer index, as an ``index_select`` on dim 0.
@@ -782,13 +795,12 @@ def spyre__index_tensor(self, indices):
     index = _row_index(self, indices)
     if index.numel() == 0:
         return torch.empty((0, *self.shape[1:]), dtype=self.dtype, device=self.device)
-    if self.shape[0] == 1 and self.dim() > 1 and self.stride(0) != 1:
+    if self.shape[0] == 1 and _stick_runs_along_a_row(self):
         # Every in-range index of a one-row source is 0, so this is a broadcast.
-        # index_select on a one-row source whose rows are not the stick dim
-        # lowers to an op the backend can't schedule (identity for one index,
-        # stick mismatch for more). A source whose dim 0 runs along the stick
-        # (stride 1, e.g. a transposed column) gathers fine and is the one
-        # layout the broadcast cannot materialize.
+        # index_select on a one-row source whose stick runs along the row lowers
+        # to an op the backend can't schedule (identity for one index, stick
+        # mismatch for more). When the stick runs across rows instead (e.g. a
+        # transposed column), index_select works and the broadcast does not.
         return self.expand(index.numel(), *self.shape[1:]).clone()
     return torch.index_select(self, 0, index)
 

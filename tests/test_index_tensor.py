@@ -141,10 +141,38 @@ def test_one_row_source(rows):
 
 
 @pytest.mark.parametrize("rows", [[0], [0, 0], [0, -1, 0]], ids=str)
-def test_transposed_one_row_source(rows):
-    """Dim 0 runs along the stick, so this one gathers instead of broadcasting."""
+@pytest.mark.parametrize(
+    "make_source",
+    [
+        pytest.param(lambda d: d[:, :1].T, id="column.T"),
+        pytest.param(lambda d: d[:, :1].T.squeeze(0).unsqueeze(0), id="restrided"),
+        pytest.param(lambda d: d[:, 0].unsqueeze(1).T, id="(8,1).T"),
+    ],
+)
+def test_transposed_one_row_source(make_source, rows):
+    """The stick runs across rows, so this one gathers instead of broadcasting."""
     base = torch.arange(512, dtype=DTYPE).reshape(8, 64)
-    dx = base.to(DEVICE)[:, :1].T
+    dx = make_source(base.to(DEVICE))
+    index = torch.tensor(rows)
+
+    got = dx[index]
+
+    torch.testing.assert_close(got.cpu(), dx.cpu()[index], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("rows", [[0], [0, 0], [0, -1, 0]], ids=str)
+@pytest.mark.parametrize(
+    "make_source",
+    [
+        pytest.param(lambda d: d, id="contiguous"),
+        pytest.param(lambda d: d.squeeze(0).unsqueeze(1).T, id="stride(1,1)"),
+        pytest.param(lambda d: d.squeeze(0)[:, None].T, id="vector[:,None].T"),
+    ],
+)
+def test_equal_one_row_views_with_other_singleton_strides(make_source, rows):
+    """The stride of dim 0 is meaningless at size 1 and must not pick the path."""
+    _, base = _to_device(torch.randn(1, HIDDEN, dtype=DTYPE))
+    dx = make_source(base)
     index = torch.tensor(rows)
 
     got = dx[index]
