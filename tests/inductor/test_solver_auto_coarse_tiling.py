@@ -1232,6 +1232,22 @@ class TileOwnershipGroupingTests(unittest.TestCase):
                 self._assert_close(device, cpu)
                 self.assertEqual(len(_nests(tiling)), nests, _describe(tiling))
 
+    def test_apply_takes_two_reads_that_agree_only_on_the_tiled_axis(self):
+        # The comparison is per axis. Along d0 both reads move the same way,
+        # so they want the same advance and the tile is exact; that one read
+        # holds still on d1 where the other walks it does not matter, because
+        # d1 is not the axis being tiled.
+        x = torch.randn(64, 64, 128, dtype=torch.float16)
+        y = torch.randn(64, 64, 128, dtype=torch.float16)
+
+        def fn(x, y):
+            a = x + y
+            return a + a[:, 0:1]
+
+        cpu, device, tiling = self._compile_with_both_tiled_d0(fn, (x, y))
+        self._assert_close(device, cpu)
+        self.assertEqual(self._model_ops(tiling), ["buf0", "buf1"], _describe(tiling))
+
     def test_consumer_that_repeats_its_producer(self):
         # Unforced. repeat walks dim 1 of its input twice. The solve once tiled
         # the repeat on that dim, which the apply took and codegen then could
