@@ -34,6 +34,30 @@ if TYPE_CHECKING:
 _UNSET = object()
 
 
+def _sharding_key(tensor) -> tuple | None:
+    """Address-free sharding signature of a real Spyre tensor, else None.
+
+    Part of guards and the FX graph cache key: a sharded input compiles to a
+    non-unified kernel, so it must never reuse an unsharded kernel (or one
+    with another sharding), and vice versa.
+    """
+    import torch
+
+    if (
+        not isinstance(tensor, torch.Tensor)
+        or getattr(tensor, "device", None) is None
+        or tensor.device.type != DEVICE_NAME
+        or isinstance(tensor, torch._subclasses.FakeTensor)
+    ):
+        return None
+    from torch_spyre import _C
+
+    if not _C._spyre_is_sharded(tensor):
+        return None
+    info = _C._spyre_sharding_info(tensor)
+    return (info["shard_dim"], info["num_shards"], info["shard_device_bytes"])
+
+
 def _add_ea(src_tensor, res_tensor) -> None:
     """Update the EA tag after an eager transfer handled by ``orig_to``.
 
@@ -371,6 +395,8 @@ def _patch_tensor_for_spyre():
 
         # Guard on storage_offset to prevent graph reuse across different offsets (#3770)
         expected_offset = value.storage_offset()
+        # Sharded storage compiles to a different (non-unified) kernel.
+        expected_sharding = _sharding_key(value)
 
         # add lambda guard on tensor's child manager
         # same node as TENSOR_MATCH!
@@ -381,10 +407,11 @@ def _patch_tensor_for_spyre():
                 or (
                     x.device_tensor_layout() == expected_layout
                     and x.storage_offset() == expected_offset
+                    and _sharding_key(x) == expected_sharding
                 )
             ),
             [
-                f"SpyreTensorLayout({guard.name}) == {expected_layout} and storage_offset == {expected_offset}"
+                f"SpyreTensorLayout({guard.name}) == {expected_layout} and storage_offset == {expected_offset} and sharding == {expected_sharding}"
             ],
             guard.user_stack,
         )
@@ -427,10 +454,17 @@ def _patch_tensor_for_spyre():
             ):
                 layout = value.device_tensor_layout()
                 offset = value.storage_offset()
-            return (extract_tensor_metadata(value), layout, offset)
+            return (
+                extract_tensor_metadata(value),
+                layout,
+                offset,
+                _sharding_key(value),
+            )
 
         def _spyre_tensor_reuse_eval(value, metadata):
-            base_metadata, expected_layout, expected_offset = metadata
+            base_metadata, expected_layout, expected_offset, expected_sharding = (
+                metadata
+            )
             if not isinstance(value, torch.Tensor):
                 return False
             if extract_tensor_metadata(value) != base_metadata:
@@ -441,6 +475,7 @@ def _patch_tensor_for_spyre():
             return (
                 value.device_tensor_layout() == expected_layout
                 and value.storage_offset() == expected_offset
+                and _sharding_key(value) == expected_sharding
             )
 
         _spyre_reuse_spec = GuardCheckSpec(
@@ -1310,6 +1345,7 @@ def _patch_fx_graph_hash():
         # extract layout and offset from real tensors, fallback to example_inputs
         spyre_layouts = []
         spyre_offsets = []
+        spyre_shardings = []
         # Use real_inputs only if it's a valid list/tuple, otherwise use example_inputs
         inputs_to_use = (
             real_inputs if isinstance(real_inputs, (list, tuple)) else example_inputs
@@ -1321,13 +1357,17 @@ def _patch_fx_graph_hash():
                 offset = inp.storage_offset() if layout is not None else None
                 spyre_layouts.append(layout)
                 spyre_offsets.append(offset)
+                spyre_shardings.append(_sharding_key(inp))
             else:
                 spyre_layouts.append(None)
                 spyre_offsets.append(None)
+                spyre_shardings.append(None)
 
         # Both fields are pickled into cache key to prevent reuse across offsets (#3770)
         self.spyre_layouts = spyre_layouts
         self.spyre_offsets = spyre_offsets
+        # Sharded inputs compile to non-unified kernels (sharded_hbm.py).
+        self.spyre_shardings = spyre_shardings
 
     FxGraphHashDetails.__init__ = _spyre_init
     FxGraphHashDetails._spyre_hash_patched = True
