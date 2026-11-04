@@ -1154,6 +1154,13 @@ def _sigmoid(x):
     return 1.0 / (1.0 + math.exp(-x))
 
 
+def _user_values():
+    values = S.Reals
+    if padding_strict_mode:
+        values = values.union(FiniteSet(S.NaN))
+    return values
+
+
 class DomainRangeTracer(DefaultHandler):
     """
     Validates input set and propagate to image.
@@ -1468,6 +1475,14 @@ class DomainRangeTracer(DefaultHandler):
 
     def where(self, condition, input, other):
         return input.union(other)
+
+    def _default(self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+        logger.warning(
+            "Operation %s has not been enabled in padding propagation. "
+            "No inferences can be made about its padding state.",
+            name,
+        )
+        return _user_values()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1804,13 +1819,6 @@ def is_padded(graph: GraphLowering, node: IRNode | Layout | SpyreTensorLayout):
     total_size = math.prod(node.device_size)
 
     return total_valid_elems < total_size
-
-
-def _user_values():
-    values = S.Reals
-    if padding_strict_mode:
-        values = values.union(FiniteSet(S.NaN))
-    return values
 
 
 _ASSUMED_PADDING: dict[type, Set] = {
