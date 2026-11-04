@@ -1150,11 +1150,10 @@ def enumerate_work_division_candidates(
 def work_division_splits_are_legal(
     op: ComputedBuffer, splits: dict[Symbol, int]
 ) -> bool:
-    """Return whether symbol-keyed splits obey this op's hard constraints.
+    """Whether splits obey hard constraints and scheduler transport.
 
-    The op's own constraints only: unlike :meth:`WorkDivisionContext.is_legal`
-    this asks nothing about a core budget or per-core spans, because the splits
-    are already committed rather than proposed.
+    Unlike :meth:`WorkDivisionContext.is_legal`, this checks neither a core
+    budget nor per-core spans.
     """
     layout = op.get_layout()
     if isinstance(layout, MutationLayoutSHOULDREMOVE):
@@ -1164,7 +1163,11 @@ def work_division_splits_are_legal(
 
     ctx = work_division_context_for_op(op)
     assert ctx is not None  # untiled: never rejected
-    return ctx.obeys_op_constraints(splits) and ctx.meets_span_floors(splits)
+    return (
+        ctx.obeys_op_constraints(splits)
+        and ctx.meets_span_floors(splits)
+        and ctx._representable_by_index_coeff(splits)
+    )
 
 
 # Per-candidate core-division machinery: the questions a solver asks of

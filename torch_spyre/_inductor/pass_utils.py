@@ -2230,21 +2230,6 @@ def unrepresentable_splits_by_index_coeff(
     return problems
 
 
-def splits_representable_by_index_coeff(
-    splits: dict[sympy.Symbol, int],
-    it_space: dict[sympy.Symbol, sympy.Expr],
-    write_index: sympy.Expr,
-    read_index: sympy.Expr,
-) -> bool:
-    """Whether ``splits_by_index_coeff`` can carry every split in ``splits``
-    (factor > 1 entries) without loss. See
-    :func:`unrepresentable_splits_by_index_coeff`.
-    """
-    return not unrepresentable_splits_by_index_coeff(
-        splits, it_space, write_index, read_index
-    )
-
-
 def _coeff_splits_from_index(
     splits: dict[sympy.Symbol, _V],
     index: sympy.Expr,
