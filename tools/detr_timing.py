@@ -13,14 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Time DETR model load, compile and run on Spyre.
+"""Time DETR load / compile / run on Spyre: 2-stream vs 3-stream topology.
 
-Reports:
-  * load time    - ``model_gen()`` + input image load + transfer to the device
-  * compile time - first call of the ``torch.compile``d model (includes one
-                   execution; the steady-state run time is subtracted to
-                   estimate pure compile time)
-  * run time     - mean/min/max over ``--iters`` calls after compilation
+Topologies (see torch_spyre/csrc/spyre_stream.cpp, SpyreStream::launch):
+  2-stream: SPYRE_HAZARD_TRACKER=1
+  3-stream: SPYRE_HAZARD_TRACKER=1 SPYRE_DMA_STREAM=1
+
+SPYRE_HAZARD_TRACKER is latched when the runtime starts, so each topology is
+measured in its own subprocess. Per topology it reports:
+  * load time    - model_gen() + input image load + transfer to the device
+  * compile time - first call of the torch.compile'd model minus the mean
+                   steady-state run time (the first call includes one run)
+  * run time     - mean/min/max over --iters calls after compilation
 
 Usage:
     python3 tools/detr_timing.py /path/to/detr [--batch-size 1] [--iters 10]
@@ -28,13 +32,21 @@ Usage:
 
 import argparse
 import importlib.util
+import json
+import os
 import statistics
+import subprocess
 import sys
 import time
 from pathlib import Path
 
-import torch
-import torch_spyre  # noqa: F401
+RESULT_PREFIX = "DETR_TIMING_RESULT "
+
+# name -> env overrides. None removes the variable from the child environment.
+TOPOLOGIES = {
+    "2-stream": {"SPYRE_HAZARD_TRACKER": "1", "SPYRE_DMA_STREAM": None},
+    "3-stream": {"SPYRE_HAZARD_TRACKER": "1", "SPYRE_DMA_STREAM": "1"},
+}
 
 
 def import_detr(detr_dir: Path):
@@ -48,29 +60,17 @@ def import_detr(detr_dir: Path):
     return module
 
 
-def run_once(fn, x):
-    """Run *fn* and force completion by copying outputs back to the host."""
-    out = fn(x)
-    return tuple(o.cpu() for o in out)
+def measure(args) -> dict:
+    """Run one load/compile/run measurement in the current process."""
+    import torch
+    import torch_spyre  # noqa: F401
 
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("detr_dir", type=Path, help="folder containing detr_model.py")
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--iters", type=int, default=10, help="timed runs")
-    parser.add_argument("--device", default="spyre")
-    parser.add_argument(
-        "--dtype",
-        default="float16",
-        choices=["float16", "float32"],
-        help="dtype for model and input on the device",
-    )
-    args = parser.parse_args()
-
-    detr_dir = args.detr_dir.expanduser().resolve()
     dtype = getattr(torch, args.dtype)
-    detr = import_detr(detr_dir)
+    detr = import_detr(args.detr_dir)
+
+    def run_once(fn, x):
+        # Copy outputs back to the host to force completion.
+        return tuple(o.cpu() for o in fn(x))
 
     # ---- load ----
     t0 = time.perf_counter()
@@ -100,20 +100,110 @@ def main() -> None:
             times.append(time.perf_counter() - t0)
 
     run_mean = statistics.mean(times) if times else 0.0
-    compile_s = max(first_s - run_mean, 0.0)
+    return {
+        "load_s": load_s,
+        "first_s": first_s,
+        "compile_s": max(first_s - run_mean, 0.0),
+        "run_mean_s": run_mean,
+        "run_min_s": min(times) if times else 0.0,
+        "run_max_s": max(times) if times else 0.0,
+        "iters": len(times),
+    }
 
-    print(f"DETR dir        : {detr_dir}")
-    print(f"batch size      : {args.batch_size}")
-    print(f"device / dtype  : {args.device} / {args.dtype}")
-    print(f"load time       : {load_s:.3f} s")
-    print(f"first call      : {first_s:.3f} s (compile + 1 run)")
-    print(f"compile time    : {compile_s:.3f} s (first call - mean run)")
-    if times:
-        print(
-            f"run time        : mean {run_mean * 1e3:.3f} ms, "
-            f"min {min(times) * 1e3:.3f} ms, max {max(times) * 1e3:.3f} ms "
-            f"({len(times)} iters)"
+
+def run_topology(name: str, args) -> dict | None:
+    """Measure one topology in a fresh subprocess; None on failure."""
+    env = os.environ.copy()
+    for key, value in TOPOLOGIES[name].items():
+        if value is None:
+            env.pop(key, None)
+        else:
+            env[key] = value
+
+    cmd = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        str(args.detr_dir),
+        "--batch-size",
+        str(args.batch_size),
+        "--iters",
+        str(args.iters),
+        "--device",
+        args.device,
+        "--dtype",
+        args.dtype,
+        "--worker",
+    ]
+    print(f"[{name}] running ...", flush=True)
+    proc = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, text=True)
+    for line in proc.stdout.splitlines():
+        if line.startswith(RESULT_PREFIX):
+            return json.loads(line[len(RESULT_PREFIX) :])
+    print(f"[{name}] FAILED (exit code {proc.returncode}); see stderr above")
+    return None
+
+
+def print_comparison(results: dict, args) -> None:
+    rows = [
+        ("load time (s)", "load_s", 1.0, "{:.3f}"),
+        ("first call (s)", "first_s", 1.0, "{:.3f}"),
+        ("compile time (s)", "compile_s", 1.0, "{:.3f}"),
+        ("run mean (ms)", "run_mean_s", 1e3, "{:.3f}"),
+        ("run min (ms)", "run_min_s", 1e3, "{:.3f}"),
+        ("run max (ms)", "run_max_s", 1e3, "{:.3f}"),
+    ]
+    names = list(results)
+    print()
+    print(f"DETR dir       : {args.detr_dir}")
+    print(f"batch size     : {args.batch_size}")
+    print(f"device / dtype : {args.device} / {args.dtype}")
+    print(f"timed iters    : {args.iters}")
+    print()
+    header = f"{'':<18}" + "".join(f"{n:>14}" for n in names)
+    if len(names) == 2:
+        header += f"{'3 vs 2':>12}"
+    print(header)
+    for label, key, scale, fmt in rows:
+        vals = [results[n][key] * scale if results[n] else None for n in names]
+        line = f"{label:<18}" + "".join(
+            f"{(fmt.format(v) if v is not None else 'FAILED'):>14}" for v in vals
         )
+        if len(vals) == 2 and all(v is not None for v in vals) and vals[0] > 0:
+            line += f"{(vals[1] / vals[0] - 1) * 100:>+11.1f}%"
+        print(line)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("detr_dir", type=Path, help="folder containing detr_model.py")
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--iters", type=int, default=10, help="timed runs")
+    parser.add_argument("--device", default="spyre")
+    parser.add_argument(
+        "--dtype",
+        default="float16",
+        choices=["float16", "float32"],
+        help="dtype for model and input on the device",
+    )
+    parser.add_argument(
+        "--topology",
+        default="both",
+        choices=["2-stream", "3-stream", "both"],
+        help="topology to measure (default: both, compared)",
+    )
+    parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    args.detr_dir = args.detr_dir.expanduser().resolve()
+
+    if args.worker:
+        print(RESULT_PREFIX + json.dumps(measure(args)), flush=True)
+        return
+
+    names = list(TOPOLOGIES) if args.topology == "both" else [args.topology]
+    results = {n: run_topology(n, args) for n in names}
+    print_comparison(results, args)
+    if any(r is None for r in results.values()):
+        sys.exit(1)
 
 
 if __name__ == "__main__":
