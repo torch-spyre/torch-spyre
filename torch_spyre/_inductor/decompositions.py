@@ -891,6 +891,12 @@ def _select_sdpa_tiling(
             candidate
             for candidate in candidates
             if candidate.estimated_live_bytes_per_core <= lx_budget_bytes
+            or (
+                candidate.num_blocks == 1
+                and candidate.estimated_live_bytes_per_core
+                // candidate.estimated_restick_active_cores
+                <= lx_budget_bytes
+            )
         ]
         if feasible_decode:
             fewest_executions = min(
