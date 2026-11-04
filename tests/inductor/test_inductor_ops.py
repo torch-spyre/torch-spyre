@@ -2081,8 +2081,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_topk_rows", "test_topk_rows_past_lx"): {
             "param_sets": {
-                # topk.ddl was silently wrong once a core held more than half of
-                # the LX Deeptools owns; the k split sets the cores left for rows.
                 "k16_rows256_row_split": (256, 16),
                 "k22_rows384_two_cores": (384, 22),
                 "k17_rows256_one_core": (256, 17),
