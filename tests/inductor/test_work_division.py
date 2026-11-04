@@ -3698,6 +3698,79 @@ class TestCoOptimizingAllocator(unittest.TestCase):
         label = allocation[0].core_divisions[0].label
         self.assertIn(f"division {label}, tiling untiled", message)
 
+    def test_pruned_candidates_exclude_unrepresentable_transport_collision(self):
+        i0, i1, i2 = (_isym(name) for name in ("i0", "i1", "i2"))
+        op = _computed_buffer((8, 8, 64), name="transport_collision")
+        graph = MagicMock(operations=[op])
+        allocator = CoOptimizingAllocator(_UNBUILT_SOLVER, size=1, prune=True)
+        representable = {i0: 1, i1: 1, i2: 4}
+        unrepresentable = {i0: 4, i1: 1, i2: 1}
+        it_space = {i0: 8, i1: 8, i2: 64}
+        rw = MagicMock(
+            writes=[
+                MemoryDep(
+                    op.name,
+                    8 * i0 + 8 * i1 + i2,
+                    (i0, i1, i2),
+                    (8, 8, 64),
+                )
+            ],
+            reads=[],
+        )
+        output_td = _tensor_dep(op.name, (8, 8, 64), (i0, i1, i2))
+
+        with (
+            patch(
+                "torch_spyre._inductor.scratchpad.allocator."
+                "ops_in_offset_mutation_component",
+                return_value=set(),
+            ),
+            patch(
+                "torch_spyre._inductor.scratchpad.allocator."
+                "_find_distinct_matmul_splits",
+                return_value=((), ()),
+            ),
+            patch(
+                "torch_spyre._inductor.scratchpad.allocator._enum_split_options",
+                return_value=[representable, unrepresentable],
+            ),
+            patch(
+                "torch_spyre._inductor.scratchpad.allocator.op_read_writes",
+                return_value=rw,
+            ),
+            patch.object(work_division_module, "op_read_writes", return_value=rw),
+            patch.object(
+                work_division_module, "iteration_space_from_op", return_value=it_space
+            ),
+            patch.object(work_division_module, "get_mem_deps_from_rw", return_value=[]),
+            patch.object(
+                work_division_module,
+                "collect_tensor_deps",
+                return_value=([], output_td),
+            ),
+            patch.object(
+                work_division_module,
+                "adjust_it_space_for_sticks",
+                return_value=(it_space, {}),
+            ),
+            patch.object(
+                work_division_module,
+                "collect_work_division_constraints",
+                return_value=ConstraintResult(),
+            ),
+            patch.object(work_division_module, "_span_min_splits", return_value={}),
+            patch(
+                "torch_spyre._inductor.scratchpad.allocator._split_fits_sticks",
+                return_value=True,
+            ),
+        ):
+            division_map = allocator._division_map(graph)
+
+        self.assertEqual(
+            division_map.divisions[op.name],
+            [CoreDivision(splits={i2: 4})],
+        )
+
     def test_a_division_the_tiled_graph_cannot_state_is_unsupported(self):
         # The tilings are applied by then, so a SolveError would send the
         # greedy fallback onto a graph the solve rewrote.
