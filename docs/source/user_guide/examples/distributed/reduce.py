@@ -18,7 +18,6 @@ import math
 import os
 import tempfile
 from typing import Tuple
-import regex as re
 import torch
 import torch.distributed as dist
 from torch.profiler import ProfilerActivity, profile
@@ -340,11 +339,6 @@ def execute_with_algo(step, show_algo: bool):
     the cost-based default choice, not just a forced COLL_*_ALGO. Returns
     ``(result, algos)``; ``algos`` is None when not requested, and an empty list
     when the profiler build does not emit coll metadata.
-
-    Fallback: spyre-comms prefixes compute kernel names with
-    ``[Coll,Algo,Bytes,CollId]``. When that prefix is not stripped into
-    ``coll_algo`` (e.g. a leading space defeats flex's parser), the algorithm
-    is read from the event name instead.
     """
     if not show_algo:
         return step(), None
@@ -359,11 +353,6 @@ def execute_with_algo(step, show_algo: bool):
         with open(trace_path) as f:
             events = json.load(f)["traceEvents"]
     algos = {e["args"]["coll_algo"] for e in events if "coll_algo" in e.get("args", {})}
-    if not algos:
-        for e in events:
-            m = re.match(r"\s*\[[^,\]]+,([^,\]]+),\d+", e.get("name", ""))
-            if m:
-                algos.add(m.group(1))
     return result, sorted(algos)
 
 
