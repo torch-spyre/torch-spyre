@@ -887,8 +887,8 @@ def test_same_group_coarse_tiled_edge_is_offered_and_priced_per_trip(monkeypatch
 def test_sibling_pins_leave_an_untiled_edge_capped(monkeypatch):
     """Outside a coarse-tiling loop no consumer division counts as pinned by a
     sibling parent, so the per-edge cap holds there. On this fanout graph the
-    sum's other parent matches most of each add's divisions, and pinning them
-    kept 256 groups across 22 edges where the cap allows 88."""
+    sum's other parent matches most of each add's divisions, so pinning them
+    would leave most edges uncapped."""
     kept_per_edge = []
     orig_cap = alloc_mod.CoOptimizingAllocator._cap_relayout_groups
 
