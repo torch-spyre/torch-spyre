@@ -29,6 +29,7 @@
 #include <cstdlib>     // std::getenv
 #include <filesystem>  // NOLINT(build/c++17)
 #include <flex/flex.hpp>
+#include <flex/memory_interface/pool_lifecycle.hpp>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -59,6 +60,7 @@
 #include "spyre_guard.h"
 #include "spyre_kernel.h"
 #include "spyre_mem.h"
+#include "spyre_pinned_allocator.h"
 #include "spyre_stream.h"
 #include "spyre_tensor_impl.h"
 #include "spyre_views.h"
@@ -69,6 +71,7 @@ namespace fs = std::filesystem;
 namespace spyre {
 
 static constexpr int32_t kSpyreTensorLayoutPickleVersion = 4;
+static constexpr int32_t kPoolDescriptorPickleVersion = 1;
 
 std::atomic<bool> g_downcast_warn_enabled{true};
 
@@ -231,6 +234,14 @@ PYBIND11_MODULE(_C, m) {
       at::Generator getNewGenerator(c10::DeviceIndex device) const override {
         return spyre::detail::createSpyreGenerator(device);
       }
+      at::Allocator* getPinnedMemoryAllocator() const override {
+        return spyre::GetSpyrePinnedAllocator();
+      }
+      bool isPinnedPtr(const void* data) const override {
+        auto* allocator = static_cast<spyre::SpyrePinnedAllocator*>(
+            spyre::GetSpyrePinnedAllocator());
+        return allocator->isPinnedPtr(data);
+      }
     };
     static auto* hooks = new SpyreHooksInterface();
     at::RegisterPrivateUse1HooksInterface(hooks);
@@ -296,6 +307,218 @@ PYBIND11_MODULE(_C, m) {
       };
 
   py::class_<spyre::SpyreTensorLayout> dci_cls(m, "SpyreTensorLayout");
+
+  py::enum_<flex::PoolBackend>(m, "PoolBackend")
+      .value("HostDram", flex::PoolBackend::HostDram);
+
+  py::enum_<flex::PoolState>(m, "PoolState")
+      .value("Initializing", flex::PoolState::Initializing)
+      .value("Ready", flex::PoolState::Ready)
+      .value("Destroying", flex::PoolState::Destroying);
+
+  py::enum_<flex::PoolStatus>(m, "PoolStatus")
+      .value("Ok", flex::PoolStatus::Ok)
+      .value("NotFound", flex::PoolStatus::NotFound)
+      .value("AlreadyExists", flex::PoolStatus::AlreadyExists)
+      .value("Initializing", flex::PoolStatus::Initializing)
+      .value("Destroying", flex::PoolStatus::Destroying)
+      .value("PoolBusy", flex::PoolStatus::PoolBusy)
+      .value("StaleGeneration", flex::PoolStatus::StaleGeneration)
+      .value("ConfigurationMismatch", flex::PoolStatus::ConfigurationMismatch)
+      .value("ResourceError", flex::PoolStatus::ResourceError);
+
+  // PoolConfig has no constructor, so build it in a factory. compatibility
+  // is an opaque tag; expose it as bytes rather than pybind's list[int].
+  py::class_<flex::PoolConfig>(m, "PoolConfig")
+      .def(py::init([](std::string name, size_t num_slots, size_t slot_bytes,
+                       flex::PoolBackend backend,
+                       const py::bytes& compatibility) {
+             flex::PoolConfig config;
+             config.name = std::move(name);
+             config.backend = backend;
+             config.num_slots = num_slots;
+             config.slot_bytes = slot_bytes;
+             const std::string tag = compatibility;
+             config.compatibility.assign(tag.begin(), tag.end());
+             return config;
+           }),
+           py::arg("name"), py::arg("num_slots"), py::arg("slot_bytes"),
+           py::arg("backend") = flex::PoolBackend::HostDram,
+           py::arg("compatibility") = py::bytes())
+      .def_readwrite("name", &flex::PoolConfig::name)
+      .def_readwrite("backend", &flex::PoolConfig::backend)
+      .def_readwrite("num_slots", &flex::PoolConfig::num_slots)
+      .def_readwrite("slot_bytes", &flex::PoolConfig::slot_bytes)
+      .def_property(
+          "compatibility",
+          [](const flex::PoolConfig& config) {
+            return py::bytes(
+                reinterpret_cast<const char*>(config.compatibility.data()),
+                config.compatibility.size());
+          },
+          [](flex::PoolConfig& config, const py::bytes& compatibility) {
+            const std::string tag = compatibility;
+            config.compatibility.assign(tag.begin(), tag.end());
+          });
+
+  // Returned by create_pool()/open_pool(). Picklable so a delegator can send
+  // it to workers; attach_pool() re-checks it against the pool either way.
+  py::class_<flex::PoolDescriptor>(m, "PoolDescriptor")
+      .def_readonly("name", &flex::PoolDescriptor::name)
+      .def_readonly("generation", &flex::PoolDescriptor::generation)
+      .def_readonly("state", &flex::PoolDescriptor::state)
+      .def_readonly("config", &flex::PoolDescriptor::config)
+      .def(py::pickle(
+          [](const flex::PoolDescriptor& descriptor) {  // __getstate__
+            // If the pickle format changes, then update
+            // kPoolDescriptorPickleVersion but keep the tuple as the returned
+            // object and the first element to be the version
+            const flex::PoolConfig& config = descriptor.config;
+            return py::make_tuple(
+                spyre::kPoolDescriptorPickleVersion, descriptor.name,
+                descriptor.generation, static_cast<uint32_t>(descriptor.state),
+                config.name, static_cast<uint32_t>(config.backend),
+                config.num_slots, config.slot_bytes,
+                py::bytes(
+                    reinterpret_cast<const char*>(config.compatibility.data()),
+                    config.compatibility.size()));
+          },
+          [](py::tuple t) {  // __setstate__
+            if (t.size() == 0) {
+              throw py::value_error(
+                  "Invalid PoolDescriptor pickle: empty state");
+            }
+            int32_t version = t[0].cast<int32_t>();
+            if (version != spyre::kPoolDescriptorPickleVersion) {
+              throw py::value_error(
+                  "Unsupported PoolDescriptor pickle version; it was pickled "
+                  "by a different torch_spyre build");
+            }
+            // Version 1: (version, name, generation, state, config name,
+            // backend, num_slots, slot_bytes, compatibility)
+            if (t.size() != 9) {
+              throw py::value_error(
+                  "Invalid PoolDescriptor pickle v1: wrong tuple size");
+            }
+            // Reject values outside the enums instead of casting them blindly
+            const uint32_t state = t[3].cast<uint32_t>();
+            const uint32_t backend = t[5].cast<uint32_t>();
+            if (state < static_cast<uint32_t>(flex::PoolState::Initializing) ||
+                state > static_cast<uint32_t>(flex::PoolState::Destroying)) {
+              throw py::value_error(
+                  "Invalid PoolDescriptor pickle v1: unknown state");
+            }
+            if (backend != static_cast<uint32_t>(flex::PoolBackend::HostDram)) {
+              throw py::value_error(
+                  "Invalid PoolDescriptor pickle v1: unknown backend");
+            }
+            flex::PoolDescriptor descriptor;
+            descriptor.name = t[1].cast<std::string>();
+            descriptor.generation = t[2].cast<uint64_t>();
+            descriptor.state = static_cast<flex::PoolState>(state);
+            descriptor.config.name = t[4].cast<std::string>();
+            descriptor.config.backend = static_cast<flex::PoolBackend>(backend);
+            descriptor.config.num_slots = t[6].cast<size_t>();
+            descriptor.config.slot_bytes = t[7].cast<size_t>();
+            const std::string tag = t[8].cast<std::string>();
+            descriptor.config.compatibility.assign(tag.begin(), tag.end());
+            return descriptor;
+          }));
+
+  // smart_holder lets detach_pool() take the pool's unique_ptr back from
+  // Python, which flex::DetachPool() requires.
+  py::classh<flex::SharedPool>(m, "SharedPool")
+      .def("slot_count", &flex::SharedPool::SlotCount)
+      .def("slot_bytes", &flex::SharedPool::SlotBytes)
+      .def("name", &flex::SharedPool::Name)
+      .def("total_bytes", &flex::SharedPool::TotalBytes);
+
+  // (status, descriptor), with None for the descriptor on failure, like
+  // attach_pool(). Builds Python objects, so call it with the GIL held.
+  auto descriptor_result =
+      [](const flex::PoolDescriptorResult& result) -> py::tuple {
+    if (result.status != flex::PoolStatus::Ok) {
+      return py::make_tuple(result.status, py::none());
+    }
+    return py::make_tuple(result.status, result.descriptor);
+  };
+
+  // Delegator side: no device needed. CreatePool() and DestroyPool() wait on
+  // a per-name lock another process may hold, so release the GIL.
+  m.def(
+      "create_pool",
+      [descriptor_result](const flex::PoolConfig& config) {
+        // Copy while holding the GIL: once it is released, another thread
+        // could modify the Python object flex is reading.
+        const flex::PoolConfig config_copy = config;
+        flex::PoolDescriptorResult result;
+        {
+          py::gil_scoped_release release;
+          result = flex::CreatePool(config_copy);
+        }
+        return descriptor_result(result);
+      },
+      py::arg("config"));
+  m.def(
+      "open_pool",
+      [descriptor_result](const std::string& name) {
+        flex::PoolDescriptorResult result;
+        {
+          py::gil_scoped_release release;
+          result = flex::OpenPool(name);
+        }
+        return descriptor_result(result);
+      },
+      py::arg("name"));
+  m.def(
+      "destroy_pool",
+      [](const flex::PoolDescriptor& descriptor) {
+        // Copy while holding the GIL, as in create_pool().
+        const flex::PoolDescriptor descriptor_copy = descriptor;
+        py::gil_scoped_release release;
+        return flex::DestroyPool(descriptor_copy);
+      },
+      py::arg("descriptor"));
+
+  // Worker side: attaching pins the data segment for this process's device.
+  m.def(
+      "attach_pool",
+      [](const flex::PoolDescriptor& descriptor) {
+        spyre::startRuntime();
+        // Copy while holding the GIL, as in create_pool().
+        const flex::PoolDescriptor descriptor_copy = descriptor;
+        flex::AttachResult result;
+        {
+          // Release the GIL for AttachPool; the closing brace takes it back
+          // before py::make_tuple() below touches Python objects.
+          py::gil_scoped_release release;
+          result =
+              flex::AttachPool(spyre::GlobalRuntime::get(), descriptor_copy);
+        }
+        return py::make_tuple(result.status, std::move(result.pool));
+      },
+      py::arg("descriptor"));
+  // Takes the pool's unique_ptr out of the Python object (see SharedPool
+  // above); any later use of that object raises. Detaching an already
+  // detached pool does nothing, like closing a closed file.
+  m.def(
+      "detach_pool",
+      [](const py::object& pool) {
+        // Take the pool out of the Python object while holding the GIL.
+        std::unique_ptr<flex::SharedPool> owned;
+        try {
+          owned = py::cast<std::unique_ptr<flex::SharedPool>>(pool);
+        }
+        catch (const py::value_error&) {
+          // smart_holder reports an already detached handle as value_error.
+          return;
+        }
+        // Unpinning and unmapping a large pool can take a while; let other
+        // Python threads run meanwhile.
+        py::gil_scoped_release release;
+        flex::DetachPool(std::move(owned));
+      },
+      py::arg("pool"));
 
   dci_cls.def_readonly("device_size", &spyre::SpyreTensorLayout::device_size)
       .def_readonly("stride_map", &spyre::SpyreTensorLayout::stride_map)
@@ -470,9 +693,14 @@ PYBIND11_MODULE(_C, m) {
         py::arg("device") = -1);
 
   // Memory copy function
+  // Lets go of the GIL while it runs, so other Python threads (for example
+  // the threaded weight upload in model_utils) can run at the same time. Most
+  // of the time goes to turning the host data into the device format.
+  // spyre_copy_from does not use any Python object.
   m.def("copy_tensor", &spyre::spyre_copy_from,
         "Copy tensor between host and device using DMA", py::arg("self"),
-        py::arg("dst"), py::arg("non_blocking") = false);
+        py::arg("dst"), py::arg("non_blocking") = false,
+        py::call_guard<py::gil_scoped_release>());
 
   // Device-side fill using FillDMA (no host buffer or H2D copy)
   m.def("fill_tensor", &spyre::spyre_fill_tensor,
@@ -643,15 +871,19 @@ PYBIND11_MODULE(_C, m) {
   // Symbolic argument payload types
   py::enum_<spyre::SymbolicArgKind>(m, "SymbolicArgKind")
       .value("kAddress", spyre::SymbolicArgKind::kAddress)
-      .value("kDimension", spyre::SymbolicArgKind::kDimension);
+      .value("kDimension", spyre::SymbolicArgKind::kDimension)
+      .value("kShardAddress", spyre::SymbolicArgKind::kShardAddress);
 
   py::class_<spyre::SymbolicArg>(m, "SymbolicArg")
       .def(py::init([](spyre::SymbolicArgKind kind, int64_t tensor_id,
-                       int64_t dim_index, int64_t value) {
-             return spyre::SymbolicArg{kind, tensor_id, dim_index, value};
+                       int64_t dim_index, int64_t value, int64_t num_shards) {
+             return spyre::SymbolicArg{kind, tensor_id, dim_index, value,
+                                       num_shards};
            }),
            py::arg("kind"), py::arg("tensor_id"),
-           py::arg("dim_index") = int64_t{-1}, py::arg("value") = int64_t{-1})
+           py::arg("dim_index") = int64_t{-1}, py::arg("value") = int64_t{-1},
+           py::arg("num_shards") = int64_t{-1})
+      .def_readwrite("num_shards", &spyre::SymbolicArg::num_shards)
       .def_readwrite("kind", &spyre::SymbolicArg::kind)
       .def_readwrite("value", &spyre::SymbolicArg::value)
       .def_readwrite("tensor_id", &spyre::SymbolicArg::tensor_id)
@@ -693,6 +925,38 @@ PYBIND11_MODULE(_C, m) {
       "        rather than blindly iterating tensors. Empty (default)\n"
       "        preserves today's legacy behavior.");
 
+  // Test-only seam: runs a single HostCompute on the current stream and returns
+  // the produced correction bytes. A HostCompute-only plan cannot go through
+  // prepare_kernel (the validator requires a following Compute, and executing
+  // a Compute from a mock SpyreCode faults the device), so this drives the
+  // same flex path JobPlanStepHostCompute::construct uses (Case 2: no input
+  // buffer, no address args) directly. The "_" prefix signals this is not part
+  // of the stable public API.
+  m.def(
+      "_host_compute_bytes",
+      [](const std::string& hcm_json, size_t correction_size) {
+        auto hcm = std::make_unique<Hcm>();
+        TORCH_CHECK(hcm->importJsonStr(hcm_json), "Failed to import Hcm");
+        auto handle = flex::createHostComputeHandle(std::move(hcm));
+        auto* params = flex::createHostComputeParams(
+            handle.get(), correction_size, /*input_buffer=*/nullptr, {});
+        struct Guard {
+          flex::HostComputeParams* p;
+          ~Guard() {
+            flex::destroyHostComputeParams(p);
+          }
+        } guard{params};
+        std::unique_ptr<flex::HostComputeBuffer,
+                        decltype(&flex::destroyHostComputeBuffer)>
+            buffer(spyre::getCurrentStream().launchHostCompute(params),
+                   flex::destroyHostComputeBuffer);
+        return py::bytes(static_cast<const char*>(buffer->data()),
+                         buffer->size());
+      },
+      py::arg("hcm_json"), py::arg("correction_size"),
+      "Test-only: run one HostCompute (no args) and return the produced "
+      "bytes.");
+
   // Test-only seam: exposes JobPlanStepHostCompute::resolveSymbolicArgs so
   // that Python tests can verify the HostComputeArg ordering without needing
   // a live HCM or device execution. Returns one integer (CompositeAddress*
@@ -710,8 +974,12 @@ PYBIND11_MODULE(_C, m) {
         std::vector<uintptr_t> addrs;
         addrs.reserve(resolved.size());
         for (const auto& host_arg : resolved) {
-          addrs.push_back(reinterpret_cast<uintptr_t>(
-              std::get<const flex::CompositeAddress*>(host_arg)));
+          if (const auto* value = std::get_if<int64_t>(&host_arg)) {
+            addrs.push_back(static_cast<uintptr_t>(*value));
+          } else {
+            addrs.push_back(reinterpret_cast<uintptr_t>(
+                std::get<const flex::CompositeAddress*>(host_arg)));
+          }
         }
         return addrs;
       },
@@ -779,6 +1047,73 @@ PYBIND11_MODULE(_C, m) {
       "TEST-ONLY: project REAL plan steps (classifyStep + role(), exactly as "
       "validate() does) in the given index order, then run the ordering "
       "checker. Returns '' if valid else the error message.");
+
+  m.def(
+      "_spyre_empty_sharded",
+      [](std::vector<int64_t> size, c10::ScalarType dtype, int64_t shard_dim,
+         int64_t num_shards, std::optional<c10::Device> device) {
+        return spyre::spyre_empty_sharded(size, dtype, shard_dim, num_shards,
+                                          device);
+      },
+      py::arg("size"), py::arg("dtype"), py::arg("shard_dim"),
+      py::arg("num_shards"), py::arg("device") = std::nullopt,
+      "Allocate an uninitialized sharded Spyre tensor.");
+  m.def("_spyre_is_sharded", &spyre::spyre_is_sharded, py::arg("tensor"),
+        "Whether a tensor's storage is sharded storage.");
+  m.def(
+      "_spyre_sharding_info",
+      [](const at::Tensor& tensor) {
+        TORCH_CHECK(spyre::spyre_is_sharded(tensor),
+                    "expected a sharded Spyre tensor");
+        auto* ctx = static_cast<spyre::SharedOwnerCtx*>(
+            tensor.storage().data_ptr().get_context());
+        const auto& info = *ctx->sharding;
+        const auto& regions = flex::RuntimeContext::getInstance()
+                                  ->getAllocator()
+                                  ->getIdToRegionMap();
+        py::dict result;
+        result["shard_dim"] = info.shard_dim;
+        result["num_shards"] = info.num_shards;
+        result["shard_device_bytes"] = info.shard_device_bytes;
+        result["total_bytes"] = ctx->composite_addr.total_size();
+        py::list entries;
+        // The shard table is indexed by shard ordinal; shard i backs core i.
+        // logical_core_id and is_device_addressable are asserted by
+        // construction (identity slot-to-core map; per-shard allocations are
+        // device-addressable), not read from Flex; physical placement is
+        // read from the live region map.
+        for (size_t i = 0; i < ctx->shard_addrs.size(); ++i) {
+          const flex::Chunk& chunk = ctx->shard_addrs[i].chunks()[0];
+          auto region_it = regions.find(chunk.addr.region_id);
+          TORCH_CHECK(region_it != regions.end(), "shard ", i,
+                      " references unknown region ", chunk.addr.region_id);
+          const flex::MemoryRegion* region = region_it->second;
+          py::dict entry;
+          entry["logical_chunk_id"] = i;
+          entry["logical_core_id"] = i;
+          entry["physical_domain_id"] = region->domainId();
+          entry["region_id"] = region->regionId();
+          entry["segment_id"] = region->hardwareId();
+          entry["segment_offset_bytes"] = chunk.addr.offset;
+          entry["size_bytes"] = static_cast<uint64_t>(chunk.size);
+          entry["is_device_addressable"] = true;
+          entries.append(entry);
+        }
+        result["chunks"] = entries;
+        return result;
+      },
+      py::arg("tensor"),
+      "Address-free sharding record and per-chunk placement receipt.");
+  m.def(
+      "num_memory_domains",
+      []() -> size_t {
+        auto allocator = flex::RuntimeContext::getInstance()->getAllocator();
+        TORCH_CHECK(allocator != nullptr,
+                    "num_memory_domains requires the Flex runtime to be "
+                    "initialized");
+        return allocator->topology().num_domains();
+      },
+      "Number of memory domains in the Flex device topology.");
 
   // Allocator statistics functions
   m.def(

@@ -71,6 +71,9 @@ CAPABILITY_STATUS_VALUES = frozenset(
 )
 
 RUN_SOURCE_VALUES = frozenset({"jenkins", "gha"})
+RUN_LINK_RELATION_VALUES = frozenset({"launched", "retry_of"})
+RUN_LINK_EVIDENCE_VALUES = frozenset({"recorded", "cited", "inferred"})
+RUN_LINK_CONFIDENCE_VALUES = frozenset({"exact", "timestamp", "low", "unresolved"})
 PIPELINE_TYPE_VALUES = frozenset(
     {"orchestrator", "component-build", "product-test", "gha-workflow", "gha-job"}
 )
@@ -93,6 +96,7 @@ EVENT_TYPE_VALUES = frozenset(
 )
 DISPATCH_STATE_VALUES = frozenset({"queued", "triggered", "failed", "skipped"})
 REQUESTED_BY_VALUES = frozenset({"user", "pipeline"})
+RBAC_SUBJECT_TYPE_VALUES = frozenset({"user", "group"})
 DISPATCHED_BY_VALUES = REQUESTED_BY_VALUES | {"auto"}
 
 # NOT constrained, deliberately: the DDL declares tag_family and arch without a CHECK.
@@ -746,6 +750,43 @@ class ArtifactSubscriptions(Table):
     enums = (("target_type", TARGET_TYPE_VALUES),)
 
 
+class RbacRoles(Table):
+    """A named set of '<resource>:<action>' permissions; the newest updated_at wins."""
+
+    name = "rbac_roles"
+    columns = (
+        "role_id",
+        "updated_at",
+        "active",
+        "permissions",
+        "description",
+        "updated_by",
+        "props",
+    )
+    required = ("role_id",)
+
+
+class RbacBindings(Table):
+    """A role given to a user or OpenShift group, limited to a scope; the newest updated_at wins."""
+
+    name = "rbac_bindings"
+    columns = (
+        "binding_id",
+        "updated_at",
+        "active",
+        "subject_type",
+        "subject",
+        "role_id",
+        "scope",
+        "expires_at",
+        "updated_by",
+        "notes",
+        "props",
+    )
+    required = ("binding_id", "subject", "role_id")
+    enums = (("subject_type", RBAC_SUBJECT_TYPE_VALUES),)
+
+
 class DispatchRequests(Table):
     """A person's or pipeline's "run this subscription against this artifact"."""
 
@@ -818,6 +859,31 @@ class DispatchTargets(Table):
     required = ("published_at",)
 
 
+class PipelineRunLinks(Table):
+    """A launcher-recorded run-to-run edge: an intent first, then the resolved child run."""
+
+    name = "pipeline_run_links"
+    columns = (
+        "link_id",
+        "observed_at",
+        "from_run_key",
+        "to_run_key",
+        "relation",
+        "evidence_kind",
+        "confidence",
+        "target",
+        "dispatched_at",
+        "recorded_by",
+        "props",
+    )
+    required = ("link_id", "from_run_key")
+    enums = (
+        ("relation", RUN_LINK_RELATION_VALUES),
+        ("evidence_kind", RUN_LINK_EVIDENCE_VALUES),
+        ("confidence", RUN_LINK_CONFIDENCE_VALUES),
+    )
+
+
 # Constant API, kept so installed consumers name one table model rather than copying it.
 TEST_CASES = TestCases
 TEST_CASE_RUNS = TestCaseRuns
@@ -831,8 +897,11 @@ ARTIFACT_TAGS = ArtifactTags
 ARTIFACT_RESULTS = ArtifactResults
 ARTIFACT_RESULT_REASONS = ArtifactResultReasons
 PIPELINE_RUNS = PipelineRuns
+PIPELINE_RUN_LINKS = PipelineRunLinks
 CI_RUN_TIMINGS = CiRunTimings
 ARTIFACT_SUBSCRIPTIONS = ArtifactSubscriptions
+RBAC_ROLES = RbacRoles
+RBAC_BINDINGS = RbacBindings
 DISPATCH_REQUESTS = DispatchRequests
 ARTIFACT_DISPATCHES = ArtifactDispatches
 DISPATCH_TARGETS = DispatchTargets
@@ -852,8 +921,11 @@ TABLES = {
         Capabilities,
         CapabilityRuns,
         PipelineRuns,
+        PipelineRunLinks,
         CiRunTimings,
         ArtifactSubscriptions,
+        RbacRoles,
+        RbacBindings,
         DispatchRequests,
         ArtifactDispatches,
         DispatchTargets,

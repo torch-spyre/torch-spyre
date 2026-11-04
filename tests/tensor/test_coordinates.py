@@ -41,7 +41,7 @@ from torch_spyre._inductor.propagate_layouts import (
     PropArg,
     _check_supported_input_sticks,
     _find_alt_target_stl,
-    find_stick_compatible_input_layout,
+    generate_stl_with_required_stick,
 )
 from torch_spyre._inductor.views import (
     _decompose_constant_offset,
@@ -865,7 +865,7 @@ class TestFactorizedMatmulCandidates(TestCase):
         for layouts in ([factorized, canonical], [canonical, factorized]):
             with self.subTest(first=layouts[0]):
                 arg, contraction = self._scenario(layouts)
-                result = find_stick_compatible_input_layout(
+                result = generate_stl_with_required_stick(
                     arg, contraction, BATCH_MATMUL_OP, "x"
                 )
                 self.assertEqual(result, canonical)
@@ -880,7 +880,7 @@ class TestFactorizedMatmulCandidates(TestCase):
             [0, 1, 2],
         )
 
-        result = find_stick_compatible_input_layout(
+        result = generate_stl_with_required_stick(
             arg, contraction, BATCH_MATMUL_OP, "x"
         )
 
@@ -910,7 +910,7 @@ class TestFactorizedMatmulCandidates(TestCase):
                 contraction_range=arg.dep.ranges[contraction],
             ):
                 with self.assertRaisesRegex(Unsupported, "contiguous host dimension"):
-                    find_stick_compatible_input_layout(
+                    generate_stl_with_required_stick(
                         arg, contraction, BATCH_MATMUL_OP, "x"
                     )
 
@@ -925,11 +925,46 @@ class TestFactorizedMatmulCandidates(TestCase):
         arg, contraction, _ = self._same_graph_attention_scenario(
             contraction_range=2048
         )
-        result = find_stick_compatible_input_layout(
+        result = generate_stl_with_required_stick(
             arg, contraction, BATCH_MATMUL_OP, "x"
         )
         self.assertEqual(list(result.device_size), [64, 64, 1, 64])
         self.assertEqual(list(result.stride_map), [4096, 64, -1, 1])
+
+    def test_outer_loop_var_in_the_head_coordinate_collapses_the_whole_chain(self):
+        """An outer variable added to the head coordinate does not block collapse.
+
+        The dep index ``4096*outer + contraction`` makes the head coordinate
+        ``32*outer + floor(contraction/128)``: a loop variable selects a group of
+        32 heads and the contraction variable walks one group.  Only the part of
+        a host coordinate that varies with the contraction variable must depend
+        on it alone, so the outer term is allowed (issue #5441).  The canonical
+        layout spans the whole 64-head chain.
+        """
+        outer, contraction = sympy.symbols(
+            "outer contraction", integer=True, nonnegative=True
+        )
+        heads = 64
+        host = FixedLayout(
+            torch.device("cpu"),
+            torch.float16,
+            [1, heads, 1, 128],
+            [heads * 128, 128, 128, 1],
+        )
+        source = SpyreTensorLayout(
+            [heads, 1, 2, 1, 64],
+            [128, -1, 64, -1, 1],
+            get_device_dtype(torch.float16),
+            {(0,): heads, (1,): 1, (2, 4): 128, (3,): 1},
+        )
+        dep = MemoryDep(
+            "x", 4096 * outer + contraction, (outer, contraction), (heads // 32, 4096)
+        )
+        result = generate_stl_with_required_stick(
+            PropArg(dep, host, [source]), contraction, BATCH_MATMUL_OP, "x"
+        )
+        self.assertEqual(list(result.device_size), [1, 128, 1, 64])
+        self.assertEqual(list(result.stride_map), [-1, 64, -1, 1])
 
     def test_nonstandard_matmul_layout_is_not_canonicalized(self):
         """Non-STANDARD formats are returned unchanged by Pass 3."""
@@ -941,7 +976,7 @@ class TestFactorizedMatmulCandidates(TestCase):
             ElementArrangement.QFP8WT,
         )
         arg, contraction = self._scenario([qfp8wt])
-        result = find_stick_compatible_input_layout(
+        result = generate_stl_with_required_stick(
             arg, contraction, BATCH_MATMUL_FP8_OP, "x"
         )
         self.assertEqual(result, qfp8wt)

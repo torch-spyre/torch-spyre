@@ -239,10 +239,16 @@ test_suite_config:
           mode: xfail  # xfail: dxp_standalone not detected
         # These tests exercise various operations (e.g., add, addmm, bitwise_and) across different dtypes.
         # They are classified as xfail due to unsupported dtypes and type conversion limitations on Spyre.
-        # Relevant Spyre limitations include incomplete dtype support and type conversion during tensor operations.
+        # bitwise_and is excluded (not xfailed): uint8 SIGABRTs inside the
+        # per-dtype loop (free(): invalid next size). YAML xfail still runs
+        # the body and kills the process (#3444). Skip that op on all platforms.
         - names:
             - TestCommon::test_dtypes
           mode: xfail  # xfail: AssertionError, RecursionError, RuntimeError
+          edits:
+            ops:
+              exclude:
+                - name: bitwise_and  # skip: uint8 SIGABRT issue (#3444)
         # These tests exercise a variety of operations and data types, including non-standard boolean values, non-contiguous tensors, and eager variant consistency.
         # The tests are classified as xfail due to NotImplementedError, RuntimeError, and torch._inductor.exc.InductorError exceptions.
         # Relevant Spyre limitations include unsupported operations, missing files, and non-contiguous memory formats.

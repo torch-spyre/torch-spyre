@@ -28,6 +28,7 @@ from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import ComputedBuffer, FixedLayout, Pointwise, Scatter
 from torch._inductor.sizevars import SizeVarAllocator
 from torch._inductor.virtualized import V
+from torch_spyre._C import SpyreTensorLayout
 from torch.utils._ordered_set import OrderedSet
 
 import torch_spyre._inductor.pass_utils as pass_utils
@@ -38,6 +39,7 @@ from torch_spyre._inductor.wrapper import noop_simplify_loops_impl
 @pytest.mark.parametrize("folded_axis", ["new", "old", None])
 def test_restickify_does_not_discard_folded_cache_pages(folded_axis):
     from torch_spyre._C import DataFormats, SpyreTensorLayout
+    from torch_spyre._inductor.propagate_layouts import PropArg
 
     page, token, head, feature = sympy.symbols(
         "page token head feature", integer=True, nonnegative=True
@@ -55,10 +57,22 @@ def test_restickify_does_not_discard_folded_cache_pages(folded_axis):
             2 * page + sympy.floor(feature / 64),
             sympy.Mod(feature, 64),
         ]
+        dep = MemoryDep(
+            "x",
+            5120 * token + 2560 * head + 128 * page + feature,
+            (token, head, page, feature),
+            (64, 2, 20, 128),
+        )
     else:
         size = [20, 64, 2, 64]
         stride = [8192, 128, 64, 1]
         host_coords = [page, token, head, feature]
+        dep = MemoryDep(
+            "x",
+            8192 * page + 128 * token + 64 * head + feature,
+            (page, token, head, feature),
+            (20, 64, 2, 64),
+        )
         if folded_axis == "new":
             stl = SpyreTensorLayout(
                 [1280, 2, 1, 64], [128, 64, 64, 1], DataFormats.SEN169_FP16
@@ -71,12 +85,15 @@ def test_restickify_does_not_discard_folded_cache_pages(folded_axis):
                 DataFormats.SEN169_FP16,
             )
             device_coords = [page, token, head, sympy.S.Zero, feature]
+    host = FixedLayout(torch.device("cpu"), torch.float16, size, stride)
+    arg = PropArg(dep, host, [stl])
     target = pass_utils.compute_restickify_target_layout(
         stl,
-        FixedLayout(torch.device("cpu"), torch.float16, size, stride),
+        host,
         sympy.Mod(token, 64),
         host_coords,
         device_coords,
+        arg=arg,
     )
     if folded_axis is not None:
         assert target is None
@@ -262,6 +279,48 @@ def test_lowering_during_a_spyre_compile_does_not_reuse_a_live_name():
     assert GraphLowering.register_operation is upstream
 
 
+def test_dedup_freed_name_is_not_reissued_during_spyre_compile():
+    """A name freed by dedup_and_promote_constants must not be reissued.
+
+    The sequence that triggers the bug:
+    1. splice_while_loops shortens graph.operations (5 ops -> 3 ops).
+       op3 and op4 are still live and still in name_to_op.
+    2. _unique_operation_names is active for the whole compile.
+    3. split_multi_ops registers a new op (gets op5); operations is now len 4.
+    4. dedup_and_promote_constants removes one op from operations (len->3) and
+       pops op3 from name_to_op entirely.
+    5. _maybe_scratchpad_planning registers another op: len(operations)==3 so
+       it tries op3 first, finds it not in name_to_op, and reissues it.
+    """
+    old_ops = [types.SimpleNamespace(operation_name=f"op{i}") for i in range(5)]
+    graph = types.SimpleNamespace(
+        # operations was shortened to 3 entries by splice_while_loops;
+        # op3 and op4 are still live and in name_to_op.
+        operations=[old_ops[0], old_ops[1], old_ops[2]],
+        name_to_op={op.operation_name: op for op in old_ops},
+        qualify_name=lambda name: name,
+    )
+
+    with _unique_operation_names():
+        # Step 3: split_multi_ops registers a new op (op5); operations grows to 4.
+        first = types.SimpleNamespace(operation_name=None)
+        GraphLowering.register_operation(graph, first)
+        assert first.operation_name == "op5"
+
+        # Step 4: dedup removes one op from operations (back to 3) and pops op3.
+        graph.operations.remove(old_ops[2])
+        graph.name_to_op.pop("op3")
+
+        # Step 5: scratchpad registers another op. len(operations)==3, so it
+        # tries op3 first — which is no longer in name_to_op. Bug: reissues op3.
+        inserted = types.SimpleNamespace(operation_name=None)
+        name = GraphLowering.register_operation(graph, inserted)
+
+    assert name == "op6", (
+        f"expected op6 but got {name!r} (freed name 'op3' must not be reissued)"
+    )
+
+
 def test_replace_computed_buffer_body_preserves_body_origins():
     """A dataclass body rewrite must retain the FX provenance used by layouts."""
 
@@ -300,3 +359,46 @@ def test_replace_computed_buffer_body_preserves_body_origins():
         )
 
     assert set(replacement.data.origins) == {old_origin, replacement_origin}
+
+
+def test_compute_restickify_target_layout_moves_to_existing_size1_dim():
+    """Case (a): an existing size-1 host dim hosts the stick, no synthesis needed."""
+    d1 = sympy.Symbol("d1")
+    host_layout = FixedLayout(torch.device("spyre"), torch.float16, [1, 64], [64, 1])
+    # Host coords: dim0 is the constant size-1 dim, dim1 varies with d1.
+    ic = [sympy.S.Zero, d1]
+    # Device layout with the stick currently on dim1 (idc[-1] == d1); the
+    # outer dim's coordinate is the same constant as the host's size-1 dim.
+    stl = SpyreTensorLayout([1, 64], [64, 1], torch.float16, [0, 1])
+    idc = [sympy.S.Zero, d1]
+
+    result = pass_utils.compute_restickify_target_layout(
+        stl, host_layout, sympy.S.Zero, ic, idc
+    )
+
+    assert result is not None
+    # The stick actually moved: the leading device dim goes from a size-1
+    # placeholder (stl's old outer slot for the size-1 host dim) to the
+    # elems-per-stick extent, reflecting the restickify onto that dim.
+    assert stl.device_size[0] == 1
+    assert result.device_size[0] == 64
+
+
+def test_compute_restickify_target_layout_synthesizes_when_no_size1_dim_exists():
+    """Case (b): no size-1 host dim exists, so the size-1 stick dim is synthetic."""
+    d0, d1 = sympy.symbols("d0 d1", integer=True, nonnegative=True)
+    dep = MemoryDep("x", d0 * 64 + d1, (d0, d1), (4, 64))
+    host_layout = FixedLayout(torch.device("spyre"), torch.float16, [4, 64], [64, 1])
+    stl = SpyreTensorLayout([4, 64], [64, 1], torch.float16, [0, 1])
+    ic = pass_utils.host_coordinates(host_layout, dep, None)
+    idc = pass_utils.device_coordinates(stl, dep, None)
+
+    result = pass_utils.compute_restickify_target_layout(
+        stl, host_layout, sympy.S.Zero, ic, idc
+    )
+
+    assert result is not None
+    # One element per stick: the old stick's 64 elements become an outer dim
+    # and the stick maps to no host stride.
+    assert list(result.device_size) == [64, 4, 64]
+    assert list(result.stride_map) == [1, 64, -1]

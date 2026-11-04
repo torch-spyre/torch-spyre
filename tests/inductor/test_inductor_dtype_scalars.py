@@ -139,12 +139,23 @@ class TestDatatypeScalarOperations:
     def test_integer_scalar_types(self, request, execution_mode, dtype, value):
         """Test integer scalars with FP32 tensor."""
         if execution_mode == "compiled":
-            strict_xfail(
-                request,
-                NotImplementedError,
-                "an integer scalar constant calls spyre::to_dtype_cpu on a CPU "
-                "tensor (the same error as #5070)",
-            )
+            # The scalar becomes a CPU tensor in the graph, and its conversion to
+            # the tensor's float16 is lowered for Spyre (#5070): int32 takes the
+            # device route through float32, the narrower types spyre::to_dtype_cpu.
+            if dtype is np.int32:
+                strict_xfail(
+                    request,
+                    RuntimeError,
+                    "an integer scalar constant is a CPU tensor, which the device "
+                    "conversion route cannot lay out (#5070)",
+                )
+            else:
+                strict_xfail(
+                    request,
+                    NotImplementedError,
+                    "an integer scalar constant calls spyre::to_dtype_cpu on a CPU "
+                    "tensor (the same error as #5070)",
+                )
 
         def int_mul(x):
             return x * dtype(value)

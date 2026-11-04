@@ -207,7 +207,10 @@ the same inputs and the same cost model:
   (and, where landed, tiling candidates) are decision variables, placement is a 2D no-overlap
   packing — each resident buffer an optional `[lifetime] × [address, address+size)` rectangle —
   and producer/consumer slicing-match constraints tie divisions together across edges. CP-SAT
-  searches exactly, minimizing predicted HBM traffic.
+  searches exactly, minimizing the symbolic `cost_expr` below — predicted runtime, not HBM
+  traffic alone — and falls back to a lexicographic traffic-first ladder when no usable
+  expression reaches it (see
+  [CpSatLayoutSolver](scratchpad_planning.md#cpsatlayoutsolver) for both objectives).
 - **`SaCoOptimizingSolver`** (`config.layout_solver = "simulated_annealing"` with
   `co_optimizing_lx_planning`) anneals a single joint state heuristically. The state is the pair
   `(pi, W)`: the LX layout permutation `pi` (held in a composed `PermutationBasedLayoutSolver`)
@@ -286,7 +289,34 @@ When no cost expression is usable (symbolic shapes, serialized captures, or a co
 error), both solvers fall back to a cheaper **memory-only** objective: pure differential HBM
 traffic, where a resident buffer costs zero and only spills are summed — the compute-roofline
 term drops out entirely. This fallback is weaker — on a graph where everything already fits,
-every division scores identically and the search has nothing left to optimize on.
+every division scores identically and the search has nothing left to optimize on. On the CP-SAT
+side that traffic term is the first level of the lexicographic ladder in
+[CpSatLayoutSolver](scratchpad_planning.md#cpsatlayoutsolver), whose later levels break the
+remaining ties by cut count, parallelism, division balance and tile count; CP-SAT also takes
+that ladder when `cost_expr_to_cpsat` cannot lower the expression, and whenever
+`auto_coarse_tiling` is on, since the allocator then withholds the expression (the model is flat
+in tile size and cut count).
+
+:::{warning}
+Even when the expression survives, parts of the model go quiet. Both engines price the *same*
+expression, built once by the allocator, so both inherit the same limitation: a term cannot
+branch on a decision the solver has not made yet (issue `#4233`). Terms that would branch on a
+still-symbolic shape or residency guard themselves (`_is_sym`, or an
+`isinstance(..., sympy.Basic)` check) and return their neutral value instead — the coarse
+underfill derate (`coarse_underfill_eff`), `_lx_spill_bw_derate` (in its
+`_lx_spill_working_set` helper, not the derate itself), `_matmul_mac_peak`,
+`_reduction_bw_cores_factor`, the bundled model's split-reread term, and `_eff_bw`'s per-op
+access-pattern overrides, which a symbolic `is_lx` drops back to the default turnaround.
+Nothing raises, and nothing reports it: the plan is just ranked by a model short those
+derates. The bundled matmul's array-fill derate is a different case and not a symbolic one:
+it goes through `underfill_eff`, which a coarse-tiled matmul bypasses outright for want of
+data to fit (`_select(tiles_output_dim, ...)` takes the un-derated branch), while the
+matmul-calibrated `coarse_underfill_eff_matmul` curve reaches only the `SPYRE_DUMP_COST`
+report text, never the minimized expression. A branch that cannot guard itself costs more —
+reading `ArgTraffic.mem` raises on a symbolic `is_lx`, which the allocator catches and turns
+into the memory-only fallback for the whole graph; see the warning under [The
+objective](sa_co_optimization.md#the-objective) for the paths that still read it.
+:::
 
 ## What gets co-optimized today
 
@@ -331,20 +361,18 @@ At a high level: both solvers decide tiling jointly with LX placement and work d
 rank it differently. CP-SAT does so in the *same* constraint model, just ranked by a different
 objective. When `auto_coarse_tiling` is on,
 `cost_expr` is dropped and residency, division, and tiling are all still decided together, but
-now ranked by an ordered sequence of tie-breaks instead: residency first, then fewest tiling
-cuts, then parallelism, then division shape, then tile count, each one only resolving ties the
-step before leaves open. Once that solve picks a tiling, the graph is physically rewritten to
-apply it, and residency and division are solved jointly *again* over the now-tiled graph — a
-second joint solve, not a continuation of the first, since tiling is no longer offered as a
-choice at that point. Simulated annealing picks a tiling jointly with division too, through
-`OpSplitSpace`, and keeps ranking by `cost_expr`, which prices the tiling through its tile-count
-symbols: the loop reaches the price mainly through the operands it re-reads, beside the
-residency the tiling makes possible. Its chosen tilings are applied the same way, and its
-placement stands: there is no second solve.
+now ranked by an ordered sequence of tie-breaks instead: HBM traffic first, then fewest
+tiling cuts, then parallelism, then division shape, then tile count, each one only resolving
+ties the step before leaves open. Simulated annealing picks a tiling jointly with division too,
+through `OpSplitSpace`, and keeps ranking by `cost_expr`, which prices the tiling through its
+tile-count symbols: the loop reaches the price mainly through the operands it re-reads, beside
+the residency the tiling makes possible. Either way there is one solve: once it picks a tiling,
+the graph is physically rewritten to apply it, the divisions the solve chose are committed onto
+the tiled graph's ops, and the placement stands.
 
-**Status: landed for both solvers, off by default; SA fixes still landing.** `CoreDivision.tiling`
+**Status: landed for both solvers, off by default.** `CoreDivision.tiling`
 / `min_footprint` in `plan_solver.py` account for a tiling if one is present, and
-`scratchpad/coarse_tiling.py`'s `CoarseTilingPass` — taking a `TileSpec` and lowering it to
+`scratchpad/coarse_tiling.py`'s `apply_tilings` — taking a `TileSpec` and lowering it to
 `DimHint`s — applies the chosen tilings, both shared by the two solvers:
 
 - **CP-SAT**: landed via `#4768` (`main` as of this update). Each op is offered a menu of
@@ -352,23 +380,27 @@ placement stands: there is no second solve.
   compatible if they agree on which slice of the shared buffer each tile and core owns.
   Consecutive ops sharing a loop nest form a loop group, and every producer/consumer edge
   inside one must be compatible. The solve ranks plans with the lexicographic ladder described
-  above, not `cost_expr`. Once it picks a tiling, `CoarseTilingPass` applies it to the graph
-  and the allocation is solved again over the now-tiled graph, with no further tilings
-  offered — that second plan is the one committed.
+  above, not `cost_expr`. It places the graph its tilings produce: a *cut* (a tiled op whose
+  value must leave its nest) gets a copy op that drains each tile into a full-sized HBM
+  buffer, and the first ladder stage charges that copy's traffic. The tile itself stays an LX
+  candidate, but only under a division with no reduction split, since the copy reads it core
+  for core. A buffer a tiled op reads lives until that op's nest ends, and an input clone it
+  reads is held from the nest's start. Once it picks a tiling, `apply_chosen_tilings`
+  applies it and each op takes the division the solve chose for it, a cut's copy op that of
+  the op it drains. A division that splits a dim its tile no longer iterates raises
+  `Unsupported`: the tilings are already applied by then, so the greedy fallback, which
+  catches only `SolveError`, cannot replan the graph.
 
-- **Simulated annealing**: a 7-PR stack (`#4456` through `#4894`) adds this; the first six
-  are merged. `OpSplitSpace`'s `TilingSpace` half offers each op its tilings; the **flip** move
-  shifts a tiled run's boundary, and the **recolor** move (it floods a coordinated division
-  change across a connected region of buffers) carries a tiling along with it. `#4602`
-  applies the chosen tilings before the divisions are committed, keeping the anneal's
-  placement; a tiling the apply refuses raises rather than falling back. `#4611` prices the
-  HBM traffic of the full-extent companion buffer the apply mints for a tiled op whose output
-  escapes its run. `#4770` prices the loop a tiling introduces, through tile-count symbols in
-  `cost_expr`, and refuses LX to a buffer a tiled op reads across its run's boundary. Still to
-  come: `#4894` fixes the gaps between what the search may tile and
-  what the apply builds that surface once tilings are applied, as compile failures or
-  mis-scaled reads. Until `#4894` lands, keep `auto_coarse_tiling` off under simulated
-  annealing. See [The apply round](sa_co_optimization.md#the-apply-round) for the mechanics.
+- **Simulated annealing**: landed via `#4456` through `#4894`. `OpSplitSpace`'s `TilingSpace`
+  half offers each op its tilings; the **flip** move shifts a tiled run's boundary, and the
+  **recolor** move (it floods a coordinated division change across a connected region of
+  buffers) carries a tiling along with it. Besides the tile-count symbols in `cost_expr`, the
+  anneal prices the HBM traffic of the full-extent companion buffer the apply mints for a tiled
+  op whose output escapes its run, outside that expression. A buffer a tiled op reads from
+  outside its run is refused LX. The chosen tilings are applied before the divisions are
+  committed, keeping the anneal's placement. A tiling the apply refuses raises rather than
+  falling back, since `OpSplitSpace.admits` is meant to offer only tilings the apply can build.
+  See [The apply round](sa_co_optimization.md#the-apply-round) for the mechanics.
 
 `scratchpad_planning.md`'s "Current limitations"/"Future work" coarse-tiling items now point
 here for current status, rather than carrying their own stale claim.
@@ -393,8 +425,9 @@ solvers differ in what "substitute and evaluate" compiles down to:
   (`scratchpad/ilp_solver_ortools.py`) maps each sympy symbol straight onto a native OR-Tools
   decision variable (`sym_map[t.buffer.sym_is_lx.name] = t.in_buffer`, and similarly for
   `sym_core_divs`), then hands the whole expression, still unevaluated, to the constraint model
-  as the objective to minimize via `_SympyExprToCpSat(...).convert(cost_expr)`. CP-SAT never
-  evaluates `cost_expr` in Python; it searches the symbolic constraint space directly.
+  as the objective to minimize via `cost_expr_to_cpsat(...)`
+  (`scratchpad/cpsat_expr_printer.py`). CP-SAT never evaluates `cost_expr` in Python; it
+  searches the symbolic constraint space directly.
 - **Simulated annealing (compiled, then evaluated numerically per move)**: `_build_score_fn`
   (`scratchpad/sa_cooptimizer.py`) instead compiles `cost_expr` once via `sympy.lambdify` into
   a plain Python function of `(chosen, resident)`, and calls that function fresh for every
@@ -412,8 +445,9 @@ Two useful flags:
 - `SPYRE_DUMP_COST_EXPR_FILE=<path>`: a companion machine-readable dump, one JSON line per
   solve (`cost_expr_record` in `scratchpad/plan_solver.py`), recording the objective's
   per-bundle terms as lossless `sympy.srepr` strings, the symbol bindings the solver actually
-  chose, every term evaluated under those bindings, and the alternative divisions each buffer
-  could have taken instead — a self-describing record of one solve, meant to be read without
+  chose, every term evaluated under those bindings, the terms the solver adds outside the
+  expression and the total it minimized, and the alternative divisions each buffer could have
+  taken instead — a self-describing record of one solve, meant to be read without
   needing to know which flags produced it. This one is specific to a *co-optimized* solve.
 
 ### Keeping the model honest: recalibrating against real hardware
@@ -484,39 +518,40 @@ whatever configurations happen to already have measurements
 (`run_cost_model_sweep.py`'s `_configs()`, driven by `_env_from_record`) — there is no
 code anywhere that checks the result for balance, so today's distribution is an artifact
 of what got measured historically, not a deliberate weighting choice. Measured directly
-from `sweep_plan.json` (1632 configs total; `run_cost_model_sweep.py --dry-run` reports
-1518 of those because `_SKIP_OPS` excludes `bmm_layout` — a non-default operand layout no
+from `sweep_plan.json` (1762 configs total; `run_cost_model_sweep.py --dry-run` reports
+1648 of those because `_SKIP_OPS` excludes `bmm_layout` — a non-default operand layout no
 released build emits — and `bmm_3d2d_k_tiling`, quarantined after a real hardware incident
 on 2026-08-07 rather than for being a bad config), grouped into
 [Accuracy](cost_model.md#accuracy)'s own reporting categories:
 
   <table>
-  <thead><tr><th>group</th><th>category</th><th>configs</th><th>% of 1632</th></tr></thead>
+  <thead><tr><th>group</th><th>category</th><th>configs</th><th>% of 1762</th></tr></thead>
   <tbody>
-  <tr><td rowspan="9"><b>matmul/bmm</b><br/>573 (35.1%)</td><td>matmul_split (<code>mmwd</code>)</td><td align="right">281</td><td align="right">17.2%</td></tr>
-  <tr><td>bmm_split</td><td align="right">113</td><td align="right">6.9%</td></tr>
-  <tr><td>matmul_row</td><td align="right">93</td><td align="right">5.7%</td></tr>
-  <tr><td>bmm</td><td align="right">23</td><td align="right">1.4%</td></tr>
-  <tr><td>matmul</td><td align="right">18</td><td align="right">1.1%</td></tr>
+  <tr><td rowspan="9"><b>matmul/bmm</b><br/>573 (32.5%)</td><td>matmul_split (<code>mmwd</code>)</td><td align="right">281</td><td align="right">15.9%</td></tr>
+  <tr><td>bmm_split</td><td align="right">113</td><td align="right">6.4%</td></tr>
+  <tr><td>matmul_row</td><td align="right">93</td><td align="right">5.3%</td></tr>
+  <tr><td>bmm</td><td align="right">23</td><td align="right">1.3%</td></tr>
+  <tr><td>matmul</td><td align="right">18</td><td align="right">1.0%</td></tr>
   <tr><td>matmul_k</td><td align="right">15</td><td align="right">0.9%</td></tr>
-  <tr><td>matmul_nested</td><td align="right">13</td><td align="right">0.8%</td></tr>
-  <tr><td>bmm_3d2d (skipped)</td><td align="right">9</td><td align="right">0.6%</td></tr>
+  <tr><td>matmul_nested</td><td align="right">13</td><td align="right">0.7%</td></tr>
+  <tr><td>bmm_3d2d (skipped)</td><td align="right">9</td><td align="right">0.5%</td></tr>
   <tr><td>bmm_nested</td><td align="right">8</td><td align="right">0.5%</td></tr>
-  <tr><td rowspan="2"><b>softmax</b><br/>138 (8.5%)</td><td>softmax</td><td align="right">113</td><td align="right">6.9%</td></tr>
-  <tr><td>softmax_unrolled</td><td align="right">25</td><td align="right">1.5%</td></tr>
-  <tr><td rowspan="2"><b>reduction</b><br/>206 (12.6%)</td><td>reduction (plain)</td><td align="right">155</td><td align="right">9.5%</td></tr>
-  <tr><td>coarse_reduction</td><td align="right">51</td><td align="right">3.1%</td></tr>
-  <tr><td colspan="2">broadcast</td><td align="right">226</td><td align="right">13.8%</td></tr>
-  <tr><td colspan="2">transport</td><td align="right">172</td><td align="right">10.5%</td></tr>
-  <tr><td colspan="2">pointwise</td><td align="right">168</td><td align="right">10.3%</td></tr>
-  <tr><td colspan="2">other (incl. <code>bmm_layout</code>, skipped)</td><td align="right">149</td><td align="right">9.1%</td></tr>
+  <tr><td rowspan="2"><b>softmax</b><br/>138 (7.8%)</td><td>softmax</td><td align="right">113</td><td align="right">6.4%</td></tr>
+  <tr><td>softmax_unrolled</td><td align="right">25</td><td align="right">1.4%</td></tr>
+  <tr><td rowspan="2"><b>reduction</b><br/>206 (11.7%)</td><td>reduction (plain)</td><td align="right">155</td><td align="right">8.8%</td></tr>
+  <tr><td>coarse_reduction</td><td align="right">51</td><td align="right">2.9%</td></tr>
+  <tr><td colspan="2">broadcast</td><td align="right">226</td><td align="right">12.8%</td></tr>
+  <tr><td colspan="2">transport</td><td align="right">172</td><td align="right">9.8%</td></tr>
+  <tr><td colspan="2">pointwise</td><td align="right">168</td><td align="right">9.5%</td></tr>
+  <tr><td colspan="2">other (incl. <code>bmm_layout</code>, skipped)</td><td align="right">149</td><td align="right">8.5%</td></tr>
+  <tr><td colspan="2"><code>relayout</code> (scored by <code>eval_model.py --relayout</code>)</td><td align="right">130</td><td align="right">7.4%</td></tr>
   </tbody>
   </table>
 
-  Summed by family, matmul/bmm+softmax together are 711/1632 (43.6%) — well under
-  broadcast+transport+pointwise+reduction's combined 921/1632 (56.4%), so "matmul-biased"
+  Summed by family, matmul/bmm+softmax together are 711/1762 (40.4%) — well under
+  broadcast+transport+pointwise+reduction's combined 921/1762 (52.3%), so "matmul-biased"
   overstates it at the top level. The real skew is *within* the matmul family: `mmwd` alone
-  (17.2%) outweighs every other single op by a wide margin, while five matmul/bmm
+  (15.9%) outweighs every other single op by a wide margin, while five matmul/bmm
   sub-categories — `matmul`, `matmul_k`, `matmul_nested`, `bmm_3d2d`, `bmm_nested` — each
   rest on under 20 configs (8 to 18). Their rows in the Accuracy table are the ones to treat
   as statistically thin regardless of how important those ops are architecturally; a
@@ -593,9 +628,10 @@ Open items from drafting this page that are worth resolving before calling it do
 
 ### Tiling-related:
 
-- SA's coarse-tiling stack (`#4456` through `#4894`) is 6 of 7 merged — update [b) LX
-  placement, work division, and coarse tiling](#b-lx-placement-work-division-and-coarse-tiling)
-  above (and `scratchpad_planning.md`'s pointers to it) again as `#4894` lands.
+- Simulated annealing decides by its own objective whether a tiling pays, and can decide
+  against it: `test_solver_auto_coarse_tiling.py`'s MLP stays untiled under simulated annealing
+  (`sa_may_stay_untiled`). How closely the tile-count symbols track the device is not covered
+  by the sweep plan (see the sweep-coverage item above).
 - The existing docs use "tiling" for two different things — `CoreDivision.tiling` (coarse
   tiling proper, a `TileSpec`), and `scratchpad_planning.md`'s co-optimization section calling
   core-division splits for matmuls "the matmuls' tilings." The code no longer does:

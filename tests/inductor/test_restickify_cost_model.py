@@ -24,7 +24,7 @@ from torch._inductor.dependencies import MemoryDep
 from torch._inductor.virtualized import V
 from torch_spyre._C import DataFormats, SpyreTensorLayout
 from torch_spyre._inductor import cost_model as cm
-from torch_spyre._inductor import dump_cost_model as dcm
+from torch_spyre._inductor import cost_features as dcm
 
 
 B, X, N = sympy.symbols("b x n", integer=True, nonnegative=True)
@@ -320,7 +320,7 @@ def test_serialization_defaults_and_roundtrip():
 @pytest.mark.parametrize("n,trips", [(1024, 1), (1024, 128), (16384, 1)])
 def test_symbolic_cpsat_picks_measured_fast_division(n, trips):
     cp_model = pytest.importorskip("ortools.sat.python.cp_model")
-    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import _SympyExprToCpSat
+    from torch_spyre._inductor.scratchpad.cpsat_expr_printer import _SympyExprToCpSat
 
     sb, sx = sympy.symbols("split_b split_x", integer=True, positive=True)
     expr = sympy.sympify(cm.predict_ops([restickify(sb, sx, n=n, trips=trips)]))

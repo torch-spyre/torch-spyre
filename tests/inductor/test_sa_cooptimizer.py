@@ -69,6 +69,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionBuffer,
     TileAxis,
     TileSpec,
+    cost_expr_record,
 )
 from synthetic_cooptimization_graphs import synthetic_graphs
 from utils_inductor import (
@@ -2355,3 +2356,45 @@ class CompanionBufferPricingTest(TestCase):
         self.assertEqual(
             after - before, utils.to_fixed_us(4096 / solver._hbm_bytes_per_us)
         )
+
+
+class CostDumpScoreTest(TestCase):
+    """The cost dump's ``score_ns`` is what the search minimized: ``cost_expr``
+    plus the terms :meth:`SaCoOptimizingSolver._score` adds outside it."""
+
+    def _solved(self):
+        # A tiled alone with two untiled readers, so its output escapes.
+        bufs = [_run_buffer("A", 0, _two_axis_space(tiling=_tiling_space()))]
+        for position, name in ((1, "B"), (2, "C")):
+            bufs.append(_run_buffer(name, position, _two_axis_space()))
+            bufs[-1].parents = ["A"]
+        cost_expr = 1e6 / bufs[0].sym_tile_counts[0, False]
+        solver = SaCoOptimizingSolver(bufs, 1 << 30, 128)
+        result = solver.plan_layout_and_core_divisions(cost_expr)
+        return solver, cost_expr, result
+
+    def _record(self, solver, cost_expr, result):
+        return cost_expr_record(
+            cost_expr,
+            [],
+            result,
+            off_expression_ns=solver.off_expression_ns(),
+            score_ns=solver.score_ns(),
+        )
+
+    def _assert_score(self, record, solver):
+        self.assertAlmostEqual(record["score_ns"], solver.best_score / 1000, places=2)
+        self.assertAlmostEqual(
+            record["score_ns"],
+            record["objective_ns"] + sum(record["off_expression_ns"].values()),
+            places=2,
+        )
+
+    def test_score_ns_is_the_best_score_with_a_companion(self):
+        solver, cost_expr, result = self._solved()
+        record = self._record(solver, cost_expr, result)
+        self.assertGreater(record["off_expression_ns"]["companions"], 0)
+        self.assertNotAlmostEqual(
+            record["objective_ns"], solver.best_score / 1000, places=2
+        )
+        self._assert_score(record, solver)

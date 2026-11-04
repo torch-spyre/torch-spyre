@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for the matmul M/N/K decode in ``dump_cost_model._matmul_features``.
+"""Unit tests for the matmul M/N/K decode in ``cost_features._matmul_features``.
 
 Regression guard for the batchmatmul decode bug: for a 3D ``[B, M, N]`` output the
 batch stride is the LARGEST write-index coefficient, so the old "largest coeff = M"
@@ -40,11 +40,11 @@ from torch._inductor.sizevars import SizeVarAllocator
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 
-import torch_spyre._inductor.dump_cost_model as dcm
+import torch_spyre._inductor.cost_features as dcm
 from torch_spyre._C import DataFormats, SpyreTensorLayout
 from torch_spyre._inductor import work_division as wd
 from torch_spyre._inductor.cost_model import ArgTraffic
-from torch_spyre._inductor.dump_cost_model import (
+from torch_spyre._inductor.cost_features import (
     _level_loop_vars,
     _loop_factor_for_index,
     _loop_var_advances,

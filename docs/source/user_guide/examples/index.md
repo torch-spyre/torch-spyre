@@ -18,6 +18,15 @@ common Torch-Spyre use cases.
 | `for_each_tile.py` | Tiling a computation into a loop with `for_each_tile` (a map over M, a split-K carry) |
 | `profile_ops.py` | Measuring one operation's device time with the PyTorch profiler (see [the cost model](../../compiler/cost_model.md)) |
 | `run_cost_model_sweep.py` | Re-measuring every configuration in the cost-model database |
+| `attention.py` | Scaled dot-product attention from matmul and softmax (compile-only) |
+| `mlp.py` | SwiGLU feed-forward block on Spyre |
+| `rms_norm.py` | RMS normalization along the reduction dimension |
+| `embedding.py` | Embedding lookup with a zeroed padding row |
+| `fp8.py` | FP8 channel-wise quantization roundtrip |
+| `tensor_layout.py` | Moving a tensor to Spyre with an explicit on-device layout |
+| `custom_op.py` | Registering a custom op with a Spyre lowering |
+| `flash_attention.py` | Block-wise flash attention with online softmax |
+| `hf_model.py` | Running a HuggingFace causal LM through hf-adapters |
 
 ## Distributed Examples
 
@@ -47,18 +56,11 @@ resulting buffer layouts. They require `matplotlib` and `numpy`.
 
 ## Provenance Audit
 
-A multi-stage audit that traces a model through the compilation pipeline and
-records, at each stage, which source-to-kernel provenance fields are carried or
-dropped ([issue #2574](https://github.com/torch-spyre/torch-spyre/issues/2574)).
-The **README** explains how to run the audit; the **example** is one generated
-artifact from auditing `SimpleMLP`.
-
-```{toctree}
-:maxdepth: 1
-
-provenance/README
-provenance/provenance_audit
-```
+The provenance audit traces which source-to-kernel provenance fields survive
+each compilation stage. It is an observability tool, so it now lives under
+[Debugging](../debugging/index.md): see
+[how to run it](../debugging/provenance/README.md) and the
+[example audit of `SimpleMLP`](../debugging/provenance/provenance_audit.md).
 
 ## Running an Example
 
