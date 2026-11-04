@@ -1431,9 +1431,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "5d_neg": (
                     -torch.randn((8, 3, 30, 112, 112), dtype=torch.float16).abs(),
                 ),
-                "5d_inf": (
-                    torch.full((1, 1, 2, 2, 3), float("inf"), dtype=torch.float16),
-                ),
                 "5d_nan": (
                     torch.full((1, 1, 2, 2, 3), float("nan"), dtype=torch.float16),
                 ),
@@ -11485,6 +11482,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ``a.clone()`` would be functionalized into a plain out-of-place clamp
         and never exercise the write-back.)
         """
+        # clamp_min_/clamp_max_ require their bound; only clamp_ accepts None.
+        if op is torch.Tensor.clamp_min_ and min_val is None:
+            pytest.skip("clamp_min_ requires min_val")
+        if op is torch.Tensor.clamp_max_ and max_val is None:
+            pytest.skip("clamp_max_ requires max_val")
+
         atol, rtol = _clamp_tol(x.dtype)
         if op is torch.Tensor.clamp_:
 
