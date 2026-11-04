@@ -62,6 +62,8 @@ pinned_dims: dict[str, set[int]]  (local to reorder_nonstick_dims, never on grap
 """
 
 import math
+import random
+import warnings
 import sympy
 from typing import Any, Literal, NamedTuple
 
@@ -121,6 +123,8 @@ from .enforce_indirect_access_layout import (
 )
 
 logger = get_inductor_logger("nonstick_dim_order")
+
+_ndo_random: random.Random | None = None
 
 
 def _buf_stl(buf) -> SpyreTensorLayout | None:
@@ -400,7 +404,11 @@ def _matmul_reorder_stl(
     name: str = "",
     pinned: set[int] | None = None,
 ) -> SpyreTensorLayout | None:
-    """Swap the largest non-pinned nonstick dim into the outer_stick+1 slot.
+    """Swap a non-pinned nonstick dim into the outer_stick+1 slot.
+
+    Normally swaps the largest candidate (performance heuristic). When
+    config.ndo_stress_test_seed is set, picks a random candidate instead so
+    that different orderings can be exercised for layout-sensitivity testing.
 
     Returns a new STL if a swap was made, or None if no change is needed.
     pinned is a set of device positions that must not be moved or displaced.
@@ -451,8 +459,17 @@ def _matmul_reorder_stl(
     if device_size[largest] <= device_size[slot]:
         return None
 
+    if _ndo_random is not None:
+        chosen = _ndo_random.choice(candidates)
+        warnings.warn(
+            f"STRESS_TEST_NDO={config.ndo_stress_test_seed}: {name} randomly chose"
+            f" dim {chosen} instead of largest dim {largest}"
+        )
+    else:
+        chosen = largest
+
     new_order = list(range(n))
-    new_order[slot], new_order[largest] = new_order[largest], new_order[slot]
+    new_order[slot], new_order[chosen] = new_order[chosen], new_order[slot]
     new_device_size = [device_size[d] for d in new_order]
     new_stride_map = [stride_map[d] for d in new_order]
     logger.debug(
@@ -1111,6 +1128,9 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
       V.graph.nonstick_deferred     — list[_DeferredReorder] consumed by
                                       reorder_nonstick_dims_mutation.
     """
+    global _ndo_random
+    seed = config.ndo_stress_test_seed
+    _ndo_random = random.Random(seed) if seed is not None else None
     V.graph.nonstick_deferred = []
     log: dict[str, SpyreTensorLayout] = {}
     pinned_dims = _apply_correctness_constraints(graph, log)
