@@ -3963,7 +3963,7 @@ def _patch_consumers(
                 new_loop_info.loop_count,
                 new_loop_info.tiled_dims_per_read,
                 new_tiled_dims_per_read,
-            ) 
+            )
 
 
 class _NameAndIndexSwapHandler(WrapperHandler):
