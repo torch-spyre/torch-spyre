@@ -5212,8 +5212,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
             "expect_fail": {
-                "mul_4d_with_nan": "Issue #1829",
-                "mul_5d_with_inf": "Issue #1830",
+                "4d_with_nan": "Issue #1829",
+                "5d_with_inf": "Issue #1830",
             },
         },
         (
