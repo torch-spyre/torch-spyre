@@ -424,17 +424,21 @@ class TestLoadModelToSpyre(TestCase):
     @requires_spyre
     def test_parameter_with_a_cpp_weakref_is_replaced_with_a_warning(self):
         """The impl swap refuses a parameter with a C++ weakref. That one falls back to a
-        new Parameter, as before, instead of failing the load with the model half moved."""
-        model = nn.Linear(64, 128, dtype=torch.float16)
-        held = model.weight
+        new Parameter, as before, instead of failing the load with the model half moved.
+        A tied holder gets the same new Parameter, so the tie and the forward hold."""
+        model = nn.Module()
+        model.embed = nn.Embedding(256, 128, dtype=torch.float16)
+        model.head = nn.Linear(128, 256, bias=False, dtype=torch.float16)
+        model.head.weight = model.embed.weight
+        held = model.embed.weight
         ref = torch._C._WeakTensorRef(held)  # noqa: F841 -- kept alive through the move
         with self.assertLogs("spyre.inductor.model_utils", "WARNING") as logs:
             load_model_to_spyre(model)
 
-        self.assertIsNot(model.weight, held)
-        self.assertEqual(model.weight.device.type, "spyre")
-        self.assertEqual(model.bias.device.type, "spyre")
-        self.assertIn("Linear.weight", "".join(logs.output))
+        self.assertIsNot(model.embed.weight, held)
+        self.assertIs(model.head.weight, model.embed.weight)
+        self.assertEqual(model.head.weight.device.type, "spyre")
+        self.assertIn("could not keep embed.weight", "".join(logs.output))
 
     def test_tied_parameter_is_listed_once(self):
         from torch_spyre.model_utils import _transfer_module
@@ -444,10 +448,13 @@ class TestLoadModelToSpyre(TestCase):
         model.head = nn.Linear(8, 16, bias=False)
         model.head.weight = model.embed.weight
         uploads = []
-        _transfer_module(model, None, uploads)
+        with self.assertLogs("spyre.inductor.model_utils", "WARNING") as logs:
+            _transfer_module(model, None, uploads)
         self.assertEqual(
             [(u.module, u.name) for u in uploads], [(model.embed, "weight")]
         )
+        self.assertEqual(uploads[0].ties, [(model.head, "weight")])
+        self.assertIn("head.weight is tied to embed.weight", "".join(logs.output))
 
     @requires_spyre
     def test_load_model_idempotent(self):
@@ -564,7 +571,9 @@ class TestLoadModelToSpyre(TestCase):
                         raise RuntimeError("upload failed")
                     return m.weight.data + 1, "linear"
 
-                out.append(model_utils._Upload(m, "weight", True, run))
+                out.append(
+                    model_utils._Upload(m, "weight", f"{i}.weight", True, run, [])
+                )
             return out
 
         with (

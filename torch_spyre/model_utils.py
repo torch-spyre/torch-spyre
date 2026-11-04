@@ -414,10 +414,14 @@ class _Upload(NamedTuple):
 
     module: nn.Module
     name: str
+    # Dotted path, as in ``named_parameters``, for logs.
+    path: str
     # None for a buffer, else the requires_grad of the parameter.
     requires_grad: bool | None
     # Uploads the tensor and returns (device tensor, kind for the log counts).
     run: Callable[[], tuple[torch.Tensor, str]]
+    # The other (module, name) slots holding the same parameter (tied weights).
+    ties: list[tuple[nn.Module, str]]
 
 
 def _transfer_module(
@@ -469,13 +473,17 @@ def _transfer_module(
     for name, param in list(module._parameters.items()):
         if param is None or param.device.type == DEVICE_NAME:
             continue
+        path = f"{prefix}.{name}" if prefix else name
         # Each upload swaps into the one shared object, so a second would race it.
         if id(param) in seen:
+            first = next(
+                u for u in uploads if u.module._parameters.get(u.name) is param
+            )
+            first.ties.append((module, name))
             logger.warning(
-                "load_model_to_spyre: %s.%s is tied to a parameter already "
-                "listed and keeps that one's layout",
-                prefix,
-                name,
+                "load_model_to_spyre: %s is tied to %s and shares its layout",
+                path,
+                first.path,
             )
             continue
         seen.add(id(param))
@@ -499,13 +507,14 @@ def _transfer_module(
             prefix,
             use_fp8_weights,
         )
-        uploads.append(_Upload(module, name, param.requires_grad, run))
+        uploads.append(_Upload(module, name, path, param.requires_grad, run, []))
 
     for name, buf in list(module._buffers.items()):
         if buf is None or buf.device.type == DEVICE_NAME:
             continue
         run = functools.partial(_upload_buffer, buf, dtype)
-        uploads.append(_Upload(module, name, None, run))
+        path = f"{prefix}.{name}" if prefix else name
+        uploads.append(_Upload(module, name, path, None, run, []))
 
 
 def _upload_parameter(
@@ -619,7 +628,7 @@ def _put_upload(
     reference; this swaps the impl without that check, so a view of the old
     parameter keeps the host tensor. Grad hooks and ``.grad`` are not carried
     over. A parameter the swap still refuses (a C++ weakref) is replaced, as
-    before, with a warning.
+    before, with a warning, in every module that holds it.
     """
     dev, kind = result
     counts[kind] += 1
@@ -633,13 +642,14 @@ def _put_upload(
         torch._C._swap_tensor_impl(param, new)
     except RuntimeError as e:
         logger.warning(
-            "load_model_to_spyre: could not keep %s.%s as the same object (%s); "
-            "replacing it, so a holder of the old parameter keeps the host tensor",
-            type(upload.module).__name__,
-            upload.name,
+            "load_model_to_spyre: could not keep %s as the same object (%s); "
+            "replacing it, so a holder outside the model keeps the host tensor",
+            upload.path,
             e,
         )
         upload.module._parameters[upload.name] = new
+        for module, name in upload.ties:
+            module._parameters[name] = new
 
 
 def _run_uploads(
