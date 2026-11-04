@@ -272,8 +272,9 @@ def load(run_dir, analyzed=None, label="", **workload) -> dict:
 
 
 def run_props(ctx: dict, bundle_url: str = "") -> dict[str, str]:
-    """Props on every row: env fingerprint, artifact_id12, compile totals, run time."""
+    """Props on every row: workload, engine limits, env fingerprint, artifact_id12, compile totals, run time."""
     art = ctx["artifact"]
+    w = ctx["workload"]
     out = benchmeta.flatten("env", {**ctx["env"], "artifact": art})
     res = ctx["res"] or {}
     comp = res.get("compile") or ctx["compile_summary"] or {}
@@ -284,6 +285,12 @@ def run_props(ctx: dict, bundle_url: str = "") -> dict[str, str]:
         )
     )
     for k, v in (
+        ("model", w["model"]),
+        ("tensor_parallel", w["tp"]),
+        ("batch_size", w["batch_size"]),
+        ("input_len", w["input_len"]),
+        ("output_len", w["output_len"]),
+        *((k, w.get(k)) for k in ENGINE_LIMITS),
         ("arch", art.get("arch") or ctx["env"].get("arch")),
         ("hardware_type", "IBM_Spyre"),
         ("run_utc", ctx["run_utc"]),
@@ -327,7 +334,7 @@ def entries(ctx: dict, bundle_url: str = "") -> list[dict]:
                 "props": props,
                 "measurements": measurements,
                 "iterations": int(iterations),
-                "run_props": {**rprops, **(extra or {})},
+                "run_props": {**rprops, "run_mode": props["run_mode"], **(extra or {})},
                 "disc": props,
                 "disc_keys": ID_KEYS,
             }

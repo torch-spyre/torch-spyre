@@ -104,10 +104,37 @@ def test_run_props_link_the_artifact_and_carry_env_and_compile():
     assert p["trace_bundle_url"] == "https://x/bundle.tgz"
     assert p["compile_total_s"] == "123.4" and p["compile_cache_misses"] == "3"
     assert p["arch"] == "x86_64" and p["hardware_type"] == "IBM_Spyre"
+    shared = {k: v for k, v in p.items() if k != "run_mode"}
     assert all(
-        r["run_props"] == p for r in rows if r["props"]["record_type"] != "trace_kernel"
+        {k: v for k, v in r["run_props"].items() if k != "run_mode"} == shared
+        for r in rows
+        if r["props"]["record_type"] != "trace_kernel"
     )
     assert not any(k.startswith("res_") for k in p)
+
+
+def test_run_props_carry_the_workload_and_known_engine_limits_only():
+    rows = vllm_trace.entries(fleet_ctx())
+    for r in rows:
+        p = r["run_props"]
+        for k in ("model", "tensor_parallel", "batch_size", "input_len", "output_len",
+                  "max_num_seqs", "max_model_len", "run_mode"):  # fmt: skip
+            assert p[k] == r["props"][k], k
+        assert "max_num_batched_tokens" not in p
+        assert "" not in p.values()
+
+
+def test_run_props_never_change_the_benchmark_identity():
+    ctx = fleet_ctx()
+    base = [bench_id(r) for r in vllm_trace.entries(ctx)]
+    ctx["workload"]["max_num_batched_tokens"] = "512"
+    rows = vllm_trace.entries(ctx)
+    assert all(r["run_props"]["max_num_batched_tokens"] == "512" for r in rows)
+    for r in rows:
+        r["run_props"] = {}
+    ids = [bench_id(r) for r in rows]
+    assert not set(base) & set(ids)
+    assert ids == [bench_id(r) for r in vllm_trace.entries(ctx)]
 
 
 def test_pvc_layout_reads_the_manifest_artifact_and_env():
@@ -122,6 +149,12 @@ def test_pvc_layout_reads_the_manifest_artifact_and_env():
     assert p["env_cpu_model"] == "Example CPU"
     assert p["env_knob_FLEX_COMPUTE"] == "EXAMPLE"
     assert p["run_utc"] == "2026-11-03 00:05:45"
+    assert (p["max_num_batched_tokens"], p["max_num_seqs"], p["max_model_len"]) == (
+        "512",
+        "4",
+        "2048",
+    )
+    assert p["model"] == "example-org/model-a" and p["tensor_parallel"] == "1"
     assert rows[0]["props"]["model"] == "example-org/model-a"
     assert {r["props"]["record_type"] for r in rows} == set(TRACE_TYPES)
 
