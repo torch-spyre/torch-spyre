@@ -142,8 +142,18 @@ the row's sticks and is unsupported when both outer axes have extent greater
 than one. `SpyreKernel._check_indirect_index_step` rejects this layout during
 code generation; it previously could produce incorrect rows without an error.
 
+An accumulator carry is declared, not rewritten, by `splice_while_loop`: a
+`LoopCarryRecord` on the carry's storage (its initial buffer) and on its
+update names both, and the spliced body stays pure, with the loop's result the
+update's own buffer. The `apply_loop_carries` pass, which runs just before
+layout propagation, then makes the update an in-place write of the storage and
+sends every reader of the update to the storage, so every later pass sees the
+carry in place. Until then, `deadcode_elimination` judges a declared update
+like the mutation it will become: it is live while its storage is.
+
 Partial scatter carries deliberately have no `LoopCarryRecord`: that record
-opts full-buffer accumulators into LX residency. Scatter destinations remain
+opts full-buffer accumulators into LX residency. Their write is made in place
+at the splice. Scatter destinations remain
 in HBM, with mutation dependencies preserving their lifetime across iterations,
 including when `LX_PLANNING=1` and `HBM_POOL_PLANNING=1`.
 
