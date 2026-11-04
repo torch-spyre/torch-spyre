@@ -30,6 +30,7 @@ from torch._inductor.sizevars import SizeVarAllocator
 
 from .errors import Unsupported
 from .ir import FixedTiledLayout
+from .sharded_hbm import placement_of
 
 # The wrapper header imports that the generated async_compile.sdsc(...) /
 # .ktir(...) kernel definitions evaluate their OpSpec source text against.
@@ -37,7 +38,7 @@ SPYRE_WRAPPER_IMPORTS = """
                 from torch_spyre._inductor.op_spec import wrapper_sympify as sympify
                 from torch_spyre._inductor.op_spec import TensorArg, TensorWorkDivision, OpSpec, UnimplementedOp, LoopSpec, spyre_constant_tensor, IndirectAccess, DebugHandle, SourceLoc, ProvenanceTransform
                 from torch_spyre.execution.async_compile import SpyreAsyncCompile
-                from torch_spyre._C import DataFormats, ElementArrangement, SpyreTensorLayout, spyre_empty_with_layout, set_spyre_tensor_layout
+                from torch_spyre._C import DataFormats, ElementArrangement, SpyreTensorLayout, spyre_empty_with_layout, set_spyre_tensor_layout, _spyre_empty_sharded
                 import subprocess
                 from torch_spyre.ops.eager import _run_compiled_fallback
             """
@@ -89,6 +90,15 @@ class _SpyreWrapperCodegenMixin(PythonWrapperCodegen):
         name = buffer.get_name()
         codegen_shape_tuple = self.codegen_python_shape_tuple(tuple(layout.size))
         codegen_stride_tuple = self.codegen_python_shape_tuple(tuple(layout.stride))
+
+        placement = placement_of(name)
+        if placement is not None:
+            # Output of a non-unified kernel: shard c lands in chunk c.
+            return (
+                f"{name} = _spyre_empty_sharded("
+                f"list({codegen_shape_tuple}), {layout.dtype}, "
+                f"{placement.shard_dim}, {placement.num_shards})"
+            )
 
         out = (
             f"{name} = spyre_empty_with_layout("
