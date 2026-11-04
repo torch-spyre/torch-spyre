@@ -476,6 +476,36 @@ class TestStickReshapePivot(unittest.TestCase):
                 first.fill_(7)
                 self.assertEqual(second.cpu().flatten()[:4].tolist(), [7.0] * 4)
 
+    @pytest.mark.filterwarnings("ignore::UserWarning")  # forced cache disabling
+    def test_escaping_alias_with_in_graph_consumer_raises(self):
+        """Known gap: skipping the repair makes an in-graph consumer fail.
+
+        When the view both escapes and feeds another op, the alias guard
+        leaves the reshape alone, so the consumer meets the unaligned layout
+        the pass would otherwise have repaired and compilation stops.
+
+        This is the better of the two outcomes available here: the guard
+        exists because materialising the view would silently break the alias,
+        and plain main miscompiles this same graph instead of refusing it
+        (measured rel=1.0 against a CPU reference). Repairing for the
+        consumer while keeping the escaping view a true alias would need the
+        reshape to be duplicated, which is left as follow-up work.
+        """
+        import torch._inductor.config as config
+        from torch._inductor.exc import InductorError
+
+        def fn(x):
+            y = torch.nn.functional.silu(x * 2)
+            r = y.reshape(1, 32, 25600)
+            return y, r, r * 3
+
+        torch.compiler.reset()
+        with config.patch(force_disable_caches=True):
+            with self.assertRaises(InductorError):
+                torch.compile(fn, dynamic=False)(
+                    torch.randn(1, 32, 160, 160, dtype=torch.float16).to("spyre")
+                )
+
 
 class TestPassUtils(unittest.TestCase):
     """Unit tests for helpers in ``torch_spyre._inductor.pass_utils``."""
