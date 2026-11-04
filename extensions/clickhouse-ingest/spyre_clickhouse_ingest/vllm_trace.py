@@ -83,7 +83,10 @@ KERNEL_FIELDS = {
     "gbps": "gbps",
     "hbm_bytes": "hbm_bytes",
     "macs": "macs",
+    "cores": "cores",
 }
+TOP_FALLBACK_OPS = 10
+TOP_THREAD_GROUPS = 5
 
 
 class TraceError(ValueError):
@@ -198,8 +201,8 @@ def _predicted(run: Path) -> dict[str, float]:
 ENGINE_LIMITS = ("max_num_batched_tokens", "max_num_seqs", "max_model_len")
 
 
-def _engine_limits(run: Path, args: dict, batch_size, given: dict) -> dict[str, str]:
-    """Engine limits: flag, else vllm.log's `non-default args` line, else e2e.json (budget 0 = default)."""
+def _logged_args(run: Path) -> dict[str, str]:
+    """Engine limits and dtype from vllm.log's `non-default args` line."""
     logged: dict[str, str] = {}
     for d in (run, run / "rank0"):
         log = next(
@@ -213,8 +216,16 @@ def _engine_limits(run: Path, args: dict, batch_size, given: dict) -> dict[str, 
                             m = re.search(rf"'{k}': (\d+)", line)
                             if m:
                                 logged[k] = m[1]
+                        m = re.search(r"'dtype': '([^']+)'", line)
+                        if m:
+                            logged["dtype"] = m[1]
                         break
             break
+    return logged
+
+
+def _engine_limits(logged: dict, args: dict, batch_size, given: dict) -> dict[str, str]:
+    """Engine limits: flag, else vllm.log's `non-default args` line, else e2e.json (budget 0 = default)."""
     e2e = {
         "max_num_batched_tokens": args.get("budget") or "",
         "max_model_len": args.get("max_model_len") or "",
@@ -256,7 +267,11 @@ def load(run_dir, analyzed=None, label="", **workload) -> dict:
             f"workload not known ({', '.join(missing)}): no e2e.json, no flag"
         )
     w["model"] = model_name(str(w["model"]))
-    w.update(_engine_limits(run, args, w["batch_size"], workload))
+    logged = _logged_args(run)
+    w.update(_engine_limits(logged, args, w["batch_size"], workload))
+    rc = env.get("runtime_config") or {}
+    for k in ("dtype", "task"):
+        w[k] = str(rc.get(k) or args.get(k) or logged.get(k) or "")
     return {
         "label": label,
         "res": found.get("res"),
@@ -268,7 +283,31 @@ def load(run_dir, analyzed=None, label="", **workload) -> dict:
         "predicted": _predicted(run),
         "run_utc": _run_utc(run),
         "compile_summary": _first_json(run, "compile_summary.json"),
+        "series_files": _series_files(run, (host or {}).get("trace") or ""),
     }
+
+
+def _series_files(run: Path, trace: str) -> dict[str, str]:
+    """Run-dir-relative paths of the host and device-memory samples and the step trace."""
+    out = {}
+    for key, pats in (
+        ("host", ("samples.jsonl",)),
+        ("devmem", ("devmem.jsonl",)),
+        ("step_trace", ("traces/*.json", "traces/*.json.gz")),
+    ):
+        found = sorted(
+            q for d in (run, run / "rank0") for pat in pats for q in d.glob(pat)
+        )
+        named = [q for q in found if trace and trace.endswith(q.name)]
+        if named or found:
+            out[key] = (named or found)[0].relative_to(run).as_posix()
+    return out
+
+
+def _compact(d: dict, n: int, key=None) -> str:
+    """Top n of d as one-line JSON, largest first; empty when d is."""
+    top = sorted(d.items(), key=key or (lambda kv: -kv[1]))[:n]
+    return json.dumps(dict(top), separators=(",", ":")) if top else ""
 
 
 def run_props(ctx: dict, bundle_url: str = "") -> dict[str, str]:
@@ -290,7 +329,15 @@ def run_props(ctx: dict, bundle_url: str = "") -> dict[str, str]:
         ("batch_size", w["batch_size"]),
         ("input_len", w["input_len"]),
         ("output_len", w["output_len"]),
-        *((k, w.get(k)) for k in ENGINE_LIMITS),
+        *((k, w.get(k)) for k in (*ENGINE_LIMITS, "dtype", "task")),
+        ("compile_n_compiles", comp.get("n_compiles")),
+        ("dev_mem_total_b", (res.get("device_memory") or {}).get("total_b")),
+        (
+            "series_files",
+            json.dumps(ctx["series_files"], separators=(",", ":"))
+            if ctx["series_files"]
+            else "",
+        ),
         ("arch", art.get("arch") or ctx["env"].get("arch")),
         ("hardware_type", "IBM_Spyre"),
         ("run_utc", ctx["run_utc"]),
@@ -301,6 +348,10 @@ def run_props(ctx: dict, bundle_url: str = "") -> dict[str, str]:
         if v:
             out[k] = str(v)
     return out
+
+
+def _extra(**kv) -> dict[str, str] | None:
+    return {k: str(v) for k, v in kv.items() if v} or None
 
 
 def entries(ctx: dict, bundle_url: str = "") -> list[dict]:
@@ -347,6 +398,16 @@ def entries(ctx: dict, bundle_url: str = "") -> list[dict]:
             {"record_type": "trace_phase", "run_mode": "trace", "phase": phase},
             _measure(p, PHASE_FIELDS),
             p.get("n_samples") or 0,
+            _extra(
+                top_thread_groups=_compact(
+                    {
+                        g: v
+                        for g, v in (p.get("top_thread_groups") or {}).items()
+                        if _num(v)
+                    },
+                    TOP_THREAD_GROUPS,
+                )
+            ),
         )
 
     host = ctx["host"] or {}
@@ -354,14 +415,36 @@ def entries(ctx: dict, bundle_url: str = "") -> list[dict]:
     for kind in ("prefill", "decode"):
         s = host.get(f"{kind}_summary") or steps.get(kind) or {}
         m = _measure(s, STEP_FIELDS)
-        for cls, ms in (s.get("waterfall_ms_per_step") or {}).items():
-            if _num(ms):
-                m[f"host_{cls}_ms"] = [float(ms)]
+        waterfall = s.get("waterfall_ms_per_step")
+        if isinstance(waterfall, dict):
+            # The waterfall lists only nonzero classes: an absent cpu_fallback is a measured 0.
+            for cls, ms in {"cpu_fallback": 0.0, **waterfall}.items():
+                if _num(ms):
+                    m[f"host_{cls}_ms"] = [float(ms)]
+        fb = (
+            s.get("fallback_ops")
+            or ((steps.get("cpu_fallback") or {}).get(kind) or {}).get("ops")
+            or {}
+        )
+        fb = {
+            op: {
+                a: round(v[a], 4)
+                for a in ("calls_per_step", "ms_per_step")
+                if _num(v.get(a))
+            }
+            for op, v in fb.items()
+            if isinstance(v, dict) and _num(v.get("ms_per_step"))
+        }
         add(
             f"step:{kind}",
             {"record_type": "trace_step", "run_mode": kind, "phase": kind},
             m,
             s.get("n") or 0,
+            _extra(
+                fallback_ops=_compact(
+                    fb, TOP_FALLBACK_OPS, key=lambda kv: -kv[1]["ms_per_step"]
+                )
+            ),
         )
 
     for k in (ctx["roof"] or {}).get("kernels") or []:
@@ -387,7 +470,7 @@ def entries(ctx: dict, bundle_url: str = "") -> list[dict]:
             },
             m,
             k.get("calls") or 0,
-            {"bound": k["bound"]} if k.get("bound") else None,
+            _extra(bound=k.get("bound")),
         )
 
     comp = res.get("compile") or {}

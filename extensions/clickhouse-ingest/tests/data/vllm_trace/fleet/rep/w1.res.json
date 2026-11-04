@@ -89,6 +89,14 @@
    "pss_peak_b": 46,
    "rss_peak_b": 50,
    "throttled_s": 26.5,
+   "top_thread_groups": {
+    "python": 40.0,
+    "worker-a": 30.0,
+    "worker-b": 20.0,
+    "worker-c": 10.0,
+    "worker-d": 5.0,
+    "worker-e": 1.0
+   },
    "wall_s": 28.0
   },
   "prefill": {

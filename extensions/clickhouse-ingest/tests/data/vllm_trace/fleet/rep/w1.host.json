@@ -50,7 +50,68 @@
    "d2h_kb_per_step": 19.0,
    "d2h_per_step": 20.5,
    "fallback_ms_per_step": 0.0,
-   "fallback_ops": {},
+   "fallback_ops": {
+    "aten::op_00": {
+     "calls_per_step": 1.0,
+     "in_compiled": 0,
+     "ms_per_step": 0.1
+    },
+    "aten::op_01": {
+     "calls_per_step": 1.0,
+     "in_compiled": 0,
+     "ms_per_step": 0.2
+    },
+    "aten::op_02": {
+     "calls_per_step": 1.0,
+     "in_compiled": 0,
+     "ms_per_step": 0.30000000000000004
+    },
+    "aten::op_03": {
+     "calls_per_step": 1.0,
+     "in_compiled": 0,
+     "ms_per_step": 0.4
+    },
+    "aten::op_04": {
+     "calls_per_step": 1.0,
+     "in_compiled": 0,
+     "ms_per_step": 0.5
+    },
+    "aten::op_05": {
+     "calls_per_step": 1.0,
+     "in_compiled": 0,
+     "ms_per_step": 0.6000000000000001
+    },
+    "aten::op_06": {
+     "calls_per_step": 1.0,
+     "in_compiled": 0,
+     "ms_per_step": 0.7000000000000001
+    },
+    "aten::op_07": {
+     "calls_per_step": 1.0,
+     "in_compiled": 0,
+     "ms_per_step": 0.8
+    },
+    "aten::op_08": {
+     "calls_per_step": 1.0,
+     "in_compiled": 0,
+     "ms_per_step": 0.9
+    },
+    "aten::op_09": {
+     "calls_per_step": 1.0,
+     "in_compiled": 0,
+     "ms_per_step": 1.0
+    },
+    "aten::op_10": {
+     "calls_per_step": 1.0,
+     "in_compiled": 0,
+     "ms_per_step": 1.1
+    },
+    "aten::op_11": {
+     "calls_per_step": 1.0,
+     "in_compiled": 0,
+     "ms_per_step": 1.2000000000000002
+    }
+   },
    "fallback_per_step": 23.5,
    "gaps_per_step": 25.0,
    "h2d_kb_per_step": 26.5,
@@ -66,6 +127,7 @@
    "waterfall_ms_per_step": {
     "attn_host": 16.0,
     "correction_upload": 17.5,
+    "cpu_fallback": 7.5,
     "dynamo_guard": 19.0,
     "h2d_copy": 20.5,
     "launch": 22.0,

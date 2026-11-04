@@ -104,11 +104,11 @@ def test_run_props_link_the_artifact_and_carry_env_and_compile():
     assert p["trace_bundle_url"] == "https://x/bundle.tgz"
     assert p["compile_total_s"] == "123.4" and p["compile_cache_misses"] == "3"
     assert p["arch"] == "x86_64" and p["hardware_type"] == "IBM_Spyre"
-    shared = {k: v for k, v in p.items() if k != "run_mode"}
+    per_row = {"run_mode", "bound", "fallback_ops", "top_thread_groups"}
+    shared = {k: v for k, v in p.items() if k not in per_row}
     assert all(
-        {k: v for k, v in r["run_props"].items() if k != "run_mode"} == shared
+        {k: v for k, v in r["run_props"].items() if k not in per_row} == shared
         for r in rows
-        if r["props"]["record_type"] != "trace_kernel"
     )
     assert not any(k.startswith("res_") for k in p)
 
@@ -122,6 +122,50 @@ def test_run_props_carry_the_workload_and_known_engine_limits_only():
             assert p[k] == r["props"][k], k
         assert "max_num_batched_tokens" not in p
         assert "" not in p.values()
+
+
+def test_run_props_carry_card_memory_compiles_dtype_task_and_series_files():
+    p = vllm_trace.entries(fleet_ctx())[0]["run_props"]
+    assert p["dev_mem_total_b"] == "1000000" and p["compile_n_compiles"] == "3"
+    assert (p["dtype"], p["task"]) == ("float16", "generate")
+    assert json.loads(p["series_files"]) == {
+        "host": "rank0/samples.jsonl",
+        "devmem": "rank0/devmem.jsonl",
+        "step_trace": "rank0/traces/example.json",
+    }
+
+
+def test_pvc_dtype_comes_from_the_log_and_an_unknown_task_is_omitted():
+    ctx = vllm_trace.load(
+        PVC / PVC_RUN, PVC / "analyzed", PVC_RUN,
+        model="m/n", tp=1, batch_size=4, input_len=1984, output_len=32,
+    )  # fmt: skip
+    p = vllm_trace.entries(ctx)[0]["run_props"]
+    assert p["dtype"] == "float16" and "task" not in p and "series_files" not in p
+
+
+def test_step_rows_carry_cpu_fallback_and_the_top_fallback_ops():
+    steps = {
+        r["props"]["phase"]: r
+        for r in by_type(vllm_trace.entries(fleet_ctx()))["trace_step"]
+    }
+    pre, dec = steps["prefill"], steps["decode"]
+    assert pre["measurements"]["host_cpu_fallback_ms"] == [7.5]
+    assert dec["measurements"]["host_cpu_fallback_ms"] == [0.0]
+    ops = json.loads(pre["run_props"]["fallback_ops"])
+    assert len(ops) == vllm_trace.TOP_FALLBACK_OPS
+    assert next(iter(ops)) == "aten::op_11" and "aten::op_00" not in ops
+    assert ops["aten::op_11"] == {"calls_per_step": 1.0, "ms_per_step": 1.2}
+    assert "fallback_ops" not in dec["run_props"]
+
+
+def test_phase_rows_carry_the_top_thread_groups_and_kernels_their_cores():
+    rows = by_type(vllm_trace.entries(fleet_ctx()))
+    phases = {r["props"]["phase"]: r["run_props"] for r in rows["trace_phase"]}
+    tg = json.loads(phases["init"]["top_thread_groups"])
+    assert list(tg) == ["python", "worker-a", "worker-b", "worker-c", "worker-d"]
+    assert "top_thread_groups" not in phases["decode"]
+    assert all("cores" in k["measurements"] for k in rows["trace_kernel"])
 
 
 def test_run_props_never_change_the_benchmark_identity():
