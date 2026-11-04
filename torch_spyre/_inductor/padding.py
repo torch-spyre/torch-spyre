@@ -1832,22 +1832,6 @@ def track_padding_value(graph: GraphLowering) -> None:
     operations = graph.operations
     tracer = DomainRangeTracer()
 
-    resolved_mutations: dict[str, dict[str, bool]] = {}
-    # Collect mutation buffers
-    for op in list(operations):
-        if isinstance(op, ComputedBuffer) and isinstance(
-            op.layout, MutationLayoutSHOULDREMOVE
-        ):
-            target = op.layout.target
-            while isinstance(target, (MutableBox, ReinterpretView)):
-                target = target.data
-            target_name = target.maybe_get_name()
-            if target_name is not None:
-                resolved_mutations.setdefault(target_name, {})
-                resolved_mutations[target_name][op.name] = False
-                if isinstance(target, InputBuffer):
-                    tracer.buffer_range[target_name] = _ASSUMED_PADDING[InputBuffer]
-
     with V.set_ops_handler(SetDtypeTracer(tracer)):
         for op in list(operations):
             tracer.current_op = op
@@ -1861,20 +1845,31 @@ def track_padding_value(graph: GraphLowering) -> None:
                 while isinstance(buf, MutableBox):
                     buf = buf.data
                 if isinstance(buf, InputBuffer):
-                    tracer.buffer_range[dep.name] = _ASSUMED_PADDING[InputBuffer]
+                    tracer.buffer_range[dep.name] = (
+                        _ASSUMED_PADDING[InputBuffer]
+                        if is_padded(graph, buf)
+                        else EmptySet
+                    )
                 else:
                     assert dep.name in tracer.buffer_range, (
                         f"Nodes seen out of order, expected {dep.name} to have been visited"
                     )
-
-                if dep.name in resolved_mutations:
-                    for mut, resolved in resolved_mutations[dep.name].items():
-                        assert resolved, (
-                            f"Mutation target {dep.name} seen before mutation buffer {mut}"
-                        )
-
                 input_buffers[dep.name] = buf
                 any_input_padded = any_input_padded or is_padded(graph, buf)
+
+            if isinstance(op, ComputedBuffer) and isinstance(
+                op.layout, MutationLayoutSHOULDREMOVE
+            ):
+                target = op.layout.target
+                while isinstance(target, (MutableBox, ReinterpretView)):
+                    target = target.data
+                target_name = target.maybe_get_name()
+                if target_name is not None and isinstance(target, InputBuffer):
+                    tracer.buffer_range[target_name] = (
+                        _ASSUMED_PADDING[InputBuffer]
+                        if is_padded(graph, target)
+                        else EmptySet
+                    )
 
             if isinstance(op, InputsKernel):
                 if not padded:
@@ -1976,16 +1971,13 @@ def track_padding_value(graph: GraphLowering) -> None:
 
                     if not is_padded(graph, target):
                         tracer.buffer_range[target_name] = EmptySet
-                        resolved_mutations[target_name][op.name] = True
                         continue
 
                     # If we're here it means that the target is padded.
                     # Without deeper analysis we don't know if the values written into the
                     # destination padding come from source padding or valid elements.
-                    # Set the resulting to all possible inputs united with what could
-                    # be in the mutation source buffer padding.
+                    # Set the resulting padding to all possible inputs united with
+                    # what could be in the mutation source buffer padding.
                     user_data = _user_values()
                     pad_set = tracer.buffer_range[op.name]
                     tracer.buffer_range[target_name] = user_data.union(pad_set)
-
-                    resolved_mutations[target_name][op.name] = True
