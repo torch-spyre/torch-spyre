@@ -398,6 +398,11 @@ def _autoload_impl():
     # cache_size_limit says.
     torch._dynamo.config.accumulated_cache_size_limit = 1024
 
+    # Report recompiles that break a declared range (TORCH_SPYRE_RECOMPILE_CHECK).
+    from torch_spyre._inductor.recompile_check import install_recompile_check
+
+    install_recompile_check()
+
     _orig_isAllocatorInitialized = torch._C._accelerator_isAllocatorInitialized
 
     def _patched_isAllocatorInitialized():
