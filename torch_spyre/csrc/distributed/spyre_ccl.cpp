@@ -79,6 +79,7 @@ SpyreCCLBackend::SpyreCCLBackend(const c10::intrusive_ptr<::c10d::Store>& store,
    */
   spyre_comms::initialize_library(spyre::GlobalRuntime::get(),
                                   spyre::getDefaultStreamRuntimeHandle());
+  library_ref_held_.store(true);
   group_context_ = spyre_comms::get_world_context();
   if (nullptr == group_context_) {
     std::string _err_msg =
@@ -88,7 +89,26 @@ SpyreCCLBackend::SpyreCCLBackend(const c10::intrusive_ptr<::c10d::Store>& store,
 }
 
 SpyreCCLBackend::~SpyreCCLBackend() {
-  spyre_comms::finalize_library();
+  // Destructors must not throw; finalize_library() can (e.g. OOB barrier).
+  try {
+    shutdown();
+  }
+  catch (const std::exception& e) {
+    SPYRE_RUNTIME_DEBUG() << "# [Spyre CCL]: shutdown failed in destructor: "
+                          << e.what();
+  }
+  catch (...) {
+    SPYRE_RUNTIME_DEBUG()
+        << "# [Spyre CCL]: shutdown failed in destructor: unknown error";
+  }
+}
+
+void SpyreCCLBackend::shutdown() {
+  // Release this backend's single reference exactly once, whether we get here
+  // from destroy_process_group() or from the destructor.
+  if (library_ref_held_.exchange(false)) {
+    spyre_comms::finalize_library();
+  }
 }
 
 /* **********************************************
