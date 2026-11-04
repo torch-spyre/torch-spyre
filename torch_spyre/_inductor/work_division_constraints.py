@@ -509,7 +509,7 @@ def coarse_tile_local_dim_split_domains(
     fused loop body could disagree about which core owns which slice of that
     dim (``committed_splits``/ownership is keyed by split count, so a split
     other than the deliberate, uniform value of 1 breaks that agreement).
-    ``work_distribution``/``span_reduction`` divide each op in the graph
+    ``work_distribution`` and the joint solve divide each op in the graph
     independently, so without this pin an op's own greedy, size-priority core
     search (``_default_split`` -> ``multi_dim_iteration_space_split``) could
     otherwise choose a split > 1 for a dim that must stay whole -- confirmed

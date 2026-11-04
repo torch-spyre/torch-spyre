@@ -114,7 +114,7 @@ from torch_spyre._inductor.work_division import (
     work_division_context_for_op,
     work_division_splits_are_legal,
     multi_dim_iteration_space_split,
-    span_reduction_pass,
+    span_floors,
 )
 from torch_spyre._inductor.work_division_constraints import (
     JOINT_TILING_AND_DIVISION_ATTR,
@@ -1149,9 +1149,12 @@ class TestWorkDivisionCandidates(unittest.TestCase):
     def test_candidates_respect_span_floor(self):
         x = _isym("x")
         op = _computed_buffer((8,), name="span_floor")
-        op._work_division_span_min_splits = {x: 2}
         output_td = _tensor_dep("span_floor", (8,), (x,))
         with (
+            patch(
+                "torch_spyre._inductor.work_division.must_split_vars",
+                return_value={x: 2},
+            ),
             patch(
                 "torch_spyre._inductor.work_division.iteration_space_from_op",
                 return_value={x: 8},
@@ -1260,6 +1263,7 @@ class _CandidateCase:
         stick_vars=None,
         constraints=None,
         symbol_meta=None,
+        span_floors=None,
     ):
         self.name = name
         self.op = op
@@ -1276,6 +1280,7 @@ class _CandidateCase:
         self.stick_vars = stick_vars or {}
         self.constraints = constraints or ConstraintResult()
         self.symbol_meta = symbol_meta
+        self.span_floors = span_floors or {}
 
     def patches(self):
         """Patch the module inputs a work-division context is derived from."""
@@ -1299,6 +1304,7 @@ class _CandidateCase:
                 "collect_work_division_constraints",
                 {"return_value": self.constraints},
             ),
+            ("must_split_vars", {"return_value": self.span_floors}),
         ] + (
             []
             if self.symbol_meta is None
@@ -1319,9 +1325,6 @@ def _candidate_cases():
     reduction-count rule, blocked dims and hard domains."""
     x, y, m, k0, k1 = (_isym(n) for n in ("x", "y", "m", "k0", "k1"))
 
-    floor_op = _computed_buffer((8,), name="span_floor")
-    floor_op._work_division_span_min_splits = {x: 2}
-
     red_out = _tensor_dep("reduction_out", (8,), (m,))
     red_in = _tensor_dep("reduction_in", (8, 4, 4), (m, k0, k1))
 
@@ -1331,10 +1334,11 @@ def _candidate_cases():
     return [
         _CandidateCase(
             name="span_floor",
-            op=floor_op,
+            op=_computed_buffer((8,), name="span_floor"),
             it_space={x: 8},
             output_td=_tensor_dep("span_floor", (8,), (x,)),
             constraints=ConstraintResult(allowed_splits={x: frozenset({1, 2, 4})}),
+            span_floors={x: 2},
             max_cores=8,
             axes=(x,),
             # The floor of 2 removes the unsplit candidate; 8 is outside the
@@ -2657,38 +2661,96 @@ class TestCollectWorkDivisionConstraints(unittest.TestCase):
         )
 
 
-class TestSpanReductionConstraints(unittest.TestCase):
+class TestSpanFloors(unittest.TestCase):
     _PATCH_TARGET = "torch_spyre._inductor.work_division"
 
-    def test_span_search_excludes_blocked_dimensions(self):
-        o, r0, r1 = (_isym(name) for name in ("o", "r0", "r1"))
-        op = _computed_buffer((8,), name="indirect_reduction")
-        output_td = _tensor_dep("indirect_reduction", (8,), (o,))
+    @contextmanager
+    def _context_inputs(self, op, it_space, output_td, constraints, floors):
+        """Patch what ``span_floors`` derives the op's context from, with the
+        span search itself (``must_split_vars``) answering ``floors``."""
         with (
             patch(
                 f"{self._PATCH_TARGET}.iteration_space_from_op",
-                return_value={o: 8, r0: 8, r1: 8},
+                return_value=it_space,
             ),
             patch(
                 f"{self._PATCH_TARGET}.collect_tensor_deps",
                 return_value=([], output_td),
             ),
             patch(
+                f"{self._PATCH_TARGET}.op_read_writes",
+                return_value=MagicMock(writes=[output_td.dep], reads=[]),
+            ),
+            patch(f"{self._PATCH_TARGET}.get_mem_deps_from_rw", return_value=[]),
+            patch(
                 f"{self._PATCH_TARGET}.adjust_it_space_for_sticks",
-                return_value=({o: 8, r0: 8, r1: 8}, {}),
+                return_value=(it_space, {}),
             ),
             patch(
-                f"{self._PATCH_TARGET}.must_split_vars", return_value={}
+                f"{self._PATCH_TARGET}.must_split_vars", return_value=floors
             ) as must_split,
             patch(
                 f"{self._PATCH_TARGET}.collect_work_division_constraints",
-                return_value=ConstraintResult(blocked={r0, r1}),
-            ),
-            patch(f"{self._PATCH_TARGET}.apply_splits") as apply_splits,
+                return_value=constraints,
+            ) as collect,
         ):
-            span_reduction_pass(op, [], 32)
-        self.assertEqual(apply_splits.call_args.args[1], {})
+            yield must_split, collect
+
+    def test_span_search_excludes_blocked_dimensions(self):
+        o, r0, r1 = (_isym(name) for name in ("o", "r0", "r1"))
+        op = _computed_buffer((8,), name="indirect_reduction")
+        output_td = _tensor_dep("indirect_reduction", (8,), (o,))
+        with self._context_inputs(
+            op,
+            {o: 8, r0: 8, r1: 8},
+            output_td,
+            ConstraintResult(blocked={r0, r1}),
+            floors={},
+        ) as (must_split, _):
+            self.assertEqual(span_floors(op), {})
         self.assertEqual(must_split.call_args.args[-1], {r0, r1})
+
+    def test_floors_are_checked_against_the_constraints(self):
+        """The floors the search finds go back through the constraints as
+        committed splits, which is what rejects a floor a hard domain forbids."""
+        x = _isym("x")
+        op = _computed_buffer((8,), name="floored")
+        output_td = _tensor_dep("floored", (8,), (x,))
+        with self._context_inputs(
+            op, {x: 8}, output_td, ConstraintResult(), floors={x: 2}
+        ) as (_, collect):
+            self.assertEqual(span_floors(op), {x: 2})
+        committed = [call.args[0].committed_splits for call in collect.call_args_list]
+        self.assertEqual(committed, [{}, {x: 2}])
+
+    def test_floors_on_two_reduction_dims_raise(self):
+        o, r0, r1 = (_isym(name) for name in ("o", "r0", "r1"))
+        op = _computed_buffer((8,), name="two_reduction_floors")
+        output_td = _tensor_dep("two_reduction_floors", (8,), (o,))
+        with (
+            self._context_inputs(
+                op,
+                {o: 8, r0: 8, r1: 8},
+                output_td,
+                ConstraintResult(),
+                floors={r0: 2, r1: 2},
+            ),
+            self.assertRaisesRegex(Unsupported, "at most 1"),
+        ):
+            span_floors(op)
+
+    def test_ops_that_are_not_divided_have_no_floors(self):
+        """No context is built for them, so nothing about them is asked."""
+        cpu_op = _computed_buffer((8,), name="cpu_buf")
+        cpu_op.layout = FixedLayout("cpu", torch.float16, [8], [1])
+        other_data = _computed_buffer((8,), name="other_data")
+        other_data.data = MagicMock()
+        with patch(
+            f"{self._PATCH_TARGET}.work_division_context_for_op",
+            side_effect=AssertionError("context built"),
+        ):
+            for op in (MagicMock(), cpu_op, other_data):
+                self.assertEqual(span_floors(op), {})
 
 
 def _physical_view(*splits):
