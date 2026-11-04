@@ -1234,29 +1234,25 @@ class DomainRangeTracer(DefaultHandler):
         dtype: torch.dtype,
         src_dtype: torch.dtype,
         reduction_type,
-        value: Set | tuple[Set, Set],
+        value: Set | tuple[Set, ...],
     ) -> Set:
+        if not isinstance(value, tuple):
+            value = (value,)
         required_padding = FiniteSet(0)
-        if reduction_type != "batchmatmul":
-            if (pad := get_pad_value(reduction_type, dtype)) is not None:
-                required_padding = FiniteSet(pad)
-
-            assert isinstance(value, Set)
-
-            if not value.is_subset(required_padding):
-                raise InvalidDomain(required_padding, reduction_type)
-
-        else:
+        if reduction_type.startswith("batchmatmul"):
             assert isinstance(value, tuple) and len(value) == 2
 
             # at least one of the paddings has to be zero
             if not any(v.is_subset(required_padding) for v in value):
                 # TODO: verify which choice is optimal.
                 raise InvalidDomain(required_padding, reduction_type, arg_index=0)
-
-        if reduction_type == "batchmatmul":
             return FiniteSet(0)
         else:
+            if (pad := get_pad_value(reduction_type, dtype)) is not None:
+                required_padding = FiniteSet(pad)
+            for v in value:
+                if not v.is_subset(required_padding):
+                    raise InvalidDomain(required_padding, reduction_type)
             # other reductions can leave some garbage in padding
             return S.Reals
 
@@ -1625,17 +1621,13 @@ class ArgNameToIndexTracer(DefaultHandler):
         dtype: torch.dtype,
         src_dtype: torch.dtype,
         reduction_type,
-        value: Set | tuple[Set, Set],
+        value: Set | tuple[Set, ...],
     ) -> None:
-        if reduction_type != "batchmatmul":
-            assert isinstance(value, ArgName)
-            self.name2inx[value.name] = [0]
-        else:
-            assert isinstance(value, tuple) and len(value) == 2
-            assert isinstance(value[0], ArgName) and isinstance(value[1], ArgName)
-
-            self.name2inx[value[0].name] = [0]
-            self.name2inx[value[1].name] = [1]
+        if not isinstance(value, tuple):
+            value = (value,)
+        for i, v in enumerate(value):
+            assert isinstance(v, ArgName)
+            self.name2inx[v.name] = [i]
 
     def store_reduction(self, name: str, index: sympy.Expr, value: Set) -> None:
         pass
@@ -1742,7 +1734,7 @@ def pick_element(s: Set):
 
 
 def get_pad_value(func, dtype) -> float | None:
-    if func == "batchmatmul":
+    if func.startswith("batchmatmul"):
         return 0
     if func == "indirect_indexing":
         return 0
