@@ -443,6 +443,8 @@ def _transfer_module(
     ``named_modules``) for logs.
     """
     # Keyed on id(): a module that overrides __eq__ must not hide a sibling.
+    # Holds module and parameter ids alike; the model keeps both alive, so
+    # they cannot collide.
     if seen is None:
         seen = set()
     if id(module) in seen:
@@ -469,8 +471,9 @@ def _transfer_module(
             continue
         # Each upload swaps into the one shared object, so a second would race it.
         if id(param) in seen:
-            logger.debug(
-                "  %s.%s: tied to a parameter already listed; keeps its layout",
+            logger.warning(
+                "load_model_to_spyre: %s.%s is tied to a parameter already "
+                "listed and keeps that one's layout",
                 prefix,
                 name,
             )
@@ -610,12 +613,13 @@ def _put_upload(
 
     A parameter keeps its Python object, as ``nn.Module.to`` keeps it, so a caller
     holding it (an optimizer, an attention impl, a weight loader) sees the device
-    tensor, and its class and attributes stay. ``param.data = dev`` would copy
-    into the CPU tensor impl rather than give it a Spyre one. ``swap_tensors``
-    refuses a parameter that has a view or another strong reference; this swaps
-    the impl without that check, so a view of the old parameter keeps the host
-    tensor. Grad hooks and ``.grad`` are not carried over. A parameter the swap
-    still refuses (a C++ weakref) is replaced, as before, with a warning.
+    tensor, and its class and attributes stay. ``param.data = dev`` is refused:
+    ``set_data`` rejects a tensor with a different backend key set.
+    ``swap_tensors`` refuses a parameter that has a view or another strong
+    reference; this swaps the impl without that check, so a view of the old
+    parameter keeps the host tensor. Grad hooks and ``.grad`` are not carried
+    over. A parameter the swap still refuses (a C++ weakref) is replaced, as
+    before, with a warning.
     """
     dev, kind = result
     counts[kind] += 1
