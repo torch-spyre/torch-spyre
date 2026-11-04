@@ -1,0 +1,2 @@
+Timing baseline for torch-spyre#6000: main's job layout (single-card long configs), unchanged.
+Nothing reads this file; it exists so the PR has a non-doc change and CI runs the full test matrix.
