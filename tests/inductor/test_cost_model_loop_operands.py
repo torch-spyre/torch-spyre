@@ -873,39 +873,147 @@ def test_an_m_only_split_pays_for_every_core_streaming_the_whole_weight():
     assert 0 < wide < m_only
 
 
-@pytest.mark.parametrize("boundary", [False, True])
-@pytest.mark.parametrize("second_split", [8, 16])
-def test_stream_shared_input_excess_follows_boundary_ownership(boundary, second_split):
-    from torch_spyre._inductor.cost_model import (
-        _fused_hbm_bytes,
-        _reused_operand_stream_excess_ns,
-    )
-
-    p = CostParams()
-    resident = sympy.Symbol("is_lx_arg5_1", integer=True, nonnegative=True)
+def _shared_gemm_readers(splits, boundary, residents, runs):
     ops = []
-    prices = []
-    for i, split in enumerate((8, second_split)):
+    for i, (split, resident, run) in enumerate(zip(splits, residents, runs)):
         op = _gemm(split, 1)
         op.name = f"matmul{i}"
         op.args[0].name = f"out{i}"
+        op.args[1].name = f"activation{i}"
         weight = op.args[2]
         weight.is_boundary = boundary
-        prices.append(float(_reused_operand_stream_excess_ns([op], p)))
         weight.is_lx = resident
+        weight.read_run_bytes = run
         ops.append(op)
-    assert all(price > 0 for price in prices)
-    if second_split == 16:
-        assert prices[0] > prices[1]
+    return ops
+
+
+def _combined_stream_charge(ops, p):
+    from torch_spyre._inductor.cost_model import (
+        _reused_operand_stream_excess_ns,
+        _shared_operand_read_excess,
+    )
+
+    return (
+        _shared_operand_read_excess(ops, p)
+        + _read_burst_excess_ns(ops, p)
+        + _reused_operand_stream_excess_ns(ops, p)
+    )
+
+
+@pytest.mark.parametrize("boundary", [False, True])
+@pytest.mark.parametrize("splits", [(8, 8), (8, 16), (16, 8), (16, 16)])
+@pytest.mark.parametrize("runs", [(None, None), (128, 256), (256, 128)])
+def test_stream_composes_shared_input_charges_before_ownership(boundary, splits, runs):
+    from itertools import product
+
+    p = CostParams()
+    residents = sympy.symbols(
+        "is_lx_reader0 is_lx_reader1", integer=True, nonnegative=True
+    )
+    ops = _shared_gemm_readers(splits, boundary, residents, runs)
+    expr = sympy.sympify(_combined_stream_charge(ops, p))
+    for residency in product((0, 1), repeat=2):
+        concrete = _shared_gemm_readers(splits, boundary, residency, runs)
+        prices = [float(_combined_stream_charge([op], p)) for op in concrete]
+        expected = max(prices) if boundary else sum(prices)
+        for readers in (concrete, list(reversed(concrete))):
+            assert float(_combined_stream_charge(readers, p)) == pytest.approx(expected)
+        assert float(expr.subs(dict(zip(residents, residency)))) == pytest.approx(
+            expected, abs=1e-8
+        )
+        if runs == (None, None) and residency == (0, 0):
+            # Both complete reader prices equal 13.217 us, even though only
+            # the 16-way reader pays the 5.362 us sharing charge.
+            nbytes = 768 * 768 * 2
+            whole = _stream_ns(p, nbytes, 4096, p.mm_stream_multicast_ns_per_request)
+            whole -= nbytes / p.bw_peak_gbps
+            assert prices == pytest.approx([whole, whole])
+        if runs != (None, None) and residency == (0, 0):
+            assert prices[0] != prices[1]
+
+
+@pytest.mark.parametrize("boundary", [False, True])
+def test_stream_composition_includes_a_reader_without_stream_pricing(boundary):
+    p = CostParams()
+    ops = _shared_gemm_readers((8, 16), boundary, (False, False), (None, 128))
+    # The second reader keeps its short-burst charge, but no matmul stream
+    # estimate. It still owns the same boundary load as the first reader.
+    ops[1].is_matmul = False
+    prices = [float(_combined_stream_charge([op], p)) for op in ops]
+    assert prices[1] > prices[0] > 0
     expected = max(prices) if boundary else sum(prices)
-    for readers in (ops, list(reversed(ops))):
-        expr = sympy.sympify(_reused_operand_stream_excess_ns(readers, p))
-        hbm = sympy.sympify(_fused_hbm_bytes(readers)[0])
-        for lx in (0, 1):
-            assert float(hbm.subs(resident, lx)) == 768 * 768 * 2 * (
-                1 if boundary else 2
-            ) * (1 - lx)
-            assert float(expr.subs(resident, lx)) == pytest.approx(expected * (1 - lx))
+    assert float(_combined_stream_charge(ops, p)) == pytest.approx(expected)
+    unrelated = _shared_gemm_readers((16,), True, (False,), (128,))[0]
+    unrelated.args[2].name = "other_weight"
+    unrelated.is_matmul = False
+    expected += float(_combined_stream_charge([unrelated], p))
+    assert float(_combined_stream_charge([*ops, unrelated], p)) == pytest.approx(
+        expected
+    )
+
+
+@pytest.mark.parametrize("boundary", [False, True])
+@pytest.mark.parametrize("runs", [(None, None), (128, 256)])
+def test_cpsat_composes_shared_stream_splits_and_residency(boundary, runs):
+    from itertools import product
+
+    cp_model = pytest.importorskip("ortools.sat.python.cp_model")
+    from torch_spyre._inductor.scratchpad.cpsat_expr_printer import _SympyExprToCpSat
+    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
+        _CoreDivisionBufferWithCpVars,
+    )
+    from torch_spyre._inductor.scratchpad.plan_solver import (
+        CoreDivision,
+        CoreDivisionBuffer,
+    )
+
+    p = CostParams()
+    model = cp_model.CpModel()
+    d0 = sympy.Symbol("d0")
+    residents = sympy.symbols(
+        "is_lx_reader0 is_lx_reader1", integer=True, nonnegative=True
+    )
+    sym_map = {r.name: model.new_bool_var(r.name) for r in residents}
+    buffer_map, wrappers, splits = {}, [], []
+    for i in range(2):
+        buffer = CoreDivisionBuffer(
+            f"reader{i}",
+            ELEMS,
+            [0, 1],
+            core_divisions=[CoreDivision(splits={d0: n}) for n in (8, 16)],
+        )
+        wrapper = _CoreDivisionBufferWithCpVars(
+            buffer=buffer, model=model, capacity_units=ELEMS
+        )
+        split = buffer.sym_core_divs[d0]
+        sym_map[split.name] = wrapper.cp_core_divs[d0]
+        buffer_map[split.name] = (wrapper, wrapper.cp_core_divs_raw[d0])
+        wrappers.append(wrapper)
+        splits.append(split)
+    expr = sympy.sympify(
+        _combined_stream_charge(
+            _shared_gemm_readers(splits, boundary, residents, runs), p
+        )
+    )
+    model.minimize(_SympyExprToCpSat(model, sym_map, buffer_map).convert(expr))
+    solver = cp_model.CpSolver()
+    solver.parameters.num_search_workers = 1
+    for indices in product((0, 1), repeat=2):
+        for residency in product((0, 1), repeat=2):
+            fixed = model.clone()
+            for wrapper, index, resident, lx in zip(
+                wrappers, indices, residents, residency
+            ):
+                fixed.add(wrapper.division == index)
+                fixed.add(sym_map[resident.name] == lx)
+            concrete = _shared_gemm_readers(
+                [8 if i == 0 else 16 for i in indices], boundary, residency, runs
+            )
+            prices = [float(_combined_stream_charge([op], p)) for op in concrete]
+            expected = max(prices) if boundary else sum(prices)
+            assert solver.solve(fixed) == cp_model.OPTIMAL
+            assert solver.objective_value == pytest.approx(expected, abs=1e-3)
 
 
 def test_reused_operand_stream_price_is_symbolic_in_the_split():

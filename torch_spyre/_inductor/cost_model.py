@@ -1607,8 +1607,11 @@ def _shared_operand_read_excess(ops: list, p: "CostParams"):
     Resident operands vanish through hbm_elems; boundary clone loads stay separate.
     A small-M decode weight is priced by ``_decode_weight_delivery_excess`` instead.
     """
-    total = 0
-    external: dict[str, float | sympy.Expr] = {}
+    return _owned_total(_shared_operand_read_terms(ops, p))
+
+
+def _shared_operand_read_terms(ops: list, p: "CostParams"):
+    """Sharing charges before ownership aggregation, for stream composition."""
     for op in ops:
         if not op.is_matmul:
             continue
@@ -1624,13 +1627,7 @@ def _shared_operand_read_excess(ops: list, p: "CostParams"):
                 * (_matmul_multicast_penalty(arg.replication) - 1)
                 / p.bw_peak_gbps
             )
-            if arg.is_graph_boundary:
-                external[arg.name] = (
-                    max(external[arg.name], excess) if arg.name in external else excess
-                )
-            else:
-                total += excess
-    return total + sum(external.values())
+            yield arg, excess
 
 
 def _is_single_pass(op) -> bool:
@@ -1762,8 +1759,10 @@ def _reused_operand_stream_excess_ns(ops: list, p: "CostParams"):
 
     A small-M shared decode weight already pays the calibrated delivery term
     of ``_decode_weight_delivery_excess``; leave that operand to that term.
-    Like the base HBM read, a shared boundary input pays the maximum of its
-    readers' excesses once. Internal reads retain their separate charges.
+    Compose each reader's sharing, burst and stream charges first, then apply
+    ownership: a boundary input pays its largest complete charge once; internal
+    reads stay additive. Subtract the existing sharing and burst aggregates only
+    after this maximum, since different readers may dominate those aggregates.
     """
     gbps = p.mm_stream_gbps_per_core
     unicast = p.mm_stream_unicast_ns_per_request
@@ -1784,8 +1783,51 @@ def _reused_operand_stream_excess_ns(ops: list, p: "CostParams"):
     )
     if single_pass is sympy.false:
         return 0.0
-    total = 0.0
-    external: dict[str, float | sympy.Expr] = {}
+    streams = list(
+        _reused_operand_stream_terms(ops, p, gbps, unicast, multicast, burst)
+    )
+    if not streams:
+        return 0.0
+    stream_by_arg = {id(arg): price for arg, price in streams}
+    boundary_names = {arg.name for arg, _ in streams if arg.is_graph_boundary}
+
+    def affected(arg):
+        return id(arg) in stream_by_arg or (
+            arg.is_graph_boundary and arg.name in boundary_names
+        )
+
+    # Include every reader of the affected boundary inputs, even a reader to
+    # which stream pricing does not apply. Its existing charges still take part
+    # in the same ownership maximum.
+    sharing = [
+        (arg, price)
+        for arg, price in _shared_operand_read_terms(ops, p)
+        if affected(arg)
+    ]
+    bursts = [(arg, price) for arg, price in _read_burst_terms(ops, p) if affected(arg)]
+    sharing_by_arg = {id(arg): price for arg, price in sharing}
+    burst_by_arg = {id(arg): price for arg, price in bursts}
+    composed = _owned_total(
+        (
+            arg,
+            max(
+                sharing_by_arg.get(id(arg), 0) + burst_by_arg.get(id(arg), 0),
+                stream_by_arg.get(id(arg), 0),
+            ),
+        )
+        for op in ops
+        for arg in op.args
+        if affected(arg)
+    )
+    # Subtract the actual existing aggregates, not per-reader remainders:
+    # sharing uses ownership maxima; the burst term sums its individual reads.
+    # This correction can be negative when it removes duplicate burst charges.
+    excess = composed - _owned_total(sharing) - sum(price for _, price in bursts)
+    return _select(single_pass, excess, 0.0)
+
+
+def _reused_operand_stream_terms(ops, p, gbps, unicast, multicast, burst):
+    """Per-reader stream delivery excess over bytes/peak, before composition."""
     for op in ops:
         if not op.is_matmul:
             continue
@@ -1828,31 +1870,14 @@ def _reused_operand_stream_excess_ns(ops: list, p: "CostParams"):
             def stream(ns_per_request):
                 return per_core / gbps + requests * ns_per_request
 
-            # Past the cohort limit, _shared_operand_read_excess already charges
-            # part of the sharing; only the stream time beyond it is added.
-            cohort = (
-                nbytes * (_matmul_multicast_penalty(replication) - 1) / p.bw_peak_gbps
-            )
             if replication.is_number:
-                if replication > 1:
-                    t = stream(multicast) - cohort
-                else:
-                    t = stream(unicast)
+                t = stream(multicast if replication > 1 else unicast)
             else:
-                shared = stream(multicast) - cohort if arg.broadcast else 0
                 t = sympy.Piecewise(
-                    (stream(unicast), sympy.Eq(replication, 1)), (shared, True)
+                    (stream(unicast), sympy.Eq(replication, 1)),
+                    (stream(multicast) if arg.broadcast else 0, True),
                 )
-            bursts = _read_burst_arg_excess(op, arg, p)
-            price = t - nbytes / p.bw_peak_gbps - (0 if bursts is None else bursts)
-            excess = (1 - arg.is_lx) * max(0.0, price)
-            if arg.is_graph_boundary:
-                external[arg.name] = (
-                    max(external[arg.name], excess) if arg.name in external else excess
-                )
-            else:
-                total += excess
-    return _select(single_pass, total + sum(external.values()), 0.0)
+            yield arg, (1 - arg.is_lx) * max(0.0, t - nbytes / p.bw_peak_gbps)
 
 
 def _loop_reread_bytes(ops: list) -> float:
@@ -2838,7 +2863,11 @@ def _read_burst_excess_ns(ops: list, p: "CostParams"):
     ``_loop_operand_request_excess`` instead, which composes requests with
     delivery and counts shared inputs once. An unproven run adds nothing.
     """
-    total = 0.0
+    return sum(price for _, price in _read_burst_terms(ops, p))
+
+
+def _read_burst_terms(ops: list, p: "CostParams"):
+    """Per-read burst charges, including residency and loop factor."""
     for op in ops:
         if transport_dma_cost_available(op, p):
             continue
@@ -2848,8 +2877,7 @@ def _read_burst_excess_ns(ops: list, p: "CostParams"):
                 continue
             is_lx = arg.is_lx
             lf = getattr(arg, "loop_factor", 1) or 1
-            total += (1 - is_lx) * lf * excess
-    return total
+            yield arg, (1 - is_lx) * lf * excess
 
 
 def _read_burst_arg_excess(op, arg, p: "CostParams"):
@@ -3444,7 +3472,7 @@ def explain(ops: list, params: CostParams | None = None) -> str:
     reused_extra = _reused_operand_stream_excess_ns(ops, p)
     if reused_extra:
         lines.append(
-            f"     reused matmul operand streaming: +{float(reused_extra) / 1000:.2f} us "
+            f"     reused matmul operand streaming: {float(reused_extra) / 1000:+.2f} us "
             f"({p.mm_stream_gbps_per_core:g} GB/s per core + "
             f"{p.mm_stream_unicast_ns_per_request:g} / "
             f"{p.mm_stream_multicast_ns_per_request:g} ns per run unicast / multicast;"

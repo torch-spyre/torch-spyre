@@ -373,6 +373,23 @@ replication-aware model needs a measured multicast rate. Coarse loops are exclud
 from this delivery estimate because their delivery was not measured and they have
 separate re-read pricing.
 
+### Ownership of single-pass reused-operand delivery
+
+For a reused matmul input, the stream estimate overlaps the existing sharing and
+short-burst charges. Compose each reader's complete excess over bytes/peak as
+`max(sharing + burst, stream)` before aggregating ownership: a shared boundary
+input pays the maximum complete excess among its readers; internal reads add.
+The stream correction then subtracts the sharing and burst totals already charged
+for those reads. Readers without a stream estimate still participate in their
+boundary input's maximum with their existing charges. Unrelated reads are unchanged.
+
+For example, two `64x768 @ 768x768` matmuls sharing a weight use eight-way and
+sixteen-way M splits. Both complete delivery excesses are 13.217 us, although the
+sixteen-way reader already pays 5.362 us in sharing. The shared load pays 13.217 us.
+Taking separate maxima of sharing and stream remainder would incorrectly charge
+18.579 us. The correction can be negative when it removes duplicate short-burst
+charges; the complete delivery charge remains the maximum of the readers' prices.
+
 ### DMA requests of a loop matmul's operand reads
 
 A core reads its slice of an operand as contiguous runs, and each run is one DMA request.
