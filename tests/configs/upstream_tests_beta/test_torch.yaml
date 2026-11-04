@@ -13,7 +13,6 @@ test_suite_config:
             - TestDevicePrecision::test_from_sequence
             - TestTorchDeviceType::test_index_add_mem_overlap
             - TestTorchDeviceType::test_index_copy_mem_overlap
-            - TestTorchDeviceType::test_is_signed
             - TestTorchDeviceType::test_lazy_clone
             - TestTorchDeviceType::test_lazy_clone_view
             - TestTorchDeviceType::test_memory_format_consistency
@@ -22,6 +21,11 @@ test_suite_config:
             - TestTorchDeviceType::test_scatter_mem_overlap
             - TestTorchDeviceType::test_storage_use_count
           mode: mandatory_success
+        # Upstream regression: test_is_signed_spyre copies a uint8 (Byte) tensor to the device and
+        # fails with "Spyre backend does not support dtype Byte for host transfers" (#1588).
+        - names:
+            - TestTorchDeviceType::test_is_signed
+          mode: skip  # skip: uint8 host transfer unsupported (#1588)
         # Skipped: flaky/unsupported on the Spyre backend.
         - names:
             - TestTorch::test_normal_shape

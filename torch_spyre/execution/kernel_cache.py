@@ -239,6 +239,7 @@ def compute_specs_hash(
     pool_size: int = 0,
     *,
     backend_loop_unroll: bool | None = None,
+    ktir_device_mlir: str | None = None,
 ) -> str:
     """Compute a cache key from OpSpec objects without any disk I/O.
 
@@ -258,6 +259,8 @@ def compute_specs_hash(
                      their pool size get different cache keys.
         backend_loop_unroll: Resolved setting passed to the backend compiler.
                              Defaults to the active Spyre config.
+        ktir_device_mlir: Resolved device override passed to the backend compiler.
+                          Defaults to the active Spyre config.
     """
     from torch_spyre._inductor.codegen.superdsc import compile_op_spec
     from torch_spyre._inductor.op_spec import LoopSpec, OpSpec
@@ -265,6 +268,8 @@ def compute_specs_hash(
 
     if backend_loop_unroll is None:
         backend_loop_unroll = _spyre_config.backend_loop_unroll
+    if ktir_device_mlir is None:
+        ktir_device_mlir = _spyre_config.ktir_device_mlir
     use_symbols = _spyre_config.bundle_symbolic_args
 
     specs_list = list(specs)
@@ -392,6 +397,7 @@ def compute_specs_hash(
         f"frontend_pool_allocation:{int(_spyre_config.frontend_pool_allocation)}".encode()
     )
     content_parts.append(f"loop_unroll:{int(backend_loop_unroll)}".encode())
+    content_parts.append(f"ktir_device_mlir:{ktir_device_mlir}".encode())
 
     content = b"||".join(content_parts)
     extra = "||".join(
