@@ -405,6 +405,8 @@ class AutomatedCoarseTilingTests(
             case, (), layout_solver=solver, auto_tiling=True
         )
         self._assert_matches_cpu(case, device, cpu)
+        # The one pytest.xfail AGENTS.md allows: it runs after the CPU check, so it
+        # cannot hide a wrong answer. Update AGENTS.md if this moves or goes away.
         if not tiling and solver == "simulated_annealing" and case.sa_may_stay_untiled:
             pytest.xfail(case.sa_may_stay_untiled)
         self.assertTrue(
