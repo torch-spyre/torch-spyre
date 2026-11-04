@@ -55,7 +55,6 @@ from torch._inductor.graph import GraphLowering
 from torch._inductor.utils import IndentedBuffer, sympy_index_symbol
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
-from torch.utils._sympy.functions import ModularIndexing
 
 from torch_spyre._C import DataFormats
 from torch_spyre._inductor import config
@@ -80,7 +79,6 @@ from torch_spyre._inductor.wsr.coarse_tile import (
     _apply_plan,
     _compute_fill_loop_info_planned,
     _consumer_own_dim_symbol,
-    _dims_read_along,
     _divide_ranges,
     _index_var_prefix,
     _loop_var_to_reduction_ranges_pos,
@@ -1174,51 +1172,6 @@ def _make_consumer_with_ranges(ranges):
     return _make_op(_make_pointwise(ranges))
 
 
-def _tiled_consumer(ranges, loop_count, loop_tiled_dims):
-    """A fake consumer running a coarse-tile nest of its own: ``ranges`` are
-    its live, divided ranges, ``loop_count`` trips per level over
-    ``loop_tiled_dims``."""
-    consumer = _make_consumer_with_ranges(ranges)
-    consumer.dim_hints = ()
-    consumer.loop_info = CoarseTileInfo(
-        loop_group_id=(1,),
-        loop_count=[Integer(count) for count in loop_count],
-        loop_tiled_dims=loop_tiled_dims,
-        loop_tiled_reduction_dims=[[] for _ in loop_count],
-    )
-    return consumer
-
-
-class TestDimsReadAlong(unittest.TestCase):
-    """Which dims of a buffer a read's index moves along, charged by stride."""
-
-    STRIDES = (Integer(524288), Integer(2048), Integer(1))
-
-    def test_an_in_step_read_moves_along_every_dim(self):
-        d0, d1, d2 = (sympy_index_symbol(f"d{i}") for i in range(3))
-
-        dims = _dims_read_along(524288 * d0 + 2048 * d1 + d2, self.STRIDES)
-
-        self.assertEqual(dims, {0, 1, 2})
-
-    def test_a_broadcast_read_has_no_term_for_the_dim(self):
-        d1, d2 = sympy_index_symbol("d1"), sympy_index_symbol("d2")
-
-        self.assertEqual(_dims_read_along(2048 * d1 + d2, self.STRIDES), {1, 2})
-
-    def test_offset_stepped_and_modular_reads_count_as_in_step(self):
-        d0, d1, d2 = (sympy_index_symbol(f"d{i}") for i in range(3))
-
-        offset_and_stepped = 524288 * (d0 + 32) + 2 * 2048 * d1 + d2
-        modular = 2048 * ModularIndexing(d1, 1, 128) + d2
-
-        self.assertEqual(_dims_read_along(offset_and_stepped, self.STRIDES), {0, 1, 2})
-        self.assertEqual(_dims_read_along(modular, self.STRIDES), {1, 2})
-
-    def test_a_constant_index_moves_along_nothing(self):
-        self.assertEqual(_dims_read_along(Integer(5), self.STRIDES), frozenset())
-
-
 class TestSqueezedRetileDims(unittest.TestCase):
     """Unit tests for which raw dims need a re-minted symbol on redirect.
 
@@ -1355,24 +1308,6 @@ class TestConsumerOwnDimSymbol(unittest.TestCase):
 
         self.assertEqual(sym, sympy_index_symbol("q0"))
 
-    def test_a_tiled_consumer_is_compared_before_its_division(self):
-        # The consumer runs a nest of its own, two trips over dim 0, so its
-        # live ranges are a tile of the producer's shape: the shape test
-        # takes the ranges before division.
-        info = _RetiledBufferInfo(
-            old_stride=(Integer(256), Integer(1)),
-            new_stride=(Integer(256), Integer(1)),
-            old_size=(Integer(1), Integer(256)),
-            new_size=(Integer(4), Integer(256)),
-        )
-        consumer = _tiled_consumer([2, 256], loop_count=[2], loop_tiled_dims=[[0]])
-
-        self.assertEqual(_squeezed_retile_dims(info, consumer), [0])
-
-        narrower = _tiled_consumer([2, 128], loop_count=[2], loop_tiled_dims=[[0]])
-        with self.assertRaisesRegex(Unsupported, "shape-changing"):
-            _squeezed_retile_dims(info, narrower)
-
 
 class TestRetileLoadIndexWithConsumer(unittest.TestCase):
     """End-to-end unit tests for _retile_load_index's consumer-aware path.
@@ -1418,58 +1353,6 @@ class TestRetileLoadIndexWithConsumer(unittest.TestCase):
         result = _retile_load_index("buf", q1, info, consumer)
 
         self.assertEqual(result, q1)
-
-    def test_squeezed_dim_restored_for_a_consumer_in_another_nest(self):
-        # The producer's tile took dim 0 whole, so its strides are the full
-        # buffer's and the consumer, traced against the tile, lost the term
-        # all the same. Its read moved along dim 0 before the division, so
-        # the term comes back, loop nest or not.
-        info = _RetiledBufferInfo(
-            old_stride=(Integer(256), Integer(1)),
-            new_stride=(Integer(256), Integer(1)),
-            old_size=(Integer(1), Integer(256)),
-            new_size=(Integer(4), Integer(256)),
-        )
-        q1 = sympy.Symbol("q1")
-        consumer = _tiled_consumer([2, 256], loop_count=[2], loop_tiled_dims=[[0]])
-
-        result = _retile_load_index(
-            "buf", q1, info, consumer, restore_dims=frozenset({0})
-        )
-
-        self.assertEqual(simplify(result - (256 * sympy_index_symbol("q0") + q1)), 0)
-
-    def test_a_read_that_did_not_move_along_the_dim_keeps_its_index(self):
-        # A broadcast read never had the term, so none is added.
-        info = _RetiledBufferInfo(
-            old_stride=(Integer(256), Integer(1)),
-            new_stride=(Integer(256), Integer(1)),
-            old_size=(Integer(1), Integer(256)),
-            new_size=(Integer(4), Integer(256)),
-        )
-        q1 = sympy.Symbol("q1")
-        consumer = _tiled_consumer([2, 256], loop_count=[2], loop_tiled_dims=[[0]])
-
-        result = _retile_load_index("buf", q1, info, consumer, restore_dims=frozenset())
-
-        self.assertEqual(result, q1)
-
-    def test_a_permuted_read_of_a_unit_row_producer_is_refused(self):
-        # A 4x4 producer read as a[d1, d0]: the tile cost the read its 4*d1
-        # term, and the positional symbol for dim 0 is d0, which already
-        # addresses dim 1. Raw positions cannot restore that, so it is refused
-        # rather than read wrong.
-        info = _RetiledBufferInfo(
-            old_stride=(Integer(4), Integer(1)),
-            new_stride=(Integer(4), Integer(1)),
-            old_size=(Integer(1), Integer(4)),
-            new_size=(Integer(4), Integer(4)),
-        )
-        d0 = sympy_index_symbol("d0")
-        consumer = _make_consumer_with_ranges([4, 4])
-
-        with self.assertRaisesRegex(Unsupported, "already addresses"):
-            _retile_load_index("buf", d0, info, consumer, restore_dims=frozenset({0}))
 
     def test_unit_consumer_dim_adds_no_term_and_does_not_collide(self):
         # Same squeeze shape as above, but the consumer's own dim 0 is ALSO
@@ -1636,6 +1519,184 @@ class TestRetileLoadIndexWithConsumer(unittest.TestCase):
                 "q", index, info, consumer, preserve_target_stride_atoms=True
             )
             self.assertEqual(simplify(result - full_scale), 0)
+
+
+class TestPatchConsumersReadsThroughFullBuffer(unittest.TestCase):
+    """An outside consumer redirected to a copy-out buffer derives its load
+    index from that buffer's layout, not from the producer's tile.
+
+    The producer, 64 x 64 x 128, is divided to one row per trip, so its own
+    layout becomes (1, 64, 128) with the full buffer's strides, and a consumer
+    traced against it would lose its row term. After the redirect each
+    consumer's index must equal its index before the division, on the full
+    buffer's name, and the producer must be the tile again afterwards.
+    """
+
+    FULL = [64, 64, 128]
+    STRIDE = [8192, 128, 1]
+
+    def setUp(self):
+        gm = fx.symbolic_trace(lambda: None)
+        self._graph_ctx = V.set_graph_handler(GraphLowering(gm))
+        self._graph_ctx.__enter__()
+        load_x = ir_input_loader("x", self.FULL)
+        # A producer that reads nothing is inlined into its consumers by
+        # ComputedBuffer.make_loader instead of being loaded by name.
+        self.load0, self.buf0 = ir_computed_buffer(
+            "buf0", self.FULL, lambda i: load_x(i)
+        )
+        self.buf0.dim_hints = ()
+        ir_input_loader("full", self.FULL)
+        self.full = V.graph.name_to_buffer["full"]
+        self.d0, self.d1, self.d2 = (sympy_index_symbol(f"d{i}") for i in range(3))
+
+    def tearDown(self):
+        self._graph_ctx.__exit__(None, None, None)
+
+    @staticmethod
+    def _indexes(op, name):
+        from torch_spyre._inductor.pass_utils import invalidate_op_read_writes
+
+        invalidate_op_read_writes(op)
+        return [r.index for r in op.get_read_writes().reads if r.name == name]
+
+    def _redirect(self, consumers, tiled_dims=(0,), loop_count=64):
+        """Indexes of ``buf0`` before the division, and of ``full`` after the
+        redirect, keyed by consumer name."""
+        before = {c.get_name(): self._indexes(c, "buf0") for c in consumers}
+        _divide_ranges(self.buf0, Integer(loop_count), list(tiled_dims))
+        operations = list(consumers)
+        _patch_consumers(
+            consumers,
+            "buf0",
+            "full",
+            operations,
+            producer_layout=self.buf0.layout,
+            read_layout=self.full.layout,
+        )
+        after = {op.get_name(): self._indexes(op, "full") for op in operations}
+        return before, after
+
+    def test_an_in_step_read_keeps_its_row_term(self):
+        _, c = ir_computed_buffer("c", self.FULL, lambda i: self.load0(i))
+
+        before, after = self._redirect([c])
+
+        self.assertEqual(after["c"], [8192 * self.d0 + 128 * self.d1 + self.d2])
+        self.assertEqual(after, before)
+
+    def test_a_broadcast_read_stays_a_broadcast(self):
+        _, c = ir_computed_buffer("c", self.FULL, lambda i: self.load0([0, i[1], i[2]]))
+
+        before, after = self._redirect([c])
+
+        self.assertEqual(after["c"], [128 * self.d1 + self.d2])
+        self.assertEqual(after, before)
+
+    def test_permuted_stepped_and_offset_reads_are_addressed_as_before(self):
+        _, permuted = ir_computed_buffer(
+            "permuted", self.FULL, lambda i: self.load0([i[1], i[0], i[2]])
+        )
+        _, stepped = ir_computed_buffer(
+            "stepped", [32, 64, 128], lambda i: self.load0([2 * i[0], i[1], i[2]])
+        )
+        _, offset = ir_computed_buffer(
+            "offset", [32, 64, 128], lambda i: self.load0([i[0] + 32, i[1], i[2]])
+        )
+
+        before, after = self._redirect([permuted, stepped, offset])
+
+        self.assertEqual(after["permuted"], [128 * self.d0 + 8192 * self.d1 + self.d2])
+        self.assertEqual(after["stepped"], [16384 * self.d0 + 128 * self.d1 + self.d2])
+        self.assertEqual(
+            after["offset"], [8192 * self.d0 + 128 * self.d1 + self.d2 + 262144]
+        )
+        self.assertEqual(after, before)
+
+    def test_a_narrowing_view_keeps_its_own_layout(self):
+        from torch._inductor.ir import (
+            FixedLayout,
+            ReinterpretView,
+            StorageBox,
+            TensorBox,
+        )
+
+        view = TensorBox(
+            ReinterpretView(
+                data=StorageBox(self.buf0),
+                layout=FixedLayout(
+                    torch.device("cpu"), torch.float32, [16, 64, 128], self.STRIDE
+                ),
+            )
+        ).make_loader()
+        _, c = ir_computed_buffer("c", [16, 64, 128], lambda i: view(i))
+
+        before, after = self._redirect([c])
+
+        self.assertEqual(after["c"], [8192 * self.d0 + 128 * self.d1 + self.d2])
+        self.assertEqual(after, before)
+
+    def test_two_reads_that_disagree_each_keep_their_index(self):
+        _, c = ir_computed_buffer(
+            "c",
+            self.FULL,
+            lambda i: self.load0(i) + self.load0([0, i[1], i[2]]),
+        )
+
+        before, after = self._redirect([c])
+
+        self.assertEqual(
+            sorted(after["c"], key=str),
+            sorted(
+                [8192 * self.d0 + 128 * self.d1 + self.d2, 128 * self.d1 + self.d2],
+                key=str,
+            ),
+        )
+        self.assertEqual(after, before)
+
+    def test_a_tile_along_an_inner_dim_reads_the_full_strides(self):
+        # The tile (64, 16, 128) has its own row stride, 2048; the consumer
+        # reads the full buffer and must use 8192.
+        _, c = ir_computed_buffer("c", self.FULL, lambda i: self.load0(i))
+
+        before, after = self._redirect([c], tiled_dims=(1,), loop_count=4)
+
+        self.assertEqual(list(self.buf0.layout.stride), [2048, 128, 1])
+        self.assertEqual(after["c"], [8192 * self.d0 + 128 * self.d1 + self.d2])
+        self.assertEqual(after, before)
+
+    def test_the_producer_is_the_tile_again_after_every_trace(self):
+        _, c = ir_computed_buffer("c", self.FULL, lambda i: self.load0(i))
+        _divide_ranges(self.buf0, Integer(64), [0])
+        tile = (list(self.buf0.layout.size), list(self.buf0.layout.stride))
+        operations = [c]
+        _patch_consumers(
+            [c],
+            "buf0",
+            "full",
+            operations,
+            producer_layout=self.buf0.layout,
+            read_layout=self.full.layout,
+        )
+
+        for _ in range(2):
+            self._indexes(operations[0], "full")
+            self.assertEqual(
+                (list(self.buf0.layout.size), list(self.buf0.layout.stride)), tile
+            )
+        self.assertEqual(tile[0], [1, 64, 128])
+
+    def test_read_through_a_mutation_layout_presents_on_its_target(self):
+        from torch._inductor.ir import MutationLayoutSHOULDREMOVE, StorageBox, TensorBox
+
+        from torch_spyre._inductor.wsr.loop_tiling_common import _ReadThroughLayout
+
+        self.buf0.layout.size = [1, 64, 128]
+        mutation = MutationLayoutSHOULDREMOVE(TensorBox(StorageBox(self.buf0)))
+
+        with _ReadThroughLayout(mutation, self.full.layout):
+            self.assertEqual(list(self.buf0.layout.size), self.FULL)
+        self.assertEqual(list(self.buf0.layout.size), [1, 64, 128])
 
 
 class TestPatchConsumersLoopInfo(unittest.TestCase):

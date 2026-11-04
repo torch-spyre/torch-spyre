@@ -186,12 +186,6 @@ class PropagationPlan:
         (``_patch_consumers``) must search for reads of this name instead of
         the op's own name. ``None`` otherwise, meaning the op's own name
         should be used, as for ordinary (non-mutation) copy-out ops.
-    consumer_read_dims:
-        For each outside consumer, the dims of this op's buffer that each of
-        its reads moves along (``_dims_read_along``), taken at planning time
-        while those reads are still traced against the undivided layout. The
-        redirect to the full buffer (``_patch_consumers``) restores a dim the
-        tile consumed whole only where a read moved along it.
     """
 
     kind: Literal["loop_internal", "copy_out", "reduction", "mutation_write_back"]
@@ -203,7 +197,6 @@ class PropagationPlan:
     is_graph_output: bool = False
     graph_output_name: str | None = None
     consumer_lookup_name: str | None = None
-    consumer_read_dims: tuple[tuple[str, tuple[frozenset[int], ...]], ...] = ()
 
 
 @dataclass(frozen=True)

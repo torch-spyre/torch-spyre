@@ -56,9 +56,9 @@ this file's rewrite sites depend on.
 from __future__ import annotations
 
 
+import contextlib
 import dataclasses
 import logging
-from collections.abc import Mapping
 from typing import NamedTuple
 
 import sympy
@@ -73,6 +73,7 @@ from torch._inductor.ir import (
     Buffer,
     ComputedBuffer,
     FixedLayout,
+    Layout,
     MutableBox,
     MutationLayoutSHOULDREMOVE,
     Operation,
@@ -120,9 +121,9 @@ from .loop_tiling_common import (  # noqa: F401
     _NameSwapHandler,
     _PointReadRebaseHandler,
     _REDUCTION_FREE_SYMS_KEY,
+    _ReadThroughLayout,
     _RetileLoadIndexHandler,
     _RetiledBufferInfo,
-    _dims_read_along,
     _affine_point_read_index,
     _cache_key,
     _capture_logical_iteration_symbols,
@@ -400,37 +401,6 @@ def _find_outside_consumers_planned(
 
     is_graph_output = buf_name in _graph_output_names()
     return consumer_names, is_graph_output
-
-
-def _planned_consumer_read_dims(
-    consumer_names: list[str],
-    buf_name: str,
-    strides: tuple[Expr, ...],
-    operations: list[Operation],
-) -> tuple[tuple[str, tuple[frozenset[int], ...]], ...]:
-    """``PropagationPlan.consumer_read_dims``: per outside consumer, the dims
-    of ``buf_name`` each of its reads moves along, taken now, while the reads
-    are still traced against the undivided layout (see ``_patch_consumers``)."""
-    by_name = {op.get_name(): op for op in operations if isinstance(op, ComputedBuffer)}
-    result = []
-    for name in consumer_names:
-        op = by_name.get(name)
-        if op is None:
-            continue
-        try:
-            deps = op_read_writes(op).reads
-        except Exception as exc:  # as _reads_buffer tolerates
-            logger.debug("_planned_consumer_read_dims: %s raised %s", name, exc)
-            continue
-        reads = tuple(
-            _dims_read_along(index, strides)
-            for dep in deps
-            if isinstance(dep, MemoryDep)
-            and dep.name == buf_name
-            and isinstance(index := getattr(dep, "index", None), sympy.Basic)
-        )
-        result.append((name, reads))
-    return tuple(result)
 
 
 def _compute_full_ranges_planned(
@@ -947,9 +917,6 @@ def _plan_tiling_propagation(
                 full_device_layout=_planned_full_device_layout(op, full_ranges),
                 outside_consumer_names=tuple(all_consumer_names),
                 is_graph_output=is_graph_output,
-                consumer_read_dims=_planned_consumer_read_dims(
-                    all_consumer_names, buf_name, tuple(op.layout.stride), operations
-                ),
             )
 
     _zero_reads_of_fixed_buffers_planned(operations, plan)
@@ -2677,9 +2644,6 @@ def _propagate_tiled_op(
     own_outer_key = loop_group_id[0]
     planned_names = set(propagation.outside_consumer_names)
     outside_consumers = []
-    # The consumers in another loop group, whose reads of the full buffer get
-    # a dim the tile consumed whole restored (see _patch_consumers).
-    cross_group_names: set[str] = set()
     for o in operations:
         if not isinstance(o, ComputedBuffer) or o is op:
             continue
@@ -2693,8 +2657,6 @@ def _propagate_tiled_op(
         # would wrongly drop it.
         if o_outer != own_outer_key or o.get_name() in planned_names:
             outside_consumers.append(o)
-            if o_outer != own_outer_key:
-                cross_group_names.add(o.get_name())
     resolved_names = {o.get_name() for o in outside_consumers}
     if resolved_names != planned_names:
         logger.debug(
@@ -2734,6 +2696,10 @@ def _propagate_tiled_op(
     # Capture before _insert_copy_op overwrites op.layout.
     old_stride = tuple(op.layout.stride)
     old_size = tuple(op.layout.size)
+    # The layout object every outside consumer's loader is bound to -- the one
+    # _divide_ranges shrank to the tile. Their reads are derived from full_buf
+    # through it (see _patch_consumers).
+    consumer_bound_layout = op.layout
 
     # Every cross-loop-group write always takes the copy-op path: the real
     # compute op keeps its own natural, input-derived, tile-sized layout,
@@ -2818,25 +2784,18 @@ def _propagate_tiled_op(
         # level.
         loop_info.output_tiled_dims = []
 
-    # Patch outside consumers and graph outputs to read full_buf.
+    # Patch outside consumers and graph outputs to read full_buf. An outside
+    # consumer belongs to another loop nest; full_buf, in HBM, is the only
+    # thing it shares with this one, so its read is derived from full_buf's
+    # layout, never from this op's tile.
     full_name = full_buf.get_name()
-    retile_info = _RetiledBufferInfo(
-        old_stride,
-        tuple(full_buf.layout.stride),
-        old_size,
-        tuple(full_buf.layout.size),
-    )
     _patch_consumers(
         outside_consumers,
         read_lookup_name,
         full_name,
         operations,
-        retile_info,
-        read_dims={
-            name: dims
-            for name, dims in propagation.consumer_read_dims
-            if name in cross_group_names
-        },
+        producer_layout=consumer_bound_layout,
+        read_layout=full_buf.layout,
     )
     if is_graph_output:
         _patch_graph_outputs(propagation.graph_output_name or buf_name, full_buf)
@@ -3860,73 +3819,47 @@ def _patch_consumers(
     new_name: str,
     operations: list[Operation],
     retile_info: _RetiledBufferInfo | None = None,
-    read_dims: Mapping[str, tuple[frozenset[int], ...]] | None = None,
+    *,
+    producer_layout: Layout | None = None,
+    read_layout: Layout | None = None,
 ) -> None:
-    """Redirect outside consumers from old_name to new_name.
+    """Redirect consumers from old_name to new_name.
 
-    Patches each consumer's inner_fn via NameSwapHandler (or
-    _NameAndIndexSwapHandler, when retile_info's old/new strides differ) and
-    reconstructs the ComputedBuffer to invalidate the sizes cache.
+    Patches each consumer's inner_fn with a NameSwapHandler and reconstructs
+    the ComputedBuffer to invalidate the sizes cache. The load index is
+    handled one of two ways:
 
-    retile_info carries the old (tile-local) and new (full-size) strides of
-    the renamed buffer, needed whenever new_name isn't addressing-equivalent
-    to old_name (e.g. a coarse-tiled dim's stride scaled up for the full
-    buffer) — plain NameSwapHandler forwards the load index unmodified,
-    which computes wrong addresses when the strides differ.
+    ``read_layout`` (with ``producer_layout``, the layout object the
+    consumers' loaders are bound to): the consumer is traced with
+    ``producer_layout`` presenting ``read_layout``'s host shape
+    (``_ReadThroughLayout``), so its index is derived from the buffer it now
+    reads. This is the copy-out path: an outside consumer belongs to another
+    loop nest, and the full buffer is the only thing the two nests share.
 
-    read_dims is ``PropagationPlan.consumer_read_dims`` as a mapping: the
-    dims of old_name each consumer's reads moved along before the producer
-    was divided. A dim the tile consumed whole has size 1 in the tile, and a
-    consumer re-traced against that layout loses the dim's term (Inductor's
-    indexer skips a size-1 dim) even when the strides agree, as they do for
-    the outermost dim. Such a consumer takes _NameAndIndexSwapHandler too,
-    which adds the term back for the dims its reads moved along; reads that
-    disagree about a dim are refused.
+    ``retile_info`` carries the old (tile-local) and new (full-size) strides
+    of the renamed buffer, and the index traced against the tile is rescaled
+    (``_NameAndIndexSwapHandler``) when they differ. This is the reduction
+    accumulator path, which redirects same-nest consumers as well.
     """
     if not consumers or old_name == new_name:
         return
+    assert (producer_layout is None) == (read_layout is None), (
+        "_patch_consumers: producer_layout and read_layout go together"
+    )
+    assert retile_info is None or read_layout is None, (
+        "_patch_consumers: a consumer's index is either derived from the read "
+        "buffer or rescaled from the tile, not both"
+    )
 
     from ..pass_utils import NameSwapHandler
 
     name_map = {old_name: new_name}
-    strides_differ = (
+    has_retile = (
         retile_info is not None and retile_info.old_stride != retile_info.new_stride
     )
-    grown_dims = (
-        [
-            d
-            for d, (old, new) in enumerate(
-                zip(retile_info.old_size, retile_info.new_size)
-            )
-            if old == 1 and new != 1
-        ]
-        if retile_info is not None
-        else []
-    )
-
-    def restorable(consumer: ComputedBuffer) -> frozenset[int] | None:
-        if read_dims is None or consumer.get_name() not in read_dims:
-            return None
-        reads = read_dims[consumer.get_name()]
-        if not reads:
-            return None
-        restore = set()
-        for d in grown_dims:
-            moved = [d in dims for dims in reads]
-            if all(moved):
-                restore.add(d)
-            elif any(moved):
-                raise Unsupported(
-                    f"coarse_tile: {consumer.get_name()} reads {old_name} both "
-                    f"along and across dim {d}, which its producer's tile "
-                    f"consumes whole; the full buffer cannot be read both ways."
-                )
-        return frozenset(restore)
 
     for consumer in consumers:
         orig_inner = consumer.data.inner_fn
-        restore = restorable(consumer)
-        has_retile = strides_differ or bool(restore)
 
         def new_inner_fn(
             *args,
@@ -3934,15 +3867,21 @@ def _patch_consumers(
             _info=retile_info if has_retile else None,
             _orig=orig_inner,
             _consumer=consumer,
-            _restore=restore,
+            _bound=producer_layout,
+            _read=read_layout,
         ):
             if _info is not None:
                 handler = _NameAndIndexSwapHandler(
-                    V.ops, _map, {old_name: _info}, _consumer, restore_dims=_restore
+                    V.ops, _map, {old_name: _info}, _consumer
                 )
             else:
                 handler = NameSwapHandler(V.ops, _map)
-            with V.set_ops_handler(handler):
+            read_through = (
+                _ReadThroughLayout(_bound, _read)
+                if _read is not None
+                else contextlib.nullcontext()
+            )
+            with read_through, V.set_ops_handler(handler):
                 return _orig(*args)
 
         object.__setattr__(consumer.data, "inner_fn", new_inner_fn)
@@ -4042,13 +3981,11 @@ class _NameAndIndexSwapHandler(WrapperHandler):
         name_map: dict[str, str],
         infos_by_old_name: dict[str, _RetiledBufferInfo],
         consumer: "ComputedBuffer | None" = None,
-        restore_dims: frozenset[int] | None = None,
     ):
         super().__init__(inner)
         self._name_map = name_map
         self._infos_by_old_name = infos_by_old_name
         self._consumer = consumer
-        self._restore_dims = restore_dims
 
     def load(self, name, index):
         if name in self._infos_by_old_name:
@@ -4058,7 +3995,6 @@ class _NameAndIndexSwapHandler(WrapperHandler):
                 self._infos_by_old_name[name],
                 self._consumer,
                 preserve_target_stride_atoms=True,
-                restore_dims=self._restore_dims,
             )
         return super().load(self._name_map.get(name, name), index)
 
