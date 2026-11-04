@@ -187,7 +187,7 @@ class TestSpyre(TestCase):
         cache = make_cache(shape, fill_random=True)
         pool = self._pool(cache, NUM_BLOCKS)
         # _pool() builds one slot pools, so slot 0 is the only valid slot
-        with self.assertRaisesRegex(RuntimeError, "slot index is out of range"):
+        with self.assertRaisesRegex(IndexError, "out of range"):
             copy_kv_page_raw(cache, 1, pool, 1, to_device=False)
 
 
