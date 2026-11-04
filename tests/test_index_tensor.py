@@ -57,6 +57,19 @@ def test_gathers_the_indexed_rows(source, rows, dtype, index_device):
 
 @pytest.mark.parametrize("index_device", ["cpu", DEVICE])
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("length", [8, 16, 63])
+def test_gathers_from_a_1d_source(length, dtype, index_device):
+    """A 1-D source shorter than a 64-element stick (#4334)."""
+    x, dx = _to_device(torch.arange(length, dtype=DTYPE))
+    index = torch.tensor([length - 1, 0, 3, 3], dtype=dtype)
+
+    got = dx[index.to(index_device)]
+
+    torch.testing.assert_close(got.cpu(), x[index], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("index_device", ["cpu", DEVICE])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
 def test_negative_indices_wrap(source, dtype, index_device):
     x, dx = source
     index = torch.tensor([-1, 0, -ROWS], dtype=dtype)
@@ -117,10 +130,21 @@ def test_trailing_dims_are_kept():
     torch.testing.assert_close(got.cpu(), x[index], atol=0, rtol=0)
 
 
-def test_one_row_source():
+@pytest.mark.parametrize("rows", [[0], [0, 0], [0, -1, 0]], ids=str)
+def test_one_row_source(rows):
     x, dx = _to_device(torch.randn(1, HIDDEN, dtype=DTYPE))
-    got = dx[torch.tensor([0])]
-    torch.testing.assert_close(got.cpu(), x, atol=0, rtol=0)
+    index = torch.tensor(rows)
+
+    got = dx[index]
+
+    torch.testing.assert_close(got.cpu(), x[index], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.int16, torch.float32])
+def test_index_dtype_invalid_on_cpu_raises_as_on_cpu(source, dtype):
+    _, dx = source
+    with pytest.raises(IndexError, match="must be long, int, byte or bool"):
+        dx[torch.tensor([0, 1], dtype=dtype)]
 
 
 @pytest.mark.parametrize(
@@ -130,6 +154,7 @@ def test_one_row_source():
         pytest.param(lambda: (slice(None), torch.tensor([1, 2])), id="dim1"),
         pytest.param(lambda: torch.tensor([[0, 1]]), id="2d"),
         pytest.param(lambda: torch.zeros(ROWS, dtype=torch.bool), id="bool"),
+        pytest.param(lambda: torch.zeros(ROWS, dtype=torch.uint8), id="uint8"),
     ],
 )
 def test_other_index_forms_name_the_supported_subset(source, make_index):

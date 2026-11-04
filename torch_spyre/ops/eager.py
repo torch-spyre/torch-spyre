@@ -726,8 +726,18 @@ def _row_index(self, indices):
     Only one 1-D integer index on dim 0 is supported (row selection, e.g. the
     sampled rows of a decoder's hidden states). The index is bounds-checked and
     its negative entries wrapped on the host, as eager CPU indexing does, so an
-    index already on Spyre takes a D2H round trip.
+    index already on Spyre takes a D2H round trip, a host-side int32 cast and an
+    H2D back.
     """
+    # Invalid on every device, so raise what CPU raises, before the scope check.
+    if any(
+        i is not None
+        and i.dtype not in (torch.int64, torch.int32, torch.uint8, torch.bool)
+        for i in indices
+    ):
+        raise IndexError(
+            "tensors used as indices must be long, int, byte or bool tensors"
+        )
     if (
         len(indices) != 1
         or indices[0] is None
@@ -766,10 +776,11 @@ def spyre__index_tensor(self, indices):
     index = _row_index(self, indices)
     if index.numel() == 0:
         return torch.empty((0, *self.shape[1:]), dtype=self.dtype, device=self.device)
-    if self.shape[0] == 1 and index.numel() == 1:
-        # A one-row gather from a one-row source lowers to an identity op the
-        # backend cannot schedule, and the only valid index is 0.
-        return self.clone()
+    if self.shape[0] == 1:
+        # Every in-range index of a one-row source is 0, so this is a broadcast.
+        # index_select on a one-row source lowers to an op the backend can't
+        # schedule (identity for one index, stick mismatch for more).
+        return self.expand(index.numel(), *self.shape[1:]).clone()
     return torch.index_select(self, 0, index)
 
 
