@@ -39,6 +39,7 @@ from torch._inductor.ir import (
 )
 from torch._inductor.virtualized import V
 
+from torch_spyre._inductor.deadcode_elimination import deadcode_elimination
 from torch_spyre._inductor.loop_carries import apply_loop_carries
 from torch_spyre._inductor.loop_info import LoopCarryRecord
 from torch_spyre._inductor.loop_node import LoopNode
@@ -258,6 +259,59 @@ class TestApplyLoopCarries(_CarryGraph):
         self.graph.operations = [storage, body_reader, after]
         with self.assertRaisesRegex(RuntimeError, "update 'upd' is gone"):
             apply_loop_carries(self.graph)
+
+
+class TestPureWindow(_CarryGraph):
+    """Between the splice and ``apply_loop_carries`` the update is pure, and
+    its record is what says it is live."""
+
+    def test_dce_keeps_a_carry_nobody_reads(self):
+        """The carry's result is read by no one after the loop, but the update
+        feeds the next trip through its storage, and a live op (``out``)
+        reads that storage."""
+        self._input("x")
+        storage = self._op("storage", ["x"])
+        out = self._op("out", ["storage"])  # an in-body reader of the old value
+        update = self._op("upd", ["storage", "x"])
+        record = LoopCarryRecord("storage", "upd")
+        storage._loop_carry_record = record
+        update._loop_carry_record = record
+        self.graph.operations = [storage, out, update]
+        self.graph.get_output_names = lambda: ["out"]
+
+        deadcode_elimination(self.graph)
+
+        self.assertEqual(
+            [op.get_name() for op in self.graph.operations], ["storage", "out", "upd"]
+        )
+        self.assertNotIsInstance(update.layout, MutationLayoutSHOULDREMOVE)
+        self.assertNotIn("upd", self.graph.removed_buffers)
+
+    def test_dce_collects_a_carry_whose_storage_is_dead(self):
+        """Nobody reads the storage either: the whole carry is dead, as an
+        in-place write into a dead target is."""
+        self._input("x")
+        storage, update, *_ = self._carry()
+        self._input("y")
+        other = self._op("other", ["y"])
+        self.graph.operations = [storage, update, other]
+        self.graph.get_output_names = lambda: ["other"]
+
+        deadcode_elimination(self.graph)
+
+        self.assertEqual([op.get_name() for op in self.graph.operations], ["other"])
+        apply_loop_carries(self.graph)  # nothing left to apply; must not raise
+
+    def test_loop_node_reports_the_pending_carry_as_its_mutation(self):
+        storage, update, body_reader, after, _ = self._carry()
+        node = LoopNode(
+            "loopnode0", [update, body_reader], induction=None, trip_count=4
+        )
+        self.assertEqual(node.mutation_targets(), ["storage"])
+        self.assertTrue(node.has_side_effects())
+        writes = {dep.name for dep in node.get_read_writes().writes}
+        self.assertIn("storage", writes)
+        self.assertIn("upd", writes)
 
 
 if __name__ == "__main__":

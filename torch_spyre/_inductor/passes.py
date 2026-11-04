@@ -93,6 +93,7 @@ from .scheduler import (
 )
 from .constants import DEVICE_NAME
 from .deadcode_elimination import deadcode_elimination
+from .loop_carries import apply_loop_carries
 from .loop_node import (
     OpsView,
     all_ops,
@@ -586,6 +587,17 @@ class CustomPreSchedulingPasses:
             #
             # Tensor Layout (Stickification)
             split_multi_ops,
+            # Loop carries: splice_while_loops declares each accumulator carry
+            # (a LoopCarryRecord) and leaves its update pure; this makes the
+            # update an in-place write of the carry's storage. It runs here,
+            # just before propagation, because every pass that treats a
+            # mutation carry differently runs from propagation on (layout
+            # choice, restickify, work division, LX/HBM planning), and they
+            # then see exactly the in-place form the splice used to make.
+            # Moving it later costs LX footprint: propagation would choose the
+            # update's layout freely instead of tying it to the storage
+            # (measured in the stage-6 investigation, task 6.0a, section 3).
+            apply_loop_carries,
             propagate_spyre_tensor_layouts,
             validate_ops,
             optimize_restickify_locations,

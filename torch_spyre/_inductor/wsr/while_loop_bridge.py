@@ -802,6 +802,19 @@ def _carry_real_input_is_private(
     storage = _storage_buffer(real_input)
     if not isinstance(storage, ir.ComputedBuffer):
         return False
+    record = getattr(storage, "_loop_carry_record", None)
+    if (
+        isinstance(record, LoopCarryRecord)
+        and record.update_name == storage.get_name()
+        and not isinstance(storage.layout, ir.MutationLayoutSHOULDREMOVE)
+    ):
+        # An earlier loop's result (a chained carry), still in its pure form:
+        # the update will write its carry's storage in place
+        # (``loop_carries.apply_loop_carries``), so ownership is that
+        # storage's, which the update itself reads.
+        storage = graph.get_buffer(record.storage_name)
+        if not isinstance(storage, ir.ComputedBuffer):
+            return False
     name = storage.get_name()
 
     if name in graph.graph_inputs:
@@ -1014,11 +1027,20 @@ def _rewire_accumulator_output(
 ) -> list["ir.Operation"]:
     """Make an accumulator carry's body write land in the carry's own buffer.
 
-    Turns the body op that produces ``binding.body_output`` into an in-place
-    mutation of ``real_input`` (the carry's pre-loop initial buffer) by
-    swapping its layout for ``MutationLayoutSHOULDREMOVE(real_input)``, and
-    repoints any outside consumer of the loop's result for this carry
-    position at that same buffer.
+    For a full-buffer accumulator this only DECLARES the carry: a
+    ``LoopCarryRecord`` on the storage (``real_input``'s backing buffer, the
+    carry's pre-loop initial value) and on the body op that produces
+    ``binding.body_output`` (the update), with ``real_input`` itself recorded
+    as ``storage_view`` when it is a view. The body stays pure, and any
+    outside consumer of the loop's result for this carry position is
+    repointed at the update. ``loop_carries.apply_loop_carries`` later makes
+    the update an in-place write of the storage and sends its readers there.
+
+    A partial scatter carry (``partial_update``) has no record: its write is
+    made in place here, by swapping the update's layout for
+    ``MutationLayoutSHOULDREMOVE(real_input)``, and outside consumers are
+    repointed at the storage. The rest of this docstring describes that
+    in-place form, which the declared carry reaches once applied.
 
     Why the initial buffer and not a fresh one: the accumulator's fill is
     already there. ``for_each_tile(..., init=torch.zeros(M, N))`` lowers to a
@@ -1121,27 +1143,30 @@ def _rewire_accumulator_output(
     target = real_input
     while isinstance(target, ir.MutableBox):
         target = target.data
-    mutation_layout = ir.MutationLayoutSHOULDREMOVE(target)
-    producer.layout = mutation_layout
 
-    # ``target`` may be a frozen ReinterpretView (for example, an SDPA
-    # accumulator whose initial value is a view).  The carry contract belongs
-    # to the mutable backing Buffer that the allocator sees in graph.operations,
-    # not to that view.  MutationLayoutSHOULDREMOVE.get_buffer() performs the
-    # same recursive view/box unwrapping used when resolving mutation storage.
-    storage = mutation_layout.get_buffer()
-    storage_name = storage.get_name()
-    # LoopCarryRecord opts full-buffer accumulators into LX residency. A
-    # scatter must retain its whole destination in HBM, including untouched
-    # rows; ordinary mutation dependencies carry its lifetime across trips.
     if not partial_update:
+        # ``target`` may be a frozen ReinterpretView (for example, an SDPA
+        # accumulator whose initial value is a view).  The carry contract
+        # belongs to the mutable backing Buffer that the allocator sees in
+        # graph.operations, not to that view; the view is recorded as what the
+        # update writes through.
+        storage = _storage_buffer(target)
         record = LoopCarryRecord(
-            storage_name=storage_name,
+            storage_name=storage.get_name(),
             update_name=producer.get_name(),
             loop_origin=_validated_loop_origin(graph, while_op),
+            storage_view=None if target is storage else target,
         )
         storage._loop_carry_record = record
         producer._loop_carry_record = record
+        if while_out_name is not None:
+            _repoint_refs_to_buffer(graph, while_out_name, producer)
+            _repoint_mutation_targets(graph.operations, while_out, producer)
+        return body_ops
+
+    mutation_layout = ir.MutationLayoutSHOULDREMOVE(target)
+    producer.layout = mutation_layout
+    storage_name = mutation_layout.get_buffer().get_name()
 
     # In-body readers must use carry storage: the former producer is now a
     # mutation operation without an independent allocation.

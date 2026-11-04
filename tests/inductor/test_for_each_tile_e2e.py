@@ -64,6 +64,7 @@ from torch_spyre._inductor import passes as ts_passes
 from torch_spyre._inductor.constants import RESTICKIFY_OP
 from torch_spyre._inductor.loop_node import all_ops
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
+from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
 from torch_spyre._inductor.scratchpad.coarse_tiling import (
     PrescribedRegion,
@@ -390,7 +391,6 @@ class TestForEachTileE2E(_DynamoResetTestCase):
                 torch.testing.assert_close(inputs[2].cpu(), initial, atol=0, rtol=0)
 
     def test_computed_where_condition_in_broadcast_tile(self):
-        from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
         from torch_spyre.ops.fallbacks import FallbackWarning
 
         def tiled_where(x):
@@ -1835,6 +1835,174 @@ class TestForEachTileCarriedSumE2E(_DynamoResetTestCase):
                     self._compile(
                         lambda v: carried_expert_sum_fn(v, split), self._named(values)
                     )
+
+
+class _RecordCarries(CustomPreSchedulingPasses):
+    """Pre-scheduling pipeline that records the loop carries twice: right after
+    the first ``deadcode_elimination`` (the pure window, before
+    ``apply_loop_carries``) and at the end."""
+
+    window: list = []
+    final: dict = {}
+
+    def __init__(self):
+        super().__init__()
+        cls = type(self)
+        out = []
+        for p in self.passes:
+            out.append(p)
+            if p is ts_passes.deadcode_elimination and not any(
+                getattr(q, "__name__", "") == "record_window" for q in out
+            ):
+
+                def record_window(graph):
+                    cls.window = [
+                        (
+                            op.get_name(),
+                            getattr(op, "_loop_carry_record", None),
+                            type(op.layout).__name__,
+                        )
+                        for op in all_ops(graph.operations)
+                    ]
+
+                out.append(record_window)
+        self.passes = out
+
+    def __call__(self, graph) -> None:
+        super().__call__(graph)
+        cls = type(self)
+        cls.final = {}
+        for op in graph.operations:
+            record = getattr(op, "_loop_carry_record", None)
+            if record is not None and record.update_name == op.get_name():
+                storage = graph.get_buffer(record.storage_name)
+                cls.final[record.update_name] = (
+                    record.storage_name,
+                    type(op.layout).__name__,
+                    dict(getattr(storage.get_layout(), "allocation", {}) or {}),
+                )
+
+
+class TestForEachTileCarriesInPlaceE2E(_DynamoResetTestCase):
+    """Each carry is declared at the splice and put in place by
+    ``apply_loop_carries``.
+
+    Numerics alone cannot show that a carry's back edge exists: on online
+    softmax a body whose updates were never put in place still compiles, and
+    with LX offsets masked its kernel is identical. The back edge is in the
+    kernel only as the update writing the address its storage was given, so
+    these tests check that address too.
+    """
+
+    def _compile(self, fn, *args):
+        from torch._inductor.utils import run_and_get_code
+
+        _RecordCarries.window = []
+        _RecordCarries.final = {}
+        with (
+            patch.object(ts_passes, "CustomPreSchedulingPasses", _RecordCarries),
+            torch._inductor.config.patch(force_disable_caches=True),
+            config.patch(lx_planning=True),
+        ):
+            compiled = torch.compile(fn, backend="inductor", fullgraph=True)
+            out, code = run_and_get_code(compiled, *args)
+        return out, "\n".join(code)
+
+    @staticmethod
+    def _output_allocations(source):
+        """buffer name -> the output allocation of the OpSpec that writes it."""
+        import regex as re
+
+        out = {}
+        for chunk in source.split("OpSpec(\n")[1:]:
+            chain = re.search(r"ir_chain=\(([^)]*)\)", chunk)
+            allocs = re.findall(
+                r"is_input=False.*?allocation=\{'(\w+)': (\d+)\}", chunk, re.DOTALL
+            )
+            if chain and allocs:
+                names = re.findall(r"'([^']+)'", chain.group(1))
+                out.setdefault(names[-1], {allocs[-1][0]: int(allocs[-1][1])})
+        return out
+
+    def _assert_carries_in_place(self, source, expected):
+        final = _RecordCarries.final
+        self.assertEqual(len(final), expected, final)
+        written = self._output_allocations(source)
+        for update, (storage, layout, allocation) in final.items():
+            self.assertEqual(layout, "MutationLayoutSHOULDREMOVE", update)
+            self.assertIn("lx", allocation, f"carry {storage} is not in LX")
+            self.assertEqual(
+                written.get(update),
+                allocation,
+                f"update {update} does not write its storage {storage}'s address",
+            )
+
+    def test_online_softmax_carries_share_their_storage_address(self):
+        Q = cached_xavier((LQ, D))
+        K = cached_xavier((LK, D), differentiation=1)
+        V = cached_xavier((LK, D), differentiation=2)
+        ref = online_softmax_reference(
+            dl16_round(Q.float()), dl16_round(K.float()), dl16_round(V.float())
+        )
+
+        out, src = self._compile(
+            online_softmax_fn, Q.to(DEVICE_NAME), K.to(DEVICE_NAME), V.to(DEVICE_NAME)
+        )
+
+        torch.testing.assert_close(out.cpu().float(), ref, atol=1e-2, rtol=1e-2)
+        # m, denom, acc: all three stay in LX and are updated in place.
+        self._assert_carries_in_place(src, 3)
+
+    def test_carries_are_pure_until_applied(self):
+        """After the splice and dead-code elimination, each carry is declared
+        and its update still writes its own buffer."""
+        Q = cached_xavier((LQ, D))
+        K = cached_xavier((LK, D), differentiation=1)
+        V = cached_xavier((LK, D), differentiation=2)
+
+        self._compile(
+            online_softmax_fn, Q.to(DEVICE_NAME), K.to(DEVICE_NAME), V.to(DEVICE_NAME)
+        )
+
+        updates = {
+            name: layout
+            for name, record, layout in _RecordCarries.window
+            if record is not None and record.update_name == name
+        }
+        self.assertEqual(len(updates), 3, _RecordCarries.window)
+        self.assertNotIn("MutationLayoutSHOULDREMOVE", updates.values())
+        self.assertEqual(set(updates), set(_RecordCarries.final))
+
+    def test_carry_nobody_reads_after_the_loop(self):
+        """``c`` is returned by no one; only ``acc`` reads it, inside the loop.
+        Its update must survive dead-code elimination and stay in place."""
+
+        def fn(x):
+            def body(carry, ops):
+                c, acc = carry
+                (tile,) = ops
+                return (c + tile, acc + c), None
+
+            zeros = torch.zeros(64, 64, device=x.device, dtype=x.dtype)
+            (_, acc), _ = for_each_tile(
+                body, (x,), dims=(0,), tile_size=64, init=(zeros, zeros.clone())
+            )
+            return acc
+
+        # Integers 0..3: every partial sum is an integer of at most 18, exact
+        # in fp16, so a stale or missing carry shows up as a mismatch.
+        x = torch.randint(0, 4, (256, 64), generator=torch.Generator().manual_seed(0))
+        x = x.half()
+        c = torch.zeros(64, 64)
+        ref = torch.zeros(64, 64)
+        for tile in x.float().reshape(4, 64, 64):
+            ref = ref + c
+            c = c + tile
+
+        out, src = self._compile(fn, x.to(DEVICE_NAME))
+
+        torch.testing.assert_close(out.cpu().float(), ref, atol=0, rtol=0)
+        self._assert_carries_in_place(src, 2)
 
 
 if __name__ == "__main__":
