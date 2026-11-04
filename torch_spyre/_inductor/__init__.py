@@ -286,7 +286,13 @@ def enable_spyre_compile_fx_wrapper():
                             with enable_spyre_context(
                                 example_inputs, declared_dims=declared
                             ):
-                                return _orig(gm, example_inputs, *args, **kwargs)
+                                compiled = _orig(gm, example_inputs, *args, **kwargs)
+                                from torch_spyre._inductor.narrowing_check import (
+                                    check_declared_ranges,
+                                )
+
+                                check_declared_ranges(gm, example_inputs)
+                                return compiled
                     finally:
                         _compile_state.in_spyre_compile = _prev_in_spyre
 
