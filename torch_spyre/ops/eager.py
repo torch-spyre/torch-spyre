@@ -748,6 +748,12 @@ def _row_index(self, indices):
             "Spyre aten::index.Tensor supports only x[index] with a single 1-D "
             "int32/int64 index tensor on dim 0"
         )
+    if self.dtype == torch.bool:
+        # The device copy of a bool tensor drops its values, so a gather or a
+        # broadcast would return wrong rows without an error.
+        raise NotImplementedError(
+            "Spyre aten::index.Tensor does not support bool source tensors"
+        )
     index = indices[0]
     if index.device.type != "cpu" and index.device != self.device:
         raise RuntimeError(
@@ -776,10 +782,13 @@ def spyre__index_tensor(self, indices):
     index = _row_index(self, indices)
     if index.numel() == 0:
         return torch.empty((0, *self.shape[1:]), dtype=self.dtype, device=self.device)
-    if self.shape[0] == 1:
+    if self.shape[0] == 1 and self.dim() > 1 and self.stride(0) != 1:
         # Every in-range index of a one-row source is 0, so this is a broadcast.
-        # index_select on a one-row source lowers to an op the backend can't
-        # schedule (identity for one index, stick mismatch for more).
+        # index_select on a one-row source whose rows are not the stick dim
+        # lowers to an op the backend can't schedule (identity for one index,
+        # stick mismatch for more). A source whose dim 0 runs along the stick
+        # (stride 1, e.g. a transposed column) gathers fine and is the one
+        # layout the broadcast cannot materialize.
         return self.expand(index.numel(), *self.shape[1:]).clone()
     return torch.index_select(self, 0, index)
 

@@ -140,6 +140,27 @@ def test_one_row_source(rows):
     torch.testing.assert_close(got.cpu(), x[index], atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("rows", [[0], [0, 0], [0, -1, 0]], ids=str)
+def test_transposed_one_row_source(rows):
+    """Dim 0 runs along the stick, so this one gathers instead of broadcasting."""
+    base = torch.arange(512, dtype=DTYPE).reshape(8, 64)
+    dx = base.to(DEVICE)[:, :1].T
+    index = torch.tensor(rows)
+
+    got = dx[index]
+
+    torch.testing.assert_close(got.cpu(), dx.cpu()[index], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("shape", [(1, 64), (8, 64)], ids=str)
+def test_bool_source_raises(shape):
+    # TODO: the device copy of a bool tensor loses its values; when it is fixed,
+    # bool sources must move to the positive tests above.
+    dx = (torch.arange(64 * shape[0]).reshape(shape) % 2 == 0).to(DEVICE)
+    with pytest.raises(NotImplementedError, match="bool source"):
+        dx[torch.tensor([0, 0])]
+
+
 @pytest.mark.parametrize("dtype", [torch.int16, torch.float32])
 def test_index_dtype_invalid_on_cpu_raises_as_on_cpu(source, dtype):
     _, dx = source
