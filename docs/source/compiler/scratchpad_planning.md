@@ -133,7 +133,7 @@ extra HBM round-trips.
 ## Pipeline position
 
 Scratchpad planning runs at the end of `CustomPreSchedulingPasses`,
-after work division has stamped per-op core splits:
+after the work-division passes:
 
 ```
 deadcode_elimination
@@ -154,19 +154,44 @@ insert_restickify_padding
 dedup_and_promote_constants
 _maybe_coarse_tile_span_overflow      # span-overflow coarse tiling (post-stickification)
 span_reduction                        # work-division: enforce 256 MB span
-cost_model_matmul_division            # work-division: matmul cost model
-work_distribution                     # work-division: default distributor
+cost_model_matmul_division            # work-division: matmul cost model (*)
+work_distribution                     # work-division: default distributor (*)
 _maybe_scratchpad_planning            # ← THIS PASS, gated by config.lx_planning
 ```
 
-Two ordering constraints fix this slot:
+(*) Run by `_distribute_work`, which leaves them to the LX solve when it
+chooses the splits itself (see below).
 
-- **Work division must run first.** Scratchpad planning reads the
-  symbol-keyed `iteration_space_ownership` committed by work division to
-  compute per-core buffer sizes. Work division also decides whether adjacent
-  ops have compatible core splits.
-  Incompatible splits trigger `core_div_mismatch` and disqualify shared
-  buffers from LX (see [Current limitations](#current-limitations)).
+Three ordering constraints fix this slot:
+
+- **Span floors must be set first.** `span_reduction` always runs before
+  planning. It commits the minimum split that keeps each op's per-core
+  span under 256 MB, and every candidate split the planner considers must
+  meet it.
+- **Each op needs a committed split wherever the planner reads one.**
+  Placement-only planning sizes per-core buffers from the symbol-keyed
+  `iteration_space_ownership` that work division commits, and checks
+  whether adjacent ops have compatible core splits. Incompatible splits
+  trigger `core_div_mismatch` and disqualify shared buffers from LX (see
+  [Current limitations](#current-limitations)). So without
+  co-optimization, and for the pruned exhaustive search, which seeds its
+  candidates from the committed split, `cost_model_matmul_division` and
+  `work_distribution` run first.
+
+  The co-optimizing solve (CP-SAT with ortools, or simulated annealing)
+  chooses the split of every op it can enumerate, and would overwrite a
+  split committed up front. When `solve_decides_work_division()` holds,
+  `_distribute_work` only records the ops it would have divided
+  (`defer_work_division`). The allocator commits the pass's split for one
+  of those ops only where it still reads it:
+
+  - when it pins the op to a fixed division (a hint, indirect access, a
+    host buffer, a layout group, an op it cannot enumerate);
+  - after the solve, for an op the solve committed no split to;
+  - before the greedy fallback, when the solve fails.
+
+  Every op still ends with a committed split, and a pinned op keeps the one
+  the pass would have given it.
 - **Stickification must run first.** All buffers need `FixedTiledLayout`
   for device-memory size computation.
 
