@@ -1,0 +1,143 @@
+name: refresh-test-timings
+
+# Regenerates .github/test_timings.json from ClickHouse and opens (or updates) a PR with the data
+# diff. The grouping in tests/oot_framework/utils/test_layout.py packs short configs into shared
+# jobs from that file; a config with fewer than the policy's min_runs runs (a new one, say) runs as
+# its own job until a refresh records enough of them. Nothing changes what CI runs until the PR is
+# reviewed and merged.
+on:
+  schedule:
+    - cron: 30 0 * * 1   # Mondays 00:30 UTC (06:00 IST)
+  workflow_dispatch:
+    inputs:
+      days:
+        description: Window of runs to take the median over, in days.
+        required: false
+        default: '30'
+
+concurrency:
+  group: refresh-test-timings
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    # On main only: the bot PR is based on the checked-out commit.
+    if: github.repository == 'torch-spyre/torch-spyre' && github.ref == 'refs/heads/main'
+    # The ingest pool: it is the one that reaches ClickHouse.
+    runs-on:
+      - x86_64
+      - linux
+      - image_ingest
+    timeout-minutes: 20
+    env:
+      BRANCH: bot/refresh-test-timings
+      CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
+      CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT }}
+      CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
+      CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS }}
+      CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB }}
+      CLICKHOUSE_DB_V2: ${{ secrets.CLICKHOUSE_DB_V2 }}
+    steps:
+      - uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
+        id: app-token
+        with:
+          app-id: ${{ vars.SPYRE_BOT_APP_ID }}
+          private-key: ${{ secrets.SPYRE_BOT_PRIVATE_KEY }}
+
+      # The script walks tests/configs/torch_spyre_tests/ to key the timings, so it needs those
+      # configs as well as the ingest library.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          sparse-checkout: |
+            .github
+            extensions/clickhouse-ingest
+            tests/configs/torch_spyre_tests
+            tests/scripts/refresh_test_timings.py
+          sparse-checkout-cone-mode: false
+
+      - uses: ./.github/actions/setup-clickhouse-ingest
+        with:
+          extra-scripts: tests/scripts/refresh_test_timings.py
+
+      - uses: ./.github/actions/setup-gh-cli
+
+      - name: Regenerate timings
+        env:
+          DAYS: ${{ inputs.days || '30' }}
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          python tests/scripts/refresh_test_timings.py \
+            --out .github/test_timings.json --days "${DAYS}" --db "${CLICKHOUSE_DB_V2:-spyre_v2}"
+
+      # generated_at changes on every run, so compare the configs only: no PR for a no-op week.
+      - name: Check for a data change
+        id: diff
+        run: |
+          set -euo pipefail
+          git show HEAD:.github/test_timings.json > "${RUNNER_TEMP}/old.json"
+          python3 - "${RUNNER_TEMP}/old.json" .github/test_timings.json <<'PYEOF' >> "$GITHUB_OUTPUT"
+          import json, sys
+          old, new = (json.load(open(p))["configs"] for p in sys.argv[1:])
+          print(f"changed={'true' if old != new else 'false'}")
+          PYEOF
+
+      - name: Open or update the PR
+        if: steps.diff.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          SUMMARY="$(python3 - "${RUNNER_TEMP}/old.json" .github/test_timings.json <<'PYEOF'
+          import json, sys
+          old, new = (json.load(open(p))["configs"] for p in sys.argv[1:])
+          added = sorted(set(new) - set(old))
+          gone = sorted(set(old) - set(new))
+          moved = sorted(
+              k for k in set(old) & set(new)
+              if abs(new[k]["p50_min"] - old[k]["p50_min"]) > 0.5 * max(old[k]["p50_min"], 0.1)
+          )
+          print(f"{len(new)} configs ({len(added)} new, {len(gone)} gone, {len(moved)} with p50 moved >50%).")
+          for title, keys in (("New", added), ("Gone", gone)):
+              if keys:
+                  print(f"\n**{title}:** " + ", ".join(f"`{k}`" for k in keys))
+          if moved:
+              print("\n| Config | p50 before | p50 now |\n|---|---|---|")
+              for k in moved:
+                  print(f"| `{k}` | {old[k]['p50_min']} | {new[k]['p50_min']} |")
+          PYEOF
+          )"
+          # The commit is made through the API, not `git commit`: the runner has no signing key,
+          # and GitHub signs a commit it creates for the app token (shown Verified, as main's
+          # required_signatures expects). The branch is reset to main's head each week.
+          BASE_SHA="$(git rev-parse HEAD)"
+          BLOB_SHA="$(gh api "repos/${GITHUB_REPOSITORY}/git/blobs" -f encoding=base64 \
+            -f content="$(base64 -w0 .github/test_timings.json)" --jq .sha)"
+          TREE_SHA="$(gh api "repos/${GITHUB_REPOSITORY}/git/trees" -f base_tree="${BASE_SHA}" \
+            -f 'tree[][path]=.github/test_timings.json' -f 'tree[][mode]=100644' \
+            -f 'tree[][type]=blob' -f "tree[][sha]=${BLOB_SHA}" --jq .sha)"
+          COMMIT_SHA="$(gh api "repos/${GITHUB_REPOSITORY}/git/commits" -f tree="${TREE_SHA}" \
+            -f 'parents[]='"${BASE_SHA}" \
+            -f message="$(printf 'ci(tests): refresh test_timings.json from ClickHouse\n\nSigned-off-by: spyre-bot[bot] <spyre-bot[bot]@users.noreply.github.com>')" \
+            --jq .sha)"
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${BRANCH}" >/dev/null 2>&1; then
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/git/refs/heads/${BRANCH}" \
+              -f sha="${COMMIT_SHA}" -F force=true >/dev/null
+          else
+            gh api "repos/${GITHUB_REPOSITORY}/git/refs" -f ref="refs/heads/${BRANCH}" \
+              -f sha="${COMMIT_SHA}" >/dev/null
+          fi
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          BODY="Weekly regeneration of \`.github/test_timings.json\` by \`tests/scripts/refresh_test_timings.py\` (run ${RUN_URL}).
+
+          ${SUMMARY}"
+          if gh pr view "${BRANCH}" --json state --jq .state 2>/dev/null | grep -q OPEN; then
+            gh pr edit "${BRANCH}" --body "${BODY}"
+          else
+            gh pr create --head "${BRANCH}" --base main \
+              --title "ci(tests): refresh test timings" --body "${BODY}"
+          fi
