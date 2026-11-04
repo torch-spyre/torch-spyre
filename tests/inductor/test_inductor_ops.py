@@ -2080,8 +2080,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
         },
         ("test_topk", "test_topk_cpu"): {
-            # 4d_k32_dim2: incorrect output mapping due to tensor size; see #5101
-            "skip": ["4d_k32_dim2"],
             "param_sets": {
                 "2d_k1_dim0": (unique_randn_along_dim((64, 256), dim=0), 1, 0),
                 "2d_k4_dim0": (unique_randn_along_dim((64, 256), dim=0), 4, 0),
