@@ -555,26 +555,23 @@ def test_integral_promotes_on_device(op_name, dtype, cast_offloads):
     torch.testing.assert_close(out, expected, atol=1e-4, rtol=1e-4)
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.parametrize("dtype, tol", _UPCAST_DTYPES)
 @pytest.mark.parametrize("op_name", ["cos", "sin"])
-def test_low_precision_odd_stick_count_rejected(op_name, dtype):
-    """The fp32 upcast at an odd fp32-stick count is rejected, not computed wrongly.
+def test_low_precision_odd_stick_count(op_name, dtype, tol):
+    """The fp32 upcast stays accurate at an odd number of fp32 sticks.
 
     (2, 3, 32) spans an odd number of fp32 sticks, so the closing fp32 ->
-    fp16/bf16 cast cannot rescale the device layout to whole fp16 sticks, and the
-    compiler says so ("cannot rescale device layout", #3809).  A bare
-    ``(x.float() * 2.0).to(dtype)`` on this shape is rejected the same way with no
-    cos/sin in the graph, so this is the backend cast and not the decomposition.
-    If the cast is ever supported this stops raising and has to become a positive
-    test.
-
+    fp16/bf16 cast narrows a stick dim that does not fill whole fp16 sticks.
     Every shape in ``_SPYRE_SHAPES`` has an even fp32-stick count, which is why
-    the rest of the suite cannot see this.
+    the rest of the suite cannot see this. Scored like
+    ``test_low_precision_compiles_and_accurate``, against the input as the device
+    holds it.
     """
     op = getattr(torch, op_name)
     x = torch.linspace(-3.0, 3.0, 192, dtype=dtype).reshape(2, 3, 32)
-    with pytest.raises(Exception, match="cannot rescale device layout"):
-        _compile_on_spyre(op, x)
+    held = x.to("spyre").cpu()
+    out = _compile_on_spyre(op, x)
+    torch.testing.assert_close(out, op(held.double()).to(dtype), atol=tol, rtol=tol)
 
 
 def test_cos_sin_non_contiguous():
