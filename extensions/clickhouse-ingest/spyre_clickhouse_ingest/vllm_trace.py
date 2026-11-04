@@ -482,8 +482,9 @@ def entries(ctx: dict, bundle_url: str = "") -> list[dict]:
         )
 
     comp = res.get("compile") or {}
+    # by_pass values are {self_s, n}, or bare self seconds in older bundles.
     passes = {
-        n: (v.get("self_s"), v.get("n") or 0)
+        n: (v.get("self_s"), v.get("n") or 0) if isinstance(v, dict) else (v, 0)
         for n, v in (comp.get("by_pass") or {}).items()
     } or {
         n: (v, 0)

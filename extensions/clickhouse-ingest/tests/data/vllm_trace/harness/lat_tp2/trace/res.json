@@ -1,17 +1,49 @@
 {
+ "compile": {
+  "by_pass": {
+   "Post:b": {
+    "n": 2,
+    "self_s": 2.0
+   },
+   "Pre:a": {
+    "n": 2,
+    "self_s": 4.0
+   }
+  },
+  "kernel_cache": {
+   "entries": 4,
+   "hits": 2,
+   "misses": 2
+  },
+  "n_compiles": 2,
+  "source": "compile_summary",
+  "total_s": 8.0
+ },
+ "compile_summary": {
+  "cache": {
+   "entries": 4,
+   "hits": 2,
+   "misses": 2
+  },
+  "passes": {
+   "Post:b": 2.0,
+   "Pre:a": 4.0
+  },
+  "total_s": 8.0
+ },
  "device_memory": null,
  "label": "lat_tp2",
  "phases": {
   "compile_warmup": {
-   "cg_mem_peak_b": null,
-   "cpu_cores_mean": null,
-   "cpu_cores_peak": null,
-   "cpu_s": null,
+   "cg_mem_peak_b": 1000000000.0,
+   "cpu_cores_mean": 1.0,
+   "cpu_cores_peak": 1.0,
+   "cpu_s": 1.0,
    "dev_allocated_peak_b": null,
    "dev_max_allocated_b": null,
-   "n_samples": 0,
+   "n_samples": 1,
    "nr_throttled": null,
-   "rss_peak_b": null,
+   "rss_peak_b": 500000000.0,
    "throttled_s": null,
    "wall_s": 0.5
   },
@@ -28,19 +60,6 @@
    "throttled_s": null,
    "wall_s": 0.5
   },
-  "post": {
-   "cg_mem_peak_b": null,
-   "cpu_cores_mean": null,
-   "cpu_cores_peak": null,
-   "cpu_s": null,
-   "dev_allocated_peak_b": null,
-   "dev_max_allocated_b": null,
-   "n_samples": 0,
-   "nr_throttled": null,
-   "rss_peak_b": null,
-   "throttled_s": null,
-   "wall_s": 0.0
-  },
   "prefill": {
    "cg_mem_peak_b": null,
    "cpu_cores_mean": null,
@@ -54,42 +73,16 @@
    "throttled_s": null,
    "wall_s": 0.5
   },
-  "profiled": {
-   "cg_mem_peak_b": null,
-   "cpu_cores_mean": null,
-   "cpu_cores_peak": null,
-   "cpu_s": null,
-   "dev_allocated_peak_b": null,
-   "dev_max_allocated_b": null,
-   "n_samples": 0,
-   "nr_throttled": null,
-   "rss_peak_b": null,
-   "throttled_s": null,
-   "wall_s": 0.5
-  },
-  "ready": {
-   "cg_mem_peak_b": null,
-   "cpu_cores_mean": null,
-   "cpu_cores_peak": null,
-   "cpu_s": null,
-   "dev_allocated_peak_b": null,
-   "dev_max_allocated_b": null,
-   "n_samples": 0,
-   "nr_throttled": null,
-   "rss_peak_b": null,
-   "throttled_s": null,
-   "wall_s": 0.5
-  },
   "warmup": {
-   "cg_mem_peak_b": null,
-   "cpu_cores_mean": null,
-   "cpu_cores_peak": null,
-   "cpu_s": null,
+   "cg_mem_peak_b": 1000000000.0,
+   "cpu_cores_mean": 3.0,
+   "cpu_cores_peak": 3.0,
+   "cpu_s": 1.5,
    "dev_allocated_peak_b": null,
    "dev_max_allocated_b": null,
-   "n_samples": 0,
+   "n_samples": 1,
    "nr_throttled": null,
-   "rss_peak_b": null,
+   "rss_peak_b": 500000000.0,
    "throttled_s": null,
    "wall_s": 0.5
   },

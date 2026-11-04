@@ -2,10 +2,12 @@
  "args": {
   "batch_size": 4,
   "bench_type": "latency",
-  "budget": 0,
+  "budget": 256,
   "dtype": "float16",
   "input_len": 128,
   "max_model_len": 256,
+  "max_num_batched_tokens": 256,
+  "max_num_seqs": 4,
   "model": "example-org/model-b",
   "output_len": 16,
   "tp": 2

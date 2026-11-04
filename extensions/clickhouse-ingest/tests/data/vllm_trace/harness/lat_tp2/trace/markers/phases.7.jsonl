@@ -1,8 +1,8 @@
-{"t": 1793776215.102926, "phase": "weight_load", "pid": 7}
-{"t": 1793776215.602926, "phase": "compile_warmup", "pid": 7}
-{"t": 1793776216.102926, "phase": "ready", "pid": 7}
-{"t": 1793776216.602926, "phase": "warmup", "pid": 7}
-{"t": 1793776217.102926, "phase": "profiled", "pid": 7}
-{"t": 1793776217.602926, "phase": "prefill", "pid": 7}
-{"t": 1793776218.102926, "phase": "decode", "pid": 7}
-{"t": 1793776218.602926, "phase": "post", "pid": 7}
+{"t": 1793777269.2255712, "phase": "weight_load", "pid": 7}
+{"t": 1793777269.7255712, "phase": "compile_warmup", "pid": 7}
+{"t": 1793777270.2255712, "phase": "ready", "pid": 7}
+{"t": 1793777270.7255712, "phase": "warmup", "pid": 7}
+{"t": 1793777271.2255712, "phase": "profiled", "pid": 7}
+{"t": 1793777271.7255712, "phase": "prefill", "pid": 7}
+{"t": 1793777272.2255712, "phase": "decode", "pid": 7}
+{"t": 1793777272.7255712, "phase": "post", "pid": 7}

@@ -313,25 +313,34 @@ def test_harness_bundle_records_profile_level_and_rank_count():
     assert p["profile_level"] == "full" and p["n_ranks"] == "2"
     assert p["tensor_parallel"] == "2" and p["artifact_id12"] == "dddddddddddd"
     assert json.loads(p["series_files"]) == {
-        "step_trace": "raw/dp0_pp0_tp0_rank0.123.pt.trace.json"
+        "host": "samples.jsonl",
+        "step_trace": "raw/dp0_pp0_tp0_rank0.123.pt.trace.json",
     }
     assert "profile_level" not in vllm_trace.entries(fleet_ctx())[0]["run_props"]
 
 
+def harness_ctx_with_a_mixed_kernel():
+    """The harness folds mixed steps into decode kernels; older roof.json had phase mixed."""
+    ctx = vllm_trace.load(HARNESS)
+    k = next(k for k in ctx["roof"]["kernels"] if k["phase"] == "decode")
+    ctx["roof"]["kernels"].append({**k, "phase": "mixed"})
+    return ctx
+
+
 def test_harness_mixed_steps_and_kernels_read_from_rank0():
-    rows = by_type(vllm_trace.entries(vllm_trace.load(HARNESS)))
+    rows = by_type(vllm_trace.entries(harness_ctx_with_a_mixed_kernel()))
     steps = {r["props"]["phase"]: r for r in rows["trace_step"]}
     assert set(steps) == {"prefill", "decode", "mixed"}
     assert steps["mixed"]["props"]["run_mode"] == "mixed"
     # Rank 1 has no spyre tags, so no mixed steps: only rank 0's counts are read.
-    assert (steps["mixed"]["iterations"], steps["decode"]["iterations"]) == (2, 2)
+    assert (steps["mixed"]["iterations"], steps["decode"]["iterations"]) == (2, 4)
     mixed = [k for k in rows["trace_kernel"] if k["props"]["phase"] == "mixed"]
     assert [k["props"]["run_mode"] for k in mixed] == ["mixed"]
     assert mixed[0]["run_props"]["run_mode"] == "mixed"
 
 
 def test_mixed_rows_leave_prefill_and_decode_ids_unchanged():
-    ctx = vllm_trace.load(HARNESS)
+    ctx = harness_ctx_with_a_mixed_kernel()
     with_mixed = {bench_id(r) for r in vllm_trace.entries(ctx)}
     ctx["host"].pop("mixed_summary")
     ctx["roof"]["kernels"] = [
@@ -339,3 +348,23 @@ def test_mixed_rows_leave_prefill_and_decode_ids_unchanged():
     ]
     without = {bench_id(r) for r in vllm_trace.entries(ctx)}
     assert without < with_mixed and len(with_mixed - without) == 2
+
+
+def test_harness_compile_block_gives_pass_rows_and_compile_props():
+    rows = vllm_trace.entries(vllm_trace.load(HARNESS))
+    p = rows[0]["run_props"]
+    assert (p["compile_total_s"], p["compile_n_compiles"]) == ("8.0", "2")
+    assert (p["compile_cache_entries"], p["compile_cache_hits"]) == ("4", "2")
+    passes = {
+        r["props"]["pass"]: (r["measurements"]["self_s"], r["iterations"])
+        for r in by_type(rows)["compile_pass"]
+    }
+    assert passes == {"Pre:a": ([4.0], 2), "Post:b": ([2.0], 2)}
+
+
+def test_by_pass_as_bare_seconds_still_reads():
+    ctx = vllm_trace.load(HARNESS)
+    ctx["res"]["compile"]["by_pass"] = {"pass:Pre:a": 1.5}
+    rows = by_type(vllm_trace.entries(ctx))["compile_pass"]
+    assert [(r["props"]["pass"], r["measurements"]["self_s"], r["iterations"])
+            for r in rows] == [("Pre:a", [1.5], 0)]  # fmt: skip
