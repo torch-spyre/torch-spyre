@@ -585,5 +585,98 @@ class TestGraphValidationErrorAttributes(unittest.TestCase):
         self.assertIs(err.violations[1], v2)
 
 
+# ---------------------------------------------------------------------------
+# Tests: LoopNode transparency
+# ---------------------------------------------------------------------------
+
+
+class TestLoopNodeTransparency(unittest.TestCase):
+    """Validator must descend into LoopNode wrappers and check leaf ops."""
+
+    def setUp(self):
+        self.graph = _enter_fresh_graph(self)
+
+    @staticmethod
+    def _make_loop_node(body):
+        from sympy import Symbol
+
+        from torch_spyre._inductor.loop_node import LoopNode
+
+        return LoopNode(
+            "loopnode0",
+            body,
+            induction=Symbol("i"),
+            trip_count=4,
+        )
+
+    def test_loop_node_is_transparent_to_inv4(self):
+        """A LoopNode wrapping properly registered leaf ops must not trigger
+        INV-4."""
+        buf = _make_buffer("placeholder")
+        _register_and_add_operation(self.graph, buf)
+        self.graph.operations.remove(buf)
+
+        node = self._make_loop_node([buf])
+        self.graph.operations.append(node)
+
+        validate_graph(self.graph)
+
+    def test_loop_node_leaf_violation_still_caught(self):
+        """INV-4 must still catch a leaf op inside a LoopNode whose
+        name_to_op entry is missing."""
+        buf = _make_buffer("placeholder")
+        name = _register_and_add_operation(self.graph, buf)
+        self.graph.operations.remove(buf)
+
+        node = self._make_loop_node([buf])
+        self.graph.operations.append(node)
+
+        del self.graph.name_to_op[name]
+
+        with self.assertRaises(GraphValidationError) as ctx:
+            validate_graph(self.graph)
+        self.assertIn("INV-4", str(ctx.exception))
+
+    def test_loop_node_transparent_to_inv10(self):
+        """INV-10 (duplicate operation names) must detect duplicates inside
+        a LoopNode."""
+        buf1 = _make_buffer("placeholder")
+        _register_and_add_operation(self.graph, buf1)
+        op_name = buf1.get_operation_name()
+
+        buf2 = _make_buffer("placeholder")
+        _register_and_add_operation(self.graph, buf2)
+        buf2.operation_name = op_name
+
+        self.graph.operations.remove(buf1)
+        self.graph.operations.remove(buf2)
+
+        node = self._make_loop_node([buf1, buf2])
+        self.graph.operations.append(node)
+
+        with self.assertRaises(GraphValidationError) as ctx:
+            validate_graph(self.graph)
+        self.assertIn("INV-10", str(ctx.exception))
+
+    def test_loop_node_transparent_to_inv5(self):
+        """INV-5 must catch a leaf op inside a LoopNode that reads from an
+        undefined buffer."""
+        buf = _make_buffer("placeholder")
+        _register_and_add_operation(self.graph, buf)
+        self.graph.operations.remove(buf)
+
+        mock_rw = _make_read_writes(
+            reads=["nonexistent_buffer"], writes=[buf.get_name()]
+        )
+        buf.get_read_writes = lambda: mock_rw
+
+        node = self._make_loop_node([buf])
+        self.graph.operations.append(node)
+
+        with self.assertRaises(GraphValidationError) as ctx:
+            validate_graph(self.graph)
+        self.assertIn("INV-5", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

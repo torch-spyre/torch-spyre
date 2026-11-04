@@ -42,15 +42,33 @@ Planned future work:
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     NoneAsConstantBuffer,
+    Operation,
     ShapeAsConstantBuffer,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _leaf_operations(graph: GraphLowering) -> Iterable[Operation]:
+    """Return the leaf operations of the graph, descending into ``LoopNode``s.
+
+    After ``splice_while_loops`` calls ``collapse()``, ``graph.operations``
+    contains ``LoopNode`` wrappers that are intentionally not registered in
+    ``name_to_op``.  The validator must check the leaf ops inside them, not the
+    nodes themselves.
+    """
+    from .loop_node import all_ops, has_loop_nodes
+
+    ops = graph.operations
+    if has_loop_nodes(ops):
+        return all_ops(ops)
+    return ops
 
 
 class GraphValidationError(ValueError):
@@ -231,7 +249,7 @@ def _check_name_to_op_consistency(
     graph: GraphLowering, pass_name: str
 ) -> list[GraphValidationError]:
     violations: list[GraphValidationError] = []
-    for op in graph.operations:
+    for op in _leaf_operations(graph):
         op_name = op.operation_name
         if op_name is None:
             violations.append(
@@ -282,7 +300,7 @@ def _check_operation_name_uniqueness(
     """
     violations: list[GraphValidationError] = []
     seen: dict[str, int] = {}
-    for i, op in enumerate(graph.operations):
+    for i, op in enumerate(_leaf_operations(graph)):
         op_name = op.operation_name
         if op_name is None:
             continue
@@ -321,13 +339,14 @@ def _check_reads_from_defined_buffers(
     defined = _defined_names(graph)
     removed = graph.removed_buffers
 
-    for op in graph.operations:
+    for op in _leaf_operations(graph):
+        op_label = op.operation_name if op.operation_name is not None else repr(op)
         try:
             rw = op.get_read_writes()
         except Exception as e:
             logger.debug(
                 "validate_graph: skipping read/write check for %r: %s",
-                op.get_name(),
+                op_label,
                 e,
             )
             continue
@@ -339,7 +358,7 @@ def _check_reads_from_defined_buffers(
                 violations.append(
                     GraphValidationError(
                         "INV-8: live operation reads from removed buffer",
-                        f"Operation {op.get_name()!r} reads buffer "
+                        f"Operation {op_label!r} reads buffer "
                         f"{name!r} which is in removed_buffers",
                         pass_name,
                     )
@@ -348,7 +367,7 @@ def _check_reads_from_defined_buffers(
                 violations.append(
                     GraphValidationError(
                         "INV-5: operation reads from undefined buffer",
-                        f"Operation {op.get_name()!r} reads buffer "
+                        f"Operation {op_label!r} reads buffer "
                         f"{name!r} which is not in name_to_buffer, "
                         f"graph_inputs, or constants",
                         pass_name,
