@@ -569,11 +569,15 @@ class TestSpyreTensorLayout(TestCase):
     ):
         x = torch.empty_strided(sizes, strides, dtype=torch.float16).uniform_(0, 1)
         x_sliced = x[sizes[0] // 2 :]
+        sliced_sizes = list(x_sliced.shape)
+        sliced_strides = list(x_sliced.stride())
         x_stl = SpyreTensorLayout(
             device_size,
             stride_map,
             get_device_dtype(torch.float16),
-            _valid_elements_from_host(sizes, strides, device_size, stride_map),
+            _valid_elements_from_host(
+                sliced_sizes, sliced_strides, device_size, stride_map
+            ),
         )
         x_dev = x_sliced.to(device_layout=x_stl)
         self.assertEqual(x_sliced, x_dev.cpu())

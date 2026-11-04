@@ -290,7 +290,7 @@ class TestDenseScatterSourceStl(unittest.TestCase):
             _ds,
             [256, 32768, 64, 262144, 1],
             get_device_dtype(torch.bfloat16),
-            {(0,): 8, (1,): 64, (2, 4): 128, (3,): 1},
+            {(0,): 128, (1,): 8, (2, 4): 256, (3,): 1},
             ElementArrangement.FP32_TO_DL16,
         )
         layout = FixedTiledLayout(

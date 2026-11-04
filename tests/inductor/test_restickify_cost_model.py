@@ -363,7 +363,7 @@ def test_real_layout_extraction_uses_device_order_and_invocation_extent(monkeypa
         device_size=_dst_ds,
         stride_map=[131072, 64, 1024, 1],
         device_dtype=DataFormats.SEN169_FP16,
-        valid_elements={(0,): 8, (1, 3): 128, (2,): 1024},
+        valid_elements={(0,): 8, (1, 3): 1024, (2,): 128},
     )
     read = MemoryDep("input", N * 1024 + B * 128 + X, (B, X, N), (8, 128, 1024))
     write = MemoryDep("output", B * 131072 + X * 1024 + N, (B, X, N), (8, 128, 1024))
@@ -446,7 +446,7 @@ def staged_transport_graph():
                 [131072, 1024, 1],
                 [8, 16, 128, 64],
                 [131072, 64, 1024, 1],
-                {(0,): 8, (1, 3): 128, (2,): 1024},
+                {(0,): 8, (1, 3): 1024, (2,): 128},
             ),
             data=Pointwise(
                 device=device,
