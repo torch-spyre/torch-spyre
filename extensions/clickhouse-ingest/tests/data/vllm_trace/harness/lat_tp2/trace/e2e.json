@@ -1,0 +1,15 @@
+{
+ "args": {
+  "batch_size": 4,
+  "bench_type": "latency",
+  "budget": 0,
+  "dtype": "float16",
+  "input_len": 128,
+  "max_model_len": 256,
+  "model": "example-org/model-b",
+  "output_len": 16,
+  "tp": 2
+ },
+ "e2e_s": 0.01101,
+ "profile_level": "full"
+}

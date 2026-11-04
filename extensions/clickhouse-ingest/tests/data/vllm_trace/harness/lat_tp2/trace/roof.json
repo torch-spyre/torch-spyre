@@ -1,0 +1,40 @@
+{
+ "kernels": [
+  {
+   "aten": [],
+   "calls": 2,
+   "key": "k_decode",
+   "median_us": 400.0,
+   "phase": "decode",
+   "steps_per_call": 1,
+   "total_ms": 0.8
+  },
+  {
+   "aten": [],
+   "calls": 2,
+   "key": "k_decode",
+   "median_us": 400.0,
+   "phase": "mixed",
+   "steps_per_call": 1,
+   "total_ms": 0.8
+  },
+  {
+   "aten": [],
+   "calls": 1,
+   "key": "k_prefill",
+   "median_us": 400.0,
+   "phase": "prefill",
+   "steps_per_call": 1,
+   "total_ms": 0.4
+  }
+ ],
+ "params": {
+  "cost_records": 0,
+  "skip_first_decode": 1
+ },
+ "schema": 1,
+ "unjoined_keys": [
+  "k_decode",
+  "k_prefill"
+ ]
+}

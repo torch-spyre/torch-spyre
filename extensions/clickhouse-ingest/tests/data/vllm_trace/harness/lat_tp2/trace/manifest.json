@@ -1,0 +1,39 @@
+{
+ "absent": {
+  "device_memory": "no devmem samples from the workers",
+  "kernel_cost": "torch-spyre wrote no kernel_cost.*.jsonl"
+ },
+ "artifact": {
+  "arch": "x86_64",
+  "artifact_id": "dddddddd-dddd-5ddd-8ddd-dddddddddddd",
+  "id12": "dddddddddddd"
+ },
+ "bench_type": "latency",
+ "created_utc": "2026-11-04T07:10:18Z",
+ "env": {
+  "_missing": {},
+  "arch": "x86_64",
+  "host": "node-a"
+ },
+ "label": "lat_tp2",
+ "profile_level": "full",
+ "profiler_config": {
+  "ignore_frontend": true,
+  "profiler": "torch",
+  "torch_profiler_activities": [
+   "CPU",
+   "PrivateUse1"
+  ],
+  "torch_profiler_dir": "/results/lat_tp2/trace/raw",
+  "torch_profiler_dump_cuda_time_total": false,
+  "torch_profiler_record_shapes": true,
+  "torch_profiler_with_memory": true,
+  "torch_profiler_with_stack": false
+ },
+ "schema": 1,
+ "test_name": "lat_tp2",
+ "traces": [
+  "raw/dp0_pp0_tp0_rank0.123.pt.trace.json",
+  "raw/dp0_pp0_tp0_rank1.123.pt.trace.json"
+ ]
+}

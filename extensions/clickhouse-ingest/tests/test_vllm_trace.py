@@ -29,6 +29,8 @@ PVC = DATA / "pvc"
 PVC_RUN = "20261103T000544-b512"
 AID = "aaaaaaaa-aaaa-5aaa-8aaa-aaaaaaaaaaaa"
 TRACE_TYPES = ("trace_phase", "trace_step", "trace_kernel", "compile_pass")
+# Written by spyre-inference's run_vllm_benchmarks.py --profile-level full with vllm mocked (TP=2).
+HARNESS = DATA / "harness" / "lat_tp2" / "trace"
 
 
 def fleet_ctx(**kw):
@@ -296,3 +298,44 @@ def test_cli_rejects_a_bundle_with_no_artifact(tmp_path, capsys):
     rc = cli(["vllm-trace", str(tmp_path / "w1"), "--analyzed", str(FLEET / "rep"),
               "--label", "w1", "--dry-run"])  # fmt: skip
     assert rc == 2 and "no artifact" in capsys.readouterr().out
+
+
+def test_harness_bundle_label_comes_from_the_manifest_not_the_trace_dir():
+    ctx = vllm_trace.load(HARNESS)
+    assert ctx["label"] == "lat_tp2" and HARNESS.name == "trace"
+    p = vllm_trace.entries(ctx)[0]["run_props"]
+    assert p["trace_label"] == "lat_tp2" and p["source_file"] == "vllm-trace/lat_tp2"
+    assert vllm_trace.load(HARNESS, label="other")["label"] == "other"
+
+
+def test_harness_bundle_records_profile_level_and_rank_count():
+    p = vllm_trace.entries(vllm_trace.load(HARNESS))[0]["run_props"]
+    assert p["profile_level"] == "full" and p["n_ranks"] == "2"
+    assert p["tensor_parallel"] == "2" and p["artifact_id12"] == "dddddddddddd"
+    assert json.loads(p["series_files"]) == {
+        "step_trace": "raw/dp0_pp0_tp0_rank0.123.pt.trace.json"
+    }
+    assert "profile_level" not in vllm_trace.entries(fleet_ctx())[0]["run_props"]
+
+
+def test_harness_mixed_steps_and_kernels_read_from_rank0():
+    rows = by_type(vllm_trace.entries(vllm_trace.load(HARNESS)))
+    steps = {r["props"]["phase"]: r for r in rows["trace_step"]}
+    assert set(steps) == {"prefill", "decode", "mixed"}
+    assert steps["mixed"]["props"]["run_mode"] == "mixed"
+    # Rank 1 has no spyre tags, so no mixed steps: only rank 0's counts are read.
+    assert (steps["mixed"]["iterations"], steps["decode"]["iterations"]) == (2, 2)
+    mixed = [k for k in rows["trace_kernel"] if k["props"]["phase"] == "mixed"]
+    assert [k["props"]["run_mode"] for k in mixed] == ["mixed"]
+    assert mixed[0]["run_props"]["run_mode"] == "mixed"
+
+
+def test_mixed_rows_leave_prefill_and_decode_ids_unchanged():
+    ctx = vllm_trace.load(HARNESS)
+    with_mixed = {bench_id(r) for r in vllm_trace.entries(ctx)}
+    ctx["host"].pop("mixed_summary")
+    ctx["roof"]["kernels"] = [
+        k for k in ctx["roof"]["kernels"] if k["phase"] != "mixed"
+    ]
+    without = {bench_id(r) for r in vllm_trace.entries(ctx)}
+    assert without < with_mixed and len(with_mixed - without) == 2

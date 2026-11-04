@@ -1,0 +1,382 @@
+[
+ {
+  "decode_summary": {
+   "busy_ms": 0.4,
+   "busy_pct": 40.0,
+   "d2h_kb_per_step": 0.0,
+   "d2h_per_step": 0.0,
+   "fallback_ms_per_step": 0.0,
+   "fallback_ops": {},
+   "fallback_per_step": 0.0,
+   "gaps_per_step": 2.0,
+   "h2d_kb_per_step": 0.0,
+   "h2d_per_step": 0.0,
+   "host_exposed_ms": 0.6,
+   "launches_per_step": 1.0,
+   "n": 2,
+   "sync_ms_per_step": 0.0,
+   "wall_ms": 1.0,
+   "waterfall_ms_per_step": {
+    "launch": 0.05,
+    "python": 0.55
+   }
+  },
+  "mixed_summary": {
+   "busy_ms": 0.4,
+   "busy_pct": 40.0,
+   "d2h_kb_per_step": 0.0,
+   "d2h_per_step": 0.0,
+   "fallback_ms_per_step": 0.0,
+   "fallback_ops": {},
+   "fallback_per_step": 0.0,
+   "gaps_per_step": 2.0,
+   "h2d_kb_per_step": 0.0,
+   "h2d_per_step": 0.0,
+   "host_exposed_ms": 0.6,
+   "launches_per_step": 1.0,
+   "n": 2,
+   "sync_ms_per_step": 0.0,
+   "wall_ms": 1.0,
+   "waterfall_ms_per_step": {
+    "launch": 0.05,
+    "python": 0.55
+   }
+  },
+  "prefill_summary": {
+   "busy_ms": 0.4,
+   "busy_pct": 40.0,
+   "d2h_kb_per_step": 0.0,
+   "d2h_per_step": 0.0,
+   "fallback_ms_per_step": 0.0,
+   "fallback_ops": {},
+   "fallback_per_step": 0.0,
+   "gaps_per_step": 2.0,
+   "h2d_kb_per_step": 0.0,
+   "h2d_per_step": 0.0,
+   "host_exposed_ms": 0.6,
+   "launches_per_step": 1.0,
+   "n": 1,
+   "sync_ms_per_step": 0.0,
+   "wall_ms": 1.0,
+   "waterfall_ms_per_step": {
+    "launch": 0.05,
+    "python": 0.55
+   }
+  },
+  "steps": [
+   {
+    "busy_us": 400.0,
+    "d2h": 0,
+    "d2h_bytes": 0,
+    "fallback_n": 0,
+    "fallback_ops": {},
+    "fallback_us": 0,
+    "gap_attrib_us": {
+     "launch": 50.0,
+     "python": 550.0
+    },
+    "h2d": 0,
+    "h2d_bytes": 0,
+    "idle_us": 600.0,
+    "kind": "prefill",
+    "launches": 1,
+    "n_gaps": 2,
+    "step": "spyre::prefill:128",
+    "sync_us": 0,
+    "tokens": 128,
+    "wall_us": 1000.0
+   },
+   {
+    "busy_us": 400.0,
+    "d2h": 0,
+    "d2h_bytes": 0,
+    "fallback_n": 0,
+    "fallback_ops": {},
+    "fallback_us": 0,
+    "gap_attrib_us": {
+     "launch": 50.0,
+     "python": 550.0
+    },
+    "h2d": 0,
+    "h2d_bytes": 0,
+    "idle_us": 600.0,
+    "kind": "decode",
+    "launches": 1,
+    "n_gaps": 2,
+    "step": "spyre::decode:4",
+    "sync_us": 0,
+    "tokens": 4,
+    "wall_us": 1000.0
+   },
+   {
+    "busy_us": 400.0,
+    "d2h": 0,
+    "d2h_bytes": 0,
+    "fallback_n": 0,
+    "fallback_ops": {},
+    "fallback_us": 0,
+    "gap_attrib_us": {
+     "launch": 50.0,
+     "python": 550.0
+    },
+    "h2d": 0,
+    "h2d_bytes": 0,
+    "idle_us": 600.0,
+    "kind": "decode",
+    "launches": 1,
+    "n_gaps": 2,
+    "step": "spyre::decode:4",
+    "sync_us": 0,
+    "tokens": 4,
+    "wall_us": 1000.0
+   },
+   {
+    "busy_us": 400.0,
+    "d2h": 0,
+    "d2h_bytes": 0,
+    "fallback_n": 0,
+    "fallback_ops": {},
+    "fallback_us": 0,
+    "gap_attrib_us": {
+     "launch": 50.0,
+     "python": 550.0
+    },
+    "h2d": 0,
+    "h2d_bytes": 0,
+    "idle_us": 600.0,
+    "kind": "mixed",
+    "launches": 1,
+    "n_gaps": 2,
+    "step": "spyre::mixed:36",
+    "sync_us": 0,
+    "tokens": 36,
+    "wall_us": 1000.0
+   },
+   {
+    "busy_us": 400.0,
+    "d2h": 0,
+    "d2h_bytes": 0,
+    "fallback_n": 0,
+    "fallback_ops": {},
+    "fallback_us": 0,
+    "gap_attrib_us": {
+     "launch": 50.0,
+     "python": 550.0
+    },
+    "h2d": 0,
+    "h2d_bytes": 0,
+    "idle_us": 600.0,
+    "kind": "decode",
+    "launches": 1,
+    "n_gaps": 2,
+    "step": "spyre::decode:4",
+    "sync_us": 0,
+    "tokens": 4,
+    "wall_us": 1000.0
+   },
+   {
+    "busy_us": 400.0,
+    "d2h": 0,
+    "d2h_bytes": 0,
+    "fallback_n": 0,
+    "fallback_ops": {},
+    "fallback_us": 0,
+    "gap_attrib_us": {
+     "launch": 50.0,
+     "python": 550.0
+    },
+    "h2d": 0,
+    "h2d_bytes": 0,
+    "idle_us": 600.0,
+    "kind": "mixed",
+    "launches": 1,
+    "n_gaps": 2,
+    "step": "spyre::mixed:36",
+    "sync_us": 0,
+    "tokens": 36,
+    "wall_us": 1000.0
+   }
+  ],
+  "trace": "raw/dp0_pp0_tp0_rank0.123.pt.trace.json"
+ },
+ {
+  "decode_summary": {
+   "busy_ms": 0.4,
+   "busy_pct": 40.0,
+   "d2h_kb_per_step": 0.0,
+   "d2h_per_step": 0.0,
+   "fallback_ms_per_step": 0.0,
+   "fallback_ops": {},
+   "fallback_per_step": 0.0,
+   "gaps_per_step": 2.0,
+   "h2d_kb_per_step": 0.0,
+   "h2d_per_step": 0.0,
+   "host_exposed_ms": 0.6,
+   "launches_per_step": 1.0,
+   "n": 4,
+   "sync_ms_per_step": 0.0,
+   "wall_ms": 1.0,
+   "waterfall_ms_per_step": {
+    "launch": 0.05,
+    "python": 0.55
+   }
+  },
+  "mixed_summary": {},
+  "prefill_summary": {
+   "busy_ms": 0.4,
+   "busy_pct": 40.0,
+   "d2h_kb_per_step": 0.0,
+   "d2h_per_step": 0.0,
+   "fallback_ms_per_step": 0.0,
+   "fallback_ops": {},
+   "fallback_per_step": 0.0,
+   "gaps_per_step": 2.0,
+   "h2d_kb_per_step": 0.0,
+   "h2d_per_step": 0.0,
+   "host_exposed_ms": 0.6,
+   "launches_per_step": 1.0,
+   "n": 1,
+   "sync_ms_per_step": 0.0,
+   "wall_ms": 1.0,
+   "waterfall_ms_per_step": {
+    "launch": 0.05,
+    "python": 0.55
+   }
+  },
+  "steps": [
+   {
+    "busy_us": 400.0,
+    "d2h": 0,
+    "d2h_bytes": 0,
+    "fallback_n": 0,
+    "fallback_ops": {},
+    "fallback_us": 0,
+    "gap_attrib_us": {
+     "launch": 50.0,
+     "python": 550.0
+    },
+    "h2d": 0,
+    "h2d_bytes": 0,
+    "idle_us": 600.0,
+    "kind": "prefill",
+    "launches": 1,
+    "n_gaps": 2,
+    "step": "execute_context_1(128)_generation_0(0)",
+    "sync_us": 0,
+    "tokens": 128,
+    "wall_us": 1000.0
+   },
+   {
+    "busy_us": 400.0,
+    "d2h": 0,
+    "d2h_bytes": 0,
+    "fallback_n": 0,
+    "fallback_ops": {},
+    "fallback_us": 0,
+    "gap_attrib_us": {
+     "launch": 50.0,
+     "python": 550.0
+    },
+    "h2d": 0,
+    "h2d_bytes": 0,
+    "idle_us": 600.0,
+    "kind": "decode",
+    "launches": 1,
+    "n_gaps": 2,
+    "step": "execute_context_0(0)_generation_4(4)",
+    "sync_us": 0,
+    "tokens": 4,
+    "wall_us": 1000.0
+   },
+   {
+    "busy_us": 400.0,
+    "d2h": 0,
+    "d2h_bytes": 0,
+    "fallback_n": 0,
+    "fallback_ops": {},
+    "fallback_us": 0,
+    "gap_attrib_us": {
+     "launch": 50.0,
+     "python": 550.0
+    },
+    "h2d": 0,
+    "h2d_bytes": 0,
+    "idle_us": 600.0,
+    "kind": "decode",
+    "launches": 1,
+    "n_gaps": 2,
+    "step": "execute_context_0(0)_generation_4(4)",
+    "sync_us": 0,
+    "tokens": 4,
+    "wall_us": 1000.0
+   },
+   {
+    "busy_us": 400.0,
+    "d2h": 0,
+    "d2h_bytes": 0,
+    "fallback_n": 0,
+    "fallback_ops": {},
+    "fallback_us": 0,
+    "gap_attrib_us": {
+     "launch": 50.0,
+     "python": 550.0
+    },
+    "h2d": 0,
+    "h2d_bytes": 0,
+    "idle_us": 600.0,
+    "kind": "decode",
+    "launches": 1,
+    "n_gaps": 2,
+    "step": "execute_context_0(0)_generation_4(4)",
+    "sync_us": 0,
+    "tokens": 4,
+    "wall_us": 1000.0
+   },
+   {
+    "busy_us": 400.0,
+    "d2h": 0,
+    "d2h_bytes": 0,
+    "fallback_n": 0,
+    "fallback_ops": {},
+    "fallback_us": 0,
+    "gap_attrib_us": {
+     "launch": 50.0,
+     "python": 550.0
+    },
+    "h2d": 0,
+    "h2d_bytes": 0,
+    "idle_us": 600.0,
+    "kind": "decode",
+    "launches": 1,
+    "n_gaps": 2,
+    "step": "execute_context_0(0)_generation_4(4)",
+    "sync_us": 0,
+    "tokens": 4,
+    "wall_us": 1000.0
+   },
+   {
+    "busy_us": 400.0,
+    "d2h": 0,
+    "d2h_bytes": 0,
+    "fallback_n": 0,
+    "fallback_ops": {},
+    "fallback_us": 0,
+    "gap_attrib_us": {
+     "launch": 50.0,
+     "python": 550.0
+    },
+    "h2d": 0,
+    "h2d_bytes": 0,
+    "idle_us": 600.0,
+    "kind": "decode",
+    "launches": 1,
+    "n_gaps": 2,
+    "step": "execute_context_0(0)_generation_4(4)",
+    "sync_us": 0,
+    "tokens": 4,
+    "wall_us": 1000.0
+   }
+  ],
+  "trace": "raw/dp0_pp0_tp0_rank1.123.pt.trace.json"
+ }
+]

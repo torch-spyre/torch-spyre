@@ -1,0 +1,111 @@
+{
+ "device_memory": null,
+ "label": "lat_tp2",
+ "phases": {
+  "compile_warmup": {
+   "cg_mem_peak_b": null,
+   "cpu_cores_mean": null,
+   "cpu_cores_peak": null,
+   "cpu_s": null,
+   "dev_allocated_peak_b": null,
+   "dev_max_allocated_b": null,
+   "n_samples": 0,
+   "nr_throttled": null,
+   "rss_peak_b": null,
+   "throttled_s": null,
+   "wall_s": 0.5
+  },
+  "decode": {
+   "cg_mem_peak_b": null,
+   "cpu_cores_mean": null,
+   "cpu_cores_peak": null,
+   "cpu_s": null,
+   "dev_allocated_peak_b": null,
+   "dev_max_allocated_b": null,
+   "n_samples": 0,
+   "nr_throttled": null,
+   "rss_peak_b": null,
+   "throttled_s": null,
+   "wall_s": 0.5
+  },
+  "post": {
+   "cg_mem_peak_b": null,
+   "cpu_cores_mean": null,
+   "cpu_cores_peak": null,
+   "cpu_s": null,
+   "dev_allocated_peak_b": null,
+   "dev_max_allocated_b": null,
+   "n_samples": 0,
+   "nr_throttled": null,
+   "rss_peak_b": null,
+   "throttled_s": null,
+   "wall_s": 0.0
+  },
+  "prefill": {
+   "cg_mem_peak_b": null,
+   "cpu_cores_mean": null,
+   "cpu_cores_peak": null,
+   "cpu_s": null,
+   "dev_allocated_peak_b": null,
+   "dev_max_allocated_b": null,
+   "n_samples": 0,
+   "nr_throttled": null,
+   "rss_peak_b": null,
+   "throttled_s": null,
+   "wall_s": 0.5
+  },
+  "profiled": {
+   "cg_mem_peak_b": null,
+   "cpu_cores_mean": null,
+   "cpu_cores_peak": null,
+   "cpu_s": null,
+   "dev_allocated_peak_b": null,
+   "dev_max_allocated_b": null,
+   "n_samples": 0,
+   "nr_throttled": null,
+   "rss_peak_b": null,
+   "throttled_s": null,
+   "wall_s": 0.5
+  },
+  "ready": {
+   "cg_mem_peak_b": null,
+   "cpu_cores_mean": null,
+   "cpu_cores_peak": null,
+   "cpu_s": null,
+   "dev_allocated_peak_b": null,
+   "dev_max_allocated_b": null,
+   "n_samples": 0,
+   "nr_throttled": null,
+   "rss_peak_b": null,
+   "throttled_s": null,
+   "wall_s": 0.5
+  },
+  "warmup": {
+   "cg_mem_peak_b": null,
+   "cpu_cores_mean": null,
+   "cpu_cores_peak": null,
+   "cpu_s": null,
+   "dev_allocated_peak_b": null,
+   "dev_max_allocated_b": null,
+   "n_samples": 0,
+   "nr_throttled": null,
+   "rss_peak_b": null,
+   "throttled_s": null,
+   "wall_s": 0.5
+  },
+  "weight_load": {
+   "cg_mem_peak_b": null,
+   "cpu_cores_mean": null,
+   "cpu_cores_peak": null,
+   "cpu_s": null,
+   "dev_allocated_peak_b": null,
+   "dev_max_allocated_b": null,
+   "n_samples": 0,
+   "nr_throttled": null,
+   "rss_peak_b": null,
+   "throttled_s": null,
+   "wall_s": 0.5
+  }
+ },
+ "schema": 1
+}

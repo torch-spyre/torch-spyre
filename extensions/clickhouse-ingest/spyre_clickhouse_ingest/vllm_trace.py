@@ -240,7 +240,9 @@ def load(run_dir, analyzed=None, label="", **workload) -> dict:
     """Everything the rows need, from the run dir and its analyzed JSON."""
     run = Path(run_dir)
     ana = Path(analyzed) if analyzed else run
-    label = label or run.name
+    manifest = _json(run / "manifest.json") if (run / "manifest.json").is_file() else {}
+    # Harness bundles all sit in a dir named `trace`: their manifest names the run.
+    label = label or manifest.get("label") or run.name
     found = {}
     for kind in ("res", "roof", "host"):
         for p in (ana / f"{label}.{kind}.json", ana / f"{kind}.json"):
@@ -250,10 +252,12 @@ def load(run_dir, analyzed=None, label="", **workload) -> dict:
     if not found:
         raise TraceError(f"no {label}.res/roof/host.json in {ana}")
     host = found.get("host")
+    n_ranks = len(host) if isinstance(host, list) else None
     if isinstance(host, list):
         host = host[0] if host else None
     art, env = _artifact(run)
-    args = (_first_json(run, "e2e.json") or {}).get("args", {})
+    e2e_json = _first_json(run, "e2e.json") or {}
+    args = e2e_json.get("args", {})
     w = {
         "model": workload.get("model") or args.get("model"),
         "tp": workload.get("tp") or args.get("tp"),
@@ -284,6 +288,8 @@ def load(run_dir, analyzed=None, label="", **workload) -> dict:
         "run_utc": _run_utc(run),
         "compile_summary": _first_json(run, "compile_summary.json"),
         "series_files": _series_files(run, (host or {}).get("trace") or ""),
+        "n_ranks": n_ranks,
+        "profile_level": manifest.get("profile_level") or e2e_json.get("profile_level"),
     }
 
 
@@ -292,8 +298,8 @@ def _series_files(run: Path, trace: str) -> dict[str, str]:
     out = {}
     for key, pats in (
         ("host", ("samples.jsonl",)),
-        ("devmem", ("devmem.jsonl",)),
-        ("step_trace", ("traces/*.json", "traces/*.json.gz")),
+        ("devmem", ("devmem.jsonl", "markers/devmem.*.jsonl")),
+        ("step_trace", ("traces/*.json", "traces/*.json.gz", "raw/*.pt.trace.json*")),
     ):
         found = sorted(
             q for d in (run, run / "rank0") for pat in pats for q in d.glob(pat)
@@ -331,6 +337,8 @@ def run_props(ctx: dict, bundle_url: str = "") -> dict[str, str]:
         ("output_len", w["output_len"]),
         *((k, w.get(k)) for k in (*ENGINE_LIMITS, "dtype", "task")),
         ("compile_n_compiles", comp.get("n_compiles")),
+        ("profile_level", ctx.get("profile_level")),
+        ("n_ranks", ctx.get("n_ranks")),
         ("dev_mem_total_b", (res.get("device_memory") or {}).get("total_b")),
         (
             "series_files",
@@ -412,7 +420,7 @@ def entries(ctx: dict, bundle_url: str = "") -> list[dict]:
 
     host = ctx["host"] or {}
     steps = res.get("steps") or {}
-    for kind in ("prefill", "decode"):
+    for kind in ("prefill", "decode", "mixed"):
         s = host.get(f"{kind}_summary") or steps.get(kind) or {}
         m = _measure(s, STEP_FIELDS)
         waterfall = s.get("waterfall_ms_per_step")
