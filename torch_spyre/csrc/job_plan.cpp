@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "spyre_composite_address.h"
+#include "spyre_mem.h"
 #include "spyre_stream.h"
 
 namespace spyre {
@@ -86,7 +87,8 @@ void JobPlanStepD2H::construct(LaunchContext& ctx,
         flex::createDmaParams(host_address_, device_address->total_size(),
                               /*to_device=*/false, device_address.get());
     params->pipeline_barrier = pipeline_barrier_;
-    params->callback = [device_address](void*) {};
+    params->callback = [device_address](void*,
+                                        const flex::FlexCallbackMetadata*) {};
     stream.launchD2H(params);
     flex::destroyDmaParams(params);
   }
@@ -146,6 +148,12 @@ std::vector<flex::HostComputeArg> JobPlanStepHostCompute::resolveSymbolicArgs(
     switch (arg.kind) {
       case SymbolicArgKind::kAddress:
         resolved[i] = get_composite_address(tensors[arg.tensor_id]);
+        break;
+      case SymbolicArgKind::kShardAddress:
+        // dim_index = core (= shard), value = expected per-shard bytes,
+        // num_shards = expected shard count; all checked against the tensor.
+        resolved[i] = static_cast<int64_t>(shard_device_address(
+            tensors[arg.tensor_id], arg.dim_index, arg.num_shards, arg.value));
         break;
       case SymbolicArgKind::kDimension:
         TORCH_CHECK(false,
@@ -215,7 +223,8 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
   dma_params->pipeline_barrier = pipeline_barrier_;
   // The managed buffer is freed when the callback is destroyed, which happens
   // after the DMA completes or is cancelled.
-  dma_params->callback = [host_buffer](void*) {};
+  dma_params->callback = [host_buffer](void*,
+                                       const flex::FlexCallbackMetadata*) {};
 
   try {
     stream.launchH2D(dma_params);

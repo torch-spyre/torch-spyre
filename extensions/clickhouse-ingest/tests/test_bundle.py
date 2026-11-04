@@ -509,9 +509,31 @@ PROD_IDS = {
 MODEL = "ibm-ai-platform/micro-g3.3-8b-instruct-1b"
 
 
-def _vllm(tmp_path, *extra):
+HOST_METRICS = {
+    "latency_granite8B_tp1_in64_out64": [
+        ("host_cpu_pct_total_mean", 42.1),
+        ("host_mem_mb_peak", 2048.0),
+        ("compile_host_cpu_pct_total_mean", 77.5),
+    ],
+    "throughput_granite8B_tp1_in64_out64": [("host_cpu_pct_total_mean", 55.0)],
+}
+
+
+def _vllm(tmp_path, *extra, host_resources=False):
+    """`results --offline` over the vLLM fixtures; host_resources adds the sampler's files."""
     src = tmp_path / "vllm-out"
     shutil.copytree(VLLM_DATA / "results", src)
+    if host_resources:
+        for name, metrics in HOST_METRICS.items():
+            (src / f"{name}.host_resources.json").write_text(
+                "".join(
+                    json.dumps(
+                        {"test_name": name, "metric": m, "value": v, "model": MODEL}
+                    )
+                    + "\n"
+                    for m, v in metrics
+                )
+            )
     shutil.copy(VLLM_DATA / "attachments" / "latency_granite8B_tp1_in64_out64.cmd", src)
     out = tmp_path / "perf"
     argv = ["results", "--offline", "--out", str(out), "--vllm-results-dir", str(src),
@@ -657,6 +679,127 @@ def test_a_native_file_alone_takes_its_model_from_perf(tmp_path):
     _edit(out, files=None)
     rows = bundle.vllm_rows(out, offline.check(out) | {"arch": "x86_64"})
     assert {json.loads(r["extra"])["model"] for r in rows} == {MODEL}
+
+
+def test_offline_vllm_bundle_carries_the_host_resources_files(tmp_path, capsys):
+    out = _vllm(tmp_path, host_resources=True)
+    paths = {f["path"] for f in _meta(out)["files"]}
+    assert {f"results/{name}.host_resources.json" for name in HOST_METRICS} <= paths
+    assert cli(["results", "--from-bundle", str(out), "--validate-only"]) == 0
+
+
+def test_offline_writes_a_tgz_with_host_resources_directly(tmp_path):
+    src = tmp_path / "vllm-out"
+    shutil.copytree(VLLM_DATA / "results", src)
+    name = "latency_granite8B_tp1_in64_out64"
+    (src / f"{name}.host_resources.json").write_text(
+        json.dumps({"test_name": name, "metric": "host_cpu_pct_total_mean", "value": 1})
+    )
+    tgz = tmp_path / "perf.tgz"
+    argv = ["results", "--offline", "--out", str(tgz), "--vllm-results-dir", str(src),
+            "--artifact", f"id:{AID}", "--arch", "x86_64"]  # fmt: skip
+    assert cli(argv) == 0
+    with tarfile.open(tgz) as tar:
+        assert any(n.endswith(f"{name}.host_resources.json") for n in tar.getnames())
+    assert cli(["results", "--from-bundle", str(tgz), "--validate-only"]) == 0
+
+
+@pytest.mark.parametrize(
+    "name, content, why",
+    [
+        ("latency_x.host_resources.json", '{"test_name": "latency_x"}', "no host resource"),
+        ("latency_x.host_resources.json", "", "no host resource"),
+        ("decode_tp1.host_resources.json", '{"metric": "m", "value": 1}', "must start with"),
+        (
+            "latency_x_tp4.host_resources.json",
+            '{"metric": "m", "value": 1}',
+            "differ from perf",
+        ),
+    ],
+)  # fmt: skip
+def test_a_bad_host_resources_file_rejects_the_bundle(tmp_path, name, content, why):
+    out = _vllm(tmp_path, host_resources=True)
+    (out / "results" / name).write_text(content)
+    _edit(out, perf={"tensor_parallel": "1"}, files=None)
+    assert why in _rejected(out)
+
+
+def test_a_vllm_bundle_with_host_resources_writes_them_onto_the_same_benchmarks(
+    tmp_path, monkeypatch, capsys
+):
+    """The host metrics land on the latency / throughput benchmarks the bench JSON makes: no
+    benchmark of their own, no new run, the bench measurements and the verdict untouched."""
+    from spyre_clickhouse_ingest import client, resolver, vllm
+
+    out = _vllm(tmp_path, host_resources=True)
+    ch = CapturingClient()
+    monkeypatch.setattr(client.ClickHouse, "connect", lambda **kw: ch)
+    monkeypatch.setattr(client, "tables_present", lambda *a, **kw: True)
+    monkeypatch.setattr(vllm, "tables_present", lambda *a, **kw: True)
+    monkeypatch.setattr(
+        resolver,
+        "resolve",
+        lambda *a, **kw: _resolution(AID, "x86_64", "spyre-inference"),
+    )
+    monkeypatch.setenv("CLICKHOUSE_DB_V2", "spyre_v2")
+    code, report = _ingest(out, capsys, "--bundle-url", "https://art/p/")
+    assert (code, report["status"], report["benchmark_runs"]) == (0, "ingested", 2)
+
+    assert {r["name"]: r["benchmark_id"] for r in ch.inserted["benchmarks"]} == PROD_IDS
+    runs = {r["benchmark_id"]: r for r in ch.inserted["benchmark_runs"]}
+    lat = runs[PROD_IDS["latency_granite8B_tp1_in64_out64"]]
+    thr = runs[PROD_IDS["throughput_granite8B_tp1_in64_out64"]]
+
+    assert lat["measurements"]["host_cpu_pct_total_mean"] == [42.1]
+    assert lat["measurements"]["host_mem_mb_peak"] == [2048.0]
+    assert lat["measurements"]["compile_host_cpu_pct_total_mean"] == [77.5]
+    assert thr["measurements"]["host_cpu_pct_total_mean"] == [55.0]
+    assert lat["props"]["unit.host_cpu_pct_total_mean"] == "%"
+    assert lat["props"]["unit.compile_host_cpu_pct_total_mean"] == "%"
+    assert lat["props"]["unit.host_mem_mb_peak"] == "MB"
+    # The bench numbers and their sample counts are what they were without the host files.
+    assert lat["measurements"]["latency"] == [0.7093, 0.7155] and lat["iterations"] == 2
+    assert thr["iterations"] == 1
+    assert thr["measurements"]["tokens_per_second"]
+    assert lat["run_id"] == thr["run_id"] == report["run_id"]
+    (bench,) = [b for b in ch.inserted["benchmarks"] if b["name"].startswith("latency")]
+    assert bench["props"]["model"] == MODEL
+    (verdict,) = ch.inserted["artifact_results"]
+    assert verdict["duration_s"] == pytest.approx(3.162)
+
+
+def test_a_vllm_bundle_with_host_resources_has_the_live_legs_rows(tmp_path):
+    """Bundle and live ingest shape the same directory the same way."""
+    out = _vllm(tmp_path, host_resources=True)
+    rows = bundle.vllm_rows(out, offline.check(out) | {"arch": "x86_64"})
+    host = [r for r in rows if "host_" in r["metric"]]
+    assert sorted((json.loads(r["extra"])["test_name"], r["metric"]) for r in host) == (
+        sorted((n, f"{m}") for n, ms in HOST_METRICS.items() for m, _ in ms)
+    )
+    for r in host:
+        extra = json.loads(r["extra"])
+        assert (extra["model"], extra["arch"]) == (MODEL, "x86_64")
+        assert "iterations" not in extra
+
+
+def test_a_host_resources_file_alone_takes_its_model_from_the_record(tmp_path):
+    """No bench JSON beside it, and no perf model: the record names the model."""
+    out = _vllm(tmp_path, host_resources=True)
+    for f in (out / "results").glob("*.json"):
+        if ".host_resources." not in f.name:
+            f.unlink()
+    _edit(out, files=None)
+    rows = bundle.vllm_rows(out, offline.check(out) | {"arch": "x86_64"})
+    assert rows and {json.loads(r["extra"])["model"] for r in rows} == {MODEL}
+
+
+def test_the_bundle_digest_covers_the_host_resources_files(tmp_path):
+    out = _vllm(tmp_path, host_resources=True)
+    before = offline.digest(out)
+    f = out / "results" / "latency_granite8B_tp1_in64_out64.host_resources.json"
+    f.write_text(f.read_text().replace("42.1", "43.1"))
+    assert offline.digest(out) != before
+    assert "sha256 mismatch" in _rejected(out)
 
 
 # --- results --upload, against a local Artifactory stand-in ----------------------------------

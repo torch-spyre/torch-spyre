@@ -14,6 +14,7 @@
 
 import dataclasses
 from functools import partial
+import logging
 import math
 from types import SimpleNamespace
 from unittest import mock
@@ -23,6 +24,7 @@ import sympy
 
 import torch_spyre._inductor.codegen.superdsc as superdsc_module
 import torch_spyre._inductor.core_mapping as core_mapping_module
+import torch_spyre._inductor.kernel_provenance as kernel_provenance_module
 import torch_spyre._inductor.pass_utils as pass_utils_module
 import torch_spyre._inductor.spyre_kernel as spyre_kernel_module
 from torch_spyre._C import DataFormats, ElementArrangement
@@ -40,6 +42,7 @@ from torch_spyre._inductor.core_mapping import (
     derive_partition_mapping,
     derive_operation_mapping,
     finalize_tensor_work_divisions,
+    matmul_reduction_dim,
     select_unique_partition_division,
 )
 from torch_spyre._inductor.op_spec import (
@@ -780,6 +783,117 @@ def test_planner_and_sdsc_use_the_same_mapping(
         assert not planner_view.same_partition(PerCoreView((), (), num_cores=1))
 
 
+def test_matmul_reduction_dim_is_found_by_identity():
+    """K is the one loop that both inputs index and the output does not."""
+    mb, out, reduction, restored = sympy.symbols("mb out reduction restored")
+    space = {mb: (512, 2), out: (12800, 4), reduction: (4096, 4), restored: (1, 1)}
+
+    def args(x, y, output):
+        return [
+            SimpleNamespace(is_input=True, device_coordinates=x),
+            SimpleNamespace(is_input=True, device_coordinates=y),
+            SimpleNamespace(is_input=False, device_coordinates=output),
+        ]
+
+    x = [restored, mb, reduction]
+    y = [restored, reduction, sympy.Mod(out, 64)]
+    # Alignment appends a restored loop after K, so the last loop is not K.
+    assert matmul_reduction_dim(space, args(x, y, [restored, mb, out])) == reduction
+    # K is K whatever its split; an integer coordinate indexes no loop.
+    unsplit = {**space, reduction: (4096, 1)}
+    output = [sympy.Integer(0), restored, mb, out]
+    assert matmul_reduction_dim(unsplit, args(x, y, output)) == reduction
+    # An N of 1 that y and the output fold away is not K.
+    folded = args(x, [restored, reduction], [restored, mb])
+    assert matmul_reduction_dim({**space, out: (1, 1)}, folded) == reduction
+    # Two loops that both inputs index and the output does not: no single K.
+    assert matmul_reduction_dim(space, args(x, y, [mb, out])) is None
+
+
+def _bmm_op_spec_on_a_slice(op: str, restored_loops: int) -> OpSpec:
+    """A bmm whose x is one slice of a larger buffer, before alignment.
+
+    Each added device dimension of x has size 2 and a constant coordinate.
+    Alignment restores a range-1 loop for each such dimension, and it puts the
+    loop in every tensor. It adds these loops after K, as for a batch-1 matmul in
+    a ``for_each_tile`` body.
+    """
+    op_spec = _bmm_op_spec(op)
+    x = op_spec.args[0]
+    x.device_size = [2] * restored_loops + x.device_size
+    x.device_coordinates = [sympy.Integer(1)] * restored_loops + x.device_coordinates
+    return op_spec
+
+
+@pytest.mark.parametrize("op", [BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP])
+@pytest.mark.parametrize(
+    "restored_loops,labels",
+    [(1, ["x", "mb", "out", "in"]), (2, ["y", "x", "mb", "out", "in"])],
+)
+def test_restored_loops_go_in_front_of_k(monkeypatch, op, restored_loops, labels):
+    """Every reader that takes K as the last loop sees K after alignment."""
+    monkeypatch.setattr(
+        spyre_kernel_module._spyre_config, "core_id_k_fast_emission", True
+    )
+    op_spec = _bmm_op_spec_on_a_slice(op, restored_loops)
+    mb, out, reduction = op_spec.iteration_space
+    simplify_op_spec(op_spec)
+    dims = list(op_spec.iteration_space)
+    restored = dims[:restored_loops]
+    assert dims[restored_loops:] == [mb, out, reduction]
+    assert [op_spec.iteration_space[dim] for dim in restored] == [(1, 1)] * len(
+        restored
+    )
+    for arg in op_spec.args:
+        indexed = {s for c in arg.device_coordinates for s in c.free_symbols}
+        assert indexed.issuperset(restored)
+    # Core order: the four K slices of each output slice are on adjacent cores.
+    coordinates = _mapping_coordinates(
+        op_spec.core_id_to_work_slice, (mb, out, reduction), 32
+    )
+    assert coordinates == [(core // 4 % 2, core // 8, core % 4) for core in range(32)]
+    # Provenance takes this K-fast order as the default one.
+    assert kernel_provenance_module._is_canonical_core_mapping(op_spec)
+    # SDSC: the restored loops are batch dims, and K is `in`.
+    sdsc_spec, renamed = parse_op_spec(op_spec)
+    assert [str(renamed[dim]) for dim in dims] == labels
+    assert [str(label) for label in sdsc_spec.iteration_space] == labels
+
+
+def test_matmul_loop_order_is_kept_without_a_proven_batch_loop(caplog):
+    """No single K, or a loop after K that a tensor does not index: no change.
+
+    The readers then take the last loop as K, and a debug line gives the reason.
+    """
+    op_spec = _bmm_op_spec(BATCH_MATMUL_OP)
+    mb, out, reduction = op_spec.iteration_space
+    spyre_kernel_module._restore_matmul_loop_order(op_spec)
+    assert list(op_spec.iteration_space) == [mb, out, reduction]
+
+    def kept(op_spec, message):
+        dims = list(op_spec.iteration_space)
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger=spyre_kernel_module.logger.name):
+            spyre_kernel_module._restore_matmul_loop_order(op_spec)
+        assert list(op_spec.iteration_space) == dims
+        assert message in caplog.text
+
+    # A loop after K that y does not index is not a batch loop.
+    extra = sympy.Symbol("extra")
+    op_spec.iteration_space = {**op_spec.iteration_space, extra: (1, 1)}
+    for arg in (op_spec.args[0], op_spec.args[-1]):
+        arg.device_coordinates = [extra, *arg.device_coordinates]
+    kept(op_spec, "are not in every tensor")
+
+    # K in two loops: both inputs index each one and the output indexes neither.
+    op_spec = _bmm_op_spec(BATCH_MATMUL_OP)
+    second = sympy.Symbol("second")
+    op_spec.iteration_space = {**op_spec.iteration_space, second: (2, 2)}
+    for arg in op_spec.args[:2]:
+        arg.device_coordinates = [second, *arg.device_coordinates]
+    kept(op_spec, "no single reduction loop")
+
+
 def test_flattened_iteration_span_is_not_a_single_axis_view():
     heads, flat = sympy.symbols("heads flat")
     prep = _view_prep(
@@ -1101,6 +1215,63 @@ def test_prepare_per_core_view_does_not_record_repeat_info():
     assert graph._repeat_info == before
 
 
+def _attention_repack_view_prep(*, width=128, offset=0):
+    """The actual GKSPILL5 buf7 write, before SDSC factors its feature axis."""
+    row, head, feature = sympy.symbols(
+        "row head feature", integer=True, nonnegative=True
+    )
+    prep = _view_prep(
+        iter_space={row: 512, head: 8, feature: width},
+        write_index=1024 * row + 128 * head + feature,
+        dep_coeff={row: 1024, head: 128, feature: 1},
+        dep_device_coordinates=(
+            2 * head + sympy.floor(feature / 64) + offset,
+            row,
+            sympy.Mod(feature, 64),
+        ),
+        device_size=[16, 512, 64],
+        stride_map=[64, 1024, 1],
+        device_stride_to_dim={64: 0, 1024: 1, 1: 2},
+        stick_host_stride=1,
+        num_stick_dim=0,
+        num_stick=16,
+        num_stick_stride=64,
+    )
+    return prep, row, head, feature
+
+
+@pytest.mark.parametrize(
+    "width,offset,relayout_enabled,representable",
+    [
+        (128, 0, True, True),
+        (192, 0, True, False),
+        (128, 1, True, False),
+        (128, 0, False, False),
+    ],
+)
+def test_attention_repack_maps_only_complete_head_shards(
+    monkeypatch, width, offset, relayout_enabled, representable
+):
+    monkeypatch.setattr(
+        pass_utils_module.config, "lx_planner_relayout", relayout_enabled
+    )
+    prep, row, head, feature = _attention_repack_view_prep(width=width, offset=offset)
+    coordinates = prep.dep_device_coordinates
+    view, partial, actual = pass_utils_module._per_core_view_from_prep(
+        prep, {row: 8, head: 4, feature: 1}
+    )
+    assert actual is representable
+    assert not partial
+    assert prep.dep_device_coordinates == coordinates
+    if representable:
+        assert view.num_cores == 32
+        assert dict(view.work_slice_dims) == {0: 4, 1: 8}
+        owners = dict(view.core_to_slot)
+        for core in range(32):
+            assert int(owners[0].subs(_CORE_ID, core)) == core // 8
+            assert int(owners[1].subs(_CORE_ID, core)) == core % 8
+
+
 @pytest.mark.parametrize("relayout_enabled", [False, True])
 def test_reshape_changes_per_core_ownership_within_one_device_axis(
     monkeypatch, relayout_enabled
@@ -1410,7 +1581,52 @@ def test_the_probe_bound_covers_the_callers_filter_too():
     assert probes(1) == 1
 
 
-@pytest.mark.parametrize("kind", ["direct", "affine"])
+def test_geometry_and_feature_import_layers():
+    """Planner queries must not import a reporting module."""
+    import ast
+    from pathlib import Path
+
+    root = Path(core_mapping_module.__file__).resolve().parent
+    for path in (root / "scratchpad").glob("*.py"):
+        tree = ast.parse(path.read_text())
+        assert not any(
+            isinstance(node, ast.ImportFrom)
+            and node.module is not None
+            and node.module.endswith("dump_cost_model")
+            for node in ast.walk(tree)
+        ), path
+    tree = ast.parse((root / "core_mapping.py").read_text())
+    bindings = {
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef))
+    }
+    for node in tree.body:
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            bindings.update(
+                child.id
+                for child in ast.walk(node)
+                if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)
+            )
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            bindings.update(
+                alias.asname or alias.name.split(".")[0] for alias in node.names
+            )
+    for path in root.rglob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.ImportFrom) and (node.module or "").endswith(
+                "core_mapping"
+            ):
+                assert {alias.name for alias in node.names} <= bindings, path
+    assert not any(
+        isinstance(node, ast.ImportFrom)
+        and node.module is not None
+        and ("scratchpad" in node.module or node.module.endswith("pass_utils"))
+        for node in ast.walk(tree)
+    )
+
+
+@pytest.mark.parametrize("kind", ["direct", "affine", "floor"])
 @pytest.mark.parametrize("enabled", [False, True])
 def test_ownership_callers_keep_their_admission_policy(monkeypatch, kind, enabled):
     """Compare both production callers without widening the recovery policy."""
@@ -1420,10 +1636,23 @@ def test_ownership_callers_keep_their_admission_policy(monkeypatch, kind, enable
         "row head pair lane", integer=True, nonnegative=True
     )
     affine = kind == "affine"
-    iteration = {row: 512, head: 8, **({pair: 2} if affine else {}), lane: 64}
-    coordinate = 2 * head + pair if affine else head
-    width = 1024 if affine else 512
-    index = width * row + (128 if affine else 64) * head + lane
+    floor = kind == "floor"
+    combined = affine or floor
+    iteration = {
+        row: 512,
+        head: 8,
+        **({pair: 2} if affine else {}),
+        lane: 128 if floor else 64,
+    }
+    coordinate = (
+        2 * head + sympy.floor(lane / 64)
+        if floor
+        else 2 * head + pair
+        if affine
+        else head
+    )
+    width = 1024 if combined else 512
+    index = width * row + (128 if combined else 64) * head + lane
     if affine:
         index += 64 * pair
     coefficients = {symbol: index.coeff(symbol) for symbol in iteration}
@@ -1432,12 +1661,12 @@ def test_ownership_callers_keep_their_admission_policy(monkeypatch, kind, enable
         write_index=index,
         dep_coeff=coefficients,
         dep_device_coordinates=(coordinate, row, lane),
-        device_size=[16 if affine else 8, 512, 64],
+        device_size=[16 if combined else 8, 512, 64],
         stride_map=[64, width, 1],
         device_stride_to_dim={64: 0, width: 1, 1: 2},
         stick_host_stride=1,
         num_stick_dim=0,
-        num_stick=16 if affine else 8,
+        num_stick=16 if combined else 8,
         num_stick_stride=64,
     )
     physical = PerCoreView(
@@ -1459,10 +1688,10 @@ def test_ownership_callers_keep_their_admission_policy(monkeypatch, kind, enable
         assert not partial
         # The affine emitter may accept while recovery declines: recovery is
         # floor-only, not a second route around the affine admission policy.
-        assert represented is (not affine)
+        assert represented is (not combined or (floor and enabled))
         if represented:
             assert recovered.same_partition(physical)
-        if affine and not enabled:
+        if combined and not enabled:
             with pytest.raises(ValueError, match="cannot map device dimension"):
                 work_division_from_view(
                     physical, prep.device_size, coordinates, iteration

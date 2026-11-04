@@ -68,6 +68,14 @@ class ModelOpInfo(OpInfo):
 model_ops_db: list[ModelOpInfo] = []
 
 
+def dtype_precision(dtypes: List[Dict[str, Any]], dtype: torch.dtype) -> Dict[str, Any]:
+    """Return the "precision" mapping of the top-level "dtypes" entry for dtype."""
+    for entry in dtypes:
+        if parse_dtype(entry["name"]) == dtype:
+            return dict(entry.get("precision") or {})
+    return {}
+
+
 def add_model_ops_db(loadedCases: List[LoadedCase]):
     seen_test_names = set()
     for loadedCase in loadedCases:
@@ -193,8 +201,14 @@ class TestSpyreModelOps(TestCase):
 
         # load parameters
         seed = case.get("seed", defaults.get("seed", None))
-        rtol = float(case.get("rtol", defaults.get("rtol", 5e-3)))
-        atol = float(case.get("atol", defaults.get("atol", 5e-3)))
+        # Precedence: case > top-level "dtypes" entry for dtype > defaults
+        precision = dtype_precision(loadedCase.dtypes, dtype)
+        rtol = float(
+            case.get("rtol", precision.get("rtol", defaults.get("rtol", 5e-3)))
+        )
+        atol = float(
+            case.get("atol", precision.get("atol", defaults.get("atol", 5e-3)))
+        )
         description = case.get("description")
 
         # Build CPU args ONCE, then copy to Spyre (identical values)
