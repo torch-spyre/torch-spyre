@@ -91,6 +91,7 @@ import json
 import sys
 from pathlib import Path
 
+
 try:
     import yaml
 except ImportError:
@@ -149,6 +150,79 @@ def _suite_flags(flags_map: dict, rel: str) -> str:
         return flags_map[rel]
     prefixes = [k for k in flags_map if k.endswith("/") and rel.startswith(k)]
     return flags_map[max(prefixes, key=len)] if prefixes else ""
+
+
+# The grouping policy and timings key configs relative to tests/configs/torch_spyre_tests/, but trunk
+# scans tests/configs, where the same file is torch_spyre_tests/<key>. Normalise to one root so a
+# bucket is the same on every tier.
+LAYOUT_ROOT = "torch_spyre_tests/"
+
+
+def _layout_key(rel: str) -> str:
+    return rel[len(LAYOUT_ROOT) :] if rel.startswith(LAYOUT_ROOT) else rel
+
+
+def _config_facts(path: Path) -> tuple:
+    """(global block, test file paths) of a config, for the bucket safety checks."""
+    with path.open() as fh:
+        raw = yaml.safe_load(fh) or {}
+    tsc = raw.get("test_suite_config") or {}
+    return tsc.get("global"), [str(f.get("path", "")) for f in tsc.get("files") or []]
+
+
+def _bucket_name(members: list) -> str:
+    """Job name for a bucket that says what is in it: "Inductor / Cache, Codegen +14 more (16)".
+
+    Members' own display names, with the shared directory and "Test" prefix said once.
+    """
+    head, _, _ = members[0]["name"].rpartition(" / ")
+    short = []
+    for m in members:
+        n = m["name"].rpartition(" / ")[2]
+        short.append(n[len("Test ") :] if n.startswith("Test ") else n)
+    shown = ", ".join(short[:3])
+    if len(short) > 3:
+        shown += f" +{len(short) - 3} more"
+    return f"{head + ' / ' if head else ''}{shown} ({len(members)})"
+
+
+def _fold_buckets(results: list) -> list:
+    """Fold configs that share a bucket into one matrix entry, after tier filtering.
+
+    Re-checks what test_layout.plan promised, so a hand-edited timings or policy file can never
+    produce a bucket that behaves differently from its members run alone: members must share
+    runner, flags and `global:` block (run_test.sh unions global lists across merged configs), and
+    must not name the same test file (the merge keeps only the first config's mode for that file).
+    """
+    out, buckets = [], {}
+    for r in results:
+        b = r.get("bucket")
+        if not b:
+            out.append(r)
+            continue
+        if b not in buckets:
+            buckets[b] = dict(r, members=[r])
+            out.append(buckets[b])
+            continue
+        g = buckets[b]
+        for field in ("runner", "flags", "global"):
+            if r[field] != g[field]:
+                sys.exit(
+                    f"ERROR: bucket {b!r}: {r['config']} and {g['config']} differ in {field}"
+                )
+        shared = set(r["files"]) & {f for m in g["members"] for f in m["files"]}
+        if shared:
+            sys.exit(
+                f"ERROR: bucket {b!r}: {r['config']} shares test file(s) {sorted(shared)} with another member"
+            )
+        g["members"].append(r)
+    for g in out:
+        members = g.pop("members", None)
+        if members and len(members) > 1:
+            g["configs"] = " ".join(m["config"] for m in members)
+            g["report"] = f"bucket_{g['bucket']}"
+            g["name"] = _bucket_name(members)
+    return out
 
 
 # The tier ladder. A config's labels also carry suite groups and one-off markers;
@@ -263,6 +337,18 @@ def main() -> None:
             "'matrix-json': GitHub Actions dynamic-matrix JSON."
         ),
     )
+    ap.add_argument(
+        "--layout-policy",
+        metavar="JSON_FILE",
+        default=None,
+        help="Optional .github/test_layout_policy.json: group short configs into shared jobs.",
+    )
+    ap.add_argument(
+        "--timings",
+        metavar="JSON_FILE",
+        default=None,
+        help="Optional .github/test_timings.json: per-config runtimes the grouping packs by.",
+    )
     args = ap.parse_args()
 
     config_dir = Path(args.config_dir).resolve()
@@ -281,6 +367,18 @@ def main() -> None:
         runner_map = _load_path_map(args.runner_map)
     flags_map: dict = _load_path_map(args.flags_map) if args.flags_map else {}
 
+    # Test files more than one config on disk lists (e.g. test_inductor_ops.py, split across many
+    # configs by test class). A bucket's JUnit report is named after the bucket, so the timings
+    # refresh credits its cases to a config by test file; a shared file makes that ambiguous, and
+    # those configs therefore always run alone (test_layout.plan) to keep their timings fresh.
+    owners: dict = {}
+    for cfg in config_dir.rglob("*.yaml"):
+        try:
+            for f in _config_facts(cfg)[1]:
+                owners.setdefault(Path(f).stem, set()).add(cfg)
+        except Exception:  # noqa: BLE001  (unreadable configs are reported below)
+            continue
+
     results = []
     skipped_covered = 0
     for cfg in sorted(config_dir.rglob("*.yaml")):
@@ -295,6 +393,7 @@ def main() -> None:
             skipped_covered += 1
             continue
         rel = str(cfg.relative_to(config_dir))
+        glob, files = _config_facts(cfg)
         results.append(
             {
                 "name": _display_name(cfg, config_dir),
@@ -302,6 +401,13 @@ def main() -> None:
                 "runner": runner_map.get(rel, "spyre_pf_x1"),
                 "flags": _suite_flags(flags_map, rel),
                 "path": str(cfg),
+                "key": _layout_key(rel),
+                "dir": str(Path(_layout_key(rel)).parent),
+                "global": glob,
+                "files": files,
+                "shared_file": any(
+                    len(owners.get(Path(f).stem, ())) > 1 for f in files
+                ),
             }
         )
 
@@ -321,12 +427,40 @@ def main() -> None:
     if args.format == "paths":
         print(" ".join(r["path"] for r in results))
     else:
+        # Imported only when grouping is asked for: callers that sparse-check-out filter_configs.py
+        # alone (upstream_tests.yaml, integration-tests.yaml) never pass --layout-policy.
+        if args.layout_policy:
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            import test_layout
+        else:
+            test_layout = None
+        try:
+            policy = (
+                test_layout.load_policy(args.layout_policy) if test_layout else None
+            )
+            timings = test_layout.load_timings(args.timings) if test_layout else {}
+        except ValueError as exc:  # test_layout.LayoutError
+            sys.exit(f"ERROR: {exc}")
+        if args.layout_policy and policy is None:
+            print(
+                f"WARNING: {args.layout_policy} not found; every config runs as its own job",
+                file=sys.stderr,
+            )
+        buckets = test_layout.plan(results, policy, timings) if test_layout else {}
+        for r in results:
+            r["bucket"] = buckets.get(r["key"], "")
+        results = _fold_buckets(results)
         matrix = [
             {
                 "name": r["name"],
                 "config": r["config"],
                 "runner": r["runner"],
                 **({"extra_test_flags": r["flags"]} if r["flags"] else {}),
+                **(
+                    {"configs": r["configs"], "report": r["report"]}
+                    if r.get("configs")
+                    else {}
+                ),
             }
             for r in results
         ]
