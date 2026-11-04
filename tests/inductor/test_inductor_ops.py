@@ -1309,6 +1309,29 @@ def _sort_params(dtype, names=None):
     }
 
 
+# Sort-dim sizes 256, 512 and 1024 in 1D and 2D, as (input, dim). Sorting along
+# dim 0, 1D sort, and stable sort along dim=1 for n=256/512 all work. n=1024
+# along dim=1 compiles but returns wrong values. fp32 also checks the indices.
+_SORT_SIZES = (256, 512, 1024)
+_SORT_SIZES_PARAM_SETS = {
+    **{
+        f"2d_dim0_n{n}_{tag}": (_sort_ties((n, 32), 11, dt), 0)
+        for n in _SORT_SIZES
+        for tag, dt in (("fp16", torch.float16), ("fp32", torch.float32))
+    },
+    # Wider than the cases above: fp32 returns wrong values at 1024 rows.
+    **{
+        f"2d_dim0_n1024_c64_{tag}": (_sort_ties((1024, 64), 11, dt), 0)
+        for tag, dt in (("fp16", torch.float16), ("fp32", torch.float32))
+    },
+    **{f"1d_n{n}_fp32": (_sort_ties((n,), 11, torch.float32), 0) for n in _SORT_SIZES},
+    **{
+        f"2d_dim1_n{n}_fp32": (_sort_ties((64, n), 11, torch.float32), 1)
+        for n in _SORT_SIZES
+    },
+}
+
+
 class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     torch.manual_seed(0xAFFE)  # seeds cached_randn/cached_xavier calls in PARAMS below
 
@@ -2474,6 +2497,23 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     True,
                 ),
                 "1d_ties": (_sort_ties((64,), 4, torch.float16), 0, False),
+            },
+        },
+        # Sort-dim sizes 256, 512 and 1024. 1D sort works. Stable sort along
+        # the wide stick dim (64 x n, dim=1) works for n=256 and n=512. n=1024
+        # compiles but returns wrong values (TODO: cite an open issue once
+        # diagnosed).
+        ("test_sort_sizes", "test_sort_sizes_cpu"): {
+            "param_sets": _SORT_SIZES_PARAM_SETS,
+            "expect_fail": {
+                "2d_dim0_n1024_c64_fp32": (
+                    "fp32 topk peeling returns wrong values for a 1024x64 sort "
+                    "along dim 0 (TODO: cite an open issue)"
+                ),
+                "2d_dim1_n1024_fp32": (
+                    "fp32 topk peeling returns wrong values for a 64x1024 stable "
+                    "sort along dim 1 (TODO: cite an open issue)"
+                ),
             },
         },
         ("test_topk_indices", "test_topk_indices_cpu"): {
@@ -10873,6 +10913,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             lambda x: torch.sort(x, dim=dim, descending=descending, stable=True), x
         )
 
+    def test_sort_sizes_cpu(self, x, dim: int):
+        # Indices are compared in fp32 only: the fp16 indices come back wrong
+        # (see _SORT_PERMUTED).
+        values, indices = _compile_and_run(
+            lambda x: torch.sort(x, dim=dim, stable=True), [x], "spyre"
+        )
+        expected = torch.sort(x, dim=dim, stable=True)
+        torch.testing.assert_close(values.cpu(), expected.values)
+        if x.dtype == torch.float32:
+            torch.testing.assert_close(indices.cpu(), expected.indices)
+
     @pytest.mark.xfail(
         strict=True,
         raises=AssertionError,
@@ -10885,14 +10936,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         x = (torch.arange(16 * 192) * 7 % 11).reshape(16, 192).half()
         self.compare_with_cpu(lambda x: torch.sort(x, dim=1, stable=True)[0], x)
 
-    @expects_raise
-    def test_sort_1d_unsplittable_rejected(self):
-        # n=35 cannot be split across cores, so spyre_topk would pad it, and a
-        # 1D tensor cannot be padded (its only axis is the stick).
-        # TODO: when 1D padding works this must become a positive test.
+    def test_sort_1d_unsplittable(self):
+        # n=35 cannot be split across cores, so spyre_topk pads it with -inf.
+        # Values only: the fp16 indices are wrong (see _SORT_PERMUTED).
         x = torch.randn(35).half()
-        with pytest.raises(Exception, match="1D tensor of size 35"):
-            _compile_and_run(lambda x: torch.sort(x, stable=True), [x], "spyre")
+        self.compare_with_cpu(lambda x: torch.sort(x, stable=True)[0], x)
 
     @expects_raise
     def test_sort_fp16_index_range_rejected(self):

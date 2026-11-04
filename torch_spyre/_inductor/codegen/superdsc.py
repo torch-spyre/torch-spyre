@@ -2417,6 +2417,14 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
                 work_slices,
             )
         )
+    elif _is_keep_by_index(op_spec.op) and op_stick_fallback_sym is not None:
+        # keep_by_index shares the same fallback-stick need as topk: when the
+        # op has no real stick dim, _create_sdsc_tensors Step 3 would pick an
+        # independent fallback symbol per arg (values vs. output), causing
+        # mismatched stick variables and a dbo-opt DtException.  Inject the
+        # op-level symbol so both args share one fallback stick.
+        # Unlike topk, keep_by_index needs no topk_missing_dim.
+        injected_dims["topk_stick_fallback_sym"] = op_stick_fallback_sym
 
     # For matmul N=1: inject N dimension into iteration space so y and output have it.
     if is_matmul:

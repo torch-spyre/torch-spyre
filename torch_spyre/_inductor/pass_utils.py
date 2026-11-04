@@ -2407,12 +2407,31 @@ def compute_restickify_target_layout(
             j for j in range(len(idc) - 1) if old_var in idc[j].free_symbols
         ]
     else:
-        # Zero stick (placeholder dim with no variable): only valid for BATCH_MATMUL_OP,
-        # where a size-1 contraction dim produces a constant stick expression.
-        # For all other ops, this layout is infeasible.
-        if reduction_type != BATCH_MATMUL_OP:
+        # Zero stick (placeholder dim with no variable).  Two sub-cases:
+        #
+        # 1. BATCH_MATMUL_OP: a size-1 contraction dim produces a constant
+        #    stick expression; treat like an ordinary size-1 dim below.
+        # 2. General size-1 stick produced by a gather / keep_by_index /
+        #    index_select: the outer dim for the stick placeholder is the
+        #    size-1 device dim whose coordinate is also 0.  Moving the stick
+        #    from this dim to a real variable (target_stick_expr) is the
+        #    reverse of compute_size1_restickify_layout and is legal whenever
+        #    a size-1 outer dim can be found.
+        old_sd_outer_dim_candidate = next(
+            (
+                j
+                for j in range(len(idc) - 1)
+                if idc[j] == sympy.S.Zero and stl.device_size[j] == 1
+            ),
+            None,
+        )
+        if reduction_type != BATCH_MATMUL_OP and old_sd_outer_dim_candidate is None:
             return None
-        old_sd_host_size, old_sd_host_stride = 1, 1
+        # Use stride_map=-1 when the outer placeholder is a synthetic size-1
+        # dim (the gather/index_select case); use 1 for the matmul path where
+        # no such dim exists and the size-1 is a real host dim.
+        old_sd_host_stride = -1 if old_sd_outer_dim_candidate is not None else 1
+        old_sd_host_size = 1
         old_var_outer_dims = []
         old_var = None
     if len(old_var_outer_dims) > 1:
@@ -2770,7 +2789,18 @@ def compute_restickify_needed(
         # have extra dimensions in which the input will be broadcasted into.
         expanded, expanded_stl = expand_sparse(in_stl, dense_in_host)
         if expanded:
-            return True, expanded_stl
+            # expanded_stl expands the sparse layout to the natural dense form,
+            # whose stick always points along the host's last (fastest-varying)
+            # dim.  When target_stick asks for a *different* dim (e.g. the row
+            # axis of a [64, 256] tensor for a topk-along-dim-1 consumer), the
+            # expanded form has the wrong stick and would cause a
+            # "different stick loop variables" error in parse_op_spec.  Fall
+            # through to compute_restickify_target_layout, which can target the
+            # correct dim, when the sticks differ.
+            exp_idc = try_device_coordinates(expanded_stl, in_dep, ind_sizes, op=op)
+            exp_stick = exp_idc[-1] if exp_idc else None
+            if exp_stick is not None and exp_stick.free_symbols == target_stick.free_symbols:
+                return True, expanded_stl
 
     # Local import avoids circular dependency (propagate_layouts imports pass_utils).
     from .propagate_layouts import PropArg  # noqa: PLC0415

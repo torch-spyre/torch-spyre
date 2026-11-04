@@ -1868,14 +1868,6 @@ def spyre_topk(
         # after any real element it ties with: the pads are always the last
         # results, even when the input holds infinities.
         pad = max(padded_k - n, 0)
-        if pad and input.dim() == 1:
-            # A 1D tensor's only axis is the stick, and padding it fails in
-            # layout propagation with "no offset-free alternative stick dim for
-            # mutation target". Reject it here with a clear message instead.
-            raise Unsupported(
-                f"topk with k={k} on a 1D tensor of size {n}: k cannot be split "
-                f"across cores and a 1D tensor cannot be padded"
-            )
         if pad:
             input = torch.constant_pad_nd(
                 input, [0, 0] * (input.dim() - 1 - dim) + [pad, 0], float("-inf")
