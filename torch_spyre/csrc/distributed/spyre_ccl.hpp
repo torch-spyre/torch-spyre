@@ -18,6 +18,7 @@
 #include <pybind11/chrono.h>
 #include <torch/python.h>
 
+#include <atomic>
 #include <chrono>
 #include <exception>
 #include <spyre_comms.hpp>
@@ -171,9 +172,12 @@ class SpyreCCLBackend : public c10d::Backend {
   /*
    * Shutdown
    *
-   * shutdown() is a silent no-op: spyre_comms has no graceful-shutdown API,
-   * and the silent no-op matches the behaviour of the Gloo, MPI, and UCC
-   * backends. Finalization is handled by the SpyreCCLBackend destructor.
+   * shutdown() releases this backend's reference on spyre_comms by calling
+   * spyre_comms::finalize_library(). It is idempotent: only the first call
+   * (from destroy_process_group() or the destructor) finalizes. It is called
+   * explicitly by destroy_process_group() so that finalization does not depend
+   * on every Python reference to the ProcessGroup being dropped (compile
+   * caches, device meshes, etc. can keep it alive past teardown).
    *
    * abort() is not supported by the underlying spyre_comms library and will
    * throw SpyreCCLNotSupportedException.
@@ -181,7 +185,7 @@ class SpyreCCLBackend : public c10d::Backend {
   void abort() override {
     throw SpyreCCLNotSupportedException(getBackendName(), __func__);
   }
-  void shutdown() override {}
+  void shutdown() override;
 
   /*
    * Backend registration
@@ -192,6 +196,9 @@ class SpyreCCLBackend : public c10d::Backend {
 
  private:
   std::shared_ptr<spyre_comms::Context> group_context_;
+  // True while this backend holds one initialize_library() reference that has
+  // not yet been released by finalize_library().
+  std::atomic<bool> library_ref_held_{false};
 
   [[nodiscard]] spyre_comms::TensorInfo getTensorInfo(const at::Tensor& input);
   void prepare_tensor(const at::Tensor& input_tensor,
