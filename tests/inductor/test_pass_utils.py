@@ -28,8 +28,8 @@ from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import ComputedBuffer, FixedLayout, Pointwise, Scatter
 from torch._inductor.sizevars import SizeVarAllocator
 from torch._inductor.virtualized import V
-from torch_spyre._C import SpyreTensorLayout
 from torch.utils._ordered_set import OrderedSet
+from torch_spyre._C import SpyreTensorLayout
 
 import torch_spyre._inductor.pass_utils as pass_utils
 from torch_spyre._inductor.patches import _unique_operation_names
@@ -48,7 +48,10 @@ def test_restickify_does_not_discard_folded_cache_pages(folded_axis):
         size = [64, 2, 20, 128]
         stride = [5120, 2560, 128, 1]
         stl = SpyreTensorLayout(
-            [64, 2, 40, 64], [5120, 2560, 64, 1], DataFormats.SEN169_FP16
+            [64, 2, 40, 64],
+            [5120, 2560, 64, 1],
+            DataFormats.SEN169_FP16,
+            {(0,): 64, (1,): 2, (2, 3): 40 * 64},
         )
         host_coords = [token, head, page, feature]
         device_coords = [
@@ -75,7 +78,10 @@ def test_restickify_does_not_discard_folded_cache_pages(folded_axis):
         )
         if folded_axis == "new":
             stl = SpyreTensorLayout(
-                [1280, 2, 1, 64], [128, 64, 64, 1], DataFormats.SEN169_FP16
+                [1280, 2, 1, 64],
+                [128, 64, 64, 1],
+                DataFormats.SEN169_FP16,
+                {(0,): 1280, (1,): 2, (2, 3): 1 * 64},
             )
             device_coords = [64 * page + token, head, sympy.S.Zero, feature]
         else:
@@ -83,6 +89,7 @@ def test_restickify_does_not_discard_folded_cache_pages(folded_axis):
                 [20, 64, 2, 1, 64],
                 [8192, 128, 64, 64, 1],
                 DataFormats.SEN169_FP16,
+                {(0,): 20, (1,): 64, (2,): 2, (3, 4): 64},
             )
             device_coords = [page, token, head, sympy.S.Zero, feature]
     host = FixedLayout(torch.device("cpu"), torch.float16, size, stride)

@@ -1590,6 +1590,7 @@ def test_v_projection_cache_handoff_preserves_persistent_alias(
         device_size=[1024, 2, 2, 1, 64],
         stride_map=[128, 1024 * 128, 64, 2 * 1024 * 128, 1],
         device_dtype=get_device_dtype(torch.float16),
+        valid_elements={(0,): 1024, (1,): 2, (2, 4): 128, (3,): 1},
     )
     cache = cache_host.to("spyre", device_layout=cache_layout)
     alias = cache
@@ -1927,6 +1928,7 @@ def _run_prefix_linear_case(monkeypatch, *, mode):
         device_size=[physical // eps, rows, eps],
         stride_map=[eps, physical, 1],
         device_dtype=get_device_dtype(torch.float16),
+        valid_elements={(0, 2): physical, (1,): rows},
     )
     compiled = torch.compile(fn, dynamic=False, fullgraph=True)
     options = {**_COOPT, "sencores": 32, "lx_same_tile_group_relayout": False}
