@@ -1173,6 +1173,8 @@ def _repoint_refs_to_buffer(
     graph: "GraphLowering",
     old_name: str,
     new_buf: Any,
+    *,
+    redirect_readers: bool = True,
 ) -> None:
     """Point graph outputs (and any op input) naming old_name at new_buf.
 
@@ -1196,6 +1198,9 @@ def _repoint_refs_to_buffer(
     survives as a dangling ``graph.name_to_buffer`` lookup after
     ``splice_while_loop`` drops the ``MultiOutput``/``WhileLoop`` objects
     ``old_name`` and the while_loop itself named.
+
+    ``redirect_readers=False`` skips that last step, for a caller that has
+    already redirected every ``ComputedBuffer`` reader itself.
     """
     from torch._inductor import ir
     from torch_spyre._inductor.pass_utils import redirect_computed_buffer_reads
@@ -1224,7 +1229,7 @@ def _repoint_refs_to_buffer(
             for j, inp in enumerate(inputs):
                 if getattr(inp, "get_name", lambda: None)() == old_name:
                     inputs[j] = new_tb
-        if isinstance(op, ir.ComputedBuffer):
+        if redirect_readers and isinstance(op, ir.ComputedBuffer):
             reads = {dep.name for dep in op.get_read_writes().reads}
             if old_name in reads:
                 graph.operations[i] = redirect_computed_buffer_reads(

@@ -21,7 +21,7 @@ and consumed by the scheduler, kernel codegen, and buffer-propagation pass.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import sympy
 
@@ -51,11 +51,17 @@ class LoopCarryRecord:
     loop's node), in which case the post-loop materialization plan declines
     and the carry keeps today's HBM behavior.  No other consumer of this
     record reads the field.
+
+    ``storage_view`` is the view the update writes through when the carry's
+    initial value is a view of the storage (a transposed init), else None.
+    ``loop_carries.apply_loop_carries`` uses it as the mutation target, as the
+    splice did when it made the write in place itself.
     """
 
     storage_name: str
     update_name: str
     loop_origin: "torch.fx.Node | None" = None
+    storage_view: Any = field(default=None, compare=False, repr=False)
 
 
 @dataclass(frozen=True)
