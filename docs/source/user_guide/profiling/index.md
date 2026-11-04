@@ -62,8 +62,8 @@ if report is not None:
     print(report["_report_path"])
 ```
 
-See the [FFDC user guide](ffdc.md) for failure categories, report
-locations, pod/CI workflow, and JSON triage. The
+See the [FFDC user guide](ffdc.md) for the enable → fail → retrieve →
+triage workflow, failure categories, report schema, and JSON triage. The
 [API reference](../../api/torch_spyre.rst) documents the function
 contract.
 
