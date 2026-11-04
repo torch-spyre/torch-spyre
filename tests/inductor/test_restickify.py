@@ -1625,7 +1625,12 @@ def test_strict_senuint32_transpose_clone():
 
     x = torch.randint(0, 1000, (64, 64), dtype=torch.int64)
     base = _CSTL(list(x.size()), torch.int64)
-    stl = _CSTL(list(base.device_size), list(base.stride_map), DataFormats.SENUINT32)
+    stl = _CSTL(
+        list(base.device_size),
+        list(base.stride_map),
+        DataFormats.SENUINT32,
+        base.valid_elements,
+    )
     xd = x.to("spyre", device_layout=stl)
     assert torch.equal(xd.cpu(), x), "SENUINT32 round trip is not exact"
 
@@ -2650,6 +2655,7 @@ def test_size1_grow_prepends_size64_gap_dim():
         list(_SIZE1_COLLAPSED_DEVICE_SIZE),
         list(_SIZE1_COLLAPSED_STRIDE_MAP),
         DataFormats.SEN169_FP16,
+        {(0,): 67, (1, 3): 7, (2,): 1},
         ElementArrangement.STANDARD,
     )
     layout = FixedTiledLayout(
@@ -3041,6 +3047,7 @@ def test_compute_restickify_target_layout_factorized_new_sd():
         [8, 2, 1, 64],
         [128, 64, 1024, 1],
         DataFormats.SEN169_FP16,
+        {(0,): 8, (2,): 1, (1, 3): 128},
     )
     # host_coords (ic): L maps to lq, H to floor(k/128), D to Mod(k, 128).
     ic = [lq, sympy.floor(k / 128), sympy.Mod(k, 128)]
