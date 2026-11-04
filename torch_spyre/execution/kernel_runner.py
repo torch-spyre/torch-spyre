@@ -35,6 +35,22 @@ from torch_spyre.profiler._ffdc import (
 logger = get_inductor_logger("kernel_runner")
 
 
+def _symbolic_arg(sk: SymbolKind, arg_offset: int) -> SymbolicArg:
+    """The launch-time resolution of one bundle input_arg."""
+    if sk.is_shard_kernel:
+        # Core sk.core_idx's own shard of a sharded tensor (non-unified HBM).
+        return SymbolicArg(
+            kind=SymbolicArgKind.kShardAddress,
+            tensor_id=sk.arg_index + arg_offset,
+            dim_index=sk.core_idx,
+            value=sk.offset,
+            num_shards=sk.split_count,
+        )
+    return SymbolicArg(
+        kind=SymbolicArgKind.kAddress, tensor_id=sk.arg_index + arg_offset
+    )
+
+
 class SpyreUnimplementedRunner:
     def __init__(self, name: str, op: str):
         self.kernel_name = name
@@ -125,21 +141,10 @@ class SpyreSDSCKernelRunner:
                 # tensors only, so add 1 to account for the pool.
                 self._symbolic_args: list[SymbolicArg] | None = (
                     [SymbolicArg(kind=SymbolicArgKind.kAddress, tensor_id=0)]
-                ) + (
-                    [
-                        SymbolicArg(
-                            kind=SymbolicArgKind.kAddress,
-                            tensor_id=sk.arg_index + 1,
-                        )
-                        for sk in self.symbol_kinds[1:]
-                    ]
-                )
+                ) + ([_symbolic_arg(sk, 1) for sk in self.symbol_kinds[1:]])
             else:
                 # No pool param — arg_index maps directly to args position.
-                self._symbolic_args = [
-                    SymbolicArg(kind=SymbolicArgKind.kAddress, tensor_id=sk.arg_index)
-                    for sk in self.symbol_kinds
-                ]
+                self._symbolic_args = [_symbolic_arg(sk, 0) for sk in self.symbol_kinds]
         else:
             self._symbolic_args = None
 
