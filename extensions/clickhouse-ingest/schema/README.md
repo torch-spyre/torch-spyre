@@ -20,7 +20,7 @@ Applying them in filename order works from an empty database.
 | `42-ci-requests.sql` | `ci_requests` | — |
 | `47-pipeline-runs.sql` | `pipeline_runs`, `pipeline_run_legs` | — |
 | `48-ci-run-timings.sql` | `ci_run_timings` | — |
-| `49-result-uploads.sql` | `result_uploads`, `v_result_uploads`, `v_artifact_results_published` | 20 |
+| `49-result-uploads.sql` | `result_uploads`, `v_result_uploads`, `v_retracted_rounds`, `v_artifact_results_published` | 20 |
 | `50-artifact-views.sql` | 8 `v_tag_*` / `v_artifact_*` / `v_tier_trend` views | 10, 20 |
 | `51-functional-views.sql` | 4 `v_case_*` / `v_run_tier_counters` / `v_tier_report_completeness` views | 10, 20 |
 | `52-cross-views.sql` | `v_run_coverage` | 10, 20 |
@@ -41,6 +41,7 @@ Applying them in filename order works from an empty database.
 | `70-vllm-hud-projection.sql` | `oss_ci_benchmark_v3`, `oss_ci_benchmark_metadata`, their `_by_tag` copies + their MVs | 30, 60 |
 | `72-ops-audit-events.sql` | `ops_audit_events`, `v_ops_audit_events` | — |
 | `73-ci-access-audit.sql` | `ci_access_audit`, `v_ci_access_audit` | — |
+| `74-model-priority-events.sql` | `model_priority_events`, `v_model_priority` | — |
 
 Column names `chat_turns` shares with `vigil_ops.analyst_turns`, so one `UNION ALL` view can read both:
 
