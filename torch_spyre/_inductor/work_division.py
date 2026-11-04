@@ -127,6 +127,11 @@ def _collect_symbol_metadata(it_space: dict[Symbol, Expr]) -> SymbolMeta:
 
     Concrete dims (no free symbols) are also omitted, so callers can use
     ``v in meta`` to detect both cases.
+
+    Deprecated. Serves the symbolic-SDSC route, which the explicit-loop route
+    supersedes. On the loop route this returns EMPTY, because there the body op's
+    iteration space is a static tile, so callers must treat empty as normal.
+    TODO(issue#5890): remove with the rest of the symbolic-SDSC route.
     """
     meta: SymbolMeta = {}
     for sym, expr in it_space.items():
@@ -462,6 +467,9 @@ def adjust_it_space_for_sticks(
         if stick_var not in adjusted_space:
             continue
         if stick_var in symbol_meta:
+            # Deprecated with _collect_symbol_metadata: reachable only when
+            # symbol_meta is non-empty, so never on the explicit-loop route.
+            # TODO(issue#5890): remove with the symbolic-SDSC route.
             logger.info(
                 f"[work_division/symbolic] stick-dim guard raised: "
                 f"stick_var={stick_var} on tensor {td.dep.name} is symbolic"
@@ -1801,6 +1809,9 @@ def has_resolved_work_div_hint(op: ComputedBuffer) -> bool:
 
     ``spyre_hint`` annotates every node in its scope, so an op can carry a
     ``work_div`` hint naming none of its dims; that op gets a default split.
+    Shard-pinned ops are not excluded here: the scratchpad allocator's
+    "shard plan" branch commits their division first, so this predicate never
+    decides for them.
     """
     return (
         isinstance(op.data, (Pointwise, Reduction))
@@ -2145,8 +2156,21 @@ def work_distribution_pass(
     blocked = constraint_result.blocked
     allowed_splits = constraint_result.allowed_splits
 
-    if not config.ignore_work_division_hints:
-        user_splits = _resolve_work_div_hint(op, it_space_adjusted)
+    # A shard plan (sharded_hbm.plan_sharded_hbm) is a correctness constraint,
+    # not a preference, so it applies even when hints are ignored.
+    shard_splits = getattr(op, "shard_pinned_splits", None)
+    if shard_splits:
+        if not config.ignore_work_division_hints and has_work_div_hint(op):
+            # The shard plan wins over a user work_div hint by design; say so
+            # instead of dropping the hint silently.
+            logger.info(
+                "work_distribution(shard-plan) %s: shard plan %s overrides the "
+                "work_div hint (the split must follow the shards)",
+                op.get_name(),
+                shard_splits,
+            )
+    if shard_splits or not config.ignore_work_division_hints:
+        user_splits = shard_splits or _resolve_work_div_hint(op, it_space_adjusted)
         if user_splits is not None:
             user_splits = _apply_user_hint(
                 op,
@@ -2851,10 +2875,11 @@ def _iter_computed_buffers(operations: list[Operation]):
                 continue
             yield op
         elif isinstance(op, FallbackKernel):
-            # FallbackKernel produces 0..N trailing MultiOutputs
-            # (see torch_spyre/_inductor/propagate_layouts.py).
-            # Work division is not supported on either; the MultiOutputs
-            # are skipped in their own branch below.
+            # FallbackKernel either carries a single output itself or
+            # produces trailing MultiOutputs (see
+            # torch_spyre/_inductor/propagate_layouts.py). Work division is
+            # not supported on either; the MultiOutputs are skipped in their
+            # own branch below.
             pass
         elif isinstance(op, MultiOutput):
             pass
@@ -2927,12 +2952,17 @@ def work_distribution(
     for op in _iter_computed_buffers(operations):
         if op in preassigned_ops:
             continue
-        rw = op_read_writes(op)
-        args = _apply_input_layout_overrides(op, get_mem_deps_from_rw(rw))
-        if isinstance(op.data, Pointwise):
-            divide_pointwise_op(op, args, max_cores, work_distribution_pass)
-        elif isinstance(op.data, Reduction):
-            divide_reduction_op(op, args, max_cores, work_distribution_pass)
+        _work_distribution_op(op, max_cores)
+
+
+def _work_distribution_op(op: ComputedBuffer, max_cores: int) -> None:
+    """Pass 3 for one op: commit its default split."""
+    rw = op_read_writes(op)
+    args = _apply_input_layout_overrides(op, get_mem_deps_from_rw(rw))
+    if isinstance(op.data, Pointwise):
+        divide_pointwise_op(op, args, max_cores, work_distribution_pass)
+    elif isinstance(op.data, Reduction):
+        divide_reduction_op(op, args, max_cores, work_distribution_pass)
 
 
 def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
@@ -3058,3 +3088,62 @@ def cost_model_matmul_division(graph: GraphLowering) -> list[Operation]:
         if _cost_model_divide_op(op, max_cores):
             cost_model_ops.append(op)
     return cost_model_ops
+
+
+# The ops ``defer_work_division`` left undivided, by name. Stored on the
+# GraphLowering, so it lives exactly as long as one compile.
+_DEFERRED_WORK_DIVISION = "_spyre_deferred_work_division"
+
+
+def defer_work_division(graph: GraphLowering) -> None:
+    """Leave Pass 2 and Pass 3 to the joint LX planning solve.
+
+    The co-optimizing solve re-chooses the split of every op it can enumerate,
+    so a split these passes commit up front is overwritten. Record the ops they
+    would have divided instead. The allocator divides one on demand when it pins
+    the op to that split (:func:`divide_deferred_op`), counts the solve's commit
+    as the op's division, and divides whatever the solve leaves
+    (:func:`divide_deferred_ops`), so every op ends with the split it had when
+    the passes ran up front. Span floors are unaffected: ``span_reduction``
+    still runs first.
+    """
+    setattr(
+        graph,
+        _DEFERRED_WORK_DIVISION,
+        {
+            op.get_name()
+            for op in _iter_computed_buffers(graph.operations)
+            if isinstance(op.data, (Pointwise, Reduction))
+        },
+    )
+
+
+def deferred_work_division(graph: GraphLowering) -> set[str]:
+    """Names of the ops whose deferred division is still undecided.
+
+    Empty when nothing was deferred. The set is live: discarding a name marks
+    that op divided.
+    """
+    return getattr(graph, _DEFERRED_WORK_DIVISION, set())
+
+
+def divide_deferred_op(graph: GraphLowering, op: Operation) -> None:
+    """Commit the split Pass 2 or Pass 3 would have given ``op``, if its
+    division was deferred and nothing has decided it since."""
+    deferred = deferred_work_division(graph)
+    if op.get_name() not in deferred:
+        return
+    deferred.discard(op.get_name())
+    assert isinstance(op, ComputedBuffer)
+    max_cores = _validate_max_cores()
+    if not _cost_model_divide_op(op, max_cores):
+        _work_distribution_op(op, max_cores)
+
+
+def divide_deferred_ops(graph: GraphLowering) -> None:
+    """Divide every op whose deferred division is still undecided, in graph
+    order: the ones the solve neither pinned nor committed."""
+    if not deferred_work_division(graph):
+        return
+    for op in graph.operations:
+        divide_deferred_op(graph, op)

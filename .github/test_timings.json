@@ -1,0 +1,1124 @@
+{
+ "version": 1,
+ "generated_at": "2026-11-03T13:20:46Z",
+ "window_days": 30,
+ "source": "ClickHouse spyre_v2.test_case_runs, median of per-run summed case minutes",
+ "configs": {
+  "inductor/test_building_blocks_config.yaml": {
+   "p50_min": 7.638,
+   "p90_min": 9.276,
+   "runs": 3566,
+   "cases": 70
+  },
+  "inductor/test_cache_config.yaml": {
+   "p50_min": 0.193,
+   "p90_min": 0.206,
+   "runs": 3569,
+   "cases": 2
+  },
+  "inductor/test_coarse_tile_split_config.yaml": {
+   "p50_min": 0.099,
+   "p90_min": 0.1,
+   "runs": 12,
+   "cases": 23
+  },
+  "inductor/test_coarse_tiling_config.yaml": {
+   "p50_min": 0.143,
+   "p90_min": 0.16,
+   "runs": 3380,
+   "cases": 435
+  },
+  "inductor/test_codegen_config.yaml": {
+   "p50_min": 0.236,
+   "p90_min": 0.254,
+   "runs": 3380,
+   "cases": 56
+  },
+  "inductor/test_compact.yaml": {
+   "p50_min": 0.772,
+   "p90_min": 1.025,
+   "runs": 3567,
+   "cases": 24
+  },
+  "inductor/test_constant_tensor_cache_config.yaml": {
+   "p50_min": 0.099,
+   "p90_min": 0.1,
+   "runs": 3380,
+   "cases": 9
+  },
+  "inductor/test_cooptimization_types_config.yaml": {
+   "p50_min": 0.179,
+   "p90_min": 0.197,
+   "runs": 3380,
+   "cases": 18
+  },
+  "inductor/test_copy_back_elision_config.yaml": {
+   "p50_min": 0.263,
+   "p90_min": 0.281,
+   "runs": 3568,
+   "cases": 6
+  },
+  "inductor/test_copy_from_d2d_offsets.yaml": {
+   "p50_min": 0.326,
+   "p90_min": 0.352,
+   "runs": 3567,
+   "cases": 20
+  },
+  "inductor/test_core_mapping_config.yaml": {
+   "p50_min": 0.104,
+   "p90_min": 0.426,
+   "runs": 3379,
+   "cases": 88
+  },
+  "inductor/test_cost_expr_dump_config.yaml": {
+   "p50_min": 0.099,
+   "p90_min": 0.1,
+   "runs": 3382,
+   "cases": 11
+  },
+  "inductor/test_cost_model_decode_config.yaml": {
+   "p50_min": 0.132,
+   "p90_min": 0.14,
+   "runs": 3381,
+   "cases": 68
+  },
+  "inductor/test_cost_model_loop_operands_config.yaml": {
+   "p50_min": 0.302,
+   "p90_min": 0.323,
+   "runs": 3140,
+   "cases": 20
+  },
+  "inductor/test_cost_model_pass_config.yaml": {
+   "p50_min": 0.1,
+   "p90_min": 0.103,
+   "runs": 3381,
+   "cases": 62
+  },
+  "inductor/test_cost_model_replication_config.yaml": {
+   "p50_min": 0.199,
+   "p90_min": 0.214,
+   "runs": 3379,
+   "cases": 83
+  },
+  "inductor/test_data_transfer_config.yaml": {
+   "p50_min": 0.209,
+   "p90_min": 0.226,
+   "runs": 3385,
+   "cases": 16
+  },
+  "inductor/test_deadcode_elimination_config.yaml": {
+   "p50_min": 0.191,
+   "p90_min": 0.204,
+   "runs": 3179,
+   "cases": 7
+  },
+  "inductor/test_decomp_config.yaml": {
+   "p50_min": 0.393,
+   "p90_min": 0.421,
+   "runs": 3381,
+   "cases": 4
+  },
+  "inductor/test_dedup_constants_config.yaml": {
+   "p50_min": 0.233,
+   "p90_min": 0.25,
+   "runs": 3565,
+   "cases": 18
+  },
+  "inductor/test_dtype_scalars_config.yaml": {
+   "p50_min": 1.171,
+   "p90_min": 1.245,
+   "runs": 3378,
+   "cases": 128
+  },
+  "inductor/test_ea_bidirectional_conversion_config.yaml": {
+   "p50_min": 1.53,
+   "p90_min": 1.703,
+   "runs": 3565,
+   "cases": 114
+  },
+  "inductor/test_enumerate_tilings_config.yaml": {
+   "p50_min": 0.108,
+   "p90_min": 0.111,
+   "runs": 3381,
+   "cases": 38
+  },
+  "inductor/test_eval_model_config.yaml": {
+   "p50_min": 0.099,
+   "p90_min": 0.1,
+   "runs": 247,
+   "cases": 15
+  },
+  "inductor/test_expect_fail_reason_config.yaml": {
+   "p50_min": 0.099,
+   "p90_min": 0.101,
+   "runs": 2717,
+   "cases": 6
+  },
+  "inductor/test_expect_fail_unstable_config.yaml": {
+   "p50_min": 0.098,
+   "p90_min": 0.1,
+   "runs": 3093,
+   "cases": 6
+  },
+  "inductor/test_expect_raise_config.yaml": {
+   "p50_min": 0.099,
+   "p90_min": 0.1,
+   "runs": 2997,
+   "cases": 11
+  },
+  "inductor/test_explicit_conversion_config.yaml": {
+   "p50_min": 0.336,
+   "p90_min": 0.36,
+   "runs": 3388,
+   "cases": 27
+  },
+  "inductor/test_fallback_kernel_config.yaml": {
+   "p50_min": 0.94,
+   "p90_min": 1.0,
+   "runs": 3570,
+   "cases": 18
+  },
+  "inductor/test_for_each_tile_config.yaml": {
+   "p50_min": 1.174,
+   "p90_min": 1.325,
+   "runs": 3382,
+   "cases": 29
+  },
+  "inductor/test_for_each_tile_e2e_config.yaml": {
+   "p50_min": 1.862,
+   "p90_min": 2.16,
+   "runs": 3571,
+   "cases": 65
+  },
+  "inductor/test_for_each_tile_lowering_config.yaml": {
+   "p50_min": 1.477,
+   "p90_min": 1.852,
+   "runs": 3379,
+   "cases": 118
+  },
+  "inductor/test_for_each_tile_view_spellings_config.yaml": {
+   "p50_min": 0.105,
+   "p90_min": 0.107,
+   "runs": 146,
+   "cases": 18
+  },
+  "inductor/test_fp8_prequantized_load_config.yaml": {
+   "p50_min": 0.495,
+   "p90_min": 0.525,
+   "runs": 3212,
+   "cases": 22
+  },
+  "inductor/test_frontend_only_config.yaml": {
+   "p50_min": 0.099,
+   "p90_min": 0.103,
+   "runs": 3085,
+   "cases": 15
+  },
+  "inductor/test_frontend_work_bounds_config.yaml": {
+   "p50_min": 0.335,
+   "p90_min": 0.363,
+   "runs": 1674,
+   "cases": 6
+  },
+  "inductor/test_fusion_config.yaml": {
+   "p50_min": 0.099,
+   "p90_min": 0.1,
+   "runs": 3380,
+   "cases": 15
+  },
+  "inductor/test_hash_coverage_config.yaml": {
+   "p50_min": 0.101,
+   "p90_min": 0.102,
+   "runs": 127,
+   "cases": 17
+  },
+  "inductor/test_hbm_pool_planning_config.yaml": {
+   "p50_min": 0.158,
+   "p90_min": 0.168,
+   "runs": 3381,
+   "cases": 28
+  },
+  "inductor/test_hint_flags_config.yaml": {
+   "p50_min": 0.49,
+   "p90_min": 0.518,
+   "runs": 2070,
+   "cases": 4
+  },
+  "inductor/test_implicit_promotion_config.yaml": {
+   "p50_min": 0.32,
+   "p90_min": 0.343,
+   "runs": 3381,
+   "cases": 29
+  },
+  "inductor/test_indirect_access_gather_config.yaml": {
+   "p50_min": 4.539,
+   "p90_min": 5.539,
+   "runs": 3562,
+   "cases": 190
+  },
+  "inductor/test_indirect_access_internals_config.yaml": {
+   "p50_min": 0.103,
+   "p90_min": 0.105,
+   "runs": 3379,
+   "cases": 74
+  },
+  "inductor/test_indirect_access_scatter_config.yaml": {
+   "p50_min": 1.644,
+   "p90_min": 1.973,
+   "runs": 3564,
+   "cases": 75
+  },
+  "inductor/test_inductor_fx_passes_config.yaml": {
+   "p50_min": 0.39,
+   "p90_min": 0.415,
+   "runs": 3376,
+   "cases": 26
+  },
+  "inductor/test_inductor_ops_fp8_config.yaml": {
+   "p50_min": 0.854,
+   "p90_min": 1.067,
+   "runs": 3377,
+   "cases": 75
+  },
+  "inductor/test_inductor_ops_lx_matmul_config.yaml": {
+   "p50_min": 6.082,
+   "p90_min": 6.548,
+   "runs": 3377,
+   "cases": 114
+  },
+  "inductor/test_inductor_ops_lx_misc_compute_a_config.yaml": {
+   "p50_min": 5.718,
+   "p90_min": 7.723,
+   "runs": 3373,
+   "cases": 280
+  },
+  "inductor/test_inductor_ops_lx_misc_compute_b_config.yaml": {
+   "p50_min": 6.35,
+   "p90_min": 10.983,
+   "runs": 3376,
+   "cases": 348
+  },
+  "inductor/test_inductor_ops_lx_misc_compute_c_config.yaml": {
+   "p50_min": 14.43,
+   "p90_min": 18.666,
+   "runs": 3370,
+   "cases": 46
+  },
+  "inductor/test_inductor_ops_lx_misc_shape_a_config.yaml": {
+   "p50_min": 3.254,
+   "p90_min": 3.583,
+   "runs": 3376,
+   "cases": 332
+  },
+  "inductor/test_inductor_ops_lx_misc_shape_b_config.yaml": {
+   "p50_min": 5.396,
+   "p90_min": 5.973,
+   "runs": 3375,
+   "cases": 560
+  },
+  "inductor/test_inductor_ops_lx_misc_shape_c_config.yaml": {
+   "p50_min": 7.316,
+   "p90_min": 8.438,
+   "runs": 3376,
+   "cases": 350
+  },
+  "inductor/test_inductor_ops_lx_misc_shape_d_config.yaml": {
+   "p50_min": 1.912,
+   "p90_min": 2.442,
+   "runs": 3377,
+   "cases": 82
+  },
+  "inductor/test_inductor_ops_lx_misc_shape_slice_config.yaml": {
+   "p50_min": 8.312,
+   "p90_min": 8.993,
+   "runs": 3371,
+   "cases": 630
+  },
+  "inductor/test_inductor_ops_lx_pointwise_a_config.yaml": {
+   "p50_min": 10.756,
+   "p90_min": 12.275,
+   "runs": 3074,
+   "cases": 744
+  },
+  "inductor/test_inductor_ops_lx_pointwise_b_config.yaml": {
+   "p50_min": 8.71,
+   "p90_min": 9.821,
+   "runs": 3078,
+   "cases": 792
+  },
+  "inductor/test_inductor_ops_lx_reduction_index_a_config.yaml": {
+   "p50_min": 4.176,
+   "p90_min": 4.664,
+   "runs": 3371,
+   "cases": 324
+  },
+  "inductor/test_inductor_ops_lx_reduction_index_b_config.yaml": {
+   "p50_min": 5.408,
+   "p90_min": 6.154,
+   "runs": 3378,
+   "cases": 398
+  },
+  "inductor/test_inductor_ops_lx_reduction_multidim0_config.yaml": {
+   "p50_min": 5.471,
+   "p90_min": 5.889,
+   "runs": 3373,
+   "cases": 306
+  },
+  "inductor/test_inductor_ops_lx_reduction_multidim1_config.yaml": {
+   "p50_min": 4.643,
+   "p90_min": 4.999,
+   "runs": 3376,
+   "cases": 266
+  },
+  "inductor/test_inductor_ops_lx_reduction_scalar_config.yaml": {
+   "p50_min": 2.674,
+   "p90_min": 6.036,
+   "runs": 3371,
+   "cases": 172
+  },
+  "inductor/test_inductor_ops_lx_reduction_singledim0_config.yaml": {
+   "p50_min": 5.247,
+   "p90_min": 5.785,
+   "runs": 3374,
+   "cases": 248
+  },
+  "inductor/test_inductor_ops_lx_reduction_singledim1_config.yaml": {
+   "p50_min": 4.138,
+   "p90_min": 4.58,
+   "runs": 3373,
+   "cases": 200
+  },
+  "inductor/test_inductor_ops_matmul_config.yaml": {
+   "p50_min": 6.577,
+   "p90_min": 8.368,
+   "runs": 3562,
+   "cases": 144
+  },
+  "inductor/test_inductor_ops_misc_compute_a_config.yaml": {
+   "p50_min": 2.071,
+   "p90_min": 2.845,
+   "runs": 3377,
+   "cases": 141
+  },
+  "inductor/test_inductor_ops_misc_compute_b_config.yaml": {
+   "p50_min": 2.57,
+   "p90_min": 6.026,
+   "runs": 3564,
+   "cases": 191
+  },
+  "inductor/test_inductor_ops_misc_compute_c_config.yaml": {
+   "p50_min": 6.522,
+   "p90_min": 8.538,
+   "runs": 3564,
+   "cases": 23
+  },
+  "inductor/test_inductor_ops_misc_shape_a_config.yaml": {
+   "p50_min": 5.167,
+   "p90_min": 5.669,
+   "runs": 3364,
+   "cases": 541
+  },
+  "inductor/test_inductor_ops_misc_shape_b_config.yaml": {
+   "p50_min": 5.025,
+   "p90_min": 6.008,
+   "runs": 3377,
+   "cases": 565
+  },
+  "inductor/test_inductor_ops_misc_shape_c_config.yaml": {
+   "p50_min": 0.79,
+   "p90_min": 0.941,
+   "runs": 3381,
+   "cases": 47
+  },
+  "inductor/test_inductor_ops_pointwise_config.yaml": {
+   "p50_min": 8.38,
+   "p90_min": 9.924,
+   "runs": 3564,
+   "cases": 847
+  },
+  "inductor/test_inductor_ops_reduction_keepdim_index_norm_eager_config.yaml": {
+   "p50_min": 4.625,
+   "p90_min": 5.258,
+   "runs": 3564,
+   "cases": 361
+  },
+  "inductor/test_inductor_ops_reduction_keepdim_multidim0_config.yaml": {
+   "p50_min": 3.589,
+   "p90_min": 3.896,
+   "runs": 3482,
+   "cases": 153
+  },
+  "inductor/test_inductor_ops_reduction_keepdim_multidim1_config.yaml": {
+   "p50_min": 3.098,
+   "p90_min": 3.379,
+   "runs": 3483,
+   "cases": 133
+  },
+  "inductor/test_inductor_ops_reduction_keepdim_singledim0_config.yaml": {
+   "p50_min": 3.377,
+   "p90_min": 3.71,
+   "runs": 3378,
+   "cases": 124
+  },
+  "inductor/test_inductor_ops_reduction_keepdim_singledim1_config.yaml": {
+   "p50_min": 2.689,
+   "p90_min": 2.974,
+   "runs": 3381,
+   "cases": 100
+  },
+  "inductor/test_inductor_ops_reduction_scalar_config.yaml": {
+   "p50_min": 1.508,
+   "p90_min": 4.237,
+   "runs": 3562,
+   "cases": 109
+  },
+  "inductor/test_inductor_scalar_config.yaml": {
+   "p50_min": 2.068,
+   "p90_min": 2.719,
+   "runs": 3382,
+   "cases": 30
+  },
+  "inductor/test_inductor_transpose_edge_config.yaml": {
+   "p50_min": 0.411,
+   "p90_min": 0.469,
+   "runs": 3376,
+   "cases": 47
+  },
+  "inductor/test_inplace_op_kernels.yaml": {
+   "p50_min": 0.35,
+   "p90_min": 0.383,
+   "runs": 3566,
+   "cases": 73
+  },
+  "inductor/test_invoke_subgraph_split_config.yaml": {
+   "p50_min": 0.184,
+   "p90_min": 0.199,
+   "runs": 3380,
+   "cases": 1
+  },
+  "inductor/test_kernel_preparation_config.yaml": {
+   "p50_min": 0.113,
+   "p90_min": 0.116,
+   "runs": 3379,
+   "cases": 3
+  },
+  "inductor/test_kernel_provenance_config.yaml": {
+   "p50_min": 0.1,
+   "p90_min": 0.103,
+   "runs": 3377,
+   "cases": 49
+  },
+  "inductor/test_ktir_compile_config.yaml": {
+   "p50_min": 0.098,
+   "p90_min": 0.099,
+   "runs": 3380,
+   "cases": 9
+  },
+  "inductor/test_ktir_validate_config.yaml": {
+   "p50_min": 0.107,
+   "p90_min": 0.116,
+   "runs": 3376,
+   "cases": 143
+  },
+  "inductor/test_kv_window_config.yaml": {
+   "p50_min": 0.154,
+   "p90_min": 0.208,
+   "runs": 3376,
+   "cases": 106
+  },
+  "inductor/test_log_op_specs_config.yaml": {
+   "p50_min": 0.098,
+   "p90_min": 0.1,
+   "runs": 3376,
+   "cases": 13
+  },
+  "inductor/test_log_passes_config.yaml": {
+   "p50_min": 0.198,
+   "p90_min": 0.206,
+   "runs": 3374,
+   "cases": 12
+  },
+  "inductor/test_logging_config.yaml": {
+   "p50_min": 0.098,
+   "p90_min": 0.101,
+   "runs": 3379,
+   "cases": 6
+  },
+  "inductor/test_loop_advance_config.yaml": {
+   "p50_min": 1.25,
+   "p90_min": 1.283,
+   "runs": 4,
+   "cases": 34
+  },
+  "inductor/test_loop_facts_config.yaml": {
+   "p50_min": 0.098,
+   "p90_min": 0.099,
+   "runs": 12,
+   "cases": 10
+  },
+  "inductor/test_loop_node_config.yaml": {
+   "p50_min": 0.102,
+   "p90_min": 0.102,
+   "runs": 4,
+   "cases": 41
+  },
+  "inductor/test_loop_node_equivalence_config.yaml": {
+   "p50_min": 1.508,
+   "p90_min": 1.576,
+   "runs": 81,
+   "cases": 7
+  },
+  "inductor/test_lx_context_switching_config.yaml": {
+   "p50_min": 0.56,
+   "p90_min": 0.6,
+   "runs": 3563,
+   "cases": 7
+  },
+  "inductor/test_lx_extern_kernel_clobber.yaml": {
+   "p50_min": 0.287,
+   "p90_min": 0.305,
+   "runs": 3562,
+   "cases": 3
+  },
+  "inductor/test_lx_inplace_layout_config.yaml": {
+   "p50_min": 0.141,
+   "p90_min": 0.149,
+   "runs": 3562,
+   "cases": 3
+  },
+  "inductor/test_lx_planning_suite_config.yaml": {
+   "p50_min": 0.005,
+   "p90_min": 0.006,
+   "runs": 3225,
+   "cases": 9
+  },
+  "inductor/test_matmul_config.yaml": {
+   "p50_min": 0.258,
+   "p90_min": 0.275,
+   "runs": 3377,
+   "cases": 12
+  },
+  "inductor/test_matmul_rewrites_config.yaml": {
+   "p50_min": 0.098,
+   "p90_min": 0.1,
+   "runs": 3373,
+   "cases": 6
+  },
+  "inductor/test_normalization_scalars_config.yaml": {
+   "p50_min": 2.713,
+   "p90_min": 3.281,
+   "runs": 3384,
+   "cases": 112
+  },
+  "inductor/test_offset_view_eager_ops.yaml": {
+   "p50_min": 0.466,
+   "p90_min": 0.512,
+   "runs": 3563,
+   "cases": 19
+  },
+  "inductor/test_op_features_config.yaml": {
+   "p50_min": 0.174,
+   "p90_min": 0.189,
+   "runs": 3375,
+   "cases": 22
+  },
+  "inductor/test_op_spec_validation_config.yaml": {
+   "p50_min": 0.102,
+   "p90_min": 0.105,
+   "runs": 3374,
+   "cases": 72
+  },
+  "inductor/test_opspec_tiling.yaml": {
+   "p50_min": 1.291,
+   "p90_min": 2.081,
+   "runs": 3562,
+   "cases": 1
+  },
+  "inductor/test_opspec_utils_config.yaml": {
+   "p50_min": 0.101,
+   "p90_min": 0.103,
+   "runs": 3377,
+   "cases": 41
+  },
+  "inductor/test_overwrite.yaml": {
+   "p50_min": 0.342,
+   "p90_min": 0.361,
+   "runs": 3379,
+   "cases": 10
+  },
+  "inductor/test_padding_config.yaml": {
+   "p50_min": 0.383,
+   "p90_min": 0.741,
+   "runs": 3377,
+   "cases": 23
+  },
+  "inductor/test_pass_counters_config.yaml": {
+   "p50_min": 0.098,
+   "p90_min": 0.099,
+   "runs": 1585,
+   "cases": 16
+  },
+  "inductor/test_pass_utils_swa_tiling_config.yaml": {
+   "p50_min": 0.198,
+   "p90_min": 0.201,
+   "runs": 3378,
+   "cases": 31
+  },
+  "inductor/test_perm_layout_solver_config.yaml": {
+   "p50_min": 0.287,
+   "p90_min": 1.72,
+   "runs": 3370,
+   "cases": 99
+  },
+  "inductor/test_propagate_named_dims_config.yaml": {
+   "p50_min": 0.719,
+   "p90_min": 0.773,
+   "runs": 3378,
+   "cases": 43
+  },
+  "inductor/test_provenance_config.yaml": {
+   "p50_min": 0.098,
+   "p90_min": 0.1,
+   "runs": 3564,
+   "cases": 38
+  },
+  "inductor/test_provenance_integration_config.yaml": {
+   "p50_min": 0.133,
+   "p90_min": 0.149,
+   "runs": 3563,
+   "cases": 3
+  },
+  "inductor/test_provenance_observer_config.yaml": {
+   "p50_min": 0.1,
+   "p90_min": 0.104,
+   "runs": 3378,
+   "cases": 41
+  },
+  "inductor/test_qfp8wt_k_constraint_config.yaml": {
+   "p50_min": 0.1,
+   "p90_min": 0.102,
+   "runs": 613,
+   "cases": 5
+  },
+  "inductor/test_restickify_config.yaml": {
+   "p50_min": 3.739,
+   "p90_min": 6.874,
+   "runs": 3561,
+   "cases": 372
+  },
+  "inductor/test_sa_cooptimizer_config.yaml": {
+   "p50_min": 1.171,
+   "p90_min": 1.294,
+   "runs": 3370,
+   "cases": 111
+  },
+  "inductor/test_scan_cache_flag_config.yaml": {
+   "p50_min": 0.421,
+   "p90_min": 0.445,
+   "runs": 2114,
+   "cases": 6
+  },
+  "inductor/test_scan_cache_spyre_config.yaml": {
+   "p50_min": 0.212,
+   "p90_min": 0.224,
+   "runs": 2113,
+   "cases": 1
+  },
+  "inductor/test_scatter_copy_insertion_config.yaml": {
+   "p50_min": 0.2,
+   "p90_min": 0.215,
+   "runs": 3564,
+   "cases": 4
+  },
+  "inductor/test_scatter_layout_helpers_config.yaml": {
+   "p50_min": 0.099,
+   "p90_min": 0.101,
+   "runs": 3379,
+   "cases": 12
+  },
+  "inductor/test_scratchpad_patterns_config.yaml": {
+   "p50_min": 0.1,
+   "p90_min": 0.101,
+   "runs": 3379,
+   "cases": 35
+  },
+  "inductor/test_scratchpad_solver_config.yaml": {
+   "p50_min": 0.317,
+   "p90_min": 0.336,
+   "runs": 3376,
+   "cases": 310
+  },
+  "inductor/test_scratchpad_use_config.yaml": {
+   "p50_min": 2.659,
+   "p90_min": 2.893,
+   "runs": 3563,
+   "cases": 160
+  },
+  "inductor/test_scratchpad_utils_config.yaml": {
+   "p50_min": 0.099,
+   "p90_min": 0.102,
+   "runs": 3378,
+   "cases": 15
+  },
+  "inductor/test_sdpa_tiling_config.yaml": {
+   "p50_min": 1.205,
+   "p90_min": 1.772,
+   "runs": 3377,
+   "cases": 42
+  },
+  "inductor/test_sdsc_logging_config.yaml": {
+   "p50_min": 0.098,
+   "p90_min": 0.1,
+   "runs": 3377,
+   "cases": 7
+  },
+  "inductor/test_simulated_annealing_config.yaml": {
+   "p50_min": 0.102,
+   "p90_min": 0.104,
+   "runs": 3371,
+   "cases": 18
+  },
+  "inductor/test_sliding_window_attention_config.yaml": {
+   "p50_min": 16.408,
+   "p90_min": 20.061,
+   "runs": 3561,
+   "cases": 48
+  },
+  "inductor/test_solver_auto_coarse_tiling_config.yaml": {
+   "p50_min": 2.137,
+   "p90_min": 2.677,
+   "runs": 3564,
+   "cases": 43
+  },
+  "inductor/test_solver_cost_model_config.yaml": {
+   "p50_min": 0.261,
+   "p90_min": 0.271,
+   "runs": 3379,
+   "cases": 112
+  },
+  "inductor/test_solver_relayout_config.yaml": {
+   "p50_min": 0.688,
+   "p90_min": 1.453,
+   "runs": 3375,
+   "cases": 74
+  },
+  "inductor/test_span_overflow_hint_analysis_config.yaml": {
+   "p50_min": 0.596,
+   "p90_min": 0.649,
+   "runs": 3562,
+   "cases": 201
+  },
+  "inductor/test_spyre_hint_keys_config.yaml": {
+   "p50_min": 0.1,
+   "p90_min": 0.101,
+   "runs": 2069,
+   "cases": 10
+  },
+  "inductor/test_subgraph_wrapper_config.yaml": {
+   "p50_min": 0.1,
+   "p90_min": 0.102,
+   "runs": 3377,
+   "cases": 4
+  },
+  "inductor/test_symbolic_dim_bundle_config.yaml": {
+   "p50_min": 0.099,
+   "p90_min": 0.158,
+   "runs": 3377,
+   "cases": 21
+  },
+  "inductor/test_taylor_cossin_config.yaml": {
+   "p50_min": 1.282,
+   "p90_min": 1.456,
+   "runs": 3377,
+   "cases": 52
+  },
+  "inductor/test_timing_recorder_config.yaml": {
+   "p50_min": 0.1,
+   "p90_min": 0.101,
+   "runs": 3377,
+   "cases": 30
+  },
+  "inductor/test_view_backed_loop_codegen_config.yaml": {
+   "p50_min": 0.099,
+   "p90_min": 0.1,
+   "runs": 3377,
+   "cases": 3
+  },
+  "inductor/test_work_division_config.yaml": {
+   "p50_min": 0.203,
+   "p90_min": 0.23,
+   "runs": 3378,
+   "cases": 121
+  },
+  "inductor/test_work_division_hint_config.yaml": {
+   "p50_min": 0.756,
+   "p90_min": 0.879,
+   "runs": 3564,
+   "cases": 127
+  },
+  "tensors/test_coordinates_config.yaml": {
+   "p50_min": 0.119,
+   "p90_min": 0.126,
+   "runs": 3381,
+   "cases": 42
+  },
+  "tensors/test_it_space_splits_config.yaml": {
+   "p50_min": 0.097,
+   "p90_min": 0.098,
+   "runs": 3377,
+   "cases": 12
+  },
+  "tensors/test_memory_format_config.yaml": {
+   "p50_min": 0.0,
+   "p90_min": 0.0,
+   "runs": 3566,
+   "cases": 4
+  },
+  "tensors/test_model_utils_config.yaml": {
+   "p50_min": 0.004,
+   "p90_min": 0.009,
+   "runs": 3564,
+   "cases": 26
+  },
+  "tensors/test_resize_config.yaml": {
+   "p50_min": 0.097,
+   "p90_min": 0.098,
+   "runs": 3565,
+   "cases": 32
+  },
+  "tensors/test_safetensors_patch_monkey_patch_config.yaml": {
+   "p50_min": 0.096,
+   "p90_min": 0.097,
+   "runs": 3561,
+   "cases": 56
+  },
+  "tensors/test_safetensors_patch_monkey_patch_spyre_config.yaml": {
+   "p50_min": 0.0,
+   "p90_min": 0.0,
+   "runs": 3563,
+   "cases": 19
+  },
+  "tensors/test_tensor_layout_config.yaml": {
+   "p50_min": 0.378,
+   "p90_min": 0.446,
+   "runs": 3563,
+   "cases": 137
+  },
+  "test_allocator_e2e_config.yaml": {
+   "p50_min": 0.751,
+   "p90_min": 0.985,
+   "runs": 3580,
+   "cases": 16
+  },
+  "test_async_compile_config.yaml": {
+   "p50_min": 0.061,
+   "p90_min": 0.068,
+   "runs": 3391,
+   "cases": 21
+  },
+  "test_composite_address_config.yaml": {
+   "p50_min": 0.1,
+   "p90_min": 0.102,
+   "runs": 3571,
+   "cases": 5
+  },
+  "test_derive_artifact_id_config.yaml": {
+   "p50_min": 0.002,
+   "p90_min": 0.004,
+   "runs": 3383,
+   "cases": 15
+  },
+  "test_device_enum_config.yaml": {
+   "p50_min": 0.691,
+   "p90_min": 0.745,
+   "runs": 3384,
+   "cases": 10
+  },
+  "test_device_error_skip_config.yaml": {
+   "p50_min": 0.28,
+   "p90_min": 0.299,
+   "runs": 3383,
+   "cases": 26
+  },
+  "test_eager_compile_guards_config.yaml": {
+   "p50_min": 0.363,
+   "p90_min": 0.386,
+   "runs": 3382,
+   "cases": 11
+  },
+  "test_execution_trace_config.yaml": {
+   "p50_min": 0.187,
+   "p90_min": 0.201,
+   "runs": 3568,
+   "cases": 1
+  },
+  "test_fallbacks_config.yaml": {
+   "p50_min": 0.207,
+   "p90_min": 0.231,
+   "runs": 3381,
+   "cases": 10
+  },
+  "test_ffdc_config.yaml": {
+   "p50_min": 0.1,
+   "p90_min": 0.11,
+   "runs": 3382,
+   "cases": 63
+  },
+  "test_gha_composite_action_manifests_config.yaml": {
+   "p50_min": 0.003,
+   "p90_min": 0.004,
+   "runs": 3377,
+   "cases": 46
+  },
+  "test_hw_diagnostics_scripts_config.yaml": {
+   "p50_min": 0.001,
+   "p90_min": 0.001,
+   "runs": 3379,
+   "cases": 25
+  },
+  "test_ingest_kernel_xml_config.yaml": {
+   "p50_min": 0.001,
+   "p90_min": 0.005,
+   "runs": 3378,
+   "cases": 12
+  },
+  "test_ingest_xml_config.yaml": {
+   "p50_min": 0.004,
+   "p90_min": 0.011,
+   "runs": 3378,
+   "cases": 85
+  },
+  "test_kernel_caching_config.yaml": {
+   "p50_min": 0.371,
+   "p90_min": 0.409,
+   "runs": 3565,
+   "cases": 22
+  },
+  "test_launch_jobplan_config.yaml": {
+   "p50_min": 0.199,
+   "p90_min": 0.221,
+   "runs": 3560,
+   "cases": 11
+  },
+  "test_layout_config.yaml": {
+   "p50_min": 0.003,
+   "p90_min": 0.003,
+   "runs": 1,
+   "cases": 23
+  },
+  "test_logging_patterns_config.yaml": {
+   "p50_min": 1.74,
+   "p90_min": 1.904,
+   "runs": 3373,
+   "cases": 44
+  },
+  "test_mark_retried_config.yaml": {
+   "p50_min": 0.001,
+   "p90_min": 0.004,
+   "runs": 3297,
+   "cases": 9
+  },
+  "test_memory_pressure_gc_config.yaml": {
+   "p50_min": 0.41,
+   "p90_min": 0.449,
+   "runs": 3564,
+   "cases": 5
+  },
+  "test_model_ops_capability_config.yaml": {
+   "p50_min": 0.0,
+   "p90_min": 0.001,
+   "runs": 3296,
+   "cases": 4
+  },
+  "test_model_ops_v1_parity_config.yaml": {
+   "p50_min": 0.0,
+   "p90_min": 0.0,
+   "runs": 3300,
+   "cases": 2
+  },
+  "test_modules_config.yaml": {
+   "p50_min": 0.201,
+   "p90_min": 0.217,
+   "runs": 3563,
+   "cases": 2
+  },
+  "test_oot_framework_utils_config.yaml": {
+   "p50_min": 0.0,
+   "p90_min": 0.0,
+   "runs": 1687,
+   "cases": 8
+  },
+  "test_op_spec_lab_config.yaml": {
+   "p50_min": 0.101,
+   "p90_min": 0.108,
+   "runs": 3377,
+   "cases": 35
+  },
+  "test_prepare_kernel_config.yaml": {
+   "p50_min": 0.097,
+   "p90_min": 0.099,
+   "runs": 3563,
+   "cases": 45
+  },
+  "test_regex_config.yaml": {
+   "p50_min": 0.0,
+   "p90_min": 0.0,
+   "runs": 3377,
+   "cases": 1
+  },
+  "test_reuse_copy_config.yaml": {
+   "p50_min": 0.0,
+   "p90_min": 0.0,
+   "runs": 3378,
+   "cases": 11
+  },
+  "test_shared_host_pool_config.yaml": {
+   "p50_min": 0.1,
+   "p90_min": 0.102,
+   "runs": 29,
+   "cases": 26
+  },
+  "test_spyre_config.yaml": {
+   "p50_min": 0.302,
+   "p90_min": 0.336,
+   "runs": 3564,
+   "cases": 54
+  },
+  "test_spyre_generator_config.yaml": {
+   "p50_min": 0.0,
+   "p90_min": 0.0,
+   "runs": 3564,
+   "cases": 6
+  },
+  "test_spyre_lazy_init_config.yaml": {
+   "p50_min": 0.194,
+   "p90_min": 0.214,
+   "runs": 3377,
+   "cases": 2
+  },
+  "test_spyre_lazy_silent_config.yaml": {
+   "p50_min": 0.151,
+   "p90_min": 0.156,
+   "runs": 3377,
+   "cases": 1
+  },
+  "test_spyre_profiler_config.yaml": {
+   "p50_min": 18.43,
+   "p90_min": 19.778,
+   "runs": 85,
+   "cases": 33
+  },
+  "test_stream_config.yaml": {
+   "p50_min": 0.185,
+   "p90_min": 0.199,
+   "runs": 3562,
+   "cases": 26
+  },
+  "test_version_config.yaml": {
+   "p50_min": 0.0,
+   "p90_min": 0.0,
+   "runs": 3377,
+   "cases": 3
+  }
+ }
+}

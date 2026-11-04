@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import inspect
 import logging
 import time
+from collections.abc import Iterator
 from typing import Optional, Any, Callable
 
 import torch
@@ -71,14 +73,17 @@ from .insert_restickify import (
 )
 from .enforce_indirect_access_layout import enforce_indirect_access_layout
 from .hbm_pool_planning import hbm_pool_planning
+from .sharded_hbm import plan_sharded_hbm
 from .work_division import (
     span_reduction,
     work_distribution,
     cost_model_matmul_division,
+    defer_work_division,
 )
 from .pass_utils import format_operations, finalize_work_division_for_scheduler
 from .scratchpad.allocator import (
     scratchpad_planning,
+    solve_decides_work_division,
 )
 from .scratchpad.lx_relayout import anchor_lx_relayout_ownership
 from .fusion import spyre_fuse_nodes
@@ -88,6 +93,7 @@ from .scheduler import (
 )
 from .constants import DEVICE_NAME
 from .deadcode_elimination import deadcode_elimination
+from .loop_node import OpsView, all_ops, expand, expanded, has_loop_nodes
 from .dedup_constants import dedup_and_promote_constants
 from .read_copy_elision import elide_proven_read_copies
 from .materialize_hinted_views import materialize_hinted_views
@@ -151,6 +157,11 @@ def _operations_have_spyre_device(operations: list[Operation]) -> bool:
         op.get_device() is not None and op.get_device().type == DEVICE_NAME
         for op in operations
     )
+
+
+def _count_ops(operations) -> int:
+    """Leaf op count; the splice leaves LoopNodes in the real list it returns."""
+    return sum(1 for _ in all_ops(operations))
 
 
 def _uuid(passes: list[Callable]) -> Optional[Any]:
@@ -409,6 +420,12 @@ def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
 
 @_runs(cost_model_matmul_division, work_distribution)
 def _distribute_work(graph: GraphLowering) -> None:
+    if solve_decides_work_division():
+        # The co-optimizing LX solve re-chooses every split it can enumerate, so
+        # a split committed here would be overwritten. The allocator divides the
+        # ops it pins, and whatever the solve leaves, on demand.
+        defer_work_division(graph)
+        return
     # cost_model_matmul_division claims a subset of ops; work_distribution skips
     # those so every op is divided by exactly one of the two passes.
     preassigned_ops = cost_model_matmul_division(graph)
@@ -423,6 +440,50 @@ def _maybe_scratchpad_planning(graph: GraphLowering) -> None:
     # scratchpad_planning -> select_allocator; no allocator wiring here.
     plans = anchor_lx_relayout_ownership(graph)
     scratchpad_planning(graph, lx_relayout_plans=plans)
+
+
+# Passes the flat view cannot run as they run today, so they run on the
+# expanded list and the nodes are rebuilt after them.
+# ``dedup_and_promote_constants`` ends with ``operations[:] = constants +
+# non_constants``: it hoists every constant to the head of the WHOLE list. The
+# view keeps a constant that sits in a body inside that body (it cannot tell
+# whether a reorder means to cross a node boundary), and the node then sorts by
+# that constant, ahead of top-level ops it used to follow. On nested graphs that
+# changes the op order and the kernel (spec B.7, pass 18).
+_PASSES_RUN_EXPANDED = frozenset({"dedup_and_promote_constants"})
+
+
+@contextlib.contextmanager
+def _flat_operations(graph: GraphLowering, pass_name: str) -> Iterator[None]:
+    """For one pre-scheduling pass: if the graph holds LoopNodes, show the pass
+    (and the observer, timing and logging around it) a flat view of them.
+
+    No pass is node-aware yet. While the pass runs, ``graph.operations`` is a
+    ``loop_node.OpsView`` over the real nested list: it iterates the leaf ops
+    in program order and forwards each edit to the list that owns the op. The
+    real list is put back afterwards. A pass that rebinds ``graph.operations``
+    to a new list would silently drop the nodes, so that raises.
+    """
+    real = graph.operations
+    if not has_loop_nodes(real):
+        yield
+        return
+    if pass_name in _PASSES_RUN_EXPANDED:
+        with expanded(graph):
+            yield
+        return
+    view = OpsView(real)
+    graph.operations = view
+    try:
+        yield
+    finally:
+        rebound = graph.operations
+        graph.operations = real
+    if rebound is not view:
+        raise RuntimeError(
+            f"pre-scheduling pass {pass_name} rebound graph.operations while "
+            "LoopNodes were present; edit it in place"
+        )
 
 
 class CustomPreSchedulingPasses:
@@ -519,6 +580,12 @@ class CustomPreSchedulingPasses:
             _maybe_coarse_tile_span_overflow,
             #
             # Core Division
+            # The shard plan pins the split of ops on sharded operands first.
+            # Invariant: this must run before any pass that could insert a
+            # consumer of a sharded buffer (its rejection loops only see the
+            # graph as of this point); compute_ops' all-sharded check is the
+            # second net.
+            plan_sharded_hbm,
             span_reduction,
             _distribute_work,
             #
@@ -561,7 +628,14 @@ class CustomPreSchedulingPasses:
                     )
 
             with timing_recorder.stage(f"stage:{pipeline}:pass_loop"):
-                self._run_pass_loop(graph)
+                try:
+                    self._run_pass_loop(graph)
+                finally:
+                    # splice_while_loops wraps each loop into a LoopNode; flatten
+                    # them again so the cost model, the scheduler and codegen see
+                    # today's flat list. In a finally so an error in a pass does
+                    # not leave nodes behind for an error handler to trip over.
+                    expand(graph)
 
             if logger.isEnabledFor(logging.INFO):
                 with timing_recorder.stage(f"stage:{pipeline}:log_after"):
@@ -597,33 +671,45 @@ class CustomPreSchedulingPasses:
         pipeline = type(self).__name__
         for pass_fn in self.passes:
             pass_name = _get_pass_name(pass_fn)
-            # `graph` is the same object throughout -- passes mutate
-            # `graph.operations` in place -- so before/after reconciliation
-            # is exact here.
-            with SpyreGraphTransformObserver(graph, pass_name, kind="graphlowering"):
-                pass_counts = COUNTERS.snapshot()
-                with timing_recorder.stage(
-                    f"pass:{pipeline}:{pass_name}",
-                    input_operations=len(graph.operations),
-                ) as event:
-                    t0 = time.perf_counter()
-                    pass_fn(graph)
-                    elapsed_ms = (time.perf_counter() - t0) * 1000
-                # Counted after the region closes, so counting is never charged
-                # to the work it describes.
-                event.meta["output_operations"] = len(graph.operations)
-                event.meta.update(COUNTERS.since(pass_counts))
+            with _flat_operations(graph, pass_name):
+                self._run_one_pass(graph, pipeline, pass_fn, pass_name)
 
-            if logger.isEnabledFor(logging.INFO):
-                logger.info(
-                    "elapsed %5dms  %s",
-                    elapsed_ms,
-                    pass_name,
-                )
-            if logger.isEnabledFor(logging.DEBUG) and _should_log_pass(pass_name):
-                logger.debug(
-                    "AFTER %s\n%s", pass_name, format_operations(graph.operations)
-                )
+    def _run_one_pass(
+        self,
+        graph: GraphLowering,
+        pipeline: str,
+        pass_fn: Callable,
+        pass_name: str,
+    ) -> None:
+        # `graph` is the same object throughout -- passes mutate
+        # `graph.operations` in place -- so before/after reconciliation
+        # is exact here.
+        with SpyreGraphTransformObserver(graph, pass_name, kind="graphlowering"):
+            pass_counts = COUNTERS.snapshot()
+            with timing_recorder.stage(
+                f"pass:{pipeline}:{pass_name}",
+                input_operations=len(graph.operations),
+            ) as event:
+                t0 = time.perf_counter()
+                pass_fn(graph)
+                elapsed_ms = (time.perf_counter() - t0) * 1000
+            # Counted after the region closes, so counting is never charged
+            # to the work it describes.
+            event.meta["output_operations"] = _count_ops(graph.operations)
+            event.meta.update(COUNTERS.since(pass_counts))
+
+        if logger.isEnabledFor(logging.INFO):
+            logger.info(
+                "elapsed %5dms  %s",
+                elapsed_ms,
+                pass_name,
+            )
+        if logger.isEnabledFor(logging.DEBUG) and _should_log_pass(pass_name):
+            logger.debug(
+                "AFTER %s\n%s",
+                pass_name,
+                format_operations(list(all_ops(graph.operations))),
+            )
 
     def uuid(self) -> Any | None:
         return _uuid(self.passes)

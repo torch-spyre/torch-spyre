@@ -18,10 +18,14 @@ __all__: list[str] = [
     "SymbolicArg",
     "SymbolicArgKind",
     "_SpyreStreamBase",
+    "_spyre_empty_sharded",
+    "_spyre_is_sharded",
+    "_spyre_sharding_info",
     "current_stream",
     "default_stream",
     "get_device_state",
     "get_stream_from_pool",
+    "num_memory_domains",
     "set_current_stream",
     "stream_get_error",
     "stream_get_error_string",
@@ -52,10 +56,31 @@ __all__: list[str] = [
     "spyre_empty_with_layout",
     "start_runtime",
     "to_with_layout",
+    "PoolBackend",
+    "PoolConfig",
+    "PoolDescriptor",
+    "PoolState",
+    "PoolStatus",
+    "SharedPool",
+    "attach_pool",
+    "create_pool",
+    "destroy_pool",
+    "detach_pool",
+    "open_pool",
 ]
 
 AIUPTI_ACTIVITY_NAME_MAX_BYTES: int
 
+def _spyre_empty_sharded(
+    size: collections.abc.Sequence[typing.SupportsInt],
+    dtype: torch.dtype,
+    shard_dim: typing.SupportsInt,
+    num_shards: typing.SupportsInt,
+    device: torch.device | None = None,
+) -> torch.Tensor: ...
+def _spyre_is_sharded(tensor: torch.Tensor) -> bool: ...
+def _spyre_sharding_info(tensor: torch.Tensor) -> dict[str, object]: ...
+def num_memory_domains() -> int: ...
 def extract_kernel_provenance_key(event_name: str) -> str | None: ...
 def kernel_provenance_registry_stats() -> dict[str, int]: ...
 def lookup_kernel_provenance(key: str) -> list[str] | None: ...
@@ -428,10 +453,13 @@ class SymbolicArgKind:
       kAddress
 
       kDimension
+
+      kShardAddress
     """
 
     kAddress: typing.ClassVar[SymbolicArgKind]
     kDimension: typing.ClassVar[SymbolicArgKind]
+    kShardAddress: typing.ClassVar[SymbolicArgKind]
     __members__: typing.ClassVar[dict[str, SymbolicArgKind]]
     def __eq__(self, other: typing.Any) -> bool: ...
     def __hash__(self) -> int: ...
@@ -448,12 +476,14 @@ class SymbolicArg:
     value: int
     tensor_id: int
     dim_index: int
+    num_shards: int
     def __init__(
         self,
         kind: SymbolicArgKind,
         tensor_id: int,
         dim_index: int = -1,
         value: int = -1,
+        num_shards: int = -1,
     ) -> None: ...
     def __repr__(self) -> str: ...
 
@@ -568,3 +598,63 @@ def start_runtime() -> None: ...
 def set_device(idx: int) -> None: ...
 def current_device() -> int: ...
 def to_with_layout(arg0: torch.Tensor, arg1: SpyreTensorLayout) -> torch.Tensor: ...
+
+class SharedPool:
+    def slot_count(self) -> int: ...
+    def slot_bytes(self) -> int: ...
+    def name(self) -> str: ...
+    def total_bytes(self) -> int: ...
+
+class PoolBackend:
+    HostDram: typing.ClassVar[PoolBackend]
+
+class PoolState:
+    Initializing: typing.ClassVar[PoolState]
+    Ready: typing.ClassVar[PoolState]
+    Destroying: typing.ClassVar[PoolState]
+
+class PoolStatus:
+    Ok: typing.ClassVar[PoolStatus]
+    NotFound: typing.ClassVar[PoolStatus]
+    AlreadyExists: typing.ClassVar[PoolStatus]
+    Initializing: typing.ClassVar[PoolStatus]
+    Destroying: typing.ClassVar[PoolStatus]
+    PoolBusy: typing.ClassVar[PoolStatus]
+    StaleGeneration: typing.ClassVar[PoolStatus]
+    ConfigurationMismatch: typing.ClassVar[PoolStatus]
+    ResourceError: typing.ClassVar[PoolStatus]
+
+class PoolConfig:
+    name: str
+    backend: PoolBackend
+    num_slots: int
+    slot_bytes: int
+    compatibility: bytes
+    def __init__(
+        self,
+        name: str,
+        num_slots: int,
+        slot_bytes: int,
+        backend: PoolBackend = ...,
+        compatibility: bytes = ...,
+    ) -> None: ...
+
+class PoolDescriptor:
+    @property
+    def name(self) -> str: ...
+    @property
+    def generation(self) -> int: ...
+    @property
+    def state(self) -> PoolState: ...
+    @property
+    def config(self) -> PoolConfig: ...
+    def __getstate__(self) -> tuple[typing.Any, ...]: ...
+    def __setstate__(self, state: tuple[typing.Any, ...]) -> None: ...
+
+def create_pool(config: PoolConfig) -> tuple[PoolStatus, PoolDescriptor | None]: ...
+def open_pool(name: str) -> tuple[PoolStatus, PoolDescriptor | None]: ...
+def destroy_pool(descriptor: PoolDescriptor) -> PoolStatus: ...
+def attach_pool(
+    descriptor: PoolDescriptor,
+) -> tuple[PoolStatus, SharedPool | None]: ...
+def detach_pool(pool: SharedPool) -> None: ...
