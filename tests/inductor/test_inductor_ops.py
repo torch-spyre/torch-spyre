@@ -4873,6 +4873,48 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
         },
         (
+            # Integer comparisons give fp32-backed bools (32 elems/stick); combining
+            # two of them must not assume the 64-elem stick of an fp16 bool.
+            "test_logical_int_mask",
+            "test_logical_int_mask_compiled",
+        ): {
+            "ops_dict": {
+                "and": lambda a, b: torch.logical_and(a >= 0, a < b),
+                "or": lambda a, b: torch.logical_or(a < 0, a >= b),
+                "where_and": lambda a, b: torch.where(
+                    torch.logical_and(a >= 0, a < b), a, torch.zeros_like(a)
+                ),
+            },
+            "param_sets": {
+                f"{str(dtype).split('.')[-1]}_{n}": (
+                    torch.randint(-50, 1050, (n,), dtype=dtype),
+                    torch.full((n,), 1000, dtype=dtype),
+                )
+                for dtype in (torch.int64, torch.int32)
+                for n in (1, 7, 64, 512)
+            },
+        },
+        (
+            # An fp16-backed and an fp32-backed bool share no stick size.
+            "test_logical_mixed_bool_mask",
+            "test_logical_int_mask_compiled",
+        ): {
+            "ops_dict": {
+                "and": lambda x, a: torch.logical_and(x >= 0, a < 1000),
+            },
+            "param_sets": {
+                "fp16_int32_64": (
+                    cached_randn((64,), dtype=torch.float16),
+                    torch.randint(-50, 1050, (64,), dtype=torch.int32),
+                ),
+            },
+            # TODO: a missing feature. When mixed bool formats are converted to one
+            # format this stops raising, and the case has to become a positive one.
+            "expect_raise": {
+                "and_fp16_int32_64": "torch.bool result from operands with device",
+            },
+        },
+        (
             "test_logical_not",
             "test_fallback_unary_op_cpu",
         ): {
@@ -9754,6 +9796,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_fallback_unary_op_cpu(self, op, x):
         self.compare_with_cpu(op, x)
 
+    def test_logical_int_mask_compiled(self, op, a, b):
+        # Exercise compiled layouts without requiring eager logical kernels.
+        # LX wrappers leave bool/int outputs unchanged, but the reduction wrapper
+        # relaxes atol. Bypass them to keep these checks exact under LX too.
+        utils_inductor.compare_with_cpu(op, a, b, atol=0, rtol=0, run_eager=False)
+
     def test_binary_op(self, op, a, b):
         if op == torch.div:
             # TODO: Division by 0 or near-zero differs on Spyre from CPU, sidestep for now.
@@ -10906,33 +10954,23 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ):
             self.compare_with_cpu(lambda x: torch.cummin(x, dim=0), x, run_eager=False)
 
-    @pytest.mark.xfail(
-        reason=(
-            "Spyre compiled backend does not support torch.quantile yet "
-            "(stable error signature: InductorError: KeyError: "
-            "'No FX node for buf...', the failure of #3287)"
-        ),
-        raises=InductorError,
-        strict=True,
-    )
-    def test_quantile_q050_dim0_known_xfail(self):
+    @expects_raise
+    def test_quantile_q050_dim0_rejected(self):
+        # TODO(#1228): 2.14 constant folding materializes quantile's internal
+        # float64 conversion of q on device. When Double is supported, replace
+        # this rejection assertion with a numerical check.
         x = cached_randn((67, 256), dtype=torch.float32)
-        self.compare_with_cpu(
-            lambda x: torch.quantile(x, 0.5, dim=0, keepdim=False),
-            x,
-            run_eager=False,
-        )
+        with pytest.raises(RuntimeError, match="does not support dtype Double"):
+            self.compare_with_cpu(
+                lambda x: torch.quantile(x, 0.5, dim=0, keepdim=False),
+                x,
+                run_eager=False,
+            )
 
-    @pytest.mark.xfail(
-        reason=(
-            "Spyre compiled backend does not support torch.nanquantile yet "
-            "(stable error signature: InductorError: KeyError: "
-            "'No FX node for buf...', the failure of #3287)"
-        ),
-        raises=InductorError,
-        strict=True,
-    )
-    def test_nanquantile_q050_dim0_known_xfail(self):
+    @expects_raise
+    def test_nanquantile_q050_dim0_rejected(self):
+        # TODO(#1228): nanquantile has the same internal float64 conversion of
+        # q as quantile. Make this a numerical check once Double is supported.
         x = torch.tensor(
             [
                 [float("nan"), 1.0, -2.0, 3.0],
@@ -10942,11 +10980,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             ],
             dtype=torch.float32,
         )
-        self.compare_with_cpu(
-            lambda x: torch.nanquantile(x, 0.5, dim=0, keepdim=False),
-            x,
-            run_eager=False,
-        )
+        with pytest.raises(RuntimeError, match="does not support dtype Double"):
+            self.compare_with_cpu(
+                lambda x: torch.nanquantile(x, 0.5, dim=0, keepdim=False),
+                x,
+                run_eager=False,
+            )
 
     @expects_raise
     def test_median_dim1_rejected(self):
