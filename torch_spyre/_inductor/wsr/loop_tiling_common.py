@@ -213,9 +213,9 @@ def _stick_host_dim(op: ComputedBuffer, device_layout) -> int | None:
     """Authoritative stick host-dim index for ``op``'s output, recovered from
     coordinate identity (issue #3116).
 
-    ``SpyreTensorLayout`` discards its ``dim_map`` at construction, so the
-    host<->device dim identity is not carried on the layout object.  We recover
-    only the stick host dim: the device layout's inner-stick coordinate has a
+    A ``SpyreTensorLayout`` does not record which host dim each device dim came
+    from, so the host<->device dim identity is not carried on the layout object.
+    We recover only the stick host dim: the device layout's inner-stick coordinate has a
     single iteration symbol that also drives exactly one host coordinate, so
     ``matching_dim`` resolves it unambiguously — even when two host dims share a
     size (transposed flash-attn QK^T with ``Sq == Skv``), which defeats the
