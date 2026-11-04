@@ -787,6 +787,42 @@ def _default_pointwise_layout(
     )
 
 
+def _is_loop_scaffold_origin(node) -> bool:
+    """Whether an origin was added by splicing a loop body into its parent graph.
+
+    A buffer from a spliced ``for_each_tile`` body lists the ``while_loop``
+    higher-order op and the ``get_attr`` nodes of its cond and body subgraphs
+    ahead of the op that computes it, e.g. ``[while_loop,
+    while_loop_cond_graph_0_0, while_loop_body_graph_0_0, aten.reshape.default,
+    spyre.qfp8ch.default]``.
+    """
+    return getattr(node, "op", None) == "get_attr" or isinstance(
+        getattr(node, "target", None), torch._ops.HigherOrderOperator
+    )
+
+
+def _layout_dispatch_target(data, special_ops: tuple):
+    """The origin target that selects an op's layout rule.
+
+    This is the first origin. The one exception is a buffer whose first
+    origin is loop scaffolding (see ``_is_loop_scaffold_origin``) and that
+    has an op from ``special_ops`` among its origins: that op is returned.
+    The spliced body lists view origins such as ``aten.reshape.default``
+    before the real op too, so the op is looked for by name (issue #5423:
+    ``qfp8ch`` and ``qfp8wt`` inside a ``for_each_tile`` body fell through
+    to the generic pointwise rule). Every other buffer, inside a loop body or
+    not, keeps the first-origin rule unchanged.
+    """
+    origins = list(data.origins)
+    if not origins:
+        return None
+    if _is_loop_scaffold_origin(origins[0]):
+        special = next((o.target for o in origins if o.target in special_ops), None)
+        if special is not None:
+            return special
+    return origins[0].target
+
+
 def _single_arg_op_layout(
     op: Operation,
     output: FixedLayout,
@@ -808,7 +844,13 @@ def _single_arg_op_layout(
 
     # Single-arg pointwise
     assert isinstance(data, Pointwise)
-    aten_op = next(iter(data.origins)).target if data.origins else None
+    # Inside a for_each_tile body only the FP8 quantizations are looked up
+    # past the loop origins (#5423); their layout rule is what batchmatmulfp8
+    # needs. The dtype conversions keep the first-origin rule there:
+    # rerouting them changed an fp16 attention body's schedule.
+    aten_op = _layout_dispatch_target(
+        data, (spyreop.qfp8ch.default, spyreop.qfp8wt.default)
+    )
     match aten_op:
         case (
             prims.convert_element_type.default
