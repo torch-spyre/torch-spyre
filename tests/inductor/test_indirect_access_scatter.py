@@ -28,6 +28,7 @@ capture-only via check(expect=CRASHED); there is no bundle to run end-to-end.
 import os
 import sys
 
+import pytest
 import torch
 from torch._inductor.utils import run_and_get_code
 
@@ -39,12 +40,14 @@ from indirect_access_common import (  # noqa: E402
     DIRECT_OP_SPEC,
     register_multicore_variants,
 )
+from utils_inductor import expects_raise  # noqa: E402
 
 from torch_spyre._C import (  # noqa: E402
     SpyreTensorLayout,
     get_device_dtype,
     get_elem_in_stick,
 )
+from torch_spyre._inductor.errors import Unsupported  # noqa: E402
 
 
 # The backend scheduler's rejection of a scatter bundle (#4409), as it appears in
@@ -1297,8 +1300,9 @@ class _ScatterScenarios:
 
         self.check(kernel, inp, mask, src, expect=CRASHED)
 
-    # -- Rank-changing view before a scatter (issue #4443) -----------------
+    # -- Rank-changing view (issue #4443) -----------------
 
+    @expects_raise
     def test_scatter_rank_changing_view_unsupported(self):
         """Scatter ops into a rank-changing view whose inner dims are sub-stick.
 
@@ -1339,12 +1343,16 @@ class _ScatterScenarios:
                 x = torch.zeros(8, 32, 32, dtype=torch.float16).to("spyre")
                 idx = torch.arange(4, dtype=idx_dtype).to("spyre")
                 src = torch.ones(4, 1024, dtype=torch.float16).to("spyre")
-                result = self.check(kernel, x, idx, src, expect=CRASHED)
-                msg = str(result.exc)
-                self.assertIn("innermost allocation stride (32)", msg)
-                self.assertIn("elems_per_stick (64)", msg)
-                self.assertIn("sub-stick", msg)
+                with pytest.raises(
+                    Unsupported,
+                    match=(
+                        "innermost allocation stride \\(32\\)"
+                        ".*elems_per_stick \\(64\\).*sub-stick"
+                    ),
+                ):
+                    torch.compile(kernel, dynamic=False)(x, idx, src)
 
+    @expects_raise
     def test_scatter_rank_changing_view_unsupported_fp32(self):
         """Same view collapse with fp32 (32 elems/stick): [8, 16, 16] -> [8, 256].
 
@@ -1359,12 +1367,16 @@ class _ScatterScenarios:
             x.view(8, 256).index_put_((idx,), src, accumulate=False)
             return x
 
-        result = self.check(kernel, x, idx, src, expect=CRASHED)
-        msg = str(result.exc)
-        self.assertIn("innermost allocation stride (16)", msg)
-        self.assertIn("elems_per_stick (32)", msg)
-        self.assertIn("sub-stick", msg)
+        with pytest.raises(
+            Unsupported,
+            match=(
+                "innermost allocation stride \\(16\\)"
+                ".*elems_per_stick \\(32\\).*sub-stick"
+            ),
+        ):
+            torch.compile(kernel, dynamic=False)(x, idx, src)
 
+    @expects_raise
     def test_scatter_rank_changing_view_unsupported_reshape(self):
         """reshape (which returns a view here) behaves like view."""
         x = torch.zeros(8, 32, 32, dtype=torch.float16).to("spyre")
@@ -1375,11 +1387,13 @@ class _ScatterScenarios:
             x.reshape(8, 1024).index_put_((idx,), src, accumulate=False)
             return x
 
-        result = self.check(kernel, x, idx, src, expect=CRASHED)
-        msg = str(result.exc)
-        self.assertIn("innermost allocation stride (32)", msg)
-        self.assertIn("sub-stick", msg)
+        with pytest.raises(
+            Unsupported,
+            match="innermost allocation stride \\(32\\).*sub-stick",
+        ):
+            torch.compile(kernel, dynamic=False)(x, idx, src)
 
+    @expects_raise
     def test_scatter_rank_changing_view_unsupported_row_counts(self):
         """The failure does not depend on the number of leading rows."""
 
@@ -1393,12 +1407,16 @@ class _ScatterScenarios:
                 x = torch.zeros(rows, 32, 32, dtype=torch.float16).to("spyre")
                 idx = torch.arange(2, dtype=torch.int32).to("spyre")
                 src = torch.ones(2, 1024, dtype=torch.float16).to("spyre")
-                result = self.check(kernel, x, idx, src, expect=CRASHED)
-                msg = str(result.exc)
-                self.assertIn("innermost allocation stride (32)", msg)
-                self.assertIn("elems_per_stick (64)", msg)
-                self.assertIn("sub-stick", msg)
+                with pytest.raises(
+                    Unsupported,
+                    match=(
+                        "innermost allocation stride \\(32\\)"
+                        ".*elems_per_stick \\(64\\).*sub-stick"
+                    ),
+                ):
+                    torch.compile(kernel, dynamic=False)(x, idx, src)
 
+    @expects_raise
     def test_scatter_rank_changing_view_unsupported_bf16(self):
         """bf16 shares fp16's 64-element stick, so the message matches fp16."""
         x = torch.zeros(8, 32, 32, dtype=torch.bfloat16).to("spyre")
@@ -1409,12 +1427,16 @@ class _ScatterScenarios:
             x.view(8, 1024).index_put_((idx,), src, accumulate=False)
             return x
 
-        result = self.check(kernel, x, idx, src, expect=CRASHED)
-        msg = str(result.exc)
-        self.assertIn("innermost allocation stride (32)", msg)
-        self.assertIn("elems_per_stick (64)", msg)
-        self.assertIn("sub-stick", msg)
+        with pytest.raises(
+            Unsupported,
+            match=(
+                "innermost allocation stride \\(32\\)"
+                ".*elems_per_stick \\(64\\).*sub-stick"
+            ),
+        ):
+            torch.compile(kernel, dynamic=False)(x, idx, src)
 
+    @expects_raise
     def test_scatter_rank_changing_view_4d_to_2d_unsupported(self):
         """4-D -> 2-D collapse when inner three dims are all sub-stick.
 
@@ -1430,12 +1452,16 @@ class _ScatterScenarios:
             x.view(4, 1024).index_put_((idx,), src, accumulate=False)
             return x
 
-        result = self.check(kernel, x, idx, src, expect=CRASHED)
-        msg = str(result.exc)
-        self.assertIn("innermost allocation stride (16)", msg)
-        self.assertIn("elems_per_stick (64)", msg)
-        self.assertIn("sub-stick", msg)
+        with pytest.raises(
+            Unsupported,
+            match=(
+                "innermost allocation stride \\(16\\)"
+                ".*elems_per_stick \\(64\\).*sub-stick"
+            ),
+        ):
+            torch.compile(kernel, dynamic=False)(x, idx, src)
 
+    @expects_raise
     def test_scatter_rank_changing_view_partial_collapse_unsupported(self):
         """Partial collapse: three sub-stick trailing dims collapsed to one.
 
@@ -1451,11 +1477,13 @@ class _ScatterScenarios:
             x.view(8, 4096).index_put_((idx,), src, accumulate=False)
             return x
 
-        result = self.check(kernel, x, idx, src, expect=CRASHED)
-        msg = str(result.exc)
-        self.assertIn("innermost allocation stride (32)", msg)
-        self.assertIn("sub-stick", msg)
+        with pytest.raises(
+            Unsupported,
+            match="innermost allocation stride \\(32\\).*sub-stick",
+        ):
+            torch.compile(kernel, dynamic=False)(x, idx, src)
 
+    @expects_raise
     def test_scatter_rank_changing_view_int8_unsupported(self):
         """int8 has elems_per_stick=128; inner dim of 64 is sub-stick for int8.
 
@@ -1470,11 +1498,14 @@ class _ScatterScenarios:
             x.view(8, 512).index_put_((idx,), src, accumulate=False)
             return x
 
-        result = self.check(kernel, x, idx, src, expect=CRASHED)
-        msg = str(result.exc)
-        self.assertIn("innermost allocation stride (64)", msg)
-        self.assertIn("elems_per_stick (128)", msg)
-        self.assertIn("sub-stick", msg)
+        with pytest.raises(
+            Unsupported,
+            match=(
+                "innermost allocation stride \\(64\\)"
+                ".*elems_per_stick \\(128\\).*sub-stick"
+            ),
+        ):
+            torch.compile(kernel, dynamic=False)(x, idx, src)
 
 
 # Op-behaviour scenarios run once at the default 32 cores. They classify / lower
