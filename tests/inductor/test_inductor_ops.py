@@ -13662,6 +13662,87 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=True,
         )
 
+    @pytest.mark.filterwarnings("error::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_index_copy_int32_index(self):
+        """Eager index_copy / index_copy_ / index_copy(out=) accept an int32 index.
+
+        Spyre has no int64, so int32 is its native index dtype. The in-place and
+        functional overloads used to raise "Expected a long tensor for index"
+        while ``out=`` and the compiled path accepted it.
+
+        CPU rejects an int32 index for these ops, so ``fn`` widens the index on
+        the CPU run only; the Spyre run keeps int32.
+        """
+
+        def functional(dst, index, src):
+            if dst.device.type == "cpu":
+                index = index.long()
+            return torch.index_copy(dst, 2, index, src)
+
+        def inplace(dst, index, src):
+            if dst.device.type == "cpu":
+                index = index.long()
+            dst = dst.clone()
+            result = dst.index_copy_(2, index, src)
+            assert result.data_ptr() == dst.data_ptr(), (
+                "index_copy_: return value is not the same tensor as self"
+            )
+            return dst
+
+        def with_out(dst, index, src):
+            if dst.device.type == "cpu":
+                index = index.long()
+            out = torch.empty_like(dst)
+            torch.index_copy(dst, 2, index, src, out=out)
+            return out
+
+        dst = cached_randn((1, 8, 64, 128))
+        index = torch.tensor([3, 7, 9], dtype=torch.int32)
+        src = cached_randn((1, 8, 3, 128), differentiation="src")
+        for fn in (functional, inplace, with_out):
+            with self.subTest(fn=fn.__name__):
+                self.compare_with_cpu(
+                    fn, dst, index, src, run_compile=False, run_eager=True
+                )
+
+    @expects_raise
+    def test_index_copy_int32_index_rejects_bad_args(self):
+        """The int32-capable overloads still reject what PyTorch rejects.
+
+        PyTorch's checks for these ops live in code the Spyre kernels bypass, so
+        they are repeated in ``_check_index_copy_args``: a self/source dtype
+        mismatch and an index/source size mismatch, through the real ops on the
+        device, and an index that is neither int32 nor int64, through the helper
+        on CPU tensors (Spyre cannot hold an int16 tensor).
+        """
+        from torch_spyre.ops.eager import _check_index_copy_args
+
+        dst = cached_randn((1, 8, 64, 128)).to("spyre")
+        src = cached_randn((1, 8, 3, 128), differentiation="src").to("spyre")
+        index = torch.tensor([3, 7, 9], dtype=torch.int32).to("spyre")
+
+        # self fp16, source fp32
+        src_fp32 = src.to(torch.float32)
+        with pytest.raises(RuntimeError, match="same dtype"):
+            dst.index_copy_(2, index, src_fp32)
+        with pytest.raises(RuntimeError, match="same dtype"):
+            torch.index_copy(dst, 2, index, src_fp32)
+
+        # 2 indices for a source with 3 rows along ``dim``.
+        short = torch.tensor([3, 7], dtype=torch.int32).to("spyre")
+        with pytest.raises(RuntimeError, match="index_copy_"):
+            dst.index_copy_(2, short, src)
+        with pytest.raises(RuntimeError, match="index_copy_"):
+            torch.index_copy(dst, 2, short, src)
+
+        with pytest.raises(RuntimeError, match="int32 or int64 tensor for index"):
+            _check_index_copy_args(
+                torch.empty(1, 8, 64, 128, dtype=torch.float16),
+                2,
+                torch.tensor([3, 7, 9], dtype=torch.int16),
+                torch.empty(1, 8, 3, 128, dtype=torch.float16),
+            )
+
     def test_repeat_cpu(self, op, x, repeats):
         shape = x.repeat(*repeats).shape
         self.compare_with_cpu(lambda a: op(a, repeats, shape), x)
