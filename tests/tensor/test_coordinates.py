@@ -1457,7 +1457,19 @@ class TestSparseLayoutServesRead(TestCase):
             self.assertEqual(offset, flat, f"c0={flat}")
 
     def test_flat_read_is_served_and_exact(self):
-        for shape in ([8, 65], [3, 65], [4, 130], [2, 100], [2, 3, 65], [4, 2, 100]):
+        for shape in (
+            [8, 65],
+            [3, 65],
+            [4, 130],
+            [2, 100],
+            [2, 3, 65],
+            [4, 2, 100],
+            # 4D, including size-1 dims in the middle and in the front.
+            [2, 3, 4, 65],
+            [2, 2, 2, 100],
+            [3, 1, 2, 65],
+            [1, 2, 3, 65],
+        ):
             with self.subTest(shape=shape):
                 host = _contiguous_host(shape)
                 numel = math.prod(shape)
@@ -1481,7 +1493,7 @@ class TestSparseLayoutServesRead(TestCase):
         self._assert_flat_read_exact(sparse, math.prod(shape))
 
     def test_aligned_read_is_not_redirected(self):
-        for shape in ([8, 128], [2, 3, 64]):
+        for shape in ([8, 128], [2, 3, 64], [2, 2, 2, 128], [2, 2, 3, 64]):
             with self.subTest(shape=shape):
                 host = _contiguous_host(shape)
                 dense = SpyreTensorLayout(shape, torch.float16)
@@ -1498,7 +1510,7 @@ class TestSparseLayoutServesRead(TestCase):
     def test_restickify_target_for_unserved_read(self):
         # compute_restickify_needed asks for the sparse layout instead of
         # returning "no restickify needed" or "infeasible".
-        for shape in ([8, 65], [2, 3, 65]):
+        for shape in ([8, 65], [2, 3, 65], [2, 3, 4, 65], [3, 1, 2, 65]):
             with self.subTest(shape=shape):
                 host = _contiguous_host(shape)
                 numel = math.prod(shape)
