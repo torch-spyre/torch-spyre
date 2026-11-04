@@ -354,6 +354,8 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
                 # getattr(module_info, "apply_device_layout", False) so a
                 # ModuleInfo from any other source stays valid.
                 module_info.apply_device_layout = module_item.apply_device_layout
+                module_info.fp8_linears = list(module_item.fp8_linears)
+                module_info.module_precision = module_item.precision
                 module_db.append(module_info)
                 existing_names.add(module_name)
             except Exception as e:
