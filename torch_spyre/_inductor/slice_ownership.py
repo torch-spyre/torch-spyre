@@ -201,6 +201,70 @@ def project_slice_axis(
     return None
 
 
+def factor_slice_axis(
+    coordinate: sympy.Expr,
+    device_extent: int,
+    split: int,
+    slot: sympy.Expr,
+    iteration_space: Mapping[sympy.Symbol, sympy.Expr],
+) -> list[tuple[int, sympy.Expr, int, sympy.Expr]] | None:
+    """Factor an exact dense mixed-radix axis for the ownership proof only.
+
+    K's ``2*head + pair`` can split both loops. V's
+    ``2*head + floor(feature/64)`` can split heads and whole sticks. Unlike
+    containment in one loop, this requires an exact zero-origin, hole-free
+    product with independent digits and rectangular slice boundaries. It does
+    not rewrite addresses or authorize an intra-stick layout change.
+    """
+    digits = []
+    seen = set()
+    for term in sympy.Add.make_args(sympy.expand(coordinate)):
+        coefficient, digit = term.as_coeff_Mul()
+        if coefficient.is_Integer is not True or coefficient <= 0:
+            return None
+        if isinstance(digit, sympy.Symbol):
+            loop, divisor = digit, 1
+        elif digit.func == sympy.floor:
+            numerator, denominator = digit.args[0].as_numer_denom()
+            if (
+                not isinstance(numerator, sympy.Symbol)
+                or denominator.is_Integer is not True
+                or denominator <= 0
+            ):
+                return None
+            loop, divisor = numerator, int(denominator)
+        else:
+            return None
+        if loop in seen or loop not in iteration_space:
+            return None
+        seen.add(loop)
+        extent = iteration_space[loop]
+        extent = sympy.sympify(extent[0] if isinstance(extent, tuple) else extent)
+        if extent.is_Integer is not True or extent <= 0 or extent % divisor:
+            return None
+        radix = int(extent) // divisor
+        if radix <= 1:
+            return None
+        digits.append((int(coefficient), digit, radix))
+    if not 2 <= len(digits) <= 4:
+        return None
+    digits.sort(key=lambda item: item[0], reverse=True)
+    stride = device_extent
+    remaining = split
+    result = []
+    for coefficient, digit, radix in digits:
+        if stride % radix or coefficient != stride // radix:
+            return None
+        stride //= radix
+        factor = min(radix, remaining)
+        if radix % factor or remaining % factor:
+            return None
+        remaining //= factor
+        owner = sympy.Mod(sympy.floor(slot / remaining), factor)
+        result.append((radix, digit, factor, owner))
+    return result if stride == remaining == 1 else None
+
+
 def ownership_proofs_markdown() -> str:
     """Describe the exact proof order and the restricted recovery policy."""
     lines = [

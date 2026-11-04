@@ -62,12 +62,23 @@ if TYPE_CHECKING:
 
 logger = get_inductor_logger("sdsc_compile")
 
-# Wall-clock ceiling on ONE backend-compiler invocation, applied to dbo-opt on
-# both the bundle and the KTIR path. It bounds a wedged compiler -- which would
-# otherwise block torch.compile forever with no diagnostic -- rather than
-# policing slowness: both finish in well under a second on a small kernel.
-# Raise it if a large bundle legitimately needs longer.
-_COMPILE_TIMEOUT_S = 60.0
+
+def _backend_compile_timeout() -> float | None:
+    """The dbo-opt timeout for ``subprocess.run``: None when the knob is <= 0.
+
+    See ``backend_compile_timeout_seconds`` in ``_inductor/config``.
+    """
+    timeout = _spyre_config.backend_compile_timeout_seconds
+    return timeout if timeout > 0 else None
+
+
+def _timeout_message(timeout: float | None) -> str:
+    return (
+        f"dbo-opt timed out after {timeout}s; raise "
+        "SPYRE_BACKEND_COMPILE_TIMEOUT_SECONDS (config "
+        "backend_compile_timeout_seconds, <= 0 disables) if this kernel "
+        "legitimately needs longer."
+    )
 
 
 def _check_ktir_device_prerequisites() -> None:
@@ -143,6 +154,26 @@ def _safe_kernel_name(kernel_name: str) -> str:
     return kernel_name[:_KERNEL_NAME_BUDGET]
 
 
+# Widths of the sdsc_bundle_dir_prefix passed to the runner and emitted as
+# args.sdsc_bundle_dir_prefix in profiler traces.
+#   cached path   — First 16 characters of the base32 SHA-256 cache key
+#                   (80 bits; birthday bound ~2^40 kernels).
+#   no-cache path — First 8 hex characters of a UUID (32 bits); enough for the
+#                   few ephemeral bundles of a single process run.
+_CACHED_BUNDLE_DIR_PREFIX_LEN = 16
+_UNCACHED_BUNDLE_DIR_PREFIX_LEN = 8
+
+
+def _cached_bundle_dir_prefix(cache_key: str) -> str:
+    """Prefix of a cached SDSC bundle directory, derived from its cache key."""
+    return cache_key[:_CACHED_BUNDLE_DIR_PREFIX_LEN]
+
+
+def _new_uncached_bundle_dir_prefix() -> str:
+    """Fresh random prefix for a uncached bundle directory."""
+    return uuid.uuid4().hex[:_UNCACHED_BUNDLE_DIR_PREFIX_LEN]
+
+
 def _check_backend_compiler_on_path() -> None:
     """Raise unless ``dbo-opt`` can be found, before a bundle is emitted.
 
@@ -161,12 +192,15 @@ def _check_backend_compiler_on_path() -> None:
         )
 
 
-def get_output_dir(kernel_name: str):
+def get_output_dir(kernel_name: str, sdsc_bundle_dir_prefix: str | None = None):
+    if sdsc_bundle_dir_prefix is None:
+        sdsc_bundle_dir_prefix = _new_uncached_bundle_dir_prefix()
     spyre_dir = os.path.join(cache_dir(), "inductor-spyre")
     os.makedirs(spyre_dir, exist_ok=True)
-    digest = uuid.uuid4().hex[:8]
     safe_name = _safe_kernel_name(kernel_name)
-    kernel_output_dir = tempfile.mkdtemp(dir=spyre_dir, prefix=f"{digest}_{safe_name}_")
+    kernel_output_dir = tempfile.mkdtemp(
+        dir=spyre_dir, prefix=f"{sdsc_bundle_dir_prefix}_{safe_name}_"
+    )
     return kernel_output_dir
 
 
@@ -212,6 +246,8 @@ def _run_backend_compiler(
     compile_dir: str,
     env: dict[str, str],
     backend_loop_unroll: bool,
+    ktir_device_mlir: str,
+    timeout: float | None,
 ) -> str:
     """Compile one materialized bundle with dbo-opt and return its directory.
 
@@ -224,6 +260,9 @@ def _run_backend_compiler(
     the dbo-opt lookup below resolves the same binary the parent would.
     ``backend_loop_unroll`` is the resolved parent config used for the cache key;
     workers must not re-read it from their own config or environment.
+    ``ktir_device_mlir`` is the same parent-side device override used for the key.
+    ``timeout`` is likewise resolved in the parent (``_backend_compile_timeout``)
+    so a runtime config change reaches pool workers too.
     """
     _check_backend_compiler_on_path()
 
@@ -232,8 +271,8 @@ def _run_backend_compiler(
     # to the spyre_dd2_basic under DEEPTOOLS_PATH, so passing an empty value
     # would be worse than omitting the flag.  KTIR_DEVICE_MLIR is reused rather
     # than given a bundle-path spelling of its own.
-    if _spyre_config.ktir_device_mlir:
-        cmd.append(f"--device={_spyre_config.ktir_device_mlir}")
+    if ktir_device_mlir:
+        cmd.append(f"--device={ktir_device_mlir}")
     # Always pass the resolved value, including the default, so compilation
     # matches the cache key instead of depending on dbo-opt's own default.
     cmd.append(f"--enable-loop-unroll={int(backend_loop_unroll)}")
@@ -257,7 +296,7 @@ def _run_backend_compiler(
                 text=True,
                 check=True,
                 env=env,
-                timeout=_COMPILE_TIMEOUT_S,
+                timeout=timeout,
             )
             # The KTIR path (#3651) reports that dbo-opt can exit 0 having
             # written nothing, so treat the artifact -- not the return code --
@@ -282,8 +321,7 @@ def _run_backend_compiler(
                 code_dir=compile_dir,
             )
             raise RuntimeError(
-                f"dbo-opt timed out after {_COMPILE_TIMEOUT_S}s "
-                f"(_COMPILE_TIMEOUT_S).\ncommand: {' '.join(cmd)}"
+                f"{_timeout_message(timeout)}\ncommand: {' '.join(cmd)}"
             ) from exc
         except subprocess.CalledProcessError as exc:
             try_collect(
@@ -317,6 +355,7 @@ def _prepare_kernel(
     output_dir: str,
     kernel_provenance: "KernelProvenanceDescriptor | None",
     symbol_kinds: Any = None,
+    sdsc_bundle_dir_prefix: str | None = None,
 ) -> SpyreSDSCKernelRunner:
     with timing_recorder.stage(
         "stage:SpyreAsyncCompile:prepare_kernel", kernel=kernel_name
@@ -326,6 +365,7 @@ def _prepare_kernel(
             output_dir,
             kernel_provenance=kernel_provenance,
             symbol_kinds=symbol_kinds,
+            sdsc_bundle_dir_prefix=sdsc_bundle_dir_prefix,
         )
 
 
@@ -340,6 +380,7 @@ class _SpyreCompileFuture(CodeCacheFuture):
         kernel_provenance,
         symbol_kinds,
         cache_key: str | None = None,
+        sdsc_bundle_dir_prefix: str | None = None,
     ) -> None:
         self._task = task
         self._kernel_name = kernel_name
@@ -347,6 +388,7 @@ class _SpyreCompileFuture(CodeCacheFuture):
         self._kernel_provenance = kernel_provenance
         self._symbol_kinds = symbol_kinds
         self._cache_key = cache_key
+        self._sdsc_bundle_dir_prefix = sdsc_bundle_dir_prefix
         self._runner: SpyreSDSCKernelRunner | None = None
         self._failure_dir_moved = False
 
@@ -370,11 +412,18 @@ class _SpyreCompileFuture(CodeCacheFuture):
         code_dir = self._compile_dir
         if self._cache_key is not None:
             code_dir = commit_compile_dir(self._compile_dir, self._cache_key)
+
+        # sdsc_bundle_dir_prefix selection: See the _CACHED_BUNDLE_DIR_PREFIX_LEN
+        # and _UNCACHED_BUNDLE_DIR_PREFIX_LEN. The (activity base name, prefix)
+        # pair identifies the SDSC bundle directory of a kernel event.
         self._runner = _prepare_kernel(
             self._kernel_name,
             code_dir,
             self._kernel_provenance,
             self._symbol_kinds,
+            _cached_bundle_dir_prefix(self._cache_key)
+            if self._cache_key
+            else self._sdsc_bundle_dir_prefix,
         )
         return self._runner
 
@@ -417,7 +466,9 @@ class SpyreAsyncCompile(AsyncCompile):
         kernel_name: str,
         compile_dir: str,
         *,
-        backend_loop_unroll: bool | None = None,
+        backend_loop_unroll: bool,
+        ktir_device_mlir: str,
+        timeout: float | None,
     ) -> Future[str] | None:
         """Submit the backend compile to Inductor's pool, or compile inline."""
         # Everything before this call is frontend work and _run_backend_compiler
@@ -427,8 +478,6 @@ class SpyreAsyncCompile(AsyncCompile):
         assert not _spyre_config.frontend_only, (
             "frontend-only must stop before the backend is submitted"
         )
-        if backend_loop_unroll is None:
-            backend_loop_unroll = _spyre_config.backend_loop_unroll
         if get_compile_threads() > 1:
             # The first use creates the pool and submits its readiness probe.
             # Waiting for that short probe guarantees the first Spyre kernel is
@@ -441,11 +490,18 @@ class SpyreAsyncCompile(AsyncCompile):
                     compile_dir,
                     dict(os.environ),
                     backend_loop_unroll,
+                    ktir_device_mlir,
+                    timeout,
                 )
 
         with timing_recorder.stage(_BACKEND_STAGE, kernel=kernel_name, tool="dbo-opt"):
             _run_backend_compiler(
-                kernel_name, compile_dir, dict(os.environ), backend_loop_unroll
+                kernel_name,
+                compile_dir,
+                dict(os.environ),
+                backend_loop_unroll,
+                ktir_device_mlir,
+                timeout,
             )
         return None
 
@@ -457,6 +513,7 @@ class SpyreAsyncCompile(AsyncCompile):
         kernel_provenance,
         symbol_kinds,
         cache_key: str | None = None,
+        sdsc_bundle_dir_prefix: str | None = None,
     ) -> _SpyreCompileFuture:
         future = _SpyreCompileFuture(
             task,
@@ -465,6 +522,7 @@ class SpyreAsyncCompile(AsyncCompile):
             kernel_provenance,
             symbol_kinds,
             cache_key=cache_key,
+            sdsc_bundle_dir_prefix=sdsc_bundle_dir_prefix,
         )
         self._pending_spyre_futures.append(future)
         return future
@@ -483,6 +541,7 @@ class SpyreAsyncCompile(AsyncCompile):
             return SpyreUnimplementedRunner(kernel_name, unimp.op)
 
         self._provenance_attempt_count += 1
+
         try:
             # This is the common fresh-compile/cache-reload boundary: generated
             # wrappers have reconstructed the finalized OpSpecs before calling
@@ -511,6 +570,8 @@ class SpyreAsyncCompile(AsyncCompile):
         # Keep cache identity and the worker's compiler argument on the same
         # config snapshot, including overrides made with config.patch.
         backend_loop_unroll = _spyre_config.backend_loop_unroll
+        ktir_device_mlir = _spyre_config.ktir_device_mlir
+        timeout = _backend_compile_timeout()
         use_cache = (
             _spyre_config.spyre_kernel_cache
             and not torch._inductor.config.force_disable_caches
@@ -532,6 +593,7 @@ class SpyreAsyncCompile(AsyncCompile):
                     kernel_name=kernel_name,
                     pool_size=pool_size,
                     backend_loop_unroll=backend_loop_unroll,
+                    ktir_device_mlir=ktir_device_mlir,
                 )
             except RuntimeError as e:
                 logger.warning(
@@ -553,6 +615,7 @@ class SpyreAsyncCompile(AsyncCompile):
                         cached_dir,
                         kernel_provenance,
                         load_symbol_kinds(cached_dir),
+                        _cached_bundle_dir_prefix(cache_key),
                     )
 
                 logger.debug("Cache MISS: Compiling kernel")
@@ -572,6 +635,8 @@ class SpyreAsyncCompile(AsyncCompile):
                         kernel_name,
                         compile_dir,
                         backend_loop_unroll=backend_loop_unroll,
+                        ktir_device_mlir=ktir_device_mlir,
+                        timeout=timeout,
                     )
                     if task is not None:
                         return self._compile_future(
@@ -584,8 +649,13 @@ class SpyreAsyncCompile(AsyncCompile):
                         )
                     cached_dir = commit_compile_dir(compile_dir, cache_key)
                     logger.debug("Kernel compiled and cached at: %s", cached_dir)
+
                     return _prepare_kernel(
-                        kernel_name, cached_dir, kernel_provenance, symbol_kinds
+                        kernel_name,
+                        cached_dir,
+                        kernel_provenance,
+                        symbol_kinds,
+                        _cached_bundle_dir_prefix(cache_key),
                     )
                 except Exception:  # subprocess.CalledProcessError:
                     # Move the failed dir to failed/ for manual debugging
@@ -594,14 +664,18 @@ class SpyreAsyncCompile(AsyncCompile):
                     raise
 
         # Caching disabled (SPYRE_KERNEL_CACHE=0, force_disable_caches, or
-        # frontend-only). Compile into a throw-away temp dir that lives for this
-        # process only.
-        output_dir = get_output_dir(kernel_name)
+        # frontend-only). Compile into a fresh, uncached directory.
+        sdsc_bundle_dir_prefix = _new_uncached_bundle_dir_prefix()
+        output_dir = get_output_dir(kernel_name, sdsc_bundle_dir_prefix)
         symbol_kinds = _compile_to_dir(kernel_name, output_dir, specs, pool_size)
         if _spyre_config.frontend_only:
             return _skip_backend(kernel_name, output_dir, "dbo-opt")
         task = self._submit_backend_compile(
-            kernel_name, output_dir, backend_loop_unroll=backend_loop_unroll
+            kernel_name,
+            output_dir,
+            backend_loop_unroll=backend_loop_unroll,
+            ktir_device_mlir=ktir_device_mlir,
+            timeout=timeout,
         )
         if task is not None:
             return self._compile_future(
@@ -610,8 +684,16 @@ class SpyreAsyncCompile(AsyncCompile):
                 output_dir,
                 kernel_provenance,
                 symbol_kinds,
+                sdsc_bundle_dir_prefix=sdsc_bundle_dir_prefix,
             )
-        return _prepare_kernel(kernel_name, output_dir, kernel_provenance, symbol_kinds)
+
+        return _prepare_kernel(
+            kernel_name,
+            output_dir,
+            kernel_provenance,
+            symbol_kinds,
+            sdsc_bundle_dir_prefix,
+        )
 
     def ktir(
         self, kernel_name: str, specs: Sequence[OpSpec | LoopSpec | UnimplementedOp]
@@ -663,17 +745,26 @@ class SpyreAsyncCompile(AsyncCompile):
                 frontend_pool_allocation=_spyre_config.pool_allocated_by_frontend(),
             )
 
-        # Persist the emitted KTIR as a text file in the same per-kernel output
-        # dir as sdsc's bundle.
-        output_dir = get_output_dir(kernel_name)
+        # Persist the emitted KTIR as a text file in a fresh, uncached per-kernel
+        # directory (the same directory sdsc's bundle goes in).
+        sdsc_bundle_dir_prefix = _new_uncached_bundle_dir_prefix()
+        output_dir = get_output_dir(kernel_name, sdsc_bundle_dir_prefix)
         ktir_path = os.path.join(output_dir, f"{_safe_kernel_name(kernel_name)}.ktir")
         with open(ktir_path, "w") as fh:
             fh.write(ktir_text)
         logger.debug("OpSpec->KTIR: wrote %s", ktir_path)
 
-        return self._compile_ktir_with_dbo(kernel_name, ktir_path, output_dir)
+        return self._compile_ktir_with_dbo(
+            kernel_name, ktir_path, output_dir, sdsc_bundle_dir_prefix
+        )
 
-    def _compile_ktir_with_dbo(self, kernel_name: str, ktir_path: str, output_dir: str):
+    def _compile_ktir_with_dbo(
+        self,
+        kernel_name: str,
+        ktir_path: str,
+        output_dir: str,
+        sdsc_bundle_dir_prefix: str,
+    ):
         """Compile ``ktir_path`` with ``dbo-opt`` and return a runner for it.
 
         ``--export-dir`` receives the per-kernel output dir, under which dbo-opt
@@ -711,6 +802,7 @@ class SpyreAsyncCompile(AsyncCompile):
         # problem to fix in the shell, not something to paper over per-child --
         # and a child-only path stopped being separable once a process commits
         # to one backend for its lifetime via ``ktir_emitter``.
+        timeout = _backend_compile_timeout()
         with torch.profiler.record_function(f"dbo-opt:{kernel_name}"):
             try:
                 with timing_recorder.stage(
@@ -721,7 +813,7 @@ class SpyreAsyncCompile(AsyncCompile):
                         capture_output=True,
                         text=True,
                         check=True,
-                        timeout=_COMPILE_TIMEOUT_S,
+                        timeout=timeout,
                     )
                 # dbo-opt can exit 0 having written nothing, so the artifact
                 # itself -- not the return code -- is the success condition.
@@ -744,8 +836,7 @@ class SpyreAsyncCompile(AsyncCompile):
                     code_dir=output_dir,
                 )
                 raise RuntimeError(
-                    f"OpSpec->KTIR: dbo-opt timed out after "
-                    f"{_COMPILE_TIMEOUT_S}s (_COMPILE_TIMEOUT_S).\n"
+                    f"OpSpec->KTIR: {_timeout_message(timeout)}\n"
                     f"command: {' '.join(cmd)}"
                 ) from exc
             except subprocess.CalledProcessError as exc:
@@ -771,7 +862,12 @@ class SpyreAsyncCompile(AsyncCompile):
                 )
                 raise
 
-        return SpyreSDSCKernelRunner(kernel_name, output_dir)
+        return SpyreSDSCKernelRunner(
+            kernel_name,
+            output_dir,
+            kernel_provenance=None,
+            sdsc_bundle_dir_prefix=sdsc_bundle_dir_prefix,
+        )
 
     def wait(self, scope: dict[str, Any]) -> None:
         try:
