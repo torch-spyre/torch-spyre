@@ -63,7 +63,6 @@ pinned_dims: dict[str, set[int]]  (local to reorder_nonstick_dims, never on grap
 
 import math
 import random
-import warnings
 import sympy
 from typing import Any, Literal, NamedTuple
 
@@ -461,9 +460,10 @@ def _matmul_reorder_stl(
 
     if _ndo_random is not None:
         chosen = _ndo_random.choice(candidates)
-        warnings.warn(
+        print(
             f"STRESS_TEST_NDO={config.ndo_stress_test_seed}: {name} randomly chose"
-            f" dim {chosen} instead of largest dim {largest}"
+            f" dim {chosen} instead of largest dim {largest}",
+            flush=True,
         )
     else:
         chosen = largest
