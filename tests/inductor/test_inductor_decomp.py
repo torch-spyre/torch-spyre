@@ -123,7 +123,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             # table integrity, so skip eager.
             compare_with_cpu(fn, x, cpu_compile=True, run_eager=False)
 
-        assert len(record) == 1, "Exactly one FallbackWarning should be encountered!"
+        # pytest.warns records every warning raised in the block, not just
+        # FallbackWarning (e.g. torch's once-per-process dynamo_pgo UserWarning
+        # when caches are force-disabled), so count only the category we check.
+        fallback_warnings = [
+            w
+            for w in record
+            if issubclass(w.category, torch_spyre.ops.fallbacks.FallbackWarning)
+        ]
+        assert len(fallback_warnings) == 1, (
+            "Exactly one FallbackWarning should be encountered!"
+        )
 
         after_decomps = copy.deepcopy(decompositions)
         after_post_autograd_decomposition_table = copy.deepcopy(
