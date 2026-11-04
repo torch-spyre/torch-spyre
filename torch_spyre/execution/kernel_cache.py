@@ -27,7 +27,7 @@ from torch._inductor.codecache import code_hash
 from torch._inductor.runtime.runtime_utils import cache_dir
 
 from torch_spyre._inductor.codegen.compute_ops import SymbolKind
-from torch_spyre._inductor.logging_utils import get_inductor_logger, warn_once
+from torch_spyre._inductor.logging_utils import get_inductor_logger
 
 
 logger = get_inductor_logger("kernel_cache")
@@ -682,6 +682,7 @@ def precompute_kernel_key(
     """
     from torch._inductor.virtualized import NullHandler, V
     from torch_spyre._inductor import config as _spyre_config
+    from torch_spyre._inductor.logging_utils import warn_once
     from torch_spyre._inductor.op_spec import find_unimplemented
     from torch_spyre._inductor.wrapper import spec_eval_namespace
 
