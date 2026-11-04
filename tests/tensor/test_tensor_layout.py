@@ -1046,6 +1046,30 @@ class TestSpyreTensorLayout(TestCase):
         restored = pickle.loads(pickle.dumps(stl))
         self.assertEqual(list(restored.stride_map), [32, 0, 1])
 
+    def test_stl_v4_pickle_minus_one_loads_as_zero(self):
+        """A v4 pickle written before the -1 -> 0 switch still loads, with 0."""
+        fp16_df = get_device_dtype(torch.float16)
+        stl = SpyreTensorLayout([2, 1, 32], [32, 0, 1], fp16_df)
+        restored = SpyreTensorLayout.__new__(SpyreTensorLayout)
+        restored.__setstate__(
+            (
+                4,
+                [2, 1, 32],
+                [32, -1, 1],
+                fp16_df,
+                stl.element_arrangement,
+                dict(stl.valid_elements),
+            )
+        )
+        self.assertEqual(list(restored.stride_map), [32, 0, 1])
+
+    def test_stl_pickle_writes_v5(self):
+        fp16_df = get_device_dtype(torch.float16)
+        stl = SpyreTensorLayout([2, 1, 32], [32, 0, 1], fp16_df)
+        state = stl.__getstate__()
+        self.assertEqual(state[0], 5)
+        self.assertEqual(len(state), 6)
+
 
 @instantiate_parametrized_tests
 class TestComputeValidElements(TestCase):
