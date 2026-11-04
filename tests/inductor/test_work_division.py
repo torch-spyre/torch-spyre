@@ -23,16 +23,16 @@ import dataclasses
 import itertools
 import math
 import unittest
-from contextlib import contextmanager, ExitStack
+from contextlib import ExitStack, contextmanager
 from types import SimpleNamespace
 from typing import NamedTuple
 from unittest.mock import MagicMock, patch
 
 import pytest
-
 import sympy
-from torch._inductor.utils import sympy_index_symbol
 import torch
+from decode_matmul_sweep import SHAPES as DECODE_SHAPES
+from decode_matmul_sweep import SWEEP as DECODE_SWEEP
 from sympy import Symbol
 from torch._inductor.dependencies import MemoryDep, StarDep, WeakDep
 from torch._inductor.ir import (
@@ -42,9 +42,10 @@ from torch._inductor.ir import (
     Pointwise,
     Reduction,
 )
-from torch._inductor.utils import fresh_cache
-from torch.utils._sympy.functions import ModularIndexing
+from torch._inductor.utils import fresh_cache, sympy_index_symbol
 from torch.utils._ordered_set import OrderedSet
+from torch.utils._sympy.functions import ModularIndexing
+from utils_inductor import mock_op_split_space
 
 from torch_spyre._C import (
     DataFormats,
@@ -52,14 +53,9 @@ from torch_spyre._C import (
     SpyreTensorLayout,
     get_device_dtype,
 )
-from torch_spyre._inductor import work_division_constraints
-from torch_spyre._inductor.errors import Unsupported
-from torch_spyre._inductor.ir import FixedTiledLayout
-from torch_spyre._inductor.loop_info import (
-    CoarseTileInfo,
-    LoopCarryRecord,
-    copy_op_metadata,
-)
+from torch_spyre._inductor import pass_utils as pass_utils_module
+from torch_spyre._inductor import passes, work_division_constraints
+from torch_spyre._inductor import work_division as work_division_module
 from torch_spyre._inductor.constants import (
     AVGPOOL2D_OP,
     BATCH_MATMUL_FP8_OP,
@@ -68,12 +64,17 @@ from torch_spyre._inductor.constants import (
     DEPTHWISE_CONV2D_OP,
     TOPK_OPS,
 )
-from torch_spyre._inductor import pass_utils as pass_utils_module
+from torch_spyre._inductor.errors import Unsupported
+from torch_spyre._inductor.ir import FixedTiledLayout
+from torch_spyre._inductor.loop_info import (
+    CoarseTileInfo,
+    LoopCarryRecord,
+    copy_op_metadata,
+)
 from torch_spyre._inductor.pass_utils import PerCoreView, SchedNodeArg, op_read_writes
 from torch_spyre._inductor.scratchpad import allocator as allocator_module
 from torch_spyre._inductor.scratchpad import coarse_tiling as coarse_tiling_module
 from torch_spyre._inductor.scratchpad import lx_relayout
-from torch_spyre._inductor import work_division as work_division_module
 from torch_spyre._inductor.scratchpad.allocator import (
     CoOptimizingAllocator,
     CoreDivision,
@@ -91,22 +92,13 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
 from torch_spyre._inductor.scratchpad.utils import (
     is_empty_tiled_layout,
 )
-from decode_matmul_sweep import SHAPES as DECODE_SHAPES, SWEEP as DECODE_SWEEP
-
-
-from torch_spyre._inductor.wsr.enumerate_tilings import (
-    TilingSpace,
-    build_tiling_space,
-    enumerate_tile_options,
-)
-
 from torch_spyre._inductor.work_division import (
+    _HBM_BW_GBS,
     TensorDep,
     WorkDivisionContext,
     _cost_model_matmul_planner,
     _decode_weight_delivery_us,
     _default_split,
-    _HBM_BW_GBS,
     _in_decode_delivery_scope,
     _matmul_hbm_us,
     _matmul_multicast_penalty,
@@ -114,17 +106,17 @@ from torch_spyre._inductor.work_division import (
     adjust_it_space_for_sticks,
     apply_splits,
     enumerate_work_division_candidates,
-    work_division_context_for_op,
-    work_division_splits_are_legal,
     multi_dim_iteration_space_split,
     span_reduction_pass,
+    work_division_context_for_op,
+    work_division_splits_are_legal,
 )
 from torch_spyre._inductor.work_division_constraints import (
     JOINT_TILING_AND_DIVISION_ATTR,
-    coarse_tile_local_dim_split_domains,
     ConstraintResult,
     WorkDivConstraintContext,
     aligned_ownership_split_domains,
+    coarse_tile_local_dim_split_domains,
     collect_work_division_constraints,
     conv_spatial_blocked_vars,
     coordinate_mask_blocked_vars,
@@ -140,8 +132,11 @@ from torch_spyre._inductor.work_division_constraints import (
     restickify_padding_blocked_vars,
     topk_split_domains,
 )
-from utils_inductor import mock_op_split_space
-
+from torch_spyre._inductor.wsr.enumerate_tilings import (
+    TilingSpace,
+    build_tiling_space,
+    enumerate_tile_options,
+)
 
 # A solver class for allocator tests that never solve: never built, only asked
 # for its capabilities.
@@ -341,19 +336,19 @@ class TestLoopCarryLxEligibility(unittest.TestCase):
                     metadata = next(r for r in BUFFER_RESIDENCY_RULES if r.name == rule)
                     self.assertEqual(expected, metadata.reason)
                 op = _computed_buffer((64, 64), name="buf")
-                common = dict(
-                    graph=_residency_graph(op),
-                    name="buf",
-                    uses=[0, 1],
-                    op=op,
-                    mutated_buffers=set(),
-                    graph_output_names=set(),
-                    reinterpret_output_names=set(),
-                    ncores={"buf": 32},
-                    ncores_reasons={},
-                    division_is_fixed=True,
-                    buf_user_deps={},
-                )
+                common = {
+                    "graph": _residency_graph(op),
+                    "name": "buf",
+                    "uses": [0, 1],
+                    "op": op,
+                    "mutated_buffers": set(),
+                    "graph_output_names": set(),
+                    "reinterpret_output_names": set(),
+                    "ncores": {"buf": 32},
+                    "ncores_reasons": {},
+                    "division_is_fixed": True,
+                    "buf_user_deps": {},
+                }
                 stack.enter_context(
                     allocator_module.config.patch(
                         lx_planner_relayout=False,
@@ -461,18 +456,18 @@ class TestLoopCarryLxEligibility(unittest.TestCase):
     def test_only_joint_solver_accepts_tagged_loop_carry_mutation_target(self):
         ordinary = _computed_buffer((64, 64), name="carry")
         graph = _residency_graph(ordinary)
-        common = dict(
-            graph=graph,
-            name="carry",
-            uses=[0, 1],
-            mutated_buffers={"carry"},
-            graph_output_names=set(),
-            reinterpret_output_names=set(),
-            ncores={},
-            ncores_reasons={},
-            division_is_fixed=False,
-            buf_user_deps={},
-        )
+        common = {
+            "graph": graph,
+            "name": "carry",
+            "uses": [0, 1],
+            "mutated_buffers": {"carry"},
+            "graph_output_names": set(),
+            "reinterpret_output_names": set(),
+            "ncores": {},
+            "ncores_reasons": {},
+            "division_is_fixed": False,
+            "buf_user_deps": {},
+        }
         self.assertEqual(
             self.allocator._buffer_residency_reason(op=ordinary, **common),
             "mutation target",
@@ -521,18 +516,18 @@ class TestLoopCarryLxEligibility(unittest.TestCase):
         """
         carry = self._tagged_carry()
         graph = _residency_graph(carry, output_names=("carry",))
-        common = dict(
-            graph=graph,
-            name="carry",
-            uses=[0, 1],
-            mutated_buffers={"carry"},
-            graph_output_names={"carry"},
-            reinterpret_output_names=set(),
-            ncores={},
-            ncores_reasons={},
-            division_is_fixed=False,
-            buf_user_deps={},
-        )
+        common = {
+            "graph": graph,
+            "name": "carry",
+            "uses": [0, 1],
+            "mutated_buffers": {"carry"},
+            "graph_output_names": {"carry"},
+            "reinterpret_output_names": set(),
+            "ncores": {},
+            "ncores_reasons": {},
+            "division_is_fixed": False,
+            "buf_user_deps": {},
+        }
         with (
             patch.object(allocator_module, "_is_tiled_advancing", return_value=False),
             patch.object(
@@ -592,18 +587,18 @@ class TestRestickifyBarrierDeferredOnJointPath(unittest.TestCase):
     def setUp(self):
         self.allocator = CoOptimizingAllocator(_UNBUILT_SOLVER, 2**20)
         self.op = _computed_buffer((64, 64), name="buf")
-        self.common = dict(
-            graph=_residency_graph(self.op),
-            name="buf",
-            uses=[0, 1],
-            op=self.op,
-            mutated_buffers=set(),
-            graph_output_names=set(),
-            reinterpret_output_names=set(),
-            ncores={},
-            ncores_reasons={},
-            buf_user_deps={},
-        )
+        self.common = {
+            "graph": _residency_graph(self.op),
+            "name": "buf",
+            "uses": [0, 1],
+            "op": self.op,
+            "mutated_buffers": set(),
+            "graph_output_names": set(),
+            "reinterpret_output_names": set(),
+            "ncores": {},
+            "ncores_reasons": {},
+            "buf_user_deps": {},
+        }
 
     def test_joint_path_does_not_consult_the_barrier(self):
         with (
@@ -1622,22 +1617,19 @@ class TestWorkDivisionContextAnswers(unittest.TestCase):
         keyed by, and every enumerated candidate is one the context calls legal
         and whose factors come from its own per-axis domains."""
         for case in _candidate_cases():
-            with self.subTest(case.name):
-                with case.patches():
-                    ctx = work_division_context_for_op(case.op, case.max_cores)
-                    candidates = enumerate_work_division_candidates(
-                        case.op, case.max_cores
+            with self.subTest(case.name), case.patches():
+                ctx = work_division_context_for_op(case.op, case.max_cores)
+                candidates = enumerate_work_division_candidates(case.op, case.max_cores)
+                self.assertEqual(ctx.axes, list(case.axes))
+                domains = {v: ctx.factor_domain(v) for v in ctx.axes}
+                self.assertTrue(all(ctx.is_legal(c) for c in candidates))
+                self.assertTrue(
+                    all(
+                        split in domains[v]
+                        for c in candidates
+                        for v, split in c.items()
                     )
-                    self.assertEqual(ctx.axes, list(case.axes))
-                    domains = {v: ctx.factor_domain(v) for v in ctx.axes}
-                    self.assertTrue(all(ctx.is_legal(c) for c in candidates))
-                    self.assertTrue(
-                        all(
-                            split in domains[v]
-                            for c in candidates
-                            for v, split in c.items()
-                        )
-                    )
+                )
 
 
 class TestMatmulRowOrderSplitDomains(unittest.TestCase):
@@ -2216,9 +2208,11 @@ class TestConvSpatialBlockedVars(unittest.TestCase):
         ctx.committed_splits = {i: 2}
         rw = MagicMock()
         rw.writes = [MagicMock(ranges=(_isym("mb"), _isym("out"), i, j))]
-        with patch(self._PATCH_TARGET, return_value=rw):
-            with self.assertRaisesRegex(Unsupported, "blocked dim"):
-                collect_work_division_constraints(ctx)
+        with (
+            patch(self._PATCH_TARGET, return_value=rw),
+            self.assertRaisesRegex(Unsupported, "blocked dim"),
+        ):
+            collect_work_division_constraints(ctx)
 
     def test_blocked_spatial_dims_are_not_distributed(self):
         mb, out, i, j = (_isym(name) for name in ("mb", "out", "i", "j"))
@@ -2261,7 +2255,7 @@ class TestFinalMappingConstraints(unittest.TestCase):
         self.assertEqual(result.blocked, {ki, kj})
 
     def test_conv_only_blocks_nontrivial_kernel_dims(self):
-        channel, ki, kj = (_isym(name) for name in ("channel", "ki", "kj"))
+        channel, ki, _kj = (_isym(name) for name in ("channel", "ki", "kj"))
         op = _computed_buffer(
             (8,),
             name="conv",
@@ -2410,11 +2404,13 @@ class TestDepthwiseConvWindowBlocked(unittest.TestCase):
 
         x, w, x_dev, w_dev = self._inputs()
         torch._dynamo.reset()
-        with fresh_cache():
-            with patch.object(
+        with (
+            fresh_cache(),
+            patch.object(
                 work_division_constraints, "reduction_window_blocked_vars", window
-            ):
-                out = torch.compile(self._conv)(x_dev, w_dev).cpu()
+            ),
+        ):
+            out = torch.compile(self._conv)(x_dev, w_dev).cpu()
         self.assertTrue(captured, "depthwise conv never reached work division")
         return out, self._conv(x, w), captured
 
@@ -3618,11 +3614,9 @@ class TestCoOptimizingAllocator(unittest.TestCase):
                 "torch_spyre._inductor.scratchpad.allocator._split_option_is_legal",
                 return_value=False,
             ),
+            self.assertRaisesRegex(Unsupported, "fixed split violates hard domain"),
         ):
-            with self.assertRaisesRegex(
-                Unsupported, "fixed split violates hard domain"
-            ):
-                allocator._division_map(graph)
+            allocator._division_map(graph)
 
     def test_pruned_candidates_and_commit_reject_illegal_division(self):
         batch, m = _isym("batch"), _isym("m")
@@ -3971,13 +3965,17 @@ class TestDeferredWorkDivision(unittest.TestCase):
                 )
                 stack.enter_context(
                     patch.object(
-                        passes, "finalize_work_division_for_scheduler", finalize
+                        passes,
+                        "finalize_work_division_for_scheduler",
+                        finalize,
                     )
                 )
                 if not defer:
                     stack.enter_context(
                         patch.object(
-                            passes, "solve_decides_work_division", return_value=False
+                            passes,
+                            "solve_decides_work_division",
+                            return_value=False,
                         )
                     )
                 torch.compile(fn)(x).cpu()
@@ -4064,6 +4062,7 @@ class TestTiledSplitsAfterAUnitTile(unittest.TestCase):
     ):
         from torch._inductor.sizevars import SizeVarAllocator
         from torch._inductor.virtualized import V, ops
+
         from torch_spyre._inductor.pass_utils import iteration_space_from_op
         from torch_spyre._inductor.scratchpad import coarse_tiling
 
@@ -4161,11 +4160,13 @@ class TestTiledSplitsAfterAUnitTile(unittest.TestCase):
 
     def test_a_refusal_names_the_chosen_tilings(self):
         tiling = TileSpec((TileAxis(host_dim=0, count=32),))
-        with self.assertRaises(Unsupported) as caught:
-            with self._applied(
+        with (
+            self.assertRaises(Unsupported) as caught,
+            self._applied(
                 [32, 1024], tiling, {1: 4}, post_stickify=_RefusingPostStickify
-            ):
-                pass
+            ),
+        ):
+            pass
         self.assertEqual(
             caught.exception.__notes__,
             [f"auto_coarse_tiling chose: tiled={tiling.label}"],
@@ -4320,9 +4321,9 @@ class TestFp8MatmulConsumerAlignment(unittest.TestCase):
                 ops_in_offset_mutation_component=lambda graph: set(),
                 _find_distinct_matmul_splits=lambda ops: ((), ()),
                 _fused_layout_group_ops=lambda graph, seeds: group,
-                _fp8_matmul_consumer_seeds=lambda g: dict.fromkeys(
-                    ("mul", "mul2", "kbi"), [ops["mm"]]
-                ),
+                _fp8_matmul_consumer_seeds=lambda g: {
+                    name: [ops["mm"]] for name in ("mul", "mul2", "kbi")
+                },
                 _fixed_core_division=lambda op: fixed,
                 _split_option_is_legal=lambda op, splits: True,
             ),
@@ -4373,9 +4374,11 @@ class TestFp8MatmulConsumerAlignmentOnDevice(unittest.TestCase):
             )
 
         torch._dynamo.reset()
-        lx = dict(
-            lx_planning=True, co_optimizing_lx_planning=True, layout_solver="cpsat"
-        )
+        lx = {
+            "lx_planning": True,
+            "co_optimizing_lx_planning": True,
+            "layout_solver": "cpsat",
+        }
         with fresh_cache(), allocator_module.config.patch(sencores=32, **lx):
             qa = torch.compile(
                 lambda x, s: torch.ops.spyre.quantize_fp8_with_scale(x, s)
@@ -4621,33 +4624,30 @@ class TestOpSplitSpace(unittest.TestCase):
         menu is built with."""
         reductions = 0
         for case in _candidate_cases():
-            with self.subTest(case.name):
-                with _space_for(case) as space:
-                    for splits in case.candidates:
-                        expected = work_division_module._core_division(case.op, splits)
-                        actual = space.division(splits)
-                        self.assertEqual(_division_key(actual), _division_key(expected))
-                        reductions += bool(expected.reduction_splits)
+            with self.subTest(case.name), _space_for(case) as space:
+                for splits in case.candidates:
+                    expected = work_division_module._core_division(case.op, splits)
+                    actual = space.division(splits)
+                    self.assertEqual(_division_key(actual), _division_key(expected))
+                    reductions += bool(expected.reduction_splits)
         self.assertGreater(reductions, 0, "no case splits a reduction axis")
 
     def test_neighbours_are_the_one_axis_moves_inside_the_space(self):
         local = []
         for case in _candidate_cases():
-            with self.subTest(case.name):
-                with _space_for(case) as space:
-                    for splits in case.candidates:
-                        expected = {
-                            _division_key(space.division(other))
-                            for other in case.candidates
-                            if sum(other[axis] != splits[axis] for axis in space.axes)
-                            == 1
-                        }
-                        actual = {
-                            _division_key(division)
-                            for division in space.neighbours(space.division(splits))
-                        }
-                        self.assertEqual(actual, expected, _by_name(splits))
-                        local.append(len(expected) < len(case.candidates) - 1)
+            with self.subTest(case.name), _space_for(case) as space:
+                for splits in case.candidates:
+                    expected = {
+                        _division_key(space.division(other))
+                        for other in case.candidates
+                        if sum(other[axis] != splits[axis] for axis in space.axes) == 1
+                    }
+                    actual = {
+                        _division_key(division)
+                        for division in space.neighbours(space.division(splits))
+                    }
+                    self.assertEqual(actual, expected, _by_name(splits))
+                    local.append(len(expected) < len(case.candidates) - 1)
         # A move alphabet that reached every candidate from every candidate
         # would not be a local one, and the test would say nothing.
         self.assertTrue(any(local))
@@ -5363,7 +5363,7 @@ class TestResidencyRuleRegistry(unittest.TestCase):
             checks = SimpleNamespace()
             for rule in BUFFER_RESIDENCY_RULES:
 
-                def check(rule=rule):
+                def check(rule=rule, visited=visited, failing=failing):
                     visited.append(rule.name)
                     return rule.reason if rule is failing else None
 
@@ -5414,6 +5414,7 @@ class TestResidencyRuleRegistry(unittest.TestCase):
 
     def test_registry_documentation_matches_runtime_rules(self):
         from pathlib import Path
+
         from torch_spyre._inductor.scratchpad.residency_rules import (
             BUFFER_RESIDENCY_RULES,
             residency_rules_markdown,
@@ -5433,8 +5434,9 @@ class TestResidencyRuleRegistry(unittest.TestCase):
 
     def test_transfer_certificate_references_resolve(self):
         import ast
-        from pkgutil import resolve_name
         from pathlib import Path
+        from pkgutil import resolve_name
+
         from torch_spyre._inductor.scratchpad.residency_rules import (
             TRANSFER_CERTIFICATES,
         )
