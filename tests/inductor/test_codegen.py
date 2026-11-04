@@ -586,6 +586,55 @@ class TestSdscJsonSymbolicDimSmoke(InductorTestCase):
 
 
 class TestOverlappingWindowCoreOffsets(InductorTestCase):
+    def test_restickify_preserves_negative_window_gap(self):
+        """Restickify must not replace an unfold gap with a padding gap."""
+        position, feature, window, batch = sympy.symbols("c0:4")
+        iteration_space = {
+            position: (sympy.Integer(7), 7),
+            feature: (sympy.Integer(64), 1),
+            window: (sympy.Integer(4), 2),
+            batch: (sympy.Integer(64), 1),
+        }
+        spec = OpSpec(
+            op="restickify",
+            is_reduction=False,
+            iteration_space=iteration_space,
+            core_id_to_work_slice=derive_operation_mapping(iteration_space),
+            args=[
+                TensorArg(
+                    is_input=True,
+                    arg_index=0,
+                    device_dtype=DataFormats.SEN169_FP16,
+                    device_size=[1, 8, 2, 64, 64],
+                    device_coordinates=[
+                        sympy.floor(feature / 64),
+                        position,
+                        window,
+                        batch,
+                        sympy.Mod(feature, 64),
+                    ],
+                    allocation={"hbm": 0},
+                ),
+                TensorArg(
+                    is_input=False,
+                    arg_index=1,
+                    device_dtype=DataFormats.SEN169_FP16,
+                    device_size=[1, 7, 4, 64, 64],
+                    device_coordinates=[
+                        sympy.floor(batch / 64),
+                        position,
+                        window,
+                        feature,
+                        sympy.Mod(batch, 64),
+                    ],
+                    allocation={"hbm": 1},
+                ),
+            ],
+            op_info={},
+        )
+        sdsc, mapping = parse_op_spec(spec)
+        self.assertEqual(sdsc.args[0].backGap[mapping[window]], -2)
+
     def test_unfold_window_split(self):
         """Core slices address x.unfold(1, 4, 2).sum(0) at the full window stride."""
         position, feature, window, batch = sympy.symbols("c0:4")
@@ -636,6 +685,15 @@ class TestOverlappingWindowCoreOffsets(InductorTestCase):
                     op_info={},
                 )
                 sdsc, mapping = parse_op_spec(spec)
+                # With at most two window rows per core, a negative backGap
+                # brings the window dim back to its two physical rows, so the
+                # outer dims keep their real strides (issue #5347). With
+                # window_splits == 1, ceil(4 / 1) = 4 exceeds the physical
+                # extent 2, so the negative-backGap branch is inactive.
+                self.assertEqual(
+                    sdsc.args[0].backGap.get(mapping[window]),
+                    -2 if window_splits > 1 else None,
+                )
                 for pos in range(7):
                     for part in range(window_splits):
                         slices = {str(dim): 0 for dim in sdsc.work_slices}
@@ -649,6 +707,23 @@ class TestOverlappingWindowCoreOffsets(InductorTestCase):
                             ),
                             expected,
                         )
+                if window_splits > 1:
+                    # Slicing the source by one row adds a constant to the
+                    # normalized window coordinate. The negative gap and
+                    # per-core base must both survive that offset.
+                    spec.args[0].device_size[1] = 9
+                    spec.args[0].device_coordinates[2] = window + 1
+                    sliced_sdsc, sliced_mapping = parse_op_spec(spec)
+                    self.assertEqual(
+                        sliced_sdsc.args[0].backGap[sliced_mapping[window]], -2
+                    )
+                    slices = {str(dim): 0 for dim in sliced_sdsc.work_slices}
+                    self.assertEqual(
+                        core_idx_to_slice_offset(
+                            sliced_sdsc.args[0], slices, sliced_sdsc.work_slices
+                        ),
+                        8 * 64,
+                    )
 
 
 class TestTiledAwayPhysicalAxis(InductorTestCase):
