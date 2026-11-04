@@ -48,6 +48,7 @@ from torch_spyre._inductor.constants import (
     TOPK_OPS,
     KEEP_BY_INDEX_OP,
 )
+from torch_spyre._inductor.core_mapping import matmul_reduction_dim
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
 from torch_spyre._inductor.indirect_access import (
     compute_indirect_max_dim_sizes,
@@ -91,6 +92,12 @@ class SDSCArgs:
     is_index_tensor: bool = False
     related_value_tensor_idx: int = -1
     device_tile_advance_expr: Expr | None = None
+    # Sharded storage: each core addresses its own chunk (see sharded_hbm.py).
+    non_unified_shard_bytes: int = 0
+
+    @property
+    def non_unified(self) -> bool:
+        return self.non_unified_shard_bytes > 0
 
     def __str__(self) -> str:
         scales = ", ".join(f"{k}={v}" for k, v in self.scales.items())
@@ -1781,6 +1788,7 @@ def _create_sdsc_tensors(
             is_index_tensor=is_idx_tensor,
             related_value_tensor_idx=related_val_idx,
             device_tile_advance_expr=arg.device_tile_advance_expr,
+            non_unified_shard_bytes=arg.non_unified_shard_bytes,
         )
         if arg.work_division is not None:
             sdsc_arg.work_division = arg.work_division.remap_symbols(symbol_mapping)
@@ -1849,6 +1857,11 @@ def _resolve_sdsc_size(expr: Expr, symbolic_dim_bounds: dict) -> int:
     codegen time from ShapeEnv, serialized as plain ints into the generated
     file) so this works during the reload phase when ShapeEnv is gone.
     Falls back to _concretize_for_sdsc for concrete expressions.
+
+    The symbolic branch is deprecated: only the symbolic-SDSC route reaches it.
+    The explicit-loop route that supersedes that one puts no dimension symbol in
+    an SDSC, so every size here is already concrete and takes the fallback.
+    TODO(issue#5890): drop the symbolic branch with the symbolic-SDSC route.
     """
     # ``symbolic_dim_bounds`` is keyed by a single symbol name, so it can only
     # answer for a single-symbol expression; a multi-symbol one falls through to
@@ -1900,36 +1913,24 @@ def _extend_matmul_k_to_padded(
     - y's dev_dim_size for K == it_dim_size → backGap branch never fires for y.
     - Strides are computed against K_padded → correct for K_padded-extended iteration.
     - _get_padded_iteration_space becomes a no-op for K (already aligned).
-
-    K is identified as the symbol that appears in y's (non-stick) device_coordinates
-    but NOT in the output's device_coordinates.  This is the reduction symbol and is
-    layout-position agnostic: it works regardless of how MATMUL_DIM_LABELS maps the
-    iteration symbols for this particular ndim.
     """
-    # y is always args[1]; output is always args[-1] for matmul.
+    # y is always args[1] for matmul.
     y_arg = op_spec.args[1]
-    out_arg = op_spec.args[-1]
+    reduction = matmul_reduction_dim(op_spec.iteration_space, op_spec.args)
+    k_sym = symbol_mapping.get(reduction)
 
     # Collect non-stick symbols in y's device_coordinates (after symbol_mapping).
     y_dim_order, y_stick_dim = _get_device_dim_order(y_arg, symbol_mapping)
     # y_stick_dim is the within-stick symbol; the remaining dims include K.
     y_non_stick_syms: set = set(y_dim_order) - ({y_stick_dim} if y_stick_dim else set())
-
-    # Collect all symbols in the output's device_coordinates.
-    out_dim_order, _ = _get_device_dim_order(out_arg, symbol_mapping)
-    out_syms: set = set(out_dim_order)
-
-    # K is in y but not in the output (it's reduced).
-    k_candidates = y_non_stick_syms - out_syms
-    if not k_candidates:
+    if k_sym not in y_non_stick_syms:
         logger.warning(
-            "_extend_matmul_k_to_padded: could not identify K symbol "
-            "(y_non_stick=%s, out_syms=%s), skipping",
+            "_extend_matmul_k_to_padded: K symbol %s is not a non-stick dim of y "
+            "(y_non_stick=%s), skipping",
+            k_sym,
             y_non_stick_syms,
-            out_syms,
         )
         return
-    k_sym = min(k_candidates, key=str)
 
     if k_sym not in sdsc_iteration_space:
         logger.warning(
@@ -2383,15 +2384,14 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     elif is_restickify:
         _extend_restickify_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
 
-    # Grow the index-entry iteration to the padded output device_size so a
-    # partial-last-stick gather splits stick-aligned across cores. The output's
-    # entry-dim device_size was rounded up to the index stick multiple at layout
-    # time (enforce_indirect_access_layout); match the SDSC iteration to it BEFORE
-    # _create_sdsc_tensors so the output's per-core base stride is computed from
-    # the padded (stick-aligned) size rather than the shorter logical count.
-    # Otherwise the per-core base lands element-aligned (mid-stick) and the split
-    # miscompiles. No-op unless the output was actually padded (device_size >
-    # iteration), i.e. only for the multi-core partial-stick case.
+    # Grow a core-split index-entry iteration to the padded output device_size.
+    # The output's entry-dim device_size was rounded up to the index stick
+    # multiple at layout time (enforce_indirect_access_layout) so the entry dim
+    # can split in whole index sticks; matching the SDSC iteration to it BEFORE
+    # _create_sdsc_tensors puts each core's output base on a stick boundary
+    # rather than mid-stick. An unsplit entry dim keeps its logical count: the
+    # grown iteration would dereference the index's padding lanes as table rows,
+    # and those hold whatever the index's producer left there.
     if has_indirect_access and _spyre_config.sencores > 1:
         idx_arg = op_spec.args[next(iter(index_tensor_indices))]
         idx_stick = idx_arg.device_coordinates[-1]
@@ -2404,6 +2404,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
                     dev = int(out_arg.device_size[pos])
                     if (
                         entry_mb in sdsc_iteration_space
+                        and dim_splits[entry_mb] > 1
                         and dev > sdsc_iteration_space[entry_mb]
                     ):
                         sdsc_iteration_space[entry_mb] = dev

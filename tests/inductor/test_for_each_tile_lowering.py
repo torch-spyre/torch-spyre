@@ -70,6 +70,7 @@ from for_each_tile_fixtures import (
     split_m_fn,
     two_loops_shared_init_fn,
 )
+from torch_spyre._inductor.loop_node import all_ops, expand
 from torch_spyre._inductor.wsr.for_each_tile_lowering import (
     try_prove_for_each_tile,
 )
@@ -1560,6 +1561,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
             )
 
             splice_while_loops(graph)
+            expand(graph)
 
             self.assertFalse(
                 any(isinstance(op, ir.WhileLoop) for op in graph.operations)
@@ -1587,6 +1589,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
         graph = self._run_graph(split_k_fn, (X, Y))
         with V.set_graph_handler(graph):
             splice_while_loops(graph)
+            expand(graph)
         copies = [
             op
             for op in graph.operations
@@ -1612,6 +1615,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
         input_names = set(graph.graph_inputs.keys())
         with V.set_graph_handler(graph):
             splice_while_loops(graph)
+            expand(graph)
         copies = [
             op
             for op in graph.operations
@@ -1652,6 +1656,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
         graph = self._run_graph(split_k_private_transposed_init_fn, (X, Y))
         with V.set_graph_handler(graph):
             splice_while_loops(graph)
+            expand(graph)
         copies = [
             op
             for op in graph.operations
@@ -1677,6 +1682,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
         input_names = set(graph.graph_inputs.keys())
         with V.set_graph_handler(graph):
             splice_while_loops(graph)  # must not raise
+            expand(graph)
         copies = [
             op
             for op in graph.operations
@@ -1716,6 +1722,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
         graph = self._run_graph(two_loops_shared_init_fn, (X, Y))
         with V.set_graph_handler(graph):
             splice_while_loops(graph)
+            expand(graph)
         copies = [
             op
             for op in graph.operations
@@ -1748,6 +1755,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
         graph = self._run_graph(split_k_fn, (X, Y))
         with V.set_graph_handler(graph):
             splice_while_loops(graph)
+            expand(graph)
 
             self.assertFalse(
                 any(isinstance(op, ir.WhileLoop) for op in graph.operations)
@@ -1798,6 +1806,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
         graph = self._run_graph(nested_online_softmax_fn, attention_inputs())
         with V.set_graph_handler(graph):
             splice_while_loops(graph)
+            expand(graph)
 
         self.assertFalse(any(isinstance(op, ir.WhileLoop) for op in graph.operations))
 
@@ -1856,6 +1865,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
         graph = self._run_graph(tile_sequence, (prefix,))
         with V.set_graph_handler(graph):
             splice_while_loops(graph)
+            expand(graph)
 
             identities = [
                 (op, identity)
@@ -1968,6 +1978,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
         graph = self._run_graph(nested_tile_sequence, (prefix,))
         with V.set_graph_handler(graph):
             splice_while_loops(graph)
+            expand(graph)
 
             identities = [
                 (op, identity)
@@ -2075,6 +2086,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
         graph = self._run_graph(nested_tile_sequence, (query, prefix))
         with V.set_graph_handler(graph):
             splice_while_loops(graph)
+            expand(graph)
 
             identities = [
                 (op, identity)
@@ -2365,6 +2377,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
         graph = self._run_graph(nested_two_inner_loops_shared_init_fn, (X, Y))
         with V.set_graph_handler(graph):
             splice_while_loops(graph)
+            expand(graph)
 
         copies = [
             op for op in graph.operations if "while_loop_carry_copy_" in op.get_name()
@@ -2466,6 +2479,7 @@ class TestDrainMaterialization(unittest.TestCase):
         graph = self._run_graph(split_k_fn, (X, Y))
         with V.set_graph_handler(graph):
             splice_while_loops(graph)
+            expand(graph)
         return graph
 
     # ------------------------------------------------------------------
@@ -2700,6 +2714,7 @@ class TestDrainMaterialization(unittest.TestCase):
         graph = self._run_graph(split_k_caller_init_fn, (X, Y, torch.zeros_like(ref)))
         with V.set_graph_handler(graph):
             splice_while_loops(graph)
+            expand(graph)
         storage, _update, record = self._carry_parts(graph)
         self.assertIn("while_loop_carry_copy_", storage.get_name())
         self.assertIsNotNone(record.loop_origin)
@@ -2727,6 +2742,7 @@ class TestDrainMaterialization(unittest.TestCase):
         )
         with V.set_graph_handler(graph):
             splice_while_loops(graph)
+            expand(graph)
 
         def nested_view(entry):
             node = entry.data if isinstance(entry, ir.TensorBox) else None
@@ -2894,6 +2910,66 @@ class TestDrainMaterialization(unittest.TestCase):
 
 
 class TestTryProveForEachTile(unittest.TestCase):
+    def _fallback_counter_init(self, fill=0, size=(), dtype=torch.int64, wrapped=False):
+        from torch._inductor import ir
+        from torch._inductor.graph import GraphLowering
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        from torch.fx.experimental.proxy_tensor import make_fx
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        from torch_spyre._inductor.lowering import enable_spyre_lowerings
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import _unwrap_to_buffer
+
+        # Use the real Spyre full lowering: CPU re-lowering alone emits a
+        # Pointwise and cannot exercise the fallback representation from CI.
+        with FakeTensorMode(shape_env=ShapeEnv()) as fake_mode:
+            gm = make_fx(lambda: (torch.full(size, fill, dtype=dtype),))()
+            graph = GraphLowering(gm, example_inputs=[], shape_env=fake_mode.shape_env)
+            with (
+                V.set_graph_handler(graph),
+                V.set_fake_mode(fake_mode),
+                enable_spyre_lowerings(),
+            ):
+                graph.run()
+                init = _unwrap_to_buffer(graph.graph_outputs[0])
+                self.assertIsInstance(init, ir.FallbackKernel)
+                if wrapped:
+                    # Recreate the pre-2.14 single-output representation.
+                    layout = init.layout
+                    init.layout = ir.MultiOutputLayout(device=init.get_device())
+                    init = ir.MultiOutput(layout, init, [])
+                return init
+
+    def test_fallback_counter_zero_is_proven(self):
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _counter_init_failure,
+        )
+
+        for wrapped in (False, True):
+            with self.subTest(wrapped=wrapped):
+                init = self._fallback_counter_init(wrapped=wrapped)
+                self.assertIsNone(
+                    _counter_init_failure(mock.Mock(carried_inputs=[init]))
+                )
+
+    def test_fallback_counter_requires_scalar_int64_zero(self):
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _counter_init_failure,
+        )
+
+        cases = (
+            ({"fill": 1}, "fill value is 1, not 0"),
+            ({"size": (1,)}, "not a scalar fill"),
+            ({"dtype": torch.int32}, "not the int64"),
+        )
+        for wrapped in (False, True):
+            for kwargs, reason in cases:
+                with self.subTest(wrapped=wrapped, kwargs=kwargs):
+                    init = self._fallback_counter_init(wrapped=wrapped, **kwargs)
+                    failure = _counter_init_failure(mock.Mock(carried_inputs=[init]))
+                    self.assertIsNotNone(failure)
+                    self.assertIn(reason, failure)
+
     def test_host_counter_stays_integer_under_spyre_comparison_lowering(self):
         from torch._inductor import ir
         from torch._inductor.graph import GraphLowering
@@ -3994,7 +4070,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         from torch._inductor.dependencies import MemoryDep
         from torch._inductor.ir import Reduction
 
-        import torch_spyre._inductor.wsr.coarse_tile as coarse_tile_mod
+        import torch_spyre._inductor.pass_utils as pass_utils_mod
         from torch_spyre._inductor.wsr.for_each_tile_lowering import (
             _MARKER_MAPS,
             clear_marker_maps,
@@ -4036,7 +4112,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         graph.operations = operations
 
         with mock.patch.object(
-            coarse_tile_mod, "op_out_coords", return_value=[sympy.Integer(0)]
+            pass_utils_mod, "op_out_coords", return_value=[sympy.Integer(0)]
         ):
             with V.set_graph_handler(graph):
                 result = lookup_marker_dim(op, u0)
@@ -4056,7 +4132,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         # returned unconditionally.
         _MARKER_MAPS[id(operations)] = {}
         with mock.patch.object(
-            coarse_tile_mod, "op_out_coords", return_value=[sympy.Integer(0)]
+            pass_utils_mod, "op_out_coords", return_value=[sympy.Integer(0)]
         ):
             with V.set_graph_handler(graph):
                 empty_map_result = lookup_marker_dim(op, u0)
@@ -4094,7 +4170,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
 
         from torch._inductor.dependencies import MemoryDep
 
-        import torch_spyre._inductor.wsr.coarse_tile as coarse_tile_mod
+        import torch_spyre._inductor.wsr.loop_tiling_common as loop_tiling_common_mod
         from torch_spyre._inductor.propagate_hints import DimHint
         from torch_spyre._inductor.wsr.for_each_tile_lowering import (
             clear_marker_maps,
@@ -4132,7 +4208,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         graph.operations = ["sentinel_operations_list"]
 
         with mock.patch.object(
-            coarse_tile_mod, "_loop_var_to_ranges_pos", return_value=None
+            loop_tiling_common_mod, "_loop_var_to_ranges_pos", return_value=None
         ):
             with V.set_graph_handler(graph):
                 with self.assertRaises(
@@ -4142,7 +4218,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
                     "through no channel (output dim, reduction dim, or "
                     "marker map)",
                 ):
-                    coarse_tile_mod._hint_ranges_pos(
+                    loop_tiling_common_mod._hint_ranges_pos(
                         op, hint, out_coords=[sympy.Integer(0)]
                     )
 
@@ -4163,10 +4239,10 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         invariant_op.get_read_writes.return_value = invariant_rw
 
         with mock.patch.object(
-            coarse_tile_mod, "_loop_var_to_ranges_pos", return_value=None
+            loop_tiling_common_mod, "_loop_var_to_ranges_pos", return_value=None
         ):
             with V.set_graph_handler(graph):
-                result = coarse_tile_mod._hint_ranges_pos(
+                result = loop_tiling_common_mod._hint_ranges_pos(
                     invariant_op, hint, out_coords=[sympy.Integer(0)]
                 )
         self.assertEqual(
@@ -4537,7 +4613,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
             # returns cannot distinguish "spliced correctly" from
             # "splicing was a no-op and DCE pruned the orphaned WhileLoop
             # as unrelated dead code."
-            captured["operations"] = list(graph.operations)
+            captured["operations"] = list(all_ops(graph.operations))
             return result
 
         passes_mod.splice_while_loops = capturing_splice_while_loops
@@ -4630,7 +4706,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
             # test_nested_for_each_tile_markers_resolve_correctly): this test
             # only checks that both WhileLoops were spliced, not marker
             # survival, so it has no later use for the graph reference.
-            captured["operations"] = list(graph.operations)
+            captured["operations"] = list(all_ops(graph.operations))
             return result
 
         passes_mod.splice_while_loops = capturing_splice_while_loops
@@ -4888,7 +4964,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
             # Deliberately broken: never calls the real splicer, never
             # rewires or mutates anything. The WhileLoop op it was handed
             # is still fully intact in graph.operations right now.
-            captured["operations"] = list(graph.operations)
+            captured["operations"] = list(all_ops(graph.operations))
             return None
 
         passes_mod.splice_while_loops = noop_splice_while_loops
@@ -4968,7 +5044,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
 
         def capturing_splice_while_loops(graph):
             result = original_splice_while_loops(graph)
-            captured["operations"] = list(graph.operations)
+            captured["operations"] = list(all_ops(graph.operations))
             return result
 
         passes_mod.splice_while_loops = capturing_splice_while_loops
@@ -5219,7 +5295,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         """
         import sympy
 
-        import torch_spyre._inductor.wsr.coarse_tile as coarse_tile_mod
+        import torch_spyre._inductor.pass_utils as pass_utils_mod
         from torch._inductor.dependencies import MemoryDep
         from torch_spyre._inductor.wsr.for_each_tile_lowering import (
             _MARKER_MAPS,
@@ -5269,7 +5345,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         graph = mock.Mock(spec=["operations"])
         graph.operations = operations
 
-        with mock.patch.object(coarse_tile_mod, "op_out_coords", return_value=[v0, w0]):
+        with mock.patch.object(pass_utils_mod, "op_out_coords", return_value=[v0, w0]):
             with V.set_graph_handler(graph):
                 result = lookup_marker_dim(op, u0)
 
@@ -5578,6 +5654,7 @@ class TestHoistedInputCloneOnRealGraph(unittest.TestCase):
         graph = self._run_graph(split_m_fn, (X, Y))
         with V.set_graph_handler(graph):
             splice_while_loops(graph)
+            expand(graph)
         return graph
 
     @staticmethod

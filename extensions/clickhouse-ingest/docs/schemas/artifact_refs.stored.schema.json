@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "How a consumer obtains an artifact, and the address that takes.",
+  "properties": {
+    "artifact_id": {},
+    "content_digest": {},
+    "index_uri": {},
+    "method": {
+      "enum": [
+        "container-pull",
+        "dnf",
+        "download",
+        "pip"
+      ]
+    },
+    "props": {},
+    "ref": {
+      "minLength": 1
+    },
+    "ref_kind": {
+      "enum": [
+        "glob",
+        "pullspec",
+        "url"
+      ]
+    }
+  },
+  "required": [
+    "artifact_id",
+    "method",
+    "ref_kind",
+    "index_uri",
+    "ref",
+    "content_digest",
+    "props"
+  ],
+  "title": "artifact_refs: the stored row",
+  "type": "object",
+  "x-uploadable": false
+}

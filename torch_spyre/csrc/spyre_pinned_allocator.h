@@ -19,7 +19,7 @@
 #include <ATen/core/CachingHostAllocator.h>
 
 #include <cstddef>
-#include <flex/memory_interface/pinned_staging_cache.hpp>
+#include <flex/flex.hpp>
 #include <map>
 #include <memory>
 #include <mutex>
