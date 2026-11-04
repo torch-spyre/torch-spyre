@@ -803,9 +803,7 @@ def topk_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
 
     The reduction/search axes stay unsplit. Expose every divisor of the output
     K axis that fits within ``SENCORES`` and leaves at most
-    ``TOPK_MAX_K_PER_CORE`` results per core. Larger factors have triggered an
-    incorrect result mapping for 4D ``k=32``; ``test_topk_4d_k32_dim2`` remains
-    a known failing case with those factors admitted.
+    ``TOPK_MAX_K_PER_CORE`` results per core.
     """
     if (
         not isinstance(ctx.op.data, Reduction)

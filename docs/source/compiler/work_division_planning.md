@@ -453,8 +453,8 @@ TopK reductions use constraint-based work division:
 1. **k is split, capped at 4 rows per core.** Every divisor `d` of `k` with
    `k / d <= 4` is admitted as a candidate, subject to the core budget. For
    example, `k=8` admits splits 2, 4, and 8; the planner can choose a larger
-   factor when it benefits work distribution. The 4D `k=32` regression
-   `test_topk_4d_k32_dim2` remains a known failure with larger factors enabled.
+   factor when it benefits work distribution. If no valid divisor exists within
+   max_cores, the compiler raises `Unsupported`.
 2. **The search-space dimension is never split.** The dimension being
    searched (the `dim` argument to `torch.topk`) must stay whole on one core.
 
