@@ -290,6 +290,9 @@ def _traffic(o: "OpCost", width: int = 12) -> str:
 
 def _loop_group_id(op) -> tuple[int, ...] | None:
     # A malformed id (e.g. a bare int) reads as "no loop" and must not sink the report.
+    # ``include_extern=True`` keeps this reader's old behaviour of not special-casing
+    # an ExternKernel.  Here ``op`` is an IR op from the report's operation list, and
+    # the extractor skips ops it cannot model, so the flag changes nothing today.
     return counted_loop_path(op, include_extern=True) or None
 
 
