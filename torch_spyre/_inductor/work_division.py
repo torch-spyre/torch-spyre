@@ -1999,11 +1999,8 @@ def _apply_user_hint(
         write_index, read_index = select_work_division_transport_indexes(
             op, op_read_writes(op), it_space_adjusted
         )
-    except (Unsupported, AttributeError):
-        # Unsupported: op has no MemoryDep write, so this transport never
-        # applies to it. AttributeError: op is a lightweight stand-in (unit
-        # tests of this function's pruning/validation logic) with no real
-        # read/write analysis to run the representability check against.
+    except Unsupported:
+        # The transport is not used when the op has no MemoryDep write.
         write_index = read_index = None
     if write_index is not None:
         problems = unrepresentable_splits_by_index_coeff(
