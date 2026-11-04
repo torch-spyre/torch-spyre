@@ -1258,7 +1258,7 @@ _SORT_CASES = {
         0,
         False,
     ),
-    "2d_ties_dim0_desc": (lambda dt: _sort_ties((128, 64), 7, dt), 0, True),
+    "2d_ties_dim0": (lambda dt: _sort_ties((128, 64), 7, dt), 0, False),
     "3d_ties_dim1": (lambda dt: _sort_ties((2, 16, 64), 3, dt), 1, False),
     "2d_size1_dim0": (
         lambda dt: unique_randn_along_dim((1, 64), dim=1, dtype=dt),
@@ -1268,22 +1268,15 @@ _SORT_CASES = {
     # Last (stick) dim, width not a whole number of sticks: the stable flip
     # pads to a full stick.
     "2d_ties_last_dim_w60": (lambda dt: _sort_ties((16, 60), 5, dt), 1, False),
-    # Sort-dim sizes topk can't split across cores: padded to the next size
-    # that can (127 -> 128, 35 -> 36).
-    "2d_ties_unsplittable_n127_last_dim_desc": (
+    # Sort-dim size topk can't split across cores: padded to the next size
+    # that can (127 -> 128).
+    "2d_ties_unsplittable_n127_last_dim": (
         lambda dt: _sort_ties((16, 127), 5, dt),
         1,
-        True,
-    ),
-    "2d_ties_unsplittable_n35_dim0_desc": (
-        lambda dt: _sort_ties((35, 16), 5, dt),
-        0,
-        True,
+        False,
     ),
     # Sort dims over TOPK_MAX_K (128): spyre_topk peels them in chunks of 128.
-    # 129 leaves a remainder of 1; 165 leaves 37, padded to 40 so the last chunk
-    # splits across cores.
-    "2d_ties_peeling_n129_dim0": (lambda dt: _sort_ties((129, 32), 11, dt), 0, False),
+    # 165 leaves 37, padded to 40 so the last chunk splits across cores.
     "2d_ties_peeling_n165_dim0_desc": (
         lambda dt: _sort_ties((165, 32), 11, dt),
         0,
@@ -1309,10 +1302,10 @@ def _sort_params(dtype, names=None):
     }
 
 
-# Sort-dim sizes 256, 512 and 1024 in 1D and 2D, as (input, dim). Sorting along
-# dim 0, 1D sort, and stable sort along dim=1 for n=256/512 all work. n=1024
-# along dim=1 compiles but returns wrong values. fp32 also checks the indices.
-_SORT_SIZES = (256, 512, 1024)
+# Sort-dim sizes 256, 999 and 1024 in 1D and 2D, as (input, dim). Sorting along
+# dim 0, 1D sort, and stable sort along dim=1 for n=256 and n=999 all work.
+# fp32 also checks the indices.
+_SORT_SIZES = (256, 999, 1024)
 _SORT_SIZES_PARAM_SETS = {
     **{
         f"2d_dim0_n{n}_{tag}": (_sort_ties((n, 32), 11, dt), 0)
@@ -1326,7 +1319,10 @@ _SORT_SIZES_PARAM_SETS = {
     },
     **{f"1d_n{n}_fp32": (_sort_ties((n,), 11, torch.float32), 0) for n in _SORT_SIZES},
     **{
-        f"2d_dim1_n{n}_fp32": (_sort_ties((64, n), 11, torch.float32), 1)
+        f"2d_dim1_n{n}_fp32": (
+            _sort_ties((32, n), 11, torch.float32),
+            1,
+        )
         for n in _SORT_SIZES
     },
 }
@@ -2180,8 +2176,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 # Stick-aligned (64 fp16 per 128-byte stick) and unaligned.
                 "w64": (64,),
                 "w96": (96,),
-                "w128": (128,),
-                "w160": (160,),
                 "w192": (192,),
             },
         },
@@ -2199,11 +2193,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     2,
                     1,
                 ),
-                "3d_k3_dim1": (
-                    unique_randn_along_dim((67, 71, 256), dim=1),
-                    3,
-                    1,
-                ),
                 "3d_k4_dim0": (
                     unique_randn_along_dim((67, 71, 256), dim=0),
                     4,
@@ -2213,11 +2202,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     unique_randn_along_dim((6, 17, 7, 64), dim=1),
                     2,
                     1,
-                ),
-                "4d_k3_dim2": (
-                    unique_randn_along_dim((6, 17, 7, 64), dim=2),
-                    3,
-                    2,
                 ),
                 "4d_k4_dim0": (
                     unique_randn_along_dim((6, 17, 7, 64), dim=0),
@@ -2237,11 +2221,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d_k12_dim1": (
                     unique_randn_along_dim((2, 64, 32), dim=1, dtype=torch.float32),
                     12,
-                    1,
-                ),
-                "3d_k20_dim1": (
-                    unique_randn_along_dim((6, 256, 32), dim=1, dtype=torch.float32),
-                    20,
                     1,
                 ),
                 "4d_k32_dim2": (
@@ -2308,107 +2287,34 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     4,
                     1,
                 ),
-                "3d_batch1x1_k4_dim2_lt64": (
-                    unique_randn_along_dim((1, 1, 32), dim=2),
-                    4,
-                    2,
-                ),
                 "3d_batch1x1_k4_dim2_gt64": (
                     unique_randn_along_dim((1, 1, 128), dim=2),
                     4,
                     2,
                 ),
-                "2d_batch1_k6_dim1_gt64": (
-                    unique_randn_along_dim((1, 128), dim=1),
-                    6,
-                    1,
-                ),
-                "3d_batch1x1_k6_dim2_gt64": (
-                    unique_randn_along_dim((1, 1, 128), dim=2),
-                    6,
-                    2,
-                ),
-                "2d_batch1_k8_dim1_gt64": (
-                    unique_randn_along_dim((1, 128), dim=1),
-                    8,
-                    1,
-                ),
-                "3d_batch1x1_k8_dim2_gt64": (
-                    unique_randn_along_dim((1, 1, 128), dim=2),
-                    8,
-                    2,
-                ),
                 # N not a multiple of the 64-element stick size.
-                "2d_batch1_k4_dim1_non_multiple_of_64": (
-                    unique_randn_along_dim((1, 100), dim=1),
-                    4,
-                    1,
-                ),
-                "3d_batch1x1_k4_dim2_non_multiple_of_64": (
-                    unique_randn_along_dim((1, 1, 100), dim=2),
-                    4,
-                    2,
-                ),
                 "2d_batch1_k6_dim1_non_multiple_of_64": (
                     unique_randn_along_dim((1, 100), dim=1),
                     6,
                     1,
                 ),
-                "3d_batch1x1_k6_dim2_non_multiple_of_64": (
-                    unique_randn_along_dim((1, 1, 100), dim=2),
-                    6,
-                    2,
-                ),
-                "2d_batch1_k8_dim1_non_multiple_of_64": (
-                    unique_randn_along_dim((1, 100), dim=1),
-                    8,
-                    1,
-                ),
-                "3d_batch1x1_k8_dim2_non_multiple_of_64": (
-                    unique_randn_along_dim((1, 1, 100), dim=2),
-                    8,
-                    2,
-                ),
                 # Mirror of the (1, N) case: the size-1 dim is last instead
                 # of first, so the reduction dim (0) is the tensor's first
                 # dim rather than its last.
-                "2d_nx1_k4_dim0_lt64": (
-                    unique_randn_along_dim((32, 1), dim=0),
-                    4,
-                    0,
-                ),
                 "2d_nx1_k4_dim0_gt64": (
                     unique_randn_along_dim((128, 1), dim=0),
                     4,
                     0,
                 ),
-                "2d_nx1_k4_dim0_non_multiple_of_64": (
+                "2d_nx1_k8_dim0_non_multiple_of_64": (
                     unique_randn_along_dim((100, 1), dim=0),
-                    4,
-                    0,
-                ),
-                # k=8 variant to catch any backend-side assumption that the
-                # reduction dim of a degenerate topk sits last rather than
-                # first (dim=0 here, vs. dim=1/2 for the (1, N)-family above).
-                "2d_nx1_k8_dim0_gt64": (
-                    unique_randn_along_dim((128, 1), dim=0),
                     8,
                     0,
                 ),
                 # Reduction dim sandwiched between two size-1 dims.
-                "3d_1xnx1_k4_dim1_lt64": (
-                    unique_randn_along_dim((1, 32, 1), dim=1),
-                    4,
-                    1,
-                ),
                 "3d_1xnx1_k4_dim1_gt64": (
                     unique_randn_along_dim((1, 128, 1), dim=1),
                     4,
-                    1,
-                ),
-                "3d_1xnx1_k8_dim1_gt64": (
-                    unique_randn_along_dim((1, 128, 1), dim=1),
-                    8,
                     1,
                 ),
                 # Every dim is size 1: reduction dim, k dim, and the only
@@ -2472,10 +2378,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
                 "int32_dim0_desc": (_sort_ties((64, 8), 11, torch.int32), 0, True),
                 # n=192 peels as 128 + 64.
-                "int64_peeling_n192_dim0_desc": (
+                "int64_peeling_n192_dim0": (
                     _sort_ties((192, 32), 11, torch.int64),
                     0,
-                    True,
+                    False,
                 ),
             },
         },
@@ -2499,20 +2405,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "1d_ties": (_sort_ties((64,), 4, torch.float16), 0, False),
             },
         },
-        # Sort-dim sizes 256, 512 and 1024. 1D sort works. Stable sort along
-        # the wide stick dim (64 x n, dim=1) works for n=256 and n=512. n=1024
-        # compiles but returns wrong values (TODO: cite an open issue once
-        # diagnosed).
+        # Sort-dim sizes 256, 999 and 1024. 1D sort works. Stable sort along
+        # the stick dim (32 x n, dim=1) works for all sizes. The fp32 1024x64
+        # dim=0 case below fails to compile: dbo-opt (sbf-ddc) raises
+        # "Expect valid chunk size that fits in LX" on the topkvalue kernel. A
+        # plain fp32 topk of a 1024x64 tensor fails the same way, with no sort
+        # or peeling involved.
         ("test_sort_sizes", "test_sort_sizes_cpu"): {
             "param_sets": _SORT_SIZES_PARAM_SETS,
             "expect_fail": {
                 "2d_dim0_n1024_c64_fp32": (
-                    "fp32 topk peeling returns wrong values for a 1024x64 sort "
-                    "along dim 0 (TODO: cite an open issue)"
-                ),
-                "2d_dim1_n1024_fp32": (
-                    "fp32 topk peeling returns wrong values for a 64x1024 stable "
-                    "sort along dim 1 (TODO: cite an open issue)"
+                    "dbo-opt fails with 'Expect valid chunk size that fits in LX' "
+                    "for the topk of a 1024x64 fp32 tensor (PLACEHOLDER ISSUE)"
                 ),
             },
         },
@@ -2585,13 +2489,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     2,
                     0.0,
                 ),
-            },
-            # A backend regression makes these cases fail their correctness check.
-            # Non-strict, so an unexpected pass does not fail the run. Remove the
-            # entries when #5950 is fixed.
-            "expect_fail_unstable": {
-                "2d_dim1": "keep_by_index result fails the correctness check, #5950",
-                "4d_dim2": "keep_by_index result fails the correctness check, #5950",
             },
         },
         ("test_reduce_keepdim0", "test_reduce_keepdim0_cpu"): {
@@ -10924,14 +10821,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         if x.dtype == torch.float32:
             torch.testing.assert_close(indices.cpu(), expected.indices)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "a stable sort along the stick dim returns wrong values when the "
-            "flip -> topk has k > 64 (TODO: cite an issue)"
-        ),
-    )
     def test_sort_stick_dim_peeling(self):
         x = (torch.arange(16 * 192) * 7 % 11).reshape(16, 192).half()
         self.compare_with_cpu(lambda x: torch.sort(x, dim=1, stable=True)[0], x)

@@ -159,10 +159,16 @@ class SpyreSDSCKernelRunner:
                 with torch.profiler.record_function(
                     f"prepare_kernel:{self.kernel_name}"
                 ):
-                    self._jobplan = prepare_kernel(
-                        spyrecode_dir,
-                        profiler_name=self.profiler_event_name,
-                    )
+                    try:
+                        self._jobplan = prepare_kernel(
+                            spyrecode_dir,
+                            profiler_name=self.profiler_event_name,
+                        )
+                    except TypeError:
+                        self._jobplan = prepare_kernel(
+                            spyrecode_dir,
+                            profiler_event_name=self.profiler_event_name,
+                        )
         return self._jobplan
 
     @with_ffdc(CATEGORY_RUNTIME_LAUNCH, logger)

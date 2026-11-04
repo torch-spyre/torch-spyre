@@ -2799,7 +2799,10 @@ def compute_restickify_needed(
             # correct dim, when the sticks differ.
             exp_idc = try_device_coordinates(expanded_stl, in_dep, ind_sizes, op=op)
             exp_stick = exp_idc[-1] if exp_idc else None
-            if exp_stick is not None and exp_stick.free_symbols == target_stick.free_symbols:
+            if (
+                exp_stick is not None
+                and exp_stick.free_symbols == target_stick.free_symbols
+            ):
                 return True, expanded_stl
 
     # Local import avoids circular dependency (propagate_layouts imports pass_utils).
