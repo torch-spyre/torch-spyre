@@ -73,14 +73,17 @@ from .insert_restickify import (
 )
 from .enforce_indirect_access_layout import enforce_indirect_access_layout
 from .hbm_pool_planning import hbm_pool_planning
+from .sharded_hbm import plan_sharded_hbm
 from .work_division import (
     span_reduction,
     work_distribution,
     cost_model_matmul_division,
+    defer_work_division,
 )
 from .pass_utils import format_operations, finalize_work_division_for_scheduler
 from .scratchpad.allocator import (
     scratchpad_planning,
+    solve_decides_work_division,
 )
 from .scratchpad.lx_relayout import anchor_lx_relayout_ownership
 from .fusion import spyre_fuse_nodes
@@ -416,6 +419,12 @@ def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
 
 @_runs(cost_model_matmul_division, work_distribution)
 def _distribute_work(graph: GraphLowering) -> None:
+    if solve_decides_work_division():
+        # The co-optimizing LX solve re-chooses every split it can enumerate, so
+        # a split committed here would be overwritten. The allocator divides the
+        # ops it pins, and whatever the solve leaves, on demand.
+        defer_work_division(graph)
+        return
     # cost_model_matmul_division claims a subset of ops; work_distribution skips
     # those so every op is divided by exactly one of the two passes.
     preassigned_ops = cost_model_matmul_division(graph)
@@ -571,6 +580,12 @@ class CustomPreSchedulingPasses:
             _maybe_coarse_tile_span_overflow,
             #
             # Core Division
+            # The shard plan pins the split of ops on sharded operands first.
+            # Invariant: this must run before any pass that could insert a
+            # consumer of a sharded buffer (its rejection loops only see the
+            # graph as of this point); compute_ops' all-sharded check is the
+            # second net.
+            plan_sharded_hbm,
             span_reduction,
             _distribute_work,
             #
