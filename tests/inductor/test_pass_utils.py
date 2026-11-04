@@ -150,6 +150,65 @@ def test_scatter_index_discovery_preserves_load_order_after_wrapping():
     assert [value.base.name for value in subs.values()] == ["new_rows", "new_columns"]
 
 
+def _layout_state_marked_op():
+    """A pointwise op carrying the per-op results of layout propagation."""
+    op = ComputedBuffer(
+        name="buf0",
+        layout=FixedLayout(torch.device("cpu"), torch.float32, [64], [1]),
+        data=Pointwise(
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            inner_fn=lambda index: V.ops.load("src", index[0]),
+            ranges=[64],
+        ),
+    )
+    op.operation_name = "op0"
+    op.layouts = ["layouts-sentinel"]
+    op.restick_cost_fn = "cost-sentinel"
+    op.committed_stl = "committed-sentinel"
+    return op
+
+
+def test_redirect_computed_buffer_reads_keeps_layout_state():
+    """Rebuilding a reader after layout propagation must not drop its results.
+
+    ``layouts``, ``restick_cost_fn`` and ``committed_stl`` are set by
+    propagate_spyre_tensor_layouts / nonstick_dim_order.  A rebuild that loses
+    them makes later passes fail (KeyError in optimize_restickify, FixedLayout
+    without ``device_layout`` in insert_restickify).
+    """
+    op = _layout_state_marked_op()
+    graph = types.SimpleNamespace(
+        sizevars=SizeVarAllocator(),
+        name_to_buffer={"buf0": op},
+        name_to_op={"op0": op},
+    )
+    with V.set_graph_handler(graph):
+        rebuilt = pass_utils.redirect_computed_buffer_reads(
+            op, {"src": "other"}, [op], pass_name="test"
+        )
+    assert rebuilt is not op
+    assert rebuilt.layouts == ["layouts-sentinel"]
+    assert rebuilt.restick_cost_fn == "cost-sentinel"
+    assert rebuilt.committed_stl == "committed-sentinel"
+
+
+def test_copy_op_metadata_layout_state_is_opt_in():
+    """A new op built from another op must not inherit the source's layouts."""
+    from torch_spyre._inductor.loop_info import copy_op_metadata
+
+    src = _layout_state_marked_op()
+    default = types.SimpleNamespace()
+    copy_op_metadata(src, default)
+    for attr in ("layouts", "restick_cost_fn", "committed_stl"):
+        assert not hasattr(default, attr)
+    opted = types.SimpleNamespace()
+    copy_op_metadata(src, opted, layout_state=True)
+    assert opted.layouts == ["layouts-sentinel"]
+    assert opted.restick_cost_fn == "cost-sentinel"
+    assert opted.committed_stl == "committed-sentinel"
+
+
 @pytest.mark.parametrize("indexed_axis", [0, 1, 2])
 @pytest.mark.parametrize("normalize", [False, True])
 def test_scatter_iteration_space_preserves_indirect_axes(indexed_axis, normalize):
