@@ -144,10 +144,12 @@ class TestNamedWorkDivisionHint(InductorTestCase):
         )
 
     def _fake_op(self, loop_var_dims):
-        return SimpleNamespace(
+        op = SimpleNamespace(
             get_name=lambda: "fake_op",
+            get_read_writes=lambda: SimpleNamespace(writes=[], reads=[]),
             work_div_loop_info=loop_var_dims,
         )
+        return op
 
     def _fake_output_td(self, coord_vars):
         return SimpleNamespace(device_coords=[*coord_vars, Integer(0)])
@@ -330,6 +332,22 @@ class TestNamedWorkDivisionHint(InductorTestCase):
                 max_cores=32,
                 allowed_splits={m: frozenset({1})},
             )
+
+    def test_apply_work_div_hint_propagates_attribute_error(self):
+        h = Symbol("H")
+        op = self._fake_op({h: ["H"]})
+        with mock_patch(
+            "torch_spyre._inductor.work_division.select_work_division_transport_indexes",
+            side_effect=AttributeError("broken operation guard"),
+        ):
+            with self.assertRaisesRegex(AttributeError, "broken operation guard"):
+                _wd._apply_user_hint(
+                    op,
+                    {h: 2},
+                    {h: 64},
+                    self._fake_output_td([h]),
+                    max_cores=32,
+                )
 
     @config.patch({"sencores": 8})
     def test_pointwise_work_div_hint_applied(self):
