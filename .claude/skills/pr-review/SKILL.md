@@ -106,12 +106,14 @@ Ensure tests cover the affected path(s).
 - Tests use `ParameterizedTestMeta` for parameterized cases
 - Building-block tests for module-level changes
 
-**Test expectations** (the "Test Invariants" section of `CLAUDE.md`). For any PR that
+**Test expectations** (the "Test Invariants" section of `AGENTS.md`). For any PR that
 adds, changes or removes an `xfail`, `skip`, `expect_*` key or `pytest.raises` in a test:
 
 - No `pytest.xfail(...)` in a test body or helper, and no `try`/`except` that turns an
   error into an xfail or skip. Use a marker, a `PARAMS` key or `strict_xfail`
-  (**BLOCKER**: the test then cannot XPASS).
+  (**BLOCKER**: the test then cannot XPASS). The one exception is a call placed last,
+  after the body has already checked its result; `AGENTS.md` names the single such
+  call in the tree.
 - An xfail is strict, and has `raises=` where the author writes the marker
   (`@pytest.mark.xfail`, `strict_xfail`). `expect_fail` is a `{case: reason}` mapping
   that cites the issue. `expect_fail_unstable` needs a reason and an issue and must be

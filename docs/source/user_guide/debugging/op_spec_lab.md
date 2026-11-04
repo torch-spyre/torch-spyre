@@ -255,7 +255,7 @@ capture time, so `KERNEL ARGS` shows them in the frozen header but not under
 ### `LoopSpec`
 
 Wraps a body of specs in a `count` trip count. Only coarse tiling produces
-these, and only via `spyre_hint(num_tiles_per_dim=...)` — see
+these: a `for_each_tile` loop, or the automatic span-overflow tiling — see
 [Coarse Tiling Loops](../../compiler/coarse_tiling_loops.md).
 
 ## Walkthrough: four worked examples

@@ -38,9 +38,9 @@ from torch._inductor.ir import (
     ReinterpretView,
     Scatter,
 )
-from torch_spyre._C import DataFormats, SpyreTensorLayout
+from torch_spyre._C import SpyreTensorLayout
 
-from .constants import ELIDED_COPY_BACK_ATTR
+from .constants import ELIDED_COPY_BACK_ATTR, RESTICKIFY_SUPPORTED_DEVICE_DTYPES
 from .errors import Unsupported
 from .insert_restickify import (
     _fixed_tiled,
@@ -60,6 +60,7 @@ from .pass_utils import (
     iteration_space_from_op,
     iteration_space_with_splits,
     padded_entry_output_stl,
+    per_trip_index,
 )
 from .views import AlignmentInputs, UnalignedStickSplit, align_tensors_pure
 from . import config
@@ -209,7 +210,7 @@ def _dense_scatter_source_stl(value_layout: FixedTiledLayout) -> SpyreTensorLayo
     arrangement while returning its host dimensions to their canonical order.
     """
     source_stl = value_layout.device_layout
-    if source_stl.device_dtype != DataFormats.SEN169_FP16:
+    if source_stl.device_dtype not in RESTICKIFY_SUPPORTED_DEVICE_DTYPES:
         raise Unsupported(
             "scatter source alignment requires materialization, but "
             f"ReStickifyOpHBM does not support {source_stl.device_dtype}"
@@ -261,9 +262,16 @@ def _scatter_alignment_inputs(
         if not isinstance(layout, FixedTiledLayout):
             return None
         accesses.append(
-            AlignmentAccess(overrides.get(dep.name, layout.device_layout), dep.index)
+            AlignmentAccess(
+                overrides.get(dep.name, layout.device_layout),
+                per_trip_index(op, dep.index),
+            )
         )
-    accesses.append(AlignmentAccess(output_layout.device_layout, write_dep.index))
+    accesses.append(
+        AlignmentAccess(
+            output_layout.device_layout, per_trip_index(op, write_dep.index)
+        )
+    )
     space = iteration_space_from_op(op)
     return build_operation_alignment_inputs(
         space,
@@ -330,7 +338,10 @@ def _materialize_unaligned_scatter_source(
         # ReStickify cannot materialize a non-DL16 source.  It may be an
         # unrelated direct operand, so keep looking for a feasible candidate;
         # if none resolves the split, preserve the original alignment error.
-        if source_layout.device_layout.device_dtype != DataFormats.SEN169_FP16:
+        if (
+            source_layout.device_layout.device_dtype
+            not in RESTICKIFY_SUPPORTED_DEVICE_DTYPES
+        ):
             logger.debug(
                 "enforce_indirect_access_layout: scatter source candidate %s "
                 "uses unsupported ReStickify format %s",

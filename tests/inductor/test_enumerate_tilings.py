@@ -577,12 +577,21 @@ class TestTilingSpace(unittest.TestCase):
         self.assertEqual(space.neighbours(TileSpec()), [])
 
     def test_an_op_the_hint_passes_already_tiled_is_offered_nothing(self):
-        # ``CoarseTilingPass`` stamps ``op.dim_hints`` wholesale, so a tiling
+        # ``apply_tilings`` stamps ``op.dim_hints`` wholesale, so a tiling
         # chosen here for an already-hinted op would clobber the group it is
         # part of. The marker both earlier passes leave set is the guard.
         op = _pointwise_op((512, 256, 128))
         self.assertFalse(build_tiling_space(op).is_empty)  # non-vacuity
         op.dim_hints = [object()]
+        space = build_tiling_space(op)
+        self.assertTrue(space.is_empty)
+        self.assertEqual(space.enumerate(), [TileSpec()])
+
+    def test_a_loop_group_member_without_hints_is_offered_nothing(self):
+        # ``coarse_tile`` adds members -- a group's copy-out, a restickify of a
+        # tiled read -- that carry ``loop_info`` but no ``dim_hints``.
+        op = _pointwise_op((512, 256, 128))
+        op.loop_info = object()
         space = build_tiling_space(op)
         self.assertTrue(space.is_empty)
         self.assertEqual(space.enumerate(), [TileSpec()])

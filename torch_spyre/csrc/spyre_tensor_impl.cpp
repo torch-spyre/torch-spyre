@@ -91,6 +91,12 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
   const auto [sen_dtype_cpu, sen_dtype_dev] =
       stringToDTDataFormatPair(str_type);
   this->device_dtype = sen_dtype_dev;
+  TORCH_CHECK(this->device_dtype != DataFormats::INVALID,
+              "Spyre backend does not support dtype ", dtype);
+  TORCH_CHECK(this->elems_per_stick() > 0,
+              "No stick size mapping for device data format ",
+              this->device_dtype,
+              " (deeptools dataFormatToStickSize is incomplete)");
 
   if (host_size.size() == 0) {
     // Degenerate case of 0-dimension tensor (ie, a scalar)

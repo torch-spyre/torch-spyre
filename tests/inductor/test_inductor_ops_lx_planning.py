@@ -24,7 +24,7 @@ from torch.testing import FileCheck
 from torch._dynamo.testing import make_test_cls_with_patches
 
 import unittest
-from utils_inductor import compare_with_cpu
+from utils_inductor import _safe_test_name, compare_with_cpu
 
 _test_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 sys.path.append(_test_dir)
@@ -100,11 +100,11 @@ def _canonical_test_names(test_cls):
                     None,
                 )
                 if case is not None:
-                    canonical.add(f"{prefix}_{op_name}_{case}")
+                    canonical.add(_safe_test_name(f"{prefix}_{op_name}_{case}"))
         else:
             case = next((c for c in param_sets if c not in expect_fail), None)
             if case is not None:
-                canonical.add(f"{prefix}_{case}")
+                canonical.add(_safe_test_name(f"{prefix}_{case}"))
     for name in vars(test_cls):
         if name.startswith("test_") and not any(
             name.startswith(p + "_") for p in parameterized_prefixes
@@ -182,9 +182,11 @@ def _copy_canonical_tests(
 
 INHERITED_TEST_ATTRIBUTES = [
     "is_dtype_supported",
+    "_run_clamp_cpu",
     # Shared body for the direct-path conv3d cases; the im2col conv3d and gate
     # tests are self-contained, but test_conv3d_via_conv2d_base delegates here.
     "_run_conv3d_via_conv2d",
+    "_assert_conversion_on_device",
 ]
 
 POINTWISE_TEST_FAILURES = []
@@ -208,6 +210,15 @@ class _LxPlanningTwoOpTestBase(unittest.TestCase):
     # flags. Subclasses with such a wrap raise this floor; wholesale coherence
     # bugs (orders of magnitude larger) still fail.
     _wrap_atol_floor: float = 0.0
+    # Floor on the relative tolerance, for the same wraps. The device sums fp16
+    # in DLFloat16, whose step is ~0.2% of the running sum, so the error grows
+    # with the sum and an absolute floor alone cannot cover a large one. It also
+    # keeps a base test's exact compare (rtol=0), meant for its own op, from
+    # being applied to the wrap's accumulation.
+    # TODO: the error scales with the sum of the magnitudes summed, not with the
+    # result, so a cancelling column still fails; replace both floors with a
+    # per-element bound (#5719).
+    _wrap_rtol_floor: float = 0.0
 
     def setUp(self):
         super().setUp()
@@ -230,6 +241,10 @@ class _LxPlanningTwoOpTestBase(unittest.TestCase):
             ).to(torch.float16)
         if self._wrap_atol_floor:
             kwargs["atol"] = max(kwargs.get("atol") or 0.0, self._wrap_atol_floor)
+        # Only an rtol the base test passes is raised; without one, the
+        # comparison's own default applies.
+        if self._wrap_rtol_floor and "rtol" in kwargs:
+            kwargs["rtol"] = max(kwargs["rtol"] or 0.0, self._wrap_rtol_floor)
 
         # Large matmul on s390x/ppc64: live fp16 CPU GEMM inside wrap(fn) is slow.
         # Build fp32→fp16 proxy gold through the same wrap as Spyre (matmul-only
@@ -264,7 +279,7 @@ class _LxPlanningTwoOpTestBase(unittest.TestCase):
             self.wrap(fn),
             *args,
             atol=max(cpu_atol, self._wrap_atol_floor),
-            rtol=cpu_rtol,
+            rtol=max(cpu_rtol, self._wrap_rtol_floor),
             needs_device=needs_device,
             cpu_compile=False,
         )
@@ -306,8 +321,10 @@ REDUCTION_TEST_FAILURES = []
 
 class LxPlanningTwoOpReductionTest(_LxPlanningTwoOpTestBase):
     # The sum-reduction wrap accumulates in fp16 across cores; allow for the
-    # resulting order/cancellation noise (see _wrap_atol_floor).
+    # resulting order/cancellation noise (see _wrap_atol_floor and
+    # _wrap_rtol_floor).
     _wrap_atol_floor = 1.0
+    _wrap_rtol_floor = 0.1
 
     def wrap_dlfloat16_reference(self, result):
         # These references contain same-sign values, so a sum cannot overflow

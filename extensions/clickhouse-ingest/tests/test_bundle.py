@@ -34,7 +34,7 @@ from spyre_clickhouse_ingest.junit import RunCoordinates
 
 AID = "93c0abb3-ed25-5934-b811-31b6c149ba47"
 OTHER = "0" * 8 + AID[8:]
-IMAGE = "icr.io/ai_sw_accel/2.0/prod/spyre-inference-devel@sha256:" + "b6" * 32
+IMAGE = "icr.io/example/2.0/prod/spyre-inference-devel@sha256:" + "b6" * 32
 JUNIT = """<?xml version="1.0"?><testsuites><testsuite name="s" tests="2"
  timestamp="2026-10-08T10:00:00+00:00"><testcase classname="a.b" name="test_x" time="1"/>
  <testcase classname="a.b" name="test_y" time="1"><failure message="boom"/></testcase>
@@ -113,7 +113,7 @@ def test_offline_writes_a_bundle_from_the_usual_flags(tmp_path, capsys):
     assert meta["started_at"] == "2026-10-08T10:00:00Z"
     assert report["run_id"] == RunId.derive("jenkins", meta["run_key"], "s390x", "fvt")
     assert report["upload_path"].startswith(
-        f"zsp/next/s390x/v2-results/inbox/{AID}/Spyre-Test_testing_"
+        f"next/s390x/v2-results/inbox/{AID}/Spyre-Test_testing_"
     )
 
 
@@ -122,7 +122,7 @@ def test_offline_tgz_and_validate_only(tmp_path, capsys):
     assert cli(["results", "--from-bundle", str(tgz), "--validate-only"]) == 0
     report = json.loads(capsys.readouterr().out)
     assert report["status"] == "valid"
-    assert report["upload_path"].split("/")[5] == "sha256-" + "b6" * 32
+    assert report["upload_path"].split("/")[4] == "sha256-" + "b6" * 32
     assert report["run_key"].startswith("manual:<uploader>:")
 
 
@@ -509,9 +509,31 @@ PROD_IDS = {
 MODEL = "ibm-ai-platform/micro-g3.3-8b-instruct-1b"
 
 
-def _vllm(tmp_path, *extra):
+HOST_METRICS = {
+    "latency_granite8B_tp1_in64_out64": [
+        ("host_cpu_pct_total_mean", 42.1),
+        ("host_mem_mb_peak", 2048.0),
+        ("compile_host_cpu_pct_total_mean", 77.5),
+    ],
+    "throughput_granite8B_tp1_in64_out64": [("host_cpu_pct_total_mean", 55.0)],
+}
+
+
+def _vllm(tmp_path, *extra, host_resources=False):
+    """`results --offline` over the vLLM fixtures; host_resources adds the sampler's files."""
     src = tmp_path / "vllm-out"
     shutil.copytree(VLLM_DATA / "results", src)
+    if host_resources:
+        for name, metrics in HOST_METRICS.items():
+            (src / f"{name}.host_resources.json").write_text(
+                "".join(
+                    json.dumps(
+                        {"test_name": name, "metric": m, "value": v, "model": MODEL}
+                    )
+                    + "\n"
+                    for m, v in metrics
+                )
+            )
     shutil.copy(VLLM_DATA / "attachments" / "latency_granite8B_tp1_in64_out64.cmd", src)
     out = tmp_path / "perf"
     argv = ["results", "--offline", "--out", str(out), "--vllm-results-dir", str(src),
@@ -659,6 +681,127 @@ def test_a_native_file_alone_takes_its_model_from_perf(tmp_path):
     assert {json.loads(r["extra"])["model"] for r in rows} == {MODEL}
 
 
+def test_offline_vllm_bundle_carries_the_host_resources_files(tmp_path, capsys):
+    out = _vllm(tmp_path, host_resources=True)
+    paths = {f["path"] for f in _meta(out)["files"]}
+    assert {f"results/{name}.host_resources.json" for name in HOST_METRICS} <= paths
+    assert cli(["results", "--from-bundle", str(out), "--validate-only"]) == 0
+
+
+def test_offline_writes_a_tgz_with_host_resources_directly(tmp_path):
+    src = tmp_path / "vllm-out"
+    shutil.copytree(VLLM_DATA / "results", src)
+    name = "latency_granite8B_tp1_in64_out64"
+    (src / f"{name}.host_resources.json").write_text(
+        json.dumps({"test_name": name, "metric": "host_cpu_pct_total_mean", "value": 1})
+    )
+    tgz = tmp_path / "perf.tgz"
+    argv = ["results", "--offline", "--out", str(tgz), "--vllm-results-dir", str(src),
+            "--artifact", f"id:{AID}", "--arch", "x86_64"]  # fmt: skip
+    assert cli(argv) == 0
+    with tarfile.open(tgz) as tar:
+        assert any(n.endswith(f"{name}.host_resources.json") for n in tar.getnames())
+    assert cli(["results", "--from-bundle", str(tgz), "--validate-only"]) == 0
+
+
+@pytest.mark.parametrize(
+    "name, content, why",
+    [
+        ("latency_x.host_resources.json", '{"test_name": "latency_x"}', "no host resource"),
+        ("latency_x.host_resources.json", "", "no host resource"),
+        ("decode_tp1.host_resources.json", '{"metric": "m", "value": 1}', "must start with"),
+        (
+            "latency_x_tp4.host_resources.json",
+            '{"metric": "m", "value": 1}',
+            "differ from perf",
+        ),
+    ],
+)  # fmt: skip
+def test_a_bad_host_resources_file_rejects_the_bundle(tmp_path, name, content, why):
+    out = _vllm(tmp_path, host_resources=True)
+    (out / "results" / name).write_text(content)
+    _edit(out, perf={"tensor_parallel": "1"}, files=None)
+    assert why in _rejected(out)
+
+
+def test_a_vllm_bundle_with_host_resources_writes_them_onto_the_same_benchmarks(
+    tmp_path, monkeypatch, capsys
+):
+    """The host metrics land on the latency / throughput benchmarks the bench JSON makes: no
+    benchmark of their own, no new run, the bench measurements and the verdict untouched."""
+    from spyre_clickhouse_ingest import client, resolver, vllm
+
+    out = _vllm(tmp_path, host_resources=True)
+    ch = CapturingClient()
+    monkeypatch.setattr(client.ClickHouse, "connect", lambda **kw: ch)
+    monkeypatch.setattr(client, "tables_present", lambda *a, **kw: True)
+    monkeypatch.setattr(vllm, "tables_present", lambda *a, **kw: True)
+    monkeypatch.setattr(
+        resolver,
+        "resolve",
+        lambda *a, **kw: _resolution(AID, "x86_64", "spyre-inference"),
+    )
+    monkeypatch.setenv("CLICKHOUSE_DB_V2", "spyre_v2")
+    code, report = _ingest(out, capsys, "--bundle-url", "https://art/p/")
+    assert (code, report["status"], report["benchmark_runs"]) == (0, "ingested", 2)
+
+    assert {r["name"]: r["benchmark_id"] for r in ch.inserted["benchmarks"]} == PROD_IDS
+    runs = {r["benchmark_id"]: r for r in ch.inserted["benchmark_runs"]}
+    lat = runs[PROD_IDS["latency_granite8B_tp1_in64_out64"]]
+    thr = runs[PROD_IDS["throughput_granite8B_tp1_in64_out64"]]
+
+    assert lat["measurements"]["host_cpu_pct_total_mean"] == [42.1]
+    assert lat["measurements"]["host_mem_mb_peak"] == [2048.0]
+    assert lat["measurements"]["compile_host_cpu_pct_total_mean"] == [77.5]
+    assert thr["measurements"]["host_cpu_pct_total_mean"] == [55.0]
+    assert lat["props"]["unit.host_cpu_pct_total_mean"] == "%"
+    assert lat["props"]["unit.compile_host_cpu_pct_total_mean"] == "%"
+    assert lat["props"]["unit.host_mem_mb_peak"] == "MB"
+    # The bench numbers and their sample counts are what they were without the host files.
+    assert lat["measurements"]["latency"] == [0.7093, 0.7155] and lat["iterations"] == 2
+    assert thr["iterations"] == 1
+    assert thr["measurements"]["tokens_per_second"]
+    assert lat["run_id"] == thr["run_id"] == report["run_id"]
+    (bench,) = [b for b in ch.inserted["benchmarks"] if b["name"].startswith("latency")]
+    assert bench["props"]["model"] == MODEL
+    (verdict,) = ch.inserted["artifact_results"]
+    assert verdict["duration_s"] == pytest.approx(3.162)
+
+
+def test_a_vllm_bundle_with_host_resources_has_the_live_legs_rows(tmp_path):
+    """Bundle and live ingest shape the same directory the same way."""
+    out = _vllm(tmp_path, host_resources=True)
+    rows = bundle.vllm_rows(out, offline.check(out) | {"arch": "x86_64"})
+    host = [r for r in rows if "host_" in r["metric"]]
+    assert sorted((json.loads(r["extra"])["test_name"], r["metric"]) for r in host) == (
+        sorted((n, f"{m}") for n, ms in HOST_METRICS.items() for m, _ in ms)
+    )
+    for r in host:
+        extra = json.loads(r["extra"])
+        assert (extra["model"], extra["arch"]) == (MODEL, "x86_64")
+        assert "iterations" not in extra
+
+
+def test_a_host_resources_file_alone_takes_its_model_from_the_record(tmp_path):
+    """No bench JSON beside it, and no perf model: the record names the model."""
+    out = _vllm(tmp_path, host_resources=True)
+    for f in (out / "results").glob("*.json"):
+        if ".host_resources." not in f.name:
+            f.unlink()
+    _edit(out, files=None)
+    rows = bundle.vllm_rows(out, offline.check(out) | {"arch": "x86_64"})
+    assert rows and {json.loads(r["extra"])["model"] for r in rows} == {MODEL}
+
+
+def test_the_bundle_digest_covers_the_host_resources_files(tmp_path):
+    out = _vllm(tmp_path, host_resources=True)
+    before = offline.digest(out)
+    f = out / "results" / "latency_granite8B_tp1_in64_out64.host_resources.json"
+    f.write_text(f.read_text().replace("42.1", "43.1"))
+    assert offline.digest(out) != before
+    assert "sha256 mismatch" in _rejected(out)
+
+
 # --- results --upload, against a local Artifactory stand-in ----------------------------------
 
 
@@ -709,6 +852,11 @@ class FakeArtifactory(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+@pytest.fixture(autouse=True)
+def results_root(monkeypatch):
+    monkeypatch.setenv("ARTIFACTORY_V2_RESULTS_ROOT", "next/{arch}/v2-results")
+
+
 @pytest.fixture
 def art(monkeypatch):
     FakeArtifactory.store, FakeArtifactory.seen, FakeArtifactory.fail = {}, [], 0
@@ -736,7 +884,7 @@ def test_offline_upload_puts_one_tgz_in_the_inbox(tmp_path, art, capsys):
     assert (code, report["status"]) == (0, "uploaded")
     ((method, path, auth),) = art.cls.seen
     assert path.startswith(
-        f"/artifactory/repo/zsp/next/s390x/v2-results/inbox/{AID}/manual_"
+        f"/artifactory/repo/next/s390x/v2-results/inbox/{AID}/manual_"
     )
     assert path.endswith("-fvt.tgz") and auth == "Bearer tok"
     tgz = tmp_path / "got.tgz"
@@ -752,6 +900,54 @@ def test_a_folder_upload_puts_bundle_json_last_and_retries_a_503(tmp_path, art, 
     puts = [p for m, p, _ in art.cls.seen]
     assert code == 0 and puts[0] == puts[1] and puts[-1].endswith("/bundle.json")
     assert puts[1].endswith("/results/junit.xml")
+
+
+@pytest.mark.parametrize("env", ["ARTIFACTORY_BASE_URL", "ARTIFACTORY_V2_RESULTS_REPO",
+                                 "ARTIFACTORY_V2_RESULTS_ROOT"])  # fmt: skip
+def test_upload_needs_its_location_settings(tmp_path, art, capsys, monkeypatch, env):
+    path = _offline(tmp_path, capsys=capsys)
+    monkeypatch.delenv(env, raising=False)
+    flags = {"ARTIFACTORY_BASE_URL": "--base-url", "ARTIFACTORY_V2_RESULTS_REPO": "--repo",
+             "ARTIFACTORY_V2_RESULTS_ROOT": "--root"}  # fmt: skip
+    argv = ["results", "--upload", str(path)]
+    argv += [
+        a
+        for k, f in flags.items()
+        if k != env
+        for a in (f, art.base if f == "--base-url" else "repo")
+    ]
+    capsys.readouterr()
+    assert cli(argv) == offline.FAILED
+    assert f"${env}" in json.loads(capsys.readouterr().out.splitlines()[-1])["reason"]
+
+
+def test_the_location_comes_from_the_environment_or_flags(
+    tmp_path, art, capsys, monkeypatch
+):
+    path = _offline(tmp_path, capsys=capsys)
+    monkeypatch.setenv("ARTIFACTORY_BASE_URL", art.base)
+    monkeypatch.setenv("ARTIFACTORY_V2_RESULTS_REPO", "repo")
+    monkeypatch.setenv("ARTIFACTORY_V2_RESULTS_ROOT", "env-root/{arch}")
+    capsys.readouterr()
+    assert cli(["results", "--upload", str(path)]) == 0
+    assert art.cls.seen[-1][1].startswith(
+        f"/artifactory/repo/env-root/s390x/inbox/{AID}/"
+    )
+    assert cli(["results", "--upload", str(path), "--root", "flag-root/{arch}"]) == 0
+    assert art.cls.seen[-1][1].startswith(
+        f"/artifactory/repo/flag-root/s390x/inbox/{AID}/"
+    )
+
+
+def test_validate_only_shows_a_placeholder_when_no_root_is_set(
+    tmp_path, capsys, monkeypatch
+):
+    path = _offline(tmp_path, capsys=capsys)
+    monkeypatch.delenv("ARTIFACTORY_V2_RESULTS_ROOT")
+    capsys.readouterr()
+    assert cli(["results", "--from-bundle", str(path), "--validate-only"]) == 0
+    got = json.loads(capsys.readouterr().out)["upload_path"]
+    assert got.startswith("<ARTIFACTORY_V2_RESULTS_ROOT>/inbox/")
 
 
 def test_upload_without_a_token_fails_clearly(tmp_path, art, capsys, monkeypatch):
@@ -784,7 +980,7 @@ def test_wait_reports_the_relays_outcome(tmp_path, art, capsys, where, status):
     path = _offline(tmp_path, capsys=capsys)
     with offline.opened(path) as root:
         meta, dig = offline.check(root), offline.digest(root)
-    done = f"/artifactory/repo/zsp/next/s390x/v2-results/{where}/{AID}/{offline.bundle_name(meta, dig)}.tgz"
+    done = f"/artifactory/repo/next/s390x/v2-results/{where}/{AID}/{offline.bundle_name(meta, dig)}.tgz"
     art.cls.store[done] = b"x"
     art.cls.store[done + ".REJECTED.json"] = json.dumps(
         {"reason": "sha256 mismatch"}

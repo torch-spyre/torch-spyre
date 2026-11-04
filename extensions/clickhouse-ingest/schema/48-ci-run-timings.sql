@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS ci_run_timings
     trigger_source         LowCardinality(String) DEFAULT '',                             -- e.g. 'spyre-test' (also 'main-push', 'merge-queue')
     preset                 LowCardinality(String) DEFAULT '',                             -- e.g. 'trigger-pr-validation'
     build_mode             LowCardinality(String) DEFAULT '',                             -- e.g. 'pr'
-    trigger_pr             String DEFAULT '',                                             -- e.g. 'github.ibm.com/ai-chip-toolchain/deeptools#4500' ('' for a non-PR run)
+    trigger_pr             String DEFAULT '',                                             -- e.g. 'ghe.example.com/example-org/deeptools#4500' ('' for a non-PR run)
     repo                   LowCardinality(String) DEFAULT '',                             -- e.g. 'deeptools'
     pr_number              UInt32 DEFAULT 0,                                              -- e.g. 4500
     sha                    String DEFAULT '',                                             -- e.g. '0123456789abcdef0123456789abcdef01234567'

@@ -17,21 +17,58 @@
 
 #include <c10/core/CachingDeviceAllocator.h>
 #include <c10/core/Device.h>
+#include <c10/core/ScalarType.h>
 #include <c10/core/Stream.h>
 
 #include <flex/flex.hpp>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <utility>
+#include <vector>
 
 namespace spyre {
 
-struct SharedOwnerCtx {
-  flex::CompositeAddress composite_addr;
-  signed char device_id;
+// Defined in spyre_mem.cpp: a single-shard view whose DataPtr context is the
+// SharedOwnerCtx below. Forward-declared so the ctx can point back at it.
+struct ShardViewCtx;
 
-  SharedOwnerCtx(flex::CompositeAddress addr, signed char dev_id)
-      : composite_addr(std::move(addr)), device_id(dev_id) {}
+// Sharding of a tensor's storage: shard i (the i-th equal slice along
+// shard_dim) lives in that shard's own allocation, encoded in the
+// shard-local device layout (shard_device_bytes). Address-free.
+struct ShardedStorageInfo {
+  int64_t shard_dim;
+  uint32_t num_shards;
+  uint64_t shard_device_bytes;
+  // Shape and dtype the storage was allocated for; the copy path checks
+  // tensor metadata against them. Filled in by spyre_empty_sharded; the
+  // dtype default makes a future caller that forgets to set it fail the
+  // copy check instead of reading an indeterminate value.
+  std::vector<int64_t> global_shape;
+  c10::ScalarType dtype = c10::ScalarType::Undefined;
+};
+
+struct SharedOwnerCtx {
+  // Non-sharded storage: the owning allocation. Sharded storage: a non-owning
+  // whole-storage view over the shards' chunks (hand-built, so its destructor
+  // never frees); the owning per-shard allocations live in shard_addrs.
+  flex::CompositeAddress composite_addr;
+  // Sharded storage only: one owning plain allocation per shard, indexed by
+  // shard ordinal (shard i backs core i). Empty for non-sharded storage.
+  std::vector<flex::CompositeAddress> shard_addrs;
+  signed char device_id;
+  flex::MemoryType memory_type;
+  // Set only for sharded storage.
+  std::optional<ShardedStorageInfo> sharding;
+  // Set only on the SharedOwnerCtx embedded in a ShardViewCtx: points back
+  // at the enclosing view so the view's DataPtr deleter can free it.
+  ShardViewCtx* shard_view = nullptr;
+
+  SharedOwnerCtx(flex::CompositeAddress addr, signed char dev_id,
+                 flex::MemoryType mem_type)
+      : composite_addr(std::move(addr)),
+        device_id(dev_id),
+        memory_type(mem_type) {}
 };
 
 // A custom allocator for our custom device, which returns a handle to the
@@ -62,18 +99,30 @@ struct SpyreAllocator final : public c10::DeviceAllocator {
   c10::CachingDeviceAllocator::DeviceStats getDeviceStats(
       c10::DeviceIndex device) override;
 
+  std::pair<size_t, size_t> getMemoryInfo(c10::DeviceIndex device) override;
+
   void resetAccumulatedStats(c10::DeviceIndex device) override;
 
   void resetPeakStats(c10::DeviceIndex device) override;
 
-  void recordAlloc(size_t nbytes, void* data, int device);
+  void recordAlloc(size_t nbytes, void* data, int device,
+                   flex::MemoryType memory_type);
 
-  void recordRelease(size_t nbytes, void* data, int device);
+  void recordRelease(size_t nbytes, void* data, int device,
+                     flex::MemoryType memory_type);
 
   c10::DataPtr allocate(size_t nbytes) override;
 
   c10::DataPtr allocate(size_t nbytes,
                         const flex::AllocationDirective& directive);
+
+  // Allocate sharded storage: num_shards plain per-shard allocations of
+  // shard_device_bytes, shard i bound to Flex memory domain
+  // i % num_memory_domains, tagged with the sharding record. The returned
+  // DataPtr owns them through a SharedOwnerCtx.
+  static c10::DataPtr allocateShardedStorage(int64_t shard_dim,
+                                             uint32_t logical_chunks,
+                                             uint64_t shard_device_bytes);
 
   static void ReportAndDelete(void* ctx_void);
 

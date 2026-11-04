@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for the matmul M/N/K decode in ``dump_cost_model._matmul_features``.
+"""Unit tests for the matmul M/N/K decode in ``cost_features._matmul_features``.
 
 Regression guard for the batchmatmul decode bug: for a 3D ``[B, M, N]`` output the
 batch stride is the LARGEST write-index coefficient, so the old "largest coeff = M"
@@ -36,14 +36,15 @@ import torch
 from sympy import Symbol
 from torch._inductor.dependencies import MemoryDep, ReadWrites
 from torch._inductor.ir import InputBuffer, MutationLayoutSHOULDREMOVE, Scatter
+from torch._inductor.sizevars import SizeVarAllocator
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 
-import torch_spyre._inductor.dump_cost_model as dcm
+import torch_spyre._inductor.cost_features as dcm
 from torch_spyre._C import DataFormats, SpyreTensorLayout
 from torch_spyre._inductor import work_division as wd
 from torch_spyre._inductor.cost_model import ArgTraffic
-from torch_spyre._inductor.dump_cost_model import (
+from torch_spyre._inductor.cost_features import (
     _level_loop_vars,
     _loop_factor_for_index,
     _loop_var_advances,
@@ -188,9 +189,21 @@ def _cache_store_op(dep, slot_index=None):
     """A stand-in mutation op around real objects: real InputBuffer target, real
     mutation layout, real read/writes; only the op wrapper is hand-built."""
     op = mock.Mock()
-    indices = [SimpleNamespace(name="slots")]
+    slot_expr = _isym("d0") if slot_index is None else slot_index
+
+    def output_indexer(index):
+        with V.set_graph_handler(SimpleNamespace(sizevars=SizeVarAllocator())):
+            load_index = slot_expr.xreplace(dict(zip(dep.var_names, index)))
+            return [
+                V.ops.indirect_indexing(
+                    V.ops.load("slots", load_index), CACHE_ROWS, check=False
+                ),
+                index[1],
+            ]
+
     op.data = mock.Mock(spec=Scatter)
-    op.data.output_indexer = lambda _: indices
+    op.data.ranges = list(dep.size)
+    op.data.output_indexer = output_indexer
     op.dim_hints = []
     with V.set_graph_handler(mock.Mock()):
         op.get_layout.return_value = MutationLayoutSHOULDREMOVE(
