@@ -224,6 +224,14 @@ def read_advance(op: Operation, dep: MemoryDep) -> tuple[sympy.Expr, ...]:
     ``MemoryDep`` reads.  The value is in host elements: projecting it to the
     device (``views.tiling_expr_to_device_expr``) needs a concrete layout and
     stays with the caller.
+
+    For a term that is linear in the level's loop variable (every term the
+    ``for_each_tile`` lowering produces today) this is the coefficient the
+    kernel projects.  For a non-linear term the two can differ:
+    ``4096 * floor(8 * s)`` gives ``32768`` here (the term at ``s = 1`` minus
+    the term at ``s = 0``), while ``SpyreKernel._general_tile_advance`` takes the
+    coefficient of ``s``, which is ``0``, and so emits no advance.  Do not
+    substitute one for the other without deciding which is right.
     """
     found = _read_record(op, dep)
     if found is None:
@@ -249,7 +257,9 @@ def output_advance(op: Operation) -> tuple[sympy.Expr, ...]:
     """Host-element advance per trip of ``op``'s write, one per level.
 
     The write is ``op``'s first ``MemoryDep`` write, as in the kernel.  ``()``
-    when ``op`` has no ``loop_info`` or no ``MemoryDep`` write.
+    when ``op`` has no ``loop_info`` or no ``MemoryDep`` write.  The same
+    caveat as :func:`read_advance` applies to a term that is not linear in the
+    level's loop variable.
     """
     loop_info = getattr(op, "loop_info", None)
     if loop_info is None:
