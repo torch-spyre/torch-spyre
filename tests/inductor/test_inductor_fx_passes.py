@@ -506,6 +506,63 @@ class TestStickReshapePivot(unittest.TestCase):
                     torch.randn(1, 32, 160, 160, dtype=torch.float16).to("spyre")
                 )
 
+    @pytest.mark.filterwarnings("ignore::UserWarning")  # forced cache disabling
+    def test_widening_conversion_is_left_alone(self):
+        """A reshape feeding a different stick size is not repaired.
+
+        float16 packs 64 to a stick and float32 packs 32, and the backend
+        reorders across that conversion (#3999): measured on device, an
+        *aligned* reshape feeding float16 -> float32 is already wrong without
+        this pass, so the conversion is what is broken, not the layout.
+        Upstream refuses the unaligned ones ("no supported output layout");
+        repairing them would replace that refusal with wrong values, which is
+        what this pass exists to remove. The guard is transitive, so this
+        holds with the conversion further downstream too. Lift it once #3999
+        lands -- this test then fails loudly instead of going quiet.
+        """
+        import torch._inductor.config as config
+        from torch._inductor.exc import InductorError
+
+        torch.compiler.reset()
+        with config.patch(force_disable_caches=True):
+            with self.assertRaises(InductorError) as caught:
+                torch.compile(
+                    lambda t: t.reshape(2, 320).to(torch.float32), dynamic=False
+                )(torch.randn(2, 8, 40, dtype=torch.float16).to("spyre"))
+        self.assertIn("no supported output layout", str(caught.exception))
+
+    @pytest.mark.filterwarnings("ignore::UserWarning")  # forced cache disabling
+    def test_same_stick_conversion_is_still_repaired(self):
+        """The guard is about the stick size, not about conversions as such.
+
+        A host bool packs 64 to a stick like float16 does, so converting to
+        float16 leaves the stick alone and the sub-stick reshape in front of
+        it is still repaired. Upstream refuses this same graph.
+
+        Checked here rather than through ``_compile_and_check``, whose float32
+        reference takes its dtype from the conversion inside ``fn``.
+        """
+        from torch._dynamo.testing import InductorAndRecordGraphs, normalize_gm
+        import torch._inductor.config as config
+
+        def fn(t):
+            return t.reshape(8, 8).to(torch.float16) * 2
+
+        a = torch.randint(0, 2, (64,), dtype=torch.bool)
+        ref = fn(a).float()  # exactly 0 or 2, so no tolerance is needed
+        torch.compiler.reset()
+        backend = InductorAndRecordGraphs()
+        with config.patch(force_disable_caches=True):
+            out = torch.compile(fn, backend=backend)(a.to("spyre"))
+        torch.testing.assert_close(out.cpu().float(), ref)
+        graph = normalize_gm(
+            backend.inductor_graphs[0].print_readable(print_output=False)
+        )
+        # bool is not in RESTICKIFY_SUPPORTED_DEVICE_DTYPES, so the repair is
+        # the host path rather than the on-device pivot; either way the guard
+        # must not have skipped the reshape.
+        self.assertIn("spyre.reshape_via_cpu", graph)
+
 
 class TestPassUtils(unittest.TestCase):
     """Unit tests for helpers in ``torch_spyre._inductor.pass_utils``."""

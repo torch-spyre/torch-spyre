@@ -78,6 +78,11 @@ _RESHAPE_OPS = (
     aten._unsafe_view.default,
 )
 
+_CONVERT_OPS = (
+    torch.ops.prims.convert_element_type.default,
+    aten._to_copy.default,
+)
+
 
 def _static_shape(val) -> Optional[list[int]]:
     shape = getattr(val, "shape", None)
@@ -165,6 +170,45 @@ def _feeds_stick_dim_cat(node: torch.fx.Node) -> bool:
         dim = user.args[1] if len(user.args) > 1 else user.kwargs.get("dim", 0)
         if isinstance(dim, int) and dim % out_rank == out_rank - 1:
             return True
+    return False
+
+
+def _reaches_stick_size_change(node: torch.fx.Node, eps: int) -> bool:
+    """True when anything downstream converts to a different stick size.
+
+    float16 and bfloat16 pack 64 to a stick, float32 packs 32, and converting
+    between the two reorders elements in the backend (#3999). Measured on
+    device: float16 -> float32 is wrong on its own, with no reshape in the
+    graph at all and whatever the row width ((2, 320), (2, 64) and (2, 40) all
+    mismatch a CPU reference), so the conversion is what is broken, not the
+    relayout. Upstream refuses an unaligned reshape in front of one ("no
+    supported output layout"); repairing it would hand the broken conversion a
+    layout it accepts and turn that refusal into wrong values, which is the
+    failure mode this pass exists to remove.
+
+    The walk is transitive: the conversion is just as wrong two ops later
+    (measured: ``reshape -> bfloat16 -> float32`` and ``reshape -> mul ->
+    float32`` both mismatch), so a direct-user check is not enough. Lift this
+    once #3999 lands.
+    """
+    seen = {node}
+    queue = [node]
+    while queue:
+        for user in queue.pop().users:
+            if user in seen:
+                continue
+            seen.add(user)
+            queue.append(user)
+            if user.op != "call_function" or user.target not in _CONVERT_OPS:
+                continue
+            dtype = getattr(user.meta.get("val"), "dtype", None)
+            if dtype is None:
+                return True  # unknown conversion: assume it changes the stick
+            try:
+                if get_elem_in_stick(dtype) != eps:
+                    return True
+            except Exception:
+                return True  # dtype with no stick layout of its own
     return False
 
 
@@ -462,6 +506,8 @@ def pivot_unaligned_stick_reshapes(graph: torch.fx.Graph) -> None:
         work_out = _strip_trailing_ones(out_shape)
         found = _stick_reshape_kind(work_in, work_out, eps)
         if found is None:
+            continue
+        if _reaches_stick_size_change(node, eps):
             continue
         # Last, because it is the only check that walks the graph: the cheap
         # shape and device filters reject almost everything before this.
