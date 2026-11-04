@@ -88,10 +88,12 @@ def _static_shape(val) -> Optional[list[int]]:
 
 def _trailing_group(shape: list[int], extent: int) -> Optional[int]:
     """Largest j with ``prod(shape[j:]) == extent`` and at least two pieces."""
+    tail = shape[-1]
     for j in range(len(shape) - 2, -1, -1):
-        if prod(shape[j:]) == extent:
+        tail *= shape[j]
+        if tail == extent:
             return j
-        if prod(shape[j:]) > extent:
+        if tail > extent:
             return None
     return None
 
@@ -116,6 +118,8 @@ def _stick_reshape_kind(
     reshaped too (``(C, L) -> (1, C, H, W)``); that part never touches the
     stick and is done as a separate plain view. Returns None otherwise.
     """
+    if prod(in_shape) == 0:
+        return None  # empty tensor: no element to move, and 0 divides nothing
     if in_shape == out_shape or in_shape[-1:] == out_shape[-1:]:
         return None  # stick dim untouched
     # A sub-stick reshape (64 -> 8x8) is NOT free either: the destination pads
@@ -394,18 +398,24 @@ def _rewrite(
                 new = _call(
                     graph, aten.view.default, (new, final_shape), {}, node, fake_mode
                 )
-                # Materialise the outer merge. Left as a plain view, Inductor
-                # folds it away and consumers see the pivot's higher-rank
-                # intermediate (a depthwise conv then reports "expected a 3D
-                # or 4D activation, got [1, 4, 64, 20, 20]").
-                new = _call(
-                    graph,
-                    torch.ops.spyre.rebase_copy.default,
-                    (new,),
-                    {},
-                    node,
-                    fake_mode,
-                )
+                if _strip_trailing_ones(final_shape) != pivot_out:
+                    # Materialise the outer merge. Left as a plain view,
+                    # Inductor folds it away and consumers see the pivot's
+                    # higher-rank intermediate (a depthwise conv then reports
+                    # "expected a 3D or 4D activation, got [1,4,64,20,20]").
+                    #
+                    # Skipped when only trailing size-1 dims were re-added:
+                    # the view moves nothing, and materialising it would pad
+                    # an innermost 1 up to a whole stick -- 64x the buffer for
+                    # no gain.
+                    new = _call(
+                        graph,
+                        torch.ops.spyre.rebase_copy.default,
+                        (new,),
+                        {},
+                        node,
+                        fake_mode,
+                    )
     node.replace_all_uses_with(new)
     graph.erase_node(node)
     logger.info(

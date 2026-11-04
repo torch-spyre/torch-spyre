@@ -105,7 +105,8 @@ conv2d_direct_lowering: bool = os.environ.get("SPYRE_CONV2D_DIRECT", "0") == "1"
 # measurements (host transfers included, 0.1-13 MB tensors) the pivot took
 # about half the time of the host round trip (e.g. 8.3 ms vs 16.2 ms at
 # 3.3 MB). The pass still uses the host path when no dim can pivot, the dtype
-# is not fp16, or the pivot would exceed the per-core span limit.
+# is not one restickify supports (RESTICKIFY_SUPPORTED_DEVICE_DTYPES), or
+# either pivot intermediate would exceed the per-core span limit.
 stick_reshape_on_device: bool = (
     os.environ.get("SPYRE_STICK_RESHAPE_ON_DEVICE", "1") == "1"
 )
