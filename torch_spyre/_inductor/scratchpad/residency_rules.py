@@ -28,6 +28,7 @@ class ResidencyChecks(Protocol):
     def extern(self) -> Optional[str]: ...
     def multi_output_extern(self) -> Optional[str]: ...
     def indirect(self) -> Optional[str]: ...
+    def ea_shuffle_source(self) -> Optional[str]: ...
     def reinterpret_output(self) -> Optional[str]: ...
     def mutated_output(self) -> Optional[str]: ...
     def partial_read(self) -> Optional[str]: ...
@@ -192,6 +193,17 @@ BUFFER_RESIDENCY_RULES = (
         lambda c: c.indirect(),
         ("direct addressing",),
         ("Data-dependent indices and the values they address resolve through HBM."),
+        ("test_buffer_residency_adapter_rejection_strings",),
+    ),
+    ResidencyRule(
+        "ea_shuffle_source",
+        "read by shuffle",
+        lambda c: c.ea_shuffle_source(),
+        ("source not read by an EA shuffle",),
+        (
+            "A shuffle that changes the element arrangement cannot be scheduled "
+            "by the backend compiler when its source or output is in LX."
+        ),
         ("test_buffer_residency_adapter_rejection_strings",),
     ),
     ResidencyRule(

@@ -71,10 +71,6 @@ STAGGERED_EAS = frozenset(
     }
 )
 
-# SUPPORTED_EAS can be a separate list of all non-STANDARD EAs that split_multi_ops
-# can shuffle back to STANDARD, but for now it is the same as STAGGERED_EAS
-SUPPORTED_EAS = STAGGERED_EAS
-
 
 def is_ea_compatible(eas) -> bool:
     """Return True if the given ElementArrangements can co-exist on one multi-arg

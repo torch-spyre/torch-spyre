@@ -709,9 +709,6 @@ def test_pad_of_staggered_inside_stick_pair_raises():
 # ---------------------------------------------------------------------------
 # Shuffle of staggered operands
 # ---------------------------------------------------------------------------
-# TODO: replace with the issue number of the backend-compiler report (the
-# shuffle kernel fails in dbo-opt) once it is filed.
-_BACKEND_SHUFFLE_ISSUE = "#TBD"
 
 
 class TestEAShuffle:
@@ -1497,20 +1494,7 @@ class TestInsertEAShuffle:
     @pytest.mark.parametrize(
         "program, shape",
         [
-            pytest.param(
-                p,
-                s,
-                id=f"{p}-{shapes2key((s,))}",
-                marks=pytest.mark.xfail(
-                    p.startswith("fp16_to_fp32") and s == (64, 256),
-                    strict=True,
-                    raises=InductorError,
-                    reason=(
-                        "the backend compiler: Cannot find a valid minimum value"
-                        f"{_BACKEND_SHUFFLE_ISSUE}"
-                    ),
-                ),
-            )
+            pytest.param(p, s, id=f"{p}-{shapes2key((s,))}")
             for p, s in itertools.product(PROGRAMS, SHAPES)
         ],
     )
@@ -1540,24 +1524,7 @@ class TestInsertEAShuffle:
     WIDE_SHAPES = [(64, 151936), (2, 128256)]
 
     @pytest.mark.parametrize(
-        "shape",
-        [
-            pytest.param(
-                s,
-                marks=pytest.mark.xfail(
-                    spyre_config.lx_planning,
-                    strict=True,
-                    raises=InductorError,
-                    reason=(
-                        "the backend compiler (dbo-opt) rejects a shuffle whose "
-                        "input and output are in different memories (LX and HBM), "
-                        f"{_BACKEND_SHUFFLE_ISSUE}"
-                    ),
-                ),
-            )
-            for s in WIDE_SHAPES
-        ],
-        ids=lambda s: shapes2key((s,)),
+        "shape", WIDE_SHAPES, ids=[shapes2key((s,)) for s in WIDE_SHAPES]
     )
     def test_wide_rows_lx(self, shape):
         self._assert_exact_on_device(

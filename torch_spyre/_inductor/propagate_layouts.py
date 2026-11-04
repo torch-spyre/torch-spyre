@@ -71,7 +71,6 @@ from .constants import (
     MATMUL_REDUCTION_OPS,
     REDUCTIONS_NON_STICK_DIM_ONLY,
     STAGGERED_EAS,
-    SUPPORTED_EAS,
 )
 from .ir import (
     AllGatherAsyncFallback,
@@ -1835,7 +1834,7 @@ def _resolve_pointwise_ea(ea_args: list[PropArg]) -> ElementArrangement:
     # cost). Report the offending STANDARD operand (there is always one
     # here, since 3.1 failed).
     stag_eas = [arg.layouts[0].element_arrangement for arg, _, _ in stag_split]
-    if stag_eas and all(ea in SUPPORTED_EAS for ea in stag_eas):
+    if stag_eas and all(ea in STAGGERED_EAS for ea in stag_eas):
         return ElementArrangement.STANDARD
     else:
         arg = next(arg for arg, broadcast, _ in std_split if not broadcast)

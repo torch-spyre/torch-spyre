@@ -51,7 +51,7 @@ from torch_spyre._inductor.pass_utils import (
     _is_matmul_op,
     op_short_name,
 )
-from torch_spyre._C import get_device_size_in_bytes
+from torch_spyre._C import ElementArrangement, get_device_size_in_bytes
 from torch_spyre._inductor.work_division import (
     OpSplitSpace,
     ResidencyEdge,
@@ -814,6 +814,44 @@ class ScratchpadOptimizationPass(ABC):
         pass
 
 
+def _device_ea(layout: Any) -> Any:
+    """Element arrangement of ``layout``, or None when it has no device layout."""
+    if isinstance(layout, MutationLayoutSHOULDREMOVE):
+        layout = layout.real_layout()
+    device_layout = getattr(layout, "device_layout", None)
+    return getattr(device_layout, "element_arrangement", None)
+
+
+def _is_ea_shuffle_source(
+    graph: GraphLowering, name: str, uses: list[int], op: Optional[Operation]
+) -> bool:
+    """True if ``name`` is an input or the output of an EA shuffle.
+
+    Codegen turns a copy between different arrangements into a ``shuffle``
+    (spyre_kernel.store). The backend compiler cannot schedule a shuffle whose
+    input and output are in different memories, or whose DL16_TO_FP32 source is
+    in LX (sbf-ddc: "Cannot find a valid minimum value for data stage"). Keeping
+    both sides in HBM always works, so a shuffle's output (tagged ``ea_shuffle``
+    by insert_ea_shuffle) and the buffers it reads are not placed in LX.
+    """
+    if not isinstance(op, ComputedBuffer):
+        return False
+    if getattr(op, "ea_shuffle", False):
+        return True
+    is_dl16_source = _device_ea(op.layout) == ElementArrangement.DL16_TO_FP32
+    for u in uses:
+        consumer = graph.operations[u]
+        if consumer is op or not isinstance(consumer, ComputedBuffer):
+            continue
+        if name not in consumer.get_read_names():
+            continue
+        if getattr(consumer, "ea_shuffle", False):
+            return True
+        if is_dl16_source and _device_ea(consumer.layout) != _device_ea(op.layout):
+            return True
+    return False
+
+
 @dataclass
 class _BufferResidencyChecks:
     """Facts for one synchronous residency check, before any graph edit.
@@ -903,6 +941,11 @@ class _BufferResidencyChecks:
             self.graph, self.name, self.uses, self.op
         ):
             return "index tensor or indirectly accessed"
+        return None
+
+    def ea_shuffle_source(self) -> Optional[str]:
+        if _is_ea_shuffle_source(self.graph, self.name, self.uses, self.op):
+            return "read by shuffle"
         return None
 
     @cached_property

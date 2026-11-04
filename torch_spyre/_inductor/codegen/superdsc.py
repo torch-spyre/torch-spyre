@@ -2022,6 +2022,37 @@ def _extend_restickify_to_padded(
         )
 
 
+def _extend_shuffle_to_padded(
+    op_spec: OpSpec,
+    sdsc_iteration_space: dict,
+    symbol_mapping: dict,
+) -> None:
+    """Extend sdsc_iteration_space[stick_sym] to the largest stick extent of any arg.
+
+    A staggered operand (DL16_TO_FP32) is padded to whole stick pairs, e.g. 4
+    fp32 sticks for 68 elements, while the stick-aligned iteration space only
+    covers 3. The staggered element order is only defined over whole pairs, so a
+    shuffle must iterate the full padded extent of its widest operand.
+    """
+    for arg in op_spec.args:
+        _, stick_sym = _get_device_dim_order(arg, symbol_mapping)
+        if stick_sym is None or stick_sym not in sdsc_iteration_space:
+            continue
+        extent = math.prod(
+            size
+            for size, coord in zip(arg.device_size, arg.device_coordinates)
+            if stick_sym in coord.subs(symbol_mapping).free_symbols
+        )
+        if extent > sdsc_iteration_space[stick_sym]:
+            logger.debug(
+                "_extend_shuffle_to_padded: extending %s %d -> %d",
+                stick_sym,
+                sdsc_iteration_space[stick_sym],
+                extent,
+            )
+            sdsc_iteration_space[stick_sym] = extent
+
+
 def _inject_implicit_conv_kernel_dims(
     is_conv2d: bool,
     op_spec: OpSpec,
@@ -2398,6 +2429,8 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         _extend_matmul_k_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
     elif is_restickify:
         _extend_restickify_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
+    elif is_ea_shuffle:
+        _extend_shuffle_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
 
     # Grow a core-split index-entry iteration to the padded output device_size.
     # The output's entry-dim device_size was rounded up to the index stick

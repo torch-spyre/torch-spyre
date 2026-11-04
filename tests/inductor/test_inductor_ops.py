@@ -648,24 +648,14 @@ TO_DTYPE_OP_EXPECT_FAIL = [
 
 # EA-shuffle (bfloat16/float16 -> float32) requires whole FP32 stick pairs. The copy
 # round trip is rejected at compile time when a core gets an odd number of FP32
-# sticks: 1 for 4x16, 3 for 68. The add round trip is not rejected: it compiles on
-# these shapes, where it either passes (68) or returns a wrong result (4x16, an
-# xfail below).
+# sticks: 1 for 4x16. The add round trip is not rejected: it compiles on this
+# shape and returns a wrong result (an xfail below). The 68 and 5120 shapes
+# compile and pass: the shuffle covers the whole stick pair the staggered layout
+# pads to, and its staggered source is kept out of LX.
 _WHOLE_PAIR_REJECTION = "requires whole FP32 stick pairs"
 ROUND_TRIP_COPY_PAIR_REJECTED = {
     "bfloat16_to_float32_4x16",
     "float16_to_float32_4x16",
-    "bfloat16_to_float32_68",
-    "float16_to_float32_68",
-}
-# The copy round trip of a 5120 upcast gets through the frontend and fails in the
-# backend compiler (dbo-opt, sbf-ddc: "Cannot find a valid minimum value for data
-# stage 5"). That is a backend bug, not a deliberate rejection, so it is an xfail.
-# TODO: cite an issue once one is filed.
-_COPY_UPCAST_5120_FAIL = {
-    f"{src}_to_float32_5120": "dbo-opt fails to schedule the copy round trip: "
-    "sbf-ddc 'Cannot find a valid minimum value for data stage 5'"
-    for src in ("bfloat16", "float16")
 }
 
 # The cases left in TO_DTYPE_OP_EXPECT_FAIL return the cast result straight to the
@@ -766,6 +756,8 @@ _ROUND_TRIP_ADD_NOW_PASSING = _ROUND_TRIP_COMMON_NOW_PASSING | {
 _ROUND_TRIP_COPY_NOW_PASSING = _ROUND_TRIP_COMMON_NOW_PASSING | {
     "bfloat16_to_float16_4x16",
     "bfloat16_to_float16_68",
+    "bfloat16_to_float32_4x68",
+    "float16_to_float32_4x68",
     "float32_to_float16_4x16",
 }
 _ROUND_TRIP_IMPLICIT_NOW_PASSING = {
@@ -7939,10 +7931,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_round_trip_to_dtype_copy", "test_round_trip_to_dtype_copy_cpu"): {
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
-            "expect_fail": {
-                **TO_DTYPE_OP_ROUND_TRIP_COPY_EXPECT_FAIL,
-                **_COPY_UPCAST_5120_FAIL,
-            },
+            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_COPY_EXPECT_FAIL,
             "expect_raise": {
                 **dict.fromkeys(ROUND_TRIP_RESCALE_REJECTED, _RESCALE_REJECTION),
                 **dict.fromkeys(ROUND_TRIP_COPY_PAIR_REJECTED, _WHOLE_PAIR_REJECTION),
@@ -9552,10 +9541,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             # which propagate_layouts rejects; remove when that is supported
             "expect_raise": {
                 "floor_div_fp16_int32_1d256": (
-                    "torch.bool result from operands with device format(s)"
+                    r"torch.bool result from operands with device format\(s\)"
                 ),
                 "floor_div_fp16_int64_1d256": (
-                    "torch.bool result from operands with device format(s)"
+                    r"torch.bool result from operands with device format\(s\)"
                 ),
             },
             "expect_fail": {

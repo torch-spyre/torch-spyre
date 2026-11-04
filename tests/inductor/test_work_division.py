@@ -325,6 +325,11 @@ class TestLoopCarryLxEligibility(unittest.TestCase):
                 "_is_index_or_indirectly_accessed",
                 "index tensor or indirectly accessed",
             ),
+            (
+                "ea_shuffle_source",
+                "_is_ea_shuffle_source",
+                "read by shuffle",
+            ),
             ("reinterpret_output", None, "graph output is a ReinterpretView"),
             ("partial_read", "buffer_not_read_in_full", "partial/offset read"),
             ("core_division", None, "core div mismatch: reader"),
