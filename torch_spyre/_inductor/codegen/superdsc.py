@@ -107,7 +107,6 @@ class SDSCArgs:
     def non_unified(self) -> bool:
         return self.non_unified_shard_bytes > 0
 
-
     def __str__(self) -> str:
         scales = ", ".join(f"{k}={v}" for k, v in self.scales.items())
         strides = ", ".join(f"{k}={v}" for k, v in self.strides.items())

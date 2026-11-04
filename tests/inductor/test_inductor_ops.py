@@ -550,11 +550,11 @@ _CMP_BIGINT_REASON = (
     "integers above 2**24 are compared as fp32, so near neighbours collapse"
 )
 
-# A comparison of an integer with an fp16 tensor converts the integer to fp16 on
-# device, and the bool result then has operands in both fp16 and fp32 device formats.
-_BOOL_RESULT_MIXED_FORMAT_REJECTION = (
-    "torch.bool result from operands with device format"
-)
+# The device represents torch.bool using both torch.float16 & torch.float32
+# depending on the source dtype, so operands to an op must be of same source
+# i.e. torch.eq(x, y) x & y must be torch.bool dtypes from same source dtype
+# either torch.float16 or torch.float32 but not mixed.
+_BOOL_RESULT_MIXED_DTYPES_REASON = "torch.bool result from operands with device format"
 
 TO_DTYPE_OP_MAP_PARAMS_SETS = {
     f"{_dtype_name(src)}_to_{_dtype_name(dst)}": (src, dst)
@@ -646,14 +646,10 @@ TO_DTYPE_OP_EXPECT_FAIL = [
     case for case in TO_DTYPE_OP_EXPECT_FAIL if case not in TO_DTYPE_OP_RESCALE_REJECTED
 ]
 
-# EA-shuffle (bfloat16/float16 -> float32) requires whole FP32 stick pairs. The copy
-# round trip is rejected at compile time when a core gets an odd number of FP32
-# sticks: 1 for 4x16. The add round trip is not rejected: it compiles on this
-# shape and returns a wrong result (an xfail below). The 68 and 5120 shapes
-# compile and pass: the shuffle covers the whole stick pair the staggered layout
-# pads to, and its staggered source is kept out of LX.
-_WHOLE_PAIR_REJECTION = "requires whole FP32 stick pairs"
-ROUND_TRIP_COPY_PAIR_REJECTED = {
+# Unstaggering fp16 to fp32 EA requires whole FP32 stick pairs. The copy round trip is
+# rejected at compile time when a core gets an odd number of FP32 sticks: 1 for 4x16.
+_WHOLE_STICK_PAIRS = "requires whole FP32 stick pairs"
+WHOLE_STICK_PAIRS_REJECTIED = {
     "bfloat16_to_float32_4x16",
     "float16_to_float32_4x16",
 }
@@ -738,27 +734,22 @@ _TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL_ALL = [
 # Further round-trip cases that now pass on every config. They differ between the
 # add and copy variants, so each variant gets its own expect_fail list. The implicit
 # variant is the same as the shared implicit list minus its own passing cases.
-_ROUND_TRIP_COMMON_NOW_PASSING = {
+_ROUND_TRIP_ADD_NOW_PASSING = {
+    "bfloat16_to_float16_4x16",
     "bfloat16_to_float16_4x32",
     "bfloat16_to_float16_4x63",
     "bfloat16_to_float16_4x68",
+    "bfloat16_to_float16_68",
     "bfloat16_to_float32_4x63",
     "float16_to_float32_4x63",
+    "float32_to_float16_4x16",
     "float32_to_float16_4x63",
-}
-_ROUND_TRIP_ADD_NOW_PASSING = _ROUND_TRIP_COMMON_NOW_PASSING | {
-    "bfloat16_to_float16_4x16",
-    "bfloat16_to_float16_68",
     "bfloat16_to_float32_4x68",
     "float16_to_float32_4x68",
-    "float32_to_float16_4x16",
 }
-_ROUND_TRIP_COPY_NOW_PASSING = _ROUND_TRIP_COMMON_NOW_PASSING | {
-    "bfloat16_to_float16_4x16",
-    "bfloat16_to_float16_68",
-    "bfloat16_to_float32_4x68",
-    "float16_to_float32_4x68",
-    "float32_to_float16_4x16",
+_ROUND_TRIP_COPY_NOW_PASSING = _ROUND_TRIP_ADD_NOW_PASSING | {
+    "bfloat16_to_float32_4x16",
+    "float16_to_float32_4x16",
 }
 _ROUND_TRIP_IMPLICIT_NOW_PASSING = {
     "float32_to_float16_4x16",
@@ -773,7 +764,6 @@ TO_DTYPE_OP_ROUND_TRIP_COPY_EXPECT_FAIL = [
     case
     for case in _TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL_ALL
     if case not in _ROUND_TRIP_COPY_NOW_PASSING
-    and case not in ROUND_TRIP_COPY_PAIR_REJECTED
 ]
 # These fail with a value mismatch, but pass on some runs (in cold-cache full runs of
 # the xfail-marked tests, each has passed in some of them), so they are non-strict
@@ -811,7 +801,6 @@ _PAIR_SECOND_STICK_UNSPLIT = (
     "with SENCORES=1 (#5361)"
 )
 _ROUND_TRIP_PAIR_REASON_BY_SHAPE = {
-    "68": _PAIR_SECOND_STICK_LOST,
     "4x16": _PAIR_SECOND_STICK_LOST,
     "4x63": _PAIR_SECOND_STICK_LOST,
     "4x68": _PAIR_SECOND_STICK_UNSPLIT,
@@ -3459,8 +3448,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         #   int32 x fp16 -> fp16 : int32tofp32 then fp32todl16, the second of
         #                          which reorders sticks. The bool result is then
         #                          computed from operands whose device formats
-        #                          differ (fp16 and fp32), which the backend
-        #                          rejects at compile time.
+        #                          differ (fp16 and fp32), which the compiler
+        #                          rejects in layout propagation.
         #
         # Promoting to fp16 also inherits fp16's 11-bit significand, so integers
         # above 2048 lose their distinction. That is not a divergence: eager does
@@ -3477,14 +3466,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "gt": torch.gt,
                 "ge": torch.ge,
             },
-            # A bool result computed from operands in different device formats
-            # (fp16 and fp32) is rejected at compile time.
             "expect_raise": {
-                "int32_fp16_1d256": _BOOL_RESULT_MIXED_FORMAT_REJECTION,
-                "fp16_int32_1d256": _BOOL_RESULT_MIXED_FORMAT_REJECTION,
-                "int32_fp16_2d4x64": _BOOL_RESULT_MIXED_FORMAT_REJECTION,
-                "int64_fp16_1d256": _BOOL_RESULT_MIXED_FORMAT_REJECTION,
-                "fp16_int64_1d256": _BOOL_RESULT_MIXED_FORMAT_REJECTION,
+                "int32_fp16_1d256": _BOOL_RESULT_MIXED_DTYPES_REASON,
+                "fp16_int32_1d256": _BOOL_RESULT_MIXED_DTYPES_REASON,
+                "int32_fp16_2d4x64": _BOOL_RESULT_MIXED_DTYPES_REASON,
+                "int64_fp16_1d256": _BOOL_RESULT_MIXED_DTYPES_REASON,
+                "fp16_int64_1d256": _BOOL_RESULT_MIXED_DTYPES_REASON,
             },
             # The compare is right on the device, but its staggered result is read
             # back permuted with no error (#4393).
@@ -3493,7 +3480,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "fp16_fp32_bcast_0dim": "readback of the staggered mask is permuted, #4393",
             },
             "param_sets": {
-                # fp16 -> fp32 is stick-reordering: handled by the EA shuffle
                 "fp16_fp32_1d256": (
                     torch.ceil(cached_randn((256,), abs=True, scale=10.0)).to(
                         dtype=torch.float16
@@ -3526,7 +3512,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                         dtype=torch.float16
                     ),
                 ),
-                # fp16 vs a broadcaster at the stick dim: result incorrect
+                # fp16 vs a broadcaster at the stick dim: skipped, result incorrect
                 "fp16_fp32_bcast_stick": (
                     torch.ceil(cached_randn((4, 64), abs=True, scale=10.0)).to(
                         dtype=torch.float16
@@ -3541,7 +3527,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ),
                     torch.tensor(2.0, dtype=torch.float32),
                 ),
-                # int32 -> fp16 gives operands in different formats (see header)
+                # int32 -> fp16 gives a staggered operand (see the header above)
                 "int32_fp16_1d256": (
                     torch.randint(0, 100, (256,), dtype=torch.int32),
                     torch.ceil(cached_randn((256,), abs=True, scale=50.0)).to(
@@ -3573,7 +3559,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                         cached_randn((4, 64), abs=True, scale=50.0, dtype=torch.float32)
                     ),
                 ),
-                # int64 x float16 -> float16: different formats, as for int32
+                # int64 x float16 -> float16: staggered, as for int32
                 "int64_fp16_1d256": (
                     torch.randint(0, 100, (256,), dtype=torch.int64),
                     torch.ceil(cached_randn((256,), abs=True, scale=50.0)).to(
@@ -7712,9 +7698,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "ops_dict": {"add": torch.add},
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
             "expect_fail": TO_DTYPE_OP_ROUND_TRIP_ADD_EXPECT_FAIL,
-            "expect_raise": {
-                **dict.fromkeys(ROUND_TRIP_RESCALE_REJECTED, _RESCALE_REJECTION),
-            },
+            "expect_raise": dict.fromkeys(
+                ROUND_TRIP_RESCALE_REJECTED, _RESCALE_REJECTION
+            ),
         },
         # storage_offset support for graph-input placeholders, non-stick dims.
         # `slicer` runs after .to("spyre") and before compile, so the offset
@@ -7934,7 +7920,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "expect_fail": TO_DTYPE_OP_ROUND_TRIP_COPY_EXPECT_FAIL,
             "expect_raise": {
                 **dict.fromkeys(ROUND_TRIP_RESCALE_REJECTED, _RESCALE_REJECTION),
-                **dict.fromkeys(ROUND_TRIP_COPY_PAIR_REJECTED, _WHOLE_PAIR_REJECTION),
+                **dict.fromkeys(WHOLE_STICK_PAIRS_REJECTIED, _WHOLE_STICK_PAIRS),
             },
         },
         (
@@ -9536,16 +9522,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "true_div": lambda a, b: torch.div(a, b),
                 "floor_div": _floor_div,
             },
-            # Mixed staggered/STANDARD operands are shuffled by insert_ea_shuffle.
-            # TODO: the floor correction compares an fp16 and an fp32 operand,
-            # which propagate_layouts rejects; remove when that is supported
             "expect_raise": {
-                "floor_div_fp16_int32_1d256": (
-                    r"torch.bool result from operands with device format\(s\)"
-                ),
-                "floor_div_fp16_int64_1d256": (
-                    r"torch.bool result from operands with device format\(s\)"
-                ),
+                "floor_div_fp16_int32_1d256": _BOOL_RESULT_MIXED_DTYPES_REASON,
+                "floor_div_fp16_int64_1d256": _BOOL_RESULT_MIXED_DTYPES_REASON,
             },
             "expect_fail": {
                 # fp16 intermediate product rounding can zero the residual and
@@ -9559,10 +9538,26 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     "and blind the +-1 correction; this case pins the pair "
                     "72.0 / 0.314453125 from that class, #5605"
                 ),
+                # fp16 division on device (int32->fp16 cast runs on the host).
+                # 1/256 off by exactly 1 at |q|~228 (rel diff 1/228), related to
+                # issue #5605.
+                "floor_div_int32_fp16_1d256": (
+                    "fp16 residual rounding blinds the +-1 correction on 1 of "
+                    "256 elements at |q|~228, same class as #5605"
+                ),
+                # Mixed fp16/fp32 floor correction on a 1-D tensor: ~55% of
+                # elements are off by one (CPU 0, device 1). The 2d4x64
+                # variants pass, so this is specific to the 1-D layout.
+                "floor_div_fp16_fp32_1d256": (
+                    "mixed fp16/fp32 floor correction on a 1-D tensor returns "
+                    "wrong quotients for ~55% of elements, #TBD"
+                ),
+                "floor_div_fp32_fp16_1d256": (
+                    "mixed fp32/fp16 floor correction on a 1-D tensor returns "
+                    "wrong quotients for ~55% of elements, #TBD"
+                ),
             },
             "param_sets": {
-                # fp16 -> fp32 is stick-reordering: the staggered operand is
-                # shuffled to STANDARD before it meets the other one
                 "fp16_fp32_1d256": (
                     cached_randn((256,), abs=True, scale=10.0, dtype=torch.float16),
                     cached_randn((256,), abs=True, scale=9.9, dtype=torch.float32),
