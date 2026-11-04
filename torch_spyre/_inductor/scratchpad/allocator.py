@@ -57,6 +57,9 @@ from torch_spyre._inductor.work_division import (
     ResidencyEdge,
     build_op_split_space,
     build_residency_edge,
+    deferred_work_division,
+    divide_deferred_op,
+    divide_deferred_ops,
     enumerate_work_division_candidates,
     has_resolved_work_div_hint,
     work_division_context_for_op,
@@ -900,7 +903,11 @@ class _BufferResidencyChecks:
             and not config.ktir_emitter
             and prefix_lx_gather_source(self.graph, self.name, self.uses)
             and (
-                (not self.division_is_fixed and self.allocator._decides_lx_relayouts)
+                (
+                    not self.division_is_fixed
+                    and self.allocator._decides_lx_relayouts
+                    and config.lx_solver_relayout
+                )
                 or (
                     self.division_is_fixed
                     and any(
@@ -2275,7 +2282,9 @@ def _fused_layout_group_ops(
     per-core division. The joint solver, free to divide each op independently,
     can hand the group's members incompatible divisions and corrupt the shared
     per-core addressing/scheduling, so the caller pins the whole group to its
-    fixed (work-division) division. Two op kinds need this identical treatment:
+    fixed (work-division) division (except an fp8 consumer that
+    :meth:`CoOptimizingAllocator._seed_aligned_division` aligns to its matmul).
+    Two op kinds need this identical treatment:
 
     * ``keepbyindex`` reproduces a fragile multi-stick search layout that its
       input restickifies and output clones carry too; an output clone splitting
@@ -2322,10 +2331,62 @@ def _fused_layout_group_ops(
     return group
 
 
+def _fp8_matmul_consumer_seeds(graph: GraphLowering) -> dict[str, list[Operation]]:
+    """Map each op that reads a ``batchmatmulfp8`` output to the seeds it reads.
+
+    These are the one-hop consumers of :func:`_fused_layout_group_ops`'s fp8
+    groups, minus any op whose own output an fp8 seed reads: that op is also an
+    operand producer of that seed, and operand producers keep their pin.
+    """
+    seeds = {
+        op.get_name(): op
+        for op in graph.operations
+        if isinstance(op, ComputedBuffer)
+        and isinstance(op.data, Reduction)
+        and op.data.reduction_type == BATCH_MATMUL_FP8_OP
+    }
+    if not seeds:
+        return {}
+    seed_inputs = {
+        dep.name
+        for seed in seeds.values()
+        for dep in op_read_writes(seed).reads
+        if isinstance(dep, MemoryDep)
+    }
+    result: dict[str, list[Operation]] = {}
+    for op in graph.operations:
+        if (
+            not isinstance(op, ComputedBuffer)
+            or op.get_name() in seeds
+            or op.get_name() in seed_inputs
+        ):
+            continue
+        read: dict[str, Operation] = {}
+        for dep in op_read_writes(op).reads:
+            if isinstance(dep, MemoryDep) and dep.name in seeds:
+                read.setdefault(dep.name, seeds[dep.name])
+        if read:
+            result[op.get_name()] = list(read.values())
+    return result
+
+
 def _fixed_core_division(op: Operation) -> CoreDivision:
     """The op's committed symbol-keyed division, or a one-core division."""
     ownership = getattr(op, "iteration_space_ownership", None)
     return _core_division(op, ownership.work_slices if ownership is not None else {})
+
+
+def _upstream_core_division(graph: GraphLowering | None, op: Operation) -> CoreDivision:
+    """:func:`_fixed_core_division`, for a pin.
+
+    When work division was left to the joint solve (``defer_work_division``),
+    ``op`` has no split from it yet, so divide it first: a pinned op keeps the
+    split work division would have committed. Without ``graph``, nothing is
+    divided.
+    """
+    if graph is not None:
+        divide_deferred_op(graph, op)
+    return _fixed_core_division(op)
 
 
 def _legal_fixed_division(
@@ -2858,6 +2919,9 @@ def commit_divisions(
     division. One it cannot restate raises ``Unsupported``, not
     ``SolveError``: the tilings are already applied, so the greedy fallback
     in ``scratchpad_planning`` would replan a graph it did not see.
+
+    An op whose work division was left to this solve (``defer_work_division``)
+    counts as divided by the work-division pass: committing here decides it.
     """
     splits, violations = planned_splits(graph, allocation)
     if violations:
@@ -2867,12 +2931,13 @@ def commit_divisions(
         for buf in allocation
         if buf.chosen_division is not None
     }
+    deferred = deferred_work_division(graph)
     commits: list[tuple[Operation, dict[sympy.Symbol, int]]] = []
     for op in graph.operations:
         op_splits = splits.get(op.name)
         if op_splits is None:
             continue
-        if not hasattr(op, "iteration_space_ownership"):
+        if not hasattr(op, "iteration_space_ownership") and op.name not in deferred:
             # The guard (#4062) means "only refine a division the
             # work-division pass established", and its real subjects are the
             # fallback ops (SpyreConstantFallback / SpyreEmptyFallback):
@@ -2897,6 +2962,7 @@ def commit_divisions(
         commits.append((op, op_splits))
     for op, op_splits in commits:
         commit_iteration_space_ownership(op, op_splits)
+        deferred.discard(op.name)
 
 
 def check_priced_footprints(
@@ -3102,7 +3168,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             for op in graph.operations
             if hasattr(op, "_read_copy_elision_record")
             and is_restickify_op(op, graph)
-            and divisions[op.name] != [_fixed_core_division(op)]
+            and divisions[op.name] != [_upstream_core_division(graph, op)]
         }
         while True:
             buffers = self._build_cd_bound_buffers(graph, in_place, division_map)
@@ -3123,7 +3189,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 return buffers
             for name in rejected:
                 op = pending.pop(name)
-                fixed = _fixed_core_division(op)
+                fixed = _upstream_core_division(graph, op)
                 assert fixed.cores_used <= config.sencores, (
                     f"{name}: fixed direct-read division over the "
                     f"{config.sencores}-core budget"
@@ -3468,6 +3534,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         apply_chosen_tilings(graph, allocation)
         check_priced_footprints(graph, allocation)
         commit_divisions(graph, allocation)
+        # Work division left to this solve (``defer_work_division``): an op the
+        # solve committed no division to keeps the split the pass would have
+        # given it, exactly as when the pass ran up front.
+        divide_deferred_ops(graph)
         commit_lx_views(
             graph,
             allocation,
@@ -3673,17 +3743,21 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # fixed division. A resolved user work_div hint takes the same remedy,
         # last so a hazard guard's reason is the one logged: work division
         # already committed the hint, and the pin is whole-op -- unhinted dims
-        # keep their committed split of 1. The graph-level group sets are
-        # loop-invariant, so build them once here rather than rescanning
-        # graph.operations for every op.
+        # keep their committed split of 1. When work division was left to this
+        # solve, a pin divides the op first (``_upstream_core_division``). The
+        # graph-level group sets are loop-invariant, so build them once here
+        # rather than rescanning graph.operations for every op.
         offset_mutation_ops = ops_in_offset_mutation_component(graph)
+        fp8_group_reason = "fp8 matmul layout group"
         layout_group_reason = _fused_layout_group_ops(
             graph,
             {
                 KEEP_BY_INDEX_OP: "keep_by_index layout group",
-                BATCH_MATMUL_FP8_OP: "fp8 matmul layout group",
+                BATCH_MATMUL_FP8_OP: fp8_group_reason,
             },
         )
+        fp8_consumer_seeds = _fp8_matmul_consumer_seeds(graph)
+        prep_cache: dict = {}
         result = {}
         enumerated = set()
         for op in graph.operations:
@@ -3714,6 +3788,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 # pricing the direct read in the actual allocation context.
                 # Other callers and unrecognized records keep the fixed pin.
                 reason = "deferred direct graph-input read"
+            elif isinstance(op, ComputedBuffer) and getattr(
+                op, "shard_pinned_splits", None
+            ):
+                reason = "shard plan"
             elif (
                 not config.ignore_work_division_hints
                 and isinstance(op, ComputedBuffer)
@@ -3721,8 +3799,23 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             ):
                 reason = "user work_div hint"
 
-            if reason is not None:
-                divs = _legal_fixed_division(op, [_fixed_core_division(op)], reason)
+            aligned: Optional[CoreDivision] = None
+            if reason == fp8_group_reason and op.name in fp8_consumer_seeds:
+                aligned = self._seed_aligned_division(
+                    op,
+                    fp8_consumer_seeds[op.name],
+                    profiles,
+                    matmul_roles,
+                    max_cores,
+                    prep_cache,
+                    graph,
+                )
+            if aligned is not None:
+                divs = [aligned]
+            elif reason is not None:
+                divs = _legal_fixed_division(
+                    op, [_upstream_core_division(graph, op)], reason
+                )
             elif self.prune and isinstance(op, ComputedBuffer):
                 divs = [
                     _core_division(op, splits)
@@ -3735,7 +3828,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                         op, [_fixed_core_division(op)], "empty pruned candidate set"
                     )
             else:
-                divs, is_enumeration = self._enumerate_core_divisions(op, max_cores)
+                divs, is_enumeration = self._enumerate_core_divisions(
+                    op, max_cores, graph
+                )
                 if is_enumeration:
                     enumerated.add(op.name)
             if not divs:
@@ -3758,26 +3853,100 @@ class CoOptimizingAllocator(ScratchpadAllocator):
 
         return _DivisionMap(result, enumerated)
 
+    def _seed_aligned_division(
+        self,
+        op: Operation,
+        seeds: list[Operation],
+        profiles: tuple[dict[int, int], ...],
+        matmul_roles: tuple[dict[str, int], ...],
+        max_cores: int,
+        prep_cache: dict,
+        graph: GraphLowering | None = None,
+    ) -> Optional[CoreDivision]:
+        """A division for an fp8 matmul consumer that slices the matmul output
+        the way the matmul does, or ``None`` to keep the consumer's fixed one.
+
+        Work division sizes the matmul on its FP8 sticks and the consumer on its
+        fp16 sticks, so the two fixed divisions can differ (M=1, N=14336: 28 vs
+        32 cores). The fp8 layout group pins both, and when no relayout can
+        bridge the two core domains the matmul output can never be LX-resident.
+        In that case only, the consumer takes the most-cores candidate of its
+        ordinary menu whose view of the output matches the matmul's.
+
+        With ``graph``, both fixed divisions are the ones work division commits,
+        dividing either op first if its work division was deferred
+        (:func:`_upstream_core_division`).
+        """
+        if len(seeds) != 1:
+            return None
+        seed = seeds[0]
+        edge = build_residency_edge(
+            seed.name, seed, op, op_read_writes(op).reads, None, prep_cache
+        )
+        if edge is None:
+            return None
+        seed_div = _upstream_core_division(graph, seed)
+        fixed = _upstream_core_division(graph, op)
+        if edge.match_pairs([seed_div], [fixed]):
+            return None
+        src, dst = seed_div.cores_used, fixed.cores_used
+        if core_domain_rejection(src, dst) is None and dst % src == 0:
+            return None
+        if self.prune:
+            menu = [
+                _core_division(op, splits)
+                for splits in _legal_split_options(
+                    op, _enum_split_options(op, profiles, matmul_roles)
+                )
+            ]
+        else:
+            menu, _ = self._enumerate_core_divisions(op, max_cores, graph)
+        menu = [
+            d
+            for d in menu
+            if d.cores_used <= max_cores and _split_option_is_legal(op, d.splits)
+        ]
+        pairs = edge.match_pairs([seed_div], menu)
+        matched = sorted({j for _, j in pairs})
+        if not matched:
+            return None
+        aligned = max((menu[j] for j in matched), key=lambda d: d.cores_used)
+        logger.debug(
+            "align %s to fp8 matmul %s: %s -> %s",
+            op.name,
+            seed.name,
+            fixed.label,
+            aligned.label,
+        )
+        return aligned
+
     def _enumerate_core_divisions(
-        self, op: Operation, max_cores: int
+        self, op: Operation, max_cores: int, graph: GraphLowering | None = None
     ) -> tuple[list[CoreDivision], bool]:
         """Enumerate and deduplicate symbol-keyed candidates for one operation,
         with whether they are the *whole* legal cross product.
 
         Operations without an enumerable concrete iteration space retain their
-        committed division, and say so (see :class:`_DivisionMap`).
-        Deduplication uses local symbol names only within this operation;
-        cross-operation compatibility is derived from ``PerCoreView`` instead.
+        committed division, and say so (see :class:`_DivisionMap`); with
+        ``graph``, one whose work division was deferred is divided first (see
+        :func:`_upstream_core_division`). Deduplication uses local symbol names
+        only within this operation; cross-operation compatibility is derived
+        from ``PerCoreView`` instead.
         """
-        fixed = [_fixed_core_division(op)]
+
+        def fixed() -> list[CoreDivision]:
+            # Only a pin reads the committed division, so a deferred op is
+            # divided here, never for a menu the solve chooses from.
+            return [_upstream_core_division(graph, op)]
+
         if not isinstance(op, ComputedBuffer) or not isinstance(
             op.data, (Pointwise, Reduction)
         ):
-            return fixed, False
+            return fixed(), False
         try:
             candidates = enumerate_work_division_candidates(op, max_cores)
         except Unsupported as exc:
-            return _legal_fixed_division(op, fixed, str(exc)), False
+            return _legal_fixed_division(op, fixed(), str(exc)), False
         cds: list[CoreDivision] = []
         seen: set[tuple] = set()
         # Each tiling option gets its own division enumeration: the legal split
@@ -3833,7 +4002,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     cds.append(division)
         if cds:
             return cds, True
-        return _legal_fixed_division(op, fixed, "no enumerable candidate"), False
+        return _legal_fixed_division(op, fixed(), "no enumerable candidate"), False
 
     def _tiling_candidates(self, op: Operation, max_cores: int) -> list[TileSpec]:
         """Coarse-tiling options to pair with ``op``'s divisions.
@@ -4924,14 +5093,18 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         ``collect_lx_relayout_plans``; the per-pair gates (permutation
         compatibility, projectable ownership on both frames, the law's fitted
         split range) live in ``solver_relayout_pair_cost``. Gated on the
-        solver's ``decides_lx_relayouts``.
+        solver's ``decides_lx_relayouts`` and on ``config.lx_solver_relayout``.
 
         ``cd_parent_matches`` (the caller's own ``_cd_parent_matches`` result)
         gives each parent's cap-and-rank step the other parents' already-free
         divisions, so it won't drop the one group that would let this parent
         join them.
         """
-        if not self._decides_lx_relayouts or config.ktir_emitter:
+        if (
+            not self._decides_lx_relayouts
+            or not config.lx_solver_relayout
+            or config.ktir_emitter
+        ):
             return {}
         if consumer_op is None:
             return {}
@@ -5343,6 +5516,28 @@ def select_allocator() -> ScratchpadAllocator:
     )
 
 
+def solve_decides_work_division() -> bool:
+    """Whether the LX planning solve chooses the split of every op it can
+    enumerate, so work division can be left to it (``defer_work_division``).
+
+    True exactly when :func:`select_allocator` builds a
+    :class:`CoOptimizingAllocator` with a native core-division engine: simulated
+    annealing, or CP-SAT with ortools. Keep the two in step. The pruned
+    exhaustive search is excluded, because it seeds its menus from the committed
+    split (``_seed_splits``), and so is every placement-only allocator, which
+    keeps the committed split as it is.
+    """
+    if not (config.lx_planning and config.co_optimizing_lx_planning):
+        return False
+    if config.layout_solver == "simulated_annealing":
+        return True
+    if config.layout_solver == "cpsat":
+        return _cpsat_solver_class().chooses_core_divisions()
+    solver_cls = _PLACEMENT_SOLVERS.get(config.layout_solver)
+    # An unknown solver is select_allocator's error to raise, not this one's.
+    return solver_cls is not None and solver_cls.chooses_core_divisions()
+
+
 def scratchpad_planning(
     graph: GraphLowering,
     allocator: Optional[ScratchpadAllocator] = None,
@@ -5382,6 +5577,10 @@ def scratchpad_planning(
             config.layout_solver,
             error,
         )
+        # Work division may have been left to the failed solve
+        # (``defer_work_division``): divide what it left, so greedy placement
+        # plans with the splits the pass would have committed up front.
+        divide_deferred_ops(graph)
         ScratchpadAllocator(
             GreedyLayoutSolver,
             size=_lx_planning_size(),
