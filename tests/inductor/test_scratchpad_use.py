@@ -1888,6 +1888,7 @@ class TestSolverCapabilities(unittest.TestCase):
             SimulatedAnnealingLayoutSolver: none,
             SaCoOptimizingSolver: {
                 **joint,
+                "decides_lx_relayouts": True,
                 "generates_divisions": True,
                 "chooses_tilings": True,
             },
