@@ -111,7 +111,9 @@ adds, changes or removes an `xfail`, `skip`, `expect_*` key or `pytest.raises` i
 
 - No `pytest.xfail(...)` in a test body or helper, and no `try`/`except` that turns an
   error into an xfail or skip. Use a marker, a `PARAMS` key or `strict_xfail`
-  (**BLOCKER**: the test then cannot XPASS).
+  (**BLOCKER**: the test then cannot XPASS). The one exception is a call placed last,
+  after the body has already checked its result; `AGENTS.md` names the single such
+  call in the tree.
 - An xfail is strict, and has `raises=` where the author writes the marker
   (`@pytest.mark.xfail`, `strict_xfail`). `expect_fail` is a `{case: reason}` mapping
   that cites the issue. `expect_fail_unstable` needs a reason and an issue and must be

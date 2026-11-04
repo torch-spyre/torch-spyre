@@ -43,7 +43,8 @@ For a PR that touches `xfail`, `skip`, `expect_*` or `pytest.raises` in tests
 (see "Test Invariants" in `AGENTS.md`):
 
 - [ ] No `pytest.xfail(...)` in a body or helper, no `try`/`except` that turns an
-  error into an xfail or skip (**BLOCKER**)
+  error into an xfail or skip (**BLOCKER**) -- except a call placed last, after the
+  body has already checked its result; `AGENTS.md` names the one in the tree
 - [ ] xfail is strict, with `raises=` where the marker is written by hand;
   `expect_fail` is a `{case: reason}` mapping; `expect_fail_unstable` has a reason and
   an issue
