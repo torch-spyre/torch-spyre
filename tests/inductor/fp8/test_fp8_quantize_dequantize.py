@@ -15,9 +15,10 @@
 from __future__ import annotations
 import pytest
 import torch
+from torch._inductor.exc import InductorError
 from torch_spyre.constants import DEVICE_NAME
 
-E4M3 = getattr(torch, "float8_e4m3fn", None)
+E4M3 = torch.float8_e4m3fn
 FP16 = torch.float16
 FP32 = torch.float32
 BF16 = torch.bfloat16
@@ -35,54 +36,45 @@ def _spyre_available() -> bool:
         return False
 
 
-def _quantize_op_available():
-    try:
-        _ = torch.ops.spyre.quantize_fp8_with_scale
-        return True
-    except AttributeError:
-        return False
-
-
-def _weight_quantize_op_available():
-    try:
-        _ = torch.ops.spyre.quantize_weight_fp8_with_scale
-        return True
-    except AttributeError:
-        return False
-
-
-def _dequantize_op_available():
-    try:
-        _ = torch.ops.spyre.dequantize_fp8_with_scale
-        return True
-    except AttributeError:
-        return False
-
-
 pytestmark = pytest.mark.skipif(
     not _spyre_available(), reason="Spyre device not available"
 )
 
-skip_no_quantize = pytest.mark.skipif(
-    not _quantize_op_available(), reason="quantize_fp8_with_scale not registered"
-)
-skip_no_weight_quantize = pytest.mark.skipif(
-    not _weight_quantize_op_available(),
-    reason="quantize_weight_fp8_with_scale not registered",
-)
-skip_no_dequantize = pytest.mark.skipif(
-    not _dequantize_op_available(),
-    reason="dequantize_fp8_with_scale not registered",
-)
-
 _RAW_QUANTIZE_PARAMS = [
-    pytest.param("quantize_fp8_with_scale", id="activation", marks=skip_no_quantize),
-    pytest.param(
-        "quantize_weight_fp8_with_scale", id="weight", marks=skip_no_weight_quantize
-    ),
+    pytest.param("quantize_fp8_with_scale", id="activation"),
+    pytest.param("quantize_weight_fp8_with_scale", id="weight"),
 ]
 
-activation_roundtrip_marks = [skip_no_quantize, skip_no_dequantize]
+_XFAIL_3033 = pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="https://github.com/torch-spyre/torch-spyre/issues/3033: for K>=16 a host "
+    "FP8 copy is STANDARD but the FP8 kernels read and write QFP8CH, so from the 9th "
+    "element of a row on, values come from the wrong offset",
+)
+
+_XFAIL_3024 = pytest.mark.xfail(
+    strict=True,
+    raises=InductorError,
+    reason="https://github.com/torch-spyre/torch-spyre/issues/3024: some stick-"
+    "unaligned K (13, 50, 9) trip a compiler assertion 'Unsupported coordinate "
+    "expression 13*c0/64'; other unaligned K (77, 129) work",
+)
+
+_XFAIL_3999 = pytest.mark.xfail(
+    strict=True,
+    raises=RuntimeError,
+    reason="https://github.com/torch-spyre/torch-spyre/issues/3999: .cpu() of the FP16 "
+    "output raises 'Invalid device sizes and stride map': the conversion from FP8 pads "
+    "this stick-unaligned K to two FP16 sticks",
+)
+
+_XFAIL_3026 = pytest.mark.xfail(
+    strict=True,
+    raises=InductorError,
+    reason="https://github.com/torch-spyre/torch-spyre/issues/3026: head_dim=64 roundtrip "
+    "fails to compile: 'Unexpected stick expression d2 + 64*(Mod(d1, 2))' or its 4D form",
+)
 
 
 def _quantize_fn(x, scale):
@@ -158,15 +150,23 @@ class TestQuantizeFP8:
         assert out.device.type == DEVICE
         assert out.is_contiguous()
 
-    @skip_no_quantize
-    def test_activation_quantize_2d_cpu_copy(self):
-        """Activation FP8 (2,8) non-uniform output: .cpu() must preserve logical values."""
-        x = _make_arange_fp16((2, 8))
+    @pytest.mark.parametrize(
+        "shape",
+        [
+            (2, 8),
+            pytest.param((2, 16), marks=_XFAIL_3033),
+            pytest.param((16, 128), marks=_XFAIL_3033),
+        ],
+        ids=["2x8", "2x16", "16x128"],
+    )
+    def test_activation_quantize_2d_cpu_copy(self, shape):
+        """Activation FP8 non-uniform output: .cpu() must preserve logical values."""
+        x = _make_arange_fp16(shape)
         scale = torch.tensor(1.0, dtype=FP16, device=DEVICE)
         fn = _compile(_quantize_fn)
         out = fn(x, scale)
         assert out.dtype == E4M3
-        assert out.shape == torch.Size((2, 8))
+        assert out.shape == torch.Size(shape)
         out_cpu = out.cpu()
         expected = x.cpu().to(FP32).clamp(-FP8_MAX, FP8_MAX).to(E4M3)
         assert out_cpu.dtype == E4M3
@@ -216,7 +216,6 @@ class TestQuantizeFP8:
         assert out.dtype == E4M3
         assert out.shape == torch.Size((2, 8))
 
-    @skip_no_quantize
     @pytest.mark.parametrize(
         "shape",
         [
@@ -235,18 +234,11 @@ class TestQuantizeFP8:
         assert out.shape == torch.Size(shape)
         assert out.device.type == DEVICE
 
-    @skip_no_quantize
     @pytest.mark.parametrize(
         "shape",
         [
             (1, 4, 32, 128),
-            pytest.param(
-                (2, 8, 64, 64),
-                marks=pytest.mark.skip(
-                    reason="https://github.com/torch-spyre/torch-spyre/issues/3026: "
-                    "3D/4D head_dim=64 fails to compile: compound stick expression not supported"
-                ),
-            ),
+            (2, 8, 64, 64),
         ],
         ids=["1x4x32x128", "2x8x64x64"],
     )
@@ -259,8 +251,6 @@ class TestQuantizeFP8:
         assert out.shape == torch.Size(shape)
         assert out.device.type == DEVICE
 
-    @skip_no_quantize
-    @skip_no_dequantize
     @pytest.mark.parametrize(
         "shape",
         [
@@ -288,13 +278,11 @@ class TestQuantizeFP8:
 class TestFP8Dequantize:
     """dequantize_fp8_with_scale: value correctness, shape coverage, edge values, and sign preservation."""
 
-    pytestmark = skip_no_dequantize
-
     @pytest.mark.parametrize(
         "shape,scale_val",
         [
             ((2, 8), 1.0),
-            ((4, 8), 2.0),
+            pytest.param((4, 8), 2.0, marks=_XFAIL_3999),
             ((2, 2, 8), 1.0),
         ],
         ids=["2x8_s1", "4x8_s2", "2x2x8_s1"],
@@ -338,16 +326,7 @@ class TestFP8Dequantize:
 
     @pytest.mark.parametrize(
         "shape",
-        [
-            (1, 8),
-            pytest.param(
-                (1, 16),
-                marks=pytest.mark.skip(
-                    reason="https://github.com/torch-spyre/torch-spyre/issues/2527: "
-                    "M=1 shapes crash dxp_standalone with DtException SIGABRT"
-                ),
-            ),
-        ],
+        [(1, 8), pytest.param((1, 16), marks=_XFAIL_3033)],
         ids=["1x8", "1x16"],
     )
     def test_2d_m1_shapes(self, shape):
@@ -371,10 +350,7 @@ class TestFP8Dequantize:
         assert out.shape == torch.Size((M, 8))
         torch.testing.assert_close(out.cpu(), ref, atol=0.0, rtol=0.0)
 
-    @pytest.mark.skip(
-        reason="https://github.com/torch-spyre/torch-spyre/issues/3033: "
-        "dequantize wrong values for K≥16 (all shapes here have K=512-4096)"
-    )
+    @_XFAIL_3033
     @pytest.mark.parametrize(
         "shape,scale_val",
         [
@@ -459,9 +435,12 @@ class TestFP8Dequantize:
         torch.testing.assert_close(out.cpu(), ref, atol=0.0, rtol=0.0)
         assert (out.cpu()[0] > 0).all() and (out.cpu()[1] < 0).all()
 
-    @pytest.mark.skip(
-        reason="https://github.com/torch-spyre/torch-spyre/issues/3027: "
-        "hardware FP8→FP16 decodes ~6.25% of E4M3fn bit patterns incorrectly"
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason="https://github.com/torch-spyre/torch-spyre/issues/3027: exactly the 14 "
+        "nonzero subnormal codes (0x01-0x07, 0x81-0x87) decode wrong, as if exponent 0 "
+        "were a normal binade (0x01 -> 0.00879, not 0.00195); every other code is exact",
     )
     def test_all_e4m3_bit_patterns(self):
         """All 256 E4M3 bit patterns must convert to the corresponding FP16 values."""
@@ -472,6 +451,7 @@ class TestFP8Dequantize:
         out = _compile(_dequantize_fn)(x_fp8_cpu.to(DEVICE), scale)
         torch.testing.assert_close(out.cpu(), ref, atol=0.0, rtol=0.0, equal_nan=True)
 
+    @_XFAIL_3999
     def test_shape_guard_recompile(self):
         """(2,8) then (4,8): shape guard must recompile, correct output for both shapes."""
         from torch._dynamo.testing import CompileCounterWithBackend
@@ -490,9 +470,11 @@ class TestFP8Dequantize:
             f"got {counter.frame_count}"
         )
 
-    @pytest.mark.skip(
-        reason="https://github.com/torch-spyre/torch-spyre/issues/2526: "
-        "non-contiguous FP8 input fails to compile (no stick-incompatibility resolution)"
+    @pytest.mark.xfail(
+        strict=True,
+        raises=InductorError,
+        reason="https://github.com/torch-spyre/torch-spyre/issues/2526: transposed FP8 "
+        "input fails to compile: 'no mechanism to resolve stick incompatibility'",
     )
     def test_transposed_fp8_input(self):
         """Transposed non-contiguous FP8 input via .t()."""
@@ -509,14 +491,13 @@ class TestFP8Dequantize:
 class TestWeightRoundtrip:
     """quantize_weight_fp8_with_scale → dequantize roundtrip: stick-aligned K, K=8, scale arithmetic."""
 
-    pytestmark = [
-        skip_no_weight_quantize,
-        skip_no_dequantize,
-        pytest.mark.skip(
-            reason="https://github.com/torch-spyre/torch-spyre/issues/3022: "
-            "fused weight quant/dequant crashes dxp_standalone compiler"
-        ),
-    ]
+    pytestmark = pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason="https://github.com/torch-spyre/torch-spyre/issues/3022: no longer "
+        "crashes the backend compiler, but dequantize misreads the QFP8WT weight layout "
+        "and returns wrong values",
+    )
 
     @pytest.mark.parametrize(
         "shape,scale_val",
@@ -565,7 +546,23 @@ class TestWeightRoundtrip:
         )
 
     @pytest.mark.parametrize(
-        "shape", [(2, 8), (4, 8), (8, 8)], ids=["2x8", "4x8", "8x8"]
+        "shape",
+        [
+            (2, 8),
+            pytest.param(
+                (4, 8),
+                marks=pytest.mark.xfail(
+                    strict=True,
+                    raises=RuntimeError,
+                    reason="https://github.com/torch-spyre/torch-spyre/issues/3999: .cpu() "
+                    "of the FP16 output raises 'Invalid device sizes and stride map': "
+                    "the conversion from FP8 pads this stick-unaligned K to two FP16 "
+                    "sticks. Wrong values from issue 3022 are behind it",
+                ),
+            ),
+            (8, 8),
+        ],
+        ids=["2x8", "4x8", "8x8"],
     )
     def test_2d_k8_small_m(self, shape):
         """K=8, M < rows_per_stick(16), non-uniform input."""
@@ -595,13 +592,11 @@ class TestWeightRoundtrip:
 class TestRoundtripBaseline:
     """Activation quantize → dequantize baseline: 2D/3D fill, distinct rows, and determinism."""
 
-    pytestmark = activation_roundtrip_marks
-
     @pytest.mark.parametrize(
         "shape,scale_val",
         [
             ((2, 8), 1.0),
-            ((4, 8), 2.0),
+            pytest.param((4, 8), 2.0, marks=_XFAIL_3999),
             ((8, 8), 1.0),
             ((2, 2, 8), 2.0),
         ],
@@ -656,7 +651,11 @@ class TestRoundtripBaseline:
 
     @pytest.mark.parametrize(
         "seed,shape",
-        [(42, (2, 8)), (0, (4, 8)), (7, (2, 2, 8))],
+        [
+            (42, (2, 8)),
+            pytest.param(0, (4, 8), marks=_XFAIL_3999),
+            (7, (2, 2, 8)),
+        ],
         ids=["seed42_2x8", "seed0_4x8", "seed7_2x2x8"],
     )
     def test_seeded_random_fp16_input(self, seed, shape):
@@ -692,12 +691,6 @@ class TestRoundtripBaseline:
 class TestRoundtripShapes:
     """Activation roundtrip shape sweep: M=1, K=4/8/16, K-unaligned, 3D/4D, LLaMA/matrix shapes."""
 
-    pytestmark = activation_roundtrip_marks
-
-    @pytest.mark.skip(
-        reason="https://github.com/torch-spyre/torch-spyre/issues/2527: "
-        "M=1 shapes crash dxp_standalone with DtException SIGABRT"
-    )
     @pytest.mark.parametrize(
         "shape", [(1, 8), (1, 16), (1, 32)], ids=["1x8", "1x16", "1x32"]
     )
@@ -713,7 +706,13 @@ class TestRoundtripShapes:
         )
 
     @pytest.mark.parametrize(
-        "shape", [(2, 4), (4, 4), (2, 2, 4)], ids=["2x4", "4x4", "2x2x4"]
+        "shape",
+        [
+            pytest.param((2, 4), marks=_XFAIL_3999),
+            (4, 4),
+            pytest.param((2, 2, 4), marks=_XFAIL_3999),
+        ],
+        ids=["2x4", "4x4", "2x2x4"],
     )
     def test_2d_k4_shapes(self, shape):
         """K=4 2D and 3D shapes, non-uniform input."""
@@ -764,13 +763,24 @@ class TestRoundtripShapes:
             out, _roundtrip_ref(x.cpu(), scale.cpu()), atol=0.0, rtol=0.0
         )
 
-    @pytest.mark.skip(
-        reason="https://github.com/torch-spyre/torch-spyre/issues/4312: "
-        "spyre_fill_tensor raises RuntimeError for numel()==0"
+    @pytest.mark.xfail(
+        strict=True,
+        raises=RuntimeError,
+        reason="https://github.com/torch-spyre/torch-spyre/issues/4312: creating the "
+        "input with torch.zeros(0, 8, device=spyre) raises 'spyre_fill_tensor: cannot "
+        "fill empty tensor', before any FP8 op runs",
     )
     def test_2d_zero_batch(self):
         """Zero-sized first dimension (0,8): must return empty tensor, not crash."""
         x = torch.zeros(0, 8, dtype=FP16, device=DEVICE)
+        scale = torch.tensor(1.0, dtype=FP16, device=DEVICE)
+        out = _compile(_quant_dequant_fn)(x, scale)
+        assert out.shape == torch.Size((0, 8))
+        assert out.dtype == FP16
+
+    def test_2d_zero_batch_host_input(self):
+        """Zero-sized (0,8) input copied from the host: must return empty tensor."""
+        x = torch.zeros(0, 8, dtype=FP16).to(DEVICE)
         scale = torch.tensor(1.0, dtype=FP16, device=DEVICE)
         out = _compile(_quant_dequant_fn)(x, scale)
         assert out.shape == torch.Size((0, 8))
@@ -882,9 +892,12 @@ class TestRoundtripShapes:
             out.cpu(), _roundtrip_ref(x.cpu(), scale.cpu()), atol=0.0, rtol=0.0
         )
 
-    @pytest.mark.skip(
-        reason="https://github.com/torch-spyre/torch-spyre/issues/3029: "
-        "3D (2,S,8) K=8 roundtrip produces wrong values / hardware errors across all S values"
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason="https://github.com/torch-spyre/torch-spyre/issues/3029: (2,16,8) is "
+        "exact, but (2,17,8) and (2,32,8) return wrong values; the mismatch count "
+        "varies between runs",
     )
     @pytest.mark.parametrize("S", [17, 32], ids=["S17", "S32"])
     def test_3d_shapes_varying_seq_k8(self, S):
@@ -901,13 +914,7 @@ class TestRoundtripShapes:
     @pytest.mark.parametrize(
         "shape",
         [
-            pytest.param(
-                (2, 128, 64),
-                marks=pytest.mark.skip(
-                    reason="https://github.com/torch-spyre/torch-spyre/issues/3026: "
-                    "3D/4D head_dim=64 fails to compile: compound stick expression not supported"
-                ),
-            ),
+            pytest.param((2, 128, 64), marks=_XFAIL_3026),
             (4, 64, 256),
             (2, 32, 4096),
             (1, 512, 4096),
@@ -929,28 +936,10 @@ class TestRoundtripShapes:
         "shape",
         [
             (63, 8),
-            pytest.param(
-                (63, 13),
-                marks=pytest.mark.skip(
-                    reason="https://github.com/torch-spyre/torch-spyre/issues/3024: "
-                    "stick-unaligned K causes compile crash (unsupported coordinate expression)"
-                ),
-            ),
+            pytest.param((63, 13), marks=_XFAIL_3024),
             (63, 129),
-            pytest.param(
-                (17, 13),
-                marks=pytest.mark.skip(
-                    reason="https://github.com/torch-spyre/torch-spyre/issues/3024: "
-                    "stick-unaligned K causes compile crash (unsupported coordinate expression)"
-                ),
-            ),
-            pytest.param(
-                (100, 50),
-                marks=pytest.mark.skip(
-                    reason="https://github.com/torch-spyre/torch-spyre/issues/3024: "
-                    "stick-unaligned K causes compile crash (unsupported coordinate expression)"
-                ),
-            ),
+            pytest.param((17, 13), marks=_XFAIL_3024),
+            pytest.param((100, 50), marks=_XFAIL_3024),
             (7, 77),
             (67, 256),
         ],
@@ -970,13 +959,7 @@ class TestRoundtripShapes:
     @pytest.mark.parametrize(
         "shape",
         [
-            pytest.param(
-                (3, 7, 9),
-                marks=pytest.mark.skip(
-                    reason="https://github.com/torch-spyre/torch-spyre/issues/3024: "
-                    "stick-unaligned K causes compile crash (unsupported coordinate expression)"
-                ),
-            ),
+            pytest.param((3, 7, 9), marks=_XFAIL_3024),
             (67, 71, 77),
             (2, 63, 128),
         ],
@@ -995,16 +978,7 @@ class TestRoundtripShapes:
 
     @pytest.mark.parametrize(
         "shape",
-        [
-            pytest.param(
-                (2, 8, 64, 64),
-                marks=pytest.mark.skip(
-                    reason="https://github.com/torch-spyre/torch-spyre/issues/3026: "
-                    "3D/4D head_dim=64 fails to compile: compound stick expression not supported"
-                ),
-            ),
-            (1, 4, 32, 128),
-        ],
+        [pytest.param((2, 8, 64, 64), marks=_XFAIL_3026), (1, 4, 32, 128)],
         ids=["2x8x64x64", "1x4x32x128"],
     )
     def test_4d_attention_layout(self, shape):
@@ -1021,8 +995,6 @@ class TestRoundtripShapes:
 
 class TestRoundtripScale:
     """Activation roundtrip scale coverage: scalar range, zero/inf/negative, and per-row scales."""
-
-    pytestmark = activation_roundtrip_marks
 
     # Power-of-2 scales only: non-power-of-2 (e.g. 0.1) have inexact FP16 reciprocals,
     # causing ±1 ULP differences at FP8 boundaries that make atol=0.0 invalid.
@@ -1043,9 +1015,12 @@ class TestRoundtripScale:
             msg=f"scale={scale_val}: roundtrip differs",
         )
 
-    @pytest.mark.skip(
-        reason="https://github.com/torch-spyre/torch-spyre/issues/3037: "
-        "scale=0 produces +inf output instead of 0"
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason="https://github.com/torch-spyre/torch-spyre/issues/3037: output is NaN, "
+        "not 0: the device computes reciprocal(0) as NaN instead of +inf, so the clamp "
+        "to 448 never happens (dequantize(448, scale=0) alone gives 0 correctly)",
     )
     def test_zero_scale(self):
         """scale=0: output must be all zero."""
@@ -1105,8 +1080,6 @@ class TestRoundtripScale:
 
 class TestRoundtripEdgeCases:
     """Activation roundtrip edge values: zero fill, FP8 max/min, clamp, inf, NaN, sign."""
-
-    pytestmark = activation_roundtrip_marks
 
     def test_zero_filled_input(self):
         """All-zero input: roundtrip must produce all-zero output."""
@@ -1216,11 +1189,12 @@ class TestRoundtripEdgeCases:
 class TestRoundtripInputVariants:
     """Activation roundtrip with non-standard inputs: non-contiguous (transposed) and BF16."""
 
-    pytestmark = activation_roundtrip_marks
-
-    @pytest.mark.skip(
-        reason="https://github.com/torch-spyre/torch-spyre/issues/2526: "
-        "non-contiguous input fails to compile (no stick-incompatibility resolution)"
+    @pytest.mark.xfail(
+        strict=True,
+        raises=InductorError,
+        reason="https://github.com/torch-spyre/torch-spyre/issues/2526: transposed input "
+        "fails to compile: dbo-opt raises DtException 'Expect valid lower and upper bound "
+        "parameters'",
     )
     def test_transposed_non_contiguous_input(self):
         """Transposed non-contiguous input, non-uniform."""
@@ -1251,8 +1225,6 @@ class TestRoundtripInputVariants:
 
 class TestRoundtripGraphBehavior:
     """Activation roundtrip compilation: fullgraph=True, repeated-call determinism, shape guard recompile."""
-
-    pytestmark = activation_roundtrip_marks
 
     def test_quantize_dequantize_fullgraph(self):
         """Both ops in a single fullgraph compile without graph break."""
@@ -1295,11 +1267,12 @@ class TestFP8EagerMode:
     def setup_method(self):
         torch._dynamo.reset()
 
-    @pytest.mark.skip(
-        reason="https://github.com/torch-spyre/torch-spyre/issues/4313: quantize ops return None in eager mode"
-    )
-    @pytest.mark.skipif(
-        not _quantize_op_available(), reason="quantize_fp8_with_scale not registered"
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason="https://github.com/torch-spyre/torch-spyre/issues/4313: no longer returns "
+        "None, but values differ from the CPU oracle: at K>=16 the .cpu() copy reads "
+        "elements from the wrong offset, as in issue 3033",
     )
     def test_quantize_fp8_with_scale_eager(self):
         """quantize_fp8_with_scale eager: output shape, dtype, and values match CPU oracle."""
@@ -1317,12 +1290,12 @@ class TestFP8EagerMode:
         ref = a_cpu.float().clamp(-FP8_MAX, FP8_MAX).to(E4M3)
         torch.testing.assert_close(a_fp8.cpu().float(), ref.float(), atol=0.0, rtol=0.0)
 
-    @pytest.mark.skip(
-        reason="https://github.com/torch-spyre/torch-spyre/issues/4313: quantize ops return None in eager mode"
-    )
-    @pytest.mark.skipif(
-        not _weight_quantize_op_available(),
-        reason="quantize_weight_fp8_with_scale not registered",
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason="https://github.com/torch-spyre/torch-spyre/issues/4313: no longer returns "
+        "None, but some values differ from the CPU oracle: subnormals and values near "
+        "FP8 midpoints round differently on the device",
     )
     def test_quantize_weight_fp8_with_scale_eager(self):
         """quantize_weight_fp8_with_scale eager: output shape, dtype, and values match CPU oracle."""

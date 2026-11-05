@@ -16,10 +16,12 @@ from __future__ import annotations
 
 import pytest
 import torch
+from torch._inductor.exc import InductorError
 from torch_spyre.constants import DEVICE_NAME
+from utils_inductor import expects_raise
 
-E4M3 = getattr(torch, "float8_e4m3fn", None)
-FP8_MAX = float(torch.finfo(E4M3).max) if E4M3 is not None else 448.0
+E4M3 = torch.float8_e4m3fn
+FP8_MAX = float(torch.finfo(E4M3).max)
 FP16 = torch.float16
 BF16 = torch.bfloat16
 FP32 = torch.float32
@@ -36,38 +38,45 @@ def _spyre_available() -> bool:
         return False
 
 
-def _fp8_available() -> bool:
-    return hasattr(torch, "float8_e4m3fn")
-
-
-def _quantize_op_available() -> bool:
-    try:
-        import torch_spyre  # noqa: F401
-
-        _ = torch.ops.spyre.quantize_fp8_with_scale
-        return True
-    except (ImportError, AttributeError):
-        return False
-
-
-skip_no_spyre = pytest.mark.skipif(
+pytestmark = pytest.mark.skipif(
     not _spyre_available(),
     reason="Spyre device not available",
 )
-skip_no_fp8 = pytest.mark.skipif(
-    not _fp8_available(),
-    reason="FP8 dtype not in this PyTorch build",
-)
-skip_no_quantize_ops = pytest.mark.skipif(
-    not _quantize_op_available(),
-    reason="quantize_fp8_with_scale not registered (requires PR #2401)",
+
+_XFAIL_4305 = pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="https://github.com/torch-spyre/torch-spyre/issues/4305: with non-unit dynamic "
+    "scales, some output elements differ from the CPU oracle by more than atol=0.1, "
+    "rtol=0.05",
 )
 
-pytestmark = [skip_no_spyre, skip_no_fp8]
+_XFAIL_4308 = pytest.mark.xfail(
+    strict=True,
+    raises=InductorError,
+    reason="https://github.com/torch-spyre/torch-spyre/issues/4308: K%128!=0 fails to "
+    "compile: padding K leaves a STANDARD weight, so the FP8 matmul cost model finds no "
+    "QFP8WT input (StopIteration); past that, dbo-opt cannot zero-fill FP8 padding",
+)
+
+_XFAIL_4310 = pytest.mark.xfail(
+    strict=True,
+    raises=InductorError,
+    reason="https://github.com/torch-spyre/torch-spyre/issues/4310: a raw FP8 weight "
+    "moved with .to(device) is STANDARD, not QFP8WT, so the FP8 matmul cost model "
+    "raises StopIteration at compile",
+)
+
+_XFAIL_4311 = pytest.mark.xfail(
+    strict=True,
+    raises=InductorError,
+    reason="https://github.com/torch-spyre/torch-spyre/issues/4311: non-contiguous "
+    "activation fails to compile: 'batchmatmulfp8: cannot restickify any input layout'",
+)
 
 
 def _amax_scale(t: torch.Tensor) -> float:
-    """Amax-based scale: amax(|t|)/448 — maps max→FP8 max. OVERFLOWS FP16 for K≥1."""
+    """Amax-based scale: amax(|t|)/448 — maps max→FP8 max."""
     return max(float(t.float().abs().amax()) / FP8_MAX, 1e-6)
 
 
@@ -89,7 +98,11 @@ def _pipeline_ref(
     out_dtype: torch.dtype = FP16,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """CPU oracle: (clip(a/sa)@clip(w/sw)) * sa*sw [+bias], all intermediate in FP32."""
+    """CPU oracle: (clip(a/sa)@clip(w/sw)) * sa*sw [+bias], all intermediate in FP32.
+
+    Tests compare with rtol=0.05, under half an E4M3 step (6.25%), and an atol of one to
+    three FP16 ULPs at the output size for rand inputs, K/4 (atol=0.1 at K=128, 1.0 at K=4096).
+    """
     a_fp8 = (a.cpu().float() / sa).clamp(-FP8_MAX, FP8_MAX).to(E4M3)
     w_fp8 = (w.cpu().float() / sw).clamp(-FP8_MAX, FP8_MAX).to(E4M3)
     out = (a_fp8.float() @ w_fp8.float()) * (sa * sw)
@@ -136,8 +149,6 @@ def _pipeline_bias_fn(a, w, sa, sw, bias, out_dtype=FP16):
 
 class TestFP8Correctness:
     """Sunny-day pipeline correctness: K%128==0, Spyre quantize ops, compiled path."""
-
-    pytestmark = skip_no_quantize_ops
 
     def setup_method(self):
         torch._dynamo.reset()
@@ -244,9 +255,7 @@ class TestFP8Correctness:
         assert not out.isinf().any(), "Inf in identity-weight output"
         torch.testing.assert_close(out, ref, atol=0.1, rtol=0.05)
 
-    @pytest.mark.skip(
-        reason="https://github.com/torch-spyre/torch-spyre/issues/4311: non-contiguous activation causes unsupported stick expression"
-    )
+    @_XFAIL_4311
     def test_noncontiguous_activation(self):
         """Non-contiguous activation (strides=(1,K)): quantize_fp8_with_scale on transposed view."""
         M, K, N = 16, 128, 128
@@ -272,9 +281,7 @@ class TestFP8Correctness:
         assert not out.isinf().any()
         torch.testing.assert_close(out, ref, atol=0.1, rtol=0.05)
 
-    @pytest.mark.skip(
-        reason="https://github.com/torch-spyre/torch-spyre/issues/4305: non-unit dynamic scale epilogue gives wrong output"
-    )
+    @_XFAIL_4305
     def test_safe_dynamic_scale(self):
         """Dynamic safe scale (amax-computed) for both sa and sw."""
         M, K, N = 16, 128, 128
@@ -299,8 +306,6 @@ class TestFP8Correctness:
 
 class TestFP8CanonicalShapes:
     """Canonical pipeline shapes from test_fp8_scaled_mm_cpu."""
-
-    pytestmark = skip_no_quantize_ops
 
     def setup_method(self):
         torch._dynamo.reset()
@@ -485,8 +490,6 @@ class TestFP8CanonicalShapes:
 class TestFP8ScaleSemantics:
     """Scale divide-in-quantize / multiply-in-post-mm duality: net effect is out ≈ a @ w."""
 
-    pytestmark = skip_no_quantize_ops
-
     def setup_method(self):
         torch._dynamo.reset()
 
@@ -541,9 +544,7 @@ class TestFP8ScaleSemantics:
         # Scale cancel-out duality: sa=sw=2.0 must match sa=sw=1.0
         torch.testing.assert_close(out_sa1, out_sa2, atol=0.1, rtol=0.05)
 
-    @pytest.mark.skip(
-        reason="https://github.com/torch-spyre/torch-spyre/issues/4305: non-unit dynamic scale epilogue gives wrong output"
-    )
+    @_XFAIL_4305
     def test_dynamic_safe_scale_from_data(self):
         """Data-driven scale via _safe_dynamic_scale (maps max→0.5, no FP16 overflow)."""
         M, K, N = 16, 128, 128
@@ -566,9 +567,7 @@ class TestFP8ScaleSemantics:
         assert not out.isinf().any()
         torch.testing.assert_close(out, ref, atol=0.1, rtol=0.05)
 
-    @pytest.mark.skip(
-        reason="https://github.com/torch-spyre/torch-spyre/issues/4305: non-unit dynamic scale epilogue gives wrong output"
-    )
+    @_XFAIL_4305
     def test_asymmetric_dynamic_scales(self):
         """Asymmetric dynamic scales: sa >> sw (3× vs 0.1× inputs), applied independently."""
         M, K, N = 16, 128, 128
@@ -592,11 +591,10 @@ class TestFP8ScaleSemantics:
         assert not out.isinf().any()
         torch.testing.assert_close(out, ref, atol=0.1, rtol=0.05)
 
-    @pytest.mark.skip(
-        reason="https://github.com/torch-spyre/torch-spyre/issues/4305: test expects scale-drop overflow but scale is now applied"
-    )
+    @_XFAIL_4305
     def test_amax_scale_fp16_pipeline(self):
-        """Amax-scale with K=128: K × 448² > FP16 max → NaN/Inf expected (documents overflow)."""
+        """Amax scale (max→448): the unscaled K-term FP8 product exceeds FP16 max, so the
+        output is finite only if the scales are applied before the FP16 store."""
         M, K, N = 16, 128, 128
         torch.manual_seed(7)
         a = torch.randn(M, K, dtype=FP16)
@@ -605,6 +603,7 @@ class TestFP8ScaleSemantics:
         sw_val = _amax_scale(w)
         sa = _st16(sa_val, DEVICE)
         sw = _st16(sw_val, DEVICE)
+        ref = _pipeline_ref(a, w, sa_val, sw_val, FP16)
         a, w = a.to(DEVICE), w.to(DEVICE)
 
         fn_c = _compile(_pipeline_fn)
@@ -612,11 +611,9 @@ class TestFP8ScaleSemantics:
 
         assert out.shape == (M, N)
         assert out.dtype == FP16
-        # When https://github.com/torch-spyre/torch-spyre/issues/4305 is fixed, re-evaluate: the
-        # sa×sw factor will reduce output magnitude and overflow may disappear.
-        assert out.isnan().any() or out.isinf().any(), (
-            "Expected FP16 overflow with amax scale — K × 448² > FP16 max (65504)"
-        )
+        assert not out.isnan().any()
+        assert not out.isinf().any()
+        torch.testing.assert_close(out, ref, atol=0.1, rtol=0.05)
 
     @pytest.mark.parametrize(
         "sa_val,sw_val,seed",
@@ -646,8 +643,6 @@ class TestFP8ScaleSemantics:
 
 class TestFP8AlignedShapes:
     """K%128==0 shape grid: irregular M, wide N, K=256, asymmetric sw — all K-aligned."""
-
-    pytestmark = skip_no_quantize_ops
 
     def setup_method(self):
         torch._dynamo.reset()
@@ -700,14 +695,10 @@ class TestFP8AlignedShapes:
 class TestFP8UnalignedShapes:
     """K%128!=0: insert_bmm_padding pads weight K to next multiple of 128."""
 
-    pytestmark = skip_no_quantize_ops
-
     def setup_method(self):
         torch._dynamo.reset()
 
-    @pytest.mark.skip(
-        reason="https://github.com/torch-spyre/torch-spyre/issues/4308: K%128!=0 causes dxp_standalone SIGABRT; K=64 scheduler fails"
-    )
+    @_XFAIL_4308
     def test_k64_hardcoded_scale(self):
         """K=64 (K%128=64), sa=sw=1.0: padding to K=128, value correctness vs oracle."""
         M, K, N = 16, 64, 128
@@ -725,9 +716,7 @@ class TestFP8UnalignedShapes:
         assert not out.isinf().any()
         torch.testing.assert_close(out, ref, atol=0.1, rtol=0.05)
 
-    @pytest.mark.skip(
-        reason="https://github.com/torch-spyre/torch-spyre/issues/4308: K%128!=0 causes dxp_standalone SIGABRT; K=16 scheduler fails"
-    )
+    @_XFAIL_4308
     def test_k16_hardcoded_scale(self):
         """K=16 (K%128=16), sa=sw=1.0: padding to K=128, value correctness vs oracle."""
         M, K, N = 16, 16, 128
@@ -745,9 +734,7 @@ class TestFP8UnalignedShapes:
         assert not out.isinf().any()
         torch.testing.assert_close(out, ref, atol=0.1, rtol=0.05)
 
-    @pytest.mark.skip(
-        reason="https://github.com/torch-spyre/torch-spyre/issues/4308: K%128!=0; K=2880 causes dxp_standalone SIGABRT"
-    )
+    @_XFAIL_4308
     def test_k2880_medium_unaligned(self):
         """K=2880 (K%128=64), sa=sw=1.0: padded 2880→2944, value correctness vs oracle."""
         M, K, N = 16, 2880, 2880
@@ -766,9 +753,7 @@ class TestFP8UnalignedShapes:
         torch.testing.assert_close(out, ref, atol=1.0, rtol=0.05)
 
     @pytest.mark.slow
-    @pytest.mark.skip(
-        reason="https://github.com/torch-spyre/torch-spyre/issues/4308: K%128!=0 causes dxp_standalone SIGABRT; K=4032 scheduler fails"
-    )
+    @_XFAIL_4308
     def test_k4032_large_padding(self):
         """@slow — K=4032 (K%128=64), padded 4032→4096, value correctness at production K."""
         M, K, N = 16, 4032, 4096
@@ -787,9 +772,7 @@ class TestFP8UnalignedShapes:
         torch.testing.assert_close(out, ref, atol=1.0, rtol=0.05)
 
     @pytest.mark.slow
-    @pytest.mark.skip(
-        reason="https://github.com/torch-spyre/torch-spyre/issues/4308: K%128!=0 causes dxp_standalone SIGABRT; K=3904 scheduler fails"
-    )
+    @_XFAIL_4308
     def test_k3904_large_padding(self):
         """@slow — K=3904 (K%128=64), padded 3904→3968, value correctness at production K."""
         M, K, N = 16, 3904, 4096
@@ -811,7 +794,7 @@ class TestFP8UnalignedShapes:
 class TestFP8LargeShapes:
     """Production LLM shapes (all @slow): M sweep at K=N=4096, Llama up_proj, Granite q_proj."""
 
-    pytestmark = [skip_no_quantize_ops, pytest.mark.slow]
+    pytestmark = pytest.mark.slow
 
     def setup_method(self):
         torch._dynamo.reset()
@@ -902,9 +885,7 @@ class TestFP8LargeShapes:
         assert not out.isinf().any()
         torch.testing.assert_close(out, ref, atol=1.0, rtol=0.05)
 
-    @pytest.mark.skip(
-        reason="https://github.com/torch-spyre/torch-spyre/issues/4311: non-contiguous activation causes unsupported stick expression"
-    )
+    @_XFAIL_4311
     def test_noncontiguous_activation_k4096(self):
         """@slow — non-contiguous activation (strides=(1,K)) at K=4096; extends K=128 TC."""
         M, K, N = 16, 4096, 4096
@@ -947,8 +928,6 @@ class TestFP8LargeShapes:
 
 class TestFP8Bias:
     """Bias epilogue: out = batchmatmulfp8(a, w) * sa * sw + bias, applied post-scale."""
-
-    pytestmark = skip_no_quantize_ops
 
     def setup_method(self):
         torch._dynamo.reset()
@@ -1058,9 +1037,7 @@ class TestFP8Bias:
         expected_diff = torch.full((M, N), bias_val)
         torch.testing.assert_close(diff, expected_diff, atol=0.1, rtol=0.0)
 
-    @pytest.mark.skip(
-        reason="https://github.com/torch-spyre/torch-spyre/issues/4305: non-unit dynamic scale epilogue gives wrong output"
-    )
+    @_XFAIL_4305
     def test_dynamic_asymmetric_scale_with_bias(self):
         """Dynamic asymmetric scales (a×3, w×0.1) + bias[N]: all three epilogues active."""
         M, K, N = 16, 128, 128
@@ -1089,8 +1066,6 @@ class TestFP8Bias:
 
 class TestFP8CompileIntegrity:
     """Compilation properties: fullgraph (no graph break), bit-identical repeated calls, fresh-recompile."""
-
-    pytestmark = skip_no_quantize_ops
 
     def setup_method(self):
         torch._dynamo.reset()
@@ -1178,8 +1153,6 @@ class TestFP8CompileIntegrity:
 
 class TestFP8OptionalParams:
     """Optional _scaled_mm params: scale_result/use_fast_accum accepted (no-op); FP32 out_dtype unsupported on Spyre."""
-
-    pytestmark = skip_no_quantize_ops
 
     def setup_method(self):
         torch._dynamo.reset()
@@ -1303,9 +1276,7 @@ class TestFP8UpstreamAPI:
     def setup_method(self):
         torch._dynamo.reset()
 
-    @pytest.mark.skip(
-        reason="https://github.com/torch-spyre/torch-spyre/issues/4310: upstream _scaled_mm with FP8 inputs causes SIGABRT in ddl_conversion"
-    )
+    @_XFAIL_4310
     def test_upstream_k128_unit_scale_fp16(self):
         """K=128, FP16 unit scale, uniform 0.25 FP8 inputs: exact output match."""
         M, K, N = 16, 128, 128
@@ -1327,8 +1298,12 @@ class TestFP8UpstreamAPI:
         assert not out.isnan().any()
         torch.testing.assert_close(out, ref, atol=0.0, rtol=0.0)
 
-    @pytest.mark.skip(
-        reason="https://github.com/torch-spyre/torch-spyre/issues/4310: upstream _scaled_mm SIGABRT; https://github.com/torch-spyre/torch-spyre/issues/4308: K=64 unaligned"
+    @pytest.mark.xfail(
+        strict=True,
+        raises=InductorError,
+        reason="https://github.com/torch-spyre/torch-spyre/issues/4310: raw FP8 weight "
+        "has no QFP8WT input, so the FP8 matmul cost model raises StopIteration; K=64 "
+        "then also hits https://github.com/torch-spyre/torch-spyre/issues/4308",
     )
     def test_upstream_k64_fp16_scale(self):
         """K=64 (K%128=64), FP16 scale: insert_bmm_padding pads 64→128, oracle correctness."""
@@ -1354,9 +1329,7 @@ class TestFP8UpstreamAPI:
         assert not out.isnan().any()
         torch.testing.assert_close(out, ref, atol=0.1, rtol=0.05)
 
-    @pytest.mark.skip(
-        reason="https://github.com/torch-spyre/torch-spyre/issues/4310: rowwise scales trigger split_multi_ops KeyError"
-    )
+    @_XFAIL_4310
     def test_upstream_rowwise_scale_shape(self):
         """Per-token scales [M,1]/[1,N] (torchao/vLLM pattern): documents Spyre acceptance."""
         M, K, N = 16, 128, 128
@@ -1380,15 +1353,14 @@ class TestFP8UpstreamAPI:
 
 
 class TestFP8Negative:
-    """Invalid inputs: dtype guard, swapped quantize ops, K-dim mismatch — all must raise."""
-
-    pytestmark = skip_no_quantize_ops
+    """Invalid inputs: dtype guard, swapped quantize ops — all must raise."""
 
     def setup_method(self):
         torch._dynamo.reset()
 
+    @expects_raise
     def test_non_fp8_mat1_dtype(self):
-        """FP16 mat1 (unquantized) passed to _scaled_mm: rejected by lower_scaled_mm dtype guard."""
+        """FP16 mat1 (unquantized) passed to _scaled_mm: rejected by PyTorch's dtype check."""
         M, K, N = 16, 128, 128
         a_fp16 = torch.rand(M, K, dtype=FP16, device=DEVICE)
         w_fp8 = _col_major(torch.rand(K, N, dtype=FP16).to(E4M3)).to(DEVICE)
@@ -1399,11 +1371,12 @@ class TestFP8Negative:
             return torch._scaled_mm(a, w, scale_a=sa, scale_b=sw, out_dtype=FP16)
 
         fn_c = _compile(_wrong_mat1_dtype)
-        with pytest.raises((RuntimeError, ValueError)):
+        with pytest.raises(RuntimeError, match="Expected both inputs to be fp8"):
             fn_c(a_fp16, w_fp8, sa, sw)
 
+    @expects_raise
     def test_swapped_quantize_ops(self):
-        """Swapped quantize ops (qfp8wt on activation, qfp8ch on weight): DDL layout mismatch."""
+        """Swapped quantize ops (qfp8wt on activation, qfp8ch on weight): rejected at compile."""
         M, K, N = 16, 128, 128
         a, w = _make_rand_inputs(M, K, N, seed=53, device=DEVICE)
         sa = _st16(1.0, DEVICE)
@@ -1417,28 +1390,14 @@ class TestFP8Negative:
             )
 
         fn_c = _compile(_swapped_ops_fn)
-        with pytest.raises(RuntimeError):
+        with pytest.raises(
+            InductorError, match="the matmul reduces over its stick dim"
+        ):
             fn_c(a, w, sa, sw)
-
-    def test_k_dimension_mismatch(self):
-        """(M,K1)@(K2,N) with K1≠K2: rejected by _check_scaled_mm_sizes at PyTorch API layer."""
-        M, K1, K2, N = 16, 128, 256, 128
-        a_fp8 = torch.full((M, K1), 0.25, dtype=FP16).to(E4M3).to(DEVICE)
-        w_fp8 = _col_major(torch.full((K2, N), 0.25, dtype=FP16).to(E4M3)).to(DEVICE)
-        sa = _st16(1.0, DEVICE)
-        sw = _st16(1.0, DEVICE)
-
-        fn_c = _compile(
-            lambda a, b, sa, sb: torch._scaled_mm(a, b, sa, sb, out_dtype=FP16)
-        )
-        with pytest.raises((RuntimeError, ValueError)):
-            fn_c(a_fp8, w_fp8, sa, sw)
 
 
 class TestFP8EagerMode:
     """FP8 pipeline stages in eager mode (no torch.compile): shape, dtype, and value checks."""
-
-    pytestmark = skip_no_quantize_ops
 
     def setup_method(self):
         torch._dynamo.reset()
