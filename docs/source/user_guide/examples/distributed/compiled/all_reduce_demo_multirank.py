@@ -31,7 +31,7 @@ def run_demo():
         # Pre-reduce computation
         y = t + t
 
-        # All-reduce (sum) across all ranks - lowered to allreduce_async
+        # All-reduce (sum) across all ranks - lowered to allreduce_run + wait_work
         y_reduced = torch.ops._c10d_functional.all_reduce(y, "sum", "default")
 
         # Independent computation (potential overlap with collective)
