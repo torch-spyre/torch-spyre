@@ -1839,5 +1839,141 @@ class TestForEachTileCarriedSumE2E(_DynamoResetTestCase):
                     )
 
 
+FP8_QK_B, FP8_QK_M, FP8_QK_D, FP8_QK_N, FP8_QK_PAGES = 8, 4, 128, 128, 2
+
+
+def fp8_qk_fn(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+    """FP8 Q @ K^T for one KV page: q [B, M, D], k [B, N, D] -> [B, M, N].
+
+    Both quantizations (qfp8ch through quantize_fp8_with_scale, and qfp8wt)
+    feed the batchmatmulfp8 directly.
+    """
+    s = torch.ops.spyre.quantscalepertokenfp8(q)
+    q8 = torch.ops.spyre.quantize_fp8_with_scale(q, s)
+    kt8 = torch.ops.spyre.qfp8wt(k.transpose(-2, -1).contiguous())
+    return torch.ops.spyre.scaled_bmm(q8, kt8, out_dtype=torch.float16) * s
+
+
+def fp8_qk_pages_fn(q: torch.Tensor, k_pages: torch.Tensor) -> torch.Tensor:
+    """fp8_qk_fn for every KV page, summed: the paged-attention shape of #5423.
+
+    q [B, M, D] is invariant; k_pages [PAGES, B, N, D] is cut into one page per
+    trip, so fp8_qk_fn's quantizations and matmul all run inside the body.
+    """
+    from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
+
+    def body(acc, tiles):
+        k_page, q_whole = tiles
+        return acc + fp8_qk_fn(q_whole, k_page.squeeze(0)), None
+
+    out, _ = for_each_tile(
+        body,
+        (k_pages, q),
+        dims=(0, None),
+        tile_size=1,
+        init=torch.zeros(
+            FP8_QK_B, FP8_QK_M, FP8_QK_N, dtype=torch.float16, device=q.device
+        ),
+    )
+    return out
+
+
+def fp8_qk_pages_reference(q: torch.Tensor, k_pages: torch.Tensor) -> torch.Tensor:
+    """CPU reference for fp8_qk_pages_fn, with the same fp8 roundings."""
+    from torch_spyre._inductor.constants import (
+        FP8_E4M3FN_MAX,
+        QUANTSCALEPERTOKENFP8_CLIP_MIN,
+    )
+
+    qf = q.float()
+    s = (qf.abs().amax(-1, keepdim=True) / FP8_E4M3FN_MAX).clamp(
+        min=QUANTSCALEPERTOKENFP8_CLIP_MIN
+    )
+    s = s.half().float()  # the device computes the scale in fp16
+    q8 = (qf / s).clamp(-FP8_E4M3FN_MAX, FP8_E4M3FN_MAX).to(torch.float8_e4m3fn)
+    out = torch.zeros(FP8_QK_B, FP8_QK_M, FP8_QK_N)
+    for page in k_pages:
+        kt8 = page.float().transpose(-2, -1).to(torch.float8_e4m3fn)
+        out += (q8.float() @ kt8.float()) * s
+    return out
+
+
+class TestForEachTileFp8BmmE2E(_DynamoResetTestCase):
+    """FP8 batched matmul inside a for_each_tile body (issue #5423).
+
+    Splicing the body adds loop origins (while_loop and its subgraph get_attr
+    nodes) ahead of each buffer's real op. propagate_layouts used to pick the
+    layout rule from the first origin, so qfp8ch and qfp8wt fell through to the
+    generic pointwise rule: STANDARD layouts with B, M or nothing on the
+    activation's stick and K on the weight's, which batchmatmulfp8 cannot read,
+    and the restickify planner raised "no mechanism to resolve stick
+    incompatibility".
+    """
+
+    # Loop vs the same compute without the loop, both on the device: the page
+    # results come from the same FP8 kernels, and the loop adds them into an
+    # fp16 carry. Each carry add rounds once to the device's fp16 (dl16, 10
+    # significant bits: 2^-9 relative); FP8_QK_PAGES = 2 trips give 2^-8.
+    LOOP_TOL = 2.0**-8
+    # Against the CPU reference the device FP8 matmul's own accumulation
+    # rounding remains (also present without a loop), so the tolerance is the
+    # one the scaled_bmm tests in test_inductor_ops.py use. Positive inputs, as
+    # there, keep outputs away from zero, where a relative tolerance has no
+    # slack.
+    REF_ATOL = 0.1
+    REF_RTOL = 0.1
+
+    def test_fp8_qk_per_kv_page(self):
+        q = cached_randn((FP8_QK_B, FP8_QK_M, FP8_QK_D), abs=True)
+        k_pages = cached_randn(
+            (FP8_QK_PAGES, FP8_QK_B, FP8_QK_N, FP8_QK_D), differentiation=1, abs=True
+        )
+        q_dev = q.to(DEVICE_NAME)
+
+        looped = torch.compile(fp8_qk_pages_fn, backend="inductor", fullgraph=True)
+        out = looped(q_dev, k_pages.to(DEVICE_NAME)).cpu().float()
+
+        per_page = torch.compile(fp8_qk_fn, backend="inductor", fullgraph=True)
+        no_loop = sum(
+            per_page(q_dev, page.to(DEVICE_NAME)).cpu().float() for page in k_pages
+        )
+
+        torch.testing.assert_close(out, no_loop, atol=self.LOOP_TOL, rtol=self.LOOP_TOL)
+        torch.testing.assert_close(
+            out,
+            fp8_qk_pages_reference(q, k_pages),
+            atol=self.REF_ATOL,
+            rtol=self.REF_RTOL,
+        )
+
+    def test_layout_dispatch_skips_loop_scaffold_origins(self):
+        """The rule is picked past loop origins, and only past them."""
+        import types
+
+        from torch_spyre._inductor.propagate_layouts import _layout_dispatch_target
+
+        g = torch.fx.Graph()
+        loop = g.call_function(torch.ops.higher_order.while_loop, ())
+        cond = g.get_attr("while_loop_cond_graph_0_0")
+        body = g.get_attr("while_loop_body_graph_0_0")
+        reshape = g.call_function(torch.ops.aten.reshape.default, ())
+        qfp8ch = g.call_function(torch.ops.spyre.qfp8ch.default, ())
+        special = (torch.ops.spyre.qfp8ch.default,)
+
+        def target(*origins):
+            data = types.SimpleNamespace(origins=origins)
+            return _layout_dispatch_target(data, special)
+
+        # A spliced body buffer: the special op wins over loop and view origins.
+        self.assertIs(
+            target(loop, cond, body, reshape, qfp8ch), torch.ops.spyre.qfp8ch.default
+        )
+        # Outside a loop body the first origin still decides, as before.
+        self.assertIs(target(reshape, qfp8ch), torch.ops.aten.reshape.default)
+        # Loop origins and no special op: unchanged, the first origin decides.
+        self.assertIs(target(loop, cond, reshape), torch.ops.higher_order.while_loop)
+        self.assertIsNone(target())
+
+
 if __name__ == "__main__":
     unittest.main()
