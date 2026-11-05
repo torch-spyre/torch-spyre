@@ -1203,16 +1203,10 @@ def _get_data_format(op, device_dtype):
 
     This is metadata relabeling only; the underlying 32-bit data is unchanged.
     Native integer add/mul (``addi32toi32`` / ``muli32toi32``) use SENUINT32
-    tensor descriptors in the SDSC DDL.  Identity retains its fp32 relabeling.
+    tensor descriptors in the SDSC DDL.
     """
-    if device_dtype == DataFormats.IEEE_INT32:
-        if op in SPYRE_INT32_OPS:
-            return DataFormats.SENUINT32
-        if op == IDENTITY_OP:
-            # In the long term, SDSC should accept int32 as the data format.
-            # Such re-labeling will become unnecessary.
-            # See backend issue deeptools#4307.
-            return DataFormats.IEEE_FP32
+    if device_dtype == DataFormats.IEEE_INT32 and op in SPYRE_INT32_OPS:
+        return DataFormats.SENUINT32
     return device_dtype
 
 
@@ -1220,9 +1214,8 @@ def _get_sdsc_spec_data_format(op, arg_data_format):
     """Return the SDSC compute format for an operation.
 
     dtype-conversion ops (fp32↔int32) and native int32 ops (addi32toi32,
-    muli32toi32) must report IEEE_FP32 as the SDSC spec's compute format;
-    all other ops pass the tensor format through unchanged.
-    See backend issue deeptools#4307.
+    muli32toi32) are bound to IEEE_FP32.  All other ops pass the tensor
+    format through unchanged.
     """
     if op in (FP32TOINT32_OP, INT32TOFP32_OP, *SPYRE_INT32_OPS):
         return DataFormats.IEEE_FP32
@@ -1750,7 +1743,7 @@ def _create_sdsc_tensors(
             )
 
         # Index tensors carry 32-bit integer indices; re-label as SENUINT32 since
-        # the backend doesn't yet accept IEEE_INT32 in SDSC (deeptools #4307).
+        # the backend's gather index conversion requires SENUINT32.
         arg_data_format = (
             DataFormats.SENUINT32
             if (has_indirect_access and i in index_tensor_indices)
@@ -2401,7 +2394,16 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             for pos, coord in enumerate(out_arg.device_coordinates[:-1]):
                 if coord.free_symbols == {entry_c}:
                     entry_mb = symbol_mapping.get(entry_c)
-                    dev = int(out_arg.device_size[pos])
+                    # Never iterate past the index's allocated entries: the padding
+                    # lanes past them are uninitialized and read as indices.
+                    idx_pos = next(
+                        i
+                        for i, c in enumerate(idx_arg.device_coordinates[:-1])
+                        if c.free_symbols == {entry_c}
+                    )
+                    idx_eps = idx_arg.device_dtype.elems_per_stick()
+                    idx_extent = int(idx_arg.device_size[idx_pos]) * idx_eps
+                    dev = min(int(out_arg.device_size[pos]), idx_extent)
                     if (
                         entry_mb in sdsc_iteration_space
                         and dim_splits[entry_mb] > 1
