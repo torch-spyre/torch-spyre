@@ -28,7 +28,10 @@ capture-only via check(expect=CRASHED); there is no bundle to run end-to-end.
 import os
 import sys
 
+import pytest
 import torch
+from torch._dynamo.exc import BackendCompilerFailed
+from torch._inductor.exc import InductorError
 from torch._inductor.utils import run_and_get_code
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -39,6 +42,7 @@ from indirect_access_common import (  # noqa: E402
     DIRECT_OP_SPEC,
     register_multicore_variants,
 )
+from utils_inductor import expects_raise  # noqa: E402
 
 from torch_spyre._C import (  # noqa: E402
     SpyreTensorLayout,
@@ -50,6 +54,10 @@ from torch_spyre._C import (  # noqa: E402
 # The backend scheduler's rejection of a scatter bundle (#4409), as it appears in
 # the BackendCompilerFailed message.
 _INDEX_STICK_DIM_ERROR = "Expect index stick dim to be innermost in chunk loop order"
+
+# dbo-opt's rejection of a full-rank torch.scatter index on a non-leading dim of a
+# 5-D destination (GatherIndexConversion.cpp), as it appears in the compile error.
+_GATHER_INDEX_CONVERSION_ERROR = r"fmod\(dsDim, size\) == 0"
 
 
 class _ScatterScenarios:
@@ -303,6 +311,39 @@ class _ScatterScenarios:
             expect=SCATTER_OP_SPEC,
             expect_backend_error=_INDEX_STICK_DIM_ERROR,
         )
+
+    @expects_raise
+    def test_scatter_5d_dim2(self):
+        """torch.scatter(out, 2, index, src) on a 5-D destination, full-rank index.
+
+        out[2,4,8,16,64], src[2,4,3,16,64], and an int64 index with src's shape
+        whose entries along dim 2 are 3 unique rows (constant over every other
+        dim, so there is no write collision). The frontend reaches a scatter op
+        spec, then dbo-opt rejects the bundle. The same compile with a 1-D index
+        (index_copy_ / index_put, see test_index_copy_5d_each_dim_e2e) works.
+        """
+        shape, P = (2, 4, 8, 16, 64), 3
+        src_shape = (*shape[:2], P, *shape[3:])
+        out = torch.zeros(shape, dtype=torch.float16).to("spyre")
+        src = torch.rand(src_shape, dtype=torch.float16).to("spyre")
+        rows = torch.randperm(shape[2], dtype=torch.int64)[:P]
+        index = rows.view(1, 1, P, 1, 1).expand(src_shape).contiguous().to("spyre")
+
+        def kernel(out, src, index):
+            return torch.scatter(out, 2, index, src)
+
+        self.check(kernel, out, src, index, expect=SCATTER_OP_SPEC)
+
+        # TODO: a full-rank torch.scatter index does not compile (dbo-opt asserts in
+        # GatherIndexConversion.cpp; torch.gather with a 2-D index fails the same
+        # way, see test_torch_gather). Cite the open issue here, and once it is
+        # fixed turn this into a positive test that compares with the CPU result.
+        torch._dynamo.reset()
+        with pytest.raises(
+            (BackendCompilerFailed, InductorError),
+            match=_GATHER_INDEX_CONVERSION_ERROR,
+        ):
+            torch.compile(kernel, dynamic=False)(out, src, index)
 
     def test_scatter_method_without_unary(self):
         """out.scatter_(0, index, src) -- in-place method form without a unary."""
@@ -668,6 +709,50 @@ class _ScatterScenarios:
             return y
 
         self._assert_compiled_matches_cpu(kernel, y, src, idx)
+
+    # ===== 5-D scatter on each non-stick dim =====
+    # No 5-D coverage existed; these extend the 4-D index_put/index_copy_ cases
+    # by one rank. The last dim (64) is one full fp16 stick and is not indexed.
+    _SCATTER_5D_SHAPE = (8, 4, 8, 16, 64)
+    _SCATTER_5D_P = 3  # rows written along the indexed dim
+
+    def _scatter_5d_operands(self, dim):
+        """y[8,4,8,16,64] zeros, src with size P on `dim`, unique int64 idx[P]."""
+        shape = self._SCATTER_5D_SHAPE
+        P = self._SCATTER_5D_P
+        src_shape = list(shape)
+        src_shape[dim] = P
+        y = torch.zeros(shape, dtype=torch.float16).to("spyre")
+        src = torch.rand(src_shape, dtype=torch.float16).to("spyre")
+        # Unique rows: repeated indices have no defined winner.
+        idx = torch.randperm(shape[dim], dtype=torch.int64)[:P].to("spyre")
+        return y, src, idx
+
+    def test_index_copy_5d_each_dim_e2e(self):
+        """y.index_copy_(dim, idx, src) on a 5-D destination, dim 0..3."""
+        for dim in range(4):
+            with self.subTest(dim=dim):
+                torch._dynamo.reset()
+                y, src, idx = self._scatter_5d_operands(dim)
+
+                def kernel(y, src, idx, dim=dim):
+                    y.index_copy_(dim, idx, src)  # index_copy needs int64
+                    return y
+
+                self._assert_compiled_matches_cpu(kernel, y, src, idx)
+
+    def test_index_put_5d_each_dim_e2e(self):
+        """y[:, ..., idx] = src on a 5-D destination, indexing dim 0..3."""
+        for dim in range(4):
+            with self.subTest(dim=dim):
+                torch._dynamo.reset()
+                y, src, idx = self._scatter_5d_operands(dim)
+
+                def kernel(y, src, idx, dim=dim):
+                    y[(slice(None),) * dim + (idx,)] = src
+                    return y
+
+                self._assert_compiled_matches_cpu(kernel, y, src, idx)
 
     # ===== index_add: gather + add + overwrite-scatter decomposition =====
     # aten.index_add lowers (spyre_index_add in decompositions.py) to
@@ -1062,6 +1147,40 @@ class _ScatterScenarios:
             return out.index_put_((idx,), src, accumulate=True)
 
         self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC)
+
+    def _row_scatter_add_bf16_operands(self, M=128, N=64, P=4):
+        """2-D row scatter in bf16: dst[M,N] zeros, src[P,N], 1-D int32 idx[P].
+
+        Indexed along dim 0, contiguous along dim 1 (the stick dim; N=64 is one
+        full 16-bit stick). idx is arange(P), so rows are unique and the result
+        does not depend on accumulation order.
+        """
+        dst = torch.zeros(M, N, dtype=torch.bfloat16).to("spyre")
+        src = torch.randn(P, N, dtype=torch.bfloat16).to("spyre")
+        idx = torch.arange(P, dtype=torch.int32).to("spyre")
+        self.name_dims(dst, {"M": M, "N": N})
+        self.name_dims(src, {"P": P, "N": N})
+        self.name_dims(idx, {"P": P})
+        return dst, src, idx
+
+    def test_index_add_2d_row_bf16(self):
+        """torch.index_add(dst, 0, idx, src) on a 2-D bf16 [128, 64] destination."""
+        dst, src, idx = self._row_scatter_add_bf16_operands()
+
+        def kernel(dst, src, idx):
+            return torch.index_add(dst, 0, idx, src)
+
+        self._stage_and_e2e(kernel, dst, src, idx, expect=SCATTER_OP_SPEC, sdsc=False)
+
+    def test_index_put_accumulate_2d_row_bf16(self):
+        """dst.index_put_((idx,), src, accumulate=True) on a 2-D bf16 [128, 64]
+        destination."""
+        dst, src, idx = self._row_scatter_add_bf16_operands()
+
+        def kernel(dst, src, idx):
+            return dst.index_put_((idx,), src, accumulate=True)
+
+        self._stage_and_e2e(kernel, dst, src, idx, expect=SCATTER_OP_SPEC)
 
     def test_scatter_add_functional(self):
         """torch.scatter_add(out, 0, index, src) -- functional accumulating scatter."""
