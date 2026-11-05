@@ -61,7 +61,7 @@ DELETE FROM test_case_runs WHERE audit_uuid IN (SELECT audit_uuid FROM case_outc
 
 DELETE FROM run_case_counters WHERE run_id IN (SELECT DISTINCT run_id FROM case_outcome_dups);
 
-INSERT INTO run_case_counters
+INSERT INTO run_case_counters (run_id, component, total_tests, passed, failed, errors, skipped, xfail, xpass)
 SELECT
     run_id,
     component,

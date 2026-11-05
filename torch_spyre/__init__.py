@@ -138,10 +138,14 @@ class _SpyreImpl:
         return default_generator.initial_seed()
 
     def is_available(self) -> bool:
+        # A process that doesn't own the card (forked, or started with
+        # IS_INDUCTOR_SPAWNED_SUBPROCESS=1) never starts the runtime, so it has
+        # no usable device. Reporting one makes torch.accelerator callers (e.g.
+        # Dynamo's stream tracking on every compile) reach stream code that
+        # needs the runtime, and the process aborts even for CPU-only code.
         if self._is_in_bad_fork():
-            return True
-        else:
-            return self.device_count() > 0
+            return False
+        return self.device_count() > 0
 
     def is_initialized(self):
         return self._initialized and not self._is_in_bad_fork()
@@ -189,6 +193,11 @@ def make_spyre_module() -> types.ModuleType:
     mod.device_count = lambda: impl.device_count()
     mod.current_device = lambda: impl.current_device()
     mod.set_device = lambda idx: impl.set_device(idx)
+    from torch_spyre._sharded_api import is_sharded, sharding_info, to_sharded
+
+    mod.to_sharded = to_sharded
+    mod.is_sharded = is_sharded
+    mod.sharding_info = sharding_info
     mod._is_compiled = lambda: True
     mod.memory = memory
     # Public profiler API (eagerly imported above); avoid private _ffdc import.
@@ -366,11 +375,7 @@ def _autoload_impl():
         _orig_init = torch.profiler.profile.__init__
 
         def _init_with_spyre_profiler(self, *args, **kwargs):
-            # For first call, need to ensure torch_spyre._C is loaded so that SpyreProfiler is registered
-            if not torch.spyre.is_initialized():
-                torch.spyre._impl._lazy_init()
             try:
-                # This will automatically register the profiler
                 import torch_spyre._C  # noqa: F401
             except ImportError:
                 pass

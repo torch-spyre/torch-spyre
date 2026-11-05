@@ -32,9 +32,14 @@ from torch._inductor.ir import (
     TensorBox,
 )
 from torch._inductor.virtualized import V
-from torch_spyre._C import SpyreTensorLayout
+from torch_spyre._C import SpyreTensorLayout, get_device_size_in_bytes
+from .constants import (
+    RESTICKIFY_DEVICE_DTYPE_COST_WEIGHT,
+    RESTICKIFY_SUPPORTED_DEVICE_DTYPES,
+)
 from .pass_utils import (
     compute_restickify_needed,
+    compute_size1_restickify_target,
     device_coordinates,
     host_coordinates,
 )
@@ -45,33 +50,25 @@ logger = get_inductor_logger("optimize_restickify")
 
 
 class EdgeCostMap:
-    """Lazy cost table mapping (in_layout, target_layout) -> restick cost for one op input.
+    """Lazy cost table mapping (in_stl, out_stl) -> restick cost for one op input.
 
-    Entries are computed on demand by compute_restickify_needed. `dep` is the
-    MemoryDep for this input; it is not used locally but is forwarded to
-    compute_restickify_needed in pass_utils. ``require_exact`` makes physical
-    layout equality, rather than ordinary stick compatibility, the zero-cost
-    condition for this edge.
+    target_dep is the dep whose host layout drives the output target passed to
+    compute_restickify_needed. Entries are computed on demand and cached.
     """
 
     def __init__(
         self,
         dep: "MemoryDep",
         in_layouts: list,
-        target_layouts: list,
         target_dep: "MemoryDep",
         op,
         forbidden_stick_sym: "sympy.Symbol | None" = None,
-        require_exact: bool = False,
     ):
         self.dep = dep
         self._op = op
         self._in_layouts = in_layouts
-        self._target_layouts = target_layouts
         self._target_dep = target_dep
-        self._require_exact = require_exact
         self._dep_layout = V.graph.get_buffer(dep.name).get_layout()
-        self._target_dep_layout = V.graph.get_buffer(target_dep.name).get_layout()
         self._forbidden_stick_sym = forbidden_stick_sym
 
         # _cost and _layout are parallel maps.
@@ -94,29 +91,38 @@ class EdgeCostMap:
     ) -> None:
         """Populate _cost and _layout for (in_stl, target_stl).
 
-        Cost is 0 if compatible, the input element count if restickifiable, or INF if infeasible.
+        Cost is 0 if stick-compatible, the input device size in bytes weighted by the
+        device dtype (RESTICKIFY_DEVICE_DTYPE_COST_WEIGHT; 32-bit formats cost 2x fp16
+        per byte) if restickifiable, or INF if infeasible.
         _layout stores:
           None               — compatible, no restickify needed
           INFEASIBLE         — restickify needed but compute_restickify_target_layout returned None
           SpyreTensorLayout  — feasible restickify target layout
         """
         needed, tgt = compute_restickify_needed(
-            in_stl,
-            self._dep_layout,
-            self.dep,
-            target_stl,
-            self._target_dep,
-            self._op,
-            require_exact=self._require_exact,
+            in_stl, self._dep_layout, self.dep, target_stl, self._target_dep, self._op
         )
         if not needed and self._forbidden_stick_sym is not None:
             stick_expr = device_coordinates(in_stl, self.dep, None)[-1]
             if self._forbidden_stick_sym in stick_expr.free_symbols:
                 # Input stick contains a forbidden symbol (e.g. topk reduction
-                # var): this pairing is invalid even though stick_compatible
-                # accepted it. Mark as infeasible so the optimizer is forced to
-                # pick a different input candidate or output STL.
-                needed, tgt = True, None
+                # var): invalid even though stick_compatible accepted it, because
+                # the output stick is synthetic (zero) and carries no input var.
+                # Restickify the input onto a size-1 dim to move the var off the
+                # stick. tgt must either move the stick off the forbidden symbol
+                # or stay None, which is INFEASIBLE below; a target whose stick
+                # still carries the symbol is rejected rather than trusted.
+                needed = True
+                if in_stl.device_dtype in RESTICKIFY_SUPPORTED_DEVICE_DTYPES:
+                    tgt = compute_size1_restickify_target(
+                        in_stl, self._dep_layout, self.dep, self._op
+                    )
+                    if (
+                        tgt is not None
+                        and self._forbidden_stick_sym
+                        in device_coordinates(tgt, self.dep, None)[-1].free_symbols
+                    ):
+                        tgt = None
         if not needed:
             cost = 0.0
             self._layout[in_stl][target_stl] = None
@@ -124,7 +130,10 @@ class EdgeCostMap:
             cost = INF  # infeasible restickify
             self._layout[in_stl][target_stl] = EdgeCostMap.INFEASIBLE
         else:
-            cost = float(math.prod(in_stl.device_size))
+            cost = float(
+                get_device_size_in_bytes(in_stl)
+                * RESTICKIFY_DEVICE_DTYPE_COST_WEIGHT[in_stl.device_dtype]
+            )
             self._layout[in_stl][target_stl] = tgt
         self._cost[in_stl][target_stl] = cost
 
@@ -164,7 +173,7 @@ class RestickNodeCost(abc.ABC):
 
     @abc.abstractmethod
     def cost(
-        self, in_layouts: "list[SpyreTensorLayout]", out_stl: "SpyreTensorLayout"
+        self, in_layouts: "dict[str, SpyreTensorLayout]", out_stl: "SpyreTensorLayout"
     ) -> float: ...
 
     @abc.abstractmethod
@@ -232,9 +241,7 @@ class AllSameNode(RestickNodeCost):
         out_dep = out_deps[0]  # reference output dep for stick-compatibility checks
         co_output_deps = out_deps[1:]
         input_edge_costs = [
-            EdgeCostMap(
-                arg.dep, arg.layouts, out_layouts, out_dep, op, forbidden_stick_sym
-            )
+            EdgeCostMap(arg.dep, arg.layouts, out_dep, op, forbidden_stick_sym)
             for arg in args
         ]
         output_edge_costs = [
@@ -246,7 +253,6 @@ class AllSameNode(RestickNodeCost):
                 # list here would cause min_input_cost to return INF for all
                 # beam states with no useful error message.
                 getattr(V.graph.get_buffer(dep.name), "layouts", []),
-                out_layouts,
                 out_dep,
                 op,
             )
@@ -260,21 +266,18 @@ class AllSameNode(RestickNodeCost):
         self._output_edge_costs = output_edge_costs or []
 
     def cost(
-        self, in_layouts: "list[SpyreTensorLayout]", out_stl: "SpyreTensorLayout"
+        self, in_layouts: "dict[str, SpyreTensorLayout]", out_stl: "SpyreTensorLayout"
     ) -> float:
         input_cost = sum(
-            ec.cost(lk, out_stl)
-            for ec, lk in zip(
-                self._input_edge_costs, in_layouts[: len(self._input_edge_costs)]
-            )
+            ec.cost(in_layouts[ec.dep.name], out_stl) for ec in self._input_edge_costs
         )
         if input_cost >= INF:
             return INF
         # Co-output edges: the shared buffer must have the exact same STL as this op's
         # output. Any mismatch means two mutation ops write the same buffer with different
         # layouts, which is always wrong — cost INF, not a restickify.
-        co_offset = len(self._input_edge_costs)
-        for ec, lk in zip(self._output_edge_costs, in_layouts[co_offset:]):
+        for ec in self._output_edge_costs:
+            lk = in_layouts.get(ec.dep.name)
             if lk is not None and lk != out_stl:
                 return INF
         return input_cost
@@ -285,13 +288,18 @@ class AllSameNode(RestickNodeCost):
     def min_input_cost(self, dep_name, in_stl, out_stl):
         # next() takes the first match; if dep_name appears twice (x+x), both edges
         # are identical so the cost is the same either way.
-        ec = next(e for e in self.edge_costs if e.dep.name == dep_name)
+        # Co-output deps are not in _input_edge_costs; the DP may call us with one
+        # when it walks edge_costs, which includes co-output entries. Cost is 0: the
+        # co-output layout constraint is enforced in cost(), not here.
+        ec = next((e for e in self._input_edge_costs if e.dep.name == dep_name), None)
+        if ec is None:
+            return 0.0
         edge_c = ec.cost(in_stl, out_stl)
         if edge_c == INF:
             return INF
         other_ok = all(
             any(e.cost(other_c, out_stl) < INF for other_c in e._in_layouts)
-            for e in self.edge_costs
+            for e in self._input_edge_costs
             if e.dep.name != dep_name
         )
         return edge_c if other_ok else INF
@@ -316,19 +324,11 @@ class FixedInOutNode(RestickNodeCost):
         self._out_host = V.graph.get_buffer(out_dep.name).get_layout()
 
     @classmethod
-    def from_args(cls, args, out_stl, req_stls, op, out_dep, exact_input_indices=None):
+    def from_args(cls, args, out_stl, req_stls, op, out_dep):
         assert req_stls, "FixedInOutNode.from_args: req_stls is empty"
-        exact_input_indices = exact_input_indices or set()
         edge_costs = [
-            EdgeCostMap(
-                arg.dep,
-                arg.layouts,
-                [req],
-                arg.dep,
-                op,
-                require_exact=i in exact_input_indices,
-            )
-            for i, (arg, req) in enumerate(zip(args, req_stls))
+            EdgeCostMap(arg.dep, arg.layouts, arg.dep, op)
+            for arg, req in zip(args, req_stls)
         ]
         return cls(
             edge_costs,
@@ -352,13 +352,13 @@ class FixedInOutNode(RestickNodeCost):
         return not needed
 
     def cost(
-        self, in_layouts: "list[SpyreTensorLayout]", out_stl: "SpyreTensorLayout"
+        self, in_layouts: "dict[str, SpyreTensorLayout]", out_stl: "SpyreTensorLayout"
     ) -> float:
         if not self._out_stick_compatible(out_stl):
             return INF
         return sum(
-            ec.cost(lk, rk)
-            for ec, lk, rk in zip(self.edge_costs, in_layouts, self.required_in_stls)
+            ec.cost(in_layouts[ec.dep.name], rk)
+            for ec, rk in zip(self.edge_costs, self.required_in_stls)
         )
 
     def required_input_stls(self, out_stl):
@@ -397,7 +397,7 @@ class AnyInNode(RestickNodeCost):
         return cls(edge_costs=[])
 
     def cost(
-        self, in_layouts: "list[SpyreTensorLayout]", out_stl: "SpyreTensorLayout"
+        self, in_layouts: "dict[str, SpyreTensorLayout]", out_stl: "SpyreTensorLayout"
     ) -> float:
         return 0.0
 
@@ -612,11 +612,6 @@ def _reorder_any_in_nodes(operations: list) -> list:
             if insert_before == i:
                 result.append(moved_ops[old_pos])
         result.append(op)
-    # Handle any ops targeted past the end.
-    for old_pos, insert_before in sorted(to_move.items()):
-        if insert_before >= len(operations):
-            result.append(moved_ops[old_pos])
-
     return result
 
 
@@ -716,8 +711,7 @@ def beam_global_min_cost(operations: list) -> None:
     # have zero cost when STLs match, and SpyreEmptyFallback has all valid STLs
     # as candidates, so the future-min-cost estimate is never pessimistic in a
     # way that causes incorrect pruning. Last-use liveness is also correct — the
-    # fallback should stay live until its last writer. A cleaner fix would
-    # exclude co-output deps from the base class edge_costs; cleanup is coming.
+    # fallback should stay live until its last writer.
     future_min_cost = compute_future_min_cost(operations)
 
     step_of: dict[str, int] = {}
@@ -779,7 +773,7 @@ def beam_global_min_cost(operations: list) -> None:
         op_future = future_min_cost.get(op.get_name(), {})
         next_states = []
         for state in frontier.states:
-            in_layouts = [frontier.input_stl(state, dep.name) for dep in deps]
+            in_layouts = {dep.name: frontier.input_stl(state, dep.name) for dep in deps}
 
             for candidate_stl in op.layouts:
                 extra_cost = cost_fn.cost(in_layouts, candidate_stl)

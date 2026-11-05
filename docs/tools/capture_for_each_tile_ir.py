@@ -13,8 +13,7 @@
 # limitations under the License.
 """Capture real IR/OpSpec/bundle.mlir for the coarse-tiling loops doc's
 `for_each_tile` small example: `y = a + b; z = y * c`, tiled along dim 0
-with `for_each_tile`, the direct-loop-info analog of
-`capture_coarse_tile_ir.py`'s `spyre_hint`-driven example.
+with `for_each_tile`.
 
 See docs/tools/README.md for usage. In short:
 

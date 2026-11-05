@@ -4,5 +4,6 @@
 # in "/". Read by filter_configs.py (--flags-map) when building the CI matrix.
 
 # Every model-ops test is xfail by config: an xfail IS the "not implemented" verdict these
-# suites record, so trunk's `-m "not xfail"` would deselect all of them.
+# suites record, so a caller's `-m "not xfail"` (build_test_pytorch_source.yaml still passes
+# one) would deselect all of them.
 model_ops_tests/: -v

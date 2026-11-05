@@ -38,8 +38,10 @@ from .spyre_kernel import SpyreKernel
 from .ir import FixedTiledLayout
 from .pass_utils import iteration_space
 from .logging_utils import get_inductor_logger
+from .loop_facts import scheduler_enclosing_loops
 from .scratchpad.lx_relayout import (
     demote_lx_relayout_group,
+    local_lx_emission_contract,
     materialized_lx_relayout_for_destination,
 )
 from .op_spec import LoopSpec
@@ -96,13 +98,20 @@ class CountedLoopSchedulerNode(FusedSchedulerNode):
 
 
 def _loop_group_id(node: BaseSchedulerNode):
-    """Return the loop_group_id of the ir.Operation inside node, or None."""
-    for snode in node.get_nodes():
-        if isinstance(snode, SchedulerNode) and snode.node is not None:
-            loop_info = getattr(snode.node, "loop_info", None)
-            if loop_info is not None:
-                return loop_info.loop_group_id
-    return None
+    """The normalized ``loop_group_id`` tuple of the loop ``node`` is a member
+    of, or None.
+
+    A ``CountedLoopSchedulerNode`` (which includes the ``LoopSchedulerNode``
+    that a ``LoopNode`` becomes) is already a loop group, not a member of
+    another loop, so it gives None. Its first leaf carries the loop's own
+    ``loop_info``; reading that would make ``build_loop_scheduler_nodes``
+    wrap the structured node a second time, a nested ``LoopSpec`` that runs
+    the body ``trip_count`` squared times.
+    """
+    if isinstance(node, CountedLoopSchedulerNode):
+        return None
+    levels = scheduler_enclosing_loops(node)
+    return levels[-1].group_path if levels else None
 
 
 def _loop_count(node: BaseSchedulerNode, depth: int) -> sympy.Expr:
@@ -110,26 +119,16 @@ def _loop_count(node: BaseSchedulerNode, depth: int) -> sympy.Expr:
 
     ``loop_count`` on the ir.Operation is a list of trip counts, one per
     nesting level from outermost to innermost (stamped by
-    coarse_tile_pre_stickify()/coarse_tile_post_stickify()).
+    coarse_tile_post_stickify() or the for_each_tile lowering).
     ``depth`` is the absolute nesting depth being queried (0 = outermost).
 
     For a flat (depth-1) op, ``loop_count = [K]`` and only depth 0 is valid.
     For a nested op with ``loop_group_id = (g, 0)``, ``loop_count = [K1, K2]``
     and depth 0 → K1, depth 1 → K2.
     """
-    for snode in node.get_nodes():
-        if isinstance(snode, SchedulerNode) and snode.node is not None:
-            loop_info = getattr(snode.node, "loop_info", None)
-            if loop_info is not None:
-                counts: list = loop_info.loop_count
-                gid = loop_info.loop_group_id
-                # coarse_tile stamps one count per nesting level, so
-                # len(counts) == len(gid) always holds.
-                assert len(counts) == len(gid), (
-                    f"loop_count length {len(counts)} != loop_group_id depth {len(gid)}"
-                )
-                if 0 <= depth < len(counts):
-                    return counts[depth]
+    levels = scheduler_enclosing_loops(node)
+    if 0 <= depth < len(levels):
+        return levels[depth].trip_count
     raise AssertionError(f"Node {node.get_name()} has no loop_count for depth {depth}")
 
 
@@ -307,7 +306,12 @@ def build_loop_scheduler_nodes(
     seen: dict[tuple, str] = {}
     for node in result:
         if isinstance(node, CountedLoopSchedulerNode):
-            gid = _loop_group_id(node.get_nodes()[0])
+            # The member's own levels, not _loop_group_id: that is None for a
+            # nested loop node, which can be the first member.  A structured
+            # LoopSchedulerNode passed through is checked the same way, so a
+            # flat op of the same loop left outside it is caught here.
+            levels = scheduler_enclosing_loops(node.get_nodes()[0])
+            gid = levels[-1].group_path if levels else None
             if gid is not None:
                 key = gid[0:1]
                 name = node.get_name()
@@ -432,106 +436,6 @@ def prepare_spyre_kernels(
     )
 
 
-def verify_carried_reduction_ownership(
-    nodes: list[BaseSchedulerNode],
-) -> list[BaseSchedulerNode]:
-    """Require carried-reduction stages and their committed LX ownership to survive.
-
-    Kernel preparation already proved each access against the physical view.
-    After HBM-pool planning, check that the stages, accesses, and view still exist.
-    """
-
-    grouped: dict[object, dict[str, SchedulerNode]] = {}
-    for node in _all_scheduler_nodes(nodes):
-        record = getattr(node.node, "_carried_reduction_record", None)
-        if record is not None:
-            grouped.setdefault(record, {})[node.get_name()] = node
-
-    for record, by_name in grouped.items():
-        expected_names = {
-            record.fill_name,
-            record.combine_name,
-            record.drain_name,
-        }
-        missing = expected_names - by_name.keys()
-        if missing:
-            raise Unsupported(
-                "carried reduction lost physical stages after fusion: "
-                f"accumulator={record.accumulator_name}, missing={sorted(missing)}"
-            )
-
-        accumulator = V.graph.try_get_buffer(record.accumulator_name)
-        if accumulator is None:
-            raise Unsupported(
-                f"carried reduction accumulator {record.accumulator_name} is missing"
-            )
-        layout = accumulator.get_layout()
-        if not isinstance(layout, FixedTiledLayout):
-            raise Unsupported(
-                f"carried reduction accumulator {record.accumulator_name} has "
-                f"non-device layout {type(layout).__name__}"
-            )
-        if "lx" not in layout.allocation:
-            logger.info(
-                "carried reduction %s remained in HBM; execution is correct but "
-                "the persistent-LX performance contract was not realized",
-                record.accumulator_name,
-            )
-            continue
-
-        checks = (
-            (record.fill_name, "write"),
-            (record.combine_name, "read"),
-            (record.combine_name, "write"),
-            (record.drain_name, "read"),
-        )
-        if layout.lx_view is None:
-            raise Unsupported(
-                f"carried reduction accumulator {record.accumulator_name} has "
-                "an LX address but no physical ownership"
-            )
-        for op_name, access in checks:
-            node = by_name[op_name]
-            deps = (
-                node.read_writes.reads if access == "read" else node.read_writes.writes
-            )
-            dep = next(
-                (
-                    candidate
-                    for candidate in deps
-                    if isinstance(candidate, MemoryDep)
-                    and candidate.name == record.accumulator_name
-                ),
-                None,
-            )
-            if dep is None and access == "write" and op_name == record.combine_name:
-                # MutationLayout's scheduled write is named after the combine
-                # op, while its storage target is the carried accumulator.
-                memory_deps = [
-                    candidate for candidate in deps if isinstance(candidate, MemoryDep)
-                ]
-                dep = memory_deps[0] if len(memory_deps) == 1 else None
-            if dep is None and access == "read" and op_name == record.drain_name:
-                # Mutation propagation names this dependency after the latest
-                # in-place writer, but it still reads the accumulator storage.
-                memory_deps = [
-                    candidate for candidate in deps if isinstance(candidate, MemoryDep)
-                ]
-                dep = memory_deps[0] if len(memory_deps) == 1 else None
-            if dep is None:
-                raise Unsupported(
-                    f"carried reduction {op_name} lost its {access} of "
-                    f"{record.accumulator_name}; deps="
-                    f"{[(type(candidate).__name__, candidate.name) for candidate in deps]}"
-                )
-            # The row decision was made by carried_reduction_pinned_row before
-            # placement. Kernel preparation above already proved this
-            # stage can consume the committed physical view. Do not recreate a
-            # symbol correspondence from post-scheduler loop position here.
-
-    return nodes
-
-
 class SuperDSCScheduling(BaseScheduling):
     """Inductor scheduling backend for Spyre.
 
@@ -647,6 +551,9 @@ class SuperDSCScheduling(BaseScheduling):
         # _codegen_into_kernel may reach further inner nodes, so the set can be a
         # subset -- which errs towards declining.
         kernel.fused_node_names = OrderedSet(n.get_name() for n in nodes)
+        kernel.local_read_contract_factory = lambda name, consumer: (
+            local_lx_emission_contract(V.graph, name, consumer)
+        )
         with kernel:
             self._codegen_into_kernel(nodes, kernel)
         if isinstance(node, CountedLoopSchedulerNode):

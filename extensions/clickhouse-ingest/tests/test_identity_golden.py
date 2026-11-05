@@ -40,7 +40,7 @@ from spyre_clickhouse_ingest import (
     tags_for_case,
 )
 from spyre_clickhouse_ingest.apply_schema import SCHEMA_DIR, SchemaApplier
-from spyre_clickhouse_ingest.identity import ArtifactId
+from spyre_clickhouse_ingest.identity import ArtifactId, BenchmarkId
 
 
 class _Args:
@@ -441,3 +441,104 @@ def test_disc_key_order_is_positional():
     a = benchmark_id_for("c", "n", [], {"a": "1", "b": "2"}, ("a", "b"))
     b = benchmark_id_for("c", "n", [], {"a": "1", "b": "2"}, ("b", "a"))
     assert a != b
+
+
+# ingest_xml's _V2_BENCH_ID_KEYS, the only producer that hashes kernel_name.
+_PERF_KEYS = (
+    "record_type",
+    "config_name",
+    "input_shapes",
+    "run_mode",
+    "kernel_name",
+    "is_total",
+)
+
+
+@pytest.mark.parametrize(
+    ("raw", "stem"),
+    [
+        (
+            "spyre_kernel_v1_fused_softmax_g266zmeotllmjp5f#2",
+            "spyre_kernel_v1_fused_softmax#2",
+        ),
+        ("spyre_kernel_v1_fused_add_maprxynops5ngbzx", "spyre_kernel_v1_fused_add"),
+        ("spyre_kernel_v1_fused_add_maprxynops5ngbzx#", ""),
+        ("spyre_kernel_v1_fused_add_MAPRXYNOPS5NGBZX#2", ""),
+        ("aten::copy_", ""),
+        ("Total", ""),
+        (None, ""),
+    ],
+)
+def test_kernel_stem_drops_only_the_compile_token(raw, stem):
+    assert BenchmarkId.kernel_stem(raw) == stem
+
+
+def _kernel(raw, ms, name="pointwise_add"):
+    return {
+        "name": name,
+        "tags": [],
+        "backend": "spyre",
+        "measurements": {"duration_ms": [ms]},
+        "disc": {"record_type": "op", "kernel_name": raw},
+        "disc_keys": _PERF_KEYS,
+    }
+
+
+def test_kernel_id_survives_a_recompile():
+    first, second = (
+        BenchmarkId.rank_kernels(
+            "torch-spyre", [_kernel(f"spyre_kernel_v1_fused_add_{t}#2", 0.27)]
+        )
+        for t in ("maprxynops5ngbzx", "mp62rpe75axhxw2u")
+    )
+    ids = {
+        benchmark_id_for("torch-spyre", e["name"], e["tags"], e["disc"], _PERF_KEYS)
+        for e in first + second
+    }
+    assert len(ids) == 1
+    assert second[0]["run_props"] == {
+        "kernel_name": "spyre_kernel_v1_fused_add_mp62rpe75axhxw2u#2"
+    }
+
+
+def test_kernels_sharing_a_stem_rank_slowest_first():
+    # One op's two fused_add kernels (0.003 and 0.27 ms) are two benchmarks, not one.
+    fast, slow, other = BenchmarkId.rank_kernels(
+        "torch-spyre",
+        [
+            _kernel("spyre_kernel_v1_fused_add_aaaaaaaaaaaaaaaa#2", 0.003),
+            _kernel("spyre_kernel_v1_fused_add_bbbbbbbbbbbbbbbb#2", 0.27),
+            _kernel(
+                "spyre_kernel_v1_fused_add_cccccccccccccccc#2", 0.003, name="softmax"
+            ),
+        ],
+    )
+    assert slow["disc"]["kernel_name"] == "spyre_kernel_v1_fused_add#2@1"
+    assert slow["props"]["kernel_key"] == slow["disc"]["kernel_name"]
+    assert fast["disc"]["kernel_name"] == "spyre_kernel_v1_fused_add#2@2"
+    assert other["disc"]["kernel_name"] == "spyre_kernel_v1_fused_add#2@1"
+
+
+def test_profiler_events_keep_their_id():
+    e = _kernel("aten::copy_", 1.0)
+    assert BenchmarkId.rank_kernels("torch-spyre", [e]) == [e]
+
+
+def test_kernel_rekey_migration_matches_the_recipe():
+    # Pinned beside the migrations/012 SQL (its header); the SQL must strip the same token.
+    golden = benchmark_id_for(
+        "torch-spyre",
+        "softmax",
+        [],
+        {"kernel_name": "spyre_kernel_v1_fused_softmax#2@1"},
+        _PERF_KEYS,
+    )
+    assert golden == "d1ebd21d-1a04-5c64-9e52-5dd2c542cb36"
+    sql = (
+        SCHEMA_DIR / "migrations" / "012_benchmark_id_without_kernel_hash.sql"
+    ).read_text()
+    assert SchemaApplier.RERUNNABLE.search(sql)
+    assert golden in sql
+    assert tuple(_sql_array(sql, "keys")) == _PERF_KEYS
+    assert f"startsWith(kernel, '{BenchmarkId.KERNEL_PREFIX}')" in sql
+    assert f"'_[a-z0-9]{{{BenchmarkId.KERNEL_TOKEN}}}(#[0-9]+)?$' AS token" in sql

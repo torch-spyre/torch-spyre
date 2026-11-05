@@ -22,7 +22,15 @@ from torch.testing._internal.common_utils import (
     run_tests,
     subtest,
 )
+import ast
+import os
+import subprocess
+import sys
 import warnings
+from pathlib import Path
+
+import torch_spyre
+from torch_spyre.ops.eager import RetileWarning
 from torch_spyre.ops.fallbacks import FallbackWarning
 
 
@@ -138,6 +146,60 @@ class TestFallbacks(TestCase):
 
             self._assert_close(op, output_spyre.cpu(), output_cpu)
             self.assertEqual(id(buffer_spyre), id(output_spyre))
+
+
+_WARNING_TYPES = (FallbackWarning, RetileWarning)
+_IMPORT_TIMEOUT_S = 130  # Hang guard for the subprocess's torch import.
+
+
+def _base_name(base):
+    if isinstance(base, ast.Name):
+        return base.id
+    if isinstance(base, ast.Attribute):
+        return base.attr
+    return ""
+
+
+class TestWarningTypes(TestCase):
+    def test_importable_without_backend_autoload(self):
+        # xdist's controller rebuilds each worker warning by importing its class's module.
+        env = {**os.environ, "TORCH_DEVICE_BACKEND_AUTOLOAD": "0"}
+        for module in sorted({c.__module__ for c in _WARNING_TYPES}):
+            names = [c.__name__ for c in _WARNING_TYPES if c.__module__ == module]
+            script = (
+                "import importlib; "
+                f"mod = importlib.import_module({module!r}); "
+                f"[getattr(mod, name) for name in {names!r}]"
+            )
+            proc = subprocess.run(
+                [sys.executable, "-c", script],
+                capture_output=True,
+                env=env,
+                timeout=_IMPORT_TIMEOUT_S,
+                text=True,
+            )
+            self.assertEqual(proc.returncode, 0, f"{module}:\n{proc.stderr}")
+
+    def test_warning_classes_live_in_warning_types(self):
+        # A warning class in a module with import side effects crashes xdist's controller.
+        package = Path(torch_spyre.__file__).parent
+        home = package / "ops" / "warning_types.py"
+        misplaced = []
+        for path in sorted(package.rglob("*.py")):
+            if path == home:
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            misplaced += [
+                f"{path.relative_to(package.parent)}:{node.lineno} {node.name}"
+                for node in ast.walk(tree)
+                if isinstance(node, ast.ClassDef)
+                and any(_base_name(b).endswith("Warning") for b in node.bases)
+            ]
+        self.assertEqual(
+            misplaced,
+            [],
+            f"Define warning classes in {home.relative_to(package.parent)}",
+        )
 
 
 if __name__ == "__main__":

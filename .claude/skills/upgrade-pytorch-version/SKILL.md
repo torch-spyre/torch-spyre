@@ -58,10 +58,24 @@ locations (`~/dt-inductor`, `~/torch-spyre`).
 
 Before making changes, verify:
 
-1. **Target version is valid** — `release/$NEW` branch exists:
+1. **Target version is valid** — the `v$NEW.0` tag (or `release/$NEW`
+   branch) exists upstream. Check the remote, not just local refs, since
+   a local clone may not have fetched it yet:
    ```bash
-   cd $PYTORCH_DIR && git branch -r | grep "release/$NEW"
+   cd $PYTORCH_DIR && git ls-remote origin "refs/tags/v$NEW.0" "refs/heads/release/$NEW"
    ```
+   To move an existing checkout, fetch the tag and update submodules:
+   ```bash
+   git fetch origin tag v$NEW.0 --no-tags
+   git checkout v$NEW.0 && git submodule update --init --recursive
+   ```
+   **Pitfall:** if a submodule directory holds its own embedded `.git`
+   (e.g. a local fork checked out in place), `git checkout` with
+   `submodule.recurse=true` can abort halfway ("could not migrate git
+   directory ... File exists"), leaving HEAD at the old tag and the work
+   tree half-updated. Move that directory out of the tree first (it may
+   hold unpushed branches — never delete it), then re-run the checkout and
+   `git submodule update`.
 
 2. **PyTorch source is at target version:**
    ```bash
@@ -197,7 +211,9 @@ version examples. Update them:
 ```
 
 Note: Search broadly for the OLD version — if a version was previously
-skipped, some comments may still reference an even older version.
+skipped, some comments may still reference an even older version. As of
+the 2.14 upgrade these example comments no longer exist; if the grep in
+Step 10 finds nothing here, there is nothing to do.
 
 ---
 
@@ -222,6 +238,21 @@ The requirements table has a PyTorch row:
 →
 | PyTorch | ~= $NEW.0 |
 ```
+
+### `.github/actions/build-torch-spyre-local-pytorch/action.yml`
+
+**File:** `$TORCH_SPYRE_DIR/.github/actions/build-torch-spyre-local-pytorch/action.yml`
+
+This CI action carries its own copy of the LOCAL_PYTORCH `sed` patterns
+(forward substitution **and** the trap/revert), matching Step 6's
+`build-torch-spyre.sh`. Update every `torch~=$OLD.0` and `torch>=$OLD.0`
+to `$NEW.0`. If missed, the patterns silently stop matching and CI's
+local-PyTorch build keeps the pinned wheel instead of the source build.
+
+### `.github/workflows/push-pytorch-dispatch-to-clickhouse.yaml`
+
+Comment-only examples (`"release/$OLD"`, `"$OLD"`, `"torch~=$OLD.0"`);
+the logic reads `pyproject.toml`. Update the examples to `$NEW`.
 
 ### `.github/workflows/upstream_tests_beta.yaml` (if present)
 
@@ -465,8 +496,84 @@ After all changes:
 5. **Run tests:**
    ```bash
    cd $TORCH_SPYRE_DIR
-   python -m pytest tests/_inductor/test_inductor_ops.py -v
+   python -m pytest tests/inductor/test_inductor_ops.py -q -rf
    ```
+   - The full file takes longer than a typical tool timeout; run it in the
+     background. `pytest-timeout` is not installed, so don't pass
+     `--timeout`.
+   - A test that faults the device leaves it in an error state
+     (`StreamError`) and `conftest.py` then reports later tests in that
+     process as device errors. Restart the process before rerunning the
+     affected tests.
+   - CI runs tests through the OOT runner (`tests/run_test.sh <config>.yaml`),
+     which can differ from plain pytest (test order within a process,
+     generated wrapper classes). Reproduce CI failures with the same
+     config.
+
+6. **Re-calibrate the frontend work bounds** (needs a Spyre device).
+   `tests/inductor/test_frontend_work_bounds.py` bounds read-writes
+   extractions per operation, and upstream's own `get_read_writes` calls
+   are part of that count, so a torch bump can move it. Re-measure, then
+   update `MAX_EXTRACTIONS_PER_OP` and the calibration table in the
+   module docstring if the figures moved:
+   ```bash
+   cd $TORCH_SPYRE_DIR
+   python3 -c "import sys; sys.argv=[sys.argv[0]]; \
+       sys.path.insert(0, 'tests/inductor'); import torch, torch_spyre; \
+       from test_frontend_work_bounds import _calibrate; _calibrate()"
+   ```
+
+6a. **Re-verify the LoopNode scheduler patch** (`torch_spyre/_inductor/loop_scheduler.py`).
+   Counted loops reach Inductor's scheduler as one node through a patch of
+   private Inductor code, and the patch is supported on exactly one torch
+   release (`SUPPORTED_RELEASES`). A torch bump can change any function it
+   replaces or relies on, and it fails by silently running a loop body the
+   wrong number of times, not by an error, so do this before trusting a green
+   run. It needs the NEW torch installed and the OLD release's
+   `torch/_inductor/{scheduler,ir}.py`; the tool does not import `torch` or
+   `torch_spyre`, so it runs before the native extension is rebuilt.
+   ```bash
+   cd $TORCH_SPYRE_DIR
+   # The old release's files, if you no longer have an environment for it:
+   mkdir -p /tmp/inductor-$OLD && for f in scheduler.py ir.py; do
+     curl -sSfLo /tmp/inductor-$OLD/$f \
+       https://raw.githubusercontent.com/pytorch/pytorch/v$OLD.0/torch/_inductor/$f
+   done
+   NEW_INDUCTOR=$(python3 -c "import os, torch; print(os.path.join(os.path.dirname(torch.__file__), '_inductor'))")
+   python3 tools/diff_inductor_surface.py /tmp/inductor-$OLD $NEW_INDUCTOR
+   ```
+   - Exit status 0 means no function in `PATCHED_SURFACE` changed. Exit 1 means
+     read every `CHANGED` diff (the tool already ignores the `assert` to
+     `raise AssertionError` rewrite). For a method the patch **replaces**
+     (`create_scheduler_node`, `update_zero_dim_cpu_tensor`, `compute_ancestors`,
+     `dead_node_elimination`), check that the wrapper in `loop_scheduler.py`
+     still matches the new body. For one it only **relies on**, check the
+     assumption listed beside it in `PATCHED_SURFACE`.
+   - `NOT FOUND` for a name present in the new release only is a new function,
+     not an error; one missing from both trees means `PATCHED_SURFACE` has a
+     typo or the function was renamed.
+   - A new attribute that Inductor asserts on every node (as `mempool` was for
+     2.14: `ir.Operation.get_mempool` asserts `hasattr(self, "mempool")`) must
+     be added to `LoopNode` in `loop_node.py`.
+   - Update `SUPPORTED_RELEASES` in `loop_scheduler.py` to the new release, and
+     the faked versions in `tests/inductor/test_loop_scheduler.py` (the
+     release-gate tests pin the new release as supported and the old one as
+     refused).
+   - Run, serially (the device is exclusive):
+     ```bash
+     python -m pytest tests/inductor/test_loop_scheduler.py \
+       tests/inductor/test_loop_scheduler_readers.py \
+       tests/inductor/test_loop_scheduler_review.py \
+       tests/inductor/test_loop_scheduler_equivalence.py -q
+     ```
+     `test_loop_scheduler_equivalence.py` is the gate: it compiles real loops
+     with the flow-through on and off and compares kernels, numerics and the
+     scheduler's structure. A numerics-only test cannot stand in for it: a loop
+     wrapped twice still matches a CPU reference for online softmax.
+
+7. **Run the full CI.** Local runs cover only a slice, and the local lower
+   stack may differ from CI's. The fastest full signal is a draft PR.
+   Before calling a failure local-only, confirm it passes in CI.
 
 ---
 
@@ -483,6 +590,7 @@ After completing all steps, report:
    - docs/source/getting_started/installation.md: version table updated
    - checkout-pytorch-src.sh: comment + branch updated
    - build-torch-spyre.sh: sed patterns updated (both forward + trap)
+   - build-torch-spyre-local-pytorch/action.yml: sed patterns updated (both forward + trap)
    - dev_install.md: version references updated
    - profiling_tools.md: stale kineto-spyre wheel section removed (not needed since PyTorch 2.13)
    - libgomp shim symlinks created under $PYTORCH_DIR/torch/lib/
@@ -491,6 +599,9 @@ After completing all steps, report:
    - [ ] Regenerate uv.lock + requirements/*.txt via `./tools/update-requirements.sh` (needs wheels on index)
    - [ ] Rebuild torch-spyre + any downstream C++ extensions (vllm, ...)
    - [ ] Run test suite
+   - [ ] Re-calibrate test_frontend_work_bounds.py (Step 10.6)
+   - [ ] Re-verify the LoopNode scheduler patch: `tools/diff_inductor_surface.py`,
+         `SUPPORTED_RELEASES`, the four `test_loop_scheduler*` files (Step 10.6a)
    - [ ] Check torch_spyre/_monkey_patch.py & torch_spyre/ops/eager.py
          for API drift against the new PyTorch (Dynamo guards, ATen ops)
 ```
@@ -533,6 +644,11 @@ After upgrading, watch for:
    `native_functions.yaml`.
 4. **Inductor API changes** — `torch._inductor` internals may have changed.
    Watch for import errors or API mismatches in `torch_spyre/_inductor/`.
+   `torch_spyre/_inductor/loop_scheduler.py` patches four `Scheduler`
+   methods and depends on about two dozen more; `python3
+   tools/diff_inductor_surface.py <old> <new>` lists the ones that changed
+   (Step 10.6a). A loop that compiles but runs its body the wrong number of
+   times is this, not an op bug.
 5. **Deprecation warnings** — New deprecations may need filterwarnings entries
    in `pyproject.toml`.
 5a. **Dynamo / guard API changes** — `torch._C._dynamo.guards.GuardManager`
@@ -545,6 +661,13 @@ After upgrading, watch for:
    Fix: pass `guard.user_stack` (or `None`) as the third argument. Check
    signatures in `torch/_C/_dynamo/guards.pyi` after the upgrade and
    cross-reference against torch-spyre's patches.
+   Also re-check `torch._dynamo.eval_frame._is_eager_on_nested_compile`, used
+   by `spyre__copy_from` to avoid recursively compiling a device copy during
+   compiler-internal tracing. This flag can be set while the Python dispatch
+   key remains enabled, so it is distinct from `no_dispatch()`. Run
+   `TestCopyFromD2DNestedCompile` in `test_copy_from_d2d_offsets.py` on supported
+   patch releases; it exercises the private `_use_eager_on_nested_compile`
+   context as well as the predicate.
 6. **Skipped-version accumulation** — If skipping versions, multiple breaking
    changes may compound. Consider reading PyTorch release notes for each
    skipped version to anticipate issues.
@@ -558,6 +681,34 @@ After upgrading, watch for:
    across minor versions. Any extension linked against `libtorch` /
    `libc10` (vllm `_C.abi3.so`, torchvision, torchaudio, custom kernels)
    must be rebuilt against the new PyTorch. See dedicated section below.
+9. **Inductor IR shape changes** — torch-spyre's passes pattern-match
+   upstream IR. Example (2.14, pytorch#184279): single-output
+   `FallbackKernel`s stopped producing a `MultiOutputLayout` + `MultiOutput`
+   and now carry a `FixedLayout` themselves. `propagate_layouts` skipped
+   `FallbackKernel`, so the output never got a device layout and every
+   consumer raised `<buf> does not have FixedTiledLayout`. When many
+   unrelated ops fail with the same pass error, `git log` the upstream
+   `torch/_inductor/ir.py` between the two tags for the node type involved.
+10. **Test framework validation** — upstream `torch.testing` tightens
+    checks. Example (2.14, pytorch#192648): generated test names may not
+    contain `.`, which aborted collection of whole files (every OOT wrapper
+    job failed at collection). Fixed centrally in `ParameterizedTestMeta`
+    (`_safe_test_name`).
+11. **Tests that depend on Dynamo/Inductor internals** — placeholder
+    numbering (`arg0_1`, `arg1_1`) followed Dynamo's input order, which
+    changed in 2.14; tests hard-coding generated buffer names broke (and
+    one inverted assertion passed vacuously). Identify buffers by
+    shape/role, not by number. Likewise `pytest.warns` records *every*
+    warning raised in its block, so count by category.
+12. **Upstream tests newly running on device** — the upstream-test configs
+    (`tests/configs/upstream_tests/*.yaml`) list tests by name. When
+    upstream drops `@onlyCPU` / `@onlyNativeDeviceTypes` or adds
+    `device=` params, a test that "passed" trivially on CPU now runs on
+    spyre. Diff the upstream test file between tags
+    (`git diff v$OLD.0 v$NEW.0 -- test/<file>.py | grep -E "^[-+] +(@|def test_)"`)
+    and move newly device-bound failures to `xfail` (or `skip` if they
+    crash the process, since a crash kills the xdist worker and every
+    remaining test in the file).
 
 ---
 

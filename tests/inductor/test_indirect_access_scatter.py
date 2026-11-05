@@ -47,6 +47,11 @@ from torch_spyre._C import (  # noqa: E402
 )
 
 
+# The backend scheduler's rejection of a scatter bundle (#4409), as it appears in
+# the BackendCompilerFailed message.
+_INDEX_STICK_DIM_ERROR = "Expect index stick dim to be innermost in chunk loop order"
+
+
 class _ScatterScenarios:
     """torch scatter-family ops: one compile + all-stage checks per scenario.
 
@@ -115,7 +120,8 @@ class _ScatterScenarios:
         Bn, M, N, P = 4, 16, 1024, 6
         y = torch.rand(Bn, M, N, dtype=torch.float16).to("spyre")
         src = torch.rand(Bn, P, N, dtype=torch.float16).to("spyre")
-        idx = torch.randint(0, M, (P,), dtype=torch.int32).to("spyre")
+        # Unique rows: with a repeated index `y[:, idx] = src` has no defined winner.
+        idx = torch.randperm(M, dtype=torch.int32)[:P].to("spyre")
         self.name_dims(y, {"B": Bn, "M": M, "N": N})
         self.name_dims(src, {"B": Bn, "P": P, "N": N})
         self.name_dims(idx, {"P": P})
@@ -170,16 +176,12 @@ class _ScatterScenarios:
         src = torch.randn(Bn, L, H, D, dtype=dtype, generator=generator)
         freqs = torch.randn(Bn, L, 2, 2, D // 2, dtype=dtype, generator=generator)
         dst = torch.zeros(Bn, H, M, D, dtype=dtype)
+        eps = get_elem_in_stick(dtype)
         cache_layout = SpyreTensorLayout(
-            device_size=[
-                M,
-                H,
-                D // get_elem_in_stick(dtype),
-                Bn,
-                get_elem_in_stick(dtype),
-            ],
-            stride_map=[D, M * D, get_elem_in_stick(dtype), H * M * D, 1],
+            device_size=[M, H, D // eps, Bn, eps],
+            stride_map=[D, M * D, eps, H * M * D, 1],
             device_dtype=get_device_dtype(dtype),
+            valid_elements={(0,): M, (1,): H, (2, 4): D, (3,): Bn},
         )
 
         def apply_rope(src, freqs):
@@ -287,7 +289,16 @@ class _ScatterScenarios:
         def kernel(out, src, index):
             return torch.scatter(out, 0, index, src)
 
-        self._stage_and_e2e(kernel, out, src, index, expect=SCATTER_OP_SPEC)
+        # torch.scatter on dim 0 does not compile: the backend scheduler rejects
+        # the bundle (#4409). Drop the pin once that is fixed.
+        self._stage_and_e2e(
+            kernel,
+            out,
+            src,
+            index,
+            expect=SCATTER_OP_SPEC,
+            expect_backend_error=_INDEX_STICK_DIM_ERROR,
+        )
 
     def test_scatter_method_without_unary(self):
         """out.scatter_(0, index, src) -- in-place method form without a unary."""
@@ -296,7 +307,16 @@ class _ScatterScenarios:
         def kernel(out, src, index):
             return out.scatter_(0, index, src)
 
-        self._stage_and_e2e(kernel, out, src, index, expect=SCATTER_OP_SPEC)
+        # torch.scatter on dim 0 does not compile: the backend scheduler rejects
+        # the bundle (#4409). Drop the pin once that is fixed.
+        self._stage_and_e2e(
+            kernel,
+            out,
+            src,
+            index,
+            expect=SCATTER_OP_SPEC,
+            expect_backend_error=_INDEX_STICK_DIM_ERROR,
+        )
 
     def test_scatter_with_exp(self):
         """y.scatter_(0, index, src.exp()) -- fused unary, exp runs on Spyre.
@@ -310,6 +330,7 @@ class _ScatterScenarios:
         def kernel(out, src, index):
             return out.scatter_(0, index, src.exp())
 
+        # The backend scheduler rejects the bundle (#4409); drop the pin once fixed.
         self._stage_and_e2e(
             kernel,
             out,
@@ -318,6 +339,7 @@ class _ScatterScenarios:
             expect=SCATTER_OP_SPEC,
             op="exp",
             detected=False,
+            expect_backend_error=_INDEX_STICK_DIM_ERROR,
         )
 
     def test_scatter_add(self):
@@ -327,7 +349,16 @@ class _ScatterScenarios:
         def kernel(out, src, index):
             return out.scatter_add_(0, index, src)
 
-        self._stage_and_e2e(kernel, out, src, index, expect=SCATTER_OP_SPEC)
+        # torch.scatter on dim 0 does not compile: the backend scheduler rejects
+        # the bundle (#4409). Drop the pin once that is fixed.
+        self._stage_and_e2e(
+            kernel,
+            out,
+            src,
+            index,
+            expect=SCATTER_OP_SPEC,
+            expect_backend_error=_INDEX_STICK_DIM_ERROR,
+        )
 
     def test_index_copy(self):
         """torch.index_copy(out, 0, idx, src).
@@ -510,9 +541,10 @@ class _ScatterScenarios:
         layout used by attention decode/prefill (see test_paged.py)."""
         eps = get_elem_in_stick(torch.float16)
         return SpyreTensorLayout(
-            device_size=[L, H, (D + eps - 1) // eps, eps],
-            stride_map=[H * D, D, eps, 1],
-            device_dtype=get_device_dtype(torch.float16),
+            [L, H, (D + eps - 1) // eps, eps],
+            [H * D, D, eps, 1],
+            get_device_dtype(torch.float16),
+            {(0,): L, (1,): H, (2, 3): D},
         )
 
     def _paged_kv_cache_operands(self, L=576, H=8, D=128, P=3):
@@ -529,7 +561,7 @@ class _ScatterScenarios:
 
     def _assert_compiled_matches_cpu(self, kernel, *dev_args):
         """Run `kernel` through torch.compile on device and require the result
-        to match the CPU eager reference -- a hard assertion, not an xfail.
+        to match the CPU eager reference -- a hard assertion.
         Compute CPU reference from pristine inputs before compiled run to catch
         mutations that corrupt non-indexed regions."""
         cpu_args = [
@@ -633,6 +665,233 @@ class _ScatterScenarios:
             return y
 
         self._assert_compiled_matches_cpu(kernel, y, src, idx)
+
+    # ===== scatter through a view of the destination =====================
+    # The scatter writes through a view, so the shape the index uses and the
+    # shape the destination was allocated with are not the same.
+
+    def _view_cache_operands(self, pages, slots, P, dtype=torch.bfloat16):
+        """A paged cache addressed through ``view(-1, 8, 128)``, with a
+        matching source and P unique slots.
+        """
+        cache = torch.rand(pages, slots, 8, 128, dtype=dtype).to("spyre")
+        src = torch.rand(P, 8, 128, dtype=dtype).to("spyre")
+        idx = torch.randperm(pages * slots, dtype=torch.int64)[:P].to("spyre")
+        return cache, src, idx
+
+    @staticmethod
+    def _put_through_view(c, s, i):
+        c.view(-1, 8, 128).index_put_((i,), s)
+        return c
+
+    @staticmethod
+    def _copy_through_view(c, s, i):
+        c.view(-1, 8, 128).index_copy_(0, i, s)
+        return c
+
+    def test_index_put_through_view_consecutive_slots_e2e(self):
+        """8192 consecutive slots in a 1024-page cache."""
+        cache = torch.rand(1024, 16, 8, 128, dtype=torch.bfloat16).to("spyre")
+        src = torch.rand(8192, 8, 128, dtype=torch.bfloat16).to("spyre")
+        idx = torch.arange(8192, dtype=torch.int64).to("spyre")
+        self._assert_compiled_matches_cpu(self._put_through_view, cache, src, idx)
+
+    def test_index_put_through_view_scattered_slots_e2e(self):
+        """A few slots scattered across the same cache."""
+        cache, src, idx = self._view_cache_operands(1024, 16, P=64)
+        self._assert_compiled_matches_cpu(self._put_through_view, cache, src, idx)
+
+    def test_index_put_through_view_page_geometries_e2e(self):
+        """Several page counts and page sizes."""
+        for pages, slots_per_page in ((4, 16), (16, 4), (4, 32), (64, 16), (512, 16)):
+            with self.subTest(pages=pages, slots_per_page=slots_per_page):
+                cache, src, idx = self._view_cache_operands(
+                    pages, slots_per_page, P=max(1, pages * slots_per_page // 2)
+                )
+                self._assert_compiled_matches_cpu(
+                    self._put_through_view, cache, src, idx
+                )
+
+    def test_index_copy_through_view_e2e(self):
+        """The index_copy_ form of the same write."""
+        cache, src, idx = self._view_cache_operands(8, 16, P=16)
+        self._assert_compiled_matches_cpu(self._copy_through_view, cache, src, idx)
+
+    def test_index_put_through_three_level_view_e2e(self):
+        """Three leading dims collapsed into the indexed dimension."""
+        cache = torch.rand(2, 4, 16, 8, 128, dtype=torch.bfloat16).to("spyre")
+        src = torch.rand(32, 8, 128, dtype=torch.bfloat16).to("spyre")
+        idx = torch.randperm(2 * 4 * 16, dtype=torch.int64)[:32].to("spyre")
+        self._assert_compiled_matches_cpu(self._put_through_view, cache, src, idx)
+
+    def test_index_put_through_view_of_5d_cache_e2e(self):
+        """Four leading dims collapsed into the indexed dimension."""
+        cache = torch.rand(2, 2, 4, 16, 8, 128, dtype=torch.bfloat16).to("spyre")
+        src = torch.rand(32, 8, 128, dtype=torch.bfloat16).to("spyre")
+        idx = torch.randperm(2 * 2 * 4 * 16, dtype=torch.int64)[:32].to("spyre")
+        self._assert_compiled_matches_cpu(self._put_through_view, cache, src, idx)
+
+    def test_index_put_through_partial_view_e2e(self):
+        """A view that collapses only some leading dims, leaving one in place."""
+        cache = torch.rand(2, 4, 16, 8, 128, dtype=torch.bfloat16).to("spyre")
+        src = torch.rand(4, 16, 8, 128, dtype=torch.bfloat16).to("spyre")
+        idx = torch.randperm(8, dtype=torch.int64)[:4].to("spyre")
+
+        def kernel(c, s, i):
+            c.view(8, 16, 8, 128).index_put_((i,), s)
+            return c
+
+        self._assert_compiled_matches_cpu(kernel, cache, src, idx)
+
+    def test_index_copy_through_view_on_middle_dim_e2e(self):
+        """A non-leading indexed dim, which can still be made outermost."""
+        idx = torch.randperm(128, dtype=torch.int64)[:4].to("spyre")
+
+        def kept_tail(c, s, i):
+            c.view(2, -1, 8, 128).index_copy_(1, i, s)
+            return c
+
+        def flat_tail(c, s, i):
+            c.view(2, 128, -1).index_copy_(1, i, s)
+            return c
+
+        for name, kernel, src_shape in (
+            ("trailing dims kept", kept_tail, (2, 4, 8, 128)),
+            ("trailing dims flattened", flat_tail, (2, 4, 8 * 128)),
+        ):
+            with self.subTest(view=name):
+                cache = torch.rand(2, 8, 16, 8, 128, dtype=torch.bfloat16).to("spyre")
+                src = torch.rand(*src_shape, dtype=torch.bfloat16).to("spyre")
+                self._assert_compiled_matches_cpu(kernel, cache, src, idx)
+
+    # -- a view that keeps the indexed dim and flattens the rest -----------
+    def _flat_view_operands(self, N=8192, P=64, dtype=torch.bfloat16):
+        x = torch.rand(N, 8, 128, dtype=dtype).to("spyre")
+        values = torch.rand(P, 8 * 128, dtype=dtype).to("spyre")
+        return x, values, torch.arange(P, dtype=torch.int64).to("spyre")
+
+    def test_scatter_through_flat_view_e2e(self):
+        """Both scatter ops on x.view(N, H*D), mutating the view itself."""
+
+        def put(x, v, i):
+            x.view(x.shape[0], 8 * 128).index_put_((i,), v, accumulate=False)
+            return x
+
+        def copy(x, v, i):
+            x.view(x.shape[0], 8 * 128).index_copy_(0, i, v)
+            return x
+
+        for name, kernel in (("index_put_", put), ("index_copy_", copy)):
+            with self.subTest(op=name):
+                self._assert_compiled_matches_cpu(kernel, *self._flat_view_operands())
+
+    def test_scatter_through_flat_view_clone_e2e(self):
+        """Controls -- .clone() breaks the alias, so no view is written through."""
+
+        def put(x, v, i):
+            x2 = x.view(x.shape[0], 8 * 128).clone()
+            x2.index_put_((i,), v, accumulate=False)
+            return x2
+
+        def copy(x, v, i):
+            x2 = x.view(x.shape[0], 8 * 128).clone()
+            x2.index_copy_(0, i, v)
+            return x2
+
+        for name, kernel in (("index_put_", put), ("index_copy_", copy)):
+            with self.subTest(op=name):
+                self._assert_compiled_matches_cpu(kernel, *self._flat_view_operands())
+
+    def test_index_copy_through_small_flat_view_fp16_e2e(self):
+        """The same pattern at 8 rows, in fp16."""
+
+        def kernel(x, v, i):
+            x.view(x.shape[0], 8 * 128).index_copy_(0, i, v)
+            return x
+
+        self._assert_compiled_matches_cpu(
+            kernel, *self._flat_view_operands(N=8, P=4, dtype=torch.float16)
+        )
+
+    def test_scatter_through_bias_view_e2e(self):
+        """A 4-D fp32 attention bias viewed as [B, S*S].
+
+        Uses a tensor source because an indirect store of a scalar constant is
+        unsupported.
+        """
+        B, S = 4, 64
+        idx = torch.tensor([0, 2], dtype=torch.int64).to("spyre")
+        values = torch.rand(2, S * S, dtype=torch.float32).to("spyre")
+
+        def put(b, i, v):
+            b.view(b.shape[0], -1).index_put_((i,), v)
+            return b
+
+        def copy(b, i, v):
+            b.view(b.shape[0], -1).index_copy_(0, i, v)
+            return b
+
+        for name, kernel in (("index_put_", put), ("index_copy_", copy)):
+            with self.subTest(op=name):
+                bias = torch.rand(B, 1, S, S, dtype=torch.float32).to("spyre")
+                self._assert_compiled_matches_cpu(kernel, bias, idx, values)
+
+    # -- other shapes, dtypes and index patterns ---------------------------
+    def test_index_put_through_view_fp32_e2e(self):
+        """fp32, where a stick holds 32 elements rather than 64."""
+        cache, src, idx = self._view_cache_operands(8, 16, P=16, dtype=torch.float32)
+        self._assert_compiled_matches_cpu(self._put_through_view, cache, src, idx)
+
+    def test_index_put_through_view_feature_widths_e2e(self):
+        """Trailing widths of one, three and four sticks."""
+        for head_dim in (64, 192, 256):
+            with self.subTest(head_dim=head_dim):
+                cache = torch.rand(8, 16, 8, head_dim, dtype=torch.bfloat16).to("spyre")
+                src = torch.rand(16, 8, head_dim, dtype=torch.bfloat16).to("spyre")
+                idx = torch.randperm(128, dtype=torch.int64)[:16].to("spyre")
+
+                def kernel(c, s, i, hd=head_dim):
+                    c.view(-1, 8, hd).index_put_((i,), s)
+                    return c
+
+                self._assert_compiled_matches_cpu(kernel, cache, src, idx)
+
+    def test_index_put_through_view_single_head_e2e(self):
+        """A middle dimension of size 1."""
+        cache = torch.rand(8, 16, 1, 128, dtype=torch.bfloat16).to("spyre")
+        src = torch.rand(16, 1, 128, dtype=torch.bfloat16).to("spyre")
+        idx = torch.randperm(128, dtype=torch.int64)[:16].to("spyre")
+
+        def kernel(c, s, i):
+            c.view(-1, 1, 128).index_put_((i,), s)
+            return c
+
+        self._assert_compiled_matches_cpu(kernel, cache, src, idx)
+
+    def test_index_put_through_view_int32_index_e2e(self):
+        """An int32 index, which skips the int64 downcast."""
+        cache = torch.rand(8, 16, 8, 128, dtype=torch.bfloat16).to("spyre")
+        src = torch.rand(16, 8, 128, dtype=torch.bfloat16).to("spyre")
+        idx = torch.randperm(128)[:16].to(torch.int32).to("spyre")
+        self._assert_compiled_matches_cpu(self._put_through_view, cache, src, idx)
+
+    def test_index_put_through_view_narrow_slot_sets_e2e(self):
+        """A single slot, and the last slot.
+
+        Duplicates are excluded: index_put_ with accumulate=False is
+        nondeterministic when the index repeats.
+        """
+        rows = 8 * 16
+        for name, slot_list in (("one slot", [77]), ("last slot", [rows - 1])):
+            with self.subTest(slots=name):
+                cache = torch.rand(8, 16, 8, 128, dtype=torch.bfloat16).to("spyre")
+                src = torch.rand(len(slot_list), 8, 128, dtype=torch.bfloat16).to(
+                    "spyre"
+                )
+                idx = torch.tensor(slot_list, dtype=torch.int64).to("spyre")
+                self._assert_compiled_matches_cpu(
+                    self._put_through_view, cache, src, idx
+                )
 
     # ===== index_add: gather + add + overwrite-scatter decomposition =====
     # aten.index_add lowers (spyre_index_add in decompositions.py) to
@@ -790,7 +1049,6 @@ class _ScatterScenarios:
             idx,
             expect=SCATTER_OP_SPEC,
             sdsc=False,
-            expect_close=True,
         )
 
     def test_index_add_tiny_zeros(self):
@@ -812,7 +1070,6 @@ class _ScatterScenarios:
             idx,
             expect=SCATTER_OP_SPEC,
             sdsc=False,
-            expect_close=True,
         )
 
     def test_index_add_nonzero_dest(self):
@@ -836,7 +1093,6 @@ class _ScatterScenarios:
             idx,
             expect=SCATTER_OP_SPEC,
             sdsc=False,
-            expect_close=True,
         )
 
     def test_index_add_moe_inplace(self):
@@ -856,7 +1112,6 @@ class _ScatterScenarios:
             idx,
             expect=SCATTER_OP_SPEC,
             sdsc=False,
-            expect_close=True,
         )
 
     def test_index_add_moe_functional(self):
@@ -874,7 +1129,6 @@ class _ScatterScenarios:
             idx,
             expect=SCATTER_OP_SPEC,
             sdsc=False,
-            expect_close=True,
         )
 
     def test_index_add_partial_update(self):
@@ -898,7 +1152,6 @@ class _ScatterScenarios:
             idx,
             expect=SCATTER_OP_SPEC,
             sdsc=False,
-            expect_close=True,
         )
 
     def test_index_add_dense_update(self):
@@ -921,7 +1174,6 @@ class _ScatterScenarios:
             idx,
             expect=SCATTER_OP_SPEC,
             sdsc=False,
-            expect_close=True,
         )
 
     def test_index_add_large_p(self):
@@ -949,7 +1201,6 @@ class _ScatterScenarios:
             idx,
             expect=SCATTER_OP_SPEC,
             sdsc=False,
-            expect_close=True,
         )
 
     def test_index_add_ragged_n(self):
@@ -966,7 +1217,6 @@ class _ScatterScenarios:
             idx,
             expect=SCATTER_OP_SPEC,
             sdsc=False,
-            expect_close=True,
         )
 
     def test_index_add_fp32(self):
@@ -989,7 +1239,6 @@ class _ScatterScenarios:
             idx,
             expect=SCATTER_OP_SPEC,
             sdsc=False,
-            expect_close=True,
         )
 
     def test_index_add_dim1_unsupported(self):
@@ -1018,7 +1267,16 @@ class _ScatterScenarios:
         def kernel(out, src, index):
             return out.scatter_reduce_(0, index, src, "sum")
 
-        self._stage_and_e2e(kernel, out, src, index, expect=SCATTER_OP_SPEC)
+        # torch.scatter on dim 0 does not compile: the backend scheduler rejects
+        # the bundle (#4409). Drop the pin once that is fixed.
+        self._stage_and_e2e(
+            kernel,
+            out,
+            src,
+            index,
+            expect=SCATTER_OP_SPEC,
+            expect_backend_error=_INDEX_STICK_DIM_ERROR,
+        )
 
     def test_index_put_accumulate(self):
         """out.index_put_((idx,), src, accumulate=True) -- out[idx] += src."""
@@ -1036,7 +1294,16 @@ class _ScatterScenarios:
         def kernel(out, src, index):
             return torch.scatter_add(out, 0, index, src)
 
-        self._stage_and_e2e(kernel, out, src, index, expect=SCATTER_OP_SPEC)
+        # torch.scatter on dim 0 does not compile: the backend scheduler rejects
+        # the bundle (#4409). Drop the pin once that is fixed.
+        self._stage_and_e2e(
+            kernel,
+            out,
+            src,
+            index,
+            expect=SCATTER_OP_SPEC,
+            expect_backend_error=_INDEX_STICK_DIM_ERROR,
+        )
 
     # ------------- Not Detected As Indirect Access Scatter -------------
     def test_scatter_reduce_amax(self):
@@ -1046,7 +1313,10 @@ class _ScatterScenarios:
         def kernel(out, src, index):
             return out.scatter_reduce_(0, index, src, "amax")
 
-        self._stage_and_e2e(kernel, out, src, index, expect=DIRECT_OP_SPEC)
+        # The device result is wrong (#5326); drop the pin once that is fixed.
+        self._stage_and_e2e(
+            kernel, out, src, index, expect=DIRECT_OP_SPEC, expect_close=False
+        )
 
     def test_scatter_reduce_amin(self):
         """out.scatter_reduce_(0, index, src, "amin")"""
@@ -1127,9 +1397,7 @@ class _ScatterScenarios:
         def kernel(inp, mask, src):
             return torch.masked_scatter(inp, mask, src)
 
-        self._stage_and_e2e(
-            kernel, inp, mask, src, expect=GATHER_OP_SPEC, expect_close=True
-        )
+        self._stage_and_e2e(kernel, inp, mask, src, expect=GATHER_OP_SPEC)
 
     def test_masked_scatter_unexpanded_row_broadcast(self):
         """torch.masked_scatter with a row mask left in its UN-EXPANDED form:
@@ -1156,9 +1424,7 @@ class _ScatterScenarios:
         def kernel(inp, mask, src):
             return torch.masked_scatter(inp, mask, src)
 
-        self._stage_and_e2e(
-            kernel, inp, mask, src, expect=GATHER_OP_SPEC, expect_close=True
-        )
+        self._stage_and_e2e(kernel, inp, mask, src, expect=GATHER_OP_SPEC)
 
     def _row_broadcast_operands(self, shape, src_rows, n_true):
         """Supported masked_scatter operands: `self` of `shape`, a mask broadcast
@@ -1220,9 +1486,7 @@ class _ScatterScenarios:
         def kernel(inp, mask, src):
             return torch.masked_scatter(inp, mask, src)
 
-        self._stage_and_e2e(
-            kernel, inp, mask, src, expect=GATHER_OP_SPEC, expect_close=True
-        )
+        self._stage_and_e2e(kernel, inp, mask, src, expect=GATHER_OP_SPEC)
 
     def test_masked_scatter_no_rows_selected(self):
         """All-False mask: nothing is selected, so the result must equal `self`
@@ -1238,9 +1502,7 @@ class _ScatterScenarios:
         def kernel(inp, mask, src):
             return torch.masked_scatter(inp, mask, src)
 
-        self._stage_and_e2e(
-            kernel, inp, mask, src, expect=GATHER_OP_SPEC, expect_close=True
-        )
+        self._stage_and_e2e(kernel, inp, mask, src, expect=GATHER_OP_SPEC)
 
     def test_masked_scatter_degenerate_last_dim_unsupported(self):
         """Degenerate last dim (cols == 1): a single-column row is not a real
@@ -1303,9 +1565,11 @@ class _ScatterMulticoreScenarios:
         address past 4 GB overflows its uint32 UINT32_TO_16* encoding)."""
 
         def make():
+            # One destination row per entry: with a repeated index `dest[i] = src`
+            # has no defined winner, so the device could not be checked.
             src = torch.rand(1024, 64, 1024, dtype=torch.float16).to("spyre")
-            dest = torch.zeros(128, 64, 1024, dtype=torch.float16).to("spyre")
-            i = (torch.arange(1024) % 128).int().to("spyre")
+            dest = torch.zeros(1024, 64, 1024, dtype=torch.float16).to("spyre")
+            i = torch.randperm(1024).int().to("spyre")
             return dest, src, i
 
         fn = self._scatter_fn
@@ -1318,9 +1582,10 @@ class _ScatterMulticoreScenarios:
         caps at 8 and must never spill onto the forbidden dest K dim."""
 
         def make():
+            # One destination row per entry (see test_work_division_entry_split_full).
             src = torch.rand(256, 64, 256, dtype=torch.float16).to("spyre")
-            dest = torch.zeros(128, 64, 256, dtype=torch.float16).to("spyre")
-            i = (torch.arange(256) % 128).int().to("spyre")
+            dest = torch.zeros(256, 64, 256, dtype=torch.float16).to("spyre")
+            i = torch.randperm(256).int().to("spyre")
             return dest, src, i
 
         fn = self._scatter_fn

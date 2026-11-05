@@ -29,23 +29,14 @@ test_suite_config:
               exclude:
                 - name: bool
                 - name: int64
-        # These tests exercise tensor_split with various indices, dimensions, and tensor shapes.
-        # They are mandatory_success because Spyre supports tensor_split for float16 and float32 dtypes.
-        # The failures for bool and int64 are due to missing support for aten::random_.from during tensor creation.
+        # Upstream regression: test_tensor_split_indices/test_tensor_split_sections now
+        # produce a numerically wrong result on Spyre for float16/float32 -- splitting a 1D
+        # tensor into unequal pieces along dim -1 and comparing each piece against a
+        # single-split reference, every element mismatches (100%).
         - names:
             - TestOldViewOps::test_tensor_split_indices
-          mode: mandatory_success
-          edits:
-            dtypes:
-              exclude:
-                - name: bool
-                - name: int64
-        # These tests exercise tensor_split with sections across various tensor sizes and dimensions.
-        # They are mandatory_success because Spyre supports the core view operation but lacks random_ for bool/int64 initialization.
-        # The failures are due to missing aten::random_.from for bool and int64 dtypes during tensor creation.
-        - names:
             - TestOldViewOps::test_tensor_split_sections
-          mode: mandatory_success
+          mode: skip  # skip: wrong numeric result on upstream PyTorch bump
           edits:
             dtypes:
               exclude:

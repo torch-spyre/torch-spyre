@@ -2,7 +2,7 @@ torch\_spyre
 ============
 
 When the ``torch_spyre`` package is installed, PyTorch picks it up
-through the ``torch.backends`` autoload entry point — no explicit
+through the ``torch.backends`` autoload entry point; no explicit
 ``import torch_spyre`` is needed. The Spyre backend registers itself
 on first use of ``torch`` and the public API is available under
 ``torch.spyre``, mirroring the ``torch.cuda`` surface.
@@ -332,14 +332,18 @@ FFDC (First Failure Data Capture)
    Retrieval does not require that variable, even if it was unset in a
    later session. The directory **does** have to match: if
    ``TORCHINDUCTOR_CACHE_DIR`` (or ``TMPDIR``) differs between capture
-   and retrieval, pass the original ``output_dir`` explicitly.
+   and retrieval, pass the original **report** directory as
+   ``output_dir`` — ``<cache-root>/torch-spyre/ffdc_reports`` (or
+   ``<tempdir>/torch-spyre-ffdc`` on the fallback path), **not** the
+   cache or ``TMPDIR`` root. This function searches ``output_dir`` for
+   JSON files; it does not append ``torch-spyre/ffdc_reports``.
 
-   :param output_dir: Directory to search. If ``None``, uses
-       ``<Inductor cache root>/torch-spyre/ffdc_reports``, where the cache
-       root is ``$TORCHINDUCTOR_CACHE_DIR`` or else
+   :param output_dir: Directory containing FFDC JSON files. If ``None``,
+       uses ``<Inductor cache root>/torch-spyre/ffdc_reports``, where the
+       cache root is ``$TORCHINDUCTOR_CACHE_DIR`` or else
        ``<tempdir>/torchinductor_<user>`` from Inductor ``cache_dir()``
        (not ``~/.cache/torch/inductor``). ``<tempdir>`` is
-       ``tempfile.gettempdir()`` — typically ``/tmp`` on Linux, or
+       ``tempfile.gettempdir()``, typically ``/tmp`` on Linux, or
        ``$TMPDIR`` when that is set. Falls back to
        ``<tempdir>/torch-spyre-ffdc`` if that root cannot be resolved.
    :type output_dir: str, optional
@@ -357,8 +361,9 @@ FFDC (First Failure Data Capture)
           print(report["_report_path"])
 
    The same function is also available as
-   ``torch_spyre.profiler.get_diagnostic_report``. For usage workflow,
-   report locations, and JSON triage, see
+   ``torch_spyre.profiler.get_diagnostic_report``. For the enable →
+   fail → retrieve → triage workflow, report schema, and
+   interpretation notes, see
    :doc:`../user_guide/profiling/ffdc`.
 
 Tensor Operations
@@ -681,12 +686,12 @@ Environment Variables
    * - ``TORCH_SPYRE_NUM_HOST_COMPUTE_STREAMS``
      - Size of the host-compute stream pool used by program correction
        (default ``4``, maximum ``8``)
-   * - ``SPYRE_INDUCTOR_LOG=1``
-     - *Deprecated*. Use ``TORCH_LOGS='torch_spyre.inductor'``. Enables Spyre
-       Inductor logging (INFO level)
-   * - ``SPYRE_INDUCTOR_LOG_LEVEL=DEBUG``
-     - *Deprecated*. Use ``TORCH_LOGS='+torch_spyre.inductor'`` (DEBUG level).
-       Sets Spyre Inductor log verbosity
+   * - ``SPYRE_HAZARD_TRACKER``
+     - Split the program-correction triple across the ``S_prep`` and
+       ``S_dev`` streams and let flex insert the cross-stream H2D-to-compute
+       edge, overlapping the two stages. Off by default, which keeps the
+       single-stream FIFO ordering. On values match flex's grammar exactly:
+       ``1``, ``true``, ``t``, ``yes``, ``y``
    * - ``SPYRE_LOG_FILE=path``
      - *Deprecated*. Mapped to the top-level ``spyre`` logger file handler.
        Redirects Spyre Inductor logs to a file
@@ -722,8 +727,9 @@ Environment Variables
    * - ``CO_OPTIMIZING_LX_PLANNING``
      - Use the co-optimizing LX allocator strategy (default ``1``)
    * - ``CPSAT_TIME_LIMIT_SECONDS``
-     - Wall-clock budget for one CP-SAT solve (default ``30``; ``0``
-       disables the limit)
+     - Wall-clock budget for one CP-SAT solve (default ``60``; ``0``
+       disables the limit). Applies separately to each optimization phase.
+       A timeout may return a feasible plan without proving optimality.
    * - ``HBM_POOL_PLANNING``
      - Enable HBM-pool planning for intermediates not in LX
        (default ``1``)
@@ -732,6 +738,13 @@ Environment Variables
        passed in as ``%pool_base_addr``, instead of the backend
        self-allocating via ``sdscbundle.device_mem_allocate``
        (default ``0``)
+   * - ``SPYRE_BACKEND_LOOP_UNROLL``
+     - Enable SDSC-bundle backend loop unrolling (default ``1``). Set ``0``
+       to preserve counted device loops; this requires autopilot. Set before
+       importing torch-spyre. Accepts case-insensitive ``1``/``true``/``yes``
+       and ``0``/``false``/``no``; invalid values raise an error. The resolved
+       boolean is part of the kernel cache key. See
+       :doc:`/compiler/working_set_reduction` for Python configuration.
    * - ``SPYRE_CORE_ID_K_FAST_EMISSION``
      - Permute physical core IDs at SDSC emission so K-collaborator cores
        sit on adjacent ring positions, reducing PSUM chain hops (default
@@ -739,10 +752,6 @@ Environment Variables
    * - ``BUNDLE_SYMBOLIC_ARGS``
      - Emit LPDDR5 tensor addresses as runtime symbols rather than baked
        integers (default ``1``)
-   * - ``TORCHINDUCTOR_COMPILE_THREADS``
-     - Number of Inductor compile workers. Independent backend kernels compile in
-       parallel when this is greater than ``1``; a value of ``1`` executes
-       compilation inline
    * - ``LAYOUT_SOLVER``
      - LX scratchpad layout solver strategy: ``cpsat`` (default),
        ``greedy``, ``bestfit``, ``firstfit``, ``simulated_annealing``.
@@ -763,35 +772,31 @@ Environment Variables
        op-spec IR at pipeline stage boundaries (default empty)
    * - ``TORCH_SPYRE_TIMING``
      - Record structured per-compile frontend timings: one JSON event per
-       pass pipeline and per pass, with input/output graph sizes
-       (default ``0``)
+       pass pipeline and per pass, with input/output graph sizes and
+       analysis-call counts (default ``0``)
    * - ``TORCH_SPYRE_TIMING_OUT``
      - Destination for the ``TORCH_SPYRE_TIMING`` record. The pid is
        inserted before the suffix, so ``rec.json`` is written as
        ``rec.<pid>.json``. Empty writes nothing (default empty)
+   * - ``TORCH_SPYRE_FRONTEND_ONLY``
+     - Measurement mode: run a compile through backend-input generation and
+       stop before the backend compiler. Produces no runnable kernel --
+       calling one raises (default ``0``)
    * - ``SPYRE_DUMP_COST``
      - Print the predicted-runtime report after pre-scheduling: one total
        plus a per-kernel breakdown (default ``0``).
        See :doc:`/compiler/cost_model`
-   * - ``TORCH_SPYRE_NATIVE_PACKER``
-     - Use the C++ permutation-layout packer accelerator in the
-       simulated-annealing layout solver (default ``1``; set ``0`` to force
-       the pure-Python packer). No effect unless
-       ``LAYOUT_SOLVER=simulated_annealing``.
-       See :doc:`/compiler/simulated_annealing_layout`
    * - ``MAX_BUCKETS``
      - Maximum number of work division buckets (default ``32``)
    * - ``MIN_DEFAULT_GRANULARITY``
      - Minimum default granularity for work division (default ``4``)
-   * - ``SPYRE_INDUCTOR_IGNORE_HINTS``
-     - Ignore ``spyre_hint`` annotations: ``work_div={...}``
-       work-division hints, hint-based working-set reduction, and
-       span-overflow coarse-tiling hints (default ``0``)
+   * - ``SPYRE_INDUCTOR_IGNORE_WORK_DIV_HINTS``
+     - Ignore ``spyre_hint(work_div={...})`` work-division hints and use
+       the automatic work-distribution planner (default ``0``)
    * - ``SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS``
-     - Ignore only span-overflow coarse-tiling hints; a narrower
-       alternative to ``SPYRE_INDUCTOR_IGNORE_HINTS``.  Defaults to
-       ``1`` (disabled/opt-in): set to ``0`` to enable automatic
-       span-overflow coarse tiling.
+     - Ignore the compiler-generated span-overflow coarse-tiling hints.
+       Defaults to ``1`` (disabled/opt-in): set to ``0`` to enable
+       automatic span-overflow coarse tiling.
    * - ``SPYRE_INDUCTOR_SDSC_CACHE``
      - Cache and reuse ``sdsc.json`` files during codegen when two OpSpecs
        produce identical SuperDSC content, reducing bundle size for
@@ -815,10 +820,21 @@ Environment Variables
    * - ``KTIR_DEVICE_MLIR``
      - Path to a ``.mlir`` file declaring the target device for the KTIR
        execution path (default empty)
+   * - ``SPYRE_BACKEND_COMPILE_TIMEOUT_SECONDS``
+     - Wall-clock limit on one backend-compiler (``dbo-opt``) invocation,
+       on both the SDSC bundle and KTIR paths (default ``60``;
+       non-positive values disable the limit)
    * - ``ENABLE_LX_CONTEXT_SWITCHING``
      - Bracket opaque ``FallbackKernel`` calls that have no native Spyre
        lowering with per-buffer LX dump and restore clones, so LX-resident
        buffers survive the call (default ``1``; set ``0`` to disable)
+   * - ``SPYRE_LX_SOLVER_RELAYOUT``
+     - Let a co-optimizing solver that decides LX relayouts (today only
+       CP-SAT) choose them (default ``1``). Set ``0`` to offer it no relayout
+       candidates, so an edge whose views differ spills to HBM and nothing
+       else about the plan changes. Unlike ``SPYRE_LX_PLANNER_RELAYOUT=0``,
+       restickify residency and fused-axis views stay on. Used by the
+       cost-model sweep to measure the spill side of an edge
    * - ``SPYRE_LX_SOLVER_RELAYOUT_GROUPS_PER_EDGE``
      - Number of destination views the CP-SAT relayout enumeration keeps per
        (source, consumer) edge, cheapest first (default ``4``; ``0`` keeps
@@ -831,18 +847,39 @@ Environment Variables
        leaves the graph unchanged (default ``1``; set ``0`` to disable)
    * - ``SPYRE_DUMP_COST_EXPR_FILE``
      - Append one JSON record per co-optimized graph with the symbolic cost
-       objective the solver minimizes, the chosen symbol values, and each
-       term evaluated under them (default empty)
+       objective, the chosen symbol values, each term evaluated under them,
+       the terms the solver adds outside the expression, and the total it
+       minimized (default empty)
    * - ``SPYRE_DUMP_COST_FILE``
      - Destination file for the ``SPYRE_DUMP_COST`` output. Empty writes to
        stderr (default empty)
    * - ``SPYRE_KERNEL_CACHE``
      - Cache compiled Spyre kernels on disk and reuse them across
-       invocations (default ``0``; set ``1`` to enable)
+       invocations (default ``0``; set ``1`` to enable). When enabled,
+       ``LIB_VERSION_FILE`` must point at the compiler version file, which
+       supplies the compiler version for the cache key. If it is unset, the
+       cache key cannot be computed: torch-spyre logs a warning and compiles
+       that kernel without caching instead of failing. Set
+       ``SPYRE_KERNEL_CACHE=0`` to run without caching when no version file is
+       available
+   * - ``LIB_VERSION_FILE``
+     - Path to the compiler version file read to form the kernel-cache key.
+       Used when ``SPYRE_KERNEL_CACHE=1``; if it is unset while caching is on,
+       that kernel is compiled without caching and a warning is logged
+   * - ``TORCH_SPYRE_CACHE_SCAN``
+     - Let the FX graph and AOTAutograd caches keep graphs that use the
+       ``scan`` op, such as attention built on ``for_each_tile`` (default
+       ``1``; set ``0`` to disable). Without it, these graphs compile again in
+       every process. It uses Inductor's ``unsafe_marked_cacheable_functions``
+       (see ``_allow_scan_graph_caching``). With ``SPYRE_KERNEL_CACHE=1`` too,
+       a restart also reuses the compiled Spyre kernels for these graphs
    * - ``SPYRE_NUM_CPUS``
-     - Override the CPU count CP-SAT uses to size its search worker pool.
-       When unset the count is derived from the cgroup v2 quota, then
-       ``psutil``, then ``os.cpu_count()``
+     - CPUs CP-SAT uses to size its search worker pool (config
+       ``num_cpus``; ``config.patch(num_cpus=1)`` gives one worker). When
+       unset, or not a positive integer, ``num_cpus`` is ``None`` and the
+       count is derived from the cgroup v2 quota, then ``psutil``, then
+       ``os.cpu_count()``. Not part of the compile cache key, so a cached
+       compile is reused whatever the value
 
 **Device enumeration** (``torch_spyre/csrc/spyre_device_enum.cpp``):
 
@@ -859,6 +896,10 @@ Environment Variables
    * - ``FLEX_DEVICE``
      - Select the underlying flex runtime mode (``PF``, ``VF``, or
        ``MOCK``)
+   * - ``LOCAL_RANK``
+     - Per-process rank set by torchrun. Seeds the logical Spyre device
+       index when ``set_device()`` has not been called (0 when unset;
+       invalid or out-of-range values raise)
 
 **Internal:**
 
@@ -883,3 +924,7 @@ Environment Variables
      - Verbose PyTorch Inductor logging
    * - ``TORCH_COMPILE_DEBUG=1``
      - Dump Inductor debug artifacts
+   * - ``TORCHINDUCTOR_COMPILE_THREADS``
+     - Number of Inductor compile workers. Independent backend kernels
+       compile in parallel when this is greater than ``1``; a value of
+       ``1`` executes compilation inline

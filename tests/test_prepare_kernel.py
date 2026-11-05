@@ -20,6 +20,7 @@ import hashlib
 import json
 import os
 import tempfile
+import uuid
 
 import pytest
 import torch
@@ -219,9 +220,9 @@ class TestPrepareKernel:
             # First step should be ComputeSpecialize
             assert job_plan.get_step_type(0) == "Compute"
 
-    def test_profiler_name_overrides_spyrecode_name_and_adds_step_suffix(self):
+    def test_profiler_event_name_overrides_spyrecode_name_and_adds_step_suffix(self):
         """Compiler provenance name identifies every device-compute step."""
-        profiler_name = "spyre_kernel_v1_fused_mm_" + "a" * 16
+        profiler_event_name = "spyre_kernel_v1_fused_mm_" + "a" * 16
         job_exec_plan = [
             {
                 "command": "ComputeOnDevice",
@@ -242,16 +243,16 @@ class TestPrepareKernel:
 
             job_plan = torch_spyre._C.prepare_kernel(
                 spyrecode_dir,
-                profiler_name=profiler_name,
+                profiler_event_name=profiler_event_name,
             )
 
-            assert job_plan.get_step_name(0) == f"{profiler_name}#0"
-            assert job_plan.get_step_name(1) == f"{profiler_name}#1"
+            assert job_plan.get_step_name(0) == f"{profiler_event_name}#0"
+            assert job_plan.get_step_name(1) == f"{profiler_event_name}#1"
 
-    def test_profiler_name_accepts_exact_aiupti_limit(self):
+    def test_profiler_event_name_accepts_exact_aiupti_limit(self):
         """The finalized name may fill the AIUPTI buffer through byte 127."""
         suffix = "#0"
-        profiler_name = "p" * (
+        profiler_event_name = "p" * (
             torch_spyre._C.AIUPTI_ACTIVITY_NAME_MAX_BYTES - len(suffix)
         )
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -259,15 +260,15 @@ class TestPrepareKernel:
 
             job_plan = torch_spyre._C.prepare_kernel(
                 spyrecode_dir,
-                profiler_name=profiler_name,
+                profiler_event_name=profiler_event_name,
             )
 
-            assert job_plan.get_step_name(0) == profiler_name + suffix
+            assert job_plan.get_step_name(0) == profiler_event_name + suffix
 
-    def test_profiler_name_rejects_final_name_over_aiupti_limit(self):
+    def test_profiler_event_name_rejects_final_name_over_aiupti_limit(self):
         """The C++ boundary checks the name after adding the step suffix."""
         suffix = "#0"
-        profiler_name = "p" * (
+        profiler_event_name = "p" * (
             torch_spyre._C.AIUPTI_ACTIVITY_NAME_MAX_BYTES - len(suffix) + 1
         )
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -279,10 +280,10 @@ class TestPrepareKernel:
             ):
                 torch_spyre._C.prepare_kernel(
                     spyrecode_dir,
-                    profiler_name=profiler_name,
+                    profiler_event_name=profiler_event_name,
                 )
 
-    def test_spyrecode_compute_name_is_preserved_without_profiler_name(self):
+    def test_spyrecode_compute_name_is_preserved_without_profiler_event_name(self):
         """Existing named SpyreCode plans retain their current behavior."""
         with tempfile.TemporaryDirectory() as tmpdir:
             spyrecode_dir = self.create_mock_spyrecode(
@@ -364,6 +365,85 @@ class TestPrepareKernel:
             # Should raise error for out-of-range index
             with pytest.raises(RuntimeError, match="Step index out of range"):
                 job_plan.get_step_type(999)
+
+    @pytest.mark.parametrize("num_corrections", [1, 2, 3])
+    @pytest.mark.parametrize(
+        "following_step", ["ComputeOnDevice", "DataTransfer", None]
+    )
+    def test_prepare_host_compute_sequence(self, num_corrections, following_step):
+        """Multiple correction blobs must prepare before the device compute."""
+        job_exec_plan = []
+        for i in range(num_corrections):
+            job_exec_plan.extend(
+                [
+                    {
+                        "command": "ComputeOnHost",
+                        "properties": {
+                            "ohandle": f"correction{i}",
+                            "size": "256",
+                            "ishape": ["0"],
+                            "ihandle": "",
+                            "hcm": {"vdci": {}, "senConstants": []},
+                        },
+                    },
+                    {
+                        "command": "DataTransfer",
+                        "properties": {
+                            "dirn": "false",
+                            "host_handle": f"correction{i}",
+                            "dev_ptr": str(120259084288 + i * 256),
+                            "size": "256",
+                        },
+                    },
+                ]
+            )
+
+        if following_step == "ComputeOnDevice":
+            job_exec_plan.append(
+                {
+                    "command": "ComputeOnDevice",
+                    "properties": {"job_bin_ptr": "120259084288"},
+                }
+            )
+        elif following_step == "DataTransfer":
+            job_exec_plan.append(
+                {
+                    "command": "DataTransfer",
+                    "properties": {
+                        "dirn": "true",
+                        "host_handle": "result",
+                        "dev_ptr": "120259084288",
+                        "size": "256",
+                    },
+                }
+            )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir, job_exec_plan=job_exec_plan
+            )
+            if following_step != "ComputeOnDevice":
+                error = (
+                    "Incomplete step sequence"
+                    if following_step is None
+                    else f"Step ordering violation at step {num_corrections}:"
+                )
+                with pytest.raises(RuntimeError, match=error):
+                    torch_spyre._C.prepare_kernel(spyrecode_dir)
+                return
+
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+            assert job_plan.num_steps() == num_corrections + 1
+            assert [job_plan.get_step_type(i) for i in range(job_plan.num_steps())] == [
+                "HostCompute"
+            ] * num_corrections + ["Compute"]
+            assert [
+                job_plan.get_step_stream_role(i) for i in range(job_plan.num_steps())
+            ] == ["Prep"] * num_corrections + ["Dev"]
+            assert all(
+                job_plan.get_step_pipeline_barrier(i)
+                for i in range(job_plan.num_steps())
+            )
 
     def test_prepare_emits_bare_split_triple(self):
         """prepare emits the bare split triple, independent of the flag.
@@ -832,6 +912,133 @@ class TestPrepareKernel:
 
             with pytest.raises(RuntimeError, match="Step index out of range"):
                 job_plan.get_step_pipeline_barrier(999)
+
+    def test_dev_only_plan_has_all_dev_roles(self):
+        """A pure ComputeOnDevice plan assigns Dev role to every step.
+
+        Guards that the two-stream role assignment never bleeds into legacy
+        single-stream plans: every step of a plain ComputeOnDevice plan must
+        carry role=Dev, never Prep.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir, exec_command="ComputeOnDevice"
+            )
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+            n = job_plan.num_steps()
+            assert n >= 1
+            roles = [job_plan.get_step_stream_role(i) for i in range(n)]
+            assert all(r == "Dev" for r in roles), (
+                f"Expected all Dev roles for a pure Compute plan, got {roles}"
+            )
+
+    def test_sdsc_bundle_dir_prefix_registered_via_provenance_profiler_event_name(self):
+        """prepare_kernel with profiler_event_name registers the prefix under that name."""
+        profiler_event_name = "spyre_kernel_v1_fused_mm_" + "a" * 16
+        sdsc_bundle_dir_prefix = uuid.uuid4().hex[:8]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(tmpdir)
+            torch_spyre._C.prepare_kernel(
+                spyrecode_dir,
+                profiler_event_name=profiler_event_name,
+                sdsc_bundle_dir_prefix=sdsc_bundle_dir_prefix,
+            )
+        assert (
+            torch_spyre._C.lookup_bundle_dir_prefix(profiler_event_name)
+            == sdsc_bundle_dir_prefix
+        )
+
+    def test_sdsc_bundle_dir_prefix_registered_without_provenance_profiler_event_name(
+        self,
+    ):
+        """Without a profiler_event_name (no provenance key), the prefix is still
+        registered under the directory-derived name_base and can be looked up.
+
+        This is the critical case: kernels compiled without a kernel-provenance
+        descriptor have no profiler_event_name, so the activity handler must still be
+        able to emit sdsc_bundle_dir_prefix by falling back to the directory
+        path as the registry key.
+        """
+        sdsc_bundle_dir_prefix = uuid.uuid4().hex[:8]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(tmpdir)
+            # No profiler_event_name — no provenance key is generated.
+            torch_spyre._C.prepare_kernel(
+                spyrecode_dir,
+                sdsc_bundle_dir_prefix=sdsc_bundle_dir_prefix,
+            )
+            # The name_base used by JobPlanBuilder mirrors the directory fallback
+            # in translateComputeOnDevice: <sdsc_dir>/<spyreCodeDir>/bundle.mlir
+            sdsc_dir = os.path.basename(tmpdir)
+            expected_name_base = os.path.join(sdsc_dir, "spyreCodeDir", "bundle.mlir")
+            assert (
+                torch_spyre._C.lookup_bundle_dir_prefix(expected_name_base)
+                == sdsc_bundle_dir_prefix
+            )
+
+    def test_sdsc_bundle_dir_prefix_registered_under_backend_command_name(self):
+        """Without a profiler_event_name, the name in the ComputeOnDevice command
+        becomes the activity name if present for which the prefix gets registerd.
+        The prefix does not get registered under the fallback directory name."""
+        sdsc_bundle_dir_prefix = uuid.uuid4().hex[:8]
+        backend_name = f"backend_kernel_{uuid.uuid4().hex}"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir,
+                job_exec_plan=[
+                    {
+                        "command": "ComputeOnDevice",
+                        "properties": {
+                            "job_bin_ptr": "120259084288",
+                            "name": backend_name,
+                        },
+                    }
+                ],
+            )
+            torch_spyre._C.prepare_kernel(
+                spyrecode_dir,
+                sdsc_bundle_dir_prefix=sdsc_bundle_dir_prefix,
+            )
+            fallback_name_base = os.path.join(
+                os.path.basename(tmpdir), "spyreCodeDir", "bundle.mlir"
+            )
+            assert (
+                torch_spyre._C.lookup_bundle_dir_prefix(backend_name)
+                == sdsc_bundle_dir_prefix
+            )
+            assert torch_spyre._C.lookup_bundle_dir_prefix(fallback_name_base) is None
+
+
+@pytest.mark.parametrize(
+    ("profiler_event_name", "expected_activity_name_base"),
+    [
+        (
+            "spyre_kernel_v1_fused_add_aaaaaaaaaaaaaaaa",
+            "spyre_kernel_v1_fused_add_aaaaaaaaaaaaaaaa",
+        ),
+        (
+            "spyre_kernel_v1_fused_mm_aaaaaaaaaaaaaaaa#17",
+            "spyre_kernel_v1_fused_mm_aaaaaaaaaaaaaaaa",
+        ),
+        (
+            "spyre_kernel_v1_fused_bmm_expand_silu_aaaaaaaaaaaaaaaa#step",
+            "spyre_kernel_v1_fused_bmm_expand_silu_aaaaaaaaaaaaaaaa#step",
+        ),
+        (
+            "spyre_kernel_v1_fused_scaled_dot_product_fused_attention_overrideable_aaaaaaaaaaaaaaaa#",
+            "spyre_kernel_v1_fused_scaled_dot_product_fused_attention_overrideable_aaaaaaaaaaaaaaaa",
+        ),
+        (
+            "deadbeef_sdsc_fused_linear/spyreCodeDir/bundle.mlir#2",
+            "deadbeef_sdsc_fused_linear/spyreCodeDir/bundle.mlir",
+        ),
+    ],
+)
+def test_activity_name_base(profiler_event_name, expected_activity_name_base):
+    assert (
+        torch_spyre._C.activity_name_base(profiler_event_name)
+        == expected_activity_name_base
+    )
 
 
 if __name__ == "__main__":
