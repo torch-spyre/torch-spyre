@@ -318,6 +318,13 @@ class GraphEditor:
                     )
 
         self.lowering.operations.remove(new_com_buf)
+        if lower_anchor is None and not input:
+            # An output clone copies the buffer's final value, so it runs right
+            # after the last op that writes it: the producer, or a later
+            # in-place mutation. ``buffer_users`` comes from get_buffer_users,
+            # which lists writers as well as readers, so "before the first
+            # user" would put the clone ahead of the producer it copies.
+            lower_anchor = self._last_writer(buf_name)
         if lower_anchor is not None:
             # Post-loop drain: insert after the loop's last member (an
             # Operation object, not a saved index -- earlier clones in the same
@@ -336,6 +343,16 @@ class GraphEditor:
             )
 
         return new_com_buf
+
+    def _last_writer(self, buf_name: str) -> Operation:
+        """The last op in the lowered order that writes ``buf_name``: its
+        producer, or a later op that mutates it in place."""
+        last = None
+        for op in self.lowering.operations:
+            if op.get_name() == buf_name or buf_name in op.get_mutation_names():
+                last = op
+        assert last is not None, f"no op in the graph writes {buf_name}"
+        return last
 
     def insert_clone_before_consumers(
         self,
