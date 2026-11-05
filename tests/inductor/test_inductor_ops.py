@@ -4518,15 +4518,21 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": {
                 "fp16": (
                     cached_randn((32, 8, 16, 1), dtype=torch.float16),
-                    cached_randn((32, 8, 16, 1), dtype=torch.float16, differentiation="b"),
+                    cached_randn(
+                        (32, 8, 16, 1), dtype=torch.float16, differentiation="b"
+                    ),
                 ),
                 "bfloat16": (
                     cached_randn((32, 8, 16, 1), dtype=torch.bfloat16),
-                    cached_randn((32, 8, 16, 1), dtype=torch.bfloat16, differentiation="b"),
+                    cached_randn(
+                        (32, 8, 16, 1), dtype=torch.bfloat16, differentiation="b"
+                    ),
                 ),
                 "fp32": (
                     cached_randn((32, 8, 16, 1), dtype=torch.float32),
-                    cached_randn((32, 8, 16, 1), dtype=torch.float32, differentiation="b"),
+                    cached_randn(
+                        (32, 8, 16, 1), dtype=torch.float32, differentiation="b"
+                    ),
                 ),
             },
         },
