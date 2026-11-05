@@ -1185,6 +1185,76 @@ class TileOwnershipGroupingTests(unittest.TestCase):
         cpu, device, _ = self._compile(fn, (x, y))
         self._assert_close(device, cpu)
 
+    def _assert_disagreeing_reads_refused(self, fn):
+        """Forced onto an op whose two reads of one buffer walk the tiled axis
+        differently, the apply refuses the spec instead of compiling it.
+
+        Each read does get its own advance, and each is right on its own, but
+        the device returned 70% wrong values: of the four d0 tiles only the
+        first came out right, the rest reading elements of the producer that
+        belong to another tile. The enumerator does not offer such an axis either --
+        both come from the one authority, try_resolve_tile_axis_loop_vars -- so
+        forcing it is what checks the refusal.
+        """
+        x = torch.randn(64, 64, 128, dtype=torch.float16)
+        y = torch.randn(64, 64, 128, dtype=torch.float16)
+        with self.assertRaises(Exception) as refusal:
+            self._compile_with_both_tiled_d0(fn, (x, y))
+        self.assertIn("two ways", str(refusal.exception))
+
+    def test_apply_refuses_a_transposed_second_read_of_one_producer(self):
+        def fn(x, y):
+            a = x + y
+            return a + a.permute(1, 0, 2)
+
+        self._assert_disagreeing_reads_refused(fn)
+
+    def test_apply_refuses_a_broadcast_second_read_of_one_producer(self):
+        # The broadcast read holds still on the tiled axis while the other read
+        # advances along it, which is the same disagreement.
+        def fn(x, y):
+            a = x + y
+            return a + a[0:1]
+
+        self._assert_disagreeing_reads_refused(fn)
+
+    def test_apply_takes_two_reads_that_agree(self):
+        # Both reads walk the tiled axis the same way, so there is nothing to
+        # disagree about: in step they share one nest, transposed they share one
+        # advance, and both are exact.
+        x = torch.randn(64, 64, 128, dtype=torch.float16)
+        y = torch.randn(64, 64, 128, dtype=torch.float16)
+
+        def in_step_twice(x, y):
+            a = x + y
+            return a + a
+
+        def transposed_twice(x, y):
+            a = x + y
+            return a.permute(1, 0, 2) + a.permute(1, 0, 2)
+
+        for fn, nests in ((in_step_twice, 1), (transposed_twice, 2)):
+            with self.subTest(fn=fn.__name__):
+                cpu, device, tiling = self._compile_with_both_tiled_d0(fn, (x, y))
+                self._assert_close(device, cpu)
+                self.assertEqual(len(_nests(tiling)), nests, _describe(tiling))
+
+    def test_apply_takes_two_reads_that_agree_only_on_the_tiled_axis(self):
+        # The comparison is per axis. Along d0 both reads move the same way,
+        # so they want the same advance and the tile is exact; that one read
+        # holds still on d1 where the other walks it does not matter, because
+        # d1 is not the axis being tiled.
+        x = torch.randn(64, 64, 128, dtype=torch.float16)
+        y = torch.randn(64, 64, 128, dtype=torch.float16)
+
+        def fn(x, y):
+            a = x + y
+            return a + a[:, 0:1]
+
+        cpu, device, tiling = self._compile_with_both_tiled_d0(fn, (x, y))
+        self._assert_close(device, cpu)
+        self.assertEqual(self._model_ops(tiling), ["buf0", "buf1"], _describe(tiling))
+
     def test_consumer_that_repeats_its_producer(self):
         # Unforced. repeat walks dim 1 of its input twice. The solve once tiled
         # the repeat on that dim, which the apply took and codegen then could
