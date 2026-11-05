@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""IR-level unit tests for insert_bmm_padding.
+"""Tests for padding: insert_bmm_padding at the IR level, and compiled ops on
+padded device layouts.
 
-Tests hook into CustomPreSchedulingPasses after insert_bmm_padding runs to inspect
-the operations list directly, without requiring end-to-end compilation to succeed.
+The IR-level classes hook into CustomPreSchedulingPasses after
+insert_bmm_padding runs and inspect the operations list directly, without
+requiring end-to-end compilation to succeed. The remaining classes compile and
+run on the device and compare against CPU.
 """
 
 import math
@@ -24,6 +27,7 @@ from unittest.mock import patch
 from typing import Any, Callable, Optional, TypeVarTuple, Unpack, override
 
 import sympy
+import pytest
 import torch
 import torch.fx as fx
 from torch._inductor import config as t_inductor_config
@@ -35,13 +39,15 @@ from torch._inductor.ir import (
     Reduction,
 )
 from torch._inductor.graph import GraphLowering
+from torch._inductor.utils import run_and_get_code
 from torch._inductor.virtualized import V
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
     parametrize,
 )
 
-from torch_spyre._C import get_elem_in_stick
+
+from torch_spyre._C import get_elem_in_stick, SpyreTensorLayout
 from torch_spyre._inductor import config as ts_inductor_config
 from torch_spyre._inductor import passes
 from torch_spyre._inductor.codegen import superdsc
@@ -57,7 +63,7 @@ from torch_spyre._inductor.padding import (
 )
 from torch_spyre._inductor.scratchpad import allocator
 from torch_spyre._inductor.scratchpad import utils as scratchpad_utils
-from utils_inductor import try_reinterpret_host_shape
+from utils_inductor import try_reinterpret_host_shape, total_core_split, cached_randn
 
 
 Ts = TypeVarTuple("Ts")
@@ -1708,6 +1714,90 @@ class TestMatmulCoordinateMaskingNaN(unittest.TestCase):
         self._assert_close_to_cpu(
             result, fn(a_cpu.float(), w_cpu.float(), y_cpu.float())
         )
+
+
+@t_inductor_config.patch("force_disable_caches", True)
+@instantiate_parametrized_tests
+class TestPaddedInputCoreDivision(unittest.TestCase):
+    """Core division of compiled ops on a graph input with a padded device layout.
+
+    The input's row dim is padded on the device only: the host shape is
+    unchanged and ``valid_elements`` records the real row count. The padded
+    extent divides evenly across the cores where the host extent does not, so
+    work division should split the padded extent (#741).
+    """
+
+    @staticmethod
+    def _run_times_two(x: torch.Tensor) -> tuple[torch.Tensor, list[str]]:
+        """Compile ``2 * x`` and run it on ``x``; return the output and the
+        generated source.
+
+        ``run_and_get_code`` resets Dynamo first, so every call compiles afresh.
+        """
+        return run_and_get_code(torch.compile(lambda t: 2 * t, dynamic=False), x)
+
+    @staticmethod
+    def _padded_rows_input(
+        rows: int, padded_rows: int
+    ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+        """Return a CPU tensor, its device copy with the row dim padded to
+        ``padded_rows``, and the padded ``device_size``."""
+        # Round to bf16 so the values are exact in dl16, Spyre's on-device
+        # format; then 2*x is exact, too.
+        x_cpu = cached_randn((rows, 64)).bfloat16().half()
+
+        base = SpyreTensorLayout([rows, 64], torch.float16)
+        ds = list(base.device_size)
+        ds[1] = padded_rows  # device dims are [sticks, rows, 64]
+        stl = SpyreTensorLayout(
+            ds, base.stride_map, base.device_dtype, base.valid_elements
+        )
+        x_spyre = x_cpu.to(device="spyre", device_layout=stl)
+
+        return x_cpu, x_spyre, ds
+
+    @parametrize("rows,padded_rows", [(7, 8), (13, 16)])
+    def test_pointwise_output_keeps_valid_elements(self, rows, padded_rows) -> None:
+        """The compiled output inherits the padded layout, including the real
+        row count in ``valid_elements``, not just the padded ``device_size``."""
+        x_cpu, x_spyre, ds = self._padded_rows_input(rows, padded_rows)
+        out, _ = self._run_times_two(x_spyre)
+
+        torch.testing.assert_close(out.cpu(), x_cpu * 2, atol=0.0, rtol=0.0)
+        self.assertEqual(
+            out.device_tensor_layout().valid_elements,
+            {(0, 2): 64, (1,): rows},
+        )
+
+    @parametrize(
+        "rows,padded_rows,sencores",
+        [
+            (61, 64, 4),
+            (251, 256, 8),
+        ],
+    )
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason="work division splits the host row extent, not the padded device extent (#741)",
+    )
+    def test_pointwise_splits_padded_rows(self, rows, padded_rows, sencores) -> None:
+        """A pointwise op on a row-padded input splits the padded rows across
+        all cores.
+
+        ``rows`` is prime with no divisor in 2..``sencores``, so the host extent
+        cannot split; ``padded_rows`` is a multiple of ``sencores``. One stick of
+        columns leaves the row dim as the only dim that can split, so the total
+        split must equal ``sencores``.
+        """
+        with ts_inductor_config.patch("sencores", sencores):
+            x_cpu, x_spyre, ds = self._padded_rows_input(rows, padded_rows)
+            out, source_codes = self._run_times_two(x_spyre)
+
+            # Multiplying by two is exact in fp16.
+            torch.testing.assert_close(out.cpu(), x_cpu * 2, atol=0.0, rtol=0.0)
+            self.assertEqual(out.device_tensor_layout().device_size, ds)
+            self.assertEqual(total_core_split(source_codes[0]), sencores)
 
 
 if __name__ == "__main__":
