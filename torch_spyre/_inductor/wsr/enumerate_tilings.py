@@ -123,18 +123,28 @@ def _output_stick_host_dim(op: ComputedBuffer) -> int | None:
     return _stick_host_dim(op, layout.device_layout)
 
 
-def _output_split_counts(op: ComputedBuffer, host_dim: int) -> list[int]:
-    """Legal split counts (> 1) for output ``host_dim``, exact divisors only.
+def _output_split_counts(
+    op: ComputedBuffer, host_dim: int
+) -> tuple[list[int], str | None]:
+    """Legal split counts (> 1) for output ``host_dim``, exact divisors only,
+    and why there are none when there are none.
 
     Delegates to ``_split_candidates_for_host_dim`` -- which already composes
     exact divisibility, ``_MAX_AUTO_TILE_SPLIT_COUNT``, the Reduction unit-extent
-    rejection, and both stick-alignment checks -- and drops the trivial ``1``.
+    rejection, both stick-alignment checks and the resize check -- and drops the
+    trivial ``1``.
     """
     try:
         candidates = _split_candidates_for_host_dim(op, host_dim)
-    except Unsupported:
-        return []
-    return [s for s in candidates if s > 1]
+    except Unsupported as exc:
+        return [], str(exc)
+    counts = [s for s in candidates if s > 1]
+    if not counts:
+        return (
+            [],
+            "no exact divisor passes the stick-alignment, resize and count checks",
+        )
+    return counts, None
 
 
 def _unit_tile_breaks_a_reader(
@@ -227,24 +237,16 @@ def _reduction_split_counts(op: ComputedBuffer, red_pos: int) -> list[int]:
     return legal
 
 
-def _lowering_accepts(op: ComputedBuffer, axis: TileAxis) -> bool:
-    """Whether the lowering can resolve ``axis`` on ``op`` to a loop variable.
+def _lowering_rejection(op: ComputedBuffer, axis: TileAxis) -> str | None:
+    """Why the lowering cannot resolve ``axis`` on ``op`` to a loop variable,
+    or ``None`` if it can.
 
     Asks :func:`try_resolve_tile_axis_loop_vars` -- the resolver
     ``tile_spec_to_dim_hints`` raises through -- so no option is offered that the
-    lowering would reject. A rejection is ordinary pruning here, not an error:
-    the reason is logged and the axis dropped.
+    lowering would reject. A rejection is ordinary pruning here, not an error.
     """
-    loop_vars, reason = try_resolve_tile_axis_loop_vars(op, TileSpec((axis,)))
-    if loop_vars is None:
-        logger.debug(
-            "enumerate_tile_options: dropping %s on %s: %s",
-            axis,
-            op.get_name(),
-            reason,
-        )
-        return False
-    return True
+    _, reason = try_resolve_tile_axis_loop_vars(op, TileSpec((axis,)))
+    return reason
 
 
 def _canonical_key(spec: TileSpec) -> tuple:
@@ -406,32 +408,25 @@ def canonical_tiling(spec: TileSpec) -> TileSpec:
     )
 
 
-def _tileable(op: object) -> bool:
-    """Whether ``op`` may be offered a coarse tiling at all. Not in a loop
-    group already, which ``apply_tilings`` would clobber by stamping
-    ``dim_hints`` wholesale: ``dim_hints`` marks the ops the hint and
-    span-overflow passes tiled, ``loop_info`` the members ``coarse_tile`` adds
-    around them (a copy-out, a restickify of a tiled read)."""
+def _untileable_reason(op: object) -> str | None:
+    """Why ``op`` may not be offered a coarse tiling at all, or ``None``. It
+    must not be in a loop group already, which ``apply_tilings`` would clobber
+    by stamping ``dim_hints`` wholesale: ``dim_hints`` marks the ops the hint
+    and span-overflow passes tiled, ``loop_info`` the members ``coarse_tile``
+    adds around them (a copy-out, a restickify of a tiled read)."""
+    if not isinstance(op, ComputedBuffer):
+        return f"a {type(op).__name__}, not a ComputedBuffer"
     # A mutation writes through its target's layout (MutationLayoutSHOULDREMOVE)
     # and has no device layout of its own to size or stick-check a tile
     # against; prediction refuses to tile it for the same reason.
-    return (
-        isinstance(op, ComputedBuffer)
-        and isinstance(op.get_layout(), FixedTiledLayout)
-        and not getattr(op, "dim_hints", [])
-        and getattr(op, "loop_info", None) is None
-    )
-
-
-def _static_extents(op: ComputedBuffer) -> bool:
-    """Whether ``op`` has no symbolic extent. With one, the applier cannot tile
-    it on any axis (:func:`_symbolic_extent_reason`). The resolver refuses its
-    output axes for the same reason; asking once here also covers the reduction
-    axes, which are resolved one dim at a time."""
-    reason = _symbolic_extent_reason(op)
-    if reason is not None:
-        logger.debug("enumerate_tilings: %s", reason)
-    return reason is None
+    layout = op.get_layout()
+    if not isinstance(layout, FixedTiledLayout):
+        return f"layout is a {type(layout).__name__}, not a FixedTiledLayout"
+    if getattr(op, "dim_hints", []):
+        return "already tiled by the hint or span-overflow pass (dim_hints)"
+    if getattr(op, "loop_info", None) is not None:
+        return "already a member of a coarse-tiling loop group (loop_info)"
+    return None
 
 
 def build_tiling_space(
@@ -442,30 +437,58 @@ def build_tiling_space(
     readers: Iterable[Operation] = (),
 ) -> TilingSpace:
     """The :class:`TilingSpace` for ``op``; empty domains for an op that cannot
-    be coarse-tiled at all (:func:`_tileable`, :func:`_static_extents`), which
-    is not an error -- untiled is always legal. An output dim the lowering's
-    resolver refuses (:func:`_lowering_accepts`) has an empty domain.
+    be coarse-tiled at all (:func:`_untileable_reason`, a stick dim coordinate
+    identity cannot name, :func:`_symbolic_extent_reason`), which is not an
+    error -- untiled is always legal. An output dim the lowering's resolver refuses
+    (:func:`_lowering_rejection`) has an empty domain.
 
     ``readers`` are the ops reading ``op``'s output; a unit tile some reader
     views through another shape is not admitted
     (:func:`_unit_tile_breaks_a_reader`).
+
+    Logs, at DEBUG, one line per call: what ``op`` is offered, and why each
+    refused dim -- or the whole op -- is refused. A caller that builds the
+    space repeatedly repeats the line.
     """
+    reason = _untileable_reason(op)
+    stick_dim = _output_stick_host_dim(op) if reason is None else None
+    if reason is None and stick_dim is None:
+        reason = "coordinate identity cannot name its stick dim"
+    if reason is None:
+        reason = _symbolic_extent_reason(op)
+    if reason is not None:
+        logger.debug("%s is offered no coarse tiling: %s", op.get_name(), reason)
+        return TilingSpace(max_dims=max_dims, output_counts={})
     output_counts: dict[int, list[int]] = {}
-    stick_dim = _output_stick_host_dim(op) if _tileable(op) else None
-    if stick_dim is not None and _static_extents(op):
-        n_out = len(op.data.ranges) if hasattr(op.data, "ranges") else 0
-        # Only a ComputedBuffer reader is re-indexed by the apply.
-        retiled_readers = [r for r in readers if isinstance(r, ComputedBuffer)]
-        for host_dim in range(n_out):
-            if host_dim == stick_dim:
-                continue  # fail closed on the stick dim (module docstring)
-            counts = [
-                count
-                for count in _output_split_counts(op, host_dim)
-                if not _unit_tile_breaks_a_reader(op, host_dim, count, retiled_readers)
-            ][:max_splits_per_dim]
-            if counts and _lowering_accepts(op, TileAxis(host_dim, counts[0])):
-                output_counts[host_dim] = counts
+    refused: dict[int, str] = {}
+    n_out = len(op.data.ranges) if hasattr(op.data, "ranges") else 0
+    # Only a ComputedBuffer reader is re-indexed by the apply.
+    retiled_readers = [r for r in readers if isinstance(r, ComputedBuffer)]
+    for host_dim in range(n_out):
+        if host_dim == stick_dim:
+            # Fail closed on the stick dim (module docstring).
+            refused[host_dim] = "the stick dim"
+            continue
+        counts, reason = _output_split_counts(op, host_dim)
+        counts = [
+            count
+            for count in counts
+            if not _unit_tile_breaks_a_reader(op, host_dim, count, retiled_readers)
+        ][:max_splits_per_dim]
+        if reason is None and not counts:
+            reason = "every count leaves a unit tile a reader views reshaped"
+        if reason is None:
+            reason = _lowering_rejection(op, TileAxis(host_dim, counts[0]))
+        if reason is None:
+            output_counts[host_dim] = counts
+        else:
+            refused[host_dim] = reason
+    logger.debug(
+        "%s is offered coarse tiling counts %s by output dim; refused %s",
+        op.get_name(),
+        output_counts,
+        "; ".join(f"dim {dim}: {why}" for dim, why in refused.items()),
+    )
     return TilingSpace(max_dims=max_dims, output_counts=output_counts)
 
 
@@ -493,7 +516,7 @@ def enumerate_tile_options(
 
     Every option lowers: each candidate dim is resolved through
     :func:`try_resolve_tile_axis_loop_vars` before any spec is built from it --
-    an output dim by :func:`_lowering_accepts`, a reduction dim inside
+    an output dim by :func:`_lowering_rejection`, a reduction dim inside
     :func:`_reduction_split_counts` -- and a dim the resolver rejects
     contributes no options. One check per dim is enough because the resolver
     reads each axis independently and from its ``host_dim`` and
@@ -504,8 +527,10 @@ def enumerate_tile_options(
         op, max_dims=max_dims, max_splits_per_dim=max_splits_per_dim, readers=readers
     ).enumerate()
     if (
-        _tileable(op)
-        and _static_extents(op)
+        _untileable_reason(op) is None
+        # The resolver refuses a symbolic op's output axes, but resolves the
+        # reduction axes one dim at a time, so the op is refused here.
+        and _symbolic_extent_reason(op) is None
         and isinstance(op.data, Reduction)
         and config.enable_reduction_tiling
         # No reduction tilings beside a size-1 reduction dim (module docstring).
