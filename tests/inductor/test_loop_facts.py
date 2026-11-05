@@ -191,8 +191,16 @@ def test_scheduler_loop_count_missing_depth_is_loud():
 
 class TestBroadcastBatchVars:
     """``pass_utils.broadcast_batch_vars`` reads the tiled dims through the
-    accessors. No compiled test reaches it (265 matmul, attention and loop tests
-    never called it), so it is pinned here on stand-in deps."""
+    accessors.
+
+    It is kept on purpose, and so is this test. ``find_matmul_generated_var``
+    calls it when given ``op`` (``propagate_layouts`` and ``read_copy_elision``
+    both pass it) as a second line of defence for when
+    ``coarse_tile._check_matmul_broadcast_batch_tiling``, which rejects its input
+    first, is loosened or bypassed. No compiled test reaches it (265 matmul,
+    attention and loop tests never called it), so it is pinned here on stand-in
+    deps: a ``SimpleNamespace`` index cannot tell a real ``MemoryDep`` from a stub.
+    """
 
     @staticmethod
     def _op(loop_info):

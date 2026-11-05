@@ -588,9 +588,9 @@ def coarse_tile_local_dim_split_domains(
     into it, rather than assuming a non-empty ``loop_tiled_reduction_dims``
     implies one exists.
     """
-    levels = enclosing_loops(ctx.op)
     if getattr(ctx.op, "loop_info", None) is None:
         return ConstraintResult()
+    levels = enclosing_loops(ctx.op)
 
     if getattr(ctx.op, JOINT_TILING_AND_DIVISION_ATTR, False):
         return ConstraintResult()  # see JOINT_TILING_AND_DIVISION_ATTR

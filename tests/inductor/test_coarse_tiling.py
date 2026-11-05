@@ -10767,8 +10767,10 @@ class TestHoistedInputClone(unittest.TestCase):
         self.assertIs(counted_loop_entry([hoisted_const, member], member), member)
 
     def test_the_allocator_path_matches_the_scratchpad_path(self):
-        # allocator._access_group_path says it mirrors utils.counted_loop_group_path;
-        # nothing else pins it (the one other test patches it out).
+        # Both are now one call to loop_facts.counted_loop_path, so they cannot
+        # drift apart. What this pins is the DEFAULT they share: an extern kernel
+        # that keeps its loop_info (a hoisted constant) is not in the loop.
+        # Nothing else pins _access_group_path (the one other test patches it out).
         from torch_spyre._inductor.scratchpad.allocator import _access_group_path
         from torch_spyre._inductor.scratchpad.utils import counted_loop_group_path
 

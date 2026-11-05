@@ -420,8 +420,11 @@ class DrainPlan:
 
 
 def _access_group_path(op: Operation) -> tuple[int, ...]:
-    """The op's counted-loop group path, mirroring utils.group_path exactly."""
+    """The op's counted-loop group path; an extern kernel runs once, so ``()``.
 
+    The same answer as ``scratchpad.utils.counted_loop_group_path``; both are
+    kept as named entry points for their callers.
+    """
     return counted_loop_path(op)
 
 
