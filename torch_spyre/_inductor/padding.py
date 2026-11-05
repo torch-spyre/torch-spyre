@@ -1272,9 +1272,9 @@ class DomainRangeTracer(DefaultHandler):
         else:
             if (pad := get_pad_value(reduction_type, dtype)) is not None:
                 required_padding = FiniteSet(pad)
-            for v in value:
+            for arg_index, v in enumerate(value):
                 if not v.is_subset(required_padding):
-                    raise InvalidDomain(required_padding, reduction_type)
+                    raise InvalidDomain(required_padding, reduction_type, arg_index)
             # other reductions can leave some garbage in padding
             return S.Reals
 
@@ -2028,7 +2028,7 @@ def track_padding_value(graph: GraphLowering) -> None:
                     tracer.buffer_input[op.name][name] = FiniteSet(pad_value)
 
             else:
-                raise ValueError("Infinite loop")
+                raise ValueError(f"Could not find an input padding that op {op.name}")
 
             if not padded:
                 tracer.buffer_range[op.name] = EmptySet

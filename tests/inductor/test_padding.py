@@ -1564,6 +1564,39 @@ class TestRecordedPadding(unittest.TestCase):
         result = torch.compile(fn, fullgraph=True, dynamic=True)(x.to("spyre"))
         torch.testing.assert_close(result.cpu(), fn(x))
 
+    def test_unmaskable_op_on_unrecorded_padding_warns(self) -> None:
+        # Depthwise conv needs zero padding on both inputs and cannot be
+        # coordinate-masked. With no recorded padding on either input the
+        # analysis must ask for zero padding on each input in turn: the
+        # reduction has to name the input it rejects (arg_index), or the retries
+        # keep blaming input 0 and end in "Infinite loop". No pass rewrites
+        # padding yet, so the result is the "incompatible values" warning.
+        from torch_spyre._C import SpyreTensorLayout, get_device_dtype
+
+        dtype = get_device_dtype(torch.float16)
+        x = torch.randn(1, 16, 64, dtype=torch.float16)
+        w = torch.randn(16, 1, 3, dtype=torch.float16)
+        # 16 channels in a 64-wide stick: 48 padding elements per stick.
+        x_dev = x.to(
+            device_layout=SpyreTensorLayout([64, 1, 1, 64], [1, -1, 1024, 64], dtype)
+        )
+        w_dev = w.to(
+            device_layout=SpyreTensorLayout([3, 1, 1, 64], [1, -1, 3, 3], dtype)
+        )
+        # An in-place compiled graph leaves the padding unrecorded.
+        for t in (x_dev, w_dev):
+            torch.compile(lambda a: a.mul_(1), dynamic=False)(t)
+            self.assertIsNone(t.device_tensor_layout().padding_value)
+
+        def conv(x, w):
+            return torch.conv1d(x, w, None, stride=1, padding=0, groups=16)
+
+        with self.assertLogs("spyre.inductor.padding", level="WARNING") as logs:
+            result = torch.compile(conv, dynamic=False)(x_dev, w_dev)
+        self.assertTrue(any("incompatible values" in m for m in logs.output))
+        # The padding is in fact still zero here, so the result is correct.
+        torch.testing.assert_close(result.cpu(), conv(x, w), atol=0.5, rtol=0.1)
+
     def test_eager_inplace_clears_recorded_padding(self) -> None:
         # In-place eager ops write self through a compiled copy_from_d2d.
         t = self._filled(5.0)
