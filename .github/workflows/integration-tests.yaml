@@ -217,6 +217,69 @@ jobs:
       CLICKHOUSE_DB: ${{ inputs.clickhouse_env == 'prod' && secrets.CLICKHOUSE_DB || secrets.CLICKHOUSE_DB_DEV }}
       CLICKHOUSE_DB_V2: ${{ inputs.clickhouse_env == 'prod' && secrets.CLICKHOUSE_DB_V2 || secrets.CLICKHOUSE_DB_V2_DEV }}
 
+  # Reports whether any upstream PyTorch config carries this tier, so run-upstream-tests is skipped rather than handed an empty matrix.
+  upstream-configs:
+    name: Check upstream configs for this tier
+    runs-on: ubuntu-latest
+    outputs:
+      has_configs: ${{ steps.tier.outputs.has_configs }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          repository: ${{ inputs.repository || github.repository }}
+          sparse-checkout: |
+            tests/configs/upstream_tests
+            tests/oot_framework/utils/filter_configs.py
+          sparse-checkout-cone-mode: false
+
+      - name: Check which upstream configs carry this tier
+        id: tier
+        env:
+          TEST_TYPE: ${{ inputs.test_type || 'integration' }}
+        run: |
+          pip install pyyaml --quiet
+          configs=$(python3 tests/oot_framework/utils/filter_configs.py \
+            --config-dir tests/configs/upstream_tests \
+            --test-type "${TEST_TYPE}" \
+            --format paths)
+          has_configs=false
+          if [ -n "${configs}" ]; then
+            has_configs=true
+          fi
+          echo "tier=${TEST_TYPE} upstream configs carrying it: ${has_configs}"
+          echo "has_configs=${has_configs}" >> "$GITHUB_OUTPUT"
+
+  # Upstream PyTorch configs carrying this tier, as upstream_tests.yaml runs them on a PR; trunk keeps its current scope.
+  run-upstream-tests:
+    # After run-tests, like runtests_nightly's model-ops leg: reuses its wheel and never races its run-wide artifact uploads.
+    needs: [upstream-configs, run-tests]
+    if: ${{ !cancelled() && needs.upstream-configs.outputs.has_configs == 'true' && inputs.test_type != 'trunk' }}
+    uses: ./.github/workflows/_test_matrix.yaml
+    with:
+      runner_label: linux
+      component: ${{ inputs.component || 'torch-spyre' }}
+      # Empty: run-tests already uploads this run's run-id artifact, and a second upload of that name fails.
+      run_id: ''
+      image_label: ${{ inputs.runner_label || 'image_spyre_backend' }}
+      extra_test_flags: -v
+      # The prebaked image sets TORCH_ROOT to its baked PyTorch tree, so only the checkout path clones one.
+      checkout_pytorch: ${{ !inputs.prebaked_image }}
+      ref: ${{ inputs.ref || '' }}
+      repository: ${{ inputs.repository || '' }}
+      test_type: ${{ inputs.test_type || 'integration' }}
+      config_dir: upstream_tests
+      prebaked_image: ${{ inputs.prebaked_image }}
+      # Reuse run-tests' wheel on the checkout path instead of building and uploading a second one.
+      torch_spyre_wheel_artifact_name: ${{ !inputs.prebaked_image && 'torch-spyre-wheel' || '' }}
+    secrets:
+      CLICKHOUSE_HOST: ${{ inputs.clickhouse_env == 'prod' && secrets.CLICKHOUSE_HOST || secrets.CLICKHOUSE_HOST_DEV }}
+      CLICKHOUSE_PORT: ${{ inputs.clickhouse_env == 'prod' && secrets.CLICKHOUSE_PORT || secrets.CLICKHOUSE_PORT_DEV }}
+      CLICKHOUSE_USER: ${{ inputs.clickhouse_env == 'prod' && secrets.CLICKHOUSE_USER || secrets.CLICKHOUSE_USER_DEV }}
+      CLICKHOUSE_PASS: ${{ inputs.clickhouse_env == 'prod' && secrets.CLICKHOUSE_PASS || secrets.CLICKHOUSE_PASS_DEV }}
+      CLICKHOUSE_DB: ${{ inputs.clickhouse_env == 'prod' && secrets.CLICKHOUSE_DB || secrets.CLICKHOUSE_DB_DEV }}
+      CLICKHOUSE_DB_V2: ${{ inputs.clickhouse_env == 'prod' && secrets.CLICKHOUSE_DB_V2 || secrets.CLICKHOUSE_DB_V2_DEV }}
+
   # ----------------------------------------------------------------------------------
   # Fan-in gate job which is similar to run-spyre-unit-tests in torch_spyre_tests.yaml
   # so callers can poll a single stable job name for pass/fail.
@@ -224,15 +287,24 @@ jobs:
   integration-test-result:
     name: Integration test result
     runs-on: ubuntu-latest
-    needs: run-tests
+    needs: [run-tests, upstream-configs, run-upstream-tests]
     if: always()
     steps:
       - name: Evaluate test results
         run: |
           RESULT="${{ needs.run-tests.result }}"
+          UPSTREAM_CHECK="${{ needs.upstream-configs.result }}"
+          UPSTREAM_RESULT="${{ needs.run-upstream-tests.result }}"
           echo "run-tests result: ${RESULT}"
+          echo "upstream-configs result: ${UPSTREAM_CHECK}"
+          echo "run-upstream-tests result: ${UPSTREAM_RESULT}"
 
-          if [[ "${RESULT}" == "success" ]]; then
+          if [[ "${UPSTREAM_CHECK}" != "success" ]]; then
+            echo "Could not check which upstream configs carry this tier."
+            exit 1
+          fi
+
+          if [[ "${RESULT}" == "success" && ( "${UPSTREAM_RESULT}" == "success" || "${UPSTREAM_RESULT}" == "skipped" ) ]]; then
             echo "All integration test suites passed."
             exit 0
           fi

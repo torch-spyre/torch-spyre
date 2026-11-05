@@ -41,7 +41,7 @@ from torch_spyre._inductor.propagate_layouts import (
     PropArg,
     _check_supported_input_sticks,
     _find_alt_target_stl,
-    find_stick_compatible_input_layout,
+    generate_stl_with_required_stick,
 )
 from torch_spyre._inductor.views import (
     _decompose_constant_offset,
@@ -725,8 +725,18 @@ class TestUnrepresentableStickCandidates(TestCase):
         dev = self._dtype()
         d0, d1, d2 = sympy.symbols("d0 d1 d2", integer=True, nonnegative=True)
         dep = MemoryDep("buf", 4096 * d0 + d2, (d0, d1, d2), (512, 4096, 4096))
-        bad = SpyreTensorLayout([512, 128, 1, 1, 64], [4096, 1, 8192, -1, 128], dev)
-        good = SpyreTensorLayout([512, 1, 1, 64], [4096, -1, -1, 1], dev)
+        bad = SpyreTensorLayout(
+            [512, 128, 1, 1, 64],
+            [4096, 1, 8192, -1, 128],
+            dev,
+            {(0,): 512, (1,): 128, (3,): 1, (2, 4): 64},
+        )
+        good = SpyreTensorLayout(
+            [512, 1, 1, 64],
+            [4096, -1, -1, 1],
+            dev,
+            {(0,): 512, (1, 3): 1, (2,): 1},
+        )
         return dep, bad, good
 
     def test_device_coordinates_raises_try_returns_none(self):
@@ -844,6 +854,7 @@ class TestFactorizedMatmulCandidates(TestCase):
                 [64, 2, 32, 64],
                 [4096, 64, 128, 1],
                 get_device_dtype(torch.float16),
+                {(0,): 64, (2,): 32, (1, 3): 128},
             )
         else:
             source = SpyreTensorLayout(
@@ -857,7 +868,12 @@ class TestFactorizedMatmulCandidates(TestCase):
     def test_canonicalization_is_independent_of_candidate_order(self):
         """Canonical layout is returned regardless of candidate list order."""
         dtype = get_device_dtype(torch.float16)
-        factorized = SpyreTensorLayout([8, 2, 32, 64], [4096, 64, 128, 1], dtype)
+        factorized = SpyreTensorLayout(
+            [8, 2, 32, 64],
+            [4096, 64, 128, 1],
+            dtype,
+            {(0,): 8, (2,): 32, (1, 3): 128},
+        )
         canonical = SpyreTensorLayout(
             [1, 8, 4096], [32768, 4096, 1], torch.float16, [0, 1, 2]
         )
@@ -865,7 +881,7 @@ class TestFactorizedMatmulCandidates(TestCase):
         for layouts in ([factorized, canonical], [canonical, factorized]):
             with self.subTest(first=layouts[0]):
                 arg, contraction = self._scenario(layouts)
-                result = find_stick_compatible_input_layout(
+                result = generate_stl_with_required_stick(
                     arg, contraction, BATCH_MATMUL_OP, "x"
                 )
                 self.assertEqual(result, canonical)
@@ -880,7 +896,7 @@ class TestFactorizedMatmulCandidates(TestCase):
             [0, 1, 2],
         )
 
-        result = find_stick_compatible_input_layout(
+        result = generate_stl_with_required_stick(
             arg, contraction, BATCH_MATMUL_OP, "x"
         )
 
@@ -910,7 +926,7 @@ class TestFactorizedMatmulCandidates(TestCase):
                 contraction_range=arg.dep.ranges[contraction],
             ):
                 with self.assertRaisesRegex(Unsupported, "contiguous host dimension"):
-                    find_stick_compatible_input_layout(
+                    generate_stl_with_required_stick(
                         arg, contraction, BATCH_MATMUL_OP, "x"
                     )
 
@@ -925,7 +941,7 @@ class TestFactorizedMatmulCandidates(TestCase):
         arg, contraction, _ = self._same_graph_attention_scenario(
             contraction_range=2048
         )
-        result = find_stick_compatible_input_layout(
+        result = generate_stl_with_required_stick(
             arg, contraction, BATCH_MATMUL_OP, "x"
         )
         self.assertEqual(list(result.device_size), [64, 64, 1, 64])
@@ -960,7 +976,7 @@ class TestFactorizedMatmulCandidates(TestCase):
         dep = MemoryDep(
             "x", 4096 * outer + contraction, (outer, contraction), (heads // 32, 4096)
         )
-        result = find_stick_compatible_input_layout(
+        result = generate_stl_with_required_stick(
             PropArg(dep, host, [source]), contraction, BATCH_MATMUL_OP, "x"
         )
         self.assertEqual(list(result.device_size), [1, 128, 1, 64])
@@ -969,14 +985,16 @@ class TestFactorizedMatmulCandidates(TestCase):
     def test_nonstandard_matmul_layout_is_not_canonicalized(self):
         """Non-STANDARD formats are returned unchanged by Pass 3."""
         dtype = get_device_dtype(torch.float16)
+        _ds = [8, 2, 32, 64]
         qfp8wt = SpyreTensorLayout(
-            [8, 2, 32, 64],
+            _ds,
             [4096, 64, 128, 1],
             dtype,
+            {(i,): _ds[i] for i in range(len(_ds))},
             ElementArrangement.QFP8WT,
         )
         arg, contraction = self._scenario([qfp8wt])
-        result = find_stick_compatible_input_layout(
+        result = generate_stl_with_required_stick(
             arg, contraction, BATCH_MATMUL_FP8_OP, "x"
         )
         self.assertEqual(result, qfp8wt)
@@ -1222,11 +1240,13 @@ class TestFlatDenseProjectionLayout(TestCase):
             [seq, heads, 1, B, 64],
             [K, head_dim, head_dim, seq * K, 1],
             get_device_dtype(torch.float16),
+            {(0,): seq, (1, 4): K, (2,): 1, (3,): B},
         )
         weight = SpyreTensorLayout(
             [heads, K, 64],
             [head_dim * N, 1, K],
             get_device_dtype(torch.float16),
+            {(0,): heads, (1,): K, (2,): 64},
         )
         x = PropArg(x_dep, x_host, [source])
         y = PropArg(y_dep, y_host, [weight])
@@ -1261,6 +1281,7 @@ class TestFlatDenseProjectionLayout(TestCase):
             [seq, heads, 1, B, 32],
             [K, head_dim, head_dim, seq * K, 1],
             get_device_dtype(torch.float32),
+            {(0,): seq, (1,): heads, (2,): 1, (3,): B, (4,): 32},
         )
         fp32_x = PropArg(
             x_dep,
@@ -1316,11 +1337,13 @@ class TestFlatDenseProjectionLayout(TestCase):
             [12, M, B, 64],
             [64, K, M * K, 1],
             get_device_dtype(torch.float16),
+            {(0, 3): K, (1,): M, (2,): B},
         )
         weight = SpyreTensorLayout(
             [12, K, B, 64],
             [64, N, K * N, 1],
             get_device_dtype(torch.float16),
+            {(0, 3): K, (1,): K, (2,): B},
         )
         x = PropArg(x_dep, x_host, [source])
         y = PropArg(y_dep, y_host, [weight])

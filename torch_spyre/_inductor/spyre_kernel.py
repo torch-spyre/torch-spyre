@@ -30,6 +30,7 @@ from torch._inductor.codegen.common import (
     REMOVED,
 )
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
+from torch._inductor.ir import ComputedBuffer, Pointwise
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ops_handler import DefaultHandler, StoreMode
 from torch._inductor.utils import IndentedBuffer, sympy_index_symbol, sympy_subs
@@ -46,6 +47,7 @@ from .constants import (
     MATMUL_REDUCTION_OPS,
     POOL_OPS,
     RESTICKIFY_OP,
+    RESTICKIFY_SUPPORTED_DEVICE_DTYPES,
     SEGMENT_OFFSETS,
     TWO_INPUT_REDUCTION_OPS,
 )
@@ -53,16 +55,24 @@ from . import config as _spyre_config
 from .core_mapping import (
     derive_operation_mapping,
     finalize_tensor_work_divisions,
+    matmul_reduction_dim,
     remap_work_division,
+    work_division_from_view,
 )
 from .errors import Unsupported
+from .lx_read_contracts import (
+    LocalReadEmission,
+    has_partial_read,
+    normalize_local_read as normalize_local_lx_subrange,
+)
 from .ir import FixedTiledLayout, SpyreConstantFallback
+from .sharded_hbm import placement_of
 from .scratchpad.lx_relayout import (
     materialized_lx_relayout_for_destination,
-    work_division_from_view,
 )
 from .pass_utils import (
     concretize_expr,
+    op_read_writes,
     compute_symbolic_bounds,
     finite_upper_or_none,
     iteration_space,
@@ -75,6 +85,7 @@ from .pass_utils import (
 )
 from .views import align_tensors, tiling_expr_to_device_expr
 from .logging_utils import get_inductor_logger
+from .loop_facts import enclosing_loops
 from .op_spec import (
     IndirectAccess,
     LX_RELAYOUT_INFO_KEY,
@@ -546,6 +557,27 @@ def _tile_advance_expr_from_dep(
     return dep.index.subs(subs)
 
 
+def _non_unified_shard_bytes(name: str, layout: FixedTiledLayout) -> int:
+    """Per-shard device bytes of a sharded kernel tensor, else 0.
+
+    The chunks hold shards in the default layout of the shard-local shape, so
+    the tensor's committed layout must be the default global layout; a
+    restickified or otherwise relaid tensor cannot use chunk addressing.
+    """
+    placement = placement_of(name)
+    if placement is None:
+        return 0
+    from torch_spyre._C import SpyreTensorLayout
+
+    size = [int(s) for s in layout.size]
+    if layout.device_layout != SpyreTensorLayout(size, layout.dtype):
+        raise Unsupported(
+            f"{name}: non-unified kernels need sharded tensors in the default "
+            f"device layout; got {layout.device_layout}"
+        )
+    return placement.shard_device_bytes
+
+
 class SpyreKernel(Kernel[CSEVariable]):
     overrides = SpyreOpFuncs  # type: ignore[assignment]
 
@@ -562,6 +594,9 @@ class SpyreKernel(Kernel[CSEVariable]):
         self.scheduled_nodes: list[SchedulerNode] = []
         self.failed_node: SchedulerNode | None = None
         self.pool_size: int = pool_size
+        self.local_read_contract_factory: (
+            Callable[[str, Any], LocalReadEmission | None] | None
+        ) = None
         # Live call args, deduped and filtered to names in spyre_kernel_args.
         # Set by codegen_kernel(); used by call_kernel() to ensure arg_index
         # values match .run() positional args.
@@ -890,6 +925,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             tensor.layout.device_layout.device_size,
             device_coords,
             it_space,
+            allow_extended=_spyre_config.lx_extended_ownership,
         )
         tensor_arg = TensorArg(
             is_input,
@@ -904,7 +940,28 @@ class SpyreKernel(Kernel[CSEVariable]):
             work_division=work_division,
             kernel_local=kernel_local,
             replicated_scalar=replicated_scalar,
+            non_unified_shard_bytes=_non_unified_shard_bytes(name, tensor.layout),
         )
+        if (
+            _spyre_config.lx_planner_relayout
+            and not _spyre_config.ktir_emitter
+            and tensor_arg.is_input
+            and "lx" in tensor_arg.allocation
+            and isinstance(operation, ComputedBuffer)
+            and isinstance(operation.data, Pointwise)
+        ):
+            reads = [dep for dep in op_read_writes(operation).reads if dep.name == name]
+            if has_partial_read(V.graph.get_buffer(name).layout.size, reads):
+                if self.local_read_contract_factory is None:
+                    raise ValueError(f"{name}: local LX contract provider is missing")
+                contract = self.local_read_contract_factory(name, operation)
+                tensor_arg = normalize_local_lx_subrange(
+                    contract,
+                    name,
+                    tensor_arg,
+                    it_space,
+                    allow_extended=_spyre_config.lx_extended_ownership,
+                )
         if (
             "lx" not in tensor.layout.allocation
             and "hbm_pool" not in tensor.layout.allocation
@@ -976,6 +1033,10 @@ class SpyreKernel(Kernel[CSEVariable]):
             # Check if operation supports the argument's dtype
             if not (
                 op == IDENTITY_OP
+                or (
+                    op == RESTICKIFY_OP
+                    and arg.device_dtype in RESTICKIFY_SUPPORTED_DEVICE_DTYPES
+                )
                 or DtypeOpTable.is_dtype_op(op)
                 or (op in SPYRE_FP32_OPS and arg.device_dtype == DataFormats.IEEE_FP32)
                 or (
@@ -1008,10 +1069,9 @@ class SpyreKernel(Kernel[CSEVariable]):
         # device_tile_advance_expr.coeff(sym) resolves to that level's own
         # contribution regardless of how many host dims it tiles.
         li = getattr(ir_node, "loop_info", None)
-        raw_tiled_dims: list[list[int]] = li.loop_tiled_dims if li is not None else []
-        raw_tiled_red_dims: list[list[int]] = (
-            li.loop_tiled_reduction_dims if li is not None else []
-        )
+        loops = enclosing_loops(ir_node)
+        raw_tiled_dims = [loop.tiled_dims for loop in loops]
+        raw_tiled_red_dims = [loop.tiled_reduction_dims for loop in loops]
         # A dim tiled down to a per-tile extent of 1 is squeezed out of the
         # op's own iteration space entirely (no d{i} symbol survives), so it
         # is invisible to loop_tiled_dims/loop_tiled_reduction_dims and can
@@ -1031,11 +1091,9 @@ class SpyreKernel(Kernel[CSEVariable]):
         raw_squeezed_advance_output: list[list[tuple]] = (
             li.squeezed_advance_output if li is not None else []
         )
-        # CoarseTileInfo always constructs loop_tiled_dims and
-        # loop_tiled_reduction_dims with the same length (one sublist per
-        # nesting level), so max() is just a safety net; in practice both
-        # lists have the same length and the per-level loop below never
-        # silently drops an entry from the shorter one.
+        # enclosing_loops gives one entry per nesting level, so the first two
+        # terms are both the loop depth; max() keeps a squeezed record that
+        # (malformed) runs deeper than the loop nest from being dropped.
         n_levels = max(
             len(raw_tiled_dims),
             len(raw_tiled_red_dims),
@@ -1046,7 +1104,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         tiled_symbol_trip_counts: dict = {}
         tiled_syms: list[list] = []
         if n_levels > 0:
-            loop_count = li.loop_count if li is not None else []
+            loop_count = [loop.trip_count for loop in loops]
 
             op_name = ir_node.get_operation_name()
             tiled_syms_per_level_outermost: list[list] = []
@@ -1751,6 +1809,11 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                                 buf.writeline("kernel_local=True,")
                             if arg.replicated_scalar:
                                 buf.writeline("replicated_scalar=True,")
+                            if arg.non_unified:
+                                buf.writeline(
+                                    "non_unified_shard_bytes="
+                                    f"{arg.non_unified_shard_bytes},"
+                                )
                             if arg.device_tile_advance_expr is not None:
                                 buf.writeline(
                                     "device_tile_advance_expr="
@@ -1961,6 +2024,8 @@ def simplify_op_spec(
                 c.xreplace(indirect_access_subs) for c in arg.device_coordinates
             ]
 
+    if op_spec.op in MATMUL_REDUCTION_OPS:
+        _restore_matmul_loop_order(op_spec)
     _finalize_tensor_work_divisions(op_spec)
     is_relayout = is_lx_relayout_identity(op_spec.op, op_spec.args, op_spec.op_info)
     if is_relayout:
@@ -1972,6 +2037,44 @@ def simplify_op_spec(
         _finalize_core_mapping(op_spec, use_tensor_constraints=True)
         for arg in op_spec.args:
             arg.work_division = None
+
+
+def _restore_matmul_loop_order(op_spec: OpSpec) -> None:
+    """Make a matmul's reduction loop K its last loop again after alignment.
+
+    Inductor orders matmul loops batch, M, N, K. The K-fast core order, the SDSC
+    dim labels and the kernel provenance take K as the last loop. Alignment adds
+    a range-1 loop after K for each elided device dimension, and it puts this
+    loop in every tensor. Such a loop is a batch loop, so this step moves it to
+    the front. ``matmul_reduction_dim`` finds K from its role. The order does not
+    change when there is no single K, or when a tensor does not index a loop
+    after K. The readers then take the last loop as K.
+    """
+    reduction = matmul_reduction_dim(op_spec.iteration_space, op_spec.args)
+    if reduction is None:
+        logger.debug("%s: no single reduction loop; loop order kept", op_spec.op)
+        return
+    dims = list(op_spec.iteration_space)
+    trailing = dims[dims.index(reduction) + 1 :]
+    if not trailing:
+        return
+    for arg in op_spec.args:
+        indexed = {
+            symbol
+            for coordinate in arg.device_coordinates
+            for symbol in sympy.sympify(coordinate).free_symbols
+        }
+        if not indexed.issuperset(trailing):
+            logger.debug(
+                "%s: loops %s after K are not in every tensor; loop order kept",
+                op_spec.op,
+                trailing,
+            )
+            return
+    op_spec.iteration_space = {
+        dim: op_spec.iteration_space[dim]
+        for dim in trailing + dims[: dims.index(reduction) + 1]
+    }
 
 
 def _finalize_tensor_work_divisions(op_spec: OpSpec) -> None:

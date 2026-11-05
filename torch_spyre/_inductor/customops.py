@@ -868,8 +868,9 @@ def _(input: torch.Tensor) -> torch.Tensor:
 @torch.library.custom_op(
     "spyre::quantscalepertokenfp8", mutates_args=(), device_types="spyre"
 )
+@compile_once("spyre.quantscalepertokenfp8")
 def quantscalepertokenfp8(
-    input: torch.Tensor, scale_ub: float = FP8_E4M3FN_MAX
+    input: torch.Tensor, scale_ub: float = FP8_E4M3FN_MAX, compiled=None
 ) -> torch.Tensor:
     """
     Compute per-token quantization scale for FP8 conversion.
@@ -906,8 +907,11 @@ def quantscalepertokenfp8(
         >>> scale = torch.ops.spyre.quantscalepertokenfp8(x)
         >>> # scale.shape = [2, 4, 1]
         >>> x_fp8 = torch.ops.spyre.quantize_fp8_with_scale(x, scale)
+
+    Note:
+        - Supports eager mode via compile_once decorator
     """
-    pass
+    return compiled(input, scale_ub)
 
 
 @quantscalepertokenfp8.register_fake
@@ -1029,6 +1033,9 @@ def scaled_mm(
     """
     Raw FP8 matrix multiplication, with no scaling or bias applied.
 
+    mat1 [M, K] @ mat2 [K, N] -> [M, N]. Like torch._scaled_mm, this is 2D only:
+    use spyre.scaled_bmm, or its raw form spyre.bmm_fp8, for batched operands.
+
     Scaling (scale_a, scale_b) and bias are intentionally NOT applied here -
     they're applied afterward at the decomposition level by scaled_mm_decomp,
     mirroring how dequantize_fp8_with_scale keeps its FP8->FP16 conversion
@@ -1041,7 +1048,85 @@ def scaled_mm(
 def _(
     mat1: torch.Tensor, mat2: torch.Tensor, out_dtype: torch.dtype = None
 ) -> torch.Tensor:
+    if mat1.ndim != 2 or mat2.ndim != 2:
+        raise ValueError(
+            f"spyre.scaled_mm is 2D only, got {list(mat1.shape)} and "
+            f"{list(mat2.shape)}. Use spyre.scaled_bmm or spyre.bmm_fp8 for batched "
+            "operands."
+        )
     output_shape = [mat1.shape[0], mat2.shape[-1]]
+    return mat1.new_empty(output_shape, dtype=out_dtype or torch.float16)
+
+
+@torch.library.custom_op("spyre::bmm_fp8", mutates_args=(), device_types="spyre")
+def bmm_fp8(
+    mat1: torch.Tensor, mat2: torch.Tensor, out_dtype: torch.dtype = None
+) -> torch.Tensor:  # type: ignore[empty-body]
+    """
+    Raw FP8 batched matrix multiplication, with no scaling applied.
+
+    The batched counterpart to spyre.scaled_mm: mat1 [*batch, M, K] @
+    mat2 [*batch, K, N] -> [*batch, M, N], with one or two matching leading batch
+    dims, or mat1 [B, M, K] @ mat2 [K, N] -> [B, M, N], sharing mat2 across B.
+
+    Scaling is intentionally NOT applied here - scaled_bmm_decomp applies it
+    afterward, exactly as scaled_mm_decomp does for spyre.scaled_mm.
+
+    Maps to: deeptools batchmatmulfp8.
+    """
+    pass
+
+
+@bmm_fp8.register_fake
+def _(
+    mat1: torch.Tensor, mat2: torch.Tensor, out_dtype: torch.dtype = None
+) -> torch.Tensor:
+    # [*batch, M, K] @ [*batch, K, N] -> [*batch, M, N]
+    output_shape = [*mat1.shape[:-2], mat1.shape[-2], mat2.shape[-1]]
+    return mat1.new_empty(output_shape, dtype=out_dtype or torch.float16)
+
+
+@torch.library.custom_op("spyre::scaled_bmm", mutates_args=(), device_types="spyre")
+def scaled_bmm(
+    mat1: torch.Tensor,
+    mat2: torch.Tensor,
+    scale_a: torch.Tensor = None,
+    scale_b: torch.Tensor = None,
+    out_dtype: torch.dtype = None,
+    use_fast_accum: bool = False,
+) -> torch.Tensor:  # type: ignore[empty-body]
+    """
+    FP8 batched matrix multiplication with per-tensor scales applied.
+
+    mat1 [*batch, M, K] @ mat2 [*batch, K, N] -> [*batch, M, N], with one or two
+    matching leading batch dims, or mat1 [B, M, K] @ mat2 [K, N] -> [B, M, N],
+    sharing mat2 across B. Used for FP8 attention QK, e.g.
+    query[B, H, S, D] @ key_T[B, H, D, S].
+
+    aten has no batched equivalent of _scaled_mm to decompose from, so this op
+    plays that role: scaled_bmm_decomp rewrites it into the raw spyre.bmm_fp8
+    followed by the scale multiplies, the same split scaled_mm_decomp performs
+    for torch._scaled_mm.
+
+    ``use_fast_accum`` is accepted for signature compatibility with the
+    consumers' scaled_bmm and with torch._scaled_mm, but is ignored: Spyre has
+    no fast 8-bit accumulation path, so there is no faster mode to select.
+    Passing True logs a warning rather than changing behaviour.
+    """
+    pass
+
+
+@scaled_bmm.register_fake
+def _(
+    mat1: torch.Tensor,
+    mat2: torch.Tensor,
+    scale_a: torch.Tensor = None,
+    scale_b: torch.Tensor = None,
+    out_dtype: torch.dtype = None,
+    use_fast_accum: bool = False,
+) -> torch.Tensor:
+    # [*batch, M, K] @ [*batch, K, N] -> [*batch, M, N]
+    output_shape = [*mat1.shape[:-2], mat1.shape[-2], mat2.shape[-1]]
     return mat1.new_empty(output_shape, dtype=out_dtype or torch.float16)
 
 
@@ -1337,23 +1422,6 @@ def stagger_to_standard_ea(x: torch.Tensor) -> torch.Tensor:
 @stagger_to_standard_ea.register_fake
 def _(x: torch.Tensor) -> torch.Tensor:
     return torch.empty_like(x)
-
-
-@torch.library.custom_op("spyre::prod_dim_int", mutates_args=(), device_types="spyre")
-def prod_dim_int(input: torch.Tensor, dim: int, keepdim: bool = False) -> torch.Tensor:
-    pass
-
-
-@prod_dim_int.register_fake
-def _(input: torch.Tensor, dim: int, keepdim: bool = False) -> torch.Tensor:
-    if dim < 0:
-        dim += input.ndim
-    out_shape = list(input.shape)
-    if keepdim:
-        out_shape[dim] = 1
-    else:
-        out_shape = out_shape[:dim] + out_shape[dim + 1 :]
-    return torch.empty(out_shape, dtype=input.dtype, device=input.device)
 
 
 @torch.library.custom_op(

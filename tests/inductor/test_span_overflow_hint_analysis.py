@@ -4117,6 +4117,10 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
                 _out_coords_for_bhld,
             ),
             patch(
+                "torch_spyre._inductor.wsr.loop_tiling_common.op_out_coords",
+                _out_coords_for_bhld,
+            ),
+            patch(
                 "torch_spyre._inductor.wsr.coarse_tile_span_overflow._bmm_k_symbol",
                 return_value=sympy.Symbol("k"),
             ),
@@ -4127,6 +4131,11 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             ),
             patch(
                 "torch_spyre._inductor.wsr.coarse_tile."
+                "_loop_var_to_reduction_ranges_pos",
+                return_value=0,
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.loop_tiling_common."
                 "_loop_var_to_reduction_ranges_pos",
                 return_value=0,
             ),

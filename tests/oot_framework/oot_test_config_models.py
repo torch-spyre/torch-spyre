@@ -223,6 +223,7 @@ class InputTensorSpec(BaseModel):
             device_size=device_size,
             stride_map=stride_map,
             device_dtype=device_dtype,
+            valid_elements={(i,): device_size[i] for i in range(len(device_size))},
         )
         logger.debug("Layout created: %s", stl)
 
@@ -1231,6 +1232,13 @@ class ModulesNamedItem(BaseModel):
     # Consumed by the out-of-tree custom module tests; ignored on devices with no
     # layout concept (e.g. CPU).
     apply_device_layout: bool = False
+
+    # FP8 matmul support for the out-of-tree custom module tests, which interpret
+    # both; the framework only carries them. ``fp8_linears``: submodule paths
+    # (relative; "" = this module) production runs as FP8 linears. ``precision``:
+    # a per-module tolerance, as upstream's overrides are keyed by dtype only.
+    fp8_linears: List[str] = []
+    precision: Optional[Precision] = None
 
     sample_inputs_func: InputsEdits = InputsEdits()  # Legacy: forward inputs only
     constructor_inputs: Optional[InputsEdits] = None  # New: explicit constructor inputs

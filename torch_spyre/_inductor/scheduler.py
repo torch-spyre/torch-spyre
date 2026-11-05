@@ -38,8 +38,10 @@ from .spyre_kernel import SpyreKernel
 from .ir import FixedTiledLayout
 from .pass_utils import iteration_space
 from .logging_utils import get_inductor_logger
+from .loop_facts import scheduler_enclosing_loops
 from .scratchpad.lx_relayout import (
     demote_lx_relayout_group,
+    local_lx_emission_contract,
     materialized_lx_relayout_for_destination,
 )
 from .op_spec import LoopSpec
@@ -96,13 +98,20 @@ class CountedLoopSchedulerNode(FusedSchedulerNode):
 
 
 def _loop_group_id(node: BaseSchedulerNode):
-    """Return the loop_group_id of the ir.Operation inside node, or None."""
-    for snode in node.get_nodes():
-        if isinstance(snode, SchedulerNode) and snode.node is not None:
-            loop_info = getattr(snode.node, "loop_info", None)
-            if loop_info is not None:
-                return loop_info.loop_group_id
-    return None
+    """The normalized ``loop_group_id`` tuple of the loop ``node`` is a member
+    of, or None.
+
+    A ``CountedLoopSchedulerNode`` (which includes the ``LoopSchedulerNode``
+    that a ``LoopNode`` becomes) is already a loop group, not a member of
+    another loop, so it gives None. Its first leaf carries the loop's own
+    ``loop_info``; reading that would make ``build_loop_scheduler_nodes``
+    wrap the structured node a second time, a nested ``LoopSpec`` that runs
+    the body ``trip_count`` squared times.
+    """
+    if isinstance(node, CountedLoopSchedulerNode):
+        return None
+    levels = scheduler_enclosing_loops(node)
+    return levels[-1].group_path if levels else None
 
 
 def _loop_count(node: BaseSchedulerNode, depth: int) -> sympy.Expr:
@@ -117,19 +126,9 @@ def _loop_count(node: BaseSchedulerNode, depth: int) -> sympy.Expr:
     For a nested op with ``loop_group_id = (g, 0)``, ``loop_count = [K1, K2]``
     and depth 0 → K1, depth 1 → K2.
     """
-    for snode in node.get_nodes():
-        if isinstance(snode, SchedulerNode) and snode.node is not None:
-            loop_info = getattr(snode.node, "loop_info", None)
-            if loop_info is not None:
-                counts: list = loop_info.loop_count
-                gid = loop_info.loop_group_id
-                # coarse_tile stamps one count per nesting level, so
-                # len(counts) == len(gid) always holds.
-                assert len(counts) == len(gid), (
-                    f"loop_count length {len(counts)} != loop_group_id depth {len(gid)}"
-                )
-                if 0 <= depth < len(counts):
-                    return counts[depth]
+    levels = scheduler_enclosing_loops(node)
+    if 0 <= depth < len(levels):
+        return levels[depth].trip_count
     raise AssertionError(f"Node {node.get_name()} has no loop_count for depth {depth}")
 
 
@@ -307,7 +306,12 @@ def build_loop_scheduler_nodes(
     seen: dict[tuple, str] = {}
     for node in result:
         if isinstance(node, CountedLoopSchedulerNode):
-            gid = _loop_group_id(node.get_nodes()[0])
+            # The member's own levels, not _loop_group_id: that is None for a
+            # nested loop node, which can be the first member.  A structured
+            # LoopSchedulerNode passed through is checked the same way, so a
+            # flat op of the same loop left outside it is caught here.
+            levels = scheduler_enclosing_loops(node.get_nodes()[0])
+            gid = levels[-1].group_path if levels else None
             if gid is not None:
                 key = gid[0:1]
                 name = node.get_name()
@@ -547,6 +551,9 @@ class SuperDSCScheduling(BaseScheduling):
         # _codegen_into_kernel may reach further inner nodes, so the set can be a
         # subset -- which errs towards declining.
         kernel.fused_node_names = OrderedSet(n.get_name() for n in nodes)
+        kernel.local_read_contract_factory = lambda name, consumer: (
+            local_lx_emission_contract(V.graph, name, consumer)
+        )
         with kernel:
             self._codegen_into_kernel(nodes, kernel)
         if isinstance(node, CountedLoopSchedulerNode):
