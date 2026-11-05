@@ -2678,25 +2678,14 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     conv_params = (
         dict(op_spec.op_info.get("conv_params", {})) if op_spec.op_info else {}
     )
-    pool_params_out: dict = {}
-    if is_pool and op_spec.op_info:
-        # Pool geometry lives under pool_params (like conv_params); "constants"
-        # carries only the SDSC-level op constants.
-        pool_params_out = dict(op_spec.op_info.get("pool_params", {}))
-        pool_constants = op_spec.op_info.get("constants", {})
-        # ``nmap`` is avgpool's window-mean multiplier.  maxpoolfwd is a pure
-        # window max with no normalization and requires ``opConsts_ == {}``, so
-        # emit nmap only when the lowering actually supplied a scaling factor.
-        # Keyed on the declared constant rather than on the opfunc string, so a
-        # future pool op opts in by what it declares.
-        if "scaling_factor" in pool_constants:
-            constants = {"nmap": pool_constants["scaling_factor"]}
-        else:
-            constants = {}
-    else:
-        constants = (
-            dict(op_spec.op_info.get("constants", {})) if op_spec.op_info else {}
-        )
+    # Pool geometry lives under pool_params (like conv_params); "constants"
+    # carries only the SDSC-level op constants, as for every other op.
+    pool_params_out: dict = (
+        dict(op_spec.op_info.get("pool_params", {}))
+        if is_pool and op_spec.op_info
+        else {}
+    )
+    constants = dict(op_spec.op_info.get("constants", {})) if op_spec.op_info else {}
     coordinate_masking = _get_coordinate_mask(
         sdsc_iteration_space, args[-1], padding, op_spec.op, args[:-1]
     )

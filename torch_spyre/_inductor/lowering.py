@@ -1151,9 +1151,9 @@ def lower_avg_pool2d(
         (kH, kW),
         (sH, sW),
         (pH, pW),
-        # scaling_factor is the window mean multiplier; codegen emits it as the
-        # `nmap` opConst.
-        constants={"scaling_factor": 1.0 / (kH * kW)},
+        # `nmap` is avgpoolfwd's window-mean multiplier. maxpoolfwd passes no
+        # constants: it requires opConsts_ == {}.
+        constants={"nmap": 1.0 / (kH * kW)},
     )
     if result is None:
         # Degenerate k==1 window (see _lower_pool2d).  Spyre has no eager
