@@ -237,7 +237,7 @@ class TestFp8KvCacheStickAlignment:
         # torch.zeros → to(device, device_layout=layout) mirrors allocate_pages.
         t = torch.zeros((num_slots, NUM_KV_HEADS, HEAD_SIZE), dtype=dtype).to(
             DEVICE, device_layout=layout
-        )  # type: ignore[no-matching-overload]
+        )
         assert t.device.type == "spyre"
         assert t.shape == (num_slots, NUM_KV_HEADS, HEAD_SIZE)
         assert t.dtype == torch.float8_e4m3fn
@@ -255,7 +255,7 @@ class TestFp8KvCacheStickAlignment:
             device_dtype=get_device_dtype(dtype),
         )
         shape = (NUM_BLOCKS, NUM_KV_HEADS, BLOCK_SIZE, HEAD_SIZE)
-        t = torch.zeros(shape, dtype=dtype).to(DEVICE, device_layout=layout)  # type: ignore[no-matching-overload]
+        t = torch.zeros(shape, dtype=dtype).to(DEVICE, device_layout=layout)
         assert t.device.type == "spyre"
         assert t.dtype == torch.float8_e4m3fn
         assert t.shape == shape

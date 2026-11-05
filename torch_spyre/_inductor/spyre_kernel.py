@@ -12,34 +12,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import itertools
-import logging
-import math
-from abc import ABC
 from dataclasses import dataclass, field
+import itertools
+import math
 from typing import Any, Callable, Self, Sequence, Tuple, Union
+from abc import ABC
 
-import sympy
 import torch
+import sympy
+
+from torch_spyre._C import DataFormats, ElementArrangement
+
+from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.codegen.common import (
-    REMOVED,
     CSEVariable,
     Kernel,
+    REMOVED,
 )
+from torch_spyre._inductor.dtype_ops import DtypeOpTable
 from torch._inductor.ir import ComputedBuffer, Pointwise
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ops_handler import DefaultHandler, StoreMode
-from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.utils import IndentedBuffer, sympy_index_symbol, sympy_subs
-from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
+from torch._inductor.virtualized import V
 
-from torch_spyre._C import DataFormats, ElementArrangement
-from torch_spyre._inductor.dtype_ops import DtypeOpTable
-from torch_spyre._inductor.provenance import build_debug_handle
 
-from . import config as _spyre_config
 from .constants import (
+    SPYRE_FP32_OPS,
+    SPYRE_INT32_OPS,
     CONV_OPS,
     DEPTHWISE_CONV_REDUCTION_OPS,
     IDENTITY_OP,
@@ -48,10 +49,9 @@ from .constants import (
     RESTICKIFY_OP,
     RESTICKIFY_SUPPORTED_DEVICE_DTYPES,
     SEGMENT_OFFSETS,
-    SPYRE_FP32_OPS,
-    SPYRE_INT32_OPS,
     TWO_INPUT_REDUCTION_OPS,
 )
+from . import config as _spyre_config
 from .core_mapping import (
     derive_operation_mapping,
     finalize_tensor_work_divisions,
@@ -66,40 +66,40 @@ from .lx_read_contracts import (
     normalize_local_read as normalize_local_lx_subrange,
 )
 from .ir import FixedTiledLayout, SpyreConstantFallback
+from .sharded_hbm import placement_of
+from .scratchpad.lx_relayout import (
+    materialized_lx_relayout_for_destination,
+)
+from .pass_utils import (
+    concretize_expr,
+    op_read_writes,
+    compute_symbolic_bounds,
+    finite_upper_or_none,
+    iteration_space,
+    iteration_space_with_splits,
+    indirect_access_subs_from_kernel,
+    input_layout_for_operation,
+    is_restickify_coords,
+    alignment_coordinates,
+    per_trip_index,
+)
+from .views import align_tensors, tiling_expr_to_device_expr
 from .logging_utils import get_inductor_logger
 from .loop_facts import enclosing_loops
 from .op_spec import (
-    LX_RELAYOUT_INFO_KEY,
     IndirectAccess,
+    LX_RELAYOUT_INFO_KEY,
     LoopSpec,
     OpSpec,
     TensorArg,
     TensorWorkDivision,
+    UnimplementedOp as OpSpecUnimplementedOp,
     format_op_spec_list,
     is_lx_relayout_identity,
 )
-from .op_spec import (
-    UnimplementedOp as OpSpecUnimplementedOp,
-)
 from .op_spec_validation import validate_op_specs
-from .pass_utils import (
-    alignment_coordinates,
-    compute_symbolic_bounds,
-    concretize_expr,
-    finite_upper_or_none,
-    indirect_access_subs_from_kernel,
-    input_layout_for_operation,
-    is_restickify_coords,
-    iteration_space,
-    iteration_space_with_splits,
-    op_read_writes,
-    per_trip_index,
-)
-from .scratchpad.lx_relayout import (
-    materialized_lx_relayout_for_destination,
-)
-from .sharded_hbm import placement_of
-from .views import align_tensors, tiling_expr_to_device_expr
+from torch_spyre._inductor.provenance import build_debug_handle
+import logging
 
 logger = get_inductor_logger("spyre_kernel")
 
@@ -1155,7 +1155,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         # call site too so an unexpected node shape can't fail create_op_spec.
         try:
             debug_handle = build_debug_handle(ir_node)
-        except Exception:
+        except Exception:  # noqa: BLE001 - provenance must never fail the build
             logger.warning(
                 "debug_handle construction failed for op %s; continuing without "
                 "provenance",

@@ -845,8 +845,8 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
 
     // For H2D, output (device) shape is the expanded form including batch dims.
     // For D2H, output (host) shape is the original cpu_sizes (all dims
-    // reversed). The batch dims are prepended in reversed order
-    // (innermost-first convention).
+    // reversed). The batch dims are appended after the four expanded dims in
+    // reversed (innermost-first) order.
     std::vector<int64_t> expanded_dev_shape = {si, so, dim2, dim3};
     for (size_t i = 2; i < cpu_sizes.size(); ++i)
       expanded_dev_shape.push_back(cpu_sizes[i]);

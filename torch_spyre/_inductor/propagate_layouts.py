@@ -13,15 +13,15 @@
 # limitations under the License.
 
 
-import logging
-import math
 from collections import Counter
 from typing import NamedTuple
 
+import logging
+import math
+
 import sympy
 import torch
-from torch._inductor.dependencies import MemoryDep
-from torch._inductor.graph import GraphLowering
+from .logging_utils import get_inductor_logger
 from torch._inductor.ir import (
     ComputedBuffer,
     DeviceCopy,
@@ -30,19 +30,22 @@ from torch._inductor.ir import (
     FixedLayout,
     InputBuffer,
     Layout,
-    MultiOutput,
     MutableBox,
     MutationLayoutSHOULDREMOVE,
+    MultiOutput,
+    ReinterpretView,
     Operation,
     Pointwise,
     Reduction,
-    ReinterpretView,
     StorageBox,
     TensorBox,
 )
+from torch._inductor.dependencies import MemoryDep
+from torch._inductor.graph import GraphLowering
 from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.virtualized import V
 
+from . import config
 from torch_spyre._C import (
     DataFormats,
     ElementArrangement,
@@ -50,11 +53,17 @@ from torch_spyre._C import (
     get_device_dtype,
     get_elem_in_stick,
 )
-
-from . import config
+from .dtype_ops import (
+    bool_equivalent_dtype,
+    bool_layout_dtype,
+    resolve_output_formats,
+    DtypeOpTable,
+)
+from .errors import Unsupported
+from .sharded_hbm import check_sharded_input, graph_placements, placement_from_tensor
 from .constants import (
-    BATCH_MATMUL_FP8_OP,
     BATCH_MATMUL_OP,
+    BATCH_MATMUL_FP8_OP,
     CONV2D_FWD_OP,
     COPY_BACK_CANDIDATE_ATTR,
     DEVICE_NAME,
@@ -62,44 +71,35 @@ from .constants import (
     REDUCTIONS_NON_STICK_DIM_ONLY,
     STAGGERED_EAS,
 )
-from .dtype_ops import (
-    DtypeOpTable,
-    bool_equivalent_dtype,
-    bool_layout_dtype,
-    resolve_output_formats,
-)
-from .errors import Unsupported
 from .ir import (
     AllGatherAsyncFallback,
     AllReduceAsyncFallback,
-    BroadcastAsyncFallback,
     FixedTiledLayout,
     SpyreConstantFallback,
     SpyreEmptyFallback,
+    BroadcastAsyncFallback,
     WaitWorkFallback,
 )
-from .logging_utils import get_inductor_logger
-from .optimize_restickify import AllSameNode, AnyInNode, FixedInOutNode
 from .pass_utils import (
     compute_restickify_target_layout,
     concretize_expr,
-    device_coordinates,
     expand_sparse,
     find_matmul_generated_var,
     find_reduction_var,
     get_matmul_m_size,
     get_matmul_n_size,
-    host_coordinates,
     identify_matmul_inputs,
+    host_coordinates,
+    device_coordinates,
+    try_device_coordinates,
     indirect_info_from_op,
     is_keep_by_index,
     is_stick_expr_offset_free,
     is_topk,
     iter_var_id,
     rescale_stl_for_dtype,
-    try_device_coordinates,
 )
-from .sharded_hbm import check_sharded_input, graph_placements, placement_from_tensor
+from .optimize_restickify import AllSameNode, AnyInNode, FixedInOutNode
 from .views import compute_coordinates, matching_dim
 
 # ---------------------------------------------------------------------------
@@ -502,7 +502,7 @@ def _qfp8wt_stl(
     output: FixedLayout,
     in_layout: FixedLayout,
 ) -> SpyreTensorLayout:
-    """Propagate special FP8 tensor with 2D stick [2, 64].
+    """Propagate special FP8 tensor with 2D stick [2, 64]
 
     The QFP8WT weight (KERNEL) tensor requires stick dimensions of [2, 64].  This
     function propagates the output layout for both aligned and unaligned input tensors.
@@ -520,13 +520,11 @@ def _qfp8wt_stl(
     in_eps = get_elem_in_stick(in_layout.dtype)
     stick_dim_size = concretize_expr(in_layout.size[-1])
     unaligned = stick_dim_size % in_eps
-    last_dim = in_eps if unaligned > 0 else concretize_expr(output.size[-1])
-
     outer_sizes = [concretize_expr(s) for s in output.size[:-1]]
     outer_strides = [concretize_expr(s) for s in output.stride[:-1]]
+    last_dim = in_eps if unaligned > 0 else concretize_expr(output.size[-1])
     c_size = outer_sizes + [last_dim]
     c_stride = outer_strides + [1]
-
     return SpyreTensorLayout(
         c_size,
         c_stride,
@@ -3577,7 +3575,10 @@ def propagate_spyre_tensor_layouts(
             if isinstance(op.layout, FixedLayout):
                 op.layouts = [generic_layout(op)]
                 op.restick_cost_fn = AnyInNode.from_args()
-        elif isinstance(op, (MultiOutput, SpyreConstantFallback)):
+        elif isinstance(op, MultiOutput):
+            op.layouts = [generic_layout(op)]
+            op.restick_cost_fn = AnyInNode.from_args()
+        elif isinstance(op, SpyreConstantFallback):
             op.layouts = [generic_layout(op)]
             op.restick_cost_fn = AnyInNode.from_args()
         elif isinstance(op, SpyreEmptyFallback):

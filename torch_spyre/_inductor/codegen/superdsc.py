@@ -35,7 +35,6 @@ from torch_spyre._inductor.constants import (
     IDENTITY_OP,
     INPUT_DIM_LABELS,
     INT32TOFP32_OP,
-    KEEP_BY_INDEX_OP,
     LAYOUT_LABELS,
     MATMUL_DIM_LABELS,
     MATMUL_LAYOUT_LABELS,
@@ -47,6 +46,7 @@ from torch_spyre._inductor.constants import (
     RESTICKIFY_OP,
     SPYRE_INT32_OPS,
     TOPK_OPS,
+    KEEP_BY_INDEX_OP,
 )
 from torch_spyre._inductor.core_mapping import matmul_reduction_dim
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
@@ -1650,6 +1650,7 @@ def _create_sdsc_tensors(
                 # accounts for the gap between the device extent and the
                 # iteration extent. Emitting a backGap for a conv op double-counts
                 # that gap and corrupts the generated addressing.
+                #
                 if not _is_conv(op_spec.op) and dev_dim_size > it_dim_size:
                     backGap[dim] = dev_dim_size - it_dim_size
                 elif (
@@ -1706,7 +1707,7 @@ def _create_sdsc_tensors(
         # Injected stick dims: set max_dim_size=1 for all tensors
         # that carry them in dim_order.
         if index_stick_syms:
-            for stick_sym in index_stick_syms.values():
+            for idx, stick_sym in index_stick_syms.items():
                 if stick_sym in dim_order:
                     injected_dim_sizes[stick_sym] = 1
 
@@ -1985,7 +1986,7 @@ def _extend_matmul_k_to_padded(
     reduction = matmul_reduction_dim(op_spec.iteration_space, op_spec.args)
     k_sym = symbol_mapping.get(reduction)
 
-    # Collect all symbols in y's device_coordinates (after symbol_mapping).
+    # Collect non-stick symbols in y's device_coordinates (after symbol_mapping).
     y_dim_order, y_stick_dim = _get_device_dim_order(y_arg, symbol_mapping)
     # y_stick_dim is the within-stick symbol; the remaining dims include K.
     y_non_stick_syms: set = set(y_dim_order) - ({y_stick_dim} if y_stick_dim else set())
@@ -2330,9 +2331,10 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     ref_arg = _ref_arg(op_spec)
     op_dim_order, op_stick_dim = _get_device_dim_order(ref_arg, symbol_mapping)
 
-    # On-device type-conversion ops (DL16TOFP32/FP32TODL16, not identity)
-    # require at least one outer spatial dim beyond the stick; inject a
-    # virtual mb=1 row when the op's tensor has only the stick dim.
+    # A dtype conversion that changes the elements per stick (DL16TOFP32,
+    # FP32TODL16, FP8TODL16, qfp8ch, qfp8wt) requires at least one outer spatial
+    # dim beyond the stick; inject a virtual mb=1 row when the op's tensor has
+    # only the stick dim.
     # op_dim_order is empty for a degenerate stick dim, which has no loop symbol.
     changes_stick_width = len(op_spec.args) == 2 and (
         op_spec.args[0].device_dtype.elems_per_stick()

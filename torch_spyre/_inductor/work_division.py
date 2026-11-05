@@ -16,12 +16,12 @@
 import builtins
 import dataclasses
 import itertools
+import sympy
 import logging
 import math
 from collections.abc import Callable, Iterable, Sequence
-from typing import TYPE_CHECKING, Optional
+from typing import Optional, TYPE_CHECKING
 
-import sympy
 from sympy import Expr, Integer, Symbol, divisors
 from torch._inductor.dependencies import Dep, MemoryDep
 from torch._inductor.graph import GraphLowering
@@ -61,9 +61,6 @@ from .lx_read_contracts import (
 from .pass_utils import (
     PerCoreView,
     SchedNodeArg,
-    _per_core_view_from_prep,
-    _prepare_per_core_view,
-    commit_iteration_space_ownership,
     compute_granularity,
     compute_max_size,
     concretize_expr,
@@ -73,8 +70,11 @@ from .pass_utils import (
     input_layout_for_operation,
     invert_per_core_view,
     iteration_space_from_op,
+    commit_iteration_space_ownership,
     op_out_coords,
     op_read_writes,
+    _per_core_view_from_prep,
+    _prepare_per_core_view,
     tile_ownership_view,
 )
 from .propagate_hints import get_op_hints

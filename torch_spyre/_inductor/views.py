@@ -14,13 +14,13 @@
 
 # Helper methods to handle views
 
+from dataclasses import dataclass, astuple
 import math
-from dataclasses import astuple, dataclass
-from typing import Callable, Dict, Optional, Sequence, Tuple, cast
-
 import sympy
+from typing import Callable, Dict, Optional, Sequence, Tuple, cast
+from torch.utils._sympy.functions import ModularIndexing, FloorDiv
+
 from torch._inductor.virtualized import V
-from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 
 from .errors import Unsupported
 
@@ -595,10 +595,10 @@ def normalize_coordinates(
                 num = den = mod = sympy.S.One
                 terms.append(Term(num, den, var, mod, dim_size, offset))
             else:
-                # A constant coordinate on the last (stick) dim or a size-1 dim is
-                # valid — the offset is the HBM base address baked into the device
-                # coordinate by the layout engine.  Let it propagate into the Term
-                # so downstream code can use it as a constant address contribution.
+                # A constant coordinate on the last (stick) dim is valid: the offset
+                # is the HBM base address baked into the device coordinate by the
+                # layout engine.  Keep it in the Term so downstream code can use it
+                # as a constant address contribution.
                 terms.append(Term(None, None, None, None, dim_size, offset))
             continue
         # If any free symbols are not loop vars, check if they're indirect symbols

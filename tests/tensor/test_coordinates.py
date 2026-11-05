@@ -1189,6 +1189,30 @@ class TestNormalizeCoordinatesFusion(TestCase):
         )
         self.assertEqual([int(t.dim_size) for t in terms], [32, 64])
 
+    def test_constant_stick_coordinate_keeps_hbm_base_offset(self):
+        """A constant coordinate on the stick dim is an HBM base address, not an error.
+
+        A sub-stick indirect scatter (``index_copy_`` of ``[T, KV, 1]`` rows) has
+        no loop variable on its last device dim; the layout engine bakes the
+        base offset into that coordinate.  It must survive as the ``offset`` of a
+        variable-free term instead of tripping ``assert offset == 0``.
+        """
+        k = sympy.Symbol("c1")
+        terms = self._normalize(
+            {k: 4},
+            [4, 64],
+            [k, sympy.Integer(5)],
+        )
+        self.assertEqual(len(terms), 2)
+        stick = terms[-1]
+        self.assertIsNone(stick.var)
+        self.assertEqual(stick.dim_size, 64)
+        self.assertEqual(stick.offset, 5)
+        # The base offset is part of the flat device address.
+        addr = self._addr(terms)
+        for val in range(4):
+            self.assertEqual(int(addr.subs({k: val})), val * 64 + 5)
+
 
 class TestFlatDenseProjectionLayout(TestCase):
     """Unit tests for _flat_dense_projection_x_layout in nonstick_dim_order."""

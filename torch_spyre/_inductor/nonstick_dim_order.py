@@ -62,9 +62,9 @@ pinned_dims: dict[str, set[int]]  (local to reorder_nonstick_dims, never on grap
 """
 
 import math
+import sympy
 from typing import Any, Literal, NamedTuple
 
-import sympy
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
@@ -79,7 +79,6 @@ from torch._inductor.ir import (
     TensorBox,
 )
 from torch._inductor.virtualized import V
-
 from torch_spyre._C import (
     DataFormats,
     ElementArrangement,
@@ -87,25 +86,15 @@ from torch_spyre._C import (
     get_device_size_in_bytes,
 )
 
-from . import config
 from .constants import BATCH_MATMUL_FP8_OP, MATMUL_REDUCTION_OPS
-
-# Helpers shared with enforce_indirect_access_layout.
-# enforce_indirect_access_layout does NOT import nonstick_dim_order, so this
-# import is safe at module level.
-from .enforce_indirect_access_layout import (
-    _insert_relayout_copy,
-    _real_layout,
-    _resolve_mutation_target,
-    _scatter_access_subs_and_sizes,
-)
 from .errors import Unsupported
 from .insert_restickify import (
-    RestickifyArgInfo,
     _create_restickify_node,
     _fixed_tiled,
+    RestickifyArgInfo,
 )
 from .ir import FixedTiledLayout
+from . import config
 from .logging_utils import get_inductor_logger
 from .op_spec import IndirectAccess
 from .pass_utils import (
@@ -120,6 +109,16 @@ from .pass_utils import (
 )
 from .propagate_layouts import PropArg
 from .work_division import MAX_SPAN_BYTES
+
+# Helpers shared with enforce_indirect_access_layout.
+# enforce_indirect_access_layout does NOT import nonstick_dim_order, so this
+# import is safe at module level.
+from .enforce_indirect_access_layout import (
+    _insert_relayout_copy,
+    _real_layout,
+    _resolve_mutation_target,
+    _scatter_access_subs_and_sizes,
+)
 
 logger = get_inductor_logger("nonstick_dim_order")
 
