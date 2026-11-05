@@ -311,6 +311,8 @@ def restickify_valid_elements(
     new_old_outer_size = -(-new_sd_host_size // stick_size)
     if old_sd_outer_dim not in old_stick_key and new_old_outer_size > 1:
         old_stick_key = tuple(sorted(set(old_stick_key) | {old_sd_outer_dim}))
+    # The new outer dim becomes standalone, so it must leave the stick key.
+    old_stick_key = tuple(d for d in old_stick_key if d != new_sd_outer_dim)
     regrouped = set(old_stick_key) | {new_sd_outer_dim}
     # Split keys containing the old outer dim too, so it isn't duplicated.
     touched = regrouped | {old_sd_outer_dim}
