@@ -44,6 +44,7 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 | `torch.nn.functional.dropout` | Y | Y | Spyre | |
 | `torch.nn.functional.scaled_dot_product_attention` | Y | Y | Spyre | Custom decomposition (flash-attention-style tiled online softmax) with native grouped-query attention: K/V keep their head count and gain a unit broadcast axis rather than materializing `Hq` copies; auto-registers a PrivateUse1 kernel for eager dispatch |
 | `torch.ops.spyre.sliding_window_attention` | | Y | Spyre | Compiled-only custom op; runtime additive mask, causal and non-causal paths, native GQA |
+| `torch.ops.spyre.linear_attention` | | Y | Spyre | Compiled-only custom op; chunkwise causal and non-causal linear attention with a carried `[B, H, Dk, Dv]` state. Phase 1: no GQA, no gating or decay (see [Linear attention custom op](#linear-attention-custom-op)) |
 | **Pointwise Unary** | | | | |
 | `torch.abs` | Y | Y | Spyre | |
 | `torch.neg` | Y | Y | Spyre | |
@@ -211,6 +212,55 @@ are still computed before the additive mask is applied.
 The cache capacity must be positive and a multiple of 64, and `Lq` must be in
 `[1, Lk]`. The op has no eager implementation and must be called on Spyre under
 `torch.compile(backend="inductor")`.
+
+## Linear attention custom op
+
+`torch.ops.spyre.linear_attention` has the schema:
+
+```python
+linear_attention(
+    query, key, value, initial_state=None, chunk_size=64, is_causal=True, scale=None
+) -> tuple[Tensor, Tensor]  # (output, final_state)
+```
+
+Linear attention drops the softmax. With the feature map already applied by
+the caller, the causal form is the recurrence `S_t = S_{t-1} + k_tᵀ v_t`,
+`o_t = scale · q_t S_t`, where the current token is included. The state `S` has
+a fixed `[Dk, Dv]` size per head, so decode costs the same at any context
+length, unlike a KV cache.
+
+The query and key shape is `[B, H, L, Dk]` and the value shape is
+`[B, H, L, Dv]`. The result is `output` with shape `[B, H, L, Dv]` and
+`final_state` with shape `[B, H, Dk, Dv]`. Pass one call's `final_state` as the
+next call's `initial_state` (same dtype as the query) to continue a sequence,
+which is how chunked prefill and token-by-token decode work. `scale` defaults
+to `Dk ** -0.5`. With `is_causal=False` every row reads the state summed over
+the whole sequence.
+
+`chunk_size` is static configuration: a multiple of 64, at most 512. The
+sequence is padded at the end to a whole number of chunks and processed one
+chunk per step with plain matmuls plus a `[chunk_size, chunk_size]` lower
+triangular mask. Padding at the end leaves the output and final state exact.
+
+The caller owns the feature map (for example `elu(x) + 1`) and any
+normalization. [`linear_attention.py`](examples/linear_attention.py) shows how
+to get the normalizer from the same call by appending a block of ones to the
+value.
+
+Phase 1 limits, each rejected with an `Unsupported` error that names the
+problem:
+
+- Query, key and value must share a dtype, device, batch, heads and length;
+  there is no grouped-query form and no cross-length form.
+- No gating or decay (so not GLA, RetNet, Mamba-2, or the delta-rule family).
+- The chunk loop is unrolled into the graph, so `ceil(L / chunk_size)` is
+  capped at 128. Raise `chunk_size` for longer sequences.
+- The state is accumulated in the input dtype (fp16 by default), so keep `L`
+  and the key scale such that the state stays well inside fp16 range.
+
+The op has no eager implementation on Spyre and must be called under
+`torch.compile(backend="inductor")`. On CPU it runs the fp32 token-by-token
+reference, which is the accuracy yardstick for the device path.
 
 ## Unsupported Operations
 

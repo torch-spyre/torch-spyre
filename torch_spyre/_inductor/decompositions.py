@@ -36,6 +36,14 @@ from torch._prims_common import ELEMENTWISE_TYPE_PROMOTION_KIND, elementwise_dty
 
 from .constants import DEVICE_NAME, FP8_E4M3FN_MAX, FP8_E4M3FN_MIN
 from .errors import Unsupported
+from .linear_attention import (
+    DEFAULT_CHUNK_SIZE,
+    check_linear_attention,
+    chunkwise_linear_attention,
+    default_scale,
+    pad_sequence_end,
+    padded_sequence_length,
+)
 from .sliding_window_plan import (
     MAX_QUERY_BLOCK,
     STICK,
@@ -2762,6 +2770,61 @@ def spyre_sliding_window_attention(
         num_heads,
     )
     return output[:, :, pad_rows:, :] if pad_rows else output
+
+
+@register_spyre_decompositions([torch.ops.spyre.linear_attention.default])
+def spyre_linear_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    initial_state: torch.Tensor | None = None,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    is_causal: bool = True,
+    scale: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Chunkwise linear attention built from matmuls Spyre already lowers.
+
+    The sequence is padded at its end to a whole number of chunks, each chunk
+    is processed with the intra-chunk masked matmul plus a read of the carried
+    state, and the padding is sliced off the output. See ``linear_attention.py``
+    for the algorithm and why end-padding leaves the output and final state
+    exact. Phase 1 unrolls the chunk loop; ``check_linear_attention`` bounds the
+    unrolled count.
+    """
+    reason = check_linear_attention(query, key, value, initial_state, chunk_size, scale)
+    if reason is not None:
+        raise Unsupported(f"linear_attention: {reason}")
+
+    seqlen = query.size(2)
+    pad_rows = padded_sequence_length(seqlen, chunk_size) - seqlen
+    query = pad_sequence_end(query, pad_rows)
+    key = pad_sequence_end(key, pad_rows)
+    value = pad_sequence_end(value, pad_rows)
+
+    # spyre::tril_mask builds the [C, C] lower-triangular 0/1 mask on CPU and
+    # transfers it to the query device, keeping the CPU-side construction
+    # opaque to torch.compile exactly as spyre_triu does for triu_mask. A
+    # non-causal call reads one shared state and needs no mask.
+    intra_mask = (
+        torch.ops.spyre.tril_mask(chunk_size, chunk_size, 0, query.dtype, query.device)
+        if is_causal
+        else None
+    )
+    output, state = chunkwise_linear_attention(
+        query,
+        key,
+        value,
+        chunk_size=chunk_size,
+        intra_mask=intra_mask,
+        initial_state=initial_state,
+        scale=default_scale(query.size(-1)) if scale is None else scale,
+        is_causal=is_causal,
+    )
+    if pad_rows:
+        # Slicing leaves a view with the padded row stride; the op's fake
+        # advertises a contiguous [B, H, L, Dv] output, so materialize it.
+        output = output[:, :, :seqlen, :].contiguous()
+    return output, state
 
 
 @register_spyre_decompositions([torch.ops.aten.max.default])
