@@ -268,6 +268,21 @@ class TensorArg:
             buffer reads it. The KTIR plan-time fuser deletes a producer op only
             for such a buffer; only the scheduler can see a buffer's users, so
             it is filled there and defaults to False.
+        replicated_scalar: True when EVERY element of this buffer's device
+            allocation holds the same value, so a reader may take any element
+            and get the scalar. Only a producer knows this, which is why it
+            travels here rather than being inferred: a degenerate buffer's
+            shape does not say it -- a full reduction to a 0-dim tensor has the
+            same one-stick, all-constant-coordinate description and holds the
+            answer at lane 0 only, with partial sums in the other lanes.
+            Set for ``spyre.constant`` buffers, whose whole stick is covered by
+            one MEMORY_FILL (``spyre_constant_tensor`` -> ``spyre_fill_tensor``),
+            and False everywhere else. The KTIR emitter reads it to widen a
+            scalar operand's read to its whole stick; see ``_reads_every_lane``.
+        non_unified_shard_bytes: Device bytes of one shard when the tensor is
+            sharded storage (core c reads or writes only chunk c, through its
+            own start address, ``nonUnifiedAllocInHBM_``; see sharded_hbm.py);
+            0 for ordinary storage. Checked against the real tensor at launch.
     """
 
     is_input: bool
@@ -283,6 +298,12 @@ class TensorArg:
     )
     work_division: TensorWorkDivision | None = None
     kernel_local: bool = False
+    replicated_scalar: bool = False
+    non_unified_shard_bytes: int = 0
+
+    @property
+    def non_unified(self) -> bool:
+        return self.non_unified_shard_bytes > 0
 
 
 def is_lx_relayout_identity(

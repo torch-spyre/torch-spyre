@@ -12,6 +12,7 @@ on:
       - extensions/clickhouse-ingest/tests/test_sandbox.py
       - extensions/clickhouse-ingest/spyre_clickhouse_ingest/sandbox_server.py
       - extensions/clickhouse-ingest/tests/test_sandbox_server.py
+      - extensions/clickhouse-ingest/tests/test_kernel_rekey_migration.py
       - .github/workflows/clickhouse-schema.yaml
 
 concurrency:
@@ -40,7 +41,7 @@ jobs:
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
       - name: Unit tests
         working-directory: extensions/clickhouse-ingest
-        run: uv run --with pytest python -m pytest -q tests
+        run: uv run --with pytest --with chdb python -m pytest -q tests
       - name: Apply to an empty database, then prove it converged
         working-directory: extensions/clickhouse-ingest
         # Scoped to this step: the unit tests assert on these variables being unset.

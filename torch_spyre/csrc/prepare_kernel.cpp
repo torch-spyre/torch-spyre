@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "job_plan.h"
+#include "kernel_provenance_registry.h"
 #include "logging.h"
 #include "spyre_allocator.h"
 #include "spyrecode-host-functions/spyrecode.h"
@@ -207,10 +208,12 @@ static int64_t safe_stoll(const std::string& str,
 
 JobPlanBuilder::JobPlanBuilder(const std::string& spyrecode_dir,
                                const SpyreStream* stream,
-                               std::optional<std::string> profiler_name)
+                               std::optional<std::string> profiler_event_name,
+                               std::string sdsc_bundle_dir_prefix)
     : spyrecode_dir_(spyrecode_dir),
       stream_(stream ? *stream : getCurrentStream()),
-      profiler_name_(std::move(profiler_name)) {
+      profiler_event_name_(std::move(profiler_event_name)),
+      sdsc_bundle_dir_prefix_(std::move(sdsc_bundle_dir_prefix)) {
   // Validate directory exists
   TORCH_CHECK(std::filesystem::exists(spyrecode_dir_),
               "SpyreCode directory does not exist: ", spyrecode_dir_.string());
@@ -347,8 +350,8 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnDevice(
   // A compiler provenance name deliberately overrides any backend-emitted
   // label: every compute step needs the same stable bundle join key. Without a
   // provenance name, preserve the existing backend and directory fallbacks.
-  if (profiler_name_.has_value() && !profiler_name_->empty()) {
-    name = *profiler_name_ + "#" + std::to_string(step_idx);
+  if (profiler_event_name_.has_value() && !profiler_event_name_->empty()) {
+    name = *profiler_event_name_ + "#" + std::to_string(step_idx);
     TORCH_CHECK(name.size() <= kAIUptiActivityNameMaxBytes,
                 "profiler-visible compute name exceeds AIUPTI limit: ",
                 name.size(), " bytes > ", kAIUptiActivityNameMaxBytes);
@@ -387,6 +390,12 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnDevice(
       job_allocation_.at(0).total_size() > 0,
       "ComputeOnDevice program allocation must be populated (size > 0)");
   flex::CompositeAddress program_address(job_allocation_.at(0).chunks()[0]);
+
+  // Remember the activity name base. build() registers the SDSC bundle
+  // directory prefix under it once the whole plan is validated. Keying on the
+  // final activity name keeps the registry in step with every naming branch
+  // above whether or not provenance is present.
+  activity_name_bases_.insert(spyre::activityNameBase(name));
 
   return std::make_unique<JobPlanStepCompute>(std::move(program_address),
                                               bind_io_addresses_,
@@ -699,11 +708,8 @@ std::unique_ptr<JobPlan> JobPlanBuilder::translateJobExecPlan() {
     }
   }
 
-  // Two-stream overlap. Emit the plain triple [HostCompute, H2D, Compute]; the
-  // ctors tag it with roles [Prep, Prep, Dev]. When SPYRE_HAZARD_TRACKER is on,
-  // the launch router splits it across S_prep/S_dev and flex inserts the
-  // cross-stream H2D->Compute edge; off keeps every step on S_dev. Every op
-  // keeps pipeline_barrier=true (per-stream FIFO). No plan rewrite here.
+  // HostCompute owns H2D on Prep; Compute is Dev. Hazard tracking inserts the
+  // cross-stream edges; otherwise all steps keep per-stream FIFO on Dev.
 
   // TODO(jni): expected_input_shapes to be added once provided in SpyreCode
   // Create pinned_buffers vector from pinned_buffer_map_
@@ -736,25 +742,22 @@ JobPlanBuilder::ValidationResult JobPlanBuilder::validate(
   // - Verify shape count matches number of input tensors
 
   // P2-14: JobPlan step ordering validation
-  // After the HostCompute+H2D merge, the required sequence when the first step
-  // is a HostCompute is:  HostCompute(owns H2D) → Compute.
-  // The old HostCallback→H2D→Compute pattern is no longer expected in
-  // production SpyreCode; the translator collapses them.
-  if (!job_plan.steps.empty()) {
-    bool first_is_host_compute = dynamic_cast<const JobPlanStepHostCompute*>(
-                                     job_plan.steps[0].get()) != nullptr;
-
-    if (first_is_host_compute) {
-      // Step 0 is HostCompute (which owns the H2D); step 1 must be Compute.
-      TORCH_CHECK(job_plan.steps.size() >= 2,
-                  "Incomplete step sequence: HostCompute must be followed "
-                  "by Compute");
-      bool is_compute = dynamic_cast<const JobPlanStepCompute*>(
-                            job_plan.steps[1].get()) != nullptr;
-      TORCH_CHECK(is_compute,
-                  "Step ordering violation at step 1: "
-                  "HostCompute (with H2D) must be followed by Compute");
-    }
+  // A device program can need multiple correction blobs. Each leading
+  // HostCompute owns its H2D; all must precede the consuming Compute.
+  size_t compute_index = 0;
+  while (compute_index < job_plan.steps.size() &&
+         dynamic_cast<const JobPlanStepHostCompute*>(
+             job_plan.steps[compute_index].get()) != nullptr) {
+    ++compute_index;
+  }
+  if (compute_index > 0) {
+    TORCH_CHECK(compute_index < job_plan.steps.size(),
+                "Incomplete step sequence: HostCompute must be followed "
+                "by Compute");
+    TORCH_CHECK(dynamic_cast<const JobPlanStepCompute*>(
+                    job_plan.steps[compute_index].get()) != nullptr,
+                "Step ordering violation at step ", compute_index,
+                ": HostCompute (with H2D) must be followed by Compute");
   }
 
   // P2-15: Host compute metadata validation
@@ -797,13 +800,25 @@ std::unique_ptr<JobPlan> JobPlanBuilder::build() {
     TORCH_CHECK(false, error_msg);
   }
 
+  // Register the SDSC bundle directory prefix so the activity handler can emit
+  // sdsc_bundle_dir_prefix in trace args metadata whether or not provenance is
+  // present. Done only after the JobPlan has been validated so that a failed
+  // build leaves no entry in the registry.
+  if (!sdsc_bundle_dir_prefix_.empty()) {
+    for (const auto& name_base : activity_name_bases_) {
+      spyre::registerBundleDirPrefix(name_base, sdsc_bundle_dir_prefix_);
+    }
+  }
+
   return job_plan;
 }
 
 std::unique_ptr<JobPlan> prepareKernel(
     const std::string& spyrecode_dir, const SpyreStream* stream,
-    std::optional<std::string> profiler_name) {
-  JobPlanBuilder builder(spyrecode_dir, stream, std::move(profiler_name));
+    std::optional<std::string> profiler_event_name,
+    std::string sdsc_bundle_dir_prefix) {
+  JobPlanBuilder builder(spyrecode_dir, stream, std::move(profiler_event_name),
+                         std::move(sdsc_bundle_dir_prefix));
   auto jobplan = builder.build();
 
   // Dump JobPlan if debug logging is enabled

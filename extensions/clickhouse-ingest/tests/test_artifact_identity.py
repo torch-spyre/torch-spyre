@@ -226,6 +226,8 @@ def test_a_release_tags_its_manifest_list_like_its_per_arch_images():
         [f"s390x={DIGEST}"],
     )
     assert arts[leaf.artifact_id]["identity_deps"] == []
+    assert arts[multi.artifact_id]["props"]["source_artifact_id"] == leaf.artifact_id
+    assert "source_artifact_id" not in arts[leaf.artifact_id]["props"]
     tags = {}
     for t in _rows(c, ARTIFACT_TAGS):
         tags.setdefault(t["artifact_id"], set()).add(t["tag"])

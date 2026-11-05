@@ -133,7 +133,10 @@ jobs:
       # Per-PR ephemeral image label when provided, else the merge-queue or
       # standing set for this event.
       image_label: ${{ inputs.runner_label || (github.event_name == 'merge_group' && 'image_spyre_backend_mq') || 'image_spyre_backend' }}
-      extra_test_flags: -v -m "not xfail"
+      # xfail-marked tests run here too. A strict xfail that starts passing fails
+      # the run, and an intermittent one should be marked non-strict
+      # (`expect_fail_unstable`), which keeps it an xfail and reports its XPASS.
+      extra_test_flags: -v
       extra_test_flags_multi_spyre: -v
       checkout_pytorch: false
       ref: ${{ inputs.ref || '' }}

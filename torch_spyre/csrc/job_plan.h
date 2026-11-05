@@ -219,6 +219,12 @@ enum class StepKind {
 enum class SymbolicArgKind : int32_t {
   kAddress = 0,
   kDimension = 1,
+  // Device address of one shard of a sharded tensor: the chunk whose
+  // logical_chunk_id == dim_index (= the core that owns it). value is the
+  // expected per-shard device bytes and num_shards the expected shard count;
+  // both are checked at launch. Used by non-unified kernels, where each
+  // core has its own start address.
+  kShardAddress = 2,
 };
 
 /**
@@ -244,6 +250,8 @@ struct SymbolicArg {
   int64_t tensor_id;
   int64_t dim_index = -1;
   int64_t value = -1;
+  // kShardAddress only: the shard count the kernel was compiled for.
+  int64_t num_shards = -1;
 };
 
 /**
@@ -272,6 +280,8 @@ struct LaunchContext {
    * for existing callers that pass no payload.
    */
   std::vector<SymbolicArg> symbolic_args;
+  bool batch_program_corrections = false;
+  std::vector<flex::ProgramCorrection> program_corrections;
 };
 
 /**
@@ -552,6 +562,15 @@ class JobPlanStepHostCompute final : public JobPlanStep {
   void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
 
   void write(std::ostream& os) const override;
+
+  /**
+   * @brief Resolve a symbolic_args payload to a vector of HostComputeArgs.
+   *
+   * NOTE: kDimension is not yet implemented; only kAddress is supported.
+   */
+  static std::vector<flex::HostComputeArg> resolveSymbolicArgs(
+      const std::vector<at::Tensor>& tensors,
+      const std::vector<SymbolicArg>& symbolic_args);
 
  private:
   size_t correction_size_;  ///< byte count of the correction blob

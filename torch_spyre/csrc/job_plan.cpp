@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "spyre_composite_address.h"
+#include "spyre_mem.h"
 #include "spyre_stream.h"
 
 namespace spyre {
@@ -86,7 +87,8 @@ void JobPlanStepD2H::construct(LaunchContext& ctx,
         flex::createDmaParams(host_address_, device_address->total_size(),
                               /*to_device=*/false, device_address.get());
     params->pipeline_barrier = pipeline_barrier_;
-    params->callback = [device_address](void*) {};
+    params->callback = [device_address](void*,
+                                        const flex::FlexCallbackMetadata*) {};
     stream.launchD2H(params);
     flex::destroyDmaParams(params);
   }
@@ -113,11 +115,14 @@ void JobPlanStepCompute::construct(LaunchContext& ctx,
       tensor_allocs.push_back(get_composite_address(tensor));
     }
   }
-  auto* params = flex::createComputeParams(
-      &program_address_, std::move(tensor_allocs), name_, bootstrap_offset_);
+  std::unique_ptr<flex::ComputeParams, decltype(&flex::destroyComputeParams)>
+      params(
+          flex::createComputeParams(&program_address_, std::move(tensor_allocs),
+                                    name_, bootstrap_offset_),
+          flex::destroyComputeParams);
+  params->program_corrections = std::move(ctx.program_corrections);
   params->pipeline_barrier = pipeline_barrier_;
-  stream.launchCompute(params);
-  flex::destroyComputeParams(params);
+  stream.launchCompute(params.get());
 }
 
 void JobPlanStepCompute::write(std::ostream& os) const {
@@ -130,6 +135,38 @@ void JobPlanStepCompute::write(std::ostream& os) const {
      << "\n";
 }
 
+// NOTE: kDimension is not yet implemented; only kAddress is supported.
+std::vector<flex::HostComputeArg> JobPlanStepHostCompute::resolveSymbolicArgs(
+    const std::vector<at::Tensor>& tensors,
+    const std::vector<SymbolicArg>& symbolic_args) {
+  std::vector<flex::HostComputeArg> resolved(symbolic_args.size());
+  for (size_t i = 0; i < symbolic_args.size(); ++i) {
+    const SymbolicArg& arg = symbolic_args[i];
+    TORCH_CHECK(arg.tensor_id >= 0 &&
+                    static_cast<size_t>(arg.tensor_id) < tensors.size(),
+                "symbolic_args tensor_id out of range");
+    switch (arg.kind) {
+      case SymbolicArgKind::kAddress:
+        resolved[i] = get_composite_address(tensors[arg.tensor_id]);
+        break;
+      case SymbolicArgKind::kShardAddress:
+        // dim_index = core (= shard), value = expected per-shard bytes,
+        // num_shards = expected shard count; all checked against the tensor.
+        resolved[i] = static_cast<int64_t>(shard_device_address(
+            tensors[arg.tensor_id], arg.dim_index, arg.num_shards, arg.value));
+        break;
+      case SymbolicArgKind::kDimension:
+        TORCH_CHECK(false,
+                    "SymbolicArgKind::kDimension is not yet implemented");
+        break;
+      default:
+        TORCH_CHECK(false, "Unknown SymbolicArgKind value: ",
+                    static_cast<int32_t>(arg.kind));
+    }
+  }
+  return resolved;
+}
+
 void JobPlanStepHostCompute::construct(LaunchContext& ctx,
                                        const SpyreStream& stream) const {
   std::vector<flex::HostComputeArg> args;
@@ -138,16 +175,8 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
   // the distinction into HostComputeParams directly.
   if (input_buffer_ == nullptr && !(ishape_.size() == 1 && ishape_[0] == 0)) {
     if (!ctx.symbolic_args.empty()) {
-      // Case 3a: typed symbolic args: one HostComputeArg per slot.
-      for (const auto& sym : ctx.symbolic_args) {
-        TORCH_CHECK(sym.tensor_id >= 0 && static_cast<size_t>(sym.tensor_id) <
-                                              ctx.inputs_outputs.size(),
-                    "symbolic_args tensor_id out of range");
-        TORCH_CHECK(sym.kind == SymbolicArgKind::kAddress,
-                    "SymbolicArgKind::kDimension is not yet implemented");
-        args.push_back(
-            get_composite_address(ctx.inputs_outputs[sym.tensor_id]));
-      }
+      // Case 3a: typed symbolic args — delegate to resolveSymbolicArgs.
+      args = resolveSymbolicArgs(ctx.inputs_outputs, ctx.symbolic_args);
     } else {
       // Case 3b: legacy: one Address arg per context tensor in order.
       for (const auto& tensor : ctx.inputs_outputs) {
@@ -166,14 +195,26 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
     }
   } guard{params};
 
-  // Create a managed shared_ptr to ensure the host buffer's lifetime is tied to
-  // callback destruction.
+  // Flex RuntimeStream::launchOperation(const HostComputeParams*) resolves
+  // arguments and calls deeptools::processComputeOnHostCommand[Fast] inline
+  // before returning this fully written buffer (Flex #1990,
+  // src/runtime_stream/runtime_stream.cpp). This is not queued work on S_prep:
+  // caller ordering makes the bytes ready before S_dev receives the consuming
+  // ComputeParams, regardless of whether hazard tracking is enabled.
+  // Shared ownership then keeps the bytes alive through upload completion.
   std::shared_ptr<flex::HostComputeBuffer> host_buffer(
       stream.launchHostCompute(params), flex::destroyHostComputeBuffer);
 
   // Enforce that the host buffer correction size matches the expected device
   // allocation size.
   TORCH_DCHECK_EQ(host_buffer->size(), device_address_.total_size());
+
+  if (ctx.batch_program_corrections) {
+    ctx.program_corrections.push_back(
+        {std::move(host_buffer), std::make_shared<flex::CompositeAddress>(
+                                     device_address_.clone_non_owning())});
+    return;
+  }
 
   // Create DmaParams to transfer the host buffer.
   auto* dma_params =
@@ -182,7 +223,8 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
   dma_params->pipeline_barrier = pipeline_barrier_;
   // The managed buffer is freed when the callback is destroyed, which happens
   // after the DMA completes or is cancelled.
-  dma_params->callback = [host_buffer](void*) {};
+  dma_params->callback = [host_buffer](void*,
+                                       const flex::FlexCallbackMetadata*) {};
 
   try {
     stream.launchH2D(dma_params);

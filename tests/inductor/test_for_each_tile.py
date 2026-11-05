@@ -86,9 +86,9 @@ inductor names a fused kernel after every op it fused (`cpp_fused_add_copy_...`)
 the while_loop prologue clones every carried operand under `if not should_loop:`, so
 grepping the wrapper text counts copies that either do not exist or are not ours.
 
-Every tensor stays on CPU and the compiled backend is stock inductor: what is under test
-is the graph `for_each_tile` traces to, which is device-independent, so no Spyre device
-and no Spyre backend compiler is required.
+Every tensor stays on CPU. Lowering checks use stock inductor; graph-reuse checks capture
+and execute the traced graph directly. What is under test is the device-independent graph
+`for_each_tile` traces to, so no Spyre device or Spyre backend compiler is required.
 
 Run:
 
@@ -100,8 +100,11 @@ Run:
 import contextlib
 import itertools
 import os
+import sys
 import unittest
+import warnings
 from typing import NamedTuple
+from unittest import mock
 
 import torch
 from torch._inductor.utils import run_and_get_code
@@ -124,6 +127,7 @@ def post_grad_graphs():
     `post_grad_custom_post_pass` fires BEFORE that decomposition, so a custom pass
     cannot see the while_loop; wrapping the decomposition itself can.
     """
+    import torch._inductor.config as inductor_config
     import torch._inductor.fx_passes.post_grad as pg
 
     seen: list[torch.fx.GraphModule] = []
@@ -136,7 +140,9 @@ def post_grad_graphs():
 
     pg.decompose_scan_to_while_loop = wrapper
     try:
-        yield seen
+        # A cache hit skips the post-grad passes, so nothing would be captured.
+        with inductor_config.patch(force_disable_caches=True):
+            yield seen
     finally:
         pg.decompose_scan_to_while_loop = original
 
@@ -546,11 +552,6 @@ class TestForEachTileLowering(unittest.TestCase):
             compiled = torch.compile(fn, backend="inductor", fullgraph=True)
             out, code = run_and_get_code(compiled, *args)
 
-        # No `fresh_cache()` needed, unlike its neighbours in this suite: inductor
-        # bypasses the FX graph cache outright for a graph holding a `scan` HOP, which
-        # every case here has by construction, so a warm cache can never skip the
-        # post-grad pass the capture above hooks. Asserted rather than assumed -- if
-        # that ever changes, this says so instead of an IndexError on `graphs[-1]`.
         self.assertTrue(graphs, "no post-grad graph captured (FX graph cache hit?)")
 
         # The decomposition runs bottom-up, one module at a time, so the graph captured
@@ -632,6 +633,128 @@ class TestForEachTileLowering(unittest.TestCase):
         self._assert_lowers(
             fn, args, ref, name="B_split_n", loops=1, materializations=2
         )
+
+    def test_pytree_map_outputs_reuse_graph(self):
+        for axis in (0, -1):
+            with self.subTest(axis=axis):
+                graphs = []
+
+                def capture(gm, _):
+                    graphs.append(gm)
+                    return gm.forward
+
+                def kernel(x):
+                    def body(_, tiles):
+                        (tile,) = tiles
+                        return None, (
+                            tile + 1,
+                            {"sums": tile.sum(dim=1 if axis == 0 else 0)},
+                        )
+
+                    return for_each_tile(
+                        body, (x,), dims=(axis,), tile_size=32, out_dim=axis
+                    )[1]
+
+                torch._dynamo.reset()
+                with (
+                    mock.patch("torch.accelerator.is_available", return_value=False),
+                    torch.inference_mode(),
+                ):
+                    compiled = torch.compile(
+                        kernel, backend=capture, fullgraph=True, dynamic=False
+                    )
+                    for step in range(2):
+                        x = (
+                            torch.arange(96 * 64, dtype=torch.float32).reshape(96, 64)
+                            + step
+                        )
+                        shifted, stats = compiled(x)
+                        torch.testing.assert_close(shifted, x + 1)
+                        torch.testing.assert_close(
+                            stats["sums"], x.sum(dim=1 if axis == 0 else 0)
+                        )
+                self.assertEqual(len(graphs), 1)
+
+    def test_pytree_outputs_with_carry(self):
+        """A carry and nested outputs retain traversal and per-leaf axis semantics."""
+        for axis, reverse in itertools.product((0, 1, -1), (False, True)):
+            with self.subTest(axis=axis, reverse=reverse):
+
+                def kernel(x, init):
+                    def body(carry, tiles):
+                        (tile,) = tiles
+                        return carry + tile.sum(), {
+                            "values": [tile + carry, (tile.unsqueeze(0) - carry,)]
+                        }
+
+                    return for_each_tile(
+                        body,
+                        (x,),
+                        dims=0,
+                        tile_size=2,
+                        init=init,
+                        out_dim=axis,
+                        reverse=reverse,
+                    )
+
+                x = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+                init = torch.tensor(7.0)
+                blocks = x.reshape(3, 2, 4)
+                totals = blocks.sum(dim=(1, 2))
+                inclusive = (
+                    totals.flip(0).cumsum(0).flip(0) if reverse else totals.cumsum(0)
+                )
+                offsets = (init + inclusive - totals).reshape(3, 1, 1)
+                expected = {
+                    "values": [
+                        torch.cat((blocks + offsets).unbind(0), dim=axis),
+                        (
+                            torch.cat(
+                                (blocks - offsets).unsqueeze(1).unbind(0), dim=axis
+                            ),
+                        ),
+                    ]
+                }
+                torch._dynamo.reset()
+                with (
+                    mock.patch("torch.accelerator.is_available", return_value=False),
+                    torch.inference_mode(),
+                ):
+                    for fn in (
+                        kernel,
+                        torch.compile(kernel, backend="inductor", fullgraph=True),
+                    ):
+                        final, out = fn(x, init)
+                        torch.testing.assert_close(final, init + x.sum())
+                        torch.testing.assert_close(out, expected)
+                torch.testing.assert_close(init, torch.tensor(7.0))
+
+    def test_pytree_output_dim_error_identifies_leaf(self):
+        for axis, scalar in ((1, False), (-2, False), (0, True)):
+            with self.subTest(axis=axis, scalar=scalar):
+
+                def body(_, tiles):
+                    (tile,) = tiles
+                    stats = tile.sum() if scalar else tile.sum(dim=0)
+                    return None, (tile + 1, {"stats": [stats]})
+
+                rank = 0 if scalar else 1
+                with (
+                    mock.patch("torch.accelerator.is_available", return_value=False),
+                    torch.inference_mode(),
+                    self.assertRaisesRegex(
+                        IndexError,
+                        rf"out_dim={axis} is invalid for output\[1\]\['stats'\]\[0\]"
+                        rf" with tile rank {rank}",
+                    ),
+                ):
+                    for_each_tile(
+                        body,
+                        (torch.ones(6, 4),),
+                        dims=0,
+                        tile_size=2,
+                        out_dim=axis,
+                    )
 
     def test_split_k(self):
         """C: co-indexed `dims=(-1, 0)` on the shared axis, carry accumulates.
@@ -1183,6 +1306,634 @@ class TestScanInputAliasing(unittest.TestCase):
                 torch._dynamo.reset()
                 with self.assertRaisesRegex(Exception, "(?i)aliasing"):
                     self._compile(fn)(self.x, self.kv)
+
+
+# The package re-exports the `for_each_tile` function under the submodule's name, so
+# the module itself is only reachable through `sys.modules`.
+_FET_MODULE = "torch_spyre._inductor.wsr.for_each_tile"
+_RAII_PYTHONS = (3, 12) <= sys.version_info[:2] < (3, 14)
+
+
+class TestScanCRecursionBudget(unittest.TestCase):
+    """The nested `scan` compile's C-recursion budget (#4973).
+
+    Raised on s390x only (CPython caps C recursion at 800 there, 10000 elsewhere),
+    never lowered, and always restored.
+    """
+
+    def setUp(self):
+        torch._dynamo.reset()
+        self.m = sys.modules[_FET_MODULE]
+        saved = torch._dynamo.get_recursion_limit()
+        self.addCleanup(torch._dynamo.set_recursion_limit, saved)
+        if saved != -1:
+            torch._dynamo.set_recursion_limit(-1)
+        self.x = torch.randn(4, 8)
+
+    def _run_eager(self):
+        """A reduction loop run outside Dynamo, so `scan` compiles its own body."""
+        final, _ = self.m.for_each_tile(
+            lambda c, t: (c + t[0].sum(0), None),
+            (self.x,),
+            dims=0,
+            tile_size=1,
+            init=torch.zeros(8),
+        )
+        return final
+
+    def _spy_set_limit(self):
+        return mock.patch.object(
+            torch._dynamo,
+            "set_recursion_limit",
+            wraps=torch._dynamo.set_recursion_limit,
+        )
+
+    def _target(self):
+        return self.m._scan_c_recursion_target("s390x", sys.version_info[:2])
+
+    def test_eager_no_runtime_warning(self):
+        """Dynamo warns when a new C limit is below the remaining budget."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            torch.testing.assert_close(self._run_eager(), self.x.sum(0))
+
+    def test_target_gating(self):
+        target = self.m._scan_c_recursion_target
+        for machine in ("x86_64", "aarch64", "ppc64le", "AMD64", "arm64"):
+            for py in ((3, 11), (3, 12), (3, 13), (3, 14)):
+                with self.subTest(machine=machine, py=py):
+                    self.assertIsNone(target(machine, py))
+        for py in ((3, 11), (3, 14), (3, 15)):
+            with self.subTest(machine="s390x", py=py):
+                self.assertIsNone(target("s390x", py))
+        for py in ((3, 12), (3, 13)):
+            with self.subTest(machine="s390x", py=py):
+                # Above CPython's s390x default, or it would lower the budget.
+                self.assertGreater(
+                    target("s390x", py), self.m._S390X_CPYTHON_C_RECURSION_LIMIT
+                )
+
+    def test_non_s390x_never_touches_limit(self):
+        with (
+            mock.patch("platform.machine", return_value="x86_64"),
+            mock.patch.object(
+                torch._dynamo,
+                "get_recursion_limit",
+                wraps=torch._dynamo.get_recursion_limit,
+            ) as get_spy,
+            self._spy_set_limit() as spy,
+        ):
+            torch.testing.assert_close(self._run_eager(), self.x.sum(0))
+        get_spy.assert_not_called()
+        spy.assert_not_called()
+        self.assertEqual(torch._dynamo.get_recursion_limit(), -1)
+
+    @unittest.skipUnless(_RAII_PYTHONS, "Dynamo's C-recursion RAII is 3.12/3.13 only")
+    def test_limit_restored(self):
+        target = self._target()
+        with (
+            warnings.catch_warnings(),
+            mock.patch("platform.machine", return_value="s390x"),
+        ):
+            # Off s390x the target is below the host's remaining budget and warns.
+            warnings.simplefilter("ignore", RuntimeWarning)
+            with self._spy_set_limit() as spy:
+                torch.testing.assert_close(self._run_eager(), self.x.sum(0))
+            # Compare args, not mock.call objects: PyTorch's TestCase.assertEqual
+            # (used under the OOT wrapper) compares those tuples element-wise.
+            self.assertEqual([c.args for c in spy.call_args_list], [(target,), (-1,)])
+            self.assertEqual(torch._dynamo.get_recursion_limit(), -1)
+
+            # A caller's limit at or above the target is left alone.
+            torch._dynamo.set_recursion_limit(target + 1)
+            with self._spy_set_limit() as spy:
+                torch.testing.assert_close(self._run_eager(), self.x.sum(0))
+            spy.assert_not_called()
+            self.assertEqual(torch._dynamo.get_recursion_limit(), target + 1)
+
+    @unittest.skipUnless(_RAII_PYTHONS, "Dynamo's C-recursion RAII is 3.12/3.13 only")
+    def test_limit_restored_when_body_raises(self):
+        target = self._target()
+        seen = []
+
+        def failing_scan(*args, **kwargs):
+            seen.append(torch._dynamo.get_recursion_limit())
+            raise ValueError("boom")
+
+        with (
+            warnings.catch_warnings(),
+            mock.patch("platform.machine", return_value="s390x"),
+            mock.patch.object(self.m, "scan", side_effect=failing_scan),
+        ):
+            warnings.simplefilter("ignore", RuntimeWarning)
+            with self.assertRaisesRegex(ValueError, "boom"):
+                self._run_eager()
+        self.assertEqual(seen, [target])
+        self.assertEqual(torch._dynamo.get_recursion_limit(), -1)
+
+
+class TestTraceUnderMakeFx(unittest.TestCase):
+    """A `for_each_tile` reached under make_fx -- i.e. from an AOT decomposition such as
+    the SDPA tiling -- emits its `scan` without re-entering Dynamo (torch-spyre#4885).
+
+    Re-entering `torch.compile` per level cost ~180 CPython C-recursion levels per nest
+    level, which a GQA SDPA nest exhausts under s390x's 800-level C budget.
+    """
+
+    def setUp(self):
+        torch._dynamo.reset()
+
+    @staticmethod
+    def _trace(fn, *args):
+        from torch.fx.experimental.proxy_tensor import make_fx
+
+        return make_fx(fn, tracing_mode="fake")(*args)
+
+    @staticmethod
+    def _graph_modules(gm):
+        return [m for m in gm.modules() if isinstance(m, torch.fx.GraphModule)]
+
+    def test_nested_levels_do_not_reenter_dynamo(self):
+        from unittest import mock
+
+        import torch._higher_order_ops.utils as hop_utils
+
+        depth = 6
+        traced = []
+
+        def nest(x, level=0):
+            if level == depth:
+                return x * 2
+
+            def body(_, tiles):
+                traced.append(level)
+                return None, nest(tiles[0], level + 1)
+
+            return for_each_tile(body, (x,), dims=level, tile_size=1, out_dim=level)[1]
+
+        x = torch.randn(*([2] * depth), 8)
+        # `scan()`'s way into Dynamo outside a Dynamo trace.
+        with mock.patch.object(
+            hop_utils, "_hop_compile_and_call", wraps=hop_utils._hop_compile_and_call
+        ) as compile_and_call:
+            gm = self._trace(lambda x: nest(x), x)
+        compile_and_call.assert_not_called()
+        # Checking a body reads the graph trace_scan built; it never traces it again.
+        self.assertEqual(sorted(traced), list(range(depth)))
+        scans = [
+            node
+            for m in self._graph_modules(gm)
+            for node in m.graph.nodes
+            if node.target is torch.ops.higher_order.scan
+        ]
+        self.assertEqual(len(scans), depth)
+        torch.testing.assert_close(gm(x), x * 2)
+
+    def test_operands_read_whole_are_lifted(self):
+        """Invariants and Gather pools enter as scan inputs, never as constants."""
+        x, w, pool = torch.randn(3, 8), torch.randn(8), torch.randn(6, 8)
+        index = torch.tensor([4, 1, 3])
+
+        def fn(x, w, pool, index):
+            def body(acc, tiles):
+                x_t, w_t, row = tiles
+                return acc + (x_t * row).squeeze(0) * w_t, None
+
+            acc, _ = for_each_tile(
+                body,
+                (x, w, pool),
+                dims=(0, None, Gather(0, index)),
+                tile_size=1,
+                init=torch.zeros(8),
+            )
+            return acc
+
+        gm = self._trace(fn, x, w, pool, index)
+        for m in self._graph_modules(gm):
+            for node in m.graph.nodes:
+                if node.op == "get_attr":
+                    self.assertNotIsInstance(getattr(m, node.target), torch.Tensor)
+        args = (x, w, pool, index)
+        torch.testing.assert_close(gm(*args), (x * pool[index] * w).sum(0))
+        torch.testing.assert_close(gm(*args), fn(*args))
+
+    def test_matches_dynamo_path(self):
+        """Map and reduction modes, forward and reversed, agree with eager `scan()`."""
+        x = torch.randn(4, 6, 8)
+
+        def map_dim1(x, reverse):
+            def body(_, tiles):
+                return None, tiles[0] * 3
+
+            return for_each_tile(
+                body, (x,), dims=1, tile_size=2, out_dim=1, reverse=reverse
+            )[1]
+
+        def single_carry(x, reverse):
+            def body(acc, tiles):
+                return acc * 0.5 + tiles[0].sum(0), None
+
+            return for_each_tile(
+                body,
+                (x,),
+                dims=0,
+                tile_size=1,
+                init=torch.zeros(6, 8),
+                reverse=reverse,
+            )[0]
+
+        def multi_carry_with_output(x, reverse):
+            def body(carry, tiles):
+                m, s = carry
+                t = tiles[0]
+                return (torch.maximum(m, t.amax(1)), s + t.sum(1)), t.exp()
+
+            (m, s), out = for_each_tile(
+                body,
+                (x,),
+                dims=0,
+                tile_size=2,
+                init=(torch.full((2, 8), float("-inf")), torch.zeros(2, 8)),
+                out_dim=0,
+                reverse=reverse,
+            )
+            return m, s, out
+
+        for fn, reverse in itertools.product(
+            (map_dim1, single_carry, multi_carry_with_output), (False, True)
+        ):
+            with self.subTest(fn=fn.__name__, reverse=reverse):
+                torch._dynamo.reset()
+                gm = self._trace(lambda x: fn(x, reverse), x)
+                torch.testing.assert_close(gm(x), fn(x, reverse))
+
+    def test_closed_over_traced_tensor_is_rejected(self):
+        """make_fx would bake the capture into the body as a constant; refuse it."""
+
+        def fn(x, w):
+            w3 = w * 3
+
+            def body(acc, tiles):
+                return acc + tiles[0].squeeze(0) * w3, None
+
+            return for_each_tile(body, (x,), dims=0, tile_size=1, init=torch.zeros(8))[
+                0
+            ]
+
+        with self.assertRaisesRegex(RuntimeError, "closes over a tensor"):
+            self._trace(fn, torch.randn(4, 8), torch.randn(8))
+
+    def test_operands_sharing_a_storage_are_supported(self):
+        """Read-only inputs may share a storage, e.g. K and V split from one QKV."""
+
+        def invariants(x, kv, rows):
+            def body(_, tiles):
+                x_t, k, v = tiles
+                return None, x_t @ k.T @ v
+
+            k, v = kv.split(4, dim=-1)
+            return for_each_tile(
+                body, (x, k, v), dims=(0, None, None), tile_size=2, out_dim=0
+            )[1]
+
+        def gather_pools(x, kv, rows):
+            def body(acc, tiles):
+                x_t, k_row, v_row = tiles
+                return acc + (x_t * k_row * v_row).squeeze(0), None
+
+            cache = kv.unflatten(-1, (2, 4))
+            return for_each_tile(
+                body,
+                (x, cache[:, 0], cache[:, 1]),
+                dims=(0, Gather(0, rows), Gather(0, rows.flip(0))),
+                tile_size=1,
+                init=torch.zeros(4),
+            )[0]
+
+        def sliced_and_invariant(x, kv, rows):
+            def body(_, tiles):
+                x_t, x_whole = tiles
+                return None, x_t * x_whole.sum()
+
+            _, out = for_each_tile(body, (x, x), dims=(0, None), tile_size=2, out_dim=0)
+            return out
+
+        def carry_init_views_an_operand(x, kv, rows):
+            def body(acc, tiles):
+                x_t, kv_whole = tiles
+                return acc + kv_whole[1] * x_t.sum(), None
+
+            return for_each_tile(
+                body, (x, kv), dims=(0, None), tile_size=2, init=kv[0]
+            )[0]
+
+        def gather_expected(x, kv, rows):
+            cache = kv.unflatten(-1, (2, 4))
+            return (x * cache[rows, 0] * cache[rows.flip(0), 1]).sum(0)
+
+        cases = {
+            "K and V invariants": (
+                invariants,
+                lambda x, kv, rows: x @ kv[:, :4].T @ kv[:, 4:],
+            ),
+            "K and V Gather pools": (gather_pools, gather_expected),
+            "one tensor sliced and invariant": (
+                sliced_and_invariant,
+                lambda x, kv, rows: x * x.sum(),
+            ),
+            "carry init viewing an operand": (
+                carry_init_views_an_operand,
+                lambda x, kv, rows: kv[0] + kv[1] * x.sum(),
+            ),
+        }
+        args = (torch.randn(8, 4), torch.randn(6, 8), torch.arange(8) * 5 % 6)
+        for name, (fn, expected) in cases.items():
+            with self.subTest(name):
+                torch._dynamo.reset()
+                gm = self._trace(fn, *args)
+                torch.testing.assert_close(gm(*args), expected(*args))
+
+    def test_unsupported_bodies_are_rejected(self):
+        """A body that writes to or returns one of its inputs fails to trace."""
+
+        def map_x(body):
+            return lambda x, w: for_each_tile(
+                body, (x, w), dims=(0, None), tile_size=2, out_dim=0
+            )
+
+        def reduce_x(body, out_dim=None):
+            return lambda x, w: for_each_tile(
+                body,
+                (x, w),
+                dims=(0, None),
+                tile_size=2,
+                init=torch.zeros(4),
+                out_dim=out_dim,
+            )
+
+        def writes_invariant(_, tiles):
+            x_t, w = tiles
+            return None, x_t * w.add_(1)
+
+        def updates_carry_in_place(acc, tiles):
+            return acc.add_(tiles[0].sum(0)) * 2, None
+
+        def returns_view_of_invariant(_, tiles):
+            return None, tiles[1].expand(2, 4)
+
+        def passes_carry_through(acc, tiles):
+            return acc, None
+
+        def returns_carry_as_tile(acc, tiles):
+            new_acc = acc + tiles[0].sum(0)
+            return new_acc, new_acc.expand(2, 4)
+
+        def inner_level_passes_carry_through(_, tiles):
+            x_t, w = tiles
+            acc, _ = for_each_tile(
+                passes_carry_through,
+                (x_t, w),
+                dims=(0, None),
+                tile_size=1,
+                init=torch.zeros(4),
+            )
+            return None, x_t * acc
+
+        cases = {
+            "writes an invariant": (map_x(writes_invariant), "writes to an input"),
+            "updates its carry in place": (
+                reduce_x(updates_carry_in_place),
+                "writes to an input",
+            ),
+            "returns a view of an invariant": (
+                map_x(returns_view_of_invariant),
+                "returns an input",
+            ),
+            "passes its carry through": (
+                reduce_x(passes_carry_through),
+                "returns an input",
+            ),
+            "returns its carry as the tile": (
+                reduce_x(returns_carry_as_tile, out_dim=0),
+                "returns an input",
+            ),
+            "inner level passes its carry through": (
+                map_x(inner_level_passes_carry_through),
+                "returns an input",
+            ),
+        }
+        for name, (fn, message) in cases.items():
+            with self.subTest(name):
+                torch._dynamo.reset()
+                with self.assertRaisesRegex(RuntimeError, message):
+                    self._trace(fn, torch.randn(8, 4), torch.randn(4))
+
+    def test_tensor_captures_rejected_in_all_tracing_modes(self):
+        from torch.fx.experimental.proxy_tensor import make_fx
+
+        def fn(x, w):
+            captured = {"weight": w * 3}
+
+            def body(acc, tiles):
+                return acc + tiles[0].squeeze(0) * captured["weight"], None
+
+            return for_each_tile(body, (x,), dims=0, tile_size=1, init=torch.zeros(4))
+
+        for mode in ("real", "fake", "symbolic"):
+            with (
+                self.subTest(mode=mode),
+                self.assertRaisesRegex(
+                    RuntimeError, "closes over a tensor.*pass it as an operand"
+                ),
+            ):
+                make_fx(fn, tracing_mode=mode)(torch.ones(3, 4), torch.ones(4))
+
+    def test_literal_tensor_constants_rejected(self):
+        def fn(x):
+            def body(acc, tiles):
+                return acc + tiles[0].squeeze(0) * torch.tensor(
+                    [1.0, 2.0, 3.0, 4.0]
+                ), None
+
+            return for_each_tile(body, (x,), dims=0, tile_size=1, init=torch.zeros(4))
+
+        with self.assertRaisesRegex(RuntimeError, "literal tensor constant"):
+            self._trace(fn, torch.ones(3, 4))
+
+    def test_carry_structure_changes_rejected(self):
+        def fn(x, change):
+            def body(carry, tiles):
+                value = carry[0] + tiles[0].squeeze(0)
+                return change(value), None
+
+            return for_each_tile(
+                body, (x,), dims=0, tile_size=1, init=(torch.zeros(4),)
+            )
+
+        for change in (
+            lambda v: [v],
+            lambda v: v,
+            lambda v: (v, v.clone()),
+            lambda v: (),
+        ):
+            with (
+                self.subTest(change=change),
+                self.assertRaisesRegex(
+                    RuntimeError, "next_carry must have the same pytree structure"
+                ),
+            ):
+                self._trace(lambda x: fn(x, change), torch.ones(3, 4))
+
+    def test_carry_metadata_changes_rejected(self):
+        def fn(x, change):
+            def body(carry, tiles):
+                return change(carry + tiles[0].squeeze(0)), None
+
+            return for_each_tile(body, (x,), dims=0, tile_size=1, init=torch.zeros(4))
+
+        for change in (
+            lambda v: v[:2].clone(),
+            lambda v: v.double(),
+            lambda v: v.to("meta"),
+        ):
+            with (
+                self.subTest(change=change),
+                self.assertRaisesRegex(RuntimeError, "metadata.*mismatch|differ"),
+            ):
+                self._trace(lambda x: fn(x, change), torch.ones(3, 4))
+
+    def test_non_tensor_output_leaves_rejected(self):
+        def fn(x):
+            return for_each_tile(
+                lambda _, tiles: (None, {"tile": tiles[0] * 2, "count": 3}),
+                (x,),
+                dims=0,
+                tile_size=1,
+                out_dim=0,
+            )
+
+        with self.assertRaisesRegex(RuntimeError, "output leaves must be Tensors"):
+            self._trace(fn, torch.ones(3, 4))
+
+    def test_keyword_list_and_view_mutations_rejected(self):
+        def write_out(x, w):
+            torch.add(x.squeeze(0), 1, out=w)
+
+        def write_list(x, w):
+            torch._foreach_add_([w], 1)
+
+        def write_view(x, w):
+            w.view(2, 2).add_(1)
+
+        def fn(x, w, mutate):
+            def body(acc, tiles):
+                mutate(*tiles)
+                return acc + tiles[0].squeeze(0) * tiles[1], None
+
+            return for_each_tile(
+                body, (x, w), dims=(0, None), tile_size=1, init=torch.zeros(4)
+            )
+
+        for mutate in (write_out, write_list, write_view):
+            with (
+                self.subTest(mutate=mutate.__name__),
+                self.assertRaisesRegex(RuntimeError, "writes to an input"),
+            ):
+                self._trace(
+                    lambda x, w: fn(x, w, mutate), torch.ones(3, 4), torch.ones(4)
+                )
+
+    def test_nested_body_mutation_rejected(self):
+        def fn(x, w):
+            def outer(_, tiles):
+                def inner(_, tiles):
+                    tiles[1].add_(1)
+                    return None, tiles[0] * tiles[1].sum()
+
+                return None, for_each_tile(
+                    inner, tiles, dims=(1, None), tile_size=1, out_dim=1
+                )[1]
+
+            return for_each_tile(outer, (x, w), dims=(0, None), tile_size=1, out_dim=0)
+
+        with self.assertRaisesRegex(RuntimeError, "writes to an input"):
+            self._trace(fn, torch.ones(3, 4), torch.ones(4))
+
+    def test_output_pytree_aliases_rejected(self):
+        def fn(x):
+            def body(_, tiles):
+                value = tiles[0] * 2
+                return None, {"first": value, "second": (value.view_as(value),)}
+
+            return for_each_tile(body, (x,), dims=0, tile_size=1, out_dim=0)
+
+        with self.assertRaisesRegex(RuntimeError, "outputs sharing storage"):
+            self._trace(fn, torch.ones(3, 4))
+
+    def test_pytree_outputs_factories_and_local_mutation(self):
+        from torch.fx.experimental.proxy_tensor import make_fx
+
+        def fn(x, w):
+            def body(_, tiles):
+                value = tiles[0] * tiles[1]
+                torch.add(value, 1, out=value)
+                torch._foreach_add_([value], 2)
+                return None, {"first": value, "second": (value * torch.full((), 2.0),)}
+
+            return for_each_tile(
+                body, (x, w), dims=(0, None), tile_size=1, out_dim=0, reverse=True
+            )[1]
+
+        x, w = torch.randn(3, 4), torch.randn(4)
+        for mode in ("real", "fake", "symbolic"):
+            with self.subTest(mode=mode):
+                gm = make_fx(fn, tracing_mode=mode)(x, w)
+                # A new value detects accidental specialization of the invariant.
+                new_w = w + 7
+                expected = x * new_w + 3
+                torch.testing.assert_close(
+                    gm(x, new_w), {"first": expected, "second": (expected * 2,)}
+                )
+
+    def test_direct_trace_does_not_adjust_c_recursion_budget(self):
+        with (
+            mock.patch("platform.machine", return_value="s390x"),
+            mock.patch.object(torch._dynamo, "set_recursion_limit") as set_limit,
+        ):
+            gm = self._trace(
+                lambda x: for_each_tile(
+                    lambda _, tiles: (None, tiles[0] + 1),
+                    (x,),
+                    dims=0,
+                    tile_size=1,
+                    out_dim=0,
+                )[1],
+                torch.ones(3, 4),
+            )
+            set_limit.assert_not_called()
+        torch.testing.assert_close(gm(torch.ones(3, 4)), torch.full((3, 4), 2.0))
+
+    def test_invalid_scan_inputs_rejected(self):
+        def fn(x, **kwargs):
+            return for_each_tile(
+                lambda carry, tiles: (carry, tiles[0] * 2),
+                (x,),
+                dims=0,
+                tile_size=1,
+                out_dim=0,
+                **kwargs,
+            )
+
+        for init in ((), (2,), {"carry": "invalid"}):
+            with (
+                self.subTest(init=init),
+                self.assertRaisesRegex(ValueError, "init must"),
+            ):
+                self._trace(lambda x: fn(x, init=init), torch.ones(3, 4))
+        with self.assertRaisesRegex(ValueError, "at least one tile"):
+            self._trace(fn, torch.ones(0, 4))
+        with self.assertRaisesRegex(TypeError, "reverse must be a bool"):
+            self._trace(lambda x: fn(x, reverse=1), torch.ones(3, 4))
 
 
 if __name__ == "__main__":

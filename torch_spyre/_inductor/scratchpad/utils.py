@@ -14,23 +14,24 @@
 
 
 import math
-from typing import Any, Optional
+from collections.abc import Mapping
+from typing import Optional
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     ExternKernel,
     Operation,
-    IRNode,
     Pointwise,
 )
-from torch._inductor.virtualized import V
-from torch._inductor.ops_handler import WrapperHandler
 from torch.utils._sympy.value_ranges import ValueRanges, bound_sympy
 
-import sympy
 
 from torch_spyre._C import get_device_size_in_bytes
 from torch_spyre._inductor.ir import FixedTiledLayout
+from torch_spyre._inductor.loop_facts import (
+    output_advances_anywhere,
+    read_advances_anywhere,
+)
 from torch_spyre._inductor.pass_utils import (
     PerCoreView,
     _per_core_view_on_buf,
@@ -107,6 +108,38 @@ def calculate_liveness(graph: GraphLowering) -> dict[str, list[int]]:
     return liveness
 
 
+def counted_loop_group_path(op: Operation) -> tuple[int, ...]:
+    """The counted-loop group path ``op`` runs in, outermost first; ``()`` if none.
+
+    Mirrors scheduler._loop_group_id: only SchedulerNodes join a counted loop.
+    An extern kernel keeps its loop_info (e.g. a loop-body constant that
+    dedup_and_promote_constants hoisted to the graph head) but runs once,
+    outside the loop.
+    """
+    if isinstance(op, ExternKernel):
+        return ()
+    return tuple(getattr(getattr(op, "loop_info", None), "loop_group_id", ()) or ())
+
+
+def counted_loop_entry(
+    operations: list[Operation], op: Operation
+) -> Optional[Operation]:
+    """First operation of the outermost counted loop that ``op`` runs in.
+
+    ``None`` when ``op`` is not a counted-loop member.  "First" is the same
+    textual position :func:`counted_loop_lifetime_overrides` uses as that loop's
+    start, so a value placed immediately before the returned operation is
+    inside the interval those overrides already reserve for a value born
+    outside the loop and read inside it.
+    """
+    outer = counted_loop_group_path(op)[:1]
+    if not outer:
+        return None
+    return next(
+        (o for o in operations if counted_loop_group_path(o)[:1] == outer), None
+    )
+
+
 def counted_loop_lifetime_overrides(
     graph: GraphLowering,
 ) -> tuple[dict[str, int], dict[str, int]]:
@@ -123,14 +156,7 @@ def counted_loop_lifetime_overrides(
     their ordinary per-iteration lifetimes.
     """
 
-    def group_path(op: Operation) -> tuple[int, ...]:
-        # Mirror scheduler._loop_group_id: only SchedulerNodes join a counted
-        # loop. An extern kernel keeps its loop_info (e.g. a loop-body constant
-        # that dedup_and_promote_constants hoisted to the graph head) but runs
-        # once, outside the loop.
-        if isinstance(op, ExternKernel):
-            return ()
-        return tuple(getattr(getattr(op, "loop_info", None), "loop_group_id", ()) or ())
+    group_path = counted_loop_group_path
 
     loop_start: dict[tuple[int, ...], int] = {}
     loop_end: dict[tuple[int, ...], int] = {}
@@ -271,6 +297,36 @@ def is_empty_tiled_layout(layout: object) -> bool:
     )
 
 
+def storage_has_single_writer(
+    graph: GraphLowering,
+    producer: Operation,
+    *,
+    transferred_mutation: Operation | None = None,
+) -> bool:
+    """Prove fresh storage has no aliases or writers beyond its producer.
+
+    An explicitly transferred mutation (a collective moved onto a private
+    drain) may be exempted. Ordinary gathered sources have no exemption.
+    Inspect mutation/alias declarations as well as liveness dependencies.
+    """
+    name = producer.get_name()
+    for op in graph.operations:
+        try:
+            if (
+                (op is not transferred_mutation and name in op.get_mutation_names())
+                or name in op.get_inputs_that_alias_output()
+                or (
+                    op is not producer
+                    and op is not transferred_mutation
+                    and any(dep.name == name for dep in op_read_writes(op).writes)
+                )
+            ):
+                return False
+        except NotImplementedError:
+            return False
+    return True
+
+
 def buffer_not_read_in_full(graph: GraphLowering, buf_name: str) -> bool:
     """True if any consumer reads less than the whole ``buf_name`` (a sliced,
     partial, or multi-offset read), or if the footprint can't be proven to
@@ -356,13 +412,9 @@ def _is_tiled_advancing(op: Operation) -> bool:
     layout = getattr(op, "layout", None)
     if not isinstance(layout, FixedTiledLayout):
         return False
-    loop_info = getattr(op, "loop_info", None)
-    if loop_info is None:
-        return False
-    if any(dims for dims in loop_info.output_tiled_dims):
-        return True
-    squeezed_advance_output = getattr(loop_info, "squeezed_advance_output", None) or []
-    return any(level for level in squeezed_advance_output)
+    # The record test (False without a loop_info) lives in loop_facts; the
+    # layout gate above is an LX question and stays here.
+    return output_advances_anywhere(op)
 
 
 def _is_read_advancing_anywhere(
@@ -391,37 +443,21 @@ def _is_read_advancing_anywhere(
     ``loop_info.tiled_dims_per_read`` by position.
     """
     for reader_op, dep in buf_user_deps.get(name, []):
-        loop_info = getattr(reader_op, "loop_info", None)
-        if loop_info is None:
+        if getattr(reader_op, "loop_info", None) is None:
             continue
+        # read_advances_anywhere answers from the record at dep's position
+        # among the reader's MemoryDep reads, and is False when dep is not
+        # one of them (it is name's write on this op), when dep lies past
+        # the end of tiled_dims_per_read, and when every level of its tiled
+        # and squeezed entries is empty (e.g. [[], []]: _general_tile_advance
+        # contributes no term for an empty level).  The squeezed entry
+        # covers a dim tiled down to per-tile extent 1, which is squeezed out
+        # of the read's own index and so never appears in tiled_dims_per_read
+        # (see loop_info.py's squeezed_advance_per_read docstring).
         read_deps = [
             d for d in op_read_writes(reader_op).reads if isinstance(d, MemoryDep)
         ]
-        if dep not in read_deps:
-            continue  # dep is name's write on this op, not a read
-        dep_idx = read_deps.index(dep)
-        if dep_idx >= len(loop_info.tiled_dims_per_read):
-            continue
-        # Mirrors _general_tile_advance's own per-level loop: a dep whose
-        # outer per-level list is non-empty but every level's own
-        # (dim, extent) list is empty (e.g. [[], []]) still advances by
-        # zero -- _general_tile_advance's `if not dim_extent_pairs:
-        # continue` never contributes a term for such a level, so the
-        # resulting device_tile_advance_expr is None, not merely small.
-        if any(loop_info.tiled_dims_per_read[dep_idx]):
-            return True
-        # Mirror _is_tiled_advancing's squeezed_advance_output check on the
-        # read side: a dim tiled down to per-tile extent 1 is squeezed out
-        # of this read's own index, so it never appears in
-        # tiled_dims_per_read even though the read's device address
-        # genuinely advances every iteration (see loop_info.py's
-        # squeezed_advance_per_read docstring).
-        squeezed_advance_per_read = (
-            getattr(loop_info, "squeezed_advance_per_read", None) or []
-        )
-        if dep_idx < len(squeezed_advance_per_read) and any(
-            squeezed_advance_per_read[dep_idx]
-        ):
+        if read_advances_anywhere(reader_op, dep, reads=read_deps):
             return True
     return False
 
@@ -458,66 +494,52 @@ def _writes_at_constant_offset(op: Operation) -> bool:
 def ops_in_offset_mutation_component(
     graph: GraphLowering,
 ) -> set[str]:
-    """Names of ops data-connected to a sliced in-place mutation that writes at
-    a constant non-zero offset (e.g. ``x[:, 32:96] = ...``).
+    """Pin the forward dependency closure of constant-offset mutation storage.
 
-    Such a mutation and everything fused with it land in one SDSC. The offset
-    write's codegen assumes the target buffer keeps the slicing the eager path
-    chose; if the co-optimizing allocator re-slices any op in that fused kernel
-    (a different core division), the deeptools scheduler can no longer place the
-    offset write and aborts the compile (``DtException: "There must be at least
-    one valid candidate"``, ``L3DlOpsScheduler.cpp:1196``). This is the root
-    cause of the ``slice_stick_mutation_*`` co-optimizing-allocator failures --
-    the division change, *not* LX residency (the abort reproduces with pinning
-    fully disabled).
+    Re-slicing an offset write or its downstream users can make its address
+    arithmetic unschedulable or produce wrong results, including when all
+    involved buffers are in HBM. ``cd_parent_matches`` only constrains LX
+    residency, so adding mutation edges there cannot replace this guard.
 
-    The caller pins every op in this set to its upstream (fixed) division, so
-    the offset-write SDSC keeps the schedulable slicing the greedy /
-    placement-only path uses. Fusion boundaries are unknown at planning time, so
-    the SDSC is over-approximated by the undirected data-dependency component
-    containing the offset write: producer chain (the value written), the
-    mutation target it aliases, and the consumers of that target. Over-approxi-
-    mation only forgoes a division optimization (correct, never a new failure --
-    a fixed division is exactly what greedy uses).
+    Follow reads from buffer to consumer, and MutationLayout links in both
+    directions: an update and its target share storage. This also follows
+    copy-backs and zero-offset writes reached through arbitrarily long reader
+    chains. There is no hop limit. A reached writer brings its target and all
+    of that target's readers into the closure, regardless of graph order.
 
-    Coverage-aware via :func:`_writes_at_constant_offset`: symbolic per-core
-    offsets (coarse tiling) are not offset writes, so no component is seeded and
-    coarse tiling is not constrained.
+    Do not follow ordinary reads backwards to their producers: the solver's
+    residency gate already protects reads from independently re-sliced
+    producers. In particular, padding an FFN input must not pin the upstream
+    attention block (issue #4990). Downstream ops are conservatively pinned;
+    this is a dependency boundary, not an exact address-dependence analysis.
+
+    Symbolic coarse-tile offsets do not seed the walk; see
+    :func:`_writes_at_constant_offset`.
     """
-    # Undirected adjacency over buffer names (op.name == its output buffer,
-    # Inductor convention). Edges: producer<->operand (read deps) and a
-    # MutationLayout op <-> its aliased target buffer.
-    adj: dict[str, set[str]] = {}
+    seeds = [op.name for op in graph.operations if _writes_at_constant_offset(op)]
+    if not seeds:
+        return set()
 
-    def link(a: str, b: str) -> None:
-        adj.setdefault(a, set()).add(b)
-        adj.setdefault(b, set()).add(a)
-
-    seeds: list[str] = []
+    successors: dict[str, set[str]] = {}
+    op_names = {op.name for op in graph.operations}
     for op in graph.operations:
         for dep in op_read_writes(op).reads:
-            name = getattr(dep, "name", None)
-            if name:
-                link(op.name, name)
+            successors.setdefault(dep.name, set()).add(op.name)
         layout = getattr(op, "layout", None)
         if isinstance(layout, MutationLayoutSHOULDREMOVE):
-            try:
-                link(op.name, layout.target.get_name())
-            except (AttributeError, TypeError):
-                pass
-        if _writes_at_constant_offset(op):
-            seeds.append(op.name)
+            target = layout.target.get_name()
+            successors.setdefault(op.name, set()).add(target)
+            successors.setdefault(target, set()).add(op.name)
 
-    op_names = {op.name for op in graph.operations}
-    component: set[str] = set()
+    reached: set[str] = set()
     stack = list(seeds)
     while stack:
-        node = stack.pop()
-        if node in component:
+        name = stack.pop()
+        if name in reached:
             continue
-        component.add(node)
-        stack.extend(adj.get(node, ()))
-    return component & op_names
+        reached.add(name)
+        stack.extend(successors.get(name, ()))
+    return reached & op_names
 
 
 def get_buffer_users(graph: GraphLowering) -> dict[str, list[Operation]]:
@@ -555,7 +577,9 @@ def _op_num_cores(op: Operation) -> int:
 
 
 def get_ncores_for_buffers(
-    graph: GraphLowering, cache: Optional[dict] = None
+    graph: GraphLowering,
+    cache: Optional[dict] = None,
+    drained_readers: Optional[Mapping[str, str]] = None,
 ) -> tuple[dict[str, int], dict[str, str], dict[str, PerCoreView]]:
     """
     Return ``(num_cores, mismatch_reasons, accepted_views)``, where ``num_cores`` maps each
@@ -570,12 +594,21 @@ def get_ncores_for_buffers(
     results across calls (e.g. across co-opt search leaves). Safe to
     share only within a single graph, since the cache key includes the
     op name and `dep` (which carries the buffer name).
+
+    ``drained_readers`` maps a loop-carry storage to the collective that a
+    validated drain plan will repoint at the post-loop drain.  The judge runs
+    before that rewrite, so that collective's use is not one of the storage's.
     """
+    from .lx_relayout import is_partial_lx_read, local_lx_subrange_certificate
+
     result: dict[str, int] = {}
     mismatch_reasons_cache: dict[str, str] = {}
     accepted_views: dict[str, PerCoreView] = {}
     buf_user_deps = _get_buffer_user_deps(graph)
     for buf_name, users in buf_user_deps.items():
+        drained_reader = (drained_readers or {}).get(buf_name)
+        if drained_reader is not None:
+            users = [(op, dep) for op, dep in users if op.get_name() != drained_reader]
         layout = getattr(graph.try_get_buffer(buf_name), "layout", None)
         if is_empty_tiled_layout(layout):
             # Reject before the unsplit whole-buffer view shortcut and before
@@ -659,6 +692,20 @@ def get_ncores_for_buffers(
                     f"op '{ref_op_name}' ref {ref_view} != '{op.get_name()}' {view}"
                 )
                 break
+        if mismatch_reason is None:
+            producer = graph.try_get_buffer(buf_name)
+            for op, dep in users:
+                if dep in op_read_writes(op).reads and is_partial_lx_read(
+                    producer, dep
+                ):
+                    if (
+                        local_lx_subrange_certificate(
+                            graph, producer, op, ref_view, ref_view
+                        )
+                        is None
+                    ):
+                        mismatch_reason = f"partial LX read on '{op.get_name()}'"
+                        break
         if mismatch_reason is not None:
             num_cores = -1
             mismatch_reasons_cache[buf_name] = mismatch_reason
@@ -676,40 +723,29 @@ def get_ncores_for_buffers(
     return result, mismatch_reasons_cache, accepted_views
 
 
-class _GetLoadStoreIndices(WrapperHandler):
-    def __init__(self, inner):
-        super().__init__(inner)
-        self._load_map = {}
-        self._store_map = {}
+def get_op_pointwise_inputs(op: Operation) -> list[str]:
+    """Inputs whose every read addresses the pointwise output's storage index.
 
-    def load(self, name: str, index: sympy.Expr):
-        self._load_map[name] = index
-        return super().load(name, index)
-
-    def store(self, name: str, index: sympy.Expr, value: Any, mode: Any = None):
-        self._store_map[name] = index
-        return super().store(name, index, value, mode)
-
-
-def get_load_and_store_indices(
-    pointwise: Pointwise,
-) -> tuple[dict[str, sympy.Expr], dict[str, sympy.Expr]]:
-    handler = _GetLoadStoreIndices(V.MockHandler())
-    index = [sympy.Symbol(f"index{i}") for i in range(len(pointwise.ranges))]
-    with V.set_ops_handler(handler):
-        pointwise.inner_fn(index)
-    return handler._load_map, handler._store_map
-
-
-def get_op_pointwise_inputs(node: IRNode) -> list[str]:
-    if not isinstance(node, Pointwise):
+    Trace the ComputedBuffer, not Pointwise.inner_fn: the latter returns a
+    value without emitting a store, so comparing against its stores is vacuous.
+    Keep every read of each input; one transposed or offset read bars reuse even
+    when another read of that same buffer matches the output.
+    """
+    if not isinstance(op, ComputedBuffer) or not isinstance(op.data, Pointwise):
         return []
-    loads, stores = get_load_and_store_indices(node)
-
+    rw = op_read_writes(op)
+    writes = [dep for dep in rw.writes if isinstance(dep, MemoryDep)]
+    if len(writes) != 1:
+        return []
+    invalid = {
+        dep.name
+        for dep in rw.reads
+        if not isinstance(dep, MemoryDep) or dep.index != writes[0].index
+    }
     return [
-        inp
-        for inp, load_index in loads.items()
-        if all(store_index == load_index for store_index in stores.values())
+        name
+        for name in dict.fromkeys(dep.name for dep in rw.reads)
+        if name not in invalid
     ]
 
 
@@ -720,10 +756,14 @@ def _would_produce_lx_back_gap(
 ) -> bool:
     """Check if pinning a buffer to LX would produce a backGapCore_.
 
-    A backGap fires when device_size[d] > it_dim_size for any device dimension d.
-    The backend supports backGap for HBM but not for LX, so buffers triggering
-    this condition must stay in HBM.
+    A backGap fires when the in-core iteration and physical device extents
+    differ, including the negative gap used for overlapping unfold reads.
+    Generic LX gaps remain unsupported. The allocator may admit only a
+    certified prefix-slice gather whose unsplit-K consumer uses a uniform
+    outer tail gap, with a guaranteed disjoint full-buffer copy.
     """
+    from .lx_relayout import local_lx_subrange_geometry
+
     buf = graph.get_buffer(buf_name)
     stl = buf.layout.device_layout
     device_size = stl.device_size
@@ -733,6 +773,13 @@ def _would_produce_lx_back_gap(
         rw = op_read_writes(op)
         for dep in rw.reads | rw.writes:
             if dep.name != buf_name:
+                continue
+            if (
+                dep in rw.reads
+                and local_lx_subrange_geometry(graph, buf, op) is not None
+            ):
+                # Emission uses the proved compact input shape. Other readers
+                # still undergo the ordinary back-gap test below.
                 continue
             try:
                 coords = device_coordinates(stl, dep, None)
@@ -763,7 +810,21 @@ def _would_produce_lx_back_gap(
                     )
                     + 1
                 )
-                if device_size[d] > covered:
+                if device_size[d] > covered or (
+                    device_size[d] < covered and coord_expr.as_coeff_Add()[1] in syms
+                ):
+                    return True
+                # Normalization splits an affine coordinate such as 2*w + k
+                # into nested axes. The original axis can be fully covered
+                # while its inner k axis needs a negative backGap. Check that
+                # overlap before allowing this buffer to reside in LX.
+                from torch_spyre._inductor.work_division_constraints import (
+                    overlapping_coordinate_extents,
+                )
+
+                if overlapping_coordinate_extents(
+                    coord_expr, {sym: int(dep.ranges[sym]) for sym in syms}
+                ):
                     return True
     return False
 

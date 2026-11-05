@@ -1232,6 +1232,13 @@ class ModulesNamedItem(BaseModel):
     # layout concept (e.g. CPU).
     apply_device_layout: bool = False
 
+    # FP8 matmul support for the out-of-tree custom module tests, which interpret
+    # both; the framework only carries them. ``fp8_linears``: submodule paths
+    # (relative; "" = this module) production runs as FP8 linears. ``precision``:
+    # a per-module tolerance, as upstream's overrides are keyed by dtype only.
+    fp8_linears: List[str] = []
+    precision: Optional[Precision] = None
+
     sample_inputs_func: InputsEdits = InputsEdits()  # Legacy: forward inputs only
     constructor_inputs: Optional[InputsEdits] = None  # New: explicit constructor inputs
     forward_inputs: Optional[Union[InputsEdits, List[InputsEdits]]] = (
@@ -1374,7 +1381,9 @@ class OpsNamedItem(BaseModel):
             op_name=self.name,
             test_device=test_device,
         )
-        resolved_kw = self.sample_inputs_func.resolved_kwargs(test_device=test_device)
+        resolved_kw = self.sample_inputs_func.resolved_kwargs(
+            seed=seed, test_device=test_device
+        )
         inp = cpu_args[0] if cpu_args else None
         rest = tuple(cpu_args[1:]) if len(cpu_args) > 1 else ()
         return SampleInput(inp, args=rest, kwargs=resolved_kw)
