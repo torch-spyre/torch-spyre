@@ -254,11 +254,21 @@ def collapse_valid_elements(
     new_ve: dict[tuple[int, ...], int] = {}
     merged_val = 1
     for key, val in stl.valid_elements.items():
-        if any(d in outer_dims for d in key):
-            merged_val *= val
-        else:
+        merged_dims = [d for d in key if d in outer_dims]
+        rest = [d for d in key if d not in outer_dims]
+        if not merged_dims:
             new_key = tuple(sorted(shift[d] for d in key))
             new_ve[new_key] = val
+        elif not rest:
+            merged_val *= val
+        else:
+            # A key shared with non-merged dims (e.g. the stick group (1, 3) when
+            # dim 1 is merged).  The rest keeps its positions; the merged dims
+            # get the remaining count, rounded up so no valid position is lost.
+            rest_size = math.prod(stl.device_size[d] for d in rest)
+            rest_val = min(val, rest_size)
+            merged_val *= -(-val // rest_size)
+            new_ve[tuple(sorted(shift[d] for d in rest))] = rest_val
     new_ve[(shift[keep],)] = merged_val
     return new_ve
 
@@ -288,27 +298,34 @@ def restickify_valid_elements(
 ) -> dict[tuple[int, ...], int]:
     """Update valid_elements after moving the stick to a new host dimension.
 
-    Finds the existing stick group (the key containing stick_dim) and updates
-    its count to new_sd_host_size; new_sd_outer_dim becomes a standalone key
-    with old_sd_host_size.  Any dim that shared a key with a touched dim but
-    is not itself touched is split out as a singleton with count 1.  When
-    old == new, no move is possible so an empty map is returned.  Parallel to
-    restickify_device_size and restickify_stride_map.
+    Updates the stick group's count to new_sd_host_size and makes
+    new_sd_outer_dim a standalone key with old_sd_host_size. Dims that shared a
+    touched key are split out with count 1. Returns {} when old == new.
     """
     if old_sd_outer_dim == new_sd_outer_dim:
         return {}
     stick_dim = len(stl.device_size) - 1
     old_stick_key = next(k for k in stl.valid_elements if stick_dim in k)
+    # Fold the old outer dim into the stick group if it still holds sticks.
+    stick_size = stl.device_size[stick_dim]
+    new_old_outer_size = -(-new_sd_host_size // stick_size)
+    if old_sd_outer_dim not in old_stick_key and new_old_outer_size > 1:
+        old_stick_key = tuple(sorted(set(old_stick_key) | {old_sd_outer_dim}))
     regrouped = set(old_stick_key) | {new_sd_outer_dim}
+    # Split keys containing the old outer dim too, so it isn't duplicated.
+    touched = regrouped | {old_sd_outer_dim}
     result = {}
     for key, val in stl.valid_elements.items():
-        if regrouped.isdisjoint(key):
+        if touched.isdisjoint(key):
             result[key] = val
         else:
-            for d in set(key) - regrouped:
+            for d in set(key) - touched:
                 result[(d,)] = 1
     result[old_stick_key] = new_sd_host_size
     result[(new_sd_outer_dim,)] = old_sd_host_size
+    # A standalone old outer dim left at size 1 must hold a count of 1 at most.
+    if new_old_outer_size == 1 and old_sd_outer_dim not in old_stick_key:
+        result[(old_sd_outer_dim,)] = 1
     return result
 
 
@@ -2380,6 +2397,20 @@ def iteration_space_with_splits(
 # but are here to avoid circular dependences in those files
 
 
+def _zero_outer_dim_for_stick(stl: SpyreTensorLayout, idc: list) -> int | None:
+    """Pick the outer device dim a stick variable that is absent from idc occupies.
+
+    Prefers a zero-coordinate dim in the stick's own valid_elements group, so the
+    restickify rewrites the stick group rather than an unrelated size-1 dim (which
+    would leave one dim in two valid_elements keys).  Falls back to the first
+    zero-coordinate dim.
+    """
+    zeros = [j for j in range(len(idc) - 1) if idc[j] == sympy.S.Zero]
+    stick_dim = len(stl.device_size) - 1
+    stick_key = next((k for k in stl.valid_elements if stick_dim in k), ())
+    return next((j for j in zeros if j in stick_key), next(iter(zeros), None))
+
+
 def restickify_device_size(
     old_device_size: list,
     old_sd_outer_dim: int,
@@ -2527,7 +2558,7 @@ def compute_restickify_target_layout(
     old_stride_map = list(stl.stride_map)
     old_sd_outer_dim = next(
         iter(old_var_outer_dims),
-        next((j for j in range(len(idc) - 1) if idc[j] == sympy.S.Zero), None),
+        _zero_outer_dim_for_stick(stl, idc),
     )
     if old_sd_outer_dim is None:
         return None
@@ -2605,7 +2636,7 @@ def compute_size1_restickify_layout(
         return None
     old_sd_outer_dim = next(
         iter(old_var_outer_dims),
-        next((j for j in range(len(idc) - 1) if idc[j] == sympy.S.Zero), None),
+        _zero_outer_dim_for_stick(stl, idc),
     )
     if old_sd_outer_dim is None:
         return None
