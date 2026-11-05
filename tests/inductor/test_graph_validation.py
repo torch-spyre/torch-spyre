@@ -625,13 +625,13 @@ class TestLoopNodeTransparency(unittest.TestCase):
         """INV-4 must still catch a leaf op inside a LoopNode whose
         name_to_op entry is missing."""
         buf = _make_buffer("placeholder")
-        name = _register_and_add_operation(self.graph, buf)
+        _register_and_add_operation(self.graph, buf)
         self.graph.operations.remove(buf)
 
         node = self._make_loop_node([buf])
         self.graph.operations.append(node)
 
-        del self.graph.name_to_op[name]
+        del self.graph.name_to_op[buf.get_operation_name()]
 
         with self.assertRaises(GraphValidationError) as ctx:
             validate_graph(self.graph)
