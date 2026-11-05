@@ -13767,6 +13767,65 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 torch._dynamo.reset()
                 self.compare_with_cpu(fn, x, torch.tensor([1, 3]))
 
+    @staticmethod
+    def _index_fill_pattern_cases():
+        """Index and dim patterns for index_fill_, as (fn, x, index) by name.
+
+        A repeated index is well defined here, unlike index_copy: every selected
+        row gets the same value.
+        """
+
+        def inplace(dim, value):
+            def fn(x, index):
+                x = x.clone()
+                x.index_fill_(dim, index, value)
+                return x
+
+            return fn
+
+        return {
+            "issue_2d_dim0_int_value": (
+                inplace(0, 1),
+                torch.zeros(8, 64, dtype=torch.float16),
+                torch.tensor([0, 2]),
+            ),
+            "first_and_last_row": (
+                inplace(0, 10.0),
+                cached_randn((67, 256)),
+                torch.tensor([0, 66]),
+            ),
+            "every_row": (inplace(0, 10.0), cached_randn((8, 64)), torch.arange(8)),
+            "unsorted_index": (
+                inplace(0, 10.0),
+                cached_randn((67, 256)),
+                torch.tensor([5, 1, 3]),
+            ),
+            "repeated_index": (
+                inplace(0, 10.0),
+                cached_randn((67, 256)),
+                torch.tensor([1, 3, 1]),
+            ),
+            "negative_dim": (
+                inplace(-2, 10.0),
+                cached_randn((67, 256)),
+                torch.tensor([1, 3]),
+            ),
+        }
+
+    @pytest.mark.filterwarnings("error::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_index_fill_index_patterns_cpu(self):
+        """Eager index_fill_ matches CPU across index patterns, #4414."""
+        for name, (fn, x, index) in self._index_fill_pattern_cases().items():
+            with self.subTest(case=name):
+                self.compare_with_cpu(fn, x, index, run_compile=False, run_eager=True)
+
+    def test_index_fill_index_patterns_compiled_cpu(self):
+        """torch.compile'd index_fill_ matches CPU across index patterns, #4414."""
+        for name, (fn, x, index) in self._index_fill_pattern_cases().items():
+            with self.subTest(case=name):
+                torch._dynamo.reset()
+                self.compare_with_cpu(fn, x, index)
+
     @expects_raise
     def test_index_fill_stick_dim_raises(self):
         """index_fill along the stick (last) dim raises, like index_copy (#4404).

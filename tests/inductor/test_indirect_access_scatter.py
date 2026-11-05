@@ -1118,7 +1118,7 @@ class _ScatterScenarios:
         index_fill requires a long (int64) index, like index_copy.
         """
         out = torch.rand(128, 256, dtype=torch.float16).to("spyre")
-        idx = torch.tensor([5, 40, 99], dtype=torch.int64).to("spyre")
+        idx = torch.randint(0, 128, (3,), dtype=torch.int64).to("spyre")
         self.name_dims(out, {"M": 128, "N": 256})
         self.name_dims(idx, {"P": 3})
 
