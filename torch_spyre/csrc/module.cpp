@@ -264,6 +264,21 @@ PYBIND11_MODULE(_C, m) {
       },
       py::arg("key"), "Return registered debug-handle IDs without mutation");
   m.def(
+      "lookup_bundle_dir_prefix",
+      [](const std::string& name_base) -> py::object {
+        const auto sdsc_bundle_dir_prefix =
+            spyre::lookupBundleDirPrefix(name_base);
+        if (sdsc_bundle_dir_prefix.empty()) {
+          return py::none();
+        }
+        return py::cast(sdsc_bundle_dir_prefix);
+      },
+      py::arg("name_base"),
+      "Return the SDSC bundle directory prefix for an activity name base");
+  m.def("activity_name_base", &spyre::activityNameBase,
+        py::arg("profiler_event_name"),
+        "Return the activity base name from the profiler event name");
+  m.def(
       "kernel_provenance_registry_stats",
       []() {
         const auto stats = spyre::kernelProvenanceRegistryStats();
@@ -629,6 +644,15 @@ PYBIND11_MODULE(_C, m) {
   m.def("spyre_empty_with_layout", &spyre::spyre_empty_with_layout,
         py::arg("size"), py::arg("stride"), py::arg("dtype"),
         py::arg("device_layout"), py::arg("device") = py::none());
+  m.def("spyre_empty_reserved", &spyre::spyre_empty_reserved, py::arg("size"),
+        py::arg("stride"), py::arg("dtype"), py::arg("dim"),
+        py::arg("min_size"), py::arg("max_size"), py::arg("granularity"),
+        "Allocate a Spyre tensor whose physical layout/storage are sized "
+        "for dim `dim` == `max_size`, while its logical (PyTorch-visible) "
+        "size/stride stay at `size`/`stride`. `min_size`/`granularity` are "
+        "stored on the tensor for the runtime resize_ guard to check. "
+        "Backs tensor.to(\"spyre\", dynamic={dim: {min, max, "
+        "granularity}}).");
   m.def("empty_with_layout", &spyre::py_empty_with_layout);
   m.def("as_strided_with_layout", &spyre::as_strided_with_layout);
   m.def("reinterpret_tensor", &spyre::reinterpret_tensor);
@@ -672,6 +696,31 @@ PYBIND11_MODULE(_C, m) {
   m.def("set_spyre_tensor_layout", &spyre::set_spyre_tensor_layout);
   m.def("get_spyre_tensor_sizes", &spyre::get_spyre_tensor_sizes);
   m.def("get_spyre_tensor_strides", &spyre::get_spyre_tensor_strides);
+  m.def(
+      "get_reserved_dims",
+      [](const at::Tensor& tensor)
+          -> std::optional<std::map<int64_t, std::map<std::string, int64_t>>> {
+        // The dict-of-strings conversion lives here, at the Python
+        // boundary, rather than in spyre::get_reserved_dims itself -- a
+        // C++ caller of that function gets the typed ReservedDimInfo
+        // struct with compile-time field checking, not string lookups
+        // into a dict it has to spell correctly.
+        auto reserved = spyre::get_reserved_dims(tensor);
+        if (!reserved.has_value()) {
+          return std::nullopt;
+        }
+        std::map<int64_t, std::map<std::string, int64_t>> result;
+        for (const auto& [dim, info] : *reserved) {
+          result[dim] = {{"min", info.min},
+                         {"max", info.max},
+                         {"granularity", info.granularity}};
+        }
+        return result;
+      },
+      py::arg("tensor"),
+      "Return {dim: {'min', 'max', 'granularity'}} for a tensor.to("
+      "\"spyre\", dynamic=...) reservation, or None. Never raises, even "
+      "for a non-Spyre tensor.");
   m.def("get_downcast_warning", &spyre::get_downcast_warn_enabled,
         "Return whether downcast warnings are enabled.");
   m.def("set_downcast_warning", &spyre::set_downcast_warn_enabled,
@@ -896,15 +945,24 @@ PYBIND11_MODULE(_C, m) {
       });
 
   m.def("prepare_kernel", &spyre::prepareKernel, py::arg("spyrecode_dir"),
-        py::arg("stream") = nullptr, py::arg("profiler_name") = std::nullopt,
+        py::arg("stream") = nullptr,
+        py::arg("profiler_event_name") = std::nullopt,
+        py::arg("sdsc_bundle_dir_prefix") = std::string{},
         "Prepare a kernel from a SpyreCode directory and return a JobPlan.\n\n"
         "Args:\n"
         "    spyrecode_dir (str): Path to the SpyreCode directory\n"
         "    stream (SpyreStream, optional): Stream to use for initialization "
         "transfers.\n"
-        "        If None, uses the current stream. Defaults to None.\n\n"
-        "    profiler_name (str, optional): Bounded base name for "
-        "profiler-visible compute events. Defaults to None.\n\n"
+        "        If None, uses the current stream. Defaults to None.\n"
+        "    profiler_event_name (str, optional): Bounded base name for "
+        "profiler-visible compute events. Defaults to None.\n"
+        "    sdsc_bundle_dir_prefix (str, optional): Prefix of the SDSC "
+        "bundle directory name; emitted as args.sdsc_bundle_dir_prefix in "
+        "profiler traces.  Use 16 characters (the first 16 characters of the "
+        "lowercase base32 cache key, a SHA-256 digest) on the cached path, or "
+        "8 hex characters (the first 8 hex characters of a UUID) on the "
+        "no-cache/KTIR path. "
+        "Empty string disables registration.\n\n"
         "Returns:\n"
         "    Prepared JobPlan ready for execution");
   // Bind the current-stream overload (resolves the current stream internally).
