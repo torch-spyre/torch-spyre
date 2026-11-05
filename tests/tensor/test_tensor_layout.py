@@ -996,6 +996,37 @@ class TestSpyreTensorLayout(TestCase):
                 self.assertEqual(out.device_size[-2], size[-2])
                 self.assertEqual(out.stride_map[-2], contiguous(size)[-2])
 
+    @parametrize(
+        "host_size,between",
+        [
+            ([2, 3, 128], 1),  # largest non-stick dim is in the last non-stick slot
+            ([4, 256, 64], 1),
+            ([2, 5, 3, 128], 1),  # max in the middle; other dims keep host order
+            ([2, 3, 5, 128], 2),
+            ([8, 8, 8, 128], 0),  # tie: lowest index wins
+            ([5, 7, 7, 64], 1),  # tie between non-first dims
+            ([3, 64], 0),  # rank < 3: identity
+            ([64], 0),
+        ],
+    )
+    def test_default_layout_largest_nonstick_dim_between_sticks(
+        self, host_size, between
+    ):
+        """The default layout puts the largest non-stick dim between the sticks."""
+        rank = len(host_size)
+        if rank >= 3:
+            order = [between] + [d for d in range(rank) if d != between]
+        else:
+            order = list(range(rank))
+        strides = [1] * rank
+        for d in range(rank - 2, -1, -1):
+            strides[d] = strides[d + 1] * host_size[d + 1]
+        expected = SpyreTensorLayout(host_size, strides, torch.float16, order)
+        self.assertEqual(SpyreTensorLayout(host_size, torch.float16), expected)
+        if rank >= 3:
+            # device_size[rank - 1] is the slot between the two stick dims.
+            self.assertEqual(expected.device_size[rank - 1], host_size[between])
+
     def test_explicit_layout_rejects_malformed_device_size(self):
         """The explicit (device_size, stride_map) constructor validates the one
         invariant every consumer assumes: non-negative device dims, one

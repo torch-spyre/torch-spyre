@@ -981,7 +981,7 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
                         << ", Stride: " << stride << ", dtype: " << dtype
                         << ") to be mapped onto device " << device;
   auto device_layout = SpyreTensorLayout(size.vec(), stride.vec(), scalar_type,
-                                         generic_stick_dim_order(size.size()));
+                                         default_dim_order(size));
   size_t device_size_bytes = get_device_size_in_bytes(device_layout);
   int64_t cpu_numel = std::accumulate(size.begin(), size.end(), 1LL,
                                       std::multiplies<int64_t>());

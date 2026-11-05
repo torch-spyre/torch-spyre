@@ -34,7 +34,13 @@
 namespace spyre {
 
 int64_t elems_per_stick(const DataFormats& df);
-std::vector<int32_t> generic_stick_dim_order(int32_t num_dims);
+/**
+ * Default dim_order used by SpyreTensorLayout(host_size, dtype). The stick
+ * stays on the last host dim. For rank >= 3 the device dim between the two
+ * stick dims is the largest non-stick host dim (lowest index wins ties) and
+ * the other dims keep their host order. Lower ranks get the identity order.
+ */
+std::vector<int32_t> default_dim_order(c10::IntArrayRef host_size);
 /* Describes how device coordinates are arranged in memory.
  * Certain on-device type conversions result in non-sequential device
  * coordinates and some stick reduction operations (e.g., exx2) result in

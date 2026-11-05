@@ -339,8 +339,10 @@ explicit `SpyreTensorLayout`.  When a `SpyreTensorLayout` is provided, it
 specifies precisely how the device tensor will be laid out. When the APIs are
 invoked without providing a `SpyreTensorLayout` the device tensor
 is created using a default layout. Conceptually the default layout
-(a) designates the last dimension as the stick dimension, (b) tiles
-along the first dimension, and (c) pads the size of the stick dimension
+(a) designates the last dimension as the stick dimension, (b) places the
+largest non-stick dimension between the two stick dimensions of the device
+layout (the first such dimension wins ties; tensors with fewer than three
+dimensions are unaffected), and (c) pads the size of the stick dimension
 to make it evenly divisible into sticks.
 
 ### Default Layout Example
@@ -366,10 +368,11 @@ print(stl)
 You should see something like:
 
 ```
-SpyreTensorLayout(device_size=[100, 3, 5, 64], stride_map =[150, 64, 15000, 1], device_dtype=DataFormats.SEN169_FP16)
+SpyreTensorLayout(device_size=[5, 3, 100, 64], stride_map =[15000, 64, 150, 1], device_dtype=DataFormats.SEN169_FP16)
 ```
 
-The 3-D tensor has a 4-D `device_size`.
+The 3-D tensor has a 4-D `device_size`. The largest non-stick dimension (`100`)
+sits between the two stick dimensions.
 A float16 is two bytes, therefore each stick contains 64 data values.
 The stick dimension of `150` has been padded to `192` and broken into two device dimensions of (`3` and `64`).
 
@@ -393,7 +396,7 @@ print(y.device_tensor_layout())
 You should see exactly the same output as before:
 
 ```
-SpyreTensorLayout(device_size=[100, 3, 5, 64], stride_map =[150, 64, 15000, 1], device_dtype=DataFormats.SEN169_FP16)
+SpyreTensorLayout(device_size=[5, 3, 100, 64], stride_map =[15000, 64, 150, 1], device_dtype=DataFormats.SEN169_FP16)
 ```
 
 A second constructor of `SpyreTensorLayout` enables finer-grained control.
@@ -405,13 +408,14 @@ default contiguous strides for you; this one requires them explicitly.)
 For example, changing the constructor in the above program to
 
 ```
-stl = SpyreTensorLayout((5, 100, 150), (15000, 150, 1), torch.float16, [1,0,2])
+stl = SpyreTensorLayout((5, 100, 150), (15000, 150, 1), torch.float16, [0,1,2])
 ```
 
-yields a tensor with the tiling inverted:
+yields a tensor with the tiling inverted (the first dimension, rather than
+the largest, sits between the stick dimensions):
 
 ```
-SpyreTensorLayout(device_size=[5, 3, 100, 64], stride_map =[15000, 64, 150, 1], device_dtype=DataFormats.SEN169_FP16)
+SpyreTensorLayout(device_size=[100, 3, 5, 64], stride_map =[150, 64, 15000, 1], device_dtype=DataFormats.SEN169_FP16)
 ```
 
 See the [tensor layout example](https://github.com/torch-spyre/torch-spyre/blob/main/docs/source/user_guide/examples/tensor_layout.py) for a runnable
