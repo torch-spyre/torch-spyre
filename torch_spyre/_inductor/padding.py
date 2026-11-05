@@ -85,7 +85,13 @@ from torch._inductor.ops_handler import DefaultHandler, WrapperHandler
 from torch._inductor.utils import sympy_product
 from torch._inductor.virtualized import V
 
-from .constants import BATCH_MATMUL_FP8_OP, BATCH_MATMUL_OP, DEVICE_NAME
+from .constants import (
+    BATCH_MATMUL_FP8_OP,
+    BATCH_MATMUL_OP,
+    DEVICE_NAME,
+    FP16_MAX,
+    FP16_MIN,
+)
 from .errors import Unsupported
 from .ir import (
     FixedTiledLayout,
@@ -1687,8 +1693,8 @@ class ArgNameToIndexTracer(DefaultHandler):
 # padded lanes get reduced over. _FP16_MAX/_FP16_MIN are the most extreme
 # finite fp16 values, so they lose (max)/win (min) against any real fp16 score
 # while still encoding correctly.
-_FP16_MAX = 65504.0
-_FP16_MIN = -65504.0
+_FP16_MAX = FP16_MAX
+_FP16_MIN = FP16_MIN
 
 # 32-bit coordinate masking uses a repeating 16-bit pattern for the mask
 # value. 0.0 (used for sum/mean) already satisfies this requirement.

@@ -2399,6 +2399,24 @@ def _prune_unsafe_identity_selections(
             selected.pop(name, None)
 
 
+def _is_declared_carry_update(op: Any) -> bool:
+    """True for an op that is the update of a declared loop carry.
+
+    Until ``apply_loop_carries`` puts it in place, a carry update has a plain
+    ``FixedLayout``; before that pass existed it carried the mutation layout
+    from the splice on, and so no contraction pass below could pick it up. These
+    passes must still leave it alone: they remove or shrink ops, and the update
+    has to keep its full size and name for the pass that writes it in place.
+
+    No known graph reaches this check: it restores the earlier behaviour (a
+    carry update was never a candidate) and has no test that depends on it.
+    """
+    from torch_spyre._inductor.loop_info import LoopCarryRecord
+
+    record = getattr(op, "_loop_carry_record", None)
+    return isinstance(record, LoopCarryRecord) and record.update_name == op.get_name()
+
+
 def _contract_cross_scope_input_materializations(
     graph: Any,
     pending_levels: list[tuple[sympy.Symbol, sympy.Expr, int, list[str]]],
@@ -2639,8 +2657,10 @@ def _contract_cross_scope_input_materializations(
             transforms = {}
             for name in chain_names:
                 op = graph.try_get_buffer(name)
-                if not isinstance(op, ir.ComputedBuffer) or not isinstance(
-                    op.layout, FixedLayout
+                if (
+                    not isinstance(op, ir.ComputedBuffer)
+                    or not isinstance(op.layout, FixedLayout)
+                    or _is_declared_carry_update(op)
                 ):
                     valid_chain = False
                     break
@@ -2944,6 +2964,7 @@ def _contract_exact_stride_input_materializations(
                     not has_level_advance
                     or coefficient == 0
                     or not isinstance(layout, FixedLayout)
+                    or _is_declared_carry_update(producer)
                 ):
                     continue
                 axes = [
@@ -3009,8 +3030,11 @@ def _contract_exact_stride_input_materializations(
                 source_axis = selected[source_name][0]
                 source_layout = getattr(source, "layout", None)
                 layout = getattr(op, "layout", None)
-                if not isinstance(source_layout, FixedLayout) or not isinstance(
-                    layout, FixedLayout
+                if (
+                    not isinstance(source_layout, FixedLayout)
+                    or not isinstance(layout, FixedLayout)
+                    or _is_declared_carry_update(op)
+                    or _is_declared_carry_update(source)
                 ):
                     continue
                 source_stride = source_layout.stride[source_axis]
