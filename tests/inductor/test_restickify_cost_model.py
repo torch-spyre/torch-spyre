@@ -24,7 +24,7 @@ from torch._inductor.dependencies import MemoryDep
 from torch._inductor.virtualized import V
 from torch_spyre._C import DataFormats, SpyreTensorLayout
 from torch_spyre._inductor import cost_model as cm
-from torch_spyre._inductor import dump_cost_model as dcm
+from torch_spyre._inductor import cost_features as dcm
 
 
 B, X, N = sympy.symbols("b x n", integer=True, nonnegative=True)
@@ -320,7 +320,7 @@ def test_serialization_defaults_and_roundtrip():
 @pytest.mark.parametrize("n,trips", [(1024, 1), (1024, 128), (16384, 1)])
 def test_symbolic_cpsat_picks_measured_fast_division(n, trips):
     cp_model = pytest.importorskip("ortools.sat.python.cp_model")
-    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import _SympyExprToCpSat
+    from torch_spyre._inductor.scratchpad.cpsat_expr_printer import _SympyExprToCpSat
 
     sb, sx = sympy.symbols("split_b split_x", integer=True, positive=True)
     expr = sympy.sympify(cm.predict_ops([restickify(sb, sx, n=n, trips=trips)]))
@@ -351,15 +351,19 @@ def test_symbolic_cpsat_picks_measured_fast_division(n, trips):
 
 
 def test_real_layout_extraction_uses_device_order_and_invocation_extent(monkeypatch):
+    _src_ds = [33280, 8, 2, 64]
     src = SpyreTensorLayout(
-        device_size=[33280, 8, 2, 64],
+        device_size=_src_ds,
         stride_map=[1024, 128, 64, 1],
         device_dtype=DataFormats.SEN169_FP16,
+        valid_elements={(0,): 33280, (1,): 8, (2, 3): 128},
     )
+    _dst_ds = [8, 16, 128, 64]
     dst = SpyreTensorLayout(
-        device_size=[8, 16, 128, 64],
+        device_size=_dst_ds,
         stride_map=[131072, 64, 1024, 1],
         device_dtype=DataFormats.SEN169_FP16,
+        valid_elements={(0,): 8, (1, 3): 1024, (2,): 128},
     )
     read = MemoryDep("input", N * 1024 + B * 128 + X, (B, X, N), (8, 128, 1024))
     write = MemoryDep("output", B * 131072 + X * 1024 + N, (B, X, N), (8, 128, 1024))
@@ -394,7 +398,7 @@ def staged_transport_graph():
     graph = GraphLowering(fx.symbolic_trace(lambda: None))
     device = torch.device("spyre")
 
-    def layout(shape, strides, device_size, stride_map):
+    def layout(shape, strides, device_size, stride_map, valid_elements):
         return FixedTiledLayout(
             device,
             torch.float16,
@@ -404,6 +408,7 @@ def staged_transport_graph():
                 device_size=device_size,
                 stride_map=stride_map,
                 device_dtype=DataFormats.SEN169_FP16,
+                valid_elements=valid_elements,
             ),
         )
 
@@ -411,13 +416,21 @@ def staged_transport_graph():
         source = InputBuffer(
             name="input",
             layout=layout(
-                [32768, 8, 128], [1024, 128, 1], [32768, 8, 2, 64], [1024, 128, 64, 1]
+                [32768, 8, 128],
+                [1024, 128, 1],
+                [32768, 8, 2, 64],
+                [1024, 128, 64, 1],
+                {(0,): 32768, (1,): 8, (2, 3): 128},
             ),
         )
         stage = ComputedBuffer(
             name="stage",
             layout=layout(
-                [1024, 8, 128], [1024, 128, 1], [8, 2, 1024, 64], [128, 64, 1024, 1]
+                [1024, 8, 128],
+                [1024, 128, 1],
+                [8, 2, 1024, 64],
+                [128, 64, 1024, 1],
+                {(0,): 8, (1, 3): 128, (2,): 1024},
             ),
             data=Pointwise(
                 device=device,
@@ -433,6 +446,7 @@ def staged_transport_graph():
                 [131072, 1024, 1],
                 [8, 16, 128, 64],
                 [131072, 64, 1024, 1],
+                {(0,): 8, (1, 3): 1024, (2,): 128},
             ),
             data=Pointwise(
                 device=device,

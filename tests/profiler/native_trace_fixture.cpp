@@ -202,6 +202,7 @@ uint64_t emitBatch(uint32_t batch, const std::string& mode) {
     kernel.activity_kind = AIUPTI_ACTIVITY_KIND_CMPT;
     kernel.operation_kind = AIUPTI_ACTIVITY_CMPT_KIND_EXEC;
     kernel.correlation_id = batch;
+    kernel.stream_id = 3;
     kernel.start = now + 2000;
     kernel.end = now + 4000;
     std::memcpy(kernel.name, "synthetic_kernel", sizeof("synthetic_kernel"));
@@ -216,6 +217,7 @@ void emitMemcpy(uint32_t batch, bool launch, bool calibration = false) {
   copy.activity_kind = AIUPTI_ACTIVITY_KIND_MEMCPY;
   copy.copy_kind = AIUPTI_ACTIVITY_MEMCPY_KIND_HTOD;
   copy.correlation_id = batch;
+  copy.stream_id = 5;
   copy.start = now + 1000;
   copy.end = now + 3000;
   copy.bytes = 64;
@@ -232,6 +234,21 @@ void emitMemcpy(uint32_t batch, bool launch, bool calibration = false) {
     record.end = now + 1000;
     syntheticApi.runtime.push_back(record);
   }
+}
+
+// A host-side runtime span whose `data` payload carries CBID-specific metadata.
+void emitRuntime(uint32_t cbid, uint32_t correlation, uint64_t data) {
+  const auto now = libkineto::timeSinceEpoch(std::chrono::system_clock::now());
+  AIUpti_ActivityAPI record{};
+  record.activity_kind = AIUPTI_ACTIVITY_KIND_RUNTIME;
+  record.cbid = cbid;
+  record.process_id = getpid();
+  record.thread_id = getpid() + 1000;
+  record.correlation_id = correlation;
+  record.start = now;
+  record.end = now + 1000;
+  record.data = data;
+  syntheticApi.runtime.push_back(record);
 }
 
 void checkBufferReplay() {
@@ -279,6 +296,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
     unmatched.correlation_id = 18;
     syntheticApi.runtime.push_back(unmatched);
     checkBufferReplay();
+  });
+  module.def("emit_runtime_metadata", [] {
+    // Distinct nonzero payloads catch both CBID and metadata-key drift.
+    emitRuntime(AIUPTI_RUNTIME_TRACE_CBID_ISSUE_BARRIER, 40, 3);
+    emitRuntime(AIUPTI_RUNTIME_TRACE_CBID_LAUNCH_P2P_RDMA_SEND, 41, 5);
   });
   module.def("emit_capture_window", [](int window) {
     at::RecordFunction origin(at::RecordScope::FUNCTION);

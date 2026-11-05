@@ -448,6 +448,91 @@ def lower_scaled_mm(
     return result
 
 
+@register_spyre_lowering(torch.ops.spyre.bmm_fp8.default)
+def lower_bmm_fp8(
+    mat1,
+    mat2,
+    out_dtype=None,
+):
+    # FP8 batched matmul: the FP8 dtype checks and BATCH_MATMUL_FP8_OP reduction
+    # of lower_scaled_mm, with the per-batch-dim indexing of lower_bmm.
+    mat1.realize()
+    mat2.realize()
+    mat1_loader = mat1.make_loader()
+    mat2_loader = mat2.make_loader()
+
+    mat1_size = mat1.get_size()
+    mat2_size = mat2.get_size()
+    mat1_ndim = len(mat1_size)
+    mat2_ndim = len(mat2_size)
+
+    mat1_dtype = mat1.get_dtype()
+    mat2_dtype = mat2.get_dtype()
+
+    if mat1_dtype not in [torch.float8_e4m3fn]:
+        raise ValueError(f"Expected FP8 input for mat1, got {mat1_dtype}")
+    if mat2_dtype not in [torch.float8_e4m3fn]:
+        raise ValueError(f"Expected FP8 input for mat2, got {mat2_dtype}")
+
+    # [B, M, K] × [B, K, N] → [B, M, N]  and
+    # [B, H, M, K] × [B, H, K, N] → [B, H, M, N], with identical batch dims and
+    # a matching contraction dim. Batch broadcasting is not supported.
+    if (
+        mat1_ndim != mat2_ndim
+        or mat1_ndim not in (3, 4)
+        or any(
+            sympy.simplify(d1 - d2) != 0
+            for d1, d2 in zip(
+                [*mat1_size[:-2], mat1_size[-1]], [*mat2_size[:-2], mat2_size[-2]]
+            )
+        )
+    ):
+        raise Unsupported(
+            f"bmm_fp8 with shapes {mat1_size} and {mat2_size} not supported"
+        )
+
+    output_dtype = out_dtype if out_dtype is not None else torch.float16
+    reduction_numel = mat1_size[-1]  # K
+    ranges = [*mat1_size[:-2], mat1_size[-2], mat2_size[-1]]
+
+    def inner_fn(index, reduction_index):
+        # Each batch dim keeps its own iteration symbol in both loaders.
+        # Recovering b and h from a fused batch index via // and % would put one
+        # symbol in two device coordinates, which garbles the dim-order scan in
+        # superdsc._get_device_dim_order.
+        *batch_index, row, column = index
+        (contraction,) = reduction_index
+        return (
+            mat1_loader([*batch_index, row, contraction]),
+            mat2_loader([*batch_index, contraction, column]),
+        )
+
+    result = Reduction.create(
+        reduction_type=BATCH_MATMUL_FP8_OP,
+        input_node=[mat1, mat2],
+        device=mat1.get_device(),
+        dst_dtype=output_dtype,
+        src_dtype=mat1_dtype,
+        inner_fn=inner_fn,
+        ranges=ranges,
+        reduction_ranges=[reduction_numel],
+    )
+
+    result.realize()
+
+    if logger.isEnabledFor(logging.DEBUG):
+        result_buf = V.graph.get_buffer(result.get_name())
+        logger.debug(
+            f"bmm_fp8: mat1{[int(s) for s in mat1_size]} @ "
+            f"mat2{[int(s) for s in mat2_size]} "
+            f"-> {[int(s) for s in result_buf.get_size()]}, "
+            f"mat1_dtype={mat1_dtype}, mat2_dtype={mat2_dtype}, "
+            f"out_dtype={output_dtype}"
+        )
+
+    return result
+
+
 @register_spyre_lowering(torch.ops.aten.mm.default)
 def lower_mm(x, y):
     x.realize()
@@ -610,9 +695,49 @@ def lower_depthwise_conv2d(x, w, stride, padding, dilation, groups):
     x_loader = x.make_loader()
     w_loader = w.make_loader()
 
-    # Input / weight shapes
-    N, C_in, H_in, W_in = x.get_size()
-    C_out, G, K_h, K_w = w.get_size()
+    # Input / weight shapes. A depthwise conv1d arrives here at rank 3
+    # ((N, C, L) activation, (C_out, G, K) weight) and is handled natively
+    # rather than being reshaped to rank 4 by the decomposition.
+    # Reshape doesn't work as V.graph.get_buffer resolves to the underlying
+    # buffer with get_size() returning 3 entries only.
+    #
+    # Keeping the op at rank 3 enables using the input tensor's activation
+    # and stick dim as pinned.
+    #
+    x_size = x.get_size()
+    w_size = w.get_size()
+    is_conv1d = len(x_size) == 3
+
+    if is_conv1d:
+        if len(w_size) != 3:
+            raise Unsupported(
+                f"depthwise conv1d: expected a 3D weight for a 3D activation, "
+                f"got activation {list(x_size)} and weight {list(w_size)}"
+            )
+        if len(stride) != 1 or len(padding) != 1 or len(dilation) != 1:
+            raise Unsupported(
+                f"depthwise conv1d: expected 1-element stride/padding/dilation, "
+                f"got stride={stride}, padding={padding}, dilation={dilation}"
+            )
+        N, C_in, W_in = x_size
+        C_out, G, K_w = w_size
+        # Degenerate height: a single row, a single tap, no padding, unit stride.
+        H_in, K_h = 1, 1
+        stride = [1, stride[0]]
+        padding = [0, padding[0]]
+        dilation = [1, dilation[0]]
+    elif len(x_size) == 4:
+        if len(w_size) != 4:
+            raise Unsupported(
+                f"depthwise conv2d: expected a 4D weight for a 4D activation, "
+                f"got activation {list(x_size)} and weight {list(w_size)}"
+            )
+        N, C_in, H_in, W_in = x_size
+        C_out, G, K_h, K_w = w_size
+    else:
+        raise Unsupported(
+            f"depthwise conv: expected a 3D or 4D activation, got {list(x_size)}"
+        )
 
     H_in_padded = H_in + 2 * padding[0]
     W_in_padded = W_in + 2 * padding[1]
@@ -640,6 +765,16 @@ def lower_depthwise_conv2d(x, w, stride, padding, dilation, groups):
     W_out = (W_in + 2 * padding[1] - K_w) // stride[1] + 1
 
     def inner_fn(index, reduction_index):
+        # At rank 3 there is no height axis to index, and the reduction carries
+        # only the kernel width.
+        if is_conv1d:
+            n, c, wo = index
+            kw = reduction_index[0]
+            g = reduction_index[1] if len(reduction_index) > 1 else 0
+            x_val = x_loader([n, c, wo])
+            w_val = w_loader([c, g, kw])
+            return (x_val, w_val)
+
         # Output indices
         n, c, ho, wo = index
         # Reduction indices: may be [kh, kw] or [kh, kw, g] depending on whether G is 1
@@ -671,10 +806,13 @@ def lower_depthwise_conv2d(x, w, stride, padding, dilation, groups):
             else "padded_nozeropad",
         }
     }
-    # Only include G in reduction_ranges if it's not 1 (size-1 dims get simplified away anyway)
-    red_ranges = [K_h, K_w]
+    # Only include G in reduction_ranges if it's not 1 (size-1 dims get simplified away anyway).
+    # A conv1d's height is likewise always 1, so it is left out for the same reason.
+    red_ranges = [K_w] if is_conv1d else [K_h, K_w]
     if G != 1:
         red_ranges.append(G)
+
+    ranges = [N, C_out, W_out] if is_conv1d else [N, C_out, H_out, W_out]
 
     result = SpyreReduction.create(
         reduction_type=DEPTHWISE_CONV2D_OP,
@@ -683,7 +821,7 @@ def lower_depthwise_conv2d(x, w, stride, padding, dilation, groups):
         dst_dtype=x.get_dtype(),
         src_dtype=x.get_dtype(),
         inner_fn=inner_fn,
-        ranges=[N, C_out, H_out, W_out],
+        ranges=ranges,
         reduction_ranges=red_ranges,
         op_info=op_info,
     )
@@ -927,8 +1065,13 @@ def lower_convolution(
     avgpool (lower_avg_pool2d) patterns. Selected via config.conv2d_direct_lowering;
     when off, aten.convolution decomposes to im2col+matmul (conv2d_via_bmm_decomp).
 
-    v1 scope: fp16, groups==1, non-transposed, 4D input. Bias (if present) is a
-    separate pointwise add, not a fused biasadd computeOp (follow-up).
+    v1 scope: fp16, groups==1, non-transposed, 3D or 4D input. Bias (if present)
+    is a separate pointwise add, not a fused biasadd computeOp (follow-up).
+
+    A 3D input is a conv1d and is lowered natively at rank 3 (no reshape to rank
+    4): the degenerate height collapses the ``ki`` tap, which needs no special
+    handling because this path's dim roles are recovered structurally from the
+    args' access expressions rather than from sizes or positions.
     """
     # Lock-step invariant with the decomposition: conv2d_via_bmm_decomp only
     # declines (returns NotImplemented, letting aten.convolution survive to this
@@ -954,13 +1097,24 @@ def lower_convolution(
         raise Unsupported(f"conv2d direct lowering: padding={padding} (only 0)")
     if any(d != 1 for d in dilation):
         raise Unsupported(f"conv2d direct lowering: dilation={dilation} (only 1)")
-    if len(x.get_size()) != 4:
+    is_conv1d = len(x.get_size()) == 3
+    if not is_conv1d and len(x.get_size()) != 4:
         raise Unsupported(
-            f"conv2d direct lowering: expected 4D input, got {len(x.get_size())}D"
+            f"conv2d direct lowering: expected 3D or 4D input, got {len(x.get_size())}D"
+        )
+    if is_conv1d and len(weight.get_size()) != 3:
+        raise Unsupported(
+            f"conv2d direct lowering: expected a 3D weight for a 3D input, got "
+            f"{len(weight.get_size())}D"
         )
     if x.get_dtype() != torch.float16:
         raise Unsupported(f"conv2d direct lowering: dtype {x.get_dtype()} (fp16 only)")
-    if weight.get_size()[-2] == 1 and weight.get_size()[-1] == 1:
+    # A conv1d's height tap is degenerate (kh_w == 1), so a K_w == 1 rank-3
+    # weight collapses *both* taps -- exactly the condition the 1x1 guard below
+    # exists to reject.
+    kh_w = 1 if is_conv1d else int(weight.get_size()[-2])
+    kw_w = int(weight.get_size()[-1])
+    if kh_w == 1 and kw_w == 1:
         # Only a 1x1 kernel squeezes *both* ki and kj to size-1, leaving the
         # conv SDSC with no window dims -- which the backend's conv path rejects in
         # dimension-mapping. A 1x1 conv is a channel matmul; it stays on the
@@ -968,7 +1122,6 @@ def lower_convolution(
         # Nx1 kernel keeps one window dim and direct-lowers fine (a 1-D conv;
         # verified by the test_conv2d_direct k1x3 / k3x1 cases).
         raise Unsupported("conv2d direct lowering: 1x1 kernel (use decomposition)")
-    kh_w, kw_w = int(weight.get_size()[-2]), int(weight.get_size()[-1])
     if kh_w > 3 or kw_w > 3:
         # k>3 overflows the dense C_in*kH*kW contraction's LX budget in the backend;
         # mirrors the _CONV_MAX_KERNEL exclusion in _is_direct_conv_supported.
@@ -993,12 +1146,20 @@ def lower_convolution(
     x_loader = x.make_loader()
     weight_loader = weight.make_loader()
 
-    N, C_in, H_in, W_in = x.get_size()
-    C_out, C_in_per_group, kH, kW = weight.get_size()
+    if is_conv1d:
+        # Rank-3 conv1d: no host height axis.
+        N, C_in, W_in = x.get_size()
+        C_out, C_in_per_group, kW = weight.get_size()
+        H_in, kH = 1, 1
+        sH, pH, dilH = 1, 0, 1
+        sW, pW, dilW = stride[0], padding[0], dilation[0]
+    else:
+        N, C_in, H_in, W_in = x.get_size()
+        C_out, C_in_per_group, kH, kW = weight.get_size()
 
-    sH, sW = stride[0], stride[1]
-    pH, pW = padding[0], padding[1]
-    dilH, dilW = dilation[0], dilation[1]
+        sH, sW = stride[0], stride[1]
+        pH, pW = padding[0], padding[1]
+        dilH, dilW = dilation[0], dilation[1]
 
     H_out = (H_in + 2 * pH - dilH * (kH - 1) - 1) // sH + 1
     W_out = (W_in + 2 * pW - dilW * (kW - 1) - 1) // sW + 1
@@ -1036,11 +1197,23 @@ def lower_convolution(
     }
 
     def inner_fn(index, reduction_index):
-        n, co, ho, wo = index
-        r_in, r_ki, r_kj = reduction_index
         # Unclamped windowed input coordinates; zero-padding is expressed at the
         # SDSC level via padFront_/padBack_ in padding_sizes (see superdsc
         # _conv_sdsc_fields), mirroring the avgpool window mechanism.
+        if is_conv1d:
+            # kH == 1 is excluded from reduction_ranges below
+            # hence no r_ki here and no height coordinate to index.
+            n, co, wo = index
+            r_in, r_kj = reduction_index
+            wi = wo * sW - pW + r_kj * dilW
+            act = x_loader([n, r_in, wi])
+            # weight is [C_out, C_in_per_group, kW]; groups==1 so
+            # C_in_per_group == C_in.
+            ker = weight_loader([co, r_in, r_kj])
+            return (act, ker)
+
+        n, co, ho, wo = index
+        r_in, r_ki, r_kj = reduction_index
         hi = ho * sH - pH + r_ki * dilH
         wi = wo * sW - pW + r_kj * dilW
         act = x_loader([n, r_in, hi, wi])
@@ -1055,17 +1228,19 @@ def lower_convolution(
         dst_dtype=x.get_dtype(),
         src_dtype=x.get_dtype(),
         inner_fn=inner_fn,
-        ranges=[N, C_out, H_out, W_out],
-        reduction_ranges=[C_in, kH, kW],
+        ranges=[N, C_out, W_out] if is_conv1d else [N, C_out, H_out, W_out],
+        reduction_ranges=[C_in, kW] if is_conv1d else [C_in, kH, kW],
         op_info=op_info,
     )
     result.realize()
 
     if bias is not None:
         # v1: separate pointwise add (broadcast bias [C_out] over NCHW) rather
-        # than a fused biasadd computeOp. Reshape to (1, C_out, 1, 1) for the
-        # channel-wise broadcast.
-        bias_reshaped = lowering.view(bias, [1, C_out, 1, 1])
+        # than a fused biasadd computeOp. Reshape to a channel vector with unit
+        # spatial dims for the channel-wise broadcast -- one spatial dim at rank 3
+        # (conv1d), two at rank 4.
+        bias_shape = [1, C_out, 1] if is_conv1d else [1, C_out, 1, 1]
+        bias_reshaped = lowering.view(bias, bias_shape)
         result = lowering.add(result, bias_reshaped)
 
     return result
@@ -1840,8 +2015,8 @@ def lower_trunc(x):
 
     The device has no trunc op, so this computes floor(|x|) * clip(x, -1, 1),
     with no compare or select. A negative fraction gives 0.0 rather than -0.0,
-    since the device multiply makes no negative zero. Integers and bools are
-    returned as is.
+    since the device multiply makes no negative zero. An integer or bool input
+    comes back as a copy, since an op's result must not alias its input.
 
     The clip is Spyre's single clip op (lower_clamp). It and the product are
     realized with origins of their own, so split_multi_ops can split the bodies
@@ -1849,7 +2024,8 @@ def lower_trunc(x):
     a view only as a body's last op.
     """
     if not x.get_dtype().is_floating_point:
-        return x
+        # Upstream's clone keeps x's layout; ours forces the standard one.
+        return lowering.clone(x)
     origin = x.get_origin_node() if isinstance(x, ir.IRNode) else None
     origin_args = () if origin is None else (origin,)
     sign = lower_clamp(x, -1.0, 1.0)
@@ -1879,11 +2055,26 @@ def to_dtype(x, dst_dtype, use_compute_types=True, *, skip_trunc=False):
     if src_dtype == dst_dtype:
         return lowering.clone(x)
 
-    # No bool format has an op to an integer, but float32 has one, and a bool's
-    # 0/1 values convert exactly through it.
-    if src_dtype == torch.bool and dst_dtype in (torch.int32, torch.int64):
+    integer = (torch.int32, torch.int64)
+    float16_format = (torch.float16, torch.bfloat16)
+
+    # Only float32 has an op to an integer, so a float16-format source (float16,
+    # bfloat16, or a bool stored as either) converts through it. A bool's 0/1
+    # values need no trunc.
+    if src_dtype in (torch.bool, *float16_format) and dst_dtype in integer:
+        skip_trunc = skip_trunc or src_dtype == torch.bool
         as_float = to_dtype(x, torch.float32, use_compute_types)
-        return to_dtype(as_float, dst_dtype, use_compute_types, skip_trunc=True)
+        return to_dtype(as_float, dst_dtype, use_compute_types, skip_trunc=skip_trunc)
+
+    # Likewise an integer has an op only to float32, which then converts to the
+    # float16 format.
+    if src_dtype in integer and dst_dtype in float16_format:
+        as_float = to_dtype(x, torch.float32, use_compute_types)
+        return to_dtype(as_float, dst_dtype, use_compute_types)
+
+    # A cast to bool tests against zero rather than converting a value.
+    if src_dtype in integer and dst_dtype == torch.bool:
+        return lower_ne_scalar(x, 0)
 
     # Check if conversion is supported by backend
     if not DtypeOpTable.is_supported(src_dtype, dst_dtype):
@@ -1955,6 +2146,43 @@ def with_int64_fallback(fn, *args, convert_output=True):
     return output
 
 
+def _promoted_dtype(*args, kind):
+    """Return the result dtype for elementwise promotion of *args under kind.
+
+    Arguments in *args can be:
+    - Tensor IR nodes (objects with get_dtype())
+    - torch.dtype objects
+    - Python numbers (int, float, bool, complex, etc.) or sympy expressions
+    """
+
+    def _to_elementwise_arg(v):
+        if hasattr(v, "get_dtype"):
+            ndim = len(v.get_size()) if hasattr(v, "get_size") else 1
+            return torch.zeros([1] * ndim, dtype=v.get_dtype())
+        if isinstance(v, torch.dtype):
+            return torch.empty(0, dtype=v)
+        return v
+
+    return elementwise_dtypes(
+        *(_to_elementwise_arg(v) for v in args if v is not None),
+        type_promotion_kind=kind,
+    )[1]
+
+
+def _convert_to_dtype(v, dtype):
+    """Convert v to dtype for use in a pointwise lowering.
+
+    - Tensor operands: convert via to_dtype if not already at dtype, else return as-is.
+    - Python int scalars: coerce to float() when dtype is floating-point.
+    - Everything else (Python float, already-correct tensor, etc.): return unchanged.
+    """
+    if hasattr(v, "get_dtype"):
+        return v if v.get_dtype() == dtype else to_dtype(v, dtype)
+    if dtype.is_floating_point and isinstance(v, int):
+        return float(v)
+    return v
+
+
 @register_spyre_lowering(torch.ops.aten.where.self, type_promotion_kind=None)
 def lower_where(condition, self, other):
     # where3 requires all operands to share the same stick size.
@@ -1989,23 +2217,20 @@ def lower_where(condition, self, other):
     #   int32:      INT32TOFP32 (Spyre-native); cast back to int32 after
     #   int64:      CPU fallback for int→fp32; cast back to int64 after
 
-    self_t = torch.empty(0, dtype=self.get_dtype())
-    other_t = torch.empty(0, dtype=other.get_dtype())
-
     # result_dtype: what aten.where.self must return — NO_OPMATH promotion, which
     # prevents unintended fp16->fp32 promotion and ensures output dtype is correct
-    result_dtype, _ = elementwise_dtypes(
-        self_t,
-        other_t,
-        type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.NO_OPMATH,
+    result_dtype = _promoted_dtype(
+        self.get_dtype(),
+        other.get_dtype(),
+        kind=ELEMENTWISE_TYPE_PROMOTION_KIND.NO_OPMATH,
     )
 
     # val_dtype: the dtype we run the hardware op in — INT_TO_FLOAT promotes
     # integers to fp32 since Spyre has no integer where3.
-    _, val_dtype = elementwise_dtypes(
-        self_t,
-        other_t,
-        type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
+    val_dtype = _promoted_dtype(
+        self.get_dtype(),
+        other.get_dtype(),
+        kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
     )
 
     converted_self = (
@@ -2103,6 +2328,218 @@ def lower_sub(x, y, *, alpha=1):
         y = with_int64_fallback(lowering.mul, y, alpha_tensor)
         y.realize()
     return with_int64_fallback(lowering.sub, x, y)
+
+
+def _realized(t):
+    """Return t after realizing it as a fusion barrier in multi-step lowerings."""
+    t.realize()
+    return t
+
+
+def _div_operand_dtypes(x, y):
+    """Return (comp_dtype, result_dtype) for a division of x and y.
+
+    comp_dtype   — INT_TO_FLOAT promoted dtype; the dtype to run the hardware op
+                   in.  Integers promote to fp32; floats are unchanged.
+    result_dtype — NO_OPMATH promoted dtype; the natural output dtype for
+                   rounding_mode="floor"/"trunc" (e.g. int32/int32 → int32,
+                   fp16/fp16 → fp16).  Not used for true division, which always
+                   returns a float per PyTorch semantics.
+
+    Returns (None, None) when neither operand is a tensor (pure Python scalars).
+
+    Promotion table (cast-back applies to floor/trunc only, not true-div):
+
+      Operand pair    | comp_dtype| result_dtype | cast-back?
+      ----------------+-----------+--------------+-------------------------
+      fp32 / fp32     | fp32      | fp32         | no
+      fp16 / fp16     | fp16      | fp16         | no
+      fp16 / fp32     | fp32      | fp32         | no
+      int32 / int32   | fp32      | int32        | yes (floor only)
+      int64 / int64   | fp32      | int64        | yes (floor only)
+      int32 / fp32    | fp32      | fp32         | no
+      int32 / fp16    | fp16      | fp16         | no (fp16 dominates)
+      int64 / fp32    | fp32      | fp32         | no
+      int64 / fp16    | fp16      | fp16         | no (fp16 dominates)
+      bool / fp16     | fp16      | fp16         | no (fp16 dominates)
+      bool / fp32     | fp32      | fp32         | no (fp32 dominates)
+      bool / int32    | fp32      | int32        | yes (floor only)
+      bool / int64    | fp32      | int64        | yes (floor only)
+    """
+    if not any(hasattr(v, "get_dtype") for v in (x, y)):
+        return None, None
+    comp_dtype = _promoted_dtype(
+        x,
+        y,
+        kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
+    )
+    result_dtype = _promoted_dtype(
+        x,
+        y,
+        kind=ELEMENTWISE_TYPE_PROMOTION_KIND.NO_OPMATH,
+    )
+    return comp_dtype, result_dtype
+
+
+def _lower_div_impl(x, y, *, rounding_mode=None):
+    """Shared implementation for lower_div and lower_floor_divide.
+
+    Operand type promotion follows the same two-dtype pattern as lower_where:
+    - comp_dtype   (INT_TO_FLOAT): dtype to cast inputs to before the hardware op.
+                   Integers promote to fp32; floats stay at their native width.
+    - result_dtype (NO_OPMATH):   natural output dtype, used only for
+                   rounding_mode="floor"/"trunc" where int inputs return int.
+
+    Result dtype per mode:
+    - rounding_mode=None  : always comp_dtype (float), even for integer inputs —
+                            consistent with PyTorch true-division semantics.
+    - rounding_mode="floor": comp_dtype for the correction arithmetic; cast back
+                             to result_dtype at the end (int inputs → int out).
+                             Emits ~20 realize() barriers for a tensor divisor
+                             (~15 for a scalar divisor) — one per SDSC op; this
+                             is the minimum required for the sign-aware correction.
+    - rounding_mode="trunc": not yet implemented (raises Unsupported).
+
+    The scalar-divisor sign optimisation (y < 0 fold) requires y to be a
+    concrete Python int or float; sympy/symbolic scalars are not supported.
+    """
+    comp_dtype, result_dtype = _div_operand_dtypes(x, y)
+
+    if comp_dtype is not None:
+        x = _convert_to_dtype(x, comp_dtype)
+        y = _convert_to_dtype(y, comp_dtype)
+
+    if rounding_mode == "floor":
+        # All operands are now at comp_dtype (fp32 for integer inputs).
+        # Each _realized call is a fusion barrier (Spyre requires one op per SDSC).
+        # Inductor built-ins (lowering.<fn> / lowering.lowerings[...]) are used
+        # throughout rather than the Spyre lower_* wrappers: all operands are
+        # already at comp_dtype, and using the built-ins avoids emitting compound
+        # or non-composable intermediate wrapper ops that break SDSC single-op invariants.
+        #
+        # The +-1 quotient correction is only meaningful while the compute dtype's
+        # spacing is below 1 -- |q| <= 1024 for device fp16, |q| <= 2**24 for fp32.
+        # Above that, qf +- 1 rounds back to qf and the result is whatever the divider
+        # returned. Exact integer division beyond that range needs the quotient carried
+        # in more than one float; out of scope here.
+        #
+        # Two further limits apply within the quotient-magnitude bound:
+        #
+        # (1) Residual destruction. Even with |q| <= 1024, the correction can fail
+        #     when qf*y rounds back to exactly x, leaving rem=0 and the correction
+        #     blind. This affects ~2.7% of random fp16 pairs that are representable
+        #     on device and have |q| <= 1024. The bound is necessary but not
+        #     sufficient for exact floor division.
+        #
+        # (2) fp16 host inputs are re-rounded on arrival. Device fp16 is DL16, not
+        #     IEEE fp16, so values like 1853 arrive as 1854 before any lowering
+        #     runs. A host-side .float() before transfer preserves the intended
+        #     value; no on-device upcast can recover it. A host-fp16 reference is
+        #     therefore not a valid expectation for this op.
+        qf = _realized(lowering.div(x, y))
+        qf = _realized(lowering.floor(qf))
+        qf_initial = qf
+        # Quotient correction. Correct floor-division satisfies
+        #   0 <= rem*sign(y) < |y|,   where rem = x - qf*y        … (*)
+        # which holds for EITHER sign of y.  rem is computed via multiply-
+        # subtract (exact); re-dividing rem/y would reintroduce the same
+        # rounding error being corrected.
+        #
+        # Normalising by sign(y) gives rem_s = rem*sign(y), abs_y = |y|,
+        # turning (*) into the sign-independent test  0 <= rem_s < abs_y:
+        #   rem_s >= abs_y  => qf underestimated by 1  (add 1)
+        #   rem_s <  0      => qf overestimated  by 1  (subtract 1)
+        # The two conditions are mutually exclusive (rem_s < 0 and rem_s >= abs_y
+        # cannot both hold), so at most one correction is applied per element.
+        aten_ge = lowering.lowerings[torch.ops.aten.ge.Tensor]
+        aten_lt = lowering.lowerings[torch.ops.aten.lt.Tensor]
+        prod = _realized(lowering.mul(qf, y))
+        rem = _realized(lowering.sub(x, prod))
+        if hasattr(y, "get_dtype"):
+            y_neg = _realized(aten_lt(y, 0.0))
+            neg_rem = _realized(lowering.neg(rem))
+            neg_y = _realized(lowering.neg(y))
+            rem_s = _realized(lowering.where(y_neg, neg_rem, rem))
+            abs_y = _realized(lowering.where(y_neg, neg_y, y))
+        else:
+            # y is a Python scalar: its sign is known at compile time, so fold
+            # it statically instead of emitting the select.
+            # Only concrete int/float scalars reach here; symbolic values are
+            # not supported (comparison with sympy raises TypeError).
+            assert isinstance(y, (int, float)), (
+                f"_lower_div_impl: scalar divisor must be int or float, got {type(y)}"
+            )
+            rem_s = _realized(lowering.neg(rem)) if y < 0 else rem
+            abs_y = -y if y < 0 else y
+        over_est = _realized(aten_ge(rem_s, abs_y))
+        under_est = _realized(aten_lt(rem_s, 0.0))
+        qf_plus1 = _realized(lowering.add(qf, 1.0))
+        qf = _realized(lowering.where(over_est, qf_plus1, qf))
+        # qf_minus1 must derive from the UPDATED qf, so the two corrections
+        # compose instead of the second silently discarding the first.
+        qf_minus1 = _realized(lowering.sub(qf, 1.0))
+        qf = _realized(lowering.where(under_est, qf_minus1, qf))
+        # |x| < |y| => the quotient is 0 or -1 by sign alone. Do not apply
+        # residual correction there: x + y is not always representable, and a
+        # rounded-up residual trips over_est and turns a correct -1 into 0.
+        #
+        # The initial floor(div(x, y)) is exact when |x/y| is representable,
+        # but underflows to -0.0 when |x/y| < ~2^-32 (device DL16 subnormal
+        # floor). When it underflows, the residual path is correct (prod=0,
+        # rem=x, rem_s<0 → qf corrects to -1) and the unconditional restore
+        # breaks it. Guard with qf_initial < 0.0: only restore when floor(x/y)
+        # is representable as -1. lt(-0.0, 0.0) is false, so -0.0 falls
+        # through to the residual path.
+        abs_x = _realized(lowering.abs(x))
+        degenerate = _realized(aten_lt(abs_x, abs_y))
+        keep = _realized(
+            lowering.where(_realized(aten_lt(qf_initial, 0.0)), qf_initial, qf)
+        )
+        qf = _realized(lowering.where(degenerate, keep, qf))
+        # Cast back to result_dtype (e.g. fp32 → int32/int64 for integer inputs).
+        if result_dtype is not None and result_dtype != comp_dtype:
+            return to_dtype(qf, result_dtype, skip_trunc=True)
+        return qf
+
+    elif rounding_mode == "trunc":
+        # TODO(PR#3610): implement trunc-mode floor-division
+        raise Unsupported("div with rounding_mode='trunc' is not yet implemented")
+
+    else:
+        # rounding_mode=None (true division): result is always comp_dtype (float),
+        # even for integer inputs — consistent with PyTorch semantics.
+        # Inputs are already at comp_dtype; call lowering.div directly.
+        return lowering.div(x, y)
+
+
+@register_spyre_lowering(
+    torch.ops.aten.div.Tensor, type_promotion_kind=None, broadcast=True
+)
+@register_spyre_lowering(
+    torch.ops.aten.div.Tensor_mode, type_promotion_kind=None, broadcast=True
+)
+@register_spyre_lowering(
+    torch.ops.aten.div.Scalar, type_promotion_kind=None, broadcast=True
+)
+@register_spyre_lowering(
+    torch.ops.aten.div.Scalar_mode, type_promotion_kind=None, broadcast=True
+)
+@register_spyre_lowering(
+    torch.ops.aten.true_divide.Tensor, type_promotion_kind=None, broadcast=True
+)
+@register_spyre_lowering(
+    torch.ops.aten.true_divide.Scalar, type_promotion_kind=None, broadcast=True
+)
+def lower_div(x, y, *, rounding_mode=None):
+    return _lower_div_impl(x, y, rounding_mode=rounding_mode)
+
+
+@register_spyre_lowering(
+    torch.ops.aten.floor_divide, type_promotion_kind=None, broadcast=True
+)
+def lower_floor_divide(x, y):
+    # aten.floor_divide has no rounding_mode parameter; always floor division.
+    return _lower_div_impl(x, y, rounding_mode="floor")
 
 
 @register_spyre_lowering(
@@ -2215,10 +2652,9 @@ def _cmp_operand_dtype(tensors):
       Both branches are expect_fail in the tests.
     * int32 -> fp32 (int32tofp32) keeps the element byte size, so the EA is
       unchanged and the comparison runs entirely on device.
-    * int32/int64 -> fp16 is not in DtypeOpTable at all, so ``to_dtype`` falls
-      back to a host cast. Those pairs produce the right answer and raise no EA
-      question -- no stick reordering is emitted -- but at the cost of a D2H/H2D
-      round-trip, and the fallback is only visible as a FallbackWarning.
+    * int32/int64 -> fp16 converts through fp32, and its fp32todl16 step makes
+      the operand staggered, so it meets the STANDARD fp16 operand exactly as in
+      the fp16 <-> fp32 case above.
 
     All-``torch.bool`` operands are returned unchanged, deliberately diverging
     from torch (which would promote them to fp32). A device bool is already stored
@@ -2229,9 +2665,9 @@ def _cmp_operand_dtype(tensors):
     """
     if all(t.get_dtype() == torch.bool for t in tensors):
         return torch.bool
-    _, operand_dtype = elementwise_dtypes(
-        *(torch.empty(0, dtype=t.get_dtype()) for t in tensors),
-        type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
+    operand_dtype = _promoted_dtype(
+        *(t.get_dtype() for t in tensors),
+        kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
     )
     return operand_dtype
 
@@ -2256,34 +2692,11 @@ def _lower_cmp_impl(x, y, pointwise_fn):
     """
     tensors = [v for v in (x, y) if hasattr(v, "get_dtype")]
 
-    # A 0-dim integer predicate compared against a Python int (e.g. a
-    # while_loop / for_each_tile cond ``iter < N``) keeps Inductor's stock
-    # form unchanged.  Such a predicate is pattern-matched by the WhileLoop
-    # lowering (_extract_trip_count in wsr/for_each_tile_lowering.py), which
-    # expects exactly one ``load(iter) < constant(int N)`` op in the cond
-    # graph.  The int -> float cast below would insert a second op and coerce
-    # N to float, breaking both checks and causing silently wrong loop counts.
-    dtypes = {t.get_dtype() for t in tensors}
-    if (
-        len(dtypes) == 1
-        and not next(iter(dtypes)).is_floating_point
-        and all(len(t.get_size()) == 0 for t in tensors)
-        and all(isinstance(v, int) for v in (x, y) if not hasattr(v, "get_dtype"))
-    ):
-        return pointwise_fn(x, y)
-
     operand_dtype = _cmp_operand_dtype(tensors)
 
-    def convert(v):
-        if hasattr(v, "get_dtype"):
-            if v.get_dtype() == operand_dtype:
-                return v
-            return to_dtype(v, operand_dtype)
-        if operand_dtype.is_floating_point and isinstance(v, int):
-            return float(v)
-        return v
-
-    return pointwise_fn(convert(x), convert(y))
+    return pointwise_fn(
+        _convert_to_dtype(x, operand_dtype), _convert_to_dtype(y, operand_dtype)
+    )
 
 
 def _is_host_cmp(x, y):
@@ -2400,6 +2813,14 @@ def lower_qfp8wt(x):
         traceback=x.get_traceback(),
     )
     pw.realize()
+    # The QFP8WT 2D stick pairs host dims -2 (K) and -1 (N), so the output must
+    # be row-major [..., K, N]. Left flexible, ComputedBuffer.get_fill_order()
+    # copies the stride order of a permuted input (e.g. k.transpose(-1, -2) in
+    # attention), the stick lands on the wrong dim, and the layout _qfp8wt_stl
+    # builds cannot be read by batchmatmulfp8. Same fix as the clone lowering.
+    pw.freeze_layout_with_stride_order(
+        ir.get_stride_order(ir.FlexibleLayout.contiguous_strides(pw.get_size()))
+    )
     return pw
 
 
@@ -2477,10 +2898,12 @@ def lower_quantscalepertokenfp8(x, scale_ub=FP8_E4M3FN_MAX):
 
 
 @register_spyre_lowering(
-    torch.ops.spyre.prod_dim_int,
+    torch.ops.aten.prod.dim_int,
     type_promotion_kind=None,
 )
 def lower_prod_dim(x, dim, keepdim=False):
+    # int64 is not natively supported by the hardware prod reduction; convert to
+    # fp32 via with_int64_fallback and cast the output back to int64.
     def _prod_dim_impl(x):
         kwargs = lowering._make_reduction_inner(
             x, axis=[dim], keepdims=keepdim, dtype=x.dtype, override_return_dtype=None
@@ -2532,6 +2955,15 @@ def lower_any_def(x):
 # ============================================================================
 # Direct c10d Lowerings
 # ============================================================================
+def _realize_collective_input(tensor):
+    # Views can retain their base allocation's padded descriptor. A copy
+    # obtains a finalized device layout for exactly the contributed elements.
+    if isinstance(tensor.data, ir.BaseView):
+        tensor = ir.ExternKernel.copy_input(tensor)
+    tensor.realize()
+    return tensor
+
+
 @register_spyre_lowering(torch.ops._c10d_functional.broadcast.default)
 def lower_c10d_broadcast_async(tensor, src_rank, group_name):
     """
@@ -2552,7 +2984,7 @@ def lower_c10d_broadcast_async(tensor, src_rank, group_name):
         group_name,
     )
 
-    tensor.realize()
+    tensor = _realize_collective_input(tensor)
     return ir.TensorBox.create(
         BroadcastAsyncFallback(
             torch.ops.spyre.broadcast_async.default,
@@ -2568,7 +3000,7 @@ def lower_c10d_wait_tensor_async(tensor):
     """
     Direct lowering for _c10d_functional.wait_tensor using ASYNC pattern.
 
-    Synchronizes on the async broadcast operation, blocking until communication completes.
+    Synchronizes on the async collective operation, blocking until communication completes.
 
     Flow:
       _c10d_functional.wait_tensor → This lowering → WaitWorkFallback
@@ -2577,12 +3009,21 @@ def lower_c10d_wait_tensor_async(tensor):
     logger.debug("Lowering _c10d_functional.wait_tensor to WaitWorkFallback")
 
     tensor.realize()
-    return ir.TensorBox.create(
-        WaitWorkFallback(
-            torch.ops.spyre.wait_work.default,
-            tensor,
+    producer = WaitWorkFallback.get_copy_back_producer(tensor)
+    if producer is not None and producer.copy_back_result is not None:
+        # The first wait already copied back. Preserve aliases of the current
+        # target, including mutations performed since that wait.
+        return WaitWorkFallback.copy_back_view(
+            tensor, producer, producer.copy_back_result
         )
-    )
+    wait = WaitWorkFallback(torch.ops.spyre.wait_work.default, tensor)
+    result = ir.TensorBox.create(wait)
+    if wait.copy_back_producer is not None:
+        producer = wait.copy_back_producer
+        target = lowering.mutate_to(producer.mutation_target, result)
+        producer.copy_back_result = target
+        return wait.copy_back_view(wait.waited_tensor, producer, target)
+    return result
 
 
 @register_spyre_lowering(torch.ops._c10d_functional.all_gather_into_tensor.default)
@@ -2605,7 +3046,7 @@ def lower_c10d_all_gather_async(tensor, group_size, group_name):
         group_name,
     )
 
-    tensor.realize()
+    tensor = _realize_collective_input(tensor)
     return ir.TensorBox.create(
         AllGatherAsyncFallback(
             torch.ops.spyre.all_gather_async.default,
@@ -2624,7 +3065,7 @@ def lower_c10d_all_reduce_async(tensor, reduce_op, group_name):
     Creates an async all_reduce operation that returns immediately without blocking.
     Output tensor has shape[0] = input.shape[0].
     """
-    tensor.realize()
+    tensor = _realize_collective_input(tensor)
     logger.debug(
         "Lowering _c10d_functional.all_reduce to AllReduceAsyncFallback "
         "(reduce_op=%s, group_name='%s')",
@@ -2650,7 +3091,8 @@ def lower_c10d_all_reduce_inplace(tensor, reduce_op, group_name):
     all_reduce_ when the output shape matches the input. This lowering catches
     that case and emits the same Spyre all_reduce op (always in-place on device).
     """
-    tensor.realize()
+    mutation_target = tensor if isinstance(tensor.data, ir.BaseView) else None
+    tensor = _realize_collective_input(tensor)
     logger.debug(
         "Lowering _c10d_functional.all_reduce_ to AllReduceAsyncFallback "
         "(reduce_op=%s, group_name='%s')",
@@ -2663,5 +3105,6 @@ def lower_c10d_all_reduce_inplace(tensor, reduce_op, group_name):
             tensor,
             reduce_op,
             group_name,
+            mutation_target=mutation_target,
         )
     )

@@ -4,8 +4,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 cd ${ROOT_DIR}
 
-# Refresh the uv.lock file, based on pyproject.toml
-uv lock
+# Refresh uv.lock; pass resolver options such as --upgrade-package torch.
+uv lock "$@"
 
 # Regenerate requirement files for convenience
 UV_EXPORT_OPTIONS="--format requirements.txt --no-hashes --no-install-project"

@@ -13,8 +13,6 @@ captured artifacts.
 
 | Variable | Effect |
 |---|---|
-| `SPYRE_INDUCTOR_LOG=1` | *Deprecated*. Use `TORCH_LOGS="torch_spyre.inductor"`. Enables Spyre-specific Inductor logging (INFO level) |
-| `SPYRE_INDUCTOR_LOG_LEVEL=DEBUG` | *Deprecated*. Use `TORCH_LOGS="+torch_spyre.inductor"`. Sets Spyre Inductor log verbosity to DEBUG |
 | `SPYRE_LOG_FILE=path/to/file.log` | *Deprecated*. Mapped to the top-level `spyre` logger file handler. Redirects Spyre Inductor log output to a file |
 | `TORCH_LOGS="+torch_spyre.inductor"` | Preferred logging control (DEBUG level). Accepts `torch_spyre.*` namespaces |
 | `TORCH_LOGS="torch_spyre.inductor"` | Same as above but at INFO level (no `+` prefix) |
@@ -175,16 +173,54 @@ What it does not measure: the backend itself, kernel execution, and anything a
 later pass would have learned from a compiled artifact. Bundle generation is
 inside the boundary, not outside it.
 
+Each pipeline and pass event also carries `meta` with the graph size it saw
+(`input_nodes` / `output_nodes`, or `input_operations` / `output_operations`
+for the pre-scheduling pipeline) and counts of the analysis calls it made.
+Timing says a pass is slow; the counts say how many times it asked the same
+question, and unlike a duration they are reproducible to a fraction of a percent. A counter that
+did not move is omitted rather than recorded as zero.
+
+| Counter | Meaning |
+|---|---|
+| `read_writes.requests` | Calls to the memoized `op_read_writes` helper: how many times the pass asked |
+| `read_writes.misses` | Of those, the ones the per-op memo could not serve |
+| `read_writes.extractions` | `ComputedBuffer.get_read_writes` invocations -- the sympy dependency extraction that actually costs something, including callers that bypass the memo |
+| `read_writes.extract_ns` | Nanoseconds spent inside those extractions, so a count can be sized rather than guessed |
+| `device_coordinates` | Device-space coordinate constructions |
+| `host_coordinates` | Host-space coordinate constructions |
+
+`read_writes.extractions` and `read_writes.extract_ns` cover
+`ComputedBuffer.get_read_writes` only. The
+scheduler extracts directly in `SchedulerNode._compute_attrs`, and so do several
+`ir.py` classes (`Loops`, `BaseView`, `TemplateBuffer`), so `extractions` is a
+lower bound on dependency extraction and `extract_ns` a lower bound on its cost.
+
+Read these against a baseline record of the same workload rather than in the
+absolute. Most extractions come from callers that reach past the memo by design,
+so misses sitting far below extractions is the normal state and not a finding; a
+*change* in that relationship for one workload is. How much the memo absorbs is
+requests against misses, not against extractions. Pipeline events carry the
+inclusive total, the same way `inclusive_ns` does.
+
+The counters are one process-wide, unsynchronized store. If two threads compile
+at once (a multi-threaded server such as vLLM, say), each pass's counts include
+the other compile's work, and a negative delta means another compile reset the
+store mid-pass. Profile with a single compiling thread to get per-compile
+figures.
+
 ## FFDC (First Failure Data Capture)
 
 | Variable | Effect |
 |---|---|
 | `TORCH_SPYRE_FFDC=1` | Opt in to automatic FFDC JSON reports on Spyre frontend-compile / backend-compile / runtime / unimplemented failures. Retrieve with `torch.spyre.get_diagnostic_report()`. Separate from `USE_SPYRE_PROFILER` (the `setup.py` Kineto build flag); this env var alone gates capture at runtime and is not set by default on pods. |
 | `TORCH_COMPILE_DEBUG=1` | Optional. Writes `torch_compile_debug/` artifacts that FFDC links into `artifacts.paths` (see [FFDC user guide](ffdc.md)). Not required for capture. |
-| `DUMP_SPYRE_CODE=1` | Optional. Emits `sdsc_*.json` and `*.mlir` bundle files that FFDC can reference. Not required for capture. |
 
-See the [FFDC user guide](ffdc.md) for the full workflow, report locations,
-and pod/CI usage.
+`DUMP_SPYRE_CODE` is snapshotted into the FFDC JSON if set; torch-spyre
+does not read it. Bundle files (`sdsc_*.json`, `bundle.mlir`) come from
+`generate_bundle()`, not from that variable.
+
+See the [FFDC user guide](ffdc.md) for the enable → fail → retrieve →
+triage workflow, report schema, and pod/CI usage.
 
 ## Device enumeration
 

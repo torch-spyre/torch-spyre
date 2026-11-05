@@ -62,6 +62,7 @@ from torch_spyre.constants import DEVICE_NAME
 from torch_spyre._inductor import config
 from torch_spyre._inductor import passes as ts_passes
 from torch_spyre._inductor.constants import RESTICKIFY_OP
+from torch_spyre._inductor.loop_node import all_ops
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
 from torch_spyre._inductor.scratchpad.coarse_tiling import (
@@ -284,6 +285,7 @@ class TestForEachTileE2E(_DynamoResetTestCase):
                         device_size=[4, rows // 32, 32],
                         stride_map=[rows, 32, 1],
                         device_dtype=get_device_dtype(torch.int32),
+                        valid_elements={(0,): 4, (1, 2): rows},
                     )
                     inputs = (
                         values.to(DEVICE_NAME),
@@ -367,6 +369,7 @@ class TestForEachTileE2E(_DynamoResetTestCase):
                             device_size=[96, 1, 64],
                             stride_map=[64, 64, 1],
                             device_dtype=get_device_dtype(torch.float16),
+                            valid_elements={(0,): 96, (1, 2): 64},
                         )
                     }
                     if row_outermost
@@ -1082,8 +1085,13 @@ class _CollectRegions(CustomPreSchedulingPasses):
     def __call__(self, graph) -> None:
         super().__call__(graph)
         cls = type(self)
-        cls.operations = list(graph.operations)
-        cls.regions = prescribed_regions(graph.operations)
+        # The leaf ops in program order: graph.operations now keeps its
+        # LoopNodes after the pipeline (they reach the scheduler as nodes),
+        # and its leaf ops are exactly the flat list the pipeline used to
+        # leave.  The passes that call prescribed_regions run inside the pass
+        # loop, where they see this flat view (OpsView).
+        cls.operations = list(all_ops(graph.operations))
+        cls.regions = prescribed_regions(cls.operations)
 
 
 class TestPrescribedRegionsE2E(_DynamoResetTestCase):
@@ -1809,6 +1817,26 @@ class TestForEachTileCarriedSumE2E(_DynamoResetTestCase):
         torch.testing.assert_close(
             out.float(), values.float().sum(0) + 1, atol=0.05, rtol=0.05
         )
+
+    @expects_raise
+    def test_carried_sum_rejects_a_split_that_does_not_divide_the_rows(self):
+        """A ``work_div`` that does not divide the output rows is an error.
+
+        The hint-driven carried reduction raised here; the ``for_each_tile``
+        carry must not quietly pick another split, which would leave the
+        accumulator's init and update on different row splits.
+        """
+        from torch._inductor.exc import InductorError
+
+        values = self._linspace_values(2)
+        for split in (3, 7):
+            with self.subTest(work_div=split):
+                with self.assertRaisesRegex(
+                    InductorError, "work_division_hint:.*dim d0 size=64"
+                ):
+                    self._compile(
+                        lambda v: carried_expert_sum_fn(v, split), self._named(values)
+                    )
 
 
 if __name__ == "__main__":

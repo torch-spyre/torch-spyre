@@ -19,8 +19,10 @@ import tempfile
 from pathlib import Path
 
 import pytest
+import torch
 
 from torch_spyre import make_spyre_module  # type: ignore[attr-defined]
+from torch_spyre.constants import DEVICE_NAME
 from torch_spyre.profiler import get_diagnostic_report as profiler_get_diagnostic_report
 from torch_spyre.profiler._ffdc import (
     CATEGORY_COMPILE_BACKEND,
@@ -28,6 +30,8 @@ from torch_spyre.profiler._ffdc import (
     CATEGORY_RUNTIME_LAUNCH,
     CATEGORY_UNIMPLEMENTED,
     CATEGORY_UNKNOWN,
+    HOOK_FAILURE_CATEGORIES,
+    KNOWN_FAILURE_CATEGORIES,
     _call_with_timeout,
     _default_output_dir,
     _MAX_REPORTS,
@@ -134,6 +138,56 @@ def _reimport(monkeypatch, name):
 
     monkeypatch.delitem(sys.modules, name, raising=False)
     return importlib.import_module(name)
+
+
+def _write_isolated_ffdc_report(
+    monkeypatch,
+    tmp_path,
+    trigger,
+    *,
+    expected_category: str,
+    match: str,
+):
+    """Capture under ``tmp_path`` via ``TORCHINDUCTOR_CACHE_DIR``; return the JSON path."""
+    monkeypatch.setenv("TORCH_SPYRE_FFDC", "1")
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(tmp_path))
+    reports_dir = _default_output_dir()
+    assert reports_dir.resolve().is_relative_to(Path(tmp_path).resolve())
+
+    with pytest.raises(RuntimeError, match=match):
+        trigger()
+
+    reports = sorted(reports_dir.glob("ffdc_*.json"))
+    assert len(reports) == 1
+    assert reports[0].name.startswith(f"ffdc_{expected_category}_")
+    with open(reports[0], encoding="utf-8") as handle:
+        on_disk = json.load(handle)
+    assert on_disk["failure"]["category"] == expected_category
+    assert match in (on_disk["failure"].get("message") or "")
+    assert on_disk["failure"].get("traceback")
+    return reports[0]
+
+
+def _retrieve_via_torch_spyre(expected_category: str, report_path, match: str):
+    """No-arg retrieve must return this report.
+
+    Prefer the live ``torch.spyre.get_diagnostic_report`` binding (Spyre CI /
+    pods). When PrivateUse1 is not registered (common on Mac without
+    autoload), use ``make_spyre_module().get_diagnostic_report`` — the same
+    callable that binding installs — rather than inventing a fake
+    ``torch.spyre`` namespace. ``TestFfdcPublicApi`` covers the module attr.
+    """
+    if hasattr(torch, "spyre") and hasattr(torch.spyre, "get_diagnostic_report"):
+        getter = torch.spyre.get_diagnostic_report
+    else:
+        getter = make_spyre_module().get_diagnostic_report
+    assert getter is get_diagnostic_report
+    result = getter()
+    assert result is not None
+    assert result["failure"]["category"] == expected_category
+    assert result["_report_path"] == str(report_path.resolve())
+    assert result["failure"]["traceback"]
+    assert match in (result["failure"]["message"] or "")
 
 
 class TestFfdcCollect:
@@ -417,6 +471,172 @@ class TestFfdcCollect:
                 report = self._collect_to_tmpdir(exc, failure_category=category)
             assert report["failure"]["category"] == category
 
+    def test_collect_normalizes_invalid_and_strips_custom_categories(self):
+        # Public surface: empty / whitespace / non-str → unknown; padded
+        # custom labels are stripped, stored, and retrieved.
+        cases = (
+            ("", CATEGORY_UNKNOWN, "ffdc_unknown_"),
+            ("   ", CATEGORY_UNKNOWN, "ffdc_unknown_"),
+            (None, CATEGORY_UNKNOWN, "ffdc_unknown_"),
+            (1, CATEGORY_UNKNOWN, "ffdc_unknown_"),
+            ("  custom_label  ", "custom_label", "ffdc_custom_label_"),
+        )
+        for category, expected, prefix in cases:
+            with tempfile.TemporaryDirectory() as tmp:
+                report = collect(
+                    RuntimeError("x"),
+                    failure_category=category,
+                    output_dir=tmp,
+                )
+                assert report["failure"]["category"] == expected
+                assert Path(report["_report_path"]).name.startswith(prefix)
+                result = get_diagnostic_report(output_dir=tmp)
+            assert result is not None
+            assert result["failure"]["category"] == expected
+
+    def test_hooks_emit_only_hook_failure_categories(self):
+        """Auto-hook sites must pass only HOOK_FAILURE_CATEGORIES values.
+
+        Full contract (intentional — not accidental strictness):
+
+        * Match by **bare** call name (``try_collect`` / ``with_ffdc``),
+          regardless of qualifier (attr-only). Rename a non-hook helper
+          if its name would collide; a qualifier allowlist is a possible
+          follow-up if false positives appear.
+        * ``try_collect`` must pass ``failure_category=`` as a **keyword**
+          (positional rejected — the default would be
+          ``CATEGORY_UNKNOWN``).
+        * ``with_ffdc`` may use positional or keyword.
+        * Category arg must be an ``ast.Name`` of a ``CATEGORY_*``
+          constant in ``HOOK_FAILURE_CATEGORIES`` (rejects aliases /
+          variables / ``CATEGORY_UNKNOWN``).
+        * ``emitted == HOOK_FAILURE_CATEGORIES``: every hook label must
+          be actively emitted somewhere in the installed package (CI
+          scans site-packages after the wheel install).
+
+        Maintenance: a known (preferred) category needs
+        ``CATEGORY_*`` + ``KNOWN_FAILURE_CATEGORIES`` in ``_ffdc.py``
+        and a mention in ``docs/source/user_guide/profiling/ffdc.md``
+        (``test_ffdc_docs_list_known_failure_categories`` checks
+        document-wide backtick mentions, not table rows). Update
+        ``HOOK_FAILURE_CATEGORIES`` and this ``name_to_value`` map only
+        when the label is hook-emitted; capture-time-only labels
+        (e.g. ``CATEGORY_UNKNOWN``) stay out of both.
+        """
+        import ast
+
+        import torch_spyre
+
+        # CI removes the checked-out torch_spyre/ source tree after installing
+        # the wheel so the package cannot shadow site-packages. Scan the
+        # importable package location instead of Path(__file__)/../torch_spyre.
+        package_root = Path(torch_spyre.__file__).resolve().parent
+        # Only hook labels — CATEGORY_UNKNOWN must not appear at auto-hook sites.
+        # Keep keys in sync with HOOK_FAILURE_CATEGORIES in _ffdc.py.
+        name_to_value = {
+            "CATEGORY_COMPILE_FRONTEND": CATEGORY_COMPILE_FRONTEND,
+            "CATEGORY_COMPILE_BACKEND": CATEGORY_COMPILE_BACKEND,
+            "CATEGORY_RUNTIME_LAUNCH": CATEGORY_RUNTIME_LAUNCH,
+            "CATEGORY_UNIMPLEMENTED": CATEGORY_UNIMPLEMENTED,
+        }
+        assert set(name_to_value.values()) == HOOK_FAILURE_CATEGORIES
+        emitted: set[str] = set()
+
+        def _hook_category_name(
+            call: ast.Call, *, path: Path, require_keyword: bool
+        ) -> str:
+            cat_kw = next(
+                (kw for kw in call.keywords if kw.arg == "failure_category"),
+                None,
+            )
+            if cat_kw is not None:
+                cat_node = cat_kw.value
+            elif require_keyword:
+                # try_collect defaults failure_category to CATEGORY_UNKNOWN;
+                # requiring the keyword keeps hooks from silently falling
+                # into capture-time unknown.
+                raise AssertionError(
+                    f"{path}:{call.lineno}: try_collect must pass "
+                    f"failure_category=CATEGORY_* (default would be "
+                    f"CATEGORY_UNKNOWN)"
+                )
+            elif call.args:
+                cat_node = call.args[0]
+            else:
+                raise AssertionError(
+                    f"{path}:{call.lineno}: with_ffdc must pass a CATEGORY_* "
+                    f"positional arg or failure_category= keyword"
+                )
+            # Reject aliases / variables / Attribute forms so the inventory
+            # stays a literal CATEGORY_* name, not a runtime expression.
+            assert isinstance(cat_node, ast.Name), (
+                f"{path}:{call.lineno}: failure_category must use "
+                f"CATEGORY_* constant, got {ast.dump(cat_node)}"
+            )
+            assert cat_node.id in name_to_value, (
+                f"{path}:{call.lineno}: hook category must be a "
+                f"HOOK_FAILURE_CATEGORIES name, got {cat_node.id}"
+            )
+            return name_to_value[cat_node.id]
+
+        for path in sorted(package_root.rglob("*.py")):
+            if path.name == "_ffdc.py":
+                continue
+            tree = ast.parse(path.read_text(), filename=str(path))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                if isinstance(func, ast.Name):
+                    fname = func.id
+                elif isinstance(func, ast.Attribute):
+                    # Intentional: match attr name only, not the qualifier,
+                    # so import style cannot hide a hook call site.
+                    fname = func.attr
+                else:
+                    continue
+                if fname == "try_collect":
+                    emitted.add(
+                        _hook_category_name(node, path=path, require_keyword=True)
+                    )
+                elif fname == "with_ffdc":
+                    emitted.add(
+                        _hook_category_name(node, path=path, require_keyword=False)
+                    )
+
+        # Every HOOK_FAILURE_CATEGORIES label must be live somewhere; an
+        # unused preferred label is treated as dead vocabulary.
+        assert emitted == HOOK_FAILURE_CATEGORIES, (
+            f"hook inventory from {package_root} was {emitted!r}, "
+            f"expected {HOOK_FAILURE_CATEGORIES!r}"
+        )
+
+    def test_ffdc_docs_list_known_failure_categories(self):
+        """Each known category must appear somewhere in ffdc.md.
+
+        Document-wide backtick mentions only — this does not parse the
+        category table or require a dedicated table row per label.
+        """
+        docs = (
+            Path(__file__).resolve().parents[2]
+            / "docs"
+            / "source"
+            / "user_guide"
+            / "profiling"
+            / "ffdc.md"
+        )
+        text = docs.read_text()
+        for category in sorted(KNOWN_FAILURE_CATEGORIES):
+            assert f"`{category}`" in text
+        assert "KNOWN_FAILURE_CATEGORIES" in text
+        assert "HOOK_FAILURE_CATEGORIES" in text
+
+    def test_category_sets_not_reexported_on_profiler(self):
+        import torch_spyre.profiler as profiler_mod
+
+        assert not hasattr(profiler_mod, "KNOWN_FAILURE_CATEGORIES")
+        assert not hasattr(profiler_mod, "HOOK_FAILURE_CATEGORIES")
+
     def test_report_filename_contains_category(self):
         try:
             raise ValueError("x")
@@ -428,19 +648,6 @@ class TestFfdcCollect:
                 fname = Path(report["_report_path"]).name
         assert fname.startswith("ffdc_compile_frontend_")
         assert ".json" in fname
-
-    def test_empty_failure_category_normalizes_to_unknown(self):
-        try:
-            raise ValueError("x")
-        except ValueError as exc:
-            with tempfile.TemporaryDirectory() as tmp:
-                report = collect(exc, failure_category="", output_dir=tmp)
-                assert report["failure"]["category"] == CATEGORY_UNKNOWN
-                fname = Path(report["_report_path"]).name
-                assert fname.startswith("ffdc_unknown_")
-                result = get_diagnostic_report(output_dir=tmp)
-        assert result is not None
-        assert result["failure"]["category"] == CATEGORY_UNKNOWN
 
     def test_collect_filename_has_report_sort_key(self):
         try:
@@ -466,13 +673,13 @@ class TestFfdcCollect:
         missing = report["collector"]["missing_fields"]
         assert "failure.exception_type" in missing
         assert "failure.traceback" in missing
-        # REQUIRED_FIELDS has 11 entries; exc=None leaves exception_type and
-        # traceback as None (2 missing, 9 present).
-        # round(100 * 9 / 11, 1) == 81.8  — hardcoded to catch formula regressions.
-        assert len(REQUIRED_FIELDS) == 11, (
+        # REQUIRED_FIELDS has 10 entries; exc=None leaves exception_type and
+        # traceback as None (2 missing, 8 present).
+        # round(100 * 8 / 10, 1) == 80.0  — hardcoded to catch formula regressions.
+        assert len(REQUIRED_FIELDS) == 10, (
             "Update the expected_pct below if REQUIRED_FIELDS changes"
         )
-        assert report["collector"]["completeness_pct"] == 81.8
+        assert report["collector"]["completeness_pct"] == 80.0
         assert report["collector"]["completeness_pct"] < 100.0
 
     def test_metadata_fields_present(self):
@@ -493,14 +700,30 @@ class TestFfdcCollect:
             assert key in meta
 
     def test_environment_keys_captured(self):
+        # Explicit contract — do not import ``_ENV_KEYS`` as the expected
+        # set, or deleting a key from both the list and this assertion
+        # would still pass.
+        expected = frozenset(
+            {
+                "TORCH_COMPILE_DEBUG",
+                "TORCH_SPYRE_DEBUG",
+                "DUMP_SPYRE_CODE",
+                "TORCH_LOGS",
+                "TORCHINDUCTOR_FORCE_DISABLE_CACHES",
+                "SENCORES",
+                "TORCH_SPYRE_FFDC",
+            }
+        )
+        from torch_spyre.profiler._ffdc import _ENV_KEYS
+
+        assert frozenset(_ENV_KEYS) == expected
+
         try:
             raise ValueError("x")
         except ValueError as exc:
             report = self._collect_to_tmpdir(exc, failure_category=CATEGORY_UNKNOWN)
 
-        env = report["environment"]
-        for key in ("TORCH_COMPILE_DEBUG", "TORCH_SPYRE_DEBUG", "SPYRE_INDUCTOR_LOG"):
-            assert key in env
+        assert frozenset(report["environment"]) == expected
 
     def test_capture_latency_is_positive(self):
         try:
@@ -513,6 +736,22 @@ class TestFfdcCollect:
     def test_get_diagnostic_report_returns_none_when_empty(self):
         with tempfile.TemporaryDirectory() as tmp:
             assert get_diagnostic_report(output_dir=tmp) is None
+
+    def test_get_diagnostic_report_rejects_cache_root_as_output_dir(
+        self, monkeypatch, tmp_path
+    ):
+        """``output_dir`` is the report dir, not the Inductor cache root."""
+        monkeypatch.setenv("TORCH_SPYRE_FFDC", "1")
+        monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(tmp_path))
+        reports_dir = _default_output_dir()
+        try:
+            raise RuntimeError("cache-root probe")
+        except RuntimeError as exc:
+            collect(exc, failure_category=CATEGORY_UNKNOWN, output_dir=str(reports_dir))
+        assert get_diagnostic_report(output_dir=str(tmp_path)) is None
+        hit = get_diagnostic_report(output_dir=str(reports_dir))
+        assert hit is not None
+        assert hit["failure"]["category"] == CATEGORY_UNKNOWN
 
     def test_default_output_dir_uses_inductor_cache_root(self, monkeypatch, tmp_path):
         # Documents the real Inductor layout: cache_dir() → default_cache_dir()
@@ -832,8 +1071,6 @@ class TestFfdcCompileFx:
         import torch
         import torch._inductor.compile_fx as cfx
 
-        from torch_spyre.constants import DEVICE_NAME
-
         class _ElementArrangement(IntEnum):
             STANDARD = 0
             DL16_TO_FP32 = 1
@@ -841,9 +1078,18 @@ class TestFfdcCompileFx:
             EXX2 = 3
             QFP8CH = 4
 
-        if "torch_spyre._C" not in sys.modules:
+        # Minimal values for ``torch_spyre._inductor.constants`` import.
+        class _DataFormats(IntEnum):
+            SEN169_FP16 = 0
+            IEEE_FP32 = 1
+            IEEE_INT32 = 2
+            SENUINT32 = 3
+
+        _c = sys.modules.get("torch_spyre._C")
+        if _c is None or not hasattr(_c, "DataFormats"):
             _c = types.ModuleType("torch_spyre._C")
             _c.ElementArrangement = _ElementArrangement
+            _c.DataFormats = _DataFormats
             _c.launch_jobplan = lambda *a, **k: None
             _c.prepare_kernel = lambda *a, **k: None
             monkeypatch.setitem(sys.modules, "torch_spyre._C", _c)
@@ -902,7 +1148,28 @@ class TestFfdcAsyncCompile:
 
         out_dir = str(tmp_path / "bundle")
 
-        inductor = _stub_module(monkeypatch, "torch_spyre._inductor")
+        class _FakeSpyreConfig:
+            frontend_only = False
+            backend_loop_unroll = False
+            ktir_device_mlir = ""
+            spyre_kernel_cache = False
+
+            def __getattr__(self, _name):
+                return False
+
+        class _FakeTimingRecorder:
+            @staticmethod
+            def stage(*_a, **_k):
+                from contextlib import nullcontext
+
+                return nullcontext()
+
+        inductor = _stub_module(
+            monkeypatch,
+            "torch_spyre._inductor",
+            config=_FakeSpyreConfig(),
+            timing_recorder=_FakeTimingRecorder(),
+        )
         inductor.__path__ = []
         _stub_module(
             monkeypatch,
@@ -967,7 +1234,7 @@ class TestFfdcAsyncCompile:
         mod = _reimport(monkeypatch, "torch_spyre.execution.async_compile")
         # Run the process-local compiler and FFDC mocks inline.
         monkeypatch.setattr(torch._inductor.config, "compile_threads", 1)
-        monkeypatch.setattr(mod, "get_output_dir", lambda name: out_dir)
+        monkeypatch.setattr(mod, "get_output_dir", lambda name, prefix=None: out_dir)
         monkeypatch.setattr(mod, "generate_bundle", lambda *a, **k: [])
         monkeypatch.setattr(mod, "find_unimplemented", lambda specs: None)
         return mod, out_dir
@@ -990,6 +1257,12 @@ class TestFfdcAsyncCompile:
         monkeypatch.setattr(ffdc_mod, "try_collect", fake_try_collect)
 
         mod, out_dir = self._load_async_compile(monkeypatch, tmp_path)
+        # Pass the pre-flight PATH check so the FFDC hook around dbo-opt runs.
+        monkeypatch.setattr(
+            mod.shutil,
+            "which",
+            lambda name: "/fake/dbo-opt" if name == "dbo-opt" else None,
+        )
 
         def fail_run(cmd, **kwargs):
             raise subprocess.CalledProcessError(1, cmd)
@@ -1020,6 +1293,11 @@ class TestFfdcAsyncCompile:
 
         _patch_collect_raises(monkeypatch)
         mod, _out_dir = self._load_async_compile(monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            mod.shutil,
+            "which",
+            lambda name: "/fake/dbo-opt" if name == "dbo-opt" else None,
+        )
 
         def fail_run(cmd, **kwargs):
             raise subprocess.CalledProcessError(1, cmd)
@@ -1038,26 +1316,48 @@ class TestFfdcKernelRunner:
         """Load ``kernel_runner`` without permanently shadowing real ``_C``.
 
         Prefer patching the module's bound ``launch_jobplan`` / ``prepare_kernel``.
-        Stub ``_C`` only when it is absent (e.g. no extension on Mac).
+        Stub ``_C`` when absent or missing attrs required by ``kernel_runner``
+        (incomplete Mac installs). A fully loaded extension keeps its types.
         """
         import logging
         import sys
 
-        def _launch(jobplan, args):
+        def _launch(jobplan, args, *extra, **kwargs):
             if launch_side_effect is not None:
                 raise launch_side_effect
 
-        if "torch_spyre._C" not in sys.modules:
+        # Stub when the extension is absent or incomplete (e.g. Mac without a
+        # full Spyre build). Do not invent types on a fully loaded ``_C``.
+        _c = sys.modules.get("torch_spyre._C")
+        _c_needed = (
+            "launch_jobplan",
+            "prepare_kernel",
+            "register_kernel_provenance",
+            "SymbolicArg",
+            "SymbolicArgKind",
+        )
+        if _c is None or any(not hasattr(_c, name) for name in _c_needed):
             _stub_module(
                 monkeypatch,
                 "torch_spyre._C",
                 launch_jobplan=_launch,
-                prepare_kernel=lambda path: "fake_jobplan",
+                prepare_kernel=lambda path, **kwargs: "fake_jobplan",
                 register_kernel_provenance=lambda *a, **k: True,
+                SymbolicArg=object,
+                SymbolicArgKind=object,
             )
         if "torch_spyre._inductor" not in sys.modules:
             inductor = _stub_module(monkeypatch, "torch_spyre._inductor")
             inductor.__path__ = []
+        if "torch_spyre._inductor.codegen" not in sys.modules:
+            codegen = _stub_module(monkeypatch, "torch_spyre._inductor.codegen")
+            codegen.__path__ = []
+        if "torch_spyre._inductor.codegen.compute_ops" not in sys.modules:
+            _stub_module(
+                monkeypatch,
+                "torch_spyre._inductor.codegen.compute_ops",
+                SymbolKind=object,
+            )
         if "torch_spyre._inductor.logging_utils" not in sys.modules:
             _stub_module(
                 monkeypatch,
@@ -1079,7 +1379,7 @@ class TestFfdcKernelRunner:
 
         mod = _reimport(monkeypatch, "torch_spyre.execution.kernel_runner")
         monkeypatch.setattr(mod, "launch_jobplan", _launch)
-        monkeypatch.setattr(mod, "prepare_kernel", lambda path: "fake_jobplan")
+        monkeypatch.setattr(mod, "prepare_kernel", lambda path, **kw: "fake_jobplan")
         monkeypatch.setattr(mod, "register_kernel_provenance", lambda *a, **k: True)
         return mod
 
@@ -1097,9 +1397,56 @@ class TestFfdcKernelRunner:
         launch_exc = RuntimeError("launch_jobplan failed")
         mod = self._load_kernel_runner(monkeypatch, launch_side_effect=launch_exc)
         runner = mod.SpyreSDSCKernelRunner("k", "/tmp/code")
+        # Lazy prepare_kernel calls torch.spyre._lazy_init; seed the handle so
+        # this unit test stays device-free.
+        runner._jobplan = "fake_jobplan"
 
         with pytest.raises(RuntimeError, match="launch_jobplan failed"):
             runner.run()
+
+    def test_unimplemented_hook_retrieves_via_torch_spyre(self, monkeypatch, tmp_path):
+        """No-arg ``torch.spyre.get_diagnostic_report`` after the unimplemented hook."""
+        try:
+            from torch_spyre.execution.kernel_runner import SpyreUnimplementedRunner
+
+            runner = SpyreUnimplementedRunner("k", "aten::foo")
+        except ImportError:
+            mod = self._load_kernel_runner(monkeypatch)
+            runner = mod.SpyreUnimplementedRunner("k", "aten::foo")
+        report_path = _write_isolated_ffdc_report(
+            monkeypatch,
+            tmp_path,
+            runner.run,
+            expected_category=CATEGORY_UNIMPLEMENTED,
+            match="unimplemented operation",
+        )
+        _retrieve_via_torch_spyre(
+            CATEGORY_UNIMPLEMENTED, report_path, "unimplemented operation"
+        )
+
+    def test_runtime_launch_hook_retrieves_via_torch_spyre(self, monkeypatch, tmp_path):
+        """No-arg ``torch.spyre.get_diagnostic_report`` after the runtime_launch hook.
+
+        Seeds ``_jobplan`` and stubs ``launch_jobplan`` so CI covers write +
+        retrieve without a Spyre card or ``test_prepare_kernel`` coupling.
+        ``tools/ffdc_trigger.py`` remains the pod path that exercises a real
+        ``prepare_kernel`` before ``launch_jobplan`` fails.
+        """
+        launch_exc = RuntimeError("ffdc launch boom")
+        mod = self._load_kernel_runner(monkeypatch, launch_side_effect=launch_exc)
+        runner = mod.SpyreSDSCKernelRunner("ffdc_launch", str(tmp_path / "kernel"))
+        # Skip lazy prepare_kernel / _lazy_init; the hook wraps run() itself.
+        runner._jobplan = "fake_jobplan"
+        report_path = _write_isolated_ffdc_report(
+            monkeypatch,
+            tmp_path,
+            runner.run,
+            expected_category=CATEGORY_RUNTIME_LAUNCH,
+            match="ffdc launch boom",
+        )
+        _retrieve_via_torch_spyre(
+            CATEGORY_RUNTIME_LAUNCH, report_path, "ffdc launch boom"
+        )
 
 
 class TestFfdcProfilerApi:
