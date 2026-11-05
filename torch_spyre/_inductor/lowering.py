@@ -378,8 +378,6 @@ def lower_scaled_mm(
 
     mat1_size = mat1.get_size()
     mat2_size = mat2.get_size()
-    mat1_ndim = len(mat1_size)
-    mat2_ndim = len(mat2_size)
 
     mat1_dtype = mat1.get_dtype()
     mat2_dtype = mat2.get_dtype()
@@ -392,37 +390,18 @@ def lower_scaled_mm(
     output_dtype = out_dtype if out_dtype is not None else torch.float16
     reduction_numel = mat1_size[-1]
 
-    if mat1_ndim == 2 and mat2_ndim == 2:
-        # [M, K] × [K, N] → [M, N]
-        ranges = [mat1_size[0], mat2_size[1]]
-
-        def inner_fn(index, reduction_index):
-            i0, i1 = index
-            (r0,) = reduction_index
-            return (mat1_loader([i0, r0]), mat2_loader([r0, i1]))
-
-    elif mat1_ndim == 3 and mat2_ndim == 2:
-        # [B, M, K] × [K, N] → [B, M, N]
-        ranges = [mat1_size[0], mat1_size[1], mat2_size[1]]
-
-        def inner_fn(index, reduction_index):
-            i0, i1, i2 = index
-            (r0,) = reduction_index
-            return (mat1_loader([i0, i1, r0]), mat2_loader([r0, i2]))
-
-    elif mat1_ndim == 3 and mat2_ndim == 3:
-        # [B, M, K] × [B, K, N] → [B, M, N]
-        ranges = [mat1_size[0], mat1_size[1], mat2_size[2]]
-
-        def inner_fn(index, reduction_index):
-            i0, i1, i2 = index
-            (r0,) = reduction_index
-            return (mat1_loader([i0, i1, r0]), mat2_loader([i0, r0, i2]))
-
-    else:
+    # [M, K] × [K, N] → [M, N]. Batched operands go through lower_bmm_fp8.
+    if len(mat1_size) != 2 or len(mat2_size) != 2:
         raise Unsupported(
             f"_scaled_mm with shapes {mat1_size} and {mat2_size} not supported"
         )
+
+    ranges = [mat1_size[0], mat2_size[1]]
+
+    def inner_fn(index, reduction_index):
+        i0, i1 = index
+        (r0,) = reduction_index
+        return (mat1_loader([i0, r0]), mat2_loader([r0, i1]))
 
     result = Reduction.create(
         reduction_type=BATCH_MATMUL_FP8_OP,
@@ -476,15 +455,14 @@ def lower_bmm_fp8(
 
     # [B, M, K] × [B, K, N] → [B, M, N]  and
     # [B, H, M, K] × [B, H, K, N] → [B, H, M, N], with identical batch dims and
-    # a matching contraction dim. Batch broadcasting is not supported.
-    if (
-        mat1_ndim != mat2_ndim
-        or mat1_ndim not in (3, 4)
-        or any(
-            sympy.simplify(d1 - d2) != 0
-            for d1, d2 in zip(
-                [*mat1_size[:-2], mat1_size[-1]], [*mat2_size[:-2], mat2_size[-2]]
-            )
+    # a matching contraction dim. Size-1 batch broadcasting is not supported.
+    # [B, M, K] × [K, N] → [B, M, N] shares one mat2 across the batch.
+    shared_mat2 = mat1_ndim == 3 and mat2_ndim == 2
+    mat1_batch = [] if shared_mat2 else list(mat1_size[:-2])
+    if not (shared_mat2 or (mat1_ndim == mat2_ndim and mat1_ndim in (3, 4))) or any(
+        sympy.simplify(d1 - d2) != 0
+        for d1, d2 in zip(
+            [*mat1_batch, mat1_size[-1]], [*mat2_size[:-2], mat2_size[-2]]
         )
     ):
         raise Unsupported(
@@ -499,12 +477,13 @@ def lower_bmm_fp8(
         # Each batch dim keeps its own iteration symbol in both loaders.
         # Recovering b and h from a fused batch index via // and % would put one
         # symbol in two device coordinates, which garbles the dim-order scan in
-        # superdsc._get_device_dim_order.
+        # superdsc._get_device_dim_order. A shared mat2 has no batch dim to index.
         *batch_index, row, column = index
         (contraction,) = reduction_index
+        mat2_batch_index = [] if shared_mat2 else batch_index
         return (
             mat1_loader([*batch_index, row, contraction]),
-            mat2_loader([*batch_index, contraction, column]),
+            mat2_loader([*mat2_batch_index, contraction, column]),
         )
 
     result = Reduction.create(
