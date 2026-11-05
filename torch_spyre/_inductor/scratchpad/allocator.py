@@ -3591,14 +3591,19 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         )
         self._stage_collective_outputs(graph, allocation, accepted_lx_relayouts)
         log_solver_decisions(graph, allocation)
+        self._warn_spilled_carries(allocation)
+
+    def _warn_spilled_carries(self, allocation: Sequence[Any]) -> None:
+        """Warn for each carry whose extra writers all had an ownership edge
+        but which the solve still left in HBM."""
         carry_writers = getattr(self, "_carry_writers", {})
         for buffer in allocation:
-            writer = carry_writers.get(buffer.name)
-            if writer is not None and buffer.address is None:
+            writers = carry_writers.get(buffer.name)
+            if writers and buffer.address is None:
                 logger.warning(
-                    "loop carry %s with writer %s spilled to HBM: %s",
+                    "loop carry %s with writers %s spilled to HBM: %s",
                     buffer.name,
-                    writer,
+                    ", ".join(writers),
                     buffer.spill_reason or "not chosen by the solve",
                 )
 
@@ -4318,33 +4323,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 continue
             if residency_by_buf.get(record.storage_name) is None:
                 carry_update_edges[record.update_name] = edge
-        # A carry's other writers, e.g. the copy-back of an all_reduce_ into the
-        # loop result, write the same storage and must share its ownership.
-        self._carry_writers: dict[str, str] = {}
-        for writer in graph.operations:
-            storage_name = _loop_carry_mutation_target(writer, op_by_name)
-            if storage_name is None or writer.name in carry_update_edges:
-                continue
-            if residency_by_buf.get(storage_name) is not None:
-                continue
-            edge = self._carry_writer_edge(
-                writer, storage_name, op_by_name, prep_cache, graph=graph
-            )
-            if edge is not None:
-                carry_update_edges[writer.name] = edge
-                self._carry_writers[storage_name] = writer.get_name()
-                continue
-            logger.warning(
-                "loop carry %s stays in HBM: its writer %s has no ownership edge",
-                storage_name,
-                writer.get_name(),
-            )
-            residency_by_buf[storage_name] = "loop carry writer ownership unavailable"
-            carry_update_edges = {
-                name: edge
-                for name, edge in carry_update_edges.items()
-                if edge.buf_name != storage_name
-            }
+        self._add_carry_writer_edges(
+            graph, op_by_name, prep_cache, residency_by_buf, carry_update_edges
+        )
 
         input_clone_matches: dict[str, dict[str, list[tuple[int, int]]]] = {}
         # Consumer op name -> input clones for which it is the last reader, and so
@@ -4659,6 +4640,51 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         return CoOptimizingAllocator._carry_writer_edge(
             update_op, record.storage_name, op_by_name, prep_cache, graph=graph
         )
+
+    def _add_carry_writer_edges(
+        self,
+        graph: GraphLowering,
+        op_by_name: dict[str, Operation],
+        prep_cache: dict,
+        residency_by_buf: dict[str, Optional[str]],
+        carry_update_edges: dict[str, ResidencyEdge],
+    ) -> None:
+        """Give each other writer of a carry, e.g. the copy-back of an
+        all_reduce_ into the loop result, the storage's ownership edge.
+
+        A writer without one leaves the storage in HBM and drops every edge
+        on it. Records the writers of each storage in ``_carry_writers``.
+        """
+        self._carry_writers: dict[str, list[str]] = {}
+        for writer in graph.operations:
+            storage_name = _loop_carry_mutation_target(writer, op_by_name)
+            if storage_name is None or writer.get_name() in carry_update_edges:
+                continue
+            if residency_by_buf.get(storage_name) is not None:
+                continue
+            edge = self._carry_writer_edge(
+                writer, storage_name, op_by_name, prep_cache, graph=graph
+            )
+            if edge is not None:
+                carry_update_edges[writer.get_name()] = edge
+                self._carry_writers.setdefault(storage_name, []).append(
+                    writer.get_name()
+                )
+                continue
+            logger.warning(
+                "loop carry %s stays in HBM: its writer %s has no ownership edge",
+                storage_name,
+                writer.get_name(),
+            )
+            # Warned here, so _warn_spilled_carries must not warn again.
+            self._carry_writers.pop(storage_name, None)
+            residency_by_buf[storage_name] = "loop carry writer ownership unavailable"
+            for name in [
+                name
+                for name, edge in carry_update_edges.items()
+                if edge.buf_name == storage_name
+            ]:
+                del carry_update_edges[name]
 
     @staticmethod
     def _carry_writer_edge(
