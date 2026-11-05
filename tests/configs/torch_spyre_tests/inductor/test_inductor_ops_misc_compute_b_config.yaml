@@ -35,6 +35,8 @@ test_suite_config:
             # bitwise (fallback path)
             - TestOps::test_bitwise_and.*
             - TestOps::test_bitwise_not.*
+            - TestOps::test_logical_int_mask.*
+            - TestOps::test_logical_mixed_bool_mask.*
             # misc arithmetic / ops
             - TestOps::test_dropout_functional.*
             - TestOps::test_fallback.*
@@ -65,6 +67,7 @@ test_suite_config:
             - TestOps::test_where.*
             # pooling
             - TestOps::test_avg_pool2d.*
+            - TestOps::test_max_pool2d.*
             # invalid-dim error-path tests
             - TestOps::test_core_reduction_invalid_dims_api.*
             - TestOps::test_core_reduction_invalid_dims_spyre.*
