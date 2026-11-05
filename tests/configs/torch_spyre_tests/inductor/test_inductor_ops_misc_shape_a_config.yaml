@@ -38,6 +38,8 @@ test_suite_config:
             - TestOps::test_view_split_stick_slice.*
             # a stick-dim gather written at an offset inside a wider stick
             - TestOps::test_stick_gather_at_offset.*
+            # a strided slice of the stick dim, gathered
+            - TestOps::test_strided_stick_slice.*
             - TestOps::test_rope_on_split_stick_view.*
           mode: mandatory_success
           tags:
