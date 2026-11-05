@@ -753,6 +753,8 @@ self.passes = [
     #
     # Tensor Layout (Stickification)
     split_multi_ops,
+    apply_loop_carries,            # makes each declared for_each_tile carry's
+                                   # update an in-place write of its storage
     propagate_spyre_tensor_layouts,
     validate_ops,
     optimize_restickify_locations,
