@@ -155,9 +155,12 @@ def _matching_completed_reduction_routes(route_calls, completed_producer_cores):
         if tuple(core for core, _readers in result) == completed_producer_cores
     ]
     if not matches:
+        captured = [
+            tuple(core for core, _readers in result) for _, _, _, result in route_calls
+        ]
         raise AssertionError(
             "no captured derive_completed_reduction_routes call's producer-core "
-            f"set matches {completed_producer_cores}"
+            f"set matches {completed_producer_cores}; captured sets: {captured}"
         )
     assert all(match == matches[0] for match in matches[1:]), (
         "captured derive_completed_reduction_routes calls disagree for "
