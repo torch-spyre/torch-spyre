@@ -1819,14 +1819,6 @@ def silu(input: torch.Tensor) -> torch.Tensor:
     return torch.ops.spyre.silu(input)
 
 
-def _mask_indices(x: torch.Tensor, indices: torch.Tensor, dim: int) -> torch.Tensor:
-    """Set the elements of ``x`` at ``indices`` along ``dim`` to ``-inf``."""
-    dim = dim % x.ndim
-    ones = torch.ones_like(x)
-    marker = torch.ops.spyre.keep_by_index(ones, indices, dim, 0.0)
-    return torch.where(marker == 1.0, float("-inf"), x)
-
-
 @register_spyre_decompositions([torch.ops.aten.topk])
 def spyre_topk(
     input: torch.Tensor,
@@ -1896,7 +1888,7 @@ def spyre_topk(
         idxs_list.append(i)
         remaining_k -= chunk_k
         if remaining_k > 0:
-            curr_input = _mask_indices(curr_input, i, dim)
+            curr_input = torch.ops.spyre.mask_by_index(curr_input, i, dim)
 
     if len(vals_list) == 1:
         values, indices = vals_list[0], idxs_list[0]

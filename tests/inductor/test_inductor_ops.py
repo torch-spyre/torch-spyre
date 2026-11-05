@@ -2566,6 +2566,53 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        ("test_mask_by_index", "test_mask_by_index_cpu"): {
+            # mask_by_index always masks with -inf, so there is no fill value.
+            "param_sets": {
+                # Stick-aligned (every dim a multiple of 64).
+                "2d_aligned_dim0": (
+                    unique_randn_along_dim((64, 128), dim=0),
+                    8,
+                    0,
+                ),
+                "3d_aligned_dim0": (
+                    unique_randn_along_dim((64, 64, 128), dim=0),
+                    2,
+                    0,
+                ),
+                "4d_aligned_dim2": (
+                    unique_randn_along_dim((2, 4, 64, 64), dim=2),
+                    16,
+                    2,
+                ),
+                # Unaligned.
+                "2d_dim0": (
+                    unique_randn_along_dim((67, 256), dim=0),
+                    8,
+                    0,
+                ),
+                "2d_dim1": (
+                    unique_randn_along_dim((256, 64), dim=1),
+                    12,
+                    1,
+                ),
+                "3d_dim0": (
+                    unique_randn_along_dim((67, 71, 256), dim=0),
+                    2,
+                    0,
+                ),
+                "4d_dim0": (
+                    unique_randn_along_dim((6, 17, 7, 64), dim=0),
+                    2,
+                    0,
+                ),
+                "4d_dim2": (
+                    unique_randn_along_dim((6, 17, 64, 64), dim=2),
+                    16,
+                    2,
+                ),
+            },
+        },
         ("test_reduce_keepdim0", "test_reduce_keepdim0_cpu"): {
             "ops_dict": CORE_REDUCTION_OPS_DICT,
             "param_sets": COMMON_REDUCTION_KEEPDIM_PARAM_SETS,
@@ -10900,6 +10947,20 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         def fn(x, indices):
             return torch.ops.spyre.keep_by_index(x, indices, dim, fill_value)
+
+        compiled_fn = torch.compile(fn)
+        result_spyre = compiled_fn(
+            x.to("spyre"), indices.to(torch.float16).to("spyre")
+        ).cpu()
+        expected = fn(x, indices)
+
+        torch.testing.assert_close(result_spyre, expected, atol=0.1, rtol=0.1)
+
+    def test_mask_by_index_cpu(self, x, k: int, dim: int):
+        _, indices = torch.topk(x, k, dim=dim, largest=True)
+
+        def fn(x, indices):
+            return torch.ops.spyre.mask_by_index(x, indices, dim)
 
         compiled_fn = torch.compile(fn)
         result_spyre = compiled_fn(
