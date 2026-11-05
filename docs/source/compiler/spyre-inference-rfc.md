@@ -1,170 +1,109 @@
-# RFC: Platform simplification through symbolic shapes, for compile time and runtime
+# RFC: Using torch-spyre's dynamic dimensions in spyre-inference
 
 | Field | Value |
 |---|---|
 | Status | Draft, for discussion under the boot-time epic |
 | Created | 2026-11-05 |
 | Tracking | [#1432 Reduce spyre-inference boot/compile time](https://github.com/torch-spyre/spyre-inference/issues/1432), [#1515 Investigate how torch-spyre symbolic shape can reduce compile time](https://github.com/torch-spyre/spyre-inference/issues/1515) |
-| Related | #1523, #1525, #1524 (the encoder items and their interim), #959, #566 (boot time as a tracked metric), #771 (denser block ladder), #942 (performance above 32 sequences), #1364 (compiles after warm-up), #1473 (vision encoders once dynamic shapes exist), #713 (long context); torch-spyre #5891, #5912, #5917, #5179, #5186 |
+| Related | #1523, #1525, #1524, #1473 (encoders and vision towers), #771, #1060 (a request pays for its bucket), #1364 (compiles after warm-up), #942 (performance above 32 sequences), #713 (long context), #468 (jagged attention), #959, #566 (boot time as a metric), #1242, #1239 (the V2 runner's startup and step inputs); torch-spyre #43 (the epic), #5891, #5912, #5917, #5179, #5186 |
 
-Terms used throughout. A **static-shape program** is what Spyre compiles today: one binary for one exact tensor shape. A **dynamic dimension** is a tensor dimension that torch-spyre lets a caller mark as variable over a range (a minimum, a maximum and a step between supported sizes, called the granularity). A **dynamic-shape program** is one binary compiled once over such a range, which runs at every size in it. A **bucket** is a fixed size the plugin rounds a varying quantity up to, so that a static-shape program can serve it. A **KV cache page** is 128 tokens of a sequence's history.
+What this RFC is. torch-spyre is adding dynamic dimensions: a tensor dimension that varies over a declared range and is served by one compiled program instead of one program per size. This document describes the feature as it stands, where it pays and where it does not, how spyre-inference can use it, and in what order, so that any part of the plugin can adopt it the same way. It is written for the priorities stated on the epic: compile-time reduction first, which here means fewer programs through fewer buckets, and end-to-end throughput second. It is a guide, not a description of one implementation, and it carries no measurements. The measurements that back it exist and are shared separately.
 
-## 1. Motivation
+Terms. A **static-shape program** is what Spyre compiles today: one binary for one exact tensor shape. A **dynamic dimension** is a dimension declared as variable over a range, with a minimum, a maximum and a granularity (the step between supported sizes). A **dynamic-shape program** is one binary compiled over such a range. A **bucket** is a fixed size the plugin rounds a varying quantity up to so that a static-shape program can serve it. A **KV cache page** is a block of tokens of a sequence's history.
 
-Every program on Spyre is compiled for one exact shape. The plugin handles a varying size by rounding it up to a bucket and compiling one static-shape program per bucket, then compiling every bucket at start. For paged attention that is one program per (query bucket, page-count bucket) for the per-sequence kernels and one per (sequence-count bucket, page-count bucket) for the batched decode kernel. The number grows with the context length and with `max_num_seqs`, and so does the boot time. On granite-3.3-8b at the epic's first configuration (4096 context, 32 sequences, one card) that is 48 attention programs beside 7 body programs and 961 s of cold boot, and at 32K context with 4 sequences 45 attention programs and 751 s.
+## 1. The feature
 
-The epic's target is a boot under 8 minutes on row 1 and on six more rows at 32K with 32 sequences. The same bucketing also costs at run time, since a request pays for its bucket and not for its own length (#771, #1060), and it leaves compile hazards after warm-up whenever a shape escapes the bucket list (#1364).
+### 1.1 The declaration
 
-torch-spyre is landing symbolic shapes: a dynamic dimension served by one dynamic-shape program whose device loop runs for the real size at launch. This RFC proposes to use that to remove the attention buckets from the plugin, shows what it measured, states what it does not change, and lists what has to land in torch-spyre first. It answers the seven questions of #1515 in the appendix.
-
-## 2. Goals and non-goals
-
-Goals: one attention program per kernel per query bucket, independent of the context length and of `max_num_seqs`. The attention page buckets, their presets, the per-variant grids and the per-variant warm-up compiles removed. Boot time on row 1 under the target with no cache. Output tokens identical to today's. No regression at short context, a gain at long context.
-
-Non-goals: the transformer body's token buckets (a decode step is a weight pass, so the body wants one flat row count per phase and a loop over rows does not help it), tensor parallel sizes above 1 (not measurable on the one-card pods), the vision towers (#1473, a later step on the same mechanism), jagged attention, prefix caching changes.
-
-## 3. What torch-spyre provides
-
-A caller marks one dimension of a host tensor as dynamic when it moves it to the device:
+A caller marks one dimension of a host tensor as dynamic when it moves the tensor to the device:
 
 ```python
 x_dev = x_cpu.to("spyre", dynamic={0: {"min": m, "max": M, "granularity": G}})
 ```
 
-The device buffer is allocated once at `M` rows with the strides of `M`, the real rows are copied in, and dim 0 is marked dynamic for Dynamo (torch-spyre #5179). Inside a compiled kernel the dynamic size may reach exactly one thing: the iteration count of a `for_each_tile` loop over that dimension. Every address, stride and buffer extent is built at `M`, and the loop's iteration count is set at launch from the tensor's real size, so one dynamic-shape program serves every size in `[m, M]` that is a multiple of `G` (torch-spyre #5186, split into #5891 merged, #5912 approved, #5917 and a fourth part open). The compile is one Inductor compile at the maximum, not one per size.
+The device buffer is allocated once at `M` rows with the strides of `M`, the real rows are copied in, and the dimension is marked dynamic for Dynamo. The tensor carries the declaration (`reserved_dims`, readable with `get_reserved_dims`) for its life. Nothing changes in the `torch.compile` call: `dynamic=False` stays, and the compiled function states the range with `torch._check` on the dimension and ties any second dynamic tensor to the first.
 
-Limits of the build measured (torch-spyre `43c4150a`: main plus #5179 plus #5186 plus one cross-kernel commit): dim 0 only, `M / G` at most 32 loop iterations (`MAX_BUCKETS`), and the dynamic dimension must be a loop's tile axis and nothing else.
+### 1.2 What the compiler does with it
 
-## 4. Proposal
+Inside a compiled kernel the dynamic size reaches exactly one thing: the iteration count of a `for_each_tile` loop over that dimension. Every address, stride and buffer extent in the program is built at `M`, and the loop's iteration count is set at launch from the tensor's real size. One Inductor compile at the maximum therefore produces one program that serves every size in `[m, M]` that is a multiple of `G`, with no compile for the other sizes. The dynamic dimension must be the loop's tile axis and nothing else: it cannot index a weight, set an output's static extent or decide control flow outside the loop. A reduction along the dimension is fine, as long as it is carried through the loop (an online softmax across pages is the canonical case).
 
-### 4.1 What becomes dynamic
+### 1.3 The rules a caller has to respect
 
-| kernel | dynamic dimension | one program per |
-|---|---|---|
-| per-sequence prefill and decode (head-major) | the page count of the page table and the mask stack | query bucket |
-| batched decode (head-major) | the chunk count of the chunk page index and the chunk mask (pages per chunk pinned at `32 // num_seqs`) | sequence-count bucket |
+- Dimension 0 only, today.
+- `M` is a multiple of `G`, the real size at every call is in `[m, M]` and a multiple of `G`.
+- `M / G` is at most `MAX_BUCKETS`, 32 by default and an environment variable, because every possible iteration is a slot the host sets at launch. Long contexts therefore take several pages per iteration at the default cap unless the cap is raised, which caps of 128 and 256 have shown to work (section 2.5). A cap set per declaration rather than per process is a torch-spyre item.
+- A range of one value is a constant, not a dynamic dimension: one supported size compiles as a static-shape program. Today a range also has to start at two granules; a fix for that is in hand on the torch-spyre side, and until it lands a static companion program covers the one-granule case.
+- The declaration is carried by the declaring transfer and by shallow copies of the tensor. A view that changes sizes or strides, or sits at an offset, is a plain tensor again. The output of a compiled graph does not carry its input's declaration on the current pull requests; carrying it across graph outputs is implemented and under test on the torch-spyre side (section 2.2), and is the one item the encoder cases wait on.
+- A dynamic dimension on a tensor that is also moved with a custom device layout (`device_layout=`) is refused by the current `.to()`; allowing the two together is a torch-spyre item.
 
-Everything else in the kernels keeps a fixed extent, so the dynamic size reaches only the page walk's iteration count. The kernels already walk pages with `for_each_tile`, so the kernel change is small: the operand slice (`[:num_blocks]`) replaced by four `torch._check` statements on the range, and the page body taking a tile of `G` pages.
+### 1.4 Where the torch-spyre work stands
 
-### 4.2 What leaves the plugin
+The compile half (#5186) is being merged as a stack: #5891 merged, #5912 and #5917 open, a fourth part to come. The runtime half, the declaring transfer and the reservation, is #5179. Three more items are in progress or filed on the torch-spyre side: the declaration carried across graph outputs, the layout combination above, and two runtime behaviours found while measuring (a copy of fewer rows than the maximum into a dynamic buffer is far slower than a whole copy, and `resize_` of a dynamic buffer in a custom device layout reads wrong). The plugin can plan around all of them (section 2.6) and none blocks the decoder attention path.
 
-The KV page bucket list and its presets (`SPYRE_ATTN_KV_LADDER`, `SPYRE_ATTN_KV_BUCKETS`), the padding of a request to a page bucket, the (sequences, pages) variant grid of the batched kernel, the per-variant warm-up loops over those grids, and the main reason for the jagged grouping (it exists to avoid padding every sequence to the longest bucket, which exact chunk counts make small). The bucketer keeps the query buckets and the body's row counts. The warm-up and the compile guard stay, with far fewer things to compile and to watch. The V2 runner uses the same warm-up, so nothing here is specific to V1.
+## 2. Where a dynamic dimension pays, and where it does not
 
-### 4.3 How the per-step tensors move to the device
+### 2.1 A per-step tensor that enters a graph and never leaves it
 
-On the current runtime, copying fewer rows than the maximum into a dynamic buffer is about ten times slower than copying the whole buffer. The plugin therefore pads each per-step tensor (page tables, mask stacks, the chunk mask) to the maximum on the host, copies it whole, and resizes the device tensor down to the real count, which moves no data. Measured exact, and 2.8 ms for a 512-query mask stack where the partial copy took 19 ms. Under load this padding is what keeps serving level with today's plugin (section 5.4).
+The simplest and most valuable case. Paged attention takes, every step, a set of host-built tensors whose first dimension is a count that varies per request: the page table and the mask stack of a sequence (one row per KV cache page), and the chunk page index and chunk mask of the batched decode kernel (one row per chunk of pages). Today those counts are rounded up to a bucket, and the plugin compiles one attention program per (query bucket, page bucket) and per (sequence bucket, page bucket), then warms every one of them up. With the page count or the chunk count declared dynamic, the kernel's existing page walk becomes the loop, one program per kernel per query bucket serves every context length, and the programs no longer scale with `max_model_len` or `max_num_seqs`.
 
-### 4.4 Rollout
+What goes away: the KV page bucket list and its presets, the padding of a request to a page bucket, the (sequences, pages) variant grid, the per-variant warm-up loops, and most of the reason for jagged grouping. What a request gains: it pays for its own page count and not for its bucket's, which is what #771, #1060, #942 and #713 ask for in their different ways, and the compile hazards of #1364 shrink to the shapes no range covers. The tensors never cross a graph boundary, so this case needs no propagation of the declaration and works on the current pull requests plus the layout combination.
 
-Behind switches, off by default, in one pull request against the plugin once torch-spyre's pins carry the stack and #5179: `SPYRE_ATTN_SYMBOLIC_PAGES` (the per-sequence kernels), `SPYRE_ATTN_SYMBOLIC_BATCHED` (the batched kernel), `SPYRE_ATTN_SYMBOLIC_PAD_TRANSFER` (the padding of section 4.3), `SPYRE_ATTN_SYMBOLIC_ONE_CHUNK` (a static program for the single-chunk case of the batched kernel, so a lone short request is not padded to two chunks). The plugin's attention device tests pass with them on. The bucket path stays until the switches have run the CI configurations, then the buckets go.
+### 2.2 A batch-like axis that the output keeps
 
-## 5. Evidence
+The encoder cases: a vision tower run over any number of fixed-size units (#1523, CLIP images or Granite Vision tiles), an encoder block graph over any batch width at a fixed sequence length (#1525), and the vision budgets more generally (#1473, with #1524 as the interim with fewer budgets). Here the dynamic dimension is on the hidden state itself, `[units * rows_per_unit, width]` or `[B * L, H]`, nothing reduces across units, and every block's output has the same dynamic dimension as its input. Because the plugin compiles one graph per block, the declaration has to survive a graph boundary, which is the question asked on torch-spyre #43 and the propagation item of section 1.3. Until it lands the options are one graph for the whole tower or waiting; once it lands the pattern is the same as 2.1 with the declaration made once at the tower's input. The range workarounds those issues list, declaring the flattened rows with the unit's row count as the granularity and keeping a static graph for a single unit, are the right ones.
 
-### 5.1 Method
+### 2.3 What not to make dynamic
 
-Everything below was measured with the plugin's own tools on one Spyre card (`vivekmankar-spyre-dev-pf`), one build (torch-spyre `43c4150a`, spyre-inference `1881aa45fa` plus the patch), today's plugin against the same plugin with the switches on, a fresh compile cache for every leg:
+The transformer body's token axis. A dynamic dimension becomes a loop, and in the body that loop runs over rows of a matmul against the weights, so every iteration streams the block's weights again; a decode step is a weight pass already, and a prefill chunk would pay one weight pass per tile instead of one. The body wants one flat row count per phase, bucketed, and the lever there is fewer token buckets by default, which is the plugin's own setting and needs nothing from torch-spyre. The same reasoning covers the sequence count of the batched decode kernel: keep it bucketed (it sets how many pages each chunk holds), and let the chunk count be the dynamic axis.
 
-- Boot and latency: `vllm bench latency`, the first run of each leg from an empty cache gives the engine init time (the boot), the later runs give the latencies (5 iterations after 2 warm-ups for the small benches, 3 after 1 for the large ones). A compile guard at `error` fails any run where a compile leaks into a timed iteration.
-- Serving: `vllm bench serve` against `vllm serve`, 200 random prompts of 1024 tokens plus or minus 80 percent, 128 output tokens, concurrency 32 (equal to `max_num_seqs`, the team's parity rule), prefix caching off.
-- Correctness, before any number is quoted: eight prompts of 1200 to 3900 tokens (four of 5000 to 17000 at 32K) run greedily through the vLLM `LLM` API as one batch and the longest alone, output tokens compared with today's plugin, logprobs recorded.
+### 2.4 Short ranges and the single-size case
 
-Each pair below comes from one run. The plugin's own run-to-run drift between engine starts is 2 to 6 percent, so a difference inside that band is reported as a wash.
+A kernel whose count can be one (a lone short request, a single image) hits the single-size rule: one supported size is a static program, and today a range starts at two granules. Keep a static program for that case beside the dynamic one, chosen by the metadata builder when the real count fits one tile. When the one-granule fix lands the companion goes and the range starts at `G`.
 
-### 5.2 granite-3.3-8b-instruct, bf16: compile time
+### 2.5 Scenario: a long-context deployment and the iteration cap
 
-| configuration | attention programs, today | attention programs, with dynamic | cold boot, today | cold boot, with dynamic | gain |
-|---|---|---|---|---|---|
-| **4096 context, 32 sequences (the epic's first configuration)** | **48** | **8** | **961 s** | **370 s** | **61 percent** |
-| **the same, with the body's decode buckets cut from six to one as well (compile sizes 32 and 512 instead of 1, 2, 4, 8, 16, 32 and 512)** | **48** | **8** | **961 s** | **233 s** | **76 percent** |
-| **4096 context, 64 sequences** | **54** | **9** | **1106 s** | **424 s** | **62 percent** |
-| 32768 context, 4 sequences | 45 | 5 | 751 s | 335 s | 55 percent |
+A deployment at 32K context has many more pages per sequence than the default cap of 32 iterations allows at one page each, so the plugin has to choose a tile of several pages per iteration. That costs twice: the per-iteration program body unrolls the tile's pages and compiles slower, and a short request walks a whole minimum of two tiles whatever its length.
 
-Output tokens were identical to today's plugin in every row (8 prompts at 4096, 4 at 2048, 4 prompts of up to 17K tokens at 32K). The boot gap widens with the sequence count: going from 32 to 64 sequences cost today's plugin 145 s and six more programs, and the dynamic-shape plugin one more program and under a minute. With a populated compile cache the engine start halves too: 25 to 27 s today against 15 to 16 s at 2048, 53 to 55 s against 27 to 30 s at 4096 with 64 sequences.
+The guidance: raise the cap (`MAX_BUCKETS`, an environment variable today) so that one page per iteration fits the longest context, and let the plugin's bucketer derive its tile from that same variable rather than carry its own copy of the cap. Caps of 128 and 256 iterations have been exercised with identical tokens and no observed launch cost, so the number of slots is not the constraint it was assumed to be at these sizes; the per-sequence programs compile faster the smaller the tile, and a request walks only its own pages. What a raised cap does not remove is the padding of the per-step mask stack to the maximum before the copy (section 2.6), which a short prompt in a long deployment still pays; the two ways to remove that are granularity bands (a short list of ranges with one program each, so a short request moves a short mask) and a mask built on the device from the sequence lengths, which is the plugin's kernel design to decide. Test at the chosen cap: tokens at the minimum, the maximum and a size just above a former bucket boundary, and the launch cost at the longest context, since the host work per launch does grow with the slot count and larger programs or tensor-parallel deployments may show it.
 
-### 5.3 granite-3.3-8b-instruct, bf16: run time (`vllm bench latency`, 1100 tokens in, 64 out)
+### 2.6 How to move the per-step tensors
 
-Where the gain is large:
+Until the runtime copies fewer rows than the maximum at the speed of a whole copy, pad each per-step tensor to the maximum on the host, move it whole, and `resize_` the device tensor down to the real count, which moves no data and is exact in the default device layout. Do not `resize_` a dynamic buffer that carries a custom device layout; keep the partial copy for that one tensor. Between two compiled graphs, pass outputs as they are or as shallow copies; a reshape that changes strides drops the declaration.
 
-| configuration and bench | today | with dynamic | gain |
-|---|---|---|---|
-| **4096 with 64 sequences, decode step at 64 sequences** | **473 ms** | **380 ms** | **20 percent** |
-| **4096 with 32 sequences, decode step at 32 sequences** | **298 ms** | **258 ms** | **13 percent** (two engines, the morning's and the evening's) |
-| **32768 with 4 sequences, prefill of 9K to 31K prompts** | | | **10 to 18 percent** |
-| 4096 with 64 sequences, 64-sequence generation of 64 tokens | 81.8 s | 74.1 s | 9 percent |
+## 3. What would change in spyre-inference
 
-The gain is fewer pages walked: at full batch the attention step reads the real page count instead of the bucket's, and the larger the batch, the larger the share of the step that attention is. Every other bench is level or better, inside or just above the plugin's own run-to-run band: the 64-sequence prefill 3 percent faster, 8 sequences 2.5 percent faster, the 32K decode step 7 to 9 percent faster between page buckets and flat at a bucket boundary, 1 sequence equal (a short-context decode step is a weight pass and does not move), and the 512-token prefill within 3 percent.
+Guidance per area, the same for any kernel that adopts the feature.
 
-### 5.4 granite-3.3-8b-instruct, bf16: serving under load (`vllm bench serve`, 4096 context, 32 sequences)
+- **Bucketer.** A declared range per dynamic axis in place of a bucket list: the minimum, the maximum derived from `max_model_len` (and `max_num_seqs` for the batched kernel) and the granularity derived from the cap. The query buckets and the body's row counts stay. One compile point per kernel per range instead of a grid walk.
+- **Metadata builder.** Real counts floored at the range's minimum instead of rounded to a bucket; the per-step tensors built at their real size and moved with the declaration (section 2.6); no host-side slicing of a tensor after it has been declared, since a slice is a view.
+- **Kernels.** The operand slice to the bucket (`[:num_blocks]`) replaced by `torch._check` statements on the declared range, and the page body taking a tile of `G` pages per iteration. The kernels already walk pages with `for_each_tile`, so this is a small change in each.
+- **Warm-up.** One compile per kernel per range instead of one per variant; the recorder stays, with far fewer entries. A dynamic program that fails to compile at warm-up should fail warm-up rather than be deferred to serving, because the compile guard at `error` would otherwise stop the engine on the first request that needs it.
+- **Compile guard.** No change: when the ranges cover every size the engine can see, the guard sees no compile at serving time.
+- **Compile cache.** Fewer and larger entries; the populated-cache start shrinks with the program count. Behaviour across tensor-parallel ranks is to be checked on a multi-card host.
+- **Tests.** Every kernel that adopts a range is run at several sizes across the range, including the minimum, the maximum and a size just above a former bucket boundary, against the static program or CPU, with tokens compared, before any size is served. The plugin's attention device tests run with the switches on.
+- **The V2 runner.** The same recorder and the same seams (#1242 for startup, #1239 for step inputs); nothing in the pattern is specific to V1, and the extract-first rule applies to the shared helpers.
+- **Rollout.** Behind per-kernel switches, off by default: the per-sequence kernels' page axis, the batched kernel's chunk axis, the padded transfer, the single-size companion. The bucket path stays until the switches have run the CI configurations, then the buckets go.
 
-| | today | dynamic |
-|---|---|---|
-| server boot to ready | 1176 s | 379 s |
-| attention programs | 48 | 8 |
-| output throughput | 84.3 tok/s | 83.5 tok/s |
-| TTFT median, p99 | 2337 ms, 26.5 s | 2323 ms, 26.3 s |
-| ITL median, p99 | 345 ms, 443 ms | 355 ms, 435 ms |
+## 4. The order of work, and what can start in parallel
 
-Throughput and latency are a wash under this load, every figure inside the plugin's own run-to-run band. The decode-step gain of 5.3 does not show once prefills of mixed lengths interleave with the decodes. The padding of section 4.3 is what keeps it level: without it the dynamic-shape plugin runs 4 to 11 percent behind under the same load (80.4 tok/s, median ITL 372 ms, a third run the same night).
+On the torch-spyre side: merging the stack (#5912, #5917, the fourth part) and #5179 so the plugin's pin can carry the mechanism; then the layout combination, the declaration across graph outputs, the one-granule minimum, the runtime copy behaviours and the cap. Of these, the decoder attention path needs only the merged stack, #5179 and the layout combination; the encoder path needs the propagation as well.
 
-### 5.5 granite-3.3-8b-instruct-FP8: the same picture on FP8 weights
+On the spyre-inference side, in parallel: the decoder attention path of section 2.1 behind switches, with its tests at every size, is the first thing to build and the one that answers #1515 directly; the body's default token buckets (section 2.3) can be revisited independently of any of this; the encoder work of #1523 and #1525 can be designed now and declared once the propagation lands, with #1524 as the interim. Owners and dates are for the epic to assign.
 
-| 4096 context, 32 sequences | today | with dynamic |
-|---|---|---|
-| cold boot | 1079 s | 494 s |
-| decode step at 32 sequences | 247 ms | 203 ms |
-| 32-sequence generation, 1100 in 64 out | 36.1 s | 32.4 s |
-| 32-sequence prefill | 20.2 s | 19.4 s |
-| 8 sequences, 1100 in 64 out | 12.1 s | 11.7 s |
-| 1 sequence, 1100 in 64 out | 6.23 s | 6.63 s |
-| prefill of 512 tokens | 0.178 s | 0.183 s |
-| correctness | the reference | tokens identical, 8 prompts |
+## 5. Risks and limits
 
-The FP8 checkpoint runs its benches about a third faster than the bf16 one, so attention is a larger share of its step and the gain at full batch is larger: boot 54 percent less, the decode step 18 percent faster at 32 sequences. At one sequence and on the 512-token prefill the two are within a few percent of each other, the small batches being where attention is the smallest share of the step; that run did not have the single-chunk program of section 4.4 on.
-
-### 5.6 granite-3.3-8b-instruct, bf16: the loop iteration cap
-
-The cap of 32 loop iterations sets 8 pages per iteration at 32K. A run of the 32K configuration at caps of 32, 128 and 256 (8, 2 and 1 pages per iteration) is in progress on 5 November, measuring the boot, the long-prompt prefill and correctness at each. Its rows go here when they land. Until then no number is claimed for it.
-
-### 5.7 Other models, each one run, 4096 context with 32 sequences, tokens identical
-
-| model | attention programs, today | with dynamic | cold boot, today | cold boot, with dynamic | boot gain | decode step at 32 sequences |
-|---|---|---|---|---|---|---|
-| **granite-3.3-8b-instruct-FP8** | 48 | 8 | 1079 s | 494 s | 54 percent | **18 percent faster** |
-| granite-4.1-8b | 48 | 8 | 922 s | 379 s | 59 percent | 4 percent faster |
-| granite-4.1-8b-fp8 with the fp8 KV cache (the epic's fourth configuration) | 48 | 8 | 1101 s | 504 s | 54 percent | 9 percent faster |
-| **granite-4.2-8b** | 48 | 8 | 971 s | 422 s | 57 percent | **13 percent faster** |
-| granite-4.2-8b-fp8 | 48 | 8 | 1209 s | 525 s | 57 percent | not quoted, the card faulted during that run |
-| **Ministral-3-14B, with its vision tower** | 48 | 8 | 1231 s | 428 s | **65 percent** | 9 percent faster |
-| **Ministral-3-8B, with its vision tower** | 48 | 8 | 1067 s | 409 s | **62 percent** | 9 percent faster |
-
-Boot is 2.2 to 2.9 times faster on every model tried, the same 48 to 8 programs each time, and the dynamic-shape plugin boots every one of them in 7 to 9 minutes where today's takes 15 to 21.
-
-Against the epic's 8-minute target at TP1, 4096 with 32 sequences: granite-3.3-8b, granite-4.1-8b and granite-4.2-8b are under it with the dynamic-shape attention alone, and the three FP8 checkpoints miss it by 14 to 45 s on the body's token buckets, which this proposal does not touch and which one body bucket brings under it (233 s on bf16).
-
-## 6. What dynamic shapes do not change
-
-- The transformer body. A decode step at short context is a weight pass (137 ms a step for 16 GB of fp16 weights at one sequence), so attention changes do not move it, and time to first token for short prompts likewise. The body's token buckets are where the remaining boot time sits once attention is down to 8 programs: compiling the body at 7 token buckets against 2 is 137 s of the 370 s on the epic's first configuration.
-- The loop iteration cap. A dynamic-shape program is compiled with one slot per possible iteration, and the host sets the iteration count at every launch, so the number of iterations is capped (32 today) and long contexts take several pages per iteration. Finer granularity at 32K is a trade between compile size, padding and launch cost, which section 5.6 measures.
-- Tensor parallel sizes above 1 and the TP4 rows of the epic: not measurable on a one-card pod. For those the program count is the arithmetic (48 attention programs to 8 at any context), not a time.
-- The vision towers and the encoder path: out of scope here, covered by #1523, #1525 and #1473 on the same mechanism (section 7).
-
-## 7. What has to land in torch-spyre first
-
-1. The stack (#5912, #5917, the fourth part) and #5179 merged, so the plugin's pin can carry the mechanism.
-2. A dynamic dimension on a tensor that is also moved with a custom device layout. The batched kernel's chunk page index is moved with `device_layout=` (the plugin's chunk-major layout, so the kernel can gather one chunk's pages at a time), and #5179's `.to()` refuses `dynamic=` and `device_layout=` in the same call. The measurements above used a small Python-side relaxation of that check in the build; the relaxation has to become part of torch-spyre.
-3. Two runtime changes found by this work, both recorded for the runtime owner: a partial copy into a dynamic buffer at the speed of a whole copy (then the padding of section 4.3 becomes unnecessary), and `resize_` of a dynamic buffer that carries a custom device layout.
-4. For the encoder follow-ons only: the dynamic dimension carried across graph outputs, so a chain of per-block graphs keeps it (asked on torch-spyre #43 on 4 November; implemented with tests on the cross-kernel branch, not yet in a pull request). The decoder path in this RFC does not need it, since it marks only per-step tensors that enter a graph and never leave it.
-
-## 8. Alternatives considered
-
-A denser bucket list (#771) adds programs and boot time where this removes them. A populated compile cache (#959) helps restarts, not the first boot of a new configuration, and the dynamic-shape programs make the cache smaller too. Emitting static loops instead of unrolled programs was tested and found equal, so there is no codegen change to make.
+- Correctness at every size in a range is a property to test, not to assume, on every kernel that adopts the feature.
+- The iteration cap constrains long contexts until it moves; the plugin should read the cap from the same environment variable torch-spyre uses rather than carry its own copy.
+- The body is unchanged, so short-context decode and time to first token for short prompts do not change with this work.
+- Tensor-parallel sizes above one have not been exercised with a dynamic dimension.
+- The encoder and vision paths wait on the propagation item.
 
 ## Appendix: the seven questions of #1515
 
-1. **Mechanism.** `tensor.to("spyre", dynamic={dim: {"min", "max", "granularity"}})` on the host tensor, nothing in the `torch.compile` call (`dynamic=False` stays), four `torch._check` statements in the kernel stating the range and tying the two dynamic tensors. Dim 0 only, `max / granularity` at most 32, the dimension must be a loop's tile axis.
-2. **One compile for many buckets.** Yes. One Inductor compile at the maximum per kernel per query bucket, the other buckets are not compiled at all. 25 attention programs to 5 at 2K, 48 to 8 at 4096 with 32 sequences, 45 to 5 at 32K.
-3. **Correctness.** Output tokens identical to today's plugin at every size tried, 2K to 32K, batch and single, greedy with logprobs (largest logprob gap 0.0075), on granite-3.3-8b and five more checkpoints. The kernels are bit-exact against the static ones on the device probe at 2 and 8 pages per iteration.
-4. **Run-time cost.** None in the launch: the dynamic-shape and the static-shape program at the same page count launch in the same time within 1 percent. The cost was in the per-step copy below the maximum, removed by padding before the copy. The gain is fewer pages walked: 7 to 18 percent at long context, 13 to 20 percent a decode step at full batch at 4096, a wash at short context and under the serve load.
-5. **Changes in spyre-inference.** The bucketer (the page range, the chunking, one warm-up compile per kernel), the metadata builder (the real count instead of a bucket, two dynamic transfers, no host slice of a dynamic tensor), the head-major backend (the dynamic chunk index and mask), the three kernels (the range checks and the tile walk), nothing in the `torch.compile` calls, the warm-up and the guard unchanged, about 980 patch lines behind switches. The body buckets keep their own compiles.
-6. **Compile cache.** The dynamic-shape programs hit the kernel cache across restarts (engine start 15 to 16 s against 25 to 27 s at 2K). Across TP ranks not measured, one card.
-7. **Gaps.** The 32-iteration cap at long context, `dynamic=` with `device_layout=`, the slow partial copy, the `resize_` under a custom layout, and the body's token axis, which is not a loop's business.
+1. **Mechanism.** `tensor.to("spyre", dynamic={dim: {"min", "max", "granularity"}})` on the host tensor, nothing in the `torch.compile` call, `torch._check` statements in the kernel. Dimension 0 only, `max / granularity` at most the cap, the dimension must be a loop's tile axis.
+2. **One compile for many buckets.** Yes: one Inductor compile at the maximum per kernel per range; the other sizes are not compiled at all.
+3. **Correctness.** A single compile serves every size in the range with the same results as the static programs when the kernel reduces along the dimension through the loop's carry; it is tested at every size before it is served.
+4. **Run-time cost.** None in the launch for a dynamic-shape program against a static one at the same page count. The cost that exists today is in the per-step copy of fewer rows than the maximum, which the padded transfer avoids. The gain is fewer pages walked at long context and full batch; short-context decode is a weight pass and does not change.
+5. **Changes in spyre-inference.** Section 3: the bucketer, the metadata builder, the kernels' operand checks and tile walk, nothing in the `torch.compile` calls, the recorder and the guard unchanged, behind switches. The body's token buckets keep their own compiles.
+6. **Compile cache.** The dynamic-shape programs hit the kernel cache across restarts like any other; fewer programs, a faster populated-cache start. Across TP ranks, to be checked.
+7. **Gaps.** The iteration cap at long context, `dynamic=` with `device_layout=`, the slow partial copy, `resize_` under a custom layout, the two-granule minimum, the declaration across graph outputs, and the body's token axis, which is not a loop's business.
