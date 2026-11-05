@@ -376,10 +376,10 @@ INTENTIONAL_PROVENANCE_REMAP_PASSES: frozenset[str] = frozenset()
 # Passes that intentionally delete pre-existing buffers without forwarding
 # their provenance. Other removals must leave the removed unit's origins and
 # history on at least one surviving carrier.
-# optimize_shuffling only deletes compiler-generated EA shuffle copies (they carry
+# insert_ea_shuffle only deletes compiler-generated EA shuffle copies (they carry
 # a synthetic origin and no user source line of their own).
 INTENTIONAL_PROVENANCE_REMOVAL_PASSES = frozenset(
-    {"deadcode_elimination", "optimize_shuffling"}
+    {"deadcode_elimination", "insert_ea_shuffle"}
 )
 
 # Warn at most once per pass name per compile to avoid log spam. Reset by the

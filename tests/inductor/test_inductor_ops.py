@@ -9545,17 +9545,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     "fp16 residual rounding blinds the +-1 correction on 1 of "
                     "256 elements at |q|~228, same class as #5605"
                 ),
-                # Mixed fp16/fp32 floor correction on a 1-D tensor: ~55% of
-                # elements are off by one (CPU 0, device 1). The 2d4x64
-                # variants pass, so this is specific to the 1-D layout.
-                "floor_div_fp16_fp32_1d256": (
-                    "mixed fp16/fp32 floor correction on a 1-D tensor returns "
-                    "wrong quotients for ~55% of elements, #TBD"
-                ),
-                "floor_div_fp32_fp16_1d256": (
-                    "mixed fp32/fp16 floor correction on a 1-D tensor returns "
-                    "wrong quotients for ~55% of elements, #TBD"
-                ),
             },
             "param_sets": {
                 "fp16_fp32_1d256": (

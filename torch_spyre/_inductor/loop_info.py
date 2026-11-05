@@ -367,7 +367,7 @@ _SPYRE_METADATA_ATTRS = (
     # since that module imports this one (through pass_utils).
     "_work_division_chosen_with_tiling",
     # Marks an element-arrangement shuffle copy inserted by insert_ea_shuffle;
-    # optimize_shuffling finds them by this tag, and must still see it after any
+    # passes find them by this tag, and must still see it after any
     # rebuild of the buffer (e.g. when its input is redirected).
     "ea_shuffle",
 )

@@ -116,7 +116,6 @@ from .cost_model_pass import CostReport, cost_model_pass
 from .split_multi_ops import split_multi_ops
 from .element_arrangement import (
     insert_ea_shuffle,
-    optimize_shuffling,
     validate_ops,
 )
 
@@ -613,7 +612,6 @@ class CustomPreSchedulingPasses:
             # Decided from the committed layouts, so it follows finalize_layouts
             # (and insert_restickify, which never touches a staggered operand).
             insert_ea_shuffle,
-            optimize_shuffling,
             validate_no_restickify_on_mutation_targets,
             enforce_indirect_access_layout,
             reorder_nonstick_dims_mutation,

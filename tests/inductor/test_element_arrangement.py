@@ -13,9 +13,7 @@
 # limitations under the License.
 
 """
-Tests for ElementArrangement: bidirectional FP16↔FP32 type conversion, the
-shuffle of staggered operands to STANDARD (``insert_ea_shuffle``,
-``optimize_shuffling``) and the read-only ``validate_ops`` check.
+Test bidirectional FP16↔FP32 type conversion with ElementArrangement.
 
 Tests in mode: compile, eager
 FP16 types: FP16, BF16
@@ -38,8 +36,6 @@ from torch._inductor.dependencies import MemoryDep
 from torch._inductor.exc import InductorError
 from torch._inductor.ir import (
     ComputedBuffer,
-    MutationLayoutSHOULDREMOVE,
-    Operation,
     Pointwise,
     Scatter,
 )
@@ -56,8 +52,22 @@ from torch_spyre._inductor.codegen.compute_ops import gen_coord_info_value
 from torch_spyre._inductor.constants import DEVICE_NAME, STAGGERED_EAS
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
 from torch_spyre._inductor.element_arrangement import (
+    EA_SHUFFLE_PATH_ATTR,
+    SHUFFLE_COST,
+    EAPath,
+    ShuffleStep,
+    ea_decision_table,
+    find_cast_to_sink_into,
+    find_chain_source,
+    find_ea_paths,
+    find_existing_shuffle,
+    find_unread_shuffles,
     insert_ea_shuffle,
-    optimize_shuffling,
+    mark_ea_shuffle_path,
+    optimize_ea_path,
+    optimize_ea_step,
+    select_ea_path,
+    shuffle_is_noop,
     validate_ops,
 )
 from torch_spyre._inductor.errors import Unsupported
@@ -707,28 +717,165 @@ def test_pad_of_staggered_inside_stick_pair_raises():
 
 
 # ---------------------------------------------------------------------------
-# Shuffle of staggered operands
+# Shuffle op recording and device-free mock helpers
 # ---------------------------------------------------------------------------
+class _ShuffleRecorder(CustomPreSchedulingPasses):
+    """Pre-scheduling pipeline that records the EA shuffles inserted by the pass."""
+
+    records: dict = {}
+
+    def __init__(self):
+        super().__init__()
+        self.passes = [self._record(p) for p in self.passes]
+
+    @staticmethod
+    def _shuffle_source_dtypes(graph):
+        dtypes = []
+        for op in graph.operations:
+            if not getattr(op, "ea_shuffle", False):
+                continue
+            (src,) = {
+                d.name for d in op.get_read_writes().reads if isinstance(d, MemoryDep)
+            }
+            dtypes.append(graph.get_buffer(src).get_dtype())
+        return dtypes
+
+    @staticmethod
+    def _shuffle_layouts(graph):
+        """``(source layout, shuffle layout)`` of every shuffle copy."""
+        pairs = []
+        for op in graph.operations:
+            if not getattr(op, "ea_shuffle", False):
+                continue
+            (src,) = {
+                d.name for d in op.get_read_writes().reads if isinstance(d, MemoryDep)
+            }
+            pairs.append(
+                (
+                    graph.get_buffer(src).get_layout().device_layout,
+                    op.get_layout().device_layout,
+                )
+            )
+        return pairs
+
+    @classmethod
+    def _record(cls, pass_fn):
+        if pass_fn is not insert_ea_shuffle:
+            return pass_fn
+
+        def wrapped(graph):
+            pass_fn(graph)
+            cls.records["shuffles"] = cls._shuffle_source_dtypes(graph)
+            cls.records["layouts"] = cls._shuffle_layouts(graph)
+
+        wrapped.__name__ = pass_fn.__name__
+        return wrapped
 
 
-class TestEAShuffle:
-    """A multi-arg op mixing STANDARD and staggered operands gets a shuffle.
+def _compile_recording(fn, *args):
+    """Compile ``fn`` and return ``(result, records)`` from ``_ShuffleRecorder``."""
+    _ShuffleRecorder.records = {}
+    torch.compiler.reset()
+    with (
+        inductor_config.patch(force_disable_caches=True),
+        patch.object(passes, "CustomPreSchedulingPasses", _ShuffleRecorder),
+    ):
+        result = torch.compile(fn)(*args)
+    torch.compiler.reset()
+    return result, _ShuffleRecorder.records
 
-    Both staggered arrangements (fp16 -> fp32 gives DL16_TO_FP32, fp32 -> fp16
-    gives FP32_TO_DL16) are met by a STANDARD operand. ``test_ea_shuffle`` covers
-    every shape group on the device with one pointwise op, and
-    ``test_shuffle_pointwise`` covers every pointwise op and chain on one small
-    shape. The remaining tests check the stick coordinate info that codegen
-    emits for a shuffle (``gen_coord_info_value``) on the same shapes, without a
-    device. Inputs are small integers, so device results compare exactly.
+
+def _ea_buf(
+    name, ea=EA.STANDARD, reads=(), dtype=torch.float16, shuffle=False, **attrs
+):
+    """A mock pointwise ``ComputedBuffer`` of shape (4, 128) in arrangement ``ea``.
+
+    ``attrs`` override attributes of the mock (``data``, ``loop_info``, ...);
+    ``broadcast=True`` makes the stick a broadcast (``stride_map[-1] == -1``).
     """
+    broadcast = attrs.pop("broadcast", False)
+    stl = SpyreTensorLayout([4, 128], dtype).with_element_arrangement(ea)
+    if broadcast:
+        stl = SpyreTensorLayout(
+            device_size=list(stl.device_size),
+            stride_map=[*stl.stride_map[:-1], -1],
+            device_dtype=stl.device_dtype,
+            element_arrangement=ea,
+        )
+    op = MagicMock(spec=ComputedBuffer)
+    op.layout = FixedTiledLayout(torch.device("spyre"), dtype, [4, 128], [128, 1], stl)
+    op.data = MagicMock(spec=Pointwise)
+    op.loop_info = None
+    op._read_copy_elision_record = None
+    op.ea_shuffle = shuffle
+    op.reads = list(reads)
+    op.get_name.return_value = name
+    op.get_layout.side_effect = lambda: op.layout
+    op.get_dtype.return_value = dtype
+    op.get_read_names.side_effect = lambda: list(op.reads)
+    op.get_read_writes.side_effect = lambda: SimpleNamespace(
+        reads=[MemoryDep(r, sympy.Integer(0), (), ()) for r in op.reads],
+        writes=[MemoryDep(name, sympy.Integer(0), (), ())],
+    )
+    for key, value in attrs.items():
+        setattr(op, key, value)
+    return op
 
-    # Shape groups. Every shape is distinct; a group is kept small by taking one
-    # representative per rank and per stick-count class.
-    #
-    # STICK_ONLY_SHAPES (module level, shared with test_roundtrip_stick_only_shape)
-    # hold a scalar or all size-1 dims.
 
+def _fake_graph(ops, outputs=()):
+    """A device-free stand-in for ``GraphLowering`` over the mock ops ``ops``."""
+    graph = SimpleNamespace(
+        operations=list(ops), removed_buffers=set(), graph_inputs={}
+    )
+    graph.get_output_names = lambda: list(outputs)
+    graph.get_buffer = lambda n: next(o for o in graph.operations if o.get_name() == n)
+    return graph
+
+
+@pytest.fixture
+def ea_mocks(monkeypatch):
+    """Replace the graph-editing helpers of ``element_arrangement`` with mocks."""
+
+    def fake_insert_shuffle_op(graph, src_name, target_ea, before_op=None):
+        shuffle = _ea_buf(f"shuffle_of_{src_name}", target_ea, [src_name], shuffle=True)
+        if before_op is not None and before_op in graph.operations:
+            graph.operations.insert(graph.operations.index(before_op), shuffle)
+        else:
+            graph.operations.append(shuffle)
+        return shuffle
+
+    def fake_redirect(op, name_map, operations, **_):
+        op.reads = [name_map.get(r, r) for r in op.reads]
+        return op
+
+    monkeypatch.setattr(
+        element_arrangement, "_insert_shuffle_op", fake_insert_shuffle_op
+    )
+    monkeypatch.setattr(
+        element_arrangement, "redirect_computed_buffer_reads", fake_redirect
+    )
+    monkeypatch.setattr(
+        element_arrangement, "indirect_info_from_op", lambda op: (set(), {}, None)
+    )
+
+
+@pytest.fixture
+def run_pass(ea_mocks):
+    """``run_pass(pass_fn, ops, outputs=())`` runs a pass on a fake graph and
+    returns the ``(name, reads)`` of the operations left in it."""
+
+    def run(pass_fn, ops, outputs=()):
+        graph = _fake_graph(ops, outputs)
+        pass_fn(graph)
+        return [(op.get_name(), op.reads) for op in graph.operations]
+
+    return run
+
+
+# ---------------------------------------------------------------------------
+# Shuffle op correctness verification to apply or restore element arrangement
+# ---------------------------------------------------------------------------
+class TestEAShuffle:
     # The stick dim is a whole number of 64-element sticks.
     _STICK_ALIGNED_SHAPES = [
         (64,),
@@ -909,8 +1056,6 @@ class TestEAShuffle:
         sticks = -(-size // 32)
         return [(4, 1), (8, 8), (2, 4), (sticks // 2, 64)]
 
-    # -- on the device -----------------------------------------------------
-
     @pytest.mark.parametrize(
         "fp16",
         DtypeOpTable.fp16_types(),
@@ -969,8 +1114,6 @@ class TestEAShuffle:
 
         assert_ea(result, EA.STANDARD)
         assert torch.equal(result.cpu(), fn(x, y))
-
-    # -- stick coordinate info of a shuffle (no device) --------------------
 
     @pytest.mark.parametrize("nsplits", [1, 4])
     @pytest.mark.parametrize("ea, shape", _SHUFFLE_CASES)
@@ -1061,394 +1204,6 @@ class TestEAShuffle:
         with pytest.raises(Unsupported, match="not defined for"):
             self._coord_info(128, 1, eps, ea)
 
-
-# ---------------------------------------------------------------------------
-# Shuffle optimization (optimize_shuffling)
-# ---------------------------------------------------------------------------
-class _ShuffleRecorder(CustomPreSchedulingPasses):
-    """Pre-scheduling pipeline that records the EA shuffles around the pass.
-
-    ``records["before"]`` is taken right after ``insert_ea_shuffle`` (what it
-    inserted) and ``records["after"]`` right after ``optimize_shuffling``. Each
-    is the list of source dtypes, one entry per shuffle copy.
-    """
-
-    records: dict = {}
-
-    def __init__(self):
-        super().__init__()
-        self.passes = [self._record(p) for p in self.passes]
-
-    @staticmethod
-    def _shuffle_source_dtypes(graph):
-        dtypes = []
-        for op in graph.operations:
-            if not getattr(op, "ea_shuffle", False):
-                continue
-            (src,) = {
-                d.name for d in op.get_read_writes().reads if isinstance(d, MemoryDep)
-            }
-            dtypes.append(graph.get_buffer(src).get_dtype())
-        return dtypes
-
-    @staticmethod
-    def _shuffle_layouts(graph):
-        """``(source layout, shuffle layout)`` of every shuffle copy."""
-        pairs = []
-        for op in graph.operations:
-            if not getattr(op, "ea_shuffle", False):
-                continue
-            (src,) = {
-                d.name for d in op.get_read_writes().reads if isinstance(d, MemoryDep)
-            }
-            pairs.append(
-                (
-                    graph.get_buffer(src).get_layout().device_layout,
-                    op.get_layout().device_layout,
-                )
-            )
-        return pairs
-
-    @classmethod
-    def _record(cls, pass_fn):
-        key = {insert_ea_shuffle: "before", optimize_shuffling: "after"}.get(pass_fn)
-        if key is None:
-            return pass_fn
-
-        def wrapped(graph):
-            pass_fn(graph)
-            cls.records[key] = cls._shuffle_source_dtypes(graph)
-            if key == "before":
-                cls.records["layouts"] = cls._shuffle_layouts(graph)
-
-        wrapped.__name__ = pass_fn.__name__
-        return wrapped
-
-
-def _compile_recording(fn, *args):
-    """Compile ``fn`` and return ``(result, records)`` from ``_ShuffleRecorder``."""
-    _ShuffleRecorder.records = {}
-    torch.compiler.reset()
-    with (
-        inductor_config.patch(force_disable_caches=True),
-        patch.object(passes, "CustomPreSchedulingPasses", _ShuffleRecorder),
-    ):
-        result = torch.compile(fn)(*args)
-    torch.compiler.reset()
-    return result, _ShuffleRecorder.records
-
-
-# ---------------------------------------------------------------------------
-# Device-free graphs for insert_ea_shuffle / optimize_shuffling
-#
-# The passes run on committed layouts only, so a graph of mock ``ComputedBuffer``
-# ops with real ``FixedTiledLayout``s is enough. Only the IR rewrites (inserting
-# the shuffle copy, re-pointing a reader) are replaced by a fake that edits the
-# ``reads`` list of the mock op; tests assert the resulting ``(name, reads)``.
-# ---------------------------------------------------------------------------
-def _ea_buf(
-    name, ea=EA.STANDARD, reads=(), dtype=torch.float16, shuffle=False, **attrs
-):
-    """A mock pointwise ``ComputedBuffer`` of shape (4, 128) in arrangement ``ea``.
-
-    ``attrs`` override attributes of the mock (``data``, ``loop_info``, ...);
-    ``broadcast=True`` makes the stick a broadcast (``stride_map[-1] == -1``).
-    """
-    broadcast = attrs.pop("broadcast", False)
-    stl = SpyreTensorLayout([4, 128], dtype).with_element_arrangement(ea)
-    if broadcast:
-        stl = SpyreTensorLayout(
-            device_size=list(stl.device_size),
-            stride_map=[*stl.stride_map[:-1], -1],
-            device_dtype=stl.device_dtype,
-            element_arrangement=ea,
-        )
-    op = MagicMock(spec=ComputedBuffer)
-    op.layout = FixedTiledLayout(torch.device("spyre"), dtype, [4, 128], [128, 1], stl)
-    op.data = MagicMock(spec=Pointwise)
-    op.loop_info = None
-    op._read_copy_elision_record = None
-    op.ea_shuffle = shuffle
-    op.reads = list(reads)
-    op.get_name.return_value = name
-    op.get_layout.side_effect = lambda: op.layout
-    op.get_dtype.return_value = dtype
-    op.get_read_names.side_effect = lambda: list(op.reads)
-    op.get_read_writes.side_effect = lambda: SimpleNamespace(
-        reads=[MemoryDep(r, sympy.Integer(0), (), ()) for r in op.reads],
-        writes=[MemoryDep(name, sympy.Integer(0), (), ())],
-    )
-    for key, value in attrs.items():
-        setattr(op, key, value)
-    return op
-
-
-@pytest.fixture
-def run_pass(monkeypatch):
-    """``run_pass(pass_fn, ops, outputs=())`` runs a pass on a fake graph and
-    returns the ``(name, reads)`` of the operations left in it."""
-
-    def fake_insert_shuffle_op(graph, src_name, target_ea, before_op):
-        shuffle = _ea_buf(f"shuffle_of_{src_name}", target_ea, [src_name], shuffle=True)
-        graph.operations.insert(graph.operations.index(before_op), shuffle)
-        return shuffle
-
-    def fake_redirect(op, name_map, operations, **_):
-        op.reads = [name_map.get(r, r) for r in op.reads]
-        return op
-
-    monkeypatch.setattr(
-        element_arrangement, "_insert_shuffle_op", fake_insert_shuffle_op
-    )
-    monkeypatch.setattr(
-        element_arrangement, "redirect_computed_buffer_reads", fake_redirect
-    )
-    monkeypatch.setattr(
-        element_arrangement, "indirect_info_from_op", lambda op: (set(), {}, None)
-    )
-
-    def run(pass_fn, ops, outputs=()):
-        graph = SimpleNamespace(
-            operations=list(ops), removed_buffers=set(), graph_inputs={}
-        )
-        graph.get_output_names = lambda: list(outputs)
-        graph.get_buffer = lambda n: next(
-            o for o in graph.operations if o.get_name() == n
-        )
-        pass_fn(graph)
-        return [(op.get_name(), op.reads) for op in graph.operations]
-
-    return run
-
-
-class TestOptimizeShuffling:
-    """``optimize_shuffling`` removes or cheapens the shuffles
-    ``insert_ea_shuffle`` adds.
-
-    The structural assertions look at the IR between ``insert_ea_shuffle`` and
-    ``optimize_shuffling``; each test also checks the numerical result.
-    """
-
-    SHAPE = (4, 128)
-
-    @staticmethod
-    def _run_recording(fn, *args):
-        """Compile ``fn``; return ``(result, before, after)`` shuffle source dtypes."""
-        result, records = _compile_recording(fn, *args)
-        return result, records["before"], records["after"]
-
-    def test_no_shuffle(self):
-        """Operands that share one arrangement need no shuffle at all."""
-
-        def fn(x, y):
-            return x.to(torch.float32) + y.to(torch.float32)
-
-        x = cached_randn(self.SHAPE, dtype=torch.float16)
-        y = cached_randn(self.SHAPE, dtype=torch.float16)
-
-        result, before, after = self._run_recording(
-            fn, x.to(DEVICE_NAME), y.to(DEVICE_NAME)
-        )
-
-        assert before == [] and after == []
-        assert_val(fn, (x, y), result, rtol=1e-2, atol=1e-2)
-
-    def test_shuffle_kept(self):
-        """A staggered fp16 operand meeting a STANDARD one still needs its shuffle."""
-
-        def fn(x, y):
-            return x.to(torch.float16) + y
-
-        x = cached_randn(self.SHAPE, dtype=torch.float32)
-        y = cached_randn(self.SHAPE, dtype=torch.float16)
-
-        result, before, after = self._run_recording(
-            fn, x.to(DEVICE_NAME), y.to(DEVICE_NAME)
-        )
-
-        # The shuffle reads the fp32 -> fp16 cast; a downcast has no narrower
-        # input to move the shuffle onto, so it is neither removed nor rewritten.
-        assert before == [torch.float16]
-        assert after == [torch.float16]
-        assert_ea(result, EA.STANDARD)
-        assert_val(fn, (x, y), result, rtol=1e-2, atol=1e-2)
-
-    def test_sink_through_upcast(self):
-        """``fp16 -> fp32`` then a shuffle becomes a shuffle of the fp16 input."""
-
-        def fn(x, y):
-            return (x.to(torch.float32) + y) * 2.0
-
-        x = cached_randn(self.SHAPE, dtype=torch.float16)
-        y = cached_randn(self.SHAPE, dtype=torch.float32)
-
-        result, before, after = self._run_recording(
-            fn, x.to(DEVICE_NAME), y.to(DEVICE_NAME)
-        )
-
-        # Before: the staggered fp32 cast output is shuffled (4 B/element).
-        # After: the fp16 input is shuffled and the cast itself restores STANDARD.
-        assert before == [torch.float32]
-        assert after == [torch.float16]
-        assert_ea(result, EA.STANDARD)
-        assert_val(fn, (x, y), result, rtol=1e-2, atol=1e-2)
-
-    def test_merge_duplicates(self):
-        """Two consumers of one staggered value share a single shuffle."""
-
-        def fn(x, y):
-            a = x.to(torch.float16)
-            return a + y, a * y
-
-        x = cached_randn(self.SHAPE, dtype=torch.float32)
-        y = cached_randn(self.SHAPE, dtype=torch.float16)
-
-        (r1, r2), before, after = self._run_recording(
-            fn, x.to(DEVICE_NAME), y.to(DEVICE_NAME)
-        )
-
-        assert len(before) >= len(after) == 1
-        for r, ref in zip((r1, r2), fn(x, y)):
-            assert_ea(r, EA.STANDARD)
-            torch.testing.assert_close(r.cpu(), ref, rtol=1e-2, atol=1e-2)
-
-    @staticmethod
-    def _shuffle(name, src, ea=EA.STANDARD, **kwargs):
-        return _ea_buf(name, ea, [src], shuffle=True, **kwargs)
-
-    def test_dead(self, run_pass):
-        ops = [_ea_buf("a", EA.DL16_TO_FP32), self._shuffle("s", "a")]
-        assert run_pass(optimize_shuffling, ops) == [("a", [])]
-
-    def test_dead_output_kept(self, run_pass):
-        ops = [_ea_buf("a", EA.DL16_TO_FP32), self._shuffle("s", "a")]
-        assert run_pass(optimize_shuffling, ops, outputs=["s"]) == [
-            ("a", []),
-            ("s", ["a"]),
-        ]
-
-    def test_noop(self, run_pass):
-        """The source already has the target layout, so readers read it."""
-        ops = [
-            _ea_buf("a"),
-            self._shuffle("s", "a"),
-            _ea_buf("out", EA.STANDARD, ["s"]),
-        ]
-        assert run_pass(optimize_shuffling, ops, outputs=["out"]) == [
-            ("a", []),
-            ("out", ["a"]),
-        ]
-
-    def test_required_kept(self, run_pass):
-        ops = [
-            _ea_buf("a", EA.DL16_TO_FP32),
-            self._shuffle("s", "a"),
-            _ea_buf("out", EA.STANDARD, ["s"]),
-        ]
-        assert run_pass(optimize_shuffling, ops, outputs=["out"]) == [
-            ("a", []),
-            ("s", ["a"]),
-            ("out", ["s"]),
-        ]
-
-    def test_chain_cancels(self, run_pass):
-        """``STANDARD -> staggered -> STANDARD`` leaves no shuffle."""
-        ops = [
-            _ea_buf("a"),
-            self._shuffle("s1", "a", EA.DL16_TO_FP32),
-            self._shuffle("s2", "s1"),
-            _ea_buf("out", EA.STANDARD, ["s2"]),
-        ]
-        assert run_pass(optimize_shuffling, ops, outputs=["out"]) == [
-            ("a", []),
-            ("out", ["a"]),
-        ]
-
-    def test_chain_collapses(self, run_pass):
-        """``A -> B -> C`` through two shuffles becomes ``A -> C``."""
-        ops = [
-            _ea_buf("a", EA.FP32_TO_DL16),
-            self._shuffle("s1", "a", EA.DL16_TO_FP32),
-            self._shuffle("s2", "s1"),
-            _ea_buf("out", EA.STANDARD, ["s2"]),
-        ]
-        result = run_pass(optimize_shuffling, ops, outputs=["out"])
-        assert ("s2", ["a"]) in result and "s1" not in dict(result)
-
-    def test_dup_merged(self, run_pass):
-        ops = [
-            _ea_buf("a", EA.DL16_TO_FP32),
-            self._shuffle("s1", "a"),
-            self._shuffle("s2", "a"),
-            _ea_buf("out1", EA.STANDARD, ["s1"]),
-            _ea_buf("out2", EA.STANDARD, ["s2"]),
-        ]
-        result = dict(run_pass(optimize_shuffling, ops, outputs=["out1", "out2"]))
-        assert result["out1"] == result["out2"] == ["s1"]
-        assert "s2" not in result
-
-    def test_upcast_sunk(self, run_pass):
-        """``x(fp16) -upcast-> s -shuffle-> t`` shuffles the narrow ``x`` instead."""
-        fp32 = torch.float32
-        ops = [
-            _ea_buf("x"),
-            _ea_buf("s", EA.DL16_TO_FP32, ["x"], dtype=fp32),
-            self._shuffle("t", "s", dtype=fp32),
-            _ea_buf("out", EA.STANDARD, ["t"], dtype=fp32),
-        ]
-        result = run_pass(optimize_shuffling, ops, outputs=["out"])
-        names = dict(result)
-        assert "t" not in names and "shuffle_of_x" in names
-
-    @pytest.mark.parametrize(
-        "attrs",
-        [
-            {"layout": MagicMock(spec=MutationLayoutSHOULDREMOVE)},
-            {"data": MagicMock(spec=Scatter)},
-            {"loop_info": object()},
-            {"_read_copy_elision_record": object()},
-        ],
-        ids=["mutation", "scatter", "coarse_tiled", "copy_elision"],
-    )
-    def test_unredirectable_reader(self, run_pass, attrs):
-        """A no-op shuffle stays if one of its readers cannot be re-pointed."""
-        ops = [
-            _ea_buf("a"),
-            self._shuffle("s", "a"),
-            _ea_buf("ok", EA.STANDARD, ["s"]),
-            _ea_buf("bad", EA.STANDARD, ["s"], **attrs),
-        ]
-        result = dict(run_pass(optimize_shuffling, ops, outputs=["ok", "bad"]))
-        assert result["s"] == ["a"] and result["ok"] == ["s"]
-
-    def test_reader_reads_source(self, run_pass):
-        """Renaming would merge two reads of one op, so the shuffle stays."""
-        ops = [
-            _ea_buf("a"),
-            self._shuffle("s", "a"),
-            _ea_buf("out", EA.STANDARD, ["s", "a"]),
-        ]
-        result = dict(run_pass(optimize_shuffling, ops, outputs=["out"]))
-        assert result["s"] == ["a"] and result["out"] == ["s", "a"]
-
-    def test_non_computed_reader(self, run_pass):
-        extern = MagicMock(spec=Operation)
-        extern.reads = ["s"]
-        extern.get_name = lambda: "ext"
-        extern.get_read_writes = lambda: SimpleNamespace(
-            reads=[MemoryDep("s", sympy.Integer(0), (), ())], writes=[]
-        )
-        ops = [_ea_buf("a"), self._shuffle("s", "a"), extern]
-        result = dict(run_pass(optimize_shuffling, ops, outputs=["ext"]))
-        assert result["s"] == ["a"] and result["ext"] == ["s"]
-
-
-# ---------------------------------------------------------------------------
-# insert_ea_shuffle: exactness on device and the geometry of the inserted copy
-# ---------------------------------------------------------------------------
-class TestInsertEAShuffle:
-    """Mixed staggered/STANDARD pointwise ops compile and match CPU exactly."""
-
     @staticmethod
     def _staggered_add(a, b):
         """``a`` (fp16) upcast to a staggered fp32 meets the STANDARD fp32 ``b``."""
@@ -1505,22 +1260,23 @@ class TestInsertEAShuffle:
         self._assert_exact_on_device(fn, a, b)
 
     def test_shuffle_geometry(self):
-        """The copy has the committed input layout, only the arrangement changes."""
+        """The copy has the committed input layout, only the arrangement changes.
+
+        The shuffle sinks through the upcast: the narrow STANDARD fp16 input is
+        shuffled into the staggered arrangement whose cast yields STANDARD.
+        """
         a, b = self._staggered_add_inputs((4, 128))
         _, records = _compile_recording(
             self._staggered_add, a.to(DEVICE_NAME), b.to(DEVICE_NAME)
         )
         assert records["layouts"], "no shuffle was inserted"
         for src, shuffle in records["layouts"]:
-            assert src.element_arrangement in STAGGERED_EAS
-            assert shuffle.element_arrangement == EA.STANDARD
+            assert src.element_arrangement == EA.STANDARD
+            assert shuffle.element_arrangement in STAGGERED_EAS
             assert list(shuffle.device_size) == list(src.device_size)
             assert list(shuffle.stride_map) == list(src.stride_map)
             assert shuffle.device_dtype == src.device_dtype
 
-    # The fp32 widths and the odd-pair backend failures are covered by
-    # TestEAShuffle. Here the shuffle's input and output land in different
-    # memories (one in LX, one in HBM) when the LX planner cannot fit both.
     WIDE_SHAPES = [(64, 151936), (2, 128256)]
 
     @pytest.mark.parametrize(
@@ -1541,16 +1297,23 @@ class TestInsertEAShuffle:
             )
 
     @pytest.mark.parametrize(
-        "in_ea, out_ea, kwargs, shuffled",
+        "in_ea, out_ea, kwargs, expected",
         [
-            (EA.DL16_TO_FP32, EA.STANDARD, {}, True),
-            (EA.FP32_TO_DL16, EA.STANDARD, {}, True),
+            (EA.DL16_TO_FP32, EA.STANDARD, {}, ["shuffle_of_a", "b"]),
+            (EA.FP32_TO_DL16, EA.STANDARD, {}, ["shuffle_of_a", "b"]),
             # A broadcast stick reads one element of the stick: order is moot.
-            (EA.DL16_TO_FP32, EA.STANDARD, {"broadcast": True}, False),
-            (EA.STANDARD, EA.STANDARD, {}, False),
-            # The op itself produces a staggered result: nothing to restore.
-            (EA.DL16_TO_FP32, EA.DL16_TO_FP32, {}, False),
-            (EA.DL16_TO_FP32, EA.FP32_TO_DL16, {}, False),
+            (EA.DL16_TO_FP32, EA.STANDARD, {"broadcast": True}, ["a", "b"]),
+            (EA.STANDARD, EA.STANDARD, {}, ["a", "b"]),
+            # A staggered output makes the op run staggered: flip the STANDARD operand.
+            (EA.DL16_TO_FP32, EA.DL16_TO_FP32, {}, ["a", "shuffle_of_b"]),
+            # Three targets cost the same; the one that keeps the output layout
+            # (no output shuffle) wins, so both operands are flipped to it.
+            (
+                EA.DL16_TO_FP32,
+                EA.FP32_TO_DL16,
+                {},
+                ["shuffle_of_a", "shuffle_of_b"],
+            ),
         ],
         ids=[
             "dl16_to_fp32",
@@ -1561,27 +1324,44 @@ class TestInsertEAShuffle:
             "staggered_output_other",
         ],
     )
-    def test_operand(self, run_pass, in_ea, out_ea, kwargs, shuffled):
+    def test_operand(self, run_pass, in_ea, out_ea, kwargs, expected):
         ops = [
             _ea_buf("a", in_ea, **kwargs),
             _ea_buf("b"),
             _ea_buf("out", out_ea, ["a", "b"]),
         ]
         reads = dict(run_pass(insert_ea_shuffle, ops))
-        assert reads["out"] == (["shuffle_of_a", "b"] if shuffled else ["a", "b"])
+        assert reads["out"] == expected
 
     def test_single_operand(self, run_pass):
         ops = [_ea_buf("a", EA.DL16_TO_FP32), _ea_buf("out", EA.STANDARD, ["a"])]
         assert dict(run_pass(insert_ea_shuffle, ops))["out"] == ["a"]
 
-    def test_both_staggered(self, run_pass):
+    def test_both_staggered_output_shuffled(self, run_pass):
+        """Running the op staggered and shuffling its result (1 shuffle) beats
+        flipping both operands (2 shuffles); readers see the shuffled result."""
+        ops = [
+            _ea_buf("a", EA.DL16_TO_FP32),
+            _ea_buf("b", EA.DL16_TO_FP32),
+            _ea_buf("out", EA.STANDARD, ["a", "b"]),
+            _ea_buf("use", EA.STANDARD, ["out"]),
+        ]
+        reads = dict(run_pass(insert_ea_shuffle, ops))
+        assert reads["out"] == ["a", "b"]
+        assert reads["shuffle_of_out"] == ["out"]
+        assert reads["use"] == ["shuffle_of_out"]
+        assert ops[2].layout.device_layout.element_arrangement == EA.DL16_TO_FP32
+
+    def test_both_staggered_graph_output(self, run_pass):
+        """A graph output keeps its EA, so the operands are flipped instead."""
         ops = [
             _ea_buf("a", EA.DL16_TO_FP32),
             _ea_buf("b", EA.DL16_TO_FP32),
             _ea_buf("out", EA.STANDARD, ["a", "b"]),
         ]
-        reads = dict(run_pass(insert_ea_shuffle, ops))
+        reads = dict(run_pass(insert_ea_shuffle, ops, outputs=["out"]))
         assert reads["out"] == ["shuffle_of_a", "shuffle_of_b"]
+        assert ops[2].layout.device_layout.element_arrangement == EA.STANDARD
 
     @expects_raise
     def test_coarse_tiled_raises(self, run_pass):
@@ -1592,6 +1372,519 @@ class TestInsertEAShuffle:
         ]
         with pytest.raises(Unsupported, match="coarse-tiled loop"):
             run_pass(insert_ea_shuffle, ops)
+
+
+# ---------------------------------------------------------------------------
+# Stage 1: find all paths
+# ---------------------------------------------------------------------------
+class TestEAPaths:
+    @staticmethod
+    def _by_target(paths):
+        return {p.target_ea: p for p in paths}
+
+    def test_decision_table_standard_output(self):
+        """Mixed operands, STANDARD output: flip the staggered one, or flip the
+        STANDARD one and shuffle the result back."""
+        paths = self._by_target(
+            ea_decision_table({"a": EA.DL16_TO_FP32, "b": EA.STANDARD}, EA.STANDARD)
+        )
+        assert set(paths) == {EA.STANDARD, EA.DL16_TO_FP32}
+        std, stag = paths[EA.STANDARD], paths[EA.DL16_TO_FP32]
+        assert list(std.input_steps) == ["a"] and std.output_step is None
+        assert list(stag.input_steps) == ["b"]
+        assert (stag.output_step.from_ea, stag.output_step.target_ea) == (
+            EA.DL16_TO_FP32,
+            EA.STANDARD,
+        )
+        # Stage 1 prices every step as a full "insert".
+        assert std.cost == SHUFFLE_COST and stag.cost == 2 * SHUFFLE_COST
+        assert all(s.kind == "insert" for p in (std, stag) for s in p.steps)
+
+    def test_decision_table_staggered_output(self):
+        """A target equal to the committed output EA needs no output shuffle."""
+        paths = self._by_target(
+            ea_decision_table(
+                {"a": EA.DL16_TO_FP32, "b": EA.STANDARD}, EA.DL16_TO_FP32, "out"
+            )
+        )
+        assert paths[EA.DL16_TO_FP32].output_step is None
+        out_step = paths[EA.STANDARD].output_step
+        assert out_step.src == "out" and out_step.target_ea == EA.DL16_TO_FP32
+
+    def test_decision_table_same_ea(self):
+        (path,) = ea_decision_table({"a": EA.STANDARD, "b": EA.STANDARD}, EA.STANDARD)
+        assert path.steps == [] and path.cost == 0
+
+    def test_find_ea_paths(self, ea_mocks):
+        ops = [
+            _ea_buf("a", EA.DL16_TO_FP32),
+            _ea_buf("b"),
+            _ea_buf("out", EA.STANDARD, ["a", "b"]),
+        ]
+        graph = _fake_graph(ops)
+        paths = find_ea_paths(graph, ops[2])
+        assert {p.target_ea for p in paths} == {EA.STANDARD, EA.DL16_TO_FP32}
+        assert all(p.op is ops[2] for p in paths)
+
+    def test_find_ea_paths_keeps_graph_output_ea(self, ea_mocks):
+        """A path that shuffles a graph output would change its EA: dropped."""
+        ops = [
+            _ea_buf("a", EA.DL16_TO_FP32),
+            _ea_buf("b"),
+            _ea_buf("out", EA.STANDARD, ["a", "b"]),
+        ]
+        paths = find_ea_paths(_fake_graph(ops), ops[2], outputs={"out"})
+        assert [p.target_ea for p in paths] == [EA.STANDARD]
+
+    def test_find_ea_paths_single_operand(self, ea_mocks):
+        ops = [_ea_buf("a", EA.DL16_TO_FP32), _ea_buf("out", EA.STANDARD, ["a"])]
+        assert find_ea_paths(_fake_graph(ops), ops[1]) == []
+
+    def test_find_ea_paths_unshuffleable_ea(self, ea_mocks):
+        ops = [
+            _ea_buf("a", EA.EXX2),
+            _ea_buf("b"),
+            _ea_buf("out", EA.STANDARD, ["a", "b"]),
+        ]
+        assert find_ea_paths(_fake_graph(ops), ops[2]) == []
+
+    def test_find_ea_paths_indirect_same_ea(self, ea_mocks):
+        ops = [
+            _ea_buf("a", EA.DL16_TO_FP32),
+            _ea_buf("b", EA.DL16_TO_FP32),
+            _ea_buf("out", EA.DL16_TO_FP32, ["a", "b"], data=MagicMock(spec=Scatter)),
+        ]
+        assert find_ea_paths(_fake_graph(ops), ops[2]) == []
+
+    @expects_raise
+    def test_find_ea_paths_indirect_mixed_raises(self, ea_mocks):
+        ops = [
+            _ea_buf("a", EA.DL16_TO_FP32),
+            _ea_buf("b"),
+            _ea_buf("out", EA.STANDARD, ["a", "b"], data=MagicMock(spec=Scatter)),
+        ]
+        with pytest.raises(Unsupported, match="indirect access op"):
+            find_ea_paths(_fake_graph(ops), ops[2])
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: rules that remove or minimize shuffles
+# ---------------------------------------------------------------------------
+class TestEAOptimizationRules:
+    @staticmethod
+    def _shuffle(name, src, ea=EA.STANDARD, **kwargs):
+        return _ea_buf(name, ea, [src], shuffle=True, **kwargs)
+
+    def test_find_unread_shuffles(self):
+        ops = [_ea_buf("a"), self._shuffle("s", "a")]
+        dead = find_unread_shuffles(_fake_graph(ops))
+        assert [d.get_name() for d in dead] == ["s"]
+
+    def test_find_unread_shuffles_skips_read_and_outputs(self):
+        ops = [
+            _ea_buf("a"),
+            self._shuffle("s", "a"),
+            _ea_buf("c", EA.STANDARD, ["s"]),
+            self._shuffle("t", "a"),
+        ]
+        graph = _fake_graph(ops, outputs=["t"])
+        assert find_unread_shuffles(graph) == []
+        assert [d.get_name() for d in find_unread_shuffles(graph, set())] == ["t"]
+
+    def test_shuffle_is_noop(self):
+        ops = [
+            _ea_buf("a", EA.STANDARD),
+            _ea_buf("b", EA.DL16_TO_FP32, broadcast=True),
+            _ea_buf("c", EA.DL16_TO_FP32),
+        ]
+        graph = _fake_graph(ops)
+        assert shuffle_is_noop(graph, "a", EA.STANDARD) is True
+        assert shuffle_is_noop(graph, "b", EA.STANDARD) is True
+        assert shuffle_is_noop(graph, "c", EA.STANDARD) is False
+
+    def test_find_chain_source_cancels(self):
+        a = _ea_buf("a", EA.STANDARD)
+        s1 = self._shuffle("s1", "a", EA.DL16_TO_FP32)
+        # s1 to STANDARD cancels back to reading 'a'
+        assert find_chain_source(_fake_graph([a, s1]), "s1", EA.STANDARD) == ("a", True)
+
+    def test_find_chain_source_collapses(self):
+        a = _ea_buf("a", EA.FP32_TO_DL16)
+        s1 = self._shuffle("s1", "a", EA.DL16_TO_FP32)
+        assert find_chain_source(_fake_graph([a, s1]), "s1", EA.STANDARD) == (
+            "a",
+            False,
+        )
+
+    def test_find_chain_source_not_a_shuffle(self):
+        graph = _fake_graph([_ea_buf("a", EA.DL16_TO_FP32)])
+        assert find_chain_source(graph, "a", EA.STANDARD) is None
+
+    def test_find_existing_shuffle(self):
+        a = _ea_buf("a", EA.DL16_TO_FP32)
+        s1 = self._shuffle("s1", "a", EA.STANDARD)
+        c = _ea_buf("c", EA.STANDARD, ["s1"])
+        graph = _fake_graph([a, s1, c])
+        assert find_existing_shuffle(graph, "a", EA.STANDARD, before_op=c) is s1
+        assert find_existing_shuffle(graph, "a", EA.FP32_TO_DL16, before_op=c) is None
+
+    def test_find_existing_shuffle_must_precede_reader(self):
+        a = _ea_buf("a", EA.DL16_TO_FP32)
+        c = _ea_buf("c", EA.STANDARD, ["a"])
+        s1 = self._shuffle("s1", "a", EA.STANDARD)
+        graph = _fake_graph([a, c, s1])
+        assert find_existing_shuffle(graph, "a", EA.STANDARD, before_op=c) is None
+        assert find_existing_shuffle(graph, "a", EA.STANDARD) is s1
+
+    @staticmethod
+    def _upcast_graph(**cast_attrs):
+        x = _ea_buf("x", EA.STANDARD, dtype=torch.float16)
+        s = _ea_buf("s", EA.DL16_TO_FP32, ["x"], dtype=torch.float32, **cast_attrs)
+        c = _ea_buf("c", EA.STANDARD, ["s"], dtype=torch.float32)
+        return _fake_graph([x, s, c], outputs=["c"]), s, c
+
+    def test_find_cast_to_sink_into(self):
+        graph, s, c = self._upcast_graph()
+        sink = find_cast_to_sink_into(graph, "s", c)
+        assert sink is not None
+        cast_buf, x_name, e_in = sink
+        assert cast_buf is s and x_name == "x" and e_in == EA.FP32_TO_DL16
+
+    def test_find_cast_to_sink_into_rejects_graph_output(self):
+        graph, _, c = self._upcast_graph()
+        assert find_cast_to_sink_into(graph, "s", c, outputs={"s"}) is None
+
+    def test_find_cast_to_sink_into_rejects_coarse_tiled_cast(self):
+        graph, _, c = self._upcast_graph(loop_info=object())
+        assert find_cast_to_sink_into(graph, "s", c) is None
+
+    def test_find_cast_to_sink_into_rejects_shared_cast(self):
+        graph, s, c = self._upcast_graph()
+        graph.operations.append(_ea_buf("d", EA.STANDARD, ["s"], dtype=torch.float32))
+        assert find_cast_to_sink_into(graph, "s", c) is None
+
+    def test_optimize_noop(self):
+        ops = [
+            _ea_buf("a", EA.DL16_TO_FP32, broadcast=True),
+            _ea_buf("out", EA.STANDARD, ["a"]),
+        ]
+        step = ShuffleStep("a", EA.DL16_TO_FP32, EA.STANDARD)
+        optimize_ea_step(_fake_graph(ops), step, ops[1])
+        assert (step.kind, step.cost) == ("noop", 0.0)
+
+    def test_optimize_insert(self):
+        ops = [_ea_buf("a", EA.DL16_TO_FP32), _ea_buf("out", EA.STANDARD, ["a"])]
+        step = ShuffleStep("a", EA.DL16_TO_FP32, EA.STANDARD)
+        optimize_ea_step(_fake_graph(ops), step, ops[1])
+        assert (step.kind, step.cost) == ("insert", SHUFFLE_COST)
+        assert step.read_from == "a"
+
+    def test_optimize_sink(self):
+        graph, _, c = self._upcast_graph()
+        step = ShuffleStep("s", EA.DL16_TO_FP32, EA.STANDARD)
+        optimize_ea_step(graph, step, c, outputs={"c"})
+        assert (step.kind, step.cost) == ("sink", SHUFFLE_COST / 2)
+
+    def test_optimize_cancel(self):
+        a = _ea_buf("a", EA.STANDARD)
+        s1 = self._shuffle("s1", "a", EA.DL16_TO_FP32)
+        out = _ea_buf("out", EA.STANDARD, ["s1"])
+        step = ShuffleStep("s1", EA.DL16_TO_FP32, EA.STANDARD)
+        optimize_ea_step(_fake_graph([a, s1, out]), step, out)
+        assert (step.kind, step.cost, step.read_from) == ("cancel", 0.0, "a")
+
+    def test_optimize_collapse(self):
+        a = _ea_buf("a", EA.FP32_TO_DL16)
+        s1 = self._shuffle("s1", "a", EA.DL16_TO_FP32)
+        out = _ea_buf("out", EA.STANDARD, ["s1"])
+        step = ShuffleStep("s1", EA.DL16_TO_FP32, EA.STANDARD)
+        optimize_ea_step(_fake_graph([a, s1, out]), step, out)
+        assert (step.kind, step.cost, step.read_from) == (
+            "collapse",
+            SHUFFLE_COST,
+            "a",
+        )
+
+    def test_optimize_reuse(self):
+        a = _ea_buf("a", EA.DL16_TO_FP32)
+        s1 = self._shuffle("s1", "a", EA.STANDARD)
+        out = _ea_buf("out", EA.STANDARD, ["a"])
+        step = ShuffleStep("a", EA.DL16_TO_FP32, EA.STANDARD)
+        optimize_ea_step(_fake_graph([a, s1, out]), step, out)
+        assert (step.kind, step.cost) == ("reuse", 0.0)
+
+    def test_optimize_ea_path_prices_every_input_step(self):
+        ops = [
+            _ea_buf("a", EA.DL16_TO_FP32),
+            _ea_buf("b"),
+            _ea_buf("out", EA.STANDARD, ["a", "b"]),
+        ]
+        graph = _fake_graph(ops)
+        paths = ea_decision_table(
+            {"a": EA.DL16_TO_FP32, "b": EA.STANDARD}, EA.STANDARD, "out"
+        )
+        for path in paths:
+            path.op = ops[2]
+            optimize_ea_path(graph, path)
+        by_target = {p.target_ea: p for p in paths}
+        # DL16 target: "b" has to be flipped; STANDARD target: "a" has to be.
+        assert [s.kind for s in by_target[EA.STANDARD].input_steps.values()] == [
+            "insert"
+        ]
+        assert by_target[EA.STANDARD].cost == SHUFFLE_COST
+
+
+# ---------------------------------------------------------------------------
+# Stage 3: select the cheapest path and mark it
+# ---------------------------------------------------------------------------
+class TestEAPathSelection:
+    @staticmethod
+    def _paths(operand_eas, output_ea):
+        return ea_decision_table(operand_eas, output_ea, "out")
+
+    def test_select_cheapest(self):
+        paths = self._paths({"a": EA.DL16_TO_FP32, "b": EA.STANDARD}, EA.STANDARD)
+        best = select_ea_path(paths)
+        assert best.target_ea == EA.STANDARD and best.output_step is None
+
+    def test_select_follows_staggered_output(self):
+        paths = self._paths({"a": EA.DL16_TO_FP32, "b": EA.STANDARD}, EA.DL16_TO_FP32)
+        best = select_ea_path(paths)
+        assert best.target_ea == EA.DL16_TO_FP32 and list(best.input_steps) == ["b"]
+
+    def test_select_tie_keeps_committed_output_layout(self):
+        """Flipping both STANDARD operands and shuffling a + the result both
+        cost 2 shuffles; the one that leaves the output layout alone wins."""
+        paths = self._paths(
+            {"a": EA.DL16_TO_FP32, "b": EA.STANDARD, "c": EA.STANDARD},
+            EA.DL16_TO_FP32,
+        )
+        assert len({p.cost for p in paths}) == 1
+        best = select_ea_path(paths)
+        assert best.target_ea == EA.DL16_TO_FP32 and best.output_step is None
+
+    def test_select_prefers_cheaper_technique(self):
+        paths = self._paths({"a": EA.DL16_TO_FP32, "b": EA.STANDARD}, EA.STANDARD)
+        for p in paths:
+            for step in p.input_steps.values():
+                if p.target_ea == EA.DL16_TO_FP32:
+                    step.kind, step.cost = "reuse", 0.0
+        # Free flip of "b" but the result still needs shuffling back.
+        best = select_ea_path(paths)
+        assert best.target_ea == EA.STANDARD
+
+    def test_select_nothing_to_do(self):
+        paths = self._paths({"a": EA.STANDARD, "b": EA.STANDARD}, EA.STANDARD)
+        assert select_ea_path(paths) is None
+
+    def test_select_all_noop_is_none(self):
+        paths = self._paths({"a": EA.DL16_TO_FP32, "b": EA.STANDARD}, EA.STANDARD)
+        for p in paths:
+            for step in p.steps:
+                step.kind, step.cost = "noop", 0.0
+        assert select_ea_path(paths) is None
+
+    def test_select_empty(self):
+        assert select_ea_path([]) is None
+
+    def test_mark_path(self):
+        op = _ea_buf("out", EA.STANDARD, ["a", "b"])
+        path = EAPath(
+            op, EA.STANDARD, {"a": ShuffleStep("a", EA.DL16_TO_FP32, EA.STANDARD)}
+        )
+        mark_ea_shuffle_path(op, path)
+        assert getattr(op, EA_SHUFFLE_PATH_ATTR) is path
+
+    def test_mark_none(self):
+        op = _ea_buf("out", EA.STANDARD, ["a", "b"])
+        mark_ea_shuffle_path(op, None)
+        assert getattr(op, EA_SHUFFLE_PATH_ATTR, None) is None
+
+    @expects_raise
+    def test_mark_coarse_tiled_costly_path_raises(self):
+        op = _ea_buf("out", EA.STANDARD, ["a", "b"], loop_info=object())
+        path = EAPath(
+            op, EA.STANDARD, {"a": ShuffleStep("a", EA.DL16_TO_FP32, EA.STANDARD)}
+        )
+        with pytest.raises(Unsupported, match="coarse-tiled loop"):
+            mark_ea_shuffle_path(op, path)
+
+    def test_mark_coarse_tiled_free_path_is_unmarked(self):
+        op = _ea_buf("out", EA.STANDARD, ["a", "b"], loop_info=object())
+        free = ShuffleStep("a", EA.DL16_TO_FP32, EA.STANDARD, kind="cancel", cost=0.0)
+        mark_ea_shuffle_path(op, EAPath(op, EA.STANDARD, {"a": free}))
+        assert getattr(op, EA_SHUFFLE_PATH_ATTR, None) is None
+
+
+class TestEAInsertions:
+    SHAPE = (4, 128)
+
+    @staticmethod
+    def _run_recording(fn, *args):
+        """Compile ``fn``; return ``(result, shuffles)`` shuffle source dtypes."""
+        result, records = _compile_recording(fn, *args)
+        return result, records.get("shuffles", [])
+
+    def test_no_shuffle(self):
+        """Operands that share one arrangement need no shuffle at all."""
+
+        def fn(x, y):
+            return x.to(torch.float32) + y.to(torch.float32)
+
+        x = cached_randn(self.SHAPE, dtype=torch.float16)
+        y = cached_randn(self.SHAPE, dtype=torch.float16)
+
+        result, shuffles = self._run_recording(fn, x.to(DEVICE_NAME), y.to(DEVICE_NAME))
+
+        assert shuffles == []
+        assert_val(fn, (x, y), result, rtol=1e-2, atol=1e-2)
+
+    def test_shuffle_kept(self):
+        """A staggered fp16 operand meeting a STANDARD one still needs its shuffle."""
+
+        def fn(x, y):
+            return x.to(torch.float16) + y
+
+        x = cached_randn(self.SHAPE, dtype=torch.float32)
+        y = cached_randn(self.SHAPE, dtype=torch.float16)
+
+        result, shuffles = self._run_recording(fn, x.to(DEVICE_NAME), y.to(DEVICE_NAME))
+
+        assert shuffles == [torch.float16]
+        assert_ea(result, EA.STANDARD)
+        assert_val(fn, (x, y), result, rtol=1e-2, atol=1e-2)
+
+    def test_sink_through_upcast(self):
+        """``fp16 -> fp32`` then a shuffle becomes a shuffle of the fp16 input."""
+
+        def fn(x, y):
+            return (x.to(torch.float32) + y) * 2.0
+
+        x = cached_randn(self.SHAPE, dtype=torch.float16)
+        y = cached_randn(self.SHAPE, dtype=torch.float32)
+
+        result, shuffles = self._run_recording(fn, x.to(DEVICE_NAME), y.to(DEVICE_NAME))
+
+        # The narrow fp16 input is shuffled before upcast
+        assert shuffles == [torch.float16]
+        assert_ea(result, EA.STANDARD)
+        assert_val(fn, (x, y), result, rtol=1e-2, atol=1e-2)
+
+    def test_merge_duplicates(self):
+        """Two consumers of one staggered value share a single shuffle."""
+
+        def fn(x, y):
+            a = x.to(torch.float16)
+            return a + y, a * y
+
+        x = cached_randn(self.SHAPE, dtype=torch.float32)
+        y = cached_randn(self.SHAPE, dtype=torch.float16)
+
+        (r1, r2), shuffles = self._run_recording(
+            fn, x.to(DEVICE_NAME), y.to(DEVICE_NAME)
+        )
+
+        assert len(shuffles) == 1
+        for r, ref in zip((r1, r2), fn(x, y)):
+            assert_ea(r, EA.STANDARD)
+            torch.testing.assert_close(r.cpu(), ref, rtol=1e-2, atol=1e-2)
+
+    @staticmethod
+    def _shuffle(name, src, ea=EA.STANDARD, **kwargs):
+        return _ea_buf(name, ea, [src], shuffle=True, **kwargs)
+
+    def test_dead(self, run_pass):
+        ops = [_ea_buf("a", EA.DL16_TO_FP32), self._shuffle("s", "a")]
+        assert run_pass(insert_ea_shuffle, ops) == [("a", [])]
+
+    def test_dead_output_kept(self, run_pass):
+        ops = [_ea_buf("a", EA.DL16_TO_FP32), self._shuffle("s", "a")]
+        assert run_pass(insert_ea_shuffle, ops, outputs=["s"]) == [
+            ("a", []),
+            ("s", ["a"]),
+        ]
+
+    def test_noop(self, run_pass):
+        """The source already has the target layout, so readers read it."""
+        ops = [
+            _ea_buf("a"),
+            _ea_buf("b"),
+            _ea_buf("out", EA.STANDARD, ["a", "b"]),
+        ]
+        assert run_pass(insert_ea_shuffle, ops, outputs=["out"]) == [
+            ("a", []),
+            ("b", []),
+            ("out", ["a", "b"]),
+        ]
+
+    def test_required_kept(self, run_pass):
+        """The shuffle is placed right before its consumer."""
+        ops = [
+            _ea_buf("a", EA.DL16_TO_FP32),
+            _ea_buf("b"),
+            _ea_buf("out", EA.STANDARD, ["a", "b"]),
+        ]
+        assert run_pass(insert_ea_shuffle, ops, outputs=["out"]) == [
+            ("a", []),
+            ("b", []),
+            ("shuffle_of_a", ["a"]),
+            ("out", ["shuffle_of_a", "b"]),
+        ]
+
+    def test_chain_cancels(self, run_pass):
+        """``STANDARD -> staggered -> STANDARD`` leaves no shuffle."""
+        ops = [
+            _ea_buf("a"),
+            self._shuffle("s1", "a", EA.DL16_TO_FP32),
+            _ea_buf("b"),
+            _ea_buf("out", EA.STANDARD, ["s1", "b"]),
+        ]
+        result = dict(run_pass(insert_ea_shuffle, ops, outputs=["out"]))
+        assert result["out"] == ["a", "b"]
+
+    def test_chain_collapses(self, run_pass):
+        """``A -> B -> C`` through two shuffles becomes ``A -> C``."""
+        ops = [
+            _ea_buf("a", EA.FP32_TO_DL16),
+            self._shuffle("s1", "a", EA.DL16_TO_FP32),
+            _ea_buf("b"),
+            _ea_buf("out", EA.STANDARD, ["s1", "b"]),
+        ]
+        result = dict(run_pass(insert_ea_shuffle, ops, outputs=["out"]))
+        assert result["out"] == ["shuffle_of_a", "b"]
+
+    def test_dup_merged(self, run_pass):
+        ops = [
+            _ea_buf("a", EA.DL16_TO_FP32),
+            _ea_buf("b"),
+            _ea_buf("out1", EA.STANDARD, ["a", "b"]),
+            _ea_buf("out2", EA.STANDARD, ["a", "b"]),
+        ]
+        result = dict(run_pass(insert_ea_shuffle, ops, outputs=["out1", "out2"]))
+        assert result["out1"] == result["out2"] == ["shuffle_of_a", "b"]
+
+    def test_upcast_sunk(self, run_pass):
+        """``x(fp16) -upcast-> s -shuffle-> t`` shuffles the narrow ``x`` instead."""
+        fp32 = torch.float32
+        ops = [
+            _ea_buf("x"),
+            _ea_buf("s", EA.DL16_TO_FP32, ["x"], dtype=fp32),
+            _ea_buf("b", EA.STANDARD, dtype=fp32),
+            _ea_buf("out", EA.STANDARD, ["s", "b"], dtype=fp32),
+        ]
+        result = run_pass(insert_ea_shuffle, ops, outputs=["out"])
+        names = dict(result)
+        assert "shuffle_of_x" in names and names["out"] == ["s", "b"]
+
+    def test_staggered_output_flipped(self, run_pass):
+        """Mixed op producing staggered output shuffles standard operands to match."""
+        ops = [
+            _ea_buf("a", EA.DL16_TO_FP32),
+            _ea_buf("b", EA.STANDARD),
+            _ea_buf("out", EA.DL16_TO_FP32, ["a", "b"]),
+        ]
+        result = dict(run_pass(insert_ea_shuffle, ops, outputs=["out"]))
+        assert result["out"] == ["a", "shuffle_of_b"]
 
 
 # ---------------------------------------------------------------------------
