@@ -145,12 +145,19 @@ class TestNamedWorkDivisionHint(InductorTestCase):
         )
 
     def _fake_op(self, loop_var_dims):
-        op = SimpleNamespace(
+        from torch._inductor.ir import Pointwise
+
+        ranges = {sym: 512 for sym in loop_var_dims}
+        data = MagicMock(spec=Pointwise)
+        data.ranges = ranges
+        return SimpleNamespace(
+            data=data,
             get_name=lambda: "fake_op",
-            get_read_writes=lambda: SimpleNamespace(writes=[], reads=[]),
+            get_read_writes=lambda: SimpleNamespace(
+                writes=[SimpleNamespace(ranges=ranges)], reads=[]
+            ),
             work_div_loop_info=loop_var_dims,
         )
-        return op
 
     def _fake_output_td(self, coord_vars):
         return SimpleNamespace(device_coords=[*coord_vars, Integer(0)])

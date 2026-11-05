@@ -290,7 +290,7 @@ class GraphEditor:
                 op_read_writes(new_com_buf),
                 clone_space,
                 clone_ownership.work_slices,
-                label="LX input clone",
+                message_prefix="LX input clone:",
             )
             commit_tensor_work_division(new_com_buf, clone_ownership)
         else:
@@ -298,6 +298,8 @@ class GraphEditor:
                 sym: metadata_owner.work_slices.get(sym, 1) if metadata_owner else 1
                 for sym in iteration_space_from_op(new_com_buf)
             }
+            # unallocated_copy preserves device layout and index coefficients,
+            # so the producer's accepted splits stay representable on this clone.
             commit_iteration_space_ownership(new_com_buf, clone_splits)
 
         if input:

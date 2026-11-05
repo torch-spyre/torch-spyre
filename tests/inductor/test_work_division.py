@@ -1587,15 +1587,12 @@ class TestWorkDivisionContextAnswers(unittest.TestCase):
                     self.assertEqual(ctx.is_legal(splits), legal, _by_name(splits))
 
     def test_is_legal_representability_uses_real_extents_not_adjusted_ones(self):
-        """The representability sub-check must judge the op's real,
-        un-tiled extents, not it_space_adjusted: those are the per-tile frame
-        under a non-trivial tiling, whose extents can be smaller than the
-        op's real ones (a stick var with a small element extent can adjust
-        to a per-tile/per-stick size of 1). The commit-time gates
-        (apply_splits, finalize_work_division_for_scheduler) judge the real,
-        un-tiled op, so a candidate is_legal wrongly admits here would still
-        be rejected there -- a latent, fail-closed inconsistency, not merely
-        a cosmetic one."""
+        """The representability sub-check uses ``transport_it_space``: the
+        op's real, un-tiled extents, not ``it_space_adjusted``. The latter is
+        the per-tile frame under non-trivial tiling and can make a real axis
+        look size 1. Commit-time gates use the un-tiled op too, so admitting a
+        candidate here would create a fail-closed inconsistency at commit.
+        """
         i0, i1 = _isym("i0"), _isym("i1")
         write_index = 8 * i0 + 8 * i1  # i0, i1 share coeff 8
         op = _computed_buffer((8, 8), name="divergent_extents")
@@ -1614,14 +1611,10 @@ class TestWorkDivisionContextAnswers(unittest.TestCase):
             read_index=write_index,
             transport_it_space={i0: 8, i1: 8},
         )
-        with patch(
-            "torch_spyre._inductor.work_division.iteration_space_from_op",
-            return_value={i0: 8, i1: 8},  # the op's real, un-tiled extents
-        ):
-            self.assertFalse(
-                ctx._representable_by_index_coeff({i0: 4, i1: 1}),
-                "i1's real extent (8) must be used, not its tile-adjusted extent (1)",
-            )
+        self.assertFalse(
+            ctx._representable_by_index_coeff({i0: 4, i1: 1}),
+            "i1's transport extent (8) must be used, not its tile-adjusted extent (1)",
+        )
 
     def test_context_answers_match_the_enumeration(self):
         """The seam itself: the context's axis order is the one a candidate is
@@ -2450,7 +2443,7 @@ class TestDepthwiseConvWindowBlocked(unittest.TestCase):
             self.assertNotIn(channel, result.blocked)
         torch.testing.assert_close(out, ref, atol=0.1, rtol=0.1)
 
-    def test_unblocked_window_split_is_dropped_before_codegen(self):
+    def test_unblocked_window_split_is_rejected_before_codegen(self):
         """What the guard prevents: permit (and force) a kh split, and the
         committed plan cannot be carried to codegen -- compilation now raises
         rather than silently dropping the split and running on fewer cores."""
@@ -3829,36 +3822,60 @@ class TestCoOptimizingAllocator(unittest.TestCase):
         self.assertEqual(divisions[op.name], [fixed])
         enumerate_divs.assert_not_called()
 
-    def test_fixed_illegal_split_raises_unsupported(self):
-        op = MagicMock(spec=ComputedBuffer, name="fixed_op")
-        op.data = MagicMock(spec=Pointwise)
-        op.name = "fixed_op"
-        graph = MagicMock(operations=[op])
-        allocator = CoOptimizingAllocator(_UNBUILT_SOLVER, size=1)
-        fixed = CoreDivision()
-
+    def test_fixed_transport_collision_reports_failed_domain(self):
+        i0, i1 = _isym("i0"), _isym("i1")
+        op = _computed_buffer((8, 8), name="fixed_transport_collision")
+        splits = {i0: 4, i1: 1}
+        ctx = WorkDivisionContext(
+            op=op,
+            max_cores=32,
+            it_space={i0: 8, i1: 8},
+            it_space_adjusted={i0: 8, i1: 8},
+            stick_vars={},
+            symbol_meta={},
+            tensor_deps=[],
+            reduction_vars=[],
+            constraints=ConstraintResult(),
+            span_min_splits={},
+            write_index=8 * i0 + 8 * i1,
+            read_index=8 * i0 + 8 * i1,
+            transport_it_space={i0: 8, i1: 8},
+        )
         with (
-            patch(
-                "torch_spyre._inductor.scratchpad.allocator."
-                "ops_in_offset_mutation_component",
-                return_value={op.name},
+            patch.object(
+                work_division_module, "work_division_context_for_op", return_value=ctx
             ),
-            patch(
-                "torch_spyre._inductor.scratchpad.allocator."
-                "_find_distinct_matmul_splits",
-                return_value=((), ()),
+            patch.object(
+                allocator_module, "work_division_context_for_op", return_value=ctx
             ),
-            patch(
-                "torch_spyre._inductor.scratchpad.allocator._fixed_core_division",
-                return_value=fixed,
-            ),
-            patch(
-                "torch_spyre._inductor.scratchpad.allocator._split_option_is_legal",
-                return_value=False,
-            ),
-            self.assertRaisesRegex(Unsupported, "fixed split violates hard domain"),
         ):
-            allocator._division_map(graph)
+            with self.assertRaises(Unsupported) as caught:
+                allocator_module._legal_fixed_division(
+                    op, [CoreDivision(splits=splits)], "pinned"
+                )
+            message = str(caught.exception)
+            self.assertIn("fixed split {i0: 4, i1: 1} violates hard domain", message)
+            self.assertIn("fails scheduler coefficient-keyed transport", message)
+            self.assertNotIn("fails ;", message)
+            self.assertNotIn("op constraints", message)
+            self.assertNotIn("span floors", message)
+
+            op.iteration_space_ownership = MagicMock()
+            with (
+                patch.object(
+                    allocator_module,
+                    "planned_splits",
+                    return_value=({op.name: splits}, []),
+                ),
+                self.assertRaises(Unsupported) as caught,
+            ):
+                allocator_module.commit_divisions(MagicMock(operations=[op]), [])
+            message = str(caught.exception)
+            self.assertIn("chosen split {i0: 4, i1: 1} violates hard domain", message)
+            self.assertIn("fails scheduler coefficient-keyed transport", message)
+            self.assertNotIn("fails ;", message)
+            self.assertNotIn("op constraints", message)
+            self.assertNotIn("span floors", message)
 
     def test_pruned_candidates_and_commit_reject_illegal_division(self):
         batch, m = _isym("batch"), _isym("m")
