@@ -29,6 +29,7 @@ from torch_spyre._inductor.pass_utils import (
     invalidate_op_read_writes,
     op_read_writes,
     register_operation_after_graph_edit,
+    work_division_transport_indexes,
 )
 from torch._inductor.virtualized import V
 from torch._inductor.ir import (
@@ -281,6 +282,13 @@ class GraphEditor:
             )
             if clone_ownership is None:
                 raise ValueError("LX clone is missing its accepted physical ownership")
+            work_division_transport_indexes(
+                new_com_buf,
+                op_read_writes(new_com_buf),
+                clone_space,
+                clone_ownership.work_slices,
+                label="LX input clone",
+            )
             commit_tensor_work_division(new_com_buf, clone_ownership)
         else:
             clone_splits = {

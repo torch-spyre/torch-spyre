@@ -1602,6 +1602,7 @@ class TestWorkDivisionContextAnswers(unittest.TestCase):
             span_min_splits={},
             write_index=write_index,
             read_index=write_index,
+            transport_it_space={i0: 8, i1: 8},
         )
         with patch(
             "torch_spyre._inductor.work_division.iteration_space_from_op",

@@ -2977,8 +2977,9 @@ def commit_divisions(
             # ownership for it and let the division land.
             if not isinstance(op, ComputedBuffer) or not op_splits:
                 continue
-        # The solve chose a tiled op's division on its untiled frame, which its
-        # hard domains and span floors are still keyed by.
+        # Joint tiling/division candidates were filtered by
+        # WorkDivisionContext.is_legal on the un-tiled frame before the solver
+        # saw them. Do not re-check resized tiled ranges here.
         if not getattr(
             op, JOINT_TILING_AND_DIVISION_ATTR, False
         ) and not _split_option_is_legal(op, op_splits):
