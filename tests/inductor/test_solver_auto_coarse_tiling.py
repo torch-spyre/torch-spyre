@@ -46,6 +46,7 @@ from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.loop_info import CoarseTileInfo
 from torch_spyre._inductor.pass_utils import PerCoreView
+from torch_spyre._inductor.loop_node import all_ops
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 from torch_spyre._inductor.scratchpad import sa_cooptimizer as sa
 from torch_spyre._inductor.scratchpad.allocator import (
@@ -265,8 +266,12 @@ class CollectTilingPasses(CustomPreSchedulingPasses):
 
     def __call__(self, graph: GraphLowering) -> None:
         super().__call__(graph)
+        # Leaf ops: graph.operations keeps its LoopNodes after the pipeline
+        # (they reach the scheduler as nodes); a LoopNode has no loop_info.
         tiled = [
-            op for op in graph.operations if getattr(op, "loop_info", None) is not None
+            op
+            for op in all_ops(graph.operations)
+            if getattr(op, "loop_info", None) is not None
         ]
         type(self).tiling = {op.get_name(): op.loop_info for op in tiled}
         type(self).core_splits = {
@@ -405,6 +410,8 @@ class AutomatedCoarseTilingTests(
             case, (), layout_solver=solver, auto_tiling=True
         )
         self._assert_matches_cpu(case, device, cpu)
+        # The one pytest.xfail AGENTS.md allows: it runs after the CPU check, so it
+        # cannot hide a wrong answer. Update AGENTS.md if this moves or goes away.
         if not tiling and solver == "simulated_annealing" and case.sa_may_stay_untiled:
             pytest.xfail(case.sa_may_stay_untiled)
         self.assertTrue(
