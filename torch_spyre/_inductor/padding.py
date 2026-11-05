@@ -1185,6 +1185,9 @@ class DomainRangeTracer(DefaultHandler):
         self.current_op: str | None = None
         # buffer name -> output set
         self.buffer_range = dict[str, Set]()
+        # Same as buffer_range, but reset for each op to account
+        # for slicing
+        self.current_reads = dict[str, Set]()
         # op name -> (arg name -> adjusted )
         self.buffer_input = dict[str, dict[str, Set]]()
         self.non_zero_reals = S.Reals - FiniteSet(0)
@@ -1223,7 +1226,7 @@ class DomainRangeTracer(DefaultHandler):
             self.buffer_input[self.current_op.name] = {}
 
         if padding_range is None:
-            padding_range = self.buffer_range.get(name)
+            padding_range = self.current_reads.get(name)
         if padding_range is None:
             current_op_name = (
                 self.current_op.name if self.current_op is not None else None
@@ -1720,6 +1723,14 @@ _PADDING_MASK_VALUES: dict[str, dict[DataFormats, float]] = {
         DataFormats.SEN169_FP16: float("inf"),
         DataFormats.IEEE_FP32: _FP32_MAX,
     },
+    "sum": {
+        DataFormats.SEN169_FP16: 0,
+        DataFormats.IEEE_FP32: 0,
+    },
+    "mean": {
+        DataFormats.SEN169_FP16: 0,
+        DataFormats.IEEE_FP32: 0,
+    },
 }
 
 _POINTWISE_PADDING_OPS: set[str] = {"exp", "reciprocal", "rsqrt", "log", "realdiv"}
@@ -1793,7 +1804,9 @@ def _call_innner(op):
         store_fn(syms)
 
 
-def is_padded(graph: GraphLowering, node: IRNode | Layout | SpyreTensorLayout):
+def _get_layout(
+    graph: GraphLowering, node: IRNode | Layout | SpyreTensorLayout
+) -> SpyreTensorLayout | None:
     if isinstance(node, ComputedBuffer) and isinstance(
         node.layout, MutationLayoutSHOULDREMOVE
     ):
@@ -1806,17 +1819,24 @@ def is_padded(graph: GraphLowering, node: IRNode | Layout | SpyreTensorLayout):
         layout = node.maybe_get_layout()
         if layout is None:
             # FallbackKernels and others
-            return False
+            return None
         node = layout
     if isinstance(node, Layout):
         assert isinstance(node, FixedLayout), f"Expected finalized layout, got {node}"
         if not isinstance(node, FixedTiledLayout):
             assert node.device.type != DEVICE_NAME
-            return False
+            return None
         node = node.device_layout
+    return node
 
-    total_valid_elems = math.prod(node.valid_elements.values())
-    total_size = math.prod(node.device_size)
+
+def is_padded(graph: GraphLowering, node: IRNode | Layout | SpyreTensorLayout) -> bool:
+    layout = _get_layout(graph, node)
+    if layout is None:
+        return False
+
+    total_valid_elems = math.prod(layout.valid_elements.values())
+    total_size = math.prod(layout.device_size)
 
     return total_valid_elems < total_size
 
@@ -1853,18 +1873,40 @@ def track_padding_value(graph: GraphLowering) -> None:
                 buf = graph.get_buffer(dep.name)
                 while isinstance(buf, MutableBox):
                     buf = buf.data
+                layout = _get_layout(graph, buf)
+                buf_is_padded = (
+                    is_padded(graph, layout) if layout is not None else False
+                )
                 if isinstance(buf, InputBuffer):
+                    assert layout is not None
+                    buf_is_padded = is_padded(graph, layout)
                     tracer.buffer_range[dep.name] = (
-                        _ASSUMED_PADDING[InputBuffer]
-                        if is_padded(graph, buf)
-                        else EmptySet
+                        _ASSUMED_PADDING[InputBuffer] if buf_is_padded else EmptySet
                     )
                 else:
                     assert dep.name in tracer.buffer_range, (
                         f"Nodes seen out of order, expected {dep.name} to have been visited"
                     )
+                tracer.current_reads[dep.name] = tracer.buffer_range[dep.name]
                 input_buffers[dep.name] = buf
-                any_input_padded = any_input_padded or is_padded(graph, buf)
+                if layout is None:
+                    continue
+
+                is_sliced = False
+                if layout.valid_elements:
+                    total_valid_elems = math.prod(layout.valid_elements.values())
+                    is_sliced = dep.get_numel() < total_valid_elems
+
+                # If the output is padded and there is slicing on the input it means
+                # that the if there is slicing along the stiock dim, valid values
+                # from the input can end up in the output padding
+                # TODO: refine analysis to exclude non-stick slicing cases
+                if padded and is_sliced:
+                    tracer.current_reads[dep.name] = tracer.current_reads[
+                        dep.name
+                    ].union(_user_values())
+                    buf_is_padded = True
+                any_input_padded = any_input_padded or buf_is_padded
 
             if isinstance(op, ComputedBuffer) and isinstance(
                 op.layout, MutationLayoutSHOULDREMOVE
@@ -1919,7 +1961,6 @@ def track_padding_value(graph: GraphLowering) -> None:
                 except InvalidDomain as inv_domain:
                     name = index2arg[inv_domain.arg_index]
                     buf = input_buffers[name]
-
                     if can_coord_mask(inv_domain.func, buf.layout.dtype):
                         do_coord_mask = True
                         # For now this is true for all operations that are padded
