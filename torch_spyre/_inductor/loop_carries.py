@@ -198,7 +198,9 @@ def apply_loop_carries(graph: GraphLowering) -> None:
 
     Runs under ``passes._flat_operations``, or on a list holding
     ``LoopNode``s: a rebuilt op replaces the old one in the list that owns it.
-    Reads are traced once per op per run.
+    Every reader of an update is found with one trace of each op per run (the
+    names are batched into one ``redirect_computed_buffer_reads`` call); the
+    ``op_read_writes`` memo is not used, as a rebuilt op would not invalidate it.
     """
     from .wsr.while_loop_bridge import (
         _repoint_refs_to_buffer,

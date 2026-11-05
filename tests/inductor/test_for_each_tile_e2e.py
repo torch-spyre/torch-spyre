@@ -2006,6 +2006,42 @@ class TestForEachTileCarriesInPlaceE2E(_DynamoResetTestCase):
         torch.testing.assert_close(out.cpu().float(), ref, atol=0, rtol=0)
         self._assert_carries_in_place(src, 2)
 
+    def test_chained_loop_result_that_is_also_returned_is_not_overwritten(self):
+        """Loop 2 takes loop 1's result as its init, and both are returned.
+
+        Loop 1's body ignores its old value, so its update is the result. While
+        that update is still pure, the result is the update's own buffer, so
+        loop 2 may write it in place only if nothing else holds it. Judged on
+        the storage alone, loop 2 overwrote ``a`` with its own final value.
+        """
+
+        def fn(x):
+            def first(carry, ops):
+                (tile,) = ops
+                return (tile * 2,), None
+
+            def second(carry, ops):
+                (acc,) = carry
+                (tile,) = ops
+                return (acc + tile,), None
+
+            zeros = torch.zeros(64, 64, device=x.device, dtype=x.dtype)
+            (a,), _ = for_each_tile(first, (x,), dims=(0,), tile_size=64, init=(zeros,))
+            (b,), _ = for_each_tile(second, (x,), dims=(0,), tile_size=64, init=(a,))
+            return a, b
+
+        # Small integers keep every value exact in fp16.
+        x = torch.randint(0, 4, (128, 64), generator=torch.Generator().manual_seed(0))
+        x = x.half()
+        t0, t1 = x.float()[:64], x.float()[64:]
+        ref_a = t1 * 2  # the last trip's value
+        ref_b = ref_a + t0 + t1  # loop 2 starts from a
+
+        a, b = self._compile(fn, x.to(DEVICE_NAME))[0]
+
+        torch.testing.assert_close(a.cpu().float(), ref_a, atol=0, rtol=0)
+        torch.testing.assert_close(b.cpu().float(), ref_b, atol=0, rtol=0)
+
 
 if __name__ == "__main__":
     unittest.main()

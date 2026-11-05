@@ -37,10 +37,11 @@ if TYPE_CHECKING:
 class LoopCarryRecord:
     """Identity contract for one accumulator carried through a counted loop.
 
-    ``for_each_tile`` lowering rewrites the carry update as an in-place write
-    into the carry's initial storage.  Recording both ends lets scratchpad
-    planning distinguish that closed, compiler-created mutation from an
-    arbitrary user mutation, which must remain in HBM.
+    ``for_each_tile`` lowering declares the carry with this record;
+    ``loop_carries.apply_loop_carries`` then rewrites the update as an
+    in-place write into the carry's initial storage.  Recording both ends
+    lets scratchpad planning distinguish that closed, compiler-created
+    mutation from an arbitrary user mutation, which must remain in HBM.
 
     ``loop_origin`` is the exact FX ``while_loop`` HOP node the carry belonged
     to, captured and validated at the splice site (see

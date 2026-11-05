@@ -143,7 +143,8 @@ than one. `SpyreKernel._check_indirect_index_step` rejects this layout during
 code generation; it previously could produce incorrect rows without an error.
 
 An accumulator carry is declared, not rewritten, by `splice_while_loop`: a
-`LoopCarryRecord` on the carry's storage (its initial buffer) and on its
+`LoopCarryRecord` on the carry's storage (its initial buffer, or the pre-loop
+copy of it when the initial buffer is not private to the loop) and on its
 update names both, and the spliced body stays pure, with the loop's result the
 update's own buffer. The `apply_loop_carries` pass, which runs just before
 layout propagation, then makes the update an in-place write of the storage and
