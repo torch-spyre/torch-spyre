@@ -598,8 +598,8 @@ def _make_inplace_kernel(functional_op):
 # In-place ops that write through their compiled ``out=`` overload instead of
 # the functional-compute + ``copy_`` kernel, mapped to that ``out`` overload.
 # The copy-back kernel materializes a full ``self``-sized result even when the
-# op touches a few slices; ``out=self`` scatters into ``self`` directly, the
-# path ``index_copy_`` already takes via ``index_copy.out``.
+# op touches a few slices; ``out=self`` scatters into an offset-0 ``self``
+# directly, the path ``index_copy_`` already takes via ``index_copy.out``.
 _OUT_ROUTED_INPLACE_OPS = {
     aten.index_fill_.int_Scalar: aten.index_fill.int_Scalar_out,
     aten.index_fill_.int_Tensor: aten.index_fill.int_Tensor_out,
@@ -648,9 +648,10 @@ def register_inplace_kernels(ops):
 def _make_out_routed_inplace_kernel(out_op):
     """Build an in-place kernel that calls ``out_op(self, ..., out=self)``.
 
-    The compiled ``out`` kernel takes ``out`` as a runtime argument, and its
-    dispatch (:func:`_make_offset_safe_dispatch`) handles a ``self`` view with
-    a storage offset, so the write lands in ``self`` without a full copy.
+    The compiled ``out`` kernel takes ``out`` as a runtime argument, so an
+    offset-0 ``self`` is written without a full copy. A ``self`` view with a
+    storage offset goes through :func:`_make_offset_safe_dispatch`, which
+    clones the view and copies the result back.
     """
 
     def kernel(self, *args):
