@@ -42,7 +42,7 @@ from torch._inductor.ir import (
 )
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
-from torch._inductor.scheduler import SchedulerNode
+from torch._inductor.scheduler import FusedSchedulerNode, SchedulerNode
 from torch._inductor.virtualized import V
 
 from . import config
@@ -3743,6 +3743,15 @@ def _clean_mutation_op_output_layout(node: ComputedBuffer) -> FixedLayout:
     )
 
 
+def _leaf_scheduler_nodes(nodes):
+    """Every node in ``nodes``, descending into ``FusedSchedulerNode``s."""
+    for n in nodes:
+        if isinstance(n, FusedSchedulerNode):
+            yield from _leaf_scheduler_nodes(n.get_nodes())
+        else:
+            yield n
+
+
 def propagate_mutation_layouts(
     nodes: list,
 ) -> list:
@@ -3754,8 +3763,12 @@ def propagate_mutation_layouts(
     mutation layout during its initialisation to set up mutation tracking.
     This pass runs as a _pre_fusion_custom_pass (after scheduler init) to
     assign FixedTiledLayout to those remaining mutation ops.
+
+    A counted loop reaches this pass as one ``LoopSchedulerNode`` (a
+    ``FusedSchedulerNode``); its body's mutation ops are handled like any
+    other, so the pass descends into it.
     """
-    for n in nodes:
+    for n in _leaf_scheduler_nodes(nodes):
         if not (isinstance(n, SchedulerNode) and isinstance(n.node, ComputedBuffer)):
             continue
         if not isinstance(n.node.layout, MutationLayoutSHOULDREMOVE):
