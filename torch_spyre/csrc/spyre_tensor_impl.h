@@ -332,6 +332,24 @@ class SpyreTensorLayout {
     padding_value.clear();
   }
 
+  /**
+   * Return a copy of this layout with the padding reset to UNINITIALIZED.
+   *
+   * For a tensor that aliases another's storage (a view or a detached
+   * tensor): the runtime records padding on the tensor it writes, so an
+   * alias's copy would go stale after a write through the other tensor.
+   */
+  SpyreTensorLayout without_padding() const {
+    SpyreTensorLayout copy = *this;
+    copy.clear_padding();
+    return copy;
+  }
+
+  /** Equality ignoring the padding state. */
+  bool same_layout_ignoring_padding(const SpyreTensorLayout& other) const {
+    return without_padding() == other.without_padding();
+  }
+
   void init(std::vector<int64_t> host_size, c10::ScalarType dtype);
 
   void init(std::vector<int64_t> host_size, std::vector<int64_t> host_strides,

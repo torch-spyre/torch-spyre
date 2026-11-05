@@ -321,8 +321,9 @@ SpyreTensorImpl::shallow_copy_and_detach_core(
       return r;
     }
   }
-  auto impl = c10::make_intrusive<SpyreTensorImpl>(storage_, key_set_,
-                                                   data_type_, spyre_layout);
+  // A detached tensor aliases this storage: see without_padding().
+  auto impl = c10::make_intrusive<SpyreTensorImpl>(
+      storage_, key_set_, data_type_, spyre_layout.without_padding());
   impl->dma_sizes = this->dma_sizes;
   impl->dma_strides = this->dma_strides;
   copy_tensor_metadata(
