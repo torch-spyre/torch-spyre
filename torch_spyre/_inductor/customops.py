@@ -1033,6 +1033,9 @@ def scaled_mm(
     """
     Raw FP8 matrix multiplication, with no scaling or bias applied.
 
+    mat1 [M, K] @ mat2 [K, N] -> [M, N]. Like torch._scaled_mm, this is 2D only:
+    use spyre.scaled_bmm, or its raw form spyre.bmm_fp8, for batched operands.
+
     Scaling (scale_a, scale_b) and bias are intentionally NOT applied here -
     they're applied afterward at the decomposition level by scaled_mm_decomp,
     mirroring how dequantize_fp8_with_scale keeps its FP8->FP16 conversion
@@ -1045,6 +1048,12 @@ def scaled_mm(
 def _(
     mat1: torch.Tensor, mat2: torch.Tensor, out_dtype: torch.dtype = None
 ) -> torch.Tensor:
+    if mat1.ndim != 2 or mat2.ndim != 2:
+        raise ValueError(
+            f"spyre.scaled_mm is 2D only, got {list(mat1.shape)} and "
+            f"{list(mat2.shape)}. Use spyre.scaled_bmm or spyre.bmm_fp8 for batched "
+            "operands."
+        )
     output_shape = [mat1.shape[0], mat2.shape[-1]]
     return mat1.new_empty(output_shape, dtype=out_dtype or torch.float16)
 
@@ -1057,7 +1066,8 @@ def bmm_fp8(
     Raw FP8 batched matrix multiplication, with no scaling applied.
 
     The batched counterpart to spyre.scaled_mm: mat1 [*batch, M, K] @
-    mat2 [*batch, K, N] -> [*batch, M, N], with matching leading batch dims.
+    mat2 [*batch, K, N] -> [*batch, M, N], with one or two matching leading batch
+    dims, or mat1 [B, M, K] @ mat2 [K, N] -> [B, M, N], sharing mat2 across B.
 
     Scaling is intentionally NOT applied here - scaled_bmm_decomp applies it
     afterward, exactly as scaled_mm_decomp does for spyre.scaled_mm.
@@ -1088,8 +1098,9 @@ def scaled_bmm(
     """
     FP8 batched matrix multiplication with per-tensor scales applied.
 
-    mat1 [*batch, M, K] @ mat2 [*batch, K, N] -> [*batch, M, N], with matching
-    leading batch dims. Used for FP8 attention QK, e.g.
+    mat1 [*batch, M, K] @ mat2 [*batch, K, N] -> [*batch, M, N], with one or two
+    matching leading batch dims, or mat1 [B, M, K] @ mat2 [K, N] -> [B, M, N],
+    sharing mat2 across B. Used for FP8 attention QK, e.g.
     query[B, H, S, D] @ key_T[B, H, D, S].
 
     aten has no batched equivalent of _scaled_mm to decompose from, so this op

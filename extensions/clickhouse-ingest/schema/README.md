@@ -20,7 +20,7 @@ Applying them in filename order works from an empty database.
 | `42-ci-requests.sql` | `ci_requests` | — |
 | `47-pipeline-runs.sql` | `pipeline_runs`, `pipeline_run_legs` | — |
 | `48-ci-run-timings.sql` | `ci_run_timings` | — |
-| `49-result-uploads.sql` | `result_uploads`, `v_result_uploads`, `v_artifact_results_published` | 20 |
+| `49-result-uploads.sql` | `result_uploads`, `v_result_uploads`, `v_retracted_rounds`, `v_artifact_results_published` | 20 |
 | `50-artifact-views.sql` | 8 `v_tag_*` / `v_artifact_*` / `v_tier_trend` views | 10, 20 |
 | `51-functional-views.sql` | 4 `v_case_*` / `v_run_tier_counters` / `v_tier_report_completeness` views | 10, 20 |
 | `52-cross-views.sql` | `v_run_coverage` | 10, 20 |
@@ -35,7 +35,27 @@ Applying them in filename order works from an empty database.
 | `62-benchmark-verdicts.sql` | `benchmark_metric_policy`, `v_benchmark_metric_verdicts`, `v_benchmark_gate`, `benchmark_metric_verdicts` + its refreshable MV | 60 |
 | `63-perf-regression-gate.sql` | `v_perf_regression_gate` | 20, 62 |
 | `64-rbac.sql` | `rbac_roles`, `rbac_bindings`, each with a `*_versions` log and MV | — |
+| `65-insight-reports.sql` | `insight_reports`, `v_insight_reports` | — |
+| `66-chat-turns.sql` | `chat_turns` (kept forever), `chat_turn_retention`, `v_chat_turns`, `v_chat_turn_retention`, `v_chat_turn_daily` | — |
+| `67-effect-status.sql` | `effect_status` (append-only triage events), `v_effect_status` | — |
 | `70-vllm-hud-projection.sql` | `oss_ci_benchmark_v3`, `oss_ci_benchmark_metadata`, their `_by_tag` copies + their MVs | 30, 60 |
+| `72-ops-audit-events.sql` | `ops_audit_events`, `v_ops_audit_events` | — |
+| `73-ci-access-audit.sql` | `ci_access_audit`, `v_ci_access_audit` | — |
+| `74-model-priority-events.sql` | `model_priority_events`, `v_model_priority` | — |
+
+Column names `chat_turns` shares with `vigil_ops.analyst_turns`, so one `UNION ALL` view can read both:
+
+| column | values |
+|---|---|
+| `ts` | DateTime64(3, 'UTC') |
+| `session_id` | the conversation |
+| `role` | what the call was for |
+| `actor`, `actor_kind` | `human`, `anonymous`, `agent`, `service` |
+| `model_alias`, `served_model` | display name, model id |
+| `prompt_version` | first 12 hex of the system prompt sha256 |
+| `tokens_in`, `tokens_out`, `latency_ms`, `cost_usd` | numbers, 0 when unknown |
+| `outcome` | `ok`, `rejected_schema`, `error`, `timeout`, `budget` |
+| `props` | Map(String, String), error detail |
 
 The `50`/`51`/`52` split is by what a view reads, not by taste: the artifact and functional view
 families are independent, and `v_run_coverage` is separate because it measures the join between

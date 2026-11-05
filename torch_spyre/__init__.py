@@ -193,6 +193,11 @@ def make_spyre_module() -> types.ModuleType:
     mod.device_count = lambda: impl.device_count()
     mod.current_device = lambda: impl.current_device()
     mod.set_device = lambda idx: impl.set_device(idx)
+    from torch_spyre._sharded_api import is_sharded, sharding_info, to_sharded
+
+    mod.to_sharded = to_sharded
+    mod.is_sharded = is_sharded
+    mod.sharding_info = sharding_info
     mod._is_compiled = lambda: True
     mod.memory = memory
     # Public profiler API (eagerly imported above); avoid private _ffdc import.

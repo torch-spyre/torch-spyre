@@ -92,6 +92,12 @@ class SDSCArgs:
     is_index_tensor: bool = False
     related_value_tensor_idx: int = -1
     device_tile_advance_expr: Expr | None = None
+    # Sharded storage: each core addresses its own chunk (see sharded_hbm.py).
+    non_unified_shard_bytes: int = 0
+
+    @property
+    def non_unified(self) -> bool:
+        return self.non_unified_shard_bytes > 0
 
     def __str__(self) -> str:
         scales = ", ".join(f"{k}={v}" for k, v in self.scales.items())
@@ -1197,16 +1203,10 @@ def _get_data_format(op, device_dtype):
 
     This is metadata relabeling only; the underlying 32-bit data is unchanged.
     Native integer add/mul (``addi32toi32`` / ``muli32toi32``) use SENUINT32
-    tensor descriptors in the SDSC DDL.  Identity retains its fp32 relabeling.
+    tensor descriptors in the SDSC DDL.
     """
-    if device_dtype == DataFormats.IEEE_INT32:
-        if op in SPYRE_INT32_OPS:
-            return DataFormats.SENUINT32
-        if op == IDENTITY_OP:
-            # In the long term, SDSC should accept int32 as the data format.
-            # Such re-labeling will become unnecessary.
-            # See backend issue deeptools#4307.
-            return DataFormats.IEEE_FP32
+    if device_dtype == DataFormats.IEEE_INT32 and op in SPYRE_INT32_OPS:
+        return DataFormats.SENUINT32
     return device_dtype
 
 
@@ -1214,9 +1214,8 @@ def _get_sdsc_spec_data_format(op, arg_data_format):
     """Return the SDSC compute format for an operation.
 
     dtype-conversion ops (fp32↔int32) and native int32 ops (addi32toi32,
-    muli32toi32) must report IEEE_FP32 as the SDSC spec's compute format;
-    all other ops pass the tensor format through unchanged.
-    See backend issue deeptools#4307.
+    muli32toi32) are bound to IEEE_FP32.  All other ops pass the tensor
+    format through unchanged.
     """
     if op in (FP32TOINT32_OP, INT32TOFP32_OP, *SPYRE_INT32_OPS):
         return DataFormats.IEEE_FP32
@@ -1256,7 +1255,7 @@ def _collect_index_tensor_layouts(
             stick_dim = index_stick_syms[i]
             dim_order = dim_order + [stick_dim]
         index_tensor_layouts[i] = (dim_order, stick_dim)
-        active_dims = {d for d in dim_order if d is not stick_dim}
+        active_dims = {d for d in dim_order if d != stick_dim}
         index_active_dims[i] = active_dims
         logger.debug(
             f"Index tensor {i}: dim_order={dim_order}, stick_dim={stick_dim}, "
@@ -1399,7 +1398,7 @@ def _create_sdsc_tensors(
         ):
             if not (has_indirect_access and i in index_tensor_indices):
                 reduced_dims = [
-                    d for d in op_dim_order if d not in dim_order and d is not mb_sym
+                    d for d in op_dim_order if d not in dim_order and d != mb_sym
                 ]
                 dim_order = dim_order + reduced_dims
 
@@ -1464,7 +1463,7 @@ def _create_sdsc_tensors(
             # Locate live roles by coordinate identity so that slot cannot
             # shift an outer role onto the wrong device extent.
             physical_axis = _unambiguous_physical_axis(arg, dim, symbol_mapping)
-            if dim is stick_dim and physical_axis not in gap_factor_by_inner_axis:
+            if dim == stick_dim and physical_axis not in gap_factor_by_inner_axis:
                 # Keep the positional handling for ordinary stick dimensions.
                 # When a tiled-away axis precedes the stick's block axis,
                 # however, include its gap just as for a non-stick dimension:
@@ -1477,9 +1476,9 @@ def _create_sdsc_tensors(
             ):
                 scales[dim] = 1
             elif dim in reduced_dims and op_spec.op != "layernormscale":
-                scales[dim] = -2 if (stick_dim is None and dim is op_stick_dim) else -1
+                scales[dim] = -2 if (stick_dim is None and dim == op_stick_dim) else -1
             elif dim in reduced_dims and op_spec.op == "layernormscale":
-                scales[dim] = -2 if (dim is stick_dim) else -1
+                scales[dim] = -2 if (dim == stick_dim) else -1
             else:
                 scales[dim] = 1
 
@@ -1506,7 +1505,7 @@ def _create_sdsc_tensors(
                 dim_device_stride = math.prod(arg.device_size[-stride_idx - 1 :])
             offsets[dim] = 0
 
-            if dim is stick_dim and dim in sdsc_dim_advance:
+            if dim == stick_dim and dim in sdsc_dim_advance:
                 # Authoritative fact from coarse_tile.py: the stick dim's
                 # iteration-0 tile is tile_size elements out of
                 # supertile_count tiles total (supertile_count already folds
@@ -1596,7 +1595,7 @@ def _create_sdsc_tensors(
                 if not _is_conv(op_spec.op) and dev_dim_size > it_dim_size:
                     backGap[dim] = dev_dim_size - it_dim_size
                 elif (
-                    dim is not stick_dim
+                    dim != stick_dim
                     and dim not in reduced_dims
                     and not (_is_conv(op_spec.op) or _is_pool(op_spec.op))
                     and coord_without_offset.subs(symbol_mapping) == dim
@@ -1744,7 +1743,7 @@ def _create_sdsc_tensors(
             )
 
         # Index tensors carry 32-bit integer indices; re-label as SENUINT32 since
-        # the backend doesn't yet accept IEEE_INT32 in SDSC (deeptools #4307).
+        # the backend's gather index conversion requires SENUINT32.
         arg_data_format = (
             DataFormats.SENUINT32
             if (has_indirect_access and i in index_tensor_indices)
@@ -1782,6 +1781,7 @@ def _create_sdsc_tensors(
             is_index_tensor=is_idx_tensor,
             related_value_tensor_idx=related_val_idx,
             device_tile_advance_expr=arg.device_tile_advance_expr,
+            non_unified_shard_bytes=arg.non_unified_shard_bytes,
         )
         if arg.work_division is not None:
             sdsc_arg.work_division = arg.work_division.remap_symbols(symbol_mapping)
@@ -1850,6 +1850,11 @@ def _resolve_sdsc_size(expr: Expr, symbolic_dim_bounds: dict) -> int:
     codegen time from ShapeEnv, serialized as plain ints into the generated
     file) so this works during the reload phase when ShapeEnv is gone.
     Falls back to _concretize_for_sdsc for concrete expressions.
+
+    The symbolic branch is deprecated: only the symbolic-SDSC route reaches it.
+    The explicit-loop route that supersedes that one puts no dimension symbol in
+    an SDSC, so every size here is already concrete and takes the fallback.
+    TODO(issue#5890): drop the symbolic branch with the symbolic-SDSC route.
     """
     # ``symbolic_dim_bounds`` is keyed by a single symbol name, so it can only
     # answer for a single-symbol expression; a multi-symbol one falls through to
@@ -2372,15 +2377,14 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     elif is_restickify:
         _extend_restickify_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
 
-    # Grow the index-entry iteration to the padded output device_size so a
-    # partial-last-stick gather splits stick-aligned across cores. The output's
-    # entry-dim device_size was rounded up to the index stick multiple at layout
-    # time (enforce_indirect_access_layout); match the SDSC iteration to it BEFORE
-    # _create_sdsc_tensors so the output's per-core base stride is computed from
-    # the padded (stick-aligned) size rather than the shorter logical count.
-    # Otherwise the per-core base lands element-aligned (mid-stick) and the split
-    # miscompiles. No-op unless the output was actually padded (device_size >
-    # iteration), i.e. only for the multi-core partial-stick case.
+    # Grow a core-split index-entry iteration to the padded output device_size.
+    # The output's entry-dim device_size was rounded up to the index stick
+    # multiple at layout time (enforce_indirect_access_layout) so the entry dim
+    # can split in whole index sticks; matching the SDSC iteration to it BEFORE
+    # _create_sdsc_tensors puts each core's output base on a stick boundary
+    # rather than mid-stick. An unsplit entry dim keeps its logical count: the
+    # grown iteration would dereference the index's padding lanes as table rows,
+    # and those hold whatever the index's producer left there.
     if has_indirect_access and _spyre_config.sencores > 1:
         idx_arg = op_spec.args[next(iter(index_tensor_indices))]
         idx_stick = idx_arg.device_coordinates[-1]
@@ -2390,9 +2394,19 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             for pos, coord in enumerate(out_arg.device_coordinates[:-1]):
                 if coord.free_symbols == {entry_c}:
                     entry_mb = symbol_mapping.get(entry_c)
-                    dev = int(out_arg.device_size[pos])
+                    # Never iterate past the index's allocated entries: the padding
+                    # lanes past them are uninitialized and read as indices.
+                    idx_pos = next(
+                        i
+                        for i, c in enumerate(idx_arg.device_coordinates[:-1])
+                        if c.free_symbols == {entry_c}
+                    )
+                    idx_eps = idx_arg.device_dtype.elems_per_stick()
+                    idx_extent = int(idx_arg.device_size[idx_pos]) * idx_eps
+                    dev = min(int(out_arg.device_size[pos]), idx_extent)
                     if (
                         entry_mb in sdsc_iteration_space
+                        and dim_splits[entry_mb] > 1
                         and dev > sdsc_iteration_space[entry_mb]
                     ):
                         sdsc_iteration_space[entry_mb] = dev

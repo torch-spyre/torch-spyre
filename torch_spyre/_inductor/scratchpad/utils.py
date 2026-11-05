@@ -28,6 +28,10 @@ from torch.utils._sympy.value_ranges import ValueRanges, bound_sympy
 
 from torch_spyre._C import get_device_size_in_bytes
 from torch_spyre._inductor.ir import FixedTiledLayout
+from torch_spyre._inductor.loop_facts import (
+    output_advances_anywhere,
+    read_advances_anywhere,
+)
 from torch_spyre._inductor.pass_utils import (
     PerCoreView,
     _per_core_view_on_buf,
@@ -408,13 +412,9 @@ def _is_tiled_advancing(op: Operation) -> bool:
     layout = getattr(op, "layout", None)
     if not isinstance(layout, FixedTiledLayout):
         return False
-    loop_info = getattr(op, "loop_info", None)
-    if loop_info is None:
-        return False
-    if any(dims for dims in loop_info.output_tiled_dims):
-        return True
-    squeezed_advance_output = getattr(loop_info, "squeezed_advance_output", None) or []
-    return any(level for level in squeezed_advance_output)
+    # The record test (False without a loop_info) lives in loop_facts; the
+    # layout gate above is an LX question and stays here.
+    return output_advances_anywhere(op)
 
 
 def _is_read_advancing_anywhere(
@@ -443,37 +443,21 @@ def _is_read_advancing_anywhere(
     ``loop_info.tiled_dims_per_read`` by position.
     """
     for reader_op, dep in buf_user_deps.get(name, []):
-        loop_info = getattr(reader_op, "loop_info", None)
-        if loop_info is None:
+        if getattr(reader_op, "loop_info", None) is None:
             continue
+        # read_advances_anywhere answers from the record at dep's position
+        # among the reader's MemoryDep reads, and is False when dep is not
+        # one of them (it is name's write on this op), when dep lies past
+        # the end of tiled_dims_per_read, and when every level of its tiled
+        # and squeezed entries is empty (e.g. [[], []]: _general_tile_advance
+        # contributes no term for an empty level).  The squeezed entry
+        # covers a dim tiled down to per-tile extent 1, which is squeezed out
+        # of the read's own index and so never appears in tiled_dims_per_read
+        # (see loop_info.py's squeezed_advance_per_read docstring).
         read_deps = [
             d for d in op_read_writes(reader_op).reads if isinstance(d, MemoryDep)
         ]
-        if dep not in read_deps:
-            continue  # dep is name's write on this op, not a read
-        dep_idx = read_deps.index(dep)
-        if dep_idx >= len(loop_info.tiled_dims_per_read):
-            continue
-        # Mirrors _general_tile_advance's own per-level loop: a dep whose
-        # outer per-level list is non-empty but every level's own
-        # (dim, extent) list is empty (e.g. [[], []]) still advances by
-        # zero -- _general_tile_advance's `if not dim_extent_pairs:
-        # continue` never contributes a term for such a level, so the
-        # resulting device_tile_advance_expr is None, not merely small.
-        if any(loop_info.tiled_dims_per_read[dep_idx]):
-            return True
-        # Mirror _is_tiled_advancing's squeezed_advance_output check on the
-        # read side: a dim tiled down to per-tile extent 1 is squeezed out
-        # of this read's own index, so it never appears in
-        # tiled_dims_per_read even though the read's device address
-        # genuinely advances every iteration (see loop_info.py's
-        # squeezed_advance_per_read docstring).
-        squeezed_advance_per_read = (
-            getattr(loop_info, "squeezed_advance_per_read", None) or []
-        )
-        if dep_idx < len(squeezed_advance_per_read) and any(
-            squeezed_advance_per_read[dep_idx]
-        ):
+        if read_advances_anywhere(reader_op, dep, reads=read_deps):
             return True
     return False
 
