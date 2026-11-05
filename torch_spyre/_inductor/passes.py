@@ -16,7 +16,7 @@ import contextlib
 import inspect
 import logging
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Iterable
 from typing import Optional, Any, Callable
 
 import torch
@@ -33,7 +33,7 @@ except ImportError:
 
 
 from torch._inductor.graph import GraphLowering
-from torch._inductor.ir import Operation
+from torch._inductor.ir import MultiOutput, Operation
 from torch._inductor.scheduler import BaseSchedulerNode
 
 from . import timing_recorder
@@ -106,7 +106,6 @@ from .dump_cost_model import dump_cost_model
 from . import cost_model_pass as cost_model_pass_module
 from .cost_model_pass import CostReport, cost_model_pass
 from .split_multi_ops import split_multi_ops, validate_ops
-
 
 logger = get_inductor_logger("passes")
 
@@ -697,6 +696,9 @@ class CustomPreSchedulingPasses:
             event.meta["output_operations"] = _count_ops(graph.operations)
             event.meta.update(COUNTERS.since(pass_counts))
 
+        with timing_recorder.stage(f"validate:{pipeline}:{pass_name}"):
+            check_operation_order(all_ops(graph.operations), pass_name)
+
         if logger.isEnabledFor(logging.INFO):
             logger.info(
                 "elapsed %5dms  %s",
@@ -712,3 +714,68 @@ class CustomPreSchedulingPasses:
 
     def uuid(self) -> Any | None:
         return _uuid(self.passes)
+
+
+class InvalidGraphError(AssertionError):
+    """A pre-scheduling pass left ``graph.operations`` ill formed."""
+
+
+def _output_names(op: Operation) -> list[str]:
+    names = [op.get_name()]
+    try:
+        names.extend(buf.get_name() for buf in op.get_outputs())
+    except NotImplementedError:
+        pass
+    return names
+
+
+def _read_names(op: Operation) -> set[str]:
+    """Names of the buffers ``op`` reads.
+
+    Uses ``get_read_writes()``, which the Scheduler builds its dependencies
+    from and which nothing caches on the node. ``get_read_names()`` caches the
+    traced body (``inner_fn_opcount``), which could leave a stale answer for a
+    later reader once a pass rewrites the body, and ``get_reads()`` raises
+    ``NotImplementedError`` on a ``Reduction`` body.
+    """
+    try:
+        names = {dep.name for dep in op.get_read_writes().reads}
+    except NotImplementedError:
+        # An operation that does not describe its reads (some extern kernels).
+        names = set(op.get_read_names())
+    # A MultiOutput reads its parent; say so even if get_read_writes() stops
+    # reporting it, since the order of the two is what codegen relies on.
+    if isinstance(op, MultiOutput):
+        names.update(inp.get_name() for inp in op.inputs if hasattr(inp, "get_name"))
+    return names
+
+
+def check_operation_order(operations: Iterable[Operation], pass_name: str) -> None:
+    """Raise :class:`InvalidGraphError` unless ``operations`` is topologically
+    ordered.
+
+    Each operation must come after the producer of every buffer it reads. A name
+    that no operation in the list produces (a graph input, a constant, a buffer
+    of an enclosing graph) is outside the check. A read of an operation's own
+    output is allowed: a mutation reads the buffer it updates in place.
+
+    Args:
+        operations: The flat list of leaf operations, in program order.
+        pass_name: The pass that just ran, named in the error.
+    """
+    ops = list(operations)
+    producer: dict[str, int] = {}
+    for i, op in enumerate(ops):
+        for name in _output_names(op):
+            producer.setdefault(name, i)
+
+    for i, op in enumerate(ops):
+        for name in sorted(_read_names(op)):
+            j = producer.get(name)
+            if j is not None and j > i:
+                raise InvalidGraphError(
+                    f"after pre-scheduling pass {pass_name}: operation "
+                    f"{op.get_name()} ({type(op).__name__}) at position {i} "
+                    f"reads {name}, which {ops[j].get_name()} "
+                    f"({type(ops[j]).__name__}) produces later, at position {j}"
+                )

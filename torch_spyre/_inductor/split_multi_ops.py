@@ -20,7 +20,6 @@ import torch.fx as fx
 from torch._inductor.ir import (
     ComputedBuffer,
     FixedLayout,
-    MultiOutput,
     MutationLayoutSHOULDREMOVE,
     Pointwise,
     Reduction,
@@ -473,6 +472,9 @@ def _lower_fx_node(node, gl, ops, idx):
     start = len(gl.operations)
     tb = gl.run_node(node)
     gl.env[node] = tb  # run_node does not record it in the env
+    # buf is the lowering's result, not every operation it registered: for a
+    # host fallback it is the MultiOutput, registered after its FallbackKernel.
+    # new_ops below holds all of them, so the whole group moves together.
     buf = tb.data.data
     new_ops = [gl.operations[i] for i in range(start, len(gl.operations))]
     for new_op in new_ops:
@@ -992,23 +994,3 @@ def split_multi_ops(graph: GraphLowering):
             op.get_name(),
             len(intermediate_ops),
         )
-
-    _check_multi_output_order(operations)
-
-
-def _check_multi_output_order(operations) -> None:
-    """Assert every MultiOutput comes after the FallbackKernel it reads.
-
-    Lowering an intermediate can register a FallbackKernel and its MultiOutput;
-    _lower_fx_node must move both ahead of the consumer, in order.
-    """
-    pos = {id(op): i for i, op in enumerate(operations)}
-    for i, op in enumerate(operations):
-        if isinstance(op, MultiOutput):
-            parent = op.inputs[0]
-            j = pos.get(id(parent))
-            if j is None or j > i:
-                raise AssertionError(
-                    f"split_multi_ops: {op.get_name()} at {i} precedes its parent "
-                    f"{parent.get_name()} at {j}"
-                )
