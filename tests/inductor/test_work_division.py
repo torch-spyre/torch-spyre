@@ -1612,7 +1612,7 @@ class TestWorkDivisionContextAnswers(unittest.TestCase):
             transport_it_space={i0: 8, i1: 8},
         )
         self.assertFalse(
-            ctx._representable_by_index_coeff({i0: 4, i1: 1}),
+            ctx.representable_by_index_coeff({i0: 4, i1: 1}),
             "i1's transport extent (8) must be used, not its tile-adjusted extent (1)",
         )
 
