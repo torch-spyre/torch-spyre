@@ -9421,6 +9421,42 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
         },
         # -----------------------------------------------------------------------
+        # Eager floor division: Tensor.__floordiv__ / torch.floor_divide dispatch
+        # aten::floor_divide, which needs its own eager kernel (compile mode
+        # decomposes it to div.Tensor_mode and never reaches that dispatch).
+        # -----------------------------------------------------------------------
+        ("test_floor_divide_eager", "test_floor_divide_eager_cpu"): {
+            "param_sets": {
+                # issue 4643: ceil-division idiom on an int64 count tensor
+                "int64_floordiv_scalar": (
+                    torch.tensor(
+                        [0, 1, 31, 32, 33, 63, 64] + [0] * 121, dtype=torch.int64
+                    )
+                    + 31,
+                    32,
+                    lambda x, s: x // s,
+                ),
+                "int64_floor_divide_scalar": (
+                    torch.tensor(
+                        [0, 1, 31, 32, 33, 63, 64] + [0] * 121, dtype=torch.int64
+                    )
+                    + 31,
+                    32,
+                    torch.floor_divide,
+                ),
+                "int64_floordiv_neg": (
+                    torch.tensor([-12, -21, 31, -7], dtype=torch.int64),
+                    4,
+                    lambda x, s: x // s,
+                ),
+                "int64_floordiv_tensor": (
+                    torch.tensor([0, 1, 31, 32, 33, 63, 64, 100], dtype=torch.int64),
+                    torch.tensor([32, 32, 32, 32, 32, 32, 32, 7], dtype=torch.int64),
+                    lambda x, y: x // y,
+                ),
+            },
+        },
+        # -----------------------------------------------------------------------
         # Mixed-dtype division (true division and floor division):
         # tests type promotion across operand dtype combinations.
         # -----------------------------------------------------------------------
@@ -14440,7 +14476,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             offs_2d2d,
         )
 
-    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
     def test_div_rounding_mode_cpu(self, rounding_mode, x, y):
         """Test torch.div with different rounding modes."""
@@ -14457,7 +14492,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # the class of error the quotient-correction step exists to fix.
         self.compare_with_cpu(fn, x, y, atol=0, rtol=0)
 
-    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
     def test_div_mixed_dtype_cpu(self, op, x, y):
         """Test torch.div type promotion across mixed tensor dtypes."""
@@ -14466,7 +14500,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         tol_kwargs = {"atol": 0, "rtol": 0} if op is _floor_div else {}
         self.compare_with_cpu(op, x, y, **tol_kwargs)
 
-    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
     def test_div_scalar_dtypes_cpu(self, op, x, scalar):
         """Test torch.div type promotion with Python scalar operands."""
@@ -14474,6 +14507,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             scalar = 1.0
         tol_kwargs = {"atol": 0, "rtol": 0} if op is _floor_div else {}
         self.compare_with_cpu(op, x, scalar, **tol_kwargs)
+
+    @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
+    def test_floor_divide_eager_cpu(self, x, y, fn):
+        # Eager-only: `//` / torch.floor_divide must have a spyre eager kernel.
+        # Floor division is exact integer arithmetic, so compare exactly.
+        self.compare_with_cpu(
+            fn, x, y, atol=0, rtol=0, run_compile=False, run_eager=True
+        )
 
 
 _TEST_LARGE_MATMUL_FP32_PROXY_SHAPES = _derive_test_large_matmul_fp32_proxy_shapes(

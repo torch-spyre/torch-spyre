@@ -462,6 +462,7 @@ COMPILED_OPS = [
     aten.bmm,
     aten.cat,
     aten.div,
+    aten.floor_divide,
     aten.exp,
     aten.floor,
     aten.trunc,
