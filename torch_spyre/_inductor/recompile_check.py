@@ -42,6 +42,8 @@ import warnings
 
 import torch
 
+from torch_spyre.ops.warning_types import RecompileWarning
+
 MODE_ENV = "TORCH_SPYRE_RECOMPILE_CHECK"
 _MODES = ("warn", "error", "all", "off")
 _DEFAULT_MODE = "warn"
@@ -55,10 +57,6 @@ _ledger: dict[str, dict[str, float]] = {}
 
 class RecompileError(RuntimeError):
     """A recompile broke a declared size range, in ``error`` mode."""
-
-
-class RecompileWarning(UserWarning):
-    """User code recompiled."""
 
 
 def _mode():

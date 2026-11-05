@@ -30,11 +30,11 @@ import torch_spyre  # noqa: F401  registers the "spyre" device
 from torch_spyre._inductor.narrowing_check import (
     MODE_ENV,
     DeclaredRangeNarrowedError,
-    DeclaredRangeNarrowedWarning,
     rejected_sizes,
 )
 from torch_spyre._inductor.wsr import for_each_tile
 from torch_spyre.constants import DEVICE_NAME
+from torch_spyre.ops.warning_types import DeclaredRangeNarrowedWarning
 
 TILE = 64
 MAX_ROWS = 512

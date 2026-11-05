@@ -33,13 +33,13 @@ from torch_spyre._inductor import recompile_check
 from torch_spyre._inductor.recompile_check import (
     MODE_ENV,
     RecompileError,
-    RecompileWarning,
     compile_ledger,
     install_recompile_check,
     reset_compile_ledger,
 )
 from torch_spyre._inductor.wsr import for_each_tile
 from torch_spyre.constants import DEVICE_NAME
+from torch_spyre.ops.warning_types import RecompileWarning
 
 COLS = 8
 SPEC = {0: {"min": 128, "max": 512, "granularity": 64}}
