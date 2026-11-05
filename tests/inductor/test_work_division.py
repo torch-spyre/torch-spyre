@@ -5227,8 +5227,13 @@ class TestJointTilingAndDivisionExemption(unittest.TestCase):
     def _tiled_op(self, marked):
         op = MagicMock()
         op.get_name.return_value = "buf0"
+        # One level, as CoarseTileInfo always has: group id, count and the
+        # tiled-dim lists are the same length.
         op.loop_info = SimpleNamespace(
-            loop_tiled_dims=[[0]], loop_tiled_reduction_dims=[[]]
+            loop_group_id=(0,),
+            loop_count=[8],
+            loop_tiled_dims=[[0]],
+            loop_tiled_reduction_dims=[[]],
         )
         op.data = SimpleNamespace(ranges=[sympy.Integer(8)])
         op.dim_hints = []

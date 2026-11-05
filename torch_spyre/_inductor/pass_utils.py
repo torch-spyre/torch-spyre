@@ -83,6 +83,7 @@ from .constants import (
 )
 from .ir import FixedTiledLayout, SpyreConstantFallback
 from .logging_utils import get_inductor_logger
+from .loop_facts import enclosing_loops
 from .loop_info import copy_op_metadata
 from .loop_node import LoopNode, all_ops
 from .pass_counters import (
@@ -1356,8 +1357,8 @@ def broadcast_batch_vars(op: Operation, x_dep: MemoryDep, out_dep: MemoryDep) ->
     that dim's squeezed symbol entirely (broadcast), rather than genuinely
     being tiled on it too.
     """
-    loop_info = getattr(op, "loop_info", None)
-    if loop_info is None or not loop_info.loop_tiled_dims:
+    levels = enclosing_loops(op)
+    if not any(level.tiled_dims for level in levels):
         return set()
 
     # Map each squeezed output-dim position (index into out_dep.var_names) to
@@ -1375,8 +1376,8 @@ def broadcast_batch_vars(op: Operation, x_dep: MemoryDep, out_dep: MemoryDep) ->
             it_idx += 1
 
     excess: set = set()
-    for level_dims in loop_info.loop_tiled_dims:
-        for pos in level_dims:
+    for level in levels:
+        for pos in level.tiled_dims:
             squeezed = raw_to_squeezed.get(pos)
             if squeezed is None or squeezed >= len(out_dep.var_names):
                 continue

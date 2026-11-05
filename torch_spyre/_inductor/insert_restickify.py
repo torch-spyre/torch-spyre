@@ -26,6 +26,7 @@ import torch
 from .constants import ELIDED_COPY_BACK_ATTR
 from .errors import Unsupported
 from .ir import FixedTiledLayout, SpyreEmptyFallback
+from .loop_facts import counted_loop_path, enclosing_loops
 from .loop_info import ReadCopyElisionRecord
 from .optimize_restickify import AnyInNode, EdgeCostMap
 from .logging_utils import get_inductor_logger
@@ -513,10 +514,8 @@ def insert_restickify_on_node_inputs(
         operations.insert(op_index, restick_buff)
         op_index += 1  # consumer shifted right by 1
 
-        source_group_id = getattr(
-            getattr(old_name_buf, "loop_info", None), "loop_group_id", ()
-        )
-        consumer_group_id = getattr(getattr(op, "loop_info", None), "loop_group_id", ())
+        source_group_id = counted_loop_path(old_name_buf, include_extern=True)
+        consumer_group_id = counted_loop_path(op, include_extern=True)
         shared_loop_depth = 0
         for source_level, consumer_level in zip(
             source_group_id, consumer_group_id, strict=False
@@ -653,9 +652,8 @@ def finalize_layouts(graph: GraphLowering) -> None:
             # the device coordinate system.
             loop_info = getattr(op, "loop_info", None)
             if loop_info is not None and isinstance(op.layout, FixedTiledLayout):
-                all_tiled_rdims_empty = all(
-                    not dims
-                    for dims in getattr(loop_info, "loop_tiled_reduction_dims", [])
+                all_tiled_rdims_empty = not any(
+                    level.tiled_reduction_dims for level in enclosing_loops(op)
                 )
                 if not all_tiled_rdims_empty:
                     # If accum_full already has a FixedTiledLayout,

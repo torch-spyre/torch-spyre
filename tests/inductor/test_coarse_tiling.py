@@ -10766,6 +10766,22 @@ class TestHoistedInputClone(unittest.TestCase):
         self.assertEqual(counted_loop_group_path(hoisted_const), ())
         self.assertIs(counted_loop_entry([hoisted_const, member], member), member)
 
+    def test_the_allocator_path_matches_the_scratchpad_path(self):
+        # allocator._access_group_path says it mirrors utils.counted_loop_group_path;
+        # nothing else pins it (the one other test patches it out).
+        from torch_spyre._inductor.scratchpad.allocator import _access_group_path
+        from torch_spyre._inductor.scratchpad.utils import counted_loop_group_path
+
+        for op, want in (
+            (_LoopOp("plain"), ()),
+            (_LoopOp("outer", (0,)), (0,)),
+            (_LoopOp("inner", (0, 1)), (0, 1)),
+            (_extern_op("hoisted_const", (0,)), ()),
+        ):
+            with self.subTest(op=op.get_name()):
+                self.assertEqual(_access_group_path(op), want)
+                self.assertEqual(counted_loop_group_path(op), want)
+
     def test_entry_is_the_loop_start_the_lifetime_overrides_reserve_from(self):
         """The hoist position and the reserved interval are the same index."""
         from torch_spyre._inductor.scratchpad import utils as utils_module

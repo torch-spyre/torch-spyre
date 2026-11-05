@@ -140,6 +140,7 @@ from torch_spyre._inductor.constants import (
 
 from torch_spyre._inductor import config
 from torch_spyre._inductor.logging_utils import get_inductor_logger, warn_once
+from torch_spyre._inductor.loop_facts import counted_loop_path, enclosing_loops
 from torch_spyre._inductor.loop_info import (
     CoarseTileInfo,
     LoopCarryRecord,
@@ -359,7 +360,6 @@ def _coarse_tile_loop_trip_count(op: Any) -> int:
     """
     if not _is_coarse_tiled(op):
         return 1
-    loop_info = op.loop_info
 
     def _resolved(c) -> int:
         try:
@@ -367,7 +367,9 @@ def _coarse_tile_loop_trip_count(op: Any) -> int:
         except (TypeError, ValueError):
             return 1
 
-    return max(1, math.prod(_resolved(c) for c in loop_info.loop_count))
+    return max(
+        1, math.prod(_resolved(level.trip_count) for level in enclosing_loops(op))
+    )
 
 
 @dataclass(frozen=True)
@@ -420,9 +422,7 @@ class DrainPlan:
 def _access_group_path(op: Operation) -> tuple[int, ...]:
     """The op's counted-loop group path, mirroring utils.group_path exactly."""
 
-    if isinstance(op, ExternKernel):
-        return ()
-    return tuple(getattr(getattr(op, "loop_info", None), "loop_group_id", ()) or ())
+    return counted_loop_path(op)
 
 
 def _is_reinterpret_output_entry(entry: Any) -> bool:
