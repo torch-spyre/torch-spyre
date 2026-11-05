@@ -3044,7 +3044,7 @@ def redirect_computed_buffer_reads(
     )
     new_buf.operation_name = op.operation_name
     preserve_provenance(op, new_buf, pass_name=pass_name, reason=reason)
-    copy_op_metadata(op, new_buf)
+    copy_op_metadata(op, new_buf, layout_state=True)
 
     op_idx = operations.index(op)
     operations[op_idx] = new_buf
