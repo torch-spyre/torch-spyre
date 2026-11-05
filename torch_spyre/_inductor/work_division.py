@@ -70,8 +70,8 @@ from .pass_utils import (
     commit_iteration_space_ownership,
     op_out_coords,
     op_read_writes,
-    select_work_division_transport_indexes,
     unrepresentable_splits_by_index_coeff,
+    work_division_transport_indexes,
     _per_core_view_from_prep,
     _prepare_per_core_view,
     tile_ownership_view,
@@ -849,23 +849,9 @@ def apply_splits(op: ComputedBuffer, splits: dict) -> None:
     ``WorkDivisionContext.is_legal`` -- the same representability check --
     before the solver ever sees them.
     """
-    it_space = iteration_space_from_op(op)
-    try:
-        write_index, read_index = select_work_division_transport_indexes(
-            op, op_read_writes(op), it_space
-        )
-    except Unsupported:
-        write_index = read_index = None
-    if write_index is not None:
-        problems = unrepresentable_splits_by_index_coeff(
-            splits, it_space, write_index, read_index
-        )
-        if problems:
-            raise Unsupported(
-                f"work division for {op.get_name()} split {splits} cannot be "
-                "represented by the scheduler's coefficient-keyed transport: "
-                f"{'; '.join(problems)}."
-            )
+    work_division_transport_indexes(
+        op, op_read_writes(op), iteration_space_from_op(op), splits
+    )
     commit_iteration_space_ownership(op, splits)
 
 
@@ -898,16 +884,15 @@ class WorkDivisionContext:
     constraints: ConstraintResult
     # Hard per-axis floors ``span_reduction_pass`` has already committed.
     span_min_splits: dict[Symbol, int]
-    # The write/read indexes the scheduler's coefficient-keyed transport will
-    # key this op's committed split by (``select_work_division_transport_indexes``),
-    # or ``None`` when the op has no ``MemoryDep`` write and so never goes
-    # through that transport -- in which case no split is representability-
-    # checked. Used by :meth:`is_legal` to reject a split that transport
-    # cannot carry losslessly.
+    # The write/read indexes the scheduler transport uses; None means no
+    # indexed write exists.
     write_index: Expr | None
     read_index: Expr | None
-    # factor_domain is asked once per axis by the enumeration and again per
-    # candidate by is_legal; the derivation is sympy-heavy, so memoize it.
+    # The transport's unit-axis carve-out must use the same full frame as
+    # commit-time checks, even when this context was built for a tiled frame.
+    # Cache it once rather than re-deriving the sympy iteration space per candidate.
+    transport_it_space: dict[Symbol, Expr] | None = None
+    # candidate by is_legal; memoize its sympy-heavy derivation.
     _factor_domains: dict[Symbol, list[int]] = dataclasses.field(
         default_factory=dict, init=False, repr=False, compare=False
     )
@@ -956,22 +941,13 @@ class WorkDivisionContext:
 
     def _representable_by_index_coeff(self, splits: dict[Symbol, int]) -> bool:
         """Whether the scheduler's coefficient-keyed transport can carry
-        ``splits`` without loss -- see ``unrepresentable_splits_by_index_coeff``.
-
-        Uses a fresh, un-tiled ``iteration_space_from_op(self.op)`` rather
-        than ``self.it_space``/``self.it_space_adjusted``: those are the
-        per-tile frame under a non-trivial ``tiling``, whose extents can be
-        smaller than the op's real ones (a stick var with a small element
-        extent can adjust to a per-tile size of 1). The commit-time gates
-        (``apply_splits``, ``finalize_work_division_for_scheduler``) judge
-        the whole, un-tiled op, so the size-1 carve-out here must use the
-        same real extents they do, or this could admit a candidate at
-        enumeration time that the commit gate then rejects.
+        ``splits`` without loss, using the op's full, un-tiled iteration space.
         """
         if self.write_index is None:
             return True
+        full_it_space = self.transport_it_space or self.it_space
         return not unrepresentable_splits_by_index_coeff(
-            splits, iteration_space_from_op(self.op), self.write_index, self.read_index
+            splits, full_it_space, self.write_index, self.read_index
         )
 
     def obeys_op_constraints(self, splits: dict[Symbol, int]) -> bool:
@@ -1060,7 +1036,8 @@ def work_division_context_for_op(
     rejects by value, and would silently disagree with the frame the allocator
     prices the same candidate on.
     """
-    it_space = iteration_space_from_op(op)
+    transport_it_space = iteration_space_from_op(op)
+    it_space = transport_it_space
     if tiling is not None and not tiling.is_untiled:
         from .wsr.tile_prediction import predict_frame
 
@@ -1096,12 +1073,8 @@ def work_division_context_for_op(
             committed_splits={},
         )
     )
-    try:
-        write_index, read_index = select_work_division_transport_indexes(
-            op, rw, it_space
-        )
-    except Unsupported:
-        write_index = read_index = None
+    indexes = work_division_transport_indexes(op, rw, it_space)
+    write_index, read_index = indexes if indexes is not None else (None, None)
     return WorkDivisionContext(
         op=op,
         max_cores=max_cores,
@@ -1115,6 +1088,7 @@ def work_division_context_for_op(
         span_min_splits=_span_min_splits(op),
         write_index=write_index,
         read_index=read_index,
+        transport_it_space=transport_it_space,
     )
 
 
@@ -1995,24 +1969,15 @@ def _apply_user_hint(
             f"{conflicting_domains} or span floors {below_span_floor}."
         )
 
-    try:
-        write_index, read_index = select_work_division_transport_indexes(
-            op, op_read_writes(op), it_space_adjusted
+    rw = op_read_writes(op)
+    if any(isinstance(dep, MemoryDep) for dep in rw.writes):
+        work_division_transport_indexes(
+            op,
+            rw,
+            iteration_space_from_op(op),
+            splits,
+            label="work_division_hint",
         )
-    except Unsupported:
-        # The transport is not used when the op has no MemoryDep write.
-        write_index = read_index = None
-    if write_index is not None:
-        problems = unrepresentable_splits_by_index_coeff(
-            splits, it_space_adjusted, write_index, read_index
-        )
-        if problems:
-            raise Unsupported(
-                f"work_division_hint: {op_name} split {splits} cannot be "
-                "represented by the scheduler's coefficient-keyed transport: "
-                f"{'; '.join(problems)}."
-            )
-
     return splits
 
 

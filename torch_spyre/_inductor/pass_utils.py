@@ -2395,6 +2395,45 @@ def select_work_division_transport_indexes(
     return write_index, read.index if read is not None else write_index
 
 
+def work_division_transport_indexes(
+    op: Operation,
+    rw: ReadWrites,
+    it_space: dict[sympy.Symbol, sympy.Expr],
+    splits: dict[sympy.Symbol, int] | None = None,
+    *,
+    label: str | None = None,
+) -> tuple[sympy.Expr, sympy.Expr] | None:
+    """Select scheduler indexes; optionally reject an unrepresentable split.
+
+    Operations without an indexed write do not use the coefficient transport.
+    Legality callers pass ``splits`` to apply the same losslessness check;
+    candidate contexts omit it and cache the selected indexes.
+    """
+    if not any(isinstance(dep, MemoryDep) for dep in rw.writes):
+        return None
+    write_index, read_index = select_work_division_transport_indexes(op, rw, it_space)
+    if splits is None:
+        return write_index, read_index
+    problems = unrepresentable_splits_by_index_coeff(
+        splits, it_space, write_index, read_index
+    )
+    if problems:
+        if label == "work_division_hint":
+            message = (
+                f"{label}: {op.get_name()} split {splits} cannot be represented "
+                "by the scheduler's coefficient-keyed transport: "
+                f"{'; '.join(problems)}."
+            )
+        else:
+            message = (
+                f"work division for {op.get_name()} split {splits} cannot be "
+                "represented by the scheduler's coefficient-keyed transport: "
+                f"{'; '.join(problems)}."
+            )
+        raise Unsupported(message)
+    return write_index, read_index
+
+
 def finalize_work_division_for_scheduler(graph: GraphLowering) -> None:
     """Convert committed symbol ownership to legacy scheduler split transport.
 
@@ -2405,25 +2444,14 @@ def finalize_work_division_for_scheduler(graph: GraphLowering) -> None:
         ownership = getattr(op, "iteration_space_ownership", None)
         if ownership is None:
             continue
-        rw = op_read_writes(op)
         it_space = iteration_space_from_op(op)
-        try:
-            write_index, read_index = select_work_division_transport_indexes(
-                op, rw, it_space
-            )
-        except Unsupported:
-            continue
-        problems = unrepresentable_splits_by_index_coeff(
-            ownership.work_slices, it_space, write_index, read_index
+        rw = op_read_writes(op)
+        indexes = work_division_transport_indexes(
+            op, rw, it_space, ownership.work_slices
         )
-        if problems:
-            raise Unsupported(
-                f"work division for {op.get_name()} cannot be represented by "
-                "the scheduler's coefficient-keyed transport (this should be "
-                "unreachable: is_legal/_apply_user_hint/apply_splits are "
-                f"expected to reject such a split before it is committed): "
-                f"{'; '.join(problems)}"
-            )
+        if indexes is None:
+            continue
+        write_index, read_index = indexes
         op.op_it_space_splits = splits_by_index_coeff(
             ownership.work_slices, write_index, read_index
         )
