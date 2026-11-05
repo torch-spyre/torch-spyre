@@ -1841,9 +1841,22 @@ def is_padded(graph: GraphLowering, node: IRNode | Layout | SpyreTensorLayout) -
     return total_valid_elems < total_size
 
 
+def _input_padding_range(layout: SpyreTensorLayout) -> Set:
+    """Possible values in the padding of a padded graph input.
+
+    A graph input may have been DMA'd from the host or written by an earlier
+    graph or eager kernel, so the padding is only known when the runtime
+    recorded a constant padding value in the tensor's layout. The layout,
+    padding state included, is part of the dynamo guard, so a kernel compiled
+    for a known padding value is not reused for a tensor without one.
+    """
+    if (value := layout.padding_value) is not None:
+        return FiniteSet(value)
+    return _user_values()
+
+
 _ASSUMED_PADDING: dict[type, Set] = {
-    # input buffers are zero paddded in DMA transfer to the device
-    InputBuffer: FiniteSet(0),
+    # Graph inputs (InputBuffer) are handled by _input_padding_range.
     # Each collective behaves a bit differently wrt. to padding,
     # but the fact is that we don't know what is being read from
     # other processes, so for now it's better to be conservative.
@@ -1881,7 +1894,7 @@ def track_padding_value(graph: GraphLowering) -> None:
                     assert layout is not None
                     buf_is_padded = is_padded(graph, layout)
                     tracer.buffer_range[dep.name] = (
-                        _ASSUMED_PADDING[InputBuffer] if buf_is_padded else EmptySet
+                        _input_padding_range(layout) if buf_is_padded else EmptySet
                     )
                 else:
                     assert dep.name in tracer.buffer_range, (
@@ -1916,9 +1929,10 @@ def track_padding_value(graph: GraphLowering) -> None:
                     target = target.data
                 target_name = target.maybe_get_name()
                 if target_name is not None and isinstance(target, InputBuffer):
+                    target_layout = _get_layout(graph, target)
                     tracer.buffer_range[target_name] = (
-                        _ASSUMED_PADDING[InputBuffer]
-                        if is_padded(graph, target)
+                        _input_padding_range(target_layout)
+                        if target_layout is not None and is_padded(graph, target)
                         else EmptySet
                     )
 

@@ -53,7 +53,6 @@ from torch_spyre._inductor.padding import (
     _is_dense_flattened_coordinate,
     _is_nonoverlapping_aligned_stick_coordinate,
     _restickify_input_required_extent,
-    _ASSUMED_PADDING,
 )
 from torch_spyre._inductor.scratchpad import allocator
 from torch_spyre._inductor.scratchpad import utils as scratchpad_utils
@@ -1231,8 +1230,10 @@ class TestCoordinateMasking(unittest.TestCase):
     @parametrize("dtype", COORD_MASK_DTYPES)
     @parametrize("shape", SHAPES)
     def test_division(self, shape, dtype) -> None:
-        a_spyre = torch.full(shape, 2, dtype=dtype, device="spyre")
-        b_spyre = torch.full(shape, 2, dtype=dtype, device="spyre")
+        # Copied from the host, so the padding is recorded as 0: 0 / 0 must be
+        # coordinate-masked.
+        a_spyre = torch.full(shape, 2, dtype=dtype).to("spyre")
+        b_spyre = torch.full(shape, 2, dtype=dtype).to("spyre")
 
         def fn(x, y):
             return x / y
@@ -1244,8 +1245,6 @@ class TestCoordinateMasking(unittest.TestCase):
         exposed_padding = try_reinterpret_host_shape(result, unpadded).cpu()[
             :, shape[-1] :
         ]
-        print(f"{exposed_padding.shape=}")
-        print(f"{exposed_padding=}")
         assert (exposed_padding == 0).all().item()
 
     @parametrize("dtype", COORD_MASK_DTYPES)
@@ -1280,26 +1279,30 @@ class TestCoordinateMasking(unittest.TestCase):
     @parametrize("dtype", COORD_MASK_DTYPES)
     @parametrize("shape", SHAPES)
     def test_exp(self, shape, dtype) -> None:
-        with patch.dict(_ASSUMED_PADDING, {InputBuffer: sympy.S.Reals}):
-            unpadded = unpad_shape(shape, dtype)
-            a_spyre_full = torch.full(unpadded, 222, dtype=dtype, device="spyre")
-            a_spyre = try_reinterpret_host_shape(a_spyre_full, shape)
+        # The reinterpreted view carries a fresh layout with no recorded
+        # padding value, so the analysis must assume the padding (222s from
+        # the full allocation) can hold anything.
+        unpadded = unpad_shape(shape, dtype)
+        a_spyre_full = torch.full(unpadded, 222, dtype=dtype, device="spyre")
+        a_spyre = try_reinterpret_host_shape(a_spyre_full, shape)
 
-            def fn(x):
-                return torch.exp(x)
+        def fn(x):
+            return torch.exp(x)
 
-            compiled = torch.compile(fn, fullgraph=True, dynamic=False)
-            result = compiled(a_spyre)
+        compiled = torch.compile(fn, fullgraph=True, dynamic=False)
+        result = compiled(a_spyre)
 
-            exposed_padding = try_reinterpret_host_shape(result, unpadded).cpu()[
-                :, shape[-1] :
-            ]
-            assert (exposed_padding == 0).all().item()
+        exposed_padding = try_reinterpret_host_shape(result, unpadded).cpu()[
+            :, shape[-1] :
+        ]
+        assert (exposed_padding == 0).all().item()
 
     @parametrize("dtype", COORD_MASK_DTYPES)
     @parametrize("shape", SHAPES)
     def test_pow_neg(self, shape, dtype) -> None:
-        a_spyre = torch.full(shape, 0.5, dtype=dtype, device="spyre")
+        # Copied from the host, so the padding is recorded as 0, which the op
+        # cannot take: the kernel must coordinate-mask it.
+        a_spyre = torch.full(shape, 0.5, dtype=dtype).to("spyre")
 
         def fn(x):
             return torch.pow(x, -1.0)
@@ -1316,7 +1319,9 @@ class TestCoordinateMasking(unittest.TestCase):
     @parametrize("dtype", COORD_MASK_DTYPES)
     @parametrize("shape", SHAPES)
     def test_reciprocal(self, shape, dtype) -> None:
-        a_spyre = torch.full(shape, 0.5, dtype=dtype, device="spyre")
+        # Copied from the host, so the padding is recorded as 0, which the op
+        # cannot take: the kernel must coordinate-mask it.
+        a_spyre = torch.full(shape, 0.5, dtype=dtype).to("spyre")
 
         def fn(x):
             return torch.reciprocal(x)
@@ -1334,7 +1339,9 @@ class TestCoordinateMasking(unittest.TestCase):
     @parametrize("shape", SHAPES)
     def test_rsqrt(self, shape, dtype) -> None:
         full, half = full_half_stick(dtype)
-        a_spyre = torch.full(shape, 0.5, dtype=dtype, device="spyre")
+        # Copied from the host, so the padding is recorded as 0, which the op
+        # cannot take: the kernel must coordinate-mask it.
+        a_spyre = torch.full(shape, 0.5, dtype=dtype).to("spyre")
 
         def fn(x):
             return torch.rsqrt(x)
@@ -1351,7 +1358,9 @@ class TestCoordinateMasking(unittest.TestCase):
     @parametrize("dtype", COORD_MASK_DTYPES)
     @parametrize("shape", SHAPES)
     def test_log(self, shape, dtype) -> None:
-        a_spyre = torch.full(shape, 0.5, dtype=dtype, device="spyre")
+        # Copied from the host, so the padding is recorded as 0, which the op
+        # cannot take: the kernel must coordinate-mask it.
+        a_spyre = torch.full(shape, 0.5, dtype=dtype).to("spyre")
 
         def fn(x):
             return torch.log(x)
