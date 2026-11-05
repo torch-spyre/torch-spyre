@@ -1872,7 +1872,9 @@ class _RecordCarries(CustomPreSchedulingPasses):
         super().__call__(graph)
         cls = type(self)
         cls.final = {}
-        for op in graph.operations:
+        # After the pipeline the loops are LoopNodes in graph.operations
+        # (_hand_off_loop_nodes); the carries live on their leaf ops.
+        for op in all_ops(graph.operations):
             record = getattr(op, "_loop_carry_record", None)
             if record is not None and record.update_name == op.get_name():
                 storage = graph.get_buffer(record.storage_name)
