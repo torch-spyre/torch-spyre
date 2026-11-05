@@ -21,7 +21,7 @@ and consumed by the scheduler, kernel codegen, and buffer-propagation pass.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import sympy
 
@@ -37,10 +37,11 @@ if TYPE_CHECKING:
 class LoopCarryRecord:
     """Identity contract for one accumulator carried through a counted loop.
 
-    ``for_each_tile`` lowering rewrites the carry update as an in-place write
-    into the carry's initial storage.  Recording both ends lets scratchpad
-    planning distinguish that closed, compiler-created mutation from an
-    arbitrary user mutation, which must remain in HBM.
+    ``for_each_tile`` lowering declares the carry with this record;
+    ``loop_carries.apply_loop_carries`` then rewrites the update as an
+    in-place write into the carry's initial storage.  Recording both ends
+    lets scratchpad planning distinguish that closed, compiler-created
+    mutation from an arbitrary user mutation, which must remain in HBM.
 
     ``loop_origin`` is the exact FX ``while_loop`` HOP node the carry belonged
     to, captured and validated at the splice site (see
@@ -51,11 +52,17 @@ class LoopCarryRecord:
     loop's node), in which case the post-loop materialization plan declines
     and the carry keeps today's HBM behavior.  No other consumer of this
     record reads the field.
+
+    ``storage_view`` is the view the update writes through when the carry's
+    initial value is a view of the storage (a transposed init), else None.
+    ``loop_carries.apply_loop_carries`` uses it as the mutation target, as the
+    splice did when it made the write in place itself.
     """
 
     storage_name: str
     update_name: str
     loop_origin: "torch.fx.Node | None" = None
+    storage_view: Any = field(default=None, compare=False, repr=False)
 
 
 @dataclass(frozen=True)
