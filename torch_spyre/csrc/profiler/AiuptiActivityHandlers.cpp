@@ -17,6 +17,7 @@
  */
 #include <libaiupti/aiupti_runtime_cbid.h>
 
+#include <cstdint>
 #include <cstring>
 #include <memory>
 #include <nlohmann/json.hpp>
@@ -359,6 +360,12 @@ inline std::string fixedCharField(const char (&field)[N]) {
 // all required, so a non-empty coll_algo means coll_bytes was really parsed.
 // On collective records coll_bytes is therefore the number when known
 // (including a real 0) and "" when the label carried no size.
+//
+// coll_id is the spyre-comms collective ID from a "[Coll,Algo,Bytes,CollId]"
+// label. 0 is a valid ID, so has_coll_id says whether it was set. It is the
+// same value as the correlation of the collective's aiuCommsColl* host span,
+// so device events can be joined to the invocation that issued them, and it
+// is equal across ranks for the same collective.
 
 template <class T, class = void>
 struct HasCollFields : std::false_type {};
@@ -368,9 +375,23 @@ struct HasCollFields<T, std::void_t<decltype(std::declval<T&>().coll_group),
                                     decltype(std::declval<T&>().coll_bytes)>>
     : std::true_type {};
 
+// coll_id is newer than the other coll fields, so it is detected separately and
+// older libaiupti headers still get coll_group/coll_algo/coll_bytes.
+template <class T, class = void>
+struct HasCollIdFields : std::false_type {};
+template <class T>
+struct HasCollIdFields<T, std::void_t<decltype(std::declval<T&>().coll_id),
+                                      decltype(std::declval<T&>().has_coll_id)>>
+    : std::true_type {};
+
 template <class trace_activity_type, class aiupti_activity_type>
 inline void addCollMetadata(trace_activity_type& trace_activity,
                             const aiupti_activity_type* activity) {
+  if constexpr (HasCollIdFields<aiupti_activity_type>::value) {
+    if (activity->has_coll_id != 0) {
+      trace_activity->addMetadata("collective_id", activity->coll_id);
+    }
+  }
   if constexpr (HasCollFields<aiupti_activity_type>::value) {
     if (activity->coll_group[0] != '\0') {
       trace_activity->addMetadataQuoted("coll_group",
@@ -629,6 +650,12 @@ inline uint32_t getBaseResourceId(const AIUpti_ActivityMemcpy* activity) {
   return activity->copy_kind * 100;
 }
 
+// PtoP copies get their own lanes (copy_kind PTOP == 3 -> 300), below the
+// memory/memset lanes at 400.
+inline uint32_t getBaseResourceId(const AIUpti_ActivityMemcpyPtoP* activity) {
+  return activity->copy_kind * 100;
+}
+
 inline uint32_t getBaseResourceId(const AIUpti_ActivityMemory* activity) {
   return 400;
 }
@@ -671,6 +698,8 @@ uint32_t AiuptiActivityProfilerSession::getResourceId(
 template uint32_t AiuptiActivityProfilerSession::getResourceId<
     AIUpti_ActivityMemcpy>(AIUpti_ActivityMemcpy* activity);
 template uint32_t AiuptiActivityProfilerSession::getResourceId<
+    AIUpti_ActivityMemcpyPtoP>(AIUpti_ActivityMemcpyPtoP* activity);
+template uint32_t AiuptiActivityProfilerSession::getResourceId<
     AIUpti_ActivityMemory>(AIUpti_ActivityMemory* activity);
 template uint32_t AiuptiActivityProfilerSession::getResourceId<
     AIUpti_ActivityMemset>(AIUpti_ActivityMemset* activity);
@@ -711,11 +740,73 @@ void AiuptiActivityProfilerSession::handleMemcpyActivity(
   memcpy_activity->addMetadata("bytes", activity->bytes);
   memcpy_activity->addMetadata("memory bandwidth (GB/s)", bandwidth(activity));
   memcpy_activity->addMetadata("stream", activity->stream_id);
-  // AIUpti_ActivityMemcpy does not say whether the record came from a
-  // command buffer (real counters) or a standalone flex MEMCPY (always 0;
-  // today flex reports every DMA this way), so omit the key when all slots
-  // are 0. Gate on record kind instead once libaiupti marks which records
-  // carry counters.
+  // flex fills these from the CB's response block for both memcpy producers;
+  // older flex/libaiupti builds report all 0 for standalone DMAs, so omit the
+  // key when every slot is 0 rather than emit a meaningless array.
+  if (hasCyclesTs(activity)) {
+    memcpy_activity->addMetadata("cycles_ts", cyclesTsJson(activity));
+  }
+  addCollMetadata(memcpy_activity, activity);
+  addCbHardwareMetadata(memcpy_activity, activity);
+
+  if (memcpy_activity->resource == getBaseResourceId(activity)) {
+    recordMemoryStream(memcpy_activity->device, memcpy_activity->resource,
+                       fmt::format("Memcpy ({}):", memoryCopyOperationName(
+                                                       activity->copy_kind)));
+  } else {
+    recordMemoryStream(memcpy_activity->device, memcpy_activity->resource, " ");
+  }
+  memcpy_activity->log(*logger);
+}
+
+// Peer-to-peer (RDMA) copies: flex reports RDMA singlecast/multicast data CBs
+// as MEMCPY2 records. Same slice and args as a host memcpy, plus the source
+// and destination ranks. A multicast has no single destination, so flex sets
+// dst_device_id to UINT32_MAX; that is emitted as "" rather than a fake rank.
+// The record has no timestamps_estimated flag, so no timestamp_source arg.
+void AiuptiActivityProfilerSession::handleMemcpyPtoPActivity(
+    const AIUpti_ActivityMemcpyPtoP* activity,
+    libkineto::ActivityLogger* logger) {
+  traceBuffer_.span.opCount += 1;
+  traceBuffer_.gpuOpCount += 1;
+  const libkineto::ITraceActivity* linked =
+      linkedActivity(activity->correlation_id, cpuCorrelationMap_);
+  traceBuffer_.emplace_activity(
+      traceBuffer_.span, libkineto::ActivityType::GPU_MEMCPY,
+      fmt::format("Memcpy ({})", memoryCopyOperationName(activity->copy_kind)));
+  auto& memcpy_activity = traceBuffer_.activities.back();
+  memcpy_activity->startTime = activity->start;
+  memcpy_activity->endTime = activity->end;
+  memcpy_activity->id = activity->correlation_id;
+  memcpy_activity->device = activity->device_id;
+  memcpy_activity->resource = getResourceId(activity);
+  memcpy_activity->threadId = activity->stream_id;
+  memcpy_activity->flow.id = launchActivityIds_.count(activity->correlation_id)
+                                 ? activity->correlation_id
+                                 : 0;
+  memcpy_activity->flow.type = libkineto::kLinkAsyncCpuGpu;
+  memcpy_activity->flow.start = 0;
+  memcpy_activity->linked = linked;
+  memcpy_activity->addMetadataQuoted(
+      "call", memoryCopyOperationName(activity->copy_kind));
+  memcpy_activity->addMetadata("device", memcpy_activity->deviceId());
+  memcpy_activity->addMetadataQuoted("context",
+                                     std::to_string(activity->context_id));
+  memcpy_activity->addMetadata("correlation", activity->correlation_id);
+  memcpy_activity->addMetadata("memory operation id", activity->copy_kind);
+  memcpy_activity->addMetadata("bytes", activity->bytes);
+  memcpy_activity->addMetadata("memory bandwidth (GB/s)", bandwidth(activity));
+  memcpy_activity->addMetadata("stream", activity->stream_id);
+  memcpy_activity->addMetadata("src_device", activity->src_device_id);
+  memcpy_activity->addMetadataQuoted("src_context",
+                                     std::to_string(activity->src_context_id));
+  if (activity->dst_device_id == UINT32_MAX) {
+    memcpy_activity->addMetadataQuoted("dst_device", "");
+  } else {
+    memcpy_activity->addMetadata("dst_device", activity->dst_device_id);
+  }
+  memcpy_activity->addMetadataQuoted("dst_context",
+                                     std::to_string(activity->dst_context_id));
   if (hasCyclesTs(activity)) {
     memcpy_activity->addMetadata("cycles_ts", cyclesTsJson(activity));
   }
@@ -882,6 +973,10 @@ void AiuptiActivityProfilerSession::handlePtiActivity(
     case (uint8_t)AIUPTI_ACTIVITY_KIND_MEMCPY:
       handleMemcpyActivity(
           reinterpret_cast<const AIUpti_ActivityMemcpy*>(record), logger);
+      break;
+    case (uint8_t)AIUPTI_ACTIVITY_KIND_MEMCPY2:
+      handleMemcpyPtoPActivity(
+          reinterpret_cast<const AIUpti_ActivityMemcpyPtoP*>(record), logger);
       break;
     case (uint8_t)AIUPTI_ACTIVITY_KIND_MEMSET:
       handleMemsetActivity(
