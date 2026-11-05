@@ -18,12 +18,13 @@ from typing import Any
 
 from sympy import Symbol
 
-from torch_spyre._C import DataFormats, encode_constant
+from torch_spyre._C import DataFormats, ElementArrangement, encode_constant
 from torch_spyre._inductor.constants import (
     CONV2D_DIM_LABELS,
     DEPTHWISE_CONV2D_OP,
     DLFLOAT16_MAX,
     FP8_2D_STICK_OPS,
+    STAGGERED_EAS,
 )
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.sharded_hbm import verify_non_unified_split
@@ -354,6 +355,97 @@ def _layout_info_for_tensor(sdsc_spec, tensor, tensor_idx: int) -> dict:
     return layout_info
 
 
+def _shuffle_stick_levels(
+    size: int,
+    elems_per_stick: int,
+    ea: ElementArrangement,
+    device_size: int | None = None,
+) -> list[tuple[int, int]]:
+    """Element arrangement shuffle: compute nested levels for stick dimension
+
+    Returns a list of levels (dimension size and step multiplier) based on
+    the element arrangement and elements per stick, filtering out trivial
+    levels of size 1.
+
+    Args:
+        size: Logical size of the stick dim per core.
+        device_size: Size of the stick dim per core as laid out on the device,
+            which is padded to whole sticks (and, for DL16_TO_FP32, to whole
+            stick pairs). Defaults to ``size`` when not given.
+    """
+    # The layout pads the stick dim, so count sticks from the device size.
+    padded = max(size, device_size) if device_size is not None else size
+    if ea not in STAGGERED_EAS:
+        levels = [
+            (elems_per_stick, 1),
+            (-(-padded // elems_per_stick), elems_per_stick),
+        ]
+    elif elems_per_stick == 64:
+        levels = [(4, 1), (2, 32), (8, 4), (-(-padded // 64), 64)]
+    elif elems_per_stick == 32:
+        # The stagger unit is a pair of sticks.
+        sticks = -(-padded // 32)
+        if sticks % 2:
+            raise Unsupported(
+                f"shuffle: {ea.name} requires whole FP32 stick pairs, got "
+                f"{sticks} stick(s) for a stick dim of {padded} per core"
+            )
+        levels = [(4, 1), (8, 8), (2, 4), (sticks // 2, 64)]
+    else:
+        raise Unsupported(
+            f"shuffle: {ea.name} is not defined for {elems_per_stick} "
+            f"elements per stick"
+        )
+    return [lvl for i, lvl in enumerate(levels) if i == 0 or lvl[0] != 1]
+
+
+def _gen_shuffle_stick_coord_info(
+    size: int,
+    nsplits: int,
+    elems_per_stick: int,
+    padding: str,
+    ea: ElementArrangement,
+    device_size: int | None = None,
+) -> dict:
+    """Coordinate info of the stick dim of a `shuffle` tensor, in arrangement `ea`.
+
+    `device_size` is the whole (all cores) device size of the stick dim.
+    """
+    levels = _shuffle_stick_levels(
+        size,
+        elems_per_stick,
+        ea,
+        None if device_size is None else -(-device_size // nsplits),
+    )
+    zero = {"Affine": {"alpha_": 0, "beta_": 0}}
+    return {
+        "spatial": 3,
+        "temporal": 0,
+        "elemArr": len(levels),
+        "padding": padding,
+        "folds": {
+            "dim_prop_func": [
+                {"Affine": {"alpha_": size, "beta_": 0}},
+                zero,
+                zero,
+                *(
+                    {"Affine": {"alpha_": alpha, "beta_": 0}}
+                    for _, alpha in reversed(levels)
+                ),
+            ],
+            "dim_prop_attr": [
+                {"factor_": nsplits, "label_": "core_fold"},
+                {"factor_": 1, "label_": "corelet_fold"},
+                {"factor_": 1, "label_": "row_fold"},
+                *(
+                    {"factor_": card, "label_": f"elem_arr_{i}"}
+                    for i, (card, _) in reversed(list(enumerate(levels)))
+                ),
+            ],
+        },
+    }
+
+
 def gen_coord_info_value(
     size: int,
     nsplits: int,
@@ -365,9 +457,17 @@ def gen_coord_info_value(
     tensor_idx: int = -1,
     opfunc: str = "",
     core_stride: int | None = None,
+    element_arrangement: ElementArrangement = ElementArrangement.STANDARD,
+    is_ea_shuffle: bool = False,
+    stick_device_size: int | None = None,
 ):
     """
     Args:
+        is_ea_shuffle: True for a `shuffle` that changes the element arrangement
+        (a tensor is staggered); `element_arrangement` then shapes the stick dim.
+        stick_device_size: Device size of the stick dim over all cores; a
+        `shuffle` counts sticks from it, as the device pads it to whole sticks
+        (and stick pairs).
         conv_params: Dict with padding info for convolution ops; contains 'conv_padding' (pad type) and 'total_size' (per-core slice size for padding dims).
         If conv_params is not specified, pad type should default to "nopad" and total_size to size.
     """
@@ -428,6 +528,15 @@ def gen_coord_info_value(
                 ],
             },
         }
+    elif is_stick_dim and is_ea_shuffle:
+        return _gen_shuffle_stick_coord_info(
+            size,
+            nsplits,
+            elems_per_stick,
+            padding,
+            element_arrangement,
+            stick_device_size,
+        )
     elif is_stick_dim and tensor_idx == 0 and opfunc == "batchmatmulfp8":
         return {
             "spatial": 3,
@@ -1233,6 +1342,11 @@ def generate_sdsc(
             result[f"[{c}, 0, 0]"] = str(local_symbols[key])
         return result
 
+    # `shuffle` with staggered tensors re-arranges the elements to standard.
+    is_ea_shuffle = sdsc_spec.opfunc == "shuffle" and any(
+        a.element_arrangement in STAGGERED_EAS for a in sdsc_spec.args
+    )
+
     def _build_coord_info(op, tensor, tensor_idx: int) -> dict:
         """Builds the coordinate information for all dimensions of a tensor.
 
@@ -1297,6 +1411,9 @@ def generate_sdsc(
                 core_stride=(
                     _coord_core_stride(dim, is_input, nsplits) if is_tiled else None
                 ),
+                element_arrangement=tensor.element_arrangement,
+                is_ea_shuffle=is_ea_shuffle,
+                stick_device_size=tensor.stick_device_size,
             )
         return result
 
@@ -1680,6 +1797,7 @@ def generate_sdsc(
                                                 or int(core) in active_core_ids
                                             }
                                             if sdsc_spec.opfunc == "shuffle"
+                                            and not is_ea_shuffle
                                             and tensor.work_division is not None
                                             else {}
                                         ),

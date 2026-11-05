@@ -18,6 +18,7 @@ from torch_spyre._C import DataFormats, ElementArrangement
 
 BATCH_MATMUL_OP = "batchmatmul"
 IDENTITY_OP = "identity"
+SHUFFLE_OP = "shuffle"
 RESTICKIFY_OP = "ReStickifyOpHBM"
 
 # Relative restickify cost per device byte, by device dtype. The restickify cost

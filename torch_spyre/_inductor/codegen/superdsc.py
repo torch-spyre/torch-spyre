@@ -31,6 +31,7 @@ from torch_spyre._inductor.constants import (
     CONV_DIM_LABELS,
     CONV_OPS,
     DEPTHWISE_CONV2D_OP,
+    SHUFFLE_OP,
     FP32TOINT32_OP,
     IDENTITY_OP,
     INPUT_DIM_LABELS,
@@ -92,6 +93,13 @@ class SDSCArgs:
     is_index_tensor: bool = False
     related_value_tensor_idx: int = -1
     device_tile_advance_expr: Expr | None = None
+    element_arrangement: ElementArrangement = dataclasses.field(
+        default_factory=lambda: ElementArrangement.STANDARD
+    )
+    # Elements in the tensor's stick dim as laid out on the device (padded to
+    # whole sticks, and to whole stick pairs for DL16_TO_FP32), summed over all
+    # cores. None when the stick dim is not part of dim_order.
+    stick_device_size: int | None = None
     # Sharded storage: each core addresses its own chunk (see sharded_hbm.py).
     non_unified_shard_bytes: int = 0
 
@@ -1464,6 +1472,7 @@ def _create_sdsc_tensors(
             d for d in dim_order if d not in reduced_dims
         ] + reduced_dims
 
+        stick_device_size = None
         for dim in dim_order:
             stride_idx = stride_dim_order.index(dim)
             # A tiled-away loop role may survive as a constant physical axis.
@@ -1556,6 +1565,8 @@ def _create_sdsc_tensors(
                     stick_size = arg.device_dtype.elems_per_stick()
                     dev_dim_size *= stick_size
                     it_dim_size = ((it_dim_size - 1) // stick_size + 1) * stick_size
+            if dim is stick_dim:
+                stick_device_size = dev_dim_size
 
             if has_indirect_access:
                 max_dim_sizes[dim] = compute_indirect_max_dim_sizes(
@@ -1788,6 +1799,8 @@ def _create_sdsc_tensors(
             is_index_tensor=is_idx_tensor,
             related_value_tensor_idx=related_val_idx,
             device_tile_advance_expr=arg.device_tile_advance_expr,
+            element_arrangement=arg.element_arrangement,
+            stick_device_size=stick_device_size,
             non_unified_shard_bytes=arg.non_unified_shard_bytes,
         )
         if arg.work_division is not None:
@@ -2008,6 +2021,37 @@ def _extend_restickify_to_padded(
         )
 
 
+def _extend_shuffle_to_padded(
+    op_spec: OpSpec,
+    sdsc_iteration_space: dict,
+    symbol_mapping: dict,
+) -> None:
+    """Extend sdsc_iteration_space[stick_sym] to the largest stick extent of any arg.
+
+    A staggered operand (DL16_TO_FP32) is padded to whole stick pairs, e.g. 4
+    fp32 sticks for 68 elements, while the stick-aligned iteration space only
+    covers 3. The staggered element order is only defined over whole pairs, so a
+    shuffle must iterate the full padded extent of its widest operand.
+    """
+    for arg in op_spec.args:
+        _, stick_sym = _get_device_dim_order(arg, symbol_mapping)
+        if stick_sym is None or stick_sym not in sdsc_iteration_space:
+            continue
+        extent = math.prod(
+            size
+            for size, coord in zip(arg.device_size, arg.device_coordinates)
+            if stick_sym in coord.subs(symbol_mapping).free_symbols
+        )
+        if extent > sdsc_iteration_space[stick_sym]:
+            logger.debug(
+                "_extend_shuffle_to_padded: extending %s %d -> %d",
+                stick_sym,
+                sdsc_iteration_space[stick_sym],
+                extent,
+            )
+            sdsc_iteration_space[stick_sym] = extent
+
+
 def _inject_implicit_conv_kernel_dims(
     is_conv2d: bool,
     op_spec: OpSpec,
@@ -2147,6 +2191,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     is_conv2d = _is_conv(op_spec.op)
     is_relayout = is_lx_relayout_identity(op_spec.op, op_spec.args, op_spec.op_info)
     is_restickify = op_spec.op == RESTICKIFY_OP
+    is_ea_shuffle = op_spec.op == SHUFFLE_OP
     is_pool = _is_pool(op_spec.op)
     is_conv = _is_conv(op_spec.op)
     ndim = len(op_spec.iteration_space)
@@ -2383,6 +2428,8 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         _extend_matmul_k_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
     elif is_restickify:
         _extend_restickify_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
+    elif is_ea_shuffle:
+        _extend_shuffle_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
 
     # Grow a core-split index-entry iteration to the padded output device_size.
     # The output's entry-dim device_size was rounded up to the index stick
@@ -2477,9 +2524,11 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             [args[0]],
             [args[0].dim_order],
         )
-    elif is_restickify:
+    elif is_restickify or is_ea_shuffle:
         # Pad iteration space using all args so both the old stick (input) and
         # new stick (output) are rounded up to the nearest stick boundary.
+        # SHUFFLE_OP (element-arrangement shuffle) also has potentially
+        # different arrangements on input and output and needs both padded.
         pad_args, pad_sdsc_args, dim_order = (
             list(op_spec.args),
             args,
@@ -2692,7 +2741,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     value_arg_index = 1 if indirect_access_indices else 0
     opfunc = (
         "shuffle"
-        if is_relayout
+        if is_relayout or is_ea_shuffle
         else _get_op_func(
             op_spec.op,
             op_spec.is_reduction,
