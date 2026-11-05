@@ -53,6 +53,7 @@ __all__: list[str] = [
     "register_kernel_provenance",
     "set_downcast_warning",
     "set_spyre_tensor_layout",
+    "set_tensor_padding_value",
     "spyre_empty_with_layout",
     "start_runtime",
     "to_with_layout",
@@ -562,6 +563,7 @@ def set_downcast_warning(arg0: bool) -> None:
     """
 
 def set_spyre_tensor_layout(arg0: torch.Tensor, arg1: SpyreTensorLayout) -> None: ...
+def set_tensor_padding_value(tensor: torch.Tensor, value: float | None) -> None: ...
 def spyre_empty_with_layout(
     size: tuple[int, ...],
     stride: tuple[int, ...],

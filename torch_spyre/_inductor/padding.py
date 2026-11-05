@@ -82,6 +82,7 @@ from torch._inductor.ir import (
     FallbackKernel,
 )
 from torch._inductor.ops_handler import DefaultHandler, WrapperHandler
+from torch._inductor.utils import sympy_product
 from torch._inductor.virtualized import V
 
 from .constants import BATCH_MATMUL_FP8_OP, BATCH_MATMUL_OP, DEVICE_NAME
@@ -111,7 +112,12 @@ from .pass_utils import (
     replace_computed_buffer_body,
 )
 from .views import compute_coordinates
-from torch_spyre._C import SpyreTensorLayout, get_elem_in_stick, DataFormats
+from torch_spyre._C import (
+    DataFormats,
+    ElementArrangement,
+    SpyreTensorLayout,
+    get_elem_in_stick,
+)
 from .config import padding_strict_mode
 
 
@@ -1835,10 +1841,25 @@ def is_padded(graph: GraphLowering, node: IRNode | Layout | SpyreTensorLayout) -
     if layout is None:
         return False
 
-    total_valid_elems = math.prod(layout.valid_elements.values())
     total_size = math.prod(layout.device_size)
+    if not layout.valid_elements:
+        # Unknown valid extents (a layout built without valid_elements). Its
+        # device elements can only include padding when they outnumber the
+        # tensor's; without the tensor to count, assume padding.
+        numel = _host_numel(node)
+        return numel is None or numel < total_size
 
+    total_valid_elems = math.prod(layout.valid_elements.values())
     return total_valid_elems < total_size
+
+
+def _host_numel(node: IRNode | Layout | SpyreTensorLayout) -> int | None:
+    """The tensor's element count, when node has a static host size."""
+    if isinstance(node, SpyreTensorLayout):
+        return None
+    size = node.size if isinstance(node, Layout) else node.get_size()
+    numel = sympy_product(size)
+    return int(numel) if numel.is_Integer else None
 
 
 def _input_padding_range(layout: SpyreTensorLayout) -> Set:
@@ -1887,15 +1908,15 @@ def track_padding_value(graph: GraphLowering) -> None:
                 while isinstance(buf, MutableBox):
                     buf = buf.data
                 layout = _get_layout(graph, buf)
-                buf_is_padded = (
-                    is_padded(graph, layout) if layout is not None else False
-                )
+                buf_is_padded = is_padded(graph, buf) if layout is not None else False
                 if isinstance(buf, InputBuffer):
                     assert layout is not None
-                    buf_is_padded = is_padded(graph, layout)
-                    tracer.buffer_range[dep.name] = (
-                        _input_padding_range(layout) if buf_is_padded else EmptySet
-                    )
+                    # Seed from the padding the input held before the graph,
+                    # once: after a mutation the range is what that left.
+                    if dep.name not in tracer.buffer_range:
+                        tracer.buffer_range[dep.name] = (
+                            _input_padding_range(layout) if buf_is_padded else EmptySet
+                        )
                 else:
                     assert dep.name in tracer.buffer_range, (
                         f"Nodes seen out of order, expected {dep.name} to have been visited"
@@ -1928,7 +1949,13 @@ def track_padding_value(graph: GraphLowering) -> None:
                 while isinstance(target, (MutableBox, ReinterpretView)):
                     target = target.data
                 target_name = target.maybe_get_name()
-                if target_name is not None and isinstance(target, InputBuffer):
+                # Seed a mutated input with its padding from before the graph,
+                # unless an earlier mutation already set what it holds now.
+                if (
+                    target_name is not None
+                    and isinstance(target, InputBuffer)
+                    and target_name not in tracer.buffer_range
+                ):
                     target_layout = _get_layout(graph, target)
                     tracer.buffer_range[target_name] = (
                         _input_padding_range(target_layout)
@@ -2045,3 +2072,42 @@ def track_padding_value(graph: GraphLowering) -> None:
                     user_data = _user_values()
                     pad_set = tracer.buffer_range[op.name]
                     tracer.buffer_range[target_name] = user_data.union(pad_set)
+
+    _record_mutated_input_padding(graph, tracer)
+
+
+def _can_record_padding(layout: SpyreTensorLayout) -> bool:
+    """Whether layout can record a constant padding (set_constant_padding)."""
+    return layout.element_arrangement == ElementArrangement.STANDARD and (
+        layout.device_dtype in (DataFormats.SEN169_FP16, DataFormats.IEEE_FP32)
+    )
+
+
+def _record_mutated_input_padding(
+    graph: GraphLowering, tracer: DomainRangeTracer
+) -> None:
+    """Record the padding each graph input is left with by its mutations.
+
+    A graph input is a runtime tensor whose layout carries a recorded padding
+    value that later graphs trust (see _input_padding_range). A graph that
+    writes an input must update that record, or it keeps claiming the value
+    from before the write.
+
+    The wrapper decides which inputs to update: every Spyre input in
+    graph.mutated_inputs, after its last use (see
+    _SpyreWrapperCodegenMixin._input_padding_update). This only supplies the
+    value, so it lists just the inputs whose final padding is proven to be one
+    value; the wrapper clears any other mutated input (unknown padding, a
+    fallback-kernel mutation, or a layout that cannot record a value).
+    """
+    padding: dict[str, float] = {}
+    for name in graph.graph_input_names:
+        pad_set = tracer.buffer_range.get(name)
+        layout = _get_layout(graph, graph.get_buffer(name))
+        if pad_set is None or layout is None or not _can_record_padding(layout):
+            continue
+        if isinstance(pad_set, FiniteSet) and len(pad_set) == 1:
+            (value,) = pad_set
+            if value.is_finite and value.is_real:
+                padding[name] = float(value)
+    graph._spyre_input_padding = padding  # type: ignore[attr-defined]

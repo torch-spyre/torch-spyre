@@ -1486,5 +1486,68 @@ class TestMatmulPaddingNaN(unittest.TestCase):
         self._assert_matches_cpu_and_has_no_nan(result, expected)
 
 
+class TestRecordedPadding(unittest.TestCase):
+    """The padding value recorded on a tensor's layout must stay true.
+
+    A fill records its value as the padding, and the padding analysis of a
+    later graph trusts it for a graph input. A graph that writes the input must
+    update the record (the wrapper's set_tensor_padding_value), or the next
+    graph reads padding it no longer holds.
+    """
+
+    # 3 fp16 elements in a 64-element stick: 61 padding elements.
+    SIZE = 3
+
+    def _filled(self, value: float) -> torch.Tensor:
+        t = torch.empty(self.SIZE, dtype=torch.float16, device="spyre")
+        t.fill_(value)
+        self.assertEqual(t.device_tensor_layout().padding_value, value)
+        return t
+
+    def test_compiled_inplace_clears_recorded_padding(self) -> None:
+        t = self._filled(5.0)
+
+        def scale(x):
+            x.mul_(2)
+            return x
+
+        torch.compile(scale, fullgraph=True, dynamic=False)(t)
+        self.assertIsNone(t.device_tensor_layout().padding_value)
+        # The sum must not count the padding, whatever it now holds.
+        result = torch.compile(lambda x: x.sum(), dynamic=False)(t)
+        torch.testing.assert_close(result.cpu(), torch.tensor(30.0).half())
+
+    def test_compiled_double_inplace_clears_recorded_padding(self) -> None:
+        # A second mutation must not reseed the input from its pre-graph
+        # padding (5), which the first mutation already overwrote.
+        t = self._filled(5.0)
+
+        def scale_shift(x):
+            x.mul_(2)
+            x.add_(1)
+            return x
+
+        torch.compile(scale_shift, fullgraph=True, dynamic=False)(t)
+        self.assertIsNone(t.device_tensor_layout().padding_value)
+        torch.testing.assert_close(t.cpu(), torch.full((self.SIZE,), 11.0).half())
+
+    def test_eager_inplace_clears_recorded_padding(self) -> None:
+        # In-place eager ops write self through a compiled copy_from_d2d.
+        t = self._filled(5.0)
+        t.add_(1)
+        self.assertIsNone(t.device_tensor_layout().padding_value)
+        torch.testing.assert_close(t.sum().cpu(), torch.tensor(18.0).half())
+
+    def test_view_does_not_inherit_recorded_padding(self) -> None:
+        t = self._filled(5.0)
+        self.assertIsNone(t.view(self.SIZE).device_tensor_layout().padding_value)
+        self.assertIsNone(t.detach().device_tensor_layout().padding_value)
+        self.assertEqual(t.device_tensor_layout().padding_value, 5.0)
+
+    def test_h2d_records_zero_padding(self) -> None:
+        t = torch.tensor([1.0, -2.0, 3.0], dtype=torch.float16).to("spyre")
+        self.assertEqual(t.device_tensor_layout().padding_value, 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

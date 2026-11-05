@@ -13,13 +13,7 @@
 # limitations under the License.
 
 import torch
-from torch_spyre._C import (
-    fill_tensor,
-    copy_tensor,
-    SpyreTensorLayout,
-    get_spyre_tensor_layout,
-    set_spyre_tensor_layout,
-)
+from torch_spyre._C import fill_tensor, copy_tensor, SpyreTensorLayout
 import torch_spyre.ops.fallbacks  # noqa: F401
 from .fallbacks import _get_op_overloads
 from .warning_types import RetileWarning
@@ -731,23 +725,6 @@ def spyre__local_scalar_dense(self):
     return self.cpu().item()
 
 
-def _clear_padding_state(t: torch.Tensor) -> None:
-    """Forget the padding value recorded on ``t`` (and its base).
-
-    The runtime records a constant padding value on a tensor's layout after a
-    fill or a host-to-device copy, and Inductor's padding analysis trusts it
-    for graph inputs. A write that does not maintain it must reset it, on the
-    tensor written and on the base whose storage it shares.
-    """
-    for x in (t, t._base):
-        if x is None or isinstance(x, torch._subclasses.FakeTensor):
-            continue
-        stl = get_spyre_tensor_layout(x)
-        if stl.padding_value is not None:
-            stl.padding_value = None
-            set_spyre_tensor_layout(x, stl)
-
-
 @torch.library.register_kernel("aten::_copy_from", ["spyre"])
 def spyre__copy_from(self, dst, non_blocking=False):
     if self.numel() == 0:
@@ -815,9 +792,6 @@ def spyre__copy_from(self, dst, non_blocking=False):
             torch.ops.spyre.copy_from_d2d(
                 self, dst, self.storage_offset(), dst.storage_offset()
             )
-            # The compiled copy does not update dst's recorded padding, so a
-            # constant left by an earlier fill or H2D copy is no longer known.
-            _clear_padding_state(dst)
         return dst
     else:
         if non_blocking:

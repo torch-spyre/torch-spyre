@@ -420,6 +420,13 @@ uint64_t get_device_size_in_bytes(const std::vector<int64_t>& device_size,
 SpyreTensorLayout get_spyre_tensor_layout(const at::Tensor& tensor);
 void set_spyre_tensor_layout(const at::Tensor& tensor,
                              const SpyreTensorLayout& stl);
+/**
+ * Record the padding a write left in tensor: a constant value, or
+ * UNINITIALIZED when value is nullopt. When tensor is a view the base is
+ * reset to UNINITIALIZED, since its storage was written too.
+ */
+void set_tensor_padding_value(const at::Tensor& tensor,
+                              std::optional<double> value);
 std::vector<int64_t> get_spyre_tensor_sizes(const at::Tensor& tensor);
 std::vector<int64_t> get_spyre_tensor_strides(const at::Tensor& tensor);
 

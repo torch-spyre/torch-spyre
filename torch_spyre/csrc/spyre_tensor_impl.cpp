@@ -406,6 +406,28 @@ void set_spyre_tensor_layout(const at::Tensor& tensor,
   }
 }
 
+void set_tensor_padding_value(const at::Tensor& tensor,
+                              std::optional<double> value) {
+  TORCH_CHECK(tensor.is_privateuseone());
+  auto* impl = dynamic_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl());
+  TORCH_CHECK(impl != nullptr,
+              "set_tensor_padding_value: device tensor has no SpyreTensorImpl");
+  if (tensor.is_view()) {
+    const at::TensorBase& base = tensor._base();
+    if (base.defined() && base.is_privateuseone()) {
+      if (auto* base_impl =
+              dynamic_cast<SpyreTensorImpl*>(base.unsafeGetTensorImpl())) {
+        base_impl->spyre_layout.clear_padding();
+      }
+    }
+  }
+  if (value.has_value()) {
+    impl->spyre_layout.set_constant_padding(*value);
+  } else {
+    impl->spyre_layout.clear_padding();
+  }
+}
+
 std::vector<int64_t> get_spyre_tensor_sizes(const at::Tensor& tensor) {
   TORCH_CHECK(tensor.is_privateuseone());
   SpyreTensorImpl* impl;
