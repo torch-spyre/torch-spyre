@@ -42,7 +42,7 @@ from torch._inductor.ir import (
 )
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
-from torch._inductor.scheduler import SchedulerNode
+from torch._inductor.scheduler import FusedSchedulerNode, SchedulerNode
 from torch._inductor.virtualized import V
 
 from . import config
@@ -68,6 +68,7 @@ from .constants import (
     COPY_BACK_CANDIDATE_ATTR,
     DEVICE_NAME,
     ELIDED_COPY_BACK_ATTR,
+    MATMUL_REDUCTION_OPS,
     REDUCTIONS_NON_STICK_DIM_ONLY,
     STAGGERED_EAS,
 )
@@ -534,7 +535,7 @@ def _qfp8wt_stl(
     )
 
 
-def _reduction_layout(
+def _reduction_layout_from_stl(
     op: Operation,
     output: FixedLayout,
     output_dep: MemoryDep,
@@ -542,10 +543,11 @@ def _reduction_layout(
     in_layout: FixedLayout,
     stl: SpyreTensorLayout,
 ) -> list[SpyreTensorLayout]:
-    """Output STL candidates for a reduction op.
+    """Output STL candidates of a reduction for one candidate input STL.
 
     Tries to preserve the input layout first (mapped through the reduction),
-    then falls back to scanning alternative input dims.
+    then falls back to scanning alternative input dims. An empty result means
+    this candidate cannot produce a supported output layout.
     """
     data = op.data
     # Bool physical format resolution: see bool_layout_dtype's docstring.
@@ -666,22 +668,23 @@ def _convert_layout(
             in_coords = host_coordinates(in_layout, dep, None)
             source_device_coords = device_coordinates(stl, dep, None)
             staggered_arg = PropArg(dep, in_layout, [stl])
-            for target_stick_expr in in_coords:
-                if not target_stick_expr.free_symbols:
-                    continue
-                target_stl = compute_restickify_target_layout(
-                    stl,
-                    in_layout,
-                    target_stick_expr,
-                    in_coords,
-                    source_device_coords,
-                    arg=staggered_arg,
-                )
-                if target_stl is None:
-                    continue
-                candidate = rescale_stl_for_dtype(target_stl, output.dtype, fmt)
-                if candidate not in layouts:
-                    layouts.append(candidate)
+            if source_device_coords[-1].free_symbols:
+                for target_stick_expr in in_coords:
+                    if not target_stick_expr.free_symbols:
+                        continue
+                    target_stl = compute_restickify_target_layout(
+                        stl,
+                        in_layout,
+                        target_stick_expr,
+                        in_coords,
+                        source_device_coords,
+                        arg=staggered_arg,
+                    )
+                    if target_stl is None:
+                        continue
+                    candidate = rescale_stl_for_dtype(target_stl, output.dtype, fmt)
+                    if candidate not in layouts:
+                        layouts.append(candidate)
 
         # Under the current EA map, an already-staggered input is the
         # reverse staggered-to-STANDARD restoration. It needs no
@@ -795,7 +798,7 @@ def _single_arg_op_layout(
     in_layout: FixedLayout,
     stl: SpyreTensorLayout,
 ) -> list[SpyreTensorLayout]:
-    """Compute output STL(s) for one candidate input STL of a single-arg op.
+    """Compute output STL(s) for one candidate input STL of a single-arg pointwise op.
 
     Called once per candidate input STL to produce corresponding output STL(s).
     An empty result means this candidate cannot produce a supported output layout;
@@ -803,10 +806,7 @@ def _single_arg_op_layout(
     """
     data = op.data
 
-    if isinstance(data, Reduction):
-        return _reduction_layout(op, output, output_dep, dep, in_layout, stl)
-
-    # Single-arg pointwise
+    # Reductions are laid out by _reduction_layouts.
     assert isinstance(data, Pointwise)
     aten_op = next(iter(data.origins)).target if data.origins else None
     match aten_op:
@@ -1069,7 +1069,6 @@ def _factorized_chain(
     host_size: list,
     host_stride: list,
     var: sympy.Symbol,
-    reduction_type: str,
     label: str,
 ) -> tuple[list[int], int, int]:
     """Validate the host dims that jointly carry ``var`` as one contiguous chain.
@@ -1122,7 +1121,7 @@ def _factorized_chain(
         or host_stride[chain[-1]] != var_stride
     ):
         raise Unsupported(
-            f"{reduction_type}: cannot canonicalize factorized {label}_var="
+            f"cannot canonicalize factorized {label}_var="
             f"{var}; expected an affine contiguous host dimension chain "
             f"covering a window of whole inner dims, got host coordinates "
             f"{host_coords}, size={list(arg.layout.size)}, "
@@ -1191,7 +1190,7 @@ def _rebuild_stl_for_matmul(
         if var is None:
             continue
         hdims, _, var_stride = _factorized_chain(
-            arg, host_coords, host_size, host_stride, var, reduction_type, label
+            arg, host_coords, host_size, host_stride, var, label
         )
         if len(hdims) == 1 and not is_stick:
             continue
@@ -1394,6 +1393,11 @@ def _stl_via_restickify(
         if target_stick_expr is None:
             continue
         stl, dev_coords = _prepare_for_restickify(stl, dev_coords, reduction_type)
+        if (
+            not dev_coords[-1].free_symbols
+            and reduction_type not in MATMUL_REDUCTION_OPS
+        ):
+            continue
         result = compute_restickify_target_layout(
             stl,
             arg.layout,
@@ -1401,7 +1405,6 @@ def _stl_via_restickify(
             arg_host_coords,
             dev_coords,
             arg=arg,
-            reduction_type=reduction_type,
             label=label,
         )
         if result is not None:
@@ -2120,6 +2123,65 @@ def _multi_arg_pointwise_layouts(
     return results
 
 
+def _reduction_layouts(
+    op: Operation,
+    output: FixedLayout,
+    output_dep: MemoryDep,
+    args: list[PropArg],
+    *,
+    cost_args: list[PropArg] | None = None,
+    out_deps: MemoryDep | list[MemoryDep] | None = None,
+) -> list[SpyreTensorLayout]:
+    """Output STL candidates and restickify cost for a reduction.
+
+    The candidates follow the first input, the one being reduced; any further
+    inputs (the weight of a depthwise conv) are matched by the cost node.
+    ``cost_args`` and ``out_deps`` default to ``args`` and ``output_dep``; a
+    mutation op passes its full reads and the co-output dep of its target.
+
+    A ``REDUCTIONS_NON_STICK_DIM_ONLY`` op (``prod``) cannot reduce along the
+    stick, so an input whose stick carries the reduced dim is restickified off
+    it (``forbidden_stick_sym`` in ``AllSameNode.from_args``). When its output
+    keeps only size-1 dims, as for ``prod`` of a ``(1, N)`` tensor over dim 1,
+    no dim can carry the output stick, so the output takes a synthetic stick
+    (one element per stick), as in ``_topk_layouts``.
+    """
+    arg = args[0]
+    layouts = []
+    for stl in arg.layouts:
+        layouts.extend(
+            _reduction_layout_from_stl(op, output, output_dep, arg.dep, arg.layout, stl)
+        )
+    non_stick_only = op.data.reduction_type in REDUCTIONS_NON_STICK_DIM_ONLY
+    if (
+        not layouts
+        and non_stick_only
+        and all(c == 0 for c in host_coordinates(output, output_dep, None))
+    ):
+        c_size = [concretize_expr(s) for s in output.size]
+        c_stride = [concretize_expr(s) for s in output.stride]
+        dim_order = list(range(len(output.size))) + [-1]
+        layouts.append(SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order))
+    if any(stride == 0 for stride in output.stride):
+        layouts = [_compact_broadcast_device_dims(stl) for stl in layouts]
+    if not layouts:
+        raise Unsupported(
+            f"{op.get_name()} ({op.data.reduction_type}): no supported output "
+            f"layout found for any of {len(arg.layouts)} candidate input layouts; "
+            f"output size={output.size}"
+        )
+    op.restick_cost_fn = AllSameNode.from_args(
+        args if cost_args is None else cost_args,
+        layouts,
+        output_dep if out_deps is None else out_deps,
+        op,
+        forbidden_stick_sym=(
+            find_reduction_var((arg.dep,), output_dep) if non_stick_only else None
+        ),
+    )
+    return layouts
+
+
 def _topk_layouts(
     op: Operation,
     output: FixedLayout,
@@ -2331,6 +2393,9 @@ def compute_layouts(
 
     if is_keep_by_index(op):
         return _keep_by_index_layouts(op, output, output_dep, args)
+
+    if isinstance(data, Reduction):
+        return _reduction_layouts(op, output, output_dep, args)
 
     aten_op = next(iter(data.origins)).target if data.origins else None
 
@@ -3178,34 +3243,20 @@ def _handle_empty_fallback_mutation(
         op.layouts = candidates
     elif isinstance(op.data, Reduction):
         # The non-target input is the reduction's un-reduced,
-        # higher-rank input. Must use _single_arg_op_layout, not the
-        # broadcast-oriented pointwise join path.
+        # higher-rank input. Must use the reduction candidates, not
+        # the broadcast-oriented pointwise join path.
         assert len(new_value_args) == 1, (
             "Reduction mutation op should have exactly one non-target "
             f"input, got {len(new_value_args)} for {op.get_name()}"
         )
-        accum_layout = target_buf.get_layout()
-        in_arg = new_value_args[0]
-        candidates = []
-        for stl in in_arg.layouts:
-            candidates.extend(
-                _single_arg_op_layout(
-                    op,
-                    accum_layout,
-                    output_dep,
-                    in_arg.dep,
-                    in_arg.layout,
-                    stl,
-                )
-            )
-        if not candidates:
-            raise Unsupported(
-                f"{op.get_name()}: no supported output layout "
-                f"found for any of {len(in_arg.layouts)} "
-                f"candidate input layouts; target size="
-                f"{accum_layout.size}"
-            )
-        op.restick_cost_fn = AllSameNode.from_args(all_args, candidates, out_deps, op)
+        candidates = _reduction_layouts(
+            op,
+            target_buf.get_layout(),
+            output_dep,
+            new_value_args,
+            cost_args=all_args,
+            out_deps=out_deps,
+        )
         target_buf.layouts = candidates
         op.layouts = candidates
     else:
@@ -3689,6 +3740,15 @@ def _clean_mutation_op_output_layout(node: ComputedBuffer) -> FixedLayout:
     )
 
 
+def _leaf_scheduler_nodes(nodes):
+    """Every node in ``nodes``, descending into ``FusedSchedulerNode``s."""
+    for n in nodes:
+        if isinstance(n, FusedSchedulerNode):
+            yield from _leaf_scheduler_nodes(n.get_nodes())
+        else:
+            yield n
+
+
 def propagate_mutation_layouts(
     nodes: list,
 ) -> list:
@@ -3700,8 +3760,12 @@ def propagate_mutation_layouts(
     mutation layout during its initialisation to set up mutation tracking.
     This pass runs as a _pre_fusion_custom_pass (after scheduler init) to
     assign FixedTiledLayout to those remaining mutation ops.
+
+    A counted loop reaches this pass as one ``LoopSchedulerNode`` (a
+    ``FusedSchedulerNode``); its body's mutation ops are handled like any
+    other, so the pass descends into it.
     """
-    for n in nodes:
+    for n in _leaf_scheduler_nodes(nodes):
         if not (isinstance(n, SchedulerNode) and isinstance(n.node, ComputedBuffer)):
             continue
         if not isinstance(n.node.layout, MutationLayoutSHOULDREMOVE):
