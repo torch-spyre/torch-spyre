@@ -2112,11 +2112,12 @@ def splits_by_index_coeff(
     This is intentionally a boundary representation: pre-scheduler passes keep
     symbol-keyed ownership. Coefficients are stable across scheduler renaming,
     but cannot distinguish distinct non-unity splits sharing one coefficient.
-    Callers (``WorkDivisionContext.is_legal``, ``_apply_user_hint``) must
-    reject a ``splits`` map ``unrepresentable_splits_by_index_coeff`` flags
-    before it is ever committed, so this encoder may assume representability
-    holds; ``finalize_work_division_for_scheduler`` re-checks it defensively
-    and raises rather than encoding a lossy result.
+    Callers (``WorkDivisionContext.is_legal``, ``_apply_user_hint``, and
+    ``apply_splits``) must reject a ``splits`` map
+    ``unrepresentable_splits_by_index_coeff`` flags before it is ever
+    committed, so this encoder may assume representability holds;
+    ``finalize_work_division_for_scheduler`` re-checks it defensively and
+    raises rather than encoding a lossy result.
 
     Only non-unity splits are stored; 1 is the default on the apply side.
     Dimensions absent from both indexes are intentionally omitted.
@@ -2248,13 +2249,14 @@ def work_division_transport_indexes(
     it_space: dict[sympy.Symbol, sympy.Expr],
     splits: dict[sympy.Symbol, int] | None = None,
     *,
-    label: str | None = None,
+    message_prefix: str = "work division for",
 ) -> tuple[sympy.Expr, sympy.Expr] | None:
     """Select scheduler indexes; optionally reject an unrepresentable split.
 
     Operations without an indexed write do not use the coefficient transport.
     Legality callers pass ``splits`` to apply the same losslessness check;
-    candidate contexts omit it and cache the selected indexes.
+    candidate contexts omit it and cache the selected indexes. ``message_prefix``
+    identifies the requesting pass in rejection diagnostics.
     """
     if not any(isinstance(dep, MemoryDep) for dep in rw.writes):
         return None
@@ -2265,19 +2267,11 @@ def work_division_transport_indexes(
         splits, it_space, write_index, read_index
     )
     if problems:
-        if label == "work_division_hint":
-            message = (
-                f"{label}: {op.get_name()} split {splits} cannot be represented "
-                "by the scheduler's coefficient-keyed transport: "
-                f"{'; '.join(problems)}."
-            )
-        else:
-            message = (
-                f"work division for {op.get_name()} split {splits} cannot be "
-                "represented by the scheduler's coefficient-keyed transport: "
-                f"{'; '.join(problems)}."
-            )
-        raise Unsupported(message)
+        raise Unsupported(
+            f"{message_prefix} {op.get_name()} split {splits} cannot be represented "
+            "by the scheduler's coefficient-keyed transport: "
+            f"{'; '.join(problems)}."
+        )
     return write_index, read_index
 
 

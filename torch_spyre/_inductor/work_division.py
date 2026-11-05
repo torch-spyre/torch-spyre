@@ -895,6 +895,7 @@ class WorkDivisionContext:
     # commit-time checks, even when this context was built for a tiled frame.
     # Cache it once rather than re-deriving the sympy iteration space per candidate.
     transport_it_space: dict[Symbol, Expr] | None = None
+    # factor_domain is asked once per axis by the enumeration and again per
     # candidate by is_legal; memoize its sympy-heavy derivation.
     _factor_domains: dict[Symbol, list[int]] = dataclasses.field(
         default_factory=dict, init=False, repr=False, compare=False
@@ -948,7 +949,11 @@ class WorkDivisionContext:
         """
         if self.write_index is None:
             return True
-        full_it_space = self.transport_it_space or self.it_space
+        full_it_space = (
+            self.transport_it_space
+            if self.transport_it_space is not None
+            else self.it_space
+        )
         return not unrepresentable_splits_by_index_coeff(
             splits, full_it_space, self.write_index, self.read_index
         )
@@ -1972,15 +1977,13 @@ def _apply_user_hint(
             f"{conflicting_domains} or span floors {below_span_floor}."
         )
 
-    rw = op_read_writes(op)
-    if any(isinstance(dep, MemoryDep) for dep in rw.writes):
-        work_division_transport_indexes(
-            op,
-            rw,
-            iteration_space_from_op(op),
-            splits,
-            label="work_division_hint",
-        )
+    work_division_transport_indexes(
+        op,
+        op_read_writes(op),
+        iteration_space_from_op(op),
+        splits,
+        message_prefix="work_division_hint:",
+    )
     return splits
 
 
