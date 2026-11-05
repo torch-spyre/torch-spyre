@@ -388,11 +388,16 @@ def rescale_stl_for_dtype(
             out_device_size[i] = (total_elems + out_eps - 1) // out_eps
             out_stride_map[i] = out_eps
             break
+    # Clamp each count to the rescaled capacity of its dims; unchanged otherwise.
+    out_valid = {
+        key: min(val, math.prod(out_device_size[d] for d in key))
+        for key, val in stl.valid_elements.items()
+    }
     return SpyreTensorLayout(
         out_device_size,
         out_stride_map,
         get_device_dtype(out_dtype),
-        forward_valid_elements(stl),
+        out_valid,
         ea,
     )
 

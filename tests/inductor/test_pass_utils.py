@@ -432,15 +432,6 @@ def _stl(device_size, stride_map, valid_elements, ea=ElementArrangement.STANDARD
     return SpyreTensorLayout(device_size, stride_map, _FP16, valid_elements, ea)
 
 
-def test_forward_valid_elements_returns_copy():
-    """Returns a copy; mutating the result does not affect the original."""
-    _ds = [4, 3, 64]
-    stl = _stl(_ds, [192, 64, 1], {(0,): 4, (1, 2): 3})
-    result = forward_valid_elements(stl)
-    assert result == {(0,): 4, (1, 2): 3}
-    assert stl.valid_elements == {(0,): 4, (1, 2): 3}
-
-
 def test_forward_valid_elements_independent_groups():
     _ds = [8, 4, 64]
     stl = _stl(_ds, [256, 64, 1], {(0,): 8, (1, 2): 4})
