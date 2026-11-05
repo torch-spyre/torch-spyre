@@ -2764,6 +2764,490 @@ def spyre_sliding_window_attention(
     return output[:, :, pad_rows:, :] if pad_rows else output
 
 
+def _mla_prefer_absorbed(
+    *,
+    seqlen_q: int,
+    seqlen_kv: int,
+    nope_dim: int,
+    rope_dim: int,
+    latent_rank: int,
+    value_dim: int,
+) -> bool:
+    """Choose MLA's execution path from the two multiply counts.
+
+    Both paths compute the same scores; they differ in where the key and value
+    up-projections are applied. Counting multiply-accumulates per head and per
+    batch element (both scale with ``B * H``, so they cancel):
+
+    * absorbed -- fold ``w_uk`` into the query once, score against the latent
+      cache, accumulate in latent space, project the result with ``w_uv``::
+
+          Lq * (Dn * R + R * Dv + Lk * (2R + Dr))
+
+    * materialized -- project every cached token into per-head keys and values,
+      then run ordinary attention::
+
+          Lk * R * (Dn + Dv) + Lq * Lk * (Dn + Dr + Dv)
+
+    The absorbed path pays ``2R + Dr`` per (query, key) pair instead of
+    ``Dn + Dr + Dv`` -- about three times more for DeepSeek-V3's dimensions --
+    and in exchange never touches ``Lk * R * (Dn + Dv)``. Solving for the
+    crossover at those dimensions (R=512, Dn=Dv=128, Dr=64) puts it near 170
+    query rows, approached from below as the context grows: decode and short
+    chunks absorb, full prefill materializes.
+
+    Memory does not enter the comparison because neither path holds a
+    cache-length per-head tensor: the materialized path projects one K/V tile
+    at a time inside the counted loop, so its working set is the tile.
+    """
+    absorbed_work = seqlen_q * (
+        nope_dim * latent_rank
+        + latent_rank * value_dim
+        + seqlen_kv * (2 * latent_rank + rope_dim)
+    )
+    materialized_work = seqlen_kv * latent_rank * (nope_dim + value_dim) + (
+        seqlen_q * seqlen_kv * (nope_dim + rope_dim + value_dim)
+    )
+    return absorbed_work <= materialized_work
+
+
+def _mla_attend(
+    q_main: torch.Tensor,
+    q_pe: torch.Tensor,
+    kv_latent: torch.Tensor,
+    k_pe: torch.Tensor,
+    masks: tuple[torch.Tensor, ...],
+    *,
+    w_uk: torch.Tensor | None,
+    w_uv: torch.Tensor | None,
+    query_scale: float,
+    kv_block_size: int,
+    num_kv_blocks: int,
+    accumulator_dim: int,
+) -> torch.Tensor:
+    """Blocked online-softmax attention over a head-shared latent K/V cache.
+
+    ``q_main`` is ``[B, H, Lq, Dm]`` -- the absorbed query (``Dm = R``) or
+    ``q_nope`` (``Dm = Dn``). ``kv_latent`` ``[B, 1, Lk, R]`` and ``k_pe``
+    ``[B, 1, Lk, Dr]`` carry a unit head axis and broadcast across query heads
+    in the native batched matmuls, exactly as SDPA's GQA path broadcasts K/V
+    across a query-head group. Here the group is every head, because an MLA
+    cache has exactly one.
+
+    ``w_uk`` ``[1, H, Dn, R]`` and ``w_uv`` ``[1, H, R, Dv]``, when given,
+    project the current K/V tile to per-head keys and values inside the loop.
+    ``None`` leaves the latent cache to be scored and accumulated directly,
+    which is the absorbed path. ``w_uk`` multiplies the *transposed* tile, so
+    the materialized path reuses the one shared transpose rather than
+    restickifying a per-head key.
+
+    The scores are the sum of two matmuls, ``q_main @ keys_T`` and
+    ``q_pe @ k_pe_T``, rather than one matmul over concatenated rows: the
+    roped half is head-shared in both paths, and concatenating it onto a
+    per-head key would expand it ``H`` times.
+    """
+    # Spyre stores fp16 and bf16 tensors in its 16-bit floating-point format.
+    # Use values representable in that storage rather than bf16's wider range.
+    storage_dtype = (
+        torch.float16
+        if q_main.dtype in (torch.float16, torch.bfloat16)
+        else q_main.dtype
+    )
+    finite_min = torch.finfo(storage_dtype).min
+    positive_min = torch.finfo(storage_dtype).tiny
+
+    # Q and the carry seeds are invariant across the counted K/V loop. A finite
+    # maximum keeps fully masked blocks defined: their exponentials and
+    # weighted contribution are exactly zero.
+    q_main_scaled = q_main * query_scale
+    q_pe_scaled = q_pe * query_scale
+    accumulator_shape = (*q_main.shape[:-1], STICK)
+    running_max_reduced = torch.full(
+        accumulator_shape,
+        finite_min,
+        device=q_main.device,
+        dtype=q_main.dtype,
+    )
+    running_max = running_max_reduced.amax(dim=-1)
+    denominator_reduced = torch.zeros(
+        accumulator_shape,
+        device=q_main.device,
+        dtype=q_main.dtype,
+    )
+    denominator = denominator_reduced.amax(dim=-1)
+    output = torch.zeros(
+        (*q_main.shape[:-1], accumulator_dim),
+        device=q_main.device,
+        dtype=q_main.dtype,
+    )
+
+    def mla_kv_body(carry, tiles):
+        running_max, denominator, output = carry
+        _, _, latent_blk, pe_blk, *mask_blocks = tiles
+
+        # One transpose per block, shared by every head. In the materialized
+        # path w_uk left-multiplies it, which produces the per-head key already
+        # transposed for the score matmul.
+        latent_t = latent_blk.transpose(-1, -2).contiguous()
+        keys_t = (
+            latent_t if w_uk is None else torch.ops.spyre.batched_matmul(w_uk, latent_t)
+        )
+        pe_t = pe_blk.transpose(-1, -2).contiguous()
+        scores = torch.ops.spyre.batched_matmul(q_main_scaled, keys_t)
+        scores = scores + torch.ops.spyre.batched_matmul(q_pe_scaled, pe_t)
+        for mask_blk in mask_blocks:
+            scores = scores + mask_blk
+
+        # Clamp before reducing so fully masked blocks do not form
+        # ``-inf - -inf`` in the online-softmax recurrence.
+        block_max = torch.amax(torch.clamp_min(scores, finite_min), dim=-1)
+        # Form the old-max correction first. The loop lowering can then update
+        # running_max without a carry snapshot.
+        correction = torch.exp(torch.clamp_max(running_max - block_max, 0.0))
+        new_max = torch.maximum(running_max, block_max)
+        exp_scores = torch.exp(scores - new_max.unsqueeze(-1))
+        new_denominator = denominator * correction + exp_scores.sum(dim=-1)
+        exp_scores = exp_scores.contiguous()
+        values = (
+            latent_blk
+            if w_uv is None
+            else torch.ops.spyre.batched_matmul(latent_blk, w_uv)
+        )
+        weighted = torch.ops.spyre.batched_matmul(exp_scores, values)
+        new_output = output * correction.unsqueeze(-1) + weighted
+        return (new_max, new_denominator, new_output), None
+
+    padded_seqlen_kv = kv_latent.size(-2)
+    mask_dims = tuple(
+        -1 if mask.size(-1) == padded_seqlen_kv else None for mask in masks
+    )
+    operands = (q_main, q_pe, kv_latent, k_pe, *masks)
+    initial = (running_max, denominator, output)
+    if num_kv_blocks == 1:
+        (_, denominator, output), _ = mla_kv_body(initial, operands)
+    else:
+        (_, denominator, output), _ = for_each_tile(
+            mla_kv_body,
+            operands,
+            dims=(None, None, -2, -2, *mask_dims),
+            tile_size=kv_block_size,
+            init=initial,
+        )
+    # A row its mask excludes entirely has a zero denominator. Clamping yields
+    # zeros for that row instead of a NaN that would spread through the rest of
+    # the layer.
+    safe_denominator = torch.clamp_min(denominator, positive_min)
+    return output / safe_denominator.unsqueeze(-1)
+
+
+def _mla_validate(
+    q_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    kv_latent: torch.Tensor,
+    k_pe: torch.Tensor,
+    w_uk: torch.Tensor,
+    w_uv: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    scale: float | None,
+) -> None:
+    """Reject malformed calls at the public decomposition boundary."""
+    if q_nope.dim() != 4 or q_pe.dim() != 4:
+        raise Unsupported(
+            "multi_latent_attention: q_nope and q_pe must be rank 4 "
+            f"[B, H, Lq, D], got {q_nope.dim()} and {q_pe.dim()}"
+        )
+    if kv_latent.dim() != 3 or k_pe.dim() != 3:
+        raise Unsupported(
+            "multi_latent_attention: kv_latent and k_pe must be rank 3 "
+            f"[B, Lk, D], got {kv_latent.dim()} and {k_pe.dim()}"
+        )
+    if w_uk.dim() != 3 or w_uv.dim() != 3:
+        raise Unsupported(
+            "multi_latent_attention: w_uk and w_uv must be rank 3 [H, D, R], "
+            f"got {w_uk.dim()} and {w_uv.dim()}"
+        )
+
+    batch_size, num_heads, seqlen_q, nope_dim = q_nope.shape
+    seqlen_kv = kv_latent.size(1)
+    latent_rank = kv_latent.size(2)
+    rope_dim = q_pe.size(3)
+
+    if q_pe.shape[:3] != q_nope.shape[:3]:
+        raise Unsupported(
+            "multi_latent_attention: q_pe must agree with q_nope on batch, "
+            f"heads and query length, got {tuple(q_pe.shape[:3])} and "
+            f"{tuple(q_nope.shape[:3])}"
+        )
+    if kv_latent.size(0) != batch_size or k_pe.size(0) != batch_size:
+        raise Unsupported(
+            "multi_latent_attention: latent cache batch "
+            f"{(kv_latent.size(0), k_pe.size(0))} must match query batch "
+            f"{batch_size}"
+        )
+    if k_pe.size(1) != seqlen_kv:
+        raise Unsupported(
+            f"multi_latent_attention: k_pe length {k_pe.size(1)} must match "
+            f"kv_latent length {seqlen_kv}"
+        )
+    if k_pe.size(2) != rope_dim:
+        raise Unsupported(
+            f"multi_latent_attention: k_pe head dim {k_pe.size(2)} must match "
+            f"q_pe head dim {rope_dim}"
+        )
+    if w_uk.size(0) != num_heads or w_uv.size(0) != num_heads:
+        raise Unsupported(
+            "multi_latent_attention: up-projection weights must carry one "
+            f"block per query head, got {(w_uk.size(0), w_uv.size(0))} for "
+            f"H={num_heads}"
+        )
+    if w_uk.size(1) != nope_dim:
+        raise Unsupported(
+            f"multi_latent_attention: w_uk must be [H, {nope_dim}, R] to match "
+            f"q_nope, got {tuple(w_uk.shape)}"
+        )
+    if w_uk.size(2) != latent_rank or w_uv.size(2) != latent_rank:
+        raise Unsupported(
+            "multi_latent_attention: up-projection weights must map from the "
+            f"latent rank {latent_rank}, got {(w_uk.size(2), w_uv.size(2))}"
+        )
+    if seqlen_q <= 0 or seqlen_kv <= 0:
+        raise Unsupported(
+            "multi_latent_attention: query and cache lengths must be "
+            f"positive, got seqlen_q={seqlen_q}, seqlen_kv={seqlen_kv}"
+        )
+
+    tensors = (q_nope, q_pe, kv_latent, k_pe, w_uk, w_uv)
+    if any(tensor.dtype != q_nope.dtype for tensor in tensors):
+        raise Unsupported(
+            "multi_latent_attention: all inputs must share one dtype, got "
+            f"{tuple(str(tensor.dtype) for tensor in tensors)}"
+        )
+    if any(tensor.device != q_nope.device for tensor in tensors):
+        raise Unsupported(
+            "multi_latent_attention: all inputs must share one device, got "
+            f"{tuple(str(tensor.device) for tensor in tensors)}"
+        )
+
+    if attention_mask is not None:
+        broadcasts = (
+            attention_mask.dim() == 4
+            and attention_mask.size(0) in (1, batch_size)
+            and attention_mask.size(1) in (1, num_heads)
+            and attention_mask.size(2) == seqlen_q
+            and attention_mask.size(3) == seqlen_kv
+        )
+        if not broadcasts:
+            raise Unsupported(
+                "multi_latent_attention: attention_mask shape "
+                f"{tuple(attention_mask.shape)} must broadcast to "
+                f"{(batch_size, 1, seqlen_q, seqlen_kv)}"
+            )
+        if attention_mask.dtype != q_nope.dtype:
+            raise Unsupported(
+                f"multi_latent_attention: attention_mask dtype "
+                f"{attention_mask.dtype} must match query dtype {q_nope.dtype}"
+            )
+        if attention_mask.device != q_nope.device:
+            raise Unsupported(
+                f"multi_latent_attention: attention_mask device "
+                f"{attention_mask.device} must match query device "
+                f"{q_nope.device}"
+            )
+
+    if scale is not None and scale < 0:
+        # math.sqrt would otherwise raise a bare ValueError.
+        raise Unsupported(f"multi_latent_attention: scale={scale} must be non-negative")
+
+
+@register_spyre_decompositions([torch.ops.spyre.multi_latent_attention.default])
+def spyre_multi_latent_attention(
+    q_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    kv_latent: torch.Tensor,
+    k_pe: torch.Tensor,
+    w_uk: torch.Tensor,
+    w_uv: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+    is_causal: bool = False,
+    scale: float | None = None,
+    absorbed: bool | None = None,
+) -> torch.Tensor:
+    """Multi-head latent attention over a head-shared compressed KV cache.
+
+    The two execution paths differ only in where the key and value
+    up-projections are applied -- to the query once (absorbed) or to each K/V
+    tile inside the counted loop (materialized). Everything else, including
+    the online-softmax recurrence and the head-shared roped key, is common.
+    See ``spyre::multi_latent_attention`` for the argument contract and
+    ``_mla_prefer_absorbed`` for the dispatch.
+    """
+    _mla_validate(q_nope, q_pe, kv_latent, k_pe, w_uk, w_uv, attention_mask, scale)
+
+    batch_size, num_heads, seqlen_q, nope_dim = q_nope.shape
+    seqlen_kv, latent_rank = kv_latent.shape[1:]
+    rope_dim = q_pe.size(3)
+    value_dim = w_uv.size(1)
+
+    query_scale = scale
+    if query_scale is None:
+        # The unabsorbed QK width, in both paths: the absorbed query is a
+        # reparameterization of the same scores, not a wider head.
+        query_scale = 1.0 / math.sqrt(nope_dim + rope_dim)
+
+    use_absorbed = absorbed
+    if use_absorbed is None:
+        use_absorbed = _mla_prefer_absorbed(
+            seqlen_q=seqlen_q,
+            seqlen_kv=seqlen_kv,
+            nope_dim=nope_dim,
+            rope_dim=rope_dim,
+            latent_rank=latent_rank,
+            value_dim=value_dim,
+        )
+
+    main_dim = latent_rank if use_absorbed else nope_dim
+    accumulator_dim = latent_rank if use_absorbed else value_dim
+    # One KV head, every query head in its group: the extreme of SDPA's GQA
+    # case. The score and accumulator rows differ in width here, so the live-
+    # set estimate takes the wider of the two.
+    tiling = _select_swa_tiling(
+        batch_size=batch_size,
+        num_heads=num_heads,
+        num_kvheads=1,
+        q_block=seqlen_q,
+        buffer_width=seqlen_kv,
+        head_dim=max(main_dim + rope_dim, accumulator_dim),
+        element_size=q_nope.dtype.itemsize,
+        num_cores=config.sencores,
+        lx_budget_bytes=_sdpa_lx_budget_bytes(),
+    )
+    padded_seqlen_kv = tiling.num_kv_blocks * tiling.kv_block_size
+    pad_columns = padded_seqlen_kv - seqlen_kv
+    logger.debug(
+        "MLA tiling: path=%s strategy=%s reason=%s B=%s H=%s Lq=%s Lk=%s "
+        "latent_rank=%s nope_dim=%s rope_dim=%s value_dim=%s "
+        "kv_blocks=%s kv_block_size=%s pad_columns=%s "
+        "score_bytes_per_core=%s estimated_live_bytes_per_core=%s "
+        "lx_budget_bytes=%s",
+        "absorbed" if use_absorbed else "materialized",
+        tiling.strategy,
+        tiling.reason,
+        batch_size,
+        num_heads,
+        seqlen_q,
+        seqlen_kv,
+        latent_rank,
+        nope_dim,
+        rope_dim,
+        value_dim,
+        tiling.num_kv_blocks,
+        tiling.kv_block_size,
+        pad_columns,
+        tiling.score_bytes_per_core,
+        tiling.estimated_live_bytes_per_core,
+        tiling.lx_budget_bytes,
+    )
+
+    # The causal band is positional, so it is built at the logical cache width
+    # and only then padded: a band built at the padded width would hand later
+    # queries the synthetic columns as attendable keys.
+    masks = []
+    if is_causal:
+        masks.append(
+            torch.ops.spyre.causal_mask(
+                seqlen_q, seqlen_kv, q_nope.dtype, q_nope.device
+            )
+        )
+    if attention_mask is not None:
+        masks.append(attention_mask)
+
+    if pad_columns:
+        pad_shape = (batch_size, pad_columns)
+        kv_latent = torch.cat(
+            [
+                kv_latent,
+                torch.zeros(
+                    (*pad_shape, latent_rank),
+                    device=kv_latent.device,
+                    dtype=kv_latent.dtype,
+                ),
+            ],
+            dim=1,
+        )
+        k_pe = torch.cat(
+            [
+                k_pe,
+                torch.zeros(
+                    (*pad_shape, rope_dim), device=k_pe.device, dtype=k_pe.dtype
+                ),
+            ],
+            dim=1,
+        )
+        masks = [
+            torch.cat(
+                [
+                    mask,
+                    torch.full(
+                        (*mask.shape[:-1], pad_columns),
+                        float("-inf"),
+                        device=mask.device,
+                        dtype=mask.dtype,
+                    ),
+                ],
+                dim=-1,
+            )
+            for mask in masks
+        ]
+
+    # A unit head axis, broadcast across every query head at the matmuls.
+    kv_latent = kv_latent.unsqueeze(1)
+    k_pe = k_pe.unsqueeze(1)
+
+    # Attention routinely receives logical [B, H, Lq, D] queries backed by
+    # physical [B, Lq, H, D] storage. A projection result can be logically
+    # contiguous while retaining a noncanonical Spyre device layout, so
+    # ``contiguous()`` is not sufficient to materialize the normalization that
+    # WhileLoop.create would otherwise synthesize; full SDPA's broadcasting
+    # path clones for the same reason. The copies are query-sized and bounded.
+    # Do not do this to the latent cache: those copies scale with context
+    # length, so the compiler streams their bounded tiles instead.
+    q_pe = q_pe.clone(memory_format=torch.contiguous_format)
+    q_nope = q_nope.clone(memory_format=torch.contiguous_format)
+
+    if use_absorbed:
+        # q_nope @ k_nope.T == q_nope @ w_uk[h] @ kv_latent.T. Associating left
+        # moves the only per-head work out of the K/V loop entirely.
+        q_main = torch.ops.spyre.batched_matmul(q_nope, w_uk.unsqueeze(0))
+        loop_w_uk = None
+        loop_w_uv = None
+    else:
+        q_main = q_nope
+        loop_w_uk = w_uk.unsqueeze(0)
+        loop_w_uv = w_uv.transpose(-1, -2).contiguous().unsqueeze(0)
+
+    output = _mla_attend(
+        q_main,
+        q_pe,
+        kv_latent,
+        k_pe,
+        tuple(masks),
+        w_uk=loop_w_uk,
+        w_uv=loop_w_uv,
+        query_scale=query_scale,
+        kv_block_size=tiling.kv_block_size,
+        num_kv_blocks=tiling.num_kv_blocks,
+        accumulator_dim=accumulator_dim,
+    )
+
+    if use_absorbed:
+        # Normalization is linear, so dividing by the softmax denominator
+        # before this projection is the same as dividing after it.
+        output = torch.ops.spyre.batched_matmul(
+            output.contiguous(), w_uv.transpose(-1, -2).contiguous().unsqueeze(0)
+        )
+    return output
+
+
 @register_spyre_decompositions([torch.ops.aten.max.default])
 def spyre_max_default_decomp(input):
     """
