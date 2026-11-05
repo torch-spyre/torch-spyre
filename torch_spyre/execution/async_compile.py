@@ -155,6 +155,26 @@ def _safe_kernel_name(kernel_name: str) -> str:
     return kernel_name[:_KERNEL_NAME_BUDGET]
 
 
+# Widths of the sdsc_bundle_dir_prefix passed to the runner and emitted as
+# args.sdsc_bundle_dir_prefix in profiler traces.
+#   cached path   — First 16 characters of the base32 SHA-256 cache key
+#                   (80 bits; birthday bound ~2^40 kernels).
+#   no-cache path — First 8 hex characters of a UUID (32 bits); enough for the
+#                   few ephemeral bundles of a single process run.
+_CACHED_BUNDLE_DIR_PREFIX_LEN = 16
+_UNCACHED_BUNDLE_DIR_PREFIX_LEN = 8
+
+
+def _cached_bundle_dir_prefix(cache_key: str) -> str:
+    """Prefix of a cached SDSC bundle directory, derived from its cache key."""
+    return cache_key[:_CACHED_BUNDLE_DIR_PREFIX_LEN]
+
+
+def _new_uncached_bundle_dir_prefix() -> str:
+    """Fresh random prefix for a uncached bundle directory."""
+    return uuid.uuid4().hex[:_UNCACHED_BUNDLE_DIR_PREFIX_LEN]
+
+
 def _check_backend_compiler_on_path() -> None:
     """Raise unless ``dbo-opt`` can be found, before a bundle is emitted.
 
@@ -173,12 +193,15 @@ def _check_backend_compiler_on_path() -> None:
         )
 
 
-def get_output_dir(kernel_name: str):
+def get_output_dir(kernel_name: str, sdsc_bundle_dir_prefix: str | None = None):
+    if sdsc_bundle_dir_prefix is None:
+        sdsc_bundle_dir_prefix = _new_uncached_bundle_dir_prefix()
     spyre_dir = os.path.join(cache_dir(), "inductor-spyre")
     os.makedirs(spyre_dir, exist_ok=True)
-    digest = uuid.uuid4().hex[:8]
     safe_name = _safe_kernel_name(kernel_name)
-    kernel_output_dir = tempfile.mkdtemp(dir=spyre_dir, prefix=f"{digest}_{safe_name}_")
+    kernel_output_dir = tempfile.mkdtemp(
+        dir=spyre_dir, prefix=f"{sdsc_bundle_dir_prefix}_{safe_name}_"
+    )
     return kernel_output_dir
 
 
@@ -333,6 +356,7 @@ def _prepare_kernel(
     output_dir: str,
     kernel_provenance: "KernelProvenanceDescriptor | None",
     symbol_kinds: Any = None,
+    sdsc_bundle_dir_prefix: str | None = None,
 ) -> SpyreSDSCKernelRunner:
     with timing_recorder.stage(
         "stage:SpyreAsyncCompile:prepare_kernel", kernel=kernel_name
@@ -342,6 +366,7 @@ def _prepare_kernel(
             output_dir,
             kernel_provenance=kernel_provenance,
             symbol_kinds=symbol_kinds,
+            sdsc_bundle_dir_prefix=sdsc_bundle_dir_prefix,
         )
 
 
@@ -356,6 +381,7 @@ class _SpyreCompileFuture(CodeCacheFuture):
         kernel_provenance,
         symbol_kinds,
         cache_key: str | None = None,
+        sdsc_bundle_dir_prefix: str | None = None,
     ) -> None:
         self._task = task
         self._kernel_name = kernel_name
@@ -363,6 +389,7 @@ class _SpyreCompileFuture(CodeCacheFuture):
         self._kernel_provenance = kernel_provenance
         self._symbol_kinds = symbol_kinds
         self._cache_key = cache_key
+        self._sdsc_bundle_dir_prefix = sdsc_bundle_dir_prefix
         self._runner: SpyreSDSCKernelRunner | None = None
         self._failure_dir_moved = False
 
@@ -386,11 +413,18 @@ class _SpyreCompileFuture(CodeCacheFuture):
         code_dir = self._compile_dir
         if self._cache_key is not None:
             code_dir = commit_compile_dir(self._compile_dir, self._cache_key)
+
+        # sdsc_bundle_dir_prefix selection: See the _CACHED_BUNDLE_DIR_PREFIX_LEN
+        # and _UNCACHED_BUNDLE_DIR_PREFIX_LEN. The (activity base name, prefix)
+        # pair identifies the SDSC bundle directory of a kernel event.
         self._runner = _prepare_kernel(
             self._kernel_name,
             code_dir,
             self._kernel_provenance,
             self._symbol_kinds,
+            _cached_bundle_dir_prefix(self._cache_key)
+            if self._cache_key
+            else self._sdsc_bundle_dir_prefix,
         )
         return self._runner
 
@@ -480,6 +514,7 @@ class SpyreAsyncCompile(AsyncCompile):
         kernel_provenance,
         symbol_kinds,
         cache_key: str | None = None,
+        sdsc_bundle_dir_prefix: str | None = None,
     ) -> _SpyreCompileFuture:
         future = _SpyreCompileFuture(
             task,
@@ -488,6 +523,7 @@ class SpyreAsyncCompile(AsyncCompile):
             kernel_provenance,
             symbol_kinds,
             cache_key=cache_key,
+            sdsc_bundle_dir_prefix=sdsc_bundle_dir_prefix,
         )
         self._pending_spyre_futures.append(future)
         return future
@@ -506,6 +542,7 @@ class SpyreAsyncCompile(AsyncCompile):
             return SpyreUnimplementedRunner(kernel_name, unimp.op)
 
         self._provenance_attempt_count += 1
+
         try:
             # This is the common fresh-compile/cache-reload boundary: generated
             # wrappers have reconstructed the finalized OpSpecs before calling
@@ -579,6 +616,7 @@ class SpyreAsyncCompile(AsyncCompile):
                         cached_dir,
                         kernel_provenance,
                         load_symbol_kinds(cached_dir),
+                        _cached_bundle_dir_prefix(cache_key),
                     )
 
                 logger.debug("Cache MISS: Compiling kernel")
@@ -612,8 +650,13 @@ class SpyreAsyncCompile(AsyncCompile):
                         )
                     cached_dir = commit_compile_dir(compile_dir, cache_key)
                     logger.debug("Kernel compiled and cached at: %s", cached_dir)
+
                     return _prepare_kernel(
-                        kernel_name, cached_dir, kernel_provenance, symbol_kinds
+                        kernel_name,
+                        cached_dir,
+                        kernel_provenance,
+                        symbol_kinds,
+                        _cached_bundle_dir_prefix(cache_key),
                     )
                 except Exception:  # subprocess.CalledProcessError:
                     # Move the failed dir to failed/ for manual debugging
@@ -622,9 +665,9 @@ class SpyreAsyncCompile(AsyncCompile):
                     raise
 
         # Caching disabled (SPYRE_KERNEL_CACHE=0, force_disable_caches, or
-        # frontend-only). Compile into a throw-away temp dir that lives for this
-        # process only.
-        output_dir = get_output_dir(kernel_name)
+        # frontend-only). Compile into a fresh, uncached directory.
+        sdsc_bundle_dir_prefix = _new_uncached_bundle_dir_prefix()
+        output_dir = get_output_dir(kernel_name, sdsc_bundle_dir_prefix)
         symbol_kinds = _compile_to_dir(kernel_name, output_dir, specs, pool_size)
         if _spyre_config.frontend_only:
             return _skip_backend(kernel_name, output_dir, "dbo-opt")
@@ -642,8 +685,16 @@ class SpyreAsyncCompile(AsyncCompile):
                 output_dir,
                 kernel_provenance,
                 symbol_kinds,
+                sdsc_bundle_dir_prefix=sdsc_bundle_dir_prefix,
             )
-        return _prepare_kernel(kernel_name, output_dir, kernel_provenance, symbol_kinds)
+
+        return _prepare_kernel(
+            kernel_name,
+            output_dir,
+            kernel_provenance,
+            symbol_kinds,
+            sdsc_bundle_dir_prefix,
+        )
 
     def ktir(
         self, kernel_name: str, specs: Sequence[OpSpec | LoopSpec | UnimplementedOp]
@@ -695,17 +746,26 @@ class SpyreAsyncCompile(AsyncCompile):
                 frontend_pool_allocation=_spyre_config.pool_allocated_by_frontend(),
             )
 
-        # Persist the emitted KTIR as a text file in the same per-kernel output
-        # dir as sdsc's bundle.
-        output_dir = get_output_dir(kernel_name)
+        # Persist the emitted KTIR as a text file in a fresh, uncached per-kernel
+        # directory (the same directory sdsc's bundle goes in).
+        sdsc_bundle_dir_prefix = _new_uncached_bundle_dir_prefix()
+        output_dir = get_output_dir(kernel_name, sdsc_bundle_dir_prefix)
         ktir_path = os.path.join(output_dir, f"{_safe_kernel_name(kernel_name)}.ktir")
         with open(ktir_path, "w") as fh:
             fh.write(ktir_text)
         logger.debug("OpSpec->KTIR: wrote %s", ktir_path)
 
-        return self._compile_ktir_with_dbo(kernel_name, ktir_path, output_dir)
+        return self._compile_ktir_with_dbo(
+            kernel_name, ktir_path, output_dir, sdsc_bundle_dir_prefix
+        )
 
-    def _compile_ktir_with_dbo(self, kernel_name: str, ktir_path: str, output_dir: str):
+    def _compile_ktir_with_dbo(
+        self,
+        kernel_name: str,
+        ktir_path: str,
+        output_dir: str,
+        sdsc_bundle_dir_prefix: str,
+    ):
         """Compile ``ktir_path`` with ``dbo-opt`` and return a runner for it.
 
         ``--export-dir`` receives the per-kernel output dir, under which dbo-opt
@@ -803,7 +863,12 @@ class SpyreAsyncCompile(AsyncCompile):
                 )
                 raise
 
-        return SpyreSDSCKernelRunner(kernel_name, output_dir)
+        return SpyreSDSCKernelRunner(
+            kernel_name,
+            output_dir,
+            kernel_provenance=None,
+            sdsc_bundle_dir_prefix=sdsc_bundle_dir_prefix,
+        )
 
     def wait(self, scope: dict[str, Any]) -> None:
         try:

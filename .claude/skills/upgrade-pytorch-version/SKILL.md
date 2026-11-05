@@ -523,6 +523,54 @@ After all changes:
        from test_frontend_work_bounds import _calibrate; _calibrate()"
    ```
 
+6a. **Re-verify the LoopNode scheduler patch** (`torch_spyre/_inductor/loop_scheduler.py`).
+   Counted loops reach Inductor's scheduler as one node through a patch of
+   private Inductor code, and the patch is supported on exactly one torch
+   release (`SUPPORTED_RELEASES`). A torch bump can change any function it
+   replaces or relies on, and it fails by silently running a loop body the
+   wrong number of times, not by an error, so do this before trusting a green
+   run. It needs the NEW torch installed and the OLD release's
+   `torch/_inductor/{scheduler,ir}.py`; the tool does not import `torch` or
+   `torch_spyre`, so it runs before the native extension is rebuilt.
+   ```bash
+   cd $TORCH_SPYRE_DIR
+   # The old release's files, if you no longer have an environment for it:
+   mkdir -p /tmp/inductor-$OLD && for f in scheduler.py ir.py; do
+     curl -sSfLo /tmp/inductor-$OLD/$f \
+       https://raw.githubusercontent.com/pytorch/pytorch/v$OLD.0/torch/_inductor/$f
+   done
+   NEW_INDUCTOR=$(python3 -c "import os, torch; print(os.path.join(os.path.dirname(torch.__file__), '_inductor'))")
+   python3 tools/diff_inductor_surface.py /tmp/inductor-$OLD $NEW_INDUCTOR
+   ```
+   - Exit status 0 means no function in `PATCHED_SURFACE` changed. Exit 1 means
+     read every `CHANGED` diff (the tool already ignores the `assert` to
+     `raise AssertionError` rewrite). For a method the patch **replaces**
+     (`create_scheduler_node`, `update_zero_dim_cpu_tensor`, `compute_ancestors`,
+     `dead_node_elimination`), check that the wrapper in `loop_scheduler.py`
+     still matches the new body. For one it only **relies on**, check the
+     assumption listed beside it in `PATCHED_SURFACE`.
+   - `NOT FOUND` for a name present in the new release only is a new function,
+     not an error; one missing from both trees means `PATCHED_SURFACE` has a
+     typo or the function was renamed.
+   - A new attribute that Inductor asserts on every node (as `mempool` was for
+     2.14: `ir.Operation.get_mempool` asserts `hasattr(self, "mempool")`) must
+     be added to `LoopNode` in `loop_node.py`.
+   - Update `SUPPORTED_RELEASES` in `loop_scheduler.py` to the new release, and
+     the faked versions in `tests/inductor/test_loop_scheduler.py` (the
+     release-gate tests pin the new release as supported and the old one as
+     refused).
+   - Run, serially (the device is exclusive):
+     ```bash
+     python -m pytest tests/inductor/test_loop_scheduler.py \
+       tests/inductor/test_loop_scheduler_readers.py \
+       tests/inductor/test_loop_scheduler_review.py \
+       tests/inductor/test_loop_scheduler_equivalence.py -q
+     ```
+     `test_loop_scheduler_equivalence.py` is the gate: it compiles real loops
+     with the flow-through on and off and compares kernels, numerics and the
+     scheduler's structure. A numerics-only test cannot stand in for it: a loop
+     wrapped twice still matches a CPU reference for online softmax.
+
 7. **Run the full CI.** Local runs cover only a slice, and the local lower
    stack may differ from CI's. The fastest full signal is a draft PR.
    Before calling a failure local-only, confirm it passes in CI.
@@ -552,6 +600,8 @@ After completing all steps, report:
    - [ ] Rebuild torch-spyre + any downstream C++ extensions (vllm, ...)
    - [ ] Run test suite
    - [ ] Re-calibrate test_frontend_work_bounds.py (Step 10.6)
+   - [ ] Re-verify the LoopNode scheduler patch: `tools/diff_inductor_surface.py`,
+         `SUPPORTED_RELEASES`, the four `test_loop_scheduler*` files (Step 10.6a)
    - [ ] Check torch_spyre/_monkey_patch.py & torch_spyre/ops/eager.py
          for API drift against the new PyTorch (Dynamo guards, ATen ops)
 ```
@@ -594,6 +644,11 @@ After upgrading, watch for:
    `native_functions.yaml`.
 4. **Inductor API changes** — `torch._inductor` internals may have changed.
    Watch for import errors or API mismatches in `torch_spyre/_inductor/`.
+   `torch_spyre/_inductor/loop_scheduler.py` patches four `Scheduler`
+   methods and depends on about two dozen more; `python3
+   tools/diff_inductor_surface.py <old> <new>` lists the ones that changed
+   (Step 10.6a). A loop that compiles but runs its body the wrong number of
+   times is this, not an op bug.
 5. **Deprecation warnings** — New deprecations may need filterwarnings entries
    in `pyproject.toml`.
 5a. **Dynamo / guard API changes** — `torch._C._dynamo.guards.GuardManager`
