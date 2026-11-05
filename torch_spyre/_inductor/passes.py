@@ -595,8 +595,7 @@ class CustomPreSchedulingPasses:
             # choice, restickify, work division, LX/HBM planning), and they
             # then see exactly the in-place form the splice used to make.
             # Moving it later costs LX footprint: propagation would choose the
-            # update's layout freely instead of tying it to the storage
-            # (measured in the stage-6 investigation, task 6.0a, section 3).
+            # update's layout freely instead of tying it to the storage.
             #
             # The passes that run between the splice and this one see a carry
             # update with a plain FixedLayout and no mutation form. Audited by
