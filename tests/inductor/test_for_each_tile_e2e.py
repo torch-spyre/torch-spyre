@@ -62,6 +62,7 @@ from torch_spyre.constants import DEVICE_NAME
 from torch_spyre._inductor import config
 from torch_spyre._inductor import passes as ts_passes
 from torch_spyre._inductor.constants import RESTICKIFY_OP
+from torch_spyre._inductor.loop_node import all_ops
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
 from torch_spyre._inductor.scratchpad.coarse_tiling import (
@@ -284,6 +285,7 @@ class TestForEachTileE2E(_DynamoResetTestCase):
                         device_size=[4, rows // 32, 32],
                         stride_map=[rows, 32, 1],
                         device_dtype=get_device_dtype(torch.int32),
+                        valid_elements={(0,): 4, (1, 2): rows},
                     )
                     inputs = (
                         values.to(DEVICE_NAME),
@@ -367,6 +369,7 @@ class TestForEachTileE2E(_DynamoResetTestCase):
                             device_size=[96, 1, 64],
                             stride_map=[64, 64, 1],
                             device_dtype=get_device_dtype(torch.float16),
+                            valid_elements={(0,): 96, (1, 2): 64},
                         )
                     }
                     if row_outermost
@@ -1082,8 +1085,13 @@ class _CollectRegions(CustomPreSchedulingPasses):
     def __call__(self, graph) -> None:
         super().__call__(graph)
         cls = type(self)
-        cls.operations = list(graph.operations)
-        cls.regions = prescribed_regions(graph.operations)
+        # The leaf ops in program order: graph.operations now keeps its
+        # LoopNodes after the pipeline (they reach the scheduler as nodes),
+        # and its leaf ops are exactly the flat list the pipeline used to
+        # leave.  The passes that call prescribed_regions run inside the pass
+        # loop, where they see this flat view (OpsView).
+        cls.operations = list(all_ops(graph.operations))
+        cls.regions = prescribed_regions(cls.operations)
 
 
 class TestPrescribedRegionsE2E(_DynamoResetTestCase):
