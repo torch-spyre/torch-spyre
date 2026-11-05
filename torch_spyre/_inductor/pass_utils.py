@@ -2769,7 +2769,28 @@ def compute_restickify_needed(
         # have extra dimensions in which the input will be broadcasted into.
         expanded, expanded_stl = expand_sparse(in_stl, dense_in_host)
         if expanded:
-            return True, expanded_stl
+            # expand_sparse puts the stick on the input's own last host dim. If the
+            # consumer needs another stick (a stick-dim gather written at an offset
+            # into a wider stick, as in cat), codegen turns the mismatched read into
+            # a second restickify padded to a whole stick, which writes past the
+            # slice and at the wrong offset. Restickify straight to the consumer's
+            # stick instead, when that layout exists.
+            expanded_idc = try_device_coordinates(
+                expanded_stl, in_dep, ind_sizes, op=op
+            )
+            if expanded_idc is not None and stick_compatible([expanded_idc, out_idc]):
+                return True, expanded_stl
+            from .propagate_layouts import PropArg  # noqa: PLC0415
+
+            direct = compute_restickify_target_layout(
+                in_stl,
+                in_host,
+                target_stick,
+                ic,
+                idc,
+                arg=PropArg(in_dep, in_host, [in_stl]),
+            )
+            return True, expanded_stl if direct is None else direct
 
     # Local import avoids circular dependency (propagate_layouts imports pass_utils).
     from .propagate_layouts import PropArg  # noqa: PLC0415

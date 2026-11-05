@@ -9013,6 +9013,56 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        # A stick-dim gather written at an offset inside a wider stick: the
+        # restickify of the gather output must target the consumer's stick, or
+        # it writes at stick position 0 and over the neighbouring lanes.
+        ("test_stick_gather_at_offset", "test_stick_gather_at_offset_cpu"): {
+            "param_sets": {
+                "cat_after": (
+                    lambda x, a, i: torch.cat((a, torch.index_select(x, -1, i)), -1),
+                    cached_randn((32, 8, 64), differentiation="sgo_x"),
+                    cached_randn((32, 8, 32), differentiation="sgo_a"),
+                ),
+                "cat_even_odd": (
+                    lambda x, a, i: torch.cat(
+                        (
+                            torch.index_select(x, -1, i),
+                            torch.index_select(x, -1, i + 1),
+                        ),
+                        -1,
+                    ),
+                    cached_randn((32, 8, 64), differentiation="sgo_x"),
+                    cached_randn((32, 8, 32), differentiation="sgo_a"),
+                ),
+                "cat_after_2d": (
+                    lambda x, a, i: torch.cat((a, torch.index_select(x, -1, i)), -1),
+                    cached_randn((8, 64), differentiation="sgo_x2"),
+                    cached_randn((8, 32), differentiation="sgo_a2"),
+                ),
+                "pad_left": (
+                    lambda x, a, i: torch.nn.functional.pad(
+                        torch.index_select(x, -1, i), (32, 0)
+                    ),
+                    cached_randn((32, 8, 64), differentiation="sgo_x"),
+                    cached_randn((32, 8, 32), differentiation="sgo_a"),
+                ),
+                # The fill value must survive next to the gathered lanes.
+                "pad_right_fill": (
+                    lambda x, a, i: torch.nn.functional.pad(
+                        torch.index_select(x, -1, i), (0, 32), value=7.0
+                    ),
+                    cached_randn((32, 8, 64), differentiation="sgo_x"),
+                    cached_randn((32, 8, 32), differentiation="sgo_a"),
+                ),
+                "pad_both_fill": (
+                    lambda x, a, i: torch.nn.functional.pad(
+                        torch.index_select(x, -1, i), (16, 16), value=7.0
+                    ),
+                    cached_randn((32, 8, 64), differentiation="sgo_x"),
+                    cached_randn((32, 8, 32), differentiation="sgo_a"),
+                ),
+            },
+        },
         # rotate_half on q/k built by view + transpose of the projection output:
         # the HF attention pattern issue #4050 was reported against.
         ("test_rope_on_split_stick_view", "test_rope_on_split_stick_view_cpu"): {
@@ -11712,6 +11762,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return slicer(x.view(*view_shape)) * 1.0
 
         self.compare_with_cpu(fn, x, run_eager=False)
+
+    def test_stick_gather_at_offset_cpu(self, build, x, a):
+        """Gather the even stick positions of ``x`` and write them beside ``a``."""
+        index = torch.arange(0, x.shape[-1], 2)
+        self.compare_with_cpu(build, x, a, index, run_eager=False)
 
     def test_rope_on_split_stick_view_cpu(self, hidden, cos, sin):
         """rotate_half on q and k that are view + transpose of one buffer."""
