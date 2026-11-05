@@ -379,11 +379,14 @@ def in_building_loop() -> bool:
 # the REAL nested list, not on OpsView: OpsView.insert places an op beside the
 # op at a flat index, so "just before the loop" lands inside the body.
 #
-# There are six points. These four have a caller or a defined meaning today;
-# "start of each iteration" is ``insert_at_start`` and needs no more than the
-# body list, so it is a one-liner. Not here: an insertion that carries its own
-# index expression. The caller owns the index and may use the variable of any
-# enclosing loop (:func:`check_index_loops` verifies that).
+# The plan names six points; they are these four calls. Before and after "the
+# loop" and before and after "a given node" are the same call on a
+# :class:`LoopNode` anchor; "start of each iteration" and "the back edge" are
+# ``insert_at_start`` and ``insert_on_back_edge``. None has a caller outside the
+# tests yet: the allocator's ``lower_before`` / ``lower_anchor`` still go through
+# the flat view and ``peel_non_members``. An op that carries its own index
+# expression is the caller's: it may use the variable of any enclosing loop,
+# and ``loop_checker`` rule 2 verifies that between passes.
 
 
 def _enclosing_chain(

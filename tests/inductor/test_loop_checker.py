@@ -70,6 +70,13 @@ class _Op:
         return f"_Op({self._name})"
 
 
+class _SpyreOp(_Op):
+    """Like ``_Op`` but reports a Spyre device, so the pass pipeline runs."""
+
+    def get_device(self):
+        return torch.device("spyre")
+
+
 class _StarOp(_Op):
     """An op whose only dependency is a StarDep, which has no index."""
 
@@ -168,6 +175,30 @@ class TestCheckLoops(unittest.TestCase):
         with self.assertRaises(LoopStructureError):
             check_loops(graph, where="my_pass")
 
+    def test_the_usual_spellings_are_accepted_and_a_typo_raises(self):
+        self.enabled_patch.stop()
+        self.addCleanup(self.enabled_patch.start)
+        for value, expected in (
+            ("1", True),
+            ("true", True),
+            ("YES", True),
+            ("on", True),
+            ("0", False),
+            ("False", False),
+            ("no", False),
+            ("off", False),
+        ):
+            with self.subTest(value=value):
+                with unittest.mock.patch.dict(
+                    "os.environ", {"TORCH_SPYRE_CHECK_LOOPS": value}
+                ):
+                    self.assertEqual(loop_checker.checking_enabled(), expected)
+        with unittest.mock.patch.dict(
+            "os.environ", {"TORCH_SPYRE_CHECK_LOOPS": "maybe"}
+        ):
+            with self.assertRaisesRegex(ValueError, "TORCH_SPYRE_CHECK_LOOPS='maybe'"):
+                loop_checker.checking_enabled()
+
     def test_the_default_follows_the_environment(self):
         # Undo setUp's patch for this test only.
         self.enabled_patch.stop()
@@ -179,6 +210,102 @@ class TestCheckLoops(unittest.TestCase):
         with unittest.mock.patch.dict("os.environ"):
             os.environ.pop("TORCH_SPYRE_CHECK_LOOPS", None)
             self.assertTrue(loop_checker.checking_enabled())  # pytest is loaded
+
+
+class TestPipelineWiring(unittest.TestCase):
+    """``CustomPreSchedulingPasses`` calls the checker after each pass.
+
+    The unit tests above call ``check_loops`` directly, so they would stay green
+    if the call in ``_run_pass_loop`` were dropped. These go through the real
+    ``__call__``.
+    """
+
+    def setUp(self):
+        patcher = unittest.mock.patch.object(
+            loop_checker, "checking_enabled", return_value=True
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def tree(self):
+        # "a" is in the u0 loop and indexes with u1, which the second loop owns.
+        return [
+            _node("n0", [_SpyreOp("a", U1)], U0),
+            _node("n1", [_SpyreOp("b")], U1),
+        ]
+
+    def run_passes(self, passes, operations):
+        from torch_spyre._inductor.passes import CustomPreSchedulingPasses
+
+        graph = SimpleNamespace(operations=list(operations), name_to_op={})
+        pipeline = CustomPreSchedulingPasses.__new__(CustomPreSchedulingPasses)
+        pipeline.passes = passes
+        with (
+            unittest.mock.patch("torch_spyre._inductor.passes.cost_model_pass"),
+            unittest.mock.patch("torch_spyre._inductor.passes.dump_cost_model"),
+            unittest.mock.patch(
+                "torch_spyre._inductor.passes.finalize_work_division_for_scheduler"
+            ),
+        ):
+            pipeline(graph)
+        return graph
+
+    def test_a_pass_that_leaves_a_bad_tree_is_named(self):
+        def benign(graph):
+            pass
+
+        def corrupt(graph):
+            pass  # the tree is already bad; the checker must run after THIS pass
+
+        with self.assertRaises(LoopStructureError) as caught:
+            self.run_passes([corrupt, benign], self.tree())
+        self.assertEqual(caught.exception.where, "corrupt")
+        self.assertIn("a indexes with ['u1']", str(caught.exception))
+
+    def test_a_pass_that_breaks_a_good_tree_is_the_one_named(self):
+        good = [
+            _node("n0", [_SpyreOp("a", U0)], U0),
+            _node("n1", [_SpyreOp("b", U1)], U1),
+        ]
+
+        def innocent(graph):
+            pass
+
+        def break_it(graph):
+            # Passes see the flat view, so operations[0] is the first leaf op.
+            graph.operations[0]._index = U1
+
+        with self.assertRaises(LoopStructureError) as caught:
+            self.run_passes([innocent, break_it], good)
+        self.assertEqual(caught.exception.where, "break_it")
+
+    def test_control_a_good_tree_passes_every_pass(self):
+        good = [
+            _node("n0", [_SpyreOp("a", U0)], U0),
+            _node("n1", [_SpyreOp("b", U1)], U1),
+        ]
+
+        def benign(graph):
+            pass
+
+        self.run_passes([benign, benign], good)
+
+    def test_the_checker_does_not_run_when_disabled(self):
+        def corrupt(graph):
+            pass
+
+        with unittest.mock.patch.object(
+            loop_checker, "checking_enabled", return_value=False
+        ):
+            self.run_passes([corrupt], self.tree())
+
+    def test_the_error_is_not_unsupported(self):
+        # A test that asserts Unsupported around a whole compile must not pass
+        # on a checker failure.
+        from torch_spyre._inductor.errors import Unsupported
+
+        self.assertFalse(issubclass(LoopStructureError, Unsupported))
+        self.assertTrue(issubclass(LoopStructureError, RuntimeError))
 
 
 class TestInsertionPoints(unittest.TestCase):

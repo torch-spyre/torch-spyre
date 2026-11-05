@@ -55,18 +55,54 @@ import sympy
 from torch._inductor import ir
 from torch._inductor.dependencies import MemoryDep
 
-from .errors import Unsupported
+from .logging_utils import get_inductor_logger
 from .loop_node import LoopNode, all_ops, in_building_loop
 
+logger = get_inductor_logger("loop_checker")
 
-class LoopStructureError(Unsupported):
-    """The ``LoopNode`` tree is inconsistent. ``where`` names the pass."""
+
+class LoopStructureError(RuntimeError):
+    """The ``LoopNode`` tree is inconsistent: a compiler bug, not a user error.
+
+    Not a subclass of ``Unsupported``: that reads "the Spyre backend does not
+    support ...", which tells a user their program is at fault when a pass broke
+    an invariant, and a test that asserts ``Unsupported`` around a whole compile
+    would pass on this error and hide the regression.
+
+    ``where`` is the name of the pass that left the tree inconsistent;
+    ``problems`` are the individual violations.
+    """
+
+    def __init__(self, where: str, problems: list[str]) -> None:
+        self.where = where
+        self.problems = list(problems)
+        super().__init__(
+            f"after {where}: the loop structure is inconsistent "
+            "(a compiler bug; set TORCH_SPYRE_CHECK_LOOPS=0 to skip this check):\n  "
+            + "\n  ".join(self.problems)
+        )
+
+
+_TRUE = frozenset({"1", "true", "yes", "on"})
+_FALSE = frozenset({"0", "false", "no", "off", ""})
 
 
 def checking_enabled() -> bool:
+    """``TORCH_SPYRE_CHECK_LOOPS`` decides when it is set; otherwise on under pytest.
+
+    An unrecognised value raises, so a typo cannot silently turn the check off.
+    """
     flag = os.environ.get("TORCH_SPYRE_CHECK_LOOPS")
     if flag is not None:
-        return flag == "1"
+        value = flag.strip().lower()
+        if value in _TRUE:
+            return True
+        if value in _FALSE:
+            return False
+        raise ValueError(
+            f"TORCH_SPYRE_CHECK_LOOPS={flag!r}: expected one of "
+            f"{sorted(_TRUE | _FALSE - {''})}"
+        )
     return "pytest" in sys.modules
 
 
@@ -91,11 +127,24 @@ def _inductions(operations: list[ir.Operation]) -> set[sympy.Symbol]:
 
 
 def _index_symbols(op: ir.Operation) -> set[sympy.Symbol]:
-    """Free symbols of every memory dependency's index (a ``StarDep`` has none)."""
+    """Free symbols of every memory dependency's index (a ``StarDep`` has none).
+
+    Calls ``get_read_writes()`` and not the ``pass_utils.op_read_writes`` memo
+    on purpose: the memo is invalidated by hand at each site that rewrites an
+    op, so a pass that forgot to would leave a stale entry, and a checker that
+    read it would miss exactly the violation that pass just created.
+    """
     used: set[sympy.Symbol] = set()
     try:
         rw = op.get_read_writes()
-    except Exception:  # an op that cannot trace itself has nothing to check
+    except Exception as exc:  # a checker must not crash a compile
+        logger.debug(
+            "loop_checker: %s cannot trace its reads and writes (%s: %s); "
+            "its indices are not checked",
+            op.get_name(),
+            type(exc).__name__,
+            exc,
+        )
         return used
     for dep in (*rw.reads, *rw.writes):
         if isinstance(dep, MemoryDep):
@@ -113,6 +162,10 @@ def find_violations(operations: list[ir.Operation]) -> list[str]:
         if id(op) in seen:
             problems.append(f"{op.get_name()} appears more than once in the tree")
         seen.add(id(op))
+        if not all_inductions:
+            # No loop has an induction variable, so no index can use a stray
+            # one: skip tracing every op's dependencies.
+            continue
         mine = {n.induction for n in enclosing if n.induction is not None}
         stray = (_index_symbols(op) & all_inductions) - mine
         if stray:
@@ -151,7 +204,4 @@ def check_loops(graph: Any, *, where: str) -> None:
         return
     problems = find_violations(operations)
     if problems:
-        raise LoopStructureError(
-            f"after {where}: the loop structure is inconsistent:\n  "
-            + "\n  ".join(problems)
-        )
+        raise LoopStructureError(where, problems)
