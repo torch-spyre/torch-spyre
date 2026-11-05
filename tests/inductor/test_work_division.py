@@ -37,6 +37,7 @@ from torch._inductor.ir import (
     ComputedBuffer,
     FixedLayout,
     FlexibleLayout,
+    MutationLayoutSHOULDREMOVE,
     Pointwise,
     Reduction,
 )
@@ -2989,6 +2990,38 @@ class TestResidencyEdgeMatching(unittest.TestCase):
             # The update's own write is the carry edge, not a read edge.
             self.assertEqual(
                 allocator._loop_carry_read_edges(update_op, carry_edges, {}), {}
+            )
+
+    def test_post_loop_copy_back_into_a_carry_is_an_edge_on_its_storage(self):
+        # An all_reduce_ copy-back targets the update alias of the loop result.
+        # It writes the storage's bytes, so it must take the storage's ownership.
+        allocator = CoOptimizingAllocator(_UNBUILT_SOLVER, size=1)
+        update_op = self._carry_update()
+        x = _isym("x")
+        copy_back = self.consumer_op
+        self.assertIsNone(
+            allocator_module._loop_carry_mutation_target(copy_back, self.op_by_name)
+        )
+        copy_back.layout = MagicMock(spec=MutationLayoutSHOULDREMOVE)
+        copy_back.layout.get_buffer.return_value = update_op
+        self.rw[copy_back] = MagicMock(
+            writes=[MemoryDep("consumer", x, (x,), (8,))],
+            reads=[MemoryDep("reduced", x, (x,), (8,))],
+        )
+
+        storage_name = allocator_module._loop_carry_mutation_target(
+            copy_back, self.op_by_name
+        )
+        self.assertEqual(storage_name, "plain")
+        with self._patches():
+            edge = allocator._carry_writer_edge(
+                copy_back, storage_name, self.op_by_name, {}
+            )
+            self.assertIs(edge.consumer_op, copy_back)
+            self.assertEqual([dep.name for dep in edge.read_deps], ["plain"])
+            self.assertEqual(
+                edge.match_pairs(self.parent_divs, self.consumer_divs),
+                [(0, 0), (1, 1)],
             )
 
     @staticmethod
