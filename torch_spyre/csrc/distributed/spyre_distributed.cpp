@@ -220,9 +220,15 @@ void ensure_wsi(CachedPlan& plan, int64_t num_elems,
       plan.wsi = context->allgather(output_infos, *plan.tensor_info);
       break;
     }
-    case PlanKind::AllToAll:
-      plan.wsi = context->alltoall(*plan.tensor_info, *plan.tensor_info);
+    case PlanKind::AllToAll: {
+      // Even split: each rank sends/receives num_elems / group_size elements.
+      std::vector<int> split_sizes(
+          static_cast<size_t>(plan.group_size),
+          static_cast<int>(num_elems / plan.group_size));
+      plan.wsi = context->alltoallw(*plan.tensor_info, *plan.tensor_info,
+                                    split_sizes, split_sizes);
       break;
+    }
   }
   TORCH_CHECK(plan.wsi != nullptr, "Failed to create WSI");
 }
@@ -616,8 +622,9 @@ at::Tensor spyre_alltoall_run_impl(const at::Tensor& input,
                                     output.storage().data_ptr().get());
   output_tensor.SetSpyreDeviceAddressBorrowed(get_composite_address(output));
 
-  auto work_schedule = context->alltoall_applyTensors(*plan.wsi, input_tensor,
-                                                      output_tensor);
+  // Note: alltoallw_applyTensors takes (output, input).
+  auto work_schedule =
+      context->alltoallw_applyTensors(*plan.wsi, output_tensor, input_tensor);
   TORCH_CHECK(work_schedule != nullptr,
               "alltoall_applyTensors operation failed to create WorkSchedule");
 
