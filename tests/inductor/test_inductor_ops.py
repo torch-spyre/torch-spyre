@@ -4537,6 +4537,33 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
         },
         (
+            "test_cat_stack_last_dim",
+            "test_cat_stack_last_dim_cpu",
+        ): {
+            # #5196 through torch.stack(parts, dim=-1).flatten(-2), the re-interleave
+            # of GPT-J style RoPE: stack lowers to a cat into a new size-1 last dim,
+            # so part i writes the bare constant i as the stick coordinate.
+            "param_sets": {
+                "2_parts_32x8x32": (
+                    2,
+                    cached_randn((32, 8, 32), differentiation="stack_a"),
+                ),
+                "2_parts_17x4x32": (
+                    2,
+                    cached_randn((17, 4, 32), differentiation="stack_b"),
+                ),
+                "2_parts_64x32": (2, cached_randn((64, 32), differentiation="stack_c")),
+                "2_parts_32x8x16": (
+                    2,
+                    cached_randn((32, 8, 16), differentiation="stack_d"),
+                ),
+                "3_parts_32x8x32": (
+                    3,
+                    cached_randn((32, 8, 32), differentiation="stack_e"),
+                ),
+            },
+        },
+        (
             "test_pad",
             "test_pad_cpu",
         ): {
@@ -11476,6 +11503,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return torch.cat([a, b], dim=-1).sum(dim=-1)
 
         self.compare_with_cpu(fn, a, b)
+
+    def test_cat_stack_last_dim_cpu(self, parts, x):
+        """Stack ``parts`` tensors on a new last dim and flatten it into the stick."""
+
+        def fn(x):
+            return torch.stack([x * (i + 1) for i in range(parts)], dim=-1).flatten(-2)
+
+        self.compare_with_cpu(fn, x, run_eager=False)
 
     def test_pad_cpu(self, x, pad):
         """Compiled torch.nn.functional.pad (constant zero) on Spyre matches CPU."""
