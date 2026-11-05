@@ -940,10 +940,10 @@ class WorkDivisionContext:
             and self._spans_within_cap(splits)
             and self._in_split_domains(splits)
             and self.meets_span_floors(splits)
-            and self._representable_by_index_coeff(splits)
+            and self.representable_by_index_coeff(splits)
         )
 
-    def _representable_by_index_coeff(self, splits: dict[Symbol, int]) -> bool:
+    def representable_by_index_coeff(self, splits: dict[Symbol, int]) -> bool:
         """Whether the scheduler's coefficient-keyed transport can carry
         ``splits`` without loss, using the op's full, un-tiled iteration space.
         """
@@ -1148,7 +1148,7 @@ def work_division_splits_are_legal(
     return (
         ctx.obeys_op_constraints(splits)
         and ctx.meets_span_floors(splits)
-        and ctx._representable_by_index_coeff(splits)
+        and ctx.representable_by_index_coeff(splits)
     )
 
 

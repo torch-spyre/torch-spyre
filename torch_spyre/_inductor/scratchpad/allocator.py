@@ -2450,7 +2450,7 @@ def _hard_domain_violation(
         failed.append("op constraints")
     if not ctx.meets_span_floors(splits):
         failed.append(f"span floors {ctx.span_min_splits}")
-    if not ctx._representable_by_index_coeff(splits):
+    if not ctx.representable_by_index_coeff(splits):
         failed.append("scheduler coefficient-keyed transport")
     chosen = (
         f"division {division.label}, tiling {division.tiling.label}, "
