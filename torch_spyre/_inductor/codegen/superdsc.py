@@ -1255,7 +1255,7 @@ def _collect_index_tensor_layouts(
             stick_dim = index_stick_syms[i]
             dim_order = dim_order + [stick_dim]
         index_tensor_layouts[i] = (dim_order, stick_dim)
-        active_dims = {d for d in dim_order if d is not stick_dim}
+        active_dims = {d for d in dim_order if d != stick_dim}
         index_active_dims[i] = active_dims
         logger.debug(
             f"Index tensor {i}: dim_order={dim_order}, stick_dim={stick_dim}, "
@@ -1398,7 +1398,7 @@ def _create_sdsc_tensors(
         ):
             if not (has_indirect_access and i in index_tensor_indices):
                 reduced_dims = [
-                    d for d in op_dim_order if d not in dim_order and d is not mb_sym
+                    d for d in op_dim_order if d not in dim_order and d != mb_sym
                 ]
                 dim_order = dim_order + reduced_dims
 
@@ -1463,7 +1463,7 @@ def _create_sdsc_tensors(
             # Locate live roles by coordinate identity so that slot cannot
             # shift an outer role onto the wrong device extent.
             physical_axis = _unambiguous_physical_axis(arg, dim, symbol_mapping)
-            if dim is stick_dim and physical_axis not in gap_factor_by_inner_axis:
+            if dim == stick_dim and physical_axis not in gap_factor_by_inner_axis:
                 # Keep the positional handling for ordinary stick dimensions.
                 # When a tiled-away axis precedes the stick's block axis,
                 # however, include its gap just as for a non-stick dimension:
@@ -1476,9 +1476,9 @@ def _create_sdsc_tensors(
             ):
                 scales[dim] = 1
             elif dim in reduced_dims and op_spec.op != "layernormscale":
-                scales[dim] = -2 if (stick_dim is None and dim is op_stick_dim) else -1
+                scales[dim] = -2 if (stick_dim is None and dim == op_stick_dim) else -1
             elif dim in reduced_dims and op_spec.op == "layernormscale":
-                scales[dim] = -2 if (dim is stick_dim) else -1
+                scales[dim] = -2 if (dim == stick_dim) else -1
             else:
                 scales[dim] = 1
 
@@ -1505,7 +1505,7 @@ def _create_sdsc_tensors(
                 dim_device_stride = math.prod(arg.device_size[-stride_idx - 1 :])
             offsets[dim] = 0
 
-            if dim is stick_dim and dim in sdsc_dim_advance:
+            if dim == stick_dim and dim in sdsc_dim_advance:
                 # Authoritative fact from coarse_tile.py: the stick dim's
                 # iteration-0 tile is tile_size elements out of
                 # supertile_count tiles total (supertile_count already folds
@@ -1595,7 +1595,7 @@ def _create_sdsc_tensors(
                 if not _is_conv(op_spec.op) and dev_dim_size > it_dim_size:
                     backGap[dim] = dev_dim_size - it_dim_size
                 elif (
-                    dim is not stick_dim
+                    dim != stick_dim
                     and dim not in reduced_dims
                     and not (_is_conv(op_spec.op) or _is_pool(op_spec.op))
                     and coord_without_offset.subs(symbol_mapping) == dim
