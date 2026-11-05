@@ -49,6 +49,29 @@ at::Tensor spyre_empty_with_layout(
     SpyreTensorLayout device_layout,
     std::optional<c10::Device> device_opt = std::nullopt);
 
+/**
+ * Allocate a Spyre tensor whose logical size/stride are `size`/`stride`
+ * (i.e. what PyTorch sees) but whose physical layout and storage are sized
+ * as if dimension `dim` were `max_size`. Only `dim == 0` is supported (and
+ * never the innermost/stick dimension): padding any other dimension changes
+ * the host stride of the dimensions outside it. This lets a single allocation
+ * absorb any later in-place resize of `dim` up to `max_size` (see
+ * spyre_resize_) without reallocating or changing the SpyreTensorLayout
+ * that recompile guards compare against. `min_size`/`granularity` are
+ * stored on the resulting tensor (SpyreTensorImpl::reserved_dims) for the
+ * runtime guard to check on every later resize_; they do not affect the
+ * allocation itself, which is always sized for `max_size`. They are also
+ * validated at this boundary (range, positivity, `max_size % granularity
+ * == 0`), so this function does not purely trust its caller even though
+ * Python's `dynamic=` parsing re-checks the same rules for a better
+ * message. Backs `tensor.to("spyre", dynamic={dim: {min, max,
+ * granularity}})`.
+ */
+at::Tensor spyre_empty_reserved(c10::IntArrayRef size, c10::IntArrayRef stride,
+                                c10::ScalarType dtype, int64_t dim,
+                                int64_t min_size, int64_t max_size,
+                                int64_t granularity);
+
 at::Tensor empty_with_layout(
     c10::IntArrayRef size, SpyreTensorLayout device_layout,
     std::optional<c10::ScalarType> dtype_opt,
@@ -61,6 +84,25 @@ at::Tensor py_empty_with_layout(
     std::optional<c10::ScalarType> dtype_opt,
     std::optional<c10::Device> device_opt, std::optional<bool> pin_memory_opt,
     std::optional<c10::MemoryFormat> memory_format_opt);
+
+// Sharded tensors. A sharded tensor has the global logical shape, and
+// its storage holds num_shards plain per-shard allocations (shard i, the
+// i-th equal slice along shard_dim, backs core i), encoded in the
+// shard-local default SpyreTensorLayout.
+at::Tensor spyre_empty_sharded(c10::IntArrayRef size, c10::ScalarType dtype,
+                               int64_t shard_dim, int64_t num_shards,
+                               std::optional<c10::Device> device_opt);
+
+// Whether `tensor`'s storage is sharded storage.
+bool spyre_is_sharded(const at::Tensor& tensor);
+
+// Device address of shard `shard_index` of a sharded tensor: the start of
+// that shard's own allocation. Resolved per launch for
+// non-unified kernels; never baked into compiled artifacts. Fails unless the
+// tensor has the shard count and per-shard bytes the kernel was compiled for.
+uint64_t shard_device_address(const at::Tensor& sharded, int64_t shard_index,
+                              int64_t expected_num_shards,
+                              int64_t expected_shard_bytes);
 
 auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
                   SpyreTensorLayout stl, bool host2device)

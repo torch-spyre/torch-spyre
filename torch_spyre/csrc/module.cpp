@@ -264,6 +264,21 @@ PYBIND11_MODULE(_C, m) {
       },
       py::arg("key"), "Return registered debug-handle IDs without mutation");
   m.def(
+      "lookup_bundle_dir_prefix",
+      [](const std::string& name_base) -> py::object {
+        const auto sdsc_bundle_dir_prefix =
+            spyre::lookupBundleDirPrefix(name_base);
+        if (sdsc_bundle_dir_prefix.empty()) {
+          return py::none();
+        }
+        return py::cast(sdsc_bundle_dir_prefix);
+      },
+      py::arg("name_base"),
+      "Return the SDSC bundle directory prefix for an activity name base");
+  m.def("activity_name_base", &spyre::activityNameBase,
+        py::arg("profiler_event_name"),
+        "Return the activity base name from the profiler event name");
+  m.def(
       "kernel_provenance_registry_stats",
       []() {
         const auto stats = spyre::kernelProvenanceRegistryStats();
@@ -629,6 +644,15 @@ PYBIND11_MODULE(_C, m) {
   m.def("spyre_empty_with_layout", &spyre::spyre_empty_with_layout,
         py::arg("size"), py::arg("stride"), py::arg("dtype"),
         py::arg("device_layout"), py::arg("device") = py::none());
+  m.def("spyre_empty_reserved", &spyre::spyre_empty_reserved, py::arg("size"),
+        py::arg("stride"), py::arg("dtype"), py::arg("dim"),
+        py::arg("min_size"), py::arg("max_size"), py::arg("granularity"),
+        "Allocate a Spyre tensor whose physical layout/storage are sized "
+        "for dim `dim` == `max_size`, while its logical (PyTorch-visible) "
+        "size/stride stay at `size`/`stride`. `min_size`/`granularity` are "
+        "stored on the tensor for the runtime resize_ guard to check. "
+        "Backs tensor.to(\"spyre\", dynamic={dim: {min, max, "
+        "granularity}}).");
   m.def("empty_with_layout", &spyre::py_empty_with_layout);
   m.def("as_strided_with_layout", &spyre::as_strided_with_layout);
   m.def("reinterpret_tensor", &spyre::reinterpret_tensor);
@@ -672,6 +696,31 @@ PYBIND11_MODULE(_C, m) {
   m.def("set_spyre_tensor_layout", &spyre::set_spyre_tensor_layout);
   m.def("get_spyre_tensor_sizes", &spyre::get_spyre_tensor_sizes);
   m.def("get_spyre_tensor_strides", &spyre::get_spyre_tensor_strides);
+  m.def(
+      "get_reserved_dims",
+      [](const at::Tensor& tensor)
+          -> std::optional<std::map<int64_t, std::map<std::string, int64_t>>> {
+        // The dict-of-strings conversion lives here, at the Python
+        // boundary, rather than in spyre::get_reserved_dims itself -- a
+        // C++ caller of that function gets the typed ReservedDimInfo
+        // struct with compile-time field checking, not string lookups
+        // into a dict it has to spell correctly.
+        auto reserved = spyre::get_reserved_dims(tensor);
+        if (!reserved.has_value()) {
+          return std::nullopt;
+        }
+        std::map<int64_t, std::map<std::string, int64_t>> result;
+        for (const auto& [dim, info] : *reserved) {
+          result[dim] = {{"min", info.min},
+                         {"max", info.max},
+                         {"granularity", info.granularity}};
+        }
+        return result;
+      },
+      py::arg("tensor"),
+      "Return {dim: {'min', 'max', 'granularity'}} for a tensor.to("
+      "\"spyre\", dynamic=...) reservation, or None. Never raises, even "
+      "for a non-Spyre tensor.");
   m.def("get_downcast_warning", &spyre::get_downcast_warn_enabled,
         "Return whether downcast warnings are enabled.");
   m.def("set_downcast_warning", &spyre::set_downcast_warn_enabled,
@@ -871,15 +920,19 @@ PYBIND11_MODULE(_C, m) {
   // Symbolic argument payload types
   py::enum_<spyre::SymbolicArgKind>(m, "SymbolicArgKind")
       .value("kAddress", spyre::SymbolicArgKind::kAddress)
-      .value("kDimension", spyre::SymbolicArgKind::kDimension);
+      .value("kDimension", spyre::SymbolicArgKind::kDimension)
+      .value("kShardAddress", spyre::SymbolicArgKind::kShardAddress);
 
   py::class_<spyre::SymbolicArg>(m, "SymbolicArg")
       .def(py::init([](spyre::SymbolicArgKind kind, int64_t tensor_id,
-                       int64_t dim_index, int64_t value) {
-             return spyre::SymbolicArg{kind, tensor_id, dim_index, value};
+                       int64_t dim_index, int64_t value, int64_t num_shards) {
+             return spyre::SymbolicArg{kind, tensor_id, dim_index, value,
+                                       num_shards};
            }),
            py::arg("kind"), py::arg("tensor_id"),
-           py::arg("dim_index") = int64_t{-1}, py::arg("value") = int64_t{-1})
+           py::arg("dim_index") = int64_t{-1}, py::arg("value") = int64_t{-1},
+           py::arg("num_shards") = int64_t{-1})
+      .def_readwrite("num_shards", &spyre::SymbolicArg::num_shards)
       .def_readwrite("kind", &spyre::SymbolicArg::kind)
       .def_readwrite("value", &spyre::SymbolicArg::value)
       .def_readwrite("tensor_id", &spyre::SymbolicArg::tensor_id)
@@ -892,15 +945,24 @@ PYBIND11_MODULE(_C, m) {
       });
 
   m.def("prepare_kernel", &spyre::prepareKernel, py::arg("spyrecode_dir"),
-        py::arg("stream") = nullptr, py::arg("profiler_name") = std::nullopt,
+        py::arg("stream") = nullptr,
+        py::arg("profiler_event_name") = std::nullopt,
+        py::arg("sdsc_bundle_dir_prefix") = std::string{},
         "Prepare a kernel from a SpyreCode directory and return a JobPlan.\n\n"
         "Args:\n"
         "    spyrecode_dir (str): Path to the SpyreCode directory\n"
         "    stream (SpyreStream, optional): Stream to use for initialization "
         "transfers.\n"
-        "        If None, uses the current stream. Defaults to None.\n\n"
-        "    profiler_name (str, optional): Bounded base name for "
-        "profiler-visible compute events. Defaults to None.\n\n"
+        "        If None, uses the current stream. Defaults to None.\n"
+        "    profiler_event_name (str, optional): Bounded base name for "
+        "profiler-visible compute events. Defaults to None.\n"
+        "    sdsc_bundle_dir_prefix (str, optional): Prefix of the SDSC "
+        "bundle directory name; emitted as args.sdsc_bundle_dir_prefix in "
+        "profiler traces.  Use 16 characters (the first 16 characters of the "
+        "lowercase base32 cache key, a SHA-256 digest) on the cached path, or "
+        "8 hex characters (the first 8 hex characters of a UUID) on the "
+        "no-cache/KTIR path. "
+        "Empty string disables registration.\n\n"
         "Returns:\n"
         "    Prepared JobPlan ready for execution");
   // Bind the current-stream overload (resolves the current stream internally).
@@ -970,8 +1032,12 @@ PYBIND11_MODULE(_C, m) {
         std::vector<uintptr_t> addrs;
         addrs.reserve(resolved.size());
         for (const auto& host_arg : resolved) {
-          addrs.push_back(reinterpret_cast<uintptr_t>(
-              std::get<const flex::CompositeAddress*>(host_arg)));
+          if (const auto* value = std::get_if<int64_t>(&host_arg)) {
+            addrs.push_back(static_cast<uintptr_t>(*value));
+          } else {
+            addrs.push_back(reinterpret_cast<uintptr_t>(
+                std::get<const flex::CompositeAddress*>(host_arg)));
+          }
         }
         return addrs;
       },
@@ -1039,6 +1105,73 @@ PYBIND11_MODULE(_C, m) {
       "TEST-ONLY: project REAL plan steps (classifyStep + role(), exactly as "
       "validate() does) in the given index order, then run the ordering "
       "checker. Returns '' if valid else the error message.");
+
+  m.def(
+      "_spyre_empty_sharded",
+      [](std::vector<int64_t> size, c10::ScalarType dtype, int64_t shard_dim,
+         int64_t num_shards, std::optional<c10::Device> device) {
+        return spyre::spyre_empty_sharded(size, dtype, shard_dim, num_shards,
+                                          device);
+      },
+      py::arg("size"), py::arg("dtype"), py::arg("shard_dim"),
+      py::arg("num_shards"), py::arg("device") = std::nullopt,
+      "Allocate an uninitialized sharded Spyre tensor.");
+  m.def("_spyre_is_sharded", &spyre::spyre_is_sharded, py::arg("tensor"),
+        "Whether a tensor's storage is sharded storage.");
+  m.def(
+      "_spyre_sharding_info",
+      [](const at::Tensor& tensor) {
+        TORCH_CHECK(spyre::spyre_is_sharded(tensor),
+                    "expected a sharded Spyre tensor");
+        auto* ctx = static_cast<spyre::SharedOwnerCtx*>(
+            tensor.storage().data_ptr().get_context());
+        const auto& info = *ctx->sharding;
+        const auto& regions = flex::RuntimeContext::getInstance()
+                                  ->getAllocator()
+                                  ->getIdToRegionMap();
+        py::dict result;
+        result["shard_dim"] = info.shard_dim;
+        result["num_shards"] = info.num_shards;
+        result["shard_device_bytes"] = info.shard_device_bytes;
+        result["total_bytes"] = ctx->composite_addr.total_size();
+        py::list entries;
+        // The shard table is indexed by shard ordinal; shard i backs core i.
+        // logical_core_id and is_device_addressable are asserted by
+        // construction (identity slot-to-core map; per-shard allocations are
+        // device-addressable), not read from Flex; physical placement is
+        // read from the live region map.
+        for (size_t i = 0; i < ctx->shard_addrs.size(); ++i) {
+          const flex::Chunk& chunk = ctx->shard_addrs[i].chunks()[0];
+          auto region_it = regions.find(chunk.addr.region_id);
+          TORCH_CHECK(region_it != regions.end(), "shard ", i,
+                      " references unknown region ", chunk.addr.region_id);
+          const flex::MemoryRegion* region = region_it->second;
+          py::dict entry;
+          entry["logical_chunk_id"] = i;
+          entry["logical_core_id"] = i;
+          entry["physical_domain_id"] = region->domainId();
+          entry["region_id"] = region->regionId();
+          entry["segment_id"] = region->hardwareId();
+          entry["segment_offset_bytes"] = chunk.addr.offset;
+          entry["size_bytes"] = static_cast<uint64_t>(chunk.size);
+          entry["is_device_addressable"] = true;
+          entries.append(entry);
+        }
+        result["chunks"] = entries;
+        return result;
+      },
+      py::arg("tensor"),
+      "Address-free sharding record and per-chunk placement receipt.");
+  m.def(
+      "num_memory_domains",
+      []() -> size_t {
+        auto allocator = flex::RuntimeContext::getInstance()->getAllocator();
+        TORCH_CHECK(allocator != nullptr,
+                    "num_memory_domains requires the Flex runtime to be "
+                    "initialized");
+        return allocator->topology().num_domains();
+      },
+      "Number of memory domains in the Flex device topology.");
 
   // Allocator statistics functions
   m.def(

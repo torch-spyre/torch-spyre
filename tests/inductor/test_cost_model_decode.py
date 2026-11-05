@@ -1461,6 +1461,7 @@ def _moe_gate(hidden=_K, cols=_N, bank_dtype=DataFormats.SEN169_FP16):
                     device_size=[hidden // 64, _T, 64],
                     stride_map=[64, hidden, 1],
                     device_dtype=DataFormats.SEN169_FP16,
+                    valid_elements={(0, 2): hidden, (1,): _T},
                 ),
             ),
             "arg1": (
@@ -1469,6 +1470,7 @@ def _moe_gate(hidden=_K, cols=_N, bank_dtype=DataFormats.SEN169_FP16):
                     device_size=[_E, hidden, cols // 64, 64],
                     stride_map=[hidden * cols, cols, 64, 1],
                     device_dtype=bank_dtype,
+                    valid_elements={(0,): _E, (1,): hidden, (2, 3): cols},
                 ),
             ),
         }
