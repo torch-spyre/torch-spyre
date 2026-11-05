@@ -132,7 +132,9 @@ def capture_op_specs():
     """
     captured: list[list] = []
 
-    def _spy(self, kernel_name, specs, pool_size=0, precomputed_key=None):  # noqa: ARG001
+    def _spy(
+        self, kernel_name, specs, pool_size=0, precomputed_key=None, launch_args=None
+    ):  # noqa: ARG001
         captured.append(list(specs))
         return _NoopRunner()
 
@@ -148,7 +150,9 @@ def capture_sdsc_calls():
     """
     calls: list[tuple[str, list]] = []
 
-    def _spy(self, kernel_name, specs, pool_size=0, precomputed_key=None):  # noqa: ARG001
+    def _spy(
+        self, kernel_name, specs, pool_size=0, precomputed_key=None, launch_args=None
+    ):  # noqa: ARG001
         calls.append((kernel_name, list(specs)))
         return _NoopRunner()
 
