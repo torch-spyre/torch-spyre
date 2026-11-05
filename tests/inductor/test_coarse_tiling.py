@@ -1521,6 +1521,184 @@ class TestRetileLoadIndexWithConsumer(unittest.TestCase):
             self.assertEqual(simplify(result - full_scale), 0)
 
 
+class TestPatchConsumersReadsThroughFullBuffer(unittest.TestCase):
+    """An outside consumer redirected to a copy-out buffer derives its load
+    index from that buffer's layout, not from the producer's tile.
+
+    The producer, 64 x 64 x 128, is divided to one row per trip, so its own
+    layout becomes (1, 64, 128), and a consumer traced against it would lose
+    its row term. After the redirect each
+    consumer's index must equal its index before the division, on the full
+    buffer's name, and the producer must be the tile again afterwards.
+    """
+
+    FULL = [64, 64, 128]
+    STRIDE = [8192, 128, 1]
+
+    def setUp(self):
+        gm = fx.symbolic_trace(lambda: None)
+        self._graph_ctx = V.set_graph_handler(GraphLowering(gm))
+        self._graph_ctx.__enter__()
+        load_x = ir_input_loader("x", self.FULL)
+        # A producer that reads nothing is inlined into its consumers by
+        # ComputedBuffer.make_loader instead of being loaded by name.
+        self.load0, self.buf0 = ir_computed_buffer(
+            "buf0", self.FULL, lambda i: load_x(i)
+        )
+        self.buf0.dim_hints = ()
+        ir_input_loader("full", self.FULL)
+        self.full = V.graph.name_to_buffer["full"]
+        self.d0, self.d1, self.d2 = (sympy_index_symbol(f"d{i}") for i in range(3))
+
+    def tearDown(self):
+        self._graph_ctx.__exit__(None, None, None)
+
+    @staticmethod
+    def _indexes(op, name):
+        from torch_spyre._inductor.pass_utils import invalidate_op_read_writes
+
+        invalidate_op_read_writes(op)
+        return [r.index for r in op.get_read_writes().reads if r.name == name]
+
+    def _redirect(self, consumers, tiled_dims=(0,), loop_count=64):
+        """Indexes of ``buf0`` before the division, and of ``full`` after the
+        redirect, keyed by consumer name."""
+        before = {c.get_name(): self._indexes(c, "buf0") for c in consumers}
+        _divide_ranges(self.buf0, Integer(loop_count), list(tiled_dims))
+        operations = list(consumers)
+        _patch_consumers(
+            consumers,
+            "buf0",
+            "full",
+            operations,
+            producer_layout=self.buf0.layout,
+            read_layout=self.full.layout,
+        )
+        after = {op.get_name(): self._indexes(op, "full") for op in operations}
+        return before, after
+
+    def test_an_in_step_read_keeps_its_row_term(self):
+        _, c = ir_computed_buffer("c", self.FULL, lambda i: self.load0(i))
+
+        before, after = self._redirect([c])
+
+        self.assertEqual(after["c"], [8192 * self.d0 + 128 * self.d1 + self.d2])
+        self.assertEqual(after, before)
+
+    def test_a_broadcast_read_stays_a_broadcast(self):
+        _, c = ir_computed_buffer("c", self.FULL, lambda i: self.load0([0, i[1], i[2]]))
+
+        before, after = self._redirect([c])
+
+        self.assertEqual(after["c"], [128 * self.d1 + self.d2])
+        self.assertEqual(after, before)
+
+    def test_permuted_stepped_and_offset_reads_are_addressed_as_before(self):
+        _, permuted = ir_computed_buffer(
+            "permuted", self.FULL, lambda i: self.load0([i[1], i[0], i[2]])
+        )
+        _, stepped = ir_computed_buffer(
+            "stepped", [32, 64, 128], lambda i: self.load0([2 * i[0], i[1], i[2]])
+        )
+        _, offset = ir_computed_buffer(
+            "offset", [32, 64, 128], lambda i: self.load0([i[0] + 32, i[1], i[2]])
+        )
+
+        before, after = self._redirect([permuted, stepped, offset])
+
+        self.assertEqual(after["permuted"], [128 * self.d0 + 8192 * self.d1 + self.d2])
+        self.assertEqual(after["stepped"], [16384 * self.d0 + 128 * self.d1 + self.d2])
+        self.assertEqual(
+            after["offset"], [8192 * self.d0 + 128 * self.d1 + self.d2 + 262144]
+        )
+        self.assertEqual(after, before)
+
+    def test_a_narrowing_view_keeps_its_own_layout(self):
+        from torch._inductor.ir import (
+            FixedLayout,
+            ReinterpretView,
+            StorageBox,
+            TensorBox,
+        )
+
+        view = TensorBox(
+            ReinterpretView(
+                data=StorageBox(self.buf0),
+                layout=FixedLayout(
+                    torch.device("cpu"), torch.float32, [16, 64, 128], self.STRIDE
+                ),
+            )
+        ).make_loader()
+        _, c = ir_computed_buffer("c", [16, 64, 128], lambda i: view(i))
+
+        before, after = self._redirect([c])
+
+        self.assertEqual(after["c"], [8192 * self.d0 + 128 * self.d1 + self.d2])
+        self.assertEqual(after, before)
+
+    def test_two_reads_that_disagree_each_keep_their_index(self):
+        _, c = ir_computed_buffer(
+            "c",
+            self.FULL,
+            lambda i: self.load0(i) + self.load0([0, i[1], i[2]]),
+        )
+
+        before, after = self._redirect([c])
+
+        self.assertEqual(
+            sorted(after["c"], key=str),
+            sorted(
+                [8192 * self.d0 + 128 * self.d1 + self.d2, 128 * self.d1 + self.d2],
+                key=str,
+            ),
+        )
+        self.assertEqual(after, before)
+
+    def test_a_tile_along_an_inner_dim_reads_the_full_strides(self):
+        # The tile (64, 16, 128) has its own row stride, 2048; the consumer
+        # reads the full buffer and must use 8192.
+        _, c = ir_computed_buffer("c", self.FULL, lambda i: self.load0(i))
+
+        before, after = self._redirect([c], tiled_dims=(1,), loop_count=4)
+
+        self.assertEqual(list(self.buf0.layout.stride), [2048, 128, 1])
+        self.assertEqual(after["c"], [8192 * self.d0 + 128 * self.d1 + self.d2])
+        self.assertEqual(after, before)
+
+    def test_the_producer_is_the_tile_again_after_every_trace(self):
+        _, c = ir_computed_buffer("c", self.FULL, lambda i: self.load0(i))
+        _divide_ranges(self.buf0, Integer(64), [0])
+        tile = (list(self.buf0.layout.size), list(self.buf0.layout.stride))
+        operations = [c]
+        _patch_consumers(
+            [c],
+            "buf0",
+            "full",
+            operations,
+            producer_layout=self.buf0.layout,
+            read_layout=self.full.layout,
+        )
+
+        for _ in range(2):
+            self._indexes(operations[0], "full")
+            self.assertEqual(
+                (list(self.buf0.layout.size), list(self.buf0.layout.stride)), tile
+            )
+        self.assertEqual(tile[0], [1, 64, 128])
+
+    def test_read_through_a_mutation_layout_presents_on_its_target(self):
+        from torch._inductor.ir import MutationLayoutSHOULDREMOVE, StorageBox, TensorBox
+
+        from torch_spyre._inductor.wsr.loop_tiling_common import _ReadThroughLayout
+
+        self.buf0.layout.size = [1, 64, 128]
+        mutation = MutationLayoutSHOULDREMOVE(TensorBox(StorageBox(self.buf0)))
+
+        with _ReadThroughLayout(mutation, self.full.layout):
+            self.assertEqual(list(self.buf0.layout.size), self.FULL)
+        self.assertEqual(list(self.buf0.layout.size), [1, 64, 128])
+
+
 class TestPatchConsumersLoopInfo(unittest.TestCase):
     """``_patch_consumers`` redirecting a tiled buffer's ``loop_info`` readers.
 
@@ -2155,6 +2333,7 @@ class TestDivideRanges(unittest.TestCase):
             [1, 256, 64],
             [64, 64, 1],
             expected.device_dtype,
+            {(0,): 1, (1,): 256, (2,): 64},
             expected.element_arrangement,
         )
         self.assertNotEqual(layout.device_layout, buggy)
@@ -2435,7 +2614,12 @@ class TestDivideRanges(unittest.TestCase):
         dev = SpyreTensorLayout([1, 1], torch.float16).device_dtype
         # Transposed QK^T output: Skv (host dim 3) is the stick; Sq (host dim 2)
         # is a non-stick dim of the same size (512), so they collide by size.
-        stl = SpyreTensorLayout([32, 512, 8, 1, 64], [512, 16384, 64, -1, 1], dev)
+        stl = SpyreTensorLayout(
+            [32, 512, 8, 1, 64],
+            [512, 16384, 64, -1, 1],
+            dev,
+            {(0,): 32, (1,): 512, (2, 4): 512, (3,): 1},
+        )
         host_size = [1, 32, 512, 512]
 
         # Fallback (no identity): size-based elimination is ambiguous -> raise.
@@ -7740,6 +7924,33 @@ def _ftl_pointwise(shape, name="buf0", dtype=torch.float16, host_stride=None):
     )
 
 
+def _ftl_pointwise_reading_twice(shape, permutation, name="buf0"):
+    """``_ftl_pointwise`` whose op reads its one input a second time with its
+    index permuted: ``in0[d0, d1, ...] + in0[d[p] for p in permutation]``.
+
+    The two reads carry the same ``MemoryDep.name`` and differ only in index,
+    which is what the resolver's per-axis read comparison looks at.
+    """
+    from torch._inductor.ir import ComputedBuffer, Pointwise, StorageBox, TensorBox
+
+    template = _ftl_pointwise(shape, name=name)
+    loader = TensorBox(StorageBox(V.graph.name_to_buffer[f"in0_{name}"])).make_loader()
+
+    def inner_fn(index):
+        return loader(index) + loader([index[p] for p in permutation])
+
+    pw = Pointwise.create(
+        device=template.get_device(),
+        dtype=template.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=list(template.data.ranges),
+    )
+    op = ComputedBuffer(name=name, layout=template.layout, data=pw.data.data)
+    op.operation_name = name
+    V.graph.name_to_buffer[name] = op
+    return op
+
+
 class TestPredictFrame(unittest.TestCase):
     """predict_frame == what coarse_tile actually applies, and mutates no IR."""
 
@@ -8219,7 +8430,7 @@ class TestValidateTiling(unittest.TestCase):
         from torch_spyre._inductor.scratchpad.coarse_tiling import (
             try_resolve_tile_axis_loop_vars,
         )
-        from torch_spyre._inductor.wsr.enumerate_tilings import _lowering_accepts
+        from torch_spyre._inductor.wsr.enumerate_tilings import _lowering_rejection
 
         op = _ftl_pointwise((512, 256), name="val_not_iter_var")
         spec = TileSpec((TileAxis(0, 2),))
@@ -8233,7 +8444,7 @@ class TestValidateTiling(unittest.TestCase):
             self.assertIsNone(loop_vars)
             with self.assertRaises(Unsupported):
                 tile_spec_to_dim_hints(op, spec, [0])
-            self.assertFalse(_lowering_accepts(op, TileAxis(0, 2)))
+            self.assertIsNotNone(_lowering_rejection(op, TileAxis(0, 2)))
             self.assertEqual(_rejection_reason(op, spec), reason)
             self.assertIsNone(predict_frame(op, spec))
 
@@ -8280,7 +8491,11 @@ class TestValidateTiling(unittest.TestCase):
         self.assertIsNotNone(predict_frame(op, spec))  # non-vacuity
         dl = op.layout.device_layout
         op.layout.device_layout = SpyreTensorLayout(
-            [64, 80, 1, 64], [5120, 64, -1, 1], dl.device_dtype, dl.element_arrangement
+            [64, 80, 1, 64],
+            [5120, 64, -1, 1],
+            dl.device_dtype,
+            {(0,): 64, (1,): 80, (2, 3): 64},
+            dl.element_arrangement,
         )
         self.assertIsNone(predict_frame(op, spec))
 
@@ -8335,6 +8550,37 @@ class TestValidateTiling(unittest.TestCase):
         frame = predict_frame(op, TileSpec((TileAxis(0, 2, is_reduction=True),)))
         self.assertIs(frame.layout, op.layout)
         self.assertEqual([int(r) for r in frame.reduction_ranges], [8])
+
+    def test_two_reads_of_one_input_are_compared_per_axis(self):
+        """``a + a.permute(0, 2, 1, 3)`` reads one input two ways. Dim 0 is
+        walked the same way by both reads, so it tiles; dims 1 and 2 are each
+        walked at the other's stride, so each is refused -- by the resolver, and
+        so by prediction and lowering alike.
+
+        Along the shared axis both reads need the same per-tile advance, which
+        is why agreeing reads are safe however they differ elsewhere; along a
+        swapped axis they need two different advances of one buffer, which is
+        the case that returns wrong values on the device.
+        """
+        op = _ftl_pointwise_reading_twice(
+            (32, 16, 16, 128), (0, 2, 1, 3), name="val_two_reads"
+        )
+        shared = TileSpec((TileAxis(0, 4),))
+        loop_vars, reason = try_resolve_tile_axis_loop_vars(op, shared)
+        self.assertIsNone(reason)
+        self.assertEqual(len(loop_vars), 1)
+        self.assertIsNotNone(predict_frame(op, shared))
+
+        for axis in (1, 2):
+            with self.subTest(axis=axis):
+                swapped = TileSpec((TileAxis(axis, 2),))
+                loop_vars, reason = try_resolve_tile_axis_loop_vars(op, swapped)
+                self.assertIsNone(loop_vars)
+                self.assertIn(f"along d{axis} two ways", reason)
+                self.assertEqual(_rejection_reason(op, swapped), reason)
+                self.assertIsNone(predict_frame(op, swapped))
+                with self.assertRaisesRegex(Unsupported, "two ways"):
+                    tile_spec_to_dim_hints(op, swapped, [0])
 
 
 class TestTileHelpers(unittest.TestCase):
@@ -9078,25 +9324,31 @@ class TestEnumeratedOptionsLower(unittest.TestCase):
                 with self.subTest(op=op.get_name(), spec=spec):
                     self.assertIsNotNone(predict_frame(op, spec))
 
-    def test_lowering_accepts_consults_the_lowering(self):
-        # _lowering_accepts rejects exactly what the shared resolver rejects.
-        from torch_spyre._inductor.wsr.enumerate_tilings import _lowering_accepts
+    def test_lowering_rejection_consults_the_lowering(self):
+        # _lowering_rejection rejects exactly what the shared resolver rejects.
+        from torch_spyre._inductor.wsr.enumerate_tilings import _lowering_rejection
 
         pw = _make_real_tiled_op("pw_acc", [6, 128])
         red = _make_real_tiled_op("red_acc", [4, 64], [8])
         red_unit = _make_real_tiled_op("red_unit_acc", [4, 64], [1, 8])
-        self.assertTrue(_lowering_accepts(pw, TileAxis(0, 2)))
-        self.assertTrue(_lowering_accepts(red, TileAxis(0, 2, is_reduction=True)))
+        self.assertIsNone(_lowering_rejection(pw, TileAxis(0, 2)))
+        self.assertIsNone(_lowering_rejection(red, TileAxis(0, 2, is_reduction=True)))
         # Out of bounds for the output frame.
-        self.assertFalse(_lowering_accepts(pw, TileAxis(2, 2)))
+        self.assertIsNotNone(_lowering_rejection(pw, TileAxis(2, 2)))
         # A reduction axis on an op with no reduction.
-        self.assertFalse(_lowering_accepts(pw, TileAxis(0, 2, is_reduction=True)))
+        self.assertIsNotNone(_lowering_rejection(pw, TileAxis(0, 2, is_reduction=True)))
         # Out of bounds for the one reduction loop variable.
-        self.assertFalse(_lowering_accepts(red, TileAxis(1, 2, is_reduction=True)))
+        self.assertIsNotNone(
+            _lowering_rejection(red, TileAxis(1, 2, is_reduction=True))
+        )
         # [1, 8] has one reduction loop variable, for the 8: host_dim 0 names
         # it, and host_dim 1 is out of bounds though [1, 8] has two entries.
-        self.assertTrue(_lowering_accepts(red_unit, TileAxis(0, 2, is_reduction=True)))
-        self.assertFalse(_lowering_accepts(red_unit, TileAxis(1, 2, is_reduction=True)))
+        self.assertIsNone(
+            _lowering_rejection(red_unit, TileAxis(0, 2, is_reduction=True))
+        )
+        self.assertIsNotNone(
+            _lowering_rejection(red_unit, TileAxis(1, 2, is_reduction=True))
+        )
 
 
 class TestPlannedFullBufferLayout(unittest.TestCase):
