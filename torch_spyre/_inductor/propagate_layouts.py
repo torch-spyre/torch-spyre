@@ -3508,8 +3508,9 @@ def propagate_spyre_tensor_layouts(
                 #      deferred IA-rotate entry records QFP8WT EA.
                 #   2. _ia_rotate_stl (with EA preservation) propagates QFP8WT
                 #      into the required_stl of the _DeferredReorder.
-                #   3. _insert_mutation_relayout_copy creates buf_tmp with
-                #      QFP8WT EA so the scatter writes in 2D-stick addressing.
+                #   3. reorder_nonstick_dims_mutation rewrites the target's layout
+                #      in place to that required_stl, so the scatter writes in
+                #      2D-stick addressing with no copy-in / copy-back.
                 source_is_qfp8wt = any(
                     any(
                         stl.element_arrangement == ElementArrangement.QFP8WT

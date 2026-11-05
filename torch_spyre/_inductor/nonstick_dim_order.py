@@ -1174,9 +1174,8 @@ def _insert_mutation_relayout_copy(
 
     # If the target already has exactly the required layout, no copy-in/copy-back
     # is needed — the scatter can write directly into the target buffer.
-    # This is the QFP8WT case: after propagate_layouts promotes k_cache to QFP8WT
-    # and finalize_layouts assigns FixedTiledLayout(QFP8WT), the required_stl
-    # (QFP8WT, slot-dim-first from _ia_rotate_stl) already matches target_layout.
+    # (Non-STANDARD EA targets such as QFP8WT never get here: they are rewritten
+    # in place by reorder_nonstick_dims_mutation.)
     if target_layout.device_layout == required_stl:
         logger.info(
             "nonstick_dim_order: scatter target %s already has required layout "
