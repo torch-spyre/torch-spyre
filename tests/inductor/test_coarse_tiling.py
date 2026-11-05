@@ -7746,6 +7746,33 @@ def _ftl_pointwise(shape, name="buf0", dtype=torch.float16, host_stride=None):
     )
 
 
+def _ftl_pointwise_reading_twice(shape, permutation, name="buf0"):
+    """``_ftl_pointwise`` whose op reads its one input a second time with its
+    index permuted: ``in0[d0, d1, ...] + in0[d[p] for p in permutation]``.
+
+    The two reads carry the same ``MemoryDep.name`` and differ only in index,
+    which is what the resolver's per-axis read comparison looks at.
+    """
+    from torch._inductor.ir import ComputedBuffer, Pointwise, StorageBox, TensorBox
+
+    template = _ftl_pointwise(shape, name=name)
+    loader = TensorBox(StorageBox(V.graph.name_to_buffer[f"in0_{name}"])).make_loader()
+
+    def inner_fn(index):
+        return loader(index) + loader([index[p] for p in permutation])
+
+    pw = Pointwise.create(
+        device=template.get_device(),
+        dtype=template.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=list(template.data.ranges),
+    )
+    op = ComputedBuffer(name=name, layout=template.layout, data=pw.data.data)
+    op.operation_name = name
+    V.graph.name_to_buffer[name] = op
+    return op
+
+
 class TestPredictFrame(unittest.TestCase):
     """predict_frame == what coarse_tile actually applies, and mutates no IR."""
 
@@ -8345,6 +8372,37 @@ class TestValidateTiling(unittest.TestCase):
         frame = predict_frame(op, TileSpec((TileAxis(0, 2, is_reduction=True),)))
         self.assertIs(frame.layout, op.layout)
         self.assertEqual([int(r) for r in frame.reduction_ranges], [8])
+
+    def test_two_reads_of_one_input_are_compared_per_axis(self):
+        """``a + a.permute(0, 2, 1, 3)`` reads one input two ways. Dim 0 is
+        walked the same way by both reads, so it tiles; dims 1 and 2 are each
+        walked at the other's stride, so each is refused -- by the resolver, and
+        so by prediction and lowering alike.
+
+        Along the shared axis both reads need the same per-tile advance, which
+        is why agreeing reads are safe however they differ elsewhere; along a
+        swapped axis they need two different advances of one buffer, which is
+        the case that returns wrong values on the device.
+        """
+        op = _ftl_pointwise_reading_twice(
+            (32, 16, 16, 128), (0, 2, 1, 3), name="val_two_reads"
+        )
+        shared = TileSpec((TileAxis(0, 4),))
+        loop_vars, reason = try_resolve_tile_axis_loop_vars(op, shared)
+        self.assertIsNone(reason)
+        self.assertEqual(len(loop_vars), 1)
+        self.assertIsNotNone(predict_frame(op, shared))
+
+        for axis in (1, 2):
+            with self.subTest(axis=axis):
+                swapped = TileSpec((TileAxis(axis, 2),))
+                loop_vars, reason = try_resolve_tile_axis_loop_vars(op, swapped)
+                self.assertIsNone(loop_vars)
+                self.assertIn(f"along d{axis} two ways", reason)
+                self.assertEqual(_rejection_reason(op, swapped), reason)
+                self.assertIsNone(predict_frame(op, swapped))
+                with self.assertRaisesRegex(Unsupported, "two ways"):
+                    tile_spec_to_dim_hints(op, swapped, [0])
 
 
 class TestTileHelpers(unittest.TestCase):
