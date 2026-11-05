@@ -597,6 +597,19 @@ class CustomPreSchedulingPasses:
             # Moving it later costs LX footprint: propagation would choose the
             # update's layout freely instead of tying it to the storage
             # (measured in the stage-6 investigation, task 6.0a, section 3).
+            #
+            # The passes that run between the splice and this one see a carry
+            # update with a plain FixedLayout and no mutation form. Audited by
+            # reading each for a branch on the layout class or the carry
+            # record: deadcode_elimination (reads the record and keeps a
+            # declared update live), the three contraction gates in
+            # for_each_tile_lowering (guarded, see _is_declared_carry_update),
+            # propagate_named_dims / validate_named_dims / assign_dim_hints
+            # (no reference to either), insert_bmm_padding (padding.py: only
+            # its own fill/copy ops), and split_multi_ops (accepts FixedLayout
+            # and MutationLayoutSHOULDREMOVE alike). Not audited by a test
+            # that exercises every one with a carry: add a pass here only
+            # after checking it the same way.
             apply_loop_carries,
             propagate_spyre_tensor_layouts,
             validate_ops,

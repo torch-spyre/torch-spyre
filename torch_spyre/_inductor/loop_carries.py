@@ -40,6 +40,10 @@ from .logging_utils import get_inductor_logger
 from .loop_info import LoopCarryRecord
 from .loop_node import OpsView, all_ops, has_loop_nodes
 from .pass_utils import invalidate_op_read_writes, redirect_computed_buffer_reads
+from .wsr.while_loop_bridge import (
+    _repoint_refs_to_buffer,
+    _substitute_direct_input_refs,
+)
 
 logger = get_inductor_logger("loop_carries")
 
@@ -53,9 +57,11 @@ def _records(operations: list[ir.Operation]) -> list[LoopCarryRecord]:
     from either end.
     """
     records: list[LoopCarryRecord] = []
+    seen: set[int] = set()
     for op in operations:
         record = getattr(op, "_loop_carry_record", None)
-        if isinstance(record, LoopCarryRecord) and record not in records:
+        if isinstance(record, LoopCarryRecord) and id(record) not in seen:
+            seen.add(id(record))
             records.append(record)
     return records
 
@@ -202,11 +208,6 @@ def apply_loop_carries(graph: GraphLowering) -> None:
     names are batched into one ``redirect_computed_buffer_reads`` call); the
     ``op_read_writes`` memo is not used, as a rebuilt op would not invalidate it.
     """
-    from .wsr.while_loop_bridge import (
-        _repoint_refs_to_buffer,
-        _substitute_direct_input_refs,
-    )
-
     pending = _pending(graph)
     if not pending:
         return

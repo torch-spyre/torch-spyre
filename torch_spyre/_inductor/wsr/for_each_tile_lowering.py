@@ -2407,6 +2407,9 @@ def _is_declared_carry_update(op: Any) -> bool:
     from the splice on, and so no contraction pass below could pick it up. These
     passes must still leave it alone: they remove or shrink ops, and the update
     has to keep its full size and name for the pass that writes it in place.
+
+    No known graph reaches this check: it restores the earlier behaviour (a
+    carry update was never a candidate) and has no test that depends on it.
     """
     from torch_spyre._inductor.loop_info import LoopCarryRecord
 

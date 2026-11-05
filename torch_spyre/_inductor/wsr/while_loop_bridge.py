@@ -496,7 +496,8 @@ def _extra_readers_of_placeholder(
     pre-iteration value).
 
     ``_rewire_accumulator_output`` declares the carry, and ``apply_loop_carries``
-    makes the carry's new value land in place in the carry's own initial buffer -- correct for PyTorch's ``while_loop``
+    makes the carry's new value land in place in the carry's own initial
+    buffer -- correct for PyTorch's ``while_loop``
     semantics (which give every iteration's body a copy-in/compute/copy-out
     view of each carry) only because the *read* side is also redirected to
     that same buffer (see splice_while_loop's ``name_map``). Once the
@@ -1064,8 +1065,12 @@ def _rewire_accumulator_output(
     A partial scatter carry (``partial_update``) has no record: its write is
     made in place here, by swapping the update's layout for
     ``MutationLayoutSHOULDREMOVE(real_input)``, and outside consumers are
-    repointed at the storage. The rest of this docstring describes that
-    in-place form, which the declared carry reaches once applied.
+    repointed at the storage.
+
+    The rest of this docstring explains why the write goes into the initial
+    buffer. That reasoning holds for both cases: the scatter carry is in
+    place from here on, and the declared carry is in place once
+    ``apply_loop_carries`` has run.
 
     Why the initial buffer and not a fresh one: the accumulator's fill is
     already there. ``for_each_tile(..., init=torch.zeros(M, N))`` lowers to a
