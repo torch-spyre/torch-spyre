@@ -3808,6 +3808,162 @@ def spyre_conv2d_with_bias_decomp(
     return output
 
 
+def _materialize(x: torch.Tensor, dim: int, rows: int = STICK) -> torch.Tensor:
+    """Write ``x`` through a real kernel by padding ``dim`` and slicing it back.
+
+    Inductor elides ``.contiguous()`` and ``clone()`` of a view, so a layout
+    change that needs a real buffer between two reads silently does not
+    happen (see ``_conv2d_im2col_matmul``).  ``dim`` must not be the stick dim.
+    The pad defaults to a whole stick of rows: ``insert_restickify_padding``
+    cannot grow a pad buffer (it is allocated empty and filled by mutation),
+    so the allocation must already cover a whole-stick window should ``dim``
+    later become the stick.  Pass ``rows=1`` when it never does.
+    """
+    nd = x.dim()
+    pad = [0, 0] * nd
+    pad[2 * (nd - 1 - dim) + 1] = rows  # constant_pad_nd lists pads last-dim-first
+    return torch.constant_pad_nd(x, pad).narrow(dim, 0, x.shape[dim])
+
+
+@register_spyre_decompositions([torch.ops.aten.im2col.default])
+def spyre_im2col(
+    input: torch.Tensor,
+    kernel_size: Sequence[int],
+    dilation: Sequence[int],
+    padding: Sequence[int],
+    stride: Sequence[int],
+) -> torch.Tensor:
+    """Gather sliding windows as columns: (N, C, H, W) -> (N, C*kH*kW, L).
+
+    ``torch.nn.functional.unfold`` lowers to this op.  Inductor's default
+    decomposition is a two-index gather, which the backend rejects, and a
+    single reshape/permute into aten's column order needs a strided read
+    within the stick (the check behind #2346).  A tap can be read as a plain
+    view only along a dim that is not the stick, so:
+
+    1. Copy the input channel-last, so C carries the stick and H and W are
+       outer dims, and pad H and W to whole strides.
+    2. View H as (Hq, sH) and W as (Wq, sW): tap ``(a, b)`` is the slice
+       ``[qa:qa+H_out, ra, qb:qb+W_out, rb]`` with ``q, r = divmod(d*tap, s)``
+       (the tap gather of ``_conv2d_im2col_matmul``'s channel-last branch).
+       Concatenate the taps on the stick: (N, H_out, W_out, kH*kW*C), columns
+       ordered (a, b, c).  When the windows do not overlap, every tap is its
+       own slot of one stride group and the gather is a single permute.
+    3. Transpose so L carries the stick, then reorder the column dim to
+       aten's ``c*kH*kW + a*kW + b`` -- an outer-dim permute, which is free.
+
+    C and L are padded to whole sticks so every concatenation and the final
+    transpose land on stick boundaries; the padding is sliced off at the end.
+    The copies are written through ``_materialize`` or a real pad, or Inductor
+    fuses the steps back into the one read the backend cannot express.
+
+    Every shape is handled here: Inductor keeps a fallback for
+    ``aten.im2col``, so a decomposition cannot decline with ``NotImplemented``
+    ("both a fallback and a decomp for same op").
+    """
+    # Replacing the op means aten.im2col's own argument validation no longer
+    # runs; repeat it, raising what aten raises (RuntimeError: invalid
+    # arguments, not a Spyre limitation).
+    for name, value in (
+        ("kernel_size", kernel_size),
+        ("dilation", dilation),
+        ("padding", padding),
+        ("stride", stride),
+    ):
+        if len(value) != 2:
+            raise RuntimeError(
+                f"im2col: expected {name} to have 2 elements, got {len(value)}"
+            )
+    kH, kW = kernel_size
+    dH, dW = dilation
+    pH, pW = padding
+    sH, sW = stride
+    if kH <= 0 or kW <= 0:
+        raise RuntimeError(f"im2col: kernel_size must be positive, got ({kH}, {kW})")
+    if dH <= 0 or dW <= 0:
+        raise RuntimeError(f"im2col: dilation must be positive, got ({dH}, {dW})")
+    if pH < 0 or pW < 0:
+        raise RuntimeError(f"im2col: padding must be non-negative, got ({pH}, {pW})")
+    if sH <= 0 or sW <= 0:
+        raise RuntimeError(f"im2col: stride must be positive, got ({sH}, {sW})")
+
+    batched = input.dim() == 4
+    if input.dim() == 3:
+        input = input.unsqueeze(0)
+    elif not batched:
+        raise RuntimeError(f"im2col: expected 3D or 4D input, got {input.dim()}D")
+
+    # Specialize on the shape: every pad amount below is derived from it, and
+    # lower_constant_pad_nd cannot take a symbolic pad. A new input size then
+    # recompiles instead of failing in the lowering.
+    N, C, H, W = (int(size) for size in input.shape)
+    H_out = (H + 2 * pH - dH * (kH - 1) - 1) // sH + 1
+    W_out = (W + 2 * pW - dW * (kW - 1) - 1) // sW + 1
+    if H_out < 1 or W_out < 1:
+        raise RuntimeError(
+            f"im2col: calculated output size ({H_out}, {W_out}) is too small "
+            f"for input ({H}, {W}), kernel {list(kernel_size)}, dilation "
+            f"{list(dilation)}, padding {list(padding)}, stride {list(stride)}"
+        )
+    # A whole fp16/bf16 stick, and two fp32 sticks. get_elem_in_stick cannot
+    # be traced here.
+    stick = STICK
+    C_p = _round_up(C, stick)
+    x = input
+    if C_p != C:
+        x = torch.constant_pad_nd(x, (0, 0, 0, 0, 0, C_p - C))
+
+    # Start from a real channel-last buffer (C on the stick). The input may be
+    # a view that splits a merged dim, or have W on the stick; the taps below
+    # must read a plain buffer.
+    x = _materialize(x.permute(0, 2, 3, 1), dim=1, rows=1)  # (N, H, W, C_p)
+
+    # Padded extents: whole strides covering the input and every tap.
+    Hq = max(-(-(H + 2 * pH) // sH), H_out + dH * (kH - 1) // sH)
+    Wq = max(-(-(W + 2 * pW) // sW), W_out + dW * (kW - 1) // sW)
+    pad_w_total = Wq * sW - W
+    pad_h_total = Hq * sH - H
+    if pad_w_total or pad_h_total:
+        x = torch.constant_pad_nd(x, (0, 0, pW, pad_w_total - pW, pH, pad_h_total - pH))
+
+    # With C on the stick, H and W are outer dims, so each tap is a plain view.
+    xv = x.view(N, Hq, sH, Wq, sW, C_p)
+    if dH * (kH - 1) < sH and dW * (kW - 1) < sW:
+        # No tap reaches into the next stride group (windows do not overlap),
+        # so the whole gather is one outer-dim permute and needs no cat.
+        taps = xv[
+            :, :H_out, 0 : dH * (kH - 1) + 1 : dH, :W_out, 0 : dW * (kW - 1) + 1 : dW
+        ]
+        patches = taps.permute(0, 1, 3, 2, 4, 5)  # (N, H_out, W_out, kH, kW, C_p)
+    else:
+        taps = []
+        for a in range(kH):
+            qa, ra = divmod(dH * a, sH)
+            for b in range(kW):
+                qb, rb = divmod(dW * b, sW)
+                taps.append(xv[:, qa : qa + H_out, ra, qb : qb + W_out, rb])
+        patches = torch.cat(taps, dim=-1)  # (N, H_out, W_out, kH*kW*C_p)
+
+    # Put L on the stick, then reorder the columns. L is padded to whole
+    # sticks so the transpose reads a real buffer whose allocation covers a
+    # whole-stick window, and sliced back before the transpose so the stick
+    # dim is never sliced afterwards.
+    L = H_out * W_out
+    KK = kH * kW
+    L_p = _round_up(L, stick)
+    if L_p == L:
+        L_p += stick  # keep the pad real
+    flat = patches.reshape(N, L, KK * C_p)
+    flat = torch.constant_pad_nd(flat, (0, 0, 0, L_p - L))[:, :L]
+    cols = flat.transpose(1, 2).contiguous()  # (N, KK*C_p, L), L on the stick
+    out = cols.view(N, KK, C_p, L).permute(0, 2, 1, 3)  # (N, C_p, KK, L)
+    out = out[:, :C].reshape(N, C * KK, L)
+    # A consumer that restickifies this output (a transpose into a matmul)
+    # needs a plain buffer, not the reorder's view chain.
+    out = _materialize(out, dim=1)
+    return out if batched else out.squeeze(0)
+
+
 # Register decomposition for custom spyre op (not aten, so use decomp.register_decomposition directly)
 @register_spyre_decompositions([torch.ops.spyre.dequantize_fp8_with_scale])
 def dequantize_fp8_with_scale_decomp(

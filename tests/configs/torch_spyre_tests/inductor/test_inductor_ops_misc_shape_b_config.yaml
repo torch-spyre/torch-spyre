@@ -41,6 +41,8 @@ test_suite_config:
             - TestOps::test_unbind.*
             - TestOps::test_size_one.*
             - TestOps::test_unfold.*
+            # im2col covers test_im2col_* and test_im2col_patch_merger
+            - TestOps::test_im2col.*
             # squeeze covers test_squeeze and test_squeeze_reduction
             - TestOps::test_squeeze.*
             # unsqueeze covers test_unsqueeze and test_unsqueeze_broadcast

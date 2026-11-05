@@ -1121,7 +1121,13 @@ def _pad_restickify_input(op: Operation, graph: GraphLowering) -> None:
         write_dep = _write_dep(in_buf)
         host_coords = host_coordinates(layout, write_dep, None)
         syms = host_coords[new_stick_dim].free_symbols
-        assert len(syms) == 1
+        assert len(syms) == 1, (
+            f"restickify padding: input {in_buf.get_name()} of {op.get_name()} "
+            f"writes host dim {new_stick_dim} (the new-stick dim) with "
+            f"{host_coords[new_stick_dim]}, which has {len(syms)} loop symbols; "
+            f"expected exactly one (host_coords={host_coords}, "
+            f"device_size={layout.device_layout.device_size})"
+        )
         device_dim = _device_dim_carrying_sym(
             layout.device_layout, write_dep, next(iter(syms))
         )

@@ -39,6 +39,7 @@ test_suite_config:
           mode: xfail
         - names:
             - LxPlanning.*::test_unfold.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_im2col.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_squeeze.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_unsqueeze.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_t_1d.*_lx_planning_(pointwise|reduction)
