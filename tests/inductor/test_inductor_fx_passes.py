@@ -458,6 +458,24 @@ class TestStickReshapePivot(unittest.TestCase):
                 )
 
     @pytest.mark.filterwarnings("ignore::UserWarning")  # forced cache disabling
+    def test_yolo26_batched_merges(self):
+        # The yolo26 merges at batch 4: the batch dim in front lets the pivot
+        # take a dim wider than one stick. Both cases fail without the pass.
+        cases = {
+            "psa qkv": ((4, 512, 20, 20), (4, 4, 128, 400)),
+            "detect view": ((4, 80, 80, 80), (4, 80, 6400)),
+        }
+        for name, (shape, out) in cases.items():
+            with self.subTest(name):
+                x = torch.randn(*shape, dtype=torch.float16)
+                self._compile_and_check(
+                    lambda x, out=out: torch.nn.functional.silu(x * 2).reshape(out) + 1,
+                    x,
+                    on_device=True,
+                    expect="pivot",
+                )
+
+    @pytest.mark.filterwarnings("ignore::UserWarning")  # forced cache disabling
     def test_aligned_stick_reshape_is_left_alone(self):
         a = torch.randn(1, 32, 128 * 128, dtype=torch.float16)
         self._compile_and_check(
