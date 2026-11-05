@@ -1541,6 +1541,42 @@ def test_shared_producer_gets_two_restickify_nodes():
     )
 
 
+def test_no_pass_leaves_a_stale_read_writes_memo():
+    """op_read_writes memoizes on the op instance and is filled from the layout
+    passes onwards, so a pass that changes what an op reads in place must call
+    invalidate_op_read_writes. After every pre-scheduling pass, each memoized
+    entry must still equal a fresh extraction. insert_restickify is the case
+    this graph exercises: it rewires each transpose's read to its restickify
+    buffer on the same instance."""
+    from torch._inductor.ir import ComputedBuffer
+
+    from torch_spyre._inductor.loop_node import all_ops
+    from torch_spyre._inductor.passes import CustomPreSchedulingPasses
+
+    run_one_pass = CustomPreSchedulingPasses._run_one_pass
+    checked: dict[str, int] = {}
+    stale: list[str] = []
+
+    def checking_run_one_pass(self, graph, pipeline, pass_fn, pass_name):
+        run_one_pass(self, graph, pipeline, pass_fn, pass_name)
+        for op in all_ops(graph.operations):
+            cached = op.__dict__.get("_ts_cached_read_writes")
+            if cached is None or not isinstance(op, ComputedBuffer):
+                continue
+            checked[pass_name] = checked.get(pass_name, 0) + 1
+            if cached != op.get_read_writes():
+                stale.append(f"{op.get_name()} after {pass_name}")
+
+    (x, za, zb), fn = _shared_producer_two_restickify_case()
+    with patch.object(
+        CustomPreSchedulingPasses, "_run_one_pass", checking_run_one_pass
+    ):
+        _compile_and_run(fn, (x, za, zb), DEVICE)
+    # Not vacuous: entries exist by the time insert_restickify edits the ops.
+    assert checked.get("insert_restickify"), checked
+    assert not stale, stale
+
+
 # ------- Restickify padding: strict (distinct values + torch.equal) ---------
 #
 # The tolerance-based tests above compare ``randn`` data with atol=rtol=0.1,

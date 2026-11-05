@@ -938,6 +938,7 @@ def _inline_marker_into_consumer(
 
     from torch_spyre._inductor.pass_utils import (
         _invalidate_body_caches,
+        invalidate_op_read_writes,
         replace_computed_buffer_body,
     )
 
@@ -964,6 +965,9 @@ def _inline_marker_into_consumer(
 
         object.__setattr__(consumer_op.data, "output_indexer", new_output_indexer)
     _invalidate_body_caches(consumer_op.data)
+    # As in redirect_computed_buffer_reads: the replacement starts unmemoized,
+    # but consumer_op already reads through the patched data.
+    invalidate_op_read_writes(consumer_op)
 
     result = replace_computed_buffer_body(
         consumer_op,
