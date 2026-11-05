@@ -1498,6 +1498,14 @@ class TestRecordedPadding(unittest.TestCase):
     # 3 fp16 elements in a 64-element stick: 61 padding elements.
     SIZE = 3
 
+    def setUp(self) -> None:
+        # Compile every graph afresh: a cached graph skips track_padding_value,
+        # and the dynamic-shape tests would then pass without exercising it.
+        torch._dynamo.reset()
+        patcher = t_inductor_config.patch("force_disable_caches", True)
+        patcher.__enter__()
+        self.addCleanup(patcher.__exit__, None, None, None)
+
     def _filled(self, value: float) -> torch.Tensor:
         t = torch.empty(self.SIZE, dtype=torch.float16, device="spyre")
         t.fill_(value)
@@ -1530,6 +1538,31 @@ class TestRecordedPadding(unittest.TestCase):
         torch.compile(scale_shift, fullgraph=True, dynamic=False)(t)
         self.assertIsNone(t.device_tensor_layout().padding_value)
         torch.testing.assert_close(t.cpu(), torch.full((self.SIZE,), 11.0).half())
+
+    def test_dynamic_recompile_of_inplace(self) -> None:
+        # The second call recompiles with a symbolic size. The slice check in
+        # track_padding_value must not compare it with the concrete
+        # valid_elements of the layout ("cannot determine truth value").
+        def scale(x):
+            x.mul_(2)
+            return x
+
+        compiled = torch.compile(scale, fullgraph=True)
+        compiled(self._filled(5.0))
+        t = torch.empty(64, dtype=torch.float16, device="spyre")
+        t.fill_(1.0)
+        compiled(t)
+        torch.testing.assert_close(t.cpu(), torch.full((64,), 2.0).half())
+
+    def test_dynamic_slice_is_masked(self) -> None:
+        # A symbolic slice of the stick dim leaves valid input elements in the
+        # output padding; the following sum must still count only the slice.
+        def fn(x):
+            return (x[:, : x.shape[1] - 3] + 1).sum(dim=1)
+
+        x = torch.ones(4, 64, dtype=torch.float16)
+        result = torch.compile(fn, fullgraph=True, dynamic=True)(x.to("spyre"))
+        torch.testing.assert_close(result.cpu(), fn(x))
 
     def test_eager_inplace_clears_recorded_padding(self) -> None:
         # In-place eager ops write self through a compiled copy_from_d2d.

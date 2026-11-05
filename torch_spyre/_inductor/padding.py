@@ -1926,10 +1926,14 @@ def track_padding_value(graph: GraphLowering) -> None:
                 if layout is None:
                     continue
 
-                is_sliced = False
-                if layout.valid_elements:
-                    total_valid_elems = math.prod(layout.valid_elements.values())
-                    is_sliced = dep.get_numel() < total_valid_elems
+                # The read is a slice when it touches fewer elements than the
+                # buffer holds. Compare host numels, both in the graph's size
+                # symbols (valid_elements is concrete even when the sizes are
+                # dynamic, so it cannot be compared with a symbolic read). A
+                # read not proven to cover the buffer counts as a slice.
+                is_sliced = not V.graph.sizevars.statically_known_geq(
+                    dep.get_numel(), V.graph.get_numel(dep.name)
+                )
 
                 # If the output is padded and there is slicing on the input it means
                 # that the if there is slicing along the stiock dim, valid values
