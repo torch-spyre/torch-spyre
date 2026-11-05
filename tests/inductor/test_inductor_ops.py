@@ -10853,11 +10853,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     @pytest.mark.xfail(
         reason=(
-            "Spyre compiled backend hits an internal lowering bug for "
-            "torch.nansum (stable error signature: InductorError: RuntimeError: "
-            "Failed to import the generated kernel, a SyntaxError)"
+            "Spyre compiled backend has no lowering for the isnan in "
+            "torch.nansum (stable error signature: RuntimeError: Invoked "
+            "<kernel> which contains unimplemented operation isnan)"
         ),
-        raises=InductorError,
+        raises=RuntimeError,
         strict=True,
     )
     def test_nansum_all_dims_known_xfail(self):
