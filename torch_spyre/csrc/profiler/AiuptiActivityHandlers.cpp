@@ -615,11 +615,10 @@ uint32_t AiuptiActivityProfilerSession::getResourceId(
       last_active_times.push_back(activity->end);
       overlap_offset = last_active_times.size() - 1;
     }
-    activeThreadMap_[{activity->device_index, base_resource_id}]
-                    [overlap_offset] = activity->end;
+    activeThreadMap_[{activity->device_index, base_resource_id}][overlap_offset] =
+        activity->end;
   } else {
-    activeThreadMap_[{activity->device_index, base_resource_id}] = {
-        activity->end};
+    activeThreadMap_[{activity->device_index, base_resource_id}] = {activity->end};
   }
   return base_resource_id + overlap_offset;
 }

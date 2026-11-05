@@ -80,8 +80,7 @@ c10::CachingDeviceAllocator::DeviceStats SpyreAllocator::getDeviceStats(
 
 std::pair<size_t, size_t> SpyreAllocator::getMemoryInfo(
     c10::DeviceIndex device) {
-  int64_t active_device_id =
-      flex::RuntimeContext::getInstance()->getDeviceIndex();
+  int64_t active_device_id = flex::RuntimeContext::getInstance()->getDeviceIndex();
   TORCH_CHECK(static_cast<int64_t>(device) == active_device_id,
               "SpyreAllocator::getMemoryInfo: requested device index ", device,
               " does not match the active device (", active_device_id, ")");
