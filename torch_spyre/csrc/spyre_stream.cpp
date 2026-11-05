@@ -489,6 +489,11 @@ void SpyreStream::launchFillAsync(flex::FillAsyncParams* params) const {
   resolveRuntimeHandle()->launchOperation(params);
 }
 
+void SpyreStream::launchCopyRaw(flex::CopyRawParams* params) const {
+  RECORD_FUNCTION("launch::CopyRaw", {});
+  resolveRuntimeHandle()->launchOperation(params);
+}
+
 flex::HostComputeBuffer* SpyreStream::launchHostCompute(
     flex::HostComputeParams* params) const {
   RECORD_FUNCTION("launch::HostCompute", {});

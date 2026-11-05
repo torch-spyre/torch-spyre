@@ -1915,8 +1915,12 @@ def test_relayout_footprint_uses_device_storage_not_host_strides(host_strides):
     # Packed device storage is 8192 / 131072 regardless of the host permutation.
     # The replicated consumer cannot be sized by dividing the tensor by 32.
     layout = object.__new__(FixedTiledLayout)
+    _dl_ds = [8, 1, 2, 128, 64]
     layout.device_layout = SpyreTensorLayout(
-        [8, 1, 2, 128, 64], list(host_strides), DataFormats.SEN169_FP16
+        _dl_ds,
+        list(host_strides),
+        DataFormats.SEN169_FP16,
+        {(i,): _dl_ds[i] for i in range(len(_dl_ds))},
     )
     source = PerCoreView(
         ((0, 8), (2, 2), (3, 2)),

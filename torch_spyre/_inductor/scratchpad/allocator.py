@@ -319,6 +319,32 @@ def _collective_stage_storage_is_private(
     return storage_has_single_writer(graph, producer, transferred_mutation=collective)
 
 
+def _is_coarse_tiled(op: Any) -> bool:
+    return isinstance(getattr(op, "loop_info", None), CoarseTileInfo)
+
+
+def _sibling_pinned_divisions(
+    parent: str,
+    parent_op: Any,
+    cd_parent_matches: Optional[dict[str, list[tuple[int, int]]]],
+) -> frozenset[int]:
+    """Consumer divisions another parent already matches for free, which
+    ``_cap_relayout_groups`` keeps past the cap.
+
+    Only for a coarse-tiled parent, the edges solver_relayout_edge_context's
+    same-tile-group exception admits. Elsewhere a sibling usually matches most
+    consumer divisions, and pinning them all would leave the edge uncapped.
+    """
+    if not _is_coarse_tiled(parent_op):
+        return frozenset()
+    return frozenset(
+        j
+        for other_parent, pairs in (cd_parent_matches or {}).items()
+        if other_parent != parent
+        for _, j in pairs
+    )
+
+
 def _coarse_tile_loop_trip_count(op: Any) -> int:
     """Total trip count of ``op``'s coarse-tiling loop, or 1 when untiled.
 
@@ -331,9 +357,9 @@ def _coarse_tile_loop_trip_count(op: Any) -> int:
     value, 1 (not a propagated symbol that would later crash numeric code
     expecting a plain float) when it doesn't.
     """
-    loop_info = getattr(op, "loop_info", None)
-    if not isinstance(loop_info, CoarseTileInfo):
+    if not _is_coarse_tiled(op):
         return 1
+    loop_info = op.loop_info
 
     def _resolved(c) -> int:
         try:
@@ -3788,6 +3814,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 # pricing the direct read in the actual allocation context.
                 # Other callers and unrecognized records keep the fixed pin.
                 reason = "deferred direct graph-input read"
+            elif isinstance(op, ComputedBuffer) and getattr(
+                op, "shard_pinned_splits", None
+            ):
+                reason = "shard plan"
             elif (
                 not config.ignore_work_division_hints
                 and isinstance(op, ComputedBuffer)
@@ -5092,9 +5122,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         solver's ``decides_lx_relayouts`` and on ``config.lx_solver_relayout``.
 
         ``cd_parent_matches`` (the caller's own ``_cd_parent_matches`` result)
-        gives each parent's cap-and-rank step the other parents' already-free
-        divisions, so it won't drop the one group that would let this parent
-        join them.
+        gives a coarse-tiled parent's cap-and-rank step the other parents'
+        already-free divisions, so it won't drop the one group that would let
+        this parent join them.
         """
         if (
             not self._decides_lx_relayouts
@@ -5341,11 +5371,8 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                         consumer_op.get_name(),
                         exc,
                     )
-            sibling_pinned = frozenset(
-                j
-                for other_parent, pairs in (cd_parent_matches or {}).items()
-                if other_parent != parent
-                for _, j in pairs
+            sibling_pinned = _sibling_pinned_divisions(
+                parent, parent_op, cd_parent_matches
             )
             candidates = self._cap_relayout_groups(
                 parent,

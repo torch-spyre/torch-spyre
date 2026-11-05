@@ -1937,20 +1937,34 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
     def _log_tilings(self) -> None:
         """Report the tiled runs the search kept, each with its companion
-        traffic, or that it kept none although some buffer could tile."""
+        traffic, or that it kept none although some buffer could tile; and
+        which buffers that could tile it left untiled."""
         if not self._tilings_are_possible:
             return
         charges: dict[tuple[int, int], int] = {}
         for run, nbytes in self._companion_charges(self.packer.addresses):
             charges[run] = charges.get(run, 0) + nbytes
         tiled = [run for run in self._runs() if not self._tiling_at(run[0]).is_untiled]
+        could_tile = [
+            idx
+            for idx, source in enumerate(self._sources)
+            if isinstance(source, _GeneratedDivisions) and source.can_tile()
+        ]
         if not tiled:
             logger.info(
                 "SA co-optimizer kept no coarse tiling; %d buffer(s) could tile",
-                sum(
-                    isinstance(source, _GeneratedDivisions) and source.can_tile()
-                    for source in self._sources
-                ),
+                len(could_tile),
+            )
+        left_untiled = [
+            self._bufs[idx].name
+            for idx in could_tile
+            if self.chosen[idx].tiling.is_untiled
+        ]
+        if left_untiled:
+            # What each was offered is logged by wsr.enumerate_tilings.
+            logger.debug(
+                "SA co-optimizer left untiled, though each could tile: %s",
+                ", ".join(left_untiled),
             )
         for lo, hi in tiled:
             logger.debug(
