@@ -2,8 +2,8 @@
 -- Read 10-functional-tests.sql first -- identity rules, props/tags and run_id are stated there.
 --
 -- Scope: torch-spyre op/kernel/model benchmarks (spyre-perf-suite, plus sendnn and CPU baselines
--- it measures against -- see `backend`). vLLM/spyre-inference perf stays in results_v3 +
--- run_metadata (the schema upstream PyTorch HUD reads) and joins in via run_id/artifact_results.
+-- it measures against -- see `backend`) and spyre-inference vLLM benchmarks, which
+-- 70-vllm-hud-projection.sql projects into the upstream HUD shape.
 --
 -- Replaces v1's benchmark_runs + perf_benchmarks + perf_kernels, sendnn_runs +
 -- sendnn_benchmarks, and loz_system_performance_vllm.
@@ -12,7 +12,8 @@ CREATE TABLE IF NOT EXISTS benchmarks
 (
     ts           DateTime DEFAULT now(),
 
-    -- uuid5(name|sorted(tags)|record_type,config_name,input_shapes,run_mode,kernel_name,is_total).
+    -- uuid5(name|sorted(tags)|record_type,config_name,input_shapes,run_mode,kernel_name,is_total),
+    -- a compiled kernel_name hashed as `<stem>@<rank>` (BenchmarkId.rank_kernels), not raw.
     -- Discriminators are IN the hash, not just props: one operation_name recurs across
     -- record_types (granite as both model and op), so name+tags alone would merge them.
     benchmark_id UUID,
@@ -28,6 +29,9 @@ CREATE TABLE IF NOT EXISTS benchmarks
     -- input_shapes, run_mode, kernel_name, is_total, batch_size, prompt_length, ...) -- a Map
     -- since producers' identity tuples disagree.
     props        Map(LowCardinality(String), String),
+    audit_uuid      UUID DEFAULT generateUUIDv7(),
+    audit_timestamp DateTime64(3) DEFAULT now64(3),
+
 
     CONSTRAINT chk_component CHECK component != '',
     CONSTRAINT chk_name      CHECK name != ''
@@ -69,9 +73,12 @@ CREATE TABLE IF NOT EXISTS benchmark_runs
     iterations   UInt32 DEFAULT 0,
 
     props        Map(LowCardinality(String), String),
+    audit_uuid      UUID DEFAULT generateUUIDv7(),
+    audit_timestamp DateTime64(3) DEFAULT now64(3),
+
 
     -- regression_status is deliberately absent: a stored verdict with no baseline can't be
-    -- checked. Derived in v_benchmark_regression against an explicit baseline run_id.
+    -- checked. Derived in v_benchmark_metric_verdicts against each series' recorded baseline runs.
     CONSTRAINT chk_measurements CHECK length(measurements) > 0
 )
 ENGINE = MergeTree()

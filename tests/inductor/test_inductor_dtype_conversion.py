@@ -22,6 +22,7 @@ Organized by coverage area:
   TestModelIntegration   — compiled model-layer integration
 """
 
+import functools
 import unittest
 import warnings
 
@@ -31,6 +32,26 @@ from torch.testing._internal.common_utils import set_warn_always_context
 
 import utils_inductor
 from utils_inductor import cached_randn
+
+
+def _rejected(match, issue):
+    """Assert that the test body is rejected with a message matching ``match``.
+
+    For a case that is not supported yet (tracked by ``issue``) or is rejected on
+    purpose. The test fails if the body stops raising or raises something else, so
+    when the rejection is lifted the test has to become a positive one.
+    """
+
+    def decorate(test):
+        @functools.wraps(test)
+        def rejected(*args, **kwargs):
+            with pytest.raises(Exception, match=match):
+                test(*args, **kwargs)
+
+        rejected.tracking_issue = issue
+        return utils_inductor.expects_raise(rejected)
+
+    return decorate
 
 
 class TestExplicitConversion(unittest.TestCase):
@@ -115,11 +136,13 @@ class TestExplicitConversion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, run_eager=False)
 
-    @pytest.mark.skip(
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
         reason=(
-            "SKIP #2847 — eager .to(dtype) on Spyre tensor returns wrong dtype result; "
-            "https://github.com/torch-spyre/torch-spyre/issues/2847"
-        )
+            "eager .to(torch.float16) on a spyre fp32 tensor returns values "
+            "that differ from the CPU result (#2847)"
+        ),
     )
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_eager_to_dtype_fp32_to_fp16(self):
@@ -141,12 +164,7 @@ class TestExplicitConversion(unittest.TestCase):
         self.assertEqual(fn(x).dtype, torch.float16)
         self.compare_with_cpu(fn, x, run_eager=False)
 
-    @pytest.mark.skip(
-        reason=(
-            "SKIP #2851 — stride-2 slice generates unsupported stick expression "
-            "2*(Mod(d1,32)); https://github.com/torch-spyre/torch-spyre/issues/2851"
-        )
-    )
+    @_rejected("no supported output layout found", "#2851")
     def test_to_dtype_strided_slice_fp16_to_fp32(self):
         """fp16->fp32 on a stride-2 sliced non-contiguous tensor."""
         x = cached_randn((4, 128), differentiation="ncex02_stride")
@@ -176,12 +194,14 @@ class TestExplicitConversion(unittest.TestCase):
         self.assertEqual(fn(x).dtype, torch.float16)
         self.compare_with_cpu(fn, x, run_eager=False)
 
-    @pytest.mark.skip(
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
         reason=(
-            "SKIP #2205 — fp32.half() uses FP32TODL16_OP; result "
-            "stored in DL16_TO_FP32 arrangement; D2H reads garbled values; "
-            "https://github.com/torch-spyre/torch-spyre/issues/2205"
-        )
+            "the fp32 to fp16 cast leaves a staggered element arrangement and the "
+            "device-to-host copy reads it as standard, so the elements come back "
+            "permuted (#4393)"
+        ),
     )
     def test_half_shortcut_value_correctness(self):
         """fp32.half() shortcut — FP32TODL16_OP path, SKIP #2205."""
@@ -201,12 +221,14 @@ class TestExplicitConversion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, run_eager=False)
 
-    @pytest.mark.skip(
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
         reason=(
-            "SKIP #2205 — fp32.bfloat16() uses FP32TODL16_OP; "
-            "result stored in DL16_TO_FP32 arrangement; D2H readback garbled; "
-            "https://github.com/torch-spyre/torch-spyre/issues/2205"
-        )
+            "the fp32 to bf16 cast leaves a staggered element arrangement and the "
+            "device-to-host copy reads it as standard, so the elements come back "
+            "permuted (#4393)"
+        ),
     )
     def test_bfloat16_shortcut_from_fp32_value_correctness(self):
         """fp32.bfloat16() uses FP32TODL16_OP, SKIP #2205."""
@@ -289,13 +311,6 @@ class TestExplicitConversion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @pytest.mark.skip(
-        reason=(
-            "SKIP — non-contiguous fp16 source to to_dtype: slice (4,128)[:, :64] "
-            "has row stride 128 but logical extent 64; compiled graph produces wrong "
-            "values on Spyre hardware"
-        )
-    )
     def test_wa_exp_add_non_contiguous_2d(self):
         """both-fp16 add via explicit fp32 cast — non-contiguous slice (4,128)→(4,64)."""
         x = cached_randn((4, 128), differentiation="expnc_x")
@@ -325,12 +340,13 @@ class TestExplicitConversion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, z, run_eager=False)
 
-    @pytest.mark.skip(
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
         reason=(
-            "SKIP #2204 — unaligned last dim (16) causes padding "
-            "propagation failure in to_dtype for fp16→fp32; "
-            "https://github.com/torch-spyre/torch-spyre/issues/2204"
-        )
+            "about half the elements come back wrong when the last dim (16) "
+            "does not fill whole stick pairs of the staggered fp32 value (#5361)"
+        ),
     )
     def test_explicit_fp16_to_fp32_add_3d_unaligned(self):
         """explicit cast — 3D unaligned (2,4,16)."""
@@ -345,12 +361,13 @@ class TestExplicitConversion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @pytest.mark.skip(
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
         reason=(
-            "SKIP #2204 — unaligned last dim (16) causes padding "
-            "propagation failure in to_dtype for fp16→fp32; "
-            "https://github.com/torch-spyre/torch-spyre/issues/2204"
-        )
+            "about half the elements come back wrong when the last dim (16) "
+            "does not fill whole stick pairs of the staggered fp32 value (#5361)"
+        ),
     )
     def test_explicit_fp16_to_fp32_add_4d_unaligned(self):
         """explicit cast — 4D unaligned (2,2,4,16)."""
@@ -384,13 +401,7 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @pytest.mark.skip(
-        reason=(
-            "SKIP #2252 — explicit fp16→fp32 cast + H2D fp32 tensor: "
-            "DL16_TO_FP32 vs STANDARD arrangement mismatch on add inputs; "
-            "https://github.com/torch-spyre/torch-spyre/issues/2252"
-        )
-    )
+    @_rejected("Multi-arg pointwise with mixed EA", "#2252")
     def test_working_implicit_add_fp16_to_fp32(self):
         """explicit fp16->fp32 cast still hits #2252 arrangement mismatch."""
         x = cached_randn((4, 64), differentiation="newim01_x")
@@ -402,13 +413,7 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @pytest.mark.skip(
-        reason=(
-            "SKIP #2252 — direct fp16 + H2D fp32 tensor: "
-            "DL16_TO_FP32 vs STANDARD arrangement mismatch; "
-            "https://github.com/torch-spyre/torch-spyre/issues/2252"
-        )
-    )
+    @_rejected("Multi-arg pointwise with mixed EA", "#2252")
     def test_direct_mixed_dtype_add_arrangement_error(self):
         """direct add of H2D fp32 + on-device fp16 hits arrangement mismatch."""
         x = cached_randn((4, 64), differentiation="newim02_fp16")
@@ -419,12 +424,7 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @pytest.mark.skip(
-        reason=(
-            "SKIP #2252 — direct fp16+fp32 4D add hits arrangement mismatch; "
-            "https://github.com/torch-spyre/torch-spyre/issues/2252"
-        )
-    )
+    @_rejected("Multi-arg pointwise with mixed EA", "#2252")
     def test_direct_mixed_dtype_add_4d_stick_aligned(self):
         """direct fp16+fp32 add on 4D (2,2,4,64) without workaround."""
         x = cached_randn((2, 2, 4, 64), differentiation="dir4d_fp16")
@@ -437,12 +437,7 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @pytest.mark.skip(
-        reason=(
-            "SKIP #2252 — direct fp16+fp32 5D add hits arrangement mismatch; "
-            "https://github.com/torch-spyre/torch-spyre/issues/2252"
-        )
-    )
+    @_rejected("Multi-arg pointwise with mixed EA", "#2252")
     def test_direct_mixed_dtype_add_5d_stick_aligned(self):
         """direct fp16+fp32 add on 5D (2,2,2,4,64) without workaround."""
         x = cached_randn((2, 2, 2, 4, 64), differentiation="dir5d_fp16")
@@ -455,12 +450,7 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @pytest.mark.skip(
-        reason=(
-            "SKIP #2252 — direct fp16+fp32 large-value add hits arrangement mismatch; "
-            "https://github.com/torch-spyre/torch-spyre/issues/2252"
-        )
-    )
+    @_rejected("Multi-arg pointwise with mixed EA", "#2252")
     def test_direct_mixed_dtype_add_large_values(self):
         """direct fp16+fp32 add with large values (scale=100)."""
         x = cached_randn((4, 64), differentiation="dirlrg_fp16", scale=100.0)
@@ -473,12 +463,7 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @pytest.mark.skip(
-        reason=(
-            "SKIP #2252 — direct fp16+fp32 small-value add hits arrangement mismatch; "
-            "https://github.com/torch-spyre/torch-spyre/issues/2252"
-        )
-    )
+    @_rejected("Multi-arg pointwise with mixed EA", "#2252")
     def test_direct_mixed_dtype_add_small_values(self):
         """direct fp16+fp32 add with small values (scale=1e-3)."""
         x = cached_randn((4, 64), differentiation="dirsml_fp16", scale=1e-3)
@@ -531,13 +516,7 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @pytest.mark.skip(
-        reason=(
-            "SKIP #2204 — unaligned last dim (32) causes padding "
-            "propagation failure in to_dtype for fp16→fp32; "
-            "https://github.com/torch-spyre/torch-spyre/issues/2204"
-        )
-    )
+    @_rejected("cannot rescale device layout", "#3809")
     def test_implicit_add_fp16_2d_unaligned(self):
         """implicit add workaround — 2D unaligned (4,32)."""
         x = cached_randn((4, 32), differentiation="imp2du_x")
@@ -550,12 +529,13 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @pytest.mark.skip(
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
         reason=(
-            "SKIP #2204 — unaligned last dim (16) causes padding "
-            "propagation failure in to_dtype for fp16→fp32; "
-            "https://github.com/torch-spyre/torch-spyre/issues/2204"
-        )
+            "about half the elements come back wrong when the last dim (16) "
+            "does not fill whole stick pairs of the staggered fp32 value (#5361)"
+        ),
     )
     def test_implicit_add_fp16_3d_unaligned(self):
         """implicit add workaround — 3D unaligned (2,4,16)."""
@@ -569,12 +549,13 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @pytest.mark.skip(
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
         reason=(
-            "SKIP #2204 — unaligned last dim (16) causes padding "
-            "propagation failure in to_dtype for fp16→fp32; "
-            "https://github.com/torch-spyre/torch-spyre/issues/2204"
-        )
+            "about half the elements come back wrong when the last dim (16) "
+            "does not fill whole stick pairs of the staggered fp32 value (#5361)"
+        ),
     )
     def test_implicit_add_fp16_4d_unaligned(self):
         """implicit add workaround — 4D unaligned (2,2,4,16)."""
@@ -588,13 +569,7 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @pytest.mark.skip(
-        reason=(
-            "SKIP #2252 — sub with explicit fp16→fp32 cast: "
-            "DL16_TO_FP32 vs STANDARD arrangement mismatch; "
-            "https://github.com/torch-spyre/torch-spyre/issues/2252"
-        )
-    )
+    @_rejected("Multi-arg pointwise with mixed EA", "#2252")
     def test_sub_fp16_fp32_via_explicit_cast_roundtrip(self):
         """sub with explicit fp16->fp32 cast hits #2252."""
         x = cached_randn((4, 64), differentiation="spe09_x")
@@ -606,13 +581,7 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @pytest.mark.skip(
-        reason=(
-            "SKIP #2252 — mul with explicit fp16→fp32 cast: "
-            "DL16_TO_FP32 vs STANDARD arrangement mismatch; "
-            "https://github.com/torch-spyre/torch-spyre/issues/2252"
-        )
-    )
+    @_rejected("Multi-arg pointwise with mixed EA", "#2252")
     def test_mul_fp16_fp32_via_explicit_cast_roundtrip(self):
         """mul with explicit fp16->fp32 cast hits #2252."""
         x = cached_randn((4, 64), differentiation="spe10_x")
@@ -624,13 +593,7 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @pytest.mark.skip(
-        reason=(
-            "SKIP #2252 — div with explicit fp16→fp32 cast: "
-            "DL16_TO_FP32 vs STANDARD arrangement mismatch; "
-            "https://github.com/torch-spyre/torch-spyre/issues/2252"
-        )
-    )
+    @_rejected("Multi-arg pointwise with mixed EA", "#2252")
     def test_div_fp16_by_fp32_via_explicit_cast_workaround(self):
         """div with explicit fp16->fp32 cast hits #2252."""
         x = cached_randn((4, 64), differentiation="spe12_x")
@@ -653,13 +616,7 @@ class TestImplicitPromotion(unittest.TestCase):
         self.assertEqual(fn(x, y).dtype, torch.float16)
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @pytest.mark.skip(
-        reason=(
-            "SKIP #2252 — fp32 - fp16 reversed operands: "
-            "STANDARD (H2D fp32) vs DL16_TO_FP32 (implicit fp16→fp32) arrangement mismatch; "
-            "https://github.com/torch-spyre/torch-spyre/issues/2252"
-        )
-    )
+    @_rejected("Multi-arg pointwise with mixed EA", "#2252")
     def test_direct_sub_fp32_tensor_fp16_tensor(self):
         """fp32_tensor - fp16_tensor (reversed operand order)."""
         x = cached_randn((4, 64), dtype=torch.float32, differentiation="tp02_fp32")
@@ -670,13 +627,7 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @pytest.mark.skip(
-        reason=(
-            "SKIP #2252 — stack([fp16→fp32, fp32]) inserts implicit to_dtype; "
-            "DL16_TO_FP32 and STANDARD arrangements mismatch on stack; "
-            "https://github.com/torch-spyre/torch-spyre/issues/2252"
-        )
-    )
+    @_rejected("mixed element arrangements", "#2252")
     def test_stack_fp16_fp32_implicit_promotion(self):
         """stack([fp16, fp32]) implicit promotion."""
         x = cached_randn((4, 64), differentiation="tp04_fp16")
@@ -687,13 +638,7 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @pytest.mark.skip(
-        reason=(
-            "SKIP #2252 — cat([fp16→fp32, fp32]) results in "
-            "DL16_TO_FP32 + STANDARD arrangement mismatch; "
-            "https://github.com/torch-spyre/torch-spyre/issues/2252"
-        )
-    )
+    @_rejected("mixed element arrangements", "#2252")
     def test_cat_fp16_fp32_implicit_promotion(self):
         """cat([fp16, fp32]) implicit promotion."""
         x = cached_randn((4, 64), differentiation="spe06_fp16")
@@ -794,13 +739,7 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, run_eager=False)
 
-    @pytest.mark.skip(
-        reason=(
-            "SKIP #2252 — non-contiguous fp16.t()→fp32 gives DL16_TO_FP32 "
-            "while fp32.t() has STANDARD arrangement → mismatch on add; "
-            "https://github.com/torch-spyre/torch-spyre/issues/2252"
-        )
-    )
+    @_rejected("Multi-arg pointwise with mixed EA", "#2252")
     def test_implicit_tensor_add_non_contiguous_fp16_fp32(self):
         """non-contiguous fp16 + fp32 hits arrangement mismatch."""
         x = cached_randn((64, 4), differentiation="ncim02_fp16")
@@ -902,13 +841,6 @@ class TestDataTransfer(unittest.TestCase):
 
         self.compare_with_cpu(fn, src, run_eager=False)
 
-    @pytest.mark.skip(
-        reason=(
-            "SKIP #2205 — compiled D2H fp32→fp16: FP32TODL16_OP output has "
-            "DL16_TO_FP32 arrangement; copy_tensor fails with invalid sizes/stride map; "
-            "https://github.com/torch-spyre/torch-spyre/issues/2205"
-        )
-    )
     def test_compiled_d2h_fp32_to_fp16(self):
         """compiled D2H fp32 → fp16 in one .to('cpu', dtype=fp16) call."""
         x_cpu = torch.tensor(
@@ -929,15 +861,17 @@ class TestDataTransfer(unittest.TestCase):
             msg=f"D2H fp32→fp16 value mismatch: got {result}, expected {expected}",
         )
 
-    @pytest.mark.skip(
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
         reason=(
-            "SKIP #2852 — cross-dtype copy_() fp32→fp16: aten.copy.default has no STL "
-            "candidate for IEEE_FP32→SEN169_FP16; "
-            "https://github.com/torch-spyre/torch-spyre/issues/2852"
-        )
+            "the copy compiles (#2852 is fixed), but the fp16 result is staggered and "
+            "its readback is permuted: converting it back on the device restores the "
+            "values (#4393)"
+        ),
     )
     def test_compiled_copy_cross_dtype_fp32_to_fp16(self):
-        """Compiled copy_() from fp32 into fp16 Spyre tensor — missing cross-format layout candidate."""
+        """Compiled copy_() from fp32 into fp16 Spyre tensor."""
         src_fp32 = cached_randn(
             (4, 64), dtype=torch.float32, differentiation="cop02_src"
         )
@@ -960,15 +894,17 @@ class TestDataTransfer(unittest.TestCase):
             msg=f"copy_ value mismatch: got {dst_spyre.cpu()}, expected {expected}",
         )
 
-    @pytest.mark.skip(
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
         reason=(
-            "SKIP #2205 #1482 — .float() on Spyre tensor produces DL16_TO_FP32 "
-            "arrangement; direct .cpu() gives wrong values; .half() may also fail; "
-            "https://github.com/torch-spyre/torch-spyre/issues/2205"
+            ".float() on a Spyre tensor gives a staggered (DL16_TO_FP32) result whose "
+            "readback is permuted (#4393), and the eager .half() of it is also wrong, "
+            "though the compiled .half() of the same tensor is right; see also #2205"
         ),
     )
     def test_float_half_methods_on_spyre_tensor(self):
-        """.float() and .half() shortcut methods on Spyre tensors, SKIP #2205."""
+        """.float() and .half() shortcut methods on Spyre tensors."""
         x_cpu = torch.randn(4, 64, dtype=torch.float16)
         x_spyre = x_cpu.to("spyre")
         x_float = x_spyre.float()

@@ -4,12 +4,13 @@
 -- and 90-day TTLs. Checked in so a database can be stood up complete and a reader can see the
 -- shape being queried -- not to be edited (a changed column breaks the exporter's insert).
 --
--- We are a READER only: pushToClickhouse.groovy reads otel_traces for stage timings, and ~16
+-- We are a READER only: the orchestrator and Grafana read otel_traces for stage timings, and
 -- Grafana panels read the metrics tables.
 --
--- Two families, different keys: traces are keyed (ServiceName, SpanName, Timestamp) with a
--- TraceId lookup table fed by its own MV; metrics are keyed (ServiceName, MetricName, hour,
--- hash(Attributes), TimeUnix) per instrument type.
+-- Two families, different keys: traces are keyed (ServiceName, SpanName, Timestamp); metrics are
+-- keyed (ServiceName, MetricName, hour, hash(Attributes), TimeUnix) per instrument type. The
+-- exporter's otel_traces_trace_id_ts lookup table + MV is omitted: nothing reads it, and its MV
+-- serialised every trace insert.
 --
 -- Regenerate rather than hand-edit, to stay byte-faithful: SHOW CREATE TABLE <db>.otel_traces
 -- (repeat per table, unqualify the database).
@@ -52,32 +53,6 @@ ENGINE = MergeTree
 PARTITION BY toDate(Timestamp)
 ORDER BY (ServiceName, SpanName, toDateTime(Timestamp))
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1;
-
-CREATE TABLE IF NOT EXISTS otel_traces_trace_id_ts
-(
-    `TraceId` String CODEC(ZSTD(1)),
-    `Start` DateTime CODEC(Delta(4), ZSTD(1)),
-    `End` DateTime CODEC(Delta(4), ZSTD(1)),
-    INDEX idx_trace_id TraceId TYPE bloom_filter(0.01) GRANULARITY 1
-)
-ENGINE = MergeTree
-PARTITION BY toDate(Start)
-ORDER BY (TraceId, Start)
-SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1;
-
-CREATE MATERIALIZED VIEW IF NOT EXISTS otel_traces_trace_id_ts_mv TO otel_traces_trace_id_ts
-(
-    `TraceId` String,
-    `Start` DateTime64(9),
-    `End` DateTime64(9)
-)
-AS SELECT
-    TraceId,
-    min(Timestamp) AS Start,
-    max(Timestamp) AS End
-FROM otel_traces
-WHERE TraceId != ''
-GROUP BY TraceId;
 
 CREATE TABLE IF NOT EXISTS otel_logs
 (

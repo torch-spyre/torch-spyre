@@ -32,7 +32,7 @@ from types import SimpleNamespace
 import pytest
 import sympy
 
-import torch_spyre._inductor.dump_cost_model as dcm
+import torch_spyre._inductor.cost_features as dcm
 from torch_spyre._inductor import cost_model, logging_utils
 from torch_spyre._inductor.cost_model import (
     ArgTraffic,
@@ -665,6 +665,80 @@ def _extractable_op(name, reads):
     )
 
 
+@pytest.mark.parametrize("execution_cores", [16, 32])
+def test_relayout_price_does_not_replace_execution_cores(monkeypatch, execution_cores):
+    from dataclasses import replace
+
+    import torch
+    from torch._inductor.dependencies import MemoryDep
+    from torch._inductor.ir import Pointwise
+    from torch._inductor.virtualized import V, ops
+
+    price = OpFeatures(
+        name="lx_relayout",
+        is_reduction=False,
+        out_elems=64,
+        cores=16,
+        dtype_bytes=2,
+        args=[],
+        is_lx_relayout=True,
+        relayout_cores=16,
+        relayout_run_elems=8,
+        relayout_split=8,
+    )
+    monkeypatch.setattr(dcm, "_relayout_features", lambda *_: price)
+    op = _extractable_op("buf1", ["buf0"])
+    row = sympy.Symbol("row", integer=True)
+    op.data = Pointwise(
+        device=torch.device("cpu"),
+        dtype=torch.float16,
+        inner_fn=lambda index: ops.load("buf0", index[0]),
+        ranges=[64],
+    )
+    op.get_read_writes = lambda: SimpleNamespace(
+        reads=[MemoryDep("buf0", row, (row,), (64,))],
+        writes=[MemoryDep("buf1", row, (row,), (64,))],
+    )
+    graph = _StubGraph(inputs=[], outputs=[])
+    graph.get_buffer = lambda name: _extractable_op(name, [])
+    with V.set_graph_handler(graph):
+        feature = dcm.extract_op_features(
+            op, {row: execution_cores}, is_lx={"buf0": True, "buf1": True}
+        )
+
+    assert feature.cores == execution_cores
+    assert feature.relayout_cores == 16
+    assert feature.read_bytes() == feature.write_bytes() == 0
+    params = CostParams()
+    legacy = replace(feature, cores=16, relayout_cores=0)
+    assert cost_model.relayout_ns(feature, params) == cost_model.relayout_ns(
+        legacy, params
+    )
+    assert cost_model.predict_ops([feature], params) == cost_model.predict_ops(
+        [legacy], params
+    )
+
+
+@pytest.mark.parametrize(
+    "source_cores,destination_cores", [(16, 32), (32, 16), (32, 32)]
+)
+def test_relayout_features_keep_the_smaller_price_domain(
+    monkeypatch, source_cores, destination_cores
+):
+    monkeypatch.setattr(dcm, "governing_run_split", lambda *_: (64, 8))
+    feature = dcm.relayout_cost_features(
+        object(),
+        object(),
+        source_cores,
+        [512, 4096],
+        512 * 4096,
+        2,
+        destination_num_cores=destination_cores,
+    )
+    assert feature.cores == source_cores
+    assert feature.relayout_cores == min(source_cores, destination_cores)
+
+
 def _stamps(op, graph):
     """{(role, name): is_boundary} as the real extractor stamps them under ``graph``."""
     from torch._inductor.virtualized import V
@@ -728,6 +802,45 @@ def test_the_extractor_stamps_reads_of_graph_inputs():
     assert stamps[("input", "buf0")] is False
 
 
+def _transport_flags(
+    monkeypatch, used_ops, *, reduction_type=None, geometry=(128, 4096)
+):
+    """(transport_compute_read, transport_read_run_bytes) the real extractor stamps on an
+    op whose body uses ``used_ops``. The source-run geometry has its own tests; it is
+    stubbed so this pins only how the extractor decides the flag."""
+    from torch._inductor.virtualized import V
+
+    op = _extractable_op("buf1", ["buf0"])
+    op.data = SimpleNamespace(
+        reduction_type=reduction_type,
+        inner_fn_opcount=lambda: SimpleNamespace(used_ops=set(used_ops)),
+    )
+    monkeypatch.setattr(dcm, "_transport_read_geometry", lambda *_: geometry)
+    with V.set_graph_handler(_StubGraph(inputs=[], outputs=[])):
+        feats = dcm.extract_op_features(op)
+    return feats.transport_compute_read, feats.transport_read_run_bytes
+
+
+def test_the_extractor_flags_an_arithmetic_read_and_not_a_copy_or_reduction(
+    monkeypatch,
+):
+    """Covers the wiring itself: the pricing tests build ``OpFeatures`` by hand, so
+    without this the extractor could stop setting ``transport_compute_read`` and every
+    other test would still pass."""
+    assert _transport_flags(monkeypatch, {"load", "tanh"}) == (True, 128)
+    assert _transport_flags(monkeypatch, {"load"}) == (False, 128)
+    # A reduction is not a one-input arithmetic read: it is never transport-priced.
+    assert _transport_flags(monkeypatch, {"load", "add"}, reduction_type="sum") == (
+        False,
+        None,
+    )
+    # No proven source run, nothing to price.
+    assert _transport_flags(monkeypatch, {"load", "tanh"}, geometry=(None, None)) == (
+        False,
+        None,
+    )
+
+
 def test_the_extractor_stamps_the_write_of_a_graph_output():
     graph = _StubGraph(inputs=["arg0_1"], outputs=["buf1"])
     assert _stamps(_extractable_op("buf1", ["arg0_1"]), graph)[("output", "op_buf1")]
@@ -770,11 +883,13 @@ def test_the_per_arg_io_breakdown_sums_to_its_own_total():
     """``LAST_IO`` feeds ``profile_ops.py``, whose printed lines ``parse_sweep_logs.py``
     reads back. Its per-arg ``hbm_counted`` must use the same accounting as the total it
     is printed beside -- a resident boundary arg is the case where the two can diverge."""
+    from torch_spyre._inductor import dump_cost_model as reports
+
     feats = [_reader("C", "buf1", resident={"arg0_1"})]
-    dcm._record_last_io(feats)
-    counted = sum(a["hbm_counted"] for o in dcm.LAST_IO["ops"] for a in o["args"])
+    reports._record_last_io(feats)
+    counted = sum(a["hbm_counted"] for o in reports.LAST_IO["ops"] for a in o["args"])
     # The clone-in load of the resident input, plus the write of the HBM output.
-    assert counted == dcm.LAST_IO["hbm_bytes"] == 2 * BYTES
+    assert counted == reports.LAST_IO["hbm_bytes"] == 2 * BYTES
 
 
 def _indirect_store(cores=1, is_lx=False, **kwargs):
