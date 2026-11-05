@@ -535,6 +535,87 @@ def adjust_it_space_for_sticks(
     return adjusted_space, max_elems
 
 
+def _padded_extent(
+    sym: Symbol,
+    extent_expr: Expr | int,
+    tensor_deps: list[TensorDep],
+) -> Expr:
+    """Return the padded extent ``sym`` can iterate to, or ``extent_expr`` to keep
+    the current one.
+
+    ``sym`` grows to ``p`` only if ``extent_expr`` is concrete, ``sym`` is not in
+    any dep's in-stick coordinate, and every occurrence of ``sym`` in every dep's
+    device coordinates is a whole coordinate (an identity access) whose
+    ``device_size`` is the same ``p`` greater than ``extent_expr``. Iterations
+    past ``extent_expr`` then land in each tensor's own padding. A dep that does
+    not read ``sym`` at all (a broadcast) does not constrain it.
+    """
+    if isinstance(extent_expr, int):
+        extent = extent_expr
+        extent_expr = sympy.Integer(extent_expr)
+    else:
+        if not extent_expr.is_Integer:
+            # Not a concrete dim
+            return extent_expr
+        extent = int(extent_expr)
+
+    grown_extent = None
+    for dep in tensor_deps:
+        if dep.device_coords[-1].has(sym):
+            return extent_expr
+
+        for coord, new_extent in zip(
+            dep.device_coords[:-1],
+            dep.layout.device_layout.device_size[:-1],
+            strict=True,
+        ):
+            if coord == sym:
+                if grown_extent is None:
+                    if new_extent <= extent:
+                        # This is not growing the iteration space.
+                        return extent_expr
+
+                    grown_extent = new_extent
+                elif grown_extent != new_extent:
+                    # The symbol occurs with different device sizes in
+                    # different deps (or, unlikely, with different device sizes
+                    # in different dimensions of the same dep).
+                    return extent_expr
+
+            elif coord.has(sym):
+                return extent_expr
+
+    return extent_expr if grown_extent is None else sympy.Integer(grown_extent)
+
+
+def adjust_it_space_for_padding(
+    it_space: dict[Symbol, Expr],
+    input_tds: list[TensorDep],
+    output_td: TensorDep,
+) -> dict[Symbol, Expr]:
+    """Return a copy of ``it_space`` with each padded output dim grown to its
+    padded device extent.
+
+    Only output coordinate vars are candidates; every other var, including
+    reduction vars, keeps its extent. See ``_padded_extent`` for when a
+    candidate grows.
+    """
+    candidates = {
+        sym
+        for coord in output_td.device_coords[:-1]
+        for sym in coord.free_symbols
+        if sym in it_space
+    }
+
+    adjusted_it_space = dict(it_space)
+    for sym in candidates:
+        adjusted_it_space[sym] = _padded_extent(
+            sym, it_space[sym], input_tds + [output_td]
+        )
+
+    return adjusted_it_space
+
+
 def _is_indirectly_accessed(td: TensorDep) -> bool:
     """Return whether td has a data-dependent indirect coordinate."""
     return any(coord.has(IndirectAccess) for coord in td.device_coords[:-1])

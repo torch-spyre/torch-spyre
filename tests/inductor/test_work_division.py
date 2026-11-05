@@ -112,6 +112,7 @@ from torch_spyre._inductor.work_division import (
     _matmul_multicast_penalty,
     _matmul_split_cost,
     _work_distribution_op,
+    adjust_it_space_for_padding,
     adjust_it_space_for_sticks,
     apply_splits,
     defer_work_division,
@@ -1196,6 +1197,130 @@ class TestMultiDimIterationSpaceSplit(unittest.TestCase):
                 [r0, r1],
                 allowed_splits={r0: frozenset({2}), r1: frozenset({2})},
             )
+
+
+def _with_padded_dim(td, sym, extent):
+    """Return ``td`` with the device dim it reads ``sym`` through grown to ``extent``.
+
+    The padding is device-only, as on a padded graph input: host size, strides
+    and ``valid_elements`` are unchanged.
+    """
+    k = td.device_coords.index(sym)
+    stl = td.layout.device_layout
+    device_size = list(stl.device_size)
+    device_size[k] = extent
+    padded = SpyreTensorLayout(
+        device_size, stl.stride_map, stl.device_dtype, stl.valid_elements
+    )
+    layout = FixedTiledLayout(
+        td.layout.device, td.layout.dtype, td.layout.size, td.layout.stride, padded
+    )
+    return TensorDep(dep=td.dep, layout=layout)
+
+
+class TestAdjustItSpaceForPadding(unittest.TestCase):
+    """``adjust_it_space_for_padding`` grows a non-stick output var to the padded
+    device extent only when every dep that reads it agrees on that extent."""
+
+    def setUp(self):
+        self.rows, self.cols = _isym("d0"), _isym("d1")
+        self.it_space = {self.rows: sympy.Integer(7), self.cols: sympy.Integer(64)}
+
+    def _dep(self, name, padded_rows=None):
+        """A ``[7, 64]`` access over (rows, cols), its row dim padded if asked."""
+        td = _tensor_dep(name, (7, 64), (self.rows, self.cols))
+        if padded_rows is None:
+            return td
+        return _with_padded_dim(td, self.rows, padded_rows)
+
+    def test_padded_input_and_output_grow_rows(self):
+        result = adjust_it_space_for_padding(
+            self.it_space, [self._dep("x", 8)], self._dep("out", 8)
+        )
+        self.assertEqual(result, {self.rows: 8, self.cols: 64})
+        # A copy: the caller's iteration space is untouched.
+        self.assertEqual(self.it_space[self.rows], 7)
+
+    def test_other_vars_keep_extent_and_order(self):
+        # k stands in for a reduction var: in it_space, in no output coordinate.
+        k = _isym("d2")
+        it_space = {self.rows: sympy.Integer(7), k: sympy.Integer(32)}
+        it_space[self.cols] = sympy.Integer(64)
+        result = adjust_it_space_for_padding(
+            it_space, [self._dep("x", 8)], self._dep("out", 8)
+        )
+        self.assertEqual(list(result), [self.rows, k, self.cols])
+        self.assertEqual(result[k], 32)
+        self.assertEqual(result[self.cols], 64)
+
+    def test_unpadded_output_keeps_rows(self):
+        # Iterating to 8 would write past the output's allocation.
+        result = adjust_it_space_for_padding(
+            self.it_space, [self._dep("x", 8)], self._dep("out")
+        )
+        self.assertEqual(result, self.it_space)
+
+    def test_disagreeing_padding_keeps_rows(self):
+        result = adjust_it_space_for_padding(
+            self.it_space, [self._dep("x", 8)], self._dep("out", 16)
+        )
+        self.assertEqual(result, self.it_space)
+
+    def test_broadcast_input_does_not_constrain(self):
+        bias = _tensor_dep("bias", (64,), (self.cols,))
+        result = adjust_it_space_for_padding(
+            self.it_space, [self._dep("x", 8), bias], self._dep("out", 8)
+        )
+        self.assertEqual(result[self.rows], 8)
+
+    def test_compound_access_after_padded_dep_keeps_rows(self):
+        # x[1:8] read from a [9, 64] buffer: rows appears as ``rows + 1``. It
+        # comes after a padded identity dep, which had already fixed p = 8.
+        shifted = TensorDep(
+            dep=MemoryDep(
+                "src",
+                64 * (self.rows + 1) + self.cols,
+                (self.rows, self.cols),
+                (7, 64),
+            ),
+            layout=_fixed_tiled_layout((9, 64)),
+        )
+        result = adjust_it_space_for_padding(
+            self.it_space, [self._dep("x", 8), shifted], self._dep("out", 8)
+        )
+        self.assertEqual(result, self.it_space)
+
+    def test_var_in_a_stick_coordinate_keeps_extent(self):
+        # out[c, r] = x[r, c]: c is a padded non-stick dim of the output (64 ->
+        # 72) but x's stick dim, so iterating past 64 would leave x's sticks.
+        c, r = self.cols, self.rows
+        out = _with_padded_dim(_tensor_dep("out", (64, 7), (c, r)), c, 72)
+        x = TensorDep(
+            dep=MemoryDep("x", 64 * r + c, (c, r), (64, 7)),
+            layout=_fixed_tiled_layout((7, 64)),
+        )
+        it_space = {c: sympy.Integer(64), r: sympy.Integer(7)}
+        self.assertEqual(adjust_it_space_for_padding(it_space, [x], out), it_space)
+
+    def test_symbolic_extent_keeps_extent(self):
+        s0 = _isym("s0")
+        it_space = {self.rows: s0, self.cols: sympy.Integer(64)}
+        result = adjust_it_space_for_padding(
+            it_space, [self._dep("x", 8)], self._dep("out", 8)
+        )
+        self.assertEqual(result, it_space)
+
+    def test_plain_int_extents(self):
+        # Some callers build iteration spaces with Python ints, not sympy.
+        it_space = {self.rows: 7, self.cols: 64}
+        grown = adjust_it_space_for_padding(
+            it_space, [self._dep("x", 8)], self._dep("out", 8)
+        )
+        self.assertEqual(grown, {self.rows: 8, self.cols: 64})
+        kept = adjust_it_space_for_padding(
+            it_space, [self._dep("x", 8)], self._dep("out")
+        )
+        self.assertEqual(kept, it_space)
 
 
 class TestWorkDivisionCandidates(unittest.TestCase):
