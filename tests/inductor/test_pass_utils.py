@@ -32,6 +32,7 @@ from torch.utils._ordered_set import OrderedSet
 from torch_spyre._C import SpyreTensorLayout
 
 import torch_spyre._inductor.pass_utils as pass_utils
+from torch_spyre._inductor.propagate_layouts import PropArg
 from torch_spyre._inductor.patches import _unique_operation_names
 from torch_spyre._inductor.wrapper import noop_simplify_loops_impl
 
@@ -378,9 +379,11 @@ def test_compute_restickify_target_layout_moves_to_existing_size1_dim():
     # outer dim's coordinate is the same constant as the host's size-1 dim.
     stl = SpyreTensorLayout([1, 64], [64, 1], torch.float16, [0, 1])
     idc = [sympy.S.Zero, d1]
+    dep = MemoryDep("x", d1, (d1,), (64,))
+    arg = PropArg(dep, host_layout, [stl])
 
     result = pass_utils.compute_restickify_target_layout(
-        stl, host_layout, sympy.S.Zero, ic, idc
+        stl, host_layout, sympy.S.Zero, ic, idc, arg=arg
     )
 
     assert result is not None
@@ -400,8 +403,10 @@ def test_compute_restickify_target_layout_synthesizes_when_no_size1_dim_exists()
     ic = pass_utils.host_coordinates(host_layout, dep, None)
     idc = pass_utils.device_coordinates(stl, dep, None)
 
+    arg = PropArg(dep, host_layout, [stl])
+
     result = pass_utils.compute_restickify_target_layout(
-        stl, host_layout, sympy.S.Zero, ic, idc
+        stl, host_layout, sympy.S.Zero, ic, idc, arg=arg
     )
 
     assert result is not None
