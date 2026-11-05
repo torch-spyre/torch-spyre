@@ -910,7 +910,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         # _general_tile_advance's docstring), which that method folds into
         # device_tile_advance_expr below. Pin every splice loop_var to trip
         # zero in the base coordinates so the raw unbacked symbol neither
-        # leaks into the OpSpec iteration space nor applies the same00
+        # leaks into the OpSpec iteration space nor applies the same
         # advance a second time.
         device_tile_advance_expr = self._general_tile_advance(tensor, is_input, name)
         base_index = per_trip_index(operation, tensor.index)
@@ -928,7 +928,6 @@ class SpyreKernel(Kernel[CSEVariable]):
             it_space,
             allow_extended=_spyre_config.lx_extended_ownership,
         )
-
         tensor_arg = TensorArg(
             is_input,
             -1,
@@ -1472,7 +1471,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                 or (not isinstance(value.arguments[1], TensorAccess))
             ):
                 raise Unsupported(f"invalid {value.op} arguments {value.arguments}")
-            x: TensorAccess = value.arguments[0]
+            x = value.arguments[0]
             y = value.arguments[1]
             args = [
                 self.create_tensor_arg(True, x.name, x),
