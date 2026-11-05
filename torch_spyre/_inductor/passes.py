@@ -93,6 +93,7 @@ from .scheduler import (
 )
 from .constants import DEVICE_NAME
 from .deadcode_elimination import deadcode_elimination
+from .loop_carries import apply_loop_carries
 from .loop_node import (
     OpsView,
     all_ops,
@@ -585,6 +586,29 @@ class CustomPreSchedulingPasses:
             #
             # Tensor Layout (Stickification)
             split_multi_ops,
+            # Loop carries: splice_while_loops declares each accumulator carry
+            # (a LoopCarryRecord) and leaves its update pure; this makes the
+            # update an in-place write of the carry's storage. It runs here,
+            # just before propagation, because every pass that treats a
+            # mutation carry differently runs from propagation on (layout
+            # choice, restickify, work division, LX/HBM planning), and they
+            # then see exactly the in-place form the splice used to make.
+            # Moving it later costs LX footprint: propagation would choose the
+            # update's layout freely instead of tying it to the storage.
+            #
+            # The passes that run between the splice and this one see a carry
+            # update with a plain FixedLayout and no mutation form. Audited by
+            # reading each for a branch on the layout class or the carry
+            # record: deadcode_elimination (reads the record and keeps a
+            # declared update live), the three contraction gates in
+            # for_each_tile_lowering (guarded, see _is_declared_carry_update),
+            # propagate_named_dims / validate_named_dims / assign_dim_hints
+            # (no reference to either), insert_bmm_padding (padding.py: only
+            # its own fill/copy ops), and split_multi_ops (accepts FixedLayout
+            # and MutationLayoutSHOULDREMOVE alike). Not audited by a test
+            # that exercises every one with a carry: add a pass here only
+            # after checking it the same way.
+            apply_loop_carries,
             propagate_spyre_tensor_layouts,
             validate_ops,
             optimize_restickify_locations,
