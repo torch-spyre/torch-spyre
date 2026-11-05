@@ -44,9 +44,11 @@ from torch_spyre._inductor.op_spec import OpSpec, TensorArg
 __all__ = [
     "PARALLEL",
     "REDUCTION",
+    "NeedsRelayout",
     "align_reshape_plan",
     "buf_id",
     "core_divisions",
+    "needs_relayout",
     "per_core_extent",
     "placeholder_axes",
     "reduction_indexing",
@@ -163,6 +165,22 @@ def _dim_info(coord: sympy.Expr) -> tuple[str, sympy.Symbol | None]:
     )
 
 
+class NeedsRelayout(NotImplementedError):
+    """An operand that no reshape or broadcast lines up with the output.
+
+    Raised by ``align_reshape_plan`` in exactly two cases: the operand's device
+    axes are a permutation of the output's (the matched axes are out of order),
+    or one of its data-carrying axes matches no output axis (a symbol is split
+    into stick and lane on one side and not on the other, i.e. the stick moved).
+    Both need the operand's elements MOVED, which a map cannot say.
+
+    A subclass of ``NotImplementedError`` so that callers that only want "this
+    operand is refused" keep catching it, while ``needs_relayout`` can tell it
+    apart from the other refusals of alignment (a coordinate form ``_dim_info``
+    cannot classify), which are not relayouts and must stay errors.
+    """
+
+
 def align_reshape_plan(
     in_coords: list[sympy.Expr],
     in_block: list[int],
@@ -187,9 +205,11 @@ def align_reshape_plan(
     Returns ``None`` when the operand already matches the output (fast path:
     no reshape / broadcast emitted, keeping simple kernels byte-identical).
 
-    Raises ``NotImplementedError`` for a cross-stick transpose (an input axis
-    with extent > 1 that no output axis matches, or matched axes that would need
-    a permute) -- that needs a restickify, not a reshape.
+    Raises ``NeedsRelayout`` for a cross-stick transpose (an input axis with
+    extent > 1 that no output axis matches, or matched axes that would need a
+    permute) -- that needs a restickify, not a reshape.  Raises a plain
+    ``NotImplementedError`` (from ``_dim_info``) for a coordinate form it cannot
+    classify.
     """
     in_block = [int(b) for b in in_block]
     out_block = [int(b) for b in out_block]
@@ -223,7 +243,7 @@ def align_reshape_plan(
     # axes must appear in increasing order.  If not, the operand would need a
     # transpose (restickify) to align -- not supported on this path.
     if any(matched_seq[i] >= matched_seq[i + 1] for i in range(len(matched_seq) - 1)):
-        raise NotImplementedError(
+        raise NeedsRelayout(
             "OpSpec alignment: pointwise operand needs a transpose (restickify) "
             "to align device axes; not supported yet"
         )
@@ -236,12 +256,42 @@ def align_reshape_plan(
     if prod_in != prod_reshape:
         # An input axis with extent > 1 was dropped -> real data would be lost;
         # aligning it needs a cross-stick transpose (restickify).
-        raise NotImplementedError(
+        raise NeedsRelayout(
             "OpSpec alignment: pointwise operand needs a cross-stick transpose "
             "(restickify) to align device axes; not supported yet"
         )
     broadcast_to = out_block if reshape_to != out_block else None
     return (reshape_to, broadcast_to)
+
+
+def needs_relayout(source: TensorArg, out: TensorArg) -> bool:
+    """Whether ``source``'s elements must be moved to line up with ``out``'s.
+
+    True exactly when ``align_reshape_plan`` raises ``NeedsRelayout`` for the
+    pair: their device axes are permuted, or a stick split differs.  False when
+    a reshape or broadcast (or nothing) lines them up.  Any other refusal of
+    alignment propagates, because it is not a relayout.
+
+    Built on ``align_reshape_plan`` rather than a separate test so that the
+    pointwise path and this detector cannot disagree: every operand the pointwise
+    path refuses as needing a restickify is detected here, and no other.  It is
+    a necessary condition for ``relayout_strides``, not a sufficient one -- a
+    padded stick or a broadcast combined with a transpose is detected here and
+    then refused by ``relayout_strides`` with its own message.
+
+    Per operand, not per op: a pointwise op with several inputs may need a
+    relayout on any subset of them.
+    """
+    try:
+        align_reshape_plan(
+            list(source.device_coordinates),
+            [int(s) for s in source.device_size],
+            list(out.device_coordinates),
+            [int(s) for s in out.device_size],
+        )
+    except NeedsRelayout:
+        return True
+    return False
 
 
 def operand_indexing(

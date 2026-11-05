@@ -69,6 +69,7 @@ from torch_spyre._inductor.codegen.opspec_utils import (
     align_reshape_plan,
     buf_id,
     core_divisions,
+    needs_relayout,
     operand_indexing,
     per_core_extent,
     placeholder_axes,
@@ -78,12 +79,19 @@ from torch_spyre._inductor.codegen.opspec_utils import (
 )
 from torch_spyre._inductor.constants import (
     ABSMAX_OP,
+    IDENTITY_OP,
     MAX_POOL_SIZE_BYTES,
     RESTICKIFY_OP,
     STAGGERED_EAS,
 )
 from torch_spyre._inductor.logging_utils import get_inductor_logger
-from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
+from torch_spyre._inductor.op_spec import (
+    LoopSpec,
+    OpSpec,
+    TensorArg,
+    UnimplementedOp,
+    is_lx_relayout_identity,
+)
 from torch_spyre._inductor.pass_utils import coeff_through_floor
 
 # The module's one logger, and the reason it has one is ``PlanFusion``: a table
@@ -1748,9 +1756,27 @@ class KernelPlan:
         emission has nothing left to derive.
         """
         recipe = KtirBuilder.RECIPES[spec.op]
-        if recipe.relayout:
-            return self._relayout_step(spec, loops, stage)
         out, inputs = validated_roles(spec)
+        if is_lx_relayout_identity(spec.op, spec.args, spec.op_info):
+            # A planner-certified move between LX owners: the elements change
+            # cores, not addresses within one buffer, so neither a copy nor a
+            # strided view states it.
+            _unimplemented(
+                "lx-relayout",
+                f"{spec.op!r} moves {inputs[0].name!r} between scratchpad owners; "
+                "a core-to-core relayout is not emitted",
+            )
+        # Whether the operand has to be MOVED is read off the operands, and whether
+        # the op may be emitted as that move is read off the recipe: a copy is the
+        # only op whose payload survives being replaced by a strided read.  A
+        # compute op on a permuted operand falls through and is refused by the
+        # pointwise path's alignment, rather than losing its compute.
+        if recipe.copy and needs_relayout(inputs[0], out):
+            return self._relayout_step(spec, loops, stage)
+        if recipe.copy:
+            # A copy that a reshape or broadcast lines up still has to reach
+            # memory in the same formats as the relayout does.
+            self._check_copy_operands(spec, out, inputs[0])
         dtype = dtype_of(spec)
         for arg in inputs:
             # In-place (input buffer aliases the output) is not supported yet.
@@ -1930,6 +1956,38 @@ class KernelPlan:
             store=not is_threaded(out),
         )
 
+    @staticmethod
+    def _check_copy_operands(spec: OpSpec, out: TensorArg, source: TensorArg) -> None:
+        """Refuse a copy op whose operands a copy has not been run with.
+
+        Asked of every copy recipe (``Recipe.copy``), whichever path builds its
+        step, so that whether an identity's operands happen to need a relayout
+        does not decide whether a threaded, fused-arrangement or non-fp16 copy is
+        let through.  Both buffers must reach memory, at fp16, in the standard
+        element arrangement.
+        """
+        for arg in (source, out):
+            if is_threaded(arg):
+                _unimplemented(
+                    "relayout-threaded",
+                    f"{spec.op!r} operand {arg.name!r} is threaded; a relayout "
+                    "reads and writes memory",
+                )
+            if _arrangement(arg) not in (None, ElementArrangement.STANDARD):
+                _unimplemented(
+                    "relayout-element-arrangement",
+                    f"{spec.op!r} operand {arg.name!r} has element arrangement "
+                    f"{_arrangement(arg)!r}",
+                )
+        dtype = dtype_of(spec)
+        if dtype != DataFormats.SEN169_FP16:
+            # The payload would serve any format; the backend's transpose
+            # lowering has only been run at fp16.
+            _unimplemented(
+                "relayout-format",
+                f"{spec.op!r} at {dtype.name}; a relayout is emitted at fp16 only",
+            )
+
     def _relayout_step(
         self, spec: OpSpec, loops: Sequence[LoopSpec], stage: int
     ) -> ComputeStep:
@@ -1961,19 +2019,7 @@ class KernelPlan:
                 f"{spec.op!r} is tiled or work-divided; a relayout is emitted over "
                 "one whole, undivided iteration space (SENCORES=1)",
             )
-        for arg in (source, out):
-            if is_threaded(arg):
-                _unimplemented(
-                    "relayout-threaded",
-                    f"{spec.op!r} operand {arg.name!r} is threaded; a relayout "
-                    "reads and writes memory",
-                )
-            if _arrangement(arg) not in (None, ElementArrangement.STANDARD):
-                _unimplemented(
-                    "relayout-element-arrangement",
-                    f"{spec.op!r} operand {arg.name!r} has element arrangement "
-                    f"{_arrangement(arg)!r}",
-                )
+        self._check_copy_operands(spec, out, source)
         ranges = {}
         for sym, (count, _div) in spec.iteration_space.items():
             count = _static(count)
@@ -1983,13 +2029,6 @@ class KernelPlan:
                     "relayout's ranges must be whole numbers"
                 )
             ranges[sym] = count
-        if dtype != DataFormats.SEN169_FP16:
-            # The payload would serve any format; the backend's transpose
-            # lowering has only been run at fp16.
-            _unimplemented(
-                "relayout-format",
-                f"{spec.op!r} at {dtype.name}; a relayout is emitted at fp16 only",
-            )
         recipe.arm(dtype)
         extent, in_strides, out_strides = relayout_strides(
             list(source.device_coordinates),
@@ -2625,6 +2664,18 @@ def _written_here(fold: Callable[..., Any]) -> Callable[[], Callable[..., Any]]:
     return lambda: fold
 
 
+def _copy_recipe() -> Recipe:
+    """A recipe whose payload yields its one operand: ``Recipe(copy=True)``.
+
+    One constructor for every op that is a copy, so their recipes cannot drift.
+    """
+    return Recipe(
+        arity=1,
+        copy=True,
+        arms=Arm(kind=BindingKind.PAYLOAD, binding=_written_here(lambda x: x)),
+    )
+
+
 def _arms(arms: Arm | tuple[Arm, ...]) -> tuple[Arm, ...]:
     """\\p arms as a tuple, whether it was written as one arm or several.
 
@@ -2774,13 +2825,14 @@ class Recipe:
     # binds it as an INSTANCE attribute, and instance attributes are not
     # descriptors, so ``self.dispatch(arms, request)`` passes no ``self``.
     dispatch: Dispatch = request_by_dtype
-    # Whether the op MOVES elements between two layouts rather than computing
-    # them.  A relayout's operand and result order their device axes
-    # differently, so neither alignment nor a broadcast map can line them up;
-    # its step is built by ``KernelPlan._relayout_step`` instead, which puts the
-    # whole layout change into the input view's strides and leaves the compute
-    # an identity.
-    relayout: bool = False
+    # Whether the payload yields its single operand unchanged.  This says what
+    # the op COMPUTES, not which path builds its step: whether the operand has to
+    # be moved is a fact about the operands, which ``needs_relayout`` reads off
+    # them per spec.  When it does, ``KernelPlan._relayout_step`` puts the whole
+    # layout change into the input view's strides and leaves the compute an
+    # identity -- sound only because the payload IS an identity, which is why a
+    # compute op on a permuted operand is refused instead of routed there.
+    copy: bool = False
 
     def __post_init__(self) -> None:
         if self.arity < 1:
@@ -2821,6 +2873,11 @@ class Recipe:
                 f"{self.arity})"
             )
         object.__setattr__(self, "arms", arms)
+        if self.copy and (self.arity != 1 or self.reduces):
+            raise ValueError(
+                "OpSpec->KTIR: a copy recipe passes one operand through, so it "
+                f"takes arity 1 and does not reduce; got arity {self.arity}"
+            )
 
     @property
     def reduces(self) -> bool:
@@ -3678,15 +3735,14 @@ class KtirBuilder:
             arity=2,
             arms=Arm(kind=BindingKind.PAYLOAD, binding=lambda: spyreop.realdiv),
         ),
-        # A transpose that moves the stick dim.  It is a copy once the input is
-        # viewed in the output's order, so the payload yields its operand.  The
-        # payload is format-free; which formats the plan lets through is
-        # ``_relayout_step``'s business.
-        RESTICKIFY_OP: Recipe(
-            arity=1,
-            relayout=True,
-            arms=Arm(kind=BindingKind.PAYLOAD, binding=_written_here(lambda x: x)),
-        ),
+        # The two copies.  A restickify is a transpose that moves the stick dim;
+        # ``identity`` is the same data movement when it arrives under the
+        # generic name (or a plain copy, when its operands already line up).
+        # Neither recipe says which path builds the step: ``needs_relayout``
+        # reads that off the operands.  The payload is format-free; which formats
+        # the plan lets through is ``_check_copy_operands``' business.
+        RESTICKIFY_OP: _copy_recipe(),
+        IDENTITY_OP: _copy_recipe(),
     }
 
     # -- emission surfaces -------------------------------------------------
