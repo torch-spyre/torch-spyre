@@ -749,8 +749,8 @@ def _row_index(self, indices):
             "int32/int64 index tensor on dim 0"
         )
     if self.dtype == torch.bool:
-        # The device copy of a bool tensor drops its values, so a gather or a
-        # broadcast would return wrong rows without an error.
+        # TODO(#6043): the device copy of a bool tensor drops its values, so a
+        # gather or a broadcast would return wrong rows without an error.
         raise NotImplementedError(
             "Spyre aten::index.Tensor does not support bool source tensors"
         )
@@ -791,6 +791,9 @@ def spyre__index_tensor(self, indices):
     ``index_select`` compiles once per index length and source shape and layout
     (``dynamic=False``), so a caller that sees many lengths should pad the index
     onto a fixed set of them.
+
+    Eager only: the path choice reads the source's device layout, which a
+    FakeTensor does not have.
     """
     index = _row_index(self, indices)
     if index.numel() == 0:

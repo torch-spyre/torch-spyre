@@ -131,8 +131,9 @@ def test_trailing_dims_are_kept():
 
 
 @pytest.mark.parametrize("rows", [[0], [0, 0], [0, -1, 0]], ids=str)
-def test_one_row_source(rows):
-    x, dx = _to_device(torch.randn(1, HIDDEN, dtype=DTYPE))
+@pytest.mark.parametrize("shape", [(1, HIDDEN), (1,), (1, 1), (1, 4, 64)], ids=str)
+def test_one_row_source(shape, rows):
+    x, dx = _to_device(torch.randn(shape, dtype=DTYPE))
     index = torch.tensor(rows)
 
     got = dx[index]
@@ -182,8 +183,8 @@ def test_equal_one_row_views_with_other_singleton_strides(make_source, rows):
 
 @pytest.mark.parametrize("shape", [(1, 64), (8, 64)], ids=str)
 def test_bool_source_raises(shape):
-    # TODO: the device copy of a bool tensor loses its values; when it is fixed,
-    # bool sources must move to the positive tests above.
+    # TODO(#6043): the device copy of a bool tensor loses its values; when it is
+    # fixed, bool sources must move to the positive tests above.
     dx = (torch.arange(64 * shape[0]).reshape(shape) % 2 == 0).to(DEVICE)
     with pytest.raises(NotImplementedError, match="bool source"):
         dx[torch.tensor([0, 0])]
