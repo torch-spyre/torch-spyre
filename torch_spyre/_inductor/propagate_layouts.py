@@ -42,7 +42,7 @@ from torch._inductor.ir import (
 )
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
-from torch._inductor.scheduler import SchedulerNode
+from torch._inductor.scheduler import FusedSchedulerNode, SchedulerNode
 from torch._inductor.virtualized import V
 
 from . import config
@@ -60,6 +60,7 @@ from .dtype_ops import (
     DtypeOpTable,
 )
 from .errors import Unsupported
+from .sharded_hbm import check_sharded_input, graph_placements, placement_from_tensor
 from .constants import (
     BATCH_MATMUL_OP,
     BATCH_MATMUL_FP8_OP,
@@ -67,6 +68,7 @@ from .constants import (
     COPY_BACK_CANDIDATE_ATTR,
     DEVICE_NAME,
     ELIDED_COPY_BACK_ATTR,
+    MATMUL_REDUCTION_OPS,
     REDUCTIONS_NON_STICK_DIM_ONLY,
     STAGGERED_EAS,
 )
@@ -209,6 +211,18 @@ def infer_bool_device_dtype(args: list[PropArg]) -> DataFormats:
         )
     (device_dtype,) = formats
     return device_dtype
+
+
+def arg_dtype_for_layout(arg: PropArg) -> torch.dtype:
+    """Logical dtype whose stick size matches ``arg``'s physical format.
+
+    A torch.bool operand takes it from its producer's format (fp32-backed bools
+    hold 32 elements per stick, not the 64 that ``torch.bool`` implies).
+    Reads only ``arg.layouts[0]``: both callers handle single-layout operands only.
+    """
+    if arg.layout.dtype != torch.bool or not arg.layouts:
+        return arg.layout.dtype
+    return bool_layout_dtype(arg.layouts[0].device_dtype, "operand")
 
 
 def _compute_dim_order(stick_dim, size, coords):
@@ -653,22 +667,23 @@ def _convert_layout(
             in_coords = host_coordinates(in_layout, dep, None)
             source_device_coords = device_coordinates(stl, dep, None)
             staggered_arg = PropArg(dep, in_layout, [stl])
-            for target_stick_expr in in_coords:
-                if not target_stick_expr.free_symbols:
-                    continue
-                target_stl = compute_restickify_target_layout(
-                    stl,
-                    in_layout,
-                    target_stick_expr,
-                    in_coords,
-                    source_device_coords,
-                    arg=staggered_arg,
-                )
-                if target_stl is None:
-                    continue
-                candidate = rescale_stl_for_dtype(target_stl, output.dtype, fmt)
-                if candidate not in layouts:
-                    layouts.append(candidate)
+            if source_device_coords[-1].free_symbols:
+                for target_stick_expr in in_coords:
+                    if not target_stick_expr.free_symbols:
+                        continue
+                    target_stl = compute_restickify_target_layout(
+                        stl,
+                        in_layout,
+                        target_stick_expr,
+                        in_coords,
+                        source_device_coords,
+                        arg=staggered_arg,
+                    )
+                    if target_stl is None:
+                        continue
+                    candidate = rescale_stl_for_dtype(target_stl, output.dtype, fmt)
+                    if candidate not in layouts:
+                        layouts.append(candidate)
 
         # Under the current EA map, an already-staggered input is the
         # reverse staggered-to-STANDARD restoration. It needs no
@@ -1056,7 +1071,6 @@ def _factorized_chain(
     host_size: list,
     host_stride: list,
     var: sympy.Symbol,
-    reduction_type: str,
     label: str,
 ) -> tuple[list[int], int, int]:
     """Validate the host dims that jointly carry ``var`` as one contiguous chain.
@@ -1109,7 +1123,7 @@ def _factorized_chain(
         or host_stride[chain[-1]] != var_stride
     ):
         raise Unsupported(
-            f"{reduction_type}: cannot canonicalize factorized {label}_var="
+            f"cannot canonicalize factorized {label}_var="
             f"{var}; expected an affine contiguous host dimension chain "
             f"covering a window of whole inner dims, got host coordinates "
             f"{host_coords}, size={list(arg.layout.size)}, "
@@ -1178,7 +1192,7 @@ def _rebuild_stl_for_matmul(
         if var is None:
             continue
         hdims, _, var_stride = _factorized_chain(
-            arg, host_coords, host_size, host_stride, var, reduction_type, label
+            arg, host_coords, host_size, host_stride, var, label
         )
         if len(hdims) == 1 and not is_stick:
             continue
@@ -1386,6 +1400,11 @@ def _stl_via_restickify(
         if target_stick_expr is None:
             continue
         stl, dev_coords = _prepare_for_restickify(stl, dev_coords, reduction_type)
+        if (
+            not dev_coords[-1].free_symbols
+            and reduction_type not in MATMUL_REDUCTION_OPS
+        ):
+            continue
         result = compute_restickify_target_layout(
             stl,
             arg.layout,
@@ -1393,7 +1412,6 @@ def _stl_via_restickify(
             arg_host_coords,
             dev_coords,
             arg=arg,
-            reduction_type=reduction_type,
             label=label,
         )
         if result is not None:
@@ -1966,7 +1984,7 @@ def _multi_arg_pointwise_layouts(
                 arg_coors != out_coords
                 or arg.layout.size != output.size
                 or arg.dep.index != output_dep.index
-                or not same_device_size(arg.layout.dtype, out_dtype_for_layout)
+                or not same_device_size(arg_dtype_for_layout(arg), out_dtype_for_layout)
             ):
                 can_use_same_layout = False
                 break
@@ -2064,14 +2082,14 @@ def _multi_arg_pointwise_layouts(
             # whose index is exactly the same expression as the output's qualify
             # as same-frame candidates for in-place layout reuse.
             or arg.dep.index != output_dep.index
-            or not same_device_size(arg.layout.dtype, output.dtype)
+            or not same_device_size(arg_dtype_for_layout(arg), out_dtype_for_layout)
         ):
             continue
         src_stl = next(iter(arg.layouts))
         candidate = SpyreTensorLayout(
             src_stl.device_size,
             src_stl.stride_map,
-            get_device_dtype(output.dtype),
+            out_device_dtype,
         )
         if (
             math.prod([s for s in candidate.device_size if s > 0])
@@ -3298,9 +3316,33 @@ def propagate_spyre_tensor_layouts(
                     )
                     tb.layouts = [stl]
         else:
-            for name, real_input in zip(graph.graph_input_names, V.get_real_inputs()):
+            real_inputs = V.get_real_inputs()
+            # Sharding is resolved only from real inputs below; a mismatched
+            # length would silently zip-truncate and let a sharded input
+            # compile as unified storage, so fail closed instead.
+            if len(real_inputs) != len(graph.graph_input_names):
+                raise Unsupported(
+                    f"graph has {len(graph.graph_input_names)} inputs but "
+                    f"{len(real_inputs)} real inputs; cannot resolve sharding"
+                )
+            for name, real_input in zip(graph.graph_input_names, real_inputs):
                 if isinstance(real_input, torch.Tensor):
                     stl = real_input.device_tensor_layout()
+                    placement = (
+                        placement_from_tensor(real_input) if stl is not None else None
+                    )
+                    if placement is not None:
+                        # Sharded storage carries the shard-local layout; the
+                        # graph sees the global tensor, so plan with its global
+                        # layout and record the sharding by buffer name. Only a
+                        # base tensor whose storage holds exactly the shards of
+                        # its own shape qualifies: a view keeps the base's
+                        # shard layout, which no longer matches its shape.
+                        check_sharded_input(name, real_input, placement, stl)
+                        stl = SpyreTensorLayout(
+                            list(real_input.shape), real_input.dtype
+                        )
+                        graph_placements(graph)[name] = placement
                     if stl is None:
                         # A CPU tensor lifted as a graph input, or a host tensor
                         # feeding a FallbackKernel has no Spyre layout;
@@ -3477,13 +3519,18 @@ def propagate_spyre_tensor_layouts(
                 logger.warning(f"Warning: unhandled node type {type(op.data)}")
         elif isinstance(op, FallbackKernel):
             # FallbackKernel.create in PyTorch produces three cases:
-            #   Case 1 (single tensor)  -> MultiOutputLayout + 1 MultiOutput
+            #   Case 1 (single tensor)  -> FixedLayout on the FallbackKernel itself
+            #                              (PT >= 2.14, pytorch#184279; older
+            #                              versions used MultiOutputLayout + 1
+            #                              MultiOutput)
             #   Case 2 (tuple of N)     -> MultiOutputLayout + N MultiOutputs
             #   Case 3 (void/in-place)  -> NoneLayout       + 0 MultiOutputs
-            # The FallbackKernel itself never carries a real tensor layout
-            # (MultiOutputLayout / NoneLayout both raise from get_layout()).
-            # The trailing MultiOutputs are handled in their own branch below.
-            pass
+            # Case 1 is laid out like a MultiOutput; in cases 2 and 3 the
+            # FallbackKernel carries no real tensor layout and the trailing
+            # MultiOutputs are handled in their own branch below.
+            if isinstance(op.layout, FixedLayout):
+                op.layouts = [generic_layout(op)]
+                op.restick_cost_fn = AnyInNode.from_args()
         elif isinstance(op, MultiOutput):
             op.layouts = [generic_layout(op)]
             op.restick_cost_fn = AnyInNode.from_args()
@@ -3652,6 +3699,15 @@ def _clean_mutation_op_output_layout(node: ComputedBuffer) -> FixedLayout:
     )
 
 
+def _leaf_scheduler_nodes(nodes):
+    """Every node in ``nodes``, descending into ``FusedSchedulerNode``s."""
+    for n in nodes:
+        if isinstance(n, FusedSchedulerNode):
+            yield from _leaf_scheduler_nodes(n.get_nodes())
+        else:
+            yield n
+
+
 def propagate_mutation_layouts(
     nodes: list,
 ) -> list:
@@ -3663,8 +3719,12 @@ def propagate_mutation_layouts(
     mutation layout during its initialisation to set up mutation tracking.
     This pass runs as a _pre_fusion_custom_pass (after scheduler init) to
     assign FixedTiledLayout to those remaining mutation ops.
+
+    A counted loop reaches this pass as one ``LoopSchedulerNode`` (a
+    ``FusedSchedulerNode``); its body's mutation ops are handled like any
+    other, so the pass descends into it.
     """
-    for n in nodes:
+    for n in _leaf_scheduler_nodes(nodes):
         if not (isinstance(n, SchedulerNode) and isinstance(n.node, ComputedBuffer)):
             continue
         if not isinstance(n.node.layout, MutationLayoutSHOULDREMOVE):

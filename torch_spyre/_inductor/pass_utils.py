@@ -75,7 +75,6 @@ from .core_mapping import (
     decompose_fused_split_view,
 )
 from .constants import (
-    BATCH_MATMUL_OP,
     ELIDED_COPY_BACK_ATTR,
     KEEP_BY_INDEX_OP,
     MATMUL_REDUCTION_OPS,
@@ -85,6 +84,7 @@ from .constants import (
 from .ir import FixedTiledLayout, SpyreConstantFallback
 from .logging_utils import get_inductor_logger
 from .loop_info import copy_op_metadata
+from .loop_node import LoopNode, all_ops
 from .pass_counters import (
     COUNTERS,
     DEVICE_COORDINATES,
@@ -380,7 +380,12 @@ def finite_upper_or_none(expr: Expr) -> Optional[int]:
 
 
 def compute_granularity(expr: Expr, max_size: int) -> int:
-    """Return the granularity for a symbolic dimension.
+    """Return the granularity for a symbolic dimension. SDSC route only.
+
+    Deprecated. The explicit-loop route supersedes this one and never calls it:
+    there G comes from ``for_each_tile(tile_size=G)`` through the trip count, so
+    the bundle's declared granularity and the loop's own step cannot disagree.
+    TODO(issue#5890): remove with the rest of the symbolic-SDSC route.
 
     Admissible runtime values are ``{G, 2G, ..., max_size}``. If the
     user passed ``mark_dynamic(min=...)`` we honour it after validation;
@@ -1694,23 +1699,6 @@ def _find_entry_output_dim(op) -> "tuple[int, int, int] | None":
     return None
 
 
-def is_output_stick_aligned_for_entry(op) -> bool:
-    """Whether a gather output already holds a whole-stick slice for its entry dim.
-
-    The work-division guard uses this to decide the partial-last-stick split:
-    True means the stick-aligned split is legal (the output extent is a multiple
-    of the index ``eps`` -- either naturally, or because the padding pass grew
-    it); False means keep the split forbidden. Returns False for anything that is
-    not a paddable gather entry (scatter, non-committed layout), so the guard
-    stays conservative.
-    """
-    found = _find_entry_output_dim(op)
-    if found is None:
-        return False
-    eps, _out_pos, out_extent = found
-    return out_extent % eps == 0
-
-
 def padded_entry_output_stl(op) -> "SpyreTensorLayout | None":
     """The gather output's device layout grown so the entry dim is a whole stick.
 
@@ -1827,25 +1815,16 @@ def indirect_forbidden_split_syms(op: "ComputedBuffer") -> set[Symbol]:
     1. **Shared-table data dims** — the non-row dims of a shared gather/scatter
        table must not advance per core (all cores share the same base address).
 
-    2. **Partial-last-stick entry dims** — splitting a partial last index stick
-       across cores straddles the stick boundary. Forbidden unless the gather
-       output was already padded to a stick boundary by
-       ``enforce_indirect_access_layout``, which makes the split safe. Scatter
-       output rows are chosen at runtime so can never be padded; they stay unsplit.
+    2. **Partial-last-stick entry dims** — an index-entry dim whose count is not
+       a whole number of index sticks stays on one core, for gathers and
+       scatters alike. Work division splits the entry dim in whole index
+       sticks, so the last core would iterate the padding lanes of the index's
+       last stick and use whatever they hold as rows; an invalid value faults
+       the card.
     """
     syms = shared_indirect_data_syms(op)  # (1)
 
-    # (2) Forbid a partial-last-stick index-entry dim UNLESS the gather output is
-    # provably stick-aligned for it. The partial check keys off the INDEX's
-    # *logical* entry count (d.ranges[stick_var], e.g. 40), which is never padded
-    # -- the stick-alignment fix grows the gather OUTPUT's device_size, not the
-    # index. is_output_stick_aligned_for_entry reads that (possibly padded)
-    # output extent, so the split is allowed only when the output can hold a
-    # whole-stick slice. It stays forbidden when the output is NOT aligned: a
-    # SCATTER (its in-place dest can't be resized -> returns False) or a gather
-    # whose output the pass could not grow -- those fall back to a single core,
-    # not miscompile. Applies to BOTH gather and scatter
-    output_aligned = is_output_stick_aligned_for_entry(op)
+    # (2) keys off the index's logical entry count (d.ranges[stick_var]).
     subs = indirect_access_subs_from_op(op)
     index_names = {e.args[0].name for e in subs.values() if e.args}
     for d in op.get_read_writes().reads:
@@ -1860,7 +1839,7 @@ def indirect_forbidden_split_syms(op: "ComputedBuffer") -> set[Symbol]:
         partial = (
             stick_var in d.ranges and concretize_expr(d.ranges[stick_var]) % eps != 0
         )
-        if partial and not output_aligned:
+        if partial:
             syms.add(stick_var)
 
     return syms
@@ -2180,8 +2159,13 @@ def finalize_work_division_for_scheduler(graph: GraphLowering) -> None:
 
     Coefficient keys cannot distinguish every symbol.  Preserve the established
     iteration-order last-wins behavior, but warn once per affected operation.
+
+    Runs after the pass loop, where ``graph.operations`` may hold LoopNodes
+    (they reach the Scheduler as one node each). The ops inside a loop are
+    finalized like any other: a LoopNode has no ownership of its own, so a
+    loop over the top level would skip its whole body without an error.
     """
-    for op in graph.operations:
+    for op in all_ops(graph.operations):
         ownership = getattr(op, "iteration_space_ownership", None)
         if ownership is None:
             continue
@@ -2332,7 +2316,6 @@ def _host_size_stride_for_expr(
     host_size: list[int],
     host_stride: list[int],
     arg: "PropArg",
-    reduction_type: str,
     label: str,
 ) -> "tuple[int, int] | None":
     """Return (host_size, host_stride) for the host dim group that expr maps to.
@@ -2353,7 +2336,7 @@ def _host_size_stride_for_expr(
         return None
     try:
         host_dims, _var_range, var_stride = _factorized_chain(
-            arg, host_coords, host_size, host_stride, var, reduction_type, label
+            arg, host_coords, host_size, host_stride, var, label
         )
     except Unsupported:
         return None
@@ -2377,8 +2360,7 @@ def compute_restickify_target_layout(
     ic: list,
     idc: list,
     *,
-    arg: "PropArg | None" = None,
-    reduction_type: str = "",
+    arg: "PropArg",
     label: str = "",
 ) -> "SpyreTensorLayout | None":
     """Compute the target STL that results from moving stl's stick to target_stick_expr.
@@ -2395,20 +2377,18 @@ def compute_restickify_target_layout(
 
     Returns None if the restickify is infeasible.
 
-    ``arg``, ``reduction_type``, and ``label`` are forwarded to
-    ``_host_size_stride_for_expr`` to enable resolution of factorized
-    (FloorDiv) coordinate expressions via ``_factorized_chain``.
+    ``arg`` and ``label`` are forwarded to ``_host_size_stride_for_expr`` to
+    enable resolution of factorized (FloorDiv) coordinate expressions via
+    ``_factorized_chain``.
     """
     if target_stick_expr == sympy.S.Zero:
         return compute_size1_restickify_layout(stl, host_layout, ic, idc)
     if not target_stick_expr.free_symbols:
         return None
-    if arg is None:
-        return None
     host_size = [concretize_expr(s) for s in host_layout.size]
     host_stride = [concretize_expr(s) for s in host_layout.stride]
     new_sd_size_stride = _host_size_stride_for_expr(
-        target_stick_expr, ic, host_size, host_stride, arg, reduction_type, label
+        target_stick_expr, ic, host_size, host_stride, arg, label
     )
     if new_sd_size_stride is None:
         return None
@@ -2418,7 +2398,7 @@ def compute_restickify_target_layout(
     stick_size = get_elem_in_stick(host_layout.dtype)
     if old_stick_expr.free_symbols:
         old_sd_size_stride = _host_size_stride_for_expr(
-            old_stick_expr, ic, host_size, host_stride, arg, reduction_type, label
+            old_stick_expr, ic, host_size, host_stride, arg, label
         )
         if old_sd_size_stride is None:
             return None
@@ -2428,11 +2408,9 @@ def compute_restickify_target_layout(
             j for j in range(len(idc) - 1) if old_var in idc[j].free_symbols
         ]
     else:
-        # Zero stick (placeholder dim with no variable): only valid for BATCH_MATMUL_OP,
-        # where a size-1 contraction dim produces a constant stick expression.
-        # For all other ops, this layout is infeasible.
-        if reduction_type != BATCH_MATMUL_OP:
-            return None
+        # Constant stick expression: the old stick dim has no variable (size-1
+        # contraction dim in matmul).  Callers are responsible for rejecting this
+        # case for non-matmul ops before calling here.
         old_sd_host_size, old_sd_host_stride = 1, 1
         old_var_outer_dims = []
         old_var = None
@@ -4313,15 +4291,34 @@ _STACK_TRACES_BLOCK_RE = regex.compile(
 )
 
 
+def _indent(text: str) -> str:
+    """``text`` with two spaces before every non-blank line."""
+    return "".join(
+        line if line == "\n" else f"  {line}" for line in text.splitlines(keepends=True)
+    )
+
+
 def _strip_stack_traces(text: str) -> str:
     """Remove IRNode "stack_traces = { ... }" blocks from formatted op text."""
     return _STACK_TRACES_BLOCK_RE.sub("", text)
 
 
 def format_operations(operations: list[Operation]) -> str:
-    """Format LLIR operations including torch-spyre custom metadata"""
+    """Format LLIR operations including torch-spyre custom metadata.
+
+    A LoopNode prints as a header line followed by its body, each body line
+    indented by two spaces per nesting level. A list with no LoopNode prints
+    exactly as it did before nodes existed.
+    """
     buf = io.StringIO()
     for op in operations:
+        if isinstance(op, LoopNode):
+            buf.write(
+                f"{op.get_operation_name()}: LoopNode trip_count={op.trip_count} "
+                f"induction={op.induction} carries={len(op.carries)}\n\n"
+            )
+            buf.write(_indent(format_operations(op.body)))
+            continue
         buf.write(f"{op.get_operation_name()}: {type(op).__name__}")
         if isinstance(op, ComputedBuffer):
             buf.write(f"\n  buffer={op.get_name()}")

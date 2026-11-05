@@ -660,10 +660,12 @@ class TestEmptyLxEligibility(unittest.TestCase):
         empty = _fixed_tiled_layout((0, 64))
         nonempty = _fixed_tiled_layout((64, 64))
         zero_extent = _fixed_tiled_layout((64, 64))
+        _ds = [1, 0, 64]
         zero_extent.device_layout = SpyreTensorLayout(
-            [1, 0, 64],
+            _ds,
             [64, 64, 1],
             DataFormats.SEN169_FP16,
+            {(i,): _ds[i] for i in range(len(_ds))},
             ElementArrangement.STANDARD,
         )
         self.assertEqual(
@@ -2338,11 +2340,19 @@ class TestDepthwiseConvWindowBlocked(unittest.TestCase):
         w = torch.randn(self._W_SHAPE, dtype=torch.float16)
         x_dev = x.to(
             device_layout=SpyreTensorLayout(
-                [32, 32, 1, 1, 64], [32, 1, -1, 65536, 1024], fp16
+                [32, 32, 1, 1, 64],
+                [32, 1, -1, 65536, 1024],
+                fp16,
+                {(0,): 32, (1,): 32, (4,): 64},
             )
         )
         w_dev = w.to(
-            device_layout=SpyreTensorLayout([3, 3, 1, 1, 64], [1, 3, -1, 9, 9], fp16)
+            device_layout=SpyreTensorLayout(
+                [3, 3, 1, 1, 64],
+                [1, 3, -1, 9, 9],
+                fp16,
+                {(0,): 3, (1,): 3, (4,): 64},
+            )
         )
         return x, w, x_dev, w_dev
 
@@ -3737,6 +3747,175 @@ class TestCoOptimizingAllocator(unittest.TestCase):
         ):
             allocator_module.check_priced_footprints(graph, [buf])
         self.assertIn("buf0", str(caught.exception))
+
+
+class TestDeferredWorkDivision(unittest.TestCase):
+    """Work division left to the co-optimizing LX solve (``defer_work_division``)."""
+
+    def test_solve_decides_work_division_matches_select_allocator(self):
+        """The predicate holds exactly where ``select_allocator`` builds a
+        ``CoOptimizingAllocator`` that chooses every split itself: not the
+        pruned exhaustive search, which seeds its menus from the committed
+        split, and never when LX planning is off or the config is refused."""
+        from torch_spyre._inductor.scratchpad import ilp_solver_ortools
+
+        # Forcing ortools absent covers the cpsat fallback on every host; the
+        # present case runs only where ortools is installed.
+        ortools_states = (
+            (False, True) if ilp_solver_ortools.cp_model is not None else (False,)
+        )
+        solvers = ("greedy", "bestfit", "firstfit", "simulated_annealing", "cpsat")
+        cases = itertools.product(
+            (True, False),
+            (True, False),
+            # "bogus" is unknown: select_allocator's ValueError to raise.
+            (*solvers, "bogus"),
+            (True, False),
+            ortools_states,
+        )
+        for lx_planning, co_optimizing, solver, exhaustive, ortools in cases:
+            with (
+                self.subTest(
+                    lx_planning=lx_planning,
+                    co_optimizing=co_optimizing,
+                    solver=solver,
+                    allow_exhaustive_search=exhaustive,
+                    ortools=ortools,
+                ),
+                allocator_module.config.patch(
+                    lx_planning=lx_planning,
+                    co_optimizing_lx_planning=co_optimizing,
+                    layout_solver=solver,
+                    allow_exhaustive_search=exhaustive,
+                    _cpsat_warn_on_cost_expr=False,
+                ),
+                ExitStack() as stack,
+            ):
+                if not ortools:
+                    stack.enter_context(
+                        patch.object(ilp_solver_ortools, "cp_model", None)
+                    )
+                try:
+                    allocator = allocator_module.select_allocator()
+                except ValueError:
+                    # Refused: the compile fails and nothing is planned.
+                    allocator = None
+                expected = (
+                    lx_planning
+                    and isinstance(allocator, CoOptimizingAllocator)
+                    and not allocator.prune
+                )
+                self.assertEqual(
+                    allocator_module.solve_decides_work_division(), expected
+                )
+
+    def test_pinned_op_keeps_the_pass_split(self):
+        """An op the allocator pins ends with the split ``_distribute_work``
+        commits up front, though with work division deferred only the pin
+        divides it.
+
+        Reading a slice at a constant offset (``s`` below, the graph of
+        ``test_sliced_intermediate_is_correct``) pins the reader as an "offset
+        slice read". The graph is compiled with work division deferred and
+        with it committed up front, and every pinned op must end with the same
+        split. A split above one on a sliced read shows the deferred op was
+        divided at all, not left at its span floor.
+        """
+        try:
+            from ortools.sat.python import cp_model  # noqa: F401
+        except ImportError:
+            self.skipTest("work division is deferred to the CP-SAT solver (ortools)")
+
+        def fn(x):
+            t = torch.exp(x)
+            s = t[:, :, 32:96]
+            return s.clone() + s
+
+        x = torch.rand((128, 192, 256), dtype=torch.float16).to("spyre")
+
+        def compile_and_capture(defer: bool):
+            """Each pin's reason, the ops a pin divided, and every op's final
+            split, by op name."""
+            pins: dict[str, str] = {}
+            divided_by_pin: set[str] = set()
+            splits: dict[str, dict[str, int]] = {}
+            real_legal_fixed = allocator_module._legal_fixed_division
+            real_divide = allocator_module.divide_deferred_op
+            real_finalize = passes.finalize_work_division_for_scheduler
+
+            def legal_fixed(op, fixed, reason):
+                pins[op.get_name()] = reason
+                return real_legal_fixed(op, fixed, reason)
+
+            def divide(graph, op):
+                if op.get_name() in work_division_module.deferred_work_division(graph):
+                    divided_by_pin.add(op.get_name())
+                real_divide(graph, op)
+
+            def finalize(graph):
+                for op in graph.operations:
+                    ownership = getattr(op, "iteration_space_ownership", None)
+                    if ownership is not None:
+                        splits[op.get_name()] = {
+                            str(symbol): factor
+                            for symbol, factor in ownership.work_slices.items()
+                        }
+                real_finalize(graph)
+
+            torch._dynamo.reset()
+            with ExitStack() as stack:
+                stack.enter_context(fresh_cache())
+                stack.enter_context(
+                    torch._inductor.config.patch(force_disable_caches=True)
+                )
+                stack.enter_context(
+                    patch.object(allocator_module, "_legal_fixed_division", legal_fixed)
+                )
+                stack.enter_context(
+                    patch.object(allocator_module, "divide_deferred_op", divide)
+                )
+                stack.enter_context(
+                    patch.object(
+                        passes, "finalize_work_division_for_scheduler", finalize
+                    )
+                )
+                if not defer:
+                    stack.enter_context(
+                        patch.object(
+                            passes, "solve_decides_work_division", return_value=False
+                        )
+                    )
+                torch.compile(fn)(x).cpu()
+            return pins, divided_by_pin, splits
+
+        self.addCleanup(torch._dynamo.reset)
+        with allocator_module.config.patch(
+            lx_planning=True,
+            co_optimizing_lx_planning=True,
+            layout_solver="cpsat",
+            sencores=32,
+            _cpsat_warn_on_cost_expr=False,
+        ):
+            self.assertTrue(allocator_module.solve_decides_work_division())
+            pins, divided_by_pin, deferred = compile_and_capture(defer=True)
+            upfront_pins, upfront_divided, upfront = compile_and_capture(defer=False)
+
+        sliced = {
+            name for name, reason in pins.items() if reason == "offset slice read"
+        }
+        self.assertTrue(sliced, f"no op was pinned as an offset slice read: {pins}")
+        self.assertEqual(pins, upfront_pins)
+        # Up front, the passes divided every op before the allocator ran.
+        self.assertEqual(upfront_divided, set())
+        self.assertLessEqual(sliced, divided_by_pin)
+        for name in sorted(pins):
+            with self.subTest(op=name, reason=pins[name]):
+                self.assertEqual(deferred.get(name), upfront.get(name))
+        self.assertTrue(
+            any(factor > 1 for name in sliced for factor in deferred[name].values()),
+            "every sliced read runs on one core, so its split cannot tell the "
+            f"pass's split from none: {[deferred[name] for name in sorted(sliced)]}",
+        )
 
 
 class _SqueezingPostStickify:
