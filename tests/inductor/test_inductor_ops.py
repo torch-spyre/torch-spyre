@@ -9066,6 +9066,133 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "edge_nopad_2d": (1, 5, 2, cached_randn((16, 33))),
             },
         },
+        # F.unfold / nn.Unfold dispatch to aten::im2col; spyre_im2col
+        # (decompositions.py) gathers the taps as conv2d does (#5642).
+        # (x, kernel_size, dilation, padding, stride)
+        ("test_im2col", "test_im2col_cpu"): {
+            "param_sets": {
+                # Mistral-Small-3.2 patch merger: the patch conv's channel-last
+                # output, 2x2 windows, stride 2.
+                "mistral_bf16": (
+                    cached_randn((1, 1024, 28, 38), dtype=torch.bfloat16).contiguous(
+                        memory_format=torch.channels_last
+                    ),
+                    (2, 2),
+                    (1, 1),
+                    (0, 0),
+                    (2, 2),
+                ),
+                # Odd grid: the last row/column is dropped.
+                "mistral_odd_bf16": (
+                    cached_randn((1, 1024, 27, 37), dtype=torch.bfloat16).contiguous(
+                        memory_format=torch.channels_last
+                    ),
+                    (2, 2),
+                    (1, 1),
+                    (0, 0),
+                    (2, 2),
+                ),
+                # C is not a whole stick: padded to one inside the op.
+                "small_c_fp16": (
+                    cached_randn((1, 3, 8, 8)),
+                    (2, 2),
+                    (1, 1),
+                    (0, 0),
+                    (2, 2),
+                ),
+                # Batch of two, C of two sticks, 4x4 windows.
+                "batch2_k4_bf16": (
+                    cached_randn((2, 128, 8, 8), dtype=torch.bfloat16),
+                    (4, 4),
+                    (1, 1),
+                    (0, 0),
+                    (4, 4),
+                ),
+                # 1x1 kernel: one tap per axis, so neither phase concatenates.
+                "k1_fp16": (
+                    cached_randn((1, 64, 8, 8)),
+                    (1, 1),
+                    (1, 1),
+                    (0, 0),
+                    (1, 1),
+                ),
+                # kW == 1 with padding: the single W tap is a view of the padded
+                # buffer, not a concatenation.
+                "kw1_padded_fp16": (
+                    cached_randn((1, 64, 8, 8)),
+                    (2, 1),
+                    (1, 1),
+                    (1, 1),
+                    (2, 1),
+                ),
+                # Overlapping windows (stride < kernel), in fp32.
+                "overlap_fp32": (
+                    cached_randn((1, 64, 8, 8), dtype=torch.float32),
+                    (3, 3),
+                    (1, 1),
+                    (0, 0),
+                    (1, 1),
+                ),
+                # Padding with dilation, on an odd grid.
+                "padded_dilated_bf16": (
+                    cached_randn((1, 64, 9, 9), dtype=torch.bfloat16),
+                    (3, 3),
+                    (2, 2),
+                    (2, 2),
+                    (1, 1),
+                ),
+                # Each axis differs: H overlaps (k3 s1) and is padded, W is
+                # gapped (k2 s3) and is not.
+                "asymmetric_fp16": (
+                    cached_randn((1, 64, 8, 12)),
+                    (3, 2),
+                    (1, 1),
+                    (1, 0),
+                    (1, 3),
+                ),
+                # L is a whole number of sticks (128), so its pad is a full stick.
+                "l128_fp16": (
+                    cached_randn((1, 64, 32, 16)),
+                    (2, 2),
+                    (1, 1),
+                    (0, 0),
+                    (2, 2),
+                ),
+                # Unbatched (C, H, W) input.
+                "input_3d_fp16": (
+                    cached_randn((64, 8, 8)),
+                    (2, 2),
+                    (1, 1),
+                    (0, 0),
+                    (2, 2),
+                ),
+                # aten.im2col takes floating-point and bool inputs only.
+                "bool": (
+                    cached_randn((1, 64, 8, 8)) > 0,
+                    (2, 2),
+                    (1, 1),
+                    (0, 0),
+                    (2, 2),
+                ),
+                # H == 1 (a conv1d-shaped input): both tap gathers run
+                # channel-last. Tiling, then overlapping with padding on both
+                # axes (kH = 3 over the one padded row).
+                "h1_fp16": (
+                    cached_randn((1, 64, 1, 16)),
+                    (1, 2),
+                    (1, 1),
+                    (0, 0),
+                    (1, 2),
+                ),
+                "h1_padded_bf16": (
+                    cached_randn((1, 64, 1, 8), dtype=torch.bfloat16),
+                    (3, 3),
+                    (1, 1),
+                    (1, 1),
+                    (1, 1),
+                ),
+            },
+        },
         ("test_unbind", "test_unbind_cpu"): {
             "param_sets": {
                 # 1D — produces 0-D scalar tensors
@@ -14242,6 +14369,64 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return t.unfold(0, 3, 1).sum(dim=-1)
 
         self.compare_with_cpu(fn, x, atol=0, rtol=0, run_eager=False)
+
+    def test_im2col_cpu(self, x, kernel_size, dilation, padding, stride):
+        """F.unfold (aten::im2col) against the CPU reference.
+
+        The op only moves data, so bf16 and fp32 are compared exactly; fp16
+        differs by one ulp where the device's dlfloat16 rounding does, so it
+        keeps the default tolerance.
+        """
+
+        def fn(a):
+            return F.unfold(
+                a,
+                kernel_size=kernel_size,
+                dilation=dilation,
+                padding=padding,
+                stride=stride,
+            )
+
+        exact = {} if x.dtype == torch.float16 else {"atol": 0, "rtol": 0}
+        self.compare_with_cpu(fn, x, **exact)
+
+    def test_im2col_resized_input(self):
+        """One compiled F.unfold called with three input sizes.
+
+        After the first size Dynamo makes the shape dynamic. spyre_im2col
+        specializes on it, so each size recompiles; without that the pad
+        amounts are symbolic and lower_constant_pad_nd rejects them. Compiled
+        without dynamic=False on purpose.
+        """
+
+        def fn(a):
+            return F.unfold(a, kernel_size=2, stride=2)
+
+        compiled = torch.compile(fn)
+        for h, w in ((8, 12), (6, 10), (8, 12)):
+            x = cached_randn((1, 64, h, w), dtype=torch.bfloat16)
+            out = compiled(x.to(utils_inductor.DEVICE)).cpu()
+            torch.testing.assert_close(out, fn(x), rtol=0, atol=0)
+
+    def test_im2col_patch_merger(self):
+        """Mistral-Small-3.2's Mistral3PatchMerger, end to end.
+
+        tokens (h*w, d) -> grid (1, d, h, w) -> F.unfold k=2 s=2 -> (d*4, L).t()
+        -> Linear(d*4 -> d). The unfold's input is a view of a merged dim and its
+        output feeds a transpose and a matmul, which is what the op's final
+        copy exists for (see spyre_im2col). Tolerance: the Linear accumulates
+        over K = 4096 in bf16; the op itself is exact (test_im2col_mistral_bf16).
+        """
+        h, w, d = 28, 38, 1024
+        tokens = cached_randn((h * w, d), dtype=torch.bfloat16)
+        weight = cached_randn((d, d * 4), dtype=torch.bfloat16, scale=1 / 64)
+
+        def fn(t, wt):
+            grid = t.view(h, w, d).permute(2, 0, 1).unsqueeze(0)
+            cols = F.unfold(grid, kernel_size=2, stride=2)
+            return F.linear(cols.view(d * 4, -1).t(), wt)
+
+        self.compare_with_cpu(fn, tokens, weight)
 
     def test_unbind_cpu(self, dim: int, x):
         self.compare_with_cpu(lambda a: torch.unbind(a, dim=dim), x)

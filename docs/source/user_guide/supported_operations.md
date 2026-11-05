@@ -29,7 +29,7 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 | `torch.ops.spyre.quantize_weight_fp8_with_scale` | Y | Y | Spyre | Quantize FP16 weight to FP8 using a pre-computed scale (`qfp8wt` layout) |
 | `torch.ops.spyre.dequantize_fp8_with_scale` | Y | Y | Spyre | Dequantize FP8 tensor to FP16 using a pre-computed scale |
 | `torch.nn.functional.linear` | Y | Y | Spyre | Decomposed to `matmul` + `add` |
-| `torch.nn.functional.conv2d` | Y | Y | Spyre | Custom decomposition (`conv2d_via_bmm`); CPU fallback for the im2col step |
+| `torch.nn.functional.conv2d` | Y | Y | Spyre | Custom decomposition (`conv2d_via_bmm`); the im2col step runs on device as a two-phase tap gather |
 | `torch.nn.functional.avg_pool2d` | | Y | Spyre | Compiled only; custom lowering |
 | `torch.triu` | Y | Y | Spyre | Compiled via mask-multiply decomposition; integer dtypes and `out=` variant fall back to CPU |
 | **Activation Functions** | | | | |
@@ -112,6 +112,7 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 | `torch.repeat` | Y | Y | Spyre | Registered on the compiled path (`ops/eager.py` `COMPILED_OPS`); the eager kernel dispatches through `torch.compile` |
 | `torch.unbind` | Y | Y | Spyre | |
 | `torch.Tensor.unfold` | Y | Y | Spyre | View op |
+| `torch.nn.functional.unfold` | Y | Y | Spyre | Decomposed from `aten::im2col` (`spyre_im2col` in `_inductor/decompositions.py`): the two-phase tap gather conv2d uses, finished into aten's column order. Any kernel, stride, padding and dilation |
 | `torch.flip` | Y | Y | Spyre | Custom decomposition to `index_select` gathers; reversing the last (stick) dimension is unsupported and raises |
 | `torch.index_copy` | Y | Y | Spyre | `index_copy.out` is registered on the compiled path (`ops/eager.py` `COMPILED_OPS`), which also serves `index_copy` and `index_copy_`. Scattering along the last (stick) dimension is unsupported and raises |
 | `torch.split` | | Y | Spyre | Compiled only (lowers via `aten.slice`) |
