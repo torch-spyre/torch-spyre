@@ -42,6 +42,7 @@ from torch_spyre._inductor.codegen.compute_ops import (
     core_idx_to_slice_offset,
     generate_constant_info,
 )
+from torch_spyre._inductor.codegen import superdsc
 from torch_spyre._inductor.codegen.superdsc import (
     _align_pool_dim_labels,
     _resolve_sdsc_size,
@@ -851,6 +852,153 @@ class TestTiledAwayPhysicalAxis(InductorTestCase):
             {"y": 192, "x": 24},
         )
         self.assertEqual(int(source.strides[sympy.Symbol("x")]), 524_288)
+
+
+def _equal_but_distinct(symbol):
+    """A symbol ``==`` to ``symbol`` but not ``is`` it: ``Symbol.__xnew__``
+    skips sympy's symbol cache, as a symbol rebuilt after that cache evicted
+    the original does."""
+    return sympy.Symbol.__xnew__(sympy.Symbol, symbol.name, **symbol.assumptions0)
+
+
+class TestSdscIgnoresSymbolIdentity(InductorTestCase):
+    """SDSC codegen must compare dims by value. In a long compile process
+    sympy's caches can return an expression built on an earlier, equal ``x``
+    object, so a stick dim read from one coordinate can be ``==`` but not
+    ``is`` the same dim read from another."""
+
+    c0, c1, z0 = sympy.symbols("c0 c1 z0")
+
+    def _spec(self, op, is_reduction, iteration_space, args):
+        return OpSpec(
+            op=op,
+            is_reduction=is_reduction,
+            iteration_space=iteration_space,
+            core_id_to_work_slice=derive_operation_mapping(iteration_space),
+            args=[
+                TensorArg(
+                    is_input=is_input,
+                    arg_index=index,
+                    device_dtype=DataFormats.SEN169_FP16,
+                    device_size=size,
+                    device_coordinates=coordinates,
+                    allocation=allocation,
+                )
+                for index, (is_input, size, coordinates, allocation) in enumerate(args)
+            ],
+            op_info={},
+        )
+
+    def _broadcast_mul(self):
+        """GQA decode's score scaling: ``[4, 128]`` times a one-stick vector
+        broadcast along both dims (the kernel PR #5587 failed on)."""
+        c0, c1, z0, zero = self.c0, self.c1, self.z0, sympy.S.Zero
+        return self._spec(
+            "mul",
+            False,
+            {
+                c0: (sympy.Integer(4), 4),
+                c1: (sympy.Integer(128), 1),
+                z0: (sympy.Integer(1), 1),
+            },
+            [
+                (
+                    True,
+                    [4, 4, 2, 64],
+                    [c0, z0, sympy.floor(c1 / 64), sympy.Mod(c1, 64)],
+                    {"hbm": 0},
+                ),
+                (True, [1, 1, 1, 64], [zero, zero, z0, zero], {"hbm": 1}),
+                (
+                    False,
+                    [1, 2, 4, 64],
+                    [z0, sympy.floor(c1 / 64), c0, sympy.Mod(c1, 64)],
+                    {"lx": 384},
+                ),
+            ],
+        )
+
+    def _stick_sum(self):
+        c0, c1, zero = self.c0, self.c1, sympy.S.Zero
+        return self._spec(
+            "sum",
+            True,
+            {c0: (sympy.Integer(4), 4), c1: (sympy.Integer(256), 1)},
+            [
+                (
+                    True,
+                    [4, 4, 64],
+                    [sympy.floor(c1 / 64), c0, sympy.Mod(c1, 64)],
+                    {"lx": 896},
+                ),
+                (False, [1, 4, 64], [zero, c0, zero], {"lx": 640}),
+            ],
+        )
+
+    def _stick_broadcast_copy(self):
+        c0, c1, zero = self.c0, self.c1, sympy.S.Zero
+        return self._spec(
+            "identity",
+            False,
+            {c0: (sympy.Integer(4), 4), c1: (sympy.Integer(64), 1)},
+            [
+                (True, [1, 1, 64], [zero, zero, zero], {"hbm": 0}),
+                (
+                    False,
+                    [1, 4, 64],
+                    [sympy.floor(c1 / 64), c0, sympy.Mod(c1, 64)],
+                    {"lx": 0},
+                ),
+            ],
+        )
+
+    def _sdsc(self, spec, distinct_stick):
+        real = superdsc._get_device_dim_order
+
+        def dim_order(*args, **kwargs):
+            order, stick = real(*args, **kwargs)
+            if stick is not None:
+                stick = _equal_but_distinct(stick)
+            return order, stick
+
+        with patch.object(
+            superdsc,
+            "_get_device_dim_order",
+            dim_order if distinct_stick else real,
+        ):
+            sdsc_json, _, _, _ = compile_op_spec(idx=0, op_spec=spec, symbols=[])
+        body = next(iter(sdsc_json.values()))
+        body.pop("debug_handle_", None)
+        return body
+
+    def test_broadcast_input_keeps_reduced_stick_scale(self):
+        """The broadcast vector's reduced stick dim ``x`` keeps scale -2 and
+        the stick-reduction fold; scale -1 makes dbo-opt fail with
+        "Incorrect chunk size in bytes"."""
+        mul = self._sdsc(self._broadcast_mul(), distinct_stick=True)["dscs_"][0]["mul"]
+        self.assertEqual(mul["labeledDs_"][1]["scale_"], [-2, 1, -1])
+        (vector_hbm,) = (
+            node
+            for node in mul["scheduleTree_"]
+            if node.get("name_") == "allocate-Tensor1_hbm"
+        )
+        folds = vector_hbm["coordinates_"]["coordInfo"]["x"]["folds"]
+        self.assertEqual(
+            [f["Affine"]["alpha_"] for f in folds["dim_prop_func"]],
+            [64, 0, 0, 64, 0],
+        )
+
+    def test_sdsc_does_not_depend_on_symbol_identity(self):
+        for name, build in (
+            ("broadcast mul", self._broadcast_mul),
+            ("stick sum", self._stick_sum),
+            ("stick broadcast copy", self._stick_broadcast_copy),
+        ):
+            with self.subTest(name):
+                self.assertEqual(
+                    self._sdsc(build(), distinct_stick=True),
+                    self._sdsc(build(), distinct_stick=False),
+                )
 
 
 class TestSymbolKindKernelDerivedSymbolic(InductorTestCase):
