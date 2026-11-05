@@ -73,6 +73,7 @@ from .insert_restickify import (
 )
 from .enforce_indirect_access_layout import enforce_indirect_access_layout
 from .hbm_pool_planning import hbm_pool_planning
+from .sharded_hbm import plan_sharded_hbm
 from .work_division import (
     span_reduction,
     work_distribution,
@@ -92,7 +93,15 @@ from .scheduler import (
 )
 from .constants import DEVICE_NAME
 from .deadcode_elimination import deadcode_elimination
-from .loop_node import OpsView, all_ops, expand, expanded, has_loop_nodes
+from .loop_node import (
+    OpsView,
+    all_ops,
+    expand,
+    expanded,
+    has_loop_nodes,
+    peel_non_members,
+)
+from . import loop_scheduler
 from .dedup_constants import dedup_and_promote_constants
 from .read_copy_elision import elide_proven_read_copies
 from .materialize_hinted_views import materialize_hinted_views
@@ -484,6 +493,37 @@ def _flat_operations(graph: GraphLowering, pass_name: str) -> Iterator[None]:
         )
 
 
+def _hand_off_loop_nodes(graph: GraphLowering) -> None:
+    """Decide what the readers after the pass loop and the Scheduler see.
+
+    On a release the scheduler patch supports (``loop_scheduler.py``), the
+    real nested list: each ``LoopNode`` reaches ``Scheduler.__init__`` and
+    becomes ONE ``LoopSchedulerNode``. The readers in between (the cost
+    model, the dump, the work-division finalizer, the INFO logging) descend
+    into the nodes.
+
+    On any other release a graph that holds a ``LoopNode`` is refused here,
+    with ``Unsupported`` naming the release: flattening it would compile the
+    loop through the old path without saying that the release is
+    unsupported (decided policy: fail loudly outside the supported set). A
+    graph with no loop is unaffected on every release.
+
+    ``loop_scheduler.SCHEDULE_LOOP_NODES`` off (the equivalence test only)
+    expands the nodes as before, whatever the release.
+    """
+    if not has_loop_nodes(graph.operations):
+        return
+    if not loop_scheduler.SCHEDULE_LOOP_NODES:
+        expand(graph)
+        return
+    if not loop_scheduler.loop_scheduler_supported():
+        expand(graph)
+        raise loop_scheduler.refuse_release()
+    # A pass may have put an op that belongs before (or after) a loop at the
+    # edge of its body; the scheduler runs a node's whole body every trip.
+    peel_non_members(graph)
+
+
 class CustomPreSchedulingPasses:
     """
     Spyre-specific passes that run on the GraphLowering immediately before the
@@ -578,6 +618,12 @@ class CustomPreSchedulingPasses:
             _maybe_coarse_tile_span_overflow,
             #
             # Core Division
+            # The shard plan pins the split of ops on sharded operands first.
+            # Invariant: this must run before any pass that could insert a
+            # consumer of a sharded buffer (its rejection loops only see the
+            # graph as of this point); compute_ops' all-sharded check is the
+            # second net.
+            plan_sharded_hbm,
             span_reduction,
             _distribute_work,
             #
@@ -622,12 +668,12 @@ class CustomPreSchedulingPasses:
             with timing_recorder.stage(f"stage:{pipeline}:pass_loop"):
                 try:
                     self._run_pass_loop(graph)
-                finally:
-                    # splice_while_loops wraps each loop into a LoopNode; flatten
-                    # them again so the cost model, the scheduler and codegen see
-                    # today's flat list. In a finally so an error in a pass does
-                    # not leave nodes behind for an error handler to trip over.
+                except BaseException:
+                    # An error in a pass must not leave nodes behind for an
+                    # error handler (or a fallback) to trip over.
                     expand(graph)
+                    raise
+                _hand_off_loop_nodes(graph)
 
             if logger.isEnabledFor(logging.INFO):
                 with timing_recorder.stage(f"stage:{pipeline}:log_after"):
@@ -655,7 +701,8 @@ class CustomPreSchedulingPasses:
             with timing_recorder.stage(f"stage:{pipeline}:finalize_work_division"):
                 finalize_work_division_for_scheduler(graph)
 
-        pipeline_event.meta["output_operations"] = len(graph.operations)
+        # Leaf ops, as the per-pass counts are: the list may now hold LoopNodes.
+        pipeline_event.meta["output_operations"] = _count_ops(graph.operations)
         pipeline_event.meta.update(COUNTERS.since(pipeline_counts))
 
     def _run_pass_loop(self, graph: GraphLowering) -> None:

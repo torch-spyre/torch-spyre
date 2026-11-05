@@ -2079,6 +2079,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "w192": (192,),
             },
         },
+        ("test_topk_rows", "test_topk_rows_past_lx"): {
+            "param_sets": {
+                "k16_rows256_row_split": (256, 16),
+                "k22_rows384_two_cores": (384, 22),
+                "k17_rows256_one_core": (256, 17),
+                "k22_rows602_padded_tiles": (602, 22),
+            },
+        },
         ("test_topk", "test_topk_cpu"): {
             "param_sets": {
                 "2d_k1_dim0": (unique_randn_along_dim((64, 256), dim=0), 1, 0),
@@ -2359,13 +2367,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     2,
                     0.0,
                 ),
-            },
-            # A backend regression makes these cases fail their correctness check.
-            # Non-strict, so an unexpected pass does not fail the run. Remove the
-            # entries when #5950 is fixed.
-            "expect_fail_unstable": {
-                "2d_dim1": "keep_by_index result fails the correctness check, #5950",
-                "4d_dim2": "keep_by_index result fails the correctness check, #5950",
             },
         },
         ("test_reduce_keepdim0", "test_reduce_keepdim0_cpu"): {
@@ -10698,6 +10699,23 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         result = torch.compile(route, dynamic=False)(probs.to("spyre")).cpu()
 
         torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
+
+    def test_topk_rows_past_lx(self, rows: int, k: int):
+        x = torch.sigmoid(
+            torch.randn(rows, 512, generator=torch.Generator().manual_seed(rows))
+        ).half()
+        values, indices = torch.compile(
+            lambda x: torch.topk(x, k, dim=-1), dynamic=False
+        )(x.to("spyre"))
+        values, indices = values.cpu().float(), indices.cpu().long()
+        expected = torch.topk(x.float(), k, dim=-1).values
+        assert ((indices >= 0) & (indices < 512)).all()
+        torch.testing.assert_close(
+            x.float().gather(1, indices), values, atol=2e-3, rtol=0
+        )
+        torch.testing.assert_close(
+            values.sort(-1).values, expected.sort(-1).values, atol=2e-3, rtol=0
+        )
 
     def test_min_tuple_output_keepdim0(self):
         x = unique_randn_along_dim((5, 7), dim=1)
