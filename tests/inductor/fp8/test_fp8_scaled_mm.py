@@ -18,7 +18,7 @@ import pytest
 import torch
 from torch._inductor.exc import InductorError
 from torch_spyre.constants import DEVICE_NAME
-from utils_inductor import expects_raise
+from utils_inductor import cached_randn, compare_with_pytorch, expects_raise
 
 E4M3 = torch.float8_e4m3fn
 FP8_MAX = float(torch.finfo(E4M3).max)
@@ -1422,3 +1422,224 @@ class TestFP8EagerMode:
 
         ref = _pipeline_ref(a, w, sa_val, sw_val, FP16)
         torch.testing.assert_close(out.cpu(), ref, atol=0.1, rtol=0.05)
+
+
+class TestFP8ScaledMMRegressions:
+    """Model-shape and graph-pattern regressions for the FP8 ``_scaled_mm`` path.
+
+    Moved from ``test_inductor_ops.py``. Each test compiles the Spyre pipeline and
+    compares it with an uncompiled CPU reference via ``compare_with_pytorch``.
+    """
+
+    def setup_method(self):
+        torch._dynamo.reset()
+
+    @pytest.mark.parametrize(
+        "m,k,n",
+        [
+            (1, 4096, 4096),
+            (2, 4096, 4096),
+            (1, 4096, 6144),
+            (1, 4096, 25600),
+            (4, 4096, 4096),
+            (8, 4096, 4096),
+            (16, 4096, 4096),
+            (64, 4096, 4096),
+            (8, 4096, 1024),
+            (8, 4096, 12800),
+        ],
+        ids=[
+            "decode_m1_n4096_baseline",
+            "decode_m2_n4096_baseline",
+            "fused_qkv_n6144",
+            "fused_gate_up_n25600",
+            "wide_m4_n4096",
+            "wide_m8_n4096",
+            "prefill_warmup_m16_n4096",
+            "bench_prefill_m64_n4096",
+            "m8_n1024",
+            "m8_n12800",
+        ],
+    )
+    def test_granite_fp8_shapes(self, m, k, n):
+        """Regression test for SuperDSC aborts on FP8 _scaled_mm at Granite 8B shapes.
+
+        Covers fused QKV (N=6144), fused gate_up (N=25600), and wide-M prefill
+        shapes that previously caused compilation failures (issue #4179).
+
+        Two independent fixes are exercised here:
+          Fix 1 (compute_ops.py): corrects the out/N-dim elemArr constants
+            emitted by gen_coord_info_value for the QFP8WT KERNEL weight.
+          Fix 2 (work_division.py): routes batchmatmulfp8 through the analytic
+            cost model (_cost_model_divide_op), which was previously skipped for
+            FP8 BMM ops. The cost model now produces a correct split for all N.
+        """
+        x = cached_randn((m, k), dtype=FP16, differentiation=("x", m, k, n), scale=0.5)
+        w = cached_randn((k, n), dtype=FP16, differentiation=("w", m, k, n), scale=0.5)
+        scale_a = torch.tensor([0.1], dtype=FP16)
+        scale_b = torch.tensor([0.1], dtype=FP16)
+
+        def spyre_fn(x, w, scale_a, scale_b):
+            xa = torch.ops.spyre.quantize_fp8_with_scale(x, scale_a)
+            wb = torch.ops.spyre.quantize_weight_fp8_with_scale(w, scale_b)
+            return torch.ops.aten._scaled_mm(
+                xa, wb, scale_a=scale_a, scale_b=scale_b, out_dtype=FP16
+            )
+
+        def pytorch_fn(x, w, scale_a, scale_b):
+            xa = (x / scale_a).clamp(-FP8_MAX, FP8_MAX).to(E4M3).to(FP16)
+            wb = (w / scale_b).clamp(-FP8_MAX, FP8_MAX).to(E4M3).to(FP16)
+            return (xa @ wb) * (scale_a * scale_b)
+
+        compare_with_pytorch(
+            spyre_fn, pytorch_fn, x, w, scale_a, scale_b, atol=2.0, rtol=0.2
+        )
+
+    @pytest.mark.parametrize(
+        "m,k,n_hidden,n_out",
+        [
+            (2, 4096, 1024, 4096),
+            (1, 4096, 1024, 4096),
+            (2, 4096, 4096, 4096),
+        ],
+        ids=[
+            "granite_m2_k4096_n1024_n4096",
+            "granite_m1_k4096_n1024_n4096",
+            "granite_m2_k4096_n4096_n4096",
+        ],
+    )
+    def test_chained_scaled_mm(self, m, k, n_hidden, n_out):
+        """Regression test for chained FP8 matmul (MLP / decoder block pattern).
+
+        Two fp8_linear calls where the output of the first feeds the input of
+        the second -- the MLP pattern in a Granite decoder block. Per-row
+        dynamic x_scale computed from the activation; external per-column
+        w_scale passed in.
+
+        Previously failed with:
+          NotImplementedError: no mechanism to resolve stick incompatibility
+
+        Root cause: three combined issues unblocked by this fix:
+          1. pass_utils.py: compute_restickify_needed blocked SEN143_FP8 (#4238)
+          2. spyre_kernel.py: RESTICKIFY_OP gate excluded SEN143_FP8
+          3. propagate_layouts.py: generate_stl_with_required_stick returned
+             sparse QFP8CH without checking reduction_var was on the stick
+        """
+        scale_eps = 1e-4
+
+        def fp8_linear(x, w, w_scale):
+            x_scale = (x.abs().amax(dim=-1, keepdim=True) * (1.0 / FP8_MAX)).clamp(
+                min=scale_eps
+            )
+            wq = torch.ops.spyre.quantize_weight_fp8_with_scale(w, w_scale)
+            xq = torch.ops.spyre.quantize_fp8_with_scale(x, x_scale)
+            y = torch.ops.spyre.scaled_mm(
+                xq.reshape(-1, xq.shape[-1]), wq, out_dtype=FP16
+            )
+            return (y.reshape(*x.shape[:-1], w.shape[-1]) * x_scale * w_scale).to(
+                x.dtype
+            )
+
+        x = cached_randn(
+            (1, m, k),
+            dtype=FP16,
+            differentiation=("x", m, k, n_hidden, n_out),
+            scale=0.1,
+        )
+        g = cached_randn(
+            (k,),
+            dtype=FP16,
+            differentiation=("g", m, k, n_hidden, n_out),
+            scale=0.1,
+        )
+        w1 = cached_randn(
+            (k, n_hidden),
+            dtype=FP16,
+            differentiation=("w1", m, k, n_hidden, n_out),
+            scale=0.1,
+        )
+        w2 = cached_randn(
+            (n_hidden, n_out),
+            dtype=FP16,
+            differentiation=("w2", m, k, n_hidden, n_out),
+            scale=0.1,
+        )
+        ws1 = torch.full((n_hidden,), 0.1, dtype=FP16)
+        ws2 = torch.full((n_out,), 0.1, dtype=FP16)
+
+        def spyre_fn(x, g, w1, ws1, w2, ws2):
+            h = x * g
+            return fp8_linear(fp8_linear(h, w1, ws1), w2, ws2)
+
+        def pytorch_fn(x, g, w1, ws1, w2, ws2):
+            def ref_linear(x, w, ws):
+                x_scale = (x.abs().amax(dim=-1, keepdim=True) * (1.0 / FP8_MAX)).clamp(
+                    min=scale_eps
+                )
+                xq = (x / x_scale).clamp(-FP8_MAX, FP8_MAX).to(E4M3).to(FP16)
+                wq = (w / ws).clamp(-FP8_MAX, FP8_MAX).to(E4M3).to(FP16)
+                y = (xq.reshape(-1, xq.shape[-1]) @ wq) * (x_scale * ws)
+                return y.reshape(*x.shape[:-1], w.shape[-1]).to(x.dtype)
+
+            h = x * g
+            return ref_linear(ref_linear(h, w1, ws1), w2, ws2)
+
+        compare_with_pytorch(
+            spyre_fn, pytorch_fn, x, g, w1, ws1, w2, ws2, atol=2.0, rtol=0.2
+        )
+
+    @pytest.mark.parametrize(
+        "b,m,k,n",
+        [
+            (2, 8, 128, 128),
+            (2, 4, 256, 128),
+            (4, 2, 128, 256),
+        ],
+        ids=["b2_m8_k128_n128", "b2_m4_k256_n128", "b4_m2_k128_n256"],
+    )
+    def test_3d_activation_reshape(self, b, m, k, n):
+        """Regression test for _project_pointwise_dim_order rank_diff < 0 with QFP8CH.
+
+        A 3D batched activation (B, M, K) is reshaped to 2D (B*M, K) before
+        quantization and the matmul output is reshaped back to (B, M, N).
+        The QFP8CH rank-2 buffer produced by quantize_fp8_with_scale is then
+        consumed by rank-3 pointwise rescaling ops, giving rank_diff = 2 - 3 = -1
+        in _project_pointwise_dim_order. The sparse-stick -1 marker was incorrectly
+        shifted as if it were a dimension index, producing a dim_order of the wrong
+        length and crashing SpyreTensorLayout.__init__.
+
+        Previously failed with:
+          RuntimeError: Incompatible host_size and dim_order
+
+        Root cause:
+          propagate_layouts.py: _project_pointwise_dim_order shifted the trailing
+          -1 sparse-stick marker when rank_diff < 0, corrupting dim_order length
+        """
+        a_3d = cached_randn(
+            (b, m, k), dtype=FP16, differentiation=("a3d", b, m, k, n), scale=0.1
+        )
+        w = cached_randn(
+            (k, n), dtype=FP16, differentiation=("w", b, m, k, n), scale=0.1
+        )
+        # Non-unit scales: scale=1.0 makes quantization a numerical pass-through
+        # and masks range-boundary errors.
+        sa = torch.full((1,), 0.5, dtype=FP16)
+        sw = torch.full((1,), 0.25, dtype=FP16)
+
+        def spyre_fn(a_3d, w, sa, sw):
+            a_2d = a_3d.reshape(a_3d.shape[0] * a_3d.shape[1], a_3d.shape[2])
+            a_fp8 = torch.ops.spyre.quantize_fp8_with_scale(a_2d, sa)
+            w_fp8 = torch.ops.spyre.quantize_weight_fp8_with_scale(w, sw)
+            out = torch.ops.aten._scaled_mm(
+                a_fp8, w_fp8, scale_a=sa, scale_b=sw, out_dtype=FP16
+            )
+            return out.reshape(a_3d.shape[0], a_3d.shape[1], n)
+
+        def pytorch_fn(a_3d, w, sa, sw):
+            a_2d = a_3d.reshape(a_3d.shape[0] * a_3d.shape[1], a_3d.shape[2])
+            a_fp8 = (a_2d / sa).clamp(-FP8_MAX, FP8_MAX).to(E4M3).to(FP16)
+            w_fp8 = (w / sw).clamp(-FP8_MAX, FP8_MAX).to(E4M3).to(FP16)
+            out = (a_fp8 @ w_fp8) * (sa * sw)
+            return out.reshape(a_3d.shape[0], a_3d.shape[1], n)
+
+        compare_with_pytorch(spyre_fn, pytorch_fn, a_3d, w, sa, sw, atol=2.0, rtol=0.2)
