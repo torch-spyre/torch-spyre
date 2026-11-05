@@ -669,6 +669,50 @@ class _ScatterScenarios:
 
         self._assert_compiled_matches_cpu(kernel, y, src, idx)
 
+    # ===== 5-D scatter on each non-stick dim =====
+    # No 5-D coverage existed; these extend the 4-D index_put/index_copy_ cases
+    # by one rank. The last dim (64) is one full fp16 stick and is not indexed.
+    _SCATTER_5D_SHAPE = (8, 4, 8, 16, 64)
+    _SCATTER_5D_P = 3  # rows written along the indexed dim
+
+    def _scatter_5d_operands(self, dim):
+        """y[8,4,8,16,64] zeros, src with size P on `dim`, unique int64 idx[P]."""
+        shape = self._SCATTER_5D_SHAPE
+        P = self._SCATTER_5D_P
+        src_shape = list(shape)
+        src_shape[dim] = P
+        y = torch.zeros(shape, dtype=torch.float16).to("spyre")
+        src = torch.rand(src_shape, dtype=torch.float16).to("spyre")
+        # Unique rows: repeated indices have no defined winner.
+        idx = torch.randperm(shape[dim], dtype=torch.int64)[:P].to("spyre")
+        return y, src, idx
+
+    def test_index_copy_5d_each_dim_e2e(self):
+        """y.index_copy_(dim, idx, src) on a 5-D destination, dim 0..3."""
+        for dim in range(4):
+            with self.subTest(dim=dim):
+                torch._dynamo.reset()
+                y, src, idx = self._scatter_5d_operands(dim)
+
+                def kernel(y, src, idx, dim=dim):
+                    y.index_copy_(dim, idx, src)  # index_copy needs int64
+                    return y
+
+                self._assert_compiled_matches_cpu(kernel, y, src, idx)
+
+    def test_index_put_5d_each_dim_e2e(self):
+        """y[:, ..., idx] = src on a 5-D destination, indexing dim 0..3."""
+        for dim in range(4):
+            with self.subTest(dim=dim):
+                torch._dynamo.reset()
+                y, src, idx = self._scatter_5d_operands(dim)
+
+                def kernel(y, src, idx, dim=dim):
+                    y[(slice(None),) * dim + (idx,)] = src
+                    return y
+
+                self._assert_compiled_matches_cpu(kernel, y, src, idx)
+
     # ===== index_add: gather + add + overwrite-scatter decomposition =====
     # aten.index_add lowers (spyre_index_add in decompositions.py) to
     # index_select (indirect gather) + add + index_put (indirect overwrite
