@@ -77,6 +77,7 @@ def test_standard_export_contains_both_flow_stages(native_traces, filename):
     assert len(submits) == 6
     assert all(event["dur"] == 5 for event in submits)
     assert all(event["dur"] == 2 for event in kernels)
+    assert all(event["args"]["stream"] == 3 for event in kernels)
     assert all(event["dur"] == 0 for event in markers)
     assert all(
         (event["pid"], event["tid"], event["ts"]) == (cpu["pid"], cpu["tid"], cpu["ts"])
@@ -126,6 +127,7 @@ def test_device_flows_require_both_endpoints(native_traces):
     spans = [event for event in events if event.get("ph") == "X"]
     copies = [event for event in spans if event["name"] == "Memcpy (HtoD)"]
     assert {event["args"]["correlation"] for event in copies} == {13, 14, 16, 17}
+    assert all(event["args"]["stream"] == 5 for event in copies)
     assert any(event["name"] == "synthetic_kernel" for event in spans)
     assert any(event["args"].get("correlation") == 18 for event in spans)
     # Only 13 has both a non-calibration launch and a device record. Orphan
@@ -140,6 +142,20 @@ def test_device_flows_require_both_endpoints(native_traces):
         copy["tid"],
         copy["ts"],
     )
+
+
+def test_runtime_data_metadata(native_traces):
+    events = _read(native_traces / "runtime-metadata.json")["traceEvents"]
+    spans = {
+        event["args"]["correlation"]: event
+        for event in events
+        if event.get("ph") == "X" and "correlation" in event.get("args", {})
+    }
+    barrier, send = spans[40], spans[41]
+    assert barrier["name"] == "aiuIssueBarrier"
+    assert barrier["args"]["fence_size"] == 3
+    assert send["name"] == "aiuLaunchP2PRdmaSend"
+    assert send["args"]["num_dest_ranks"] == 5
 
 
 @pytest.mark.parametrize("prefix", ["reused", "scheduled-reused"])
@@ -245,6 +261,12 @@ def _capture_native_traces(output):
     ) as prof:
         fixture.emit_flow_pairs()
     prof.export_chrome_trace(str(output / "flow-pairs.json"))
+
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU]
+    ) as prof:
+        fixture.emit_runtime_metadata()
+    prof.export_chrome_trace(str(output / "runtime-metadata.json"))
 
     lookups = []
     for window in range(2):

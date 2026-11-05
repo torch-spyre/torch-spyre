@@ -18,6 +18,15 @@
 /torch_spyre/_inductor/  @dgrove-oss @avery-blanchard @cyang49 @marnold-ibm @tardieu
 /torch_spyre/inductor/  @dgrove-oss @avery-blanchard @cyang49 @marnold-ibm @tardieu
 
+# Cost model implementation, features, and reporting
+/torch_spyre/_inductor/cost_model.py  @dgrove-oss @avery-blanchard @cyang49 @marnold-ibm @tardieu @AdnanHoque
+/torch_spyre/_inductor/cost_model_pass.py  @dgrove-oss @avery-blanchard @cyang49 @marnold-ibm @tardieu @AdnanHoque
+/torch_spyre/_inductor/cost_features.py  @dgrove-oss @avery-blanchard @cyang49 @marnold-ibm @tardieu @AdnanHoque
+/torch_spyre/_inductor/dump_cost_model.py  @dgrove-oss @avery-blanchard @cyang49 @marnold-ibm @tardieu @AdnanHoque
+
+# LX scratchpad planning
+/torch_spyre/_inductor/scratchpad/  @dgrove-oss @avery-blanchard @cyang49 @marnold-ibm @tardieu @chichun-charlie-liu
+
 # Device, execution, memory, and C++ runtime
 /torch_spyre/device/     @JRosenkranz @thoangtrvn @ani300
 /torch_spyre/execution/  @JRosenkranz @thoangtrvn @ani300
@@ -60,4 +69,7 @@
 /tools/install-ktir.sh         @dgrove-oss @avery-blanchard @tardieu
 
 # tools used to tune/refresh the cost model used in inductor
-/tools/cost_model/  @dgrove-oss @avery-blanchard @cyang49 @marnold-ibm @tardieu
+/tools/cost_model/  @dgrove-oss @avery-blanchard @cyang49 @marnold-ibm @tardieu @AdnanHoque
+
+# tools that check or capture the LX planner's decisions
+/tools/lx_planning/  @dgrove-oss @avery-blanchard @cyang49 @marnold-ibm @tardieu @chichun-charlie-liu

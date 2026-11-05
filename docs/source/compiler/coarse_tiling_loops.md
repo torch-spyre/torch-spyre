@@ -1041,7 +1041,15 @@ that `TensorArg` (the base address is fixed across iterations);
 `loop_count`, and `loop_tiled_dims`) as the original op, so the scheduler
 wraps both in the same `CountedLoopSchedulerNode`.  The `tiled_symbols` / `affine.apply`
 machinery computes the per-iteration slice offset automatically.  All
-outside consumers are patched to read the full buffer.
+outside consumers are patched to read the full buffer, and each one's load
+index is derived from the full buffer's layout while its `inner_fn` is
+traced (`_ReadThroughLayout` in `loop_tiling_common.py`): the producer's
+layout object, which `_divide_ranges` shrank to the tile and which the
+consumer's loader is bound to, presents the full buffer's host shape for the
+duration of the trace.  A downstream nest therefore shares nothing with this
+one but the full buffer in HBM.  In particular a dim the tile consumed whole,
+which has size 1 in the tile and so gets no term in an index traced against
+it, keeps its term.
 
 Beyond closing the post-stickify safety gap described above, splitting the
 crossing into two ops buys two more things for free, because the copy op is
@@ -1953,6 +1961,10 @@ Call sites, all following this exact shape:
 - `_patch_consumers` (in `coarse_tile.py`, `NameSwapHandler` imported
   from `insert_restickify.py`), patches an outside consumer's `inner_fn` to
   read the newly-promoted full buffer instead of the original tile-sized one.
+  For a copy-out it also traces the consumer with the producer's layout
+  presenting the full buffer's shape (`_ReadThroughLayout`), so the index is
+  the full buffer's by construction; for a reduction accumulator it rescales
+  the tile-traced index instead (`_NameAndIndexSwapHandler`).
 - `_patch_retiled_load_indexes` / `_RetileLoadIndexHandler`
   (both in `coarse_tile.py`), a distinct
   mechanism from name-swapping, detailed in the next subsection.
