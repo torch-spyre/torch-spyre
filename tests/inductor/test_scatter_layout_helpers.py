@@ -53,7 +53,7 @@ class TestDimOrderCompliance(unittest.TestCase):
         _ds = [8, 2, 1, 64]
         stl = SpyreTensorLayout(
             device_size=_ds,
-            stride_map=[128, 64, -1, 1],
+            stride_map=[128, 64, 0, 1],
             device_dtype=get_device_dtype(torch.float16),
             valid_elements={(0,): 8, (1, 3): 128, (2,): 1},
         )
@@ -66,7 +66,7 @@ class TestDimOrderCompliance(unittest.TestCase):
         _ds = [2, 8, 1, 64]
         stl = SpyreTensorLayout(
             device_size=_ds,
-            stride_map=[512, 64, -1, 1],
+            stride_map=[512, 64, 0, 1],
             device_dtype=get_device_dtype(torch.float16),
             valid_elements={(0,): 2, (1, 3): 512, (2,): 1},
         )
@@ -79,7 +79,7 @@ class TestDimOrderCompliance(unittest.TestCase):
         _ds = [2, 4, 1, 64]
         stl = SpyreTensorLayout(
             device_size=_ds,
-            stride_map=[256, 64, -1, 1],
+            stride_map=[256, 64, 0, 1],
             device_dtype=get_device_dtype(torch.float16),
             valid_elements={(0,): 2, (1, 3): 256, (2,): 1},
         )
@@ -153,7 +153,7 @@ class TestIaRotateStl(unittest.TestCase):
         _ds = [2, 4, 1, 64]
         original_stl = SpyreTensorLayout(
             device_size=_ds,
-            stride_map=[256, 64, -1, 1],
+            stride_map=[256, 64, 0, 1],
             device_dtype=get_device_dtype(torch.float16),
             valid_elements={(0,): 2, (1, 3): 256, (2,): 1},
         )
@@ -170,7 +170,7 @@ class TestIaRotateStl(unittest.TestCase):
         _ds = [8, 2, 1, 64]
         original_stl = SpyreTensorLayout(
             device_size=_ds,
-            stride_map=[128, 64, -1, 1],
+            stride_map=[128, 64, 0, 1],
             device_dtype=get_device_dtype(torch.float16),
             valid_elements={(0,): 8, (1, 3): 128, (2,): 1},
         )
@@ -184,7 +184,7 @@ class TestIaRotateStl(unittest.TestCase):
         _ds = [2, 8, 1, 64]
         original_stl = SpyreTensorLayout(
             device_size=_ds,
-            stride_map=[512, 64, -1, 1],
+            stride_map=[512, 64, 0, 1],
             device_dtype=get_device_dtype(torch.float16),
             valid_elements={(0,): 2, (1, 3): 512, (2,): 1},
         )
@@ -267,7 +267,7 @@ class TestIndirectInsideStick(unittest.TestCase):
         """A rotation only reorders dims, so relabelling stays safe."""
         original_stl = SpyreTensorLayout(
             device_size=[2, 8, 1, 64],
-            stride_map=[512, 64, -1, 1],
+            stride_map=[512, 64, 0, 1],
             device_dtype=get_device_dtype(torch.float16),
             valid_elements={(0,): 2, (1, 3): 512, (2,): 1},
         )

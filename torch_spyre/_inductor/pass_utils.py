@@ -2304,7 +2304,7 @@ def restickify_stride_map(
     new_stride_map = list(old_stride_map)
     new_stride_map[-1] = new_sd_host_stride
     new_stride_map[old_sd_outer_dim] = (
-        -1 if new_sd_host_stride < 0 else new_sd_host_stride * stick_size
+        0 if new_sd_host_stride <= 0 else new_sd_host_stride * stick_size
     )
     new_stride_map[new_sd_outer_dim] = old_sd_host_stride
     return new_stride_map
@@ -2720,7 +2720,7 @@ def compute_restickify_needed(
         # dimensions, which may include size-1 dims (e.g. M=1) that cause
         # SpyreTensorLayout constructor 2 to produce an extra device dimension.
         # Rule: find the K-chunk dim (stride == elem_stride * stick_size), expand
-        # it by stick_size, promote the element stride there, set stick to -1.
+        # it by stick_size, promote the element stride there, set stick to 0.
         stick_size = get_elem_in_stick(in_host.dtype)
         ds = list(in_stl.device_size)
         sm = list(in_stl.stride_map)

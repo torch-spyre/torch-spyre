@@ -8154,7 +8154,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     64,
                     [[32, 32, 1, 1, 64], [3, 3, 1, 1, 64]],
-                    [[32, 1, -1, 65536, 1024], [1, 3, -1, 9, 9]],
+                    [[32, 1, 0, 65536, 1024], [1, 3, 0, 9, 9]],
                 ),
                 "2x64_ksize5_stride2": (
                     cached_randn((2, 64, 32, 32)),
@@ -8164,7 +8164,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (2, 2),
                     64,
                     [[32, 32, 1, 2, 64], [5, 5, 1, 1, 64]],
-                    [[32, 1, -1, 65536, 1024], [1, 5, -1, 25, 25]],
+                    [[32, 1, 0, 65536, 1024], [1, 5, 0, 25, 25]],
                 ),
                 "8x64_ksize3": (
                     cached_randn((8, 64, 128, 128)),
@@ -8174,7 +8174,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     64,
                     [[128, 128, 1, 8, 64], [3, 3, 1, 1, 64]],
-                    [[128, 1, -1, 1048576, 16384], [1, 3, -1, 9, 9]],
+                    [[128, 1, 0, 1048576, 16384], [1, 3, 0, 9, 9]],
                 ),
                 # Same shape/layouts as 8x64_ksize3, padding=(1, 1): xfail, see
                 # the expect_fail note above.  The layouts are inherited from the
@@ -8187,7 +8187,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     64,
                     [[128, 128, 1, 8, 64], [3, 3, 1, 1, 64]],
-                    [[128, 1, -1, 1048576, 16384], [1, 3, -1, 9, 9]],
+                    [[128, 1, 0, 1048576, 16384], [1, 3, 0, 9, 9]],
                 ),
                 "1x3x64_ksize3": (
                     cached_randn((1, 3, 64, 64)),
@@ -8197,7 +8197,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     3,
                     [[64, 64, 1, 1, 64], [3, 3, 1, 1, 64]],
-                    [[64, 1, -1, 12288, 4096], [1, 3, -1, 9, 9]],
+                    [[64, 1, 0, 12288, 4096], [1, 3, 0, 9, 9]],
                 ),
                 # C == 1 (single-channel depthwise), strided.  The activation's
                 # channel axis is size 1, so its device stick is degenerate (stick
@@ -8212,7 +8212,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (2, 2),
                     1,
                     [[128, 128, 1, 8, 64], [3, 3, 1, 1, 64]],
-                    [[128, 1, -1, 16384, -1], [1, 3, -1, 9, -1]],
+                    [[128, 1, 0, 16384, 0], [1, 3, 0, 9, 0]],
                 ),
                 "1x3x64_ksize_1x3": (
                     cached_randn((1, 3, 64, 64)),
@@ -8222,7 +8222,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     3,
                     [[64, 64, 1, 1, 64], [3, 1, 1, 1, 64]],
-                    [[64, 1, -1, 12288, 4096], [1, 3, -1, 3, 3]],
+                    [[64, 1, 0, 12288, 4096], [1, 3, 0, 3, 3]],
                 ),
                 "1x3x64_ksize_3x1": (
                     cached_randn((1, 3, 64, 64)),
@@ -8232,7 +8232,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     3,
                     [[64, 64, 1, 1, 64], [1, 3, 1, 1, 64]],
-                    [[64, 1, -1, 12288, 4096], [1, 1, -1, 3, 3]],
+                    [[64, 1, 0, 12288, 4096], [1, 1, 0, 3, 3]],
                 ),
                 "1x3x64x1_ksize_3x1": (
                     cached_randn((1, 3, 64, 1)),
@@ -8242,7 +8242,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     3,
                     [[1, 64, 1, 1, 64], [1, 3, 1, 1, 64]],
-                    [[1, 1, -1, 192, 64], [1, 1, -1, 3, 3]],
+                    [[1, 1, 0, 192, 64], [1, 1, 0, 3, 3]],
                 ),
                 "1x3x64x1_ksize_1x1": (
                     cached_randn((1, 3, 64, 1)),
@@ -8252,7 +8252,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     3,
                     [[1, 64, 1, 1, 64], [1, 1, 1, 1, 64]],
-                    [[1, 1, -1, 192, 64], [1, 1, -1, 1, 1]],
+                    [[1, 1, 0, 192, 64], [1, 1, 0, 1, 1]],
                 ),
                 "2x3x32_ksize1": (
                     cached_randn((2, 3, 32, 32)),
@@ -8262,7 +8262,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     3,
                     [[32, 32, 1, 2, 64], [1, 1, 1, 1, 64]],
-                    [[32, 1, -1, 3072, 1024], [1, 1, -1, 1, 1]],
+                    [[32, 1, 0, 3072, 1024], [1, 1, 0, 1, 1]],
                 ),
                 "1x16x64_ksize3": (
                     cached_randn((1, 16, 64, 64)),
@@ -8272,7 +8272,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     16,
                     [[64, 64, 1, 1, 64], [3, 3, 1, 1, 64]],
-                    [[64, 1, -1, 65536, 4096], [1, 3, -1, 9, 9]],
+                    [[64, 1, 0, 65536, 4096], [1, 3, 0, 9, 9]],
                 ),
                 "2x32_ksize1_stride2": (
                     cached_randn((2, 32, 64, 64)),
@@ -8282,7 +8282,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (2, 2),
                     32,
                     [[64, 64, 1, 2, 64], [1, 1, 1, 1, 64]],
-                    [[64, 1, -1, 131072, 4096], [1, 1, -1, 1, 1]],
+                    [[64, 1, 0, 131072, 4096], [1, 1, 0, 1, 1]],
                 ),
                 "1x3x128_ksize5": (
                     cached_randn((1, 3, 128, 128)),
@@ -8292,7 +8292,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     3,
                     [[128, 128, 1, 1, 64], [5, 5, 1, 1, 64]],
-                    [[128, 1, -1, 49152, 16384], [1, 5, -1, 25, 25]],
+                    [[128, 1, 0, 49152, 16384], [1, 5, 0, 25, 25]],
                 ),
                 # With bias, conv2d_with_bias decomposes to spyre.conv2d + add, so
                 # the depthwise output is an intermediate the add reads rather than
@@ -8306,7 +8306,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     64,
                     [[32, 32, 1, 1, 64], [3, 3, 1, 1, 64]],
-                    [[32, 1, -1, 65536, 1024], [1, 3, -1, 9, 9]],
+                    [[32, 1, 0, 65536, 1024], [1, 3, 0, 9, 9]],
                 ),
                 "2x32_ksize1_stride2_bias": (
                     cached_randn((2, 32, 64, 64)),
@@ -8316,7 +8316,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (2, 2),
                     32,
                     [[64, 64, 1, 2, 64], [1, 1, 1, 1, 64]],
-                    [[64, 1, -1, 131072, 4096], [1, 1, -1, 1, 1]],
+                    [[64, 1, 0, 131072, 4096], [1, 1, 0, 1, 1]],
                 ),
             },
         },
@@ -8404,7 +8404,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                     64,
                     [[32, 1, 1, 64], [3, 1, 1, 64]],
-                    [[1, -1, 2048, 32], [1, -1, 3, 3]],
+                    [[1, 0, 2048, 32], [1, 0, 3, 3]],
                 ),
                 "8x64_ksize3": (
                     cached_randn((8, 64, 128)),
@@ -8414,7 +8414,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                     64,
                     [[128, 1, 8, 64], [3, 1, 1, 64]],
-                    [[1, -1, 8192, 128], [1, -1, 3, 3]],
+                    [[1, 0, 8192, 128], [1, 0, 3, 3]],
                 ),
                 # Same shape/layouts as 8x64_ksize3, padding=1: rejected, see
                 # the expect_raise note above.  The layouts are inherited from the
@@ -8427,7 +8427,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                     64,
                     [[128, 1, 8, 64], [3, 1, 1, 64]],
-                    [[1, -1, 8192, 128], [1, -1, 3, 3]],
+                    [[1, 0, 8192, 128], [1, 0, 3, 3]],
                 ),
                 "1x3x64_ksize3": (
                     cached_randn((1, 3, 64)),
@@ -8437,7 +8437,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                     3,
                     [[64, 1, 1, 64], [3, 1, 1, 64]],
-                    [[1, -1, 4096, 64], [1, -1, 3, 3]],
+                    [[1, 0, 4096, 64], [1, 0, 3, 3]],
                 ),
                 "1x3x64_ksize_1": (
                     cached_randn((1, 3, 64)),
@@ -8447,7 +8447,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                     3,
                     [[64, 1, 1, 64], [1, 1, 1, 64]],
-                    [[1, -1, 192, 64], [1, -1, 1, 1]],
+                    [[1, 0, 192, 64], [1, 0, 1, 1]],
                 ),
                 "2x3x32_ksize1": (
                     cached_randn((2, 3, 32)),
@@ -8457,7 +8457,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                     3,
                     [[32, 1, 2, 64], [1, 1, 1, 64]],
-                    [[1, -1, 96, 32], [1, -1, 1, 1]],
+                    [[1, 0, 96, 32], [1, 0, 1, 1]],
                 ),
                 "1x16x64_ksize3": (
                     cached_randn((1, 16, 64)),
@@ -8467,7 +8467,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                     16,
                     [[64, 1, 1, 64], [3, 1, 1, 64]],
-                    [[1, -1, 1024, 64], [1, -1, 3, 3]],
+                    [[1, 0, 1024, 64], [1, 0, 3, 3]],
                 ),
                 "2x32_ksize1_stride2": (
                     cached_randn((2, 32, 64)),
@@ -8477,7 +8477,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     2,
                     32,
                     [[64, 1, 2, 64], [1, 1, 1, 64]],
-                    [[1, -1, 2048, 64], [1, -1, 1, 1]],
+                    [[1, 0, 2048, 64], [1, 0, 1, 1]],
                 ),
                 "1x3x128_ksize5": (
                     cached_randn((1, 3, 128)),
@@ -8487,7 +8487,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                     3,
                     [[128, 1, 1, 64], [5, 1, 1, 64]],
-                    [[1, -1, 384, 128], [1, -1, 5, 5]],
+                    [[1, 0, 384, 128], [1, 0, 5, 5]],
                 ),
             },
         },
