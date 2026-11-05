@@ -1214,10 +1214,8 @@ def _get_sdsc_spec_data_format(op, arg_data_format):
     """Return the SDSC compute format for an operation.
 
     dtype-conversion ops (fp32↔int32) and native int32 ops (addi32toi32,
-    muli32toi32) are bound to IEEE_FP32 as their compute type in the DDL
-    templates (unary_parallel.ddl, broadcast_ops.ddl), while their int32
-    tensors keep their own descriptor format.  All other ops pass the
-    tensor format through unchanged.
+    muli32toi32) are bound to IEEE_FP32.  All other ops pass the tensor
+    format through unchanged.
     """
     if op in (FP32TOINT32_OP, INT32TOFP32_OP, *SPYRE_INT32_OPS):
         return DataFormats.IEEE_FP32
