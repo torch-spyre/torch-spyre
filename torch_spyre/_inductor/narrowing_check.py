@@ -32,6 +32,8 @@ import warnings
 import torch
 from torch._guards import TracingContext
 
+from torch_spyre.ops.warning_types import DeclaredRangeNarrowedWarning
+
 MODE_ENV = "TORCH_SPYRE_NARROWING_CHECK"
 _MODES = ("warn", "error", "off")
 _DEFAULT_MODE = "warn"
@@ -39,10 +41,6 @@ _DEFAULT_MODE = "warn"
 
 class DeclaredRangeNarrowedError(RuntimeError):
     """A guard rejects sizes in a declared range, in ``error`` mode."""
-
-
-class DeclaredRangeNarrowedWarning(UserWarning):
-    """A guard rejects sizes in a declared range; those sizes will recompile."""
 
 
 def _mode():

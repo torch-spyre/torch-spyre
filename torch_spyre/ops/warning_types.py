@@ -25,3 +25,12 @@ class FallbackWarning(UserWarning):
 class RetileWarning(UserWarning):
     """Warning issued when an eager result had to be re-tiled to the layout a
     compiled graph assumes for it."""
+
+
+class DeclaredRangeNarrowedWarning(UserWarning):
+    """A guard rejects sizes in a declared dynamic range; those sizes will
+    compile a separate program."""
+
+
+class RecompileWarning(UserWarning):
+    """User code recompiled and broke a declared dynamic range."""
