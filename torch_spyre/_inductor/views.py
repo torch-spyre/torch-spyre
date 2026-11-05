@@ -278,6 +278,9 @@ def compute_coordinates(
         f"compute_coordinates requires concrete sizes, got {size}"
     )
 
+    # A constant index (a rank-0 access) may arrive as a bare int; the code
+    # below relies on the sympy API (``free_symbols``, ``xreplace``).
+    index = sympy.sympify(index)
     # Convert ModularIndexing expressions to sympy.Mod before processing
     index = convert_modular_indexing(index)
     repeat_info = find_repeat_vars([index], var_ranges)
