@@ -1118,6 +1118,36 @@ class TileOwnershipGroupingTests(unittest.TestCase):
         for name in model_ops:
             self.assertIn(name, CollectTilingPasses.lx_resident, _describe(tiling))
 
+    def test_a_consumer_in_the_next_nest_reads_every_row_of_a_unit_row_producer(
+        self,
+    ):
+        # The producer takes one row per tile; the consumer runs a nest of its
+        # own, so it is redirected to the producer's full buffer, and it is
+        # re-traced against the producer's one-row tile on the way. A size-1
+        # dim has no term in an index, so the consumer's row vanished from
+        # its read and every row of a consumer tile read the first of its 16.
+        x = torch.randn(64, 64, 128, dtype=torch.float16)
+        y = torch.randn(64, 64, 128, dtype=torch.float16)
+        unit_rows = TileSpec((TileAxis(host_dim=0, count=64),))
+
+        def offered(alloc, op, max_cores):
+            return [unit_rows] if _reads_graph_inputs_only(op) else [_D0_BY_4]
+
+        with patch.object(CoOptimizingAllocator, "_tiling_candidates", offered):
+            cpu, device, tiling = self._compile(lambda x, y: (x + y) * 2, (x, y))
+        self._assert_close(device, cpu)
+        self.assertEqual(len(_nests(tiling)), 2, _describe(tiling))
+        (consumer,) = [
+            name
+            for name, info in tiling.items()
+            if tuple(info.loop_count) == (4,)
+            and not name.startswith("coarse_tile_copy_")
+        ]
+        # The redirected read reached codegen advancing a tile's 16 rows along
+        # dim 0: without this the body would pass on a read held still.
+        outer_levels = [levels[0] for levels in tiling[consumer].tiled_dims_per_read]
+        self.assertIn([(0, 16)], outer_levels, _describe(tiling))
+
     def test_untiled_op_splits_a_skip_connection_into_two_nests(self):
         # a -> b -> c with a -> c as well. a and c may only be tiled d0:4 and
         # b, between them, only untiled. Loop groups are consecutive runs, so
