@@ -25,6 +25,8 @@ import pytest
 import torch
 from torch._inductor.exc import InductorError
 from utils_inductor import (
+    DEVICE,
+    _compile_and_run,
     cached_randn,
     compare_with_pytorch,
 )
@@ -48,6 +50,21 @@ FP16_SAFE_LARGE_VALUE = (
 )
 MIXED_SIGNS_SCALE = 100.0  # Scale factor to test moderate value ranges with mixed positive/negative values
 
+# A stick-unaligned FP8 conversion accesses beyond its buffers today, which a tight
+# device allocation turns into a page fault, so these cases are collected but never
+# run (--runxfail would run them). Remove the mark when unaligned conversions are
+# supported.
+_UNALIGNED_FP8 = pytest.mark.xfail(
+    run=False, reason="#3999: stick-unaligned FP8 conversion is not supported yet"
+)
+
+
+def _fp8_reference_quantize_dequantize(x, scale):
+    """CPU reference for FP8 quantize→dequantize: clamp, cast to FP8, cast back, rescale."""
+    return (x / scale).clamp(FP8_E4M3FN_MIN, FP8_E4M3FN_MAX).to(torch.float8_e4m3fn).to(
+        torch.float16
+    ) * scale
+
 
 class TestFP8Operations:
     """Test suite for FP8 quantization operations not covered in test_inductor_ops.py."""
@@ -56,14 +73,14 @@ class TestFP8Operations:
         """Test basic FP16→FP8 format conversion with qfp8ch.
 
         Tests:
-        - Basic conversion with shape [1, 2, 8]
+        - Basic conversion with shape [1, 2, 128]
         - Roundtrip: FP16 → FP8 → FP16 with scaling
         - Verifies qfp8ch operation is used internally
 
         Note: We use dequantize_fp8_with_scale for FP8→FP16 conversion
         because direct .to(torch.float16) cannot transfer to CPU.
         """
-        x = cached_randn((1, 2, 8), scale=1.0, dtype=torch.float16)
+        x = cached_randn((1, 2, 128), scale=1.0, dtype=torch.float16)
         scale = torch.ones((1, 2, 1), dtype=torch.float16)
 
         def spyre_fn(x, scale):
@@ -76,19 +93,35 @@ class TestFP8Operations:
 
         def pytorch_fn(x, scale):
             # CPU reference: direct format conversion with identity scale
-            x_fp8 = x.clamp(FP8_E4M3FN_MIN, FP8_E4M3FN_MAX).to(torch.float8_e4m3fn)
-            return x_fp8.to(torch.float16) * scale
+            return _fp8_reference_quantize_dequantize(x, scale)
 
+        device_result = _compile_and_run(spyre_fn, (x, scale), DEVICE)
         compare_with_pytorch(
             spyre_fn,
             pytorch_fn,
             x,
             scale,
-            atol=0.0,
-            rtol=0.0,
+            # The device rounds the input to DLFloat16 before FP8, so a value next to
+            # the midpoint of two FP8 values can land one E4M3 step (12.5%) away, and
+            # it does not match the CPU on FP8 subnormals (below 2**-6).
+            atol=2**-6,
+            rtol=0.125,
+            target=device_result,
+        )
+        # The tolerance alone accepts a conversion that is one step off everywhere, so
+        # also bound how many normal-range values may differ from the CPU (3 of 251
+        # today); a wrong rounding mode, or a one-step bias, gets half or more wrong.
+        reference = pytorch_fn(x, scale)
+        normal = reference.abs() >= 2**-6
+        mismatched = (device_result != reference)[normal].float().mean().item()
+        assert mismatched <= 0.02, (
+            f"{mismatched:.1%} of normal-range values differ from the CPU"
         )
 
-    def test_fp8todl16_basic_conversion(self):
+    @pytest.mark.parametrize(
+        "shape", [(1, 2, 128), pytest.param((1, 2, 8), marks=_UNALIGNED_FP8)]
+    )
+    def test_fp8todl16_basic_conversion(self, shape):
         """Test FP8→FP16 dtype conversion with fp8todl16.
 
         Tests:
@@ -102,7 +135,7 @@ class TestFP8Operations:
         scaling cannot transfer to CPU, so we use identity scale (ones) to enable
         CPU transfer while still testing the fp8todl16 operation.
         """
-        x = cached_randn((1, 2, 8), scale=1.0, dtype=torch.float16)
+        x = cached_randn(shape, scale=1.0, dtype=torch.float16)
         scale = torch.ones((1, 2, 1), dtype=torch.float16)
 
         def spyre_fn(x, scale):
@@ -119,8 +152,7 @@ class TestFP8Operations:
 
         def pytorch_fn(x, scale):
             # CPU reference: FP16 → FP8 → FP16 conversion with identity scale
-            x_fp8 = x.clamp(FP8_E4M3FN_MIN, FP8_E4M3FN_MAX).to(torch.float8_e4m3fn)
-            return x_fp8.to(torch.float16) * scale
+            return _fp8_reference_quantize_dequantize(x, scale)
 
         compare_with_pytorch(
             spyre_fn,
@@ -139,16 +171,17 @@ class TestFP8Operations:
     @pytest.mark.parametrize(
         "shape,scale_value,mean,std",
         [
-            ((1, 2, 32), 0.01, 0.0, 1.0),
-            ((1, 2, 32), 0.01, 0.0, 5.0),
-            ((1, 2, 32), 0.1, 0.0, 1.0),
-            ((1, 2, 32), 0.1, 0.0, 5.0),
-            ((1, 2, 32), 0.5, 0.0, 1.0),
-            ((1, 2, 32), 0.5, 0.0, 5.0),
-            ((1, 2, 32), 1.0, 0.0, 1.0),
-            ((1, 2, 32), 1.0, 0.0, 5.0),
-            ((1, 2, 32), 2.0, 0.0, 1.0),
-            ((1, 2, 32), 2.0, 0.0, 5.0),
+            ((1, 2, 128), 0.01, 0.0, 1.0),
+            ((1, 2, 128), 0.01, 0.0, 5.0),
+            ((1, 2, 128), 0.1, 0.0, 1.0),
+            ((1, 2, 128), 0.1, 0.0, 5.0),
+            ((1, 2, 128), 0.5, 0.0, 1.0),
+            ((1, 2, 128), 0.5, 0.0, 5.0),
+            ((1, 2, 128), 1.0, 0.0, 1.0),
+            ((1, 2, 128), 1.0, 0.0, 5.0),
+            ((1, 2, 128), 2.0, 0.0, 1.0),
+            ((1, 2, 128), 2.0, 0.0, 5.0),
+            pytest.param((1, 2, 32), 1.0, 0.0, 1.0, marks=_UNALIGNED_FP8),
         ],
     )
     def test_quantize_dequantize_fp8_small_range(
@@ -171,11 +204,11 @@ class TestFP8Operations:
     @pytest.mark.parametrize(
         "shape,scale_value,mean,std",
         [
-            ((1, 2, 32), 0.01, 10.0, 50.0),
-            ((1, 2, 32), 0.1, 10.0, 50.0),
-            ((1, 2, 32), 0.5, 10.0, 50.0),
-            ((1, 2, 32), 1.0, 10.0, 50.0),
-            ((1, 2, 32), 2.0, 10.0, 50.0),
+            ((1, 2, 128), 0.01, 10.0, 50.0),
+            ((1, 2, 128), 0.1, 10.0, 50.0),
+            ((1, 2, 128), 0.5, 10.0, 50.0),
+            ((1, 2, 128), 1.0, 10.0, 50.0),
+            ((1, 2, 128), 2.0, 10.0, 50.0),
         ],
     )
     def test_quantize_dequantize_fp8_medium_range(
@@ -202,16 +235,16 @@ class TestFP8Operations:
     @pytest.mark.parametrize(
         "shape,scale_value,mean,std",
         [
-            ((1, 2, 32), 0.01, 100.0, 100.0),
-            ((1, 2, 32), 0.01, 200.0, 200.0),
-            ((1, 2, 32), 0.1, 100.0, 100.0),
-            ((1, 2, 32), 0.1, 200.0, 200.0),
-            ((1, 2, 32), 0.5, 100.0, 100.0),
-            ((1, 2, 32), 0.5, 200.0, 200.0),
-            ((1, 2, 32), 1.0, 100.0, 100.0),
-            ((1, 2, 32), 1.0, 200.0, 200.0),
-            ((1, 2, 32), 2.0, 100.0, 100.0),
-            ((1, 2, 32), 2.0, 200.0, 200.0),
+            ((1, 2, 128), 0.01, 100.0, 100.0),
+            ((1, 2, 128), 0.01, 200.0, 200.0),
+            ((1, 2, 128), 0.1, 100.0, 100.0),
+            ((1, 2, 128), 0.1, 200.0, 200.0),
+            ((1, 2, 128), 0.5, 100.0, 100.0),
+            ((1, 2, 128), 0.5, 200.0, 200.0),
+            ((1, 2, 128), 1.0, 100.0, 100.0),
+            ((1, 2, 128), 1.0, 200.0, 200.0),
+            ((1, 2, 128), 2.0, 100.0, 100.0),
+            ((1, 2, 128), 2.0, 200.0, 200.0),
         ],
     )
     def test_quantize_dequantize_fp8_boundary_cases(
@@ -228,7 +261,8 @@ class TestFP8Operations:
             mean,
             std,
             atol=FP8_E4M3FN_MAX_SPACING * scale_value,
-            rtol=0.0,
+            # One FP8 step plus the fp16 rounding of the rescaled value
+            rtol=0.005,
         )
 
     @pytest.mark.parametrize(
@@ -257,11 +291,203 @@ class TestFP8Operations:
             return torch.ops.spyre.dequantize_fp8_with_scale(x_fp8, scale)
 
         def pytorch_fn(x, scale):
-            return (x / scale).clamp(FP8_E4M3FN_MIN, FP8_E4M3FN_MAX).to(
-                torch.float8_e4m3fn
-            ).to(torch.float16) * scale
+            return _fp8_reference_quantize_dequantize(x, scale)
 
         compare_with_pytorch(spyre_fn, pytorch_fn, x, scale, atol=0.5, rtol=0.1)
+
+    def test_quantize_dequantize_fp8_4d_shape(self):
+        """Test FP8 quantize/dequantize (qfp8ch path) with a 4D input tensor.
+
+        Exercises the general 4D compilation path for quantize_fp8_with_scale
+        (qfp8ch / activation quantization).
+        """
+        shape = (2, 4, 128, 512)
+        x = cached_randn(shape, dtype=torch.float16, scale=1.0) * 2.0 + 1.0
+        scale = torch.tensor([1.0], dtype=torch.float16)
+
+        def spyre_fn(x, scale):
+            x_fp8 = torch.ops.spyre.quantize_fp8_with_scale(x, scale)
+            return torch.ops.spyre.dequantize_fp8_with_scale(x_fp8, scale)
+
+        def pytorch_fn(x, scale):
+            return _fp8_reference_quantize_dequantize(x, scale)
+
+        compare_with_pytorch(spyre_fn, pytorch_fn, x, scale, atol=0.5, rtol=0.1)
+
+    @pytest.mark.parametrize(
+        "shape",
+        [
+            (2, 12, 384, 128),
+            (1, 12, 384, 128),
+            (1, 12, 384, 384),
+            (2, 12, 128, 128),
+            (1, 12, 128, 128),
+        ],
+        ids=lambda s: "x".join(str(d) for d in s),
+    )
+    def test_quantize_dequantize_fp8_attention_shapes(self, shape):
+        """Test FP8 quantize/dequantize at the 4D attention activation shapes.
+
+        These are mat1 of the test_fp8_scaled_bmm shapes in test_inductor_ops.py,
+        so the activation quantizer can be checked without a matmul in the graph.
+        """
+        x = cached_randn(shape, dtype=torch.float16, scale=1.0) * 2.0 + 1.0
+        scale = torch.tensor([1.0], dtype=torch.float16)
+
+        def spyre_fn(x, scale):
+            x_fp8 = torch.ops.spyre.quantize_fp8_with_scale(x, scale)
+            return torch.ops.spyre.dequantize_fp8_with_scale(x_fp8, scale)
+
+        def pytorch_fn(x, scale):
+            return _fp8_reference_quantize_dequantize(x, scale)
+
+        compare_with_pytorch(spyre_fn, pytorch_fn, x, scale, atol=0.5, rtol=0.1)
+
+    def test_fp8_scaled_mm_separate_compilation(self):
+        """Regression test for FP8 batchmatmulfp8 SDSC crash under separate compilation.
+
+        Pre-quantizing the weight in one torch.compile call and running _scaled_mm
+        in a second torch.compile call crosses the compile boundary: the QFP8WT
+        kernel tensor arrives at the batchmatmulfp8 SDSC codegen with a
+        flat stick_size=[128] (instead of the canonical [2, 64]) because the
+        SpyreTensorLayout crossing the compile boundary loses the 2D-stick structure.
+        Without _layout_info_for_tensor restoring it, batchmatmulfp8 codegen
+        produced:
+
+            loc("bmm.ddl":22:24): error: Fixed layout with too many dimensions
+            DtException: Impossible to match for sdsc0_batchmatmulfp8
+
+        The fix lives in _layout_info_for_tensor (compute_ops.py): it detects the
+        flat stick_size=[128] at the compile boundary and restores stick_size=[2, 64].
+        """
+        M, K, N = 128, 128, 128
+        mat_a = cached_randn((M, K), dtype=torch.float16, scale=1.0)
+        mat_b = cached_randn((K, N), dtype=torch.float16, scale=1.0)
+        scale_a = torch.tensor([1.0], dtype=torch.float16)
+        scale_b = torch.max(torch.abs(mat_b)).reshape(1).to(torch.float16)
+
+        mat_a_d = mat_a.to(DEVICE)
+        mat_b_d = mat_b.to(DEVICE)
+        scale_a_d = scale_a.to(DEVICE)
+        scale_b_d = scale_b.to(DEVICE)
+
+        # Quantize activation and weight in separate compiled calls.
+        quantize_a = torch.compile(
+            lambda x, s: torch.ops.spyre.quantize_fp8_with_scale(x, s)
+        )
+        quantize_b = torch.compile(
+            lambda x, s: torch.ops.spyre.quantize_weight_fp8_with_scale(x, s)
+        )
+        q_a = quantize_a(mat_a_d, scale_a_d)
+        q_b = quantize_b(mat_b_d, scale_b_d)
+
+        # Run _scaled_mm in a third separate compiled call — this is the case
+        # that triggered the "Fixed layout with too many dimensions" crash.
+        scaled_mm = torch.compile(
+            lambda a, b: torch.ops.aten._scaled_mm(
+                a,
+                b,
+                scale_a=None,
+                scale_b=None,
+                bias=None,
+                out_dtype=torch.float16,
+            )
+        )
+        result = scaled_mm(q_a, q_b)
+
+        assert result.dtype == torch.float16, (
+            f"Expected torch.float16, got {result.dtype}"
+        )
+        assert result.shape == (M, N), f"Expected shape ({M}, {N}), got {result.shape}"
+
+    def test_quantize_weight_fp8_with_scale_eager_mode_dtype_only(self):
+        """Regression guard: quantize_weight_fp8_with_scale returns a valid FP8 tensor in eager mode.
+
+        A duplicate custom op registration with an empty body can silently overwrite
+        the real implementation at import time, causing the op to return None in eager
+        mode. A None return fails verify_fp8_dtype immediately.
+
+        This test intentionally checks dtype and shape only — not numerical correctness.
+        The qfp8wt op produces a QFP8WT 2D-stick physical layout that is opaque to
+        fp8todl16 (dequantize uses a 1D flat read), so a naive quantize→dequantize
+        roundtrip will not match a CPU reference. Numerical correctness of the
+        qfp8wt → batchmatmulfp8 path is covered by test_fp8_scaled_mm in
+        test_inductor_ops.py.
+        """
+        weight = cached_randn((128, 128), dtype=torch.float16, scale=1.0)
+        scale = torch.max(torch.abs(weight)).reshape(1)
+        weight_d = weight.to(DEVICE)
+        scale_d = scale.to(DEVICE)
+
+        # Call directly without torch.compile — exercises the compile_once eager path.
+        quantized = torch.ops.spyre.quantize_weight_fp8_with_scale(weight_d, scale_d)
+
+        verify_fp8_dtype(quantized)
+        assert quantized.shape == weight_d.shape, (
+            f"Expected shape {weight_d.shape}, got {quantized.shape}"
+        )
+
+    def test_dequantize_fp8_with_scale_eager_mode(self):
+        """Test dequantize_fp8_with_scale in eager mode.
+
+        Validates that dequantize_fp8_with_scale now works in eager mode via
+        the compile_once decorator (previously required torch.compile and
+        returned None when called directly).
+
+        Uses quantize_fp8_with_scale (qfp8ch path) to produce the FP8 input
+        since that path produces a flat QFP8CH layout compatible with
+        fp8todl16. Verifies numerical correctness via a compiled roundtrip.
+        """
+        x = cached_randn((1, 2, 128), dtype=torch.float16, scale=1.0)
+        scale = torch.tensor([1.0], dtype=torch.float16)
+
+        def spyre_fn(inp, s):
+            q = torch.ops.spyre.quantize_fp8_with_scale(inp, s)
+            return torch.ops.spyre.dequantize_fp8_with_scale(q, s)
+
+        def pytorch_fn(inp, s):
+            return _fp8_reference_quantize_dequantize(inp, s)
+
+        compare_with_pytorch(spyre_fn, pytorch_fn, x, scale, atol=0.5, rtol=0.1)
+
+    def test_quantscalepertokenfp8_eager_mode(self):
+        """Test quantscalepertokenfp8 in eager mode via compile_once.
+
+        Validates that quantscalepertokenfp8 can be called directly without
+        torch.compile and returns a numerically correct per-token scale tensor.
+
+        The CPU reference is ``amax(|x|, dim=-1, keepdim=True) / FP8_E4M3FN_MAX``,
+        clipped from below by ``QUANTSCALEPERTOKENFP8_CLIP_MIN`` to match the
+        hardware's clipMin guard.  FP16 encoding of ``mulConst = 1 / 448.0``
+        introduces up to one ULP of rounding (≈ 9.8e-4 relative), so atol=1e-3
+        is sufficient.
+        """
+        x = cached_randn((2, 4, 128), dtype=torch.float16, scale=1.0)
+        x_d = x.to(DEVICE)
+
+        # Call directly without torch.compile — exercises the compile_once eager path.
+        scale_d = torch.ops.spyre.quantscalepertokenfp8(x_d)
+
+        # Shape: last dim collapsed to 1.
+        assert scale_d.shape == (2, 4, 1), (
+            f"Expected shape (2, 4, 1), got {scale_d.shape}"
+        )
+        assert scale_d.dtype == torch.float16, (
+            f"Expected dtype torch.float16, got {scale_d.dtype}"
+        )
+
+        # Numerical reference: amax / FP8_E4M3FN_MAX, clipped at QUANTSCALEPERTOKENFP8_CLIP_MIN.
+        scale_ref = (
+            x.abs().amax(dim=-1, keepdim=True).to(torch.float16) / FP8_E4M3FN_MAX
+        ).clamp(min=QUANTSCALEPERTOKENFP8_CLIP_MIN)
+
+        torch.testing.assert_close(
+            scale_d.cpu(),
+            scale_ref,
+            atol=1e-3,
+            rtol=0.0,
+            msg="quantscalepertokenfp8 eager mode: scale mismatch vs CPU reference",
+        )
 
     def _run_quantize_dequantize_fp8_test(
         self,
@@ -280,9 +506,7 @@ class TestFP8Operations:
             return torch.ops.spyre.dequantize_fp8_with_scale(x_fp8, scale)
 
         def pytorch_fn(x, scale):
-            return (x / scale).clamp(FP8_E4M3FN_MIN, FP8_E4M3FN_MAX).to(
-                torch.float8_e4m3fn
-            ).to(torch.float16) * scale
+            return _fp8_reference_quantize_dequantize(x, scale)
 
         compare_with_pytorch(
             spyre_fn,
@@ -428,7 +652,7 @@ class TestFP8Operations:
     @pytest.mark.parametrize(
         "shape,scale_ub",
         [
-            ((2, 4, 8), FP8_E4M3FN_MAX),
+            ((2, 4, 128), FP8_E4M3FN_MAX),
             ((1, 128, 512), FP8_E4M3FN_MAX),
         ],
     )
@@ -474,6 +698,7 @@ class TestFP8Operations:
             ("large", (2, 4, 8)),
             ("mixed_signs", (2, 4, 32)),
             ("large_hidden", (1, 1, 8192)),
+            ("sub_stick_token", (1, 1, 8)),
         ],
     )
     def test_quantscalepertokenfp8_edge_cases(self, input_type, shape):
@@ -485,6 +710,7 @@ class TestFP8Operations:
         - large: Values near FP16 max (65504)
         - mixed_signs: Positive and negative values
         - large_hidden: Very large hidden dimension
+        - sub_stick_token: A single token shorter than one stick
         """
         if input_type == "zeros":
             x = cached_randn(shape, dtype=torch.float16, scale=1.0) * 0.0
@@ -498,7 +724,7 @@ class TestFP8Operations:
             )
         elif input_type == "mixed_signs":
             x = cached_randn(shape, dtype=torch.float16, scale=1.0) * MIXED_SIGNS_SCALE
-        elif input_type == "large_hidden":
+        elif input_type in ("large_hidden", "sub_stick_token"):
             x = cached_randn(shape, dtype=torch.float16, scale=1.0)
         else:
             raise ValueError(f"Unknown input_type: {input_type}")

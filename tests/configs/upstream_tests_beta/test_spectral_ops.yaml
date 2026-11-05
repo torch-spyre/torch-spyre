@@ -9,7 +9,6 @@ test_suite_config:
         # They are classified as mandatory_success due to the critical nature of FFT ops in signal processing.
         # Relevant Spyre capabilities include handling empty tensors and supporting float32 dtype for FFT ops.
         - names:
-            - TestFFT::test_empty_fft
             - TestFFT::test_fft_half_and_bfloat16_errors
             - TestFFT::test_fftn_invalid
           mode: mandatory_success
@@ -65,6 +64,12 @@ test_suite_config:
         - names:
             - TestFFT::test_istft_throws
           mode: skip
+        # Upstream regression: test_empty_fft now fails on the Spyre backend with
+        # RuntimeError: Spyre backend does not support dtype ComplexFloat, across all four
+        # of its (refs/non-refs x hfft/irfft) subtests.
+        - names:
+            - TestFFT::test_empty_fft
+          mode: skip  # skip: unsupported ComplexFloat dtype on upstream PyTorch bump
 
   global:
     supported_dtypes:

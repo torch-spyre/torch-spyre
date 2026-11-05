@@ -16,8 +16,8 @@
 """Tests for SDSC IR artifact logging via spyre.inductor.sdsc logger.
 
 Verifies that the spyre.inductor.sdsc logger is correctly registered and
-that SDSC JSON and bundle.mlir content is emitted when logging is enabled
-via TORCH_LOGS="+spyre.inductor.sdsc".
+that SDSC JSON and bundle.mlir content is emitted at DEBUG when logging is
+enabled via TORCH_LOGS="+torch_spyre.inductor.sdsc".
 """
 
 import logging
@@ -52,12 +52,12 @@ class TestSdscJsonLogging:
     """Tests for SDSC JSON content logging in _compile_specs."""
 
     def test_sdsc_json_logged_when_enabled(self):
-        """SDSC JSON content is logged at INFO when logger is enabled."""
+        """SDSC JSON content is logged at DEBUG when logger is enabled."""
         from torch_spyre._inductor.codegen import bundle
 
         sdsc_log = logging.getLogger("spyre.inductor.sdsc")
         with patch.object(sdsc_log, "isEnabledFor", return_value=True):
-            with patch.object(sdsc_log, "info") as mock_info:
+            with patch.object(sdsc_log, "debug") as mock_debug:
                 fake_json = {"0_add": {"dscs_": []}}
                 with patch(
                     "torch_spyre._inductor.codegen.bundle.compile_op_spec",
@@ -75,10 +75,10 @@ class TestSdscJsonLogging:
                             output_dir=tmpdir,
                         )
 
-                info_calls = mock_info.call_args_list
+                debug_calls = mock_debug.call_args_list
                 sdsc_json_calls = [
                     c
-                    for c in info_calls
+                    for c in debug_calls
                     if len(c.args) >= 1 and "SDSC JSON" in c.args[0]
                 ]
                 assert len(sdsc_json_calls) == 1
@@ -90,7 +90,7 @@ class TestSdscJsonLogging:
 
         sdsc_log = logging.getLogger("spyre.inductor.sdsc")
         with patch.object(sdsc_log, "isEnabledFor", return_value=False):
-            with patch.object(sdsc_log, "info") as mock_info:
+            with patch.object(sdsc_log, "debug") as mock_debug:
                 fake_json = {"0_add": {"dscs_": []}}
                 with patch(
                     "torch_spyre._inductor.codegen.bundle.compile_op_spec",
@@ -110,7 +110,7 @@ class TestSdscJsonLogging:
 
                 sdsc_json_calls = [
                     c
-                    for c in mock_info.call_args_list
+                    for c in mock_debug.call_args_list
                     if len(c.args) >= 1 and "SDSC JSON" in c.args[0]
                 ]
                 assert len(sdsc_json_calls) == 0
@@ -120,12 +120,12 @@ class TestBundleMlirLogging:
     """Tests for bundle.mlir content logging in generate_bundle."""
 
     def test_bundle_mlir_logged_when_enabled(self):
-        """bundle.mlir content is logged at INFO when logger is enabled."""
+        """bundle.mlir content is logged at DEBUG when logger is enabled."""
         from torch_spyre._inductor.codegen import bundle
 
         sdsc_log = logging.getLogger("spyre.inductor.sdsc")
         with patch.object(sdsc_log, "isEnabledFor", return_value=True):
-            with patch.object(sdsc_log, "info") as mock_info:
+            with patch.object(sdsc_log, "debug") as mock_debug:
                 with (
                     patch.object(bundle.logger, "isEnabledFor", return_value=False),
                     patch(
@@ -150,7 +150,7 @@ class TestBundleMlirLogging:
 
                 mlir_calls = [
                     c
-                    for c in mock_info.call_args_list
+                    for c in mock_debug.call_args_list
                     if len(c.args) >= 1 and "BUNDLE MLIR" in c.args[0]
                 ]
                 assert len(mlir_calls) == 1
@@ -162,7 +162,7 @@ class TestBundleMlirLogging:
 
         sdsc_log = logging.getLogger("spyre.inductor.sdsc")
         with patch.object(sdsc_log, "isEnabledFor", return_value=False):
-            with patch.object(sdsc_log, "info") as mock_info:
+            with patch.object(sdsc_log, "debug") as mock_debug:
                 with (
                     patch.object(bundle.logger, "isEnabledFor", return_value=False),
                     patch(
@@ -187,7 +187,7 @@ class TestBundleMlirLogging:
 
                 mlir_calls = [
                     c
-                    for c in mock_info.call_args_list
+                    for c in mock_debug.call_args_list
                     if len(c.args) >= 1 and "BUNDLE MLIR" in c.args[0]
                 ]
                 assert len(mlir_calls) == 0

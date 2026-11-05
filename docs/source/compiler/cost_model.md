@@ -5,13 +5,21 @@ IR, without running it. It exists so the compiler can compare two candidate plan
 different coarse tile sizes, different work divisions, different scratchpad placements —
 cheaply enough to do it during compilation.
 
-It is **off by default** and adds nothing to a normal compile.
+This page documents the **standalone reporting pass** in `cost_model_pass.py`, reached through
+`SPYRE_DUMP_COST`. It is **off by default** and adds nothing to a normal compile. Turning it on
+**prints** a prediction and does nothing else — the pass never changes what gets compiled. The
+estimate is also returned as a value, so a pass or a tool can read it during compilation and
+choose between two plans; see
+[Using it as an API during compilation](#using-it-as-an-api-during-compilation). Nothing in the
+compiler consumes that report yet.
 
-Today, turning it on **prints** a prediction and does nothing else — it never changes what
-gets compiled. The estimate is also returned as a value, so a pass or a tool can read it
-during compilation and choose between two plans; see
-[Using it as an API during compilation](#using-it-as-an-api-during-compilation). Nothing in
-the compiler consumes it yet.
+The `cost_model.py` *module* is a different matter: the co-optimizer builds a symbolic
+`cost_expr` out of `predict_by_bundle`/`predict_bundles` and minimizes it, so the pricing this
+page describes does drive compilation on that path — it is how core divisions and LX residency
+get chosen. See [The co-optimizer](co_optimizer.md#cost-model) for how each
+solver consumes the expression, [Joint core-division + LX placement](sa_co_optimization.md#the-objective)
+for the simulated-annealing path, and
+[CpSatLayoutSolver](scratchpad_planning.md#cpsatlayoutsolver) for the CP-SAT one.
 
 > **Not to be confused with** `work_division.cost_model_matmul_division`, an unrelated
 > model that chooses a matmul work division. This page describes the whole-program
@@ -281,17 +289,141 @@ once rather than once each, and the turnaround and overlap terms are taken over 
 totals. Per-operation prices do not sum to the kernel price, which is why the per-operation
 column is an attribution.
 
-A matmul operand that the core split replicates is the one input charged more than once.
-When the split lies on a dimension the operand does not index, an M split for the right-hand
-operand or an N split for the left-hand one, every core of that split loads its own full copy
-of the operand's slice from HBM.
-The extractor records that factor per argument (`replication` in the report's traffic lines)
-and the HBM bytes scale by it while the operand is not LX-resident.
-Those loads run at a per-core ceiling of about 2.3 GB/s rather than at the shared HBM peak,
-so they are priced as the bytes each core reads over that rate (`mm_replicated_read_gbps_per_core`).
-Residency removes every replica load; a resident graph input keeps only its clone-in load.
-The rule is limited to matmul consumers because a pointwise kernel's broadcast operand was
-measured to load once per kernel regardless of the core split.
+A matmul input can be loaded separately by each consumer core or loaded once and shared.
+The extractor records the consumer count as `replication` and shared loads as `broadcast`.
+For separate loads, an M split repeats the right-hand input and an N split repeats the
+left-hand input. The HBM bytes scale by the consumer count, and those reads use the measured
+per-core rate (`mm_replicated_read_gbps_per_core`, about 2.3 GB/s).
+For a shared load, count the physical HBM bytes once, then charge extra delivery time using
+the existing estimate for the number of consumers. Do not turn that delivery into extra
+HBM bytes. The feature rule treats a single batch or an input with a broadcast tag as shared;
+it is not the standalone work chooser's dependency-based test.
+
+Keeping an input in LX removes these HBM reads; a graph input still needs its one copy into LX.
+Both matmul models use this input accounting. The bundled model keeps a separate estimate
+for rereading inputs when large output tiles are split across many cores. That fitted term
+has not been recalibrated together with shared-input delivery; their combined accuracy is
+not established for all shapes. Pointwise broadcast inputs retain their existing one-load rule.
+
+### Two matmul models: the planner's and the report's
+
+The scratchpad allocator and the report price a matmul with different models, so a
+fix to one is not a fix to the other.
+
+| caller | setting | matmul compute |
+|---|---|---|
+| scratchpad allocator (the CP-SAT objective that chooses plans) | `use_bundled_cost_model=False` | rebuilds batch, M, N and K from the features and calls `work_division._matmul_execution_cost` without its HBM term |
+| report (`cost_model_pass`, `SPYRE_DUMP_COST`) | default, `use_bundled_cost_model=True` | `matmul_macs / cores / (mac_peak * pt_eff)` |
+
+Both must count the same work over a loop. The rebuilt axes describe **one pass over the
+output buffer**: batch × M × N is `out_elems`, and K is the slice of the reduction one
+trip sees. `matmul_macs` is the work of the whole loop: the extractor multiplies one
+pass by the write's own loop factor. The allocator's estimate is therefore charged once
+per pass, `passes = matmul_macs / (out_elems * K)`, and never multiplied by the trip
+count directly. Two loops of 128 experts, each expert a `[64, 128]` output with K = 64:
+
+- a body that re-writes one `[64, 128]` buffer every trip makes 128 passes;
+- a body that writes its own slice of a stacked `[128, 64, 128]` buffer makes one pass,
+  because the batch already counts the 128 experts.
+
+Both cost 128 experts of work on both models. A reduction-tiled loop makes one pass per
+K slice; a loop that tiles an output dimension walks its output once and makes one pass.
+
+### Delivering the operand a loop walks
+
+The single-pass delivery estimate applies only when every op in the bundle is
+single-pass and the operand is partitioned and unreused (`replication == 1` and
+`matmul_macs <= elems`). Symbolic replication receives this charge only where it
+equals 1, complementing replicated-read pricing. Unknown reuse does not qualify.
+
+A `for_each_tile` loop that reads one expert bank (or one KV page) per trip streams that
+operand from main memory one slice per trip. When too few cores stream it, delivery is
+slower than the shared peak. The allocator adds that excess time for an input of a
+looped matmul only when all three hold:
+
+1. a `for_each_tile` variable advances the read's address, by the lowering's own
+   per-read verdict: its stamp, else a nonzero coefficient on the variable. This is the
+   same verdict that sets the read's loop factor;
+2. the loop walks the read once (loop factor 1);
+3. some division in the allocator's legal menu splits a dimension the read indexes.
+
+The excess is `bytes / (cores * rate) - bytes / peak`, and never below zero. Three reads
+look similar but are not eligible: a read whose index contains the variable but does not
+advance with it (the tests use the synthetic index `4096 * FloorDiv(u0, 2)`; no lowered
+kernel is known to produce such a read); a read walked only by a coarse-tiled dimension
+of the op; a read re-entered every trip.
+
+Condition 3 applies to the whole legal menu, not to the selected division's replication.
+Once it holds, even a candidate that replicates the read receives this estimate, using
+the op's total core count. Its existing replica or shared-load delivery charge remains
+additive. The expert-region screens support plan selection on the tested shapes; they
+do not separately calibrate this sum for replicated looped reads or establish whether
+the underlying costs overlap. Treat the sum as an empirical ranking proxy, not a
+measurement of separate physical costs. The `max(delivery, requests)` rule below combines
+only the loop-delivery and request estimates; it does not include the replica or
+shared-load delivery charge.
+
+The report leaves this estimate out. It extracts features without the legal menu, so
+condition 3 never holds there, and its totals need not rank eligible looped-matmul plans
+the way the allocator does.
+
+The loop estimate reuses the single-pass rate, selected by the 32/128/512-token
+expert-loop sweep. Scaling it by replication did not improve that screen; a
+replication-aware model needs a measured multicast rate. Coarse loops are excluded
+from this delivery estimate because their delivery was not measured and they have
+separate re-read pricing.
+
+### DMA requests of a loop matmul's operand reads
+
+A core reads its slice of an operand as contiguous runs, and each run is one DMA request.
+A request has a fixed cost, so a slice cut into many tiny runs is slow even when its bytes
+are few. The transport term already prices this with a calibrated request law. The same
+law prices each HBM input of a matmul inside a loop (`loop_trip > 1`):
+
+- requests per trip = the read's own footprint per trip / one core's contiguous run (a
+  run ends at the innermost split of the axes the read indexes), floored at one maximum
+  burst and capped at one 128-byte word;
+- each request costs the calibrated ns of the largest calibrated core count at or below
+  the op's (22 cores take the 16-core rate, 11 take the 8-core rate);
+- the excess over `bytes / peak`, times the trips, times `(1 - is_lx)`.
+
+This includes coarse loops with proven operand geometry. They receive the request
+estimate but not the `for_each_tile` delivery estimate above.
+
+Toy example: one expert of the MoE gate bank is `[2816, 704]` in a layout that keeps each
+row's 11 sticks together. Split the columns 11 ways (on 22 cores) and every core gets one
+128-byte stick of every row: 2816 × 11 = 30,976 requests per trip. At 7.5 ns that is
+232 µs, against 26.4 µs to move the bytes, so 206 µs per trip, 26.35 ms over 128 experts.
+Split K 4 ways instead and each core reads whole rows, one long run: no excess.
+
+The loop-delivery estimate above prices the same bytes for a different reason (too few
+cores streaming them). Delivery takes as long as the slower of the two, so a read is
+charged `max(delivery, requests)`, never their sum, and this term adds only the part the
+estimate does not already charge. Both sides aggregate reads the same way: a graph input
+read by several ops of one kernel is one load, charged once at the slowest of its reads;
+any other read is charged on its own. With two reads of one graph input at (delivery,
+requests) = (10, 10) and (1, 20), the load is delivered in 20: the estimate charges 10
+and this term adds 10, not 19.
+
+Where it does not apply:
+
+- a single-pass matmul (no loop) keeps its previous price, which keeps this term disjoint
+  from any single-pass delivery estimate;
+- a read whose geometry is not proven (another device dtype, a gather or indirect index,
+  or a stick split that some candidate of the menu cannot keep whole) keeps its previous
+  price for every candidate;
+- plain copies keep their existing transport term. One-input/one-output arithmetic
+  ops with proven geometry use that term too, in any bundle, looped or not; the
+  general read-burst term then declines them to avoid a second request charge.
+  This arithmetic extension uses the per-trip footprint and the rate at the largest
+  calibrated core count at or below the choice. At an uncalibrated count this adds
+  pricing where the general burst term charged zero. A matmul never enters the
+  transport term.
+
+The report has no menu, so the delivery estimate is absent there and the report charges
+the whole request excess. Two things are assumptions, not measurements: the rate at core
+counts the calibration never visited, and that the two bottlenecks combine by `max`
+rather than adding.
 
 `spyre_fuse_nodes` fuses everything it can — contiguous Spyre nodes accumulate in order, and
 only a node that is not on the device starts a new bundle. No size limit, no cost heuristic,
@@ -389,7 +521,7 @@ checkout builds its own database from zero:
 ```bash
 python3 docs/source/user_guide/examples/run_cost_model_sweep.py --dry-run   # what it would run
 python3 docs/source/user_guide/examples/run_cost_model_sweep.py --limit 20  # a timed pilot
-python3 docs/source/user_guide/examples/run_cost_model_sweep.py             # 1535 configurations
+python3 docs/source/user_guide/examples/run_cost_model_sweep.py             # 1762 configurations
 python3 tools/cost_model/eval_model.py                                      # score, no hardware
 ```
 

@@ -15,10 +15,12 @@
 import torch
 from torch_spyre._C import (
     SymbolicArg,
+    SymbolicArgKind,
     launch_jobplan,
     prepare_kernel,
     register_kernel_provenance,
 )
+from torch_spyre._inductor.codegen.compute_ops import SymbolKind
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.kernel_provenance import KernelProvenanceDescriptor
 from torch_spyre._inductor.profiler_event import (
@@ -33,16 +35,57 @@ from torch_spyre.profiler._ffdc import (
 logger = get_inductor_logger("kernel_runner")
 
 
+def _symbolic_arg(sk: SymbolKind, arg_offset: int) -> SymbolicArg:
+    """The launch-time resolution of one bundle input_arg."""
+    if sk.is_shard_kernel:
+        # Core sk.core_idx's own shard of a sharded tensor (non-unified HBM).
+        return SymbolicArg(
+            kind=SymbolicArgKind.kShardAddress,
+            tensor_id=sk.arg_index + arg_offset,
+            dim_index=sk.core_idx,
+            value=sk.offset,
+            num_shards=sk.split_count,
+        )
+    return SymbolicArg(
+        kind=SymbolicArgKind.kAddress, tensor_id=sk.arg_index + arg_offset
+    )
+
+
 class SpyreUnimplementedRunner:
     def __init__(self, name: str, op: str):
         self.kernel_name = name
         self.op = op
 
     @with_ffdc(CATEGORY_UNIMPLEMENTED, logger, code_dir_attr=None)
-    def run(self, *args, **kw_args):
+    def run(self, *args, **kwargs):
         raise RuntimeError(
             f"Invoked {self.kernel_name} which contains"
             f" unimplemented operation {self.op}"
+        )
+
+
+class SpyreFrontendOnlyRunner:
+    """Stands in for a kernel whose backend compile was deliberately skipped.
+
+    ``config.frontend_only`` stops a compile before the backend compiler, so there
+    is no spyreCodeDir to prepare and nothing to launch. Failing at call time
+    rather than at compile time is the point: the frontend runs to completion and
+    is measured, and only an attempt to actually execute reports the gap.
+    """
+
+    def __init__(self, name: str, code_dir: str):
+        self.kernel_name = name
+        self.code_dir = code_dir
+        self.profiler_event_name = None
+
+    # No @with_ffdc, unlike every other runner here: this failure is the mode
+    # working as asked, not a first failure worth capturing diagnostics for.
+    def run(self, *args, **kw_args):
+        raise RuntimeError(
+            f"{self.kernel_name} was compiled with TORCH_SPYRE_FRONTEND_ONLY=1: "
+            "the backend compiler never ran, so there is no kernel to launch. "
+            f"Backend input was left in {self.code_dir}. Unset "
+            "TORCH_SPYRE_FRONTEND_ONLY to produce a runnable kernel."
         )
 
 
@@ -60,11 +103,18 @@ class SpyreSDSCKernelRunner:
         name: str,
         code_dir: str,
         kernel_provenance: KernelProvenanceDescriptor | None = None,
+        symbol_kinds: list[SymbolKind] | None = None,
+        sdsc_bundle_dir_prefix: str | None = None,
     ):
         self.kernel_name = name
         self.code_dir = code_dir
         self.kernel_provenance = kernel_provenance
+        # Canonical symbol order returned by generate_bundle()
+        self.symbol_kinds: list[SymbolKind] = (
+            symbol_kinds if symbol_kinds is not None else []
+        )
         self.profiler_event_name: str | None
+        self.sdsc_bundle_dir_prefix = sdsc_bundle_dir_prefix or ""
         self._jobplan = None  # initialised lazily, not pickled
 
         if kernel_provenance is None:
@@ -81,6 +131,25 @@ class SpyreSDSCKernelRunner:
                 list(kernel_provenance.debug_handle_ids),
             )
 
+        # Build the SymbolicArg payload from the canonical symbol order
+        # that generate_bundle() returned and stored on this runner.
+        # symbol_kinds matches the MLIR input_arg slot order: pool first
+        # (when frontend_pool_allocation is active), then kernel tensor
+        # args in arg_index order. The payload is invariant across launches.
+        if self.symbol_kinds:
+            if self.symbol_kinds[0].is_pool:
+                # call_kernel prepends the pool tensor to args, so it sits at
+                # args[0].  Kernel tensor arg_indices are 0-based among kernel
+                # tensors only, so add 1 to account for the pool.
+                self._symbolic_args: list[SymbolicArg] | None = (
+                    [SymbolicArg(kind=SymbolicArgKind.kAddress, tensor_id=0)]
+                ) + ([_symbolic_arg(sk, 1) for sk in self.symbol_kinds[1:]])
+            else:
+                # No pool param — arg_index maps directly to args position.
+                self._symbolic_args = [_symbolic_arg(sk, 0) for sk in self.symbol_kinds]
+        else:
+            self._symbolic_args = None
+
     @property
     def jobplan(self):
         if self._jobplan is None:
@@ -91,23 +160,25 @@ class SpyreSDSCKernelRunner:
             # prepare_kernel(), which calls into JobPlanBuilder/getDefaultStream().
             torch.spyre._impl._lazy_init()
             spyrecode_dir = self.code_dir + "/spyreCodeDir"
-            if self.profiler_event_name is None:
-                self._jobplan = prepare_kernel(spyrecode_dir)
-            else:
-                with torch.profiler.record_function(
-                    f"prepare_kernel:{self.kernel_name}"
-                ):
+            with torch.profiler.record_function(f"prepare_kernel:{self.kernel_name}"):
+                if self.profiler_event_name is None:
                     self._jobplan = prepare_kernel(
                         spyrecode_dir,
-                        profiler_name=self.profiler_event_name,
+                        sdsc_bundle_dir_prefix=self.sdsc_bundle_dir_prefix,
+                    )
+                else:
+                    self._jobplan = prepare_kernel(
+                        spyrecode_dir,
+                        profiler_event_name=self.profiler_event_name,
+                        sdsc_bundle_dir_prefix=self.sdsc_bundle_dir_prefix,
                     )
         return self._jobplan
 
     @with_ffdc(CATEGORY_RUNTIME_LAUNCH, logger)
-    def run(self, *args, symbolic_args: list[SymbolicArg] | None = None, **kw_args):
+    def run(self, *args):
         logger.info("RUN: %s %s", self.kernel_name, self.code_dir)
         with torch.profiler.record_function(f"launch_jobplan:{self.kernel_name}"):
-            if symbolic_args:
-                launch_jobplan(self.jobplan, args, symbolic_args)
+            if self._symbolic_args is not None:
+                launch_jobplan(self.jobplan, args, self._symbolic_args)
             else:
                 launch_jobplan(self.jobplan, args)

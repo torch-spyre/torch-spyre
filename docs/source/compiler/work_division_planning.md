@@ -410,6 +410,17 @@ floors are retained with the operation's work-division metadata when an IR pass
 reconstructs it. A later split may use any legal factor at least as large as the
 floor; it need not be a multiple of the original span factor.
 
+Overlapping view reads impose another hard domain. For example,
+`x.unfold(d, 4, 2)` reads a coordinate of the form `2*w + k`: the window
+variable `k` iterates over four values, but its physical device dimension
+holds only two. The planner splits `k` so each core reads at most two values.
+If `k` is reduced and must stay whole, each core instead gets one `w` value
+and one value of every physical dimension outside it. A preceding slice adds
+a base offset but does not change these restrictions. If no legal division
+fits the core budget, compilation raises `Unsupported` rather than emitting
+an incorrectly addressed read. A symbolic inner window extent is rejected
+until the planner can prove a safe bound for every runtime size.
+
 :::{admonition} What gets written to `iteration_space_ownership`
 :class: note
 
@@ -544,7 +555,9 @@ ring positions. The permutation is implemented in
 runtime. The flag `SPYRE_CORE_ID_K_FAST_EMISSION` (default on)
 controls this codegen-side permutation. The name is legacy from when
 k-fast was also a planner. The permutation runs whenever any planner
-picks a K-split.
+picks a K-split. It takes K as the matmul's last loop. Alignment can add
+range-1 loops after K, for example for a batch-1 matmul in a `for_each_tile`
+body. `simplify_op_spec` moves these batch loops to the front, so K stays last.
 
 :::{figure} ../_static/images/work-division/core-id-k-mapping.svg
 :alt: Default core order places the two K slices of one output tile four cores apart; contiguous_dim on K places them on adjacent cores.
@@ -559,18 +572,68 @@ hop instead of several.
 ### Scratchpad planning
 
 With `SPYRE_LX_PLANNER_RELAYOUT=1`, a supported LX copy can connect
-different producer and reader partitions. A matmul's split reduction makes
+different producer and consumer partitions. A matmul's split reduction makes
 its output partial, not its input: input placement uses the values each
-reader actually needs. Expansion to more cores uses the same ownership
-proof for pointwise and matmul readers. Existing core-domain, capacity,
+consumer actually needs. Expansion to more cores uses the same ownership
+proof for pointwise and matmul consumers. Existing core-domain, capacity,
 lifetime and whole-source fallback restrictions still apply; this does
 not change the work chooser's policy.
 
-Each pass plans one op at a time. When two adjacent ops share a tensor
-but select different per-core splits for it, the LX scratchpad planner
-sees a core-division mismatch and disqualifies the shared tensor from
-scratchpad reuse. The tensor is then routed through a DDR round-trip
-on the boundary, even though it could have stayed on-core.
+#### Split-K results in LX
+
+For `A[128,256] @ B[256,128]`, let eight producer cores use
+`(M,N,K)=(1,2,4)`. Each output column half is calculated by four cores,
+each adding 64 of the 256 terms. With K varying fastest, cores 0–3 calculate
+columns 0–63 and cores 4–7 calculate columns 64–127. The backend combines
+each group's partial sums. Only producer cores 3 and 7 write finished values.
+
+Let a pointwise consumer use `(M,N)=(8,1)`: consumer core `c` needs rows
+`16*c` through `16*c+15`, across all 128 columns.
+
+| Finished producer | Output held | Consumers | Piece sent to consumer `c` |
+|---|---|---|---|
+| 3 | All 128 rows, columns 0–63 | 0–7 | Its 16 rows, columns 0–63 |
+| 7 | All 128 rows, columns 64–127 | 0–7 | Its 16 rows, columns 64–127 |
+
+Each consumer assembles two **disjoint output pieces**, not two partial sums.
+No addition takes place in this copy. The reduction over K was completed by
+the producer; splitting N divided the finished output into column pieces.
+
+Planning first selects the producer cores holding finished values. It then
+uses the same partition intersections as ordinary LX copies. The frontend
+records only the finished producer cores, here `(3, 7)`, and exposes only
+those cores as holders of the input. The existing backend derives the
+connections and byte ranges from the producer and consumer placements.
+There is no separate producer-consumer list stored or emitted by the frontend.
+
+Different dimensions can require different movements in one copy. For an
+8×8 tensor, a 2×4 producer partition holds 4×2 pieces; a 4×2 consumer partition
+needs 2×4 pieces. Each producer splits its rows between two consumers, and
+each consumer collects columns from two producers. Ordinary eight-core
+copies support this combination without separate gather/scatter operations.
+Completed-result copies use the same intersections, subject to the limits below.
+
+**Current limits:**
+
+- The producer must have a supported native reduction and a proven finished
+  core for each output piece. This path admits single-corelet matmuls with contiguous K-fast
+  groups; other reductions need their own finished-producer rule, not a new
+  copying mechanism.
+- Every consumer must receive its requested pieces exactly once. Each
+  consumer must use the same number of producers, and each finished producer
+  must serve the same number of consumers. Uneven cases are not supported.
+- The copy uses either the producer's full core count or one consumer core
+  per finished producer. Copies to fewer cores currently require one
+  finished producer per consumer. Thus the ordinary 2×4 → 4×2 example above
+  does **not** imply support for a split-K producer shrinking from 16 physical
+  cores to eight consumers while each consumer collects two pieces.
+- Existing LX capacity, lifetime, layout and whole-source fallback checks
+  still apply. A legal copy is not a promise that LX has space or is faster.
+
+Without a supported relayout, different producer and consumer partitions
+prevent direct LX reuse. The following example shows that HBM fallback.
+Co-optimization can instead choose matching partitions; relayout can connect
+supported mismatched partitions without changing either operation's division.
 
 ```text
 Aligned splits (LX reuse possible)        Mismatched splits (DDR round-trip)
@@ -587,9 +650,8 @@ Aligned splits (LX reuse possible)        Mismatched splits (DDR round-trip)
         ✓ reuse                                   ✗ DDR reload
 ```
 
-A graph-aware co-optimisation pass exists and is opt-in via
-`CO_OPTIMIZING_LX_PLANNING=1`. It aligns splits across adjacent ops to
-grow the LX planner's legal-reuse set. See the
+A graph-aware co-optimisation pass runs by default
+(`CO_OPTIMIZING_LX_PLANNING=0` opts out). See the
 [scratchpad planning](scratchpad_planning.md) doc for details.
 
 ## User Work-Division Hints
@@ -618,9 +680,10 @@ def fn(x, y):
 ```
 
 The compiler resolves each user-facing name onto the concrete iteration
-variables for each operation in the hint scope. Coarse-tiling hints are kept
-separate, so `spyre_hint(tiles={...})` and `spyre_hint(work_div={...})` can
-coexist in the same scope.
+variables for each operation in the hint scope. Tiling is expressed with
+`for_each_tile` rather than a hint, and a `spyre_hint(work_div={...})` scope
+wrapped around a `for_each_tile` call divides the operations in the loop body
+across cores.
 
 When the work-division planner sees a resolved user hint, it validates the
 request and commits the accepted splits directly instead of running the
@@ -641,8 +704,18 @@ and the user hint asks for fewer splits, the compiler logs a warning and applies
 the strict user hint. `raise_if_per_core_overflow` then raises `Unsupported` if
 the resulting per-core span exceeds the hardware limit.
 
-Set `SPYRE_INDUCTOR_IGNORE_HINTS=1` to ignore `spyre_hint(work_div={...})`
+Set `SPYRE_INDUCTOR_IGNORE_WORK_DIV_HINTS=1` to ignore `spyre_hint(work_div={...})`
 annotations and use the automatic work-distribution planner.
+
+:::{note}
+Work-division hints also hold under co-optimization, which is on by default. An
+op whose hint resolves onto its own dimensions is pinned to the division this
+pass committed, so the joint solver cannot re-slice it. The pin covers the whole
+op: dimensions the hint does not name stay unsplit even when that leaves cores
+idle, and a neighbouring buffer whose division no longer matches the hinted op
+may be kept out of LX. Ops in the hint scope that have none of the hinted
+dimensions are not pinned.
+:::
 
 ## Limitations and Future Work
 

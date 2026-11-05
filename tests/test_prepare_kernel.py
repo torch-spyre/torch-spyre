@@ -20,6 +20,7 @@ import hashlib
 import json
 import os
 import tempfile
+import uuid
 
 import pytest
 import torch
@@ -219,9 +220,9 @@ class TestPrepareKernel:
             # First step should be ComputeSpecialize
             assert job_plan.get_step_type(0) == "Compute"
 
-    def test_profiler_name_overrides_spyrecode_name_and_adds_step_suffix(self):
+    def test_profiler_event_name_overrides_spyrecode_name_and_adds_step_suffix(self):
         """Compiler provenance name identifies every device-compute step."""
-        profiler_name = "spyre_kernel_v1_fused_mm_" + "a" * 16
+        profiler_event_name = "spyre_kernel_v1_fused_mm_" + "a" * 16
         job_exec_plan = [
             {
                 "command": "ComputeOnDevice",
@@ -242,16 +243,16 @@ class TestPrepareKernel:
 
             job_plan = torch_spyre._C.prepare_kernel(
                 spyrecode_dir,
-                profiler_name=profiler_name,
+                profiler_event_name=profiler_event_name,
             )
 
-            assert job_plan.get_step_name(0) == f"{profiler_name}#0"
-            assert job_plan.get_step_name(1) == f"{profiler_name}#1"
+            assert job_plan.get_step_name(0) == f"{profiler_event_name}#0"
+            assert job_plan.get_step_name(1) == f"{profiler_event_name}#1"
 
-    def test_profiler_name_accepts_exact_aiupti_limit(self):
+    def test_profiler_event_name_accepts_exact_aiupti_limit(self):
         """The finalized name may fill the AIUPTI buffer through byte 127."""
         suffix = "#0"
-        profiler_name = "p" * (
+        profiler_event_name = "p" * (
             torch_spyre._C.AIUPTI_ACTIVITY_NAME_MAX_BYTES - len(suffix)
         )
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -259,15 +260,15 @@ class TestPrepareKernel:
 
             job_plan = torch_spyre._C.prepare_kernel(
                 spyrecode_dir,
-                profiler_name=profiler_name,
+                profiler_event_name=profiler_event_name,
             )
 
-            assert job_plan.get_step_name(0) == profiler_name + suffix
+            assert job_plan.get_step_name(0) == profiler_event_name + suffix
 
-    def test_profiler_name_rejects_final_name_over_aiupti_limit(self):
+    def test_profiler_event_name_rejects_final_name_over_aiupti_limit(self):
         """The C++ boundary checks the name after adding the step suffix."""
         suffix = "#0"
-        profiler_name = "p" * (
+        profiler_event_name = "p" * (
             torch_spyre._C.AIUPTI_ACTIVITY_NAME_MAX_BYTES - len(suffix) + 1
         )
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -279,10 +280,10 @@ class TestPrepareKernel:
             ):
                 torch_spyre._C.prepare_kernel(
                     spyrecode_dir,
-                    profiler_name=profiler_name,
+                    profiler_event_name=profiler_event_name,
                 )
 
-    def test_spyrecode_compute_name_is_preserved_without_profiler_name(self):
+    def test_spyrecode_compute_name_is_preserved_without_profiler_event_name(self):
         """Existing named SpyreCode plans retain their current behavior."""
         with tempfile.TemporaryDirectory() as tmpdir:
             spyrecode_dir = self.create_mock_spyrecode(
@@ -365,6 +366,85 @@ class TestPrepareKernel:
             with pytest.raises(RuntimeError, match="Step index out of range"):
                 job_plan.get_step_type(999)
 
+    @pytest.mark.parametrize("num_corrections", [1, 2, 3])
+    @pytest.mark.parametrize(
+        "following_step", ["ComputeOnDevice", "DataTransfer", None]
+    )
+    def test_prepare_host_compute_sequence(self, num_corrections, following_step):
+        """Multiple correction blobs must prepare before the device compute."""
+        job_exec_plan = []
+        for i in range(num_corrections):
+            job_exec_plan.extend(
+                [
+                    {
+                        "command": "ComputeOnHost",
+                        "properties": {
+                            "ohandle": f"correction{i}",
+                            "size": "256",
+                            "ishape": ["0"],
+                            "ihandle": "",
+                            "hcm": {"vdci": {}, "senConstants": []},
+                        },
+                    },
+                    {
+                        "command": "DataTransfer",
+                        "properties": {
+                            "dirn": "false",
+                            "host_handle": f"correction{i}",
+                            "dev_ptr": str(120259084288 + i * 256),
+                            "size": "256",
+                        },
+                    },
+                ]
+            )
+
+        if following_step == "ComputeOnDevice":
+            job_exec_plan.append(
+                {
+                    "command": "ComputeOnDevice",
+                    "properties": {"job_bin_ptr": "120259084288"},
+                }
+            )
+        elif following_step == "DataTransfer":
+            job_exec_plan.append(
+                {
+                    "command": "DataTransfer",
+                    "properties": {
+                        "dirn": "true",
+                        "host_handle": "result",
+                        "dev_ptr": "120259084288",
+                        "size": "256",
+                    },
+                }
+            )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir, job_exec_plan=job_exec_plan
+            )
+            if following_step != "ComputeOnDevice":
+                error = (
+                    "Incomplete step sequence"
+                    if following_step is None
+                    else f"Step ordering violation at step {num_corrections}:"
+                )
+                with pytest.raises(RuntimeError, match=error):
+                    torch_spyre._C.prepare_kernel(spyrecode_dir)
+                return
+
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+            assert job_plan.num_steps() == num_corrections + 1
+            assert [job_plan.get_step_type(i) for i in range(job_plan.num_steps())] == [
+                "HostCompute"
+            ] * num_corrections + ["Compute"]
+            assert [
+                job_plan.get_step_stream_role(i) for i in range(job_plan.num_steps())
+            ] == ["Prep"] * num_corrections + ["Dev"]
+            assert all(
+                job_plan.get_step_pipeline_barrier(i)
+                for i in range(job_plan.num_steps())
+            )
+
     def test_prepare_emits_bare_split_triple(self):
         """prepare emits the bare split triple, independent of the flag.
 
@@ -387,25 +467,24 @@ class TestPrepareKernel:
             # gone), so nothing here depends on the program-region count.
             job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
 
-            # Bare split triple: 3 steps, NO event steps inserted.
-            assert job_plan.num_steps() == 3
-            assert [job_plan.get_step_type(i) for i in range(3)] == [
+            # Verify it has 2 steps (HostCompute-with-H2D merged, Compute)
+            # The adjacent DataTransfer H2D is collapsed into the HostCompute step
+            # by translateComputeOnHostWithH2D
+            assert job_plan.num_steps() == 2
+            assert [job_plan.get_step_type(i) for i in range(2)] == [
                 "HostCompute",
-                "H2D",
                 "Compute",
             ]
             # Roles are assigned by step type in the ctors, so the bare triple
             # already carries the split roles -- the split is real.
-            assert [job_plan.get_step_stream_role(i) for i in range(3)] == [
-                "Prep",
+            assert [job_plan.get_step_stream_role(i) for i in range(2)] == [
                 "Prep",
                 "Dev",
             ]
             # pipeline_barrier stays True on EVERY step of the bare split:
             # overlap comes only from the S_prep/S_dev split + flex's dynamic
             # cross-stream events, never from relaxing a barrier.
-            assert [job_plan.get_step_pipeline_barrier(i) for i in range(3)] == [
-                True,
+            assert [job_plan.get_step_pipeline_barrier(i) for i in range(2)] == [
                 True,
                 True,
             ]
@@ -737,16 +816,20 @@ class TestPrepareKernel:
     def test_pipeline_barrier_dma_steps_default_true(self):
         """H2D and D2H steps must carry pipeline_barrier=True by default."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            # H2D lives at index 1 of the correction triple
-            # ([HostCompute, H2D, Compute]).
             spyrecode_dir = self.create_mock_spyrecode(
                 tmpdir, exec_command="ComputeOnHost"
             )
             job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
 
-            assert job_plan.get_step_type(1) == "H2D"
+            # After merge: HostCompute(0) → Compute(1); no standalone H2D step.
+            assert job_plan.num_steps() == 2
+            assert job_plan.get_step_type(0) == "HostCompute"
+            assert job_plan.get_step_type(1) == "Compute"
+            assert job_plan.get_step_pipeline_barrier(0) is True, (
+                "HostCompute (merged) must must carry pipeline_barrier=True by default"
+            )
             assert job_plan.get_step_pipeline_barrier(1) is True, (
-                "H2D step must carry pipeline_barrier=True by default"
+                "Compute step must carry pipeline_barrier=True by default"
             )
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -788,23 +871,23 @@ class TestPrepareKernel:
             )
             job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
 
-            assert job_plan.num_steps() == 3
-
-            # Strict FIFO everywhere: barrier=True on every step, no exceptions.
-            for i in range(job_plan.num_steps()):
-                assert job_plan.get_step_pipeline_barrier(i) is True, (
-                    f"step {i} ({job_plan.get_step_type(i)}) must carry "
-                    "pipeline_barrier=True; the PoC keeps strict per-stream FIFO "
-                    "for all ops and gets overlap from the stream split + events, "
-                    "not from a barrier opt-out"
-                )
-
-            # Explicitly guard the regressed case: HostCompute is no longer
-            # barrier=False.
+            # After the HC+H2D merge: HostCompute(0) → Compute(1)
+            # The adjacent DataTransfer H2D is collapsed into the HostCompute step.
+            assert job_plan.num_steps() == 2
             assert job_plan.get_step_type(0) == "HostCompute"
+            assert job_plan.get_step_type(1) == "Compute"
+
             assert job_plan.get_step_pipeline_barrier(0) is True, (
-                "HostCompute must keep pipeline_barrier=True (edit 1 removed the "
-                "old overlap-via-barrier-opt-out); overlap is via S_prep/S_dev"
+                "HostCompute step must carry pipeline_barrier=True: it is a "
+                "consumer of the correction H2D's seg-7 write (RAW hazard); "
+                "Compute must wait for H2D. Inert under STRICT_ORDERING; "
+                "load-bearing under OP_ORDERING."
+            )
+            assert job_plan.get_step_pipeline_barrier(1) is True, (
+                "Compute step must carry pipeline_barrier=True: it is a "
+                "consumer of the correction H2D's seg-7 write (RAW hazard); "
+                "Compute must wait for H2D. Inert under STRICT_ORDERING; "
+                "load-bearing under OP_ORDERING."
             )
 
     def test_pipeline_barrier_pure_compute_true(self):
@@ -830,198 +913,132 @@ class TestPrepareKernel:
             with pytest.raises(RuntimeError, match="Step index out of range"):
                 job_plan.get_step_pipeline_barrier(999)
 
-    def test_project_real_plan_identity_valid_permuted_rejected(self):
-        """#7a: project a REAL prepared plan through validate()'s exact path.
+    def test_dev_only_plan_has_all_dev_roles(self):
+        """A pure ComputeOnDevice plan assigns Dev role to every step.
 
-        validate() classifies each JobPlanStep (classifyStep) and reads its
-        baked-in role() to build the (kind, role) sequence it checks. The
-        check_job_plan_step_ordering binding takes NAME lists and bypasses that
-        projection, so a wiring bug in the step -> (kind, role) mapping would slip
-        past it. _test_project_and_check_ordering runs the REAL projection over
-        REAL step objects in a caller-given index order:
-          - identity order [0, 1, 2] must reproduce validate()'s acceptance ('');
-          - a permuted order that puts the real H2D before the real HostCompute
-            must be REJECTED by the same projection (the prep stream must begin
-            with HostCompute), enforced over real steps, not name lists.
+        Guards that the two-stream role assignment never bleeds into legacy
+        single-stream plans: every step of a plain ComputeOnDevice plan must
+        carry role=Dev, never Prep.
         """
         with tempfile.TemporaryDirectory() as tmpdir:
             spyrecode_dir = self.create_mock_spyrecode(
-                tmpdir, exec_command="ComputeOnHost"
+                tmpdir, exec_command="ComputeOnDevice"
             )
-            plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
-            assert plan.num_steps() == 3
-
-            err_identity = torch_spyre._C._test_project_and_check_ordering(
-                plan, [0, 1, 2]
-            )
-            assert err_identity == "", (
-                "real-step projection in canonical order must be accepted, "
-                f"matching validate(); got: {err_identity!r}"
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+            n = job_plan.num_steps()
+            assert n >= 1
+            roles = [job_plan.get_step_stream_role(i) for i in range(n)]
+            assert all(r == "Dev" for r in roles), (
+                f"Expected all Dev roles for a pure Compute plan, got {roles}"
             )
 
-            err_permuted = torch_spyre._C._test_project_and_check_ordering(
-                plan, [1, 0, 2]
+    def test_sdsc_bundle_dir_prefix_registered_via_provenance_profiler_event_name(self):
+        """prepare_kernel with profiler_event_name registers the prefix under that name."""
+        profiler_event_name = "spyre_kernel_v1_fused_mm_" + "a" * 16
+        sdsc_bundle_dir_prefix = uuid.uuid4().hex[:8]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(tmpdir)
+            torch_spyre._C.prepare_kernel(
+                spyrecode_dir,
+                profiler_event_name=profiler_event_name,
+                sdsc_bundle_dir_prefix=sdsc_bundle_dir_prefix,
             )
-            assert err_permuted != "", (
-                "projecting the real steps with H2D before HostCompute must "
-                "be rejected (prep stream must begin with HostCompute)"
-            )
-            assert "HostCompute" in err_permuted
-
-
-# The canonical correction triple, as parallel (StepKind, StreamRole) name
-# lists: [HostCompute(Prep), H2D(Prep), Compute(Dev)]. This is what
-# checkJobPlanStepOrdering must accept; the negative tests below mutate it to
-# violate the per-stream role ordering.
-_VALID_KINDS = ["HostCompute", "H2D", "Compute"]
-_VALID_ROLES = ["Prep", "Prep", "Dev"]
-
-
-class TestStepOrderingValidator:
-    """Direct tests of the P2-14 two-stream step-ordering validator.
-
-    Exercised through the check_job_plan_step_ordering binding, which calls the
-    pure checker over projected (StepKind, StreamRole) sequences. This lets the
-    role-ordering NEGATIVE cases be tested without constructing real steps (a
-    real HostCompute needs a deeptools::Hcm plus pinned host buffers). The
-    validator returns '' when valid, else a human-readable error string.
-    """
-
-    def test_valid_bare_triple_ordering_accepted(self):
-        """The canonical correction triple is accepted (returns '')."""
-        err = torch_spyre._C.check_job_plan_step_ordering(_VALID_KINDS, _VALID_ROLES)
-        assert err == "", f"expected valid ordering, got error: {err!r}"
-
-    def test_h2d_before_hostcompute_rejected(self):
-        """NEGATIVE: H2D before HostCompute on S_prep is rejected.
-
-        The prep stream must be exactly HostCompute -> H2D, so it must begin
-        with HostCompute. Putting the H2D first is flagged.
-        """
-        kinds = ["H2D", "HostCompute", "Compute"]
-        roles = ["Prep", "Prep", "Dev"]
-        err = torch_spyre._C.check_job_plan_step_ordering(kinds, roles)
-        assert err != "", "H2D-before-HostCompute must be rejected"
-        assert "HostCompute" in err
-
-    def test_missing_h2d_on_prep_rejected(self):
-        """NEGATIVE: a HostCompute-led plan with no H2D on S_prep is rejected.
-
-        The prep stream must BEGIN with HostCompute -> H2D; dropping the H2D
-        leaves prep as just [HostCompute], which the S_prep walk rejects.
-        """
-        kinds = ["HostCompute", "Compute"]
-        roles = ["Prep", "Dev"]
-        err = torch_spyre._C.check_job_plan_step_ordering(kinds, roles)
-        assert err != "", "HostCompute with no following H2D must be rejected"
-        assert "H2D" in err
-
-    def test_compute_on_prep_stream_rejected(self):
-        """NEGATIVE: a device Compute mis-assigned to S_prep is rejected.
-
-        Routing the Compute to Prep leaves prep as [HostCompute, H2D, Compute];
-        Compute is a device op and is not permitted on the prep stream, which
-        carries only HostCompute / H2D.
-        """
-        kinds = ["HostCompute", "H2D", "Compute"]
-        roles = ["Prep", "Prep", "Prep"]
-        err = torch_spyre._C.check_job_plan_step_ordering(kinds, roles)
-        assert err != "", "Compute on the prep stream must be rejected"
-
-    def test_legacy_single_stream_plan_still_valid(self):
-        """A legacy plan (no HostCompute) stays unconditionally valid.
-
-        Guards backward-compat: pure ComputeOnDevice, standalone D2H, and tensor
-        .to() moves have no HostCompute, so the checker must not impose the
-        two-stream shape on them.
-        """
-        assert torch_spyre._C.check_job_plan_step_ordering(["Compute"], ["Dev"]) == ""
-        assert torch_spyre._C.check_job_plan_step_ordering(["D2H"], ["Dev"]) == ""
         assert (
-            torch_spyre._C.check_job_plan_step_ordering(
-                ["H2D", "Compute"], ["Dev", "Dev"]
-            )
-            == ""
+            torch_spyre._C.lookup_bundle_dir_prefix(profiler_event_name)
+            == sdsc_bundle_dir_prefix
         )
 
-    def test_hazard_tracker_bare_split_ordering_valid(self):
-        """LOCK: the HostCompute-led, split, NO-events triple is valid.
+    def test_sdsc_bundle_dir_prefix_registered_without_provenance_profiler_event_name(
+        self,
+    ):
+        """Without a profiler_event_name (no provenance key), the prefix is still
+        registered under the directory-derived name_base and can be looked up.
 
-        Under SPYRE_HAZARD_TRACKER the correction triple is split across
-        S_prep/S_dev and carries NO event steps (flex inserts the cross-stream
-        edges dynamically at enqueue). The ordering validator must accept the
-        bare [HostCompute(Prep), H2D(Prep), Compute(Dev)] triple. This locks that
-        property so a future validator change that would break hazard mode fails
-        here loudly. Contrast test_legacy_single_stream_plan_still_valid (no
-        HostCompute): this plan HAS a HostCompute but still no events.
+        This is the critical case: kernels compiled without a kernel-provenance
+        descriptor have no profiler_event_name, so the activity handler must still be
+        able to emit sdsc_bundle_dir_prefix by falling back to the directory
+        path as the registry key.
         """
-        assert (
-            torch_spyre._C.check_job_plan_step_ordering(
-                ["HostCompute", "H2D", "Compute"], ["Prep", "Prep", "Dev"]
+        sdsc_bundle_dir_prefix = uuid.uuid4().hex[:8]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(tmpdir)
+            # No profiler_event_name — no provenance key is generated.
+            torch_spyre._C.prepare_kernel(
+                spyrecode_dir,
+                sdsc_bundle_dir_prefix=sdsc_bundle_dir_prefix,
             )
-            == ""
-        )
+            # The name_base used by JobPlanBuilder mirrors the directory fallback
+            # in translateComputeOnDevice: <sdsc_dir>/<spyreCodeDir>/bundle.mlir
+            sdsc_dir = os.path.basename(tmpdir)
+            expected_name_base = os.path.join(sdsc_dir, "spyreCodeDir", "bundle.mlir")
+            assert (
+                torch_spyre._C.lookup_bundle_dir_prefix(expected_name_base)
+                == sdsc_bundle_dir_prefix
+            )
 
-    def test_trailing_d2h_on_dev_accepted(self):
-        """The contract is ordering-only, not an exact triple: S_dev carries
-        Compute AND D2H (see StreamRole in job_plan.h), so a longer plan
-        HostCompute -> H2D -> Compute -> D2H is valid.
+    def test_sdsc_bundle_dir_prefix_registered_under_backend_command_name(self):
+        """Without a profiler_event_name, the name in the ComputeOnDevice command
+        becomes the activity name if present for which the prefix gets registerd.
+        The prefix does not get registered under the fallback directory name."""
+        sdsc_bundle_dir_prefix = uuid.uuid4().hex[:8]
+        backend_name = f"backend_kernel_{uuid.uuid4().hex}"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir,
+                job_exec_plan=[
+                    {
+                        "command": "ComputeOnDevice",
+                        "properties": {
+                            "job_bin_ptr": "120259084288",
+                            "name": backend_name,
+                        },
+                    }
+                ],
+            )
+            torch_spyre._C.prepare_kernel(
+                spyrecode_dir,
+                sdsc_bundle_dir_prefix=sdsc_bundle_dir_prefix,
+            )
+            fallback_name_base = os.path.join(
+                os.path.basename(tmpdir), "spyreCodeDir", "bundle.mlir"
+            )
+            assert (
+                torch_spyre._C.lookup_bundle_dir_prefix(backend_name)
+                == sdsc_bundle_dir_prefix
+            )
+            assert torch_spyre._C.lookup_bundle_dir_prefix(fallback_name_base) is None
 
-        S_prep = [HostCompute, H2D], S_dev = [Compute, D2H]. This locks the
-        relaxation so a future re-tightening to the bare triple fails here.
-        """
-        kinds = ["HostCompute", "H2D", "Compute", "D2H"]
-        roles = ["Prep", "Prep", "Dev", "Dev"]
-        err = torch_spyre._C.check_job_plan_step_ordering(kinds, roles)
-        assert err == "", f"HostCompute -> H2D -> Compute -> D2H must be valid: {err!r}"
 
-    def test_multiple_compute_on_dev_accepted(self):
-        """More than one Compute on S_dev is valid (ordering-only contract).
-
-        S_prep = [HostCompute, H2D], S_dev = [Compute, Compute]. The dev walk
-        requires only that the stream BEGIN with Compute and carry nothing
-        outside {Compute, D2H}.
-        """
-        kinds = ["HostCompute", "H2D", "Compute", "Compute"]
-        roles = ["Prep", "Prep", "Dev", "Dev"]
-        err = torch_spyre._C.check_job_plan_step_ordering(kinds, roles)
-        assert err == "", f"a second Compute on S_dev must be valid: {err!r}"
-
-    def test_d2h_on_prep_stream_rejected(self):
-        """NEGATIVE: a D2H on S_prep is rejected.
-
-        D2H is a device op and belongs on S_dev (see StreamRole in job_plan.h);
-        role assignment never routes it to Prep, so a D2H on prep signals a
-        role-assignment bug. Prep carries only HostCompute / H2D.
-        """
-        kinds = ["HostCompute", "H2D", "D2H"]
-        roles = ["Prep", "Prep", "Prep"]
-        err = torch_spyre._C.check_job_plan_step_ordering(kinds, roles)
-        assert err != "", "D2H on the prep stream must be rejected"
-        assert "prep stream" in err
-
-    def test_hostcompute_on_dev_stream_rejected(self):
-        """NEGATIVE: HostCompute mis-assigned to the device stream (S_dev).
-
-        HostCompute belongs on S_prep. Flipping step 0's role to Dev leaves
-        S_prep beginning with H2D, which the S_prep walk rejects (prep must
-        begin with HostCompute).
-        """
-        roles = ["Dev", "Prep", "Dev"]
-        err = torch_spyre._C.check_job_plan_step_ordering(_VALID_KINDS, roles)
-        assert err != "", "HostCompute on the device stream must be rejected"
-        assert "HostCompute" in err
-
-    def test_h2d_on_dev_stream_rejected(self):
-        """NEGATIVE: H2D mis-assigned to the device stream (S_dev).
-
-        The correction H2D belongs on S_prep. Flipping H2D's role to Dev leaves
-        S_prep as just [HostCompute] (rejected: expected H2D after HostCompute)
-        and puts a forbidden H2D on the device stream.
-        """
-        roles = ["Prep", "Dev", "Dev"]
-        err = torch_spyre._C.check_job_plan_step_ordering(_VALID_KINDS, roles)
-        assert err != "", "H2D on the device stream must be rejected"
+@pytest.mark.parametrize(
+    ("profiler_event_name", "expected_activity_name_base"),
+    [
+        (
+            "spyre_kernel_v1_fused_add_aaaaaaaaaaaaaaaa",
+            "spyre_kernel_v1_fused_add_aaaaaaaaaaaaaaaa",
+        ),
+        (
+            "spyre_kernel_v1_fused_mm_aaaaaaaaaaaaaaaa#17",
+            "spyre_kernel_v1_fused_mm_aaaaaaaaaaaaaaaa",
+        ),
+        (
+            "spyre_kernel_v1_fused_bmm_expand_silu_aaaaaaaaaaaaaaaa#step",
+            "spyre_kernel_v1_fused_bmm_expand_silu_aaaaaaaaaaaaaaaa#step",
+        ),
+        (
+            "spyre_kernel_v1_fused_scaled_dot_product_fused_attention_overrideable_aaaaaaaaaaaaaaaa#",
+            "spyre_kernel_v1_fused_scaled_dot_product_fused_attention_overrideable_aaaaaaaaaaaaaaaa",
+        ),
+        (
+            "deadbeef_sdsc_fused_linear/spyreCodeDir/bundle.mlir#2",
+            "deadbeef_sdsc_fused_linear/spyreCodeDir/bundle.mlir",
+        ),
+    ],
+)
+def test_activity_name_base(profiler_event_name, expected_activity_name_base):
+    assert (
+        torch_spyre._C.activity_name_base(profiler_event_name)
+        == expected_activity_name_base
+    )
 
 
 if __name__ == "__main__":

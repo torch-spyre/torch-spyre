@@ -28,18 +28,19 @@ without noise from unrelated subsystems.
 
 ## Views
 
-**Operations** — Each PyTorch op and its Spyre implementation path:
-decomposition, lowering, custom op, CPU fallback, or direct eager
-kernel. Use this view to check whether a specific op is supported and
-how the backend handles it.
+**Operations**: every PyTorch op and how the backend handles it, through a
+decomposition, lowering, custom op, CPU fallback, or direct eager kernel. A
+decomposition node links on to the ops it expands into, so you can follow a
+chain such as `aten.silu.default` to `silu` to `spyre.silu` and check whether a
+specific op is supported.
 
-**Compiler Passes** — Pass groups and their constituent transformation
+**Compiler Passes**: pass groups and their constituent transformation
 functions, laid out top-to-bottom in pipeline order.
 
-**Architecture** — Module dependencies, class inheritance, and
+**Architecture**: module dependencies, class inheritance, and
 dataclass definitions across the `torch_spyre` package.
 
-**Configuration** — Environment variables and the modules that read
+**Configuration**: environment variables and the modules that read
 them, showing which runtime knobs control which subsystems.
 
 ## Navigation
@@ -85,3 +86,10 @@ The extractors cover:
 - `@dataclass`-decorated structs and their typed fields
 - Intra-package import statements
 - `os.environ` and `os.getenv` call sites
+
+Within each decomposition, the extractor also records the ops it calls as
+`decomposes_into` edges. This is best-effort: it names explicit
+`torch.ops.spyre.*`, `torch.ops.aten.*`, and `torch.*` calls, but Python
+operators such as `*`, `+`, and `@`, and tensor methods such as `.transpose`,
+cannot be resolved from source and are not shown. Open the decomposition's
+source link to read the full body.

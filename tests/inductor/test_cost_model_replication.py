@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Per-core re-reads of a replicated matmul operand (``ArgTraffic.replication``).
+"""Per-core reads of replicated and partitioned matmul operands.
 
 When a matmul's core split lies on a dim an operand does not index, every core of
 that split loads its own full copy of the operand's slice from HBM. The grouped
@@ -20,7 +20,13 @@ LX-relayout sweep (2026-09-09) measured that consumer at f times its one-load by
 the once-per-input count under-predicted the demote penalty 10-40x. These tests pin
 the rule at the three places it lives: the arg's byte function, the extractor's
 stamp, and the fused-bundle de-duplication that has to tolerate the symbolic result.
+
+Partitioned, unreused operands instead stream one slice per core. Their tests
+cover the per-core delivery limit, scope guards, and symbolic solver agreement.
 """
+
+import dataclasses
+import types
 
 import pytest
 import sympy
@@ -29,16 +35,24 @@ import torch
 import torch_spyre  # noqa: F401
 import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
 from torch_spyre._inductor import config, cost_model, spyre_hint
+from torch_spyre._inductor import work_division as wd
 from torch_spyre._inductor import cost_model_pass as cmp
 from torch_spyre._inductor.cost_model import (
     ArgTraffic,
     CostParams,
     OpFeatures,
+    _decode_weight_delivery_excess,
     _fused_hbm_bytes,
+    _loop_operand_request_excess,
+    _partitioned_operand_read_excess,
+    _read_burst_excess_ns,
     _replicated_operand_reads,
+    _shared_operand_read_excess,
+    explain,
     predict_ops,
 )
-from torch_spyre._inductor.dump_cost_model import _replication
+from torch_spyre._inductor.cost_features import _replication
+from torch_spyre._inductor.scratchpad.allocator import _COST_PARAMS
 
 ELEMS = 4096
 BYTES = ELEMS * 2
@@ -79,19 +93,23 @@ def test_residency_removes_every_replica_load():
     assert _arg(4, resident=True).hbm_elems() == 0
 
 
-def test_a_resident_boundary_input_keeps_exactly_the_clone_in_load():
+def test_a_resident_boundary_input_adds_exactly_one_clone_in_load():
     # Pinning a graph input inserts one clone-in; without residency each replica
-    # core loads it. The charge is one load resident, f loads not.
-    assert _arg(4, resident=True, boundary=True).hbm_elems() == ELEMS
-    assert _arg(4, resident=False, boundary=True).hbm_elems() == 4 * ELEMS
+    # core loads it. Resident, the reader is served from LX and the clone loads it
+    # once; not resident, the reader pays f loads and there is no clone.
+    resident = _arg(4, resident=True, boundary=True)
+    assert (resident.hbm_elems(), resident.clone_in_elems()) == (0, ELEMS)
+    spilled = _arg(4, resident=False, boundary=True)
+    assert (spilled.hbm_elems(), spilled.clone_in_elems()) == (4 * ELEMS, 0)
 
 
 def test_the_replicated_charge_stays_linear_in_symbolic_residency():
     is_lx = sympy.Symbol("is_lx")
     plain = _arg(4, resident=is_lx).hbm_elems()
-    boundary = _arg(4, resident=is_lx, boundary=True).hbm_elems()
+    boundary = _arg(4, resident=is_lx, boundary=True)
     assert sympy.simplify(plain - 4 * ELEMS * (1 - is_lx)) == 0
-    assert sympy.simplify(boundary - ELEMS * (is_lx + 4 * (1 - is_lx))) == 0
+    assert sympy.simplify(boundary.hbm_elems() - 4 * ELEMS * (1 - is_lx)) == 0
+    assert sympy.simplify(boundary.clone_in_elems() - ELEMS * is_lx) == 0
     # replication itself may be a solver split symbol
     f = sympy.Symbol("split_n")
     assert sympy.simplify(_arg(f, resident=0).hbm_elems() - f * ELEMS) == 0
@@ -103,6 +121,29 @@ def test_replication_defaults_to_one_on_legacy_records():
     assert op.args[0].replication == 1
     back = cost_model.op_from_dict(cost_model.op_to_dict(_op(_arg(4, resident=False))))
     assert back.args[0].replication == 4
+
+
+def test_shared_load_keeps_consumer_degree_without_reloading_each_copy():
+    from torch_spyre._inductor.cost_model import _shared_operand_read_excess
+    from torch_spyre._inductor.work_division import _matmul_multicast_penalty
+
+    degree, resident = sympy.symbols("degree resident", integer=True)
+    arg = _arg(degree, resident=resident, boundary=True)
+    arg.broadcast = True
+    op, params = _op(arg), CostParams()
+    assert arg.replication == degree
+    assert arg.hbm_elems() == ELEMS * (1 - resident)
+    assert arg.replicated_hbm_elems() == 0
+    excess = _shared_operand_read_excess([op, op], params)
+    for count in (1, 8, 12, 16, 32):
+        expected = BYTES * (_matmul_multicast_penalty(count) - 1) / params.bw_peak_gbps
+        assert float(excess.subs({degree: count, resident: 0})) == pytest.approx(
+            expected
+        )
+        assert excess.subs({degree: count, resident: 1}) == 0
+    arg.broadcast = False
+    assert _shared_operand_read_excess([op], params) == 0
+    assert arg.hbm_elems() == ELEMS * degree * (1 - resident)
 
 
 # ------------------------------------------------------------------ the rule
@@ -187,10 +228,14 @@ def test_the_ladder_law_reproduces_a_measured_rung():
 
 def test_a_resident_operand_has_no_per_core_reads():
     assert _arg(8, resident=True).replicated_hbm_elems() == 0
-    # A resident boundary operand keeps its one clone-in load, which is an aggregate
-    # transfer and stays with the ordinary bytes, not the per-core term.
+    # A resident boundary operand adds its one clone-in load, which is an aggregate
+    # transfer priced on its own, not a per-core read.
     a = _arg(8, resident=True, boundary=True)
-    assert (a.replicated_hbm_elems(), a.hbm_elems()) == (0, ELEMS)
+    assert (a.replicated_hbm_elems(), a.hbm_elems(), a.clone_in_elems()) == (
+        0,
+        0,
+        ELEMS,
+    )
     p = CostParams()
     assert _replicated_operand_reads([_matmul(a)], p) == (0, 0)
 
@@ -213,12 +258,11 @@ def test_per_core_pricing_is_symbolic_and_matches_the_numeric_path():
         cores=32,
     )
     _bytes, ns = _replicated_operand_reads([sym], p)
-    assert (
-        sympy.simplify(
-            ns - BYTES * (1 - is_lx) / (s_m * p.mm_replicated_read_gbps_per_core)
-        )
-        == 0
+    expected = sympy.Piecewise(
+        (0, sympy.Eq(s_n, 1)),
+        (BYTES * (1 - is_lx) / (s_m * p.mm_replicated_read_gbps_per_core), True),
     )
+    assert sympy.simplify(ns - expected) == 0
     expr = predict_ops([sym], p)
     at_point = sympy.lambdify([s_m, s_n, is_lx], expr, modules="math")
     assert at_point(4, 8, 0) == pytest.approx(predict_ops([num], p), rel=1e-9)
@@ -229,6 +273,557 @@ def test_per_core_pricing_is_symbolic_and_matches_the_numeric_path():
         cores=32,
     )
     assert at_point(4, 8, 1) == pytest.approx(predict_ops([resident], p), rel=1e-9)
+
+    # The same symbolic menu also contains unreplicated choices. Neither those
+    # choices nor an already-substituted SymPy Integer may pay the replica rate.
+    for factor in (1, sympy.Integer(1), 2):
+        for resident in (False, True):
+            concrete = _matmul(
+                _arg(1, resident=False),
+                ArgTraffic("buf0", "input", resident, ELEMS, replication=factor),
+                cores=4 * factor,
+            )
+            assert at_point(4, factor, int(resident)) == pytest.approx(
+                float(predict_ops([concrete], p)), rel=1e-9
+            )
+
+
+# ----------------------------------------------------- partitioned read rate
+
+# One TP4 Granite 3.3 8B MLP gate projection at decode: x[1, 4096] @ W[4096, 3200].
+K, N = 4096, 3200
+W_ELEMS = K * N
+W_BYTES = 2 * W_ELEMS
+
+
+def _projection(n_split, k_split, *, weight_lx=False, macs=W_ELEMS, **fields):
+    """The projection as the extractor records it: the weight is the graph input
+    indexed by both split dims (replication 1); the activation is indexed by K
+    only, so every output split replicates it."""
+    return OpFeatures(
+        name="bmm",
+        is_reduction=True,
+        out_elems=N,
+        cores=n_split * k_split,
+        dtype_bytes=2,
+        args=[
+            ArgTraffic("buf43", "output", False, N),
+            ArgTraffic("buf42", "input", False, K, broadcast=True, replication=n_split),
+            ArgTraffic(
+                "arg12_1",
+                "input",
+                weight_lx,
+                W_ELEMS,
+                broadcast=True,
+                is_boundary=True,
+            ),
+        ],
+        reduction_cores=k_split,
+        is_matmul=True,
+        matmul_macs=macs,
+        matmul_rows_per_core=N / n_split,
+        matmul_cols_per_core=1.0,
+        matmul_m_split=n_split,
+        matmul_a_bytes=W_BYTES,
+        matmul_b_bytes=2 * K,
+        **fields,
+    )
+
+
+def _excess_ns(cores, p=_COST_PARAMS):
+    return W_BYTES * (1 / (cores * p.mm_partitioned_read_gbps_per_core) - 1 / 150)
+
+
+def test_the_planner_prices_partitioned_reads_by_default():
+    assert _COST_PARAMS.mm_partitioned_read_gbps_per_core > 0
+    assert (
+        _COST_PARAMS.mm_partitioned_read_gbps_per_core
+        == CostParams().mm_partitioned_read_gbps_per_core
+    )
+
+
+def test_fewer_reading_cores_pay_the_slower_delivery_and_all_cores_pay_nothing():
+    p = _COST_PARAMS
+    assert _partitioned_operand_read_excess([_projection(25, 1)], p) == pytest.approx(
+        _excess_ns(25)
+    )
+    assert _partitioned_operand_read_excess([_projection(2, 16)], p) == 0
+    assert _partitioned_operand_read_excess([_projection(1, 32)], p) == 0
+    off = dataclasses.replace(p, mm_partitioned_read_gbps_per_core=0.0)
+    for splits in ((25, 1), (2, 16)):
+        op = _projection(*splits)
+        added = predict_ops([op], p) - predict_ops([op], off)
+        assert added == pytest.approx(_partitioned_operand_read_excess([op], p))
+
+
+def test_the_decode_gate_ranking_follows_the_cores_that_stream_the_weight():
+    # The measured reversal: the planner ranked 25 cores x 1 above 2 x 16 (all 32
+    # cores), while the device ran the 32-core split faster. Pricing the slower
+    # 25-core delivery puts the 32-core split ahead; nothing about K is guessed.
+    off = dataclasses.replace(_COST_PARAMS, mm_partitioned_read_gbps_per_core=0.0)
+
+    def price(p, splits):
+        return predict_ops([_projection(*splits)], p)
+
+    assert price(off, (25, 1)) < price(off, (2, 16))
+    assert price(_COST_PARAMS, (2, 16)) < price(_COST_PARAMS, (25, 1))
+
+
+def test_a_bundle_with_any_looped_op_keeps_its_price():
+    looped = [
+        {"loop_trip": 4},
+        {"tiles_output_dim": True},
+        {"tiles_reduction_dim": True},
+    ]
+    for fields in looped:
+        bundle = [_projection(25, 1), _projection(25, 1, **fields)]
+        assert _partitioned_operand_read_excess(bundle, _COST_PARAMS) == 0
+    advancing = _projection(25, 1)
+    advancing.args[0] = dataclasses.replace(advancing.args[0], loop_factor=4)
+    assert _partitioned_operand_read_excess([advancing], _COST_PARAMS) == 0
+
+
+def _expert_loop_projection(cores, *, trips=4, **fields):
+    """A per-expert projection in a ``for_each_tile`` loop, as the extractor records it.
+
+    The loop tiles none of the op's own dims. The weight is the operand the loop walks
+    (its address advances with the loop variable and is read once across the loop,
+    ``loop_factor`` 1); the activation is re-entered at one address every trip.
+    """
+    op = _projection(cores, 1, loop_trip=trips, **fields)
+    op.args = [
+        dataclasses.replace(a, loop_factor=trips)
+        if a.role == "input" and a.elems != W_ELEMS
+        else dataclasses.replace(
+            a, advances_with_loop_var=True, has_partitioning_candidate=True
+        )
+        if a.role == "input"
+        else a
+        for a in op.args
+    ]
+    return op
+
+
+def _coarse_tiled_dense_matmul(cores=32, trips=4, size=4096):
+    """A row-tiled dense matmul under automatic coarse tiling: A advances with the
+    row loop (``loop_factor`` 1, exactly like the expert weight above) and the weight
+    is re-entered at one address every trip.  The loop variable is not a
+    ``for_each_tile`` one."""
+    a_elems, w_elems = size * size // trips, size * size
+    return OpFeatures(
+        name="matmul_row_tiling",
+        is_reduction=True,
+        out_elems=size * size // trips,
+        cores=cores,
+        dtype_bytes=2,
+        args=[
+            ArgTraffic("buf2", "output", False, size * size // trips),
+            ArgTraffic("arg0_1", "input", False, a_elems, is_boundary=True),
+            ArgTraffic(
+                "arg1_1", "input", False, w_elems, loop_factor=trips, is_boundary=True
+            ),
+        ],
+        is_matmul=True,
+        matmul_macs=size**3,
+        matmul_rows_per_core=size / trips / cores,
+        matmul_cols_per_core=float(size),
+        matmul_m_split=cores,
+        matmul_a_bytes=2 * a_elems,
+        matmul_b_bytes=2 * w_elems,
+        loop_trip=trips,
+        tiles_output_dim=True,
+    )
+
+
+def test_a_for_each_tile_loop_prices_the_operand_it_walks_and_nothing_else():
+    """A counted for_each_tile loop changes which operand is priced, not whether any is.
+
+    The operand the loop walks is priced as partitioned across the op's cores with the
+    single-pass arithmetic; the operand the loop re-enters at one address carries the
+    trip count and keeps its price.
+    """
+    p = _COST_PARAMS
+    op = _expert_loop_projection(25)
+    assert _partitioned_operand_read_excess([op], p) == pytest.approx(_excess_ns(25))
+    # The walked operand alone: drop the re-entered activation, same price.
+    weight_only = dataclasses.replace(
+        op, args=[a for a in op.args if a.elems == W_ELEMS or a.role == "output"]
+    )
+    assert _partitioned_operand_read_excess([weight_only], p) == pytest.approx(
+        _excess_ns(25)
+    )
+    # Re-entered, or advancing without being walked once: not the priced class.
+    for change in (
+        {"advances_with_loop_var": False},
+        {"loop_factor": 4},
+        {"has_partitioning_candidate": False},
+    ):
+        unpriced = _expert_loop_projection(25)
+        unpriced.args[2] = dataclasses.replace(unpriced.args[2], **change)
+        assert _partitioned_operand_read_excess([unpriced], p) == 0
+    # A counted loop with no matmul has no tiled operand to price.
+    pointwise = dataclasses.replace(_expert_loop_projection(25), is_matmul=False)
+    assert _partitioned_operand_read_excess([pointwise], p) == 0
+
+
+def test_a_for_each_tile_loop_price_depends_on_how_many_cores_stream_the_operand():
+    p = _COST_PARAMS
+    priced = [
+        _partitioned_operand_read_excess([_expert_loop_projection(cores)], p)
+        for cores in (8, 16, 25, 32)
+    ]
+    assert priced[0] == pytest.approx(_excess_ns(8))
+    assert priced[0] > priced[1] > priced[2] > priced[3] == 0
+    # The number of cores is all it reads: two 32-core shapes are not ranked by it.
+    shaped = [
+        _partitioned_operand_read_excess(
+            [
+                dataclasses.replace(
+                    _expert_loop_projection(1), cores=32, matmul_m_split=m
+                )
+            ],
+            p,
+        )
+        for m in (1, 2, 32)
+    ]
+    assert shaped == [0, 0, 0]
+
+
+def test_the_for_each_tile_price_is_symbolic_in_the_core_count_and_matches_numeric():
+    cores = sympy.Symbol("cores", integer=True, positive=True)
+    sym = _expert_loop_projection(1)
+    sym.cores = cores
+    expr = _partitioned_operand_read_excess([sym], _COST_PARAMS)
+    at = sympy.lambdify([cores], expr, modules="math")
+    for c in (4, 8, 16, 32):
+        concrete = _partitioned_operand_read_excess(
+            [
+                _expert_loop_projection(1)
+                if c == 1
+                else dataclasses.replace(_expert_loop_projection(1), cores=c)
+            ],
+            _COST_PARAMS,
+        )
+        assert at(c) == pytest.approx(concrete, rel=1e-9, abs=1e-6)
+
+
+def test_an_unpartitionable_loop_read_keeps_the_price_without_delivery_estimation():
+    off = dataclasses.replace(_COST_PARAMS, mm_partitioned_read_gbps_per_core=0.0)
+    cores = sympy.Symbol("cores", integer=True, positive=True)
+    for c in (8, 16, 32, cores):
+        op = dataclasses.replace(_expert_loop_projection(1), cores=c)
+        op.args = [
+            dataclasses.replace(a, has_partitioning_candidate=False) for a in op.args
+        ]
+        assert _partitioned_operand_read_excess([op], _COST_PARAMS) == 0
+        difference = sympy.simplify(
+            predict_ops([op], _COST_PARAMS) - predict_ops([op], off)
+        )
+        assert difference.is_zero is True
+
+
+def test_a_coarse_tiled_dense_matmul_keeps_its_price():
+    """A 4096^3 row-tiled matmul under coarse tiling (4 trips, tiles an output dim):
+    A advances with the loop (factor 1) and the weight is re-entered (factor 4), the
+    same factors an expert loop records for its walked and re-entered operands, but the
+    loop is not a for_each_tile loop and nothing here is priced -- alone, in a bundle,
+    and at every core count."""
+    p = _COST_PARAMS
+    off = dataclasses.replace(p, mm_partitioned_read_gbps_per_core=0.0)
+    for cores in (8, 16, 32):
+        op = _coarse_tiled_dense_matmul(cores)
+        assert (op.loop_trip, op.tiles_output_dim) == (4, True)
+        assert [a.loop_factor for a in op.args] == [1, 1, 4]
+        assert _partitioned_operand_read_excess([op], p) == 0
+        assert _partitioned_operand_read_excess([op, _projection(25, 1)], p) == 0
+        assert predict_ops([op], p) == predict_ops([op], off)
+
+
+def test_a_mixed_bundle_prices_the_walked_operand_and_leaves_single_pass_matmuls():
+    """Looped and single-pass matmuls in one bundle: the loop's walked operand is
+    priced and a single-pass matmul keeps its previous price (zero), because the bundle
+    is not all single-pass."""
+    p = _COST_PARAMS
+    other = _projection(25, 1)
+    other.args[2] = dataclasses.replace(other.args[2], name="arg99_1")
+    mixed = [_expert_loop_projection(25), other]
+    assert _partitioned_operand_read_excess([other], p) == pytest.approx(_excess_ns(25))
+    assert _partitioned_operand_read_excess(mixed, p) == pytest.approx(_excess_ns(25))
+
+
+def test_a_bundle_with_any_looped_op_keeps_its_price_outside_the_walked_operand():
+    looped = [
+        {"loop_trip": 4},
+        {"tiles_output_dim": True},
+        {"tiles_reduction_dim": True},
+    ]
+    for fields in looped:
+        bundle = [_projection(25, 1), _projection(25, 1, **fields)]
+        assert _partitioned_operand_read_excess(bundle, _COST_PARAMS) == 0
+    advancing = _projection(25, 1)
+    advancing.args[0] = dataclasses.replace(advancing.args[0], loop_factor=4)
+    assert _partitioned_operand_read_excess([advancing], _COST_PARAMS) == 0
+
+
+def test_reused_replicated_resident_or_unknown_operands_keep_their_price():
+    p = _COST_PARAMS
+    # Row reuse: prefill rows, or a GQA group sharing one KV head, feed each
+    # element to several MACs -- a regime this rate was not measured in.
+    assert (
+        _partitioned_operand_read_excess([_projection(25, 1, macs=4 * W_ELEMS)], p) == 0
+    )
+    # Unknown MAC count (legacy records carry 0).
+    assert _partitioned_operand_read_excess([_projection(25, 1, macs=0)], p) == 0
+    # Resident weight: nothing to deliver from HBM.
+    assert (
+        _partitioned_operand_read_excess([_projection(25, 1, weight_lx=True)], p) == 0
+    )
+    # Replicated operand: priced by _replicated_operand_reads instead.
+    replicated = _projection(25, 1)
+    replicated.args[2] = dataclasses.replace(replicated.args[2], replication=2)
+    assert _partitioned_operand_read_excess([replicated], p) == 0
+
+
+def test_one_graph_input_read_twice_in_a_bundle_is_charged_once():
+    both = [_projection(25, 1), _projection(25, 1)]
+    assert _partitioned_operand_read_excess(both, _COST_PARAMS) == pytest.approx(
+        _excess_ns(25)
+    )
+
+
+def test_tp1_gqa_decode_attention_reads_are_reused_and_keep_their_price():
+    # TP1 Granite decode QK: 32 query heads over 8 KV heads, 512 cached positions.
+    # Each cached K element feeds the 4 query heads of its group.
+    kv_elems, macs = 8 * 128 * 512, 32 * 128 * 512
+    for cores in (1, 8, 16, 32):
+        qk = OpFeatures(
+            name="bmm",
+            is_reduction=True,
+            out_elems=32 * 512,
+            cores=cores,
+            dtype_bytes=2,
+            args=[
+                ArgTraffic("buf20", "output", False, 32 * 512),
+                ArgTraffic("buf18", "input", False, 32 * 128),
+                ArgTraffic("arg30_1", "input", False, kv_elems, is_boundary=True),
+            ],
+            is_matmul=True,
+            matmul_macs=macs,
+        )
+        assert _partitioned_operand_read_excess([qk], _COST_PARAMS) == 0
+
+
+def test_the_symbolic_price_equals_the_committed_price_at_every_candidate():
+    """The co-optimizer scores this term over its split and residency symbols;
+    at each candidate it must equal the committed-path number -- including the
+    activation, whose symbolic replication is 1 exactly when N is unsplit."""
+    n, k = sympy.symbols("split_n split_k", integer=True, positive=True)
+    is_lx = sympy.Symbol("is_lx")
+    sym = _projection(n, k, weight_lx=is_lx)
+    sym.cores = n * k
+    expr = _partitioned_operand_read_excess([sym], _COST_PARAMS)
+    at = sympy.lambdify([n, k, is_lx], expr, modules="math")
+    for n_i, k_i, lx in ((25, 1, 0), (2, 16, 0), (1, 32, 0), (1, 16, 0), (25, 1, 1)):
+        concrete = _partitioned_operand_read_excess(
+            [_projection(n_i, k_i, weight_lx=bool(lx))], _COST_PARAMS
+        )
+        assert at(n_i, k_i, lx) == pytest.approx(concrete, rel=1e-9, abs=1e-6)
+
+
+def _solve_pinned(expr, menu, candidate, residency=None):
+    """Lower ``expr`` as the joint planner does -- split symbols wired to one
+    buffer's candidate divisions, residency a solver variable -- and solve it
+    with the division (and residency) pinned. Returns the objective value."""
+    cp_model = pytest.importorskip("ortools.sat.python.cp_model")
+    from torch_spyre._inductor.scratchpad.cpsat_expr_printer import _SympyExprToCpSat
+
+    model = cp_model.CpModel()
+    division = model.new_int_var(0, len(menu) - 1, "div")
+    model.add(division == candidate)
+    buf = types.SimpleNamespace(division=division)
+    sym_map, buffer_map = {}, {}
+    for d, name in enumerate(("split_n", "split_k", "split_m")[: len(menu[0])]):
+        raw = [c[d] for c in menu]
+        sym_map[name] = model.new_int_var(min(raw), max(raw), name)
+        model.add_element(division, raw, sym_map[name])
+        buffer_map[name] = (buf, raw)
+    if residency is not None:
+        sym_map["is_lx_w"] = model.new_bool_var("is_lx_w")
+        model.add(sym_map["is_lx_w"] == residency)
+    model.minimize(_SympyExprToCpSat(model, sym_map, buffer_map).convert(expr))
+    solver = cp_model.CpSolver()
+    assert solver.Solve(model) == cp_model.OPTIMAL
+    return solver.ObjectiveValue()
+
+
+def test_cp_sat_keeps_the_term_at_every_candidate():
+    """Lower the symbolic term exactly as the joint planner does and solve it
+    with each candidate division pinned: the integerized objective must carry
+    the priced excess, not round it away."""
+    n, k = sympy.symbols("split_n split_k", integer=True, positive=True)
+    sym = _projection(n, k)
+    sym.cores = n * k
+    expr = _partitioned_operand_read_excess([sym], _COST_PARAMS)
+    menu = [(25, 1), (2, 16), (1, 32), (10, 2), (5, 4)]
+    for i, (n_i, k_i) in enumerate(menu):
+        exact = _excess_ns(n_i * k_i) if n_i * k_i < 32 else 0.0
+        got = _solve_pinned(expr, menu, i)
+        assert got == pytest.approx(exact, rel=1e-3, abs=1.0)
+
+
+def test_cp_sat_follows_symbolic_weight_replication_and_residency():
+    """The weight's replication and residency are both solver symbols here: a
+    third split the weight does not index replicates it (priced elsewhere), and
+    residency removes its HBM read. The lowered term must price exactly the
+    partitioned, non-resident candidates."""
+    n, k, m = sympy.symbols("split_n split_k split_m", integer=True, positive=True)
+    is_lx = sympy.Symbol("is_lx_w", integer=True, nonnegative=True)
+    sym = _projection(n, k, weight_lx=is_lx)
+    sym.cores = n * k * m
+    sym.args[2] = dataclasses.replace(sym.args[2], replication=m)
+    expr = _partitioned_operand_read_excess([sym], _COST_PARAMS)
+    menu = [(25, 1, 1), (10, 2, 1), (10, 1, 2), (5, 2, 2), (2, 16, 1)]
+    for i, (n_i, k_i, m_i) in enumerate(menu):
+        for resident in (0, 1):
+            cores = n_i * k_i * m_i
+            partitioned = m_i == 1 and not resident
+            exact = _excess_ns(cores) if partitioned and cores < 32 else 0.0
+            got = _solve_pinned(expr, menu, i, residency=resident)
+            assert got == pytest.approx(exact, rel=1e-3, abs=1.0), (menu[i], resident)
+
+
+def _with_run(op, run, **fields):
+    """``op`` with a proven per-core DMA run of ``run`` bytes on its weight read,
+    one trip's share of the weight per invocation."""
+    op.args[2] = dataclasses.replace(
+        op.args[2],
+        read_run_bytes=run,
+        read_tile_elems=W_ELEMS // op.loop_trip,
+        **fields,
+    )
+    return op
+
+
+def _requests_excess_ns(run, ns=7.5):
+    """The weight's DMA request time beyond bytes/peak over the whole loop."""
+    return W_BYTES * (ns / run - 1 / 150)
+
+
+def test_loop_operand_requests_skip_resident_and_single_pass_reads():
+    """The request term is ``(1 - is_lx)`` times the excess, symbolically, and prices
+    looped matmuls only, so it stays disjoint from the single-pass estimate."""
+    p = _COST_PARAMS
+    added = _requests_excess_ns(128) - _excess_ns(16)
+    assert added > 0
+    is_lx = sympy.Symbol("is_lx_w", integer=True, nonnegative=True)
+    resident = _with_run(_expert_loop_projection(16), 128, is_lx=is_lx)
+    term = sympy.sympify(_loop_operand_request_excess([resident], p))
+    assert term.subs(is_lx, 1) == 0
+    assert float(term.subs(is_lx, 0)) == pytest.approx(added, rel=1e-9)
+    assert _read_burst_excess_ns([resident], p) == 0
+    single = _with_run(_projection(16, 1), 128)
+    assert _loop_operand_request_excess([single], p) == 0
+    assert _read_burst_excess_ns([single], p) > 0
+    # Without a proven per-trip footprint, the general burst term still applies.
+    fallback = _expert_loop_projection(16)
+    fallback.args[2] = dataclasses.replace(fallback.args[2], read_run_bytes=128)
+    assert _loop_operand_request_excess([fallback], p) == 0
+    assert _read_burst_excess_ns([fallback], p) > 0
+    # A coarse loop has no for_each_tile advance verdict. Proven request geometry
+    # still owns its read, but it receives no loop-delivery estimate.
+    coarse = _with_run(_expert_loop_projection(16), 128, advances_with_loop_var=False)
+    assert _partitioned_operand_read_excess([coarse], p) == 0
+    assert _loop_operand_request_excess([coarse], p) == pytest.approx(
+        _requests_excess_ns(128)
+    )
+    assert _read_burst_excess_ns([coarse], p) == 0
+
+
+def test_a_candidate_tile_count_declines_the_looped_matmul_terms():
+    # Under a candidate coarse tiling the trip count is a tile-count symbol. The
+    # op is still untiled, so it has no per-trip geometry for either term.
+    tiles = sympy.Symbol("tile_buf0_o0", integer=True, positive=True)
+    op = dataclasses.replace(
+        _with_run(_expert_loop_projection(16), 128), loop_trip=tiles
+    )
+    assert _partitioned_operand_read_excess([op], _COST_PARAMS) == 0
+    assert _loop_operand_request_excess([op], _COST_PARAMS) == 0
+
+
+@pytest.mark.parametrize("boundary", [True, False])
+@pytest.mark.parametrize("order", [(0, 1), (1, 0)])
+def test_a_weight_read_by_two_looped_matmuls_is_counted_by_its_owner(boundary, order):
+    """Use A, 4 cores and 256 B runs: delivery-bound. Use B, 16 cores and 128 B
+    runs: request-bound, slower than A's delivery. A graph input is one load: its
+    composed price is the slowest use (B's requests), not A's delivery plus B's
+    requests beyond B's delivery. An internal buffer is two loads, each read at
+    its own slower bottleneck."""
+    p = _COST_PARAMS
+    a = (_excess_ns(4), _requests_excess_ns(256))
+    b = (_excess_ns(16), _requests_excess_ns(128))
+    assert a[0] > a[1] > 0 and b[1] > a[0] > b[0] > 0
+    uses = [
+        _with_run(_expert_loop_projection(cores), run, is_boundary=boundary)
+        for cores, run in ((4, 256), (16, 128))
+    ]
+    uses = [uses[i] for i in order]
+    delivery = _partitioned_operand_read_excess(uses, p)
+    composed = (
+        delivery
+        + _loop_operand_request_excess(uses, p)
+        + _read_burst_excess_ns(uses, p)
+    )
+    if boundary:
+        assert delivery == pytest.approx(a[0], rel=1e-9)
+        assert composed == pytest.approx(b[1], rel=1e-9)
+    else:
+        assert delivery == pytest.approx(a[0] + b[0], rel=1e-9)
+        assert composed == pytest.approx(a[0] + b[1], rel=1e-9)
+
+
+@pytest.mark.parametrize("boundary", [True, False])
+def test_cp_sat_composes_two_symbolic_readers_by_ownership(boundary):
+    """Symbolic splits change both bottlenecks and which shared reader wins."""
+    n, k = sympy.symbols("split_n split_k", integer=True, positive=True)
+    uses = [
+        _with_run(_expert_loop_projection(cores), extent / cores, is_boundary=boundary)
+        for cores, extent in ((n, 4096), (k, 8192))
+    ]
+    delivery = _partitioned_operand_read_excess(uses, _COST_PARAMS)
+    extra = _loop_operand_request_excess(uses, _COST_PARAMS)
+    assert delivery.free_symbols == extra.free_symbols == {n, k}
+    menu = [(4, 16), (16, 4), (32, 16), (16, 32)]
+    rows = []
+    for i, cores in enumerate(menu):
+        parts = [max(0, _excess_ns(c)) for c in cores]
+        requests = [
+            max(
+                0,
+                _requests_excess_ns(
+                    extent / c, ns=_COST_PARAMS.transport_dma_ns_per_request[c]
+                ),
+            )
+            for c, extent in zip(cores, (4096, 8192))
+        ]
+        aggregate = max if boundary else sum
+        rows.append([max(a, b) for a, b in zip(parts, requests)])
+        expected = aggregate(rows[-1])
+        assert float(
+            (delivery + extra).subs(dict(zip((n, k), cores)))
+        ) == pytest.approx(expected)
+        assert _solve_pinned(delivery + extra, menu, i) == pytest.approx(
+            expected, abs=2.0
+        )
+    assert any(min(row) > 0 for row in rows)  # shared max differs from internal sum
+    assert len({row.index(max(row)) for row in rows}) == 2
+
+
+def test_explain_reports_the_limit():
+    text = explain([_projection(25, 1)], _COST_PARAMS)
+    assert "partitioned-read core limit" in text
+    assert "partitioned-read core limit" not in explain(
+        [_projection(2, 16)], _COST_PARAMS
+    )
 
 
 # -------------------------------------------------------- extractor, on device
@@ -294,3 +889,307 @@ def test_extractor_stamps_the_matmul_operand_the_core_split_replicates(monkeypat
     for f in captured.values():
         if not f.is_matmul:
             assert all(a.replication == 1 for a in f.args), f.name
+
+
+# ------------------------------------------------ small-M decode weight delivery
+#
+# The co-optimizer's price for a small-M decode projection's shared weight must
+# follow ``work_division._decode_weight_delivery_us`` at every candidate, concretely
+# and as lowered to CP-SAT, so the joint solver ranks gate_up M4 x N8 ahead of
+# M8 x N4 (1357 vs 1626 us measured) instead of pricing them alike.
+
+GU_K, GU_N = 4096, 25600  # gate_up
+GU_W_ELEMS = GU_K * GU_N
+GU_W_BYTES = 2 * GU_W_ELEMS
+
+
+def _gate_up(M, m, n, k, *, weight_lx=False):
+    cores = m * n * k
+    return OpFeatures(
+        name="mm",
+        is_reduction=True,
+        out_elems=M * GU_N,
+        cores=cores,
+        dtype_bytes=2,
+        reduction_cores=k,
+        args=[
+            ArgTraffic("buf0", "input", False, M * GU_K, replication=n),
+            ArgTraffic(
+                "arg1_1", "input", weight_lx, GU_W_ELEMS, broadcast=m > 1,
+                is_boundary=True, replication=m,
+            ),
+            ArgTraffic("buf1", "output", False, M * GU_N),
+        ],
+        is_matmul=True,
+        matmul_macs=M * GU_K * GU_N,
+        matmul_a_bytes=2 * M * GU_K,
+        matmul_b_bytes=GU_W_BYTES,
+        matmul_rows_per_core=M / m,
+        matmul_cols_per_core=GU_N / n,
+        matmul_m_split=m,
+        matmul_n_split=n,
+    )  # fmt: skip
+
+
+def _decode_expected(m, k, cores, p=_COST_PARAMS):
+    bw = wd._decode_weight_delivery_gbps(cores, m, k)
+    return max(0.0, GU_W_BYTES / bw - GU_W_BYTES / p.bw_peak_gbps)
+
+
+@pytest.mark.parametrize("m, n, k", [(4, 8, 1), (8, 4, 1), (1, 16, 1), (8, 2, 2)])
+def test_the_excess_is_the_measured_delivery_over_the_peak(m, n, k):
+    got = _decode_weight_delivery_excess([_gate_up(8, m, n, k)], _COST_PARAMS)
+    assert got == pytest.approx(_decode_expected(m, k, m * n * k))
+
+
+def test_the_joint_price_ranks_sharing_by_four_ahead_of_eight():
+    p = _COST_PARAMS
+    by_4 = predict_ops([_gate_up(8, 4, 8, 1)], p)
+    by_8 = predict_ops([_gate_up(8, 8, 4, 1)], p)
+    unshared_16 = predict_ops([_gate_up(8, 1, 16, 1)], p)
+    assert by_4 < by_8 < unshared_16
+    assert by_8 - by_4 > 100_000  # ~270 us measured
+
+
+def test_a_resident_weight_pays_no_delivery():
+    assert _decode_weight_delivery_excess([_gate_up(8, 8, 4, 1, weight_lx=True)], _COST_PARAMS) == 0  # fmt: skip
+
+
+@pytest.mark.parametrize("M", [1, 64])
+def test_outside_the_measured_rows_the_cohort_excess_still_prices(M):
+    op = _gate_up(M, 16, 2, 1)  # shared by 16: past the cohort limit
+    assert _decode_weight_delivery_excess([op], _COST_PARAMS) == 0
+    expected = (
+        GU_W_BYTES * (wd._matmul_multicast_penalty(16) - 1) / _COST_PARAMS.bw_peak_gbps
+    )
+    assert _shared_operand_read_excess([op], _COST_PARAMS) == pytest.approx(expected)
+
+
+def test_in_scope_the_cohort_excess_steps_aside():
+    op = _gate_up(8, 16, 2, 1)  # replication 16: the old cohort penalty would fire
+    assert _shared_operand_read_excess([op], _COST_PARAMS) == 0
+
+
+DECODE_MENU = [
+    (4, 8, 1),
+    (8, 4, 1),
+    (2, 16, 1),
+    (1, 16, 1),
+    (8, 2, 2),
+    (2, 4, 4),
+    (1, 8, 4),
+]
+SPLIT_M, SPLIT_N, SPLIT_K = sympy.symbols(
+    "split_m split_n split_k", integer=True, positive=True
+)
+
+
+def _decode_symbolic(M, *, weight_lx=False):
+    """The op as the co-optimizer extracts it: symbolic M, N and K splits."""
+    m, n, k = SPLIT_M, SPLIT_N, SPLIT_K
+    op = _gate_up(M, 1, 1, 1, weight_lx=weight_lx)
+    return dataclasses.replace(
+        op,
+        cores=m * n * k,
+        reduction_cores=k,
+        matmul_m_split=m,
+        matmul_n_split=n,
+        args=[
+            dataclasses.replace(op.args[0], replication=n),
+            dataclasses.replace(op.args[1], broadcast=True, replication=m),
+            op.args[2],
+        ],
+    )
+
+
+def _at(m, n, k):
+    return {SPLIT_M: m, SPLIT_N: n, SPLIT_K: k}
+
+
+@pytest.mark.parametrize("batch", [2, 4])
+@pytest.mark.parametrize("shared_weight", [False, True])
+@pytest.mark.parametrize("symbolic", [False, True])
+def test_batched_matmuls_keep_cohort_pricing(batch, shared_weight, symbolic):
+    op = _decode_symbolic(8) if symbolic else _gate_up(8, 16, 2, 1)
+    activation, weight, output = op.args
+    weight = dataclasses.replace(
+        weight, elems=weight.elems * (1 if shared_weight else batch)
+    )
+    # The extractor's A/B byte counts exclude batch; MACs, output elements,
+    # and per-batch argument footprints include it.
+    op = dataclasses.replace(
+        op,
+        matmul_macs=op.matmul_macs * batch,
+        out_elems=op.out_elems * batch,
+        args=[
+            dataclasses.replace(activation, elems=activation.elems * batch),
+            weight,
+            dataclasses.replace(output, elems=output.elems * batch),
+        ],
+    )
+    assert _decode_weight_delivery_excess([op], _COST_PARAMS) == 0
+    cohort = _shared_operand_read_excess([op], _COST_PARAMS)
+    actual = float(sympy.sympify(cohort).xreplace(_at(16, 2, 1)))
+    expected = (
+        weight.elems
+        * op.dtype_bytes
+        * (wd._matmul_multicast_penalty(16) - 1)
+        / _COST_PARAMS.bw_peak_gbps
+    )
+    assert actual == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("symbolic", [False, True])
+def test_decode_delivery_charges_a_shared_boundary_weight_once(symbolic):
+    op = _decode_symbolic(8) if symbolic else _gate_up(8, 4, 8, 1)
+    other = _gate_up(8, 8, 4, 1)
+    expr = _decode_weight_delivery_excess([op, other], _COST_PARAMS)
+    for m, n, k in DECODE_MENU if symbolic else [(4, 8, 1)]:
+        actual = float(sympy.sympify(expr).xreplace(_at(m, n, k)))
+        expected = max(_decode_expected(m, k, m * n * k), _decode_expected(8, 1, 32))
+        assert actual == pytest.approx(expected, abs=1.0)
+
+
+def test_the_symbolic_price_equals_the_concrete_price_at_every_candidate():
+    expr = _decode_weight_delivery_excess([_decode_symbolic(8)], _COST_PARAMS)
+    at = sympy.lambdify([SPLIT_M, SPLIT_N, SPLIT_K], expr, modules="math")
+    for m, n, k in DECODE_MENU:
+        expected = _decode_expected(m, k, m * n * k)
+        assert at(m, n, k) == pytest.approx(expected, abs=1.0), (m, n, k)
+        # The substituted node folds, and evalf (plan_solver's reading) agrees.
+        assert float(expr.xreplace(_at(m, n, k))) == pytest.approx(expected, abs=1.0)
+
+
+def test_a_resident_symbolic_weight_pays_nothing():
+    is_lx = sympy.Symbol("is_lx_arg1_1", integer=True, nonnegative=True)
+    expr = _decode_weight_delivery_excess(
+        [_decode_symbolic(8, weight_lx=is_lx)], _COST_PARAMS
+    )
+    at = sympy.lambdify([SPLIT_M, SPLIT_N, SPLIT_K, is_lx], expr, modules="math")
+    assert at(8, 4, 1, 1) == 0
+    assert at(8, 4, 1, 0) == pytest.approx(_decode_expected(8, 1, 32), abs=1.0)
+    assert expr.xreplace({is_lx: 1}) == 0
+
+
+def _decode_buffer():
+    """A co-optimizer buffer whose candidates are ``DECODE_MENU``; a candidate
+    that does not split an axis reads 1 for it."""
+    keys = {"d0": SPLIT_M, "d1": SPLIT_N, "d2": SPLIT_K}
+    return types.SimpleNamespace(
+        sym_division=sympy.Symbol("division_buf1", integer=True, nonnegative=True),
+        sym_core_divs=keys,
+        core_divisions=[
+            types.SimpleNamespace(splits={d: v for d, v in zip(keys, mnk) if v != 1})
+            for mnk in DECODE_MENU
+        ],
+    )
+
+
+@pytest.mark.parametrize("weight_lx", [False, True])
+def test_cp_sat_calls_the_functor_at_every_candidate(weight_lx):
+    cp_model = pytest.importorskip("ortools.sat.python.cp_model")
+    from torch_spyre._inductor.scratchpad.cpsat_expr_printer import _SympyExprToCpSat
+
+    is_lx = sympy.Symbol("is_lx_arg1_1", integer=True, nonnegative=True)
+    expr = _decode_weight_delivery_excess(
+        [_decode_symbolic(8, weight_lx=is_lx)], _COST_PARAMS
+    )
+    buffer = _decode_buffer()
+    for i, (m, n, k) in enumerate(DECODE_MENU):
+        model = cp_model.CpModel()
+        division = model.new_int_var(0, len(DECODE_MENU) - 1, "div")
+        model.add(division == i)
+        resident = model.new_bool_var("resident")
+        model.add(resident == int(weight_lx))
+        wrapper = types.SimpleNamespace(division=division, buffer=buffer)
+        sym_map = {is_lx.name: resident}
+        buffer_map = {
+            sym.name: (wrapper, [cd.splits.get(key, 1) for cd in buffer.core_divisions])
+            for key, sym in buffer.sym_core_divs.items()
+        }
+        model.minimize(_SympyExprToCpSat(model, sym_map, buffer_map).convert(expr))
+        solver = cp_model.CpSolver()
+        assert solver.Solve(model) == cp_model.OPTIMAL
+        expected = 0 if weight_lx else _decode_expected(m, k, m * n * k)
+        assert solver.ObjectiveValue() == pytest.approx(expected, rel=2e-3, abs=2.0), (
+            m,
+            n,
+            k,
+        )
+
+
+def test_cp_sat_leaves_a_split_without_an_owner_unpriced():
+    cp_model = pytest.importorskip("ortools.sat.python.cp_model")
+    from torch_spyre._inductor.scratchpad.cpsat_expr_printer import _SympyExprToCpSat
+
+    expr = _decode_weight_delivery_excess([_decode_symbolic(8)], _COST_PARAMS)
+    assert _SympyExprToCpSat(cp_model.CpModel(), {}, {}).convert(expr) == 0
+
+
+def test_cp_sat_gates_the_price_on_residency_without_a_product():
+    cp_model = pytest.importorskip("ortools.sat.python.cp_model")
+    from torch_spyre._inductor.scratchpad.cpsat_expr_printer import _SympyExprToCpSat
+
+    is_lx = sympy.Symbol("is_lx_arg1_1", integer=True, nonnegative=True)
+    expr = _decode_weight_delivery_excess(
+        [_decode_symbolic(8, weight_lx=is_lx)], _COST_PARAMS
+    )
+    buffer = _decode_buffer()
+    model = cp_model.CpModel()
+    wrapper = types.SimpleNamespace(
+        division=model.new_int_var(0, len(DECODE_MENU) - 1, "div"), buffer=buffer
+    )
+    sym_map = {is_lx.name: model.new_bool_var("resident")}
+    buffer_map = {
+        sym.name: (wrapper, [cd.splits.get(key, 1) for cd in buffer.core_divisions])
+        for key, sym in buffer.sym_core_divs.items()
+    }
+    _SympyExprToCpSat(model, sym_map, buffer_map).convert(expr)
+    constraints = model.proto.constraints
+    # One lookup for the price, though ``expand`` repeats it under the gate,
+    # and the gate as enforced linear constraints rather than a product.
+    assert sum(c.has_element() for c in constraints) == 1
+    assert not any(c.has_int_prod() for c in constraints)
+
+
+@pytest.mark.parametrize("resident", [0, 1])
+@pytest.mark.parametrize("value", [-3, 0, 5])
+def test_cp_sat_bool_times_int_is_the_int_while_the_bool_holds(resident, value):
+    cp_model = pytest.importorskip("ortools.sat.python.cp_model")
+    from torch_spyre._inductor.scratchpad.cpsat_expr_printer import _SympyExprToCpSat
+
+    b, x = sympy.symbols("b x", integer=True)
+    model = cp_model.CpModel()
+    bool_var, int_var = model.new_bool_var("b"), model.new_int_var(-4, 6, "x")
+    model.add(bool_var == resident)
+    model.add(int_var == value)
+    sym_map = {"b": bool_var, "x": int_var}
+    model.minimize(_SympyExprToCpSat(model, sym_map, {}).convert(2 * b * x + 1))
+    assert not any(c.has_int_prod() for c in model.proto.constraints)
+    solver = cp_model.CpSolver()
+    assert solver.Solve(model) == cp_model.OPTIMAL
+    assert solver.ObjectiveValue() == 2 * resident * value + 1
+
+
+@pytest.mark.parametrize("resident", [(0, 0), (0, 1), (1, 0), (1, 1)])
+@pytest.mark.parametrize("value", [None, -3, 5])
+def test_cp_sat_bools_times_int_is_the_int_while_every_bool_holds(resident, value):
+    cp_model = pytest.importorskip("ortools.sat.python.cp_model")
+    from torch_spyre._inductor.scratchpad.cpsat_expr_printer import _SympyExprToCpSat
+
+    b1, b2, x = sympy.symbols("b1 b2 x", integer=True)
+    model = cp_model.CpModel()
+    bool_vars = [model.new_bool_var("b1"), model.new_bool_var("b2")]
+    int_var = model.new_int_var(-4, 6, "x")
+    for var, r in zip(bool_vars, resident):
+        model.add(var == r)
+    model.add(int_var == (value or 0))
+    sym_map = {"b1": bool_vars[0], "b2": bool_vars[1], "x": int_var}
+    # value=None leaves x out: a product of booleans alone.
+    expr = 2 * b1 * b2 * (1 if value is None else x) + 1
+    model.minimize(_SympyExprToCpSat(model, sym_map, {}).convert(expr))
+    assert not any(c.has_int_prod() for c in model.proto.constraints)
+    solver = cp_model.CpSolver()
+    assert solver.Solve(model) == cp_model.OPTIMAL
+    expected = resident[0] * resident[1] * (1 if value is None else value)
+    assert solver.ObjectiveValue() == 2 * expected + 1

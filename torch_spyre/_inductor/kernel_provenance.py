@@ -70,6 +70,7 @@ _EXPECTED_OP_SPEC_SCHEMA = {
     "tiled_symbol_trip_counts": "dict[Symbol, int]",
     "symbolic_dim_bounds": "dict[str, tuple[int, int]]",
     "node_output_ranges": "tuple[Expr, ...] | None",
+    "completed_producer_cores": "tuple[int, ...]",
     "debug_handle": "DebugHandle | None",
 }
 _EXPECTED_TENSOR_ARG_SCHEMA = {
@@ -84,6 +85,8 @@ _EXPECTED_TENSOR_ARG_SCHEMA = {
     "element_arrangement": "ElementArrangement",
     "work_division": "TensorWorkDivision | None",
     "kernel_local": "bool",
+    "replicated_scalar": "bool",
+    "non_unified_shard_bytes": "int",
 }
 _EXPECTED_TENSOR_WORK_DIVISION_SCHEMA = {
     "work_slices": "dict[Symbol, int]",
@@ -278,6 +281,10 @@ def _canonical_spec(spec: object) -> object:
             result["core_id_to_work_slice"] = _canonical_value(
                 spec.core_id_to_work_slice
             )
+        if spec.completed_producer_cores:
+            result["completed_producer_cores"] = _canonical_value(
+                spec.completed_producer_cores
+            )
         return result
     if isinstance(spec, LoopSpec):
         return {
@@ -329,6 +336,13 @@ def _canonical_tensor_arg(arg: TensorArg) -> object:
     # keep the exact key they had before this field existed.
     if arg.kernel_local:
         result["kernel_local"] = True
+    # Same rule, same reason: only set on the KTIR path, so an SDSC identity is
+    # unchanged.  It belongs in the identity at all because it changes what the
+    # emitter reads out of the buffer -- one lane or the whole stick.
+    if arg.replicated_scalar:
+        result["replicated_scalar"] = True
+    if arg.non_unified_shard_bytes:
+        result["non_unified_shard_bytes"] = arg.non_unified_shard_bytes
     return result
 
 

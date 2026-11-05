@@ -31,28 +31,27 @@ and that a refactor would quietly break:
 
 from __future__ import annotations
 
-import importlib.util
+import importlib
 import pathlib
 import sys
 
 import pytest
 
-_SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / ".github" / "scripts"
+# The ingest imports the shared library from extensions/; it is in this repo, so put it on
+# sys.path rather than requiring an install for a parse-only test.
+_CHLIB = (
+    pathlib.Path(__file__).resolve().parents[1] / "extensions" / "clickhouse-ingest"
+)
+if str(_CHLIB) not in sys.path:
+    sys.path.insert(0, str(_CHLIB))
 
 
 @pytest.fixture(scope="module")
 def ing():
-    """Load ingest_xml.py by path -- it is a script, not an importable package."""
-    sys.path.insert(0, str(_SCRIPTS))
-    spec = importlib.util.spec_from_file_location(
-        "ingest_xml", _SCRIPTS / "ingest_xml.py"
-    )
-    mod = importlib.util.module_from_spec(spec)
     try:
-        spec.loader.exec_module(mod)
+        return importlib.import_module("spyre_clickhouse_ingest.results")
     except ModuleNotFoundError as exc:  # lxml / clickhouse_connect / regex absent
-        pytest.skip(f"ingest_xml deps unavailable: {exc}")
-    return mod
+        pytest.skip(f"ingest deps unavailable: {exc}")
 
 
 class FakeRows:
@@ -120,7 +119,17 @@ def test_copy_is_scoped_to_the_tiers_own_cases(ing):
     c = FakeCH()
     ing.copy_reused_cases(c, "db", "run-1", "torch-spyre", [("integration", "src-1")])
     sql, _ = c.commands[0]
-    assert "has(c.tags, concat('testtype__', {tier:String}))" in sql
+    assert "has(cr.tags, concat('testtype__', {tier:String}))" in sql
+
+
+def test_only_a_case_the_run_executed_blocks_the_copy(ing):
+    """A local skip keeps the copy beside it, as the writer and migration 009 do."""
+    c = FakeCH()
+    ing.copy_reused_cases(c, "db", "run-1", "torch-spyre", [("integration", "src-1")])
+    sql, _ = c.commands[0]
+    held = sql.split("NOT IN")[1]
+    assert "status != 'skipped'" in held
+    assert "props['ran_in'] IN ('', toString({run_id:UUID}))" in held
 
 
 def test_ran_in_is_preserved_not_overwritten(ing):
@@ -190,10 +199,36 @@ def test_several_tiers_in_one_call(ing):
 def test_executed_rows_are_stamped_with_this_run(ing):
     """`ran_in = run_id` is what makes "how much did we actually execute" answerable:
     countIf(props['ran_in'] = run_id). Without it every reuse copy inflates that count."""
-    src = (_SCRIPTS / "ingest_xml.py").read_text()
-    insert_v2 = src[src.index("def insert_v2(") :]
-    insert_v2 = insert_v2[: insert_v2.index("\ndef ")]
-    assert '"ran_in": run_id' in insert_v2
-    assert "source_file" in insert_v2, (
+    # insert_test_results (TestResultWriter.insert) lives in the shared library -- this
+    # calls it behaviourally rather than slicing source, so the assertion survives a
+    # refactor of the writer's internal shape.
+    from spyre_clickhouse_ingest import writer
+
+    class _Rows:
+        result_rows: tuple = ()
+
+    class _FakeClient:
+        def __init__(self):
+            self.inserts = []
+
+        def insert(self, name, rows, column_names=None, database=None):
+            self.inserts.append((name, rows, column_names))
+
+        def query(self, sql, parameters=None):
+            return _Rows()
+
+    c = _FakeClient()
+    writer.insert_test_results(
+        c,
+        "db",
+        "torch-spyre",
+        "run-1",
+        [{"classname": "C", "name": "n", "status": "passed"}],
+        source_file="a.xml",
+    )
+    _name, rows, cols = next(i for i in c.inserts if i[0] == "test_case_runs")
+    props = rows[0][cols.index("props")]
+    assert props["ran_in"] == "run-1"
+    assert props["source_file"] == "a.xml", (
         "the shard discriminator must survive alongside it"
     )

@@ -14,6 +14,7 @@
 
 import dataclasses
 from functools import partial
+import logging
 import math
 from types import SimpleNamespace
 from unittest import mock
@@ -23,6 +24,7 @@ import sympy
 
 import torch_spyre._inductor.codegen.superdsc as superdsc_module
 import torch_spyre._inductor.core_mapping as core_mapping_module
+import torch_spyre._inductor.kernel_provenance as kernel_provenance_module
 import torch_spyre._inductor.pass_utils as pass_utils_module
 import torch_spyre._inductor.spyre_kernel as spyre_kernel_module
 from torch_spyre._C import DataFormats, ElementArrangement
@@ -33,12 +35,14 @@ from torch_spyre._inductor.constants import (
     BATCH_MATMUL_OP,
 )
 from torch_spyre._inductor.core_mapping import (
+    aligned_split_keeps_blocks,
     core_mappings_equal,
     core_to_slice_mapping,
     derive_core_mapping,
     derive_partition_mapping,
     derive_operation_mapping,
     finalize_tensor_work_divisions,
+    matmul_reduction_dim,
     select_unique_partition_division,
 )
 from torch_spyre._inductor.op_spec import (
@@ -294,6 +298,28 @@ def test_late_partition_mapping_repeats_contiguous_owners():
 
 
 @pytest.mark.parametrize(
+    ("split", "bases", "keeps_blocks"),
+    [
+        # d0 < 6 cut into its repeat period (2, innermost) and count (3).
+        (1, (2, 3), True),
+        (3, (2, 3), True),
+        (6, (2, 3), True),
+        # gcd(2, 3) leaves the count whole and splits the period: core 0
+        # would own rows {0, 2, 4}.
+        (2, (2, 3), False),
+        # A partial split of the outermost segment keeps blocks.
+        (2, (2, 4), True),
+        (4, (4, 3), False),
+        (6, (4, 3), True),
+        # Nothing absorbs a factor of 5.
+        (5, (2, 3), False),
+    ],
+)
+def test_aligned_split_keeps_blocks(split, bases, keeps_blocks):
+    assert aligned_split_keeps_blocks(split, bases) is keeps_blocks
+
+
+@pytest.mark.parametrize(
     ("extent", "split", "device_size", "accepted", "owner"),
     [
         # A 98-wide axis must not lose f = 98 to floating-point rounding.
@@ -434,6 +460,9 @@ def test_owner_maps_compare_physical_owners_not_sympy_spelling():
     assert not view.same_partition(
         PerCoreView(((0, 4),), ((0, reordered),), num_cores=8)
     )
+    # A physical core count left implicit is the product of the splits.
+    implicit = PerCoreView(((0, 4),), ((0, sympy.Mod(_CORE_ID, 4)),))
+    assert implicit.same_partition(dataclasses.replace(implicit, num_cores=4))
 
 
 def test_late_mapping_rejects_geometry_that_does_not_fill_groups():
@@ -754,6 +783,117 @@ def test_planner_and_sdsc_use_the_same_mapping(
         assert not planner_view.same_partition(PerCoreView((), (), num_cores=1))
 
 
+def test_matmul_reduction_dim_is_found_by_identity():
+    """K is the one loop that both inputs index and the output does not."""
+    mb, out, reduction, restored = sympy.symbols("mb out reduction restored")
+    space = {mb: (512, 2), out: (12800, 4), reduction: (4096, 4), restored: (1, 1)}
+
+    def args(x, y, output):
+        return [
+            SimpleNamespace(is_input=True, device_coordinates=x),
+            SimpleNamespace(is_input=True, device_coordinates=y),
+            SimpleNamespace(is_input=False, device_coordinates=output),
+        ]
+
+    x = [restored, mb, reduction]
+    y = [restored, reduction, sympy.Mod(out, 64)]
+    # Alignment appends a restored loop after K, so the last loop is not K.
+    assert matmul_reduction_dim(space, args(x, y, [restored, mb, out])) == reduction
+    # K is K whatever its split; an integer coordinate indexes no loop.
+    unsplit = {**space, reduction: (4096, 1)}
+    output = [sympy.Integer(0), restored, mb, out]
+    assert matmul_reduction_dim(unsplit, args(x, y, output)) == reduction
+    # An N of 1 that y and the output fold away is not K.
+    folded = args(x, [restored, reduction], [restored, mb])
+    assert matmul_reduction_dim({**space, out: (1, 1)}, folded) == reduction
+    # Two loops that both inputs index and the output does not: no single K.
+    assert matmul_reduction_dim(space, args(x, y, [mb, out])) is None
+
+
+def _bmm_op_spec_on_a_slice(op: str, restored_loops: int) -> OpSpec:
+    """A bmm whose x is one slice of a larger buffer, before alignment.
+
+    Each added device dimension of x has size 2 and a constant coordinate.
+    Alignment restores a range-1 loop for each such dimension, and it puts the
+    loop in every tensor. It adds these loops after K, as for a batch-1 matmul in
+    a ``for_each_tile`` body.
+    """
+    op_spec = _bmm_op_spec(op)
+    x = op_spec.args[0]
+    x.device_size = [2] * restored_loops + x.device_size
+    x.device_coordinates = [sympy.Integer(1)] * restored_loops + x.device_coordinates
+    return op_spec
+
+
+@pytest.mark.parametrize("op", [BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP])
+@pytest.mark.parametrize(
+    "restored_loops,labels",
+    [(1, ["x", "mb", "out", "in"]), (2, ["y", "x", "mb", "out", "in"])],
+)
+def test_restored_loops_go_in_front_of_k(monkeypatch, op, restored_loops, labels):
+    """Every reader that takes K as the last loop sees K after alignment."""
+    monkeypatch.setattr(
+        spyre_kernel_module._spyre_config, "core_id_k_fast_emission", True
+    )
+    op_spec = _bmm_op_spec_on_a_slice(op, restored_loops)
+    mb, out, reduction = op_spec.iteration_space
+    simplify_op_spec(op_spec)
+    dims = list(op_spec.iteration_space)
+    restored = dims[:restored_loops]
+    assert dims[restored_loops:] == [mb, out, reduction]
+    assert [op_spec.iteration_space[dim] for dim in restored] == [(1, 1)] * len(
+        restored
+    )
+    for arg in op_spec.args:
+        indexed = {s for c in arg.device_coordinates for s in c.free_symbols}
+        assert indexed.issuperset(restored)
+    # Core order: the four K slices of each output slice are on adjacent cores.
+    coordinates = _mapping_coordinates(
+        op_spec.core_id_to_work_slice, (mb, out, reduction), 32
+    )
+    assert coordinates == [(core // 4 % 2, core // 8, core % 4) for core in range(32)]
+    # Provenance takes this K-fast order as the default one.
+    assert kernel_provenance_module._is_canonical_core_mapping(op_spec)
+    # SDSC: the restored loops are batch dims, and K is `in`.
+    sdsc_spec, renamed = parse_op_spec(op_spec)
+    assert [str(renamed[dim]) for dim in dims] == labels
+    assert [str(label) for label in sdsc_spec.iteration_space] == labels
+
+
+def test_matmul_loop_order_is_kept_without_a_proven_batch_loop(caplog):
+    """No single K, or a loop after K that a tensor does not index: no change.
+
+    The readers then take the last loop as K, and a debug line gives the reason.
+    """
+    op_spec = _bmm_op_spec(BATCH_MATMUL_OP)
+    mb, out, reduction = op_spec.iteration_space
+    spyre_kernel_module._restore_matmul_loop_order(op_spec)
+    assert list(op_spec.iteration_space) == [mb, out, reduction]
+
+    def kept(op_spec, message):
+        dims = list(op_spec.iteration_space)
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger=spyre_kernel_module.logger.name):
+            spyre_kernel_module._restore_matmul_loop_order(op_spec)
+        assert list(op_spec.iteration_space) == dims
+        assert message in caplog.text
+
+    # A loop after K that y does not index is not a batch loop.
+    extra = sympy.Symbol("extra")
+    op_spec.iteration_space = {**op_spec.iteration_space, extra: (1, 1)}
+    for arg in (op_spec.args[0], op_spec.args[-1]):
+        arg.device_coordinates = [extra, *arg.device_coordinates]
+    kept(op_spec, "are not in every tensor")
+
+    # K in two loops: both inputs index each one and the output indexes neither.
+    op_spec = _bmm_op_spec(BATCH_MATMUL_OP)
+    second = sympy.Symbol("second")
+    op_spec.iteration_space = {**op_spec.iteration_space, second: (2, 2)}
+    for arg in op_spec.args[:2]:
+        arg.device_coordinates = [second, *arg.device_coordinates]
+    kept(op_spec, "no single reduction loop")
+
+
 def test_flattened_iteration_span_is_not_a_single_axis_view():
     heads, flat = sympy.symbols("heads flat")
     prep = _view_prep(
@@ -1033,6 +1173,24 @@ def test_fused_view_keeps_sticks_whole(monkeypatch, flat_split):
         )
 
 
+def test_tile_ownership_view_runs_the_innermost_level_fastest():
+    # Tile ids count the way the loop nest runs: the outer level's slice holds
+    # while the inner level steps through its tiles.
+    head, flat = sympy.symbols("head flat", integer=True, nonnegative=True)
+    prep, _ = _prepare_compound_axis_view({head: 16, flat: 512}, 512 * head + flat)
+    view = pass_utils_module.tile_ownership_view(prep, ((head, 2), (flat, 4)))
+    assert view.same_partition(
+        PerCoreView(
+            ((2, 4), (3, 2)),
+            ((2, sympy.Mod(_CORE_ID, 4)), (3, sympy.floor(_CORE_ID / 4))),
+            num_cores=8,
+        )
+    )
+    # The same two levels nested the other way walk the buffer differently.
+    swapped = pass_utils_module.tile_ownership_view(prep, ((flat, 4), (head, 2)))
+    assert not view.same_partition(swapped)
+
+
 def test_direct_axis_proof_budget_boundary():
     prove = core_mapping_module.direct_axis_ownership_failure
     point = core_mapping_module._LOOP_POINT
@@ -1055,6 +1213,63 @@ def test_prepare_per_core_view_does_not_record_repeat_info():
 
     assert graph._repeat_info is existing
     assert graph._repeat_info == before
+
+
+def _attention_repack_view_prep(*, width=128, offset=0):
+    """The actual GKSPILL5 buf7 write, before SDSC factors its feature axis."""
+    row, head, feature = sympy.symbols(
+        "row head feature", integer=True, nonnegative=True
+    )
+    prep = _view_prep(
+        iter_space={row: 512, head: 8, feature: width},
+        write_index=1024 * row + 128 * head + feature,
+        dep_coeff={row: 1024, head: 128, feature: 1},
+        dep_device_coordinates=(
+            2 * head + sympy.floor(feature / 64) + offset,
+            row,
+            sympy.Mod(feature, 64),
+        ),
+        device_size=[16, 512, 64],
+        stride_map=[64, 1024, 1],
+        device_stride_to_dim={64: 0, 1024: 1, 1: 2},
+        stick_host_stride=1,
+        num_stick_dim=0,
+        num_stick=16,
+        num_stick_stride=64,
+    )
+    return prep, row, head, feature
+
+
+@pytest.mark.parametrize(
+    "width,offset,relayout_enabled,representable",
+    [
+        (128, 0, True, True),
+        (192, 0, True, False),
+        (128, 1, True, False),
+        (128, 0, False, False),
+    ],
+)
+def test_attention_repack_maps_only_complete_head_shards(
+    monkeypatch, width, offset, relayout_enabled, representable
+):
+    monkeypatch.setattr(
+        pass_utils_module.config, "lx_planner_relayout", relayout_enabled
+    )
+    prep, row, head, feature = _attention_repack_view_prep(width=width, offset=offset)
+    coordinates = prep.dep_device_coordinates
+    view, partial, actual = pass_utils_module._per_core_view_from_prep(
+        prep, {row: 8, head: 4, feature: 1}
+    )
+    assert actual is representable
+    assert not partial
+    assert prep.dep_device_coordinates == coordinates
+    if representable:
+        assert view.num_cores == 32
+        assert dict(view.work_slice_dims) == {0: 4, 1: 8}
+        owners = dict(view.core_to_slot)
+        for core in range(32):
+            assert int(owners[0].subs(_CORE_ID, core)) == core // 8
+            assert int(owners[1].subs(_CORE_ID, core)) == core % 8
 
 
 @pytest.mark.parametrize("relayout_enabled", [False, True])
@@ -1114,3 +1329,386 @@ def test_reshape_changes_per_core_ownership_within_one_device_axis(
         {consumer_head: 16, consumer_outer: 2, consumer_inner: 1},
     )
     assert outer_split_representable
+
+
+# The inverse of the per-core view: given a producer's slicing of a buffer,
+# rebuild the split map a consumer needs to read it the same way. Every case
+# below verifies the answer by calling the forward map on it, which is the
+# soundness argument -- a wrong inverse can only ever be a miss.
+
+_HEAD_DOMAIN = [1, 2, 4, 8, 16]  # divisors of the 16-element outer host dim
+_FLAT_DOMAIN = [1, 2, 4, 8]  # divisors of the 8-stick inner host dim
+
+
+def _reproduces(prep, splits, target):
+    """Whether ``splits`` slices the buffer the way ``target`` does.
+
+    ``same_partition``, not ``==``, because that is the question the production
+    comparison asks -- two records differing only in spelling describe one
+    slicing. Verifying through ``==`` would pass whatever the production
+    predicate happened to be.
+    """
+    view, _partial, representable = pass_utils_module._per_core_view_from_prep(
+        prep, splits
+    )
+    return representable and target.same_partition(view)
+
+
+def _producer_prep():
+    """A 2D stickified buffer sliced by an outer axis and a stick-counted one."""
+    head, flat = sympy.symbols("head flat", integer=True, nonnegative=True)
+    prep, _ = _prepare_compound_axis_view({head: 16, flat: 512}, 512 * head + flat)
+    return prep, head, flat
+
+
+def _shadowed_prep():
+    """Two axes sharing one host stride, beside a stick-counted one."""
+    a, b, col = sympy.symbols("a b col", integer=True, nonnegative=True)
+    prep, _ = _prepare_compound_axis_view(
+        {a: 4, b: 4, col: 512}, 512 * a + 512 * b + col
+    )
+    return prep, a, b, col, {a: [1, 2, 4], b: [1, 2, 4], col: _FLAT_DOMAIN}
+
+
+def _consumer_prep(*, swap_axis_order=False, reduction=False):
+    """The same buffer as a *different* op sees it: its own axis names, its own
+    iteration order, and optionally a reduction axis the producer has not got."""
+    row, col, red = sympy.symbols("row col red", integer=True, nonnegative=True)
+    space = {col: 512, row: 16} if swap_axis_order else {row: 16, col: 512}
+    if reduction:
+        space[red] = 64
+    prep, _ = _prepare_compound_axis_view(space, 512 * row + col)
+    return prep, row, col, red
+
+
+def test_inverse_rebuilds_a_split_on_a_differently_named_iteration_space():
+    prep, head, flat = _producer_prep()
+    target, _, representable = pass_utils_module._per_core_view_from_prep(
+        prep, {head: 4, flat: 2}
+    )
+    assert representable
+    assert target.work_slice_dims == ((2, 2), (3, 4))
+
+    consumer, row, col, red = _consumer_prep(reduction=True)
+    splits = pass_utils_module.invert_per_core_view(
+        consumer,
+        target,
+        {row: _HEAD_DOMAIN, col: _FLAT_DOMAIN, red: [1, 2, 4]},
+    )
+    assert splits == {row: 4, col: 2, red: 1}
+    assert _reproduces(consumer, splits, target)
+
+
+def test_inverse_round_trips_every_representable_split_of_one_prep():
+    """The claim the search rests on: what the forward map can express, the
+    inverse can rebuild."""
+    prep, head, flat = _producer_prep()
+    domains = {head: _HEAD_DOMAIN, flat: _FLAT_DOMAIN}
+    inverted = 0
+    for head_split in _HEAD_DOMAIN:
+        for flat_split in _FLAT_DOMAIN:
+            splits = {head: head_split, flat: flat_split}
+            view, _partial, representable = pass_utils_module._per_core_view_from_prep(
+                prep, splits
+            )
+            if not representable or not view.work_slice_dims:
+                continue
+            got = pass_utils_module.invert_per_core_view(prep, view, domains)
+            assert got is not None, splits
+            assert _reproduces(prep, got, view)
+            inverted += 1
+    assert inverted >= 10
+
+
+def test_inverse_searches_an_axis_the_view_cannot_see():
+    """A reduction axis does not slice the buffer, so it leaves no trace in
+    ``work_slice_dims`` -- but its factor still shifts every slot expression, so
+    it has to be searched rather than solved."""
+    head, flat, k = sympy.symbols("head flat k", integer=True, nonnegative=True)
+    prep, _ = _prepare_compound_axis_view(
+        {head: 16, flat: 512, k: 64}, 512 * head + flat
+    )
+    target, _, representable = pass_utils_module._per_core_view_from_prep(
+        prep, {head: 2, flat: 1, k: 2}
+    )
+    assert representable
+    assert target.work_slice_dims == ((3, 2),)
+    assert target.num_cores == 4
+
+    consumer, row, col, red = _consumer_prep(reduction=True)
+    domains = {row: _HEAD_DOMAIN, col: _FLAT_DOMAIN, red: [1, 2, 4]}
+    assert pass_utils_module.invert_per_core_view(consumer, target, domains) == {
+        row: 2,
+        col: 1,
+        red: 2,
+    }
+    # Without the freedom on that axis there is no answer at all: two cores'
+    # worth of the division is invisible in the view.
+    assert (
+        pass_utils_module.invert_per_core_view(consumer, target, {**domains, red: [1]})
+        is None
+    )
+
+
+def test_inverse_recovers_a_split_shadowed_at_one_host_stride():
+    """``splits_by_stride`` is keyed by host stride, so of two axes sharing one
+    stride only the later reaches the geometry; the other's factor is
+    unobservable and has to be searched too."""
+    prep, a, b, col, domains = _shadowed_prep()
+    assert prep.dep_coeff[a] == prep.dep_coeff[b]
+    target, _, representable = pass_utils_module._per_core_view_from_prep(
+        prep, {a: 2, b: 2, col: 1}
+    )
+    assert representable
+    assert (target.work_slice_dims, target.num_cores) == (((3, 2),), 4)
+
+    splits = pass_utils_module.invert_per_core_view(prep, target, domains)
+    assert splits == {a: 2, b: 2, col: 1}
+    assert _reproduces(prep, splits, target)
+
+
+def test_inverse_backtracks_past_a_candidate_the_caller_rejects():
+    """Several axes can serve one device dim, so a candidate the caller's own
+    legality filter turns down must fall through to the next -- taking the first
+    placement is wrong on a real fraction of edges."""
+    prep, a, b, col, domains = _shadowed_prep()
+    target, _, _ = pass_utils_module._per_core_view_from_prep(
+        prep, {a: 4, b: 1, col: 1}
+    )
+
+    first = pass_utils_module.invert_per_core_view(prep, target, domains)
+    assert first == {a: 4, b: 1, col: 1}
+
+    rejected: list[dict] = []
+
+    def accept(candidate):
+        if not rejected:
+            rejected.append(dict(candidate))
+            return False
+        return True
+
+    second = pass_utils_module.invert_per_core_view(
+        prep, target, domains, accept=accept
+    )
+    assert rejected == [first]
+    assert second == {a: 1, b: 4, col: 1}
+    assert _reproduces(prep, second, target)
+
+
+def test_inverse_accepts_a_target_that_records_the_partition_differently():
+    """The inverse compares partitions, not records. A target whose dims are
+    listed in the other order is the same slicing, and the search has to find
+    it -- an ``==`` here would call a live edge unreachable."""
+    prep, head, flat = _producer_prep()
+    view, _partial, representable = pass_utils_module._per_core_view_from_prep(
+        prep, {head: 4, flat: 2}
+    )
+    assert representable
+    assert len(view.work_slice_dims) == 2
+
+    restated = dataclasses.replace(
+        view,
+        work_slice_dims=view.work_slice_dims[::-1],
+        core_to_slot=view.core_to_slot[::-1],
+    )
+    assert restated != view
+    assert restated.same_partition(view)
+
+    domains = {head: _HEAD_DOMAIN, flat: _FLAT_DOMAIN}
+    splits = pass_utils_module.invert_per_core_view(prep, restated, domains)
+    assert splits == {head: 4, flat: 2}
+    assert _reproduces(prep, splits, restated)
+
+
+def test_inverse_declines_a_view_no_legal_split_reproduces():
+    """A consumer that iterates the two sliced axes in the other order assigns
+    the slices to different cores, and no factor choice repairs that."""
+    prep, head, flat = _producer_prep()
+    target, _, _ = pass_utils_module._per_core_view_from_prep(prep, {head: 4, flat: 2})
+
+    consumer, row, col, _red = _consumer_prep(swap_axis_order=True)
+    domains = {row: _HEAD_DOMAIN, col: _FLAT_DOMAIN}
+    assert pass_utils_module.invert_per_core_view(consumer, target, domains) is None
+    # Not a miss: an exhaustive scan of the same domains finds nothing either.
+    assert not [
+        (row_split, col_split)
+        for row_split in _HEAD_DOMAIN
+        for col_split in _FLAT_DOMAIN
+        if _reproduces(consumer, {row: row_split, col: col_split}, target)
+    ]
+
+
+def test_inverse_gives_up_rather_than_probing_without_bound():
+    prep, head, flat = _producer_prep()
+    target, _, _ = pass_utils_module._per_core_view_from_prep(prep, {head: 4, flat: 2})
+    domains = {head: _HEAD_DOMAIN, flat: _FLAT_DOMAIN}
+    assert pass_utils_module.invert_per_core_view(prep, target, domains) is not None
+    assert (
+        pass_utils_module.invert_per_core_view(prep, target, domains, max_probes=0)
+        is None
+    )
+    # An unrepresentable edge has no prep, and so no inverse.
+    assert pass_utils_module.invert_per_core_view(None, target, domains) is None
+
+
+def test_the_probe_bound_covers_the_callers_filter_too():
+    """``accept`` can be as expensive as the forward map -- a residency edge
+    runs its write-side policy there -- so a candidate is counted before
+    ``accept`` sees it, not after it passes."""
+    prep, a, b, col, domains = _shadowed_prep()
+    target, _, _ = pass_utils_module._per_core_view_from_prep(
+        prep, {a: 4, b: 1, col: 1}
+    )
+    calls: list[dict] = []
+
+    def reject_everything(candidate):
+        calls.append(dict(candidate))
+        return False
+
+    def probes(max_probes):
+        calls.clear()
+        assert (
+            pass_utils_module.invert_per_core_view(
+                prep, target, domains, accept=reject_everything, max_probes=max_probes
+            )
+            is None
+        )
+        return len(calls)
+
+    unbounded = probes(256)
+    assert unbounded > 1, "this target has to offer more than one candidate"
+    assert probes(unbounded - 1) == unbounded - 1
+    assert probes(1) == 1
+
+
+def test_geometry_and_feature_import_layers():
+    """Planner queries must not import a reporting module."""
+    import ast
+    from pathlib import Path
+
+    root = Path(core_mapping_module.__file__).resolve().parent
+    for path in (root / "scratchpad").glob("*.py"):
+        tree = ast.parse(path.read_text())
+        assert not any(
+            isinstance(node, ast.ImportFrom)
+            and node.module is not None
+            and node.module.endswith("dump_cost_model")
+            for node in ast.walk(tree)
+        ), path
+    tree = ast.parse((root / "core_mapping.py").read_text())
+    bindings = {
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef))
+    }
+    for node in tree.body:
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            bindings.update(
+                child.id
+                for child in ast.walk(node)
+                if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)
+            )
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            bindings.update(
+                alias.asname or alias.name.split(".")[0] for alias in node.names
+            )
+    for path in root.rglob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.ImportFrom) and (node.module or "").endswith(
+                "core_mapping"
+            ):
+                assert {alias.name for alias in node.names} <= bindings, path
+    assert not any(
+        isinstance(node, ast.ImportFrom)
+        and node.module is not None
+        and ("scratchpad" in node.module or node.module.endswith("pass_utils"))
+        for node in ast.walk(tree)
+    )
+
+
+@pytest.mark.parametrize("kind", ["direct", "affine", "floor"])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_ownership_callers_keep_their_admission_policy(monkeypatch, kind, enabled):
+    """Compare both production callers without widening the recovery policy."""
+    from torch_spyre._inductor.scratchpad.lx_relayout import work_division_from_view
+
+    row, head, pair, lane = sympy.symbols(
+        "row head pair lane", integer=True, nonnegative=True
+    )
+    affine = kind == "affine"
+    floor = kind == "floor"
+    combined = affine or floor
+    iteration = {
+        row: 512,
+        head: 8,
+        **({pair: 2} if affine else {}),
+        lane: 128 if floor else 64,
+    }
+    coordinate = (
+        2 * head + sympy.floor(lane / 64)
+        if floor
+        else 2 * head + pair
+        if affine
+        else head
+    )
+    width = 1024 if combined else 512
+    index = width * row + (128 if combined else 64) * head + lane
+    if affine:
+        index += 64 * pair
+    coefficients = {symbol: index.coeff(symbol) for symbol in iteration}
+    prep = _view_prep(
+        iter_space=iteration,
+        write_index=index,
+        dep_coeff=coefficients,
+        dep_device_coordinates=(coordinate, row, lane),
+        device_size=[16 if combined else 8, 512, 64],
+        stride_map=[64, width, 1],
+        device_stride_to_dim={64: 0, width: 1, 1: 2},
+        stick_host_stride=1,
+        num_stick_dim=0,
+        num_stick=16 if combined else 8,
+        num_stick_stride=64,
+    )
+    physical = PerCoreView(
+        ((0, 4), (1, 8)),
+        ((0, sympy.floor(_CORE_ID / 8)), (1, sympy.Mod(_CORE_ID, 8))),
+        num_cores=32,
+    )
+    splits = {
+        symbol: 8 if symbol == row else 4 if symbol == head else 1
+        for symbol in iteration
+    }
+    coordinates = prep.dep_device_coordinates
+    with pass_utils_module.config.patch(
+        lx_extended_ownership=enabled, lx_planner_relayout=True
+    ):
+        recovered, partial, represented = pass_utils_module._per_core_view_from_prep(
+            prep, splits
+        )
+        assert not partial
+        # The affine emitter may accept while recovery declines: recovery is
+        # floor-only, not a second route around the affine admission policy.
+        assert represented is (not combined or (floor and enabled))
+        if represented:
+            assert recovered.same_partition(physical)
+        if combined and not enabled:
+            with pytest.raises(ValueError, match="cannot map device dimension"):
+                work_division_from_view(
+                    physical, prep.device_size, coordinates, iteration
+                )
+        else:
+            division = work_division_from_view(
+                physical, prep.device_size, coordinates, iteration
+            )
+            assert division.work_slices == {head: 4, row: 8}
+            assert division.physical_core_count == 32
+            for core in range(32):
+                assert (
+                    int(division.core_id_to_work_slice[head].subs(_CORE_ID, core))
+                    == core // 8
+                )
+                assert (
+                    int(division.core_id_to_work_slice[row].subs(_CORE_ID, core))
+                    == core % 8
+                )
+    assert prep.dep_device_coordinates == coordinates

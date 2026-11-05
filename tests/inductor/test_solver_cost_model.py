@@ -20,6 +20,9 @@ store). Before this was modelled, the objective freed every load of a resident i
 charged nobody for the clone-in -- a credit that was 65% of the predicted cost on
 softmax, and steered the anneal into plans 5-6% worse on flash.
 
+The clone-in is its own read-only pass: a resident input's readers are served from LX,
+and the clone's one load is priced separately, outside the readers' bundle turnaround.
+
 No Spyre device or backend compiler is required; features are built directly.
 """
 
@@ -29,17 +32,249 @@ from types import SimpleNamespace
 import pytest
 import sympy
 
-import torch_spyre._inductor.dump_cost_model as dcm
-from torch_spyre._inductor import cost_model
+import torch_spyre._inductor.cost_features as dcm
+from torch_spyre._inductor import cost_model, logging_utils
 from torch_spyre._inductor.cost_model import (
     ArgTraffic,
+    CostParams,
     OpFeatures,
+    _clone_in_bytes,
     _fused_hbm_bytes,
     charge_boundary_reads_once,
 )
 
 ELEMS, DTYPE = 1024, 2
 BYTES = ELEMS * DTYPE
+
+
+@pytest.mark.parametrize("shared_weight", [False, True])
+@pytest.mark.parametrize("k_split", [1, 2])
+def test_matmul_time_does_not_charge_unused_available_cores(shared_weight, k_split):
+    from torch_spyre._inductor.work_division import (
+        _matmul_execution_cost,
+        _matmul_split_cost,
+    )
+
+    axes = ((16, 8), (64, 1), (128, 1), (256, k_split))
+    used = 8 * k_split
+    options = dict(shared_weight=shared_weight, include_hbm=False)
+    estimate = _matmul_execution_cost(*axes, used, **options)
+    assert estimate > 0
+    assert _matmul_execution_cost(*axes, 32, **options) == pytest.approx(estimate)
+    split = sympy.Symbol("k_split", integer=True, positive=True)
+    symbolic = _matmul_execution_cost(*axes[:3], (256, split), 32, **options)
+    assert float(symbolic.subs(split, k_split)) == pytest.approx(estimate)
+    assert _matmul_split_cost(*axes, 32, **options) > _matmul_split_cost(
+        *axes, used, **options
+    )
+
+
+@pytest.mark.parametrize("shared_weight", [False, True])
+def test_split_sum_matmul_prices_one_corelet(shared_weight):
+    from torch_spyre._inductor import work_division as wd
+
+    split = sympy.Symbol("k_split", integer=True, positive=True)
+    axes = ((2, 2), (128, 2), (256, 2), (1024, split))
+    price = wd._matmul_execution_cost(
+        *axes, 32, shared_weight=shared_weight, include_hbm=False
+    )
+    coefficient = (
+        wd._PSUM_PER_CORE_ELEM_US if shared_weight else wd._BMM_PSUM_PER_CORE_ELEM_US
+    )
+    for k in (1, 2, 4):
+        compute = (2 * 128 * 256 * 1024) / (8 * k) / wd._PEAK_MACS_US_CORE
+        expected = compute * (2 if k > 1 else 1) + (k - 1) * 8192 * coefficient
+        assert float(price.subs(split, k)) == pytest.approx(expected)
+        assert wd._matmul_execution_cost(
+            *axes[:3], (1024, k), 32, shared_weight=shared_weight, include_hbm=False
+        ) == pytest.approx(expected)
+
+
+def test_joint_matmul_price_is_independent_of_standalone_preferences(monkeypatch):
+    from torch_spyre._inductor import work_division as wd
+
+    op = OpFeatures(
+        name="bmm",
+        is_reduction=True,
+        dtype_bytes=2,
+        args=[],
+        is_matmul=True,
+        out_elems=16 * 64 * 128,
+        cores=16,
+        matmul_macs=16 * 64 * 128 * 256,
+        matmul_rows_per_core=64,
+        matmul_cols_per_core=128,
+        matmul_a_bytes=64 * 256 * 2,
+        matmul_b_bytes=256 * 128 * 2,
+    )
+    params = cost_model.CostParams(use_bundled_cost_model=False)
+    before = cost_model.predict_ops([op], params)
+    axes = ((16, 8), (64, 1), (128, 1), (256, 1))
+    standalone = wd._matmul_split_cost(*axes, 32)
+    for name in (
+        "_CORE_UNDERUSE_PENALTY_US",
+        "_M_TILE_UNDERFILL_PENALTY_US",
+        "_M_LANE_UNDERUSE_PENALTY_US",
+        "_BMM_BATCH_SPLIT_PENALTY_US",
+        "_WIDE_N_TILE_PENALTY_US",
+        "_LARGE_M_TILE_SHAPE_PENALTY_US",
+        "_SHARED_DOWN_N_SPLIT_PENALTY_US",
+    ):
+        monkeypatch.setattr(wd, name, getattr(wd, name) * 2)
+    assert cost_model.predict_ops([op], params) == pytest.approx(before)
+    assert wd._matmul_split_cost(*axes, 32) > standalone
+
+
+def test_fused_reduction_compute_uses_work_per_active_core():
+    small = ArgTraffic("small", "input", True, 1024)
+    large = ArgTraffic("large", "input", True, 6144, loop_factor=2)
+    output = ArgTraffic("out", "output", True, 64)
+    reductions = [
+        OpFeatures("amax", True, 64, 8, 2, [small, output]),
+        OpFeatures("sum", True, 64, 8, 2, [large, output]),
+        # Matmul has a different compute model and must not set this floor.
+        OpFeatures("bmm", True, 1 << 20, 1, 2, [], is_matmul=True),
+    ]
+
+    expected = (6144 * 2) / 8 / CostParams().fused_reduction_elems_per_core_ns
+    assert cost_model._fused_reduction_compute_ns(
+        reductions, CostParams()
+    ) == pytest.approx(expected)
+
+
+def test_fused_reduction_compute_keeps_core_count_symbolic():
+    heads, rows = sympy.symbols("split_heads split_rows", integer=True, positive=True)
+    op = OpFeatures(
+        "sum",
+        True,
+        64,
+        heads * rows,
+        2,
+        [ArgTraffic("input", "input", True, 12_288)],
+    )
+
+    compute = cost_model._fused_reduction_compute_ns([op], CostParams())
+
+    assert compute.free_symbols == {heads, rows}
+    assert float(compute.subs({heads: 4, rows: 8})) == pytest.approx(256)
+
+
+def test_fused_reduction_compute_skips_independent_boundary_reductions():
+    boundary = ArgTraffic("arg0_1", "input", False, 6144, is_boundary=True)
+    output = ArgTraffic("out", "output", False, 64, is_boundary=True)
+    reductions = [
+        OpFeatures("amax", True, 64, 8, 2, [boundary, output]),
+        OpFeatures("amin", True, 64, 8, 2, [boundary, output]),
+    ]
+
+    assert cost_model._fused_reduction_compute_ns(reductions, CostParams()) == 0.0
+
+
+def test_fused_reduction_compute_keeps_spill_cost_visible():
+    params = CostParams(overlap_gamma=0.46)
+
+    def prediction(is_lx):
+        intermediate = ArgTraffic("buf0", "input", is_lx, 12_288, is_boundary=False)
+        output = ArgTraffic("buf1", "output", False, 64, is_boundary=True)
+        reduction = OpFeatures("sum", True, 64, 8, 2, [intermediate, output])
+        pointwise = OpFeatures("exp", False, 12_288, 8, 2, [intermediate])
+        return cost_model.predict_ops([pointwise, reduction], params)
+
+    assert prediction(False) > prediction(True)
+
+
+def test_standalone_reduction_keeps_its_calibrated_bandwidth_model():
+    op = OpFeatures(
+        "amax",
+        True,
+        64,
+        1,
+        2,
+        [
+            ArgTraffic("input", "input", False, 6144),
+            ArgTraffic("out", "output", False, 64),
+        ],
+    )
+
+    assert cost_model.predict_ops(
+        [op], CostParams(fused_reduction_elems_per_core_ns=1e-6)
+    ) == pytest.approx(
+        cost_model.predict_ops([op], CostParams(fused_reduction_elems_per_core_ns=1e6))
+    )
+
+
+def test_isinf_is_symbolic_aware():
+    from torch_spyre._inductor.work_division import isinf
+
+    m = sympy.Symbol("output_split_m", integer=True, positive=True)
+    for infinite in (float("inf"), -float("inf"), sympy.oo, -sympy.oo, sympy.zoo):
+        assert isinf(infinite), infinite
+    for finite in (0, 1.5, sympy.Integer(3), m, 2 / m, sympy.Max(1, m)):
+        assert not isinf(finite), finite
+    # Undecidable is not infinite: a symbolic cost's finiteness rests on the
+    # enumerated candidate menu, not on this test.
+    assert not isinf(sympy.Piecewise((sympy.oo, m > 32), (m, True)))
+
+
+def test_matmul_split_cost_over_symbolic_splits_matches_concrete_in_budget():
+    from torch_spyre._inductor import work_division as wd
+
+    m, n, k = (
+        sympy.Symbol(name, integer=True, positive=True)
+        for name in ("output_split_m", "output_split_n", "reduction_split_k")
+    )
+    B, M, N, K = 1, 1024, 1024, 64
+    symbolic = wd._matmul_split_cost((B, 1), (M, m), (N, n), (K, k), 32)
+    assert isinstance(symbolic, sympy.Basic)
+    assert not wd.isinf(symbolic)
+    for m_split, n_split, k_split in ((4, 4, 2), (1, 8, 1), (2, 2, 2)):
+        concrete = wd._matmul_split_cost(
+            (B, 1), (M, m_split), (N, n_split), (K, k_split), 32
+        )
+        assert not wd.isinf(concrete)
+        point = {m: m_split, n: n_split, k: k_split}
+        assert float(symbolic.subs(point)) == pytest.approx(concrete)
+
+
+def _issue_4387_matmul(cores, m_split, n_split, k_split):
+    """``[1, 1024, 64] @ [1, 64, 1024]`` from issue #4387, at the given split."""
+    return OpFeatures(
+        name="mm",
+        is_reduction=True,
+        dtype_bytes=2,
+        args=[],
+        is_matmul=True,
+        out_elems=1024 * 1024,
+        cores=cores,
+        reduction_cores=k_split,
+        matmul_macs=1024 * 1024 * 64,
+        matmul_rows_per_core=1024 // m_split,
+        matmul_cols_per_core=1024 // n_split,
+        matmul_m_split=m_split,
+        matmul_n_split=n_split,
+        matmul_a_bytes=1024 * 64 * 2,
+        matmul_b_bytes=64 * 1024 * 2,
+    )
+
+
+def test_upstream_matmul_price_rejects_an_over_budget_split(monkeypatch):
+    monkeypatch.setattr(cost_model.config, "sencores", 32)
+    params = cost_model.CostParams(use_bundled_cost_model=False)
+    priced = cost_model._matmul_ns_upstream([_issue_4387_matmul(32, 4, 4, 2)], params)
+    assert priced > 0
+    with pytest.raises(RuntimeError, match="infeasible core split"):
+        cost_model._matmul_ns_upstream([_issue_4387_matmul(64, 4, 8, 2)], params)
+
+
+@pytest.mark.parametrize("infinity", [float("inf"), sympy.oo, sympy.zoo])
+def test_upstream_matmul_price_rejects_a_symbolic_infinity(monkeypatch, infinity):
+    monkeypatch.setattr(cost_model.config, "sencores", 32)
+    monkeypatch.setattr(
+        cost_model, "_matmul_execution_cost", lambda *args, **kwargs: infinity
+    )
+    params = cost_model.CostParams(use_bundled_cost_model=False)
+    with pytest.raises(RuntimeError, match="infeasible core split"):
+        cost_model._matmul_ns_upstream([_issue_4387_matmul(32, 4, 4, 2)], params)
 
 
 def _reader(name, out, *, input_name="arg0_1", resident=(), resident_expr=None):
@@ -94,17 +329,26 @@ def _writer(out, *, is_boundary, resident=False):
     )
 
 
+def _loads(bundles):
+    """(reader bytes, clone-in bytes) per bundle after the once-rule."""
+    return [
+        (_fused_hbm_bytes(b)[0], _clone_in_bytes(b))
+        for b in charge_boundary_reads_once(bundles)
+    ]
+
+
 def _read_bytes(bundles):
-    return sum(_fused_hbm_bytes(b)[0] for b in charge_boundary_reads_once(bundles))
+    """Every HBM byte loaded for inputs: the readers' own and the clones'."""
+    return sum(r + c for r, c in _loads(bundles))
 
 
 # --------------------------------------------------------------- input side
 
 
-def test_a_resident_graph_input_read_is_still_charged():
+def test_a_resident_graph_inputs_load_moves_from_its_readers_to_the_clone():
     # All readers in ONE bundle: the clone-in performs the single load the bundle
-    # would have performed itself, so residency saves NOTHING. This is the exact
-    # case in the issue's corpus -- every clone-eligible input, every graph.
+    # would have performed itself, so residency saves no BYTES -- they only move from
+    # the readers, now served from LX, to the clone.
     hbm = [[_reader("C", "buf1"), _reader("D", "buf2")]]
     lx = [
         [
@@ -112,28 +356,48 @@ def test_a_resident_graph_input_read_is_still_charged():
             _reader("D", "buf2", resident={"arg0_1"}),
         ]
     ]
-    assert _read_bytes(lx) == _read_bytes(hbm)
+    assert _read_bytes(lx) == _read_bytes(hbm) == BYTES
+    assert _loads(hbm) == [(BYTES, 0)]
+    assert _loads(lx) == [(0, BYTES)]
+
+
+def test_the_clone_in_saves_the_turnaround_its_readers_no_longer_pay():
+    # The same bytes are not the same time. The clone is its own read-only pass, so
+    # its load is priced alone; the readers' bundle keeps only its writes and pays no
+    # read/write turnaround. Measured on device (x*2 + x*3, x = 16 MiB): 417 us
+    # without the clone, 222 us with it -- one read plus one write at the peak rate.
+    p = CostParams()
+    hbm = [_reader("C", "buf1"), _reader("D", "buf2")]
+    lx = [
+        _reader("C", "buf1", resident={"arg0_1"}),
+        _reader("D", "buf2", resident={"arg0_1"}),
+    ]
+    # Each reader writes BYTES to HBM, so min(R, W) is the one load of the input.
+    saved = p.rw_turnaround_ns_per_byte * BYTES
+    assert cost_model.predict_ops(hbm, p) - cost_model.predict_ops(
+        lx, p
+    ) == pytest.approx(saved)
 
 
 def test_the_clone_in_load_is_charged_once_across_bundles():
     # Readers in TWO bundles: without residency each bundle loads the input; with
-    # residency ONE clone loads it and the second bundle is served from LX. The
-    # saving is exactly one load -- not two (the bug) and not zero (charging every
-    # bundle would be the opposite error).
+    # residency ONE clone loads it and every reader is served from LX. The saving is
+    # exactly one load -- not two (the bug) and not zero (charging every bundle would
+    # be the opposite error).
     hbm = [[_reader("C", "buf1")], [_reader("D", "buf2")]]
     lx = [
         [_reader("C", "buf1", resident={"arg0_1"})],
         [_reader("D", "buf2", resident={"arg0_1"})],
     ]
     assert _read_bytes(hbm) - _read_bytes(lx) == BYTES
-    assert _read_bytes(lx) == BYTES
+    assert _loads(lx) == [(0, BYTES), (0, 0)]
 
 
 def test_charging_the_clone_in_once_does_not_disturb_a_non_resident_input():
-    # The rewrite only redistributes the boundary charge; an input in HBM is loaded
-    # by every bundle that reads it either way.
+    # The rewrite only redistributes the clone-in charge; an input in HBM is loaded
+    # by every bundle that reads it either way, and there is no clone.
     bundles = [[_reader("C", "buf1")], [_reader("D", "buf2")]]
-    assert _read_bytes(bundles) == 2 * BYTES
+    assert _loads(bundles) == [(BYTES, 0), (BYTES, 0)]
 
 
 def test_a_later_bundle_with_several_readers_still_loads_the_input_once():
@@ -152,24 +416,24 @@ def test_a_later_bundle_with_several_readers_still_loads_the_input_once():
     ]
 
 
-def test_residency_frees_a_later_multi_reader_bundle_entirely():
-    # Same shape, resident: the clone pays one load in bundle 1 and every reader in
-    # bundle 2 is served from LX. The saving must be one load, not one per reader.
+def test_residency_frees_every_reader_and_charges_one_clone_in():
+    # Same shape, resident: every reader in both bundles is served from LX, and the
+    # one clone-in lands in bundle 1 however many readers bundle 1 has.
     resident = {"arg0_1"}
     bundles = [
-        [_reader("C", "buf1", resident=resident)],
+        [
+            _reader("C", "buf1", resident=resident),
+            _reader("G", "buf5", resident=resident),
+        ],
         [
             _reader("D", "buf2", resident=resident),
             _reader("E", "buf3", resident=resident),
         ],
     ]
-    assert [_fused_hbm_bytes(b)[0] for b in charge_boundary_reads_once(bundles)] == [
-        BYTES,
-        0,
-    ]
+    assert _loads(bundles) == [(0, BYTES), (0, 0)]
 
 
-def test_a_later_bundles_readers_stay_linear_in_symbolic_residency():
+def test_readers_and_clone_in_stay_linear_in_symbolic_residency():
     # The slope, not just the constant, has to be right: an over-counted later bundle
     # over-rewards pinning the input by (readers - 1)x in the solver's objective.
     is_lx = sympy.Symbol("is_lx")
@@ -180,21 +444,24 @@ def test_a_later_bundles_readers_stay_linear_in_symbolic_residency():
             _reader("E", "buf3", resident_expr=is_lx),
         ],
     ]
-    rewritten = charge_boundary_reads_once(bundles)
-    assert (
-        sympy.simplify(_fused_hbm_bytes(rewritten[1])[0] - (BYTES - BYTES * is_lx)) == 0
-    )
+    expected = [(BYTES - BYTES * is_lx, BYTES * is_lx), (BYTES - BYTES * is_lx, 0)]
+    for (reader, clone), (want_reader, want_clone) in zip(_loads(bundles), expected):
+        assert sympy.simplify(reader - want_reader) == 0
+        assert sympy.simplify(clone - want_clone) == 0
 
 
 def test_the_once_rule_is_idempotent():
     # ``is_boundary`` survives the rewrite, so the second pass recomputes the same
     # "already seen" set and changes nothing.
-    bundles = [[_reader("C", "buf1")], [_reader("D", "buf2"), _reader("E", "buf3")]]
-    once = charge_boundary_reads_once(bundles)
-    twice = charge_boundary_reads_once(once)
-    assert [_fused_hbm_bytes(b)[0] for b in once] == [
-        _fused_hbm_bytes(b)[0] for b in twice
+    bundles = [
+        [_reader("C", "buf1", resident={"arg0_1"})],
+        [
+            _reader("D", "buf2", resident={"arg0_1"}),
+            _reader("E", "buf3", resident={"arg0_1"}),
+        ],
     ]
+    once = charge_boundary_reads_once(bundles)
+    assert _loads(once) == _loads(bundles)
 
 
 # --------------------------------------------------------------- output side
@@ -243,14 +510,17 @@ def test_predict_by_bundle_applies_the_once_rule(monkeypatch):
     assert charged_once < charged_twice
 
 
-def test_a_boundary_arg_stays_constant_under_symbolic_residency():
-    """The solver objective must stay linear in ``sym_is_lx``: a boundary arg's bytes
-    no longer depend on the residency variable at all."""
+def test_a_boundary_reads_bytes_are_conserved_under_symbolic_residency():
+    """The solver objective must stay linear in ``sym_is_lx``: residency moves a
+    boundary read's bytes between the reader and the clone without changing their sum,
+    so the variable's weight comes from where they are priced, not from how many."""
     sym = sympy.Symbol("is_lx_arg0", integer=True)
     boundary = ArgTraffic("arg0_1", "input", sym, ELEMS, is_boundary=True)
     interior = ArgTraffic("buf1", "input", sym, ELEMS, is_boundary=False)
-    assert boundary.hbm_elems() == ELEMS
+    assert sym in sympy.sympify(boundary.hbm_elems()).free_symbols
+    assert sympy.simplify(boundary.hbm_elems() + boundary.clone_in_elems()) == ELEMS
     assert sym in sympy.sympify(interior.hbm_elems()).free_symbols
+    assert interior.clone_in_elems() == 0
 
 
 def test_a_legacy_record_falls_back_to_the_arg_naming_convention():
@@ -262,7 +532,7 @@ def test_a_legacy_record_falls_back_to_the_arg_naming_convention():
         a.pop("is_boundary")
     back = cost_model.op_from_dict(d)
     assert [a.is_graph_boundary for a in back.args] == [False, True]
-    assert back.read_bytes() == BYTES
+    assert (back.read_bytes(), back.clone_in_bytes()) == (0, BYTES)
 
 
 def test_an_explicit_stamp_survives_the_round_trip():
@@ -272,18 +542,26 @@ def test_an_explicit_stamp_survives_the_round_trip():
     op.args[1].is_boundary = False
     back = cost_model.op_from_dict(cost_model.op_to_dict(op))
     assert back.args[1].is_boundary is False
-    assert back.read_bytes() == 0
+    assert (back.read_bytes(), back.clone_in_bytes()) == (0, 0)
 
 
 # --------------------------------------------------------------- stamping
 
 
 class _FakeMutationLayout:
-    def __init__(self, target):
+    """Stands in for ``MutationLayoutSHOULDREMOVE``: it answers for the buffer it
+    writes into, and carries no ``device_layout`` / ``allocation`` of its own --
+    both live on ``real_layout()``, the target's layout."""
+
+    def __init__(self, target, real=None):
         self._target = target
+        self._real = real
 
     def get_buffer(self):
         return SimpleNamespace(get_name=lambda: self._target)
+
+    def real_layout(self):
+        return self._real
 
 
 def _op(name, layout):
@@ -387,6 +665,80 @@ def _extractable_op(name, reads):
     )
 
 
+@pytest.mark.parametrize("execution_cores", [16, 32])
+def test_relayout_price_does_not_replace_execution_cores(monkeypatch, execution_cores):
+    from dataclasses import replace
+
+    import torch
+    from torch._inductor.dependencies import MemoryDep
+    from torch._inductor.ir import Pointwise
+    from torch._inductor.virtualized import V, ops
+
+    price = OpFeatures(
+        name="lx_relayout",
+        is_reduction=False,
+        out_elems=64,
+        cores=16,
+        dtype_bytes=2,
+        args=[],
+        is_lx_relayout=True,
+        relayout_cores=16,
+        relayout_run_elems=8,
+        relayout_split=8,
+    )
+    monkeypatch.setattr(dcm, "_relayout_features", lambda *_: price)
+    op = _extractable_op("buf1", ["buf0"])
+    row = sympy.Symbol("row", integer=True)
+    op.data = Pointwise(
+        device=torch.device("cpu"),
+        dtype=torch.float16,
+        inner_fn=lambda index: ops.load("buf0", index[0]),
+        ranges=[64],
+    )
+    op.get_read_writes = lambda: SimpleNamespace(
+        reads=[MemoryDep("buf0", row, (row,), (64,))],
+        writes=[MemoryDep("buf1", row, (row,), (64,))],
+    )
+    graph = _StubGraph(inputs=[], outputs=[])
+    graph.get_buffer = lambda name: _extractable_op(name, [])
+    with V.set_graph_handler(graph):
+        feature = dcm.extract_op_features(
+            op, {row: execution_cores}, is_lx={"buf0": True, "buf1": True}
+        )
+
+    assert feature.cores == execution_cores
+    assert feature.relayout_cores == 16
+    assert feature.read_bytes() == feature.write_bytes() == 0
+    params = CostParams()
+    legacy = replace(feature, cores=16, relayout_cores=0)
+    assert cost_model.relayout_ns(feature, params) == cost_model.relayout_ns(
+        legacy, params
+    )
+    assert cost_model.predict_ops([feature], params) == cost_model.predict_ops(
+        [legacy], params
+    )
+
+
+@pytest.mark.parametrize(
+    "source_cores,destination_cores", [(16, 32), (32, 16), (32, 32)]
+)
+def test_relayout_features_keep_the_smaller_price_domain(
+    monkeypatch, source_cores, destination_cores
+):
+    monkeypatch.setattr(dcm, "governing_run_split", lambda *_: (64, 8))
+    feature = dcm.relayout_cost_features(
+        object(),
+        object(),
+        source_cores,
+        [512, 4096],
+        512 * 4096,
+        2,
+        destination_num_cores=destination_cores,
+    )
+    assert feature.cores == source_cores
+    assert feature.relayout_cores == min(source_cores, destination_cores)
+
+
 def _stamps(op, graph):
     """{(role, name): is_boundary} as the real extractor stamps them under ``graph``."""
     from torch._inductor.virtualized import V
@@ -396,6 +748,51 @@ def _stamps(op, graph):
     return {(a.role, a.name): a.is_boundary for a in feats.args}
 
 
+def test_extractor_reads_residency_from_is_lx(monkeypatch):
+    from torch._inductor.virtualized import V
+    from torch_spyre._inductor.scratchpad.plan_solver import CoreDivisionBuffer
+
+    row, other, cores = sympy.symbols("row other cores", integer=True)
+    output = CoreDivisionBuffer("buf1", 128, [0])
+    source = CoreDivisionBuffer("buf0", 128, [0])
+    is_lx = {output.name: output.sym_is_lx, source.name: source.sym_is_lx}
+    op = _extractable_op("buf1", ["buf0", "outside"])
+    rw = op.get_read_writes()
+    rw.writes.append(SimpleNamespace(index=row))
+    op.get_read_writes = lambda: rw
+    monkeypatch.setattr(dcm, "iteration_space_from_op", lambda _: {row: 64})
+    graph = _StubGraph(inputs=[], outputs=[])
+    graph.get_buffer = lambda name: _extractable_op(name, [])
+    # Store geometry is covered separately; this checks the buffer-data wiring.
+    monkeypatch.setattr(dcm, "_indirect_write_elems", lambda *_: 32)
+    with V.set_graph_handler(graph):
+        feature = dcm.extract_op_features(op, {row: cores}, is_lx=is_lx)
+    residency = {a.name: a.is_lx for a in feature.args}
+    assert residency == {
+        "op_buf1": output.sym_is_lx,
+        "buf0": source.sym_is_lx,
+        "outside": False,
+    }
+    assert feature.cores == cores
+
+
+@pytest.mark.parametrize("placement", [None, {"buf0": True, "buf1": False}])
+def test_extractor_without_buffers_keeps_committed_or_explicit_placement(placement):
+    from torch._inductor.virtualized import V
+
+    op = _extractable_op("buf1", ["buf0"])
+    op.get_layout().allocation = {"lx": 0}
+    graph = _StubGraph(inputs=[], outputs=[])
+    graph.get_buffer = lambda name: _extractable_op(name, [])
+    with V.set_graph_handler(graph):
+        feature = dcm.extract_op_features(op, is_lx=placement)
+    assert {a.name: a.is_lx for a in feature.args} == (
+        {"op_buf1": True, "buf0": False}
+        if placement is None
+        else {"op_buf1": False, "buf0": True}
+    )
+
+
 def test_the_extractor_stamps_reads_of_graph_inputs():
     """Covers the wiring itself: without this, the stamping line could be deleted and
     every other test in this file would still pass."""
@@ -403,6 +800,45 @@ def test_the_extractor_stamps_reads_of_graph_inputs():
     stamps = _stamps(_extractable_op("buf1", ["arg0_1", "buf0"]), graph)
     assert stamps[("input", "arg0_1")] is True
     assert stamps[("input", "buf0")] is False
+
+
+def _transport_flags(
+    monkeypatch, used_ops, *, reduction_type=None, geometry=(128, 4096)
+):
+    """(transport_compute_read, transport_read_run_bytes) the real extractor stamps on an
+    op whose body uses ``used_ops``. The source-run geometry has its own tests; it is
+    stubbed so this pins only how the extractor decides the flag."""
+    from torch._inductor.virtualized import V
+
+    op = _extractable_op("buf1", ["buf0"])
+    op.data = SimpleNamespace(
+        reduction_type=reduction_type,
+        inner_fn_opcount=lambda: SimpleNamespace(used_ops=set(used_ops)),
+    )
+    monkeypatch.setattr(dcm, "_transport_read_geometry", lambda *_: geometry)
+    with V.set_graph_handler(_StubGraph(inputs=[], outputs=[])):
+        feats = dcm.extract_op_features(op)
+    return feats.transport_compute_read, feats.transport_read_run_bytes
+
+
+def test_the_extractor_flags_an_arithmetic_read_and_not_a_copy_or_reduction(
+    monkeypatch,
+):
+    """Covers the wiring itself: the pricing tests build ``OpFeatures`` by hand, so
+    without this the extractor could stop setting ``transport_compute_read`` and every
+    other test would still pass."""
+    assert _transport_flags(monkeypatch, {"load", "tanh"}) == (True, 128)
+    assert _transport_flags(monkeypatch, {"load"}) == (False, 128)
+    # A reduction is not a one-input arithmetic read: it is never transport-priced.
+    assert _transport_flags(monkeypatch, {"load", "add"}, reduction_type="sum") == (
+        False,
+        None,
+    )
+    # No proven source run, nothing to price.
+    assert _transport_flags(monkeypatch, {"load", "tanh"}, geometry=(None, None)) == (
+        False,
+        None,
+    )
 
 
 def test_the_extractor_stamps_the_write_of_a_graph_output():
@@ -447,8 +883,156 @@ def test_the_per_arg_io_breakdown_sums_to_its_own_total():
     """``LAST_IO`` feeds ``profile_ops.py``, whose printed lines ``parse_sweep_logs.py``
     reads back. Its per-arg ``hbm_counted`` must use the same accounting as the total it
     is printed beside -- a resident boundary arg is the case where the two can diverge."""
+    from torch_spyre._inductor import dump_cost_model as reports
+
     feats = [_reader("C", "buf1", resident={"arg0_1"})]
-    dcm._record_last_io(feats)
-    counted = sum(a["hbm_counted"] for o in dcm.LAST_IO["ops"] for a in o["args"])
+    reports._record_last_io(feats)
+    counted = sum(a["hbm_counted"] for o in reports.LAST_IO["ops"] for a in o["args"])
     # The clone-in load of the resident input, plus the write of the HBM output.
-    assert counted == dcm.LAST_IO["hbm_bytes"] == 2 * BYTES
+    assert counted == reports.LAST_IO["hbm_bytes"] == 2 * BYTES
+
+
+def _indirect_store(cores=1, is_lx=False, **kwargs):
+    return OpFeatures(
+        name="store",
+        is_reduction=False,
+        out_elems=65536,
+        cores=cores,
+        dtype_bytes=2,
+        is_indirect_store=True,
+        args=[ArgTraffic("cache", "output", is_lx, 65536, is_boundary=False)],
+        **kwargs,
+    )
+
+
+def test_store_core_rate_and_saturation():
+    params = CostParams()
+    assert params.store_gbps_per_core == 30.0
+    for cores in (1, 2, 4, 5, 8, 16, 32):
+        store = _indirect_store(cores)
+        expected = store.write_bytes() * (
+            1 / min(params.bw_peak_gbps, cores * 30) - 1 / params.bw_peak_gbps
+        )
+        assert cost_model._store_core_excess_ns([store], params) == pytest.approx(
+            expected
+        )
+    assert cost_model._store_core_excess_ns([_indirect_store(5)], params) == 0
+    assert (
+        cost_model._store_core_excess_ns(
+            [_indirect_store()], CostParams(store_gbps_per_core=0)
+        )
+        == 0
+    )
+
+
+def test_store_rate_does_not_change_other_ops():
+    store = _indirect_store()
+    store.is_indirect_store = False
+    for reduction in (False, True):
+        store.is_reduction = reduction
+        assert cost_model.predict_ops([store]) == cost_model.predict_ops(
+            [store], CostParams(store_gbps_per_core=0)
+        )
+    store.is_matmul = store.is_indirect_store = True
+    assert cost_model._store_core_excess_ns([store], CostParams()) == 0
+
+
+def test_store_symbolic_cost_matches_concrete():
+    params = CostParams()
+    cores_symbol = sympy.symbols("cores", integer=True)
+    feature = _indirect_store(cores_symbol)
+    expression = cost_model._store_core_excess_ns([feature], params)
+    for cores in (1, 2, 4, 5, 8, 16, 32):
+        expected = cost_model._store_core_excess_ns([_indirect_store(cores)], params)
+        assert float(expression.subs(cores_symbol, cores)) == pytest.approx(expected)
+
+
+def test_store_cost_composes_with_bundle_and_is_reported(monkeypatch):
+    store = _indirect_store()
+    # Store and reduction may coexist in a bundle; only the store is adjusted.
+    reduction = _writer("buf9", is_boundary=False, resident=True)
+    reduction.is_reduction = True
+    bundles = [[store, reduction]]
+    monkeypatch.setattr(cost_model, "group_features_by_bundle", lambda *_: bundles)
+    before = cost_model.predict_by_bundle([], {}, CostParams(store_gbps_per_core=0))
+    after = cost_model.predict_by_bundle([], {}, CostParams())
+    extra = cost_model._store_core_excess_ns([store], CostParams())
+    assert after - before == pytest.approx(extra)
+    assert f"indirect-store core limit: +{extra / 1000:.2f} us" in cost_model.explain(
+        [store]
+    )
+
+
+# ------------------------------------------- sizing and placing a mutating write
+
+
+def test_the_wrapper_answers_neither_question_itself():
+    """What makes the fake above faithful, and the defect silent: the real class
+    defines neither attribute and no ``__getattr__`` to synthesize one, so reading
+    them off it returns ``None`` rather than raising."""
+    from torch._inductor.ir import MutationLayoutSHOULDREMOVE
+
+    assert not hasattr(MutationLayoutSHOULDREMOVE, "device_layout")
+    assert not hasattr(MutationLayoutSHOULDREMOVE, "allocation")
+    assert not hasattr(MutationLayoutSHOULDREMOVE, "__getattr__")
+
+
+def test_device_dims_come_from_the_mutation_target(monkeypatch):
+    monkeypatch.setattr(dcm, "MutationLayoutSHOULDREMOVE", _FakeMutationLayout)
+    target = SimpleNamespace(device_layout=SimpleNamespace(device_size=[4, 128]))
+    assert dcm._device_dims(_FakeMutationLayout("buf1", target)) == [4, 128]
+
+
+def test_residency_comes_from_the_mutation_target(monkeypatch):
+    """The planner stamps ``allocation`` on the target's ``FixedTiledLayout``, never
+    on the wrapper -- so a write into a resident target is HBM traffic unless the
+    wrapper is resolved."""
+    monkeypatch.setattr(dcm, "MutationLayoutSHOULDREMOVE", _FakeMutationLayout)
+    resident = SimpleNamespace(allocation={"lx": 0})
+    assert dcm._mem_of_layout(_FakeMutationLayout("buf1", resident)) == "lx"
+    assert dcm._mem_of_layout(_FakeMutationLayout("buf1", SimpleNamespace())) == "hbm"
+
+
+def test_the_extractor_sizes_and_places_a_mutating_write_by_its_target(monkeypatch):
+    """End to end, on the shape where the two errors bite: a target whose last dim is
+    stick-unaligned (100 fp16 -> 128) and LX-resident. Off the wrapper the write is
+    100 elements of HBM; off the target it is 128 elements of LX."""
+    monkeypatch.setattr(dcm, "MutationLayoutSHOULDREMOVE", _FakeMutationLayout)
+    target = SimpleNamespace(
+        device_layout=SimpleNamespace(device_size=[128]), allocation={"lx": 0}
+    )
+    op = _extractable_op("buf1", ["arg0_1"])
+    op.get_size = lambda: [100]
+    op.get_layout = lambda: _FakeMutationLayout("arg0_1", target)
+
+    from torch._inductor.virtualized import V
+
+    with V.set_graph_handler(_StubGraph(inputs=["arg0_1"], outputs=["buf9"])):
+        feats = dcm.extract_op_features(op)
+
+    write = next(a for a in feats.args if a.role == "output")
+    assert (write.elems, write.dims, write.logical) == (128, [128], [100])
+    assert write.is_lx is True
+
+
+def test_an_unresolvable_target_falls_back_rather_than_raising(monkeypatch, caplog):
+    """Both helpers are best-effort: an op whose target buffer cannot be reached keeps
+    the pre-existing logical-dims / HBM answer instead of breaking extraction (the
+    extractor-level case is pinned by the unreadable-write test above). Degraded
+    numbers are indistinguishable downstream from correct ones, so the log line is
+    the only signal that they are degraded -- as on the graph-output side."""
+
+    class _BrokenTarget(_FakeMutationLayout):
+        target = SimpleNamespace(name="buf_gone")
+
+        def real_layout(self):
+            raise RuntimeError("target buffer is gone")
+
+    monkeypatch.setattr(dcm, "MutationLayoutSHOULDREMOVE", _BrokenTarget)
+    logging_utils._warned_once.discard((dcm.logger.name, "mutation-target:buf_gone"))
+    with caplog.at_level(logging.WARNING, logger="spyre.inductor.cost_model"):
+        assert dcm._device_dims(_BrokenTarget("buf1")) is None
+        assert dcm._mem_of_layout(_BrokenTarget("buf1")) == "hbm"
+    assert "buf_gone" in caplog.text
+    # Keyed on the target, so the second helper's identical failure stays quiet.
+    assert len(caplog.records) == 1

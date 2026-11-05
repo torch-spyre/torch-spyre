@@ -2157,7 +2157,7 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.bfloat16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                     kwargs:
                       dim: 1
                   description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/integrations/moe.py#L171 in batched_mm_experts_forward,
@@ -4443,7 +4443,7 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.bfloat16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                     kwargs:
                       dim: 1
                   description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/integrations/moe.py#L171 in batched_mm_experts_forward,

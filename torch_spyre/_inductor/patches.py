@@ -27,6 +27,7 @@ from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.utils import InputType
 from torch._inductor.virtualized import V
 
+from . import pass_counters
 from .constants import DEVICE_NAME
 
 
@@ -100,6 +101,40 @@ def _preserve_spyre_input_storage_offsets():
 
 
 @contextmanager
+def _unique_operation_names():
+    """Name every operation as ``register_operation_after_graph_edit`` does.
+
+    Upstream ``GraphLowering.register_operation`` names an op
+    ``op{len(graph.operations)}``.  Pre-scheduling passes that lower new nodes
+    (``insert_restickify``, ``insert_bmm_padding``, ``coarse_tile``) register
+    them after earlier passes have shortened the list, so the name can already
+    belong to a live op and ``name_to_op`` is overwritten.  Anything that then
+    looks the op up by name gets the newcomer.  While lowering only appends, the
+    first free name is the upstream one.
+
+    Additionally, ``dedup_and_promote_constants`` pops merged constants from
+    ``name_to_op`` entirely, freeing their name slots.  Checking ``name_to_op``
+    alone would allow those freed names to be reissued.  This wrapper stamps
+    ``_spyre_issued_op_names`` on the graph at first registration; that set
+    accumulates every name ever handed out and is never pruned by graph passes.
+    """
+    from torch_spyre._inductor.pass_utils import register_operation_after_graph_edit
+
+    old_register_operation = GraphLowering.register_operation
+
+    def _register(graph, op):
+        if not hasattr(graph, "_spyre_issued_op_names"):
+            graph._spyre_issued_op_names = set(graph.name_to_op.keys())
+        return register_operation_after_graph_edit(graph, op)
+
+    GraphLowering.register_operation = _register  # type: ignore[method-assign]
+    try:
+        yield
+    finally:
+        GraphLowering.register_operation = old_register_operation  # type: ignore[method-assign]
+
+
+@contextmanager
 def enable_spyre_context(example_inputs: list[InputType]):
     """
     Context manager that sets up the complete Spyre compilation environment.
@@ -136,6 +171,10 @@ def enable_spyre_context(example_inputs: list[InputType]):
         CustomPreFusionPasses,
         CustomPostFusionPasses,
         CustomPreSchedulingPasses,
+    )
+    from torch_spyre._inductor import timing_recorder
+    from torch_spyre._inductor.loop_scheduler import (
+        loop_scheduler_patches_for_compile,
     )
     from torch_spyre._inductor.propagate_hints import recover_spyre_hints
 
@@ -191,7 +230,10 @@ def enable_spyre_context(example_inputs: list[InputType]):
                 recover_spyre_hints(self.graph)
             _pre_scheduling_pass(self)
             setattr(self, "_spyre_pre_scheduling_complete", True)
-        old_update_scheduler(self)
+        # Upstream scheduler construction, which the pre-scheduling pipeline runs
+        # immediately before. Timed separately so the two are not conflated.
+        with timing_recorder.stage("stage:GraphLowering:update_scheduler"):
+            old_update_scheduler(self)
 
     GraphLowering._update_scheduler = _spyre_update_scheduler  # type: ignore[method-assign]
 
@@ -224,10 +266,23 @@ def enable_spyre_context(example_inputs: list[InputType]):
 
     SchedulerNode.has_side_effects = _spyre_scheduler_node_has_side_effects  # type: ignore[method-assign]
 
+    # A LoopNode reaching the scheduler becomes one LoopSchedulerNode
+    # (loop_scheduler.py).  On a torch release the patch does not support,
+    # entering does NOT raise: a compile with no loop must keep working on any
+    # release, so only a LoopNode handed to the scheduler is refused there
+    # (CustomPreSchedulingPasses refuses one earlier, naming the release).
+    # On a graph with no LoopNode each patched method takes its original path.
     with (
+        # First in the header: the same ``with`` closes it however the body, or
+        # the entry of a later manager, exits.
+        loop_scheduler_patches_for_compile(),
         spyre_data_types(),
         _preserve_spyre_input_storage_offsets(),
+        _unique_operation_names(),
         enable_spyre_lowerings(),
+        # Analysis-call counters ride the timing gate: they exist to annotate
+        # timing records, and a second knob would let the two disagree.
+        pass_counters.counting(install=timing_recorder.is_enabled()),
         V.set_real_inputs(example_inputs),
         V.set_choices_handler(SpyreHeuristics()),
         torch._inductor.config.patch(new_config),

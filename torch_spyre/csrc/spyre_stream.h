@@ -62,10 +62,11 @@ class SpyreStream {
   void launchCompute(flex::ComputeParams* params) const;
   void launchHostCallback(flex::HostCallbackParams* params) const;
   // Device-side MEMORY_FILL DMA. Routes through the typed
-  // flex::RuntimeStream::fillAsync overload, which performs the value->pattern
-  // conversion internally (no FillParams construction here).
-  void fillAsync(const flex::CompositeAddress* dst, double value,
-                 DataFormats dtype, bool use_dmai) const;
+  // flex::RuntimeStream::launchOperation(FillAsyncParams*) wrapper, which
+  // performs the value->pattern conversion internally.
+  void launchFillAsync(flex::FillAsyncParams* params) const;
+  // Host-side compute for deeptools host compute calls.
+  flex::HostComputeBuffer* launchHostCompute(flex::HostComputeParams*) const;
 
   // Conversions
   c10::Stream unwrap() const;
@@ -76,9 +77,10 @@ class SpyreStream {
 
  private:
   flex::RuntimeStream* resolveRuntimeHandle() const;
-  void copyAsyncImpl(void* cpu_ptr,
+  void copyAsyncImpl(void* cpu_ptr, size_t host_capacity,
                      const flex::CompositeAddress* device_address,
-                     const DataConversionInfo* dci, bool host2device) const;
+                     const DataConversionInfo* dci, bool host2device,
+                     std::shared_ptr<void> host_lifetime = nullptr) const;
 };
 
 /**

@@ -22,8 +22,11 @@ from torch_spyre._C import DataFormats, encode_constant
 from torch_spyre._inductor.constants import (
     CONV2D_DIM_LABELS,
     DEPTHWISE_CONV2D_OP,
+    DLFLOAT16_MAX,
+    FP8_2D_STICK_OPS,
 )
 from torch_spyre._inductor.errors import Unsupported
+from torch_spyre._inductor.sharded_hbm import verify_non_unified_split
 from torch_spyre._inductor.op_spec import TensorWorkDivision
 from torch_spyre._inductor.pass_utils import coeff_through_floor
 
@@ -149,6 +152,26 @@ class SymbolKind:
         )
 
     @classmethod
+    def shard_kernel(
+        cls, arg_index: int, core_idx: int, num_shards: int, shard_bytes: int
+    ) -> "SymbolKind":
+        """Start address of core ``core_idx``'s own shard of a sharded tensor.
+
+        Non-unified kernels give every core an independent start address
+        (``nonUnifiedAllocInHBM_``); the runtime resolves this one to the
+        chunk holding shard ``core_idx`` of kernel arg ``arg_index``, after
+        checking the tensor has ``num_shards`` (``split_count``) shards of
+        ``shard_bytes`` (``offset``) device bytes.
+        """
+        return cls(
+            kind="shard_kernel",
+            arg_index=arg_index,
+            core_idx=core_idx,
+            split_count=num_shards,
+            offset=shard_bytes,
+        )
+
+    @classmethod
     def pool(cls) -> "SymbolKind":
         return cls(kind="pool")
 
@@ -170,6 +193,10 @@ class SymbolKind:
     @property
     def is_derived_symbolic(self) -> bool:
         return self.kind == "kernel_derived_symbolic"
+
+    @property
+    def is_shard_kernel(self) -> bool:
+        return self.kind == "shard_kernel"
 
     @property
     def is_pool(self) -> bool:
@@ -225,7 +252,14 @@ def generate_constant_info(
     constant_info: dict[str, Any] = {}
     for name, value in constants.items():
         try:
-            encoded_value = encode_constant(value, data_format)
+            # The host converter saturates DLFloat16 constants at 2**32.
+            # Preserve the exact finite limits used for missing clip bounds.
+            if data_format == DataFormats.SEN169_FP16 and value == DLFLOAT16_MAX:
+                encoded_value = 0x7FFE
+            elif data_format == DataFormats.SEN169_FP16 and value == -DLFLOAT16_MAX:
+                encoded_value = 0xFFFE
+            else:
+                encoded_value = encode_constant(value, data_format)
         except (ValueError, TypeError) as e:
             raise ValueError(
                 f"Cannot encode constant '{name}' with value {value} "
@@ -242,7 +276,7 @@ def generate_constant_info(
                     {"factor_": 1, "label_": "corelet"},
                     {"factor_": 1, "label_": "time"},
                 ],
-                "data_": {"[0, 0, 0]": [encoded_value]},
+                "data_": {"[0, 0, 0]": [str(encoded_value)]},
             },
         }
         constant_info[f"{len(constant_info)}"] = ci
@@ -265,6 +299,59 @@ def add_constant(kwargs, name, value) -> int:
     kwargs["op_info"]["constants"][name] = value
 
     return index
+
+
+# FP8 has 128 elements per stick. A QFP8WT tensor with 2D stick [2, 64]
+# is flattened back to [128] after device-size flattening. Matching this
+# sentinel identifies tensors that need their 2D-stick metadata restored.
+_FP8_FLAT_STICK_SIZE = [128]  # == 2 * 64
+
+# Index of the QFP8WT-layout tensor within each op in FP8_2D_STICK_OPS.
+# Both ops store it at argument index 1 in op_spec.args (inputs then outputs):
+#   batchmatmulfp8: arg 0 = INPUT activation,  arg 1 = INPUT KERNEL weight (QFP8WT)
+#   qfp8wt:         arg 0 = INPUT fp16 weight,  arg 1 = OUTPUT fp8 weight (QFP8WT)
+# In hardware terminology both are "KERNEL layout" tensors — qfp8wt's OUTPUT is
+# the weight that batchmatmulfp8 will subsequently consume as its KERNEL input.
+_FP8_2D_STICK_TENSOR_IDX = 1
+
+
+def _layout_info_for_tensor(sdsc_spec, tensor, tensor_idx: int) -> dict:
+    """Return layout metadata to emit for a tensor.
+
+    For individually compiled FP8 ops in FP8_2D_STICK_OPS, the upstream
+    flattening needed to satisfy the SDSC dimension limit can erase the
+    semantic 2D-stick metadata on the KERNEL tensor. Restore that metadata
+    here so the emitted SDSC matches the combined-compilation shape contract.
+
+    Covers both ``batchmatmulfp8`` (consumer) and ``qfp8wt`` (producer) so
+    that individually compiled kernels for either op emit the correct 2D-stick
+    layout, mirroring the flattening guard in superdsc._create_sdsc_tensors.
+    """
+    layout_info = sdsc_spec.layouts[tensor.layout]
+    if (
+        sdsc_spec.opfunc in FP8_2D_STICK_OPS
+        and tensor_idx == _FP8_2D_STICK_TENSOR_IDX
+        and tensor.data_format == DataFormats.SEN143_FP8
+        and layout_info["stick_size"] == _FP8_FLAT_STICK_SIZE
+    ):
+        # After device-size flattening a rank-4+ tensor produces a 3-element
+        # dim_order (one collapsed leading dim + the two trailing stick dims).
+        # The [-2:] slice always selects the two stick dims regardless of how
+        # many leading dims were collapsed, because flattening only touches
+        # leading dims and the trailing stick dims are preserved as-is by
+        # _flatten_device_size (keep_trailing_dims=2). Ranks above 3 are safe.
+        dim_order = layout_info["dim_order"]
+        if len(dim_order) < 2:
+            raise ValueError(
+                f"FP8 {sdsc_spec.opfunc} kernel tensor expected at least 2D "
+                f"dim_order, got {len(dim_order)}D: {dim_order}"
+            )
+        return {
+            **layout_info,
+            "stick_dim_order": list(dim_order),
+            "stick_size": [2, 64],
+        }
+    return layout_info
 
 
 def gen_coord_info_value(
@@ -746,6 +833,8 @@ def generate_sdsc(
             key = ("kernel", kind.arg_index)
         elif kind.kind == "kernel_slice":
             key = ("kernel_slice", kind.arg_index, kind.offset)
+        elif kind.is_shard_kernel:
+            key = ("shard_kernel", kind.arg_index, kind.core_idx)
         elif kind.is_derived_symbolic:
             # Per-core symbolic address: key by (tensor, core) so every
             # (arg_index, core_idx) is a distinct registration and never
@@ -809,7 +898,37 @@ def generate_sdsc(
     # the symbols at that level that advance tensor i.  Empty list of dicts
     # (i.e. [{}] * n_levels or []) for non-tiled tensors.
     affine_strides: list[list[dict]] = []
+    non_unified_args = [t for t in sdsc_spec.args if t.non_unified]
+    if non_unified_args:
+        if len(non_unified_args) != len(sdsc_spec.args):
+            raise Unsupported("non-unified kernels need every tensor argument sharded")
+        verify_non_unified_split(sdsc_spec, non_unified_args)
     for tensor in sdsc_spec.args:
+        if tensor.non_unified:
+            # Sharded storage: core c owns chunk c, addressed from its own
+            # start (no base + per-core offset).
+            if tensor.arg_index < 0 or any(
+                _tensor_tiled_by_symbol(tensor, s)
+                for level_syms in tiled_symbols
+                for s in level_syms
+            ):
+                raise Unsupported(
+                    "non-unified kernels support untiled HBM kernel arguments "
+                    f"only (arg {tensor.arg_index}, allocation {tensor.allocation})"
+                )
+            shard_bytes = tensor.non_unified_shard_bytes
+            for c in range(sdsc_spec.num_cores):
+                offset_as_symbol(
+                    tensor.arg_index,
+                    SymbolKind.shard_kernel(
+                        arg_index=tensor.arg_index,
+                        core_idx=c,
+                        num_shards=sdsc_spec.num_cores,
+                        shard_bytes=shard_bytes,
+                    ),
+                )
+            affine_strides.append([{} for _ in tiled_symbols])
+            continue
         if "lx" in tensor.allocation:
             # LX addresses are never registered as symbols in the SDSC JSON
             # (isStartAddrSymbolic_ is always unset for lx, and bundle.py's
@@ -1048,6 +1167,13 @@ def generate_sdsc(
     def _start_addr_data(tensor):
         # All per-core addresses were already registered by the per-tensor loop
         # above. Look them up using the same key scheme as offset_as_symbol.
+        if tensor.non_unified:
+            return {
+                f"[{c}, 0, 0]": str(
+                    local_symbols[("shard_kernel", tensor.arg_index, c)]
+                )
+                for c in range(sdsc_spec.num_cores)
+            }
         if "lx" in tensor.allocation:
             return {
                 f"[{c}, 0, 0]": str(tensor.start_address)
@@ -1287,12 +1413,15 @@ def generate_sdsc(
             extra["allocateNode_"] = alloc_node
         return extra
 
+    active_core_ids = sdsc_spec.completed_producer_cores or tuple(
+        range(sdsc_spec.num_cores)
+    )
     return (
         {
             f"{idx}_{sdsc_spec.opfunc}": {
                 # Source-to-kernel provenance. JSON key uses the SDSC
                 # trailing-underscore convention; the Python field stays
-                # `debug_handle`. dxp_standalone ignores unknown keys.
+                # `debug_handle`. The backend ignores unknown keys.
                 "debug_handle_": (
                     sdsc_spec.debug_handle.to_dict()
                     if sdsc_spec.debug_handle is not None
@@ -1306,8 +1435,8 @@ def generate_sdsc(
                 },
                 "coreFoldProp_": {"factor_": sdsc_spec.num_cores, "label_": "core"},
                 "coreletFoldProp_": {"factor_": 1, "label_": "corelet"},
-                "numCoresUsed_": sdsc_spec.num_cores,
-                "coreIdToDsc_": {str(c): 0 for c in range(sdsc_spec.num_cores)},
+                "numCoresUsed_": len(active_core_ids),
+                "coreIdToDsc_": {str(c): 0 for c in active_core_ids},
                 # The top-level map is the operation schedule. Each shuffle
                 # tensor's physical owners are carried separately on its
                 # allocation coordinates below.
@@ -1317,14 +1446,14 @@ def generate_sdsc(
                 },
                 "coreIdToWkSlice_": core_id_to_wk_slice,
                 "coreIdToDscSchedule": {
-                    str(c): [[-1, 0, 0, 0]] for c in range(sdsc_spec.num_cores)
+                    str(c): [[-1, 0, 0, 0]] for c in active_core_ids
                 },
                 "dscs_": [
                     {
                         sdsc_spec.opfunc: {
-                            "numCoresUsed_": sdsc_spec.num_cores,
+                            "numCoresUsed_": len(active_core_ids),
                             "numCoreletsUsed_": 1,
-                            "coreIdsUsed_": [c for c in range(sdsc_spec.num_cores)],
+                            "coreIdsUsed_": list(active_core_ids),
                             "N_": {
                                 "name_": "n",
                                 **{
@@ -1402,26 +1531,37 @@ def generate_sdsc(
                                     },
                                 }
                             },
+                            # Iterate args instead of sdsc_spec.layouts so _layout_info_for_tensor
+                            # receives the originating tensor and tensor_idx, allowing it to apply
+                            # any tensor-specific layout adjustments (e.g. FP8 2D-stick override).
                             "primaryDsInfo_": {
-                                label: {
-                                    "layoutDimOrder_": [
-                                        str(dim)
-                                        for dim in _filter_window_dims(
-                                            layout_info["dim_order"], label
-                                        )
-                                    ],
-                                    "stickDimOrder_": [
-                                        str(dim)
-                                        for dim in layout_info["stick_dim_order"]
-                                    ],
-                                    "stickSize_": layout_info["stick_size"],
-                                    **(
-                                        {"stickRepl_": [1]}
-                                        if sdsc_spec.stick_replication
-                                        else {}
-                                    ),
-                                }
-                                for label, layout_info in sdsc_spec.layouts.items()
+                                tensor.layout: (
+                                    lambda layout_info, label=tensor.layout: {
+                                        "layoutDimOrder_": [
+                                            str(dim)
+                                            for dim in _filter_window_dims(
+                                                layout_info["dim_order"], label
+                                            )
+                                        ],
+                                        "stickDimOrder_": [
+                                            str(dim)
+                                            for dim in layout_info["stick_dim_order"]
+                                        ],
+                                        "stickSize_": layout_info["stick_size"],
+                                        **(
+                                            {"stickRepl_": [1]}
+                                            if sdsc_spec.stick_replication
+                                            else {}
+                                        ),
+                                    }
+                                )(_layout_info_for_tensor(sdsc_spec, tensor, i))
+                                # Keyed by tensor.layout (the layout-role label assigned by
+                                # _get_layout_label). Two tensors share a label only when their
+                                # dim_order, stick_dim_order, and stick_size are all identical —
+                                # in that case the values are equal too, so the overwrite is
+                                # harmless. If the same label could map to distinct layouts in
+                                # the future, key by (i, tensor.layout) instead.
+                                for i, tensor in enumerate(sdsc_spec.args)
                             },
                             **(
                                 {"pdsRelation_": {"isPdsReuse": 1}}
@@ -1450,6 +1590,11 @@ def generate_sdsc(
                                     **(
                                         {"isStartAddrSymbolic_": 1}
                                         if "lx" not in tensor.allocation
+                                        else {}
+                                    ),
+                                    **(
+                                        {"nonUnifiedAllocInHBM_": True}
+                                        if tensor.non_unified
                                         else {}
                                     ),
                                     "layoutDimOrder_": [
@@ -1524,10 +1669,16 @@ def generate_sdsc(
                                             sdsc_spec.opfunc, tensor, i
                                         ),
                                         "coreIdToWkSlice_": (
-                                            tensor.work_division.to_core_slices(
-                                                tensor.work_division.num_cores
-                                                or sdsc_spec.num_cores
-                                            )
+                                            {
+                                                core: slices
+                                                for core, slices in tensor.work_division.to_core_slices(
+                                                    tensor.work_division.num_cores
+                                                    or sdsc_spec.num_cores
+                                                ).items()
+                                                if i != 0
+                                                or not sdsc_spec.completed_producer_cores
+                                                or int(core) in active_core_ids
+                                            }
                                             if sdsc_spec.opfunc == "shuffle"
                                             and tensor.work_division is not None
                                             else {}

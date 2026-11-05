@@ -30,18 +30,29 @@ Invariants checked:
 from __future__ import annotations
 
 import ast
+from collections import Counter
 from collections.abc import Sequence
 import functools
 import inspect
+import math
 import textwrap
 
 import regex
+from typing import NoReturn
 import sympy
 
-from . import constants
+from . import config, constants
+from .core_mapping import owner_slots, transfer_edges
 from .dtype_ops import DtypeOpTable
 from .logging_utils import get_inductor_logger
-from .op_spec import IndirectAccess, LoopSpec, OpSpec, TensorArg, UnimplementedOp
+from .op_spec import (
+    IndirectAccess,
+    LoopSpec,
+    OpSpec,
+    TensorArg,
+    UnimplementedOp,
+    is_lx_relayout_identity,
+)
 
 logger = get_inductor_logger("op_spec_validation")
 
@@ -87,7 +98,11 @@ def _pointwise_ops() -> frozenset[str]:
 # them so this file cannot silently drift out of sync as ops are added.
 MATMUL_OPS = constants.MATMUL_REDUCTION_OPS
 
-REDUCTION_OPS = constants.SINGLE_INPUT_REDUCTION_OPS | {constants.KEEP_BY_INDEX_OP}
+REDUCTION_OPS = (
+    constants.SINGLE_INPUT_REDUCTION_OPS
+    | constants.TWO_INPUT_REDUCTION_OPS
+    | constants.DEPTHWISE_CONV_REDUCTION_OPS
+)
 
 DTYPE_OPS = DtypeOpTable.op_names()
 
@@ -96,8 +111,10 @@ SPECIAL_OPS = frozenset({constants.RESTICKIFY_OP})
 BINARY_OPS = frozenset(
     {
         "add",
+        "addi32toi32",
         "sub",
         "mul",
+        "muli32toi32",
         "realdiv",
         "maximum",
         "minimum",
@@ -236,7 +253,78 @@ def _validate_op_spec(op_spec: OpSpec, stage: str, loop_depth: int) -> None:
     _check_symbol_consistency(op_spec, stage)
     _check_tiled_symbols(op_spec, stage, loop_depth)
     _check_stick_constraints(op_spec, stage)
+    _check_completed_reduction_route(op_spec, stage)
     _check_op_specific_constraints(op_spec, stage)
+
+
+def _check_completed_reduction_route(op_spec: OpSpec, stage: str) -> None:
+    """Validate the completed-reduction route certified during planning."""
+
+    producers = op_spec.completed_producer_cores
+    if not producers:
+        return
+
+    def reject(message: str, detail: str = "") -> NoReturn:
+        raise OpSpecValidationError(op_spec, message, detail, stage)
+
+    if not is_lx_relayout_identity(op_spec.op, op_spec.args, op_spec.op_info):
+        reject(
+            "completed-reduction routes require a certified LX identity copy",
+            f"Got op={op_spec.op!r}, args={len(op_spec.args)}",
+        )
+    source_division = op_spec.args[0].work_division
+    destination_division = op_spec.args[-1].work_division
+    if source_division is None or destination_division is None:
+        reject("completed-reduction routes require both tensor divisions")
+    source_count = source_division.physical_core_count
+    destination_count = destination_division.physical_core_count
+    if not 0 < destination_count <= config.sencores or any(
+        not isinstance(core, int) or not 0 <= core < source_count <= config.sencores
+        for core in producers
+    ):
+        reject("completed-reduction producers must name configured cores")
+    sources = set(producers)
+    if len(sources) != len(producers):
+        reject("completed-reduction source cores must be unique")
+    # Planning constructs these copies over one shared iteration domain; the
+    # identity marker alone does not prove that. Intersect those
+    # partitions just as the planner does; several writers supply disjoint pieces,
+    # never partial sums that still need adding.
+    try:
+        source_rows = owner_slots(
+            source_division.core_id_to_work_slice,
+            source_division.work_slices,
+            source_count,
+        )
+        destination_rows = owner_slots(
+            destination_division.core_id_to_work_slice,
+            destination_division.work_slices,
+            destination_count,
+        )
+    except ValueError as error:
+        reject("invalid completed-reduction ownership", str(error))
+    groups: dict[tuple, list[int]] = {}
+    for core, row in enumerate(source_rows):
+        groups.setdefault(tuple(row.items()), []).append(core)
+    # Planning proves contiguous K-fast groups: only their last core writes.
+    if len(groups) != math.prod(source_division.work_slices.values()) or sources != {
+        group[-1] for group in groups.values()
+    }:
+        reject("completed-reduction sources must cover every terminal owner")
+    edges = transfer_edges(
+        source_division.work_slices,
+        destination_division.work_slices,
+        {core: source_rows[core] for core in sources},
+        dict(enumerate(destination_rows)),
+    )
+    if {s for s, _ in edges} != sources or {d for _, d in edges} != set(
+        range(destination_count)
+    ):
+        reject("completed-reduction routes must cover every producer and consumer")
+    if len(set(Counter(s for s, _ in edges).values())) != 1:
+        reject("completed-reduction routes require uniform fanout")
+    if len(set(Counter(d for _, d in edges).values())) != 1:
+        reject("completed-reduction routes require uniform fanin")
 
 
 def _check_mandatory_fields(op_spec: OpSpec, stage: str) -> None:
@@ -275,12 +363,18 @@ def _check_mandatory_fields(op_spec: OpSpec, stage: str) -> None:
 
 
 def _check_op_name(op_spec: OpSpec, stage: str) -> None:
-    """OS-2: Op name should be a known operation."""
+    """OS-2: Op name must be a known operation.
+
+    A new op must be registered in one of the sets behind _all_known_ops()
+    (see constants.py) so that it also gets the per-op checks below.
+    """
     if op_spec.op not in _all_known_ops():
-        logger.warning(
-            "Unknown op name %r in OpSpec at stage %s. "
-            "This may be valid for new ops not yet registered.",
-            op_spec.op,
+        raise OpSpecValidationError(
+            op_spec,
+            "unknown op name",
+            f"Got op={op_spec.op!r}. Register new ops in the op sets in "
+            "constants.py (or SpyreOpFuncs for pointwise ops) so they are "
+            "known to op_spec_validation.",
             stage,
         )
 
@@ -386,7 +480,7 @@ def _check_args(op_spec: OpSpec, stage: str) -> None:
 
         _check_allocation(op_spec, arg, i, stage)
 
-    if not has_output and op_spec.op in _all_known_ops():
+    if not has_output:
         raise OpSpecValidationError(
             op_spec,
             "OpSpec must have at least one output TensorArg (is_input=False)",
@@ -565,6 +659,12 @@ def _check_stick_constraints(op_spec: OpSpec, stage: str) -> None:
         _check_stick_topk(op_spec, stage)
     elif op == constants.RESTICKIFY_OP:
         _check_stick_restickify(op_spec, stage)
+    elif op in constants.CONV_OPS:
+        # Convolution args stick on different dims by design (input on
+        # in-channel, weight on its own dim, output on out-channel), so the
+        # all-same rule below does not apply.
+        # TODO: add a conv-specific stick check.
+        return
     elif op in _pointwise_ops() | DTYPE_OPS | REDUCTION_OPS:
         # avgpoolfwd is in REDUCTION_OPS but its full constraint (window dims
         # must not appear in the stick) is deferred — _check_stick_all_same

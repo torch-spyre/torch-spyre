@@ -50,11 +50,12 @@ present in the output but absent from x (N).  This handles M==K==N and
 M=1 (decode phase) correctly.
 """
 
-from typing import Optional
+import dataclasses
 
 import sympy
 import torch
 from sympy import Expr
+from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     Buffer,
@@ -63,7 +64,6 @@ from torch._inductor.ir import (
     Operation,
     Pointwise,
     Reduction,
-    TensorBox,
 )
 from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.virtualized import V
@@ -75,12 +75,14 @@ from .logging_utils import get_inductor_logger
 from .pass_utils import (
     concretize_expr,
     concretize_index,
+    device_coordinates,
     find_reduction_var,
+    find_fx_node,
     host_coordinates,
     identify_matmul_inputs,
     is_restickify_coords,
-    _is_compact_node,
     lower_pad_sequence,
+    patch_env,
     redirect_computed_buffer_reads,
     replace_computed_buffer_body,
 )
@@ -102,18 +104,6 @@ def round_up_to_stick(cur_size: int, dtype: torch.dtype) -> int:
     return cur_size + compute_padding(cur_size, dtype)
 
 
-def _patch_env(graph_lowering) -> None:
-    """Add view nodes (ReinterpretView) to env from name_to_users."""
-    env: dict = {}
-    for tbs in graph_lowering.name_to_users.values():
-        for tb in tbs:
-            if not tb.data.origins:
-                continue
-            tb_fx_node = list(tb.data.origins)[0]
-            env[tb_fx_node] = tb
-    graph_lowering.env.update(env)
-
-
 def _move_ops_before(
     operations: list[Operation], new_ops: list[Operation], anchor: Operation
 ) -> None:
@@ -130,34 +120,6 @@ def _move_ops_before(
         operations.insert(idx + i, o)
 
 
-def _find_arg_fx_node(arg_name: str) -> Optional[torch.fx.Node]:
-    """Return the FX node whose lowered TensorBox has the given buffer name.
-
-    Buffer names are unique, but a single buffer can be reached through
-    multiple FX nodes that present it at different sizes.  For example,
-    mm_to_bmm_pass inserts an unsqueeze/reshape so the matmul inner_fn
-    indexes x as 3D [1, M, K] even though the underlying buffer is 2D
-    [M, K].  Both FX nodes lower to a TensorBox whose get_name() returns
-    the same buffer name, but with different get_size() results.
-
-    Returns the first candidate (the base buffer, with no view applied), or
-    None if no candidate exists -- e.g. a coarse_tile read-copy buffer (see
-    coarse_tile.py's _insert_one_read_copy), which is synthesized purely at
-    the IR level after FX lowering completed and so has no FX-graph
-    counterpart at all.
-    """
-    graph_lowering = V.graph
-    _patch_env(graph_lowering)
-    candidates = [
-        fx_node
-        for fx_node, tb in graph_lowering.env.items()
-        if isinstance(fx_node, torch.fx.Node)
-        and isinstance(tb, TensorBox)
-        and tb.get_name() == arg_name
-    ]
-    return candidates[0] if candidates else None
-
-
 class _PaddedLoadHandler(WrapperHandler):
     """Redirect every ``load`` of ``orig_name`` to ``padded_name``, re-striding
     the index.
@@ -170,7 +132,7 @@ class _PaddedLoadHandler(WrapperHandler):
     into host coordinates against y's layout and re-composed with the padded
     buffer's indexer.
 
-    This wraps the live index (see CLAUDE.md "Compiler Pass Conventions")
+    This wraps the live index (see AGENTS.md "Compiler Pass Conventions")
     rather than re-deriving y's coordinates from the matmul's dim order, so
     any view stays correct by construction.
     """
@@ -220,7 +182,7 @@ def _rebuild_matmul(
     y's host dims are [.., K, N] in the common case, but need not be: a
     transposed ``nn.Linear`` weight is [N, K] (issue #4208), and a coarse-tile
     read-copy buffer for a loop-invariant y can be transposed and column-major
-    (see test_bmm_read_copy_y_unaligned_k_pads).  Re-striding the live load
+    (see test_bmm_invariant_y_unaligned_k_pads_for_each_tile).  Re-striding the live load
     index covers all of these without knowing which position K occupies.
     """
     reduction = op.data
@@ -272,6 +234,85 @@ def _rebuild_matmul(
         operations,
         pass_name="insert_bmm_padding",
         reason="redirect matmul to padded input",
+    )
+
+
+def _refresh_loop_advance_for_padded_read(
+    op: ComputedBuffer, y_buf: Buffer, y_padded_buf: Buffer
+) -> None:
+    """Re-stride the per-trip step of the read that now targets the padded y.
+
+    ``splice_while_loops`` stamps ``squeezed_advance_per_read`` before padding,
+    as the loop variable's coefficient in the read of y, which is a stride of
+    y's own layout.  Padding retargets that read to a buffer whose K is larger,
+    so the stride of every dim outside K grows (for example the per-expert stride
+    of a tiled weight, 67 * 128 to 128 * 128).  The stamped step would walk the
+    padded buffer by the unpadded stride, and every trip after the first would
+    read the wrong place (#5573).
+
+    A step that is the stride of one dim of y becomes that dim's stride in the
+    padded buffer.  A step that is no dim's stride is left alone.  A step shared by
+    several dims of size above one cannot be mapped, and raises ``Unsupported``
+    rather than leave a step that would silently read the wrong place.
+    """
+    info = getattr(op, "loop_info", None)
+    if info is None or not info.squeezed_advance_per_read:
+        return
+    old_size = [concretize_expr(s) for s in y_buf.get_layout().size]
+    old_stride = [concretize_expr(s) for s in y_buf.get_layout().stride]
+    new_stride = [concretize_expr(s) for s in y_padded_buf.get_layout().stride]
+    if len(old_stride) != len(new_stride):
+        return
+    reads = [d for d in op.get_read_writes().reads if isinstance(d, MemoryDep)]
+    squeezed = [
+        [list(level) for level in per_read]
+        for per_read in info.squeezed_advance_per_read
+    ]
+    changed = False
+    for idx, dep in enumerate(reads):
+        if dep.name != y_padded_buf.get_name() or idx >= len(squeezed):
+            continue
+        for level in squeezed[idx]:
+            for pos, (step, extent) in enumerate(level):
+                # A size-one dim is never stepped, so it cannot own the step; its
+                # stride is arbitrary and would make a real match look ambiguous.
+                matches = [
+                    d
+                    for d, st in enumerate(old_stride)
+                    if st == step and old_size[d] > 1
+                ]
+                if len(matches) > 1:
+                    raise Unsupported(
+                        f"insert_bmm_padding: cannot tell which dim of "
+                        f"{y_buf.get_name()} the loop steps by {step} "
+                        f"(strides {old_stride}, sizes {old_size}); the padded "
+                        f"buffer's per-trip step would be wrong"
+                    )
+                if matches and new_stride[matches[0]] != step:
+                    level[pos] = (sympy.Integer(new_stride[matches[0]]), extent)
+                    changed = True
+    if changed:
+        op.loop_info = dataclasses.replace(info, squeezed_advance_per_read=squeezed)
+
+
+def _loop_info_without_advance(info, new_op):
+    """Loop group membership of ``info`` with no per-trip advance on ``new_op``.
+
+    ``tiled_dims_per_read`` and ``squeezed_advance_per_read`` are positional in the
+    op's own reads.  A padding op reads different buffers than the matmul it pads
+    for, so the matmul's records would land on the wrong reads (for example the
+    tiled ``x``'s advance on the loop-invariant ``y`` being padded).  The padding
+    op re-runs identical work every trip, so it advances nothing.
+    """
+    n_reads = len([d for d in new_op.get_read_writes().reads if hasattr(d, "name")])
+    levels = len(info.loop_count)
+    return dataclasses.replace(
+        info,
+        tiled_dims_per_read=[[[] for _ in range(levels)] for _ in range(n_reads)],
+        output_tiled_dims=[[] for _ in range(levels)],
+        squeezed_advance_per_read=[[[] for _ in range(levels)] for _ in range(n_reads)],
+        squeezed_advance_output=[[] for _ in range(levels)],
+        propagation=None,
     )
 
 
@@ -384,7 +425,8 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
             y_k_dim = y_host_k_dim
         y_padded_size = list(y_size)
         y_padded_size[y_k_dim] = k_padded
-        y_fx_node = _find_arg_fx_node(y_name)
+        patch_env(V.graph)
+        y_fx_node = find_fx_node(y_name, V.graph)
 
         # No orig_stl: this pass runs before stickification, so the new ops keep
         # host FixedLayouts and propagate_spyre_tensor_layouts lays them out.
@@ -408,23 +450,20 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
         if hasattr(op, "loop_info"):
             for new_op in y_new_ops:
                 if isinstance(new_op, ComputedBuffer):
-                    new_op.loop_info = op.loop_info  # type: ignore[attr-defined]
+                    new_op.loop_info = _loop_info_without_advance(  # type: ignore[attr-defined]
+                        op.loop_info, new_op
+                    )
 
         # --- Rebuild matmul inner_fn to load y from the padded buffer ---
         # x is left entirely untouched: the original inner_fn's x loader is
         # preserved as-is.  Only y's loads are redirected to the padded buffer.
-        _rebuild_matmul(op, y_buf, y_padded_buf, operations)
+        new_op = _rebuild_matmul(op, y_buf, y_padded_buf, operations)
+        _refresh_loop_advance_for_padded_read(new_op, y_buf, y_padded_buf)
 
 
 # --------------------------------------------------------------------------- #
 # insert_restickify_padding                                                   #
 # --------------------------------------------------------------------------- #
-
-
-def _device_coords(stl: SpyreTensorLayout, dep) -> list[Expr]:
-    """Return device-space coordinate expressions for ``dep`` against ``stl``."""
-    index = concretize_index(dep.index, set(dep.ranges.keys()))
-    return compute_coordinates(stl.device_size, stl.stride_map, dep.ranges, index)
 
 
 def _write_dep(op):
@@ -475,11 +514,30 @@ def _device_dim_carrying_sym(stl: SpyreTensorLayout, write_dep, sym) -> int | No
     # identifies the dim.  A symbol whose range spans more than one tile can
     # appear split across several coordinates (e.g. v // 64 in one, v % 64 in
     # another); the outermost (lowest-index) one is the governing dim.
-    device_coords = _device_coords(stl, write_dep)
+    device_coords = device_coordinates(stl, write_dep)
     for dim in range(len(device_coords) - 1):
         if sym in device_coords[dim].free_symbols:
             return dim
     return None
+
+
+def _written_extent(stl: SpyreTensorLayout, write_dep, device_dim: int, sym) -> int:
+    """Number of positions the write covers along ``device_dim``.
+
+    Normally that dim's coordinate is ``sym`` alone, so its extent is the range of
+    ``sym``.  A collapsed factorized dim (for example the contraction dim K of a
+    ``[N, heads, D]`` weight, coordinate ``128*heads + D``) is written by several
+    loop variables together; its extent is the highest coordinate written, plus
+    one.  Those variables' ranges must be used, or the write looks like a slice of
+    the dim.
+    """
+    coord = device_coordinates(stl, write_dep)[device_dim]
+    if len(coord.free_symbols) <= 1:
+        return concretize_expr(write_dep.ranges[sym])
+    last = coord.xreplace(
+        {v: concretize_expr(write_dep.ranges[v]) - 1 for v in coord.free_symbols}
+    )
+    return int(last) + 1
 
 
 def _stick_symbol(stl: SpyreTensorLayout, dep) -> object | None:
@@ -487,7 +545,7 @@ def _stick_symbol(stl: SpyreTensorLayout, dep) -> object | None:
     or None if it has none (e.g. a symbol-free size-1 stick, or a scalar /
     zero-dim layout with no coords at all).
     """
-    device_coords = _device_coords(stl, dep)
+    device_coords = device_coordinates(stl, dep)
     if not device_coords:
         return None
     # A coefficient or offset on the coordinate doesn't add free symbols, so
@@ -514,15 +572,13 @@ def is_restickify_op(op: Operation, graph: GraphLowering) -> bool:
         return False
     if not isinstance(op.data, Pointwise):
         return False
-    if _is_compact_node(op):
-        return False
 
     in_dep, _in_buf, in_layout = _restickify_input(op, graph)
     if in_dep is None:
         return False
 
-    in_coords = _device_coords(in_layout.device_layout, in_dep)
-    out_coords = _device_coords(out_layout.device_layout, _write_dep(op))
+    in_coords = device_coordinates(in_layout.device_layout, in_dep)
+    out_coords = device_coordinates(out_layout.device_layout, _write_dep(op))
     # A scalar / zero-dim layout has no coordinates, so it can't be a restickify.
     if not in_coords or not out_coords:
         return False
@@ -636,7 +692,7 @@ def _pad_restickify_output(op: Operation, graph: GraphLowering) -> None:
     #
     # TODO: support this by restickifying into a fresh temp buffer sized to a stick
     # multiple, then cloning that buffer into the slice.
-    host_dim_size = concretize_expr(write_dep.ranges[old_sym])
+    host_dim_size = _written_extent(stl, write_dep, device_dim, old_sym)
     if host_dim_size < unpadded_dim_size:
         raise Unsupported(
             f"insert_restickify_padding: sliced output on {op.get_name()} "
@@ -661,7 +717,138 @@ def _pad_restickify_output(op: Operation, graph: GraphLowering) -> None:
     )
 
 
-def _assert_input_paddable(op: ComputedBuffer, in_dep, in_layout) -> None:
+def _compute_digits(coord, ranges) -> list[tuple[int, sympy.Symbol]]:
+    syms = coord.free_symbols
+    if len(syms) < 2:
+        return []
+
+    residual = sympy.expand(coord)
+    digits: list[tuple[int, sympy.Symbol]] = []
+    for sym in syms:
+        if sym not in ranges:
+            return []
+        coeff_expr = residual.coeff(sym)
+        if coeff_expr.free_symbols or coeff_expr.is_integer is not True:
+            return []
+        coeff = concretize_expr(coeff_expr)
+        if coeff <= 0:
+            return []
+        digits.append((coeff, sym))
+        residual -= coeff_expr * sym
+
+    # A numeric constant is a slice offset and does not change contiguity.
+    if residual.free_symbols or not residual.is_number:
+        return []
+
+    return sorted(digits, key=lambda item: item[0])
+
+
+def _is_dense_flattened_coordinate(digits, ranges) -> bool:
+    """Return whether ``coord`` densely flattens two or more loop dimensions.
+
+    ``host_coordinates`` normally returns one loop symbol per host dimension.
+    A view may instead split one physical host dimension into several logical
+    dimensions, for example ``128 * head + feature`` for a ``[H, 128]`` view of
+    one ``H * 128`` projection dimension.  That is still a unit-stride,
+    contiguous traversal of the host dimension: ordering the symbols from the
+    innermost coefficient outwards must produce the mixed-radix strides
+    ``1, size(inner), size(inner) * size(next), ...``.
+
+    Reject nonlinear expressions and gapped or overlapping flattenings.  They need
+    the same re-base copy as an ordinary strided input.
+    """
+    if not digits:
+        return False
+    expected = 1
+    for coeff, sym in digits:
+        if coeff != expected:
+            return False
+        expected *= concretize_expr(ranges[sym])
+    return True
+
+
+def _is_nonoverlapping_aligned_stick_coordinate(
+    digits, coord, ranges, stick_sym, dtype
+) -> bool:
+    """Return whether ``coord`` gives each outer index a disjoint stick window.
+
+    Coarse tiling can narrow an inner range without changing its outer physical
+    stride, for example ``512 * batch + tile_sequence`` with a 256-element tile.
+    That is not dense, but it is safe for a restickify when the inner symbol is
+    unit-stride and every outer coefficient leaves enough room for the padded
+    span of all lower-order symbols.
+    """
+    if not digits:
+        return False
+    syms = coord.free_symbols
+    if stick_sym not in syms:
+        return False
+
+    stick_extent = concretize_expr(ranges[stick_sym])
+    if compute_padding(stick_extent, dtype) != 0:
+        return False
+
+    if digits[0] != (1, stick_sym):
+        return False
+
+    span = stick_extent
+    for coeff, sym in digits[1:]:
+        if coeff < span:
+            return False
+        span += coeff * (concretize_expr(ranges[sym]) - 1)
+    return True
+
+
+def _restickify_input_required_extent(coord, ranges, stick_sym, dtype) -> int:
+    """Return the allocation extent needed for a restickify read window.
+
+    A view can split one physical input dimension into several logical loop
+    dimensions, so the physical coordinate may be a dense mixed-radix sum such
+    as ``64 * batch + sequence``.  The restickify reads a whole stick starting
+    at each outer digit's base.  Account for the last such base, then round only
+    the innermost (unit-stride) stick digit's extent.
+    """
+    syms = coord.free_symbols
+    if stick_sym not in syms:
+        raise Unsupported(
+            f"insert_restickify_padding: new-stick symbol {stick_sym} is absent "
+            f"from input coordinate {coord}"
+        )
+    if len(syms) == 1:
+        # Preserve the existing one-symbol behavior, including coordinates
+        # split across host dimensions with FloorDiv/Mod expressions.
+        slice_offset = concretize_expr(coord.as_coeff_Add()[0])
+        return slice_offset + round_up_to_stick(
+            concretize_expr(ranges[stick_sym]), dtype
+        )
+
+    digits = _compute_digits(coord, ranges)
+    is_dense = _is_dense_flattened_coordinate(digits, ranges)
+    has_disjoint_stick_windows = _is_nonoverlapping_aligned_stick_coordinate(
+        digits, coord, ranges, stick_sym, dtype
+    )
+    if not is_dense and not has_disjoint_stick_windows:
+        raise Unsupported(
+            f"insert_restickify_padding: input coordinate {coord} is not a "
+            "dense flattening or a set of non-overlapping stick windows"
+        )
+
+    stick_extent = concretize_expr(ranges[stick_sym])
+    if not has_disjoint_stick_windows:
+        raise Unsupported(
+            f"insert_restickify_padding: new-stick extent {stick_extent} in "
+            f"dense flattened input coordinate {coord} requires a re-base copy"
+        )
+
+    max_slice_start = coord.subs(stick_sym, 0)
+    for sym in syms - {stick_sym}:
+        max_slice_start = max_slice_start.subs(sym, concretize_expr(ranges[sym]) - 1)
+    return concretize_expr(max_slice_start) + round_up_to_stick(stick_extent, dtype)
+
+
+def _assert_input_paddable(
+    op: ComputedBuffer, in_dep, in_layout, out_stick_sym
+) -> list[sympy.Expr]:
     """Raise ``Unsupported`` for restickify inputs outside what the stick-boundary
     bump supports, classifying each input dim's read by its coordinate.
 
@@ -680,12 +867,19 @@ def _assert_input_paddable(op: ComputedBuffer, in_dep, in_layout) -> None:
         syms = coord.free_symbols
         if not syms:  # degenerate size-1 host dim, nothing to slice
             continue
-        assert len(syms) == 1, (
-            f"insert_restickify_padding: host dim {i} of {op.get_name()} "
-            f"(coord {coord}) carries multiple free symbols -- an interleaved "
-            f"index this pass's per-dim strided/sliced classification cannot "
-            f"read; a restickify input must not reach this shape"
-        )
+        if len(syms) > 1:
+            digits = _compute_digits(coord, in_dep.ranges)
+            if _is_dense_flattened_coordinate(
+                digits, in_dep.ranges
+            ) or _is_nonoverlapping_aligned_stick_coordinate(
+                digits, coord, in_dep.ranges, out_stick_sym, in_layout.dtype
+            ):
+                continue
+            raise Unsupported(
+                f"insert_restickify_padding: host dim {i} of {op.get_name()} "
+                f"(coord {coord}) is neither dense nor a set of "
+                "non-overlapping stick windows"
+            )
         sym = next(iter(syms))
         # Strided (k not in {0, 1}), on any dim: codegen carries only a contiguous
         # tail.  A broadcast (coeff 0) is read from the device layout, not this
@@ -695,6 +889,7 @@ def _assert_input_paddable(op: ComputedBuffer, in_dep, in_layout) -> None:
                 f"insert_restickify_padding: strided input on host dim "
                 f"{i} of {op.get_name()} (coord {coord}) is not supported"
             )
+    return in_host_coords
 
 
 def lower_identity_clone(
@@ -796,8 +991,7 @@ def _pad_restickify_input(op: Operation, graph: GraphLowering) -> None:
     new_stick_dim = None
     padded_dim_size = None
     if not size1:
-        _assert_input_paddable(op, in_dep, in_layout)
-        in_host_coords = host_coordinates(in_layout, in_dep, None)
+        in_host_coords = _assert_input_paddable(op, in_dep, in_layout, out_stick_sym)
         new_stick_dim = _host_dim_carrying_sym(in_host_coords, out_stick_sym)
         assert new_stick_dim is not None, (
             f"restickify padding: no input host dim carries new-stick symbol "
@@ -805,15 +999,14 @@ def _pad_restickify_input(op: Operation, graph: GraphLowering) -> None:
         )
         dtype = in_layout.dtype
         coord = in_host_coords[new_stick_dim]
-        syms = coord.free_symbols
-        assert len(syms) == 1
-        sym = next(iter(syms))
-        slice_offset = concretize_expr(coord.as_coeff_Add()[0])
-        slice_size = concretize_expr(in_dep.ranges[sym])
-        device_dim = _device_dim_carrying_sym(in_layout.device_layout, in_dep, sym)
+        device_dim = _device_dim_carrying_sym(
+            in_layout.device_layout, in_dep, out_stick_sym
+        )
         assert device_dim is not None
         dim_size = concretize_expr(in_layout.device_layout.device_size[device_dim])
-        padded_dim_size = slice_offset + round_up_to_stick(slice_size, dtype)
+        padded_dim_size = _restickify_input_required_extent(
+            coord, in_dep.ranges, out_stick_sym, dtype
+        )
         if padded_dim_size <= dim_size:
             return
 
@@ -827,7 +1020,8 @@ def _pad_restickify_input(op: Operation, graph: GraphLowering) -> None:
         device = in_buf.get_device()
         if device is None:
             return
-        in_fx_node = _find_arg_fx_node(in_dep.name)
+        patch_env(V.graph)
+        in_fx_node = find_fx_node(in_dep.name, V.graph)
         if in_fx_node is None:
             raise RuntimeError(f"no FX node found for buffer {in_dep.name!r}")
         clone_buf, new_ops = lower_identity_clone(

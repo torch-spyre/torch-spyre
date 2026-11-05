@@ -18,11 +18,15 @@
 
 #include <ATen/ATen.h>
 #include <c10/util/intrusive_ptr.h>
+#include <c10/util/safe_numerics.h>
 #include <util/sendefs/sendefs.h>
 
 #include <functional>
+#include <limits>
+#include <map>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "spyre_storage_impl.h"
@@ -31,7 +35,6 @@ namespace spyre {
 
 int64_t elems_per_stick(const DataFormats& df);
 std::vector<int32_t> generic_stick_dim_order(int32_t num_dims);
-
 /* Describes how device coordinates are arranged in memory.
  * Certain on-device type conversions result in non-sequential device
  * coordinates and some stick reduction operations (e.g., exx2) result in
@@ -92,6 +95,13 @@ class SpyreTensorLayout {
 
   ElementArrangement element_arrangement = ElementArrangement::STANDARD;
 
+  /**
+   * Maps groups of device dimensions to their valid (non-padded) element
+   * count. This field maps disjoint ordered lists of device dimensions to
+   * sizes.
+   */
+  std::map<std::vector<int64_t>, int64_t> valid_elements;
+
   SpyreTensorLayout() = default;
   ~SpyreTensorLayout() = default;
 
@@ -124,15 +134,48 @@ class SpyreTensorLayout {
    * or the expert programmer. It enables complete control over the
    * device memory layout, but callers are responsible for ensuring
    * that all device layout invariants are satisfied.
+   *
+   * When valid_elements is omitted, it defaults to {}, meaning the valid
+   * extents are unknown. No consumer uses valid_elements for layout decisions
+   * yet, but one that does must not treat {} as "every device element is
+   * valid".
+   *
+   * @deprecated Use the overload that takes valid_elements as a required
+   * parameter (before element_arrangement) to ensure accurate padding
+   * information is always provided.
+   */
+  [[deprecated(
+      "Pass valid_elements explicitly using the "
+      "SpyreTensorLayout(device_size, stride_map, device_dtype, valid_elements"
+      "[, element_arrangement]) overload.")]]
+  SpyreTensorLayout(
+      std::vector<int64_t> device_size, std::vector<int64_t> stride_map,
+      DataFormats device_dtype,
+      ElementArrangement element_arrangement = ElementArrangement::STANDARD,
+      std::map<std::vector<int64_t>, int64_t> valid_elements = {})
+      : device_size(device_size),
+        stride_map(stride_map),
+        device_dtype(device_dtype),
+        element_arrangement(element_arrangement),
+        valid_elements(std::move(valid_elements)) {
+    validate_shape();
+  }
+
+  /**
+   * Construct a SpyreTensorLayout with the specified device_size, stride_map,
+   * and valid_elements. Unlike the overload above, valid_elements is required
+   * here, so callers must supply accurate padding information.
    */
   SpyreTensorLayout(
       std::vector<int64_t> device_size, std::vector<int64_t> stride_map,
       DataFormats device_dtype,
+      std::map<std::vector<int64_t>, int64_t> valid_elements,
       ElementArrangement element_arrangement = ElementArrangement::STANDARD)
       : device_size(device_size),
         stride_map(stride_map),
         device_dtype(device_dtype),
-        element_arrangement(element_arrangement) {
+        element_arrangement(element_arrangement),
+        valid_elements(std::move(valid_elements)) {
     validate_shape();
   }
 
@@ -155,6 +198,10 @@ class SpyreTensorLayout {
    * size-1 or sparse dimension and 0 a broadcast dimension, both legitimate.
    * Consistency between stride_map and the host strides is only knowable at
    * use time and is checked in get_device_stride_infos.
+   *
+   * valid_elements is validated here, too: keys are disjoint, strictly
+   * increasing, in-range dimension tuples, and each count is between 0 and the
+   * product of the group's device extents. This is vacuously true for {}.
    */
   void validate_shape() const {
     TORCH_CHECK(!device_size.empty(),
@@ -167,6 +214,58 @@ class SpyreTensorLayout {
                   "Invalid SpyreTensorLayout: device dimension ", i,
                   " has negative size ", device_size[i],
                   "; every device dimension must be non-negative (device_size=",
+                  c10::ArrayRef<int64_t>(device_size), ")");
+    }
+    std::vector<uint8_t> seen(device_size.size());
+    for (const auto& [device_dim_indices, element_count] : valid_elements) {
+      TORCH_CHECK(!device_dim_indices.empty(),
+                  "Invalid SpyreTensorLayout: valid_elements contains an empty "
+                  "device dimension tuple");
+
+      for (size_t i = 0; i + 1 < device_dim_indices.size(); ++i) {
+        TORCH_CHECK(device_dim_indices[i] < device_dim_indices[i + 1],
+                    "Invalid SpyreTensorLayout: valid_elements entry has key "
+                    "that is not strictly increasing (key=",
+                    c10::ArrayRef<int64_t>(device_dim_indices), ")");
+      }
+
+      int64_t device_space = 1;
+      for (int64_t device_dim_index : device_dim_indices) {
+        TORCH_CHECK(device_dim_index >= 0,
+                    "Invalid SpyreTensorLayout: keys in valid_elements must "
+                    "consist of nonnegative integers, but encountered ",
+                    device_dim_index, " (the full key is ",
+                    c10::ArrayRef<int64_t>(device_dim_indices), ")");
+        TORCH_CHECK(
+            device_dim_index < static_cast<int64_t>(device_size.size()),
+            "Invalid SpyreTensorLayout: keys in valid_elements must "
+            "consist of integers less than len(device_size) == ",
+            device_size.size(), ", but encountered ", device_dim_index,
+            " (the full key is ", c10::ArrayRef<int64_t>(device_dim_indices),
+            " and device_size=", c10::ArrayRef<int64_t>(device_size), ")");
+
+        TORCH_CHECK(seen[device_dim_index] == 0,
+                    "Invalid SpyreTensorLayout: multiple keys in "
+                    "valid_elements contain the device dimension index ",
+                    device_dim_index);
+        seen[device_dim_index] = 1;
+
+        // On overflow the true product exceeds any int64 count, so saturate.
+        if (c10::mul_overflows(device_space, device_size[device_dim_index],
+                               &device_space)) {
+          device_space = std::numeric_limits<int64_t>::max();
+        }
+      }
+
+      TORCH_CHECK(element_count >= 0,
+                  "Invalid SpyreTensorLayout: valid_elements' values must be "
+                  "nonnegative integers, but found value ",
+                  element_count);
+      TORCH_CHECK(element_count <= device_space,
+                  "Invalid SpyreTensorLayout: valid_elements[",
+                  c10::ArrayRef<int64_t>(device_dim_indices),
+                  "] = ", element_count, " exceeds the ", device_space,
+                  " positions of those device dimensions (device_size=",
                   c10::ArrayRef<int64_t>(device_size), ")");
     }
   }
@@ -192,6 +291,8 @@ class SpyreTensorLayout {
   }
 
   bool operator==(const SpyreTensorLayout& other) const {
+    // Include valid_elements (and update std::hash) after deprecated
+    // constructor call sites have migrated to the valid_elements overload.
     return this->device_size == other.device_size &&
            this->stride_map == other.stride_map &&
            this->device_dtype == other.device_dtype &&
