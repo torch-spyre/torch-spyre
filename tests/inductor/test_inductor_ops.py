@@ -280,6 +280,49 @@ SPYRE_MODE_SUPPORT_OVERRIDES_BY_OP = {
 }
 
 
+def _valid_elements_from_host(sizes, strides, device_size, stride_map):
+    """Compute valid_elements by mapping device dims to host dims.
+
+    Mirrors the C++ get_dim_map logic: maps each device dim to the host dim
+    with the largest host stride <= stride_map[j], then groups device dims
+    by their host dim.  The value for each group is the host dimension's
+    element count.  Use this for manually-constructed device layouts where
+    the 4-arg dim_order constructor is not available.
+    """
+    host_rank = len(sizes)
+    device_rank = len(stride_map)
+    stick_dim_index = max(0, device_rank - 3)
+
+    max_stride_le = [0] * device_rank
+    dim_map = [-1] * device_rank
+
+    for i in range(host_rank):
+        if sizes[i] == 1:
+            continue
+        hst = strides[i]
+        if hst == 0:
+            continue
+        for j in range(device_rank):
+            if device_size[j] == 1:
+                continue
+            dst = stride_map[j]
+            if hst > max_stride_le[j] and hst <= dst:
+                max_stride_le[j] = hst
+                dim_map[j] = i
+
+    if dim_map[stick_dim_index] != -1:
+        dim_map[stick_dim_index] = dim_map[device_rank - 1]
+
+    groups: dict[int, list[int]] = {}
+    for j in range(device_rank):
+        h = dim_map[j]
+        if h == -1:
+            continue
+        groups.setdefault(h, []).append(j)
+
+    return {tuple(sorted(dims)): sizes[h] for h, dims in groups.items()}
+
+
 def _get_spyre_mode_support(op):
     return SPYRE_MODE_SUPPORT_OVERRIDES_BY_OP.get(
         op,
@@ -2077,6 +2120,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "w128": (128,),
                 "w160": (160,),
                 "w192": (192,),
+            },
+        },
+        ("test_topk_rows", "test_topk_rows_past_lx"): {
+            "param_sets": {
+                "k16_rows256_row_split": (256, 16),
+                "k22_rows384_two_cores": (384, 22),
+                "k17_rows256_one_core": (256, 17),
+                "k22_rows602_padded_tiles": (602, 22),
             },
         },
         ("test_topk", "test_topk_cpu"): {
@@ -8744,71 +8795,27 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # can register `prod` in CORE_REDUCTION_OPS_DICT like other reduction ops.
         ("test_prod", "test_prod_cpu"): {
             "param_sets": {
-                "int64_dim0": (
-                    torch.randint(2, 10, (1, 2), dtype=torch.int64),
-                    0,
-                    False,
-                ),
-                "int64_dim0_keepdim": (
-                    torch.randint(2, 10, (1, 2), dtype=torch.int64),
-                    0,
-                    True,
-                ),
-                "int64_dim1": (
-                    torch.randint(2, 10, (1, 2), dtype=torch.int64),
-                    -1,
-                    False,
-                ),
-                "int64_dim1_2x2": (
-                    torch.randint(2, 10, (2, 2), dtype=torch.int64),
-                    -1,
-                    False,
-                ),
-                "int64_dim1_keepdim": (
-                    torch.randint(2, 10, (1, 2), dtype=torch.int64),
-                    -1,
-                    True,
-                ),
-                "int64_dim0_2": (
-                    torch.randint(1, 2, (64, 32), dtype=torch.int64),
-                    0,
-                    False,
-                ),
-                "int64_dim0_2_keepdim": (
-                    torch.randint(1, 2, (64, 32), dtype=torch.int64),
-                    0,
-                    True,
-                ),
-                "int64_dim1_2": (
-                    torch.randint(1, 2, (64, 32), dtype=torch.int64),
-                    -1,
-                    False,
-                ),
-                "int64_dim1_2_keepdim": (
-                    torch.randint(1, 2, (64, 32), dtype=torch.int64),
-                    -1,
-                    True,
-                ),
-                "fp16_dim0": (torch.randn((128, 64), dtype=torch.float16), 0, False),
-                "fp16_dim0_keepdim": (
-                    torch.randn((128, 64), dtype=torch.float16),
-                    0,
-                    True,
-                ),
-                "fp16_dim1": (torch.randn((128, 64), dtype=torch.float16), -1, False),
-                "fp16_dim1_keepdim": (
-                    torch.randn((128, 64), dtype=torch.float16),
-                    -1,
-                    True,
-                ),
-            },
-            "expect_fail": {
-                "int64_dim1": (
-                    "output size [1] triggers _make_output_stl c_size[stick_dim]==1 guard"
-                ),
-                "int64_dim1_keepdim": (
-                    "output size [1,1] triggers _make_output_stl c_size[stick_dim]==1 guard"
-                ),
+                "int64_dim0": ((1, 2), torch.int64, 0, False),
+                "int64_dim0_keepdim": ((1, 2), torch.int64, 0, True),
+                "int64_dim1": ((1, 2), torch.int64, -1, False),
+                "int64_dim1_2x2": ((2, 2), torch.int64, -1, False),
+                "int64_dim1_keepdim": ((1, 2), torch.int64, -1, True),
+                "int64_dim0_2": ((64, 32), torch.int64, 0, False),
+                "int64_dim0_2_keepdim": ((64, 32), torch.int64, 0, True),
+                "int64_dim1_2": ((64, 32), torch.int64, -1, False),
+                "int64_dim1_2_keepdim": ((64, 32), torch.int64, -1, True),
+                # The only other dim has size 1 (Mistral-Small-3.2 position ids).
+                "fp16_1x64_dim1": ((1, 64), torch.float16, -1, False),
+                "fp16_1x64_dim1_keepdim": ((1, 64), torch.float16, -1, True),
+                "fp16_1x1x128_dim2": ((1, 1, 128), torch.float16, -1, False),
+                # 1-D input: the output keeps no dim at all.
+                "fp16_64_dim0": ((64,), torch.float16, 0, False),
+                "fp16_64_dim0_keepdim": ((64,), torch.float16, 0, True),
+                "int64_2_dim0": ((2,), torch.int64, 0, False),
+                "fp16_dim0": ((128, 64), torch.float16, 0, False),
+                "fp16_dim0_keepdim": ((128, 64), torch.float16, 0, True),
+                "fp16_dim1": ((128, 64), torch.float16, -1, False),
+                "fp16_dim1_keepdim": ((128, 64), torch.float16, -1, True),
             },
         },
         ("test_unfold", "test_unfold_cpu"): {
@@ -10643,6 +10650,23 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         result = torch.compile(route, dynamic=False)(probs.to("spyre")).cpu()
 
         torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
+
+    def test_topk_rows_past_lx(self, rows: int, k: int):
+        x = torch.sigmoid(
+            torch.randn(rows, 512, generator=torch.Generator().manual_seed(rows))
+        ).half()
+        values, indices = torch.compile(
+            lambda x: torch.topk(x, k, dim=-1), dynamic=False
+        )(x.to("spyre"))
+        values, indices = values.cpu().float(), indices.cpu().long()
+        expected = torch.topk(x.float(), k, dim=-1).values
+        assert ((indices >= 0) & (indices < 512)).all()
+        torch.testing.assert_close(
+            x.float().gather(1, indices), values, atol=2e-3, rtol=0
+        )
+        torch.testing.assert_close(
+            values.sort(-1).values, expected.sort(-1).values, atol=2e-3, rtol=0
+        )
 
     def test_min_tuple_output_keepdim0(self):
         x = unique_randn_along_dim((5, 7), dim=1)
@@ -13355,9 +13379,22 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         torch._inductor.codecache.FxGraphCache.clear()
 
         device_dtype_fp16 = get_device_dtype(torch.float16)
-        x_layout = SpyreTensorLayout(dev_layout[0], dev_stride[0], device_dtype_fp16)
+
+        x_layout = SpyreTensorLayout(
+            dev_layout[0],
+            dev_stride[0],
+            device_dtype_fp16,
+            _valid_elements_from_host(
+                list(x.shape), list(x.stride()), dev_layout[0], dev_stride[0]
+            ),
+        )
         weight_layout = SpyreTensorLayout(
-            dev_layout[1], dev_stride[1], device_dtype_fp16
+            dev_layout[1],
+            dev_stride[1],
+            device_dtype_fp16,
+            _valid_elements_from_host(
+                list(weight.shape), list(weight.stride()), dev_layout[1], dev_stride[1]
+            ),
         )
 
         x_dev = x.to(device_layout=x_layout)
@@ -13401,9 +13438,22 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         torch._inductor.codecache.FxGraphCache.clear()
 
         device_dtype_fp16 = get_device_dtype(torch.float16)
-        x_layout = SpyreTensorLayout(dev_layout[0], dev_stride[0], device_dtype_fp16)
+
+        x_layout = SpyreTensorLayout(
+            dev_layout[0],
+            dev_stride[0],
+            device_dtype_fp16,
+            _valid_elements_from_host(
+                list(x.shape), list(x.stride()), dev_layout[0], dev_stride[0]
+            ),
+        )
         weight_layout = SpyreTensorLayout(
-            dev_layout[1], dev_stride[1], device_dtype_fp16
+            dev_layout[1],
+            dev_stride[1],
+            device_dtype_fp16,
+            _valid_elements_from_host(
+                list(weight.shape), list(weight.stride()), dev_layout[1], dev_stride[1]
+            ),
         )
 
         x_dev = x.to(device_layout=x_layout)
@@ -13917,7 +13967,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ):
             compiled(x_multi.to("spyre"))
 
-    def test_prod_cpu(self, x, dim, keepdim):
+    def test_prod_cpu(self, shape, dtype, dim, keepdim):
+        # Entries in {-1, 1}: every product is exact, and its sign depends on every
+        # element, so a dropped or repeated element changes the result.
+        x = (torch.randint(0, 2, shape) * 2 - 1).to(dtype)
+
         def fn(a):
             return torch.prod(a, dim=dim, keepdim=keepdim)
 

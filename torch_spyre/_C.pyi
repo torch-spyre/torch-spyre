@@ -44,6 +44,7 @@ __all__: list[str] = [
     "get_device_dtype",
     "get_downcast_warning",
     "get_elem_in_stick",
+    "get_reserved_dims",
     "get_spyre_tensor_layout",
     "get_device_size_in_bytes",
     "kernel_provenance_registry_stats",
@@ -53,6 +54,7 @@ __all__: list[str] = [
     "register_kernel_provenance",
     "set_downcast_warning",
     "set_spyre_tensor_layout",
+    "spyre_empty_reserved",
     "spyre_empty_with_layout",
     "start_runtime",
     "to_with_layout",
@@ -438,6 +440,15 @@ def get_downcast_warning() -> bool:
     """
 
 def get_elem_in_stick(arg0: torch.dtype) -> int: ...
+def get_reserved_dims(
+    tensor: torch.Tensor,
+) -> dict[int, dict[str, int]] | None:
+    """
+    Return {dim: {'min', 'max', 'granularity'}} for a tensor.to(
+    "spyre", dynamic=...) reservation, or None. Never raises, even
+    for a non-Spyre tensor.
+    """
+
 @typing.overload
 def get_device_size_in_bytes(layout: SpyreTensorLayout) -> int: ...
 @typing.overload
@@ -527,7 +538,8 @@ def launch_jobplan(
 def prepare_kernel(
     spyrecode_dir: str,
     stream: _SpyreStreamBase | None = None,
-    profiler_name: str | None = None,
+    profiler_event_name: str | None = None,
+    sdsc_bundle_dir_prefix: str | None = "",
 ) -> JobPlan:
     """
     Prepare a kernel from a SpyreCode directory and return a JobPlan.
@@ -536,8 +548,13 @@ def prepare_kernel(
         spyrecode_dir: Path to the SpyreCode directory
         stream: Stream to use for initialization transfers.
             If None, uses the current stream. Defaults to None.
-        profiler_name: Bounded base name for profiler-visible compute events.
+        profiler_event_name: Bounded base name for profiler-visible compute events.
             If None, uses the existing SpyreCode or directory-derived name.
+        sdsc_bundle_dir_prefix: Prefix of the SDSC bundle directory.
+            16 characters on the cached path (first 16 of the base32-encoded
+            SHA-256 cache key), 8 hex characters on the no-cache/KTIR path
+            (first 8 of the UUID). Emitted as ``args.sdsc_bundle_dir_prefix`` in
+            profiler traces. Empty string disables registration. Defaults to "".
 
     Returns:
         Prepared JobPlan ready for execution
@@ -550,6 +567,23 @@ def set_downcast_warning(arg0: bool) -> None:
     """
 
 def set_spyre_tensor_layout(arg0: torch.Tensor, arg1: SpyreTensorLayout) -> None: ...
+def spyre_empty_reserved(
+    size: tuple[int, ...],
+    stride: tuple[int, ...],
+    dtype: torch.dtype,
+    dim: int,
+    min_size: int,
+    max_size: int,
+    granularity: int,
+) -> torch.Tensor:
+    """
+    Allocate a Spyre tensor whose physical layout/storage are sized for
+    dim `dim` == `max_size`, while its logical (PyTorch-visible)
+    size/stride stay at `size`/`stride`. `min_size`/`granularity` are
+    stored on the tensor for the runtime resize_ guard to check. Backs
+    tensor.to("spyre", dynamic={dim: {min, max, granularity}}).
+    """
+
 def spyre_empty_with_layout(
     size: tuple[int, ...],
     stride: tuple[int, ...],
