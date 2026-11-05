@@ -121,14 +121,6 @@ from utils_inductor import DEVICE, cached_randn, compare_with_pytorch
 from torch_spyre._C import SpyreTensorLayout, get_device_dtype, get_elem_in_stick
 from torch_spyre._inductor.constants import FP8_E4M3FN_MAX, FP8_E4M3FN_MIN
 
-# spyre.scaled_bmm is registered by PR #5158 (spyre::scaled_bmm custom op).
-# Skip all tests that depend on it until that PR merges to upstream/main.
-_SCALED_BMM_AVAILABLE = hasattr(torch.ops.spyre, "scaled_bmm")
-_skip_no_scaled_bmm = pytest.mark.skipif(
-    not _SCALED_BMM_AVAILABLE,
-    reason="spyre.scaled_bmm not available — requires PR #5158",
-)
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Shared geometry constants matching standard paged-cache shapes.
 # block_size=128, head_size=128: both are multiples of 128 (fp8 elems/stick).
@@ -1707,7 +1699,6 @@ class TestFp8IndexSelectRobustness:
         )
 
 
-@_skip_no_scaled_bmm
 class TestFp8ScaledBmmQKT:
     """FP8 Q·Kᵀ via ``spyre.scaled_bmm`` with three scale schemes.
 
@@ -1949,7 +1940,6 @@ class TestFp8ScaledBmmQKT:
         torch.testing.assert_close(result.cpu(), expected, atol=1e-1, rtol=0.0)
 
 
-@_skip_no_scaled_bmm
 class TestFp8KvCacheWriteQFP8WT:
     """KV cache write+read round-trip with K stored in QFP8WT (2D-stick) layout.
 
@@ -2094,7 +2084,6 @@ class TestFp8KvCacheWriteQFP8WT:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-@_skip_no_scaled_bmm
 class TestFp8KvCacheQFP8WTDecodeEndToEnd:
     """Full fill-and-decode pipeline using the direct-FP8-matmul strategy.
 
