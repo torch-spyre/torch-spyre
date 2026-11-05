@@ -2369,24 +2369,6 @@ def compute_layouts(
         # unless there is an offset in the stick dimension.
         return _clone_layout(op, output, output_dep, args)
 
-    if aten_op == spyreop.qfp8wt.default:
-        # _qfp8wt_stl derives the output entirely from the host FixedLayout
-        # (output, in_layout), never from the device STL.  Any input stick
-        # layout is acceptable — the hardware can absorb a preceding restickify
-        # at the same cost as the quantisation itself.  Using AnyInNode avoids
-        # spurious stick-scatter incompatibilities when the input tensor carries
-        # a factored (tiled) candidate STL that would otherwise be paired against
-        # the QFP8WT sparse-stick output and fail the beam search.
-        #
-        # The input must be contiguous before quantize_weight_fp8_with_scale is
-        # called (callers use .contiguous() after permute).  _qfp8wt_stl reads
-        # output.size/stride to build the STL; non-contiguous permuted strides
-        # would give a misleading stride ordering.
-        in_layout = args[0].layout
-        out_stl = _qfp8wt_stl(output, in_layout)
-        op.restick_cost_fn = AnyInNode.from_args()
-        return [out_stl]
-
     # All other single arg ops
     layouts = []
     for stl in args[0].layouts:

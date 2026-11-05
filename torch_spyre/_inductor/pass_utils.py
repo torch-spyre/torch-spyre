@@ -33,11 +33,9 @@ if TYPE_CHECKING:
     from .propagate_layouts import PropArg
 
 import regex
-import sympy
 import torch
+import sympy
 from sympy import Expr, Symbol
-from torch._inductor.dependencies import MemoryDep, ReadWrites, is_indirect
-from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     Buffer,
     ComputedBuffer,
@@ -55,11 +53,12 @@ from torch._inductor.ir import (
 )
 from torch._inductor.ops_handler import DefaultHandler, WrapperHandler
 from torch._inductor.scheduler import SchedulerNode
+from torch._inductor.graph import GraphLowering
 from torch._inductor.utils import sympy_subs
-from torch._inductor.virtualized import V
+from torch._inductor.dependencies import MemoryDep, ReadWrites, is_indirect
 from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
+from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
-
 from torch_spyre._C import (
     ElementArrangement,
     SpyreTensorLayout,
@@ -70,6 +69,11 @@ from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.op_spec import IndirectAccess, TensorWorkDivision
 
 from . import config
+from .core_mapping import (
+    PerCoreView as PerCoreView,
+    core_to_slice_mapping,
+    decompose_fused_split_view,
+)
 from .constants import (
     BATCH_MATMUL_OP,
     ELIDED_COPY_BACK_ATTR,
@@ -77,11 +81,6 @@ from .constants import (
     MATMUL_REDUCTION_OPS,
     RESTICKIFY_SUPPORTED_DEVICE_DTYPES,
     TOPK_OPS,
-)
-from .core_mapping import (
-    PerCoreView as PerCoreView,
-    core_to_slice_mapping,
-    decompose_fused_split_view,
 )
 from .ir import FixedTiledLayout, SpyreConstantFallback
 from .logging_utils import get_inductor_logger
@@ -2034,10 +2033,7 @@ def splits_by_index_coeff(
     Only non-unity splits are stored; 1 is the default on the apply side.
     Dimensions absent from both indexes are intentionally omitted.
     """
-
-    def skip(v):
-        return v <= 1
-
+    skip = lambda v: v <= 1  # noqa: E731
     output_splits = _coeff_splits_from_index(splits, write_index, skip=skip)
     # Reduction splits: symbols with coeff==0 in write_index but coeff!=0 in read_index
     reduction_only = {
