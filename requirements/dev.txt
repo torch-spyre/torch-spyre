@@ -14,7 +14,7 @@ cfgv==3.5.0
     # via pre-commit
 cmake==3.31.10
     # via torch-spyre
-colorama==0.4.6 ; (os_name != 'nt' and sys_platform == 'win32') or (os_name == 'nt' and sys_platform != 'darwin')
+colorama==0.4.6 ; (os_name == 'nt' and sys_platform != 'darwin' and sys_platform != 'win32') or sys_platform == 'win32'
     # via
     #   build
     #   pytest
