@@ -126,7 +126,7 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 | `torch.full` | Y | Y | Spyre | Custom decomposition |
 | `torch.nn.functional.pad` / `torch.constant_pad_nd` | Y | Y | Spyre | Custom lowering |
 | **In-place / Initialization** | | | | |
-| `torch.Tensor.fill_` | | Y | Spyre | Compiled only; eager kernel registered but not yet stable. Eager `fill_`/`zero_` raise on a partial, broadcast or overlapping view and on sharded tensors |
+| `torch.Tensor.fill_` | | Y | Spyre | Compiled only; eager kernel registered but not yet stable. Eager `fill_`/`zero_` raise on a partial, broadcast or overlapping view; sharded tensors are filled one shard at a time |
 | `torch.Tensor.normal_` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.Tensor.uniform_` | Y | | CPU fallback | Eager only; random values generated on CPU, copied back |
 | `torch.Tensor.random_` | Y | | CPU fallback | Eager only; `from` overload |
