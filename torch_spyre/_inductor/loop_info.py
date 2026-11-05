@@ -376,14 +376,38 @@ _SPYRE_METADATA_ATTRS = (
 )
 
 
-def copy_op_metadata(src: "ComputedBuffer", dst: "ComputedBuffer") -> None:
+# Per-op layout state set by propagate_spyre_tensor_layouts and
+# nonstick_dim_order.  It describes ``src``'s own output and inputs, so it is
+# only valid on a rebuild of ``src`` that keeps its name, layout and body
+# (``copy_op_metadata(..., layout_state=True)``).  A new op built from another
+# op (a drain, a restore, an inserted copy) must not inherit it.
+_SPYRE_LAYOUT_STATE_ATTRS = (
+    "layouts",
+    "restick_cost_fn",
+    "committed_stl",
+)
+
+
+def copy_op_metadata(
+    src: "ComputedBuffer", dst: "ComputedBuffer", *, layout_state: bool = False
+) -> None:
     """Copy non-provenance Spyre pass metadata from src to dst.
 
     Call this whenever a pass reconstructs a ComputedBuffer to ensure
     dim_hints, work-division hint metadata, and coarse-tiling attrs are not
     silently dropped. Source provenance is owned by the helpers in
     ``provenance.py`` and is deliberately excluded from this bulk copy.
+
+    Pass ``layout_state=True`` only when ``dst`` replaces ``src`` with the same
+    name, layout and body semantics (a name-swap or body-wrap rebuild): it also
+    copies the layout-propagation results in ``_SPYRE_LAYOUT_STATE_ATTRS``.
+    Without it, a rebuild after ``propagate_spyre_tensor_layouts`` loses them
+    and later passes fail (``KeyError`` in optimize_restickify,
+    ``FixedLayout`` without ``device_layout`` in insert_restickify).
     """
-    for attr in _SPYRE_METADATA_ATTRS:
+    attrs: tuple[str, ...] = _SPYRE_METADATA_ATTRS
+    if layout_state:
+        attrs = attrs + _SPYRE_LAYOUT_STATE_ATTRS
+    for attr in attrs:
         if hasattr(src, attr):
             setattr(dst, attr, getattr(src, attr))
