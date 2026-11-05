@@ -373,6 +373,26 @@ def _rewrite(
         body_bytes = prod(in_shape) // body[-1] * padded_body * esize
         if max(pivot_bytes, body_bytes) > MAX_SPAN_BYTES:
             p = None
+    if p is not None and len(prefix) > 2:
+        # Collapse the dims around the pivot to at most one on each side. The
+        # first restickify pads the old stick dim to whole sticks, and with
+        # two or more dims in front of it the chosen layout can put that
+        # padded dim inside a non-unit outer dim, so the padding falls between
+        # the outer slices and the next read lands on the wrong rows.
+        # Measured: (1,4,64,400) -> (1,4,64,20,20) and (2,4,64,400) gave
+        # wrong values, (4,64,400) and these shapes collapsed did not.
+        # Prefixes of one or two dims are left as they are: they were already
+        # correct, and collapsing them would add a copy to restore the shape.
+        before, after = prod(prefix[:p]), prod(prefix[p + 1 :])
+        if before > 1 and after > 1:
+            p = None  # not reducible to one outer dim; take the host path
+        else:
+            tail = in_shape[len(prefix) :]
+            pivot = prefix[p]
+            prefix = [before] * (before > 1) + [pivot] + [after] * (after > 1)
+            p = int(before > 1)
+            in_shape = prefix + tail
+            pivot_out = prefix + body
 
     with graph.inserting_before(node):
         if list(src_val.shape) != in_shape:

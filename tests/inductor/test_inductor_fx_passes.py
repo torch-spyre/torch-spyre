@@ -436,6 +436,28 @@ class TestStickReshapePivot(unittest.TestCase):
         )
 
     @pytest.mark.filterwarnings("ignore::UserWarning")  # forced cache disabling
+    def test_two_outer_dims_with_padded_stick(self):
+        # Two or more dims in front of a padded old stick dim (400 is 6.25
+        # sticks) used to give wrong values: the restickify layout put the
+        # padding between the outer slices. The first case is the yolo26 PSA
+        # attention output view.
+        cases = {
+            "yolo26 psa output": ((1, 4, 64, 400), (1, 256, 20, 20)),
+            "split only": ((1, 4, 64, 400), (1, 4, 64, 20, 20)),
+            "no size-1 dim": ((2, 4, 64, 400), (2, 4, 64, 20, 20)),
+            "narrow row": ((1, 4, 64, 160), (1, 4, 64, 2, 80)),
+        }
+        for name, (shape, out) in cases.items():
+            with self.subTest(name):
+                x = torch.randn(*shape, dtype=torch.float16)
+                self._compile_and_check(
+                    lambda x, out=out: torch.nn.functional.silu(x * 2).reshape(out) + 1,
+                    x,
+                    on_device=True,
+                    expect="pivot",
+                )
+
+    @pytest.mark.filterwarnings("ignore::UserWarning")  # forced cache disabling
     def test_aligned_stick_reshape_is_left_alone(self):
         a = torch.randn(1, 32, 128 * 128, dtype=torch.float16)
         self._compile_and_check(
