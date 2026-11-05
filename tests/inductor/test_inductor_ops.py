@@ -903,11 +903,35 @@ SCALED_MM_TESTS = {
     for sa, sb, b in _SCALED_MM_PARAMS
 }
 
+# Operand shapes spyre.scaled_mm rejects: it is 2D only, like torch._scaled_mm.
+_SCALED_MM_NON_2D_SHAPES = {
+    "3d_3d": ((8, 4, 128), (8, 128, 128)),
+    "3d_2d": ((8, 4, 128), (128, 128)),
+    "2d_3d": ((4, 128), (8, 128, 128)),
+}
+
+# Operand shapes spyre.scaled_bmm rejects: it takes 3D@2D, 3D@3D and 4D@4D.
+_SCALED_BMM_REJECTED_SHAPES = {
+    "2d_2d": ((4, 128), (128, 128)),
+    "4d_2d": ((2, 8, 4, 128), (128, 128)),
+    "3d_4d": ((8, 4, 128), (2, 8, 128, 128)),
+    "3d_2d_k_mismatch": ((8, 4, 128), (256, 128)),
+    "3d_3d_batch_mismatch": ((8, 4, 128), (2, 128, 128)),
+}
+
 
 _SCALED_BMM_SHAPES = {
+    # 3D @ 2D, one mat2 shared across the batch
+    "3d_2d_8x4x128x128": ((8, 4, 128), (128, 128)),
+    "3d_2d_2x64x128x128": ((2, 64, 128), (128, 128)),
+    "3d_2d_2x4x128x256": ((2, 4, 128), (128, 256)),
+    # 3D @ 2D with batch size 1
+    "3d_2d_1x64x128x128": ((1, 64, 128), (128, 128)),
     # 3D
     "3d_4x64x128x64": ((4, 64, 128), (4, 128, 64)),
     "3d_2x64x128x128": ((2, 64, 128), (2, 128, 128)),
+    # 3D with batch size 1
+    "3d_1x64x128x128": ((1, 64, 128), (1, 128, 128)),
     # 4D
     "4d_1x32x64x128x64": ((1, 32, 64, 128), (1, 32, 128, 64)),
     "4d_2x8x64x128x128": ((2, 8, 64, 128), (2, 8, 128, 128)),
@@ -8868,8 +8892,33 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ("test_fp8_scaled_mm", "test_fp8_scaled_mm_cpu"): {
             "param_sets": SCALED_MM_TESTS,
         },
+        ("test_fp8_scaled_mm_rejects", "test_fp8_scaled_mm_rejects_cpu"): {
+            "param_sets": _SCALED_MM_NON_2D_SHAPES,
+            "expect_raise": dict.fromkeys(_SCALED_MM_NON_2D_SHAPES, "is 2D only"),
+        },
         ("test_fp8_scaled_bmm", "test_fp8_scaled_bmm_cpu"): {
             "param_sets": SCALED_BMM_TESTS,
+        },
+        (
+            "test_fp8_scaled_bmm_per_row_scale",
+            "test_fp8_scaled_bmm_per_row_scale_cpu",
+        ): {
+            # Shapes: (mat1_shape, mat2_shape)
+            "param_sets": {
+                "3d_8x4x128x128": ((8, 4, 128), (8, 128, 128)),
+                "3d_2x64x128x128": ((2, 64, 128), (2, 128, 128)),
+                "3d_2d_8x4x128x128": ((8, 4, 128), (128, 128)),
+                "3d_2d_2x64x128x128": ((2, 64, 128), (128, 128)),
+                # Batch size 1
+                "3d_1x64x128x128": ((1, 64, 128), (1, 128, 128)),
+                "3d_2d_1x64x128x128": ((1, 64, 128), (128, 128)),
+            },
+        },
+        ("test_fp8_scaled_bmm_rejects", "test_fp8_scaled_bmm_rejects_cpu"): {
+            "param_sets": _SCALED_BMM_REJECTED_SHAPES,
+            "expect_raise": dict.fromkeys(
+                _SCALED_BMM_REJECTED_SHAPES, "bmm_fp8 with shapes"
+            ),
         },
         ("test_fp8_scaled_bmm_kt_view", "test_fp8_scaled_bmm_kt_view_cpu"): {
             "param_sets": SCALED_BMM_QK_TESTS,
@@ -13977,6 +14026,94 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             self._scaled_bmm_on_device_weight(
                 q, w_dev, scale_a, scale_b, permute=(0, 2, 1, 3)
             )
+
+    def test_fp8_scaled_mm_rejects_cpu(self, mat1_shape, mat2_shape):
+        """spyre.scaled_mm rejects non-2D operands at trace time (#5424).
+
+        Its fake used to trace [B, M, K] operands as [B, N], so the failure
+        only surfaced later, as a broadcast error in the op using the result.
+        """
+        a = torch.rand(mat1_shape, dtype=torch.float16)
+        b = torch.rand(mat2_shape, dtype=torch.float16)
+        scale = torch.tensor(1.0, dtype=torch.float16)
+
+        def spyre_fn(a, b, scale):
+            q_a = torch.ops.spyre.quantize_fp8_with_scale(a, scale)
+            q_b = torch.ops.spyre.quantize_weight_fp8_with_scale(b, scale)
+            return torch.ops.spyre.scaled_mm(q_a, q_b, out_dtype=torch.float16)
+
+        _compile_and_run(spyre_fn, [a, b, scale], "spyre")
+
+    def test_fp8_scaled_bmm_rejects_cpu(self, mat1_shape, mat2_shape):
+        """spyre.scaled_bmm rejects any shape outside 3D@2D, 3D@3D and 4D@4D."""
+        a = torch.rand(mat1_shape, dtype=torch.float16)
+        b = torch.rand(mat2_shape, dtype=torch.float16)
+        scale = torch.tensor(1.0, dtype=torch.float16)
+
+        def spyre_fn(a, b, scale):
+            q_a = torch.ops.spyre.quantize_fp8_with_scale(a, scale)
+            q_b = torch.ops.spyre.quantize_weight_fp8_with_scale(b, scale)
+            return torch.ops.spyre.scaled_bmm(
+                q_a, q_b, scale_a=scale, scale_b=scale, out_dtype=torch.float16
+            )
+
+        _compile_and_run(spyre_fn, [a, b, scale], "spyre")
+
+    def test_fp8_scaled_bmm_per_row_scale_cpu(self, mat1_shape, mat2_shape):
+        """spyre.bmm_fp8 output rescaled by a per-row [B, M, 1] scale (#5424).
+
+        This is the batched route now that spyre.scaled_mm is 2D only, with a
+        batched mat2 and with one mat2 shared across the batch. Every row must
+        match the trusted 2D path exactly, batch by batch.
+
+        The inputs sit on the FP8 grid: every row is FP8 codes times a power of two
+        and holds 448, so its scale is that power of two and quantization recovers
+        the codes. Neighbouring rows differ by a factor of 2, so a scale applied to
+        the wrong row fails against the fp32 reference too. That check needs a
+        tolerance because 2D scaled_mm itself runs about 0.2% high against fp32 and
+        carries rounding noise peaking near 16 per unit of row scale, on outputs of
+        rms 850. Both paths share that error, so only the reference check allows it.
+        """
+        b, m, k = mat1_shape
+        rows = torch.arange(b * m)
+        shapes = (*mat1_shape, *mat2_shape)
+        codes = self._fp8_ref(
+            64.0 * cached_randn(mat1_shape, differentiation=("a", *shapes)), 1.0
+        )
+        codes.view(-1, k)[rows, rows % k] = 448.0
+        gain = (2.0 ** (rows % 4)).to(torch.float16).reshape(b, m, 1)
+        a = codes * gain
+        w = self._fp8_ref(cached_randn(mat2_shape, differentiation=("w", *shapes)), 1.0)
+
+        def rescaled(mm):
+            def spyre_fn(a, w):
+                scale = torch.ops.spyre.quantscalepertokenfp8(a)
+                q_a = torch.ops.spyre.quantize_fp8_with_scale(a, scale)
+                q_w = torch.ops.spyre.qfp8wt(w)
+                return mm(q_a, q_w, out_dtype=torch.float16) * scale
+
+            return spyre_fn
+
+        actual = _compile_and_run(rescaled(torch.ops.spyre.bmm_fp8), (a, w), "spyre")
+        batch_weights = w if w.dim() == 3 else w.expand(b, -1, -1)
+        trusted = torch.stack(
+            [
+                _compile_and_run(
+                    rescaled(torch.ops.spyre.scaled_mm),
+                    (a[i], batch_weights[i]),
+                    "spyre",
+                )
+                for i in range(b)
+            ]
+        )
+        torch.testing.assert_close(actual, trusted, atol=0, rtol=0)
+
+        # Normalized by row scale, so one absolute tolerance fits every row.
+        gain = gain.to(torch.float32)
+        reference = a.to(torch.float32) @ w.to(torch.float32)
+        torch.testing.assert_close(
+            actual.to(torch.float32) / gain, reference / gain, atol=32.0, rtol=0.01
+        )
 
     def test_fp8_scaled_mm_granite_fp8_shapes_cpu(self, m, k, n):
         """Regression test for SuperDSC aborts on FP8 _scaled_mm at Granite 8B shapes.
