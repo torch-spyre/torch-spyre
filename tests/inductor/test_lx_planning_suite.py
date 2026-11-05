@@ -175,6 +175,39 @@ class TestLxPlanningSuiteGeneration(unittest.TestCase):
 
         self.assertEqual(lx._canonical_test_names(Fake), {"test_a_good"})
 
+    def test_canonical_subset_normalizes_decimal_names(self):
+        class Fake:
+            PARAMS = {
+                ("test_a", "base"): {
+                    "ops_dict": {"op0.5": None},
+                    "param_sets": {"0.5": (), "1.0": ()},
+                    "expect_raise": {"op0.5_0.5": "boom"},
+                },
+                ("test_b", "base"): {
+                    "param_sets": {"0.5": (), "1.0": ()},
+                    "expect_fail": {"0.5": "rejected"},
+                },
+            }
+
+        # Select using raw PARAMS keys, then match the generated method names.
+        self.assertEqual(
+            lx._canonical_test_names(Fake), {"test_a_op0p5_1p0", "test_b_1p0"}
+        )
+
+    def test_decimal_representatives_are_copied(self):
+        # Reduced mode used to drop decimals in both op names and case keys.
+        names = {
+            "test_pow_nonint_0p3_fp16_1d",
+            "test_add_alpha_add_alpha_0p5_256_256",
+            "test_sub_alpha_sub_alpha_0p5_256_256",
+            "test_fp8_scaled_mm_128x128x128_1p0_1p0_0p0",
+        }
+        self.assertLessEqual(names, set(_tests(ops.TestOps)))
+        for cls in _LX_CLASSES:
+            with self.subTest(cls=cls.__name__):
+                copied = {re.sub(r"_lx_planning_\w+$", "", n) for n in _tests(cls)}
+                self.assertEqual(sorted(names - copied), [])
+
     def test_canonical_subset_skips_xfail_cases(self):
         class Fake:
             PARAMS = {

@@ -1782,6 +1782,9 @@ def has_resolved_work_div_hint(op: ComputedBuffer) -> bool:
 
     ``spyre_hint`` annotates every node in its scope, so an op can carry a
     ``work_div`` hint naming none of its dims; that op gets a default split.
+    Shard-pinned ops are not excluded here: the scratchpad allocator's
+    "shard plan" branch commits their division first, so this predicate never
+    decides for them.
     """
     return (
         isinstance(op.data, (Pointwise, Reduction))
@@ -2126,8 +2129,21 @@ def work_distribution_pass(
     blocked = constraint_result.blocked
     allowed_splits = constraint_result.allowed_splits
 
-    if not config.ignore_work_division_hints:
-        user_splits = _resolve_work_div_hint(op, it_space_adjusted)
+    # A shard plan (sharded_hbm.plan_sharded_hbm) is a correctness constraint,
+    # not a preference, so it applies even when hints are ignored.
+    shard_splits = getattr(op, "shard_pinned_splits", None)
+    if shard_splits:
+        if not config.ignore_work_division_hints and has_work_div_hint(op):
+            # The shard plan wins over a user work_div hint by design; say so
+            # instead of dropping the hint silently.
+            logger.info(
+                "work_distribution(shard-plan) %s: shard plan %s overrides the "
+                "work_div hint (the split must follow the shards)",
+                op.get_name(),
+                shard_splits,
+            )
+    if shard_splits or not config.ignore_work_division_hints:
+        user_splits = shard_splits or _resolve_work_div_hint(op, it_space_adjusted)
         if user_splits is not None:
             user_splits = _apply_user_hint(
                 op,
@@ -2832,10 +2848,11 @@ def _iter_computed_buffers(operations: list[Operation]):
                 continue
             yield op
         elif isinstance(op, FallbackKernel):
-            # FallbackKernel produces 0..N trailing MultiOutputs
-            # (see torch_spyre/_inductor/propagate_layouts.py).
-            # Work division is not supported on either; the MultiOutputs
-            # are skipped in their own branch below.
+            # FallbackKernel either carries a single output itself or
+            # produces trailing MultiOutputs (see
+            # torch_spyre/_inductor/propagate_layouts.py). Work division is
+            # not supported on either; the MultiOutputs are skipped in their
+            # own branch below.
             pass
         elif isinstance(op, MultiOutput):
             pass
