@@ -74,6 +74,8 @@ class AiuptiActivityProfilerSession
                             libkineto::ActivityLogger* logger);
   void handleMemcpyActivity(const AIUpti_ActivityMemcpy* activity,
                             libkineto::ActivityLogger* logger);
+  void handleMemcpyPtoPActivity(const AIUpti_ActivityMemcpyPtoP* activity,
+                                libkineto::ActivityLogger* logger);
   void handleMemsetActivity(const AIUpti_ActivityMemset* activity,
                             libkineto::ActivityLogger* logger);
   void handleMemoryActivity(const AIUpti_ActivityMemory* activity,
