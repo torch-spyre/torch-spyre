@@ -1013,8 +1013,31 @@ class SpyreKernel(Kernel[CSEVariable]):
             if step == 0:
                 continue
             if int(step) % elems_per_stick != 0:
+                # Only a step of exactly 1 is really "one element per trip"; a
+                # larger sub-stick step (e.g. a Kind.SLICE operand tiled narrower
+                # than a stick) is a different advance, so the specific remedy
+                # below only applies to the former. Either way, point at the one
+                # documented fix (the counted-loop index-table layout note) rather
+                # than restating it here with different wording, so the two don't
+                # drift out of sync.
+                hint = (
+                    "See the counted-loop index-table layout note in "
+                    "docs/source/compiler/working_set_reduction.md for the "
+                    "supported SpyreTensorLayout."
+                )
+                if step == 1:
+                    hint = (
+                        "A bare index read one element per trip can't be "
+                        "stick-aligned. If this operand's per-trip row is really "
+                        "just the next contiguous chunk, use Slice(dim, extent) "
+                        "instead of Gather so no index table is needed. "
+                    ) + hint
                 raise UnalignedStickSplit(
-                    idx_arg.arg_index, sym, int(step), elems_per_stick
+                    idx_arg.arg_index,
+                    sym,
+                    int(step),
+                    elems_per_stick,
+                    hint=hint,
                 )
 
     def create_op_spec(
