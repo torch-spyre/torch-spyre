@@ -296,6 +296,44 @@ def matmul_inputs():
     return (X, Y), X @ Y
 
 
+# x/w tiled at tile_size=SLICE_T along K; sw needs one row per K-step instead of
+# SLICE_T, via Slice(0, extent=1) -- shared by both the lowering test and its eager
+# (no torch.compile) counterpart so the reference loop isn't duplicated.
+SLICE_M, SLICE_K, SLICE_N, SLICE_T = 4, 8, 6, 2
+
+
+def slice_scale_table_inputs():
+    torch.manual_seed(0)
+    x = torch.randn(SLICE_M, SLICE_K)
+    w = torch.randn(SLICE_K, SLICE_N)
+    sw = torch.rand(SLICE_K // SLICE_T, SLICE_N)
+    return x, w, sw
+
+
+def slice_scale_table_ref(x, w, sw):
+    ref = torch.zeros(SLICE_M, SLICE_N)
+    for i in range(SLICE_K // SLICE_T):
+        x_t = x[:, i * SLICE_T : (i + 1) * SLICE_T]
+        w_t = w[i * SLICE_T : (i + 1) * SLICE_T, :]
+        ref = ref + torch.matmul(x_t, w_t) * sw[i : i + 1]
+    return ref
+
+
+def slice_scale_table_fn(x, w, sw):
+    def body(acc, tiles):
+        x_t, w_t, s = tiles
+        return acc + torch.matmul(x_t, w_t) * s, None
+
+    acc, _ = for_each_tile(
+        body,
+        (x, w, sw),
+        dims=(1, 0, Slice(0, extent=1)),
+        tile_size=SLICE_T,
+        init=torch.zeros(SLICE_M, SLICE_N),
+    )
+    return acc
+
+
 # Online-softmax settings for case G: one 128-token query block against a 256-token KV
 # span in two tiles, at flash attention's own head size. `HEAD_DIM` is spelled out
 # rather than `D` because a bare `D` reads as case D in this file.
@@ -623,31 +661,51 @@ class TestForEachTileLowering(unittest.TestCase):
         working_set_reduction.md's counted-loop index-table note). No
         materialization: sw's one-row tile is a plain `narrow`, same as X/Y's.
         """
-        M, K, N, T = 4, 8, 6, 2
+        x, w, sw = slice_scale_table_inputs()
+        ref = slice_scale_table_ref(x, w, sw)
+        self._assert_lowers(
+            slice_scale_table_fn, (x, w, sw), ref, name="Slice_scale_table", loops=1
+        )
+
+    def test_slice_extent_wider_than_tile_size(self):
+        """Slice(dim, extent) with extent > tile_size (the docs say "narrower (or
+        wider)"), the companion case to test_slice_extent_differs_from_tile_size,
+        which only covers extent < tile_size.
+
+        x/w are tiled at tile_size=1 along K (one column/row per trip); sw packs two
+        rows per trip instead via `Slice(0, extent=2)`, wider than tile_size. Both
+        still yield K trips, so they stay co-indexed; the body collapses sw's 2-row
+        tile with `mean` before it multiplies the (M, N) matmul tile.
+        """
+        M, K, N = 4, 4, 6
+        torch.manual_seed(0)
         x = torch.randn(M, K)
         w = torch.randn(K, N)
-        sw = torch.rand(K // T, N)
+        sw = torch.rand(2 * K, N)
 
         def fn(x, w, sw):
             def body(acc, tiles):
                 x_t, w_t, s = tiles
-                return acc + torch.matmul(x_t, w_t) * s, None
+                return acc + torch.matmul(x_t, w_t) * s.mean(0, keepdim=True), None
 
             acc, _ = for_each_tile(
                 body,
                 (x, w, sw),
-                dims=(1, 0, Slice(0, extent=1)),
-                tile_size=T,
+                dims=(1, 0, Slice(0, extent=2)),
+                tile_size=1,
                 init=torch.zeros(M, N),
             )
             return acc
 
         ref = torch.zeros(M, N)
-        for i in range(K // T):
-            x_t, w_t = x[:, i * T : (i + 1) * T], w[i * T : (i + 1) * T, :]
-            ref = ref + torch.matmul(x_t, w_t) * sw[i : i + 1]
+        for i in range(K):
+            x_t, w_t = x[:, i : i + 1], w[i : i + 1, :]
+            s = sw[2 * i : 2 * i + 2].mean(0, keepdim=True)
+            ref = ref + torch.matmul(x_t, w_t) * s
 
-        self._assert_lowers(fn, (x, w, sw), ref, name="Slice_scale_table", loops=1)
+        self._assert_lowers(
+            fn, (x, w, sw), ref, name="Slice_wider_than_tile_size", loops=1
+        )
 
     def test_split_n(self):
         """B: tile N as a map -- case A with the output axis moved, X invariant.
@@ -2028,28 +2086,29 @@ class TestSliceTileSpecValidation(unittest.TestCase):
 
     def test_extent_differing_from_tile_size_runs_in_eager(self):
         """The validated case actually runs end to end outside Dynamo too."""
-        M, K, N, T = 4, 8, 6, 2
-        x = torch.randn(M, K)
-        w = torch.randn(K, N)
-        sw = torch.rand(K // T, N)
+        x, w, sw = slice_scale_table_inputs()
+        acc = slice_scale_table_fn(x, w, sw)
+        torch.testing.assert_close(acc, slice_scale_table_ref(x, w, sw))
 
-        def body(acc, tiles):
-            x_t, w_t, s = tiles
-            return acc + torch.matmul(x_t, w_t) * s, None
+    def test_tile_size_rejected_when_only_slice_entries(self):
+        """tile_size is unread when every tiled operand is Slice, not plain int.
 
-        acc, _ = for_each_tile(
-            body,
-            (x, w, sw),
-            dims=(1, 0, Slice(0, extent=1)),
-            tile_size=T,
-            init=torch.zeros(M, N),
-        )
-
-        ref = torch.zeros(M, N)
-        for i in range(K // T):
-            x_t, w_t = x[:, i * T : (i + 1) * T], w[i * T : (i + 1) * T, :]
-            ref = ref + torch.matmul(x_t, w_t) * sw[i : i + 1]
-        torch.testing.assert_close(acc, ref)
+        Mirrors the existing no-sliced-operand guard (a gathered-only call also
+        rejects tile_size != 1, for the same "a wrong value would silently look
+        right" reason): Slice carries its own extent and also never reads
+        tile_size, but it still produces Kind.SLICE like a plain int entry does,
+        so a stale tile_size must be caught here too rather than only when there
+        is no SLICE-kind operand at all.
+        """
+        x = torch.randn(4, 8)
+        with self.assertRaisesRegex(ValueError, "no operand has a plain int"):
+            for_each_tile(
+                lambda c, t: (c + t[0], None),
+                (x,),
+                dims=(Slice(0, extent=2),),
+                tile_size=3,
+                init=torch.zeros(2, 8),
+            )
 
 
 if __name__ == "__main__":

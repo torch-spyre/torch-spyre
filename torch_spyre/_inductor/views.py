@@ -933,10 +933,9 @@ class UnalignedStickSplit(Unsupported):
             f"physical stick of {stick_size} elements"
         )
         # Call-site-specific guidance, e.g. SpyreKernel._check_indirect_index_step
-        # naming the actual unsupported pattern (a standalone Gather read one
-        # element per trip) rather than leaving the reader only this generic,
-        # internal-symbol-name message. Omitted by other call sites, whose
-        # alignment failures aren't tied to one specific, nameable pattern.
+        # naming the documented remedy for its own checks, rather than leaving the
+        # reader only this generic, internal-symbol-name message. Omitted by other
+        # call sites, whose alignment failures aren't tied to one documented fix.
         if hint:
             message = f"{message}. {hint}"
         super().__init__(message)

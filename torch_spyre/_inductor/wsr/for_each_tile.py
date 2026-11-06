@@ -329,6 +329,11 @@ def _normalize_in_specs(operands, dims, tile_size: int) -> tuple[list[TileSpec],
     # dim 0, and with a 2-page gather, but not with y[6, 5].
     num_tiles: int | None = None
     num_tiles_of: int | None = None
+    # Whether any operand actually narrows by the shared `tile_size`: a plain `int`
+    # dims entry does, but Slice carries its own extent and Gather always reads one
+    # pool row, so both leave `tile_size` unread. Kind.SLICE alone can't tell these
+    # apart -- a Slice entry produces it too -- so this is tracked separately.
+    tile_size_used = False
 
     for k, (o, d) in enumerate(zip(operands, per_operand)):
         if not isinstance(o, torch.Tensor):
@@ -364,6 +369,7 @@ def _normalize_in_specs(operands, dims, tile_size: int) -> tuple[list[TileSpec],
                 idx,
             )
         elif isinstance(d, int) and not isinstance(d, bool):
+            tile_size_used = True
             axis = utils.canonicalize_dim(o.ndim, d)
             length = o.shape[axis]
             if length % tile_size != 0:
@@ -403,6 +409,10 @@ def _normalize_in_specs(operands, dims, tile_size: int) -> tuple[list[TileSpec],
                     f"{d.dim}, which is not a multiple of Slice extent={d.extent} "
                     f"(ragged tiles are not supported)"
                 )
+            # Same reasoning as the plain-int branch above: record it as a fact so
+            # the simplifier can fold extent * (length // extent) back to length for
+            # a symbolic length too.
+            torch._check(length % d.extent == 0)
             spec = TileSpec(
                 Kind.SLICE,
                 axis,
@@ -430,13 +440,15 @@ def _normalize_in_specs(operands, dims, tile_size: int) -> tuple[list[TileSpec],
             "for_each_tile() needs at least one sliced or gathered operand; a "
             "counter-only loop cannot be traced (see torch-spyre#3965, I1)"
         )
-    # With no sliced operand nothing reads tile_size: a gathered step takes one pool
-    # row, and the trip count comes from the index table. Silently ignoring the
-    # argument would let a wrong one look right.
-    if tile_size != 1 and all(s.kind is not Kind.SLICE for s in specs):
+    # With no plain-int dims entry nothing reads tile_size: a gathered step takes one
+    # pool row and a Slice entry carries its own extent, so the trip count comes from
+    # the index table or the extent instead. Silently ignoring the argument would let
+    # a wrong one look right.
+    if tile_size != 1 and not tile_size_used:
         raise ValueError(
-            f"for_each_tile() got tile_size={tile_size} with no sliced operand; a "
-            f"gathered step takes one pool row, so tile_size must be 1"
+            f"for_each_tile() got tile_size={tile_size} but no operand has a plain "
+            f"int dims entry; a gathered step takes one pool row and a Slice entry "
+            f"carries its own extent, so neither reads tile_size and it must be 1"
         )
     return specs, num_tiles
 
