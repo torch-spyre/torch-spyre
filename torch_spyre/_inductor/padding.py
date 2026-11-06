@@ -1781,7 +1781,8 @@ def get_pad_value(func, dtype) -> float | None:
         return 0
     if func == "indirect_indexing":
         return 0
-    if dtype == torch.float16:
+    # bfloat16 is stored on device as SEN169_FP16, like float16.
+    if dtype in (torch.float16, torch.bfloat16):
         data_format = DataFormats.SEN169_FP16
     elif dtype == torch.float32:
         data_format = DataFormats.IEEE_FP32
@@ -2014,7 +2015,7 @@ def track_padding_value(graph: GraphLowering) -> None:
                     if can_coord_mask(inv_domain.func, buf.layout.dtype):
                         do_coord_mask = True
                         # For now this is true for all operations that are padded
-                        if op.layout.dtype == torch.float16:
+                        if op.layout.dtype in (torch.float16, torch.bfloat16):
                             tracer.buffer_range[op.name] = FiniteSet(0)
                         else:
                             tracer.buffer_range[op.name] = Interval(0, 1e-2)
