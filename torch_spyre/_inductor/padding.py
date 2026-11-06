@@ -73,6 +73,7 @@ from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .pass_utils import (
+    loop_induction_symbols,
     concretize_expr,
     concretize_index,
     device_coordinates,
@@ -121,6 +122,54 @@ def _move_ops_before(
         operations.insert(idx + i, o)
 
 
+def restride_loop_step(
+    step: Expr,
+    size: list[int],
+    stride: list[int],
+    padded_stride: list[int],
+    buffer_name: str,
+) -> Expr:
+    """The per-trip step of a loop that walks ``buffer_name``, in the padded buffer.
+
+    ``step`` is the loop variable's coefficient in a read of the unpadded buffer,
+    so it is a whole number of positions along one of that buffer's dims:
+    ``step = count * stride[d]``. Padding grows some dims, so the stride of every
+    dim outside the padded one can change (the per-expert stride of a tiled weight
+    goes from 67 * 128 to 128 * 128). The step in the padded buffer is
+    ``count * padded_stride[d]``.
+
+    An exact match (``count == 1``) wins. A multiple (``count > 1``, a tile of
+    several positions) is taken only if it stays inside the dim. Dims of size one
+    are never stepped, so they cannot own the step. If two dims could own it the
+    loop cannot be re-strided, and this raises ``Unsupported`` rather than leave a
+    step that walks the padded buffer by the unpadded stride (#5573). A step that
+    is no dim's is returned unchanged.
+    """
+    dims = [d for d in range(len(stride)) if size[d] > 1 and stride[d] > 0]
+    exact = [d for d in dims if stride[d] == step]
+    if len(exact) > 1:
+        raise Unsupported(
+            f"insert_bmm_padding: cannot tell which dim of {buffer_name} the loop "
+            f"steps by {step} (strides {stride}, sizes {size}); the padded "
+            f"buffer's per-trip step would be wrong"
+        )
+    if exact:
+        return sympy.Integer(padded_stride[exact[0]])
+    multiples = [
+        d for d in dims if step % stride[d] == 0 and step // stride[d] < size[d]
+    ]
+    if len(multiples) > 1:
+        raise Unsupported(
+            f"insert_bmm_padding: cannot tell which dim of {buffer_name} the loop "
+            f"steps by {step} (strides {stride}, sizes {size}); the padded "
+            f"buffer's per-trip step would be wrong"
+        )
+    if multiples:
+        d = multiples[0]
+        return sympy.Integer(step // stride[d] * padded_stride[d])
+    return step
+
+
 class _PaddedLoadHandler(WrapperHandler):
     """Redirect every ``load`` of ``orig_name`` to ``padded_name``, re-striding
     the index.
@@ -147,6 +196,7 @@ class _PaddedLoadHandler(WrapperHandler):
         padded_name: str,
         padded_indexer,
         var_ranges: dict,
+        padded_stride: list[int],
     ):
         super().__init__(inner)
         self._orig_name = orig_name
@@ -155,15 +205,32 @@ class _PaddedLoadHandler(WrapperHandler):
         self._padded_name = padded_name
         self._padded_indexer = padded_indexer
         self._var_ranges = var_ranges
+        self._padded_stride = padded_stride
 
     def load(self, name, index):
         if name != self._orig_name:
             return super().load(name, index)
         index = concretize_index(sympy.sympify(index), set(self._var_ranges))
+        # A loop induction variable is not an iteration variable of this op, so
+        # ``compute_coordinates`` cannot place it and would drop the term; the
+        # padded read would then read tile 0 on every trip. Take the term out,
+        # decompose the rest, and add it back at the padded buffer's stride.
+        loop_term = sympy.S.Zero
+        for symbol in loop_induction_symbols(index, self._var_ranges):
+            step = index.coeff(symbol)
+            if step != 0:
+                loop_term += symbol * restride_loop_step(
+                    step,
+                    self._orig_size,
+                    self._orig_stride,
+                    self._padded_stride,
+                    self._orig_name,
+                )
+                index = index - step * symbol
         coords = compute_coordinates(
             self._orig_size, self._orig_stride, self._var_ranges, index
         )
-        return super().load(self._padded_name, self._padded_indexer(coords))
+        return super().load(self._padded_name, self._padded_indexer(coords) + loop_term)
 
 
 def _rebuild_matmul(
@@ -196,6 +263,7 @@ def _rebuild_matmul(
     y_stride = [concretize_expr(s) for s in y_layout.stride]
     padded_name = y_padded_buf.get_name()
     padded_indexer = y_padded_buf.get_layout().make_indexer()
+    y_padded_stride = [concretize_expr(s) for s in y_padded_buf.get_layout().stride]
 
     def new_inner_fn(
         index,
@@ -222,6 +290,7 @@ def _rebuild_matmul(
             padded_name,
             padded_indexer,
             var_ranges,
+            y_padded_stride,
         )
         with V.set_ops_handler(handler):
             return _orig_inner_fn(index, reduction_index)
@@ -275,22 +344,13 @@ def _refresh_loop_advance_for_padded_read(
             continue
         for level in squeezed[idx]:
             for pos, (step, extent) in enumerate(level):
-                # A size-one dim is never stepped, so it cannot own the step; its
-                # stride is arbitrary and would make a real match look ambiguous.
-                matches = [
-                    d
-                    for d, st in enumerate(old_stride)
-                    if st == step and old_size[d] > 1
-                ]
-                if len(matches) > 1:
-                    raise Unsupported(
-                        f"insert_bmm_padding: cannot tell which dim of "
-                        f"{y_buf.get_name()} the loop steps by {step} "
-                        f"(strides {old_stride}, sizes {old_size}); the padded "
-                        f"buffer's per-trip step would be wrong"
-                    )
-                if matches and new_stride[matches[0]] != step:
-                    level[pos] = (sympy.Integer(new_stride[matches[0]]), extent)
+                # The same rule the index uses (_PaddedLoadHandler), so the two
+                # sources of the advance cannot disagree until the record is gone.
+                new_step = restride_loop_step(
+                    step, old_size, old_stride, new_stride, y_buf.get_name()
+                )
+                if new_step != step:
+                    level[pos] = (new_step, extent)
                     changed = True
     if changed:
         op.loop_info = dataclasses.replace(info, squeezed_advance_per_read=squeezed)

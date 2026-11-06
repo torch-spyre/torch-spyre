@@ -35,9 +35,16 @@ What it pins:
   ``_rebase_point_splice_reads`` rewrites to ``0`` on purpose, because layout
   propagation rejects the loop variable. The allow-list is exact: a fifth
   disagreement fails.
-* a padded weight read (K = 67, tiled weight) does NOT agree today: padding drops
-  the loop term from the index and the record covers for it (#6049). That test is
-  a strict xfail and passes when the gap is fixed (stage 7.1).
+* a padded weight read (K = 67) agrees. Padding used to drop the loop term from
+  its index and let the stored record cover for it (#6049); it now keeps the term
+  at the padded buffer's stride. Three weights are covered because the stride a
+  padded read needs differs: a ``[K, N]`` weight tiled along N (padding K leaves
+  the step as it is), and per-expert ``[E, K, N]`` and ``[E, N, K]`` weights
+  (padding K changes the per-expert stride). The existing padding tests check
+  numerics, which the record keeps right, so they cannot see a wrong stride in the
+  index; this comparison can. The transposed ``[E, N, K]`` weight does not agree
+  yet: ``insert_restickify`` inserts a relayout copy after padding and moves the
+  advance onto it in the record only (#6051). A strict xfail until that is fixed.
 
 What it does not cover: a read that advances through a non-affine index term
 (``floor(u/2)``, ``Mod(u, 2)``). ``coeff`` reads those as 0, and no corpus graph
@@ -210,22 +217,58 @@ def _padded_weight_case(tile):
 
 
 @pytest.mark.parametrize("tile", [64, 128])
-def test_a_padded_weight_read_keeps_its_loop_term_in_the_index(request, tile):
-    strict_xfail(
-        request,
-        AssertionError,
-        "padding drops the loop term from a padded weight read's index and the "
-        "stored record covers for it; the kernel advance is floor(8192*s) at "
-        "tile 64 and floor(16384*s) at tile 128, the index gives 0 "
-        "(#6049, fixed by stage 7.1)",
-    )
+def test_a_padded_weight_read_keeps_its_loop_term_in_the_index(tile):
     fn, args = _padded_weight_case(tile)
     probe = _compile_and_probe(fn, args)
     differing = [r for r in probe.rows if not r[6]]
     assert not differing, [
         (r[0], r[1], r[2], r[3], str(r[4]), str(r[5])) for r in differing
     ]
-    assert any(r[4] != 0 for r in probe.rows)
+    # The comparison must not be vacuous: the padded weight read advances.
+    padded = [r for r in probe.rows if r[1] == "read" and r[4] != 0]
+    assert padded, "no advancing read: the padded weight read was not exercised"
+
+
+def _expert_weight_case(transposed):
+    """Per-expert weight with K = 67, tiled one expert per trip.
+
+    Padding K grows the per-expert stride (67 * 128 to 128 * 128), so the loop
+    term has to be re-strided: keeping the unpadded step walks the padded buffer
+    by the wrong amount (#5573)."""
+    e, m, k, n = 4, 64, 67, 128
+    g = torch.Generator().manual_seed(0)
+    x = (torch.randn(e, m, k, generator=g) * 0.1).half()
+    w_shape = (e, n, k) if transposed else (e, k, n)
+    w = (torch.randn(*w_shape, generator=g) * 0.1).half()
+
+    def fn(a, b):
+        def body(_, ops):
+            weight = ops[1].transpose(-1, -2) if transposed else ops[1]
+            return None, torch.matmul(ops[0], weight)
+
+        return for_each_tile(body, (a, b), dims=(0, 0), tile_size=1, out_dim=0)[1]
+
+    return fn, (x, w)
+
+
+@pytest.mark.parametrize("transposed", [False, True], ids=["E_K_N", "E_N_K"])
+def test_a_padded_expert_weight_read_is_restrided_in_the_index(request, transposed):
+    if transposed:
+        strict_xfail(
+            request,
+            AssertionError,
+            "insert_restickify inserts a relayout copy after padding and moves the "
+            "advance onto it in the record only: the copy's read advances "
+            "floor(64*s) with no loop term in its index, and the matmul keeps "
+            "16384*u0 on a read the kernel does not advance (#6051)",
+        )
+    fn, args = _expert_weight_case(transposed)
+    probe = _compile_and_probe(fn, args)
+    differing = [r for r in probe.rows if not r[6]]
+    assert not differing, [
+        (r[0], r[1], r[2], r[3], str(r[4]), str(r[5])) for r in differing
+    ]
+    assert any(r[1] == "read" and r[4] != 0 for r in probe.rows)
 
 
 def test_an_invariant_padded_weight_has_nothing_to_advance():
