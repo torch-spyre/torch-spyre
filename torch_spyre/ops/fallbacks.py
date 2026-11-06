@@ -232,10 +232,7 @@ def register_fallback_default(ops):
 
 register_fallback_default(
     [
-        aten.arange,
         aten.isin,
-        aten.tril,
-        aten.triu.out,
         aten.bitwise_xor.Tensor,
         aten.bitwise_xor.Tensor_out,
         aten.bitwise_or.Tensor,
