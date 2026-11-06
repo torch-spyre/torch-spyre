@@ -644,6 +644,15 @@ PYBIND11_MODULE(_C, m) {
   m.def("spyre_empty_with_layout", &spyre::spyre_empty_with_layout,
         py::arg("size"), py::arg("stride"), py::arg("dtype"),
         py::arg("device_layout"), py::arg("device") = py::none());
+  m.def("spyre_empty_reserved", &spyre::spyre_empty_reserved, py::arg("size"),
+        py::arg("stride"), py::arg("dtype"), py::arg("dim"),
+        py::arg("min_size"), py::arg("max_size"), py::arg("granularity"),
+        "Allocate a Spyre tensor whose physical layout/storage are sized "
+        "for dim `dim` == `max_size`, while its logical (PyTorch-visible) "
+        "size/stride stay at `size`/`stride`. `min_size`/`granularity` are "
+        "stored on the tensor for the runtime resize_ guard to check. "
+        "Backs tensor.to(\"spyre\", dynamic={dim: {min, max, "
+        "granularity}}).");
   m.def("empty_with_layout", &spyre::py_empty_with_layout);
   m.def("as_strided_with_layout", &spyre::as_strided_with_layout);
   m.def("reinterpret_tensor", &spyre::reinterpret_tensor);
@@ -687,6 +696,31 @@ PYBIND11_MODULE(_C, m) {
   m.def("set_spyre_tensor_layout", &spyre::set_spyre_tensor_layout);
   m.def("get_spyre_tensor_sizes", &spyre::get_spyre_tensor_sizes);
   m.def("get_spyre_tensor_strides", &spyre::get_spyre_tensor_strides);
+  m.def(
+      "get_reserved_dims",
+      [](const at::Tensor& tensor)
+          -> std::optional<std::map<int64_t, std::map<std::string, int64_t>>> {
+        // The dict-of-strings conversion lives here, at the Python
+        // boundary, rather than in spyre::get_reserved_dims itself -- a
+        // C++ caller of that function gets the typed ReservedDimInfo
+        // struct with compile-time field checking, not string lookups
+        // into a dict it has to spell correctly.
+        auto reserved = spyre::get_reserved_dims(tensor);
+        if (!reserved.has_value()) {
+          return std::nullopt;
+        }
+        std::map<int64_t, std::map<std::string, int64_t>> result;
+        for (const auto& [dim, info] : *reserved) {
+          result[dim] = {{"min", info.min},
+                         {"max", info.max},
+                         {"granularity", info.granularity}};
+        }
+        return result;
+      },
+      py::arg("tensor"),
+      "Return {dim: {'min', 'max', 'granularity'}} for a tensor.to("
+      "\"spyre\", dynamic=...) reservation, or None. Never raises, even "
+      "for a non-Spyre tensor.");
   m.def("get_downcast_warning", &spyre::get_downcast_warn_enabled,
         "Return whether downcast warnings are enabled.");
   m.def("set_downcast_warning", &spyre::set_downcast_warn_enabled,
@@ -715,6 +749,27 @@ PYBIND11_MODULE(_C, m) {
   m.def("copy_tensor", &spyre::spyre_copy_from,
         "Copy tensor between host and device using DMA", py::arg("self"),
         py::arg("dst"), py::arg("non_blocking") = false,
+        py::call_guard<py::gil_scoped_release>());
+
+  // Single KV page copy
+  m.def("copy_kv_page_raw", &spyre::copy_kv_page_raw,
+        "Copy one KV cache page between a shared pool slot and the device.\n\n"
+        "The copy is byte-exact (no dtype or layout conversion) and blocks "
+        "until the DMA finishes.\n\n"
+        "Args:\n"
+        "    cache: The full KV cache on Spyre, rank 4 and row-major, either "
+        "slot-major or head-major, with pages on dim 0 so that one page is a "
+        "contiguous range. Pass the whole cache, not a page view.\n"
+        "    block_id: Index of the page to copy.\n"
+        "    pool: Attached SharedPool that holds the slot. Don't detach it "
+        "from another thread while the copy runs.\n"
+        "    slot_id: Slot to copy to or from; flex rejects one past the "
+        "pool's slot_count. The caller decides which process uses which slot; "
+        "nothing here stops two processes from writing the same slot.\n"
+        "    to_device: True copies the slot into the page (H2D), False "
+        "copies the page into the slot (D2H).",
+        py::arg("cache"), py::arg("block_id"), py::arg("pool"),
+        py::arg("slot_id"), py::arg("to_device"),
         py::call_guard<py::gil_scoped_release>());
 
   // Device-side fill using FillDMA (no host buffer or H2D copy)

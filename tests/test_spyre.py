@@ -690,6 +690,23 @@ class TestSpyre(TestCase):
         b = a.to(device="spyre").add(2.0).to(device="cpu")
         self.assertEqual(b, a + 2)
 
+    # A plain .to("spyre").cpu() roundtrip cannot catch a byte-order bug: a raw DMA
+    # swaps the bytes in both directions and the swaps cancel. Each test below
+    # crosses the host/device boundary once with values the device produced or
+    # consumed, so a big-endian host that skips ConvertData fails it (#5864).
+    @parametrize("dtype", [torch.float16, torch.float32])
+    def test_cross_device_copy_d2h_device_fill(self, dtype):
+        out = torch.full((64,), 1.5, dtype=dtype, device="spyre").cpu()
+        torch.testing.assert_close(
+            out, torch.full((64,), 1.5, dtype=dtype), atol=0, rtol=0
+        )
+
+    @parametrize("dtype", [torch.float16, torch.float32])
+    def test_cross_device_copy_h2d_device_op(self, dtype):
+        x = torch.tensor([1.0, 2.0, 0.5, -7.25] * 16, dtype=dtype)
+        out = (x.to("spyre") + 1.0).cpu()
+        torch.testing.assert_close(out, x + 1.0, atol=0, rtol=0)
+
     def test_cross_device_copy_dtypes(self):
         dtype_configs = {
             torch.int8: lambda: (torch.rand(64, 64) * 100).to(dtype=torch.int8),

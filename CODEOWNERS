@@ -53,6 +53,10 @@
 # Documentation
 /docs/                   @kaoutar55 @dgrove-oss @tardieu @mudhakar @raghukiran1224 @viji560 @tehbone
 
+# Project-level coding agents
+/AGENTS.md               @ani300 @dgrove-oss @tardieu @mudhakar
+/.claude/                @ani300 @dgrove-oss @tardieu @mudhakar
+
 # CI/CD
 /.github/                 @ashokponkumar @jabostian @anubhavjana @n-marion
 /.pre-commit-config.yaml  @ashokponkumar @jabostian @anubhavjana @n-marion
@@ -62,9 +66,10 @@
 
 /extensions/clickhouse-ingest/  @ashokponkumar @jabostian @anubhavjana @n-marion
 
-# ktir-mlir-frontend pin and its installer.  Two files rather than /tools/, which
-# is otherwise CI's: which frontend revision the OpSpec->KTIR emitter is tested
-# against is a fact about /torch_spyre/_inductor/.
+# tools -- default tools owners
+/tools/                 @ani300 @dgrove-oss @tardieu @mudhakar
+
+# ktir-mlir-frontend pin and its installer.
 /tools/ktir-mlir-frontend.pin  @dgrove-oss @avery-blanchard @tardieu
 /tools/install-ktir.sh         @dgrove-oss @avery-blanchard @tardieu
 
