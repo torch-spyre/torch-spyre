@@ -489,7 +489,7 @@ def test_compute_size1_restickify_layout_indirect_access():
     # 1-D host tensor with 512 fp16 elements (8 sticks of 64).
     host_layout = FixedLayout(torch.device("spyre"), torch.float16, [512], [1])
     # dep.ranges is empty: tmp0 is an indirect symbol, not a loop variable.
-    dep = MemoryDep("x", tmp0, {}, (512,))
+    dep = MemoryDep("x", tmp0, (), ())
     stl = SpyreTensorLayout([8, 64], [64, 1], torch.float16, [0, 1])
     # Host coordinate for the single dim is the indirect symbol itself.
     ic = [tmp0]
