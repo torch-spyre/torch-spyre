@@ -42,9 +42,10 @@ What it pins:
   the step as it is), and per-expert ``[E, K, N]`` and ``[E, N, K]`` weights
   (padding K changes the per-expert stride). The existing padding tests check
   numerics, which the record keeps right, so they cannot see a wrong stride in the
-  index; this comparison can. The transposed ``[E, N, K]`` weight does not agree
-  yet: ``insert_restickify`` inserts a relayout copy after padding and moves the
-  advance onto it in the record only (#6051). A strict xfail until that is fixed.
+  index; this comparison can. The transposed ``[E, N, K]`` weight needed a second
+  fix: ``insert_restickify`` inserts a relayout copy after padding and used to move
+  the advance onto it in the record only (#6051). It now moves the loop term in the
+  index as well.
 
 What it does not cover: a read that advances through a non-affine index term
 (``floor(u/2)``, ``Mod(u, 2)``). ``coeff`` reads those as 0, and no corpus graph
@@ -68,7 +69,6 @@ from torch_spyre._inductor.views import tiling_expr_to_device_expr
 from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 
 from test_loop_advance import CORPUS
-from utils_inductor import strict_xfail
 
 
 class _Probe:
@@ -252,16 +252,7 @@ def _expert_weight_case(transposed):
 
 
 @pytest.mark.parametrize("transposed", [False, True], ids=["E_K_N", "E_N_K"])
-def test_a_padded_expert_weight_read_is_restrided_in_the_index(request, transposed):
-    if transposed:
-        strict_xfail(
-            request,
-            AssertionError,
-            "insert_restickify inserts a relayout copy after padding and moves the "
-            "advance onto it in the record only: the copy's read advances "
-            "floor(64*s) with no loop term in its index, and the matmul keeps "
-            "16384*u0 on a read the kernel does not advance (#6051)",
-        )
+def test_a_padded_expert_weight_read_is_restrided_in_the_index(transposed):
     fn, args = _expert_weight_case(transposed)
     probe = _compile_and_probe(fn, args)
     differing = [r for r in probe.rows if not r[6]]

@@ -30,7 +30,11 @@ from .loop_facts import counted_loop_path, enclosing_loops
 from .loop_info import ReadCopyElisionRecord
 from .optimize_restickify import AnyInNode, EdgeCostMap
 from .logging_utils import get_inductor_logger
-from .pass_utils import invalidate_op_read_writes, patch_env
+from .pass_utils import (
+    invalidate_op_read_writes,
+    loop_induction_symbols,
+    patch_env,
+)
 from torch._inductor.dependencies import MemoryDep, index_vars_squeeze
 from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.graph import GraphLowering
@@ -126,8 +130,14 @@ class InputEdgeSwapHandler(WrapperHandler):
     in dep.index, built positionally from inner_fn_args() at wrap time.
     """
 
-    def __init__(self, inner, swaps, name_map=None, index_replacements=None):
+    def __init__(
+        self, inner, swaps, name_map=None, index_replacements=None, moved_terms=None
+    ):
         super().__init__(inner)
+        # old buffer name -> loop term (coefficient * induction variable) that the
+        # restickify copy now carries. The consumer reads the new buffer at a
+        # fixed address, so a matched swap drops the term from its index.
+        self._moved_terms: dict = {} if moved_terms is None else moved_terms
         self._swaps_by_name: dict = defaultdict(list)
         for old_name, dep_index, occurrence, new_name in swaps:
             self._swaps_by_name[old_name].append((dep_index, occurrence, new_name))
@@ -181,7 +191,101 @@ class InputEdgeSwapHandler(WrapperHandler):
                 f"multiple targets {unique_targets}"
             )
             target = next(iter(unique_targets))
+        moved = self._moved_terms.get(name)
+        if moved is not None:
+            index = sympy.sympify(index) - moved
         return super().load(target, index)
+
+
+class _AddLoopTermHandler(WrapperHandler):
+    """Add a loop term to every load of ``name`` (the restickify copy's source)."""
+
+    def __init__(self, inner, name: str, term: sympy.Expr):
+        super().__init__(inner)
+        self._name = name
+        self._term = term
+
+    def load(self, name, index):
+        if name == self._name:
+            index = sympy.sympify(index) + self._term
+        return super().load(name, index)
+
+
+def _give_copy_the_loop_term(
+    restick_buff: ComputedBuffer,
+    consumer: ComputedBuffer,
+    source_name: str,
+    term: sympy.Expr,
+) -> None:
+    """Make the restickify copy read ``source_name`` at ``term`` more per trip.
+
+    A loop variable in an index is only understood by ``per_trip_index`` and
+    ``op_out_coords`` when the op declares it in ``dim_hints`` (a ``DimHint`` with
+    ``loop_var_range``); otherwise the kernel's coordinate computation raises
+    "indirect symbol not found". The copy gets the consumer's loop-variable hints.
+    """
+    loop_hints = [
+        hint
+        for hint in getattr(consumer, "dim_hints", None) or []
+        if getattr(hint, "loop_var_range", None) is not None
+    ]
+    if loop_hints:
+        restick_buff.dim_hints = [  # type: ignore[attr-defined]
+            *(getattr(restick_buff, "dim_hints", None) or []),
+            *loop_hints,
+        ]
+    original = restick_buff.data.inner_fn
+
+    def inner(*args, _original=original):
+        with V.set_ops_handler(_AddLoopTermHandler(V.ops, source_name, term)):
+            return _original(*args)
+
+    object.__setattr__(restick_buff.data, "inner_fn", inner)
+    invalidate_op_read_writes(restick_buff)
+
+
+def _moved_loop_term(
+    op: ComputedBuffer,
+    restick_arg_info: RestickifyArgInfo,
+    restick_buff: ComputedBuffer,
+    n_levels: int,
+    shared_loop_depth: int,
+) -> sympy.Expr | None:
+    """The loop term the restickify copy takes over from ``op``'s read, or None.
+
+    ``_transfer_loop_info`` hands the advance of the swapped read to the copy in
+    the record. The index must follow: the copy's read gains the term and the
+    consumer's read of the new buffer, which sits at a fixed address, loses it.
+
+    Only when every level of the consumer's loop transfers (``shared_loop_depth ==
+    n_levels``) is every loop term in the read the copy's, so no level-to-variable
+    mapping is needed. In any other shape the index is left as it was, which is
+    what happened before the index carried the advance.
+    """
+    consumer_li = getattr(op, "loop_info", None)
+    copy_li = getattr(restick_buff, "loop_info", None)
+    if consumer_li is None or copy_li is None or copy_li is consumer_li:
+        return None
+    if not n_levels or shared_loop_depth != n_levels:
+        return None
+    transferred = any(
+        any(level for level in per_read)
+        for per_read in [
+            *copy_li.tiled_dims_per_read,
+            *copy_li.squeezed_advance_per_read,
+        ]
+    )
+    if not transferred:
+        return None
+    deps = [d for d in op.get_read_writes().reads if isinstance(d, MemoryDep)]
+    dep_idx = _restickify_dep_index(deps, restick_arg_info)
+    if dep_idx is None:
+        return None
+    index = sympy.sympify(deps[dep_idx].index)
+    term = sympy.S.Zero
+    for symbol in loop_induction_symbols(index, set()):
+        term += index.coeff(symbol) * symbol
+    return term if term != 0 else None
 
 
 def _fixed_tiled(layout: FixedLayout, stl: SpyreTensorLayout) -> FixedTiledLayout:
@@ -317,7 +421,7 @@ def _create_restickify_node(
 #    ReadCopyElisionRecord, which redirect_computed_buffer_reads does not touch.
 
 
-def make_per_edge_inner_fn(orig_fn, swaps, name_map, canonical_args):
+def make_per_edge_inner_fn(orig_fn, swaps, name_map, canonical_args, moved_terms=None):
     """Wrap orig_fn with InputEdgeSwapHandler for per-edge load redirection.
 
     Builds index_replacements lazily at each call by mapping the live i*/r0_*
@@ -332,6 +436,7 @@ def make_per_edge_inner_fn(orig_fn, swaps, name_map, canonical_args):
         _map=name_map,
         _orig=orig_fn,
         _canonical=canonical_args,
+        _moved=moved_terms,
     ):
         assert len(args) == len(_canonical), (
             f"{_orig.__qualname__}: inner_fn argument cardinality changed: "
@@ -356,7 +461,7 @@ def make_per_edge_inner_fn(orig_fn, swaps, name_map, canonical_args):
                     f"{actual} -> {previous}, {canonical}"
                 )
         with V.set_ops_handler(
-            InputEdgeSwapHandler(V.ops, _swaps, _map, index_replacements)
+            InputEdgeSwapHandler(V.ops, _swaps, _map, index_replacements, _moved)
         ):
             return _orig(*args)
 
@@ -484,6 +589,7 @@ def insert_restickify_on_node_inputs(
     existing_record = getattr(op, "_read_copy_elision_record", None)
     edge_swaps: list[tuple] = []
     name_map: dict[str, str] = {}
+    moved_terms: dict[str, sympy.Expr] = {}
     try:
         op_index = operations.index(op)
     except ValueError:
@@ -526,6 +632,16 @@ def insert_restickify_on_node_inputs(
         _transfer_loop_info(
             restick_buff, old_name_buf, op, restick_arg_info, shared_loop_depth
         )
+        moved = _moved_loop_term(
+            op,
+            restick_arg_info,
+            restick_buff,
+            len(enclosing_loops(op)),
+            shared_loop_depth,
+        )
+        if moved is not None:
+            moved_terms[old_name] = moved
+            _give_copy_the_loop_term(restick_buff, op, old_name, moved)
 
         # A saved direct-read form can sit on an identity whose committed
         # layout is incompatible with its consumer.  The deferred restickify
@@ -564,7 +680,9 @@ def insert_restickify_on_node_inputs(
     object.__setattr__(
         op.data,
         "inner_fn",
-        make_per_edge_inner_fn(op.data.inner_fn, edge_swaps, name_map, canonical_args),
+        make_per_edge_inner_fn(
+            op.data.inner_fn, edge_swaps, name_map, canonical_args, moved_terms
+        ),
     )
     # op now reads the restickify buffers: an extraction memoized before this
     # (e.g. by optimize_restickify_locations) names the old inputs.
