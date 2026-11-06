@@ -365,17 +365,48 @@ def test_device_each_shard_is_in_its_own_chunk():
 
 
 @_requires_spyre
-def test_device_fill_fails_instead_of_writing_one_chunk(active_cores):
-    # TODO: positive once fills are shard-aware.
-    # fill_ takes one device address; the runtime guard rejects sharded
-    # storage. Compiled ops on sharded tensors are covered by
-    # test_sharded_add.py.
-    result = torch.spyre.to_sharded(torch.randn(16, 64), Shard(0))
+@pytest.mark.parametrize("num_shards", [8, 16])
+@pytest.mark.parametrize(
+    "dim, dtype",
+    [(0, torch.float32), (1, torch.float32), (0, torch.float16)],
+)
+@pytest.mark.parametrize("op", ["fill", "zero"])
+def test_device_fill_writes_every_shard(active_cores, num_shards, dim, dtype, op):
+    # fill_/zero_ fill each shard's own chunk, so every element of every
+    # shard changes and the result is still sharded with the same placement.
+    active_cores["cores"] = num_shards
+    shape = [num_shards * 4, 64]
+    shape[dim] = num_shards * 64
+    result = torch.spyre.to_sharded(_source(tuple(shape), dtype), Shard(dim))
+    before = torch.spyre.sharding_info(result)
 
-    with pytest.raises(
-        RuntimeError, match="does not support sharded Spyre tensors yet"
-    ):
-        result.fill_(0)
+    if op == "fill":
+        result.fill_(3)
+        expected = torch.full(tuple(shape), 3, dtype=dtype)
+    else:
+        result.zero_()
+        expected = torch.zeros(tuple(shape), dtype=dtype)
+
+    assert torch.equal(result.cpu(), expected)
+    assert torch.spyre.is_sharded(result)
+    after = torch.spyre.sharding_info(result)
+    assert (after.placement, after.num_shards, after.shard_device_bytes) == (
+        before.placement,
+        before.num_shards,
+        before.shard_device_bytes,
+    )
 
 
-test_device_fill_fails_instead_of_writing_one_chunk._expects_raise = True
+@_requires_spyre
+def test_device_fill_then_partial_copy_keeps_other_shards(active_cores):
+    # A fill followed by a copy into one shard: only that shard's rows move,
+    # so each shard was filled in its own chunk.
+    from torch_spyre import _C
+
+    result = torch.spyre.to_sharded(torch.randn(32, 64), Shard(0))
+    result.fill_(5.0)
+    replacement = torch.full((32, 64), 5.0)
+    replacement[12:16] = 7.0
+    _C.copy_tensor(replacement, result, non_blocking=False)
+
+    assert torch.equal(result.cpu(), replacement)
