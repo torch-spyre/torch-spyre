@@ -1632,6 +1632,8 @@ class ArgNameToIndexTracer(DefaultHandler):
         return inx2arg
 
     def _default(self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]):
+        if name in ("store", "store_reduction"):
+            return
         for argname, arg in kwargs.items():
             assert not isinstance(arg, ArgName), (
                 f"Can't determine order of kwargs. Found kwarg {argname}"
@@ -1650,15 +1652,6 @@ class ArgNameToIndexTracer(DefaultHandler):
     def load(self, name: str, index: sympy.Expr) -> ArgName:
         return ArgName(name)
 
-    def store(
-        self,
-        name: str,
-        index: sympy.Expr,
-        value: Set,
-        mode=None,
-    ) -> None:
-        pass
-
     def reduction(
         self,
         dtype: torch.dtype,
@@ -1671,9 +1664,6 @@ class ArgNameToIndexTracer(DefaultHandler):
         for i, v in enumerate(value):
             assert isinstance(v, ArgName)
             self.name2inx[v.name] = [i]
-
-    def store_reduction(self, name: str, index: sympy.Expr, value: Set) -> None:
-        pass
 
     def constant(self, value: Union[bool, float, int], dtype: torch.dtype):
         name = f"__const_{self.constant_counter}"

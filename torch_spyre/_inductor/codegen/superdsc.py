@@ -213,7 +213,7 @@ def _get_coordinate_mask(
     iteration_space: dict,
     arg: SDSCArgs,
     dim_padding: dict,
-    op: str = "",
+    op_spec: OpSpec,
     inputs: list[SDSCArgs] | None = None,
 ) -> dict:
     # Reduction path: mask the stick dim being reduced (scale == -2), so the
@@ -229,7 +229,7 @@ def _get_coordinate_mask(
     # inf / y == inf instead of 0. Worse, for some widths (e.g. 6 sticks) the
     # backend applies the mask to valid lanes and corrupts the result,
     # whatever the mask value. Unmasked, the valid lanes are correct.
-    mask_pointwise = all(
+    mask_pointwise = (not op_spec.is_reduction) and all(
         inp.scales.get(dim) == 1
         for inp in inputs or []
         for dim, padding in dim_padding.items()
@@ -2571,15 +2571,12 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         else {}
     )
     constants = dict(op_spec.op_info.get("constants", {})) if op_spec.op_info else {}
-    coordinate_masking = _get_coordinate_mask(
-        sdsc_iteration_space, args[-1], padding, op_spec.op, args[:-1]
-    )
     mask_value = op_spec.args[0].mask_value
     coordinate_masking = {}
     masking_const_id = -1
     if mask_value is not None:
         coordinate_masking = _get_coordinate_mask(
-            sdsc_iteration_space, args[-1], padding, op_spec.op, args[:-1]
+            sdsc_iteration_space, args[-1], padding, op_spec, args[:-1]
         )
         if coordinate_masking:
             # Constant ids follow insertion order, so capture the index here rather
