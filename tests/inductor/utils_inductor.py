@@ -91,6 +91,23 @@ def cached_randn(
 
 
 @functools.lru_cache(maxsize=None)
+def cached_randint(
+    shape,
+    differentiation=None,
+    low=0,
+    high=512,
+    dtype=torch.int32,
+):
+    """Return a cached integer tensor with the given shape and dtype.
+
+    Uses a stable seed derived from the arguments so results are identical
+    across processes regardless of PYTHONHASHSEED.
+    """
+    gen = _make_generator(shape, differentiation, low, high, dtype)
+    return torch.randint(low, high, shape, dtype=dtype, generator=gen)
+
+
+@functools.lru_cache(maxsize=None)
 def cached_xavier(
     shape,
     differentiation=None,
@@ -1061,8 +1078,8 @@ def capture_backend_output_dirs():
     output_dirs = []
     get_output_dir = async_compile_module.get_output_dir
 
-    def capture(kernel_name):
-        output_dir = get_output_dir(kernel_name)
+    def capture(kernel_name, sdsc_bundle_dir_prefix=None):
+        output_dir = get_output_dir(kernel_name, sdsc_bundle_dir_prefix)
         output_dirs.append(Path(output_dir))
         return output_dir
 
