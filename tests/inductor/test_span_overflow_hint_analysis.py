@@ -128,7 +128,7 @@ def rejects_nested_loops(test):
     @functools.wraps(test)
     def wrapper(self, *args, **kwargs):
         with self.assertRaisesRegex(
-            Exception, r"nested loop tiling is not supported.*#6088"
+            InductorError, r"nested loop tiling is not supported.*#6088"
         ):
             test(self, *args, **kwargs)
 
@@ -6787,7 +6787,7 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
                     # TODO(#6088): a two-level group is refused; this becomes a
                     # positive case when nested loops are supported.
                     with self.assertRaisesRegex(
-                        Exception, r"nested loop tiling is not supported.*#6088"
+                        InductorError, r"nested loop tiling is not supported.*#6088"
                     ):
                         self._assert_unit_tiling_matches_cpu(shape, levels)
                 else:
@@ -6821,7 +6821,7 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
                     # TODO(#6088): a two-level group is refused; this becomes a
                     # positive case when nested loops are supported.
                     with self.assertRaisesRegex(
-                        Exception, r"nested loop tiling is not supported.*#6088"
+                        InductorError, r"nested loop tiling is not supported.*#6088"
                     ):
                         self._assert_forced_tiling_matches_cpu(
                             lambda x: x.sum(dim=0), (x,), out_shape, levels
@@ -7594,8 +7594,10 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
         limit gives ``[4, 4]``); no one-level plan of this buffer has a tile count
         of 8 (measured: ``[4]`` at 512 KB, ``[2]`` from 1 MB). The nested loop is
         refused (#6088), so this regression has no coverage until that is fixed:
-        ``test_permuted_dims_tile_numeric_one_level`` covers the permuted buffer
-        at one level but not the coincidence.
+        ``test_span_overflow_gate.py::test_a_forced_one_level_plan_of_a_buffer_is_right``
+        covers the permuted buffer at 4 tiles, and
+        ``..._tiled_eight_ways_at_one_level_is_right`` (a strict xfail, #6093) the
+        coincidence at one level.
         """
         torch.manual_seed(0xAFFE)
         x = torch.randn(8, 8, 64, 512, dtype=torch.float16).permute(1, 0, 2, 3)
@@ -7612,38 +7614,6 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
             run_compile=True,
             run_eager=False,
             source_check=assert_tiled,
-            atol=0.05,
-            rtol=0.05,
-        )
-
-    @config.patch({"sencores": 4, "ignore_span_overflow_hints": False})
-    @patch(
-        "torch_spyre._inductor.wsr.span_overflow_hint_analysis.MAX_SPAN_BYTES",
-        512 * 1024,
-    )
-    def test_permuted_dims_tile_numeric_one_level(self):
-        """The permuted buffer of ``test_permuted_same_size_dims_tile_numeric`` at a
-        limit that tiles it with ONE level (4 tiles), so it is not refused.
-
-        It checks the permuted buffer's device layout is resized by its own
-        strides at a tile count that does not equal the size-8 dims. It does NOT
-        reproduce that test's coincidence (a tile count of 8), which needs two
-        levels (#6088)."""
-        torch.manual_seed(0xAFFE)
-        x = torch.randn(8, 8, 64, 512, dtype=torch.float16).permute(1, 0, 2, 3)
-
-        def fn(x):
-            return torch.abs(x) + 1
-
-        def assert_one_level(src):
-            self.assertEqual(src.count("LoopSpec("), 1)
-
-        compare_with_cpu(
-            fn,
-            x,
-            run_compile=True,
-            run_eager=False,
-            source_check=assert_one_level,
             atol=0.05,
             rtol=0.05,
         )

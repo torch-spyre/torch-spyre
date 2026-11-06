@@ -47,6 +47,7 @@ from unittest import mock
 import pytest
 import regex as re
 import torch
+from torch._inductor.exc import InductorError
 from torch._inductor.utils import run_and_get_code
 
 import torch_spyre  # noqa: F401  registers the "spyre" device
@@ -58,7 +59,7 @@ from torch_spyre._inductor.wsr import coarse_tile, span_overflow_hint_analysis
 from torch_spyre._inductor.wsr.coarse_tile import reject_nested_loops
 from torch_spyre.constants import DEVICE_NAME
 
-from utils_inductor import expects_raise
+from utils_inductor import expects_raise, strict_xfail
 
 MB = 1024 * 1024
 
@@ -274,12 +275,14 @@ def test_the_current_lowering_on_a_compiled_span_overflow_graph(case):
     assert _relative_error(compiled.outputs, reference) < 2e-2
 
 
-@pytest.mark.parametrize(
-    "case", ["pointwise_copy_out", "matmul_k_tiled", "matmul_pointwise_consumer"]
-)
+@pytest.mark.parametrize("case", sorted(CASES))
 def test_the_generated_code_is_deterministic_after_normalising(case):
     """A comparison against a new lowering is only worth anything if two compiles
-    of the same graph agree."""
+    of the same graph agree. Every case, in one process; for five of them
+    (a copy-out, a K-tiled matmul, a joined group, an output-tiled matmul and an
+    independent pair) two separate processes also gave identical text, which this
+    does not repeat: a spurious difference from a token the normaliser misses
+    would show up here as a failure."""
     fn, shapes, limit, _, _ = CASES[case]
     args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
     first = compile_span_overflow(fn, args, limit)
@@ -296,7 +299,9 @@ def test_a_two_level_group_is_rejected():
     two-level group; the case compiled before the rejection and matched fp32 to
     4e-3."""
     args = [_shaped((4096, 4096), seed) for seed in range(2)]
-    with pytest.raises(Exception, match=r"nested loop tiling is not supported.*#6088"):
+    with pytest.raises(
+        InductorError, match=r"nested loop tiling is not supported.*#6088"
+    ):
         compile_span_overflow(lambda a, b: a @ b, args, 8 * MB)
 
 
@@ -325,7 +330,7 @@ REJECTED = {
 def test_an_unsupported_graph_is_rejected(case):
     fn, shapes, limit, message = REJECTED[case]
     args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
-    with pytest.raises(Exception, match=message):
+    with pytest.raises(InductorError, match=message):
         compile_span_overflow(fn, args, limit)
 
 
@@ -359,22 +364,66 @@ def test_one_nested_group_among_flat_ones_is_still_found():
         reject_nested_loops([(flat, [(0, 2)]), (nested, [(1, 2), (2, 2), (3, 2)])], "x")
 
 
-def test_the_allocator_search_is_bounded_to_one_level():
+def test_the_allocator_asks_the_enumerator_for_one_level_only():
     """The SA co-optimizer raises rather than falls back when the apply refuses a
     tiling, so the search must not offer one the lowering will refuse (#6088).
 
-    This is a structural check, not a behavioural one: the two places the
-    allocator asks the enumerator for tilings sit behind ``auto_coarse_tiling`` and
-    solver selection on a fully built allocator, so reaching them needs more
-    stubbing than it is worth. What it does catch is the realistic regression, a
-    new enumerator call without the bound. The enumerator itself is tested in
+    Calls the allocator's two real entry points, ``_tiling_candidates`` (the menu)
+    and ``_division_space`` (the solver's tiling space), on a stand-in ``self``, with
+    the enumerator mocked, and checks the ``max_dims`` each one passes. The
+    enumerator's own behaviour at ``max_dims=1`` is tested in
     ``test_enumerate_tilings.test_max_dims_one_gives_no_nested_specs``."""
+    from types import SimpleNamespace
+
+    from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
+    from torch_spyre._inductor.scratchpad.plan_solver import TileSpec
+    from torch_spyre._inductor.wsr import enumerate_tilings
+
+    calls = []
+
+    def fake_options(op, **kwargs):
+        calls.append(("enumerate_tile_options", kwargs.get("max_dims")))
+        return [TileSpec()]
+
+    def fake_space(op, **kwargs):
+        calls.append(("build_tiling_space", kwargs.get("max_dims")))
+        return None
+
+    op = SimpleNamespace(
+        loop_info=None, get_operation_name=lambda: "buf0", get_name=lambda: "buf0"
+    )
+    allocator = SimpleNamespace(
+        _tilings_from_menu=True,
+        _prescribed_ops=(),
+        _readers_by_name={},
+        _get_op_name=lambda o: "pointwise",
+        _solver_chooses_tilings=True,
+    )
+    with (
+        config.patch({"auto_coarse_tiling": True}),
+        mock.patch.object(enumerate_tilings, "enumerate_tile_options", fake_options),
+        mock.patch.object(enumerate_tilings, "build_tiling_space", fake_space),
+    ):
+        CoOptimizingAllocator._tiling_candidates(allocator, op, 4)
+        CoOptimizingAllocator._division_space(allocator, op)
+
+    assert MAX_SEARCH_TILE_DEPTH == 1
+    assert calls == [
+        ("enumerate_tile_options", MAX_SEARCH_TILE_DEPTH),
+        ("build_tiling_space", MAX_SEARCH_TILE_DEPTH),
+    ], calls
+
+
+def test_no_third_enumerator_call_in_the_allocator_escapes_the_bound():
+    """The test above covers the two known call sites. This is the structural
+    backstop for a new one: every call to the enumerator in ``allocator.py`` must
+    pass ``max_dims=MAX_SEARCH_TILE_DEPTH``. (``enumerate_tilings.py`` calls itself
+    with the bound it was given, and the allocator is its only other caller.)"""
     import ast
     import inspect
 
     from torch_spyre._inductor.scratchpad import allocator
 
-    assert MAX_SEARCH_TILE_DEPTH == 1
     tree = ast.parse(inspect.getsource(allocator))
     calls = [
         node
@@ -389,20 +438,109 @@ def test_the_allocator_search_is_bounded_to_one_level():
         assert bound == "MAX_SEARCH_TILE_DEPTH", ast.unparse(call)
 
 
-def test_a_nested_for_each_tile_loop_is_not_affected():
-    """for_each_tile builds its own nests and never reaches the rejection. Run one
-    with span-overflow on: it must still compile and be right."""
+@pytest.mark.parametrize("limit", [256 * 1024, 16 * 1024], ids=["256KB", "16KB"])
+def test_a_nested_for_each_tile_loop_is_not_affected(limit):
+    """for_each_tile builds its own nests and never reaches the rejection.
+
+    ``span_overflow_groups`` skips an op that carries ``dim_hints``, which the
+    ``for_each_tile`` lowering stamps, so no group forms over a loop body however
+    low the limit goes (16 KB tempts it to tile everything: each tensor here is
+    128 KB or less). The test checks that directly: no group formed, so there was
+    nothing for ``reject_nested_loops`` to refuse, and the nest is intact and right.
+
+    The 256 KB case is a control (nothing overflows). The 16 KB case is the one
+    with power: with that skip removed the planner groups the loop body and the
+    compile fails with "group (1,) would overwrite the existing loop_info of
+    while_loop_body_graph_0_0_op5"."""
     from for_each_tile_fixtures import nested_split_m_then_k_fn
 
     x = _shaped((256, 256), 0)
     y = _shaped((256, 64), 1)
-    reference = x.float() @ y.float()
+    compiled = compile_span_overflow(nested_split_m_then_k_fn, [x, y], limit)
+    assert compiled.groups == [], compiled.groups
+    assert _relative_error(compiled.outputs, x.float() @ y.float()) < 2e-2
+    # still two nested loops: the nest the for_each_tile lowering built is intact
+    assert compiled.code.count("LoopSpec(") >= 2, compiled.code.count("LoopSpec(")
+
+
+def _forced_one_level(shape, levels, make_input):
+    """Compile ``abs(x) + 1`` with the span-overflow plan forced to ``levels``.
+
+    Reads the generated code directly: ``compare_with_cpu``'s ``source_check`` is
+    never called (it compares ``device == "spyre"`` where ``device`` is a
+    ``torch.device``, which is ``False``), so a check passed there asserts nothing.
+    Returns ``(fraction of elements more than 0.05 from fp32, loop count, trip
+    counts)``. A wrong layout puts whole tiles in the wrong place, so the
+    max-normalised error of the other helpers is misleading here."""
+    from test_span_overflow_hint_analysis import _forced_span_plan
+
+    torch.manual_seed(0xAFFE)
+    x = make_input()
+    reference = torch.abs(x.float()) + 1
     torch._dynamo.reset()
     with (
-        config.patch({"ignore_span_overflow_hints": False}),
+        mock.patch(
+            "torch_spyre._inductor.wsr.coarse_tile_span_overflow."
+            "plan_span_overflow_tile",
+            _forced_span_plan(shape, levels),
+        ),
+        config.patch({"sencores": 4, "ignore_span_overflow_hints": False}),
         torch._inductor.config.patch(force_disable_caches=True),
     ):
-        out = torch.compile(
-            nested_split_m_then_k_fn, backend="inductor", fullgraph=True
-        )(x.to(DEVICE_NAME), y.to(DEVICE_NAME))
-    assert _relative_error((out.cpu().float(),), reference) < 2e-2
+        compiled = torch.compile(
+            lambda x: torch.abs(x) + 1, backend="inductor", fullgraph=True
+        )
+        out, code = run_and_get_code(compiled, x.to(DEVICE_NAME))
+    source = "\n".join(code)
+    counts = sorted({int(c) for c in re.findall(r"count=sympify\('(\d+)'\)", source)})
+    wrong = ((out.cpu().float() - reference).abs() > 0.05).float().mean().item()
+    return wrong, source.count("LoopSpec("), counts
+
+
+_PERMUTE_SHAPE = (8, 8, 64, 512)
+
+
+def _plain():
+    return torch.randn(*_PERMUTE_SHAPE, dtype=torch.float16)
+
+
+def _permuted():
+    return torch.randn(*_PERMUTE_SHAPE, dtype=torch.float16).permute(1, 0, 2, 3)
+
+
+@pytest.mark.parametrize(
+    "make_input, levels, trips",
+    [
+        (_plain, [(0, 8)], [8]),
+        (_plain, [(1, 8)], [8]),
+        (_permuted, [(0, 4)], [4]),
+    ],
+    ids=["plain_8_dim0", "plain_8_dim1", "permuted_4_dim0"],
+)
+def test_a_forced_one_level_plan_of_a_buffer_is_right(make_input, levels, trips):
+    """Controls for the permuted test below: the forced plan is applied (one loop
+    with the forced trip count, read from the generated code) and the result is
+    right for a plain buffer at 8 tiles and for the permuted buffer at 4."""
+    wrong, loops, counts = _forced_one_level(_PERMUTE_SHAPE, levels, make_input)
+    assert (loops, counts) == (1, trips), (loops, counts)
+    assert wrong == 0.0, wrong
+
+
+@pytest.mark.parametrize("dim", [0, 1])
+def test_a_permuted_buffer_tiled_eight_ways_at_one_level_is_right(request, dim):
+    """The stride coincidence of ``test_permuted_same_size_dims_tile_numeric``: the
+    tile count equals the size of the two leading dims. Reached with one level when
+    the plan is forced (the planner picks ``[4, 4]``, which is right and is that
+    test, refused today because it nests). The result is wrong, not just misplaced:
+    the sorted values differ from the expected ones. How wrong depends on the
+    measure (about 98% of the elements differ by more than 0.05 here, and a
+    different probe of the same plan counted far fewer), so this asserts none."""
+    strict_xfail(
+        request,
+        AssertionError,
+        "a permuted buffer tiled 8 ways at one level returns wrong values: the "
+        "result differs from fp32 and is not a rearrangement of it (#6093)",
+    )
+    wrong, loops, counts = _forced_one_level(_PERMUTE_SHAPE, [(dim, 8)], _permuted)
+    assert (loops, counts) == (1, [8]), (loops, counts)
+    assert wrong == 0.0, wrong

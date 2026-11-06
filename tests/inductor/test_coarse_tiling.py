@@ -131,6 +131,7 @@ from torch_spyre._inductor.wsr.tile import (
     compute_tile_stride,
 )
 from utils_inductor import (
+    expects_raise,
     ir_computed_buffer,
     ir_input_loader,
     patch_tiling_helper,
@@ -9701,6 +9702,7 @@ class TestApplyTilingsEquivalence(unittest.TestCase):
         c0 = sympy.Symbol("c0")
         self.assertEqual(got.symbols_on_tile, {c0: c0})
 
+    @expects_raise
     def test_nested_two_level_is_refused_by_apply_tilings(self):
         """The transform still takes a two-level group (the direct call below, and
         the other direct tests); ``apply_tilings`` refuses one, because the
@@ -9724,8 +9726,6 @@ class TestApplyTilingsEquivalence(unittest.TestCase):
             apply_tilings(
                 {"op0": TileSpec((TileAxis(0, 4), TileAxis(1, 2)))}, _graph([got])
             )
-
-    test_nested_two_level_is_refused_by_apply_tilings._expects_raise = True
 
     def test_two_equal_spec_runs_become_two_groups_with_distinct_hint_ids(self):
         spec = TileSpec((TileAxis(0, 4),))
