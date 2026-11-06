@@ -1265,6 +1265,13 @@ def insert_run(client, run_id: str, run: dict, args):
     )
 
 
+def _count_rows(client, sql: str, params: dict) -> int:
+    """Row count for a v1 insert's scope. Another writer sharing the scope makes a failed
+    batch look kept, which fails safe as BatchAmbiguous; case ids cannot narrow it (fresh
+    uuids, and a 35k-id list exceeds http_max_field_value_size)."""
+    return int(client.query(sql, parameters=params).result_rows[0][0])
+
+
 def insert_cases(client, run_id: str, cases: list[dict], workflow: str = ""):
     if not cases:
         return
@@ -1300,10 +1307,11 @@ def insert_cases(client, run_id: str, cases: list[dict], workflow: str = ""):
             "triggered_at",
             "workflow",
         ],
-        already_landed=lambda: client.query(
+        already_landed=lambda: _count_rows(
+            client,
             "SELECT count() FROM test_cases WHERE run_id = {r:String} AND workflow = {w:String}",
-            parameters={"r": run_id, "w": workflow},
-        ).result_rows[0][0],
+            {"r": run_id, "w": workflow},
+        ),
     )
 
 
@@ -1340,10 +1348,11 @@ def insert_properties(client, run_id: str, cases: list[dict]):
                 "prop_value",
                 "triggered_at",
             ],
-            already_landed=lambda: client.query(
+            already_landed=lambda: _count_rows(
+                client,
                 "SELECT count() FROM run_properties WHERE run_id = {r:String}",
-                parameters={"r": run_id},
-            ).result_rows[0][0],
+                {"r": run_id},
+            ),
         )
 
 

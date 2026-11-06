@@ -158,13 +158,17 @@ class RunWriter:
         """Write the unknown identities and every fact row; returns the row count.
 
         `scope` is (where, params) naming this call's rows, so a batch that errors is only
-        resent when none of it was stored (the fact tables are plain MergeTree).
+        resent when none of it was stored (the fact tables are plain MergeTree). Without a
+        scope a failed batch is not resent.
         """
         cls.identity_table.insert_identities(client, ident_rows, db=db)
         landed = None
         if scope:
             where, params = scope
-            landed = lambda: cls.fact_table.count_rows(client, db, where, params)  # noqa: E731
+
+            def landed() -> int:
+                return cls.fact_table.count_rows(client, db, where, params)
+
         cls.fact_table.insert(client, fact_rows, db=db, landed=landed)
         return len(fact_rows)
 

@@ -17,7 +17,7 @@
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, TypedDict
 
-from .batching import insert_chunks
+from spyre_clickhouse_ingest.batching import insert_chunks
 
 # The DDL's CHECK constraints, re-expressed: unreadable from the server at ingest
 # time. Keep in step with schema/10-functional-tests.sql and schema/20-artifacts.sql.
@@ -149,6 +149,9 @@ class Table:
     enums: tuple[tuple[str, frozenset[str]], ...] = ()
     # id column for cross-run identity dedup; None for fact tables, which append freely.
     identity: str | None = None
+    # True for a ReplacingMergeTree whose sort key a resent row repeats: a blind retry of a
+    # failed batch collapses on merge. Plain MergeTree and SummingMergeTree tables stay False.
+    idempotent: bool = False
     # The TypedDict shape a caller should build for this table -- checked by mypy/the editor,
     # never at runtime; `row()` below is still what actually validates a row.
     Row: type = dict
@@ -203,6 +206,7 @@ class Table:
             list(cls.columns),
             database=db or None,
             already_landed=landed,
+            idempotent=cls.idempotent,
         )
 
     @classmethod
@@ -466,6 +470,7 @@ class ArtifactRefRow(TypedDict):
 class ArtifactRefs(Table):
     """How a consumer obtains an artifact, and the address that takes."""
 
+    idempotent = True
     name = "artifact_refs"
     columns = (
         "artifact_id",
@@ -550,6 +555,7 @@ class ArtifactResultReasonRow(TypedDict):
 class ArtifactResultReasons(Table):
     """Why a verdict did not pass, written after the verdict itself; one row per source."""
 
+    idempotent = True
     name = "artifact_result_reasons"
     columns = (
         "artifact_id",
@@ -580,6 +586,8 @@ class PipelineRuns(Table):
     Jenkins rows arrive as JSONEachRow from vars/pushToClickhouse.groovy; this model is the
     shape the gha_runs poller writes through.
     """
+
+    idempotent = True
 
     name = "pipeline_runs"
     columns = (
@@ -643,6 +651,8 @@ class CiRunTimings(Table):
     columns. `leg` and every `*_ms` are MATERIALIZED in the DDL, so they are not modelled here:
     the server derives them and ignores a value a writer supplies.
     """
+
+    idempotent = True
 
     name = "ci_run_timings"
     columns = (
@@ -726,6 +736,7 @@ class CiRunTimings(Table):
 class ArtifactSubscriptions(Table):
     """Who an artifact triggers; one row per version, the newest updated_at wins."""
 
+    idempotent = True
     name = "artifact_subscriptions"
     columns = (
         "subscription_id",
@@ -766,6 +777,7 @@ class ArtifactSubscriptions(Table):
 class RbacRoles(Table):
     """A named set of '<resource>:<action>' permissions; the newest updated_at wins."""
 
+    idempotent = True
     name = "rbac_roles"
     columns = (
         "role_id",
@@ -782,6 +794,7 @@ class RbacRoles(Table):
 class RbacBindings(Table):
     """A role given to a user or OpenShift group, limited to a scope; the newest updated_at wins."""
 
+    idempotent = True
     name = "rbac_bindings"
     columns = (
         "binding_id",
@@ -823,6 +836,7 @@ class DispatchRequests(Table):
 class ArtifactDispatches(Table):
     """One dispatch, upserted on every state change; written only by the dispatcher."""
 
+    idempotent = True
     name = "artifact_dispatches"
     columns = (
         "dispatch_id",

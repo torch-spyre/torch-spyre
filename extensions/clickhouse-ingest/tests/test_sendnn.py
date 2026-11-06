@@ -190,19 +190,13 @@ def test_a_retry_after_a_lost_verdict_completes_the_upload(
     ch = CapturingClient()
     real_insert = ch.insert
 
-    from spyre_clickhouse_ingest import batching
-
-    ch.lost = 0
-
     def lose_first_verdict(table, rows, **kw):
-        # Lost on every in-process retry of the first run, so only a re-run can land it.
-        if table == "artifact_results" and ch.lost < batching.ATTEMPTS:
-            ch.lost += 1
+        if table == "artifact_results" and not getattr(ch, "lost", False):
+            ch.lost = True
             raise ConnectionError("verdict insert dropped")
         real_insert(table, rows, **kw)
 
     ch.insert = lose_first_verdict
-    monkeypatch.setattr(batching.time, "sleep", lambda s: None)
     monkeypatch.setattr(client.ClickHouse, "connect", lambda **kw: ch)
     monkeypatch.setattr(client, "tables_present", lambda *a, **kw: True)
     monkeypatch.setattr(
