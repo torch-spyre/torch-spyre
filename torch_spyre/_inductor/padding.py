@@ -1172,7 +1172,7 @@ def _user_values():
     return values
 
 
-class DomainRangeTracer(DefaultHandler):
+class DomainRangeSolver(DefaultHandler):
     """
     Validates input set and propagate to image.
 
@@ -1189,18 +1189,7 @@ class DomainRangeTracer(DefaultHandler):
     functions it's trivial to return the image of {0}.
     """
 
-    name = "DomainRangeTracer"
-
     def __init__(self):
-        super().__init__()
-        self.current_op: ComputedBuffer | None = None
-        # buffer name -> output set
-        self.buffer_range = dict[str, Set]()
-        # Same as buffer_range, but reset for each op to account
-        # for slicing
-        self.current_reads = dict[str, Set]()
-        # op name -> (arg name -> adjusted )
-        self.buffer_input = dict[str, dict[str, Set]]()
         self.non_zero_reals = S.Reals - FiniteSet(0)
         self.positive_numbers = Interval(0, sympy.oo)
         self.booleans = FiniteSet(0, 1)
@@ -1210,10 +1199,6 @@ class DomainRangeTracer(DefaultHandler):
         self.extended_strictly_positive_numbers = self.strictly_positive_numbers.union(
             FiniteSet(oo)
         )
-
-    def start_op(self, op):
-        self.current_op = op
-        self.current_reads = {}
 
     def constant(self, value: Union[bool, float, int], dtype: torch.dtype) -> Set:
         return FiniteSet(value)
@@ -1230,36 +1215,6 @@ class DomainRangeTracer(DefaultHandler):
         if not zero == x:
             raise InvalidDomain(zero, "indirect_indexing")
         return sympy.Symbol("dummy")
-
-    def load(self, name: str, index: sympy.Expr) -> Set:
-        assert self.current_op is not None
-
-        padding_range = None
-        if (overwrites := self.buffer_input.get(self.current_op.name)) is not None:
-            if (val := overwrites.get(name)) is not None:
-                padding_range = val
-        else:
-            self.buffer_input[self.current_op.name] = {}
-
-        if padding_range is None:
-            padding_range = self.current_reads.get(name)
-        if padding_range is None:
-            current_op_name = (
-                self.current_op.name if self.current_op is not None else None
-            )
-            raise ValueError(
-                f"Expected range of buffer {name} to be known. Current op is {current_op_name}"
-            )
-        return padding_range
-
-    def store(
-        self,
-        name: str,
-        index: sympy.Expr,
-        value: Set,
-        mode=None,
-    ) -> None:
-        self.buffer_range[name] = value
 
     def reduction(
         self,
@@ -1287,9 +1242,6 @@ class DomainRangeTracer(DefaultHandler):
                     raise InvalidDomain(required_padding, reduction_type, arg_index)
             # other reductions can leave some garbage in padding
             return S.Reals
-
-    def store_reduction(self, name: str, index: sympy.Expr, value: Set) -> None:
-        self.buffer_range[name] = value
 
     # only valid for monotonic functions
     def _unary_op(self, op, x0, fallback_set=None) -> Set:
@@ -1505,6 +1457,256 @@ class DomainRangeTracer(DefaultHandler):
 
 
 @dataclasses.dataclass(frozen=True)
+class PaddingDecision:
+    # The value of the output padding, of the tensor has padding
+    output_padding: float | None
+    # True if the op supports masking and the input needs fixing
+    do_mask: bool
+    # True if the op doesn't support masking and the input needs fixing
+    do_overwrite: bool
+    # The value to set the input padding to with masking or overwriting
+    input_vals: dict[str, float]
+
+
+class DomainRangeTracer(DomainRangeSolver):
+    """
+    Traces through a graph to infer and correct the state of padding.
+
+    Each graph node has to be fed to the tracer in topological order.
+    For each node, it will validate the operands, verify if they
+    need padding correction and compute output padding if any.
+    """
+
+    name = "DomainRangeTracer"
+
+    def __init__(self, graph: GraphLowering):
+        super().__init__()
+        self.current_op: ComputedBuffer | None = None
+        # buffer name -> output set
+        self.buffer_range = dict[str, Set]()
+        # Same as buffer_range, but reset for each op to account
+        # for slicing
+        self.current_reads = dict[str, Set]()
+        # op name -> (arg name -> adjusted )
+        self.buffer_input = dict[str, dict[str, Set]]()
+        self.graph = graph
+
+    def start_op(self, op):
+        self.current_op = op
+        self.current_reads = {}
+
+    def load(self, name: str, index: sympy.Expr) -> Set:
+        assert self.current_op is not None
+
+        padding_range = None
+        if (overwrites := self.buffer_input.get(self.current_op.name)) is not None:
+            if (val := overwrites.get(name)) is not None:
+                padding_range = val
+        else:
+            self.buffer_input[self.current_op.name] = {}
+
+        if padding_range is None:
+            padding_range = self.current_reads.get(name)
+        if padding_range is None:
+            current_op_name = (
+                self.current_op.name if self.current_op is not None else None
+            )
+            raise ValueError(
+                f"Expected range of buffer {name} to be known. Current op is {current_op_name}"
+            )
+        return padding_range
+
+    def store(
+        self,
+        name: str,
+        index: sympy.Expr,
+        value: Set,
+        mode=None,
+    ) -> None:
+        self.buffer_range[name] = value
+
+    def store_reduction(self, name: str, index: sympy.Expr, value: Set) -> None:
+        self.buffer_range[name] = value
+
+    def run_node(self, op: Operation) -> PaddingDecision:
+        self.start_op(op)
+        padded = is_padded(self.graph, op)
+
+        input_buffers, any_input_padded = self.handle_operands(op, padded)
+
+        if isinstance(op, InputsKernel):
+            self.handle_graph_input(op, padded)
+            return PaddingDecision(None, False, False, {})
+
+        if padded or any_input_padded:
+            # Even if the output of this op is not padded, we need to run
+            # the input validation if there are padded inputs
+            do_coord_mask, do_pad = self.trace_op(op, input_buffers)
+        else:
+            do_coord_mask = do_pad = False
+
+        if not padded:
+            self.buffer_range[op.name] = EmptySet
+
+        overwrites = {}
+        output_padding = None
+
+        if do_coord_mask or do_pad:
+            pad_set = self.buffer_range[op.name]
+            if padded:
+                # set the propagated output padding
+                output_padding = float(pick_element(pad_set))
+
+            for arg_name, pad_set in self.buffer_input[op.name].items():
+                overwrites[arg_name] = float(pick_element(pad_set))
+
+        return PaddingDecision(output_padding, do_coord_mask, do_pad, overwrites)
+
+    def handle_graph_input(self, op, padded):
+        if not padded:
+            self.buffer_range[op.name] = EmptySet
+            return
+        if isinstance(op, SpyreConstantFallback):
+            self.buffer_range[op.name] = FiniteSet(op.constant_args[0])
+            return
+
+        for _class, pad in _ASSUMED_PADDING.items():
+            if isinstance(op, _class):
+                self.buffer_range[op.name] = pad
+                break
+        else:
+            raise ValueError(f"Couldn't find entry for {op} in _ASSUMED_PADDING")
+
+    def handle_operands(
+        self, op: Operation, padded: bool
+    ) -> tuple[dict[str, Buffer], bool]:
+        reads = op.get_read_writes().reads
+        input_buffers = dict[str, Buffer]()
+        any_input_padded = False
+        for dep in reads:
+            buf = self.graph.get_buffer(dep.name)
+            while isinstance(buf, MutableBox):
+                buf = buf.data
+            stl = _get_stl(self.graph, buf)
+            buf_is_padded = is_padded(self.graph, buf) if stl is not None else False
+            if isinstance(buf, InputBuffer):
+                if dep.name not in self.buffer_range:
+                    if is_spyre_layout(buf.layout):
+                        assert stl is not None
+                        # Seed from the padding the input held before the graph,
+                        # once: after a mutation the range is what that left.
+                        self.buffer_range[dep.name] = (
+                            _input_padding_range(stl) if buf_is_padded else EmptySet
+                        )
+                    else:
+                        # other device buffers are not padded
+                        self.buffer_range[dep.name] = EmptySet
+            else:
+                assert dep.name in self.buffer_range, (
+                    f"Nodes seen out of order, expected {dep.name} to have been visited"
+                )
+            self.current_reads[dep.name] = self.buffer_range[dep.name]
+            input_buffers[dep.name] = buf
+            if stl is None:
+                continue
+
+            # The read is a slice when it touches fewer elements than the
+            # buffer holds. Compare host numels, both in the graph's size
+            # symbols (valid_elements is concrete even when the sizes are
+            # dynamic, so it cannot be compared with a symbolic read). A
+            # read not proven to cover the buffer counts as a slice.
+            is_sliced = not V.graph.sizevars.statically_known_geq(
+                dep.get_numel(), V.graph.get_numel(dep.name)
+            )
+
+            # If the output is padded and there is slicing on the input it means
+            # that the if there is slicing along the stiock dim, valid values
+            # from the input can end up in the output padding
+            # TODO: refine analysis to exclude non-stick slicing cases
+            if padded and is_sliced:
+                self.current_reads[dep.name] = self.current_reads[dep.name].union(
+                    _user_values()
+                )
+                buf_is_padded = True
+            any_input_padded = any_input_padded or buf_is_padded
+        return input_buffers, any_input_padded
+
+    def trace_op(self, op, input_buffers: dict[str, Buffer]) -> tuple[bool, bool]:
+        index2arg = inx2arg(op)
+        do_coord_mask = False
+        do_pad = False
+        # Fixed point loop until we can either allow the inputs to pass unmodified or
+        # find a suitable padding. So the max iteration count is 1 for the
+        # first try and 1 retry for each argument
+        for i in range(1 + len(input_buffers)):
+            try:
+                _call_innner(op)
+                break
+            except InvalidDomain as inv_domain:
+                name = index2arg[inv_domain.arg_index]
+                buf = input_buffers[name]
+                if can_coord_mask(inv_domain.func, buf.layout.dtype):
+                    do_coord_mask = True
+                    # For now this is true for all operations that are padded
+                    if op.layout.dtype in (torch.float16, torch.bfloat16):
+                        self.buffer_range[op.name] = FiniteSet(0)
+                    else:
+                        self.buffer_range[op.name] = Interval(0, 1e-2)
+                else:
+                    do_pad = True
+
+                try:
+                    pad_value = get_or_pick_pad_value(inv_domain, buf.layout.dtype)
+                    self.buffer_input[op.name][name] = FiniteSet(pad_value)
+                except ValueError:
+                    raise ValueError(
+                        f"Could not find legal pad for input {name} of {op.name}:{inv_domain.func}"
+                    )
+        else:
+            raise ValueError(f"Could not find an input padding that op {op.name}")
+        return do_coord_mask, do_pad
+
+    def handle_mutation_output(self, op):
+        if isinstance(op, ComputedBuffer) and isinstance(
+            op.layout, MutationLayoutSHOULDREMOVE
+        ):
+            target = op.layout.target
+            while isinstance(target, (MutableBox, ReinterpretView)):
+                target = target.data
+            target_name = target.maybe_get_name()
+            if target_name is not None:
+                target_is_padded = is_padded(self.graph, target)
+                # Seed a mutated input with its padding from before the graph,
+                # unless an earlier mutation already set what it holds now.
+                if (
+                    isinstance(target, InputBuffer)
+                    and target_name not in self.buffer_range
+                ):
+                    self.buffer_range[target_name] = (
+                        _input_padding_range(_get_stl(self.graph, target))
+                        if target_is_padded
+                        else EmptySet
+                    )
+
+                assert target_name in self.buffer_range, (
+                    f"Mutation buffer {op} seen before the buffer it mutates {target_name}"
+                )
+
+                if not target_is_padded:
+                    self.buffer_range[target_name] = EmptySet
+                    return
+
+                # If we're here it means that the target is padded.
+                # Without deeper analysis we don't know if the values written into the
+                # destination padding come from source padding or valid elements.
+                # Set the resulting padding to all possible inputs united with
+                # what could be in the mutation source buffer padding.
+                user_data = _user_values()
+                pad_set = self.buffer_range[op.name]
+                self.buffer_range[target_name] = user_data.union(pad_set)
+
+
+@dataclasses.dataclass(frozen=True)
 class SetDtype:
     set: Set
     dtype: torch.dtype | None
@@ -1669,6 +1871,13 @@ class ArgNameToIndexTracer(DefaultHandler):
         name = f"__const_{self.constant_counter}"
         self.constant_counter += 1
         return ArgName(name)
+
+
+def inx2arg(op: ComputedBuffer):
+    arg_pos_tracer = ArgNameToIndexTracer()
+    with V.set_ops_handler(arg_pos_tracer):
+        _call_innner(op)
+    return arg_pos_tracer.get_inx2arg()
 
 
 # NOTE: the mask value is a large finite negative, not -inf. encode_constant()
@@ -1902,157 +2111,17 @@ def get_or_pick_pad_value(inv_domain: InvalidDomain, dtype: torch.dtype):
 
 def track_padding_value(graph: GraphLowering) -> None:
     operations = graph.operations
-    tracer = DomainRangeTracer()
+    tracer = DomainRangeTracer(graph)
 
     with V.set_ops_handler(SetDtypeTracer(tracer)):
         for op in list(operations):
-            tracer.start_op(op)
-            padded = is_padded(graph, op)
-
-            reads = op.get_read_writes().reads
-            input_buffers = dict[str, Buffer]()
-            any_input_padded = False
-            for dep in reads:
-                buf = graph.get_buffer(dep.name)
-                while isinstance(buf, MutableBox):
-                    buf = buf.data
-                stl = _get_stl(graph, buf)
-                buf_is_padded = is_padded(graph, buf) if stl is not None else False
-                if isinstance(buf, InputBuffer):
-                    if dep.name not in tracer.buffer_range:
-                        if is_spyre_layout(buf.layout):
-                            assert stl is not None
-                            # Seed from the padding the input held before the graph,
-                            # once: after a mutation the range is what that left.
-                            tracer.buffer_range[dep.name] = (
-                                _input_padding_range(stl) if buf_is_padded else EmptySet
-                            )
-                        else:
-                            # other device buffers are not padded
-                            tracer.buffer_range[dep.name] = EmptySet
-                else:
-                    assert dep.name in tracer.buffer_range, (
-                        f"Nodes seen out of order, expected {dep.name} to have been visited"
-                    )
-                tracer.current_reads[dep.name] = tracer.buffer_range[dep.name]
-                input_buffers[dep.name] = buf
-                if stl is None:
-                    continue
-
-                # The read is a slice when it touches fewer elements than the
-                # buffer holds. Compare host numels, both in the graph's size
-                # symbols (valid_elements is concrete even when the sizes are
-                # dynamic, so it cannot be compared with a symbolic read). A
-                # read not proven to cover the buffer counts as a slice.
-                is_sliced = not V.graph.sizevars.statically_known_geq(
-                    dep.get_numel(), V.graph.get_numel(dep.name)
-                )
-
-                # If the output is padded and there is slicing on the input it means
-                # that the if there is slicing along the stiock dim, valid values
-                # from the input can end up in the output padding
-                # TODO: refine analysis to exclude non-stick slicing cases
-                if padded and is_sliced:
-                    tracer.current_reads[dep.name] = tracer.current_reads[
-                        dep.name
-                    ].union(_user_values())
-                    buf_is_padded = True
-                any_input_padded = any_input_padded or buf_is_padded
-
-            if isinstance(op, ComputedBuffer) and isinstance(
-                op.layout, MutationLayoutSHOULDREMOVE
-            ):
-                target = op.layout.target
-                while isinstance(target, (MutableBox, ReinterpretView)):
-                    target = target.data
-                target_name = target.maybe_get_name()
-                # Seed a mutated input with its padding from before the graph,
-                # unless an earlier mutation already set what it holds now.
-                if (
-                    target_name is not None
-                    and isinstance(target, InputBuffer)
-                    and target_name not in tracer.buffer_range
-                ):
-                    target_layout = _get_stl(graph, target)
-                    tracer.buffer_range[target_name] = (
-                        _input_padding_range(target_layout)
-                        if target_layout is not None and is_padded(graph, target)
-                        else EmptySet
-                    )
-
-            if isinstance(op, InputsKernel):
-                if not padded:
-                    tracer.buffer_range[op.name] = EmptySet
-                    continue
-                if isinstance(op, SpyreConstantFallback):
-                    tracer.buffer_range[op.name] = FiniteSet(op.constant_args[0])
-                    continue
-
-                for _class, pad in _ASSUMED_PADDING.items():
-                    if isinstance(op, _class):
-                        tracer.buffer_range[op.name] = pad
-                        break
-                else:
-                    raise ValueError(
-                        f"Couldn't find entry for {op} in _ASSUMED_PADDING"
-                    )
-                continue
-
-            arg_pos_tracer = ArgNameToIndexTracer()
-            with V.set_ops_handler(arg_pos_tracer):
-                _call_innner(op)
-            index2arg = arg_pos_tracer.get_inx2arg()
-
-            do_coord_mask = False
-            do_pad = False
-            # Fixed point loop until we can either allow the inputs to pass unmodified or
-            # find a suitable padding. So the max iteration count is 1 for the
-            # first try and 1 retry for each argument
-            for i in range(1 + len(input_buffers)):
-                # Even if the output of this op is not padded, we need to run
-                # the input validation if there are padded inputs
-                if not padded and not any_input_padded:
-                    break
-                try:
-                    _call_innner(op)
-                    break
-                except InvalidDomain as inv_domain:
-                    name = index2arg[inv_domain.arg_index]
-                    buf = input_buffers[name]
-                    if can_coord_mask(inv_domain.func, buf.layout.dtype):
-                        do_coord_mask = True
-                        # For now this is true for all operations that are padded
-                        if op.layout.dtype in (torch.float16, torch.bfloat16):
-                            tracer.buffer_range[op.name] = FiniteSet(0)
-                        else:
-                            tracer.buffer_range[op.name] = Interval(0, 1e-2)
-                    else:
-                        do_pad = True
-
-                    try:
-                        pad_value = get_or_pick_pad_value(inv_domain, buf.layout.dtype)
-                        tracer.buffer_input[op.name][name] = FiniteSet(pad_value)
-                    except ValueError:
-                        raise ValueError(
-                            f"Could not find legal pad for input {name} of {op.name}:{inv_domain.func}"
-                        )
-            else:
-                raise ValueError(f"Could not find an input padding that op {op.name}")
-
-            if not padded:
-                tracer.buffer_range[op.name] = EmptySet
-
-            if do_coord_mask:
-                pad_set = tracer.buffer_range[op.name]
-                if padded:
+            decision = tracer.run_node(op)
+            if decision.do_mask:
+                if decision.output_padding is not None:
                     # set the propagated output padding
-                    op.layout.device_layout.padding_value = float(pick_element(pad_set))
-
-                op.input_mask_values = dict[str, float]()
-                for arg_name, pad_set in tracer.buffer_input[op.name].items():
-                    op.input_mask_values[arg_name] = float(pick_element(pad_set))
-
-            if do_pad:
+                    op.layout.device_layout.padding_value = decision.output_padding
+                op.input_mask_values = decision.input_vals
+            elif decision.do_overwrite:
                 # TODO: if coord masking is not available, the padding must be overwritten.
                 # For now there are no passes to do that, so we log a warning
                 logger.warning(
@@ -2061,30 +2130,7 @@ def track_padding_value(graph: GraphLowering) -> None:
                     op.get_operation_name(),
                 )
 
-            if isinstance(op, ComputedBuffer) and isinstance(
-                op.layout, MutationLayoutSHOULDREMOVE
-            ):
-                target = op.layout.target
-                while isinstance(target, (MutableBox, ReinterpretView)):
-                    target = target.data
-                target_name = target.maybe_get_name()
-                if target_name is not None:
-                    assert target_name in tracer.buffer_range, (
-                        f"Mutation buffer {op} seen before the buffer it mutates {target_name}"
-                    )
-
-                    if not is_padded(graph, target):
-                        tracer.buffer_range[target_name] = EmptySet
-                        continue
-
-                    # If we're here it means that the target is padded.
-                    # Without deeper analysis we don't know if the values written into the
-                    # destination padding come from source padding or valid elements.
-                    # Set the resulting padding to all possible inputs united with
-                    # what could be in the mutation source buffer padding.
-                    user_data = _user_values()
-                    pad_set = tracer.buffer_range[op.name]
-                    tracer.buffer_range[target_name] = user_data.union(pad_set)
+            tracer.handle_mutation_output(op)
 
     _record_mutated_input_padding(graph, tracer)
 
