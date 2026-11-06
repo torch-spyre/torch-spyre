@@ -1001,7 +1001,7 @@ def _lower_pool2d(
 
     ``padding`` is symmetric per axis and is NOT materialized: ``x`` stays
     unpadded in HBM and the backend fills the LX pad lanes on chip (codegen
-    emits ``padded_nozeropad`` + lx ``isZeroPadded``).  
+    emits ``padded_nozeropad`` + lx ``isZeroPadded``).
 
     Returns ``None`` if the kernel is degenerate along either axis (``k == 1``),
     letting the caller delegate to an in-tree lowering: ``op`` is a *windowed*
