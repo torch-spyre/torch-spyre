@@ -629,6 +629,66 @@ def register_inplace_kernels(ops):
 register_inplace_kernels(COMPILED_OPS)
 
 
+def _check_index_copy_args(
+    self: torch.Tensor, dim: int, index: torch.Tensor, source: torch.Tensor
+) -> None:
+    """Validate ``index_copy`` / ``index_copy_`` arguments, allowing an int32 index.
+
+    ``index_copy`` and ``index_copy_`` are structured-delegate ops: PyTorch runs
+    the op's meta function and then calls ``index_copy.out``. That meta function
+    accepts only an int64 index. Spyre has no int64 and its kernels take int32
+    (``index_copy(out=)`` and the compiled path already do), so the two
+    overloads below skip the delegate and call the ``index_copy.out`` kernel
+    directly. That leaves the other checks to run here.
+
+    The index dtype and the self/source dtype are checked explicitly. The rest
+    (dim range, index rank, index/source size match) runs on meta tensors with
+    an int64 stand-in for ``index``, so the errors are PyTorch's own. Meta
+    tensors have no storage, so nothing is allocated or moved. The self/source
+    dtype check cannot be left to the meta call: it lives in PyTorch's CPU
+    kernel, so a meta ``index_copy`` accepts a mismatch.
+    """
+    if index.dtype not in (torch.int32, torch.int64):
+        raise RuntimeError(
+            "index_copy_(): Expected an int32 or int64 tensor for index, "
+            f"but got {index.dtype}"
+        )
+    if self.dtype != source.dtype:
+        raise RuntimeError(
+            "index_copy_(): self and source expected to have the same dtype, "
+            f"but got (self) {self.dtype} and (source) {source.dtype}"
+        )
+    meta = torch.device("meta")
+    torch.index_copy(
+        torch.empty(self.shape, dtype=self.dtype, device=meta),
+        dim,
+        torch.empty(index.shape, dtype=torch.int64, device=meta),
+        torch.empty(source.shape, dtype=source.dtype, device=meta),
+    )
+
+
+# NOTE: do not also add ``aten.index_copy`` to ``COMPILED_OPS``.
+# ``register_inplace_kernels`` would then register ``aten::index_copy_`` a second
+# time, and its functional-plus-``copy_`` form would copy the whole destination
+# (a KV cache) on every in-place update.
+@torch.library.register_kernel("aten::index_copy_", ["spyre"])  # type:ignore
+def spyre_index_copy_(
+    self: torch.Tensor, dim: int, index: torch.Tensor, source: torch.Tensor
+) -> torch.Tensor:
+    _check_index_copy_args(self, dim, index, source)
+    # Same call PyTorch's own in-place wrapper makes: ``out`` aliases ``self``.
+    aten.index_copy.out(self, dim, index, source, out=self)
+    return self
+
+
+@torch.library.register_kernel("aten::index_copy", ["spyre"])  # type:ignore
+def spyre_index_copy(
+    self: torch.Tensor, dim: int, index: torch.Tensor, source: torch.Tensor
+) -> torch.Tensor:
+    _check_index_copy_args(self, dim, index, source)
+    return aten.index_copy.out(self, dim, index, source, out=torch.empty_like(self))
+
+
 @torch.library.register_kernel("aten::fill_.Scalar", ["spyre"])  # type:ignore
 def spyre__fill_scalar(
     self: torch.Tensor, other: int | float | bool | complex
