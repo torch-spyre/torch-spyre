@@ -261,6 +261,52 @@ class TestSpyreTensorLayout(TestCase):
         s = {x, y, z}
         self.assertEqual(len(s), 2)
 
+    def test_equals_ignoring_valid_elements(self):
+        geometry = ([4, 512, 64], [64, 256, 1], get_device_dtype(torch.float16))
+        populated = SpyreTensorLayout(*geometry, {(0, 2): 256, (1,): 512})
+        padded = SpyreTensorLayout(*geometry, {(0, 2): 200, (1,): 7})
+        unknown = SpyreTensorLayout(*geometry, {})
+
+        # Without this the assertions below would hold vacuously.
+        self.assertNotEqual(populated.valid_elements, padded.valid_elements)
+        self.assertEqual(unknown.valid_elements, {})
+
+        self.assertTrue(populated.equals_ignoring_valid_elements(populated))
+        for name, other in [("padded", padded), ("unknown", unknown)]:
+            with self.subTest(other=name):
+                self.assertTrue(populated.equals_ignoring_valid_elements(other))
+                self.assertTrue(other.equals_ignoring_valid_elements(populated))
+
+    def test_equals_ignoring_valid_elements_compares_everything_else(self):
+        valid_elements = {(0, 2): 256, (1,): 512}
+        fp16 = get_device_dtype(torch.float16)
+        base = SpyreTensorLayout([4, 512, 64], [64, 256, 1], fp16, valid_elements)
+        differs = {
+            "device_size": SpyreTensorLayout(
+                [8, 512, 64], [64, 256, 1], fp16, valid_elements
+            ),
+            "stride_map": SpyreTensorLayout(
+                [4, 512, 64], [256, 64, 1], fp16, valid_elements
+            ),
+            "device_dtype": SpyreTensorLayout(
+                [4, 512, 64],
+                [64, 256, 1],
+                get_device_dtype(torch.float32),
+                valid_elements,
+            ),
+            "element_arrangement": SpyreTensorLayout(
+                [4, 512, 64],
+                [64, 256, 1],
+                fp16,
+                valid_elements,
+                ElementArrangement.EXX2,
+            ),
+        }
+        for field, other in differs.items():
+            with self.subTest(field=field):
+                self.assertFalse(base.equals_ignoring_valid_elements(other))
+                self.assertFalse(other.equals_ignoring_valid_elements(base))
+
     def test_stl_pickleable(self):
         stl = SpyreTensorLayout(
             [512, 256],
