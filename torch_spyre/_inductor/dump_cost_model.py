@@ -26,6 +26,7 @@ from .cost_features import (
     _resolved_work_slices as _resolved_work_slices,
     _cores as _cores,
     _replication as _replication,
+    _partitions as _partitions,
     _real_layout as _real_layout,
     _mem_of_layout as _mem_of_layout,
     _device_dims as _device_dims,
@@ -60,7 +61,6 @@ from .cost_features import (
     _unit_stride_stick_var as _unit_stride_stick_var,
     _indirect_write_elems as _indirect_write_elems,
     _relayout_logger as _relayout_logger,
-    _has_partitioning_candidate as _has_partitioning_candidate,
     extract_op_features as extract_op_features,
     extract_features as extract_features,
 )
