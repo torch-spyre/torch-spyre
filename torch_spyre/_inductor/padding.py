@@ -1193,7 +1193,7 @@ class DomainRangeTracer(DefaultHandler):
 
     def __init__(self):
         super().__init__()
-        self.current_op: str | None = None
+        self.current_op: ComputedBuffer | None = None
         # buffer name -> output set
         self.buffer_range = dict[str, Set]()
         # Same as buffer_range, but reset for each op to account
@@ -1202,13 +1202,18 @@ class DomainRangeTracer(DefaultHandler):
         # op name -> (arg name -> adjusted )
         self.buffer_input = dict[str, dict[str, Set]]()
         self.non_zero_reals = S.Reals - FiniteSet(0)
-        self.extended_non_zero_reals = self.non_zero_reals.union(FiniteSet(-oo, oo))
         self.positive_numbers = Interval(0, sympy.oo)
-        self.strictly_positive_numbers = Interval(0, sympy.oo, left_open=True)
-        self.extended_strictly_positive_numbers = self.strictly_positive_numbers.union(
-            FiniteSet(-oo, oo)
-        )
         self.booleans = FiniteSet(0, 1)
+        self.strictly_positive_numbers = Interval(0, sympy.oo, left_open=True)
+        # -oo and oo are always the open-ended limits of an interval in sympy
+        self.extended_non_zero_reals = self.non_zero_reals.union(FiniteSet(-oo, oo))
+        self.extended_strictly_positive_numbers = self.strictly_positive_numbers.union(
+            FiniteSet(oo)
+        )
+
+    def start_op(self, op):
+        self.current_op = op
+        self.current_reads = {}
 
     def constant(self, value: Union[bool, float, int], dtype: torch.dtype) -> Set:
         return FiniteSet(value)
@@ -1395,7 +1400,7 @@ class DomainRangeTracer(DefaultHandler):
     def log(self, x0):
         if not x0.is_subset(self.extended_strictly_positive_numbers):
             raise InvalidDomain(self.extended_strictly_positive_numbers, "log")
-        return S.Reals
+        return self._unary_op(math.log, x0, S.Reals)
 
     def le(self, x0, x1):
         return self._singleton_set_binary(operator.le, x0, x1, self.booleans)
@@ -1900,7 +1905,7 @@ def track_padding_value(graph: GraphLowering) -> None:
 
     with V.set_ops_handler(SetDtypeTracer(tracer)):
         for op in list(operations):
-            tracer.current_op = op
+            tracer.start_op(op)
             padded = is_padded(graph, op)
 
             reads = op.get_read_writes().reads
