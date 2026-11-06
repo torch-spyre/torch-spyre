@@ -52,11 +52,15 @@ def _symbolic_arg(sk: SymbolKind, arg_offset: int) -> SymbolicArg:
         # it, which is the tensor's LOGICAL size along that dim. Under a
         # max-strided reservation (#5179) that is deliberately smaller than the
         # allocated extent, and reading the allocated one would run the maximum
-        # number of trips on every call while appearing to work.
+        # number of trips on every call while appearing to work. The declared
+        # contract rides along so the launch can refuse a size the bundle was
+        # not built for.
         return SymbolicArg(
             kind=SymbolicArgKind.kDimension,
             tensor_id=sk.arg_index + arg_offset,
             dim_index=sk.dim_index,
+            granularity=sk.granularity,
+            max_value=sk.max_value,
         )
     return SymbolicArg(
         kind=SymbolicArgKind.kAddress, tensor_id=sk.arg_index + arg_offset

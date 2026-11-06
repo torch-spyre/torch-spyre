@@ -107,6 +107,15 @@ class TestADimensionSlotNamesATensorAndADim(unittest.TestCase):
 
         self.assertEqual(payload[1].dim_index, 2)
 
+    def test_the_declared_contract_rides_with_the_slot(self):
+        """Granularity and maximum travel in the descriptor so the launch can
+        refuse a size the bundle was not built for. An address slot carries
+        neither."""
+        (addr, dim) = _payload([SymbolKind.kernel(0), _loop_dim()])
+
+        self.assertEqual((dim.granularity, dim.max_value), (TILE, MAX))
+        self.assertEqual((addr.granularity, addr.max_value), (-1, -1))
+
     def test_a_pool_shifts_the_dimension_slot_too(self):
         """The offset applies to every kernel-indexed slot, not only addresses.
 
