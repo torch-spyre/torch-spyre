@@ -4422,6 +4422,9 @@ def arange_start_decomp(
     )
 
 
+# Bytes in one stick, whatever the element type.
+_STICK_BYTES = 128
+
 # Block edge a mask is tiled from, per element type: the largest integer that
 # type holds exactly, since the comparison reads coordinates as values and a
 # wider block lands the kept/dropped boundary a column off the diagonal.
@@ -4632,7 +4635,10 @@ def _build_mask(
     of the view fuses into the consuming op, so the slice becomes loop bounds
     rather than a copy.
     """
-    stick = get_elem_in_stick(dtype)
+    # Not get_elem_in_stick: an eager call compiles this decomposition with
+    # Dynamo, which cannot trace the extension function and would break the
+    # graph here.  Every served compute type has a whole-byte element.
+    stick = _STICK_BYTES // dtype.itemsize
     padded_cols = ((cols + stick - 1) // stick) * stick
     if max(rows, padded_cols) <= _TRIANGULAR_BLOCK[dtype]:
         # Within one block the comparison is already exact, so keep the single
