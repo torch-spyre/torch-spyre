@@ -154,7 +154,15 @@ def get_op_hints(op: Operation) -> dict[int, dict[str, Any]]:
     custom = None
     for fx_node in getattr(op, "origins", ()):
         c = (fx_node.meta or {}).get("custom") or {}
-        if c:
+        # Not just non-empty: a non-hint annotation (e.g.
+        # _SCAN_SNAPSHOT_SEQ_KEY on a for_each_tile body's while_loop origin)
+        # is also non-empty custom meta and can precede a real _hint_N entry
+        # on a later origin in iteration order -- confirmed on
+        # spyre-inference's page_attn_head_major_prefill_kernel, where that
+        # stopped the scan before it ever reached the K/V gather's own
+        # index/squeeze/unsqueeze origins, silently dropping a hint that
+        # traced onto those nodes correctly.
+        if c and any(_HINT_RE.match(k) for k in c):
             custom = c
             break
     if not custom:
