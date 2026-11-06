@@ -3794,6 +3794,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # the device, as in LFM2's causal conv. The compare runs on CPU, so the
         # Spyre int -> float promotion must not be applied to it.
         ("test_cmp_host_operand", "test_cmp_host_operand_cpu"): {
+            # TODO: a host tensor inside a Spyre graph is out of scope; this test
+            # and the host-side branches it covers go in #6068.
+            "expect_raise": dict.fromkeys(
+                ["fp16_1x64x64"], "arange on cpu inside a Spyre graph"
+            ),
             "ops_dict": {
                 "eq": torch.eq,
                 "ne": torch.ne,
@@ -3816,11 +3821,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "clamp_min": torch.clamp_min,
                 "clamp_max": torch.clamp_max,
             },
-            # TODO: the clamped int64 mask converts to fp16 on device, which makes
-            # it staggered, and it does not broadcast at the stick dim, so its
-            # product with the STANDARD fp16 operand is rejected as mixed EA.
+            # TODO: a host tensor inside a Spyre graph is out of scope; this test
+            # and the host-side branches it covers go in #6068.
             "expect_raise": {
-                "fp16_1x64x64": "Multi-arg pointwise with mixed EA",
+                "fp16_1x64x64": "arange on cpu inside a Spyre graph",
             },
             "param_sets": {
                 "fp16_1x64x64": (cached_randn((1, 64, 64)),),
