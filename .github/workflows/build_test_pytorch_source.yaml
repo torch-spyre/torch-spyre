@@ -296,6 +296,8 @@ jobs:
       # must also grant `actions: write`.
       actions: write
       id-token: write
+      # Needed by the "Open or update issues for failed tests" step.
+      issues: write
     env:
       CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST_DEV }}
       CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT_DEV }}
@@ -546,6 +548,31 @@ jobs:
           path: xml_artifacts/**/*.xml
           if-no-files-found: warn
           retention-days: 30
+
+      # Files one issue per failure bucket (inductor / profiler / nn / optim /
+      # eager-ops), tagging that bucket's maintainers, and de-duplicates across
+      # runs: an unfixed regression re-fails on every CRCR dispatch, so an open
+      # issue is reused and only commented on for NEW failures. Non-blocking.
+      - name: Open or update issues for failed tests
+        if: always() && steps.test_results.outcome == 'success'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PYTORCH_SHA: ${{ inputs.pytorch_sha }}
+          MATRIX_RUN_ID: ${{ steps.dispatch.outputs.run_id }}
+        run: |
+          MATRIX_URL=""
+          [[ -n "$MATRIX_RUN_ID" ]] && MATRIX_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${MATRIX_RUN_ID}"
+          uv run --with regex \
+            torch-spyre/.github/scripts/report_test_failures_issue.py \
+            --xml-dir xml_artifacts \
+            --codeowners torch-spyre/CODEOWNERS \
+            --repo "${{ github.repository }}" \
+            --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --matrix-run-url "${MATRIX_URL}" \
+            --pytorch-sha "${PYTORCH_SHA}" \
+            --torch-spyre-sha "${{ github.sha }}" \
+            --report-artifact "upstream-beta-reports-${PYTORCH_SHA}"
 
       # Only a genuine 'success' when tests actually ran (total > 0) -- a
       # build/test job that reports 'success' without collecting any tests
