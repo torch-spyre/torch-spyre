@@ -608,13 +608,21 @@ def _compute_coordinates_uncached(
         repeat_info_out.update(repeat_info)
 
     # Filter out variables that are not iteration variables of this operation
-    # (e.g. outer while-loop offsets or dynamic size symbols).
+    # (e.g. outer while-loop offsets or dynamic size symbols), and variables
+    # with a trivial range (<= 1), which can only take the value 0.  For
+    # symbolic ranges we cannot tell, so they are kept.
     vars_in_index = index.free_symbols
-    vars_to_zero = {
-        s
-        for s in vars_in_index
-        if s not in var_ranges and (indirect_sizes is None or s not in indirect_sizes)
-    }
+    vars_to_zero = set()
+    for s in vars_in_index:
+        if s in var_ranges:
+            range_val = var_ranges[s]
+        elif indirect_sizes is not None and s in indirect_sizes:
+            range_val = indirect_sizes[s]
+        else:
+            vars_to_zero.add(s)
+            continue
+        if _is_concrete_int(range_val) and int(range_val) <= 1:
+            vars_to_zero.add(s)
     if vars_to_zero:
         index = index.xreplace({s: 0 for s in vars_to_zero})
 
