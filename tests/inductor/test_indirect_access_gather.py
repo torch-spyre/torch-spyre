@@ -328,6 +328,76 @@ class _GatherScenarios:
             lambda x, i: torch.index_select(x, 0, i), x, i, expect=GATHER_OP_SPEC
         )
 
+    def test_index_select_fp8_e4m3(self):
+        """FP8 (torch.float8_e4m3fn) gather via index_select (#4710, #4711).
+
+        The gather lowers to an identity copy with IndirectAccess on the input,
+        which create_op_spec allows for every dtype, so no SPYRE_FP8_OPS entry
+        is needed. N=256 is two 128-element FP8 sticks per row; check() asserts
+        that the indexed dim ends up outermost in the FP8 source's device
+        coordinates. Small integers are exact in E4M3, so the e2e compare is
+        exact.
+        """
+        M, N, P = 128, 256, 32
+        dtype = torch.float8_e4m3fn
+        x = self.to_spyre(torch.randint(-10, 10, (M, N)).float().to(dtype))
+        i = torch.randint(0, M, (P,), dtype=torch.int32).to("spyre")
+        self.name_dims(x, {"M": M, "N": N})
+        self.name_dims(i, {"P": P})
+        self._stage_and_e2e(
+            lambda x, i: torch.index_select(x, 0, i), x, i, expect=GATHER_OP_SPEC
+        )
+
+    def test_index_select_fp8_e4m3_paged_kv_cache(self):
+        """FP8 page gather from a paged KV cache via index_select (#4711).
+
+        Mirrors the paged-attention page read k_pages.index_select(0, page_idx):
+        pages [num_pages, block=64, kv_heads=8, head_dim=128] in FP8 (head_dim is
+        one 128-element FP8 stick), gathered by 32 unique page ids. The pages
+        come from the host, so they are in STANDARD element order; see
+        test_index_select_fp8_qfp8ch_source for pages quantized on device.
+        """
+        NP, BLK, KVH, HD, P = 64, 64, 8, 128, 32
+        dtype = torch.float8_e4m3fn
+        pages = torch.randint(-10, 10, (NP, BLK, KVH, HD)).float().to(dtype)
+        pages = self.to_spyre(pages)
+        idx = torch.randperm(NP)[:P].to(torch.int32).to("spyre")
+        self.name_dims(pages, {"NP": NP, "BLK": BLK, "KVH": KVH, "HD": HD})
+        self.name_dims(idx, {"P": P})
+        self._stage_and_e2e(
+            lambda k, i: torch.index_select(k, 0, i), pages, idx, expect=GATHER_OP_SPEC
+        )
+
+    def test_index_select_fp8_qfp8ch_source(self):
+        """Device round trip: qfp8ch quantize, index_select, dequantize (#4711).
+
+        Pins the read path attention uses today with pages quantized on device:
+        the values that come back after dequantize are exact.
+
+        This does not show that the gather keeps the QFP8CH arrangement. It
+        does not: the gather writes the QFP8CH bytes unchanged under a STANDARD
+        tag, and fp8todl16 assumes QFP8CH order for any FP8 input, so the two
+        cancel here. A STANDARD FP8 tensor from the host dequantizes wrongly,
+        with or without a gather (#QFP8CH_ISSUE). Inputs are small integers and
+        the scale is 1.0, so quantize and dequantize are exact.
+        """
+        NP, BLK, KVH, HD, P = 64, 64, 8, 128, 32
+        x = torch.randint(-10, 10, (NP, BLK, KVH, HD)).to(torch.float16)
+        scale = torch.tensor([1.0], dtype=torch.float16)
+        idx = torch.randperm(NP)[:P].to(torch.int32)
+
+        def kernel(x, scale, idx):
+            q = torch.ops.spyre.quantize_fp8_with_scale(x, scale)
+            g = torch.index_select(q, 0, idx)
+            return torch.ops.spyre.dequantize_fp8_with_scale(g, scale)
+
+        actual = torch.compile(kernel, dynamic=False)(
+            x.to("spyre"), scale.to("spyre"), idx.to("spyre")
+        ).cpu()
+        torch.testing.assert_close(
+            actual, torch.index_select(x, 0, idx), atol=0, rtol=0
+        )
+
     def test_index_select_with_exp(self):
         x, i = self._xi(P=32)
         self._stage_and_e2e(
