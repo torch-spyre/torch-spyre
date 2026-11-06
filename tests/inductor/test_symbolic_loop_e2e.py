@@ -39,6 +39,14 @@ compiler adds later then reads as breaking that promise and raises
 the dim bare and the range is declared from inside the region. What a later
 bridge changes is who writes these three lines, not where they go.
 
+THE MINIMUM IS TWO TILES. ``for_each_tile`` views the operand as ``(count, G,
+...)``, so the tile count is a dimension of a traced tensor, and PyTorch's
+contiguity check asks ``count == 1`` before it looks at the stride. The answer
+becomes a guard, ``Ne(rows // G, 1)``, and a one-tile call then recompiles
+(#6018, upstream pytorch/pytorch#203781). Until #6060 installs the stride-first
+check, a declared range starts at ``2 * G`` and this file declares it that way.
+With ``min == G`` the headline test below counted two graphs in CI.
+
 VERIFIED EMITTED BUNDLE, 6 Oct 2026, for the region below at 64 columns fp16::
 
     #map_0 = affine_map<(d0)[s0] -> (s0 + 128*d0)>
@@ -67,7 +75,6 @@ tiles.
 
 import os
 import unittest
-from functools import wraps
 
 import regex as re
 import torch
@@ -84,25 +91,16 @@ from torch_spyre.execution.kernel_cache import get_cache_root_dir
 ROWS = 256
 COLS = 64
 TILE = 64
-MIN_ROWS = 64
+MIN_ROWS = 2 * TILE  # two tiles, see the module docstring
 MAX_ROWS = 512
 SPEC = {"min": MIN_ROWS, "max": MAX_ROWS, "granularity": TILE}
-# The compile size first, then every kind of other size: the minimum (one
-# tile), the maximum, above the compile size (where hint-sized geometry was
+# The compile size first, then every kind of other size: the minimum (two
+# tiles), the maximum, above the compile size (where hint-sized geometry was
 # measured wrong), and below it.
-SIZES = [ROWS, MIN_ROWS, MAX_ROWS, 448, 128]
+SIZES = [ROWS, MIN_ROWS, MAX_ROWS, 448, 192]
 
 ATOL = 1e-2
 RTOL = 1e-2
-
-
-def _with_dynamo_reset(fn):
-    @wraps(fn)
-    def wrapper(*args, **kwargs):
-        torch._dynamo.reset()
-        return fn(*args, **kwargs)
-
-    return wrapper
 
 
 def tiled_gelu(x):
@@ -140,11 +138,10 @@ def _kernel_cache_entries():
 
 
 class TestSymbolicLoopOnDevice(unittest.TestCase):
-    def __init_subclass__(cls, **kwargs):
-        super().__init_subclass__(**kwargs)
-        for name, value in list(vars(cls).items()):
-            if name.startswith("test") and callable(value):
-                setattr(cls, name, _with_dynamo_reset(value))
+    def setUp(self):
+        # Every test here compiles ``tiled_gelu`` and counts what happens, so
+        # none may inherit another's Dynamo cache entry, in any run order.
+        torch._dynamo.reset()
 
     @staticmethod
     def _compile_and_run(rows=ROWS):
@@ -217,11 +214,10 @@ class TestOneBinaryServesTheRange(unittest.TestCase):
     recompile and hide a size-specific kernel behind a green run.
     """
 
-    def __init_subclass__(cls, **kwargs):
-        super().__init_subclass__(**kwargs)
-        for name, value in list(vars(cls).items()):
-            if name.startswith("test") and callable(value):
-                setattr(cls, name, _with_dynamo_reset(value))
+    def setUp(self):
+        # A warm cache entry for ``tiled_gelu`` from an earlier test would make
+        # the graph count below read 0 or 1 by accident. Cold every time.
+        torch._dynamo.reset()
 
     def test_one_graph_one_kernel_right_at_every_size(self):
         counters.clear()
