@@ -366,6 +366,7 @@ def test_each_cache_key_ignore_prefix_matches_only_known_settings():
         "timing": ["timing", "timing_out"],
         "dump_cost_expr_file": ["dump_cost_expr_file"],
         "spyre_kernel_cache": ["spyre_kernel_cache"],
+        "precomputed_kernel_key": ["precomputed_kernel_key"],
     }
 
 
