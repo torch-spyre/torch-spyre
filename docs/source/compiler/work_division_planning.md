@@ -294,14 +294,25 @@ otherwise-equivalent splits. A split that uses zero cores or more than
 **Compute time** is per-core work divided by per-core peak rate:
 
 ```text
-compute = (B·M·N·K / (b·m·n·k)) / (peak_MACs_per_core × pt_eff)
+compute = (B·M·N·K / (b·m·n·k)) / peak_MACs_per_core
 ```
 
-`pt_eff` drops below 1 when the per-core M slice is short. The PT array
-streams M in passes of `_PT_ROWS = 8` rows, and `pt_passes = (M/m) / 8`.
-Below the `_TARGET_PT_PASSES = 5` target, startup and drain overhead is
-amortised over too little work, so effective throughput falls off as
-`(pt_passes / 5) ** 0.25`.
+A short per-core M slice adds no compute time here. The short-tile
+preference below ranks such splits instead.
+
+The graph allocator also uses all nine standalone preferences in its objective,
+after it has built the candidate menu. For example, a true batched matmul split
+four ways over batch gets the standalone `10 * log2(4) = 20` microsecond score
+once. This replaces the graph's separate batch-versus-M charge. The score guides
+the choice; it does not mean that the device takes 20 microseconds longer.
+
+`_matmul_split_preferences` holds the shared formulas. The graph evaluates them
+numerically for each existing division and rounds their sum to integer
+nanoseconds. This preserves floors, logs and the short-tile fractional power
+without a symbolic approximation. The score enters the compute side before
+compute/memory overlap and uses the same output-pass count as execution work.
+Time predictions keep these preferences off. Graph feature rules still decide
+whether weights are shared; they can differ from the standalone chooser's rules.
 
 **HBM time** is bytes moved divided by aggregate LPDDR5 bandwidth,
 scaled by a cohort penalty:
@@ -334,6 +345,16 @@ bandwidth-bound.
 separate compute-equivalent splits and bias the planner away from kernel
 shapes the codegen handles poorly:
 
+- The PT short-tile term ranks a split whose per-core M slice is shorter
+  than `_TARGET_PT_PASSES = 5` passes of `_PT_ROWS = 8` rows as if its
+  compute were `(5 / pt_passes) ** 0.25` times slower, at most 1.50 at
+  8 rows per core: it adds `(factor − 1) × compute`. It is a ranking
+  preference, not a kernel time. On the card, matmuls with 8 to 40 rows
+  per core and the input in LX ran no slower than taller cuts of the same
+  shape on the same cores (`tools/cost_model/matmul_short_tile_fit.py`),
+  so the execution estimate that the co-optimizing planner sums does not
+  carry it. With the input in HBM a short tile can run slower; that is a
+  cost of the HBM read, not of the PT array.
 - The M-lane underuse term adds `10 µs` per log2 step when the M split
   exposes fewer M lanes than the target.
 - The M-tile underfill term adds `30 µs` per log2 step when per-core rows
