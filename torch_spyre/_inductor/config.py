@@ -132,10 +132,10 @@ disable_conv2d_spatial_split: bool = (
 
 # Allow splitting a padded pool's padded output spatial dims across cores, as
 # long as each core keeps more outputs than the pad (the backend's own work
-# division applies the same limit).  A core slice that starts after the front
-# pad needs backend support for shifting a symbolic start address; without it
-# the backend compiler fails with an undeclared symbol.
-# Off by default: padded spatial dims then stay whole on each core.
+# division applies the same limit).  Off by default: splitting both padded
+# spatial dims can fail in the backend compiler.  Padded spatial dims then
+# stay whole on each core.
+
 pool_padded_spatial_split: bool = (
     os.environ.get("SPYRE_POOL_PADDED_SPATIAL_SPLIT", "0") == "1"
 )
