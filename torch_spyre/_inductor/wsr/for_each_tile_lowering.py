@@ -3521,11 +3521,16 @@ def splice_while_loops(graph) -> None:
     # in-body page index, dep.index == 32*u0). coarse_tile_post_stickify
     # reaches _rebase_point_splice_reads for this same shape, but WhileLoop-
     # splice groups never go through it -- see this function's own docstring.
-    # Without this call the raw indirect symbol survives into
-    # propagate_spyre_tensor_layouts, which rejects it (not an
-    # iteration_space key). Run once, after every level's stamping has been
-    # merged in above, so squeezed_advance_per_read reflects each op's final,
-    # fully-merged state rather than a partially-stamped intermediate.
+    # Measured with this call removed (the paged-gather fixtures): the loop
+    # variable stays in the read's index through propagate_spyre_tensor_layouts,
+    # which accepts it, and the result is unchanged, because the op's dim_hints
+    # declare the variable and per_trip_index pins it. So the call is not
+    # needed to compile today; it keeps the index at iteration 0 for when that
+    # pin goes (the index becoming the source of the advance), where the raw
+    # symbol would otherwise reach device_coordinates. Run once, after every
+    # level's stamping has been merged in above, so squeezed_advance_per_read
+    # reflects each op's final, fully-merged state rather than a
+    # partially-stamped intermediate.
     _rebase_point_splice_reads(graph.operations)
 
     if pending_levels:
