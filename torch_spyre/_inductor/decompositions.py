@@ -1880,7 +1880,7 @@ def spyre_topk(
             )
     # topkindex's indices come back in the input dtype, and Spyre's fp16 holds
     # integers exactly only up to FP16_TOPK_MAX_DIM, so a longer fp16 search dim
-    # (counted after padding) would return wrong indices. fp32 is not limited.
+    # (counted after padding) would return wrong indices.
     if input.dtype == torch.float16 and n + pad > FP16_TOPK_MAX_DIM:
         raise Unsupported(
             f"topk with k={k} along a dim of size {n} (padded to {n + pad}) on a "
