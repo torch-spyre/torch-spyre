@@ -94,6 +94,7 @@ from .scheduler import (
 from .constants import DEVICE_NAME
 from .deadcode_elimination import deadcode_elimination
 from .loop_carries import apply_loop_carries
+from .loop_checker import check_loops
 from .loop_node import (
     OpsView,
     all_ops,
@@ -738,6 +739,9 @@ class CustomPreSchedulingPasses:
             pass_name = _get_pass_name(pass_fn)
             with _flat_operations(graph, pass_name):
                 self._run_one_pass(graph, pipeline, pass_fn, pass_name)
+            # After the view is put back: the checker reads the real tree, and a
+            # violation then names the pass that left it.
+            check_loops(graph, where=pass_name)
 
     def _run_one_pass(
         self,
