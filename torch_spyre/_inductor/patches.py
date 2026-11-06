@@ -231,6 +231,45 @@ def _resolve_scan_shapes_by_expression():
         _post_grad.resolve_shape_to_proxy = original
 
 
+def _contiguous_stride_first(sizes, strides, false_if_dde=False):
+    """torch's check_contiguous_sizes_strides, but compares the stride before
+    asking size == 1, so a correct stride installs no Ne(size, 1) guard (#6018).
+    Remove once upstream does the same."""
+    from torch.fx.experimental.symbolic_shapes import (
+        guard_or_false,
+        guard_or_true,
+        statically_known_true,
+    )
+
+    maybe_false = guard_or_false if false_if_dde else bool
+    maybe_true = guard_or_true if false_if_dde else bool
+    expected, expected_max = 1, 1
+    for x, y in reversed(tuple(zip(sizes, strides))):
+        if statically_known_true(y == expected) or statically_known_true(
+            y == expected_max
+        ):
+            pass
+        elif maybe_false(x == 1):
+            continue
+        elif maybe_true(y != expected) and maybe_true(y != expected_max):
+            return False
+        expected_max *= torch.sym_max(x, 1)
+        expected *= x
+    return True
+
+
+@contextmanager
+def _contiguity_stride_first():
+    import torch._prims_common as prims_common
+
+    original = prims_common.check_contiguous_sizes_strides
+    prims_common.check_contiguous_sizes_strides = _contiguous_stride_first
+    try:
+        yield
+    finally:
+        prims_common.check_contiguous_sizes_strides = original
+
+
 @contextmanager
 def enable_spyre_context(example_inputs: list[InputType]):
     """
@@ -377,6 +416,7 @@ def enable_spyre_context(example_inputs: list[InputType]):
         _preserve_spyre_input_storage_offsets(),
         _unique_operation_names(),
         _resolve_scan_shapes_by_expression(),
+        _contiguity_stride_first(),
         enable_spyre_lowerings(),
         # Analysis-call counters ride the timing gate: they exist to annotate
         # timing records, and a second knob would let the two disagree.
