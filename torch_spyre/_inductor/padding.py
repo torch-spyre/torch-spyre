@@ -841,9 +841,11 @@ def _restickify_input_required_extent(coord, ranges, stick_sym, dtype) -> int:
             f"dense flattened input coordinate {coord} requires a re-base copy"
         )
 
-    max_slice_start = coord.subs(stick_sym, 0)
+    max_slice_start = coord.xreplace({stick_sym: sympy.Integer(0)})
     for sym in syms - {stick_sym}:
-        max_slice_start = max_slice_start.subs(sym, concretize_expr(ranges[sym]) - 1)
+        max_slice_start = max_slice_start.xreplace(
+            {sym: sympy.Integer(concretize_expr(ranges[sym]) - 1)}
+        )
     return concretize_expr(max_slice_start) + round_up_to_stick(stick_extent, dtype)
 
 

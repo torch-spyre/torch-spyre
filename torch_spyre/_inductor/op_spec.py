@@ -21,7 +21,7 @@ import math
 import threading
 from typing import Any, Literal, Sequence
 
-from sympy import Symbol, Expr, Function, sympify
+from sympy import Symbol, Expr, Function, Integer, sympify
 from torch_spyre._C import DataFormats, ElementArrangement
 import torch
 from torch_spyre import _C
@@ -215,7 +215,7 @@ class TensorWorkDivision:
         for core in range(num_cores):
             slots = {}
             for dim, expression in self.core_id_to_work_slice.items():
-                value = sympify(expression).subs(core_id, core)
+                value = sympify(expression).xreplace({core_id: Integer(core)})
                 if value.free_symbols or value.is_integer is not True:
                     raise ValueError(
                         f"core {core} owns non-integral {dim} slot {value}"

@@ -69,7 +69,7 @@ def _owner_at_core(expression: Expr, core: int) -> Expr:
     One core at a time preserves callers' short-circuit and error ordering.
     No buffer, layout, split count or graph state participates in this result.
     """
-    return expression.subs(Symbol("core_id"), core)
+    return expression.xreplace({Symbol("core_id"): Integer(core)})
 
 
 def owner_slots(
@@ -196,7 +196,7 @@ def _loop_regions(
     try:
         for coordinate, size in zip(coordinates, device_extents):
             expr = coordinate.replace(floor, lambda x: x)
-            offset = expr.subs(_LOOP_POINT, 0)
+            offset = expr.xreplace({_LOOP_POINT: Integer(0)})
             term = Term.from_coordinate(
                 expr - offset, _LOOP_POINT, Integer(extent), size
             )
@@ -244,7 +244,9 @@ def _loop_regions(
                 bounds.append(tuple(sorted((num * low + offset, num * high + offset))))
         else:
             points = [
-                tuple(sympify(c).subs(_LOOP_POINT, p) for c in coordinates)
+                tuple(
+                    sympify(c).xreplace({_LOOP_POINT: Integer(p)}) for c in coordinates
+                )
                 for p in range(first, last + 1)
             ]
             if any(value.is_integer is not True for row in points for value in row):
@@ -460,7 +462,12 @@ def decompose_fused_split_view(
             ):
                 return tuple(sorted(split_dims)), tuple(
                     sorted(
-                        (axis, mapping[synthetic[axis]].subs(core_id, fused_slot_expr))
+                        (
+                            axis,
+                            mapping[synthetic[axis]].xreplace(
+                                {core_id: fused_slot_expr}
+                            ),
+                        )
                         for axis, _ in split_dims
                     )
                 )
@@ -699,11 +706,11 @@ def derive_core_mapping(
     )
     return {
         **{
-            dim: expression.subs(core_id, group_id)
+            dim: expression.xreplace({core_id: group_id})
             for dim, expression in owner_mapping.items()
         },
         **{
-            dim: expression.subs(core_id, local_core_id)
+            dim: expression.xreplace({core_id: local_core_id})
             for dim, expression in local_mapping.items()
         },
     }
@@ -732,7 +739,8 @@ def derive_partition_mapping(
     group_id = floor(core_id / group_size)
     mapping = core_to_slice_mapping(dims, splits, owner_count)
     return {
-        dim: expression.subs(core_id, group_id) for dim, expression in mapping.items()
+        dim: expression.xreplace({core_id: group_id})
+        for dim, expression in mapping.items()
     }
 
 

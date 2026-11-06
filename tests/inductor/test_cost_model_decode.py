@@ -326,7 +326,9 @@ class SymbolicPriceTest(unittest.TestCase):
 
         symbolic = store(sym_is_lx).hbm_elems()
         self.assertFalse(isinstance(symbolic, int))  # genuinely symbolic, not cast
-        self.assertEqual(int(symbolic.subs(sym_is_lx, 0)), store(False).hbm_elems())
+        self.assertEqual(
+            int(symbolic.xreplace({sym_is_lx: 0})), store(False).hbm_elems()
+        )
         self.assertEqual(store(False).hbm_elems(), 65536)
 
 
@@ -1529,8 +1531,8 @@ def test_operand_geometry_declines_an_indirect_bank_index(monkeypatch):
     # not a for_each_tile offset that the geometry proof can pin per invocation.
     bank = dataclasses.replace(
         rw.reads[1],
-        index=rw.reads[1].index.subs(
-            u0, sympy.Symbol("idx", integer=True, nonnegative=True)
+        index=rw.reads[1].index.xreplace(
+            {u0: sympy.Symbol("idx", integer=True, nonnegative=True)}
         ),
     )
     op.get_read_writes = lambda: SimpleNamespace(
@@ -1659,13 +1661,13 @@ def test_the_symbolic_operand_price_equals_the_concrete_price_at_every_candidate
             run = _read(symbolic, name).read_run_bytes
             assert (run is None) == (name in declined)
             assert run is None or sympy.sympify(run).free_symbols
-            assert (None if run is None else sympy.sympify(run).subs(at)) == _read(
+            assert (None if run is None else sympy.sympify(run).xreplace(at)) == _read(
                 concrete, name
             ).read_run_bytes
         expected = float(_requests_ns([concrete]))
         priced.append(expected)
-        assert float(term.subs(at)) == pytest.approx(expected, abs=1e-3)
-        assert float(objective.subs(at)) == pytest.approx(
+        assert float(term.xreplace(at)) == pytest.approx(expected, abs=1e-3)
+        assert float(objective.xreplace(at)) == pytest.approx(
             float(predict_ops([concrete], _COST_PARAMS)), rel=1e-9
         )
         assert _solve_pinned(term, pinned, i) == pytest.approx(expected, abs=2.0)

@@ -896,16 +896,12 @@ class _InlineMarkerHandler(WrapperHandler):
                     "substitute positionally."
                 )
             subs = dict(zip(self._marker_var_names, non_unit_coords))
-            # simultaneous=True is required: sympy.Expr.subs(dict) otherwise
-            # applies substitutions sequentially, one symbol at a time, so a
-            # dict like {d0: d1, d1: d2} first rewrites d0->d1 and THEN
-            # rewrites that same fresh d1 -> d2, silently merging two
-            # distinct coordinates into one wrong composed index (e.g.
-            # {d0: d1, d1: d2} applied sequentially to `d0 + 2*d1` yields
-            # `3*d1` instead of the correct `d1 + 2*d2`) whenever the
-            # substitution's target set overlaps its source set, which a
-            # coordinate permutation (e.g. a transposed tile read) does.
-            composed = self._marker_read_index.subs(subs, simultaneous=True)
+            # xreplace substitutes simultaneously, which is required: a
+            # sequential substitution of {d0: d1, d1: d2} applied to
+            # `d0 + 2*d1` yields `3*d1` instead of `d1 + 2*d2` whenever the
+            # target set overlaps the source set, which a coordinate
+            # permutation (e.g. a transposed tile read) does.
+            composed = self._marker_read_index.xreplace(subs)
             return super().load(self._marker_input_name, composed)
         return super().load(name, index)
 
@@ -2227,7 +2223,9 @@ class _IdentityChainLoadHandler(WrapperHandler):
                     parameter_symbols.update(sympy.sympify(expr).free_symbols)
                 iteration_symbols = local_index.free_symbols - parameter_symbols
             local_constant = sympy.simplify(
-                local_index.subs({symbol: sympy.S.Zero for symbol in iteration_symbols})
+                local_index.xreplace(
+                    {symbol: sympy.S.Zero for symbol in iteration_symbols}
+                )
             )
             if local_constant != 0:
                 # A flat offset in the identity's output layout cannot in
@@ -2674,7 +2672,7 @@ def _contract_cross_scope_input_materializations(
                     for index in identity_indices
                 ]
                 source_base = sympy.simplify(
-                    source_index.subs(
+                    source_index.xreplace(
                         {index: sympy.S.Zero for index in identity_indices}
                     )
                 )
@@ -3213,7 +3211,7 @@ def _contract_exact_stride_input_materializations(
             continue
         source_name, source_index, identity_indices = identity
         source_base = sympy.simplify(
-            source_index.subs({index: sympy.S.Zero for index in identity_indices})
+            source_index.xreplace({index: sympy.S.Zero for index in identity_indices})
         )
         source_strides = [
             sympy.simplify(source_index.coeff(index)) for index in identity_indices
@@ -3262,7 +3260,7 @@ def _contract_exact_stride_input_materializations(
         # offset.  A nonzero one would need coordinate decomposition rather
         # than stride substitution, so retain the staging fallback for it.
         copy_offset = sympy.simplify(
-            copy_dep.index.subs(
+            copy_dep.index.xreplace(
                 {symbol: sympy.S.Zero for symbol in copy_dep.index.free_symbols}
             )
         )

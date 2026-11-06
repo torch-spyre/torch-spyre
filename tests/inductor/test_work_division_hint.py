@@ -873,7 +873,7 @@ def test_consumer_anchoring_commits_the_unique_accepted_owner_order(mode):
                 return []
             candidate = overrides["source"]
             owners = [
-                int(candidate.core_id_to_work_slice[kv].subs(_CORE_ID, core))
+                int(candidate.core_id_to_work_slice[kv].xreplace({_CORE_ID: core}))
                 for core in range(32)
             ]
             return [object()] if owners == [core % 8 for core in range(32)] else []
@@ -928,7 +928,7 @@ def test_consumer_anchoring_commits_the_unique_accepted_owner_order(mode):
         assert committed is original
         return
     assert [
-        int(committed.core_id_to_work_slice[kv].subs(_CORE_ID, core))
+        int(committed.core_id_to_work_slice[kv].xreplace({_CORE_ID: core}))
         for core in range(32)
     ] == [core % 8 for core in range(32)]
 
@@ -1171,7 +1171,7 @@ def test_q_rope_ownership_keeps_the_whole_pair_in_its_slice(pair_extent, offset)
         assert division.physical_core_count == 32
         for core in range(32):
             owners = {
-                loop: int(owner.subs(_CORE_ID, core))
+                loop: int(owner.xreplace({_CORE_ID: core}))
                 for loop, owner in division.core_id_to_work_slice.items()
             }
             assert owners == {row: core % 8, head: core // 8}
@@ -1474,7 +1474,7 @@ def test_lx_relayout_normalizes_ownership_and_lowers_only_in_superdsc():
         remapped.work_division, {old: ((inner, 2), (outer, 8))}
     )
     core_three = {
-        dim: int(slot.subs(_CORE_ID, 3))
+        dim: int(slot.xreplace({_CORE_ID: 3}))
         for dim, slot in remapped.work_division.core_id_to_work_slice.items()
     }
     assert core_three == {inner: 1, outer: 1}
@@ -1820,7 +1820,11 @@ def test_unhinted_moe_down_route_preserves_the_chosen_split(enabled):
     partners = {}
     for core in range(config.sencores):
         owner = tuple(
-            int(bmm_specs[0].core_id_to_work_slice[dim].subs(Symbol("core_id"), core))
+            int(
+                bmm_specs[0]
+                .core_id_to_work_slice[dim]
+                .xreplace({Symbol("core_id"): core})
+            )
             for dim in output_dims
         )
         partners.setdefault(owner, []).append(core)
@@ -2701,12 +2705,14 @@ def test_relayout_operation_frame_keeps_tensor_domains(source_cores, destination
     if source_cores <= destination_cores:
         core = Symbol("physical_core", integer=True)
         assert (
-            sympy.simplify(Mod(owner.subs(_CORE_ID, core) - core, parsed.num_cores))
+            sympy.simplify(
+                Mod(owner.xreplace({_CORE_ID: core}) - core, parsed.num_cores)
+            )
             == 0
         ), "equal/expanded operation frame was repeated"
-    assert [int(owner.subs(_CORE_ID, core)) for core in range(parsed.num_cores)] == [
-        core % destination_cores for core in range(parsed.num_cores)
-    ]
+    assert [
+        int(owner.xreplace({_CORE_ID: core})) for core in range(parsed.num_cores)
+    ] == [core % destination_cores for core in range(parsed.num_cores)]
     for argument, physical_count, expected in zip(
         parsed.args, [source_cores, destination_cores], [source_owner, _CORE_ID]
     ):
@@ -2717,8 +2723,10 @@ def test_relayout_operation_frame_keeps_tensor_domains(source_cores, destination
         ]
         formula = argument.work_division.core_id_to_work_slice[dimension]
         assert [
-            int(formula.subs(_CORE_ID, core)) for core in range(physical_count)
-        ] == [int(expected.subs(_CORE_ID, core)) for core in range(physical_count)]
+            int(formula.xreplace({_CORE_ID: core})) for core in range(physical_count)
+        ] == [
+            int(expected.xreplace({_CORE_ID: core})) for core in range(physical_count)
+        ]
 
 
 @pytest.mark.parametrize("enabled", [False, True])
