@@ -1485,6 +1485,11 @@ def is_stick_expr_offset_free(stick_expr: sympy.Expr, elems_per_stick: int) -> b
 
 def _is_stick_expr_with_offset(stick_expr: sympy.Expr, elems_per_stick: int) -> bool:
     """Return True if stick_expr is an offset variant: Mod(var, N) + c or var + c."""
+    if isinstance(stick_expr, sympy.Integer):
+        assert 0 <= int(stick_expr) < elems_per_stick, (
+            f"stick coordinate {stick_expr} outside its stick ({elems_per_stick})"
+        )
+        return stick_expr != 0
     if not isinstance(stick_expr, sympy.Add):
         return False
     free_args = [a for a in stick_expr.args if a.free_symbols]
