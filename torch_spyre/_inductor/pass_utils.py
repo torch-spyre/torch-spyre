@@ -83,6 +83,7 @@ from .constants import (
 )
 from .ir import FixedTiledLayout, SpyreConstantFallback
 from .logging_utils import get_inductor_logger
+from .loop_facts import enclosing_loops
 from .loop_info import copy_op_metadata
 from .loop_node import LoopNode, all_ops
 from .pass_counters import (
@@ -409,9 +410,19 @@ def op_read_writes(op: Operation) -> ReadWrites:
 
     ``ComputedBuffer.get_read_writes`` re-runs sympy dependency extraction on
     every call and is not cached upstream, yet its result does not depend on
-    work-division metadata. The scratchpad pass calls it hundreds of times, so
-    we cache it under a private key only this helper reads -- a non-planner
-    caller (e.g. later-pass codegen) still goes through the real method.
+    work-division metadata. Pre-scheduling passes, the scratchpad planner and
+    its cost features ask for it hundreds of thousands of times per model, so it
+    is cached under a private key on the op.
+
+    The memo is filled from the layout passes onwards, so a pass that changes
+    what an op reads or writes ON THE SAME INSTANCE -- swapping a load name in
+    its ``inner_fn``, replacing its ``data`` -- must call
+    :func:`invalidate_op_read_writes` on it right after (``insert_restickify``
+    does). Rebuilding the op (``replace_computed_buffer_body``) needs nothing:
+    the new instance starts unmemoized. A Spyre layout change needs nothing
+    either while it leaves the host strides alone, as the stick (device layout)
+    passes do; one that changes a buffer's host strides changes the indices of
+    its writer's write and of every reader's read.
     """
     if COUNTERS.enabled:
         COUNTERS.bump(READ_WRITES_REQUESTS)
@@ -1019,7 +1030,7 @@ def _build_indirect_store_subs(
     """
     from sympy import IndexedBase
 
-    rw = op.get_read_writes()
+    rw = op_read_writes(op)
     writes = [
         d
         for d in rw.writes
@@ -1237,7 +1248,7 @@ def _build_indirect_load_subs(
     """
     from sympy import IndexedBase
 
-    rw = op.get_read_writes()
+    rw = op_read_writes(op)
     reads = [
         d
         for d in rw.reads
@@ -1486,8 +1497,8 @@ def broadcast_batch_vars(op: Operation, x_dep: MemoryDep, out_dep: MemoryDep) ->
     that dim's squeezed symbol entirely (broadcast), rather than genuinely
     being tiled on it too.
     """
-    loop_info = getattr(op, "loop_info", None)
-    if loop_info is None or not loop_info.loop_tiled_dims:
+    levels = enclosing_loops(op)
+    if not any(level.tiled_dims for level in levels):
         return set()
 
     # Map each squeezed output-dim position (index into out_dep.var_names) to
@@ -1505,8 +1516,8 @@ def broadcast_batch_vars(op: Operation, x_dep: MemoryDep, out_dep: MemoryDep) ->
             it_idx += 1
 
     excess: set = set()
-    for level_dims in loop_info.loop_tiled_dims:
-        for pos in level_dims:
+    for level in levels:
+        for pos in level.tiled_dims:
             squeezed = raw_to_squeezed.get(pos)
             if squeezed is None or squeezed >= len(out_dep.var_names):
                 continue
@@ -1958,7 +1969,7 @@ def indirect_forbidden_split_syms(op: "ComputedBuffer") -> set[Symbol]:
     # (2) keys off the index's logical entry count (d.ranges[stick_var]).
     subs = indirect_access_subs_from_op(op)
     index_names = {e.args[0].name for e in subs.values() if e.args}
-    for d in op.get_read_writes().reads:
+    for d in op_read_writes(op).reads:
         if not (isinstance(d, MemoryDep) and d.name in index_names):
             continue
         layout = _fixed_read_layout(V.graph.get_buffer(d.name))
@@ -3220,6 +3231,9 @@ def redirect_computed_buffer_reads(
 
         object.__setattr__(op.data, "output_indexer", new_output_indexer)
     _invalidate_body_caches(op.data)
+    # The replacement below starts unmemoized, but op itself now reads through
+    # the patched data; a caller still holding op must not see its old reads.
+    invalidate_op_read_writes(op)
 
     # Reconstruct ComputedBuffer as a fresh object so the instance-keyed cache
     # on get_default_sizes_body can be cleanly invalidated below.
@@ -3234,7 +3248,7 @@ def redirect_computed_buffer_reads(
     )
     new_buf.operation_name = op.operation_name
     preserve_provenance(op, new_buf, pass_name=pass_name, reason=reason)
-    copy_op_metadata(op, new_buf)
+    copy_op_metadata(op, new_buf, layout_state=True)
 
     op_idx = operations.index(op)
     operations[op_idx] = new_buf

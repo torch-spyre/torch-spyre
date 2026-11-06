@@ -83,6 +83,7 @@ from .pass_utils import (
     identify_matmul_inputs,
     is_restickify_coords,
     lower_pad_sequence,
+    op_read_writes,
     patch_env,
     prepend_dim_valid_elements,
     redirect_computed_buffer_reads,
@@ -470,7 +471,7 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
 
 def _write_dep(op):
     """Return op's write dependency on the buffer it produces."""
-    writes = [d for d in op.get_read_writes().writes if hasattr(d, "name")]
+    writes = [d for d in op_read_writes(op).writes if hasattr(d, "name")]
     assert len(writes) == 1, (
         f"_write_dep: {op.get_name()} has {len(writes)} named writes, want exactly 1"
     )
@@ -484,7 +485,7 @@ def _restickify_input(op, graph: GraphLowering):
     """
     # Callers that already know op is a confirmed restickify can assume this
     # succeeds.
-    reads = [r for r in op.get_read_writes().reads if hasattr(r, "name")]
+    reads = [r for r in op_read_writes(op).reads if hasattr(r, "name")]
     if len(reads) != 1:
         return None, None, None
     in_dep = reads[0]
