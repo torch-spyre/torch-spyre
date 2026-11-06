@@ -1364,6 +1364,99 @@ def _(
 
 
 @torch.library.custom_op(
+    "spyre::multi_latent_attention", mutates_args=(), device_types="spyre"
+)
+def multi_latent_attention(  # type: ignore[empty-body]
+    q_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    kv_latent: torch.Tensor,
+    k_pe: torch.Tensor,
+    w_uk: torch.Tensor,
+    w_uv: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    is_causal: bool = False,
+    scale: Optional[float] = None,
+    absorbed: Optional[bool] = None,
+) -> torch.Tensor:
+    """
+    Multi-head latent attention (MLA) over a compressed KV cache.
+
+    MLA keeps one latent vector per token instead of one key and one value per
+    head: ``kv_latent`` is ``[B, Lk, R]`` and ``k_pe`` is ``[B, Lk, Dr]``, both
+    shared by every query head. Per-head keys and values exist only as
+    ``k_nope = kv_latent @ w_uk[h].T`` and ``v = kv_latent @ w_uv[h].T``; this
+    op never requires either to be materialized for the whole cache.
+
+    Shapes, named after the DeepSeek-V3 configuration fields:
+
+    * ``q_nope`` ``[B, H, Lq, Dn]`` -- ``Dn = qk_nope_head_dim``
+    * ``q_pe``   ``[B, H, Lq, Dr]`` -- ``Dr = qk_rope_head_dim``, already roped
+    * ``kv_latent`` ``[B, Lk, R]``  -- ``R = kv_lora_rank``, already normed
+    * ``k_pe``   ``[B, Lk, Dr]``    -- the decoupled roped key, head-shared
+    * ``w_uk``   ``[H, Dn, R]``     -- key up-projection
+    * ``w_uv``   ``[H, Dv, R]``     -- value up-projection, ``Dv = v_head_dim``
+    * returns    ``[B, H, Lq, Dv]``
+
+    ``w_uk`` and ``w_uv`` are the two halves of HuggingFace's ``kv_b_proj``
+    weight viewed as ``[H, Dn + Dv, R]``, in that order, so they can be sliced
+    from a checkpoint without a transpose.
+
+    ``attention_mask`` is an optional additive mask broadcastable to
+    ``[B, 1, Lq, Lk]``; it is the only source of position-dependent state, so
+    changing a decode position does not specialize the compiled graph.
+    ``is_causal`` adds the usual lower-triangular band on top of it. Zero-fill
+    unwritten cache rows: masked scores are still computed, and adding a mask
+    cannot rescue a NaN. A row the mask excludes entirely yields zeros rather
+    than NaN.
+
+    ``scale`` defaults to ``1 / sqrt(Dn + Dr)`` and is applied to the scores in
+    both execution paths, so the absorbed path is not silently rescaled by its
+    wider latent query.
+
+    ``absorbed`` selects the execution path and is static configuration, not
+    runtime data:
+
+    * ``True`` folds ``w_uk`` into the query (``q_nope @ w_uk[h]``), scores
+      against the latent cache directly, accumulates the output in latent
+      space and projects it with ``w_uv`` once at the end. Score and
+      accumulator rows are ``R`` wide rather than ``Dn``/``Dv``, and no
+      per-head key or value is ever formed -- the right trade for decode and
+      short chunks.
+    * ``False`` projects each K/V tile to per-head keys and values inside the
+      counted loop, so the arithmetic is the ordinary ``Dn + Dr`` attention of
+      a GQA model with one KV head. Cheaper once the query is long enough to
+      amortize the projection over many rows -- the right trade for prefill.
+    * ``None`` (default) picks by shape, comparing the two multiply counts.
+
+    Both paths compute the same function and agree to fp16 rounding.
+
+    MUST be called under torch.compile(backend="inductor") on the spyre
+    device; the real lowering is in decompositions.py. This eager body is
+    intentionally empty, matching spyre::sliding_window_attention.
+    """
+    pass
+
+
+@multi_latent_attention.register_fake
+def _(
+    q_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    kv_latent: torch.Tensor,
+    k_pe: torch.Tensor,
+    w_uk: torch.Tensor,
+    w_uv: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    is_causal: bool = False,
+    scale: Optional[float] = None,
+    absorbed: Optional[bool] = None,
+) -> torch.Tensor:
+    # Shape only. The argument contract is checked in the decomposition, where
+    # a rejection can name the offending tensor; see spyre_sliding_window_
+    # attention for the same split.
+    return q_nope.new_empty((*q_nope.shape[:-1], w_uv.size(-2)))
+
+
+@torch.library.custom_op(
     "spyre::stagger_to_standard_ea", mutates_args=(), device_types="spyre"
 )
 def stagger_to_standard_ea(x: torch.Tensor) -> torch.Tensor:
