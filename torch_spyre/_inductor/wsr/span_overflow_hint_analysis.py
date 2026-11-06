@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import itertools
 import math
 from collections.abc import Sequence
@@ -28,7 +29,7 @@ from torch._inductor.ir import ComputedBuffer, Pointwise, Reduction
 from torch._inductor.virtualized import V
 
 from .. import config
-from ..constants import BATCH_MATMUL_OP
+from ..constants import BATCH_MATMUL_OP, INDIRECT_RELAYOUT_ATTR
 from ..errors import Unsupported
 from ..ir import FixedTiledLayout, _resize_device_layout
 from ..logging_utils import get_inductor_logger
@@ -37,10 +38,11 @@ from ..pass_utils import (
     device_coordinates,
     _fixed_read_layout,
     host_coordinates,
+    indirect_access_subs_from_op,
     indirect_info_from_op,
     op_out_coords,
 )
-from ..work_division import MAX_SPAN_BYTES
+from ..work_division import MAX_SPAN_BYTES, fits_span_without_tiling
 from .coarse_tile import _loop_var_hinted_ranges, _stick_host_dim
 from .tile import compute_tile_stride
 
@@ -1319,6 +1321,8 @@ def _output_span_candidates_from_op(
 
     device_size = [int(s) for s in layout.device_layout.device_size]
     itemsize = layout.dtype.itemsize
+    # Hoisted out of the loop below: this walks the op's inner_fn.
+    count_each_tile_once = _is_indirect_access_related(op)
     candidates: list[SpanOverflowCandidate] = []
     for device_dim, coord in enumerate(device_coords[:-1]):
         if not coord.free_symbols:
@@ -1341,9 +1345,16 @@ def _output_span_candidates_from_op(
             )
             continue
 
-        split_by_symbol = {
-            sym: split_by_host_dim.get(symbol_to_dim[sym], 1) for sym in output_syms
-        }
+        # ``coord`` already spans one tile, so dividing by the same split again
+        # under-counts and can accept a plan that still overflows. Count an
+        # indirect access exactly; other ops keep the existing accounting,
+        # which changing would alter the plans they pick.
+        if count_each_tile_once:
+            split_by_symbol: dict[sympy.Symbol, int] = {}
+        else:
+            split_by_symbol = {
+                sym: split_by_host_dim.get(symbol_to_dim[sym], 1) for sym in output_syms
+            }
         coord_span_elems = _coordinate_span_elems(coord, out_dep, split_by_symbol)
         if coord_span_elems is None:
             continue
@@ -2092,18 +2103,75 @@ def _search_output_only_tile_plan(
     )
 
 
+def _gather_entry_host_dims(op: ComputedBuffer) -> set[int]:
+    """Output host dims of a gather that its index tensor is read over."""
+    index_names = {
+        access.args[0].name
+        for access in indirect_access_subs_from_op(op).values()
+        if access.args
+    }
+    symbol_to_dim = _output_symbol_to_dim(op)
+    return {
+        symbol_to_dim[sym]
+        for dep in op.get_read_writes().reads
+        if isinstance(dep, MemoryDep) and dep.name in index_names
+        for sym in dep.index.free_symbols
+        if sym in symbol_to_dim
+    }
+
+
+def _gather_data_dim_candidates(
+    op: ComputedBuffer,
+    candidates: list[SpanOverflowCandidate],
+) -> list[SpanOverflowCandidate]:
+    """Move a gather's output span candidates onto the shared table's data dims.
+
+    The span analysis offers only dims the index is read over. Tiling one of
+    those does not reduce the data coordinate that overflows, so supply the
+    table's own dims, which does. Each is offered with the worst overflowing
+    span; the stick dim only as a last resort, since tiling it leaves the
+    collector buffer needing the split that overflowed.
+    """
+    if not candidates:
+        return []
+    entry_dims = _gather_entry_host_dims(op)
+    data_dims = [
+        dim
+        for dim, size in enumerate(op.data.ranges)
+        if dim not in entry_dims and concretize_expr(size) > 1
+    ]
+    stick_dim = _stick_host_dim(op, op.layout.device_layout)
+    dims = [dim for dim in data_dims if dim != stick_dim] or data_dims
+    worst = max(candidates, key=lambda c: c.chunking_info.per_core_span)
+    return [
+        SpanOverflowCandidate(
+            dataclasses.replace(worst.chunking_info, selected_host_dim=dim),
+            source=worst.source,
+        )
+        for dim in dims
+    ]
+
+
 def _has_indirect_reads(op: ComputedBuffer) -> bool:
     """Return True if the op uses indirect/gather-style input reads.
 
-    Automatic span-overflow tiling currently handles direct MemoryDep address
-    math only.  Indirect-access ops use their own SDSC/IDA lowering path and are
-    skipped here.
+    Callers decide what to do with that: a gather is planned over the shared
+    table's data dims, while an op with its own SDSC/IDA lowering path is left
+    alone.
     """
     try:
         _, _, indirect_sizes = indirect_info_from_op(op)
     except (AttributeError, RuntimeError, TypeError, Unsupported):
         return False
     return indirect_sizes is not None
+
+
+def _is_indirect_access_related(op: ComputedBuffer) -> bool:
+    """Whether ``op`` is a gather or scatter, or the relayout copy feeding one.
+
+    For a large value tensor that copy, not the gather, is what overflows.
+    """
+    return bool(getattr(op, INDIRECT_RELAYOUT_ATTR, False)) or _has_indirect_reads(op)
 
 
 def can_conform_pointwise_tile(
@@ -2164,6 +2232,32 @@ def can_conform_pointwise_tile(
     return not remaining
 
 
+def _plan_indirect_access_tile(
+    op: ComputedBuffer,
+    max_cores: int,
+    candidates: list[SpanOverflowCandidate],
+) -> SpanOverflowTilePlan | None:
+    """Plan a tile for an op taking part in an indirect access, or decline.
+
+    Tiling is a fallback: an op work division can place keeps that plan rather
+    than trade cores for sequential trips. Declining when no tile fits lets
+    work division report the span overflow itself, instead of hiding the
+    reason behind a planner-internal message.
+    """
+    if fits_span_without_tiling(op, max_cores):
+        logger.debug("[span-overflow planner] op=%s fits without tiling", op.get_name())
+        return None
+    if _has_indirect_reads(op):
+        candidates = _gather_data_dim_candidates(op, candidates)
+    try:
+        return _search_min_cost_tile_plan(op, max_cores, candidates)
+    except Unsupported as exc:
+        logger.debug(
+            "[span-overflow planner] op=%s no tile fits: %s", op.get_name(), exc
+        )
+        return None
+
+
 def plan_span_overflow_tile(
     op: ComputedBuffer,
     max_cores: int,
@@ -2173,8 +2267,8 @@ def plan_span_overflow_tile(
     Supported inputs are static ``FixedTiledLayout`` ``ComputedBuffer`` ops whose
     data is ``Pointwise`` or ``Reduction``.  The planner skips non-computed ops,
     flexible/dynamic layouts, scalar reductions with no output ranges, and
-    indirect-access ops because those are handled outside this automatic
-    span-overflow coarse-tiling path.
+    indirect-access ops other than a gather, which is an indirect read inside a
+    ``Pointwise`` op and is planned over the shared table's data dims.
 
     The returned plan contains one or more output- or reduction-range tile levels
     plus the physical span facts that caused them.  ``None`` means this op either
@@ -2229,9 +2323,9 @@ def plan_span_overflow_tile(
         list(op.layout.device_layout.device_size),
     )
 
-    # Indirect-access ops are supported by separate lowering paths; automatic
-    # span-overflow tiling only handles direct MemoryDep address math.
-    if _has_indirect_reads(op):
+    # A gather is an indirect read inside a Pointwise op, so plan it here.
+    # Any other indirect-access op has its own lowering path.
+    if _has_indirect_reads(op) and not isinstance(op.data, Pointwise):
         logger.debug(
             "[span-overflow planner] skip op=%s reason=indirect_reads",
             op.get_name(),
@@ -2241,6 +2335,8 @@ def plan_span_overflow_tile(
     if isinstance(op.data, Pointwise):
         # Pointwise ops only need output-span analysis here.
         candidates = _output_span_candidates_from_op(op, op_name=op.get_name())
+        if candidates and _is_indirect_access_related(op):
+            return _plan_indirect_access_tile(op, max_cores, candidates)
         logger.debug(
             "[span-overflow planner] op=%s pointwise_output_candidates=%d",
             op.get_name(),

@@ -78,7 +78,7 @@ from torch_spyre._C import (  # noqa: E402
 from torch_spyre._inductor.constants import IDENTITY_OP, RESTICKIFY_OP  # noqa: E402
 from torch_spyre._inductor.op_spec import find_unimplemented  # noqa: E402
 from torch_spyre._inductor.work_division_constraints import ConstraintResult  # noqa: E402
-from utils_inductor import mock_backend_compiler
+from utils_inductor import expects_raise, mock_backend_compiler
 
 
 class _GatherScenarios:
@@ -1663,6 +1663,176 @@ def test_gather_stick_indexed_32bit(dtype):
     idx = torch.tensor([3, 17, 40, 5], dtype=torch.int32)
     out = torch.compile(lambda x, i: x[i])(x.to("spyre"), idx.to("spyre"))
     torch.testing.assert_close(out.cpu(), x[idx], atol=0, rtol=0)
+
+
+# ---------------------------------------------------------------------------
+# Per-core span of a large gather
+#
+# Work division cannot split a gather's data dims, so past the 256 MB
+# per-core span the op runs as a loop over blocks of the table's rows. The
+# buffer collecting the tiles still has to be placed, so the larger shapes
+# below need a production core count. A gather is a pure copy, so every case
+# requires an exact match against CPU.
+# ---------------------------------------------------------------------------
+
+_MOE_DOWN_PROJ = (32, 2880, 2880)  # gpt-oss-20b, 15.8 MB per expert
+_MOE_GATE_UP = (32, 2880, 5760)  # gpt-oss-20b, 31.6 MB per expert
+# 8 MB per entry, so 32 entries land exactly on the 256 MB span limit and the
+# sweep below crosses it without allocating a production-sized table.
+_SPAN_SWEEP_TABLE = (8, 2048, 2048)
+
+
+def _assert_gather_matches_cpu(table_shape, idx_shape, dtype=torch.bfloat16):
+    """Compile ``table[idx]`` and require the identical bit pattern back."""
+    torch._dynamo.reset()
+    table = torch.randn(*table_shape, dtype=dtype)
+    idx = torch.randint(0, table_shape[0], idx_shape, dtype=torch.int64)
+    out = torch.compile(lambda t, i: t[i], dynamic=False)(
+        table.to("spyre"), idx.to("spyre")
+    )
+    torch.testing.assert_close(out.cpu(), table[idx], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("experts", [4, 44], ids=lambda n: f"{n}experts")
+def test_moe_gather_down_proj_model_sizes(experts):
+    """``down_proj[expert_ids]`` at a shipping model's size.
+
+    Decode selects 4 experts and an 11-token top-4 prefill selects 44, and each
+    is hard for a different reason: 4 because the entry dim is padded to a whole
+    index stick and every padded entry is copied (63 MB charged as 506 MB), 44
+    because 44 x 15.8 MB admits no legal core split at all.
+    """
+    _assert_gather_matches_cpu(_MOE_DOWN_PROJ, (experts,))
+
+
+@pytest.mark.parametrize("experts", [4, 44], ids=lambda n: f"{n}experts")
+def test_moe_gather_gate_up_proj_model_sizes(experts):
+    """``gate_up_proj[expert_ids]``, the wider half of the same MoE layer."""
+    _assert_gather_matches_cpu(_MOE_GATE_UP, (experts,))
+
+
+@pytest.mark.parametrize("entries", [1, 2, 16, 31, 32, 33, 48, 63, 64])
+def test_gather_span_entry_count_sweep(entries):
+    """Entry counts either side of the span limit, on one table.
+
+    At 8 MB per entry the limit falls at exactly 32 entries, so this covers
+    outputs that fit outright, the boundary itself, and outputs that only run
+    once the data dim is tiled -- including counts that are not a multiple
+    of an index stick (31, 33, 63), where the entry dim cannot be split.
+    """
+    _assert_gather_matches_cpu(_SPAN_SWEEP_TABLE, (entries,))
+
+
+@pytest.mark.parametrize(
+    "idx_shape", [(4, 4), (11, 4), (8, 8)], ids=lambda s: f"{s[0]}x{s[1]}"
+)
+def test_gather_span_two_dim_index(idx_shape):
+    """A ``[tokens, top_k]`` index, the shape MoE routing actually produces.
+
+    A 2-D index puts the entry dims outermost in the output's device layout,
+    unlike the 1-D case, so it exercises a different coordinate geometry for
+    the same span question.
+    """
+    _assert_gather_matches_cpu(_SPAN_SWEEP_TABLE, idx_shape)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_gather_span_dtypes(dtype):
+    """The span limit is a byte count, so a tiled gather must hold for either
+    2-byte dtype.
+
+    The reference is the table as the device holds it, not the host tensor: an
+    fp16 table loses mantissa bits on the transfer, which happens before the
+    gather. Against the device's own values the gather is exact for both.
+    """
+    torch._dynamo.reset()
+    table = torch.randn(*_SPAN_SWEEP_TABLE, dtype=dtype)
+    idx = torch.randint(0, _SPAN_SWEEP_TABLE[0], (48,), dtype=torch.int64)
+    on_device = table.to("spyre")
+    expected = on_device.cpu()[idx]
+    out = torch.compile(lambda t, i: t[i], dynamic=False)(on_device, idx.to("spyre"))
+    torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
+
+
+@expects_raise
+def test_gather_span_unfactorable_data_dim_is_rejected():
+    """A data dim with no useful divisor cannot be tiled, and says so.
+
+    Tiling and work division both need an exact divisor of the overflowing dim.
+    2879 is prime, so neither has one and the compile reports the span error
+    instead of emitting a tile that still overflows. Tiling the other data
+    dim does not rescue it either: the collector buffer keeps 2879 outermost.
+    The same shape at 2880 compiles exactly.
+    """
+    torch._dynamo.reset()
+    table = torch.randn(8, 2879, 2880, dtype=torch.bfloat16)
+    idx = torch.randint(0, 8, (44,), dtype=torch.int64)
+    with pytest.raises(Exception, match="per-core tensor span"):
+        torch.compile(lambda t, i: t[i], dynamic=False)(
+            table.to("spyre"), idx.to("spyre")
+        )
+
+
+# ---------------------------------------------------------------------------
+# F.embedding on a large vocab table
+#
+# A vocab table runs only because nn.Embedding uploads it in the gather's own
+# layout, so the span follows the sequence length rather than the vocab size.
+# Moved as a plain tensor it keeps the default tiling and has to be re-copied,
+# a relayout no core split fits -- the last test here.
+# ---------------------------------------------------------------------------
+
+# vocab, hidden, prefill seq_len, model -- five shipping models' tables.
+_VOCAB_TABLES = [
+    (262144, 2816, 34, "gemma-4-26B"),
+    (201088, 2880, 11, "gpt-oss-20b"),
+    (131072, 5120, 14, "Ministral-3-14B"),
+    (131072, 5120, 855, "Mistral-Small-3.2-24B"),
+    (152064, 3584, 39, "Qwen2.5-7B"),
+]
+
+_EMBEDDING_CASES = [
+    (vocab, hidden, seq_len, f"{model}-{phase}")
+    for vocab, hidden, prefill, model in _VOCAB_TABLES
+    for seq_len, phase in ((1, "decode"), (prefill, "prefill"))
+]
+
+
+@pytest.mark.parametrize(
+    "vocab,hidden,seq_len",
+    [case[:3] for case in _EMBEDDING_CASES],
+    ids=[case[3] for case in _EMBEDDING_CASES],
+)
+def test_embedding_vocab_table_model_sizes(vocab, hidden, seq_len):
+    """nn.Embedding at each shipping table size, decode and prefill."""
+    torch._dynamo.reset()
+    emb = torch.nn.Embedding(vocab, hidden, dtype=torch.bfloat16)
+    ids = torch.randint(0, vocab, (1, seq_len), dtype=torch.int64)
+    # nn.Module.to() moves in place, so take the reference before moving.
+    expected = emb(ids)
+    emb.to("spyre")
+    out = torch.compile(lambda m, i: m(i), dynamic=False)(emb, ids.to("spyre"))
+    torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("seq_len", [1, 34], ids=["decode", "prefill"])
+def test_embedding_plain_tensor_table(seq_len):
+    """F.embedding on a vocab table moved as a plain tensor.
+
+    The table arrives in the default layout, so a relayout copy of all 1.38 GB
+    is inserted ahead of the gather. No core split fits that copy, so it runs
+    as sequential trips over blocks of the table. Uploading in gather layout
+    (the test above) skips it; this pins that the slow route is still correct.
+    """
+    torch._dynamo.reset()
+    vocab, hidden = 262144, 2816
+    weight = torch.randn(vocab, hidden, dtype=torch.bfloat16)
+    ids = torch.randint(0, vocab, (1, seq_len), dtype=torch.int64)
+    expected = torch.nn.functional.embedding(ids, weight)
+    out = torch.compile(torch.nn.functional.embedding, dynamic=False)(
+        ids.to("spyre"), weight.to("spyre")
+    )
+    torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
 
 
 if __name__ == "__main__":
