@@ -39,6 +39,7 @@ from torch._inductor.virtualized import V
 
 
 from .constants import (
+    BATCH_MATMUL_OP,
     SPYRE_FP32_OPS,
     SPYRE_INT32_OPS,
     CONV_OPS,
@@ -1048,8 +1049,10 @@ class SpyreKernel(Kernel[CSEVariable]):
                     and arg.device_dtype
                     in [DataFormats.SEN143_FP8, DataFormats.SEN152_FP8]
                 )
+                or _is_sen1p5_bf16_matmul_input(op, arg)
             ):
                 raise Unsupported(f"{op} on {arg.device_dtype}")
+        _check_sen1p5_matmul_inputs(op, args)
 
         it_space = iteration_space(self.current_node)
 
@@ -1655,6 +1658,36 @@ def _indirect_syms_used(
     if dst_index is not None:
         syms.update(s for s in dst_index.free_symbols if s in indirect_vars)
     return syms
+
+
+def _is_sen1p5_bf16_matmul_input(op: str, arg: TensorArg) -> bool:
+    """A BFLOAT16 matmul input on 1p5 (the output stays DLFloat16)."""
+    return (
+        _spyre_config.sen1p5
+        and op == BATCH_MATMUL_OP
+        and arg.is_input
+        and arg.device_dtype == DataFormats.BFLOAT16
+    )
+
+
+def _check_sen1p5_matmul_inputs(op: str, args: Sequence[TensorArg]) -> None:
+    """On 1p5 a matmul takes BFLOAT16 inputs only. An input that is already
+    BFLOAT16 on the device (a graph input or weight copied with
+    ``.to("spyre", device_layout=...)`` and a BFLOAT16 SpyreTensorLayout) is
+    used as it is. Any other input is refused here with a message, instead of
+    failing later in the backend compiler. There is no on-device
+    DLFloat16-to-BFLOAT16 conversion to insert yet."""
+    if not (_spyre_config.sen1p5 and op == BATCH_MATMUL_OP):
+        return
+    for arg in args:
+        if arg.is_input and arg.device_dtype != DataFormats.BFLOAT16:
+            raise Unsupported(
+                f"{op} on {arg.device_dtype} for sen1p5: matmul inputs must "
+                "be BFLOAT16 on the device; copy each operand with "
+                '.to("spyre", device_layout=...) and device_dtype '
+                "DataFormats.BFLOAT16 (an operand computed by another kernel "
+                "is not supported yet)"
+            )
 
 
 def _is_indirect_index_arg(
