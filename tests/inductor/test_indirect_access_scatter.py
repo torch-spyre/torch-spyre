@@ -19,9 +19,9 @@ self._stage_and_e2e(...): it asserts across every capture-path stage --
 classification, op-spec structure (IndirectAccess on the output), and SDSC
 fields -- and then runs the kernel end-to-end on the real backend.
 
-The two forms that crash during compilation -- index_fill (rank-0 scalar
-Constant codegen) and masked_scatter (mask-based CPU fallback) -- stay
-capture-only via check(expect=CRASHED); there is no bundle to run end-to-end.
+An element-level masked_scatter mask is rejected by its decomposition and
+stays capture-only via check(expect=CRASHED); there is no bundle to run
+end-to-end.
 
 """
 
@@ -1336,25 +1336,70 @@ class _ScatterScenarios:
 
         self._stage_and_e2e(kernel, out, src, index, expect=DIRECT_OP_SPEC)
 
-    # -- Known crashes (separate from the indirect-store path) -------------
-    def test_index_fill_crashes(self):
-        """out.index_fill_(0, idx, 0.0) -- scalar fill -> rank-0 Constant codegen."""
-        # Main 6e92c9ec and lift 89c7c210 both reject the scalar Constant
-        # before producing an OpSpec. The lift also rejects this unsupported
-        # scatter's missing index bound during preflight; this is not a
-        # successful-finalization case and must not hide any other fallback.
-        out = torch.rand(128, 256, dtype=torch.float16).to("spyre")
-        idx = torch.randint(0, 128, (3,), dtype=torch.int32).to("spyre")
-        self.name_dims(out, {"M": 128, "N": 256})
-        self.name_dims(idx, {"P": 3})
+    # -- Scalar-value fills: materialized by a decomposition ----------------
+    def test_index_fill_scalar(self):
+        """out.index_fill_(0, idx, 0.0) -- scalar fill on the row dim.
+
+        The scalar form used to reach the kernel as a rank-0 Constant and be
+        rejected ("store value of unexpected type Constant"); spyre_index_fill
+        materializes it into a `full` and scatters that, so this is an ordinary
+        indirect store (torch-spyre#4446, #4472). This is the KV-cache padding
+        shape: zero the unused cache slots.
+        """
+        M, N, P = 128, 256, 3
+        out = torch.rand(M, N, dtype=torch.float16).to("spyre")
+        # int64: index_fill_ requires a long index, as index_copy_ does above.
+        # Unique rows: a constant fill is well defined under duplicates, but
+        # keeping them unique matches the rest of the scatter scenarios.
+        idx = torch.randperm(M, dtype=torch.int64)[:P].to("spyre")
+        self.name_dims(out, {"M": M, "N": N})
+        self.name_dims(idx, {"P": P})
 
         def kernel(out, idx):
             return out.index_fill_(0, idx, 0.0)
 
-        result = self.check(kernel, out, idx, expect=CRASHED)
-        self.assertIn("store value of unexpected type", str(result.exc))
-        self.assertIn("Constant", str(result.exc))
+        self._stage_and_e2e(kernel, out, idx, expect=SCATTER_OP_SPEC)
 
+    def test_index_fill_scalar_3d(self):
+        """x.index_fill_(0, idx, 7.0) on a 3-D bf16 tensor [rows, 8, 128].
+
+        Same shape as the index_copy_ 3-D coverage above, with a nonzero fill
+        value so a dropped write is distinguishable from the initial contents.
+        """
+        rows, H, D, P = 16, 8, 128, 3
+        x = torch.ones(rows, H, D, dtype=torch.bfloat16).to("spyre")
+        # int64: index_fill_ requires a long index.
+        idx = torch.tensor([1, 5, 10], dtype=torch.int64).to("spyre")
+        self.name_dims(x, {"ROWS": rows, "H": H, "D": D})
+        self.name_dims(idx, {"P": P})
+
+        def kernel(x, idx):
+            return x.index_fill_(0, idx, 7.0)
+
+        self._stage_and_e2e(kernel, x, idx, expect=SCATTER_OP_SPEC)
+
+    def test_scatter_value(self):
+        """out.scatter_(0, index, 0.0) -- scalar form of the full-index scatter.
+
+        spyre_scatter_value materializes the scalar into an index-shaped `src`,
+        so this behaves exactly like test_scatter_method_without_unary: the op
+        spec is produced and the backend scheduler then rejects the dim-0
+        bundle (#4409). Drop the pin once that is fixed.
+        """
+        out, _src, index = self._full_index_store()
+
+        def kernel(out, index):
+            return out.scatter_(0, index, 0.0)
+
+        self._stage_and_e2e(
+            kernel,
+            out,
+            index,
+            expect=SCATTER_OP_SPEC,
+            expect_backend_error=_INDEX_STICK_DIM_ERROR,
+        )
+
+    # -- Known crashes (separate from the indirect-store path) -------------
     def test_masked_scatter_element_mask_unsupported(self):
         """Element-level mask (stride(-1) != 0): the decomposition rejects it.
 

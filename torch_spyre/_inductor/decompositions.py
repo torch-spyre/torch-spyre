@@ -4160,6 +4160,56 @@ def spyre_index_add(
     return torch.index_put(self, indices, updated, accumulate=False)
 
 
+@register_spyre_decompositions([torch.ops.aten.index_fill.int_Scalar])
+def spyre_index_fill(
+    self: torch.Tensor,
+    dim: int,
+    index: torch.Tensor,
+    value: Union[int, float, bool],
+) -> torch.Tensor:
+    """`index_fill` as a materialized `full` plus an overwrite-scatter.
+
+    ``value`` is built into a tensor shaped like the written slice -- ``self``'s
+    shape with the filled dim narrowed to ``index.numel()`` -- and stored with
+    ``index_put``, which runs on the indirect-access engine. ``new_full`` carries
+    ``self``'s dtype and device, so no promotion is introduced.
+
+    ``indices`` selects the filled dim positionally: ``None`` covers a dim whole,
+    so ``[None] * dim + [index]`` is the list form of ``self[..., index]`` at
+    ``dim``. ``accumulate=False`` makes the write an overwrite.
+
+    Duplicate entries in ``index`` are safe here: every writer to a slot stores
+    the same value, so the surviving writer does not matter.
+    """
+    dim = dim % self.dim()
+    fill_shape = list(self.shape)
+    fill_shape[dim] = index.numel()
+    src = self.new_full(fill_shape, value)
+    indices: list[Optional[torch.Tensor]] = [None] * dim + [index]
+    return torch.index_put(self, indices, src, accumulate=False)
+
+
+@register_spyre_decompositions([torch.ops.aten.scatter.value])
+def spyre_scatter_value(
+    self: torch.Tensor,
+    dim: int,
+    index: torch.Tensor,
+    value: Union[int, float, bool],
+) -> torch.Tensor:
+    """`scatter.value` as `scatter.src` with the scalar materialized.
+
+    ``scatter.src`` takes its written values from a tensor shaped like ``index``
+    -- one value per index entry -- so ``value`` is built to that shape and
+    forwarded. ``new_full`` carries ``self``'s dtype and device.
+
+    As in :func:`spyre_index_fill`, duplicate index entries are safe: every
+    writer stores the same value.
+    """
+    dim = dim % self.dim()
+    src = self.new_full(list(index.shape), value)
+    return torch.ops.aten.scatter.src(self, dim, index, src)
+
+
 def _grouped_mm_capacity(n: int, num_experts: int) -> int:
     """Static per-expert capacity: 2 * ceil_to_64(n / num_experts), clamped to [64, n].
 
