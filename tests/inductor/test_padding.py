@@ -63,7 +63,13 @@ from torch_spyre._inductor.padding import (
 )
 from torch_spyre._inductor.scratchpad import allocator
 from torch_spyre._inductor.scratchpad import utils as scratchpad_utils
-from utils_inductor import try_reinterpret_host_shape, total_core_split, cached_randn
+from torch_spyre._inductor.scratchpad.plan_solver import TileAxis, TileSpec
+from utils_inductor import (
+    try_reinterpret_host_shape,
+    total_core_split,
+    cached_randn,
+    expects_raise,
+)
 
 
 Ts = TypeVarTuple("Ts")
@@ -1776,11 +1782,6 @@ class TestPaddedInputCoreDivision(unittest.TestCase):
             (251, 256, 8),
         ],
     )
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason="work division splits the host row extent, not the padded device extent (#741)",
-    )
     def test_pointwise_splits_padded_rows(self, rows, padded_rows, sencores) -> None:
         """A pointwise op on a row-padded input splits the padded rows across
         all cores.
@@ -1798,6 +1799,59 @@ class TestPaddedInputCoreDivision(unittest.TestCase):
             torch.testing.assert_close(out.cpu(), x_cpu * 2, atol=0.0, rtol=0.0)
             self.assertEqual(out.device_tensor_layout().device_size, ds)
             self.assertEqual(total_core_split(source_codes[0]), sencores)
+
+    @staticmethod
+    def _force_row_tiling(tiles: int):
+        """Patch context tiling every computed op's row dim ``tiles`` ways.
+
+        Bypasses the solve's own choice, which does not tile anything this
+        small.
+        """
+        spec = TileSpec((TileAxis(host_dim=0, count=tiles),))
+
+        def chosen(graph, planned):
+            return {
+                op.get_operation_name(): spec
+                for op in graph.operations
+                if isinstance(op, ComputedBuffer)
+            }
+
+        return patch(
+            "torch_spyre._inductor.scratchpad.coarse_tiling.chosen_tilings", chosen
+        )
+
+    @expects_raise
+    def test_coarse_tiling_rejects_a_padded_row_dim(self) -> None:
+        """Coarse tiling a row-padded buffer is rejected, before codegen.
+
+        ``_resize_device_layout`` shrinks each non-stick ``device_size`` entry to
+        its per-tile extent, and matches device dims to host dims *by size*. A
+        padded row dim is larger than its host dim, so no match is found and the
+        tiling is refused.
+
+        That refusal is why codegen's padding never meets a padded tensor inside
+        a tile loop: the combination does not compile at all. The
+        ``enclosing_loops`` guard in ``create_op_spec`` is belt and braces --
+        removing it does not change this test, because the rejection happens in
+        pre-scheduling.
+
+        TODO(#741): when coarse tiling learns padded layouts, this becomes a
+        positive test -- force the same tiling and assert the result matches
+        ``x_cpu * 2`` exactly -- and the guard starts earning its keep.
+        """
+        rows, padded_rows, tiles = 60, 64, 4
+        with (
+            ts_inductor_config.patch(
+                sencores=4,
+                co_optimizing_lx_planning=True,
+                auto_coarse_tiling=True,
+                allow_all_ops_in_lx_planning=True,
+            ),
+            self._force_row_tiling(tiles),
+            pytest.raises(Exception, match="_resize_device_layout"),
+        ):
+            _, x_spyre, _ = self._padded_rows_input(rows, padded_rows)
+            self._run_times_two(x_spyre)
 
 
 if __name__ == "__main__":

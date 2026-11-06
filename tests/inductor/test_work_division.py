@@ -119,10 +119,12 @@ from torch_spyre._inductor.work_division import (
     deferred_work_division,
     enumerate_work_division_candidates,
     multi_dim_iteration_space_split,
+    pad_iteration_space,
     span_floors,
     work_division_context_for_op,
     work_division_splits_are_legal,
 )
+from torch_spyre._inductor.op_spec import IndirectAccess
 from torch_spyre._inductor.work_division_constraints import (
     JOINT_TILING_AND_DIVISION_ATTR,
     ConstraintResult,
@@ -1321,6 +1323,41 @@ class TestAdjustItSpaceForPadding(unittest.TestCase):
             it_space, [self._dep("x", 8)], self._dep("out")
         )
         self.assertEqual(kept, it_space)
+
+
+class TestPadIterationSpaceIndirect(unittest.TestCase):
+    """``pad_iteration_space`` never pads an op with indirect access: iterating
+    into an index tensor's padding would use garbage as indices.
+
+    Both forms are covered: work division sees an ``IndirectAccess`` call in a
+    coordinate, while codegen, before that substitution, sees the raw indirect
+    symbol, which is not an iteration var. Accesses are given as
+    ``(device_coords, device_size)`` pairs, as codegen passes them.
+    """
+
+    def setUp(self):
+        self.rows, self.cols = _isym("d0"), _isym("d1")
+        self.it_space = {self.rows: sympy.Integer(7), self.cols: sympy.Integer(64)}
+        # The output reads rows as a whole coordinate, padded 7 -> 8, so rows
+        # would grow if nothing else blocked it.
+        self.output = ([sympy.Integer(0), self.rows, self.cols], [1, 8, 64])
+
+    def _pad(self, gather_row_coord):
+        """Pad for ``out[rows, cols] = x[gather_row_coord, cols]``, ``x`` being
+        a 100-row source table."""
+        source = ([sympy.Integer(0), gather_row_coord, self.cols], [1, 100, 64])
+        return pad_iteration_space(self.it_space, self.output[0], [source, self.output])
+
+    def test_direct_source_lets_rows_grow(self):
+        # The control: with a direct read of x, rows grows to the padded 8.
+        self.assertEqual(self._pad(sympy.Integer(3))[self.rows], 8)
+
+    def test_indirect_access_keeps_rows(self):
+        gathered = IndirectAccess(sympy.Symbol("idx"))
+        self.assertEqual(self._pad(gathered), self.it_space)
+
+    def test_raw_indirect_symbol_keeps_rows(self):
+        self.assertEqual(self._pad(sympy.Symbol("tmp0")), self.it_space)
 
 
 class TestWorkDivisionContextPadding(unittest.TestCase):

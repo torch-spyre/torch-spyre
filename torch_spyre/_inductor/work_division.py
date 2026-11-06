@@ -539,7 +539,7 @@ def adjust_it_space_for_sticks(
 def _padded_extent(
     sym: Symbol,
     extent_expr: Expr | int,
-    tensor_deps: list[TensorDep],
+    accesses: Iterable[tuple[Sequence[Expr], Sequence[int]]],
 ) -> Expr:
     """Return the padded extent ``sym`` can iterate to, or ``extent_expr`` to keep
     the current one.
@@ -561,13 +561,13 @@ def _padded_extent(
         extent = int(extent_expr)
 
     grown_extent = None
-    for dep in tensor_deps:
-        if dep.device_coords[-1].has(sym):
+    for device_coords, device_sizes in accesses:
+        if device_coords[-1].has(sym):
             return extent_expr
 
         for coord, new_extent in zip(
-            dep.device_coords[:-1],
-            dep.layout.device_layout.device_size[:-1],
+            device_coords[:-1],
+            device_sizes[:-1],
             strict=True,
         ):
             if coord == sym:
@@ -589,32 +589,66 @@ def _padded_extent(
     return extent_expr if grown_extent is None else sympy.Integer(grown_extent)
 
 
-def adjust_it_space_for_padding(
+def pad_iteration_space(
     it_space: dict[Symbol, Expr],
-    input_tds: list[TensorDep],
-    output_td: TensorDep,
+    output_coords: Sequence[Expr],
+    accesses: Sequence[tuple[Sequence[Expr], Sequence[int]]],
 ) -> dict[Symbol, Expr]:
     """Return a copy of ``it_space`` with each padded output dim grown to its
     padded device extent.
 
-    Only output coordinate vars are candidates; every other var, including
-    reduction vars, keeps its extent. See ``_padded_extent`` for when a
-    candidate grows.
+    Only vars in the output's non-stick coordinates are candidates; every
+    other var, including reduction vars, keeps its extent. See
+    :func:`_padded_extent` for when a candidate grows.
+
+    Work division calls this through :func:`adjust_it_space_for_padding`;
+    codegen calls it directly with its kernel args, so both see the same
+    extents.
+
+    Args:
+        it_space: Extent of each iteration var, in elements.
+        output_coords: The output's device coordinates, one per device dim; the
+            last is the in-stick coordinate.
+        accesses: ``(device_coords, device_size)`` for every tensor the op
+            reads or writes, the output included. The two line up dim for dim.
+
+    Returns:
+        A new dict with the same keys, in the same order.
     """
+    # Indirect access: the index tensor's padding holds garbage indices, so
+    # iterating into it would read or write outside the indexed tensor.
+    if any(
+        coord.has(IndirectAccess) or not coord.free_symbols <= it_space.keys()
+        for coords, _ in accesses
+        for coord in coords
+    ):
+        return dict(it_space)
+
     candidates = {
         sym
-        for coord in output_td.device_coords[:-1]
+        for coord in output_coords[:-1]
         for sym in coord.free_symbols
         if sym in it_space
     }
 
     adjusted_it_space = dict(it_space)
     for sym in candidates:
-        adjusted_it_space[sym] = _padded_extent(
-            sym, it_space[sym], input_tds + [output_td]
-        )
+        adjusted_it_space[sym] = _padded_extent(sym, it_space[sym], accesses)
 
     return adjusted_it_space
+
+
+def adjust_it_space_for_padding(
+    it_space: dict[Symbol, Expr],
+    input_tds: list[TensorDep],
+    output_td: TensorDep,
+) -> dict[Symbol, Expr]:
+    """:func:`pad_iteration_space` for an op's tensor deps."""
+    accesses = [
+        (td.device_coords, td.layout.device_layout.device_size)
+        for td in input_tds + [output_td]
+    ]
+    return pad_iteration_space(it_space, output_td.device_coords, accesses)
 
 
 @dataclasses.dataclass(frozen=True)
