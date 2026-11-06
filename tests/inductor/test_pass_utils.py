@@ -28,10 +28,11 @@ from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import ComputedBuffer, FixedLayout, Pointwise, Scatter
 from torch._inductor.sizevars import SizeVarAllocator
 from torch._inductor.virtualized import V
-from torch_spyre._C import SpyreTensorLayout
 from torch.utils._ordered_set import OrderedSet
+from torch_spyre._C import SpyreTensorLayout
 
 import torch_spyre._inductor.pass_utils as pass_utils
+from torch_spyre._inductor.propagate_layouts import PropArg
 from torch_spyre._inductor.patches import _unique_operation_names
 from torch_spyre._inductor.wrapper import noop_simplify_loops_impl
 
@@ -48,7 +49,10 @@ def test_restickify_does_not_discard_folded_cache_pages(folded_axis):
         size = [64, 2, 20, 128]
         stride = [5120, 2560, 128, 1]
         stl = SpyreTensorLayout(
-            [64, 2, 40, 64], [5120, 2560, 64, 1], DataFormats.SEN169_FP16
+            [64, 2, 40, 64],
+            [5120, 2560, 64, 1],
+            DataFormats.SEN169_FP16,
+            {(0,): 64, (1,): 2, (2, 3): 40 * 64},
         )
         host_coords = [token, head, page, feature]
         device_coords = [
@@ -75,7 +79,10 @@ def test_restickify_does_not_discard_folded_cache_pages(folded_axis):
         )
         if folded_axis == "new":
             stl = SpyreTensorLayout(
-                [1280, 2, 1, 64], [128, 64, 64, 1], DataFormats.SEN169_FP16
+                [1280, 2, 1, 64],
+                [128, 64, 64, 1],
+                DataFormats.SEN169_FP16,
+                {(0,): 1280, (1,): 2, (2, 3): 1 * 64},
             )
             device_coords = [64 * page + token, head, sympy.S.Zero, feature]
         else:
@@ -83,6 +90,7 @@ def test_restickify_does_not_discard_folded_cache_pages(folded_axis):
                 [20, 64, 2, 1, 64],
                 [8192, 128, 64, 64, 1],
                 DataFormats.SEN169_FP16,
+                {(0,): 20, (1,): 64, (2,): 2, (3, 4): 64},
             )
             device_coords = [page, token, head, sympy.S.Zero, feature]
     host = FixedLayout(torch.device("cpu"), torch.float16, size, stride)
@@ -148,6 +156,65 @@ def test_scatter_index_discovery_preserves_load_order_after_wrapping():
         ]
         subs, _ = pass_utils._build_indirect_store_subs(scatter)
     assert [value.base.name for value in subs.values()] == ["new_rows", "new_columns"]
+
+
+def _layout_state_marked_op():
+    """A pointwise op carrying the per-op results of layout propagation."""
+    op = ComputedBuffer(
+        name="buf0",
+        layout=FixedLayout(torch.device("cpu"), torch.float32, [64], [1]),
+        data=Pointwise(
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            inner_fn=lambda index: V.ops.load("src", index[0]),
+            ranges=[64],
+        ),
+    )
+    op.operation_name = "op0"
+    op.layouts = ["layouts-sentinel"]
+    op.restick_cost_fn = "cost-sentinel"
+    op.committed_stl = "committed-sentinel"
+    return op
+
+
+def test_redirect_computed_buffer_reads_keeps_layout_state():
+    """Rebuilding a reader after layout propagation must not drop its results.
+
+    ``layouts``, ``restick_cost_fn`` and ``committed_stl`` are set by
+    propagate_spyre_tensor_layouts / nonstick_dim_order.  A rebuild that loses
+    them makes later passes fail (KeyError in optimize_restickify, FixedLayout
+    without ``device_layout`` in insert_restickify).
+    """
+    op = _layout_state_marked_op()
+    graph = types.SimpleNamespace(
+        sizevars=SizeVarAllocator(),
+        name_to_buffer={"buf0": op},
+        name_to_op={"op0": op},
+    )
+    with V.set_graph_handler(graph):
+        rebuilt = pass_utils.redirect_computed_buffer_reads(
+            op, {"src": "other"}, [op], pass_name="test"
+        )
+    assert rebuilt is not op
+    assert rebuilt.layouts == ["layouts-sentinel"]
+    assert rebuilt.restick_cost_fn == "cost-sentinel"
+    assert rebuilt.committed_stl == "committed-sentinel"
+
+
+def test_copy_op_metadata_layout_state_is_opt_in():
+    """A new op built from another op must not inherit the source's layouts."""
+    from torch_spyre._inductor.loop_info import copy_op_metadata
+
+    src = _layout_state_marked_op()
+    default = types.SimpleNamespace()
+    copy_op_metadata(src, default)
+    for attr in ("layouts", "restick_cost_fn", "committed_stl"):
+        assert not hasattr(default, attr)
+    opted = types.SimpleNamespace()
+    copy_op_metadata(src, opted, layout_state=True)
+    assert opted.layouts == ["layouts-sentinel"]
+    assert opted.restick_cost_fn == "cost-sentinel"
+    assert opted.committed_stl == "committed-sentinel"
 
 
 @pytest.mark.parametrize("indexed_axis", [0, 1, 2])
@@ -371,9 +438,11 @@ def test_compute_restickify_target_layout_moves_to_existing_size1_dim():
     # outer dim's coordinate is the same constant as the host's size-1 dim.
     stl = SpyreTensorLayout([1, 64], [64, 1], torch.float16, [0, 1])
     idc = [sympy.S.Zero, d1]
+    dep = MemoryDep("x", d1, (d1,), (64,))
+    arg = PropArg(dep, host_layout, [stl])
 
     result = pass_utils.compute_restickify_target_layout(
-        stl, host_layout, sympy.S.Zero, ic, idc
+        stl, host_layout, sympy.S.Zero, ic, idc, arg=arg
     )
 
     assert result is not None
@@ -393,8 +462,10 @@ def test_compute_restickify_target_layout_synthesizes_when_no_size1_dim_exists()
     ic = pass_utils.host_coordinates(host_layout, dep, None)
     idc = pass_utils.device_coordinates(stl, dep, None)
 
+    arg = PropArg(dep, host_layout, [stl])
+
     result = pass_utils.compute_restickify_target_layout(
-        stl, host_layout, sympy.S.Zero, ic, idc
+        stl, host_layout, sympy.S.Zero, ic, idc, arg=arg
     )
 
     assert result is not None
