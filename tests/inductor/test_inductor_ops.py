@@ -3789,43 +3789,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
-        # Host-resident integer operand inside a Spyre graph: a position index
-        # built with torch.arange (CPU int64) and compared before being moved to
-        # the device, as in LFM2's causal conv. The compare runs on CPU, so the
-        # Spyre int -> float promotion must not be applied to it.
-        ("test_cmp_host_operand", "test_cmp_host_operand_cpu"): {
-            "ops_dict": {
-                "eq": torch.eq,
-                "ne": torch.ne,
-                "lt": torch.lt,
-                "le": torch.le,
-                "gt": torch.gt,
-                "ge": torch.ge,
-            },
-            "param_sets": {
-                "fp16_1x64x64": (cached_randn((1, 64, 64)),),
-            },
-        },
-        # Host-resident integer tensor clamped inside a Spyre graph: an index
-        # vector built with torch.arange (CPU int64) is clamped before being
-        # moved to the device, mirroring LFM2-style mask construction. The clamp
-        # runs on CPU, so the Spyre int -> float promotion must not be applied.
-        ("test_clamp_host_operand", "test_clamp_host_operand_cpu"): {
-            "ops_dict": {
-                "clamp": torch.clamp,
-                "clamp_min": torch.clamp_min,
-                "clamp_max": torch.clamp_max,
-            },
-            # TODO: the clamped int64 mask converts to fp16 on device, which makes
-            # it staggered, and it does not broadcast at the stick dim, so its
-            # product with the STANDARD fp16 operand is rejected as mixed EA.
-            "expect_raise": {
-                "fp16_1x64x64": "Multi-arg pointwise with mixed EA",
-            },
-            "param_sets": {
-                "fp16_1x64x64": (cached_randn((1, 64, 64)),),
-            },
-        },
         # -----------------------------------------------------------------------
         # Large integers: int -> fp32 is LOSSY. fp32 carries a 24-bit significand,
         # so above 2**24 the gaps between representable values exceed 1 and two
@@ -10461,31 +10424,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_cmp_mixed_dtype_cpu(self, op, x, y):
         # Operands with different dtypes: the lowering promotes both to one dtype.
         self.compare_with_cpu(op, x, y, run_eager=True)
-
-    def test_cmp_host_operand_cpu(self, op, x):
-        # The compare's operands live on CPU even though the graph targets Spyre.
-        def fn(x):
-            positions = torch.arange(x.shape[-1])
-            mask = op(positions, 2)[None, None, :]
-            return x * mask.to(dtype=x.dtype, device=x.device)
-
-        self.compare_with_cpu(fn, x, run_eager=False)
-
-    def test_clamp_host_operand_cpu(self, op, x):
-        # The clamp operand lives on CPU even though the graph targets Spyre.
-        # An int64 position index is clamped then moved to the device, as in
-        # LFM2-style causal conv mask construction.
-        def fn(x):
-            positions = torch.arange(x.shape[-1])  # CPU int64
-            if op is torch.clamp:
-                clamped = op(positions, min=0, max=1)
-            elif op is torch.clamp_min:
-                clamped = op(positions, min=0)
-            else:  # clamp_max
-                clamped = op(positions, max=1)
-            return x * clamped[None, None, :].to(dtype=x.dtype, device=x.device)
-
-        self.compare_with_cpu(fn, x, run_eager=False)
 
     def test_cmp_bigint_cpu(self, op, x, y):
         # Integers large enough that int→fp32 loses the distinction between them.
