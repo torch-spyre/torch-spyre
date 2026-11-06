@@ -195,9 +195,33 @@ def _legal_split_factors(
     return [s for s in factors if s >= (min_splits or {}).get(v, 1)]
 
 
-def _span_min_splits(op: ComputedBuffer) -> dict[Symbol, int]:
-    """Return the hard span floors committed by ``span_reduction_pass``."""
-    return getattr(op, "_work_division_span_min_splits", {})
+def _has_span_floors(op: Operation) -> bool:
+    """Whether ``op`` is divided at all: a ``Pointwise`` or ``Reduction``
+    ``ComputedBuffer`` with a device layout. Any other op has no span floors."""
+    if not isinstance(op, ComputedBuffer) or not isinstance(
+        op.data, (Pointwise, Reduction)
+    ):
+        return False
+    layout = op.maybe_get_layout()
+    if isinstance(layout, MutationLayoutSHOULDREMOVE):
+        layout = layout.real_layout()
+    return isinstance(layout, FixedTiledLayout)
+
+
+def span_floors(op: Operation) -> dict[Symbol, int]:
+    """The hard minimum split per axis that keeps every tensor of ``op``
+    within ``MAX_SPAN_BYTES`` per core, computed from ``op`` as it is now.
+
+    Every division of ``op`` must meet these floors. Empty for an op that is
+    not divided (see :func:`_has_span_floors`) or that fits on one core.
+    Raises ``Unsupported`` where :func:`_compute_span_floors` does.
+    """
+    if not _has_span_floors(op):
+        return {}
+    assert isinstance(op, ComputedBuffer)
+    ctx = work_division_context_for_op(op)
+    assert ctx is not None  # untiled: never None
+    return ctx.span_min_splits
 
 
 def _largest_legal_split(
@@ -861,7 +885,7 @@ class WorkDivisionContext:
     # Dims absent from the output's device coordinates, i.e. reduction (K) dims.
     reduction_vars: list[Symbol]
     constraints: ConstraintResult
-    # Hard per-axis floors ``span_reduction_pass`` has already committed.
+    # Hard per-axis floors from the span limit, in this context's frame.
     span_min_splits: dict[Symbol, int]
     # factor_domain is asked once per axis by the enumeration and again per
     # candidate by is_legal; the derivation is sympy-heavy, so memoize it.
@@ -879,9 +903,9 @@ class WorkDivisionContext:
 
         Mirrors ``must_split_vars.valid_splits``, minus that helper's own
         ``>= current_min`` search floor: the full set, narrowed by the op's
-        allowed-split domains and by any span floor ``span_reduction_pass``
-        committed. The committed floor is applied here, so ``1`` is absent
-        wherever a floor or an exact domain excludes it.
+        allowed-split domains and by its span floors (``span_min_splits``).
+        The floor is applied here, so ``1`` is absent wherever a floor or an
+        exact domain excludes it.
         """
         if v not in self._factor_domains:
             if v in self.symbol_meta:
@@ -912,7 +936,7 @@ class WorkDivisionContext:
 
     def obeys_op_constraints(self, splits: dict[Symbol, int]) -> bool:
         """The subset of :meth:`is_legal` intrinsic to the op, dropping the
-        core budget, the ``MAX_SPAN_BYTES`` cap, the committed span floors and
+        core budget, the ``MAX_SPAN_BYTES`` cap, the span floors and
         the divisibility check -- so a split committed under one core budget
         stays legal under another.
 
@@ -925,8 +949,8 @@ class WorkDivisionContext:
         )
 
     def meets_span_floors(self, splits: dict[Symbol, int]) -> bool:
-        """Whether ``splits`` meets the hard span floors ``span_reduction_pass``
-        committed. A factor that is present is already checked against the
+        """Whether ``splits`` meets the op's hard span floors
+        (``span_min_splits``). A factor that is present is already checked against the
         axis's :meth:`factor_domain`, which applies the floor, so this is what
         rejects a split that omits a floored axis altogether."""
         return all(
@@ -995,6 +1019,10 @@ def work_division_context_for_op(
     it directly would raise ``IndexError``/``KeyError`` on a spec the predictor
     rejects by value, and would silently disagree with the frame the allocator
     prices the same candidate on.
+
+    The span floors are computed in the same frame, so a tiling that shrinks
+    a span relaxes them. Raises ``Unsupported`` where
+    :func:`_compute_span_floors` does.
     """
     it_space = iteration_space_from_op(op)
     if tiling is not None and not tiling.is_untiled:
@@ -1019,17 +1047,21 @@ def work_division_context_for_op(
         if isinstance(v, Symbol)
     }
     reduction_vars = [v for v in it_space_adjusted if v not in coord_vars]
-    constraint_result = collect_work_division_constraints(
-        WorkDivConstraintContext(
-            op=op,
-            it_space=it_space,
-            it_space_adjusted=it_space_adjusted,
-            output_td=output_td,
-            input_tds=input_tds,
-            stick_vars=stick_vars,
-            reduction_vars=reduction_vars,
-            committed_splits={},
-        )
+    constraint_ctx = WorkDivConstraintContext(
+        op=op,
+        it_space=it_space,
+        it_space_adjusted=it_space_adjusted,
+        output_td=output_td,
+        input_tds=input_tds,
+        stick_vars=stick_vars,
+        reduction_vars=reduction_vars,
+        committed_splits={},
+    )
+    constraint_result = collect_work_division_constraints(constraint_ctx)
+    span_min_splits = (
+        _compute_span_floors(constraint_ctx, constraint_result, symbol_meta)
+        if _has_span_floors(op)
+        else {}
     )
     return WorkDivisionContext(
         op=op,
@@ -1041,7 +1073,7 @@ def work_division_context_for_op(
         tensor_deps=input_tds + [output_td],
         reduction_vars=reduction_vars,
         constraints=constraint_result,
-        span_min_splits=_span_min_splits(op),
+        span_min_splits=span_min_splits,
     )
 
 
@@ -1821,12 +1853,17 @@ def _apply_user_hint(
     max_cores: int,
     blocked: set[Symbol] | None = None,
     allowed_splits: dict[Symbol, frozenset[int]] | None = None,
+    min_splits: dict[Symbol, int] | None = None,
 ) -> dict[Symbol, int]:
-    """Apply legal splits in insertion order, pruning lower-priority overflows."""
+    """Apply legal splits in insertion order, pruning lower-priority overflows.
+
+    ``min_splits`` are the op's span floors (:func:`span_floors`); a hinted
+    split below one raises ``Unsupported``.
+    """
     op_name = op.get_name()
     blocked = blocked or set()
     allowed_splits = allowed_splits or {}
-    min_splits = _span_min_splits(op)
+    min_splits = min_splits or {}
 
     splits: dict[Symbol, int] = {}
     cores_used = 1
@@ -1926,78 +1963,51 @@ def _commit_user_splits(op: ComputedBuffer, splits: dict[Symbol, int]) -> None:
     apply_splits(op, splits)
 
 
-def span_reduction_pass(
-    op: ComputedBuffer,
-    args: list[SchedNodeArg],
-    max_cores: int,
-) -> None:
-    """Mandatory per-op pass: compute hard minimum splits for MAX_SPAN_BYTES.
+def _compute_span_floors(
+    ctx: WorkDivConstraintContext,
+    constraints: ConstraintResult,
+    symbol_meta: SymbolMeta,
+) -> dict[Symbol, int]:
+    """Hard minimum splits for MAX_SPAN_BYTES in the frame ``ctx`` describes.
 
-    Writes symbol-keyed ownership and persists the span floors separately so
-    later planning may choose any legal factor at or above each floor. Unity
-    splits are retained so later passes have a complete operation iteration-space
-    ownership record.
+    ``constraints`` is ``ctx``'s constraint result, with nothing committed.
+    Later planning may choose any legal factor at or above each floor. The
+    search runs under the full ``SENCORES`` budget, whatever budget the caller
+    proposes splits under.
 
     For indirect-access ops (gather / scatter), shared-table data dimensions
     (K, N of the value table or the scatter destination) have legal split domain
     `{1}`. Splitting those dims would give every core a different base address
-    into the shared table, producing wrong results. If the memory span cannot be
-    reduced within the hard domains, the pass raises `Unsupported`.
+    into the shared table, producing wrong results.
+
+    Where no split brings a span within the limit, the floors are the search's
+    best attempt (``must_split_vars`` warns). Raises ``Unsupported`` when an
+    axis has no legal factor at all, when the floors conflict with a hard
+    domain, or when they split more than one reduction dimension.
     """
-    it_space = iteration_space_from_op(op)
-    input_tds, output_td = collect_tensor_deps(op, args)
-    all_tds = input_tds + [output_td]
-
-    # Symbolic-dim bucket metadata for the iteration vars in this op. Built
-    # before stick adjustment so the stick-dim guard inside
-    # adjust_it_space_for_sticks can raise on symbolic stick dims.
-    symbol_meta = _collect_symbol_metadata(it_space)
-
-    it_space_adjusted, stick_vars = adjust_it_space_for_sticks(
-        it_space, all_tds, symbol_meta
-    )
-    coord_vars = {
-        v
-        for e in output_td.device_coords[:-1]
-        for v in e.free_symbols
-        if isinstance(v, Symbol)
-    }
-    reduction_vars = [v for v in it_space_adjusted if v not in coord_vars]
-    constraints = collect_work_division_constraints(
-        WorkDivConstraintContext(
-            op=op,
-            it_space=it_space,
-            it_space_adjusted=it_space_adjusted,
-            output_td=output_td,
-            input_tds=input_tds,
-            stick_vars=stick_vars,
-            reduction_vars=reduction_vars,
-            committed_splits={},
-        )
-    )
     min_splits = must_split_vars(
-        all_tds,
-        it_space,
-        it_space_adjusted,
-        stick_vars,
-        max_cores,
+        ctx.input_tds + [ctx.output_td],
+        ctx.it_space,
+        ctx.it_space_adjusted,
+        ctx.stick_vars,
+        _validate_max_cores(),
         symbol_meta,
         constraints.allowed_splits,
         constraints.blocked,
     )
-    collect_work_division_constraints(
-        WorkDivConstraintContext(
-            op=op,
-            it_space=it_space,
-            it_space_adjusted=it_space_adjusted,
-            output_td=output_td,
-            input_tds=input_tds,
-            stick_vars=stick_vars,
-            reduction_vars=reduction_vars,
-            committed_splits=min_splits,
+    if min_splits:
+        # The constraints again, now checking the floors against them. With no
+        # floors this is the call that produced ``constraints``.
+        collect_work_division_constraints(
+            dataclasses.replace(ctx, committed_splits=min_splits)
         )
-    )
 
+    coord_vars = {
+        v
+        for e in ctx.output_td.device_coords[:-1]
+        for v in e.free_symbols
+        if isinstance(v, Symbol)
+    }
     reduction_vars_to_split = {
         v for v, split in min_splits.items() if split > 1 and v not in coord_vars
     }
@@ -2012,21 +2022,14 @@ def span_reduction_pass(
             f"({reduction_vars_to_split}), but the backend supports at most 1."
         )
 
-    op._work_division_span_min_splits = dict(min_splits)
-    apply_splits(op, min_splits)
-
-    if symbol_meta and math.prod(min_splits.values()) > 1:
-        logger.info(
-            f"[work_division/symbolic] span_reduction {op.get_name()}: "
-            f"committed min_splits={ {str(k): v for k, v in min_splits.items()} }, "
-            f"cores={math.prod(min_splits.values())}"
-        )
     if logger.isEnabledFor(logging.DEBUG) and math.prod(min_splits.values()) > 1:
         logger.debug(
-            f"span_reduction work_division {op.get_name()}: cores={math.prod(min_splits.values())}, "
-            f"iteration_space={it_space}, it_space_adjusted={it_space_adjusted}, "
-            f"symbol_meta={symbol_meta}, priorities=[], min_splits={min_splits}"
+            f"span floors {ctx.op.get_name()}: cores={math.prod(min_splits.values())}, "
+            f"iteration_space={ctx.it_space}, "
+            f"it_space_adjusted={ctx.it_space_adjusted}, "
+            f"symbol_meta={symbol_meta}, min_splits={min_splits}"
         )
+    return min_splits
 
 
 def _default_split(
@@ -2039,7 +2042,7 @@ def _default_split(
     blocked: set[Symbol],
     allowed_splits: dict[Symbol, frozenset[int]],
 ) -> tuple[dict[Symbol, int], list[Symbol], list[Symbol]]:
-    """Distribute max_cores by priority on top of span_reduction's commits.
+    """Distribute max_cores by priority on top of the span floors.
 
     Returns the chosen splits and the (output, reduction) priority dims the
     caller logs. Shared by work_distribution_pass and cost_model_matmul_division.
@@ -2048,7 +2051,7 @@ def _default_split(
         op, output_td, it_space_adjusted, symbol_meta
     )
 
-    # If span reduction already committed a reduction split, grow only that
+    # If the span floors already split a reduction dimension, grow only that
     # dimension; backend supports one reduction dimension split per op.
     coord_vars = {
         v
@@ -2087,8 +2090,7 @@ def work_distribution_pass(
 ) -> None:
     """Optional per-op pass: distribute remaining cores to maximize parallelism.
 
-    Reads symbol-keyed ownership written by span_reduction_pass (if any), then
-    fills remaining cores by priority.
+    Starts from the op's span floors, then fills remaining cores by priority.
     """
     it_space = iteration_space_from_op(op)
     input_tds, output_td = collect_tensor_deps(op, args)
@@ -2100,13 +2102,6 @@ def work_distribution_pass(
         it_space, all_tds, symbol_meta
     )
 
-    ownership = getattr(op, "iteration_space_ownership", None)
-    committed_splits = (
-        {s: v for s, v in ownership.work_slices.items() if v > 1}
-        if ownership is not None
-        else {}
-    )
-
     coord_vars = {
         v
         for e in output_td.device_coords[:-1]
@@ -2114,20 +2109,27 @@ def work_distribution_pass(
         if isinstance(v, Symbol)
     }
     reduction_vars = [v for v in it_space_adjusted if v not in coord_vars]
-    constraint_result = collect_work_division_constraints(
-        WorkDivConstraintContext(
-            op=op,
-            it_space=it_space,
-            it_space_adjusted=it_space_adjusted,
-            output_td=output_td,
-            input_tds=input_tds,
-            stick_vars=stick_vars,
-            reduction_vars=reduction_vars,
-            committed_splits=committed_splits,
-        )
+    constraint_ctx = WorkDivConstraintContext(
+        op=op,
+        it_space=it_space,
+        it_space_adjusted=it_space_adjusted,
+        output_td=output_td,
+        input_tds=input_tds,
+        stick_vars=stick_vars,
+        reduction_vars=reduction_vars,
+        committed_splits={},
     )
+    constraint_result = collect_work_division_constraints(constraint_ctx)
     blocked = constraint_result.blocked
     allowed_splits = constraint_result.allowed_splits
+    # Also checks the floors against the constraints.
+    committed_splits = {
+        s: v
+        for s, v in _compute_span_floors(
+            constraint_ctx, constraint_result, symbol_meta
+        ).items()
+        if v > 1
+    }
 
     # A shard plan (sharded_hbm.plan_sharded_hbm) is a correctness constraint,
     # not a preference, so it applies even when hints are ignored.
@@ -2153,6 +2155,7 @@ def work_distribution_pass(
                 max_cores,
                 blocked,
                 allowed_splits,
+                min_splits=committed_splits,
             )
             _commit_user_splits(op, user_splits)
 
@@ -2724,13 +2727,9 @@ def _cost_model_matmul_planner(
     batch_sizes = [concretize_expr(it_space_adjusted[bd]) for bd in batch_dims]
     B_total = math.prod(batch_sizes)
 
-    span_min_splits = _span_min_splits(op)
-
     def factors(dim: Symbol, size: int) -> list[int]:
         return (
-            [1]
-            if dim in blocked
-            else _legal_split_factors(dim, size, allowed_splits, span_min_splits)
+            [1] if dim in blocked else _legal_split_factors(dim, size, allowed_splits)
         )
 
     b_combos = (
@@ -2890,19 +2889,6 @@ def _apply_input_layout_overrides(
     ]
 
 
-def span_reduction(graph: GraphLowering) -> None:
-    """Pass 1: compute minimum per-op splits required by MAX_SPAN_BYTES."""
-    operations = graph.operations
-    max_cores = _validate_max_cores()
-    for op in _iter_computed_buffers(operations):
-        rw = op_read_writes(op)
-        args = _apply_input_layout_overrides(op, get_mem_deps_from_rw(rw))
-        if isinstance(op.data, Pointwise):
-            divide_pointwise_op(op, args, max_cores, span_reduction_pass)
-        elif isinstance(op.data, Reduction):
-            divide_reduction_op(op, args, max_cores, span_reduction_pass)
-
-
 def work_distribution(
     graph: GraphLowering,
     preassigned_ops: list[Operation] | None = None,
@@ -2934,11 +2920,11 @@ def _work_distribution_op(op: ComputedBuffer, max_cores: int) -> None:
 def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
     """Re-price one matmul's split with the analytic cost model.
 
-    Runs between span_reduction and work_distribution, so
-    iteration_space_ownership still holds only span-reduction's commits. Computes the split
-    work_distribution would pick, hands it to the cost model, and commits the
-    cost model's choice when it differs — returning True so the caller excludes
-    the op from work_distribution (every op is divided by exactly one pass).
+    Runs before work_distribution, starting from the op's span floors.
+    Computes the split work_distribution would pick, hands it to the cost
+    model, and commits the cost model's choice when it differs — returning
+    True so the caller excludes the op from work_distribution (every op is
+    divided by exactly one pass).
     """
     if not isinstance(op.data, Reduction):
         return False
@@ -2974,12 +2960,9 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
         it_space, all_tds, symbol_meta
     )
 
-    ownership = getattr(op, "iteration_space_ownership", None)
-    committed_splits = (
-        {s: v for s, v in ownership.work_slices.items() if v > 1}
-        if ownership is not None
-        else {}
-    )
+    # The floors come from the op's own context: unlike the tensor deps above,
+    # they see the input layout overrides.
+    committed_splits = {s: v for s, v in span_floors(op).items() if v > 1}
 
     coord_vars = {
         v
@@ -3043,7 +3026,7 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
 def cost_model_matmul_division(graph: GraphLowering) -> list[Operation]:
     """Pass 2: re-price matmul/bmm splits with the analytic hardware cost model.
 
-    Runs after span_reduction and before work_distribution. Returns the ops it
+    Runs before work_distribution. Returns the ops it
     re-split so passes.py can exclude them from work_distribution — every op is
     divided by exactly one pass.
     """
@@ -3070,8 +3053,8 @@ def defer_work_division(graph: GraphLowering) -> None:
     the op to that split (:func:`divide_deferred_op`), counts the solve's commit
     as the op's division, and divides whatever the solve leaves
     (:func:`divide_deferred_ops`), so every op ends with the split it had when
-    the passes ran up front. Span floors are unaffected: ``span_reduction``
-    still runs first.
+    the passes ran up front. Span floors are unaffected: each division
+    computes them from the op (:func:`span_floors`).
     """
     setattr(
         graph,
