@@ -630,14 +630,7 @@ def _pad_elided_dim(buf: ComputedBuffer) -> None:
     only bumps the dim size; a later pass, ``_restickify_restore_elided_dim``,
     creates the shared iteration variable that pairs this dim with the stick on the
     other operand.
-
-    Idempotent: a buffer read by several restickifies needs the gap dim once,
-    not once per reader.  Every reader's ``_restickify_restore_elided_dim`` binds
-    its shared symbol to this single outermost dim, so growing again only
-    multiplies the allocation by 64 per extra reader.
     """
-    if getattr(buf, "_spyre_elided_dim_padded", False):
-        return
     layout = buf.get_layout()
     assert isinstance(layout, FixedTiledLayout)
     stl = layout.device_layout
@@ -653,7 +646,6 @@ def _pad_elided_dim(buf: ComputedBuffer) -> None:
     buf.layout = FixedTiledLayout(
         layout.device, layout.dtype, host_size, host_stride, grown_stl
     )
-    buf._spyre_elided_dim_padded = True
 
 
 def _pad_restickify_output(op: Operation, graph: GraphLowering) -> None:

@@ -241,11 +241,7 @@ _MAX_K_PER_CORE = 4
 TOPK_MAX_K_PER_CORE = _MAX_K_PER_CORE
 # Largest k topkvalue/topkindex accept.
 TOPK_MAX_K = 128
-
-# topkindex returns its indices in the input dtype. Spyre's fp16 (DLFloat16) has
-# 9 mantissa bits, so it holds every integer exactly only up to 512. Above that
-# not every integer is representable and the indices are wrong, so an fp16 topk
-# (and sort) can search at most this many elements; fp32 has no such limit.
+# DLFloat16 has integer precision up to 512, so above it indices come back wrong
 FP16_TOPK_MAX_DIM = 512
 
 LAYOUT_LABELS = ["OUTPUT", "KERNEL", "INPUT", "KERNEL_IDX"]
