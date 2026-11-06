@@ -1469,10 +1469,9 @@ void copy_sharded(const at::Tensor& self, const at::Tensor& dst) {
               "sharded Spyre tensors only support whole-tensor copies");
   TORCH_CHECK(host.sizes() == sharded.sizes(),
               "copy shape mismatch: ", host.sizes(), " vs ", sharded.sizes());
-  // Dtype-converting DMA is rejected: the D2H conversion path bounds its
-  // host output only through the post-factory host_capacity_bytes write in
-  // spyre_stream.cpp (a flex-side TODO), and converting shard copies are
-  // untested against it.
+  // Dtype-converting DMA is rejected: converting shard copies are untested
+  // against the D2H conversion path, which bounds its host output by the
+  // host_capacity the DMA factories set.
   TORCH_CHECK(host.dtype() == sharded.dtype(),
               "sharded Spyre tensors can only be copied without a dtype "
               "change (got ",
