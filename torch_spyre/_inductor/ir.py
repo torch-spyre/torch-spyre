@@ -596,8 +596,8 @@ class SpyreCollectiveKernel(ir._CollectiveKernel, metaclass=abc.ABCMeta):
 
     * ``create_inplace`` (all_reduce): ``NoneLayout`` node plus a
       ``MutationOutput`` on each input; the lowering returns the input.
-    * ``create_out_of_place`` (broadcast, all_gather): the node is the output
-      buffer.
+    * ``create_out_of_place`` (broadcast, all_gather, reduce_scatter): the
+      node is the output buffer.
 
     ``op_overload`` is the ``_c10d_functional`` op, whose Meta impl drives
     ``process_kernel``; ``constant_args`` are its non-tensor args in schema
@@ -683,6 +683,29 @@ class AllGatherKernel(SpyreCollectiveKernel):
     def _run_call(self, input_name: str, plan_var: str) -> str:
         group_size, _ = self.constant_args
         return f"torch.ops.spyre.allgather_run({input_name}, {plan_var}, {group_size})"
+
+
+class ReduceScatterKernel(SpyreCollectiveKernel):
+    """Out-of-place ``_c10d_functional.reduce_scatter_tensor``.
+
+    Output tensor has shape[0] = input.shape[0] // group_size.
+    """
+
+    plan_prefix = "rs"
+
+    def _plan_call(self, num_elems: int, dtype_code: int) -> str:
+        reduce_op, group_size, group_name = self.constant_args
+        return (
+            f"torch.ops.spyre.reducescatter_plan("
+            f"{num_elems}, {dtype_code}, {group_size}, "
+            f"'{reduce_op}', '{group_name}')"
+        )
+
+    def _run_call(self, input_name: str, plan_var: str) -> str:
+        _, group_size, _ = self.constant_args
+        return (
+            f"torch.ops.spyre.reducescatter_run({input_name}, {plan_var}, {group_size})"
+        )
 
 
 class AllReduceKernel(SpyreCollectiveKernel):
