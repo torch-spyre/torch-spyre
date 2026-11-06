@@ -734,13 +734,12 @@ def test_reshape_split_untracked_dim_tolerated():
         t = x.exp().view(_T, _Hh, _Dd)
         return t + y
 
-    # The assertion is simply that compilation does not raise: without the
-    # _untracked_ tolerance branch, the split of x.exp()'s untracked dim would
-    # hit "reshape split a named dim" and abort.  We deliberately do not pin the
-    # output op's propagated_dims -- the final op reads annotated y, so its names
-    # come from y, not from the untracked split path under test; asserting them
-    # would test the wrong op.  Reaching this line means the branch tolerated
-    # the split.
+    # The assertion is simply that compilation does not raise: the split of
+    # x.exp()'s untracked dim must be tolerated by the len(loop_vars) >
+    # len(names) branch. We deliberately do not pin the output op's
+    # propagated_dims -- the final op reads annotated y, so its names come from
+    # y, not from the untracked split path under test; asserting them would test
+    # the wrong op. Reaching this line means the branch tolerated the split.
     _run_and_capture(
         fn,
         [x, y],

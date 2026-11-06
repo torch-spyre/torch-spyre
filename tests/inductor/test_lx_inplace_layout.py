@@ -95,18 +95,14 @@ class TestLXInplaceLayout:
         assert project([2, 0, 1, 3], output_rank=4, input_rank=3) == [1, 0, 2]
 
     def test_pointwise_dim_order_projection_rank_diff_le_minus_2(self):
-        """_project_pointwise_dim_order is correct for rank_diff <= -2.
+        """_project_pointwise_dim_order handles rank_diff <= -2.
 
         When output_rank < input_rank - 1 the backing buffer has more than one
-        extra leading axis (e.g. a 5-D tile for a 3-D output).  The fix strips
-        the trailing -1 sparse-stick marker *before* prepending the leading
-        indices so that the projected list has the right length in all cases:
-
-          - without marker: len(projected) == input_rank
-          - with    marker: len(projected) == input_rank + 1  (marker re-appended)
-
-        These are the exact properties checked by
-        ``_is_supported_layout``'s ``assert len(c_in_size) == len(projected_dim_order)``.
+        extra leading axis (e.g. a 5-D tile for a 3-D output). The projected
+        list has input_rank entries, plus the trailing -1 sparse-stick marker
+        when the body order carries one. ``_is_supported_pointwise_layout``
+        pads ``c_in_size`` against this projected length before asserting
+        ``len(c_in_size) == len(projected_dim_order)``.
         """
         project = propagate_layouts._project_pointwise_dim_order
 
