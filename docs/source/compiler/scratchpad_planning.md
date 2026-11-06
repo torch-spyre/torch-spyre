@@ -639,7 +639,7 @@ Those two modes minimize two different objectives:
   sympy symbol onto the matching CP-SAT decision variable and lowers the
   whole expression into the constraint model via `cost_expr_to_cpsat`
   (`_SympyExprToCpSat` in
-  `scratchpad/cpsat_expr_printer.py`), so CP-SAT searches it symbolically
+  `scratchpad/cpsat_expr_printer.py`), so CP-SAT searches it directly
   rather than evaluating it per candidate. When there is no usable
   expression -- symbolic shapes, a serialized capture, `auto_coarse_tiling`
   on (the allocator withholds it, the model being flat in tile size), or
