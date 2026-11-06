@@ -835,13 +835,13 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
                 chosen[idx].menu_index
             )
             for key, sym in buf.sym_core_divs.items():
-                value_of[sym] = lambda chosen, resident, idx=idx, key=key: (
-                    chosen[idx].splits.get(key, 1)
-                )
+                value_of[sym] = lambda chosen, resident, idx=idx, key=key: chosen[
+                    idx
+                ].splits.get(key, 1)
             for key, sym in buf.sym_tile_counts.items():
-                value_of[sym] = lambda chosen, resident, idx=idx, key=key: (
-                    chosen[idx].tiling.count_for(key)
-                )
+                value_of[sym] = lambda chosen, resident, idx=idx, key=key: chosen[
+                    idx
+                ].tiling.count_for(key)
         try:
             free = sorted(cost_expr.free_symbols, key=str)
             if any(sym not in value_of for sym in free):

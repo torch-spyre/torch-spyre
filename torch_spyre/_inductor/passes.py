@@ -86,7 +86,7 @@ from .scratchpad.allocator import (
     solve_decides_work_division,
 )
 from .scratchpad.lx_relayout import anchor_lx_relayout_ownership
-from .fusion import spyre_fuse_nodes
+from .fusion import sink_collective_waits, spyre_fuse_nodes
 from .scheduler import (
     build_loop_scheduler_nodes,
     prepare_spyre_kernels,
@@ -353,6 +353,7 @@ class CustomPostFusionPasses(_SpyreNodePassPipeline):
         # emission binds only what pooling decided.
         super().__init__(
             [
+                sink_collective_waits,
                 spyre_fuse_nodes,
                 prepare_spyre_kernels,
                 hbm_pool_planning,
