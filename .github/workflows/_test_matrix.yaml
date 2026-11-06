@@ -1240,6 +1240,8 @@ jobs:
             config: distributed_tests/test_allgather_compiled.yaml
           - name: Test Multi-Spyre Allreduce Compiled
             config: distributed_tests/test_allreduce_compiled.yaml
+          - name: Test Multi-Spyre KV Offload
+            config: distributed_tests/test_kv_offload.yaml
           - name: Test Multi-Spyre SharedHostPool
             config: distributed_tests/test_shared_host_pool.yaml
           - name: Test Multi-Spyre Profiler Coll Metadata
