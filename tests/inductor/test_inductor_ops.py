@@ -1542,21 +1542,21 @@ def _sort_params(dtype, names=None):
     }
 
 
-# Sort-dim sizes 256, 999 and 1024 in 1D and 2D, as (input, dim). Sorting along
-# dim 0, 1D sort, and stable sort along dim=1 for n=256 and n=999 all work.
-# fp32 also checks the indices.
+# Sort-dim sizes 256, 512, 999 and 1024 in 1D and 2D, as (input, dim). Sorting
+# along dim 0, 1D sort, and stable sort along dim=1 for n=256 and n=999 all
+# work. fp32 also checks the indices. fp16 stops at 512 (FP16_TOPK_MAX_DIM),
+# because the indices are held in fp16, so the fp16 sizes are 256 and 512 only.
 _SORT_SIZES = (256, 999, 1024)
 _SORT_SIZES_PARAM_SETS = {
     **{
-        f"2d_dim0_n{n}_{tag}": (_sort_ties((n, 32), 11, dt), 0)
-        for n in _SORT_SIZES
-        for tag, dt in (("fp16", torch.float16), ("fp32", torch.float32))
+        f"2d_dim0_n{n}_fp16": (_sort_ties((n, 32), 11, torch.float16), 0)
+        for n in (256, 512)
     },
-    # Wider than the cases above: fp32 returns wrong values at 1024 rows.
     **{
-        f"2d_dim0_n1024_c64_{tag}": (_sort_ties((1024, 64), 11, dt), 0)
-        for tag, dt in (("fp16", torch.float16), ("fp32", torch.float32))
+        f"2d_dim0_n{n}_fp32": (_sort_ties((n, 32), 11, torch.float32), 0)
+        for n in _SORT_SIZES
     },
+    "2d_dim0_n1024_c64_fp32": (_sort_ties((1024, 64), 11, torch.float32), 0),
     **{f"1d_n{n}_fp32": (_sort_ties((n,), 11, torch.float32), 0) for n in _SORT_SIZES},
     **{
         f"2d_dim1_n{n}_fp32": (
@@ -2653,18 +2653,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "1d_ties": (_sort_ties((64,), 4, torch.float16), 0, False),
             },
         },
-        # Sort-dim sizes 256, 999 and 1024. 1D sort works. Stable sort along
-        # the stick dim (32 x n, dim=1) works for all sizes. The fp32 1024x64
-        # dim=0 case below fails to compile: dbo-opt (sbf-ddc) raises
-        # "Expect valid chunk size that fits in LX" on the topkvalue kernel. A
-        # plain fp32 topk of a 1024x64 tensor fails the same way, with no sort
-        # or peeling involved.
+        # Sort-dim sizes 256, 512, 999 and 1024 (fp16 up to 512 only). The fp32
+        # 1024x64 dim=0 case fails to compile in dbo-opt ("Expect valid chunk
+        # size that fits in LX").
+        # TODO: once an unsupported gate rejects it, make it an expect_raise.
         ("test_sort_sizes", "test_sort_sizes_cpu"): {
             "param_sets": _SORT_SIZES_PARAM_SETS,
             "expect_fail": {
                 "2d_dim0_n1024_c64_fp32": (
                     "dbo-opt fails with 'Expect valid chunk size that fits in LX' "
-                    "for the topk of a 1024x64 fp32 tensor (PLACEHOLDER ISSUE)"
+                    "on the topkvalue kernel; pending an unsupported gate"
                 ),
             },
         },
@@ -11261,11 +11259,19 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     @expects_raise
     def test_sort_fp16_index_range_rejected(self):
-        # topkindex yields indices in the input dtype, and fp16 holds integers
-        # exactly only up to 2048, so a longer fp16 sort dim must be rejected.
-        x = unique_randn_along_dim((2050, 8), dim=0)
-        with pytest.raises(Exception, match="Unsupported"):
+        # topkindex yields indices in the input dtype, and Spyre's fp16 holds
+        # integers exactly only up to 512 (9 mantissa bits), so a longer fp16
+        # sort dim must be rejected.
+        x = unique_randn_along_dim((513, 8), dim=0)
+        with pytest.raises(Exception, match="the search dim may be at most 512"):
             _compile_and_run(lambda x: torch.sort(x, dim=0), [x], "spyre")
+
+    @expects_raise
+    def test_topk_fp16_index_range_rejected(self):
+        # The same limit applies to topk itself, even for a small k.
+        x = unique_randn_along_dim((513, 8), dim=0)
+        with pytest.raises(Exception, match="the search dim may be at most 512"):
+            _compile_and_run(lambda x: torch.topk(x, 4, dim=0)[0], [x], "spyre")
 
     def test_keep_by_index_cpu(self, x, k: int, dim: int, fill_value: float):
         _, indices = torch.topk(x, k, dim=dim, largest=True)

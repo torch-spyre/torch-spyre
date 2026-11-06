@@ -40,7 +40,7 @@ from torch._prims_common import (
 
 from .constants import (
     DEVICE_NAME,
-    FP16_MAX_PRECISE_INTEGER,
+    FP16_TOPK_MAX_DIM,
     FP8_E4M3FN_MAX,
     FP8_E4M3FN_MIN,
     TOPK_MAX_K,
@@ -1865,8 +1865,8 @@ def spyre_topk(
         padded_k += legal_remainder
 
     pad = 0
+    n = input.size(dim)
     if padded_k != k or padded_k > TOPK_MAX_K:
-        n = input.size(dim)
         if not isinstance(n, int):
             raise Unsupported(f"topk along a dim of symbolic size {n}")
         # Front-pad with -inf when the dim is shorter than padded_k. Among
@@ -1878,12 +1878,15 @@ def spyre_topk(
             input = torch.constant_pad_nd(
                 input, [0, 0] * (input.dim() - 1 - dim) + [pad, 0], float("-inf")
             )
-        if input.dtype == torch.float16 and n + pad - 1 > FP16_MAX_PRECISE_INTEGER:
-            raise Unsupported(
-                f"topk with k={k} along a dim of size {n} (padded to {n + pad}) "
-                f"on a float16 input: indices above {FP16_MAX_PRECISE_INTEGER} "
-                "are not exact"
-            )
+    # topkindex's indices come back in the input dtype, and Spyre's fp16 holds
+    # integers exactly only up to FP16_TOPK_MAX_DIM, so a longer fp16 search dim
+    # (counted after padding) would return wrong indices. fp32 is not limited.
+    if input.dtype == torch.float16 and n + pad > FP16_TOPK_MAX_DIM:
+        raise Unsupported(
+            f"topk with k={k} along a dim of size {n} (padded to {n + pad}) on a "
+            f"float16 input: the search dim may be at most {FP16_TOPK_MAX_DIM} "
+            "because the indices are held in float16; use float32"
+        )
 
     # Peel in chunks of at most TOPK_MAX_K elements. After each chunk its
     # elements are masked to -inf so the next chunk takes the next largest ones.
@@ -1957,7 +1960,7 @@ def spyre_sort(
     key = torch.flip(input, [dim]) if stable else input
     if not descending:
         key = -key
-    # spyre_topk pads an unsplittable n and rejects fp16 indices above 2048.
+    # spyre_topk pads an unsplittable n and rejects an fp16 dim over 512.
     values, indices = spyre_topk(key, n, dim=dim, largest=True, sorted=True)
     if not descending:
         values = -values
