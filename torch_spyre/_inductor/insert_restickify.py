@@ -29,7 +29,7 @@ from .ir import FixedTiledLayout, SpyreEmptyFallback
 from .loop_info import ReadCopyElisionRecord
 from .optimize_restickify import AnyInNode, EdgeCostMap
 from .logging_utils import get_inductor_logger
-from .pass_utils import patch_env
+from .pass_utils import invalidate_op_read_writes, patch_env
 from torch._inductor.dependencies import MemoryDep, index_vars_squeeze
 from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.graph import GraphLowering
@@ -476,9 +476,9 @@ def insert_restickify_on_node_inputs(
     resticks_needed: list[RestickifyArgInfo],
     operations: list[Operation],
 ) -> None:
-    """Insert restickify nodes before op for each incompatible input, patch op's inner_fn
-    to read the new buffer names, and reconstruct the consumer ComputedBuffer to
-    invalidate its sizes cache.
+    """Insert restickify nodes before op for each incompatible input, and patch
+    op's inner_fn in place to read the new buffer names. op stays the same
+    instance, so its memoized read/writes (``op_read_writes``) are dropped.
     """
     existing_record = getattr(op, "_read_copy_elision_record", None)
     edge_swaps: list[tuple] = []
@@ -567,6 +567,9 @@ def insert_restickify_on_node_inputs(
         "inner_fn",
         make_per_edge_inner_fn(op.data.inner_fn, edge_swaps, name_map, canonical_args),
     )
+    # op now reads the restickify buffers: an extraction memoized before this
+    # (e.g. by optimize_restickify_locations) names the old inputs.
+    invalidate_op_read_writes(op)
     if isinstance(existing_record, ReadCopyElisionRecord):
         copy_name = existing_record.copy_name
         for old_name, _dep_index, _occurrence, new_name in edge_swaps:
