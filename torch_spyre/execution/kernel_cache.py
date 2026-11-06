@@ -245,7 +245,9 @@ def _normalized_expr_str(expr) -> str:
     raw = str(expr)
     try:
         return str(sympy.sympify(raw))
-    except Exception:  # noqa: BLE001 - a key we cannot normalise is still a key
+    except (sympy.SympifyError, SyntaxError, TypeError):
+        # A spelling sympify cannot parse is still a usable key. Anything else
+        # is a real bug and propagates.
         return raw
 
 

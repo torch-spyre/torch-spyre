@@ -39,6 +39,7 @@ from utils_inductor import expects_raise
 
 from torch_spyre._inductor.codegen.bundle import generate_bundle
 from torch_spyre._inductor.codegen.compute_ops import SymbolKind
+from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec
 
 SYM = "s0"
@@ -221,7 +222,7 @@ class TestItRefusesRatherThanGuesses(_BundleHarness):
         """A wrong (arg_index, dim_index) is silently wrong on every launch."""
         spec = self._symbolic_loop(sources={})
 
-        with self.assertRaises(NotImplementedError) as caught:
+        with self.assertRaises(Unsupported) as caught:
             self._run([spec], [self._entry(TILE_STRIDE)])
 
         self.assertIn(SYM, str(caught.exception))
@@ -243,7 +244,7 @@ class TestItRefusesRatherThanGuesses(_BundleHarness):
             tile=64, bounds={SYM: (MAX, 64)}, body=[_op_spec(), inner]
         )
 
-        with self.assertRaises(NotImplementedError) as caught:
+        with self.assertRaises(Unsupported) as caught:
             self._run([outer], [self._entry(TILE_STRIDE)] * 2)
 
         self.assertIn(SYM, str(caught.exception))

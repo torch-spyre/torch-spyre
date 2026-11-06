@@ -91,13 +91,13 @@ from .op_spec import (
     IndirectAccess,
     LX_RELAYOUT_INFO_KEY,
     LoopSpec,
-    walk_loop_specs,
     OpSpec,
     TensorArg,
     TensorWorkDivision,
     UnimplementedOp as OpSpecUnimplementedOp,
     format_op_spec_list,
     is_lx_relayout_identity,
+    walk_loop_specs,
 )
 from .op_spec_validation import validate_op_specs
 from torch_spyre._inductor.provenance import build_debug_handle

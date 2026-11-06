@@ -40,6 +40,7 @@ from torch_spyre._inductor.codegen.bundle import (
 )
 from torch_spyre._inductor.pass_utils import decompose_tiled_count
 from torch_spyre._inductor.codegen.compute_ops import SymbolKind
+from torch_spyre._inductor.errors import Unsupported
 
 G = 64
 MAX = 512
@@ -161,7 +162,7 @@ class TestLoopLevel(unittest.TestCase):
 
     @expects_raise
     def test_unrecognised_count_raises_naming_the_symbol(self):
-        with self.assertRaises(NotImplementedError) as cm:
+        with self.assertRaises(Unsupported) as cm:
             _loop_level(_sym() * 2, 0, DIM_SSA)
         msg = str(cm.exception)
         self.assertIn(SYM, msg, "the message must name the symbol")
@@ -169,7 +170,7 @@ class TestLoopLevel(unittest.TestCase):
 
     @expects_raise
     def test_symbol_with_no_input_arg_raises_naming_it(self):
-        with self.assertRaises(NotImplementedError) as cm:
+        with self.assertRaises(Unsupported) as cm:
             _loop_level(FloorDiv(_sym(), G), 0, {})
         msg = str(cm.exception)
         self.assertIn(SYM, msg)

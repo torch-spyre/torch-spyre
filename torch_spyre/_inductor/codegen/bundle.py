@@ -22,10 +22,10 @@ from typing import Any
 import sympy
 
 from torch_spyre._inductor import config as _spyre_config
-from torch_spyre._inductor.pass_utils import decompose_tiled_count
 from torch_spyre._inductor.codegen.compute_ops import SymbolKind
 from torch_spyre._inductor.codegen.superdsc import compile_op_spec
 from torch_spyre._inductor.constants import MAX_POOL_SIZE_BYTES
+from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import (
     LoopSpec,
@@ -34,6 +34,7 @@ from torch_spyre._inductor.op_spec import (
     walk_loop_specs,
 )
 from torch_spyre._inductor.op_spec_validation import validate_op_specs
+from torch_spyre._inductor.pass_utils import decompose_tiled_count
 
 
 logger = get_inductor_logger("sdsc_compile")
@@ -125,7 +126,7 @@ def _merge_loop_symbol_maps(specs, attr: str) -> dict:
             value = tuple(raw)
             existing = merged.get(sym_name)
             if existing is not None and existing != value:
-                raise NotImplementedError(
+                raise Unsupported(
                     f"two loops in one kernel disagree about {sym_name}: "
                     f"{attr} is {existing} on one and {value} on another. A "
                     f"bundle declares one parameter per dimension, so it cannot "
@@ -411,7 +412,7 @@ def generate_bundle(
             for sym_name, (max_value, granularity) in loop_dim_bounds.items():
                 source = loop_dim_sources.get(sym_name)
                 if source is None:
-                    raise NotImplementedError(
+                    raise Unsupported(
                         f"symbolic loop dimension {sym_name} has bounds "
                         f"{(max_value, granularity)} but no source, so nothing "
                         f"at launch knows which tensor dimension to bind into "
@@ -891,8 +892,9 @@ def _loop_level(
     defining op, and only a constant, a query-map result or a symbol-creation
     result becomes a true symbolic loop count, so an authored divide would land
     on a generic dynamic-loop path instead. Keeping the dimension itself as the
-    bound is also what lets one dimension parameter drive two loops with
-    different tile sizes, since each derives its own count.
+    bound would also let one dimension parameter drive two loops with different
+    tile sizes, each deriving its own count, but that case is refused today in
+    ``_merge_loop_symbol_maps`` and is not something this emitter supports yet.
 
     Floor versus ceiling does not arise: G divides the size exactly, which the
     declared contract guarantees and the host checks before dispatch.
@@ -907,7 +909,7 @@ def _loop_level(
         The level's setup lines, bound, step and stride scale.
 
     Raises:
-        NotImplementedError: The count is symbolic but not a shape this emitter
+        Unsupported: The count is symbolic but not a shape this emitter
             recognises, or it names a symbol with no ``input_arg`` parameter.
     """
     if isinstance(count, (sympy.Integer, int)):
@@ -920,7 +922,7 @@ def _loop_level(
 
     decomposed = decompose_tiled_count(count)
     if decomposed is None:
-        raise NotImplementedError(
+        raise Unsupported(
             f"symbolic loop count {count!r} (type {type(count).__name__}, "
             f"free_symbols="
             f"{sorted(map(str, getattr(count, 'free_symbols', [])))}) is not a "
@@ -932,7 +934,7 @@ def _loop_level(
     sym, tile = decomposed
     sym_name = str(sym)
     if sym_name not in loop_dim_ssa:
-        raise NotImplementedError(
+        raise Unsupported(
             f"symbolic loop count {count} references {sym_name}, which has no "
             f"input_arg parameter to read its value from. Known dimension "
             f"params: {sorted(loop_dim_ssa)}. A symbol reaches that list via "

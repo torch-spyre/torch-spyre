@@ -452,10 +452,17 @@ def symbolic_count_bounds(count) -> "dict[str, tuple[int, int]]":
     refusal belongs at emission where the message can name the symbol.
 
     Raises:
-        Unsupported: the count involves more than one symbol. The backend
-            asserts exactly one per symbolic loop, so that is a check failure
-            there rather than a degraded kernel here.
+        Unsupported: the count involves more than one symbol after the
+            ShapeEnv's replacements are applied (what ``torch._check(a == b)``
+            records, so a tied pair counts as one). The backend asserts exactly
+            one per symbolic loop, so that is a check failure there rather than
+            a degraded kernel here.
     """
+    replacements = getattr(
+        getattr(V.graph.sizevars, "shape_env", None), "replacements", None
+    )
+    if replacements and hasattr(count, "free_symbols"):
+        count = sympy_subs(count, replacements)
     free_symbols = getattr(count, "free_symbols", None) or set()
     if len(free_symbols) > 1:
         raise Unsupported(

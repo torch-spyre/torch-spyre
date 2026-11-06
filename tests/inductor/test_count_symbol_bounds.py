@@ -300,6 +300,24 @@ class TestMoreThanOneSymbolIsRefusedHere(unittest.TestCase):
 
         self.assertIn("torch._check", str(caught.exception))
 
+    def test_a_pair_tied_by_a_check_counts_as_one_symbol(self):
+        """``torch._check(a == b)`` lands in the ShapeEnv's replacements, and the
+        count is read after they are applied, so the pair the message above asks
+        for is not then refused as two symbols. The tied spelling resolves to
+        the surviving symbol and the bounds are keyed by it.
+        """
+        other = sympy.Symbol("s1", integer=True, positive=True)
+        graph = _graph_with_upper(sympy.Integer(MAX))
+        graph.sizevars.shape_env.replacements = {other: _sym()}
+
+        with V.set_graph_handler(graph):
+            bounds = symbolic_count_bounds(FloorDiv(other, TILE))
+            # Two names that the replacement folds into one are not refused.
+            folded = symbolic_count_bounds(FloorDiv(_sym() + other, TILE))
+
+        self.assertEqual(bounds, {SYM: (MAX, TILE)})
+        self.assertNotIn("s1", folded)
+
     def test_one_symbol_is_still_fine(self):
         """The control: the refusal must not catch the supported case."""
         graph = _graph_with_bounds({SYM: sympy.Integer(MAX)})
