@@ -678,6 +678,11 @@ class TestNegativeScalarOperations:
         result = _run_spyre(execution_mode, int_float_add, x)
         assert result.dtype in (torch.float32, torch.float64)
 
+    @pytest.mark.xfail(
+        strict=True,
+        raises=RuntimeError,
+        reason="DL16_TO_FP32 D2H requires whole stick pairs; bool tensor conversion produces invalid layout (#5361)",
+    )
     def test_bool_tensor_scalar_multiply(self, execution_mode):
         """Bool tensor * float scalar."""
 
