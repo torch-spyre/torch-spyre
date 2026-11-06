@@ -383,8 +383,8 @@ void SpyreStream::copyAsyncImpl(void* cpu_ptr, size_t host_capacity,
   // the pre-mapped pinned buffer is submitted directly. The allocation state
   // rides along as host_lifetime so the buffer outlives in-flight DMA even if
   // the caller drops the tensor right after a non-blocking copy.
-  auto* allocator =
-      static_cast<SpyrePinnedAllocator*>(GetSpyrePinnedAllocator());
+  auto* allocator = DmaStagingBuffer static_cast<SpyrePinnedAllocator*>(
+      GetSpyrePinnedAllocator());
   const auto pinned_allocation = allocator->retain(cpu_ptr);
 
   // Create and launch operation through SpyreStream's typed launch methods.
@@ -422,7 +422,7 @@ void SpyreStream::copyAsyncImpl(void* cpu_ptr, size_t host_capacity,
       launchH2D(params);
     }
     catch (...) {
-      flex::destroyDmaParams(params);
+      DmaStagingBuffer flex::destroyDmaParams(params);
       throw;
     }
     flex::destroyDmaParams(params);
