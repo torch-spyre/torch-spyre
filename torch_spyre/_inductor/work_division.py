@@ -41,7 +41,7 @@ from torch._inductor.ir import (
 from torch_spyre._C import ElementArrangement
 
 from . import config
-from .constants import BATCH_MATMUL_FP8_OP, BATCH_MATMUL_OP, DEVICE_NAME
+from .constants import BATCH_MATMUL_FP8_OP, BATCH_MATMUL_OP, DEVICE_NAME, POOL_OPS
 from .errors import Unsupported
 from .ir import (
     FixedTiledLayout,
@@ -2077,7 +2077,59 @@ def _default_split(
         symbol_meta,
         allowed_splits,
     )
+
+    # A pool keeps several images per core when the largest-dim-first policy
+    # spends the cores on output rows first; the backend scheduler then cannot
+    # fit its initial chunk in LX (8x64x128x128 k8 s8: i 16 x mb 2 leaves 4
+    # images per core and fails, mb 8 x i 4 compiles and is exact).  Prefer
+    # splitting the batch first whenever that uses at least as many cores.
+    batch = _pool_batch_var(op, output_dims, it_space_adjusted)
+    if batch is not None and output_dims[0] is not batch:
+        batch_first = [batch] + [v for v in output_dims if v is not batch]
+        alt_splits = multi_dim_iteration_space_split(
+            it_space_adjusted,
+            max_cores,
+            batch_first,
+            reduction_dims,
+            committed_splits,
+            symbol_meta,
+            allowed_splits,
+        )
+        if math.prod(alt_splits.values()) >= math.prod(splits.values()):
+            splits, output_dims = alt_splits, batch_first
     return splits, output_dims, reduction_dims
+
+
+def _pool_batch_var(
+    op: ComputedBuffer,
+    output_dims: list[Symbol],
+    it_space: dict[Symbol, Expr],
+) -> Symbol | None:
+    """The batch loop var of a pool reduction, or None.
+
+    A pool's ranges are ``[N, C, H_out, W_out]`` (see ``_lower_pool2d``), so the
+    batch is the first var of the output write -- the same positional reading
+    ``conv_spatial_blocked_vars`` uses for the spatial dims.  A size-1 batch
+    has no var, so the first var must also match ``N`` in size.
+    """
+    data = getattr(op, "data", None)
+    if not isinstance(data, Reduction) or data.reduction_type not in POOL_OPS:
+        return None
+    writes = list(op_read_writes(op).writes)
+    if len(writes) != 1 or not isinstance(writes[0], MemoryDep):
+        return None
+    write_vars = list(writes[0].ranges)
+    if not write_vars:
+        return None
+    first = write_vars[0]
+    n_batch = concretize_expr(data.ranges[0])
+    if (
+        first not in output_dims
+        or n_batch <= 1
+        or concretize_expr(it_space[first]) != n_batch
+    ):
+        return None
+    return first
 
 
 def work_distribution_pass(

@@ -8778,22 +8778,37 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "ops_dict": {
                 "k2s2": lambda x: F.avg_pool2d(x, kernel_size=2, stride=2),
                 "k4s4": lambda x: F.avg_pool2d(x, kernel_size=4, stride=4),
+                # count_include_pad (the default): pad lanes are 0 and count
+                # toward the divisor.
+                "k2s2p1": lambda x: F.avg_pool2d(x, kernel_size=2, stride=2, padding=1),
+                "k4s4p1": lambda x: F.avg_pool2d(x, kernel_size=4, stride=4, padding=1),
             },
             "param_sets": {
                 "1x3x8x8": (cached_randn((1, 3, 8, 8)),),
                 "1x3x24x24": (cached_randn((1, 3, 24, 24)),),
                 "2x3x8x8": (cached_randn((2, 3, 8, 8)),),
             },
+            # k2s2p1 always has out * stride > in on a padded axis, which the
+            # pool lowering rejects (see _lower_pool2d).  TODO: make these
+            # positive cases once views.py supports per-dim window coordinates.
+            "expect_raise": {
+                "k2s2p1_1x3x8x8": "padded H axis reads past the input",
+                "k2s2p1_1x3x24x24": "padded H axis reads past the input",
+                "k2s2p1_2x3x8x8": "padded H axis reads past the input",
+            },
         },
         # max_pool2d lowers to a native maxpoolfwd SDSC (lower_max_pool2d_with_indices).
         # Coverage mirrors avg_pool2d because both share the one pool datapath.
         # stride < kernel is unsupported as yet, so every case here keeps stride == kernel.
         # Non-square k/s is exercised since the H and W window dims are independent
-        # SDSC fields.  padding>0 is not covered as it is still unsupported.
+        # SDSC fields.  The padded cases check that the pad lanes are filled with
+        # the max identity (padval) on chip, not with 0 or adjacent HBM data.
         ("test_max_pool2d", "test_max_pool2d_base"): {
             "ops_dict": {
                 "k2s2": lambda x: F.max_pool2d(x, kernel_size=2, stride=2),
                 "k4s4": lambda x: F.max_pool2d(x, kernel_size=4, stride=4),
+                "k2s2p1": lambda x: F.max_pool2d(x, kernel_size=2, stride=2, padding=1),
+                "k4s4p1": lambda x: F.max_pool2d(x, kernel_size=4, stride=4, padding=1),
                 "k2x4s2x4": lambda x: F.max_pool2d(
                     x, kernel_size=(2, 4), stride=(2, 4)
                 ),
@@ -8804,6 +8819,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "2x3x8x8": (cached_randn((2, 3, 8, 8)),),
                 # C=64 == one full stick, the aligned-channel case.
                 "1x64x8x8": (cached_randn((1, 64, 8, 8)),),
+            },
+            # k2s2p1 always has out * stride > in on a padded axis, which the
+            # pool lowering rejects (see _lower_pool2d).  TODO: make these
+            # positive cases once views.py supports per-dim window coordinates.
+            "expect_raise": {
+                "k2s2p1_1x3x8x8": "padded H axis reads past the input",
+                "k2s2p1_1x3x24x24": "padded H axis reads past the input",
+                "k2s2p1_2x3x8x8": "padded H axis reads past the input",
+                "k2s2p1_1x64x8x8": "padded H axis reads past the input",
             },
         },
         ("test_repeat", "test_repeat_cpu"): {
