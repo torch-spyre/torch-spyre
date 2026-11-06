@@ -14200,6 +14200,194 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=True,
         )
 
+    @pytest.mark.filterwarnings("error::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_index_fill_cpu(self):
+        """Eager index_fill / index_fill_ run on Spyre (no CPU fallback), #4414.
+
+        Compile is off: test_index_fill_compiled_cpu covers it.
+        """
+
+        def inplace(dim, value):
+            def fn(x, index):
+                x = x.clone()
+                result = x.index_fill_(dim, index, value)
+                assert result.data_ptr() == x.data_ptr(), (
+                    "index_fill_: return value is not the same tensor as self"
+                )
+                return result
+
+            return fn
+
+        def functional(dim, value):
+            return lambda x, index: torch.index_fill(x, dim, index, value)
+
+        # The reproducer from #4414
+        self.compare_with_cpu(
+            inplace(0, 10.0),
+            torch.zeros(5, 3),
+            torch.tensor([1, 3]),
+            run_compile=False,
+            run_eager=True,
+        )
+
+        dtypes = (torch.float16, torch.bfloat16, torch.float32, torch.int64, torch.bool)
+        for dtype in dtypes:
+            with self.subTest(dtype=dtype):
+                self.compare_with_cpu(
+                    inplace(0, True if dtype is torch.bool else 10),
+                    torch.zeros(128, 256, dtype=dtype),
+                    torch.tensor([1, 3, 100]),
+                    run_compile=False,
+                    run_eager=True,
+                )
+
+        cases = {
+            "functional_2d_dim0": (functional(0, 10.0), cached_randn((67, 256))),
+            "3d_dim1": (inplace(1, -2.0), cached_randn((4, 8, 128))),
+            "4d_kv_cache_dim-2": (inplace(-2, 0.0), cached_randn((1, 8, 64, 128))),
+            "tensor_value": (
+                inplace(0, torch.tensor(3.0, dtype=torch.float16)),
+                cached_randn((67, 256)),
+            ),
+        }
+        for name, (fn, x) in cases.items():
+            with self.subTest(case=name):
+                self.compare_with_cpu(
+                    fn, x, torch.tensor([1, 3]), run_compile=False, run_eager=True
+                )
+
+        with self.subTest(case="0d_index"):
+            self.compare_with_cpu(
+                inplace(0, 10.0),
+                cached_randn((67, 256)),
+                torch.tensor(5),
+                run_compile=False,
+                run_eager=True,
+            )
+
+    @pytest.mark.filterwarnings("error::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_index_fill_inplace_writes_self(self):
+        """Eager index_fill_ scatters into self via index_fill.out(out=self), #4414.
+
+        Checks the in-place contract: returns self, and a view writes only its
+        own rows.
+        """
+        base = torch.zeros(8, 256, dtype=torch.float16)
+        expected = base.clone()
+        expected[1:].index_fill_(0, torch.tensor([0, 2]), 5.0)
+        x = base.to("spyre")
+        view = x[1:]
+        result = view.index_fill_(0, torch.tensor([0, 2], device="spyre"), 5.0)
+        self.assertIs(result, view)
+        torch.testing.assert_close(x.cpu(), expected)
+
+    def test_index_fill_compiled_cpu(self):
+        """torch.compile'd index_fill / index_fill_ match CPU, #4414."""
+
+        def functional(x, index):
+            return torch.index_fill(x, 0, index, 10.0)
+
+        def inplace(x, index):
+            x = x.clone()
+            x.index_fill_(1, index, -2.0)
+            return x
+
+        def tensor_value(x, index):
+            return torch.index_fill(x, 0, index, torch.tensor(3.0, device=x.device))
+
+        cases = {
+            "functional": (functional, cached_randn((67, 256))),
+            "inplace_3d_dim1": (inplace, cached_randn((4, 8, 128))),
+            "tensor_value": (tensor_value, cached_randn((67, 256))),
+        }
+        for name, (fn, x) in cases.items():
+            with self.subTest(case=name):
+                torch._dynamo.reset()
+                self.compare_with_cpu(fn, x, torch.tensor([1, 3]))
+
+    @staticmethod
+    def _index_fill_pattern_cases():
+        """Index and dim patterns for index_fill_, as (fn, x, index) by name.
+
+        A repeated index is well defined here, unlike index_copy: every selected
+        row gets the same value.
+        """
+
+        def inplace(dim, value):
+            def fn(x, index):
+                x = x.clone()
+                x.index_fill_(dim, index, value)
+                return x
+
+            return fn
+
+        return {
+            "issue_2d_dim0_int_value": (
+                inplace(0, 1),
+                torch.zeros(8, 64, dtype=torch.float16),
+                torch.tensor([0, 2]),
+            ),
+            "first_and_last_row": (
+                inplace(0, 10.0),
+                cached_randn((67, 256)),
+                torch.tensor([0, 66]),
+            ),
+            "every_row": (inplace(0, 10.0), cached_randn((8, 64)), torch.arange(8)),
+            "unsorted_index": (
+                inplace(0, 10.0),
+                cached_randn((67, 256)),
+                torch.tensor([5, 1, 3]),
+            ),
+            "repeated_index": (
+                inplace(0, 10.0),
+                cached_randn((67, 256)),
+                torch.tensor([1, 3, 1]),
+            ),
+            "negative_dim": (
+                inplace(-2, 10.0),
+                cached_randn((67, 256)),
+                torch.tensor([1, 3]),
+            ),
+        }
+
+    @pytest.mark.filterwarnings("error::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_index_fill_index_patterns_cpu(self):
+        """Eager index_fill_ matches CPU across index patterns, #4414."""
+        for name, (fn, x, index) in self._index_fill_pattern_cases().items():
+            with self.subTest(case=name):
+                self.compare_with_cpu(fn, x, index, run_compile=False, run_eager=True)
+
+    def test_index_fill_index_patterns_compiled_cpu(self):
+        """torch.compile'd index_fill_ matches CPU across index patterns, #4414."""
+        for name, (fn, x, index) in self._index_fill_pattern_cases().items():
+            with self.subTest(case=name):
+                torch._dynamo.reset()
+                self.compare_with_cpu(fn, x, index)
+
+    @expects_raise
+    def test_index_fill_stick_dim_raises(self):
+        """index_fill along the stick (last) dim raises, like index_copy (#4404).
+
+        TODO: a missing feature. When a stick-dim scatter compiles, this stops
+        raising and must become a positive test.
+        """
+        cases = {
+            "2d_dim1": (torch.zeros(8, 128), 1, "cannot re-tile"),
+            # A 1-D tensor's only dim is the stick dim.
+            "1d_dim0": (torch.zeros(128), 0, "restickify op_spec has 3 args"),
+        }
+        for name, (x, dim, match) in cases.items():
+            with self.subTest(case=name):
+                torch._dynamo.reset()
+                with pytest.raises(InductorError, match=match):
+                    self.compare_with_cpu(
+                        lambda x, index: torch.index_fill(x, dim, index, 10.0),
+                        x,
+                        torch.tensor([0, 64]),
+                        run_compile=False,
+                        run_eager=True,
+                    )
+
     def test_repeat_cpu(self, op, x, repeats):
         shape = x.repeat(*repeats).shape
         self.compare_with_cpu(lambda a: op(a, repeats, shape), x)
