@@ -204,8 +204,9 @@ def test_benchmarks_are_stamped_with_the_callers_component(
     monkeypatch.setattr(
         ingest,
         "insert_benchmarks",
-        lambda client, db, comp, run_id, entries, **kw: written.append(comp)
-        or len(entries),
+        lambda client, db, comp, run_id, entries, **kw: (
+            written.append(comp) or len(entries)
+        ),
     )
     _run_main(
         ingest,

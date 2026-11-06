@@ -61,6 +61,7 @@ from .constants import (
 from .core_mapping import aligned_split_keeps_blocks
 from .errors import Unsupported
 from .ir import FixedTiledLayout
+from .loop_facts import enclosing_loops
 from .pass_utils import (
     AlignmentAccess,
     build_operation_alignment_inputs,
@@ -252,12 +253,10 @@ def direct_read_source_stick_split_domains(
     full physical/logical ownership equivalence; this rule only keeps the work-
     division search from choosing a candidate that is known to be impossible.
     """
-    loop_info = getattr(ctx.op, "loop_info", None)
-    loop_counts = getattr(loop_info, "loop_count", ())
     try:
         loop_trips = 1
-        for count in loop_counts:
-            loop_trips *= concretize_expr(count)
+        for level in enclosing_loops(ctx.op):
+            loop_trips *= concretize_expr(level.trip_count)
     except Exception:
         return ConstraintResult()
     if loop_trips < _MIN_SOURCE_AWARE_DIRECT_READ_TRIPS:
@@ -589,9 +588,9 @@ def coarse_tile_local_dim_split_domains(
     into it, rather than assuming a non-empty ``loop_tiled_reduction_dims``
     implies one exists.
     """
-    loop_info = getattr(ctx.op, "loop_info", None)
-    if loop_info is None:
+    if getattr(ctx.op, "loop_info", None) is None:
         return ConstraintResult()
+    levels = enclosing_loops(ctx.op)
 
     if getattr(ctx.op, JOINT_TILING_AND_DIVISION_ATTR, False):
         return ConstraintResult()  # see JOINT_TILING_AND_DIVISION_ATTR
@@ -655,15 +654,15 @@ def coarse_tile_local_dim_split_domains(
 
     allowed_splits: dict[Symbol, frozenset[int]] = {}
     output_ranges = ctx.op.data.ranges
-    for level_dims in loop_info.loop_tiled_dims:
-        for pos in level_dims:
+    for level in levels:
+        for pos in level.tiled_dims:
             pin(pos, output_ranges)
 
     n_output_dims = len(output_ranges)
     reduction_ranges = getattr(ctx.op.data, "reduction_ranges", None)
     if reduction_ranges is not None:
-        for level_dims in loop_info.loop_tiled_reduction_dims:
-            for pos in level_dims:
+        for level in levels:
+            for pos in level.tiled_reduction_dims:
                 pin(n_output_dims + pos, reduction_ranges, raw_base=n_output_dims)
 
     return ConstraintResult(allowed_splits=allowed_splits)

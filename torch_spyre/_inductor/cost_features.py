@@ -35,6 +35,7 @@ from .pass_utils import (
     apply_splits_from_index_coeff,
     iteration_space_from_op,
     loop_var_ranges_from_dim_hints,
+    op_read_writes,
 )
 
 logger = get_logger("cost_model")
@@ -86,7 +87,7 @@ def _resolved_work_slices(op, work_slices=None) -> dict:
     """The op's complete symbol-keyed core-split map (``{}`` when unavailable):
     the explicit candidate during LX planning, else the committed ownership."""
     try:
-        rw = op.get_read_writes()
+        rw = op_read_writes(op)
         write_index = next(iter(rw.writes)).index
         read_index = next((d.index for d in rw.reads), write_index)
         it_space = iteration_space_from_op(op)
@@ -447,7 +448,7 @@ def _candidate_tiling(op, tiling: Mapping):
         raise ValueError(
             f"candidate tiling given for {op.get_name()}, which is already coarse-tiled"
         )
-    write_index = next(iter(op.get_read_writes().writes)).index
+    write_index = next(iter(op_read_writes(op).writes)).index
     out_syms = write_index.free_symbols
     out_counts = [count for sym, count in tiling.items() if sym in out_syms]
     red_counts = [count for sym, count in tiling.items() if sym not in out_syms]
@@ -490,7 +491,7 @@ def _row_split(op, default: int, work_slices=None) -> int:
     (usually total cores) on any failure -> the prior all-cores-on-rows behavior.
     """
     try:
-        rw = op.get_read_writes()
+        rw = op_read_writes(op)
         write_index = next(iter(rw.writes)).index
         read_index = next((d.index for d in rw.reads), write_index)
         it_space = iteration_space_from_op(op)
@@ -628,7 +629,7 @@ def _transport_read_geometry(op, work_slices=None):
             and not getattr(op, "op_it_space_splits", None)
         ):
             return None, None
-        rw = op.get_read_writes()
+        rw = op_read_writes(op)
         if len(rw.reads) != 1 or len(rw.writes) != 1:
             return None, None
         read, write = next(iter(rw.reads)), next(iter(rw.writes))
@@ -809,7 +810,7 @@ def _read_run_bytes(op, read, work_slices=None):
 
         from .pass_utils import device_coordinates
 
-        rw = op.get_read_writes()
+        rw = op_read_writes(op)
         write = next(iter(rw.writes))
         src = _real_layout(V.graph.get_buffer(read.name).get_layout()).device_layout
         it_space = iteration_space_from_op(op)
@@ -882,7 +883,7 @@ def _matmul_features(
     a_bytes = b_bytes = 0
     k_split = m_split = n_split = 1
     try:
-        rw = op.get_read_writes()
+        rw = op_read_writes(op)
         write_index = next(iter(rw.writes)).index
         read_index = next((d.index for d in rw.reads), write_index)
         it_space = iteration_space_from_op(op)
@@ -956,7 +957,7 @@ def _hbm_pattern(op, is_reduction: bool, out_dims) -> str:
     "" -> ordinary contiguous access; the default bw_peak + turnaround applies.
     """
     try:
-        rw = op.get_read_writes()
+        rw = op_read_writes(op)
         write_index = next(iter(rw.writes)).index
         it_space = iteration_space_from_op(op)
 
@@ -1230,7 +1231,7 @@ def _indirect_write_elems(op, out_elems: int) -> int | None:
     try:
         if not isinstance(op.get_layout(), MutationLayoutSHOULDREMOVE):
             return None
-        rw = op.get_read_writes()
+        rw = op_read_writes(op)
         writes = list(rw.writes)
         if len(writes) != 1 or not writes[0].is_indirect():
             return None
@@ -1385,7 +1386,7 @@ def extract_op_features(
     _li = getattr(op, "loop_info", None)
     _rw = None
     try:
-        _rw = op.get_read_writes()
+        _rw = op_read_writes(op)
         _write_index = next(iter(_rw.writes)).index
     except Exception:  # noqa: BLE001 - best-effort feature extraction
         _write_index = None
@@ -1536,7 +1537,7 @@ def extract_op_features(
     # No dependencies change during feature extraction. Reuse the output snapshot,
     # retrying only if that extraction failed; keep it local to this invocation.
     try:
-        reads = (_rw if _rw is not None else op.get_read_writes()).reads
+        reads = (_rw if _rw is not None else op_read_writes(op)).reads
     except Exception:  # noqa: BLE001
         reads = []
     n_out_vars = len(out_size)

@@ -44,7 +44,7 @@ def run_demo():
         # Pre-broadcast computation
         y = t + t
 
-        # Broadcast from root rank - lowered to broadcast_async
+        # Broadcast from root rank - lowered to broadcast_run + wait_work
         y_bcast = torch.ops._c10d_functional.broadcast(y, root_rank, "default")
 
         # Independent computation (compiler in future can schedule this to overlap with broadcast)
