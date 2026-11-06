@@ -33,6 +33,20 @@ from torch.testing._internal.common_utils import (
 )
 
 # 0-dim scalar roundtrip: shared dtype × factory lambdas (used by parametrized fill test).
+# H2D copies into a sub-view of a larger allocation: (base shape, index).
+# int32 sticks hold 32 elements, so the substick_* cases start or end mid-stick
+# and need spyre_copy_from's read-modify-write, while the stick_aligned_* ones
+# must stay on generate_dci's native path (#4858, #4789's vLLM prefix copy).
+_H2D_SUBVIEW_CASES = [
+    subtest(((64,), slice(0, 9)), name="substick_head"),
+    subtest(((64,), slice(55, 64)), name="substick_tail"),
+    subtest(((4, 100), (slice(None), slice(0, 9))), name="substick_column_prefix"),
+    subtest(((4, 100), (slice(None), slice(40, 49))), name="substick_column_window"),
+    subtest(((4, 100), (2, slice(0, 9))), name="substick_single_row"),
+    subtest(((64,), slice(0, 32)), name="stick_aligned_prefix"),
+    subtest(((64,), slice(32, 64)), name="stick_aligned_suffix"),
+]
+
 _SCALAR_ROUNDTRIP_DTYPE_CASES = [
     (torch.int8, lambda fn: fn((), dtype=torch.float32).to(dtype=torch.int8)),
     (torch.bool, lambda fn: fn((), dtype=torch.bool)),
@@ -1109,6 +1123,72 @@ class TestSpyre(TestCase):
             ),
         )
 
+    def _check_h2d_subview_copy(self, shape, index, non_blocking=False):
+        """Copy a CPU source into spyre_base[index] and compare the whole
+        allocation against a CPU tensor patched the same way, so the check
+        covers both the slot and everything outside it.
+        """
+        sentinel = -1
+        cpu_src = torch.arange(torch.Size(shape).numel(), dtype=torch.int32)
+        cpu_src = cpu_src.reshape(shape)
+        spyre_base = torch.full(shape, sentinel, dtype=torch.int32).to("spyre")
+
+        spyre_base[index].copy_(cpu_src[index], non_blocking=non_blocking)
+
+        expected = torch.full(shape, sentinel, dtype=torch.int32)
+        expected[index] = cpu_src[index]
+        self.assertEqual(spyre_base.cpu(), expected)
+
+    @parametrize("shape,index", _H2D_SUBVIEW_CASES)
+    def test_h2d_copy_into_subview(self, shape, index):
+        """Regression for #3976: an H2D copy into a sub-view must land at the
+        right offset without disturbing the elements sharing its sticks.
+        """
+        self._check_h2d_subview_copy(shape, index)
+
+    def test_h2d_copy_into_subview_non_blocking(self):
+        """The staging buffer is function-local and copyAsync does not retain
+        it, so without a synchronize it dies with the DMA still in flight.
+        """
+        self._check_h2d_subview_copy((64,), slice(0, 9), non_blocking=True)
+
+    def test_h2d_copy_into_subview_preserves_earlier_slice(self):
+        """The read-modify-write reads the live allocation first, so a second
+        sub-stick copy must not undo the first.
+        """
+        N, n, sentinel = 64, 9, -1
+        cpu_src = torch.arange(N, dtype=torch.int32)
+        spyre_base = torch.full((N,), sentinel, dtype=torch.int32).to("spyre")
+
+        spyre_base[:n].copy_(cpu_src[:n])
+        spyre_base[-n:].copy_(cpu_src[-n:])
+
+        expected = torch.full((N,), sentinel, dtype=torch.int32)
+        expected[:n] = cpu_src[:n]
+        expected[-n:] = cpu_src[-n:]
+        self.assertEqual(spyre_base.cpu(), expected)
+
+    def test_h2d_subview_copy_preserves_out_of_slot_dtype_precision(self):
+        """With a dtype-converting source the staging buffer must use dst's
+        dtype, or out-of-slot elements lose precision on the round trip. The
+        int32 base keeps the check bitwise exact.
+        """
+        N = 64
+        n = 9
+
+        sentinel = 0x12345678
+        spyre_base = torch.full((N,), sentinel, dtype=torch.int32).to("spyre")
+        spyre_base[:n].copy_(torch.ones(n, dtype=torch.float16))
+
+        result = spyre_base.cpu()
+
+        self.assertEqual(result[:n], torch.ones(n, dtype=torch.int32))
+        # Bitwise check: out-of-slot elements must be untouched
+        self.assertTrue(
+            torch.all(result[n:] == sentinel),
+            msg=f"out-of-slot elements corrupted: {result[n:]}",
+        )
+
     def test_scalar_tensor(self):
         """Test to ensure we have scalar tensor on Spyre"""
         scalar = torch.tensor(3.14, dtype=torch.float16, device="spyre")
@@ -1500,13 +1580,10 @@ class TestSpyre(TestCase):
             [9, 15, 35, 100],
         ],
     )
-    @pytest.mark.xfail(
-        strict=False,  # Allows XPASS for now, will be changed to True to enforce later
-        raises=AssertionError,
-        reason="Sub-stick slices are not yet supported for DMA",
-    )
     def test_h2d_copy_to_substick_sliced_destination(self, sizes):
-        """H2D sub-stick tensor slice"""
+        """H2D sub-stick tensor slice, served by spyre_copy_from's
+        read-modify-write (flex issue 2083 tracks native sub-stick DMA).
+        """
         x = torch.rand(
             sizes,
             dtype=torch.float16,
