@@ -105,6 +105,7 @@ from .pass_utils import (
     get_matmul_m_size,
     get_matmul_n_size,
     indirect_info_from_op,
+    reorder_valid_elements,
     try_device_coordinates,
 )
 from .propagate_layouts import PropArg
@@ -464,9 +465,10 @@ def _matmul_reorder_stl(
         new_stride_map,
     )
     return SpyreTensorLayout(
-        device_size=new_device_size,
-        stride_map=new_stride_map,
-        device_dtype=stl.device_dtype,
+        new_device_size,
+        new_stride_map,
+        stl.device_dtype,
+        reorder_valid_elements(stl, new_order),
     )
 
 
@@ -539,6 +541,7 @@ def _ia_rotate_stl(
         device_size=new_device_size,
         stride_map=[stride_map[i] for i in order],
         device_dtype=stl.device_dtype,
+        valid_elements=reorder_valid_elements(stl, order),
     )
 
 
