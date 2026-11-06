@@ -38,6 +38,7 @@ from torch._inductor.ir import (
     ComputedBuffer,
     FallbackKernel,
     MutationLayoutSHOULDREMOVE,
+    _CollectiveKernel,
 )
 from torch._inductor.lowering import clone as clone_lowering
 
@@ -149,6 +150,11 @@ def _select_bracket_targets(
 
     for fk_idx, op in enumerate(graph.operations):
         if not isinstance(op, FallbackKernel):
+            continue
+        if isinstance(op, _CollectiveKernel):
+            # Collectives and waits run in spyre-comms and never launch a
+            # nested compile.  Bracketing them would add a dump and a restore
+            # around every all_reduce on the TP decode path.
             continue
         outputs = getattr(op, "outputs", None)
         if outputs is None or len(outputs) > 1:
