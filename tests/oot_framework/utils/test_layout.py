@@ -30,6 +30,11 @@ can only credit its cases back to a config through a test file that config alone
 a bucket share a runner, directory, flags and `global:` block, and never two of them name the same
 test file, so a bucket runs exactly the tests its members would run on their own.
 
+A long config can instead move to a multi-card runner (`multicard` in the policy): run_test.sh
+--parallel then deals its tests across the pod's cards, so one job finishes sooner without splitting
+the config. Only configs on the default single-card runner move; an explicit runner_overrides.yaml
+entry, `exclude`, or too few runs keeps a config where it is.
+
 No policy file means every config runs alone, which is today's behaviour, so this can never be the
 reason a matrix fails to build. A malformed policy or timings file is an error instead, because it
 would otherwise change what runs without anyone noticing.
@@ -45,7 +50,10 @@ DEFAULT_POLICY: dict = {
     "max_members": 16,
     "min_runs": 5,
     "exclude": [],
+    "multicard": {"enabled": False, "runners": []},
 }
+
+DEFAULT_RUNNER = "spyre_pf_x1"
 
 
 class LayoutError(ValueError):
@@ -71,6 +79,7 @@ def load_policy(path: Optional[str]) -> Optional[dict]:
         raise LayoutError(
             f"{path}: target_job_minutes must be a positive number, got {v!r}"
         )
+    _check_multicard(path, policy["multicard"])
     for name, low in (("max_members", 2), ("min_runs", 1)):
         v = policy[name]
         if isinstance(v, bool) or not isinstance(v, int) or v < low:
@@ -110,6 +119,76 @@ def load_timings(path: Optional[str]) -> Dict[str, dict]:
     return out
 
 
+def _check_multicard(path: str, mc) -> None:
+    """`multicard`: {"enabled": bool, "runners": [{"label", "cards" >= 2, "min_minutes" > 0}]}."""
+    if not isinstance(mc, dict) or set(mc) - {"enabled", "runners"}:
+        raise LayoutError(
+            f'{path}: multicard must be {{"enabled", "runners"}}, got {mc!r}'
+        )
+    if not isinstance(mc.get("enabled", False), bool):
+        raise LayoutError(f"{path}: multicard.enabled must be true or false")
+    runners = mc.get("runners", [])
+    if not isinstance(runners, list):
+        raise LayoutError(f"{path}: multicard.runners must be a list")
+    for r in runners:
+        ok = (
+            isinstance(r, dict)
+            and set(r) == {"label", "cards", "min_minutes"}
+            and isinstance(r["label"], str)
+            and r["label"]
+            and isinstance(r["cards"], int)
+            and not isinstance(r["cards"], bool)
+            and r["cards"] >= 2
+            and isinstance(r["min_minutes"], (int, float))
+            and not isinstance(r["min_minutes"], bool)
+            and r["min_minutes"] > 0
+        )
+        if not ok:
+            raise LayoutError(
+                f"{path}: multicard runner must be "
+                f'{{"label": str, "cards": int >= 2, "min_minutes": number > 0}}, got {r!r}'
+            )
+
+
+def multicard_runners(
+    configs: List[dict], policy: Optional[dict], timings: Dict[str, dict]
+) -> Dict[str, str]:
+    """{config key: multi-card runner label} for the long configs that move off one card.
+
+    A config moves when it is on the default runner, not excluded, has `min_runs` runs, and its
+    median reaches a runner's `min_minutes`; it gets the runner with the highest `min_minutes` it
+    reaches, so a longer config gets more cards. A shared test file does not matter here: a moved
+    config runs alone and reports under its own name, so its timings stay exact.
+    """
+    if policy is None or not policy["multicard"].get("enabled"):
+        return {}
+    ladder = sorted(
+        policy["multicard"].get("runners", []), key=lambda r: -float(r["min_minutes"])
+    )
+    out: Dict[str, str] = {}
+    for c in configs:
+        key = c["key"]
+        rec = timings.get(key)
+        if (
+            c["runner"] != DEFAULT_RUNNER
+            or _excluded(key, policy)
+            or rec is None
+            or rec["runs"] < policy["min_runs"]
+        ):
+            continue
+        for r in ladder:
+            if rec["p50_min"] >= float(r["min_minutes"]):
+                out[key] = r["label"]
+                break
+    return out
+
+
+def _excluded(key: str, policy: dict) -> bool:
+    return any(
+        key == e or (e.endswith("/") and key.startswith(e)) for e in policy["exclude"]
+    )
+
+
 def step_overhead(minutes: float) -> float:
     """Pytest step time beyond the summed case time: ~0.25 min small, up to ~2 min for big configs."""
     return 0.25 + min(2.0, 0.12 * minutes)
@@ -131,13 +210,9 @@ def plan(
     for c in configs:
         key = c["key"]
         rec = timings.get(key)
-        excluded = any(
-            key == e or (e.endswith("/") and key.startswith(e))
-            for e in policy["exclude"]
-        )
         # Too few runs to size it: alone, exactly as it would run without grouping.
         if (
-            excluded
+            _excluded(key, policy)
             or c.get("shared_file")
             or rec is None
             or rec["runs"] < policy["min_runs"]
