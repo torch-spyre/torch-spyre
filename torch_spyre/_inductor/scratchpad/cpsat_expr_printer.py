@@ -21,32 +21,21 @@ given: ``sym_map`` (symbol name -> CP-SAT var, plus ``_division_of_<sym>`` ->
 the division-choosing buffer wrapper) and ``buffer_map`` (split or tile symbol
 name -> ``(wrapper, candidate values)``). A wrapper supplies ``buffer``,
 ``division`` and ``division_is``.
-
-Every decision the cost depends on has a finite domain: a division index over
-an enumerated menu, or a residency literal. So most of the expression is a table:
-the cost model evaluated exactly at each point of the decisions it depends on,
-looked up by one ``element`` constraint (see :meth:`_SympyExprToCpSat._axes`).
-Only what spans too many decisions to enumerate jointly -- a bundle's memory
-term, a sum over its residencies -- lowers term by term, as sums, gated
-products and ``int_prod``s of tables.
 """
 
 from __future__ import annotations
 
-import functools
+from collections import Counter
 import logging
 import math
 import operator
-import sys
 from fractions import Fraction
 from functools import cache
-from typing import Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 import numpy as np
 import sympy
 from sympy.printing.printer import Printer
-
-from torch_spyre._inductor import config
 
 if TYPE_CHECKING:
     from ortools.sat.python import cp_model, cp_model_helper
@@ -60,22 +49,35 @@ __all__ = ["cost_expr_to_cpsat"]
 
 logger = logging.getLogger(__name__)
 
+# constant to scale log of core split. error ~0.5%
+_CORE_LOG_SCALE = 32.0
+# cap on the scale for the inverse of a core split, and the scale itself when
+# the split has no candidate values (see _SympyExprToCpSat._inv_scale).
+# error <= ~4%
+_CORE_INV_SCALE = 1024
+# largest value _CORE_INV_SCALE is sized for: the core count. Past it (a tile
+# count can be any divisor of its axis) the cap grows in step, see _inv_scale.
+_CORE_INV_SCALE_MAX_VALUE = 32
 # constant limit on product terms to avoid int32 overflow in CP-SAT
 _MAX_PRODUCT_BOUND = 2**30
-# Bits each factor of a multiplication keeps, so the product of two of them
-# stays inside int32. Past that presolve mis-propagates the multiplication:
-# against a 30-bit value it reported a satisfiable model INFEASIBLE, and where
-# it did solve it proved plans several times worse than the exact cost of a
-# plan the same model admits.
-_PRODUCT_FACTOR_BITS = 15
-# CP-SAT rejects a linear constraint whose worst-case sum could pass this.
-_INT64_MAX = 2**63 - 1
-# Scale on a Min/Max operand with fractional coefficients, so a table's step
-# survives rounding to an integer.
-_MINMAX_OPERAND_SCALE = 1024
-# Largest value such an operand may reach once scaled: _floored's two terms each
-# carry it times a denominator of at most _MINMAX_OPERAND_SCALE.
-_MINMAX_OPERAND_BOUND = _INT64_MAX // (2 * _MINMAX_OPERAND_SCALE)
+# Bits of a derived symbol's largest value: it rounds to 2**-_DERIVED_BITS of
+# that value, and its levels stay inside _MAX_PRODUCT_BOUND.
+_DERIVED_BITS = 30
+_NONLINEAR_FUNCS = (
+    sympy.log,
+    sympy.floor,
+    sympy.ceiling,
+    sympy.Min,
+    sympy.Max,
+    sympy.Piecewise,
+    sympy.ITE,
+    sympy.KroneckerDelta,
+)
+_DUAL = {sympy.Min: sympy.Max, sympy.Max: sympy.Min}
+# Bits kept of a Min/Max operand's smallest coefficient, and the bound on any
+# scaled operand: below int64 once _integerize_minmax multiplies by 10000.
+_MINMAX_COEFFICIENT_BITS = 24
+_MINMAX_VALUE_BITS = 48
 
 
 _operator_map = {
@@ -125,76 +127,59 @@ def _simplify_eq_conjunction(expr):
     return sympy.And(*kept)
 
 
-def _reduce(op):
-    return lambda args: functools.reduce(op, args)
-
-
-def _piecewise(args):
-    """A Piecewise's values at every point: the first branch whose condition
-    holds. NaN where none does, so a table that reaches it is refused."""
-    result = np.nan
-    for value, cond in reversed(list(zip(args[::2], args[1::2]))):
-        result = np.where(cond, value, result)
-    return result
-
-
-# The evaluator behind the tables: for each sympy node type, the numpy
-# function _values applies to the node's operands, each already evaluated at
-# every point of the node's decisions as an array broadcast against the others.
-# An n-ary node folds its function over the operands; a Piecewise takes the
-# first branch whose condition holds (_piecewise). A type absent here is one
-# the tables cannot evaluate, so _find_axes returns None for it and the node
-# lowers through its own printer method: a ``RelayoutCharge`` or
-# ``KroneckerDelta`` onto the solver's own division literals, an implemented
-# function through _print_AppliedUndef.
-_TABLE_OPS = {
-    sympy.Add: _reduce(np.add),
-    sympy.Mul: _reduce(np.multiply),
-    sympy.Pow: lambda a: np.power(np.asarray(a[0], dtype=float), a[1]),
-    sympy.Min: _reduce(np.minimum),
-    sympy.Max: _reduce(np.maximum),
-    sympy.floor: lambda a: np.floor(a[0]),
-    sympy.ceiling: lambda a: np.ceil(a[0]),
-    sympy.log: lambda a: np.log(a[0]),
-    sympy.exp: lambda a: np.exp(a[0]),
-    sympy.Abs: lambda a: np.abs(a[0]),
-    sympy.Mod: lambda a: np.mod(a[0], a[1]),
-    sympy.And: _reduce(np.logical_and),
-    sympy.Or: _reduce(np.logical_or),
-    sympy.Not: lambda a: np.logical_not(a[0]),
-    sympy.ITE: lambda a: np.where(a[0], a[1], a[2]),
-    sympy.Piecewise: _piecewise,
+_inv_rel_op = {
+    sympy.Eq: sympy.Eq,
+    sympy.Ge: sympy.Le,
+    sympy.Le: sympy.Ge,
+    sympy.Gt: sympy.Lt,
+    sympy.Lt: sympy.Gt,
 }
 
 
-def _table_op(expr):
-    """The function that evaluates ``expr`` over its operands' tables, or None."""
-    if expr.is_Relational:
-        compare = _operator_map[expr.rel_op]
-        return lambda a: compare(a[0], a[1])
-    for cls in type(expr).__mro__:
-        if cls in _TABLE_OPS:
-            return _TABLE_OPS[cls]
-    return None
+class _LazyMin(sympy.Min):
+    """``Min`` built without canonicalization. An evaluated ``Min``/``Max`` runs
+    sympy's pairwise dominance check on its arguments (``_find_localzeros``),
+    which for the split-symbol expressions of the cost objective goes through
+    the assumptions system (``is_ge`` -> ``_monotonic_sign`` -> ``factor_terms``);
+    every rewrite pass below rebuilds these nodes, so on the 304-op spyre_attn
+    decode graph that check was ~60% of the planner's Python time (59.6 s of
+    the rewrite passes; 2.0 s with these classes). The printer lowers a
+    ``Min``/``Max`` structurally and never needs the canonical form."""
+
+    def __new__(cls, *args, **kwargs):
+        kwargs["evaluate"] = False
+        return super().__new__(cls, *args, **kwargs)
 
 
-def _table_operands(expr):
-    if expr.is_Piecewise:
-        return [part for pair in expr.args for part in pair]
-    return expr.args
+class _LazyMax(sympy.Max):
+    """``Max`` counterpart of :class:`_LazyMin`."""
+
+    def __new__(cls, *args, **kwargs):
+        kwargs["evaluate"] = False
+        return super().__new__(cls, *args, **kwargs)
 
 
-# A float holds every integer below this exactly; a larger "integer" entry is
-# a rounded float and stays one.
-_FLOAT_EXACT_INTEGER = 1 << sys.float_info.mant_dig
+_LAZY = {sympy.Min: _LazyMin, sympy.Max: _LazyMax}
 
 
-def _number(value):
-    """A table entry as the constant the model takes: an int where it is one."""
-    value = float(value)
-    if value.is_integer() and abs(value) < _FLOAT_EXACT_INTEGER:
-        return int(value)
-    return value
+def _lazy_minmax(expr: sympy.Expr) -> sympy.Expr:
+    """Rebuild every ``Min``/``Max`` node of ``expr`` as its lazy counterpart.
+
+    A hand-rolled bottom-up rebuild rather than ``Basic.replace``: ``replace``
+    reconstructs a node whose children changed with its ORIGINAL class before
+    applying the substitution, so a ``Min`` nested inside a ``Max`` was
+    canonicalized once more on the way up (13 s on the 304-op graph's
+    objective). Here a ``Min``/``Max`` is built lazy in the first place and
+    every other node is rebuilt only when a child actually changed."""
+    if not expr.args:
+        return expr
+    args = [_lazy_minmax(a) for a in expr.args]
+    lazy = _LAZY.get(type(expr))
+    if lazy is not None:
+        return lazy(*args)
+    if all(a is b for a, b in zip(args, expr.args)):
+        return expr
+    return expr.func(*args)
 
 
 class memoize_method:
@@ -226,294 +211,693 @@ class _SympyExprToCpSat(Printer):
         model: "cp_model.CpModel",
         sym_map: dict,
         buffer_map: dict,
-        max_table_entries: Optional[int] = None,
     ) -> None:
         self._model = model
         self._count = 0
         self._sym_map = sym_map
         self._buffer_map = buffer_map
-        # Points a joint table may span; the caller decides, see
-        # config.cpsat_max_table_entries.
-        self._max_table_entries = (
-            config.cpsat_max_table_entries
-            if max_table_entries is None
-            else max_table_entries
-        )
+        self._allow_tables = True
         # These caches belong to one converter/model. A class-level @cache
         # would retain every converter and its CP model across compilations.
         self._expr_cache: dict = {}
+        self._untabled_expr_cache: dict = {}
         self._conjunction_cache: dict = {}
-        self._axes_cache: dict = {}
-        self._values_cache: dict = {}
-        self._lookup_cache: dict = {}
-        self._domain_index: dict = {}
-        # Axis id (a variable's index) -> (variable, first value, size, is a
-        # residency literal). See _axes.
-        self._axis: dict = {}
-        # The indices of the table levels: see _is_table_factor.
-        self._table_vars: set = set()
+        self._candidate_cache: dict = {}
+        self._division_table_cache: dict = {}
+        self._derived: dict = {}
+        self._fold_cache: dict = {}
         super().__init__()
 
     def _print(self, expr, **kwargs):
         if expr not in self._expr_cache:
-            self._expr_cache[expr] = self._lower(expr, **kwargs)
+            table = (
+                self._division_table(expr) if self._allow_tables and expr.args else None
+            )
+            self._expr_cache[expr] = (
+                super()._print(expr, **kwargs) if table is None else table
+            )
         return self._expr_cache[expr]
 
-    def _lower(self, expr, **kwargs):
-        """The one decision of the lowering, made for every node ``_print``
-        meets.
+    def _candidate_values(self, expr):
+        """Evaluate an expression over at most one buffer's division menu.
 
-        When :meth:`_axes` knows which decisions the node reads and there is at
-        most one (a buffer's division index, a residency literal, or the rank
-        of a wide Min/Max), the node is finished as one table: :meth:`_values`
-        evaluates it at every point of that decision and :meth:`_emit` hands
-        CP-SAT a constant, a linear expression or one ``element`` lookup, and
-        nothing under the node is lowered. Otherwise -- the node reads several
-        decisions, or an operand no table can evaluate -- the printer method
-        for its type lowers it term by term and recurses into the operands
-        through ``_print``, so each operand gets the same chance. Those methods
-        take a joint table over several decisions where that pays (``_joint``
-        in ``_print_Pow``, ``_print_Min``/``_print_Max`` and
-        ``_print_Piecewise``, the factor groups of ``_print_Mul``); a sum never
-        does, since a sum of tables is exact for free."""
-        if expr.args:
-            axes = self._axes(expr)
-            if axes is not None and len(axes) <= 1:
-                table = self._emit(axes, self._values(expr))
-                if table is not None:
-                    return table
-        return super()._print(expr, **kwargs)
+        Residency and other free decisions stop evaluation at that node. Work
+        on the rewritten expression, including its reciprocal/log scales and
+        Min/Max rounding, so tabulation does not change the cost model.
+        """
+        if expr not in self._candidate_cache:
+            self._candidate_cache[expr] = self._evaluate_candidates(expr)
+        return self._candidate_cache[expr]
 
-    def convert(self, cost_expr: sympy.Expr) -> "cp_model.LinearExpr":
-        """Return the CP-SAT expression equivalent to ``cost_expr`` under
-        ``sym_map`` (``sympy symbol -> CP-SAT var``)."""
-        logger.debug("[CP-SAT layout solver] cost expr: %s", cost_expr)
-        return self._print(cost_expr)
-
-    # -- Tables ---------------------------------------------------------------
-    #
-    # An axis is one decision with a finite domain: a buffer's division index
-    # (its splits and tile counts are the menu's columns), a residency literal,
-    # or the rank of a Min/Max too wide to take jointly. A node's table is its
-    # value at every point of its axes, evaluated from the cost expression as
-    # written, so the objective prices each candidate as the cost model does.
-
-    def _add_axis(self, var, first, size, literal=False):
-        self._axis.setdefault(var.index, (var, first, size, literal))
-        return var.index
-
-    def _shape(self, axes):
-        return tuple(self._axis[a][2] for a in axes)
-
-    def _size(self, axes):
-        return math.prod(self._shape(axes))
-
-    def _axes(self, expr):
-        """The axes ``expr`` is a function of, as a sorted tuple of axis ids, or
-        ``None`` when it is not a table: it reads a variable with no small
-        domain, holds a node :data:`_TABLE_OPS` does not evaluate, or spans
-        more than ``max_table_entries`` points jointly."""
-        if expr not in self._axes_cache:
-            self._axes_cache[expr] = self._find_axes(expr)
-        return self._axes_cache[expr]
-
-    def _find_axes(self, expr):
-        if expr.is_Number or expr in (sympy.true, sympy.false):
-            return ()
+    def _evaluate_candidates(self, expr):
+        if expr in (sympy.true, sympy.false):
+            return None, bool(expr)
+        if expr.is_Number:
+            return None, int(expr) if expr.is_Integer else float(expr)
         if expr.is_Symbol:
-            return self._leaf_axes(expr)
-        if _table_op(expr) is None:
-            return None
-        found: set = set()
-        for arg in _table_operands(expr):
-            axes = self._axes(arg)
-            if axes is None:
+            mapped = self._sym_map.get(expr.name)
+            if isinstance(mapped, (int, float)):
+                return None, mapped
+            name = expr.name
+            prefix = next((p for p in ("inv_", "log2_") if name.startswith(p)), "")
+            raw_name = name[len(prefix) :]
+            entry = self._buffer_map.get(raw_name)
+            if entry is None:
+                wrapper = self._sym_map.get(f"_division_of_{name}")
+                if wrapper is None:
+                    return None
+                entry = wrapper, range(len(wrapper.buffer.core_divisions))
+            wrapper, raw = entry
+            if wrapper is None:
+                # Domain-only entries can set reciprocal scales without a
+                # shared division selector. Keep their arithmetic symbolic;
+                # their candidate arrays are not scalar constants or a table.
                 return None
-            found.update(axes)
-        axes = tuple(sorted(found))
-        if len(axes) <= 1 or self._size(axes) <= self._max_table_entries:
-            return axes
-        if isinstance(expr, (sympy.Min, sympy.Max)):
-            return self._rank_axes(expr)
-        return None
+            if prefix == "inv_":
+                scale = self._inv_scale(raw_name)
+                raw = [scale // v for v in raw]
+            elif prefix == "log2_":
+                raw = [int(round(_CORE_LOG_SCALE * math.log2(v))) for v in raw]
+            values = np.asarray(raw, dtype=object)
+            if all(v == values[0] for v in values):
+                return None, values[0]
+            return wrapper, values
 
-    def _leaf_axes(self, symbol):
-        """A symbol's axes, its values recorded in ``_values_cache``: a column
-        of its buffer's menu, a division index, or a variable of the solve with
-        a small domain. A constant has none."""
-        name = symbol.name
-        mapped = self._sym_map.get(name)
-        if isinstance(mapped, (int, float)):
-            self._values_cache[symbol] = np.asarray(float(mapped))
-            return ()
-        wrapper, raw = self._buffer_map.get(name, (None, None))
-        if wrapper is None:
-            wrapper = self._sym_map.get(f"_division_of_{name}")
-            if wrapper is not None:
-                raw = range(len(wrapper.buffer.core_divisions))
-        if wrapper is not None:
-            self._values_cache[symbol] = np.asarray(raw, dtype=float)
-            return (self._add_axis(wrapper.division, 0, len(raw)),)
-        if not isinstance(mapped, cp_model.IntVar):
+        if expr.is_Piecewise and expr.args[-1][1] != sympy.true:
+            return None  # Preserve the ordinary printer's required default.
+        args = (
+            [part for pair in expr.args for part in pair]
+            if expr.is_Piecewise
+            else expr.args
+        )
+        evaluated = [self._candidate_values(arg) for arg in args]
+        if any(value is None for value in evaluated):
             return None
-        domain = list(mapped.proto.domain)
-        lo, hi = domain[0], domain[-1]
-        if len(domain) == 2:
-            if hi - lo + 1 > self._max_table_entries:
-                return None
-            self._values_cache[symbol] = np.arange(lo, hi + 1, dtype=float)
-            return (self._add_axis(mapped, lo, hi - lo + 1, mapped.is_boolean),)
-        # A domain with holes, such as a split's divisors, is indexed by a
-        # selector of its own: one per variable, so two such variables stay
-        # independent decisions.
-        values = [v for a, b in zip(domain[::2], domain[1::2]) for v in range(a, b + 1)]
-        if len(values) > self._max_table_entries:
+        owners = [value[0] for value in evaluated if value[0] is not None]
+        owner = owners[0] if owners else None
+        if any(other is not owner for other in owners):
             return None
-        if mapped.index not in self._domain_index:
-            index = self._model.new_int_var(0, len(values) - 1, f"{name}_index")
-            self._model.add_element(index, values, mapped)
-            self._domain_index[mapped.index] = index
-        self._values_cache[symbol] = np.asarray(values, dtype=float)
-        return (self._add_axis(self._domain_index[mapped.index], 0, len(values)),)
-
-    def _rank_axes(self, expr):
-        """A ``Min``/``Max`` whose operands are tables too wide to take jointly,
-        as one axis: the rank of its value among every value the operands take.
-        Ranks keep the values' order, so the extreme of the operands' ranks is
-        the rank of their extreme, and the table is the operands' values
-        together rather than their product."""
-        tables = [(self._axes(arg), self._values(arg)) for arg in expr.args]
-        found = np.concatenate([np.ravel(values) for _, values in tables])
-        if np.isnan(found).any():
-            return None
-        values = np.unique(found)
-        ranks = []
-        for axes, table in tables:
-            rank = np.searchsorted(values, table)
-            ranks.append(self._emit(axes, rank) if axes else int(rank))
-        var = self._model.new_int_var(0, len(values) - 1, f"rank_{self._count}")
-        self._count += 1
-        if isinstance(expr, sympy.Min):
-            self._model.add_min_equality(var, ranks)
+        values = [value[1] for value in evaluated]
+        if expr.is_Add:
+            result = sum(values)
+        elif expr.is_Mul:
+            result = math.prod(values)
+        elif expr.is_Pow:
+            result = values[0] ** values[1]
+        elif isinstance(expr, (sympy.Min, sympy.Max)):
+            operation = np.minimum if isinstance(expr, sympy.Min) else np.maximum
+            result = values[0]
+            for value in values[1:]:
+                result = operation(result, value)
+        elif expr.is_Relational:
+            result = _operator_map[expr.rel_op](*values)
+        elif expr.func in (sympy.And, sympy.Or):
+            operation = np.logical_and if expr.func is sympy.And else np.logical_or
+            result = values[0]
+            for value in values[1:]:
+                result = operation(result, value)
+        elif expr.is_Piecewise:
+            result = values[-2]
+            for value, cond in reversed(list(zip(values[:-2:2], values[1:-2:2]))):
+                result = np.where(cond, value, result)
+        elif expr.func is sympy.KroneckerDelta:
+            result = np.equal(*values)
         else:
-            self._model.add_max_equality(var, ranks)
-        self._values_cache[expr] = values
-        return (self._add_axis(var, 0, len(values)),)
-
-    def _values(self, expr):
-        """``expr`` at every point of its :meth:`_axes`, one array dimension
-        per axis."""
-        if expr not in self._values_cache:
-            if expr.is_Number:
-                return np.asarray(float(expr))
-            if expr in (sympy.true, sympy.false):
-                return np.asarray(bool(expr))
-            axes = self._axes(expr)  # a leaf or a rank records its own values
-            if expr not in self._values_cache:
-                operands = [self._broadcast(a, axes) for a in _table_operands(expr)]
-                with np.errstate(all="ignore"):
-                    values = _table_op(expr)(operands)
-                self._values_cache[expr] = np.broadcast_to(values, self._shape(axes))
-        return self._values_cache[expr]
-
-    def _broadcast(self, expr, axes):
-        """``expr``'s table shaped to broadcast over ``axes``, a superset of
-        its own."""
-        own = self._axes(expr)
-        shape = [self._axis[a][2] if a in own else 1 for a in axes]
-        return np.reshape(self._values(expr), shape)
-
-    def _joint(self, expr):
-        """``expr`` as one table over all of its axes, or None."""
-        axes = self._axes(expr)
-        return None if axes is None else self._emit(axes, self._values(expr))
-
-    def _emit(self, axes, values):
-        """A table as a CP-SAT expression: a constant, a linear expression
-        where the table is linear in its axes, else a lookup. None when an
-        entry is not finite -- a pole that a branch's guard excludes, which
-        then lowers branch by branch."""
-        values = np.asarray(values)
-        if values.dtype == bool:
-            return self._emit_condition(axes, values)
-        values = values.astype(float)
-        if not np.isfinite(values).all():
             return None
-        flat = values.ravel()
-        if not axes or (flat == flat[0]).all():
-            return _number(flat[0])
-        linear = self._linear(axes, values)
-        if linear is not None:
-            return linear
-        return self._lookup(axes, flat)
+        return owner, result
 
-    def _emit_condition(self, axes, values):
-        flat = values.ravel()
-        if not axes or (flat == flat[0]).all():
-            return bool(flat[0])
-        var, _, _, literal = self._axis[axes[0]]
-        if len(axes) == 1 and literal:
-            return var if flat[1] else var.Not()
-        return self._lookup(axes, flat.astype(int))
-
-    def _linear(self, axes, values):
-        """``values`` as ``offset + sum(slope * axis)`` where every step along
-        every axis is the same, else None."""
-        slopes = []
-        for dim, size in enumerate(values.shape):
-            steps = np.diff(values, axis=dim) if size > 1 else np.zeros(1)
-            if not (steps == steps.flat[0]).all():
-                return None
-            slopes.append(steps.flat[0])
-        terms = [(self._axis[a], s) for a, s in zip(axes, slopes) if s]
-        offset = values.flat[0] - sum(s * first for (_, first, *_), s in terms)
-        if len(terms) == 1 and terms[0][1] == 1 and offset == 0:
-            return terms[0][0][0]
-        return sum((_number(s) * var for (var, *_), s in terms), _number(offset))
-
-    def _index(self, axes):
-        """The flat, row-major position of a point of ``axes``, as a linear
-        expression ``element`` takes for its index."""
-        index, stride = 0, 1
-        for a in reversed(axes):
-            var, first, size, _ = self._axis[a]
-            index = index + stride * (var - first)
-            stride *= size
-        return index
-
-    def _lookup(self, axes, flat):
-        """One ``element`` lookup of a level variable, ``offset + coefficient *
-        level``. Levels are exact where the entries' common denominator leaves
-        them inside _MAX_PRODUCT_BOUND, else rounded against the entries' span:
-        the differences are what order the points, so a fraction of the span is
-        what the rounding may cost, not a fraction of the largest entry."""
-        rationals = [Fraction(float(v)) for v in flat]
+    def _division_table(self, expr):
+        evaluated = self._candidate_values(expr)
+        if evaluated is None:
+            return None
+        owner, values = evaluated
+        if owner is None:
+            return np.asarray(values).item()
+        raw = np.asarray(values, dtype=object).reshape(-1).tolist()
+        # An exact affine encoding of the binary floating values, without
+        # introducing another rounding scale. If its integer range is too
+        # large, lower the expression normally and try its smaller children.
+        if not all(math.isfinite(v) for v in raw):
+            return None
+        rationals = [Fraction(v) for v in raw]
         base = min(rationals)
         denominator = math.lcm(*(v.denominator for v in rationals))
         differences = [int((v - base) * denominator) for v in rationals]
         divisor = math.gcd(*differences)
+        if divisor == 0:
+            return raw[0]
         table = tuple(v // divisor for v in differences)
+        if max(table) > _MAX_PRODUCT_BOUND:
+            return None
         scale = Fraction(divisor, denominator)
-        rounded = max(table) > _MAX_PRODUCT_BOUND
-        if rounded:
-            step = (max(rationals) - base) / _MAX_PRODUCT_BOUND
-            table = tuple(round((v - base) / step) for v in rationals)
-            offset, coefficient = _number(base), float(step)
-        else:
-            offset, coefficient = _number(base), _number(scale)
-        key = axes, table
-        if key not in self._lookup_cache:
+        offset = int(base) if base.denominator == 1 else float(base)
+        coefficient = int(scale) if scale.denominator == 1 else float(scale)
+        if Fraction(offset) != base or Fraction(coefficient) != scale:
+            return None
+        key = owner.division.index, table
+        if key not in self._division_table_cache:
             var = self._model.new_int_var_from_domain(
-                cp_model.Domain.FromValues(table), f"table_{self._count}"
+                cp_model.Domain.FromValues(table), f"division_cost_{self._count}"
             )
             self._count += 1
-            self._model.add_element(self._index(axes), table, var)
-            self._lookup_cache[key] = var
-            self._table_vars.add(var.index)
-        var = self._lookup_cache[key]
-        if coefficient == 1 and offset == 0:
-            return var
-        return coefficient * var + offset
+            self._model.add_element(owner.division, table, var)
+            self._division_table_cache[key] = var
+        return coefficient * self._division_table_cache[key] + offset
+
+    def _menu_symbol(self, sym):
+        """``(wrapper, values)`` when ``sym`` is a function of one buffer's
+        division index: a split or tile count, the division itself, or a
+        derived symbol; else None."""
+        name = sym.name
+        if name in self._derived:
+            return self._derived[name]
+        entry = self._buffer_map.get(name)
+        if entry is not None and entry[0] is not None:
+            return entry
+        wrapper = self._sym_map.get(f"_division_of_{name}")
+        if wrapper is not None and hasattr(wrapper, "division"):
+            return wrapper, list(range(len(wrapper.buffer.core_divisions)))
+        return None
+
+    def _single_owner(self, expr):
+        owners = {}
+        for sym in expr.free_symbols:
+            entry = self._menu_symbol(sym)
+            if entry is None:
+                return None
+            owners[id(entry[0])] = entry[0]
+        return next(iter(owners.values())) if len(owners) == 1 else None
+
+    @staticmethod
+    def _nonlinear(expr):
+        for node in sympy.preorder_traversal(expr):
+            if isinstance(node, sympy.Pow) and node.exp != 1:
+                return True
+            if isinstance(node, _NONLINEAR_FUNCS):
+                return True
+            if isinstance(node, sympy.Mul) and sum(bool(a.free_symbols) for a in node.args) > 1:
+                return True
+        return False
+
+    def _menu_values(self, expr):
+        """``expr`` at every entry of its one buffer's menu, or None where an
+        entry is not finite (a pole its guard does not exclude)."""
+        syms = sorted(expr.free_symbols, key=lambda s: s.name)
+        cols = [self._menu_symbol(s)[1] for s in syms]
+        try:
+            f = sympy.lambdify(syms, expr, modules=["math"])
+            values = [float(f(*[c[i] for c in cols])) for i in range(len(cols[0]))]
+        except (ZeroDivisionError, OverflowError, ValueError, TypeError):
+            return None
+        return values if all(math.isfinite(v) for v in values) else None
+
+    @staticmethod
+    def _scale_exponent(values):
+        largest = max(abs(v) for v in values)
+        return _DERIVED_BITS - math.ceil(math.log2(largest)) if largest else 0
+
+    def _derived_symbol(self, wrapper, values, exponent):
+        """``values`` over ``wrapper``'s menu as ``fn * 2**-exponent``: ``fn`` is
+        an integer variable bound to the division by one element, holding each
+        value rounded to ``2**-exponent``. The rewrite stays linear in ``fn``,
+        as it is in ``inv_`` and ``log2_``."""
+        levels = [round(math.ldexp(v, exponent)) for v in values]
+        if all(level == levels[0] for level in levels):
+            return sympy.Integer(levels[0]) * sympy.Integer(2) ** -exponent
+        name = f"fn_{self._count}"
+        self._count += 1
+        var = self._model.new_int_var_from_domain(
+            cp_model.Domain.FromValues(levels), name
+        )
+        self._model.add_element(wrapper.division, levels, var)
+        self._sym_map[name] = var
+        self._buffer_map[name] = (wrapper, levels)
+        self._derived[name] = (wrapper, levels)
+        return sympy.Symbol(name, integer=True) * sympy.Integer(2) ** -exponent
+
+    def _fold(self, expr):
+        """Replace each nonlinear sub-expression that reads one buffer's
+        decisions with a derived symbol, and rewrite the powers that span
+        buffers or a residency literal until they do."""
+        if expr not in self._fold_cache:
+            self._fold_cache[expr] = self._fold_uncached(expr)
+        return self._fold_cache[expr]
+
+    def _fold_uncached(self, expr):
+        if expr.is_Atom or type(expr).__name__ == "RelayoutCharge":
+            return expr
+        if isinstance(expr, sympy.Expr) and not isinstance(expr, sympy.Symbol):
+            wrapper = self._single_owner(expr)
+            if wrapper is not None and self._nonlinear(expr):
+                values = self._menu_values(expr)
+                if values is not None:
+                    return self._derived_symbol(
+                        wrapper, values, self._scale_exponent(values)
+                    )
+        pushed = self._pushed_power(expr)
+        if pushed is not None:
+            return self._fold(pushed)
+        args = [self._fold(arg) for arg in expr.args]
+        if any(new is not old for new, old in zip(args, expr.args)):
+            try:
+                expr = expr.func(*args, evaluate=False)
+            except TypeError:
+                expr = expr.func(*args)
+        if isinstance(expr, sympy.Expr) and not expr.free_symbols:
+            return sympy.Float(expr.evalf()) if not expr.is_Integer else expr
+        return self._cross(expr)
+
+    @staticmethod
+    def _pushed_power(expr):
+        """``(c * Min(a, b))**y`` as ``c**y * Min(a**y, b**y)`` (``Max`` for a
+        negative ``y``): a power is monotone over the positive values a cost
+        takes, so each operand's power reads only what that operand reads."""
+        if not (
+            isinstance(expr, sympy.Pow)
+            and expr.exp.is_Number
+            and not (expr.exp.is_Integer and expr.exp > 0)
+        ):
+            return None
+        coefficient, rest = expr.base.as_coeff_Mul()
+        if coefficient <= 0 or not isinstance(rest, (sympy.Min, sympy.Max)):
+            return None
+        func = type(rest) if expr.exp > 0 else _DUAL[type(rest)]
+        return sympy.Float(coefficient**expr.exp) * func(
+            *(arg**expr.exp for arg in rest.args), evaluate=False
+        )
+
+    def _cross(self, expr):
+        if (
+            isinstance(expr, sympy.Pow)
+            and expr.exp.is_Number
+            and not (expr.exp.is_Integer and expr.exp > 0)
+        ):
+            base, exp = expr.base, expr.exp
+            if isinstance(base, sympy.Mul) and base.args[0].is_Number and base.args[0] > 0:
+                # (c * x)**y = c**y * x**y for the positive c a scale pulls out.
+                coefficient, rest = base.as_coeff_Mul()
+                return sympy.Float(coefficient**exp) * self._fold(
+                    sympy.Pow(rest, exp, evaluate=False)
+                )
+            if isinstance(base, (sympy.Min, sympy.Max)):
+                # A power is monotone over the positive values a cost takes.
+                func = type(base) if exp > 0 else _DUAL[type(base)]
+                return self._fold(
+                    func(*(arg**exp for arg in base.args), evaluate=False)
+                )
+            literals = [s for s in base.free_symbols if s.name.startswith("is_lx_")]
+            if len(literals) == 1:
+                (lit,) = literals
+                off = self._fold(base.subs(lit, 0) ** exp)
+                on = self._fold(base.subs(lit, 1) ** exp)
+                return off + (on - off) * lit
+        if isinstance(expr, (sympy.Min, sympy.Max)):
+            return self._aligned_minmax(expr)
+        return expr
+
+    def _aligned_minmax(self, expr):
+        """A Min/Max of constants and one-buffer operands with every operand on
+        one integer scale, so ``_integerize_minmax`` keeps their precision."""
+        columns = []
+        for arg in expr.args:
+            if arg.is_Number:
+                columns.append((None, [float(arg)]))
+                continue
+            wrapper = self._single_owner(arg)
+            values = self._menu_values(arg) if wrapper is not None else None
+            if values is None:
+                return self._integer_minmax(expr)
+            columns.append((wrapper, values))
+        exponent = min(self._scale_exponent(values) for _, values in columns)
+        operands = [
+            sympy.Integer(round(math.ldexp(values[0], exponent)))
+            if wrapper is None
+            else self._derived_symbol(wrapper, values, exponent)
+            * sympy.Integer(2) ** exponent
+            for wrapper, values in columns
+        ]
+        return self._opaque_minmax(type(expr), operands) * sympy.Integer(2) ** -exponent
+
+    def _opaque_minmax(self, func, operands):
+        """Lower a Min/Max of integer operands here and hand the rewrite one
+        symbol for it: ``_rewrite`` would otherwise push every coefficient of
+        whatever multiplies it into its operands and round each at 10000x."""
+        printed = [self._print(self._rewrite(op)) for op in operands]
+        if all(isinstance(p, (int, float)) for p in printed):
+            return sympy.Integer(int((max if func is sympy.Max else min)(printed)))
+        printed = [self._lin_max_operand(p) for p in printed]
+        pick = max if func is sympy.Max else min
+        bounds = [self._affine_bounds(p) for p in printed]
+        low, high = pick(b[0] for b in bounds), pick(b[1] for b in bounds)
+        name = f"mm_{self._count}"
+        self._count += 1
+        var = self._model.new_int_var(low, high, name)
+        if func is sympy.Max:
+            self._model.add_max_equality(var, printed)
+        else:
+            self._model.add_min_equality(var, printed)
+        self._sym_map[name] = var
+        return sympy.Symbol(name, integer=True)
+
+    def _upper_bound(self, monomial):
+        bound = 1
+        for factor in sympy.Mul.make_args(monomial):
+            base, power = factor.as_base_exp()
+            entry = self._menu_symbol(base) if base.is_Symbol else None
+            top = max(abs(v) for v in entry[1]) if entry is not None else 1
+            bound *= top ** int(power) if power.is_Integer else top
+        return bound
+
+    def _integer_minmax(self, expr):
+        """A Min/Max whose operands mix buffers and literals, scaled by one
+        power of two until every coefficient is an integer that keeps
+        2**-_MINMAX_COEFFICIENT_BITS of the smallest one, so the 10000-scale
+        truncation in ``_integerize_minmax`` leaves it whole."""
+        operands = [sympy.expand(arg) for arg in expr.args]
+        terms = [sympy.Add.make_args(op) for op in operands]
+        coefficients = [
+            abs(float(t.as_coeff_Mul()[0])) for ts in terms for t in ts if t != 0
+        ]
+        coefficients = [c for c in coefficients if c]
+        if not coefficients:
+            return expr
+        bits = _MINMAX_COEFFICIENT_BITS - math.floor(math.log2(min(coefficients)))
+        largest = max(
+            abs(float(c)) * self._upper_bound(m)
+            for ts in terms
+            for c, m in (t.as_coeff_Mul() for t in ts)
+        )
+        bits = min(bits, _MINMAX_VALUE_BITS - math.ceil(math.log2(largest or 1)))
+        scale = sympy.Integer(2) ** bits
+        scaled = [
+            sympy.Add(*(sympy.Integer(round(float(c * scale))) * m for c, m in
+                        (t.as_coeff_Mul() for t in ts)))
+            for ts in terms
+        ]
+        return self._opaque_minmax(type(expr), scaled) / scale
+
+    def convert(self, cost_expr: sympy.Expr) -> "cp_model.LinearExpr":
+        """Return the CP-SAT expression equivalent to ``cost_expr`` under
+        ``sym_map`` (``sympy symbol -> CP-SAT var``)."""
+        logger.debug("[CP-SAT layout solver] cost expr (raw): %s", cost_expr)
+        cost_expr = self._fold(cost_expr)
+        cost_expr = self._rewrite(cost_expr)
+        logger.debug("[CP-SAT layout solver] cost expr (linearized): %s", cost_expr)
+        return self._print(cost_expr)
+
+    def _rewrite(self, cost_expr: sympy.Expr) -> sympy.Expr:
+        """The symbolic rewrites that bring ``cost_expr`` into the form the
+        printer lowers: floors dropped, logs of Min/Max pushed inside, split
+        logs and inverses replaced by table symbols, scalars pushed into
+        Min/Max/Piecewise, floats truncated. Min/Max are rebuilt lazily first
+        (see :class:`_LazyMin`)."""
+        cost_expr = _lazy_minmax(cost_expr)
+        cost_expr = cost_expr.replace(
+            lambda e: e.func == sympy.floor,
+            lambda e: e.args[0],
+        )
+        cost_expr = sympy.expand(cost_expr)
+        cost_expr = cost_expr.replace(
+            lambda e: e.func in [sympy.log, sympy.Piecewise],
+            lambda e: self._piecewise_canonical(self._log_min(e)),
+        )
+        cost_expr = sympy.expand(cost_expr)
+        cost_expr = cost_expr.replace(
+            lambda e: e.func in [sympy.log, sympy.Pow, sympy.Mul],
+            self._inv_log_sym,
+        )
+        cost_expr = cost_expr.replace(
+            lambda e: e.func == sympy.Mul,
+            lambda e: self._min_piecewise_expand(e),
+        )
+        cost_expr = self._integerize_minmax(cost_expr)
+        return cost_expr
+
+    @classmethod
+    def _log_min(cls, expr):
+        # rewrite log(min(a, b)) as min(log(a), log(b))
+        if expr.func is not sympy.log:
+            return expr
+        arg = expr.args[0]
+        if isinstance(arg, (sympy.Min, sympy.Max)):
+            # n() here is to get a numeric value instead of log(2)
+            return arg.func(*[sympy.log(a.n()) for a in arg.args])
+        if (
+            isinstance(arg, sympy.Mul)
+            and len(arg.args) == 2
+            and isinstance(arg.args[0], sympy.Number)
+            and isinstance(arg.args[1], (sympy.Min, sympy.Max))
+        ):
+            return arg.func(
+                *[sympy.log((a * arg.args[0]).n()) for a in arg.args[1].args]
+            )
+        else:
+            return expr
+
+    @staticmethod
+    def _is_split_sym(expr):
+        # A tile count is, like a core split, a positive integer tabulated over
+        # its buffer's candidate divisions, so its log and inverse lower the
+        # same way.
+        return expr.is_Symbol and expr.name.startswith(("split_", "tile_"))
+
+    def _inv_scale(self, name: str) -> int:
+        """Fixed-point scale of ``inv_<name>``: the LCM of ``name``'s values
+        across the candidate divisions, so every ``scale // v`` is exact and the
+        variable spans only the bits it needs. ``_CORE_INV_SCALE`` when there
+        are no values, or a value with many divisors if the LCM exceeds the cap.
+
+        The cap is ``_CORE_INV_SCALE`` for values up to the core count and
+        doubles with each doubling past it, so a tile count, which can far
+        exceed any core split, keeps the resolution a split has rather than
+        flattening to ``scale // v == 0``."""
+        _, raw = self._buffer_map.get(name, (None, ()))
+        if not raw or min(raw) < 1:
+            return _CORE_INV_SCALE
+
+        ints = [int(r) for r in raw]
+        widen = max(
+            0, (max(ints) - 1).bit_length() - _CORE_INV_SCALE_MAX_VALUE.bit_length() + 1
+        )
+        cap = _CORE_INV_SCALE << widen
+        lcm = math.lcm(*ints)
+        if lcm <= cap:
+            return lcm
+
+        # Otherwise: find the highest power of 2 in ints; among its multiples,
+        # find which has the most entries of ints as divisors, and use that.
+        # (We weight entries of ints by multiplicity.)
+        cnt = Counter(ints)
+        pow2 = max((a for a in cnt if a & (a - 1) == 0), default=1)
+        # The cap is sized past every value, so this holds by construction.
+        assert pow2 < cap, f"expected cap={cap} past every value, found {pow2}"
+        scaled_core_inv_scale = cap // pow2
+        counts = np.zeros(scaled_core_inv_scale + 1, dtype=np.int64)
+        for a, mult in cnt.items():
+            step = a // math.gcd(a, pow2)
+            if step <= scaled_core_inv_scale:
+                counts[step::step] += mult
+
+        # Among those, the one whose worst-rounded entry rounds best: the error
+        # of an inexact v is (scale % v) / scale, so width is what buys
+        # accuracy. A worst case does not accumulate, so unlike the count above
+        # this weighs each value once. Ties -- frequent, since a scale and its
+        # multiples often round alike -- go to the narrowest, keeping the
+        # products in _print_multiply clear of _MAX_PRODUCT_BOUND.
+        candidates = pow2 * (np.flatnonzero(counts[1:] == counts[1:].max()) + 1)
+        values = sorted(cnt)
+        return min(
+            (int(c) for c in candidates),
+            key=lambda s: (Fraction(max(s % v for v in values), s), s),
+        )
+
+    def _inv_log_sym(self, expr):
+        # replaces log(sym) with log2_sym and 1/sym with inv_sym
+        arg = expr.args[0]
+        if expr.func == sympy.log:
+            if self._is_split_sym(arg):
+                return (
+                    sympy.Symbol(f"log2_{arg.name}", integer=True, nonnegative=True)
+                    * sympy.log(2.0)
+                    / _CORE_LOG_SCALE
+                )
+            elif arg.is_Number:
+                return math.log(float(arg))
+        elif expr.func == sympy.Pow:
+            if not self._is_split_sym(arg):
+                return expr
+            # Core splits only: a tile count can exceed 32.
+            if (
+                expr.exp.is_Number
+                and math.isclose(expr.exp, 0.25)
+                and arg.name.startswith("split_")
+            ):
+                # Discrete piecewise linear approximation of x^(1/4) over the interval [1, 32],
+                # pinned to return 1 at x=1, generated using tools/approximate-power.py.
+                # since we check that the base is a _split_ symbol, it is an integer in the
+                # range [1, 32]
+                # Max 4.5% deviation for two segments;
+                # we would get:
+                #   max 1.6% deviation with 3 segments;
+                #   max 0.074% deviation with 8 segments;
+                #   max 0.019% deviation with 12 segments;
+                #   no deviation with 16 segments.
+                # script at https://github.com/user-attachments/files/31975789/approximate-power.py
+                return sympy.Piecewise(
+                    (0.139980295504224 * arg + 0.860019704495776, arg <= 5),
+                    (0.0287191888771944 * arg + 1.45940018593522, True),
+                )
+            if expr.exp == -1:
+                return sympy.Symbol(
+                    f"inv_{arg.name}", integer=True, nonnegative=True
+                ) / self._inv_scale(arg.name)
+        elif expr.func == sympy.Mul:
+            symbols = [
+                arg
+                for arg in expr.args
+                if arg.is_Symbol and arg.name.startswith("inv_")
+            ]
+            if len(symbols) <= 2:
+                return expr
+            product = "_product_" + "_".join(
+                sorted([symbol.name[4:] for symbol in symbols])
+            )
+            if product in self._sym_map:
+                # The coefficient already divides by each factor's own scale;
+                # swap those for the product's scale to keep the magnitude.
+                result = sympy.Symbol(f"inv_{product}", integer=True, nonnegative=True)
+                result *= sympy.Rational(
+                    math.prod(self._inv_scale(s.name[4:]) for s in symbols),
+                    self._inv_scale(product),
+                )
+                result *= math.prod([arg for arg in expr.args if arg not in symbols])
+                return result
+        return expr
+
+    @classmethod
+    def _piecewise_canonical(cls, expr):
+        # re-write 1/x < 1/5 as x > 5, then tighten to an equivalent integer
+        # bound (e.g. x < 4/3 as x <= 1) when x is integer-valued and the
+        # bound is numeric.
+        if not expr.is_Piecewise:
+            return expr
+        args = []
+        for value, cond in expr.args:
+            if (
+                cond.is_Relational
+                and cond.lhs.is_Pow
+                and cond.lhs.exp == -1
+                and cond.lhs.base.is_Symbol
+                and cond.lhs.base.is_nonnegative
+            ):
+                args.append(
+                    (
+                        value,
+                        cls._tighten_integer_bound(
+                            _inv_rel_op[cond.func], 1 / cond.lhs, 1 / cond.rhs
+                        ),
+                    )
+                )
+            else:
+                args.append((value, cond))
+        return expr.func(*args)
+
+    @staticmethod
+    def _tighten_integer_bound(rel_op, lhs, rhs):
+        if not (lhs.is_Symbol and lhs.is_integer and rhs.is_Number):
+            return rel_op(lhs, rhs)
+        if rel_op is sympy.Lt:
+            return sympy.Le(lhs, sympy.ceiling(rhs) - 1)
+        if rel_op is sympy.Gt:
+            return sympy.Ge(lhs, sympy.floor(rhs) + 1)
+        if rel_op is sympy.Le:
+            return sympy.Le(lhs, sympy.floor(rhs))
+        if rel_op is sympy.Ge:
+            return sympy.Ge(lhs, sympy.ceiling(rhs))
+        return rel_op(lhs, rhs)
+
+    @staticmethod
+    def _min_piecewise_expand(expr):
+        # re-writes 2.1*Min(x, y) as Min(2.1*x, 2.1*y)
+        # len(expr.args) may exceed 2 when extra scalar factors ride alongside
+        # the leading number and the (single) Min/Max/Piecewise factor this
+        # rewrites, e.g. 2.1*a*Min(x, y); only the first such factor is expanded
+        # per call, with the rest folded back in as a plain multiplier.
+        if len(expr.args) < 2 or not isinstance(expr.args[0], sympy.Number):
+            return expr
+        if any(
+            isinstance(arg, (sympy.Min, sympy.Max, sympy.Piecewise))
+            for arg in expr.args[1:]
+        ):
+            idx, arg = next(
+                (
+                    (idx, a)
+                    for idx, a in enumerate(expr.args)
+                    if isinstance(a, (sympy.Min, sympy.Max, sympy.Piecewise))
+                )
+            )
+            m = expr.args[0]
+
+            def apply(arg):
+                if isinstance(arg, (tuple, sympy.Tuple)):
+                    return (apply(arg[0]), *arg[1:])
+                else:
+                    new_arg = arg * abs(m)
+                    return new_arg.replace(
+                        lambda e: e.func == sympy.Mul,
+                        lambda e: _SympyExprToCpSat._min_piecewise_expand(e),
+                    )
+
+            new_args = [apply(a) for a in arg.args]
+            return (
+                arg.func(*new_args)
+                * sympy.sign(m)
+                * sympy.Mul(*(expr.args[1:idx] + expr.args[idx + 1 :]))
+            )
+        return expr
+
+    @classmethod
+    def _integerize_minmax(cls, expr):
+        # Only Min/Max constraints require integer operands. A conditional
+        # objective supports float values directly; rounding its coefficients
+        # can erase a large cost multiplied by scaled reciprocal variables.
+        # Keep upstream's lazy Min/Max classes when rebuilding their subtrees.
+        if isinstance(expr, (sympy.Min, sympy.Max)):
+            return expr.replace(
+                lambda e: isinstance(e, (sympy.Min, sympy.Max, sympy.Piecewise)),
+                cls._truncate_floats_min,
+            )
+        if not expr.has(sympy.Min, sympy.Max):
+            return expr
+        return expr.func(*(cls._integerize_minmax(arg) for arg in expr.args))
+
+    @staticmethod
+    def _truncate_floats_min(expr):
+        # re-writes Min(x*0.5, y*0.5) as Min(x, y)/2
+        m = 10000
+        func = expr.func
+
+        def _process_inner(expr):
+            if isinstance(expr, sympy.Mul) and isinstance(expr.args[0], sympy.Number):
+                a = (expr.args[0] * m).round()
+                r = sympy.Mul(a, *expr.args[1:])
+            elif isinstance(expr, sympy.Number):
+                r = (expr * m).round()
+            else:
+                r = expr * m
+            return r
+
+        def _process_outer(expr):
+            if isinstance(expr, sympy.Add):
+                return sympy.Add(*[_process_inner(a) for a in expr.args])
+            elif isinstance(expr, sympy.Tuple):
+                return (_process_outer(expr[0]), *expr[1:])
+            else:
+                return _process_inner(expr)
+
+        result = list(map(_process_outer, expr.args))
+
+        return func(*result) / m
 
     def _print_Integer(self, expr):
         return int(expr.p)
@@ -524,55 +908,35 @@ class _SympyExprToCpSat(Printer):
     def _print_Add(self, expr):
         return sum(self._print(arg) for arg in expr.args)
 
-    def _grouped_factors(self, expr):
-        """``expr``'s factors, printed, with the tables that fit together in
-        ``max_table_entries`` taken as one table of their product: a bundle term's
-        derates and a buffer's splits beside them are numbers at each point,
-        which one table holds exactly where multiplying their variables would
-        need an ``int_prod``. A factor over a residency literal stays out, so
-        its product stays a gate."""
-        groups, rest = [], []
-        for arg in expr.args:
-            axes = self._axes(arg)
-            if not axes or any(self._axis[a][3] for a in axes):
-                rest.append(arg)
-                continue
-            for group in groups:
-                union = tuple(sorted({*group[0], *axes}))
-                if len(union) == 1 or self._size(union) <= self._max_table_entries:
-                    group[0] = union
-                    group[1].append(arg)
-                    break
-            else:
-                groups.append([axes, [arg]])
-        printed = [self._print(arg) for arg in rest]
-        for axes, args in groups:
-            table = None
-            if len(args) > 1:
-                values = [self._broadcast(arg, axes) for arg in args]
-                table = self._emit(
-                    axes, np.broadcast_to(math.prod(values), self._shape(axes))
-                )
-            if table is None:
-                printed.extend(self._print(arg) for arg in args)
-            else:
-                printed.append(table)
-        return printed
-
     def _print_Mul(self, expr):
-        return self._print_multiply(self._grouped_factors(expr))
+        args = [self._print(arg) for arg in expr.args]
+        try:
+            return self._print_multiply(args)
+        except ValueError:
+            if not self._allow_tables:
+                raise
+            # A table can combine an affine sum into one wider integer, whose
+            # product exceeds the bound even though each original term fits.
+            # Keep the original factorization locally. Unused table helpers
+            # are removed by presolve; other expressions can still tabulate.
+            # Reuse this converter's variable namespace and guard caches.
+            self._allow_tables = False
+            self._expr_cache, self._untabled_expr_cache = (
+                self._untabled_expr_cache,
+                self._expr_cache,
+            )
+            try:
+                return self._print(expr)
+            finally:
+                self._expr_cache, self._untabled_expr_cache = (
+                    self._untabled_expr_cache,
+                    self._expr_cache,
+                )
+                self._allow_tables = True
 
     def _print_multiply_two(self, a, b):
         if isinstance(a, (int, float)) or isinstance(b, (int, float)):
             return a * b
-        for x, y in ((a, b), (b, a)):
-            split = self._boolean_affine(x)
-            if split is not None and self._boolean_affine(y) is None:
-                return self._literal_times(split, y)
-        if self._is_table_factor(a):
-            return self._times_table(b, a)
-        if self._is_table_factor(b):
-            return self._times_table(a, b)
         if isinstance(a, cp_model_helper.NotBooleanVariable):
             return b - self._print_multiply_two(a.Not(), b)
         if isinstance(b, cp_model_helper.NotBooleanVariable):
@@ -585,74 +949,37 @@ class _SympyExprToCpSat(Printer):
             )
         if isinstance(b, (cp_model_helper.IntAffine, cp_model_helper.FloatAffine)):
             return self._print_multiply_two(b, a)
-        # A sum: each of its variables times the other factor. Products of sums
-        # reach here as written, since the cost expression is not expanded.
-        if not isinstance(a, cp_model.LinearExpr) or not isinstance(
-            b, cp_model.LinearExpr
-        ):
-            raise NotImplementedError(f"multiplying {type(a)} by {type(b)}")
-        if isinstance(a, cp_model.IntVar):
-            a, b = b, a
-        try:
-            flat = cp_model.FlatIntExpr(a)
-        except TypeError:
-            flat = cp_model.FlatFloatExpr(a)
-        result = flat.offset * b
-        for var, c in zip(flat.vars, flat.coeffs):
-            result = result + c * self._print_multiply_two(var, b)
-        return result
-
-    def _prod(self, factors):
-        """Product of constants and linear expressions; two rounded tables can
-        meet here, each an affine of its level, which ``math.prod`` refuses."""
-        constants = [f for f in factors if isinstance(f, (int, float))]
-        result = math.prod(constants)
-        for factor in factors:
-            if not isinstance(factor, (int, float)):
-                result = self._print_multiply_two(result, factor)
-        return result
-
-    def _is_table_factor(self, arg):
-        """Whether ``arg`` is linear in table levels only (see :meth:`_lookup`),
-        whose product with a wide factor is narrowed past the bound rather than
-        refused: a level may span up to _MAX_PRODUCT_BOUND by design, and below
-        the bound the product is exact."""
-        if isinstance(arg, (int, float)):
-            return False
-        try:
-            flat = cp_model.FlatFloatExpr(arg)
-        except TypeError:
-            return False
-        return bool(flat.vars) and all(v.index in self._table_vars for v in flat.vars)
+        if hasattr(a, "num_exprs"):
+            try:
+                flat = cp_model.FlatIntExpr(a)
+            except TypeError:
+                flat = cp_model.FlatFloatExpr(a)
+            result = flat.offset * b
+            for var, c in zip(flat.vars, flat.coeffs):
+                result = result + c * self._print_multiply_two(var, b)
+            return result
+        if hasattr(b, "num_exprs"):
+            return self._print_multiply_two(b, a)
+        raise NotImplementedError(f"multiplying {type(a)} by {type(b)}")
 
     def _print_multiply(self, args):
-        tables = [arg for arg in args if self._is_table_factor(arg)]
-        if tables:
-            # Last: a bundle's memory term carries its underfill and spill
-            # derates, which meet the value only once it is a sum of products.
-            rest = [arg for arg in args if not self._is_table_factor(arg)]
-            result = self._print_multiply(rest) if rest else 1
-            for table in tables:
-                result = self._times_table(result, table)
-            return result
-
         ints = [arg for arg in args if isinstance(arg, cp_model.IntVar)]
         nonints = [arg for arg in args if not isinstance(arg, cp_model.IntVar)]
         if len(ints) == 1:
-            return self._print_multiply_two(self._prod(nonints), ints[0])
+            return self._print_multiply_two(math.prod(nonints), ints[0])
         elif len(ints) == 0:
-            return self._prod(nonints)
+            return math.prod(nonints)
 
         # Names need not be unique: in particular, both Boolean constants
         # have an empty name. Cache by the variables' actual model identity.
         name = "_product_" + "_".join(str(arg.index) for arg in ints)
         if name in self._sym_map:
-            return self._print_multiply_two(self._prod(nonints), self._sym_map[name])
+            return self._print_multiply_two(math.prod(nonints), self._sym_map[name])
 
         if any(arg.is_boolean for arg in ints):
             product = self._print_gated_product(ints, name)
             self._sym_map[name] = product
-            return self._print_multiply_two(self._prod(nonints), product)
+            return self._print_multiply_two(math.prod(nonints), product)
 
         # The product is multilinear (degree 1 in each factor), so its
         # extrema over the box of bounds occur at the box's vertices. Rather
@@ -679,146 +1006,7 @@ class _SympyExprToCpSat(Printer):
         product = self._model.new_int_var(int(lb), int(ub), name)
         self._model.add_multiplication_equality(product, ints)
         self._sym_map[name] = product
-        return self._print_multiply_two(self._prod(nonints), product)
-
-    def _narrowed_pair(self, a, b):
-        """``(factors, bounds, divisor)``: ``a`` and ``b`` each floored so that
-        their product keeps _MAX_PRODUCT_BOUND and ``divisor`` scales it back.
-
-        A bit comes off whichever factor is wider at the time, so a narrow factor
-        -- a derate, or a table's levels -- keeps all of its precision and the
-        wide value it multiplies gives up only range it was not using. An even
-        _PRODUCT_FACTOR_BITS each is what two equally wide factors settle on.
-        """
-        bounds = [self._affine_bounds(x) for x in (a, b)]
-        widths = [max(abs(lb), abs(ub)).bit_length() for lb, ub in bounds]
-        shifts = [0, 0]
-        while sum(widths) > 2 * _PRODUCT_FACTOR_BITS:
-            wider = 0 if widths[0] >= widths[1] else 1
-            widths[wider] -= 1
-            shifts[wider] += 1
-        factors, narrowed = [], []
-        for value, (lb, ub), shift in zip((a, b), bounds, shifts):
-            divisor = 1 << shift
-            if divisor > 1:
-                lb, ub = lb // divisor, ub // divisor
-                value = self._floored(value, divisor, lb, ub)
-            factors.append(value)
-            narrowed.append((lb, ub))
-        return factors, narrowed, 1 << sum(shifts)
-
-    def _times_table(self, value, table):
-        """``value * table`` for a ``table`` linear in levels, each pair of their
-        variables taking its own :meth:`_print_table_product`."""
-        if isinstance(value, (int, float)):
-            return value * table
-        split = self._boolean_affine(value)
-        if split is not None:
-            return self._literal_times(split, table)
-        flat = cp_model.FlatFloatExpr(value)
-        levels = cp_model.FlatFloatExpr(table)
-        result = levels.offset * value
-        for level, weight in zip(levels.vars, levels.coeffs):
-            result = result + weight * flat.offset * level
-            for var, c in zip(flat.vars, flat.coeffs):
-                result = result + weight * c * self._print_table_product(level, var)
-        return result
-
-    def _print_table_product(self, level, value):
-        """``level * value``, past the bound a product of two wide factors is
-        refused at: each factor keeps _PRODUCT_FACTOR_BITS, far finer than the
-        objective resolves, so their product stays inside int32. Cached by the
-        pair, as _print_multiply caches its products: a bundle's derate meets
-        the same operand's bytes in more than one term."""
-        key = f"_table_{level.index}_{value.index}"
-        if key in self._sym_map:
-            return self._sym_map[key]
-        if value.is_boolean:
-            result = self._print_gated_product([level, value], key)
-        else:
-            # ``a * b`` as ``lo_a * b + lo_b * (a - lo_a) + (a - lo_a) * (b -
-            # lo_b)``: the two linear parts are exact, so only the factors'
-            # spans meet in the product that has to be narrowed. A derate spans
-            # a fraction of its value, and so loses a fraction of what flooring
-            # it whole would cost.
-            lo_level = max(0, self._affine_bounds(level)[0])
-            lo_value = max(0, self._affine_bounds(value)[0])
-            spans = (level - lo_level, value - lo_value)
-            factors, ((low, high), (lb, ub)), divisor = self._narrowed_pair(*spans)
-            corners = (low * lb, low * ub, high * lb, high * ub)
-            product = self._model.new_int_var(min(corners), max(corners), key)
-            self._model.add_multiplication_equality(product, factors)
-            result = lo_level * value + lo_value * spans[0] + divisor * product
-        self._sym_map[key] = result
-        return result
-
-    def _floored(self, value, divisor, lb, ub):
-        """``value // divisor`` by linear bounds, not an ``int_div``: that is the
-        chained shape that overflows presolve."""
-        var = self._model.new_int_var(lb, ub, f"floored_{self._count}")
-        self._count += 1
-        self._model.add(value - divisor * var >= 0)
-        self._model.add(value - divisor * var < divisor)
-        return var
-
-    @staticmethod
-    def _boolean_affine(x):
-        """``(literal, alpha, beta)`` when ``x`` is ``alpha + beta * literal`` for
-        one Boolean variable (a negated literal counts), else None."""
-        if isinstance(x, cp_model_helper.NotBooleanVariable):
-            return x.Not(), 1, -1
-        if isinstance(x, (int, float)) or not isinstance(x, cp_model.LinearExpr):
-            return None
-        try:
-            flat = cp_model.FlatFloatExpr(x)
-        except TypeError:
-            return None
-        if len(flat.vars) != 1 or not flat.vars[0].is_boolean:
-            return None
-        return flat.vars[0], flat.offset, flat.coeffs[0]
-
-    def _literal_times(self, split, value):
-        """``(alpha + beta * b) * value`` as ``alpha * [not b] value + (alpha +
-        beta) * [b] value``, each part a gate on its own literal. Expanding it
-        as ``alpha * value + beta * (b * value)`` instead leaves the linear
-        relaxation free to cancel ``value`` against its gated copy: at a
-        fractional ``b`` the copy can sit at the top of its range while
-        ``value`` sits at the bottom, so ``(1 - b) * value`` relaxes far below
-        zero although it is never negative. A gate per literal keeps each part
-        inside ``[min(0, lb), max(0, ub)]`` of ``value``."""
-        literal, alpha, beta = split
-        result = 0
-        for lit, weight in ((literal.Not(), alpha), (literal, alpha + beta)):
-            if weight:
-                result = result + weight * self._gate(lit, value)
-        return result
-
-    def _gate(self, lit, value):
-        """``value`` while ``lit`` holds, else 0: per variable of ``value`` one
-        gated variable, so a table's level is gated exactly and its scale stays
-        a coefficient."""
-        if isinstance(value, (int, float)):
-            return value * (lit if isinstance(lit, cp_model.IntVar) else 1 - lit.Not())
-        flat = cp_model.FlatFloatExpr(value)
-        if flat.offset:
-            base = lit if isinstance(lit, cp_model.IntVar) else 1 - lit.Not()
-            result = flat.offset * base
-        else:
-            result = 0
-        negated = not isinstance(lit, cp_model.IntVar)
-        positive = lit.Not() if negated else lit
-        for var, c in zip(flat.vars, flat.coeffs):
-            key = f"_gate_{'n' if negated else 'p'}{positive.index}_{var.index}"
-            if key not in self._sym_map:
-                lb, ub = self._affine_bounds(var)
-                gated = self._model.new_int_var(min(0, int(lb)), max(0, int(ub)), key)
-                self._model.add(gated == var).only_enforce_if(lit)
-                self._model.add(gated == 0).only_enforce_if(lit.Not())
-                self._sym_map[key] = gated
-                if var.index in self._table_vars:
-                    self._table_vars.add(gated.index)
-            result = result + c * self._sym_map[key]
-        return result
+        return self._print_multiply_two(math.prod(nonints), product)
 
     def _print_gated_product(self, ints, name):
         """A product with boolean factors as the product of the others, gated
@@ -851,7 +1039,23 @@ class _SympyExprToCpSat(Printer):
     def _print_Symbol(self, expr):
         if expr.name in self._sym_map:
             return self._sym_map[expr.name]
-        raise NotImplementedError(f"not implemented. expr: {expr}")
+        if not expr.name.startswith(("log2_", "inv_")):
+            raise NotImplementedError(f"not implemented. expr: {expr}")
+        name = expr.name[5:] if expr.name.startswith("log2_") else expr.name[4:]
+        b, raw = self._buffer_map[name]
+
+        if expr.name.startswith("log2_"):
+            values = [int(round(_CORE_LOG_SCALE * math.log2(v))) for v in raw]
+            domain = cp_model.Domain.FromValues(values)
+            cp_var = self._model.new_int_var_from_domain(domain, expr.name)
+            self._model.add_element(b.division, values, cp_var)
+        else:
+            scale = self._inv_scale(name)
+            values = [scale // v for v in raw]
+            cp_var = self._model.new_int_var(min(values), max(values), expr.name)
+            self._model.add_division_equality(cp_var, scale, self._sym_map[name])
+        self._sym_map[expr.name] = cp_var
+        return cp_var
 
     def _print_KroneckerDelta(self, expr):
         """``KroneckerDelta(division_X, k)`` -> the reified literal
@@ -907,7 +1111,7 @@ class _SympyExprToCpSat(Printer):
         at each of its candidate divisions. The owner is the one
         division-choosing buffer whose split symbols the arguments are written
         in; a functor of no buffer of this solve, or a candidate leaving an
-        argument unresolved, prices 0. Memoized, since a bundle repeats the
+        argument unresolved, prices 0. Memoized, since ``expand`` repeats the
         term once per residency gate."""
         key = f"_imp_{expr}"
         if key in self._sym_map:
@@ -950,35 +1154,10 @@ class _SympyExprToCpSat(Printer):
         return var
 
     def _print_Pow(self, expr):
-        if expr.exp.is_Integer and expr.exp > 1:
+        if expr.exp == 2:
             base = self._print(expr.base)
-            result = base
-            for _ in range(int(expr.exp) - 1):
-                result = self._print_multiply_two(result, base)
-            return result
-        return self._tabulated(expr)
-
-    def _tabulated(self, expr):
-        """``expr`` as one table, for a node with no lowering of its own: a
-        fractional or negative power, a floor, a log. Raises when it is not
-        a finite function of the decisions, since an approximation the solver
-        then optimizes against is worse than no objective at all."""
-        table = self._joint(expr)
-        if table is None:
-            raise ValueError(
-                f"cannot tabulate {type(expr).__name__}: it is not a finite "
-                f"function of the decisions within {self._max_table_entries} entries"
-            )
-        return table
-
-    def _print_floor(self, expr):
-        return self._tabulated(expr)
-
-    def _print_ceiling(self, expr):
-        return self._tabulated(expr)
-
-    def _print_ITE(self, expr):
-        return self._print(expr.to_nnf(simplify=False))
+            return self._print_multiply_two(base, base)
+        return self._print(expr.base) ** self._print(expr.exp)
 
     @memoize_method
     def _print_condition(self, cond):
@@ -1027,9 +1206,6 @@ class _SympyExprToCpSat(Printer):
 
     @memoize_method
     def _print_Piecewise(self, expr):
-        table = self._joint(expr)
-        if table is not None:
-            return table
         args = expr.args
         assert args[-1][1] == sympy.true
         result = 0
@@ -1050,11 +1226,12 @@ class _SympyExprToCpSat(Printer):
         return self._print_condition(expr.args[0]).Not()
 
     def _print_Relational(self, expr):
-        args, _ = self._integer_operands([self._print(arg) for arg in expr.args])
-        return _operator_map[expr.rel_op](*args)
+        return _operator_map[expr.rel_op](*[self._print(arg) for arg in expr.args])
 
     def _print_log(self, expr):
-        return self._tabulated(expr)
+        if isinstance(expr.args[0], sympy.Number):
+            return math.log(float(expr.args[0]))
+        raise NotImplementedError(f"log not implemented. expr: {expr}")
 
     @staticmethod
     def _affine_bounds(expr):
@@ -1105,7 +1282,7 @@ class _SympyExprToCpSat(Printer):
         an IntVar with interval bounds the same operand costs nothing and the
         optimum is unchanged. Float-coefficient operands pass through as
         before (``AddMaxEquality`` rejects them and ``_minimize_cost_expr``
-        falls back); :meth:`_integer_operands` rounds those a table produced."""
+        falls back)."""
         if isinstance(arg, (int, float)):
             return arg
         try:
@@ -1120,101 +1297,29 @@ class _SympyExprToCpSat(Printer):
         self._model.add(var == arg)
         return var
 
-    def _integer_operands(self, args):
-        """``(args, divisor)``: Min/Max operands with integer coefficients,
-        rounded at ``_MINMAX_OPERAND_SCALE`` where a table or the cost model's own
-        coefficients left them fractional. Operands that are already integers
-        come back unchanged."""
-
-        def fractional(arg):
-            if isinstance(arg, (int, float)):
-                return not float(arg).is_integer()
-            try:
-                cp_model.FlatIntExpr(arg)
-            except TypeError:
-                return True
-            return False
-
-        if not any(fractional(arg) for arg in args):
-            return args, 1
-
-        # The scale gives way to the operands' size, so their bounds stay in
-        # int64, and to their largest coefficient: past 2**31 one can make
-        # presolve report a satisfiable model INFEASIBLE.
-        def sizes(arg):
-            if isinstance(arg, (int, float)):
-                return abs(arg), 0.0
-            flat = cp_model.FlatFloatExpr(arg)
-            spans = (max(abs(v.domain.min()), abs(v.domain.max())) for v in flat.vars)
-            size = sum(abs(c) * s for c, s in zip(flat.coeffs, spans))
-            return abs(flat.offset) + size, max(map(abs, flat.coeffs), default=0.0)
-
-        magnitude, coefficient = map(max, zip(*map(sizes, args)))
-        scale = min(
-            _MINMAX_OPERAND_SCALE,
-            _MINMAX_OPERAND_BOUND / max(magnitude, 1.0),
-            max(1.0, _MAX_PRODUCT_BOUND / max(coefficient, 1.0)),
-        )
-
-        def term(var, weight):
-            # A table's product carries its levels' scale, which rounding the
-            # weight alone would lose, so floor the weighted variable.
-            if float(weight).is_integer():
-                return int(weight) * var
-            ratio = Fraction(abs(weight)).limit_denominator(_MINMAX_OPERAND_SCALE)
-            if ratio == 0:
-                ratio = Fraction(1, round(1 / abs(weight)))
-            lb, ub = self._affine_bounds(ratio.numerator * var)
-            floored = self._floored(
-                ratio.numerator * var,
-                ratio.denominator,
-                lb // ratio.denominator,
-                ub // ratio.denominator,
-            )
-            return floored if weight > 0 else -floored
-
-        def rounded(arg):
-            if isinstance(arg, (int, float)):
-                return round(arg * scale)
-            flat = cp_model.FlatFloatExpr(arg)
-            return sum(
-                (term(v, c * scale) for v, c in zip(flat.vars, flat.coeffs)),
-                round(flat.offset * scale),
-            )
-
-        return [rounded(arg) for arg in args], scale
-
     def _print_Max(self, expr):
-        table = self._joint(expr)
-        if table is not None:
-            return table
         # max range is (max(mins), max(maxes))
         args = [self._print(arg) for arg in expr.args]
         if all(isinstance(a, (int, float)) for a in args):
             return max(args)  # a lazy Max of constants was never folded
-        args, divisor = self._integer_operands(args)
         args = [self._lin_max_operand(arg) for arg in args]
         bounds = map(max, zip(*[self._affine_bounds(arg) for arg in args]))
         max_var = self._model.new_int_var(*bounds, f"max_var_{self._count}")
         self._model.AddMaxEquality(max_var, args)
         self._count += 1
-        return max_var if divisor == 1 else max_var * (1.0 / divisor)
+        return max_var
 
     def _print_Min(self, expr):
-        table = self._joint(expr)
-        if table is not None:
-            return table
         # min range is (min(mins), min(maxes))
         args = [self._print(arg) for arg in expr.args]
         if all(isinstance(a, (int, float)) for a in args):
             return min(args)  # a lazy Min of constants was never folded
-        args, divisor = self._integer_operands(args)
         args = [self._lin_max_operand(arg) for arg in args]
         bounds = map(min, zip(*[self._affine_bounds(arg) for arg in args]))
         min_var = self._model.new_int_var(*bounds, f"min_var_{self._count}")
         self._model.AddMinEquality(min_var, args)
         self._count += 1
-        return min_var if divisor == 1 else min_var * (1.0 / divisor)
+        return min_var
 
 
 def cost_expr_to_cpsat(
@@ -1222,11 +1327,10 @@ def cost_expr_to_cpsat(
     sym_map: dict,
     buffer_map: dict,
     cost_expr: sympy.Expr,
-    max_table_entries: Optional[int] = None,
+    max_table_entries: int | None = None,
 ) -> "cp_model.LinearExpr":
     """``cost_expr`` as a CP-SAT expression over ``model``; the variables and
     constraints the lowering needs are added to ``model``, and ``sym_map`` gains
-    the helper variables it creates. ``max_table_entries`` bounds a joint table
-    (see ``config.cpsat_max_table_entries``, the default)."""
-    printer = _SympyExprToCpSat(model, sym_map, buffer_map, max_table_entries)
-    return printer.convert(cost_expr)
+    the helper variables it creates. ``max_table_entries`` is accepted for the
+    table printer's call site and unused here."""
+    return _SympyExprToCpSat(model, sym_map, buffer_map).convert(cost_expr)
