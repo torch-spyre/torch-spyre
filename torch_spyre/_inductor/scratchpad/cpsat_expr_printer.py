@@ -60,24 +60,9 @@ _CORE_INV_SCALE = 1024
 _CORE_INV_SCALE_MAX_VALUE = 32
 # constant limit on product terms to avoid int32 overflow in CP-SAT
 _MAX_PRODUCT_BOUND = 2**30
-# Bits of a derived symbol's largest value: it rounds to 2**-_DERIVED_BITS of
-# that value, and its levels stay inside _MAX_PRODUCT_BOUND.
-_DERIVED_BITS = 30
-_NONLINEAR_FUNCS = (
-    sympy.log,
-    sympy.floor,
-    sympy.ceiling,
-    sympy.Min,
-    sympy.Max,
-    sympy.Piecewise,
-    sympy.ITE,
-    sympy.KroneckerDelta,
-)
-_DUAL = {sympy.Min: sympy.Max, sympy.Max: sympy.Min}
-# Bits kept of a Min/Max operand's smallest coefficient, and the bound on any
-# scaled operand: below int64 once _integerize_minmax multiplies by 10000.
-_MINMAX_COEFFICIENT_BITS = 24
-_MINMAX_VALUE_BITS = 48
+# Relative error a piecewise-linear power may leave at a candidate it does
+# not take as a breakpoint (see _SympyExprToCpSat._power_pwl).
+_POWER_PWL_TOLERANCE = 0.01
 
 
 _operator_map = {
@@ -224,8 +209,6 @@ class _SympyExprToCpSat(Printer):
         self._conjunction_cache: dict = {}
         self._candidate_cache: dict = {}
         self._division_table_cache: dict = {}
-        self._derived: dict = {}
-        self._fold_cache: dict = {}
         super().__init__()
 
     def _print(self, expr, **kwargs):
@@ -303,7 +286,10 @@ class _SympyExprToCpSat(Printer):
         elif expr.is_Mul:
             result = math.prod(values)
         elif expr.is_Pow:
-            result = values[0] ** values[1]
+            try:
+                result = values[0] ** values[1]
+            except (ZeroDivisionError, OverflowError):
+                return None  # a pole in a branch the guard may exclude
         elif isinstance(expr, (sympy.Min, sympy.Max)):
             operation = np.minimum if isinstance(expr, sympy.Min) else np.maximum
             result = values[0]
@@ -364,243 +350,10 @@ class _SympyExprToCpSat(Printer):
             self._division_table_cache[key] = var
         return coefficient * self._division_table_cache[key] + offset
 
-    def _menu_symbol(self, sym):
-        """``(wrapper, values)`` when ``sym`` is a function of one buffer's
-        division index: a split or tile count, the division itself, or a
-        derived symbol; else None."""
-        name = sym.name
-        if name in self._derived:
-            return self._derived[name]
-        entry = self._buffer_map.get(name)
-        if entry is not None and entry[0] is not None:
-            return entry
-        wrapper = self._sym_map.get(f"_division_of_{name}")
-        if wrapper is not None and hasattr(wrapper, "division"):
-            return wrapper, list(range(len(wrapper.buffer.core_divisions)))
-        return None
-
-    def _single_owner(self, expr):
-        owners = {}
-        for sym in expr.free_symbols:
-            entry = self._menu_symbol(sym)
-            if entry is None:
-                return None
-            owners[id(entry[0])] = entry[0]
-        return next(iter(owners.values())) if len(owners) == 1 else None
-
-    @staticmethod
-    def _nonlinear(expr):
-        for node in sympy.preorder_traversal(expr):
-            if isinstance(node, sympy.Pow) and node.exp != 1:
-                return True
-            if isinstance(node, _NONLINEAR_FUNCS):
-                return True
-            if isinstance(node, sympy.Mul) and sum(bool(a.free_symbols) for a in node.args) > 1:
-                return True
-        return False
-
-    def _menu_values(self, expr):
-        """``expr`` at every entry of its one buffer's menu, or None where an
-        entry is not finite (a pole its guard does not exclude)."""
-        syms = sorted(expr.free_symbols, key=lambda s: s.name)
-        cols = [self._menu_symbol(s)[1] for s in syms]
-        try:
-            f = sympy.lambdify(syms, expr, modules=["math"])
-            values = [float(f(*[c[i] for c in cols])) for i in range(len(cols[0]))]
-        except (ZeroDivisionError, OverflowError, ValueError, TypeError):
-            return None
-        return values if all(math.isfinite(v) for v in values) else None
-
-    @staticmethod
-    def _scale_exponent(values):
-        largest = max(abs(v) for v in values)
-        return _DERIVED_BITS - math.ceil(math.log2(largest)) if largest else 0
-
-    def _derived_symbol(self, wrapper, values, exponent):
-        """``values`` over ``wrapper``'s menu as ``fn * 2**-exponent``: ``fn`` is
-        an integer variable bound to the division by one element, holding each
-        value rounded to ``2**-exponent``. The rewrite stays linear in ``fn``,
-        as it is in ``inv_`` and ``log2_``."""
-        levels = [round(math.ldexp(v, exponent)) for v in values]
-        if all(level == levels[0] for level in levels):
-            return sympy.Integer(levels[0]) * sympy.Integer(2) ** -exponent
-        name = f"fn_{self._count}"
-        self._count += 1
-        var = self._model.new_int_var_from_domain(
-            cp_model.Domain.FromValues(levels), name
-        )
-        self._model.add_element(wrapper.division, levels, var)
-        self._sym_map[name] = var
-        self._buffer_map[name] = (wrapper, levels)
-        self._derived[name] = (wrapper, levels)
-        return sympy.Symbol(name, integer=True) * sympy.Integer(2) ** -exponent
-
-    def _fold(self, expr):
-        """Replace each nonlinear sub-expression that reads one buffer's
-        decisions with a derived symbol, and rewrite the powers that span
-        buffers or a residency literal until they do."""
-        if expr not in self._fold_cache:
-            self._fold_cache[expr] = self._fold_uncached(expr)
-        return self._fold_cache[expr]
-
-    def _fold_uncached(self, expr):
-        if expr.is_Atom or type(expr).__name__ == "RelayoutCharge":
-            return expr
-        if isinstance(expr, sympy.Expr) and not isinstance(expr, sympy.Symbol):
-            wrapper = self._single_owner(expr)
-            if wrapper is not None and self._nonlinear(expr):
-                values = self._menu_values(expr)
-                if values is not None:
-                    return self._derived_symbol(
-                        wrapper, values, self._scale_exponent(values)
-                    )
-        pushed = self._pushed_power(expr)
-        if pushed is not None:
-            return self._fold(pushed)
-        args = [self._fold(arg) for arg in expr.args]
-        if any(new is not old for new, old in zip(args, expr.args)):
-            try:
-                expr = expr.func(*args, evaluate=False)
-            except TypeError:
-                expr = expr.func(*args)
-        if isinstance(expr, sympy.Expr) and not expr.free_symbols:
-            return sympy.Float(expr.evalf()) if not expr.is_Integer else expr
-        return self._cross(expr)
-
-    @staticmethod
-    def _pushed_power(expr):
-        """``(c * Min(a, b))**y`` as ``c**y * Min(a**y, b**y)`` (``Max`` for a
-        negative ``y``): a power is monotone over the positive values a cost
-        takes, so each operand's power reads only what that operand reads."""
-        if not (
-            isinstance(expr, sympy.Pow)
-            and expr.exp.is_Number
-            and not (expr.exp.is_Integer and expr.exp > 0)
-        ):
-            return None
-        coefficient, rest = expr.base.as_coeff_Mul()
-        if coefficient <= 0 or not isinstance(rest, (sympy.Min, sympy.Max)):
-            return None
-        func = type(rest) if expr.exp > 0 else _DUAL[type(rest)]
-        return sympy.Float(coefficient**expr.exp) * func(
-            *(arg**expr.exp for arg in rest.args), evaluate=False
-        )
-
-    def _cross(self, expr):
-        if (
-            isinstance(expr, sympy.Pow)
-            and expr.exp.is_Number
-            and not (expr.exp.is_Integer and expr.exp > 0)
-        ):
-            base, exp = expr.base, expr.exp
-            if isinstance(base, sympy.Mul) and base.args[0].is_Number and base.args[0] > 0:
-                # (c * x)**y = c**y * x**y for the positive c a scale pulls out.
-                coefficient, rest = base.as_coeff_Mul()
-                return sympy.Float(coefficient**exp) * self._fold(
-                    sympy.Pow(rest, exp, evaluate=False)
-                )
-            if isinstance(base, (sympy.Min, sympy.Max)):
-                # A power is monotone over the positive values a cost takes.
-                func = type(base) if exp > 0 else _DUAL[type(base)]
-                return self._fold(
-                    func(*(arg**exp for arg in base.args), evaluate=False)
-                )
-            literals = [s for s in base.free_symbols if s.name.startswith("is_lx_")]
-            if len(literals) == 1:
-                (lit,) = literals
-                off = self._fold(base.subs(lit, 0) ** exp)
-                on = self._fold(base.subs(lit, 1) ** exp)
-                return off + (on - off) * lit
-        if isinstance(expr, (sympy.Min, sympy.Max)):
-            return self._aligned_minmax(expr)
-        return expr
-
-    def _aligned_minmax(self, expr):
-        """A Min/Max of constants and one-buffer operands with every operand on
-        one integer scale, so ``_integerize_minmax`` keeps their precision."""
-        columns = []
-        for arg in expr.args:
-            if arg.is_Number:
-                columns.append((None, [float(arg)]))
-                continue
-            wrapper = self._single_owner(arg)
-            values = self._menu_values(arg) if wrapper is not None else None
-            if values is None:
-                return self._integer_minmax(expr)
-            columns.append((wrapper, values))
-        exponent = min(self._scale_exponent(values) for _, values in columns)
-        operands = [
-            sympy.Integer(round(math.ldexp(values[0], exponent)))
-            if wrapper is None
-            else self._derived_symbol(wrapper, values, exponent)
-            * sympy.Integer(2) ** exponent
-            for wrapper, values in columns
-        ]
-        return self._opaque_minmax(type(expr), operands) * sympy.Integer(2) ** -exponent
-
-    def _opaque_minmax(self, func, operands):
-        """Lower a Min/Max of integer operands here and hand the rewrite one
-        symbol for it: ``_rewrite`` would otherwise push every coefficient of
-        whatever multiplies it into its operands and round each at 10000x."""
-        printed = [self._print(self._rewrite(op)) for op in operands]
-        if all(isinstance(p, (int, float)) for p in printed):
-            return sympy.Integer(int((max if func is sympy.Max else min)(printed)))
-        printed = [self._lin_max_operand(p) for p in printed]
-        pick = max if func is sympy.Max else min
-        bounds = [self._affine_bounds(p) for p in printed]
-        low, high = pick(b[0] for b in bounds), pick(b[1] for b in bounds)
-        name = f"mm_{self._count}"
-        self._count += 1
-        var = self._model.new_int_var(low, high, name)
-        if func is sympy.Max:
-            self._model.add_max_equality(var, printed)
-        else:
-            self._model.add_min_equality(var, printed)
-        self._sym_map[name] = var
-        return sympy.Symbol(name, integer=True)
-
-    def _upper_bound(self, monomial):
-        bound = 1
-        for factor in sympy.Mul.make_args(monomial):
-            base, power = factor.as_base_exp()
-            entry = self._menu_symbol(base) if base.is_Symbol else None
-            top = max(abs(v) for v in entry[1]) if entry is not None else 1
-            bound *= top ** int(power) if power.is_Integer else top
-        return bound
-
-    def _integer_minmax(self, expr):
-        """A Min/Max whose operands mix buffers and literals, scaled by one
-        power of two until every coefficient is an integer that keeps
-        2**-_MINMAX_COEFFICIENT_BITS of the smallest one, so the 10000-scale
-        truncation in ``_integerize_minmax`` leaves it whole."""
-        operands = [sympy.expand(arg) for arg in expr.args]
-        terms = [sympy.Add.make_args(op) for op in operands]
-        coefficients = [
-            abs(float(t.as_coeff_Mul()[0])) for ts in terms for t in ts if t != 0
-        ]
-        coefficients = [c for c in coefficients if c]
-        if not coefficients:
-            return expr
-        bits = _MINMAX_COEFFICIENT_BITS - math.floor(math.log2(min(coefficients)))
-        largest = max(
-            abs(float(c)) * self._upper_bound(m)
-            for ts in terms
-            for c, m in (t.as_coeff_Mul() for t in ts)
-        )
-        bits = min(bits, _MINMAX_VALUE_BITS - math.ceil(math.log2(largest or 1)))
-        scale = sympy.Integer(2) ** bits
-        scaled = [
-            sympy.Add(*(sympy.Integer(round(float(c * scale))) * m for c, m in
-                        (t.as_coeff_Mul() for t in ts)))
-            for ts in terms
-        ]
-        return self._opaque_minmax(type(expr), scaled) / scale
-
     def convert(self, cost_expr: sympy.Expr) -> "cp_model.LinearExpr":
         """Return the CP-SAT expression equivalent to ``cost_expr`` under
         ``sym_map`` (``sympy symbol -> CP-SAT var``)."""
         logger.debug("[CP-SAT layout solver] cost expr (raw): %s", cost_expr)
-        cost_expr = self._fold(cost_expr)
         cost_expr = self._rewrite(cost_expr)
         logger.debug("[CP-SAT layout solver] cost expr (linearized): %s", cost_expr)
         return self._print(cost_expr)
@@ -622,6 +375,9 @@ class _SympyExprToCpSat(Printer):
             lambda e: self._piecewise_canonical(self._log_min(e)),
         )
         cost_expr = sympy.expand(cost_expr)
+        cost_expr = cost_expr.replace(
+            lambda e: e.func in [sympy.Pow, sympy.Mul], self._distribute_power
+        )
         cost_expr = cost_expr.replace(
             lambda e: e.func in [sympy.log, sympy.Pow, sympy.Mul],
             self._inv_log_sym,
@@ -724,29 +480,11 @@ class _SympyExprToCpSat(Printer):
             elif arg.is_Number:
                 return math.log(float(arg))
         elif expr.func == sympy.Pow:
+            if expr.exp.is_Number and not expr.exp.is_Integer:
+                if self._candidates(arg) is not None:
+                    return self._power_pwl(arg, float(expr.exp))
             if not self._is_split_sym(arg):
                 return expr
-            # Core splits only: a tile count can exceed 32.
-            if (
-                expr.exp.is_Number
-                and math.isclose(expr.exp, 0.25)
-                and arg.name.startswith("split_")
-            ):
-                # Discrete piecewise linear approximation of x^(1/4) over the interval [1, 32],
-                # pinned to return 1 at x=1, generated using tools/approximate-power.py.
-                # since we check that the base is a _split_ symbol, it is an integer in the
-                # range [1, 32]
-                # Max 4.5% deviation for two segments;
-                # we would get:
-                #   max 1.6% deviation with 3 segments;
-                #   max 0.074% deviation with 8 segments;
-                #   max 0.019% deviation with 12 segments;
-                #   no deviation with 16 segments.
-                # script at https://github.com/user-attachments/files/31975789/approximate-power.py
-                return sympy.Piecewise(
-                    (0.139980295504224 * arg + 0.860019704495776, arg <= 5),
-                    (0.0287191888771944 * arg + 1.45940018593522, True),
-                )
             if expr.exp == -1:
                 return sympy.Symbol(
                     f"inv_{arg.name}", integer=True, nonnegative=True
@@ -773,6 +511,119 @@ class _SympyExprToCpSat(Printer):
                 result *= math.prod([arg for arg in expr.args if arg not in symbols])
                 return result
         return expr
+
+    def _distribute_power(self, expr):
+        """Bring a fractional or negative power down to the split and tile
+        symbols ``_inv_log_sym`` lowers:
+
+        - ``a**y * b**y`` over one buffer's symbols -> ``(a * b)**y``, one
+          power over the product's candidate values;
+        - ``(c * Min(p, q))**y`` -> ``c**y * Min(p**y, q**y)`` (``Max`` for a
+          negative ``y``), a power being monotone over the positive values a
+          cost takes;
+        - ``(u + v * lit)**y`` for a residency literal ->
+          ``u**y + ((u + v)**y - u**y) * lit``, exact at both values of lit."""
+        if expr.func == sympy.Mul:
+            groups: dict = {}
+            rest = []
+            for factor in expr.args:
+                base, exponent = factor.as_base_exp()
+                entry = self._buffer_map.get(base.name) if base.is_Symbol else None
+                if exponent.is_Number and not exponent.is_Integer and entry and entry[0] is not None:
+                    groups.setdefault((id(entry[0]), exponent), []).append(base)
+                else:
+                    rest.append(factor)
+            if all(len(g) < 2 for g in groups.values()):
+                return expr
+            powers = [
+                sympy.Pow(sympy.Mul(*bases, evaluate=False), exponent, evaluate=False)
+                for (_, exponent), bases in groups.items()
+            ]
+            return sympy.Mul(*rest, *powers, evaluate=False)
+        base, exponent = expr.base, expr.exp
+        if not exponent.is_Number or (exponent.is_Integer and exponent > 0):
+            return expr
+        power = lambda b: self._distribute_power(  # noqa: E731
+            sympy.Pow(b, exponent, evaluate=False)
+        )
+        coefficient, inner = base.as_coeff_Mul()
+        if coefficient > 0 and coefficient != 1:
+            return sympy.Float(coefficient**exponent) * power(inner)
+        if isinstance(inner, (sympy.Min, sympy.Max)):
+            dual = _LazyMax if isinstance(inner, sympy.Min) else _LazyMin
+            func = type(inner) if exponent > 0 else dual
+            return func(*(power(arg) for arg in inner.args))
+        if isinstance(inner, sympy.Piecewise):
+            # A zero branch under a negative power is taken as unreachable:
+            # the cost model guards each one (tile > 1) where it divides.
+            return sympy.Piecewise(
+                *(
+                    (sympy.Integer(0) if value == 0 and exponent < 0 else power(value), cond)
+                    for value, cond in inner.args
+                )
+            )
+        if inner.is_Mul:
+            grouped = self._distribute_power(
+                sympy.Mul(*(sympy.Pow(f, exponent) for f in inner.args), evaluate=False)
+            )
+            if grouped is not None:
+                return grouped
+        if inner.is_Number:
+            return sympy.Float(inner**exponent)
+        literals = [s for s in base.free_symbols if s.name.startswith("is_lx_")]
+        if len(literals) == 1 and base.free_symbols == set(literals):
+            (lit,) = literals
+            off = sympy.Float(base.subs(lit, 0) ** exponent)
+            on = sympy.Float(base.subs(lit, 1) ** exponent)
+            return off + (on - off) * lit
+        return expr
+
+    def _candidates(self, base):
+        """The values a split or tile symbol, or a product of one buffer's,
+        takes over that buffer's menu; None when they are not known."""
+        factors = sympy.Mul.make_args(base)
+        entries = [self._buffer_map.get(f.name) if f.is_Symbol else None for f in factors]
+        if all(e is not None and e[0] is not None for e in entries):
+            if len({id(e[0]) for e in entries}) == 1:
+                columns = [e[1] for e in entries]
+                return sorted({math.prod(int(c[i]) for c in columns) for i in range(len(columns[0]))})
+        if base.is_Symbol and base.name.startswith("split_"):
+            return list(range(1, _CORE_INV_SCALE_MAX_VALUE + 1))
+        return None
+
+    def _power_pwl(self, arg, exponent):
+        """``arg**exponent`` for a split or tile symbol, or a product of one
+        buffer's, as a piecewise-linear function through its candidate values.
+        Breakpoints are chosen by Ramer-Douglas-Peucker: a candidate becomes one
+        when the segment past it misses its power by more than
+        _POWER_PWL_TOLERANCE, relative. Exact at every breakpoint."""
+        xs = self._candidates(arg)
+        if xs is None:
+            return arg**exponent
+        ys = [x**exponent for x in xs]
+        if len(xs) == 1:
+            return sympy.Float(ys[0])
+        keep = {0, len(xs) - 1}
+        stack = [(0, len(xs) - 1)]
+        while stack:
+            lo, hi = stack.pop()
+            slope = (ys[hi] - ys[lo]) / (xs[hi] - xs[lo])
+            worst, at = 0.0, None
+            for i in range(lo + 1, hi):
+                miss = abs(ys[lo] + slope * (xs[i] - xs[lo]) - ys[i]) / abs(ys[i])
+                if miss > worst:
+                    worst, at = miss, i
+            if at is not None and worst > _POWER_PWL_TOLERANCE:
+                keep.add(at)
+                stack += [(lo, at), (at, hi)]
+        points = sorted(keep)
+        pieces = []
+        for lo, hi in zip(points, points[1:]):
+            slope = (ys[hi] - ys[lo]) / (xs[hi] - xs[lo])
+            line = slope * arg + (ys[lo] - slope * xs[lo])
+            last = hi == points[-1]
+            pieces.append((line, True if last else arg <= xs[hi]))
+        return sympy.Piecewise(*pieces)
 
     @classmethod
     def _piecewise_canonical(cls, expr):
