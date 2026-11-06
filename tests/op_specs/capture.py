@@ -283,7 +283,7 @@ def capture_kernels(
     def spy(method: str):
         real = originals[method]
 
-        def wrapper(self, kernel_name, specs, pool_size=0):
+        def wrapper(self, kernel_name, specs, pool_size=0, launch_args=None):
             rec = KernelRecord(
                 name=kernel_name,
                 specs=list(specs),
@@ -294,12 +294,19 @@ def capture_kernels(
                 ktir_emitter=method == "ktir",
             )
             records.append(rec)
-            # ktir() takes no pool_size: that emitter refuses an hbm_pool buffer,
-            # so the scheduler never emits one for it.
+            # ktir() takes neither pool_size nor launch_args: that emitter
+            # refuses an hbm_pool buffer, so the scheduler never emits one for
+            # it, and the launch spec is written only on the sdsc path.
             if method == "ktir":
                 runner = real(self, kernel_name, specs)
             else:
-                runner = real(self, kernel_name, specs, pool_size=pool_size)
+                runner = real(
+                    self,
+                    kernel_name,
+                    specs,
+                    pool_size=pool_size,
+                    launch_args=launch_args,
+                )
             if isinstance(runner, CodeCacheFuture):
                 return _RunRecorderFuture(runner, rec, save_inputs)
             return _RunRecorder(runner, rec, save_inputs)
