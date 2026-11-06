@@ -301,12 +301,15 @@ def restickify_valid_elements(
 
     Updates the stick group's count to new_sd_host_size and makes
     new_sd_outer_dim a standalone key with old_sd_host_size. Dims that shared a
-    touched key are split out with count 1. Returns {} when old == new.
+    touched key are split out with count 1. Returns {} (valid extents unknown)
+    when old == new, or when ``stl`` has no valid_elements stick group to update.
     """
     if old_sd_outer_dim == new_sd_outer_dim:
         return {}
     stick_dim = len(stl.device_size) - 1
-    old_stick_key = next(k for k in stl.valid_elements if stick_dim in k)
+    old_stick_key = next((k for k in stl.valid_elements if stick_dim in k), None)
+    if old_stick_key is None:
+        return {}
     # Fold the old outer dim into the stick group if it still holds sticks.
     stick_size = stl.device_size[stick_dim]
     new_old_outer_size = -(-new_sd_host_size // stick_size)
@@ -388,7 +391,7 @@ def rescale_stl_for_dtype(
                     f"{stl.device_size[i]} stick(s) of {in_eps} elements, which is "
                     f"not a whole number of {out_eps}-element output sticks"
                 )
-            out_device_size[i] = (total_elems + out_eps - 1) // out_eps
+            out_device_size[i] = total_elems // out_eps
             out_stride_map[i] = out_eps
             break
     # Clamp each count to the rescaled capacity of its dims; unchanged otherwise.
@@ -2695,10 +2698,16 @@ def compute_size1_restickify_layout(
         # Synthetic size-1 dim reuses the old outer slot: the stick group keeps
         # its key but its count becomes 1 (one element per stick).
         stick_dim = len(stl.device_size) - 1
-        old_stick_key = next(k for k in stl.valid_elements if stick_dim in k)
-        new_ve = {
-            k: (1 if k == old_stick_key else v) for k, v in stl.valid_elements.items()
-        }
+        old_stick_key = next((k for k in stl.valid_elements if stick_dim in k), None)
+        # No stick group (extents unknown): nothing to update, so stay unknown.
+        new_ve = (
+            {}
+            if old_stick_key is None
+            else {
+                k: (1 if k == old_stick_key else v)
+                for k, v in stl.valid_elements.items()
+            }
+        )
     else:
         new_ve = restickify_valid_elements(
             stl,
@@ -2923,18 +2932,21 @@ def compute_restickify_needed(
             stick_dim = len(ds) - 1
             y_ve: dict[tuple[int, ...], int] = {}
             for key, val in in_stl.valid_elements.items():
-                if k_chunk_dim in key:
-                    # The key contains both k_chunk_dim and stick_dim (the
-                    # stick's tile group).  After moving K onto the stick,
-                    # k_chunk_dim becomes independent (count = original val)
-                    # and stick_dim gets a count of 1.
-                    assert stick_dim in key, (
-                        f"expected stick_dim {stick_dim} in key {key} "
-                        f"for k_chunk_dim {k_chunk_dim}"
-                    )
-                    y_ve[(k_chunk_dim,)] = val
+                if stick_dim in key:
+                    # The stick's group.  After moving K onto the stick, the
+                    # stick gets a count of 1; k_chunk_dim, if it shared this
+                    # group, becomes independent with the original count.
+                    if set(key) - {k_chunk_dim, stick_dim}:
+                        raise Unsupported(
+                            f"sparse-N=1 restickify with valid_elements group "
+                            f"{key} spanning dims beyond k_chunk_dim "
+                            f"{k_chunk_dim} and the stick"
+                        )
+                    if k_chunk_dim in key:
+                        y_ve[(k_chunk_dim,)] = val
                     y_ve[(stick_dim,)] = 1
                 else:
+                    # Includes a standalone k_chunk_dim group: unchanged.
                     y_ve[key] = val
             return True, SpyreTensorLayout(y_ds, y_sm, in_stl.device_dtype, y_ve)
         assert False, (
