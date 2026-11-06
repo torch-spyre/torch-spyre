@@ -884,6 +884,46 @@ def test_same_group_coarse_tiled_edge_is_offered_and_priced_per_trip(monkeypatch
     torch.testing.assert_close(out.cpu(), ref, rtol=2**-8, atol=2**-6)
 
 
+def test_sibling_pins_leave_an_untiled_edge_capped(monkeypatch):
+    """Outside a coarse-tiling loop no consumer division counts as pinned by a
+    sibling parent, so the per-edge cap holds there. On this fanout graph the
+    sum's other parent matches most of each add's divisions, so pinning them
+    would leave most edges uncapped."""
+    kept_per_edge = []
+    orig_cap = alloc_mod.CoOptimizingAllocator._cap_relayout_groups
+
+    def spy_cap(*args):
+        out = orig_cap(*args)
+        kept_per_edge.append(len({c.group for c in out}))
+        return out
+
+    monkeypatch.setattr(
+        alloc_mod.CoOptimizingAllocator, "_cap_relayout_groups", staticmethod(spy_cap)
+    )
+
+    def fn(x):
+        producer = torch.relu(x)
+        total = producer * 1.0
+        for i in range(2, 9):
+            total = total + producer * float(i)
+        return total
+
+    torch._inductor.codecache.FxGraphCache.clear()
+    torch._dynamo.reset()
+    torch.manual_seed(0)
+    host = torch.randn(256, 1024, dtype=torch.float16)
+    with config.patch(_COOPT):
+        out = torch.compile(fn, dynamic=False)(host.to("spyre"))
+
+    assert kept_per_edge, "no relayout edge reached the cap"
+    assert max(kept_per_edge) <= config.lx_solver_relayout_groups_per_edge
+    # Each op rounds to dl16 (9 fraction bits, unit roundoff 2**-10). Input
+    # conversion, one multiply and up to 7 adds give a relative error near
+    # 9 * 2**-10, under rtol.
+    ref = torch.relu(host.float()) * sum(range(1, 9))
+    torch.testing.assert_close(out.cpu().float(), ref, rtol=1e-2, atol=1e-2)
+
+
 def test_sa_cooptimizer_keeps_its_objective_and_decides_no_relayout(monkeypatch):
     """The simulated-annealing engine does not decide relayouts yet, so the
     allocator must hand it neither candidates nor copies, and its objective
@@ -1590,6 +1630,7 @@ def test_v_projection_cache_handoff_preserves_persistent_alias(
         device_size=[1024, 2, 2, 1, 64],
         stride_map=[128, 1024 * 128, 64, 2 * 1024 * 128, 1],
         device_dtype=get_device_dtype(torch.float16),
+        valid_elements={(0,): 1024, (1,): 2, (2, 4): 128, (3,): 1},
     )
     cache = cache_host.to("spyre", device_layout=cache_layout)
     alias = cache
@@ -1927,6 +1968,7 @@ def _run_prefix_linear_case(monkeypatch, *, mode):
         device_size=[physical // eps, rows, eps],
         stride_map=[eps, physical, 1],
         device_dtype=get_device_dtype(torch.float16),
+        valid_elements={(0, 2): physical, (1,): rows},
     )
     compiled = torch.compile(fn, dynamic=False, fullgraph=True)
     options = {**_COOPT, "sencores": 32, "lx_same_tile_group_relayout": False}
