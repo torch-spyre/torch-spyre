@@ -1820,6 +1820,10 @@ def _call_innner(op):
         store_fn(syms)
 
 
+def is_spyre_layout(layout: Layout):
+    return layout.device.type == DEVICE_NAME
+
+
 def _get_layout(
     graph: GraphLowering, node: IRNode | Layout | SpyreTensorLayout
 ) -> SpyreTensorLayout | None:
@@ -1840,7 +1844,7 @@ def _get_layout(
     if isinstance(node, Layout):
         assert isinstance(node, FixedLayout), f"Expected finalized layout, got {node}"
         if not isinstance(node, FixedTiledLayout):
-            assert node.device.type != DEVICE_NAME
+            assert not is_spyre_layout(node)
             return None
         node = node.device_layout
     return node
@@ -1915,23 +1919,27 @@ def track_padding_value(graph: GraphLowering) -> None:
                 buf = graph.get_buffer(dep.name)
                 while isinstance(buf, MutableBox):
                     buf = buf.data
-                layout = _get_layout(graph, buf)
-                buf_is_padded = is_padded(graph, buf) if layout is not None else False
+                stl = _get_layout(graph, buf)
+                buf_is_padded = is_padded(graph, buf) if stl is not None else False
                 if isinstance(buf, InputBuffer):
-                    assert layout is not None
-                    # Seed from the padding the input held before the graph,
-                    # once: after a mutation the range is what that left.
                     if dep.name not in tracer.buffer_range:
-                        tracer.buffer_range[dep.name] = (
-                            _input_padding_range(layout) if buf_is_padded else EmptySet
-                        )
+                        if is_spyre_layout(buf.layout):
+                            assert stl is not None
+                            # Seed from the padding the input held before the graph,
+                            # once: after a mutation the range is what that left.
+                            tracer.buffer_range[dep.name] = (
+                                _input_padding_range(stl) if buf_is_padded else EmptySet
+                            )
+                        else:
+                            # other device buffers are not padded
+                            tracer.buffer_range[dep.name] = EmptySet
                 else:
                     assert dep.name in tracer.buffer_range, (
                         f"Nodes seen out of order, expected {dep.name} to have been visited"
                     )
                 tracer.current_reads[dep.name] = tracer.buffer_range[dep.name]
                 input_buffers[dep.name] = buf
-                if layout is None:
+                if stl is None:
                     continue
 
                 # The read is a slice when it touches fewer elements than the
