@@ -86,7 +86,7 @@ from .scratchpad.allocator import (
     solve_decides_work_division,
 )
 from .scratchpad.lx_relayout import anchor_lx_relayout_ownership
-from .fusion import spyre_fuse_nodes
+from .fusion import sink_collective_waits, spyre_fuse_nodes
 from .scheduler import (
     build_loop_scheduler_nodes,
     prepare_spyre_kernels,
@@ -94,6 +94,7 @@ from .scheduler import (
 from .constants import DEVICE_NAME
 from .deadcode_elimination import deadcode_elimination
 from .loop_carries import apply_loop_carries
+from .loop_checker import check_loops
 from .loop_node import (
     OpsView,
     all_ops,
@@ -353,6 +354,7 @@ class CustomPostFusionPasses(_SpyreNodePassPipeline):
         # emission binds only what pooling decided.
         super().__init__(
             [
+                sink_collective_waits,
                 spyre_fuse_nodes,
                 prepare_spyre_kernels,
                 hbm_pool_planning,
@@ -736,6 +738,9 @@ class CustomPreSchedulingPasses:
             pass_name = _get_pass_name(pass_fn)
             with _flat_operations(graph, pass_name):
                 self._run_one_pass(graph, pipeline, pass_fn, pass_name)
+            # After the view is put back: the checker reads the real tree, and a
+            # violation then names the pass that left it.
+            check_loops(graph, where=pass_name)
 
     def _run_one_pass(
         self,
