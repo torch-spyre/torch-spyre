@@ -422,7 +422,7 @@ void SpyreStream::copyAsyncImpl(void* cpu_ptr, size_t host_capacity,
       launchH2D(params);
     }
     catch (...) {
-      DmaStagingBuffer flex::destroyDmaParams(params);
+      flex::destroyDmaParams(params);
       throw;
     }
     flex::destroyDmaParams(params);
