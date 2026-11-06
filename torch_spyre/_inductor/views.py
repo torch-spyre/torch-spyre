@@ -354,6 +354,235 @@ def _copy_containers(value):
     return value
 
 
+def _is_concrete_int(x: object) -> bool:
+    return isinstance(x, (int, sympy.Integer))
+
+
+def _safe_mod(a: sympy.Expr, b: sympy.Expr | int) -> sympy.Expr:
+    b_sym = sympy.sympify(b)
+    if isinstance(a, sympy.Symbol):
+        return sympy.Mod(a, b_sym)
+    if _is_concrete_int(a):
+        return int(a) % int(b_sym)
+    if (
+        isinstance(a, sympy.Mod)
+        and _is_concrete_int(a.args[1])
+        and _is_concrete_int(b_sym)
+    ):
+        inner_m = int(a.args[1])
+        outer_m = int(b_sym)
+        if inner_m <= outer_m:
+            return a
+        if inner_m % outer_m == 0:
+            return _safe_mod(a.args[0], outer_m)
+    # Sympy Mod.eval has a bug where Mod(c * Mod(x, m1), m2) evaluates by
+    # incorrectly squaring the inner Mod. Using evaluate=False prevents this.
+    if a.has(sympy.Mod):
+        return sympy.Mod(a, b_sym, evaluate=False)
+    return sympy.Mod(a, b_sym)
+
+
+def _eval_range(
+    expr: sympy.Expr, var_ranges: dict[sympy.Symbol, sympy.Expr]
+) -> tuple[int | float, int | float]:
+    if _is_concrete_int(expr):
+        val = int(expr)
+        return val, val
+    if isinstance(expr, sympy.Symbol):
+        r = var_ranges.get(expr)
+        if r is not None and _is_concrete_int(r):
+            return 0, int(r) - 1
+        return 0, math.inf
+    if isinstance(expr, sympy.Add):
+        mins, maxs = [], []
+        for a in expr.args:
+            lo, hi = _eval_range(a, var_ranges)
+            mins.append(lo)
+            maxs.append(hi)
+        return sum(mins), sum(maxs)
+    if isinstance(expr, sympy.Mul):
+        coeff = 1
+        sub_expr = sympy.S.One
+        for a in expr.args:
+            if _is_concrete_int(a):
+                coeff *= int(a)
+            else:
+                sub_expr *= a
+        lo, hi = _eval_range(sub_expr, var_ranges)
+        if coeff >= 0:
+            return coeff * lo, coeff * hi
+        else:
+            return coeff * hi, coeff * lo
+    if isinstance(expr, sympy.Mod):
+        mod = int(expr.args[1]) if _is_concrete_int(expr.args[1]) else None
+        if mod is not None:
+            lo, hi = _eval_range(expr.args[0], var_ranges)
+            if hi < mod:
+                return lo, hi
+            return 0, mod - 1
+    return 0, math.inf
+
+
+def _extract_affine_terms(
+    expr: sympy.Expr,
+) -> tuple[list[tuple[int, sympy.Expr]], int]:
+    terms = expr.as_ordered_terms() if isinstance(expr, sympy.Add) else [expr]
+    extracted: list[tuple[int, sympy.Expr]] = []
+    const_offset = 0
+    for t in terms:
+        if _is_concrete_int(t):
+            const_offset += int(t)
+        elif isinstance(t, sympy.Mul) and any(_is_concrete_int(a) for a in t.args):
+            coeff = 1
+            rest = sympy.S.One
+            for a in t.args:
+                if _is_concrete_int(a):
+                    coeff *= int(a)
+                else:
+                    rest *= a
+            extracted.append((coeff, rest))
+        elif isinstance(
+            t, (sympy.Symbol, sympy.Mod, sympy.floor, FloorDiv, ModularIndexing)
+        ):
+            extracted.append((1, t))
+        else:
+            extracted.append((1, t))
+    return extracted, const_offset
+
+
+def _bound_aware_div(
+    expr: sympy.Expr, S: int, var_ranges: dict[sympy.Symbol, sympy.Expr]
+) -> sympy.Expr:
+    lo, hi = _eval_range(expr, var_ranges)
+    if hi < S:
+        return sympy.S.Zero
+
+    extracted, const_offset = _extract_affine_terms(expr)
+    q_terms: list[sympy.Expr] = []
+    rem_terms: list[sympy.Expr] = []
+
+    q_const = const_offset // S
+    r_const = const_offset % S
+    if q_const != 0:
+        q_terms.append(sympy.Integer(q_const))
+    if r_const != 0:
+        rem_terms.append(sympy.Integer(r_const))
+
+    for coeff, term in extracted:
+        q = coeff // S
+        r = coeff % S
+        if q != 0:
+            q_terms.append(q * term)
+        if r != 0:
+            rem_terms.append(r * term)
+
+    Q = sum(q_terms) if q_terms else sympy.S.Zero
+    if not rem_terms:
+        return Q
+
+    R = sum(rem_terms)
+    lo_R, hi_R = _eval_range(R, var_ranges)
+    if hi_R < S:
+        return Q
+
+    # Theorem: if minor terms have max < gcd(major coeffs, S), they cannot carry
+    # across S and can be pruned from the floor division.
+    rem_extracted, rem_const = _extract_affine_terms(R)
+    if len(rem_extracted) > 1:
+        rem_extracted.sort(key=lambda x: x[0], reverse=True)
+        for i in range(1, len(rem_extracted)):
+            major = rem_extracted[:i]
+            minor = rem_extracted[i:]
+            g = S
+            for c, _ in major:
+                g = math.gcd(g, c)
+            max_minor = rem_const + sum(
+                _eval_range(c * t, var_ranges)[1] for c, t in minor
+            )
+            if max_minor < g:
+                R_pruned = sum(c * t for c, t in major)
+                return Q + _bound_aware_div(R_pruned, S, var_ranges)
+
+    if len(rem_extracted) == 1 and rem_const == 0:
+        c, t = rem_extracted[0]
+        if S % c == 0:
+            factor = S // c
+            if factor == 1:
+                return Q + t
+            return Q + sympy.floor(t / factor)
+        g = math.gcd(c, S)
+        return Q + sympy.floor((c // g) * t / (S // g))
+
+    return Q + sympy.floor(R / S)
+
+
+def _bound_aware_mod(
+    expr: sympy.Expr, M: int, var_ranges: dict[sympy.Symbol, sympy.Expr]
+) -> sympy.Expr:
+    lo, hi = _eval_range(expr, var_ranges)
+    if hi < M:
+        return expr
+
+    extracted, const_offset = _extract_affine_terms(expr)
+
+    if len(extracted) > 1:
+        extracted.sort(key=lambda x: x[0], reverse=True)
+        for i in range(1, len(extracted)):
+            major = extracted[:i]
+            minor = extracted[i:]
+            g = M
+            for c, _ in major:
+                g = math.gcd(g, c)
+            max_minor = const_offset + sum(
+                _eval_range(c * t, var_ranges)[1] for c, t in minor
+            )
+            if max_minor < g:
+                major_expr = sum(c * t for c, t in major)
+                minor_expr = const_offset + sum(c * t for c, t in minor)
+                return _bound_aware_mod(major_expr, M, var_ranges) + minor_expr
+
+    rem_terms: list[sympy.Expr] = []
+    r_const = const_offset % M
+    if r_const != 0:
+        rem_terms.append(sympy.Integer(r_const))
+
+    for coeff, term in extracted:
+        if coeff > 0 and coeff % M == 0:
+            continue
+        g = math.gcd(coeff, M)
+        sub_c = coeff // g
+        sub_m = M // g
+        lo_t, hi_t = _eval_range(sub_c * term, var_ranges)
+        if hi_t < sub_m:
+            rem_terms.append(coeff * term)
+        elif sub_c == 1:
+            rem_terms.append(g * _safe_mod(term, sub_m))
+        else:
+            rem_terms.append(g * _safe_mod(sub_c * term, sub_m))
+
+    if not rem_terms:
+        return sympy.S.Zero
+    R = sum(rem_terms)
+    lo_R, hi_R = _eval_range(R, var_ranges)
+    if hi_R < M:
+        return R
+
+    rem_extracted, rem_const = _extract_affine_terms(R)
+    if len(rem_extracted) == 1 and rem_const == 0:
+        c, t = rem_extracted[0]
+        g = math.gcd(c, M)
+        sub_c = c // g
+        sub_m = M // g
+        lo_t, hi_t = _eval_range(sub_c * t, var_ranges)
+        if hi_t < sub_m:
+            return c * t
+        if sub_c == 1:
+            return g * _safe_mod(t, sub_m)
+        return g * _safe_mod(sub_c * t, sub_m)
+
+    return _safe_mod(R, M)
+
+
 def _compute_coordinates_uncached(
     size: Sequence[sympy.Expr],
     stride: Sequence[sympy.Expr],
@@ -370,163 +599,76 @@ def _compute_coordinates_uncached(
         f"compute_coordinates requires concrete sizes, got {size}"
     )
 
-    # Python ints keep the comparisons below (n^2 of them here, and n per term in
-    # add_term) out of sympy's relational machinery; sympy arithmetic in the
-    # output expressions promotes them back.
     size = [int(s) for s in size]
     stride = [int(s) for s in stride]
 
-    # Convert ModularIndexing expressions to sympy.Mod before processing
     index = convert_modular_indexing(index)
     repeat_info = find_repeat_vars([index], var_ranges)
     if repeat_info_out is not None:
         repeat_info_out.update(repeat_info)
 
-    # find stride immediately strictly larger that dim stride
+    # Filter out variables that are not iteration variables of this operation
+    # (e.g. outer while-loop offsets or dynamic size symbols), and variables
+    # with a trivial range (<= 1), which can only take the value 0.  For
+    # symbolic ranges we cannot tell, so they are kept.
+    vars_in_index = index.free_symbols
+    vars_to_zero = set()
+    for s in vars_in_index:
+        if s in var_ranges:
+            range_val = var_ranges[s]
+        elif indirect_sizes is not None and s in indirect_sizes:
+            range_val = indirect_sizes[s]
+        else:
+            vars_to_zero.add(s)
+            continue
+        if _is_concrete_int(range_val) and int(range_val) <= 1:
+            vars_to_zero.add(s)
+    if vars_to_zero:
+        index = index.xreplace({s: 0 for s in vars_to_zero})
+
+    # Check for reversed traversal on iteration variables
+    vars_in_index = index.free_symbols
+    for var in vars_in_index:
+        if var in repeat_info:
+            continue
+        if var in var_ranges:
+            term = index.xreplace(dict.fromkeys(vars_in_index - {var}, 0))
+            extracted, _ = _extract_affine_terms(term)
+            for coeff, t in extracted:
+                if t == var and coeff < 0:
+                    raise Unsupported(
+                        f"index term for {var} runs backwards: "
+                        "reversed traversal of a tensor dimension cannot "
+                        "be expressed as a device coordinate"
+                    )
+
     n = len(size)
-    next_stride: list[int | float] = [math.inf] * n
-    for i in range(n):
-        for j in range(n):
-            # n^2 is ok since n is small
-            if next_stride[i] > stride[j] and stride[j] > stride[i] and size[j] > 1:
-                next_stride[i] = stride[j]
-    # compute coordinate expressions
     coordinates = [sympy.S.Zero] * n
 
-    def add_term(var, step, limit):
-        # Concretize step and limit for comparison logic only.  The symbolic
-        # ``step`` and ``limit`` are still used in the coordinate *output*
-        # expressions (``var * step // st``), preserving symbolic output.
-        # TODO(issue#1373): replace with sympy predicates to avoid concretization.
-        concrete_step = _concretize_for_cmp(step)
-        concrete_limit = _concretize_for_cmp(limit)
-
-        # ``limit`` below ``step`` means the access walks the dimension
-        # backwards (the index carries a term like ``N - 1 - var``, as
-        # ``prims.rev`` / ``Tensor.flip`` produces).  Every dim test below
-        # compares a non-negative ``stride[dim]`` against ``concrete_step``, so
-        # a descending term can match no dim and would be dropped from
-        # ``coordinates`` entirely -- silently yielding the coordinate for
-        # ``var == 0`` at every iteration.  Device coordinates can only ascend,
-        # so reject it loudly instead (see issue #3558).
-        #
-        # Testing ``limit - step`` rather than ``step``'s sign isolates the
-        # direction from any additive constant folded into both: for a term
-        # ``a*var + b`` over range ``R``, ``limit - step == a*(R - 1)``, so the
-        # comparison sees ``a``'s sign alone.
-        if concrete_limit < concrete_step:
-            raise Unsupported(
-                f"index term for {var} runs backwards (step {step}, limit "
-                f"{limit}): reversed traversal of a tensor dimension cannot "
-                f"be expressed as a device coordinate"
-            )
-
-        # find primary dim with largest stride less than or equal to step
-        primary_stride = 0
-        primary_dim = -1
-        for dim in range(n):
-            if size[dim] == 1:
-                continue  # ignore dim with size 1
-            st = stride[dim]
-            if st <= concrete_step and st > primary_stride:
-                # found candidate primary dim
-                primary_stride = st
-                primary_dim = dim
-            elif st > concrete_step and st < concrete_limit:
-                # var range intersects dim, add term
-                if next_stride[dim] < concrete_limit:
-                    # var range overflows dim
-                    coordinates[dim] += var * step % next_stride[dim] // st
-                else:
-                    coordinates[dim] += var * step // st
-        # add term for primary dim
-        if primary_stride > 0:
-            if next_stride[primary_dim] < concrete_limit:
-                coordinates[primary_dim] += (
-                    # var range overflows primary dim
-                    var * step % next_stride[primary_dim] // primary_stride
-                )
-            else:
-                coordinates[primary_dim] += var * step // primary_stride
-
-    vars = index.free_symbols
-    offset = index.xreplace(dict.fromkeys(vars, 0))
+    # Peel constant offset positionally if present
+    vars_set = index.free_symbols
+    offset = index.xreplace(dict.fromkeys(vars_set, 0))
     if offset > 0:
         index = index - offset
-        # A concrete offset is decomposed positionally so a padded layout does
-        # not leak a modular residual onto the stick coordinate (see
-        # _decompose_constant_offset).  Symbolic offsets, or an offset that
-        # cannot be fully peeled, fall back to add_term's original behavior.
         handled = _decompose_constant_offset(offset, size, stride, coordinates)
         if not handled:
-            add_term(var=offset, step=sympy.S.One, limit=sympy.oo)
+            index = index + offset
 
-    for var in vars:
-        # Skip symbols that are not loop variables (e.g. size symbols
-        # injected by dynamic shapes that appear in the index expression
-        # but are not iteration variables).
-        if var not in var_ranges:
-            # Indirect index variables (tmp0/indirect0) are not loop vars.
-            # Skip if indirect_sizes not provided — allows pre-scheduler
-            # code that doesn't yet support indirect access to proceed.
-            if indirect_sizes is not None and var in indirect_sizes:
-                range_val = indirect_sizes[var]
-            elif indirect_sizes is not None:
-                raise Unsupported(
-                    f"indirect symbol {var} not found in indirect_sizes {indirect_sizes}"
-                )
-            else:
-                continue
-        else:
-            range_val = var_ranges[var]
+    active_dims = []
+    for dim in range(n):
+        if size[dim] > 1 and stride[dim] > 0:
+            active_dims.append((stride[dim], dim))
+    active_dims.sort(key=lambda x: x[0], reverse=True)
 
-        # Skip vars with trivial range.  For symbolic ranges we cannot
-        # statically determine triviality, so we assume they are non-trivial.
-        if isinstance(range_val, (int, sympy.Integer)) and int(range_val) <= 1:
-            continue
+    curr_expr = index
+    last_stride: int | None = None
 
-        if var in repeat_info:
-            info = repeat_info[var]
-            if info["kind"] == "mod":
-                add_term(var=info["node"], step=sympy.S.One, limit=info["modulus"])
-            elif info["kind"] == "mul_mod":
-                coeff = info["coeff"]
-                add_term(var=info["node"], step=coeff, limit=coeff * info["modulus"])
-            elif info["kind"] == "mixed_radix":
-                for digit in info["digits"]:
-                    add_term(
-                        var=digit["node"],
-                        step=digit["coeff"],
-                        limit=digit["coeff"] * digit["modulus"],
-                    )
-            continue
+    for st, dim in active_dims:
+        if last_stride is not None and last_stride != st:
+            curr_expr = _bound_aware_mod(curr_expr, last_stride, var_ranges)
+        coordinates[dim] += _bound_aware_div(curr_expr, st, var_ranges)
+        last_stride = st
 
-        # isolate current var
-        term = index.xreplace(dict.fromkeys(vars - {var}, 0))
-
-        mods_with_var = [m for m in term.atoms(sympy.Mod) if m.has(var)]
-        if len(mods_with_var) > 1:
-            raise Unsupported(
-                f"variable {var} (range {range_val}) appears in multiple Mod "
-                f"expressions {mods_with_var} and cannot be mapped to coordinates."
-            )
-
-        # compute index({var=1}) and index({var=var_ranges[var]})
-        step = term.xreplace({var: 1})
-        limit = term.xreplace({var: range_val})
-        if sympy.sympify(step).is_positive and term == var * step:
-            # A positive linear term reaches step * (range_val - 1), not
-            # step * range_val. Keep an exclusive upper bound for add_term's
-            # strict comparisons so a value exactly at a boundary still
-            # produces the required modulo and carry. Other expressions keep
-            # the existing bound; their last value need not be their maximum.
-            limit = step * (range_val - 1) + 1
-
-        add_term(var=var, step=step, limit=limit)
-
-    # NOTE: indirect_access_subs substitution is NOT applied here. It is deferred to
-    # after align_tensors() so that indirect symbols are decomposed as regular variables.
-    # The substitution is applied in simplify_op_spec() after align_tensors completes.
     return coordinates
 
 
