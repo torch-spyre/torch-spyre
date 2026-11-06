@@ -140,6 +140,7 @@ from torch_spyre._inductor.constants import (
 
 from torch_spyre._inductor import config
 from torch_spyre._inductor.logging_utils import get_inductor_logger, warn_once
+from torch_spyre._inductor.loop_facts import counted_loop_path, enclosing_loops
 from torch_spyre._inductor.loop_info import (
     CoarseTileInfo,
     LoopCarryRecord,
@@ -294,6 +295,25 @@ def _is_loop_carry_storage(op: Any) -> bool:
     return isinstance(record, LoopCarryRecord) and record.storage_name == op.get_name()
 
 
+def _loop_carry_mutation_target(
+    op: Operation, op_by_name: Mapping[str, Operation]
+) -> Optional[str]:
+    """The loop-carry storage ``op`` writes in place, if any."""
+    layout = getattr(op, "layout", None)
+    if not isinstance(op, ComputedBuffer) or not isinstance(
+        layout, MutationLayoutSHOULDREMOVE
+    ):
+        return None
+    name = layout.get_buffer().get_name()
+    record = getattr(op_by_name.get(name), "_loop_carry_record", None)
+    if not isinstance(record, LoopCarryRecord) or name not in (
+        record.storage_name,
+        record.update_name,
+    ):
+        return None
+    return record.storage_name
+
+
 def _collective_stage_storage_is_private(
     graph: GraphLowering,
     producer: Operation,
@@ -352,7 +372,6 @@ def _coarse_tile_loop_trip_count(op: Any) -> int:
     """
     if not _is_coarse_tiled(op):
         return 1
-    loop_info = op.loop_info
 
     def _resolved(c) -> int:
         try:
@@ -360,7 +379,9 @@ def _coarse_tile_loop_trip_count(op: Any) -> int:
         except (TypeError, ValueError):
             return 1
 
-    return max(1, math.prod(_resolved(c) for c in loop_info.loop_count))
+    return max(
+        1, math.prod(_resolved(level.trip_count) for level in enclosing_loops(op))
+    )
 
 
 @dataclass(frozen=True)
@@ -418,11 +439,12 @@ class DrainPlan:
 
 
 def _access_group_path(op: Operation) -> tuple[int, ...]:
-    """The op's counted-loop group path, mirroring utils.group_path exactly."""
+    """The op's counted-loop group path; an extern kernel runs once, so ``()``.
 
-    if isinstance(op, ExternKernel):
-        return ()
-    return tuple(getattr(getattr(op, "loop_info", None), "loop_group_id", ()) or ())
+    The same answer as ``scratchpad.utils.counted_loop_group_path``; both are
+    kept as named entry points for their callers.
+    """
+    return counted_loop_path(op)
 
 
 def _is_reinterpret_output_entry(entry: Any) -> bool:
@@ -3582,6 +3604,21 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         )
         self._stage_collective_outputs(graph, allocation, accepted_lx_relayouts)
         log_solver_decisions(graph, allocation)
+        self._warn_spilled_carries(allocation)
+
+    def _warn_spilled_carries(self, allocation: Sequence[Any]) -> None:
+        """Warn for each carry whose extra writers all had an ownership edge
+        but which the solve still left in HBM."""
+        carry_writers = getattr(self, "_carry_writers", {})
+        for buffer in allocation:
+            writers = carry_writers.get(buffer.name)
+            if writers and buffer.address is None:
+                logger.warning(
+                    "loop carry %s with writers %s spilled to HBM: %s",
+                    buffer.name,
+                    ", ".join(writers),
+                    buffer.spill_reason or "not chosen by the solve",
+                )
 
     def _stage_collective_outputs(
         self,
@@ -4317,6 +4354,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 continue
             if residency_by_buf.get(record.storage_name) is None:
                 carry_update_edges[record.update_name] = edge
+        self._add_carry_writer_edges(
+            graph, op_by_name, prep_cache, residency_by_buf, carry_update_edges
+        )
 
         input_clone_matches: dict[str, dict[str, list[tuple[int, int]]]] = {}
         # Consumer op name -> input clones for which it is the last reader, and so
@@ -4628,35 +4668,94 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             return None
         if record.update_name != update_op.get_name():
             return None
-        storage_op = op_by_name.get(record.storage_name)
+        return CoOptimizingAllocator._carry_writer_edge(
+            update_op, record.storage_name, op_by_name, prep_cache, graph=graph
+        )
+
+    def _add_carry_writer_edges(
+        self,
+        graph: GraphLowering,
+        op_by_name: dict[str, Operation],
+        prep_cache: dict,
+        residency_by_buf: dict[str, Optional[str]],
+        carry_update_edges: dict[str, ResidencyEdge],
+    ) -> None:
+        """Give each other writer of a carry, e.g. the copy-back of an
+        all_reduce_ into the loop result, the storage's ownership edge.
+
+        A writer without one leaves the storage in HBM and drops every edge
+        on it. Records the writers of each storage in ``_carry_writers``.
+        """
+        self._carry_writers: dict[str, list[str]] = {}
+        for writer in graph.operations:
+            storage_name = _loop_carry_mutation_target(writer, op_by_name)
+            if storage_name is None or writer.get_name() in carry_update_edges:
+                continue
+            if residency_by_buf.get(storage_name) is not None:
+                continue
+            edge = self._carry_writer_edge(
+                writer, storage_name, op_by_name, prep_cache, graph=graph
+            )
+            if edge is not None:
+                carry_update_edges[writer.get_name()] = edge
+                self._carry_writers.setdefault(storage_name, []).append(
+                    writer.get_name()
+                )
+                continue
+            logger.warning(
+                "loop carry %s stays in HBM: its writer %s has no ownership edge",
+                storage_name,
+                writer.get_name(),
+            )
+            # Warned here, so _warn_spilled_carries must not warn again.
+            self._carry_writers.pop(storage_name, None)
+            residency_by_buf[storage_name] = "loop carry writer ownership unavailable"
+            for name in [
+                name
+                for name, edge in carry_update_edges.items()
+                if edge.buf_name == storage_name
+            ]:
+                del carry_update_edges[name]
+
+    @staticmethod
+    def _carry_writer_edge(
+        writer: Operation,
+        storage_name: str,
+        op_by_name: dict[str, Operation],
+        prep_cache: dict,
+        *,
+        graph: GraphLowering | None = None,
+    ) -> Optional[ResidencyEdge]:
+        """The ownership edge for ``writer``'s write through carry ``storage_name``."""
+        storage_op = op_by_name.get(storage_name)
         if storage_op is None:
             return None
         storage_write = next(
             (
                 dep
                 for dep in op_read_writes(storage_op).writes
-                if dep.name == record.storage_name and isinstance(dep, MemoryDep)
+                if dep.name == storage_name and isinstance(dep, MemoryDep)
             ),
             None,
         )
-        update_write = next(
+        write = next(
             (
                 dep
-                for dep in op_read_writes(update_op).writes
-                if dep.name == record.update_name and isinstance(dep, MemoryDep)
+                for dep in op_read_writes(writer).writes
+                if dep.name == writer.get_name() and isinstance(dep, MemoryDep)
             ),
             None,
         )
-        if storage_write is None or update_write is None:
+        if storage_write is None or write is None:
             return None
         return ResidencyEdge(
-            buf_name=record.storage_name,
+            buf_name=storage_name,
             parent_op=storage_op,
-            consumer_op=update_op,
+            consumer_op=writer,
             write_dep=storage_write,
-            read_deps=(update_write.rename({record.update_name: record.storage_name}),),
+            read_deps=(write.rename({writer.get_name(): storage_name}),),
             prep_cache=prep_cache,
-            local_read_geometry=local_lx_read_geometry(graph, storage_op, update_op)
+            local_read_geometry=local_lx_read_geometry(graph, storage_op, writer)
             if graph is not None
             else None,
         )
