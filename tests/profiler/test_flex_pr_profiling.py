@@ -1,4 +1,4 @@
-# Copyright 2025 The Torch-Spyre Authors.
+# Copyright 2026 The Torch-Spyre Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,16 +18,35 @@ Flex owns the runtime, memory and telemetry code that the Spyre profiler
 depends on (timestamp calibration, AIUPTI activity collection). A Flex change
 can therefore break profiling without touching any torch-spyre code.
 
-This module profiles one small matmul workload and validates the Flex-coupled
-behaviour of the resulting trace. It is selected by the ``integration`` label
-(and ``regression``/``trunk``) in ``test_flex_pr_profiling_config.yaml``, the
-tier that the Spyre CI ``trigger-pr-validation`` run executes for a Flex PR.
+Placeholder tests
+-----------------
+These tests are temporary placeholders. Their purpose is to establish and
+verify the mechanism that runs torch-spyre tests on every Flex PR (the Flex PR
+integration automation): that a Flex PR run reaches torch-spyre, selects this
+config, executes the tests on Spyre hardware, and reports a result that can
+fail the run. They will be replaced with dedicated Flex-profiling test cases
+once the mechanism is confirmed to work.
 
-Unlike the tests in ``test_spyre_profiler.py``, these tests are deliberately
-not gated by ``@pytest.mark.requires_spyre_profiler``. That marker skips
-silently unless ``USE_SPYRE_PROFILER=1`` is exported at run time, and a silent
-skip on a Flex PR would read as a pass. Here a missing device, or a profiler
-that produces no device events, is a hard failure.
+Duplication with ``test_spyre_profiler.py``
+-------------------------------------------
+``_find_shifted_kernel_timestamps`` and the matmul workload are intentionally
+copied from ``TestSpyreProfiler`` rather than shared, and two of the tests
+mirror ``test_kernel_timestamp_after_cpu_dispatch`` and
+``test_no_zero_timestamp_or_duration``. Because this file is a placeholder that
+will be replaced, a shared helper would add coupling that is removed again
+later. The copy is also kept self-contained on purpose: the existing tests are
+gated by ``@pytest.mark.requires_spyre_profiler``, which skips silently unless
+``USE_SPYRE_PROFILER=1`` is set at run time, and a silent skip on a Flex PR
+would read as a pass. Here a missing device, or a profiler that produces no
+device events, is a hard failure, so a broken workflow cannot go unnoticed.
+
+Selection
+---------
+Selected only by the ``integration`` label in
+``test_flex_pr_profiling_config.yaml``, the tier that the Spyre CI
+``trigger-pr-validation`` run executes for a Flex PR. It is deliberately not
+labelled ``regression`` or ``trunk``, so it does not run on runners that may
+lack the Spyre device or the profiler extension.
 """
 
 import json

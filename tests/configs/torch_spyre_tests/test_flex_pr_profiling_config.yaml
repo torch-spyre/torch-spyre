@@ -1,9 +1,12 @@
 test_suite_config:
-  # Selected by the "integration" tier, which is what a Flex PR run executes
-  # (preset trigger-pr-validation: torch-spyre-dev -> smoke + integration).
-  # "regression" and "trunk" keep it in the wider runs. See the module docstring
-  # in tests/profiler/test_flex_pr_profiling.py.
-  labels: [regression, integration, trunk]
+  # Only the "integration" tier: it is what the Spyre CI trigger-pr-validation
+  # preset runs for a Flex PR (torch-spyre-dev -> smoke + integration).
+  # Deliberately not labelled regression or trunk: this test fails, rather than
+  # skips, when the Spyre device or profiler is absent, so it must not be pulled
+  # into runs on runners that may lack either.
+  # Placeholder test used to establish the Flex PR automation mechanism; see the
+  # module docstring in tests/profiler/test_flex_pr_profiling.py.
+  labels: [integration]
   files:
     - path: ${TORCH_DEVICE_ROOT}/tests/profiler/test_flex_pr_profiling.py
       unlisted_test_mode: mandatory_success
