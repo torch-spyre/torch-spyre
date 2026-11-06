@@ -116,7 +116,7 @@ conv2d_direct_lowering: bool = os.environ.get("SPYRE_CONV2D_DIRECT", "0") == "1"
 # buffer in addition to its input buffers. Off by default until the
 # interaction with downstream span limits is fully validated.
 ndo_matmul_output_reorder: bool = (
-    os.environ.get("SPYRE_NDO_MATMUL_OUTPUT_REORDER", "0") == "1"
+    os.environ.get("SPYRE_NDO_MATMUL_OUTPUT_REORDER", "1") == "1"
 )
 
 # For a strided (stride>1) direct-lowered conv2d, forbid splitting the output
@@ -421,6 +421,15 @@ def _positive_int_env(name: str) -> int | None:
 # spyre-inference's ``threading_config`` reads for the same budget. A value
 # that is not a positive integer (unset, ``0``, ``-2``, ``abc``) means None.
 num_cpus: int | None = _positive_int_env("SPYRE_NUM_CPUS")
+
+
+# When positive, use this value as a random seed for NDO and pick a random
+# non-stick dim to promote rather than always the largest. Set to 0 to use
+# the heuristic instead. Defaults to 1 (on).
+_ndo_seed_raw = os.environ.get("STRESS_TEST_NDO", "1").strip()
+ndo_stress_test_seed: int | None = (
+    int(_ndo_seed_raw) if _ndo_seed_raw.isdigit() and int(_ndo_seed_raw) > 0 else None
+)
 
 
 def get_cpu_count() -> int:
