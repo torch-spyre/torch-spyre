@@ -19,8 +19,11 @@
     python3 tools/frontend_timing/summarize.py /tmp/records
     python3 tools/frontend_timing/summarize.py /tmp/records --passes --csv out.csv
 
-Medians across samples. Frontend time is the compile region minus the backend
-invocations inside it. Records that did not finish a compile are reported and excluded.
+The minimum across samples, not the median: interference on a shared pod only makes a
+compile slower, so the fastest sample is the least contaminated one. Every sample stays
+in the rows file, so a median is recoverable. Frontend time is the compile region minus
+the backend invocations inside it. Records that did not finish a compile are reported
+and excluded.
 """
 
 from __future__ import annotations
@@ -51,9 +54,6 @@ GRAPH_PIPELINE = "pipeline:CustomPreSchedulingPasses"
 #: tripped it; the tests, which need whole names, did.
 GRAPH_PASS_PREFIX = GRAPH_PIPELINE.replace("pipeline:", "pass:") + ":"
 
-#: The FX-graph pipeline whose ``input_nodes`` is an FX node count. The node pipelines
-#: reuse that key for a *scheduler* node count, so taking a max over every pipeline
-#: would mix two different units into one metric.
 #: The FX-graph pipeline whose ``input_nodes`` is an FX node count, read for
 #: ``graph_nodes``. ``CustomPreGradPasses`` returns before opening its region
 #: unless a node carries ``meta["val"]`` on a Spyre device, and the pre-grad

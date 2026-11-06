@@ -9,7 +9,7 @@ The instrumentation is `torch_spyre/_inductor/timing_recorder.py`, enabled by
 
 ## Running it
 
-One point, three cold samples plus a discarded warmup:
+One point, three cold samples:
 
 ```bash
 python3 tools/frontend_timing/run_sweep.py --workload mlp -p seq_len=128 -p layers=2 \
@@ -37,16 +37,17 @@ tier.
 
 | Tier | Points | One compile each | At `--samples 3` | Meant to answer |
 |---|--:|--:|--:|---|
-| `pr` | 7 | 3.8 min | 15 min | did a change break a compile, or move it grossly |
-| `nightly` | 26 | 17.4 min | 70 min | the scaling series at moderate sizes |
-| `weekly` | 50 | 47.7 min | 191 min | everything: long sequences, depth 8, the A/B arms |
+| `pr` | 7 | 3.8 min | 14 min | did a change break a compile, or move it grossly |
+| `nightly` | 26 | 17.4 min | 78 min | the scaling series at moderate sizes |
+| `weekly` | 50 | 47.7 min | 170 min | everything: long sequences, depth 8, the A/B arms |
 
-Measured on one card, 2026-10-12, by running `--tier weekly --samples 0` and adding up
-the per-point times the driver prints. `--samples 3` is four compiles per point, since
-the warmup is discarded. Re-measure after a rebase rather than trusting these: the cost
-sits in the passes, and the passes change.
+The one-sample column was measured on one card, 2026-10-12, by running
+`--tier weekly --samples 0` and adding up the per-point times the driver prints. The
+`--samples 3` column is three compiles per point, measured over repeated runs: `pr` 10
+runs, `nightly` 20 runs (median 78, range 64-100), `weekly` 1 run. Re-measure after a
+rebase rather than trusting these: the cost sits in the passes, and the passes change.
 
-**`weekly` does not fit one job.** 191 minutes is past the 120-minute ceiling on the
+**`weekly` does not fit one job.** 170 minutes is past the 120-minute ceiling on the
 one-card runners, so it has to shard. Shard by family, which is both the natural seam and
 where the cost is concentrated: `elementwise_chain` is 15 minutes of the 48 on its own
 (`ops=1024` alone is 11), `granite_layer` another 14 across 11 points, and the remaining
@@ -87,7 +88,11 @@ First hit wins: `--out`, then `$SPYRE_FRONTEND_TIMING_RECORDS`, then `records/` 
 - **One process per sample.** `TORCHINDUCTOR_CACHE_DIR` is read at import, so only a
   fresh process gets a cache that never held the graph. Each child gets a fresh directory
   and `TORCHINDUCTOR_FORCE_DISABLE_CACHES=1`.
-- **A discarded warmup**, written to `warmup/`, which the summarizer does not read.
+- **No discarded warmup.** Every sample is already a fresh process with a fresh
+  Inductor cache, so a warmup has nothing to warm: over 52 points it ran at 1.02x the
+  median sample and cost 48 of 193 minutes. Its one real job, stopping a point that
+  cannot compile at all, moved to the first sample. `existing_records` still reads a
+  `warmup/` directory so a sweep written by an older driver stays readable.
 - **The minimum across samples**, not the median. Co-tenant interference on a shared
   pod only ever makes a compile slower -- measured at 11% typical and 63% worst spread
   across three samples of one point -- so the fastest sample is the least contaminated
@@ -217,6 +222,42 @@ not accept, if a point has no `tiers`, or if a registered family is never swept.
    counting is not charged to the work.
 2. Nothing in the summarizer changes for a new `stage:` or `pass:` region, both collected
    by prefix, or for a new counter. Add code only for something that is neither.
+
+## How this harness could lie
+
+A timing harness fails by producing a plausible wrong number rather than an error.
+These are the places this one could, and what it does about each. They are here
+rather than only in a review thread because every one of them was a real bug.
+
+- **One compile thread.** Above one, the per-kernel backend region runs in a pool
+  worker that does not share the recorder, so its region is missing from the record
+  and the frontend subtraction silently absorbs the backend. `TORCHINDUCTOR_COMPILE_THREADS=1`
+  is set for every child.
+- **The backend event is matched exactly, not by suffix.** Upstream has a
+  `dynamo_timed` phase of its own called `backend_compile` which *encloses* the Spyre
+  region, so a suffix match drives every frontend figure negative.
+- **A region entered inside itself is counted once.** Summing inclusive time per name
+  read 71% over on `GraphLowering.run` and 184% on `_recursive_joint_graph_passes`.
+  Self time is not a substitute: it is right only where the nested entry is the
+  region's only child. `by_prefix` counts the outermost entry per name.
+- **The identity check ignores per-record config and compares an arm only against its
+  arm.** `timing_out` is each sample's own file, and an arm exists to change the
+  config, so comparing every record against every other rejected every multi-sample
+  and every weekly sweep. Both were found on hardware; synthetic-record tests passed
+  either way.
+- **Counts and clocks are separated by name.** Reproducibility is why counters are
+  read, and it holds only of counts: on one sweep every model-size count was identical
+  across samples while `extract_ns` spread 14% and `solver_wall_s` 64%. Hence
+  `duration.*` beside `counter.*`, and rows schema `/2`.
+- **A time-bound solve is flagged.** A `FEASIBLE` solve returns whichever plan it had
+  at its limit, so its downstream counts vary and it cannot report a harder solve as
+  more time. `solve_time_bound` marks it rather than leaving it as noise.
+- **Exclusion reads the driver's verdict, not event errors.** The recorder stamps an
+  error on any region an exception passed through, including ones a caller swallows,
+  so error-based exclusion dropped successful compiles.
+- **The writer owns the schema name.** `scaling.py` kept its own copy of it and
+  refused every rows file the summarizer wrote after the `/2` bump, while the tests
+  passed because they built rows at `/1`. It imports the constant now.
 
 ## What is not covered
 

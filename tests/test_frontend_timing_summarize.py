@@ -35,6 +35,14 @@ _SUMMARIZE = os.path.join(
 
 
 def _load_module():
+    """Load the tool by path, deliberately.
+
+    ``tools/`` is not a package and ``tools/frontend_timing/`` has no
+    ``__init__.py``, so an ordinary import would make it an implicit namespace
+    package whose name collides with anything else called ``summarize``. Loading
+    by path keeps the tool importable from a test without putting ``tools`` on
+    ``sys.path`` for the rest of the suite.
+    """
     spec = importlib.util.spec_from_file_location("fts_summarize", _SUMMARIZE)
     module = importlib.util.module_from_spec(spec)
     # Registered before exec: @dataclass resolves its own module out of sys.modules.
@@ -865,3 +873,72 @@ class TestIdentityConflicts:
         assert summarize_mod.main([str(tmp_path)]) == 1
         assert "refusing to summarize" in capsys.readouterr().err
         assert summarize_mod.main([str(tmp_path), "--allow-mixed"]) == 0
+
+
+#: The recorder module, as text. Read rather than imported: `torch_spyre` pulls in
+#: `_C`, and this suite is labelled `unit, regression` precisely so it runs on a
+#: runner with no built extension. Importing here would make the whole file need a
+#: card -- a worse outcome than the coupling these tests exist to pin.
+_RECORDER_SRC = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "torch_spyre",
+    "_inductor",
+    "timing_recorder.py",
+)
+
+
+class TestRecorderSeam:
+    """The recorder names this tool hardcodes, checked against the recorder.
+
+    `summarize.py` matches event names as string literals and `run_sweep.py`
+    reaches into the recorder's module surface. Neither coupling is visible to the
+    type checker, so a rename upstream would pass CI and surface as a silently
+    wrong number in a nightly sweep -- a frontend time that quietly absorbed the
+    backend, or a metric that stopped being produced at all.
+    """
+
+    @staticmethod
+    def _recorder_text():
+        with open(_RECORDER_SRC) as fh:
+            return fh.read()
+
+    def test_driver_only_uses_recorder_names_that_exist(self):
+        text = self._recorder_text()
+        for name in (
+            "def set_run_meta",
+            "def append_run_meta",
+            "def stage",
+            "def dump_and_finalize",
+            "def is_enabled",
+            "RECORDER",
+            "RECORDER_VERSION",
+            "run_meta",
+        ):
+            assert name in text, f"timing_recorder no longer provides {name!r}"
+
+    def test_event_names_the_summarizer_matches_are_well_formed(self):
+        # The three shapes the recorder documents. A name that stopped matching one
+        # of these would make the corresponding metric vanish rather than error.
+        assert summarize_mod.BACKEND_EVENT.startswith("stage:")
+        assert summarize_mod.GRAPH_PIPELINE.startswith("pipeline:")
+        assert summarize_mod.FX_PIPELINE.startswith("pipeline:")
+        assert summarize_mod.GRAPH_PASS_PREFIX.startswith("pass:")
+        assert summarize_mod.GRAPH_PASS_PREFIX.endswith(":")
+        # Matched exactly, never by suffix: upstream has a `dynamo_timed` phase also
+        # called backend_compile which *encloses* the Spyre region, so a suffix match
+        # drives every frontend figure negative.
+        assert summarize_mod.BACKEND_EVENT.count(":") == 2
+
+    def test_backend_event_is_the_name_the_recorder_emits(self):
+        """Pin the literal to the recorder's own spelling of it.
+
+        The recorder may carry this as a constant; where it does, that is the source
+        of truth. Where it does not, the name appears only in the `stage(...)` call
+        that emits it, and this assertion is the only thing tying the tool to it.
+        """
+        text = self._recorder_text()
+        name = summarize_mod.BACKEND_EVENT
+        assert name in text or "BACKEND_COMPILE_EVENT" in text, (
+            f"{name!r} appears nowhere in timing_recorder.py and no constant stands "
+            "in for it; the summarizer would silently stop finding the backend region"
+        )

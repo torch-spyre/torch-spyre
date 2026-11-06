@@ -59,7 +59,8 @@ class Series:
     arm: str
     axis: str
     fixed: dict[str, Any]
-    #: axis value -> median metric value, per metric name.
+    #: axis value -> metric value, per metric name. The value is the minimum
+    #: across that point's samples, which is what the summarizer reports.
     samples: dict[Any, dict[str, float]]
 
     @property
