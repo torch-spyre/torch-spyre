@@ -1824,7 +1824,7 @@ def is_spyre_layout(layout: Layout):
     return layout.device.type == DEVICE_NAME
 
 
-def _get_layout(
+def _get_stl(
     graph: GraphLowering, node: IRNode | Layout | SpyreTensorLayout
 ) -> SpyreTensorLayout | None:
     if isinstance(node, ComputedBuffer) and isinstance(
@@ -1851,26 +1851,22 @@ def _get_layout(
 
 
 def is_padded(graph: GraphLowering, node: IRNode | Layout | SpyreTensorLayout) -> bool:
-    layout = _get_layout(graph, node)
-    if layout is None:
+    stl = _get_stl(graph, node)
+    if stl is None:
         return False
 
-    total_size = math.prod(layout.device_size)
-    if not layout.valid_elements:
-        # Unknown valid extents (a layout built without valid_elements). Its
-        # device elements can only include padding when they outnumber the
-        # tensor's; without the tensor to count, assume padding.
+    total_size = math.prod(stl.device_size)
+    if not stl.valid_elements:
+        # TODO: the constructor that creates empty valid_elements is
+        # being deprecated. Remove this if afterwards.
         numel = _host_numel(node)
         return numel is None or numel < total_size
 
-    total_valid_elems = math.prod(layout.valid_elements.values())
+    total_valid_elems = math.prod(stl.valid_elements.values())
     return total_valid_elems < total_size
 
 
-def _host_numel(node: IRNode | Layout | SpyreTensorLayout) -> int | None:
-    """The tensor's element count, when node has a static host size."""
-    if isinstance(node, SpyreTensorLayout):
-        return None
+def _host_numel(node: IRNode | Layout) -> int | None:
     size = node.size if isinstance(node, Layout) else node.get_size()
     numel = sympy_product(size)
     return int(numel) if numel.is_Integer else None
@@ -1919,7 +1915,7 @@ def track_padding_value(graph: GraphLowering) -> None:
                 buf = graph.get_buffer(dep.name)
                 while isinstance(buf, MutableBox):
                     buf = buf.data
-                stl = _get_layout(graph, buf)
+                stl = _get_stl(graph, buf)
                 buf_is_padded = is_padded(graph, buf) if stl is not None else False
                 if isinstance(buf, InputBuffer):
                     if dep.name not in tracer.buffer_range:
@@ -1976,7 +1972,7 @@ def track_padding_value(graph: GraphLowering) -> None:
                     and isinstance(target, InputBuffer)
                     and target_name not in tracer.buffer_range
                 ):
-                    target_layout = _get_layout(graph, target)
+                    target_layout = _get_stl(graph, target)
                     tracer.buffer_range[target_name] = (
                         _input_padding_range(target_layout)
                         if target_layout is not None and is_padded(graph, target)
@@ -2123,8 +2119,8 @@ def _record_mutated_input_padding(
     padding: dict[str, float] = {}
     for name in graph.graph_input_names:
         pad_set = tracer.buffer_range.get(name)
-        layout = _get_layout(graph, graph.get_buffer(name))
-        if pad_set is None or layout is None or not _can_record_padding(layout):
+        stl = _get_stl(graph, graph.get_buffer(name))
+        if pad_set is None or stl is None or not _can_record_padding(stl):
             continue
         if isinstance(pad_set, FiniteSet) and len(pad_set) == 1:
             (value,) = pad_set
