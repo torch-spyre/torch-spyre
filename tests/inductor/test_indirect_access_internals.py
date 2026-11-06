@@ -337,6 +337,35 @@ class TestDetectionHelpers(IndirectAccessTestCase):
 
 
 class TestIndirectAllocationBounds(IndirectAccessTestCase):
+    def _bounds(self, has_batch):
+        b, k, h = sympy.symbols("b k h")
+        mb, x, out = sympy.symbols("mb x out")
+        indices = _tensor_arg(True, [b, k, sympy.S.Zero], "indices")
+        indices.device_size = [4, 8, 32]
+        value_coords = [IndirectAccess(sympy.Symbol("indices")), sympy.Mod(h, 64)]
+        if has_batch:
+            value_coords.insert(0, b)
+        values = _tensor_arg(True, value_coords, "values")
+        if has_batch:
+            values.device_size = [4, 128, 64]
+        spec = _op("identity")
+        spec.args = [indices, values]
+        if has_batch:
+            spec.iteration_space = {b: (4, 1)}
+        mapping = {b: mb, k: x, h: out}
+        return [
+            compute_indirect_max_dim_sizes(
+                1, dim, out, stride, 128, spec, mapping, {0}, {}, None
+            )
+            for dim, stride in ((mb, 2), (x, 1), (out, 0))
+        ]
+
+    def test_multi_axis_indices_do_not_add_table_dimensions(self):
+        self.assertEqual(self._bounds(False), [1, 1, -1])
+
+    def test_physical_batch_dimension_is_preserved(self):
+        self.assertEqual(self._bounds(True), [-1, 1, -1])
+
     def test_index_table_singleton_uses_per_trip_extent(self):
         row, width, visit = sympy.symbols("row width visit")
         mb, x, out = sympy.symbols("mb x out")
