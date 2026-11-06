@@ -51,6 +51,7 @@ from torch_spyre._inductor.cost_features import (
     _stamped_advances,
 )
 from torch_spyre._inductor.ir import FixedTiledLayout
+from torch_spyre._inductor.pass_utils import invalidate_op_read_writes
 
 
 class _FakeDep:
@@ -1535,6 +1536,9 @@ def test_operand_geometry_declines_an_indirect_bank_index(monkeypatch):
     op.get_read_writes = lambda: SimpleNamespace(
         reads=[rw.reads[0], bank], writes=rw.writes
     )
+    # The op now reads differently, in place: the extraction above is memoized
+    # on it (op_read_writes), so drop it as any in-place edit must.
+    invalidate_op_read_writes(op)
     feature = _features(monkeypatch, op, space, **kwargs)
     read = _read(feature, "arg1")
     with V.set_graph_handler(graph):
