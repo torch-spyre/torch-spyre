@@ -152,10 +152,20 @@ class RunWriter:
         return cls.fact_table.count_rows(client, db, where, params) > 0
 
     @classmethod
-    def _flush(cls, client, db: str, ident_rows: dict, fact_rows: list) -> int:
-        """Write the unknown identities and every fact row; returns the row count."""
+    def _flush(
+        cls, client, db: str, ident_rows: dict, fact_rows: list, scope=None
+    ) -> int:
+        """Write the unknown identities and every fact row; returns the row count.
+
+        `scope` is (where, params) naming this call's rows, so a batch that errors is only
+        resent when none of it was stored (the fact tables are plain MergeTree).
+        """
         cls.identity_table.insert_identities(client, ident_rows, db=db)
-        cls.fact_table.insert(client, fact_rows, db=db)
+        landed = None
+        if scope:
+            where, params = scope
+            landed = lambda: cls.fact_table.count_rows(client, db, where, params)  # noqa: E731
+        cls.fact_table.insert(client, fact_rows, db=db, landed=landed)
         return len(fact_rows)
 
     @staticmethod
@@ -365,7 +375,23 @@ class TestResultWriter(RunWriter):
         run_rows, superseded = cls._one_per_case(
             client, db, component, run_id, run_rows
         )
-        written = cls._flush(client, db, ident_rows, run_rows)
+        written = cls._flush(
+            client,
+            db,
+            ident_rows,
+            run_rows,
+            scope=(
+                f"{cls._FILE} AND {cls._ATTEMPT} >= {{attempt:UInt32}}",
+                {
+                    "component": component,
+                    "run_id": run_id,
+                    "sf": source_file,
+                    "attempt": attempt,
+                },
+            )
+            if source_file
+            else None,
+        )
         # Checked before any batch is written, so a type's second batch is not refused.
         landed = {
             t

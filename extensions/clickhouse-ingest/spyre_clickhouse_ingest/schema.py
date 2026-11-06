@@ -14,8 +14,10 @@
 
 """The v2 ClickHouse schema as classes: one class per table, sharing `Table`."""
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any, TypedDict
+
+from .batching import insert_chunks
 
 # The DDL's CHECK constraints, re-expressed: unreadable from the server at ingest
 # time. Keep in step with schema/10-functional-tests.sql and schema/20-artifacts.sql.
@@ -181,16 +183,27 @@ class Table:
 
     @classmethod
     def insert(
-        cls, client, rows: Sequence[Mapping[str, Any]], db: str | None = None
+        cls,
+        client,
+        rows: Sequence[Mapping[str, Any]],
+        db: str | None = None,
+        landed: Callable[[], int] | None = None,
     ) -> int:
-        """Insert dicts, ordering every row through the one column list."""
+        """Insert dicts, ordering every row through the one column list, in retried batches.
+
+        `landed` counts this call's rows already stored (see batching.insert_chunks).
+        """
         if not rows:
             return 0
         ordered = [cls.row(r) for r in rows]
-        client.insert(
-            cls.name, ordered, column_names=list(cls.columns), database=db or None
+        return insert_chunks(
+            client,
+            cls.name,
+            ordered,
+            list(cls.columns),
+            database=db or None,
+            already_landed=landed,
         )
-        return len(ordered)
 
     @classmethod
     def insert_identities(
