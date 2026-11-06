@@ -16,21 +16,19 @@
 
 Every other test of this feature stops somewhere: at a helper, at a synthetic
 cond graph, at ``generate_bundle`` with a mocked SDSC. This one compiles a
-``for_each_tile`` region over a marked-dynamic dimension and runs it.
+``for_each_tile`` region over a declared dimension and runs it.
 
-WHAT THIS CANNOT YET ASSERT, and the reason is a missing dependency rather
-than a gap in the tests. The headline claim is one binary serving a range of
-sizes. That needs the varying tensor's HBM buffer reserved for the declared
-maximum, which is the max-strided reservation of #5179 and is not in this tree:
-there is no ``spyre_empty_reserved`` and ``.to()`` takes no ``dynamic=``.
-Without it a larger size is a fresh, differently sized allocation, so the layout
-guard sees a new layout and recompiles. That is safe, just not yet useful.
-
-So these assert what is assertable alone: the region compiles through the real
-pipeline, the symbolic count survives into the kernel, the emitted structure is
-the loop form the design specifies, and the numbers are right at the size it
-was compiled for. The multi-size no-recompile proof is the combined milestone
-with #5179 and belongs in that test.
+WHAT THIS ASSERTS. The headline claim is one binary serving a range of sizes.
+The tensor is declared with ``tensor.to("spyre", dynamic={0: {min, max,
+granularity}})`` (#5179), which reserves its HBM buffer at the declared maximum
+and keeps its ``SpyreTensorLayout`` fixed across resizes, so Dynamo sees one
+layout and does not recompile. The compiler builds the region's geometry at that
+maximum and the launch binds the logical size into the loop's dimension slot, so
+the trip count follows the size. ``TestOneBinaryServesTheRange`` resizes one
+declared tensor through the minimum, the maximum, a size above the one it was
+compiled at and a size below it, and asserts one graph, one kernel, right values
+at every size, and that the reserved rows above the logical size are never
+read.
 
 The range is declared with ``torch._check`` inside the traced function, and it
 stays there. The transfer call cannot carry it: passing ``min=``/``max=`` to
@@ -60,29 +58,39 @@ VERIFIED EMITTED BUNDLE, 6 Oct 2026, for the region below at 64 columns fp16::
 Every load-bearing detail of the design's bundle section is in that listing.
 The dimension parameter is last and is the only one carrying granularity and
 max_value. Its extract precedes the loop constants. The bound is the dimension
-and the step is a constant 64, with a lower bound of zero, so the device's
-``(ub - lb) / step`` is free and no division is authored anywhere. And the
-affine stride is 128, the PER-ROW stride: 64 columns of fp16 is 128 bytes, the
-tile stride is 8192, and 8192 / 64 = 128 because the loop variable counts rows
-rather than tiles.
+and the step is a constant 64, with a lower bound of zero, so the trip count is
+derived at dispatch and no division is authored anywhere. And the affine stride
+is 128, the PER-ROW stride: 64 columns of fp16 is 128 bytes, the tile stride is
+8192, and 8192 / 64 = 128 because the loop variable counts rows rather than
+tiles.
 """
 
+import os
 import unittest
 from functools import wraps
 
 import regex as re
 import torch
+from torch._dynamo.utils import counters
+from torch._inductor.utils import fresh_cache, run_and_get_code
 
 import torch_spyre  # noqa: F401  registers the "spyre" device
-from torch._inductor.utils import run_and_get_code
+import torch_spyre._inductor.config as spyre_config
+from torch_spyre._C import get_spyre_tensor_layout
 from torch_spyre._inductor.wsr import for_each_tile
 from torch_spyre.constants import DEVICE_NAME
+from torch_spyre.execution.kernel_cache import get_cache_root_dir
 
 ROWS = 256
 COLS = 64
 TILE = 64
 MIN_ROWS = 64
 MAX_ROWS = 512
+SPEC = {"min": MIN_ROWS, "max": MAX_ROWS, "granularity": TILE}
+# The compile size first, then every kind of other size: the minimum (one
+# tile), the maximum, above the compile size (where hint-sized geometry was
+# measured wrong), and below it.
+SIZES = [ROWS, MIN_ROWS, MAX_ROWS, 448, 128]
 
 ATOL = 1e-2
 RTOL = 1e-2
@@ -118,6 +126,19 @@ def tiled_gelu(x):
     return out
 
 
+def _declare(x):
+    """Move a MAX_ROWS-row host tensor to the device with the declared range.
+
+    The transfer marks dim 0 dynamic itself (#5179), so no ``mark_dynamic`` here.
+    """
+    return x.to(DEVICE_NAME, dynamic={0: SPEC})
+
+
+def _kernel_cache_entries():
+    root = get_cache_root_dir()
+    return sum(os.path.isdir(os.path.join(root, d)) for d in os.listdir(root))
+
+
 class TestSymbolicLoopOnDevice(unittest.TestCase):
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -127,11 +148,11 @@ class TestSymbolicLoopOnDevice(unittest.TestCase):
 
     @staticmethod
     def _compile_and_run(rows=ROWS):
-        x = torch.randn(rows, COLS, dtype=torch.float16)
-        reference = torch.nn.functional.gelu(x.float())
+        x = torch.randn(MAX_ROWS, COLS, dtype=torch.float16)
+        reference = torch.nn.functional.gelu(x[:rows].float())
 
-        on_device = x.to(DEVICE_NAME)
-        torch._dynamo.mark_dynamic(on_device, 0)
+        on_device = _declare(x)
+        on_device.resize_((rows, COLS))
 
         compiled = torch.compile(tiled_gelu, backend="inductor", fullgraph=True)
         out, code = run_and_get_code(compiled, on_device)
@@ -185,14 +206,15 @@ class TestSymbolicLoopOnDevice(unittest.TestCase):
         )
 
 
-class TestItIsStillCorrectAtAnotherSize(unittest.TestCase):
-    """A second size, compiled separately.
+class TestOneBinaryServesTheRange(unittest.TestCase):
+    """The headline: one compiled graph and one kernel, right at every size.
 
-    Deliberately NOT asserting one binary: without the reservation of #5179 this
-    recompiles, and asserting otherwise would be asserting a bug. What it does
-    prove is that the geometry built from the declared maximum is correct at more
-    than one actual size, which is the half of the claim that does not need the
-    reservation.
+    One declared tensor, one compiled function, the sizes in SIZES in that
+    order. The compile happens at the first size. Every later size must be
+    served by the same graph (Dynamo counts graphs) and the same kernel (the
+    kernel cache holds one entry), with the right values, and the tensor's
+    device layout must not move, since a moved layout is what would make Dynamo
+    recompile and hide a size-specific kernel behind a green run.
     """
 
     def __init_subclass__(cls, **kwargs):
@@ -201,16 +223,51 @@ class TestItIsStillCorrectAtAnotherSize(unittest.TestCase):
             if name.startswith("test") and callable(value):
                 setattr(cls, name, _with_dynamo_reset(value))
 
-    def test_a_smaller_size(self):
-        out, reference, _code = TestSymbolicLoopOnDevice._compile_and_run(rows=128)
+    def test_one_graph_one_kernel_right_at_every_size(self):
+        counters.clear()
+        x = torch.randn(MAX_ROWS, COLS, dtype=torch.float16)
+        y = _declare(x)
+        layout = str(get_spyre_tensor_layout(y))
 
-        torch.testing.assert_close(out.cpu().float(), reference, atol=ATOL, rtol=RTOL)
+        with fresh_cache(), spyre_config.patch({"spyre_kernel_cache": True}):
+            compiled = torch.compile(tiled_gelu, backend="inductor", fullgraph=True)
+            for rows in SIZES:
+                if y.size(0) != rows:
+                    y.resize_((rows, COLS))
+                out = compiled(y).cpu().float()
+                self.assertEqual(
+                    str(get_spyre_tensor_layout(y)),
+                    layout,
+                    f"the device layout changed at {rows} rows",
+                )
+                torch.testing.assert_close(
+                    out,
+                    torch.nn.functional.gelu(x[:rows].float()),
+                    atol=ATOL,
+                    rtol=RTOL,
+                    msg=f"at {rows} rows",
+                )
+            self.assertEqual(counters["stats"]["unique_graphs"], 1)
+            self.assertEqual(_kernel_cache_entries(), 1)
 
-    def test_the_minimum_size(self):
-        """One tile exactly, which is the known rough edge."""
-        out, reference, _code = TestSymbolicLoopOnDevice._compile_and_run(rows=MIN_ROWS)
+    def test_the_reserved_rows_above_the_size_are_never_read(self):
+        """NaN in the reserved rows, moved at the maximum then shrunk, so the
+        device really holds NaN above the logical size. Geometry built at the
+        maximum that read past the logical size would surface it. A trip count
+        bound at launch stops before it.
+        """
+        x = torch.randn(MAX_ROWS, COLS, dtype=torch.float16)
+        x[ROWS:] = float("nan")
+        y = _declare(x)
+        y.resize_((ROWS, COLS))
 
-        torch.testing.assert_close(out.cpu().float(), reference, atol=ATOL, rtol=RTOL)
+        compiled = torch.compile(tiled_gelu, backend="inductor", fullgraph=True)
+        out = compiled(y).cpu().float()
+
+        self.assertTrue(torch.isfinite(out).all())
+        torch.testing.assert_close(
+            out, torch.nn.functional.gelu(x[:ROWS].float()), atol=ATOL, rtol=RTOL
+        )
 
 
 if __name__ == "__main__":
