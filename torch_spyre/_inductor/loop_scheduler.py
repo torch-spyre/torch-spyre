@@ -65,12 +65,12 @@ from .loop_facts import counted_loop_path
 from .loop_node import LoopNode, expand
 from .scheduler import CountedLoopSchedulerNode
 
-# One torch release at a time: the one ``pyproject.toml`` pins (``torch~=2.14.0``).
+# One torch release at a time: the one ``pyproject.toml`` pins (``torch~=2.15.0``).
 # A torch upgrade moves this with the pin; the upgrade-pytorch-version skill has a step
 # that re-verifies ``PATCHED_SURFACE`` and updates this tuple.  Keep it a literal, not a
 # value parsed from package metadata: a patch whose failure mode is "refuse to compile a
 # loop" should not depend on metadata lookups that can fail at import.
-SUPPORTED_RELEASES: tuple[tuple[int, int], ...] = ((2, 14),)
+SUPPORTED_RELEASES: tuple[tuple[int, int], ...] = ((2, 15),)
 
 # Set to False only by the equivalence test, to compare the flow-through path
 # with the path it replaced: ``CustomPreSchedulingPasses`` then expands every
@@ -105,7 +105,7 @@ PATCHED_SURFACE: tuple[str, ...] = (
     "raise NotImplementedError; overridden",
     "FusedSchedulerNode.get_nodes / get_outputs / get_buffer_names -- inherited",
     "Scheduler.compute_dependencies -- asserts node.node; StarDep(alt_name) "
-    "per mutation; additional_buffer_deps / additional_star_deps by node name; "
+    "per mutation; additional_buffer_deps by node name; "
     "calls add_fake_dep, can_inplace, update_mutated_names; is_ordering_only "
     "branch on 2.14 (not run)",
     "Scheduler.topological_sort_schedule -- by unmet_dependencies",
@@ -290,20 +290,20 @@ def _leaves(node: LoopSchedulerNode) -> Iterator[BaseSchedulerNode]:
 
 def _forward_additional_deps(loop: LoopSchedulerNode) -> None:
     """``compute_dependencies`` looks up ``V.graph.additional_buffer_deps``
-    and ``additional_star_deps`` by the name of a node in ``Scheduler.nodes``;
+    by the name of a node in ``Scheduler.nodes``;
     a child's entries are filed under the loop's name, minus the loop's own
     buffers (an internal ordering is the body's)."""
     inner = loop.get_buffer_names()
-    for table in (V.graph.additional_buffer_deps, V.graph.additional_star_deps):
-        names = [
-            dep
-            for leaf in _leaves(loop)
-            if leaf.get_name() in table
-            for dep in table[leaf.get_name()]
-            if dep not in inner
-        ]
-        if names:
-            table[loop.get_name()].update(names)
+    table = V.graph.additional_buffer_deps
+    names = [
+        dep
+        for leaf in _leaves(loop)
+        if leaf.get_name() in table
+        for dep in table[leaf.get_name()]
+        if dep not in inner
+    ]
+    if names:
+        table[loop.get_name()].update(names)
 
 
 def _check_members(loop_node: LoopNode, kernels: Sequence[ir.Operation]) -> None:

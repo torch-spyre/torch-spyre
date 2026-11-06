@@ -371,6 +371,11 @@ does not maintain C++ ABI stability across minor releases, so extensions
 built for `$OLD` will fail to load with undefined-symbol errors against
 `$NEW`.
 
+Extensions explicitly built against PyTorch's stable ABI are an exception.
+Torchvision 0.29.2 supports torch >=2.14; its version no longer follows
+`torch minor + 15`. Use the package's declared compatibility and validate
+native operators instead of deriving a nonexistent torchvision release.
+
 Typical downstream extensions in a torch-spyre environment:
 
 | Extension | Location | Rebuild command |
@@ -559,6 +564,9 @@ After all changes:
      the faked versions in `tests/inductor/test_loop_scheduler.py` (the
      release-gate tests pin the new release as supported and the old one as
      refused).
+   - PyTorch 2.15 removed `GraphLowering.additional_star_deps`; forward loop
+     dependencies through `additional_buffer_deps`, which the new scheduler
+     still consumes. Do not silently ignore a renamed dependency table.
    - Run, serially (the device is exclusive):
      ```bash
      python -m pytest tests/inductor/test_loop_scheduler.py \
