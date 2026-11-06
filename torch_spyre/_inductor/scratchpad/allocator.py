@@ -57,6 +57,9 @@ from torch_spyre._inductor.work_division import (
     ResidencyEdge,
     build_op_split_space,
     build_residency_edge,
+    deferred_work_division,
+    divide_deferred_op,
+    divide_deferred_ops,
     enumerate_work_division_candidates,
     has_resolved_work_div_hint,
     work_division_context_for_op,
@@ -304,16 +307,47 @@ def _is_loop_carry_storage(op: Any) -> bool:
 
 
 def _collective_stage_storage_is_private(
-    graph: GraphLowering, producer: Operation, collective: Operation
+    graph: GraphLowering,
+    producer: Operation,
+    moved: Operation | Sequence[Operation],
 ) -> bool:
     """Prove a drain will observe the sole producer's final value.
 
     Liveness dependencies alone do not find every writer: a ComputedBuffer
     mutation can name its own write while its layout targets another buffer.
-    The selected collective's mutation is moved onto the drain; any other
-    mutation, alias or extra writer makes this transformation unsafe.
+    ``moved`` (the collective, and the accesses that follow it) is repointed
+    onto the drain with its mutations and aliases; any other mutation, alias or
+    extra writer makes this transformation unsafe.
     """
-    return storage_has_single_writer(graph, producer, transferred_mutation=collective)
+    if not isinstance(moved, Sequence):
+        moved = (moved,)
+    return storage_has_single_writer(graph, producer, transferred_mutations=moved)
+
+
+def _is_coarse_tiled(op: Any) -> bool:
+    return isinstance(getattr(op, "loop_info", None), CoarseTileInfo)
+
+
+def _sibling_pinned_divisions(
+    parent: str,
+    parent_op: Any,
+    cd_parent_matches: Optional[dict[str, list[tuple[int, int]]]],
+) -> frozenset[int]:
+    """Consumer divisions another parent already matches for free, which
+    ``_cap_relayout_groups`` keeps past the cap.
+
+    Only for a coarse-tiled parent, the edges solver_relayout_edge_context's
+    same-tile-group exception admits. Elsewhere a sibling usually matches most
+    consumer divisions, and pinning them all would leave the edge uncapped.
+    """
+    if not _is_coarse_tiled(parent_op):
+        return frozenset()
+    return frozenset(
+        j
+        for other_parent, pairs in (cd_parent_matches or {}).items()
+        if other_parent != parent
+        for _, j in pairs
+    )
 
 
 def _coarse_tile_loop_trip_count(op: Any) -> int:
@@ -328,9 +362,9 @@ def _coarse_tile_loop_trip_count(op: Any) -> int:
     value, 1 (not a propagated symbol that would later crash numeric code
     expecting a plain float) when it doesn't.
     """
-    loop_info = getattr(op, "loop_info", None)
-    if not isinstance(loop_info, CoarseTileInfo):
+    if not _is_coarse_tiled(op):
         return 1
+    loop_info = op.loop_info
 
     def _resolved(c) -> int:
         try:
@@ -353,11 +387,13 @@ class DrainPlan:
     the residency gate, the lifetime extension and the post-solve push -- never
     re-derived from graph state that later passes mutate.
 
-    The same drain serves a carry whose only post-loop access is a collective
-    (e.g. the TP all_reduce of a traced MoE's expert sum).  A collective needs a
+    The same drain serves a carry consumed after the loop by a collective (e.g.
+    the TP all_reduce of a traced MoE's expert sum).  A collective needs a
     materialized HBM operand, so without the drain the carry -- and with it
     every in-loop update -- stays in HBM.  With ``collective`` set, the
-    drain is an ordinary HBM buffer and the collective is rewired to it.
+    drain is an ordinary HBM buffer and every post-loop access is rewired to
+    it: the in-place collective's result lives in its operand, so its wait and
+    later readers must follow it.
 
     Attributes
     ----------
@@ -376,8 +412,12 @@ class DrainPlan:
         The exact FX ``while_loop`` HOP node retained by the splice; the drain
         clone's FX node is inserted after it.
     collective:
-        ``None`` for a graph-output carry.  Otherwise the single post-loop
-        collective reading the storage, which the push repoints at the drain.
+        ``None`` for a carry drained only for its graph output.  Otherwise the
+        first post-loop collective reading the storage.
+    post_loop_accesses:
+        With ``collective`` set, every post-loop access of the storage in graph
+        order (the collective, its waits, later readers), all of which the push
+        repoints at the drain.  Empty otherwise.
     """
 
     storage_name: str
@@ -386,6 +426,7 @@ class DrainPlan:
     anchor_op: Operation
     loop_origin: Any
     collective: Optional[Operation] = None
+    post_loop_accesses: tuple[Operation, ...] = ()
 
 
 def _access_group_path(op: Operation) -> tuple[int, ...]:
@@ -434,13 +475,16 @@ def validated_drain_plans(
         storage, and no ReinterpretView sits anywhere on its wrapper chain
         (``change_graph_output`` replaces the first match, so an aliased entry
         declines, and it repoints a view in place); or
-    P2b (collective) no entry names the storage, and its only access outside
-        the loop is one post-loop collective whose operand
+    P2b (collective) at most one entry names the storage (and, if one does, no
+        ReinterpretView sits on it), every access outside the loop runs after
+        it and is repointable, and at least one is a collective whose operand
         :meth:`GraphEditor.collective_operand_name` resolves to it
-        (:func:`_sole_post_loop_collective`);
+        (:func:`_post_loop_collective_accesses`);
     P3  the storage op carries a ``LoopCarryRecord`` whose ``storage_name`` is
         its own name and whose ``update_name`` resolves to exactly one op;
-    P4  that update is the only op mutating the storage;
+    P4  that update is the only op mutating the storage, apart from P2b's
+        post-loop accesses (an in-place collective and its waits mutate their
+        operand through ``MutationOutput``s), which the push repoints;
     P5  the update's group path is exactly one level, every in-loop access of
         the storage is that update, and the storage itself (the initializer)
         has no loop membership;
@@ -472,6 +516,11 @@ def validated_drain_plans(
         layout = getattr(op, "layout", None)
         if isinstance(layout, MutationLayoutSHOULDREMOVE):
             mutators[layout.target.get_name()].append(op)
+        # In-place collectives and waits (create_inplace / create_wait) mutate
+        # their operand through MutationOutput buffers, not their layout.
+        for mutation in getattr(op, "mutation_outputs", None) or ():
+            for target in mutation.get_mutation_names():
+                mutators[target].append(op)
 
     plans: dict[str, DrainPlan] = {}
     for name, storage_op in op_by_name.items():
@@ -494,8 +543,9 @@ def validated_drain_plans(
         if _access_group_path(storage_op):
             continue
         storage_mutators = mutators.get(name, [])
-        if len(storage_mutators) != 1 or storage_mutators[0] is not update_op:
+        if [op for op in storage_mutators if op is update_op] != [update_op]:
             continue
+        post_loop_mutators = [op for op in storage_mutators if op is not update_op]
         # Every access but the initializer's and the update's.
         accessors = [
             op
@@ -521,16 +571,28 @@ def validated_drain_plans(
             for index, entry in enumerate(graph.graph_outputs)
             if unwrapped_buffer_name(entry) == name
         ]
-        collective = None
-        if len(output_entries) == 1:
-            if _is_reinterpret_output_entry(graph.graph_outputs[output_entries[0]]):
-                continue
-        elif output_entries:
+        if len(output_entries) > 1:
             continue
+        if output_entries and _is_reinterpret_output_entry(
+            graph.graph_outputs[output_entries[0]]
+        ):
+            continue
+        post_loop_accesses = _post_loop_collective_accesses(
+            graph, name, accessors, anchor_op
+        )
+        if post_loop_accesses:
+            collective = next(
+                op
+                for op in post_loop_accesses
+                if GraphEditor.collective_operand_name(op) == name
+            )
+        elif output_entries and not post_loop_mutators:
+            # A plain graph-output carry: the drain is the output clone.
+            collective = None
         else:
-            collective = _sole_post_loop_collective(graph, name, accessors, anchor_op)
-            if collective is None:
-                continue
+            continue
+        if any(op not in post_loop_accesses for op in post_loop_mutators):
+            continue
         plans[name] = DrainPlan(
             storage_name=name,
             update_name=record.update_name,
@@ -538,35 +600,39 @@ def validated_drain_plans(
             anchor_op=anchor_op,
             loop_origin=loop_origin,
             collective=collective,
+            post_loop_accesses=post_loop_accesses,
         )
     return plans
 
 
-def _sole_post_loop_collective(
+def _post_loop_collective_accesses(
     graph: GraphLowering,
     name: str,
     accessors: Sequence[Operation],
     anchor_op: Operation,
-) -> Optional[Operation]:
-    """The collective that is ``name``'s only access outside its loop, or None.
+) -> tuple[Operation, ...]:
+    """Every access of ``name`` outside its loop, if a drain can take them all.
 
     ``accessors`` are the ops, other than the storage's initializer and its
     tagged update, that read or write the storage.  The plan applies only when
-    that is a single op running after the whole loop, and it is a collective
-    whose operand :class:`GraphEditor` can repoint at the drain.  Any other
-    post-loop access would still name the storage once the collective reads the
-    drain -- and an in-place all_reduce's result lives in its operand -- so it
-    declines.
+    every one runs after the whole loop, :class:`GraphEditor` can repoint each
+    at the drain, and at least one is a rewritable collective (the access that
+    needs an HBM operand).  An in-place all_reduce's result lives in its
+    operand, so its wait and every later reader must move to the drain with it:
+    any access left behind would read the unreduced carry.  Returns them in
+    graph order, or ``()`` when the plan does not apply.
     """
 
-    if len(accessors) != 1:
-        return None
-    consumer = accessors[0]
-    if GraphEditor.collective_operand_name(consumer) != name:
-        return None
-    if graph.operations.index(consumer) <= graph.operations.index(anchor_op):
-        return None
-    return consumer
+    if not accessors:
+        return ()
+    anchor_index = graph.operations.index(anchor_op)
+    if any(graph.operations.index(op) <= anchor_index for op in accessors):
+        return ()
+    if not any(GraphEditor.collective_operand_name(op) == name for op in accessors):
+        return ()
+    if not all(GraphEditor.is_repointable_access(op, name) for op in accessors):
+        return ()
+    return tuple(sorted(accessors, key=graph.operations.index))
 
 
 def _drain_lifetime_end_overrides(
@@ -598,11 +664,13 @@ def _drain_lifetime_end_overrides(
         )
 
 
-def _drained_collectives(drain_plans: Mapping[str, DrainPlan]) -> dict[str, str]:
-    """Storage name -> the collective its drain plan repoints at the drain."""
+def _drained_accesses(
+    drain_plans: Mapping[str, DrainPlan],
+) -> dict[str, frozenset[str]]:
+    """Storage name -> the post-loop accesses its drain plan repoints at the drain."""
 
     return {
-        name: plan.collective.get_name()
+        name: frozenset(op.get_name() for op in plan.post_loop_accesses)
         for name, plan in drain_plans.items()
         if plan.collective is not None
     }
@@ -994,7 +1062,8 @@ class ScratchpadAllocator:
         # residency gate, the lifetime extension and the post-solve push.  The
         # placement path leaves this empty, which is its pre-change behavior.
         self._validated_drain_plans: dict[str, DrainPlan] = {}
-        self._collective_output_stages: dict[str, Operation] = {}
+        # Staged matmul result -> its collective (first) and every later access.
+        self._collective_output_stages: dict[str, tuple[Operation, ...]] = {}
 
     @staticmethod
     def _planned_lx_buffer_names(
@@ -2110,6 +2179,12 @@ class ScratchpadAllocator:
                     # ``_loop_group_id(drain_node) is None`` is asserted by the
                     # captured-order test; here the op-level absence is exact.
                     _clear_loop_membership_metadata(new_buffer)
+                    if drain_plan.collective is not None:
+                        # An in-place collective's result is the output: it and
+                        # every later access move onto the drain with it.
+                        graph_editor.replace_post_loop_accesses(
+                            drain_plan.post_loop_accesses, b.name, new_buffer
+                        )
                 else:
                     new_buffer = graph_editor.push_allocation_with_clone(
                         buf, buffer_users[b.name], input=False
@@ -2118,19 +2193,21 @@ class ScratchpadAllocator:
                 graph_editor.change_graph_output(buf, new_buffer)
 
             else:
-                collective = self._collective_output_stages.get(b.name)
-                if collective is not None:
+                accesses = self._collective_output_stages.get(b.name)
+                if accesses is not None:
                     # The result has private, disjoint frontend storage. Keep
                     # the collective's required HBM operand and its mutation
                     # on a separate ordinary clone with identical addressing.
+                    # The in-place result lives in that operand, so the wait
+                    # and every later reader move onto the clone too.
                     drained = graph_editor.push_allocation_with_clone(
                         buf,
-                        [collective],
+                        list(accesses),
                         input=False,
                         private=True,
                         lower_anchor=buf,
                     )
-                    graph_editor.replace_collective_operand(collective, b.name, drained)
+                    graph_editor.replace_post_loop_accesses(accesses, b.name, drained)
                 drain_plan = drain_plans.get(b.name)
                 if drain_plan is not None and drain_plan.collective is not None:
                     # The collective needs an HBM operand: give it a post-loop
@@ -2148,8 +2225,8 @@ class ScratchpadAllocator:
                         lower_anchor=drain_plan.anchor_op,
                     )
                     _clear_loop_membership_metadata(drained)
-                    graph_editor.replace_collective_operand(
-                        drain_plan.collective, b.name, drained
+                    graph_editor.replace_post_loop_accesses(
+                        drain_plan.post_loop_accesses, b.name, drained
                     )
                 self._set_one_allocation(buf, b.address, b.lx_view)
 
@@ -2371,6 +2448,19 @@ def _fixed_core_division(op: Operation) -> CoreDivision:
     """The op's committed symbol-keyed division, or a one-core division."""
     ownership = getattr(op, "iteration_space_ownership", None)
     return _core_division(op, ownership.work_slices if ownership is not None else {})
+
+
+def _upstream_core_division(graph: GraphLowering | None, op: Operation) -> CoreDivision:
+    """:func:`_fixed_core_division`, for a pin.
+
+    When work division was left to the joint solve (``defer_work_division``),
+    ``op`` has no split from it yet, so divide it first: a pinned op keeps the
+    split work division would have committed. Without ``graph``, nothing is
+    divided.
+    """
+    if graph is not None:
+        divide_deferred_op(graph, op)
+    return _fixed_core_division(op)
 
 
 def _legal_fixed_division(
@@ -2903,6 +2993,9 @@ def commit_divisions(
     division. One it cannot restate raises ``Unsupported``, not
     ``SolveError``: the tilings are already applied, so the greedy fallback
     in ``scratchpad_planning`` would replan a graph it did not see.
+
+    An op whose work division was left to this solve (``defer_work_division``)
+    counts as divided by the work-division pass: committing here decides it.
     """
     splits, violations = planned_splits(graph, allocation)
     if violations:
@@ -2912,12 +3005,13 @@ def commit_divisions(
         for buf in allocation
         if buf.chosen_division is not None
     }
+    deferred = deferred_work_division(graph)
     commits: list[tuple[Operation, dict[sympy.Symbol, int]]] = []
     for op in graph.operations:
         op_splits = splits.get(op.name)
         if op_splits is None:
             continue
-        if not hasattr(op, "iteration_space_ownership"):
+        if not hasattr(op, "iteration_space_ownership") and op.name not in deferred:
             # The guard (#4062) means "only refine a division the
             # work-division pass established", and its real subjects are the
             # fallback ops (SpyreConstantFallback / SpyreEmptyFallback):
@@ -2942,6 +3036,7 @@ def commit_divisions(
         commits.append((op, op_splits))
     for op, op_splits in commits:
         commit_iteration_space_ownership(op, op_splits)
+        deferred.discard(op.name)
 
 
 def check_priced_footprints(
@@ -3000,7 +3095,7 @@ def commit_lx_views(
     graph: GraphLowering,
     allocation: Sequence[LifetimeBoundBuffer],
     accepted_lx_relayouts: Sequence[LXRelayoutPlan],
-    drained_readers: Optional[Mapping[str, str]] = None,
+    drained_readers: Optional[Mapping[str, Collection[str]]] = None,
 ) -> None:
     """Set ``lx_view``, the per-core view LX holds it under, on every resident
     buffer of ``allocation``."""
@@ -3015,8 +3110,8 @@ def commit_lx_views(
     source_views = {
         plan.source_name: plan.source_view for plan in accepted_lx_relayouts
     }
-    # Likewise a drained carry's collective still reads the carry here; the
-    # push repoints it at the drain, so it does not constrain the carry.
+    # Likewise a drained carry's post-loop accesses still read the carry here;
+    # the push repoints them at the drain, so they do not constrain the carry.
     _, reasons, views = get_ncores_for_buffers(graph, drained_readers=drained_readers)
     for buffer in allocation:
         # A relayout copy is not a graph buffer: materialize_lx_relayouts
@@ -3147,7 +3242,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             for op in graph.operations
             if hasattr(op, "_read_copy_elision_record")
             and is_restickify_op(op, graph)
-            and divisions[op.name] != [_fixed_core_division(op)]
+            and divisions[op.name] != [_upstream_core_division(graph, op)]
         }
         while True:
             buffers = self._build_cd_bound_buffers(graph, in_place, division_map)
@@ -3168,7 +3263,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 return buffers
             for name in rejected:
                 op = pending.pop(name)
-                fixed = _fixed_core_division(op)
+                fixed = _upstream_core_division(graph, op)
                 assert fixed.cores_used <= config.sencores, (
                     f"{name}: fixed direct-read division over the "
                     f"{config.sencores}-core budget"
@@ -3513,11 +3608,15 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         apply_chosen_tilings(graph, allocation)
         check_priced_footprints(graph, allocation)
         commit_divisions(graph, allocation)
+        # Work division left to this solve (``defer_work_division``): an op the
+        # solve committed no division to keeps the split the pass would have
+        # given it, exactly as when the pass ran up front.
+        divide_deferred_ops(graph)
         commit_lx_views(
             graph,
             allocation,
             accepted_lx_relayouts,
-            drained_readers=_drained_collectives(self._validated_drain_plans),
+            drained_readers=_drained_accesses(self._validated_drain_plans),
         )
         self._stage_collective_outputs(graph, allocation, accepted_lx_relayouts)
         log_solver_decisions(graph, allocation)
@@ -3540,8 +3639,12 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         all relayout copies. Stages also have distinct addresses from each
         other. Thus it needs no lifetime relaxation, in-place alias, synthetic
         spill saving, or backend reservation hint. No free gap means no change.
-        Only a fresh, untiled matmul result with one bare collective consumer
-        qualifies; aliases, graph outputs and other readers retain HBM.
+        Only a fresh, untiled matmul result whose first consumer is a bare
+        in-place collective qualifies.  The collective's result lives in its
+        operand, so its wait and every later reader move onto the drain with it
+        (see :func:`_post_loop_collective_accesses`); a reader before the
+        collective, an unrepointable access, an alias or a graph output retains
+        HBM.
         """
         self._collective_output_stages = {}
         if not config.lx_collective_output_staging or not clone_at_graph_boundaries():
@@ -3572,15 +3675,22 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             placed.append(LifetimeBoundBuffer(b.name, span, [0], address=b.address))
 
         outputs = set(graph.get_output_names())
-        candidates: dict[str, Operation] = {}
+        candidates: dict[str, tuple[Operation, ...]] = {}
         copy_readers = {n for plan in relayouts for n in plan.consumer_names}
         for b in allocation:
             uses = current_uses.get(b.name, [])
-            if b.address is not None or b.name in outputs or len(uses) != 2:
+            if b.address is not None or b.name in outputs or len(uses) < 2:
                 continue
-            op, consumer = (graph.operations[i] for i in uses)
+            op, consumer = (graph.operations[i] for i in uses[:2])
+            accesses = _post_loop_collective_accesses(
+                graph, b.name, [graph.operations[i] for i in uses[1:]], op
+            )
             if (
-                not isinstance(op, ComputedBuffer)
+                not accesses
+                # The collective must be the first access after the producer:
+                # an earlier reader would need the un-drained value in LX.
+                or accesses[0] is not consumer
+                or not isinstance(op, ComputedBuffer)
                 or op.get_name() != b.name
                 or not _is_matmul_op(op)
                 or not isinstance(op.layout, FixedTiledLayout)
@@ -3592,13 +3702,15 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 or origin_in_graph(consumer.origins, graph.graph) is None
             ):
                 continue
-            # The selected collective reads the HBM drain.
-            if _extern_kernel_in_live_range(graph, uses, excluded_op=consumer):
+            # The collective and every later access read the HBM drain, so the
+            # LX value lives only from the producer to the collective.
+            lx_uses = uses[:2]
+            if _extern_kernel_in_live_range(graph, lx_uses, excluded_op=consumer):
                 continue
-            if not _collective_stage_storage_is_private(graph, op, consumer):
+            if not _collective_stage_storage_is_private(graph, op, accesses):
                 continue
             if buffer_not_read_in_full(graph, b.name) or _would_produce_lx_back_gap(
-                graph, b.name, uses
+                graph, b.name, lx_uses
             ):
                 continue
             if b.name not in copy_readers and not any(
@@ -3607,14 +3719,18 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 for dep in op_read_writes(op).reads
             ):
                 continue
-            candidates[b.name] = consumer
+            candidates[b.name] = accesses
         if not candidates:
             return
         _, _, views = get_ncores_for_buffers(
             graph,
-            drained_readers={name: op.get_name() for name, op in candidates.items()},
+            drained_readers={
+                name: {op.get_name() for op in accesses}
+                for name, accesses in candidates.items()
+            },
         )
-        for name, collective in candidates.items():
+        for name, accesses in candidates.items():
+            collective = accesses[0]
             view = views.get(name)
             if view is None:
                 # The ownership judge also rejects K-split writers: only the
@@ -3636,7 +3752,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             placed.append(scratch)
             b = by_name[name]
             b.address, b.lx_view, b.spill_reason = scratch.address, view, None
-            self._collective_output_stages[name] = collective
+            self._collective_output_stages[name] = accesses
             logger.debug(
                 "collective output stage: %s LX [%d, %d), HBM drain before %s",
                 name,
@@ -3718,9 +3834,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # fixed division. A resolved user work_div hint takes the same remedy,
         # last so a hazard guard's reason is the one logged: work division
         # already committed the hint, and the pin is whole-op -- unhinted dims
-        # keep their committed split of 1. The graph-level group sets are
-        # loop-invariant, so build them once here rather than rescanning
-        # graph.operations for every op.
+        # keep their committed split of 1. When work division was left to this
+        # solve, a pin divides the op first (``_upstream_core_division``). The
+        # graph-level group sets are loop-invariant, so build them once here
+        # rather than rescanning graph.operations for every op.
         offset_mutation_ops = ops_in_offset_mutation_component(graph)
         fp8_group_reason = "fp8 matmul layout group"
         layout_group_reason = _fused_layout_group_ops(
@@ -3762,6 +3879,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 # pricing the direct read in the actual allocation context.
                 # Other callers and unrecognized records keep the fixed pin.
                 reason = "deferred direct graph-input read"
+            elif isinstance(op, ComputedBuffer) and getattr(
+                op, "shard_pinned_splits", None
+            ):
+                reason = "shard plan"
             elif (
                 not config.ignore_work_division_hints
                 and isinstance(op, ComputedBuffer)
@@ -3778,11 +3899,14 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     matmul_roles,
                     max_cores,
                     prep_cache,
+                    graph,
                 )
             if aligned is not None:
                 divs = [aligned]
             elif reason is not None:
-                divs = _legal_fixed_division(op, [_fixed_core_division(op)], reason)
+                divs = _legal_fixed_division(
+                    op, [_upstream_core_division(graph, op)], reason
+                )
             elif self.prune and isinstance(op, ComputedBuffer):
                 divs = [
                     _core_division(op, splits)
@@ -3795,7 +3919,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                         op, [_fixed_core_division(op)], "empty pruned candidate set"
                     )
             else:
-                divs, is_enumeration = self._enumerate_core_divisions(op, max_cores)
+                divs, is_enumeration = self._enumerate_core_divisions(
+                    op, max_cores, graph
+                )
                 if is_enumeration:
                     enumerated.add(op.name)
             if not divs:
@@ -3826,6 +3952,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         matmul_roles: tuple[dict[str, int], ...],
         max_cores: int,
         prep_cache: dict,
+        graph: GraphLowering | None = None,
     ) -> Optional[CoreDivision]:
         """A division for an fp8 matmul consumer that slices the matmul output
         the way the matmul does, or ``None`` to keep the consumer's fixed one.
@@ -3836,6 +3963,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         bridge the two core domains the matmul output can never be LX-resident.
         In that case only, the consumer takes the most-cores candidate of its
         ordinary menu whose view of the output matches the matmul's.
+
+        With ``graph``, both fixed divisions are the ones work division commits,
+        dividing either op first if its work division was deferred
+        (:func:`_upstream_core_division`).
         """
         if len(seeds) != 1:
             return None
@@ -3845,8 +3976,8 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         )
         if edge is None:
             return None
-        seed_div = _fixed_core_division(seed)
-        fixed = _fixed_core_division(op)
+        seed_div = _upstream_core_division(graph, seed)
+        fixed = _upstream_core_division(graph, op)
         if edge.match_pairs([seed_div], [fixed]):
             return None
         src, dst = seed_div.cores_used, fixed.cores_used
@@ -3860,7 +3991,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 )
             ]
         else:
-            menu, _ = self._enumerate_core_divisions(op, max_cores)
+            menu, _ = self._enumerate_core_divisions(op, max_cores, graph)
         menu = [
             d
             for d in menu
@@ -3881,25 +4012,32 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         return aligned
 
     def _enumerate_core_divisions(
-        self, op: Operation, max_cores: int
+        self, op: Operation, max_cores: int, graph: GraphLowering | None = None
     ) -> tuple[list[CoreDivision], bool]:
         """Enumerate and deduplicate symbol-keyed candidates for one operation,
         with whether they are the *whole* legal cross product.
 
         Operations without an enumerable concrete iteration space retain their
-        committed division, and say so (see :class:`_DivisionMap`).
-        Deduplication uses local symbol names only within this operation;
-        cross-operation compatibility is derived from ``PerCoreView`` instead.
+        committed division, and say so (see :class:`_DivisionMap`); with
+        ``graph``, one whose work division was deferred is divided first (see
+        :func:`_upstream_core_division`). Deduplication uses local symbol names
+        only within this operation; cross-operation compatibility is derived
+        from ``PerCoreView`` instead.
         """
-        fixed = [_fixed_core_division(op)]
+
+        def fixed() -> list[CoreDivision]:
+            # Only a pin reads the committed division, so a deferred op is
+            # divided here, never for a menu the solve chooses from.
+            return [_upstream_core_division(graph, op)]
+
         if not isinstance(op, ComputedBuffer) or not isinstance(
             op.data, (Pointwise, Reduction)
         ):
-            return fixed, False
+            return fixed(), False
         try:
             candidates = enumerate_work_division_candidates(op, max_cores)
         except Unsupported as exc:
-            return _legal_fixed_division(op, fixed, str(exc)), False
+            return _legal_fixed_division(op, fixed(), str(exc)), False
         cds: list[CoreDivision] = []
         seen: set[tuple] = set()
         # Each tiling option gets its own division enumeration: the legal split
@@ -3955,7 +4093,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     cds.append(division)
         if cds:
             return cds, True
-        return _legal_fixed_division(op, fixed, "no enumerable candidate"), False
+        return _legal_fixed_division(op, fixed(), "no enumerable candidate"), False
 
     def _tiling_candidates(self, op: Operation, max_cores: int) -> list[TileSpec]:
         """Coarse-tiling options to pair with ``op``'s divisions.
@@ -4166,8 +4304,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             )
         # A collective has no division pair with any resident buffer, so its
         # edge to a carry would force the carry into HBM.  A planned drain is
-        # what that collective reads instead, so the edge does not exist.
-        drained_collectives = _drained_collectives(drain_plans)
+        # what that collective (and every later access) reads instead, so those
+        # edges do not exist.
+        drained_accesses = _drained_accesses(drain_plans)
         mem_usage = mem_usage_by_buf(graph)
         in_place = {} if in_place is None else in_place
         op_by_name = {op.name: op for op in graph.operations}
@@ -4288,7 +4427,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             parent_proj = [
                 parent
                 for parent in info["op_inputs"]
-                if drained_collectives.get(parent) != output_name
+                if output_name not in drained_accesses.get(parent, ())
             ]
             residency_edges = self._parent_residency_edges(
                 op, parent_proj, op_by_name, prep_cache, residency_by_buf, graph=graph
@@ -5049,9 +5188,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         solver's ``decides_lx_relayouts`` and on ``config.lx_solver_relayout``.
 
         ``cd_parent_matches`` (the caller's own ``_cd_parent_matches`` result)
-        gives each parent's cap-and-rank step the other parents' already-free
-        divisions, so it won't drop the one group that would let this parent
-        join them.
+        gives a coarse-tiled parent's cap-and-rank step the other parents'
+        already-free divisions, so it won't drop the one group that would let
+        this parent join them.
         """
         if (
             not self._decides_lx_relayouts
@@ -5298,11 +5437,8 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                         consumer_op.get_name(),
                         exc,
                     )
-            sibling_pinned = frozenset(
-                j
-                for other_parent, pairs in (cd_parent_matches or {}).items()
-                if other_parent != parent
-                for _, j in pairs
+            sibling_pinned = _sibling_pinned_divisions(
+                parent, parent_op, cd_parent_matches
             )
             candidates = self._cap_relayout_groups(
                 parent,
@@ -5469,6 +5605,28 @@ def select_allocator() -> ScratchpadAllocator:
     )
 
 
+def solve_decides_work_division() -> bool:
+    """Whether the LX planning solve chooses the split of every op it can
+    enumerate, so work division can be left to it (``defer_work_division``).
+
+    True exactly when :func:`select_allocator` builds a
+    :class:`CoOptimizingAllocator` with a native core-division engine: simulated
+    annealing, or CP-SAT with ortools. Keep the two in step. The pruned
+    exhaustive search is excluded, because it seeds its menus from the committed
+    split (``_seed_splits``), and so is every placement-only allocator, which
+    keeps the committed split as it is.
+    """
+    if not (config.lx_planning and config.co_optimizing_lx_planning):
+        return False
+    if config.layout_solver == "simulated_annealing":
+        return True
+    if config.layout_solver == "cpsat":
+        return _cpsat_solver_class().chooses_core_divisions()
+    solver_cls = _PLACEMENT_SOLVERS.get(config.layout_solver)
+    # An unknown solver is select_allocator's error to raise, not this one's.
+    return solver_cls is not None and solver_cls.chooses_core_divisions()
+
+
 def scratchpad_planning(
     graph: GraphLowering,
     allocator: Optional[ScratchpadAllocator] = None,
@@ -5508,6 +5666,10 @@ def scratchpad_planning(
             config.layout_solver,
             error,
         )
+        # Work division may have been left to the failed solve
+        # (``defer_work_division``): divide what it left, so greedy placement
+        # plans with the splits the pass would have committed up front.
+        divide_deferred_ops(graph)
         ScratchpadAllocator(
             GreedyLayoutSolver,
             size=_lx_planning_size(),
