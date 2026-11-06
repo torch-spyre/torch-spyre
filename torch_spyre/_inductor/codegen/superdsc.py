@@ -1530,8 +1530,7 @@ def _create_sdsc_tensors(
                         dim_order = dim_order + [stick_dim]
 
         # layernormscale is unary on one value per stick, so the stick dim is
-        # reduced on the input and on the output. Marking only the input asks the
-        # backend to broadcast into the output, which it cannot do for 4-byte data.
+        # reduced on the input and on the output.
         if op_spec.op == "layernormscale":
             reduced_dims = [stick_dim]
         stride_dim_order = [
