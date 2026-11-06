@@ -516,14 +516,14 @@ def concretize_index(index: sympy.Expr, loop_vars: set) -> sympy.Expr:
     for s in size_syms:
         try:
             hint = V.graph.sizevars.optimization_hint(s)
-            subs[s] = hint  # Successfully concretized
+            subs[s] = sympy.Integer(hint)  # Successfully concretized
         except (TypeError, ValueError):
             # Can't concretize this symbol, skip it
             pass
 
     if not subs:
         return index  # No symbols concretized, return original
-    result = index.subs(subs)
+    result = index.xreplace(subs)
     return result
 
 
@@ -2359,7 +2359,7 @@ def _host_size_stride_for_expr(
     # ic=[d0, d1+32] and expr=Mod(d1,64) is invalid because offsets differ: 32 vs 0).
     d = host_dims[0]
     coord = host_coords[d]
-    if coord.subs(var, 0) != expr.subs(var, 0):
+    if coord.xreplace({var: 0}) != expr.xreplace({var: 0}):
         return None
     return host_size[d], host_stride[d]
 

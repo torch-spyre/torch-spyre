@@ -2847,7 +2847,7 @@ def _check_whole_stagger_units(
     output_dep = next(iter(op_read_writes(writer).writes))
     coord = host_coordinates(target_layout, output_dep, None)[stick_dim]
     syms = coord.free_symbols
-    offset = coord.subs({s: 0 for s in syms})
+    offset = coord.xreplace({s: sympy.S.Zero for s in syms})
     extent: int | None
     if not syms:
         extent = 1

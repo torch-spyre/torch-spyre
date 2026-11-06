@@ -218,7 +218,7 @@ def verify_non_unified_split(sdsc_spec, shard_kernel_args) -> None:
     try:
         split_dims = {d: int(v) for d, v in sdsc_spec.work_slices.items() if int(v) > 1}
         core_slices = {
-            (c, d): int(expr.subs({sympy.Symbol("core_id"): c}))
+            (c, d): int(expr.xreplace({sympy.Symbol("core_id"): c}))
             for c in range(n)
             for d, expr in sdsc_spec.core_id_to_work_slice.items()
         }

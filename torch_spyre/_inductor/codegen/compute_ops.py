@@ -748,7 +748,7 @@ def generate_sdsc(
     out_idx = len(sdsc_spec.args) - 1
     core_id_to_wk_slice = {
         str(c): {
-            str(dim): int(expr.subs({Symbol("core_id"): c}))
+            str(dim): int(expr.xreplace({Symbol("core_id"): c}))
             for dim, expr in sdsc_spec.core_id_to_work_slice.items()
         }
         for c in range(sdsc_spec.num_cores)

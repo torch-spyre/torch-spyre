@@ -71,7 +71,7 @@ def test_geometry_keeps_symbolic_splits_and_physical_gaps():
     expr = run_bytes(sb, sx)
     for b in (1, 2, 4, 8):
         for x in (1, 2):
-            assert expr.subs({sb: b, sx: x}) == run_bytes(b, x)
+            assert expr.xreplace({sb: b, sx: x}) == run_bytes(b, x)
     # Padding in X prevents coalescing across B, even though B is unsplit.
     assert (
         dcm._contiguous_device_run(
@@ -148,8 +148,8 @@ def test_residency_dtype_and_unknown_geometry():
     is_lx = sympy.Symbol("is_lx", integer=True)
     symbolic = replace(op, args=[replace(op.args[0], is_lx=is_lx), op.args[1]])
     expr = cm._transport_dma_excess_ns([symbolic], p)
-    assert expr.subs(is_lx, 1) == 0
-    assert expr.subs(is_lx, 0) == cm._transport_dma_excess_ns([op], p)
+    assert expr.xreplace({is_lx: 1}) == 0
+    assert expr.xreplace({is_lx: 0}) == cm._transport_dma_excess_ns([op], p)
     assert (
         cm._transport_dma_excess_ns([op], replace(p, transport_dma_ns_per_request={}))
         == 0
@@ -200,9 +200,9 @@ def test_compute_read_prices_a_stick_split_at_an_uncalibrated_count():
     # The solver sees the same choice through the symbolic core count.
     cores = sympy.Symbol("cores", integer=True, positive=True)
     expr = cm._transport_dma_excess_ns([replace(sticks22, cores=cores)], p)
-    assert float(expr.subs(cores, 22)) == pytest.approx(per_trip * trips)
-    assert expr.subs(cores, 16) == expr.subs(cores, 22)
-    assert 0 < expr.subs(cores, 32) < expr.subs(cores, 22)
+    assert float(expr.xreplace({cores: 22})) == pytest.approx(per_trip * trips)
+    assert expr.xreplace({cores: 16}) == expr.xreplace({cores: 22})
+    assert 0 < expr.xreplace({cores: 32}) < expr.xreplace({cores: 22})
 
 
 @pytest.mark.parametrize("cores", [16, 22])
@@ -271,8 +271,8 @@ def test_staging_copy_keeps_the_source_request_cost():
         direct, args=[direct.args[0], replace(direct.args[1], is_lx=is_lx)]
     )
     expr = sympy.sympify(cm._transport_dma_excess_ns([symbolic], p))
-    assert expr.subs(is_lx, 0) == expected
-    assert expr.subs(is_lx, 1) == expected
+    assert expr.xreplace({is_lx: 0}) == expected
+    assert expr.xreplace({is_lx: 1}) == expected
 
 
 @pytest.mark.parametrize(
@@ -343,7 +343,7 @@ def test_symbolic_cpsat_picks_measured_fast_division(n, trips):
     assert choices[solver.value(division)] == (2, 1)
     for i, (b, x) in enumerate(choices):
         expected = float(cm.predict_ops([restickify(b, x, n=n, trips=trips)]))
-        assert float(expr.subs({sb: b, sx: x})) == pytest.approx(expected)
+        assert float(expr.xreplace({sb: b, sx: x})) == pytest.approx(expected)
         fixed = model.clone()
         fixed.add(division == i)
         assert solver.solve(fixed) == cp_model.OPTIMAL
@@ -512,7 +512,7 @@ def test_proven_direct_read_is_priced_with_consumer_splits(staged_transport_grap
     sb, sx = sympy.symbols("sb sx", positive=True, integer=True)
     feats = dcm.extract_op_features(priced[0], {b: sb, x: sx, n: 1})
     cost = cm._transport_dma_excess_ns([feats], cm.CostParams())
-    assert float(cost.subs({sb: 2, sx: 1})) < float(cost.subs({sb: 8, sx: 2}))
+    assert float(cost.xreplace({sb: 2, sx: 1})) < float(cost.xreplace({sb: 8, sx: 2}))
 
 
 @pytest.mark.parametrize(
