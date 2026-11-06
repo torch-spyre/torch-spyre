@@ -29,6 +29,7 @@ from torch.utils._sympy.value_ranges import ValueRanges, bound_sympy
 from torch_spyre._C import get_device_size_in_bytes
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.loop_facts import (
+    counted_loop_path,
     output_advances_anywhere,
     read_advances_anywhere,
 )
@@ -116,9 +117,7 @@ def counted_loop_group_path(op: Operation) -> tuple[int, ...]:
     dedup_and_promote_constants hoisted to the graph head) but runs once,
     outside the loop.
     """
-    if isinstance(op, ExternKernel):
-        return ()
-    return tuple(getattr(getattr(op, "loop_info", None), "loop_group_id", ()) or ())
+    return counted_loop_path(op)
 
 
 def counted_loop_entry(
