@@ -26,6 +26,7 @@ test_suite_config:
         - names:
             - LxPlanning.*::test_layernorm.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_rmsnorm.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_batch_norm.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_softmax.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_softplus.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_embedding.*_lx_planning_(pointwise|reduction)
