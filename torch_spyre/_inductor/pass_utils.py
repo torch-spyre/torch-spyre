@@ -1474,8 +1474,8 @@ def is_stick_expr_offset_free(stick_expr: sympy.Expr, elems_per_stick: int) -> b
 
 def _is_stick_expr_with_offset(stick_expr: sympy.Expr, elems_per_stick: int) -> bool:
     """Return True if stick_expr is an offset variant: Mod(var, N) + c or var + c."""
-    if stick_expr.is_Integer and stick_expr != 0:
-        return True
+    if isinstance(stick_expr, sympy.Integer):
+        return 0 < int(stick_expr) < elems_per_stick
     if not isinstance(stick_expr, sympy.Add):
         return False
     free_args = [a for a in stick_expr.args if a.free_symbols]
