@@ -810,7 +810,7 @@ def test_fp32_reduction_cast_into_matmul(tokens, fp16):
 # ---------------------------------------------------------------------------
 # D2H EA restore, H2D write back
 # ---------------------------------------------------------------------------
-def _build_ea_d2h_tests():
+def _build_ea_dci_tests(is_h2d: bool = False):
     # Shapes common to both conversions: the stick dim is a whole number of
     # 64-element sticks.
     STICK_ALIGNED_SHAPES = [
@@ -886,6 +886,18 @@ def _build_ea_d2h_tests():
         (2, 3, 4, 44),
     ]
 
+    _XFAIL_SHAPES = {
+        (8, 16, 68),
+        (2, 96),
+        (4, 96),
+        (8, 16, 96),
+        (4, 160),
+        (8, 16, 160),
+    }
+
+    _D2H_XFAIL_SHAPES = _XFAIL_SHAPES | {(8, 16, 100)}
+    _H2D_XFAIL_SHAPES = _XFAIL_SHAPES | {(68,), (4, 68)}
+
     EA = ElementArrangement
     FP32 = torch.float32
     params = {}
@@ -903,11 +915,47 @@ def _build_ea_d2h_tests():
                     else base_expected_ea
                 )
                 key = f"{conv_name}_{shapes2key((shape,))}"
-                params[key] = (src_dtype, dst_dtype, expected_ea, shape)
+                if (
+                    not is_h2d
+                    and src_dtype in DtypeOpTable.fp16_types()
+                    and dst_dtype == FP32
+                    and shape in _D2H_XFAIL_SHAPES
+                ):
+                    params[key] = pytest.param(
+                        src_dtype,
+                        dst_dtype,
+                        expected_ea,
+                        shape,
+                        marks=pytest.mark.xfail(
+                            strict=True,
+                            raises=AssertionError,
+                            reason=f"D2H {expected_ea.name} odd-stick-pairs are unsupported #5361, #6065",
+                        ),
+                    )
+                elif (
+                    is_h2d
+                    and src_dtype in DtypeOpTable.fp16_types()
+                    and dst_dtype == FP32
+                    and shape in _H2D_XFAIL_SHAPES
+                ):
+                    params[key] = pytest.param(
+                        src_dtype,
+                        dst_dtype,
+                        expected_ea,
+                        shape,
+                        marks=pytest.mark.xfail(
+                            strict=True,
+                            raises=RuntimeError,
+                            match=r"ConvertData: output_dimwise_ea_ extent .* exceeds output buffer capacity",
+                            reason="H2D buffer capacity exceeded #5361, #6065",
+                        ),
+                    )
+                else:
+                    params[key] = (src_dtype, dst_dtype, expected_ea, shape)
     return params
 
 
-EA_D2H_TEST_PARAMS = _build_ea_d2h_tests()
+EA_D2H_TEST_PARAMS = _build_ea_dci_tests()
 
 
 def _rescale_rejected(src_dtype, dst_dtype, shape):
@@ -928,7 +976,7 @@ def _rescale_rejected(src_dtype, dst_dtype, shape):
     )
 
 
-def _d2h_unsupported(expected_ea, shape):
+def _whole_stick_pairs_rejected(expected_ea, shape):
     # fp16 -> fp32 restores whole fp32 stick pairs. A stick dim narrower than
     # 64 only gets a single fp32 stick, so half of each pair has nowhere to go.
     return expected_ea == ElementArrangement.DL16_TO_FP32 and shape[-1] < 64
@@ -976,21 +1024,23 @@ def test_ea_restore_d2h(src_dtype, dst_dtype, expected_ea, shape):
     y = _convert_one_row_per_core(x, dst_dtype)
     assert_ea(y, expected_ea)
 
-    if _d2h_unsupported(expected_ea, shape):
+    if _whole_stick_pairs_rejected(expected_ea, shape):
         with pytest.raises(RuntimeError, match="requires whole stick pairs"):
-            y.cpu()  # D2H -> ea_restore
+            y.cpu()
         return
 
-    got = y.cpu()  # D2H -> ea_restore
+    got = y.cpu()
     assert got.dtype == ref.dtype
     assert got.shape == ref.shape
     assert torch.equal(got, ref)
 
 
-EA_H2D_TEST_PARAMS = EA_D2H_TEST_PARAMS
+EA_H2D_TEST_PARAMS = _build_ea_dci_tests(is_h2d=True)
 
 EA_H2D_BASIC_TEST_PARAMS = {
-    key: params for key, params in EA_H2D_TEST_PARAMS.items() if params[3] in _SHAPES
+    key: params
+    for key, params in EA_H2D_TEST_PARAMS.items()
+    if (params.values[3] if hasattr(params, "values") else params[3]) in _SHAPES
 }
 
 
@@ -1023,7 +1073,7 @@ def test_ea_restore_h2d(src_dtype, dst_dtype, expected_ea, shape):
     y = _convert_one_row_per_core(x, dst_dtype)
     assert_ea(y, expected_ea)
 
-    if _d2h_unsupported(expected_ea, shape):
+    if _whole_stick_pairs_rejected(expected_ea, shape):
         # ea_restore now runs for H2D too and applies the same whole-stick-pair
         # check as D2H, so the copy_ itself is rejected.
         with pytest.raises(RuntimeError, match="requires whole stick pairs"):
