@@ -250,6 +250,32 @@ class TestOneBinaryServesTheRange(unittest.TestCase):
             self.assertEqual(counters["stats"]["unique_graphs"], 1)
             self.assertEqual(_kernel_cache_entries(), 1)
 
+    def test_without_a_declaration_each_size_is_its_own_graph(self):
+        """The control. A bare ``mark_dynamic`` reserves nothing, so a new size
+        is a new allocation with its own device layout and Dynamo recompiles
+        when the layout guard misses. Right at every size, and more than one
+        graph for the three sizes (measured: two, which sizes share a layout is
+        the guard's business). The declaration is what buys the one binary, and
+        nothing here changes for a dim that only went dynamic.
+        """
+        counters.clear()
+        compiled = torch.compile(tiled_gelu, backend="inductor", fullgraph=True)
+        sizes = [ROWS, MIN_ROWS, MAX_ROWS]
+
+        for rows in sizes:
+            x = torch.randn(rows, COLS, dtype=torch.float16)
+            y = x.to(DEVICE_NAME)
+            torch._dynamo.mark_dynamic(y, 0)
+            out = compiled(y).cpu().float()
+            torch.testing.assert_close(
+                out,
+                torch.nn.functional.gelu(x.float()),
+                atol=ATOL,
+                rtol=RTOL,
+                msg=f"at {rows} rows",
+            )
+        self.assertGreater(counters["stats"]["unique_graphs"], 1)
+
     def test_the_reserved_rows_above_the_size_are_never_read(self):
         """NaN in the reserved rows, moved at the maximum then shrunk, so the
         device really holds NaN above the logical size. Geometry built at the
