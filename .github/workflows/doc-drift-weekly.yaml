@@ -1,0 +1,72 @@
+# Weekly documentation maintenance.
+#
+# Runs the weekly-doc-maintenance skill on a schedule: it audits docs/source
+# against the current code for drift, consistency, and flow, applies the safe
+# fixes, proposes larger reorganizations in the PR body, and opens a pull
+# request. The prose is humanized and carries no Claude attribution.
+#
+# Activation: add an ANTHROPIC_API_KEY repository secret (or swap in
+# claude_code_oauth_token). Until that secret exists the Claude step fails
+# fast and no PR is opened. Run it on demand from the Actions tab
+# (workflow_dispatch) to test before relying on the schedule.
+name: Weekly Doc Maintenance
+
+on:
+  schedule:
+    - cron: 17 7 * * 1   # Mondays at 07:17 UTC
+  workflow_dispatch: null
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: weekly-doc-maintenance
+  cancel-in-progress: false
+
+jobs:
+  doc-maintenance:
+    # Never run on forks; only the canonical repository.
+    if: github.repository == 'torch-spyre/torch-spyre'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install docs dependencies
+        run: pip install -r docs/requirements.txt
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Run weekly documentation maintenance
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            Invoke the weekly-doc-maintenance skill and follow it exactly.
+
+            Audit docs/source against the current code for drift, consistency,
+            and flow. Apply the safe drift and consistency fixes inline. Do not
+            reorganize pages on your own; describe any larger reorganization in
+            the pull request body under "Proposed reorganization (for review)".
+            Rebuild the docs with make html in docs/ and keep the build clean.
+
+            Then open one pull request against main from a branch named
+            docs/weekly-drift-<date>, committing with git commit -s. Humanize
+            all prose, and include no Claude attribution: no "Generated with
+            Claude Code" line and no Co-Authored-By Claude trailer in the commit
+            message or the pull request body. If nothing needs changing, open no
+            pull request.
+          claude_args: |
+            --allowedTools "Read,Edit,Write,Bash(git:*),Bash(gh pr:*),Bash(make:*),Bash(python3:*),Bash(pip:*),Bash(grep:*),Bash(ls:*),Bash(sed:*),Bash(find:*)"
+            --max-turns 80
