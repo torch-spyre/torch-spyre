@@ -14,7 +14,6 @@
 
 # This file contains inductor passes that are only needed as temp fixes
 
-import operator
 from math import prod
 
 import torch
@@ -37,18 +36,6 @@ _RESHAPE_OPS = (
     aten.view.default,
     aten.reshape.default,
     aten._unsafe_view.default,
-)
-
-_VIEW_OPS = _RESHAPE_OPS + (
-    aten.slice.Tensor,
-    aten.select.int,
-    aten.unsqueeze.default,
-    aten.squeeze.dim,
-    aten.squeeze.dims,
-    aten.permute.default,
-    aten.transpose.int,
-    aten.expand.default,
-    aten.alias.default,
 )
 
 mm_to_bmm_pass = PatternMatcherPass(pass_name="unflatten_mm_to_bmm")
@@ -400,97 +387,48 @@ def decompose_addmm(graph: torch.fx.Graph) -> None:
     graph.lint()
 
 
-def _is_stick_dim(val: torch.Tensor, dim: int) -> bool:
-    """Whether ``dim`` of ``val`` is its contiguous last dim, the one Spyre sticks."""
-    return dim == val.dim() - 1 and val.stride(dim) == 1
-
-
-def _gather_needs_own_buffer(src: torch.fx.Node) -> bool:
-    """Whether a stick-dim gather source is a view the gather cannot re-tile.
-
-    A gather along the stick moves that stick onto a size-1 dim. That needs one
-    host dim of the source buffer to carry the stick; a ``[T, H*D] -> [T, H, D]``
-    view or a split of the last dim folds other elements into it (host
-    coordinate ``D*h + d``), and the re-tile fails.
-    """
-    if src.op == "placeholder":
-        return False
-    if src.target is operator.getitem or src.target in _VIEW_OPS:
-        return True
-    val = src.meta.get("val")
-    return isinstance(val, torch.Tensor) and not val.is_contiguous()
-
-
-def _copy_into_own_buffer(
-    graph: torch.fx.Graph, node: torch.fx.Node, src: torch.fx.Node, val: torch.Tensor
-) -> torch.fx.Node:
-    """Copy ``src`` into a fresh contiguous buffer of its shape.
-
-    A clone of a view keeps the base's layout, so it is ``copy_forced`` into an
-    ``empty`` of the view's shape, which gets its own row-major layout.
-    """
-    dst = graph.call_function(
-        aten.empty.memory_format,
-        args=(list(val.shape),),
-        kwargs={"dtype": val.dtype, "device": val.device},
-    )
-    dst.meta["val"] = torch.empty(val.shape, dtype=val.dtype, device="meta")
-    copy_fx_custom_meta(node, dst)
-    copy = graph.call_function(torch.ops.spyre.copy_forced.default, args=(src, dst))
-    copy.meta["val"] = torch.empty(val.shape, dtype=val.dtype, device="meta")
-    copy_fx_custom_meta(node, copy)
-    return copy
-
-
 def strided_stick_slice_to_index_select(graph: torch.fx.Graph) -> None:
-    """Rewrite ``x[..., start::step]`` (step > 1) on the stick dim as an index_select.
+    """Rewrite ``x[..., start::step]`` (step > 1) on the stick dim as a gather.
 
-    A stride inside a stick has no device coordinate: the slice reads stick
-    position ``step * i + start``, which Spyre rejects ("Unexpected stick
-    expression 2*d2"). Indexing with an arange of the same positions is a
-    gather, which Spyre lowers. This is the even/odd split of GPT-J style RoPE.
+    A stride inside a stick has no device coordinate ("Unexpected stick expression
+    2*d2"); indexing with an arange of the same positions is a gather, which Spyre
+    lowers. The source is cloned first: the gather needs a host dim that carries the
+    stick alone, which a view such as ``[T, H*D] -> [T, H, D]`` does not have.
     """
     for node in list(graph.nodes):
         if node.op != "call_function" or node.target is not aten.slice.Tensor:
             continue
-        src = node.args[0]
-        src_val = src.meta.get("val") if isinstance(src, torch.fx.Node) else None
-        out_val = node.meta.get("val")
-        if not isinstance(src_val, torch.Tensor) or not isinstance(
-            out_val, torch.Tensor
+        src, dim, start, _, step = (list(node.args) + [0, None, None, 1])[:5]
+        src_val, out_val = src.meta.get("val"), node.meta.get("val")
+        if (
+            not isinstance(step, int)
+            or step <= 1
+            or not isinstance(src_val, torch.Tensor)
         ):
             continue
-        dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", 0)
-        start = node.args[2] if len(node.args) > 2 else node.kwargs.get("start")
-        step = node.args[4] if len(node.args) > 4 else node.kwargs.get("step", 1)
-        dim = dim % src_val.dim()
-        if not isinstance(step, int) or step <= 1 or not _is_stick_dim(src_val, dim):
+        dim %= src_val.dim()
+        if dim != src_val.dim() - 1 or src_val.stride(dim) != 1:
             continue
-        size = src_val.size(dim)
-        if not isinstance(size, int):
-            continue
-        start = 0 if start is None else start
-        if not isinstance(start, int):
-            continue
-        start = max(0, min(start + size if start < 0 else start, size))
-        count = out_val.size(dim)
+        size, count = src_val.size(dim), out_val.size(dim)
+        start = 0 if start is None else max(0, min(start + size * (start < 0), size))
         with graph.inserting_before(node):
-            if _gather_needs_own_buffer(src):
-                src = _copy_into_own_buffer(graph, node, src, src_val)
+            clone = graph.call_function(
+                aten.clone.default,
+                args=(src,),
+                kwargs={"memory_format": torch.contiguous_format},
+            )
+            clone.meta["val"] = torch.empty_like(src_val, device="meta").contiguous()
             index = graph.call_function(
                 aten.arange.start_step,
                 args=(start, start + step * count, step),
                 kwargs={"dtype": torch.int64, "device": src_val.device},
             )
             index.meta["val"] = torch.empty(count, dtype=torch.int64, device="meta")
-            copy_fx_custom_meta(node, index)
             # index_select is already decomposed here; emit what it decomposes to.
-            indices = [None] * dim + [index]
-            gather = graph.call_function(aten.index.Tensor, args=(src, indices))
-            gather.meta["val"] = torch.empty(
-                out_val.shape, dtype=out_val.dtype, device="meta"
+            gather = graph.call_function(
+                aten.index.Tensor, args=(clone, [None] * dim + [index])
             )
-            copy_fx_custom_meta(node, gather)
+            gather.meta["val"] = torch.empty_like(out_val, device="meta").contiguous()
         node.replace_all_uses_with(gather)
         graph.erase_node(node)
 
