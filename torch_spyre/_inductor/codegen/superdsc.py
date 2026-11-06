@@ -362,8 +362,114 @@ def _get_coordinate_mask(
     }
 
 
+# Pool spatial dim -> its window dim (POOL_DIM_LABELS order mb,i,j,out,ki,kj).
+_POOL_WINDOW_OF = {
+    Symbol(POOL_DIM_LABELS[1]): Symbol(POOL_DIM_LABELS[4]),
+    Symbol(POOL_DIM_LABELS[2]): Symbol(POOL_DIM_LABELS[5]),
+}
+
+
+def _insert_unit_spatial_dim(
+    dim_order: list[Symbol], dim: Symbol, ref_order: list[Symbol] | None
+) -> list[Symbol]:
+    """Insert a reinstated size-1 pool spatial ``dim`` at its physical position.
+
+    ``dim_order`` runs innermost first.  A pool input addresses a spatial axis as
+    ``out * stride + window``, so the spatial dim sits immediately OUTSIDE its
+    window dim.  An arg without that window dim (the output) follows
+    ``ref_order`` -- the input's order -- placing ``dim`` after the nearest dim
+    that precedes it there.  Innermost is only the fallback when neither applies.
+    """
+    window = _POOL_WINDOW_OF.get(dim)
+    if window in dim_order:
+        pos = dim_order.index(window) + 1
+        return dim_order[:pos] + [dim] + dim_order[pos:]
+    if ref_order is not None and dim in ref_order:
+        for prev in reversed(ref_order[: ref_order.index(dim)]):
+            if prev in dim_order:
+                pos = dim_order.index(prev) + 1
+                return dim_order[:pos] + [dim] + dim_order[pos:]
+    return [dim] + dim_order
+
+
 def _calculate_device_stride(dev_dim_idx: int, device_size: list) -> int:
     return math.prod(device_size[-dev_dim_idx - 2 :])
+
+
+def _pool_spatial_pitch_scale(
+    arg, op_spec, symbol_mapping, window_symbols=()
+) -> dict[int, tuple[int, int]]:
+    """``{physical_axis: (numerator, denominator)}`` correcting a short W pitch.
+
+    ``arg.device_size`` is BOTH the read set AND the stride basis (a stride is
+    ``prod(device_size[axis+1:])``).  A windowed read factorizes a spatial axis
+    into (outer, window) factors covering only the positions the window visits:
+    a 128-wide axis pooled ``k=5 s=5`` becomes ``25 * 5 = 125``.  That read set is
+    correct, and ``device_size`` cannot express the 3-element remainder -- 128 is
+    not a multiple of the 5-wide window, which is exactly why ``paddingSizes_``
+    carries ``totalSize_``/``unneededPad_`` separately.
+
+    Only the INNERMOST spatial axis (W) matters, and only for strides whose
+    product SPANS its whole (outer, window) pair.  W's own two strides are already
+    right; the H strides above it are short because W's pitch is a factor in them:
+
+        ki (H window) = W_pitch * C        8000 vs 8192
+        i  (H out)    = s_h * W_pitch * C  40000 vs 40960
+
+    H slack is harmless; W slack alone corrupts BOTH the column advance and the
+    row advance, because W's pitch is a factor in every stride above it.
+
+    Returns an empty dict when there is nothing to scale, so non-pool ops and
+    exactly-tiling geometries are untouched.
+    """
+    pool_params = (op_spec.op_info or {}).get("pool_params") or {}
+    try:
+        # Lowering stores the extent from ``x.get_size()`` (a sympy Integer); a
+        # symbolic extent raises here and is left unscaled.
+        in_w = int(pool_params["in_w"])
+    except (KeyError, TypeError):
+        return {}
+    device_size = [int(v) for v in arg.device_size]
+
+    # Identify W's (outer, window) pair from the COORDINATES, not from sizes.
+    # Matching on ``device_size[axis] == kernel_w`` alone is unsafe: any unrelated
+    # axis of that size collides, and a batch of 2 pooled with kernel_w 2 did
+    # exactly that (device_size [1,4,2,4,2,2,64] for 2x3x8x8 k2 s2, where the
+    # batch axis at index 5 equals kernel_w) -- the scan matched the batch and
+    # rescaled strides on a geometry with no slack at all.
+    #
+    # The window axis is the one whose coordinate is the pool's *window* symbol.
+    # The pair is (outer, window) adjacent with the window inside, and the SDSC
+    # emits the W pair innermost of the two spatial pairs, so take the last such
+    # pair before the stick.
+    window_syms = {str(sym) for sym in (window_symbols or ())}
+    if not window_syms:
+        return {}
+    pair_outer = None
+    for outer in range(len(device_size) - 2, -1, -1):
+        # device_coordinates carry the kernel's raw loop symbols; map them to the
+        # SDSC dim labels the same way the surrounding code does.
+        coord = arg.device_coordinates[outer + 1].subs(symbol_mapping)
+        if {str(sym) for sym in coord.free_symbols} & window_syms:
+            pair_outer = outer
+            break
+    if pair_outer is None:
+        return {}
+    covered = device_size[pair_outer] * device_size[pair_outer + 1]
+    # ``covered`` may sit on EITHER side of the true extent, and both directions
+    # corrupt the strides built above the pair by the same ratio:
+    #   under (covered < in_w): windows tile a 128-wide axis as 25*5 = 125, so
+    #     every enclosing stride is short by the 3-element remainder;
+    #   over  (covered > in_w): a stride > kernel pool declares its window half as
+    #     the STRIDE, so 13*10 = 130 overshoots 128 and the strides run long --
+    #     measured as a 20-column-per-output-row drift on 1x64x128x128 k5 s10
+    #     (``s * (covered - in_w) = 10 * 2``).
+    # Only an exactly-tiling axis needs no correction.
+    if covered <= 0 or covered == in_w:
+        return {}
+
+    # Only strides formed strictly OUTSIDE the pair span it.
+    return {axis: (in_w, covered) for axis in range(pair_outer)}
 
 
 def _unambiguous_physical_axis(
@@ -901,6 +1007,49 @@ def _align_conv2d_dim_labels(
     return [label for idx, (label, _) in enumerate(candidates) if idx not in dropped]
 
 
+def _absorbed_window_padding(
+    total: int, span: int, pad: int, stride: int, window: str
+) -> dict:
+    """``paddingSizes_`` entry for a symmetrically padded pool window axis.
+
+    ``total`` is the padded extent ``in + 2*pad`` and ``span`` the extent the
+    windows actually read.  The difference is ``unneededPad_``, which the
+    backend absorbs from padBack_, then the valid region, then padFront_ (same
+    order as ``_conv2d_sdsc_fields``), so the
+    emitted padFront_/padBack_ are the post-absorption residuals.  E.g. in=128
+    k4 s4 p1: total 130, span 128 -> padFront_ 1, padBack_ 0, unneededPad_ 2,
+    unneededPadBack_ 1.
+    """
+    unneeded = total - span
+    if unneeded < 0:
+        raise ValueError(
+            f"pool window span {span} exceeds the padded input extent {total}"
+        )
+    pad_front, pad_back = pad, pad
+    valid = total - 2 * pad
+    unneeded_front = unneeded_back = 0
+    remaining = unneeded
+    take = min(pad_back, remaining)
+    pad_back -= take
+    unneeded_back += take
+    remaining -= take
+    remaining -= min(valid, remaining)
+    take = min(pad_front, remaining)
+    pad_front -= take
+    unneeded_front += take
+    return {
+        "padFront_": pad_front,
+        "padBack_": pad_back,
+        "unneededPad_": unneeded,
+        "unneededPadFront_": unneeded_front,
+        "unneededPadBack_": unneeded_back,
+        "totalSize_": total,
+        "stride_": stride,
+        "dilation_": 1,
+        "windowDim_": window,
+    }
+
+
 def _avgpool_sdsc_fields(
     iteration_space: dict, pool_params: dict, dim_splits: dict | None = None
 ) -> dict:
@@ -949,6 +1098,28 @@ def _avgpool_sdsc_fields(
         # unneededPad_=4).  Fall back to the span when the lowering supplied no
         # extent (older callers, conv paths).
         in_declared = pool_params.get(f"in_{'h' if spatial == 'i' else 'w'}")
+        window_dims.add(window)
+        if p > 0:
+            # A padded axis follows the backend's contract for windowed
+            # padding: the HBM input
+            # stays UNPADDED and is tagged padded_nozeropad, while totalSize_ and
+            # the input coordinates span the padded extent ``in + 2p``.  The
+            # backend fills the LX pad lanes from the ``padval`` constant (see
+            # isZeroPadded in compute_ops._memorg_extra).
+            # The lowering's in_h/in_w may be sympy Integers; the padded extent
+            # cannot be recovered from the span, so require it.
+            if in_declared is None:
+                raise ValueError(
+                    f"padded pool axis {spatial} needs the input extent "
+                    "(pool_params in_h/in_w)"
+                )
+            in_size = int(in_declared)
+            padding_sizes[spatial] = _absorbed_window_padding(
+                in_size + 2 * p, span, p, s, window
+            )
+            input_coord_padding[spatial] = "padded_nozeropad"
+            input_coord_sizes[spatial] = in_size + 2 * p
+            continue
         in_size = span
         if isinstance(in_declared, int) and in_declared > span:
             in_size = in_declared
@@ -962,7 +1133,6 @@ def _avgpool_sdsc_fields(
             "dilation_": 1,
             "windowDim_": window,
         }
-        window_dims.add(window)
         input_coord_padding[spatial] = fullspan
         input_coord_sizes[spatial] = in_size
 
@@ -986,18 +1156,28 @@ def _avgpool_sdsc_fields(
             s_ = int(entry["stride_"])
             k_ = int(iteration_space.get(Symbol(entry["windowDim_"]), 1))
             span_pc = (out_pc - 1) * s_ + k_
-            # A split strided pool (e.g. 1x64x16x16 k4 s5, i split 3 ways) gives
-            #   pc i: padFront_=-1 padBack_=-1 totalSize_=6 unneededPad_=2
-            # The slack is CARRIED per core, not zeroed, and totalSize_ is the
-            # span PLUS that slack (4 + 2 = 6) -- not the bare span.  The -1
-            # front/back sentinels mark an interior slice whose halo comes from
-            # its neighbours; a real 0 would claim this slice starts the axis.
-            unneeded = int(entry.get("unneededPad_", 0))
+            # A split axis' per-core entry covers exactly that core's read span,
+            # with no unread slack: e.g. 1x64x16x16 k4 s5, i split 3 ways, gives
+            #   pc i: padFront_=-1 padBack_=-1 totalSize_=4 unneededPad_=0
+            # The axis' global slack (the rows/columns after the last window)
+            # lies only past the LAST core's slice, so it is not repeated on
+            # every core.  Carrying it per core (totalSize_ = span + slack) is
+            # also rejected by the backend scheduler once a batch dim is present:
+            # 2x64x128x128 k5 s5 failed "initial chunk parameters must fit in
+            # LX".  The -1 front/back sentinels mark an interior slice whose halo
+            # comes from its neighbours; a real 0 would claim this slice starts
+            # the axis.
             per_core = dict(entry)
             per_core["padFront_"] = -1
             per_core["padBack_"] = -1
-            per_core["totalSize_"] = span_pc + unneeded
-            per_core["unneededPad_"] = unneeded
+            if input_coord_padding.get(spatial) == "padded_nozeropad":
+                # A padded split axis reads exactly its window span, halo
+                # included (e.g. 7 outputs per core, k9 s1: totalSize_ 15 =
+                # (7-1)*1 + 9, unneededPad_ 0).
+                per_core["unneededPadFront_"] = 0
+                per_core["unneededPadBack_"] = 0
+            per_core["totalSize_"] = span_pc
+            per_core["unneededPad_"] = 0
             padding_sizes_per_core[spatial] = per_core
 
     return {
@@ -1333,6 +1513,9 @@ def _create_sdsc_tensors(
     mb_sym = injected_dims.get("mb_sym")
     index_stick_syms = injected_dims.get("index_stick_syms")
     unit_spatial_dims: list[Symbol] = injected_dims.get("unit_spatial_dims") or []
+    # The pool input's dim order after reinstating unit spatial dims; the output
+    # (which has no window dims to anchor on) is ordered consistently with it.
+    unit_spatial_ref_order: list[Symbol] | None = None
     # Spatial dims of a pool that carry a paddingSizes_ window entry; their
     # device-vs-iteration gap is described by totalSize_/unneededPad_, so they
     # must not also get a backGap (see the emit site below).
@@ -1445,6 +1628,18 @@ def _create_sdsc_tensors(
                     ) * int(arg.device_size[tiled_axis])
                     break
 
+        pool_pitch_scale = (
+            _pool_spatial_pitch_scale(
+                arg,
+                op_spec,
+                symbol_mapping,
+                # kj is the W window symbol (POOL_DIM_LABELS order mb,i,j,out,ki,kj).
+                window_symbols=(Symbol(POOL_DIM_LABELS[5]),),
+            )
+            if _is_pool(op_spec.op) and arg.is_input
+            else {}
+        )
+
         scales: dict = {}
         strides: dict = {}
         offsets: dict = {}
@@ -1460,12 +1655,27 @@ def _create_sdsc_tensors(
         # window dim unmappable.  They are ordinary size-1 data dims (scale_ 1),
         # NOT reductions, so insert them here, ahead of Step 2, rather than letting
         # them fall into reduced_dims (scale -1).
+        #
+        # Their POSITION matters even though their extent is 1: the backend walks
+        # the tensor in layoutDimOrder_ order, and a spatial dim placed innermost
+        # (the old behavior) is declared inside every dim that is physically
+        # inside it.  For 2x64x8x8 k8 s8 that declared [j, i, mb] where memory
+        # holds mb innermost, so each core walked 64 consecutive sticks as one
+        # 8x8 window -- rows 0-3 of BOTH images -- and every batch read the wrong
+        # image.  Placing i innermost ([i, j]) likewise declared H inside W for
+        # H_out == 1, so each W output read a transposed window.
         if unit_spatial_dims and not (
             has_indirect_access and i in index_tensor_indices
         ):
             for _usd in unit_spatial_dims:
                 if _usd not in dim_order:
-                    dim_order = [_usd] + dim_order
+                    dim_order = _insert_unit_spatial_dim(
+                        dim_order, _usd, unit_spatial_ref_order
+                    )
+            if unit_spatial_ref_order is None and any(
+                w in dim_order for w in _POOL_WINDOW_OF.values()
+            ):
+                unit_spatial_ref_order = list(dim_order)
 
         # Step 2: Handle reduced dimensions — skip for index tensors.
         if (
@@ -1570,6 +1780,16 @@ def _create_sdsc_tensors(
                     math.prod(arg.device_size[physical_axis:]) * physical_gap_factor
                 )
                 dim_device_stride = math.prod(arg.device_size[physical_axis + 1 :])
+                # A pool input's innermost spatial axis under-reports the
+                # physical pitch; scale the strides that span it (see
+                # _pool_spatial_pitch_scale).  dim_device_stride is deliberately
+                # NOT rescaled: it feeds the coordinate fold's own extent, and
+                # overriding it collapses the H advance.
+                pitch_scale = pool_pitch_scale.get(physical_axis)
+                if pitch_scale is not None:
+                    num, den = pitch_scale
+                    if strides[dim] % den == 0:
+                        strides[dim] = strides[dim] // den * num
             # Injected stick dims don't exist in device_size; use stride=1.
             elif (
                 has_indirect_access

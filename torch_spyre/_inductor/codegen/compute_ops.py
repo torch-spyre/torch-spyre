@@ -1390,6 +1390,10 @@ def generate_sdsc(
             declared = int(ps.get("totalSize_", span))
             if nsplits == 1:
                 return max(span, declared)
+            if _coord_padding(str(dim), is_input) == "padded_nozeropad":
+                # A padded split axis reads exactly its halo-inclusive span per
+                # core: e.g. 7 outputs per core, k9 s1 -> (7-1)*1 + 9 = 15.
+                return span
             return max(span, span + int(ps.get("unneededPad_", 0)))
         return (
             _coord_size(str(dim), sdsc_spec.iteration_space[dim], is_input) // nsplits
@@ -1422,13 +1426,26 @@ def generate_sdsc(
             return sdsc_spec.input_coord_padding.get(str(dim), "nopad")
         return "nopad"
 
-    def _memorg_extra(is_input: bool, alloc_node: str) -> dict:
+    # Any windowed spatial dim with a real (non-zero) requested pad; the emitted
+    # padFront_/padBack_ are post-absorption residuals, so add the unneeded parts
+    # back.  The HBM input stays unpadded; the backend fills the LX pad lanes
+    # from the padval constant (default 0) only when the input's lx memOrg_
+    # says isZeroPadded.
+    has_window_pad = any(
+        int(ps.get("padFront_", 0)) + int(ps.get("unneededPadFront_", 0)) > 0
+        or int(ps.get("padBack_", 0)) + int(ps.get("unneededPadBack_", 0)) > 0
+        for ps in sdsc_spec.padding_sizes.values()
+    )
+
+    def _memorg_extra(
+        is_input: bool, alloc_node: str, zero_pad_lx: bool = False
+    ) -> dict:
         """Extra memOrg_ padding fields, emitted only when the op needs them."""
         if not sdsc_spec.emit_memorg_padding:
             return {}
         extra: dict = {
             "isPadded": 1 if is_input else 0,
-            "isZeroPadded": 0,
+            "isZeroPadded": 1 if (zero_pad_lx and has_window_pad) else 0,
         }
         # dsOffset / allocateNode_ are part of the forward-conv (#3284) and
         # general memOrg contract; depthwise conv (#3510) intentionally omits
@@ -1770,6 +1787,8 @@ def generate_sdsc(
                                                 _memorg_extra(
                                                     i < sdsc_spec.num_inputs,
                                                     "",
+                                                    # windowed activation only
+                                                    zero_pad_lx=i == 0,
                                                 )
                                                 if sdsc_spec.opfunc
                                                 != DEPTHWISE_CONV2D_OP
