@@ -2331,6 +2331,11 @@ def _host_size_stride_for_expr(
     from .propagate_layouts import _factorized_chain  # noqa: PLC0415
 
     if var not in arg.dep.ranges:
+        # Indirect gather index (e.g. x[i] where i comes from another tensor):
+        # the symbol is not a loop variable so it is absent from dep.ranges, but
+        # the tensor does vary.  Indirect-access tensors are always 1D on the
+        # host; len(host_size) == 1 is the load-bearing guard that prevents
+        # silent mis-resolution if that assumption is ever violated.
         if is_indirect(var.name) and len(host_size) == 1:
             return host_size[0], host_stride[0]
         return None
