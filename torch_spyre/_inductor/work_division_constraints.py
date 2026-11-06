@@ -51,7 +51,7 @@ from .constants import (
     BATCH_MATMUL_FP8_OP,
     CONV2D_FWD_OP,
     DEPTHWISE_CONV2D_OP,
-    KEEP_BY_INDEX_OP,
+    INDEX_MASKING_OPS,
     POOL_OPS,
     STAGGERED_EAS,
     _MAX_K_PER_CORE,
@@ -793,6 +793,19 @@ def qfp8wt_matmul_k_split_domains(ctx: WorkDivConstraintContext) -> ConstraintRe
     )
 
 
+def legal_topk_k_splits(k: int) -> frozenset[int]:
+    """Core counts that split ``k`` topk results with at most four per core.
+
+    Shared by the topk and keep_by_index constraints and by ``spyre_sort``,
+    which pads an unsplittable sort dim up to a size this accepts.
+    """
+    return frozenset(
+        split
+        for split in divisors(k)
+        if split <= config.sencores and k // split <= TOPK_MAX_K_PER_CORE
+    )
+
+
 def _topk_output_k_var(ctx: WorkDivConstraintContext) -> Symbol | None:
     """Return TopK k var, absent from every input index expression."""
     input_vars = {
@@ -829,11 +842,7 @@ def topk_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
         return ConstraintResult(allowed_splits=allowed_splits)
 
     k_size = concretize_expr(ctx.it_space[k_var])
-    legal_k_splits = frozenset(
-        split
-        for split in divisors(k_size)
-        if split <= config.sencores and k_size // split <= TOPK_MAX_K_PER_CORE
-    )
+    legal_k_splits = legal_topk_k_splits(k_size)
     if not legal_k_splits:
         raise Unsupported(
             f"topk(k={k_size}): no divisor within {config.sencores} cores gives "
@@ -844,10 +853,10 @@ def topk_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
 
 
 def _keep_by_index_axes(ctx: WorkDivConstraintContext) -> set[Symbol] | None:
-    """Return the index-only K axes of a keep_by_index op."""
+    """Return the index-only K axes of a keep_by_index / mask_by_index op."""
     if not (
         isinstance(ctx.op.data, Reduction)
-        and ctx.op.data.reduction_type == KEEP_BY_INDEX_OP
+        and ctx.op.data.reduction_type in INDEX_MASKING_OPS
     ):
         return None
     writes = op_read_writes(ctx.op).writes
@@ -886,11 +895,7 @@ def keep_by_index_k_split_constraint(ctx: WorkDivConstraintContext) -> Constrain
     allowed_splits = {}
     for axis in axes:
         size = concretize_expr(ctx.it_space[axis])
-        legal = [
-            split
-            for split in divisors(size)
-            if split <= config.sencores and size // split <= _MAX_K_PER_CORE
-        ]
+        legal = legal_topk_k_splits(size)
         if not legal:
             raise Unsupported(
                 f"keep_by_index(k={size}): no divisor within {config.sencores} "
@@ -901,18 +906,18 @@ def keep_by_index_k_split_constraint(ctx: WorkDivConstraintContext) -> Constrain
 
 
 def _keep_by_index_search_axis(ctx: WorkDivConstraintContext) -> Symbol | None:
-    """The iteration symbol of the keep_by_index full-search output axis.
+    """The iteration symbol of the keep/mask_by_index full-search output axis.
 
     The search axis is the simplest output device coordinate absent from the
     semantic indices operand. A broadcast indices input can omit unrelated
     output/batch axes, so select one simplest such coordinate rather than every
-    absent symbol. Returns ``None`` for a non-keep_by_index op or when no such
+    absent symbol. Returns ``None`` for a non-index-masking op or when no such
     axis exists.
     """
     if (
         not (
             isinstance(ctx.op.data, Reduction)
-            and ctx.op.data.reduction_type == KEEP_BY_INDEX_OP
+            and ctx.op.data.reduction_type in INDEX_MASKING_OPS
         )
         or len(ctx.input_tds) < 2
     ):
@@ -1008,7 +1013,7 @@ _STRUCTURED_REDUCTION_TYPES: frozenset[str] = frozenset(
         BATCH_MATMUL_FP8_OP,
         CONV2D_FWD_OP,
         DEPTHWISE_CONV2D_OP,
-        KEEP_BY_INDEX_OP,
+        *INDEX_MASKING_OPS,
         *TOPK_OPS,
         *POOL_OPS,
     }

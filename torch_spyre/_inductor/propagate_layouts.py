@@ -70,6 +70,7 @@ from .constants import (
     COPY_BACK_CANDIDATE_ATTR,
     DEVICE_NAME,
     ELIDED_COPY_BACK_ATTR,
+    MASK_BY_INDEX_OP,
     MATMUL_REDUCTION_OPS,
     REDUCTIONS_NON_STICK_DIM_ONLY,
     STAGGERED_EAS,
@@ -83,6 +84,7 @@ from .ir import (
 )
 from .pass_utils import (
     compute_restickify_target_layout,
+    compute_size1_restickify_target,
     concretize_expr,
     expand_sparse,
     find_matmul_generated_var,
@@ -94,7 +96,7 @@ from .pass_utils import (
     device_coordinates,
     try_device_coordinates,
     indirect_info_from_op,
-    is_keep_by_index,
+    is_index_masking_op,
     is_stick_expr_offset_free,
     is_topk,
     iter_var_id,
@@ -1013,7 +1015,18 @@ def _find_layout_avoiding_var_on_stick(
     2. Else return the first layout that can be restickified to move avoid_var
        off the stick, onto a surviving coordinate.
     3. Else raise Unsupported.
+
+    A layout whose stick is a constant (a padded size-1 stick) trivially
+    excludes avoid_var, but it is only accepted when no host coordinate
+    survives avoid_var. Otherwise the kernel reads such an indices layout
+    wrongly, so a real stick on a surviving coordinate is used instead.
     """
+    arg_host_coords = host_coordinates(arg.layout, arg.dep, None)
+    surviving_vars = set()
+    for coord in arg_host_coords:
+        if len(coord.free_symbols) > 0 and avoid_var not in coord.free_symbols:
+            surviving_vars.update(coord.free_symbols)
+
     constant_stick = None
     for stl in arg.layouts:
         dev_coords = device_coordinates(stl, arg.dep, None)
@@ -1023,16 +1036,11 @@ def _find_layout_avoiding_var_on_stick(
         if avoid_var not in stick_vars:
             if stick_vars:
                 return stl
-            constant_stick = stl
+            if not surviving_vars:
+                constant_stick = stl
 
     if constant_stick is not None:
         return constant_stick
-
-    arg_host_coords = host_coordinates(arg.layout, arg.dep, None)
-    surviving_vars = set()
-    for coord in arg_host_coords:
-        if len(coord.free_symbols) > 0 and avoid_var not in coord.free_symbols:
-            surviving_vars.update(coord.free_symbols)
 
     if not surviving_vars:
         raise Unsupported(
@@ -2267,13 +2275,13 @@ def _compact_layout(
     return out_layouts
 
 
-def _keep_by_index_layouts(
+def _index_masking_layouts(
     op: Operation,
     output: FixedLayout,
     output_dep: MemoryDep,
     args: list[PropArg],
 ) -> list[SpyreTensorLayout]:
-    """Layout propagation for keep_by_index.
+    """Layout propagation for keep_by_index and mask_by_index.
 
     Output shape matches values input (arg0). Search dimension cannot be the
     stick for arg0 or output. Indices (arg1) k dimension cannot be the stick.
@@ -2284,14 +2292,19 @@ def _keep_by_index_layouts(
       3. Find required layout for indices where k dimension is NOT on stick
       4. Compute output STL with stick matching values' output stick position
     """
-    _check_supported_input_sticks(args, "keep_by_index")
+    op_name = (
+        "mask_by_index"
+        if op.data.reduction_type == MASK_BY_INDEX_OP
+        else "keep_by_index"
+    )
+    _check_supported_input_sticks(args, op_name)
     values = args[0]
     indices = args[1]
     out_coords = host_coordinates(output, output_dep, None)
     values_coords = host_coordinates(values.layout, values.dep, None)
 
     # Find search_var: the loop variable in values not present in indices
-    # (unlike reductions, keep_by_index preserves all dimensions)
+    # (unlike reductions, keep/mask_by_index preserve all dimensions)
     indices_coords = host_coordinates(indices.layout, indices.dep, None)
     search_var = None
     for v_coord in values_coords:
@@ -2304,11 +2317,9 @@ def _keep_by_index_layouts(
             break
 
     if search_var is None:
-        raise Unsupported("keep_by_index: could not identify search dimension")
+        raise Unsupported(f"{op_name}: could not identify search dimension")
 
-    values_req_stl = _find_layout_avoiding_var_on_stick(
-        values, search_var, "keep_by_index"
-    )
+    values_req_stl = _find_layout_avoiding_var_on_stick(values, search_var, op_name)
 
     # Find reduction_var: loop variable in indices not in values (the k dimension)
     reduction_var = None
@@ -2321,10 +2332,10 @@ def _keep_by_index_layouts(
             break
 
     if reduction_var is None:
-        raise Unsupported("keep_by_index: could not identify k dimension")
+        raise Unsupported(f"{op_name}: could not identify k dimension")
 
     indices_req_stl = _find_layout_avoiding_var_on_stick(
-        indices, reduction_var, "keep_by_index"
+        indices, reduction_var, op_name
     )
 
     # Compute output STL: stick position matches values' required layout
@@ -2397,8 +2408,8 @@ def compute_layouts(
     if is_topk(op):
         return _topk_layouts(op, output, output_dep, args)
 
-    if is_keep_by_index(op):
-        return _keep_by_index_layouts(op, output, output_dep, args)
+    if is_index_masking_op(op):
+        return _index_masking_layouts(op, output, output_dep, args)
 
     if isinstance(data, Reduction):
         return _reduction_layouts(op, output, output_dep, args)
@@ -2908,6 +2919,9 @@ def _find_alt_target_stl(
         target_coords, output_dep, c_size, c_stride, write_stick, dtype_for_layout
     )
     if not candidates:
+        result = compute_size1_restickify_target(target_stl, target_layout, output_dep)
+        if result is not None:
+            return result
         raise Unsupported(
             f"no offset-free alternative stick dim for mutation target "
             f"(write stick {write_stick!r}, size={target_layout.size})"
