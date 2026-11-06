@@ -648,10 +648,6 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
     def tilings_from_menu(cls) -> bool:
         return True
 
-    @classmethod
-    def linear_cost_only(cls) -> bool:
-        return True
-
     def __init__(
         self,
         buffers: Sequence[LifetimeBoundBuffer],
@@ -862,7 +858,9 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 buffer_map[symbol.name] = (t, t.cp_tile_counts_raw[key])
 
         try:
-            cp_cost = cost_expr_to_cpsat(model, sym_map, buffer_map, cost_expr)
+            cp_cost = cost_expr_to_cpsat(
+                model, sym_map, buffer_map, cost_expr, config.cpsat_max_table_entries
+            )
             if not isinstance(cp_cost, (int, float)):
                 # if the cost is non-constant, we minimize it
                 # if the cost is constant, we use any solution
@@ -1440,10 +1438,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             return result
 
         if cost_expr is not None:
-            # Only reached with auto_coarse_tiling off: the allocator withholds the
-            # expression when tiling is a solver axis, because the cost model is
-            # flat in tile size and cut count. Unchanged behaviour otherwise --
-            # a successful cost solve returns here and the ladder is skipped.
+            # A successful cost solve returns here and the ladder is skipped.
             status = self._minimize_cost_expr(model, solver, tensors, cost_expr)
 
         if status is None:
