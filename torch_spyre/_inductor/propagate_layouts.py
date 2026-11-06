@@ -1043,10 +1043,6 @@ def _find_layout_avoiding_var_on_stick(
         return constant_stick
 
     if not surviving_vars:
-        for stl in arg.layouts:
-            result = compute_size1_restickify_target(stl, arg.layout, arg.dep)
-            if result is not None:
-                return result
         raise Unsupported(
             f"{label}: no surviving coordinates after removing {avoid_var}"
         )
