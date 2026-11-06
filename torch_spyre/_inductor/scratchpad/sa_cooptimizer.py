@@ -728,10 +728,6 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
     def tilings_from_menu(cls) -> bool:
         return False
 
-    @classmethod
-    def linear_cost_only(cls) -> bool:
-        return False
-
     def __init__(
         self,
         buffers: Sequence[LifetimeBoundBuffer],
