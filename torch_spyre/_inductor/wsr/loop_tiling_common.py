@@ -930,6 +930,13 @@ def _rebase_point_splice_reads(operations: list[Operation]) -> None:
     device_coordinates, which op_spec_validation's _check_symbol_consistency
     rejects since it is not an iteration_space key.
 
+    Neither effect is observed today: with the call removed from the
+    for_each_tile splice, the paged-gather fixtures compile and give the same
+    result, because the kernel takes the advance from the record and
+    per_trip_index pins the variable the op declares in its dim_hints. The
+    rebase is what keeps the index at iteration 0 once that pin is removed, so
+    the second effect is not tested without it.
+
     Runs after the copy/reduction/copy-out passes so it sees each op's final
     body, and rebases a read only when squeezed_advance_per_read actually
     carries its advance: any other read keeps its index as planned, so a
