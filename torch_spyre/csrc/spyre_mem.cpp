@@ -89,7 +89,14 @@ auto get_dim_map(c10::IntArrayRef sizes, c10::IntArrayRef strides,
     }
   }
 
-  if (dim_map[stick_dim_index] != -1) {
+  // Only overwrite dim_map[stick_dim_index] if it's the stick's enclosing
+  // tile (stride_map[sdi] == stride_map[-1] * device_size[-1]). Otherwise,
+  // sdi may hold an unrelated real dimension (e.g. reordered and placed
+  // between the split's tile-count and stick parts), and overwriting would
+  // corrupt its mapping.
+  if (dim_map[stick_dim_index] != -1 &&
+      stride_map[stick_dim_index] ==
+          stride_map[device_rank - 1] * device_sizes[device_rank - 1]) {
     dim_map[stick_dim_index] = dim_map[device_rank - 1];
   }
 
