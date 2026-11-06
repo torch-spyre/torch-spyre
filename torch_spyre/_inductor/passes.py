@@ -744,13 +744,13 @@ class CustomPreSchedulingPasses:
             # violation then names the pass that left it.
             check_loops(graph, where=pass_name)
 
-                if config.validate_graph_invariants:
-                    validate_graph(
-                        graph,
-                        pass_name=pass_name,
-                        prev_buffer_count=prev_buf_count,
-                    )
-                prev_buf_count = len(graph.buffers)
+            if config.validate_graph_invariants:
+                validate_graph(
+                    graph,
+                    pass_name=pass_name,
+                    prev_buffer_count=prev_buf_count,
+                )
+            prev_buf_count = len(graph.buffers)
 
     def _run_one_pass(
         self,
