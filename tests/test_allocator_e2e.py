@@ -1246,7 +1246,10 @@ class TestAllocatorE2E(TestCase):
 
         The only Python-reachable path that issues a MemoryType::Program
         allocation is prepare_kernel(): its "Allocate" command calls
-        SpyreAllocator::allocate(size, AllocationDirective{MemoryType::Program}).
+        SpyreAllocator::allocate(static_size,
+        AllocationDirective{MemoryType::Program}). Its dynamic_size is
+        only recorded on the JobPlan; the MemoryType::CompilerReserved region is
+        allocated per launch, not here, so this test sets it to 0.
 
         Note: get_memory_info() free bytes cover the whole Flex Tensor region,
         including Flex-internal buffers that bypass SpyreAllocator. With
@@ -1268,11 +1271,15 @@ class TestAllocatorE2E(TestCase):
             os.makedirs(spyrecode_dir, exist_ok=True)
             spyrecode_json = {
                 "JobPreparationPlan": [
-                    # executeAllocate() calls SpyreAllocator::allocate(size,
-                    # MemoryType::Program) (recordAlloc), moves the
-                    # CompositeAddress into job_allocation_, then drops the
-                    # DataPtr (recordRelease, 0 bytes).
-                    {"command": "Allocate", "properties": {"size": "4096"}},
+                    # executeAllocate() calls SpyreAllocator::allocate(
+                    # static_size, MemoryType::Program) (recordAlloc),
+                    # moves the CompositeAddress into job_allocation_, then
+                    # drops the DataPtr (recordRelease, 0 bytes). dynamic_size
+                    # is required but allocates nothing at prepare time.
+                    {
+                        "command": "Allocate",
+                        "properties": {"static_size": "4096", "dynamic_size": "0"},
+                    },
                     {
                         "command": "InitTransfer",
                         "properties": {
