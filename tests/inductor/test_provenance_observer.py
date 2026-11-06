@@ -621,6 +621,7 @@ class TestPipelineWrapping:
         class _FakeGraph:
             def __init__(self, ops):
                 self.operations = ops
+                self.buffers = []
 
         def dropping_gl_pass(graph):
             for op in graph.operations:

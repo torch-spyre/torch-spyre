@@ -157,6 +157,21 @@ from .loop_tiling_common import (  # noqa: F401
 )
 
 
+def _register_synthetic_buffer(name: str, buf: ComputedBuffer) -> None:
+    """Register a coarse-tile synthetic buffer on the graph.
+
+    Mirrors the bookkeeping in ``register_operation_after_graph_edit`` for
+    buffers whose name is chosen by the caller (``coarse_tile_copy_*``,
+    ``coarse_tile_combine_*``, etc.) rather than derived from
+    ``len(graph.operations)``.
+    """
+    V.graph.name_to_buffer[name] = buf
+    V.graph.name_to_op[name] = buf
+    issued = getattr(V.graph, "_spyre_issued_op_names", None)
+    if issued is not None:
+        issued.add(name)
+
+
 # ---------------------------------------------------------------------------
 # Group validation
 # ---------------------------------------------------------------------------
@@ -3235,7 +3250,7 @@ def _insert_copy_op(
         ),
     )
 
-    V.graph.name_to_buffer[copy_name] = copy_buf
+    _register_synthetic_buffer(copy_name, copy_buf)
 
     tiled_idx = operations.index(tiled_op)
     tiled_op_name = tiled_op.get_name()
@@ -3400,7 +3415,7 @@ def _insert_combine_op(
         # tiled_op's entries are for tiled_op's reads, not these two.
         squeezed_advance_per_read=[],
     )
-    V.graph.name_to_buffer[combine_name] = combine_buf
+    _register_synthetic_buffer(combine_name, combine_buf)
 
     tiled_idx = operations.index(tiled_op)
     operations.insert(tiled_idx + 1, combine_buf)
@@ -3489,7 +3504,7 @@ def _insert_reduction_copy_op(
     )
     if force_live:
         copy_buf._coarse_tile_force_live = True  # type: ignore[attr-defined]
-    V.graph.name_to_buffer[copy_name] = copy_buf
+    _register_synthetic_buffer(copy_name, copy_buf)
 
     if insert_after is not None:
         insert_idx = operations.index(insert_after) + 1
@@ -3699,7 +3714,7 @@ def _propagate_tiled_reduction_op(
     # dead_node_elimination walks, so without this it is (wrongly) seen as
     # dead and removed. Mirrors copy_buf's force_live handling above.
     fill_buf._coarse_tile_force_live = True  # type: ignore[attr-defined]
-    V.graph.name_to_buffer[fill_name] = fill_buf
+    _register_synthetic_buffer(fill_name, fill_buf)
     fill_target_idx = operations.index(fill_target)
     # scalar_op was appended to graph.operations by register_operation(); move it
     # to just after fill_target, then insert fill_buf after scalar_op.
