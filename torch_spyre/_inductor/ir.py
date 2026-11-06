@@ -685,6 +685,30 @@ class AllGatherKernel(SpyreCollectiveKernel):
         return f"torch.ops.spyre.allgather_run({input_name}, {plan_var}, {group_size})"
 
 
+class AllToAllKernel(SpyreCollectiveKernel):
+    """Out-of-place equal-split ``_c10d_functional.all_to_all_single``.
+
+    ``alltoall_run`` writes a fresh output with the input's shape; chunk i of
+    rank r's output is chunk r of rank i's input.  ``constant_args`` is the
+    c10d schema's non-tensor args with the two split lists flattened:
+    ``(*output_split_sizes, *input_split_sizes, group_name)``.  The lowering
+    only admits equal splits, so each list has ``group_size`` entries.
+    """
+
+    plan_prefix = "a2a"
+
+    def _plan_call(self, num_elems: int, dtype_code: int) -> str:
+        *splits, group_name = self.constant_args
+        group_size = len(splits) // 2
+        return (
+            f"torch.ops.spyre.alltoall_plan("
+            f"{num_elems}, {dtype_code}, {group_size}, '{group_name}')"
+        )
+
+    def _run_call(self, input_name: str, plan_var: str) -> str:
+        return f"torch.ops.spyre.alltoall_run({input_name}, {plan_var})"
+
+
 class AllReduceKernel(SpyreCollectiveKernel):
     """In-place ``_c10d_functional.all_reduce_``.
 

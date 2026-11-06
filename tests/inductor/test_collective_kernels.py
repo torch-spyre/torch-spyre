@@ -13,8 +13,8 @@
 # limitations under the License.
 """Unit tests for the Spyre collective IR nodes, built through the factories.
 
-The lowerings build ``BroadcastKernel``, ``AllGatherKernel``, ``AllReduceKernel``
-and ``WaitKernel`` with the upstream ``_CollectiveKernel`` factories
+The lowerings build ``BroadcastKernel``, ``AllGatherKernel``, ``AllToAllKernel``,
+``AllReduceKernel`` and ``WaitKernel`` with the upstream ``_CollectiveKernel`` factories
 (``create_inplace``, ``create_out_of_place``, ``create_wait``), so their
 dependency model is stock Inductor's and can change with the torch pin. These
 tests build real nodes the same way, under a minimal graph handler and without
@@ -42,6 +42,7 @@ from torch.spyre import SpyreTensorLayout
 from torch_spyre._inductor.ir import (
     AllGatherKernel,
     AllReduceKernel,
+    AllToAllKernel,
     BroadcastKernel,
     FixedTiledLayout,
     WaitKernel,
@@ -138,6 +139,12 @@ class TestFactoryBookkeeping(_CollectiveGraphTest):
                 (2, "group0"),
                 [2 * _SIZE[0], _SIZE[1]],
             ),
+            (
+                AllToAllKernel,
+                _c10d.all_to_all_single.default,
+                ([4, 4], [4, 4], "group0"),
+                _SIZE,
+            ),
         ]
         for cls, op, args, size in cases:
             with self.subTest(cls.__name__):
@@ -149,7 +156,11 @@ class TestFactoryBookkeeping(_CollectiveGraphTest):
                 self.assertNotIsInstance(result.layout, NoneLayout)
                 self.assertEqual(list(result.get_size()), size)
                 self.assertEqual(result.get_dtype(), torch.float16)
-                self.assertEqual(result.constant_args, args)
+                # Split lists (all_to_all) are flattened into constant_args.
+                flat = tuple(
+                    v for a in args for v in (a if isinstance(a, list) else (a,))
+                )
+                self.assertEqual(result.constant_args, flat)
                 self.assertEqual(result.mutation_outputs, [])
                 self.assertTrue(result.has_side_effects())
 
@@ -219,6 +230,23 @@ class TestCodegen(_CollectiveGraphTest):
                 f"{b} = torch.ops.spyre.broadcast_run(b_in, _bcast_plan_{b}, 0)",
                 f"{g} = torch.ops.spyre.allgather_run(g_in, _ag_plan_{g}, 2)",
             ],
+        )
+
+    def test_all_to_all_codegen(self):
+        a2a = AllToAllKernel.create_out_of_place(
+            _c10d.all_to_all_single.default, self._input("a_in"), [4, 4], [4, 4], "g0"
+        )
+        wrapper = _RecordingWrapper()
+
+        a2a.codegen(wrapper)
+
+        a = a2a.get_name()
+        self.assertEqual(
+            wrapper.header_lines(),
+            [f"_a2a_plan_{a} = torch.ops.spyre.alltoall_plan(512, {_FP16}, 2, 'g0')"],
+        )
+        self.assertEqual(
+            wrapper.lines, [f"{a} = torch.ops.spyre.alltoall_run(a_in, _a2a_plan_{a})"]
         )
 
     def test_wait_is_a_bare_call(self):

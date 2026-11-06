@@ -56,6 +56,7 @@ from .errors import Unsupported
 from .ir import (
     AllGatherKernel,
     AllReduceKernel,
+    AllToAllKernel,
     BroadcastKernel,
     SpyreConstantFallback,
     SpyreEmptyFallback,
@@ -3234,6 +3235,47 @@ def lower_c10d_all_gather(tensor, group_size, group_name):
         group_name,
     )
     return _all_gather(tensor, group_size, group_name)
+
+
+@register_spyre_lowering(_c10d.all_to_all_single.default)
+def lower_c10d_all_to_all_single(
+    tensor, output_split_sizes, input_split_sizes, group_name
+):
+    """Out-of-place equal-split all_to_all: output has the input's shape.
+
+    Only equal splits are supported (the default of
+    torch.distributed._functional_collectives.all_to_all_single): the tensor is
+    split into group_size equal chunks along dim 0 and chunk i goes to rank i.
+    """
+    group_size = len(input_split_sizes)
+    dim0 = tensor.get_size()[0]
+    expected = [dim0 // group_size] * group_size if group_size > 0 else []
+    if (
+        group_size == 0
+        or len(output_split_sizes) != group_size
+        or list(input_split_sizes) != expected
+        or list(output_split_sizes) != expected
+    ):
+        raise Unsupported(
+            "all_to_all_single: only equal input/output splits that evenly "
+            f"divide dim 0 are supported (input_split_sizes={input_split_sizes}, "
+            f"output_split_sizes={output_split_sizes}, dim0={dim0})"
+        )
+
+    logger.debug(
+        "Lowering _c10d_functional.all_to_all_single (group_size=%s, group_name='%s')",
+        group_size,
+        group_name,
+    )
+    return ir.TensorBox.create(
+        AllToAllKernel.create_out_of_place(
+            _c10d.all_to_all_single.default,
+            tensor,
+            output_split_sizes,
+            input_split_sizes,
+            group_name,
+        )
+    )
 
 
 def _all_reduce_inplace(tensor, reduce_op, group_name):

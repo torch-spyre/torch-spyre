@@ -76,6 +76,7 @@ from .constants import (
 )
 from .ir import (
     FixedTiledLayout,
+    AllToAllKernel,
     BroadcastKernel,
     SpyreCollectiveKernel,
     SpyreConstantFallback,
@@ -3573,8 +3574,8 @@ def propagate_spyre_tensor_layouts(
             # their output buffer.
             if isinstance(op.layout, NoneLayout):
                 pass
-            elif isinstance(op, BroadcastKernel):
-                # Same shape as the input; broadcast_run allocates it alike.
+            elif isinstance(op, (BroadcastKernel, AllToAllKernel)):
+                # Same shape as the input; the run op allocates it alike.
                 input_buf = V.graph.get_buffer(op.inputs[0].get_name())
                 op.layouts = list(input_buf.layouts)
                 op.restick_cost_fn = AnyInNode.from_args()
