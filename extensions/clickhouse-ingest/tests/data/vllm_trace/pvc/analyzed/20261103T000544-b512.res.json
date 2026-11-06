@@ -1,0 +1,230 @@
+{
+ "compile": {
+  "by_pass": {
+   "pass:CustomPreSchedulingPasses:_maybe_scratchpad_planning": {
+    "incl_s": 3.0,
+    "n": 3,
+    "self_s": 3.0
+   },
+   "pass:CustomPreSchedulingPasses:span_reduction": {
+    "incl_s": 1.0,
+    "n": 3,
+    "self_s": 1.0
+   }
+  },
+  "by_stage": {},
+  "frontend_s": 99.5,
+  "kernel_cache": {
+   "entries": 4,
+   "hits": 1,
+   "misses": 3
+  },
+  "n_compiles": 3,
+  "timing_files": 1,
+  "total_s": 99.5
+ },
+ "device_memory": {
+  "method": "example",
+  "peak_b": 500000,
+  "total_b": 1000000
+ },
+ "label": "20261103T000544-b512",
+ "phases": {
+  "compile_warmup": {
+   "cg_mem_peak_b": 14,
+   "cpu_cores_mean": 13.0,
+   "cpu_cores_peak": 14.5,
+   "cpu_s": 16.0,
+   "dev_allocated_peak_b": 30,
+   "dev_max_allocated_b": 34,
+   "n_samples": 38,
+   "nr_throttled": 42,
+   "pss_peak_b": 46,
+   "rss_peak_b": 50,
+   "throttled_s": 26.5,
+   "wall_s": 28.0
+  },
+  "decode": {
+   "cg_mem_peak_b": 62,
+   "cpu_cores_mean": 31.0,
+   "cpu_cores_peak": 32.5,
+   "cpu_s": 34.0,
+   "dev_allocated_peak_b": 10,
+   "dev_max_allocated_b": 14,
+   "n_samples": 18,
+   "nr_throttled": 22,
+   "pss_peak_b": 26,
+   "rss_peak_b": 30,
+   "throttled_s": 19.0,
+   "wall_s": 20.5
+  },
+  "import": {
+   "cg_mem_peak_b": 42,
+   "cpu_cores_mean": 23.5,
+   "cpu_cores_peak": 25.0,
+   "cpu_s": 26.5,
+   "dev_allocated_peak_b": null,
+   "dev_max_allocated_b": null,
+   "n_samples": 58,
+   "nr_throttled": 62,
+   "pss_peak_b": 66,
+   "rss_peak_b": 70,
+   "throttled_s": 34.0,
+   "wall_s": 10.0
+  },
+  "init": {
+   "cg_mem_peak_b": 14,
+   "cpu_cores_mean": 13.0,
+   "cpu_cores_peak": 14.5,
+   "cpu_s": 16.0,
+   "dev_allocated_peak_b": 30,
+   "dev_max_allocated_b": 34,
+   "n_samples": 38,
+   "nr_throttled": 42,
+   "pss_peak_b": 46,
+   "rss_peak_b": 50,
+   "throttled_s": 26.5,
+   "wall_s": 28.0
+  },
+  "prefill": {
+   "cg_mem_peak_b": 62,
+   "cpu_cores_mean": 31.0,
+   "cpu_cores_peak": 32.5,
+   "cpu_s": 34.0,
+   "dev_allocated_peak_b": 10,
+   "dev_max_allocated_b": 14,
+   "n_samples": 18,
+   "nr_throttled": 22,
+   "pss_peak_b": 26,
+   "rss_peak_b": 30,
+   "throttled_s": 19.0,
+   "wall_s": 20.5
+  },
+  "warmup": {
+   "cg_mem_peak_b": 42,
+   "cpu_cores_mean": 23.5,
+   "cpu_cores_peak": 25.0,
+   "cpu_s": 26.5,
+   "dev_allocated_peak_b": 58,
+   "dev_max_allocated_b": 62,
+   "n_samples": 66,
+   "nr_throttled": 70,
+   "pss_peak_b": 74,
+   "rss_peak_b": 10,
+   "throttled_s": 11.5,
+   "wall_s": 13.0
+  }
+ },
+ "run_dir": "out/example",
+ "schema": 1,
+ "steps": {
+  "cpu_fallback": {
+   "decode": {
+    "ms_per_step": 5.0,
+    "ops": {},
+    "per_step": 5.5
+   },
+   "prefill": {
+    "ms_per_step": 6.0,
+    "ops": {},
+    "per_step": 6.5
+   }
+  },
+  "decode": {
+   "busy_ms": 7.0,
+   "busy_pct": 1.0,
+   "corr_kb_per_step": 1.5,
+   "corr_per_step": 2.0,
+   "d2h_kb_per_step": 2.5,
+   "d2h_per_step": 3.0,
+   "fallback_ms_per_step": 0.0,
+   "fallback_ops": {},
+   "fallback_per_step": 4.0,
+   "gaps_per_step": 4.5,
+   "h2d_kb_per_step": 5.0,
+   "h2d_per_step": 5.5,
+   "host_exposed_ms": 6.0,
+   "jobplan_us_per_launch": 6.5,
+   "launch_marker_us_per_launch": 7.0,
+   "launches_per_step": 1.0,
+   "n": 2,
+   "runtime_threads_in_gaps_ms_per_step": {
+    "aiuClockCalibration": 2.0,
+    "aiuDataConvert": 2.5,
+    "aiuFetchResponseBlocks": 3.0,
+    "aiuIssueBarrier": 3.5,
+    "aiuIssueCallback": 4.0,
+    "aiuIterationDuration": 4.5,
+    "aiuLaunchControlBlocks": 5.0,
+    "aiuLaunchDMIControlBlocks": 5.5,
+    "aiuLaunchDMOControlBlocks": 6.0,
+    "aiuParseResponseBlocks": 6.5,
+    "aiuSubmitCompute": 7.0,
+    "aiuSubmitDMA": 1.0,
+    "aiuSubmitToHardware": 1.5
+   },
+   "sync_ms_per_step": 2.0,
+   "sync_n_per_step": 2.5,
+   "wall_ms": 3.0,
+   "waterfall_ms_per_step": {
+    "attn_host": 3.5,
+    "correction_upload": 4.0,
+    "d2h_copy": 4.5,
+    "dynamo_guard": 5.0,
+    "h2d_copy": 5.5,
+    "launch": 6.0,
+    "python": 6.5,
+    "sync_wait": 7.0,
+    "torch_op": 1.0
+   }
+  },
+  "prefill": {
+   "busy_ms": 1.5,
+   "busy_pct": 2.0,
+   "corr_kb_per_step": 2.5,
+   "corr_per_step": 3.0,
+   "d2h_kb_per_step": 3.5,
+   "d2h_per_step": 4.0,
+   "fallback_ms_per_step": 0.0,
+   "fallback_ops": {},
+   "fallback_per_step": 5.0,
+   "gaps_per_step": 5.5,
+   "h2d_kb_per_step": 6.0,
+   "h2d_per_step": 6.5,
+   "host_exposed_ms": 7.0,
+   "jobplan_us_per_launch": 1.0,
+   "launch_marker_us_per_launch": 1.5,
+   "launches_per_step": 2.0,
+   "n": 4,
+   "runtime_threads_in_gaps_ms_per_step": {
+    "aiuClockCalibration": 3.0,
+    "aiuDataConvert": 3.5,
+    "aiuFetchResponseBlocks": 4.0,
+    "aiuIssueBarrier": 4.5,
+    "aiuIssueCallback": 5.0,
+    "aiuIterationDuration": 5.5,
+    "aiuLaunchControlBlocks": 6.0,
+    "aiuLaunchDMIControlBlocks": 6.5,
+    "aiuLaunchDMOControlBlocks": 7.0,
+    "aiuParseResponseBlocks": 1.0,
+    "aiuSubmitCompute": 1.5,
+    "aiuSubmitDMA": 2.0,
+    "aiuSubmitToHardware": 2.5
+   },
+   "sync_ms_per_step": 3.0,
+   "sync_n_per_step": 3.5,
+   "wall_ms": 4.0,
+   "waterfall_ms_per_step": {
+    "attn_host": 4.5,
+    "correction_upload": 5.0,
+    "d2h_copy": 5.5,
+    "dynamo_guard": 6.0,
+    "h2d_copy": 6.5,
+    "launch": 7.0,
+    "python": 1.0,
+    "sync_wait": 1.5,
+    "torch_op": 2.0
+   }
+  }
+ }
+}

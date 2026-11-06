@@ -98,14 +98,15 @@ FROM (
                     groupArray(run_id) OVER w AS base_runs
                 FROM (
                     -- Every sample, not the per-run mean: U needs the distribution. Zeros are dropped,
-                    -- since producers write 0 for a metric they did not measure.
+                    -- since producers write 0 for a metric they did not measure. Trace rows
+                    -- (report_kind vllm-trace) describe a run; they have no baseline to regress against.
                     SELECT run_id, benchmark_id, component, backend, arch, source_job,
                            any(name) AS name, any(input_shapes) AS input_shapes, min(run_ts) AS run_ts,
                            s.1 AS metric, groupArray(s.2) AS cur
                     FROM v_benchmark_results_enriched
                     ARRAY JOIN arrayFlatten(arrayMap(kv -> arrayMap(v -> (kv.1, v), kv.2),
                                CAST(samples, 'Array(Tuple(String, Array(Float64)))'))) AS s
-                    WHERE s.2 != 0
+                    WHERE s.2 != 0 AND record_type NOT IN ('trace_phase', 'trace_step', 'trace_kernel', 'compile_pass')
                     GROUP BY run_id, benchmark_id, component, backend, arch, source_job, metric
                 )
                 WINDOW w AS (PARTITION BY component, benchmark_id, backend, arch, source_job, metric

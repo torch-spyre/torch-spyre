@@ -1,0 +1,120 @@
+{
+ "kernels": [
+  {
+   "aten": null,
+   "calls": 4,
+   "kernel": null,
+   "key": "k_decode",
+   "median_us": 400.0,
+   "phase": "decode",
+   "steps_per_call": 1,
+   "total_ms": 1.6
+  },
+  {
+   "aten": null,
+   "calls": 1,
+   "kernel": null,
+   "key": "k_prefill",
+   "median_us": 400.0,
+   "phase": "prefill",
+   "steps_per_call": 1,
+   "total_ms": 0.4
+  }
+ ],
+ "params": {
+  "hbm_gbps": 150.0,
+  "macs_per_ns_per_core": 1140.0,
+  "skip_first_decode": 1
+ },
+ "schema": 1,
+ "timeline": [
+  {
+   "kind": "prefill",
+   "segs": [
+    {
+     "bound": null,
+     "dur_us": 400.0,
+     "key": "k_prefill",
+     "pct_floor": null,
+     "t_us": 200.0
+    }
+   ],
+   "skipped": false,
+   "step": "ttft"
+  },
+  {
+   "kind": "decode",
+   "segs": [
+    {
+     "bound": null,
+     "dur_us": 400.0,
+     "key": "k_decode",
+     "pct_floor": null,
+     "t_us": 200.0
+    }
+   ],
+   "skipped": true,
+   "step": "itl_0001"
+  },
+  {
+   "kind": "decode",
+   "segs": [
+    {
+     "bound": null,
+     "dur_us": 400.0,
+     "key": "k_decode",
+     "pct_floor": null,
+     "t_us": 200.0
+    }
+   ],
+   "skipped": false,
+   "step": "itl_0002"
+  },
+  {
+   "kind": "decode",
+   "segs": [
+    {
+     "bound": null,
+     "dur_us": 400.0,
+     "key": "k_decode",
+     "pct_floor": null,
+     "t_us": 200.0
+    }
+   ],
+   "skipped": false,
+   "step": "itl_0003"
+  },
+  {
+   "kind": "decode",
+   "segs": [
+    {
+     "bound": null,
+     "dur_us": 400.0,
+     "key": "k_decode",
+     "pct_floor": null,
+     "t_us": 200.0
+    }
+   ],
+   "skipped": false,
+   "step": "itl_0004"
+  },
+  {
+   "kind": "decode",
+   "segs": [
+    {
+     "bound": null,
+     "dur_us": 400.0,
+     "key": "k_decode",
+     "pct_floor": null,
+     "t_us": 200.0
+    }
+   ],
+   "skipped": false,
+   "step": "itl_0005"
+  }
+ ],
+ "unjoined_keys": [
+  "k_decode",
+  "k_prefill"
+ ]
+}

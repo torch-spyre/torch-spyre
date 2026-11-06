@@ -1,0 +1,1 @@
+INFO non-default args: {'dtype': 'float16', 'max_model_len': 2048, 'max_num_batched_tokens': 512, 'max_num_seqs': 4, 'model': 'm'}

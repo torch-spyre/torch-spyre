@@ -1,0 +1,12 @@
+{
+ "cache": {
+  "entries": 4,
+  "hits": 2,
+  "misses": 2
+ },
+ "passes": {
+  "Post:b": 2.0,
+  "Pre:a": 4.0
+ },
+ "total_s": 8.0
+}

@@ -1,0 +1,16 @@
+{
+ "args": {
+  "batch_size": 1,
+  "budget": 0,
+  "dtype": "float16",
+  "input_len": 512,
+  "max_model_len": 1024,
+  "model": "example-org/model-a",
+  "out": "/work/out",
+  "output_len": 64,
+  "task": "generate",
+  "tp": 1,
+  "warmup": 2
+ },
+ "e2e_s": 8.5
+}

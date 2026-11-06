@@ -1,0 +1,142 @@
+[
+ {
+  "audit": {
+   "device_overlaps": 14,
+   "kernel_ms": 13.0,
+   "launch_marker_ms": 14.5,
+   "memcpy_ms": 16.0,
+   "memset_ms": 17.5,
+   "runtime_barrier_ms": 19.0,
+   "runtime_fetch_ms": 20.5
+  },
+  "decode_summary": {
+   "busy_ms": 22.0,
+   "busy_pct": 23.5,
+   "corr_kb_per_step": 25.0,
+   "corr_per_step": 26.5,
+   "d2h_kb_per_step": 28.0,
+   "d2h_per_step": 29.5,
+   "fallback_ms_per_step": 0.0,
+   "fallback_ops": {},
+   "fallback_per_step": 32.5,
+   "gaps_per_step": 34.0,
+   "h2d_kb_per_step": 10.0,
+   "h2d_per_step": 11.5,
+   "host_exposed_ms": 13.0,
+   "jobplan_us_per_launch": 14.5,
+   "launch_marker_us_per_launch": 16.0,
+   "launches_per_step": 100.0,
+   "n": 5,
+   "sync_ms_per_step": 20.5,
+   "sync_n_per_step": 22.0,
+   "wall_ms": 23.5,
+   "waterfall_ms_per_step": {
+    "attn_host": 25.0,
+    "correction_upload": 26.5,
+    "d2h_copy": 28.0,
+    "dynamo_guard": 29.5,
+    "h2d_copy": 31.0,
+    "launch": 32.5,
+    "python": 34.0,
+    "sync_wait": 10.0,
+    "torch_op": 11.5
+   }
+  },
+  "prefill_summary": {
+   "busy_ms": 13.0,
+   "busy_pct": 14.5,
+   "corr_kb_per_step": 16.0,
+   "corr_per_step": 17.5,
+   "d2h_kb_per_step": 19.0,
+   "d2h_per_step": 20.5,
+   "fallback_ms_per_step": 0.0,
+   "fallback_ops": {
+    "aten::op_00": {
+     "calls_per_step": 1.0,
+     "in_compiled": 0,
+     "ms_per_step": 0.1
+    },
+    "aten::op_01": {
+     "calls_per_step": 1.0,
+     "in_compiled": 0,
+     "ms_per_step": 0.2
+    },
+    "aten::op_02": {
+     "calls_per_step": 1.0,
+     "in_compiled": 0,
+     "ms_per_step": 0.30000000000000004
+    },
+    "aten::op_03": {
+     "calls_per_step": 1.0,
+     "in_compiled": 0,
+     "ms_per_step": 0.4
+    },
+    "aten::op_04": {
+     "calls_per_step": 1.0,
+     "in_compiled": 0,
+     "ms_per_step": 0.5
+    },
+    "aten::op_05": {
+     "calls_per_step": 1.0,
+     "in_compiled": 0,
+     "ms_per_step": 0.6000000000000001
+    },
+    "aten::op_06": {
+     "calls_per_step": 1.0,
+     "in_compiled": 0,
+     "ms_per_step": 0.7000000000000001
+    },
+    "aten::op_07": {
+     "calls_per_step": 1.0,
+     "in_compiled": 0,
+     "ms_per_step": 0.8
+    },
+    "aten::op_08": {
+     "calls_per_step": 1.0,
+     "in_compiled": 0,
+     "ms_per_step": 0.9
+    },
+    "aten::op_09": {
+     "calls_per_step": 1.0,
+     "in_compiled": 0,
+     "ms_per_step": 1.0
+    },
+    "aten::op_10": {
+     "calls_per_step": 1.0,
+     "in_compiled": 0,
+     "ms_per_step": 1.1
+    },
+    "aten::op_11": {
+     "calls_per_step": 1.0,
+     "in_compiled": 0,
+     "ms_per_step": 1.2000000000000002
+    }
+   },
+   "fallback_per_step": 23.5,
+   "gaps_per_step": 25.0,
+   "h2d_kb_per_step": 26.5,
+   "h2d_per_step": 28.0,
+   "host_exposed_ms": 29.5,
+   "jobplan_us_per_launch": 31.0,
+   "launch_marker_us_per_launch": 32.5,
+   "launches_per_step": 34.0,
+   "n": 1,
+   "sync_ms_per_step": 11.5,
+   "sync_n_per_step": 13.0,
+   "wall_ms": 14.5,
+   "waterfall_ms_per_step": {
+    "attn_host": 16.0,
+    "correction_upload": 17.5,
+    "cpu_fallback": 7.5,
+    "dynamo_guard": 19.0,
+    "h2d_copy": 20.5,
+    "launch": 22.0,
+    "python": 23.5,
+    "sync_wait": 25.0,
+    "torch_op": 26.5
+   }
+  },
+  "steps": [],
+  "trace": "traces/example.json"
+ }
+]
