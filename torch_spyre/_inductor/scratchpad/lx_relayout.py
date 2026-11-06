@@ -513,6 +513,20 @@ def _movement_supported(
         return False
     if max(fanin) > _MAX_SHUFFLE_FANIN:
         return False
+    # Conservative workaround for issue #5811: complete repartitions where the
+    # source splits a dropped axis (absent from destination.work_slice_dims) by
+    # _MAX_SHUFFLE_FANIN produce wrong values with NDO=1.  The exact failure
+    # mechanism is not yet established; this guard excludes the observed bad
+    # geometry until the root cause is confirmed.
+    _dropped_split_product = 1
+    for _axis, _split in source_splits.items():
+        if _axis not in destination_splits:
+            _dropped_split_product *= _split
+    if (
+        destination_slices == destination_num_cores
+        and _dropped_split_product >= _MAX_SHUFFLE_FANIN
+    ):
+        return False
     # A complete destination is an exact repartition, including contraction
     # onto fewer cores and expansion onto more cores. The shuffle's per-tensor
     # maps describe the two domains; STCDP intersects their pieces rather than
