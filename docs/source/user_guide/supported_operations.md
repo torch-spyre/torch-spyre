@@ -96,6 +96,7 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 | `torch.aminmax` | | Y | Spyre | Compiled only; eager not yet supported |
 | `torch.any` | Y | Y | Spyre | Custom lowering; reduces over `dim`/`dims` or the full tensor |
 | `torch.all` | Y | Y | Spyre | Custom decomposition (`abs` + `amin`) |
+| `torch.cumsum` | Y | Y | Spyre | Custom decomposition: matmul with a triangular matrix for fp16/bf16, a parallel prefix scan for fp32/int32/int64. A bool input, or a dtype conversion that changes the element width, falls back to CPU |
 | **View Ops** [^views] | | | | |
 | `torch.reshape` / `torch.view` | | Y | Spyre | Includes `_reshape_alias` (a C++ device view, not an Inductor lowering) |
 | `torch.transpose` | Y | Y | Spyre | |
@@ -146,7 +147,6 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 | `torch.bitwise_or` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.argmax` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.argmin` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
-| `torch.cumsum` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 
 > **Column key:**
 >

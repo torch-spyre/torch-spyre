@@ -704,6 +704,22 @@ def _(
     return input.new_empty(shape)
 
 
+@torch.library.custom_op(
+    "spyre::cumsum_cpu_fallback", mutates_args=(), device_types="spyre"
+)
+def spyre_cumsum_cpu_fallback(
+    input: torch.Tensor, dim: int, dtype: torch.dtype
+) -> torch.Tensor:
+    """torch.cumsum on CPU, for the cases spyre_cumsum does not run on Spyre."""
+    warn_fallback("torch.ops.spyre.cumsum_cpu_fallback")
+    return torch.cumsum(input.to("cpu"), dim=dim, dtype=dtype).to(input.device)
+
+
+@spyre_cumsum_cpu_fallback.register_fake
+def _(input: torch.Tensor, dim: int, dtype: torch.dtype) -> torch.Tensor:
+    return input.new_empty(input.shape, dtype=dtype)
+
+
 @torch.library.custom_op("spyre::min_dim_int64_fallback", mutates_args=())
 def min_dim_int64_fallback(
     input: torch.Tensor, dim: int, keepdim: bool = False
