@@ -70,6 +70,7 @@ from for_each_tile_fixtures import (
     split_m_fn,
     two_loops_shared_init_fn,
 )
+from torch_spyre._inductor.loop_carries import apply_loop_carries
 from torch_spyre._inductor.loop_node import all_ops, expand
 from torch_spyre._inductor.wsr.for_each_tile_lowering import (
     try_prove_for_each_tile,
@@ -543,13 +544,18 @@ class TestSpliceWhileLoop(unittest.TestCase):
                     )
 
                 if case == "identity":
+                    # The scatter is the update: it stays a mutation, now of
+                    # the storage, and declares no carry.
                     self.assertEqual(result, [update])
                     self.assertIs(update.layout.get_buffer(), storage)
                     self.assertFalse(hasattr(storage, "_loop_carry_record"))
                 else:
+                    # The clone is the update: it is declared and stays pure
+                    # until apply_loop_carries.
                     self.assertIs(result[0], clone)
-                    self.assertIs(clone.layout.get_buffer(), storage)
+                    self.assertIs(clone.layout, clone_layout)
                     self.assertEqual(storage._loop_carry_record.update_name, "clone")
+                    self.assertIs(clone._loop_carry_record, storage._loop_carry_record)
 
     def test_accumulator_view_tags_backing_storage(self):
         """A view-backed carry records ownership on its mutable Buffer."""
@@ -605,10 +611,13 @@ class TestSpliceWhileLoop(unittest.TestCase):
             )
 
         self.assertEqual(body_ops, [producer])
-        self.assertIs(producer.layout.target, target)
+        # The splice declares the carry and leaves the update pure; the view
+        # is what apply_loop_carries will make it write through.
+        self.assertIsInstance(producer.layout, ir.FixedLayout)
         record = storage._loop_carry_record
         self.assertEqual(record.storage_name, "carry_storage")
         self.assertEqual(record.update_name, "carry_update")
+        self.assertIs(record.storage_view, target)
         self.assertIs(producer._loop_carry_record, record)
         self.assertFalse(hasattr(target, "_loop_carry_record"))
 
@@ -1615,6 +1624,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
         input_names = set(graph.graph_inputs.keys())
         with V.set_graph_handler(graph):
             splice_while_loops(graph)
+            apply_loop_carries(graph)
             expand(graph)
         copies = [
             op
@@ -1682,6 +1692,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
         input_names = set(graph.graph_inputs.keys())
         with V.set_graph_handler(graph):
             splice_while_loops(graph)  # must not raise
+            apply_loop_carries(graph)
             expand(graph)
         copies = [
             op
@@ -1722,6 +1733,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
         graph = self._run_graph(two_loops_shared_init_fn, (X, Y))
         with V.set_graph_handler(graph):
             splice_while_loops(graph)
+            apply_loop_carries(graph)
             expand(graph)
         copies = [
             op
@@ -2479,6 +2491,7 @@ class TestDrainMaterialization(unittest.TestCase):
         graph = self._run_graph(split_k_fn, (X, Y))
         with V.set_graph_handler(graph):
             splice_while_loops(graph)
+            apply_loop_carries(graph)
             expand(graph)
         return graph
 
@@ -2714,6 +2727,7 @@ class TestDrainMaterialization(unittest.TestCase):
         graph = self._run_graph(split_k_caller_init_fn, (X, Y, torch.zeros_like(ref)))
         with V.set_graph_handler(graph):
             splice_while_loops(graph)
+            apply_loop_carries(graph)
             expand(graph)
         storage, _update, record = self._carry_parts(graph)
         self.assertIn("while_loop_carry_copy_", storage.get_name())
@@ -2742,6 +2756,7 @@ class TestDrainMaterialization(unittest.TestCase):
         )
         with V.set_graph_handler(graph):
             splice_while_loops(graph)
+            apply_loop_carries(graph)
             expand(graph)
 
         def nested_view(entry):
@@ -5798,6 +5813,45 @@ class TestHoistedInputCloneOnRealGraph(unittest.TestCase):
             if any(dep.name == clone_name for dep in n.unmet_dependencies)
         ]
         self.assertTrue(readers)
+
+
+class TestRepointRefsToBuffer(unittest.TestCase):
+    """An outside consumer of a spliced loop output is repointed at the carry."""
+
+    def test_in_place_collective_mutation_follows_its_operand(self):
+        """create_inplace records the mutation on MutationOutputs and
+        alias_names, which an .inputs rewrite alone never reaches: left alone
+        they name the removed loop output and the scheduler fails on it."""
+        import types
+
+        from torch._inductor import ir
+
+        from torch_spyre._inductor.ir import AllReduceKernel
+        from torch_spyre._inductor.wsr.while_loop_bridge import (
+            _repoint_refs_to_buffer,
+        )
+
+        def buffer(name):
+            buf = mock.MagicMock(spec=ir.ComputedBuffer)
+            buf.get_name.return_value = name
+            return buf
+
+        all_reduce = AllReduceKernel.__new__(AllReduceKernel)
+        all_reduce.inputs = [ir.TensorBox(ir.StorageBox(buffer("loop_out")))]
+        all_reduce.mutation_outputs = [
+            types.SimpleNamespace(mutation_names=["loop_out"])
+        ]
+        all_reduce.alias_names = ["loop_out"]
+        graph = types.SimpleNamespace(
+            graph_outputs=[], operations=[all_reduce], mutated_buffers=set()
+        )
+
+        _repoint_refs_to_buffer(graph, "loop_out", buffer("carry"))
+
+        self.assertEqual(all_reduce.inputs[0].get_name(), "carry")
+        self.assertEqual(all_reduce.mutation_outputs[0].mutation_names, ["carry"])
+        self.assertEqual(all_reduce.alias_names, ["carry"])
+        self.assertIn("carry", graph.mutated_buffers)
 
 
 class TestRecoverSpyreHints(unittest.TestCase):
