@@ -1893,6 +1893,13 @@ _ASSUMED_PADDING: dict[type, Set] = {
 }
 
 
+def get_or_pick_pad_value(inv_domain: InvalidDomain, dtype: torch.dtype):
+    pad_value = get_pad_value(inv_domain.func, dtype)
+    if pad_value is None or not inv_domain.domain.contains(pad_value):
+        pad_value = pick_element(inv_domain.domain)
+    return pad_value
+
+
 def track_padding_value(graph: GraphLowering) -> None:
     operations = graph.operations
     tracer = DomainRangeTracer()
@@ -2022,17 +2029,13 @@ def track_padding_value(graph: GraphLowering) -> None:
                     else:
                         do_pad = True
 
-                    pad_value = get_pad_value(inv_domain.func, buf.layout.dtype)
-                    if pad_value is None or not inv_domain.domain.contains(pad_value):
-                        try:
-                            pad_value = pick_element(inv_domain.domain)
-                        except ValueError:
-                            # TODO: ideally we don't want to raise here if there is no padding
-                            raise ValueError(
-                                f"Could not find legal pad for input {name} of {op.name}:{inv_domain.func}"
-                            )
-                    tracer.buffer_input[op.name][name] = FiniteSet(pad_value)
-
+                    try:
+                        pad_value = get_or_pick_pad_value(inv_domain, buf.layout.dtype)
+                        tracer.buffer_input[op.name][name] = FiniteSet(pad_value)
+                    except ValueError:
+                        raise ValueError(
+                            f"Could not find legal pad for input {name} of {op.name}:{inv_domain.func}"
+                        )
             else:
                 raise ValueError(f"Could not find an input padding that op {op.name}")
 
