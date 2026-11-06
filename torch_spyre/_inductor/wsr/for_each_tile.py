@@ -470,6 +470,11 @@ def _xs_leaf(operand: torch.Tensor, spec: TileSpec) -> torch.Tensor:
     # never reaches. Under an active `torch.device` mode -- vLLM runs its model
     # inside one -- DeviceContext.__torch_function__ re-dispatches into that body
     # and dynamo cannot trace the `super()` call. The free function has no body.
+    #
+    # Traced, the trim is one aten.slice.Tensor over the whole length, so the FX
+    # graph does differ. Inductor's slice lowering returns the input itself for
+    # it (start 0, step 1, the size provably within the end), so no kernel or
+    # view is emitted.
     tiles = spec.num_tiles
     trimmed = moved.narrow(0, 0, tiles * spec.extent)
     return torch.unflatten(trimmed, 0, (tiles, spec.extent))
