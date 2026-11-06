@@ -473,6 +473,43 @@ class TestSpyre(TestCase):
         a_cpu = a.cpu()
         self.assertTrue(a_cpu.eq(1.0).all())
 
+    @parametrize("dtype", [torch.float16, torch.float32, torch.int64, torch.bool])
+    @parametrize("op", ["fill_", "zero_"])
+    def test_fill_view_writes_only_view(self, op, dtype):
+        """fill_ / zero_ on a view leave the rest of the base untouched.
+
+        The device fill DMA covers the whole allocation, so every view below used
+        to fill all of its base.
+        """
+        views = {
+            "1d_narrow": ((8,), lambda t: t.narrow(0, 2, 1)),
+            "1d_prefix": ((5,), lambda t: t[:3]),
+            "1d_stepped": ((8,), lambda t: t[::2]),
+            "2d_rows": ((8, 64), lambda t: t[2:4]),
+            "2d_prefix_rows": ((8, 64), lambda t: t[:4]),
+            "2d_row": ((8, 64), lambda t: t[3]),
+            "2d_short_rows": ((8, 3), lambda t: t[2:4]),
+            "2d_cols": ((8, 64), lambda t: t[:, 1:3]),
+            "2d_col": ((8, 64), lambda t: t[:, 5]),
+            "2d_transposed_rows": ((8, 64), lambda t: t.t()[1:3]),
+            "3d_slab": ((4, 8, 64), lambda t: t[1]),
+            "3d_middle": ((4, 8, 64), lambda t: t[:, 2]),
+            "view_of_view": ((8, 64), lambda t: t[2:6][1:3]),
+            "whole_flat": ((8, 64), lambda t: t.view(-1)),
+            "whole": ((8, 64), lambda t: t),
+        }
+        start = torch.ones if op == "zero_" else torch.zeros
+        args = () if op == "zero_" else (1,)
+        for name, (shape, select) in views.items():
+            with self.subTest(view=name):
+                expected = start(shape, dtype=dtype)
+                getattr(select(expected), op)(*args)
+                x = start(shape, dtype=dtype).to("spyre")
+                view = select(x)
+                result = getattr(view, op)(*args)
+                self.assertIs(result, view)
+                torch.testing.assert_close(x.cpu(), expected, rtol=0, atol=0)
+
     def test_str(self):
         a = torch.tensor([1, 2], dtype=torch.float16).to("spyre")
         a_repr = str(a)

@@ -629,14 +629,68 @@ def register_inplace_kernels(ops):
 register_inplace_kernels(COMPILED_OPS)
 
 
+def _covers_whole_storage(t: torch.Tensor) -> bool:
+    """Whether ``t`` spans every element of the allocation behind it.
+
+    Spyre pads storage to whole sticks, so ``untyped_storage().nbytes()`` can't
+    tell ``y[:3]`` from a 5-element ``y``; compare against the base tensor.
+    """
+    if t.storage_offset() != 0:
+        return False
+    return t._base is None or t.numel() == t._base.numel()
+
+
+def _is_whole_row_view(t: torch.Tensor) -> bool:
+    """Whether ``t`` is a set of complete last-dim rows of a contiguous base.
+
+    Such a view owns whole sticks, so a device-to-device ``copy_`` writes only
+    its own rows. A view that cuts into the stick dimension shares sticks with
+    elements outside it, and ``copy_`` overwrites those neighbors.
+    """
+    base = t._base
+    return (
+        t.dim() >= 1
+        and base.dim() >= 1
+        and base.is_contiguous()
+        and t.size(-1) == base.size(-1)
+        and t.stride(-1) == 1
+        # d2d copy_ rejects rows that end mid-stick (128 bytes)
+        and (t.size(-1) * t.element_size()) % 128 == 0
+        and t.dtype != torch.bool  # bool d2d copy_ into a view writes nothing
+    )
+
+
+def _fill_inplace(self: torch.Tensor, value: float) -> torch.Tensor:
+    """Fill ``self`` with ``value``, honoring views.
+
+    ``fill_tensor`` launches one MEMORY_FILL DMA over the whole allocation and
+    ignores the view's offset and shape, so ``x[2:4].fill_(1)`` used to fill all
+    of ``x``. Only a tensor covering its whole storage may take that path. A
+    view of whole rows fills an offset-0 temporary and lets ``copy_`` place it;
+    any other view is filled on the host and the whole base copied back.
+    """
+    if _covers_whole_storage(self):
+        fill_tensor(self, value)
+    elif _is_whole_row_view(self):
+        self.copy_(torch.full(self.shape, value, dtype=self.dtype, device=self.device))
+    else:
+        # TODO: drop this host round trip once copy_ into a partial-stick view
+        # leaves the view's stick neighbors intact.
+        base = self._base
+        host = torch.empty_strided(base.size(), base.stride(), dtype=base.dtype)
+        host.copy_(base)
+        host.as_strided(self.size(), self.stride(), self.storage_offset()).fill_(value)
+        base.copy_(host)
+    return self
+
+
 @torch.library.register_kernel("aten::fill_.Scalar", ["spyre"])  # type:ignore
 def spyre__fill_scalar(
     self: torch.Tensor, other: int | float | bool | complex
 ) -> torch.Tensor:
     if isinstance(other, complex):
         raise TypeError("spyre fill_ does not support complex fill values")
-    fill_tensor(self, float(other))
-    return self
+    return _fill_inplace(self, float(other))
 
 
 @torch.library.register_kernel("aten::full", ["spyre"])  # type:ignore
@@ -690,8 +744,7 @@ def spyre__normal_(self, mean=0.0, std=1.0, *, generator=None):
 @torch.library.register_kernel("aten::zero_", ["spyre"])  # type:ignore
 def spyre__zero_(self: torch.Tensor) -> torch.Tensor:
     """Zero out the tensor in-place using device-side FillDMA."""
-    fill_tensor(self, 0.0)
-    return self
+    return _fill_inplace(self, 0.0)
 
 
 @torch.library.register_kernel("aten::uniform_", "spyre")  # type:ignore
