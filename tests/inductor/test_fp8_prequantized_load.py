@@ -111,6 +111,41 @@ class TestDmaToSpyreFp8Kernel:
             assert dev.dtype == torch.float8_e4m3fn
             assert list(dev.shape) == [out_f, in_f]
 
+    @pytest.mark.parametrize(
+        "k, n, padded",
+        [
+            (130, 256, True),
+            (2112, 256, True),  # #5524
+            (2222, 256, True),
+            (256, 256, False),  # aligned K
+            (2112, 2880, False),  # N % 128 != 0: not padded
+        ],
+    )
+    def test_k_padding_layout(self, k, n, padded):
+        """#5524: unaligned K is padded on device and returned as a [K, N] view
+        with K valid rows; aligned K, or N % 128 != 0, is left unpadded."""
+        import math
+        from unittest.mock import patch
+
+        from torch_spyre._C import ElementArrangement, get_elem_in_stick
+        from torch_spyre.model_utils import _dma_to_spyre_fp8_kernel
+
+        weight = torch.randn(k, n, dtype=torch.float16).to(torch.float8_e4m3fn)
+        with patch("torch_spyre.model_utils.torch.zeros", wraps=torch.zeros) as zeros:
+            dev = _dma_to_spyre_fp8_kernel(weight)
+        stick = get_elem_in_stick(torch.float8_e4m3fn)
+        device_k = -(-k // stick) * stick if padded else k
+        stl = dev.device_tensor_layout()
+
+        assert dev.shape == (k, n)
+        assert dev.stride() == (n, 1)
+        assert stl.element_arrangement == ElementArrangement.QFP8WT
+        assert list(stl.device_size)[1] == device_k
+        assert [v for key, v in stl.valid_elements.items() if 1 in key] == [k]
+        assert dev.untyped_storage().nbytes() == math.prod(stl.device_size)
+        assert dev._is_view() == padded
+        assert zeros.called == padded
+
 
 class TestLoadModelToSpyreUseFp8Weights:
     """Unit tests for load_model_to_spyre(use_fp8_weights=True) with a tiny model."""
@@ -181,6 +216,59 @@ class TestLoadModelToSpyreUseFp8Weights:
         assert model[0].weight.device.type == DEVICE_TYPE
         # dtype should be preserved (bfloat16 on device)
         assert model[0].weight.dtype == torch.bfloat16
+
+    @pytest.mark.parametrize("m", [1, 8])
+    def test_forward_unaligned_in_features(self, m):
+        """#5524 via load_fp8_model_to_spyre (nn.Parameter path): an unaligned
+        in_features=2112 matches the CPU reference."""
+        from torch_spyre.model_utils import load_fp8_model_to_spyre
+
+        k, n = 2112, 2816
+        torch.manual_seed(0)
+        act_cpu = torch.randn(m, k, dtype=torch.float16)
+        weight_cpu = torch.randn(n, k, dtype=torch.float16)
+
+        class Fp8Linear(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = nn.Linear(k, n, bias=False)
+
+            def forward(self, x):
+                scale = torch.ops.spyre.quantscalepertokenfp8(x)
+                q_x = torch.ops.spyre.quantize_fp8_with_scale(x, scale)
+                # linear.weight is the loaded [K, N] QFP8WT kernel.
+                return torch.ops.aten._scaled_mm(
+                    q_x,
+                    self.linear.weight,
+                    scale_a=scale,
+                    scale_b=torch.tensor(1.0, dtype=torch.float16, device=x.device),
+                    bias=None,
+                    out_dtype=torch.float16,
+                )
+
+        model = Fp8Linear()
+        model.linear.weight = nn.Parameter(
+            weight_cpu.clamp(-448.0, 448.0).to(torch.float8_e4m3fn),
+            requires_grad=False,
+        )
+        load_fp8_model_to_spyre(model)
+        assert isinstance(model.linear.weight, nn.Parameter)
+
+        torch._dynamo.reset()
+        result = torch.compile(model, backend="inductor")(act_cpu.to(DEVICE))
+
+        # CPU reference: as in test_full_fp8_pipeline.
+        amax = act_cpu.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5)
+        scale_ref = amax / 448.0
+        q_a = (act_cpu / scale_ref).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+        q_a_fp16 = q_a.to(torch.float16) * scale_ref
+        q_b_fp16 = (
+            weight_cpu.clamp(-448.0, 448.0).to(torch.float8_e4m3fn).to(torch.float16)
+        )
+        cpu_ref = q_a_fp16 @ q_b_fp16.T
+
+        out_cpu = result.to("cpu").to(torch.float16)
+        torch.testing.assert_close(out_cpu, cpu_ref, atol=4.0, rtol=0.1)
 
 
 # ---------------------------------------------------------------------------
@@ -469,3 +557,9 @@ class TestQuantScalePerTokenFp8WithPrequantizedWeight:
         # atol=4.0: FP8 quantization error accumulated over K terms (see
         # test_prequantized_closed_over for tolerance justification).
         torch.testing.assert_close(out_cpu, cpu_ref, atol=4.0, rtol=0.1)
+
+    @pytest.mark.parametrize("m, k, n", [(1, 2112, 2816), (8, 2112, 2816)])
+    def test_full_fp8_pipeline_unaligned_k(self, m, k, n):
+        """#5524: unaligned K=2112 (failed before: StopIteration for m>1, dbo-opt
+        for m=1)."""
+        self.test_full_fp8_pipeline(m, k, n)

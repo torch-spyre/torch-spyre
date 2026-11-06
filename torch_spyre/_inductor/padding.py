@@ -88,9 +88,41 @@ from .pass_utils import (
     replace_computed_buffer_body,
 )
 from .views import compute_coordinates
-from torch_spyre._C import SpyreTensorLayout, get_elem_in_stick
+from torch_spyre._C import ElementArrangement, SpyreTensorLayout, get_elem_in_stick
 
 logger = get_inductor_logger("padding")
+
+
+def _qfp8wt_input_device_k(
+    graph: GraphLowering, name: str, host_k_dim: int | None, k: int
+) -> int | None:
+    """Device K extent of graph input ``name`` if it is a QFP8WT weight padded by
+    _dma_to_spyre_fp8_kernel (exactly ``k`` rows valid), else ``None``.
+
+    Reads the real input's layout; layouts are not propagated yet here.
+    """
+    if host_k_dim is None or name not in graph.graph_input_names:
+        return None
+    real = V.get_real_inputs()[graph.graph_input_names.index(name)]
+    if not isinstance(real, torch.Tensor):
+        return None
+    stl = real.device_tensor_layout()
+    if stl is None or stl.element_arrangement != ElementArrangement.QFP8WT:
+        return None
+    # K's device dim has K's host stride; it is never the stick dim.
+    k_stride = real.stride()[host_k_dim]
+    dims = [
+        i
+        for i, (s, size) in enumerate(zip(stl.stride_map, stl.device_size))
+        if s == k_stride and size > 1
+    ]
+    if len(dims) != 1 or dims[0] == len(stl.device_size) - 1:
+        return None
+    # A K-slice of a larger weight has data past k, not padding.
+    valid = [n for key, n in stl.valid_elements.items() if dims[0] in key]
+    if valid != [k]:
+        return None
+    return int(stl.device_size[dims[0]])
 
 
 def compute_padding(cur_size: int, dtype: torch.dtype) -> int:
@@ -386,6 +418,21 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
                 ),
                 None,
             )
+
+        # A pre-padded QFP8WT weight must not be copied: the copy is STANDARD,
+        # which batchmatmulfp8 cannot read (#5524).
+        k_target = k_val + compute_padding(k_val, dtype)
+        device_k = _qfp8wt_input_device_k(graph, y_dep.name, y_host_k_dim, k_val)
+        if device_k is not None and device_k >= k_target:
+            logger.debug(
+                "insert_bmm_padding: %s reads QFP8WT input %s with device K=%d "
+                ">= %d; no padding",
+                op.get_name(),
+                y_dep.name,
+                device_k,
+                k_target,
+            )
+            continue
 
         x_name = x_dep.name
         y_name = y_dep.name
