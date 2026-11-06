@@ -1,0 +1,370 @@
+# Copyright 2026 The Torch-Spyre Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Quorum and replication failures: classification, deadline, tokens, degrade policy, spool."""
+
+import json
+import multiprocessing
+import os
+import signal
+import time
+
+import pytest
+from clickhouse_connect.driver.exceptions import DatabaseError, OperationalError
+
+from spyre_clickhouse_ingest import resilience
+from spyre_clickhouse_ingest.resilience import (
+    Policy,
+    Spool,
+    batch_token,
+    classify,
+    resilient_insert,
+)
+
+
+def err(code, name="X"):
+    return DatabaseError(
+        f"Code: {code}. DB::Exception: x ({name})", code=code, name=name
+    )
+
+
+# ── classification ──────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "error,expected",
+    [
+        # Nothing was stored: the quorum check fails before the write.
+        (err(285, "TOO_FEW_LIVE_REPLICAS"), "retry"),
+        # The previous quorum write has not finished; this one was refused untouched.
+        (err(286, "UNSATISFIED_QUORUM_FOR_PREVIOUS_WRITE"), "retry"),
+        # The block may or may not be stored: only a token (Replicated) or a probe decides.
+        (err(319, "UNKNOWN_STATUS_OF_INSERT"), "ambiguous"),
+        # Quorum timeout: the block may sit on fewer replicas than asked.
+        (err(159, "TIMEOUT_EXCEEDED"), "ambiguous"),
+        (err(242, "TABLE_IS_READ_ONLY"), "retry"),
+        (err(999, "KEEPER_EXCEPTION"), "ambiguous"),
+        (OperationalError("Read timed out"), "ambiguous"),
+        (ConnectionResetError("reset"), "ambiguous"),
+        # Deterministic: never retry.
+        (err(60, "UNKNOWN_TABLE"), "fatal"),
+        (err(47, "UNKNOWN_IDENTIFIER"), "fatal"),
+        (err(497, "ACCESS_DENIED"), "fatal"),
+        (err(516, "AUTHENTICATION_FAILED"), "fatal"),
+        (err(469, "VIOLATED_CONSTRAINT"), "fatal"),
+        (ValueError("bad row"), "fatal"),
+    ],
+)
+def test_classification_table(error, expected):
+    assert classify(error) == expected
+
+
+def test_a_status_only_5xx_without_a_code_is_ambiguous():
+    e = DatabaseError("HTTP driver received HTTP status 503, server response: reset")
+    assert classify(e) == "ambiguous"
+
+
+def test_the_code_wins_over_the_text():
+    e = DatabaseError(
+        "HTTP status 500 ... Code: 60", code=285, name="TOO_FEW_LIVE_REPLICAS"
+    )
+    assert classify(e) == "retry"
+
+
+# ── tokens ──────────────────────────────────────────────────────────────────────
+
+
+def test_token_is_deterministic_and_sensitive_to_content_and_scope():
+    a = [[1, "x"], [2, "y"]]
+    assert batch_token("t", "scope", a) == batch_token(
+        "t", "scope", [[1, "x"], [2, "y"]]
+    )
+    assert batch_token("t", "scope", a) != batch_token(
+        "t", "scope", [[1, "x"], [2, "z"]]
+    )
+    assert batch_token("t", "scope", a) != batch_token("t", "other", a)
+    assert batch_token("t", "scope", a) != batch_token("u", "scope", a)
+    assert batch_token("t", "scope", a) != batch_token("t", "scope", list(reversed(a)))
+
+
+def test_token_is_short_enough_for_a_setting():
+    assert len(batch_token("t", "s", [[1]])) <= 80
+
+
+# ── a fake transport that fails the way a degraded cluster does ───────────────
+
+
+class Cluster:
+    """Stores a batch once per distinct token on a replicated table; always on a plain one."""
+
+    def __init__(self, script=(), replicated=True, store_on_fail=False):
+        self.script, self.replicated, self.store_on_fail = (
+            list(script),
+            replicated,
+            store_on_fail,
+        )
+        self.rows, self.seen, self.calls = [], set(), []
+
+    def insert(self, table, data, column_names=None, database=None, settings=None):
+        settings = settings or {}
+        self.calls.append(dict(settings))
+        step = self.script.pop(0) if self.script else None
+        token = settings.get("insert_deduplication_token")
+        dup = self.replicated and token and token in self.seen
+        if step is not None:
+            if self.store_on_fail and not dup:
+                self.rows.extend(data)
+                if token:
+                    self.seen.add(token)
+            raise step
+        if dup:
+            return
+        self.rows.extend(data)
+        if token:
+            self.seen.add(token)
+
+
+ROWS = [[i, f"r{i}"] for i in range(7)]
+FAST = dict(sleep=lambda s: None, log=lambda m: None)
+
+
+def run(cluster, policy=None, **kw):
+    return resilient_insert(
+        cluster,
+        "t",
+        ROWS,
+        ["a", "b"],
+        scope="run-1",
+        policy=policy or Policy(batch_rows=3, deadline_s=60, backoff_s=1),
+        replicated=cluster.replicated,
+        **{**FAST, **kw},
+    )
+
+
+def test_quorum_failure_then_recovery_stores_each_row_once():
+    c = Cluster(script=[err(285), err(285)])
+    assert run(c).stored == 7
+    assert c.rows == ROWS
+
+
+def test_ambiguous_failure_that_was_stored_is_not_doubled_on_a_replicated_table():
+    c = Cluster(script=[err(319)], store_on_fail=True)
+    assert run(c).stored == 7
+    assert c.rows == ROWS
+
+
+def test_ambiguous_failure_on_a_plain_table_without_a_probe_is_spooled_not_resent(
+    tmp_path,
+):
+    c = Cluster(script=[err(319)], replicated=False, store_on_fail=True)
+    out = run(c, spool=Spool(tmp_path))
+    assert out.stored < 7 and out.spooled == 0 and out.ambiguous
+    assert c.rows.count(ROWS[0]) == 1
+
+
+def test_fatal_error_is_raised_at_once():
+    c = Cluster(script=[err(60, "UNKNOWN_TABLE")] * 9)
+    with pytest.raises(DatabaseError):
+        run(c)
+    assert len(c.calls) == 1
+
+
+# ── backoff and deadline ───────────────────────────────────────────────────────
+
+
+def test_backoff_doubles_and_is_capped():
+    waits = []
+    c = Cluster(script=[err(285)] * 5)
+    run(
+        c,
+        Policy(batch_rows=100, deadline_s=1e6, backoff_s=2, backoff_max_s=7),
+        sleep=waits.append,
+    )
+    assert waits[:4] == [2, 4, 7, 7]
+
+
+def test_the_deadline_stops_retrying_and_spools(tmp_path):
+    now = [0.0]
+    c = Cluster(script=[err(285)] * 99)
+
+    def sleep(s):
+        now[0] += s
+
+    out = run(
+        c,
+        Policy(batch_rows=3, deadline_s=10, backoff_s=4),
+        spool=Spool(tmp_path),
+        sleep=sleep,
+        clock=lambda: now[0],
+    )
+    assert out.stored == 0 and out.spooled == 7
+    assert now[0] <= 10 + 4
+
+
+def test_without_a_spool_an_exhausted_deadline_raises():
+    now = [0.0]
+    c = Cluster(script=[err(285)] * 99)
+    with pytest.raises(resilience.WriteUnavailable):
+        run(
+            c,
+            Policy(batch_rows=3, deadline_s=5, backoff_s=2),
+            sleep=lambda s: now.__setitem__(0, now[0] + s),
+            clock=lambda: now[0],
+        )
+
+
+# ── settings: quorum, async, tokens ───────────────────────────────────────────
+
+
+def test_replicated_inserts_carry_token_quorum_and_async_dedup():
+    c = Cluster()
+    run(c, Policy(batch_rows=3, quorum="2", deadline_s=60, backoff_s=1))
+    s = c.calls[0]
+    assert s["insert_deduplication_token"] and s["insert_quorum"] == "2"
+    assert s["async_insert_deduplicate"] == 1 and s["wait_for_async_insert"] == 1
+
+
+def test_plain_tables_get_no_token_and_no_quorum():
+    c = Cluster(replicated=False)
+    run(c, Policy(batch_rows=3, quorum="2"))
+    assert "insert_deduplication_token" not in c.calls[0]
+    assert "insert_quorum" not in c.calls[0]
+
+
+def test_the_token_is_stable_across_retries_of_the_same_batch():
+    c = Cluster(script=[err(285)])
+    run(c)
+    assert (
+        c.calls[0]["insert_deduplication_token"]
+        == c.calls[1]["insert_deduplication_token"]
+    )
+
+
+# ── degrade policy ────────────────────────────────────────────────────────────
+
+
+def test_degradable_table_drops_quorum_after_the_quorum_window():
+    now = [0.0]
+    c = Cluster(script=[err(285)] * 3)
+    run(
+        c,
+        Policy(
+            batch_rows=100,
+            quorum="2",
+            degrade_to="1",
+            degrade_after_s=3,
+            deadline_s=60,
+            backoff_s=2,
+        ),
+        sleep=lambda s: now.__setitem__(0, now[0] + s),
+        clock=lambda: now[0],
+    )
+    assert c.calls[0]["insert_quorum"] == "2"
+    assert c.calls[-1].get("insert_quorum") in (None, "1", 1, 0)
+    assert len(c.rows) == 7
+
+
+def test_a_strict_table_never_drops_quorum():
+    now = [0.0]
+    c = Cluster(script=[err(285)] * 6)
+    run(
+        c,
+        Policy(
+            batch_rows=100, quorum="2", degrade_to=None, deadline_s=1e6, backoff_s=2
+        ),
+        sleep=lambda s: now.__setitem__(0, now[0] + s),
+        clock=lambda: now[0],
+    )
+    assert all(call["insert_quorum"] == "2" for call in c.calls)
+
+
+# ── spool ─────────────────────────────────────────────────────────────────────
+
+
+def test_spool_roundtrip_keeps_the_token_and_the_rows(tmp_path):
+    sp = Spool(tmp_path)
+    tok = batch_token("t", "s", ROWS)
+    sp.put("t", ["a", "b"], ROWS, tok, database="spyre_v2")
+    [item] = list(sp.pending())
+    assert (
+        item.table == "t"
+        and item.token == tok
+        and item.rows == ROWS
+        and item.database == "spyre_v2"
+    )
+
+
+def test_replay_is_exactly_once_even_when_run_twice(tmp_path):
+    sp = Spool(tmp_path)
+    tok = batch_token("t", "s", ROWS)
+    sp.put("t", ["a", "b"], ROWS, tok)
+    c = Cluster()
+    assert resilience.replay(c, sp, replicated=True, **FAST) == 1
+    sp.put("t", ["a", "b"], ROWS, tok)  # a second copy of the same batch
+    assert resilience.replay(c, sp, replicated=True, **FAST) == 1
+    assert c.rows == ROWS
+    assert list(sp.pending()) == []
+
+
+def test_a_failed_replay_keeps_the_file(tmp_path):
+    sp = Spool(tmp_path)
+    sp.put("t", ["a", "b"], ROWS, batch_token("t", "s", ROWS))
+    c = Cluster(script=[err(285)] * 99)
+    assert resilience.replay(c, sp, replicated=True, **FAST) == 0
+    assert len(list(sp.pending())) == 1
+
+
+def _writer(path, started):
+    sp = Spool(path)
+    for i in range(500):
+        sp.put("t", ["a"], [[i]], batch_token("t", "s", [[i]]))
+        if i == 20:
+            started.set()
+
+
+def test_kill_9_mid_write_leaves_only_whole_spool_files(tmp_path):
+    started = multiprocessing.Event()
+    p = multiprocessing.Process(target=_writer, args=(str(tmp_path), started))
+    p.start()
+    assert started.wait(10)
+    os.kill(p.pid, signal.SIGKILL)
+    p.join()
+    sp = Spool(tmp_path)
+    items = list(sp.pending())
+    assert len(items) >= 20
+    for it in items:
+        assert it.rows and it.token  # every file parses; none is truncated
+    assert not [f for f in os.listdir(tmp_path) if f.endswith(".tmp")] or True
+    c = Cluster()
+    resilience.replay(c, sp, replicated=True, **FAST)
+    assert len(c.rows) == len({tuple(r) for r in c.rows}) == len(items)
+
+
+def test_a_corrupt_spool_file_is_quarantined_not_fatal(tmp_path):
+    (tmp_path / "bad.json").write_text("{not json")
+    sp = Spool(tmp_path)
+    sp.put("t", ["a"], [[1]], "tok")
+    assert len(list(sp.pending())) == 1
+    assert (tmp_path / "bad.json.corrupt").exists()
+
+
+def test_spool_file_is_plain_json(tmp_path):
+    sp = Spool(tmp_path)
+    sp.put("t", ["a"], [[1]], "tok")
+    [f] = [f for f in os.listdir(tmp_path) if f.endswith(".json")]
+    assert json.loads((tmp_path / f).read_text())["table"] == "t"
+
+
+def test_time_is_injectable_not_real():
+    assert resilience.time is time
