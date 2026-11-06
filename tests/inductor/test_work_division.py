@@ -1953,6 +1953,103 @@ class TestCostModelConstraints(unittest.TestCase):
         self.assertEqual(captured["N_e"], 12800)
         self.assertEqual(captured["K_e"], 4096)
 
+    def _fp8_planner_n_e(self, weight_arrangement, weight_dtype=torch.float8_e4m3fn):
+        """Run the FP8 planner and return the N extent it hands to the cost model."""
+        m, n, k = (_isym(name) for name in ("m", "n", "k"))
+        op = _computed_buffer(
+            (8, 12800),
+            name="scaled_mm_out",
+            reduction_type=BATCH_MATMUL_FP8_OP,
+            reduction_ranges=(4096,),
+        )
+        output_td = _tensor_dep("scaled_mm_out", (8, 12800), (m, n))
+        input_tds = [
+            _tensor_dep(
+                "act",
+                (8, 4096),
+                (m, k),
+                element_arrangement=ElementArrangement.QFP8CH,
+                dtype=torch.float8_e4m3fn,
+            ),
+            _tensor_dep(
+                "weight",
+                (4096, 12800),
+                (k, n),
+                element_arrangement=weight_arrangement,
+                dtype=weight_dtype,
+            ),
+        ]
+        it_space = {m: 8, n: 12800, k: 4096}
+        it_space_adjusted, stick_vars = adjust_it_space_for_sticks(
+            it_space, input_tds + [output_td]
+        )
+        captured = {}
+
+        def capture_axes(_b_axis, _m_axis, n_axis, k_axis, *_args, **_kwargs):
+            captured["N_e"] = n_axis[0]
+            return 1.0
+
+        with patch(
+            "torch_spyre._inductor.work_division._matmul_split_cost",
+            side_effect=capture_axes,
+        ):
+            _cost_model_matmul_planner(
+                op,
+                {sym: 1 for sym in it_space_adjusted},
+                it_space_adjusted,
+                output_td,
+                stick_vars,
+                {},
+                32,
+                input_tds,
+                set(),
+                {},
+            )
+        return captured["N_e"]
+
+    def test_fp8_cost_model_without_qfp8wt_input_uses_fp8_operand(self):
+        """The K cache can reach batchmatmulfp8 through an intermediate that
+        does not carry QFP8WT (e.g. an index_select result).  The planner must
+        not raise StopIteration; it takes the stick width from another FP8
+        operand instead, so N_e is still counted in 128-element FP8 sticks."""
+        self.assertEqual(self._fp8_planner_n_e(ElementArrangement.STANDARD), 12800)
+
+    def test_fp8_cost_model_without_any_fp8_input_falls_back_to_output(self):
+        """With no FP8 operand at all the planner must still not crash: it
+        falls back to the fp16 output's stick width (a conservative count)."""
+        m, n, k = (_isym(name) for name in ("m", "n", "k"))
+        op = _computed_buffer(
+            (8, 12800),
+            name="scaled_mm_out",
+            reduction_type=BATCH_MATMUL_FP8_OP,
+            reduction_ranges=(4096,),
+        )
+        output_td = _tensor_dep("scaled_mm_out", (8, 12800), (m, n))
+        input_tds = [
+            _tensor_dep("act", (8, 4096), (m, k)),
+            _tensor_dep("weight", (4096, 12800), (k, n)),
+        ]
+        it_space = {m: 8, n: 12800, k: 4096}
+        it_space_adjusted, stick_vars = adjust_it_space_for_sticks(
+            it_space, input_tds + [output_td]
+        )
+        with patch(
+            "torch_spyre._inductor.work_division._matmul_split_cost",
+            return_value=1.0,
+        ):
+            _cost_model_matmul_planner(
+                op,
+                {sym: 1 for sym in it_space_adjusted},
+                it_space_adjusted,
+                output_td,
+                stick_vars,
+                {},
+                32,
+                input_tds,
+                set(),
+                {},
+            )
+
     def test_fp8_matmul_split_cost_uses_correct_byte_width(self):
         """#4465: activation/weight bytes must come from their own FP8
         elems_per_stick (1 byte/elem), not the flat fp16 _DTYPE_BYTES (2)."""

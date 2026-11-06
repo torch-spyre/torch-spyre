@@ -1553,13 +1553,29 @@ def _matmul_layouts(
         x_req_stl = generate_stl_with_required_stick(
             x, stick_var, data.reduction_type, "x"
         )
-        y_dim_order = list(range(len(y.layout.size))) + [-1]
-        y_req_stl = SpyreTensorLayout(
-            [concretize_expr(s) for s in y.layout.size],
-            [concretize_expr(s) for s in y.layout.stride],
-            y.layout.dtype,
-            y_dim_order,
+        # If y already carries a non-STANDARD EA (e.g. QFP8WT from a KV-cache
+        # gather), pass it through directly.  The hardware's batchmatmulfp8
+        # op understands the 2D-stick weight layout regardless of N size;
+        # building a STANDARD sparse-stick STL here would produce a dense→sparse
+        # scatter incompatibility in the beam search.
+        _y_non_std = next(
+            (
+                stl
+                for stl in y.layouts
+                if stl.element_arrangement != ElementArrangement.STANDARD
+            ),
+            None,
         )
+        if _y_non_std is not None:
+            y_req_stl = _y_non_std
+        else:
+            y_dim_order = list(range(len(y.layout.size))) + [-1]
+            y_req_stl = SpyreTensorLayout(
+                [concretize_expr(s) for s in y.layout.size],
+                [concretize_expr(s) for s in y.layout.stride],
+                y.layout.dtype,
+                y_dim_order,
+            )
         # Output stick is on the last host dim (N=1 collapses N to a scalar position).
         out_dims = len(output.size)
         out_stick_dim = out_dims - 1
@@ -2665,6 +2681,16 @@ def _align_single_source_producer(
         return
     if not isinstance(producer.data, Pointwise):
         return
+    # Do not overwrite a producer whose layout already carries a non-STANDARD
+    # element arrangement (e.g. QFP8WT 2D-stick from qfp8wt).  The alt_stl for
+    # the mutation target is always STANDARD; forcing it onto the producer strips
+    # the arrangement and causes the codegen to misread the HBM layout.
+    if any(
+        getattr(stl, "element_arrangement", ElementArrangement.STANDARD)
+        != ElementArrangement.STANDARD
+        for stl in getattr(producer, "layouts", [])
+    ):
+        return
     producer.layouts = [alt_stl]
 
 
@@ -3533,6 +3559,35 @@ def propagate_spyre_tensor_layouts(
                         )
                     op._restickify_plan = (target_name, target_stl, alt_stl)
                     target_stl = alt_stl
+
+                # When the scatter source carries QFP8WT EA (i.e. the value
+                # being written was produced by quantize_weight_fp8_with_scale),
+                # promote the destination to QFP8WT so that:
+                #   1. reorder_nonstick_dims sees QFP8WT on k_cache and the
+                #      deferred IA-rotate entry records QFP8WT EA.
+                #   2. _ia_rotate_stl (with EA preservation) propagates QFP8WT
+                #      into the required_stl of the _DeferredReorder.
+                #   3. reorder_nonstick_dims_mutation rewrites the target's layout
+                #      in place to that required_stl, so the scatter writes in
+                #      2D-stick addressing with no copy-in / copy-back.
+                source_is_qfp8wt = any(
+                    any(
+                        stl.element_arrangement == ElementArrangement.QFP8WT
+                        for stl in a.layouts
+                    )
+                    for a in args
+                    if a.dep.name != target_name
+                )
+                if source_is_qfp8wt:
+                    qfp8wt_stl = target_stl.with_element_arrangement(
+                        ElementArrangement.QFP8WT
+                    )
+                    if graph_input is not None:
+                        graph_input.layouts = [qfp8wt_stl]
+                    elif target_buf is not None:
+                        target_buf.layouts = [qfp8wt_stl]
+                    target_stl = qfp8wt_stl
+
                 op.layouts = [target_stl]
                 op.restick_cost_fn = AllSameNode.from_args(
                     args, [target_stl], output_dep, op
