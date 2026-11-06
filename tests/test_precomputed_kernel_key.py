@@ -387,7 +387,13 @@ class TestFingerprint(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-def _runner(name, code_dir, kernel_provenance=None, symbol_kinds=None):
+def _runner(
+    name,
+    code_dir,
+    kernel_provenance=None,
+    symbol_kinds=None,
+    sdsc_bundle_dir_prefix=None,
+):
     return name, code_dir, kernel_provenance, symbol_kinds
 
 
