@@ -4921,11 +4921,21 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "end_int32": (64, torch.int32),
                 "start_end_step_int32": (-5, 60, 3, torch.int32),
                 "end_int32_part_stick": (10, torch.int32),
-                # Past 2**24 float32 no longer holds every integer, so these
-                # take the host fallback rather than rounding on device.
                 "start_end_int64_past_2p24": (2**24 - 64, 2**24 + 64, torch.int64),
-                "start_end_step_int32_past_2p24": (0, 2**24 + 192, 2**16, torch.int32),
+                "start_end_step_int32_past_2p24": (
+                    0,
+                    2**24 + 2**16 + 1,
+                    2**16,
+                    torch.int32,
+                ),
             },
+            # TODO: past 2**24 float32 no longer holds every integer, so an integer
+            # arange there is refused rather than rounded; serving it needs integer
+            # arithmetic on device.
+            "expect_raise": dict.fromkeys(
+                ["start_end_int64_past_2p24", "start_end_step_int32_past_2p24"],
+                "the float32 it computes in cannot hold exactly",
+            ),
         },
         (
             "test_empty_like",

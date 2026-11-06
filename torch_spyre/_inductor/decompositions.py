@@ -1563,6 +1563,10 @@ spyre_decompositions: dict = {}
 # until those issues are fixed.
 spyre_decompositions_to_exclude = [
     torch.ops.aten.tril,
+    torch.ops.aten.triu,
+    # Upstream's arange decomposes into prims.iota, which the backend cannot
+    # lower; the Spyre decompositions serve the functional overloads.
+    torch.ops.aten.arange,
     # PT 2.12 broadened torch._inductor.decomposition.mm/bmm to decompose the
     # K==1 (unit-contraction) case into a broadcast ``self * other`` on all
     # non-cpu/mps devices. That AOT decomposition runs before Spyre's
@@ -4341,14 +4345,14 @@ def arange_start_step_decomp(
     """``torch.arange(start, end, step)`` from a cached device ramp.
 
     A repeated ``arange`` costs the arithmetic that shifts and scales the shared
-    ramp rather than a fresh copy each pass. Declines to the host fallback what
-    it cannot serve: a symbolic bound cannot size a cached buffer.
+    ramp rather than a fresh copy each pass. Raises ``Unsupported`` for what it
+    cannot serve, such as a symbolic bound, which cannot size a cached buffer.
 
     The shift and scale are exact for every served type; how far the values
     themselves stay exact is the element type's own property.  An integer type
     computes in ``float32`` and converts once at the end, as int64 arithmetic
     does through ``with_int64_fallback``, so it is served only while every value
-    stays within 2**24, and declines to the host fallback past that.
+    stays within 2**24 and raises ``Unsupported`` past that.
     """
     assert layout in (torch.strided, None), f"doesn't support layout={layout}"
     assert not pin_memory, f"doesn't support pin_memory={pin_memory}"
@@ -4362,15 +4366,19 @@ def arange_start_step_decomp(
         out_dtype = torch.int64
     else:
         out_dtype = torch.get_default_dtype()
-    # A host arange inside a Spyre graph stays a host op.
     if not _on_spyre(device):
-        return NotImplemented
+        # The table is chosen per graph, so a host arange reaches here when it
+        # shares a graph with a Spyre op.
+        raise Unsupported(f"arange on {device} inside a Spyre graph")
     if out_dtype not in _RAMP_DTYPES:
-        return NotImplemented
+        raise Unsupported(f"arange in {out_dtype}")
     if any(isinstance(v, (torch.SymInt, torch.Tensor)) for v in (start, end, step)):
-        return NotImplemented
+        # TODO: serve a symbolic bound; needs a ramp sized at run time.
+        raise Unsupported(
+            "arange with a symbolic bound, which cannot size the cached ramp"
+        )
     if step == 0:
-        return NotImplemented
+        raise ValueError("arange: step must be nonzero")
 
     length = math.ceil((end - start) / step)
     if length <= 0:
@@ -4380,7 +4388,12 @@ def arange_start_step_decomp(
     if out_dtype in _RAMP_INTEGER_DTYPES and not _float32_exact(
         last, last * step, start, start + last * step
     ):
-        return NotImplemented
+        # TODO: serve integer values past 2**24; needs integer arithmetic on
+        # device rather than float32.
+        raise Unsupported(
+            f"arange({start}, {end}, {step}) in {out_dtype} has values past 2**24, "
+            "which the float32 it computes in cannot hold exactly"
+        )
     compute_dtype = torch.float32 if out_dtype in _RAMP_INTEGER_DTYPES else out_dtype
     # torch.arange owes its caller a mutable tensor, not the shared ramp.  Every
     # other path computes a fresh one; the bare ramp asks the lowering for a copy.
@@ -4669,17 +4682,18 @@ def _triangular_decomp(self: torch.Tensor, diagonal, kind: _MaskKind):
     over the batch. Any ``diagonal`` is served at any supported extent, including
     one past a corner that keeps everything or nothing.
 
-    Returns ``NotImplemented`` for what ``_build_mask`` cannot serve, leaving an
-    ``aten`` node for the host fallback to lower. The two coexist because
-    ``get_spyre_decomp_table`` drops each ``fallback_ops`` entry before re-adding
-    the Spyre decompositions.
+    Raises ``Unsupported`` for what ``_build_mask`` cannot serve.
     """
+    name = "tril" if kind is _MASK_LOWER else "triu"
     if isinstance(diagonal, (torch.SymInt, torch.Tensor)):
-        return NotImplemented
-    if self.dim() < 2 or not _static_shape(self.shape):
-        return NotImplemented
+        raise Unsupported(f"{name} with a symbolic diagonal")
+    if self.dim() < 2:
+        raise Unsupported(f"{name} of a {self.dim()}-D tensor")
+    if not _static_shape(self.shape):
+        # TODO: serve a symbolic shape; needs coordinates sized at run time.
+        raise Unsupported(f"{name} with a symbolic shape")
     if self.dtype not in _TRIANGULAR_BLOCK:
-        return NotImplemented
+        raise Unsupported(f"{name} in {self.dtype}")
     rows, cols = int(self.shape[-2]), int(self.shape[-1])
     compute_dtype = _mask_compute_dtype(self.dtype)
     mask = _build_mask(rows, cols, int(diagonal), kind, compute_dtype, self.device)
@@ -4717,17 +4731,21 @@ def eye_m_decomp(
     a factory the mask is the result rather than a multiplier. Upstream's
     decomposition compares an ``int32`` iota instead, which the backend cannot
     lower ("torch.bool result from operands with device format(s) IEEE_INT32").
-    Declines the rest to the host fallback (see ``tril_decomp``).
+    Raises ``Unsupported`` for what ``_build_mask`` cannot serve.
     """
     assert layout in (torch.strided, None), f"doesn't support layout={layout}"
     assert not pin_memory, f"doesn't support pin_memory={pin_memory}"
 
     out_dtype = dtype if dtype is not None else torch.get_default_dtype()
-    # A host eye inside a Spyre graph stays a host op.
     if not _on_spyre(device):
-        return NotImplemented
-    if out_dtype not in _TRIANGULAR_BLOCK or not _static_shape((n, m)):
-        return NotImplemented
+        # The table is chosen per graph, so a host eye reaches here when it
+        # shares a graph with a Spyre op.
+        raise Unsupported(f"eye on {device} inside a Spyre graph")
+    if out_dtype not in _TRIANGULAR_BLOCK:
+        raise Unsupported(f"eye in {out_dtype}")
+    if not _static_shape((n, m)):
+        # TODO: serve a symbolic size; needs coordinates sized at run time.
+        raise Unsupported("eye with a symbolic size")
     compute_dtype = _mask_compute_dtype(out_dtype)
     identity = _build_mask(
         int(n),

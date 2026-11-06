@@ -42,23 +42,6 @@ class Op(subtest):
         self.atol = atol
 
 
-class FactoryOp(Op):
-    """
-    Represents an operator that creates a new tensor without consuming an existing
-    tensor as input.
-
-    Examples:
-       - torch.arange
-       - torch.full
-    """
-
-    inputs = [(64,)]
-
-    def __init__(self, name, fn, inputs=None, rtol=None, atol=None):
-        super().__init__(name, fn, rtol, atol)
-        self.inputs = inputs or type(self).inputs
-
-
 class UnaryOp(Op):
     inputs = [torch.rand(64, dtype=torch.float16)]
 
@@ -67,17 +50,40 @@ class UnaryOp(Op):
         self.inputs = inputs or type(self).inputs
 
 
-_factory_ops = [
-    FactoryOp("arange", torch.arange, [(64.0,), (1.0, 65.0), (0.0, 128.0, 2.0)]),
+class BinaryOp(Op):
+    inputs = [
+        (torch.rand(64, dtype=torch.float16), torch.rand(64, dtype=torch.float16))
+    ]
+
+    def __init__(self, name, fn, inputs=None, rtol=None, atol=None):
+        super().__init__(name, fn, rtol, atol)
+        self.inputs = inputs or type(self).inputs
+
+
+# Each stands in for one fallback shape and must stay on the host-fallback list
+# (torch_spyre/ops/fallbacks.py): an op that gains a Spyre kernel or
+# decomposition no longer exercises the fallback, and a replacement is needed.
+# The condition-only where returns a tuple of index tensors and has no out=
+# overload, so out= is exercised through bitwise_xor.
+_unary_ops = [
+    UnaryOp(
+        "where",
+        torch.where,
+        [(torch.arange(64 * 64).reshape(64, 64) % 3 == 0).to(torch.float16)],
+    ),
 ]
 
-# aten.tril / aten.triu stand in for the unary-fallback shape here. They are
-# 2-D-only, hence the explicit inputs. (aten.sin / aten.cos used to fill this
-# slot, but they now carry Spyre decompositions and no longer fall back --
-# see torch_spyre/_inductor/decompositions.py spyre_sin / spyre_cos.)
-_unary_ops = [
-    UnaryOp("tril", torch.tril, [torch.rand(64, 64, dtype=torch.float16)]),
-    UnaryOp("triu", torch.triu, [torch.rand(64, 64, dtype=torch.float16)]),
+_binary_out_ops = [
+    BinaryOp(
+        "bitwise_xor",
+        torch.bitwise_xor,
+        [
+            (
+                torch.randint(0, 256, (64,), dtype=torch.int32),
+                torch.randint(0, 256, (64,), dtype=torch.int32),
+            )
+        ],
+    ),
 ]
 
 
@@ -95,26 +101,11 @@ class TestFallbacks(TestCase):
     def _assert_close(self, op, output_spyre, output_cpu):
         rtol = op.rtol or self.rtol
         atol = op.atol or self.atol
+        if isinstance(output_cpu, tuple):
+            output_spyre = tuple(t.cpu() for t in output_spyre)
+        else:
+            output_spyre = output_spyre.cpu()
         assert_close(output_spyre, output_cpu, rtol=rtol, atol=atol)
-
-    @parametrize("op", _factory_ops)
-    def test_factory_op(self, op):
-        for input in op.inputs:
-            output_cpu = op.fn(*input, dtype=self.dtype, device="cpu")
-            output_spyre = op.fn(*input, dtype=self.dtype, device="spyre")
-
-            self._assert_close(op, output_spyre.cpu(), output_cpu)
-
-    @parametrize("op", _factory_ops)
-    def test_factory_op_out(self, op):
-        for input in op.inputs:
-            buffer_cpu = torch.empty(0)
-            output_cpu = op.fn(*input, out=buffer_cpu)
-
-            buffer_spyre = torch.empty_like(output_cpu, device="spyre")
-            output_spyre = op.fn(*input, out=buffer_spyre)
-
-            self._assert_close(op, output_spyre.cpu(), output_cpu)
 
     @parametrize("op", _unary_ops)
     def test_unary_op(self, op):
@@ -122,29 +113,29 @@ class TestFallbacks(TestCase):
             output_cpu = op.fn(input)
             output_spyre = op.fn(input.to("spyre"))
 
-            self._assert_close(op, output_spyre.cpu(), output_cpu)
+            self._assert_close(op, output_spyre, output_cpu)
 
-    @parametrize("op", _unary_ops)
-    def test_unary_op_out(self, op):
-        for input in op.inputs:
-            buffer_cpu = torch.empty_like(input)
-            output_cpu = op.fn(input, out=buffer_cpu)
+    @parametrize("op", _binary_out_ops)
+    def test_binary_op_out(self, op):
+        for x, y in op.inputs:
+            buffer_cpu = torch.empty_like(x)
+            output_cpu = op.fn(x, y, out=buffer_cpu)
 
-            buffer_spyre = torch.empty_like(input, device="spyre")
-            output_spyre = op.fn(input.to("spyre"), out=buffer_spyre)
+            buffer_spyre = torch.empty_like(x, device="spyre")
+            output_spyre = op.fn(x.to("spyre"), y.to("spyre"), out=buffer_spyre)
 
-            self._assert_close(op, output_spyre.cpu(), output_cpu)
+            self._assert_close(op, output_spyre, output_cpu)
 
-    @parametrize("op", _unary_ops)
-    def test_unary_op_out_alias(self, op):
-        for input in op.inputs:
-            buffer_cpu = torch.clone(input)
-            output_cpu = op.fn(buffer_cpu, out=buffer_cpu)
+    @parametrize("op", _binary_out_ops)
+    def test_binary_op_out_alias(self, op):
+        for x, y in op.inputs:
+            buffer_cpu = torch.clone(x)
+            output_cpu = op.fn(buffer_cpu, y, out=buffer_cpu)
 
-            buffer_spyre = torch.clone(input).to(device="spyre")
-            output_spyre = op.fn(buffer_spyre, out=buffer_spyre)
+            buffer_spyre = torch.clone(x).to(device="spyre")
+            output_spyre = op.fn(buffer_spyre, y.to("spyre"), out=buffer_spyre)
 
-            self._assert_close(op, output_spyre.cpu(), output_cpu)
+            self._assert_close(op, output_spyre, output_cpu)
             self.assertEqual(id(buffer_spyre), id(output_spyre))
 
 

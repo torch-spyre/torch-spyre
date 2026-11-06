@@ -153,11 +153,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             after_pre_autograd_decomposition_table,
         )
 
-    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     @pytest.mark.filterwarnings(
         "ignore::UserWarning"
     )  # because of forced cache disabling
     def test_decompositions_graph(self):
+        """Spyre's decompositions apply to a graph that uses Spyre, and only to it.
+
+        ``randn`` is the probe: Inductor decomposes it into its random
+        primitives on the host, while Spyre leaves it whole. The values are
+        random, so only the captured graphs are compared.
+        """
         from torch._dynamo.testing import (
             InductorAndRecordGraphs,
             normalize_gm,
@@ -167,94 +172,42 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # Disable all Inductor caches
         config.force_disable_caches = True
 
-        def _check_out(out, tar):
-            torch.testing.assert_close(
-                out,
-                tar,
-                equal_nan=True,
-                atol=0.1,
-                rtol=0.1,
-                msg=lambda msg: f"compiled spyre <-> compiled cpu mismatch\n\n{msg}\n",
+        def graph_of(fn, device, **compile_kwargs):
+            torch.compiler.reset()
+            backend = InductorAndRecordGraphs()
+            torch.compile(fn, backend=backend, **compile_kwargs)(device)
+            return normalize_gm(
+                backend.inductor_graphs[0].print_readable(print_output=False)
             )
 
         def fn(device):
-            t = torch.arange(65, device=device)
-            return t
+            return torch.randn(65, device=device)
 
-        # For the `cpu`, there is a decomposition for arange which should be captured
-        torch.compiler.reset()
-        backend = InductorAndRecordGraphs()
-        cmp = torch.compile(fn, backend=backend)
-        out = cmp("cpu")
-        _check_out(out, torch.arange(65))
-        expected_graph_str = """\
-class <lambda>(torch.nn.Module):
-    def forward(self):
-        iota: "i64[65]" = torch.ops.prims.iota.default(65, start = 0, step = 1, dtype = torch.int64, device = device(type='cpu'), requires_grad = False)
-        return (iota,)
-"""
-        inductor_graph_str = normalize_gm(
-            backend.inductor_graphs[0].print_readable(print_output=False)
-        )
-        assert inductor_graph_str == expected_graph_str, "Graphs are not identical"
+        # The host keeps Inductor's decomposition.
+        cpu_graph = graph_of(fn, "cpu")
+        assert "prims.inductor_random" in cpu_graph, cpu_graph
+        assert "aten.randn" not in cpu_graph, cpu_graph
 
-        # For `spyre`, arange takes the Spyre decomposition instead of `iota`
-        torch.compiler.reset()
-        backend = InductorAndRecordGraphs()
-        cmp = torch.compile(fn, backend=backend)
-        out = cmp("spyre")
-        _check_out(out.cpu(), torch.arange(65))
-        inductor_graph_str = normalize_gm(
-            backend.inductor_graphs[0].print_readable(print_output=False)
-        )
-        assert "torch.ops.spyre.arange.default" in inductor_graph_str, (
-            inductor_graph_str
-        )
-        assert "prims.iota" not in inductor_graph_str, inductor_graph_str
+        # Spyre uses its own table, which does not decompose randn.
+        spyre_graph = graph_of(fn, "spyre")
+        assert "aten.randn.default" in spyre_graph, spyre_graph
+        assert "prims.inductor_random" not in spyre_graph, spyre_graph
 
-        # Check that `cpu` still has the decomposition registered
-        torch.compiler.reset()
-        backend = InductorAndRecordGraphs()
-        cmp = torch.compile(fn, fullgraph=True, backend=backend)
-        out = cmp("cpu")
-        _check_out(out, torch.arange(65))
-        expected_graph_str = """\
-class <lambda>(torch.nn.Module):
-    def forward(self):
-        iota: "i64[65]" = torch.ops.prims.iota.default(65, start = 0, step = 1, dtype = torch.int64, device = device(type='cpu'), requires_grad = False)
-        return (iota,)
-"""
-        inductor_graph_str = normalize_gm(
-            backend.inductor_graphs[0].print_readable(print_output=False)
-        )
-        assert inductor_graph_str == expected_graph_str, "Graphs are not identical"
+        # Compiling for Spyre leaves the host's table unchanged.
+        assert graph_of(fn, "cpu", fullgraph=True) == cpu_graph
 
-        def fn(device):
-            t1 = torch.arange(65, device=device).to("cpu")  # noqa: F841
-            t2 = torch.arange(65, device="cpu")
-            return t2
+        def mixed(device):
+            t1 = torch.randn(65, device=device).to("cpu")  # noqa: F841
+            return torch.randn(65, device="cpu")
 
-        # In case the graph contains `spyre` and `cpu` tensors,
-        # the decompositons of `spyre` are used and thus the
-        # `cpu` arange is not used anymore.
-        # Note: This is a known limitation at the moment as the
-        # spyre-specific lowerings and decompositions are
-        # merged PER GRAPH not per instruction
-        torch.compiler.reset()
-        backend = InductorAndRecordGraphs()
-        cmp = torch.compile(fn, backend=backend)
-        out = cmp("spyre")
-        _check_out(out, torch.arange(65))
-        expected_graph_str = """\
-class <lambda>(torch.nn.Module):
-    def forward(self):
-        arange_1: "i64[65]" = torch.ops.aten.arange.default(65, device = device(type='cpu'), pin_memory = False)
-        return (arange_1,)
-"""
-        inductor_graph_str = normalize_gm(
-            backend.inductor_graphs[0].print_readable(print_output=False)
-        )
-        assert inductor_graph_str == expected_graph_str, "Graphs are not identical"
+        # In a graph holding both, the table is chosen per graph rather than per
+        # op, so the host randn is left whole too.
+        # Note: This is a known limitation at the moment.
+        mixed_graph = graph_of(mixed, "spyre")
+        assert "torch.ops.aten.randn.default([65], device = device(type='cpu')" in (
+            mixed_graph
+        ), mixed_graph
+        assert "prims.inductor_random" not in mixed_graph, mixed_graph
 
     @pytest.mark.filterwarnings(
         "ignore::UserWarning"
