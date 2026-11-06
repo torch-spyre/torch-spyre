@@ -52,6 +52,8 @@ from torch._inductor.ir import (
     ShapeAsConstantBuffer,
 )
 
+from .pass_utils import op_read_writes
+
 logger = logging.getLogger(__name__)
 
 
@@ -342,7 +344,7 @@ def _check_reads_from_defined_buffers(
     for op in _leaf_operations(graph):
         op_label = op.operation_name if op.operation_name is not None else repr(op)
         try:
-            rw = op.get_read_writes()
+            rw = op_read_writes(op)
         except Exception as e:
             logger.debug(
                 "validate_graph: skipping read/write check for %r: %s",
