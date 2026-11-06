@@ -230,9 +230,13 @@ def _give_copy_the_loop_term(
         if getattr(hint, "loop_var_range", None) is not None
     ]
     if loop_hints:
+        # One hint per loop variable: cost_features pairs a loop variable to each
+        # level by position and pairs nothing when the counts differ.
+        existing = getattr(restick_buff, "dim_hints", None) or []
+        have = {hint.loop_var for hint in existing}
         restick_buff.dim_hints = [  # type: ignore[attr-defined]
-            *(getattr(restick_buff, "dim_hints", None) or []),
-            *loop_hints,
+            *existing,
+            *(hint for hint in loop_hints if hint.loop_var not in have),
         ]
     original = restick_buff.data.inner_fn
 
@@ -282,9 +286,18 @@ def _moved_loop_term(
     if dep_idx is None:
         return None
     index = sympy.sympify(deps[dep_idx].index)
+    symbols = loop_induction_symbols(index, set())
     term = sympy.S.Zero
-    for symbol in loop_induction_symbols(index, set()):
+    for symbol in symbols:
         term += index.coeff(symbol) * symbol
+    if any(symbol in (index - term).free_symbols for symbol in symbols):
+        # ``coeff`` reads only the linear part: floor(u / 2) or Mod(u, 2) would
+        # leave the variable in the consumer's index while the copy took nothing.
+        raise Unsupported(
+            f"insert_restickify: the loop variable of {restick_arg_info.arg_name} "
+            f"is used non-linearly in {index}, so its advance cannot move to the "
+            "restickify copy"
+        )
     return term if term != 0 else None
 
 
@@ -640,6 +653,15 @@ def insert_restickify_on_node_inputs(
             shared_loop_depth,
         )
         if moved is not None:
+            if old_name in moved_terms:
+                # The handler drops a moved term from every load that resolves to
+                # this buffer, by name: two restickified reads of one buffer
+                # cannot be told apart, so a term would be taken from the wrong one.
+                raise Unsupported(
+                    f"insert_restickify: {old_name} is restickified more than once "
+                    f"for {op.get_name()} and its per-trip advance moves to the copy; "
+                    "the loop term cannot be assigned to one read"
+                )
             moved_terms[old_name] = moved
             _give_copy_the_loop_term(restick_buff, op, old_name, moved)
 

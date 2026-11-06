@@ -73,7 +73,6 @@ from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .pass_utils import (
-    loop_induction_symbols,
     concretize_expr,
     concretize_index,
     device_coordinates,
@@ -82,6 +81,7 @@ from .pass_utils import (
     host_coordinates,
     identify_matmul_inputs,
     is_restickify_coords,
+    loop_induction_symbols,
     lower_pad_sequence,
     op_read_writes,
     patch_env,
@@ -138,36 +138,33 @@ def restride_loop_step(
     goes from 67 * 128 to 128 * 128). The step in the padded buffer is
     ``count * padded_stride[d]``.
 
-    An exact match (``count == 1``) wins. A multiple (``count > 1``, a tile of
-    several positions) is taken only if it stays inside the dim. Dims of size one
-    are never stepped, so they cannot own the step. If two dims could own it the
-    loop cannot be re-strided, and this raises ``Unsupported`` rather than leave a
-    step that walks the padded buffer by the unpadded stride (#5573). A step that
-    is no dim's is returned unchanged.
+    ``count`` is 1 for one position and above 1 for a tile of several, and the
+    count must stay inside the dim. Dims of size one are never stepped, so they
+    cannot own the step. If two dims could own it the loop cannot be re-strided,
+    and this raises ``Unsupported`` rather than guess or leave a step that walks
+    the padded buffer by the unpadded stride (#5573). A step that no dim owns is
+    returned unchanged.
     """
     dims = [d for d in range(len(stride)) if size[d] > 1 and stride[d] > 0]
-    exact = [d for d in dims if stride[d] == step]
-    if len(exact) > 1:
+    # Every dim that could own the step: a whole number (1 or more) of positions
+    # along it, staying inside it. In a contiguous layout this is at most one dim
+    # (stride[d] = stride[d + 1] * size[d + 1], so a multiple of an inner stride
+    # that fits inside the inner dim is smaller than the outer stride). A layout
+    # that is not contiguous (a transposed or column-major read-copy buffer) can
+    # give two readings of one step, and re-striding the wrong one would read the
+    # wrong place after the first trip, so it is rejected, not resolved by
+    # preferring an exact match.
+    owners = [d for d in dims if step % stride[d] == 0 and step // stride[d] < size[d]]
+    if len(owners) > 1:
         raise Unsupported(
             f"insert_bmm_padding: cannot tell which dim of {buffer_name} the loop "
             f"steps by {step} (strides {stride}, sizes {size}); the padded "
             f"buffer's per-trip step would be wrong"
         )
-    if exact:
-        return sympy.Integer(padded_stride[exact[0]])
-    multiples = [
-        d for d in dims if step % stride[d] == 0 and step // stride[d] < size[d]
-    ]
-    if len(multiples) > 1:
-        raise Unsupported(
-            f"insert_bmm_padding: cannot tell which dim of {buffer_name} the loop "
-            f"steps by {step} (strides {stride}, sizes {size}); the padded "
-            f"buffer's per-trip step would be wrong"
-        )
-    if multiples:
-        d = multiples[0]
-        return sympy.Integer(step // stride[d] * padded_stride[d])
-    return step
+    if not owners:
+        return step
+    d = owners[0]
+    return sympy.Integer(step // stride[d] * padded_stride[d])
 
 
 class _PaddedLoadHandler(WrapperHandler):
