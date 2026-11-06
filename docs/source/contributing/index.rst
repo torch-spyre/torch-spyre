@@ -15,3 +15,4 @@ For compiler-specific patterns such as adding new operation support, see
    profiling
    is_power_z_dev_label_guide
    benchmark_node_qualification
+   pytorch_2_15_audit

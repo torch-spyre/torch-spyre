@@ -15,8 +15,9 @@
 import torch
 import math
 import pytest
+from contextlib import nullcontext
 
-from utils_inductor import cached_randn, compare_with_cpu, strict_xfail
+from utils_inductor import cached_randn, compare_with_cpu, expects_raise, strict_xfail
 
 
 @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
@@ -333,16 +334,15 @@ class TestSdpaScalarHyperparameters:
             run_eager=(execution_mode == "eager"),
         )
 
+    @expects_raise
     def test_sdpa_local_window_mask_scalar(self, request, execution_mode):
         """SDPA: local window via ``masked_fill(..., -inf)``; ``window_size=32`` sets mask support."""
-        # The mask is built with ``mask[i, start:end] = False`` on a device bool
-        # tensor. Eager has no lowering for the resulting spyre.copy_from_dNd;
-        # compiled fails with "Cannot resolve target for 'index_expr'" (#4502).
-        strict_xfail(
-            request,
-            torch._inductor.exc.InductorError,
-            "slice assignment into a device bool tensor (#4502)",
-        )
+        if execution_mode == "compiled":
+            strict_xfail(
+                request,
+                torch._inductor.exc.InductorError,
+                "slice assignment into a device bool tensor (#4502)",
+            )
 
         def local_attention(q, k, v):
             d_k = q.size(-1)
@@ -362,16 +362,23 @@ class TestSdpaScalarHyperparameters:
         q = cached_randn((2, 8, 128, 64), dtype=torch.float16)
         k = cached_randn((2, 8, 128, 64), dtype=torch.float16, differentiation=1)
         v = cached_randn((2, 8, 128, 64), dtype=torch.float16, differentiation=2)
-        compare_with_cpu(
-            local_attention,
-            q,
-            k,
-            v,
-            atol=0.1,
-            rtol=0.1,
-            run_compile=(execution_mode == "compiled"),
-            run_eager=(execution_mode == "eager"),
-        )
+        # TODO(#4356): enable the positive eager check once masked_fill is supported.
+        # Eager reaches masked_fill on 2.15; compiled still fails on slice assignment.
+        with (
+            pytest.raises(NotImplementedError, match=r"aten::masked_fill_\.Scalar")
+            if execution_mode == "eager"
+            else nullcontext()
+        ):
+            compare_with_cpu(
+                local_attention,
+                q,
+                k,
+                v,
+                atol=0.1,
+                rtol=0.1,
+                run_compile=(execution_mode == "compiled"),
+                run_eager=(execution_mode == "eager"),
+            )
 
     def test_sdpa_cross_sequence_length(self, execution_mode):
         """SDPA with Q seq len ≠ KV seq len (scalar ``1/sqrt(d_k)`` scaling only)."""
@@ -416,14 +423,9 @@ class TestSdpaScalarHyperparameters:
             run_eager=(execution_mode == "eager"),
         )
 
-    def test_sdpa_causal_triu_mask_neg_inf(self, request, execution_mode):
+    @expects_raise
+    def test_sdpa_causal_triu_mask_neg_inf(self, execution_mode):
         """SDPA: causal mask via ``triu`` + ``masked_fill(..., -inf)``."""
-        if execution_mode == "eager":
-            strict_xfail(
-                request,
-                NotImplementedError,
-                "aten::masked_fill_.Scalar has no Spyre kernel (#4356)",
-            )
 
         def causal_attention(q, k, v):
             d_k = q.size(-1)
@@ -441,16 +443,22 @@ class TestSdpaScalarHyperparameters:
         q = cached_randn((2, 8, 128, 64), dtype=torch.float16)
         k = cached_randn((2, 8, 128, 64), dtype=torch.float16, differentiation=1)
         v = cached_randn((2, 8, 128, 64), dtype=torch.float16, differentiation=2)
-        compare_with_cpu(
-            causal_attention,
-            q,
-            k,
-            v,
-            atol=0.1,
-            rtol=0.1,
-            run_compile=(execution_mode == "compiled"),
-            run_eager=(execution_mode == "eager"),
-        )
+        # TODO(#4356): enable the positive eager check once masked_fill is supported.
+        with (
+            pytest.raises(NotImplementedError, match=r"aten::masked_fill_\.Scalar")
+            if execution_mode == "eager"
+            else nullcontext()
+        ):
+            compare_with_cpu(
+                causal_attention,
+                q,
+                k,
+                v,
+                atol=0.1,
+                rtol=0.1,
+                run_compile=(execution_mode == "compiled"),
+                run_eager=(execution_mode == "eager"),
+            )
 
     def test_sdpa_additive_score_bias_scalar(self, execution_mode):
         """SDPA: add scalar ``0.1`` to all attention logits before softmax."""

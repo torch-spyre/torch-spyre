@@ -731,7 +731,7 @@ def _install_is_wait_patch() -> None:
     name, so each module's binding is replaced, not just ``utils``.
 
     This is a global side effect of importing this module. Checked against
-    torch 2.13; re-check the exact-type test and the by-name imports when
+    torch 2.15; re-check the exact-type test and the by-name imports when
     upgrading.
     """
     import torch._inductor.comms as comms
