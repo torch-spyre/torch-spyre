@@ -1081,6 +1081,25 @@ _PATTERN_TOL = {
 }
 
 
+def _stick_splitting_read_param_sets():
+    """``{case: (view, x)}`` for reads that split a stick."""
+    reads = {
+        "flat_8x65": ((8, 65), lambda a: a.reshape(-1)),
+        "flat_2x3x65": ((2, 3, 65), lambda a: a.reshape(-1)),
+        "flat_4x100": ((4, 100), lambda a: a.reshape(-1)),
+        "split_1x4x800_to_1x4x5x160": ((1, 4, 800), lambda a: a.reshape(1, 4, 5, 160)),
+        "merge_1x4x5x160_to_1x4x800": ((1, 4, 5, 160), lambda a: a.reshape(1, 4, 800)),
+        "reshape_1x2x4x8x7_to_1x8x56": (
+            (1, 2, 4, 8, 7),
+            lambda a: a.reshape(1, 8, 56),
+        ),
+    }
+    return {
+        name: (view, cached_randn(shape, differentiation="ssr"))
+        for name, (shape, view) in reads.items()
+    }
+
+
 def _pattern_param_sets():
     out = {}
 
@@ -9094,6 +9113,31 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        # Reads whose row or slice boundary falls inside a stick (64 fp16
+        # elements): issues #5197, #5198, #5227, #5872. A row of 160 elements is
+        # 2.5 sticks, as in the (1, 64, 25600) <-> (1, 64, 160, 160) reshape of
+        # #5227; a smaller tensor with the same row length exercises the same
+        # split and merge.
+        (
+            "test_stick_splitting_read_pointwise",
+            "test_stick_splitting_read_pointwise_cpu",
+        ): {"param_sets": _stick_splitting_read_param_sets()},
+        (
+            "test_stick_splitting_read_reduction",
+            "test_stick_splitting_read_reduction_cpu",
+        ): {"param_sets": _stick_splitting_read_param_sets()},
+        # #2851: a dtype conversion that reads a strided slice (stick coordinate
+        # 2*Mod(d1, 32)).
+        (
+            "test_stick_splitting_read_strided_to_dtype",
+            "test_stick_splitting_read_strided_to_dtype_cpu",
+        ): {
+            "param_sets": {
+                "step2_8x128_float_half": (
+                    cached_randn((8, 128), differentiation="ssr_2851"),
+                ),
+            },
+        },
         ("test_transpose_patterns", "test_transpose_patterns_cpu"): {
             "param_sets": _pattern_param_sets(),
         },
@@ -11824,6 +11868,25 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return q.contiguous(), k.contiguous()
 
         self.compare_with_cpu(fn, hidden, cos, sin, run_eager=False)
+
+    def test_stick_splitting_read_pointwise_cpu(self, view, x):
+        """A read whose row or slice boundary falls inside a stick (issues #5197,
+        #5198, #5227, #5872), compiled and eager.
+
+        ``(view * 2).exp()``, not ``view * 1.0``: the latter already passed on main.
+        """
+        self.compare_with_cpu(lambda a: (view(a) * 2).exp(), x, atol=0.5, rtol=0.1)
+
+    def test_stick_splitting_read_reduction_cpu(self, view, x):
+        self.compare_with_cpu(lambda a: (view(a) * 2).sum(), x, atol=1.0, rtol=0.1)
+
+    def test_stick_splitting_read_strided_to_dtype_cpu(self, x):
+        """``t[:, ::2].float().half()`` (issue #2851), compiled only.
+
+        The eager result of ``.float()`` is not comparable with the CPU even for
+        a dense tensor (see the D2H element-arrangement TODO in ``eager.py``).
+        """
+        self.compare_with_cpu(lambda a: a[:, ::2].float().half(), x, run_eager=False)
 
     # --- Migrated from test_ops.py ---
 
