@@ -1323,6 +1323,76 @@ class TestAdjustItSpaceForPadding(unittest.TestCase):
         self.assertEqual(kept, it_space)
 
 
+class TestWorkDivisionContextPadding(unittest.TestCase):
+    """``work_division_context_for_op`` offers splits of the padded extent, but
+    a tiled frame keeps its per-tile extents.
+
+    Only the inputs the context is derived from are patched; padding, the stick
+    adjustment and the factor domains run for real.
+    """
+
+    def setUp(self):
+        self.rows, self.cols = _isym("d0"), _isym("d1")
+        self.op = _computed_buffer((7, 64), name="out")
+
+    def _context(self, output_padded_rows, tiling=None, frame_it_space=None):
+        """The context for ``out = f(x)`` over ``[7, 64]``, ``x`` padded to 8
+        rows and ``out`` padded to ``output_padded_rows`` (``None``: unpadded).
+        """
+        x = _with_padded_dim(
+            _tensor_dep("x", (7, 64), (self.rows, self.cols)), self.rows, 8
+        )
+        out = _tensor_dep("out", (7, 64), (self.rows, self.cols))
+        if output_padded_rows is not None:
+            out = _with_padded_dim(out, self.rows, output_padded_rows)
+        rw = MagicMock(writes=[out.dep], reads=[x.dep])
+        with ExitStack() as stack:
+            for target, value in [
+                ("iteration_space_from_op", {self.rows: 7, self.cols: 64}),
+                ("collect_tensor_deps", ([x], out)),
+                ("op_read_writes", rw),
+                ("get_mem_deps_from_rw", []),
+                ("collect_work_division_constraints", ConstraintResult()),
+            ]:
+                stack.enter_context(
+                    patch(
+                        f"torch_spyre._inductor.work_division.{target}",
+                        return_value=value,
+                    )
+                )
+            if frame_it_space is not None:
+                stack.enter_context(
+                    patch(
+                        "torch_spyre._inductor.wsr.tile_prediction.predict_frame",
+                        return_value=MagicMock(iter_space=frame_it_space),
+                    )
+                )
+            return work_division_context_for_op(self.op, 8, tiling)
+
+    def test_padded_rows_split_the_padded_extent(self):
+        ctx = self._context(output_padded_rows=8)
+        self.assertEqual(ctx.it_space[self.rows], 8)
+        self.assertEqual(ctx.factor_domain(self.rows), [1, 2, 4, 8])
+        self.assertTrue(ctx.is_legal({self.rows: 4}))
+
+    def test_unpadded_output_splits_the_host_extent(self):
+        ctx = self._context(output_padded_rows=None)
+        self.assertEqual(ctx.it_space[self.rows], 7)
+        self.assertEqual(ctx.factor_domain(self.rows), [1, 7])
+
+    def test_a_tiled_frame_is_not_padded(self):
+        # Four tiles over the rows: each tile has 2 rows, which is far below
+        # the padded device extent of 8 but must not grow to it.
+        tiling = TileSpec((TileAxis(host_dim=0, count=4),))
+        ctx = self._context(
+            output_padded_rows=8,
+            tiling=tiling,
+            frame_it_space={self.rows: 2, self.cols: 64},
+        )
+        self.assertEqual(ctx.it_space[self.rows], 2)
+        self.assertEqual(ctx.factor_domain(self.rows), [1, 2])
+
+
 class TestWorkDivisionCandidates(unittest.TestCase):
     def test_candidates_respect_span_floor(self):
         x = _isym("x")
