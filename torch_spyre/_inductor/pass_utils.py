@@ -16,6 +16,7 @@ import io
 import itertools
 import math
 import warnings
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -342,17 +343,20 @@ def concretize_expr(expr: Union[Expr, int]) -> int:
     expressions remain symbolic and will carry through to the SDSC when
     symbolic SDSC generation is implemented.
 
-    A structural parameter that depends on a varying dimension resolves to that
-    dimension's DECLARED MAXIMUM, not to this call's hint. One binary has to stay
-    valid for every size in the range, and the hint is one warm-up call's size.
-    Measured: a binary built against a 320-row warm-up was correct at 128 and 256
-    and wrong at 448 and 512, relative error 3.96 and 4.37. Over-declaring the
-    geometry is harmless and under-declaring it is a silent wrong answer, which
-    puts the maximum at the safe end.
+    A structural parameter that depends on a DECLARED dimension, one the caller
+    moved with ``tensor.to("spyre", dynamic={d: {min, max, granularity}})``,
+    resolves to that dimension's declared MAXIMUM, not to this call's hint. One
+    binary has to stay valid for every size in the range, and the hint is one
+    warm-up call's size. Measured: a binary built against a 320-row warm-up was
+    correct at 128 and 256 and wrong at 448 and 512, relative error 3.96 and
+    4.37. Over-declaring the geometry is harmless and under-declaring it is a
+    silent wrong answer, which puts the maximum at the safe end. The maximum is
+    the declaration's, recorded for this compile by ``declared_dims``, not a
+    bound the ShapeEnv happens to know.
 
-    This changes nothing for anything else: a concrete expression returns early
-    above, and a symbol that went dynamic without a declared range has no finite
-    bound and still takes the hint.
+    This changes nothing for anyone else: a concrete expression returns early
+    above, and a symbol that went dynamic by ``mark_dynamic`` alone, with or
+    without a ``max=``, is not declared and still takes the hint.
 
     Depends on the max-strided reservation (#5179). Geometry sized from the
     maximum is only addressable because the buffer was reserved for the maximum.
@@ -362,11 +366,67 @@ def concretize_expr(expr: Union[Expr, int]) -> int:
     if isinstance(expr, sympy.Integer):
         return int(expr)
     if hasattr(expr, "free_symbols") and expr.free_symbols:
-        upper = finite_upper_or_none(expr)
-        if upper is not None:
-            return upper
+        at_max = declared_max_or_none(expr)
+        if at_max is not None:
+            return at_max
         return V.graph.sizevars.optimization_hint(expr)
     return int(expr)
+
+
+# The dimensions declared with ``tensor.to("spyre", dynamic=...)`` for the compile
+# in progress, by symbol name: {name: (min, max, granularity)}. Set for the span
+# of one Spyre ``compile_fx`` by ``patches.enable_spyre_context`` from the graph
+# inputs that carry a reservation (``torch_spyre._C.get_reserved_dims``), before
+# lowering starts, because ``concretize_expr`` is already called during
+# lowering. Keyed by name because the name is what ``LoopSpec`` carries in
+# ``count_symbol_bounds`` and what survives the reload.
+_DECLARED_DIMS: dict[str, tuple[int, int, int]] = {}
+
+
+@contextmanager
+def declared_dims(mapping: "dict[str, tuple[int, int, int]] | None"):
+    """Make ``mapping`` the declared dimensions of the compile inside the block."""
+    global _DECLARED_DIMS
+    previous = _DECLARED_DIMS
+    _DECLARED_DIMS = dict(mapping or {})
+    try:
+        yield
+    finally:
+        _DECLARED_DIMS = previous
+
+
+def declared_dims_in(expr) -> dict[str, tuple[int, int, int]]:
+    """The declared dimensions among ``expr``'s free symbols, by name."""
+    if not (hasattr(expr, "free_symbols") and expr.free_symbols):
+        return {}
+    return {
+        str(s): _DECLARED_DIMS[str(s)]
+        for s in expr.free_symbols
+        if str(s) in _DECLARED_DIMS
+    }
+
+
+def declared_max_or_none(expr) -> Optional[int]:
+    """``expr`` evaluated at the declared maximum of every symbol in it, or None.
+
+    None when ``expr`` has no free symbols, or when any of them is not a declared
+    dimension: a symbol that went dynamic by ``mark_dynamic`` alone is left to
+    the caller's fallback (the hint for geometry, the ShapeEnv bound for a loop
+    count). The structural sizes this serves are monotonic in the dimension (a
+    size, a tile count, a stride product), so substituting the maximum gives the
+    largest extent the geometry has to cover.
+    """
+    if not (hasattr(expr, "free_symbols") and expr.free_symbols):
+        return None
+    declared = declared_dims_in(expr)
+    if len(declared) != len(expr.free_symbols):
+        return None
+    at_max = expr.subs({s: declared[str(s)][1] for s in expr.free_symbols})
+    if isinstance(at_max, sympy.Integer):
+        return int(at_max)
+    if getattr(at_max, "is_integer", False) and at_max.is_number:
+        return int(at_max)
+    return None
 
 
 def _user_min_or_none(expr: Expr) -> Optional[int]:
@@ -397,11 +457,17 @@ def _user_min_or_none(expr: Expr) -> Optional[int]:
 
 
 def finite_upper_or_none(expr: Expr) -> Optional[int]:
-    """Return the ShapeEnv finite upper bound for ``expr``, or ``None``.
-    A bound is usable iff it is a positive concrete
-    ``sympy.Integer``; ``sympy.oo``, non-integers, and non-positive
-    values all return ``None``.
+    """Return the finite upper bound for ``expr``, or ``None``.
+
+    A declared dimension's bound is its declaration's maximum (``declared_dims``),
+    whether or not the trace also carried a ``torch._check`` range for it.
+    Otherwise it is the ShapeEnv's bound, usable iff it is a positive concrete
+    ``sympy.Integer``; ``sympy.oo``, non-integers, and non-positive values all
+    return ``None``.
     """
+    at_max = declared_max_or_none(expr)
+    if at_max is not None:
+        return at_max
     vr = V.graph.sizevars.shape_env.bound_sympy(expr)
     if isinstance(vr.upper, sympy.Integer) and vr.upper.is_finite and int(vr.upper) > 0:
         return int(vr.upper)
@@ -532,9 +598,10 @@ def max_trip_count(count) -> int:
     reserved at the maximum and the bundle's own loop bound is what limits how
     many iterations actually run.
 
-    So this takes the ShapeEnv upper bound and never the hint. Baking in one
-    call's size specialises the SDSC to it while the binary claims to serve the
-    whole range, and that is invisible at the warm-up size.
+    So this takes the declared maximum, or the ShapeEnv upper bound for a count
+    over a dimension that only ``mark_dynamic(max=...)`` bounded, and never the
+    hint. Baking in one call's size specialises the SDSC to it while the binary
+    claims to serve the whole range, and that is invisible at the warm-up size.
 
     NOT the same number as ``symbolic_count_bounds`` carries, which is easy to
     confuse because both are "the max". For ``FloorDiv(s, 64)`` with ``s <= 512``

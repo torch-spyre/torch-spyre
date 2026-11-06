@@ -58,6 +58,9 @@ from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.op_spec import LoopSpec
 from torch_spyre._inductor.pass_utils import (
     concretize_expr,
+    declared_dims,
+    declared_dims_in,
+    declared_max_or_none,
     decompose_tiled_count,
     max_trip_count,
     symbolic_count_bounds,
@@ -161,19 +164,40 @@ class TestConcretizeExprPrefersTheDeclaredMax(unittest.TestCase):
     harmless, under-declaring is silently wrong.
     """
 
-    def test_a_declared_symbol_resolves_to_its_ceiling(self):
-        graph = _graph_with_bounds({SYM: sympy.Integer(MAX)}, hint=320)
+    def test_a_declared_symbol_resolves_to_its_maximum(self):
+        """Declared means moved with ``tensor.to("spyre", dynamic=...)`` and
+        recorded for the compile by ``declared_dims``. The ShapeEnv is not
+        consulted for it, which is why the stub here carries no bound."""
+        graph = _graph_with_bounds({}, hint=320)
 
-        with V.set_graph_handler(graph):
+        with declared_dims({SYM: (TILE, MAX, TILE)}), V.set_graph_handler(graph):
             self.assertEqual(concretize_expr(_sym()), MAX)
 
     def test_an_undeclared_symbol_still_takes_the_hint(self):
         """The regression half. A dim that went dynamic by accident has no
-        ceiling, so nothing better than the hint exists and nothing changes."""
+        declaration, so nothing better than the hint exists and nothing changes."""
         graph = _graph_with_bounds({}, hint=320)
 
         with V.set_graph_handler(graph):
             self.assertEqual(concretize_expr(_sym()), 320)
+
+    def test_a_shape_env_ceiling_alone_is_not_a_declaration(self):
+        """A ``mark_dynamic(max=...)`` user, or a ``torch._check`` range on an
+        undeclared dim, gives the ShapeEnv a ceiling and nothing else. Geometry
+        for them stays at the hint, as before this change: resolving to the
+        ceiling would need the buffer reserved for it, and only the declaration
+        reserves."""
+        graph = _graph_with_bounds({SYM: sympy.Integer(MAX)}, hint=320)
+
+        with V.set_graph_handler(graph):
+            self.assertEqual(concretize_expr(_sym()), 320)
+
+    def test_a_compound_of_a_declared_symbol_is_evaluated_at_the_maximum(self):
+        graph = _graph_with_bounds({}, hint=5)
+
+        with declared_dims({SYM: (TILE, MAX, TILE)}), V.set_graph_handler(graph):
+            self.assertEqual(concretize_expr(FloorDiv(_sym(), TILE)), MAX // TILE)
+            self.assertEqual(concretize_expr(_sym() * 2), 2 * MAX)
 
     def test_concrete_values_are_untouched(self):
         """Which is why this change cannot reach a static kernel: every
@@ -192,21 +216,23 @@ class TestTheTwoConcretizersAgree(unittest.TestCase):
     sitting in a comment.
     """
 
-    def test_both_resolve_a_declared_symbol_to_its_ceiling(self):
-        graph = _graph_with_bounds({SYM: sympy.Integer(MAX)}, hint=320)
+    def test_both_resolve_a_declared_symbol_to_its_maximum(self):
+        graph = _graph_with_bounds({}, hint=320)
 
-        with V.set_graph_handler(graph):
+        with declared_dims({SYM: (TILE, MAX, TILE)}), V.set_graph_handler(graph):
             self.assertEqual(_concretize_for_cmp(_sym()), MAX)
             self.assertEqual(concretize_expr(_sym()), MAX)
 
-    def test_both_still_take_the_hint_without_a_ceiling(self):
-        """The control. A dim that went dynamic by accident has no ceiling, so
-        nothing better than the hint exists and neither copy changes."""
-        graph = _graph_with_bounds({}, hint=320)
+    def test_both_still_take_the_hint_without_a_declaration(self):
+        """The control, in both forms an undeclared dim takes: no ceiling at
+        all, and a ShapeEnv ceiling from ``mark_dynamic(max=...)``. Neither copy
+        changes for either."""
+        for bounds in ({}, {SYM: sympy.Integer(MAX)}):
+            graph = _graph_with_bounds(bounds, hint=320)
 
-        with V.set_graph_handler(graph):
-            self.assertEqual(_concretize_for_cmp(_sym()), 320)
-            self.assertEqual(concretize_expr(_sym()), 320)
+            with V.set_graph_handler(graph):
+                self.assertEqual(_concretize_for_cmp(_sym()), 320)
+                self.assertEqual(concretize_expr(_sym()), 320)
 
     def test_the_copy_keeps_its_infinity_sentinels(self):
         """Why the copy cannot become a thin forwarder. ``add_term`` is handed
@@ -728,6 +754,49 @@ class TestTheFloorDivSpellingCanary(unittest.TestCase):
         symbol, tile = decompose_tiled_count(reread)
         self.assertEqual((str(symbol), tile), (SYM, TILE))
         self.assertEqual(_normalized_expr_str(reread), _normalized_expr_str(count))
+
+
+class TestTheDeclaredDimsOfACompile(unittest.TestCase):
+    """``declared_dims`` is what makes a symbol declared for the helpers above.
+
+    The Spyre ``compile_fx`` wrapper fills it from the graph inputs that carry a
+    ``tensor.to("spyre", dynamic=...)`` reservation, before lowering. These arms
+    pin what the helpers do with it, with no ShapeEnv bound anywhere, so a
+    declared dimension needs no ``torch._check`` range to get its geometry.
+    """
+
+    def test_outside_a_compile_nothing_is_declared(self):
+        self.assertEqual(declared_dims_in(_sym()), {})
+        self.assertIsNone(declared_max_or_none(_sym()))
+
+    def test_the_block_declares_and_restores(self):
+        with declared_dims({SYM: (TILE, MAX, TILE)}):
+            self.assertEqual(declared_dims_in(_sym()), {SYM: (TILE, MAX, TILE)})
+            with declared_dims({}):
+                self.assertEqual(declared_dims_in(_sym()), {})
+            self.assertEqual(declared_dims_in(_sym()), {SYM: (TILE, MAX, TILE)})
+        self.assertEqual(declared_dims_in(_sym()), {})
+
+    def test_a_mixed_expression_is_not_resolved(self):
+        """One declared symbol and one that is not: the maximum of the declared
+        one says nothing about the other, so the caller keeps its fallback."""
+        other = sympy.Symbol("s1", integer=True, positive=True)
+
+        with declared_dims({SYM: (TILE, MAX, TILE)}):
+            self.assertEqual(declared_dims_in(_sym() + other), {SYM: (TILE, MAX, TILE)})
+            self.assertIsNone(declared_max_or_none(_sym() + other))
+
+    def test_a_declared_count_needs_no_shape_env_bound(self):
+        """The trip count of a loop over a declared dim resolves from the
+        declaration, so a traced function that declares and does not also write
+        ``torch._check(rows <= max)`` still gets its geometry."""
+        graph = _graph_with_bounds({})
+
+        with declared_dims({SYM: (TILE, MAX, TILE)}), V.set_graph_handler(graph):
+            self.assertEqual(max_trip_count(FloorDiv(_sym(), TILE)), MAX // TILE)
+            self.assertEqual(
+                symbolic_count_bounds(FloorDiv(_sym(), TILE)), {SYM: (MAX, TILE)}
+            )
 
 
 if __name__ == "__main__":

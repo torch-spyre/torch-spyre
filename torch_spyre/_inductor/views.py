@@ -189,10 +189,10 @@ def _concretize_for_cmp(expr):
     slice / split ops).  ``int(sympy.oo)`` would raise; ``math.inf`` works
     correctly in ``<`` / ``>`` comparisons against ints and sympy values.
 
-    A symbol carrying a declared ceiling resolves to that ceiling rather than to
-    this call's hint, so a branch taken here matches the geometry
-    ``concretize_expr`` builds around it. A symbol that went dynamic without a
-    declared range has no ceiling and still takes the hint.
+    A symbol from a ``tensor.to("spyre", dynamic=...)`` declaration resolves to
+    its declared maximum rather than to this call's hint, so a branch taken here
+    matches the geometry ``concretize_expr`` builds around it. A symbol that went
+    dynamic by ``mark_dynamic`` alone is not declared and still takes the hint.
 
     TODO(issue#1373): once these algorithms use sympy predicates or
     SizeVarAllocator guards, this function can be removed.
@@ -212,11 +212,11 @@ def _concretize_for_cmp(expr):
         # Local import: pass_utils imports compute_coordinates from this module,
         # so a module-level import would cycle. build_alignment_inputs below
         # reaches for the same helper the same way.
-        from .pass_utils import finite_upper_or_none
+        from .pass_utils import declared_max_or_none
 
-        upper = finite_upper_or_none(expr)
-        if upper is not None:
-            return upper
+        at_max = declared_max_or_none(expr)
+        if at_max is not None:
+            return at_max
         return V.graph.sizevars.optimization_hint(expr)
     return int(expr)
 

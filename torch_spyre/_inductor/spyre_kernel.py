@@ -72,6 +72,7 @@ from .scratchpad.lx_relayout import (
 )
 from .pass_utils import (
     concretize_expr,
+    declared_dims_in,
     op_read_writes,
     compute_symbolic_bounds,
     max_trip_count,
@@ -1169,6 +1170,24 @@ class SpyreKernel(Kernel[CSEVariable]):
         for _, (size_expr, _) in it_space_extended.items():
             if not (hasattr(size_expr, "free_symbols") and size_expr.free_symbols):
                 continue
+            declared = declared_dims_in(size_expr)
+            if declared:
+                # A declared dimension reaches a kernel only as the trip count of
+                # a for_each_tile loop over it: the body is one static tile and
+                # the loop runs for the size the launch reads. An op whose own
+                # iteration space depends on it has no such loop, so it would be
+                # built at one size, right there and silently wrong at every
+                # other (#5937), or at the maximum and writing past an output
+                # allocated at the real size. Refuse instead.
+                raise Unsupported(
+                    f"{op} ({ir_node.get_operation_name()}): its iteration space "
+                    f"has size {size_expr}, which depends on the dimension(s) "
+                    f"{sorted(declared)} declared with "
+                    'tensor.to("spyre", dynamic=...), outside any for_each_tile '
+                    "loop. A declared dimension is consumed by a for_each_tile "
+                    "loop over it (dims=(d,), tile_size=granularity), whose body "
+                    "sees one tile and whose trip count is bound at launch."
+                )
             if finite_upper_or_none(size_expr) is None:
                 logger.debug(
                     f"[work_division/symbolic] skipping auto-dynamic symbol "
