@@ -271,6 +271,18 @@ read_copy_elision: bool = os.getenv("SPYRE_READ_COPY_ELISION", "1").lower() in (
 # after specific passes. Set via SPYRE_LOG_PASSES env var or programmatically.
 log_passes: str = os.environ.get("SPYRE_LOG_PASSES", "")
 
+# Directory for the per-kernel cost sidecar (kernel_cost.py): one JSONL line per
+# compiled kernel, in kernel_cost.<pid>.jsonl, joining the provenance key to the
+# cost model's bytes, MACs, cores and predicted time. Empty (default) is off and
+# costs one attribute read per kernel; setting it also runs the cost model pass
+# quietly, without the SPYRE_DUMP_COST report.
+kernel_cost_dir: str = os.environ.get("TORCH_SPYRE_KERNEL_COST_DIR", "")
+
+# Directory for compile_summary.<pid>.json (compile_summary.py), written at exit:
+# total compile seconds, per-pass self seconds and kernel-cache counters. Setting
+# it turns the timing recorder on, since the summary is derived from its events.
+compile_summary_dir: str = os.environ.get("TORCH_SPYRE_COMPILE_SUMMARY_DIR", "")
+
 # Structured per-compile timing records (timing_recorder.py).  Off by default;
 # when off, a timed region records nothing and allocates no event, but the call
 # site still builds its name and keyword arguments and this flag is still read,
@@ -280,7 +292,9 @@ log_passes: str = os.environ.get("SPYRE_LOG_PASSES", "")
 # pays ~0.2 ms off, ~0.5 ms on.  Records go to timing_out at process exit, or via
 # timing_recorder.dump_and_finalize() for callers that want them sooner.
 # Tests override with config.patch({"timing": True}) rather than the environment.
-timing: bool = os.getenv("TORCH_SPYRE_TIMING", "0").lower() in (
+timing: bool = bool(compile_summary_dir) or os.getenv(
+    "TORCH_SPYRE_TIMING", "0"
+).lower() in (
     "1",
     "true",
     "yes",
@@ -537,6 +551,8 @@ _cache_config_ignore_prefix: list[str] = [
     # prefix matches.
     "timing",
     "dump_cost_expr_file",
+    "kernel_cost_dir",
+    "compile_summary_dir",
     "spyre_kernel_cache",
 ]
 
