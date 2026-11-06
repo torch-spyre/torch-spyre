@@ -607,6 +607,17 @@ def _compute_coordinates_uncached(
     if repeat_info_out is not None:
         repeat_info_out.update(repeat_info)
 
+    # Filter out variables that are not iteration variables of this operation
+    # (e.g. outer while-loop offsets or dynamic size symbols).
+    vars_in_index = index.free_symbols
+    vars_to_zero = {
+        s
+        for s in vars_in_index
+        if s not in var_ranges and (indirect_sizes is None or s not in indirect_sizes)
+    }
+    if vars_to_zero:
+        index = index.xreplace({s: 0 for s in vars_to_zero})
+
     # Check for reversed traversal on iteration variables
     vars_in_index = index.free_symbols
     for var in vars_in_index:
