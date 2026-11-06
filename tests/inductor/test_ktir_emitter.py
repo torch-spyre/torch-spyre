@@ -32,6 +32,7 @@ from test_ktir_validate import (
     make_onstick_sum_specs,
     make_op_spec,
     make_pooled_chain,
+    make_relayout_op_spec,
     make_scalar_operand_op_spec,
     make_statistic_reader_specs,
     make_two_element_type_specs,
@@ -109,6 +110,47 @@ module {
             ),
             self.EXPECTED_ADD_KTIR,
         )
+
+
+@unittest.skipUnless(
+    _mlir_ktdp_available(),
+    "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
+)
+class TestKtirRestickify(unittest.TestCase):
+    """A [64, 64] transpose: the input viewed at transposed strides, then a copy.
+
+    The transpose lives in the input view alone -- its type is
+    ``strided<[4096, 1, 64]>`` -- while the output view is plain row-major and
+    the compute is an identity ``linalg.generic``.  Verified on device.
+    """
+
+    EXPECTED = """\
+#map = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+#set = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + 63 >= 0, d2 >= 0, -d2 + 63 >= 0)>
+module {
+  func.func @ktir_restickify_0(%arg0: index, %arg1: index) attributes {grid = [1]} {
+    %c0 = arith.constant 0 : index
+    %0 = ktdp.construct_memory_view %arg0, sizes: [1, 64, 64], strides: [4096, 1, 64] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<1x64x64xf16, strided<[4096, 1, 64]>>
+    %1 = ktdp.construct_access_tile %0[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<1x64x64xf16, strided<[4096, 1, 64]>> -> !ktdp.access_tile<1x64x64xindex>
+    %2 = ktdp.load %1 : <1x64x64xindex> -> tensor<1x64x64xf16>
+    %3 = tensor.empty() : tensor<1x64x64xf16>
+    %4 = linalg.generic {indexing_maps = [#map, #map], iterator_types = ["parallel", "parallel", "parallel"]} ins(%2 : tensor<1x64x64xf16>) outs(%3 : tensor<1x64x64xf16>) {
+    ^bb0(%in: f16, %out: f16):
+      linalg.yield %in : f16
+    } -> tensor<1x64x64xf16>
+    %5 = ktdp.construct_memory_view %arg1, sizes: [1, 64, 64], strides: [4096, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<1x64x64xf16>
+    %6 = ktdp.construct_access_tile %5[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<1x64x64xf16> -> !ktdp.access_tile<1x64x64xindex>
+    ktdp.store %4, %6 : tensor<1x64x64xf16>, <1x64x64xindex>
+    return
+  }
+}
+"""
+
+    def test_restickify_golden(self):
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir("ktir_restickify_0", [make_relayout_op_spec()])
+        self.assertEqual(emitted, self.EXPECTED)
 
 
 @unittest.skipUnless(

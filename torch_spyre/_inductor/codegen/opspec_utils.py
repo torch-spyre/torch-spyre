@@ -44,12 +44,15 @@ from torch_spyre._inductor.op_spec import OpSpec, TensorArg
 __all__ = [
     "PARALLEL",
     "REDUCTION",
+    "NeedsRelayout",
     "align_reshape_plan",
     "buf_id",
     "core_divisions",
+    "needs_relayout",
     "per_core_extent",
     "placeholder_axes",
     "reduction_indexing",
+    "relayout_strides",
     "row_major_strides",
 ]
 
@@ -162,6 +165,22 @@ def _dim_info(coord: sympy.Expr) -> tuple[str, sympy.Symbol | None]:
     )
 
 
+class NeedsRelayout(NotImplementedError):
+    """An operand that no reshape or broadcast lines up with the output.
+
+    Raised by ``align_reshape_plan`` in exactly two cases: the operand's device
+    axes are a permutation of the output's (the matched axes are out of order),
+    or one of its data-carrying axes matches no output axis (a symbol is split
+    into stick and lane on one side and not on the other, i.e. the stick moved).
+    Both need the operand's elements MOVED, which a map cannot say.
+
+    A subclass of ``NotImplementedError`` so that callers that only want "this
+    operand is refused" keep catching it, while ``needs_relayout`` can tell it
+    apart from the other refusals of alignment (a coordinate form ``_dim_info``
+    cannot classify), which are not relayouts and must stay errors.
+    """
+
+
 def align_reshape_plan(
     in_coords: list[sympy.Expr],
     in_block: list[int],
@@ -186,9 +205,11 @@ def align_reshape_plan(
     Returns ``None`` when the operand already matches the output (fast path:
     no reshape / broadcast emitted, keeping simple kernels byte-identical).
 
-    Raises ``NotImplementedError`` for a cross-stick transpose (an input axis
-    with extent > 1 that no output axis matches, or matched axes that would need
-    a permute) -- that needs a restickify, not a reshape.
+    Raises ``NeedsRelayout`` for a cross-stick transpose (an input axis with
+    extent > 1 that no output axis matches, or matched axes that would need a
+    permute) -- that needs a restickify, not a reshape.  Raises a plain
+    ``NotImplementedError`` (from ``_dim_info``) for a coordinate form it cannot
+    classify.
     """
     in_block = [int(b) for b in in_block]
     out_block = [int(b) for b in out_block]
@@ -222,7 +243,7 @@ def align_reshape_plan(
     # axes must appear in increasing order.  If not, the operand would need a
     # transpose (restickify) to align -- not supported on this path.
     if any(matched_seq[i] >= matched_seq[i + 1] for i in range(len(matched_seq) - 1)):
-        raise NotImplementedError(
+        raise NeedsRelayout(
             "OpSpec alignment: pointwise operand needs a transpose (restickify) "
             "to align device axes; not supported yet"
         )
@@ -235,12 +256,42 @@ def align_reshape_plan(
     if prod_in != prod_reshape:
         # An input axis with extent > 1 was dropped -> real data would be lost;
         # aligning it needs a cross-stick transpose (restickify).
-        raise NotImplementedError(
+        raise NeedsRelayout(
             "OpSpec alignment: pointwise operand needs a cross-stick transpose "
             "(restickify) to align device axes; not supported yet"
         )
     broadcast_to = out_block if reshape_to != out_block else None
     return (reshape_to, broadcast_to)
+
+
+def needs_relayout(source: TensorArg, out: TensorArg) -> bool:
+    """Whether ``source``'s elements must be moved to line up with ``out``'s.
+
+    True exactly when ``align_reshape_plan`` raises ``NeedsRelayout`` for the
+    pair: their device axes are permuted, or a stick split differs.  False when
+    a reshape or broadcast (or nothing) lines them up.  Any other refusal of
+    alignment propagates, because it is not a relayout.
+
+    Built on ``align_reshape_plan`` rather than a separate test so that the
+    pointwise path and this detector cannot disagree: every operand the pointwise
+    path refuses as needing a restickify is detected here, and no other.  It is
+    a necessary condition for ``relayout_strides``, not a sufficient one -- a
+    padded stick or a broadcast combined with a transpose is detected here and
+    then refused by ``relayout_strides`` with its own message.
+
+    Per operand, not per op: a pointwise op with several inputs may need a
+    relayout on any subset of them.
+    """
+    try:
+        align_reshape_plan(
+            list(source.device_coordinates),
+            [int(s) for s in source.device_size],
+            list(out.device_coordinates),
+            [int(s) for s in out.device_size],
+        )
+    except NeedsRelayout:
+        return True
+    return False
 
 
 def operand_indexing(
@@ -323,6 +374,249 @@ def operand_indexing(
             "output's, which needs a transpose (restickify) rather than a map"
         )
     return tuple(row)
+
+
+def _stick_term(coord: sympy.Expr) -> tuple[str, sympy.Symbol | None, int]:
+    """``(kind, sym, stick)`` for one device coordinate of a relayout.
+
+    ``_dim_info`` with the divisor kept: a relayout has to know HOW MANY lanes a
+    stick holds to split a symbol into its stick and lane parts, which alignment
+    never needed because it only matches axes of one kind against each other.
+    ``stick`` is 0 for the two kinds that carry none.
+
+    Only the bare symbol is accepted inside the split -- ``floor(s / 64)``, not
+    ``floor(2 * s / 64)`` -- because a scaled symbol is a stride, and a stride
+    inside a floor is not a stick split.
+    """
+    kind, sym = _dim_info(coord)
+    if kind in (_DIM_CONST, _DIM_BARE):
+        return kind, sym, 0
+    if isinstance(coord, ModularIndexing):
+        inner, div, stick = coord.args
+        if div != 1:
+            raise NotImplementedError(
+                f"OpSpec relayout: coordinate {coord!r} divides before it takes the "
+                "lane, which is not a stick split"
+            )
+    elif isinstance(coord, (sympy.Mod, FloorDiv)):
+        inner, stick = coord.args
+    else:  # ``sympy.floor(sym / stick)``, the projection's own spelling
+        quotient = coord.args[0]
+        stick = 1 / quotient.coeff(sym)
+        inner = sympy.expand(quotient * stick)
+    if inner != sym or not getattr(stick, "is_Integer", False) or int(stick) < 2:
+        raise NotImplementedError(
+            f"OpSpec relayout: coordinate {coord!r} is not a stick split of a bare "
+            "symbol by a whole number of lanes"
+        )
+    return kind, sym, int(stick)
+
+
+def relayout_strides(
+    in_coords: Sequence[sympy.Expr],
+    in_size: Sequence[int],
+    out_coords: Sequence[sympy.Expr],
+    out_size: Sequence[int],
+    ranges: dict[sympy.Symbol, int],
+) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+    """``(extent, in_strides, out_strides)``: a copy, in the output's axis order.
+
+    A relayout -- a transpose, across sticks or not -- moves every element of
+    one buffer to its place in another, and the two buffers order their device
+    axes differently.  Both are viewed over ONE iteration space, the output's
+    device axes in the output's order, so the output view is its own row-major
+    layout and the copy between the views is the identity.  Everything the
+    transpose is goes into the INPUT view's strides: for each iteration dim,
+    how far the input's address moves when that dim steps by one.  That is the
+    only form the backend lowers -- an input view at arbitrary strides into a
+    row-major output -- so the output's strides are row-major by construction
+    and asserted so.
+
+    The iteration space is the output's axes REFINED: an output axis that walks a
+    whole symbol the input splits into stick and lane (``s // 64``, ``s % 64``)
+    becomes two dims, ``(range / 64, 64)``, because the input's address is not
+    linear in ``s`` but is in its two parts.  Splitting a row-major axis in two
+    keeps it row-major, so the output side is unaffected.  An axis of at most one
+    stick needs no split: its stick index is 0 and its lane is the symbol.
+
+    ``ranges`` is each symbol's iteration count.  It is compared against the
+    extents to refuse padding, the one thing a stride cannot say: a stick split
+    of a symbol whose range is not a whole number of sticks reads lanes the input
+    holds no elements for.
+
+    Refuses rather than guesses: a symbol the output does not walk exactly once
+    (or as one stick/lane pair), an input axis whose symbol the output does not
+    walk, an extent that disagrees with its symbol's range, and a view that reads
+    one input element for two outputs -- each of which is not a copy.
+    """
+    in_size = [int(s) for s in in_size]
+    out_size = [int(s) for s in out_size]
+    if len(in_coords) != len(in_size) or len(out_coords) != len(out_size):
+        raise NotImplementedError(
+            "OpSpec relayout: a coordinate list and its device size differ in rank"
+        )
+
+    def rng(sym: sympy.Symbol) -> int:
+        if sym not in ranges:
+            raise NotImplementedError(
+                f"OpSpec relayout: symbol {sym} has no iteration range"
+            )
+        return int(ranges[sym])
+
+    # Each output axis, read once: what it walks and over how many elements.
+    out_terms = [_stick_term(coord) for coord in out_coords]
+    in_terms = [_stick_term(coord) for coord in in_coords]
+    for side_terms, side_size, side in (
+        (out_terms, out_size, "output"),
+        (in_terms, in_size, "input"),
+    ):
+        for axis, (kind, _sym, _stick) in enumerate(side_terms):
+            if kind == _DIM_CONST and side_size[axis] != 1:
+                raise NotImplementedError(
+                    f"OpSpec relayout: {side} device axis {axis} is a constant "
+                    f"coordinate over {side_size[axis]} elements"
+                )
+    # Which input symbols are split, and at what stick: those are the output
+    # axes that may need refining.
+    split_by_input: dict[sympy.Symbol, int] = {}
+    for kind, sym, stick in in_terms:
+        if kind in (_DIM_WITHIN_STICK, _DIM_OUTER_STICK):
+            if split_by_input.setdefault(sym, stick) != stick:
+                raise NotImplementedError(
+                    f"OpSpec relayout: the input splits {sym} at two stick sizes"
+                )
+
+    # The iteration dims, and each symbol as a linear sum over them.
+    extent: list[int] = []
+    out_strides: list[int] = []
+    form: dict[sympy.Symbol, list[tuple[int, int]]] = {}
+    out_row_major = row_major_strides(out_size)
+    # A stick axis seen without its lane axis yet: sym -> (stick, sticks).
+    pending_lane: dict[sympy.Symbol, tuple[int, int]] = {}
+    for axis, (kind, sym, stick) in enumerate(out_terms):
+        stride = out_row_major[axis]
+        if kind == _DIM_CONST:
+            extent.append(1)
+            out_strides.append(stride)
+            continue
+        if sym in form and kind != _DIM_WITHIN_STICK:
+            raise NotImplementedError(
+                f"OpSpec relayout: the output walks {sym} on more than one axis"
+            )
+        if kind == _DIM_BARE:
+            size = out_size[axis]
+            if size != rng(sym):
+                raise NotImplementedError(
+                    f"OpSpec relayout: output axis {axis} runs {size} elements of "
+                    f"{sym}, whose range is {rng(sym)}"
+                )
+            in_stick = split_by_input.get(sym, 0)
+            if in_stick and size > in_stick:
+                if size % in_stick:
+                    raise NotImplementedError(
+                        f"OpSpec relayout: {sym} runs {size} elements, not a whole "
+                        f"number of {in_stick}-lane sticks, so splitting it reads "
+                        "padding lanes"
+                    )
+                hi = len(extent)
+                extent += [size // in_stick, in_stick]
+                out_strides += [stride * in_stick, stride]
+                form[sym] = [(hi, in_stick), (hi + 1, 1)]
+            else:
+                form[sym] = [(len(extent), 1)]
+                extent.append(size)
+                out_strides.append(stride)
+            continue
+        dim = len(extent)
+        extent.append(out_size[axis])
+        out_strides.append(stride)
+        if kind == _DIM_OUTER_STICK:
+            if sym in form:
+                raise NotImplementedError(
+                    f"OpSpec relayout: the output walks {sym}'s stick twice"
+                )
+            form[sym] = [(dim, stick)]
+            pending_lane[sym] = (stick, out_size[axis])
+        else:
+            if sym not in pending_lane or pending_lane[sym][0] != stick:
+                raise NotImplementedError(
+                    f"OpSpec relayout: output lane axis {axis} of {sym} has no "
+                    "stick axis before it at the same stick size"
+                )
+            sticks = pending_lane[sym][1]
+            if out_size[axis] != stick or sticks * stick != rng(sym):
+                raise NotImplementedError(
+                    f"OpSpec relayout: output splits {sym} (range {rng(sym)}) into "
+                    f"{sticks} x {out_size[axis]}, which is padded or partial"
+                )
+            form[sym].append((dim, 1))
+            del pending_lane[sym]
+    if pending_lane:
+        raise NotImplementedError(
+            f"OpSpec relayout: output stick axes {sorted(map(str, pending_lane))} "
+            "have no lane axis"
+        )
+    assert tuple(out_strides) == tuple(row_major_strides(extent)), (
+        "a refined output layout must stay row major"
+    )
+
+    # The input's strides over those dims: each input axis contributes its own
+    # row-major stride times how its coordinate moves with each dim.
+    in_row_major = row_major_strides(in_size)
+    in_strides = [0] * len(extent)
+    for axis, (kind, sym, stick) in enumerate(in_terms):
+        if kind == _DIM_CONST:
+            continue
+        if sym not in form:
+            raise NotImplementedError(
+                f"OpSpec relayout: input axis {axis} walks {sym}, which the output "
+                "does not; that is a reduction or a broadcast, not a copy"
+            )
+        terms = form[sym]
+        stride = in_row_major[axis]
+        if kind == _DIM_BARE:
+            expected = rng(sym)
+            for dim, coeff in terms:
+                in_strides[dim] += stride * coeff
+        else:
+            # The input splits ``sym``.  Either the iteration space splits it the
+            # same way (two dims, the lane one ``stick`` long), or ``sym`` is at
+            # most one stick long and is its own lane.
+            split = (
+                len(terms) == 2
+                and terms[0][1] == stick
+                and extent[terms[1][0]] == stick
+            )
+            if not split and not (len(terms) == 1 and extent[terms[0][0]] <= stick):
+                raise NotImplementedError(
+                    f"OpSpec relayout: input axis {axis} splits {sym} at {stick} "
+                    "lanes, which the iteration space does not"
+                )
+            sticks = -(-rng(sym) // stick)
+            if kind == _DIM_OUTER_STICK:
+                expected = sticks
+                if split:
+                    in_strides[terms[0][0]] += stride
+            else:
+                expected = stick
+                if sticks * stick != rng(sym):
+                    raise NotImplementedError(
+                        f"OpSpec relayout: input lane axis {axis} of {sym} (range "
+                        f"{rng(sym)}) is padded"
+                    )
+                in_strides[(terms[1] if split else terms[0])[0]] += stride
+        if in_size[axis] != expected:
+            raise NotImplementedError(
+                f"OpSpec relayout: input axis {axis} holds {in_size[axis]} elements "
+                f"where {sym} needs {expected}"
+            )
+    for dim, (size, stride) in enumerate(zip(extent, in_strides)):
+        if size > 1 and stride == 0:
+            raise NotImplementedError(
+                f"OpSpec relayout: iteration dim {dim} moves no input element, so "
+                "one input element would be copied to many outputs"
+            )
+    return tuple(extent), tuple(in_strides), tuple(out_strides)
 
 
 def placeholder_axes(
