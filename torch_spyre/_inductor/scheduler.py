@@ -98,7 +98,18 @@ class CountedLoopSchedulerNode(FusedSchedulerNode):
 
 
 def _loop_group_id(node: BaseSchedulerNode):
-    """Return the loop_group_id of the ir.Operation inside node, or None."""
+    """The normalized ``loop_group_id`` tuple of the loop ``node`` is a member
+    of, or None.
+
+    A ``CountedLoopSchedulerNode`` (which includes the ``LoopSchedulerNode``
+    that a ``LoopNode`` becomes) is already a loop group, not a member of
+    another loop, so it gives None. Its first leaf carries the loop's own
+    ``loop_info``; reading that would make ``build_loop_scheduler_nodes``
+    wrap the structured node a second time, a nested ``LoopSpec`` that runs
+    the body ``trip_count`` squared times.
+    """
+    if isinstance(node, CountedLoopSchedulerNode):
+        return None
     levels = scheduler_enclosing_loops(node)
     return levels[-1].group_path if levels else None
 
@@ -295,7 +306,12 @@ def build_loop_scheduler_nodes(
     seen: dict[tuple, str] = {}
     for node in result:
         if isinstance(node, CountedLoopSchedulerNode):
-            gid = _loop_group_id(node.get_nodes()[0])
+            # The member's own levels, not _loop_group_id: that is None for a
+            # nested loop node, which can be the first member.  A structured
+            # LoopSchedulerNode passed through is checked the same way, so a
+            # flat op of the same loop left outside it is caught here.
+            levels = scheduler_enclosing_loops(node.get_nodes()[0])
+            gid = levels[-1].group_path if levels else None
             if gid is not None:
                 key = gid[0:1]
                 name = node.get_name()

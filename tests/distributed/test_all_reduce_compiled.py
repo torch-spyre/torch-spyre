@@ -22,6 +22,7 @@ Usage:
 """
 
 import os
+from unittest.mock import patch
 from types import SimpleNamespace
 
 import pytest
@@ -150,6 +151,24 @@ def _split_k_then_flat_allreduce(x: torch.Tensor, y: torch.Tensor) -> torch.Tens
     return torch.ops._c10d_functional.wait_tensor(reduced).reshape(acc.shape)
 
 
+def _split_k_then_squeezed_allreduce(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """The traced MoE's expert sum: a [1, M, N] carry squeezed, reduced, then read."""
+
+    def body(acc, ops):
+        x_tile, y_tile = ops
+        return acc + (x_tile @ y_tile).unsqueeze(0), None
+
+    acc, _ = for_each_tile(
+        body,
+        (x, y),
+        dims=(-1, 0),
+        tile_size=64,
+        init=torch.zeros(1, _CARRY_M, _CARRY_N, device=x.device, dtype=x.dtype),
+    )
+    reduced = torch.ops._c10d_functional.all_reduce(acc.squeeze(0), "sum", _GROUP_NAME)
+    return torch.ops._c10d_functional.wait_tensor(reduced) * 2.0
+
+
 def _loop_update_allocations(source: str) -> list[str]:
     """Allocation kinds of the carry update, the first ``add`` in the LoopSpec."""
     loop = source[source.index("LoopSpec(") :]
@@ -271,6 +290,43 @@ class TestAllReduceCompiled(TestCase):
         self.assertTrue(
             torch.allclose(result.to("cpu"), expected),
             f"Rank {self.comm_rank}: allreduce fp16 result incorrect",
+        )
+
+    def test_independent_compute_after_wait_is_hoisted_before_it(self):
+        """Compute written after the wait, but not reading the collective's
+        result, is emitted between allreduce_run and wait_work as its own kernel.
+        """
+        m, k, n = 128, 256, 256
+        x = torch.full((m, k), 0.01, dtype=torch.float16, device=DEVICE)
+        w = torch.full((k, n), 0.01, dtype=torch.float16, device=DEVICE)
+        y = torch.full((m, k), 0.01, dtype=torch.float16, device=DEVICE)
+
+        def late(x, w, y):
+            r = torch.ops._c10d_functional.all_reduce(x @ w, "sum", _GROUP_NAME)
+            r = torch.ops._c10d_functional.wait_tensor(r)
+            return r + torch.relu(y @ w)
+
+        with patch.object(spyre_config, "sink_collective_waits", True):
+            result, (code, *_) = run_and_get_code(torch.compile(late), x, w, y)
+
+        body = code[code.index("def call") :].splitlines()
+        run = next(i for i, line in enumerate(body) if "allreduce_run(" in line)
+        wait = next(i for i, line in enumerate(body) if "wait_work(" in line)
+        between = [line for line in body[run + 1 : wait] if ".run(" in line]
+        self.assertEqual(
+            len(between), 1, "expected relu(y @ w) between run and wait:\n" + code
+        )
+        # The hoisted kernel must not read the collective's buffer.
+        reduced = re.search(r"allreduce_run\((\w+),", body[run]).group(1)
+        self.assertNotIn(reduced, between[0])
+
+        expected = self.comm_size * k * 1e-4 + k * 1e-4
+        self.assertTrue(
+            torch.allclose(
+                result.to("cpu").float(), torch.full((m, n), expected), rtol=1e-2
+            ),
+            f"Rank {self.comm_rank}: got {result[0, 0].to('cpu').item()}, "
+            f"expected {expected}",
         )
 
     def test_allreduce_compiled_with_interleaved_compute(self):
@@ -453,6 +509,28 @@ class TestAllReduceCompiled(TestCase):
         torch.testing.assert_close(result.cpu().float(), expected, atol=0, rtol=0)
         self.assertIn("allreduce_run(", "\n".join(sources))
 
+    def test_allreduce_of_squeezed_loop_carry_with_lx_planning(self):
+        """The all_reduce_ copy-back writes the carry storage, so the LX planner
+        must give it the storage's core division; it ran on 2 cores against the
+        storage's 32 and failed to compile."""
+        g = torch.Generator().manual_seed(0)
+        x = torch.randint(0, 2, (_CARRY_M, _CARRY_K), generator=g).half()
+        y = torch.randint(0, 2, (_CARRY_K, _CARRY_N), generator=g).half()
+        scale = self.comm_rank + 1
+        rank_sum = self.comm_size * (self.comm_size + 1) / 2
+        expected = (x.float() @ y.float()) * rank_sum * 2.0
+
+        compiled = torch.compile(_split_k_then_squeezed_allreduce, fullgraph=True)
+        with spyre_config.patch(
+            {"lx_planning": True, "co_optimizing_lx_planning": True}
+        ):
+            result, sources = run_and_get_code(
+                compiled, (x * scale).to(DEVICE), y.to(DEVICE)
+            )
+
+        torch.testing.assert_close(result.cpu().float(), expected, atol=0, rtol=0)
+        self.assertIn("allreduce_run(", "\n".join(sources))
+
     @parametrize("shape", [(128,), (4, 96)])
     def test_allreduce_compiled_bfloat16(self, shape):
         def fn(x):
@@ -534,7 +612,7 @@ class TestAllReduceCompiled(TestCase):
         from torch._inductor.virtualized import V
 
         from torch_spyre._inductor import lowering as spyre_lowering
-        from torch_spyre._inductor.ir import WaitWorkFallback
+        from torch_spyre._inductor.ir import get_copy_back_producer
 
         full_allocation = wait_kind in ("reshape", "nested")
         shape = (2, 2, 96) if full_allocation else (5, 96)
@@ -564,12 +642,12 @@ class TestAllReduceCompiled(TestCase):
                 return base * 0.5, ready * 0.5, again * 0.5
             return base * 0.5, ready * 0.5
 
-        wait_impl = spyre_lowering.lower_c10d_wait_tensor_async
+        wait_impl = spyre_lowering.lower_c10d_wait_tensor
         rebound = []
         mutations = []
 
         def wait_with_test_mutations(tensor):
-            producer = WaitWorkFallback.get_copy_back_producer(tensor)
+            producer = get_copy_back_producer(tensor)
             if (
                 wait_kind == "repeated"
                 and producer is not None
@@ -646,7 +724,7 @@ class TestAllReduceCompiled(TestCase):
         from torch._inductor import ir
 
         from torch_spyre._inductor.errors import Unsupported
-        from torch_spyre._inductor.ir import WaitWorkFallback
+        from torch_spyre._inductor.ir import copy_back_view
 
         layout = ir.FixedLayout(DEVICE, dtype, [4, 96], [96, 1])
         target = ir.TensorBox.create(ir.InputBuffer(name="target", layout=layout))
@@ -662,7 +740,7 @@ class TestAllReduceCompiled(TestCase):
             Unsupported,
             match="dtype-changing views of an in-place collective before its wait",
         ):
-            WaitWorkFallback.copy_back_view(ir.TensorBox(view), producer, target)
+            copy_back_view(ir.TensorBox(view), producer, target)
 
     @parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_allreduce_compiled_row_parallel_linear(self, dtype):
