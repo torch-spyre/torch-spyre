@@ -149,6 +149,59 @@ def enable_spyre_compile_fx_wrapper():
                     return True
             return False
 
+        def _declared_dims_of(gm, example_inputs) -> dict[str, tuple[int, int, int]]:
+            """{symbol name: (min, max, granularity)} for every graph input
+            dimension declared with ``tensor.to("spyre", dynamic=...)``.
+
+            A Dynamo placeholder carries the real input (``meta["grapharg"]
+            .example``), which is where ``get_reserved_dims`` reads the
+            reservation, and the fake input (``meta["example_value"]``), whose
+            symbolic size names the ShapeEnv symbol this compile will see. Both
+            come from one GraphArg, so they pair without positional zipping. A
+            graph that did not come through Dynamo has no GraphArg and falls
+            back to the real inputs by position when the counts match. A
+            declared dim whose fake size is a plain int was specialised and is
+            not symbolic in this compile, so it is not recorded.
+            """
+            from torch_spyre._C import get_reserved_dims
+
+            placeholders = [n for n in gm.graph.nodes if n.op == "placeholder"]
+            by_position = (
+                list(example_inputs)
+                if example_inputs is not None
+                and len(example_inputs) == len(placeholders)
+                else None
+            )
+            declared: dict[str, tuple[int, int, int]] = {}
+            for i, node in enumerate(placeholders):
+                grapharg = node.meta.get("grapharg")
+                real = getattr(grapharg, "example", None)
+                if real is None and by_position is not None:
+                    real = by_position[i]
+                if not isinstance(real, torch.Tensor):
+                    continue
+                reserved = get_reserved_dims(real)
+                if not reserved:
+                    continue
+                fake = node.meta.get("example_value")
+                if fake is None:
+                    fake = getattr(grapharg, "fake_tensor", None)
+                if not isinstance(fake, torch.Tensor):
+                    continue
+                for dim, spec in reserved.items():
+                    size = fake.size(dim)
+                    if not isinstance(size, torch.SymInt):
+                        continue
+                    expr = size.node.expr
+                    if not getattr(expr, "is_Symbol", False):
+                        continue
+                    declared[str(expr)] = (
+                        spec["min"],
+                        spec["max"],
+                        spec["granularity"],
+                    )
+            return declared
+
         @wraps(_orig)
         def _wrapper(gm, example_inputs, *args, **kwargs):
             uses_spyre = _uses_spyre(gm, example_inputs)
@@ -184,7 +237,13 @@ def enable_spyre_compile_fx_wrapper():
                         # runs inside Dynamo's mirrored entire_frame_compile. A
                         # frontend total is this minus the per-kernel backend calls.
                         with timing_recorder.stage("stage:compile_fx:spyre_compile"):
-                            with enable_spyre_context(example_inputs):
+                            # Read before lowering: concretize_expr is called
+                            # during lowering, and a declared dimension's
+                            # geometry is built from its declared maximum.
+                            declared = _declared_dims_of(gm, example_inputs)
+                            with enable_spyre_context(
+                                example_inputs, declared_dims=declared
+                            ):
                                 return _orig(gm, example_inputs, *args, **kwargs)
                     finally:
                         _compile_state.in_spyre_compile = _prev_in_spyre
