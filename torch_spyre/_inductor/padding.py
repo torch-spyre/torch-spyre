@@ -2072,7 +2072,7 @@ def track_padding_value(graph: GraphLowering) -> None:
                 op.layout, MutationLayoutSHOULDREMOVE
             ):
                 target = op.layout.target
-                while isinstance(target, ReinterpretView):
+                while isinstance(target, (MutableBox, ReinterpretView)):
                     target = target.data
                 target_name = target.maybe_get_name()
                 if target_name is not None:
