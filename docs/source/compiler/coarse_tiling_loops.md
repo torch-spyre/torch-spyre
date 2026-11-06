@@ -806,6 +806,15 @@ post-stickification slot below, because span arithmetic needs
 `FixedTiledLayout.device_layout` (device size, stride map), which does not
 exist yet pre-stickification.
 
+**Span-overflow and the allocator's tiling take one loop level per group.**
+A group whose `levels` has more than one entry raises `Unsupported`
+("nested loop tiling is not supported in this release", #6088) from
+`reject_nested_loops`, called by `_maybe_coarse_tile_span_overflow` and
+`apply_tilings` before `coarse_tile_post_stickify`. The transform itself still
+accepts several levels and is driven that way by its unit tests; the refusal
+is there for the lowering that replaces it, which is not built yet. A
+`for_each_tile` nest never reaches it.
+
 **Must run after stickify and padding.**  `insert_bmm_padding` (which runs
 before stickification so the padded buffer is laid out like any other),
 `propagate_spyre_tensor_layouts`, `insert_restickify`, and
