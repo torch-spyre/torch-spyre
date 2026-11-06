@@ -2351,7 +2351,7 @@ class TestDepthwiseConvWindowBlocked(unittest.TestCase):
         x_dev = x.to(
             device_layout=SpyreTensorLayout(
                 [32, 32, 1, 1, 64],
-                [32, 1, -1, 65536, 1024],
+                [32, 1, 0, 65536, 1024],
                 fp16,
                 {(0,): 32, (1,): 32, (4,): 64},
             )
@@ -2359,7 +2359,7 @@ class TestDepthwiseConvWindowBlocked(unittest.TestCase):
         w_dev = w.to(
             device_layout=SpyreTensorLayout(
                 [3, 3, 1, 1, 64],
-                [1, 3, -1, 9, 9],
+                [1, 3, 0, 9, 9],
                 fp16,
                 {(0,): 3, (1,): 3, (4,): 64},
             )

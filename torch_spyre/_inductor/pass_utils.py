@@ -251,7 +251,7 @@ def rescale_stl_for_dtype(
     # Rescale the first non-stick dim that indexes whole sticks (stride == the
     # input stick depth) by the stick-depth ratio. A staggered/sparse layout
     # (e.g. the DL16_TO_FP32 restoration operand, whose stride_map carries
-    # sentinel -1 entries rather than a linear num-sticks stride) has no such
+    # sentinel 0 entries rather than a linear num-sticks stride) has no such
     # dim; there only the stick depth changes, so a no-match is expected and
     # left as-is.
     for i, s in enumerate(stl.stride_map):
@@ -2315,7 +2315,7 @@ def restickify_stride_map(
     new_stride_map = list(old_stride_map)
     new_stride_map[-1] = new_sd_host_stride
     new_stride_map[old_sd_outer_dim] = (
-        -1 if new_sd_host_stride < 0 else new_sd_host_stride * stick_size
+        0 if new_sd_host_stride <= 0 else new_sd_host_stride * stick_size
     )
     new_stride_map[new_sd_outer_dim] = old_sd_host_stride
     return new_stride_map
@@ -2563,7 +2563,7 @@ def is_sparse_stl(stl) -> bool:
 
     A sparse layout is produced by a reduction along the stick dimension:
     the stick dim (device_size[-1] == elems_per_stick) is synthetic with
-    stride_map[-1] == -1 (no corresponding host stride).
+    stride_map[-1] == 0 (no corresponding host stride).
 
     A device tensor has a device_size and stride_map. Remove the dimensions of
     size one from both lists. The stride of a dimension is the prod of the
@@ -2731,7 +2731,7 @@ def compute_restickify_needed(
         # dimensions, which may include size-1 dims (e.g. M=1) that cause
         # SpyreTensorLayout constructor 2 to produce an extra device dimension.
         # Rule: find the K-chunk dim (stride == elem_stride * stick_size), expand
-        # it by stick_size, promote the element stride there, set stick to -1.
+        # it by stick_size, promote the element stride there, set stick to 0.
         stick_size = get_elem_in_stick(in_host.dtype)
         ds = list(in_stl.device_size)
         sm = list(in_stl.stride_map)
@@ -2745,7 +2745,7 @@ def compute_restickify_needed(
             y_sm = list(sm)
             y_ds[k_chunk_dim] = ds[k_chunk_dim] * stick_size
             y_sm[k_chunk_dim] = elem_stride
-            y_sm[-1] = -1
+            y_sm[-1] = 0
             return True, SpyreTensorLayout(y_ds, y_sm, in_stl.device_dtype)
         assert False, (
             f"k_chunk_dim not found in sparse-N=1 restickify path: "

@@ -70,7 +70,7 @@ namespace fs = std::filesystem;
 
 namespace spyre {
 
-static constexpr int32_t kSpyreTensorLayoutPickleVersion = 4;
+static constexpr int32_t kSpyreTensorLayoutPickleVersion = 5;
 static constexpr int32_t kPoolDescriptorPickleVersion = 1;
 
 std::atomic<bool> g_downcast_warn_enabled{true};
@@ -615,7 +615,8 @@ PYBIND11_MODULE(_C, m) {
                                               t[3].cast<DataFormats>());
             } else if (version == 3) {
               // Version 3: (version, device_size, stride_map, device_dtype,
-              // element_arrangement)
+              // element_arrangement) — stride_map may contain legacy -1
+              // entries, which the constructor normalizes to 0
               if (t.size() != 5) {
                 throw py::value_error(
                     "Invalid SpyreTensorLayout pickle v3: wrong tuple size");
@@ -624,10 +625,15 @@ PYBIND11_MODULE(_C, m) {
                   t[1].cast<std::vector<int64_t>>(),
                   t[2].cast<std::vector<int64_t>>(), t[3].cast<DataFormats>(),
                   t[4].cast<spyre::ElementArrangement>());
-            } else if (version == 4) {
+            } else if (version == 4 || version == 5) {
+              // Version 4: (version, device_size, stride_map, device_dtype,
+              // element_arrangement, valid_elements); stride_map may contain
+              // legacy -1 entries. Version 5: same layout, written with 0 in
+              // place of -1. The constructor normalizes -1 to 0 for both.
               if (t.size() != 6) {
-                throw py::value_error(
-                    "Invalid SpyreTensorLayout pickle v4: wrong tuple size");
+                throw py::value_error("Invalid SpyreTensorLayout pickle v" +
+                                      std::to_string(version) +
+                                      ": wrong tuple size");
               }
               return spyre::SpyreTensorLayout(
                   t[1].cast<std::vector<int64_t>>(),
