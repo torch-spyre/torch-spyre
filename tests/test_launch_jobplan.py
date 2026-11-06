@@ -555,6 +555,60 @@ class TestSymbolicArg(TestCase):
                 [torch_spyre._C.SymbolicArg(kind=kdim, tensor_id=0, dim_index=3)],
             )
 
+    def test_a_size_inside_the_declared_contract_resolves(self):
+        """With the contract on the slot, a size that is a positive multiple of
+        the granularity and at most the maximum resolves as before."""
+        kdim = torch_spyre._C.SymbolicArgKind.kDimension
+        t = torch.zeros(128, 64, dtype=torch.float16, device="spyre")
+
+        resolved = torch_spyre._C._resolve_symbolic_args(
+            [t],
+            [
+                torch_spyre._C.SymbolicArg(
+                    kind=kdim, tensor_id=0, dim_index=0, granularity=64, max_value=512
+                )
+            ],
+        )
+        self.assertEqual(resolved, [128])
+
+    def test_a_size_outside_the_declared_contract_is_refused(self):
+        """The backstop at the launch. The in-trace range checks and the
+        declaring transfer enforce the contract first; a path that reaches the
+        launch without them fails here, loudly, instead of running a trip count
+        the bundle was not built for. Zero rows matters on its own: the backend
+        clamps the trip count only from above, so a divisibility check alone
+        would let an empty tensor run one tile."""
+        kdim = torch_spyre._C.SymbolicArgKind.kDimension
+
+        for rows in (0, 65, 520):
+            # empty, not zeros: the device cannot fill a zero-row tensor, and the
+            # values are never read here.
+            t = torch.empty((rows, 64), dtype=torch.float16, device="spyre")
+            with pytest.raises(RuntimeError, match="outside the declared contract"):
+                torch_spyre._C._resolve_symbolic_args(
+                    [t],
+                    [
+                        torch_spyre._C.SymbolicArg(
+                            kind=kdim,
+                            tensor_id=0,
+                            dim_index=0,
+                            granularity=64,
+                            max_value=512,
+                        )
+                    ],
+                )
+
+    def test_a_slot_without_a_contract_is_not_checked(self):
+        """A hand-built descriptor with the defaults carries no contract, and
+        then any size resolves, which is what the tests above rely on."""
+        kdim = torch_spyre._C.SymbolicArgKind.kDimension
+        t = torch.zeros(65, 64, dtype=torch.float16, device="spyre")
+
+        resolved = torch_spyre._C._resolve_symbolic_args(
+            [t], [torch_spyre._C.SymbolicArg(kind=kdim, tensor_id=0, dim_index=0)]
+        )
+        self.assertEqual(resolved, [65])
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

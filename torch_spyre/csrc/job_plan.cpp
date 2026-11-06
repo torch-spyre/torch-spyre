@@ -172,7 +172,25 @@ std::vector<flex::HostComputeArg> JobPlanStepHostCompute::resolveSymbolicArgs(
                     "symbolic_args dim_index ", arg.dim_index,
                     " is out of range for the rank-", tensor.dim(),
                     " tensor at inputs_outputs[", arg.tensor_id, "]");
-        resolved[i] = static_cast<int64_t>(tensor.size(arg.dim_index));
+        const int64_t size = tensor.size(arg.dim_index);
+        if (arg.granularity > 0 && arg.max_value > 0) {
+          // The declaration's contract (#5179), the bundle's loop was built
+          // for exactly it. The torch._check lines inside the trace and the
+          // checks at the declaring transfer enforce it first; this is the
+          // backstop for a path that reaches the launch without them. The
+          // lower bound matters on its own: the backend clamps the trip count
+          // only from above and its first slot always runs, so a size of 0
+          // would pass a divisibility check alone and execute one tile.
+          TORCH_CHECK(size >= arg.granularity && size <= arg.max_value &&
+                          size % arg.granularity == 0,
+                      "symbolic_args kDimension: size ", size,
+                      " of inputs_outputs[", arg.tensor_id, "] along dim ",
+                      arg.dim_index,
+                      " is outside the declared contract, a positive multiple "
+                      "of the granularity ",
+                      arg.granularity, " up to the maximum ", arg.max_value);
+        }
+        resolved[i] = size;
         break;
       }
       default:

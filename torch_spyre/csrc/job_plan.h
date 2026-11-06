@@ -266,6 +266,16 @@ struct SymbolicArg {
   int64_t value = -1;
   // kShardAddress only: the shard count the kernel was compiled for.
   int64_t num_shards = -1;
+  // kDimension only: the declared contract of the dimension, as the bundle
+  // was built for it. The size read at launch must be a positive multiple of
+  // granularity and at most max_value, and resolveSymbolicArgs refuses one
+  // that is not. Left at -1 when the slot carries no contract (hand-built
+  // payloads), and then the size is not checked. The CONTRACT granularity,
+  // which is the declaration's and today also the loop step; when a cost
+  // model later picks a smaller execution tile the step changes and this
+  // does not.
+  int64_t granularity = -1;
+  int64_t max_value = -1;
 };
 
 /**
@@ -582,9 +592,10 @@ class JobPlanStepHostCompute final : public JobPlanStep {
    *
    * A kAddress slot resolves to the tensor's composite address, a kShardAddress
    * slot to one shard's device address, and a kDimension slot to one of that
-   * tensor's logical dimension sizes (inputs_outputs[tensor_id].size(dim_index)),
-   * read here at launch. The returned vector therefore carries two kinds of
-   * value, so anything that reads it has to handle both alternatives.
+   * tensor's logical dimension sizes
+   * (inputs_outputs[tensor_id].size(dim_index)), read here at launch. The
+   * returned vector therefore carries two kinds of value, so anything that
+   * reads it has to handle both alternatives.
    */
   static std::vector<flex::HostComputeArg> resolveSymbolicArgs(
       const std::vector<at::Tensor>& tensors,

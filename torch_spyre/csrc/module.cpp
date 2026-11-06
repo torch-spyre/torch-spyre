@@ -948,13 +948,19 @@ PYBIND11_MODULE(_C, m) {
 
   py::class_<spyre::SymbolicArg>(m, "SymbolicArg")
       .def(py::init([](spyre::SymbolicArgKind kind, int64_t tensor_id,
-                       int64_t dim_index, int64_t value, int64_t num_shards) {
-             return spyre::SymbolicArg{kind, tensor_id, dim_index, value,
-                                       num_shards};
+                       int64_t dim_index, int64_t value, int64_t num_shards,
+                       int64_t granularity, int64_t max_value) {
+             return spyre::SymbolicArg{kind,     tensor_id,  dim_index,
+                                       value,    num_shards, granularity,
+                                       max_value};
            }),
            py::arg("kind"), py::arg("tensor_id"),
            py::arg("dim_index") = int64_t{-1}, py::arg("value") = int64_t{-1},
-           py::arg("num_shards") = int64_t{-1})
+           py::arg("num_shards") = int64_t{-1},
+           py::arg("granularity") = int64_t{-1},
+           py::arg("max_value") = int64_t{-1})
+      .def_readwrite("granularity", &spyre::SymbolicArg::granularity)
+      .def_readwrite("max_value", &spyre::SymbolicArg::max_value)
       .def_readwrite("num_shards", &spyre::SymbolicArg::num_shards)
       .def_readwrite("kind", &spyre::SymbolicArg::kind)
       .def_readwrite("value", &spyre::SymbolicArg::value)
