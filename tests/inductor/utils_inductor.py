@@ -722,6 +722,8 @@ class ParameterizedTestMeta(type):
                                 )(namespace[test_name])
                 else:
                     # ---- Original per-case expansion ----
+                    # expect_fail entries may be plain strings or (key, reason) tuples;
+                    # the reason is forwarded to pytest.mark.xfail when present.
                     def make_test(_base_func, _params):
                         @functools.wraps(_base_func)
                         def test(self):
