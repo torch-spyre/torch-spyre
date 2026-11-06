@@ -26,10 +26,11 @@ import torch
 from .constants import ELIDED_COPY_BACK_ATTR
 from .errors import Unsupported
 from .ir import FixedTiledLayout, SpyreEmptyFallback
+from .loop_facts import counted_loop_path, enclosing_loops
 from .loop_info import ReadCopyElisionRecord
 from .optimize_restickify import AnyInNode, EdgeCostMap
 from .logging_utils import get_inductor_logger
-from .pass_utils import patch_env
+from .pass_utils import invalidate_op_read_writes, patch_env
 from torch._inductor.dependencies import MemoryDep, index_vars_squeeze
 from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.graph import GraphLowering
@@ -476,9 +477,9 @@ def insert_restickify_on_node_inputs(
     resticks_needed: list[RestickifyArgInfo],
     operations: list[Operation],
 ) -> None:
-    """Insert restickify nodes before op for each incompatible input, patch op's inner_fn
-    to read the new buffer names, and reconstruct the consumer ComputedBuffer to
-    invalidate its sizes cache.
+    """Insert restickify nodes before op for each incompatible input, and patch
+    op's inner_fn in place to read the new buffer names. op stays the same
+    instance, so its memoized read/writes (``op_read_writes``) are dropped.
     """
     existing_record = getattr(op, "_read_copy_elision_record", None)
     edge_swaps: list[tuple] = []
@@ -513,10 +514,8 @@ def insert_restickify_on_node_inputs(
         operations.insert(op_index, restick_buff)
         op_index += 1  # consumer shifted right by 1
 
-        source_group_id = getattr(
-            getattr(old_name_buf, "loop_info", None), "loop_group_id", ()
-        )
-        consumer_group_id = getattr(getattr(op, "loop_info", None), "loop_group_id", ())
+        source_group_id = counted_loop_path(old_name_buf, include_extern=True)
+        consumer_group_id = counted_loop_path(op, include_extern=True)
         shared_loop_depth = 0
         for source_level, consumer_level in zip(
             source_group_id, consumer_group_id, strict=False
@@ -567,6 +566,9 @@ def insert_restickify_on_node_inputs(
         "inner_fn",
         make_per_edge_inner_fn(op.data.inner_fn, edge_swaps, name_map, canonical_args),
     )
+    # op now reads the restickify buffers: an extraction memoized before this
+    # (e.g. by optimize_restickify_locations) names the old inputs.
+    invalidate_op_read_writes(op)
     if isinstance(existing_record, ReadCopyElisionRecord):
         copy_name = existing_record.copy_name
         for old_name, _dep_index, _occurrence, new_name in edge_swaps:
@@ -653,9 +655,8 @@ def finalize_layouts(graph: GraphLowering) -> None:
             # the device coordinate system.
             loop_info = getattr(op, "loop_info", None)
             if loop_info is not None and isinstance(op.layout, FixedTiledLayout):
-                all_tiled_rdims_empty = all(
-                    not dims
-                    for dims in getattr(loop_info, "loop_tiled_reduction_dims", [])
+                all_tiled_rdims_empty = not any(
+                    level.tiled_reduction_dims for level in enclosing_loops(op)
                 )
                 if not all_tiled_rdims_empty:
                     # If accum_full already has a FixedTiledLayout,
