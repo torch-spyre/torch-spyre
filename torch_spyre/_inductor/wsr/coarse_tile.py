@@ -190,6 +190,28 @@ def validate_coarse_tile_groups(groups: list[tuple]) -> None:
             hint_id_to_group[hint_id] = group_idx
 
 
+def reject_nested_loops(groups: list[tuple], source: str) -> None:
+    """Raise ``Unsupported`` for a group that nests more than one loop level.
+
+    Span-overflow tiling and the allocator's own tiling build their groups for
+    ``coarse_tile_post_stickify``. The lowering that replaces it builds one
+    standalone ``LoopNode`` per group, so a group whose ``levels`` has more than
+    one entry is refused until nested loops are supported (#6088).
+
+    Called by the two production callers, not by the transform itself:
+    ``coarse_tile_post_stickify`` is also driven directly with several levels by
+    its unit tests, and a ``for_each_tile`` nest never reaches either caller.
+    ``source`` names the caller in the message.
+    """
+    for group_ops, levels in groups:
+        if len(levels) > 1:
+            names = ", ".join(op.get_name() for op in group_ops)
+            raise Unsupported(
+                f"{source}: nested loop tiling is not supported in this release "
+                f"({len(levels)} levels over {names}; #6088)"
+            )
+
+
 # ---------------------------------------------------------------------------
 # Cache-invalidation helpers
 # ---------------------------------------------------------------------------

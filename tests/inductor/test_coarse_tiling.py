@@ -9701,23 +9701,31 @@ class TestApplyTilingsEquivalence(unittest.TestCase):
         c0 = sympy.Symbol("c0")
         self.assertEqual(got.symbols_on_tile, {c0: c0})
 
-    def test_nested_two_level_matches_direct_call(self):
+    def test_nested_two_level_is_refused_by_apply_tilings(self):
+        """The transform still takes a two-level group (the direct call below, and
+        the other direct tests); ``apply_tilings`` refuses one, because the
+        lowering builds one standalone loop per group (#6088).
+        ``test_single_level_matches_direct_call`` covers the equivalence.
+
+        TODO(#6088): when nested loops are supported, restore the comparison with
+        the direct call: equal ``loop_info`` and ranges `[64, 64]`."""
         ref = _make_hinted_op(
             _make_pointwise([Integer(256), Integer(128)]), "op0", hints=((0, 0), (1, 1))
         )
         coarse_tile_post_stickify(
             _graph([ref]), [([ref], [(0, Integer(4)), (1, Integer(2))])]
         )
-        ref_fields = self._loop_fields(ref)
-        ref_ranges = list(ref.data.ranges)
+        self.assertEqual(list(ref.data.ranges), [Integer(64), Integer(64)])
 
         got = self._bare([256, 128], "op0")
-        apply_tilings(
-            {"op0": TileSpec((TileAxis(0, 4), TileAxis(1, 2)))}, _graph([got])
-        )
-        self.assertEqual(self._loop_fields(got), ref_fields)
-        self.assertEqual(list(got.data.ranges), ref_ranges)
-        self.assertEqual(list(got.data.ranges), [Integer(64), Integer(64)])
+        with self.assertRaisesRegex(
+            Unsupported, r"allocator coarse tiling: nested loop tiling.*#6088"
+        ):
+            apply_tilings(
+                {"op0": TileSpec((TileAxis(0, 4), TileAxis(1, 2)))}, _graph([got])
+            )
+
+    test_nested_two_level_is_refused_by_apply_tilings._expects_raise = True
 
     def test_two_equal_spec_runs_become_two_groups_with_distinct_hint_ids(self):
         spec = TileSpec((TileAxis(0, 4),))

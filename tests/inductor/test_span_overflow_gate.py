@@ -52,7 +52,10 @@ from torch._inductor.utils import run_and_get_code
 import torch_spyre  # noqa: F401  registers the "spyre" device
 from torch_spyre._inductor import config
 from torch_spyre._inductor import nonstick_dim_order, passes, work_division
+from torch_spyre._inductor.errors import Unsupported
+from torch_spyre._inductor.scratchpad.coarse_tiling import MAX_SEARCH_TILE_DEPTH
 from torch_spyre._inductor.wsr import coarse_tile, span_overflow_hint_analysis
+from torch_spyre._inductor.wsr.coarse_tile import reject_nested_loops
 from torch_spyre.constants import DEVICE_NAME
 
 from utils_inductor import expects_raise
@@ -284,17 +287,20 @@ def test_the_generated_code_is_deterministic_after_normalising(case):
     assert first.code == second.code
 
 
-def test_a_two_level_group_is_formed_today():
-    """The current planner nests two loops for a matmul too large for one level.
-    A replacement that supports one level only must reject this."""
+@expects_raise
+def test_a_two_level_group_is_rejected():
+    """A matmul too large for one level nests two (``[4, 4]``). The lowering builds
+    one standalone loop per group, so the group is refused (#6088).
+
+    TODO: when nested loops are supported this becomes a positive test of the
+    two-level group; the case compiled before the rejection and matched fp32 to
+    4e-3."""
     args = [_shaped((4096, 4096), seed) for seed in range(2)]
-    compiled = compile_span_overflow(lambda a, b: a @ b, args, 8 * MB)
-    assert compiled.groups == [(1, ["Reduction"], [4, 4])], compiled.groups
-    assert _relative_error(compiled.outputs, args[0].float() @ args[1].float()) < 2e-2
+    with pytest.raises(Exception, match=r"nested loop tiling is not supported.*#6088"):
+        compile_span_overflow(lambda a, b: a @ b, args, 8 * MB)
 
 
-# The cases the current implementation already rejects, and why. A replacement
-# keeps rejecting them.
+# The cases the planner already rejects, and why. A replacement keeps rejecting them.
 REJECTED = {
     # The second matmul's tiled dim cannot be joined to its producer's group.
     "bmm_chain": (
@@ -321,3 +327,82 @@ def test_an_unsupported_graph_is_rejected(case):
     args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
     with pytest.raises(Exception, match=message):
         compile_span_overflow(fn, args, limit)
+
+
+class _NamedOp:
+    def __init__(self, name):
+        self._name = name
+
+    def get_name(self):
+        return self._name
+
+
+def test_one_level_groups_are_accepted_and_the_check_does_nothing():
+    ops = [_NamedOp("buf0")]
+    reject_nested_loops([], "x")
+    reject_nested_loops([(ops, [(0, 4)])], "x")
+    reject_nested_loops([(ops, [(0, 4)]), (ops, [(1, 2)])], "x")
+
+
+def test_a_group_with_two_levels_is_rejected_naming_the_caller_and_the_ops():
+    ops = [_NamedOp("buf0"), _NamedOp("buf1")]
+    with pytest.raises(
+        Unsupported, match=r"my pass: nested loop tiling.*buf0, buf1.*#6088"
+    ):
+        reject_nested_loops([(ops, [(0, 4), (1, 4)])], "my pass")
+
+
+def test_one_nested_group_among_flat_ones_is_still_found():
+    flat = [_NamedOp("buf0")]
+    nested = [_NamedOp("buf1")]
+    with pytest.raises(Unsupported, match="3 levels over buf1"):
+        reject_nested_loops([(flat, [(0, 2)]), (nested, [(1, 2), (2, 2), (3, 2)])], "x")
+
+
+def test_the_allocator_search_is_bounded_to_one_level():
+    """The SA co-optimizer raises rather than falls back when the apply refuses a
+    tiling, so the search must not offer one the lowering will refuse (#6088).
+
+    This is a structural check, not a behavioural one: the two places the
+    allocator asks the enumerator for tilings sit behind ``auto_coarse_tiling`` and
+    solver selection on a fully built allocator, so reaching them needs more
+    stubbing than it is worth. What it does catch is the realistic regression, a
+    new enumerator call without the bound. The enumerator itself is tested in
+    ``test_enumerate_tilings.test_max_dims_one_gives_no_nested_specs``."""
+    import ast
+    import inspect
+
+    from torch_spyre._inductor.scratchpad import allocator
+
+    assert MAX_SEARCH_TILE_DEPTH == 1
+    tree = ast.parse(inspect.getsource(allocator))
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "id", getattr(node.func, "attr", None))
+        in ("enumerate_tile_options", "build_tiling_space")
+    ]
+    assert len(calls) == 2, [ast.unparse(c)[:60] for c in calls]
+    for call in calls:
+        bound = {kw.arg: ast.unparse(kw.value) for kw in call.keywords}.get("max_dims")
+        assert bound == "MAX_SEARCH_TILE_DEPTH", ast.unparse(call)
+
+
+def test_a_nested_for_each_tile_loop_is_not_affected():
+    """for_each_tile builds its own nests and never reaches the rejection. Run one
+    with span-overflow on: it must still compile and be right."""
+    from for_each_tile_fixtures import nested_split_m_then_k_fn
+
+    x = _shaped((256, 256), 0)
+    y = _shaped((256, 64), 1)
+    reference = x.float() @ y.float()
+    torch._dynamo.reset()
+    with (
+        config.patch({"ignore_span_overflow_hints": False}),
+        torch._inductor.config.patch(force_disable_caches=True),
+    ):
+        out = torch.compile(
+            nested_split_m_then_k_fn, backend="inductor", fullgraph=True
+        )(x.to(DEVICE_NAME), y.to(DEVICE_NAME))
+    assert _relative_error((out.cpu().float(),), reference) < 2e-2
