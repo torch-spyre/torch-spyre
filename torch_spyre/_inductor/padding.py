@@ -1609,6 +1609,7 @@ class ArgNameToIndexTracer(DefaultHandler):
     def __init__(self):
         super().__init__()
         self.name2inx = dict[str, list[int]]()
+        self.constant_counter = 0
 
     def get_inx2arg(self) -> list[str]:
         for name, indices in self.name2inx.items():
@@ -1675,7 +1676,9 @@ class ArgNameToIndexTracer(DefaultHandler):
         pass
 
     def constant(self, value: Union[bool, float, int], dtype: torch.dtype):
-        pass
+        name = f"__const_{self.constant_counter}"
+        self.constant_counter += 1
+        return ArgName(name)
 
 
 # NOTE: the mask value is a large finite negative, not -inf. encode_constant()
