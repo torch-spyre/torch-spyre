@@ -453,11 +453,11 @@ def _maybe_scratchpad_planning(graph: GraphLowering) -> None:
 
 
 # Passes the flat view cannot run as they run today, so they run on the
-# expanded list and the nodes are rebuilt after them. None at present:
-# ``dedup_and_promote_constants``, the only one, hoists every constant to the head
-# of the whole graph, which the flat view cannot express (it would move a
-# constant to the head of its own body); it now does that itself, across node
-# boundaries, from the view's real list.
+# expanded list and the nodes are rebuilt after them. None at present: the only
+# one was ``dedup_and_promote_constants``, which hoists every constant to the head
+# of the whole graph, and now does so across node boundaries itself
+# (``OpsView.hoist_to_front``). The mechanism stays, with ``expanded()``, until the
+# flat view is deleted.
 _PASSES_RUN_EXPANDED: frozenset[str] = frozenset()
 
 

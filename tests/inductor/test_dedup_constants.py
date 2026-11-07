@@ -1477,6 +1477,36 @@ class TestDedupConstantsWithLoopNodes(_PassLevelBase):
         self.assertEqual(seen["after"], seen["before"])
         self.assertEqual(seen["constants_after_first_non_constant"], [])
 
+    def test_the_view_agrees_with_the_nested_list_after_the_pass(self) -> None:
+        """The pass edits the nested list, so the view must not keep serving the
+        order it cached before: the observer and the INFO log read it afterwards."""
+        from torch_spyre._inductor.loop_node import OpsView, all_ops
+
+        fn, args = self._nested_fixture()
+        seen: dict[str, Any] = {}
+
+        def cb(graph: GraphLowering) -> None:
+            real = graph.operations
+            view = OpsView(real)
+            graph.operations = view
+            try:
+                before = list(view)  # fills the view's cache
+                dedup_and_promote_constants(graph)
+                seen["before"] = before
+                seen["view"] = [op.get_operation_name() for op in view]
+                seen["real"] = [op.get_operation_name() for op in all_ops(real)]
+            finally:
+                graph.operations = real
+            raise _TestStopSignal()
+
+        self._drive(cb, fn, args)
+        self.assertEqual(seen["view"], seen["real"])
+        self.assertNotEqual(
+            [op.get_operation_name() for op in seen["before"]],
+            seen["real"],
+            "PRECONDITION: the pass changed nothing, so this tests nothing",
+        )
+
     def test_a_graph_without_nodes_is_unchanged(self) -> None:
         """No ``LoopNode``: ``graph.operations`` is a plain list and the pass is the
         one it always was."""
@@ -1498,9 +1528,6 @@ class TestDedupConstantsWithLoopNodes(_PassLevelBase):
         self._drive(cb, fn, (torch.randn(64, 64, dtype=dtype, device="spyre"),))
         self.assertFalse(seen["is_view"])
         self.assertTrue(seen["head"])
-
-    def test_no_pass_runs_expanded_any_more(self) -> None:
-        self.assertEqual(passes._PASSES_RUN_EXPANDED, frozenset())
 
 
 if __name__ == "__main__":
