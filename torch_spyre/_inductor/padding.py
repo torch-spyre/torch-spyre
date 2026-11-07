@@ -50,27 +50,56 @@ present in the output but absent from x (N).  This handles M==K==N and
 M=1 (decode phase) correctly.
 """
 
+from typing import Any, Union
 import dataclasses
+import struct
+import math
+import operator
 
 import sympy
+from sympy import FiniteSet, Interval, S, Set, oo, EmptySet
+
 import torch
 from sympy import Expr
+from torch._inductor.dtype_propagation import DtypePropagationOpsHandler
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
+    IRNode,
+    Layout,
     Buffer,
     ComputedBuffer,
+    InputBuffer,
     FixedLayout,
     Operation,
     Pointwise,
     Reduction,
+    InputsKernel,
+    MutableBox,
+    MutationLayoutSHOULDREMOVE,
+    ReinterpretView,
+    MultiOutput,
+    FallbackKernel,
 )
-from torch._inductor.ops_handler import WrapperHandler
+from torch._inductor.ops_handler import DefaultHandler, WrapperHandler
+from torch._inductor.utils import sympy_product
 from torch._inductor.virtualized import V
 
-from .constants import BATCH_MATMUL_FP8_OP, BATCH_MATMUL_OP
+from .constants import (
+    BATCH_MATMUL_FP8_OP,
+    BATCH_MATMUL_OP,
+    DEVICE_NAME,
+    FP16_MAX,
+    FP16_MIN,
+)
 from .errors import Unsupported
-from .ir import FixedTiledLayout
+from .ir import (
+    FixedTiledLayout,
+    SpyreConstantFallback,
+    SpyreEmptyFallback,
+    SpyreCollectiveKernel,
+    WaitKernel,
+)
 from .logging_utils import get_inductor_logger
 from .pass_utils import (
     concretize_expr,
@@ -88,7 +117,14 @@ from .pass_utils import (
     replace_computed_buffer_body,
 )
 from .views import compute_coordinates
-from torch_spyre._C import SpyreTensorLayout, get_elem_in_stick
+from torch_spyre._C import (
+    DataFormats,
+    ElementArrangement,
+    SpyreTensorLayout,
+    get_elem_in_stick,
+)
+from .config import padding_strict_mode
+
 
 logger = get_inductor_logger("padding")
 
@@ -1116,3 +1152,1031 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
         if is_restickify_op(op, graph):
             _pad_restickify_output(op, graph)
             _pad_restickify_input(op, graph)
+
+
+class InvalidDomain(Exception):
+    def __init__(self, domain: Set, func: str, arg_index: int = 0):
+        self.domain = domain
+        self.func = func
+        self.arg_index = arg_index
+
+
+def _sigmoid(x):
+    return 1.0 / (1.0 + math.exp(-x))
+
+
+def _user_values():
+    values = S.Reals
+    if padding_strict_mode:
+        values = values.union(FiniteSet(S.NaN))
+    return values
+
+
+class DomainRangeSolver(DefaultHandler):
+    """
+    Validates input set and propagate to image.
+
+    Each function receives as input a sympy Set for each argument, which stands
+    for the possible values that can be in the tensor's padding, if any. This input
+    set has to be a subset of the Domain or else an InvalidDomain exception is
+    raised. This exception is a signal that we must set a specific padding value.
+
+    The functions are free to return the codomain of the function, e.g. the real numbers,
+    but we want to narrow it down at the very least to the range of the function, e.g.
+    positive real numbers. Where possible, for example for some unary or binary
+    operations on FiniteSets or Intervals, we might be able to return the image.
+    For example FiniteSet(0) represents the default zero-padding and for most
+    functions it's trivial to return the image of {0}.
+    """
+
+    def __init__(self):
+        self.non_zero_reals = S.Reals - FiniteSet(0)
+        self.positive_numbers = Interval(0, sympy.oo)
+        self.booleans = FiniteSet(0, 1)
+        self.strictly_positive_numbers = Interval(0, sympy.oo, left_open=True)
+        # -oo and oo are always the open-ended limits of an interval in sympy
+        self.extended_non_zero_reals = self.non_zero_reals.union(FiniteSet(-oo, oo))
+        self.extended_strictly_positive_numbers = self.strictly_positive_numbers.union(
+            FiniteSet(oo)
+        )
+
+    def constant(self, value: Union[bool, float, int], dtype: torch.dtype) -> Set:
+        return FiniteSet(value)
+
+    def indirect_indexing(
+        self,
+        x: Any,
+        size: Any,
+        check: bool = True,
+        wrap_neg: bool = True,
+    ) -> sympy.Symbol:
+        zero = FiniteSet(0)
+        # Due to the risk of invalid memory access we only admit 0 as padding
+        if not zero == x:
+            raise InvalidDomain(zero, "indirect_indexing")
+        return sympy.Symbol("dummy")
+
+    def reduction(
+        self,
+        dtype: torch.dtype,
+        src_dtype: torch.dtype,
+        reduction_type,
+        value: Set | tuple[Set, ...],
+    ) -> Set:
+        if not isinstance(value, tuple):
+            value = (value,)
+        required_padding = FiniteSet(0)
+        if reduction_type.startswith("batchmatmul"):
+            assert isinstance(value, tuple) and len(value) == 2
+
+            # at least one of the paddings has to be zero
+            if not any(v.is_subset(required_padding) for v in value):
+                # TODO: verify which choice is optimal.
+                raise InvalidDomain(required_padding, reduction_type, arg_index=0)
+            return FiniteSet(0)
+        else:
+            if (pad := get_pad_value(reduction_type, dtype)) is not None:
+                required_padding = FiniteSet(pad)
+            for arg_index, v in enumerate(value):
+                if not v.is_subset(required_padding):
+                    raise InvalidDomain(required_padding, reduction_type, arg_index)
+            # other reductions can leave some garbage in padding
+            return S.Reals
+
+    # only valid for monotonic functions
+    def _unary_op(self, op, x0, fallback_set=None) -> Set:
+        if isinstance(x0, FiniteSet):
+            return FiniteSet(*(op(e) for e in x0))
+        elif isinstance(x0, Interval):
+            _start = (op(x0.inf), x0.left_open)
+            _end = (op(x0.sup), x0.right_open)
+            if _start[0] > _end[0]:
+                _start, _end = _end, _start
+            return Interval(_start[0], _end[0], left_open=_start[1], right_open=_end[1])
+        if fallback_set is not None:
+            return fallback_set
+        return x0
+
+    def _singleton_set_binary(self, op, x0, x1, fallback_set) -> Set:
+        if (
+            isinstance(x0, FiniteSet)
+            and len(x0) == 1
+            and isinstance(x1, FiniteSet)
+            and len(x1) == 1
+        ):
+            return FiniteSet(op(x0.args[0], x1.args[0]))
+        return fallback_set
+
+    def _binary_op(self, op, x0, x1, output_set=None) -> Set:
+        # Like _unary_op, assumes op is monotonic in each argument, so the
+        # extremes of the result lie at the corners of the input bounds.
+        if isinstance(x0, FiniteSet) and isinstance(x1, FiniteSet):
+            return FiniteSet(*(op(a, b) for a in x0 for b in x1))
+
+        def pieces(x):
+            # Each piece is a pair of (bound, open) endpoints.
+            if isinstance(x, FiniteSet):
+                return [((e, False), (e, False)) for e in x]
+            return [((x.inf, x.left_open), (x.sup, x.right_open))]
+
+        if isinstance(x0, (FiniteSet, Interval)) and isinstance(
+            x1, (FiniteSet, Interval)
+        ):
+            result = S.EmptySet
+            for a_lo, a_hi in pieces(x0):
+                for b_lo, b_hi in pieces(x1):
+                    corners = [
+                        (sympy.sympify(op(a[0], b[0])), a[1] or b[1])
+                        for a in (a_lo, a_hi)
+                        for b in (b_lo, b_hi)
+                    ]
+                    if any(v is sympy.nan for v, _ in corners):
+                        return output_set if output_set is not None else x0.union(x1)
+                    lo = min(v for v, _ in corners)
+                    hi = max(v for v, _ in corners)
+                    # A bound is open only if every corner reaching it is open.
+                    lo_open = all(o for v, o in corners if v == lo)
+                    hi_open = all(o for v, o in corners if v == hi)
+                    result = result.union(
+                        Interval(lo, hi, left_open=lo_open, right_open=hi_open)
+                    )
+            return result
+        if output_set is not None:
+            return output_set
+        return x0.union(x1)
+
+    def abs(self, x0):
+        return self._unary_op(math.fabs, x0, self.positive_numbers)
+
+    def add(self, x0, x1):
+        return self._binary_op(operator.add, x0, x1)
+
+    def clamp(self, x, min=None, max=None):
+        return x.intersection(
+            Interval(
+                min if min is not None else -sympy.oo,
+                max if max is not None else sympy.oo,
+            )
+        )
+
+    def eq(self, x0, x1):
+        return self._singleton_set_binary(lambda x, y: x == y, x0, x1, self.booleans)
+
+    def exp(self, x0):
+        return self._unary_op(math.exp, x0, self.positive_numbers)
+
+    def exx2(self, x, scale, useZeroMean):
+        return self.positive_numbers
+
+    def floor(self, x0):
+        return x0.intersection(S.Integers)
+
+    def ge(self, x0, x1):
+        return self._singleton_set_binary(operator.ge, x0, x1, self.booleans)
+
+    def gelu(self, x):
+        return Interval(-0.17, sympy.oo)
+
+    def gt(self, x0, x1):
+        return self._singleton_set_binary(operator.gt, x0, x1, self.booleans)
+
+    def keep_by_index(self, x, indices):
+        return x
+
+    def layernormnorm(self, x, mean, norm_mean, weight, bias):
+        return S.Reals
+
+    def layernormscale(self, x, eps):
+        return self.positive_numbers
+
+    def log(self, x0):
+        if not x0.is_subset(self.extended_strictly_positive_numbers):
+            raise InvalidDomain(self.extended_strictly_positive_numbers, "log")
+        return self._unary_op(math.log, x0, S.Reals)
+
+    def le(self, x0, x1):
+        return self._singleton_set_binary(operator.le, x0, x1, self.booleans)
+
+    def logical_and(self, x0, x1):
+        return self._singleton_set_binary(operator.and_, x0, x1, self.booleans)
+
+    def logical_or(self, x0, x1):
+        return self._singleton_set_binary(operator.or_, x0, x1, self.booleans)
+
+    def lt(self, x0, x1):
+        return self._singleton_set_binary(operator.lt, x0, x1, self.booleans)
+
+    def maximum(self, x0, x1):
+        return self._binary_op(max, x0, x1)
+
+    def minimum(self, x0, x1):
+        return self._binary_op(min, x0, x1)
+
+    def mul(self, x0, x1):
+        return self._binary_op(operator.mul, x0, x1)
+
+    def ne(self, x0, x1):
+        return self._singleton_set_binary(operator.ne, x0, x1, self.booleans)
+
+    def neg(self, x0: Set):
+        return self._unary_op(operator.neg, x0, S.Reals)
+
+    def reciprocal(self, x0):
+        if not x0.is_subset(self.extended_non_zero_reals):
+            raise InvalidDomain(self.extended_non_zero_reals, "reciprocal")
+        return self._unary_op(lambda x: 1 / x, x0, self.extended_non_zero_reals)
+
+    def qfp8ch(self, x):
+        return x
+
+    def qfp8wt(self, x):
+        return x
+
+    def quantscalepertokenfp8(self, x, scale_ub):
+        return self.positive_numbers
+
+    def relu(self, x0):
+        return self._unary_op(lambda x: max(x, 0.0), x0, self.positive_numbers)
+
+    def rsqrt(self, x0):
+        if not x0.is_subset(self.extended_strictly_positive_numbers):
+            raise InvalidDomain(self.extended_strictly_positive_numbers, "rsqrt")
+        return self._unary_op(
+            lambda x: 1 / math.sqrt(x), x0, self.extended_strictly_positive_numbers
+        )
+
+    def sigmoid(self, x0):
+        return self._unary_op(
+            _sigmoid, x0, Interval(0, 1, left_open=True, right_open=True)
+        )
+
+    def softplus(self, x, beta, threshold):
+        def sp(x):
+            return (1.0 / beta) * math.log(1.0 + math.exp(beta * x))
+
+        return self._unary_op(sp, x, Interval(-0.278, sympy.oo))
+
+    def sqrt(self, x0):
+        if not x0.is_subset(self.positive_numbers):
+            raise InvalidDomain(self.positive_numbers, "rsqrt")
+        return self._unary_op(math.sqrt, x0, self.positive_numbers)
+
+    def square(self, x0):
+        return self._unary_op(lambda x: x * x, x0, self.positive_numbers)
+
+    def sub(self, x0, x1):
+        return self._binary_op(operator.sub, x0, x1)
+
+    def tanh(self, x0):
+        return self._unary_op(
+            math.tanh, x0, Interval(-1, 1, left_open=True, right_open=True)
+        )
+
+    def to_dtype(self, x, dtype, src_dtype=None, use_compute_types=False):
+        return x
+
+    def truediv(self, x0, x1):
+        if not x1.is_subset(self.extended_non_zero_reals):
+            # realdiv is the correct key in _PADDING_MASK_VALUES
+            raise InvalidDomain(self.extended_non_zero_reals, "realdiv", arg_index=1)
+        return self._binary_op(operator.truediv, x0, x1)
+
+    def silu(self, x0):
+        return self._unary_op(lambda x: x * _sigmoid(x), x0, Interval(-0.278, sympy.oo))
+
+    def where(self, condition, input, other):
+        return input.union(other)
+
+    def _default(self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+        logger.warning(
+            "Operation %s has not been enabled in padding propagation. "
+            "No inferences can be made about its padding state.",
+            name,
+        )
+        return _user_values()
+
+
+@dataclasses.dataclass(frozen=True)
+class PaddingDecision:
+    # The value of the output padding, of the tensor has padding
+    output_padding: float | None
+    # True if the op supports masking and the input needs fixing
+    do_mask: bool
+    # True if the op doesn't support masking and the input needs fixing
+    do_overwrite: bool
+    # The value to set the input padding to with masking or overwriting
+    input_vals: dict[str, float]
+
+
+class DomainRangeTracer(DomainRangeSolver):
+    """
+    Traces through a graph to infer and correct the state of padding.
+
+    Each graph node has to be fed to the tracer in topological order.
+    For each node, it will validate the operands, verify if they
+    need padding correction and compute output padding if any.
+    """
+
+    name = "DomainRangeTracer"
+
+    def __init__(self, graph: GraphLowering):
+        super().__init__()
+        self.current_op: ComputedBuffer | None = None
+        # buffer name -> output set
+        self.buffer_range = dict[str, Set]()
+        # Same as buffer_range, but reset for each op to account
+        # for slicing
+        self.current_reads = dict[str, Set]()
+        # op name -> (arg name -> adjusted )
+        self.buffer_input = dict[str, dict[str, Set]]()
+        self.graph = graph
+
+    def start_op(self, op):
+        self.current_op = op
+        self.current_reads = {}
+
+    def load(self, name: str, index: sympy.Expr) -> Set:
+        assert self.current_op is not None
+
+        padding_range = None
+        if (overwrites := self.buffer_input.get(self.current_op.name)) is not None:
+            if (val := overwrites.get(name)) is not None:
+                padding_range = val
+        else:
+            self.buffer_input[self.current_op.name] = {}
+
+        if padding_range is None:
+            padding_range = self.current_reads.get(name)
+        if padding_range is None:
+            current_op_name = (
+                self.current_op.name if self.current_op is not None else None
+            )
+            raise ValueError(
+                f"Expected range of buffer {name} to be known. Current op is {current_op_name}"
+            )
+        return padding_range
+
+    def store(
+        self,
+        name: str,
+        index: sympy.Expr,
+        value: Set,
+        mode=None,
+    ) -> None:
+        self.buffer_range[name] = value
+
+    def store_reduction(self, name: str, index: sympy.Expr, value: Set) -> None:
+        self.buffer_range[name] = value
+
+    def run_node(self, op: Operation) -> PaddingDecision:
+        self.start_op(op)
+        padded = is_padded(self.graph, op)
+
+        input_buffers, any_input_padded = self.handle_operands(op, padded)
+
+        if isinstance(op, InputsKernel):
+            self.handle_graph_input(op, padded)
+            return PaddingDecision(None, False, False, {})
+
+        if padded or any_input_padded:
+            # Even if the output of this op is not padded, we need to run
+            # the input validation if there are padded inputs
+            do_coord_mask, do_pad = self.trace_op(op, input_buffers)
+        else:
+            do_coord_mask = do_pad = False
+
+        if not padded:
+            self.buffer_range[op.name] = EmptySet
+        elif is_restickify_op(op, self.graph):
+            # The output's stick is a non-stick dim of the input, so its padding
+            # lanes come from input rows past that dim's valid extent, not from
+            # the input's padding. insert_restickify_padding (which runs later)
+            # grows the input allocation to cover them, and nothing writes the
+            # new rows, so their content is unknown. Mark that on the output and
+            # leave the input's range alone.
+            self.buffer_range[op.name] = self.buffer_range[op.name].union(
+                _user_values()
+            )
+
+        overwrites = {}
+        output_padding = None
+
+        if do_coord_mask or do_pad:
+            if padded:
+                # set the propagated output padding
+                pad_set = self.buffer_range[op.name]
+                output_padding = float(pick_element(pad_set))
+
+            for arg_name, pad_set in self.buffer_input[op.name].items():
+                overwrites[arg_name] = float(pick_element(pad_set))
+
+        return PaddingDecision(output_padding, do_coord_mask, do_pad, overwrites)
+
+    def handle_graph_input(self, op, padded):
+        if not padded:
+            self.buffer_range[op.name] = EmptySet
+            return
+        if isinstance(op, SpyreConstantFallback):
+            self.buffer_range[op.name] = FiniteSet(op.constant_args[0])
+            return
+
+        for _class, pad in _ASSUMED_PADDING.items():
+            if isinstance(op, _class):
+                self.buffer_range[op.name] = pad
+                break
+        else:
+            raise ValueError(f"Couldn't find entry for {op} in _ASSUMED_PADDING")
+
+    def handle_operands(
+        self, op: Operation, padded: bool
+    ) -> tuple[dict[str, Buffer], bool]:
+        reads = op.get_read_writes().reads
+        input_buffers = dict[str, Buffer]()
+        any_input_padded = False
+        for dep in reads:
+            buf = self.graph.get_buffer(dep.name)
+            while isinstance(buf, MutableBox):
+                buf = buf.data
+            stl = _get_stl(self.graph, buf)
+            buf_is_padded = is_padded(self.graph, buf) if stl is not None else False
+            if isinstance(buf, InputBuffer):
+                if dep.name not in self.buffer_range:
+                    if is_spyre_layout(buf.layout):
+                        assert stl is not None
+                        # Seed from the padding the input held before the graph,
+                        # once: after a mutation the range is what that left.
+                        self.buffer_range[dep.name] = (
+                            _input_padding_range(stl) if buf_is_padded else EmptySet
+                        )
+                    else:
+                        # other device buffers are not padded
+                        self.buffer_range[dep.name] = EmptySet
+            else:
+                assert dep.name in self.buffer_range, (
+                    f"Nodes seen out of order, expected {dep.name} to have been visited"
+                )
+            self.current_reads[dep.name] = self.buffer_range[dep.name]
+            input_buffers[dep.name] = buf
+            if stl is None:
+                continue
+
+            # The read is a slice when it touches fewer elements than the
+            # buffer holds. Compare host numels, both in the graph's size
+            # symbols (valid_elements is concrete even when the sizes are
+            # dynamic, so it cannot be compared with a symbolic read). A
+            # read not proven to cover the buffer counts as a slice.
+            is_sliced = not V.graph.sizevars.statically_known_geq(
+                dep.get_numel(), V.graph.get_numel(dep.name)
+            )
+
+            # If the output is padded and there is slicing on the input it means
+            # that the if there is slicing along the stiock dim, valid values
+            # from the input can end up in the output padding
+            # TODO: refine analysis to exclude non-stick slicing cases
+            if padded and is_sliced:
+                self.current_reads[dep.name] = self.current_reads[dep.name].union(
+                    _user_values()
+                )
+                buf_is_padded = True
+            any_input_padded = any_input_padded or buf_is_padded
+        return input_buffers, any_input_padded
+
+    def trace_op(self, op, input_buffers: dict[str, Buffer]) -> tuple[bool, bool]:
+        index2arg = inx2arg(op)
+        do_coord_mask = False
+        do_pad = False
+        # Fixed point loop until we can either allow the inputs to pass unmodified or
+        # find a suitable padding. So the max iteration count is 1 for the
+        # first try and 1 retry for each argument
+        for i in range(1 + len(input_buffers)):
+            try:
+                _call_innner(op)
+                break
+            except InvalidDomain as inv_domain:
+                name = index2arg[inv_domain.arg_index]
+                buf = input_buffers[name]
+                if can_coord_mask(inv_domain.func, buf.layout.dtype):
+                    do_coord_mask = True
+                    # For now this is true for all operations that are padded
+                    if op.layout.dtype in (torch.float16, torch.bfloat16):
+                        self.buffer_range[op.name] = FiniteSet(0)
+                    else:
+                        self.buffer_range[op.name] = Interval(0, 1e-2)
+                else:
+                    do_pad = True
+
+                try:
+                    pad_value = get_or_pick_pad_value(inv_domain, buf.layout.dtype)
+                    self.buffer_input[op.name][name] = FiniteSet(pad_value)
+                except ValueError:
+                    raise ValueError(
+                        f"Could not find legal pad for input {name} of {op.name}:{inv_domain.func}"
+                    )
+        else:
+            raise ValueError(f"Could not find an input padding that op {op.name}")
+        return do_coord_mask, do_pad
+
+    def handle_mutation_output(self, op):
+        if isinstance(op, ComputedBuffer) and isinstance(
+            op.layout, MutationLayoutSHOULDREMOVE
+        ):
+            target = op.layout.target
+            while isinstance(target, (MutableBox, ReinterpretView)):
+                target = target.data
+            target_name = target.maybe_get_name()
+            if target_name is not None:
+                target_is_padded = is_padded(self.graph, target)
+                # Seed a mutated input with its padding from before the graph,
+                # unless an earlier mutation already set what it holds now.
+                if (
+                    isinstance(target, InputBuffer)
+                    and target_name not in self.buffer_range
+                ):
+                    self.buffer_range[target_name] = (
+                        _input_padding_range(_get_stl(self.graph, target))
+                        if target_is_padded
+                        else EmptySet
+                    )
+
+                assert target_name in self.buffer_range, (
+                    f"Mutation buffer {op} seen before the buffer it mutates {target_name}"
+                )
+
+                if not target_is_padded:
+                    self.buffer_range[target_name] = EmptySet
+                    return
+
+                # If we're here it means that the target is padded.
+                # Without deeper analysis we don't know if the values written into the
+                # destination padding come from source padding or valid elements.
+                # Set the resulting padding to all possible inputs united with
+                # what could be in the mutation source buffer padding.
+                user_data = _user_values()
+                pad_set = self.buffer_range[op.name]
+                self.buffer_range[target_name] = user_data.union(pad_set)
+
+
+@dataclasses.dataclass(frozen=True)
+class SetDtype:
+    set: Set
+    dtype: torch.dtype | None
+
+
+class SetDtypeTracer(DefaultHandler):
+    """Run DomainRangeTracer and DtypePropagationOpsHandler side by side.
+
+    Some operations like exp() can have special limitations depending on
+    the Dtype. This handler wraps the DomainRangeTracer which operates on
+    a purely mathematical level of abstraction.
+    """
+
+    name = "SetDtypeTracer"
+
+    def __init__(self, tracer: DomainRangeTracer):
+        super().__init__()
+        self.tracer = tracer
+        self.dtype_rules = DtypePropagationOpsHandler()
+
+    @staticmethod
+    def _sets(x):
+        if isinstance(x, SetDtype):
+            return x.set
+        if isinstance(x, (tuple, list)):
+            return type(x)(SetDtypeTracer._sets(e) for e in x)
+        return x
+
+    def _dtype(self, name: str, args, kwargs) -> Any:
+        values = [*args, *kwargs.values()]
+        if any(isinstance(v, SetDtype) and v.dtype is None for v in values):
+            return None
+        rule = getattr(self.dtype_rules, name, None)
+        if rule is None:
+            return None
+        try:
+            return rule(*args, **kwargs)
+        except (AssertionError, AttributeError, TypeError):
+            # A rule that cannot handle these args (e.g. a list of indices
+            # passed to promote_types) leaves the dtype unknown; only
+            # dtype-dependent domains need it.
+            return None
+
+    @staticmethod
+    def _wrap(r, dtype):
+        if isinstance(r, Set):
+            return SetDtype(r, dtype)
+        if isinstance(r, tuple):
+            dtypes = dtype if isinstance(dtype, tuple) else (dtype,) * len(r)
+            return tuple(SetDtypeTracer._wrap(e, d) for e, d in zip(r, dtypes))
+        return r
+
+    def _default(self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]):
+        r = getattr(self.tracer, name)(
+            *self._sets(args), **{k: self._sets(v) for k, v in kwargs.items()}
+        )
+        if not isinstance(r, (Set, tuple)):
+            return r
+        return self._wrap(r, self._dtype(name, args, kwargs))
+
+    def load(self, name: str, index: sympy.Expr) -> SetDtype:
+        return SetDtype(self.tracer.load(name, index), V.graph.get_dtype(name))
+
+    def constant(self, value: Union[bool, float, int], dtype: torch.dtype) -> Set:
+        return self._wrap(self.tracer.constant(value, dtype), dtype)
+
+    def exp(self, x0) -> SetDtype:
+        # exp overflows above log(max finite value): ~11.09 for fp16, ~88.72
+        # for fp32. An unknown dtype gets the narrower fp16 domain.
+        upper = 88.7 if x0.dtype == torch.float32 else 11.05
+        domain = Interval(-sympy.oo, upper)
+        if not x0.set.is_subset(domain):
+            raise InvalidDomain(domain, "exp")
+        return self._default("exp", args=(x0,), kwargs={})
+
+    def to_dtype(
+        self,
+        x: SetDtype,
+        dtype: torch.dtype,
+        src_dtype: torch.dtype | None = None,
+        use_compute_types: bool = True,
+    ) -> SetDtype:
+        return SetDtype(
+            self.tracer.to_dtype(x.set, dtype, src_dtype, use_compute_types), dtype
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class ArgName:
+    name: str
+
+
+class ArgNameToIndexTracer(DefaultHandler):
+    """Helper to map argument names to operand indices
+
+    For an operation like x * y, op.read_wites().reads will contain
+    2 dependencies which means that we should be able to match the argument
+    index to the argument name. But for example, x * x has only one read
+    dependency. This tracer is meant to build this mapping.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.name2inx = dict[str, list[int]]()
+        self.constant_counter = 0
+
+    def get_inx2arg(self) -> list[str]:
+        for name, indices in self.name2inx.items():
+            assert len(indices) > 0, f"Could not resolve index of arg {name}"
+
+        index_entries = [
+            (index, name)
+            for name, indices in self.name2inx.items()
+            for index in indices
+        ]
+        index_entries.sort(key=lambda pair: pair[0])
+
+        inx2arg = []
+
+        for i, (index, name) in enumerate(index_entries):
+            if i > 1:
+                assert index_entries[i - 1][0] in [index, index - 1], "Skipped argument"
+            inx2arg.append(name)
+
+        return inx2arg
+
+    def _default(self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]):
+        if name in ("store", "store_reduction"):
+            return
+        for argname, arg in kwargs.items():
+            assert not isinstance(arg, ArgName), (
+                f"Can't determine order of kwargs. Found kwarg {argname}"
+            )
+
+        counter = 0
+        for arg in args:
+            if isinstance(arg, ArgName):
+                self.name2inx.setdefault(arg.name, [])
+                self.name2inx[arg.name].append(counter)
+                counter = counter + 1
+
+        if name == "indirect_indexing":
+            return sympy.Symbol("dummy")
+
+    def load(self, name: str, index: sympy.Expr) -> ArgName:
+        return ArgName(name)
+
+    def reduction(
+        self,
+        dtype: torch.dtype,
+        src_dtype: torch.dtype,
+        reduction_type,
+        value: Set | tuple[Set, ...],
+    ) -> None:
+        if not isinstance(value, tuple):
+            value = (value,)
+        for i, v in enumerate(value):
+            assert isinstance(v, ArgName)
+            self.name2inx[v.name] = [i]
+
+    def constant(self, value: Union[bool, float, int], dtype: torch.dtype):
+        name = f"__const_{self.constant_counter}"
+        self.constant_counter += 1
+        return ArgName(name)
+
+
+def inx2arg(op: ComputedBuffer):
+    arg_pos_tracer = ArgNameToIndexTracer()
+    with V.set_ops_handler(arg_pos_tracer):
+        _call_innner(op)
+    return arg_pos_tracer.get_inx2arg()
+
+
+# NOTE: the mask value is a large finite negative, not -inf. encode_constant()
+# (module.cpp -> deeptools::FloatToFp16Bin) mis-encodes IEEE +-inf as a NaN bit
+# pattern instead of the fp16 infinity encoding (confirmed empirically: -inf
+# round-trips to NaN, not 0xFC00), so exp(-inf) never reaches the runtime as
+# exp(-inf) -- it reaches it as exp(NaN), which poisons the output instead of
+# masking it to 0. -1e4 is finite (encodes correctly) and still underflows
+# exp() to exactly 0 in fp16 (fp16's smallest positive value is ~6e-8; anything
+# below about -12 already underflows), so it produces the same masking effect
+# without going through the broken infinity path.
+#
+# The max/min reduction identities below have the same encode_constant bug:
+# _get_mask_value("max") fed float("-inf") through the same broken path, so a
+# max-reduction's padded lanes were seeded with NaN instead of -inf. Unlike
+# exp's poisoned-but-locally-contained NaN, max(x, NaN) == NaN -- the identity
+# failure propagates through the whole reduction result, not just the padded
+# lanes, which would poison any block_max = torch.amax(scores, dim=-1) whose
+# padded lanes get reduced over. _FP16_MAX/_FP16_MIN are the most extreme
+# finite fp16 values, so they lose (max)/win (min) against any real fp16 score
+# while still encoding correctly.
+_FP16_MAX = FP16_MAX
+_FP16_MIN = FP16_MIN
+
+# 32-bit coordinate masking uses a repeating 16-bit pattern for the mask
+# value. 0.0 (used for sum/mean) already satisfies this requirement.
+# For max and min, the largest finite values with matching upper and lower
+# 16-bit halves are constructed directly from their bit patterns.
+_FP32_MIN = struct.unpack("<f", struct.pack("<I", 0xFF7FFF7F))[0]  # -3.40279751e38
+_FP32_MAX = struct.unpack("<f", struct.pack("<I", 0x7F7F7F7F))[0]  # 3.39617752e38
+_FP32_ALMOST_1 = struct.unpack("<f", struct.pack("<I", 0x3F803F80))[
+    0
+]  # 1.0019378662109375
+
+_PADDING_MASK_VALUES: dict[str, dict[DataFormats, float]] = {
+    "max": {
+        DataFormats.SEN169_FP16: _FP16_MIN,
+        DataFormats.IEEE_FP32: _FP32_MIN,
+    },
+    "min": {
+        DataFormats.SEN169_FP16: _FP16_MAX,
+        DataFormats.IEEE_FP32: _FP32_MAX,
+    },
+    "exp": {
+        DataFormats.SEN169_FP16: -1e4,  # exp(-1e4) underflows to 0 in fp16; see NOTE above.
+        DataFormats.IEEE_FP32: _FP32_MIN,
+    },
+    "reciprocal": {
+        DataFormats.SEN169_FP16: float("inf"),
+        DataFormats.IEEE_FP32: _FP32_MAX,
+    },
+    "rsqrt": {
+        DataFormats.SEN169_FP16: float("inf"),
+        DataFormats.IEEE_FP32: _FP32_MAX,
+    },
+    "log": {
+        DataFormats.SEN169_FP16: 1,
+        DataFormats.IEEE_FP32: _FP32_ALMOST_1,
+    },
+    "realdiv": {
+        DataFormats.SEN169_FP16: float("inf"),
+        DataFormats.IEEE_FP32: _FP32_MAX,
+    },
+    "sum": {
+        DataFormats.SEN169_FP16: 0,
+        DataFormats.IEEE_FP32: 0,
+    },
+    "mean": {
+        DataFormats.SEN169_FP16: 0,
+        DataFormats.IEEE_FP32: 0,
+    },
+}
+
+_POINTWISE_PADDING_OPS: set[str] = {"exp", "reciprocal", "rsqrt", "log", "realdiv"}
+
+
+def pick_element(s: Set):
+    """Return a valid element of s, or raise ValueError."""
+
+    # Prefer zero, then one.
+    for x in (0, 1):
+        if s.contains(x) is S.true:
+            return x
+
+    if isinstance(s, FiniteSet):
+        if not s:
+            raise ValueError("Empty set")
+        return min(s)
+
+    if isinstance(s, Interval):
+        a, b = s.start, s.end
+
+        if not s.left_open:
+            x = a
+        elif a == -oo:
+            x = b - 1
+        elif b == oo:
+            x = a + 1
+        else:
+            x = (a + b) / 2
+
+        if s.contains(x):
+            return x
+
+    raise ValueError(f"Cannot select an element from {s}")
+
+
+def get_pad_value(func, dtype) -> float | None:
+    if func.startswith("batchmatmul"):
+        return 0
+    if func == "indirect_indexing":
+        return 0
+    # bfloat16 is stored on device as SEN169_FP16, like float16.
+    if dtype in (torch.float16, torch.bfloat16):
+        data_format = DataFormats.SEN169_FP16
+    elif dtype == torch.float32:
+        data_format = DataFormats.IEEE_FP32
+    else:
+        return None
+    return _PADDING_MASK_VALUES.get(func, {}).get(data_format, None)
+
+
+def can_coord_mask(func_name, dtype) -> bool:
+    if func_name in _PADDING_MASK_VALUES:
+        return get_pad_value(func_name, dtype) is not None
+    return False
+
+
+def _index_syms(n: int) -> tuple[sympy.Symbol, ...]:
+    """The index symbols _trace_inner_fn passes to a traced inner_fn."""
+    return tuple(sympy.Symbol(f"_i{k}") for k in range(n))
+
+
+def _call_innner(op):
+    ranges = op.data.ranges
+    syms = _index_syms(len(ranges))
+    store_fn = op.get_store_function()
+    if isinstance(op.data, Reduction):
+        r_ranges = op.data.reduction_ranges
+        r_syms = tuple(sympy.Symbol(f"_r{k}") for k in range(len(r_ranges)))
+        store_fn(syms, r_syms)
+    else:
+        store_fn(syms)
+
+
+def is_spyre_layout(layout: Layout):
+    return layout.device.type == DEVICE_NAME
+
+
+def _get_stl(
+    graph: GraphLowering, node: IRNode | Layout | SpyreTensorLayout
+) -> SpyreTensorLayout | None:
+    if isinstance(node, ComputedBuffer) and isinstance(
+        node.layout, MutationLayoutSHOULDREMOVE
+    ):
+        target = node.layout.target
+        while isinstance(target, ReinterpretView):
+            target = target.data
+        target_name = target.get_name()
+        node = graph.get_buffer(target_name)
+    if isinstance(node, IRNode):
+        layout = node.maybe_get_layout()
+        if layout is None:
+            # FallbackKernels and others
+            return None
+        node = layout
+    if isinstance(node, Layout):
+        assert isinstance(node, FixedLayout), f"Expected finalized layout, got {node}"
+        if not isinstance(node, FixedTiledLayout):
+            assert not is_spyre_layout(node)
+            return None
+        node = node.device_layout
+    return node
+
+
+def is_padded(graph: GraphLowering, node: IRNode | Layout | SpyreTensorLayout) -> bool:
+    stl = _get_stl(graph, node)
+    if stl is None:
+        return False
+
+    total_size = math.prod(stl.device_size)
+    if not stl.valid_elements:
+        # TODO: the constructor that creates empty valid_elements is
+        # being deprecated. Remove this if afterwards.
+        numel = _host_numel(node)
+        return numel is None or numel < total_size
+
+    total_valid_elems = math.prod(stl.valid_elements.values())
+    return total_valid_elems < total_size
+
+
+def _host_numel(node: IRNode | Layout) -> int | None:
+    size = node.size if isinstance(node, Layout) else node.get_size()
+    numel = sympy_product(size)
+    return int(numel) if numel.is_Integer else None
+
+
+def _input_padding_range(layout: SpyreTensorLayout) -> Set:
+    """Possible values in the padding of a padded graph input.
+
+    A graph input may have been DMA'd from the host or written by an earlier
+    graph or eager kernel, so the padding is only known when the runtime
+    recorded a constant padding value in the tensor's layout. The layout,
+    padding state included, is part of the dynamo guard, so a kernel compiled
+    for a known padding value is not reused for a tensor without one.
+    """
+    if (value := layout.padding_value) is not None:
+        return FiniteSet(value)
+    return _user_values()
+
+
+_ASSUMED_PADDING: dict[type, Set] = {
+    # Graph inputs (InputBuffer) are handled by _input_padding_range.
+    # Each collective behaves a bit differently wrt. to padding,
+    # but the fact is that we don't know what is being read from
+    # other processes, so for now it's better to be conservative.
+    SpyreCollectiveKernel: _user_values(),
+    WaitKernel: _user_values(),
+    SpyreEmptyFallback: _user_values(),
+    MultiOutput: _user_values(),
+    FallbackKernel: _user_values(),
+}
+
+
+def get_or_pick_pad_value(inv_domain: InvalidDomain, dtype: torch.dtype):
+    pad_value = get_pad_value(inv_domain.func, dtype)
+    if pad_value is None or not inv_domain.domain.contains(pad_value):
+        pad_value = pick_element(inv_domain.domain)
+    return pad_value
+
+
+def track_padding_value(graph: GraphLowering) -> None:
+    operations = graph.operations
+    tracer = DomainRangeTracer(graph)
+
+    with V.set_ops_handler(SetDtypeTracer(tracer)):
+        for op in list(operations):
+            decision = tracer.run_node(op)
+            if decision.do_mask:
+                if decision.output_padding is not None:
+                    # set the propagated output padding
+                    op.layout.device_layout.padding_value = decision.output_padding
+                op.input_mask_values = decision.input_vals
+            elif decision.do_overwrite:
+                # TODO: if coord masking is not available, the padding must be overwritten.
+                # For now there are no passes to do that, so we log a warning
+                logger.warning(
+                    "Operation input buffer may contain incompatible values in the padding. "
+                    "op=%s",
+                    op.get_operation_name(),
+                )
+
+            tracer.handle_mutation_output(op)
+
+    _record_mutated_input_padding(graph, tracer)
+
+
+def _can_record_padding(layout: SpyreTensorLayout) -> bool:
+    """Whether layout can record a constant padding (set_constant_padding)."""
+    return layout.element_arrangement == ElementArrangement.STANDARD and (
+        layout.device_dtype in (DataFormats.SEN169_FP16, DataFormats.IEEE_FP32)
+    )
+
+
+def _record_mutated_input_padding(
+    graph: GraphLowering, tracer: DomainRangeTracer
+) -> None:
+    """Record the padding each graph input is left with by its mutations.
+
+    A graph input is a runtime tensor whose layout carries a recorded padding
+    value that later graphs trust (see _input_padding_range). A graph that
+    writes an input must update that record, or it keeps claiming the value
+    from before the write.
+
+    The wrapper decides which inputs to update: every Spyre input in
+    graph.mutated_inputs, after its last use (see
+    _SpyreWrapperCodegenMixin._input_padding_update). This only supplies the
+    value, so it lists just the inputs whose final padding is proven to be one
+    value; the wrapper clears any other mutated input (unknown padding, a
+    fallback-kernel mutation, or a layout that cannot record a value).
+    """
+    padding: dict[str, float] = {}
+    for name in graph.graph_input_names:
+        pad_set = tracer.buffer_range.get(name)
+        stl = _get_stl(graph, graph.get_buffer(name))
+        if pad_set is None or stl is None or not _can_record_padding(stl):
+            continue
+        if isinstance(pad_set, FiniteSet) and len(pad_set) == 1:
+            (value,) = pad_set
+            if value.is_finite and value.is_real:
+                padding[name] = float(value)
+    graph._spyre_input_padding = padding  # type: ignore[attr-defined]

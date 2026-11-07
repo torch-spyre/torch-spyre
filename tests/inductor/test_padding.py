@@ -58,7 +58,6 @@ from torch_spyre._inductor.scratchpad import allocator
 from torch_spyre._inductor.scratchpad import utils as scratchpad_utils
 from utils_inductor import try_reinterpret_host_shape
 
-
 Ts = TypeVarTuple("Ts")
 
 
@@ -1231,8 +1230,10 @@ class TestCoordinateMasking(unittest.TestCase):
     @parametrize("dtype", COORD_MASK_DTYPES)
     @parametrize("shape", SHAPES)
     def test_division(self, shape, dtype) -> None:
-        a_spyre = torch.full(shape, 2, dtype=dtype, device="spyre")
-        b_spyre = torch.full(shape, 2, dtype=dtype, device="spyre")
+        # Copied from the host, so the padding is recorded as 0: 0 / 0 must be
+        # coordinate-masked.
+        a_spyre = torch.full(shape, 2, dtype=dtype).to("spyre")
+        b_spyre = torch.full(shape, 2, dtype=dtype).to("spyre")
 
         def fn(x, y):
             return x / y
@@ -1244,8 +1245,6 @@ class TestCoordinateMasking(unittest.TestCase):
         exposed_padding = try_reinterpret_host_shape(result, unpadded).cpu()[
             :, shape[-1] :
         ]
-        print(f"{exposed_padding.shape=}")
-        print(f"{exposed_padding=}")
         assert (exposed_padding == 0).all().item()
 
     @parametrize("dtype", COORD_MASK_DTYPES)
@@ -1280,6 +1279,9 @@ class TestCoordinateMasking(unittest.TestCase):
     @parametrize("dtype", COORD_MASK_DTYPES)
     @parametrize("shape", SHAPES)
     def test_exp(self, shape, dtype) -> None:
+        # The reinterpreted view carries a fresh layout with no recorded
+        # padding value, so the analysis must assume the padding (222s from
+        # the full allocation) can hold anything.
         unpadded = unpad_shape(shape, dtype)
         a_spyre_full = torch.full(unpadded, 222, dtype=dtype, device="spyre")
         a_spyre = try_reinterpret_host_shape(a_spyre_full, shape)
@@ -1298,7 +1300,9 @@ class TestCoordinateMasking(unittest.TestCase):
     @parametrize("dtype", COORD_MASK_DTYPES)
     @parametrize("shape", SHAPES)
     def test_pow_neg(self, shape, dtype) -> None:
-        a_spyre = torch.full(shape, 0.5, dtype=dtype, device="spyre")
+        # Copied from the host, so the padding is recorded as 0, which the op
+        # cannot take: the kernel must coordinate-mask it.
+        a_spyre = torch.full(shape, 0.5, dtype=dtype).to("spyre")
 
         def fn(x):
             return torch.pow(x, -1.0)
@@ -1315,7 +1319,9 @@ class TestCoordinateMasking(unittest.TestCase):
     @parametrize("dtype", COORD_MASK_DTYPES)
     @parametrize("shape", SHAPES)
     def test_reciprocal(self, shape, dtype) -> None:
-        a_spyre = torch.full(shape, 0.5, dtype=dtype, device="spyre")
+        # Copied from the host, so the padding is recorded as 0, which the op
+        # cannot take: the kernel must coordinate-mask it.
+        a_spyre = torch.full(shape, 0.5, dtype=dtype).to("spyre")
 
         def fn(x):
             return torch.reciprocal(x)
@@ -1333,7 +1339,9 @@ class TestCoordinateMasking(unittest.TestCase):
     @parametrize("shape", SHAPES)
     def test_rsqrt(self, shape, dtype) -> None:
         full, half = full_half_stick(dtype)
-        a_spyre = torch.full(shape, 0.5, dtype=dtype, device="spyre")
+        # Copied from the host, so the padding is recorded as 0, which the op
+        # cannot take: the kernel must coordinate-mask it.
+        a_spyre = torch.full(shape, 0.5, dtype=dtype).to("spyre")
 
         def fn(x):
             return torch.rsqrt(x)
@@ -1350,7 +1358,9 @@ class TestCoordinateMasking(unittest.TestCase):
     @parametrize("dtype", COORD_MASK_DTYPES)
     @parametrize("shape", SHAPES)
     def test_log(self, shape, dtype) -> None:
-        a_spyre = torch.full(shape, 0.5, dtype=dtype, device="spyre")
+        # Copied from the host, so the padding is recorded as 0, which the op
+        # cannot take: the kernel must coordinate-mask it.
+        a_spyre = torch.full(shape, 0.5, dtype=dtype).to("spyre")
 
         def fn(x):
             return torch.log(x)
@@ -1474,6 +1484,135 @@ class TestMatmulPaddingNaN(unittest.TestCase):
         result = compiled(a_spyre, b_spyre)
         expected = fn(a_cpu, b_cpu)
         self._assert_matches_cpu_and_has_no_nan(result, expected)
+
+
+class TestRecordedPadding(unittest.TestCase):
+    """The padding value recorded on a tensor's layout must stay true.
+
+    A fill records its value as the padding, and the padding analysis of a
+    later graph trusts it for a graph input. A graph that writes the input must
+    update the record (the wrapper's set_tensor_padding_value), or the next
+    graph reads padding it no longer holds.
+    """
+
+    # 3 fp16 elements in a 64-element stick: 61 padding elements.
+    SIZE = 3
+
+    def setUp(self) -> None:
+        # Compile every graph afresh: a cached graph skips track_padding_value,
+        # and the dynamic-shape tests would then pass without exercising it.
+        torch._dynamo.reset()
+        patcher = t_inductor_config.patch("force_disable_caches", True)
+        patcher.__enter__()
+        self.addCleanup(patcher.__exit__, None, None, None)
+
+    def _filled(self, value: float) -> torch.Tensor:
+        t = torch.empty(self.SIZE, dtype=torch.float16, device="spyre")
+        t.fill_(value)
+        self.assertEqual(t.device_tensor_layout().padding_value, value)
+        return t
+
+    def test_compiled_inplace_clears_recorded_padding(self) -> None:
+        t = self._filled(5.0)
+
+        def scale(x):
+            x.mul_(2)
+            return x
+
+        torch.compile(scale, fullgraph=True, dynamic=False)(t)
+        self.assertIsNone(t.device_tensor_layout().padding_value)
+        # The sum must not count the padding, whatever it now holds.
+        result = torch.compile(lambda x: x.sum(), dynamic=False)(t)
+        torch.testing.assert_close(result.cpu(), torch.tensor(30.0).half())
+
+    def test_compiled_double_inplace_clears_recorded_padding(self) -> None:
+        # A second mutation must not reseed the input from its pre-graph
+        # padding (5), which the first mutation already overwrote.
+        t = self._filled(5.0)
+
+        def scale_shift(x):
+            x.mul_(2)
+            x.add_(1)
+            return x
+
+        torch.compile(scale_shift, fullgraph=True, dynamic=False)(t)
+        self.assertIsNone(t.device_tensor_layout().padding_value)
+        torch.testing.assert_close(t.cpu(), torch.full((self.SIZE,), 11.0).half())
+
+    def test_dynamic_recompile_of_inplace(self) -> None:
+        # The second call recompiles with a symbolic size. The slice check in
+        # track_padding_value must not compare it with the concrete
+        # valid_elements of the layout ("cannot determine truth value").
+        def scale(x):
+            x.mul_(2)
+            return x
+
+        compiled = torch.compile(scale, fullgraph=True)
+        compiled(self._filled(5.0))
+        t = torch.empty(64, dtype=torch.float16, device="spyre")
+        t.fill_(1.0)
+        compiled(t)
+        torch.testing.assert_close(t.cpu(), torch.full((64,), 2.0).half())
+
+    def test_dynamic_slice_is_masked(self) -> None:
+        # A symbolic slice of the stick dim leaves valid input elements in the
+        # output padding; the following sum must still count only the slice.
+        def fn(x):
+            return (x[:, : x.shape[1] - 3] + 1).sum(dim=1)
+
+        x = torch.ones(4, 64, dtype=torch.float16)
+        result = torch.compile(fn, fullgraph=True, dynamic=True)(x.to("spyre"))
+        torch.testing.assert_close(result.cpu(), fn(x))
+
+    def test_unmaskable_op_on_unrecorded_padding_warns(self) -> None:
+        # Depthwise conv needs zero padding on both inputs and cannot be
+        # coordinate-masked. With no recorded padding on either input the
+        # analysis must ask for zero padding on each input in turn: the
+        # reduction has to name the input it rejects (arg_index), or the retries
+        # keep blaming input 0 and end in "Infinite loop". No pass rewrites
+        # padding yet, so the result is the "incompatible values" warning.
+        from torch_spyre._C import SpyreTensorLayout, get_device_dtype
+
+        dtype = get_device_dtype(torch.float16)
+        x = torch.randn(1, 16, 64, dtype=torch.float16)
+        w = torch.randn(16, 1, 3, dtype=torch.float16)
+        # 16 channels in a 64-wide stick: 48 padding elements per stick.
+        x_dev = x.to(
+            device_layout=SpyreTensorLayout([64, 1, 1, 64], [1, -1, 1024, 64], dtype)
+        )
+        w_dev = w.to(
+            device_layout=SpyreTensorLayout([3, 1, 1, 64], [1, -1, 3, 3], dtype)
+        )
+        # An in-place compiled graph leaves the padding unrecorded.
+        for t in (x_dev, w_dev):
+            torch.compile(lambda a: a.mul_(1), dynamic=False)(t)
+            self.assertIsNone(t.device_tensor_layout().padding_value)
+
+        def conv(x, w):
+            return torch.conv1d(x, w, None, stride=1, padding=0, groups=16)
+
+        with self.assertLogs("spyre.inductor.padding", level="WARNING") as logs:
+            result = torch.compile(conv, dynamic=False)(x_dev, w_dev)
+        self.assertTrue(any("incompatible values" in m for m in logs.output))
+        # The padding is in fact still zero here, so the result is correct.
+        torch.testing.assert_close(result.cpu(), conv(x, w), atol=0.5, rtol=0.1)
+
+    def test_eager_inplace_clears_recorded_padding(self) -> None:
+        # In-place eager ops write self through a compiled copy_from_d2d.
+        t = self._filled(5.0)
+        t.add_(1)
+        self.assertIsNone(t.device_tensor_layout().padding_value)
+        torch.testing.assert_close(t.sum().cpu(), torch.tensor(18.0).half())
+
+    def test_view_does_not_inherit_recorded_padding(self) -> None:
+        t = self._filled(5.0)
+        self.assertIsNone(t.view(self.SIZE).device_tensor_layout().padding_value)
+        self.assertIsNone(t.detach().device_tensor_layout().padding_value)
+        self.assertEqual(t.device_tensor_layout().padding_value, 5.0)
+
+    def test_h2d_records_zero_padding(self) -> None:
+        t = torch.tensor([1.0, -2.0, 3.0], dtype=torch.float16).to("spyre")
+        self.assertEqual(t.device_tensor_layout().padding_value, 0.0)
 
 
 if __name__ == "__main__":

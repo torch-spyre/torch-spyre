@@ -1509,6 +1509,58 @@ void copy_sharded(const at::Tensor& self, const at::Tensor& dst) {
   }
 }
 
+/**
+ * True when tensor is the whole of its device allocation: a contiguous base
+ * at offset 0 whose layout sized the storage. A write through such a tensor
+ * (a fill, or an H2D copy whose DCI covers it) defines every padding element.
+ */
+bool covers_whole_allocation(const at::Tensor& tensor) {
+  auto* impl = static_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl());
+  if (tensor.storage_offset() != 0 || !tensor.is_contiguous()) return false;
+  if (impl->dma_sizes != tensor.sizes().vec()) return false;
+  const size_t device_bytes = get_device_size_in_bytes(impl->spyre_layout);
+  const size_t host_bytes =
+      static_cast<size_t>(tensor.numel()) * tensor.element_size();
+  return tensor.storage().nbytes() == std::max(device_bytes, host_bytes);
+}
+
+/**
+ * Record what a device write left in the padding of tensor's layout.
+ *
+ * Inductor's padding analysis reads the padding state of a graph input's
+ * layout; without a recorded constant it must assume the padding can hold
+ * any value. Record value only when the write covered the whole allocation
+ * and the layout supports constant padding; otherwise reset to
+ * UNINITIALIZED so stale state cannot claim a value that is no longer there.
+ */
+void record_padding_after_write(const at::Tensor& tensor,
+                                std::optional<double> value) {
+  // A write through a view changes the base's storage too; its recorded
+  // padding is no longer known.
+  if (tensor.is_view()) {
+    const at::TensorBase& base = tensor._base();
+    if (base.defined() && base.is_privateuseone()) {
+      static_cast<SpyreTensorImpl*>(base.unsafeGetTensorImpl())
+          ->spyre_layout.clear_padding();
+    }
+  }
+  auto* impl = static_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl());
+  auto& stl = impl->spyre_layout;
+  // The padding state takes part in layout equality, so leave layouts without
+  // padding untouched: they compare (and guard) exactly as before.
+  const int64_t device_elems = c10::multiply_integers(stl.device_size);
+  if (device_elems <= tensor.numel()) return;
+  const bool supported =
+      stl.element_arrangement == ElementArrangement::STANDARD &&
+      (stl.device_dtype == DataFormats::SEN169_FP16 ||
+       stl.device_dtype == DataFormats::IEEE_FP32);
+  if (value.has_value() && supported && covers_whole_allocation(tensor)) {
+    stl.set_constant_padding(*value);
+  } else {
+    stl.clear_padding();
+  }
+}
+
 }  // namespace
 
 at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
@@ -1643,6 +1695,12 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
   stream.copyAsync(*copy_from, *copy_to);
   if (!non_blocking) {
     stream.synchronize();
+  }
+
+  if (dst.is_privateuseone()) {
+    // H2D: ConvertData stages the whole destination region and zero-fills
+    // its padding (a padded layout never takes the DCI-less identity path).
+    record_padding_after_write(dst, 0.0);
   }
 
   if (!non_overlapping_and_dense) {
@@ -1886,6 +1944,8 @@ at::Tensor spyre_fill_tensor(const at::Tensor& self, double value) {
   } guard{params};
   SpyreStream stream;
   stream.launchFillAsync(params);
+  // The fill DMA covers the whole allocation, padding included.
+  record_padding_after_write(self, value);
 
   return self;
 }
