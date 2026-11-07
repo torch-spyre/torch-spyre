@@ -76,10 +76,15 @@ tiles.
 import os
 import unittest
 
+import pytest
 import regex as re
 import torch
+from torch._dynamo.exc import BackendCompilerFailed
 from torch._dynamo.utils import counters
+from torch._inductor.exc import InductorError
 from torch._inductor.utils import fresh_cache, run_and_get_code
+
+from utils_inductor import expects_raise
 
 import torch_spyre  # noqa: F401  registers the "spyre" device
 import torch_spyre._inductor.config as spyre_config
@@ -142,6 +147,7 @@ class TestSymbolicLoopOnDevice(unittest.TestCase):
         # Every test here compiles ``tiled_gelu`` and counts what happens, so
         # none may inherit another's Dynamo cache entry, in any run order.
         torch._dynamo.reset()
+        torch.manual_seed(0)
 
     @staticmethod
     def _compile_and_run(rows=ROWS):
@@ -218,6 +224,7 @@ class TestOneBinaryServesTheRange(unittest.TestCase):
         # A warm cache entry for ``tiled_gelu`` from an earlier test would make
         # the graph count below read 0 or 1 by accident. Cold every time.
         torch._dynamo.reset()
+        torch.manual_seed(0)
 
     def test_one_graph_one_kernel_right_at_every_size(self):
         counters.clear()
@@ -246,31 +253,63 @@ class TestOneBinaryServesTheRange(unittest.TestCase):
             self.assertEqual(counters["stats"]["unique_graphs"], 1)
             self.assertEqual(_kernel_cache_entries(), 1)
 
-    def test_without_a_declaration_each_size_is_its_own_graph(self):
-        """The control. A bare ``mark_dynamic`` reserves nothing, so a new size
-        is a new allocation with its own device layout and Dynamo recompiles
-        when the layout guard misses. Right at every size, and more than one
-        graph for the three sizes (measured: two, which sizes share a layout is
-        the guard's business). The declaration is what buys the one binary, and
-        nothing here changes for a dim that only went dynamic.
+    @expects_raise
+    def test_without_a_declaration_the_loop_is_refused(self):
+        """The control. A bare ``mark_dynamic`` reserves nothing: a new size is
+        a new allocation with its own device layout, the layout guard carries
+        the exact row count and every size recompiles (measured: four sizes,
+        four graphs). A symbolic loop over such a dimension would be a per-size
+        kernel whose extent is sized from a ShapeEnv bound no reservation backs,
+        so it is refused at compile with the declaration named as the fix. The
+        declaration is what buys the one binary.
         """
-        counters.clear()
+        x = torch.randn(ROWS, COLS, dtype=torch.float16)
+        y = x.to(DEVICE_NAME)
+        torch._dynamo.mark_dynamic(y, 0)
         compiled = torch.compile(tiled_gelu, backend="inductor", fullgraph=True)
-        sizes = [ROWS, MIN_ROWS, MAX_ROWS]
 
-        for rows in sizes:
-            x = torch.randn(rows, COLS, dtype=torch.float16)
-            y = x.to(DEVICE_NAME)
-            torch._dynamo.mark_dynamic(y, 0)
-            out = compiled(y).cpu().float()
-            torch.testing.assert_close(
-                out,
-                torch.nn.functional.gelu(x.float()),
-                atol=ATOL,
-                rtol=RTOL,
-                msg=f"at {rows} rows",
+        with pytest.raises(InductorError, match="no tensor.to.*declaration covers"):
+            compiled(y)
+
+    @expects_raise
+    def test_an_undeclared_operand_riding_the_declared_symbol_is_refused(self):
+        """Two loop operands tiled on the same axis must carry one symbol, and
+        ``torch._check(a.shape[0] == b.shape[0])`` (or Dynamo's duck shaping of
+        two equal dynamic sizes) gives them one. If only one of them is
+        declared, the other's buffer was never reserved at the maximum the
+        declared symbol builds for, so the compile refuses and names the symbol.
+        Raised in the compile_fx wrapper, before Inductor, so Dynamo reports it
+        as a backend failure. Without the check this would compile: the loop's
+        count is over a declared symbol.
+        """
+
+        def both(a, b):
+            rows = a.shape[0]
+            torch._check(rows == b.shape[0])
+            torch._check(rows >= MIN_ROWS)
+            torch._check(rows <= MAX_ROWS)
+            torch._check(rows % TILE == 0)
+
+            def body(_carry, tiles):
+                ta, tb = tiles
+                return None, torch.nn.functional.gelu(ta) + tb
+
+            _carry, out = for_each_tile(
+                body, (a, b), dims=(0, 0), tile_size=TILE, out_dim=0
             )
-        self.assertGreater(counters["stats"]["unique_graphs"], 1)
+            return out
+
+        x = torch.randn(MAX_ROWS, COLS, dtype=torch.float16)
+        y = _declare(x)
+        y.resize_((ROWS, COLS))
+        z = torch.randn(ROWS, COLS, dtype=torch.float16).to(DEVICE_NAME)
+        torch._dynamo.mark_dynamic(z, 0)
+
+        compiled = torch.compile(both, backend="inductor", fullgraph=True)
+        with pytest.raises(
+            (InductorError, BackendCompilerFailed), match="undeclared on another"
+        ):
+            compiled(y, z)
 
     def test_the_reserved_rows_above_the_size_are_never_read(self):
         """NaN in the reserved rows, moved at the maximum then shrunk, so the

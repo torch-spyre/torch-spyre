@@ -266,14 +266,16 @@ struct SymbolicArg {
   int64_t value = -1;
   // kShardAddress only: the shard count the kernel was compiled for.
   int64_t num_shards = -1;
-  // kDimension only: the declared contract of the dimension, as the bundle
-  // was built for it. The size read at launch must be a positive multiple of
-  // granularity and at most max_value, and resolveSymbolicArgs refuses one
-  // that is not. Left at -1 when the slot carries no contract (hand-built
-  // payloads), and then the size is not checked. The CONTRACT granularity,
-  // which is the declaration's and today also the loop step; when a cost
-  // model later picks a smaller execution tile the step changes and this
-  // does not.
+  // kDimension only: the contract the bundle was built for, read off the
+  // loop's SymbolKind by _symbolic_arg. granularity is the loop's tile size
+  // (the for_each_tile step) and max_value the declared maximum; today the
+  // tile size is the declaration's granularity, and a larger tile would only
+  // make this check stricter. The size read at launch must be a positive
+  // multiple of granularity and at most max_value, and resolveSymbolicArgs
+  // refuses one that is not. The declared minimum is not checked here: the
+  // declaring transfer and resize_ enforce it on the host. Left at -1 when
+  // the slot carries no contract (hand-built payloads), and then the size is
+  // not checked.
   int64_t granularity = -1;
   int64_t max_value = -1;
 };

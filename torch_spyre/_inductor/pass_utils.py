@@ -17,6 +17,7 @@ import itertools
 import math
 import warnings
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -367,10 +368,34 @@ def concretize_expr(expr: Union[Expr, int]) -> int:
     if isinstance(expr, sympy.Integer):
         return int(expr)
     if hasattr(expr, "free_symbols") and expr.free_symbols:
-        at_max = declared_max_or_none(expr)
-        if at_max is not None:
-            return at_max
-        return V.graph.sizevars.optimization_hint(expr)
+        if not declared_dims_in(expr):
+            return V.graph.sizevars.optimization_hint(expr)
+        # Declared symbols at their maximum, anything else at its hint, so a
+        # size mixing the two is still built for the declared range and the
+        # undeclared part keeps the behaviour it has without this registry.
+        partial = substitute_declared_max(expr)
+        at_max = (
+            int(partial)
+            if partial.is_number
+            else V.graph.sizevars.optimization_hint(partial)
+        )
+        # The substitution assumes the size grows with the dimension. For the
+        # structural sizes this serves (an extent, a tile count, a stride
+        # product) it does. Catch the ones it does not: a value at the maximum
+        # below the value at this call's hint means the geometry built here
+        # would not cover the call being compiled.
+        hint_of = getattr(V.graph.sizevars, "optimization_hint", None)
+        if hint_of is not None:
+            at_hint = hint_of(expr)
+            if at_max < at_hint:
+                raise Unsupported(
+                    f"structural size {expr} is {at_max} at the declared maximum "
+                    f"of {sorted(declared_dims_in(expr))} but {at_hint} at this "
+                    f"call's size, so it does not grow with the dimension and "
+                    f"geometry built at the maximum would not cover this call. "
+                    f"A declared dimension must enter a size monotonically."
+                )
+        return at_max
     return int(expr)
 
 
@@ -381,30 +406,80 @@ def concretize_expr(expr: Union[Expr, int]) -> int:
 # lowering starts, because ``concretize_expr`` is already called during
 # lowering. Keyed by name because the name is what ``LoopSpec`` carries in
 # ``count_symbol_bounds`` and what survives the reload.
-_DECLARED_DIMS: dict[str, tuple[int, int, int]] = {}
+#
+# A ContextVar rather than a module global: a compile in another thread sees its
+# own set, or none, never this one's.
+_DECLARED_DIMS: ContextVar[dict[str, tuple[int, int, int]]] = ContextVar(
+    "spyre_declared_dims", default={}
+)
 
 
 @contextmanager
 def declared_dims(mapping: "dict[str, tuple[int, int, int]] | None"):
     """Make ``mapping`` the declared dimensions of the compile inside the block."""
-    global _DECLARED_DIMS
-    previous = _DECLARED_DIMS
-    _DECLARED_DIMS = dict(mapping or {})
+    token = _DECLARED_DIMS.set(dict(mapping or {}))
     try:
         yield
     finally:
-        _DECLARED_DIMS = previous
+        _DECLARED_DIMS.reset(token)
 
 
 def declared_dims_in(expr) -> dict[str, tuple[int, int, int]]:
     """The declared dimensions among ``expr``'s free symbols, by name."""
     if not (hasattr(expr, "free_symbols") and expr.free_symbols):
         return {}
-    return {
-        str(s): _DECLARED_DIMS[str(s)]
-        for s in expr.free_symbols
-        if str(s) in _DECLARED_DIMS
-    }
+    current = _DECLARED_DIMS.get()
+    return {str(s): current[str(s)] for s in expr.free_symbols if str(s) in current}
+
+
+def substitute_declared_max(expr):
+    """``expr`` with every declared symbol replaced by its declared maximum.
+
+    Undeclared symbols stay, so the caller sees what is left: nothing (a number),
+    or the undeclared part to resolve its own way.
+    """
+    declared = declared_dims_in(expr)
+    if not declared:
+        return expr
+    return expr.subs(
+        {s: declared[str(s)][1] for s in expr.free_symbols if str(s) in declared}
+    )
+
+
+def undeclared_symbols_in(count) -> list[str]:
+    """The names of ``count``'s free symbols that no declaration covers."""
+    if not (hasattr(count, "free_symbols") and count.free_symbols):
+        return []
+    declared = declared_dims_in(count)
+    return sorted(str(s) for s in count.free_symbols if str(s) not in declared)
+
+
+def require_declared_count(count) -> None:
+    """Refuse a symbolic loop count over a dimension nobody declared.
+
+    A ``for_each_tile`` count only ever becomes one binary for a range when the
+    operand was moved with ``tensor.to("spyre", dynamic={d: {min, max,
+    granularity}})``: that reserves the buffer at the maximum and keeps the
+    device layout, so one graph serves every size. A dimension that only went
+    dynamic by ``mark_dynamic`` reserves nothing, its layout guard carries the
+    exact size and every size recompiles anyway, so a symbolic loop over it
+    would be a per-size kernel with its extent sized from a ShapeEnv bound no
+    reservation backs. Measured on device, 6 November 2026: four sizes, four
+    graphs. Refused here, at the one place every loop level's count passes,
+    with the fix in the message.
+
+    Raises:
+        Unsupported: ``count`` has a free symbol with no declaration.
+    """
+    undeclared = undeclared_symbols_in(count)
+    if undeclared:
+        raise Unsupported(
+            f"for_each_tile trip count {count} depends on {undeclared}, which "
+            f'no tensor.to("spyre", dynamic=...) declaration covers. A symbolic '
+            f"loop runs as one binary only over a declared dimension: move the "
+            f'operand with tensor.to("spyre", dynamic={{d: {{"min": ..., '
+            f'"max": ..., "granularity": ...}}}}) instead of mark_dynamic.'
+        )
 
 
 def declared_max_or_none(expr) -> Optional[int]:
@@ -419,10 +494,9 @@ def declared_max_or_none(expr) -> Optional[int]:
     """
     if not (hasattr(expr, "free_symbols") and expr.free_symbols):
         return None
-    declared = declared_dims_in(expr)
-    if len(declared) != len(expr.free_symbols):
+    if not declared_dims_in(expr):
         return None
-    at_max = expr.subs({s: declared[str(s)][1] for s in expr.free_symbols})
+    at_max = substitute_declared_max(expr)
     if isinstance(at_max, sympy.Integer):
         return int(at_max)
     if getattr(at_max, "is_integer", False) and at_max.is_number:
@@ -469,7 +543,10 @@ def finite_upper_or_none(expr: Expr) -> Optional[int]:
     at_max = declared_max_or_none(expr)
     if at_max is not None:
         return at_max
-    vr = V.graph.sizevars.shape_env.bound_sympy(expr)
+    # A mixed expression: the declared part at its maximum, the rest asked of
+    # the ShapeEnv, so the declared symbol never falls back to a bound it did
+    # not declare.
+    vr = V.graph.sizevars.shape_env.bound_sympy(substitute_declared_max(expr))
     if isinstance(vr.upper, sympy.Integer) and vr.upper.is_finite and int(vr.upper) > 0:
         return int(vr.upper)
     return None
@@ -517,6 +594,22 @@ def decompose_tiled_count(count) -> "tuple[sympy.Symbol, int] | None":
     return None
 
 
+def with_shape_env_replacements(count):
+    """``count`` with the ShapeEnv's replacements applied, else unchanged.
+
+    ``torch._check(a == b)`` lands in ``shape_env.replacements``; applying them
+    makes a tied pair one symbol everywhere the count is read.
+    """
+    replacements = getattr(
+        getattr(getattr(V.graph, "sizevars", None), "shape_env", None),
+        "replacements",
+        None,
+    )
+    if replacements and hasattr(count, "free_symbols") and count.free_symbols:
+        return sympy_subs(count, replacements)
+    return count
+
+
 def symbolic_count_bounds(count) -> "dict[str, tuple[int, int]]":
     """``{symbol name: (max_value, tile_size)}`` for one loop's trip count.
 
@@ -542,11 +635,7 @@ def symbolic_count_bounds(count) -> "dict[str, tuple[int, int]]":
             one per symbolic loop, so that is a check failure there rather than
             a degraded kernel here.
     """
-    replacements = getattr(
-        getattr(V.graph.sizevars, "shape_env", None), "replacements", None
-    )
-    if replacements and hasattr(count, "free_symbols"):
-        count = sympy_subs(count, replacements)
+    count = with_shape_env_replacements(count)
     free_symbols = getattr(count, "free_symbols", None) or set()
     if len(free_symbols) > 1:
         raise Unsupported(
@@ -599,10 +688,12 @@ def max_trip_count(count) -> int:
     reserved at the maximum and the bundle's own loop bound is what limits how
     many iterations actually run.
 
-    So this takes the declared maximum, or the ShapeEnv upper bound for a count
-    over a dimension that only ``mark_dynamic(max=...)`` bounded, and never the
-    hint. Baking in one call's size specialises the SDSC to it while the binary
-    claims to serve the whole range, and that is invisible at the warm-up size.
+    So this takes the declared maximum and never the hint. Baking in one call's
+    size specialises the SDSC to it while the binary claims to serve the whole
+    range, and that is invisible at the warm-up size. A count over a dimension
+    that only ``mark_dynamic`` made dynamic is refused first
+    (``require_declared_count``), so the ShapeEnv fallback inside
+    ``finite_upper_or_none`` never sizes a loop's extent here.
 
     NOT the same number as ``symbolic_count_bounds`` carries, which is easy to
     confuse because both are "the max". For ``FloorDiv(s, 64)`` with ``s <= 512``
@@ -614,12 +705,14 @@ def max_trip_count(count) -> int:
     addressable because the buffer was reserved for it.
 
     Raises:
-        Unsupported: the count is symbolic with no finite upper bound, so there
-            is no extent to describe. The message names the symbol.
+        Unsupported: the count is symbolic over an undeclared dimension, or has
+            no finite upper bound, so there is no extent to describe. The
+            message names the symbol.
     """
     if not (hasattr(count, "free_symbols") and count.free_symbols):
         return int(count)
 
+    require_declared_count(count)
     upper = finite_upper_or_none(count)
     if upper is None:
         raise Unsupported(
@@ -629,11 +722,12 @@ def max_trip_count(count) -> int:
             f"region"
         )
     logger.info(
-        "[symbolic-loop] max_trip_count(%s) = %d, from the ShapeEnv upper bound. "
-        "This is the SDSC's full extent, NOT how many iterations run: that comes "
-        "from the bundle's own loop bound at launch",
+        "[symbolic-loop] max_trip_count(%s) = %d, from the declared maximum of "
+        "%s. This is the SDSC's full extent, NOT how many iterations run: that "
+        "comes from the bundle's own loop bound at launch",
         count,
         upper,
+        sorted(declared_dims_in(count)),
     )
     return upper
 

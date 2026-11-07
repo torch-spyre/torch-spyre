@@ -76,7 +76,9 @@ from .pass_utils import (
     op_read_writes,
     compute_symbolic_bounds,
     max_trip_count,
+    require_declared_count,
     symbolic_count_bounds,
+    with_shape_env_replacements,
     finite_upper_or_none,
     iteration_space,
     iteration_space_with_splits,
@@ -1533,7 +1535,15 @@ class SpyreKernel(Kernel[CSEVariable]):
         scheduler's _codegen_loop_body) both come through here, so each level's
         per-symbol bounds are resolved exactly once, and at codegen time, the
         last point the ShapeEnv is available.
+
+        The ShapeEnv's replacements are applied to the count here, once, so a
+        pair tied with ``torch._check(a == b)`` reaches the LoopSpec, its
+        bounds, its sources and the bundle as the one surviving symbol. A count
+        over a dimension nobody declared is refused here, the one place every
+        level passes (see ``require_declared_count``).
         """
+        count = with_shape_env_replacements(count)
+        require_declared_count(count)
         return LoopSpec(
             count=count,
             body=body,

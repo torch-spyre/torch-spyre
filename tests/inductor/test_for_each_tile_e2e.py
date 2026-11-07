@@ -2080,6 +2080,7 @@ class TestASymbolicTripCountRunsAtEverySize(_DynamoResetTestCase):
         from torch._dynamo.utils import counters
 
         counters.clear()
+        torch.manual_seed(0)  # a rare tolerance miss must be reproducible
         x = torch.randn(512, 64, dtype=torch.float16)
         y = x.to(DEVICE_NAME, dynamic={0: self.SPEC})
         compiled = torch.compile(_length_tiled_double_fn, fullgraph=True)
