@@ -391,9 +391,11 @@ def strided_stick_slice_to_index_select(graph: torch.fx.Graph) -> None:
     """Rewrite ``x[..., start::step]`` (step > 1) on the stick dim as a gather.
 
     A stride inside a stick has no device coordinate ("Unexpected stick expression
-    2*d2"); indexing with an arange of the same positions is a gather, which Spyre
-    lowers. The source is cloned first: the gather needs a host dim that carries the
-    stick alone, which a view such as ``[T, H*D] -> [T, H, D]`` does not have.
+    2*d2"). The slice is taken as a gather of the positions along a row dim instead:
+    ``x`` is transposed to put the stick dim on a row, gathered there with an arange,
+    and transposed back. A gather along the stick itself would need one stick per
+    element, which the 256 MB per-core span limit caps at about 32k rows. Size-1
+    dims are dropped first, so that one never becomes the transposed stick dim.
     """
     for node in list(graph.nodes):
         if node.op != "call_function" or node.target is not aten.slice.Tensor:
@@ -411,24 +413,51 @@ def strided_stick_slice_to_index_select(graph: torch.fx.Graph) -> None:
             continue
         size, count = src_val.size(dim), out_val.size(dim)
         start = 0 if start is None else max(0, min(start + size * (start < 0), size))
-        with graph.inserting_before(node):
-            clone = graph.call_function(
+        lead = [s for s in src_val.shape[:-1] if not statically_known_true(s == 1)]
+        lead = lead or [1]
+        nd = len(lead) + 1
+        swap = [*range(nd - 2), nd - 1, nd - 2]
+
+        def emit(target, args, val, kwargs=None):
+            new = graph.call_function(target, args=args, kwargs=kwargs or {})
+            new.meta["val"] = val
+            copy_fx_custom_meta(node, new)
+            return new
+
+        def view(x, shape):
+            return emit(aten.view.default, (x, shape), x.meta["val"].view(shape))
+
+        def permute(x):
+            return emit(aten.permute.default, (x, swap), x.meta["val"].permute(swap))
+
+        def contiguous(x):
+            val = torch.empty_like(x.meta["val"], device="meta").contiguous()
+            return emit(
                 aten.clone.default,
-                args=(src,),
-                kwargs={"memory_format": torch.contiguous_format},
+                (x,),
+                val,
+                {"memory_format": torch.contiguous_format},
             )
-            clone.meta["val"] = torch.empty_like(src_val, device="meta").contiguous()
-            index = graph.call_function(
+
+        with graph.inserting_before(node):
+            # A view folds other dims into the stick's host dim (``[T, H*D]`` viewed
+            # ``[T, H, D]``), which the transpose's restickify cannot pad; copy it out.
+            cols = contiguous(permute(view(contiguous(src), [*lead, size])))
+            index = emit(
                 aten.arange.start_step,
-                args=(start, start + step * count, step),
-                kwargs={"dtype": torch.int64, "device": src_val.device},
+                (start, start + step * count, step),
+                torch.empty(count, dtype=torch.int64, device="meta"),
+                {"dtype": torch.int64, "device": src_val.device},
             )
-            index.meta["val"] = torch.empty(count, dtype=torch.int64, device="meta")
             # index_select is already decomposed here; emit what it decomposes to.
-            gather = graph.call_function(
-                aten.index.Tensor, args=(clone, [None] * dim + [index])
+            picked = emit(
+                aten.index.Tensor,
+                (cols, [None] * (nd - 2) + [index]),
+                torch.empty(
+                    [*lead[:-1], count, lead[-1]], dtype=src_val.dtype, device="meta"
+                ),
             )
-            gather.meta["val"] = torch.empty_like(out_val, device="meta").contiguous()
+            gather = view(permute(picked), list(out_val.shape))
         node.replace_all_uses_with(gather)
         graph.erase_node(node)
 

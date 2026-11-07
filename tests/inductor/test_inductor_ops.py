@@ -9118,6 +9118,19 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        # GPT-J style RoPE on a single key head ([T, 1, D], as MLA's shared key),
+        # with cos and sin gathered per position. A size-1 dim must not become the
+        # stick of the transposed copy: the restickify of the gathered cos and sin
+        # then grows with T and overflows a dbo-opt immediate at T=1024.
+        ("test_interleaved_rope_single_head", "test_interleaved_rope_cpu"): {
+            "param_sets": {
+                "t1024": (
+                    cached_randn((1024, 1, 64), differentiation="irs_x"),
+                    cached_randn((4096, 32), differentiation="irs_cos"),
+                    cached_randn((4096, 32), differentiation="irs_sin"),
+                ),
+            },
+        },
         # A stick-dim gather written at an offset inside a wider stick: the
         # restickify of the gather output must target the consumer's stick, or
         # it writes at stick position 0 and over the neighbouring lanes.
@@ -11903,6 +11916,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return slicer(x) * scale
 
         self.compare_with_cpu(fn, x, scale, run_eager=False)
+
+    def test_interleaved_rope_cpu(self, x, cos_cache, sin_cache):
+        """Interleaved RoPE as vLLM's ``ApplyRotaryEmb.forward_static`` reads it."""
+        positions = torch.arange(x.shape[0]) * 7 % cos_cache.shape[0]
+
+        def fn(x, cos_cache, sin_cache, positions):
+            cos = cos_cache.index_select(0, positions).unsqueeze(1)
+            sin = sin_cache.index_select(0, positions).unsqueeze(1)
+            x1, x2 = x[..., ::2], x[..., 1::2]
+            return torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), -1)
+
+        self.compare_with_cpu(fn, x, cos_cache, sin_cache, positions, run_eager=False)
 
     def test_stick_gather_at_offset_cpu(self, build, x, a):
         """Gather the even stick positions of ``x`` and write them beside ``a``."""
