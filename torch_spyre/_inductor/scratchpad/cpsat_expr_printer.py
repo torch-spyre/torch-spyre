@@ -63,6 +63,8 @@ _MAX_PRODUCT_BOUND = 2**30
 # Bits a factor keeps when a product past _MAX_PRODUCT_BOUND is narrowed, so
 # the product of two of them stays inside it.
 _PRODUCT_FACTOR_BITS = 15
+# Bits the factor ranges of one product may sum to (see _narrowed_factors).
+_PRODUCT_TOTAL_BITS = 30
 # Bits kept of a float linear sum's widest term when it becomes one integer
 # variable to enter a product.
 _LINEAR_FACTOR_BITS = 24
@@ -399,6 +401,10 @@ class _SympyExprToCpSat(Printer):
             lambda e: e.func == sympy.floor,
             lambda e: e.args[0],
         )
+        cost_expr = cost_expr.replace(
+            lambda e: e.is_Add and self._complement_of(e) is not None,
+            self._complement_of,
+        )
         cost_expr = sympy.expand(cost_expr)
         cost_expr = cost_expr.replace(
             lambda e: e.func in [sympy.log, sympy.Piecewise],
@@ -550,6 +556,29 @@ class _SympyExprToCpSat(Printer):
                 result *= math.prod([arg for arg in expr.args if arg not in symbols])
                 return result
         return expr
+
+    def _complement_of(self, expr):
+        """``1 - lit`` for a residency literal as its complement, a Boolean tied
+        to it by ``lit + not_lit == 1``. Expanded, ``(1 - lit) * v`` is then one
+        non-negative gate ``not_lit * v`` rather than ``v - lit * v``, whose
+        relaxation can hold the gated copy at its top while ``v`` sits at its
+        bottom."""
+        args = expr.args
+        if len(args) != 2 or sympy.Integer(1) not in args:
+            return None
+        other = args[0] if args[1] == 1 else args[1]
+        coefficient, lit = other.as_coeff_Mul()
+        if coefficient != -1 or not lit.is_Symbol or lit.name not in self._sym_map:
+            return None
+        var = self._sym_map[lit.name]
+        if not getattr(var, "is_boolean", False):
+            return None
+        name = f"not_{lit.name}"
+        if name not in self._sym_map:
+            complement = self._model.new_bool_var(name)
+            self._model.add(complement + var == 1)
+            self._sym_map[name] = complement
+        return sympy.Symbol(name, integer=True, nonnegative=True)
 
     def _distribute_power(self, expr):
         """Bring a fractional or negative power down to the split and tile
@@ -960,22 +989,29 @@ class _SympyExprToCpSat(Printer):
         return self._print_multiply_two(math.prod(nonints), self._sym_map[name])
 
     def _narrowed_factors(self, ints):
-        """Each factor wider than _PRODUCT_FACTOR_BITS as its value divided by a
-        power of two, rounded to nearest, and the total power the product
-        must be scaled back by."""
+        """The factors of a product past _MAX_PRODUCT_BOUND, the widest divided
+        by powers of two (rounded to nearest) until their bit widths sum to at
+        most _PRODUCT_TOTAL_BITS, and the total power the product must be scaled
+        back by. CP-SAT's presolve reported a satisfiable model INFEASIBLE when a
+        product's factor ranges multiplied past that, however narrow each factor
+        was on its own."""
+        bounds = [self._affine_bounds(var) for var in ints]
+        widths = [max(abs(lb), abs(ub)).bit_length() for lb, ub in bounds]
+        excess = [0] * len(ints)
+        while sum(w - e for w, e in zip(widths, excess)) > _PRODUCT_TOTAL_BITS:
+            widest = max(range(len(ints)), key=lambda i: widths[i] - excess[i])
+            excess[widest] += 1
         narrowed, shift = [], 0
-        for var in ints:
-            lb, ub = self._affine_bounds(var)
-            excess = max(abs(lb), abs(ub)).bit_length() - _PRODUCT_FACTOR_BITS
-            if excess <= 0:
+        for var, (lb, ub), e in zip(ints, bounds, excess):
+            if e == 0:
                 narrowed.append(var)
                 continue
-            step = 2**excess
+            step = 2**e
             low, high = math.floor(lb / step), math.ceil(ub / step)
             rounded = self._model.new_int_var(low, high, f"{var.name}_div{step}")
             self._model.add_division_equality(rounded, var + step // 2, step)
             narrowed.append(rounded)
-            shift += excess
+            shift += e
         return narrowed, shift
 
     def _print_gated_product(self, ints, name):
