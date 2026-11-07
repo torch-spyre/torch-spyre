@@ -84,10 +84,6 @@ class _NoOpSolver(CoreDivisionLayoutSolver):
     def tilings_from_menu(cls) -> bool:
         return False
 
-    @classmethod
-    def linear_cost_only(cls) -> bool:
-        return False
-
     def plan_layout(self, log_lx_usage=False):
         return list(self.buffers)
 
