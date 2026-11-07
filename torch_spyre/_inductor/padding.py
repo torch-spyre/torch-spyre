@@ -1547,14 +1547,24 @@ class DomainRangeTracer(DomainRangeSolver):
 
         if not padded:
             self.buffer_range[op.name] = EmptySet
+        elif is_restickify_op(op, self.graph):
+            # The output's stick is a non-stick dim of the input, so its padding
+            # lanes come from input rows past that dim's valid extent, not from
+            # the input's padding. insert_restickify_padding (which runs later)
+            # grows the input allocation to cover them, and nothing writes the
+            # new rows, so their content is unknown. Mark that on the output and
+            # leave the input's range alone.
+            self.buffer_range[op.name] = self.buffer_range[op.name].union(
+                _user_values()
+            )
 
         overwrites = {}
         output_padding = None
 
         if do_coord_mask or do_pad:
-            pad_set = self.buffer_range[op.name]
             if padded:
                 # set the propagated output padding
+                pad_set = self.buffer_range[op.name]
                 output_padding = float(pick_element(pad_set))
 
             for arg_name, pad_set in self.buffer_input[op.name].items():
