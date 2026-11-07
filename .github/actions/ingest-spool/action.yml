@@ -24,6 +24,14 @@ inputs:
     description: Token for the shared tier. Ignored (and never exported) when the run is not trusted.
     required: false
     default: ''
+  artifactory-url:
+    description: Base URL of the shared tier's Artifactory. Pass it from a secret; never write it in a workflow file.
+    required: false
+    default: ''
+  artifactory-repo:
+    description: Repository of the shared tier. Pass it from a secret.
+    required: false
+    default: ''
   spool-dir:
     description: Local spool directory. Defaults to a per-run directory under RUNNER_TEMP.
     required: false
@@ -54,6 +62,8 @@ runs:
       env:
         TRUSTED_IN: ${{ inputs.trusted }}
         TOKEN_IN: ${{ inputs.artifactory-token }}
+        URL_IN: ${{ inputs.artifactory-url }}
+        REPO_IN: ${{ inputs.artifactory-repo }}
         DIR_IN: ${{ inputs.spool-dir }}
         EVENT: ${{ github.event_name }}
         HEAD_FORK: ${{ github.event.pull_request.head.repo.fork }}
@@ -67,15 +77,19 @@ runs:
         if [ "${TRUSTED_IN}" = "true" ] \
            && [ "${EVENT}" != "pull_request" ] && [ "${EVENT}" != "pull_request_target" ] \
            && [ "${HEAD_FORK}" != "true" ] && [ "${REPO_FORK}" != "true" ] \
-           && [ -n "${TOKEN_IN}" ]; then
+           && [ -n "${TOKEN_IN}" ] && [ -n "${URL_IN}" ] && [ -n "${REPO_IN}" ]; then
           trusted=true
         fi
         echo "trusted=${trusted}" >> "$GITHUB_OUTPUT"
         if [ "${trusted}" = "true" ]; then
           echo "::add-mask::${TOKEN_IN}"
+          echo "::add-mask::${URL_IN}"
+          echo "::add-mask::${REPO_IN}"
           {
             echo "CH_WRITE_SHARED_SPOOL_TRUSTED=1"
             echo "CH_WRITE_ARTIFACTORY_TOKEN=${TOKEN_IN}"
+            echo "CH_WRITE_ARTIFACTORY_URL=${URL_IN}"
+            echo "CH_WRITE_ARTIFACTORY_REPO=${REPO_IN}"
           } >> "$GITHUB_ENV"
         else
           echo "::notice::Shared spool disabled for this run (event=${EVENT}); failed writes stay on the runner."

@@ -49,6 +49,8 @@ def run_step(step_id, env, tmp_path):
 BASE = {
     "TRUSTED_IN": "true",
     "TOKEN_IN": "tok-secret",
+    "URL_IN": "https://artifactory.example.test/artifactory",
+    "REPO_IN": "spool-repo",
     "DIR_IN": "",
     "EVENT": "push",
     "HEAD_FORK": "",
@@ -62,8 +64,12 @@ def test_a_trusted_push_run_enables_the_shared_tier(tmp_path):
     assert (
         "CH_WRITE_SHARED_SPOOL_TRUSTED=1" in genv
         and "CH_WRITE_ARTIFACTORY_TOKEN=tok-secret" in genv
+        and "CH_WRITE_ARTIFACTORY_URL=https://artifactory.example.test/artifactory"
+        in genv
+        and "CH_WRITE_ARTIFACTORY_REPO=spool-repo" in genv
     )
     assert "::add-mask::tok-secret" in r.stdout
+    assert "::add-mask::https://artifactory.example.test/artifactory" in r.stdout
 
 
 @pytest.mark.parametrize(
@@ -76,12 +82,15 @@ def test_a_trusted_push_run_enables_the_shared_tier(tmp_path):
         {"TRUSTED_IN": "false"},
         {"TRUSTED_IN": ""},
         {"TOKEN_IN": ""},
+        {"URL_IN": ""},
+        {"REPO_IN": ""},
     ],
 )
 def test_an_untrusted_run_never_exports_the_token_or_the_flag(tmp_path, override):
     r, kv, genv = run_step("setup", {**BASE, **override}, tmp_path)
     assert kv["trusted"] == "false"
     assert "tok-secret" not in genv and "SHARED_SPOOL_TRUSTED" not in genv
+    assert "CH_WRITE_ARTIFACTORY_URL" not in genv
     assert "tok-secret" not in r.stdout + r.stderr
 
 
