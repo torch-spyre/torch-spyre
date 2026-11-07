@@ -7596,8 +7596,7 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
         refused (#6088), so this regression has no coverage until that is fixed:
         ``test_span_overflow_gate.py::test_a_forced_one_level_plan_of_a_buffer_is_right``
         covers the permuted buffer at 4 tiles, and
-        ``..._tiled_eight_ways_at_one_level_is_right`` (a strict xfail, #6093) the
-        coincidence at one level.
+        ``..._tiled_eight_ways_at_one_level_is_right`` the coincidence at one level.
         """
         torch.manual_seed(0xAFFE)
         x = torch.randn(8, 8, 64, 512, dtype=torch.float16).permute(1, 0, 2, 3)

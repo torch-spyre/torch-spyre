@@ -59,7 +59,7 @@ from torch_spyre._inductor.wsr import coarse_tile, span_overflow_hint_analysis
 from torch_spyre._inductor.wsr.coarse_tile import reject_nested_loops
 from torch_spyre.constants import DEVICE_NAME
 
-from utils_inductor import expects_raise, strict_xfail
+from utils_inductor import expects_raise
 
 MB = 1024 * 1024
 
@@ -527,20 +527,16 @@ def test_a_forced_one_level_plan_of_a_buffer_is_right(make_input, levels, trips)
 
 
 @pytest.mark.parametrize("dim", [0, 1])
-def test_a_permuted_buffer_tiled_eight_ways_at_one_level_is_right(request, dim):
+def test_a_permuted_buffer_tiled_eight_ways_at_one_level_is_right(dim):
     """The stride coincidence of ``test_permuted_same_size_dims_tile_numeric``: the
     tile count equals the size of the two leading dims. Reached with one level when
     the plan is forced (the planner picks ``[4, 4]``, which is right and is that
-    test, refused today because it nests). The result is wrong, not just misplaced:
-    the sorted values differ from the expected ones. How wrong depends on the
-    measure (about 98% of the elements differ by more than 0.05 here, and a
-    different probe of the same plan counted far fewer), so this asserts none."""
-    strict_xfail(
-        request,
-        AssertionError,
-        "a permuted buffer tiled 8 ways at one level returns wrong values: the "
-        "result differs from fp32 and is not a rearrangement of it (#6093)",
-    )
+    test, refused today because it nests).
+
+    Host dim 0 of this buffer tiled 8 ways is squeezed to extent 1 in the copy-out.
+    Its per-trip advance was taken as the product of the sizes to its right (262144,
+    which is dim 1's stride), where the buffer's own stride is 32768, so tiles 1 to 7
+    were written to the wrong place (#6093). It is now the buffer's stride."""
     wrong, loops, counts = _forced_one_level(_PERMUTE_SHAPE, [(dim, 8)], _permuted)
     assert (loops, counts) == (1, [8]), (loops, counts)
     assert wrong == 0.0, wrong
