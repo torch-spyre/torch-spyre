@@ -2045,5 +2045,59 @@ class TestForEachTileCarriesInPlaceE2E(_DynamoResetTestCase):
         torch.testing.assert_close(b.cpu().float(), ref_b, atol=0, rtol=0)
 
 
+def _length_tiled_double_fn(x: torch.Tensor) -> torch.Tensor:
+    """for_each_tile over a varying length, so the trip count is symbolic."""
+    from torch_spyre._inductor.wsr import for_each_tile
+
+    rows = x.shape[0]
+    torch._check(rows >= 64)
+    torch._check(rows <= 512)
+    torch._check(rows % 32 == 0)
+
+    def body(_, ops):
+        (tile,) = ops
+        return None, tile * 2
+
+    _, out = for_each_tile(body, (x,), dims=(0,), tile_size=32, out_dim=0)
+    return out
+
+
+class TestASymbolicTripCountRunsAtEverySize(_DynamoResetTestCase):
+    """One compiled graph serves a declared range, at a second tile size.
+
+    A second body op (a plain scale) and a second granularity (32 rows) beside
+    ``tests/inductor/test_symbolic_loop_e2e.py``'s gelu at 64. The tensor is
+    declared with ``.to(DEVICE_NAME, dynamic=...)`` (#5179), so its buffer is
+    reserved at the maximum and the kernel's geometry is built there, and the
+    launch binds the logical size into the loop's dimension slot. 96 rows is
+    three trips of 32 and not a multiple of 64, so the granularity in use is
+    the declared one and not the other test's.
+    """
+
+    SPEC = {"min": 64, "max": 512, "granularity": 32}
+
+    def test_one_graph_right_at_every_size(self):
+        from torch._dynamo.utils import counters
+
+        counters.clear()
+        torch.manual_seed(0)  # a rare tolerance miss must be reproducible
+        x = torch.randn(512, 64, dtype=torch.float16)
+        y = x.to(DEVICE_NAME, dynamic={0: self.SPEC})
+        compiled = torch.compile(_length_tiled_double_fn, fullgraph=True)
+
+        for rows in (128, 64, 512, 96, 256):
+            y.resize_((rows, 64))
+            out = compiled(y).cpu().float()
+            # Not exact: the device rounds fp16 arithmetic its own way, and a
+            # plain eager ``y * 2`` on a Spyre tensor is already one fp16 ulp off
+            # the host on about half the elements (measured 6 Nov 2026). One
+            # ulp of a value below 4 is under 4e-3, so 1e-2 is a real check of
+            # the rows and not of the rounding.
+            torch.testing.assert_close(
+                out, x[:rows].float() * 2, atol=1e-2, rtol=1e-2, msg=f"at {rows} rows"
+            )
+        self.assertEqual(counters["stats"]["unique_graphs"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -168,10 +168,14 @@ def convert_modular_indexing(expr: sympy.Expr) -> sympy.Expr:
         return expr
 
 
-# NOTE: this is intentionally a local copy of pass_utils.concretize_expr.
-# views.py cannot import from pass_utils because pass_utils imports
-# compute_coordinates from views (circular dependency).  The duplication
-# is acceptable because both are thin wrappers around V.graph.sizevars.optimization_hint.
+# NOTE: deliberately a local copy of pass_utils.concretize_expr. A module-level
+# import would cycle, because pass_utils imports compute_coordinates from here,
+# so the helper it needs is imported inside the function instead. The two must
+# agree on how a symbol resolves, both preferring a declared ceiling over the
+# warm-up hint: a comparison here that picks its branch at one size while the
+# geometry around it is built at another is a silent wrong answer. This copy
+# also handles the sympy.oo sentinels that only the algorithms below produce,
+# which is why it is not a thin forwarder.
 def _concretize_for_cmp(expr):
     """Return a concrete numeric value for use in comparison operators only.
 
@@ -184,6 +188,11 @@ def _concretize_for_cmp(expr):
     in ``add_term`` when the index has a non-zero storage offset, e.g. for
     slice / split ops).  ``int(sympy.oo)`` would raise; ``math.inf`` works
     correctly in ``<`` / ``>`` comparisons against ints and sympy values.
+
+    A symbol from a ``tensor.to("spyre", dynamic=...)`` declaration resolves to
+    its declared maximum rather than to this call's hint, so a branch taken here
+    matches the geometry ``concretize_expr`` builds around it. A symbol that went
+    dynamic by ``mark_dynamic`` alone is not declared and still takes the hint.
 
     TODO(issue#1373): once these algorithms use sympy predicates or
     SizeVarAllocator guards, this function can be removed.
@@ -200,6 +209,14 @@ def _concretize_for_cmp(expr):
     if isinstance(expr, float):
         return expr  # passthrough (incl. math.inf); avoids int(math.inf) error
     if hasattr(expr, "free_symbols") and expr.free_symbols:
+        # Local import: pass_utils imports compute_coordinates from this module,
+        # so a module-level import would cycle. build_alignment_inputs below
+        # reaches for the same helper the same way.
+        from .pass_utils import declared_max_or_none
+
+        at_max = declared_max_or_none(expr)
+        if at_max is not None:
+            return at_max
         return V.graph.sizevars.optimization_hint(expr)
     return int(expr)
 
