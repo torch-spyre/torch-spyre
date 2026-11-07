@@ -32,9 +32,14 @@ from typing import Any, Callable, Optional, Sequence, Union
 
 import torch
 import torch._decomp as decomp
-from torch._prims_common import ELEMENTWISE_TYPE_PROMOTION_KIND, elementwise_dtypes
+from torch._prims_common import (
+    ELEMENTWISE_TYPE_PROMOTION_KIND,
+    canonicalize_dim,
+    elementwise_dtypes,
+)
 
 from .constants import DEVICE_NAME, FP8_E4M3FN_MAX, FP8_E4M3FN_MIN
+from .dtype_ops import DtypeOpTable
 from .errors import Unsupported
 from .sliding_window_plan import (
     MAX_QUERY_BLOCK,
@@ -1567,6 +1572,15 @@ spyre_decompositions_to_exclude = [
     # decomps and let the mm/bmm survive to mm_to_bmm_pass (2.11 behavior).
     torch.ops.aten.mm,
     torch.ops.aten.bmm,
+    # torch.max_pool2d / F.max_pool2d always trace to
+    # aten.max_pool2d_with_indices, which Inductor decomposes into a
+    # pointwise/reduction nest. Spyre lowers it directly to a native
+    # ``maxpoolfwd`` SDSC (see ``lower_max_pool2d_with_indices``), so the
+    # upstream decomposition must be dropped for that lowering to be reached at
+    # all. The lowering itself re-delegates to
+    # ``lowering.max_pool2d_with_indices`` for the cases maxpoolfwd cannot
+    # express (k==1 windows), so dropping the decomp loses no coverage.
+    torch.ops.aten.max_pool2d_with_indices,
 ]
 
 OpOrOps = Union[torch._ops.OperatorBase, Sequence[torch._ops.OperatorBase]]
@@ -3091,6 +3105,77 @@ def bitwise_and(input1: torch.Tensor, input2: torch.Tensor) -> torch.Tensor:
                 torch.ops.aten.bitwise_not(input1), torch.ops.aten.bitwise_not(input2)
             )
         )
+
+
+# Spyre has no native scan op (#3388), so cumsum is decomposed by result dtype:
+# fp16/bf16 multiply by a triangular matrix of ones, fp32/int32/int64 run a
+# doubling prefix scan. Every other dtype falls back to CPU.
+#
+# Each path needs the scan dim in a particular position, so it swaps it there
+# and swaps the result back; a swap works on any input, where a reshape would
+# not. Both also copy their input into a plain dense buffer first, because
+# neither can read a sliced one.
+
+# Result dtypes whose scan is a matmul, and all result dtypes that scan on device.
+_CUMSUM_MATMUL_DTYPES = (torch.float16, torch.bfloat16)
+_CUMSUM_SCAN_DTYPES = _CUMSUM_MATMUL_DTYPES + (
+    torch.float32,
+    torch.int32,
+    torch.int64,
+)
+
+
+@register_spyre_decompositions([torch.ops.aten.cumsum.default])
+def spyre_cumsum(
+    x: torch.Tensor,
+    dim: int,
+    dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    if dtype is None:
+        # torch.cumsum accumulates bool and integer inputs in int64.
+        dtype = x.dtype if x.dtype.is_floating_point else torch.int64
+    # A conversion runs on Spyre only if it is native and keeps the element width.
+    on_device = dtype in _CUMSUM_SCAN_DTYPES and (
+        x.dtype == dtype
+        or (
+            DtypeOpTable.is_supported(x.dtype, dtype)
+            and get_elem_in_stick(x.dtype) == get_elem_in_stick(dtype)
+        )
+    )
+    # Raise IndexError like torch.cumsum; eager reaches this decomposition
+    # without the op's own dim check.
+    dim = canonicalize_dim(x.dim(), dim)
+    # A 0-d input has no dim to scan; an empty one has nothing to scan.
+    if not on_device or x.dim() == 0 or x.numel() == 0:
+        return torch.ops.spyre.cumsum_cpu_fallback(x, dim, dtype)
+
+    n = x.shape[dim]
+
+    if dtype in _CUMSUM_MATMUL_DTYPES:
+        # matmul sums along the last dim, so the scan dim goes there and comes
+        # back. Both swaps do nothing when it is already last.
+        upper = torch.triu(torch.ones(n, n, dtype=dtype, device=x.device))
+        operand = torch.ops.aten.clone.default(
+            x.to(dtype).transpose(dim, -1), memory_format=torch.contiguous_format
+        )
+        return torch.ops.aten.matmul(operand, upper).transpose(dim, -1)
+
+    # Shifting only works off the innermost dim. A 1-D input has no other dim,
+    # so it gets one.
+    rank1 = x.dim() == 1
+    moved = x.unsqueeze(-1) if rank1 else x.transpose(dim, -2)
+    result = torch.ops.aten.clone.default(
+        moved.to(dtype), memory_format=torch.contiguous_format
+    )
+    # A shift of n already covers the whole scan, so stop there.
+    offset = 1
+    while offset < n:
+        sliced = torch.ops.aten.slice.Tensor(result, -2, 0, n - offset)
+        # pad takes two values per dim, innermost first; this left-pads dim -2.
+        shifted = torch.ops.aten.constant_pad_nd(sliced, [0, 0, offset, 0], 0)
+        result = result + shifted
+        offset *= 2
+    return result.squeeze(-1) if rank1 else result.transpose(dim, -2)
 
 
 #: Largest kernel tap (per spatial axis) the direct conv2d path accepts. A
