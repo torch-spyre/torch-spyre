@@ -1,0 +1,111 @@
+name: ClickHouse write spool
+description: >
+  Sets up the write spool for the ingest steps that follow, decides whether this run may use the
+  shared (Artifactory) tier, and afterwards uploads whatever is still spooled so the next run or
+  the backstop job can replay it. Use it in two places in a job: `mode: setup` before the ingest
+  and `mode: finish` after it (with `if: always()`). A run that cannot reach ClickHouse keeps its
+  rows instead of losing them; nothing else about the ingest changes.
+
+  The shared tier holds row data, so it is closed unless the run is trusted: never for
+  pull_request, pull_request_target or fork runs, and only when `trusted: 'true'` is passed by a
+  workflow that runs on a protected branch.
+
+inputs:
+  mode:
+    description: setup | finish
+    required: true
+  trusted:
+    description: >
+      'true' lets this run write row data to the shared spool. Pass it only from a workflow that
+      runs reviewed code on a protected ref (push to main, schedule, workflow_run of such a run).
+    required: false
+    default: 'false'
+  artifactory-token:
+    description: Token for the shared tier. Ignored (and never exported) when the run is not trusted.
+    required: false
+    default: ''
+  spool-dir:
+    description: Local spool directory. Defaults to a per-run directory under RUNNER_TEMP.
+    required: false
+    default: ''
+  name:
+    description: Name part of the uploaded artifact, to tell jobs apart.
+    required: false
+    default: ingest
+
+outputs:
+  trusted:
+    description: "'true' when the shared tier is enabled for this run."
+    value: ${{ steps.setup.outputs.trusted }}
+  spool-dir:
+    description: The local spool directory.
+    value: ${{ steps.setup.outputs.spool-dir }}
+  pending:
+    description: Number of spooled batches left after the ingest.
+    value: ${{ steps.finish.outputs.pending }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up the spool
+      id: setup
+      if: inputs.mode == 'setup'
+      shell: bash
+      env:
+        TRUSTED_IN: ${{ inputs.trusted }}
+        TOKEN_IN: ${{ inputs.artifactory-token }}
+        DIR_IN: ${{ inputs.spool-dir }}
+        EVENT: ${{ github.event_name }}
+        HEAD_FORK: ${{ github.event.pull_request.head.repo.fork }}
+        REPO_FORK: ${{ github.event.repository.fork }}
+      run: |
+        DIR="${DIR_IN:-${RUNNER_TEMP}/ch-spool}"
+        mkdir -p "${DIR}"
+        echo "CH_WRITE_SPOOL=${DIR}" >> "$GITHUB_ENV"
+        echo "spool-dir=${DIR}" >> "$GITHUB_OUTPUT"
+        trusted=false
+        if [ "${TRUSTED_IN}" = "true" ] \
+           && [ "${EVENT}" != "pull_request" ] && [ "${EVENT}" != "pull_request_target" ] \
+           && [ "${HEAD_FORK}" != "true" ] && [ "${REPO_FORK}" != "true" ] \
+           && [ -n "${TOKEN_IN}" ]; then
+          trusted=true
+        fi
+        echo "trusted=${trusted}" >> "$GITHUB_OUTPUT"
+        if [ "${trusted}" = "true" ]; then
+          echo "::add-mask::${TOKEN_IN}"
+          {
+            echo "CH_WRITE_SHARED_SPOOL_TRUSTED=1"
+            echo "CH_WRITE_ARTIFACTORY_TOKEN=${TOKEN_IN}"
+          } >> "$GITHUB_ENV"
+        else
+          echo "::notice::Shared spool disabled for this run (event=${EVENT}); failed writes stay on the runner."
+        fi
+
+    - name: Report and keep what is still spooled
+      id: finish
+      if: inputs.mode == 'finish'
+      shell: bash
+      env:
+        DIR: ${{ inputs.spool-dir || env.CH_WRITE_SPOOL }}
+      run: |
+        n=0
+        if [ -n "${DIR}" ] && [ -d "${DIR}" ]; then
+          n=$(find "${DIR}" -maxdepth 1 -type f \( -name '*.json' -o -name '*.jsonl' \) | wc -l | tr -d ' ')
+        fi
+        echo "pending=${n}" >> "$GITHUB_OUTPUT"
+        if [ "${n}" -gt 0 ]; then
+          echo "::warning::${n} ClickHouse write batch(es) are spooled and not yet stored. They are replayed by the next write or the backstop job."
+          {
+            echo "### ClickHouse writes pending"
+            echo "${n} batch(es) are spooled on this runner (the cluster did not accept them in time)."
+          } >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: Upload the spool when the shared tier was not available
+      if: inputs.mode == 'finish' && steps.finish.outputs.pending != '0'
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: ch-spool-${{ inputs.name }}-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ inputs.spool-dir || env.CH_WRITE_SPOOL }}
+        retention-days: 7
+        if-no-files-found: ignore
