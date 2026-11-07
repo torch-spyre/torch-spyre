@@ -23,6 +23,7 @@ from torch._inductor.virtualized import V
 from .ir import SpyreConstantFallback
 from .logging_utils import get_inductor_logger
 from .loop_info import ReadCopyElisionRecord
+from .loop_node import OpsView, owning_list
 from .pass_utils import NameSwapHandler, invalidate_op_read_writes
 from .provenance import merge_provenance
 
@@ -188,6 +189,23 @@ def _drop_constant(
     logger.debug("dedup_and_promote_constants: merged %s into canonical %s", D, C)
 
 
+def _promote_across_nodes(real: list[Operation], constants: list[Operation]) -> None:
+    """Move ``constants`` to the head of the top-level list ``real``, in order.
+
+    ``real`` is the nested list behind the flat view. A constant that sits in a
+    loop body leaves it: its key is a scalar, a dtype and a device, so it does not
+    depend on the iteration, and a flat ``operations[:] = ...`` would only move
+    it to the head of its own body (the view acts on the list that holds an op).
+    Same result as running the pass on the expanded list, which this replaces.
+    """
+    for op in constants:
+        holder, index = owning_list(real, op) or (None, -1)
+        if holder is None:
+            raise ValueError(f"{op.get_name()} is not in the operations list")
+        holder.pop(index)
+    real[:0] = constants
+
+
 def dedup_and_promote_constants(graph: GraphLowering) -> None:
     """Deduplicate SpyreConstantFallback ops and move them to the head of operations.
 
@@ -289,10 +307,13 @@ def dedup_and_promote_constants(graph: GraphLowering) -> None:
     constants = [op for op in operations if isinstance(op, SpyreConstantFallback)]
     if not constants:
         return
-    non_constants = [
-        op for op in operations if not isinstance(op, SpyreConstantFallback)
-    ]
-    operations[:] = constants + non_constants
+    if isinstance(operations, OpsView):
+        _promote_across_nodes(operations.real, constants)
+    else:
+        non_constants = [
+            op for op in operations if not isinstance(op, SpyreConstantFallback)
+        ]
+        operations[:] = constants + non_constants
     logger.debug(
         "dedup_and_promote_constants: %d constant(s) promoted to front of operations",
         len(constants),

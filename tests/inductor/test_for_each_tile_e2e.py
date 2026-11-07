@@ -322,6 +322,48 @@ class TestForEachTileE2E(_DynamoResetTestCase):
             ):
                 compiled(values, indices, initial)
 
+    def test_scatter_carry_relayout_copies_are_in_the_loop(self):
+        """The mutation relayout of a scatter into a carry puts BOTH full-buffer
+        copies inside the scatter's loop ("so other carry readers observe the
+        preceding iteration's updates"), by node membership and not only by the
+        ``loop_group_id`` stamped on them.
+
+        ``reorder_nonstick_dims_mutation`` placed the copy-back by flat index after
+        the last body op, which the flat view puts at the top level; the copy then
+        claimed the loop without being in it. The pipeline's later ``expanded()``
+        round trip rebuilt nodes from ``loop_group_id`` and hid that, until
+        ``dedup_and_promote_constants`` stopped needing it. The loop checker does
+        not flag this: it checks that an op's index uses enclosing variables, not
+        that an op with a ``loop_group_id`` is inside the matching node."""
+        rows = 32  # a shape the runtime-index test compiles: the scatter is legal
+        generator = torch.Generator().manual_seed(930)
+        values = (torch.randn(4, rows, 64, generator=generator) * 0.125).to(
+            torch.float16
+        )
+        indices = torch.stack(
+            [torch.randperm(rows * 4, generator=generator)[:rows] for _ in range(4)]
+        ).to(torch.int32)
+        initial = (torch.randn(rows * 4, 64, generator=generator) * 0.125).to(
+            torch.float16
+        )
+        _RecordLoopMembership.top_level_members = []
+        _RecordLoopMembership.body_members = []
+        with (
+            config.patch(
+                backend_loop_unroll=False, lx_planning=True, hbm_pool_planning=True
+            ),
+            torch.inference_mode(),
+            # A cache hit would skip the pipeline this test inspects, leaving the
+            # recorder's lists empty.
+            torch._inductor.config.patch(force_disable_caches=True),
+            patch.object(ts_passes, "CustomPreSchedulingPasses", _RecordLoopMembership),
+        ):
+            torch.compile(scatter_carry_fn, fullgraph=True, dynamic=False)(
+                values.to(DEVICE_NAME), indices.to(DEVICE_NAME), initial.to(DEVICE_NAME)
+            )
+        self.assertEqual(_RecordLoopMembership.top_level_members, [])
+        self.assertGreaterEqual(len(_RecordLoopMembership.body_members), 4)
+
     def test_scatter_carry_preserves_old_value_read_after_update(self):
         from torch_spyre._C import SpyreTensorLayout, get_device_dtype
         from torch_spyre.ops.fallbacks import FallbackWarning
@@ -1074,6 +1116,36 @@ class TestForEachTileNestedGatherE2E(_DynamoResetTestCase):
         torch.testing.assert_close(
             out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
         )
+
+
+class _RecordLoopMembership(CustomPreSchedulingPasses):
+    """Pre-scheduling pipeline that records, once it is done, which ops claim a
+    loop (by ``loop_info.loop_group_id``) and where they sit in the node tree."""
+
+    top_level_members: list[str] = []
+    body_members: list[str] = []
+
+    def __call__(self, graph) -> None:
+        from torch_spyre._inductor.loop_node import LoopNode
+
+        super().__call__(graph)
+        cls = type(self)
+
+        def gid(op):
+            return getattr(getattr(op, "loop_info", None), "loop_group_id", None)
+
+        cls.top_level_members = [
+            op.get_operation_name()
+            for op in graph.operations
+            if not isinstance(op, LoopNode) and gid(op) is not None
+        ]
+        cls.body_members = [
+            op.get_operation_name()
+            for node in graph.operations
+            if isinstance(node, LoopNode)
+            for op in all_ops(node.body)
+            if gid(op) is not None
+        ]
 
 
 class _CollectRegions(CustomPreSchedulingPasses):

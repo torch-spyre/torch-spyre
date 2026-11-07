@@ -1223,7 +1223,12 @@ def _insert_mutation_relayout_copy(
     )
     buf_copyback.layout = MutationLayoutSHOULDREMOVE(target_buf)
     operations.remove(buf_copyback)
-    operations.insert(mutation_op_index + 2, buf_copyback)
+    if hasattr(operations, "real"):
+        from .loop_node import insert_after
+
+        insert_after(operations.real, mutation_op, buf_copyback)
+    else:
+        operations.insert(mutation_op_index + 2, buf_copyback)
 
     # A loop-carried destination changes on every trip, even though its base
     # address is fixed. Both full-buffer copies must stay inside the scatter's
