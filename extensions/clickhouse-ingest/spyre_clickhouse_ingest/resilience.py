@@ -133,6 +133,13 @@ class SpoolItem:
     rows: list
     token: str
     database: str | None
+    created: float | None = None
+    # Rows in the probed scope before this batch was attempted; None when no probe was given.
+    scope_count: int | None = None
+    # True when a failed attempt may have stored the batch. A batch refused before any write
+    # (quorum, read-only) is not ambiguous and can always be sent again.
+    ambiguous: bool = False
+    scope: str | None = None
 
 
 class Spool:
@@ -143,19 +150,39 @@ class Spool:
         self.dir = Path(directory)
         self.dir.mkdir(parents=True, exist_ok=True)
 
-    def put(self, table, columns, rows, token, database=None) -> Path:
+    def put(
+        self,
+        table,
+        columns,
+        rows,
+        token,
+        database=None,
+        *,
+        created: float | None = None,
+        scope_count: int | None = None,
+        ambiguous: bool = False,
+        scope: str | None = None,
+    ) -> Path:
+        created = time.time() if created is None else float(created)
         doc = {
             "table": table,
             "columns": list(columns),
             "rows": [list(r) for r in rows],
             "token": token,
             "database": database,
+            "created": created,
+            "scope_count": scope_count,
+            "ambiguous": bool(ambiguous),
+            "scope": scope,
         }
         # The token names the file: spooling the same batch twice leaves one file.
-        final = self.dir / f"{int(time.time() * 1000):013d}-{token}.json"
         existing = [p for p in self.dir.glob(f"*-{token}.json")]
         if existing:
             return existing[0]
+        # Strictly increasing, so files sort in the order they were written.
+        ms = max(int(created * 1000), getattr(self, "_last_ms", 0) + 1)
+        self._last_ms = ms
+        final = self.dir / f"{ms:013d}-{token}.json"
         fd, tmp = tempfile.mkstemp(dir=self.dir, suffix=".tmp")
         try:
             with os.fdopen(fd, "w") as fh:
@@ -182,6 +209,10 @@ class Spool:
                     d["rows"],
                     d["token"],
                     d.get("database"),
+                    None if d.get("created") is None else float(d["created"]),
+                    d.get("scope_count"),
+                    bool(d.get("ambiguous")),
+                    d.get("scope"),
                 )
             except (ValueError, KeyError, OSError):
                 try:
@@ -236,12 +267,16 @@ def resilient_insert(
     policy: Policy | None = None,
     replicated: bool = False,
     database: str | None = None,
-    spool: Spool | None = None,
+    spool: Any = None,
+    probe: Callable[[Any], int] | None = None,
     sleep: Callable[[float], None] | None = None,
     clock: Callable[[], float] | None = None,
     log: Callable[[str], None] = lambda m: print(m, file=sys.stderr),
 ) -> Outcome:
     """Insert `rows` in batches, surviving quorum and Keeper failures.
+
+    With a TieredSpool the call first drains what earlier writes spooled (bounded by the spool's
+    own item and time budget), then sends its own rows; whatever it cannot land goes to the spool.
 
     `scope` names what the rows belong to (a run id, a file); it feeds the batch token so two
     different loads of identical rows are not mistaken for one. Returns an Outcome; raises
@@ -252,6 +287,15 @@ def resilient_insert(
     wait = sleep or time.sleep
     now = clock or time.monotonic
     out = Outcome()
+    if spool is not None and hasattr(spool, "drain"):
+        spool.drain(
+            client,
+            replicated=replicated,
+            probe=probe,
+            policy=policy,
+            sleep=wait,
+            log=log,
+        )
     size = max(1, policy.batch_rows)
     batches = [list(rows[i : i + size]) for i in range(0, len(rows), size)]
     for n, batch in enumerate(batches, 1):
@@ -298,13 +342,12 @@ def resilient_insert(
                             f"{table}: batch {n}/{len(batches)} not accepted within "
                             f"{policy.deadline_s:.0f}s ({err!r})"
                         ) from err
-                    spool.put(
-                        table,
-                        columns,
-                        batch,
-                        token or batch_token(table, scope, batch),
-                        database,
-                    )
+                    tok = token or batch_token(table, scope, batch)
+                    meta = {"ambiguous": kind == "ambiguous", "scope": scope}
+                    if hasattr(spool, "put_any"):
+                        spool.put_any(table, columns, batch, tok, database, **meta)
+                    else:
+                        spool.put(table, columns, batch, tok, database, **meta)
                     out.spooled += len(batch)
                     log(
                         f"  [spooled] {table} batch {n}/{len(batches)} ({len(batch)} rows): {err!r}"
