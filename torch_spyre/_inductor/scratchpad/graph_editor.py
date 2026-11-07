@@ -349,10 +349,18 @@ class GraphEditor:
 
     def _last_writer(self, buf_name: str) -> Operation:
         """The last op in the lowered order that writes ``buf_name``: its
-        producer, or a later op that mutates it in place."""
+        producer, or a later op that mutates it in place.
+
+        The base ``Operation`` (and ``LoopNode``) has no
+        ``get_mutation_names``; every leaf IR op does, and this pass sees leaf
+        ops through ``OpsView``. The fallback keeps a node without it from
+        failing here: it is then a writer only under its own name.
+        """
         last = None
         for op in self.lowering.operations:
-            if op.get_name() == buf_name or buf_name in op.get_mutation_names():
+            get_mutation_names = getattr(op, "get_mutation_names", None)
+            mutated = get_mutation_names() if get_mutation_names else ()
+            if op.get_name() == buf_name or buf_name in mutated:
                 last = op
         assert last is not None, f"no op in the graph writes {buf_name}"
         return last

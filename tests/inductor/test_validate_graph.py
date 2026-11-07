@@ -1,4 +1,4 @@
-# Copyright 2025 The Torch-Spyre Authors.
+# Copyright 2026 The Torch-Spyre Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,8 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for the operation-order check run after every pre-scheduling pass,
-and for the split_multi_ops ordering bug that motivated it (PR #5982)."""
+"""Tests for the operation-order check run after the pre-scheduling passes
+(always after the last one, and after every one with
+``config.validate_every_pass``), and for the split_multi_ops ordering bug that
+motivated it (PR #5982)."""
 
 from unittest.mock import patch
 
@@ -36,10 +38,14 @@ from torch._inductor.ir import (
 from torch._inductor.lowering import lowerings
 from torch._inductor.virtualized import V
 
+from torch_spyre._inductor import config as ts_config
+from torch_spyre._inductor import pass_counters
 from torch_spyre._inductor import split_multi_ops as smo
+from torch_spyre._inductor.pass_counters import READ_WRITES_EXTRACTIONS
 from torch_spyre._inductor.passes import (
     CustomPreSchedulingPasses,
     InvalidGraphError,
+    check_final_operation_order,
     check_operation_order,
 )
 
@@ -210,5 +216,52 @@ class TestRunsAfterEveryPass:
 
     def test_pass_that_breaks_order_is_named(self, graph):
         self._graph_ops(graph)
-        with pytest.raises(InvalidGraphError, match="_out_of_order_pass"):
+        with ts_config.patch("validate_every_pass", True):
+            with pytest.raises(InvalidGraphError, match="_out_of_order_pass"):
+                self._passes()._run_pass_loop(graph)
+
+    def test_off_by_default(self, graph):
+        # The final check catches it instead; the pass loop alone does not.
+        self._graph_ops(graph)
+        with ts_config.patch("validate_every_pass", False):
             self._passes()._run_pass_loop(graph)
+
+
+class TestFinalCheck:
+    def test_ordered_graph_passes(self, graph):
+        x = _input("x")
+        a = _pointwise("a", x)
+        check_final_operation_order([a, _pointwise("b", a)], "Pipeline")
+
+    def test_error_asks_for_the_per_pass_check(self, graph):
+        x = _input("x")
+        a = _pointwise("a", x)
+        b = _pointwise("b", a)
+        with pytest.raises(
+            InvalidGraphError,
+            match=r"(?s)after the Pipeline pre-scheduling passes: operation b .* "
+            r"reads a.*SPYRE_VALIDATE_EVERY_PASS=1",
+        ):
+            check_final_operation_order([b, a], "Pipeline")
+
+
+class TestNotCounted:
+    """The check's read-set extractions are not the work the pass counters
+    describe, so they must not move test_frontend_work_bounds.py's bounds."""
+
+    def test_check_is_not_counted(self, graph):
+        x = _input("x")
+        a = _pointwise("a", x)
+        ops = [a, _pointwise("b", a)]
+        with pass_counters.counted_region() as counts:
+            check_operation_order(ops, "p")
+            check_final_operation_order(ops, "Pipeline")
+        assert READ_WRITES_EXTRACTIONS not in counts
+
+    def test_counting_resumes_after_the_check(self, graph):
+        x = _input("x")
+        a = _pointwise("a", x)
+        with pass_counters.counted_region() as counts:
+            check_operation_order([a], "p")
+            a.get_read_writes()
+        assert counts[READ_WRITES_EXTRACTIONS] == 1
