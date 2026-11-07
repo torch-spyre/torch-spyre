@@ -9209,6 +9209,104 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        # A stride inside the stick (the even/odd split of GPT-J style RoPE) is
+        # gathered. The views are those of q/k off a projection: [T, H*D] viewed
+        # [T, H, D], and the rope part of a [T, H, 192] head split [128 | 64].
+        ("test_strided_stick_slice", "test_strided_stick_slice_cpu"): {
+            "param_sets": {
+                "step2": (
+                    lambda t: t[..., ::2],
+                    cached_randn((32, 8, 64), differentiation="sss_x"),
+                ),
+                "step2_offset": (
+                    lambda t: t[..., 1::2],
+                    cached_randn((32, 8, 64), differentiation="sss_x"),
+                ),
+                "step3_bounded": (
+                    lambda t: t[..., 2:40:3],
+                    cached_randn((32, 8, 64), differentiation="sss_x"),
+                ),
+                "step4_offset_2_sticks": (
+                    lambda t: t[..., 3::4],
+                    cached_randn((32, 4, 128), differentiation="sss_w"),
+                ),
+                "step2_2d": (
+                    lambda t: t[:, ::2],
+                    cached_randn((4, 128), differentiation="sss_2d"),
+                ),
+                "step2_of_head_view": (
+                    lambda t: t.view(32, 8, 64)[..., ::2],
+                    cached_randn((32, 512), differentiation="sss_v"),
+                ),
+                "step2_offset_of_head_split": (
+                    lambda t: t.view(32, 8, 192).split([128, 64], -1)[1][..., 1::2],
+                    cached_randn((32, 1536), differentiation="sss_s"),
+                ),
+            },
+        },
+        # GPT-J style RoPE on a single key head ([T, 1, D], as MLA's shared key),
+        # with cos and sin gathered per position. A size-1 dim must not become the
+        # stick of the transposed copy: the restickify of the gathered cos and sin
+        # then grows with T and overflows a dbo-opt immediate at T=1024.
+        ("test_interleaved_rope_single_head", "test_interleaved_rope_cpu"): {
+            "param_sets": {
+                "t1024": (
+                    cached_randn((1024, 1, 64), differentiation="irs_x"),
+                    cached_randn((4096, 32), differentiation="irs_cos"),
+                    cached_randn((4096, 32), differentiation="irs_sin"),
+                ),
+            },
+        },
+        # A stick-dim gather written at an offset inside a wider stick: the
+        # restickify of the gather output must target the consumer's stick, or
+        # it writes at stick position 0 and over the neighbouring lanes.
+        ("test_stick_gather_at_offset", "test_stick_gather_at_offset_cpu"): {
+            "param_sets": {
+                "cat_after": (
+                    lambda x, a, i: torch.cat((a, torch.index_select(x, -1, i)), -1),
+                    cached_randn((32, 8, 64), differentiation="sgo_x"),
+                    cached_randn((32, 8, 32), differentiation="sgo_a"),
+                ),
+                "cat_even_odd": (
+                    lambda x, a, i: torch.cat(
+                        (
+                            torch.index_select(x, -1, i),
+                            torch.index_select(x, -1, i + 1),
+                        ),
+                        -1,
+                    ),
+                    cached_randn((32, 8, 64), differentiation="sgo_x"),
+                    cached_randn((32, 8, 32), differentiation="sgo_a"),
+                ),
+                "cat_after_2d": (
+                    lambda x, a, i: torch.cat((a, torch.index_select(x, -1, i)), -1),
+                    cached_randn((8, 64), differentiation="sgo_x2"),
+                    cached_randn((8, 32), differentiation="sgo_a2"),
+                ),
+                "pad_left": (
+                    lambda x, a, i: torch.nn.functional.pad(
+                        torch.index_select(x, -1, i), (32, 0)
+                    ),
+                    cached_randn((32, 8, 64), differentiation="sgo_x"),
+                    cached_randn((32, 8, 32), differentiation="sgo_a"),
+                ),
+                # The fill value must survive next to the gathered lanes.
+                "pad_right_fill": (
+                    lambda x, a, i: torch.nn.functional.pad(
+                        torch.index_select(x, -1, i), (0, 32), value=7.0
+                    ),
+                    cached_randn((32, 8, 64), differentiation="sgo_x"),
+                    cached_randn((32, 8, 32), differentiation="sgo_a"),
+                ),
+                "pad_both_fill": (
+                    lambda x, a, i: torch.nn.functional.pad(
+                        torch.index_select(x, -1, i), (16, 16), value=7.0
+                    ),
+                    cached_randn((32, 8, 64), differentiation="sgo_x"),
+                    cached_randn((32, 8, 32), differentiation="sgo_a"),
+                ),
+            },
+        },
         # rotate_half on q/k built by view + transpose of the projection output:
         # the HF attention pattern issue #4050 was reported against.
         ("test_rope_on_split_stick_view", "test_rope_on_split_stick_view_cpu"): {
@@ -12111,6 +12209,36 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return slicer(x.view(*view_shape)) * 1.0
 
         self.compare_with_cpu(fn, x, run_eager=False)
+
+    def test_strided_stick_slice_cpu(self, slicer, x):
+        """Read a strided slice of the stick dim into real compute.
+
+        The slice is scaled by a tensor, not a constant: a lone slice, or one times a
+        constant, is folded into a view of the input and never reaches the device.
+        """
+        scale = torch.linspace(0.5, 1.5, slicer(x).shape[-1], dtype=x.dtype)
+
+        def fn(x, scale):
+            return slicer(x) * scale
+
+        self.compare_with_cpu(fn, x, scale, run_eager=False)
+
+    def test_interleaved_rope_cpu(self, x, cos_cache, sin_cache):
+        """Interleaved RoPE as vLLM's ``ApplyRotaryEmb.forward_static`` reads it."""
+        positions = torch.arange(x.shape[0]) * 7 % cos_cache.shape[0]
+
+        def fn(x, cos_cache, sin_cache, positions):
+            cos = cos_cache.index_select(0, positions).unsqueeze(1)
+            sin = sin_cache.index_select(0, positions).unsqueeze(1)
+            x1, x2 = x[..., ::2], x[..., 1::2]
+            return torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), -1)
+
+        self.compare_with_cpu(fn, x, cos_cache, sin_cache, positions, run_eager=False)
+
+    def test_stick_gather_at_offset_cpu(self, build, x, a):
+        """Gather the even stick positions of ``x`` and write them beside ``a``."""
+        index = torch.arange(0, x.shape[-1], 2)
+        self.compare_with_cpu(build, x, a, index, run_eager=False)
 
     def test_rope_on_split_stick_view_cpu(self, hidden, cos, sin):
         """rotate_half on q and k that are view + transpose of one buffer."""

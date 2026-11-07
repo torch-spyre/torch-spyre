@@ -46,6 +46,7 @@ from .temp_passes import (
     bmm_unflatten_pass,
     decompose_addmm,
     mm_to_bmm_pass,
+    strided_stick_slice_to_index_select,
 )
 from .wsr.coarse_tile import validate_coarse_tile_groups
 from .wsr.coarse_tile_span_overflow import span_overflow_groups
@@ -309,6 +310,8 @@ class CustomPostPasses(_SpyreGraphPassPipeline):
                 # pass) and the mm flow through the Spyre lowerings instead of
                 # falling back to extern_kernels.addmm.
                 decompose_addmm,
+                # x[..., k::s] on the stick dim has no device coordinate; gather it.
+                strided_stick_slice_to_index_select,
                 mm_to_bmm_pass.apply,
                 bmm_unflatten_pass.apply,
             ]
