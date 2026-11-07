@@ -703,9 +703,9 @@ def test_kineto_memcpy_and_memset_events_captured():
         "Expected at least one memset event in the AIUPTI-backed trace"
     )
 
-    # Memcpy events carry cycles_ts only when the record has counters; flex
-    # currently reports every DMA without them, so today the key is absent.
-    # Either way, an emitted array must be valid and never all zero.
+    # Memcpy events carry cycles_ts when flex filled them from the CB response
+    # block; older flex/libaiupti builds leave every slot 0 and the key is
+    # absent. Either way, an emitted array must be valid and never all zero.
     for e in h2d_events + d2h_events:
         cycles_ts = e.get("args", {}).get("cycles_ts")
         if cycles_ts is None:
@@ -720,7 +720,7 @@ def test_kineto_memcpy_and_memset_events_captured():
         assert "cycles_ts" not in e.get("args", {}), "memset never carries cycles_ts"
 
 
-COLL_ARG_KEYS = ("coll_group", "coll_algo", "coll_bytes")
+COLL_ARG_KEYS = ("coll_group", "coll_algo", "coll_bytes", "collective_id")
 
 
 @pytest.mark.requires_spyre_profiler
