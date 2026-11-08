@@ -1165,6 +1165,11 @@ def _sigmoid(x):
     return 1.0 / (1.0 + math.exp(-x))
 
 
+# Placeholder returned by the tracers' indirect_indexing. A load whose index
+# contains it is an indirect (gather) load.
+_INDIRECT_INDEX_SYM = sympy.Symbol("indirect_index")
+
+
 def _user_values():
     values = S.Reals
     if padding_strict_mode:
@@ -1214,7 +1219,7 @@ class DomainRangeSolver(DefaultHandler):
         # Due to the risk of invalid memory access we only admit 0 as padding
         if not zero == x:
             raise InvalidDomain(zero, "indirect_indexing")
-        return sympy.Symbol("dummy")
+        return _INDIRECT_INDEX_SYM
 
     def reduction(
         self,
@@ -1507,6 +1512,14 @@ class DomainRangeTracer(DomainRangeSolver):
 
         if padding_range is None:
             padding_range = self.current_reads.get(name)
+            if padding_range is not None and _INDIRECT_INDEX_SYM in getattr(
+                index, "free_symbols", ()
+            ):
+                # An indirect load does not read the source's padding: in the
+                # output's padding lanes it reads source[i], where i is the
+                # index's padding, which indirect_indexing restricts to 0. So
+                # the lanes hold valid source elements, i.e. user values.
+                padding_range = _user_values()
         if padding_range is None:
             current_op_name = (
                 self.current_op.name if self.current_op is not None else None
@@ -1633,7 +1646,14 @@ class DomainRangeTracer(DomainRangeSolver):
             # that the if there is slicing along the stiock dim, valid values
             # from the input can end up in the output padding
             # TODO: refine analysis to exclude non-stick slicing cases
-            if padded and is_sliced:
+            # An input with no padding cannot supply the output's padding lanes
+            # from its own padding: they read valid input elements instead
+            # (a broadcast, a transpose, or a restickify that also reads
+            # another buffer and so is not recognised by is_restickify_op).
+            reads_valid_into_padding = is_sliced or (
+                self.buffer_range[dep.name] is EmptySet
+            )
+            if padded and reads_valid_into_padding:
                 self.current_reads[dep.name] = self.current_reads[dep.name].union(
                     _user_values()
                 )
@@ -1859,7 +1879,7 @@ class ArgNameToIndexTracer(DefaultHandler):
                 counter = counter + 1
 
         if name == "indirect_indexing":
-            return sympy.Symbol("dummy")
+            return _INDIRECT_INDEX_SYM
 
     def load(self, name: str, index: sympy.Expr) -> ArgName:
         return ArgName(name)
