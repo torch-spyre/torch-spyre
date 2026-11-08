@@ -22,6 +22,7 @@ import pytest
 import torch
 
 from torch_spyre import make_spyre_module  # type: ignore[attr-defined]
+from torch_spyre._inductor.timing_recorder import BACKEND_COMPILE_EVENT
 from torch_spyre.constants import DEVICE_NAME
 from torch_spyre.profiler import get_diagnostic_report as profiler_get_diagnostic_report
 from torch_spyre.profiler._ffdc import (
@@ -1158,6 +1159,8 @@ class TestFfdcAsyncCompile:
                 return False
 
         class _FakeTimingRecorder:
+            BACKEND_COMPILE_EVENT = BACKEND_COMPILE_EVENT
+
             @staticmethod
             def stage(*_a, **_k):
                 from contextlib import nullcontext
