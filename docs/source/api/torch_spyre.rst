@@ -850,6 +850,9 @@ Environment Variables
    * - ``SPYRE_LX_SOLVER_RELAYOUT_PRESOLVE_MAX_COPIES``
      - For unpriced CP-SAT solves, skip presolve above this many relayout
        copies (default ``0``, which disables the threshold)
+   * - ``SPYRE_LX_SOLVER_PROBING_LEVEL``
+     - CP-SAT presolve probing level for the LX layout solves (default ``0``,
+       which skips probing; OR-tools' own default is ``2``)
    * - ``SPYRE_READ_COPY_ELISION``
      - Remove a proven-redundant read copy after LX planning; a failed proof
        leaves the graph unchanged (default ``1``; set ``0`` to disable)

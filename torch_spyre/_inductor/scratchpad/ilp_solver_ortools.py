@@ -1401,6 +1401,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             if torch.are_deterministic_algorithms_enabled()
             else config.get_cpu_count()
         )
+        solver.parameters.cp_model_probing_level = config.lx_solver_probing_level
         # Fixed seed so a given worker configuration is reproducible run-to-run.
         solver.parameters.random_seed = 0
         # OR-tools 9.15's variable-shaving workers can segfault on a model with

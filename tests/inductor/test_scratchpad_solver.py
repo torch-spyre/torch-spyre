@@ -1428,6 +1428,27 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
                 },
             )
 
+    def test_solve_uses_the_configured_probing_level(self):
+        from ortools.sat.python import cp_model
+
+        seen = []
+        solve = cp_model.CpSolver.Solve
+
+        def record_and_solve(solver, model, *args, **kwargs):
+            seen.append(solver.parameters.cp_model_probing_level)
+            return solve(solver, model, *args, **kwargs)
+
+        buf = CoreDivisionBuffer("out", 100, [0, 1], core_divisions=_whole())
+        with (
+            mock.patch.object(config, "lx_solver_probing_level", 0),
+            mock.patch.object(cp_model.CpSolver, "Solve", record_and_solve),
+        ):
+            self.solver_class(
+                [buf], size=1 << 20, alignment=1
+            ).plan_layout_and_core_divisions()
+        # 0 is not OR-tools' default (2), so this fails if the setting is unused.
+        self.assertEqual(set(seen), {0})
+
     def test_inplace_chain_shares_single_slot(self):
         # A 3-level in-place chain gp -> p -> c (each parent.end_time ==
         # child.start_time + 1) with whole-only divisions and capacity for just

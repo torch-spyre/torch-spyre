@@ -224,6 +224,11 @@ lx_solver_relayout_presolve_max_copies: int = int(
     os.getenv("SPYRE_LX_SOLVER_RELAYOUT_PRESOLVE_MAX_COPIES", "0")
 )
 
+# CP-SAT presolve probing level for the LX layout solves. 0 skips probing: on
+# these models it costs more time than it saves, and the plans stay optimal.
+# OR-tools' own default is 2.
+lx_solver_probing_level: int = int(os.getenv("SPYRE_LX_SOLVER_PROBING_LEVEL", "0"))
+
 allow_all_ops_in_lx_planning: bool = False
 
 dxp_lx_frac_avail: float = float(os.environ.get("DXP_LX_FRAC_AVAIL", "0.2"))
