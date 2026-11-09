@@ -3292,19 +3292,16 @@ class TestInvScale(TestCase):
 
 
 class TestObjectiveCostParams(TestCase):
-    """Every solver's objective drops the tile-height derates."""
+    """The objective prices a tile's height, so tile counts do not tie."""
 
-    def test_the_objective_neutralizes_the_derates(self):
-        from torch_spyre._inductor.cost_model import CostParams, coarse_underfill_eff
+    def test_the_objective_keeps_the_derates(self):
+        from torch_spyre._inductor.cost_model import coarse_underfill_eff
         from torch_spyre._inductor.scratchpad.allocator import _COST_PARAMS
 
-        # A symbolic tile height leaves no fractional power behind.
-        is_lx, split = sympy.symbols("is_lx_buf0 split_buf0_d0", positive=True)
-        rpc = (256 * (1 - is_lx) + 1024 * is_lx) / split
-        eff = sympy.sympify(coarse_underfill_eff(rpc, 512, _COST_PARAMS))
-        self.assertFalse(eff.free_symbols)
-        self.assertEqual(float(eff), 1.0)
-        self.assertLess(coarse_underfill_eff(2.0, 512, CostParams()), 1)
+        tile = sympy.Symbol("tile_buf0_o0", integer=True, positive=True)
+        eff = sympy.sympify(coarse_underfill_eff(1024 / tile, 512, _COST_PARAMS))
+        self.assertEqual(eff.free_symbols, {tile})
+        self.assertLess(float(eff.subs(tile, 1024)), float(eff.subs(tile, 2)))
 
 
 if __name__ == "__main__":
