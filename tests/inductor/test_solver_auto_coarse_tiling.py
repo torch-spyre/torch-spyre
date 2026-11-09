@@ -55,6 +55,7 @@ from torch_spyre._inductor.scratchpad import sa_cooptimizer as sa
 from torch_spyre._inductor.scratchpad.allocator import (
     CoOptimizingAllocator,
     _spec_within_read_distance,
+    commit_divisions as allocator_commit_divisions,
     commit_lx_views,
     select_allocator,
 )
@@ -869,6 +870,36 @@ def _reads_graph_inputs_only(op) -> bool:
     return all(dep.name in graph_inputs for dep in op.get_read_writes().reads)
 
 
+def _hold_division_on_the_tiled_axis(factor: int):
+    """Commit the division that splits each buffer's own tiled axis ``factor``
+    ways, whatever the objective preferred.
+
+    Holds the pattern under test so the body checks the addressing codegen
+    gives it, not which division the cost model happens to rank first: that
+    ranking is the cost model's business and moves with it. A buffer with no
+    such candidate (an untiled op, or a copy the apply synthesised) keeps the
+    solver's own choice.
+
+    The candidate names its own tiled axis in ``tile_splits``, so the wanted
+    division is the one splitting that same symbol -- no symbol-name matching.
+    """
+    target = "torch_spyre._inductor.scratchpad.allocator.commit_divisions"
+    original = allocator_commit_divisions
+
+    def commit(graph, allocation):
+        for buf in allocation:
+            for index, candidate in enumerate(getattr(buf, "core_divisions", ())):
+                if len(candidate.tile_splits) != 1:
+                    continue
+                ((axis, _),) = candidate.tile_splits
+                if candidate.splits == {axis: factor}:
+                    buf.chosen_division = index
+                    break
+        return original(graph, allocation)
+
+    return patch(target, commit)
+
+
 @unittest.skipUnless(_HAS_ORTOOLS, "the cpsat solver needs ortools")
 class TileOwnershipGroupingTests(unittest.TestCase):
     """A consumer shares its producer's loop nest only where it reads it tile by
@@ -1087,23 +1118,31 @@ class TileOwnershipGroupingTests(unittest.TestCase):
         self.assertIsNone(_nest_mismatch(nests[0], (4,)), _describe(tiling))
 
     def test_a_tile_is_divided_across_cores_along_its_tiled_dim(self):
-        # Every op runs one d0:4 nest, 16 rows to a tile. The solve owns each
-        # op's division and ties the divisions of the nest together, so it may
-        # give each core a slice of the tiled dim itself. The balanced division
-        # it prefers does: 4 cores along those 16 rows.
+        # Every op runs one d0:4 nest, 16 rows to a tile, and each core takes a
+        # slice of the tiled dim itself: codegen has to address a tile that is
+        # cut twice, once in time and once across cores.
+        #
+        # The division is held rather than solved for. Which division is
+        # cheapest is the cost model's business and changes with it -- it
+        # currently prices every split of a memory-bound bundle above no split
+        # at all -- so a test of this addressing asserts what codegen does with
+        # the pattern, never that the objective picks it.
         x = torch.randn(64, 64, 128, dtype=torch.float16)
         y = torch.randn(64, 64, 128, dtype=torch.float16)
-        cpu, device, tiling = self._compile(
-            lambda x, y: (x + y) * 2 + 1, (x, y), consumer_menu=[_D0_BY_4]
-        )
+        with _hold_division_on_the_tiled_axis(4):
+            cpu, device, tiling = self._compile(
+                lambda x, y: (x + y) * 2 + 1, (x, y), consumer_menu=[_D0_BY_4]
+            )
         self._assert_close(device, cpu)
         (nest,) = _nests(tiling).values()
         model_ops = self._model_ops(nest)
         self.assertEqual(len(model_ops), 3, _describe(tiling))
         dim_0_stride = 64 * 128
         for name in model_ops:
+            # The held division reached codegen: without this the body would
+            # pass on an undivided plan and test nothing.
             splits = CollectTilingPasses.core_splits[name]
-            self.assertGreater(splits.get(dim_0_stride, 1), 1, f"{name}: {splits}")
+            self.assertEqual(splits.get(dim_0_stride, 1), 4, f"{name}: {splits}")
 
     def test_a_cut_tile_resides_on_the_tiled_graph(self):
         # The producer is tiled and its readers are not, so it is a cut: its
