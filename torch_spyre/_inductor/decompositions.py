@@ -33,9 +33,9 @@ from typing import Any, Callable, Optional, Sequence, Union
 import torch
 import torch._decomp as decomp
 from torch._refs import scalar_tensor
-import torch._prims as prims
 from torch._prims_common import (
     ELEMENTWISE_TYPE_PROMOTION_KIND,
+    canonicalize_dim,
     elementwise_dtypes,
     Number,
     NumberType,
@@ -43,6 +43,7 @@ from torch._prims_common import (
 )
 
 from .constants import DEVICE_NAME, FP8_E4M3FN_MAX, FP8_E4M3FN_MIN
+from .dtype_ops import DtypeOpTable
 from .errors import Unsupported
 from .sliding_window_plan import (
     MAX_QUERY_BLOCK,
@@ -1575,6 +1576,15 @@ spyre_decompositions_to_exclude = [
     # decomps and let the mm/bmm survive to mm_to_bmm_pass (2.11 behavior).
     torch.ops.aten.mm,
     torch.ops.aten.bmm,
+    # torch.max_pool2d / F.max_pool2d always trace to
+    # aten.max_pool2d_with_indices, which Inductor decomposes into a
+    # pointwise/reduction nest. Spyre lowers it directly to a native
+    # ``maxpoolfwd`` SDSC (see ``lower_max_pool2d_with_indices``), so the
+    # upstream decomposition must be dropped for that lowering to be reached at
+    # all. The lowering itself re-delegates to
+    # ``lowering.max_pool2d_with_indices`` for the cases maxpoolfwd cannot
+    # express (k==1 windows), so dropping the decomp loses no coverage.
+    torch.ops.aten.max_pool2d_with_indices,
 ]
 
 OpOrOps = Union[torch._ops.OperatorBase, Sequence[torch._ops.OperatorBase]]
@@ -1880,19 +1890,48 @@ def spyre_gelu(
     return torch.ops.spyre.gelu(input, approximate)
 
 
+# Below this input the log1p series replaces the runtime primitive, which is up to
+# 1.4% off in [-2, -1) and returns 0 below -7 (#5741). The series' truncation error
+# peaks here at 3.1e-4, but the primitive just above is up to 0.6% off, so the
+# output can step by that much at the cutoff.
+_SOFTPLUS_SERIES_CUTOFF = -1.0
+# Terms of log1p(u) = u - u^2/2 + u^3/3 - ...; at u = e^-1 the next one is below
+# fp16 resolution.
+_SOFTPLUS_SERIES_TERMS = 6
+
+
+def _softplus_unit_beta(input: torch.Tensor, threshold: float) -> torch.Tensor:
+    """``softplus(x, beta=1)``: the primitive above the cutoff, log1p(e^x) below.
+
+    There is no log1p on Spyre and log(1 + e^x) rounds to 0 just like the
+    primitive, so the small-x branch is the log1p series in Horner form. PyTorch
+    returns x only for x > threshold, so a threshold below the cutoff lowers it.
+    """
+    cutoff = min(_SOFTPLUS_SERIES_CUTOFF, threshold)
+    u = torch.exp(torch.clamp_max(input, cutoff))
+    acc = torch.full_like(u, 1.0 / _SOFTPLUS_SERIES_TERMS)
+    for k in range(_SOFTPLUS_SERIES_TERMS - 1, 0, -1):
+        acc = 1.0 / k - u * acc
+    return torch.where(
+        input < cutoff,
+        u * acc,
+        torch.ops.spyre.softplus(input, 1.0, threshold),
+    )
+
+
 @register_spyre_decompositions([torch.ops.aten.softplus.default])
 def spyre_softplus(
     input: torch.Tensor, beta: float = 1.0, threshold: float = 20.0
 ) -> torch.Tensor:
     if beta == 1.0:
-        return torch.ops.spyre.softplus(input, beta, threshold)
+        return _softplus_unit_beta(input, threshold)
     # The runtime primitive drops the outer 1/beta factor, so beta == 1 is its
     # only exact path. Scale into it and back out; the threshold branch stays
     # exact because 1 * (beta * x) > threshold is PyTorch's beta * x > threshold.
     # aten accepts beta == 0 and saturates every element to +-inf, so take the
     # reciprocal under IEEE rules rather than letting Python raise here.
     inv_beta = math.copysign(math.inf, beta) if beta == 0.0 else 1.0 / beta
-    return torch.ops.spyre.softplus(input * beta, 1.0, threshold) * inv_beta
+    return _softplus_unit_beta(input * beta, threshold) * inv_beta
 
 
 def _pow_by_squaring(input: torch.Tensor, exponent: int) -> torch.Tensor:
@@ -2230,7 +2269,7 @@ def spyre__sdpa_overrideable(
 
         def sdpa_lk_body(carry, tiles):
             block_maximum, block_denominator, block_output = carry
-            _, k_blk, v_blk, *block_masks = tiles
+            q_blk, k_blk, v_blk, *block_masks = tiles
             if use_gqa:
                 k_blk = k_blk.unsqueeze(2)
                 v_blk = v_blk.unsqueeze(2)
@@ -2243,9 +2282,9 @@ def spyre__sdpa_overrideable(
                 k_blk = k_blk.contiguous()
             keys_T = k_blk.transpose(-1, -2).contiguous()
             scores = (
-                torch.ops.spyre.batched_matmul(q_scaled, keys_T)
+                torch.ops.spyre.batched_matmul(q_blk, keys_T)
                 if use_gqa
-                else torch.matmul(q_scaled, keys_T)
+                else torch.matmul(q_blk, keys_T)
             )
             for block_mask in block_masks:
                 scores = scores + block_mask
@@ -2267,7 +2306,9 @@ def spyre__sdpa_overrideable(
             new_output = block_output * correction.unsqueeze(-1) + weighted
             return (new_max, new_denominator, new_output), None
 
-        kv_operands = (q_tile, k_tile, v_tile, *mask_tiles)
+        # The body reads the scaled Q as an operand: for_each_tile traces it
+        # without Dynamo, so a closed-over tensor would not be lifted.
+        kv_operands = (q_scaled, k_tile, v_tile, *mask_tiles)
         kv_dims = (None, -2, -2, *mask_dims(-1, max_seqlen_kv))
         initial = (running_max, denominator, output_tile)
         # One K/V block already returned through the stable body above.
@@ -2562,15 +2603,15 @@ def _windowed_attention(
 
             def swa_kv_body(carry, tiles):
                 running_max, denominator, output = carry
-                _, k_blk, v_blk, mask_blk = tiles
+                q_blk, k_blk, v_blk, mask_blk = tiles
                 # Match full SDPA: the scan walks K in cache order and
                 # materializes only the bounded, transposed tile required by
                 # the score matmul.
                 keys_t = k_blk.transpose(-1, -2).contiguous()
                 scores = (
-                    torch.ops.spyre.batched_matmul(q_scaled, keys_t)
+                    torch.ops.spyre.batched_matmul(q_blk, keys_t)
                     if use_gqa
-                    else torch.matmul(q_scaled, keys_t)
+                    else torch.matmul(q_blk, keys_t)
                 )
                 scores = scores + mask_blk
 
@@ -2592,7 +2633,9 @@ def _windowed_attention(
                 new_output = output * correction.unsqueeze(-1) + weighted
                 return (new_max, new_denominator, new_output), None
 
-            kv_operands = (q_tile, k_tile, v_tile, mask_tile)
+            # The body reads the scaled Q as an operand: for_each_tile traces it
+            # without Dynamo, so a closed-over tensor would not be lifted.
+            kv_operands = (q_scaled, k_tile, v_tile, mask_tile)
             initial = (running_max, denominator, output_tile)
             if tiling.num_kv_blocks == 1:
                 (_, denominator, output_tile), _ = swa_kv_body(initial, kv_operands)
@@ -3106,6 +3149,77 @@ def bitwise_and(input1: torch.Tensor, input2: torch.Tensor) -> torch.Tensor:
         )
 
 
+# Spyre has no native scan op (#3388), so cumsum is decomposed by result dtype:
+# fp16/bf16 multiply by a triangular matrix of ones, fp32/int32/int64 run a
+# doubling prefix scan. Every other dtype falls back to CPU.
+#
+# Each path needs the scan dim in a particular position, so it swaps it there
+# and swaps the result back; a swap works on any input, where a reshape would
+# not. Both also copy their input into a plain dense buffer first, because
+# neither can read a sliced one.
+
+# Result dtypes whose scan is a matmul, and all result dtypes that scan on device.
+_CUMSUM_MATMUL_DTYPES = (torch.float16, torch.bfloat16)
+_CUMSUM_SCAN_DTYPES = _CUMSUM_MATMUL_DTYPES + (
+    torch.float32,
+    torch.int32,
+    torch.int64,
+)
+
+
+@register_spyre_decompositions([torch.ops.aten.cumsum.default])
+def spyre_cumsum(
+    x: torch.Tensor,
+    dim: int,
+    dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    if dtype is None:
+        # torch.cumsum accumulates bool and integer inputs in int64.
+        dtype = x.dtype if x.dtype.is_floating_point else torch.int64
+    # A conversion runs on Spyre only if it is native and keeps the element width.
+    on_device = dtype in _CUMSUM_SCAN_DTYPES and (
+        x.dtype == dtype
+        or (
+            DtypeOpTable.is_supported(x.dtype, dtype)
+            and get_elem_in_stick(x.dtype) == get_elem_in_stick(dtype)
+        )
+    )
+    # Raise IndexError like torch.cumsum; eager reaches this decomposition
+    # without the op's own dim check.
+    dim = canonicalize_dim(x.dim(), dim)
+    # A 0-d input has no dim to scan; an empty one has nothing to scan.
+    if not on_device or x.dim() == 0 or x.numel() == 0:
+        return torch.ops.spyre.cumsum_cpu_fallback(x, dim, dtype)
+
+    n = x.shape[dim]
+
+    if dtype in _CUMSUM_MATMUL_DTYPES:
+        # matmul sums along the last dim, so the scan dim goes there and comes
+        # back. Both swaps do nothing when it is already last.
+        upper = torch.triu(torch.ones(n, n, dtype=dtype, device=x.device))
+        operand = torch.ops.aten.clone.default(
+            x.to(dtype).transpose(dim, -1), memory_format=torch.contiguous_format
+        )
+        return torch.ops.aten.matmul(operand, upper).transpose(dim, -1)
+
+    # Shifting only works off the innermost dim. A 1-D input has no other dim,
+    # so it gets one.
+    rank1 = x.dim() == 1
+    moved = x.unsqueeze(-1) if rank1 else x.transpose(dim, -2)
+    result = torch.ops.aten.clone.default(
+        moved.to(dtype), memory_format=torch.contiguous_format
+    )
+    # A shift of n already covers the whole scan, so stop there.
+    offset = 1
+    while offset < n:
+        sliced = torch.ops.aten.slice.Tensor(result, -2, 0, n - offset)
+        # pad takes two values per dim, innermost first; this left-pads dim -2.
+        shifted = torch.ops.aten.constant_pad_nd(sliced, [0, 0, offset, 0], 0)
+        result = result + shifted
+        offset *= 2
+    return result.squeeze(-1) if rank1 else result.transpose(dim, -2)
+
+
 #: Largest kernel tap (per spatial axis) the direct conv2d path accepts. A
 #: dense (groups==1) conv contracts over C_in*kH*kW; that per-output-channel
 #: weight working set grows with k**2 and, at k>3 with a stick-aligned C_in>=64,
@@ -3194,7 +3308,7 @@ def _is_direct_conv_supported(
     NCHW contract) and assumes the direct path will place C_in on the device
     stick. That stick placement is NOT decided here -- it is requested by the
     direct path and enforced downstream in propagate_layouts (_conv_layouts /
-    find_stick_compatible_input_layout), which restickify the activation onto
+    generate_stl_with_required_stick), which restickify the activation onto
     C_in or raise Unsupported if they cannot. So the ``C_in % stick == 0`` check
     below is a precondition of the channel-last layout the path *will request*,
     validated against the channel *count* (which no layout choice changes). The
@@ -3206,7 +3320,10 @@ def _is_direct_conv_supported(
     the im2col+matmul fallback branch is gone (see above) -- a mismatch surfaces
     downstream as a hard Unsupported, not silent wrong numerics.
     """
-    kH, kW = weight_shape[-2], weight_shape[-1]
+    # A rank-3 (conv1d) weight is [C_out, C_in_per_group, K_w], so shape[-2] is
+    # the input-channel count, not a kernel height. For conv1d, kH is always 1
+    kH = 1 if len(weight_shape) == 3 else weight_shape[-2]
+    kW = weight_shape[-1]
     C_in = input_shape[1]
     eps = get_elem_in_stick(torch.float16)
     supported = (
@@ -3215,7 +3332,8 @@ def _is_direct_conv_supported(
         and all(p == 0 for p in padding)
         and all(d == 1 for d in dilation)
         and groups == 1
-        and len(input_shape) == 4
+        # Expand acceptable dim count to include 3 to support conv1d
+        and len(input_shape) in (3, 4)
         and input_dtype == torch.float16
         and not (kH == 1 and kW == 1)
         # Dense conv k>3 overflows the LX contraction budget in the backend.
@@ -3278,6 +3396,166 @@ def _will_lower_conv2d_direct(
     )
 
 
+# Per-band byte limit for the im2col and matmul-output buffers of
+# _conv2d_im2col_matmul. Each band stays well inside the 256 MiB per-core span
+# limit, which the full im2col of a large patch-embed conv exceeds.
+_CONV_IM2COL_BAND_BYTES = 64 << 20
+
+
+def _round_up(value: int, multiple: int) -> int:
+    return (value + multiple - 1) // multiple * multiple
+
+
+def _conv2d_im2col_matmul(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    stride: Sequence[int],
+    padding: Sequence[int],
+    dilation: Sequence[int],
+    groups: int,
+) -> torch.Tensor:
+    """2D convolution as an on-device channel-last im2col and one matmul.
+
+    Every step is a view, pad, permute or cat that lowers on the device, so
+    there is no CPU fallback. A tap (one kernel position (a, b)) can be read as
+    a plain view only along a dim that is not the stick, because slicing the
+    stick dim shifts elements across sticks. So the taps are gathered in two
+    phases, each with a different dim on the stick: the W taps while H is the
+    stick, then the H taps after the channels have become the stick.
+
+    1. Transpose the input to (N, C, W, H) and pad W. Viewing the padded W as
+       (Wq, sW) turns tap ``b``, at column ``sW*ow + dW*b``, into the slice
+       ``[q:q+W_out]`` of phase ``r``, where ``q, r = divmod(dW*b, sW)``.
+       Concatenating the kW taps on the channel dim gives (N, kW*C, W_out, H).
+    2. Pad kW*C to a whole number of sticks, C1, and go channel-last:
+       (N, H, W_out, C1). The H taps are then concatenated on the stick in whole
+       C1 chunks, so no copy lands at a partial-stick offset.
+    3. Multiply the (M, kH*C1) im2col by a (kH*C1, C_out) weight built in the
+       same tap order. Each band of output rows stays under
+       _CONV_IM2COL_BAND_BYTES.
+
+    The weight is a real 2-D buffer built with a cat: viewing a contiguous
+    (kH, kW*C, C_out) as (K, C_out) gives the matmul a K that spans two device
+    dims, which batchmatmul rejects. A grouped conv runs as one dense conv
+    whose weight is zero outside each group's diagonal block.
+
+    When H is 1 (conv1d), the transpose in step 1 would put a one-element dim on
+    the stick. Then each tap's channels are padded to a whole stick instead,
+    and both tap gathers run channel-last.
+
+    Returns a logical NCHW tensor whose storage is channel-last.
+    """
+    N, C, H, W = input.shape
+    C_out, C_in_per_group, K_h, K_w = weight.shape
+    stride_h, stride_w = stride
+    pad_h, pad_w = padding
+    dil_h, dil_w = dilation
+    # A whole fp16/bf16 stick, and two fp32 sticks. get_elem_in_stick cannot
+    # be traced here.
+    stick = STICK
+
+    if groups != 1:
+        C_out_per_group = C_out // groups
+        weight = torch.cat(
+            [
+                torch.constant_pad_nd(
+                    weight[g * C_out_per_group : (g + 1) * C_out_per_group],
+                    (0, 0, 0, 0, g * C_in_per_group, C - (g + 1) * C_in_per_group),
+                )
+                for g in range(groups)
+            ],
+            dim=0,
+        )
+
+    H_out = (H + 2 * pad_h - dil_h * (K_h - 1) - 1) // stride_h + 1
+    W_out = (W + 2 * pad_w - dil_w * (K_w - 1) - 1) // stride_w + 1
+    # Padded extents: whole strides covering the input and every tap.
+    Hq = max(-(-(H + 2 * pad_h) // stride_h), H_out + dil_h * (K_h - 1) // stride_h)
+    Wq = max(-(-(W + 2 * pad_w) // stride_w), W_out + dil_w * (K_w - 1) // stride_w)
+    C_out_p = _round_up(C_out, stick)
+    if C_out_p != C_out:
+        weight = torch.constant_pad_nd(weight, (0, 0, 0, 0, 0, 0, 0, C_out_p - C_out))
+
+    if H == 1:
+        # Pad C to a whole stick, so each tap is C1 = C_p channels.
+        C_p = _round_up(C, stick)
+        x = input
+        if C_p != C:
+            x = torch.constant_pad_nd(x, (0, 0, 0, 0, 0, C_p - C))
+            weight = torch.constant_pad_nd(weight, (0, 0, 0, 0, 0, C_p - C))
+        # contiguous(): with zero spatial padding the pad below is dropped, and
+        # the tap views must then not read through a W-stick permuted view.
+        x = x.permute(0, 2, 3, 1).contiguous()
+        x = torch.constant_pad_nd(
+            x,
+            (0, 0, pad_w, Wq * stride_w - W - pad_w, pad_h, Hq * stride_h - H - pad_h),
+        )
+        xv = x.view(N, Hq * stride_h, Wq, stride_w, C_p)
+        cols = []
+        for b in range(K_w):
+            q, r = divmod(dil_w * b, stride_w)
+            cols.append(xv[:, :, q : q + W_out, r, :])
+        t = torch.cat(cols, dim=-1) if K_w > 1 else cols[0]
+        C1 = K_w * C_p
+        tv = t.view(N, Hq, stride_h, W_out, C1)
+        w_cl = weight.permute(2, 3, 1, 0).contiguous().view(K_h, C1, C_out_p)
+    else:
+        C1 = _round_up(K_w * C, stick)
+        # The W taps read through the input's own H stick, whose device size is
+        # the padded extent rounded up to a stick; keep that a whole number of
+        # strides.
+        if _round_up(Wq * stride_w, stick) % stride_w:
+            Wq = _round_up(Wq * stride_w, math.lcm(stick, stride_w)) // stride_w
+        if _round_up(Hq * stride_h, stick) % stride_h:
+            Hq = _round_up(Hq * stride_h, math.lcm(stick, stride_h)) // stride_h
+        xt = input.transpose(2, 3).contiguous()  # (N, C, W, H)
+        xt = torch.constant_pad_nd(xt, (0, 0, pad_w, Wq * stride_w - W - pad_w))
+        xv = xt.view(N, C, Wq, stride_w, H)
+        cols = []
+        for b in range(K_w):
+            q, r = divmod(dil_w * b, stride_w)
+            cols.append(xv[:, :, q : q + W_out, r, :])
+        t = torch.cat(cols, dim=1) if K_w > 1 else cols[0]  # (N, kW*C, W_out, H)
+        t = torch.constant_pad_nd(t, (0, 0, 0, 0, 0, C1 - K_w * C))
+        tc = t.permute(0, 3, 2, 1).contiguous()  # (N, H, W_out, C1)
+        tc = torch.constant_pad_nd(tc, (0, 0, 0, 0, pad_h, Hq * stride_h - H - pad_h))
+        tv = tc.view(N, Hq, stride_h, W_out, C1)
+        w_cl = weight.permute(2, 3, 1, 0).contiguous().view(K_h, K_w * C, C_out_p)
+        w_cl = torch.constant_pad_nd(w_cl, (0, 0, 0, C1 - K_w * C))
+
+    K = K_h * C1
+    if K_h > 1:
+        weight_2d = torch.cat([w_cl[a] for a in range(K_h)], dim=0)
+    else:
+        # w_cl[0] can still be a view that merges (K_w, C) into K, leaving K two
+        # device dims: always when H == 1, and when H > 1 if K_w * C is whole
+        # sticks so the pad above is dropped. batchmatmul rejects such a K once
+        # C_out is more than one stick (out_reuse_dim.size() == 1). A clone of a
+        # contiguous view is dropped too, so pad and slice to write it through
+        # a real kernel.
+        weight_2d = torch.constant_pad_nd(w_cl[0], (0, 0, 0, stick))[:C1]
+
+    band_bytes = N * W_out * max(K, C_out_p) * input.element_size()
+    rows_per_band = max(1, min(H_out, _CONV_IM2COL_BAND_BYTES // band_bytes))
+    bands = []
+    for h0 in range(0, H_out, rows_per_band):
+        rows = min(rows_per_band, H_out - h0)
+        taps = []
+        for a in range(K_h):
+            q, r = divmod(dil_h * a, stride_h)
+            taps.append(tv[:, q + h0 : q + h0 + rows, r])
+        patches = torch.cat(taps, dim=-1) if K_h > 1 else taps[0].contiguous()
+        band = torch.matmul(patches.reshape(N * rows * W_out, K), weight_2d)
+        bands.append(band.view(N, rows, W_out, C_out_p))
+    output = torch.cat(bands, dim=1) if len(bands) > 1 else bands[0]
+    if C_out_p != C_out:
+        output = torch.constant_pad_nd(output, (0, C_out - C_out_p))
+    if bias is not None:
+        output = output + bias
+    return output.permute(0, 3, 1, 2)
+
+
 @register_spyre_decompositions([torch.ops.aten.convolution.default])
 def conv2d_via_bmm_decomp(
     input: torch.Tensor,
@@ -3291,9 +3569,8 @@ def conv2d_via_bmm_decomp(
     groups: int,
 ) -> torch.Tensor:
     """
-    Decompose 2D convolution into batch matrix multiplication using torch.nn.unfold.
-    torch.nn.unfold directly returns (N, C_in * K_h * K_w, H_out * W_out), avoiding
-    intermediate reshape/view/unsqueeze operations.
+    Decompose 2D convolution into an on-device im2col and one matrix
+    multiplication (see _conv2d_im2col_matmul).
     For depthwise convolutions (C_in = groups = C_out), invoke torch.spyre.conv2d directly.
     """
     # When the direct-lowering flag is on and the case is supported, decline the
@@ -3306,7 +3583,7 @@ def conv2d_via_bmm_decomp(
     #
     # NOTE: this first call passes the *original* input shape, so for a
     # 5-dimensional (Conv3D) input it always returns False -- _is_direct_conv_
-    # supported gates on len(input_shape) == 4. The direct deferral for a
+    # supported gates on len(input_shape) in (3, 4). The direct deferral for a
     # temporal-1 Conv3D is decided later, by the *second* call below on the
     # folded 4D shapes; here a 5D input simply proceeds into the fold branch.
     if _will_lower_conv2d_direct(
@@ -3328,6 +3605,49 @@ def conv2d_via_bmm_decomp(
     if any(op != 0 for op in output_padding):
         raise Unsupported("conv2d_via_bmm: output_padding not supported")
 
+    # conv1d (rank-3 activation) splits by whether it is depthwise.
+    #
+    # Depthwise goes to spyre.conv2d, which handles a rank-3 activation natively.
+    #
+    # The general case (C_in != C_out, or any grouping that is not depthwise) is
+    # direct-lowered at rank 3 too when _is_direct_conv_supported accepts it.
+    #
+    # This function is reached only when direct lowering returns NotImplemented
+    #
+    # That leaves the im2col+matmul fallback, which needs rank 4, so needed expansion
+    # is performed via unsqueeze.
+    if input.dim() == 3:
+        C_in = input.shape[1]
+        C_out = weight.shape[0]
+        if C_in == groups == C_out:
+            return torch.ops.spyre.conv2d_with_bias(
+                input, weight, bias, stride, padding, dilation, groups
+            )
+        if len(stride) != 1 or len(padding) != 1 or len(dilation) != 1:
+            raise Unsupported(
+                f"conv2d_via_bmm: conv1d expects 1-element stride/padding/"
+                f"dilation, got stride={stride}, padding={padding}, "
+                f"dilation={dilation}"
+            )
+        input = input.unsqueeze(2)
+        weight = weight.unsqueeze(2)
+        stride = [1, stride[0]]
+        padding = [0, padding[0]]
+        dilation = [1, dilation[0]]
+        # The trailing reshape below restores rank 4 as (N, C_out, 1, W_out);
+        # squeeze the degenerate height back out so the result matches the
+        # rank-3 shape aten.convolution promises for a 1-D conv.
+        return conv2d_via_bmm_decomp(
+            input,
+            weight,
+            bias,
+            stride,
+            padding,
+            dilation,
+            transposed,
+            output_padding,
+            groups,
+        ).squeeze(2)
     if input.dim() == 5:
         # A Conv3D with a unit temporal (depth) kernel is a *batched* Conv2d:
         # with kD == 1 (and unit depth stride, zero depth pad, unit depth
@@ -3435,12 +3755,7 @@ def conv2d_via_bmm_decomp(
         else:
             # Default row-major fold (W on the stick), the layout the im2col path
             # accepts. Permute D next to N and merge them into the batch. With
-            # N>1 AND D>1 rejected above, the N*D merge is always a squeeze view;
-            # and the im2col path's spyre.unfold already round-trips the
-            # activation through the host (CPU im2col gather), so the fold is
-            # materialised cleanly there -- no on-device relayout copy is needed
-            # on either the activation or the weight. Only the final output
-            # reshape still needs an explicit host round-trip (see out5 below).
+            # N>1 AND D>1 rejected above, the N*D merge is always a squeeze view.
             # activation (N,C,D,H,W) -> view (N,D,C,H,W) -> (N*D,C,H,W).
             x_dchw = torch.permute(input, (0, 2, 1, 3, 4)).contiguous()
             x4 = x_dchw.reshape(N * D, C_in, H_in, W_in)
@@ -3465,43 +3780,17 @@ def conv2d_via_bmm_decomp(
         # recomputing them from the conv geometry, then unfold in the matching
         # layout so the returned logical NCDHW tensor is correct either way.
         _, C_out_o, H_out, W_out = out4.shape
-        if will_direct:
-            # out4 is logical NCHW but physically NHWC-contiguous (C_out on the
-            # stick); make that explicit with a permute+contiguous, then split the
-            # leading N*D back to N,D -- a stick-preserving view -- and permute to
-            # the logical NCDHW result.
-            # view (N*D,H_out,W_out,C_out) -> (N,D,H_out,W_out,C_out)
-            # -> view (N,C_out,D,H_out,W_out).
-            out_cl = torch.permute(out4, (0, 2, 3, 1)).contiguous()
-            out_cl = out_cl.reshape(N, D, H_out, W_out, C_out_o)
-            return torch.permute(out_cl, (0, 4, 1, 2, 3))
-        # Row-major: split the leading N*D back to N,D. This one output reshape
-        # DELIBERATELY keeps the reshape_via_cpu host round-trip; the x4/w4 input
-        # folds above are on-device. Under LX scratchpad planning the row-major
-        # im2col+matmul leaves this output tensor with a stick (innermost) index
-        # of the affine form `2*d2 + d3`, which the work-division pass rejects
-        # (`Unsupported: Unexpected stick expression ..., expected Mod(var, 64),
-        # a bare variable, 0, ...` from _check_stick_expr_supported). Neither a
-        # pure view nor an on-device relayout copy here avoids it
-        # -- both propagate that index, so all six wrapped
-        # test_conv3d_via_conv2d_{grouped,im2col_*} LX-planning cases fail.
-        # Narrowing confirmed the bad stick comes solely from this output layout,
-        # not the input folds. reshape_via_cpu returns a freshly contiguous,
-        # cleanly-stickified buffer (bare-variable stick index), the only form
-        # that keeps the row-major path legal. The limitation is in LX/work-
-        # division stick-expression support, not the fold; until that is lifted
-        # the host trip stays on this single reshape. The direct path (the
-        # common channel-last case) is fully on-device.
-        # TODO: extend torch-spyre work-division stick-expression support
-        # (pass_utils._check_stick_expr_supported / alignment_coordinates) to
-        # represent affine stick indices like `2*d2 + d3`, so an on-device
-        # compact can realize this output and the host round-trip can be dropped.
-        # See
-        # torch-spyre/torch-spyre#5142 (conv3d-fold follow-up).
-        # view (N*D,C_out,H_out,W_out) -> (N,D,C_out,H_out,W_out)
+        # Both inner paths return out4 as logical NCHW over NHWC-contiguous
+        # storage (C_out on the stick): the direct SDSC by construction, and
+        # _conv2d_im2col_matmul because its matmul output is channel-last. Make
+        # that explicit with a permute+contiguous, then split the leading N*D
+        # back to N,D -- a stick-preserving view -- and permute to the logical
+        # NCDHW result.
+        # view (N*D,H_out,W_out,C_out) -> (N,D,H_out,W_out,C_out)
         # -> view (N,C_out,D,H_out,W_out).
-        out5 = torch.ops.spyre.reshape_via_cpu(out4, (N, D, C_out_o, H_out, W_out))
-        return torch.permute(out5, (0, 2, 1, 3, 4))
+        out_cl = torch.permute(out4, (0, 2, 3, 1)).contiguous()
+        out_cl = out_cl.reshape(N, D, H_out, W_out, C_out_o)
+        return torch.permute(out_cl, (0, 4, 1, 2, 3))
 
     if input.dim() != 4:
         raise Unsupported(f"conv2d_via_bmm: expected 4D input, got {input.dim()}D")
@@ -3515,73 +3804,14 @@ def conv2d_via_bmm_decomp(
             input, weight, bias, stride, padding, dilation, groups
         )
 
-    stride_h, stride_w = stride[0], stride[1]
-    pad_h, pad_w = padding[0], padding[1]
-    dil_h, dil_w = dilation[0], dilation[1]
-
     if C_in != groups * C_in_per_group:
         raise Unsupported(
             f"conv2d_via_bmm: expect C_in == groups * C_in_per_group, got C_in: {C_in}, groups: {groups} C_in_per_group: {C_in_per_group}"
         )
 
-    H_out = (H_in + 2 * pad_h - dil_h * (K_h - 1) - 1) // stride_h + 1
-    W_out = (W_in + 2 * pad_w - dil_w * (K_w - 1) - 1) // stride_w + 1
-
-    patches = torch.ops.spyre.unfold(
-        input,
-        kernel_size=(K_h, K_w),
-        dilation=(dil_h, dil_w),
-        padding=(pad_h, pad_w),
-        stride=(stride_h, stride_w),
+    return _conv2d_im2col_matmul(
+        input, weight, bias, stride[:2], padding[:2], dilation[:2], groups
     )
-
-    if groups == 1:
-        # weight_2d = weight.reshape(C_out, C_in_per_group * K_h * K_w)
-        weight_2d = torch.ops.spyre.reshape_via_cpu(
-            weight, (C_out, C_in_per_group * K_h * K_w)
-        )
-        # Broadcast the single 2D weight across the batch with a size-1 batch
-        # dim (unsqueeze only): matmul lowers a size-1 batch as a true
-        # broadcast, so every output batch reads the one weight copy with no
-        # extra memory, matching the grouped path below
-        # (weight_grouped.unsqueeze(0)). The earlier expand(N).clone() was
-        # meant to materialize N copies, but the lowering elides a contiguous
-        # clone of a broadcast view as a no-op, so it allocated nothing; the
-        # size-1 broadcast states that intent directly and drops the dead
-        # clone. Only reached for N > 1, e.g. a temporal-1 Conv3D that folds
-        # N*D into the batch.
-        output = torch.matmul(weight_2d.unsqueeze(0), patches)
-    else:
-        C_out_per_group = C_out // groups
-        # patches = patches.reshape(N, groups, C_in_per_group * K_h * K_w, H_out * W_out)
-        patches = torch.ops.spyre.reshape_via_cpu(
-            patches, (N, groups, C_in_per_group * K_h * K_w, H_out * W_out)
-        )
-        # weight_grouped = weight.reshape(groups, C_out_per_group, C_in_per_group * K_h * K_w)
-        weight_grouped = torch.ops.spyre.reshape_via_cpu(
-            weight, (groups, C_out_per_group, C_in_per_group * K_h * K_w)
-        )
-
-        output = torch.matmul(
-            weight_grouped.unsqueeze(0),
-            patches,
-        )
-        output = output.reshape(N, C_out, H_out * W_out)
-
-    if bias is not None:
-        # Add bias while the output is still (N, C_out, H_out * W_out): the
-        # matmul lays the trailing H_out*W_out dim on the stick, and for a
-        # patch-embed conv (e.g. Prithvi's stride-16 kernel) that flat length
-        # is a multiple of 64 even when H_out/W_out individually are not. If we
-        # instead reshaped to (N, C_out, H_out, W_out) first and broadcast the
-        # bias over a sub-stick spatial width (e.g. W_out == 32), the layout
-        # solver rejects the resulting `w + 32*Mod(row, 2)` stick expression.
-        bias_shaped = torch.ops.spyre.reshape_via_cpu(bias, (1, C_out, 1))
-        output = output + bias_shaped
-
-    output = output.reshape(N, C_out, H_out, W_out)
-
-    return output
 
 
 @register_spyre_decompositions([torch.ops.spyre.conv2d_with_bias.default])
@@ -3607,11 +3837,14 @@ def spyre_conv2d_with_bias_decomp(
 
     # If bias is present, add it
     if bias is not None:
-        # Get output shape
-        N, C_out, H_out, W_out = output.shape
-        # Reshape bias to (1, C_out, 1, 1) then expand to (N, C_out, H_out, W_out)
-        # This avoids stick layout issues by expanding before adding
-        bias_expanded = bias.reshape(1, C_out, 1, 1).expand(N, C_out, H_out, W_out)
+        # Reshape bias to a channel vector with unit spatial dims, then expand to
+        # the output shape; expanding before the add avoids stick layout issues.
+        # The rank follows the output's: 4 for conv2d, 3 for a depthwise conv1d
+        # so the shapes are built from output.shape.
+        out_shape = list(output.shape)
+        C_out = out_shape[1]
+        bias_shape = [1, C_out] + [1] * (len(out_shape) - 2)
+        bias_expanded = bias.reshape(bias_shape).expand(out_shape)
         output = output + bias_expanded
 
     return output
@@ -3670,6 +3903,39 @@ def scaled_mm_decomp(
         logger.warning("scale_result parameter in _scaled_mm is not yet supported")
     if use_fast_accum:
         logger.warning("use_fast_accum parameter in _scaled_mm is not yet supported")
+
+    return result
+
+
+@register_spyre_decompositions([torch.ops.spyre.scaled_bmm])
+def scaled_bmm_decomp(
+    mat1: torch.Tensor,
+    mat2: torch.Tensor,
+    scale_a: torch.Tensor = None,
+    scale_b: torch.Tensor = None,
+    out_dtype: torch.dtype = None,
+    use_fast_accum: bool = False,
+) -> torch.Tensor:
+    """
+    Decompose spyre.scaled_bmm into:
+    1. Raw FP8 batched matmul via spyre.bmm_fp8 (no scales applied)
+    2. Multiply by scale_a, if present
+    3. Multiply by scale_b, if present
+
+    The batched counterpart of scaled_mm_decomp: it keeps the scale arithmetic
+    out of lower_bmm_fp8's matmul lowering, the same separation
+    dequantize_fp8_with_scale_decomp uses for its FP8->FP16 conversion.
+    """
+    result = torch.ops.spyre.bmm_fp8(mat1, mat2, out_dtype=out_dtype)
+
+    if scale_a is not None:
+        result = result * scale_a
+    if scale_b is not None:
+        result = result * scale_b
+
+    if use_fast_accum:
+        # Spyre has no fast 8-bit accumulation path
+        logger.warning("use_fast_accum parameter in scaled_bmm is not supported")
 
     return result
 
@@ -3771,51 +4037,6 @@ def spyre_flip(input: torch.Tensor, dims: Sequence[int]) -> torch.Tensor:
     # aten.flip always returns a fresh tensor; clone so the no-op case does
     # not alias its input.
     return out if reversed_any else out.clone()
-
-
-@register_spyre_decompositions([torch.ops.aten.prod.dim_int])
-def spyre_prod_dim_int(
-    input: torch.Tensor, dim: int, keepdim: bool = False
-) -> torch.Tensor:
-    # All dtypes route through spyre.prod_dim_int.  For int64, lower_prod_dim
-    # uses with_int64_fallback which converts the input to fp32 via one CPU
-    # round-trip before the hardware reduction.  Stick-dim reductions fail at
-    # compile time (NotImplementedError "no mechanism to resolve stick
-    # incompatibility") until ReStickifyOpHBM supports fp32 (issue #2544; the
-    # CPU fallback is to be removed by issue #5126).  Those cases are
-    # expect_fail in test_prod_cpu; remove the entries when the issues land.
-    return torch.ops.spyre.prod_dim_int(input, dim, keepdim)
-
-
-@register_spyre_decompositions([torch.ops.aten.div.Tensor_mode])
-def spyre_div_Tensor_mode(
-    a: TensorLikeType | NumberType, b: TensorLikeType | NumberType, rounding_mode=None
-) -> torch.Tensor:
-    # Wrap scalars because some references only accept tensor arguments.
-    if isinstance(a, Number) and isinstance(b, Number):
-        a = scalar_tensor(a)
-        b = scalar_tensor(b)
-    elif isinstance(b, Number) and isinstance(a, torch.Tensor):
-        b = scalar_tensor(b, dtype=a.dtype, device=a.device)
-    elif isinstance(a, Number) and isinstance(b, torch.Tensor):
-        a = scalar_tensor(a, dtype=b.dtype, device=b.device)
-
-    result = torch.true_divide(a, b)
-
-    if rounding_mode == "floor":
-        result = prims.floor(result)
-    elif rounding_mode == "trunc":
-        result = prims.trunc(result)
-    else:
-        msg = f"div_Tensor_mode expected rounding_mode to be one of None, 'trunc', or 'floor' but found {rounding_mode}."
-        raise ValueError(msg)
-
-    if not (a.dtype.is_floating_point or b.dtype.is_floating_point):
-        if torch.iinfo(b.dtype).bits > torch.iinfo(a.dtype).bits:
-            result = result.to(b.dtype)
-        else:
-            result = result.to(a.dtype)
-    return result
 
 
 @register_spyre_decompositions([torch.ops.aten.fmod.Tensor])

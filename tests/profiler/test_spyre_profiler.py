@@ -15,6 +15,8 @@
 import inspect
 import json
 import math
+import os
+import tempfile
 import unittest
 
 import pytest
@@ -766,6 +768,139 @@ def test_non_collective_activities_have_no_coll_args():
         leaked = [key for key in COLL_ARG_KEYS if key in e.get("args", {})]
         assert not leaked, (
             f"non-collective {e['cat']} event {e.get('name')!r} carries {leaked}"
+        )
+
+
+@pytest.mark.requires_spyre_profiler
+def test_sdsc_bundle_dir_prefix_in_kernel_event_args_with_cache(monkeypatch, tmp_path):
+    """Verify the SDSC bundle directory prefix in the kernel event args when caching is enabled.
+
+    The warm-up run compiles the kernel and commits it to tmp_path/<cache_key>/.
+    The profiled run is a cache hit; the runner receives sdsc_bundle_dir_prefix=cache_key[:16].
+    We verify that prefix appears in every kernel event's args.
+    """
+    import torch_spyre.execution.async_compile as ac
+    import torch_spyre.execution.kernel_cache as kc
+
+    # Redirect the cache root to an isolated tmp_path so parallel runs don't collide.
+    monkeypatch.setattr(kc, "get_cache_root_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(ac._spyre_config, "spyre_kernel_cache", True)
+    torch._dynamo.reset()
+
+    x = torch.randn((10, 10), dtype=torch.float16, device="spyre")
+
+    # Warm-up: compiles and commits the kernel to tmp_path/<cache_key>/
+    _ = torch.add(x, x)
+    torch.spyre.synchronize()
+
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]
+    ) as prof:
+        # Profiled run: cache hit — runner gets sdsc_bundle_dir_prefix=cache_key[:16]
+        _ = torch.add(x, x)
+        torch.spyre.synchronize()
+
+    with TemporaryFileName(mode="w+") as fname:
+        prof.export_chrome_trace(fname)
+        with open(fname) as f:
+            trace = json.load(f)
+
+    events = trace["traceEvents"]
+    assert events, (
+        "No trace events captured; profiler produced an empty traceEvents list"
+    )
+
+    # Collect the first 16 characters of every committed cache-key directory name.
+    # Committed directories are named <cache_key> (a base32-encoded SHA-256 digest); .tmp. dirs are in-progress
+    # and are excluded. The runner receives cache_key[:16] as sdsc_bundle_dir_prefix.
+    sdsc_bundle_dir_prefixes = [
+        entry.name[:16]
+        for entry in os.scandir(str(tmp_path))
+        if entry.is_dir() and ".tmp." not in entry.name and entry.name != "failed"
+    ]
+    kernel_events = [e for e in events if e.get("cat") == "kernel"]
+    assert kernel_events, (
+        "No kernel-category events found in profiler trace; cannot verify sdsc_bundle_dir_prefix"
+    )
+
+    for ke in kernel_events:
+        ke_args = ke.get("args")
+        assert ke_args is not None, f"Kernel event '{ke.get('name')}' has no args field"
+        ke_prefix = ke_args.get("sdsc_bundle_dir_prefix")
+        assert ke_prefix is not None, (
+            f"Kernel event '{ke.get('name')}' args missing 'sdsc_bundle_dir_prefix' key"
+        )
+        assert ke_prefix in sdsc_bundle_dir_prefixes, (
+            f"Kernel event '{ke.get('name')}' has sdsc_bundle_dir_prefix '{ke_prefix}' "
+            f"not found in {sdsc_bundle_dir_prefixes}"
+        )
+
+
+@pytest.mark.requires_spyre_profiler
+def test_sdsc_bundle_dir_prefix_in_kernel_event_args_without_cache(
+    monkeypatch, tmp_path
+):
+    """Verify the SDSC bundle directory prefix in the kernel event args when caching is disabled"""
+    import torch_spyre.execution.async_compile as ac
+
+    sdsc_bundle_dir_path = str(tmp_path)
+
+    def patched_get_output_dir(kernel_name, sdsc_bundle_dir_prefix=None):
+        # Mirrors ac.get_output_dir but creates the directory under tmp_path.
+        return tempfile.mkdtemp(
+            dir=sdsc_bundle_dir_path,
+            prefix=f"{sdsc_bundle_dir_prefix}_{ac._safe_kernel_name(kernel_name)}_",
+        )
+
+    monkeypatch.setattr(ac._spyre_config, "spyre_kernel_cache", False)
+    monkeypatch.setattr(ac, "get_output_dir", patched_get_output_dir)
+    torch._dynamo.reset()
+
+    x = torch.randn((10, 10), dtype=torch.float16, device="spyre")
+
+    _ = torch.add(x, x)
+    torch.spyre.synchronize()
+
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]
+    ) as prof:
+        _ = torch.add(x, x)
+        torch.spyre.synchronize()
+
+    with TemporaryFileName(mode="w+") as fname:
+        prof.export_chrome_trace(fname)
+        with open(fname) as f:
+            trace = json.load(f)
+
+    events = trace["traceEvents"]
+    assert events, (
+        "No trace events captured; profiler produced an empty traceEvents list"
+    )
+
+    # Directory names are "<prefix>_<kernel>_<random suffix>". On the no-cache path, the prefix
+    # is the first 8 hex characters of UUID which never contains the '_' delimiter.
+    # If the prefix format changes to include it, update the parsing that recover the prefixes
+    # in order to avoid the test failure.
+    sdsc_bundle_dir_prefixes = [
+        os.path.basename(entry.path).split("_")[0]
+        for entry in os.scandir(sdsc_bundle_dir_path)
+        if entry.is_dir()
+    ]
+    kernel_events = [e for e in events if e.get("cat") == "kernel"]
+    assert kernel_events, (
+        "No kernel-category events found in profiler trace; cannot verify sdsc_bundle_dir_prefix"
+    )
+
+    for ke in kernel_events:
+        ke_args = ke.get("args")
+        assert ke_args is not None, f"Kernel event '{ke.get('name')}' has no args field"
+        ke_prefix = ke_args.get("sdsc_bundle_dir_prefix")
+        assert ke_prefix is not None, (
+            f"Kernel event '{ke.get('name')}' args missing 'sdsc_bundle_dir_prefix' key"
+        )
+        assert ke_prefix in sdsc_bundle_dir_prefixes, (
+            f"Kernel event '{ke.get('name')}' has sdsc_bundle_dir_prefix '{ke_prefix}' "
+            f"not found in {sdsc_bundle_dir_prefixes}"
         )
 
 
@@ -1748,3 +1883,450 @@ def test_runtime_events_emitted_on_multiple_thread_rows():
         f"Runtime events all landed on tid(s) {sorted(runtime_tids)}; "
         "expected more than one thread row"
     )
+
+
+_RUNTIME_DEVICE_PAIRS = {
+    "aiuLaunchDMIControlBlocks": ("gpu_memcpy", "HtoD"),
+    "aiuLaunchDMOControlBlocks": ("gpu_memcpy", "DtoH"),
+    "aiuLaunchControlBlocks": ("kernel", None),
+}
+
+
+def _find_runtime_device_pair_errors(events):
+    """Find invalid runtime-to-device event pairs using correlation IDs."""
+    runtime_events = []
+    errors = []
+    runtime_correlations = set()
+
+    for runtime_event in events:
+        if not isinstance(runtime_event, dict):
+            continue
+        if runtime_event.get("cat") != "privateuse1_runtime":
+            continue
+
+        runtime_name = runtime_event.get("name")
+        if runtime_name not in _RUNTIME_DEVICE_PAIRS:
+            continue
+
+        runtime_events.append(runtime_event)
+
+        runtime_args = runtime_event.get("args") or {}
+        correlation = runtime_args.get("correlation")
+
+        if correlation is None:
+            errors.append(f"{runtime_name}: missing correlation ID")
+            continue
+
+        if correlation in runtime_correlations:
+            errors.append(f"duplicate runtime correlation ID {correlation}")
+            continue
+
+        runtime_correlations.add(correlation)
+
+        expected_cat, expected_call = _RUNTIME_DEVICE_PAIRS[runtime_name]
+
+        correlated_device_events = []
+
+        for device_event in events:
+            if not isinstance(device_event, dict):
+                continue
+            if device_event.get("cat") not in {"kernel", "gpu_memcpy"}:
+                continue
+
+            device_args = device_event.get("args") or {}
+            if device_args.get("correlation") == correlation:
+                correlated_device_events.append(device_event)
+
+        if not correlated_device_events:
+            errors.append(
+                f"{runtime_name} correlation {correlation}: no correlated device event"
+            )
+            continue
+
+        if len(correlated_device_events) > 1:
+            errors.append(
+                f"{runtime_name} correlation {correlation}: "
+                f"found {len(correlated_device_events)} correlated device events"
+            )
+            continue
+
+        correct_type = [
+            event
+            for event in correlated_device_events
+            if event.get("cat") == expected_cat
+        ]
+
+        if not correct_type:
+            actual_types = ", ".join(
+                event.get("cat", "unknown") for event in correlated_device_events
+            )
+            errors.append(
+                f"{runtime_name} correlation {correlation}: "
+                f"expected {expected_cat}, found {actual_types}"
+            )
+            continue
+
+        matching_events = correct_type
+
+        if expected_call is not None:
+            matching_events = [
+                event
+                for event in correct_type
+                if (event.get("args") or {}).get("call") == expected_call
+            ]
+
+            if not matching_events:
+                actual_calls = ", ".join(
+                    str((event.get("args") or {}).get("call")) for event in correct_type
+                )
+                errors.append(
+                    f"{runtime_name} correlation {correlation}: "
+                    f"expected memcpy direction {expected_call}, "
+                    f"found {actual_calls}"
+                )
+                continue
+
+        if len(matching_events) > 1:
+            errors.append(
+                f"{runtime_name} correlation {correlation}: "
+                f"found {len(matching_events)} matching device events"
+            )
+            continue
+
+        device_event = matching_events[0]
+
+        # Kernel timestamp ordering is covered by the shifted timestamp validation.
+        if runtime_name == "aiuLaunchControlBlocks":
+            continue
+
+        runtime_ts = runtime_event.get("ts")
+        device_ts = device_event.get("ts")
+
+        runtime_ts_valid = (
+            isinstance(runtime_ts, (int, float))
+            and not isinstance(runtime_ts, bool)
+            and math.isfinite(runtime_ts)
+        )
+        device_ts_valid = (
+            isinstance(device_ts, (int, float))
+            and not isinstance(device_ts, bool)
+            and math.isfinite(device_ts)
+        )
+
+        if not runtime_ts_valid:
+            errors.append(
+                f"{runtime_name} correlation {correlation}: "
+                f"invalid runtime timestamp {runtime_ts}"
+            )
+            continue
+
+        if not device_ts_valid:
+            errors.append(
+                f"{runtime_name} correlation {correlation}: "
+                f"invalid device timestamp {device_ts}"
+            )
+            continue
+
+        if device_ts < runtime_ts:
+            errors.append(
+                f"{runtime_name} correlation {correlation}: "
+                f"device event starts before runtime launch "
+                f"({device_ts} < {runtime_ts})"
+            )
+
+    return runtime_events, errors
+
+
+def test_runtime_device_correlation_pairs():
+    """Verify valid runtime launches map to the expected device events."""
+    events = [
+        {
+            "cat": "privateuse1_runtime",
+            "name": "aiuLaunchDMIControlBlocks",
+            "ts": 100,
+            "args": {"correlation": 10},
+        },
+        {
+            "cat": "gpu_memcpy",
+            "name": "Memcpy (HtoD)",
+            "ts": 110,
+            "args": {"correlation": 10, "call": "HtoD"},
+        },
+        {
+            "cat": "privateuse1_runtime",
+            "name": "aiuLaunchControlBlocks",
+            "ts": 120,
+            "args": {"correlation": 11},
+        },
+        {
+            "cat": "kernel",
+            "name": "synthetic_kernel",
+            "ts": 130,
+            "args": {"correlation": 11},
+        },
+        {
+            "cat": "privateuse1_runtime",
+            "name": "aiuLaunchDMOControlBlocks",
+            "ts": 140,
+            "args": {"correlation": 12},
+        },
+        {
+            "cat": "gpu_memcpy",
+            "name": "Memcpy (DtoH)",
+            "ts": 150,
+            "args": {"correlation": 12, "call": "DtoH"},
+        },
+        {
+            "cat": "gpu_memset",
+            "name": "Memset (Device)",
+            "ts": 105,
+            "args": {"correlation": 0},
+        },
+        {
+            "cat": "cpu_op",
+            "name": "aten::matmul",
+            "ts": 90,
+            "args": {},
+        },
+    ]
+
+    runtime_events, errors = _find_runtime_device_pair_errors(events)
+
+    assert len(runtime_events) == 3
+    assert errors == []
+
+
+@pytest.mark.parametrize(
+    ("events", "expected_error"),
+    [
+        (
+            [
+                {
+                    "cat": "privateuse1_runtime",
+                    "name": "aiuLaunchDMIControlBlocks",
+                    "ts": 100,
+                    "args": {"correlation": 20},
+                }
+            ],
+            "no correlated device event",
+        ),
+        (
+            [
+                {
+                    "cat": "privateuse1_runtime",
+                    "name": "aiuLaunchDMIControlBlocks",
+                    "ts": 100,
+                    "args": {"correlation": 30},
+                },
+                {
+                    "cat": "gpu_memcpy",
+                    "name": "Memcpy (HtoD)",
+                    "ts": 110,
+                    "args": {"correlation": 31, "call": "HtoD"},
+                },
+            ],
+            "no correlated device event",
+        ),
+        (
+            [
+                {
+                    "cat": "privateuse1_runtime",
+                    "name": "aiuLaunchDMIControlBlocks",
+                    "ts": 100,
+                    "args": {"correlation": 40},
+                },
+                {
+                    "cat": "kernel",
+                    "name": "wrong_device_type",
+                    "ts": 110,
+                    "args": {"correlation": 40},
+                },
+            ],
+            "expected gpu_memcpy, found kernel",
+        ),
+        (
+            [
+                {
+                    "cat": "privateuse1_runtime",
+                    "name": "aiuLaunchDMIControlBlocks",
+                    "ts": 100,
+                    "args": {"correlation": 50},
+                },
+                {
+                    "cat": "gpu_memcpy",
+                    "name": "Memcpy (DtoH)",
+                    "ts": 110,
+                    "args": {"correlation": 50, "call": "DtoH"},
+                },
+            ],
+            "expected memcpy direction HtoD",
+        ),
+        (
+            [
+                {
+                    "cat": "privateuse1_runtime",
+                    "name": "aiuLaunchDMIControlBlocks",
+                    "ts": 200,
+                    "args": {"correlation": 60},
+                },
+                {
+                    "cat": "gpu_memcpy",
+                    "name": "Memcpy (HtoD)",
+                    "ts": 190,
+                    "args": {"correlation": 60, "call": "HtoD"},
+                },
+            ],
+            "device event starts before runtime launch",
+        ),
+        (
+            [
+                {
+                    "cat": "privateuse1_runtime",
+                    "name": "aiuLaunchControlBlocks",
+                    "ts": 100,
+                    "args": {},
+                }
+            ],
+            "missing correlation ID",
+        ),
+        (
+            [
+                {
+                    "cat": "privateuse1_runtime",
+                    "name": "aiuLaunchDMIControlBlocks",
+                    "ts": 100,
+                    "args": {"correlation": 80},
+                },
+                {
+                    "cat": "privateuse1_runtime",
+                    "name": "aiuLaunchDMIControlBlocks",
+                    "ts": 105,
+                    "args": {"correlation": 80},
+                },
+                {
+                    "cat": "gpu_memcpy",
+                    "name": "Memcpy (HtoD)",
+                    "ts": 110,
+                    "args": {"correlation": 80, "call": "HtoD"},
+                },
+            ],
+            "duplicate runtime correlation ID 80",
+        ),
+        (
+            [
+                {
+                    "cat": "privateuse1_runtime",
+                    "name": "aiuLaunchDMIControlBlocks",
+                    "ts": float("nan"),
+                    "args": {"correlation": 81},
+                },
+                {
+                    "cat": "gpu_memcpy",
+                    "name": "Memcpy (HtoD)",
+                    "ts": 110,
+                    "args": {"correlation": 81, "call": "HtoD"},
+                },
+            ],
+            "invalid runtime timestamp",
+        ),
+        (
+            [
+                {
+                    "cat": "privateuse1_runtime",
+                    "name": "aiuLaunchDMIControlBlocks",
+                    "ts": 100,
+                    "args": {"correlation": 82},
+                },
+                {
+                    "cat": "gpu_memcpy",
+                    "name": "Memcpy (HtoD)",
+                    "ts": float("inf"),
+                    "args": {"correlation": 82, "call": "HtoD"},
+                },
+            ],
+            "invalid device timestamp",
+        ),
+        (
+            [
+                {
+                    "cat": "privateuse1_runtime",
+                    "name": "aiuLaunchDMIControlBlocks",
+                    "ts": 100,
+                    "args": {"correlation": 83},
+                },
+                {
+                    "cat": "gpu_memcpy",
+                    "name": "Memcpy (HtoD)",
+                    "ts": 110,
+                    "args": {"correlation": 83, "call": "HtoD"},
+                },
+                {
+                    "cat": "kernel",
+                    "name": "unexpected_kernel",
+                    "ts": 120,
+                    "args": {"correlation": 83},
+                },
+            ],
+            "found 2 correlated device events",
+        ),
+    ],
+)
+def test_runtime_device_correlation_pair_errors(events, expected_error):
+    """Verify invalid runtime-to-device correlation pairs are rejected."""
+    _, errors = _find_runtime_device_pair_errors(events)
+
+    assert len(errors) == 1
+    assert expected_error in errors[0]
+
+
+@pytest.mark.requires_spyre_profiler
+def test_runtime_device_correlation_on_trace(tmp_path):
+    """Verify Spyre runtime-to-device correlation validation on a hardware trace."""
+    trace_file = tmp_path / "runtime_device_correlation_trace.json"
+
+    x_cpu = torch.randn((64, 64), dtype=torch.float16)
+    y_cpu = torch.randn((64, 64), dtype=torch.float16)
+
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]
+    ) as prof:
+        x = x_cpu.to("spyre")
+        y = y_cpu.to("spyre")
+        result = torch.matmul(x, y)
+        result = F.gelu(result)
+        result = torch.sum(result)
+        result.cpu()
+        torch.spyre.synchronize()
+
+    prof.export_chrome_trace(str(trace_file))
+
+    assert trace_file.exists(), "Chrome trace file was not created"
+
+    with trace_file.open("r", encoding="utf-8") as trace:
+        trace_data = json.load(trace)
+
+    assert isinstance(trace_data, dict), "Trace JSON must be a dictionary"
+    assert "traceEvents" in trace_data, "Chrome trace is missing the 'traceEvents' key"
+
+    trace_events = trace_data["traceEvents"]
+    assert isinstance(trace_events, list), "'traceEvents' must contain a list"
+
+    runtime_events, errors = _find_runtime_device_pair_errors(trace_events)
+
+    runtime_names = {event.get("name") for event in runtime_events}
+    expected_runtime_names = {
+        "aiuLaunchDMIControlBlocks",
+        "aiuLaunchDMOControlBlocks",
+        "aiuLaunchControlBlocks",
+    }
+
+    assert expected_runtime_names.issubset(runtime_names), (
+        "Expected all Spyre runtime launch types for runtime/device correlation "
+        f"validation; missing: {sorted(expected_runtime_names - runtime_names)}"
+    )
+
+    if errors:
+        pytest.fail(
+            f"{len(errors)} invalid Spyre runtime/device pair(s) detected:\n"
+            + "\n".join(errors[:10])
+        )

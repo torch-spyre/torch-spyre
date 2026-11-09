@@ -104,6 +104,8 @@ class _FakeLayout:
         self.stride_map = [64, 256, 1]
         self.device_dtype = DataFormats.SEN169_FP16
         self.element_arrangement = ElementArrangement.STANDARD
+        # Host (128, 256): dim 1 is the 128 rows; dims 0 and 2 hold the columns.
+        self.valid_elements = {(0, 2): 256, (1,): 128}
 
 
 class _FakeTensor:
@@ -374,7 +376,9 @@ def test_bundling_a_pool_spec_emits_the_pool_allocation(tmp_path):
     a pool symbol. So this fails on a lab that forgets to forward the size, where
     a mocked ``generate_bundle`` would happily record the call and pass.
     """
-    with spyre_config.patch(bundle_symbolic_args=True):  # type: ignore[attr-defined]
+    with spyre_config.patch(  # type: ignore[attr-defined]
+        bundle_symbolic_args=True, frontend_pool_allocation=False
+    ):
         listing = runner.bundle_op_specs(
             "k", [_pool_op()], str(tmp_path), pool_size=32768
         )
@@ -492,6 +496,7 @@ def test_record_args_records_the_layout_of_every_arg():
     assert len(rec.args) == 3
     assert rec.args[0].device_dtype_name == "SEN169_FP16"
     assert rec.args[0].element_arrangement_name == "STANDARD"
+    assert rec.args[0].valid_elements == {(0, 2): 256, (1,): 128}
     assert all(a.values is None for a in rec.args)
 
 

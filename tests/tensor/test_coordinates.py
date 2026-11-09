@@ -41,9 +41,12 @@ from torch_spyre._inductor.propagate_layouts import (
     PropArg,
     _check_supported_input_sticks,
     _find_alt_target_stl,
-    find_stick_compatible_input_layout,
+    generate_stl_with_required_stick,
 )
 from torch_spyre._inductor.views import (
+    _compute_coordinates_memo,
+    _compute_coordinates_uncached,
+    _coordinates_memo_key,
     _decompose_constant_offset,
     align_tensors,
     compute_coordinates,
@@ -567,6 +570,90 @@ class TestCoordinates(TestCase):
             )
 
 
+class TestComputeCoordinatesMemo(TestCase):
+    """compute_coordinates is memoized on its arguments; a hit must be
+    indistinguishable from computing the answer again."""
+
+    def setUp(self):
+        _compute_coordinates_memo.cache_clear()
+
+    def _mixed_radix_call(self, repeat_info):
+        lq, hd = sympy.symbols("lq hd", integer=True, nonnegative=True)
+        return compute_coordinates(
+            [1, 32, 64, 128],
+            [262144, 8192, 128, 1],
+            {lq: 64, hd: 4096},
+            128 * lq
+            + 8192 * ModularIndexing(hd, 128, 32)
+            + ModularIndexing(hd, 1, 128),
+            repeat_info_out=repeat_info,
+        )
+
+    def test_a_hit_returns_what_the_uncached_call_returns(self):
+        lq, hd = sympy.symbols("lq hd", integer=True, nonnegative=True)
+        args = (
+            [1, 32, 64, 128],
+            [262144, 8192, 128, 1],
+            {lq: 64, hd: 4096},
+            128 * lq
+            + 8192 * ModularIndexing(hd, 128, 32)
+            + ModularIndexing(hd, 1, 128),
+        )
+        with V.set_graph_handler(SimpleNamespace()):
+            expected_info: dict = {}
+            expected = _compute_coordinates_uncached(*args, None, expected_info)
+            first_info: dict = {}
+            first = self._mixed_radix_call(first_info)
+            second_info: dict = {}
+            second = self._mixed_radix_call(second_info)
+        self.assertEqual(first, expected)
+        self.assertEqual(second, expected)
+        self.assertEqual(first_info, expected_info)
+        self.assertEqual(second_info, expected_info)
+        info = _compute_coordinates_memo.cache_info()
+        self.assertEqual((info.misses, info.hits), (1, 1))
+
+    def test_each_caller_gets_its_own_list_and_repeat_info(self):
+        with V.set_graph_handler(SimpleNamespace()):
+            first_info: dict = {}
+            first = self._mixed_radix_call(first_info)
+            expected, expected_info = list(first), repr(first_info)
+            # Callers edit what they are handed; the memo must not see it.
+            first[0] = sympy.Symbol("edited")
+            for info in first_info.values():
+                info["kind"] = "edited"
+                for digit in info.get("digits", ()):
+                    digit["coeff"] = -1
+            second_info: dict = {}
+            second = self._mixed_radix_call(second_info)
+        self.assertEqual(second, expected)
+        self.assertEqual(repr(second_info), expected_info)
+
+    def test_an_error_is_raised_every_time_and_not_memoized(self):
+        for _ in range(2):
+            with self.assertRaisesRegex(Unsupported, "runs backwards"):
+                compute_coordinates(
+                    [4, 64], [64, 1], {p0: 4, p1: 64}, 192 - 64 * p0 + p1
+                )
+        self.assertEqual(_compute_coordinates_memo.cache_info().currsize, 0)
+
+    def test_graph_dependent_calls_are_not_memoized(self):
+        # A symbolic range or a dynamic size symbol is compared through
+        # V.graph's size hints, so the arguments alone do not decide the result.
+        s0 = sympy.Symbol("s0", integer=True, positive=True)
+        self.assertIsNone(
+            _coordinates_memo_key(
+                [4, 64], [64, 1], {p0: s0, p1: 64}, 64 * p0 + p1, None
+            )
+        )
+        self.assertIsNone(
+            _coordinates_memo_key([4, 64], [64, 1], {p1: 64}, 64 * s0 + p1, None)
+        )
+        self.assertIsNotNone(
+            _coordinates_memo_key([4, 64], [64, 1], {p0: 4, p1: 64}, 64 * p0 + p1, None)
+        )
+
+
 class TestAlignTensorsStridedTerm(TestCase):
     """A coordinate that steps over a device dim (``2*d1``) must keep the dim's
     footprint exact (issue #4050).
@@ -725,8 +812,18 @@ class TestUnrepresentableStickCandidates(TestCase):
         dev = self._dtype()
         d0, d1, d2 = sympy.symbols("d0 d1 d2", integer=True, nonnegative=True)
         dep = MemoryDep("buf", 4096 * d0 + d2, (d0, d1, d2), (512, 4096, 4096))
-        bad = SpyreTensorLayout([512, 128, 1, 1, 64], [4096, 1, 8192, -1, 128], dev)
-        good = SpyreTensorLayout([512, 1, 1, 64], [4096, -1, -1, 1], dev)
+        bad = SpyreTensorLayout(
+            [512, 128, 1, 1, 64],
+            [4096, 1, 8192, -1, 128],
+            dev,
+            {(0,): 512, (1,): 128, (3,): 1, (2, 4): 64},
+        )
+        good = SpyreTensorLayout(
+            [512, 1, 1, 64],
+            [4096, -1, -1, 1],
+            dev,
+            {(0,): 512, (1, 3): 1, (2,): 1},
+        )
         return dep, bad, good
 
     def test_device_coordinates_raises_try_returns_none(self):
@@ -844,6 +941,7 @@ class TestFactorizedMatmulCandidates(TestCase):
                 [64, 2, 32, 64],
                 [4096, 64, 128, 1],
                 get_device_dtype(torch.float16),
+                {(0,): 64, (2,): 32, (1, 3): 128},
             )
         else:
             source = SpyreTensorLayout(
@@ -857,7 +955,12 @@ class TestFactorizedMatmulCandidates(TestCase):
     def test_canonicalization_is_independent_of_candidate_order(self):
         """Canonical layout is returned regardless of candidate list order."""
         dtype = get_device_dtype(torch.float16)
-        factorized = SpyreTensorLayout([8, 2, 32, 64], [4096, 64, 128, 1], dtype)
+        factorized = SpyreTensorLayout(
+            [8, 2, 32, 64],
+            [4096, 64, 128, 1],
+            dtype,
+            {(0,): 8, (2,): 32, (1, 3): 128},
+        )
         canonical = SpyreTensorLayout(
             [1, 8, 4096], [32768, 4096, 1], torch.float16, [0, 1, 2]
         )
@@ -865,7 +968,7 @@ class TestFactorizedMatmulCandidates(TestCase):
         for layouts in ([factorized, canonical], [canonical, factorized]):
             with self.subTest(first=layouts[0]):
                 arg, contraction = self._scenario(layouts)
-                result = find_stick_compatible_input_layout(
+                result = generate_stl_with_required_stick(
                     arg, contraction, BATCH_MATMUL_OP, "x"
                 )
                 self.assertEqual(result, canonical)
@@ -880,7 +983,7 @@ class TestFactorizedMatmulCandidates(TestCase):
             [0, 1, 2],
         )
 
-        result = find_stick_compatible_input_layout(
+        result = generate_stl_with_required_stick(
             arg, contraction, BATCH_MATMUL_OP, "x"
         )
 
@@ -910,7 +1013,7 @@ class TestFactorizedMatmulCandidates(TestCase):
                 contraction_range=arg.dep.ranges[contraction],
             ):
                 with self.assertRaisesRegex(Unsupported, "contiguous host dimension"):
-                    find_stick_compatible_input_layout(
+                    generate_stl_with_required_stick(
                         arg, contraction, BATCH_MATMUL_OP, "x"
                     )
 
@@ -925,7 +1028,7 @@ class TestFactorizedMatmulCandidates(TestCase):
         arg, contraction, _ = self._same_graph_attention_scenario(
             contraction_range=2048
         )
-        result = find_stick_compatible_input_layout(
+        result = generate_stl_with_required_stick(
             arg, contraction, BATCH_MATMUL_OP, "x"
         )
         self.assertEqual(list(result.device_size), [64, 64, 1, 64])
@@ -960,7 +1063,7 @@ class TestFactorizedMatmulCandidates(TestCase):
         dep = MemoryDep(
             "x", 4096 * outer + contraction, (outer, contraction), (heads // 32, 4096)
         )
-        result = find_stick_compatible_input_layout(
+        result = generate_stl_with_required_stick(
             PropArg(dep, host, [source]), contraction, BATCH_MATMUL_OP, "x"
         )
         self.assertEqual(list(result.device_size), [1, 128, 1, 64])
@@ -969,14 +1072,16 @@ class TestFactorizedMatmulCandidates(TestCase):
     def test_nonstandard_matmul_layout_is_not_canonicalized(self):
         """Non-STANDARD formats are returned unchanged by Pass 3."""
         dtype = get_device_dtype(torch.float16)
+        _ds = [8, 2, 32, 64]
         qfp8wt = SpyreTensorLayout(
-            [8, 2, 32, 64],
+            _ds,
             [4096, 64, 128, 1],
             dtype,
+            {(i,): _ds[i] for i in range(len(_ds))},
             ElementArrangement.QFP8WT,
         )
         arg, contraction = self._scenario([qfp8wt])
-        result = find_stick_compatible_input_layout(
+        result = generate_stl_with_required_stick(
             arg, contraction, BATCH_MATMUL_FP8_OP, "x"
         )
         self.assertEqual(result, qfp8wt)
@@ -1222,11 +1327,13 @@ class TestFlatDenseProjectionLayout(TestCase):
             [seq, heads, 1, B, 64],
             [K, head_dim, head_dim, seq * K, 1],
             get_device_dtype(torch.float16),
+            {(0,): seq, (1, 4): K, (2,): 1, (3,): B},
         )
         weight = SpyreTensorLayout(
             [heads, K, 64],
             [head_dim * N, 1, K],
             get_device_dtype(torch.float16),
+            {(0,): heads, (1,): K, (2,): 64},
         )
         x = PropArg(x_dep, x_host, [source])
         y = PropArg(y_dep, y_host, [weight])
@@ -1261,6 +1368,7 @@ class TestFlatDenseProjectionLayout(TestCase):
             [seq, heads, 1, B, 32],
             [K, head_dim, head_dim, seq * K, 1],
             get_device_dtype(torch.float32),
+            {(0,): seq, (1,): heads, (2,): 1, (3,): B, (4,): 32},
         )
         fp32_x = PropArg(
             x_dep,
@@ -1316,11 +1424,13 @@ class TestFlatDenseProjectionLayout(TestCase):
             [12, M, B, 64],
             [64, K, M * K, 1],
             get_device_dtype(torch.float16),
+            {(0, 3): K, (1,): M, (2,): B},
         )
         weight = SpyreTensorLayout(
             [12, K, B, 64],
             [64, N, K * N, 1],
             get_device_dtype(torch.float16),
+            {(0, 3): K, (1,): K, (2,): B},
         )
         x = PropArg(x_dep, x_host, [source])
         y = PropArg(y_dep, y_host, [weight])

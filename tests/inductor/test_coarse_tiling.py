@@ -88,6 +88,7 @@ from torch_spyre._inductor.wsr.coarse_tile import (
     _retile_load_index,
     _should_patch_retiled_load_indexes,
     _squeezed_retile_dims,
+    _undivided_ranges,
     coarse_tile_post_stickify,
     plan_coarse_tile_groups,
     reduction_loop_vars,
@@ -98,9 +99,9 @@ from torch_spyre._inductor.wsr.tile_prediction import (
 )
 from torch_spyre._inductor.scratchpad import coarse_tiling as coarse_tiling_module
 from torch_spyre._inductor.scratchpad.coarse_tiling import (
-    CoarseTilingPass,
     _derive_group_idx_offset,
     _derive_hint_id_base,
+    apply_tilings,
     derive_tiling_groups,
     tile_spec_to_dim_hints,
     try_resolve_tile_axis_loop_vars,
@@ -129,7 +130,11 @@ from torch_spyre._inductor.wsr.tile import (
     compute_tile_index,
     compute_tile_stride,
 )
-from utils_inductor import ir_computed_buffer, ir_input_loader
+from utils_inductor import (
+    ir_computed_buffer,
+    ir_input_loader,
+    patch_tiling_helper,
+)
 
 _FP16 = DataFormats.SEN169_FP16
 
@@ -1516,6 +1521,184 @@ class TestRetileLoadIndexWithConsumer(unittest.TestCase):
             self.assertEqual(simplify(result - full_scale), 0)
 
 
+class TestPatchConsumersReadsThroughFullBuffer(unittest.TestCase):
+    """An outside consumer redirected to a copy-out buffer derives its load
+    index from that buffer's layout, not from the producer's tile.
+
+    The producer, 64 x 64 x 128, is divided to one row per trip, so its own
+    layout becomes (1, 64, 128), and a consumer traced against it would lose
+    its row term. After the redirect each
+    consumer's index must equal its index before the division, on the full
+    buffer's name, and the producer must be the tile again afterwards.
+    """
+
+    FULL = [64, 64, 128]
+    STRIDE = [8192, 128, 1]
+
+    def setUp(self):
+        gm = fx.symbolic_trace(lambda: None)
+        self._graph_ctx = V.set_graph_handler(GraphLowering(gm))
+        self._graph_ctx.__enter__()
+        load_x = ir_input_loader("x", self.FULL)
+        # A producer that reads nothing is inlined into its consumers by
+        # ComputedBuffer.make_loader instead of being loaded by name.
+        self.load0, self.buf0 = ir_computed_buffer(
+            "buf0", self.FULL, lambda i: load_x(i)
+        )
+        self.buf0.dim_hints = ()
+        ir_input_loader("full", self.FULL)
+        self.full = V.graph.name_to_buffer["full"]
+        self.d0, self.d1, self.d2 = (sympy_index_symbol(f"d{i}") for i in range(3))
+
+    def tearDown(self):
+        self._graph_ctx.__exit__(None, None, None)
+
+    @staticmethod
+    def _indexes(op, name):
+        from torch_spyre._inductor.pass_utils import invalidate_op_read_writes
+
+        invalidate_op_read_writes(op)
+        return [r.index for r in op.get_read_writes().reads if r.name == name]
+
+    def _redirect(self, consumers, tiled_dims=(0,), loop_count=64):
+        """Indexes of ``buf0`` before the division, and of ``full`` after the
+        redirect, keyed by consumer name."""
+        before = {c.get_name(): self._indexes(c, "buf0") for c in consumers}
+        _divide_ranges(self.buf0, Integer(loop_count), list(tiled_dims))
+        operations = list(consumers)
+        _patch_consumers(
+            consumers,
+            "buf0",
+            "full",
+            operations,
+            producer_layout=self.buf0.layout,
+            read_layout=self.full.layout,
+        )
+        after = {op.get_name(): self._indexes(op, "full") for op in operations}
+        return before, after
+
+    def test_an_in_step_read_keeps_its_row_term(self):
+        _, c = ir_computed_buffer("c", self.FULL, lambda i: self.load0(i))
+
+        before, after = self._redirect([c])
+
+        self.assertEqual(after["c"], [8192 * self.d0 + 128 * self.d1 + self.d2])
+        self.assertEqual(after, before)
+
+    def test_a_broadcast_read_stays_a_broadcast(self):
+        _, c = ir_computed_buffer("c", self.FULL, lambda i: self.load0([0, i[1], i[2]]))
+
+        before, after = self._redirect([c])
+
+        self.assertEqual(after["c"], [128 * self.d1 + self.d2])
+        self.assertEqual(after, before)
+
+    def test_permuted_stepped_and_offset_reads_are_addressed_as_before(self):
+        _, permuted = ir_computed_buffer(
+            "permuted", self.FULL, lambda i: self.load0([i[1], i[0], i[2]])
+        )
+        _, stepped = ir_computed_buffer(
+            "stepped", [32, 64, 128], lambda i: self.load0([2 * i[0], i[1], i[2]])
+        )
+        _, offset = ir_computed_buffer(
+            "offset", [32, 64, 128], lambda i: self.load0([i[0] + 32, i[1], i[2]])
+        )
+
+        before, after = self._redirect([permuted, stepped, offset])
+
+        self.assertEqual(after["permuted"], [128 * self.d0 + 8192 * self.d1 + self.d2])
+        self.assertEqual(after["stepped"], [16384 * self.d0 + 128 * self.d1 + self.d2])
+        self.assertEqual(
+            after["offset"], [8192 * self.d0 + 128 * self.d1 + self.d2 + 262144]
+        )
+        self.assertEqual(after, before)
+
+    def test_a_narrowing_view_keeps_its_own_layout(self):
+        from torch._inductor.ir import (
+            FixedLayout,
+            ReinterpretView,
+            StorageBox,
+            TensorBox,
+        )
+
+        view = TensorBox(
+            ReinterpretView(
+                data=StorageBox(self.buf0),
+                layout=FixedLayout(
+                    torch.device("cpu"), torch.float32, [16, 64, 128], self.STRIDE
+                ),
+            )
+        ).make_loader()
+        _, c = ir_computed_buffer("c", [16, 64, 128], lambda i: view(i))
+
+        before, after = self._redirect([c])
+
+        self.assertEqual(after["c"], [8192 * self.d0 + 128 * self.d1 + self.d2])
+        self.assertEqual(after, before)
+
+    def test_two_reads_that_disagree_each_keep_their_index(self):
+        _, c = ir_computed_buffer(
+            "c",
+            self.FULL,
+            lambda i: self.load0(i) + self.load0([0, i[1], i[2]]),
+        )
+
+        before, after = self._redirect([c])
+
+        self.assertEqual(
+            sorted(after["c"], key=str),
+            sorted(
+                [8192 * self.d0 + 128 * self.d1 + self.d2, 128 * self.d1 + self.d2],
+                key=str,
+            ),
+        )
+        self.assertEqual(after, before)
+
+    def test_a_tile_along_an_inner_dim_reads_the_full_strides(self):
+        # The tile (64, 16, 128) has its own row stride, 2048; the consumer
+        # reads the full buffer and must use 8192.
+        _, c = ir_computed_buffer("c", self.FULL, lambda i: self.load0(i))
+
+        before, after = self._redirect([c], tiled_dims=(1,), loop_count=4)
+
+        self.assertEqual(list(self.buf0.layout.stride), [2048, 128, 1])
+        self.assertEqual(after["c"], [8192 * self.d0 + 128 * self.d1 + self.d2])
+        self.assertEqual(after, before)
+
+    def test_the_producer_is_the_tile_again_after_every_trace(self):
+        _, c = ir_computed_buffer("c", self.FULL, lambda i: self.load0(i))
+        _divide_ranges(self.buf0, Integer(64), [0])
+        tile = (list(self.buf0.layout.size), list(self.buf0.layout.stride))
+        operations = [c]
+        _patch_consumers(
+            [c],
+            "buf0",
+            "full",
+            operations,
+            producer_layout=self.buf0.layout,
+            read_layout=self.full.layout,
+        )
+
+        for _ in range(2):
+            self._indexes(operations[0], "full")
+            self.assertEqual(
+                (list(self.buf0.layout.size), list(self.buf0.layout.stride)), tile
+            )
+        self.assertEqual(tile[0], [1, 64, 128])
+
+    def test_read_through_a_mutation_layout_presents_on_its_target(self):
+        from torch._inductor.ir import MutationLayoutSHOULDREMOVE, StorageBox, TensorBox
+
+        from torch_spyre._inductor.wsr.loop_tiling_common import _ReadThroughLayout
+
+        self.buf0.layout.size = [1, 64, 128]
+        mutation = MutationLayoutSHOULDREMOVE(TensorBox(StorageBox(self.buf0)))
+
+        with _ReadThroughLayout(mutation, self.full.layout):
+            self.assertEqual(list(self.buf0.layout.size), self.FULL)
+        self.assertEqual(list(self.buf0.layout.size), [1, 64, 128])
+
+
 class TestPatchConsumersLoopInfo(unittest.TestCase):
     """``_patch_consumers`` redirecting a tiled buffer's ``loop_info`` readers.
 
@@ -1857,6 +2040,15 @@ class TestDivideRanges(unittest.TestCase):
         _divide_ranges(op, Integer(4), tiled_dims=[0])
         self.assertEqual(data.ranges[0], Integer(16))
 
+    def test_pointwise_non_dividing_count_raises(self):
+        # _undivided_ranges multiplies the count back in, so it is exact only
+        # while this refusal holds.
+        data = _make_pointwise([Integer(100)])
+        op = _make_op(data)
+        with self.assertRaisesRegex(Unsupported, "not divisible"):
+            _divide_ranges(op, Integer(3), tiled_dims=[0])
+        self.assertEqual(data.ranges[0], Integer(100))
+
     def test_pointwise_symbolic_count(self):
         k = Symbol("K", positive=True)
         n = Symbol("N", positive=True)
@@ -1927,17 +2119,15 @@ class TestDivideRanges(unittest.TestCase):
         after_space = dict(zip(symbols, (Integer(64), Integer(64))))
 
         with (
-            patch(
-                "torch_spyre._inductor.wsr.coarse_tile._capture_logical_iteration_symbols",
+            patch_tiling_helper(
+                "_capture_logical_iteration_symbols",
                 side_effect=Unsupported("fused dimensions"),
             ),
-            patch(
-                "torch_spyre._inductor.wsr.coarse_tile.iteration_space_from_op",
+            patch_tiling_helper(
+                "iteration_space_from_op",
                 side_effect=(before_space, after_space),
             ),
-            patch(
-                "torch_spyre._inductor.wsr.coarse_tile.invalidate_op_read_writes"
-            ) as invalidate,
+            patch_tiling_helper("invalidate_op_read_writes") as invalidate,
         ):
             result = _divide_ranges(op, Integer(2), tiled_dims=[0])
 
@@ -1956,12 +2146,12 @@ class TestDivideRanges(unittest.TestCase):
         after_symbols = before_symbols[:1]
 
         with (
-            patch(
-                "torch_spyre._inductor.wsr.coarse_tile._capture_logical_iteration_symbols",
+            patch_tiling_helper(
+                "_capture_logical_iteration_symbols",
                 side_effect=Unsupported("fused dimensions"),
             ),
-            patch(
-                "torch_spyre._inductor.wsr.coarse_tile.iteration_space_from_op",
+            patch_tiling_helper(
+                "iteration_space_from_op",
                 side_effect=(
                     dict(zip(before_symbols, (Integer(2), Integer(64)))),
                     {after_symbols[0]: Integer(64)},
@@ -2143,6 +2333,7 @@ class TestDivideRanges(unittest.TestCase):
             [1, 256, 64],
             [64, 64, 1],
             expected.device_dtype,
+            {(0,): 1, (1,): 256, (2,): 64},
             expected.element_arrangement,
         )
         self.assertNotEqual(layout.device_layout, buggy)
@@ -2215,86 +2406,52 @@ class TestDivideRanges(unittest.TestCase):
         expected = SpyreTensorLayout([1, 128], expected_strides, torch.float16, [0, 1])
         self.assertEqual(layout.device_layout, expected)
 
-    def test_resize_device_layout_grow_from_singleton(self):
-        """_allocate_full_buffer grow path: a device dim tiled to size 1
-        (stride_map != -1) must be grown back on the full-buffer allocation.
-
-        [1, 128] grow dim0 -> [4, 128]: the size-1 non-stick device dim must
-        update to device_size=4, not remain frozen at 1."""
+    def test_resize_device_layout_refuses_to_grow(self):
+        """Growing back is ambiguous where the tile has two host dims of
+        extent 1, so a grow raises rather than return a stale layout."""
         from torch_spyre._C import SpyreTensorLayout
         from torch_spyre._inductor.wsr.coarse_tile import _resize_device_layout
 
-        # Per-tile buffer is [1, 128] — dim0 was tiled to extent 1.
-        # device_size=[2, 1, 64], stride_map=[64, -1, 1].
         stl = SpyreTensorLayout([1, 128], [128, 1], torch.float16, [0, 1])
-        result = _resize_device_layout(stl, [1, 128], [4, 128])
+        with self.assertRaisesRegex(ValueError, "only shrinks"):
+            _resize_device_layout(stl, [1, 128], [4, 128])
 
-        expected = SpyreTensorLayout([4, 128], [128, 1], torch.float16, [0, 1])
-        self.assertEqual(result, expected)
-
-    def test_resize_device_layout_grow_from_singleton_permuted(self):
-        """The grow path on a permuted buffer: a device dim tiled to size 1
-        (stride_map -1) grows back to the full buffer's actual host stride, not
-        the contiguous one."""
+    def test_resize_device_layout_keeps_a_broadcast_stick_sparse(self):
+        """A broadcast stick compacted to stride_map -1 stays -1 when another
+        dim shrinks, so the tile's layout is the one compaction gives the tile.
+        The host stride, 0, would undo the compaction, and
+        _multi_arg_pointwise_layouts recognizes a broadcast stick only by -1.
+        Device coordinates ignore both, so either addresses the same element."""
         from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.propagate_layouts import (
+            _compact_broadcast_device_dims,
+        )
         from torch_spyre._inductor.wsr.coarse_tile import _resize_device_layout
 
-        size, stride = [8, 8, 512, 512], [512, 4096, 32768, 1]
-        order = [1, 0, 2, 3]
-        expected = SpyreTensorLayout(size, stride, torch.float16, order)
-        # The per-tile buffer's compact strides, in the full buffer's dim order.
-        for tile_size, tile_stride in (
-            ([1, 8, 512, 512], [512, 512, 4096, 1]),
-            ([8, 1, 512, 512], [512, 4096, 4096, 1]),
-        ):
-            with self.subTest(tile_size=tile_size):
-                stl = SpyreTensorLayout(tile_size, tile_stride, torch.float16, order)
-                self.assertIn(-1, list(stl.stride_map))
+        # (size, stride, tile_size): x[:, :1].expand(4, 64) tiled on dim 0, and
+        # a 3-d broadcast tiled on a non-stick dim with a smaller stride.
+        cases = (
+            ([4, 64], [64, 0], [2, 64]),
+            ([4, 8, 64], [8, 1, 0], [4, 2, 64]),
+        )
+        for size, stride, tile_size in cases:
+            with self.subTest(size=size):
+                order = list(range(len(size)))
+                stl = _compact_broadcast_device_dims(
+                    SpyreTensorLayout(size, stride, torch.float16, order)
+                )
+                self.assertEqual(stl.stride_map[-1], -1)
                 result = _resize_device_layout(
                     stl,
-                    tile_size,
                     size,
-                    stick_host_dim=3,
-                    old_host_stride=tile_stride,
+                    tile_size,
+                    old_host_stride=stride,
                     new_host_stride=stride,
+                )
+                expected = _compact_broadcast_device_dims(
+                    SpyreTensorLayout(tile_size, stride, torch.float16, order)
                 )
                 self.assertEqual(result, expected)
-
-    def test_resize_device_layout_grow_from_one_stick(self):
-        """The grow path from a tile whose stick dim is one stick long: its
-        tile-count dim has size 1 but a real stride_map, so it is grown, not
-        taken for a placeholder or for a host dim of extent 1."""
-        from torch_spyre._C import SpyreTensorLayout
-        from torch_spyre._inductor.wsr.coarse_tile import _resize_device_layout
-
-        # (size, stride, tile_size, tile_stride, dim_order, stick_host_dim)
-        cases = (
-            ([4, 128], [128, 1], [4, 64], [64, 1], [0, 1], 1),
-            # Also a host dim of extent 1, which the tile-count dim must not
-            # be matched to.
-            (
-                [512, 64, 64, 2],
-                [128, 1, 65536, 64],
-                [512, 64, 64, 1],
-                [64, 1, 32768, 64],
-                [0, 2, 3, 1],
-                None,
-            ),
-        )
-        for size, stride, tile_size, tile_stride, order, shd in cases:
-            with self.subTest(size=size):
-                stl = SpyreTensorLayout(tile_size, tile_stride, torch.float16, order)
-                result = _resize_device_layout(
-                    stl,
-                    tile_size,
-                    size,
-                    stick_host_dim=shd,
-                    old_host_stride=tile_stride,
-                    new_host_stride=stride,
-                )
-                self.assertEqual(
-                    result, SpyreTensorLayout(size, stride, torch.float16, order)
-                )
 
     def test_resize_device_layout_sub_stick_tile_count(self):
         """A stick host dim shorter than a stick: its size-1 tile-count dim
@@ -2457,7 +2614,12 @@ class TestDivideRanges(unittest.TestCase):
         dev = SpyreTensorLayout([1, 1], torch.float16).device_dtype
         # Transposed QK^T output: Skv (host dim 3) is the stick; Sq (host dim 2)
         # is a non-stick dim of the same size (512), so they collide by size.
-        stl = SpyreTensorLayout([32, 512, 8, 1, 64], [512, 16384, 64, -1, 1], dev)
+        stl = SpyreTensorLayout(
+            [32, 512, 8, 1, 64],
+            [512, 16384, 64, -1, 1],
+            dev,
+            {(0,): 32, (1,): 512, (2, 4): 512, (3,): 1},
+        )
         host_size = [1, 32, 512, 512]
 
         # Fallback (no identity): size-based elimination is ambiguous -> raise.
@@ -2533,8 +2695,8 @@ def _mock_iteration_space(op):
 
 class TestCoarseTile(unittest.TestCase):
     def setUp(self):
-        self._patch = patch(
-            "torch_spyre._inductor.wsr.coarse_tile.op_out_coords",
+        self._patch = patch_tiling_helper(
+            "op_out_coords",
             side_effect=_mock_op_out_coords,
         )
         self._patch.start()
@@ -2871,8 +3033,8 @@ class TestCoarseTileNested(unittest.TestCase):
     """Verify that the nested group format [(hint_id, K1), ...] works."""
 
     def setUp(self):
-        self._patch = patch(
-            "torch_spyre._inductor.wsr.coarse_tile.op_out_coords",
+        self._patch = patch_tiling_helper(
+            "op_out_coords",
             side_effect=_mock_op_out_coords,
         )
         self._patch.start()
@@ -2962,6 +3124,28 @@ class TestCoarseTileNested(unittest.TestCase):
         # Inner level (count 2): extent = final_extent(32).
         self.assertEqual(per_level[1], {0: Integer(32)})
 
+    def test_planned_tile_extents_per_level_non_dividing_count_raises(self):
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _planned_tile_extents_per_level,
+        )
+
+        data = _make_pointwise([Integer(100)])
+        op = _make_hinted_op(data, "op0", hints=((1, 0),))
+        with self.assertRaisesRegex(Unsupported, "not divisible"):
+            _planned_tile_extents_per_level(op, [[0]], [[]], [(1, Integer(3))])
+
+    def test_undivided_ranges_restores_the_ranges_before_tiling(self):
+        data = _make_pointwise([Integer(256), Integer(128), Integer(16)])
+        op = _make_hinted_op(data, "op0", hints=((1, 0), (2, 0), (3, 1)))
+        coarse_tile_post_stickify(
+            _graph([op]),
+            [([op], [(1, Integer(4)), (2, Integer(2)), (3, Integer(8))])],
+        )
+        self.assertEqual(list(data.ranges), [Integer(32), Integer(16), Integer(16)])
+        self.assertEqual(
+            _undivided_ranges(op), ((Integer(256), Integer(128), Integer(16)), ())
+        )
+
     def test_coarse_tile_plans_before_any_transformation(self):
         """coarse_tile() must fully plan every group before transforming any.
 
@@ -3023,8 +3207,8 @@ class TestCoarseTileTiledDimsPerRead(unittest.TestCase):
     """
 
     def setUp(self):
-        self._patch = patch(
-            "torch_spyre._inductor.wsr.coarse_tile.op_out_coords",
+        self._patch = patch_tiling_helper(
+            "op_out_coords",
             side_effect=_mock_op_out_coords,
         )
         self._patch.start()
@@ -6693,6 +6877,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
         self.assertNotIn("sdsc_execute (%sym_0_1)", mlir)
         self.assertNotIn("sdsc_execute (%sym_1)", mlir)
 
+    @config.patch({"frontend_pool_allocation": False})
     def test_non_tensor_arg_symbols_remain_as_constants(self):
         c0 = Symbol("c0")
         op_a = self._make_op_spec_with_hbm_args("a", [0])
@@ -7379,8 +7564,8 @@ class TestDivideReductionRanges(unittest.TestCase):
             Symbol("d2"): ["E"],
         }
 
-        with patch(
-            "torch_spyre._inductor.wsr.coarse_tile._capture_logical_iteration_symbols",
+        with patch_tiling_helper(
+            "_capture_logical_iteration_symbols",
             side_effect=(before, after),
         ):
             remap = _divide_reduction_ranges(op, Integer(128), [0])
@@ -7427,11 +7612,11 @@ class TestDivideReductionRanges(unittest.TestCase):
         }
 
         with (
-            patch(
-                "torch_spyre._inductor.wsr.coarse_tile.op_read_writes",
+            patch_tiling_helper(
+                "op_read_writes",
                 side_effect=(rw_before, rw_after),
             ),
-            patch("torch_spyre._inductor.wsr.coarse_tile.invalidate_op_read_writes"),
+            patch_tiling_helper("invalidate_op_read_writes"),
         ):
             remap = _divide_reduction_ranges(op, Integer(128), [0])
         _apply_work_div_symbol_remap(op, remap)
@@ -7459,20 +7644,18 @@ class TestDivideReductionRanges(unittest.TestCase):
         }
 
         with (
-            patch(
-                "torch_spyre._inductor.wsr.coarse_tile._capture_logical_iteration_symbols",
+            patch_tiling_helper(
+                "_capture_logical_iteration_symbols",
                 side_effect=Unsupported("fused output dimensions"),
             ),
-            patch(
-                "torch_spyre._inductor.wsr.coarse_tile.iteration_space_from_op",
+            patch_tiling_helper(
+                "iteration_space_from_op",
                 side_effect=(
                     {output_sym: Integer(512 * 704), reduction_sym: Integer(128)},
                     {output_sym: Integer(512 * 704)},
                 ),
             ),
-            patch(
-                "torch_spyre._inductor.wsr.coarse_tile.invalidate_op_read_writes"
-            ) as invalidate,
+            patch_tiling_helper("invalidate_op_read_writes") as invalidate,
         ):
             remap = _divide_reduction_ranges(op, Integer(128), [0])
 
@@ -7741,6 +7924,33 @@ def _ftl_pointwise(shape, name="buf0", dtype=torch.float16, host_stride=None):
     )
 
 
+def _ftl_pointwise_reading_twice(shape, permutation, name="buf0"):
+    """``_ftl_pointwise`` whose op reads its one input a second time with its
+    index permuted: ``in0[d0, d1, ...] + in0[d[p] for p in permutation]``.
+
+    The two reads carry the same ``MemoryDep.name`` and differ only in index,
+    which is what the resolver's per-axis read comparison looks at.
+    """
+    from torch._inductor.ir import ComputedBuffer, Pointwise, StorageBox, TensorBox
+
+    template = _ftl_pointwise(shape, name=name)
+    loader = TensorBox(StorageBox(V.graph.name_to_buffer[f"in0_{name}"])).make_loader()
+
+    def inner_fn(index):
+        return loader(index) + loader([index[p] for p in permutation])
+
+    pw = Pointwise.create(
+        device=template.get_device(),
+        dtype=template.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=list(template.data.ranges),
+    )
+    op = ComputedBuffer(name=name, layout=template.layout, data=pw.data.data)
+    op.operation_name = name
+    V.graph.name_to_buffer[name] = op
+    return op
+
+
 class TestPredictFrame(unittest.TestCase):
     """predict_frame == what coarse_tile actually applies, and mutates no IR."""
 
@@ -7961,7 +8171,7 @@ class TestPredictFrameReduction(unittest.TestCase):
         ``reduction_ranges`` -- false as soon as a size-1 reduction dim is
         squeezed away, and the hint then names a symbol the op does not carry,
         so the applier silently tiles nothing. Going through the real lowering
-        is both faithful (it is what ``CoarseTilingPass`` does) and immune to
+        is both faithful (it is what ``apply_tilings`` does) and immune to
         that, and it mirrors ``TestPredictFrame._apply_and_compare``.
         """
         ranges_before = list(op.data.ranges)
@@ -8220,7 +8430,7 @@ class TestValidateTiling(unittest.TestCase):
         from torch_spyre._inductor.scratchpad.coarse_tiling import (
             try_resolve_tile_axis_loop_vars,
         )
-        from torch_spyre._inductor.wsr.enumerate_tilings import _lowering_accepts
+        from torch_spyre._inductor.wsr.enumerate_tilings import _lowering_rejection
 
         op = _ftl_pointwise((512, 256), name="val_not_iter_var")
         spec = TileSpec((TileAxis(0, 2),))
@@ -8234,7 +8444,7 @@ class TestValidateTiling(unittest.TestCase):
             self.assertIsNone(loop_vars)
             with self.assertRaises(Unsupported):
                 tile_spec_to_dim_hints(op, spec, [0])
-            self.assertFalse(_lowering_accepts(op, TileAxis(0, 2)))
+            self.assertIsNotNone(_lowering_rejection(op, TileAxis(0, 2)))
             self.assertEqual(_rejection_reason(op, spec), reason)
             self.assertIsNone(predict_frame(op, spec))
 
@@ -8281,7 +8491,11 @@ class TestValidateTiling(unittest.TestCase):
         self.assertIsNotNone(predict_frame(op, spec))  # non-vacuity
         dl = op.layout.device_layout
         op.layout.device_layout = SpyreTensorLayout(
-            [64, 80, 1, 64], [5120, 64, -1, 1], dl.device_dtype, dl.element_arrangement
+            [64, 80, 1, 64],
+            [5120, 64, -1, 1],
+            dl.device_dtype,
+            {(0,): 64, (1,): 80, (2, 3): 64},
+            dl.element_arrangement,
         )
         self.assertIsNone(predict_frame(op, spec))
 
@@ -8336,6 +8550,37 @@ class TestValidateTiling(unittest.TestCase):
         frame = predict_frame(op, TileSpec((TileAxis(0, 2, is_reduction=True),)))
         self.assertIs(frame.layout, op.layout)
         self.assertEqual([int(r) for r in frame.reduction_ranges], [8])
+
+    def test_two_reads_of_one_input_are_compared_per_axis(self):
+        """``a + a.permute(0, 2, 1, 3)`` reads one input two ways. Dim 0 is
+        walked the same way by both reads, so it tiles; dims 1 and 2 are each
+        walked at the other's stride, so each is refused -- by the resolver, and
+        so by prediction and lowering alike.
+
+        Along the shared axis both reads need the same per-tile advance, which
+        is why agreeing reads are safe however they differ elsewhere; along a
+        swapped axis they need two different advances of one buffer, which is
+        the case that returns wrong values on the device.
+        """
+        op = _ftl_pointwise_reading_twice(
+            (32, 16, 16, 128), (0, 2, 1, 3), name="val_two_reads"
+        )
+        shared = TileSpec((TileAxis(0, 4),))
+        loop_vars, reason = try_resolve_tile_axis_loop_vars(op, shared)
+        self.assertIsNone(reason)
+        self.assertEqual(len(loop_vars), 1)
+        self.assertIsNotNone(predict_frame(op, shared))
+
+        for axis in (1, 2):
+            with self.subTest(axis=axis):
+                swapped = TileSpec((TileAxis(axis, 2),))
+                loop_vars, reason = try_resolve_tile_axis_loop_vars(op, swapped)
+                self.assertIsNone(loop_vars)
+                self.assertIn(f"along d{axis} two ways", reason)
+                self.assertEqual(_rejection_reason(op, swapped), reason)
+                self.assertIsNone(predict_frame(op, swapped))
+                with self.assertRaisesRegex(Unsupported, "two ways"):
+                    tile_spec_to_dim_hints(op, swapped, [0])
 
 
 class TestTileHelpers(unittest.TestCase):
@@ -8507,6 +8752,7 @@ class TestCustomPostFusionPassesOrder(unittest.TestCase):
         self.assertEqual(
             names,
             [
+                "sink_collective_waits",
                 "spyre_fuse_nodes",
                 "prepare_spyre_kernels",
                 "hbm_pool_planning",
@@ -8819,8 +9065,9 @@ class TestTileSpecLoweringReduction(unittest.TestCase):
         leaked = [*reduction_loop_vars(op), sympy_index_symbol("d9")]
         spec = TileSpec((TileAxis(0, 2, is_reduction=True),))
         with (
-            patch(
-                "torch_spyre._inductor.wsr.coarse_tile.reduction_loop_vars",
+            patch_tiling_helper(
+                "reduction_loop_vars",
+                common_only=True,
                 return_value=leaked,
             ),
             patch(
@@ -9078,25 +9325,31 @@ class TestEnumeratedOptionsLower(unittest.TestCase):
                 with self.subTest(op=op.get_name(), spec=spec):
                     self.assertIsNotNone(predict_frame(op, spec))
 
-    def test_lowering_accepts_consults_the_lowering(self):
-        # _lowering_accepts rejects exactly what the shared resolver rejects.
-        from torch_spyre._inductor.wsr.enumerate_tilings import _lowering_accepts
+    def test_lowering_rejection_consults_the_lowering(self):
+        # _lowering_rejection rejects exactly what the shared resolver rejects.
+        from torch_spyre._inductor.wsr.enumerate_tilings import _lowering_rejection
 
         pw = _make_real_tiled_op("pw_acc", [6, 128])
         red = _make_real_tiled_op("red_acc", [4, 64], [8])
         red_unit = _make_real_tiled_op("red_unit_acc", [4, 64], [1, 8])
-        self.assertTrue(_lowering_accepts(pw, TileAxis(0, 2)))
-        self.assertTrue(_lowering_accepts(red, TileAxis(0, 2, is_reduction=True)))
+        self.assertIsNone(_lowering_rejection(pw, TileAxis(0, 2)))
+        self.assertIsNone(_lowering_rejection(red, TileAxis(0, 2, is_reduction=True)))
         # Out of bounds for the output frame.
-        self.assertFalse(_lowering_accepts(pw, TileAxis(2, 2)))
+        self.assertIsNotNone(_lowering_rejection(pw, TileAxis(2, 2)))
         # A reduction axis on an op with no reduction.
-        self.assertFalse(_lowering_accepts(pw, TileAxis(0, 2, is_reduction=True)))
+        self.assertIsNotNone(_lowering_rejection(pw, TileAxis(0, 2, is_reduction=True)))
         # Out of bounds for the one reduction loop variable.
-        self.assertFalse(_lowering_accepts(red, TileAxis(1, 2, is_reduction=True)))
+        self.assertIsNotNone(
+            _lowering_rejection(red, TileAxis(1, 2, is_reduction=True))
+        )
         # [1, 8] has one reduction loop variable, for the 8: host_dim 0 names
         # it, and host_dim 1 is out of bounds though [1, 8] has two entries.
-        self.assertTrue(_lowering_accepts(red_unit, TileAxis(0, 2, is_reduction=True)))
-        self.assertFalse(_lowering_accepts(red_unit, TileAxis(1, 2, is_reduction=True)))
+        self.assertIsNone(
+            _lowering_rejection(red_unit, TileAxis(0, 2, is_reduction=True))
+        )
+        self.assertIsNotNone(
+            _lowering_rejection(red_unit, TileAxis(1, 2, is_reduction=True))
+        )
 
 
 class TestPlannedFullBufferLayout(unittest.TestCase):
@@ -9219,41 +9472,30 @@ class TestPlannedFullBufferLayout(unittest.TestCase):
         ]
         self.assertEqual(combine.loop_info.squeezed_advance_per_read, [])
 
-    def test_full_buffer_grown_back_from_a_permuted_tile(self):
-        # Where no full layout was planned, the full buffer's is grown back
-        # from the tile's. This op writes its output with dim 1 outermost and
-        # is tiled on dim 0, the inner one, so the outer dim's stride shrinks
-        # with the tile and has to grow back with the full buffer.
-        from torch_spyre._C import SpyreTensorLayout
-        from torch_spyre._inductor.ir import FixedTiledLayout
+    def test_full_buffer_without_a_planned_layout_raises(self):
+        # Post-stickify, the full buffer's layout is not grown back from the
+        # tile's: with no layout given, the allocation raises before it lowers
+        # anything into the graph.
+        from torch._inductor.ir import FlexibleLayout
+
         from torch_spyre._inductor.wsr.coarse_tile import _allocate_full_buffer
 
-        size, stride = [64, 64, 128], [128, 8192, 1]
-        op = _make_real_tiled_op("pw_permuted", size)
-        original = SpyreTensorLayout(size, stride, torch.float16, [0, 1, 2])
-        op.layout = FixedTiledLayout(
-            torch.device("cpu"),
-            torch.float16,
-            [Integer(s) for s in size],
-            [Integer(s) for s in stride],
-            original,
-        )
+        size = [64, 64, 128]
+        op = _make_real_tiled_op("pw", size)
         _divide_ranges(op, Integer(4), tiled_dims=[0])
-        self.assertEqual(
-            op.layout.device_layout,
-            SpyreTensorLayout([16, 64, 128], [128, 2048, 1], torch.float16, [0, 1, 2]),
-        )
 
         operations = V.graph.operations
         operations.append(op)
-        full = _allocate_full_buffer(
-            op,
-            [Integer(s) for s in size],
-            tuple(Integer(s) for s in stride),
-            operations,
-            0,
-        )
-        self.assertEqual(full.layout.device_layout, original)
+        before = (len(operations), len(V.graph.graph.nodes))
+        with self.assertRaisesRegex(RuntimeError, "no device_layout was given"):
+            _allocate_full_buffer(
+                op,
+                [Integer(s) for s in size],
+                tuple(Integer(s) for s in FlexibleLayout.contiguous_strides(size)),
+                operations,
+                0,
+            )
+        self.assertEqual((len(operations), len(V.graph.graph.nodes)), before)
 
 
 class TestDeriveTilingGroups(unittest.TestCase):
@@ -9396,8 +9638,8 @@ class TestDerivedBases(unittest.TestCase):
         self.assertEqual(_derive_group_idx_offset(_graph([op])), 4)
 
 
-class TestCoarseTilingPassEquivalence(unittest.TestCase):
-    """CoarseTilingPass reduces to a direct coarse_tile_post_stickify call.
+class TestApplyTilingsEquivalence(unittest.TestCase):
+    """``apply_tilings`` reduces to the hint path.
 
     Both paths call the same coarse_tile_post_stickify(); the pass just builds
     its (groups, group_idx_offset, dim_hints) inputs from a TileSpec instead of
@@ -9408,8 +9650,8 @@ class TestCoarseTilingPassEquivalence(unittest.TestCase):
 
     def setUp(self):
         self.enterContext(
-            patch(
-                "torch_spyre._inductor.wsr.coarse_tile.op_out_coords",
+            patch_tiling_helper(
+                "op_out_coords",
                 side_effect=_mock_op_out_coords,
             )
         )
@@ -9448,13 +9690,16 @@ class TestCoarseTilingPassEquivalence(unittest.TestCase):
         ref_fields = self._loop_fields(ref)
         ref_range = ref.data.ranges[0]
 
-        # CoarseTilingPass: same tiling expressed as a TileSpec.
+        # apply_tilings: same tiling expressed as a TileSpec.
         got = self._bare([256], "op0")
-        CoarseTilingPass({"op0": TileSpec((TileAxis(0, 4),))}).apply_pass(_graph([got]))
+        apply_tilings({"op0": TileSpec((TileAxis(0, 4),))}, _graph([got]))
         self.assertEqual(self._loop_fields(got), ref_fields)
         self.assertEqual(got.data.ranges[0], ref_range)
         # And the win is visible: dim 0 divided by 4.
         self.assertEqual(got.data.ranges[0], Integer(64))
+        # The tile still iterates dim 0, so its one symbol is the one it had.
+        c0 = sympy.Symbol("c0")
+        self.assertEqual(got.symbols_on_tile, {c0: c0})
 
     def test_nested_two_level_matches_direct_call(self):
         ref = _make_hinted_op(
@@ -9467,9 +9712,9 @@ class TestCoarseTilingPassEquivalence(unittest.TestCase):
         ref_ranges = list(ref.data.ranges)
 
         got = self._bare([256, 128], "op0")
-        CoarseTilingPass(
-            {"op0": TileSpec((TileAxis(0, 4), TileAxis(1, 2)))}
-        ).apply_pass(_graph([got]))
+        apply_tilings(
+            {"op0": TileSpec((TileAxis(0, 4), TileAxis(1, 2)))}, _graph([got])
+        )
         self.assertEqual(self._loop_fields(got), ref_fields)
         self.assertEqual(list(got.data.ranges), ref_ranges)
         self.assertEqual(list(got.data.ranges), [Integer(64), Integer(64)])
@@ -9478,7 +9723,7 @@ class TestCoarseTilingPassEquivalence(unittest.TestCase):
         spec = TileSpec((TileAxis(0, 4),))
         ops = [self._bare([256], n) for n in ("op0", "op1", "op2")]
         g = _graph(ops)
-        CoarseTilingPass({"op0": spec, "op2": spec}).apply_pass(g)
+        apply_tilings({"op0": spec, "op2": spec}, g)
         hint_ids = [[h.hint_id for h in op.dim_hints] for op in (ops[0], ops[2])]
         self.assertEqual(hint_ids, [[0], [1]])
         self.assertNotEqual(
@@ -9515,7 +9760,7 @@ class TestCoarseTilingPassEquivalence(unittest.TestCase):
         # (untiled/absent choices).
         ops = [self._bare([64], "op0"), self._bare([64], "op1")]
         g = _graph(ops)
-        CoarseTilingPass({}).apply_pass(g)
+        apply_tilings({}, g)
         self.assertEqual(len(g.operations), 2)
         for op in ops:
             self.assertFalse(
@@ -9523,8 +9768,8 @@ class TestCoarseTilingPassEquivalence(unittest.TestCase):
             )
 
 
-class TestCoarseTilingPassRegionRefusal(unittest.TestCase):
-    """CoarseTilingPass refuses to tile an op inside a ``for_each_tile`` region.
+class TestApplyTilingsRegionRefusal(unittest.TestCase):
+    """``apply_tilings`` refuses to tile an op inside a ``for_each_tile`` region.
 
     A region spans every op between the first and last op one outermost loop
     stamped (see ``prescribed_regions``), so the refusal covers the ops the loop
@@ -9536,8 +9781,8 @@ class TestCoarseTilingPassRegionRefusal(unittest.TestCase):
 
     def setUp(self):
         self.enterContext(
-            patch(
-                "torch_spyre._inductor.wsr.coarse_tile.op_out_coords",
+            patch_tiling_helper(
+                "op_out_coords",
                 side_effect=_mock_op_out_coords,
             )
         )
@@ -9591,7 +9836,7 @@ class TestCoarseTilingPassRegionRefusal(unittest.TestCase):
         with self.assertRaisesRegex(
             Unsupported, "would re-tile op0, which a for_each_tile loop already tiles"
         ):
-            CoarseTilingPass({"op0": self._SPEC}).apply_pass(_graph(ops))
+            apply_tilings({"op0": self._SPEC}, _graph(ops))
         self.assertEqual(self._state(ops), before)
 
     def test_refuses_unstamped_op_inside_the_loop(self):
@@ -9601,13 +9846,13 @@ class TestCoarseTilingPassRegionRefusal(unittest.TestCase):
         with self.assertRaisesRegex(
             Unsupported, "would re-tile op1, which a for_each_tile loop already tiles"
         ):
-            CoarseTilingPass({"op1": self._SPEC}).apply_pass(_graph(ops))
+            apply_tilings({"op1": self._SPEC}, _graph(ops))
         self.assertEqual(self._state(ops), before)
 
     def test_tiles_op_after_the_loop(self):
         ops = [self._stamped("op0"), self._bare("op1")]
         loop_before = self._state(ops[:1])
-        CoarseTilingPass({"op1": self._SPEC}).apply_pass(_graph(ops))
+        apply_tilings({"op1": self._SPEC}, _graph(ops))
         self.assertIsInstance(ops[1].loop_info, CoarseTileInfo)
         self.assertEqual(ops[1].loop_info.loop_count, [Integer(4)])
         self.assertEqual(ops[1].data.ranges[0], Integer(64))
@@ -9935,12 +10180,13 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
 
 
 class TestDrainedCollective(unittest.TestCase):
-    """A loop carry whose only post-loop use is a collective, drained for it.
+    """A loop carry consumed after its loop by an in-place collective.
 
-    The plan accepts only the shape the push can rewrite -- one collective
-    reading the storage directly, after the whole loop -- and the rewrite moves
-    only that collective onto the drain.  The solve around it is exercised in
-    ``test_work_division.py``.
+    The collective's result lives in its operand, so the plan accepts only the
+    shape the push can rewrite whole -- every post-loop access repointable, at
+    least one a collective reading the storage directly, all after the loop --
+    and the rewrite moves every one of them onto the drain.  The solve around it
+    is exercised in ``test_work_division.py``.
     """
 
     @staticmethod
@@ -9959,54 +10205,95 @@ class TestDrainedCollective(unittest.TestCase):
         return buf
 
     @staticmethod
-    def _collective(operand, cls=None, name="all_reduce"):
-        from torch_spyre._inductor.ir import AllReduceAsyncFallback
-
-        cls = cls or AllReduceAsyncFallback
+    def _kernel(cls, operand, name, mutated="carry"):
+        """A bare in-place kernel as ``create_inplace``/``create_wait`` leave it."""
         op = cls.__new__(cls)
         op.name = name
         op.inputs = [operand]
+        op.mutation_outputs = [SimpleNamespace(mutation_names=[mutated])]
+        op.alias_names = [mutated]
         return op
 
-    def test_only_a_sole_direct_collective_after_the_loop_is_planned(self):
+    def _collective(self, operand, cls=None, name="all_reduce"):
+        from torch_spyre._inductor.ir import AllReduceKernel
+
+        return self._kernel(cls or AllReduceKernel, operand, name)
+
+    def _wait(self, operand, name="wait"):
+        from torch_spyre._inductor.ir import WaitKernel
+
+        return self._kernel(WaitKernel, operand, name)
+
+    def _reader(self, name="reader", mutates=()):
+        """A Pointwise loop reading the carry after the loop, writing ``mutates`` in place."""
+        from torch._inductor.ir import Pointwise
+
+        op = self._buffer(name)
+        op.data = MagicMock(spec=Pointwise)
+        op.get_mutation_names.return_value = list(mutates)
+        return op
+
+    def test_only_fully_repointable_post_loop_accesses_are_planned(self):
         from torch._inductor.ir import ReinterpretView, StorageBox, TensorBox
 
-        from torch_spyre._inductor.ir import AllGatherAsyncFallback
+        from torch_spyre._inductor.ir import AllGatherKernel
         from torch_spyre._inductor.scratchpad.allocator import (
-            _sole_post_loop_collective,
+            _post_loop_collective_accesses,
         )
 
         carry = self._buffer("carry")
         anchor = _LoopOp("anchor", (0,))
         all_reduce = self._collective(TensorBox(StorageBox(carry)))
-        reader = _LoopOp("reader")
+        wait = self._wait(TensorBox(StorageBox(carry)))
+        reader = self._reader()
 
         def plan(operations, accessors):
+            # Names, not ops: IR ops are dataclasses whose __eq__ reads every
+            # field, which these bare stand-ins do not have.
             graph = SimpleNamespace(operations=operations)
-            return _sole_post_loop_collective(graph, "carry", accessors, anchor)
+            accesses = _post_loop_collective_accesses(graph, "carry", accessors, anchor)
+            return tuple(op.get_name() for op in accesses)
 
         with self.subTest("all_reduce after the loop"):
-            self.assertIs(plan([carry, anchor, all_reduce], [all_reduce]), all_reduce)
-        with self.subTest("a second post-loop reader"):
-            ops = [carry, anchor, all_reduce, reader]
-            self.assertIsNone(plan(ops, [all_reduce, reader]))
+            self.assertEqual(
+                plan([carry, anchor, all_reduce], [all_reduce]), ("all_reduce",)
+            )
+        with self.subTest("all_reduce, its wait and a reader of the result"):
+            ops = [carry, anchor, all_reduce, wait, reader]
+            accessors = [all_reduce, wait, reader]
+            self.assertEqual(plan(ops, accessors), ("all_reduce", "wait", "reader"))
+        with self.subTest("a post-loop access that cannot be repointed"):
+            opaque = _extern_op("opaque")
+            ops = [carry, anchor, all_reduce, wait, opaque]
+            self.assertEqual(plan(ops, [all_reduce, wait, opaque]), ())
+        with self.subTest("a loop that writes the carry in place"):
+            # Only its loads would be renamed, so it would read the drain and
+            # still write the carry.
+            writer = self._reader("writer", mutates=["carry"])
+            ops = [carry, anchor, all_reduce, wait, writer]
+            self.assertEqual(plan(ops, [all_reduce, wait, writer]), ())
+        with self.subTest("a loop that writes another buffer in place"):
+            other_writer = self._reader("other_writer", mutates=["other"])
+            ops = [carry, anchor, all_reduce, wait, other_writer]
+            self.assertEqual(
+                plan(ops, [all_reduce, wait, other_writer]),
+                ("all_reduce", "wait", "other_writer"),
+            )
         with self.subTest("all_reduce before the loop ends"):
-            self.assertIsNone(plan([carry, all_reduce, anchor], [all_reduce]))
-        with self.subTest("the reader is not a collective"):
-            self.assertIsNone(plan([carry, anchor, reader], [reader]))
+            self.assertEqual(plan([carry, all_reduce, anchor], [all_reduce]), ())
+        with self.subTest("no collective among the accesses"):
+            self.assertEqual(plan([carry, anchor, reader], [reader]), ())
         with self.subTest("the operand is a view of the carry"):
             view = MagicMock(spec=ReinterpretView)
             through_view = self._collective(TensorBox(view))
-            self.assertIsNone(plan([carry, anchor, through_view], [through_view]))
+            self.assertEqual(plan([carry, anchor, through_view], [through_view]), ())
         with self.subTest("all_gather is not rewritten yet"):
-            gather = self._collective(
-                TensorBox(StorageBox(carry)), cls=AllGatherAsyncFallback
-            )
-            self.assertIsNone(plan([carry, anchor, gather], [gather]))
+            gather = self._collective(TensorBox(StorageBox(carry)), cls=AllGatherKernel)
+            self.assertEqual(plan([carry, anchor, gather], [gather]), ())
 
-    def test_rewrite_moves_only_the_collective_onto_the_drain(self):
-        """The all_reduce reads and mutates the drain; the carry's own wrappers
-        and its other users are untouched."""
+    def test_rewrite_moves_every_post_loop_access_onto_the_drain(self):
+        """The all_reduce and its wait read and mutate the drain, the reader
+        loads it; the carry's own wrappers and its other users are untouched."""
         from collections import defaultdict
 
         from torch._inductor.ir import StorageBox, TensorBox
@@ -10016,22 +10303,35 @@ class TestDrainedCollective(unittest.TestCase):
         carry, drain = self._buffer("carry"), self._buffer("drain")
         operand = TensorBox(StorageBox(carry))
         all_reduce = self._collective(operand)
+        wait = self._wait(TensorBox(StorageBox(carry)))
+        reader = self._reader()
         as_user = TensorBox(StorageBox(all_reduce))
+        reader_user = TensorBox(StorageBox(reader))
         other_user = TensorBox(StorageBox(self._buffer("other")))
         editor = GraphEditor.__new__(GraphEditor)
         editor.lowering = SimpleNamespace(
-            name_to_users=defaultdict(list, {"carry": [as_user, other_user]})
+            name_to_users=defaultdict(
+                list, {"carry": [as_user, reader_user, other_user]}
+            ),
+            mutated_buffers=set(),
         )
-        self.assertEqual(all_reduce.get_mutation_names(), ["carry"])
 
-        editor.replace_collective_operand(all_reduce, "carry", drain)
+        with patch.object(editor, "_replace_loop_input") as replace_loop_input:
+            editor.replace_post_loop_accesses(
+                (all_reduce, wait, reader), "carry", drain
+            )
 
+        replace_loop_input.assert_called_once_with(reader, "carry", "drain")
+        for kernel in (all_reduce, wait):
+            self.assertEqual(GraphEditor._sole_operand_name(kernel), "drain")
+            self.assertEqual(kernel.mutation_outputs[0].mutation_names, ["drain"])
+            self.assertEqual(kernel.alias_names, ["drain"])
         self.assertEqual(GraphEditor.collective_operand_name(all_reduce), "drain")
-        self.assertEqual(all_reduce.get_mutation_names(), ["drain"])
+        self.assertIn("drain", editor.lowering.mutated_buffers)
         self.assertIsNot(all_reduce.inputs[0], operand)
         self.assertIs(operand.data.data, carry)
         self.assertEqual(editor.lowering.name_to_users["carry"], [other_user])
-        self.assertEqual(editor.lowering.name_to_users["drain"], [as_user])
+        self.assertEqual(editor.lowering.name_to_users["drain"], [as_user, reader_user])
 
     def test_rewrite_rejects_a_drain_with_another_layout(self):
         """The collective's plan is sized from its operand's layout."""
@@ -10045,12 +10345,443 @@ class TestDrainedCollective(unittest.TestCase):
         operand = TensorBox(StorageBox(carry))
         all_reduce = self._collective(operand)
         editor = GraphEditor.__new__(GraphEditor)
-        editor.lowering = SimpleNamespace(name_to_users=defaultdict(list))
+        editor.lowering = SimpleNamespace(
+            name_to_users=defaultdict(list), mutated_buffers=set()
+        )
         with self.assertRaisesRegex(ValueError, "not addressing-equivalent"):
-            editor.replace_collective_operand(
-                all_reduce, "carry", self._buffer("drain", size=(16, 64))
+            editor.replace_post_loop_accesses(
+                (all_reduce,), "carry", self._buffer("drain", size=(16, 64))
             )
         self.assertIs(all_reduce.inputs[0], operand)
+
+    def test_output_stage_rejects_overwrite_hidden_from_liveness(self):
+        """A no-read mutation names its own write, not its storage target."""
+        from torch._inductor.ir import (
+            ComputedBuffer,
+            FixedLayout,
+            MutationLayoutSHOULDREMOVE,
+            Pointwise,
+            StorageBox,
+            TensorBox,
+        )
+        from torch._inductor.virtualized import ops
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
+        from torch_spyre._inductor.ir import AllReduceKernel
+        from torch_spyre._inductor.pass_utils import op_read_writes
+        from torch_spyre._inductor.scratchpad.allocator import (
+            _collective_stage_storage_is_private,
+        )
+        from torch_spyre._inductor.scratchpad.utils import calculate_liveness
+
+        # create_inplace runs the op's Meta impl under the graph's fake mode,
+        # and process_kernel reads the FX node being lowered (newer torch
+        # checks its target); a lowering always has one, so provide the graph's.
+        gm = fx.symbolic_trace(lambda: None)
+        with (
+            V.set_graph_handler(GraphLowering(gm)),
+            V.set_fake_mode(FakeTensorMode()),
+            V.set_current_node(next(iter(gm.graph.nodes))),
+        ):
+
+            def constant(name):
+                buf = ComputedBuffer(
+                    name=name,
+                    layout=FixedLayout(torch.device("cpu"), torch.float32, [8], [1]),
+                    data=Pointwise(
+                        device=torch.device("cpu"),
+                        dtype=torch.float32,
+                        inner_fn=lambda index: ops.constant(1, torch.float32),
+                        ranges=[8],
+                    ),
+                )
+                V.graph.name_to_buffer[name] = buf
+                return buf
+
+            result = constant("result")
+            AllReduceKernel.create_inplace(
+                torch.ops._c10d_functional.all_reduce_.default,
+                TensorBox(StorageBox(result)),
+                "sum",
+                "group",
+            )
+            collective = V.graph.operations[-1]
+            V.graph.operations = [result, collective]
+            self.assertTrue(
+                _collective_stage_storage_is_private(V.graph, result, collective)
+            )
+            overwrite = constant("overwrite")
+            overwrite.layout = MutationLayoutSHOULDREMOVE(result)
+            V.graph.operations.insert(1, overwrite)
+            self.assertEqual(overwrite.get_mutation_names(), ["result"])
+            self.assertEqual(op_read_writes(overwrite).reads, OrderedSet())
+            self.assertEqual(
+                {dep.name for dep in op_read_writes(overwrite).writes}, {"overwrite"}
+            )
+            self.assertEqual(calculate_liveness(V.graph)["result"], [0, 2])
+            self.assertFalse(
+                _collective_stage_storage_is_private(V.graph, result, collective)
+            )
+
+
+class TestCollectiveStageCurrentUses(unittest.TestCase):
+    """Post-solve staging uses current accesses, not saved operation positions."""
+
+    def _run_stage(self, extra_reader=False, *, placed=(), span=64, real_gaps=False):
+        from contextlib import nullcontext
+
+        from torch._inductor.ir import ComputedBuffer
+
+        from torch_spyre._inductor.ir import FixedTiledLayout
+        from torch_spyre._inductor.scratchpad import allocator as allocator_module
+        from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
+        from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
+
+        def access(name, reads=(), writes=()):
+            deps = inductor_deps.ReadWrites(
+                OrderedSet(
+                    inductor_deps.MemoryDep(n, sympy.S.Zero, (), ()) for n in reads
+                ),
+                OrderedSet(
+                    inductor_deps.MemoryDep(n, sympy.S.Zero, (), ()) for n in writes
+                ),
+                OrderedSet(),
+            )
+            return SimpleNamespace(
+                get_name=lambda: name,
+                get_read_writes=lambda: deps,
+                origins=(),
+            )
+
+        inserted = access("inserted", writes=("other",))
+        producer = MagicMock(spec=ComputedBuffer)
+        producer.get_name.return_value = "result"
+        producer.layout = MagicMock(spec=FixedTiledLayout)
+        producer.origins = ()
+        producer.get_read_writes.return_value = access(
+            "result", writes=("result",)
+        ).get_read_writes()
+        collective = access("all_reduce", reads=("result",))
+        operations = [inserted, producer, collective]
+        if extra_reader:
+            operations.insert(2, access("reader", reads=("result",)))
+        graph = SimpleNamespace(
+            operations=operations,
+            graph_input_names=[],
+            get_output_names=lambda: [],
+            get_buffer=lambda name: producer,
+            graph=object(),
+        )
+        buffer = LifetimeBoundBuffer("result", 64, [0, 1])
+        allocator = CoOptimizingAllocator.__new__(CoOptimizingAllocator)
+        allocator.size = 1024
+        gap_solver = MagicMock()
+        gap_solver.alignment = 64
+        gap_solver._pick_gap.return_value = SimpleNamespace(start=0)
+        with (
+            allocator_module.config.patch(lx_collective_output_staging=True),
+            patch.object(
+                allocator_module, "clone_at_graph_boundaries", return_value=True
+            ),
+            patch.object(
+                allocator_module, "_is_matmul_op", side_effect=lambda op: op is producer
+            ),
+            patch.object(allocator_module, "_access_group_path", return_value=()),
+            patch.object(allocator_module, "_is_tiled_advancing", return_value=False),
+            patch.object(
+                allocator_module.GraphEditor,
+                "collective_operand_name",
+                side_effect=lambda op: "result" if op is collective else None,
+            ),
+            patch.object(allocator_module, "origin_in_graph", return_value=object()),
+            patch.object(
+                allocator_module, "_extern_kernel_in_live_range", return_value=False
+            ) as external,
+            patch.object(
+                allocator_module,
+                "_collective_stage_storage_is_private",
+                return_value=True,
+            ),
+            patch.object(
+                allocator_module, "buffer_not_read_in_full", return_value=False
+            ),
+            patch.object(
+                allocator_module, "_would_produce_lx_back_gap", return_value=False
+            ) as gap,
+            patch.object(
+                allocator_module,
+                "get_ncores_for_buffers",
+                return_value=({}, {}, {"result": object()}),
+            ) as views,
+            patch.object(allocator_module, "partition_footprint", return_value=span),
+            nullcontext()
+            if real_gaps
+            else patch.object(
+                allocator_module, "FirstFitLayoutSolver", return_value=gap_solver
+            ),
+        ):
+            allocator._stage_collective_outputs(
+                graph, [*placed, buffer], [SimpleNamespace(consumer_names=("result",))]
+            )
+        self.assertEqual(buffer.uses, [0, 1])
+        return allocator, buffer, graph, collective, external, gap, views
+
+    def test_staging_switch_declines_before_placement(self):
+        from torch_spyre._inductor.scratchpad import allocator as allocator_module
+        from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
+        from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
+
+        allocator = CoOptimizingAllocator.__new__(CoOptimizingAllocator)
+        allocator.size = 1024
+        allocator._collective_output_stages = {"stale": object()}
+        held = LifetimeBoundBuffer("held", 128, [0], address=64)
+        with (
+            allocator_module.config.patch(lx_collective_output_staging=False),
+            patch.object(
+                allocator_module, "calculate_liveness", return_value={}
+            ) as live,
+            patch.object(allocator_module, "FirstFitLayoutSolver") as gaps,
+            patch.object(
+                allocator_module, "clone_at_graph_boundaries", return_value=True
+            ) as clone,
+        ):
+            self.assertFalse(
+                allocator_module.config.save_config_portable()[
+                    "lx_collective_output_staging"
+                ]
+            )
+            allocator._stage_collective_outputs(
+                SimpleNamespace(get_output_names=lambda: []), [held], []
+            )
+        self.assertEqual(allocator._collective_output_stages, {})
+        self.assertEqual(held.address, 64)
+        live.assert_not_called()
+        gaps.assert_not_called()
+        clone.assert_not_called()
+        with allocator_module.config.patch(lx_collective_output_staging=True):
+            self.assertTrue(
+                allocator_module.config.save_config_portable()[
+                    "lx_collective_output_staging"
+                ]
+            )
+
+    def test_inserted_operation_does_not_hide_eligible_stage(self):
+        allocator, buffer, graph, collective, external, gap, views = self._run_stage()
+        self.assertEqual(allocator._collective_output_stages, {"result": (collective,)})
+        self.assertEqual(buffer.address, 0)
+        external.assert_called_once_with(graph, [1, 2], excluded_op=collective)
+        gap.assert_called_once_with(graph, "result", [1, 2])
+        views.assert_called_once()
+
+    def test_new_current_reader_prevents_stage(self):
+        allocator, buffer, _, _, external, gap, views = self._run_stage(
+            extra_reader=True
+        )
+        self.assertEqual(allocator._collective_output_stages, {})
+        self.assertIsNone(buffer.address)
+        external.assert_not_called()
+        gap.assert_not_called()
+        views.assert_not_called()
+
+    def test_real_gap_solver_keeps_stages_disjoint_or_declines(self):
+        from torch_spyre._inductor.scratchpad.plan_solver import (
+            LifetimeBoundBuffer,
+            RelayoutCopyBuffer,
+        )
+
+        out, reduction = sympy.symbols("out reduction", integer=True)
+        placed = [
+            CoreDivisionBuffer(
+                "split_k",
+                512,
+                [90],
+                address=0,
+                core_divisions=[
+                    CoreDivision(
+                        splits={out: 2, reduction: 4},
+                        reduction_syms=frozenset({reduction}),
+                    )
+                ],
+                chosen_division=0,
+            ),
+            RelayoutCopyBuffer(
+                "__spyre_lx_relayout__:copy",
+                128,
+                [91],
+                address=384,
+                core_divisions=[CoreDivision()],
+                chosen_division=0,
+            ),
+            LifetimeBoundBuffer("late", 256, [92], address=768),
+        ]
+        # Reduction cores retain the full output part. Lifetimes do not
+        # overlap the candidate, but staging must still avoid every span.
+        self.assertEqual(placed[0].per_core_size(0), 256)
+        spans = ((0, 256), (384, 512), (768, 1024))
+        for span in (256, 384):
+            with self.subTest(span=span):
+                allocator, staged, _, collective, *_ = self._run_stage(
+                    placed=placed,
+                    span=span,
+                    real_gaps=True,
+                )
+                self.assertEqual([b.address for b in placed], [0, 384, 768])
+                if span == 384:
+                    self.assertIsNone(staged.address)
+                    self.assertEqual(allocator._collective_output_stages, {})
+                else:
+                    self.assertEqual(staged.address, 512)
+                    self.assertEqual(
+                        allocator._collective_output_stages, {"result": (collective,)}
+                    )
+                    for start, end in spans:
+                        self.assertTrue(
+                            staged.address + span <= start or end <= staged.address
+                        )
+
+    def test_stage_push_rewrites_a_captured_matmul_collective(self):
+        from torch._inductor.ir import ComputedBuffer, StorageBox, TensorBox
+        from torch.fx.experimental.proxy_tensor import make_fx
+
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.ir import (
+            AllReduceKernel,
+            FixedTiledLayout,
+            WaitKernel,
+        )
+        from torch_spyre._inductor.lowering import enable_spyre_lowerings
+        from torch_spyre._inductor.pass_utils import (
+            _is_matmul_op,
+            op_read_writes,
+            origin_in_graph,
+        )
+        from torch_spyre._inductor.scratchpad.allocator import (
+            ScratchpadAllocator,
+            _post_loop_collective_accesses,
+        )
+        from torch_spyre._inductor.scratchpad.graph_editor import (
+            GraphEditor,
+            unwrapped_buffer_name,
+        )
+        from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
+        from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
+
+        c10d = torch.ops._c10d_functional
+
+        def fn(x, weight):
+            # The in-place form Inductor's reinplace pass produces; the
+            # functional all_reduce lowers onto a clone of the matmul instead.
+            reduced = c10d.all_reduce_.default(x @ weight, "sum", "test_staging")
+            return c10d.wait_tensor.default(reduced) * 2.0
+
+        args = (
+            torch.empty(8, 16, dtype=torch.float16),
+            torch.empty(16, 64, dtype=torch.float16),
+        )
+        gm = make_fx(fn, tracing_mode="fake")(*args)
+        inputs = [n.meta["val"] for n in gm.graph.nodes if n.op == "placeholder"]
+        fake_mode = inputs[0].fake_mode
+        graph = GraphLowering(gm, example_inputs=inputs, shape_env=fake_mode.shape_env)
+        with (
+            V.set_graph_handler(graph),
+            V.set_fake_mode(fake_mode),
+            enable_spyre_lowerings(),
+        ):
+            graph.run(*inputs)
+            (collective,) = [
+                op for op in graph.operations if isinstance(op, AllReduceKernel)
+            ]
+            source = graph.get_buffer(GraphEditor.collective_operand_name(collective))
+            self.assertIsInstance(source, ComputedBuffer)
+            self.assertTrue(_is_matmul_op(source))
+            size, stride = list(source.layout.size), list(source.layout.stride)
+            source.layout = FixedTiledLayout(
+                torch.device("cpu"),
+                torch.float16,
+                size,
+                stride,
+                SpyreTensorLayout(size, stride, torch.float16, [0, 1]),
+            )
+            (wait,) = [op for op in graph.operations if isinstance(op, WaitKernel)]
+            (reader,) = [
+                op
+                for op in graph.operations
+                if isinstance(op, ComputedBuffer)
+                and op is not source
+                and source.get_name() in {dep.name for dep in op_read_writes(op).reads}
+            ]
+            # The in-place result lives in the matmul's storage, so the wait
+            # and the reader access it too, and all three move to the drain.
+            accesses = _post_loop_collective_accesses(
+                graph, source.get_name(), [collective, wait, reader], source
+            )
+            self.assertEqual(accesses, (collective, wait, reader))
+            # CPU lowering does not index the extern operands' users. Include
+            # the real collective and wait to test the editor's index update.
+            for op in (collective, wait):
+                user = TensorBox(StorageBox(op))
+                self.assertEqual(unwrapped_buffer_name(user), op.get_name())
+                if user not in graph.name_to_users[source.get_name()]:
+                    graph.name_to_users[source.get_name()].append(user)
+            original_operand = collective.inputs[0]
+            old_users = list(graph.name_to_users[source.get_name()])
+            moved_names = {op.get_name() for op in accesses}
+            moved_users = [
+                user for user in old_users if unwrapped_buffer_name(user) in moved_names
+            ]
+            kept_users = [user for user in old_users if user not in moved_users]
+            self.assertTrue(moved_users)
+            allocator = ScratchpadAllocator(GreedyLayoutSolver, 4096)
+            allocator._collective_output_stages = {source.get_name(): accesses}
+            view = object()
+            allocator._push_allocation(
+                graph,
+                [
+                    LifetimeBoundBuffer(
+                        source.get_name(),
+                        1024,
+                        [0, 1],
+                        address=128,
+                        lx_view=view,
+                    )
+                ],
+                [],
+            )
+
+            drain_name = GraphEditor.collective_operand_name(collective)
+            self.assertNotEqual(drain_name, source.get_name())
+            drain = graph.get_buffer(drain_name)
+            self.assertIs(graph.operations[graph.operations.index(source) + 1], drain)
+            self.assertLess(
+                graph.operations.index(drain), graph.operations.index(collective)
+            )
+            # create_inplace records the mutation on a MutationOutput.
+            self.assertEqual(
+                [m.mutation_names for m in collective.mutation_outputs], [[drain_name]]
+            )
+            self.assertIn(
+                drain_name, {dep.name for dep in op_read_writes(collective).reads}
+            )
+            # The wait and the later reader follow the result onto the drain.
+            self.assertEqual(GraphEditor._sole_operand_name(wait), drain_name)
+            reader_reads = {dep.name for dep in op_read_writes(reader).reads}
+            self.assertIn(drain_name, reader_reads)
+            self.assertNotIn(source.get_name(), reader_reads)
+            self.assertEqual(original_operand.get_name(), source.get_name())
+            self.assertEqual(graph.name_to_users[drain_name], moved_users)
+            self.assertEqual(graph.name_to_users[source.get_name()], kept_users)
+            self.assertEqual(source.layout.allocation, {"lx": 128})
+            self.assertIs(source.layout.lx_view, view)
+            self.assertEqual(drain.layout.allocation, {})
+            self.assertIsNone(drain.layout.lx_view)
+            self.assertEqual(drain.layout.stride, source.layout.stride)
+            self.assertIs(
+                drain.origin_node.args[0], origin_in_graph(source.origins, gm.graph)
+            )
+            self.assertIs(
+                origin_in_graph(collective.origins, gm.graph).args[0], drain.origin_node
+            )
+            gm.graph.lint()
 
 
 class _LoopOp:
@@ -10132,6 +10863,24 @@ class TestHoistedInputClone(unittest.TestCase):
         member = _LoopOp("member", (0,))
         self.assertEqual(counted_loop_group_path(hoisted_const), ())
         self.assertIs(counted_loop_entry([hoisted_const, member], member), member)
+
+    def test_the_allocator_path_matches_the_scratchpad_path(self):
+        # Both are now one call to loop_facts.counted_loop_path, so they cannot
+        # drift apart. What this pins is the DEFAULT they share: an extern kernel
+        # that keeps its loop_info (a hoisted constant) is not in the loop.
+        # Nothing else pins _access_group_path (the one other test patches it out).
+        from torch_spyre._inductor.scratchpad.allocator import _access_group_path
+        from torch_spyre._inductor.scratchpad.utils import counted_loop_group_path
+
+        for op, want in (
+            (_LoopOp("plain"), ()),
+            (_LoopOp("outer", (0,)), (0,)),
+            (_LoopOp("inner", (0, 1)), (0, 1)),
+            (_extern_op("hoisted_const", (0,)), ()),
+        ):
+            with self.subTest(op=op.get_name()):
+                self.assertEqual(_access_group_path(op), want)
+                self.assertEqual(counted_loop_group_path(op), want)
 
     def test_entry_is_the_loop_start_the_lifetime_overrides_reserve_from(self):
         """The hoist position and the reserved interval are the same index."""

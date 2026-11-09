@@ -65,16 +65,17 @@ from oot_framework.oot_test_common_methods_invocations import (
     create_module_inputs_func_from_config,
 )
 from oot_framework.oot_test_utilities import (
-    _OOT_PLATFORM_ARCH,
     _get_privateuse1_device_type,
     _log_warning,
     _log_error,
+    _platform_excluded,
     _platform_tags,
     _regex_entries_for_name,
     _build_test_entry_map,
     _select_entry_by_op_index,
     _select_entry_for_variant,
     _extract_op_name_from_method,
+    _OOT_PLATFORM_ARCH,
 )
 
 warnings.filterwarnings("ignore", category=pytest.PytestUnknownMarkWarning)
@@ -353,6 +354,8 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
                 # getattr(module_info, "apply_device_layout", False) so a
                 # ModuleInfo from any other source stays valid.
                 module_info.apply_device_layout = module_item.apply_device_layout
+                module_info.fp8_linears = list(module_item.fp8_linears)
+                module_info.module_precision = module_item.precision
                 module_db.append(module_info)
                 existing_names.add(module_name)
             except Exception as e:
@@ -457,6 +460,12 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
                 and test_type not in entry.labels
             ):
                 return False, f"Excluded by TEST_TYPE={test_type!r}", False, False
+
+        # Per-entry platform exclusion -- an entry tagged exclude__plat_<arch> is
+        # disabled only on that arch, even when other entries share this file
+        # (e.g. a merged multi-model run on Power).
+        if entry is not None and _platform_excluded(entry):
+            return False, f"Excluded on platform {_OOT_PLATFORM_ARCH!r}", False, False
 
         # dtype filtering — extract dtype from method_name and check against supported
         dtype_str = extract_dtype_from_name(method_name)
