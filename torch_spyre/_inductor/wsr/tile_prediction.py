@@ -97,7 +97,7 @@ from .tile import compute_tile_stride
 from ..errors import Unsupported
 
 
-logger = get_inductor_logger("tile_prediction")
+logger = get_inductor_logger("wsr.tile_prediction")
 
 
 @dataclass

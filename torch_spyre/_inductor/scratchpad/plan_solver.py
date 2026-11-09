@@ -778,7 +778,7 @@ class RelayoutCopyBuffer(CoreDivisionBuffer):
     ``destination_footprint_bytes``, the bound the committed path reserves for
     a relayout destination) times the DESTINATION's core count, and
     ``core_divisions`` holds one division sliced that many ways, so the
-    per-core footprint every engine derives (``size / output_partition``) is
+    per-core footprint every engine derives through :meth:`per_core_size` is
     exactly that span. For a broadcast the copy therefore lives on the
     consumer's cores while its source stays on fewer. ``parents`` is
     deliberately empty: the source edge is a relayout coupling, not a
@@ -804,6 +804,7 @@ class RelayoutCopyBuffer(CoreDivisionBuffer):
     def per_core_footprint(self) -> int:
         """The destination span: what one core must hold for the copy to be
         resident (``size`` is that span times the destination core count)."""
+        # A relayout group has one untiled destination division.
         return self.per_core_size(0)
 
     @property

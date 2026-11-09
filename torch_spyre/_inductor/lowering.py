@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+import operator
+import os
 import logging
 import math
 import threading
@@ -24,7 +26,6 @@ import sympy
 import torch
 import torch._inductor.ir as ir
 import torch._inductor.lowering as lowering
-from torch._inductor.graph import SubgraphLowering
 from torch._inductor.ir import Pointwise, Reduction, StorageBox
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
@@ -42,6 +43,8 @@ from .constants import (
     CONV2D_FWD_OP,
     COPY_BACK_CANDIDATE_ATTR,
     DEPTHWISE_CONV2D_OP,
+    FP16_MIN,
+    MAXPOOL2D_OP,
     DEVICE_NAME,
     DLFLOAT16_MAX,
     FP8_E4M3FN_MAX,
@@ -51,13 +54,15 @@ from .constants import (
 )
 from .errors import Unsupported
 from .ir import (
-    AllGatherAsyncFallback,
-    AllReduceAsyncFallback,
-    BroadcastAsyncFallback,
+    AllGatherKernel,
+    AllReduceKernel,
+    BroadcastKernel,
     SpyreConstantFallback,
     SpyreEmptyFallback,
     SpyreReduction,
-    WaitWorkFallback,
+    WaitKernel,
+    copy_back_view,
+    get_copy_back_producer,
 )
 from .logging_utils import get_inductor_logger
 
@@ -379,8 +384,6 @@ def lower_scaled_mm(
 
     mat1_size = mat1.get_size()
     mat2_size = mat2.get_size()
-    mat1_ndim = len(mat1_size)
-    mat2_ndim = len(mat2_size)
 
     mat1_dtype = mat1.get_dtype()
     mat2_dtype = mat2.get_dtype()
@@ -393,37 +396,18 @@ def lower_scaled_mm(
     output_dtype = out_dtype if out_dtype is not None else torch.float16
     reduction_numel = mat1_size[-1]
 
-    if mat1_ndim == 2 and mat2_ndim == 2:
-        # [M, K] × [K, N] → [M, N]
-        ranges = [mat1_size[0], mat2_size[1]]
-
-        def inner_fn(index, reduction_index):
-            i0, i1 = index
-            (r0,) = reduction_index
-            return (mat1_loader([i0, r0]), mat2_loader([r0, i1]))
-
-    elif mat1_ndim == 3 and mat2_ndim == 2:
-        # [B, M, K] × [K, N] → [B, M, N]
-        ranges = [mat1_size[0], mat1_size[1], mat2_size[1]]
-
-        def inner_fn(index, reduction_index):
-            i0, i1, i2 = index
-            (r0,) = reduction_index
-            return (mat1_loader([i0, i1, r0]), mat2_loader([r0, i2]))
-
-    elif mat1_ndim == 3 and mat2_ndim == 3:
-        # [B, M, K] × [B, K, N] → [B, M, N]
-        ranges = [mat1_size[0], mat1_size[1], mat2_size[2]]
-
-        def inner_fn(index, reduction_index):
-            i0, i1, i2 = index
-            (r0,) = reduction_index
-            return (mat1_loader([i0, i1, r0]), mat2_loader([i0, r0, i2]))
-
-    else:
+    # [M, K] × [K, N] → [M, N]. Batched operands go through lower_bmm_fp8.
+    if len(mat1_size) != 2 or len(mat2_size) != 2:
         raise Unsupported(
             f"_scaled_mm with shapes {mat1_size} and {mat2_size} not supported"
         )
+
+    ranges = [mat1_size[0], mat2_size[1]]
+
+    def inner_fn(index, reduction_index):
+        i0, i1 = index
+        (r0,) = reduction_index
+        return (mat1_loader([i0, r0]), mat2_loader([r0, i1]))
 
     result = Reduction.create(
         reduction_type=BATCH_MATMUL_FP8_OP,
@@ -444,6 +428,91 @@ def lower_scaled_mm(
             f"scaled_mm: mat1{[int(s) for s in mat1_size]} @ mat2{[int(s) for s in mat2_size]} "
             f"-> {[int(s) for s in result_buf.get_size()]}, "
             f"mat1_dtype={mat1_dtype}, mat2_dtype={mat2_dtype}, out_dtype={output_dtype}"
+        )
+
+    return result
+
+
+@register_spyre_lowering(torch.ops.spyre.bmm_fp8.default)
+def lower_bmm_fp8(
+    mat1,
+    mat2,
+    out_dtype=None,
+):
+    # FP8 batched matmul: the FP8 dtype checks and BATCH_MATMUL_FP8_OP reduction
+    # of lower_scaled_mm, with the per-batch-dim indexing of lower_bmm.
+    mat1.realize()
+    mat2.realize()
+    mat1_loader = mat1.make_loader()
+    mat2_loader = mat2.make_loader()
+
+    mat1_size = mat1.get_size()
+    mat2_size = mat2.get_size()
+    mat1_ndim = len(mat1_size)
+    mat2_ndim = len(mat2_size)
+
+    mat1_dtype = mat1.get_dtype()
+    mat2_dtype = mat2.get_dtype()
+
+    if mat1_dtype not in [torch.float8_e4m3fn]:
+        raise ValueError(f"Expected FP8 input for mat1, got {mat1_dtype}")
+    if mat2_dtype not in [torch.float8_e4m3fn]:
+        raise ValueError(f"Expected FP8 input for mat2, got {mat2_dtype}")
+
+    # [B, M, K] × [B, K, N] → [B, M, N]  and
+    # [B, H, M, K] × [B, H, K, N] → [B, H, M, N], with identical batch dims and
+    # a matching contraction dim. Size-1 batch broadcasting is not supported.
+    # [B, M, K] × [K, N] → [B, M, N] shares one mat2 across the batch.
+    shared_mat2 = mat1_ndim == 3 and mat2_ndim == 2
+    mat1_batch = [] if shared_mat2 else list(mat1_size[:-2])
+    if not (shared_mat2 or (mat1_ndim == mat2_ndim and mat1_ndim in (3, 4))) or any(
+        sympy.simplify(d1 - d2) != 0
+        for d1, d2 in zip(
+            [*mat1_batch, mat1_size[-1]], [*mat2_size[:-2], mat2_size[-2]]
+        )
+    ):
+        raise Unsupported(
+            f"bmm_fp8 with shapes {mat1_size} and {mat2_size} not supported"
+        )
+
+    output_dtype = out_dtype if out_dtype is not None else torch.float16
+    reduction_numel = mat1_size[-1]  # K
+    ranges = [*mat1_size[:-2], mat1_size[-2], mat2_size[-1]]
+
+    def inner_fn(index, reduction_index):
+        # Each batch dim keeps its own iteration symbol in both loaders.
+        # Recovering b and h from a fused batch index via // and % would put one
+        # symbol in two device coordinates, which garbles the dim-order scan in
+        # superdsc._get_device_dim_order. A shared mat2 has no batch dim to index.
+        *batch_index, row, column = index
+        (contraction,) = reduction_index
+        mat2_batch_index = [] if shared_mat2 else batch_index
+        return (
+            mat1_loader([*batch_index, row, contraction]),
+            mat2_loader([*mat2_batch_index, contraction, column]),
+        )
+
+    result = Reduction.create(
+        reduction_type=BATCH_MATMUL_FP8_OP,
+        input_node=[mat1, mat2],
+        device=mat1.get_device(),
+        dst_dtype=output_dtype,
+        src_dtype=mat1_dtype,
+        inner_fn=inner_fn,
+        ranges=ranges,
+        reduction_ranges=[reduction_numel],
+    )
+
+    result.realize()
+
+    if logger.isEnabledFor(logging.DEBUG):
+        result_buf = V.graph.get_buffer(result.get_name())
+        logger.debug(
+            f"bmm_fp8: mat1{[int(s) for s in mat1_size]} @ "
+            f"mat2{[int(s) for s in mat2_size]} "
+            f"-> {[int(s) for s in result_buf.get_size()]}, "
+            f"mat1_dtype={mat1_dtype}, mat2_dtype={mat2_dtype}, "
+            f"out_dtype={output_dtype}"
         )
 
     return result
@@ -872,6 +941,167 @@ def lower_topkindex(x, k, dim):
     return result
 
 
+def _pool2d_pair(value, default=None):
+    """Normalize an int-or-pair pooling argument to a ``(h, w)`` tuple."""
+    if value is None:
+        value = default
+    if isinstance(value, int):
+        return value, value
+    h, w = value
+    return h, w
+
+
+# Value that will fill the explicitly-materialized max_pool2d pad halo.
+#
+# Currently referenced only from the commented-out halo call in
+# lower_max_pool2d_with_indices (padding is gated off there -- see that comment).
+_MAX_POOL_PAD_VALUE = FP16_MIN
+
+
+def _max_pool2d_indices_are_used() -> bool:
+    """True if the current ``max_pool2d_with_indices`` node's indices are consumed.
+
+    ``maxpoolfwd`` computes only the window max, so this lowering cannot produce
+    indices.  ``aten.max_pool2d_with_indices`` is nominally two-output even for a
+    plain ``torch.max_pool2d`` call, but AOT's DCE drops the unused
+    ``getitem(1)`` before Inductor lowers the graph -- so the surviving users are
+    an accurate signal of whether indices are really needed.
+
+    Conservative on anything unexpected: if the node or its users cannot be
+    inspected, report True so the op falls back rather than silently returning
+    bogus indices.
+    """
+    node = getattr(V.graph, "current_node", None)
+    if node is None:
+        return True
+    try:
+        users = list(node.users)
+    except Exception:  # pragma: no cover - defensive
+        return True
+    for user in users:
+        # Anything other than a getitem on this multi-output node is opaque, so
+        # assume it may observe the indices.
+        if user.op != "call_function" or user.target is not operator.getitem:
+            return True
+        if user.args[1:] != (0,):
+            return True
+    return False
+
+
+def _lower_pool2d(
+    op,
+    x,
+    kernel_size,
+    stride,
+    padding,
+    *,
+    constants=None,
+):
+    """Build a windowed 2D pooling ``SpyreReduction`` for ``op``.
+
+    Shared by ``lower_avg_pool2d`` (``avgpoolfwd``) and
+    ``lower_max_pool2d_with_indices`` (``maxpoolfwd``).
+
+    ``padding`` must already be zero here -- callers that support padding
+    materialize it into ``x`` first (see ``lower_max_pool2d_with_indices``),
+    because the SDSC pad lanes are ``NOZEROPAD`` and so carry adjacent HBM
+    contents rather than a reduction identity.
+
+    Returns ``None`` if the kernel is degenerate along either axis (``k == 1``),
+    letting the caller delegate to an in-tree lowering: ``op`` is a *windowed*
+    reduction, and a 1-wide kernel has no pooling window along that axis (it is
+    an identity or a strided subsample), which the pool datapath cannot express
+    -- the DDL rejects a windowless pool ("Unknown primary dimension kind ...
+    for a window dimension").  ``_align_pool_dim_labels`` in codegen also relies
+    on both window dims always surviving for a pool SpyreReduction.
+    """
+    kH, kW = _pool2d_pair(kernel_size)
+    sH, sW = _pool2d_pair(stride, default=kernel_size)
+    pH, pW = _pool2d_pair(padding, default=0)
+    assert pH == 0 and pW == 0, (
+        f"_lower_pool2d requires padding to be materialized by the caller; "
+        f"got pad_h={pH}, pad_w={pW}"
+    )
+
+    if kH == 1 or kW == 1:
+        return None
+
+    N, C, H_in, W_in = x.get_size()
+
+    H_out = (H_in - kH) // sH + 1
+    W_out = (W_in - kW) // sW + 1
+
+    # A pool whose batch is 2 or more AND whose output has a size-1 spatial
+    # extent reads from the WRONG BATCH: output batch n takes its window from
+    # another batch's image.  The SDSC compiles and the values are real input
+    # elements, so this is invisible without a positional-ramp input -- raise
+    # rather than fall back, because a silent wrong answer is what this guard
+    # exists to prevent.
+    #
+    # ``x.get_size()`` yields sympy Integers, so ``isinstance(N, int)`` is False
+    # even for a static batch -- concretize instead, and treat a genuinely
+    # symbolic batch as potentially > 1.
+    from .pass_utils import concretize_expr
+
+    try:
+        n_batch: int | None = int(concretize_expr(N))
+    except (TypeError, ValueError):
+        n_batch = None
+    if (
+        (H_out == 1 or W_out == 1)
+        and (n_batch is None or n_batch > 1)
+        and os.environ.get("TORCH_SPYRE_POOL_UNSAFE") != "1"
+    ):
+        raise Unsupported(
+            f"pool with batch={n_batch if n_batch is not None else N} "
+            f"and a size-1 spatial output "
+            f"({H_out}x{W_out}) is not supported: the output reads from the "
+            "wrong batch. Batch 1 is correct at any geometry, and batch > 1 is "
+            "correct when both spatial output extents exceed 1."
+        )
+
+    pool_params = {
+        "kernel_h": kH,
+        "kernel_w": kW,
+        "stride_h": sH,
+        "stride_w": sW,
+        "pad_h": pH,
+        "pad_w": pW,
+        # True input extents.  Codegen needs these to emit paddingSizes_
+        # totalSize_/unneededPad_: when stride > kernel the window span
+        # ``(out-1)*stride + kernel`` UNDERRUNS the input (k=4 s=6 on 8 spans
+        # only 4 of 8 columns), and the SDSC must declare the real extent plus
+        # the unread slack rather than silently shrinking the tensor.
+        "in_h": H_in,
+        "in_w": W_in,
+    }
+    op_info = {
+        "constants": dict(constants or {}),
+        "pool_params": pool_params,
+    }
+
+    def inner_fn(index, reduction_index):
+        n, c, ho, wo = index
+        kh, kw = reduction_index
+        hi = ho * sH + kh
+        wi = wo * sW + kw
+        return x.make_loader()([n, c, hi, wi])
+
+    result = SpyreReduction.create(
+        reduction_type=op,
+        input_node=x,
+        device=x.get_device(),
+        dst_dtype=x.get_dtype(),
+        src_dtype=x.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=[N, C, H_out, W_out],
+        reduction_ranges=[kH, kW],
+        op_info=op_info,
+    )
+    result.realize()
+    return result
+
+
 @register_spyre_lowering(torch.ops.aten.avg_pool2d.default)
 def lower_avg_pool2d(
     x,
@@ -889,24 +1119,28 @@ def lower_avg_pool2d(
     if divisor_override is not None:
         raise Unsupported("avg_pool2d divisor_override not supported")
 
-    kH, kW = (kernel_size, kernel_size) if isinstance(kernel_size, int) else kernel_size
-    stride = stride if stride is not None else kernel_size
-    sH, sW = (stride, stride) if isinstance(stride, int) else stride
-    padding = padding if padding else 0
-    pH, pW = (padding, padding) if isinstance(padding, int) else padding
+    kH, kW = _pool2d_pair(kernel_size)
+    sH, sW = _pool2d_pair(stride, default=kernel_size)
+    pH, pW = _pool2d_pair(padding if padding else 0)
 
     if pH > 0 or pW > 0:
         raise Unsupported("avg_pool2d with non-zero padding not yet supported")
 
-    if kH == 1 or kW == 1:
-        # avgpoolfwd is a windowed reduction; a 1-wide kernel has no pooling
-        # window along that axis (it is an identity or a strided subsample),
-        # which the pool datapath cannot express — the backend rejects a windowless
-        # pool ("Unknown primary dimension kind ... for a window dimension").
-        # Spyre also has no eager avg_pool2d kernel to fall back to.  So delegate
-        # to the in-tree Inductor lowering, which decomposes avg_pool2d into
-        # pointwise/reduction ops the Spyre backend does support and keeps k=1
-        # on-device.
+    result = _lower_pool2d(
+        AVGPOOL2D_OP,
+        x,
+        (kH, kW),
+        (sH, sW),
+        (pH, pW),
+        # `nmap` is avgpoolfwd's window-mean multiplier. maxpoolfwd passes no
+        # constants: it requires opConsts_ == {}.
+        constants={"nmap": 1.0 / (kH * kW)},
+    )
+    if result is None:
+        # Degenerate k==1 window (see _lower_pool2d).  Spyre has no eager
+        # avg_pool2d kernel to fall back to, so delegate to the in-tree Inductor
+        # lowering, which decomposes avg_pool2d into pointwise/reduction ops the
+        # Spyre backend does support and keeps k=1 on-device.
         return lowering.avg_pool2d(
             x,
             [kH, kW],
@@ -916,48 +1150,101 @@ def lower_avg_pool2d(
             count_include_pad,
             divisor_override,
         )
-
-    N, C, H_in, W_in = x.get_size()
-
-    H_out = (H_in + 2 * pH - kH) // sH + 1
-    W_out = (W_in + 2 * pW - kW) // sW + 1
-
-    op_info = {
-        "constants": {
-            "kernel_h": kH,
-            "kernel_w": kW,
-            "stride_h": sH,
-            "stride_w": sW,
-            "pad_h": pH,
-            "pad_w": pW,
-            "scaling_factor": 1.0 / (kH * kW),
-        },
-    }
-
-    def inner_fn(index, reduction_index):
-        n, c, ho, wo = index
-        kh, kw = reduction_index
-        hi = ho * sH - pH + kh
-        wi = wo * sW - pW + kw
-        return x.make_loader()([n, c, hi, wi])
-
-    result = SpyreReduction.create(
-        reduction_type=AVGPOOL2D_OP,
-        input_node=x,
-        device=x.get_device(),
-        dst_dtype=x.get_dtype(),
-        src_dtype=x.get_dtype(),
-        inner_fn=inner_fn,
-        ranges=[N, C, H_out, W_out],
-        reduction_ranges=[kH, kW],
-        op_info=op_info,
-    )
-    # Realize so the pool becomes its own ComputedBuffer: codegen's
-    # kernel_store_reduction reads op_info (pool constants) off node.data.op_info,
-    # which only exists when the SpyreReduction is realized rather than fused into
-    # a consumer.
-    result.realize()
     return result
+
+
+@register_spyre_lowering(torch.ops.aten.max_pool2d_with_indices.default)
+def lower_max_pool2d_with_indices(
+    x,
+    kernel_size,
+    stride=None,
+    padding=0,
+    dilation=1,
+    ceil_mode=False,
+):
+    """Direct lowering of fp16 max_pool2d to a native ``maxpoolfwd`` SDSC.
+
+    ``torch.max_pool2d`` / ``F.max_pool2d`` always trace to
+    ``aten.max_pool2d_with_indices`` (there is no path that reaches
+    ``aten.max_pool2d.default``), so this is the op that must be lowered.  It is
+    nominally two-output ``(values, indices)``, but ``maxpoolfwd`` computes only
+    the window max -- its computeOp has one input and one output.  So this
+    lowering is **values-only**: it returns the pooled values plus an
+    ``indices`` placeholder, and any graph that actually consumes the indices
+    raises ``Unsupported`` (see ``_max_pool2d_indices_unsupported``).  Callers
+    that need indices (``return_indices=True``) therefore fall back rather than
+    silently receiving wrong indices.
+
+    ``aten.max_pool2d_with_indices`` is in Inductor's own decomposition table,
+    so it is listed in ``spyre_decompositions_to_exclude`` to survive to here.
+    """
+    if _max_pool2d_indices_are_used():
+        raise Unsupported(
+            "max_pool2d with return_indices=True not supported: the maxpoolfwd "
+            "datapath computes window values only, not argmax indices"
+        )
+    if ceil_mode:
+        raise Unsupported("max_pool2d ceil_mode not supported")
+    dH, dW = _pool2d_pair(dilation, default=1)
+    if dH != 1 or dW != 1:
+        raise Unsupported(
+            f"max_pool2d dilation={(dH, dW)} not supported (only dilation==1)"
+        )
+
+    kH, kW = _pool2d_pair(kernel_size)
+    sH, sW = _pool2d_pair(stride, default=kernel_size)
+    pH, pW = _pool2d_pair(padding if padding else 0)
+
+    if pH < 0 or pW < 0:
+        raise Unsupported(f"max_pool2d negative padding={(pH, pW)}")
+    if pH > kH // 2 or pW > kW // 2:
+        # Matches aten's own check: pad must not exceed half the kernel.
+        raise Unsupported(
+            f"max_pool2d padding={(pH, pW)} too large for kernel {(kH, kW)}"
+        )
+
+    if kH == 1 or kW == 1:
+        # Degenerate k==1 window (see _lower_pool2d).  Delegate to the in-tree
+        # lowering, which keeps the pool on-device as pointwise/reduction IR and
+        # produces real indices too.
+        return lowering.max_pool2d_with_indices(
+            x, [kH, kW], [sH, sW], [pH, pW], [dH, dW], ceil_mode
+        )
+
+    pooled_input = x
+    if pH > 0 or pW > 0:
+        # The intended implementation is the explicit halo below: the SDSC pad
+        # lanes are NOZEROPAD (_memorg_extra emits isPadded=1/isZeroPadded=0), so
+        # a padded pool read span pulls adjacent HBM rather than an identity
+        # value -- for a max reduction any such lane that exceeds the real window
+        # would win.  There is no -inf pad-fill PadType, so the halo has to be
+        # materialized with the max identity and the pool itself run unpadded.
+        # (The fill is _FP16_MIN, not float("-inf"), for the same reason codegen
+        # uses it for _get_mask_value("max"): -inf encodes as NaN through this
+        # path, and max(x, NaN) == NaN would poison the whole reduction rather
+        # than just the padded lanes.)
+        #
+        # It is gated off because materializing that halo is not yet expressible.
+        # The one line to restore when that is fixed:
+        #   pooled_input = lower_constant_pad_nd(
+        #       x, [pW, pW, pH, pH], _MAX_POOL_PAD_VALUE
+        #   )
+        raise Unsupported(
+            f"max_pool2d padding={(pH, pW)} not yet supported: the pad halo "
+            "cannot be materialized on the physically-NHWC pool input "
+            "(constant_pad_nd on a permuted NCHW view yields an unsupported "
+            "stick expression)"
+        )
+
+    values = _lower_pool2d(MAXPOOL2D_OP, pooled_input, (kH, kW), (sH, sW), (0, 0))
+    assert values is not None, "k==1 window handled above"
+
+    # aten.max_pool2d_with_indices is two-output, so the lowering must return a
+    # 2-tuple even though maxpoolfwd produces values only.  The indices slot is
+    # provably dead here: _max_pool2d_indices_are_used() above already bailed out
+    # if anything consumed it, so this placeholder is never read or codegen'd.
+    # It exists to satisfy the op schema's arity, not to carry a value.
+    return values, None
 
 
 @register_spyre_lowering(torch.ops.aten.convolution.default)
@@ -1931,8 +2218,8 @@ def lower_trunc(x):
 
     The device has no trunc op, so this computes floor(|x|) * clip(x, -1, 1),
     with no compare or select. A negative fraction gives 0.0 rather than -0.0,
-    since the device multiply makes no negative zero. Integers and bools are
-    returned as is.
+    since the device multiply makes no negative zero. An integer or bool input
+    comes back as a copy, since an op's result must not alias its input.
 
     The clip is Spyre's single clip op (lower_clamp). It and the product are
     realized with origins of their own, so split_multi_ops can split the bodies
@@ -1940,7 +2227,8 @@ def lower_trunc(x):
     a view only as a body's last op.
     """
     if not x.get_dtype().is_floating_point:
-        return x
+        # Upstream's clone keeps x's layout; ours forces the standard one.
+        return lowering.clone(x)
     origin = x.get_origin_node() if isinstance(x, ir.IRNode) else None
     origin_args = () if origin is None else (origin,)
     sign = lower_clamp(x, -1.0, 1.0)
@@ -2061,6 +2349,43 @@ def with_int64_fallback(fn, *args, convert_output=True):
     return output
 
 
+def _promoted_dtype(*args, kind):
+    """Return the result dtype for elementwise promotion of *args under kind.
+
+    Arguments in *args can be:
+    - Tensor IR nodes (objects with get_dtype())
+    - torch.dtype objects
+    - Python numbers (int, float, bool, complex, etc.) or sympy expressions
+    """
+
+    def _to_elementwise_arg(v):
+        if hasattr(v, "get_dtype"):
+            ndim = len(v.get_size()) if hasattr(v, "get_size") else 1
+            return torch.zeros([1] * ndim, dtype=v.get_dtype())
+        if isinstance(v, torch.dtype):
+            return torch.empty(0, dtype=v)
+        return v
+
+    return elementwise_dtypes(
+        *(_to_elementwise_arg(v) for v in args if v is not None),
+        type_promotion_kind=kind,
+    )[1]
+
+
+def _convert_to_dtype(v, dtype):
+    """Convert v to dtype for use in a pointwise lowering.
+
+    - Tensor operands: convert via to_dtype if not already at dtype, else return as-is.
+    - Python int scalars: coerce to float() when dtype is floating-point.
+    - Everything else (Python float, already-correct tensor, etc.): return unchanged.
+    """
+    if hasattr(v, "get_dtype"):
+        return v if v.get_dtype() == dtype else to_dtype(v, dtype)
+    if dtype.is_floating_point and isinstance(v, int):
+        return float(v)
+    return v
+
+
 @register_spyre_lowering(torch.ops.aten.where.self, type_promotion_kind=None)
 def lower_where(condition, self, other):
     # where3 requires all operands to share the same stick size.
@@ -2095,23 +2420,20 @@ def lower_where(condition, self, other):
     #   int32:      INT32TOFP32 (Spyre-native); cast back to int32 after
     #   int64:      CPU fallback for int→fp32; cast back to int64 after
 
-    self_t = torch.empty(0, dtype=self.get_dtype())
-    other_t = torch.empty(0, dtype=other.get_dtype())
-
     # result_dtype: what aten.where.self must return — NO_OPMATH promotion, which
     # prevents unintended fp16->fp32 promotion and ensures output dtype is correct
-    result_dtype, _ = elementwise_dtypes(
-        self_t,
-        other_t,
-        type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.NO_OPMATH,
+    result_dtype = _promoted_dtype(
+        self.get_dtype(),
+        other.get_dtype(),
+        kind=ELEMENTWISE_TYPE_PROMOTION_KIND.NO_OPMATH,
     )
 
     # val_dtype: the dtype we run the hardware op in — INT_TO_FLOAT promotes
     # integers to fp32 since Spyre has no integer where3.
-    _, val_dtype = elementwise_dtypes(
-        self_t,
-        other_t,
-        type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
+    val_dtype = _promoted_dtype(
+        self.get_dtype(),
+        other.get_dtype(),
+        kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
     )
 
     converted_self = (
@@ -2209,6 +2531,218 @@ def lower_sub(x, y, *, alpha=1):
         y = with_int64_fallback(lowering.mul, y, alpha_tensor)
         y.realize()
     return with_int64_fallback(lowering.sub, x, y)
+
+
+def _realized(t):
+    """Return t after realizing it as a fusion barrier in multi-step lowerings."""
+    t.realize()
+    return t
+
+
+def _div_operand_dtypes(x, y):
+    """Return (comp_dtype, result_dtype) for a division of x and y.
+
+    comp_dtype   — INT_TO_FLOAT promoted dtype; the dtype to run the hardware op
+                   in.  Integers promote to fp32; floats are unchanged.
+    result_dtype — NO_OPMATH promoted dtype; the natural output dtype for
+                   rounding_mode="floor"/"trunc" (e.g. int32/int32 → int32,
+                   fp16/fp16 → fp16).  Not used for true division, which always
+                   returns a float per PyTorch semantics.
+
+    Returns (None, None) when neither operand is a tensor (pure Python scalars).
+
+    Promotion table (cast-back applies to floor/trunc only, not true-div):
+
+      Operand pair    | comp_dtype| result_dtype | cast-back?
+      ----------------+-----------+--------------+-------------------------
+      fp32 / fp32     | fp32      | fp32         | no
+      fp16 / fp16     | fp16      | fp16         | no
+      fp16 / fp32     | fp32      | fp32         | no
+      int32 / int32   | fp32      | int32        | yes (floor only)
+      int64 / int64   | fp32      | int64        | yes (floor only)
+      int32 / fp32    | fp32      | fp32         | no
+      int32 / fp16    | fp16      | fp16         | no (fp16 dominates)
+      int64 / fp32    | fp32      | fp32         | no
+      int64 / fp16    | fp16      | fp16         | no (fp16 dominates)
+      bool / fp16     | fp16      | fp16         | no (fp16 dominates)
+      bool / fp32     | fp32      | fp32         | no (fp32 dominates)
+      bool / int32    | fp32      | int32        | yes (floor only)
+      bool / int64    | fp32      | int64        | yes (floor only)
+    """
+    if not any(hasattr(v, "get_dtype") for v in (x, y)):
+        return None, None
+    comp_dtype = _promoted_dtype(
+        x,
+        y,
+        kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
+    )
+    result_dtype = _promoted_dtype(
+        x,
+        y,
+        kind=ELEMENTWISE_TYPE_PROMOTION_KIND.NO_OPMATH,
+    )
+    return comp_dtype, result_dtype
+
+
+def _lower_div_impl(x, y, *, rounding_mode=None):
+    """Shared implementation for lower_div and lower_floor_divide.
+
+    Operand type promotion follows the same two-dtype pattern as lower_where:
+    - comp_dtype   (INT_TO_FLOAT): dtype to cast inputs to before the hardware op.
+                   Integers promote to fp32; floats stay at their native width.
+    - result_dtype (NO_OPMATH):   natural output dtype, used only for
+                   rounding_mode="floor"/"trunc" where int inputs return int.
+
+    Result dtype per mode:
+    - rounding_mode=None  : always comp_dtype (float), even for integer inputs —
+                            consistent with PyTorch true-division semantics.
+    - rounding_mode="floor": comp_dtype for the correction arithmetic; cast back
+                             to result_dtype at the end (int inputs → int out).
+                             Emits ~20 realize() barriers for a tensor divisor
+                             (~15 for a scalar divisor) — one per SDSC op; this
+                             is the minimum required for the sign-aware correction.
+    - rounding_mode="trunc": not yet implemented (raises Unsupported).
+
+    The scalar-divisor sign optimisation (y < 0 fold) requires y to be a
+    concrete Python int or float; sympy/symbolic scalars are not supported.
+    """
+    comp_dtype, result_dtype = _div_operand_dtypes(x, y)
+
+    if comp_dtype is not None:
+        x = _convert_to_dtype(x, comp_dtype)
+        y = _convert_to_dtype(y, comp_dtype)
+
+    if rounding_mode == "floor":
+        # All operands are now at comp_dtype (fp32 for integer inputs).
+        # Each _realized call is a fusion barrier (Spyre requires one op per SDSC).
+        # Inductor built-ins (lowering.<fn> / lowering.lowerings[...]) are used
+        # throughout rather than the Spyre lower_* wrappers: all operands are
+        # already at comp_dtype, and using the built-ins avoids emitting compound
+        # or non-composable intermediate wrapper ops that break SDSC single-op invariants.
+        #
+        # The +-1 quotient correction is only meaningful while the compute dtype's
+        # spacing is below 1 -- |q| <= 1024 for device fp16, |q| <= 2**24 for fp32.
+        # Above that, qf +- 1 rounds back to qf and the result is whatever the divider
+        # returned. Exact integer division beyond that range needs the quotient carried
+        # in more than one float; out of scope here.
+        #
+        # Two further limits apply within the quotient-magnitude bound:
+        #
+        # (1) Residual destruction. Even with |q| <= 1024, the correction can fail
+        #     when qf*y rounds back to exactly x, leaving rem=0 and the correction
+        #     blind. This affects ~2.7% of random fp16 pairs that are representable
+        #     on device and have |q| <= 1024. The bound is necessary but not
+        #     sufficient for exact floor division.
+        #
+        # (2) fp16 host inputs are re-rounded on arrival. Device fp16 is DL16, not
+        #     IEEE fp16, so values like 1853 arrive as 1854 before any lowering
+        #     runs. A host-side .float() before transfer preserves the intended
+        #     value; no on-device upcast can recover it. A host-fp16 reference is
+        #     therefore not a valid expectation for this op.
+        qf = _realized(lowering.div(x, y))
+        qf = _realized(lowering.floor(qf))
+        qf_initial = qf
+        # Quotient correction. Correct floor-division satisfies
+        #   0 <= rem*sign(y) < |y|,   where rem = x - qf*y        … (*)
+        # which holds for EITHER sign of y.  rem is computed via multiply-
+        # subtract (exact); re-dividing rem/y would reintroduce the same
+        # rounding error being corrected.
+        #
+        # Normalising by sign(y) gives rem_s = rem*sign(y), abs_y = |y|,
+        # turning (*) into the sign-independent test  0 <= rem_s < abs_y:
+        #   rem_s >= abs_y  => qf underestimated by 1  (add 1)
+        #   rem_s <  0      => qf overestimated  by 1  (subtract 1)
+        # The two conditions are mutually exclusive (rem_s < 0 and rem_s >= abs_y
+        # cannot both hold), so at most one correction is applied per element.
+        aten_ge = lowering.lowerings[torch.ops.aten.ge.Tensor]
+        aten_lt = lowering.lowerings[torch.ops.aten.lt.Tensor]
+        prod = _realized(lowering.mul(qf, y))
+        rem = _realized(lowering.sub(x, prod))
+        if hasattr(y, "get_dtype"):
+            y_neg = _realized(aten_lt(y, 0.0))
+            neg_rem = _realized(lowering.neg(rem))
+            neg_y = _realized(lowering.neg(y))
+            rem_s = _realized(lowering.where(y_neg, neg_rem, rem))
+            abs_y = _realized(lowering.where(y_neg, neg_y, y))
+        else:
+            # y is a Python scalar: its sign is known at compile time, so fold
+            # it statically instead of emitting the select.
+            # Only concrete int/float scalars reach here; symbolic values are
+            # not supported (comparison with sympy raises TypeError).
+            assert isinstance(y, (int, float)), (
+                f"_lower_div_impl: scalar divisor must be int or float, got {type(y)}"
+            )
+            rem_s = _realized(lowering.neg(rem)) if y < 0 else rem
+            abs_y = -y if y < 0 else y
+        over_est = _realized(aten_ge(rem_s, abs_y))
+        under_est = _realized(aten_lt(rem_s, 0.0))
+        qf_plus1 = _realized(lowering.add(qf, 1.0))
+        qf = _realized(lowering.where(over_est, qf_plus1, qf))
+        # qf_minus1 must derive from the UPDATED qf, so the two corrections
+        # compose instead of the second silently discarding the first.
+        qf_minus1 = _realized(lowering.sub(qf, 1.0))
+        qf = _realized(lowering.where(under_est, qf_minus1, qf))
+        # |x| < |y| => the quotient is 0 or -1 by sign alone. Do not apply
+        # residual correction there: x + y is not always representable, and a
+        # rounded-up residual trips over_est and turns a correct -1 into 0.
+        #
+        # The initial floor(div(x, y)) is exact when |x/y| is representable,
+        # but underflows to -0.0 when |x/y| < ~2^-32 (device DL16 subnormal
+        # floor). When it underflows, the residual path is correct (prod=0,
+        # rem=x, rem_s<0 → qf corrects to -1) and the unconditional restore
+        # breaks it. Guard with qf_initial < 0.0: only restore when floor(x/y)
+        # is representable as -1. lt(-0.0, 0.0) is false, so -0.0 falls
+        # through to the residual path.
+        abs_x = _realized(lowering.abs(x))
+        degenerate = _realized(aten_lt(abs_x, abs_y))
+        keep = _realized(
+            lowering.where(_realized(aten_lt(qf_initial, 0.0)), qf_initial, qf)
+        )
+        qf = _realized(lowering.where(degenerate, keep, qf))
+        # Cast back to result_dtype (e.g. fp32 → int32/int64 for integer inputs).
+        if result_dtype is not None and result_dtype != comp_dtype:
+            return to_dtype(qf, result_dtype, skip_trunc=True)
+        return qf
+
+    elif rounding_mode == "trunc":
+        # TODO(PR#3610): implement trunc-mode floor-division
+        raise Unsupported("div with rounding_mode='trunc' is not yet implemented")
+
+    else:
+        # rounding_mode=None (true division): result is always comp_dtype (float),
+        # even for integer inputs — consistent with PyTorch semantics.
+        # Inputs are already at comp_dtype; call lowering.div directly.
+        return lowering.div(x, y)
+
+
+@register_spyre_lowering(
+    torch.ops.aten.div.Tensor, type_promotion_kind=None, broadcast=True
+)
+@register_spyre_lowering(
+    torch.ops.aten.div.Tensor_mode, type_promotion_kind=None, broadcast=True
+)
+@register_spyre_lowering(
+    torch.ops.aten.div.Scalar, type_promotion_kind=None, broadcast=True
+)
+@register_spyre_lowering(
+    torch.ops.aten.div.Scalar_mode, type_promotion_kind=None, broadcast=True
+)
+@register_spyre_lowering(
+    torch.ops.aten.true_divide.Tensor, type_promotion_kind=None, broadcast=True
+)
+@register_spyre_lowering(
+    torch.ops.aten.true_divide.Scalar, type_promotion_kind=None, broadcast=True
+)
+def lower_div(x, y, *, rounding_mode=None):
+    return _lower_div_impl(x, y, rounding_mode=rounding_mode)
+
+
+@register_spyre_lowering(
+    torch.ops.aten.floor_divide, type_promotion_kind=None, broadcast=True
+)
+def lower_floor_divide(x, y):
+    # aten.floor_divide has no rounding_mode parameter; always floor division.
+    return _lower_div_impl(x, y, rounding_mode="floor")
 
 
 @register_spyre_lowering(
@@ -2334,14 +2868,14 @@ def _cmp_operand_dtype(tensors):
     """
     if all(t.get_dtype() == torch.bool for t in tensors):
         return torch.bool
-    _, operand_dtype = elementwise_dtypes(
-        *(torch.empty(0, dtype=t.get_dtype()) for t in tensors),
-        type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
+    operand_dtype = _promoted_dtype(
+        *(t.get_dtype() for t in tensors),
+        kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
     )
     return operand_dtype
 
 
-def _lower_cmp_impl(x, y, pointwise_fn, op_name: str):
+def _lower_cmp_impl(x, y, pointwise_fn):
     """Convert both operands to a common float dtype, then apply pointwise_fn.
 
     The operand dtype is computed from the TENSOR operands only, and a Python
@@ -2361,44 +2895,11 @@ def _lower_cmp_impl(x, y, pointwise_fn, op_name: str):
     """
     tensors = [v for v in (x, y) if hasattr(v, "get_dtype")]
 
-    # A 0-dim integer predicate of the form ``iter < N`` (while_loop /
-    # for_each_tile trip counter) must keep Inductor's stock integer form
-    # unchanged.  _extract_trip_count (wsr/for_each_tile_lowering.py) matches
-    # exactly one ``load(iter) < constant(int N)`` op in the cond graph; the
-    # int -> float cast below would insert a second op and coerce N to float,
-    # breaking both the single-op check and the loop count.
-    #
-    # The guard is narrowed to two conditions that are jointly precise:
-    #   1. op_name == "lt" -- _extract_trip_count only accepts lt; every other
-    #      0-dim integer compare (eq/ne/le/gt/ge) in a torch.cond branch or
-    #      while_loop body must still fall through to INT_TO_FLOAT promotion.
-    #   2. isinstance(V.graph, SubgraphLowering) -- the cond graph is always
-    #      compiled inside a SubgraphLowering.  Top-level 0-dim integer compares
-    #      (e.g. model-level torch.eq(i64[], N)) are compiled in a plain
-    #      GraphLowering and must not be skipped.
-    dtypes = {t.get_dtype() for t in tensors}
-    if (
-        op_name == "lt"
-        and isinstance(V.graph, SubgraphLowering)
-        and len(dtypes) == 1
-        and not next(iter(dtypes)).is_floating_point
-        and all(len(t.get_size()) == 0 for t in tensors)
-        and all(isinstance(v, int) for v in (x, y) if not hasattr(v, "get_dtype"))
-    ):
-        return pointwise_fn(x, y)
-
     operand_dtype = _cmp_operand_dtype(tensors)
 
-    def convert(v):
-        if hasattr(v, "get_dtype"):
-            if v.get_dtype() == operand_dtype:
-                return v
-            return to_dtype(v, operand_dtype)
-        if operand_dtype.is_floating_point and isinstance(v, int):
-            return float(v)
-        return v
-
-    return pointwise_fn(convert(x), convert(y))
+    return pointwise_fn(
+        _convert_to_dtype(x, operand_dtype), _convert_to_dtype(y, operand_dtype)
+    )
 
 
 def _is_host_cmp(x, y):
@@ -2442,7 +2943,7 @@ def _register_cmp_lowerings(aten_op, op_name: str):
     def _tensor(x, y):
         if _is_host_cmp(x, y):
             return stock_tensor(x, y)
-        return _lower_cmp_impl(x, y, pw, op_name=op_name)
+        return _lower_cmp_impl(x, y, pw)
 
     @register_spyre_lowering(
         aten_packet.Scalar,
@@ -2453,7 +2954,7 @@ def _register_cmp_lowerings(aten_op, op_name: str):
     def _scalar(x, y):
         if _is_host_cmp(x, y):
             return stock_scalar(x, y)
-        return _lower_cmp_impl(x, y, pw, op_name=op_name)
+        return _lower_cmp_impl(x, y, pw)
 
     return _tensor, _scalar
 
@@ -2515,6 +3016,14 @@ def lower_qfp8wt(x):
         traceback=x.get_traceback(),
     )
     pw.realize()
+    # The QFP8WT 2D stick pairs host dims -2 (K) and -1 (N), so the output must
+    # be row-major [..., K, N]. Left flexible, ComputedBuffer.get_fill_order()
+    # copies the stride order of a permuted input (e.g. k.transpose(-1, -2) in
+    # attention), the stick lands on the wrong dim, and the layout _qfp8wt_stl
+    # builds cannot be read by batchmatmulfp8. Same fix as the clone lowering.
+    pw.freeze_layout_with_stride_order(
+        ir.get_stride_order(ir.FlexibleLayout.contiguous_strides(pw.get_size()))
+    )
     return pw
 
 
@@ -2592,10 +3101,12 @@ def lower_quantscalepertokenfp8(x, scale_ub=FP8_E4M3FN_MAX):
 
 
 @register_spyre_lowering(
-    torch.ops.spyre.prod_dim_int,
+    torch.ops.aten.prod.dim_int,
     type_promotion_kind=None,
 )
 def lower_prod_dim(x, dim, keepdim=False):
+    # int64 is not natively supported by the hardware prod reduction; convert to
+    # fp32 via with_int64_fallback and cast the output back to int64.
     def _prod_dim_impl(x):
         kwargs = lowering._make_reduction_inner(
             x, axis=[dim], keepdims=keepdim, dtype=x.dtype, override_return_dtype=None
@@ -2647,136 +3158,123 @@ def lower_any_def(x):
 # ============================================================================
 # Direct c10d Lowerings
 # ============================================================================
-@register_spyre_lowering(torch.ops._c10d_functional.broadcast.default)
-def lower_c10d_broadcast_async(tensor, src_rank, group_name):
-    """
-    Direct lowering for _c10d_functional.broadcast using ASYNC pattern.
+# These mirror torch/_inductor/comm_lowering.py: nodes are built with the
+# upstream _CollectiveKernel factories (create_inplace / create_out_of_place /
+# create_wait), and only codegen is Spyre-specific (see SpyreCollectiveKernel).
+_c10d = torch.ops._c10d_functional
 
-    Creates an async broadcast operation that returns immediately without blocking.
-    This provides the infrastructure for potential communication-compute overlap,
-    though actual overlap depends on scheduler decisions.
 
-    Flow:
-      _c10d_functional.broadcast → This lowering → BroadcastAsyncFallback
-      → Generated code: torch.ops.spyre.broadcast_async() → C++ → spyre-comms (non-blocking)
-    """
+def _realize_collective_input(tensor):
+    # Views can retain their base allocation's padded descriptor. A copy
+    # obtains a finalized device layout for exactly the contributed elements.
+    if isinstance(tensor.data, ir.BaseView):
+        tensor = ir.ExternKernel.copy_input(tensor)
+    tensor.realize()
+    return tensor
+
+
+@register_spyre_lowering(_c10d.broadcast.default)
+def lower_c10d_broadcast(tensor, src_rank, group_name):
+    """Out-of-place broadcast: broadcast_run writes a fresh output tensor."""
     logger.debug(
-        "Lowering _c10d_functional.broadcast to BroadcastAsyncFallback "
-        "(src_rank=%s, group_name='%s')",
+        "Lowering _c10d_functional.broadcast (src_rank=%s, group_name='%s')",
         src_rank,
         group_name,
     )
-
-    tensor.realize()
+    tensor = _realize_collective_input(tensor)
     return ir.TensorBox.create(
-        BroadcastAsyncFallback(
-            torch.ops.spyre.broadcast_async.default,
-            tensor,
-            src_rank,
-            group_name,
+        BroadcastKernel.create_out_of_place(
+            _c10d.broadcast.default, tensor, src_rank, group_name
         )
     )
 
 
-@register_spyre_lowering(torch.ops._c10d_functional.wait_tensor.default)
-def lower_c10d_wait_tensor_async(tensor):
+@register_spyre_lowering(_c10d.wait_tensor.default)
+def lower_c10d_wait_tensor(tensor):
+    """Block until the collective producing *tensor* completes.
+
+    The wait mutates *tensor*, so returning it orders every later reader after
+    the wait.  When the collective operated on a materialized view (copy-back
+    case), the result is written back to the original mutation target.
     """
-    Direct lowering for _c10d_functional.wait_tensor using ASYNC pattern.
-
-    Synchronizes on the async broadcast operation, blocking until communication completes.
-
-    Flow:
-      _c10d_functional.wait_tensor → This lowering → WaitWorkFallback
-      → Generated code: torch.ops.spyre.wait_work() → C++ → work->wait()
-    """
-    logger.debug("Lowering _c10d_functional.wait_tensor to WaitWorkFallback")
-
+    logger.debug("Lowering _c10d_functional.wait_tensor")
     tensor.realize()
+    producer = get_copy_back_producer(tensor)
+    if producer is not None and producer.copy_back_result is not None:
+        return copy_back_view(tensor, producer, producer.copy_back_result)
+    if producer is None:
+        WaitKernel.create_wait(_c10d.wait_tensor.default, tensor)
+    else:
+        # Even a wait on a slice must complete and copy back the entire
+        # in-place contribution, so wait on the full temporary buffer.
+        result = ir.TensorBox(ir.StorageBox(producer))
+        WaitKernel.create_wait(_c10d.wait_tensor.default, result)
+        target = lowering.mutate_to(producer.mutation_target, result)
+        producer.copy_back_result = target
+        return copy_back_view(tensor, producer, target)
+    return tensor
+
+
+def _all_gather(tensor, group_size, group_name):
+    tensor = _realize_collective_input(tensor)
     return ir.TensorBox.create(
-        WaitWorkFallback(
-            torch.ops.spyre.wait_work.default,
-            tensor,
+        AllGatherKernel.create_out_of_place(
+            _c10d.all_gather_into_tensor.default, tensor, group_size, group_name
         )
     )
 
 
-@register_spyre_lowering(torch.ops._c10d_functional.all_gather_into_tensor.default)
-def lower_c10d_all_gather_async(tensor, group_size, group_name):
-    """
-    Direct lowering for _c10d_functional.all_gather_into_tensor using ASYNC pattern.
-
-    Creates an async all_gather operation that returns immediately without blocking.
-    Output tensor has shape[0] = input.shape[0] * group_size (concatenation of all ranks).
-
-    Flow:
-      _c10d_functional.all_gather_into_tensor → This lowering
-      → AllGatherAsyncFallback → Generated code:
-      torch.ops.spyre.all_gather_async() → C++ → spyre-comms (non-blocking)
-    """
-    logger.info(
-        "Lowering _c10d_functional.all_gather_into_tensor to "
-        "SpyreAllGatherAsyncFallback (group_size=%s, group_name='%s')",
+@register_spyre_lowering(_c10d.all_gather_into_tensor.default)
+def lower_c10d_all_gather(tensor, group_size, group_name):
+    """Out-of-place all_gather: output shape[0] = input.shape[0] * group_size."""
+    logger.debug(
+        "Lowering _c10d_functional.all_gather_into_tensor "
+        "(group_size=%s, group_name='%s')",
         group_size,
         group_name,
     )
+    return _all_gather(tensor, group_size, group_name)
 
-    tensor.realize()
-    return ir.TensorBox.create(
-        AllGatherAsyncFallback(
-            torch.ops.spyre.all_gather_async.default,
-            tensor,
-            group_size,
-            group_name,
-        )
+
+def _all_reduce_inplace(tensor, reduce_op, group_name):
+    mutation_target = tensor if isinstance(tensor.data, ir.BaseView) else None
+    tensor = _realize_collective_input(tensor)
+    AllReduceKernel.create_inplace(
+        _c10d.all_reduce_.default, tensor, reduce_op, group_name
     )
+    if mutation_target is not None:
+        # Tag the temporary buffer the kernel mutates; the wait lowering finds
+        # it through the waited tensor's alias chain and copies it back.
+        buf = tensor.data
+        while isinstance(buf, (ir.MutableBox, ir.BaseView)):
+            buf = buf.data
+        buf.mutation_target = mutation_target
+        buf.copy_back_result = None
+    return tensor
 
 
-@register_spyre_lowering(torch.ops._c10d_functional.all_reduce.default)
-def lower_c10d_all_reduce_async(tensor, reduce_op, group_name):
+@register_spyre_lowering(_c10d.all_reduce.default)
+def lower_c10d_all_reduce(tensor, reduce_op, group_name):
+    """Functional all_reduce, lowered as all_reduce_ on a clone of the input.
+
+    Inductor's reinplace pass already rewrites all_reduce to all_reduce_ when
+    the input is not needed afterwards, so reaching this lowering means the
+    input must be preserved.
     """
-    Direct lowering for _c10d_functional.all_reduce using ASYNC pattern.
-
-    Creates an async all_reduce operation that returns immediately without blocking.
-    Output tensor has shape[0] = input.shape[0].
-    """
-    tensor.realize()
     logger.debug(
-        "Lowering _c10d_functional.all_reduce to AllReduceAsyncFallback "
-        "(reduce_op=%s, group_name='%s')",
+        "Lowering _c10d_functional.all_reduce (reduce_op=%s, group_name='%s')",
         reduce_op,
         group_name,
     )
-    return ir.TensorBox.create(
-        AllReduceAsyncFallback(
-            torch.ops.spyre.all_reduce_async.default,
-            tensor,
-            reduce_op,
-            group_name,
-        )
-    )
+    return _all_reduce_inplace(clone(tensor), reduce_op, group_name)
 
 
-@register_spyre_lowering(torch.ops._c10d_functional.all_reduce_.default)
+@register_spyre_lowering(_c10d.all_reduce_.default)
 def lower_c10d_all_reduce_inplace(tensor, reduce_op, group_name):
-    """
-    Lowering for _c10d_functional.all_reduce_ (in-place variant).
-
-    Inductor's reinplace pass converts the functional all_reduce to the in-place
-    all_reduce_ when the output shape matches the input. This lowering catches
-    that case and emits the same Spyre all_reduce op (always in-place on device).
-    """
-    tensor.realize()
+    """In-place all_reduce_ (produced by the reinplace pass)."""
     logger.debug(
-        "Lowering _c10d_functional.all_reduce_ to AllReduceAsyncFallback "
-        "(reduce_op=%s, group_name='%s')",
+        "Lowering _c10d_functional.all_reduce_ (reduce_op=%s, group_name='%s')",
         reduce_op,
         group_name,
     )
-    return ir.TensorBox.create(
-        AllReduceAsyncFallback(
-            torch.ops._c10d_functional.all_reduce_.default,
-            tensor,
-            reduce_op,
-            group_name,
-        )
-    )
+    return _all_reduce_inplace(tensor, reduce_op, group_name)

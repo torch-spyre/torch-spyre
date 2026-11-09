@@ -17,9 +17,21 @@ import os
 import pytest
 import torch
 import torch.distributed as dist
-from torch.testing._internal.common_utils import TestCase, run_tests
+from torch.testing._internal.common_utils import (
+    TestCase,
+    instantiate_parametrized_tests,
+    parametrize,
+    run_tests,
+)
 
-from utils import _assert_tensor_equal
+from utils import (
+    _assert_tensor_equal,
+    _bfloat16_collective_expected,
+    _bfloat16_rank_input,
+    _collective_expected,
+    _collective_rank_input,
+    _native_bfloat16_tensor,
+)
 
 # Skip all tests if RANK is not defined, or WORLD_SIZE is not set or less than 2
 if "RANK" not in os.environ:
@@ -51,7 +63,28 @@ DEVICE = torch.device(f"spyre:{os.getenv('RANK', '0')}")
 C10D_BACKEND = "spyreccl"
 
 
+@instantiate_parametrized_tests
 class TestAllReduce(TestCase):
+    @parametrize("dtype", [torch.float16, torch.bfloat16])
+    @parametrize("async_op", [False, True])
+    def test_allreduce_scalar(self, dtype, async_op):
+        """SUM covers a scalar's logical value within its padded allocation."""
+        scale = 2.0**20 if dtype == torch.bfloat16 else 16.0
+        x = torch.tensor(scale * (self.comm_rank + 1), dtype=dtype).to(DEVICE)
+        work = dist.all_reduce(x, op=dist.ReduceOp.SUM, async_op=async_op)
+        if async_op:
+            self.assertIsNotNone(work)
+            work.wait()
+            self.assertTrue(work.is_completed())
+        else:
+            self.assertIsNone(work)
+        expected = torch.tensor(
+            scale * self.comm_size * (self.comm_size + 1) / 2, dtype=dtype
+        )
+        result = x.cpu()
+        self.assertEqual(result.shape, torch.Size([]))
+        self.assertEqual(result, expected, rtol=0, atol=0)
+
     @classmethod
     def setUpClass(cls):
         """Set up the distributed environment once for all tests."""
@@ -149,6 +182,58 @@ class TestAllReduce(TestCase):
     def test_allreduce_2d_tensor_float16_async(self):
         """Test allreduce with 2D tensor shapes using float16 and async_op=True."""
         self._test_allreduce_helper(shape=(4, 64), dtype=torch.float16, async_op=True)
+
+    @parametrize("shape", [(128,), (4, 64), (4, 96)])
+    @parametrize("async_op", [False, True])
+    def test_allreduce_bfloat16(self, shape, async_op):
+        x = _bfloat16_rank_input(self.comm_rank, shape).to(DEVICE)
+        work = dist.all_reduce(x, async_op=async_op)
+        if async_op:
+            self.assertIsNotNone(work)
+            work.wait()
+        else:
+            self.assertIsNone(work)
+        self.assertEqual(
+            x.cpu(),
+            _bfloat16_collective_expected("allreduce", shape, self.comm_size),
+            rtol=0,
+            atol=0,
+        )
+
+    @parametrize("async_op", [False, True])
+    def test_allreduce_float16_padded(self, async_op):
+        shape = (4, 96)
+        x = _collective_rank_input(self.comm_rank, shape, torch.float16).to(DEVICE)
+        work = dist.all_reduce(x, async_op=async_op)
+        if async_op:
+            work.wait()
+        self.assertEqual(
+            x.cpu(),
+            _collective_expected("allreduce", shape, self.comm_size, torch.float16),
+            rtol=0,
+            atol=0,
+        )
+
+    def test_allreduce_bfloat16_rejects_non_dl16_storage(self):
+        x = _native_bfloat16_tensor(DEVICE)
+        with self.assertRaisesRegex(
+            RuntimeError, "BF16 collectives require DL16 device storage"
+        ):
+            dist.all_reduce(x)
+
+    @parametrize("dtype", [torch.float16, torch.bfloat16])
+    @parametrize("prefix", [False, True])
+    def test_allreduce_rejects_unsupported_storage_view(self, dtype, prefix):
+        expected = torch.ones((5, 96), dtype=dtype)
+        base = expected.to(DEVICE)
+        x = base[:-1] if prefix else base[1:]
+        self.assertEqual(x.storage_offset() == 0, prefix)
+        error = (
+            "matching device storage extent" if prefix else "nonzero storage offsets"
+        )
+        with self.assertRaisesRegex(RuntimeError, error):
+            dist.all_reduce(x)
+        self.assertTrue(torch.equal(base.cpu(), expected))
 
 
 if __name__ == "__main__":

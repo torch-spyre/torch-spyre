@@ -464,6 +464,7 @@ COMPILED_OPS = [
     aten.div,
     aten.exp,
     aten.floor,
+    aten.trunc,
     aten.index_select,
     aten.index_copy.out,
     aten.log,
@@ -485,6 +486,8 @@ COMPILED_OPS = [
     aten.le,
     aten.ne.Tensor,
     aten.ne.Tensor_out,
+    aten.ne.Scalar,
+    aten.ne.Scalar_out,
     aten.ge,
     aten.gt,
     aten.lt,
@@ -503,6 +506,7 @@ COMPILED_OPS = [
     aten.any.default,
     aten.any.dim,
     aten.any.dims,
+    aten.repeat,
 ]
 
 register_torch_compile_kernel(COMPILED_OPS)
@@ -625,6 +629,47 @@ def register_inplace_kernels(ops):
 register_inplace_kernels(COMPILED_OPS)
 
 
+# cumsum's decomposition covers only aten.cumsum.default; out= and in-place
+# (cumsum_ reaches cumsum.out) run it and copy_ the result, like
+# _make_inplace_kernel.
+@torch.library.register_kernel("aten::cumsum.out", ["spyre"])  # type:ignore
+def spyre__cumsum_out(
+    self: torch.Tensor,
+    dim: int,
+    *,
+    dtype: torch.dtype | None = None,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Functional cumsum + ``copy_`` into ``out``.
+
+    Without ``dtype`` the result takes ``out``'s dtype, as on CPU.
+    """
+    _check_same_device([(out, True), (self, False)])
+    if dtype is not None and dtype != out.dtype:
+        raise RuntimeError(
+            f"Expected out tensor to have dtype {dtype}, but got {out.dtype} instead"
+        )
+    result = torch.cumsum(self, dim, dtype=out.dtype)
+    if out.shape != result.shape:
+        out.resize_(result.shape)
+    out.copy_(result)
+    return out
+
+
+@torch.library.register_kernel("aten::cumsum_", ["spyre"])  # type:ignore
+def spyre__cumsum_(
+    self: torch.Tensor, dim: int, *, dtype: torch.dtype | None = None
+) -> torch.Tensor:
+    """Functional cumsum in ``self``'s dtype + ``copy_`` back into ``self``."""
+    if dtype is not None and dtype != self.dtype:
+        raise RuntimeError(
+            f"Bad in-place call: input tensor dtype {self.dtype} and output "
+            f"tensor dtype {dtype} should match"
+        )
+    self.copy_(torch.cumsum(self, dim, dtype=self.dtype))
+    return self
+
+
 @torch.library.register_kernel("aten::fill_.Scalar", ["spyre"])  # type:ignore
 def spyre__fill_scalar(
     self: torch.Tensor, other: int | float | bool | complex
@@ -716,6 +761,94 @@ def spyre__random_from(self, from_=0, to=1, generator=None) -> torch.Tensor:
     return self
 
 
+def _row_index(self, indices):
+    """The int32 Spyre row index for ``self[index]``, or raise for any other form.
+
+    Only one 1-D integer index on dim 0 is supported (row selection, e.g. the
+    sampled rows of a decoder's hidden states). The index is bounds-checked and
+    its negative entries wrapped on the host, as eager CPU indexing does, so an
+    index already on Spyre takes a D2H round trip, a host-side int32 cast and an
+    H2D back.
+    """
+    # Invalid on every device, so raise what CPU raises, before the scope check.
+    if any(
+        i is not None
+        and i.dtype not in (torch.int64, torch.int32, torch.uint8, torch.bool)
+        for i in indices
+    ):
+        raise IndexError(
+            "tensors used as indices must be long, int, byte or bool tensors"
+        )
+    if (
+        len(indices) != 1
+        or indices[0] is None
+        or indices[0].dim() != 1
+        or indices[0].dtype not in (torch.int32, torch.int64)
+    ):
+        raise NotImplementedError(
+            "Spyre aten::index.Tensor supports only x[index] with a single 1-D "
+            "int32/int64 index tensor on dim 0"
+        )
+    if self.dtype == torch.bool:
+        # TODO(#6043): the device copy of a bool tensor drops its values, so a
+        # gather or a broadcast would return wrong rows without an error.
+        raise NotImplementedError(
+            "Spyre aten::index.Tensor does not support bool source tensors"
+        )
+    index = indices[0]
+    if index.device.type != "cpu" and index.device != self.device:
+        raise RuntimeError(
+            "indices should be either on cpu or on the same device as the "
+            f"indexed tensor ({self.device})"
+        )
+    if self.dim() == 0:
+        raise IndexError("too many indices for tensor of dimension 0")
+    index = index.cpu()
+    rows = self.shape[0]
+    if index.numel() and (index.min() < -rows or index.max() >= rows):
+        raise IndexError(f"index out of range for dimension 0 with size {rows}")
+    index = torch.where(index < 0, index + rows, index)
+    # Spyre has no int64 index kernel.
+    return index.to(torch.int32).to(self.device)
+
+
+def _stick_runs_along_a_row(self):
+    """Whether the device stick of ``self`` lies along a non-singleton dim past 0.
+
+    Decided from the physical layout: the stride of a size-1 dim says nothing
+    about it, so equal views can carry different strides there.
+    """
+    stick_stride = self.device_tensor_layout().stride_map[-1]
+    return any(
+        self.shape[d] > 1 and self.stride(d) == stick_stride
+        for d in range(1, self.dim())
+    )
+
+
+@torch.library.register_kernel("aten::index.Tensor", ["spyre"])  # type:ignore
+def spyre__index_tensor(self, indices):
+    """``self[index]`` for a 1-D integer index, as an ``index_select`` on dim 0.
+
+    ``index_select`` compiles once per index length and source shape and layout
+    (``dynamic=False``), so a caller that sees many lengths should pad the index
+    onto a fixed set of them.
+
+    Eager only: the path choice reads the source's device layout, which a
+    FakeTensor does not have.
+    """
+    index = _row_index(self, indices)
+    if index.numel() == 0:
+        return torch.empty((0, *self.shape[1:]), dtype=self.dtype, device=self.device)
+    if self.shape[0] == 1 and _stick_runs_along_a_row(self):
+        # Every in-range index of a one-row source is 0, so this is a broadcast.
+        # index_select on a one-row source whose stick runs along the row lowers
+        # to an op the backend can't schedule (identity for one index, stick
+        # mismatch for more). When the stick runs across rows instead (e.g. a
+        # transposed column), index_select works and the broadcast does not.
+        return self.expand(index.numel(), *self.shape[1:]).clone()
+    return torch.index_select(self, 0, index)
+
+
 @torch.library.register_kernel("aten::_local_scalar_dense", "spyre")
 def spyre__local_scalar_dense(self):
     return self.cpu().item()
@@ -761,15 +894,23 @@ def spyre__copy_from(self, dst, non_blocking=False):
         return dst
     elif self.device.type == "spyre" and self.device == dst.device:
         # copy_from_d2d requires torch.compile, which cannot run inside
-        # no_dispatch() (e.g. during FakeTensorMode constant propagation).
-        # Fall back to a CPU roundtrip copy in that case.
+        # no_dispatch() or 2.14's eager-on-nested-compile tracing regions
+        # (e.g. during FakeTensorMode constant propagation). Use a CPU
+        # roundtrip in those regions so the copy does not re-enter its kernel.
         #
         # Detecting "am I inside no_dispatch()" uses the private
         # ``torch._C._dispatch_tls_is_dispatch_key_excluded("Python")`` (no
         # public predicate exists — no_dispatch() excludes the Python dispatch
         # key). Revisit if upstream exposes a stable API; the alternative
         # (attempt copy_from_d2d and catch the re-entrancy failure) is worse.
-        if torch._C._dispatch_tls_is_dispatch_key_excluded("Python"):
+        # Dynamo's private predicate covers the separate tracing flag added in
+        # 2.14; the Python dispatch key can remain enabled in that region.
+        from torch._dynamo.eval_frame import _is_eager_on_nested_compile
+
+        if (
+            torch._C._dispatch_tls_is_dispatch_key_excluded("Python")
+            or _is_eager_on_nested_compile()
+        ):
             cpu_tmp = self.to("cpu")
             copy_tensor(cpu_tmp, dst, non_blocking)
         else:

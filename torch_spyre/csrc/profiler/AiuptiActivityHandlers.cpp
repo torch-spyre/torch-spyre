@@ -56,54 +56,6 @@ class RuntimeTraceActivity : public libkineto::GenericTraceActivity {
 }  // namespace
 
 // =========== Session Private Methods ============= //
-void AiuptiActivityProfilerSession::removeCorrelatedPtiActivities(
-    const libkineto::ITraceActivity* act1) {
-  const auto key = act1->correlationId();
-  const auto& it = correlatedPtiActivities_.find(key);
-  if (it != correlatedPtiActivities_.end()) correlatedPtiActivities_.erase(key);
-  return;
-}
-
-void AiuptiActivityProfilerSession::checkTimestampOrder(
-    const libkineto::ITraceActivity* act1) {
-  const auto& it = correlatedPtiActivities_.find(act1->correlationId());
-  if (it == correlatedPtiActivities_.end()) {
-    correlatedPtiActivities_.insert({act1->correlationId(), act1});
-    return;
-  }
-
-  const libkineto::ITraceActivity* act2 = it->second;
-  if (act2->type() == libkineto::ActivityType::PRIVATEUSE1_RUNTIME)
-    std::swap(act1, act2);
-  if (act1->timestamp() > act2->timestamp()) {
-    std::string err_msg;
-    err_msg += "AIU op timestamp (" + std::to_string(act2->timestamp());
-    err_msg += ") < runtime timestamp (" + std::to_string(act1->timestamp());
-    err_msg += ") by " + std::to_string(act1->timestamp() - act2->timestamp());
-    err_msg += "us Name: " + act2->name();
-    err_msg += " Device: " + std::to_string(act2->deviceId());
-    err_msg += " Queue: " + std::to_string(act2->resourceId());
-    errors_.push_back(err_msg);
-  }
-}
-
-inline bool AiuptiActivityProfilerSession::outOfRange(
-    const libkineto::ITraceActivity& act) {
-  bool out_of_range =
-      act.timestamp() < captureWindowStartTime_ ||
-      (act.timestamp() + act.duration()) > captureWindowEndTime_;
-  if (out_of_range) {
-    std::string err_msg;
-    err_msg += "TraceActivity outside of profiling window: " + act.name();
-    err_msg += " (" + std::to_string(act.timestamp());
-    err_msg += " < " + std::to_string(captureWindowStartTime_);
-    err_msg += " or " + std::to_string(act.timestamp() + act.duration());
-    err_msg += " > " + std::to_string(captureWindowEndTime_);
-    errors_.push_back(err_msg);
-  }
-  return out_of_range;
-}
-
 const libkineto::ITraceActivity*
 AiuptiActivityProfilerSession::linkedCpuActivity(uint64_t externalId) {
   // Kineto's lookup callback currently accepts int32_t. Preserve wider IDs in
@@ -328,6 +280,43 @@ inline std::string runtimeCbidName(AIUpti_runtime_api_trace_cbid cbid) {
       return "aiuCommsHdmaFirmwareReset";
     case AIUPTI_RUNTIME_TRACE_CBID_WAIT_FOR_QUEUE_CAPACITY:
       return "aiuWaitForQueueCapacity";
+
+    // ResponseWorker CBIDS (79-82)
+    case AIUPTI_RUNTIME_TRACE_CBID_FETCH_RESPONSE_BLOCKS:
+      return "aiuFetchResponseBlocks";
+    case AIUPTI_RUNTIME_TRACE_CBID_RESPONSE_COMPLETION_THREAD:
+      return "aiuResponseCompletionThread";
+    case AIUPTI_RUNTIME_TRACE_CBID_PARSE_RESPONSE_BLOCKS:
+      return "aiuParseResponseBlocks";
+    case AIUPTI_RUNTIME_TRACE_CBID_ITERATION_DURATION:
+      return "aiuIterationDuration";
+
+    // CBIDS 83 to 84 are reserved
+    // P2P RDMA CBIDS (85 - 91)
+    case AIUPTI_RUNTIME_TRACE_CBID_P2P_RDMA_MULTICAST:
+      return "aiuP2PRdmaMulticast";
+    case AIUPTI_RUNTIME_TRACE_CBID_P2P_RDMA_WAIT:
+      return "aiuP2PRdmaWait";
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULE_P2P_RDMA_SEND:
+      return "aiuScheduleP2PRdmaSend";
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULE_P2P_RDMA_WAIT:
+      return "aiuScheduleP2PRdmaWait";
+    case AIUPTI_RUNTIME_TRACE_CBID_LAUNCH_P2P_RDMA_SEND:
+      return "aiuLaunchP2PRdmaSend";
+    case AIUPTI_RUNTIME_TRACE_CBID_LAUNCH_P2P_RDMA_WAIT:
+      return "aiuLaunchP2PRdmaWait";
+    case AIUPTI_RUNTIME_TRACE_CBID_INITIALIZE_P2P:
+      return "aiuInitializeP2P";
+
+    // Scheduler submit/barrier CBIDS (102-105)
+    case AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_DMA:
+      return "aiuSubmitDMA";
+    case AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_COMPUTE:
+      return "aiuSubmitCompute";
+    case AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_FILL:
+      return "aiuSubmitFill";
+    case AIUPTI_RUNTIME_TRACE_CBID_ISSUE_BARRIER:
+      return "aiuIssueBarrier";
     default:
       break;
   }
@@ -488,18 +477,32 @@ void AiuptiActivityProfilerSession::handleRuntimeActivity(
       runtime_activity->addMetadata("bytes", activity->data);
       break;
 
+    case AIUPTI_RUNTIME_TRACE_CBID_ISSUE_BARRIER:
+      runtime_activity->addMetadata("fence_size", activity->data);
+      break;
+
+    case AIUPTI_RUNTIME_TRACE_CBID_P2P_RDMA_MULTICAST:
+      runtime_activity->addMetadata("bytes", activity->data);
+      break;
+
+    case AIUPTI_RUNTIME_TRACE_CBID_P2P_RDMA_WAIT:
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULE_P2P_RDMA_WAIT:
+    case AIUPTI_RUNTIME_TRACE_CBID_LAUNCH_P2P_RDMA_WAIT:
+      runtime_activity->addMetadata("num_sids", activity->data);
+      break;
+
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULE_P2P_RDMA_SEND:
+    case AIUPTI_RUNTIME_TRACE_CBID_LAUNCH_P2P_RDMA_SEND:
+      runtime_activity->addMetadata("num_dest_ranks", activity->data);
+      break;
+
+    case AIUPTI_RUNTIME_TRACE_CBID_INITIALIZE_P2P:
+      runtime_activity->addMetadata("world_size", activity->data);
+      break;
+
     default:
       break;
   }
-
-  // checkTimestampOrder(&*runtime_activity);
-  // if (outOfRange(*runtime_activity)) {
-  //   traceBuffer_.span.opCount -= 1;
-  //   traceBuffer_.gpuOpCount -= 1;
-  //   removeCorrelatedPtiActivities(&*runtime_activity);
-  //   traceBuffer_.activities.pop_back();
-  //   return;
-  // }
   runtime_activity->log(*logger);
 }
 
@@ -520,7 +523,7 @@ void AiuptiActivityProfilerSession::handleKernelActivity(
                               ? "estimated (host completion, 1 ns/tick)"
                               : "calibrated");
   kernel_activity->id = activity->correlation_id;
-  kernel_activity->device = activity->device_id;
+  kernel_activity->device = activity->device_index;
   kernel_activity->resource = activity->stream_id;
   kernel_activity->threadId = activity->stream_id;
   kernel_activity->flow.id = launchActivityIds_.count(activity->correlation_id)
@@ -532,11 +535,16 @@ void AiuptiActivityProfilerSession::handleKernelActivity(
   kernel_activity->addMetadata("queued", activity->queued);
   kernel_activity->addMetadata("submitted", activity->submitted);
   kernel_activity->addMetadata("device", kernel_activity->deviceId());
-  kernel_activity->addMetadata("stream", 1);
+  kernel_activity->addMetadata("stream", activity->stream_id);
   kernel_activity->addMetadataQuoted("context",
                                      std::to_string(activity->context_id));
   kernel_activity->addMetadata("correlation", activity->correlation_id);
   addCollMetadata(kernel_activity, activity);
+  const std::string name_base = spyre::activityNameBase(activity->name);
+  const std::string bundle_prefix = spyre::lookupBundleDirPrefix(name_base);
+  if (!bundle_prefix.empty()) {
+    kernel_activity->addMetadataQuoted("sdsc_bundle_dir_prefix", bundle_prefix);
+  }
   if (const auto key = spyre::extractKernelProvenanceKey(activity->name)) {
     kernel_activity->addMetadataQuoted("provenance_key", *key);
     if (const auto ids = spyre::lookupKernelProvenance(*key)) {
@@ -549,15 +557,6 @@ void AiuptiActivityProfilerSession::handleKernelActivity(
   kernel_activity->addMetadata("cycles_ts", cyclesTsJson(activity));
 
   recordStream(kernel_activity->device, kernel_activity->resource);
-
-  // checkTimestampOrder(&*kernel_activity);
-  // if (outOfRange(*kernel_activity)) {
-  //   traceBuffer_.span.opCount -= 1;
-  //   traceBuffer_.gpuOpCount -= 1;
-  //   removeCorrelatedPtiActivities(&*kernel_activity);
-  //   traceBuffer_.activities.pop_back();
-  //   return;
-  // }
   kernel_activity->log(*logger);
 }
 
@@ -600,7 +599,7 @@ uint32_t AiuptiActivityProfilerSession::getResourceId(
   uint32_t overlap_offset = 0;
   uint32_t base_resource_id = getBaseResourceId(activity);
   const auto it =
-      activeThreadMap_.find({activity->device_id, base_resource_id});
+      activeThreadMap_.find({activity->device_index, base_resource_id});
   if (it != activeThreadMap_.end()) {
     std::vector<int64_t>& last_active_times = (*it).second;
     bool found_useable_thread = false;
@@ -616,10 +615,11 @@ uint32_t AiuptiActivityProfilerSession::getResourceId(
       last_active_times.push_back(activity->end);
       overlap_offset = last_active_times.size() - 1;
     }
-    activeThreadMap_[{activity->device_id, base_resource_id}][overlap_offset] =
-        activity->end;
+    activeThreadMap_[{activity->device_index, base_resource_id}]
+                    [overlap_offset] = activity->end;
   } else {
-    activeThreadMap_[{activity->device_id, base_resource_id}] = {activity->end};
+    activeThreadMap_[{activity->device_index, base_resource_id}] = {
+        activity->end};
   }
   return base_resource_id + overlap_offset;
 }
@@ -648,7 +648,7 @@ void AiuptiActivityProfilerSession::handleMemcpyActivity(
                               ? "estimated (host completion, 1 ns/tick)"
                               : "calibrated");
   memcpy_activity->id = activity->correlation_id;
-  memcpy_activity->device = activity->device_id;
+  memcpy_activity->device = activity->device_index;
   memcpy_activity->resource = getResourceId(activity);
   memcpy_activity->threadId = activity->stream_id;
   memcpy_activity->flow.id = launchActivityIds_.count(activity->correlation_id)
@@ -666,6 +666,7 @@ void AiuptiActivityProfilerSession::handleMemcpyActivity(
   memcpy_activity->addMetadata("memory operation id", activity->copy_kind);
   memcpy_activity->addMetadata("bytes", activity->bytes);
   memcpy_activity->addMetadata("memory bandwidth (GB/s)", bandwidth(activity));
+  memcpy_activity->addMetadata("stream", activity->stream_id);
   // AIUpti_ActivityMemcpy does not say whether the record came from a
   // command buffer (real counters) or a standalone flex MEMCPY (always 0;
   // today flex reports every DMA this way), so omit the key when all slots
@@ -683,15 +684,6 @@ void AiuptiActivityProfilerSession::handleMemcpyActivity(
   } else {
     recordMemoryStream(memcpy_activity->device, memcpy_activity->resource, " ");
   }
-  // TODO(mamaral): verify if we can enable this
-  // checkTimestampOrder(&*memcpy_activity);
-  // if (outOfRange(*memcpy_activity)) {
-  //   traceBuffer_.span.opCount -= 1;
-  //   traceBuffer_.gpuOpCount -= 1;
-  //   removeCorrelatedPtiActivities(&*memcpy_activity);
-  //   traceBuffer_.activities.pop_back();
-  //   return;
-  // }
   memcpy_activity->log(*logger);
 }
 
@@ -720,15 +712,13 @@ void AiuptiActivityProfilerSession::handleMemoryActivity(
         traceBuffer_.span, libkineto::ActivityType::PRIVATEUSE1_DRIVER,
         fmt::format("Memory ({})",
                     memoryOperationName(activity->memory_operation_type)));
-    // memcpyName(
-    //     activity->memcpy_type, activity->mem_src, activity->mem_dst));
     auto& mem_activity = traceBuffer_.activities.back();
     mem_activity->startTime = activity->start;
     mem_activity->endTime = activity->end;
     // Memory management uses host timestamps, not calibrated device ticks.
     mem_activity->addMetadataQuoted("timestamp_source", "host");
     mem_activity->id = activity->correlation_id;
-    mem_activity->device = activity->device_id;
+    mem_activity->device = activity->device_index;
     mem_activity->resource = getResourceId(activity);
     mem_activity->threadId = activity->stream_id;
     mem_activity->flow.id = 0;
@@ -745,6 +735,7 @@ void AiuptiActivityProfilerSession::handleMemoryActivity(
                               activity->memory_operation_type);
     mem_activity->addMetadata("bytes", activity->bytes);
     mem_activity->addMetadata("memory bandwidth (GB/s)", bandwidth(activity));
+    mem_activity->addMetadata("stream", activity->stream_id);
 
     if (mem_activity->resource == getBaseResourceId(activity)) {
       recordMemoryStream(mem_activity->device, mem_activity->resource,
@@ -752,14 +743,6 @@ void AiuptiActivityProfilerSession::handleMemoryActivity(
     } else {
       recordMemoryStream(mem_activity->device, mem_activity->resource, " ");
     }
-    // checkTimestampOrder(&*mem_activity);
-    // if (outOfRange(*mem_activity)) {
-    //   traceBuffer_.span.opCount -= 1;
-    //   traceBuffer_.gpuOpCount -= 1;
-    //   removeCorrelatedPtiActivities(&*mem_activity);
-    //   traceBuffer_.activities.pop_back();
-    //   return;
-    // }
     mem_activity->log(*logger);
   }
 
@@ -789,7 +772,7 @@ void AiuptiActivityProfilerSession::handleMemoryActivity(
   memory_event->addMetadata("Total Allocated", totalAllocatedBytes_);
   memory_event->addMetadata("Bytes", bytes);
   memory_event->addMetadata("Addr", activity->address);
-  memory_event->addMetadata("Device Id", activity->device_id);
+  memory_event->addMetadata("Device Id", activity->device_index);
   memory_event->addMetadata("Device Type", 1);
 
   memory_event->log(*logger);
@@ -810,7 +793,7 @@ void AiuptiActivityProfilerSession::handleMemsetActivity(
   // Libaiupti represents host-timed allocations as MEMSET records.
   memset_activity->addMetadataQuoted("timestamp_source", "host");
   memset_activity->id = activity->correlation_id;
-  memset_activity->device = activity->device_id;
+  memset_activity->device = activity->device_index;
   // TODO(mcalman): investigate why memset activities are being processed out
   // of order This prevents us from using getResourceId which handles overlap
   memset_activity->resource = getBaseResourceId(activity);
@@ -826,6 +809,7 @@ void AiuptiActivityProfilerSession::handleMemsetActivity(
   memset_activity->addMetadata("correlation", activity->correlation_id);
   memset_activity->addMetadata("bytes", activity->bytes);
   memset_activity->addMetadata("memory bandwidth (GB/s)", bandwidth(activity));
+  memset_activity->addMetadata("stream", activity->stream_id);
 
   if (memset_activity->resource == getBaseResourceId(activity)) {
     recordMemoryStream(memset_activity->device, memset_activity->resource,
@@ -833,16 +817,6 @@ void AiuptiActivityProfilerSession::handleMemsetActivity(
   } else {
     recordMemoryStream(memset_activity->device, memset_activity->resource, " ");
   }
-
-  // TODO(mamaral): verify if we can enable this
-  // checkTimestampOrder(&*memset_activity);
-  // if (outOfRange(*memset_activity)) {
-  //   traceBuffer_.span.opCount -= 1;
-  //   traceBuffer_.gpuOpCount -= 1;
-  //   removeCorrelatedPtiActivities(&*memset_activity);
-  //   traceBuffer_.activities.pop_back();
-  //   return;
-  // }
   memset_activity->log(*logger);
 }
 

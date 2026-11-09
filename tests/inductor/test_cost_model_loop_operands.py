@@ -304,7 +304,7 @@ def test_cpsat_keeps_the_burst_price_when_replication_resolves_to_one():
 
 
 def test_stick_plane_geometry_measures_the_source_burst():
-    from torch_spyre._inductor import dump_cost_model as dcm
+    from torch_spyre._inductor import cost_features as dcm
 
     b, h, s, d = sympy.symbols("b h s d", integer=True, nonnegative=True)
     # Granite's interleaved query [B, S, H, D] as the device stores it:
