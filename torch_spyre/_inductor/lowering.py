@@ -2601,7 +2601,8 @@ def _lower_div_impl(x, y, *, rounding_mode=None):
                              Emits ~20 realize() barriers for a tensor divisor
                              (~15 for a scalar divisor) — one per SDSC op; this
                              is the minimum required for the sign-aware correction.
-    - rounding_mode="trunc": not yet implemented (raises Unsupported).
+    - rounding_mode="trunc": same correction on |x| / |y| with the sign applied
+                             last; cast back to result_dtype like "floor".
 
     The scalar-divisor sign optimisation (y < 0 fold) requires y to be a
     concrete Python int or float; sympy/symbolic scalars are not supported.
@@ -2611,6 +2612,9 @@ def _lower_div_impl(x, y, *, rounding_mode=None):
     if comp_dtype is not None:
         x = _convert_to_dtype(x, comp_dtype)
         y = _convert_to_dtype(y, comp_dtype)
+
+    aten_ge = lowering.lowerings[torch.ops.aten.ge.Tensor]
+    aten_lt = lowering.lowerings[torch.ops.aten.lt.Tensor]
 
     if rounding_mode == "floor":
         # All operands are now at comp_dtype (fp32 for integer inputs).
@@ -2654,8 +2658,6 @@ def _lower_div_impl(x, y, *, rounding_mode=None):
         #   rem_s <  0      => qf overestimated  by 1  (subtract 1)
         # The two conditions are mutually exclusive (rem_s < 0 and rem_s >= abs_y
         # cannot both hold), so at most one correction is applied per element.
-        aten_ge = lowering.lowerings[torch.ops.aten.ge.Tensor]
-        aten_lt = lowering.lowerings[torch.ops.aten.lt.Tensor]
         prod = _realized(lowering.mul(qf, y))
         rem = _realized(lowering.sub(x, prod))
         if hasattr(y, "get_dtype"):
@@ -2705,8 +2707,59 @@ def _lower_div_impl(x, y, *, rounding_mode=None):
         return qf
 
     elif rounding_mode == "trunc":
-        # TODO(PR#3610): implement trunc-mode floor-division
-        raise Unsupported("div with rounding_mode='trunc' is not yet implemented")
+        # trunc(x/y) = sign(x)*sign(y) * floor(|x| / |y|). Negation is exact, so
+        # the quotient is computed on magnitudes with the same residual correction
+        # as the "floor" branch, and the sign is applied last.
+        # Same barrier / built-in conventions as the "floor" branch; the same
+        # quotient-magnitude bound, residual-destruction and DL16 limits apply.
+        #
+        # With both operands non-negative, the floor branch's special cases go
+        # away:
+        #   - sign(|y|) = +1, so rem needs no normalisation (no rem_s / abs_y
+        #     select).
+        #   - |x| < |y| => the quotient is 0, never -1. If div rounds |x|/|y| up
+        #     to 1.0, then |y|/2 <= |x| < |y| and rem = |x| - |y| is exact
+        #     (Sterbenz) and negative, so under_est corrects it to 0.
+        #   - |x/y| underflowing floors to +0, which is already correct, so no
+        #     qf_initial < 0 restore is needed.
+        abs_x = _realized(lowering.abs(x))
+        if hasattr(y, "get_dtype"):
+            abs_y = _realized(lowering.abs(y))
+        else:
+            # y is a Python scalar: fold |y| and its sign at compile time.
+            assert isinstance(y, (int, float)), (
+                f"_lower_div_impl: scalar divisor must be int or float, got {type(y)}"
+            )
+            abs_y = -y if y < 0 else y
+        qf = _realized(lowering.div(abs_x, abs_y))
+        qf = _realized(lowering.floor(qf))
+        # Residual via multiply-subtract (exact), as in the "floor" branch.
+        # Correct truncation of magnitudes satisfies 0 <= rem < abs_y.
+        prod = _realized(lowering.mul(qf, abs_y))
+        rem = _realized(lowering.sub(abs_x, prod))
+        over_est = _realized(aten_ge(rem, abs_y))
+        under_est = _realized(aten_lt(rem, 0.0))
+        qf_plus1 = _realized(lowering.add(qf, 1.0))
+        qf = _realized(lowering.where(over_est, qf_plus1, qf))
+        # qf_minus1 must derive from the UPDATED qf, so the two corrections
+        # compose instead of the second silently discarding the first.
+        qf_minus1 = _realized(lowering.sub(qf, 1.0))
+        qf = _realized(lowering.where(under_est, qf_minus1, qf))
+        # Apply sign(x)*sign(y) as two selects rather than a bool ne(x<0, y<0).
+        # Do not test mul(x, y) < 0: the product can underflow to 0 or overflow.
+        # Negating qf = +0 yields -0.0, matching PyTorch's float result for
+        # e.g. -1.0 / 2.0 (trunc); the int cast below discards it.
+        x_neg = _realized(aten_lt(x, 0.0))
+        qf = _realized(lowering.where(x_neg, _realized(lowering.neg(qf)), qf))
+        if hasattr(y, "get_dtype"):
+            y_neg = _realized(aten_lt(y, 0.0))
+            qf = _realized(lowering.where(y_neg, _realized(lowering.neg(qf)), qf))
+        elif y < 0:
+            qf = _realized(lowering.neg(qf))
+        # Cast back to result_dtype (e.g. fp32 → int32/int64 for integer inputs).
+        if result_dtype is not None and result_dtype != comp_dtype:
+            return to_dtype(qf, result_dtype, skip_trunc=True)
+        return qf
 
     else:
         # rounding_mode=None (true division): result is always comp_dtype (float),

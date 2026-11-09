@@ -9748,24 +9748,59 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     torch.tensor([-12, -21, 31, -7], dtype=torch.int64),
                     -2,
                 ),
-                # ── trunc fp16/fp32: not yet implemented ─────────────────────────
-                # The Spyre lowering raises Unsupported for trunc on float types.
+                # ── trunc fp16/fp32 ──────────────────────────────────────────────
+                # fp16: integer-valued inputs, as for floor_fp16_rand_2d. With
+                # random fractional fp16, DL16 re-rounds inputs on transfer and
+                # the fp16 residual can round to 0, so neither the host-fp16
+                # reference nor the device result is the exact quotient.
                 "trunc_fp16_rand_2d": (
                     "trunc",
-                    cached_randn((67, 256), dtype=torch.float16, scale=50.0),
-                    cached_randn((67, 256), dtype=torch.float16, abs=True, scale=10.0),
+                    torch.randint(
+                        -100,
+                        101,
+                        (67, 256),
+                        generator=torch.Generator().manual_seed(0xAF03),
+                    ).to(torch.float16),
+                    torch.randint(
+                        2,
+                        11,
+                        (67, 256),
+                        generator=torch.Generator().manual_seed(0xAF04),
+                    ).to(torch.float16),
+                ),
+                # Mixed-sign divisors exercise the sign(y) select.
+                "trunc_fp16_mixed_sign_2d": (
+                    "trunc",
+                    torch.randint(
+                        -100,
+                        101,
+                        (67, 256),
+                        generator=torch.Generator().manual_seed(0xAF05),
+                    ).to(torch.float16),
+                    (
+                        torch.randint(
+                            2,
+                            11,
+                            (67, 256),
+                            generator=torch.Generator().manual_seed(0xAF06),
+                        )
+                        * (
+                            torch.randint(
+                                0,
+                                2,
+                                (67, 256),
+                                generator=torch.Generator().manual_seed(0xAF07),
+                            )
+                            * 2
+                            - 1
+                        )
+                    ).to(torch.float16),
                 ),
                 "trunc_fp32_rand_2d": (
                     "trunc",
                     cached_randn((67, 256), dtype=torch.float32, scale=50.0),
                     cached_randn((67, 256), dtype=torch.float32, abs=True, scale=10.0),
                 ),
-            },
-            # TODO(#3610): implement trunc-mode floor-division; remove expect_raise below
-            "expect_raise": {
-                "trunc_int64_rand_2d": "rounding_mode='trunc' is not yet implemented",
-                "trunc_fp16_rand_2d": "rounding_mode='trunc' is not yet implemented",
-                "trunc_fp32_rand_2d": "rounding_mode='trunc' is not yet implemented",
             },
         },
         # -----------------------------------------------------------------------
