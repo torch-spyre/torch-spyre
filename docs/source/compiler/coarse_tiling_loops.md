@@ -192,8 +192,8 @@ defaults to true and is set false only by a no-behaviour-change test.
 After `splice_while_loops` runs (at 51ms, the *very first* pass, ahead of
 even `deadcode_elimination`; see [pass ordering](#invariants-and-failure-modes)
 below) and every later pass (`split_multi_ops`,
-`propagate_spyre_tensor_layouts`, `insert_restickify`, `span_reduction`,
-`_distribute_work`, `_maybe_scratchpad_planning`) has run,
+`propagate_spyre_tensor_layouts`, `insert_restickify`, `_distribute_work`,
+`_maybe_scratchpad_planning`) has run,
 `graph.operations` contains three tiled ops living inside the spliced loop
 body, plus a `buf4` placeholder for the eventual output `z` (created earlier
 by Dynamo's `getitem_3`/`empty_strided`). This is the real, unedited output of
@@ -796,7 +796,6 @@ self.passes = [
     _maybe_coarse_tile_span_overflow,  # span_overflow_groups + coarse_tile_post_stickify,
                                        # needs FixedTiledLayout.device_layout
     # Core Division
-    span_reduction,
     _distribute_work,             # calls cost_model_matmul_division + work_distribution
     # LX Planning
     _maybe_scratchpad_planning,   # config-gated; calls scratchpad_planning
@@ -853,9 +852,10 @@ space so that cores divide the per-iteration work, not the full pre-tiling
 iteration space. Running coarse tiling after `work_distribution` would
 produce ownership sized for the full range, which would then be wrong
 relative to the reduced `ranges` written by the tiling pass.
-`span_reduction` and `cost_model_matmul_division` have the same requirement
-and already run before `work_distribution`, so placing `coarse_tile` with
-them is consistent.
+`cost_model_matmul_division` has the same requirement and already runs
+before `work_distribution`, so placing `coarse_tile` with it is consistent.
+The span floors need no slot of their own: each division computes them
+from the op as it is then, so they see the tiled iteration space.
 
 `scratchpad_planning` must run after coarse tiling because it sizes
 scratchpad allocations to fit the per-iteration working set.  If it ran
@@ -1912,8 +1912,8 @@ tiled dims in `loop_info.loop_tiled_dims` on the corresponding
 `ir.Operation`, selected from the scheduler-level `iteration_space` keys.
 
 **Pass ordering**: coarse tiling must run after stickify/padding and
-before `span_reduction`, `cost_model_matmul_division`, `work_distribution`,
-and `scratchpad_planning`.  `build_loop_scheduler_nodes` must run in
+before `cost_model_matmul_division`, `work_distribution`, and
+`scratchpad_planning`.  `build_loop_scheduler_nodes` must run in
 `CustomPreFusionPasses` (before Inductor's own fusion pass and before
 `spyre_fuse_nodes`), see the ordering rationale above.  `for_each_tile`'s
 `splice_while_loops` runs even earlier than `coarse_tile_post_stickify()`

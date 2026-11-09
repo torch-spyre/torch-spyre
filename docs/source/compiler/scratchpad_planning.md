@@ -153,7 +153,6 @@ insert_post_mutation_restickify
 insert_restickify_padding
 dedup_and_promote_constants
 _maybe_coarse_tile_span_overflow      # span-overflow coarse tiling (post-stickification)
-span_reduction                        # work-division: enforce 256 MB span
 cost_model_matmul_division            # work-division: matmul cost model (*)
 work_distribution                     # work-division: default distributor (*)
 _maybe_scratchpad_planning            # ← THIS PASS, gated by config.lx_planning
@@ -162,12 +161,15 @@ _maybe_scratchpad_planning            # ← THIS PASS, gated by config.lx_planni
 (*) Run by `_distribute_work`, which leaves them to the LX solve when it
 chooses the splits itself (see below).
 
-Three ordering constraints fix this slot:
+Every candidate split the planner considers must keep each op's per-core
+span under 256 MB. Those minimum splits, the
+[span floors](work_division_planning.md#span-floors), do not constrain the
+order: the planner computes them when it builds each op's split menu, in
+the candidate's own frame, so a coarse tiling that shrinks a span relaxes
+them.
 
-- **Span floors must be set first.** `span_reduction` always runs before
-  planning. It commits the minimum split that keeps each op's per-core
-  span under 256 MB, and every candidate split the planner considers must
-  meet it.
+Two ordering constraints fix this slot:
+
 - **Each op needs a committed split wherever the planner reads one.**
   Placement-only planning sizes per-core buffers from the symbol-keyed
   `iteration_space_ownership` that work division commits, and checks

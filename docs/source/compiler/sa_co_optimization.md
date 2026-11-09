@@ -62,17 +62,18 @@ uninterpretable rather than merely illegal. The tiling half of the space is `Til
 The space is **ragged**. Each tiling is judged in its own per-tile frame, the context
 `work_division_context_for_op(op, max_cores, tiling)` builds, as the CP-SAT menu is. A tile level
 cuts its axis's extent, so a core split of that axis must divide the smaller extent; it cuts the
-per-core span too, so `MAX_SPAN_BYTES` can admit a split map the untiled op cannot take. The per-axis
-domains are nested — a divisor of the per-tile extent divides the whole one, and the committed span
-floors bind both — so the untiled ones are the widest and the view inverse searching them misses
-nothing. The joint verdict is not nested, so whatever falls back from a tiled config to its untiled
-twin checks the twin, as the recolor anchor does.
+per-core span too, so `MAX_SPAN_BYTES` can admit a split map the untiled op cannot take. Each frame
+also computes its own span floors (`span_floors`), so a tiling that shrinks a span lowers them. The
+per-axis domains are therefore not nested: a divisor of the per-tile extent divides the whole one,
+but a per-tile domain can hold a factor below the untiled floor. Every move draws an axis's factors
+from the domain of the tiling at hand (`OpSplitSpace.factor_domains_at`): the flip, the recolor
+anchor and the view inverse alike. The joint verdict is not nested either, so whatever falls back
+from a tiled config to its untiled twin checks the twin, as the recolor anchor does.
 
-In practice that difference is empty. An op that fits untiled at some split fits at any split
-meeting the committed floors, which every tiled-admitted split meets. An op that fits at none never
-reaches the search untiled: `span_reduction_pass` refuses it, unless the opt-in span-overflow pass
-has tiled it first, and an op already tiled is offered no tiling. So this search still only finds
-tilings that pay through LX residency.
+So a tiling can pair with smaller splits than the untiled op can take. An op that fits at no split
+untiled is still tiled, if at all, by the opt-in span-overflow pass before the search, and an op
+already tiled is offered no tiling. This search still only finds tilings that pay through LX
+residency.
 
 That payoff is not a derate. Every tiling-sensitive derate in the cost model is bounded by 1.0, and
 the objective's `_COST_PARAMS` pins them at 1.0 besides, so none can rank a tiling above not

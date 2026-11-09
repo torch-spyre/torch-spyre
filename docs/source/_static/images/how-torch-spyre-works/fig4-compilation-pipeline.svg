@@ -80,7 +80,7 @@
 
   <rect x="110" y="408" width="360" height="40" rx="4" fill="#e55b15"/>
   <text x="290" y="426" text-anchor="middle" font-size="12" font-weight="700" fill="#ffffff">Work Division &amp; Scratchpad Planning</text>
-  <text x="290" y="440" text-anchor="middle" font-size="10" fill="#ffe4d0">span_reduction() · work_distribution() · scratchpad_planning (optional)</text>
+  <text x="290" y="440" text-anchor="middle" font-size="10" fill="#ffe4d0">cost model · work_distribution() · scratchpad_planning (optional)</text>
   <line x1="290" y1="448" x2="290" y2="456" stroke="#374151" stroke-width="1"/>
 
   <!-- Inductor Scheduler + Fusion (standard) -->

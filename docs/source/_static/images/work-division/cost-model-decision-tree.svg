@@ -19,7 +19,7 @@
 
   <!-- Title -->
   <text x="380" y="28" text-anchor="middle" class="title">Cost-Model Matmul Decision Tree</text>
-  <text x="380" y="48" text-anchor="middle" class="caption">First failing gate sends the op to Pass 3. All gates passing → enumerate divisors and commit the argmin split.</text>
+  <text x="380" y="48" text-anchor="middle" class="caption">First failing gate sends the op to Pass 2. All gates passing → enumerate divisors and commit the argmin split.</text>
 
   <!-- Decision 1 -->
   <rect class="decision" x="100" y="70"  width="360" height="44" rx="8"/>
@@ -27,7 +27,7 @@
 
   <!-- Decision 2 -->
   <rect class="decision" x="100" y="150" width="360" height="44" rx="8"/>
-  <text class="label" x="280" y="178" text-anchor="middle">span_reduction left this op uncommitted?</text>
+  <text class="label" x="280" y="178" text-anchor="middle">span floors require no split?</text>
 
   <!-- Decision 3 -->
   <rect class="decision" x="100" y="230" width="360" height="44" rx="8"/>
@@ -50,24 +50,24 @@
   <text class="label" x="280" y="572" text-anchor="middle" font-weight="600">enumerate divisors of (B, M, n_sticks, k_sticks);</text>
   <text class="label" x="280" y="590" text-anchor="middle" font-size="12">price each combo; commit the argmin (b, m, n, k)</text>
 
-  <!-- Pass 3 exits (one per decision) -->
+  <!-- Pass 2 exits (one per decision) -->
   <rect class="exit" x="560" y="78"  width="140" height="28" rx="6"/>
-  <text class="label" x="630" y="97"  text-anchor="middle">Pass 3</text>
+  <text class="label" x="630" y="97"  text-anchor="middle">Pass 2</text>
 
   <rect class="exit" x="560" y="158" width="140" height="28" rx="6"/>
-  <text class="label" x="630" y="177" text-anchor="middle">Pass 3</text>
+  <text class="label" x="630" y="177" text-anchor="middle">Pass 2</text>
 
   <rect class="exit" x="560" y="238" width="140" height="28" rx="6"/>
-  <text class="label" x="630" y="257" text-anchor="middle">Pass 3</text>
+  <text class="label" x="630" y="257" text-anchor="middle">Pass 2</text>
 
   <rect class="exit" x="560" y="318" width="140" height="28" rx="6"/>
-  <text class="label" x="630" y="337" text-anchor="middle">Pass 3</text>
+  <text class="label" x="630" y="337" text-anchor="middle">Pass 2</text>
 
   <rect class="exit" x="560" y="398" width="140" height="28" rx="6"/>
-  <text class="label" x="630" y="417" text-anchor="middle">Pass 3</text>
+  <text class="label" x="630" y="417" text-anchor="middle">Pass 2</text>
 
   <rect class="exit" x="560" y="478" width="140" height="28" rx="6"/>
-  <text class="label" x="630" y="497" text-anchor="middle">Pass 3</text>
+  <text class="label" x="630" y="497" text-anchor="middle">Pass 2</text>
 
   <!-- Vertical "yes" arrows between decisions -->
   <path class="arrow" d="M 280 114 L 280 150" marker-end="url(#arrowhead)"/>
@@ -77,7 +77,7 @@
   <path class="arrow" d="M 280 434 L 280 470" marker-end="url(#arrowhead)"/>
   <path class="arrow" d="M 280 514 L 280 550" marker-end="url(#arrowhead)"/>
 
-  <!-- Horizontal "no" arrows to Pass 3 exits -->
+  <!-- Horizontal "no" arrows to Pass 2 exits -->
   <path class="arrow" d="M 460 92  L 560 92"  marker-end="url(#arrowhead)"/>
   <path class="arrow" d="M 460 172 L 560 172" marker-end="url(#arrowhead)"/>
   <path class="arrow" d="M 460 252 L 560 252" marker-end="url(#arrowhead)"/>

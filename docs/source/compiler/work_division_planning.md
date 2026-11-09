@@ -16,34 +16,31 @@ core budget (`SENCORES`, default 32), and writes a per-dimension split
 plan onto the op. Downstream stages (codegen, the SDSC emitter,
 scratchpad planning) consume that plan.
 
-## Three-pass planner overview
+## Two-pass planner overview
 
-The planner has three responsibilities, one per pass: **Pass 1
-enforces the 256 MB per-core span limit, Pass 2 selects matmul splits
-from a cost model, and Pass 3 selects a default split for every other
-eligible op.**
+The planner has two passes: **Pass 1 selects matmul splits from a cost
+model, and Pass 2 selects a default split for every other eligible op.**
+Both start from the op's span floors, the minimum splits that keep every
+tensor within the 256 MB per-core span limit.
 
-For each eligible op the planner runs three passes in order:
-
-1. **Pass 1, span reduction**, enforces the 256 MB per-core span limit.
-   When a tensor's per-core span exceeds the limit, this pass commits
-   the minimum splits needed to bring the span back under. When no
-   tensor violates the limit, the pass leaves the op untouched.
-2. **Pass 2, cost-model matmul division**, runs only on `matmul` and
+1. **Pass 1, cost-model matmul division**, runs only on `matmul` and
    `bmm` ops. It enumerates feasible `(b, m, n, k)` splits, prices
    each one with an analytic runtime estimate, and selects the
    lowest-cost combination.
-3. **Pass 3, work distribution**, runs on every other eligible op and
+2. **Pass 2, work distribution**, runs on every other eligible op and
    on matmuls the cost model declined. It distributes the remaining
    cores across the output dimensions first by decreasing size, then
    across at most one reduction dimension.
 
-Every eligible op is finalised by either Pass 2 or Pass 3. Pass 1
-runs first and only writes to the op when a span violation forces a
-minimum split. The three passes are implemented in
+Every eligible op is finalised by either Pass 1 or Pass 2. The two passes
+are implemented in
 [work_division.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/work_division.py)
 and dispatched from `CustomPreSchedulingPasses` in
 [passes.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/passes.py).
+
+The span floors are not a pass of their own. Whatever chooses an op's
+split computes them at that point, from the op as it is then (see
+[Span floors](#span-floors)).
 
 The planner only sees ops whose IR data is `Pointwise` or `Reduction`
 (TopK reductions use dedicated constraints; see [TopK work
@@ -132,9 +129,9 @@ split assignment. The outermost device dimension a core touches sets
 the span: `per_core_size × stride`, where `per_core_size` is the number
 of positions along that dimension that each core covers.
 
-If splits are not applied, a large tensor can violate this limit. Pass 1
-detects violations and computes the minimum number of slices on the
-responsible iteration variables that bring the span back within range.
+If splits are not applied, a large tensor can violate this limit. The
+op's span floors are the minimum number of slices on the responsible
+iteration variables that bring the span back within range.
 For stick variables, valid slice counts are restricted to divisors of
 the stick count, so each core always receives a whole number of sticks.
 If the same iteration variable is a stick variable for one tensor and a
@@ -159,9 +156,9 @@ A card has 32 cores connected by a bi-directional ring.
 
 | Constant | Value | Where it shows up |
 |---|---|---|
-| Cores per card | 32 (configurable down to 1 via `SENCORES`) | Total core budget Pass 3 distributes |
-| PT rows per corelet | 8 | Pass 2's compute term and M tie-break |
-| Per-core memory span | 256 MB | Pass 1's correctness constraint |
+| Cores per card | 32 (configurable down to 1 via `SENCORES`) | Total core budget Pass 2 distributes |
+| PT rows per corelet | 8 | Pass 1's compute term and M tie-break |
+| Per-core memory span | 256 MB | The span floors, which every split must meet |
 | Stick size | 128 B (`BYTES_IN_STICK`); element count from `device_dtype.elems_per_stick()` | Stick-aligned splits across all passes |
 
 For the full hardware overview see
@@ -177,7 +174,7 @@ For the full hardware overview see
 - **Stick size is dtype dependent.** A stick is always 128 bytes, but
   the element count comes from `device_dtype.elems_per_stick()`. Code
   that hard-codes "64 fp16 elements" is fp16-specific.
-- **The cost-model planner does not change correctness.** Pass 2's
+- **The cost-model planner does not change correctness.** Pass 1's
   matmul split is correct on its own. The runtime benefit of any
   K-split comes from a paired core-ID permutation
   (`core_to_slice_mapping` in `core_mapping.py`, applied during
@@ -185,13 +182,26 @@ For the full hardware overview see
   K-collaborators occupy adjacent ring positions.
 :::
 
-## Pass 1 — Span Reduction (`span_reduction`)
+## Span floors
 
-This pass is mandatory and runs first over every eligible op.
+Every split the planner commits must keep each tensor's per-core memory
+span within 256 MB. `span_floors(op)` computes the minimum split per
+iteration dimension that does this (`must_split_vars`). The floors are
+not a pass, and nothing stores them on the op. They are computed
+wherever an op's split is chosen, from the op as it is at that point:
 
-For each operation, `span_reduction_pass` computes the minimum splits
-required to keep every tensor's per-core memory span within 256 MB
-(`must_split_vars`).
+- the co-optimizing solve's split menus (`work_division_context_for_op`),
+  in each candidate's own frame;
+- Pass 1 and Pass 2, which start from them;
+- user work-division hints, which are checked against them;
+- the LX planner's starting split for an op the solve has not divided
+  yet (`_seed_splits` in `scratchpad/allocator.py`).
+
+So the floors always describe the op's current layouts, and a pass that
+rebuilds an op has no floors to carry over. A coarse tiling shrinks each
+tile's spans, so a tiled candidate's floors come from its per-tile frame
+and can be lower than the untiled op's: the solve can pair a tiling with
+smaller splits.
 
 `must_split_vars` processes tensors one at a time. For each tensor whose
 per-core span exceeds 256 MB, it iterates over device dimensions outer
@@ -203,13 +213,14 @@ selection: among combinations whose total core count does not exceed
 span that still fits within the limit** (fewest cores used). If no
 combination brings the span within the limit, the planner instead
 selects the combination with the **smallest span** (most progress
-toward the limit). Previously committed splits are
-carried forward as lower bounds and narrow the search for subsequent
-tensors.
+toward the limit), and `must_split_vars` logs a warning. Splits chosen
+for earlier tensors are carried forward as lower bounds and narrow the
+search for subsequent tensors.
 
-The resulting minimum splits are committed as symbol-keyed
-`op.iteration_space_ownership` via `apply_splits`. If no span violation
-exists, no ownership is recorded.
+The result is a symbol-keyed map of minimum splits, empty when no tensor
+violates the limit. Computing the floors raises `Unsupported` when an
+axis has no legal factor at all, when a floor conflicts with a hard split
+domain, or when the floors split more than one reduction dimension.
 
 Splitting the outermost dim halves each core's footprint:
 
@@ -225,16 +236,16 @@ Unsplit                          Split K by 2
 ```
 
 The arithmetic generalises:
-`per_core_span = (dim_size / split) × outer_stride × dtype_bytes`. Pass 1
-picks the smallest `split` that brings the span under 256 MB on the
+`per_core_span = (dim_size / split) × outer_stride × dtype_bytes`. The
+floor is the smallest `split` that brings the span under 256 MB on the
 outermost dimension that violates it.
 
-## Pass 2 — Cost-Model Matmul Division (`cost_model_matmul_division`)
+## Pass 1 — Cost-Model Matmul Division (`cost_model_matmul_division`)
 
-Pass 2 compares feasible matmul splits and picks the one with the
+Pass 1 compares feasible matmul splits and picks the one with the
 lowest estimated runtime. It only takes over when its choice uses at
-least as many cores as the default Pass 3 split would. Otherwise the
-op goes to Pass 3 unchanged.
+least as many cores as the default Pass 2 split would. Otherwise the
+op goes to Pass 2 unchanged.
 
 The pass runs on ops whose data is a `Reduction` with
 `reduction_type == BATCH_MATMUL_OP`. Every other op falls through.
@@ -242,22 +253,22 @@ The pass runs on ops whose data is a `Reduction` with
 ### When the cost model declines
 
 The planner returns the default split unchanged in any of these cases,
-sending the op to Pass 3:
+sending the op to Pass 2:
 
 :::{figure} ../_static/images/work-division/cost-model-decision-tree.svg
-:alt: Cost-model decision tree showing five conditions plus a final safety check; any "no" exits to Pass 3
+:alt: Cost-model decision tree showing five conditions plus a final safety check; any "no" exits to Pass 2
 :width: 90%
 :align: center
 
 The cost model walks five identification checks plus one safety check.
-Any "no" exits to Pass 3.
+Any "no" exits to Pass 2.
 :::
 
 - The op must be a matmul or bmm (`Reduction` with
   `reduction_type == BATCH_MATMUL_OP`).
-- `span_reduction` must not have committed any split. When Pass 1 has
-  already committed dimensions, Pass 2 declines and Pass 3 distributes
-  the remaining cores.
+- The op's span floors must not require any split. When they do,
+  Pass 1 declines and Pass 2 distributes the remaining cores on top of
+  the floors.
 - The output must have exactly one stickified dim (`N`) and at least
   one row dim, so `N` is unambiguous.
 - Of the row dims, exactly one must appear in a single input (this is
@@ -265,13 +276,13 @@ Any "no" exits to Pass 3.
   the planner declines.
 - The op must have exactly one reduction dim (`K`).
 - As a final safety check, if the cost-model split would use fewer
-  cores than the default Pass 3 split, the planner declines.
+  cores than the default Pass 2 split, the planner declines.
 
 When all checks pass, the planner enumerates the Cartesian product of
 divisors of `B`, `M`, `n_sticks`, `k_sticks`, prices each feasible
 combination whose total core count does not exceed `max_cores`, and
 commits the argmin. The op is added to a `cost_model_ops` list that
-Pass 3 consults to skip already-divided ops.
+Pass 2 consults to skip already-divided ops.
 
 ### The cost equation
 
@@ -366,31 +377,30 @@ internal tuning constants and are not user-configurable. The values are
 fit to measured Spyre behaviour and re-tuned across hardware revisions.
 :::
 
-## Pass 3 — Work Distribution (`work_distribution`)
+## Pass 2 — Work Distribution (`work_distribution`)
 
-This pass is the default for every op Pass 2 did not claim. It runs
-after Pass 2 has finished across all operations.
+This pass is the default for every op Pass 1 did not claim. It runs
+after Pass 1 has finished across all operations.
 
 For each remaining op, `work_distribution_pass` does three things:
 
-1. It reads the symbol-keyed splits committed by Pass 1 from
-   `op.iteration_space_ownership.work_slices`. The ownership remains in
-   operation-symbol space through LX planning.
-2. It ranks the remaining dimensions (those not already committed by
-   Pass 1) for additional core assignment via `prioritize_dimensions`:
-   output dimensions first by decreasing stick-adjusted size, reduction
-   dimensions last. At most one reduction dimension is eligible for
-   splitting, selecting largest reachable legal factor within remaining core
-   budget after output dimensions have absorbed their share of cores. If Pass 1
-   already committed a reduction split, no further reduction dimensions are
-   eligible.
-3. It distributes all `max_cores` across committed and priority
+1. It computes the op's [span floors](#span-floors), which every split
+   it commits must meet.
+2. It ranks the dimensions for additional core assignment via
+   `prioritize_dimensions`: output dimensions first by decreasing
+   stick-adjusted size, reduction dimensions last. At most one reduction
+   dimension is eligible for splitting, selecting largest reachable legal
+   factor within remaining core budget after output dimensions have
+   absorbed their share of cores. If the floors already split a reduction
+   dimension, no other reduction dimension is eligible.
+3. It distributes all `max_cores` across the floored and priority
    dimensions with `multi_dim_iteration_space_split`. The function
-   first applies the committed splits as minimum requirements, then
+   first applies the floors as minimum requirements, then
    greedily assigns the largest valid divisor of each remaining
    dimension to the leftover core budget.
 
-The final splits overwrite `op.iteration_space_ownership`.
+The final splits are committed to `op.iteration_space_ownership`, which
+stays in operation-symbol space through LX planning.
 
 ### Hard split domains
 
@@ -403,12 +413,11 @@ grow it to any larger legal factor (`4` or `8`) if core budget remains. Thus an
 explicit legal-factor domain can encode a minimum split without a separate
 constraint field. `{2}` instead pins the dimension to exactly `2`.
 
-Span reduction's `min_splits` are separate hardware-span floors. They are
-applied first, must themselves be members of any applicable `allowed_splits`
-domain, and remain in force for later planning, hints, and LX candidates. The
-floors are retained with the operation's work-division metadata when an IR pass
-reconstructs it. A later split may use any legal factor at least as large as the
-floor; it need not be a multiple of the original span factor.
+The [span floors](#span-floors) are separate hardware-span minimums. Each
+floor must itself be a member of any applicable `allowed_splits` domain
+(computing the floors raises `Unsupported` otherwise), and every division,
+hint and LX candidate must meet them. A split may use any legal factor at
+least as large as the floor; it need not be a multiple of it.
 
 Overlapping view reads impose another hard domain. For example,
 `x.unfold(d, 4, 2)` reads a coordinate of the form `2*w + k`: the window
@@ -490,19 +499,18 @@ dim `K`.
 
 ### Before/after the planner
 
-| Tensor | Unsplit per-core span | Violating dim | Pass 1 commit | After Pass 3 | Cores reading it |
+| Tensor | Unsplit per-core span | Violating dim | Span floor | After Pass 2 | Cores reading it |
 |---|---|---|---|---|---|
 | A `[8192, 32768]` fp16 | 512 MB | K (outermost) | K minimum = 2 | M = 16, K = 2 | each core reads (512 rows) × (16384 K) = 16 MB |
 | W `[32768, 4096]` fp16 | 256 MB | none (at limit) | — | M = 16, K = 2 | each core reads (16384 K) × (4096 N) = 128 MB |
 | O `[8192, 4096]` fp16 | 64 MB | none | — | M = 16, K = 2 | each core writes (512 rows) × 4096 = 4 MB |
 
-Pass 2 detects that Pass 1 already committed a split (`K = 2`). The
-cost-model planner declines whenever `committed_splits` is non-empty,
-and Pass 3 distributes the remaining cores. Without the Pass-1 commit,
-the planner would enumerate divisors of `(B, M, N, K)` and price each
-feasible combination with the cost equation.
+The span floors require a split (`K = 2`). The cost-model planner (Pass 1)
+declines whenever they do, and Pass 2 distributes the remaining cores.
+Without the floor, the planner would enumerate divisors of `(B, M, N, K)`
+and price each feasible combination with the cost equation.
 
-Pass 3 retains Pass 1's K=2 lower bound. A later split may use any legal
+Pass 2 keeps the `K = 2` floor as a lower bound. A split may use any legal
 factor at or above that floor. With 16 cores remaining per K-slice, it ranks
 output dims by size (`M = 8192`, `N = 4096`) and assigns all 16 cores to `M`.
 Final split: `{M: 16, N: 1, K: 2}`.
@@ -537,10 +545,10 @@ K = 1..  │ c1 │ c3 │ c5 │ c7 │ c9 │c11 │c13 │c15 │ ... │c31 
 
 ### A small-M, narrow-N counterexample
 
-Switch to `A: [8, 1024]`, `W: [1024, 1024]` on 32 cores. Pass 1 commits
-nothing (no span violation). Pass 2 enumerates divisors of `M = 8`,
-`n_sticks`, and `k_sticks`, prices each feasible combination, and
-commits the argmin. Pass 3 skips the op.
+Switch to `A: [8, 1024]`, `W: [1024, 1024]` on 32 cores. No tensor
+violates the span limit, so the op has no span floors. Pass 1 enumerates
+divisors of `M = 8`, `n_sticks`, and `k_sticks`, prices each feasible
+combination, and commits the argmin. Pass 2 skips the op.
 
 ## Interaction with SDSC and scratchpad planning
 
@@ -700,11 +708,12 @@ the accepted split decision. Validation checks that:
 - every accepted split evenly divides the stick-adjusted dimension size
 - at most one accepted reduction dimension is split
 
-User work-division hints are intentionally authoritative. If Pass 1
-(`span_reduction`) already committed minimum splits for the 256 MB span limit,
-and the user hint asks for fewer splits, the compiler logs a warning and applies
-the strict user hint. `raise_if_per_core_overflow` then raises `Unsupported` if
-the resulting per-core span exceeds the hardware limit.
+User work-division hints are intentionally authoritative, but they cannot go
+below the [span floors](#span-floors). A hinted split below its dimension's
+floor raises `Unsupported`, naming the dimension and the floor. A floored
+dimension the hint does not name stays unsplit, and `raise_if_per_core_overflow`
+then raises `Unsupported` if the resulting per-core span exceeds the hardware
+limit.
 
 Set `SPYRE_INDUCTOR_IGNORE_WORK_DIV_HINTS=1` to ignore `spyre_hint(work_div={...})`
 annotations and use the automatic work-distribution planner.
@@ -739,7 +748,7 @@ dimensions are not pinned.
 - The cost-model planner declines on bmms with a shared 2D weight,
   because pricing the broadcast of the shared weight needs weight-rank
   awareness the current cost function does not have. Those bmms fall
-  through to Pass 3.
+  through to Pass 2.
 - Padding is approximated rather than retrieved from the layout (FIXME
   in `adjust_it_space_for_sticks`). Improved padding handling is being
   added in [#2359](https://github.com/torch-spyre/torch-spyre/pull/2359).
