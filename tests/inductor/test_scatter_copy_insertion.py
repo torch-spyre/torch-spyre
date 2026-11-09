@@ -34,12 +34,13 @@ class TestScatterCopyInsertion(unittest.TestCase):
         """Count 'restickify' operations in generated SDSC code."""
         return code_str.lower().count("restickify_")
 
-    def _create_layout(self, device_size, stride_map):
+    def _create_layout(self, device_size, stride_map, valid_elements):
         """Create a SpyreTensorLayout with given device_size and stride_map."""
         return SpyreTensorLayout(
             device_size=device_size,
             stride_map=stride_map,
             device_dtype=get_device_dtype(torch.float16),
+            valid_elements=valid_elements,
         )
 
     def test_scatter_dim0_slot_major_no_unnecessary_copy(self):
@@ -57,6 +58,7 @@ class TestScatterCopyInsertion(unittest.TestCase):
         layout = self._create_layout(
             device_size=[SLOTS, HEADS, sticks, eps],
             stride_map=[HEADS * sticks * eps, sticks * eps, eps, 1],
+            valid_elements={(0,): SLOTS, (1,): HEADS, (2, 3): sticks * eps},
         )
 
         dst = torch.zeros(SLOTS, HEADS, HD, dtype=torch.float16).to(
@@ -126,6 +128,7 @@ class TestScatterCopyInsertion(unittest.TestCase):
         layout = self._create_layout(
             device_size=[M, n_sticks, eps],
             stride_map=[n_sticks * eps, eps, 1],
+            valid_elements={(0,): M, (1, 2): n_sticks * eps},
         )
 
         dst = torch.zeros(M, N, dtype=torch.float16).to("spyre", device_layout=layout)

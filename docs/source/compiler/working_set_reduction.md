@@ -56,8 +56,8 @@ the source level.
 ## `for_each_tile`: an explicit, co-indexed tiling loop
 
 `for_each_tile` is `scan` with the tiling made explicit: **one co-indexed loop
-level** that reduces every operand to a per-step tile — a narrow view, a whole
-invariant, or a gathered pool row — threads an optional carry, and optionally
+level** that reduces every operand to a per-step tile (a narrow view, a whole
+invariant, or a gathered pool row), threads an optional carry, and optionally
 lays each step's result tile back into a full-size output along one axis.
 
 ```python
@@ -89,7 +89,8 @@ def for_each_tile(
             gathered one. All of them must agree.
         init: carry init (tensor or pytree of tensors); ``None`` means no carry.
         out_dim: ``int d`` lays step ``i``'s tile at ``narrow(d, i*extent, extent)``
-            of the returned output. ``None`` means the body emits no tile.
+            of each returned output leaf. Tiles may be a tensor or a pytree of
+            tensors. ``None`` means the body emits no tile.
         reverse: visit tiles high to low. The output still lands in natural order.
 
     Returns:
@@ -115,8 +116,168 @@ per the `dims` entry:
 that a purely elementwise tiling doesn't need: `init` threads a **carry**
 (e.g. a running accumulator) from one step to the next, and `out_dim` lays
 each step's output tile back into the correct slice of a full-size result.
-Either can be `None` independently — a pure reduction has no `out_dim`; a
+Either can be `None` independently: a pure reduction has no `out_dim`; a
 pure per-tile map has no `init`.
+
+Output leaves may have different ranks; `out_dim` is normalized separately for
+each leaf and must name an existing axis in every output tile. Scalar output
+tiles have no axis to concatenate; return a length-one tensor instead.
+As with `scan`, output leaves must not alias inputs or one another: returning
+`(y, y)` for a computed tile `y` is invalid; use `(y, y.clone())` instead.
+
+A functional `index_copy` into a carried output preserves its caller's initializer.
+The compiler removes a full carry clone only when its addresses, shape, strides
+and offset are unchanged, including the scatter target's view, and no other body
+operation still reads the old carry placeholder. Later readers of the old value
+are redirected to a pre-update snapshot by `splice_while_loop` before this check.
+If the scatter destination needs a layout conversion, both the copy-in and
+copy-back remain inside the counted loop so other carry readers see each update.
+
+For a counted loop over an int32 index table `[trips, rows]`, each visited row
+must begin at a stick boundary and its sticks must be adjacent. With `rows` a
+multiple of 32, use a `SpyreTensorLayout` with
+`device_size=[trips, rows // 32, 32]` and `stride_map=[rows, 32, 1]`. A default
+interleaved layout such as `[rows // 32, trips, 32]` inserts other trips between
+the row's sticks and is unsupported when both outer axes have extent greater
+than one. `SpyreKernel._check_indirect_index_step` rejects this layout during
+code generation; it previously could produce incorrect rows without an error.
+
+An accumulator carry is declared, not rewritten, by `splice_while_loop`: a
+`LoopCarryRecord` on the carry's storage (its initial buffer, or the pre-loop
+copy of it when the initial buffer is not private to the loop) and on its
+update names both, and the spliced body stays pure, with the loop's result the
+update's own buffer. The `apply_loop_carries` pass, which runs just before
+layout propagation, then makes the update an in-place write of the storage and
+sends every reader of the update to the storage, so every later pass sees the
+carry in place. Until then, `deadcode_elimination` judges a declared update
+like the mutation it will become: it is live while its storage is.
+
+Partial scatter carries deliberately have no `LoopCarryRecord`: that record
+opts full-buffer accumulators into LX residency. Their write is made in place
+at the splice. Scatter destinations remain
+in HBM, with mutation dependencies preserving their lifetime across iterations,
+including when `LX_PLANNING=1` and `HBM_POOL_PLANNING=1`.
+
+Set `SPYRE_BACKEND_LOOP_UNROLL=0` before importing torch-spyre to preserve counted
+loops in the SDSC-bundle backend. Unrolling is enabled by default. Values
+`1`/`true`/`yes` enable it and `0`/`false`/`no` disable it (case-insensitive).
+Invalid values raise an error.
+
+Python callers can override the resolved setting during compilation:
+
+```python
+from torch_spyre._inductor import config
+
+with config.patch(backend_loop_unroll=False):
+    result = compiled_model(inputs)  # First call triggers compilation.
+```
+
+The resolved boolean is included in the kernel cache key and passed explicitly
+to each compile worker as `dbo-opt --enable-loop-unroll=0` or `1`. Equivalent
+environment spellings share a cache key; changing the effective setting cannot
+reuse an artifact compiled with the other setting. This controls the SDSC-bundle
+frontend only, not the direct `--from-ktir` path or every loop optimization.
+Preserving device loops requires autopilot; Deeptools rejects disabling unrolling
+with `DT_OPT=autopilot=0`.
+
+For compiled SDPA, maps over batch, head, group, or query positions use this
+carry-free form when K/V fits in one block: each map body computes stable
+softmax over its complete K/V range. Only a scan over multiple K/V blocks
+needs online-softmax running maximum, denominator, and output carries.
+
+The SDPA tile selector (`_select_sdpa_tiling` in `decompositions.py`) admits
+a plan only if its resident floor fits in LX: the two co-live score tiles
+(the QK^T output and its exponentials), plus the scaled query, output carry,
+and per-block P@V for a multi-block scan. A spilled score costs far more than
+its HBM bytes, so such plans are rejected rather than priced. The selector also
+limits compilation to two nested maps and 1024 tile iterations, guarding against
+excessive default loop unrolling. If those limits leave no plan whose floor fits,
+it takes the buildable plan that spills the fewest score tiles; coarse tiling
+remains only for shapes with no buildable plan. Overflow above the floor is not
+charged: across the measured plans it
+had no measurable cost. The admitted plans are ranked by predicted device time
+from four measured terms: a fixed cost per outer map tile, an extra cost per
+tile when the plan splits query rows, the query-shaped carry each K/V scan
+step reads and writes, and HBM traffic that depends on the plan (K/V replay
+and head-tile staging). The coefficients come from forced-plan timings over
+full and chunked prefill, including Gemma 4 global and sliding layers. The
+selector chooses tiles before scratchpad planning, so it can only estimate the
+allocator's placement; a placement-aware selector would remove that gap.
+
+Sliding-window attention (`_select_swa_tiling`) applies the same resident
+floor to its per-query-block K/V window and takes the fewest blocks whose
+floor fits: each extra block adds a scan step that rescales the output carry.
+A tiling that covers the window exactly with an odd number of blocks is
+skipped, because the K/V loop then slices the cache view directly and its
+strides are not divisible by the tile count.
+
+### Body contract when tracing a decomposition
+
+When reached under make_fx and outside Dynamo, `for_each_tile` emits `scan_op`
+directly. This avoids recursively inlining the loop nest through Dynamo, which
+can exhaust CPython's C-recursion budget on s390x. Direct user calls under
+`torch.compile` and ordinary eager calls still use `scan()`; the s390x recursion
+budget workaround remains on that fallback path.
+
+A body intended for use in decompositions should follow this contract:
+
+| Requirement | Enforcement on the direct make_fx path |
+| --- | --- |
+| Pass tensor dependencies as operands, using `dims=None` for whole tensors. This includes weights, masks, and tensors computed in an enclosing loop. | Tensor `get_attr` constants in the body graph raise `Unsupported`, in real, fake, and symbolic tracing. Checks also visit nested body graphs. |
+| Create literal tensor constants before the loop and pass them as operands, or use factories such as `torch.full`, `torch.ones`, or `torch.arange` in the body. | `torch.tensor(...)` literals are conservatively rejected: their graph constants cannot be distinguished reliably from captured tensors. |
+| Return a carry with the same pytree structure as `init`, and matching shape, dtype, device, and stride metadata. | Structure is checked before flattening; PyTorch's scan tracer checks tensor metadata. A violation raises during tracing. |
+| Use tensors for all carry and output leaves. Supply a non-empty tensor carry for reduction mode. | Checked explicitly. `None` is reserved for the unused carry/output mode. |
+| Do not write to scan inputs, including the carry and invariant operands or views of them. | Operator-schema checks cover positional writes, keyword `out=` writes, tensor-list writes, and nested body graphs. Writes to newly allocated local tensors are allowed. |
+| Do not return scan inputs or views of them, or outputs that share storage with each other. Clone as needed. | Storage-alias checks raise during tracing. Read-only inputs may share storage, including a tensor passed both sliced and invariant. |
+| Use at least one nonempty sliced/gathered operand, matching trip counts, valid dimensions, and exact tile divisibility. | Existing tiling checks plus explicit zero-trip and `reverse` type checks raise before tracing the scan. |
+
+The graph checks apply the same read-only-input and disjoint-output rules to
+nested higher-order bodies. This is conservative even if a nested operator
+would otherwise allow returning an unchanged input: return a clone in that body.
+
+For example, pass the scaled query through every loop that reads it:
+
+```python
+q_scaled = q * scale
+
+
+def body(carry, tiles):
+    q_invariant, k_tile = tiles
+    scores = q_invariant @ k_tile.transpose(-1, -2)
+    return carry + scores.sum(), None
+
+
+result, _ = for_each_tile(
+    body,
+    (q_scaled, k),
+    dims=(None, -2),
+    tile_size=64,
+    init=torch.zeros((), device=q.device, dtype=q.dtype),
+)
+```
+
+The checks enforce tensor graph invariants; **they do not prove arbitrary Python
+code is pure**. Python bookkeeping runs while tracing, rather than once per
+runtime tile. A body that increments a Python counter and uses it in its tensor
+arithmetic can silently produce the wrong result. Do not keep evolving state in
+lists, globals, object attributes, or Python counters: carry it as tensors.
+Diagnostic Python actions such as appending trace information are trace-time
+only. Operators must also declare accurate aliasing/mutation schemas; hidden
+side effects in an incorrectly declared custom operator cannot be checked here.
+
+Python scalar constants and static metadata are specialized by tracing.
+Metadata-only reads of captured tensors need not leave tensor constants in the
+graph, so the capture check does not reliably detect them. For symbolic sizes, read the size from an explicit body operand instead of closing
+over an outer symbolic value (which may raise an untracked-proxy error). Tensor
+value-dependent Python branches or scalar extraction are subject to make_fx's
+data-dependency errors; use tensor operations such as `torch.where` for runtime
+choices. A raw make_fx graph does not install Dynamo's input guards, so it must
+not be reused with arbitrary shapes or Python state outside its traced contract.
+
+Sliced and gathered tiles are temporary values in the traced body. Mutating
+such a temporary does not write back to the original full tensor; return the
+updated tile through `out_dim` when an output is required. The read-only check
+tracks actual graph storage, rather than relying on a variable's name.
 
 ## Example: tiling `y = a + b; z = y * c`
 
@@ -153,7 +314,7 @@ returned `[1024, 4096]` output.
 
 This is the same tiling shape as the
 [Small Example](coarse_tiling_loops.md#small-example) in the companion
-document — a single loop, `y = a + b` then `z = y * c` — and it lowers to the
+document (a single loop, `y = a + b` then `z = y * c`) and it lowers to the
 same downstream mechanism (`loop_info: CoarseTileInfo`, a `CountedLoopSchedulerNode`,
 a `LoopSpec`). `docs/tools/capture_for_each_tile_ir.py` regenerates the real,
 captured IR/OpSpec/`bundle.mlir` for this exact example, which the
@@ -188,7 +349,7 @@ The compiler's lowering pipeline (see [Layer 1's Prove → Splice → Identify �
 Stamp
 sequence](coarse_tiling_loops.md#prove-splice-identify-stamp-how-a-for_each_tile-call-becomes-loop_info))
 runs to a fixed point over nested `for_each_tile`/`while_loop` structures, so
-this composition is handled uniformly rather than as a special case — see
+this composition is handled uniformly rather than as a special case. See
 that section for how a two-level nest like this ends up with a two-entry
 `loop_group_id` on the innermost ops, analogous to the Small Example's
 `(0, 0)`.
@@ -204,15 +365,15 @@ Inductor as an `ir.WhileLoop` (`scan`'s own lowering), not as a distinct
 "tiling loop" IR node in its own right.
 
 The Spyre backend's job is then to recognize which `ir.WhileLoop`s are
-provably bounded, tile-shaped loops — as opposed to genuinely
-data-dependent `while_loop`s, which stay as `ir.WhileLoop` — and rewrite them
+provably bounded, tile-shaped loops (as opposed to genuinely
+data-dependent `while_loop`s, which stay as `ir.WhileLoop`) and rewrite them
 into a `loop_info`-carrying representation. The mechanics of that
 recognition and rewrite (`try_prove_for_each_tile`, `splice_while_loops`,
 `_stamp_direct_loop_info`, and the surrounding carry machinery in
 `while_loop_bridge.py`) are described in detail in
-[`coarse_tiling_loops.md`](coarse_tiling_loops.md#layer-1--pre-scheduling-ir-pass),
+[`coarse_tiling_loops.md`](coarse_tiling_loops.md#layer-1-pre-scheduling-ir-pass),
 which covers everything past "a run of ops carries a `loop_info:
-CoarseTileInfo`" — the `CountedLoopSchedulerNode` scheduler wrapper (Layer 2)
+CoarseTileInfo`": the `CountedLoopSchedulerNode` scheduler wrapper (Layer 2)
 and the `LoopSpec` codegen tree (Layer 3).
 
 `splice_while_loops` runs in `CustomPreSchedulingPasses`, before dead-code
@@ -246,9 +407,9 @@ and spills to HBM. With WSR, each tile of `y` lives in LX scratchpad for the
 duration of one iteration and is consumed immediately by the next op.
 :::
 
-The full mechanics — how loop identity is carried through Inductor's
+The full mechanics (how loop identity is carried through Inductor's
 flat-list pipeline, how the loop perimeter prevents cross-group fusion, how
-buffers crossing the loop boundary are classified — are documented in
+buffers crossing the loop boundary are classified) are documented in
 [`coarse_tiling_loops.md`](coarse_tiling_loops.md).
 
 A buffer that crosses the loop boundary and has a non-empty
@@ -262,20 +423,20 @@ spans every tile the buffer occupies across the loop; sizing it for a single
 tile would let the loop overrun into whatever buffer the allocator packed
 next to it. A buffer whose `output_tiled_dims`/`tiled_dims_per_read` entries
 are empty at every level, by contrast, never advances and is a candidate for
-a fixed-address LX scratchpad slot instead — see
+a fixed-address LX scratchpad slot instead. See
 [`coarse_tiling_loops.md`](coarse_tiling_loops.md) for the `accum_full` /
 `accum_tile` buffers this distinction matters most for.
 
 ## Related documents
 
-- [`coarse_tiling_loops.md`](coarse_tiling_loops.md) — implementation
+- [`coarse_tiling_loops.md`](coarse_tiling_loops.md): implementation
   reference for the transformation stage (Layer 1 IR pass, Layer 2
   scheduler wrapper, Layer 3 codegen tree) that turns `for_each_tile`'s
   `loop_info` into an executable tiled loop nest.
 - [RFC 1358: Coarse-Tiling Loop IR Design
   Rationale](https://github.com/torch-spyre/rfcs/blob/main/1358-CoarseTiling/1358-CoarseTiling.md),
   which explains the reasoning behind the three-layer design.
-- [`scratchpad_planning.md`](scratchpad_planning.md) — how LX scratchpad
+- [`scratchpad_planning.md`](scratchpad_planning.md): how LX scratchpad
   allocation consumes the per-tile iteration spaces produced by WSR.
-- [`work_division_planning.md`](work_division_planning.md) — how work
+- [`work_division_planning.md`](work_division_planning.md): how work
   distribution across cores runs after WSR on the reduced ranges.

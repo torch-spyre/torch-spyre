@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Sequence
+from typing import Any
+
+from torch.fx import Node
 from torch.fx.graph import Graph
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
@@ -30,6 +34,7 @@ from torch_spyre._inductor.pass_utils import (
 from torch._inductor.virtualized import V
 from torch._inductor.ir import (
     ComputedBuffer,
+    IRNode,
     TensorBox,
     StorageBox,
     ReinterpretView,
@@ -40,8 +45,25 @@ from torch._inductor.ir import (
 )
 from torch._inductor.lowering import clone as clone_lowering, lowerings
 
-from torch_spyre._inductor.ir import FixedTiledLayout
-from torch_spyre._inductor.split_multi_ops import _origin_in_graph
+from torch_spyre._inductor.ir import AllReduceKernel, FixedTiledLayout, WaitKernel
+from torch_spyre._inductor.pass_utils import origin_in_graph
+
+# In-place collectives whose codegen reads exactly one tensor operand,
+# ``inputs[0]``, and only through ``codegen_reference``/``get_layout``.  The
+# result lives in that operand (``create_inplace`` returns it), so the rewrite
+# repoints the operand, the collective's ``MutationOutput``, its waits and every
+# later reader together.  all_gather and broadcast are out of place and have no
+# test reading a loop carry yet.
+_REWRITABLE_COLLECTIVES = (AllReduceKernel,)
+
+
+def unwrapped_buffer_name(node: Any) -> str | None:
+    """The name of the buffer under ``node``'s wrappers, or None if unwrappable."""
+    while not isinstance(node, Buffer):
+        node = getattr(node, "data", None)
+        if node is None:
+            return None
+    return node.get_name()
 
 
 class GraphEditor:
@@ -127,8 +149,30 @@ class GraphEditor:
         input: bool,
         private: bool = False,
         lx_view: PerCoreView | None = None,
+        after_fx: Node | None = None,
+        lower_anchor: Operation | None = None,
+        lower_before: Operation | None = None,
     ) -> ComputedBuffer:
-        """Insert a clone; private clones rewire only ``buffer_users``."""
+        """Insert a clone; private clones rewire only ``buffer_users``.
+
+        ``after_fx`` and ``lower_anchor`` relocate the clone to run after
+        ``lower_anchor`` in the lowered operation order (and after ``after_fx``
+        in the FX graph) instead of after the producer.  They exist for the
+        post-loop drain of a resident loop carry, whose value only becomes
+        final after the whole counted loop: the drain must be inserted after the
+        loop's last member, not after the pre-loop initializer.  Both default
+        to ``None``, which keeps every existing caller byte-identical.
+
+        ``lower_before`` is the mirror image for an input clone: it places the
+        lowered clone immediately before ``lower_before`` (the entry of the
+        counted loop its consumers run in) instead of before its first
+        consumer, so a loop-invariant copy runs once rather than every trip.
+        The FX node already sits right after the input placeholder, so only the
+        lowered order moves.
+        """
+        assert lower_anchor is None or lower_before is None, (
+            "a clone has one position: lower_anchor and lower_before exclude each other"
+        )
         if input and lx_view is None:
             raise ValueError("an LX input clone requires its accepted physical view")
         if isinstance(buffer, TensorBox):
@@ -144,8 +188,8 @@ class GraphEditor:
         # and the subgraph's own compute node. inserting_after requires an anchor
         # in the current lowering graph, so select the graph-local origin rather
         # than list(origins)[0] (which may be a foreign parent-graph node and
-        # asserts). See split_multi_ops._origin_in_graph for the same pattern.
-        buf_fx = _origin_in_graph(buffer.origins, self.fx_graph)
+        # asserts). See pass_utils.origin_in_graph for the same pattern.
+        buf_fx = origin_in_graph(buffer.origins, self.fx_graph)
         assert buf_fx is not None, (
             f"no origin of {buf_name} lives in the current lowering graph; "
             f"origins={[getattr(n, 'name', n) for n in buffer.origins]}"
@@ -154,7 +198,7 @@ class GraphEditor:
         if private:
             anchors = []
             for consumer in buffer_users:
-                anchor = getattr(consumer, "origin_node", None) or _origin_in_graph(
+                anchor = getattr(consumer, "origin_node", None) or origin_in_graph(
                     consumer.origins, self.fx_graph
                 )
                 assert anchor is not None, (
@@ -165,7 +209,16 @@ class GraphEditor:
                 )
                 anchors.append(anchor)
             old_users = list(dict.fromkeys(anchors))
-        self.fx_graph.inserting_after(buf_fx)
+        if after_fx is not None:
+            # Post-loop drain: place the FX clone after the whole-loop anchor
+            # (the retained while_loop HOP node) while still reading only
+            # ``buf_fx``, so the loop's carried input is untouched and no cycle
+            # is possible.  The anchor must live in this lowering's graph; the
+            # allocator's plan already re-checked that before committing.
+            assert after_fx.graph is self.fx_graph, (
+                f"FX drain anchor {after_fx} is not in the current lowering graph"
+            )
+        self.fx_graph.inserting_after(after_fx if after_fx is not None else buf_fx)
         new_fx_node = self.fx_graph.create_node(
             "call_function", self.clone_aten_op, (buf_fx,)
         )
@@ -175,17 +228,17 @@ class GraphEditor:
 
         layout = buffer.layout
         assert isinstance(layout, FixedTiledLayout)
-        clone_layout = FixedTiledLayout(
-            layout.device,
-            layout.dtype,
-            list(layout.size),
-            list(layout.stride),
-            layout.device_layout,
-            offset=layout.offset,
-        )
+        clone_layout = layout.unallocated_copy()
+        # "First consumer" means first in the lowered order, not first in
+        # ``buffer_users``: callers may pass consumers in any order (relayout
+        # groups are name-sorted, so buf121 precedes buf59). A clone placed after
+        # a consumer that reads it breaks the topological order the Scheduler
+        # relies on.
+        operations = self.lowering.operations
+        first_user = min(buffer_users, key=operations.index) if buffer_users else None
         # Input buffers have no loop metadata, so input clones inherit it from
         # their consumer. Output clones inherit it from their producer.
-        metadata_source = buffer_users[0] if input else buffer
+        metadata_source = first_user if input else buffer
         assert isinstance(metadata_source, ComputedBuffer)
         clone_tb = clone_lowering(buffer)
         new_com_buf = ComputedBuffer(
@@ -268,9 +321,22 @@ class GraphEditor:
                     )
 
         self.lowering.operations.remove(new_com_buf)
-        self.lowering.operations.insert(
-            self.lowering.operations.index(buffer_users[0]), new_com_buf
-        )
+        if lower_anchor is not None:
+            # Post-loop drain: insert after the loop's last member (an
+            # Operation object, not a saved index -- earlier clones in the same
+            # push only insert before/after existing ops, so the identity
+            # survives and a stale index cannot).
+            self.lowering.operations.insert(
+                self.lowering.operations.index(lower_anchor) + 1, new_com_buf
+            )
+        else:
+            # A hoisted input clone goes before its consumers' loop entry; any
+            # other clone goes before its first consumer, as before.
+            before = lower_before if lower_before is not None else first_user
+            assert before is not None, "a clone with no consumers needs an anchor"
+            self.lowering.operations.insert(
+                self.lowering.operations.index(before), new_com_buf
+            )
 
         return new_com_buf
 
@@ -312,9 +378,135 @@ class GraphEditor:
 
             inputs_kernel.get_free_symbol_uses.clear_cache(inputs_kernel)
 
-        So instead we just allow ops that wrap a Pointwise or Reduction.
+        So instead we just allow ops that wrap a Pointwise or Reduction.  The
+        exceptions are the rewritable collectives and their waits in
+        :meth:`replace_post_loop_accesses`, where that swap is the complete
+        rewrite because their codegen reads only ``inputs[0]``.
         """
         return hasattr(op, "data") and isinstance(op.data, Pointwise | Reduction)
+
+    @staticmethod
+    def _sole_operand_name(op: Operation) -> str | None:
+        """The buffer ``op``'s one operand names through plain boxes, or ``None``.
+
+        ``None`` when a ``ReinterpretView`` sits on the operand chain: the view
+        would have to be rebuilt around the new storage, and the view object may
+        be shared with another op, so such an op is not rewritten.
+        """
+        inputs = getattr(op, "inputs", None)
+        if not inputs or len(inputs) != 1:
+            return None
+        node = inputs[0]
+        while not isinstance(node, Buffer):
+            if not isinstance(node, TensorBox | StorageBox):
+                return None
+            node = node.data
+        return node.get_name()
+
+    @staticmethod
+    def collective_operand_name(op: Operation) -> str | None:
+        """The buffer a rewritable collective's operand names, or ``None``."""
+        if not isinstance(op, _REWRITABLE_COLLECTIVES):
+            return None
+        return GraphEditor._sole_operand_name(op)
+
+    @staticmethod
+    def is_repointable_access(op: Operation, name: str) -> bool:
+        """Whether :meth:`replace_post_loop_accesses` can move ``op`` off ``name``.
+
+        A rewritable collective or a wait on ``name``, or a Pointwise/Reduction
+        loop (whose loads are renamed) that does not write ``name`` in place:
+        renaming its loads would leave it reading ``new`` and writing ``name``.
+        """
+        if GraphEditor.collective_operand_name(op) == name:
+            return True
+        if isinstance(op, WaitKernel):
+            return GraphEditor._sole_operand_name(op) == name
+        return (
+            GraphEditor.is_rewritable_consumer(op)
+            and name not in op.get_mutation_names()
+        )
+
+    def replace_post_loop_accesses(
+        self, accesses: Sequence[Operation], old_name: str, new: ComputedBuffer
+    ) -> None:
+        """Make every op in ``accesses`` read (and mutate) ``new`` for ``old_name``.
+
+        ``accesses`` is every post-loop access of a drained carry: an in-place
+        collective's result lives in its operand, so its waits and later readers
+        must follow it onto ``new``.  Collectives and waits get their operand's
+        ``TensorBox``/``StorageBox`` wrappers rebuilt around ``new`` rather than
+        edited, so no IR object shared with another op changes, and their
+        ``MutationOutput``/alias bookkeeping renamed.  Loops get their loads
+        renamed.  ``new`` must be addressing-equivalent to ``old_name`` (same
+        layout): the collective's plan is sized from the operand's layout.
+        """
+        for op in accesses:
+            if not self.is_repointable_access(op, old_name):
+                raise ValueError(
+                    f"{op.get_name()} is not a repointable access of {old_name}"
+                )
+        new_name = new.get_name()
+        for op in accesses:
+            if self.is_rewritable_consumer(op):
+                self._replace_loop_input(op, old_name, new_name)
+            else:
+                self._replace_sole_operand(op, old_name, new)
+
+        op_names = {op.get_name() for op in accesses}
+        kept: list[IRNode] = []
+        moved: list[IRNode] = []
+        for user in self.lowering.name_to_users.get(old_name, []):
+            is_op = unwrapped_buffer_name(user) in op_names
+            (moved if is_op else kept).append(user)
+        self.lowering.name_to_users[old_name] = kept
+        self.lowering.name_to_users[new_name].extend(moved)
+
+    def _replace_sole_operand(
+        self, op: Operation, old_name: str, new: ComputedBuffer
+    ) -> None:
+        """Repoint a collective's or wait's one operand at ``new``."""
+        wrappers = []
+        node = op.inputs[0]
+        while not isinstance(node, Buffer):
+            wrappers.append(type(node))
+            node = node.data
+        old_layout, new_layout = node.get_layout(), new.get_layout()
+        if (
+            old_layout.dtype != new_layout.dtype
+            or list(old_layout.size) != list(new_layout.size)
+            or list(old_layout.stride) != list(new_layout.stride)
+            or old_layout.offset != new_layout.offset
+            or getattr(old_layout, "device_layout", None)
+            != getattr(new_layout, "device_layout", None)
+        ):
+            raise ValueError(
+                f"{new.get_name()} is not addressing-equivalent to {old_name}"
+            )
+        replacement: IRNode = new
+        for wrapper in reversed(wrappers):
+            replacement = wrapper(replacement)
+        op.inputs = [replacement]
+
+        new_name = new.get_name()
+
+        def rename(names: list[str]) -> list[str]:
+            return [new_name if n == old_name else n for n in names]
+
+        # create_inplace / create_wait record the mutation on separate
+        # MutationOutput buffers and the kernel's alias_names, not on inputs.
+        for mutation in getattr(op, "mutation_outputs", ()):
+            mutation.mutation_names = rename(mutation.mutation_names)
+        if hasattr(op, "alias_names"):
+            op.alias_names = rename(op.alias_names)
+        # ``old_name`` deliberately stays in ``mutated_buffers``: upstream only
+        # reads the set to veto optimizations (inlining, constant folding), so
+        # a stale entry is conservative, and the set cannot tell whether some
+        # other op still mutates ``old_name``.
+        if getattr(op, "mutation_outputs", None):
+            self.lowering.mutated_buffers.add(new_name)
+        invalidate_op_read_writes(op)
+        op.get_free_symbol_uses.clear_cache(op)
 
     def _replace_loop_input(
         self, old_loop: Operation, old_name: str, new_name: str

@@ -14,8 +14,10 @@
 
 """The v2 ClickHouse schema as classes: one class per table, sharing `Table`."""
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any, TypedDict
+
+from spyre_clickhouse_ingest.batching import insert_chunks
 
 # The DDL's CHECK constraints, re-expressed: unreadable from the server at ingest
 # time. Keep in step with schema/10-functional-tests.sql and schema/20-artifacts.sql.
@@ -24,16 +26,80 @@ KIND_VALUES = frozenset({"image", "rpm", "wheel", "generic"})
 ORIGIN_VALUES = frozenset({"built", "copied", "promoted", "upstream"})
 METHOD_VALUES = frozenset({"container-pull", "dnf", "pip", "download"})
 REF_KIND_VALUES = frozenset({"pullspec", "glob", "url"})
-RESULT_KIND_VALUES = frozenset({"functional", "performance", "image"})
-TEST_TYPE_VALUES = frozenset(
-    {"smoke", "unit", "integration", "regression", "trunk", "perf", "capability"}
+RESULT_KIND_VALUES = frozenset({"functional", "performance", "capability"})
+# Which capability analysis produced a capability_runs row; also the test_type of a
+# result_kind='capability' verdict.
+CAPABILITY_TYPE_VALUES = frozenset(
+    {"model_ops", "model_modules", "model_support", "model_serving"}
 )
-# Which capability analysis produced a capability_runs row -- a sibling vocabulary to
-# TEST_TYPE_VALUES, not a subset of it.
-CAPABILITY_TYPE_VALUES = frozenset({"model_ops", "model_support"})
+# spyre-test-framework's stages, each its own leg.
+SUITE_STAGE_VALUES = frozenset(
+    {"fvt", "fvt-static", "fvt-dynamic", "svt", "svt-static", "svt-dynamic"}
+)
+# quality: accuracy evals (lm-eval tasks, MTEB, RAG), benchmark rows apart from perf's gates.
+TEST_TYPE_VALUES = (
+    frozenset(
+        {"smoke", "unit", "integration", "regression", "trunk", "perf", "quality"}
+    )
+    | SUITE_STAGE_VALUES
+    | CAPABILITY_TYPE_VALUES
+)
 STATE_VALUES = frozenset({"passed", "failed", "error", "running"})
-# capability_runs.status: not_implemented is unsupported, not a skipped test.
-CAPABILITY_STATUS_VALUES = frozenset({"passed", "failed", "not_implemented"})
+# artifact_result_reasons.failure_reason, and props['failure_reason'] on a non-passing verdict:
+# spyre-frameworks' diagnose_failure.py categories plus the outcomes a log cannot show.
+FAILURE_REASON_VALUES = frozenset(
+    {
+        "test_failure",
+        "build_error",
+        "infra_disk",
+        "infra_network",
+        "infra_auth",
+        "infra_capacity",
+        "infra_hardware",
+        "infra_timeout",
+        "infra_env",
+        "superseded",
+        "aborted",
+        "dependency_failed",
+        "pipeline_error",
+        "ingest_error",
+        "unknown",
+    }
+)
+# capability_runs.status: not_implemented is unsupported, not a skipped test; undetermined is a
+# test that broke before giving a verdict.
+CAPABILITY_STATUS_VALUES = frozenset(
+    {"passed", "failed", "not_implemented", "undetermined"}
+)
+
+RUN_SOURCE_VALUES = frozenset({"jenkins", "gha"})
+RUN_LINK_RELATION_VALUES = frozenset({"launched", "retry_of"})
+RUN_LINK_EVIDENCE_VALUES = frozenset({"recorded", "cited", "inferred"})
+RUN_LINK_CONFIDENCE_VALUES = frozenset({"exact", "timestamp", "low", "unresolved"})
+PIPELINE_TYPE_VALUES = frozenset(
+    {"orchestrator", "component-build", "product-test", "gha-workflow", "gha-job"}
+)
+RUN_STATE_VALUES = frozenset({"running", "finished"})
+# ci_run_timings: one row per build or test entry. A build was built, reused from a concurrent
+# build, dropped (already published) or failed; '' is a state not reported.
+TIMING_ENTRY_VALUES = frozenset({"build", "test"})
+TIMING_BUILD_STATE_VALUES = frozenset({"built", "reused", "dropped", "failed", ""})
+TIMING_TEST_STATE_VALUES = frozenset({"passed", "failed", "error", ""})
+TIMING_STATE_VALUES = {
+    "build": TIMING_BUILD_STATE_VALUES,
+    "test": TIMING_TEST_STATE_VALUES,
+}
+TIMING_EXECUTOR_VALUES = frozenset(
+    {"gha-ephemeral", "gha-standing", "jenkins-local", "jenkins-job", ""}
+)
+TARGET_TYPE_VALUES = frozenset({"jenkins", "gha_dispatch", "webhook"})
+EVENT_TYPE_VALUES = frozenset(
+    {"artifact.tagged", "artifact.recorded", "artifact.promoted", "results.recorded"}
+)
+DISPATCH_STATE_VALUES = frozenset({"queued", "triggered", "failed", "skipped"})
+REQUESTED_BY_VALUES = frozenset({"user", "pipeline"})
+RBAC_SUBJECT_TYPE_VALUES = frozenset({"user", "group"})
+DISPATCHED_BY_VALUES = REQUESTED_BY_VALUES | {"auto"}
 
 # NOT constrained, deliberately: the DDL declares tag_family and arch without a CHECK.
 
@@ -41,6 +107,7 @@ CAPABILITY_STATUS_VALUES = frozenset({"passed", "failed", "not_implemented"})
 # since id12 is a hash INPUT to artifact_id. A reader resolves it via props['id12'].
 DEP_ENTRY_SEP = "@"
 DEP_BASE_PREFIX = "base="
+IDENTITY_LOOKUP_CHUNK = 2000
 
 
 class SchemaError(ValueError):
@@ -82,6 +149,9 @@ class Table:
     enums: tuple[tuple[str, frozenset[str]], ...] = ()
     # id column for cross-run identity dedup; None for fact tables, which append freely.
     identity: str | None = None
+    # True for a ReplacingMergeTree whose sort key a resent row repeats: a blind retry of a
+    # failed batch collapses on merge. Plain MergeTree and SummingMergeTree tables stay False.
+    idempotent: bool = False
     # The TypedDict shape a caller should build for this table -- checked by mypy/the editor,
     # never at runtime; `row()` below is still what actually validates a row.
     Row: type = dict
@@ -116,16 +186,28 @@ class Table:
 
     @classmethod
     def insert(
-        cls, client, rows: Sequence[Mapping[str, Any]], db: str | None = None
+        cls,
+        client,
+        rows: Sequence[Mapping[str, Any]],
+        db: str | None = None,
+        landed: Callable[[], int] | None = None,
     ) -> int:
-        """Insert dicts, ordering every row through the one column list."""
+        """Insert dicts, ordering every row through the one column list, in retried batches.
+
+        `landed` counts this call's rows already stored (see batching.insert_chunks).
+        """
         if not rows:
             return 0
         ordered = [cls.row(r) for r in rows]
-        client.insert(
-            cls.name, ordered, column_names=list(cls.columns), database=db or None
+        return insert_chunks(
+            client,
+            cls.name,
+            ordered,
+            list(cls.columns),
+            database=db or None,
+            already_landed=landed,
+            idempotent=cls.idempotent,
         )
-        return len(ordered)
 
     @classmethod
     def insert_identities(
@@ -137,12 +219,15 @@ class Table:
         if not cls.identity:
             raise SchemaError(f"{cls.name} has no identity column")
         ids = [str(k) for k in rows]
+        # Chunked: the ids travel as one HTTP form field, and ClickHouse rejects a field over
+        # http_max_field_value_size (128 KiB) -- a 12k-case merged junit is ~470 KiB.
         known = {
             str(r[0])
+            for i in range(0, len(ids), IDENTITY_LOOKUP_CHUNK)
             for r in client.query(
                 f"SELECT {cls.identity} FROM {cls.qualified(db)} "
                 f"WHERE {cls.identity} IN {{ids:Array(UUID)}}",
-                parameters={"ids": ids},
+                parameters={"ids": ids[i : i + IDENTITY_LOOKUP_CHUNK]},
             ).result_rows
         }
         fresh = [v for k, v in rows.items() if str(k) not in known]
@@ -184,7 +269,7 @@ class TestCaseRow(TypedDict):
 
 
 class TestCases(Table):
-    """Test identity: one row per (component, classname, name, tags)."""
+    """Test identity: one row per (component, classname, name, identity tags)."""
 
     name = "test_cases"
     columns = ("test_case_id", "component", "classname", "name", "tags")
@@ -201,10 +286,12 @@ class TestCaseRunRow(TypedDict):
     duration_s: float
     fail_message: str
     props: dict[str, str]
+    tags: list[str]
+    measurements: dict[str, float]
 
 
 class TestCaseRuns(Table):
-    """One test's outcome in one run; props carries the source_file discriminator."""
+    """One test's outcome in one run: run-context tags, recorded measurements and results."""
 
     name = "test_case_runs"
     columns = (
@@ -215,6 +302,8 @@ class TestCaseRuns(Table):
         "duration_s",
         "fail_message",
         "props",
+        "tags",
+        "measurements",
     )
     required = ("component",)
     enums = (("status", STATUS_VALUES),)
@@ -381,6 +470,7 @@ class ArtifactRefRow(TypedDict):
 class ArtifactRefs(Table):
     """How a consumer obtains an artifact, and the address that takes."""
 
+    idempotent = True
     name = "artifact_refs"
     columns = (
         "artifact_id",
@@ -447,6 +537,380 @@ class ArtifactResults(Table):
     Row = ArtifactResultRow
 
 
+class ArtifactResultReasonRow(TypedDict):
+    artifact_id: str
+    run_id: str
+    result_kind: str
+    test_type: str
+    failure_reason: str
+    failure_subreason: str
+    failure_detail: str
+    failure_log_url: str
+    failure_wait_s: int
+    confidence: int
+    source: str
+    props: dict[str, str]
+
+
+class ArtifactResultReasons(Table):
+    """Why a verdict did not pass, written after the verdict itself; one row per source."""
+
+    idempotent = True
+    name = "artifact_result_reasons"
+    columns = (
+        "artifact_id",
+        "run_id",
+        "result_kind",
+        "test_type",
+        "failure_reason",
+        "failure_subreason",
+        "failure_detail",
+        "failure_log_url",
+        "failure_wait_s",
+        "confidence",
+        "source",
+        "props",
+    )
+    required = ("source",)
+    enums = (
+        ("result_kind", RESULT_KIND_VALUES),
+        ("test_type", TEST_TYPE_VALUES),
+        ("failure_reason", FAILURE_REASON_VALUES),
+    )
+    Row = ArtifactResultReasonRow
+
+
+class PipelineRuns(Table):
+    """One CI execution (Jenkins build or GHA run attempt / job), upserted start -> end.
+
+    Jenkins rows arrive as JSONEachRow from vars/pushToClickhouse.groovy; this model is the
+    shape the gha_runs poller writes through.
+    """
+
+    idempotent = True
+
+    name = "pipeline_runs"
+    columns = (
+        "run_key",
+        "updated_at",
+        "source",
+        "pipeline_type",
+        "state",
+        "job_name",
+        "build_number",
+        "attempt",
+        "build_url",
+        "agent",
+        "parent_run_key",
+        "started_at",
+        "ended_at",
+        "queue_ms",
+        "duration_ms",
+        "build_ms",
+        "test_ms",
+        "trigger_kind",
+        "trigger_source",
+        "preset",
+        "build_mode",
+        "repo",
+        "pr_number",
+        "sha",
+        "test_with",
+        "component",
+        "arches",
+        "result",
+        "verdict",
+        "superseded",
+        "reached_normal_completion",
+        "lane_results",
+        "nodes_built",
+        "nodes_reused",
+        "nodes_dropped",
+        "tests_total",
+        "tests_failed",
+        "ch_write_failures",
+        "failure_reason",
+        "failure_is_infra",
+        "failure_evidence",
+        "failed_stage",
+        "fail_log_tail",
+        "props",
+    )
+    required = ("run_key", "job_name")
+    enums = (
+        ("source", RUN_SOURCE_VALUES),
+        ("pipeline_type", PIPELINE_TYPE_VALUES),
+        ("state", RUN_STATE_VALUES),
+    )
+
+
+class CiRunTimings(Table):
+    """One component build or test leg of an orchestrator run, trigger to teardown.
+
+    Executor-neutral: a GHA workflow and a Jenkins `make test` fill the same provision/exec
+    columns. `leg` and every `*_ms` are MATERIALIZED in the DDL, so they are not modelled here:
+    the server derives them and ignores a value a writer supplies.
+    """
+
+    idempotent = True
+
+    name = "ci_run_timings"
+    columns = (
+        "run_key",
+        "updated_at",
+        "entry",
+        "component",
+        "artifact_name",
+        "arch",
+        "id12",
+        "kind",
+        "test_modes",
+        "attempt",
+        "trigger_kind",
+        "trigger_source",
+        "preset",
+        "build_mode",
+        "trigger_pr",
+        "repo",
+        "pr_number",
+        "sha",
+        "base_ref",
+        "is_pr_component",
+        "build_url",
+        "verdict",
+        "run_result",
+        "superseded",
+        "pickup_path",
+        "comment_at",
+        "picked_up_at",
+        "run_scheduled_at",
+        "run_started_at",
+        "pr_queued_at",
+        "pr_running_at",
+        "run_ended_at",
+        "state",
+        "result",
+        "gating",
+        "url",
+        "agent",
+        "queued_at",
+        "started_at",
+        "ended_at",
+        "executor",
+        "provision_started_at",
+        "provision_ended_at",
+        "exec_dispatched_at",
+        "exec_started_at",
+        "exec_ended_at",
+        "exec_runs",
+        "exec_jobs",
+        "exec_result",
+        "exec_urls",
+        "exec_run_keys",
+        "cards",
+        "runner_died",
+        "failure_reason",
+        "failed_stage",
+        "props",
+    )
+    # run_started_at is the partition key and not Nullable.
+    required = ("run_key", "entry", "component", "arch", "run_started_at")
+    enums = (
+        ("entry", TIMING_ENTRY_VALUES),
+        ("executor", TIMING_EXECUTOR_VALUES),
+    )
+
+    @classmethod
+    def row(cls, values: Mapping[str, Any]) -> list[Any]:
+        """As Table.row, plus chk_timing_state: the allowed states depend on the entry."""
+        ordered = super().row(values)
+        allowed = TIMING_STATE_VALUES[values["entry"]]
+        if values["state"] not in allowed:
+            raise SchemaError(
+                f"{cls.name}: {values['entry']} state {values['state']!r} violates the "
+                f"DDL CHECK (allowed: {sorted(allowed)})"
+            )
+        return ordered
+
+
+class ArtifactSubscriptions(Table):
+    """Who an artifact triggers; one row per version, the newest updated_at wins."""
+
+    idempotent = True
+    name = "artifact_subscriptions"
+    columns = (
+        "subscription_id",
+        "updated_at",
+        "enabled",
+        "event_types",
+        "tag_family",
+        "tag_pattern",
+        "tag_props",
+        "exclude_families",
+        "exclude_tag_patterns",
+        "result_test_types",
+        "result_states",
+        "component",
+        "arch",
+        "kind",
+        "artifact_name",
+        "not_before",
+        "require",
+        "unless_exists",
+        "max_per_hour",
+        "max_per_day",
+        "coalesce_minutes",
+        "target_type",
+        "target",
+        "params",
+        "payload_fields",
+        "credential_id",
+        "owner",
+        "updated_by",
+        "notes",
+        "props",
+    )
+    required = ("subscription_id", "target")
+    enums = (("target_type", TARGET_TYPE_VALUES),)
+
+
+class RbacRoles(Table):
+    """A named set of '<resource>:<action>' permissions; the newest updated_at wins."""
+
+    idempotent = True
+    name = "rbac_roles"
+    columns = (
+        "role_id",
+        "updated_at",
+        "active",
+        "permissions",
+        "description",
+        "updated_by",
+        "props",
+    )
+    required = ("role_id",)
+
+
+class RbacBindings(Table):
+    """A role given to a user or OpenShift group, limited to a scope; the newest updated_at wins."""
+
+    idempotent = True
+    name = "rbac_bindings"
+    columns = (
+        "binding_id",
+        "updated_at",
+        "active",
+        "subject_type",
+        "subject",
+        "role_id",
+        "scope",
+        "expires_at",
+        "updated_by",
+        "notes",
+        "props",
+    )
+    required = ("binding_id", "subject", "role_id")
+    enums = (("subject_type", RBAC_SUBJECT_TYPE_VALUES),)
+
+
+class DispatchRequests(Table):
+    """A person's or pipeline's "run this subscription against this artifact"."""
+
+    name = "dispatch_requests"
+    columns = (
+        "request_id",
+        "requested_at",
+        "subscription_id",
+        "artifact_id",
+        "tag",
+        "requested_by",
+        "requester",
+        "params",
+        "reason",
+        "props",
+    )
+    required = ("request_id", "subscription_id", "artifact_id")
+    enums = (("requested_by", REQUESTED_BY_VALUES),)
+
+
+class ArtifactDispatches(Table):
+    """One dispatch, upserted on every state change; written only by the dispatcher."""
+
+    idempotent = True
+    name = "artifact_dispatches"
+    columns = (
+        "dispatch_id",
+        "updated_at",
+        "subscription_id",
+        "artifact_id",
+        "event_type",
+        "event_key",
+        "tag",
+        "event_ts",
+        "requested_by",
+        "requester",
+        "request_id",
+        "requested_at",
+        "state",
+        "target_type",
+        "target",
+        "params",
+        "payload",
+        "target_url",
+        "build_url",
+        "error",
+        "attempts",
+        "next_attempt_at",
+        "dispatcher_url",
+        "props",
+    )
+    required = ("dispatch_id", "subscription_id", "artifact_id")
+    enums = (
+        ("requested_by", DISPATCHED_BY_VALUES),
+        ("state", DISPATCH_STATE_VALUES),
+        ("target_type", TARGET_TYPE_VALUES | {""}),
+    )
+
+
+class DispatchTargets(Table):
+    """The dispatcher's allow-list, one snapshot per publish; an empty list is one '' / '' row."""
+
+    name = "dispatch_targets"
+    columns = (
+        "target_type",
+        "target_prefix",
+        "credential_id",
+        "published_at",
+        "job_run",
+    )
+    required = ("published_at",)
+
+
+class PipelineRunLinks(Table):
+    """A launcher-recorded run-to-run edge: an intent first, then the resolved child run."""
+
+    name = "pipeline_run_links"
+    columns = (
+        "link_id",
+        "observed_at",
+        "from_run_key",
+        "to_run_key",
+        "relation",
+        "evidence_kind",
+        "confidence",
+        "target",
+        "dispatched_at",
+        "recorded_by",
+        "props",
+    )
+    required = ("link_id", "from_run_key")
+    enums = (
+        ("relation", RUN_LINK_RELATION_VALUES),
+        ("evidence_kind", RUN_LINK_EVIDENCE_VALUES),
+        ("confidence", RUN_LINK_CONFIDENCE_VALUES),
+    )
+
+
 # Constant API, kept so installed consumers name one table model rather than copying it.
 TEST_CASES = TestCases
 TEST_CASE_RUNS = TestCaseRuns
@@ -458,6 +922,16 @@ ARTIFACTS = Artifacts
 ARTIFACT_REFS = ArtifactRefs
 ARTIFACT_TAGS = ArtifactTags
 ARTIFACT_RESULTS = ArtifactResults
+ARTIFACT_RESULT_REASONS = ArtifactResultReasons
+PIPELINE_RUNS = PipelineRuns
+PIPELINE_RUN_LINKS = PipelineRunLinks
+CI_RUN_TIMINGS = CiRunTimings
+ARTIFACT_SUBSCRIPTIONS = ArtifactSubscriptions
+RBAC_ROLES = RbacRoles
+RBAC_BINDINGS = RbacBindings
+DISPATCH_REQUESTS = DispatchRequests
+ARTIFACT_DISPATCHES = ArtifactDispatches
+DISPATCH_TARGETS = DispatchTargets
 
 TABLES = {
     t.name: t
@@ -470,8 +944,18 @@ TABLES = {
         ArtifactRefs,
         ArtifactTags,
         ArtifactResults,
+        ArtifactResultReasons,
         Capabilities,
         CapabilityRuns,
+        PipelineRuns,
+        PipelineRunLinks,
+        CiRunTimings,
+        ArtifactSubscriptions,
+        RbacRoles,
+        RbacBindings,
+        DispatchRequests,
+        ArtifactDispatches,
+        DispatchTargets,
     )
 }
 

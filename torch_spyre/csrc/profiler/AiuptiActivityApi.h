@@ -43,7 +43,7 @@ class AiuptiActivityApi {
 
   static AiuptiActivityApi& singleton();
 
-  static void pushCorrelationID(int id, CorrelationFlowType type);
+  static void pushCorrelationID(uint64_t id, CorrelationFlowType type);
   static void popCorrelationID(CorrelationFlowType type);
 
   void enableAiuptiActivities(
@@ -54,6 +54,9 @@ class AiuptiActivityApi {
 
   virtual std::unique_ptr<AiuptiActivityBufferDeque> activityBuffers();
 
+  // Iterate every buffer to exhaustion without releasing its storage. A
+  // completed iteration resets libaiupti's cursor, so the deque can be
+  // replayed.
   virtual const std::pair<int, int> processActivities(
       AiuptiActivityBufferDeque&,
       std::function<void(const Pti_Activity*)> handler);
@@ -69,7 +72,6 @@ class AiuptiActivityApi {
   std::unique_ptr<AiuptiActivityBufferDeque> readyAiuTraceBuffers_;
   std::mutex mutex_;
   std::atomic<uint32_t> tracingEnabled_{0};
-  bool externalCorrelationEnabled_{false};
 
   int processActivitiesForBuffer(
       uint8_t* buf, size_t validSize,

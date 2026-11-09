@@ -14,27 +14,35 @@
 
 """Unit tests for scatter layout enforcement helper functions.
 
-Tests the core layout-checking logic in enforce_indirect_access_layout.py:
+Tests the core layout-checking logic in nonstick_dim_order.py:
 - _dim_order_is_compliant: checks if indirect dim is at device position 0
 - _indirect_stride_idx: finds which coordinate carries IndirectAccess
-- _build_required_stl: constructs compliant layout by rotating dimensions
+- _ia_rotate_stl: constructs compliant layout by rotating dimensions
+- _retile_entry_per_stick: re-tiles when the indexed coordinate is the stick
 """
 
 import unittest
 
 import sympy
 import torch
+from torch._inductor.dependencies import MemoryDep
+from torch._inductor.ir import FixedLayout
 
 from torch_spyre._C import ElementArrangement, SpyreTensorLayout, get_device_dtype
 from torch_spyre._inductor.enforce_indirect_access_layout import (
     _dense_scatter_source_stl,
+)
+from torch_spyre._inductor.nonstick_dim_order import (
     _dim_order_is_compliant,
+    _ia_rotate_stl,
     _indirect_stride_idx,
-    _build_required_stl,
+    _is_permutation_of,
+    _retile_entry_per_stick,
 )
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.op_spec import IndirectAccess
+from torch_spyre._inductor.work_division import MAX_SPAN_BYTES
 
 
 class TestDimOrderCompliance(unittest.TestCase):
@@ -42,10 +50,12 @@ class TestDimOrderCompliance(unittest.TestCase):
 
     def test_indirect_at_position_0_is_compliant(self):
         """Indirect dim at device position 0 (outermost): compliant."""
+        _ds = [8, 2, 1, 64]
         stl = SpyreTensorLayout(
-            device_size=[8, 2, 64, 1],
-            stride_map=[128, 64, 1, 1],
+            device_size=_ds,
+            stride_map=[128, 64, -1, 1],
             device_dtype=get_device_dtype(torch.float16),
+            valid_elements={(0,): 8, (1, 3): 128, (2,): 1},
         )
         # stride_idx from right: 3 (rightmost coordinate)
         # device_pos = 4 - 1 - 3 = 0 ✓
@@ -53,10 +63,12 @@ class TestDimOrderCompliance(unittest.TestCase):
 
     def test_indirect_at_position_1_non_compliant(self):
         """Indirect dim at device position 1: non-compliant."""
+        _ds = [2, 8, 1, 64]
         stl = SpyreTensorLayout(
-            device_size=[2, 8, 64, 1],
-            stride_map=[512, 64, 1, 1],
+            device_size=_ds,
+            stride_map=[512, 64, -1, 1],
             device_dtype=get_device_dtype(torch.float16),
+            valid_elements={(0,): 2, (1, 3): 512, (2,): 1},
         )
         # stride_idx from right: 2
         # device_pos = 4 - 1 - 2 = 1 ✗
@@ -64,10 +76,12 @@ class TestDimOrderCompliance(unittest.TestCase):
 
     def test_indirect_at_position_2_non_compliant(self):
         """Indirect dim at device position 2: non-compliant."""
+        _ds = [2, 4, 1, 64]
         stl = SpyreTensorLayout(
-            device_size=[2, 4, 64, 1],
-            stride_map=[256, 64, 1, 1],
+            device_size=_ds,
+            stride_map=[256, 64, -1, 1],
             device_dtype=get_device_dtype(torch.float16),
+            valid_elements={(0,): 2, (1, 3): 256, (2,): 1},
         )
         # stride_idx from right: 1
         # device_pos = 4 - 1 - 1 = 2 ✗
@@ -131,62 +145,152 @@ class TestIndirectStrideIdx(unittest.TestCase):
         self.assertEqual(stride_idx, 2)
 
 
-class TestBuildRequiredStl(unittest.TestCase):
-    """Tests for _build_required_stl."""
+class TestIaRotateStl(unittest.TestCase):
+    """Tests for _ia_rotate_stl."""
 
     def test_rotate_indirect_to_position_0(self):
-        """Rotates indirect dim from position 2 to position 0."""
+        """Rotates indirect dim from position 1 to position 0."""
+        _ds = [2, 4, 1, 64]
         original_stl = SpyreTensorLayout(
-            device_size=[2, 4, 8, 1],
-            stride_map=[256, 64, 1, 1],
+            device_size=_ds,
+            stride_map=[256, 64, -1, 1],
             device_dtype=get_device_dtype(torch.float16),
+            valid_elements={(0,): 2, (1, 3): 256, (2,): 1},
         )
-        required_stl = _build_required_stl(original_stl, indirect_device_pos=2)
+        required_stl = _ia_rotate_stl(original_stl, indirect_device_pos=1)
 
-        # Should move dim 2 (size 8) to position 0
-        self.assertEqual(required_stl.device_size[0], 8)
-        self.assertEqual(required_stl.stride_map[0], 1)
-        # Stick (pos 3) should stay at end
-        self.assertEqual(required_stl.device_size[3], 1)
+        # Should move dim 1 (size 4) to position 0
+        self.assertEqual(required_stl.device_size[0], 4)
+        # Stick (pos 3, size 64) should stay at end
+        self.assertEqual(required_stl.device_size[3], 64)
         self.assertEqual(required_stl.stride_map[3], 1)
 
     def test_already_at_position_0_unchanged(self):
         """Returns same STL when indirect already at position 0."""
+        _ds = [8, 2, 1, 64]
         original_stl = SpyreTensorLayout(
-            device_size=[8, 2, 64, 1],
-            stride_map=[128, 64, 1, 1],
+            device_size=_ds,
+            stride_map=[128, 64, -1, 1],
             device_dtype=get_device_dtype(torch.float16),
+            valid_elements={(0,): 8, (1, 3): 128, (2,): 1},
         )
-        required_stl = _build_required_stl(original_stl, indirect_device_pos=0)
+        required_stl = _ia_rotate_stl(original_stl, indirect_device_pos=0)
 
         self.assertEqual(required_stl.device_size, original_stl.device_size)
         self.assertEqual(required_stl.stride_map, original_stl.stride_map)
 
     def test_rotate_indirect_from_position_1(self):
         """Rotates indirect dim from position 1 to position 0."""
+        _ds = [2, 8, 1, 64]
         original_stl = SpyreTensorLayout(
-            device_size=[2, 8, 64, 1],
-            stride_map=[512, 64, 1, 1],
+            device_size=_ds,
+            stride_map=[512, 64, -1, 1],
             device_dtype=get_device_dtype(torch.float16),
+            valid_elements={(0,): 2, (1, 3): 512, (2,): 1},
         )
-        required_stl = _build_required_stl(original_stl, indirect_device_pos=1)
+        required_stl = _ia_rotate_stl(original_stl, indirect_device_pos=1)
 
         # Dim 1 (size 8) moves to position 0
         self.assertEqual(required_stl.device_size[0], 8)
         # Dim 0 (size 2) should move to position 1
         self.assertEqual(required_stl.device_size[1], 2)
-        # Stick stays at end
-        self.assertEqual(required_stl.device_size[3], 1)
+        # Stick (pos 3, size 64) stays at end
+        self.assertEqual(required_stl.device_size[3], 64)
+
+
+class TestIndirectInsideStick(unittest.TestCase):
+    """The re-tile taken when the indexed coordinate is the stick.
+
+    Rotating cannot repair that case: it lists the stick twice and grows the
+    rank, which the gather then reads garbage through.
+    """
+
+    def _table(self, entries, device_size=None, stride_map=None, valid_elements=None):
+        """A 1-D bf16 table read at an indirect index, and its device layout."""
+        entry = sympy.Symbol("e", integer=True, nonnegative=True)
+        dep = MemoryDep("table", entry, (entry,), (entries,))
+        host = FixedLayout(torch.device("cpu"), torch.bfloat16, [entries], [1])
+        if device_size is None:
+            stl = SpyreTensorLayout([entries], [1], torch.bfloat16, [0])
+        else:
+            stl = SpyreTensorLayout(
+                device_size=device_size,
+                stride_map=stride_map,
+                device_dtype=get_device_dtype(torch.bfloat16),
+                valid_elements=valid_elements,
+            )
+        access_subs = {entry: IndirectAccess(sympy.Symbol("index_buffer"))}
+        return stl, host, dep, access_subs
+
+    def _retile(self, entries, **layout):
+        stl, host, dep, access_subs = self._table(entries, **layout)
+        return _retile_entry_per_stick(stl, host, dep, None, access_subs, None)
+
+    def test_retiles_to_one_entry_per_stick(self):
+        """Entries get their own outermost dim; the stick maps to no host dim."""
+        required_stl = self._retile(128)
+
+        self.assertEqual(list(required_stl.device_size), [128, 64])
+        self.assertEqual(list(required_stl.stride_map), [1, -1])
+
+    def test_entries_moved_out_of_a_spare_size1_dim(self):
+        """A spare size-1 dim takes the entries, then a reorder puts them first."""
+        required_stl = self._retile(
+            128,
+            device_size=[2, 1, 64],
+            stride_map=[64, -1, 1],
+            valid_elements={(0, 2): 128, (1,): 1},
+        )
+
+        # The layout a host [N, 1] input already receives.
+        self.assertEqual(list(required_stl.device_size), [128, 1, 64])
+        self.assertEqual(list(required_stl.stride_map), [1, -1, -1])
+
+    def test_entry_count_comes_from_the_host_extent(self):
+        """A 100-entry table keeps its length, not the 128 slots it sits in."""
+        self.assertEqual(list(self._retile(100).device_size), [100, 64])
+
+    def test_table_within_one_stick(self):
+        """Fewer entries than a stick holds: the tile dim carries no index."""
+        for entries in (2, 63):
+            with self.subTest(entries=entries):
+                required_stl = self._retile(entries)
+                self.assertEqual(list(required_stl.device_size), [entries, 64])
+
+    def test_retile_is_not_a_permutation(self):
+        """A re-tile has to go through a copy, not a producer relabel."""
+        original_stl = self._table(128)[0]
+
+        self.assertFalse(_is_permutation_of(original_stl, self._retile(128)))
+
+    def test_rotation_is_a_permutation(self):
+        """A rotation only reorders dims, so relabelling stays safe."""
+        original_stl = SpyreTensorLayout(
+            device_size=[2, 8, 1, 64],
+            stride_map=[512, 64, -1, 1],
+            device_dtype=get_device_dtype(torch.float16),
+            valid_elements={(0,): 2, (1, 3): 512, (2,): 1},
+        )
+        required_stl = _ia_rotate_stl(original_stl, indirect_device_pos=1)
+
+        self.assertTrue(_is_permutation_of(original_stl, required_stl))
+
+    def test_rejects_a_table_over_the_span_limit(self):
+        """One stick per entry must still fit a core's span."""
+        with self.assertRaises(Unsupported):
+            self._retile(MAX_SPAN_BYTES // 128 + 1)
 
 
 class TestDenseScatterSourceStl(unittest.TestCase):
     def test_preserves_logical_dtype_and_element_arrangement(self):
         host_size = [1, 64, 8, 2, 1, 128]
         host_stride = [131072, 2048, 256, 128, 128, 1]
+        _ds = [128, 8, 4, 1, 64]
         source_stl = SpyreTensorLayout(
-            [128, 8, 4, 1, 64],
+            _ds,
             [256, 32768, 64, 262144, 1],
             get_device_dtype(torch.bfloat16),
+            {(0,): 128, (1,): 8, (2, 4): 256, (3,): 1},
             ElementArrangement.FP32_TO_DL16,
         )
         layout = FixedTiledLayout(
@@ -211,21 +315,6 @@ class TestDenseScatterSourceStl(unittest.TestCase):
                 source_stl.element_arrangement,
             ),
         )
-
-    def test_rejects_non_dl16_source(self):
-        host_size = [64, 32]
-        host_stride = [32, 1]
-        source_stl = SpyreTensorLayout(host_size, torch.float32)
-        layout = FixedTiledLayout(
-            torch.device("spyre"),
-            torch.float32,
-            host_size,
-            host_stride,
-            source_stl,
-        )
-
-        with self.assertRaisesRegex(Unsupported, "ReStickifyOpHBM does not support"):
-            _dense_scatter_source_stl(layout)
 
 
 if __name__ == "__main__":

@@ -34,6 +34,14 @@ class ClickHouseEnv:
         return (os.environ.get(name) or "").strip() or default
 
     @classmethod
+    def seconds(cls, name: str, default: int) -> int:
+        """A timeout in seconds from the environment; a bad value falls back to the default."""
+        try:
+            return max(1, int(cls.get(name, str(default))))
+        except ValueError:
+            return default
+
+    @classmethod
     def host(cls) -> str:
         """CLICKHOUSE_HOST, which has no default."""
         return cls.get("CLICKHOUSE_HOST")
@@ -70,7 +78,7 @@ class ClickHouse:
     ENV = ClickHouseEnv
 
     @classmethod
-    def connect(cls, *, verify: bool = True):
+    def connect(cls, *, verify: bool = True, database: str = ""):
         """Connect with the resolved settings; `verify=False` for an unverified cert."""
         host = cls.ENV.host()
         if not host:
@@ -93,9 +101,16 @@ class ClickHouse:
             port=port,
             user=cls.ENV.get("CLICKHOUSE_USER", cls.ENV.DEFAULT_USER),
             password=password,
-            database=cls.ENV.database(),
+            database=database or cls.ENV.database(),
             secure=secure,
             verify=verify,
+            # No session: a timed-out request keeps its session locked server-side, so every
+            # retry or probe on the same client would fail with SESSION_IS_LOCKED.
+            autogenerate_session_id=False,
+            connect_timeout=cls.ENV.seconds("CLICKHOUSE_CONNECT_TIMEOUT", 30),
+            send_receive_timeout=cls.ENV.seconds(
+                "CLICKHOUSE_SEND_RECEIVE_TIMEOUT", 300
+            ),
         )
 
     @staticmethod

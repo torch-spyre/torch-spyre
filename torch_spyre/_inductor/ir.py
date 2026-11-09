@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import abc
 from typing import Any, Callable, Optional, Sequence, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -21,6 +22,7 @@ if TYPE_CHECKING:
 from sympy import Expr
 import torch
 from torch._inductor.utils import ir_dataclass
+from torch._inductor.dependencies import index_vars_no_squeeze
 from torch._inductor.ir import (
     FixedLayout,
     IRNode,
@@ -37,6 +39,7 @@ from torch._inductor.virtualized import V
 import sympy
 from torch.utils._ordered_set import OrderedSet
 import torch._inductor.ir as ir
+from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 
 logger = get_inductor_logger("ir")
@@ -105,6 +108,17 @@ class FixedTiledLayout(FixedLayout):
         self.allocation: dict[str, Any] = {}
         self.lx_view: Optional["PerCoreView"] = None
 
+    def unallocated_copy(self) -> "FixedTiledLayout":
+        """Copy host/device geometry without allocation or per-core ownership."""
+        return FixedTiledLayout(
+            self.device,
+            self.dtype,
+            list(self.size),
+            list(self.stride),
+            self.device_layout,
+            offset=self.offset,
+        )
+
     def __str__(self) -> str:
         device_index_str = "" if self.device.index is None else f":{self.device.index}"
         return (
@@ -120,25 +134,19 @@ def _resize_device_layout(
     old_host_size: list[int],
     new_host_size: list[int],
     stick_host_dim: int | None = None,
+    old_host_stride: list[int] | None = None,
+    new_host_stride: list[int] | None = None,
 ):
-    """Derive a new SpyreTensorLayout for a resized host buffer.
+    """Derive a new SpyreTensorLayout for a host buffer shrunk by tiling.
 
-    Used in two directions:
-
-    * **shrink** (``_divide_ranges``): the buffer is the same physical
-      allocation; coarse tiling narrows the per-tile iteration range.
-      ``device_size`` entries for non-stick dims shrink to reflect the smaller
-      per-tile extents.
-    * **grow** (``_allocate_full_buffer``): a full-sized scatter-target buffer
-      is allocated to match a per-tile source.  ``device_size`` entries grow
-      back to the full extent.  The stick orientation (transposed vs row-major,
-      ``element_arrangement``) is propagated verbatim so both buffers agree on
-      physical layout and scatter-copy address arithmetic is correct.
+    The buffer is the same physical allocation; coarse tiling narrows the
+    per-tile iteration range, so ``device_size`` entries for non-stick dims
+    shrink to the smaller per-tile extents.  Raises ``ValueError`` if any host
+    dim grows: growing back is ambiguous where the tile has two host dims of
+    extent 1.
 
     ``stride_map`` semantics: a value of ``-1`` means "this device dimension has
-    extent 1 and is never stepped through; its stride is undefined."  When
-    growing back from a singleton (``orig_sm[j] == -1``), the stride is
-    recomputed from the new host stride (the rescue arm in Passes 2–4).  For
+    extent 1 and is never stepped through; its stride is undefined."  For
     non-contiguous (transposed / col-major) dims, the *physical* stride on
     device is invariant to resizing, so it is left unchanged.
 
@@ -146,20 +154,21 @@ def _resize_device_layout(
 
     * **inner stick** (always ``j == ndev-1``) — ``device_size`` is always
       ``elems_per_stick``; left unchanged.  ``stride_map`` updated only if the
-      stick host dim is contiguous or was a singleton.
+      stick host dim is contiguous.
     * **non-stick dim** — one device dim per non-stick host dim.  Matched to
       host dim ``p`` by size (``device_size[j] == old_host_size[p]``), with
       ``stride_map[j]`` used as a tiebreaker when two host dims share the same
       size.  ``device_size`` updated to ``new_host_size[p]``.  ``stride_map``
-      updated iff ``orig_sm[j] == old_hs[p]`` (contiguous) or ``== -1``
-      (was a singleton being grown).
+      updated iff ``orig_sm[j] == old_hs[p]`` (contiguous).
     * **stick tile-count** — ``ceil(old_host_size[p*] / eps)`` device elements
       spanning the stick host dim ``p*``.  Updated to
       ``ceil(new_host_size[p*] / eps)``.  Same stride-update rule as non-stick.
+      Of size 1 when ``p*`` is at most one stick long, told from a singleton
+      by its ``stride_map`` (never ``-1``).
     * **singleton** (``device_size == 1, stride_map == -1``) — either a sparse
       placeholder (no corresponding host dim) or a non-stick dim tiled to
       extent 1.  Left as-is when there is no host dim to match; matched by
-      size-1 to a host dim of size 1 when one exists (grow path from singleton).
+      size-1 to a host dim of size 1 when one exists.
 
     ``p*`` (the stick host dim) is identified by elimination: the unique host
     dim *not* matched as a non-stick dim.  When a reduction collapses the stick
@@ -175,10 +184,20 @@ def _resize_device_layout(
     #3116) without relying on the ambiguous size-elimination + contiguous-stride
     tiebreak.  When ``None`` (all current callers), behaviour is unchanged.
 
+    ``old_host_stride`` / ``new_host_stride`` (optional, given together): the
+    buffer's own host strides before and after the resize.  The ``stride_map``
+    entry of a non-stick device dim is the host stride of the host dim it
+    walks, so the real strides name that host dim exactly.  Without them the
+    contiguous strides of the two sizes stand in, and they name the wrong one
+    for a buffer written in a permuted order: of two host dims of equal size
+    the tiebreak then picks the other, and the resize shrinks the wrong device
+    dim.
+
     Multi-pass algorithm:
 
     * **Pass 1**: match non-inner-stick device dims to host dims by size.
-      Size-1 dims match only to host dims of size 1.  Size > 1 dims match by
+      Size-1 dims with ``stride_map == -1`` match only to host dims of size 1;
+      other size-1 dims are tile-count.  Size > 1 dims match by
       ``device_size == old_host_size[p]``, with stride as tiebreaker when sizes
       collide.  Unmatched dims are candidates for tile-count.
     * **Pass 1b**: fix tile-count / size collisions.  When
@@ -200,6 +219,12 @@ def _resize_device_layout(
     """
     from torch._inductor.ir import FlexibleLayout
 
+    if any(n > o for o, n in zip(old_host_size, new_host_size, strict=True)):
+        raise ValueError(
+            f"_resize_device_layout only shrinks, but was asked to resize "
+            f"{old_host_size} to {new_host_size}"
+        )
+
     orig_sm = list(orig_stl.stride_map)
     orig_ds = list(orig_stl.device_size)
     eps = orig_stl.elems_per_stick()
@@ -220,8 +245,12 @@ def _resize_device_layout(
             if expected_tc not in orig_ds[:-1]:
                 stick_host_dim = None
 
-    old_hs = [int(s) for s in FlexibleLayout.contiguous_strides(old_host_size)]
-    new_hs = [int(s) for s in FlexibleLayout.contiguous_strides(new_host_size)]
+    assert (old_host_stride is None) == (new_host_stride is None)
+    if old_host_stride is None or new_host_stride is None:
+        old_host_stride = FlexibleLayout.contiguous_strides(old_host_size)
+        new_host_stride = FlexibleLayout.contiguous_strides(new_host_size)
+    old_hs = [int(s) for s in old_host_stride]
+    new_hs = [int(s) for s in new_host_stride]
 
     new_ds = list(orig_ds)
     new_sm = list(orig_sm)
@@ -232,7 +261,11 @@ def _resize_device_layout(
 
     for j in range(ndev - 1):  # j == ndev-1 is always inner stick
         dsz = orig_ds[j]
-        if dsz == 1:
+        if dsz == 1 and orig_sm[j] != -1:
+            # A host dim of extent 1 always has stride_map -1: this is the
+            # tile count of a stick host dim at most one stick long.
+            unmatched_j.append(j)
+        elif dsz == 1:
             size1_cands = [p for p in range(ndim) if old_host_size[p] == 1]
             # The authoritative stick host dim is never a non-stick match.
             if stick_host_dim is not None:
@@ -330,7 +363,7 @@ def _resize_device_layout(
         new_ds[j] = new_host_size[p]
         if new_host_size[p] == 1:
             new_sm[j] = -1
-        elif orig_sm[j] == old_hs[p] or orig_sm[j] == -1:
+        elif orig_sm[j] == old_hs[p]:
             new_sm[j] = new_hs[p]
         # else: non-contiguous stride; physical layout is invariant — leave unchanged.
 
@@ -339,31 +372,44 @@ def _resize_device_layout(
             new_ds, new_sm, orig_stl.device_dtype, orig_stl.element_arrangement
         )
 
-    # Pass 3: update tile-count dims (unmatched_j — all must equal expected tile-count).
+    # Pass 3: update tile-count dims (unmatched_j — all must equal expected
+    # tile-count). Where a non-stick host dim Pass 1 left unmatched has that
+    # size too, the dim may be that host dim's instead, which resizing it as
+    # the tile count would leave at full size: only the stride tells them
+    # apart.
+    expected_tc = -(-old_host_size[pstar] // eps)  # ceil division
+    # A tile-count dim steps its host dim a stick at a time, or the whole dim
+    # when that is shorter (as SpyreTensorLayout builds it).
+    old_tc_scale = min(eps, old_host_size[pstar])
+    new_tc_scale = min(eps, new_host_size[pstar])
+    tc_stride = old_tc_scale * old_hs[pstar]
     for j in unmatched_j:
-        expected_tc = -(-old_host_size[pstar] // eps)  # ceil division
-        if orig_ds[j] != expected_tc:
+        ambiguous = any(
+            p != pstar and p not in matched_p and old_host_size[p] == orig_ds[j]
+            for p in range(ndim)
+        )
+        if orig_ds[j] != expected_tc or (ambiguous and orig_sm[j] != tc_stride):
             raise RuntimeError(
                 f"_resize_device_layout: device dim {j} "
                 f"(stride_map={orig_sm[j]}, device_size={orig_ds[j]}) was not "
-                f"matched as a non-stick dim and does not equal the expected "
-                f"tile-count {expected_tc} for stick host dim {pstar} "
+                f"matched as a non-stick dim and is not the tile-count dim "
+                f"(size {expected_tc}, stride_map {tc_stride}) of "
+                f"stick host dim {pstar} "
                 f"(old_host_size={old_host_size}) in {orig_stl!r}. "
                 f"This layout is not supported by the device-native reconstruction."
             )
         new_ds[j] = -(-new_host_size[pstar] // eps)  # ceil division
         if new_host_size[pstar] == 1:
             new_sm[j] = -1
-        elif orig_sm[j] == eps * old_hs[pstar] or orig_sm[j] == -1:
-            # tile-count stride = eps * contiguous stride of the stick host dim
-            new_sm[j] = eps * new_hs[pstar]
+        elif orig_sm[j] == tc_stride:
+            new_sm[j] = new_tc_scale * new_hs[pstar]
         # else: non-contiguous stick; physical stride invariant.
 
     # Pass 4: inner stick (j == ndev-1) — device_size is always eps, update stride only.
     j = ndev - 1
     if new_host_size[pstar] == 1:
         new_sm[j] = -1
-    elif orig_sm[j] == old_hs[pstar] or orig_sm[j] == -1:
+    elif orig_sm[j] == old_hs[pstar]:
         new_sm[j] = new_hs[pstar]
     # else: non-contiguous stick; physical stride invariant.
 
@@ -411,7 +457,7 @@ class SpyreEmptyFallback(ir.ExternKernel):
     spyre_empty_with_layout(size, stride, dtype, device_layout, device) when the
     layout is a FixedTiledLayout; the placeholder FixedLayout set at construction
     time must be replaced with a FixedTiledLayout before codegen runs.  This upgrade
-    happens via finalize_layouts (post-stickify hint-driven path) or
+    happens via finalize_layouts (the pre-stickify for_each_tile path) or
     lower_pad_sequence (post-stickify span-overflow path).  If the layout is never
     upgraded the wrapper falls back to the generic CPU allocator, which is incorrect
     on Spyre.
@@ -479,291 +525,300 @@ def _dtype_to_int(dtype: torch.dtype) -> int:
 def _compute_device_num_elems(layout: "FixedLayout") -> int:
     """Count storage in the scalar-type units passed to the collective planner.
 
-    For FixedTiledLayout (has device_layout), uses the actual device size.
-    For plain FixedLayout (intermediates), falls back to logical numel.
+    A finalized device layout is required: logical numel can omit padding.
     """
-    if isinstance(layout, FixedTiledLayout):
-        size_bytes = get_device_size_in_bytes(layout.device_layout)
-        # The plan receives layout.dtype too. Device element count alone would
-        # change byte coverage when host and device widths differ (e.g. int64).
-        element_size = torch.tensor([], dtype=layout.dtype).element_size()
-        return size_bytes // element_size
-    numel = sympy.prod(layout.size)
-    return int(V.graph.sizevars.guarding_hint_or_throw(numel))
+    if not isinstance(layout, FixedTiledLayout):
+        raise Unsupported("Collective input requires a finalized device layout")
+    size_bytes = get_device_size_in_bytes(layout.device_layout)
+    # The plan receives layout.dtype too. Device element count alone would
+    # change byte coverage when host and device widths differ (e.g. int64).
+    element_size = torch.tensor([], dtype=layout.dtype).element_size()
+    return size_bytes // element_size
 
 
-class BroadcastAsyncFallback(ir.ExternKernel):
-    """IR node for spyre.broadcast_async — emits a runtime call to async broadcast.
+def _collective_input_layout(input_tensor: IRNode) -> FixedLayout:
+    layout = input_tensor.get_layout()
+    if not isinstance(layout, FixedTiledLayout):
+        # ExternKernel inputs can retain a pre-scheduling buffer object after
+        # the producer's device layout has been finalized. Use the allocation's
+        # padded layout only when it describes this exact input geometry.
+        producer = V.graph.try_get_buffer(input_tensor.get_name())
+        if producer is not None:
+            final_layout = producer.get_layout()
+            if (
+                isinstance(final_layout, FixedTiledLayout)
+                and layout.size == final_layout.size
+                and layout.stride == final_layout.stride
+                and layout.offset == final_layout.offset
+                and layout.dtype == final_layout.dtype
+            ):
+                return final_layout
+        # A view cannot borrow its base allocation's size, and logical numel
+        # cannot establish the view's padded size. Reject missing metadata
+        # rather than silently submitting a truncated collective.
+        raise Unsupported(
+            "Collective input view requires a finalized device layout matching "
+            "its size, stride, offset, and dtype"
+        )
+    return layout
 
-    This starts the broadcast operation asynchronously and returns immediately,
-    allowing computation to proceed while communication is in progress.
+
+def _emit_plan_once(wrapper: PythonWrapperCodegen, plan_line: str) -> None:
+    """Emit *plan_line* into the wrapper header exactly once per wrapper instance.
+
+    Each collective codegen method needs to write a plan call (e.g.
+    ``allreduce_plan(...)``) into the module-level header so it runs once at
+    graph load rather than on every forward pass.  ``wrapper._emitted_plans``
+    (a set attached to the wrapper object) guards against emitting the same
+    node's plan twice if its codegen runs again.  The line includes the plan
+    variable, which is named after the node, so lines from different nodes
+    never match.  Identical plans for different nodes (e.g. coalesced tensors of
+    one shape) still share one plan: the ``*_plan`` ops look it up in the C++
+    plan cache by kind, dtype and element count and return the same handle.
+
+    Attaching state to the wrapper is fragile if Inductor ever reuses or clones
+    wrapper objects, but it mirrors the existing pattern established by the
+    broadcast/allgather/allreduce fallbacks.  Centralising the guard here means
+    only this one place needs updating if the approach changes.
     """
+    if not hasattr(wrapper, "_emitted_plans"):
+        wrapper._emitted_plans = set()
+    if plan_line not in wrapper._emitted_plans:
+        wrapper.header.writeline(plan_line)
+        wrapper._emitted_plans.add(plan_line)
+
+
+class SpyreCollectiveKernel(ir._CollectiveKernel, metaclass=abc.ABCMeta):
+    """Base IR node for Spyre collectives built on upstream ``_CollectiveKernel``.
+
+    Nodes are created through the upstream factories, so the dependency model
+    matches stock Inductor:
+
+    * ``create_inplace`` (all_reduce): ``NoneLayout`` node plus a
+      ``MutationOutput`` on each input; the lowering returns the input.
+    * ``create_out_of_place`` (broadcast, all_gather): the node is the output
+      buffer.
+
+    ``op_overload`` is the ``_c10d_functional`` op, whose Meta impl drives
+    ``process_kernel``; ``constant_args`` are its non-tensor args in schema
+    order.  Codegen is Spyre-specific: a ``*_plan`` call emitted once in the
+    wrapper header (runs at graph load) and a ``*_run`` call in the body.
+    """
+
+    plan_prefix: str = ""
+
+    @abc.abstractmethod
+    def _plan_call(self, num_elems: int, dtype_code: int) -> str:
+        """The ``*_plan(...)`` expression emitted once in the wrapper header."""
+
+    @abc.abstractmethod
+    def _run_call(self, input_name: str, plan_var: str) -> str:
+        """The ``*_run(...)`` expression emitted in the wrapper body."""
 
     def codegen(self, wrapper: PythonWrapperCodegen) -> None:
         """Emit plan call in header (compile-time) and run call in body (runtime)."""
         input_tensor = self.inputs[0]
         input_name = input_tensor.codegen_reference()
-        src_rank, group_name = self.constant_args
-        output_name = self.get_name()
-
-        input_layout = input_tensor.get_layout()
+        input_layout = _collective_input_layout(input_tensor)
         dtype_code = _dtype_to_int(input_layout.dtype)
         num_elems = _compute_device_num_elems(input_layout)
 
-        # Emit plan call in header (module-level, runs once at graph load)
-        plan_var = f"_bcast_plan_{output_name}"
-        plan_line = (
-            f"{plan_var} = torch.ops.spyre.broadcast_plan("
-            f"{num_elems}, {dtype_code}, {src_rank}, '{group_name}')"
+        plan_var = f"_{self.plan_prefix}_plan_{self.get_name()}"
+        _emit_plan_once(
+            wrapper, f"{plan_var} = {self._plan_call(num_elems, dtype_code)}"
         )
-        if not hasattr(wrapper, "_emitted_plans"):
-            wrapper._emitted_plans = set()
-        if plan_line not in wrapper._emitted_plans:
-            wrapper.header.writeline(plan_line)
-            wrapper._emitted_plans.add(plan_line)
 
-        # Emit run call in body (per-invocation)
-        wrapper.writeline(
-            f"{output_name} = torch.ops.spyre.broadcast_run("
-            f"{input_name}, {plan_var}, {src_rank})"
-        )
+        run_call = self._run_call(input_name, plan_var)
+        if isinstance(self.layout, ir.NoneLayout):
+            # In-place: the result aliases the input, nothing to bind.
+            wrapper.writeline(run_call)
+        else:
+            wrapper.writeline(f"{self.get_name()} = {run_call}")
 
         logger.debug(
-            "Codegen broadcast plan+run: %s -> %s (src=%s, group='%s')",
+            "Codegen %s plan+run: %s -> %s %s",
+            self.plan_prefix,
             input_name,
-            output_name,
-            src_rank,
-            group_name,
+            self.get_name(),
+            self.constant_args,
         )
 
-    def should_allocate(self) -> bool:
-        return True
 
-    def get_mutation_names(self) -> Sequence[str]:
-        return []
+class BroadcastKernel(SpyreCollectiveKernel):
+    """Out-of-place ``_c10d_functional.broadcast``.
 
-    def get_unbacked_symbol_defs(self) -> OrderedSet[sympy.Symbol]:
-        return OrderedSet()
+    ``broadcast_run`` copies the input into a fresh output and broadcasts into
+    it, so the output is this node's own buffer.
+    """
 
-    def __init__(
-        self,
-        op_overload: torch._ops.OpOverload,
-        x: IRNode,
-        src_rank: int,
-        group_name: str,
-    ) -> None:
-        x_device = x.get_device()
-        x_dtype = x.get_dtype()
-        x_size = x.get_size()
-        x_stride = x.get_stride()
-        layout = FixedLayout(x_device, x_dtype, x_size, x_stride)
-        super().__init__(
-            None,
-            layout,
-            [x],
-            (src_rank, group_name),
-            python_kernel_name="torch.ops.spyre.broadcast_run",
-            op_overload=op_overload,
+    plan_prefix = "bcast"
+
+    def _plan_call(self, num_elems: int, dtype_code: int) -> str:
+        src_rank, group_name = self.constant_args
+        return (
+            f"torch.ops.spyre.broadcast_plan("
+            f"{num_elems}, {dtype_code}, {src_rank}, '{group_name}')"
         )
-        self.name = V.graph.register_buffer(self)
-        V.graph.register_operation(self)
+
+    def _run_call(self, input_name: str, plan_var: str) -> str:
+        src_rank, _ = self.constant_args
+        return f"torch.ops.spyre.broadcast_run({input_name}, {plan_var}, {src_rank})"
 
 
-class AllGatherAsyncFallback(ir.ExternKernel):
-    """IR node for spyre.all_gather_async.
+class AllGatherKernel(SpyreCollectiveKernel):
+    """Out-of-place ``_c10d_functional.all_gather_into_tensor``.
 
-    Starts the all_gather operation asynchronously and returns immediately.
     Output tensor has shape[0] = input.shape[0] * group_size.
     """
 
-    def codegen(self, wrapper: PythonWrapperCodegen) -> None:
-        """Emit plan call in header (compile-time) and run call in body (runtime)."""
-        input_tensor = self.inputs[0]
-        input_name = input_tensor.codegen_reference()
+    plan_prefix = "ag"
+
+    def _plan_call(self, num_elems: int, dtype_code: int) -> str:
         group_size, group_name = self.constant_args
-        output_name = self.get_name()
-
-        input_layout = input_tensor.get_layout()
-        dtype_code = _dtype_to_int(input_layout.dtype)
-        num_elems = _compute_device_num_elems(input_layout)
-
-        # Emit plan call in header (module-level, runs once at graph load)
-        plan_var = f"_ag_plan_{output_name}"
-        plan_line = (
-            f"{plan_var} = torch.ops.spyre.allgather_plan("
+        return (
+            f"torch.ops.spyre.allgather_plan("
             f"{num_elems}, {dtype_code}, {group_size}, '{group_name}')"
         )
-        if not hasattr(wrapper, "_emitted_plans"):
-            wrapper._emitted_plans = set()
-        if plan_line not in wrapper._emitted_plans:
-            wrapper.header.writeline(plan_line)
-            wrapper._emitted_plans.add(plan_line)
 
-        # Emit run call in body (per-invocation)
-        wrapper.writeline(
-            f"{output_name} = torch.ops.spyre.allgather_run("
-            f"{input_name}, {plan_var}, {group_size})"
-        )
-
-        logger.debug(
-            "Codegen allgather plan+run: %s -> %s (group_size=%s, group='%s')",
-            input_name,
-            output_name,
-            group_size,
-            group_name,
-        )
-
-    def should_allocate(self) -> bool:
-        return False
-
-    def get_mutation_names(self) -> Sequence[str]:
-        return []
-
-    def get_unbacked_symbol_defs(self) -> OrderedSet[sympy.Symbol]:
-        return OrderedSet()
-
-    def __init__(
-        self,
-        op_overload: torch._ops.OpOverload,
-        x: IRNode,
-        group_size: int,
-        group_name: str,
-    ) -> None:
-        in_layout = x.get_layout()
-        out_size = list(in_layout.size)
-        out_size[0] = out_size[0] * group_size
-        out_stride = ir.FlexibleLayout.contiguous_strides(out_size)
-        layout = FixedLayout(in_layout.device, in_layout.dtype, out_size, out_stride)
-        super().__init__(
-            None,
-            layout,
-            [x],
-            (group_size, group_name),
-            python_kernel_name="torch.ops.spyre.allgather_run",
-            op_overload=op_overload,
-        )
-        self.name = V.graph.register_buffer(self)
-        V.graph.register_operation(self)
+    def _run_call(self, input_name: str, plan_var: str) -> str:
+        group_size, _ = self.constant_args
+        return f"torch.ops.spyre.allgather_run({input_name}, {plan_var}, {group_size})"
 
 
-class AllReduceAsyncFallback(ir.ExternKernel):
-    """IR node for spyre.all_reduce_async.
+class AllReduceKernel(SpyreCollectiveKernel):
+    """In-place ``_c10d_functional.all_reduce_``.
 
-    Emits an asynchronous in-place all_reduce that must be paired with a
-    subsequent wait_work call to synchronize. Used by both the functional
-    (_c10d_functional.all_reduce) and in-place (_c10d_functional.all_reduce_)
-    lowerings — the generated code is identical since the Spyre runtime always
-    operates in-place.
+    Created with ``create_inplace``; the functional ``all_reduce`` lowering
+    clones its input first, as upstream does.
     """
 
-    def codegen(self, wrapper):
-        """Emit plan call in header (compile-time) and run call in body (runtime)."""
-        input_tensor = self.inputs[0]
-        input_name = input_tensor.codegen_reference()
+    plan_prefix = "ar"
+
+    def _plan_call(self, num_elems: int, dtype_code: int) -> str:
         reduce_op, group_name = self.constant_args
-        output_name = self.get_name()
-
-        input_layout = input_tensor.get_layout()
-        dtype_code = _dtype_to_int(input_layout.dtype)
-        num_elems = _compute_device_num_elems(input_layout)
-
-        # Emit plan call in header
-        plan_var = f"_ar_plan_{output_name}"
-        plan_line = (
-            f"{plan_var} = torch.ops.spyre.allreduce_plan("
+        return (
+            f"torch.ops.spyre.allreduce_plan("
             f"{num_elems}, {dtype_code}, '{reduce_op}', '{group_name}')"
         )
-        if not hasattr(wrapper, "_emitted_plans"):
-            wrapper._emitted_plans = set()
-        if plan_line not in wrapper._emitted_plans:
-            wrapper.header.writeline(plan_line)
-            wrapper._emitted_plans.add(plan_line)
 
-        # Emit run call in body
-        wrapper.writeline(
-            f"{output_name} = torch.ops.spyre.allreduce_run({input_name}, {plan_var})"
-        )
-
-    def should_allocate(self):
-        return False
-
-    def get_mutation_names(self):
-        return [self.inputs[0].get_name()]
-
-    def get_unbacked_symbol_defs(self):
-        return OrderedSet()
-
-    def __init__(
-        self,
-        op_overload: torch._ops.OpOverload,
-        x: IRNode,
-        reduce_op: str,
-        group_name: str,
-    ) -> None:
-        x_device = x.get_device()
-        x_dtype = x.get_dtype()
-        x_size = x.get_size()
-        x_stride = x.get_stride()
-        layout = FixedLayout(x_device, x_dtype, x_size, x_stride)
-        super().__init__(
-            None,
-            layout,
-            [x],
-            (reduce_op, group_name),
-            python_kernel_name="torch.ops.spyre.allreduce_run",
-            op_overload=op_overload,
-        )
-        self.name = V.graph.register_buffer(self)
-        V.graph.register_operation(self)
+    def _run_call(self, input_name: str, plan_var: str) -> str:
+        return f"torch.ops.spyre.allreduce_run({input_name}, {plan_var})"
 
 
-class WaitWorkFallback(ir.ExternKernel):
-    """IR node for spyre.wait_work — emits a runtime call to synchronize async operation.
+class WaitKernel(ir._WaitKernel):
+    """``_c10d_functional.wait_tensor`` — blocks until the collective completes.
 
-    This blocks until the async broadcast operation completes and returns the
-    same in-place-mutated buffer. No allocation is needed (should_allocate() =
-    False) because the result lives in the input tensor's buffer.
+    Created with ``create_wait``: a ``NoneLayout`` node that mutates its input,
+    so later readers of the collective's result are ordered after the wait.
+    ``wait_work`` looks up the pending work by the tensor's storage, which is
+    the tensor the run call produced (or mutated).
     """
 
     def codegen(self, wrapper: PythonWrapperCodegen) -> None:
-        input_tensor = self.inputs[0]
-        input_name = input_tensor.codegen_reference()
+        input_name = self.inputs[0].codegen_reference()
+        logger.debug("Codegen wait_work: %s", input_name)
+        wrapper.writeline(f"torch.ops.spyre.wait_work({input_name})")
 
-        # Generate the wait call
-        output_name = self.get_name()
-        generated_code = f"{output_name} = torch.ops.spyre.wait_work({input_name})"
 
-        logger.debug("Codegen wait_work: %s -> %s", input_name, output_name)
+def _install_is_wait_patch() -> None:
+    """Make upstream's ``is_wait`` recognise ``WaitKernel``.
 
-        wrapper.writeline(generated_code)
+    Upstream checks ``type(node) is ir._WaitKernel``, an exact match, so a
+    subclass is invisible to the comm/compute overlap passes
+    (``reorder_for_compute_comm_overlap``, ``sink_waits``, ...) while the
+    matching collective is still found by the ``isinstance`` check in
+    ``is_collective``.  ``comms`` and ``scheduler`` import ``is_wait`` by
+    name, so each module's binding is replaced, not just ``utils``.
 
-    def should_allocate(self) -> bool:
-        return False
+    This is a global side effect of importing this module. Checked against
+    torch 2.13; re-check the exact-type test and the by-name imports when
+    upgrading.
+    """
+    import torch._inductor.comms as comms
+    import torch._inductor.scheduler as scheduler
+    import torch._inductor.utils as utils
 
-    def get_mutation_names(self) -> Sequence[str]:
-        return [self.inputs[0].get_name()]
+    upstream = utils.is_wait
+    if getattr(upstream, "_spyre_patched", False):
+        return
 
-    def get_unbacked_symbol_defs(self) -> OrderedSet[sympy.Symbol]:
-        return OrderedSet()
+    def is_wait(node: Any) -> bool:
+        return isinstance(node, WaitKernel) or upstream(node)
 
-    def __init__(
-        self,
-        op_overload: torch._ops.OpOverload,
-        x: IRNode,
-    ) -> None:
-        # Wait returns the same tensor (pass-through)
-        x_device = x.get_device()
-        x_dtype = x.get_dtype()
-        x_size = x.get_size()
-        x_stride = x.get_stride()
-        layout = FixedLayout(x_device, x_dtype, x_size, x_stride)
-        super().__init__(
-            None,
-            layout,
-            [x],
-            (),  # No constant args
-            python_kernel_name="torch.ops.spyre.wait_work",
-            op_overload=op_overload,
+    is_wait._spyre_patched = True  # type: ignore[attr-defined]
+    for mod in (utils, comms, scheduler):
+        if getattr(mod, "is_wait", None) is upstream:
+            mod.is_wait = is_wait
+
+
+_install_is_wait_patch()
+
+
+def get_copy_back_producer(x: IRNode) -> Optional[ir.Buffer]:
+    """Find the temporary buffer of an in-place all_reduce that needs copy-back.
+
+    ``AllReduceKernel`` has a ``NoneLayout``; the reduced data lives in the
+    buffer it mutates, a copy of the original view.  The lowering tags that
+    buffer with ``mutation_target`` (the original view) and
+    ``copy_back_result``.  Follows actual alias edges (not the graph-wide name
+    registry) because producer names may be rebound while these IR objects
+    remain live consumers.
+    """
+    while isinstance(x, (ir.MutableBox, ir.BaseView)):
+        x = x.data
+    if isinstance(x, ir.Buffer) and getattr(x, "mutation_target", None) is not None:
+        return x
+    return None
+
+
+def copy_back_view(waited: IRNode, producer: ir.Buffer, target: IRNode) -> IRNode:
+    """Apply the waited view to the original target after full copy-back."""
+    current = waited
+    has_view = False
+    while isinstance(current, (ir.MutableBox, ir.BaseView)):
+        has_view |= isinstance(current, ir.BaseView)
+        if current.get_dtype() != producer.get_dtype():
+            raise Unsupported(
+                "dtype-changing views of an in-place collective before its wait; "
+                "wait on the full result before changing dtype"
+            )
+        current = current.data
+    if not has_view:
+        return target
+    layout = producer.get_layout()
+    if layout.offset != 0 or list(layout.stride) != list(
+        ir.FlexibleLayout.contiguous_strides(layout.size)
+    ):
+        raise Unsupported(
+            "a derived collective wait requires contiguous temporary storage"
         )
-        self.name = V.graph.register_buffer(self)
-        V.graph.register_operation(self)
+    (indices,), ranges = index_vars_no_squeeze(waited.get_size(), prefix="r")
+    indexer = V.graph.sizevars.simplify_with_ranges(
+        waited.make_indexer()(indices), ranges
+    )
+    waited_strides = V.graph.sizevars.stride_vars(indexer, indices)
+    target_storage = target
+    while isinstance(target_storage, (ir.MutableBox, ir.BaseView)):
+        target_storage = target_storage.data
+    target_offset = target.make_indexer()([sympy.S.Zero for _ in target.get_size()])
+    if list(waited_strides) != list(layout.stride) and (
+        target_offset != 0
+        or sympy.prod(target_storage.get_size()) != sympy.prod(target.get_size())
+    ):
+        raise Unsupported(
+            "stride-changing waits on an in-place collective target that "
+            "covers only part of its allocation"
+        )
+    source_size = producer.get_size()
+    unflatten = ir.View.dynamic_reshape_indexer(source_size, [sympy.prod(source_size)])
+    coordinates = [
+        V.graph.sizevars.simplify_with_ranges(coord, ranges)
+        for coord in unflatten([indexer])
+    ]
+
+    def reindex(index):
+        replacements = dict(zip(indices, index))
+        return [coord.xreplace(replacements) for coord in coordinates]
+
+    target_data = target.data if isinstance(target, TensorBox) else target
+    return TensorBox(ir.GenericView.create(target_data, waited.get_size(), reindex))

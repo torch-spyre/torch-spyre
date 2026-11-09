@@ -15,11 +15,13 @@
 # Helper methods to handle views
 
 from dataclasses import dataclass, astuple
+import functools
 import math
 import sympy
 from typing import Callable, Dict, Optional, Sequence, Tuple, cast
 from torch.utils._sympy.functions import ModularIndexing, FloorDiv
 
+from torch._inductor.utils import clear_on_fresh_cache
 from torch._inductor.virtualized import V
 
 from .errors import Unsupported
@@ -38,7 +40,7 @@ def _mixed_radix_digits(expr, var, var_range, mods):
     this recognition deliberately strict preserves rejection of ambiguous
     combinations such as ``Mod(x, 4) + Mod(x, 6)``.
     """
-    term = expr.xreplace({s: 0 for s in expr.free_symbols - {var}})
+    term = expr.xreplace(dict.fromkeys(expr.free_symbols - {var}, 0))
     var_terms = [addend for addend in sympy.Add.make_args(term) if addend.has(var)]
     if len(var_terms) != len(mods):
         return None
@@ -116,7 +118,7 @@ def find_repeat_vars(index_exprs, var_ranges):
                 continue
 
             vars_in_expr = expr.free_symbols
-            term = expr.xreplace({v: 0 for v in vars_in_expr - {var}})
+            term = expr.xreplace(dict.fromkeys(vars_in_expr - {var}, 0))
 
             if term == node:
                 repeat_info[var] = {
@@ -270,13 +272,109 @@ def compute_coordinates(
     Raises ``Unsupported`` if ``index`` walks a dimension backwards (a loop
     variable with a negative coefficient, as produced by ``prims.rev``): a
     device coordinate can only ascend.
+
+    Memoized on its arguments when they alone decide the result
+    (:func:`_coordinates_memo_key`): the planner asks the same question over and
+    over, and a Gemma 4 cold start made 196,594 calls with 6,047 distinct
+    arguments, 40 of its 42 s recomputing an answer it already had. Each call
+    gets its own list, and ``repeat_info_out`` gets copies of the repeat info.
+    A call that raises is not memoized; it is rerun uncached, so its side
+    effects and error are exactly those of :func:`_compute_coordinates_uncached`.
     """
+    key = _coordinates_memo_key(size, stride, var_ranges, index, indirect_sizes)
+    if key is not None:
+        try:
+            coordinates, repeat_info = _compute_coordinates_memo(*key)
+        except Exception:  # noqa: BLE001 - rerun uncached below to raise as before
+            pass
+        else:
+            if repeat_info_out is not None:
+                repeat_info_out.update(_copy_containers(repeat_info))
+            return list(coordinates)
+    return _compute_coordinates_uncached(
+        size, stride, var_ranges, index, indirect_sizes, repeat_info_out
+    )
+
+
+def _coordinates_memo_key(size, stride, var_ranges, index, indirect_sizes):
+    """:func:`compute_coordinates`' memo key, or ``None`` when its result may
+    depend on more than its arguments.
+
+    A symbolic range, or an index symbol that is neither an iteration nor an
+    indirect variable (a dynamic size), reaches ``_concretize_for_cmp``, which
+    branches on ``V.graph``'s size hint for it: the same arguments can then
+    map differently in another graph. Such calls are not memoized. The ranges
+    keep their order, as ``find_repeat_vars`` walks them in order.
+    """
+    concrete = (int, sympy.Integer)
+    if not all(isinstance(r, concrete) for r in var_ranges.values()):
+        return None
+    known = set(var_ranges)
+    if indirect_sizes is not None:
+        if not all(isinstance(r, concrete) for r in indirect_sizes.values()):
+            return None
+        known |= set(indirect_sizes)
+    if not getattr(index, "free_symbols", set()) <= known:
+        return None
+    return (
+        tuple(size),
+        tuple(stride),
+        tuple(var_ranges.items()),
+        index,
+        None if indirect_sizes is None else tuple(indirect_sizes.items()),
+    )
+
+
+@clear_on_fresh_cache
+@functools.lru_cache(maxsize=1 << 16)
+def _compute_coordinates_memo(size, stride, var_ranges, index, indirect_sizes):
+    """The coordinates (as a tuple) and repeat info for one memo key."""
+    repeat_info: dict = {}
+    coordinates = _compute_coordinates_uncached(
+        list(size),
+        list(stride),
+        dict(var_ranges),
+        index,
+        None if indirect_sizes is None else dict(indirect_sizes),
+        repeat_info,
+    )
+    return tuple(coordinates), repeat_info
+
+
+def _copy_containers(value):
+    """``value`` with its dicts, lists and tuples copied; the sympy leaves are
+    immutable and shared. Callers edit the repeat info they are handed
+    (``pass_utils`` snapshots its entries with ``dict(info)``)."""
+    if isinstance(value, dict):
+        return {k: _copy_containers(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_copy_containers(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_copy_containers(v) for v in value)
+    return value
+
+
+def _compute_coordinates_uncached(
+    size: Sequence[sympy.Expr],
+    stride: Sequence[sympy.Expr],
+    var_ranges: dict[sympy.Symbol, sympy.Expr],
+    index: sympy.Expr,
+    indirect_sizes: "dict[sympy.Symbol, int] | None" = None,
+    repeat_info_out: "dict[sympy.Symbol, dict] | None" = None,
+) -> list[sympy.Expr]:
+    """:func:`compute_coordinates` without the memo."""
     assert all(isinstance(s, (int, sympy.Integer)) for s in stride), (
         f"compute_coordinates requires concrete strides, got {stride}"
     )
     assert all(isinstance(s, (int, sympy.Integer)) for s in size), (
         f"compute_coordinates requires concrete sizes, got {size}"
     )
+
+    # Python ints keep the comparisons below (n^2 of them here, and n per term in
+    # add_term) out of sympy's relational machinery; sympy arithmetic in the
+    # output expressions promotes them back.
+    size = [int(s) for s in size]
+    stride = [int(s) for s in stride]
 
     # Convert ModularIndexing expressions to sympy.Mod before processing
     index = convert_modular_indexing(index)
@@ -286,7 +384,7 @@ def compute_coordinates(
 
     # find stride immediately strictly larger that dim stride
     n = len(size)
-    next_stride = [sympy.oo] * n
+    next_stride: list[int | float] = [math.inf] * n
     for i in range(n):
         for j in range(n):
             # n^2 is ok since n is small
@@ -352,16 +450,14 @@ def compute_coordinates(
                 coordinates[primary_dim] += var * step // primary_stride
 
     vars = index.free_symbols
-    offset = index.xreplace({v: 0 for v in vars})
+    offset = index.xreplace(dict.fromkeys(vars, 0))
     if offset > 0:
         index = index - offset
         # A concrete offset is decomposed positionally so a padded layout does
         # not leak a modular residual onto the stick coordinate (see
         # _decompose_constant_offset).  Symbolic offsets, or an offset that
         # cannot be fully peeled, fall back to add_term's original behavior.
-        handled = not offset.free_symbols and _decompose_constant_offset(
-            offset, size, stride, coordinates
-        )
+        handled = _decompose_constant_offset(offset, size, stride, coordinates)
         if not handled:
             add_term(var=offset, step=sympy.S.One, limit=sympy.oo)
 
@@ -389,9 +485,6 @@ def compute_coordinates(
         if isinstance(range_val, (int, sympy.Integer)) and int(range_val) <= 1:
             continue
 
-        # isolate current var
-        term = index.xreplace({v: 0 for v in vars - {var}})
-
         if var in repeat_info:
             info = repeat_info[var]
             if info["kind"] == "mod":
@@ -408,9 +501,8 @@ def compute_coordinates(
                     )
             continue
 
-        # compute index({var=1}) and index({var=var_ranges[var]})
-        step = term.xreplace({var: 1})
-        limit = term.xreplace({var: range_val})
+        # isolate current var
+        term = index.xreplace(dict.fromkeys(vars - {var}, 0))
 
         mods_with_var = [m for m in term.atoms(sympy.Mod) if m.has(var)]
         if len(mods_with_var) > 1:
@@ -418,6 +510,17 @@ def compute_coordinates(
                 f"variable {var} (range {range_val}) appears in multiple Mod "
                 f"expressions {mods_with_var} and cannot be mapped to coordinates."
             )
+
+        # compute index({var=1}) and index({var=var_ranges[var]})
+        step = term.xreplace({var: 1})
+        limit = term.xreplace({var: range_val})
+        if sympy.sympify(step).is_positive and term == var * step:
+            # A positive linear term reaches step * (range_val - 1), not
+            # step * range_val. Keep an exclusive upper bound for add_term's
+            # strict comparisons so a value exactly at a boundary still
+            # produces the required modulo and carry. Other expressions keep
+            # the existing bound; their last value need not be their maximum.
+            limit = step * (range_val - 1) + 1
 
         add_term(var=var, step=step, limit=limit)
 
@@ -468,6 +571,12 @@ def matching_dim(coords: list[sympy.Expr], expr: sympy.Expr) -> Optional[int]:
     values (both expressed in the single free variable of expr).  Return None if
     expr does not have exactly one free variable or if there is not exactly one
     matching dimension in coords.
+
+    .. deprecated::
+        Does not handle factorized layouts where a variable spans multiple host
+        dims. New code should use ``_host_size_stride_for_expr`` in
+        ``pass_utils.py`` instead, which resolves factorized expressions via
+        ``_factorized_chain``.
     """
     if len(expr.free_symbols) != 1:
         return None
@@ -573,7 +682,7 @@ def normalize_coordinates(
         # sympy uses floor to encode integer divisions, remove
         expr = coordinate.replace(sympy.floor, lambda x: x)
         vars = expr.free_symbols
-        offset = expr.xreplace({var: sympy.S.Zero for var in vars})
+        offset = expr.xreplace(dict.fromkeys(vars, sympy.S.Zero))
 
         if len(vars) == 0:
             if dim_size > 1 and dim_idx != len(size) - 1:
@@ -612,7 +721,7 @@ def normalize_coordinates(
                 )
 
             # extract term for each var
-            term = expr.xreplace({v: 0 for v in vars - {var}}) - offset
+            term = expr.xreplace(dict.fromkeys(vars - {var}, 0)) - offset
             dim_terms.append(Term.from_coordinate(term, var, var_range, dim_size))
         # sort dim_terms in increasing (num, mod) order so that z + offset
         # vars (num=1, mod=1) always sort before real iteration vars (num=1, mod=N)
@@ -673,10 +782,12 @@ def normalize_coordinates(
         #   so divide it by ``num`` -- leaving it inflates the dim, and with it
         #   every outer stride (issue #4050: output row l read input row 2*l).
         #   With several terms the split loop already sized it in iterations.
-        # - a residual constant offset below the stride (``2*d1 + 1``) selects
-        #   the position inside the gap.  Like any other constant offset on a
-        #   non-stick dim it needs a variable to hang off, so mint a synthetic
-        #   size-1 variable the same way the elided-dimension case above does.
+        # - the gap dim is a non-stick dim of size > 1 whose coordinate is the
+        #   constant residual offset below the stride (``1`` for ``2*d1 + 1``,
+        #   ``0`` for ``2*d1``).  Like the elided-dimension case above, it needs
+        #   a synthetic size-1 variable to hang off even when the offset is 0:
+        #   a variable-free gap dim is misaddressed by the backend, which then
+        #   reads a tiled ``[sticks, rows, 64]`` source in row-major order.
         #
         # The stick dim (last coordinate) is left alone: within-stick strides
         # are not representable and are rejected downstream.
@@ -686,26 +797,41 @@ def normalize_coordinates(
             inner.num = sympy.S.One
             if len(split_dim_terms) == 1:
                 if inner.dim_size % stride != 0:
-                    raise Unsupported(
-                        f"strided coordinate {coordinate} walks a dim of size "
-                        f"{dim_size} in steps of {stride}, which does not divide it"
-                    )
-                inner.dim_size //= stride
-            if residual_offset == 0:
-                terms.append(Term(None, None, None, None, stride))
-            else:
-                var = synthetic_var_fn()
-                var_ranges[var] = 1
-                terms.append(
-                    Term(
-                        sympy.S.One,
-                        sympy.S.One,
-                        var,
-                        sympy.S.One,
-                        stride,
-                        residual_offset,
-                    )
+                    # An incomplete final group is addressable on the outermost
+                    # physical axis: rounding its descriptive extent does not
+                    # change any enclosing stride. Keep the iteration count
+                    # unchanged, and prove that every selected coordinate is
+                    # inside the original allocation before adding the gap.
+                    count = var_ranges.get(inner.var)
+                    start = stride * inner.offset + residual_offset
+                    if not (
+                        all(s == 1 for s in size[:dim_idx])
+                        and count is not None
+                        and sympy.sympify(count).is_Integer
+                        and count > 0
+                        and coordinate == stride * inner.var + start
+                        and start >= 0
+                        and start + stride * (count - 1) < dim_size
+                    ):
+                        raise Unsupported(
+                            f"strided coordinate {coordinate} walks a dim of size "
+                            f"{dim_size} in steps of {stride}, which does not divide it"
+                        )
+                    inner.dim_size = (inner.dim_size + stride - 1) // stride
+                else:
+                    inner.dim_size //= stride
+            var = synthetic_var_fn()
+            var_ranges[var] = 1
+            terms.append(
+                Term(
+                    sympy.S.One,
+                    sympy.S.One,
+                    var,
+                    sympy.S.One,
+                    stride,
+                    residual_offset,
                 )
+            )
         elif residual_offset != 0:
             # Only a within-stick stride can get here (``2*d + 1`` on the stick
             # dim); there is no gap dim to place the residual in.
@@ -925,7 +1051,8 @@ def align_tensors_pure(
     # dict.fromkeys preserves insertion order; set() does not. This matters for two
     # reasons: (1) frontend determinism; (2) backend workaround — the backend is
     # sensitive to iteration_space dim label order even though semantically it
-    # should not be.
+    # should not be. The restored size-1 loops (the synthetic vars) come after the
+    # original loops. For a matmul, simplify_op_spec moves them in front of K.
     all_vars = dict.fromkeys(var_ranges.keys())
     for terms in all_terms:
         for term in terms:

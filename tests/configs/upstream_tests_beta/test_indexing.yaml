@@ -5,7 +5,6 @@ test_suite_config:
       unlisted_test_mode: skip
       tests:
         - names:
-            - NumpyTests::test_boolean_assignment_value_mismatch
             - NumpyTests::test_everything_returns_views
             - NumpyTests::test_index_no_floats
             - NumpyTests::test_none_index
@@ -19,6 +18,12 @@ test_suite_config:
             - TestIndexing::test_setitem_expansion_error
             - TestIndexing::test_single_int
           mode: mandatory_success
+        # Upstream regression: test_boolean_assignment_value_mismatch now fails on the Spyre
+        # backend. The int64->float32 dtype cast lowers to spyre.to_dtype_cpu, whose output
+        # FallbackKernel lacks a FixedTiledLayout, raising torch._inductor.exc.InductorError.
+        - names:
+            - NumpyTests::test_boolean_assignment_value_mismatch
+          mode: skip  # skip: InductorError (missing FixedTiledLayout) on upstream PyTorch bump
   global:
     supported_dtypes:
       - name: float16
