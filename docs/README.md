@@ -254,3 +254,5 @@ commits to the same branch, and the PR will be merged once approved.
 - [Sphinx directives reference](https://www.sphinx-doc.org/en/master/usage/restructuredtext/directives.html)
 - [sphinx-rtd-theme options](https://sphinx-rtd-theme.readthedocs.io/en/stable/configuring.html)
 - [Torch-Spyre CONTRIBUTING.md](https://github.com/torch-spyre/torch-spyre/blob/main/CONTRIBUTING.md)
+
+<!-- relay-spyre-test-probe 2026-11-09: comment-only change to exercise the /spyre-test gate during the GHE outage (spyre-frameworks issue 2737). Safe to close without merging. -->
