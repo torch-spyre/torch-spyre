@@ -1575,6 +1575,45 @@ class TestReshapeReadCoordinates(TestCase):
                 self.assertEqual(actual_addr, expected_addr)
 
 
+class TestUnboundedSymbolCoordinates(TestCase):
+    """Symbols whose range is not a plain ``var_ranges`` integer (issue #5872).
+
+    The decomposition may only prune a carry (``floor``/``Mod``) when it can
+    bound the term, so each kind of symbol must reach it with a usable range.
+    """
+
+    def test_index_that_is_a_single_non_iteration_symbol(self):
+        """A bare symbol outside var_ranges/indirect_sizes is dropped, and the
+        result stays a list of sympy values (not a Python int)."""
+        tmp0 = sympy.Symbol("tmp0", integer=True)
+        cx = compute_coordinates([128, 64], [1, -1], {}, tmp0)
+        self.assertEqual(cx, [0, 0])
+
+    def test_indirect_symbol_range_comes_from_indirect_sizes(self):
+        """tmp0 < 128 is known only from indirect_sizes. Without it the
+        decomposition cannot prove 64*tmp0 never carries into the p0 dim."""
+        tmp0 = sympy.Symbol("tmp0", integer=True)
+        cx = compute_coordinates(
+            [8, 128, 1, 1, 64],
+            [8192, 64, 64, -1, 1],
+            {p0: 8, p1: 64},
+            8192 * p0 + p1 + 64 * tmp0,
+            {tmp0: 128},
+        )
+        self.assertEqual(cx, [p0, tmp0, 0, 0, p1])
+
+    def test_symbolic_range_uses_the_size_hint(self):
+        """A dynamic range s0 is bounded by its size hint, so a term that fits
+        in one row keeps clean coordinates instead of floor/Mod."""
+        s0 = sympy.Symbol("s0", integer=True, positive=True)
+        graph = SimpleNamespace(
+            sizevars=SimpleNamespace(optimization_hint=lambda e: int(e.subs(s0, 64)))
+        )
+        with V.set_graph_handler(graph):
+            cx = compute_coordinates([4, 64], [64, 1], {p0: s0, p1: s0}, 64 * p0 + p1)
+        self.assertEqual(cx, [p0, p1])
+
+
 class TestReshapeSweepCoordinates(TestCase):
     """Parametric sweep over matrix shapes and reshape targets verifying 100% exactness."""
 

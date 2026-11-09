@@ -647,6 +647,16 @@ def _compute_coordinates_uncached(
     if indirect_sizes:
         var_ranges = {**var_ranges, **indirect_sizes}
 
+    # A symbolic range (dynamic shape) cannot bound a term, so the carry
+    # pruning would keep ``floor``/``Mod`` that downstream passes reject.
+    # Like the comparisons elsewhere in this module, use its size hint.
+    # The hint is only the value seen at compile time, so for dynamic shapes
+    # the result is not exact for every shape.
+    var_ranges = {
+        v: r if _is_concrete_int(r) else _concretize_for_cmp(r)
+        for v, r in var_ranges.items()
+    }
+
     n = len(size)
     coordinates = [sympy.S.Zero] * n
 
