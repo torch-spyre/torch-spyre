@@ -206,7 +206,7 @@ def make_op_spec(
 # ``x.transpose(..).contiguous()`` as the frontend hands it over: the input and
 # output coordinates of each OpSpec, copied from a live compile.  Symbols are
 # ``c0, c1, ...`` there, and the dict keys say which shape each one is.
-_C0, _C1, _C2 = sympy.symbols("c0 c1 c2")
+_C0, _C1, _C2, _C3 = sympy.symbols("c0 c1 c2 c3")
 RELAYOUT_CASES = {
     # 2D [64, 64] transposed: the stick dim moves, one stick on each side.
     "2d_64x64": (
@@ -237,6 +237,38 @@ RELAYOUT_CASES = {
         ([64, 2, 128, 64], [_C2, sympy.floor(_C1 / 64), _C0, sympy.Mod(_C1, 64)]),
         ([1, 128, 128, 64], [sympy.floor(_C2 / 64), _C1, _C0, sympy.Mod(_C2, 64)]),
         {_C0: 128, _C1: 128, _C2: 64},
+    ),
+    # [128, 128, 64].transpose(1, 2).contiguous(): the stick moves, and only
+    # the OUTPUT's stick symbol (c2, 128) spans more than one stick.  The
+    # input's stick symbol c1 is one stick, the mirror of 3d_128x64x128.
+    "p021_128x128x64": (
+        "ReStickifyOpHBM",
+        ([1, 128, 128, 64], [sympy.floor(_C1 / 64), _C2, _C0, sympy.Mod(_C1, 64)]),
+        ([64, 2, 128, 64], [_C1, sympy.floor(_C2 / 64), _C0, sympy.Mod(_C2, 64)]),
+        {_C0: 128, _C1: 64, _C2: 128},
+    ),
+    # [2, 2, 64, 64].permute(1, 0, 3, 2).contiguous(): rank 4, the stick
+    # moves (c2 -> c3) AND two bare dims swap (c0 <-> c1) in the same op.
+    "r4_2x2x64x64_p1032": (
+        "ReStickifyOpHBM",
+        (
+            [1, 2, 64, 2, 64],
+            [sympy.floor(_C2 / 64), _C0, _C3, _C1, sympy.Mod(_C2, 64)],
+        ),
+        (
+            [1, 2, 64, 2, 64],
+            [sympy.floor(_C3 / 64), _C1, _C2, _C0, sympy.Mod(_C3, 64)],
+        ),
+        {_C0: 2, _C1: 2, _C2: 64, _C3: 64},
+    ),
+    # [128, 128, 128].permute(2, 0, 1).contiguous(): a 3-cycle through the
+    # stick (output dims 0, 1, 2 read input dims 2, 0, 1), and both stick
+    # symbols, c0 on the input and c2 on the output, span two sticks.
+    "p201_128x128x128": (
+        "ReStickifyOpHBM",
+        ([128, 2, 128, 64], [_C2, sympy.floor(_C0 / 64), _C1, sympy.Mod(_C0, 64)]),
+        ([128, 2, 128, 64], [_C1, sympy.floor(_C2 / 64), _C0, sympy.Mod(_C2, 64)]),
+        {_C0: 128, _C1: 128, _C2: 128},
     ),
     # [4, 8, 64].permute(1, 0, 2).contiguous() as ``identity``: the stick dim
     # stays, only the two bare dims swap -- the same data movement as a
@@ -2478,6 +2510,27 @@ class TestRelayout(unittest.TestCase):
             (1, 2, 64, 128, 64),
             (1048576, 8192, 1, 64, 16384),
             (1048576, 524288, 8192, 64, 1),
+        ),
+        # n = 3, stick moves c1 -> c2.  c2 is 2 sticks on the output side and
+        # c1 is one stick, split (1, 64) anyway: n + 2.
+        "p021_128x128x64": (
+            (1, 64, 2, 128, 64),
+            (1048576, 1, 524288, 64, 8192),
+            (1048576, 16384, 8192, 64, 1),
+        ),
+        # n = 4, stick moves c2 -> c3, and c0, c1 swap.  Both sticks are one
+        # stick; c2's split is (1, 64): n + 2 = 6 loops.
+        "r4_2x2x64x64_p1032": (
+            (1, 2, 1, 64, 2, 64),
+            (8192, 64, 16384, 1, 8192, 128),
+            (16384, 8192, 8192, 128, 64, 1),
+        ),
+        # n = 3, a 3-cycle: the stick moves c0 -> c2.  c0 is 2 sticks, split
+        # (2, 64); c2 is 2 sticks on the output side: n + 2.
+        "p201_128x128x128": (
+            (128, 2, 2, 64, 64),
+            (64, 1048576, 8192, 1, 16384),
+            (16384, 8192, 4096, 64, 1),
         ),
     }
 
