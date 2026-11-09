@@ -42,6 +42,8 @@ class FakeServer:
             self.live.pop(sql.split()[-1], None)
             return None
         stmt = re.sub(r"IF\s+NOT\s+EXISTS\s+", "", sql, count=1, flags=re.I)
+        # A server stores a definition without the ON CLUSTER clause it was created with.
+        stmt = re.sub(r"\s+ON\s+CLUSTER\s+\w+", "", stmt, count=1, flags=re.I)
         m = self.NAME.match(stmt)
         if m and m.group(1) not in self.live:
             self.live[m.group(1)] = stmt
