@@ -12,11 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Compiled shard-local reductions on sharded tensors (non-unified kernels).
+"""Compiled reductions on sharded tensors (non-unified kernels).
 
-A reduction over dims that do not include the shard dim runs on every shard
-independently: core c reads input shard c and writes output shard c, and the
-result stays sharded along the remapped shard dim.
+A reduction over dims that do not include the shard dim (shard-local) runs on
+every shard independently: core c reads input shard c and writes output shard
+c, and the result stays sharded along the remapped shard dim.
+
+A reduction over the shard dim (cross-shard) runs as one program: core c reads
+input shard c, DeepTools' cross-core reduction combines the per-core partials,
+and the result is an ordinary (unsharded) tensor.
 
 The device tests need ``SENCORES`` in (8, 16) and ``FLEX_DEVICE=EMUL1p5`` at
 process start. ``test_device_suite_in_emulation_shape`` runs this file in a
@@ -269,23 +273,120 @@ def test_reduction_feeds_a_sharded_pointwise_op(launched):
 
 
 @_requires_emulation
+@pytest.mark.parametrize(
+    "fn",
+    [
+        lambda x: x.sum(1),
+        lambda x: x.amax(1),
+        lambda x: x.amin(1),
+        lambda x: x.sum(1, keepdim=True),
+    ],
+    ids=["sum", "amax", "amin", "sum_keepdim"],
+)
+def test_cross_shard_reduction_matches_cpu(launched, fn):
+    """Reducing the shard dim combines the N partials in one kernel.
+
+    Input [3, 4n, 64] is Shard(1); reducing dim 1 needs every shard. The
+    result is an ordinary tensor and, for small integers, exact.
+    """
+    n = _num_shards()
+    src = _small_ints((3, 4 * n, 64))
+    x = _sharded(src, 1, n)
+
+    y = torch.compile(fn, dynamic=False)(x)
+
+    assert len(launched) == 1, launched
+    assert not torch.spyre.is_sharded(y)
+    assert torch.equal(y.cpu(), fn(src))
+    assert torch.equal(y.cpu(), _reference(fn, src))
+
+
+@_requires_emulation
+@pytest.mark.parametrize(
+    "dtype, width",
+    # One stick per row in both dtypes (64 fp16 or 32 fp32 elements). A
+    # two-stick fp32 row hits the shard-local stride limit (#5827).
+    [(torch.float16, 64), (torch.float32, 32)],
+    ids=["fp16", "fp32"],
+)
+def test_cross_shard_sum_of_rank2_tensor(launched, dtype, width):
+    """[4n, w] Shard(0).sum(0) -> [w]: a column sum across all shards."""
+    n = _num_shards()
+    src = _small_ints((4 * n, width), dtype=dtype, seed=5)
+    x = _sharded(src, 0, n)
+
+    y = torch.compile(lambda t: t.sum(0), dynamic=False)(x)
+
+    assert len(launched) == 1, launched
+    assert torch.equal(y.cpu(), src.sum(0))
+
+
+@_requires_emulation
+def test_cross_shard_sum_combines_every_shard():
+    """Each shard holds a distinct value, so the sum is wrong if any shard's
+    partial is missing, counted twice, or read from another shard."""
+    n = _num_shards()
+    cols = 4 * n
+    shard_of_col = (torch.arange(cols) // 4).view(1, cols, 1)
+    src = shard_of_col.expand(3, cols, 64).to(torch.float16).contiguous()
+    x = _sharded(src, 1, n)
+
+    y = torch.compile(lambda t: t.sum(1), dynamic=False)(x)
+
+    # Every output element is 4 * (0 + 1 + ... + n-1).
+    assert torch.equal(y.cpu(), src.sum(1))
+    assert y.cpu()[0, 0].item() == 4 * n * (n - 1) // 2
+
+
+@_requires_emulation
+def test_cross_shard_mean_close_to_cpu():
+    """mean divides once by the global count (sum first, then divide).
+
+    Not exact in fp16; the tolerance is 0.5% relative, and the unsharded
+    device mean is measured at 0.4% on the same inputs.
+    """
+    n = _num_shards()
+    generator = torch.Generator().manual_seed(7)
+    src = (torch.rand((3, 4 * n, 64), generator=generator) * 4 + 1).to(torch.float16)
+    x = _sharded(src, 1, n)
+
+    y = torch.compile(lambda t: t.mean(1), dynamic=False)(x)
+
+    expected = src.float().mean(1)
+    assert torch.allclose(y.cpu().float(), expected, rtol=5e-3, atol=0)
+
+
+@_requires_emulation
+def test_cross_shard_result_feeds_an_unsharded_op():
+    """The cross-shard result is an ordinary tensor: later ops treat it so."""
+    n = _num_shards()
+    src = _small_ints((3, 4 * n, 64), seed=6)
+    other = _small_ints((3, 64), seed=8)
+    x = _sharded(src, 1, n)
+
+    y = torch.compile(lambda t: t.sum(1), dynamic=False)(x)
+    z = torch.compile(lambda u, v: u + v, dynamic=False)(y, other.to("spyre"))
+
+    assert torch.equal(z.cpu(), src.sum(1) + other)
+
+
+@_requires_emulation
 @expects_raise
 @pytest.mark.parametrize(
     "fn, match",
     [
-        # TODO: positive once cross-shard reductions combine partials across
-        # cores (ring chain, see docs).
-        (lambda x: x.sum(1), "reductions that keep the shard dim only"),
-        (lambda x: x.sum(), "reductions that keep the shard dim only"),
-        (lambda x: x.sum((0, 1)), "reductions that keep the shard dim only"),
+        # TODO: positive once a reduction can split more than one reduced dim
+        # across cores (DeepTools limit) or combine in two steps.
+        (lambda x: x.sum(), "must reduce the shard dim only"),
+        (lambda x: x.sum((0, 1)), "must reduce the shard dim only"),
         # A real limit for now: reducing the stick dim changes each shard's
         # device layout.
         (lambda x: x.sum(-1), "reductions over the stick dim"),
-        # TODO: positive once the keepdim output layout matches the default
-        # shard layout (it gets a size-1 outer device dim today).
+        # TODO: positive once the shard-local keepdim output layout matches
+        # the default shard layout (it gets a size-1 outer device dim today).
         (lambda x: x.sum(0, keepdim=True), "default device layout"),
     ],
-    ids=["cross_shard", "full", "includes_shard_dim", "stick_dim", "keepdim"],
+    ids=["full", "includes_shard_dim", "stick_dim", "local_keepdim"],
 )
 def test_unsupported_reductions_fail_at_compile(fn, match):
     n = _num_shards()
