@@ -195,7 +195,7 @@ class TestAlignReshapePlan(unittest.TestCase):
 
     def test_dropped_extent_raises(self):
         # An input axis with extent > 1 that no output axis matches would lose
-        # data -> needs a cross-stick transpose (restickify), not a reshape.
+        # data -> needs a restickify, not a reshape.
         a, d, c = sympy.symbols("a d c")
         with self.assertRaises(NotImplementedError):
             align_reshape_plan(

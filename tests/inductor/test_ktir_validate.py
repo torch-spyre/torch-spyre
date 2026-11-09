@@ -42,7 +42,6 @@ import sympy
 from torch_spyre._C import DataFormats, ElementArrangement
 from torch_spyre._inductor.codegen import ktir
 from torch_spyre._inductor.codegen.opspec_utils import (
-    NeedsRelayout,
     align_reshape_plan,
     needs_relayout,
     relayout_strides,
@@ -2618,8 +2617,8 @@ class TestRelayoutDetection(unittest.TestCase):
             with self.subTest(operand=name):
                 self.assertFalse(needs_relayout(source, out))
 
-    def test_needs_relayout_is_raised_by_exactly_the_two_restickify_cases(self):
-        """The permute and the moved stick raise it; an unknown coord does not."""
+    def test_alignment_refuses_exactly_the_two_restickify_cases(self):
+        """The permute and the moved stick are refused as needing a restickify."""
         c0, c1 = _C0, _C1
         floor, mod = sympy.floor, sympy.Mod
         permute = ([c1, c0, mod(c1, 64)], [8, 4, 64], [c0, c1, mod(c1, 64)], [4, 8, 64])
@@ -2630,12 +2629,27 @@ class TestRelayoutDetection(unittest.TestCase):
             [1, 128, 64],
         )
         for name, case in (("permute", permute), ("moved-stick", moved_stick)):
-            with self.subTest(case=name), self.assertRaises(NeedsRelayout):
-                align_reshape_plan(*case)
-        unknown = ([2 * c0 + 1, mod(c1, 64)], [4, 64], [c0, mod(c1, 64)], [4, 64])
-        with self.assertRaises(NotImplementedError) as ctx:
-            align_reshape_plan(*unknown)
-        self.assertNotIsInstance(ctx.exception, NeedsRelayout)
+            with self.subTest(case=name):
+                with self.assertRaisesRegex(NotImplementedError, "restickify"):
+                    align_reshape_plan(*case)
+
+    def test_an_unclassifiable_coordinate_raises_instead_of_reporting(self):
+        """An unknown coordinate is an error, not a relayout.
+
+        ``needs_relayout`` returns a bool for the two restickify cases and must
+        not turn ``_dim_info``'s refusal into ``True``.
+        """
+        c0, c1 = _C0, _C1
+        mod = sympy.Mod
+        spec = make_op_spec(
+            IDENTITY_OP,
+            inputs=1,
+            sizes=[[4, 64], [4, 64]],
+            coords_per_arg=[[2 * c0 + 1, mod(c1, 64)], [c0, mod(c1, 64)]],
+            space={c0: (4, 1), c1: (64, 1)},
+        )
+        with self.assertRaisesRegex(NotImplementedError, "classification"):
+            needs_relayout(spec.args[0], spec.args[1])
 
     def test_a_unit_axis_swap_is_detected_and_relayout_accepts_it(self):
         """A size-1 bare axis moved past the stick axis: detected, and copied.
@@ -2648,7 +2662,7 @@ class TestRelayoutDetection(unittest.TestCase):
         floor, mod = sympy.floor, sympy.Mod
         source = ([c1, floor(c0 / 64), mod(c0, 64)], [1, 2, 64])
         out = ([floor(c0 / 64), c1, mod(c0, 64)], [2, 1, 64])
-        with self.assertRaises(NeedsRelayout):
+        with self.assertRaisesRegex(NotImplementedError, "restickify"):
             align_reshape_plan(source[0], source[1], out[0], out[1])
         extent, _in_strides, _out_strides = relayout_strides(
             source[0], source[1], out[0], out[1], {c0: 128, c1: 1}
@@ -2709,7 +2723,7 @@ class TestRelayoutDetection(unittest.TestCase):
 
     def test_a_compute_op_on_a_permuted_operand_is_refused(self):
         """``exp`` is not a copy, so a permuted operand must not drop its compute."""
-        with self.assertRaises(NeedsRelayout):
+        with self.assertRaisesRegex(NotImplementedError, "restickify"):
             ktir.build_kernel_plan([make_relayout_op_spec("2d_64x64", op="exp")])
 
     def test_a_padded_transpose_is_refused_by_relayout(self):
