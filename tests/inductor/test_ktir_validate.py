@@ -2453,14 +2453,27 @@ class TestRelayout(unittest.TestCase):
 
     # (extent, input strides, output strides) per case, worked by hand from the
     # coordinates; ``test_strides_agree_with_the_coordinates`` checks the method.
-    EXPECTED = {
-        "2d_64x64": ((1, 64, 64), (4096, 1, 64), (4096, 64, 1)),
+    #
+    # Loop count, for n loop symbols: a moved stick always gives n + 2 loops.
+    # The output's stick symbol is already two axes (stick, lane), and the
+    # output's bare axis over the input's stick symbol is split into
+    # (n_sticks, 64).  That split is made even when n_sticks is 1, where it
+    # could collapse to one loop for n + 1; the collapse is not done.  A stick
+    # that stays gives n + 1.
+    EXPECTED_SHAPE_STRIDES = {
+        # n = 2, stick moves c0 -> c1.  Both are a single stick, so c0's split
+        # is (1, 64): n + 2 = 4 loops, not the collapsible n + 1 = 3.
+        "2d_64x64": ((1, 1, 64, 64), (4096, 4096, 1, 64), (4096, 4096, 64, 1)),
+        # n = 2, stick moves c0 -> c1.  c0 is 4 sticks, split (4, 64): n + 2.
         "2d_128x256": ((2, 4, 64, 64), (4096, 8192, 1, 64), (16384, 4096, 64, 1)),
+        # n = 3, stick moves c1 -> c2.  c1 is 2 sticks, split (2, 64): n + 2.
         "3d_stick": (
             (2, 64, 4, 512, 64),
             (32768, 1, 4194304, 64, 65536),
             (8388608, 131072, 32768, 64, 1),
         ),
+        # n = 3, stick moves c1 -> c2.  c2 is one stick on the output side and
+        # c1 is 2 sticks, split (2, 64): n + 2.
         "3d_128x64x128": (
             (1, 2, 64, 128, 64),
             (1048576, 8192, 1, 64, 16384),
@@ -2474,7 +2487,7 @@ class TestRelayout(unittest.TestCase):
         return relayout_strides(in_coords, in_size, out_coords, out_size, ranges)
 
     def test_strides_for_the_frontend_shapes(self):
-        for case, expected in self.EXPECTED.items():
+        for case, expected in self.EXPECTED_SHAPE_STRIDES.items():
             with self.subTest(case=case):
                 self.assertEqual(self.strides(case), expected)
 
@@ -2563,7 +2576,8 @@ class TestRelayout(unittest.TestCase):
 
     def test_the_plan_step_is_an_identity_generic_over_a_strided_input(self):
         """Each frontend layout reaches a copy plan with its derived strides."""
-        for case, (extent, in_strides, out_strides) in self.EXPECTED.items():
+        for case, expected in self.EXPECTED_SHAPE_STRIDES.items():
+            extent, in_strides, out_strides = expected
             with self.subTest(case=case):
                 plan = ktir.build_kernel_plan([make_relayout_op_spec(case)])
                 [step] = plan.steps

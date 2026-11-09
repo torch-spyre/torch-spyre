@@ -467,6 +467,20 @@ def _relayout_loops(
     the stick index and in the lane, but not in the symbol itself, so a single
     loop over it could not be given one input stride.
 
+    That split is made even when the symbol is exactly one stick long, giving
+    ``(1, 64)``.  So for ``n`` loop symbols the loop count is:
+
+      - ``n + 2`` when the stick moves (the input's stick symbol is not the
+        output's): the output's own stick symbol is two axes already, and the
+        input's stick symbol is split here.
+      - ``n + 1`` when the stick stays: only the shared stick symbol is two axes.
+
+    A single-stick symbol could be left as one loop, giving ``n + 1`` for a
+    moved stick too (the ``(1, 64)`` loop pair walks the same addresses as one
+    loop of 64).  That collapse is not done, so every moved-stick relayout has
+    the same loop structure.  A symbol shorter than a stick is not split; the
+    input's lane axis for it is refused as padded by ``_relayout_input_strides``.
+
     Args:
         out_terms: ``_stick_term(coord)`` for each output device coordinate.
         out_size: the output's device sizes.
@@ -513,7 +527,9 @@ def _relayout_loops(
                     f"{sym}, whose range is {_symbol_range(ranges, sym)}"
                 )
             in_stick = split_by_input.get(sym, 0)
-            if in_stick and size > in_stick:
+            # ``>=``: a single-stick symbol is split too, into ``(1, 64)``, so
+            # a moved stick always has ``n + 2`` loops (see the docstring).
+            if in_stick and size >= in_stick:
                 if size % in_stick:
                     raise NotImplementedError(
                         f"OpSpec relayout: {sym} runs {size} elements, not a whole "
@@ -668,12 +684,13 @@ def relayout_strides(
     compute between the two views is the identity.  That form -- a strided
     input view into a row-major output -- is the only one the backend lowers.
 
-    Example, ``x.T`` on 64 x 64 (no split)::
+    Example, ``x.T`` on 64 x 64.  Both sticks are a single stick, and the
+    output's bare ``c0`` axis is still split into the two loops ``(1, 64)``::
 
         in_coords  [floor(c0/64), c1, Mod(c0, 64)]   in_size  [1, 64, 64]
         out_coords [floor(c1/64), c0, Mod(c1, 64)]   out_size [1, 64, 64]
-        -> extent (1, 64, 64)
-           in_strides (4096, 1, 64), out_strides (4096, 64, 1)
+        -> extent (1, 1, 64, 64)
+           in_strides (4096, 4096, 1, 64), out_strides (4096, 4096, 64, 1)
 
     Example, ``[128, 64, 128].transpose(1, 2)``, where the output walks ``c1``
     bare but the input stores it as stick + lane, so that axis becomes two
@@ -693,7 +710,9 @@ def relayout_strides(
 
     Returns:
         extent: the loop bounds, i.e. the output's device axes, where an axis
-            the input stores as stick + lane is split into ``(n_sticks, 64)``.
+            the input stores as stick + lane is split into ``(n_sticks, 64)``,
+            even when ``n_sticks`` is 1.  For ``n`` loop symbols that is
+            ``n + 2`` loops when the stick moves and ``n + 1`` when it stays.
         in_strides, out_strides: how far each buffer's address moves per loop.
             The output's are always row-major.
 
