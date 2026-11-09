@@ -760,22 +760,16 @@ def spyre__copy_from(self, dst, non_blocking=False):
     elif self.device.type == "spyre" and dst.device.type == "cpu":
         copy_tensor(self, dst, non_blocking)
         from torch_spyre._C import ElementArrangement, get_spyre_tensor_layout
+        from torch_spyre.element_arrangement import STICK_ELEMENTS, destagger_host
 
         layout = get_spyre_tensor_layout(self)
-        if layout is not None and layout.element_arrangement != ElementArrangement.STANDARD:
-            ea = layout.element_arrangement
-            if dst.numel() > 0 and dst.numel() % 64 == 0:
-                orig_shape = dst.shape
-                if ea == ElementArrangement.DL16_TO_FP32:
-                    flat = dst.reshape(-1, 64)
-                    h0 = flat[:, :32].reshape(-1, 8, 4)
-                    h1 = flat[:, 32:].reshape(-1, 8, 4)
-                    dst.copy_(torch.stack([h0, h1], dim=2).reshape(orig_shape))
-                elif ea == ElementArrangement.FP32_TO_DL16:
-                    flat = dst.reshape(-1, 8, 2, 4)
-                    s0 = flat[:, :, 0, :].reshape(-1, 32)
-                    s1 = flat[:, :, 1, :].reshape(-1, 32)
-                    dst.copy_(torch.cat([s0, s1], dim=1).reshape(orig_shape))
+        if (
+            layout is not None
+            and layout.element_arrangement != ElementArrangement.STANDARD
+            and dst.numel() > 0
+            and dst.numel() % STICK_ELEMENTS == 0
+        ):
+            destagger_host(dst, layout.element_arrangement)
         return dst
     elif self.device.type == "spyre" and self.device == dst.device:
         # copy_from_d2d requires torch.compile, which cannot run inside

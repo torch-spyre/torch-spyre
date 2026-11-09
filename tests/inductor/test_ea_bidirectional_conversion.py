@@ -27,10 +27,15 @@ Tests all 4 conversion cases:
 import pytest
 import torch
 from torch._inductor.exc import InductorError
-from torch_spyre._C import ElementArrangement, get_spyre_tensor_layout
+from torch_spyre._C import (
+    ElementArrangement,
+    get_spyre_tensor_layout,
+    set_spyre_tensor_layout,
+)
 from torch_spyre._inductor import config
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
 from torch_spyre._inductor.constants import DEVICE_NAME
+from torch_spyre.element_arrangement import STICK_ELEMENTS, stick_permutation
 from utils_inductor import expects_raise
 
 
@@ -757,3 +762,56 @@ def test_pad_of_staggered_inside_stick_pair_raises():
 
 
 # Made with Bob
+
+
+# 64 fp16 values are exact in DLF16 up to 1024, so four sticks stay well inside it.
+_STICKS = 4
+
+
+def _raw_slots(t):
+    """Read ``t``'s device buffer in slot order by relabelling it STANDARD."""
+    layout = get_spyre_tensor_layout(t)
+    set_spyre_tensor_layout(
+        t, layout.with_element_arrangement(ElementArrangement.STANDARD)
+    )
+    return t.cpu()
+
+
+@pytest.mark.parametrize(
+    "fp16",
+    DtypeOpTable.fp16_types(),
+    ids=lambda dt: str(dt).replace("torch.", ""),
+)
+def test_stick_permutation_dl16_to_fp32(fp16):
+    """``stick_permutation(DL16_TO_FP32)`` is the slot order the hardware produces."""
+    n = _STICKS * STICK_ELEMENTS
+    x = torch.arange(n, dtype=torch.float32).to(fp16).to(DEVICE_NAME)
+    y = x.to(torch.float32)
+    assert_ea(y, ElementArrangement.DL16_TO_FP32)
+    perm = stick_permutation(ElementArrangement.DL16_TO_FP32)
+    expected = [
+        g * STICK_ELEMENTS + perm[s]
+        for g in range(_STICKS)
+        for s in range(STICK_ELEMENTS)
+    ]
+    assert _raw_slots(y).long().tolist() == expected
+
+
+@pytest.mark.parametrize(
+    "fp16",
+    DtypeOpTable.fp16_types(),
+    ids=lambda dt: str(dt).replace("torch.", ""),
+)
+def test_stick_permutation_fp32_to_dl16(fp16):
+    """``stick_permutation(FP32_TO_DL16)`` is the slot order the hardware produces."""
+    n = _STICKS * STICK_ELEMENTS
+    x = torch.arange(n, dtype=torch.float32).to(DEVICE_NAME)
+    y = x.to(fp16)
+    assert_ea(y, ElementArrangement.FP32_TO_DL16)
+    perm = stick_permutation(ElementArrangement.FP32_TO_DL16)
+    expected = [
+        g * STICK_ELEMENTS + perm[s]
+        for g in range(_STICKS)
+        for s in range(STICK_ELEMENTS)
+    ]
+    assert _raw_slots(y).float().long().tolist() == expected
