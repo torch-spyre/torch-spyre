@@ -410,84 +410,54 @@ def _stick_term(coord: sympy.Expr) -> tuple[str, sympy.Symbol | None, int]:
     return kind, sym, int(stick)
 
 
-def relayout_strides(
-    in_coords: Sequence[sympy.Expr],
-    in_size: Sequence[int],
-    out_coords: Sequence[sympy.Expr],
-    out_size: Sequence[int],
-    ranges: dict[sympy.Symbol, int],
-) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-    """``(extent, in_strides, out_strides)``: a copy, in the output's axis order.
-
-    A relayout -- a transpose, across sticks or not -- moves every element of
-    one buffer to its place in another, and the two buffers order their device
-    axes differently.  Both are viewed over ONE iteration space, the output's
-    device axes in the output's order, so the output view is its own row-major
-    layout and the copy between the views is the identity.  Everything the
-    transpose is goes into the INPUT view's strides: for each iteration dim,
-    how far the input's address moves when that dim steps by one.  That is the
-    only form the backend lowers -- an input view at arbitrary strides into a
-    row-major output -- so the output's strides are row-major by construction
-    and asserted so.
-
-    The iteration space is the output's axes REFINED: an output axis that walks a
-    whole symbol the input splits into stick and lane (``s // 64``, ``s % 64``)
-    becomes two dims, ``(range / 64, 64)``, because the input's address is not
-    linear in ``s`` but is in its two parts.  Splitting a row-major axis in two
-    keeps it row-major, so the output side is unaffected.  An axis of at most one
-    stick needs no split: its stick index is 0 and its lane is the symbol.
-
-    ``ranges`` is each symbol's iteration count.  It is compared against the
-    extents to refuse padding, the one thing a stride cannot say: a stick split
-    of a symbol whose range is not a whole number of sticks reads lanes the input
-    holds no elements for.
-
-    Refuses rather than guesses: a symbol the output does not walk exactly once
-    (or as one stick/lane pair), an input axis whose symbol the output does not
-    walk, an extent that disagrees with its symbol's range, and a view that reads
-    one input element for two outputs -- each of which is not a copy.
-    """
-    in_size = [int(s) for s in in_size]
-    out_size = [int(s) for s in out_size]
-    if len(in_coords) != len(in_size) or len(out_coords) != len(out_size):
+def _symbol_range(ranges: dict[sympy.Symbol, int], sym: sympy.Symbol) -> int:
+    """How many values ``sym`` takes, or raise if ``ranges`` does not say."""
+    if sym not in ranges:
         raise NotImplementedError(
-            "OpSpec relayout: a coordinate list and its device size differ in rank"
+            f"OpSpec relayout: symbol {sym} has no iteration range"
         )
+    return int(ranges[sym])
 
-    def rng(sym: sympy.Symbol) -> int:
-        if sym not in ranges:
-            raise NotImplementedError(
-                f"OpSpec relayout: symbol {sym} has no iteration range"
-            )
-        return int(ranges[sym])
 
-    # Each output axis, read once: what it walks and over how many elements.
-    out_terms = [_stick_term(coord) for coord in out_coords]
-    in_terms = [_stick_term(coord) for coord in in_coords]
-    for side_terms, side_size, side in (
-        (out_terms, out_size, "output"),
-        (in_terms, in_size, "input"),
-    ):
-        for axis, (kind, _sym, _stick) in enumerate(side_terms):
-            if kind == _DIM_CONST and side_size[axis] != 1:
-                raise NotImplementedError(
-                    f"OpSpec relayout: {side} device axis {axis} is a constant "
-                    f"coordinate over {side_size[axis]} elements"
-                )
-    # Which input symbols are split, and at what stick: those are the output
-    # axes that may need refining.
-    split_by_input: dict[sympy.Symbol, int] = {}
-    for kind, sym, stick in in_terms:
-        if kind in (_DIM_WITHIN_STICK, _DIM_OUTER_STICK):
-            if split_by_input.setdefault(sym, stick) != stick:
-                raise NotImplementedError(
-                    f"OpSpec relayout: the input splits {sym} at two stick sizes"
-                )
+def _relayout_loops(
+    out_terms: list[tuple[str, sympy.Symbol | None, int]],
+    out_size: list[int],
+    split_by_input: dict[sympy.Symbol, int],
+    ranges: dict[sympy.Symbol, int],
+) -> tuple[list[int], list[int], dict[sympy.Symbol, list[tuple[int, int]]]]:
+    """Phase 1 of ``relayout_strides``: the loop extents, built from the output.
 
-    # The iteration dims, and each symbol as a linear sum over them.
+    There is one loop per output device axis, in the output's order, with one
+    exception: a bare output axis over a symbol that the input stores as stick +
+    lane becomes two loops, ``(n_sticks, 64)``.  The input's address is linear in
+    the stick index and in the lane, but not in the symbol itself, so a single
+    loop over it could not be given one input stride.
+
+    Args:
+        out_terms: ``_stick_term(coord)`` for each output device coordinate.
+        out_size: the output's device sizes.
+        split_by_input: for each symbol the input stores as stick + lane, the
+            number of lanes in a stick (64).
+        ranges: how many values each symbol takes.
+
+    Returns:
+        extent: the loop bounds.
+        out_strides: how far the output's address moves per loop.  Always the
+            row-major strides of ``extent``: splitting a row-major axis in two
+            keeps it row-major.
+        symbol_dims: for each symbol, the loops it is made of, as
+            ``(loop, weight)`` pairs with ``sym == sum(weight * index[loop])``.
+            A symbol on one loop is ``[(d, 1)]``; one split into stick and lane
+            is ``[(d, 64), (d + 1, 1)]``.
+
+    Raises:
+        NotImplementedError: the output walks a symbol on two axes, an axis's
+            extent disagrees with its symbol's range, or a split would pad a
+            stick or leave a stick axis without its lane axis.
+    """
     extent: list[int] = []
     out_strides: list[int] = []
-    form: dict[sympy.Symbol, list[tuple[int, int]]] = {}
+    symbol_dims: dict[sympy.Symbol, list[tuple[int, int]]] = {}
     out_row_major = row_major_strides(out_size)
     # A stick axis seen without its lane axis yet: sym -> (stick, sticks).
     pending_lane: dict[sympy.Symbol, tuple[int, int]] = {}
@@ -497,16 +467,16 @@ def relayout_strides(
             extent.append(1)
             out_strides.append(stride)
             continue
-        if sym in form and kind != _DIM_WITHIN_STICK:
+        if sym in symbol_dims and kind != _DIM_WITHIN_STICK:
             raise NotImplementedError(
                 f"OpSpec relayout: the output walks {sym} on more than one axis"
             )
         if kind == _DIM_BARE:
             size = out_size[axis]
-            if size != rng(sym):
+            if size != _symbol_range(ranges, sym):
                 raise NotImplementedError(
                     f"OpSpec relayout: output axis {axis} runs {size} elements of "
-                    f"{sym}, whose range is {rng(sym)}"
+                    f"{sym}, whose range is {_symbol_range(ranges, sym)}"
                 )
             in_stick = split_by_input.get(sym, 0)
             if in_stick and size > in_stick:
@@ -519,9 +489,9 @@ def relayout_strides(
                 hi = len(extent)
                 extent += [size // in_stick, in_stick]
                 out_strides += [stride * in_stick, stride]
-                form[sym] = [(hi, in_stick), (hi + 1, 1)]
+                symbol_dims[sym] = [(hi, in_stick), (hi + 1, 1)]
             else:
-                form[sym] = [(len(extent), 1)]
+                symbol_dims[sym] = [(len(extent), 1)]
                 extent.append(size)
                 out_strides.append(stride)
             continue
@@ -529,11 +499,11 @@ def relayout_strides(
         extent.append(out_size[axis])
         out_strides.append(stride)
         if kind == _DIM_OUTER_STICK:
-            if sym in form:
+            if sym in symbol_dims:
                 raise NotImplementedError(
                     f"OpSpec relayout: the output walks {sym}'s stick twice"
                 )
-            form[sym] = [(dim, stick)]
+            symbol_dims[sym] = [(dim, stick)]
             pending_lane[sym] = (stick, out_size[axis])
         else:
             if sym not in pending_lane or pending_lane[sym][0] != stick:
@@ -542,12 +512,13 @@ def relayout_strides(
                     "stick axis before it at the same stick size"
                 )
             sticks = pending_lane[sym][1]
-            if out_size[axis] != stick or sticks * stick != rng(sym):
+            if out_size[axis] != stick or sticks * stick != _symbol_range(ranges, sym):
                 raise NotImplementedError(
-                    f"OpSpec relayout: output splits {sym} (range {rng(sym)}) into "
+                    f"OpSpec relayout: output splits {sym} (range "
+                    f"{_symbol_range(ranges, sym)}) into "
                     f"{sticks} x {out_size[axis]}, which is padded or partial"
                 )
-            form[sym].append((dim, 1))
+            symbol_dims[sym].append((dim, 1))
             del pending_lane[sym]
     if pending_lane:
         raise NotImplementedError(
@@ -557,29 +528,59 @@ def relayout_strides(
     assert tuple(out_strides) == tuple(row_major_strides(extent)), (
         "a refined output layout must stay row major"
     )
+    return extent, out_strides, symbol_dims
 
-    # The input's strides over those dims: each input axis contributes its own
-    # row-major stride times how its coordinate moves with each dim.
+
+def _relayout_input_strides(
+    in_terms: list[tuple[str, sympy.Symbol | None, int]],
+    in_size: list[int],
+    extent: list[int],
+    symbol_dims: dict[sympy.Symbol, list[tuple[int, int]]],
+    ranges: dict[sympy.Symbol, int],
+) -> list[int]:
+    """Phase 2 of ``relayout_strides``: the input's strides over the loops.
+
+    Each input axis adds its own row-major stride to the loops its coordinate
+    is made of.  For example, an input axis ``Mod(c1, 64)`` with row-major
+    stride 1, where ``symbol_dims[c1] == [(1, 64), (2, 1)]``, adds 1 to loop 2.
+
+    Args:
+        in_terms: ``_stick_term(coord)`` for each input device coordinate.
+        in_size: the input's device sizes.
+        extent: the loop bounds from ``_relayout_loops``.
+        symbol_dims: the loops each symbol is made of, from ``_relayout_loops``.
+        ranges: how many values each symbol takes.
+
+    Returns:
+        How far the input's address moves per loop, one entry per loop.
+
+    Raises:
+        NotImplementedError: the input walks a symbol the output does not (a
+            reduction or a broadcast), splits a symbol where the loops do not,
+            pads a stick, holds an extent that disagrees with its symbol's
+            range, or a loop moves no input element (one element would be
+            copied to many outputs).
+    """
     in_row_major = row_major_strides(in_size)
     in_strides = [0] * len(extent)
     for axis, (kind, sym, stick) in enumerate(in_terms):
         if kind == _DIM_CONST:
             continue
-        if sym not in form:
+        if sym not in symbol_dims:
             raise NotImplementedError(
                 f"OpSpec relayout: input axis {axis} walks {sym}, which the output "
                 "does not; that is a reduction or a broadcast, not a copy"
             )
-        terms = form[sym]
+        terms = symbol_dims[sym]
         stride = in_row_major[axis]
         if kind == _DIM_BARE:
-            expected = rng(sym)
+            expected = _symbol_range(ranges, sym)
             for dim, coeff in terms:
                 in_strides[dim] += stride * coeff
         else:
-            # The input splits ``sym``.  Either the iteration space splits it the
-            # same way (two dims, the lane one ``stick`` long), or ``sym`` is at
-            # most one stick long and is its own lane.
+            # The input splits ``sym``.  Either the loops split it the same way
+            # (two loops, the lane one ``stick`` long), or ``sym`` is at most
+            # one stick long and is its own lane.
             split = (
                 len(terms) == 2
                 and terms[0][1] == stick
@@ -590,17 +591,17 @@ def relayout_strides(
                     f"OpSpec relayout: input axis {axis} splits {sym} at {stick} "
                     "lanes, which the iteration space does not"
                 )
-            sticks = -(-rng(sym) // stick)
+            sticks = -(-_symbol_range(ranges, sym) // stick)
             if kind == _DIM_OUTER_STICK:
                 expected = sticks
                 if split:
                     in_strides[terms[0][0]] += stride
             else:
                 expected = stick
-                if sticks * stick != rng(sym):
+                if sticks * stick != _symbol_range(ranges, sym):
                     raise NotImplementedError(
                         f"OpSpec relayout: input lane axis {axis} of {sym} (range "
-                        f"{rng(sym)}) is padded"
+                        f"{_symbol_range(ranges, sym)}) is padded"
                     )
                 in_strides[(terms[1] if split else terms[0])[0]] += stride
         if in_size[axis] != expected:
@@ -614,6 +615,94 @@ def relayout_strides(
                 f"OpSpec relayout: iteration dim {dim} moves no input element, so "
                 "one input element would be copied to many outputs"
             )
+    return in_strides
+
+
+def relayout_strides(
+    in_coords: Sequence[sympy.Expr],
+    in_size: Sequence[int],
+    out_coords: Sequence[sympy.Expr],
+    out_size: Sequence[int],
+    ranges: dict[sympy.Symbol, int],
+) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+    """The loops and strides that turn a relayout into a plain copy.
+
+    A relayout (a transpose, across sticks or not) moves every element of the
+    input to its place in the output.  This picks one set of loops for both
+    buffers and gives each buffer its strides over them.  The output's strides
+    are row-major, so the whole permutation is in the input's strides and the
+    compute between the two views is the identity.  That form -- a strided
+    input view into a row-major output -- is the only one the backend lowers.
+
+    Example, ``x.T`` on 64 x 64 (no split)::
+
+        in_coords  [floor(c0/64), c1, Mod(c0, 64)]   in_size  [1, 64, 64]
+        out_coords [floor(c1/64), c0, Mod(c1, 64)]   out_size [1, 64, 64]
+        -> extent (1, 64, 64)
+           in_strides (4096, 1, 64), out_strides (4096, 64, 1)
+
+    Example, ``[128, 64, 128].transpose(1, 2)``, where the output walks ``c1``
+    bare but the input stores it as stick + lane, so that axis becomes two
+    loops ``(2, 64)``::
+
+        in_coords  [c2, floor(c1/64), c0, Mod(c1, 64)]   in_size  [64, 2, 128, 64]
+        out_coords [floor(c2/64), c1, c0, Mod(c2, 64)]   out_size [1, 128, 128, 64]
+        -> extent (1, 2, 64, 128, 64)
+           in_strides (1048576, 8192, 1, 64, 16384)
+           out_strides (1048576, 524288, 8192, 64, 1)
+
+    Args:
+        in_coords, in_size: the input's device coordinates, in terms of the
+            iteration symbols, and its device sizes.
+        out_coords, out_size: the same for the output.
+        ranges: how many values each symbol takes.
+
+    Returns:
+        extent: the loop bounds, i.e. the output's device axes, where an axis
+            the input stores as stick + lane is split into ``(n_sticks, 64)``.
+        in_strides, out_strides: how far each buffer's address moves per loop.
+            The output's are always row-major.
+
+    Raises:
+        NotImplementedError: when the pair is not a pure copy -- padding, a
+            broadcast, a reduction, a symbol walked twice, an extent that
+            disagrees with its symbol's range -- or a coordinate is not a bare
+            symbol, a stick index or a lane.
+    """
+    in_size = [int(s) for s in in_size]
+    out_size = [int(s) for s in out_size]
+    if len(in_coords) != len(in_size) or len(out_coords) != len(out_size):
+        raise NotImplementedError(
+            "OpSpec relayout: a coordinate list and its device size differ in rank"
+        )
+    out_terms = [_stick_term(coord) for coord in out_coords]
+    in_terms = [_stick_term(coord) for coord in in_coords]
+    for side_terms, side_size, side in (
+        (out_terms, out_size, "output"),
+        (in_terms, in_size, "input"),
+    ):
+        for axis, (kind, _sym, _stick) in enumerate(side_terms):
+            if kind == _DIM_CONST and side_size[axis] != 1:
+                raise NotImplementedError(
+                    f"OpSpec relayout: {side} device axis {axis} is a constant "
+                    f"coordinate over {side_size[axis]} elements"
+                )
+    # The symbols the input stores as stick + lane, and the stick size of each:
+    # the output axes over these are the ones phase 1 may split in two.
+    split_by_input: dict[sympy.Symbol, int] = {}
+    for kind, sym, stick in in_terms:
+        if kind in (_DIM_WITHIN_STICK, _DIM_OUTER_STICK):
+            if split_by_input.setdefault(sym, stick) != stick:
+                raise NotImplementedError(
+                    f"OpSpec relayout: the input splits {sym} at two stick sizes"
+                )
+
+    extent, out_strides, symbol_dims = _relayout_loops(
+        out_terms, out_size, split_by_input, ranges
+    )
+    in_strides = _relayout_input_strides(
+        in_terms, in_size, extent, symbol_dims, ranges
+    )
     return tuple(extent), tuple(in_strides), tuple(out_strides)
 
 
