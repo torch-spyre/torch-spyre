@@ -688,10 +688,62 @@ class AllGatherKernel(SpyreCollectiveKernel):
 class ReduceScatterKernel(SpyreCollectiveKernel):
     """Out-of-place ``_c10d_functional.reduce_scatter_tensor``.
 
-    Output tensor has shape[0] = input.shape[0] // group_size.
+    The input is the ``(A, g, B)`` staging buffer built by the lowering
+    (``_reduce_scatter``); the output is one rank's ``(A, B)`` chunk.
+    spyre-comms hands rank ``r`` the ``r``-th contiguous ``1/g`` of the device
+    buffer, which is ``chunk(0)[r]`` only when that buffer's default device
+    layout has ``g`` outermost, as checked in ``codegen``.
     """
 
     plan_prefix = "rs"
+
+    @classmethod
+    def create_staged(
+        cls,
+        staged: IRNode,
+        reduce_op: str,
+        group_size: int,
+        group_name: str,
+        out_size: list[int],
+    ) -> "ReduceScatterKernel":
+        """Build the node for a staged ``(A, g, B)`` input with an ``(A, B)`` output.
+
+        The upstream ``create_out_of_place`` derives the output from the
+        ``reduce_scatter_tensor`` meta (``size(0) // g``), which does not hold
+        for the staged shape.
+        """
+        layout = FixedLayout(
+            staged.get_device(),
+            staged.get_dtype(),
+            [sympy.Integer(s) for s in out_size],
+        )
+        node = cls(
+            layout,
+            torch.ops._c10d_functional.reduce_scatter_tensor.default,
+            [staged],
+            [reduce_op, group_size, group_name],
+            lambda *a: a,
+        )
+        node.outputs = [node]
+        return node
+
+    def codegen(self, wrapper: PythonWrapperCodegen) -> None:
+        _, group_size, _ = self.constant_args
+        input_layout = _collective_input_layout(self.inputs[0])
+        a_dim, g, b_dim = (int(s) for s in input_layout.size)
+        expected = SpyreTensorLayout([a_dim, g, b_dim], input_layout.dtype)
+        if (
+            g != group_size
+            or input_layout.device_layout != expected
+            or expected.device_size[0] != group_size
+        ):
+            raise Unsupported(
+                f"reduce_scatter: staged input must use the default device "
+                f"layout with the group dim outermost ({expected}) so each "
+                f"rank's chunk is one contiguous device slab; got "
+                f"{input_layout.device_layout}"
+            )
+        super().codegen(wrapper)
 
     def _plan_call(self, num_elems: int, dtype_code: int) -> str:
         reduce_op, group_size, group_name = self.constant_args

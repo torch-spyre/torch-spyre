@@ -3247,15 +3247,55 @@ def lower_c10d_all_gather_coalesced(tensors, group_size, group_name):
 
 
 def _reduce_scatter(tensor, reduce_op, group_size, group_name):
-    return ir.TensorBox.create(
-        ReduceScatterKernel.create_out_of_place(
-            _c10d.reduce_scatter_tensor.default,
-            tensor,
-            reduce_op,
-            group_size,
-            group_name,
+    """Stage the input so each rank's dim-0 chunk is one contiguous device slab.
+
+    spyre-comms splits the flat device buffer into ``group_size`` equal
+    contiguous slabs; it has no strided or per-rank-list variant.  Under the
+    default stick layout host dim 0 sits next to the stick dim, so the slab
+    rank ``r`` receives is not ``chunk(0)[r]`` (see #4273).
+
+    Instead, collapse the input to ``(g, A, B)`` -- ``B`` the stick (last) dim,
+    ``A`` everything else of one rank's chunk -- and materialize it as
+    ``(A, g, B)``.  Its default device layout is ``[g, ceil(B/stick), A,
+    stick]``: ``g`` is outermost and each slab is exactly the default device
+    image of an ``(A, B)`` tensor, which is what ``reducescatter_run``
+    allocates for the output.  The result is then viewed back to
+    ``(size(0) // g, *size[1:])``.  ``ReduceScatterKernel.codegen`` checks the
+    committed layout, so a different one raises instead of scattering wrong
+    elements.
+    """
+    sizes = [V.graph.sizevars.guard_int(s) for s in tensor.get_size()]
+    if not sizes:
+        raise Unsupported("reduce_scatter requires an input with at least 1 dim")
+    if sizes[0] % group_size != 0:
+        raise Unsupported(
+            f"reduce_scatter: input dim 0 ({sizes[0]}) must be divisible by "
+            f"group_size ({group_size})"
+        )
+    out_sizes = [sizes[0] // group_size, *sizes[1:]]
+    stick_dim = out_sizes[-1]
+    a_dim = math.prod(out_sizes) // stick_dim
+    if len(sizes) == 1 and stick_dim % get_elem_in_stick(tensor.get_dtype()) != 0:
+        # A 1-D chunk is the stick dim itself; (1, g, B) only lays out with
+        # g outermost when B fills whole sticks.
+        raise Unsupported(
+            f"reduce_scatter: 1-D per-rank chunk ({stick_dim}) must be a "
+            f"multiple of the stick size "
+            f"({get_elem_in_stick(tensor.get_dtype())})"
+        )
+
+    staged = lowering.view(tensor, [group_size, a_dim, stick_dim])
+    staged = lowering.permute(staged, [1, 0, 2])
+    # Spyre's clone freezes the contiguous stride order (upstream ignores it).
+    staged = clone(staged, memory_format=torch.contiguous_format)
+    staged.realize()
+
+    result = ir.TensorBox.create(
+        ReduceScatterKernel.create_staged(
+            staged, reduce_op, group_size, group_name, [a_dim, stick_dim]
         )
     )
+    return lowering.view(result, out_sizes)
 
 
 @register_spyre_lowering(_c10d.reduce_scatter_tensor.default)

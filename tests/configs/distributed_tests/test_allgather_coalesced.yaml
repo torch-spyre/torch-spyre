@@ -1,9 +1,9 @@
-# Configuration file for torch-spyre distributed compiled allgather tests
-# Tests the lowering of c10d all_gather operations to Spyre comms library
+# Configuration file for torch-spyre distributed compiled coalesced allgather tests
+# Tests the lowering of c10d all_gather_into_tensor_coalesced to Spyre comms library
 #
 # Usage:
 #   cd torch-spyre/tests
-#   ./run_test.sh configs/distributed_tests/test_allgather_compiled.yaml
+#   ./run_test.sh configs/distributed_tests/test_allgather_coalesced.yaml
 #
 # The run_test.sh script automatically detects tests in the distributed/
 # directory and launches them with: torchrun --nproc-per-node $AIU_WORLD_SIZE

@@ -28,7 +28,15 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.distributed.distributed_c10d as c10d
-from torch.testing._internal.common_utils import TestCase, run_tests
+from torch._inductor.exc import InductorError
+from torch.testing._internal.common_utils import (
+    TestCase,
+    instantiate_parametrized_tests,
+    parametrize,
+    run_tests,
+)
+
+from inductor.utils_inductor import expects_raise
 
 import torch_spyre  # noqa: F401
 
@@ -78,6 +86,24 @@ class ReduceScatterModule(torch.nn.Module):
         return torch.ops._c10d_functional.wait_tensor(result)
 
 
+def _position_input(shape: tuple[int, ...], rank: int) -> torch.Tensor:
+    """Position-dependent input: (arange % 509) + rank.
+
+    Distinct values per position expose a permuted or misplaced chunk, which
+    a constant fill cannot.  Every partial sum stays below 2048, so the values
+    are exact in fp16 and through DL16.
+    """
+    numel = 1
+    for s in shape:
+        numel *= s
+    return ((torch.arange(numel) % 509).to(torch.float16) + rank).reshape(shape)
+
+
+def _rs_reference(shape: tuple[int, ...], world: int, rank: int) -> torch.Tensor:
+    full = sum(_position_input(shape, r).float() for r in range(world))
+    return full.chunk(world, 0)[rank].half()
+
+
 class TestReduceScatterCompiled(TestCase):
     @classmethod
     def setUpClass(cls):
@@ -109,27 +135,23 @@ class TestReduceScatterCompiled(TestCase):
 
     def test_reduce_scatter_compiled_basic(self):
         """Each rank contributes a full tensor; output is reduced scatter."""
-        # Input: each rank has a (128,) tensor filled with (rank + 1).
-        # With 2 ranks, reduce_scatter splits input into 2 chunks of 64 and
-        # sums corresponding chunks across ranks.
-        # Rank 0 input: [1,1,...,1] (128 elems)
-        # Rank 1 input: [2,2,...,2] (128 elems)
-        # After reduce_scatter with sum:
-        #   Rank 0 gets chunk 0: 1+2 = 3
-        #   Rank 1 gets chunk 1: 1+2 = 3
+        # Input: each rank has a (256,) tensor filled with (rank + 1).
+        # reduce_scatter splits it into group_size chunks (whole sticks for up
+        # to 4 ranks) and sums corresponding chunks across ranks, so every
+        # rank gets sum(rank + 1) = ws*(ws+1)/2.
         x = torch.full(
-            (128,), float(self.comm_rank + 1), dtype=torch.float16, device=DEVICE
+            (256,), float(self.comm_rank + 1), dtype=torch.float16, device=DEVICE
         )
 
         module = ReduceScatterModule(group_size=self.comm_size)
         compiled_module = torch.compile(module)
         result = compiled_module(x)
 
-        self.assertEqual(result.shape[0], 128 // self.comm_size)
+        self.assertEqual(result.shape[0], 256 // self.comm_size)
 
         expected_val = self.comm_size * (self.comm_size + 1) / 2.0
         expected = torch.full(
-            (128 // self.comm_size,), expected_val, dtype=torch.float16
+            (256 // self.comm_size,), expected_val, dtype=torch.float16
         )
         self.assertTrue(
             torch.allclose(result.to("cpu"), expected),
@@ -139,14 +161,14 @@ class TestReduceScatterCompiled(TestCase):
 
     def test_reduce_scatter_compiled_fp16(self):
         """Verify dtype and output shape preservation for fp16 inputs."""
-        x = torch.ones((128,), dtype=torch.float16, device=DEVICE)
+        x = torch.ones((256,), dtype=torch.float16, device=DEVICE)
 
         module = ReduceScatterModule(group_size=self.comm_size)
         compiled_module = torch.compile(module)
         result = compiled_module(x)
 
         self.assertEqual(result.dtype, torch.float16)
-        self.assertEqual(result.shape[0], 128 // self.comm_size)
+        self.assertEqual(result.shape[0], 256 // self.comm_size)
 
     def test_reduce_scatter_compiled_with_compute(self):
         """Compute interleaved around reduce_scatter."""
@@ -166,9 +188,9 @@ class TestReduceScatterCompiled(TestCase):
                 return scattered + bias
 
         x = torch.full(
-            (128,), float(self.comm_rank + 1), dtype=torch.float16, device=DEVICE
+            (256,), float(self.comm_rank + 1), dtype=torch.float16, device=DEVICE
         )
-        bias = torch.ones((128 // self.comm_size,), dtype=torch.float16, device=DEVICE)
+        bias = torch.ones((256 // self.comm_size,), dtype=torch.float16, device=DEVICE)
 
         module = ComputeModule(group_size=self.comm_size)
         compiled_module = torch.compile(module)
@@ -178,7 +200,7 @@ class TestReduceScatterCompiled(TestCase):
         rs_val = 2.0 * self.comm_size * (self.comm_size + 1) / 2.0
         expected_val = rs_val + 1.0
         expected = torch.full(
-            (128 // self.comm_size,), expected_val, dtype=torch.float16
+            (256 // self.comm_size,), expected_val, dtype=torch.float16
         )
         self.assertTrue(
             torch.allclose(result.to("cpu"), expected),
@@ -193,18 +215,18 @@ class TestReduceScatterCompiled(TestCase):
 
         for iteration in range(4):
             x = torch.full(
-                (128,),
+                (256,),
                 float(self.comm_rank + 1),
                 dtype=torch.float16,
                 device=DEVICE,
             )
             result = compiled_module(x)
 
-            self.assertEqual(result.shape[0], 128 // self.comm_size)
+            self.assertEqual(result.shape[0], 256 // self.comm_size)
 
             expected_val = self.comm_size * (self.comm_size + 1) / 2.0
             expected = torch.full(
-                (128 // self.comm_size,), expected_val, dtype=torch.float16
+                (256 // self.comm_size,), expected_val, dtype=torch.float16
             )
             self.assertTrue(
                 torch.allclose(result.to("cpu"), expected),
@@ -229,13 +251,13 @@ class TestReduceScatterCompiled(TestCase):
                 return [torch.ops._c10d_functional.wait_tensor(r) for r in results]
 
         a = torch.full(
-            (128,),
+            (256,),
             float(self.comm_rank + 1),
             dtype=torch.float16,
             device=DEVICE,
         )
         b = torch.full(
-            (256,),
+            (512,),
             float(self.comm_rank + 1),
             dtype=torch.float16,
             device=DEVICE,
@@ -245,15 +267,15 @@ class TestReduceScatterCompiled(TestCase):
         compiled_module = torch.compile(module)
         r_a, r_b = compiled_module([a, b])
 
-        self.assertEqual(r_a.shape[0], 128 // self.comm_size)
-        self.assertEqual(r_b.shape[0], 256 // self.comm_size)
+        self.assertEqual(r_a.shape[0], 256 // self.comm_size)
+        self.assertEqual(r_b.shape[0], 512 // self.comm_size)
 
         expected_val = self.comm_size * (self.comm_size + 1) / 2.0
         expected_a = torch.full(
-            (128 // self.comm_size,), expected_val, dtype=torch.float16
+            (256 // self.comm_size,), expected_val, dtype=torch.float16
         )
         expected_b = torch.full(
-            (256 // self.comm_size,), expected_val, dtype=torch.float16
+            (512 // self.comm_size,), expected_val, dtype=torch.float16
         )
         self.assertTrue(
             torch.allclose(r_a.to("cpu"), expected_a),
@@ -340,6 +362,90 @@ class TestReduceScatterCompiled(TestCase):
             f"Expected {expected_val}, got {result[0, 0].to('cpu').item()}",
         )
 
+    @parametrize(
+        "shape",
+        [
+            (256,),
+            (128, 64),
+            (128, 128),
+            (64, 256),
+            (256, 4096),
+            (4, 8, 64),
+            (8, 4, 128),
+        ],
+        name_fn=lambda shape: "x".join(map(str, shape)),
+    )
+    def test_reduce_scatter_compiled_position(self, shape):
+        """Each rank receives exactly its own dim-0 chunk of the sum (#4273).
+
+        Shapes whose last dim spans several sticks used to receive a
+        column-stick block instead of their rows.
+        """
+        x = _position_input(shape, self.comm_rank).to(DEVICE)
+        result = torch.compile(ReduceScatterModule(group_size=self.comm_size))(x)
+
+        expected = _rs_reference(shape, self.comm_size, self.comm_rank)
+        self.assertEqual(result.shape, expected.shape)
+        torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+
+    def test_reduce_scatter_compiled_position_view_input(self):
+        """A dim-0 slice input is materialized before the collective."""
+
+        class SliceModule(torch.nn.Module):
+            def __init__(self, group_size: int):
+                super().__init__()
+                self._group_size = group_size
+
+            def forward(self, x):
+                result = torch.ops._c10d_functional.reduce_scatter_tensor(
+                    x[64:], "sum", self._group_size, _GROUP_NAME
+                )
+                return torch.ops._c10d_functional.wait_tensor(result)
+
+        shape = (192, 128)
+        x = _position_input(shape, self.comm_rank).to(DEVICE)
+        result = torch.compile(SliceModule(self.comm_size))(x)
+
+        full = sum(_position_input(shape, r).float() for r in range(self.comm_size))
+        expected = full[64:].chunk(self.comm_size, 0)[self.comm_rank].half()
+        torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+
+    def test_reduce_scatter_coalesced_compiled_position(self):
+        """Coalesced reduce_scatter places each tensor's chunks correctly."""
+
+        class CoalescedModule(torch.nn.Module):
+            def __init__(self, group_size: int):
+                super().__init__()
+                self._group_size = group_size
+
+            def forward(self, tensors: list[torch.Tensor]) -> list[torch.Tensor]:
+                results = torch.ops._c10d_functional.reduce_scatter_tensor_coalesced(
+                    tensors, "sum", self._group_size, _GROUP_NAME
+                )
+                return [torch.ops._c10d_functional.wait_tensor(r) for r in results]
+
+        shapes = [(128, 128), (8, 4, 128), (128, 64)]
+        inputs = [_position_input(s, self.comm_rank).to(DEVICE) for s in shapes]
+        results = torch.compile(CoalescedModule(self.comm_size))(inputs)
+
+        for shape, result in zip(shapes, results):
+            expected = _rs_reference(shape, self.comm_size, self.comm_rank)
+            torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+
+    @expects_raise
+    def test_reduce_scatter_compiled_sub_stick_1d_rejected(self):
+        """A 1-D per-rank chunk smaller than a stick raises at compile time.
+
+        spyre-comms has no algorithm for a split below one 128-byte stick and
+        terminates the process; the lowering must reject it first.
+        TODO: support by padding the per-rank chunk to whole sticks.
+        """
+        x = _position_input((100,), self.comm_rank).to(DEVICE)
+        with pytest.raises(InductorError, match="must be a multiple of the stick"):
+            torch.compile(ReduceScatterModule(group_size=self.comm_size))(x)
+
+
+instantiate_parametrized_tests(TestReduceScatterCompiled)
 
 if __name__ == "__main__":
     run_tests()

@@ -78,9 +78,8 @@ if torch._C._dispatch_has_kernel("spyre::broadcast_run"):
 
     @torch.library.register_fake("spyre::reducescatter_run")
     def _(x: torch.Tensor, plan_handle: int, group_size: int) -> torch.Tensor:
-        output_size = list(x.shape)
-        output_size[0] //= group_size
-        return torch.empty(output_size, dtype=x.dtype, device=x.device)
+        # x is the staged (A, group_size, B) buffer; see _reduce_scatter.
+        return torch.empty((x.shape[0], x.shape[2]), dtype=x.dtype, device=x.device)
 
     @torch.library.register_fake("spyre::all_gather_async")
     def _(

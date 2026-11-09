@@ -169,7 +169,12 @@ class TestAllReduceCoalescedCompiled(TestCase):
         self.assertEqual(r_b.dtype, torch.float16)
 
     def test_all_reduce_coalesced_compiled_with_compute(self):
-        """Compute interleaved around coalesced allreduce."""
+        """Compute interleaved around coalesced allreduce.
+
+        The inputs are intermediates that are dead after the collective, so
+        Inductor's reinplace pass rewrites all_reduce_coalesced to
+        all_reduce_coalesced_; this test covers the in-place lowering.
+        """
 
         class CoalescedWithComputeModule(torch.nn.Module):
             def __init__(self, group_name: str = _GROUP_NAME) -> None:

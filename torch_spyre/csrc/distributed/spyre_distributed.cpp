@@ -170,7 +170,7 @@ spyre_comms::SpyreReductionOpType parse_reduce_op(
   if (reduce_op == "sum") {
     return spyre_comms::SpyreReductionOpType::SUM;
   }
-  TORCH_CHECK(false, "Unsupported reduce_op for spyre allreduce: ", reduce_op,
+  TORCH_CHECK(false, "Unsupported reduce_op for spyre collective: ", reduce_op,
               ". Only 'sum' is currently supported.");
 }
 
@@ -354,12 +354,18 @@ int64_t spyre_reducescatter_plan_impl(int64_t num_elems, int64_t dtype_code,
       group_size > 0 && group_size == static_cast<int64_t>(context->getSize()),
       "group_size must equal world size: got ", group_size, " (world size is ",
       context->getSize(), ")");
-  TORCH_CHECK(num_elems % group_size == 0,
-              "num_elems must be divisible by group_size: ", num_elems, " % ",
-              group_size, " != 0");
+  // num_elems counts padded device elements of the staged input, whose
+  // group dim is outermost (see reducescatter_run). Each rank's slab must be
+  // a whole number of 128-byte sticks: spyre-comms has no algorithm for a
+  // smaller split and terminates the process instead of raising.
+  const auto scalar_type = static_cast<c10::ScalarType>(dtype_code);
+  const int64_t stick_elems = 128 / c10::elementSize(scalar_type);
+  TORCH_CHECK(num_elems % (group_size * stick_elems) == 0,
+              "reduce_scatter: device elements (", num_elems,
+              ") must split into group_size (", group_size,
+              ") slabs of whole sticks (", stick_elems, " elements)");
 
-  auto dtype =
-      torch_dtype_to_spyre_comms(static_cast<c10::ScalarType>(dtype_code));
+  auto dtype = torch_dtype_to_spyre_comms(scalar_type);
 
   std::lock_guard<std::mutex> lock(wsi_cache_mutex_);
   int64_t handle = cache_lookup(PlanKind::ReduceScatter, dtype, num_elems, 0,
@@ -599,6 +605,8 @@ at::Tensor spyre_reducescatter_run_impl(const at::Tensor& input,
   SPYRE_RUNTIME_DEBUG() << "called with plan_handle=" << plan_handle
                         << ", group_size=" << group_size;
 
+  check_collective_storage(input);
+
   auto context = ensure_context();
 
   std::lock_guard<std::mutex> cache_lock(wsi_cache_mutex_);
@@ -607,38 +615,47 @@ at::Tensor spyre_reducescatter_run_impl(const at::Tensor& input,
       "reducescatter_run: invalid plan_handle=", plan_handle);
   auto& plan = wsi_cache_[static_cast<size_t>(plan_handle)];
 
-  TORCH_CHECK(input.is_privateuseone(),
-              "Tensor must be on Spyre device for reduce_scatter");
-  TORCH_CHECK(input.is_contiguous(),
-              "Tensor must be contiguous for reduce_scatter");
   TORCH_CHECK(input.nbytes() > 0,
               "Tensor must have non-zero size for reduce_scatter");
 
-  // Get SharedOwnerCtx for input
-  auto* input_ctx = static_cast<spyre::SharedOwnerCtx*>(
-      input.storage().data_ptr().get_context());
-  TORCH_CHECK(input_ctx != nullptr, "SharedOwnerCtx is null for input tensor");
-
   spyre_comms::Tensor input_tensor(*plan.tensor_info,
                                    input.storage().data_ptr().get());
-  input_tensor.SetSpyreDeviceAddressBorrowed(&input_ctx->composite_addr);
+  input_tensor.SetSpyreDeviceAddressBorrowed(get_composite_address(input));
 
-  // Allocate output tensor with reduced size
-  auto output_sizes = input.sizes().vec();
-  TORCH_CHECK(output_sizes[0] % group_size == 0,
-              "reduce_scatter: input dim 0 (", output_sizes[0],
-              ") must be divisible by group_size (", group_size, ")");
-  output_sizes[0] /= group_size;
-  at::Tensor output = at::empty(output_sizes, input.options());
+  // spyre-comms hands rank r the r-th contiguous 1/group_size of the device
+  // buffer. The compiler stages the input as (A, group_size, B) so that, under
+  // the default stick layout, the device layout is
+  // [group_size, ceil(B/stick), A, stick] and each slab is exactly the default
+  // device image of an (A, B) tensor. Reject anything else: a different layout
+  // scatters the wrong elements without any error from spyre-comms.
+  TORCH_CHECK(input.dim() == 3 && input.size(1) == group_size,
+              "reduce_scatter: expected a staged (A, group_size, B) input, got "
+              "sizes ",
+              input.sizes(), " for group_size ", group_size);
+  const auto input_stl = get_spyre_tensor_layout(input);
+  const SpyreTensorLayout staged_stl(input.sizes().vec(), input.scalar_type());
+  TORCH_CHECK(
+      input_stl == staged_stl && staged_stl.device_size[0] == group_size,
+      "reduce_scatter: staged input must use the default device layout "
+      "with the group dim outermost (",
+      staged_stl.toString(), "), got ", input_stl.toString());
+  at::Tensor output =
+      at::empty({input.size(0), input.size(2)}, input.options());
+  TORCH_CHECK(
+      get_device_size_in_bytes(get_spyre_tensor_layout(output)) * group_size ==
+          get_device_size_in_bytes(input_stl),
+      "reduce_scatter: per-rank output device size does not tile the "
+      "staged input");
 
   auto* output_ctx = static_cast<spyre::SharedOwnerCtx*>(
       output.storage().data_ptr().get_context());
   TORCH_CHECK(output_ctx != nullptr,
               "SharedOwnerCtx is null for output tensor");
+  check_collective_device(output);
 
   spyre_comms::Tensor output_tensor(*plan.output_tensor_info,
                                     output.storage().data_ptr().get());
-  output_tensor.SetSpyreDeviceAddressBorrowed(&output_ctx->composite_addr);
+  output_tensor.SetSpyreDeviceAddressBorrowed(get_composite_address(output));
 
   auto work_schedule = context->reduce_scatter_applyTensors(
       *plan.wsi, input_tensor, output_tensor);
