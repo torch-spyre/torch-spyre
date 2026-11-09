@@ -169,16 +169,40 @@ def _match_axes(
     in_block: list[int],
     out_coords: list[sympy.Expr],
 ) -> tuple[list[int], bool]:
-    """Match an operand's device axes to the output's.
+    """Pair each output device axis with an input axis of the same ``_dim_info``.
 
-    Returns ``(reshape_to, aligned)``.  ``reshape_to`` has one extent per
-    output axis: the matched input axis's extent, or 1 where no input axis
-    matches (that axis is broadcast).  ``aligned`` is False when no reshape
-    lines the operand up -- its matched axes are out of order, or an axis
-    holding data matched nothing -- so it needs a restickify.
+    Two axes pair when ``_dim_info`` gives them the same ``(kind, symbol)``:
+    the same loop symbol, read the same way -- bare (``c1``), as a stick index
+    (``floor(c0/64)``), or as a lane (``Mod(c0, 64)``).  So ``c1`` pairs with
+    ``c1``, but not with ``floor(c1/64)`` or with ``c0``.  The last axis (a
+    stick's lanes) always pairs with the last axis.
 
-    Raises ``NotImplementedError`` only from ``_dim_info``, for a coordinate
-    form it cannot classify.
+    Example, an operand already in the output's order but missing a dim::
+
+        in_coords  [c0, Mod(c1, 64)]          in_block [4, 64]
+        out_coords [c0, c2, Mod(c1, 64)]
+        -> reshape_to [4, 1, 64], aligned True   (c2 is broadcast)
+
+    Example, ``x.T`` on 64 x 64, where no output axis walks ``c1`` bare::
+
+        in_coords  [floor(c0/64), c1, Mod(c0, 64)]   in_block [1, 64, 64]
+        out_coords [floor(c1/64), c0, Mod(c1, 64)]
+        -> aligned False
+
+    Args:
+        in_coords, in_block: the operand's device coordinates and sizes.
+        out_coords: the output's device coordinates.
+
+    Returns:
+        reshape_to: one extent per output axis -- the paired input axis's
+            extent, or 1 where no input axis pairs (that axis is broadcast).
+        aligned: False when no reshape lines the operand up, because the
+            paired axes are in a different order or an input axis holding
+            data paired with nothing.  Such an operand needs a restickify.
+
+    Raises:
+        NotImplementedError: from ``_dim_info``, for a coordinate form it
+            cannot classify.
     """
     in_info = [_dim_info(c) for c in in_coords]
     in_rank = len(in_coords)
@@ -214,9 +238,9 @@ def _match_axes(
     for b in reshape_to:
         prod_reshape *= b
     if prod_in != prod_reshape:
-        # An input axis holding data matched no output axis, so reshaping would
-        # drop its elements.  This is a stick that moved: one side splits a
-        # symbol into stick and lane, the other walks it bare.
+        # An input axis holding data paired with no output axis, so a reshape
+        # would drop its elements.  A moved stick is one way this happens: one
+        # side walks a symbol bare, the other splits it into stick and lane.
         return reshape_to, False
     return reshape_to, True
 
@@ -227,27 +251,37 @@ def align_reshape_plan(
     out_coords: list[sympy.Expr],
     out_block: list[int],
 ) -> tuple[list[int], list[int] | None] | None:
-    """Plan to reshape + broadcast a pointwise operand tile into the op's output
-    device-axis order.
+    """Plan the reshape + broadcast that lines a pointwise operand up with the output.
 
     A pointwise op's operands may carry their device axes in a different order
     (and rank) from the output tile: a per-row reduction result broadcasts over
     the outer-stick dim, a channel weight broadcasts over the row dim, etc.
     Elementwise broadcast typically only auto-aligns *leading* unit dims, so a
     misaligned operand (outer-stick where the output has rows) must be reshaped
-    to the output order first.
+    to the output order first.  ``_match_axes`` does the pairing.
 
-    Each output device axis is matched to an input axis by ``(kind, sym)`` (see
-    ``_dim_info``); the within-stick axis maps last -> last.  Unmatched output
-    axes get extent 1 (to be broadcast).  Returns ``(reshape_to, broadcast_to)``
-    -- reshape the operand to ``reshape_to`` (skip if it already equals
-    ``in_block``) then broadcast to ``broadcast_to`` (``None`` to skip).
-    Returns ``None`` when the operand already matches the output (fast path:
-    no reshape / broadcast emitted, keeping simple kernels byte-identical).
+    Example, a per-row value read by a [16, 8, 64] op::
 
-    Raises ``NotImplementedError`` when no reshape lines the operand up (see
-    ``_match_axes``), because that operand needs a restickify, and (from
-    ``_dim_info``) for a coordinate form it cannot classify.
+        in_coords  [c0, Mod(c2, 64)]          in_block  [16, 64]
+        out_coords [c0, c1, Mod(c2, 64)]      out_block [16, 8, 64]
+        -> ([16, 1, 64], [16, 8, 64])
+
+    Args:
+        in_coords, in_block: the operand's device coordinates and sizes.
+        out_coords, out_block: the output's device coordinates and sizes.
+
+    Returns:
+        ``None`` when the operand already matches the output, so no reshape
+        or broadcast is emitted and simple kernels stay byte-identical.
+        Otherwise ``(reshape_to, broadcast_to)``: reshape the operand to
+        ``reshape_to`` (skip if it already equals ``in_block``), then broadcast
+        it to ``broadcast_to`` (``None`` to skip).
+
+    Raises:
+        NotImplementedError: when no reshape lines the operand up (its axes
+            are permuted, or an axis holding data has no partner), because it
+            needs a restickify; and, from ``_dim_info``, for a coordinate form
+            it cannot classify.
     """
     in_block = [int(b) for b in in_block]
     out_block = [int(b) for b in out_block]
@@ -700,9 +734,7 @@ def relayout_strides(
     extent, out_strides, symbol_dims = _relayout_loops(
         out_terms, out_size, split_by_input, ranges
     )
-    in_strides = _relayout_input_strides(
-        in_terms, in_size, extent, symbol_dims, ranges
-    )
+    in_strides = _relayout_input_strides(in_terms, in_size, extent, symbol_dims, ranges)
     return tuple(extent), tuple(in_strides), tuple(out_strides)
 
 
