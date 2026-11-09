@@ -84,10 +84,10 @@ internal implementation details into user-facing pages.
 These are the errors that have actually reached doc PRs here and been caught
 in review. Check against each before claiming a section is done.
 
-- **A registration is not the same as eager support.** A lowering or a
-  decomposition is the compiled path. Do not read a `@register_spyre_lowering`
-  and mark the op Eager = Y. See section 1b for the exact rule and the
-  `run_eager=False` check.
+- **A registration is not the same as eager support.** Section 1b holds the
+  full rule and the `run_eager=False` check. The short version: a
+  `@register_spyre_lowering` or a custom-op lowering is the compiled path, so
+  it does not by itself earn Eager = Y.
 - **Do not document behavior the code does not produce.** Trace the claim to
   the line that implements it, and prefer to confirm by the op's test. Real
   examples that slipped through: a claim that `F.embedding` zeroes the
@@ -109,6 +109,9 @@ in review. Check against each before claiming a section is done.
   `torch.spyre.set_downcast_warning`). Grep the symbol before writing it.
 - **Describe the current state only.** No "previously", "used to", or
   before-and-after framing; fold new behavior into the current-state text.
+  If another skill or `AGENTS.md` states this same rule, keep the wording
+  in one place and reference it rather than restating it, so the copies do
+  not drift.
 
 ## 1. Supported Operations Table
 
@@ -151,8 +154,12 @@ decomposition that auto-installs a PrivateUse1 kernel (the five named
 above). A `@register_spyre_lowering` or a custom-op lowering is the
 `torch.compile` path only. When an op has just a lowering, it is
 Compiled = Y and the Eager column stays blank. This is the single most
-repeated error in doc PRs (`torch.nn.functional.gelu`, `torch.trunc`):
-seeing a registration and assuming it means eager.
+repeated error in doc PRs: seeing a registration and assuming it means
+eager. `torch.nn.functional.gelu` is the standing example: the
+`spyre::gelu` custom op has a lowering but no eager kernel, so it is
+compiled-only. (Pick a currently compiled-only op when citing an example
+here; an op can gain an eager path later, as `torch.trunc` did once it
+joined `COMPILED_OPS`.)
 
 To verify the Eager column:
   - Read `eager.py` (including the `COMPILED_OPS` list) and `fallbacks.py`
@@ -161,7 +168,9 @@ To verify the Eager column:
     `tests/inductor/test_inductor_ops.py`. If it runs with
     `run_eager=False`, the op is compiled-only and MUST NOT have Eager =
     Y. If no test runs it eagerly and it has only a lowering, it is
-    compiled-only.
+    compiled-only. `run_eager=False` can be set either in the test body
+    (as in `test_trunc_cpu`) or in the op's `PARAMS` param set, so check
+    both.
   - Ops registered through `register_fallback` should appear under
     the "CPU Fallback" section of the table with Execution = "CPU
     fallback".
