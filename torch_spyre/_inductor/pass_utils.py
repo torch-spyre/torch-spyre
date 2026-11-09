@@ -292,6 +292,24 @@ def prepend_dim_valid_elements(
     return shifted
 
 
+def insert_dim_valid_elements(
+    stl: SpyreTensorLayout,
+    dim: int,
+    new_dim_size: int,
+) -> dict[tuple[int, ...], int]:
+    """Add a new device dimension at index ``dim``.
+
+    Shifts the existing dim indices at or after ``dim`` by +1. The new dim has
+    new_dim_size valid elements.
+    """
+    shifted = {
+        tuple(d + 1 if d >= dim else d for d in key): val
+        for key, val in stl.valid_elements.items()
+    }
+    shifted[(dim,)] = new_dim_size
+    return shifted
+
+
 def restickify_valid_elements(
     stl: SpyreTensorLayout,
     old_sd_outer_dim: int,
@@ -1305,19 +1323,27 @@ def restickify_sweep_dim(
     """Index of the gap dim a size-1 restickify sweeps on its intact operand, if any.
 
     When the host dim on one side of a restickify has size 1, the padding pass
-    (``_pad_elided_dim``) gives the other, intact operand an outermost
-    size-``elems_per_stick`` dim that holds no data (``stride_map`` 0) and that
-    nothing indexes (coordinate 0). Codegen (``_restickify_restore_elided_dim``)
-    later binds a loop variable to it, and the kernel sweeps all its slices on
-    every core.  Work division and codegen both find the dim through this rule, so
-    the span check counts the same dim the kernel sweeps.  Without a stride map
-    there is no gap dim to find.
+    (``_pad_elided_dim``) gives the other, intact operand a size-``elems_per_stick``
+    dim that holds no data (``stride_map`` 0) and that nothing indexes (coordinate
+    0): just outside the stick dim, or outermost for a graph output.  Codegen
+    (``_restickify_restore_elided_dim``) later binds a loop variable to it, and the
+    kernel sweeps all its slices on every core.  Work division and codegen both
+    find the dim through this rule, so the span check counts the same dim the
+    kernel sweeps.  It is the innermost non-stick dim of that kind.  Without a
+    stride map there is no gap dim to find.
     """
     if stride_map is None:
         return None
-    if len(device_size) < 2 or device_size[0] != elems_per_stick:
-        return None
-    return 0 if stride_map[0] == 0 and device_coords[0] == 0 else None
+    return next(
+        (
+            i
+            for i in range(len(device_size) - 2, -1, -1)
+            if device_size[i] == elems_per_stick
+            and stride_map[i] == 0
+            and device_coords[i] == 0
+        ),
+        None,
+    )
 
 
 def is_restickify_coords(in_coords: list[Expr], out_coords: list[Expr]) -> bool:
