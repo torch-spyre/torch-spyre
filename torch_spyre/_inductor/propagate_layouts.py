@@ -2743,7 +2743,7 @@ def _scan_mutation_layout_inputs(
             in_args = _get_prop_args([first_read], strict=False)
             in_arg = in_args[0] if in_args else None
             alt_stl = _find_alt_target_stl(
-                target_layout, target_stl, output_dep, in_arg
+                target_layout, target_stl, output_dep, in_arg, is_graph_input
             )
             if alt_stl is None:
                 continue
@@ -2891,6 +2891,7 @@ def _find_alt_target_stl(
     target_stl: SpyreTensorLayout,
     output_dep: MemoryDep,
     in_arg: PropArg | None = None,
+    is_graph_input: bool = False,
 ) -> SpyreTensorLayout | None:
     """Alt SpyreTensorLayout with an offset-free stick expression for a mutation
     target, or None if the current layout already works; raises Unsupported if no
@@ -2919,10 +2920,15 @@ def _find_alt_target_stl(
         target_coords, output_dep, c_size, c_stride, write_stick, dtype_for_layout
     )
     if not candidates:
-        # Try restickify so each stick holds one element and the write is offset-free.
-        result = compute_size1_restickify_target(target_stl, target_layout, output_dep)
-        if result is not None:
-            return result
+        # Try restickify so each stick holds one element and the write is
+        # offset-free. Not for a graph input: its layout is caller-visible and
+        # would grow by a stick per element.
+        if not is_graph_input:
+            result = compute_size1_restickify_target(
+                target_stl, target_layout, output_dep
+            )
+            if result is not None:
+                return result
         raise Unsupported(
             f"no offset-free alternative stick dim for mutation target "
             f"(write stick {write_stick!r}, size={target_layout.size})"

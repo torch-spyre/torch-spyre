@@ -1487,11 +1487,13 @@ def _sort_ties(shape, mod, dtype):
 
 
 def _sort_inf_input(dim):
-    # fp16 with +-inf elements near the front of the sort dim (67 is unsplittable).
+    # fp16 with one inf near the front of every line along the sort dim (67 is
+    # unsplittable): +inf in half the lines, -inf in the rest.
     shape = (67, 16) if dim == 0 else (16, 67)
     x = (torch.arange(67 * 16) * 7 % 5).reshape(shape).half()
-    x.narrow(dim, 0, 2).fill_(float("inf"))
-    x.narrow(dim, 5, 2).fill_(float("-inf"))
+    lines = x.movedim(dim, -1)
+    lines[:8, 0] = float("inf")
+    lines[8:, 5] = float("-inf")
     return x
 
 
@@ -11294,10 +11296,21 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_sort_values_cpu(self, x, dim: int, descending: bool):
         # Values only, so the sort is still checked while the int64 index
         # cast is an expected failure in test_sort.
-        self.compare_with_cpu(
-            lambda x: torch.sort(x, dim=dim, descending=descending, stable=True)[0],
-            x,
-        )
+        def fn(x):
+            return torch.sort(x, dim=dim, descending=descending, stable=True)[0]
+
+        if x.dtype == torch.float16 and torch.isinf(x).any():
+            # Host infinities are finite +/-2^32 on device. The sort preserves
+            # them, but the additional LX arithmetic may overflow to NINF.
+            ref_input = x.to(torch.float64)
+            ref_input = torch.where(
+                torch.isinf(ref_input),
+                ref_input.sign() * DLFLOAT16_INF_SENTINEL,
+                ref_input,
+            )
+            self.compare_with_cpu(fn, x, dlfloat16_reference=fn(ref_input))
+        else:
+            self.compare_with_cpu(fn, x)
 
     def test_sort_unstable_cpu(self, x, dim: int, descending: bool):
         # Without stable=True ties may come out in any order, so only the
