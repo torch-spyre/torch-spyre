@@ -447,8 +447,13 @@ def test_unsupported_shardings_fail_at_compile(shape_per_shard, dim):
         # redistribution; positive once that exists.
         (lambda x, y: x + y, "unsharded", "every operand sharded with the same"),
         (lambda x, y: x + y, "shard1", "every operand sharded with the same"),
-        # Non-unified reductions are not implemented.
-        (lambda x, y: x.sum(0) + y.sum(0), "shard0", "pointwise ops only"),
+        # TODO: cross-shard reductions (this one reduces the shard dim);
+        # shard-local reductions are covered in test_sharded_reduction.py.
+        (
+            lambda x, y: x.sum(0) + y.sum(0),
+            "shard0",
+            "reductions that keep the shard dim only",
+        ),
         # TODO: in-place writes into sharded storage.
         (lambda x, y: x.add_(y), "shard0", "in-place writes into sharded"),
         # TODO: sharded intermediates.
@@ -713,7 +718,7 @@ def test_inputs_usable_after_compile_rejection():
     a = _sharded(src, 0, n)
     b = _sharded(src.clone(), 0, n)
 
-    with pytest.raises(RuntimeError, match="pointwise ops only"):
+    with pytest.raises(RuntimeError, match="reductions that keep the shard dim only"):
         torch.compile(lambda x, y: x.sum(0) + y.sum(0), dynamic=False)(a, b)
 
     # Same tensors still work in a supported compile afterwards.
