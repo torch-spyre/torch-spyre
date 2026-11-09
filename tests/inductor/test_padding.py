@@ -21,6 +21,7 @@ requiring end-to-end compilation to succeed. The remaining classes compile and
 run on the device and compare against CPU.
 """
 
+import dataclasses
 import math
 import unittest
 from unittest.mock import patch
@@ -35,6 +36,7 @@ from torch._inductor.ir import (
     ComputedBuffer,
     FixedLayout,
     InputBuffer,
+    MutationLayoutSHOULDREMOVE,
     Operation,
     Reduction,
 )
@@ -1722,6 +1724,62 @@ class TestMatmulCoordinateMaskingNaN(unittest.TestCase):
         )
 
 
+@dataclasses.dataclass(frozen=True)
+class _BufferRecord:
+    """One ``ComputedBuffer``'s layout as pre-scheduling left it.
+
+    The fields are copies, not the layout itself. Kernel preparation can later
+    demote a buffer out of LX by clearing its layout's allocation in place, and
+    the record has to keep what LX planning chose.
+
+    Attributes:
+        is_output: Whether the buffer is a graph output.
+        device_size: The buffer's device size.
+        allocation: The buffer's allocation, e.g. ``{"lx": 0}``; empty for HBM.
+    """
+
+    is_output: bool
+    device_size: list[int]
+    allocation: dict[str, int]
+
+
+class _RecordLayouts(CustomPreSchedulingPasses):
+    """Pre-scheduling passes that record every ``ComputedBuffer``'s layout.
+
+    Patch this class over ``passes.CustomPreSchedulingPasses``. After the
+    built-in passes, including LX planning, it stores a :class:`_BufferRecord`
+    per ``ComputedBuffer``, keyed by buffer name. Constants
+    (``SpyreConstantFallback``) are not recorded.
+
+    Records collect on the class across compiles until :meth:`drain` is called,
+    so call it before the compile as well as after.
+    """
+
+    _seen: dict[str, _BufferRecord] = {}
+
+    @classmethod
+    def drain(cls) -> dict[str, _BufferRecord]:
+        """Return the records made since the last drain, and clear them."""
+        seen = cls._seen
+        cls._seen = {}
+        return seen
+
+    def __call__(self, graph):
+        super().__call__(graph)
+        outputs = set(graph.get_output_names())
+        for op in graph.operations:
+            if not isinstance(op, ComputedBuffer):  # skip the constants
+                continue
+            layout = op.get_layout()
+            if isinstance(layout, MutationLayoutSHOULDREMOVE):
+                layout = layout.real_layout()
+            type(self)._seen[op.name] = _BufferRecord(
+                is_output=op.name in outputs,
+                device_size=list(layout.device_layout.device_size),
+                allocation=dict(layout.allocation),
+            )
+
+
 @t_inductor_config.patch("force_disable_caches", True)
 @instantiate_parametrized_tests
 class TestPaddedInputCoreDivision(unittest.TestCase):
@@ -1734,23 +1792,29 @@ class TestPaddedInputCoreDivision(unittest.TestCase):
     """
 
     @staticmethod
-    def _run_times_two(x: torch.Tensor) -> tuple[torch.Tensor, list[str]]:
-        """Compile ``2 * x`` and run it on ``x``; return the output and the
-        generated source.
+    def _compile_and_run(
+        x: torch.Tensor, f: Callable[[torch.Tensor], torch.Tensor] = lambda t: 2 * t
+    ) -> tuple[torch.Tensor, list[str]]:
+        """Compile ``f`` (default: ``lambda t: 2 * t``) and run it on ``x``;
+        return the output and the generated source.
 
         ``run_and_get_code`` resets Dynamo first, so every call compiles afresh.
         """
-        return run_and_get_code(torch.compile(lambda t: 2 * t, dynamic=False), x)
+        return run_and_get_code(torch.compile(f, dynamic=False), x)
 
     @staticmethod
     def _padded_rows_input(
-        rows: int, padded_rows: int
+        rows: int, padded_rows: int, x_cpu: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
         """Return a CPU tensor, its device copy with the row dim padded to
-        ``padded_rows``, and the padded ``device_size``."""
-        # Round to bf16 so the values are exact in dl16, Spyre's on-device
-        # format; then 2*x is exact, too.
-        x_cpu = cached_randn((rows, 64)).bfloat16().half()
+        ``padded_rows``, and the padded ``device_size``.
+
+        ``x_cpu``, if given, must be ``(rows, 64)`` and exact in dl16, Spyre's
+        on-device format. Otherwise, it is generated and rounded through bf16,
+        which dl16 represents exactly.
+        """
+        if x_cpu is None:
+            x_cpu = cached_randn((rows, 64)).bfloat16().half()
 
         base = SpyreTensorLayout([rows, 64], torch.float16)
         ds = list(base.device_size)
@@ -1767,7 +1831,7 @@ class TestPaddedInputCoreDivision(unittest.TestCase):
         """The compiled output inherits the padded layout, including the real
         row count in ``valid_elements``, not just the padded ``device_size``."""
         x_cpu, x_spyre, ds = self._padded_rows_input(rows, padded_rows)
-        out, _ = self._run_times_two(x_spyre)
+        out, _ = self._compile_and_run(x_spyre)
 
         torch.testing.assert_close(out.cpu(), x_cpu * 2, atol=0.0, rtol=0.0)
         self.assertEqual(
@@ -1775,13 +1839,60 @@ class TestPaddedInputCoreDivision(unittest.TestCase):
             {(0, 2): 64, (1,): rows},
         )
 
-    @parametrize(
-        "rows,padded_rows,sencores",
-        [
-            (61, 64, 4),
-            (251, 256, 8),
-        ],
+    @parametrize("rows,padded_rows,sencores", [(61, 64, 4), (251, 256, 8)])
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason=(
+            "A row-padded intermediate stays in HBM: _would_produce_lx_back_gap "
+            "measures coverage from the host ranges (e.g. 61 rows), sees the "
+            "padded device_size (64) as a backGap, and refuses LX (#741)"
+        ),
     )
+    def test_pointwise_intermediates_land_in_lx(
+        self, rows, padded_rows, sencores
+    ) -> None:
+        """A padded intermediate between two pointwise ops is allocated in LX.
+
+        ``2 * t + 1`` on a row-padded input compiles to two ops. The
+        intermediate ``2 * t`` inherits the input's padded ``device_size``,
+        and both ops split the padded rows evenly across the cores. Each core
+        then covers its whole share of the buffer, with no ``backGap``, so LX
+        planning should place the intermediate in LX like an unpadded one.
+
+        The input values are multiples of 1/4 with at most 8 significant bits,
+        and so are ``2 * t`` and ``2 * t + 1``. Every value is exact in dl16,
+        so the comparison with CPU uses ``atol=rtol=0``.
+        """
+        _RecordLayouts.drain()
+        # The test expects exactly one intermediate. Boundary clones can add an
+        # aten.clone ComputedBuffer at a graph input or output, so turn them off.
+        with (
+            patch.object(passes, "CustomPreSchedulingPasses", _RecordLayouts),
+            patch.object(allocator, "clone_at_graph_boundaries", lambda: False),
+            patch.object(scratchpad_utils, "clone_at_graph_boundaries", lambda: False),
+            ts_inductor_config.patch(sencores=sencores, lx_planning=True),
+        ):
+            gen = torch.Generator().manual_seed(0)
+            k = torch.randint(-120, 121, (rows, 64), generator=gen)
+            x_cpu = (k / 4).half()
+            x_cpu, x_spyre, ds = self._padded_rows_input(rows, padded_rows, x_cpu)
+
+            def f(t):
+                return 2 * t + 1
+
+            out, _ = self._compile_and_run(x_spyre, f)
+            torch.testing.assert_close(out.cpu(), 2 * x_cpu + 1, atol=0.0, rtol=0.0)
+
+        non_outputs = [r for r in _RecordLayouts.drain().values() if not r.is_output]
+        self.assertEqual(
+            len(non_outputs), 1, "expected one intermediate buffer for 2*t"
+        )
+        intermediate = non_outputs[0]
+        self.assertEqual(intermediate.device_size, ds)
+        self.assertIn("lx", intermediate.allocation)
+
+    @parametrize("rows,padded_rows,sencores", [(61, 64, 4), (251, 256, 8)])
     def test_pointwise_splits_padded_rows(self, rows, padded_rows, sencores) -> None:
         """A pointwise op on a row-padded input splits the padded rows across
         all cores.
@@ -1793,7 +1904,7 @@ class TestPaddedInputCoreDivision(unittest.TestCase):
         """
         with ts_inductor_config.patch("sencores", sencores):
             x_cpu, x_spyre, ds = self._padded_rows_input(rows, padded_rows)
-            out, source_codes = self._run_times_two(x_spyre)
+            out, source_codes = self._compile_and_run(x_spyre)
 
             # Multiplying by two is exact in fp16.
             torch.testing.assert_close(out.cpu(), x_cpu * 2, atol=0.0, rtol=0.0)
@@ -1851,7 +1962,7 @@ class TestPaddedInputCoreDivision(unittest.TestCase):
             pytest.raises(Exception, match="_resize_device_layout"),
         ):
             _, x_spyre, _ = self._padded_rows_input(rows, padded_rows)
-            self._run_times_two(x_spyre)
+            self._compile_and_run(x_spyre)
 
 
 if __name__ == "__main__":
