@@ -283,10 +283,11 @@ def _counter_init_failure(while_op: "ir.WhileLoop") -> str | None:
 
     The trip count ``N`` of ``lt(counter, N)`` is the number of iterations only
     if the counter starts at 0. The frontend's counter (``carried_inputs[0]``)
-    is always ``torch.zeros([], int64)``, which reaches the IR as a
-    ``MultiOutput`` of an ``aten.full.default`` ``FallbackKernel`` with no
-    tensor inputs. Anything else -- a caller-provided tensor, a different fill
-    value, a non-scalar -- is not proven.
+    is always ``torch.zeros([], int64)``, which reaches the IR as an
+    ``aten.full.default`` ``FallbackKernel`` with no tensor inputs. Before
+    PyTorch 2.14 its output was wrapped in a ``MultiOutput``; 2.14 returns the
+    kernel directly. Both representations must satisfy the same checks.
+    A caller-provided tensor, a different fill value, or a non-scalar is not proven.
     """
     from torch._inductor import ir
 
@@ -302,12 +303,15 @@ def _counter_init_failure(while_op: "ir.WhileLoop") -> str | None:
         )
     if isinstance(init, ir.ComputedBuffer):
         return _pointwise_zero_failure(init)
-    if not isinstance(init, ir.MultiOutput):
+    if isinstance(init, ir.FallbackKernel):
+        kernel = init
+    elif isinstance(init, ir.MultiOutput):
+        kernel = init.inputs[0] if init.inputs else None
+    else:
         return (
             "counter init is a "
             f"{type(init).__name__}, not a constant fill the prover can read"
         )
-    kernel = init.inputs[0] if init.inputs else None
     if not isinstance(kernel, ir.FallbackKernel):
         return "counter init is not produced by a fallback kernel"
     if getattr(kernel, "op_overload", None) is not torch.ops.aten.full.default:
@@ -934,6 +938,7 @@ def _inline_marker_into_consumer(
 
     from torch_spyre._inductor.pass_utils import (
         _invalidate_body_caches,
+        invalidate_op_read_writes,
         replace_computed_buffer_body,
     )
 
@@ -960,6 +965,9 @@ def _inline_marker_into_consumer(
 
         object.__setattr__(consumer_op.data, "output_indexer", new_output_indexer)
     _invalidate_body_caches(consumer_op.data)
+    # As in redirect_computed_buffer_reads: the replacement starts unmemoized,
+    # but consumer_op already reads through the patched data.
+    invalidate_op_read_writes(consumer_op)
 
     result = replace_computed_buffer_body(
         consumer_op,
@@ -2395,6 +2403,24 @@ def _prune_unsafe_identity_selections(
             selected.pop(name, None)
 
 
+def _is_declared_carry_update(op: Any) -> bool:
+    """True for an op that is the update of a declared loop carry.
+
+    Until ``apply_loop_carries`` puts it in place, a carry update has a plain
+    ``FixedLayout``; before that pass existed it carried the mutation layout
+    from the splice on, and so no contraction pass below could pick it up. These
+    passes must still leave it alone: they remove or shrink ops, and the update
+    has to keep its full size and name for the pass that writes it in place.
+
+    No known graph reaches this check: it restores the earlier behaviour (a
+    carry update was never a candidate) and has no test that depends on it.
+    """
+    from torch_spyre._inductor.loop_info import LoopCarryRecord
+
+    record = getattr(op, "_loop_carry_record", None)
+    return isinstance(record, LoopCarryRecord) and record.update_name == op.get_name()
+
+
 def _contract_cross_scope_input_materializations(
     graph: Any,
     pending_levels: list[tuple[sympy.Symbol, sympy.Expr, int, list[str]]],
@@ -2635,8 +2661,10 @@ def _contract_cross_scope_input_materializations(
             transforms = {}
             for name in chain_names:
                 op = graph.try_get_buffer(name)
-                if not isinstance(op, ir.ComputedBuffer) or not isinstance(
-                    op.layout, FixedLayout
+                if (
+                    not isinstance(op, ir.ComputedBuffer)
+                    or not isinstance(op.layout, FixedLayout)
+                    or _is_declared_carry_update(op)
                 ):
                     valid_chain = False
                     break
@@ -2940,6 +2968,7 @@ def _contract_exact_stride_input_materializations(
                     not has_level_advance
                     or coefficient == 0
                     or not isinstance(layout, FixedLayout)
+                    or _is_declared_carry_update(producer)
                 ):
                     continue
                 axes = [
@@ -3005,8 +3034,11 @@ def _contract_exact_stride_input_materializations(
                 source_axis = selected[source_name][0]
                 source_layout = getattr(source, "layout", None)
                 layout = getattr(op, "layout", None)
-                if not isinstance(source_layout, FixedLayout) or not isinstance(
-                    layout, FixedLayout
+                if (
+                    not isinstance(source_layout, FixedLayout)
+                    or not isinstance(layout, FixedLayout)
+                    or _is_declared_carry_update(op)
+                    or _is_declared_carry_update(source)
                 ):
                     continue
                 source_stride = source_layout.stride[source_axis]
