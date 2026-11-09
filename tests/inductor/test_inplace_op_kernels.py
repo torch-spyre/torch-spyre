@@ -92,6 +92,7 @@ ANCHOR_OPS = [
     "aten::div_.Scalar_mode",
     "aten::div_.Tensor",
     "aten::div_.Tensor_mode",
+    "aten::floor_divide_.Scalar",
     "aten::mul_.Scalar",
     "aten::mul_.Tensor",
     "aten::relu_",
@@ -99,7 +100,7 @@ ANCHOR_OPS = [
     "aten::sub_.Tensor",
 ]
 
-# The derivation finds 37 overloads today. A floor (rather than an equality)
+# The derivation finds 40 overloads today. A floor (rather than an equality)
 # lets ops be added or legitimately dropped without churn, while still catching
 # a broad collapse that leaves only the anchors standing.
 MIN_DERIVED_OPS = 30
@@ -151,7 +152,7 @@ def test_derivation_is_not_degenerate():
     return ``None``, ``COMPILED_OPS`` being renamed, the overload filter
     tightening) would collect zero cases and the suite would go green while
     silently testing nothing. Verified: stubbing ``_functional_sibling`` to
-    return ``None`` takes the derivation from 37 overloads to 0.
+    return ``None`` takes the derivation from 40 overloads to 0.
 
     This test is *not* parametrized, so it always runs and always asserts.
     """
@@ -168,6 +169,20 @@ def test_derivation_is_not_degenerate():
         f"derivation collapsed to {len(ops)} overloads (expected at least "
         f"{MIN_DERIVED_OPS}); the parametrized guard below is no longer "
         "covering the registration"
+    )
+
+
+def test_floor_divide_tensor_inplace_has_spyre_kernel():
+    """``floor_divide_.Tensor`` is registered explicitly, not derived.
+
+    Its functional (Tensor, Tensor) overload is ``floor_divide.default``, so
+    ``_functional_sibling`` (name-based) cannot pair it and the derived list in
+    :func:`_spyre_kernel_ops` never includes it. Without the explicit
+    registration ``x //= tensor`` fails with "Could not run
+    'aten::floor_divide_.Tensor' ... 'spyre' backend".
+    """
+    assert torch._C._dispatch_has_kernel_for_dispatch_key(
+        aten.floor_divide_.Tensor.name(), "PrivateUse1"
     )
 
 

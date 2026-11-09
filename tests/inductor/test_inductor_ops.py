@@ -1230,6 +1230,14 @@ def _floor_div(a, b):
     return torch.div(a, b, rounding_mode="floor")
 
 
+def _floordiv_inplace(x, y):
+    # ``x //= y`` -> aten::floor_divide_.{Scalar,Tensor}; work on a clone so the
+    # shared param tensor is not mutated across eager/CPU runs.
+    x = x.clone()
+    x //= y
+    return x
+
+
 def _attention_fn(q, k, v, scale=True):
     d_k = q.size(-1)
     scores = q @ k.transpose(-2, -1)
@@ -9724,13 +9732,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     32,
                     lambda x, s: x // s,
                 ),
-                "int64_floor_divide_scalar": (
-                    torch.tensor(
-                        [0, 1, 31, 32, 33, 63, 64] + [0] * 121, dtype=torch.int64
-                    )
-                    + 31,
-                    32,
-                    torch.floor_divide,
+                # floor_divide.out
+                "int64_floor_divide_out": (
+                    torch.tensor([0, 1, 31, 32, 33, 63, 64, 100], dtype=torch.int64),
+                    torch.tensor([32, 32, 32, 32, 32, 32, 32, 7], dtype=torch.int64),
+                    lambda x, y: torch.floor_divide(x, y, out=torch.empty_like(x)),
                 ),
                 "int64_floordiv_neg": (
                     torch.tensor([-12, -21, 31, -7], dtype=torch.int64),
@@ -9741,6 +9747,23 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     torch.tensor([0, 1, 31, 32, 33, 63, 64, 100], dtype=torch.int64),
                     torch.tensor([32, 32, 32, 32, 32, 32, 32, 7], dtype=torch.int64),
                     lambda x, y: x // y,
+                ),
+                # fp16: negative dividends/divisors exercise rounding toward -inf
+                "fp16_floor_divide_neg": (
+                    torch.tensor([-7, 7, -12, 9, -9, 0, 5, -1], dtype=torch.float16),
+                    torch.tensor([2, -2, 4, -4, 3, 5, -3, 8], dtype=torch.float16),
+                    torch.floor_divide,
+                ),
+                # in-place: floor_divide_.Scalar / floor_divide_.Tensor
+                "int64_floordiv_inplace_scalar": (
+                    torch.tensor([-12, -21, 31, 32, 33, 63, 64, 0], dtype=torch.int64),
+                    4,
+                    _floordiv_inplace,
+                ),
+                "int64_floordiv_inplace_tensor": (
+                    torch.tensor([0, 1, 31, 32, 33, 63, 64, 100], dtype=torch.int64),
+                    torch.tensor([32, 32, 32, 32, 32, 32, 32, 7], dtype=torch.int64),
+                    _floordiv_inplace,
                 ),
             },
         },

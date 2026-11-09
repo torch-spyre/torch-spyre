@@ -629,6 +629,14 @@ def register_inplace_kernels(ops):
 
 register_inplace_kernels(COMPILED_OPS)
 
+# ``register_inplace_kernels`` cannot derive ``floor_divide_.Tensor``: it pairs
+# overloads by name, but the functional (Tensor, Tensor) overload is
+# ``floor_divide.default``, not ``floor_divide.Tensor``. Register it explicitly
+# so ``x //= tensor`` works (``floor_divide_.Scalar`` is derived normally).
+torch.library.register_kernel("aten::floor_divide_.Tensor", ["spyre"])(
+    _make_inplace_kernel(aten.floor_divide.default)
+)
+
 
 # cumsum's decomposition covers only aten.cumsum.default; out= and in-place
 # (cumsum_ reaches cumsum.out) run it and copy_ the result, like
