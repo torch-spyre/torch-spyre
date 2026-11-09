@@ -1184,6 +1184,57 @@ class WorkDivisionContext:
         default_factory=dict, init=False, repr=False, compare=False
     )
 
+    @classmethod
+    def from_op_iteration_space(
+        cls,
+        op: ComputedBuffer,
+        oi_space: OpIterationSpace,
+        max_cores: int | None = None,
+    ) -> "WorkDivisionContext":
+        """The context for dividing ``op`` over ``oi_space``.
+
+        ``oi_space``'s extents are the ones divided, whether padded or a tiled
+        frame's. The op's constraints are collected against them with nothing
+        committed yet, and the span floors are computed in the same frame.
+
+        The scheduler transport's check is the exception: it judges a split
+        against ``op``'s own, untiled and unpadded extents, the frame the
+        transport decodes in (see ``representable_by_index_coeff``), so
+        ``transport_it_space`` is read off ``op``, not ``oi_space``. The
+        transport indexes are still chosen from ``oi_space``; the choice depends
+        only on the iteration symbols, not their extents.
+
+        Raises ``Unsupported`` where :func:`_compute_span_floors` does.
+        """
+        constraint_ctx = WorkDivConstraintContext.from_op_iteration_space(
+            op, oi_space, committed_splits={}
+        )
+        constraints = collect_work_division_constraints(constraint_ctx)
+        span_min_splits = (
+            _compute_span_floors(constraint_ctx, constraints, oi_space.symbol_meta)
+            if _has_span_floors(op)
+            else {}
+        )
+        indexes = work_division_transport_indexes(
+            op, op_read_writes(op), oi_space.it_space
+        )
+        write_index, read_index = indexes if indexes is not None else (None, None)
+        return cls(
+            op=op,
+            max_cores=max_cores,
+            it_space=oi_space.it_space,
+            it_space_adjusted=oi_space.it_space_adjusted,
+            stick_vars=oi_space.stick_vars,
+            symbol_meta=oi_space.symbol_meta,
+            tensor_deps=oi_space.tensor_deps,
+            reduction_vars=oi_space.reduction_vars,
+            constraints=constraints,
+            span_min_splits=span_min_splits,
+            write_index=write_index,
+            read_index=read_index,
+            transport_it_space=iteration_space_from_op(op),
+        )
+
     @property
     def axes(self) -> list[Symbol]:
         """The divisible axes, in the order a candidate split is keyed by."""
@@ -1331,7 +1382,6 @@ def work_division_context_for_op(
     a span relaxes them. Raises ``Unsupported`` where
     :func:`_compute_span_floors` does.
     """
-    transport_it_space = iteration_space_from_op(op)
     frame_it_space = None
     if tiling is not None and not tiling.is_untiled:
         from .wsr.tile_prediction import predict_frame
@@ -1340,43 +1390,9 @@ def work_division_context_for_op(
         if frame is None:
             return None
         frame_it_space = frame.iter_space
-    rw = op_read_writes(op)
-    args = _apply_input_layout_overrides(op, get_mem_deps_from_rw(rw))
+    args = _apply_input_layout_overrides(op, get_mem_deps_from_rw(op_read_writes(op)))
     oi_space = make_op_iteration_space(op, args, frame_it_space)
-
-    constraint_ctx = WorkDivConstraintContext(
-        op=op,
-        it_space=oi_space.it_space,
-        it_space_adjusted=oi_space.it_space_adjusted,
-        output_td=oi_space.output_td,
-        input_tds=oi_space.input_tds,
-        stick_vars=oi_space.stick_vars,
-        reduction_vars=oi_space.reduction_vars,
-        committed_splits={},
-    )
-    constraint_result = collect_work_division_constraints(constraint_ctx)
-    span_min_splits = (
-        _compute_span_floors(constraint_ctx, constraint_result, oi_space.symbol_meta)
-        if _has_span_floors(op)
-        else {}
-    )
-    indexes = work_division_transport_indexes(op, rw, oi_space.it_space)
-    write_index, read_index = indexes if indexes is not None else (None, None)
-    return WorkDivisionContext(
-        op=op,
-        max_cores=max_cores,
-        it_space=oi_space.it_space,
-        it_space_adjusted=oi_space.it_space_adjusted,
-        stick_vars=oi_space.stick_vars,
-        symbol_meta=oi_space.symbol_meta,
-        tensor_deps=oi_space.tensor_deps,
-        reduction_vars=oi_space.reduction_vars,
-        constraints=constraint_result,
-        span_min_splits=span_min_splits,
-        write_index=write_index,
-        read_index=read_index,
-        transport_it_space=transport_it_space,
-    )
+    return WorkDivisionContext.from_op_iteration_space(op, oi_space, max_cores)
 
 
 def enumerate_work_division_candidates(
@@ -2419,15 +2435,8 @@ def work_distribution_pass(
     """
     oi_space = make_op_iteration_space(op, args)
 
-    constraint_ctx = WorkDivConstraintContext(
-        op=op,
-        it_space=oi_space.it_space,
-        it_space_adjusted=oi_space.it_space_adjusted,
-        output_td=oi_space.output_td,
-        input_tds=oi_space.input_tds,
-        stick_vars=oi_space.stick_vars,
-        reduction_vars=oi_space.reduction_vars,
-        committed_splits={},
+    constraint_ctx = WorkDivConstraintContext.from_op_iteration_space(
+        op, oi_space, committed_splits={}
     )
     constraint_result = collect_work_division_constraints(constraint_ctx)
     blocked = constraint_result.blocked
