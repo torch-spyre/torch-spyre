@@ -46,7 +46,13 @@ import sys
 import tempfile
 from typing import Any
 
-from split_execution_bench import MODES, WORKLOADS, _run_child
+from split_execution_bench import (
+    MODES,
+    TILE_SIZES,
+    WORKLOADS,
+    _run_child,
+    build_compiled,
+)
 
 # Profiler/calibration settings recommended for the split-execution trace tests.
 PROFILER_ENV = {
@@ -123,7 +129,9 @@ def trace_metrics(trace_events: list[dict]) -> dict[str, Any]:
     }
 
 
-def _child_profile(shape: tuple[int, int, int], num_launches: int) -> dict[str, Any]:
+def _child_profile(
+    shape: tuple[int, int, int], tile_size: int | None, num_launches: int
+) -> dict[str, Any]:
     """Child: profile num_launches back-to-back mm launches once."""
     import torch
     import torch._dynamo
@@ -146,7 +154,7 @@ def _child_profile(shape: tuple[int, int, int], num_launches: int) -> dict[str, 
         )
         for _ in range(num_launches)
     ]
-    compiled = torch.compile(torch.mm, backend="inductor")
+    compiled = build_compiled(tile_size)
     compiled(*pairs[0])  # compile outside the profiled region
     torch.accelerator.synchronize(device)
 
@@ -214,6 +222,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="spyre_profile_cache_") as cache:
         for wl in workloads:
             shape = WORKLOADS[wl]
+            tile_size = TILE_SIZES.get(wl)
             per_mode: dict[str, list[dict[str, Any]]] = {mode: [] for mode in MODES}
             for rnd in range(ns.rounds):
                 for mode, flag in MODES.items():
@@ -224,7 +233,10 @@ def main() -> int:
                         **PROFILER_ENV,
                     }
                     out = _run_child(
-                        env, _child_profile, (shape, ns.launches), ns.timeout
+                        env,
+                        _child_profile,
+                        (shape, tile_size, ns.launches),
+                        ns.timeout,
                     )
                     if out["tracker_enabled"] != (flag == "1"):
                         raise RuntimeError(
@@ -242,6 +254,7 @@ def main() -> int:
 
             results["workloads"][wl] = {
                 "shape_mkn": list(shape),
+                "tile_size": tile_size,
                 "summary": {mode: _aggregate(r) for mode, r in per_mode.items()},
                 "rounds": per_mode,
             }

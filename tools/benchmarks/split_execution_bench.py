@@ -44,16 +44,48 @@ import traceback
 from typing import Any
 
 # name -> (M, K, N). mm_large is device-bound (kernel time >> host compute).
+# mm_tiled is the same matmul split along M with for_each_tile (see TILE_SIZES),
+# so one launch carries several tiles' program corrections.
 WORKLOADS: dict[str, tuple[int, int, int]] = {
     "mm_large": (1024, 8192, 1024),
     "mm_small": (256, 1024, 256),
+    "mm_tiled": (1024, 1024, 1024),
 }
+
+# Workloads built with for_each_tile: name -> tile size along M.
+TILE_SIZES: dict[str, int] = {"mm_tiled": 256}
 
 MODES = {"tracker_on": "1", "tracker_off": "0"}
 
 
+def build_compiled(tile_size: int | None) -> Any:
+    """Compiled mm; split along M into tile_size-row tiles when given."""
+    import torch
+
+    if tile_size is None:
+        return torch.compile(torch.mm, backend="inductor")
+
+    from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
+
+    def tiled_mm(x: Any, y: Any) -> Any:
+        def body(_: Any, ops: Any) -> Any:
+            x_tile, y_whole = ops
+            return None, x_tile @ y_whole
+
+        _, out = for_each_tile(
+            body, (x, y), dims=(0, None), tile_size=tile_size, out_dim=0
+        )
+        return out
+
+    return torch.compile(tiled_mm, backend="inductor", fullgraph=True)
+
+
 def _child_bench(
-    shape: tuple[int, int, int], num_launches: int, reps: int, warmup: int
+    shape: tuple[int, int, int],
+    tile_size: int | None,
+    num_launches: int,
+    reps: int,
+    warmup: int,
 ) -> dict[str, Any]:
     """Child: return per-launch latency in ms for each timed repetition."""
     import torch
@@ -75,7 +107,7 @@ def _child_bench(
         )
         for _ in range(num_launches)
     ]
-    compiled = torch.compile(torch.mm, backend="inductor")
+    compiled = build_compiled(tile_size)
 
     held_bytes: list[int] = []
 
@@ -202,6 +234,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="spyre_bench_cache_") as cache:
         for wl in workloads:
             shape = WORKLOADS[wl]
+            tile_size = TILE_SIZES.get(wl)
             for depth in ns.launches:
                 samples: dict[str, list[float]] = {mode: [] for mode in MODES}
                 held: dict[str, list[float]] = {mode: [] for mode in MODES}
@@ -215,7 +248,7 @@ def main() -> int:
                         out = _run_child(
                             env,
                             _child_bench,
-                            (shape, depth, ns.reps, ns.warmup),
+                            (shape, tile_size, depth, ns.reps, ns.warmup),
                             ns.timeout,
                         )
                         if out["tracker_enabled"] != (flag == "1"):
@@ -241,6 +274,7 @@ def main() -> int:
                     {
                         "workload": wl,
                         "shape_mkn": list(shape),
+                        "tile_size": tile_size,
                         "launches": depth,
                         "summary": summary,
                         "on_over_off_median": ratio,
