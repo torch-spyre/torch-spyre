@@ -2919,6 +2919,7 @@ def _find_alt_target_stl(
         target_coords, output_dep, c_size, c_stride, write_stick, dtype_for_layout
     )
     if not candidates:
+        # Try restickify so each stick holds one element and the write is offset-free.
         result = compute_size1_restickify_target(target_stl, target_layout, output_dep)
         if result is not None:
             return result
