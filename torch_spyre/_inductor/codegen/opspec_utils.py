@@ -463,12 +463,15 @@ def _relayout_loops(
 
     There is one loop per output device axis, in the output's order, with one
     exception: a bare output axis over a symbol that the input stores as stick +
-    lane becomes two loops, ``(n_sticks, 64)``.  The input's address is linear in
+    lane becomes two loops, ``(n_sticks, stick)``.  ``stick`` is the number of
+    lanes in one stick, read off the input's coordinate divisor: 64 at fp16 and 32
+    at fp32, so the same logical dim has twice as many sticks at fp32.  The
+    input's address is linear in
     the stick index and in the lane, but not in the symbol itself, so a single
     loop over it could not be given one input stride.
 
     That split is made even when the symbol is exactly one stick long, giving
-    ``(1, 64)``.  So for ``n`` loop symbols the loop count is:
+    ``(1, stick)``.  So for ``n`` loop symbols the loop count is:
 
       - ``n + 2`` when the stick moves (the input's stick symbol is not the
         output's): the output's own stick symbol is two axes already, and the
@@ -476,8 +479,8 @@ def _relayout_loops(
       - ``n + 1`` when the stick stays: only the shared stick symbol is two axes.
 
     A single-stick symbol could be left as one loop, giving ``n + 1`` for a
-    moved stick too (the ``(1, 64)`` loop pair walks the same addresses as one
-    loop of 64).  That collapse is not done, so every moved-stick relayout has
+    moved stick too (the ``(1, stick)`` loop pair walks the same addresses as one
+    loop of ``stick``).  That collapse is not done, so every moved-stick relayout has
     the same loop structure.  A symbol shorter than a stick is not split; the
     input's lane axis for it is refused as padded by ``_relayout_input_strides``.
 
@@ -485,7 +488,7 @@ def _relayout_loops(
         out_terms: ``_stick_term(coord)`` for each output device coordinate.
         out_size: the output's device sizes.
         split_by_input: for each symbol the input stores as stick + lane, the
-            number of lanes in a stick (64).
+            number of lanes in a stick (64 at fp16, 32 at fp32).
         ranges: how many values each symbol takes.
 
     Returns:
@@ -496,7 +499,7 @@ def _relayout_loops(
         symbol_dims: for each symbol, the loops it is made of, as
             ``(loop, weight)`` pairs with ``sym == sum(weight * index[loop])``.
             A symbol on one loop is ``[(d, 1)]``; one split into stick and lane
-            is ``[(d, 64), (d + 1, 1)]``.
+            is ``[(d, stick), (d + 1, 1)]``.
 
     Raises:
         NotImplementedError: the output walks a symbol on two axes, an axis's
@@ -702,6 +705,15 @@ def relayout_strides(
            in_strides (1048576, 8192, 1, 64, 16384)
            out_strides (1048576, 524288, 8192, 64, 1)
 
+    The same transpose at fp32 has 32-lane sticks, so ``c2`` (64) is now two
+    sticks on the output and ``c1`` (128) four on the input::
+
+        in_coords  [c2, floor(c1/32), c0, Mod(c1, 32)]   in_size  [64, 4, 128, 32]
+        out_coords [c1, floor(c2/32), c0, Mod(c2, 32)]   out_size [128, 2, 128, 32]
+        -> extent (4, 32, 2, 128, 32)
+           in_strides (4096, 1, 524288, 32, 16384)
+           out_strides (262144, 8192, 4096, 32, 1)
+
     Args:
         in_coords, in_size: the input's device coordinates, in terms of the
             iteration symbols, and its device sizes.
@@ -710,7 +722,7 @@ def relayout_strides(
 
     Returns:
         extent: the loop bounds, i.e. the output's device axes, where an axis
-            the input stores as stick + lane is split into ``(n_sticks, 64)``,
+            the input stores as stick + lane is split into ``(n_sticks, stick)``,
             even when ``n_sticks`` is 1.  For ``n`` loop symbols that is
             ``n + 2`` loops when the stick moves and ``n + 1`` when it stays.
         in_strides, out_strides: how far each buffer's address moves per loop.

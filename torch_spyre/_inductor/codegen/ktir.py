@@ -1220,6 +1220,16 @@ def _access(
 THREADED_SPACES: tuple[str, ...] = ("lx",)
 POOL_SPACE = "hbm_pool"
 
+# The device formats a copy op (``Recipe.copy``) may be emitted at.  A copy's
+# payload yields its operand at whatever element type it was loaded, so the
+# format does not change what the KTIR computes; it changes the stick, which a
+# relayout reads off each coordinate's divisor (64 lanes at fp16, 32 at fp32)
+# rather than assuming.  An fp32 tensor therefore has twice as many sticks as
+# the same logical fp16 tensor along a dim that touches the stick.
+RELAYOUT_FORMATS: frozenset[DataFormats] = frozenset(
+    {DataFormats.SEN169_FP16, DataFormats.IEEE_FP32}
+)
+
 
 def is_threaded(arg: TensorArg) -> bool:
     """Whether this buffer is carried as an SSA value: no base, no view, no store.
@@ -1962,9 +1972,9 @@ class KernelPlan:
 
         Asked of every copy recipe (``Recipe.copy``), whichever path builds its
         step, so that whether an identity's operands happen to need a relayout
-        does not decide whether a threaded, fused-arrangement or non-fp16 copy is
-        let through.  Both buffers must reach memory, at fp16, in the standard
-        element arrangement.
+        does not decide whether a threaded, fused-arrangement or unsupported-format
+        copy is let through.  Both buffers must reach memory, in the standard
+        element arrangement, at one of ``RELAYOUT_FORMATS``.
         """
         for arg in (source, out):
             if is_threaded(arg):
@@ -1980,12 +1990,11 @@ class KernelPlan:
                     f"{_arrangement(arg)!r}",
                 )
         dtype = dtype_of(spec)
-        if dtype != DataFormats.SEN169_FP16:
-            # The payload would serve any format; the backend's transpose
-            # lowering has only been run at fp16.
+        if dtype not in RELAYOUT_FORMATS:
             _unimplemented(
                 "relayout-format",
-                f"{spec.op!r} at {dtype.name}; a relayout is emitted at fp16 only",
+                f"{spec.op!r} at {dtype.name}; a relayout is emitted at "
+                f"{', '.join(sorted(f.name for f in RELAYOUT_FORMATS))} only",
             )
 
     def _relayout_step(

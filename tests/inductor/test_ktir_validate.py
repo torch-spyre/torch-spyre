@@ -282,9 +282,52 @@ RELAYOUT_CASES = {
 }
 
 
-def make_relayout_op_spec(case: str = "2d_64x64", **overrides) -> OpSpec:
-    """One relayout from ``RELAYOUT_CASES``, through ``make_op_spec``."""
-    op, (in_size, in_coords), (out_size, out_coords), ranges = RELAYOUT_CASES[case]
+# The same transposes at fp32, as the frontend hands them over.  A stick is 128
+# bytes, so it holds 32 fp32 lanes where it holds 64 fp16 ones: a dim that
+# touches the stick has twice as many sticks as it does at fp16, and the
+# coordinates divide by 32.  Each key names its shape; the fp16 entry of the
+# same name in ``RELAYOUT_CASES`` (where there is one) is the same logical
+# tensor.  Every entry here is at ``DataFormats.IEEE_FP32``.
+RELAYOUT_CASES_FP32 = {
+    # 2D [64, 64] transposed: one stick a side at fp16, two at fp32.
+    "2d_64x64": (
+        "ReStickifyOpHBM",
+        ([2, 64, 32], [sympy.floor(_C0 / 32), _C1, sympy.Mod(_C0, 32)]),
+        ([2, 64, 32], [sympy.floor(_C1 / 32), _C0, sympy.Mod(_C1, 32)]),
+        {_C0: 64, _C1: 64},
+    ),
+    # [128, 64, 128].transpose(1, 2): c2 (64) is one stick at fp16 and two at
+    # fp32, so at fp32 both stick symbols span more than one stick.
+    "3d_128x64x128": (
+        "ReStickifyOpHBM",
+        ([64, 4, 128, 32], [_C2, sympy.floor(_C1 / 32), _C0, sympy.Mod(_C1, 32)]),
+        ([128, 2, 128, 32], [_C1, sympy.floor(_C2 / 32), _C0, sympy.Mod(_C2, 32)]),
+        {_C0: 128, _C1: 128, _C2: 64},
+    ),
+    # [4, 8, 64].permute(1, 0, 2) as ``identity``: the stick stays, and at fp32
+    # its 64 elements are two sticks.
+    "p102_4x8x64": (
+        IDENTITY_OP,
+        ([8, 2, 4, 32], [_C1, sympy.floor(_C2 / 32), _C0, sympy.Mod(_C2, 32)]),
+        ([4, 2, 8, 32], [_C0, sympy.floor(_C2 / 32), _C1, sympy.Mod(_C2, 32)]),
+        {_C0: 4, _C1: 8, _C2: 64},
+    ),
+}
+
+
+def make_relayout_op_spec(
+    case: str = "2d_64x64", *, fp32: bool = False, **overrides
+) -> OpSpec:
+    """One relayout from ``RELAYOUT_CASES``, or ``RELAYOUT_CASES_FP32`` at fp32.
+
+    ``fp32=True`` takes the fp32 coordinates (32-lane sticks) and sets the
+    format to ``IEEE_FP32``; giving fp16 coordinates an fp32 format would
+    describe a layout the frontend never produces.
+    """
+    table = RELAYOUT_CASES_FP32 if fp32 else RELAYOUT_CASES
+    op, (in_size, in_coords), (out_size, out_coords), ranges = table[case]
+    if fp32:
+        overrides.setdefault("dtype", DataFormats.IEEE_FP32)
     divisions = overrides.pop("divisions", {})
     return make_op_spec(
         overrides.pop("op", op),
@@ -2534,20 +2577,81 @@ class TestRelayout(unittest.TestCase):
         ),
     }
 
+    # The same as ``EXPECTED_SHAPE_STRIDES``, for ``RELAYOUT_CASES_FP32``.  A stick
+    # is 32 lanes at fp32, so every split is ``(n_sticks, 32)`` and a dim that
+    # touches the stick has twice the sticks it has at fp16.
+    EXPECTED_SHAPE_STRIDES_FP32 = {
+        # n = 2, stick moves c0 -> c1.  c0 is 2 sticks, split (2, 32): n + 2.
+        # At fp16 the same tensor is (1, 1, 64, 64).
+        "2d_64x64": ((2, 2, 32, 32), (1024, 2048, 1, 32), (2048, 1024, 32, 1)),
+        # n = 3, stick moves c1 -> c2.  c1 is 4 sticks, split (4, 32); c2 is 2
+        # sticks on the output side: n + 2.  At fp16 c2 is a single stick.
+        "3d_128x64x128": (
+            (4, 32, 2, 128, 32),
+            (4096, 1, 524288, 32, 16384),
+            (262144, 8192, 4096, 32, 1),
+        ),
+        # n = 3, the stick stays: n + 1.  Its 64 elements are 2 sticks at fp32.
+        "p102_4x8x64": ((4, 2, 8, 32), (32, 128, 256, 1), (512, 256, 32, 1)),
+    }
+
     @staticmethod
-    def strides(case: str) -> tuple:
-        _op, (in_size, in_coords), (out_size, out_coords), ranges = RELAYOUT_CASES[case]
+    def strides(case: str, *, fp32: bool = False) -> tuple:
+        table = RELAYOUT_CASES_FP32 if fp32 else RELAYOUT_CASES
+        _op, (in_size, in_coords), (out_size, out_coords), ranges = table[case]
         return relayout_strides(in_coords, in_size, out_coords, out_size, ranges)
 
-    def test_strides_for_the_frontend_shapes(self):
+    def expectations(self):
+        """``(case, fp32, expected)`` for every case at both formats."""
         for case, expected in self.EXPECTED_SHAPE_STRIDES.items():
+            yield case, False, expected
+        for case, expected in self.EXPECTED_SHAPE_STRIDES_FP32.items():
+            yield case, True, expected
+
+    def test_strides_for_the_frontend_shapes(self):
+        for case, fp32, expected in self.expectations():
+            with self.subTest(case=case, fp32=fp32):
+                self.assertEqual(self.strides(case, fp32=fp32), expected)
+
+    def test_every_fp32_case_has_an_expectation(self):
+        """The fp32 table and its expectations name the same cases."""
+        self.assertEqual(
+            sorted(self.EXPECTED_SHAPE_STRIDES_FP32), sorted(RELAYOUT_CASES_FP32)
+        )
+
+    def test_fp32_sticks_are_32_lanes(self):
+        """Every split of an fp32 case is 32 lanes, and none is 64.
+
+        The stick size is read off each coordinate's divisor rather than
+        assumed, so an fp32 relayout must never produce a 64-lane loop: the
+        innermost loop is a lane, and so is the inner half of each split.
+        """
+        for case in RELAYOUT_CASES_FP32:
             with self.subTest(case=case):
-                self.assertEqual(self.strides(case), expected)
+                extent, _in_strides, _out_strides = self.strides(case, fp32=True)
+                self.assertEqual(extent[-1], 32)
+                self.assertNotIn(64, extent)
+
+    def test_fp32_has_twice_the_sticks_of_fp16(self):
+        """A dim that touches the stick has twice the sticks at fp32.
+
+        Compared on the device sizes the two tables give for the same logical
+        tensor: the product of each buffer's sizes is the same element count,
+        and the lane axis is half as wide at fp32.
+        """
+        for case, fp32 in RELAYOUT_CASES_FP32.items():
+            with self.subTest(case=case):
+                fp16 = RELAYOUT_CASES[case]
+                self.assertEqual(fp16[3], fp32[3])  # the same logical ranges
+                for side in (1, 2):  # input, output
+                    size16, size32 = fp16[side][0], fp32[side][0]
+                    self.assertEqual(math.prod(size16), math.prod(size32))
+                    self.assertEqual((size16[-1], size32[-1]), (64, 32))
 
     def test_the_output_is_row_major_and_only_the_input_is_strided(self):
-        for case in RELAYOUT_CASES:
-            with self.subTest(case=case):
-                extent, in_strides, out_strides = self.strides(case)
+        for case, fp32, _expected in self.expectations():
+            with self.subTest(case=case, fp32=fp32):
+                extent, in_strides, out_strides = self.strides(case, fp32=fp32)
                 self.assertEqual(list(out_strides), row_major_strides(extent))
                 self.assertNotEqual(list(in_strides), row_major_strides(extent))
 
@@ -2628,11 +2732,15 @@ class TestRelayout(unittest.TestCase):
             )
 
     def test_the_plan_step_is_an_identity_generic_over_a_strided_input(self):
-        """Each frontend layout reaches a copy plan with its derived strides."""
-        for case, expected in self.EXPECTED_SHAPE_STRIDES.items():
+        """Each frontend layout reaches a copy plan with its derived strides.
+
+        At both formats: an fp32 relayout is the same copy over 32-lane sticks,
+        and both of its accesses are typed ``f32``.
+        """
+        for case, fp32, expected in self.expectations():
             extent, in_strides, out_strides = expected
-            with self.subTest(case=case):
-                plan = ktir.build_kernel_plan([make_relayout_op_spec(case)])
+            with self.subTest(case=case, fp32=fp32):
+                plan = ktir.build_kernel_plan([make_relayout_op_spec(case, fp32=fp32)])
                 [step] = plan.steps
                 identity = tuple(range(len(extent)))
                 self.assertIs(step.surface, ktir.Surface.GENERIC)
@@ -2644,11 +2752,16 @@ class TestRelayout(unittest.TestCase):
                 self.assertEqual(step.out.extent, extent)
                 self.assertEqual(step.out.buffer.layout.strides, out_strides)
                 self.assertTrue(step.store)
+                elem = "f32" if fp32 else "f16"
+                self.assertEqual(
+                    (source.elems.storage, step.out.elems.storage), (elem, elem)
+                )
 
     def test_refusals(self):
         refusals = {
             "relayout-tiling": {"divisions": {"c1": 2}},
-            "relayout-format": {"dtype": DataFormats.IEEE_FP32},
+            # fp16 and fp32 are emitted (``ktir.RELAYOUT_FORMATS``); int32 is not.
+            "relayout-format": {"dtype": DataFormats.IEEE_INT32},
             "relayout-threaded": {"allocations": [None, {"lx": 0}]},
             "relayout-element-arrangement": {"arrangements": [ElementArrangement.EXX2]},
         }
@@ -2668,10 +2781,15 @@ class TestRelayoutDetection(unittest.TestCase):
         return spec.args[0], spec.args[1]
 
     def test_every_frontend_layout_is_detected(self):
-        """Each case, restickify or identity, needs its operand moved."""
-        for case in RELAYOUT_CASES:
-            with self.subTest(case=case):
-                self.assertTrue(needs_relayout(*self.args(case)))
+        """Each case, restickify or identity, needs its operand moved.
+
+        At fp32 too: detection reads the coordinates, whose stick divisor is 32.
+        """
+        for fp32, table in ((False, RELAYOUT_CASES), (True, RELAYOUT_CASES_FP32)):
+            for case in table:
+                with self.subTest(case=case, fp32=fp32):
+                    spec = make_relayout_op_spec(case, fp32=fp32)
+                    self.assertTrue(needs_relayout(spec.args[0], spec.args[1]))
 
     def test_aligned_and_broadcast_operands_are_not_relayouts(self):
         """A reshape or broadcast (or nothing) lines these up, so no move."""
@@ -2777,7 +2895,7 @@ class TestRelayoutDetection(unittest.TestCase):
     def test_a_same_layout_copy_keeps_the_copy_refusals(self):
         """A plain copy is refused where a relayout would be, by the same label."""
         for label, overrides in {
-            "relayout-format": {"dtype": DataFormats.IEEE_FP32},
+            "relayout-format": {"dtype": DataFormats.IEEE_INT32},
             "relayout-threaded": {"allocations": [None, {"lx": 0}]},
             "relayout-element-arrangement": {"arrangements": [ElementArrangement.EXX2]},
         }.items():
