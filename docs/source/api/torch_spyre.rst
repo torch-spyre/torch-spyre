@@ -332,11 +332,15 @@ FFDC (First Failure Data Capture)
    Retrieval does not require that variable, even if it was unset in a
    later session. The directory **does** have to match: if
    ``TORCHINDUCTOR_CACHE_DIR`` (or ``TMPDIR``) differs between capture
-   and retrieval, pass the original ``output_dir`` explicitly.
+   and retrieval, pass the original **report** directory as
+   ``output_dir`` — ``<cache-root>/torch-spyre/ffdc_reports`` (or
+   ``<tempdir>/torch-spyre-ffdc`` on the fallback path), **not** the
+   cache or ``TMPDIR`` root. This function searches ``output_dir`` for
+   JSON files; it does not append ``torch-spyre/ffdc_reports``.
 
-   :param output_dir: Directory to search. If ``None``, uses
-       ``<Inductor cache root>/torch-spyre/ffdc_reports``, where the cache
-       root is ``$TORCHINDUCTOR_CACHE_DIR`` or else
+   :param output_dir: Directory containing FFDC JSON files. If ``None``,
+       uses ``<Inductor cache root>/torch-spyre/ffdc_reports``, where the
+       cache root is ``$TORCHINDUCTOR_CACHE_DIR`` or else
        ``<tempdir>/torchinductor_<user>`` from Inductor ``cache_dir()``
        (not ``~/.cache/torch/inductor``). ``<tempdir>`` is
        ``tempfile.gettempdir()``, typically ``/tmp`` on Linux, or
@@ -357,8 +361,9 @@ FFDC (First Failure Data Capture)
           print(report["_report_path"])
 
    The same function is also available as
-   ``torch_spyre.profiler.get_diagnostic_report``. For usage workflow,
-   report locations, and JSON triage, see
+   ``torch_spyre.profiler.get_diagnostic_report``. For the enable →
+   fail → retrieve → triage workflow, report schema, and
+   interpretation notes, see
    :doc:`../user_guide/profiling/ffdc`.
 
 Tensor Operations
@@ -768,7 +773,8 @@ Environment Variables
    * - ``TORCH_SPYRE_TIMING``
      - Record structured per-compile frontend timings: one JSON event per
        pass pipeline and per pass, with input/output graph sizes and
-       analysis-call counts (default ``0``)
+       analysis-call counts, plus PyTorch's own compile phases (default
+       ``0``)
    * - ``TORCH_SPYRE_TIMING_OUT``
      - Destination for the ``TORCH_SPYRE_TIMING`` record. The pid is
        inserted before the suffix, so ``rec.json`` is written as
