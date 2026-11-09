@@ -624,7 +624,7 @@ def _compute_coordinates_uncached(
         if _is_concrete_int(range_val) and int(range_val) <= 1:
             vars_to_zero.add(s)
     if vars_to_zero:
-        index = index.xreplace({s: 0 for s in vars_to_zero})
+        index = index.xreplace({s: sympy.S.Zero for s in vars_to_zero})
 
     # Check for reversed traversal on iteration variables
     vars_in_index = index.free_symbols
@@ -641,6 +641,11 @@ def _compute_coordinates_uncached(
                         "reversed traversal of a tensor dimension cannot "
                         "be expressed as a device coordinate"
                     )
+
+    # Indirect symbols are bounded by ``indirect_sizes``, not ``var_ranges``;
+    # without their range the decomposition cannot prove they never carry.
+    if indirect_sizes:
+        var_ranges = {**var_ranges, **indirect_sizes}
 
     n = len(size)
     coordinates = [sympy.S.Zero] * n
