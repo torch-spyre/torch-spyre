@@ -5743,16 +5743,17 @@ class TestRestickifySweepSpan(unittest.TestCase):
         )
         self.assertTrue(all(s == 1 for s in splits.values()), splits)
 
-    def test_inner_size64_dim_is_not_a_sweep_dim(self):
-        # Only the outermost position is a gap dim: an inner size-64 dim with
-        # coordinate 0 sits inside the split dim, so the coordinate span covers it.
+    def test_inner_gap_dim_sweep_shrinks_with_the_split(self):
+        # The gap dim just outside the stick dim is swept one stick apart, inside
+        # each core's share of the split dim: 32 cores cut the span 32 ways.
         rows = 2**21 + 2048
         intact, _, it_space, d0 = self._restickify_tds(rows, gap_outermost=False)
-        self.assertIsNone(intact.sweep_dim)
-        self.assertEqual(
-            work_division_module.get_per_core_span(intact, {d0: 32}, it_space, {}),
-            work_division_module._coordinate_span(intact, {d0: 32}, it_space, {}),
-        )
+        self.assertEqual(intact.sweep_dim, 1)
+        whole = 64 * (rows // 64) * 64 * 2
+        span = work_division_module.get_per_core_span
+        self.assertEqual(span(intact, {d0: 1}, it_space, {}), whole)
+        self.assertEqual(span(intact, {d0: 32}, it_space, {}), whole // 32)
+        self.assertLessEqual(whole // 32, work_division_module.MAX_SPAN_BYTES)
 
     def test_non_restickify_op_has_no_sweep_dim(self):
         # A copy whose stick stays on the same host dim is an identity, even when

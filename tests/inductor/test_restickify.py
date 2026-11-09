@@ -2777,11 +2777,15 @@ _SIZE1_HOST_STRIDE = [469, 7, 1]
 _SIZE1_STICK = 64  # SEN169_FP16 elems_per_stick
 
 
-def test_size1_grow_prepends_size64_gap_dim():
+def _size1_collapsed_buf():
+    """A stub buffer with the [7,67,1] size-1 collapsed layout.
+
+    _pad_elided_dim reads buf.get_layout() and get_name() and writes buf.layout;
+    this stub is all the ComputedBuffer surface it touches.
+    """
     from torch_spyre._C import DataFormats, ElementArrangement
     from torch_spyre._C import SpyreTensorLayout as _CSpyreTensorLayout
     from torch_spyre._inductor.ir import FixedTiledLayout
-    from torch_spyre._inductor.padding import _pad_elided_dim
 
     # _C.SpyreTensorLayout takes device_size LITERALLY (unlike torch.spyre's
     # SpyreTensorLayout, which treats the first arg as a host shape and re-derives
@@ -2797,8 +2801,6 @@ def test_size1_grow_prepends_size64_gap_dim():
         DEVICE, torch.float16, list(_SIZE1_HOST_SIZE), list(_SIZE1_HOST_STRIDE), stl
     )
 
-    # _pad_elided_dim reads buf.get_layout() and writes buf.layout; a 2-line stub
-    # is all the ComputedBuffer surface it touches.
     class _StubBuf:
         def __init__(self, layout):
             self.layout = layout
@@ -2806,18 +2808,50 @@ def test_size1_grow_prepends_size64_gap_dim():
         def get_layout(self):
             return self.layout
 
-    buf = _StubBuf(layout)
-    _pad_elided_dim(buf)
+        def get_name(self):
+            return "buf0"
+
+    return _StubBuf(layout)
+
+
+class _StubGraph:
+    def __init__(self, outputs):
+        self._outputs = outputs
+
+    def get_output_names(self):
+        return self._outputs
+
+
+def test_size1_grow_inserts_size64_gap_dim_outside_stick():
+    from torch_spyre._inductor.padding import _pad_elided_dim
+
+    buf = _size1_collapsed_buf()
+    _pad_elided_dim(buf, _StubGraph([]))
 
     dl = buf.layout.device_layout
-    # An outermost size-64 gap dim (stride_map -1) is prepended; the original
-    # device dims follow unchanged.
-    assert list(dl.device_size) == [_SIZE1_STICK, *_SIZE1_COLLAPSED_DEVICE_SIZE]
-    assert list(dl.stride_map) == [-1, *_SIZE1_COLLAPSED_STRIDE_MAP]
+    # A size-64 gap dim (stride_map -1) goes just outside the stick dim, so its
+    # slices are one stick apart; the original device dims are unchanged.
+    *outer, stick = _SIZE1_COLLAPSED_DEVICE_SIZE
+    *outer_map, stick_map = _SIZE1_COLLAPSED_STRIDE_MAP
+    assert list(dl.device_size) == [*outer, _SIZE1_STICK, stick]
+    assert list(dl.stride_map) == [*outer_map, -1, stick_map]
     # Allocation is 128B/stick * prod(device_size[:-1]) (get_device_size_in_bytes
-    # in spyre_tensor_impl.cpp); the prepended dim grows it exactly 64x.
+    # in spyre_tensor_impl.cpp); the gap dim grows it exactly 64x.
     alloc_bytes = 128 * math.prod(list(dl.device_size)[:-1])
     assert alloc_bytes == 64 * 8576 == 548864
+
+
+def test_size1_grow_prepends_size64_gap_dim_for_graph_output():
+    from torch_spyre._inductor.padding import _pad_elided_dim
+
+    # The host<->device copy cannot place an inner gap dim on every graph output,
+    # so a graph output keeps it outermost.
+    buf = _size1_collapsed_buf()
+    _pad_elided_dim(buf, _StubGraph(["buf0"]))
+
+    dl = buf.layout.device_layout
+    assert list(dl.device_size) == [_SIZE1_STICK, *_SIZE1_COLLAPSED_DEVICE_SIZE]
+    assert list(dl.stride_map) == [-1, *_SIZE1_COLLAPSED_STRIDE_MAP]
 
 
 def _size1_restickify_op_spec():
@@ -2888,6 +2922,33 @@ def test_size1_restore_reuses_prepended_dim():
     assert op_spec.iteration_space[shared] == (_SIZE1_STICK, 1)
 
 
+def test_size1_restore_binds_inner_gap_dim():
+    import sympy
+
+    from torch_spyre._inductor.spyre_kernel import _restickify_restore_elided_dim
+
+    # The gap dim just outside the stick dim, as _pad_elided_dim places it for a
+    # buffer that is not a graph output: the restore binds that dim, not dim 0.
+    op_spec = _size1_restickify_op_spec()
+    out_arg = op_spec.args[1]
+    c = next(iter(op_spec.iteration_space))
+    out_arg.device_size = [67, 1, 64, 64]
+    out_arg.device_coordinates = [
+        c,
+        sympy.Integer(0),
+        sympy.Integer(0),
+        sympy.Mod(c, 64),
+    ]
+
+    _restickify_restore_elided_dim(op_spec)
+
+    assert list(out_arg.device_size) == [67, 1, 64, 64]
+    (shared,) = out_arg.device_coordinates[2].free_symbols
+    assert shared.name.startswith("rs")
+    assert out_arg.device_coordinates[0] == c
+    assert op_spec.iteration_space[shared] == (_SIZE1_STICK, 1)
+
+
 def test_size1_restore_asserts_when_phantom_absent():
     from torch_spyre._inductor.spyre_kernel import _restickify_restore_elided_dim
 
@@ -2946,8 +3007,8 @@ def test_sparse_to_dense_restickify_has_one_size64_dim():
     fn, x, y = _sum_plus_dense(256)
     result, sizes = _restickify_output_sizes(fn, x, y)
     torch.testing.assert_close(result, fn(x, y), atol=0, rtol=0)
-    # One gap dim: [64, 4, 64], not [64, 64, 4, 64].
-    assert sizes == [[64, 4, 64]]
+    # One gap dim, just outside the stick dim: [4, 64, 64], not [64, 64, 4, 64].
+    assert sizes == [[4, 64, 64]]
 
 
 @pytest.mark.parametrize("rows", [65536, 524288], ids=["8MiB", "64MiB"])

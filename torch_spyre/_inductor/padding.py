@@ -673,9 +673,9 @@ def _pad_device_dim(
     )
 
 
-def _pad_elided_dim(buf: ComputedBuffer) -> None:
-    """Pad ``buf``'s allocation by prepending an outermost size-64 gap dim, for a
-    restickify whose transposed dim was elided to a size-1 device dim.
+def _pad_elided_dim(buf: ComputedBuffer, graph: GraphLowering) -> None:
+    """Pad ``buf``'s allocation with a size-64 gap dim, for a restickify whose
+    transposed dim was elided to a size-1 device dim.
 
     The transposed dim is a non-stick dim here -- the new stick on the input side,
     the old stick on the output side -- that pairs with the stick on the other
@@ -683,18 +683,31 @@ def _pad_elided_dim(buf: ComputedBuffer) -> None:
     a size-1 dim with ``stride_map == -1``, and its allocation holds one plane, but
     the paired stick needs 64.
 
-    Prepending a size-64 gap dim makes the allocation cover all 64 planes.  This
-    only bumps the dim size; a later pass, ``_restickify_restore_elided_dim``,
-    creates the shared iteration variable that pairs this dim with the stick on the
-    other operand.
+    The gap dim makes the allocation cover all 64 planes.  It goes just outside the
+    stick dim, so its 64 slices are one stick apart and each core's sweep stays
+    inside its own share of the dims work division splits.  Outermost, every core
+    would sweep the whole tensor, and the backend's 21-bit stick offset would cap
+    the restickify at 256 MiB.  This only bumps the dim size; a later pass,
+    ``_restickify_restore_elided_dim``, creates the shared iteration variable that
+    pairs this dim with the stick on the other operand.
+
+    A graph output keeps the gap dim outermost, and with it the 256 MiB limit,
+    which the per-core span check reports as ``Unsupported``.
     """
     layout = buf.get_layout()
     assert isinstance(layout, FixedTiledLayout)
     stl = layout.device_layout
     stick = stl.elems_per_stick()
+    if buf.get_name() in graph.get_output_names():
+        # TODO: place the gap dim inside for a graph output too; the
+        # host<->device copy finds the stick-count dim by position and rejects
+        # an inner gap dim at three or more host dims.
+        at = 0
+    else:
+        at = len(stl.device_size) - 1
     grown_stl = SpyreTensorLayout(
-        [stick, *stl.device_size],
-        [-1, *stl.stride_map],
+        [*stl.device_size[:at], stick, *stl.device_size[at:]],
+        [*stl.stride_map[:at], -1, *stl.stride_map[at:]],
         stl.device_dtype,
         stl.element_arrangement,
     )
@@ -732,7 +745,7 @@ def _pad_restickify_output(op: Operation, graph: GraphLowering) -> None:
     stl = out_layout.device_layout
 
     if old_sym is None:
-        _pad_elided_dim(op)
+        _pad_elided_dim(op, graph)
         logger.debug(
             "insert_restickify_padding: grew size-1 output %s allocation",
             op.get_name(),
@@ -1109,9 +1122,9 @@ def _pad_restickify_input(op: Operation, graph: GraphLowering) -> None:
 
     # --- Pad the input. ---
     if size1:
-        # Prepend an outermost size-64 gap dim so the elided size-1 dim's
-        # allocation covers the full stick the restickify sweeps.
-        _pad_elided_dim(in_buf)
+        # Add a size-64 gap dim so the elided size-1 dim's allocation covers the
+        # full stick the restickify sweeps.
+        _pad_elided_dim(in_buf, graph)
     else:
         assert new_stick_dim is not None  # set in the size>1 gate above
         assert padded_dim_size is not None  # computed alongside it

@@ -2038,12 +2038,12 @@ def _restickify_restore_elided_dim(op_spec) -> None:
 
     - ELIDED operand: its stick is rebuilt as
       ``[floor(new_sym/64)] + real_dims + [Mod(new_sym, 64)]``.
-    - INTACT operand: ``new_sym`` binds to the outermost size-64 gap dim that
-      covers the 64-plane sweep (``restickify_sweep_dim``), the one the padding
-      pass (``_pad_elided_dim``) prepends.  ``new_sym`` has iteration RANGE 1, so
-      it only ever takes the value 0: SDSC codegen's back-gap mechanism absorbs
-      the size-64-vs-range-1 gap and it contributes no real stride to either
-      operand.
+    - INTACT operand: ``new_sym`` binds to the size-64 gap dim that covers the
+      64-plane sweep (``restickify_sweep_dim``), the one the padding pass
+      (``_pad_elided_dim``) adds just outside the stick dim, or outermost for a
+      graph output.  ``new_sym`` has iteration RANGE 1, so it only ever takes the
+      value 0: SDSC codegen's back-gap mechanism absorbs the size-64-vs-range-1
+      gap and it contributes no real stride to either operand.
     """
     assert len(op_spec.args) == 2, f"restickify op_spec has {len(op_spec.args)} args"
     in_arg, out_arg = op_spec.args[0], op_spec.args[1]

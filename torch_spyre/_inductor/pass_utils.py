@@ -922,16 +922,22 @@ def restickify_sweep_dim(
     """Index of the gap dim a size-1 restickify sweeps on its intact operand, if any.
 
     When the host dim on one side of a restickify has size 1, the padding pass
-    (``_pad_elided_dim``) gives the other, intact operand an outermost
-    size-``elems_per_stick`` dim that nothing indexes (coordinate 0). Codegen
-    (``_restickify_restore_elided_dim``) later binds a loop variable to it, and the
-    kernel sweeps all its slices on every core.  Work division and codegen both
-    find the dim through this rule, so the span check counts the same dim the
-    kernel sweeps.
+    (``_pad_elided_dim``) gives the other, intact operand a size-``elems_per_stick``
+    dim that nothing indexes (coordinate 0): just outside the stick dim, or
+    outermost for a graph output.  Codegen (``_restickify_restore_elided_dim``)
+    later binds a loop variable to it, and the kernel sweeps all its slices on
+    every core.  Work division and codegen both find the dim through this rule, so
+    the span check counts the same dim the kernel sweeps.  It is the innermost
+    non-stick dim of that size with coordinate 0.
     """
-    if len(device_size) < 2 or device_size[0] != elems_per_stick:
-        return None
-    return 0 if device_coords[0] == 0 else None
+    return next(
+        (
+            i
+            for i in range(len(device_size) - 2, -1, -1)
+            if device_size[i] == elems_per_stick and device_coords[i] == 0
+        ),
+        None,
+    )
 
 
 def is_restickify_coords(in_coords: list[Expr], out_coords: list[Expr]) -> bool:
