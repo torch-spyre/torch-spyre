@@ -756,4 +756,30 @@ def test_pad_of_staggered_inside_stick_pair_raises():
         torch.compile(fn)(a.to(DEVICE_NAME))
 
 
+@pytest.mark.parametrize("tokens", [1, 64])
+@pytest.mark.parametrize(
+    "fp16",
+    DtypeOpTable.fp16_types(),
+    ids=lambda dt: str(dt).replace("torch.", ""),
+)
+def test_fp32_reduction_cast_into_matmul(tokens, fp16):
+    """A matmul reads an fp32 sum cast to fp16 with K on the stick.
+
+    This is the MoE expert combine. The cast's output is tagged FP32_TO_DL16,
+    and the matmul used to take a candidate of it without K on the stick.
+    Integers of magnitude <= 256 keep every partial sum exact in bf16 and
+    DLFloat16.
+    """
+    torch._dynamo.reset()
+
+    def fn(y, w, m):
+        return (y.float() * w.float()).sum(0).to(fp16) @ m
+
+    y = torch.randint(-1, 2, (2, tokens, 128)).to(fp16)
+    w = torch.randint(0, 2, (2, tokens, 1)).to(fp16)
+    m = torch.randint(-1, 2, (128, 128)).to(fp16)
+    result = torch.compile(fn)(y.to(DEVICE_NAME), w.to(DEVICE_NAME), m.to(DEVICE_NAME))
+    torch.testing.assert_close(result.cpu(), fn(y, w, m), rtol=0, atol=0)
+
+
 # Made with Bob

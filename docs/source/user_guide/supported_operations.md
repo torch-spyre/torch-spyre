@@ -97,6 +97,7 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 | `torch.aminmax` | | Y | Spyre | Compiled only; eager not yet supported |
 | `torch.any` | Y | Y | Spyre | Custom lowering; reduces over `dim`/`dims` or the full tensor |
 | `torch.all` | Y | Y | Spyre | Custom decomposition (`abs` + `amin`) |
+| `torch.cumsum` | Y | Y | Spyre | Custom decomposition: matmul with a triangular matrix for fp16/bf16, a parallel prefix scan for fp32/int32/int64. A bool input, or a dtype conversion that changes the element width, falls back to CPU |
 | **View Ops** [^views] | | | | |
 | `torch.reshape` / `torch.view` | | Y | Spyre | Includes `_reshape_alias` (a C++ device view, not an Inductor lowering) |
 | `torch.transpose` | Y | Y | Spyre | |
@@ -134,6 +135,7 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 | **Indexing** | | | | |
 | `torch.embedding` | Y | Y | Spyre | Registered on the compiled path (`ops/eager.py`) |
 | `torch.index_select` | Y | Y | Spyre | Registered on the compiled path (`ops/eager.py`) |
+| `x[index]` (`aten.index.Tensor`) | Y | Y | Spyre | Eager supports one 1-D int32/int64 index on dim 0 (CPU or Spyre), run as `index_select`; an index dtype other than long/int/byte/bool raises `IndexError` as on CPU, and other index forms (including boolean/uint8 masks) and bool source tensors raise `NotImplementedError`. The index is bounds-checked on the host, so a Spyre index takes a D2H round trip; `out=` is not supported. Inherits `index_select`'s limits and compiles once per index length and source shape/layout |
 | `torch.index_add` | | Y | Spyre | Compiled only; custom decomposition (gather + add + overwrite-scatter); requires unique indices |
 | `torch.masked_scatter` | Y | Y | Spyre | Custom decomposition; supported for masks that broadcast along the last (stick) dimension, other masks raise `Unsupported` |
 | **Utility** | | | | |
@@ -147,7 +149,6 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 | `torch.bitwise_or` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.argmax` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.argmin` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
-| `torch.cumsum` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 
 > **Column key:**
 >
