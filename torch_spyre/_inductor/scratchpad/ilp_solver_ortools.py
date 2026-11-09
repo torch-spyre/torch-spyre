@@ -858,7 +858,9 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 buffer_map[symbol.name] = (t, t.cp_tile_counts_raw[key])
 
         try:
-            cp_cost = cost_expr_to_cpsat(model, sym_map, buffer_map, cost_expr)
+            cp_cost = cost_expr_to_cpsat(
+                model, sym_map, buffer_map, cost_expr, config.cpsat_max_table_entries
+            )
             if not isinstance(cp_cost, (int, float)):
                 # if the cost is non-constant, we minimize it
                 # if the cost is constant, we use any solution

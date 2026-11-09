@@ -423,8 +423,10 @@ solvers differ in what "substitute and evaluate" compiles down to:
   decision variable (`sym_map[t.buffer.sym_is_lx.name] = t.in_buffer`, and similarly for
   `sym_core_divs`), then hands the whole expression, still unevaluated, to the constraint model
   as the objective to minimize via `cost_expr_to_cpsat(...)`
-  (`scratchpad/cpsat_expr_printer.py`). CP-SAT never evaluates `cost_expr` in Python; it
-  searches the symbolic constraint space directly.
+  (`scratchpad/cpsat_expr_printer.py`). The printer evaluates each sub-expression once, at
+  every point of the decisions it reads, and hands CP-SAT those tables, lowering term by term
+  only what reads too many decisions to enumerate; CP-SAT then searches the constraint space
+  directly, with no evaluation per candidate.
 - **Simulated annealing (compiled, then evaluated numerically per move)**: `_build_score_fn`
   (`scratchpad/sa_cooptimizer.py`) instead compiles `cost_expr` once via `sympy.lambdify` into
   a plain Python function of `(chosen, resident)`, and calls that function fresh for every
