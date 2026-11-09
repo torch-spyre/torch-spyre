@@ -1034,6 +1034,17 @@ def plain_reduction_k_split_domains(
         return ConstraintResult()
     if ctx.op.data.reduction_type in _STRUCTURED_REDUCTION_TYPES:
         return ConstraintResult()
+    # A cross-shard reduction over the ring (sharded_hbm) splits exactly its
+    # pinned shard dim, which is a reduction var, and nothing else. That is
+    # the single split reduction dim the backend supports; keep every other
+    # reduction var unsplit.
+    if getattr(ctx.op, "shard_ring_reduction", False):
+        pinned = set(getattr(ctx.op, "shard_pinned_splits", {}) or {})
+        return ConstraintResult(
+            allowed_splits={
+                v: frozenset({1}) for v in ctx.reduction_vars if v not in pinned
+            }
+        )
     # Multi-axis: backend supports at most one split reduction dim.
     if len(ctx.reduction_vars) > 1:
         return ConstraintResult(
