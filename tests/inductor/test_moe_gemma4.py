@@ -60,7 +60,6 @@ GATE_UP = MOE_INTERMEDIATE * 2
 TILE = 32
 PREFILL_T = 12
 DECODE_T = 1
-# The smallest batch that can route to all 128 experts. Not a traced shape.
 ALL_EXPERTS_T = EXPERTS // K8
 NUM_Q_HEADS = 16
 NUM_KV_HEADS = 8
@@ -75,8 +74,6 @@ FP32_ATOL = 0.001
 FP32_RTOL = 0.001
 BF16_ATOL = 0.005
 BF16_RTOL = 0.005
-# Accumulated BF16 rounding against the FP32 reference is at most 0.00082 on CPU
-# for outputs up to 0.085 (64 tokens); this allows about twice that.
 FP32_REF_ATOL = 0.002
 SEED = 20260908
 
@@ -119,11 +116,6 @@ def _xfail(raises, reason):
 
 
 def _modes(eager=None, compiled=None):
-    """Return the modes of a scenario, with the xfail expected on Spyre if any.
-
-    ``cpu`` never takes an xfail: it validates the scenario's own references and
-    assertions without a Spyre device.
-    """
     return [
         "cpu",
         pytest.param("eager", marks=eager or ()),
@@ -132,11 +124,6 @@ def _modes(eager=None, compiled=None):
 
 
 def _cases(eager=None, compiled=None, decode_eager=None, decode_compiled=None):
-    """Return (execution_mode, T) cases at the traced token counts.
-
-    ``decode_eager`` and ``decode_compiled`` override the expectation at T=1, where
-    a scenario can fail at a different op than at T=12. ``cpu`` never takes an xfail.
-    """
     cases = []
     for T, name in ((PREFILL_T, "prefill12"), (DECODE_T, "decode1")):
         decode = T == DECODE_T
@@ -1365,8 +1352,6 @@ def test_G4_DT_002_fp32_reference_vs_bf16_execution(execution_mode, T):
     def fn(x, i, w):
         return _grouped_moe(x, i, w, bank)[0]
 
-    # Spyre is checked against the independent FP32 reference, not the CPU grouped
-    # path, so it cannot pass by matching a bug in _grouped_moe.
     _compare_mode(
         execution_mode,
         fn,
