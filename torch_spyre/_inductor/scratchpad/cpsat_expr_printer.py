@@ -267,10 +267,6 @@ class _SympyExprToCpSat(Printer):
             name = expr.name
             prefix = next((p for p in ("inv_", "log2_") if name.startswith(p)), "")
             raw_name = name[len(prefix) :]
-            if raw_name.startswith("tile_"):
-                # Tile counts are lowered by the rewrite alone; tables do not
-                # take tiling yet.
-                return None
             entry = self._buffer_map.get(raw_name)
             if entry is None:
                 wrapper = self._sym_map.get(f"_division_of_{name}")
