@@ -18,6 +18,7 @@ each, recreates changed views, and fails on table drift rather than ALTERing."""
 import argparse
 import difflib
 import hashlib
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -93,6 +94,129 @@ class SchemaApplier:
         "ENGINE = MergeTree ORDER BY migration_id"
     )
 
+    # Engines the applier can make Replicated; a table on any other engine is refused in cluster mode.
+    REPLICATED = {
+        "MergeTree": "ReplicatedMergeTree",
+        "ReplacingMergeTree": "ReplicatedReplacingMergeTree",
+        "SummingMergeTree": "ReplicatedSummingMergeTree",
+        "AggregatingMergeTree": "ReplicatedAggregatingMergeTree",
+    }
+    # Where a table made by the applier keeps its replication metadata: CLICKHOUSE_KEEPER_PATH, a
+    # template with {shard}, else /clickhouse/<cluster>/tables/{shard}/<db>/<table>.
+    KEEPER_PATH = "/clickhouse/%s/tables/{shard}/%s/%s"
+    ENGINE = re.compile(r"\bENGINE\s*=\s*(\w+)\s*(?:\(([^()]*)\))?")
+    # The stored form of a Replicated engine: 'path', 'replica' and then the plain engine's own arguments.
+    REPLICATED_ENGINE = re.compile(
+        r"\bENGINE\s*=\s*Replicated(\w*MergeTree)\s*\(\s*'[^']*'\s*,\s*'[^']*'\s*(?:,\s*([^()]*?))?\s*\)"
+    )
+    # A conversion marks its table with a comment; it is not part of the file's definition.
+    COMMENT = re.compile(r"\s+COMMENT\s+'[^']*'\s*$")
+    # Statements in a migration that change structure on every replica, and the ones that only move data.
+    MIGRATION_DDL = re.compile(
+        r"^(ALTER\s+TABLE|DROP\s+TABLE|DROP\s+VIEW|TRUNCATE\s+TABLE|CREATE\s+(?:MATERIALIZED\s+)?VIEW|"
+        r"CREATE\s+TABLE|RENAME\s+TABLE)\b",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def cluster(cls) -> str:
+        """The cluster DDL runs on: CLICKHOUSE_CLUSTER, or '' for a single server (the default)."""
+        name = os.environ.get("CLICKHOUSE_CLUSTER", "").strip()
+        if name and not re.fullmatch(r"\w+", name):
+            raise ValueError("CLICKHOUSE_CLUSTER must be a plain identifier")
+        return name
+
+    @classmethod
+    def plain_engine(cls, sql: str) -> str:
+        """`sql` with a Replicated*MergeTree engine written as its plain engine, so the two compare equal."""
+        out, last = [], 0
+        for m in cls.REPLICATED_ENGINE.finditer(sql):
+            if cls._in_literal(sql, m.start()):
+                continue
+            args = m.group(2)
+            out.append(sql[last : m.start()])
+            out.append(f"ENGINE = {m.group(1)}" + (f"({args.strip()})" if args else ""))
+            last = m.end()
+        out.append(sql[last:])
+        return cls.COMMENT.sub("", "".join(out))
+
+    @staticmethod
+    def _in_literal(sql: str, pos: int) -> bool:
+        """True when `pos` falls inside a single-quoted string literal."""
+        return len(re.findall(r"(?<!\\)'", sql[:pos])) % 2 == 1
+
+    @classmethod
+    def clustered(cls, sql: str, kind: str, cluster: str, db: str, name: str) -> str:
+        """A schema file's CREATE for cluster mode: ON CLUSTER, and a Replicated engine for a table.
+
+        A refreshable MV is returned unchanged: it would append once per replica, so it is created on
+        one server only."""
+        if not cluster or kind == "refresh":
+            return sql
+        head = re.compile(
+            r"^(CREATE\s+(?:MATERIALIZED\s+VIEW|TABLE|VIEW)\s+(?:IF\s+NOT\s+EXISTS\s+)?[\w.]+)",
+            re.I,
+        )
+        if re.match(rf"{head.pattern}\s+ON\s+CLUSTER\b", sql, re.I):
+            return sql
+        sql = head.sub(lambda m: f"{m.group(1)} ON CLUSTER {cluster}", sql, count=1)
+        if kind != "table":
+            return sql
+        m = cls.ENGINE.search(sql)
+        if not m or m.group(1) not in cls.REPLICATED:
+            raise ValueError(
+                f"{name}: cannot make engine {m.group(1) if m else '?'} Replicated"
+            )
+        args = (m.group(2) or "").strip()
+        path = os.environ.get("CLICKHOUSE_KEEPER_PATH", "").strip()
+        path = (
+            path.replace("{db}", db).replace("{table}", name)
+            if path
+            else cls.KEEPER_PATH % (cluster, db, name)
+        )
+        new = f"'{path}', '{{replica}}'" + (f", {args}" if args else "")
+        tail = sql[m.end() :]
+        return (
+            sql[: m.start()]
+            + f"ENGINE = {cls.REPLICATED[m.group(1)]}({new})"
+            + ("" if tail[:1].isspace() or not tail else " ")
+            + tail
+        )
+
+    @classmethod
+    def clustered_migration(cls, stmt: str, cluster: str) -> str:
+        """A migration statement that changes structure, run on every replica; data statements stay as they are."""
+        if not cluster or re.search(r"\bON\s+CLUSTER\b", stmt, re.I):
+            return stmt
+        m = cls.MIGRATION_DDL.match(stmt)
+        if not m:
+            if re.match(r"^DELETE\s+FROM\s+[\w.]+", stmt, re.I):
+                return re.sub(
+                    r"^(DELETE\s+FROM\s+[\w.]+)",
+                    rf"\1 ON CLUSTER {cluster}",
+                    stmt,
+                    count=1,
+                    flags=re.I,
+                )
+            return stmt
+        verb = re.sub(r"\s+", " ", m.group(1).upper())
+        target = r"(?:IF\s+(?:NOT\s+)?EXISTS\s+)?[\w.]+"
+        pat = {
+            "ALTER TABLE": rf"^(ALTER\s+TABLE\s+{target})",
+            "TRUNCATE TABLE": rf"^(TRUNCATE\s+TABLE\s+{target})",
+            "DROP TABLE": rf"^(DROP\s+TABLE\s+{target})",
+            "DROP VIEW": rf"^(DROP\s+VIEW\s+{target})",
+            "RENAME TABLE": None,
+        }.get(verb)
+        if verb.startswith("CREATE"):
+            pat = rf"^(CREATE\s+(?:MATERIALIZED\s+)?(?:VIEW|TABLE)\s+{target})"
+        if not pat:
+            return stmt
+        out = re.sub(pat, rf"\1 ON CLUSTER {cluster}", stmt, count=1, flags=re.I)
+        if verb == "DROP TABLE" and not re.search(r"\bSYNC\b", out, re.I):
+            out += " SYNC"
+        return out
+
     @staticmethod
     def schema_dir() -> Path:
         """Where the .sql files live: a checkout's sibling dir, else the install."""
@@ -117,15 +241,18 @@ class SchemaApplier:
         return [s.strip() for s in stripped.split(";") if s.strip()]
 
     @classmethod
-    def run_migration(cls, client, text: str) -> None:
-        """Run a migration's statements, skipping each one whose IF_TABLE is absent."""
+    def run_migration(cls, client, text: str, cluster: str = "") -> None:
+        """Run a migration's statements, skipping each one whose IF_TABLE is absent.
+
+        With a cluster, structural statements run on every replica; INSERT and similar data
+        statements run once, on the connected server, and reach the others by replication."""
         marked = cls.IF_TABLE.sub(lambda m: f"\0{m.group(1)}\0", text)
         for stmt in cls.statements(marked):
             table, _, sql = stmt.rpartition("\0")
             table = table.strip("\0")
             if table and not client.command(f"EXISTS TABLE {table}"):
                 continue
-            client.command(sql.strip())
+            client.command(cls.clustered_migration(sql.strip(), cluster))
 
     @classmethod
     def required_version(cls, text: str) -> tuple:
@@ -184,6 +311,7 @@ class SchemaApplier:
         s = client.query(
             "SELECT formatQuerySingleLine(%(s)s)", parameters={"s": sql}
         ).result_rows[0][0]
+        s = cls.plain_engine(s)
         s = s.replace(" IF NOT EXISTS", "", 1).replace(f"{db}.", "")
         for default in cls.SERVER_DEFAULTS:
             s = s.replace(default, "")
@@ -198,6 +326,13 @@ class SchemaApplier:
             parameters={"db": db},
         ).result_rows
         return {name: ddl for name, ddl in rows}
+
+    @classmethod
+    def ledger_ddl(cls, cluster: str, db: str) -> str:
+        """The migrations ledger's CREATE: plain on one server, Replicated ON CLUSTER in cluster mode."""
+        if not cluster:
+            return cls.LEDGER_DDL
+        return cls.clustered(cls.LEDGER_DDL, "table", cluster, db, cls.LEDGER)
 
     @classmethod
     def applied(cls, client, db: str) -> dict:
@@ -260,8 +395,13 @@ class SchemaApplier:
         return SchemaObject(obj.kind, obj.name, sql, obj.file)
 
     @classmethod
-    def plan(cls, client, db: str, files: list, migrations: list) -> list:
-        """(action, name, detail) for every change an apply would make, in order."""
+    def plan(
+        cls, client, db: str, files: list, migrations: list, cluster: str = ""
+    ) -> list:
+        """(action, name, detail) for every change an apply would make, in order.
+
+        A Replicated table compares equal to its plain file, so a converted table is never drift;
+        `cluster` only decides what the apply would do, not what the plan reports."""
         live = cls.live(client, db)
         done = cls.applied(client, db)
         objs = [o for path, text in files for o in cls.objects(path, text)]
@@ -315,15 +455,21 @@ class SchemaApplier:
         return steps
 
     @classmethod
-    def apply(cls, client, db: str, files: list, migrations: list) -> list:
-        """Converge `db` on the files. Tables/MVs, then migrations, then views, then refreshable MVs."""
-        client.command(cls.LEDGER_DDL)
+    def apply(
+        cls, client, db: str, files: list, migrations: list, cluster: str = ""
+    ) -> list:
+        """Converge `db` on the files. Tables/MVs, then migrations, then views, then refreshable MVs.
+
+        `cluster` (default: none, one server) runs DDL ON CLUSTER and creates new tables on a
+        Replicated engine. The migrations ledger is written once, by the connected server: it is a
+        Replicated table in cluster mode, so the other replicas receive the row."""
+        client.command(cls.ledger_ddl(cluster, db))
         objs = [o for path, text in files for o in cls.objects(path, text)]
         steps = []
         live = cls.live(client, db)
         for o in objs:
             if o.kind in ("table", "mv") and o.name not in live:
-                client.command(o.sql)
+                client.command(cls.clustered(o.sql, o.kind, cluster, db, o.name))
                 steps.append(("create", o.name, o.file))
         done = cls.applied(client, db)
         for path in migrations:
@@ -332,7 +478,7 @@ class SchemaApplier:
                 if done[path.name] != cls.checksum(text):
                     print(f"  [warn] {path.name} changed after it was applied")
                 continue
-            cls.run_migration(client, text)
+            cls.run_migration(client, text, cluster)
             client.insert(
                 cls.LEDGER,
                 [[path.name, cls.checksum(text)]],
@@ -357,26 +503,32 @@ class SchemaApplier:
             if o.kind != "view":
                 continue
             if o.name not in live:
-                client.command(o.sql)
+                client.command(cls.clustered(o.sql, o.kind, cluster, db, o.name))
                 steps.append(("create", o.name, o.file))
             elif cls.differs(client, o, live[o.name], db):
                 # A plain view holds no data; the server rejects CREATE OR REPLACE.
-                client.command(f"DROP VIEW IF EXISTS {o.name}")
-                client.command(o.sql)
+                oc = f" ON CLUSTER {cluster}" if cluster else ""
+                client.command(f"DROP VIEW IF EXISTS {o.name}{oc}")
+                client.command(cls.clustered(o.sql, o.kind, cluster, db, o.name))
                 steps.append(("recreate", o.name, o.file))
         for o in objs:
             if o.kind == "refresh" and o.name not in live:
+                # Never ON CLUSTER: it appends on a schedule, so one server must own it.
+                if cluster:
+                    print(
+                        f"  [info] {o.name}: refreshable MV created on this server only"
+                    )
                 client.command(o.sql)
                 steps.append(("create", o.name, o.file))
         return steps
 
     @classmethod
-    def rerun(cls, client, path: Path) -> None:
+    def rerun(cls, client, path: Path, cluster: str = "") -> None:
         """Run a migration again; refused unless it is marked `-- RERUNNABLE`."""
         text = path.read_text()
         if not cls.RERUNNABLE.search(text):
             raise ValueError(f"{path.name} is not marked -- RERUNNABLE")
-        cls.run_migration(client, text)
+        cls.run_migration(client, text, cluster)
 
 
 SCHEMA_DIR = SchemaApplier.schema_dir()
@@ -403,6 +555,12 @@ def main() -> None:
         default=[],
         help="Also apply this APPLY: explicit file (repeatable)",
     )
+    parser.add_argument(
+        "--cluster",
+        default="",
+        help="Run DDL ON CLUSTER <name> and create tables on Replicated engines "
+        "(default: $CLICKHOUSE_CLUSTER, else one server)",
+    )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
         "--dry-run",
@@ -420,6 +578,10 @@ def main() -> None:
         help="Run one -- RERUNNABLE migration again (e.g. 007_case_id_keep_name_case.sql)",
     )
     args = parser.parse_args()
+
+    if args.cluster:
+        os.environ["CLICKHOUSE_CLUSTER"] = args.cluster
+    cluster = SchemaApplier.cluster()
 
     if not SchemaApplier.sql_files(args.schema_dir):
         print(f"[error] No .sql files in {args.schema_dir}", file=sys.stderr)
@@ -441,15 +603,20 @@ def main() -> None:
     client = ClickHouse.connect(database=db)
     server = SchemaApplier.version_tuple(client.command("SELECT version()"))
     files = SchemaApplier.selected_files(args.schema_dir, args.include, server)
-    print(f"[info] {ClickHouseEnv.host()}/{db}, ClickHouse {server[0]}.{server[1]}")
+    print(
+        f"[info] {ClickHouseEnv.host()}/{db}, ClickHouse {server[0]}.{server[1]}"
+        + (f", cluster {cluster}" if cluster else "")
+    )
 
     if args.rerun:
-        SchemaApplier.rerun(client, args.schema_dir / "migrations" / args.rerun)
+        SchemaApplier.rerun(
+            client, args.schema_dir / "migrations" / args.rerun, cluster
+        )
         print(f"[info] reran {args.rerun} on {db}")
         return
 
     if args.check:
-        steps = SchemaApplier.plan(client, db, files, migrations)
+        steps = SchemaApplier.plan(client, db, files, migrations, cluster)
         for action, name, detail in steps:
             print(f"  {action:8} {name}" + (f"\n{detail}" if action == "drift" else ""))
         print(f"[check] {len(steps)} change(s) pending")
@@ -458,7 +625,7 @@ def main() -> None:
         sys.exit(1 if steps else 0)
 
     try:
-        steps = SchemaApplier.apply(client, db, files, migrations)
+        steps = SchemaApplier.apply(client, db, files, migrations, cluster)
     except SchemaDrift as e:
         print(f"[error] {e}", file=sys.stderr)
         sys.exit(1)
