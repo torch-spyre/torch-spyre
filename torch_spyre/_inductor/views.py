@@ -523,6 +523,15 @@ def _bound_aware_mod(
     if hi < M:
         return expr
 
+    # Mod(x, m) % M == x % M when M divides m: peel the inner Mod so the terms of
+    # x can be simplified against M (e.g. a term with a multiple of M drops out).
+    if (
+        isinstance(expr, sympy.Mod)
+        and _is_concrete_int(expr.args[1])
+        and int(expr.args[1]) % M == 0
+    ):
+        return _bound_aware_mod(expr.args[0], M, var_ranges)
+
     extracted, const_offset = _extract_affine_terms(expr)
 
     if len(extracted) > 1:

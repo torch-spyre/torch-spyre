@@ -1574,6 +1574,51 @@ class TestReshapeReadCoordinates(TestCase):
                 )
                 self.assertEqual(actual_addr, expected_addr)
 
+    def _assert_exact_over_grid(self, rows, cols, stick, k):
+        """x[rows, cols].reshape(-1, k) read: every grid point maps to the
+        address of the element it reads."""
+        m = rows * cols // k
+        num_sticks = (cols + stick - 1) // stick
+        cx = compute_coordinates(
+            [num_sticks, rows, stick],
+            [stick, cols, 1],
+            {p0: m, p1: k},
+            k * p0 + p1,
+        )
+        for r in range(m):
+            for c in range(k):
+                flat = k * r + c
+                row, col = divmod(flat, cols)
+                expected = (col // stick) * stick + row * cols + col % stick
+                actual = int(
+                    cx[0].subs({p0: r, p1: c}) * stick
+                    + cx[1].subs({p0: r, p1: c}) * cols
+                    + cx[2].subs({p0: r, p1: c})
+                )
+                self.assertEqual(actual, expected, f"({r}, {c})")
+        return cx
+
+    def test_stick_coordinate_drops_whole_stick_terms(self):
+        """[3, 64] stick 32 read as [-1, 96]: 32*Mod(p0, 2) is a whole number of
+        sticks, so the stick coordinate is just Mod(p1, 32), a form the stick
+        check accepts."""
+        cx = self._assert_exact_over_grid(3, 64, 32, 96)
+        self.assertEqual(cx[2], sympy.Mod(p1, 32))
+        self.assertTrue(is_stick_expr_offset_free(cx[2], 32))
+
+    def test_stick_coordinate_of_multiple_of_row_step_is_plain_mod(self):
+        """[2, 192] read as [-1, 128]: the stick coordinate is Mod(p1, 64)."""
+        cx = self._assert_exact_over_grid(2, 192, 64, 128)
+        self.assertEqual(cx[2], sympy.Mod(p1, 64))
+        self.assertTrue(is_stick_expr_offset_free(cx[2], 64))
+
+    def test_several_variables_crossing_a_row_stride_are_exact(self):
+        """The stick coordinate must not be accepted unless it is exact: here
+        p0 steps by 32 (a whole stick) yet the row width 112 is not a multiple
+        of it, so reads cross rows."""
+        cx = self._assert_exact_over_grid(2, 112, 32, 32)
+        self.assertFalse(is_stick_expr_offset_free(cx[2], 32))
+
 
 class TestUnboundedSymbolCoordinates(TestCase):
     """Symbols whose range is not a plain ``var_ranges`` integer (issue #5872).
