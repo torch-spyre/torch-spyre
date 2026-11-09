@@ -105,10 +105,15 @@ for a split reduced axis was dropped as sub-noise -- provably <=~5ns on us kerne
 MATMUL (reduction_type batchmatmul) is priced by one of two independent
 implementations, switched on ``CostParams.use_bundled_cost_model``:
 
-- UPSTREAM (``use_bundled_cost_model=False``): the computation and partial-sum part of
-  ``work_division._matmul_execution_cost``, shared with the work-division planner.
-  Standalone split-ranking preferences are excluded: they are not operation times.
-  It is called with ``include_hbm=False``. Its own
+- UPSTREAM (``use_bundled_cost_model=False``): the score the standalone work-division
+  chooser ranks splits with (``work_division._matmul_split_cost``), so CP-SAT and the
+  standalone chooser rank a matmul's splits alike (issue #5799). That is the
+  computation and partial-sum part of ``work_division._matmul_execution_cost`` plus
+  the split-ranking preferences of ``work_division._matmul_split_preference_us``,
+  minus their batch-split term (``include_batch_split=False``):
+  ``_matmul_batch_split_ns`` charges the device-fit form of it. The preferences are
+  fixed amounts per call, charged once per invocation (``loop_trip``). The execution
+  estimate is called with ``include_hbm=False``. Its own
   HBM-traffic term is dropped because the bundle memory term below already charges the
   operand/output bytes, and does so LX-aware; charging both double-counts memory.
   ``predict_ops`` also charges shared-input delivery. CP-SAT uses this model: the
@@ -196,6 +201,7 @@ from .work_division import (
     _decode_weight_delivery_gbps,
     _matmul_execution_cost,
     _matmul_multicast_penalty,
+    _matmul_split_preference_us,
     # These wrappers dispatch symbolic operands to SymPy.
     min,
     max,
@@ -669,7 +675,8 @@ class CostParams:
     # Switch between the two matmul cost implementations (see the module docstring).
     # True (default) -- matmul uses the original device-calibrated
     # compute/HBM/spill/split-shape model below (``_matmul_ns_bundled``).
-    # False -- delegates matmul entirely to ``work_division._matmul_execution_cost``.
+    # False -- delegates matmul to ``work_division._matmul_execution_cost`` plus the
+    # standalone chooser's split preferences (``_matmul_ns_upstream``).
     use_bundled_cost_model: bool = True
     # MATMUL compute term. T_matmul = max(compute, HBM), where
     # compute = MACs/cores/(mac_peak*pt_eff). mac_peak=1140 (sustained) fit on the
@@ -953,7 +960,8 @@ class CostParams:
     # Extra time, per invocation, for each log2 step of M split a batched matmul
     # gives up by splitting its batch dims instead, at the same core count (the
     # batch-split preference of work_division._matmul_split_cost, made a
-    # latency). Only M splits that keep mm_batch_split_min_m_rows rows per core
+    # latency; the upstream model drops that preference so it is not charged
+    # twice). Only M splits that keep mm_batch_split_min_m_rows rows per core
     # count. Empirical: 71 compiles of 6 Granite GQA chunks gave 4.02 us per step
     # with a 64-row bound (leave-one-graph-out 2.25-4.52 us). Only 3 graphs varied
     # in this feature, and non-matmul divisions also varied, so the fit does not
@@ -2033,8 +2041,8 @@ def _fused_reduction_compute_ns(ops: list, p: CostParams) -> float | sympy.Expr:
 
 def _matmul_axes_for_split_cost(o) -> tuple | None:
     """Recover the ``(B,b),(M,m),(N,n),(K,k)`` axis pairs, the ``shared_weight`` flag,
-    and the cores actually used -- everything ``work_division._matmul_execution_cost``
-    needs -- from one matmul :class:`OpFeatures` record.
+    and the cores actually used -- everything ``work_division._matmul_split_cost``
+    and its parts need -- from one matmul :class:`OpFeatures` record.
 
     Returns ``None`` when matmul_a_bytes and matmul_b_bytes are not given
     """
@@ -2102,12 +2110,19 @@ def _matmul_ns_upstream(ops: list, p: CostParams) -> float:
     memory term, exactly as for ``_matmul_ns_bundled`` -- the two terms count the same
     operand/output bytes, so charging both double-counts memory (and the split-cost
     version is blind to LX residency, which is what the co-optimizing planner steers).
-    Standalone chooser preferences are also excluded: a preference for using more
-    cores must not become an additive latency on every matmul in the graph.
+    The matmul is priced with the standalone chooser's score
+    (``_matmul_split_cost``: execution estimate plus split preferences), so both
+    choosers rank its splits alike (issue #5799). The batch-split preference is
+    dropped (``include_batch_split=False``) because ``_matmul_batch_split_ns``,
+    added below, is its device-fit form; charging both would count the batch
+    split twice.
 
-    The estimate is for one pass over the output buffer and is charged once per
-    pass of the loop (``_matmul_passes``), never multiplied by the trip count
-    directly: a stacked output already spans the trips.
+    The execution estimate is for one pass over the output buffer and is charged
+    once per pass of the loop (``_matmul_passes``), never multiplied by the trip
+    count directly: a stacked output already spans the trips. The preferences are
+    fixed amounts per call and are charged once per invocation (``loop_trip``), as
+    ``_matmul_batch_split_ns`` is, so a stationary-output loop and its stacked
+    form cost the same.
     """
     total_us = 0.0
     for o in ops:
@@ -2138,6 +2153,17 @@ def _matmul_ns_upstream(ops: list, p: CostParams) -> float:
                 f"k_axis={k_axis}, cores_used={cores_used})"
             )
         total_us += us * _matmul_passes(o, k_axis[0])
+        # The preferences are fixed amounts per call: charge them per invocation.
+        trip = max(1, getattr(o, "loop_trip", 1) or 1)
+        total_us += trip * _matmul_split_preference_us(
+            b_axis,
+            m_axis,
+            n_axis,
+            k_axis,
+            config.sencores,
+            shared_weight=shared_weight,
+            include_batch_split=False,
+        )
     return total_us * 1000.0 + _matmul_batch_split_ns(ops, p)  # us -> ns
 
 
@@ -2674,8 +2700,8 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
     """Predicted device latency (ns) for a bundle of ops (one fused kernel).
 
     A matmul in the bundle adds a compute term from ``_matmul_ns_upstream`` (defers to
-    ``work_division._matmul_execution_cost``) or, when ``CostParams.use_bundled_cost_model``
-    is set, ``_matmul_ns_bundled`` (the original device-calibrated compute/spill/
+    ``work_division._matmul_execution_cost`` plus split preferences) or, when
+    ``CostParams.use_bundled_cost_model`` is set, ``_matmul_ns_bundled`` (the original device-calibrated compute/spill/
     split-shape model); see the module docstring. Either way the operand/output HBM
     bytes are charged ONCE, by the memory term below -- neither matmul model carries an
     HBM term of its own. Every bundle uses the device-calibrated bandwidth/turnaround/
@@ -3238,7 +3264,8 @@ def explain(ops: list, params: CostParams | None = None) -> str:
         # see the module docstring), and the bundle memory term supplies the traffic.
         # Report the reconstructed axes each matmul op was priced with, then R/W.
         lines.append(
-            "  -- prediction (matmul, via work_division._matmul_execution_cost) --"
+            "  -- prediction (matmul, via work_division._matmul_execution_cost "
+            "+ split preferences) --"
         )
         compute_ns = batch_split_extra
         for o in ops:
@@ -3276,6 +3303,23 @@ def explain(ops: list, params: CostParams | None = None) -> str:
                 f"cores={cores_used} -> compute {us:.2f} us{per_pass}"
             )
             compute_ns += us * passes * 1000.0
+            pref_us = max(1, getattr(o, "loop_trip", 1) or 1) * (
+                _matmul_split_preference_us(
+                    (B, b),
+                    (M, m),
+                    (N, n),
+                    (K, k),
+                    config.sencores,
+                    shared_weight=shared_weight,
+                    include_batch_split=False,
+                )
+            )
+            if pref_us:
+                lines.append(
+                    f"     {o.name}: + split preferences {float(pref_us):.2f} us "
+                    "(standalone chooser's ranking terms, minus batch split)"
+                )
+                compute_ns += pref_us * 1000.0
         R, W = _fused_hbm_bytes(ops)  # external input counted once (fused kernel)
         lines.append(
             f"     compute = {compute_ns / 1000:.2f} us   R={R}B (read) W={W}B (write)"

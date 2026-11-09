@@ -90,9 +90,14 @@ def test_split_sum_matmul_prices_one_corelet(shared_weight):
         ) == pytest.approx(expected)
 
 
-def test_joint_matmul_price_is_independent_of_standalone_preferences(monkeypatch):
+def test_joint_matmul_price_follows_standalone_preferences_but_not_batch_split(
+    monkeypatch,
+):
+    """CP-SAT prices a matmul with the standalone chooser's preferences (issue
+    #5799), except the batch-split one, which ``_matmul_batch_split_ns`` charges."""
     from torch_spyre._inductor import work_division as wd
 
+    monkeypatch.setattr(cost_model.config, "sencores", 32)
     op = OpFeatures(
         name="bmm",
         is_reduction=True,
@@ -108,21 +113,37 @@ def test_joint_matmul_price_is_independent_of_standalone_preferences(monkeypatch
         matmul_b_bytes=256 * 128 * 2,
     )
     params = cost_model.CostParams(use_bundled_cost_model=False)
+    *axes, shared_weight = cost_model._matmul_axes_for_split_cost(op)
+    assert (axes, shared_weight) == (
+        [(16, 16), (64, 1), (128, 1), (256, 1)],
+        False,
+    )
+    execution = wd._matmul_execution_cost(*axes, 32, include_hbm=False)
+    preference = wd._matmul_split_preference_us(*axes, 32, include_batch_split=False)
+    assert 0 < preference < wd._matmul_split_preference_us(*axes, 32)
+    assert wd._matmul_split_cost(
+        *axes, 32, include_hbm=False
+    ) - wd._matmul_split_preference_us(*axes, 32) == pytest.approx(execution)
+    assert cost_model._matmul_ns_upstream([op], params) == pytest.approx(
+        1000.0 * (execution + preference)
+        + cost_model._matmul_batch_split_ns([op], params)
+    )
+
     before = cost_model.predict_ops([op], params)
-    axes = ((16, 8), (64, 1), (128, 1), (256, 1))
-    standalone = wd._matmul_split_cost(*axes, 32)
+    monkeypatch.setattr(
+        wd, "_BMM_BATCH_SPLIT_PENALTY_US", wd._BMM_BATCH_SPLIT_PENALTY_US * 2
+    )
+    assert cost_model.predict_ops([op], params) == pytest.approx(before)
     for name in (
         "_CORE_UNDERUSE_PENALTY_US",
         "_M_TILE_UNDERFILL_PENALTY_US",
         "_M_LANE_UNDERUSE_PENALTY_US",
-        "_BMM_BATCH_SPLIT_PENALTY_US",
         "_WIDE_N_TILE_PENALTY_US",
         "_LARGE_M_TILE_SHAPE_PENALTY_US",
         "_SHARED_DOWN_N_SPLIT_PENALTY_US",
     ):
         monkeypatch.setattr(wd, name, getattr(wd, name) * 2)
-    assert cost_model.predict_ops([op], params) == pytest.approx(before)
-    assert wd._matmul_split_cost(*axes, 32) > standalone
+    assert cost_model.predict_ops([op], params) > before
 
 
 def test_fused_reduction_compute_uses_work_per_active_core():

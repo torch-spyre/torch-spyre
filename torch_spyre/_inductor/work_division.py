@@ -2423,8 +2423,8 @@ def _matmul_execution_cost(
     sharing penalty drops out of this function with that term. ``predict_ops``
     charges shared-input delivery separately, using each operand's consumers.
 
-    Array underfill remains an efficiency factor on computation. Standalone
-    split-ranking preferences belong to ``_matmul_split_cost``, not this estimate.
+    Array underfill remains an efficiency factor on computation. Split-ranking
+    preferences belong to ``_matmul_split_cost``, not this estimate.
 
     ``operand_bytes``/``output_bytes`` are bytes-per-element, derived by the
     caller from the real tensors' own ``elems_per_stick()``. Default to
@@ -2488,10 +2488,8 @@ def _matmul_split_cost(
     operand_bytes: float = _DTYPE_BYTES,
     output_bytes: float = _DTYPE_BYTES,
 ) -> float:
-    """Standalone split-ranking score: execution estimate plus preferences.
-
-    The additive preferences preserve this chooser's existing behavior. They
-    are not operation latencies for a whole-program optimizer to sum.
+    """Standalone split-ranking score: ``_matmul_execution_cost`` plus
+    ``_matmul_split_preference_us``.
 
     ``operand_bytes``/``output_bytes`` pass straight through to
     ``_matmul_execution_cost`` (issue #4465).
@@ -2509,6 +2507,37 @@ def _matmul_split_cost(
     )
     if isinf(execution_us):
         return execution_us
+    return execution_us + _matmul_split_preference_us(
+        b_axis, m_axis, n_axis, k_axis, max_cores, shared_weight, operand_bytes
+    )
+
+
+def _matmul_split_preference_us(
+    b_axis: tuple[int, int],
+    m_axis: tuple[int, int],
+    n_axis: tuple[int, int],
+    k_axis: tuple[int, int],
+    max_cores: int,
+    shared_weight: bool = False,
+    operand_bytes: float = _DTYPE_BYTES,
+    include_batch_split: bool = True,
+) -> float:
+    """Additive split-ranking preferences, in microseconds, for one matmul call.
+
+    They stand in for effects the execution estimate does not model (backend
+    layout and fusion fallout, schedule efficiency of wide N tiles, PT
+    streaming) and were tuned on device to order candidates. The standalone
+    chooser adds them to ``_matmul_execution_cost`` (``_matmul_split_cost``).
+    The upstream cost model (``cost_model._matmul_ns_upstream``, which CP-SAT
+    uses) adds them too, so both choosers rank a matmul's splits alike (issue
+    #5799). It passes ``include_batch_split=False``: its own
+    ``_matmul_batch_split_ns`` is the device-fit form of the batch-split
+    preference, and charging both would count the batch split twice.
+
+    Every term is a fixed amount per call, not a per-element cost. The batch
+    extent enters only through the decode-scope test. Feasibility is the
+    caller's: this does not check the core budget.
+    """
     (_, b), (M, m), (N, n), (K, k) = b_axis, m_axis, n_axis, k_axis
     cores_used = b * m * n * k
     m_t = M // m if m else 1
@@ -2582,11 +2611,15 @@ def _matmul_split_cost(
 
     # True BMMs often need batch parallelism to avoid tiny-M underfill. Charge a
     # small additive split overhead instead of multiplying the whole estimate.
-    batch_split_us = 0.0 if shared_weight else log2(b) * _BMM_BATCH_SPLIT_PENALTY_US
+    # Callers that charge their own batch-split latency turn this off.
+    batch_split_us = (
+        0.0
+        if shared_weight or not include_batch_split
+        else log2(b) * _BMM_BATCH_SPLIT_PENALTY_US
+    )
 
     return (
-        execution_us
-        + m_lane_underuse_us
+        m_lane_underuse_us
         + m_tile_underfill_us
         + wide_n_us
         + large_m_tile_shape_us

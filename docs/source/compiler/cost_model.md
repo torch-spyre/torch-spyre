@@ -312,7 +312,7 @@ fix to one is not a fix to the other.
 
 | caller | setting | matmul compute |
 |---|---|---|
-| scratchpad allocator (the CP-SAT objective that chooses plans) | `use_bundled_cost_model=False` | rebuilds batch, M, N and K from the features and calls `work_division._matmul_execution_cost` without its HBM term |
+| scratchpad allocator (the CP-SAT objective that chooses plans) | `use_bundled_cost_model=False` | rebuilds batch, M, N and K from the features and calls `work_division._matmul_execution_cost` without its HBM term, plus the standalone chooser's split preferences (`_matmul_split_preference_us`) once per invocation, without their batch-split term, which `_matmul_batch_split_ns` charges instead |
 | report (`cost_model_pass`, `SPYRE_DUMP_COST`) | default, `use_bundled_cost_model=True` | `matmul_macs / cores / (mac_peak * pt_eff)` |
 
 Both must count the same work over a loop. The rebuilt axes describe **one pass over the

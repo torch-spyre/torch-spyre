@@ -440,10 +440,12 @@ def test_batch_split_latency_changes_the_cost_and_is_explained():
     p = CostParams(use_bundled_cost_model=False)
     disabled = dataclasses.replace(p, mm_batch_split_ns_per_step=0)
     batch, rows = bmm(2), bmm(8)
-    assert predict_ops([batch], disabled) == pytest.approx(
-        predict_ops([rows], disabled)
+    # The batch split adds 2 log2 steps on each of 8 invocations; the M split
+    # gives up none. Other split preferences are the same with or without it.
+    assert predict_ops([batch], p) - predict_ops([batch], disabled) == pytest.approx(
+        64000.0
     )
-    assert predict_ops([batch], p) > predict_ops([rows], p)
+    assert predict_ops([rows], p) == pytest.approx(predict_ops([rows], disabled))
     assert "batched-matmul batch splits: +64.00 us" in explain([batch], p)
     assert "batched-matmul batch splits" not in explain([rows], p)
     assert "batched-matmul batch splits" not in explain([batch], disabled)
