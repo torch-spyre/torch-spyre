@@ -289,17 +289,7 @@ def test_inplace_tensor_operand(packet):
     [
         None,
         "floor",
-        # 'trunc' fails in the *functional* div kernel, independently of any
-        # in-place wrapper. The in-place kernel inherits that gap; it does not
-        # introduce it.
-        # ``raises`` names the expected failure, not bare ``Exception``: these
-        # xfails must not double as a blanket licence for this path to break
-        # some other way. A wrong *value* or a failure in the derivation or
-        # ``copy_`` wrapper raises something else and still fails the suite,
-        # while ``strict=True`` catches the day the kernel starts working.
-        pytest.param(
-            "trunc", marks=pytest.mark.xfail(raises=RuntimeError, strict=True)
-        ),
+        "trunc",
     ],
     ids=lambda m: str(m),
 )
@@ -311,10 +301,6 @@ def test_div_rounding_mode(rounding_mode, scalar_operand):
 
     These take a kwarg-only ``rounding_mode``; the kernel forwards ``**kwargs``
     to the functional op, and nothing else in this module exercises that path.
-    ``None`` and ``floor`` are supported by the backend today; ``trunc`` is
-    strict-xfail on the specific compile error so this starts passing (and tells
-    us) once the functional kernel gains support, while any *other* failure on
-    this path still fails the suite.
     """
     op = "div_"
     torch.manual_seed(4)
