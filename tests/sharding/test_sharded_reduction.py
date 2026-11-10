@@ -371,6 +371,31 @@ def test_cross_shard_result_feeds_an_unsharded_op():
 
 
 @_requires_emulation
+def test_cross_shard_result_is_one_ordinary_chunk():
+    """The cross-shard result is allocated like any unsharded tensor.
+
+    It has one chunk, placed by the default directive (domain 0), the same as
+    a tensor copied from the CPU. If a placement policy for these outputs is
+    added later, this test is where that change shows.
+    """
+    from torch_spyre import _C
+
+    n = _num_shards()
+    src = _small_ints((3, 4 * n, 64), seed=9)
+    x = _sharded(src, 1, n)
+
+    y = torch.compile(lambda t: t.sum(1), dynamic=False)(x)
+    plain = torch.zeros(3, 64, dtype=torch.float16).to("spyre")
+
+    assert not torch.spyre.is_sharded(y)
+    chunks = _C.get_composite_address(y).chunks()
+    assert len(chunks) == 1
+    assert chunks[0].domain_id == _C.get_composite_address(plain).chunks()[0].domain_id
+    assert chunks[0].domain_id == 0
+    assert torch.equal(y.cpu(), src.sum(1))
+
+
+@_requires_emulation
 @expects_raise
 @pytest.mark.parametrize(
     "fn, match",
