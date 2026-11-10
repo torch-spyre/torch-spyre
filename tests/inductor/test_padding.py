@@ -178,7 +178,7 @@ class TestRestickifyInputCoordinate(unittest.TestCase):
 
 _I = sympy.Symbol("i")
 _NON_NEG = Interval(0, oo)
-_POS = Interval(0, oo, left_open=True)
+_NAN = padding._NAN
 
 
 def _rationalize(s):
@@ -219,7 +219,7 @@ class TestDomainRangeSolver(unittest.TestCase):
             self.assertSetEqual(ctx.exception.domain, domain)
         return ctx.exception
 
-    # -- constants and finite sets --------------------------------------------
+    # -- finite sets: evaluated exactly ----------------------------------------
 
     def test_constant_is_singleton(self) -> None:
         self.assertSetEqual(self.s.constant(2.5, torch.float16), FiniteSet(2.5))
@@ -228,8 +228,17 @@ class TestDomainRangeSolver(unittest.TestCase):
         self.assertSetEqual(self.s.exp(FiniteSet(0)), FiniteSet(1.0))
         self.assertSetEqual(self.s.relu(FiniteSet(-2, 3)), FiniteSet(0, 3))
         self.assertSetEqual(self.s.neg(FiniteSet(1, -4)), FiniteSet(-1, 4))
+        self.assertSetEqual(self.s.abs(FiniteSet(-2, 3)), FiniteSet(2, 3))
+        self.assertSetEqual(self.s.square(FiniteSet(-2, 1)), FiniteSet(1, 4))
         self.assertSetEqual(self.s.sigmoid(FiniteSet(0)), FiniteSet(0.5))
+        self.assertSetEqual(self.s.tanh(FiniteSet(0)), FiniteSet(0))
+        self.assertSetEqual(self.s.silu(FiniteSet(0)), FiniteSet(0))
         self.assertSetEqual(self.s.reciprocal(FiniteSet(2)), FiniteSet(0.5))
+        self.assertSetEqual(
+            self.s.softplus(FiniteSet(0), 1.0, 20.0), FiniteSet(math.log(2))
+        )
+        # Above the threshold softplus is the identity, as in torch.
+        self.assertSetEqual(self.s.softplus(FiniteSet(100), 1.0, 20.0), FiniteSet(100))
 
     def test_binary_on_finite_sets_is_cartesian(self) -> None:
         self.assertSetEqual(
@@ -238,55 +247,125 @@ class TestDomainRangeSolver(unittest.TestCase):
         self.assertSetEqual(
             self.s.mul(FiniteSet(0, 2), FiniteSet(3, 4)), FiniteSet(0, 6, 8)
         )
+        self.assertSetEqual(
+            self.s.sub(FiniteSet(0), FiniteSet(1, 2)), FiniteSet(-1, -2)
+        )
         self.assertSetEqual(self.s.truediv(FiniteSet(0), FiniteSet(2)), FiniteSet(0))
-
-    # -- intervals ------------------------------------------------------------
-
-    def test_unary_on_interval_maps_endpoints(self) -> None:
         self.assertSetEqual(
-            self.s.neg(Interval(1, 2, left_open=True)), Interval.Ropen(-2, -1)
-        )
-        self.assertSetEqual(self.s.reciprocal(Interval(1, 2)), Interval(0.5, 1))
-        self.assertSetEqual(self.s.exp(S.Reals), Interval.open(0, oo))
-        self.assertSetEqual(self.s.sigmoid(S.Reals), Interval.open(0, 1))
-        self.assertSetEqual(self.s.tanh(S.Reals), Interval.open(-1, 1))
-        self.assertSetEqual(self.s.sqrt(_NON_NEG), _NON_NEG)
-
-    def test_binary_on_intervals_uses_corners(self) -> None:
-        self.assertSetEqual(self.s.add(Interval(0, 1), FiniteSet(2)), Interval(2, 3))
-        self.assertSetEqual(
-            self.s.mul(Interval(-1, 2), Interval(-3, 1)), Interval(-6, 3)
-        )
-        self.assertSetEqual(self.s.sub(FiniteSet(0), Interval(0, 1)), Interval(-1, 0))
-        self.assertSetEqual(
-            self.s.maximum(FiniteSet(0), Interval(-1, 2)), Interval(0, 2)
+            self.s.maximum(FiniteSet(0), FiniteSet(-1, 2)), FiniteSet(0, 2)
         )
         self.assertSetEqual(
-            self.s.minimum(FiniteSet(0), Interval(-1, 2)), Interval(-1, 0)
-        )
-        self.assertSetEqual(self.s.add(S.Reals, FiniteSet(0)), S.Reals)
-
-    def test_binary_open_bound_only_when_every_corner_is_open(self) -> None:
-        # [0, 1) + {1} = [1, 2): the upper corner comes only from the open end.
-        self.assertSetEqual(
-            self.s.add(Interval.Ropen(0, 1), FiniteSet(1)), Interval.Ropen(1, 2)
-        )
-        # [-1, 2] * [-3, 1): -6 is reached by the closed corner (2, -3).
-        self.assertSetEqual(
-            self.s.mul(Interval(-1, 2), Interval.Ropen(-3, 1)), Interval(-6, 3)
+            self.s.minimum(FiniteSet(0), FiniteSet(-1, 2)), FiniteSet(-1, 0)
         )
 
-    def test_mul_zero_by_unbounded(self) -> None:
-        # [0, oo) excludes oo, so the 0 * oo corner is a limit: 0 * x is 0.
-        self.assertSetEqual(self.s.mul(FiniteSet(0), _NON_NEG), FiniteSet(0))
-        # A set that holds oo itself (an fp overflow) is not an interval; the
-        # solver must fall back, not lose values.
+    def test_equal_values_of_different_types_merge(self) -> None:
+        # sympy keeps {0, 0.0} as two elements; every result is a float.
+        self.assertEqual(len(self.s.add(FiniteSet(0), FiniteSet(0, 0.0))), 1)
+
+    def test_finite_set_values_like_the_device(self) -> None:
+        # Overflow and underflow as in floating point.
+        self.assertSetEqual(self.s.exp(FiniteSet(1000)), FiniteSet(oo))
+        self.assertSetEqual(self.s.exp(FiniteSet(-1e4)), FiniteSet(0))
+        self.assertSetEqual(self.s.sigmoid(FiniteSet(-1000)), FiniteSet(0))
+        self.assertSetEqual(self.s.square(FiniteSet(1e300)), FiniteSet(oo))
+        # Undefined results are NaN, not a crash.
+        self.assertSetEqual(self.s.mul(FiniteSet(0), FiniteSet(oo)), FiniteSet(_NAN))
+        self.assertSetEqual(self.s.add(FiniteSet(oo), FiniteSet(-oo)), FiniteSet(_NAN))
+        self.assertSetEqual(self.s.log(FiniteSet(oo)), FiniteSet(oo))
+
+    def test_comparisons(self) -> None:
+        self.assertSetEqual(self.s.eq(FiniteSet(0), FiniteSet(0)), FiniteSet(1))
+        self.assertSetEqual(self.s.lt(FiniteSet(1), FiniteSet(0)), FiniteSet(0))
+        self.assertSetEqual(self.s.ne(FiniteSet(0, 1), FiniteSet(0)), FiniteSet(0, 1))
+        self.assertSetEqual(
+            self.s.logical_and(FiniteSet(1), FiniteSet(0)), FiniteSet(0)
+        )
+        self.assertSetEqual(self.s.logical_or(FiniteSet(1), FiniteSet(0)), FiniteSet(1))
+        # Not both finite sets: any boolean.
+        self.assertSetEqual(self.s.lt(FiniteSet(0), S.Reals), FiniteSet(0, 1))
+
+    # -- anything else: the signs of the result, within the op's range --------
+
+    @parametrize(
+        "op,image",
+        [
+            ("abs", Interval(0, oo)),
+            ("exp", Interval(0, oo).union(FiniteSet(oo))),
+            ("neg", S.Reals),
+            ("sigmoid", Interval(0, 1)),
+            ("silu", Interval(-0.279, oo)),
+            ("square", Interval(0, oo).union(FiniteSet(oo))),
+            ("tanh", Interval(-1, 1)),
+        ],
+    )
+    def test_unary_on_unknown_values_is_the_range(self, op, image) -> None:
+        self.assertSetEqual(getattr(self.s, op)(S.Reals), image)
+
+    def test_unary_keeps_the_sign(self) -> None:
+        pos = Interval.open(0, oo)
+        self.assertSetEqual(self.s.abs(pos), pos)
+        self.assertSetEqual(self.s.neg(pos), Interval.open(-oo, 0))
+        self.assertSetEqual(self.s.tanh(pos), Interval.Lopen(0, 1))
+        # exp of a negative underflows to 0 but is not negative.
+        self.assertSetEqual(self.s.exp(Interval.open(-oo, 0)), _NON_NEG)
+        self.assertSetEqual(self.s.reciprocal(pos), pos.union(FiniteSet(oo)))
+
+    def test_sign_rule_models_underflow_and_overflow(self) -> None:
+        pos = Interval.open(0, oo)
+        # A sum of positives is at least the larger one: never 0, maybe inf.
+        self.assertSetEqual(self.s.add(pos, pos), pos.union(FiniteSet(oo)))
+        # A product of positives can underflow to 0.
+        self.assertSetEqual(self.s.mul(pos, pos), _NON_NEG.union(FiniteSet(oo)))
+        # silu and square of a tiny positive underflow to 0.
+        self.assertTrue(self.s.silu(pos).contains(0))
+        self.assertTrue(self.s.square(pos).contains(0))
+        # Without a sign to go on, overflow makes +-inf possible.
+        self.assertSetEqual(
+            self.s.add(S.Reals, S.Reals), S.Reals.union(FiniteSet(-oo, oo))
+        )
+        self.assertSetEqual(self.s.sub(pos, pos), S.Reals)
+
+    def test_sign_rule_finds_undefined_results(self) -> None:
+        # 0 * oo is NaN: it is possible when the operands can be 0 and oo.
         extended = _NON_NEG.union(FiniteSet(oo))
-        self.assertSubset(FiniteSet(0, 1, 1000), self.s.mul(FiniteSet(0), extended))
+        self.assertTrue(self.s.mul(extended, extended).has(_NAN))
+        self.assertFalse(self.s.mul(_NON_NEG, _NON_NEG).has(_NAN))
+
+    def test_device_saturates_to_range_bounds(self) -> None:
+        # sigmoid(-20) is 0 and tanh(10) is 1 in fp16, so the bounds are closed.
+        self.assertTrue(self.s.sigmoid(S.Reals).contains(0))
+        self.assertTrue(self.s.sigmoid(S.Reals).contains(1))
+        self.assertTrue(self.s.tanh(S.Reals).contains(-1))
+        self.assertTrue(self.s.exp(S.Reals).contains(0))
+        # silu's fp16 minimum is -0.27856, below the real minimum -0.27846.
+        self.assertTrue(self.s.silu(S.Reals).contains(-0.27856))
+
+    def test_positive_denominator_needs_no_mask(self) -> None:
+        # 1 / (1 + exp(-x)): a positive plus a non-negative is positive.
+        denominator = self.s.add(FiniteSet(1), self.s.exp(self.s.neg(S.Reals)))
+        self.assertFalse(denominator.contains(0))
+        self.assertTrue(denominator.is_subset(self.s.extended_non_zero_reals))
+        self.s.reciprocal(denominator)
+        self.s.truediv(FiniteSet(1), denominator)
+
+    def test_epsilon_keeps_rsqrt_in_domain(self) -> None:
+        # rsqrt(v + eps) for a non-negative v (a variance or a square).
+        variance = _NON_NEG.union(FiniteSet(oo))
+        self.s.rsqrt(self.s.add(variance, FiniteSet(1e-5)))
+        # x * x of an unknown x is not known to be non-negative: the solver
+        # cannot tell x * x from x * y (TODO: track repeated operands).
+        with self.assertRaises(InvalidDomain):
+            self.s.rsqrt(self.s.add(self.s.mul(S.Reals, S.Reals), FiniteSet(1e-5)))
+
+    def test_log_of_sigmoid_masks(self) -> None:
+        # sigmoid saturates to 0 on the device, so log's input may be 0.
+        with self.assertRaises(InvalidDomain):
+            self.s.log(self.s.sigmoid(S.Reals))
+
+    # -- max, min, relu, clamp: exact set algebra ---------------------------------
 
     def test_max_min_bound_attained_where_one_argument_dominates(self) -> None:
-        # max(x, 0) = 0 for every x <= 0, so 0 is attained though the corner
-        # (-oo, 0) is open.
+        # max(x, 0) = 0 for every x <= 0, so 0 is attained.
         self.assertSetEqual(self.s.maximum(S.Reals, Interval(0, 1)), _NON_NEG)
         self.assertSetEqual(self.s.maximum(S.Reals, FiniteSet(0)), _NON_NEG)
         self.assertSetEqual(self.s.minimum(S.Reals, Interval(0, 1)), Interval(-oo, 1))
@@ -298,9 +377,6 @@ class TestDomainRangeSolver(unittest.TestCase):
     def test_max_min_exact_image(self) -> None:
         # Values of one argument below every value of the other are not in
         # the image of max.
-        self.assertSetEqual(
-            self.s.maximum(FiniteSet(0), FiniteSet(-1, 2)), FiniteSet(0, 2)
-        )
         self.assertSetEqual(
             self.s.maximum(Interval.Lopen(0, 1), Interval.Ropen(0, 1)),
             Interval.Lopen(0, 1),
@@ -322,87 +398,6 @@ class TestDomainRangeSolver(unittest.TestCase):
         neg_extended = Interval(-oo, 0).union(FiniteSet(-oo))
         self.assertSetEqual(self.s.minimum(neg_extended, FiniteSet(1)), neg_extended)
 
-    # A corner where the op is undefined (oo - oo, 0 * oo, 0 / 0, 1 / 0) is
-    # dropped, or taken as a limit when only one of its bounds is open.
-    def test_sub_of_unbounded_intervals_is_sound(self) -> None:
-        self.assertSetEqual(self.s.sub(_NON_NEG, _NON_NEG), S.Reals)
-        self.assertSetEqual(self.s.add(S.Reals, S.Reals), S.Reals)
-
-    def test_mul_of_unbounded_intervals(self) -> None:
-        self.assertSetEqual(self.s.mul(_NON_NEG, _NON_NEG), _NON_NEG)
-        self.assertSetEqual(self.s.mul(Interval.Lopen(0, 1), _NON_NEG), _NON_NEG)
-        self.assertSetEqual(self.s.mul(S.Reals, S.Reals), S.Reals)
-
-    def test_truediv_by_interval_open_at_zero(self) -> None:
-        # 0 / 0 and 1 / 0 at the excluded 0: the quotient grows without bound.
-        divisor = Interval.Lopen(0, 1)
-        self.assertSetEqual(self.s.truediv(Interval(0, 1), divisor), _NON_NEG)
-        self.assertSetEqual(self.s.truediv(FiniteSet(1), divisor), Interval(1, oo))
-        self.assertSetEqual(self.s.truediv(FiniteSet(-1), divisor), Interval(-oo, -1))
-        self.assertSetEqual(self.s.truediv(Interval(1, 2), Interval.open(0, oo)), _POS)
-
-    # abs, square and silu are not monotonic: an interval containing their
-    # turning point has an extreme there, not at an endpoint.
-    def test_abs_of_interval_spanning_zero(self) -> None:
-        self.assertSetEqual(self.s.abs(S.Reals), _NON_NEG)
-        self.assertSetEqual(self.s.abs(Interval(-2, 1)), Interval(0, 2))
-        self.assertSetEqual(self.s.abs(Interval.open(-1, 3)), Interval.Ropen(0, 3))
-        # The two endpoints reach the same bound: closed if either one is.
-        self.assertSetEqual(self.s.abs(Interval.Lopen(-2, 2)), Interval(0, 2))
-        self.assertSetEqual(self.s.abs(Interval.open(-2, 2)), Interval.Ropen(0, 2))
-
-    def test_square_of_interval_spanning_zero(self) -> None:
-        self.assertSetEqual(self.s.square(Interval(-2, 1)), Interval(0, 4))
-        self.assertSetEqual(self.s.square(S.Reals), _NON_NEG)
-
-    def test_non_monotonic_on_one_side_of_turning_point(self) -> None:
-        # Not containing the turning point, the endpoints are the extremes.
-        self.assertSetEqual(self.s.abs(Interval(-3, -1)), Interval(1, 3))
-        self.assertSetEqual(self.s.square(Interval.Lopen(0, 2)), Interval.Lopen(0, 4))
-        # The turning point as an excluded endpoint is not reached.
-        self.assertSetEqual(self.s.square(Interval.open(-1, 0)), Interval.open(0, 1))
-
-    def test_silu_of_interval_spanning_its_minimum(self) -> None:
-        # silu's minimum, ~-0.2785, is at x ~-1.2785.
-        r = self.s.silu(Interval(-2, 0))
-        self.assertAlmostEqual(float(r.inf), -0.2785, 4)
-        self.assertFalse(r.left_open)
-        self.assertEqual(float(r.sup), 0.0)
-        # Fully left of the minimum silu is decreasing.
-        r = self.s.silu(Interval(-3, -2))
-        self.assertAlmostEqual(float(r.inf), -2 / (1 + math.exp(2)))
-        self.assertAlmostEqual(float(r.sup), -3 / (1 + math.exp(3)))
-
-    # An open (or infinite) endpoint is not attained: the bound is the op's
-    # limit there, even where the op is undefined (log(sigmoid(x)) for any x
-    # reaches log on (0, 1)).
-    def test_log_of_open_positive_interval(self) -> None:
-        self.assertSetEqual(self.s.log(_POS), S.Reals)
-        self.assertSetEqual(self.s.log(Interval.open(0, 1)), Interval.open(-oo, 0))
-
-    def test_rsqrt_of_open_positive_interval(self) -> None:
-        self.assertSetEqual(self.s.rsqrt(_POS), _POS)
-        self.assertSetEqual(self.s.rsqrt(Interval.Lopen(0, 4)), Interval.Ropen(0.5, oo))
-
-    def test_reciprocal_of_open_interval(self) -> None:
-        self.assertSetEqual(self.s.reciprocal(_POS), _POS)
-        self.assertSetEqual(
-            self.s.reciprocal(Interval.open(-oo, 0)), Interval.open(-oo, 0)
-        )
-
-    def test_silu_of_reals(self) -> None:
-        r = self.s.silu(S.Reals)
-        self.assertAlmostEqual(float(r.inf), -0.2785, 4)
-        self.assertFalse(r.left_open)
-        self.assertEqual(r.sup, oo)
-
-    def test_open_endpoint_bound_is_open(self) -> None:
-        # The limit at an open endpoint is approached, not reached.
-        r = self.s.exp(Interval.Lopen(0, 1))
-        self.assertEqual(float(r.inf), 1.0)
-        self.assertTrue(r.left_open)
-        self.assertFalse(r.right_open)
-
     def test_clamp_floor_where(self) -> None:
         self.assertSetEqual(self.s.clamp(S.Reals, 0, 1), Interval(0, 1))
         self.assertSetEqual(self.s.clamp(S.Reals, min=0), _NON_NEG)
@@ -416,13 +411,6 @@ class TestDomainRangeSolver(unittest.TestCase):
         self.assertSetEqual(
             self.s.where(FiniteSet(1), FiniteSet(0), FiniteSet(2)), FiniteSet(0, 2)
         )
-
-    def test_comparisons(self) -> None:
-        self.assertSetEqual(self.s.eq(FiniteSet(0), FiniteSet(0)), FiniteSet(True))
-        self.assertSetEqual(self.s.lt(FiniteSet(1), FiniteSet(0)), FiniteSet(False))
-        # Not both singletons: any boolean.
-        self.assertSetEqual(self.s.lt(FiniteSet(0), Interval(0, 1)), FiniteSet(0, 1))
-        self.assertSetEqual(self.s.ne(FiniteSet(0, 1), FiniteSet(0)), FiniteSet(0, 1))
 
     def test_range_fallbacks_contain_the_range(self) -> None:
         # Ops without an exact image return a superset of their range.
@@ -540,7 +528,6 @@ class TestDomainRangeSolver(unittest.TestCase):
 instantiate_parametrized_tests(TestDomainRangeSolver)
 
 
-_NAN = padding._NAN
 _NAN_SET = FiniteSet(_NAN)
 
 
@@ -718,16 +705,16 @@ class TestSetDtypeTracer(unittest.TestCase):
     def test_binary_promotes_dtype(self) -> None:
         r = self._run(
             lambda: ops.add(self._load("x"), self._load("y")),
-            {"x": (FiniteSet(1), torch.float16), "y": (Interval(0, 1), torch.float32)},
+            {"x": (FiniteSet(1), torch.float16), "y": (FiniteSet(2), torch.float32)},
         )
-        self.assertEqual(r, SetDtype(Interval(1.0, 2.0), torch.float32))
+        self.assertEqual(r, SetDtype(FiniteSet(3.0), torch.float32))
 
     def test_comparison_is_bool(self) -> None:
         r = self._run(
             lambda: ops.lt(self._load("x"), self._load("y")),
             {"x": (FiniteSet(1), torch.float16), "y": (FiniteSet(2), torch.float16)},
         )
-        self.assertEqual(r, SetDtype(FiniteSet(True), torch.bool))
+        self.assertEqual(r, SetDtype(FiniteSet(1), torch.bool))
 
     def test_to_dtype_changes_dtype_keeps_set(self) -> None:
         r = self._run(

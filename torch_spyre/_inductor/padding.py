@@ -53,7 +53,9 @@ M=1 (decode phase) correctly.
 from typing import Any, Union
 import dataclasses
 import functools
+import itertools
 import struct
+import sys
 import math
 import operator
 
@@ -1219,33 +1221,104 @@ class InvalidDomain(Exception):
         self.arg_index = arg_index
 
 
-# DomainRangeSolver writes unary ops as sympy expressions in this variable.
-_X = sympy.Symbol("x", real=True)
-
-_SIGMOID = 1 / (1 + sympy.exp(-_X))
-
-
-# silu(x) = x * sigmoid(x) decreases up to its minimum, ~-0.2785 at this x, and
-# increases after it.
-_SILU_ARGMIN = -1.278464542761074
+def _sigmoid(x: float) -> float:
+    # Written so neither branch overflows: math.exp(-x) overflows for x < -709.
+    if x >= 0:
+        return 1.0 / (1.0 + math.exp(-x))
+    return math.exp(x) / (1.0 + math.exp(x))
 
 
-@functools.lru_cache(maxsize=None)
-def _eval_at(expr: Expr, point: Expr, approach: str | None) -> Expr:
-    """expr at x = point, or its one-sided limit when approach is "+" or "-".
+def _log(x: float) -> float:
+    # log(0) is -inf and log(inf) is inf, as on the device; math.log raises.
+    if x == 0:
+        return -math.inf
+    return math.log(x)
 
-    A limit gives the value the op tends to at an excluded endpoint, where it
-    may not be defined (log at 0, silu at -oo). A finite value is rounded to a
-    float, like the device computes it (exp(-1e4) underflows to 0).
+
+def _reciprocal(x: float) -> float:
+    # 1/(+-0) is +-inf and 1/(+-inf) is 0, as on the device.
+    if x == 0:
+        return math.copysign(math.inf, x)
+    return 1.0 / x
+
+
+def _evaluate(op, *args) -> Expr:
+    try:
+        value = op(*(float(a) for a in args))
+    except OverflowError:
+        return oo
+    except (ValueError, ZeroDivisionError):
+        return _NAN
+    if math.isnan(value):
+        return _NAN
+    if math.isinf(value):
+        return oo if value > 0 else -oo
+    return sympy.Float(value)
+
+
+# The sign of a padding value: the piece of the extended reals it lies in.
+# sympy intervals exclude +-oo, so the infinities are pieces of their own.
+_SIGN_PIECES: dict[str, Set] = {
+    "-oo": FiniteSet(-oo),
+    "-": Interval.open(-oo, 0),
+    "0": FiniteSet(0),
+    "+": Interval.open(0, oo),
+    "+oo": FiniteSet(oo),
+}
+
+# Values standing for each sign: the extremes and 1. Every sign an op can
+# give on a piece is given on one of these, since the op is monotonic on each
+# piece and a result past them underflows or overflows. The signs are the
+# same in every float dtype, so float64's extremes serve for all.
+_TINY = 5e-324  # smallest float64 subnormal
+_HUGE = sys.float_info.max
+_SIGN_SAMPLES: dict[str, tuple[float, ...]] = {
+    "-oo": (-math.inf,),
+    "-": (-_HUGE, -1.0, -_TINY),
+    "0": (0.0,),
+    "+": (_TINY, 1.0, _HUGE),
+    "+oo": (math.inf,),
+}
+
+
+def _signs(s: Set) -> list[str]:
+    """The signs of the values in s. An undecidable piece counts (safe)."""
+    return [
+        k
+        for k, piece in _SIGN_PIECES.items()
+        if s.intersect(piece).is_empty is not True
+    ]
+
+
+def _sign_of(value: float) -> str | None:
+    """The sign of value, or None for NaN."""
+    if math.isnan(value):
+        return None
+    if math.isinf(value):
+        return "+oo" if value > 0 else "-oo"
+    return "0" if value == 0 else ("+" if value > 0 else "-")
+
+
+def _sign_image(op, *sets: Set) -> Set:
+    """The values op can give on sets, known only up to their signs.
+
+    op is evaluated on the samples of every combination of the inputs' signs,
+    and the result is the union of the pieces of the signs it gives. A NaN
+    result (0 * oo) adds NaN.
     """
-    if approach is None:
-        value = expr.subs(_X, point)
-    else:
-        value = sympy.limit(expr, _X, point, approach)
-    if not value.is_finite:
-        # Infinite, or a limit sympy could not evaluate.
-        return value
-    return sympy.Float(float(value))
+    signs = set()
+    for combination in itertools.product(*(_signs(s) for s in sets)):
+        for values in itertools.product(*(_SIGN_SAMPLES[k] for k in combination)):
+            try:
+                signs.add(_sign_of(op(*values)))
+            except OverflowError:
+                signs.add("+oo")
+            except (ValueError, ZeroDivisionError):
+                signs.add(None)
+    pieces = [_SIGN_PIECES[k] for k in signs if k is not None]
+    if None in signs:
+        pieces.append(FiniteSet(_NAN))
+    return sympy.Union(*pieces)
 
 
 # Placeholder returned by the tracers' indirect_indexing. A load whose index
@@ -1346,6 +1419,7 @@ class DomainRangeSolver(DefaultHandler):
         self.extended_strictly_positive_numbers = self.strictly_positive_numbers.union(
             FiniteSet(oo)
         )
+        self.extended_positive_numbers = self.positive_numbers.union(FiniteSet(oo))
 
     def constant(self, value: Union[bool, float, int], dtype: torch.dtype) -> Set:
         return FiniteSet(value)
@@ -1390,118 +1464,25 @@ class DomainRangeSolver(DefaultHandler):
             # other reductions can leave some garbage in padding
             return S.Reals
 
-    def _unary_op(self, expr, x0, fallback_set=None, turning_points=()) -> Set:
-        """Image of x0 under the op expr, a sympy expression in _X.
-
-        expr must be continuous on x0 and monotonic between consecutive
-        turning_points (where it changes direction, e.g. 0 for abs and square).
-        The extremes of the image of an interval then lie at its endpoints, or
-        at a turning point inside it. A closed endpoint is attained, so expr is
-        evaluated there. An open one (and so every infinite one) is not, and
-        expr only tends to its limit there, which is an open bound.
-        """
+    def _unary_op(self, op, x0, image) -> Set:
         if isinstance(x0, FiniteSet):
-            return FiniteSet(*(_eval_at(expr, e, None) for e in x0))
-        elif isinstance(x0, Interval):
-            # Each candidate is a pair of (value, open).
-            candidates = [
-                (_eval_at(expr, x0.inf, "+" if x0.left_open else None), x0.left_open),
-                (_eval_at(expr, x0.sup, "-" if x0.right_open else None), x0.right_open),
-            ]
-            # A turning point inside the interval is attained, so its value is
-            # a closed bound.
-            candidates += [
-                (_eval_at(expr, t, None), False)
-                for t in turning_points
-                if x0.contains(t) is S.true
-            ]
-            lo = min(v for v, _ in candidates)
-            hi = max(v for v, _ in candidates)
-            # A bound is open only if every candidate reaching it is open.
-            lo_open = all(o for v, o in candidates if v == lo)
-            hi_open = all(o for v, o in candidates if v == hi)
-            return Interval(lo, hi, left_open=lo_open, right_open=hi_open)
-        if fallback_set is not None:
-            return fallback_set
-        return x0
+            return FiniteSet(*(_evaluate(op, e) for e in x0))
+        return _sign_image(op, x0).intersect(image)
 
-    def _singleton_set_binary(self, op, x0, x1, fallback_set) -> Set:
-        if (
-            isinstance(x0, FiniteSet)
-            and len(x0) == 1
-            and isinstance(x1, FiniteSet)
-            and len(x1) == 1
-        ):
-            return FiniteSet(op(x0.args[0], x1.args[0]))
-        return fallback_set
-
-    @staticmethod
-    def _corner(op, a, b) -> Expr | None:
-        """op at the corner (a, b) of a box.
-
-        a and b are (bound, open, is_upper) endpoints. A corner where op is
-        undefined (1/0, 0/0, 0 * oo, oo - oo) and one bound is open is not
-        attained: op only tends to its limit in that coordinate there. A corner
-        with both bounds open is dropped (None). op is monotonic in each
-        argument, so where the two iterated limits disagree (oo - oo) each is
-        also reached along an edge, at another corner. Like _eval_at, a finite
-        value is a float, so that equal bounds compare equal.
-        """
-        value = sympy.sympify(op(a[0], b[0]))
-        if value is not S.NaN and value is not S.ComplexInfinity:
-            return value if value.is_infinite else sympy.Float(float(value))
-        if a[1] and b[1]:
-            return None
-        if a[1]:
-            return _eval_at(sympy.sympify(op(_X, b[0])), a[0], "+-"[a[2]])
-        return _eval_at(sympy.sympify(op(a[0], _X)), b[0], "+-"[b[2]])
-
-    def _binary_op(self, op, x0, x1, output_set=None) -> Set:
-        # Assumes op is monotonic in each argument, so the
-        # extremes of the result lie at the corners of the input bounds.
+    def _binary_op(self, op, x0, x1, image=None) -> Set:
         if isinstance(x0, FiniteSet) and isinstance(x1, FiniteSet):
-            return FiniteSet(*(op(a, b) for a in x0 for b in x1))
+            return FiniteSet(*(_evaluate(op, a, b) for a in x0 for b in x1))
+        result = _sign_image(op, x0, x1)
+        return result if image is None else result.intersect(image)
 
-        def pieces(x):
-            # Each piece is a pair of (bound, open, is_upper) endpoints.
-            if isinstance(x, FiniteSet):
-                return [((e, False, False), (e, False, True)) for e in x]
-            return [((x.inf, x.left_open, False), (x.sup, x.right_open, True))]
-
-        if isinstance(x0, (FiniteSet, Interval)) and isinstance(
-            x1, (FiniteSet, Interval)
-        ):
-            result = S.EmptySet
-            for a_lo, a_hi in pieces(x0):
-                for b_lo, b_hi in pieces(x1):
-                    corners = [
-                        (v, a[1] or b[1])
-                        for a in (a_lo, a_hi)
-                        for b in (b_lo, b_hi)
-                        if (v := self._corner(op, a, b)) is not None
-                    ]
-                    if not corners or any(
-                        v is S.NaN or v.has(sympy.Limit) for v, _ in corners
-                    ):
-                        return output_set if output_set is not None else x0.union(x1)
-                    lo = min(v for v, _ in corners)
-                    hi = max(v for v, _ in corners)
-                    # A bound is open only if every corner reaching it is open.
-                    lo_open = all(o for v, o in corners if v == lo)
-                    hi_open = all(o for v, o in corners if v == hi)
-                    result = result.union(
-                        Interval(lo, hi, left_open=lo_open, right_open=hi_open)
-                    )
-            return result
-        if output_set is not None:
-            return output_set
-        return x0.union(x1)
+    def _compare(self, op, x0, x1) -> Set:
+        if isinstance(x0, FiniteSet) and isinstance(x1, FiniteSet):
+            return FiniteSet(*(int(bool(op(a, b))) for a in x0 for b in x1))
+        return self.booleans
 
     @_propagates_nan
     def abs(self, x0):
-        return self._unary_op(
-            sympy.Abs(_X), x0, self.positive_numbers, turning_points=(0,)
-        )
+        return self._unary_op(abs, x0, self.positive_numbers)
 
     @_propagates_nan
     def add(self, x0, x1):
@@ -1509,8 +1490,6 @@ class DomainRangeSolver(DefaultHandler):
 
     @_propagates_nan
     def clamp(self, x, min=None, max=None):
-        # clamp(x) = min(max(x, lo), hi): values outside [lo, hi] move to the
-        # nearest bound, they are not dropped.
         if min is not None:
             x = self.maximum(x, FiniteSet(min))
         if max is not None:
@@ -1519,11 +1498,11 @@ class DomainRangeSolver(DefaultHandler):
 
     @_nan_gives_any_boolean
     def eq(self, x0, x1):
-        return self._singleton_set_binary(lambda x, y: x == y, x0, x1, self.booleans)
+        return self._compare(operator.eq, x0, x1)
 
     @_propagates_nan
     def exp(self, x0):
-        return self._unary_op(sympy.exp(_X), x0, self.positive_numbers)
+        return self._unary_op(math.exp, x0, self.extended_positive_numbers)
 
     def exx2(self, x, scale, useZeroMean):
         return self.positive_numbers
@@ -1534,7 +1513,7 @@ class DomainRangeSolver(DefaultHandler):
 
     @_nan_gives_any_boolean
     def ge(self, x0, x1):
-        return self._singleton_set_binary(operator.ge, x0, x1, self.booleans)
+        return self._compare(operator.ge, x0, x1)
 
     @_propagates_nan
     def gelu(self, x):
@@ -1542,7 +1521,7 @@ class DomainRangeSolver(DefaultHandler):
 
     @_nan_gives_any_boolean
     def gt(self, x0, x1):
-        return self._singleton_set_binary(operator.gt, x0, x1, self.booleans)
+        return self._compare(operator.gt, x0, x1)
 
     def keep_by_index(self, x, indices):
         return x
@@ -1557,23 +1536,23 @@ class DomainRangeSolver(DefaultHandler):
     def log(self, x0):
         if not x0.is_subset(self.extended_strictly_positive_numbers):
             raise InvalidDomain(self.extended_strictly_positive_numbers, "log")
-        return self._unary_op(sympy.log(_X), x0, S.Reals)
+        return self._unary_op(_log, x0, S.Reals)
 
     @_nan_gives_any_boolean
     def le(self, x0, x1):
-        return self._singleton_set_binary(operator.le, x0, x1, self.booleans)
+        return self._compare(operator.le, x0, x1)
 
     @_nan_gives_any_boolean
     def logical_and(self, x0, x1):
-        return self._singleton_set_binary(operator.and_, x0, x1, self.booleans)
+        return self._compare(lambda a, b: a and b, x0, x1)
 
     @_nan_gives_any_boolean
     def logical_or(self, x0, x1):
-        return self._singleton_set_binary(operator.or_, x0, x1, self.booleans)
+        return self._compare(lambda a, b: a or b, x0, x1)
 
     @_nan_gives_any_boolean
     def lt(self, x0, x1):
-        return self._singleton_set_binary(operator.lt, x0, x1, self.booleans)
+        return self._compare(operator.lt, x0, x1)
 
     # max and min are constant where one argument dominates, so a bound from
     # an open corner can still be attained (max(x, 0) = 0 for every x <= 0).
@@ -1622,17 +1601,17 @@ class DomainRangeSolver(DefaultHandler):
 
     @_nan_gives_any_boolean
     def ne(self, x0, x1):
-        return self._singleton_set_binary(operator.ne, x0, x1, self.booleans)
+        return self._compare(operator.ne, x0, x1)
 
     @_propagates_nan
     def neg(self, x0: Set):
-        return self._unary_op(-_X, x0, S.Reals)
+        return self._unary_op(operator.neg, x0, S.Reals)
 
     @_propagates_nan
     def reciprocal(self, x0):
         if not x0.is_subset(self.extended_non_zero_reals):
             raise InvalidDomain(self.extended_non_zero_reals, "reciprocal")
-        return self._unary_op(1 / _X, x0, self.extended_non_zero_reals)
+        return self._unary_op(_reciprocal, x0, self.extended_non_zero_reals)
 
     def qfp8ch(self, x):
         return x
@@ -1654,29 +1633,32 @@ class DomainRangeSolver(DefaultHandler):
         if not x0.is_subset(self.extended_strictly_positive_numbers):
             raise InvalidDomain(self.extended_strictly_positive_numbers, "rsqrt")
         return self._unary_op(
-            1 / sympy.sqrt(_X), x0, self.extended_strictly_positive_numbers
+            lambda x: _reciprocal(math.sqrt(x)),
+            x0,
+            self.extended_strictly_positive_numbers,
         )
 
     @_propagates_nan
     def sigmoid(self, x0):
-        return self._unary_op(
-            _SIGMOID, x0, Interval(0, 1, left_open=True, right_open=True)
-        )
+        # Saturates to exactly 0 and 1 on the device (sigmoid(-20) == 0).
+        return self._unary_op(_sigmoid, x0, Interval(0, 1))
 
     @_propagates_nan
     def softplus(self, x, beta, threshold):
-        sp = sympy.log(1 + sympy.exp(beta * _X)) / beta
-        return self._unary_op(sp, x, Interval(-0.278, sympy.oo))
+        def sp(v):
+            return v if beta * v > threshold else math.log1p(math.exp(beta * v)) / beta
+
+        return self._unary_op(sp, x, self.positive_numbers)
 
     @_propagates_nan
     def sqrt(self, x0):
         if not x0.is_subset(self.positive_numbers):
             raise InvalidDomain(self.positive_numbers, "rsqrt")
-        return self._unary_op(sympy.sqrt(_X), x0, self.positive_numbers)
+        return self._unary_op(math.sqrt, x0, self.positive_numbers)
 
     @_propagates_nan
     def square(self, x0):
-        return self._unary_op(_X**2, x0, self.positive_numbers, turning_points=(0,))
+        return self._unary_op(lambda x: x * x, x0, self.extended_positive_numbers)
 
     @_propagates_nan
     def sub(self, x0, x1):
@@ -1684,9 +1666,8 @@ class DomainRangeSolver(DefaultHandler):
 
     @_propagates_nan
     def tanh(self, x0):
-        return self._unary_op(
-            sympy.tanh(_X), x0, Interval(-1, 1, left_open=True, right_open=True)
-        )
+        # Saturates to exactly -1 and 1 on the device.
+        return self._unary_op(math.tanh, x0, Interval(-1, 1))
 
     def to_dtype(self, x, dtype, src_dtype=None, use_compute_types=False):
         return x
@@ -1700,12 +1681,8 @@ class DomainRangeSolver(DefaultHandler):
 
     @_propagates_nan
     def silu(self, x0):
-        return self._unary_op(
-            _X * _SIGMOID,
-            x0,
-            Interval(-0.278, sympy.oo),
-            turning_points=(_SILU_ARGMIN,),
-        )
+        # silu's minimum is ~-0.2785 (-0.27856 in fp16).
+        return self._unary_op(lambda x: x * _sigmoid(x), x0, Interval(-0.279, oo))
 
     @_propagates_nan
     def where(self, condition, input, other):
