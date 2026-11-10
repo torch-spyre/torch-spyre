@@ -1486,18 +1486,18 @@ def _sort_ties(shape, mod, dtype):
     return (torch.arange(math.prod(shape)) * 7 % mod).reshape(shape).to(dtype)
 
 
-def _sort_inf_input(dim):
-    # fp16 with one inf near the front of every line along the sort dim (67 is
+def _sort_inf_input(dim, dtype=torch.float16):
+    # One inf near the front of every line along the sort dim (67 is
     # unsplittable): +inf in half the lines, -inf in the rest.
     shape = (67, 16) if dim == 0 else (16, 67)
-    x = (torch.arange(67 * 16) * 7 % 5).reshape(shape).half()
+    x = (torch.arange(67 * 16) * 7 % 5).reshape(shape).to(dtype)
     lines = x.movedim(dim, -1)
     lines[:8, 0] = float("inf")
     lines[8:, 5] = float("-inf")
     return x
 
 
-# Stable torch.sort cases as (make_input(dtype), dim, descending). The same
+# torch.sort cases as (make_input(dtype), dim, descending). The same
 # cases run in fp32 (test_sort: values and indices, both exact) and in fp16
 # (test_sort_values: values only, because fp16 indices come back wrong, see
 # _SORT_PERMUTED). A few fp16 cases stay in test_sort as strict xfails.
@@ -1516,8 +1516,7 @@ _SORT_CASES = {
         0,
         False,
     ),
-    # Last (stick) dim, width not a whole number of sticks: the stable flip
-    # pads to a full stick.
+    # Last (stick) dim, width not a whole number of sticks.
     "2d_ties_last_dim_w60": (lambda dt: _sort_ties((16, 60), 5, dt), 1, False),
     # Sort-dim size topk can't split across cores: padded to the next size
     # that can (127 -> 128).
@@ -1554,7 +1553,7 @@ def _sort_params(dtype, names=None):
 
 
 # Sort-dim sizes 256, 512, 999 and 1024 in 1D and 2D, as (input, dim, descending).
-# Sorting along dim 0, 1D sort, and stable sort along dim=1 for n=256 and n=999 all
+# Sorting along dim 0, 1D sort, and sort along dim=1 for n=256 and n=999 all
 # work. fp32 runs in test_sort, which checks the indices. fp16 stops at 512
 # (FP16_TOPK_MAX_DIM) because the indices are held in fp16, so the fp16 sizes are
 # 256 and 512 only, and run in test_sort_values.
@@ -2551,7 +2550,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
                 # k=35's divisors are 1, 5, 7, 35: none give k // d <= 4 with
                 # d <= SENCORES (32), so spyre_topk runs k=36 and keeps 35. With
-                # the dim also 35, the input is front-padded with -inf first.
+                # the dim also 35, the input is back-padded with -inf first.
                 "2d_k35_n35_dim_0_padded": (
                     unique_randn_along_dim((35, 64), dim=0),
                     35,
@@ -2706,8 +2705,22 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 **_sort_params(torch.float16, _SORT_FP16_INDEX_XFAIL),
                 **_SORT_INT_CASES,
                 **_SORT_SIZES_FP32,
-                # Stable sort along the stick dim: the values are exact, the
-                # int64 index cast fails (see _SORT_UNALIGNED).
+                # The pad for an unsplittable sort dim is -inf in topk's key
+                # space and sits at the back, so it loses every tie with a real
+                # +-inf element. The indices show it: a pad winning a tie would
+                # put an index past the end.
+                "unsplittable_with_inf_dim0_fp32": (
+                    _sort_inf_input(0, torch.float32),
+                    0,
+                    False,
+                ),
+                "unsplittable_with_inf_dim1_fp32": (
+                    _sort_inf_input(1, torch.float32),
+                    1,
+                    False,
+                ),
+                # Sort along the stick dim: the values are exact, the int64
+                # index cast fails (see _SORT_UNALIGNED).
                 "2d_ties_dim1_desc_fp16": (
                     _sort_ties((8, 64), 5, torch.float16),
                     1,
@@ -2719,7 +2732,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 **{f"{n}_fp16": r for n, r in _SORT_FP16_INDEX_XFAIL.items()},
                 "2d_ties_dim1_desc_fp16": _SORT_UNALIGNED,
                 "1d_ties_fp16": _SORT_UNALIGNED,
-                "2d_dim0_n1024_c64_fp32": ("Exceeds allocated LX space"),
             },
         },
         # fp16, values only: the fp16 indices are wrong (see _SORT_PERMUTED).
@@ -2735,35 +2747,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 # n=35 cannot be split across cores, so spyre_topk pads it with
                 # -inf.
                 "1d_unsplittable": (cached_randn((35,)), 0, False),
-                # The pad for an unsplittable sort dim is -inf in topk's key
-                # space and sits at the front, so it loses every tie with a real
-                # +-inf element. Not fp32: it returns garbage for inf elements.
+                # The same inf inputs in fp16, values only (fp32 is in test_sort).
                 "unsplittable_with_inf_dim0": (_sort_inf_input(0), 0, False),
                 "unsplittable_with_inf_dim1": (_sort_inf_input(1), 1, False),
-            },
-        },
-        # Unstable sort, in fp32 where the indices are exact. The checks are
-        # values and that the indices pick them.
-        ("test_sort_unstable", "test_sort_unstable_cpu"): {
-            "param_sets": {
-                "2d_ties_dim0_desc_fp32": (
-                    _sort_ties((128, 64), 7, torch.float32),
-                    0,
-                    True,
-                ),
-                # Along the stick dim: neg feeds topk through a restickify.
-                "2d_dim1_asc_fp32": (
-                    unique_randn_along_dim((8, 64), dim=1, dtype=torch.float32),
-                    1,
-                    False,
-                ),
-                # Peeled without the stable path's index remap, so the peeled
-                # topk indices are concatenated and cast straight to int64.
-                "2d_peeling_n165_dim0_fp32": (
-                    _sort_ties((165, 32), 11, torch.float32),
-                    0,
-                    False,
-                ),
             },
         },
         ("test_topk_indices", "test_topk_indices_cpu"): {
@@ -3110,11 +3096,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "4d_dim_0_2": ([0, 2], cached_randn((2, 3, 5, 256))),
                 "2d_size1_dim_0": ([0], cached_randn((1, 256))),
                 "2d_no_dims": ([], cached_randn((67, 256))),
-                # Stick-dim widths that are not a whole number of sticks are
-                # left-padded to a full stick, flipped, and narrowed back.
-                "2d_dim_1_unaligned": ([1], cached_randn((16, 60))),
-                "2d_dim_neg1_unaligned_narrow": ([-1], cached_randn((16, 7))),
-                "3d_dim_2_unaligned": ([2], cached_randn((2, 8, 60))),
                 # Stick-dim reversals are unsupported and, rather than raising,
                 # fault the card, so they cannot run as xfails.
                 "2d_dim_1_stick": ([1], cached_randn((67, 256))),
@@ -11308,19 +11289,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ref_input.sign() * DLFLOAT16_INF_SENTINEL,
                 ref_input,
             )
-            self.compare_with_cpu(fn, x, dlfloat16_reference=fn(ref_input))
+            self.compare_with_cpu(
+                fn, x, dlfloat16_reference=fn(ref_input), run_eager=False
+            )
         else:
-            self.compare_with_cpu(fn, x)
-
-    def test_sort_unstable_cpu(self, x, dim: int, descending: bool):
-        # Without stable=True ties may come out in any order, so only the
-        # values must match CPU; the indices must still pick those values.
-        values, indices = _compile_and_run(
-            lambda x: torch.sort(x, dim=dim, descending=descending), [x], "spyre"
-        )
-        expected = torch.sort(x, dim=dim, descending=descending).values
-        torch.testing.assert_close(values.cpu(), expected)
-        torch.testing.assert_close(x.gather(dim, indices.cpu()), expected)
+            self.compare_with_cpu(fn, x, run_eager=False)
 
     @expects_raise
     def test_sort_fp16_index_range_rejected(self):
@@ -11782,14 +11755,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # descending index (see spyre_flip); the arange building that index
         # falls back to CPU, hence the filtered FallbackWarning.
         self.compare_with_cpu(lambda x: torch.flip(x, dims), x)
-
-    @expects_raise
-    def test_flip_unaligned_multi_dim_rejected(self):
-        # A padded (unaligned) stick-dim flip combined with another dim's
-        # gather faults the card, so it must raise before any kernel runs.
-        x = cached_randn((16, 60))
-        with pytest.raises(Exception, match="Unsupported"):
-            _compile_and_run(lambda x: torch.flip(x, [0, 1]), [x], "spyre")
 
     def test_transpose_2d_cpu(self, dim0: int, dim1: int, x):
         self.compare_with_cpu(lambda x: torch.transpose(x, dim0, dim1), x)

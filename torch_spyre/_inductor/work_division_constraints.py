@@ -796,8 +796,8 @@ def qfp8wt_matmul_k_split_domains(ctx: WorkDivConstraintContext) -> ConstraintRe
 def legal_topk_k_splits(k: int) -> frozenset[int]:
     """Core counts that split ``k`` topk results with at most four per core.
 
-    Shared by the topk and keep_by_index constraints and by ``spyre_sort``,
-    which pads an unsplittable sort dim up to a size this accepts.
+    Shared by the topk and keep_by_index constraints and by ``spyre_topk``,
+    which pads an unsplittable search dim up to a size this accepts.
     """
     return frozenset(
         split
