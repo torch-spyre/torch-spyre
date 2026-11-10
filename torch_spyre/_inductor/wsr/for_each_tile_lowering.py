@@ -3412,7 +3412,6 @@ def splice_while_loops(graph) -> None:
     from torch._inductor import ir
 
     from torch_spyre._inductor.errors import Unsupported
-    from torch_spyre._inductor.wsr.loop_tiling_common import _rebase_point_splice_reads
     from torch_spyre._inductor.wsr.while_loop_bridge import (
         carry_bindings_for,
         splice_while_loop,
@@ -3537,20 +3536,14 @@ def splice_while_loops(graph) -> None:
     # the complete K/V cache on each trip.
     _contract_exact_stride_input_materializations(graph, pending_levels)
 
-    # Read-side counterpart of the stamping above: _stamp_direct_loop_info
-    # records a point-shaped splice read's per-trip step in
-    # squeezed_advance_per_read (mirroring coarse_tile.py's own
-    # _point_splice_advance_for_dep -- see that function's docstring), but
-    # leaves the read's index itself unrebased (e.g. paged attention's
-    # in-body page index, dep.index == 32*u0). coarse_tile_post_stickify
-    # reaches _rebase_point_splice_reads for this same shape, but WhileLoop-
-    # splice groups never go through it -- see this function's own docstring.
-    # Without this call the raw indirect symbol survives into
-    # propagate_spyre_tensor_layouts, which rejects it (not an
-    # iteration_space key). Run once, after every level's stamping has been
-    # merged in above, so squeezed_advance_per_read reflects each op's final,
-    # fully-merged state rather than a partially-stamped intermediate.
-    _rebase_point_splice_reads(graph.operations)
+    # A point-shaped splice read (paged attention's in-body page index,
+    # dep.index == 32*u0) keeps its loop term in the index; it is not rebased to
+    # iteration 0 here. The kernel still takes the per-trip step from
+    # squeezed_advance_per_read, and pins the term to 0 in the base coordinates
+    # (pass_utils.per_trip_index), so the term does not reach device_coordinates.
+    # (Layout propagation accepts the loop variable; the three paged_gather
+    # fixtures compile and agree without a rebase. The rebase this call used to
+    # make is still done by the span-overflow path, loop_tiling_common.)
 
     if pending_levels:
         # Splicing/unrolling leaves dead carry-snapshot and marker scaffolding
