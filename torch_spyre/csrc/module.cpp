@@ -1190,7 +1190,7 @@ PYBIND11_MODULE(_C, m) {
         TORCH_CHECK(allocator != nullptr,
                     "num_memory_domains requires the Flex runtime to be "
                     "initialized");
-        return allocator->topology().num_domains();
+        return allocator->topology().numDomains();
       },
       "Number of memory domains in the Flex device topology.");
 
