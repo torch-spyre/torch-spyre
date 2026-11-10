@@ -1422,6 +1422,13 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 "[CP-SAT layout solver] cut tiebreak over %d candidate cut(s)",
                 len(cut_terms),
             )
+            # OR-tools 9.15 aborts the process when an LNS sub-solve's hint (the
+            # incumbent) lies below a domain its presolve reduced: the hint is
+            # not clamped before the encoding lookup. Tiling solves produce such
+            # sub-solves; this solve passes no hint, so without LNS none exists.
+            # TODO: drop once the pinned OR-tools contains google/or-tools@cd4ed0991
+            # (google/or-tools#5288).
+            solver.parameters.use_lns = False
         # Tile counts, so the last stage can prefer the coarsest tiling. Empty
         # unless the joint solve is choosing tilings, like ``cut_terms``.
         tile_terms = self._tile_count_terms(model, tensors)
