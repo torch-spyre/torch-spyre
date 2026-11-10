@@ -2450,27 +2450,6 @@ def compute_restickify_target_layout(
         old_var = None
     if len(old_var_outer_dims) > 1:
         return None
-    # SANITY (old-side): now that old_var is non-factorized on the device side,
-    # check whether host_size/stride at the single host dim carrying old_var
-    # match what _host_size_stride_for_expr returned — if so, we can drop the call.
-    if old_var is not None:
-        _old_host_dims = [d for d, e in enumerate(ic) if old_var in e.free_symbols]
-        if len(_old_host_dims) == 1:
-            _old_d = _old_host_dims[0]
-            assert host_size[_old_d] == old_sd_host_size, (
-                f"old-side size mismatch: host_size[{_old_d}]={host_size[_old_d]} vs {old_sd_host_size}"
-            )
-            assert host_stride[_old_d] == old_sd_host_stride, (
-                f"old-side stride mismatch: host_stride[{_old_d}]={host_stride[_old_d]} vs {old_sd_host_stride}"
-            )
-        else:
-            # old_var spans multiple host dims even though device side is non-factorized
-            # (collapsed by _prepare_for_restickify). Log to understand this case.
-            assert False, (
-                f"old_var={old_var!r} spans {len(_old_host_dims)} host dims after "
-                f"device-side non-factorized guard: ic={ic!r}, old_sd_host_size={old_sd_host_size}, "
-                f"old_sd_host_stride={old_sd_host_stride}"
-            )
     old_device_size = list(stl.device_size)
     old_stride_map = list(stl.stride_map)
     old_sd_outer_dim = next(
