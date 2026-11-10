@@ -108,7 +108,7 @@ test_suite_config:
         - names: # Tests that fail 
             # ---------------------- Few tests removed from this list since its throwing a seg fault ---------------------------------
             # ------------------------------------------------------------------------------------------------------------------------
-            - TestViewOps::test_advanced_indexing_nonview   # NotImplementedError: Could not run 'aten::index.Tensor_out' https://github.com/torch-spyre/torch-spyre/issues/1219
+            - TestViewOps::test_advanced_indexing_nonview   # NotImplementedError: aten::index.Tensor supports only a single 1-D integer index; the test uses two 2-D index tensors https://github.com/torch-spyre/torch-spyre/issues/1219
             - TestViewOps::test_advanced_indexing_assignment   # NotImplementedError aten::_index_put_impl_ https://github.com/torch-spyre/torch-spyre/issues/692
             # - TestViewOps::test_flatten_view    # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80 
             - TestViewOps::test_unfold_view   # RuntimeError: Comparing, Error in codegen for ComputedBuffer https://github.com/torch-spyre/torch-spyre/issues/1226

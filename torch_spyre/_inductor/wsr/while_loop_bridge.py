@@ -35,17 +35,22 @@ differently:
                 real ``while_op.carried_inputs[i]`` object; nothing else is
                 needed.
   accumulator   the body computes a new value each iteration, in place,
-                read once at the end. Rewired via fill/rewrite/drain:
+                read once at the end. Declared here and made in place by
+                ``loop_carries.apply_loop_carries``, later in the
+                pre-scheduling pipeline:
 
                   fill    the carry's own real initial buffer's pre-loop
                           producer seeds it
                   rewrite the single spliced copy of the body op that wrote
-                          this carry is redirected (via
-                          ``_rewire_accumulator_output``) to read and write
-                          that same real initial buffer in place, standing
-                          in for every trip
+                          this carry (the update) is declared a
+                          ``LoopCarryRecord`` here (via
+                          ``_rewire_accumulator_output``); the pass then
+                          makes it read and write that same real initial
+                          buffer in place, standing in for every trip
                   drain   the buffer itself IS the final value after the
-                          last trip, so outside consumers read it directly
+                          last trip; until the pass runs the loop result is
+                          the update's own buffer, which the pass then
+                          points at the storage
 
   stacking      each iteration writes a DIFFERENT SLICE of one larger
                 result (e.g. ``scan``'s ``ys``). There is no intermediate
@@ -490,8 +495,9 @@ def _extra_readers_of_placeholder(
     producer and still reads placeholder_name (the carry's OLD,
     pre-iteration value).
 
-    ``_rewire_accumulator_output`` makes the carry's new value land in place
-    in the carry's own initial buffer -- correct for PyTorch's ``while_loop``
+    ``_rewire_accumulator_output`` declares the carry, and ``apply_loop_carries``
+    makes the carry's new value land in place in the carry's own initial
+    buffer -- correct for PyTorch's ``while_loop``
     semantics (which give every iteration's body a copy-in/compute/copy-out
     view of each carry) only because the *read* side is also redirected to
     that same buffer (see splice_while_loop's ``name_map``). Once the
@@ -802,6 +808,39 @@ def _carry_real_input_is_private(
     storage = _storage_buffer(real_input)
     if not isinstance(storage, ir.ComputedBuffer):
         return False
+    record = getattr(storage, "_loop_carry_record", None)
+    if (
+        isinstance(record, LoopCarryRecord)
+        and record.update_name == storage.get_name()
+        and not isinstance(storage.layout, ir.MutationLayoutSHOULDREMOVE)
+    ):
+        # An earlier loop's result (a chained carry), still in its pure form:
+        # the update will write its carry's storage in place
+        # (``loop_carries.apply_loop_carries``), so ownership is that
+        # storage's, which the update itself reads.
+        #
+        # The update's own name is what the rest of the graph reads and what
+        # a graph output holds (the result is repointed at the update until the
+        # pass runs), so it must pass the same checks as the storage: judging
+        # only the storage would let this loop overwrite a result that is
+        # also returned or read elsewhere.
+        update_name = storage.get_name()
+        if update_name in graph.graph_inputs or update_name in set(
+            graph.get_output_names()
+        ):
+            return False
+        for out in getattr(graph, "graph_outputs", None) or []:
+            if _storage_name(out) == update_name:
+                return False
+        for op in graph.operations:
+            if op is while_op:
+                continue
+            reads = _operation_reads_buffer(op, update_name)
+            if reads is None or reads:
+                return False
+        storage = graph.get_buffer(record.storage_name)
+        if not isinstance(storage, ir.ComputedBuffer):
+            return False
     name = storage.get_name()
 
     if name in graph.graph_inputs:
@@ -1014,11 +1053,24 @@ def _rewire_accumulator_output(
 ) -> list["ir.Operation"]:
     """Make an accumulator carry's body write land in the carry's own buffer.
 
-    Turns the body op that produces ``binding.body_output`` into an in-place
-    mutation of ``real_input`` (the carry's pre-loop initial buffer) by
-    swapping its layout for ``MutationLayoutSHOULDREMOVE(real_input)``, and
-    repoints any outside consumer of the loop's result for this carry
-    position at that same buffer.
+    For a full-buffer accumulator this only DECLARES the carry: a
+    ``LoopCarryRecord`` on the storage (``real_input``'s backing buffer, the
+    carry's pre-loop initial value) and on the body op that produces
+    ``binding.body_output`` (the update), with ``real_input`` itself recorded
+    as ``storage_view`` when it is a view. The body stays pure, and any
+    outside consumer of the loop's result for this carry position is
+    repointed at the update. ``loop_carries.apply_loop_carries`` later makes
+    the update an in-place write of the storage and sends its readers there.
+
+    A partial scatter carry (``partial_update``) has no record: its write is
+    made in place here, by swapping the update's layout for
+    ``MutationLayoutSHOULDREMOVE(real_input)``, and outside consumers are
+    repointed at the storage.
+
+    The rest of this docstring explains why the write goes into the initial
+    buffer. That reasoning holds for both cases: the scatter carry is in
+    place from here on, and the declared carry is in place once
+    ``apply_loop_carries`` has run.
 
     Why the initial buffer and not a fresh one: the accumulator's fill is
     already there. ``for_each_tile(..., init=torch.zeros(M, N))`` lowers to a
@@ -1121,27 +1173,43 @@ def _rewire_accumulator_output(
     target = real_input
     while isinstance(target, ir.MutableBox):
         target = target.data
-    mutation_layout = ir.MutationLayoutSHOULDREMOVE(target)
-    producer.layout = mutation_layout
 
-    # ``target`` may be a frozen ReinterpretView (for example, an SDPA
-    # accumulator whose initial value is a view).  The carry contract belongs
-    # to the mutable backing Buffer that the allocator sees in graph.operations,
-    # not to that view.  MutationLayoutSHOULDREMOVE.get_buffer() performs the
-    # same recursive view/box unwrapping used when resolving mutation storage.
-    storage = mutation_layout.get_buffer()
-    storage_name = storage.get_name()
-    # LoopCarryRecord opts full-buffer accumulators into LX residency. A
-    # scatter must retain its whole destination in HBM, including untouched
-    # rows; ordinary mutation dependencies carry its lifetime across trips.
     if not partial_update:
+        # ``target`` may be a frozen ReinterpretView (for example, an SDPA
+        # accumulator whose initial value is a view).  The carry contract
+        # belongs to the mutable backing Buffer that the allocator sees in
+        # graph.operations, not to that view; the view is recorded as what the
+        # update writes through.
+        storage = _storage_buffer(target)
+        # A chained carry: ``target`` is an earlier loop's result, still in its
+        # pure form (its own update, not yet in place). That update will be
+        # written into its carry's storage, so this carry's storage is that
+        # storage; naming the earlier update would also overwrite the record
+        # that makes it an update.
+        earlier = getattr(storage, "_loop_carry_record", None)
+        if (
+            isinstance(earlier, LoopCarryRecord)
+            and earlier.update_name == storage.get_name()
+            and not isinstance(storage.layout, ir.MutationLayoutSHOULDREMOVE)
+        ):
+            storage = graph.get_buffer(earlier.storage_name)
+            target = storage
         record = LoopCarryRecord(
-            storage_name=storage_name,
+            storage_name=storage.get_name(),
             update_name=producer.get_name(),
             loop_origin=_validated_loop_origin(graph, while_op),
+            storage_view=None if target is storage else target,
         )
         storage._loop_carry_record = record
         producer._loop_carry_record = record
+        if while_out_name is not None:
+            _repoint_refs_to_buffer(graph, while_out_name, producer)
+            _repoint_mutation_targets(graph.operations, while_out, producer)
+        return body_ops
+
+    mutation_layout = ir.MutationLayoutSHOULDREMOVE(target)
+    producer.layout = mutation_layout
+    storage_name = mutation_layout.get_buffer().get_name()
 
     # In-body readers must use carry storage: the former producer is now a
     # mutation operation without an independent allocation.
@@ -1173,6 +1241,8 @@ def _repoint_refs_to_buffer(
     graph: "GraphLowering",
     old_name: str,
     new_buf: Any,
+    *,
+    redirect_readers: bool = True,
 ) -> None:
     """Point graph outputs (and any op input) naming old_name at new_buf.
 
@@ -1196,6 +1266,9 @@ def _repoint_refs_to_buffer(
     survives as a dangling ``graph.name_to_buffer`` lookup after
     ``splice_while_loop`` drops the ``MultiOutput``/``WhileLoop`` objects
     ``old_name`` and the while_loop itself named.
+
+    ``redirect_readers=False`` skips that last step, for a caller that has
+    already redirected every ``ComputedBuffer`` reader itself.
     """
     from torch._inductor import ir
     from torch_spyre._inductor.pass_utils import redirect_computed_buffer_reads
@@ -1217,14 +1290,31 @@ def _repoint_refs_to_buffer(
         else:
             outputs[i] = new_tb
 
-    name_map = {old_name: new_buf.get_name()}
+    new_name = new_buf.get_name()
+    name_map = {old_name: new_name}
     for i, op in enumerate(graph.operations):
         inputs = getattr(op, "inputs", None)
         if inputs:
             for j, inp in enumerate(inputs):
                 if getattr(inp, "get_name", lambda: None)() == old_name:
                     inputs[j] = new_tb
-        if isinstance(op, ir.ComputedBuffer):
+        # An in-place collective or wait (create_inplace / create_wait) also
+        # names its operand on its MutationOutput buffers and alias_names,
+        # which no .inputs rewrite reaches; left alone they name a buffer the
+        # splice removes.
+        mutated = False
+        for mutation in getattr(op, "mutation_outputs", None) or ():
+            if old_name in mutation.mutation_names:
+                mutation.mutation_names = [
+                    new_name if n == old_name else n for n in mutation.mutation_names
+                ]
+                mutated = True
+        alias_names = getattr(op, "alias_names", None)
+        if alias_names and old_name in alias_names:
+            op.alias_names = [new_name if n == old_name else n for n in alias_names]
+        if mutated:
+            graph.mutated_buffers.add(new_name)
+        if redirect_readers and isinstance(op, ir.ComputedBuffer):
             reads = {dep.name for dep in op.get_read_writes().reads}
             if old_name in reads:
                 graph.operations[i] = redirect_computed_buffer_reads(
@@ -1260,16 +1350,18 @@ def splice_while_loop(
     shape) correct with no patching.
 
     Carry rewiring (fill/rewrite/drain) for an ACCUMULATOR carry: the body
-    op that writes this carry's per-iteration value is redirected in place,
-    via ``_rewire_accumulator_output``, to write the carry's own real
-    initial buffer instead of the body subgraph's placeholder --
+    op that writes this carry's per-iteration value is DECLARED, via
+    ``_rewire_accumulator_output``, as the update of a carry whose storage is
+    the carry's own real initial buffer. ``apply_loop_carries`` (before layout
+    propagation) then makes it write that buffer instead of the body
+    subgraph's placeholder --
 
       fill    the initial buffer's own pre-loop producer (e.g. a zeros fill
               for split_k_fn's ``torch.zeros(M, N)`` init)
       rewrite this single spliced copy of the op reads the buffer and
               writes it back in place, standing in for every trip
       drain   the buffer itself IS the final value after the last trip, so
-              outside consumers read it directly
+              outside consumers read it directly once the pass has run
 
     (see ``_rewire_accumulator_output``'s own comment for the full
     rationale, including why this replaced an earlier ``scratch_name``
@@ -1367,7 +1459,8 @@ def splice_while_loop(
             _body_fx_carry_is_passthrough(while_op, binding.carry_index)
         )
         if body_output_name is not None and not is_passthrough:
-            # Real per-iteration rewrite of an ACCUMULATOR carry. Redirect
+            # Real per-iteration rewrite of an ACCUMULATOR carry. Declare it
+            # (_rewire_accumulator_output); apply_loop_carries then redirects
             # its write in place into the carry's own initial buffer, so the
             # single spliced body copy becomes the WSR accumulator shape the
             # rest of the pipeline already handles:

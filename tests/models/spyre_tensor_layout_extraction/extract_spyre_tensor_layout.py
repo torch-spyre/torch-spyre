@@ -577,8 +577,8 @@ def process_ir_graphs(
                 orig_get_buf = graph.get_buffer
                 orig_names = graph.graph_input_names
                 try:
-                    graph.get_buffer = (
-                        lambda n: buffer_map[n] if n in buffer_map else orig_get_buf(n)
+                    graph.get_buffer = lambda n: (
+                        buffer_map[n] if n in buffer_map else orig_get_buf(n)
                     )
                     graph.graph_input_names = []
                     _propagate_layouts(graph, operations)

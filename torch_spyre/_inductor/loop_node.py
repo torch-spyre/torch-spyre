@@ -370,6 +370,91 @@ def in_building_loop() -> bool:
     return _BUILDING_LOOP.get()
 
 
+# ---------------------------------------------------------------------------
+# Insertion points
+# ---------------------------------------------------------------------------
+#
+# A pass that adds an op to a loop says WHERE, in terms of the node, and the op
+# becomes a member (or not) because of where it is. The functions below act on
+# the REAL nested list, not on OpsView: OpsView.insert places an op beside the
+# op at a flat index, so "just before the loop" lands inside the body.
+#
+# The plan names six points; they are these four calls. Before and after "the
+# loop" and before and after "a given node" are the same call on a
+# :class:`LoopNode` anchor; "start of each iteration" and "the back edge" are
+# ``insert_at_start`` and ``insert_on_back_edge``. None has a caller outside the
+# tests yet: the allocator's ``lower_before`` / ``lower_anchor`` still go through
+# the flat view and ``peel_non_members``. An op that carries its own index
+# expression is the caller's: it may use the variable of any enclosing loop,
+# and ``loop_checker`` rule 2 verifies that between passes.
+
+
+def _enclosing_chain(
+    operations: list[ir.Operation], target: ir.Operation
+) -> list[LoopNode] | None:
+    """Nodes holding ``target``, outermost first; ``None`` if it is not there."""
+    for entry in operations:
+        if entry is target:
+            return []
+        if isinstance(entry, LoopNode):
+            inner = _enclosing_chain(entry.body, target)
+            if inner is not None:
+                return [entry, *inner]
+    return None
+
+
+def _holder(
+    operations: list[ir.Operation], anchor: ir.Operation
+) -> tuple[list[ir.Operation], int]:
+    found = owning_list(operations, anchor)
+    if found is None:
+        raise ValueError(f"{anchor!r} is not in the operations list")
+    return found
+
+
+def insert_before(
+    operations: list[ir.Operation], anchor: ir.Operation, op: ir.Operation
+) -> None:
+    """Insert ``op`` immediately before ``anchor``, in the list that holds it.
+
+    ``anchor`` may be an ordinary op or a :class:`LoopNode`. Before a node, the
+    op runs once, outside the loop; before a body op, it runs every trip.
+    """
+    lst, i = _holder(operations, anchor)
+    lst.insert(i, op)
+
+
+def insert_after(
+    operations: list[ir.Operation], anchor: ir.Operation, op: ir.Operation
+) -> None:
+    """Insert ``op`` immediately after ``anchor``, in the list that holds it.
+
+    After a :class:`LoopNode` the op runs once, after the last trip (the
+    allocator's post-loop drain). After a body op it runs every trip.
+    """
+    lst, i = _holder(operations, anchor)
+    lst.insert(i + 1, op)
+
+
+def insert_at_start(node: LoopNode, op: ir.Operation) -> None:
+    """Insert ``op`` as the first entry of ``node``'s body: it runs every trip,
+    before the rest of the body."""
+    node.body.insert(0, op)
+
+
+def insert_on_back_edge(node: LoopNode, op: ir.Operation) -> None:
+    """Insert ``op`` at the end of ``node``'s body: the point every trip ends at.
+
+    The end of the body is after every read of the old value, which is the
+    property a carry copy needs: placed right after its update, the copy
+    overwrote the value before its last reader in a prototype (relative error
+    0.785). The position is the guarantee, so there is nothing to search for
+    and nothing to check; a caller that wants an op NEAR an update, not at the
+    end, wants :func:`insert_after` and owns that choice.
+    """
+    node.body.append(op)
+
+
 def _group_path(op: ir.Operation) -> tuple[int, ...]:
     # An ExternKernel keeps its loop_info (e.g. a hoisted loop-body constant)
     # but runs once, outside the loop, so it is not a member of any loop.
