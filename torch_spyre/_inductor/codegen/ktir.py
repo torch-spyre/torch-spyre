@@ -2007,8 +2007,9 @@ class KernelPlan:
         output's device axes, split where the input splits a symbol into stick
         and lane), the output view row-major over it, and the input view at
         whatever strides put each of its elements under the output element it
-        becomes.  The compute between them is the identity, so the step is a
-        ``GENERIC`` with identity maps and a payload that yields its operand.
+        becomes.  Every map is then the identity, so the op is spelled by
+        ``_parallel_surface``, the same as an aligned pointwise op: a copy's
+        payload arm gives a ``GENERIC`` that yields its operand.
 
         Untiled and undivided only: a level or a division would have to walk
         the refined iteration space, and ``_solve_layout``'s steps are steps
@@ -2038,7 +2039,7 @@ class KernelPlan:
                     "relayout's ranges must be whole numbers"
                 )
             ranges[sym] = count
-        recipe.arm(dtype)
+        arm = recipe.arm(dtype)
         extent, in_strides, out_strides = relayout_strides(
             list(source.device_coordinates),
             [int(s) for s in source.device_size],
@@ -2059,17 +2060,17 @@ class KernelPlan:
             )
             self.buffers.setdefault(buf_id(arg), buffer)
             accesses[buf_id(arg)] = _access(arg, extent, [], layout, elems, buffer)
-        identity = tuple(range(len(extent)))
+        # Every operand is viewed over the same loop nest, in the output's order,
+        # so the op is spelled exactly as an aligned pointwise op is.
+        surface, indexing = _parallel_surface(arm, 1, len(extent))
         return ComputeStep(
             op=spec.op,
-            surface=Surface.GENERIC,
+            surface=surface,
             ins=((buf_id(source), accesses[buf_id(source)]),),
             out=accesses[buf_id(out)],
             out_buf_id=buf_id(out),
             stage=stage,
-            indexing=Indexing(
-                iters=(PARALLEL,) * len(extent), maps=(identity, identity)
-            ),
+            indexing=indexing,
             dtype=dtype,
             store=True,
         )
