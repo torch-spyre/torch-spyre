@@ -29,7 +29,7 @@
 namespace spyre {
 
 struct PinnedAllocationState {
-  PinnedAllocationState(std::shared_ptr<flex::PinnedBuffer> buffer,
+  PinnedAllocationState(std::shared_ptr<flex::DmaStagingBuffer> buffer,
                         std::shared_ptr<flex::PinnedStagingCache> cache)
       : buffer(std::move(buffer)), cache(std::move(cache)) {}
 
@@ -51,7 +51,7 @@ struct PinnedAllocationState {
     }
   }
 
-  std::shared_ptr<flex::PinnedBuffer> buffer;
+  std::shared_ptr<flex::DmaStagingBuffer> buffer;
   std::shared_ptr<flex::PinnedStagingCache> cache;
 };
 
@@ -76,7 +76,7 @@ c10::DataPtr SpyrePinnedAllocator::allocate(size_t size) {
         "SpyrePinnedAllocator: pinned staging cache is unavailable");
   }
 
-  std::shared_ptr<flex::PinnedBuffer> buffer;
+  std::shared_ptr<flex::DmaStagingBuffer> buffer;
   try {
     buffer = cache->acquire(size);
   }

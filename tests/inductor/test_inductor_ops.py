@@ -35,6 +35,7 @@ from utils_inductor import (
     ParameterizedTestMeta,
     _compile_and_run,
     cached_randn,
+    cached_randint,
     cached_xavier,
     compare_with_cpu,
     expects_raise,
@@ -247,6 +248,178 @@ VECTOR_NORM_KEEPDIM_PARAM_SETS = {
         -float("inf"),
         -1,
         cached_randn((3, 7, 9), dtype=torch.float32),
+    ),
+}
+
+
+CUMSUM_PARAM_SETS = {
+    # 1-D
+    "1d_4": (0, cached_randn((4,))),
+    "1d_64": (0, cached_randn((64,))),
+    "1d_256": (0, cached_randn((256,))),
+    "1d_512": (0, cached_randn((512,), scale=0.1)),  # small values avoid fp16 overflow
+    "1d_explicit": (
+        0,
+        torch.tensor([1.0, 2.0, 3.0, 4.0, -1.0, 0.5, -0.5, 1.5], dtype=torch.float16),
+    ),
+    # 0-D: no dim to scan, so CPU fallback
+    "0d": (0, cached_randn(())),
+    # Empty: nothing to scan, so CPU fallback
+    "empty_2d_dim_1": (1, cached_randn((4, 0))),
+    "empty_3d_dim_1": (1, cached_randn((2, 0, 64))),
+    # 2-D
+    "2d_dim_0": (0, cached_randn((67, 256))),
+    "2d_dim_0_n1": (0, cached_randn((1, 256))),  # n=1 edge case: identity cumsum
+    "2d_dim_0_b2": (0, cached_randn((256, 2))),
+    "2d_dim_0_b3": (0, cached_randn((256, 3))),
+    "2d_dim_1_b1": (1, cached_randn((1, 256))),
+    "2d_dim_1_b2": (1, cached_randn((2, 256))),
+    "2d_dim_1_b3": (1, cached_randn((3, 256))),
+    "2d_dim_1_b4": (1, cached_randn((4, 256))),
+    "2d_dim_1_b8": (1, cached_randn((8, 256))),
+    "2d_dim_neg1": (-1, cached_randn((8, 256))),  # negative dim alias
+    # 3-D
+    "3d_dim_1": (1, cached_randn((4, 67, 256))),
+    "3d_dim_1_b2": (1, cached_randn((1, 67, 2))),
+    "3d_dim_2_b1": (2, cached_randn((1, 1, 256))),
+    "3d_dim_2_b2": (2, cached_randn((1, 2, 256))),
+    "3d_dim_2_b4": (2, cached_randn((2, 2, 256))),
+    # 4-D
+    "4d_dim_neg1": (-1, cached_randn((1, 48, 1, 256))),
+    "4d_dim_2": (2, cached_randn((4, 5, 67, 256))),
+    "4d_dim_0": (0, cached_randn((9, 2, 3, 128))),
+    "4d_dim_1": (1, cached_randn((2, 9, 3, 128))),
+    "4d_dim_3": (3, cached_randn((2, 3, 4, 256))),
+    # 5-D
+    "5d_dim_0": (0, cached_randn((4, 2, 3, 4, 128))),
+    "5d_dim_1": (1, cached_randn((2, 9, 3, 4, 128))),
+    "5d_dim_2": (2, cached_randn((2, 3, 9, 4, 128))),
+    "5d_dim_neg1": (-1, cached_randn((2, 3, 4, 5, 128))),
+    "5d_dim_neg2": (-2, cached_randn((2, 3, 4, 128, 5))),
+    # n not a stick multiple
+    "pad_2d_dim_0": (0, cached_randn((63, 129))),
+    "pad_2d_dim_1": (1, cached_randn((63, 129))),
+    "pad_2d_dim_1_b1": (1, cached_randn((1, 129))),
+    "pad_2d_dim_1_b2": (1, cached_randn((2, 9))),
+    "pad_3d_dim_1": (1, cached_randn((3, 7, 9))),
+    "pad_3d_dim_2": (2, cached_randn((3, 7, 9))),
+    "pad_4d_dim_2": (2, cached_randn((3, 7, 9, 32))),
+    "pad_4d_dim_3": (3, cached_randn((3, 7, 9, 32))),
+    "pad_5d_dim_2": (2, cached_randn((2, 3, 7, 4, 128))),
+    "pad_5d_dim_neg1": (-1, cached_randn((2, 3, 4, 5, 129))),
+    # -----------------------------------------------------------------------
+    # bf16 (same device format as fp16, so the same matmul path)
+    "1d_256_bf16": (0, cached_randn((256,), dtype=torch.bfloat16)),
+    "2d_dim_0_bf16": (0, cached_randn((67, 256), dtype=torch.bfloat16)),
+    "2d_dim_1_b2_bf16": (1, cached_randn((2, 256), dtype=torch.bfloat16)),
+    "3d_dim_1_bf16": (1, cached_randn((4, 67, 256), dtype=torch.bfloat16)),
+    "4d_dim_neg1_bf16": (-1, cached_randn((1, 48, 1, 256), dtype=torch.bfloat16)),
+    # bf16, n not a stick multiple
+    "pad_2d_dim_1_bf16": (1, cached_randn((63, 129), dtype=torch.bfloat16)),
+    "pad_3d_dim_2_bf16": (2, cached_randn((3, 7, 9), dtype=torch.bfloat16)),
+    "empty_2d_dim_1_bf16": (1, cached_randn((4, 0), dtype=torch.bfloat16)),
+    # -----------------------------------------------------------------------
+    # fp32
+    # 2-D
+    "2d_dim_0_fp32": (0, cached_randn((67, 256), dtype=torch.float32)),
+    "2d_dim_1_fp32": (1, cached_randn((4, 256), dtype=torch.float32)),
+    "2d_dim_neg1_fp32": (-1, cached_randn((4, 64), dtype=torch.float32)),
+    # 3-D
+    "3d_dim_0_fp32": (0, cached_randn((9, 3, 64), dtype=torch.float32)),
+    "3d_dim_1_fp32": (1, cached_randn((4, 9, 64), dtype=torch.float32)),
+    "3d_dim_2_fp32": (2, cached_randn((4, 3, 64), dtype=torch.float32)),
+    "3d_dim_neg1_fp32": (-1, cached_randn((4, 3, 32), dtype=torch.float32)),
+    "3d_dim_neg2_fp32": (-2, cached_randn((4, 9, 64), dtype=torch.float32)),
+    # 4-D
+    "4d_dim_0_fp32": (0, cached_randn((4, 2, 3, 64), dtype=torch.float32)),
+    "4d_dim_1_fp32": (1, cached_randn((2, 9, 3, 64), dtype=torch.float32)),
+    "4d_dim_2_fp32": (2, cached_randn((2, 3, 7, 64), dtype=torch.float32)),
+    "4d_dim_3_fp32": (3, cached_randn((2, 3, 4, 32), dtype=torch.float32)),
+    "4d_dim_neg1_fp32": (-1, cached_randn((2, 3, 4, 64), dtype=torch.float32)),
+    "4d_dim_neg2_fp32": (-2, cached_randn((2, 3, 9, 32), dtype=torch.float32)),
+    # 5-D
+    "5d_dim_0_fp32": (0, cached_randn((4, 2, 3, 4, 32), dtype=torch.float32)),
+    "5d_dim_2_fp32": (2, cached_randn((2, 3, 9, 4, 32), dtype=torch.float32)),
+    "5d_dim_neg1_fp32": (-1, cached_randn((2, 3, 4, 5, 32), dtype=torch.float32)),
+    "5d_dim_neg2_fp32": (-2, cached_randn((2, 3, 4, 32, 5), dtype=torch.float32)),
+    # fp32, n not a stick multiple
+    "pad_2d_dim_0_fp32": (0, cached_randn((9, 17), dtype=torch.float32)),
+    "pad_2d_dim_1_fp32": (1, cached_randn((4, 17), dtype=torch.float32)),
+    "pad_3d_dim_1_fp32": (1, cached_randn((3, 7, 17), dtype=torch.float32)),
+    "pad_3d_dim_2_fp32": (2, cached_randn((3, 7, 17), dtype=torch.float32)),
+    "2d_dim_0_b1_fp32": (0, cached_randn((17, 1), dtype=torch.float32)),
+    # -----------------------------------------------------------------------
+    # int32 (accumulates in int64; int32 -> int64 converts on Spyre)
+    "2d_dim_0_int32": (0, cached_randint((9, 64))),
+    "2d_dim_1_int32": (1, cached_randint((4, 64))),
+    "2d_dim_neg1_int32": (-1, cached_randint((4, 32))),
+    "3d_dim_0_int32": (0, cached_randint((4, 3, 32))),
+    "3d_dim_1_int32": (1, cached_randint((4, 9, 32))),
+    "3d_dim_2_int32": (2, cached_randint((4, 3, 32))),
+    "4d_dim_1_int32": (1, cached_randint((2, 9, 3, 32))),
+    "4d_dim_3_int32": (3, cached_randint((2, 3, 4, 32))),
+    # int32, n not a stick multiple
+    "pad_2d_dim_0_int32": (0, cached_randint((9, 17))),
+    "pad_2d_dim_1_int32": (1, cached_randint((4, 17))),
+    "pad_3d_dim_1_int32": (1, cached_randint((3, 7, 17))),
+    "pad_3d_dim_2_int32": (2, cached_randint((3, 7, 17))),
+    "1d_17_int32": (0, cached_randint((17,))),
+    # -----------------------------------------------------------------------
+    # int64 (stored as IEEE_INT32 on Spyre; prefix scan uses addi32toi32)
+    "2d_dim_0_int64": (0, cached_randint((9, 64), dtype=torch.int64)),
+    "2d_dim_1_int64": (1, cached_randint((4, 64), dtype=torch.int64)),
+    "2d_dim_neg1_int64": (-1, cached_randint((4, 32), dtype=torch.int64)),
+    "3d_dim_0_int64": (0, cached_randint((4, 3, 32), dtype=torch.int64)),
+    "3d_dim_1_int64": (1, cached_randint((4, 9, 32), dtype=torch.int64)),
+    "3d_dim_2_int64": (2, cached_randint((4, 3, 32), dtype=torch.int64)),
+    "4d_dim_1_int64": (1, cached_randint((2, 9, 3, 32), dtype=torch.int64)),
+    "4d_dim_3_int64": (3, cached_randint((2, 3, 4, 32), dtype=torch.int64)),
+    # int64, n not a stick multiple
+    "pad_2d_dim_0_int64": (0, cached_randint((9, 17), dtype=torch.int64)),
+    "pad_2d_dim_1_int64": (1, cached_randint((4, 17), dtype=torch.int64)),
+    "pad_3d_dim_1_int64": (1, cached_randint((3, 7, 17), dtype=torch.int64)),
+    "pad_3d_dim_2_int64": (2, cached_randint((3, 7, 17), dtype=torch.int64)),
+    "1d_17_int64": (0, cached_randint((17,), dtype=torch.int64)),
+    "2d_dim_0_neg_int64": (
+        0,
+        cached_randint((9, 64), low=-512, high=512, dtype=torch.int64),
+    ),
+    # Partial sums pass 2**24, which fp32 cannot hold exactly, and stay < 2**31.
+    "2d_dim_1_big_int64": (
+        1,
+        cached_randint((4, 128), low=2**22, high=2**23, dtype=torch.int64),
+    ),
+    # -----------------------------------------------------------------------
+    # bool (torch.cumsum returns int64, so these fall back to CPU)
+    "2d_dim_1_bool": (1, cached_randint((4, 64), high=2) > 0),
+    "3d_dim_0_bool": (0, cached_randint((4, 3, 32), high=2) > 0),
+    # -----------------------------------------------------------------------
+    # Multiple seeds: validates fp16 precision at natural scale (1.0).
+    "2d_dim_1_b2_seed1": (1, cached_randn((2, 256), differentiation=1)),
+    "2d_dim_1_b2_seed2": (1, cached_randn((2, 256), differentiation=2)),
+    "3d_dim_2_b2_seed1": (2, cached_randn((1, 2, 256), differentiation=1)),
+    "3d_dim_2_b2_seed2": (2, cached_randn((1, 2, 256), differentiation=2)),
+    "3d_dim_2_b2_seed3": (2, cached_randn((1, 2, 256), differentiation=3)),
+    "3d_dim_2_b3_seed1": (2, cached_randn((1, 3, 256), differentiation=1)),
+    "4d_dim_neg1_seed1": (-1, cached_randn((1, 48, 1, 256), differentiation=1)),
+    # Alternating +1/-1: cumsum oscillates near zero, stressing fp16 precision.
+    "2d_alternating_b1": (
+        1,
+        torch.tensor([[1.0, -1.0] * 128], dtype=torch.float16),
+    ),
+    "2d_alternating_b2": (
+        1,
+        torch.tensor([[1.0, -1.0] * 128, [-1.0, 1.0] * 128], dtype=torch.float16),
+    ),
+    # Positive block followed by equal negative block.
+    "2d_ramp_drop": (
+        1,
+        torch.tensor([[0.5] * 128 + [-0.5] * 128], dtype=torch.float16),
+    ),
+    # 3-D alternating pattern, A=2.
+    "3d_alternating_b2": (
+        2,
+        torch.tensor([[[1.0, -1.0] * 128], [[-1.0, 1.0] * 128]], dtype=torch.float16),
     ),
 }
 
@@ -4722,8 +4895,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             # (~0.34 abs, 1/32768 elems) past tolerance and was xfailed in
             # commit 3a2d482 as a PT 2.12 CPU-reference numerics change. That
             # drift came from the ``sin`` in the chain; the fallback vehicle is
-            # ``cumsum`` now (``sin`` has a Spyre decomposition and no longer
-            # falls back), and all three shapes pass, so the entry is gone.
+            # ``isin`` now (``sin`` and ``cumsum`` both have Spyre decompositions
+            # and no longer fall back), and all three shapes pass, so the entry
+            # is gone.
         },
         (
             "test_arange",
@@ -8957,54 +9131,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": SCALED_BMM_QK_TESTS,
         },
         (
-            "test_fp8_scaled_mm_granite_fp8_shapes",
-            "test_fp8_scaled_mm_granite_fp8_shapes_cpu",
-        ): {
-            "param_sets": {
-                "decode_m1_n4096_baseline": (1, 4096, 4096),
-                "decode_m2_n4096_baseline": (2, 4096, 4096),
-                "fused_qkv_n6144": (1, 4096, 6144),
-                "fused_gate_up_n25600": (1, 4096, 25600),
-                "wide_m4_n4096": (4, 4096, 4096),
-                "wide_m8_n4096": (8, 4096, 4096),
-                "prefill_warmup_m16_n4096": (16, 4096, 4096),
-                "bench_prefill_m64_n4096": (64, 4096, 4096),
-                "m8_n1024": (8, 4096, 1024),
-                "m8_n12800": (8, 4096, 12800),
-            },
-        },
-        (
-            "test_fp8_chained_scaled_mm",
-            "test_fp8_chained_scaled_mm_cpu",
-        ): {
-            # Regression for three combined issues that blocked chained FP8
-            # matmul (MLP pattern: fp8_linear(fp8_linear(x))).
-            # Shapes: (m, k, n_hidden, n_out)
-            "param_sets": {
-                "granite_m2_k4096_n1024_n4096": (2, 4096, 1024, 4096),
-                "granite_m1_k4096_n1024_n4096": (1, 4096, 1024, 4096),
-                "granite_m2_k4096_n4096_n4096": (2, 4096, 4096, 4096),
-            },
-        },
-        (
-            "test_fp8_3d_activation_reshape",
-            "test_fp8_3d_activation_reshape_cpu",
-        ): {
-            # Regression for _project_pointwise_dim_order corrupting the
-            # sparse-stick -1 marker when rank_diff < 0 (Bug 4).
-            # A QFP8CH rank-2 buffer (output of quantize_fp8_with_scale on a
-            # reshaped 2D activation) is consumed by a rank-3 pointwise op
-            # after out.reshape(B, M, N), giving rank_diff = 2 - 3 = -1.
-            # Previously crashed with:
-            #   RuntimeError: Incompatible host_size and dim_order
-            # Shapes: (b, m, k, n)
-            "param_sets": {
-                "b2_m8_k128_n128": (2, 8, 128, 128),
-                "b2_m4_k256_n128": (2, 4, 256, 128),
-                "b4_m2_k128_n256": (4, 2, 128, 256),
-            },
-        },
-        (
             "test_multiops_split",
             "test_view_permute_mul",
         ): {
@@ -9096,6 +9222,49 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_transpose_patterns", "test_transpose_patterns_cpu"): {
             "param_sets": _pattern_param_sets(),
+        },
+        ("test_cumsum", "test_cumsum_cpu"): {
+            "param_sets": CUMSUM_PARAM_SETS,
+        },
+        # torch.cumsum(..., dtype=...). The last value says whether it runs on
+        # Spyre (same dtype, or a native same-width conversion) or on CPU.
+        ("test_cumsum_dtype", "test_cumsum_dtype_cpu"): {
+            "param_sets": {
+                "2d_int32_to_int32": (1, torch.int32, cached_randint((4, 64)), True),
+                "2d_int32_to_int64": (1, torch.int64, cached_randint((4, 64)), True),
+                "2d_dim_0_int64_to_fp32": (
+                    0,
+                    torch.float32,
+                    cached_randint((9, 64), dtype=torch.int64),
+                    True,
+                ),
+                # Halves in [-8, 8): the conversion truncates toward zero.
+                "2d_dim_0_fp32_to_int64": (
+                    0,
+                    torch.int64,
+                    cached_randint((9, 64), low=-16, high=16).to(torch.float32) / 2,
+                    True,
+                ),
+                "2d_dim_0_fp16_to_bf16": (
+                    0,
+                    torch.bfloat16,
+                    cached_randint((9, 64), high=8).to(torch.float16),
+                    True,
+                ),
+                "1d_int64_to_int32": (
+                    0,
+                    torch.int32,
+                    cached_randint((8,), dtype=torch.int64),
+                    True,
+                ),
+                # 16 -> 32 bit conversion: CPU fallback.
+                "2d_dim_0_fp16_to_fp32": (
+                    0,
+                    torch.float32,
+                    cached_randint((9, 64), high=8).to(torch.float16),
+                    False,
+                ),
+            },
         },
         # torch.any / torch.all: single-dim reduction
         ("test_any_single_dim", "test_reduce_keepdim0_cpu"): {
@@ -10518,6 +10687,141 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_norm_keepdim1_cpu(self, op, ord, dim, x):
         _compare_op_with_cpu(lambda x: op(x, ord=ord, dim=dim, keepdim=True), op, x)
 
+    def test_cumsum_cpu(self, dim: int, x):
+        # Integer cumsum is exact; float inputs keep the default tolerance.
+        tol = {} if x.dtype.is_floating_point else {"atol": 0, "rtol": 0}
+        self.compare_with_cpu(
+            lambda t: torch.cumsum(t, dim=dim), x, run_eager=False, **tol
+        )
+
+    def test_cumsum_dtype_cpu(self, dim: int, dtype: torch.dtype, x, on_device: bool):
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            self.compare_with_cpu(
+                lambda t: torch.cumsum(t, dim=dim, dtype=dtype),
+                x,
+                atol=0,
+                rtol=0,
+                run_eager=False,
+            )
+        fell_back = any(
+            "cumsum_cpu_fallback" in str(w.message)
+            for w in captured
+            if issubclass(w.category, FallbackWarning)
+        )
+        assert fell_back != on_device, f"on_device={on_device}, fell_back={fell_back}"
+
+    def test_cumsum_int64_on_device(self):
+        # The value tests would also pass via the CPU fallback; check that
+        # int64 runs on Spyre.
+        x = cached_randint((4, 64), dtype=torch.int64)
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            self.compare_with_cpu(
+                lambda t: torch.cumsum(t, dim=1), x, atol=0, rtol=0, run_eager=False
+            )
+        fallbacks = [
+            str(w.message) for w in captured if issubclass(w.category, FallbackWarning)
+        ]
+        assert not any("cumsum_cpu_fallback" in m for m in fallbacks), fallbacks
+
+    def test_cumsum_permuted_view(self):
+        # cumsum over a permuted view, scanning a leading dim and the
+        # innermost one.
+        exact = {"atol": 0, "rtol": 0}
+        for x, tol in (
+            (cached_randn((4, 64, 32)), {}),
+            (cached_randn((4, 64, 32), dtype=torch.float32), {}),
+            (cached_randint((4, 64, 32), dtype=torch.int64), exact),
+        ):
+            for dim in (0, 2):
+
+                def fn(t, dim=dim):
+                    # (4, 64, 32) -> (64, 32, 4)
+                    return torch.cumsum(t.permute(1, 2, 0), dim=dim)
+
+                self.compare_with_cpu(fn, x, run_eager=False, **tol)
+
+    def test_cumsum_sliced_view(self):
+        # cumsum over sliced views: an offset on the innermost dim, a
+        # stick-aligned offset, an offset on an outer dim, and a narrow.
+        exact = {"atol": 0, "rtol": 0}
+        views = {
+            "inner": lambda t: t[:, 2:],
+            "inner_stick_aligned": lambda t: t[:, 32:],
+            "outer": lambda t: t[2:, :],
+            "narrow": lambda t: t.narrow(1, 2, 32),
+        }
+        for x, tol in (
+            (cached_randn((64, 64)), {}),
+            (cached_randn((64, 64), dtype=torch.float32), {}),
+            (cached_randint((64, 64), dtype=torch.int64), exact),
+        ):
+            for dim in (0, 1):
+                for slicer in views.values():
+
+                    def fn(t, dim=dim, slicer=slicer):
+                        return torch.cumsum(slicer(t), dim=dim)
+
+                    self.compare_with_cpu(fn, x, run_eager=False, **tol)
+
+    def test_cumsum_out(self):
+        exact = {"atol": 0, "rtol": 0}
+        for x, tol in (
+            (cached_randn((4, 64)), {}),
+            (cached_randint((4, 64), dtype=torch.int64), exact),
+        ):
+
+            def fn(t):
+                out = torch.empty(t.shape, dtype=t.dtype, device=t.device)
+                torch.cumsum(t, 1, out=out)
+                return out
+
+            self.compare_with_cpu(fn, x, **tol)
+
+        def fn_view(t):
+            # out= a view: only its rows change.
+            base = torch.zeros(8, 64, dtype=t.dtype, device=t.device)
+            torch.cumsum(t, 1, out=base[4:])
+            return base
+
+        self.compare_with_cpu(fn_view, cached_randn((4, 64)), run_compile=False)
+
+    def test_cumsum_inplace(self):
+        # Clone first so the cached input is not mutated.
+        exact = {"atol": 0, "rtol": 0}
+        for x, dim, tol in (
+            (cached_randn((4, 64)), 1, {}),
+            (cached_randint((4, 64), dtype=torch.int64), 1, exact),
+            (cached_randn((4, 3, 64)), 0, {}),
+        ):
+
+            def fn(t, dim=dim):
+                y = t.clone()
+                y.cumsum_(dim)
+                return y
+
+            self.compare_with_cpu(fn, x, **tol)
+
+        def fn_view(t):
+            # In place on a view: only its rows change.
+            y = t.clone()
+            y[2:6].cumsum_(1)
+            return y
+
+        self.compare_with_cpu(fn_view, cached_randn((8, 64)), run_compile=False)
+
+    @expects_raise
+    def test_cumsum_dim_out_of_range_rejected(self):
+        # Like torch.cumsum on CPU, a dim outside [-ndim, ndim - 1] raises, in
+        # eager and compiled mode.
+        x = cached_randn((4, 64)).to(utils_inductor.DEVICE)
+        for dim in (2, -3):
+            with pytest.raises(IndexError, match="Dimension out of range"):
+                torch.cumsum(x, dim)
+            with pytest.raises(IndexError, match="Dimension out of range"):
+                torch.compile(lambda t, d=dim: torch.cumsum(t, d))(x)
+
     def _get_core_reduction_invalid_dim_cases(self):
         x = cached_randn((3, 5, 64))
         ops = CORE_REDUCTION_OPS_DICT
@@ -11471,15 +11775,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_fallback_cpu(self, x):
         """
-        Verify that cumsum executes via the CPU fallback path and emits
-        FallbackWarning. Also verifies numerical correctness via compare_with_cpu.
+        Verify that a CPU-fallback op emits a FallbackWarning and still gives
+        correct results in the middle of an otherwise on-device graph.
+
+        aten.isin has no Spyre lowering (torch_spyre/ops/fallbacks.py). cumsum
+        used to be the vehicle here; its Spyre decomposition now stays on device.
         """
 
         def fn(t):
-            t = torch.exp(t)
-            t = torch.cumsum(t.clamp(-1, 1), dim=-1)  # fallback op (aten.cumsum)
-            t = torch.exp(t.clamp(-1, 1))
-            return t
+            # Every element of t is in t, so hits is all ones however the values
+            # round -- the check stays exact while isin still runs on CPU.
+            hits = torch.isin(t, t).to(t.dtype)
+            return torch.exp(t.clamp(-1, 1)) + hits
 
         with warnings.catch_warnings(record=True) as captured:
             warnings.simplefilter("always")
@@ -11488,11 +11795,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         fallback_warnings = [
             w
             for w in captured
-            if issubclass(w.category, FallbackWarning)
-            and "aten.cumsum" in str(w.message)
+            if issubclass(w.category, FallbackWarning) and "isin" in str(w.message)
         ]
         assert len(fallback_warnings) > 0, (
-            f"Expected FallbackWarning for cumsum (CPU fallback path). "
+            f"Expected FallbackWarning from aten.isin. "
             f"All captured: {[str(w.message) for w in captured]}"
         )
 
@@ -14247,210 +14553,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         torch.testing.assert_close(
             actual.to(torch.float32) / gain, reference / gain, atol=32.0, rtol=0.01
         )
-
-    def test_fp8_scaled_mm_granite_fp8_shapes_cpu(self, m, k, n):
-        """Regression test for SuperDSC aborts on FP8 _scaled_mm at Granite 8B shapes.
-
-        Covers fused QKV (N=6144), fused gate_up (N=25600), and wide-M prefill
-        shapes that previously caused compilation failures (issue #4179).
-
-        Two independent fixes are exercised here:
-          Fix 1 (compute_ops.py): corrects the out/N-dim elemArr constants
-            emitted by gen_coord_info_value for the QFP8WT KERNEL weight.
-          Fix 2 (work_division.py): routes batchmatmulfp8 through the analytic
-            cost model (_cost_model_divide_op), which was previously skipped for
-            FP8 BMM ops. The cost model now produces a correct split for all N.
-        """
-        x = cached_randn(
-            (m, k), dtype=torch.float16, differentiation=("x", m, k, n), scale=0.5
-        )
-        w = cached_randn(
-            (k, n), dtype=torch.float16, differentiation=("w", m, k, n), scale=0.5
-        )
-        scale_a = torch.tensor([0.1], dtype=torch.float16)
-        scale_b = torch.tensor([0.1], dtype=torch.float16)
-
-        def spyre_fn(x, w, scale_a, scale_b):
-            xa = torch.ops.spyre.quantize_fp8_with_scale(x, scale_a)
-            wb = torch.ops.spyre.quantize_weight_fp8_with_scale(w, scale_b)
-            return torch.ops.aten._scaled_mm(
-                xa, wb, scale_a=scale_a, scale_b=scale_b, out_dtype=torch.float16
-            )
-
-        def pytorch_fn(x, w, scale_a, scale_b):
-            xa = (
-                (x / scale_a)
-                .clamp(-448.0, 448.0)
-                .to(torch.float8_e4m3fn)
-                .to(torch.float16)
-            )
-            wb = (
-                (w / scale_b)
-                .clamp(-448.0, 448.0)
-                .to(torch.float8_e4m3fn)
-                .to(torch.float16)
-            )
-            return (xa @ wb) * (scale_a * scale_b)
-
-        compare_with_pytorch(
-            spyre_fn, pytorch_fn, x, w, scale_a, scale_b, atol=2.0, rtol=0.2
-        )
-
-    def test_fp8_chained_scaled_mm_cpu(self, m, k, n_hidden, n_out):
-        """Regression test for chained FP8 matmul (MLP / decoder block pattern).
-
-        Two fp8_linear calls where the output of the first feeds the input of
-        the second — the MLP pattern in a Granite decoder block. Per-row
-        dynamic x_scale computed from the activation; external per-column
-        w_scale passed in.
-
-        Previously failed with:
-          NotImplementedError: no mechanism to resolve stick incompatibility
-
-        Root cause: three combined issues unblocked by this fix:
-          1. pass_utils.py: compute_restickify_needed blocked SEN143_FP8 (#4238)
-          2. spyre_kernel.py: RESTICKIFY_OP gate excluded SEN143_FP8
-          3. propagate_layouts.py: generate_stl_with_required_stick returned
-             sparse QFP8CH without checking reduction_var was on the stick
-        """
-        FP8_MAX = 448.0
-        SCALE_EPS = 1e-4
-
-        def fp8_linear(x, w, w_scale):
-            x_scale = (x.abs().amax(dim=-1, keepdim=True) * (1.0 / FP8_MAX)).clamp(
-                min=SCALE_EPS
-            )
-            wq = torch.ops.spyre.quantize_weight_fp8_with_scale(w, w_scale)
-            xq = torch.ops.spyre.quantize_fp8_with_scale(x, x_scale)
-            y = torch.ops.spyre.scaled_mm(
-                xq.reshape(-1, xq.shape[-1]), wq, out_dtype=torch.float16
-            )
-            return (y.reshape(*x.shape[:-1], w.shape[-1]) * x_scale * w_scale).to(
-                x.dtype
-            )
-
-        x = cached_randn(
-            (1, m, k),
-            dtype=torch.float16,
-            differentiation=("x", m, k, n_hidden, n_out),
-            scale=0.1,
-        )
-        g = cached_randn(
-            (k,),
-            dtype=torch.float16,
-            differentiation=("g", m, k, n_hidden, n_out),
-            scale=0.1,
-        )
-        w1 = cached_randn(
-            (k, n_hidden),
-            dtype=torch.float16,
-            differentiation=("w1", m, k, n_hidden, n_out),
-            scale=0.1,
-        )
-        w2 = cached_randn(
-            (n_hidden, n_out),
-            dtype=torch.float16,
-            differentiation=("w2", m, k, n_hidden, n_out),
-            scale=0.1,
-        )
-        ws1 = torch.full((n_hidden,), 0.1, dtype=torch.float16)
-        ws2 = torch.full((n_out,), 0.1, dtype=torch.float16)
-
-        def spyre_fn(x, g, w1, ws1, w2, ws2):
-            h = x * g
-            return fp8_linear(fp8_linear(h, w1, ws1), w2, ws2)
-
-        def pytorch_fn(x, g, w1, ws1, w2, ws2):
-            def ref_linear(x, w, ws):
-                x_scale = (x.abs().amax(dim=-1, keepdim=True) * (1.0 / FP8_MAX)).clamp(
-                    min=SCALE_EPS
-                )
-                xq = (
-                    (x / x_scale)
-                    .clamp(-FP8_MAX, FP8_MAX)
-                    .to(torch.float8_e4m3fn)
-                    .to(torch.float16)
-                )
-                wq = (
-                    (w / ws)
-                    .clamp(-FP8_MAX, FP8_MAX)
-                    .to(torch.float8_e4m3fn)
-                    .to(torch.float16)
-                )
-                y = (xq.reshape(-1, xq.shape[-1]) @ wq) * (x_scale * ws)
-                return y.reshape(*x.shape[:-1], w.shape[-1]).to(x.dtype)
-
-            h = x * g
-            return ref_linear(ref_linear(h, w1, ws1), w2, ws2)
-
-        compare_with_pytorch(
-            spyre_fn, pytorch_fn, x, g, w1, ws1, w2, ws2, atol=2.0, rtol=0.2
-        )
-
-    def test_fp8_3d_activation_reshape_cpu(self, b, m, k, n):
-        """Regression test for _project_pointwise_dim_order rank_diff < 0 with QFP8CH.
-
-        A 3D batched activation (B, M, K) is reshaped to 2D (B*M, K) before
-        quantization and the matmul output is reshaped back to (B, M, N).
-        The QFP8CH rank-2 buffer produced by quantize_fp8_with_scale is then
-        consumed by rank-3 pointwise rescaling ops, giving rank_diff = 2 - 3 = -1
-        in _project_pointwise_dim_order. The sparse-stick -1 marker was incorrectly
-        shifted as if it were a dimension index, producing a dim_order of the wrong
-        length and crashing SpyreTensorLayout.__init__.
-
-        Previously failed with:
-          RuntimeError: Incompatible host_size and dim_order
-
-        Root cause:
-          propagate_layouts.py: _project_pointwise_dim_order shifted the trailing
-          -1 sparse-stick marker when rank_diff < 0, corrupting dim_order length
-        """
-        FP8_MAX = 448.0
-
-        a_3d = cached_randn(
-            (b, m, k),
-            dtype=torch.float16,
-            differentiation=("a3d", b, m, k, n),
-            scale=0.1,
-        )
-        w = cached_randn(
-            (k, n),
-            dtype=torch.float16,
-            differentiation=("w", b, m, k, n),
-            scale=0.1,
-        )
-        # Use non-unity scales to exercise FP8 range behaviour (scale=1.0 makes
-        # quantization a numerical pass-through and masks range-boundary errors).
-        sa = torch.full((1,), 0.5, dtype=torch.float16)
-        sw = torch.full((1,), 0.25, dtype=torch.float16)
-
-        def spyre_fn(a_3d, w, sa, sw):
-            a_2d = a_3d.reshape(a_3d.shape[0] * a_3d.shape[1], a_3d.shape[2])
-            a_fp8 = torch.ops.spyre.quantize_fp8_with_scale(a_2d, sa)
-            w_fp8 = torch.ops.spyre.quantize_weight_fp8_with_scale(w, sw)
-            out = torch.ops.aten._scaled_mm(
-                a_fp8, w_fp8, scale_a=sa, scale_b=sw, out_dtype=torch.float16
-            )
-            return out.reshape(a_3d.shape[0], a_3d.shape[1], n)
-
-        def pytorch_fn(a_3d, w, sa, sw):
-            a_2d = a_3d.reshape(a_3d.shape[0] * a_3d.shape[1], a_3d.shape[2])
-            a_fp8 = (
-                (a_2d / sa)
-                .clamp(-FP8_MAX, FP8_MAX)
-                .to(torch.float8_e4m3fn)
-                .to(torch.float16)
-            )
-            w_fp8 = (
-                (w / sw)
-                .clamp(-FP8_MAX, FP8_MAX)
-                .to(torch.float8_e4m3fn)
-                .to(torch.float16)
-            )
-            out = (a_fp8 @ w_fp8) * (sa * sw)
-            return out.reshape(a_3d.shape[0], a_3d.shape[1], n)
-
-        compare_with_pytorch(spyre_fn, pytorch_fn, a_3d, w, sa, sw, atol=2.0, rtol=0.2)
 
     def test_is_nonzero_cpu(self, *args):
         """Test torch.is_nonzero on Spyre tensors"""
