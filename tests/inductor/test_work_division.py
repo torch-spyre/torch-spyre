@@ -33,14 +33,22 @@ from torch._inductor.utils import sympy_index_symbol
 import torch
 from sympy import Symbol
 from torch._inductor.dependencies import MemoryDep, StarDep, WeakDep
+from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     ComputedBuffer,
     FixedLayout,
     FlexibleLayout,
+    InputBuffer,
+    Loops,
+    MutationLayoutSHOULDREMOVE,
     Pointwise,
     Reduction,
+    ReinterpretView,
+    StorageBox,
+    TensorBox,
 )
 from torch._inductor.utils import fresh_cache
+from torch._inductor.virtualized import V
 from torch.utils._sympy.functions import ModularIndexing
 from torch.utils._ordered_set import OrderedSet
 
@@ -51,6 +59,7 @@ from torch_spyre._C import (
     get_device_dtype,
 )
 from torch_spyre._inductor import passes
+from torch_spyre._inductor.loop_carries import apply_loop_carries
 from torch_spyre._inductor import work_division_constraints
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.ir import FixedTiledLayout
@@ -84,6 +93,7 @@ from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 from torch_spyre._inductor.scratchpad.ilp_solver_ortools import CpSatLayoutSolver
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionBuffer,
+    LifetimeBoundBuffer,
     TileAxis,
     TileSpec,
 )
@@ -660,10 +670,12 @@ class TestEmptyLxEligibility(unittest.TestCase):
         empty = _fixed_tiled_layout((0, 64))
         nonempty = _fixed_tiled_layout((64, 64))
         zero_extent = _fixed_tiled_layout((64, 64))
+        _ds = [1, 0, 64]
         zero_extent.device_layout = SpyreTensorLayout(
-            [1, 0, 64],
+            _ds,
             [64, 64, 1],
             DataFormats.SEN169_FP16,
+            {(i,): _ds[i] for i in range(len(_ds))},
             ElementArrangement.STANDARD,
         )
         self.assertEqual(
@@ -2338,11 +2350,19 @@ class TestDepthwiseConvWindowBlocked(unittest.TestCase):
         w = torch.randn(self._W_SHAPE, dtype=torch.float16)
         x_dev = x.to(
             device_layout=SpyreTensorLayout(
-                [32, 32, 1, 1, 64], [32, 1, -1, 65536, 1024], fp16
+                [32, 32, 1, 1, 64],
+                [32, 1, -1, 65536, 1024],
+                fp16,
+                {(0,): 32, (1,): 32, (4,): 64},
             )
         )
         w_dev = w.to(
-            device_layout=SpyreTensorLayout([3, 3, 1, 1, 64], [1, 3, -1, 9, 9], fp16)
+            device_layout=SpyreTensorLayout(
+                [3, 3, 1, 1, 64],
+                [1, 3, -1, 9, 9],
+                fp16,
+                {(0,): 3, (1,): 3, (4,): 64},
+            )
         )
         return x, w, x_dev, w_dev
 
@@ -3085,9 +3105,12 @@ class TestResidencyEdgeMatching(unittest.TestCase):
             editor_cls = stack.enter_context(
                 patch.object(allocator_module, "GraphEditor")
             )
-            # The validator asks the real editor which collectives it rewrites.
+            # The validator asks the real editor which accesses it rewrites.
             editor_cls.collective_operand_name.side_effect = (
                 GraphEditor.collective_operand_name
+            )
+            editor_cls.is_repointable_access.side_effect = (
+                GraphEditor.is_repointable_access
             )
 
             plans = allocator_module.validated_drain_plans(
@@ -3199,58 +3222,77 @@ class TestResidencyEdgeMatching(unittest.TestCase):
             self.assertEqual(built["consumer"].cd_parent_matches.get("plain"), [])
 
     def test_post_loop_all_reduce_reads_a_drain_of_the_resident_carry(self):
-        """A carry whose only post-loop use is an all_reduce stays in LX.
+        """A carry reduced in place after its loop stays in LX.
 
         The all_reduce's whole-buffer read has no residency edge, so as a
         parent of the all_reduce the carry admits no division pair, which
         forces it -- and every in-loop update -- into HBM.  The plan gives the
-        all_reduce a post-loop drain to read instead: the carry is no longer
-        its parent, the carry is resident, the push repoints the all_reduce at
-        the drain, and the carry's lifetime still ends at the all_reduce
-        rather than the graph exit (``tail`` runs after it).
+        all_reduce a post-loop drain to work on instead.  Its result lives in
+        its operand, so the wait and the later reader (``tail``) move to the
+        drain with it: the carry is no longer their parent, the carry is
+        resident, the push repoints all three at the drain, and the carry's
+        lifetime still ends at its last access rather than the graph exit
+        (``out`` runs after it).
         """
         try:
             from ortools.sat.python import cp_model  # noqa: F401
         except ImportError:
             self.skipTest("the joint path needs the CP-SAT solver (ortools)")
-        from torch._inductor.ir import StorageBox, TensorBox
+        from torch._inductor.ir import Pointwise, StorageBox, TensorBox
 
-        from torch_spyre._inductor.ir import AllReduceAsyncFallback
+        from torch_spyre._inductor.ir import AllReduceKernel, WaitKernel
 
         storage_op = self.op_by_name["plain"]
-        all_reduce = MagicMock(spec=AllReduceAsyncFallback)
+        all_reduce = MagicMock(spec=AllReduceKernel)
         all_reduce.get_name.return_value = "all_reduce"
         all_reduce.inputs = [TensorBox(StorageBox(storage_op))]
+        wait = MagicMock(spec=WaitKernel)
+        wait.get_name.return_value = "wait"
+        wait.inputs = [TensorBox(StorageBox(storage_op))]
         tail_op = self._op("tail")
-        graph, ops = self._drained_carry_graph([all_reduce, tail_op], [tail_op])
-        # An extern kernel reads and writes whole buffers.
-        self.rw[all_reduce] = SimpleNamespace(
-            reads=OrderedSet([StarDep("plain")]),
-            writes=OrderedSet([StarDep("all_reduce")]),
+        tail_op.data = MagicMock(spec=Pointwise)
+        out_op = self._op("out")
+        graph, ops = self._drained_carry_graph(
+            [all_reduce, wait, tail_op, out_op], [out_op]
         )
-        self.rw[tail_op] = self._rw(["all_reduce"], ["tail"])
+        # Extern kernels read and write whole buffers.
+        for kernel in (all_reduce, wait):
+            self.rw[kernel] = SimpleNamespace(
+                reads=OrderedSet([StarDep("plain")]),
+                writes=OrderedSet([StarDep(kernel.get_name())]),
+            )
+        self.rw[tail_op] = self._rw(["plain"], ["tail"])
+        self.rw[out_op] = self._rw(["tail"], ["out"])
         mem_usage = {
             "plain": {"size": 256, "op_inputs": []},
             "update": {"size": -1, "op_inputs": ["plain"]},
             "consumer": {"size": 256, "op_inputs": ["update"]},
-            # An extern kernel's FixedLayout output is unsized.
+            # An in-place extern kernel's NoneLayout output is unsized.
             "all_reduce": {"size": -1, "op_inputs": ["plain"]},
-            "tail": {"size": 256, "op_inputs": ["all_reduce"]},
+            "wait": {"size": -1, "op_inputs": ["plain"]},
+            "tail": {"size": 256, "op_inputs": ["plain"]},
+            "out": {"size": 256, "op_inputs": ["tail"]},
         }
         residency = {
             "plain": None,
             "update": "op not allowed",
             "consumer": None,
             "all_reduce": "op not allowed",
+            "wait": "op not allowed",
             "tail": None,
+            "out": None,
         }
         divisions = {
             "plain": self.parent_divs,
             "update": self.parent_divs,
             "consumer": self.consumer_divs[:2],
             "all_reduce": [CoreDivision(splits={})],
+            "wait": [CoreDivision(splits={})],
             "tail": self.parent_divs[:1],
+            "out": self.parent_divs[:1],
         }
+        # The view fixture looks up the readers' own divisions.
+        self.divisions.update(tail=divisions["tail"], out=divisions["out"])
 
         def run(with_plan):
             real_plans = allocator_module.validated_drain_plans
@@ -3258,15 +3300,18 @@ class TestResidencyEdgeMatching(unittest.TestCase):
             with patch.object(allocator_module, "validated_drain_plans", plans_fn):
                 return self._plan_solve_push(graph, divisions, mem_usage, residency)
 
-        with self.subTest("the collective is drained"):
+        with self.subTest("the collective and its followers are drained"):
             plans, built, solved, editor_cls = run(with_plan=True)
             self.assertEqual(set(plans), {"plain"})
             plan = plans["plain"]
             self.assertIs(plan.collective, all_reduce)
+            self.assertEqual(plan.post_loop_accesses, (all_reduce, wait, tail_op))
             self.assertIsNotNone(solved["plain"].address)
-            self.assertNotIn("plain", built["all_reduce"].parents)
-            # Live to the all_reduce (index 3), not to the graph exit (5).
-            self.assertEqual(built["plain"].end_time, ops.index(all_reduce) + 1)
+            for name in ("all_reduce", "wait", "tail"):
+                self.assertNotIn("plain", built[name].parents)
+            # Live to its last access (tail), not to the graph exit.
+            self.assertEqual(built["plain"].end_time, ops.index(tail_op) + 1)
+            self.assertLess(built["plain"].end_time, len(ops))
             editor = editor_cls.return_value
             editor.push_allocation_with_clone.assert_called_once_with(
                 storage_op,
@@ -3277,8 +3322,8 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                 lower_anchor=plan.anchor_op,
             )
             drain = editor.push_allocation_with_clone.return_value
-            editor.replace_collective_operand.assert_called_once_with(
-                all_reduce, "plain", drain
+            editor.replace_post_loop_accesses.assert_called_once_with(
+                (all_reduce, wait, tail_op), "plain", drain
             )
             editor.change_graph_output.assert_not_called()
 
@@ -3287,7 +3332,59 @@ class TestResidencyEdgeMatching(unittest.TestCase):
             self.assertIsNone(solved["plain"].address)
             self.assertIn("plain", built["all_reduce"].parents)
             self.assertNotIn("plain", built["all_reduce"].cd_parent_matches)
-            editor_cls.return_value.replace_collective_operand.assert_not_called()
+            editor_cls.return_value.replace_post_loop_accesses.assert_not_called()
+
+    def test_a_returned_carry_reduced_in_place_drains_with_its_collective(self):
+        """``return wait(all_reduce_(acc))`` returns the carry itself.
+
+        An output clone alone would copy the carry before the in-place
+        collective reduces it, so the plan must take the collective's path and
+        repoint it and its wait at the drain.  A post-loop mutator the push
+        cannot repoint declines the plan instead.
+        """
+        from torch._inductor.ir import ExternKernel, StorageBox, TensorBox
+
+        from torch_spyre._inductor.ir import AllReduceKernel, WaitKernel
+
+        storage_op = self.op_by_name["plain"]
+
+        def in_place(cls, name):
+            op = MagicMock(spec=cls)
+            op.get_name.return_value = name
+            op.inputs = [TensorBox(StorageBox(storage_op))]
+            op.mutation_outputs = [
+                SimpleNamespace(get_mutation_names=lambda: ["plain"])
+            ]
+            self.rw[op] = SimpleNamespace(
+                reads=OrderedSet([StarDep("plain")]),
+                writes=OrderedSet([StarDep(name)]),
+            )
+            return op
+
+        def plans_for(after_loop):
+            graph, _ops = self._drained_carry_graph(after_loop, [storage_op])
+            with (
+                self._patches(),
+                patch.object(
+                    allocator_module, "clone_at_graph_boundaries", return_value=True
+                ),
+            ):
+                return allocator_module.validated_drain_plans(
+                    graph, division_is_fixed=False
+                )
+
+        with self.subTest("the collective and its wait follow the drain"):
+            all_reduce = in_place(AllReduceKernel, "all_reduce")
+            wait = in_place(WaitKernel, "wait")
+            plans = plans_for([all_reduce, wait])
+            self.assertEqual(set(plans), {"plain"})
+            self.assertIs(plans["plain"].collective, all_reduce)
+            self.assertEqual(plans["plain"].post_loop_accesses, (all_reduce, wait))
+
+        with self.subTest("a mutator the push cannot repoint declines"):
+            all_reduce = in_place(AllReduceKernel, "all_reduce")
+            opaque = in_place(ExternKernel, "opaque")
+            self.assertEqual(plans_for([all_reduce, opaque]), {})
 
     @staticmethod
     def _compatible(edge, parent_div, consumer_div):
@@ -3380,6 +3477,160 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         with self._patches():
             edges = allocator._parent_residency_edges(None, [], {}, {}, self.residency)
             self.assertEqual(allocator._cd_parent_matches(edges, [], {}), {})
+
+
+class TestCarryWriterEdges(unittest.TestCase):
+    """Writers of a loop carry besides its update, on real IR.
+
+    An ``all_reduce_`` of the loop result leaves a copy-back that writes the
+    carry's storage after the loop. It must own the storage as the storage's
+    producer does, or the storage stays in HBM.
+    """
+
+    SHAPE = (8, 128)
+
+    def setUp(self):
+        self.graph = GraphLowering(torch.fx.symbolic_trace(lambda: None))
+        handler = V.set_graph_handler(self.graph)
+        handler.__enter__()
+        self.addCleanup(handler.__exit__, None, None, None)
+        self.graph.operations = []
+        for name in ("x", "reduced"):
+            buf = InputBuffer(name=name, layout=_fixed_tiled_layout(self.SHAPE))
+            self.graph.name_to_buffer[name] = buf
+            self.graph.graph_inputs[name] = TensorBox(StorageBox(buf))
+        storage = self._op("storage", ["x"])
+        self.update = self._op("upd", ["storage", "x"])
+        record = LoopCarryRecord("storage", "upd", None)
+        storage._loop_carry_record = record
+        self.update._loop_carry_record = record
+        self.graph.graph_outputs = [TensorBox(StorageBox(self.update))]
+        self.allocator = CoOptimizingAllocator(_UNBUILT_SOLVER, size=1)
+        self.residency = {"storage": None}
+
+    def _op(self, name, reads, size=SHAPE, body=Pointwise):
+        def inner_fn(index):
+            offset = index[0] * size[1] + index[1]
+            value = V.ops.load(reads[0], offset)
+            for read in reads[1:]:
+                value = V.ops.add(value, V.ops.load(read, offset))
+            return value
+
+        op = ComputedBuffer(
+            name=name,
+            layout=_fixed_tiled_layout(size),
+            data=body(
+                device=torch.device("spyre:0"),
+                dtype=torch.float16,
+                inner_fn=inner_fn,
+                ranges=list(size),
+            ),
+        )
+        op.operation_name = name
+        self.graph.name_to_buffer[name] = op
+        self.graph.name_to_op[name] = op
+        self.graph.operations.append(op)
+        return op
+
+    def _copy_back(self, name, size=SHAPE, offset=0, body=Pointwise):
+        """The splice's copy of the reduced value into the loop result."""
+        op = self._op(name, ["reduced"], size, body)
+        target = self.update
+        if offset or tuple(size) != self.SHAPE:
+            target = ReinterpretView(
+                data=self.update,
+                layout=FixedLayout(
+                    torch.device("spyre:0"),
+                    torch.float16,
+                    list(size),
+                    FlexibleLayout.contiguous_strides(list(size)),
+                    offset,
+                ),
+            )
+        op.layout = MutationLayoutSHOULDREMOVE(target)
+        return op
+
+    def _carry_edges(self):
+        """The carry edges ``_build_cd_bound_buffers`` would build."""
+        apply_loop_carries(self.graph)
+        op_by_name = {op.get_name(): op for op in self.graph.operations}
+        update_edge = self.allocator._loop_carry_update_edge(
+            op_by_name["upd"], op_by_name, {}, graph=self.graph
+        )
+        edges = {"upd": update_edge}
+        self.allocator._add_carry_writer_edges(
+            self.graph, op_by_name, {}, self.residency, edges
+        )
+        return edges
+
+    def _divisions(self):
+        rows, sticks = sorted(
+            next(iter(op_read_writes(self.graph.get_buffer("storage")).writes)).ranges,
+            key=str,
+        )
+        return [
+            CoreDivision(),
+            CoreDivision(splits={rows: 4}),
+            CoreDivision(splits={sticks: 2}),
+            CoreDivision(splits={rows: 2}),
+        ]
+
+    def test_copy_back_owns_the_storage_like_its_producer(self):
+        copy_back = self._copy_back("copy_back")
+        edge = self._carry_edges()["copy_back"]
+        self.assertEqual(edge.buf_name, "storage")
+        self.assertIs(edge.consumer_op, copy_back)
+        divisions = self._divisions()
+        self.assertEqual(
+            edge.match_pairs(divisions[:3], divisions),
+            [(0, 0), (1, 1), (2, 2)],
+        )
+        self.assertIsNone(self.residency["storage"])
+
+    def test_copy_back_into_an_offset_slice_admits_no_division(self):
+        """It writes only part of the storage, and the edge cannot prove a
+        partial write lands on the cores owning those rows, so the storage
+        cannot be resident."""
+        self._copy_back("copy_back", size=(4, 128), offset=512)
+        edge = self._carry_edges()["copy_back"]
+        self.assertEqual(edge.buf_name, "storage")
+        divisions = self._divisions()
+        self.assertEqual(edge.match_pairs(divisions, divisions), [])
+
+    def test_spill_warning_names_every_writer_once(self):
+        self._copy_back("copy_back")
+        self._copy_back("copy_back_2")
+        self._carry_edges()
+        self.assertEqual(
+            self.allocator._carry_writers, {"storage": ["copy_back", "copy_back_2"]}
+        )
+        storage = LifetimeBoundBuffer("storage", 2048, [0, 1])
+        with self.assertLogs(allocator_module.logger, "WARNING") as logs:
+            self.allocator._warn_spilled_carries([storage])
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("copy_back, copy_back_2", logs.output[0])
+        storage.address = 0
+        with self.assertNoLogs(allocator_module.logger, "WARNING"):
+            self.allocator._warn_spilled_carries([storage])
+
+    def test_writer_without_an_edge_keeps_the_storage_in_hbm_and_warns_once(self):
+        """A ``Loops`` body records no write, so the second copy-back has no
+        edge. The storage leaves the solve with every edge on it, including
+        the first copy-back's."""
+        self._copy_back("copy_back")
+        self._copy_back("no_write", body=Loops)
+        with self.assertLogs(allocator_module.logger, "WARNING") as logs:
+            edges = self._carry_edges()
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("no_write has no ownership edge", logs.output[0])
+        self.assertEqual(edges, {})
+        self.assertEqual(
+            self.residency["storage"], "loop carry writer ownership unavailable"
+        )
+        with self.assertNoLogs(allocator_module.logger, "WARNING"):
+            self.allocator._warn_spilled_carries(
+                [LifetimeBoundBuffer("storage", 2048, [0, 1])]
+            )
 
 
 class TestCloneDivisionMatching(unittest.TestCase):
@@ -4678,6 +4929,23 @@ class TestOpSplitSpaceTiling(unittest.TestCase):
             self.assertFalse(space.admits({self.x: 1, self.y: 1}, _SPEC_ON_DIM_1))
             self.assertFalse(space.admits_tiling(_SPEC_ON_DIM_1))
 
+    def test_a_tiling_with_no_per_tile_context_is_refused_and_says_why(self):
+        by_2 = TileSpec((TileAxis(host_dim=0, count=2),))
+        by_4 = TileSpec((TileAxis(host_dim=0, count=4),))
+        with self._space(self.tiling) as space:
+            self.assertTrue(space.admits_tiling(by_2))  # non-vacuity
+            with (
+                patch.object(
+                    work_division_module,
+                    "work_division_context_for_op",
+                    side_effect=Unsupported("no frame"),
+                ),
+                self.assertLogs(work_division_module.logger, level="DEBUG") as logs,
+            ):
+                self.assertFalse(space.admits_tiling(by_4))
+        self.assertIn(f"dropping tiling {by_4} on tiled: ", logs.output[0])
+        self.assertIn("no frame", logs.output[0])
+
     def test_a_step_moves_one_axis_or_one_level_but_never_both(self):
         untiled = TileSpec()
         with self._space(self.tiling) as space:
@@ -4959,8 +5227,8 @@ class TestResidencyEdgeInversion(unittest.TestCase):
         that reproduces the geometry being illegal means no edge -- not an
         illegal division."""
         space = self.consumer_space
-        space.context.is_legal.side_effect = (
-            lambda splits, tile_counts=None: splits[self.r] != 4
+        space.context.is_legal.side_effect = lambda splits, tile_counts=None: (
+            splits[self.r] != 4
         )
         with self._geometry():
             edge = self._edge()
@@ -5200,8 +5468,13 @@ class TestJointTilingAndDivisionExemption(unittest.TestCase):
     def _tiled_op(self, marked):
         op = MagicMock()
         op.get_name.return_value = "buf0"
+        # One level, as CoarseTileInfo always has: group id, count and the
+        # tiled-dim lists are the same length.
         op.loop_info = SimpleNamespace(
-            loop_tiled_dims=[[0]], loop_tiled_reduction_dims=[[]]
+            loop_group_id=(0,),
+            loop_count=[8],
+            loop_tiled_dims=[[0]],
+            loop_tiled_reduction_dims=[[]],
         )
         op.data = SimpleNamespace(ranges=[sympy.Integer(8)])
         op.dim_hints = []

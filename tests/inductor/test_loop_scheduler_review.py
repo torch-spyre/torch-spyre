@@ -430,7 +430,8 @@ def _scaled_split_k_fn(X, Y):
 
 
 def _cumsum_split_k_fn(X, Y):
-    """A fallback (aten.cumsum) in the body that reads the body's matmul."""
+    """A cumsum in the body that reads the body's matmul.  cumsum decomposes
+    to device ops, so the body holds only kernels."""
 
     def body(acc, ops):
         x_tile, y_tile = ops
@@ -568,23 +569,25 @@ def test_non_member_kernel_op_inside_a_loop_node_is_refused():
     assert "are in no counted loop" in str(info.value)
 
 
-def test_fallback_reading_a_body_buffer_is_refused():
-    """An extern op in a body is hoisted before its loop; one that reads a
-    buffer the loop writes cannot be, and is refused naming the op.  (The
-    flat path fails on the same graph too, later and obscurely: a cycle in
-    Inductor's memory planning.)"""
+def test_cumsum_reading_a_body_buffer_runs_on_device():
+    """cumsum in a body reads a buffer the loop writes.  It used to be a CPU
+    fallback, an extern op that cannot be hoisted before the loop and was
+    refused; it now decomposes to device kernels, so it stays in the loop
+    and the flow-through matches the flat path."""
     X, Y = _matmul_inputs()
-    torch._dynamo.reset()
-    with (
-        torch._inductor.config.patch(force_disable_caches=True),
-        pytest.raises(Exception, match="cannot be placed before the loop") as info,
-    ):
-        torch.compile(_cumsum_split_k_fn, fullgraph=True, dynamic=False)(
-            X.to("spyre"), Y.to("spyre")
-        )
-    # Inductor wraps the backend's Unsupported in an InductorError.
-    assert "Unsupported" in str(info.value)
-    assert "FallbackKernel" in str(info.value)
+    flat, nodes = _compile_both(_cumsum_split_k_fn, (X, Y))
+    _assert_same_compile(flat, nodes)
+    # The cumsum's kernels are in the loop with the matmul (a matmul-only body
+    # is two kernels), and nothing but kernels is: no extern op was left in it.
+    loop = next(e[1] for e in nodes["pre_fusion"] if isinstance(e[1], list))
+    assert len(loop) > 2 and all(e[0] == "kernel" for e in loop), loop
+    # cumsum is linear, so summing the tiles' cumsums is the cumsum of the product.
+    torch.testing.assert_close(
+        nodes["out"].float(),
+        torch.cumsum(_split_k_reference(X, Y), dim=0),
+        atol=5e-2,
+        rtol=1e-2,
+    )
 
 
 # ---------------------------------------------------------------------------
