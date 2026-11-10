@@ -2492,13 +2492,15 @@ def compute_restickify_target_layout(
     # — the proposed reliable replacement for _host_size_stride_for_expr.
     if arg is not None and new_var in arg.dep.ranges:
         _new_size_from_dep = concretize_expr(arg.dep.ranges[new_var])
-        _new_stride_from_dep = int(sympy.expand(arg.dep.index).coeff(new_var))
+        _new_stride_coeff = sympy.expand(arg.dep.index).coeff(new_var)
+        _new_stride_from_dep = concretize_expr(_new_stride_coeff)
         assert _new_size_from_dep == new_sd_host_size, (
             f"new-side size mismatch: dep.ranges[{new_var}]={_new_size_from_dep} "
             f"vs _host_size_stride_for_expr={new_sd_host_size}"
         )
         assert _new_stride_from_dep == new_sd_host_stride, (
-            f"new-side stride mismatch: dep.index.coeff({new_var})={_new_stride_from_dep} "
+            f"new-side stride mismatch: dep.index.coeff({new_var})={_new_stride_coeff!r} "
+            f"concretized={_new_stride_from_dep} "
             f"vs _host_size_stride_for_expr={new_sd_host_stride}"
         )
     device_size = restickify_device_size(
