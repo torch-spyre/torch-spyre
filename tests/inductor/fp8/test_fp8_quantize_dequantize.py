@@ -1193,10 +1193,9 @@ class TestRoundtripInputVariants:
 
     @pytest.mark.xfail(
         strict=True,
-        raises=InductorError,
-        reason="https://github.com/torch-spyre/torch-spyre/issues/2526: transposed input "
-        "fails to compile: dbo-opt raises DtException 'Expect valid lower and upper bound "
-        "parameters'",
+        raises=AssertionError,
+        reason="https://github.com/torch-spyre/torch-spyre/issues/6160: transposed input "
+        "returns wrong values (4/16 elements differ, up to 16.0)",
     )
     def test_transposed_non_contiguous_input(self):
         """Transposed non-contiguous input, non-uniform."""
