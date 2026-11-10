@@ -805,20 +805,28 @@ def _marker_substitution(
 
 
 def _host_layout_key(node: Any) -> "tuple | None":
-    """Host size/stride/offset of ``node``'s layout, or None if it has none."""
-    try:
-        layout = node.get_layout()
-        return (tuple(layout.size), tuple(layout.stride), layout.offset)
-    except Exception:  # noqa: BLE001 -- no fixed host layout: do not cache
+    """Host size/stride/offset of ``node``'s layout, or None if it has none.
+
+    A node with no layout (a ``TorchBindObject``, or a ``Buffer`` whose output
+    spec is not a ``Layout``) has no key, so its marker is not cached. Any other
+    error from ``get_layout`` propagates.
+    """
+    get_layout = getattr(node, "get_layout", None)
+    if get_layout is None:
         return None
+    try:
+        layout = get_layout()
+    except NotImplementedError:
+        return None
+    return (tuple(layout.size), tuple(layout.stride), layout.offset)
 
 
 def _buffer_host_layout_key(name: str) -> "tuple | None":
     """``_host_layout_key`` of the current graph's buffer ``name``, or None."""
-    try:
-        buf = V.graph.try_get_buffer(name)
-    except Exception:  # noqa: BLE001 -- no graph installed
+    graph = V.graph
+    if not hasattr(graph, "try_get_buffer"):  # no graph installed
         return None
+    buf = graph.try_get_buffer(name)
     return None if buf is None else _host_layout_key(buf)
 
 
@@ -831,12 +839,15 @@ def _cached_marker_substitution(
     ``inner_fn``, and each trace would otherwise re-extract the erased marker's
     read/writes. The entry is reused only while what the extraction depends on
     is unchanged: the marker's body object and ``inner_fn`` (a pass patches
-    ``inner_fn`` in place), its host layout (its write index), and its input's
-    host layout (its read index).
+    ``inner_fn`` in place), its ``ranges`` (its write var names and size), its
+    host layout (its write index), and its input's host layout (its read index).
     """
     data = getattr(marker_op, "data", None)
     inner_fn = getattr(data, "inner_fn", None)
-    marker_key = _host_layout_key(marker_op)
+    layout_key = _host_layout_key(marker_op)
+    marker_key = (
+        None if layout_key is None else (layout_key, tuple(getattr(data, "ranges", ())))
+    )
     cached = marker_op.__dict__.get("_ts_marker_substitution")
     if cached is not None:
         cached_data, cached_inner_fn, cached_keys, result = cached
@@ -1363,6 +1374,9 @@ def _consume_tile_dim_markers(
                 # no-op for any reference that already points at marker_op by
                 # identity, and safely repoints any reference that doesn't.
                 _substitute_direct_input_refs([consumer_op], {marker_name: marker_op})
+                # Edited in place; its read names do not change, but evict it
+                # anyway so no later scan relies on that.
+                read_writes_cache.pop(id(consumer_op), None)
                 new_consumer = consumer_op
                 # No object reconstruction happened (unlike the ComputedBuffer
                 # branch) -- consumer_op's own identity is unchanged, and its
