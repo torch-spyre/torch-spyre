@@ -558,17 +558,22 @@ class _SympyExprToCpSat(Printer):
         return expr
 
     def _complement_of(self, expr):
-        """``1 - lit`` for a residency literal as its complement, a Boolean tied
-        to it by ``lit + not_lit == 1``. Expanded, ``(1 - lit) * v`` is then one
-        non-negative gate ``not_lit * v`` rather than ``v - lit * v``, whose
-        relaxation can hold the gated copy at its top while ``v`` sits at its
-        bottom."""
+        """``c - c*lit`` for a residency literal as ``c * not_lit``, a Boolean
+        tied to it by ``lit + not_lit == 1``. Expanded, ``(1 - lit) * v`` is then
+        one non-negative gate ``not_lit * v`` rather than ``v - lit * v``, whose
+        two copies lower apart: their roundings need not cancel at ``lit = 1``,
+        and the relaxation can hold the gated copy at its top while ``v`` sits
+        at its bottom."""
         args = expr.args
-        if len(args) != 2 or sympy.Integer(1) not in args:
+        if len(args) != 2:
             return None
-        other = args[0] if args[1] == 1 else args[1]
+        constants = [arg for arg in args if arg.is_Number]
+        if len(constants) != 1 or constants[0] == 0:
+            return None
+        (scale,) = constants
+        other = args[0] if args[1] is scale else args[1]
         coefficient, lit = other.as_coeff_Mul()
-        if coefficient != -1 or not lit.is_Symbol or lit.name not in self._sym_map:
+        if coefficient != -scale or not lit.is_Symbol or lit.name not in self._sym_map:
             return None
         var = self._sym_map[lit.name]
         if not getattr(var, "is_boolean", False):
@@ -578,7 +583,7 @@ class _SympyExprToCpSat(Printer):
             complement = self._model.new_bool_var(name)
             self._model.add(complement + var == 1)
             self._sym_map[name] = complement
-        return sympy.Symbol(name, integer=True, nonnegative=True)
+        return scale * sympy.Symbol(name, integer=True, nonnegative=True)
 
     def _distribute_power(self, expr):
         """Bring a fractional or negative power down to the split and tile
