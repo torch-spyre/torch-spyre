@@ -41,6 +41,7 @@ import os
 import sys
 
 import pytest
+import regex as re
 import torch
 from torch._inductor.exc import InductorError
 
@@ -82,37 +83,49 @@ def _compare_mode(execution_mode, fn, *args, atol=BF16_ATOL, rtol=BF16_RTOL, **k
     if execution_mode == "cpu":
         return
 
-    if execution_mode == "eager":
+    if execution_mode not in ("eager", "compiled"):
+        raise ValueError(f"Unsupported execution mode: {execution_mode}")
+
+    compiled = execution_mode == "compiled"
+    try:
         compare_with_cpu(
             fn,
             *args,
             atol=atol,
             rtol=rtol,
-            run_compile=False,
-            run_eager=True,
-            cpu_compile=False,
+            run_compile=compiled,
+            run_eager=not compiled,
+            cpu_compile=compiled,
             **kwargs,
         )
-        return
-
-    if execution_mode == "compiled":
-        compare_with_cpu(
-            fn,
-            *args,
-            atol=atol,
-            rtol=rtol,
-            run_compile=True,
-            run_eager=False,
-            cpu_compile=True,
-            **kwargs,
-        )
-        return
-
-    raise ValueError(f"Unsupported execution mode: {execution_mode}")
+    except Exception as e:
+        # raises= pins only the exception type. A fix that moves the failure to the
+        # next unsupported op of the same type must fail here, not stay xfailed.
+        if _EXPECTED_MATCH is not None and not re.search(_EXPECTED_MATCH, str(e)):
+            pytest.fail(
+                f"Expected a failure matching {_EXPECTED_MATCH!r}, "
+                f"got {type(e).__name__}: {e}",
+                pytrace=False,
+            )
+        raise
 
 
-def _xfail(raises, reason):
-    return pytest.mark.xfail(strict=True, raises=raises, reason=reason)
+# Failure-message pattern of the running case's xfail marker, if any.
+_EXPECTED_MATCH = None
+
+
+@pytest.fixture(autouse=True)
+def _xfail_match(request):
+    global _EXPECTED_MATCH
+    mark = request.node.get_closest_marker("xfail")
+    _EXPECTED_MATCH = mark.kwargs.get("match") if mark else None
+    yield
+    _EXPECTED_MATCH = None
+
+
+def _xfail(raises, reason, match):
+    """Strict xfail on ``raises`` whose message must also match ``match``."""
+    return pytest.mark.xfail(strict=True, raises=raises, reason=reason, match=match)
 
 
 def _modes(eager=None, compiled=None):
@@ -141,39 +154,62 @@ def _cases(eager=None, compiled=None, decode_eager=None, decode_compiled=None):
 GROUPED_MOE_EAGER = _xfail(
     InductorError,
     "#3193: routing flatten raises no mechanism to resolve stick incompatibility",
+    "no mechanism to resolve stick incompatibility",
 )
 GROUPED_MOE_COMPILED = _xfail(
     InductorError,
     "#4648: restickify padding finds no input host dim for the new stick symbol",
+    "restickify padding: no input host dim carries new-stick symbol",
 )
 STABLE_SORT = _xfail(
-    NotImplementedError, "#4500: aten::sort.values_stable has no Spyre kernel"
+    NotImplementedError,
+    "#4500: aten::sort.values_stable has no Spyre kernel",
+    r"aten::sort\.values_stable",
 )
 FLOOR_DIVIDE = _xfail(
-    NotImplementedError, "#4643: aten::floor_divide has no Spyre kernel"
+    NotImplementedError,
+    "#4643: aten::floor_divide has no Spyre kernel",
+    "aten::floor_divide",
 )
 TILE_OFFSET_CUMSUM = _xfail(
-    InductorError, "#4754: no offset-free alternative stick dim for mutation target"
+    InductorError,
+    "#4754: no offset-free alternative stick dim for mutation target",
+    "no offset-free alternative stick dim for mutation target",
 )
-TOPK_FLOAT_IDS = _xfail(AssertionError, "#5847: topk returns float32 indices")
+TOPK_FLOAT_IDS = _xfail(
+    AssertionError,
+    "#5847: topk returns float32 indices",
+    r"'dtype' do not match: torch\.float32 != torch\.int64",
+)
 TOPK_WRONG_VALUES = _xfail(
-    AssertionError, "#4639: compiled K=8 topk returns incorrect values"
+    AssertionError,
+    "#4639: compiled K=8 topk returns incorrect values",
+    "Tensor-likes are not close",
 )
-UNIQUE = _xfail(NotImplementedError, "#4645: aten::_unique2 has no Spyre kernel")
+UNIQUE = _xfail(
+    NotImplementedError, "#4645: aten::_unique2 has no Spyre kernel", "aten::_unique2"
+)
 INDEX_2D = _xfail(
-    NotImplementedError, "#1219: aten::index.Tensor supports only a 1-D index"
+    NotImplementedError,
+    "#1219: aten::index.Tensor supports only a 1-D index",
+    r"aten::index\.Tensor supports only",
 )
 INDEX_ADD_DUPLICATES = _xfail(
-    AssertionError, "#4411: index_add keeps the last duplicate instead of summing"
+    AssertionError,
+    "#4411: index_add keeps the last duplicate instead of summing",
+    "Tensor-likes are not close",
 )
 # At T=1 the routing flatten succeeds and the grouped path stops at the stable sort.
 SORT_AT_DECODE = dict(decode_eager=STABLE_SORT, decode_compiled=STABLE_SORT)
 MIXED_EA = _xfail(
     InductorError,
     "#4714: BF16 x FP32 broadcast multiply raises mixed EA with no staggered operand",
+    "Multi-arg pointwise with mixed EA",
 )
 FLOAT_IDS_AS_INDEX = _xfail(
-    RuntimeError, "#5847: float32 topk ids cannot index per_expert_scale"
+    RuntimeError,
+    "#5847: float32 topk ids cannot index per_expert_scale",
+    "tensors used as indices must be long, int, byte or bool",
 )
 
 
@@ -277,15 +313,22 @@ def _pad_columns(routed_sorted, weight_sorted, token_sorted, dst, n_pad, sink):
 
 
 @functools.lru_cache(maxsize=None)
+def _expert_bank_3d():
+    """All 128 experts as _grouped_mm takes them: [128, 2816, 1408], [128, 704, 2816]."""
+    gate_up = torch.empty(EXPERTS, HIDDEN, GATE_UP, dtype=torch.bfloat16)
+    down = torch.empty(EXPERTS, MOE_INTERMEDIATE, HIDDEN, dtype=torch.bfloat16)
+    for e in range(EXPERTS):
+        g = torch.Generator(device="cpu")
+        g.manual_seed(SEED + e)
+        gate_up[e] = torch.randn(HIDDEN, GATE_UP, generator=g) * 0.01
+        down[e] = torch.randn(MOE_INTERMEDIATE, HIDDEN, generator=g) * 0.01
+    return gate_up, down
+
+
 def _expert_slab(e):
-    """Return the deterministic (gate_up, down) BF16 slabs of expert ``e``."""
-    g = torch.Generator(device="cpu")
-    g.manual_seed(SEED + e)
-    gate_up = torch.randn(HIDDEN, GATE_UP, generator=g, dtype=torch.float32) * 0.01
-    down = (
-        torch.randn(MOE_INTERMEDIATE, HIDDEN, generator=g, dtype=torch.float32) * 0.01
-    )
-    return gate_up.to(torch.bfloat16), down.to(torch.bfloat16)
+    """Return expert ``e``'s (gate_up, down) slabs, as views into the 3-D bank."""
+    gate_up, down = _expert_bank_3d()
+    return gate_up[e], down[e]
 
 
 def _expert_weights(expert_ids):
@@ -466,14 +509,6 @@ def _gemma4_router(hidden, scale, proj, per_expert_scale):
     return weights * per_expert_scale[ids], ids
 
 
-@functools.lru_cache(maxsize=None)
-def _expert_bank_3d():
-    """All 128 experts as _grouped_mm takes them: [128, 2816, 1408], [128, 704, 2816]."""
-    gate_up = torch.stack([_expert_slab(e)[0] for e in range(EXPERTS)])
-    down = torch.stack([_expert_slab(e)[1] for e in range(EXPERTS)])
-    return gate_up, down
-
-
 def _hf_dispatch(hidden, weights, ids):
     """Sort routed rows by expert and gather their activations and weights."""
     expert_ids_g, perm = torch.sort(ids.reshape(-1))
@@ -544,7 +579,7 @@ def _moe_fp32_reference(hidden, ids, weights, bank):
 )
 def test_G4_RT_001_batch_routing(execution_mode, T):
     """Gemma 4-style FP32 router softmax followed by Top-K(K=8)."""
-    torch.manual_seed(20260908)
+    _seed()
 
     x = torch.randn(
         T,
@@ -788,10 +823,14 @@ def test_G4_AB_002_bincount_segment_boundaries(execution_mode):
     ("execution_mode", "T"),
     _cases(
         eager=_xfail(
-            InductorError, "#3193: no mechanism to resolve stick incompatibility"
+            InductorError,
+            "#3193: no mechanism to resolve stick incompatibility",
+            "no mechanism to resolve stick incompatibility",
         ),
         compiled=_xfail(
-            InductorError, "#3193: no mechanism to resolve stick incompatibility"
+            InductorError,
+            "#3193: no mechanism to resolve stick incompatibility",
+            "no mechanism to resolve stick incompatibility",
         ),
         **SORT_AT_DECODE,
     ),
@@ -842,10 +881,14 @@ def test_G4_AB_005_reorder_activations_weights_token_ids(execution_mode, T):
     "execution_mode",
     _modes(
         eager=_xfail(
-            NotImplementedError, "#673: repeat_interleave.Tensor has no Spyre kernel"
+            NotImplementedError,
+            "#673: repeat_interleave.Tensor has no Spyre kernel",
+            r"aten::repeat_interleave\.Tensor",
         ),
         compiled=_xfail(
-            NotImplementedError, "#673: repeat_interleave.Tensor has no Spyre kernel"
+            NotImplementedError,
+            "#673: repeat_interleave.Tensor has no Spyre kernel",
+            r"aten::repeat_interleave\.Tensor",
         ),
     ),
 )
@@ -957,9 +1000,15 @@ def test_G4_AB_004_tile_to_expert_assignment(execution_mode):
     ("execution_mode", "T"),
     _cases(
         eager=_xfail(
-            NotImplementedError, "#692: aten::_index_put_impl_ has no Spyre kernel"
+            NotImplementedError,
+            "#692: aten::_index_put_impl_ has no Spyre kernel",
+            "aten::_index_put_impl_",
         ),
-        compiled=_xfail(InductorError, "#4327: restickify op_spec has 3 args"),
+        compiled=_xfail(
+            InductorError,
+            "#4327: restickify op_spec has 3 args",
+            "restickify op_spec has 3 args",
+        ),
     ),
 )
 def test_G4_AB_006_pad_activations_weights_token_ids(execution_mode, T):
@@ -1094,6 +1143,7 @@ def test_G4_AB_007_per_tile_static_loop_scatter_add(execution_mode, T):
     got, meta = fn(hidden, expert_ids, weights)
     ref = _moe_reference(hidden, expert_ids, weights, bank)
     assert got.shape == (T, HIDDEN)
+    assert got.dtype == torch.bfloat16
     _assert_close(got, ref)
     _assert_no_nan_inf(got)
 
@@ -1209,40 +1259,17 @@ def test_G4_BE_002_fixed_tile_sink_row_scatter_reduce(execution_mode):
 
 @pytest.mark.parametrize(
     ("execution_mode", "T"),
-    _cases(eager=GROUPED_MOE_EAGER, compiled=GROUPED_MOE_COMPILED, **SORT_AT_DECODE),
-)
-def test_G4_E2E_001_moe_layer(execution_mode, T):
-    _seed()
-    hidden = torch.randn(T, HIDDEN, dtype=torch.bfloat16)
-    logits = _router_logits(T)
-    weights, expert_ids = _routing_weights(logits)
-    bank = _expert_weights(torch.unique(expert_ids).tolist())
-
-    def fn(x, ids, w):
-        return _grouped_moe(x, ids, w, bank)[0]
-
-    _compare_mode(
-        execution_mode,
-        fn,
-        hidden,
-        expert_ids,
-        weights,
-        atol=BF16_ATOL,
-        rtol=BF16_RTOL,
-    )
-
-    got = fn(hidden, expert_ids, weights)
-    ref = _moe_reference(hidden, expert_ids, weights, bank)
-    assert got.shape == (T, HIDDEN)
-    _assert_close(got, ref)
-    _assert_no_nan_inf(got)
-
-
-@pytest.mark.parametrize(
-    ("execution_mode", "T"),
     _cases(
-        eager=_xfail(RuntimeError, "#3179: rope calls pow, an unimplemented operation"),
-        compiled=_xfail(InductorError, "#4443: unexpected stick expression"),
+        eager=_xfail(
+            RuntimeError,
+            "#3179: rope calls pow, an unimplemented operation",
+            "unimplemented operation pow",
+        ),
+        compiled=_xfail(
+            InductorError,
+            "#4443: unexpected stick expression",
+            "Unexpected stick expression",
+        ),
     ),
 )
 def test_G4_E2E_002_transformer_block_attention_moe(execution_mode, T):
@@ -1304,37 +1331,6 @@ def test_G4_E2E_002_transformer_block_attention_moe(execution_mode, T):
 # ---------------------------------------------------------------------------
 # 3.9 Numerical / dtype correctness
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("execution_mode", "T"),
-    _cases(eager=GROUPED_MOE_EAGER, compiled=GROUPED_MOE_COMPILED, **SORT_AT_DECODE),
-)
-def test_G4_DT_001_bf16_end_to_end_numerical(execution_mode, T):
-    _seed()
-    hidden = torch.randn(T, HIDDEN, dtype=torch.bfloat16)
-    weights, ids = _routing_weights(_router_logits(T))
-    bank = _expert_weights(torch.unique(ids).tolist())
-
-    def fn(x, i, w):
-        return _grouped_moe(x, i, w, bank)[0]
-
-    _compare_mode(
-        execution_mode,
-        fn,
-        hidden,
-        ids,
-        weights,
-        atol=BF16_ATOL,
-        rtol=BF16_RTOL,
-    )
-
-    got = fn(hidden, ids, weights)
-    ref = _moe_reference(hidden, ids, weights, bank)
-    assert got.dtype == torch.bfloat16
-    assert got.shape == (T, HIDDEN)
-    _assert_no_nan_inf(got)
-    _assert_close(got, ref)
 
 
 @pytest.mark.parametrize(
@@ -1428,12 +1424,15 @@ def test_G4_EC_002_empty_expert_segments(execution_mode, T):
     ("execution_mode", "T"),
     _cases(
         eager=_xfail(
-            AssertionError, "#4639: eager topk selects ids outside the tied pool"
+            AssertionError,
+            "#4639: eager topk selects ids outside the tied pool",
+            "Tensor-likes are not close",
         ),
         compiled=GROUPED_MOE_COMPILED,
         decode_eager=_xfail(
             InductorError,
             "#4404: restickify restore expects a padding-prepended gap dim",
+            "restickify restore: expected padding-prepended",
         ),
         decode_compiled=STABLE_SORT,
     ),
@@ -1480,7 +1479,7 @@ def test_G4_EC_003_topk_tied_candidates(execution_mode, T):
     torch.testing.assert_close(
         values,
         torch.full((T, K8), expected, dtype=torch.float32),
-        atol=FP32_ATOL * expected,
+        atol=FP32_ATOL,
         rtol=FP32_RTOL,
     )
 
@@ -1539,7 +1538,9 @@ def test_G4_EC_005_single_expert_routing_all_tokens(execution_mode, T):
     _cases(
         eager=STABLE_SORT,
         compiled=_xfail(
-            InductorError, "#5831: split_multi_ops fails on multi-output sort"
+            InductorError,
+            "#5831: split_multi_ops fails on multi-output sort",
+            "'tuple' object has no attribute 'to'",
         ),
     ),
 )
@@ -1572,8 +1573,12 @@ def test_G4_GM_001_sort_dispatch(execution_mode, T):
 @pytest.mark.parametrize(
     ("execution_mode", "T"),
     _cases(
-        eager=_xfail(NotImplementedError, "#4071: aten::histc has no Spyre kernel"),
-        compiled=_xfail(NotImplementedError, "#4071: aten::histc has no Spyre kernel"),
+        eager=_xfail(
+            NotImplementedError, "#4071: aten::histc has no Spyre kernel", "aten::histc"
+        ),
+        compiled=_xfail(
+            NotImplementedError, "#4071: aten::histc has no Spyre kernel", "aten::histc"
+        ),
     ),
 )
 def test_G4_GM_002_histc_cumsum_offsets(execution_mode, T):
