@@ -44,6 +44,9 @@ from torch_spyre._inductor.propagate_layouts import (
     generate_stl_with_required_stick,
 )
 from torch_spyre._inductor.views import (
+    _compute_coordinates_memo,
+    _compute_coordinates_uncached,
+    _coordinates_memo_key,
     _decompose_constant_offset,
     align_tensors,
     compute_coordinates,
@@ -565,6 +568,90 @@ class TestCoordinates(TestCase):
             _decompose_constant_offset(
                 s0, [10, 10], [200, 2], [sympy.S.Zero, sympy.S.Zero]
             )
+
+
+class TestComputeCoordinatesMemo(TestCase):
+    """compute_coordinates is memoized on its arguments; a hit must be
+    indistinguishable from computing the answer again."""
+
+    def setUp(self):
+        _compute_coordinates_memo.cache_clear()
+
+    def _mixed_radix_call(self, repeat_info):
+        lq, hd = sympy.symbols("lq hd", integer=True, nonnegative=True)
+        return compute_coordinates(
+            [1, 32, 64, 128],
+            [262144, 8192, 128, 1],
+            {lq: 64, hd: 4096},
+            128 * lq
+            + 8192 * ModularIndexing(hd, 128, 32)
+            + ModularIndexing(hd, 1, 128),
+            repeat_info_out=repeat_info,
+        )
+
+    def test_a_hit_returns_what_the_uncached_call_returns(self):
+        lq, hd = sympy.symbols("lq hd", integer=True, nonnegative=True)
+        args = (
+            [1, 32, 64, 128],
+            [262144, 8192, 128, 1],
+            {lq: 64, hd: 4096},
+            128 * lq
+            + 8192 * ModularIndexing(hd, 128, 32)
+            + ModularIndexing(hd, 1, 128),
+        )
+        with V.set_graph_handler(SimpleNamespace()):
+            expected_info: dict = {}
+            expected = _compute_coordinates_uncached(*args, None, expected_info)
+            first_info: dict = {}
+            first = self._mixed_radix_call(first_info)
+            second_info: dict = {}
+            second = self._mixed_radix_call(second_info)
+        self.assertEqual(first, expected)
+        self.assertEqual(second, expected)
+        self.assertEqual(first_info, expected_info)
+        self.assertEqual(second_info, expected_info)
+        info = _compute_coordinates_memo.cache_info()
+        self.assertEqual((info.misses, info.hits), (1, 1))
+
+    def test_each_caller_gets_its_own_list_and_repeat_info(self):
+        with V.set_graph_handler(SimpleNamespace()):
+            first_info: dict = {}
+            first = self._mixed_radix_call(first_info)
+            expected, expected_info = list(first), repr(first_info)
+            # Callers edit what they are handed; the memo must not see it.
+            first[0] = sympy.Symbol("edited")
+            for info in first_info.values():
+                info["kind"] = "edited"
+                for digit in info.get("digits", ()):
+                    digit["coeff"] = -1
+            second_info: dict = {}
+            second = self._mixed_radix_call(second_info)
+        self.assertEqual(second, expected)
+        self.assertEqual(repr(second_info), expected_info)
+
+    def test_an_error_is_raised_every_time_and_not_memoized(self):
+        for _ in range(2):
+            with self.assertRaisesRegex(Unsupported, "runs backwards"):
+                compute_coordinates(
+                    [4, 64], [64, 1], {p0: 4, p1: 64}, 192 - 64 * p0 + p1
+                )
+        self.assertEqual(_compute_coordinates_memo.cache_info().currsize, 0)
+
+    def test_graph_dependent_calls_are_not_memoized(self):
+        # A symbolic range or a dynamic size symbol is compared through
+        # V.graph's size hints, so the arguments alone do not decide the result.
+        s0 = sympy.Symbol("s0", integer=True, positive=True)
+        self.assertIsNone(
+            _coordinates_memo_key(
+                [4, 64], [64, 1], {p0: s0, p1: 64}, 64 * p0 + p1, None
+            )
+        )
+        self.assertIsNone(
+            _coordinates_memo_key([4, 64], [64, 1], {p1: 64}, 64 * s0 + p1, None)
+        )
+        self.assertIsNotNone(
+            _coordinates_memo_key([4, 64], [64, 1], {p0: 4, p1: 64}, 64 * p0 + p1, None)
+        )
 
 
 class TestAlignTensorsStridedTerm(TestCase):
