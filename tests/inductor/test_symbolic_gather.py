@@ -59,7 +59,9 @@ from torch_spyre.execution import kernel_runner
 PAGE_SIZE, PAGE_HS, Q_ROWS = 32, 64, 32
 
 POOL_MIN, POOL_MAX, POOL_G = 8, 16, 8  # source tensor, dim 0
-BLOCKS_MIN, BLOCKS_MAX, BLOCKS_G = 8, 16, 1  # index tensor, dim 0 (G == tile_size)
+# Index tensor, dim 0 (G == tile_size). BLOCKS_MIN is at least two tiles: a
+# one-tile call recompiles until #6060 lands.
+BLOCKS_MIN, BLOCKS_MAX, BLOCKS_G = 8, 16, 1
 POOL_SPEC = {0: {"min": POOL_MIN, "max": POOL_MAX, "granularity": POOL_G}}
 BLOCKS_SPEC = {0: {"min": BLOCKS_MIN, "max": BLOCKS_MAX, "granularity": BLOCKS_G}}
 
@@ -174,7 +176,7 @@ def gather_pages_map(pages_pool, block_table):
 
 
 def paged_gather_no_pool_range(pages_pool, block_table, q_in):
-    """Pool marked dynamic, but its range is never declared in the trace."""
+    """No ``torch._check`` on the pool: only the tensor can say its range."""
     _check_blocks(block_table)
 
     def body(acc, tiles):
@@ -304,6 +306,22 @@ class TestPagedGatherBothSymbolic(_ResetEachTest):
             self.assertLess(err, REL_TOL, f"blocks={nb} pages={np_}")
         self.assertEqual(c.compiles, 1, "recompiled within the declared ranges")
 
+    def test_declared_pool_needs_no_trace_check(self):
+        """The pool's declaration alone sizes the gather: no ``torch._check``
+        on the pool in the trace, one binary, right at every size."""
+        c = _Counted(paged_gather_no_pool_range)
+        q = _q()
+        for i, (nb, np_) in enumerate(BOTH_SIZES):
+            pages, table = _pages(np_, i), _table(nb, np_, i)
+            out = c.fn(
+                pages.to(DEVICE_NAME, dynamic=POOL_SPEC),
+                table.to(DEVICE_NAME, dynamic=BLOCKS_SPEC),
+                q.to(DEVICE_NAME),
+            )
+            err = rel_err(out, ref_paged_gather(pages, table, q))
+            self.assertLess(err, REL_TOL, f"blocks={nb} pages={np_}")
+        self.assertEqual(c.compiles, 1)
+
     def test_pages_beyond_the_first_pool_are_reachable(self):
         """Every page id lands in the UPPER half of a 16-page pool, after a
         first call with an 8-page pool: a gather sized from the warm-up pool
@@ -345,7 +363,10 @@ class TestPagedGatherBothSymbolic(_ResetEachTest):
         bounds = re.findall(r"count_symbol_bounds=\{([^}]*)\}", src)
         self.assertEqual(len(bounds), 1, f"expected one symbolic loop, got {bounds}")
         self.assertRegex(bounds[0], r"^'s\d+': \(16, 1\)$")
-        self.assertRegex(src, r"count_symbol_sources=\{'s\d+': \(1, 0\)\}")
+        # Read from dim 0 of a launch argument. Which argument depends on the
+        # kernel's argument order; test_launch_binds_the_logical_block_count
+        # checks that the bound value is the block count.
+        self.assertRegex(src, r"count_symbol_sources=\{'s\d+': \(\d+, 0\)\}")
         # The pool copy inside the body is sized at the declared max (16 pages).
         self.assertRegex(src, r"device_size=\[1, (16, 32|32, 16), 64\]")
 
@@ -516,15 +537,17 @@ class TestGatherKnownLimits(_ResetEachTest):
 
 class TestGatherRefusals(_ResetEachTest):
     def test_undeclared_pool_range_is_refused_not_guessed(self):
-        """A symbolic pool with no declared maximum has no static range, so the
-        compile refuses it by name instead of sizing the gather from the
-        warm-up pool."""
+        """A pool made dynamic with ``mark_dynamic(max=...)`` but not declared
+        has no reservation behind its maximum, so the compile refuses it by name
+        instead of sizing the gather from that bound or the warm-up pool."""
         c = _Counted(paged_gather_no_pool_range)
         q = _q()
         pages, table = _pages(8, 0), _table(8, 8, 0)
+        pool = pages.to(DEVICE_NAME)
+        torch._dynamo.mark_dynamic(pool, 0, min=POOL_MIN, max=POOL_MAX)
         with self.assertRaisesRegex(Exception, UNDECLARED_MAX_REFUSAL):
             c.fn(
-                pages.to(DEVICE_NAME, dynamic=POOL_SPEC),
+                pool,
                 table.to(DEVICE_NAME, dynamic=BLOCKS_SPEC),
                 q.to(DEVICE_NAME),
             )
@@ -545,14 +568,25 @@ class TestIndirectIndexRange(unittest.TestCase):
 
     def test_symbolic_size_resolves_to_declared_maximum(self):
         s = sympy.Symbol("s7", integer=True, positive=True)
-        with patch.object(pass_utils, "finite_upper_or_none", return_value=16):
+        with pass_utils.declared_dims({"s7": (8, 16, 8)}):
             self.assertEqual(pass_utils.indirect_index_range(s), 16)
 
     def test_symbolic_size_without_maximum_raises_naming_the_symbol(self):
         s = sympy.Symbol("s7", integer=True, positive=True)
-        with patch.object(pass_utils, "finite_upper_or_none", return_value=None):
+        with patch.object(pass_utils, "declared_max_or_none", return_value=None):
             with self.assertRaisesRegex(Unsupported, "s7"):
                 pass_utils.indirect_index_range(s)
+            with self.assertRaisesRegex(Unsupported, UNDECLARED_MAX_REFUSAL):
+                pass_utils.indirect_index_range(s)
+
+    def test_shape_env_bound_alone_is_not_a_declaration(self):
+        """A ``mark_dynamic(max=...)`` or ``torch._check`` bound is refused,
+        not taken as the range."""
+        s = sympy.Symbol("s7", integer=True, positive=True)
+        with (
+            patch.object(pass_utils, "declared_max_or_none", return_value=None),
+            patch.object(pass_utils, "finite_upper_or_none", return_value=16),
+        ):
             with self.assertRaisesRegex(Unsupported, UNDECLARED_MAX_REFUSAL):
                 pass_utils.indirect_index_range(s)
 
@@ -566,7 +600,7 @@ class TestPinFixedCopyExtent(unittest.TestCase):
             data=SimpleNamespace(ranges=[s, PAGE_SIZE, PAGE_HS]),
             get_name=lambda: "buf_restick",
         )
-        with patch.object(insert_restickify, "finite_upper_or_none", return_value=None):
+        with patch.object(insert_restickify, "declared_max_or_none", return_value=None):
             with self.assertRaisesRegex(Unsupported, UNDECLARED_MAX_REFUSAL):
                 insert_restickify._pin_fixed_copy_extent_to_declared_max(restick_buff)
             with self.assertRaisesRegex(Unsupported, r"buf_restick.*s9"):
@@ -601,7 +635,7 @@ class TestPinFixedCopyExtent(unittest.TestCase):
         )
         cleared = []
         with (
-            patch.object(insert_restickify, "finite_upper_or_none", return_value=16),
+            patch.object(insert_restickify, "declared_max_or_none", return_value=16),
             patch.object(
                 coarse_tile,
                 "_clear_cache",

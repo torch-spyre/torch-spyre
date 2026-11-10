@@ -756,13 +756,17 @@ def indirect_index_range(size) -> int:
     loop is its trip count, the index count), so such a check needs a new slot
     for the source extent, not a change here.
 
+    Only a declared dimension has that maximum: the pool's reservation is what
+    makes it addressable. A ``mark_dynamic(max=...)`` or ``torch._check`` bound
+    reserves nothing, so it is refused rather than taken as the range.
+
     Raises:
-        Unsupported: the size is symbolic with no finite upper bound, so no
+        Unsupported: the size is symbolic and not a declared dimension, so no
             static range exists.
     """
     if not (hasattr(size, "free_symbols") and size.free_symbols):
         return int(size)
-    upper = finite_upper_or_none(size)
+    upper = declared_max_or_none(size)
     if upper is None:
         raise Unsupported(
             undeclared_maximum_message(f"indirect index range {size}", size)
@@ -777,23 +781,21 @@ def indirect_index_range(size) -> int:
 
 
 def undeclared_maximum_message(subject: str, expr) -> str:
-    """Refusal text for a symbolic extent that has no declared maximum.
+    """Refusal text for a symbolic extent that is not a declared dimension.
 
     Shared by every site that must size a symbolic extent statically at its
     declared maximum, so the advice is the same wherever the refusal fires.
-    The range has to be declared twice for now: ``.to("spyre", dynamic=...)``
-    reserves the buffer at the maximum, and an in-trace ``torch._check`` is
-    what the compiler reads, until the declaration is carried into the trace.
-    The two maxima must agree: the reservation is what makes the compiler's
-    maximum addressable.
+    Only ``.to("spyre", dynamic=...)`` declares a range: it reserves the buffer
+    at the maximum, which is what makes that maximum addressable. A
+    ``mark_dynamic(max=...)`` or ``torch._check`` bound reserves nothing.
     """
     syms = sorted(map(str, getattr(expr, "free_symbols", ()) or ()))
     return (
         f"{subject} is symbolic with no declared maximum for {syms}, so it "
         "cannot be sized statically. Declare the dimension's range on the "
         'tensor, e.g. x.to("spyre", dynamic={0: dict(min=8, max=16, '
-        "granularity=8)}), and state the same maximum in the compiled "
-        "function, e.g. torch._check(x.shape[0] <= 16)"
+        "granularity=8)}); a mark_dynamic(max=...) or torch._check bound is "
+        "not a declaration"
     )
 
 

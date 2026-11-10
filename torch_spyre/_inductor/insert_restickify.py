@@ -31,7 +31,7 @@ from .loop_info import ReadCopyElisionRecord
 from .optimize_restickify import AnyInNode, EdgeCostMap
 from .logging_utils import get_inductor_logger
 from .pass_utils import (
-    finite_upper_or_none,
+    declared_max_or_none,
     invalidate_op_read_writes,
     patch_env,
     undeclared_maximum_message,
@@ -495,7 +495,9 @@ def _pin_fixed_copy_extent_to_declared_max(restick_buff: ComputedBuffer) -> None
     So the symbolic extent is replaced by its declared maximum. That is valid at
     every runtime size because the source buffer is reserved at that maximum:
     the copy reads rows past the logical extent, which exist in the reservation,
-    and its consumer (a gather) only ever indexes rows below the real size.
+    and its consumer (a gather) only ever indexes rows below the real size. So
+    only a declared dimension is pinned: a ``mark_dynamic(max=...)`` or
+    ``torch._check`` bound reserves nothing, and the copy would read past it.
 
     Mutated in place because ``restick_buff`` was created by this pass a moment
     ago and nothing else holds a reference to it yet. Changing ``ranges``
@@ -521,7 +523,7 @@ def _pin_fixed_copy_extent_to_declared_max(restick_buff: ComputedBuffer) -> None
     emitted copy rather than as an error.
 
     Raises:
-        Unsupported: an extent is symbolic with no declared finite maximum.
+        Unsupported: an extent is symbolic and not a declared dimension.
     """
     # Deferred import: coarse_tile and this module avoid importing each other
     # at load time (see coarse_tile._NameSwapHandler).
@@ -542,7 +544,7 @@ def _pin_fixed_copy_extent_to_declared_max(restick_buff: ComputedBuffer) -> None
         return
     subs: dict = {}
     for sym in syms:
-        upper = finite_upper_or_none(sym)
+        upper = declared_max_or_none(sym)
         if upper is None:
             raise Unsupported(
                 undeclared_maximum_message(
