@@ -1063,6 +1063,11 @@ consumer's own tile divides to one element therefore gets its step from
 `_plan_direct_unit_steps` like any other read, and the redirect itself only
 renames the buffer.
 
+The same holds for a reduction tiled along its reduced dim, whose outside
+consumers are redirected to its accumulator: the accumulator has the
+reduction's undivided layout, so a reader in another nest keeps its planned
+entry, and the redirect rebuilds the entry only for same-nest consumers.
+
 Beyond closing the post-stickify safety gap described above, splitting the
 crossing into two ops buys two more things for free, because the copy op is
 a fresh, single-input edge that nothing else depends on yet:
