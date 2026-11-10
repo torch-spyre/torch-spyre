@@ -82,10 +82,12 @@ from .pass_utils import (
     input_layout_for_operation,
     is_restickify_coords,
     alignment_coordinates,
+    loop_var_ranges_from_dim_hints,
     per_trip_index,
 )
 from .views import align_tensors, tiling_expr_to_device_expr
 from .logging_utils import get_inductor_logger
+from .loop_checker import LoopAdvanceMismatch
 from .loop_facts import enclosing_loops
 from .op_spec import (
     IndirectAccess,
@@ -839,6 +841,88 @@ class SpyreKernel(Kernel[CSEVariable]):
 
         return total_device_expr
 
+    def _index_tile_advance(
+        self, tensor: TensorAccess, is_input: bool, name: str
+    ) -> "tuple[sympy.Expr, MemoryDep] | None":
+        """The advance read from the INDEX alone: each level's loop variable's
+        coefficient in ``dep.index``, projected to device elements.
+
+        Level ``i``'s variable is the ``i``-th loop-variable hint of the op's
+        ``dim_hints`` (``loop_var_ranges_from_dim_hints``, outermost first), which
+        is what ``per_trip_index`` already reads; every op in a loop node that
+        indexes with a node's induction variable lists it there (measured on 1,545
+        ops, none disagrees). Returns ``None`` when the op has no hinted variable
+        or no matching dependency, so the caller compares nothing. Otherwise the
+        advance and the dependency it was read from (for an error message).
+
+        Uses the same ``_tile_advance_symbols`` as the record-based builder, so the
+        two expressions are comparable term by term.
+        """
+        ir_node = self.current_node.node
+        hinted = list(loop_var_ranges_from_dim_hints(ir_node))
+        if not hinted:
+            return None
+        reads_writes = ir_node.get_read_writes()
+        if is_input:
+            deps = [
+                d
+                for d in reads_writes.reads
+                if isinstance(d, MemoryDep) and d.name == name
+            ]
+            # _general_tile_advance has already consumed one match for this call.
+            consumed = self._general_tile_advance_seen.get(name, 0)
+            dep = deps[consumed - 1] if 0 < consumed <= len(deps) else None
+        else:
+            writes = [d for d in reads_writes.writes if isinstance(d, MemoryDep)]
+            dep = writes[0] if writes else None
+        if dep is None:
+            return None
+        layout = tensor.layout.device_layout
+        op_name = ir_node.get_operation_name()
+        total: "sympy.Expr" = sympy.S.Zero
+        for level, variable in enumerate(hinted):
+            coefficient = dep.index.coeff(variable)
+            if coefficient == 0:
+                continue
+            total += tiling_expr_to_device_expr(
+                layout.device_size,
+                layout.stride_map,
+                coefficient * self._get_or_mint_level_symbol(level, op_name),
+            )
+        return total, dep
+
+    def _checked_tile_advance(
+        self, tensor: TensorAccess, is_input: bool, name: str
+    ) -> "sympy.Expr | None":
+        """The record-based advance, checked against the index-based one.
+
+        Until the stored per-read fields are deleted (stage 7.4) span-overflow
+        and the allocator still write them, and they have no loop variable. An op
+        with hinted loop variables has both; they must agree, and a difference is
+        a compiler bug (a pass edited one source and not the other), so it raises
+        instead of emitting a kernel that advances by the wrong amount.
+        """
+        seen_before = self._general_tile_advance_seen.get(name, 0)
+        recorded = self._general_tile_advance(tensor, is_input, name)
+        if is_input and self._general_tile_advance_seen.get(name, 0) == seen_before:
+            # No new match was consumed: this is a repeat load of a buffer the op
+            # reads once (``x + x`` deduplicates to one dependency), and the
+            # record builder answers it with None. There is nothing to compare.
+            return recorded
+        indexed = self._index_tile_advance(tensor, is_input, name)
+        if indexed is None:
+            return recorded
+        from_index, dep = indexed
+        theirs = sympy.S.Zero if recorded is None else recorded
+        if sympy.simplify(theirs - from_index) != 0:
+            node = self.current_node.node
+            raise LoopAdvanceMismatch(
+                f"{node.get_operation_name()} {'reads' if is_input else 'writes'} "
+                f"{name}: the stored record gives {theirs} and the index gives "
+                f"{from_index} (index {dep.index})"
+            )
+        return recorded
+
     def create_tensor_arg(
         self,
         is_input: bool,
@@ -913,7 +997,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         # zero in the base coordinates so the raw unbacked symbol neither
         # leaks into the OpSpec iteration space nor applies the same
         # advance a second time.
-        device_tile_advance_expr = self._general_tile_advance(tensor, is_input, name)
+        device_tile_advance_expr = self._checked_tile_advance(tensor, is_input, name)
         base_index = per_trip_index(operation, tensor.index)
         device_coords = alignment_coordinates(
             tensor.layout.device_layout,
