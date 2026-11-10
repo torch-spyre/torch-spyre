@@ -60,9 +60,6 @@ _CORE_INV_SCALE = 1024
 _CORE_INV_SCALE_MAX_VALUE = 32
 # constant limit on product terms to avoid int32 overflow in CP-SAT
 _MAX_PRODUCT_BOUND = 2**30
-# Bits a factor keeps when a product past _MAX_PRODUCT_BOUND is narrowed, so
-# the product of two of them stays inside it.
-_PRODUCT_FACTOR_BITS = 15
 # Bits the factor ranges of one product may sum to (see _narrowed_factors).
 _PRODUCT_TOTAL_BITS = 30
 # Bits kept of a float linear sum's widest term when it becomes one integer
@@ -224,11 +221,9 @@ class _SympyExprToCpSat(Printer):
         self._count = 0
         self._sym_map = sym_map
         self._buffer_map = buffer_map
-        self._allow_tables = True
         # These caches belong to one converter/model. A class-level @cache
         # would retain every converter and its CP model across compilations.
         self._expr_cache: dict = {}
-        self._untabled_expr_cache: dict = {}
         self._conjunction_cache: dict = {}
         self._candidate_cache: dict = {}
         self._division_table_cache: dict = {}
@@ -236,9 +231,7 @@ class _SympyExprToCpSat(Printer):
 
     def _print(self, expr, **kwargs):
         if expr not in self._expr_cache:
-            table = (
-                self._division_table(expr) if self._allow_tables and expr.args else None
-            )
+            table = self._division_table(expr) if expr.args else None
             self._expr_cache[expr] = (
                 super()._print(expr, **kwargs) if table is None else table
             )
@@ -625,6 +618,8 @@ class _SympyExprToCpSat(Printer):
             sympy.Pow(b, exponent, evaluate=False)
         )
         coefficient, inner = base.as_coeff_Mul()
+        if coefficient < 0:
+            return expr  # a cost is positive; not a base these rules cover
         if coefficient > 0 and coefficient != 1:
             return sympy.Float(coefficient**exponent) * power(inner)
         if isinstance(inner, _AxisPower):
@@ -689,8 +684,8 @@ class _SympyExprToCpSat(Printer):
         when the segment past it misses its power by more than
         _POWER_PWL_TOLERANCE, relative. Exact at every breakpoint."""
         xs = self._candidates(arg)
-        if xs is None:
-            return arg**exponent
+        if xs is None or (exponent < 0 and xs[0] <= 0):
+            return arg**exponent  # no candidates, or a pole at one of them
         return self._pwl(arg, xs, [x**exponent for x in xs])
 
     @staticmethod
@@ -808,49 +803,6 @@ class _SympyExprToCpSat(Printer):
             )
         return expr
 
-    @classmethod
-    def _integerize_minmax(cls, expr):
-        # Only Min/Max constraints require integer operands. A conditional
-        # objective supports float values directly; rounding its coefficients
-        # can erase a large cost multiplied by scaled reciprocal variables.
-        # Keep upstream's lazy Min/Max classes when rebuilding their subtrees.
-        if isinstance(expr, (sympy.Min, sympy.Max)):
-            return expr.replace(
-                lambda e: isinstance(e, (sympy.Min, sympy.Max, sympy.Piecewise)),
-                cls._truncate_floats_min,
-            )
-        if not expr.has(sympy.Min, sympy.Max):
-            return expr
-        return expr.func(*(cls._integerize_minmax(arg) for arg in expr.args))
-
-    @staticmethod
-    def _truncate_floats_min(expr):
-        # re-writes Min(x*0.5, y*0.5) as Min(x, y)/2
-        m = 10000
-        func = expr.func
-
-        def _process_inner(expr):
-            if isinstance(expr, sympy.Mul) and isinstance(expr.args[0], sympy.Number):
-                a = (expr.args[0] * m).round()
-                r = sympy.Mul(a, *expr.args[1:])
-            elif isinstance(expr, sympy.Number):
-                r = (expr * m).round()
-            else:
-                r = expr * m
-            return r
-
-        def _process_outer(expr):
-            if isinstance(expr, sympy.Add):
-                return sympy.Add(*[_process_inner(a) for a in expr.args])
-            elif isinstance(expr, sympy.Tuple):
-                return (_process_outer(expr[0]), *expr[1:])
-            else:
-                return _process_inner(expr)
-
-        result = list(map(_process_outer, expr.args))
-
-        return func(*result) / m
-
     def _print_Integer(self, expr):
         return int(expr.p)
 
@@ -861,30 +813,7 @@ class _SympyExprToCpSat(Printer):
         return sum(self._print(arg) for arg in expr.args)
 
     def _print_Mul(self, expr):
-        args = [self._print(arg) for arg in expr.args]
-        try:
-            return self._print_multiply(args)
-        except ValueError:
-            if not self._allow_tables:
-                raise
-            # A table can combine an affine sum into one wider integer, whose
-            # product exceeds the bound even though each original term fits.
-            # Keep the original factorization locally. Unused table helpers
-            # are removed by presolve; other expressions can still tabulate.
-            # Reuse this converter's variable namespace and guard caches.
-            self._allow_tables = False
-            self._expr_cache, self._untabled_expr_cache = (
-                self._untabled_expr_cache,
-                self._expr_cache,
-            )
-            try:
-                return self._print(expr)
-            finally:
-                self._expr_cache, self._untabled_expr_cache = (
-                    self._untabled_expr_cache,
-                    self._expr_cache,
-                )
-                self._allow_tables = True
+        return self._print_multiply([self._print(arg) for arg in expr.args])
 
     def _print_multiply_two(self, a, b):
         if isinstance(a, (int, float)) or isinstance(b, (int, float)):
@@ -996,9 +925,10 @@ class _SympyExprToCpSat(Printer):
             candidates = (lb * a, lb * b, ub * a, ub * b)
             lb, ub = min(candidates), max(candidates)
 
-        # A product past _MAX_PRODUCT_BOUND is taken over factors rounded to
-        # _PRODUCT_FACTOR_BITS each: only a factor wider than that is rounded,
-        # so a small one such as a split count stays exact.
+        # A product past _MAX_PRODUCT_BOUND is taken over narrowed factors:
+        # the widest is halved until the widths sum to _PRODUCT_TOTAL_BITS, so
+        # a small factor such as a split count is rounded only when no wider
+        # one is left to take the cut.
         shift = 0
         if max(abs(lb), abs(ub)) > _MAX_PRODUCT_BOUND:
             ints, shift = self._narrowed_factors(ints)
