@@ -969,6 +969,18 @@ def _zero_reads_of_fixed_buffers_planned(
     }
     if not fixed_names:
         return
+    # A copy-out buffer's readers in another loop nest are redirected to its
+    # full buffer, which has the producer's undivided layout. Their planned
+    # read is already that read, so it keeps its own nest's advance.
+    copied_out_nest = {
+        op.get_name(): info.loop_group_id[0]
+        for op in operations
+        if isinstance(op, ComputedBuffer)
+        and op.get_name() in fixed_names
+        and (info := plan.get(id(op))) is not None
+        and info.propagation is not None
+        and info.propagation.kind == "copy_out"
+    }
 
     for op in operations:
         if not isinstance(op, ComputedBuffer):
@@ -981,12 +993,13 @@ def _zero_reads_of_fixed_buffers_planned(
         if not info.tiled_dims_per_read:
             continue
         reads = [d for d in op.get_read_writes().reads if isinstance(d, MemoryDep)]
+        reader_nest = info.loop_group_id[0]
         for i, dep in enumerate(reads):
             if dep.name in fixed_names and info.tiled_dims_per_read[i]:
-                # This makes the read address stationary while it names the
-                # producer's per-tile scratch.  It does not make the value
-                # invariant: that scratch is rewritten every trip, and an
-                # outside consumer may later be redirected to a full buffer.
+                if copied_out_nest.get(dep.name, reader_nest) != reader_nest:
+                    continue
+                # A reader in the producer's own nest reads its per-tile
+                # scratch, which stays in place while it is rewritten.
                 info.tiled_dims_per_read[i] = []
 
 
@@ -1341,68 +1354,6 @@ def _tiled_dims_for_dep(
         [(d, extent) for d, extent in level.items() if _dim_is_read(d)]
         for level in per_level_extents
     ]
-
-
-def _redirected_unit_steps(
-    consumer: ComputedBuffer,
-    read_name: str,
-    read_ordinal: int,
-    per_level: list[list[tuple[int, Expr]]],
-    loop_tiled_dims: list[list[int]],
-    loop_count: list[int],
-) -> tuple[list[list[tuple[int, Expr]]], list[list[tuple[Expr, Expr]]]]:
-    """Split a redirected read's per-level ``(dim, extent)`` entries into the
-    ones that keep a ``d{i}`` symbol and the ``(host_stride, extent)`` steps of
-    the ones that do not.
-
-    A dim the consumer's own tiling divides down to one element has no symbol
-    in the divided read, so ``SpyreKernel._general_tile_advance`` cannot
-    advance it by substitution: it would advance whichever dim inherited the
-    number. Its step is the read's stride along that dim, which the divided
-    index no longer shows. The consumer's loader already reads the full
-    buffer, so it is traced again over the undivided ranges, where the dim
-    keeps its symbol, and the stride is that symbol's coefficient.
-    """
-    from torch._inductor.dependencies import extract_read_writes
-
-    raw_to_squeezed = _raw_to_squeezed_pos(consumer)
-    ranges = list(consumer.data.ranges)
-    unit = {
-        d
-        for level in per_level
-        for d, _extent in level
-        if d < len(ranges) and d not in raw_to_squeezed
-    }
-    if not unit or getattr(consumer.data, "reduction_ranges", None):
-        return per_level, [[] for _ in per_level]
-    full = list(ranges)
-    for level_dims, count in zip(loop_tiled_dims, loop_count):
-        for d in level_dims:
-            if d < len(full):
-                full[d] = full[d] * count
-    reads = extract_read_writes(consumer.data.inner_fn, full, normalize=False).reads
-    matches = [r for r in reads if isinstance(r, MemoryDep) and r.name == read_name]
-    if read_ordinal >= len(matches):
-        raise Unsupported(
-            f"coarse tile: {consumer.get_name()} reads {read_name} along a "
-            "one-element tile dim, and its undivided read cannot be traced"
-        )
-    index = matches[read_ordinal].index
-    full_pos: dict[int, int] = {}
-    for d, r in enumerate(full):
-        if int(r) != 1:
-            full_pos[d] = len(full_pos)
-    kept, steps = [], []
-    for level in per_level:
-        kept.append([(d, e) for d, e in level if d not in unit])
-        level_steps = []
-        for d, extent in level:
-            if d in unit:
-                stride = index.coeff(sympy_index_symbol(f"d{full_pos[d]}"))
-                if stride != 0:
-                    level_steps.append((stride, extent))
-        steps.append(level_steps)
-    return kept, steps
 
 
 def _point_splice_advance_for_dep(
@@ -3962,6 +3913,12 @@ def _patch_consumers(
             )
         ]
 
+        # A copy-out read was planned as the read of the full buffer it now
+        # names (_zero_reads_of_fixed_buffers_planned keeps it), so the
+        # consumer's own nest already decided how it advances.
+        if read_layout is not None:
+            continue
+
         # new_consumer.loop_info (copied verbatim from consumer by
         # copy_op_metadata inside replace_computed_buffer_body) still carries
         # tiled_dims_per_read as planned when this consumer's own read of
@@ -4002,36 +3959,18 @@ def _patch_consumers(
                 new_loop_info.loop_count,
                 list(new_consumer.data.ranges),
             )
-            new_tiled_dims_per_read = []
-            new_squeezed = [
-                list(levels) for levels in new_loop_info.squeezed_advance_per_read
-            ] or [[[] for _ in new_loop_info.loop_count] for _ in new_reads]
-            ordinal = 0
-            for read_idx, (read_dep, per_level) in enumerate(
-                zip(new_reads, new_loop_info.tiled_dims_per_read)
-            ):
-                if read_dep.name != new_name:
-                    new_tiled_dims_per_read.append(per_level)
-                    continue
-                kept, steps = _redirected_unit_steps(
-                    new_consumer,
-                    new_name,
-                    ordinal,
-                    _tiled_dims_for_dep(
-                        read_dep, advancing_level_extents, new_consumer
-                    ),
-                    new_loop_info.loop_tiled_dims,
-                    new_loop_info.loop_count,
+            new_tiled_dims_per_read = [
+                (
+                    _tiled_dims_for_dep(read_dep, advancing_level_extents, new_consumer)
+                    if read_dep.name == new_name
+                    else per_level
                 )
-                ordinal += 1
-                new_tiled_dims_per_read.append(kept)
-                new_squeezed[read_idx] = steps
-            if not any(any(levels) for levels in new_squeezed):
-                new_squeezed = []
+                for read_dep, per_level in zip(
+                    new_reads, new_loop_info.tiled_dims_per_read
+                )
+            ]
             new_consumer.loop_info = dataclasses.replace(  # type: ignore[attr-defined]
-                new_loop_info,
-                tiled_dims_per_read=new_tiled_dims_per_read,
-                squeezed_advance_per_read=new_squeezed,
+                new_loop_info, tiled_dims_per_read=new_tiled_dims_per_read
             )
             logger.debug(
                 "coarse_tile: patch_consumers %s old_name=%s new_name=%s "
