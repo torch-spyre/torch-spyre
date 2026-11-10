@@ -2467,32 +2467,32 @@ def compute_restickify_target_layout(
     old_sd_free = idc[old_sd_outer_dim].free_symbols - ({old_var} if old_var else set())
     if old_sd_free or idc[new_sd_outer_dim].free_symbols - {new_var}:
         return None
-    # DIAGNOSTIC: log everything needed to reason about reliable replacements
-    # for _host_size_stride_for_expr. Never asserts — just prints.
+    # SANITY: verify proposed replacements for _host_size_stride_for_expr.
+    # On failure, dump everything needed to understand the discrepancy.
     _new_host_dims = [d for d, e in enumerate(ic) if new_var in e.free_symbols]
     _new_size_from_host = math.prod(host_size[d] for d in _new_host_dims) if _new_host_dims else None
     _old_host_dims = [d for d, e in enumerate(ic) if old_var and old_var in e.free_symbols]
     _old_size_from_host = math.prod(host_size[d] for d in _old_host_dims) if _old_host_dims else None
     _new_stride_coeff = sympy.expand(arg.dep.index).coeff(new_var) if arg is not None else None
     _new_stride_from_dep = concretize_expr(_new_stride_coeff) if _new_stride_coeff is not None else None
-    _new_dep_range = concretize_expr(arg.dep.ranges[new_var]) if arg is not None and new_var in arg.dep.ranges else None
-    _old_dep_range = concretize_expr(arg.dep.ranges[old_var]) if arg is not None and old_var is not None and old_var in arg.dep.ranges else None
     _old_stride_coeff = sympy.expand(arg.dep.index).coeff(old_var) if arg is not None and old_var is not None else None
     _old_stride_from_dep = concretize_expr(_old_stride_coeff) if _old_stride_coeff is not None else None
-    import sys as _sys  # noqa: PLC0415
-    print(  # noqa: T201
-        f"CRTL_DIAG new_var={new_var!r} old_var={old_var!r} "
+    _diag = (
+        f"new_var={new_var!r} old_var={old_var!r} "
         f"new_sd_host_size={new_sd_host_size!r} new_sd_host_stride={new_sd_host_stride!r} "
         f"old_sd_host_size={old_sd_host_size!r} old_sd_host_stride={old_sd_host_stride!r} "
-        f"new_host_dims={_new_host_dims!r} new_size_from_host={_new_size_from_host!r} new_dep_range={_new_dep_range!r} "
+        f"new_host_dims={_new_host_dims!r} new_size_from_host={_new_size_from_host!r} "
         f"new_stride_coeff={_new_stride_coeff!r} new_stride_from_dep={_new_stride_from_dep!r} "
-        f"old_host_dims={_old_host_dims!r} old_size_from_host={_old_size_from_host!r} old_dep_range={_old_dep_range!r} "
+        f"old_host_dims={_old_host_dims!r} old_size_from_host={_old_size_from_host!r} "
         f"old_stride_coeff={_old_stride_coeff!r} old_stride_from_dep={_old_stride_from_dep!r} "
         f"ic={ic!r} host_size={host_size!r} host_stride={host_stride!r} "
         f"dep_index={arg.dep.index if arg is not None else None!r} "
-        f"dep_ranges={dict(arg.dep.ranges) if arg is not None else None!r}",
-        file=_sys.stderr,
+        f"dep_ranges={dict(arg.dep.ranges) if arg is not None else None!r}"
     )
+    assert _new_size_from_host == new_sd_host_size, f"new-side size mismatch: {_diag}"
+    assert _new_stride_from_dep == new_sd_host_stride, f"new-side stride mismatch: {_diag}"
+    assert _old_size_from_host == old_sd_host_size, f"old-side size mismatch: {_diag}"
+    assert _old_stride_from_dep == old_sd_host_stride, f"old-side stride mismatch: {_diag}"
     device_size = restickify_device_size(
         old_device_size,
         old_sd_outer_dim,
