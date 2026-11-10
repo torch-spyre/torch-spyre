@@ -2351,6 +2351,46 @@ class TestRecordedPadding(unittest.TestCase):
         t = torch.tensor([1.0, -2.0, 3.0], dtype=torch.float16).to("spyre")
         self.assertEqual(t.device_tensor_layout().padding_value, 0.0)
 
+    def test_allocation_padding_is_unknown_not_nan(self) -> None:
+        # insert_bmm_padding pads y's K through constant_pad_nd, whose first op
+        # is an empty() allocation. Inductor gives it zero ranges, so tracing
+        # it would load nop_loader_fn's NaN constant: sympy's NaN, which no set
+        # can hold beside a number. The allocation's padding is unknown memory.
+        from torch_spyre._inductor import padding
+
+        ranges: dict[str, Any] = {}
+        track = padding.track_padding_value
+
+        def capture(graph: GraphLowering) -> None:
+            tracer_cls = padding.DomainRangeTracer
+            orig_run = tracer_cls.run_node
+
+            def run_node(tracer, op):
+                decision = orig_run(tracer, op)
+                ranges[op.get_name()] = tracer.buffer_range.get(op.get_name())
+                return decision
+
+            with patch.object(tracer_cls, "run_node", run_node):
+                track(graph)
+
+        x = torch.randn(4, 3, dtype=torch.float16)
+        w = torch.randn(3, 8, dtype=torch.float16)
+        with patch.object(passes, "track_padding_value", capture):
+            result = torch.compile(lambda a, b: a @ b, dynamic=False)(
+                x.to("spyre"), w.to("spyre")
+            )
+        allocations = [
+            name
+            for name, r in ranges.items()
+            if r is not None and r.is_superset(S.Reals)
+        ]
+        self.assertTrue(allocations, f"no unknown-padding buffer in {ranges}")
+        for name, r in ranges.items():
+            self.assertFalse(
+                r is not None and r.has(S.NaN), f"{name} padding range is {r}"
+            )
+        torch.testing.assert_close(result.cpu(), x @ w, atol=0.05, rtol=0.05)
+
 
 if __name__ == "__main__":
     unittest.main()

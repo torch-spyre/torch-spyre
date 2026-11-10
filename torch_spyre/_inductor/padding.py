@@ -1810,6 +1810,13 @@ class DomainRangeTracer(DomainRangeSolver):
             self.handle_graph_input(op, padded)
             return PaddingDecision(None, False, False, {})
 
+        if _is_allocation(op):
+            # An empty() allocation writes nothing: its memory, padding
+            # included, holds whatever was there. Tracing it would load
+            # Inductor's zero-element placeholder, a NaN constant.
+            self.buffer_range[op.name] = _user_values() if padded else EmptySet
+            return PaddingDecision(None, False, False, {})
+
         if padded or any_input_padded:
             # Even if the output of this op is not padded, we need to run
             # the input validation if there are padded inputs
@@ -2302,6 +2309,21 @@ def can_coord_mask(func_name, dtype) -> bool:
 def _index_syms(n: int) -> tuple[sympy.Symbol, ...]:
     """The index symbols _trace_inner_fn passes to a traced inner_fn."""
     return tuple(sympy.Symbol(f"_i{k}") for k in range(n))
+
+
+def _is_allocation(op: Operation) -> bool:
+    """Whether op is an empty() allocation, which writes nothing.
+
+    Inductor's empty_strided realizes a zero-filled Pointwise and then sets its
+    ranges to zeros, so the scheduler emits no kernel for it, and make_loader
+    swaps its body for nop_loader_fn: a NaN constant for floating dtypes.
+    """
+    return (
+        isinstance(op, ComputedBuffer)
+        and isinstance(op.data, Pointwise)
+        and op.data.is_zero_elements()
+        and not isinstance(op.layout, MutationLayoutSHOULDREMOVE)
+    )
 
 
 def _call_innner(op):
