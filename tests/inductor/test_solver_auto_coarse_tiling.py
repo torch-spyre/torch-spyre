@@ -258,11 +258,14 @@ class CollectTilingPasses(CustomPreSchedulingPasses):
     of them to its committed core division over its output: the split factor
     of each dim, keyed by that dim's stride in the output index.
     ``lx_resident`` names those of them whose buffer was placed in LX.
+    ``read_names`` maps each of them to the buffers it reads, in the order of
+    its ``tiled_dims_per_read`` and ``squeezed_advance_per_read`` entries.
     """
 
     tiling: dict[str, CoarseTileInfo] = {}
     core_splits: dict[str, dict[int, int]] = {}
     lx_resident: set[str] = set()
+    read_names: dict[str, list[str]] = {}
 
     def __call__(self, graph: GraphLowering) -> None:
         super().__call__(graph)
@@ -283,6 +286,14 @@ class CollectTilingPasses(CustomPreSchedulingPasses):
             op.get_name()
             for op in tiled
             if "lx" in getattr(op.get_layout(), "allocation", {})
+        }
+        type(self).read_names = {
+            op.get_name(): [
+                dep.name
+                for dep in op.get_read_writes().reads
+                if isinstance(dep, MemoryDep)
+            ]
+            for op in tiled
         }
 
 
@@ -1147,6 +1158,49 @@ class TileOwnershipGroupingTests(unittest.TestCase):
         # dim 0: without this the body would pass on a read held still.
         outer_levels = [levels[0] for levels in tiling[consumer].tiled_dims_per_read]
         self.assertIn([(0, 16)], outer_levels, _describe(tiling))
+
+    def test_a_unit_row_consumer_in_the_next_nest_advances_its_read(self):
+        # The producer takes two tiles of 64 rows; the repeat after it takes
+        # one row per tile in a nest of its own, so it is redirected to the
+        # producer's full buffer. Its own tiling divides its row dim down to
+        # one element, which leaves no symbol for that dim in its read, and
+        # every trip read the producer's row 0.
+        x = torch.randn(128, 64, 128, dtype=torch.float16)
+        y = torch.randn(128, 64, 128, dtype=torch.float16)
+        halves = TileSpec((TileAxis(host_dim=0, count=2),))
+        unit_rows = TileSpec((TileAxis(host_dim=0, count=64),))
+
+        def offered(alloc, op, max_cores):
+            return [halves] if _reads_graph_inputs_only(op) else [unit_rows]
+
+        with patch.object(CoOptimizingAllocator, "_tiling_candidates", offered):
+            cpu, device, tiling = self._compile(
+                lambda x, y: (x + y)[:64].repeat(1, 2, 1) * 2, (x, y)
+            )
+        self._assert_close(device, cpu)
+        self.assertEqual(len(_nests(tiling)), 2, _describe(tiling))
+        # The redirected read reached codegen advancing one producer row
+        # (64 * 128 elements) per trip: without this the body would pass on a
+        # read held still.
+        consumer_nest = {
+            name: info
+            for name, info in tiling.items()
+            if tuple(info.loop_count) == (64,)
+            and not name.startswith("coarse_tile_copy_")
+        }
+        # Only the read that leaves the consumer's nest is redirected.
+        redirected = [
+            read
+            for name, info in consumer_nest.items()
+            for dep_name, read in zip(
+                CollectTilingPasses.read_names[name], info.squeezed_advance_per_read
+            )
+            if dep_name not in consumer_nest
+        ]
+        self.assertTrue(redirected, _describe(tiling))
+        for read in redirected:
+            steps = [step for level in read for step in level]
+            self.assertIn((64 * 128, 1), steps, _describe(tiling))
 
     def test_untiled_op_splits_a_skip_connection_into_two_nests(self):
         # a -> b -> c with a -> c as well. a and c may only be tiled d0:4 and
