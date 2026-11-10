@@ -605,11 +605,15 @@ def test_mixed_dtypes_fail_at_compile():
 @_requires_emulation
 @expects_raise
 def test_dynamic_shapes_fail_at_compile():
+    """torch.compile(dynamic=True) is refused before lowering, so a sharded
+    operand never reaches the non-unified static-shape check."""
     n = _num_shards()
     torch.manual_seed(0)
     a = _sharded(torch.randn(4 * n, 64, dtype=torch.float16), 0, n)
 
-    with pytest.raises(RuntimeError, match="need static shapes"):
+    with pytest.raises(
+        RuntimeError, match=r"does not support: torch\.compile\(dynamic=True\)"
+    ):
         torch.compile(lambda x, y: x + y, dynamic=True)(a, a)
 
 
