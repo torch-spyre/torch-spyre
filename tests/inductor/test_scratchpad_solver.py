@@ -2672,9 +2672,9 @@ class TestSympyExprToCpSatPrinter(TestCase):
                 exact = 1000 * k_i / (a_i * b_i)
                 self.assertAlmostEqual(got, exact, delta=_POWER_PWL_TOLERANCE * exact)
 
-    def test_tile_counts_are_not_tabulated(self):
-        # A tile count is lowered by the rewrite alone: an expression over it
-        # takes no division table, even with a shared selector.
+    def test_tile_counts_are_tabulated(self):
+        # A tile count shares its buffer's division selector, so an expression
+        # over it is one division table, like one over a split.
         t = sympy.Symbol("tile_a_o0", integer=True, positive=True)
         menus = {"tile_a_o0": [1, 2, 4, 8]}
         for i, count in enumerate(menus["tile_a_o0"]):
@@ -2684,7 +2684,7 @@ class TestSympyExprToCpSatPrinter(TestCase):
                 )
                 exact = 1000 * count**-0.5
                 self.assertAlmostEqual(got, exact, delta=_POWER_PWL_TOLERANCE * exact)
-                self.assertFalse(
+                self.assertTrue(
                     any(
                         v.name.startswith("division_cost_")
                         for v in model.proto.variables
