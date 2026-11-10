@@ -444,6 +444,67 @@ class TestReduceScatterCompiled(TestCase):
         with pytest.raises(InductorError, match="must be a multiple of the stick"):
             torch.compile(ReduceScatterModule(group_size=self.comm_size))(x)
 
+    @expects_raise
+    def test_reduce_scatter_compiled_sub_stick_per_rank_rejected(self):
+        """32 elements per rank (e.g. (128,) at g=4) is rejected, for any g.
+
+        This is the shape that terminated all ranks inside
+        context->reduce_scatter at g=4 (#4273).
+        """
+        x = _position_input((32 * self.comm_size,), self.comm_rank).to(DEVICE)
+        with pytest.raises(InductorError, match="must be a multiple of the stick"):
+            torch.compile(ReduceScatterModule(group_size=self.comm_size))(x)
+
+    @expects_raise
+    @parametrize(
+        "elems_per_rank",
+        [32, 100],
+        name_fn=lambda n: f"{n}_per_rank",
+    )
+    def test_reduce_scatter_plan_sub_stick_raises(self, elems_per_rank):
+        """reducescatter_plan rejects sub-stick slabs before calling spyre-comms.
+
+        This is the call that crashed: spyre-comms finds no algorithm for a
+        split below one 128-byte stick and terminates the process from inside
+        plan creation (DT_ERROR, no Python exception). The plan op must raise
+        first. If this check regresses the test cannot fail cleanly -- every
+        rank exits -- which still fails the run.
+        """
+        from torch_spyre._inductor.ir import _dtype_to_int
+
+        num_elems = elems_per_rank * self.comm_size
+        with pytest.raises(RuntimeError, match="slabs of whole sticks"):
+            torch.ops.spyre.reducescatter_plan(
+                num_elems,
+                _dtype_to_int(torch.float16),
+                self.comm_size,
+                "sum",
+                _GROUP_NAME,
+            )
+
+    @expects_raise
+    def test_reduce_scatter_run_unstaged_input_raises(self):
+        """reducescatter_run rejects an input that was not staged by the lowering.
+
+        An unstaged (128, 128) input was the wrong-data path: spyre-comms gave
+        each rank a column-stick block instead of its rows, with no error.
+        """
+        from torch_spyre._inductor.ir import _dtype_to_int
+
+        x = _position_input((128, 128), self.comm_rank).to(DEVICE)
+        # Plan for a valid staged buffer of the same size, so only the run-time
+        # layout check can reject this call.
+        staged_elems = 128 * 128
+        plan = torch.ops.spyre.reducescatter_plan(
+            staged_elems,
+            _dtype_to_int(torch.float16),
+            self.comm_size,
+            "sum",
+            _GROUP_NAME,
+        )
+        with pytest.raises(RuntimeError, match="expected a staged"):
+            torch.ops.spyre.reducescatter_run(x, plan, self.comm_size)
+
 
 instantiate_parametrized_tests(TestReduceScatterCompiled)
 
