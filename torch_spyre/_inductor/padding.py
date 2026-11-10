@@ -12,8 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""IR-level pass to pad y's K (row) dimension to a stick boundary for
-BATCH_MATMUL_OP operations.  Runs in CustomPreSchedulingPasses before
+"""Buffer padding: the passes that pad buffers, and the rule for iterating
+into padding.
+
+The module holds three things:
+
+- ``insert_bmm_padding`` pads a matmul's y on K at the host level, before
+  stickification. Described below.
+- ``insert_restickify_padding`` pads a restickify's buffers on the device only,
+  so codegen's widened read and write stay within them.
+- ``pad_iteration_space`` decides how far an op iterates on a dim whose device
+  extent exceeds its host extent (#741). It is a query, not a pass, and changes
+  no IR. Work division (through ``work_division.adjust_it_space_for_padding``)
+  and codegen (``SpyreKernel.create_op_spec``) both call it, so the split work
+  division commits and the iteration codegen emits cover the same extent.
+
+Matmul K padding
+----------------
+
+``insert_bmm_padding`` pads y's K (row) dimension to a stick boundary for
+BATCH_MATMUL_OP operations.  It runs in CustomPreSchedulingPasses before
 stickification, while every buffer still carries a plain host FixedLayout.
 
 Padding before stickification means the padded buffer is laid out and, if
@@ -50,9 +68,11 @@ present in the output but absent from x (N).  This handles M==K==N and
 M=1 (decode phase) correctly.
 """
 
+from collections.abc import Iterable, Sequence
+
 import sympy
 import torch
-from sympy import Expr
+from sympy import Expr, Symbol
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.utils import ceildiv
@@ -75,6 +95,7 @@ from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .loop_facts import enclosing_loops, is_looped, read_advances_anywhere
 from .loop_node import move_before, record_member
+from .op_spec import IndirectAccess
 from .pass_utils import (
     concretize_expr,
     concretize_index,
@@ -115,6 +136,124 @@ def round_up_to_stick(cur_size: int, dtype: torch.dtype) -> int:
     """Round ``cur_size`` up to the next whole stick for ``dtype`` (no-op when
     already a stick multiple)."""
     return cur_size + compute_padding(cur_size, dtype)
+
+
+def _padded_extent(
+    sym: Symbol,
+    extent_expr: Expr | int,
+    accesses: Iterable[tuple[Sequence[Expr], Sequence[int]]],
+) -> Expr:
+    """Return the padded extent ``sym`` can iterate to, or ``extent_expr`` to keep
+    the current one.
+
+    ``sym`` grows to ``p`` only if ``extent_expr`` is concrete, ``sym`` is not in
+    any dep's in-stick coordinate, and every occurrence of ``sym`` in every dep's
+    device coordinates is a whole coordinate (an identity access) whose
+    ``device_size`` is the same ``p`` greater than ``extent_expr``. Iterations
+    past ``extent_expr`` then land in each tensor's own padding. A dep that does
+    not read ``sym`` at all (a broadcast) does not constrain it.
+    """
+    if isinstance(extent_expr, int):
+        extent = extent_expr
+        extent_expr = sympy.Integer(extent_expr)
+    else:
+        if not extent_expr.is_Integer:
+            # Not a concrete dim
+            return extent_expr
+        extent = int(extent_expr)
+
+    grown_extent = None
+    for device_coords, device_sizes in accesses:
+        if device_coords[-1].has(sym):
+            return extent_expr
+
+        for coord, new_extent in zip(
+            device_coords[:-1],
+            device_sizes[:-1],
+            strict=True,
+        ):
+            if coord == sym:
+                if grown_extent is None:
+                    if new_extent <= extent:
+                        # This is not growing the iteration space.
+                        return extent_expr
+
+                    grown_extent = new_extent
+                elif grown_extent != new_extent:
+                    # The symbol occurs with different device sizes in
+                    # different deps (or, unlikely, with different device sizes
+                    # in different dimensions of the same dep).
+                    return extent_expr
+
+            elif coord.has(sym):
+                return extent_expr
+
+    return extent_expr if grown_extent is None else sympy.Integer(grown_extent)
+
+
+def _pad_iteration_space(
+    it_space: dict[Symbol, Expr],
+    output_coords: Sequence[Expr],
+    accesses: Sequence[tuple[Sequence[Expr], Sequence[int]]],
+) -> dict[Symbol, Expr]:
+    # Indirect access: the index tensor's padding holds garbage indices, so
+    # iterating into it would read or write outside the indexed tensor.
+    if any(
+        coord.has(IndirectAccess) or not coord.free_symbols <= it_space.keys()
+        for coords, _ in accesses
+        for coord in coords
+    ):
+        return dict(it_space)
+
+    candidates = {
+        sym
+        for coord in output_coords[:-1]
+        for sym in coord.free_symbols
+        if sym in it_space
+    }
+
+    adjusted_it_space = dict(it_space)
+    for sym in candidates:
+        adjusted_it_space[sym] = _padded_extent(sym, it_space[sym], accesses)
+
+    return adjusted_it_space
+
+
+def pad_iteration_space(
+    op: Operation,
+    it_space: dict[Symbol, Expr],
+    output_coords: Sequence[Expr],
+    accesses: Sequence[tuple[Sequence[Expr], Sequence[int]]],
+) -> dict[Symbol, Expr]:
+    """Return a copy of ``it_space`` with each padded output dim grown to its
+    padded device extent.
+
+    Only vars in the output's non-stick coordinates are candidates; every
+    other var, including reduction vars, keeps its extent. See
+    :func:`_padded_extent` for when a candidate grows.
+
+    Work division calls this through
+    :func:`~torch_spyre._inductor.work_division.adjust_it_space_for_padding`;
+    codegen calls it directly with its kernel args, so both see the same
+    extents.
+
+    Args:
+        it_space: Extent of each iteration var, in elements.
+        output_coords: The output's device coordinates, one per device dim; the
+            last is the in-stick coordinate.
+        accesses: ``(device_coords, device_size)`` for every tensor the op
+            reads or writes, the output included. The two line up dim for dim.
+
+    Returns:
+        A new dict with the same keys, in the same order.
+    """
+    # The enclosing_loops guard is unreachable today: _resize_device_layout
+    # refuses to tile a padded buffer, and it shrinks device_size to the
+    # per-tile extent, so a tiled op never sees device_size > extent.
+    if enclosing_loops(op):
+        return dict(it_space)
+
+    return _pad_iteration_space(it_space, output_coords, accesses)
 
 
 def _move_ops_before(

@@ -119,12 +119,12 @@ from torch_spyre._inductor.work_division import (
     deferred_work_division,
     enumerate_work_division_candidates,
     multi_dim_iteration_space_split,
-    pad_iteration_space,
     span_floors,
     work_division_context_for_op,
     work_division_splits_are_legal,
 )
 from torch_spyre._inductor.op_spec import IndirectAccess
+from torch_spyre._inductor.padding import _pad_iteration_space
 from torch_spyre._inductor.work_division_constraints import (
     JOINT_TILING_AND_DIVISION_ATTR,
     ConstraintResult,
@@ -1227,6 +1227,7 @@ class TestAdjustItSpaceForPadding(unittest.TestCase):
     def setUp(self):
         self.rows, self.cols = _isym("d0"), _isym("d1")
         self.it_space = {self.rows: sympy.Integer(7), self.cols: sympy.Integer(64)}
+        self.op_no_loop = SimpleNamespace()
 
     def _dep(self, name, padded_rows=None):
         """A ``[7, 64]`` access over (rows, cols), its row dim padded if asked."""
@@ -1237,11 +1238,29 @@ class TestAdjustItSpaceForPadding(unittest.TestCase):
 
     def test_padded_input_and_output_grow_rows(self):
         result = adjust_it_space_for_padding(
-            self.it_space, [self._dep("x", 8)], self._dep("out", 8)
+            self.op_no_loop, self.it_space, [self._dep("x", 8)], self._dep("out", 8)
         )
         self.assertEqual(result, {self.rows: 8, self.cols: 64})
         # A copy: the caller's iteration space is untouched.
         self.assertEqual(self.it_space[self.rows], 7)
+
+    def test_op_in_counted_loop_keeps_extent(self):
+        # The same deps grow rows in test_padded_input_and_output_grow_rows;
+        # only the enclosing loop differs. Unreachable end to end today
+        # (_resize_device_layout refuses a padded buffer), so pin it here.
+        op_in_loop = SimpleNamespace(
+            loop_member=LoopMember(
+                loop_group_id=(0,),
+                loop_count=[2],
+                loop_tiled_dims=[[]],
+                loop_tiled_reduction_dims=[[]],
+            )
+        )
+        result = adjust_it_space_for_padding(
+            op_in_loop, self.it_space, [self._dep("x", 8)], self._dep("out", 8)
+        )
+        self.assertEqual(result[self.rows], 7)
+        self.assertEqual(result, self.it_space)
 
     def test_other_vars_keep_extent_and_order(self):
         # k stands in for a reduction var: in it_space, in no output coordinate.
@@ -1249,7 +1268,7 @@ class TestAdjustItSpaceForPadding(unittest.TestCase):
         it_space = {self.rows: sympy.Integer(7), k: sympy.Integer(32)}
         it_space[self.cols] = sympy.Integer(64)
         result = adjust_it_space_for_padding(
-            it_space, [self._dep("x", 8)], self._dep("out", 8)
+            self.op_no_loop, it_space, [self._dep("x", 8)], self._dep("out", 8)
         )
         self.assertEqual(list(result), [self.rows, k, self.cols])
         self.assertEqual(result[k], 32)
@@ -1258,20 +1277,23 @@ class TestAdjustItSpaceForPadding(unittest.TestCase):
     def test_unpadded_output_keeps_rows(self):
         # Iterating to 8 would write past the output's allocation.
         result = adjust_it_space_for_padding(
-            self.it_space, [self._dep("x", 8)], self._dep("out")
+            self.op_no_loop, self.it_space, [self._dep("x", 8)], self._dep("out")
         )
         self.assertEqual(result, self.it_space)
 
     def test_disagreeing_padding_keeps_rows(self):
         result = adjust_it_space_for_padding(
-            self.it_space, [self._dep("x", 8)], self._dep("out", 16)
+            self.op_no_loop, self.it_space, [self._dep("x", 8)], self._dep("out", 16)
         )
         self.assertEqual(result, self.it_space)
 
     def test_broadcast_input_does_not_constrain(self):
         bias = _tensor_dep("bias", (64,), (self.cols,))
         result = adjust_it_space_for_padding(
-            self.it_space, [self._dep("x", 8), bias], self._dep("out", 8)
+            self.op_no_loop,
+            self.it_space,
+            [self._dep("x", 8), bias],
+            self._dep("out", 8),
         )
         self.assertEqual(result[self.rows], 8)
 
@@ -1288,7 +1310,10 @@ class TestAdjustItSpaceForPadding(unittest.TestCase):
             layout=_fixed_tiled_layout((9, 64)),
         )
         result = adjust_it_space_for_padding(
-            self.it_space, [self._dep("x", 8), shifted], self._dep("out", 8)
+            self.op_no_loop,
+            self.it_space,
+            [self._dep("x", 8), shifted],
+            self._dep("out", 8),
         )
         self.assertEqual(result, self.it_space)
 
@@ -1302,13 +1327,16 @@ class TestAdjustItSpaceForPadding(unittest.TestCase):
             layout=_fixed_tiled_layout((7, 64)),
         )
         it_space = {c: sympy.Integer(64), r: sympy.Integer(7)}
-        self.assertEqual(adjust_it_space_for_padding(it_space, [x], out), it_space)
+        self.assertEqual(
+            adjust_it_space_for_padding(self.op_no_loop, it_space, [x], out),
+            it_space,
+        )
 
     def test_symbolic_extent_keeps_extent(self):
         s0 = _isym("s0")
         it_space = {self.rows: s0, self.cols: sympy.Integer(64)}
         result = adjust_it_space_for_padding(
-            it_space, [self._dep("x", 8)], self._dep("out", 8)
+            self.op_no_loop, it_space, [self._dep("x", 8)], self._dep("out", 8)
         )
         self.assertEqual(result, it_space)
 
@@ -1316,17 +1344,17 @@ class TestAdjustItSpaceForPadding(unittest.TestCase):
         # Some callers build iteration spaces with Python ints, not sympy.
         it_space = {self.rows: 7, self.cols: 64}
         grown = adjust_it_space_for_padding(
-            it_space, [self._dep("x", 8)], self._dep("out", 8)
+            self.op_no_loop, it_space, [self._dep("x", 8)], self._dep("out", 8)
         )
         self.assertEqual(grown, {self.rows: 8, self.cols: 64})
         kept = adjust_it_space_for_padding(
-            it_space, [self._dep("x", 8)], self._dep("out")
+            self.op_no_loop, it_space, [self._dep("x", 8)], self._dep("out")
         )
         self.assertEqual(kept, it_space)
 
 
 class TestPadIterationSpaceIndirect(unittest.TestCase):
-    """``pad_iteration_space`` never pads an op with indirect access: iterating
+    """``_pad_iteration_space`` never pads an op with indirect access: iterating
     into an index tensor's padding would use garbage as indices.
 
     Both forms are covered: work division sees an ``IndirectAccess`` call in a
@@ -1346,7 +1374,9 @@ class TestPadIterationSpaceIndirect(unittest.TestCase):
         """Pad for ``out[rows, cols] = x[gather_row_coord, cols]``, ``x`` being
         a 100-row source table."""
         source = ([sympy.Integer(0), gather_row_coord, self.cols], [1, 100, 64])
-        return pad_iteration_space(self.it_space, self.output[0], [source, self.output])
+        return _pad_iteration_space(
+            self.it_space, self.output[0], [source, self.output]
+        )
 
     def test_direct_source_lets_rows_grow(self):
         # The control: with a direct read of x, rows grows to the padded 8.
