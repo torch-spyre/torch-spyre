@@ -48,9 +48,13 @@ pytest.importorskip("ortools")
 
 import torch_spyre._inductor.scratchpad.allocator as allocator_module
 from torch_spyre._inductor import config
+from torch_spyre._inductor.loop_info import CoarseTileInfo
 from torch_spyre._inductor.pass_utils import PerCoreView
 from torch_spyre._inductor.scratchpad import ilp_solver_ortools
-from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
+from torch_spyre._inductor.scratchpad.allocator import (
+    CoOptimizingAllocator,
+    _sibling_pinned_divisions,
+)
 from torch_spyre._inductor.scratchpad.ilp_solver_ortools import CpSatLayoutSolver
 from torch_spyre._inductor.scratchpad.lx_relayout import (
     ChosenRelayout,
@@ -170,6 +174,35 @@ def test_relayout_full_replica_preserves_sibling_pins(
     )
     assert [c.group for c in kept] == expected
     assert all(any(c is original for original in candidates) for c in kept)
+
+
+@pytest.mark.parametrize("tiled", [True, False])
+def test_sibling_pins_are_kept_only_for_a_coarse_tiled_parent(monkeypatch, tiled):
+    """A sibling parent's free division keeps its group past the cap only when
+    this parent is coarse-tiled, the same-tile-group case #5057 needs. Group 1
+    is the costlier one, so the cap keeps it only if it is pinned."""
+    monkeypatch.setattr(config, "lx_solver_relayout_groups_per_edge", 1)
+    loop_info = (
+        CoarseTileInfo(
+            loop_group_id=(0,),
+            loop_count=[4],
+            loop_tiled_dims=[[]],
+            loop_tiled_reduction_dims=[[]],
+        )
+        if tiled
+        else None
+    )
+    parent_op = SimpleNamespace(loop_info=loop_info)
+    pinned = _sibling_pinned_divisions("P", parent_op, {"Q": [(0, 1)]})
+    candidates = [
+        _candidate("C", 0, 100, group=0, j=0),
+        _candidate("C", 0, 200, group=1, j=1),
+    ]
+    divisions = [CoreDivision(splits={sympy.Symbol("d0"): 4})] * 2
+    kept = CoOptimizingAllocator._cap_relayout_groups(
+        "P", "C", candidates, divisions, pinned_consumer_divisions=pinned
+    )
+    assert [c.group for c in kept] == ([1] if tiled else [0])
 
 
 def _view(slot: int, num_cores: int = 4) -> PerCoreView:
