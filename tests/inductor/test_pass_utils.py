@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import dataclasses
+import math
 import types
 
 import pytest
@@ -478,10 +479,10 @@ def test_compute_restickify_target_layout_synthesizes_when_no_size1_dim_exists()
     )
 
     assert result is not None
-    # One element per stick: the old stick's 64 elements become an outer dim
-    # and the stick maps to no host stride.
-    assert list(result.device_size) == [64, 4, 64]
-    assert list(result.stride_map) == [1, 64, -1]
+    # Matches SpyreTensorLayout([4, 64, 1]): the size-1 dim is device dim 1 and
+    # the one-element stick maps to no host stride.
+    assert list(result.device_size) == [64, 1, 4, 64]
+    assert list(result.stride_map) == [1, -1, 64, -1]
 
 
 _FP16 = get_device_dtype(torch.float16)
@@ -817,3 +818,48 @@ def test_compiled_transpose_restickify_padded_valid_elements():
     stick_dim = len(out_stl.device_size) - 1
     stick_key = next(k for k in out_stl.valid_elements if stick_dim in k)
     assert out_stl.valid_elements[stick_key] == S
+
+
+def test_rescale_stl_for_dtype_matches_fp32_host_layout():
+    """fp16 -> fp32 rescale of [2, 4, 64] must match the fp32 constructor.
+
+    Dim 0 has stride 64 (the fp16 stick depth) but is not in the stick's
+    valid_elements pair, so it must stay 4 rows. Only dims 1 and 3 are rescaled.
+    All 512 elements remain valid.
+    """
+    stl = SpyreTensorLayout([2, 4, 64], torch.float16)
+    out = pass_utils.rescale_stl_for_dtype(
+        stl, torch.float32, ElementArrangement.STANDARD
+    )
+    ref = SpyreTensorLayout([2, 4, 64], torch.float32)
+    assert list(out.device_size) == list(ref.device_size) == [4, 2, 2, 32]
+    assert list(out.stride_map) == list(ref.stride_map) == [64, 32, 256, 1]
+    assert out.valid_elements == ref.valid_elements == {(0,): 4, (1, 3): 64, (2,): 2}
+    assert math.prod(out.valid_elements.values()) == 2 * 4 * 64
+
+
+def test_size1_restickify_in_place_matches_size1_host_layout():
+    """Host [4, 128] restickified onto a synthetic size-1 dim.
+
+    Must match SpyreTensorLayout([4, 128, 1]): the size-1 dim is inserted as
+    device dim 1, the old stick's 128 elements stay on dim 0, and the stick
+    holds one element per stick on dim 3. Counts multiply to 4 * 128.
+    """
+    stl = SpyreTensorLayout([4, 128], torch.float16)
+    hl = FixedLayout(torch.device("cpu"), torch.float16, [4, 128], [128, 1])
+    c0, c1 = sympy.symbols("c0 c1")
+    idc = [sympy.floor(c1 / 64), c0, sympy.Mod(c1, 64)]
+    out = pass_utils.compute_size1_restickify_layout(stl, hl, [c0, c1], idc)
+    oracle = SpyreTensorLayout([4, 128, 1], torch.float16)
+    assert out is not None
+    assert list(out.device_size) == list(oracle.device_size) == [128, 1, 4, 64]
+    assert list(out.stride_map) == list(oracle.stride_map) == [1, -1, 128, -1]
+    assert (
+        out.valid_elements
+        == oracle.valid_elements
+        == {
+            (0,): 128,
+            (1, 3): 1,
+            (2,): 4,
+        }
+    )
