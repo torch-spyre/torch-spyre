@@ -14,23 +14,28 @@
 
 """Gemma 4 26B-A4B-it MoE functional verification tests for Torch-Spyre.
 
-Shapes come from a traced Gemma 4 26B-A4B run (Transformers v5.15.0): a 12-token
-prefill and 1-token decode steps, so 96 and 8 routed rows. Two MoE paths are
-covered:
+Shapes and structure follow the Gemma 4 26B-A4B-it config and Transformers v5.15.0,
+traced for a 12-token prefill and 1-token decode steps (96 and 8 routed rows):
 
-* 3.11 follows Transformers' ``grouped_mm_experts_forward``, the path the model
-  runs: sort, ``perm // K`` gather, ``histc``/``cumsum`` offsets, ``_grouped_mm``
-  and an FP32 ``view(T, K, H).sum(1)`` combine.
-* 3.3 to 3.10 cover a Spyre implementation strategy (Approach B): expert segments
-  padded to 32-row tiles, with an ``index_add`` combine. The model does not run it.
+* 3.1 Router (``Gemma4TextRouter``).
+* 3.2 MoE experts as Gemma 4 runs them (``grouped_mm_experts_forward``): sort,
+  ``perm // K`` gather, ``histc``/``cumsum`` offsets, ``_grouped_mm`` and an FP32
+  combine. This is the main gate.
+* 3.3 MoE numerics and routing edge cases, on the same path.
+* 3.4 Expert FFN and layout.
+* 3.5 Attention and the decoder layer. Sliding-window layers have 8 KV heads of
+  256 and RoPE theta 1e4. Full layers have 2 KV heads of 512, take V from k_proj
+  (``attention_k_eq_v``) and use proportional RoPE over a quarter of the head with
+  theta 1e6. Both apply Q/K/V RMS norms and ``scale=1.0``. The decoder layer runs
+  the dense MLP and the MoE in parallel. Prefill is causal, and decode attends over
+  a 12-token KV cache; the 1024-token sliding window is longer than both.
+* 3.6 A Spyre implementation option, kept small: expert segments padded to 32-row
+  tiles and an ``index_add`` combine. It covers ops the grouped_mm path does not
+  reach.
 
-Attention is simplified: it covers only the 256-dim sliding-window layers, rotates
-the first 64 features, scales by ``1/sqrt(head_dim)`` and has no Q/K norm. Expert
-weights are synthetic.
-
-Every scenario also runs with ``execution_mode="cpu"``. That case uses no Spyre
-device and is never xfailed, so a bug in a reference or an assertion cannot hide
-behind a backend xfail.
+Weights are synthetic. Every scenario also runs with ``execution_mode="cpu"``. That
+case uses no Spyre device and is never xfailed, so a bug in a reference or an
+assertion cannot hide behind a backend xfail.
 """
 
 from __future__ import annotations
@@ -63,9 +68,16 @@ PREFILL_T = 12
 DECODE_T = 1
 ALL_EXPERTS_T = EXPERTS // K8
 NUM_Q_HEADS = 16
+# Sliding-window attention layers (25 of 30).
 NUM_KV_HEADS = 8
 HEAD_DIM = 256
-ROTARY_DIM = 64
+SLIDING_ROPE_THETA = 10_000.0
+# Full attention layers (5 of 30). K and V share k_proj (attention_k_eq_v).
+NUM_GLOBAL_KV_HEADS = 2
+GLOBAL_HEAD_DIM = 512
+GLOBAL_ROPE_THETA = 1_000_000.0
+GLOBAL_PARTIAL_ROTARY = 0.25
+DENSE_INTERMEDIATE = 2112
 RMS_NORM_EPS = 1e-6
 
 
@@ -76,6 +88,17 @@ FP32_RTOL = 0.001
 BF16_ATOL = 0.005
 BF16_RTOL = 0.005
 FP32_REF_ATOL = 0.002
+# BF16 against an FP32 reference on CPU: at most 0.013 for attention (outputs up to
+# 3.7) and the dense MLP (up to 2.7), and 0.064 for the decoder layer (up to 7.5,
+# where one BF16 step is 0.03). Each tolerance allows about twice that.
+# Two BF16 results computed in a different order can each round one step apart, so
+# comparisons between them also allow four BF16 steps of relative error.
+ATTN_ATOL = 0.03
+ATTN_RTOL = 2**-6
+MLP_ATOL = 0.03
+MLP_RTOL = 2**-6
+DECODER_ATOL = 0.125
+DECODER_RTOL = 2**-6
 SEED = 20260908
 
 
@@ -186,9 +209,6 @@ TOPK_WRONG_VALUES = _xfail(
     "#4639: compiled K=8 topk returns incorrect values",
     "Tensor-likes are not close",
 )
-UNIQUE = _xfail(
-    NotImplementedError, "#4645: aten::_unique2 has no Spyre kernel", "aten::_unique2"
-)
 INDEX_2D = _xfail(
     NotImplementedError,
     "#1219: aten::index.Tensor supports only a 1-D index",
@@ -210,6 +230,25 @@ FLOAT_IDS_AS_INDEX = _xfail(
     RuntimeError,
     "#5847: float32 topk ids cannot index per_expert_scale",
     "tensors used as indices must be long, int, byte or bool",
+)
+FLOAT_IDS_AS_INDEX_EAGER = _xfail(
+    IndexError,
+    "#5847: float32 topk ids cannot index per_expert_scale",
+    "tensors used as indices must be long, int, byte or bool",
+)
+SORT_MULTI_OUTPUT = _xfail(
+    InductorError,
+    "#5831: split_multi_ops fails on multi-output sort",
+    "'tuple' object has no attribute 'to'",
+)
+# The grouped_mm MoE stops at its sort: no stable-sort kernel eager, and
+# split_multi_ops rejects the multi-output sort compiled.
+GROUPED_MM_SORT = dict(eager=STABLE_SORT, compiled=SORT_MULTI_OUTPUT)
+UPCAST_RMS_NORM = _xfail(
+    AssertionError,
+    "#5893: FP32 RMSNorm of an upcast BF16 input returns wrong values, so eager "
+    "attention outputs NaN",
+    "Greatest absolute difference: nan",
 )
 
 
@@ -396,94 +435,6 @@ def _deterministic_all_experts(T=ALL_EXPERTS_T, K=K8):
     return ((torch.arange(T).unsqueeze(1) * K + torch.arange(K)) % EXPERTS).long()
 
 
-def _assert_group_metadata(expert_ids):
-    flat = expert_ids.reshape(-1)
-    perm, sorted_e, counts, group_off = _group(flat)
-    assert perm.numel() == flat.numel()
-    assert torch.equal(torch.sort(perm).values, torch.arange(flat.numel()))
-    assert torch.all(sorted_e[:-1] <= sorted_e[1:])
-    assert counts.shape == (EXPERTS,)
-    assert group_off.shape == (EXPERTS + 1,)
-    assert group_off[0].item() == 0
-    assert group_off[-1].item() == flat.numel()
-    return perm, sorted_e, counts, group_off
-
-
-def _multi_expert_ffn(x, expert_ids, bank):
-    flat_ids = expert_ids.reshape(-1)
-    out = torch.empty_like(x)
-    for e in torch.unique(flat_ids).tolist():
-        e = int(e)
-        mask = flat_ids == e
-        ge, de = bank[e]
-        if ge.device != x.device:
-            ge, de = ge.to(x.device), de.to(x.device)
-        out[mask] = _expert_ffn(x[mask], ge, de)
-    return out
-
-
-def _rms_norm(x: torch.Tensor) -> torch.Tensor:
-    variance = x.float().pow(2).mean(dim=-1, keepdim=True)
-    return (x.float() * torch.rsqrt(variance + RMS_NORM_EPS)).to(x.dtype)
-
-
-def _rope(x: torch.Tensor, theta: float) -> torch.Tensor:
-    """Apply Gemma rotary position embedding to the first ROTARY_DIM features."""
-    T = x.shape[-2]
-    positions = torch.arange(T, dtype=torch.float32, device=x.device)
-    inv_freq = 1.0 / (
-        theta
-        ** (
-            torch.arange(0, ROTARY_DIM, 2, dtype=torch.float32, device=x.device)
-            / ROTARY_DIM
-        )
-    )
-    angles = positions[:, None] * inv_freq[None, :]
-    cos = angles.cos()[None, :, :]
-    sin = angles.sin()[None, :, :]
-    rotary = x[..., :ROTARY_DIM]
-    even = rotary[..., 0::2]
-    odd = rotary[..., 1::2]
-    rotated = torch.stack(
-        (even * cos - odd * sin, even * sin + odd * cos), dim=-1
-    ).flatten(-2)
-    return torch.cat((rotated, x[..., ROTARY_DIM:]), dim=-1)
-
-
-def _gemma_attention(
-    x: torch.Tensor,
-    q_proj: torch.Tensor,
-    k_proj: torch.Tensor,
-    v_proj: torch.Tensor,
-    o_proj: torch.Tensor,
-) -> torch.Tensor:
-    """Small Gemma-style attention path: 16 Q heads, 8 KV heads, 256-D heads."""
-    q = (x @ q_proj).reshape(x.shape[0], NUM_Q_HEADS, HEAD_DIM).transpose(0, 1)
-    k = (x @ k_proj).reshape(x.shape[0], NUM_KV_HEADS, HEAD_DIM).transpose(0, 1)
-    v = (x @ v_proj).reshape(x.shape[0], NUM_KV_HEADS, HEAD_DIM).transpose(0, 1)
-
-    k = k.repeat_interleave(NUM_Q_HEADS // NUM_KV_HEADS, dim=0)
-    v = v.repeat_interleave(NUM_Q_HEADS // NUM_KV_HEADS, dim=0)
-
-    q = _rope(q, theta=1_000_000.0)
-    k = _rope(k, theta=1_000_000.0)
-
-    scores = torch.matmul(q.float(), k.float().transpose(-1, -2)) / math.sqrt(HEAD_DIM)
-    probs = torch.softmax(scores, dim=-1)
-    context = torch.matmul(probs, v.float())
-    context = context.transpose(0, 1).reshape(x.shape[0], NUM_Q_HEADS * HEAD_DIM)
-    return (context @ o_proj.float()).to(x.dtype)
-
-
-def _transformer_block(x, expert_ids, weights, bank, q_proj, k_proj, v_proj, o_proj):
-    normed = _rms_norm(x)
-    attn = _gemma_attention(normed, q_proj, k_proj, v_proj, o_proj)
-    after_attn = x + attn
-    moe_input = _rms_norm(after_attn)
-    moe, _ = _grouped_moe(moe_input, expert_ids, weights, bank)
-    return after_attn + moe
-
-
 def _per_expert_scale() -> torch.Tensor:
     """Non-uniform BF16 [128] scale, the dtype Gemma4TextRouter stores it in."""
     return (0.5 + torch.arange(EXPERTS, dtype=torch.float32) / EXPERTS).to(
@@ -500,12 +451,20 @@ def _router_params():
     return scale, proj, _per_expert_scale()
 
 
-def _gemma4_router(hidden, scale, proj, per_expert_scale):
-    """Gemma4TextRouter.forward: weights [T, 8] FP32 and expert ids [T, 8]."""
+def _gemma4_router(hidden, scale, proj, per_expert_scale, ids=None):
+    """Gemma4TextRouter.forward: weights [T, 8] FP32 and expert ids [T, 8].
+
+    ``ids`` replaces the top-8 choice; the weights are those experts' renormalized
+    probabilities.
+    """
     x = _rms_norm(hidden)
     x = x * scale * HIDDEN**-0.5
     logits = x @ proj.t()
-    weights, ids = _routing_weights(logits)
+    if ids is None:
+        weights, ids = _routing_weights(logits)
+    else:
+        weights = torch.softmax(logits, dim=-1, dtype=torch.float32).gather(-1, ids)
+        weights = weights / weights.sum(dim=-1, keepdim=True)
     return weights * per_expert_scale[ids], ids
 
 
@@ -567,7 +526,265 @@ def _moe_fp32_reference(hidden, ids, weights, bank):
 
 
 # ---------------------------------------------------------------------------
-# 3.1 Router / Top-K Selection / Routing Weights
+# Gemma 4 attention, dense MLP and decoder layer (Transformers v5.15.0)
+# ---------------------------------------------------------------------------
+
+
+def _rms_norm(x: torch.Tensor, weight: torch.Tensor | None = None) -> torch.Tensor:
+    """Gemma4RMSNorm in FP32, then an optional weight.
+
+    Uses ``rsqrt(mean(x^2) + eps)``, which equals Gemma 4's ``pow(..., -0.5)``.
+    """
+    xf = x.float()
+    out = xf * torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + RMS_NORM_EPS)
+    if weight is not None:
+        out = out * weight.float()
+    return out.type_as(x)
+
+
+def _attention_dims(kind):
+    """(KV heads, head dim, RoPE theta, rotary fraction) of a sliding or full layer."""
+    if kind == "sliding":
+        return NUM_KV_HEADS, HEAD_DIM, SLIDING_ROPE_THETA, 1.0
+    return (
+        NUM_GLOBAL_KV_HEADS,
+        GLOBAL_HEAD_DIM,
+        GLOBAL_ROPE_THETA,
+        GLOBAL_PARTIAL_ROTARY,
+    )
+
+
+def _rope_cos_sin(positions, kind):
+    """Gemma4TextRotaryEmbedding tables [T, head_dim], cast to BF16 as the layer gets them.
+
+    Full layers use proportional RoPE: only the first ``fraction * head_dim / 2``
+    frequencies are non-zero, so the other dimensions pass through unrotated.
+    """
+    _, d, theta, fraction = _attention_dims(kind)
+    angles = int(fraction * d // 2)
+    inv_freq = 1.0 / theta ** (torch.arange(0, 2 * angles, 2, dtype=torch.float32) / d)
+    inv_freq = torch.cat((inv_freq, torch.zeros(d // 2 - angles)))
+    freqs = positions.float()[:, None] * inv_freq[None, :]
+    emb = torch.cat((freqs, freqs), dim=-1)
+    return emb.cos().to(torch.bfloat16), emb.sin().to(torch.bfloat16)
+
+
+def _rotate_half(x):
+    half = x.shape[-1] // 2
+    return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
+
+
+def _apply_rope(x, cos, sin):
+    """apply_rotary_pos_emb for x [T, heads, D] and tables [T, D]."""
+    return x * cos[:, None, :] + _rotate_half(x) * sin[:, None, :]
+
+
+def _sdpa(q, k, v, causal):
+    return torch.nn.functional.scaled_dot_product_attention(
+        q[None], k[None], v[None], is_causal=causal, scale=1.0
+    )[0]
+
+
+def _manual_attention(q, k, v, causal):
+    """Reference for _sdpa: explicit scores, causal mask and softmax."""
+    scores = q @ k.transpose(-1, -2)
+    if causal:
+        T, S = q.shape[-2], k.shape[-2]
+        mask = torch.ones(T, S, dtype=torch.bool).tril(S - T)
+        scores = scores.masked_fill(~mask, float("-inf"))
+    return torch.softmax(scores, dim=-1) @ v
+
+
+def _gemma4_attention(
+    x,
+    cos,
+    sin,
+    q_w,
+    k_w,
+    v_w,
+    o_w,
+    q_norm,
+    k_norm,
+    past_k=None,
+    past_v=None,
+    attend=_sdpa,
+):
+    """Gemma4TextAttention.forward for x [T, 2816], with an optional KV cache.
+
+    ``v_w is None`` is a full layer with ``attention_k_eq_v``: V comes from k_proj.
+    """
+    T, d = x.shape[0], q_norm.shape[0]
+    kv_heads = k_w.shape[1] // d
+    q = _rms_norm((x @ q_w).view(T, NUM_Q_HEADS, d), q_norm)
+    k = (x @ k_w).view(T, kv_heads, d)
+    v = k if v_w is None else (x @ v_w).view(T, kv_heads, d)
+    q = _apply_rope(q, cos, sin).transpose(0, 1)
+    k = _apply_rope(_rms_norm(k, k_norm), cos, sin).transpose(0, 1)
+    v = _rms_norm(v).transpose(0, 1)
+    if past_k is not None:
+        k = torch.cat((past_k, k), dim=1)
+        v = torch.cat((past_v, v), dim=1)
+    groups = NUM_Q_HEADS // kv_heads
+    k = k.repeat_interleave(groups, dim=0)
+    v = v.repeat_interleave(groups, dim=0)
+    out = attend(q, k, v, causal=past_k is None and T > 1)
+    return out.transpose(0, 1).reshape(T, NUM_Q_HEADS * d) @ o_w
+
+
+def _bf16_weights(seed, *shapes):
+    """Random BF16 weights [in, out] scaled by in**-0.5, so activations stay near unit."""
+    g = torch.Generator(device="cpu")
+    g.manual_seed(seed)
+    return [
+        (torch.randn(*shape, generator=g) * shape[0] ** -0.5).to(torch.bfloat16)
+        for shape in shapes
+    ]
+
+
+def _norm_weights(seed, n, count, scale=1.0):
+    """``count`` BF16 RMSNorm weights near ``scale``."""
+    g = torch.Generator(device="cpu")
+    g.manual_seed(seed)
+    return [
+        ((1 + 0.1 * torch.randn(n, generator=g)) * scale).to(torch.bfloat16)
+        for _ in range(count)
+    ]
+
+
+def _attention_weights(kind):
+    """Synthetic weights in _gemma4_attention order: q, k, v (None for full), o, norms."""
+    kv_heads, d, _, _ = _attention_dims(kind)
+    seed = SEED + (6000 if kind == "sliding" else 7000)
+    q, k, v, o = _bf16_weights(
+        seed,
+        (HIDDEN, NUM_Q_HEADS * d),
+        (HIDDEN, kv_heads * d),
+        (HIDDEN, kv_heads * d),
+        (NUM_Q_HEADS * d, HIDDEN),
+    )
+    # With scale=1.0, trained q/k norms keep the scores small. d**-0.25 does the
+    # same for random weights, so the softmax is not close to one-hot.
+    q_norm, k_norm = _norm_weights(seed + 1, d, 2, scale=d**-0.25)
+    return q, k, v if kind == "sliding" else None, o, q_norm, k_norm
+
+
+def _attention_inputs(kind, T):
+    """Normed input, RoPE tables and KV cache for a causal prefill (T=12) or a decode
+    step at position 12 over a 12-token cache (T=1)."""
+    _seed()
+    x = _rms_norm(torch.randn(T, HIDDEN, dtype=torch.bfloat16))
+    past = 0 if T == PREFILL_T else PREFILL_T
+    cos, sin = _rope_cos_sin(torch.arange(past, past + T), kind)
+    if not past:
+        return x, cos, sin, None, None
+    kv_heads, d, _, _ = _attention_dims(kind)
+    g = torch.Generator(device="cpu")
+    g.manual_seed(SEED + 8000)
+    # Cached keys are already normed and rotated; cached values are normed.
+    past_k = (torch.randn(kv_heads, past, d, generator=g) * d**-0.25).to(torch.bfloat16)
+    past_v = torch.randn(kv_heads, past, d, generator=g).to(torch.bfloat16)
+    return x, cos, sin, past_k, past_v
+
+
+def _dense_mlp_weights():
+    """Gemma4TextMLP gate, up and down projections as [in, out]."""
+    return _bf16_weights(
+        SEED + 9000,
+        (HIDDEN, DENSE_INTERMEDIATE),
+        (HIDDEN, DENSE_INTERMEDIATE),
+        (DENSE_INTERMEDIATE, HIDDEN),
+    )
+
+
+def _dense_mlp(x, gate_w, up_w, down_w):
+    """Gemma4TextMLP: down(gelu_tanh(gate(x)) * up(x))."""
+    act = torch.nn.functional.gelu(x @ gate_w, approximate="tanh")
+    return (act * (x @ up_w)) @ down_w
+
+
+DECODER_NORMS = (
+    "input",
+    "post_attention",
+    "pre_feedforward",
+    "post_feedforward_1",
+    "pre_feedforward_2",
+    "post_feedforward_2",
+    "post_feedforward",
+)
+
+
+def _decoder_weights(kind):
+    """Every tensor a decoder layer reads, in _decoder_layer's order."""
+    return (
+        *_attention_weights(kind),
+        *_dense_mlp_weights(),
+        *_router_params(),
+        *_expert_bank_3d(),
+        *_norm_weights(SEED + 10000, HIDDEN, len(DECODER_NORMS)),
+    )
+
+
+def _moe_fp32(hidden, weights, ids, gate_up, down):
+    """FP32 reference for _hf_moe, one expert at a time."""
+    bank = {e: (gate_up[e], down[e]) for e in torch.unique(ids).tolist()}
+    return _moe_fp32_reference(hidden, ids, weights, bank)
+
+
+def _decoder_layer(
+    x,
+    cos,
+    sin,
+    past_k,
+    past_v,
+    *weights,
+    attend=_sdpa,
+    moe=_hf_moe,
+    route_ids=None,
+    return_ids=False,
+):
+    """Gemma4TextDecoderLayer.forward. layer_scalar is 1 and there is no per-layer input.
+
+    ``route_ids`` replaces the router's top-8 choice, so a reference can follow the
+    same experts as the run it checks; the routing weights are still computed.
+    """
+    q, k, v, o, q_norm, k_norm = weights[:6]
+    mlp_gate, mlp_up, mlp_down = weights[6:9]
+    router_scale, router_proj, per_expert_scale = weights[9:12]
+    experts_gate_up, experts_down = weights[12:14]
+    norm = dict(zip(DECODER_NORMS, weights[14:]))
+
+    residual = x
+    h = _rms_norm(x, norm["input"])
+    h = _gemma4_attention(
+        h, cos, sin, q, k, v, o, q_norm, k_norm, past_k, past_v, attend=attend
+    )
+    h = residual + _rms_norm(h, norm["post_attention"])
+
+    residual = h
+    mlp = _dense_mlp(_rms_norm(h, norm["pre_feedforward"]), mlp_gate, mlp_up, mlp_down)
+    mlp = _rms_norm(mlp, norm["post_feedforward_1"])
+    # The router reads the residual before any feed-forward norm.
+    route_w, route_ids = _gemma4_router(
+        residual, router_scale, router_proj, per_expert_scale, ids=route_ids
+    )
+    experts = moe(
+        _rms_norm(residual, norm["pre_feedforward_2"]),
+        route_w,
+        route_ids,
+        experts_gate_up,
+        experts_down,
+    )
+    experts = _rms_norm(experts, norm["post_feedforward_2"])
+    out = residual + _rms_norm(mlp + experts, norm["post_feedforward"])
+    return (out, route_ids) if return_ids else out
+
+
+def _f32(tensors):
+    return [t.float() if isinstance(t, torch.Tensor) else t for t in tensors]
+
+
+# ---------------------------------------------------------------------------
+# 3.1 Router (Gemma4TextRouter)
 # ---------------------------------------------------------------------------
 
 
@@ -717,7 +934,8 @@ def test_G4_RT_003_per_expert_scale(execution_mode, T):
 
 
 @pytest.mark.parametrize(
-    ("execution_mode", "T"), _cases(eager=MIXED_EA, compiled=FLOAT_IDS_AS_INDEX)
+    ("execution_mode", "T"),
+    _cases(eager=FLOAT_IDS_AS_INDEX_EAGER, compiled=FLOAT_IDS_AS_INDEX),
 )
 def test_G4_RT_004_router_from_hidden_states(execution_mode, T):
     """Gemma4TextRouter: RMS norm, scale, proj, softmax, top-8, renorm, rescale."""
@@ -744,792 +962,7 @@ def test_G4_RT_004_router_from_hidden_states(execution_mode, T):
 
 
 # ---------------------------------------------------------------------------
-# 3.3 Routed-row formation / grouping / dispatch
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("execution_mode", "T"), _cases(eager=STABLE_SORT, compiled=STABLE_SORT)
-)
-def test_G4_AB_001_routed_row_permutation_integrity(execution_mode, T):
-    """One expert-sort permutation must preserve all routed-row columns."""
-    _seed()
-    K = K8
-    expert = (torch.arange(T * K) * 37 % EXPERTS).long()
-    token = torch.arange(T).repeat_interleave(K)
-    weight = torch.arange(T * K, dtype=torch.float32) / 1000
-    activation = torch.arange(T * K * HIDDEN, dtype=torch.int64).reshape(T * K, HIDDEN)
-
-    def fn(e, t, w, a):
-        perm = torch.argsort(e, stable=True)
-        return perm, e[perm], t[perm], w[perm], a[perm]
-
-    _compare_mode(
-        execution_mode,
-        fn,
-        expert,
-        token,
-        weight,
-        activation,
-        atol=EXACT_ATOL,
-        rtol=EXACT_RTOL,
-    )
-
-    perm, sorted_e, sorted_t, sorted_w, sorted_a = fn(expert, token, weight, activation)
-    assert torch.equal(torch.sort(perm).values, torch.arange(T * K))
-    assert torch.all(sorted_e[:-1] <= sorted_e[1:])
-
-    assert torch.equal(sorted_t, token[perm])
-    assert torch.equal(sorted_w, weight[perm])
-    assert torch.equal(sorted_a, activation[perm])
-
-
-@pytest.mark.parametrize(
-    "execution_mode", _modes(eager=STABLE_SORT, compiled=STABLE_SORT)
-)
-def test_G4_AB_002_bincount_segment_boundaries(execution_mode):
-    expert = _deterministic_all_experts().reshape(-1)
-
-    def fn(e):
-        _, sorted_e, counts, group_off = _group(e)
-        return sorted_e, counts, group_off
-
-    _compare_mode(
-        execution_mode,
-        fn,
-        expert,
-        atol=EXACT_ATOL,
-        rtol=EXACT_RTOL,
-    )
-
-    sorted_e, counts, group_off = fn(expert)
-    _, expected_sorted_e, expected_counts, expected_group_off = _assert_group_metadata(
-        expert
-    )
-    assert torch.equal(sorted_e, expected_sorted_e)
-    assert torch.equal(counts, expected_counts)
-    assert torch.equal(group_off, expected_group_off)
-    assert counts.sum().item() == ALL_EXPERTS_T * K8
-    for e in range(EXPERTS):
-        s, t = group_off[e].item(), group_off[e + 1].item()
-        assert t - s == counts[e].item()
-        if counts[e] == 0:
-            assert s == t
-        else:
-            assert torch.all(sorted_e[s:t] == e)
-
-
-@pytest.mark.parametrize(
-    ("execution_mode", "T"),
-    _cases(
-        eager=_xfail(
-            InductorError,
-            "#3193: no mechanism to resolve stick incompatibility",
-            "no mechanism to resolve stick incompatibility",
-        ),
-        compiled=_xfail(
-            InductorError,
-            "#3193: no mechanism to resolve stick incompatibility",
-            "no mechanism to resolve stick incompatibility",
-        ),
-        **SORT_AT_DECODE,
-    ),
-)
-def test_G4_AB_005_reorder_activations_weights_token_ids(execution_mode, T):
-    _seed()
-    hidden = torch.randn(T, HIDDEN, dtype=torch.bfloat16)
-    weights, expert_ids = _routing_weights(_router_logits(T))
-
-    def fn(x, w, ids):
-        routed, row_w, token, expert = _flatten_routing(x, w, ids)
-        perm = torch.argsort(expert, stable=True)
-        return (
-            routed[perm],
-            row_w[perm],
-            token[perm],
-            expert[perm],
-        )
-
-    _compare_mode(
-        execution_mode,
-        fn,
-        hidden,
-        weights,
-        expert_ids,
-        atol=BF16_ATOL,
-        rtol=BF16_RTOL,
-    )
-
-    got_x, got_w, got_t, sorted_e = fn(hidden, weights, expert_ids)
-    assert got_x.shape == (T * K8, HIDDEN)
-    _, expected_w, expected_t, expected_expert = _flatten_routing(
-        hidden, weights, expert_ids
-    )
-    expected_perm = torch.argsort(expected_expert, stable=True)
-    assert torch.equal(got_t, expected_t[expected_perm])
-    assert torch.equal(got_w, expected_w[expected_perm])
-
-    _, _, _, expert_flat = _flatten_routing(hidden, weights, expert_ids)
-    assert torch.all(sorted_e[:-1] <= sorted_e[1:])
-    assert torch.equal(
-        torch.sort(sorted_e).values,
-        torch.sort(expert_flat).values,
-    )
-
-
-@pytest.mark.parametrize(
-    "execution_mode",
-    _modes(
-        eager=_xfail(
-            NotImplementedError,
-            "#673: repeat_interleave.Tensor has no Spyre kernel",
-            r"aten::repeat_interleave\.Tensor",
-        ),
-        compiled=_xfail(
-            NotImplementedError,
-            "#673: repeat_interleave.Tensor has no Spyre kernel",
-            r"aten::repeat_interleave\.Tensor",
-        ),
-    ),
-)
-def test_G4_AB_008_exact_dst_pos_construction(execution_mode):
-    counts = torch.zeros(EXPERTS, dtype=torch.long)
-    counts[0] = 1
-    counts[1] = 31
-    counts[2] = 32
-    counts[3] = 33
-    counts[4] = 64
-    counts[5] = 17
-    group_off = torch.cat([torch.zeros(1, dtype=torch.long), counts.cumsum(0)])
-    _, padded, pad_off, _ = _tile_metadata(counts)
-
-    def fn(c, go, po):
-        return _dst_pos(c, go, po)
-
-    _compare_mode(
-        execution_mode,
-        fn,
-        counts,
-        group_off,
-        pad_off,
-        atol=EXACT_ATOL,
-        rtol=EXACT_RTOL,
-    )
-
-    dst = fn(counts, group_off, pad_off)
-    n_pad = int(pad_off[-1])
-    assert dst.shape == (int(counts.sum()),)
-    assert torch.unique(dst).numel() == dst.numel()
-    assert int(dst.min()) >= 0 and int(dst.max()) < n_pad
-    for e in range(EXPERTS):
-        c = int(counts[e])
-        if c:
-            s = int(group_off[e])
-            p = int(pad_off[e])
-            assert int(dst[s]) == p
-            assert torch.equal(dst[s : s + c], torch.arange(p, p + c))
-    assert n_pad % TILE == 0
-    assert torch.all(padded % TILE == 0)
-
-
-# ---------------------------------------------------------------------------
-# 3.4 Tile preparation
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "execution_mode", _modes(eager=FLOOR_DIVIDE, compiled=TILE_OFFSET_CUMSUM)
-)
-def test_G4_AB_003_pad_expert_segments_to_tile32(execution_mode):
-    counts = torch.tensor([0, 1, 31, 32, 33, 63, 64] + [0] * 121)
-
-    def fn(c):
-        tiles, padded, pad_off, tile_expert = _tile_metadata(c)
-        return tiles, padded, pad_off, tile_expert
-
-    _compare_mode(
-        execution_mode,
-        fn,
-        counts,
-        atol=EXACT_ATOL,
-        rtol=EXACT_RTOL,
-    )
-
-    tiles, padded, pad_off, tile_expert = fn(counts)
-    assert torch.all(padded % TILE == 0)
-    assert torch.all(padded >= counts)
-    assert pad_off.shape == (129,)
-    assert pad_off[-1].item() % TILE == 0
-    assert tile_expert.numel() == tiles.sum().item()
-
-
-@pytest.mark.parametrize(
-    "execution_mode", _modes(eager=FLOOR_DIVIDE, compiled=TILE_OFFSET_CUMSUM)
-)
-def test_G4_AB_004_tile_to_expert_assignment(execution_mode):
-    counts = torch.zeros(EXPERTS, dtype=torch.long)
-    counts[[0, 2, 7, 127]] = torch.tensor([1, 33, 64, 32])
-
-    def fn(c):
-        tiles, _, _, tile_expert = _tile_metadata(c)
-        return tiles, tile_expert
-
-    _compare_mode(
-        execution_mode,
-        fn,
-        counts,
-        atol=EXACT_ATOL,
-        rtol=EXACT_RTOL,
-    )
-
-    tiles, tile_expert = fn(counts)
-    assert tile_expert.numel() == tiles.sum().item()
-    for e in range(EXPERTS):
-        expected = int(tiles[e])
-        actual = int((tile_expert == e).sum())
-        assert actual == expected
-        if expected:
-            positions = torch.where(tile_expert == e)[0]
-            assert torch.equal(
-                positions,
-                torch.arange(positions[0], positions[-1] + 1),
-            )
-
-
-@pytest.mark.parametrize(
-    ("execution_mode", "T"),
-    _cases(
-        eager=_xfail(
-            NotImplementedError,
-            "#692: aten::_index_put_impl_ has no Spyre kernel",
-            "aten::_index_put_impl_",
-        ),
-        compiled=_xfail(
-            InductorError,
-            "#4327: restickify op_spec has 3 args",
-            "restickify op_spec has 3 args",
-        ),
-    ),
-)
-def test_G4_AB_006_pad_activations_weights_token_ids(execution_mode, T):
-    _seed()
-    hidden = torch.randn(T, HIDDEN, dtype=torch.bfloat16)
-    weights, expert_ids = _routing_weights(_router_logits(T))
-    routed, row_w, token, expert = _flatten_routing(hidden, weights, expert_ids)
-    perm, _, counts, group_off = _group(expert)
-    _, _, pad_off, _ = _tile_metadata(counts)
-    n_pad = int(pad_off[-1])
-    dst = _dst_pos(counts, group_off, pad_off)
-
-    def fn(x, w, t, d, n):
-        return _pad_columns(x, w, t, d, n, hidden.shape[0])
-
-    _compare_mode(
-        execution_mode,
-        fn,
-        routed[perm],
-        row_w[perm],
-        token[perm],
-        dst,
-        n_pad,
-        atol=BF16_ATOL,
-        rtol=BF16_RTOL,
-    )
-
-    xpad, wpad, tpad = fn(routed[perm], row_w[perm], token[perm], dst, n_pad)
-    assert torch.equal(xpad[dst], routed[perm])
-    assert torch.equal(wpad[dst], row_w[perm])
-    assert torch.equal(tpad[dst], token[perm])
-
-    # Expert segments start on pad_off, with padding rows between them.
-    active = counts > 0
-    assert torch.all(pad_off[:-1][active] % TILE == 0)
-    assert torch.equal(dst[group_off[:-1][active]], pad_off[:-1][active])
-
-    padding = torch.ones(n_pad, dtype=torch.bool)
-    padding[dst] = False
-    assert padding.any()
-    assert torch.count_nonzero(xpad[padding]) == 0
-    assert torch.count_nonzero(wpad[padding]) == 0
-    assert torch.all(tpad[padding] == T)
-
-
-# ---------------------------------------------------------------------------
-# 3.5 Expert FFN
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(("execution_mode", "T"), _cases())
-def test_G4_FFN_001_routed_rows_one_expert(execution_mode, T):
-    _seed()
-    x = torch.randn(T * K8, HIDDEN, dtype=torch.bfloat16)
-    bank = _expert_weights([0])
-
-    def fn(a, gu, down):
-        return _expert_ffn(a, gu, down)
-
-    _compare_mode(
-        execution_mode,
-        fn,
-        x,
-        *bank[0],
-        atol=BF16_ATOL,
-        rtol=BF16_RTOL,
-    )
-
-    ref = fn(x, *bank[0])
-    assert ref.shape == (T * K8, HIDDEN)
-    assert ref.dtype == torch.bfloat16
-
-    x2 = x.clone()
-    x2[0, 0] += 1
-    y2 = fn(x2, *bank[0])
-    assert torch.equal(ref[1:].cpu(), y2[1:].cpu())
-
-
-@pytest.mark.parametrize(("execution_mode", "T"), _cases(eager=UNIQUE, compiled=UNIQUE))
-def test_G4_FFN_002_routed_rows_across_8_experts(execution_mode, T):
-    _seed()
-    expert_ids = (torch.arange(T).unsqueeze(1) + torch.arange(K8)) % K8
-    expert_ids = expert_ids.long()
-    x = torch.randn(T * K8, HIDDEN, dtype=torch.bfloat16)
-    bank = _expert_weights(range(K8))
-
-    def fn(a, ids):
-        return _multi_expert_ffn(a, ids, bank)
-
-    _compare_mode(
-        execution_mode,
-        fn,
-        x,
-        expert_ids,
-        atol=BF16_ATOL,
-        rtol=BF16_RTOL,
-    )
-
-    ref = fn(x, expert_ids)
-    assert ref.shape == (T * K8, HIDDEN)
-
-
-# ---------------------------------------------------------------------------
-# 3.6 Weighted combine / Approach B static tile loop
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("execution_mode", "T"),
-    _cases(eager=GROUPED_MOE_EAGER, compiled=GROUPED_MOE_COMPILED, **SORT_AT_DECODE),
-)
-def test_G4_AB_007_per_tile_static_loop_scatter_add(execution_mode, T):
-    _seed()
-    hidden = torch.randn(T, HIDDEN, dtype=torch.bfloat16)
-    weights, expert_ids = _routing_weights(_router_logits(T))
-    used = torch.unique(expert_ids).tolist()
-    bank = _expert_weights(used)
-
-    def fn(x, ids, w):
-        return _grouped_moe(x, ids, w, bank)
-
-    _compare_mode(
-        execution_mode,
-        fn,
-        hidden,
-        expert_ids,
-        weights,
-        atol=BF16_ATOL,
-        rtol=BF16_RTOL,
-    )
-
-    got, meta = fn(hidden, expert_ids, weights)
-    ref = _moe_reference(hidden, expert_ids, weights, bank)
-    assert got.shape == (T, HIDDEN)
-    assert got.dtype == torch.bfloat16
-    _assert_close(got, ref)
-    _assert_no_nan_inf(got)
-
-    perm, counts, group_off, pad_off, tile_expert, dst = meta
-    assert perm.numel() == T * K8
-    assert group_off.shape == (129,)
-    assert pad_off[-1].item() % TILE == 0
-    assert tile_expert.numel() == pad_off[-1].item() // TILE
-    assert dst.numel() == T * K8
-
-
-# ---------------------------------------------------------------------------
-# 3.7 Backend / layout
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(("execution_mode", "T"), _cases())
-def test_G4_LY_001_restickify_k8(execution_mode, T):
-    """Production K=8 router-weight flattening and restickify path."""
-    K = K8
-    logits = _router_logits(T)
-    weights, _ = _routing_weights(logits)
-
-    def fn(w):
-        return w.reshape(T * K)
-
-    _compare_mode(
-        execution_mode,
-        fn,
-        weights,
-        atol=FP32_ATOL,
-        rtol=FP32_RTOL,
-    )
-
-    flat = fn(weights)
-    assert flat.shape == (T * K,)
-    for t in range(T):
-        assert torch.equal(flat[t * K : (t + 1) * K], weights[t])
-
-
-@pytest.mark.parametrize("execution_mode", _modes())
-def test_G4_BE_001_per_tile_expert_slab_select(execution_mode):
-    _seed()
-    tile_expert = torch.tensor([0, 7, 31, 127], dtype=torch.long)
-    bank = _expert_weights(tile_expert.tolist())
-    x = torch.randn(32, HIDDEN, dtype=torch.bfloat16)
-
-    def fn(a, expert_id):
-        outputs = []
-        for e in expert_id.tolist():
-            gu, down = bank[int(e)]
-            if gu.device != a.device:
-                gu, down = gu.to(a.device), down.to(a.device)
-            outputs.append(_expert_ffn(a, gu, down))
-        return torch.stack(outputs)
-
-    _compare_mode(
-        execution_mode,
-        fn,
-        x,
-        tile_expert,
-        atol=BF16_ATOL,
-        rtol=BF16_RTOL,
-    )
-
-    got = fn(x, tile_expert)
-    assert got.shape == (4, 32, HIDDEN)
-
-
-@pytest.mark.parametrize(
-    "execution_mode", _modes(eager=INDEX_ADD_DUPLICATES, compiled=INDEX_ADD_DUPLICATES)
-)
-def test_G4_BE_002_fixed_tile_sink_row_scatter_reduce(execution_mode):
-    """Scatter-reduce one fixed 32-row tile into destination rows."""
-    _seed()
-    T = 8
-    seg_out = torch.randn(TILE, HIDDEN, dtype=torch.bfloat16)
-    dst = torch.tensor(
-        [0, 0, 1, 2, 2, 2, T, T] + [3] * 24,
-        dtype=torch.long,
-    )
-
-    def fn(seg, indices):
-        out = torch.zeros(T + 1, HIDDEN, dtype=seg.dtype, device=seg.device)
-        return out.index_add(0, indices, seg)
-
-    _compare_mode(
-        execution_mode,
-        fn,
-        seg_out,
-        dst,
-        atol=BF16_ATOL,
-        rtol=BF16_RTOL,
-    )
-
-    out = fn(seg_out, dst)
-    # Accumulate in FP32 and cast once, as index_add does not round per row.
-    ref = torch.zeros(T + 1, HIDDEN, dtype=torch.float32)
-    for i, d in enumerate(dst.tolist()):
-        ref[d] += seg_out[i].float()
-    _assert_close(out, ref.to(out.dtype))
-    ref_sink = seg_out[6].float() + seg_out[7].float()
-    _assert_close(
-        out[-1].unsqueeze(0),
-        ref_sink.unsqueeze(0).to(out.dtype),
-    )
-
-
-# ---------------------------------------------------------------------------
-# 3.8 End-to-end Gemma MoE / transformer integration
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("execution_mode", "T"),
-    _cases(
-        eager=_xfail(
-            RuntimeError,
-            "#3179: rope calls pow, an unimplemented operation",
-            "unimplemented operation pow",
-        ),
-        compiled=_xfail(
-            InductorError,
-            "#4443: unexpected stick expression",
-            "Unexpected stick expression",
-        ),
-    ),
-)
-def test_G4_E2E_002_transformer_block_attention_moe(execution_mode, T):
-    _seed()
-    x = torch.randn(T, HIDDEN, dtype=torch.bfloat16)
-    weights, ids = _routing_weights(_router_logits(T))
-
-    bank = _expert_weights(torch.unique(ids).tolist())
-    gen = torch.Generator(device="cpu")
-    gen.manual_seed(SEED + 4000)
-    q_proj = (
-        torch.randn(HIDDEN, NUM_Q_HEADS * HEAD_DIM, generator=gen, dtype=torch.float32)
-        * 0.01
-    ).to(torch.bfloat16)
-    k_proj = (
-        torch.randn(HIDDEN, NUM_KV_HEADS * HEAD_DIM, generator=gen, dtype=torch.float32)
-        * 0.01
-    ).to(torch.bfloat16)
-    v_proj = (
-        torch.randn(HIDDEN, NUM_KV_HEADS * HEAD_DIM, generator=gen, dtype=torch.float32)
-        * 0.01
-    ).to(torch.bfloat16)
-    o_proj = (
-        torch.randn(NUM_Q_HEADS * HEAD_DIM, HIDDEN, generator=gen, dtype=torch.float32)
-        * 0.01
-    ).to(torch.bfloat16)
-
-    def fn(a, b, c, q, k, v, o):
-        return _transformer_block(a, b, c, bank, q, k, v, o)
-
-    _compare_mode(
-        execution_mode,
-        fn,
-        x,
-        ids,
-        weights,
-        q_proj,
-        k_proj,
-        v_proj,
-        o_proj,
-        atol=BF16_ATOL,
-        rtol=BF16_RTOL,
-    )
-
-    got = fn(x, ids, weights, q_proj, k_proj, v_proj, o_proj)
-    assert got.shape == (T, HIDDEN)
-    assert got.dtype == torch.bfloat16
-    _assert_no_nan_inf(got)
-
-    normed = _rms_norm(x)
-    attn = _gemma_attention(normed, q_proj, k_proj, v_proj, o_proj)
-    after_attn = x + attn
-    moe_input = _rms_norm(after_attn)
-    ref_moe = _moe_reference(moe_input, ids, weights, bank)
-    ref = after_attn + ref_moe
-    _assert_close(got, ref)
-
-
-# ---------------------------------------------------------------------------
-# 3.9 Numerical / dtype correctness
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("execution_mode", "T"),
-    _cases(eager=GROUPED_MOE_EAGER, compiled=GROUPED_MOE_COMPILED, **SORT_AT_DECODE),
-)
-def test_G4_DT_002_fp32_reference_vs_bf16_execution(execution_mode, T):
-    _seed()
-    hidden = torch.randn(T, HIDDEN, dtype=torch.bfloat16)
-    weights, ids = _routing_weights(_router_logits(T))
-    bank = _expert_weights(torch.unique(ids).tolist())
-    fp32_ref = _moe_fp32_reference(hidden, ids, weights, bank)
-    assert torch.isfinite(fp32_ref).all()
-
-    def fn(x, i, w):
-        return _grouped_moe(x, i, w, bank)[0]
-
-    _compare_mode(
-        execution_mode,
-        fn,
-        hidden,
-        ids,
-        weights,
-        atol=FP32_REF_ATOL,
-        rtol=0.0,
-        cpu_eager_result=fp32_ref.to(torch.bfloat16),
-    )
-
-    got = fn(hidden, ids, weights)
-    assert (got.float() - fp32_ref).abs().max().item() <= FP32_REF_ATOL
-
-
-# ---------------------------------------------------------------------------
-# 3.10 Routing / grouping edge cases
-# ---------------------------------------------------------------------------
-
-
-def _run_case_with_ids(expert_ids, execution_mode):
-    T, K = expert_ids.shape
-    _seed()
-    hidden = torch.randn(T, HIDDEN, dtype=torch.bfloat16)
-    weights = torch.full((T, K), 1.0 / K, dtype=torch.float32)
-    bank = _expert_weights(torch.unique(expert_ids).tolist())
-
-    def fn(x, ids, w):
-        return _grouped_moe(x, ids, w, bank)
-
-    _compare_mode(
-        execution_mode,
-        fn,
-        hidden,
-        expert_ids,
-        weights,
-        atol=BF16_ATOL,
-        rtol=BF16_RTOL,
-    )
-    got, meta = fn(hidden, expert_ids, weights)
-    ref = _moe_reference(hidden, expert_ids, weights, bank)
-    _assert_close(got, ref)
-    return meta
-
-
-@pytest.mark.parametrize(
-    ("execution_mode", "T"),
-    _cases(eager=GROUPED_MOE_EAGER, compiled=GROUPED_MOE_COMPILED, **SORT_AT_DECODE),
-)
-def test_G4_EC_001_repeated_expert_selection_within_token(execution_mode, T):
-    # Each token picks one expert K times; tokens pick different experts.
-    ids = (torch.arange(T) % EXPERTS).unsqueeze(1).expand(T, K8).contiguous()
-    meta = _run_case_with_ids(ids, execution_mode)
-    counts = meta[1]
-    assert torch.all(counts[:T] == K8)
-    assert counts[T:].sum().item() == 0
-
-
-@pytest.mark.parametrize(
-    ("execution_mode", "T"),
-    _cases(eager=GROUPED_MOE_EAGER, compiled=GROUPED_MOE_COMPILED, **SORT_AT_DECODE),
-)
-def test_G4_EC_002_empty_expert_segments(execution_mode, T):
-    ids = torch.arange(K8, dtype=torch.long).expand(T, K8)
-    meta = _run_case_with_ids(ids, execution_mode)
-    counts = meta[1]
-    assert counts[:K8].sum().item() == T * K8
-    assert counts[K8:].sum().item() == 0
-    _, _, _, pad_off, _, _ = meta
-    assert pad_off[-1].item() % TILE == 0
-
-
-@pytest.mark.parametrize(
-    ("execution_mode", "T"),
-    _cases(
-        eager=_xfail(
-            AssertionError,
-            "#4639: eager topk selects ids outside the tied pool",
-            "Tensor-likes are not close",
-        ),
-        compiled=GROUPED_MOE_COMPILED,
-        decode_eager=_xfail(
-            InductorError,
-            "#4404: restickify restore expects a padding-prepended gap dim",
-            "restickify restore: expected padding-prepended",
-        ),
-        decode_compiled=STABLE_SORT,
-    ),
-)
-def test_G4_EC_003_topk_tied_candidates(execution_mode, T):
-    logits = torch.zeros(T, EXPERTS, dtype=torch.bfloat16)
-    logits[:, :8] = 1.0
-
-    def fn(x):
-        router_probabilities = torch.softmax(
-            x,
-            dim=-1,
-            dtype=torch.float32,
-        )
-        values, ids = torch.topk(
-            router_probabilities,
-            8,
-            dim=-1,
-        )
-        return values, ids
-
-    def tie_order_free(x):
-        # topk does not define the order of tied values, so count the ids that
-        # fall in the tied pool instead of comparing positions.
-        values, ids = fn(x)
-        return values, (ids < K8).float().sum(dim=-1)
-
-    _compare_mode(
-        execution_mode,
-        tie_order_free,
-        logits,
-        atol=FP32_ATOL,
-        rtol=FP32_RTOL,
-    )
-
-    values, ids = fn(logits)
-    assert ids.shape == (T, K8)
-
-    expected_pool = torch.arange(K8, dtype=torch.long)
-    for row in ids:
-        assert torch.equal(row.sort().values, expected_pool)
-    # softmax of eight logits of 1 and 120 logits of 0.
-    expected = math.e / (K8 * math.e + (EXPERTS - K8))
-    torch.testing.assert_close(
-        values,
-        torch.full((T, K8), expected, dtype=torch.float32),
-        atol=FP32_ATOL,
-        rtol=FP32_RTOL,
-    )
-
-    _run_case_with_ids(ids, execution_mode)
-
-
-@pytest.mark.parametrize("execution_mode", _modes(eager=INDEX_2D, compiled=INDEX_2D))
-def test_G4_EC_004_all_128_experts_active(execution_mode):
-    ids = _deterministic_all_experts()
-    assert torch.unique(ids).numel() == EXPERTS
-    counts = torch.bincount(ids.reshape(-1), minlength=EXPERTS)
-    assert counts.shape == (EXPERTS,)
-    assert torch.all(counts == ALL_EXPERTS_T * K8 // EXPERTS)
-
-    fingerprints = torch.arange(EXPERTS, dtype=torch.float32)
-
-    def fn(x):
-        return fingerprints[x]
-
-    selected = fn(ids)
-    assert selected.shape == ids.shape
-    assert torch.equal(
-        torch.bincount(ids.reshape(-1), minlength=EXPERTS),
-        counts,
-    )
-
-    _compare_mode(
-        execution_mode,
-        fn,
-        ids,
-        atol=EXACT_ATOL,
-        rtol=EXACT_RTOL,
-    )
-
-
-@pytest.mark.parametrize(
-    ("execution_mode", "T"),
-    _cases(eager=GROUPED_MOE_EAGER, compiled=GROUPED_MOE_COMPILED, **SORT_AT_DECODE),
-)
-def test_G4_EC_005_single_expert_routing_all_tokens(execution_mode, T):
-    ids = torch.zeros(T, K8, dtype=torch.long)
-    meta = _run_case_with_ids(ids, execution_mode)
-    counts = meta[1]
-    assert counts[0].item() == T * K8
-    assert counts[1:].sum().item() == 0
-    assert meta[4].numel() == math.ceil(T * K8 / TILE)
-
-
-# ---------------------------------------------------------------------------
-# 3.11 Transformers grouped_mm path (what Gemma 4 runs)
+# 3.2 MoE experts as Gemma 4 runs them (grouped_mm_experts_forward)
 # ---------------------------------------------------------------------------
 
 
@@ -1664,7 +1097,8 @@ def test_G4_GM_004_inverse_permute_fp32_combine(execution_mode, T):
 
 
 @pytest.mark.parametrize(
-    ("execution_mode", "T"), _cases(eager=MIXED_EA, compiled=FLOAT_IDS_AS_INDEX)
+    ("execution_mode", "T"),
+    _cases(eager=FLOAT_IDS_AS_INDEX_EAGER, compiled=FLOAT_IDS_AS_INDEX),
 )
 def test_G4_GM_005_router_and_grouped_mm_moe(execution_mode, T):
     """Gemma4TextRouter followed by grouped_mm_experts_forward."""
@@ -1695,3 +1129,587 @@ def test_G4_GM_005_router_and_grouped_mm_moe(execution_mode, T):
     bank = _expert_weights(torch.unique(ids).tolist())
     ref = _moe_fp32_reference(hidden, ids, weights, bank)
     assert (got.float() - ref).abs().max().item() <= FP32_REF_ATOL
+
+
+# ---------------------------------------------------------------------------
+# 3.3 MoE numerics and routing edge cases (grouped_mm path)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(("execution_mode", "T"), _cases(**GROUPED_MM_SORT))
+def test_G4_DT_002_fp32_reference_vs_bf16_execution(execution_mode, T):
+    """grouped_mm MoE in BF16 stays within a justified bound of an FP32 reference."""
+    _seed()
+    hidden = torch.randn(T, HIDDEN, dtype=torch.bfloat16)
+    weights, ids = _routing_weights(_router_logits(T))
+    gate_up, down = _expert_bank_3d()
+    fp32_ref = _moe_fp32(hidden, weights, ids, gate_up, down)
+    assert torch.isfinite(fp32_ref).all()
+
+    # Spyre is checked against the independent FP32 reference, not the CPU
+    # grouped_mm path, so it cannot pass by matching a bug in _hf_moe.
+    _compare_mode(
+        execution_mode,
+        _hf_moe,
+        hidden,
+        weights,
+        ids,
+        gate_up,
+        down,
+        atol=FP32_REF_ATOL,
+        rtol=0.0,
+        cpu_eager_result=fp32_ref.to(torch.bfloat16),
+    )
+
+    got = _hf_moe(hidden, weights, ids, gate_up, down)
+    assert got.dtype == torch.bfloat16
+    assert (got.float() - fp32_ref).abs().max().item() <= FP32_REF_ATOL
+
+
+def _run_case_with_ids(expert_ids, execution_mode):
+    """Run the grouped_mm MoE with fixed routing; return CPU counts and offsets."""
+    T, K = expert_ids.shape
+    _seed()
+    hidden = torch.randn(T, HIDDEN, dtype=torch.bfloat16)
+    weights = torch.full((T, K), 1.0 / K, dtype=torch.float32)
+    gate_up, down = _expert_bank_3d()
+
+    _compare_mode(
+        execution_mode,
+        _hf_moe,
+        hidden,
+        weights,
+        expert_ids,
+        gate_up,
+        down,
+        atol=BF16_ATOL,
+        rtol=BF16_RTOL,
+    )
+
+    got = _hf_moe(hidden, weights, expert_ids, gate_up, down)
+    ref = _moe_fp32(hidden, weights, expert_ids, gate_up, down)
+    assert (got.float() - ref).abs().max().item() <= FP32_REF_ATOL
+    flat = expert_ids.reshape(-1)
+    return torch.bincount(flat, minlength=EXPERTS), _hf_offsets(torch.sort(flat).values)
+
+
+@pytest.mark.parametrize(("execution_mode", "T"), _cases(**GROUPED_MM_SORT))
+def test_G4_EC_001_repeated_expert_selection_within_token(execution_mode, T):
+    # Each token picks one expert K times; tokens pick different experts.
+    ids = (torch.arange(T) % EXPERTS).unsqueeze(1).expand(T, K8).contiguous()
+    counts, offsets = _run_case_with_ids(ids, execution_mode)
+    assert torch.all(counts[:T] == K8)
+    assert counts[T:].sum().item() == 0
+    assert offsets[T - 1].item() == offsets[-1].item() == T * K8
+
+
+@pytest.mark.parametrize(("execution_mode", "T"), _cases(**GROUPED_MM_SORT))
+def test_G4_EC_002_empty_expert_segments(execution_mode, T):
+    """Experts 8-127 get no rows, so their grouped_mm segments are empty."""
+    ids = torch.arange(K8, dtype=torch.long).expand(T, K8).contiguous()
+    counts, offsets = _run_case_with_ids(ids, execution_mode)
+    assert torch.all(counts[:K8] == T)
+    assert counts[K8:].sum().item() == 0
+    assert torch.all(offsets[K8 - 1 :] == T * K8)
+
+
+@pytest.mark.parametrize(
+    ("execution_mode", "T"),
+    _cases(
+        eager=_xfail(
+            AssertionError,
+            "#4639: eager topk selects ids outside the tied pool",
+            "Tensor-likes are not close",
+        ),
+        compiled=SORT_MULTI_OUTPUT,
+        decode_eager=_xfail(
+            InductorError,
+            "#4404: restickify restore expects a padding-prepended gap dim",
+            "restickify restore: expected padding-prepended",
+        ),
+    ),
+)
+def test_G4_EC_003_topk_tied_candidates(execution_mode, T):
+    logits = torch.zeros(T, EXPERTS, dtype=torch.bfloat16)
+    logits[:, :8] = 1.0
+
+    def fn(x):
+        router_probabilities = torch.softmax(
+            x,
+            dim=-1,
+            dtype=torch.float32,
+        )
+        values, ids = torch.topk(
+            router_probabilities,
+            8,
+            dim=-1,
+        )
+        return values, ids
+
+    def tie_order_free(x):
+        # topk does not define the order of tied values, so count the ids that
+        # fall in the tied pool instead of comparing positions.
+        values, ids = fn(x)
+        return values, (ids < K8).float().sum(dim=-1)
+
+    _compare_mode(
+        execution_mode,
+        tie_order_free,
+        logits,
+        atol=FP32_ATOL,
+        rtol=FP32_RTOL,
+    )
+
+    values, ids = fn(logits)
+    assert ids.shape == (T, K8)
+
+    expected_pool = torch.arange(K8, dtype=torch.long)
+    for row in ids:
+        assert torch.equal(row.sort().values, expected_pool)
+    # softmax of eight logits of 1 and 120 logits of 0.
+    expected = math.e / (K8 * math.e + (EXPERTS - K8))
+    torch.testing.assert_close(
+        values,
+        torch.full((T, K8), expected, dtype=torch.float32),
+        atol=FP32_ATOL,
+        rtol=FP32_RTOL,
+    )
+
+    _run_case_with_ids(ids, execution_mode)
+
+
+@pytest.mark.parametrize("execution_mode", _modes(**GROUPED_MM_SORT))
+def test_G4_EC_004_all_128_experts_active(execution_mode):
+    """16 tokens route to all 128 experts once each: every segment has one row."""
+    ids = _deterministic_all_experts()
+    assert torch.unique(ids).numel() == EXPERTS
+    counts, offsets = _run_case_with_ids(ids, execution_mode)
+    assert torch.all(counts == 1)
+    assert torch.equal(offsets, torch.arange(1, EXPERTS + 1, dtype=torch.int32))
+
+
+@pytest.mark.parametrize(("execution_mode", "T"), _cases(**GROUPED_MM_SORT))
+def test_G4_EC_005_single_expert_routing_all_tokens(execution_mode, T):
+    """Every routed row goes to expert 0; the other 127 segments are empty."""
+    ids = torch.zeros(T, K8, dtype=torch.long)
+    counts, offsets = _run_case_with_ids(ids, execution_mode)
+    assert counts[0].item() == T * K8
+    assert counts[1:].sum().item() == 0
+    assert torch.all(offsets == T * K8)
+
+
+# ---------------------------------------------------------------------------
+# 3.4 Expert FFN and layout
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(("execution_mode", "T"), _cases())
+def test_G4_FFN_001_routed_rows_one_expert(execution_mode, T):
+    _seed()
+    x = torch.randn(T * K8, HIDDEN, dtype=torch.bfloat16)
+    bank = _expert_weights([0])
+
+    def fn(a, gu, down):
+        return _expert_ffn(a, gu, down)
+
+    _compare_mode(
+        execution_mode,
+        fn,
+        x,
+        *bank[0],
+        atol=BF16_ATOL,
+        rtol=BF16_RTOL,
+    )
+
+    ref = fn(x, *bank[0])
+    assert ref.shape == (T * K8, HIDDEN)
+    assert ref.dtype == torch.bfloat16
+
+    x2 = x.clone()
+    x2[0, 0] += 1
+    y2 = fn(x2, *bank[0])
+    assert torch.equal(ref[1:].cpu(), y2[1:].cpu())
+
+
+@pytest.mark.parametrize(("execution_mode", "T"), _cases())
+def test_G4_LY_001_restickify_k8(execution_mode, T):
+    """Production K=8 router-weight flattening and restickify path."""
+    K = K8
+    logits = _router_logits(T)
+    weights, _ = _routing_weights(logits)
+
+    def fn(w):
+        return w.reshape(T * K)
+
+    _compare_mode(
+        execution_mode,
+        fn,
+        weights,
+        atol=FP32_ATOL,
+        rtol=FP32_RTOL,
+    )
+
+    flat = fn(weights)
+    assert flat.shape == (T * K,)
+    for t in range(T):
+        assert torch.equal(flat[t * K : (t + 1) * K], weights[t])
+
+
+# ---------------------------------------------------------------------------
+# 3.5 Attention, dense MLP and decoder layer
+# ---------------------------------------------------------------------------
+
+
+def _attention_case(kind, execution_mode, T):
+    x, cos, sin, past_k, past_v = _attention_inputs(kind, T)
+    weights = _attention_weights(kind)
+
+    def fn(h, c, s, pk, pv, *w):
+        return _gemma4_attention(h, c, s, *w, pk, pv)
+
+    _compare_mode(
+        execution_mode,
+        fn,
+        x,
+        cos,
+        sin,
+        past_k,
+        past_v,
+        *weights,
+        atol=ATTN_ATOL,
+        rtol=ATTN_RTOL,
+    )
+
+    got = fn(x, cos, sin, past_k, past_v, *weights)
+    assert got.shape == (T, HIDDEN)
+    assert got.dtype == torch.bfloat16
+    ref = _gemma4_attention(
+        *_f32((x, cos, sin, *weights, past_k, past_v)), attend=_manual_attention
+    )
+    assert (got.float() - ref).abs().max().item() <= ATTN_ATOL
+    if past_k is None:
+        # Causal prefill: the first token attends only to itself.
+        first = fn(x[:1], cos[:1], sin[:1], None, None, *weights)
+        _assert_close(got[:1], first, atol=ATTN_ATOL, rtol=ATTN_RTOL)
+    return cos, sin, weights
+
+
+@pytest.mark.parametrize(("execution_mode", "T"), _cases(eager=UPCAST_RMS_NORM))
+def test_G4_AT_001_sliding_window_attention(execution_mode, T):
+    """Sliding layer: 16 Q / 8 KV heads of 256, RoPE theta 1e4 over the full head."""
+    _, _, weights = _attention_case("sliding", execution_mode, T)
+    assert weights[2] is not None
+
+
+@pytest.mark.parametrize(("execution_mode", "T"), _cases(eager=UPCAST_RMS_NORM))
+def test_G4_AT_002_full_attention_k_eq_v(execution_mode, T):
+    """Full layer: 2 KV heads of 512, V from k_proj, proportional RoPE theta 1e6."""
+    cos, sin, weights = _attention_case("full", execution_mode, T)
+    assert weights[2] is None
+    # Proportional RoPE rotates 64 of the 256 frequency pairs; the rest pass through.
+    rotated = int(GLOBAL_PARTIAL_ROTARY * GLOBAL_HEAD_DIM // 2)
+    half = GLOBAL_HEAD_DIM // 2
+    still = torch.cat(
+        (torch.arange(rotated, half), torch.arange(half + rotated, 2 * half))
+    )
+    assert torch.all(cos[:, still] == 1)
+    assert torch.all(sin[:, still] == 0)
+
+
+@pytest.mark.parametrize(("execution_mode", "T"), _cases())
+def test_G4_MLP_001_dense_mlp(execution_mode, T):
+    """Gemma4TextMLP: 2816 -> 2112 -> 2816 with GELU tanh, beside the MoE."""
+    _seed()
+    x = _rms_norm(torch.randn(T, HIDDEN, dtype=torch.bfloat16))
+    weights = _dense_mlp_weights()
+
+    _compare_mode(execution_mode, _dense_mlp, x, *weights, atol=MLP_ATOL, rtol=MLP_RTOL)
+
+    got = _dense_mlp(x, *weights)
+    assert got.shape == (T, HIDDEN)
+    assert got.dtype == torch.bfloat16
+    ref = _dense_mlp(*_f32((x, *weights)))
+    assert (got.float() - ref).abs().max().item() <= MLP_ATOL
+
+
+def _decoder_case(kind, execution_mode, T):
+    _, cos, sin, past_k, past_v = _attention_inputs(kind, T)
+    _seed()
+    x = torch.randn(T, HIDDEN, dtype=torch.bfloat16)
+    weights = _decoder_weights(kind)
+
+    def fn(h, c, s, pk, pv, *w):
+        return _decoder_layer(h, c, s, pk, pv, *w)
+
+    _compare_mode(
+        execution_mode,
+        fn,
+        x,
+        cos,
+        sin,
+        past_k,
+        past_v,
+        *weights,
+        atol=DECODER_ATOL,
+        rtol=DECODER_RTOL,
+    )
+
+    got, ids = _decoder_layer(x, cos, sin, past_k, past_v, *weights, return_ids=True)
+    assert got.shape == (T, HIDDEN)
+    assert got.dtype == torch.bfloat16
+    _assert_no_nan_inf(got)
+    # BF16 and FP32 routers can pick different experts for near-tied tokens, so
+    # the FP32 reference follows the experts the BF16 run chose.
+    ref = _decoder_layer(
+        *_f32((x, cos, sin, past_k, past_v, *weights)),
+        attend=_manual_attention,
+        moe=_moe_fp32,
+        route_ids=ids,
+    )
+    assert (got.float() - ref).abs().max().item() <= DECODER_ATOL
+
+
+@pytest.mark.parametrize(
+    ("execution_mode", "T"),
+    _cases(eager=FLOAT_IDS_AS_INDEX_EAGER, compiled=FLOAT_IDS_AS_INDEX),
+)
+def test_G4_E2E_002_decoder_layer_sliding(execution_mode, T):
+    """Gemma4TextDecoderLayer with sliding-window attention, dense MLP and MoE."""
+    _decoder_case("sliding", execution_mode, T)
+
+
+@pytest.mark.parametrize(
+    ("execution_mode", "T"),
+    _cases(eager=FLOAT_IDS_AS_INDEX_EAGER, compiled=FLOAT_IDS_AS_INDEX),
+)
+def test_G4_E2E_003_decoder_layer_full(execution_mode, T):
+    """Gemma4TextDecoderLayer with full attention (K = V), dense MLP and MoE."""
+    _decoder_case("full", execution_mode, T)
+
+
+# ---------------------------------------------------------------------------
+# 3.6 Tile-32 strategy (Spyre implementation option)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "execution_mode", _modes(eager=FLOOR_DIVIDE, compiled=TILE_OFFSET_CUMSUM)
+)
+def test_G4_AB_003_pad_expert_segments_to_tile32(execution_mode):
+    counts = torch.tensor([0, 1, 31, 32, 33, 63, 64] + [0] * 121)
+
+    def fn(c):
+        tiles, padded, pad_off, tile_expert = _tile_metadata(c)
+        return tiles, padded, pad_off, tile_expert
+
+    _compare_mode(
+        execution_mode,
+        fn,
+        counts,
+        atol=EXACT_ATOL,
+        rtol=EXACT_RTOL,
+    )
+
+    tiles, padded, pad_off, tile_expert = fn(counts)
+    assert torch.all(padded % TILE == 0)
+    assert torch.all(padded >= counts)
+    assert pad_off.shape == (129,)
+    assert pad_off[-1].item() % TILE == 0
+    assert tile_expert.numel() == tiles.sum().item()
+    # Each expert owns a contiguous run of exactly ``tiles[e]`` tiles.
+    for e in range(EXPERTS):
+        positions = torch.where(tile_expert == e)[0]
+        assert positions.numel() == int(tiles[e])
+        if positions.numel():
+            assert torch.equal(positions, torch.arange(positions[0], positions[-1] + 1))
+
+
+@pytest.mark.parametrize(
+    "execution_mode",
+    _modes(
+        eager=_xfail(
+            NotImplementedError,
+            "#673: repeat_interleave.Tensor has no Spyre kernel",
+            r"aten::repeat_interleave\.Tensor",
+        ),
+        compiled=_xfail(
+            NotImplementedError,
+            "#673: repeat_interleave.Tensor has no Spyre kernel",
+            r"aten::repeat_interleave\.Tensor",
+        ),
+    ),
+)
+def test_G4_AB_008_exact_dst_pos_construction(execution_mode):
+    counts = torch.zeros(EXPERTS, dtype=torch.long)
+    counts[0] = 1
+    counts[1] = 31
+    counts[2] = 32
+    counts[3] = 33
+    counts[4] = 64
+    counts[5] = 17
+    group_off = torch.cat([torch.zeros(1, dtype=torch.long), counts.cumsum(0)])
+    _, padded, pad_off, _ = _tile_metadata(counts)
+
+    def fn(c, go, po):
+        return _dst_pos(c, go, po)
+
+    _compare_mode(
+        execution_mode,
+        fn,
+        counts,
+        group_off,
+        pad_off,
+        atol=EXACT_ATOL,
+        rtol=EXACT_RTOL,
+    )
+
+    dst = fn(counts, group_off, pad_off)
+    n_pad = int(pad_off[-1])
+    assert dst.shape == (int(counts.sum()),)
+    assert torch.unique(dst).numel() == dst.numel()
+    assert int(dst.min()) >= 0 and int(dst.max()) < n_pad
+    for e in range(EXPERTS):
+        c = int(counts[e])
+        if c:
+            s = int(group_off[e])
+            p = int(pad_off[e])
+            assert int(dst[s]) == p
+            assert torch.equal(dst[s : s + c], torch.arange(p, p + c))
+    assert n_pad % TILE == 0
+    assert torch.all(padded % TILE == 0)
+
+
+@pytest.mark.parametrize(
+    ("execution_mode", "T"),
+    _cases(
+        eager=_xfail(
+            NotImplementedError,
+            "#692: aten::_index_put_impl_ has no Spyre kernel",
+            "aten::_index_put_impl_",
+        ),
+        compiled=_xfail(
+            InductorError,
+            "#4327: restickify op_spec has 3 args",
+            "restickify op_spec has 3 args",
+        ),
+    ),
+)
+def test_G4_AB_006_pad_activations_weights_token_ids(execution_mode, T):
+    _seed()
+    hidden = torch.randn(T, HIDDEN, dtype=torch.bfloat16)
+    weights, expert_ids = _routing_weights(_router_logits(T))
+    routed, row_w, token, expert = _flatten_routing(hidden, weights, expert_ids)
+    perm, _, counts, group_off = _group(expert)
+    _, _, pad_off, _ = _tile_metadata(counts)
+    n_pad = int(pad_off[-1])
+    dst = _dst_pos(counts, group_off, pad_off)
+
+    def fn(x, w, t, d, n):
+        return _pad_columns(x, w, t, d, n, hidden.shape[0])
+
+    _compare_mode(
+        execution_mode,
+        fn,
+        routed[perm],
+        row_w[perm],
+        token[perm],
+        dst,
+        n_pad,
+        atol=BF16_ATOL,
+        rtol=BF16_RTOL,
+    )
+
+    xpad, wpad, tpad = fn(routed[perm], row_w[perm], token[perm], dst, n_pad)
+    assert torch.equal(xpad[dst], routed[perm])
+    assert torch.equal(wpad[dst], row_w[perm])
+    assert torch.equal(tpad[dst], token[perm])
+
+    # Expert segments start on pad_off, with padding rows between them.
+    active = counts > 0
+    assert torch.all(pad_off[:-1][active] % TILE == 0)
+    assert torch.equal(dst[group_off[:-1][active]], pad_off[:-1][active])
+
+    padding = torch.ones(n_pad, dtype=torch.bool)
+    padding[dst] = False
+    assert padding.any()
+    assert torch.count_nonzero(xpad[padding]) == 0
+    assert torch.count_nonzero(wpad[padding]) == 0
+    assert torch.all(tpad[padding] == T)
+
+
+@pytest.mark.parametrize(
+    ("execution_mode", "T"),
+    _cases(eager=GROUPED_MOE_EAGER, compiled=GROUPED_MOE_COMPILED, **SORT_AT_DECODE),
+)
+def test_G4_AB_007_per_tile_static_loop_scatter_add(execution_mode, T):
+    _seed()
+    hidden = torch.randn(T, HIDDEN, dtype=torch.bfloat16)
+    weights, expert_ids = _routing_weights(_router_logits(T))
+    used = torch.unique(expert_ids).tolist()
+    bank = _expert_weights(used)
+
+    def fn(x, ids, w):
+        return _grouped_moe(x, ids, w, bank)
+
+    _compare_mode(
+        execution_mode,
+        fn,
+        hidden,
+        expert_ids,
+        weights,
+        atol=BF16_ATOL,
+        rtol=BF16_RTOL,
+    )
+
+    got, meta = fn(hidden, expert_ids, weights)
+    ref = _moe_reference(hidden, expert_ids, weights, bank)
+    assert got.shape == (T, HIDDEN)
+    assert got.dtype == torch.bfloat16
+    _assert_close(got, ref)
+    _assert_no_nan_inf(got)
+
+    perm, counts, group_off, pad_off, tile_expert, dst = meta
+    assert perm.numel() == T * K8
+    assert group_off.shape == (129,)
+    assert pad_off[-1].item() % TILE == 0
+    assert tile_expert.numel() == pad_off[-1].item() // TILE
+    assert dst.numel() == T * K8
+
+
+@pytest.mark.parametrize(
+    "execution_mode", _modes(eager=INDEX_ADD_DUPLICATES, compiled=INDEX_ADD_DUPLICATES)
+)
+def test_G4_BE_002_fixed_tile_sink_row_scatter_reduce(execution_mode):
+    """Scatter-reduce one fixed 32-row tile into destination rows."""
+    _seed()
+    T = 8
+    seg_out = torch.randn(TILE, HIDDEN, dtype=torch.bfloat16)
+    dst = torch.tensor(
+        [0, 0, 1, 2, 2, 2, T, T] + [3] * 24,
+        dtype=torch.long,
+    )
+
+    def fn(seg, indices):
+        out = torch.zeros(T + 1, HIDDEN, dtype=seg.dtype, device=seg.device)
+        return out.index_add(0, indices, seg)
+
+    _compare_mode(
+        execution_mode,
+        fn,
+        seg_out,
+        dst,
+        atol=BF16_ATOL,
+        rtol=BF16_RTOL,
+    )
+
+    out = fn(seg_out, dst)
+    # Accumulate in FP32 and cast once, as index_add does not round per row.
+    ref = torch.zeros(T + 1, HIDDEN, dtype=torch.float32)
+    for i, d in enumerate(dst.tolist()):
+        ref[d] += seg_out[i].float()
+    _assert_close(out, ref.to(out.dtype))
+    ref_sink = seg_out[6].float() + seg_out[7].float()
+    _assert_close(
+        out[-1].unsqueeze(0),
+        ref_sink.unsqueeze(0).to(out.dtype),
+    )
