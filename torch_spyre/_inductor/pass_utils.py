@@ -3302,6 +3302,85 @@ def restickify_dense_stl_to_sparse(
     return SpyreTensorLayout(sizes, strides, in_host.dtype, dim_order)
 
 
+def dense_relocation_serves_read(
+    stl: SpyreTensorLayout,
+    in_host: FixedLayout,
+    dep: MemoryDep,
+    indirect_sizes: "dict[sympy.Symbol, int] | None" = None,
+    *,
+    op: "Operation | None" = None,
+) -> "SpyreTensorLayout | None":
+    """A dense layout of ``in_host`` with the stick moved to another real dim, when
+    it can serve the read of ``dep`` that ``stl`` cannot, else ``None``.
+
+    A reshape that cuts the stick dim (``[4, 512, 20, 20]`` read as
+    ``[4, 4, 128, 400]``) is legal once a dim the reshape leaves alone carries the
+    stick: the cut dims are then off the stick, where cutting a row is plain
+    indexing. This is the stick relocation layout propagation already does for
+    most ops, and it keeps the tensor dense, so it is tried before the sparse layout
+    (``sparse_target_for_unservable_read``), which costs ``elems_per_stick`` times the
+    memory. Larger dims are tried first; the first that serves the read wins.
+    """
+    if (
+        stl.device_dtype not in RESTICKIFY_SUPPORTED_DEVICE_DTYPES
+        or stl.element_arrangement != ElementArrangement.STANDARD
+        or is_sparse_stl(stl)
+        or try_device_coordinates(stl, dep, indirect_sizes, op=op) is not None
+    ):
+        return None
+    sizes = [int(concretize_expr(v)) for v in in_host.size]
+    strides = [int(concretize_expr(v)) for v in in_host.stride]
+    by_stride = sorted(range(len(sizes)), key=lambda d: -strides[d])
+    current_stick = by_stride[-1]
+    candidates = [d for d in range(len(sizes)) if d != current_stick and sizes[d] > 1]
+    for stick in sorted(candidates, key=lambda d: -sizes[d]):
+        order = [d for d in by_stride if d != stick] + [stick]
+        target = _former_stick_dim_outermost(
+            SpyreTensorLayout(sizes, strides, in_host.dtype, order),
+            sizes[current_stick],
+            strides[current_stick],
+        )
+        if try_device_coordinates(target, dep, indirect_sizes, op=op) is not None:
+            return target
+    return None
+
+
+def _former_stick_dim_outermost(
+    stl: SpyreTensorLayout, host_size: int, host_stride: int
+) -> SpyreTensorLayout:
+    """``stl`` with the device dim of the former stick host dim moved outermost.
+
+    The restickify into ``stl`` pads that dim to whole sticks
+    (``_pad_restickify_output``). Outermost, the padding sits at the end of the
+    buffer; inside another dim it falls between that dim's slices, where a read
+    that walks the two dims as one (a merge) picks it up as data.
+    """
+    size, smap = list(stl.device_size), list(stl.stride_map)
+    j = next(
+        (
+            k
+            for k in range(len(size) - 1)
+            if smap[k] == host_stride and size[k] == host_size
+        ),
+        None,
+    )
+    if j is None or j == 0:
+        return stl
+    perm = [j] + [k for k in range(len(size)) if k != j]
+    where = {old: new for new, old in enumerate(perm)}
+    valid = {
+        tuple(sorted(where[k] for k in dims)): n
+        for dims, n in dict(stl.valid_elements).items()
+    }
+    return SpyreTensorLayout(
+        [size[k] for k in perm],
+        [smap[k] for k in perm],
+        stl.device_dtype,
+        valid,
+        stl.element_arrangement,
+    )
+
+
 def sparse_target_for_unservable_read(
     stl: SpyreTensorLayout,
     in_host: FixedLayout,
@@ -3373,11 +3452,11 @@ def compute_restickify_needed(
         # checking that it is stick_compatible with the output. That is safe only
         # because _default_pointwise_layout and _reduction_layout return a sparse
         # output early. Return the target only for an output it can feed.
-        # TODO(#5966): before the sparse layout, try a dense relocation of the
-        # stick: the first layout with the stick on another real dim (larger
-        # dims first, the former stick dim outermost) on which
-        # try_device_coordinates serves this read. Keep the sparse layout below
-        # as the fallback for a read with no such dim, such as a flatten to 1-D.
+        # Before the sparse layout, which costs elems_per_stick times the memory,
+        # try a dense layout with the stick on a dim the read leaves alone.
+        dense = dense_relocation_serves_read(in_stl, in_host, in_dep, ind_sizes, op=op)
+        if dense is not None:
+            return True, dense
         sparse = sparse_target_for_unservable_read(
             in_stl, in_host, in_dep, ind_sizes, op=op
         )

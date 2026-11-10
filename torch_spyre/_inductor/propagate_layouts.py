@@ -89,6 +89,7 @@ from .pass_utils import (
     collapse_valid_elements,
     compute_restickify_target_layout,
     concretize_expr,
+    dense_relocation_serves_read,
     expand_sparse,
     find_matmul_generated_var,
     find_reduction_var,
@@ -822,9 +823,13 @@ def _reduction_layout_from_stl(
 
     x_dev_coords = try_device_coordinates(stl, dep, None)
     if x_dev_coords is None:
-        # TODO(#5966): as in _default_pointwise_layout, try a dense relocation of
-        # the stick before returning the sparse output, and derive the output
-        # candidates below from the relocated layout.
+        # The stick moved to another real dim serves the read densely; derive the
+        # output from the read on that layout, as for any other input layout.
+        relocated = dense_relocation_serves_read(stl, in_layout, dep)
+        if relocated is not None:
+            stl = relocated
+            x_dev_coords = try_device_coordinates(stl, dep, None)
+    if x_dev_coords is None:
         if sparse_target_for_unservable_read(stl, in_layout, dep) is not None:
             # As for a pointwise op below.
             # TODO(#5872): return the sparse output as one candidate next to the
@@ -971,11 +976,13 @@ def _default_pointwise_layout(
     c_stride = [concretize_expr(s) for s in output.stride]
     in_device_coords = try_device_coordinates(stl, dep, None)
     if in_device_coords is None:
-        # TODO(#5966): before returning the sparse output, try a dense
-        # relocation of the stick (see compute_restickify_needed) and derive the
-        # output candidates below from the relocated layout, as for any other
-        # input layout. The sparse output stays as the fallback for a read with
-        # no dim to move the stick to.
+        # As in _reduction_layout: a dense relocation of the stick serves the
+        # read, so the normal candidates below are derived from it.
+        relocated = dense_relocation_serves_read(stl, in_layout, dep)
+        if relocated is not None:
+            stl = relocated
+            in_device_coords = try_device_coordinates(stl, dep, None)
+    if in_device_coords is None:
         if sparse_target_for_unservable_read(stl, in_layout, dep) is not None:
             # A read the input's layout cannot serve (flattening [8, 65] into
             # [520] splits a stick): compute_restickify_needed moves the input to
