@@ -62,10 +62,36 @@ def _kernel(recorded, from_index, *, consumed_after=1, consumed_before=0):
     return kernel
 
 
-def test_equal_advances_pass_and_return_the_stored_one():
+def test_equal_advances_return_the_index_based_one():
+    """The index is the source (stage 7.2c): the two builders can write the same
+    value differently, and the one that is returned is the index's."""
+    recorded = sympy.floor(8192 * SYM)
+    # The same value written differently: sympy does not fold the "+ 0".
+    from_index = sympy.Add(recorded, sympy.Integer(0), evaluate=False)
+    assert recorded != from_index
+    assert sympy.simplify(recorded - from_index) == 0
+    kernel = _kernel(recorded, (from_index, DEP))
+    assert kernel._checked_tile_advance(None, True, "buf") is from_index
+
+
+def test_an_index_advance_of_zero_is_no_advance_not_a_zero():
+    """Consumers test ``device_tile_advance_expr is not None``, so "no advance" must
+    stay None; a zero expression would make the access look like an advancing one."""
+    kernel = _kernel(None, (sympy.S.Zero, DEP))
+    assert kernel._checked_tile_advance(None, True, "buf") is None
+
+
+def test_a_stored_zero_against_a_zero_index_advance_is_no_advance():
+    kernel = _kernel(sympy.S.Zero, (sympy.S.Zero, DEP))
+    assert kernel._checked_tile_advance(None, True, "buf") is None
+
+
+def test_an_op_with_no_index_based_value_keeps_the_stored_advance():
+    """An op with no hinted loop variable (span-overflow, the allocator) has no
+    index-based value; its stored advance is returned as it is."""
     expr = sympy.floor(8192 * SYM)
-    kernel = _kernel(expr, (expr, DEP))
-    assert kernel._checked_tile_advance(None, True, "buf") == expr
+    kernel = _kernel(expr, None)
+    assert kernel._checked_tile_advance(None, True, "buf") is expr
 
 
 def test_a_differing_advance_raises_and_names_both_values():
@@ -82,13 +108,6 @@ def test_no_stored_advance_against_an_advancing_index_raises():
     kernel = _kernel(None, (sympy.floor(4096 * SYM), DEP))
     with pytest.raises(LoopAdvanceMismatch):
         kernel._checked_tile_advance(None, True, "buf")
-
-
-def test_no_index_based_value_means_nothing_to_compare():
-    """An op with no hinted loop variable (span-overflow, allocator) keeps its record."""
-    expr = sympy.floor(8192 * SYM)
-    kernel = _kernel(expr, None)
-    assert kernel._checked_tile_advance(None, True, "buf") == expr
 
 
 def test_a_repeat_load_consumes_no_match_and_is_not_compared():

@@ -894,13 +894,15 @@ class SpyreKernel(Kernel[CSEVariable]):
     def _checked_tile_advance(
         self, tensor: TensorAccess, is_input: bool, name: str
     ) -> "sympy.Expr | None":
-        """The record-based advance, checked against the index-based one.
+        """The advance, read from the index and checked against the stored record.
 
-        Until the stored per-read fields are deleted (stage 7.4) span-overflow
-        and the allocator still write them, and they have no loop variable. An op
-        with hinted loop variables has both; they must agree, and a difference is
-        a compiler bug (a pass edited one source and not the other), so it raises
-        instead of emitting a kernel that advances by the wrong amount.
+        An op that lists a loop variable in its ``dim_hints`` gets the advance from
+        the INDEX: each level's variable's coefficient in ``dep.index``. Until the
+        stored per-read fields are deleted (stage 7.4) the record is still built, and
+        the two must agree: a difference is a compiler bug (a pass edited one source
+        and not the other), so it raises instead of emitting a kernel that advances
+        by the wrong amount. Every other op (span-overflow and the allocator's
+        tiling have no loop variable) keeps the record.
         """
         seen_before = self._general_tile_advance_seen.get(name, 0)
         recorded = self._general_tile_advance(tensor, is_input, name)
@@ -921,7 +923,8 @@ class SpyreKernel(Kernel[CSEVariable]):
                 f"{name}: the stored record gives {theirs} and the index gives "
                 f"{from_index} (index {dep.index})"
             )
-        return recorded
+        # "No advance" is None, not a zero: consumers test ``is not None``.
+        return None if from_index == 0 else from_index
 
     def create_tensor_arg(
         self,
