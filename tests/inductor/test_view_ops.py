@@ -241,7 +241,10 @@ class TestReshapeUnaligned:
     @pytest.mark.parametrize("consumer", CONSUMERS)
     def test_reshape_unaligned_4d_to_3d_129(self, execution_mode, dtype, consumer):
         """[1,32,8,129]→reshape(1,32,1032)→[1,32,1032]. Inner 1032; 1032%64=8. Both consumers."""
-        pytest.xfail()
+        pytest.xfail(
+            "known failure across all dtypes and consumers (reshape across unaligned inner dim reads wrong values); "
+            "tracked in https://github.com/torch-spyre/torch-spyre/issues/5320"
+        )
         x = cached_randn(
             (1, 32, 8, 129),
             dtype=dtype,
@@ -337,7 +340,10 @@ class TestReshapeSize1:
     def test_reshape_4d_two_size1_to_2d(self, execution_mode, dtype, consumer):
         """[1,8,1,256]→reshape(8,256)→[8,256]. Inner unchanged 256→256. Both consumers."""
         if consumer == "sum_last" and dtype == torch.bfloat16:
-            pytest.xfail()
+            pytest.xfail(
+                "known failure for sum_last/bfloat16 (numerical mismatch vs CPU beyond tolerance); "
+                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5321"
+            )
         x = cached_randn(
             (1, 8, 1, 256),
             dtype=dtype,
@@ -351,7 +357,10 @@ class TestReshapeSize1:
     def test_reshape_4d_size1_trailing_to_3d(self, execution_mode, dtype, consumer):
         """[2,8,32,1]→reshape(2,8,32)→[2,8,32]. Inner changes 1→32. Both consumers."""
         if consumer == "sum_last" and dtype == torch.float16:
-            pytest.xfail()
+            pytest.xfail(
+                "known failure for sum_last/float16 (numerical mismatch vs CPU beyond tolerance); "
+                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5321"
+            )
         x = cached_randn(
             (2, 8, 32, 1),
             dtype=dtype,
@@ -749,7 +758,10 @@ class TestSqueezeSize1:
     def test_squeeze_5d_size1_inner(self, execution_mode, dtype, consumer):
         """[2,1,32,1,256]→squeeze()→[2,32,256]. Inner 256 unchanged. Both consumers."""
         if consumer == "sum_last" and dtype == torch.float16:
-            pytest.xfail()
+            pytest.xfail(
+                "known failure for sum_last/float16 (numerical mismatch vs CPU beyond tolerance); "
+                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5374"
+            )
         x = cached_randn(
             (2, 1, 32, 1, 256),
             dtype=dtype,
@@ -763,7 +775,10 @@ class TestSqueezeSize1:
     def test_squeeze_6d_size1_to_3d(self, execution_mode, dtype, consumer):
         """[1,1,4,1,8,256]→squeeze()→[4,8,256]. Inner 256 unchanged. Both consumers."""
         if consumer == "sum_last" and dtype in (torch.float16, torch.bfloat16):
-            pytest.xfail()
+            pytest.xfail(
+                "known failure for sum_last/float16 and bfloat16 (numerical mismatch vs CPU beyond tolerance); float16: #5301, bfloat16: #5374; "
+                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5301, https://github.com/torch-spyre/torch-spyre/issues/5374"
+            )
         x = cached_randn(
             (1, 1, 4, 1, 8, 256),
             dtype=dtype,
@@ -777,7 +792,10 @@ class TestSqueezeSize1:
     def test_squeeze_chain_multi_then_reshape(self, execution_mode, dtype, consumer):
         """[1,8,1,256]→squeeze(0).squeeze(1).reshape(-1)→[2048]. Both consumers."""
         if consumer == "sum_last" and dtype == torch.bfloat16:
-            pytest.xfail()
+            pytest.xfail(
+                "known failure for sum_last/bfloat16 (numerical mismatch vs CPU beyond tolerance); "
+                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5374"
+            )
         x = cached_randn(
             (1, 8, 1, 256),
             dtype=dtype,
@@ -913,7 +931,10 @@ class TestUnsqueezeUnaligned:
     def test_unsqueeze_4d_to_5d_gqa_unaligned_65(self, execution_mode, dtype, consumer):
         """[2,8,32,65]→unsqueeze(2)→[2,8,1,32,65]. Non-trailing; inner 65 unchanged. Both consumers."""
         if consumer == "sum_last" and dtype == torch.float16:
-            pytest.xfail()
+            pytest.xfail(
+                "known failure for sum_last/float16 (numerical mismatch vs CPU beyond tolerance); eager: #5317, compiled: #5318; "
+                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5317, https://github.com/torch-spyre/torch-spyre/issues/5318"
+            )
         if consumer == "sum_last" and dtype == torch.float32:
             pytest.xfail(
                 "known failure for sum_last/float32 (SubprocException); "
@@ -1041,7 +1062,10 @@ class TestUnsqueezeSize1:
     def test_unsqueeze_5d_to_6d_aligned(self, execution_mode, dtype, consumer):
         """[1,2,4,8,256]→unsqueeze(3)→[1,2,4,1,8,256]. Non-trailing (dim 3); inner 256 unchanged. Both consumers."""
         if consumer == "sum_last" and dtype in (torch.float16, torch.bfloat16):
-            pytest.xfail()
+            pytest.xfail(
+                "known failure for sum_last/float16 and bfloat16 (numerical mismatch vs CPU beyond tolerance); "
+                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5318"
+            )
         x = cached_randn(
             (1, 2, 4, 8, 256),
             dtype=dtype,
@@ -1497,7 +1521,10 @@ class TestTransposeUnaligned:
     def test_transpose_2d_unaligned_inner_swap(self, execution_mode, dtype, consumer):
         """[65,256]→transpose(0,1)→[256,65]. Inner changes 256→65; 65%64=1. Both consumers."""
         if dtype == torch.float16:
-            pytest.xfail()
+            pytest.xfail(
+                "known failure for float16 (sum_last: numerical mismatch vs CPU beyond tolerance); "
+                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5319"
+            )
         x = cached_randn(
             (65, 256),
             dtype=dtype,
@@ -1511,7 +1538,10 @@ class TestTransposeUnaligned:
     def test_transpose_3d_last_two_unaligned(self, execution_mode, dtype, consumer):
         """[4,32,70]→transpose(1,2)→[4,70,32]. Inner changes 70→32; input inner 70 unaligned. Both consumers."""
         if dtype in (torch.float16, torch.bfloat16):
-            pytest.xfail()
+            pytest.xfail(
+                "known failure for float16 and bfloat16 (sum_last: numerical mismatch vs CPU beyond tolerance); "
+                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5319"
+            )
         x = cached_randn(
             (4, 32, 70),
             dtype=dtype,
@@ -1525,7 +1555,10 @@ class TestTransposeUnaligned:
     def test_transpose_4d_key_unaligned_65(self, execution_mode, dtype, consumer):
         """[1,16,32,65]→transpose(2,3)→[1,16,65,32]. Inner changes 65→32. Both consumers."""
         if dtype in (torch.float16, torch.bfloat16):
-            pytest.xfail()
+            pytest.xfail(
+                "known failure for float16 and bfloat16 (sum_last: numerical mismatch vs CPU beyond tolerance); "
+                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5319"
+            )
         x = cached_randn(
             (1, 16, 32, 65), dtype=dtype, differentiation=f"transpose_4d_key_65_{dtype}"
         )
@@ -1539,7 +1572,10 @@ class TestTransposeUnaligned:
     ):
         """[2,32,8,70]→transpose(1,2)→[2,8,32,70]. Inner 70 unchanged; 70%64=6. Both consumers."""
         if dtype == torch.float16:
-            pytest.xfail()
+            pytest.xfail(
+                "known failure for float16 (sum_last: numerical mismatch vs CPU beyond tolerance); "
+                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5319"
+            )
         if dtype == torch.float32:
             pytest.xfail(
                 "known failure for float32; "
@@ -1558,7 +1594,10 @@ class TestTransposeUnaligned:
     def test_transpose_5d_unaligned(self, execution_mode, dtype, consumer):
         """[1,8,1,32,65]→transpose(1,3)→[1,32,1,8,65]. Inner 65 unchanged. Both consumers."""
         if dtype == torch.float16:
-            pytest.xfail()
+            pytest.xfail(
+                "known failure for float16 (sum_last: numerical mismatch vs CPU beyond tolerance); "
+                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5319"
+            )
         if dtype == torch.float32:
             pytest.xfail(
                 "known failure for float32; "
@@ -1688,7 +1727,10 @@ class TestTUnaligned:
     def test_t_2d_unaligned_inner_to_outer(self, execution_mode, dtype, consumer):
         """[65,256].t()→[256,65]. New inner 65; 65%64=1. Both consumers."""
         if consumer == "sum_last" and dtype == torch.float16:
-            pytest.xfail()
+            pytest.xfail(
+                "known failure for sum_last/float16 (numerical mismatch vs CPU beyond tolerance); "
+                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5302"
+            )
         x = cached_randn(
             (65, 256),
             dtype=dtype,
@@ -1700,7 +1742,10 @@ class TestTUnaligned:
     def test_t_2d_both_unaligned(self, execution_mode, dtype, consumer):
         """[33,70].t()→[70,33]. New inner 33 < 64; both dims unaligned. Both consumers."""
         if consumer == "sum_last" and dtype == torch.float16:
-            pytest.xfail()
+            pytest.xfail(
+                "known failure for sum_last/float16 (numerical mismatch vs CPU beyond tolerance); "
+                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5302"
+            )
         x = cached_randn(
             (33, 70), dtype=dtype, differentiation=f"t_2d_both_unaligned_{dtype}"
         )
@@ -1710,7 +1755,10 @@ class TestTUnaligned:
     def test_t_2d_aligned_swap(self, execution_mode, dtype, consumer):
         """[128,64].t()→[64,128]. New inner 128; both aligned; inner changes. Both consumers."""
         if consumer == "sum_last" and dtype in (torch.float16, torch.bfloat16):
-            pytest.xfail()
+            pytest.xfail(
+                "known failure for sum_last/float16 and bfloat16 (numerical mismatch vs CPU beyond tolerance); "
+                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5302"
+            )
         x = cached_randn(
             (128, 64), dtype=dtype, differentiation=f"t_2d_aligned_swap_{dtype}"
         )
@@ -2012,7 +2060,10 @@ class TestCatUnaligned:
     def test_cat_2d_trailing_unaligned(self, execution_mode, dtype, consumer):
         """[32,33] + [32,33] → cat(dim=-1) → [32,66]. Output inner 66 unaligned. Both consumers."""
         if consumer == "sum_last":
-            pytest.xfail()
+            pytest.xfail(
+                "known failure for sum_last (numerical mismatch vs CPU beyond tolerance); "
+                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5300"
+            )
         if dtype == torch.float32:
             pytest.xfail(
                 "known failure for float32 (no mechanism to resolve stick incompatibility); "
@@ -2038,7 +2089,10 @@ class TestCatUnaligned:
     @pytest.mark.parametrize("consumer", CONSUMERS)
     def test_cat_3d_seq_dim_unaligned(self, execution_mode, dtype, consumer):
         """[1,33,256] + [1,33,256] → cat(dim=1) → [1,66,256]. Seq dim unaligned; inner 256 unchanged. Both consumers."""
-        pytest.xfail()
+        pytest.xfail(
+            "known failure (sum_last: numerical mismatch vs CPU beyond tolerance); "
+            "tracked in https://github.com/torch-spyre/torch-spyre/issues/5300"
+        )
         a = cached_randn(
             (1, 33, 256), dtype=dtype, differentiation=f"cat_3d_seq_unaligned_a_{dtype}"
         )
@@ -2330,7 +2384,10 @@ class TestSelectUnaligned:
     def test_select_4d_unaligned_inner(self, execution_mode, dtype, consumer):
         """[1,16,32,65] → select(1,0) → [1,32,65]. Inner 65 unchanged; 65%64=1. Both consumers."""
         if consumer == "sum_last" and dtype == torch.float16:
-            pytest.xfail()
+            pytest.xfail(
+                "known failure for sum_last/float16 (numerical mismatch vs CPU beyond tolerance); "
+                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5322"
+            )
         if consumer == "sum_last" and dtype == torch.float32:
             pytest.xfail(
                 "known failure for sum_last/float32 (SubprocException); "
@@ -2381,7 +2438,10 @@ class TestSelectSize1:
     def test_select_5d_size1_dim(self, execution_mode, dtype, consumer):
         """[1,8,1,32,256] → select(2,0) → [1,8,32,256]. Select the size-1 dim; inner 256 unchanged. Both consumers."""
         if consumer == "sum_last" and dtype in (torch.float16, torch.bfloat16):
-            pytest.xfail()
+            pytest.xfail(
+                "known failure for sum_last/float16 and bfloat16 (numerical mismatch vs CPU beyond tolerance); "
+                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5322"
+            )
         x = cached_randn(
             (1, 8, 1, 32, 256),
             dtype=dtype,
@@ -2486,7 +2546,10 @@ class TestNarrowUnaligned:
     def test_narrow_3d_inner_unaligned(self, execution_mode, dtype, consumer):
         """[1,32,128]→narrow(2,0,70)→[1,32,70]. Inner changes 128→70; 70%64=6. Both consumers."""
         if consumer == "sum_last" and dtype == torch.float16:
-            pytest.xfail()
+            pytest.xfail(
+                "known failure for sum_last/float16 (numerical mismatch vs CPU beyond tolerance); "
+                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5377"
+            )
         if consumer == "sum_last" and dtype == torch.float32:
             pytest.xfail(
                 "known failure for sum_last/float32 (SubprocException); "
@@ -2505,7 +2568,10 @@ class TestNarrowUnaligned:
     def test_narrow_4d_head_dim_unaligned(self, execution_mode, dtype, consumer):
         """[1,16,32,256]→narrow(3,0,65)→[1,16,32,65]. Inner changes 256→65. Both consumers."""
         if consumer == "sum_last" and dtype in (torch.float16, torch.bfloat16):
-            pytest.xfail()
+            pytest.xfail(
+                "known failure for sum_last/float16 and bfloat16 (numerical mismatch vs CPU beyond tolerance); float16: #5299, bfloat16: #5377; "
+                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5299, https://github.com/torch-spyre/torch-spyre/issues/5377"
+            )
         if consumer == "sum_last" and dtype == torch.float32:
             pytest.xfail(
                 "known failure for sum_last/float32 (SubprocException); "
@@ -2835,7 +2901,10 @@ class TestSplitUnaligned:
     def test_split_5d_unaligned_non_trailing(self, execution_mode, dtype, consumer):
         """[1,2,4,8,256]→split(2,dim=2)→[1,2,2,8,256] × 2. Non-trailing split; inner 256 unchanged. Both consumers."""
         if consumer == "sum_last" and dtype in (torch.float16, torch.bfloat16):
-            pytest.xfail()
+            pytest.xfail(
+                "known failure for sum_last/float16 and bfloat16 (numerical mismatch vs CPU beyond tolerance); "
+                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5378"
+            )
         if consumer == "sum_last" and dtype == torch.float32:
             pytest.xfail(
                 "known failure (no mechanism to resolve stick incompatibility); "
@@ -2893,7 +2962,10 @@ class TestSplitSize1:
     def test_split_4d_size1_dim(self, execution_mode, dtype, consumer):
         """[1,8,32,256]→split(1,dim=0)→([1,8,32,256],). Single chunk. Both consumers."""
         if consumer == "sum_last" and dtype in (torch.float16, torch.bfloat16):
-            pytest.xfail()
+            pytest.xfail(
+                "known failure for sum_last/float16 and bfloat16 (numerical mismatch vs CPU beyond tolerance); "
+                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5378"
+            )
         x = cached_randn(
             (1, 8, 32, 256), dtype=dtype, differentiation=f"split_4d_size1_dim_{dtype}"
         )
@@ -2907,7 +2979,10 @@ class TestSplitSize1:
     def test_split_5d_size1_head_chunks(self, execution_mode, dtype, consumer):
         """[1,8,1,32,256]→split(4,dim=1)→[1,4,1,32,256] × 2. GQA-like chunks; inner 256 unchanged. Both consumers."""
         if consumer == "sum_last" and dtype in (torch.float16, torch.bfloat16):
-            pytest.xfail()
+            pytest.xfail(
+                "known failure for sum_last/float16 and bfloat16 (numerical mismatch vs CPU beyond tolerance); "
+                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5378"
+            )
         if consumer == "sum_last" and dtype == torch.float32:
             pytest.xfail(
                 "known failure (no mechanism to resolve stick incompatibility); "
