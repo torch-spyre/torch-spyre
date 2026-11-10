@@ -2238,8 +2238,9 @@ def log2(arg):
     return math.log2(arg)
 
 
-def _is_sym(*args) -> bool:
-    return any(isinstance(a, sympy.Basic) for a in args)
+def _is_sym(*vals) -> bool:
+    """True if any value is a sympy expression rather than a number."""
+    return any(isinstance(v, sympy.Basic) and not v.is_Number for v in vals)
 
 
 def eq(arg1, arg2):

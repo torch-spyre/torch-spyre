@@ -1062,11 +1062,6 @@ def _op_cols(o) -> float:
     return max((a.logical[-1] for a in o.args if a.logical), default=0)
 
 
-def _is_sym(*vals) -> bool:
-    """True if any value is a sympy expression rather than a number."""
-    return any(isinstance(v, sympy.Basic) and not v.is_number for v in vals)
-
-
 def _select(flag, if_true, if_false):
     """``if_true if flag else if_false`` for a flag that may be a condition over
     the solver's symbols -- ``OpFeatures.tiles_output_dim`` under a candidate
