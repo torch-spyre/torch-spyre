@@ -938,6 +938,138 @@ def test_both_matmul_models_charge_a_stacked_output_loop_once(monkeypatch):
     )
 
 
+def test_split_preferences_price_one_call_in_either_output_form(monkeypatch):
+    """Review of #6120 (B2): the preferences are charged once per invocation, so
+    they must be priced on the geometry of one call. A 128-trip decode loop
+    (T=8, N=2048, K=512, split n=32) re-writing one ``[T, N]`` buffer and the same
+    loop writing its slice of a stacked ``[128, T, N]`` buffer run the same body.
+    Priced on the buffer, the stacked form saw B = 128, lost the decode-scope
+    exemption from the M-tile underfill preference, and cost 2,592.67 vs
+    6,432.67 us."""
+    from torch_spyre._inductor import cost_model as cm
+    from torch_spyre._inductor import work_division as wd
+
+    monkeypatch.setattr(cm.config, "sencores", 32)
+    E, T, N, K = 128, 8, 2048, 512
+    m, n, r0 = sympy.symbols("m n r0", integer=True)
+    common = dict(
+        k=K,
+        trips=[E],
+        tiled_out=[[]],
+        hints=[_hint(u0, sympy.Integer(E))],
+        read_indices=[K * m + r0, N * K * u0 + N * r0 + n],
+        it_space={m: T, n: N, r0: K},
+        work_slices={m: 1, n: 32, r0: 1},
+    )
+    stationary = _looped_matmul_features(
+        monkeypatch, size=[T, N], write_index=N * m + n, **common
+    )
+    stacked = _looped_matmul_features(
+        monkeypatch, size=[E, T, N], write_index=T * N * u0 + N * m + n, **common
+    )
+    axes = [cm._matmul_axes_for_split_cost(f) for f in (stationary, stacked)]
+    assert [(a[0][0], a[4]) for a in axes] == [(1, True), (E, True)]
+    one_call = wd._matmul_split_preference_us(
+        (1, 1), (T, 1), (N, 32), (K, 1), 32, shared_weight=True,
+        include_batch_split=False,
+    )  # fmt: skip
+    assert one_call > 0
+    for feature, feature_axes in zip((stationary, stacked), axes):
+        assert cm._matmul_split_preference_us(feature, feature_axes) == (
+            pytest.approx(E * one_call)
+        )
+    assert _allocator_compute_ns(stationary) == pytest.approx(
+        _allocator_compute_ns(stacked), rel=1e-12
+    )
+
+
+def test_split_preferences_share_the_weight_of_one_call(monkeypatch):
+    """Review of #6120 (B2), sharing classifier: with an unbroadcast weight, a
+    stationary ``[T, N]`` output is classed shared (B = 1) and the stacked
+    ``[E, T, N]`` one unshared (B = E), so K > N with a split N took the
+    shared-weight branch for one and the true-BMM branch for the other. One call is
+    a 2D matmul in both, so both take the shared-weight branch."""
+    from torch_spyre._inductor import cost_model as cm
+    from torch_spyre._inductor import work_division as wd
+    from torch_spyre._inductor.cost_model import ArgTraffic, OpFeatures
+
+    monkeypatch.setattr(cm.config, "sencores", 32)
+    E, T, N, K, m, n = 8, 64, 128, 512, 4, 8
+
+    def record(out_elems):
+        return OpFeatures(
+            name="mm",
+            is_reduction=True,
+            dtype_bytes=2,
+            args=[ArgTraffic("arg1", "input", False, K * N)],
+            is_matmul=True,
+            out_elems=out_elems,
+            cores=m * n,
+            loop_trip=E,
+            matmul_macs=E * T * N * K,
+            matmul_rows_per_core=T // m,
+            matmul_cols_per_core=N // n,
+            matmul_m_split=m,
+            matmul_n_split=n,
+            matmul_a_bytes=T * K * 2,
+            matmul_b_bytes=K * N * 2,
+        )
+
+    stationary, stacked = record(T * N), record(E * T * N)
+    axes = [cm._matmul_axes_for_split_cost(f) for f in (stationary, stacked)]
+    assert [(a[0][0], a[4]) for a in axes] == [(1, True), (E, False)]
+    one_call = wd._matmul_split_preference_us(
+        (1, 1), (T, m), (N, n), (K, 1), 32, shared_weight=True,
+        include_batch_split=False,
+    )  # fmt: skip
+    assert one_call != wd._matmul_split_preference_us(
+        (1, 1), (T, m), (N, n), (K, 1), 32, shared_weight=False,
+        include_batch_split=False,
+    )  # fmt: skip
+    for feature, feature_axes in zip((stationary, stacked), axes):
+        assert cm._matmul_split_preference_us(feature, feature_axes) == (
+            pytest.approx(E * one_call)
+        )
+
+
+def test_an_uneven_call_batch_keeps_the_buffer_batch(monkeypatch):
+    """A buffer batch that is not a whole number of calls is not rounded to a
+    made-up batch: a ``[6, T, N]`` buffer over 4 trips (1.5 per call) keeps
+    ``B = 6`` and its sharing flag for the preferences."""
+    from torch_spyre._inductor import cost_model as cm
+    from torch_spyre._inductor import work_division as wd
+    from torch_spyre._inductor.cost_model import ArgTraffic, OpFeatures
+
+    monkeypatch.setattr(cm.config, "sencores", 32)
+    E, T, N, K, m, n = 4, 64, 128, 512, 4, 8
+    record = OpFeatures(
+        name="mm",
+        is_reduction=True,
+        dtype_bytes=2,
+        args=[ArgTraffic("arg1", "input", False, K * N)],
+        is_matmul=True,
+        out_elems=6 * T * N,
+        cores=m * n,
+        loop_trip=E,
+        matmul_macs=6 * T * N * K,  # one pass over the buffer
+        matmul_rows_per_core=T // m,
+        matmul_cols_per_core=N // n,
+        matmul_m_split=m,
+        matmul_n_split=n,
+        matmul_a_bytes=T * K * 2,
+        matmul_b_bytes=K * N * 2,
+    )
+    axes = cm._matmul_axes_for_split_cost(record)
+    assert (axes[0][0], axes[4]) == (6, False)
+    buffer_level = wd._matmul_split_preference_us(
+        (6, 1), (T, m), (N, n), (K, 1), 32, shared_weight=False,
+        include_batch_split=False,
+    )  # fmt: skip
+    assert cm._matmul_split_preference_us(record, axes) == pytest.approx(
+        E * buffer_level
+    )
+
+
 def test_both_matmul_models_charge_a_page_loop_and_a_reduction_tiled_loop_per_trip(
     monkeypatch,
 ):

@@ -201,12 +201,13 @@ from .work_division import (
     _decode_weight_delivery_gbps,
     _matmul_execution_cost,
     _matmul_multicast_penalty,
-    _matmul_split_preference_us,
+    _matmul_split_preference_us as _wd_matmul_split_preference_us,
     # These wrappers dispatch symbolic operands to SymPy.
     min,
     max,
     log2,
     isinf,
+    _is_sym,
 )
 from . import config
 
@@ -2102,6 +2103,52 @@ def _matmul_passes(o, K):
     return o.matmul_macs / one_pass
 
 
+def _matmul_split_preference_us(o, axes) -> float | sympy.Expr:
+    """The standalone chooser's split preferences for ``o``, in microseconds,
+    charged once per invocation (``loop_trip``), without the batch-split term.
+
+    The preferences are fixed amounts per call of the body matmul, so they are
+    priced on the geometry of one call, not of one pass over the output buffer.
+    ``_matmul_axes_for_split_cost`` rebuilds ``B`` from the output buffer, so a
+    loop writing its slice of a stacked ``[E, M, N]`` output sees ``B = E`` while
+    the same loop re-writing one ``[M, N]`` buffer sees ``B = 1``. One pass over
+    the output spans ``loop_trip / passes`` calls (``_matmul_passes``); dividing
+    ``B`` by that gives the batch of one call in both forms, and the sharing flag
+    is re-derived from it with the same rule. Without this the two forms of the
+    same body chose different preference branches (the decode-scope exemption,
+    the shared-weight shape terms) and were priced milliseconds apart.
+
+    A symbolic trip count or pass count, or a buffer batch that is not a whole
+    number of calls, keeps the buffer-level batch and sharing rather than a
+    rounded one. ``_matmul_ns_upstream`` and ``explain`` both call this, so they
+    cannot drift.
+
+    Operands are priced at ``_DTYPE_BYTES``, as the execution estimate here is:
+    the feature extractor builds matmul records only for ``BATCH_MATMUL_OP``, not
+    the FP8 matmul, so no record here carries a narrower operand width.
+    """
+    (B, b), m_axis, n_axis, k_axis, shared_weight = axes
+    trip = max(1, getattr(o, "loop_trip", 1) or 1)
+    passes = _matmul_passes(o, k_axis[0])
+    if not _is_sym(trip, passes, B):
+        call_batch = float(B) * float(passes) / float(trip)
+        call_B = round(call_batch)
+        if call_B >= 1 and math.isclose(call_batch, call_B, rel_tol=1e-9):
+            B = call_B
+            shared_weight = B == 1 or any(
+                a.role == "input" and a.broadcast for a in o.args
+            )
+    return trip * _wd_matmul_split_preference_us(
+        (B, b),
+        m_axis,
+        n_axis,
+        k_axis,
+        config.sencores,
+        shared_weight=shared_weight,
+        include_batch_split=False,
+    )
+
+
 def _matmul_ns_upstream(ops: list, p: CostParams) -> float:
     """Compute-side (ns) of a bundle containing a matmul, using the UPSTREAM
     (``CostParams.use_bundled_cost_model=False``) matmul model.
@@ -2121,8 +2168,9 @@ def _matmul_ns_upstream(ops: list, p: CostParams) -> float:
     once per pass of the loop (``_matmul_passes``), never multiplied by the trip
     count directly: a stacked output already spans the trips. The preferences are
     fixed amounts per call and are charged once per invocation (``loop_trip``), as
-    ``_matmul_batch_split_ns`` is, so a stationary-output loop and its stacked
-    form cost the same.
+    ``_matmul_batch_split_ns`` is, on the batch and sharing of one call
+    (``_matmul_split_preference_us``), so a stationary-output loop and its
+    stacked form cost the same.
     """
     total_us = 0.0
     for o in ops:
@@ -2153,17 +2201,7 @@ def _matmul_ns_upstream(ops: list, p: CostParams) -> float:
                 f"k_axis={k_axis}, cores_used={cores_used})"
             )
         total_us += us * _matmul_passes(o, k_axis[0])
-        # The preferences are fixed amounts per call: charge them per invocation.
-        trip = max(1, getattr(o, "loop_trip", 1) or 1)
-        total_us += trip * _matmul_split_preference_us(
-            b_axis,
-            m_axis,
-            n_axis,
-            k_axis,
-            config.sencores,
-            shared_weight=shared_weight,
-            include_batch_split=False,
-        )
+        total_us += _matmul_split_preference_us(o, axes)
     return total_us * 1000.0 + _matmul_batch_split_ns(ops, p)  # us -> ns
 
 
@@ -3303,17 +3341,7 @@ def explain(ops: list, params: CostParams | None = None) -> str:
                 f"cores={cores_used} -> compute {us:.2f} us{per_pass}"
             )
             compute_ns += us * passes * 1000.0
-            pref_us = max(1, getattr(o, "loop_trip", 1) or 1) * (
-                _matmul_split_preference_us(
-                    (B, b),
-                    (M, m),
-                    (N, n),
-                    (K, k),
-                    config.sencores,
-                    shared_weight=shared_weight,
-                    include_batch_split=False,
-                )
-            )
+            pref_us = _matmul_split_preference_us(o, axes)
             if pref_us:
                 lines.append(
                     f"     {o.name}: + split preferences {float(pref_us):.2f} us "

@@ -329,6 +329,30 @@ count directly. Two loops of 128 experts, each expert a `[64, 128]` output with 
 Both cost 128 experts of work on both models. A reduction-tiled loop makes one pass per
 K slice; a loop that tiles an output dimension walks its output once and makes one pass.
 
+The split preferences the allocator adds are not work, so they follow a different
+count: they are fixed amounts per call of the body matmul and are charged once per
+invocation (`loop_trip`). They are also priced on the geometry of **one call**
+(`_matmul_split_preference_us`): the batch rebuilt from the output buffer is divided
+by the number of calls one pass spans, `loop_trip / passes`, and the shared-weight flag
+is re-derived from that batch. In the example above both loops price the preferences of
+a `[64, 128]` call with batch 1, 128 times. Without this the stacked form saw batch 128,
+lost the decode-scope and shared-weight branches, and was priced milliseconds apart
+from the same body writing one buffer. When the trip or pass count is symbolic, or the
+buffer batch is not a whole number of calls, the buffer-level batch and sharing are
+kept rather than rounded.
+
+The preferences are ranking regularizers, not measured service times. Each is 10 to
+30 µs per log2 step away from its target (`_M_LANE_UNDERUSE_PENALTY_US`,
+`_M_TILE_UNDERFILL_PENALTY_US`, `_WIDE_N_TILE_PENALTY_US`,
+`_LARGE_M_TILE_SHAPE_PENALTY_US`, `_SHARED_DOWN_N_SPLIT_PENALTY_US`,
+`_CORE_UNDERUSE_PENALTY_US`), tuned on the standalone chooser's device sweeps to order
+candidates of one matmul. On a small matmul they can be far larger than the execution
+estimate: a `[16, 64, 256] @ [16, 256, 128]` BMM split 16 ways on its batch has
+1.37 µs of execution and 170 µs of preferences (without the batch-split term). In the
+CP-SAT objective they can therefore outweigh a small matmul's compute price, and they
+have not been calibrated against the objective's memory, transfer and LX-placement
+terms.
+
 ### Delivering the operand a loop walks
 
 The single-pass delivery estimate applies only when every op in the bundle is
