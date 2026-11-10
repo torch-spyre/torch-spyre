@@ -3932,10 +3932,9 @@ def _patch_consumers(
         # to get_read_writes().reads purely positionally) does not silently
         # treat the redirected read as loop-invariant.
         #
-        # A consumer that was never planned into any coarse-tile group (e.g.
-        # a plain outside consumer of a copy_out buffer) never had
-        # loop_info stamped at all -- there is no tiled_dims_per_read to fix
-        # up, and this consumer isn't part of any loop group's
+        # A consumer that was never planned into any coarse-tile group never
+        # had loop_info stamped at all -- there is no tiled_dims_per_read to
+        # fix up, and this consumer isn't part of any loop group's
         # _general_tile_advance machinery in the first place.
         if not hasattr(new_consumer, "loop_info"):
             continue
