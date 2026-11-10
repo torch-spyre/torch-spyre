@@ -64,6 +64,7 @@ from torch_spyre._inductor.padding import (
     _restickify_input_required_extent,
 )
 from torch_spyre._inductor.scratchpad import allocator
+from torch_spyre._inductor.scratchpad import lx_relayout
 from torch_spyre._inductor.scratchpad import utils as scratchpad_utils
 from torch_spyre._inductor.scratchpad.plan_solver import TileAxis, TileSpec
 from utils_inductor import (
@@ -1844,9 +1845,10 @@ class TestPaddedInputCoreDivision(unittest.TestCase):
         strict=True,
         raises=AssertionError,
         reason=(
-            "A row-padded intermediate stays in HBM: _would_produce_lx_back_gap "
-            "measures coverage from the host ranges (e.g. 61 rows), sees the "
-            "padded device_size (64) as a backGap, and refuses LX (#741)"
+            "LX planning places the row-padded intermediate in LX, but "
+            "prepare_spyre_kernels demotes it to HBM: create_tensor_arg's "
+            "work_division_from_view sees the unpadded loop extent (e.g. 61 "
+            "rows) and raises 'loop c0 not divisible by 4' (#741)"
         ),
     )
     def test_pointwise_intermediates_land_in_lx(
@@ -1859,6 +1861,8 @@ class TestPaddedInputCoreDivision(unittest.TestCase):
         and both ops split the padded rows evenly across the cores. Each core
         then covers its whole share of the buffer, with no ``backGap``, so LX
         planning should place the intermediate in LX like an unpadded one.
+        Kernel preparation demotes an LX buffer it cannot address back to HBM
+        and only logs it, so the test also checks that nothing is demoted.
 
         The input values are multiples of 1/4 with at most 8 significant bits,
         and so are ``2 * t`` and ``2 * t + 1``. Every value is exact in dl16,
@@ -1881,7 +1885,8 @@ class TestPaddedInputCoreDivision(unittest.TestCase):
             def f(t):
                 return 2 * t + 1
 
-            out, _ = self._compile_and_run(x_spyre, f)
+            with self.assertNoLogs(lx_relayout.logger.name, "INFO"):
+                out, _ = self._compile_and_run(x_spyre, f)
             torch.testing.assert_close(out.cpu(), 2 * x_cpu + 1, atol=0.0, rtol=0.0)
 
         non_outputs = [r for r in _RecordLayouts.drain().values() if not r.is_output]
@@ -1891,6 +1896,45 @@ class TestPaddedInputCoreDivision(unittest.TestCase):
         intermediate = non_outputs[0]
         self.assertEqual(intermediate.device_size, ds)
         self.assertIn("lx", intermediate.allocation)
+
+    @parametrize("rows,padded_rows,sencores", [(61, 64, 4), (251, 256, 8)])
+    def test_padded_input_read_twice_is_cloned_into_lx(
+        self, rows, padded_rows, sencores
+    ) -> None:
+        """A row-padded graph input read twice is cloned into LX.
+
+        In ``2 * t + t``, both ops read ``t``, so LX planning clones the input
+        into LX. The clone's ownership has to be built over the padded rows,
+        which the consumers split across the cores; over the true rows the split
+        does not divide and the compile fails (#6673 review). Boundary clones
+        stay on, unlike in ``test_pointwise_intermediates_land_in_lx``.
+
+        Both non-output buffers, the input clone and ``2 * t``, should be in LX.
+        The input values are multiples of 1/4 that stay exact in dl16 through
+        ``3 * t``, so the comparison with CPU uses ``atol=rtol=0``.
+        """
+        gen = torch.Generator().manual_seed(0)
+        x_cpu = (torch.randint(-120, 121, (rows, 64), generator=gen) / 4).half()
+        x_cpu, x_spyre, ds = self._padded_rows_input(rows, padded_rows, x_cpu)
+
+        _RecordLayouts.drain()
+        with (
+            patch.object(passes, "CustomPreSchedulingPasses", _RecordLayouts),
+            ts_inductor_config.patch(sencores=sencores, lx_planning=True),
+        ):
+            out, _ = self._compile_and_run(x_spyre, lambda t: 2 * t + t)
+        torch.testing.assert_close(out.cpu(), 3 * x_cpu, atol=0.0, rtol=0.0)
+
+        non_outputs = [r for r in _RecordLayouts.drain().values() if not r.is_output]
+        self.assertEqual(
+            len(non_outputs),
+            2,
+            f"expected the input clone and 2*t as intermediates, but found "
+            f"{non_outputs}",
+        )
+        for record in non_outputs:
+            self.assertEqual(record.device_size, ds)
+            self.assertIn("lx", record.allocation)
 
     @parametrize("rows,padded_rows,sencores", [(61, 64, 4), (251, 256, 8)])
     def test_pointwise_splits_padded_rows(self, rows, padded_rows, sencores) -> None:

@@ -641,6 +641,16 @@ def make_op_iteration_space(
     )
 
 
+def padded_iteration_space(op: ComputedBuffer) -> dict[Symbol, Expr]:
+    """``op``'s iteration space, with each padded output dim grown to its padded
+    device extent, as work division and codegen see it."""
+    args = _apply_input_layout_overrides(op, get_mem_deps_from_rw(op_read_writes(op)))
+    input_tds, output_td = collect_tensor_deps(op, args)
+    return adjust_it_space_for_padding(
+        op, iteration_space_from_op(op), input_tds, output_td
+    )
+
+
 def _is_indirectly_accessed(td: TensorDep) -> bool:
     """Return whether td has a data-dependent indirect coordinate."""
     return any(coord.has(IndirectAccess) for coord in td.device_coords[:-1])

@@ -15,6 +15,7 @@
 
 import math
 from collections.abc import Collection, Mapping, Sequence
+from sympy import Expr, Symbol
 from typing import Any, Optional
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
@@ -27,6 +28,7 @@ from torch.utils._sympy.value_ranges import ValueRanges, bound_sympy
 
 
 from torch_spyre._C import get_device_size_in_bytes
+from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.loop_facts import (
     counted_loop_path,
@@ -744,6 +746,19 @@ def get_op_pointwise_inputs(op: Operation) -> list[str]:
     ]
 
 
+def _padded_it_space(op: Operation) -> dict[Symbol, Expr]:
+    """``op``'s padded iteration extents, or ``{}`` (keep ``dep.ranges``) for
+    an op that is not divided by work division."""
+    from torch_spyre._inductor.work_division import padded_iteration_space
+
+    if not isinstance(op, ComputedBuffer):
+        return {}
+    try:
+        return padded_iteration_space(op)
+    except Unsupported:
+        return {}
+
+
 def _would_produce_lx_back_gap(
     graph: GraphLowering,
     buf_name: str,
@@ -756,6 +771,9 @@ def _would_produce_lx_back_gap(
     Generic LX gaps remain unsupported. The allocator may admit only a
     certified prefix-slice gather whose unsplit-K consumer uses a uniform
     outer tail gap, with a guaranteed disjoint full-buffer copy.
+
+    The coverage is measured over the padded extents that codegen actually
+    iterates over, so a padded dim that is fully iterated has no gap.
     """
     from .lx_relayout import local_lx_subrange_geometry
 
@@ -765,6 +783,7 @@ def _would_produce_lx_back_gap(
 
     for use_idx in uses:
         op = graph.operations[use_idx]
+        padded = _padded_it_space(op)
         rw = op_read_writes(op)
         for dep in rw.reads | rw.writes:
             if dep.name != buf_name:
@@ -780,13 +799,16 @@ def _would_produce_lx_back_gap(
                 coords = device_coordinates(stl, dep, None)
             except Exception:
                 continue
+            ranges: dict[Symbol, Expr] = {
+                sym: padded.get(sym, extent) for sym, extent in dep.ranges.items()
+            }
             for d, coord_expr in enumerate(coords[:-1]):
                 syms = coord_expr.free_symbols
                 if not syms:
                     if device_size[d] > 1:
                         return True
                     continue
-                if any(sym not in dep.ranges for sym in syms):
+                if any(sym not in ranges for sym in syms):
                     continue
                 # A device coordinate may be walked by several iteration symbols
                 # (``2*d0 + floor(d2/64)``), so the covered extent is the
@@ -797,10 +819,7 @@ def _would_produce_lx_back_gap(
                     int(
                         bound_sympy(
                             coord_expr,
-                            {
-                                sym: ValueRanges(0, int(dep.ranges[sym]) - 1)
-                                for sym in syms
-                            },
+                            {sym: ValueRanges(0, int(ranges[sym]) - 1) for sym in syms},
                         ).upper
                     )
                     + 1
@@ -818,7 +837,7 @@ def _would_produce_lx_back_gap(
                 )
 
                 if overlapping_coordinate_extents(
-                    coord_expr, {sym: int(dep.ranges[sym]) for sym in syms}
+                    coord_expr, {sym: int(ranges[sym]) for sym in syms}
                 ):
                     return True
     return False

@@ -270,6 +270,9 @@ class GraphEditor:
             from torch_spyre._inductor.scratchpad.lx_relayout import (
                 work_division_from_view,
             )
+            from torch_spyre._inductor.work_division import (
+                padded_iteration_space,
+            )
 
             clone_writes = [
                 dep
@@ -283,11 +286,12 @@ class GraphEditor:
                 )
             clone_write = clone_writes[0]
             clone_space = iteration_space_from_op(new_com_buf)
+            padded_space = padded_iteration_space(new_com_buf)
             clone_ownership = work_division_from_view(
                 lx_view,
                 clone_layout.device_layout.device_size,
                 device_coordinates(clone_layout.device_layout, clone_write, None),
-                clone_space,
+                padded_space,
             )
             if clone_ownership is None:
                 raise ValueError("LX clone is missing its accepted physical ownership")
