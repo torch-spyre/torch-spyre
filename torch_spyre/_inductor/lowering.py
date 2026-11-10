@@ -2558,16 +2558,16 @@ def _div_operand_dtypes(x, y):
       fp32 / fp32     | fp32      | fp32         | no
       fp16 / fp16     | fp16      | fp16         | no
       fp16 / fp32     | fp32      | fp32         | no
-      int32 / int32   | fp32      | int32        | yes (floor only)
-      int64 / int64   | fp32      | int64        | yes (floor only)
+      int32 / int32   | fp32      | int32        | yes (floor/trunc)
+      int64 / int64   | fp32      | int64        | yes (floor/trunc)
       int32 / fp32    | fp32      | fp32         | no
       int32 / fp16    | fp16      | fp16         | no (fp16 dominates)
       int64 / fp32    | fp32      | fp32         | no
       int64 / fp16    | fp16      | fp16         | no (fp16 dominates)
       bool / fp16     | fp16      | fp16         | no (fp16 dominates)
       bool / fp32     | fp32      | fp32         | no (fp32 dominates)
-      bool / int32    | fp32      | int32        | yes (floor only)
-      bool / int64    | fp32      | int64        | yes (floor only)
+      bool / int32    | fp32      | int32        | yes (floor/trunc)
+      bool / int64    | fp32      | int64        | yes (floor/trunc)
     """
     if not any(hasattr(v, "get_dtype") for v in (x, y)):
         return None, None
@@ -2601,8 +2601,13 @@ def _lower_div_impl(x, y, *, rounding_mode=None):
                              Emits ~20 realize() barriers for a tensor divisor
                              (~15 for a scalar divisor) — one per SDSC op; this
                              is the minimum required for the sign-aware correction.
-    - rounding_mode="trunc": same correction on |x| / |y| with the sign applied
-                             last; cast back to result_dtype like "floor".
+    - rounding_mode="trunc": comp_dtype for the correction arithmetic; cast back
+                             to result_dtype at the end (int inputs → int out).
+                             Runs the "floor" correction on |x| / |y|, where it
+                             needs no sign handling, then applies sign(x)*sign(y)
+                             by negation (exact). Emits ~18 realize() barriers
+                             for a tensor divisor (~15 for a scalar divisor,
+                             whose |y| and sign fold at compile time).
 
     The scalar-divisor sign optimisation (y < 0 fold) requires y to be a
     concrete Python int or float; sympy/symbolic scalars are not supported.
@@ -2747,8 +2752,9 @@ def _lower_div_impl(x, y, *, rounding_mode=None):
         qf = _realized(lowering.where(under_est, qf_minus1, qf))
         # Apply sign(x)*sign(y) as two selects rather than a bool ne(x<0, y<0).
         # Do not test mul(x, y) < 0: the product can underflow to 0 or overflow.
-        # Negating qf = +0 yields -0.0, matching PyTorch's float result for
-        # e.g. -1.0 / 2.0 (trunc); the int cast below discards it.
+        # On device, negating qf = +0 gives +0.0, so e.g. -1.0 / 2.0 (trunc) is
+        # 0.0 where CPU gives -0.0 (same as lower_trunc). The values compare
+        # equal; only signbit differs.
         x_neg = _realized(aten_lt(x, 0.0))
         qf = _realized(lowering.where(x_neg, _realized(lowering.neg(qf)), qf))
         if hasattr(y, "get_dtype"):
