@@ -928,7 +928,7 @@ def _replace_rows(t, dim, row, src):
     rest = t.size(-1) - src.size(-1)
     if rest:
         old = t.index_select(dim, picked).narrow(-1, src.size(-1), rest)
-        src = torch.cat([src, old.clone()], dim=-1)
+        src = torch.cat([src, old], dim=-1)
     torch.index_copy(t, dim, picked, src, out=t)
 
 
@@ -965,7 +965,6 @@ def spyre__scatter_src_out(self, dim, index, src, *, out):
     if src.shape != index.shape:
         for d, size in enumerate(index.shape):
             src = src.narrow(d, 0, size)
-        src = src.clone()
     # Rows come back sorted, so keep picks the src row of each: its last write
     # when a row repeats, as on CPU.
     row, inverse = row.unique(return_inverse=True)
