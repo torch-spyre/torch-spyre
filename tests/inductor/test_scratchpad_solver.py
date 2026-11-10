@@ -57,6 +57,7 @@ try:
         _CORE_INV_SCALE,
         _MAX_PRODUCT_BOUND,
         _POWER_PWL_TOLERANCE,
+        _PRODUCT_TOTAL_BITS,
         _TERM_BITS,
         _SympyExprToCpSat,
         _simplify_eq_conjunction,
@@ -2609,6 +2610,44 @@ class TestSympyExprToCpSatPrinter(TestCase):
                 solver, _ = self._optimize(expr, domains, maximize=True)
                 exact = math.prod(hi for _, hi in domains.values())
                 self.assertEqual(solver.ObjectiveValue(), exact)
+
+    def test_narrowed_product_error_at_small_values(self):
+        # a's domain makes a * d pass the bound, so a is divided by 2**excess
+        # and rounded. Its attained value does not change that step: the
+        # product is off by up to half a step times d, and a value below half
+        # a step rounds to zero.
+        excess = (2**30).bit_length() + (32).bit_length() - _PRODUCT_TOTAL_BITS
+        half_step = 2**excess // 2
+        a, d = sympy.symbols("a d", integer=True)
+        for value in (5, 100, 2**29 + 77):
+            with self.subTest(a=value):
+                model = cp_model.CpModel()
+                sym_map = {
+                    "a": model.new_int_var(1, 2**30, "a"),
+                    "d": model.new_int_var(1, 32, "d"),
+                }
+                model.add(sym_map["a"] == value)
+                model.add(sym_map["d"] == 32)
+                model.maximize(
+                    _SympyExprToCpSat(model, dict(sym_map), {}).convert(a * d)
+                )
+                solver = cp_model.CpSolver()
+                self.assertEqual(solver.solve(model), cp_model.OPTIMAL)
+                error = abs(solver.objective_value - value * 32)
+                self.assertLessEqual(error, half_step * 32)
+                if value < half_step:
+                    self.assertEqual(solver.objective_value, 0)
+
+    def test_power_with_a_pole_at_a_candidate_is_left_alone(self):
+        # A negative power has no value at a zero candidate, so the power is
+        # returned as it came rather than lowered through its candidates.
+        t = sympy.Symbol("tile_a_o0", integer=True, nonnegative=True)
+        wrapper = types.SimpleNamespace(division=None)
+        printer = _SympyExprToCpSat(
+            cp_model.CpModel(), {}, {"tile_a_o0": (wrapper, [0, 2, 4])}
+        )
+        self.assertEqual(printer._power_pwl(t, -0.5), t**-0.5)
+        self.assertIsInstance(printer._power_pwl(t, 0.5), sympy.Piecewise)
 
     def test_multiply_at_bound_lowers_exactly(self):
         # The bound itself is inclusive: 2**15 * 2**15 lowers unscaled.
