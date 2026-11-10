@@ -837,21 +837,19 @@ def _patch_scan_input_aliasing() -> bool:
     while anything else can read it.
 
     Applied process-wide, so CPU and CUDA scans in the same process are relaxed
-    too. Only on torch 2.13 and 2.14, whose patched functions are identical; other
-    versions are skipped with a warning. Returns whether the patch is active.
-    Idempotent.
+    too. Applied only on torch 2.15, using Dynamo's input-input aliasing flag;
+    other versions are skipped with a warning. Returns whether the patch is
+    active. Idempotent.
 
     TODO(#4893): remove with the first torch release that carries the upstream fix.
     """
-    import contextvars
     import functools
     import sys
 
     import torch
-    from torch.utils import _pytree as pytree
 
     release = tuple(int(p) for p in torch.__version__.split("+")[0].split(".")[:2])
-    if release not in ((2, 13), (2, 14)):
+    if release != (2, 15):
         import warnings
 
         warnings.warn(
@@ -860,89 +858,59 @@ def _patch_scan_input_aliasing() -> bool:
         )
         return False
 
-    import torch._dynamo.output_graph as output_graph
     import torch._dynamo.variables.higher_order_ops as hop_vars
     import torch._higher_order_ops.scan  # noqa: F401
     import torch._higher_order_ops.utils as hop_utils
 
     scan_op = sys.modules["torch._higher_order_ops.scan"].scan_op
-    tracer_cls = output_graph.SubgraphTracer
-    if getattr(tracer_cls.has_aliasing, "_spyre_scan_aliasing_patched", False):
+    if getattr(
+        hop_vars.check_aliasing_and_input_mutation,
+        "_spyre_scan_aliasing_patched",
+        False,
+    ):
         return True
 
-    relaxed = contextvars.ContextVar("spyre_scan_input_aliasing", default=False)
-    original_has_aliasing = tracer_cls.has_aliasing
     original_check = hop_vars.check_aliasing_and_input_mutation
     original_functionalize_check = hop_utils._check_alias_and_mutation
 
-    def has_aliasing(self):
-        """Torch's own check, or for scan a copy of it that skips input pairs."""
-        if not relaxed.get():
-            return original_has_aliasing(self)
-        storages = hop_vars.get_tensor_storages
-        example = hop_utils._collect_fake_inputs
-
+    def has_aliased_grad_input(subtracer):
         input_storages = {}
-        for node in self.graph.nodes:
+        for node in subtracer.graph.nodes:
             if node.op != "placeholder":
                 break
-            value = example([node])[0]
+            value = hop_utils._collect_fake_inputs([node])[0]
             if not isinstance(value, torch.Tensor):
                 continue
-            for storage in storages(value):
+            for storage in hop_vars.get_tensor_storages(value):
                 if storage in input_storages:
-                    first = input_storages[storage]
-                    if not (value.requires_grad or example([first])[0].requires_grad):
-                        continue
-                    msg = (
-                        f"Input-to-input aliasing detected at nodes {first} and {node}"
-                    )
-                    return output_graph.AliasingInfo(True, msg)
-                input_storages[storage] = node
-
-        output_storages = {}
-        out_nodes = self.graph.find_nodes(op="output")[0]
-        for out_node in pytree.tree_leaves(out_nodes.args[0]):
-            if not out_node:
-                continue
-            value = example([out_node])[0]
-            if isinstance(value, list):
-                raise AssertionError("example_value must not be a list")
-            if not isinstance(value, torch.Tensor):
-                continue
-            for storage in storages(value):
-                if storage in output_storages:
-                    msg = (
-                        "Output-to-output aliasing detected at nodes "
-                        f"{output_storages[storage]} and {out_node}"
-                    )
-                    return output_graph.AliasingInfo(True, msg)
-                output_storages[storage] = out_node
-
-        shared = input_storages.keys() & output_storages.keys()
-        if shared:
-            aliased = ", ".join(
-                f"{input_storages[s]} and {output_storages[s]}" for s in shared
-            )
-            msg = f"Input-to-output aliasing detected at nodes {aliased}"
-            return output_graph.AliasingInfo(True, msg)
-        return output_graph.AliasingInfo(False, "")
+                    if value.requires_grad or input_storages[storage]:
+                        return True
+                else:
+                    input_storages[storage] = value.requires_grad
+        return False
 
     @functools.wraps(original_check)
     def check_aliasing_and_input_mutation(
-        subtracer, graph, supports_input_mutation, supports_aliasing, source_target
+        subtracer,
+        graph,
+        *,
+        supports_input_mutation,
+        supports_aliasing,
+        supports_input_input_aliasing,
+        source_target,
     ):
-        token = relaxed.set(source_target is scan_op)
-        try:
-            return original_check(
-                subtracer,
-                graph,
-                supports_input_mutation,
-                supports_aliasing,
-                source_target,
-            )
-        finally:
-            relaxed.reset(token)
+        # 2.15 can relax input-input aliasing independently of output aliasing.
+        # Keep scan's autograd restriction and other HOPs' native policy.
+        if source_target is scan_op:
+            supports_input_input_aliasing = not has_aliased_grad_input(subtracer)
+        return original_check(
+            subtracer,
+            graph,
+            supports_input_mutation=supports_input_mutation,
+            supports_aliasing=supports_aliasing,
+            supports_input_input_aliasing=supports_input_input_aliasing,
+            source_target=source_target,
+        )
 
     @functools.wraps(original_functionalize_check)
     def _check_alias_and_mutation(graph_module, inputs_fake, name, pre_dispatch):
@@ -963,8 +931,7 @@ def _patch_scan_input_aliasing() -> bool:
         if mutation:
             raise RuntimeError(f"{name} might be modifying the input!")
 
-    has_aliasing._spyre_scan_aliasing_patched = True  # type: ignore[attr-defined]
-    tracer_cls.has_aliasing = has_aliasing
+    check_aliasing_and_input_mutation._spyre_scan_aliasing_patched = True  # type: ignore[attr-defined]
     hop_vars.check_aliasing_and_input_mutation = check_aliasing_and_input_mutation
     hop_utils._check_alias_and_mutation = _check_alias_and_mutation
     return True

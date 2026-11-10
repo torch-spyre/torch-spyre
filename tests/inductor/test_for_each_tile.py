@@ -1307,6 +1307,28 @@ class TestScanInputAliasing(unittest.TestCase):
                 with self.assertRaisesRegex(Exception, "(?i)aliasing"):
                     self._compile(fn)(self.x, self.kv)
 
+    def test_flex_attention_keeps_native_input_aliasing_support(self):
+        """2.15's mask_fn already permits aliased inputs outside scan."""
+        from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+
+        positions = torch.arange(256).reshape(2, 128)
+        left, right = positions[0], positions[1]
+
+        def mask(b, h, q, k):
+            return left[q] >= right[k] - 128
+
+        block_mask = create_block_mask(mask, 1, 1, 128, 128, device="cpu")
+        q, k, v = (torch.randn(1, 1, 128, 8) for _ in range(3))
+
+        def fn(q, k, v):
+            return flex_attention(q, k, v, block_mask=block_mask)
+
+        actual = torch.compile(fn, backend="eager", fullgraph=True)(q, k, v)
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, is_causal=True
+        )
+        torch.testing.assert_close(actual, expected)
+
 
 # The package re-exports the `for_each_tile` function under the submodule's name, so
 # the module itself is only reachable through `sys.modules`.

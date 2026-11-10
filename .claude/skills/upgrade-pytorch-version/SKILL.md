@@ -371,6 +371,11 @@ does not maintain C++ ABI stability across minor releases, so extensions
 built for `$OLD` will fail to load with undefined-symbol errors against
 `$NEW`.
 
+Extensions explicitly built against PyTorch's stable ABI are an exception.
+Torchvision 0.29.2 supports torch >=2.14; its version no longer follows
+`torch minor + 15`. Use the package's declared compatibility and validate
+native operators instead of deriving a nonexistent torchvision release.
+
 Typical downstream extensions in a torch-spyre environment:
 
 | Extension | Location | Rebuild command |
@@ -559,6 +564,9 @@ After all changes:
      the faked versions in `tests/inductor/test_loop_scheduler.py` (the
      release-gate tests pin the new release as supported and the old one as
      refused).
+   - PyTorch 2.15 removed `GraphLowering.additional_star_deps`; forward loop
+     dependencies through `additional_buffer_deps`, which the new scheduler
+     still consumes. Do not silently ignore a renamed dependency table.
    - Run, serially (the device is exclusive):
      ```bash
      python -m pytest tests/inductor/test_loop_scheduler.py \
@@ -668,6 +676,13 @@ After upgrading, watch for:
    `TestCopyFromD2DNestedCompile` in `test_copy_from_d2d_offsets.py` on supported
    patch releases; it exercises the private `_use_eager_on_nested_compile`
    context as well as the predicate.
+   Re-check `_patch_scan_input_aliasing` and its version guard. PyTorch 2.15
+   made the HOP check's policy arguments keyword-only and added
+   `supports_input_input_aliasing`. The patch now uses that flag instead of
+   replacing `SubgraphTracer.has_aliasing`; preserve the native policy for
+   other HOPs, including FlexAttention masks that already allow aliased inputs.
+   Run `TestScanInputAliasing` and the fused-QKV SDPA regression, and confirm
+   the scan tests actually run rather than skip behind the version guard.
 5b. **Compile phase timing** — `torch_spyre/_inductor/torch_phases.py`
    wraps `ChromiumEventLogger.log_event_start` and `log_event_end` in
    `torch/_dynamo/utils.py` with `*args`, so a change in their positional

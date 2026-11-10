@@ -187,7 +187,7 @@ class _Graph(unittest.TestCase):
 
 class TestPatchInstallRestore(unittest.TestCase):
     def setUp(self):
-        self._v = _version("2.14.0")
+        self._v = _version("2.15.0")
         self._v.start()
         self.addCleanup(self._v.stop)
 
@@ -267,9 +267,10 @@ class TestReleaseGate(_Graph):
         for text, expected in (
             ("2.12.0", False),
             ("2.13.0+cpu", False),
-            ("2.14.0", True),
-            ("2.14.1+cpu", True),
-            ("2.15.0", False),
+            ("2.14.1+cpu", False),
+            ("2.15.0", True),
+            ("2.15.1+cpu", True),
+            ("2.16.0", False),
         ):
             with self.subTest(text), _version(text):
                 self.assertIs(loop_scheduler_supported(), expected)
@@ -299,7 +300,7 @@ class TestReleaseGate(_Graph):
 
     def test_apply_raises_on_unsupported_and_patches_nothing(self):
         before = _current()
-        for text in ("2.12.0", "2.13.0+cpu", "2.15.0"):
+        for text in ("2.12.0", "2.13.0+cpu", "2.14.1", "2.16.0"):
             with self.subTest(text), _version(text):
                 with self.assertRaises(Unsupported):
                     with apply_loop_scheduler_patches():
@@ -309,7 +310,7 @@ class TestReleaseGate(_Graph):
 
     def test_per_compile_unsupported_raises_only_on_a_loop_node(self):
         before = _current()
-        for text in ("2.12.0", "2.13.0+cpu", "2.15.0"):
+        for text in ("2.12.0", "2.13.0+cpu", "2.14.1", "2.16.0"):
             with self.subTest(text), _version(text):
                 with loop_scheduler_patches_for_compile():
                     # A compile with no LoopNode is unaffected.
@@ -328,7 +329,7 @@ class TestReleaseGate(_Graph):
 
     def test_per_compile_supported_installs_the_patches(self):
         before = _current()
-        for text in ("2.14.0", "2.14.1+cpu"):
+        for text in ("2.15.0", "2.15.1+cpu"):
             with self.subTest(text), _version(text):
                 with loop_scheduler_patches_for_compile():
                     t = self._buf(f"t_{text}")
@@ -347,7 +348,7 @@ class TestReleaseGate(_Graph):
 class TestLoopSchedulerNode(_Graph):
     def setUp(self):
         super().setUp()
-        self._v = _version("2.14.0")
+        self._v = _version("2.15.0")
         self._v.start()
         self.addCleanup(self._v.stop)
         self._p = apply_loop_scheduler_patches()
@@ -473,7 +474,7 @@ class TestLoopSchedulerNode(_Graph):
 class TestSchedulerFrontHalf(_Graph):
     def setUp(self):
         super().setUp()
-        self._v = _version("2.14.0")
+        self._v = _version("2.15.0")
         self._v.start()
         self.addCleanup(self._v.stop)
         self._p = apply_loop_scheduler_patches()
@@ -608,7 +609,7 @@ class TestSchedulerFrontHalf(_Graph):
         side = self._buf("side", reads="x")
         t = self._buf("t", reads="x")
         self.outputs = ["t", "side"]
-        V.graph.additional_star_deps["t"].add("side")
+        V.graph.additional_buffer_deps["t"].add("side")
         loop = self._loop("loopnode0", [t])
         nodes = self._front_half(self._scheduler(), [loop, side])
         self.assertEqual([n.get_name() for n in nodes], ["side", "loopnode0"])
