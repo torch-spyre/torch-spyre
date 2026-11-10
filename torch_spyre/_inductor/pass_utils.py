@@ -2467,16 +2467,21 @@ def compute_restickify_target_layout(
     old_sd_free = idc[old_sd_outer_dim].free_symbols - ({old_var} if old_var else set())
     if old_sd_free or idc[new_sd_outer_dim].free_symbols - {new_var}:
         return None
-    # SANITY: verify new-side values match dep.ranges[new_var] and dep.index.coeff(new_var)
-    # — the proposed reliable replacement for _host_size_stride_for_expr.
-    if arg is not None and new_var in arg.dep.ranges:
-        _new_size_from_dep = concretize_expr(arg.dep.ranges[new_var])
-        _new_stride_coeff = sympy.expand(arg.dep.index).coeff(new_var)
-        _new_stride_from_dep = concretize_expr(_new_stride_coeff)
-        assert _new_size_from_dep == new_sd_host_size, (
-            f"new-side size mismatch: dep.ranges[{new_var}]={_new_size_from_dep} "
+    # SANITY: verify new-side size matches the product of host_size for all host
+    # dims carrying new_var — the proposed reliable replacement that avoids dep.ranges
+    # (which is per-tile in the coarse-tiling path, not the full host extent).
+    _new_host_dims = [d for d, e in enumerate(ic) if new_var in e.free_symbols]
+    if _new_host_dims:
+        _new_size_from_host = math.prod(host_size[d] for d in _new_host_dims)
+        assert _new_size_from_host == new_sd_host_size, (
+            f"new-side size mismatch: prod(host_size[{_new_host_dims}])={_new_size_from_host} "
             f"vs _host_size_stride_for_expr={new_sd_host_size}"
         )
+    # SANITY: verify new-side stride matches dep.index.coeff(new_var) — the stride
+    # of new_var in the flat index, which is independent of tiling.
+    if arg is not None and new_var in arg.dep.ranges:
+        _new_stride_coeff = sympy.expand(arg.dep.index).coeff(new_var)
+        _new_stride_from_dep = concretize_expr(_new_stride_coeff)
         assert _new_stride_from_dep == new_sd_host_stride, (
             f"new-side stride mismatch: dep.index.coeff({new_var})={_new_stride_coeff!r} "
             f"concretized={_new_stride_from_dep} "
