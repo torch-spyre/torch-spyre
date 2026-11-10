@@ -240,18 +240,37 @@ class TestStickRelocation(unittest.TestCase):
                 dynamic=False,
             )(a, a.clone())
 
-    @pytest.mark.xfail(
-        raises=InductorError,
-        strict=True,
-        reason="issue#TBD: the padding pass skips a restickify that writes into a "
-        "slice of the cat buffer (its output has a mutation layout), so its gap dim "
-        "is never added and the restickify restore asserts. Fails the same on #5804 "
-        "without the relocation.",
-    )
-    def test_cat_of_reshaped_reads(self):
-        a = torch.randn(1, 2, 4, 8, 7, dtype=torch.float16)
-        _compile_and_measure(
-            lambda a, b: torch.cat([a.reshape(1, 8, 56), b.reshape(1, 8, 56)], 1) * 2,
-            a.shape,
-            a.shape,
-        )
+    @expects_raise
+    def test_cat_of_reshaped_reads_is_rejected(self):
+        # TODO(#6163): each cat operand is restickified straight into its slice
+        # of the cat buffer, where its old-stick dim cannot be padded in place.
+        # Restickify into a fresh buffer and copy it into the slice, then make this
+        # a positive test. The yolo26 Detect head (three views, then a cat along
+        # the stick dim) stops at the same point.
+        cases = {
+            "cat of two reshapes": (
+                [(1, 2, 4, 8, 7)] * 2,
+                lambda a, b: torch.cat([a.reshape(1, 8, 56), b.reshape(1, 8, 56)], 1)
+                * 2,
+            ),
+            "yolo26 detect head": (
+                [(1, 80, 80, 80), (1, 80, 40, 40), (1, 80, 20, 20)],
+                lambda a, b, c: torch.cat([t.reshape(1, 80, -1) for t in (a, b, c)], -1)
+                * 2,
+            ),
+        }
+        for name, (shapes, fn) in cases.items():
+            with self.subTest(name):
+                torch.compiler.reset()
+                with (
+                    inductor_config.patch(force_disable_caches=True),
+                    pytest.raises(
+                        InductorError, match="written into a slice of another buffer"
+                    ),
+                ):
+                    torch.compile(fn, dynamic=False)(
+                        *[
+                            torch.randn(*s, dtype=torch.float16).to("spyre")
+                            for s in shapes
+                        ]
+                    )
