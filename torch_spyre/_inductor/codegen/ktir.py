@@ -74,7 +74,7 @@ from torch_spyre._inductor.codegen.opspec_utils import (
     per_core_extent,
     placeholder_axes,
     reduction_indexing,
-    relayout_strides,
+    relayout_views,
     row_major_strides,
 )
 from torch_spyre._inductor.constants import (
@@ -2000,13 +2000,13 @@ class KernelPlan:
     def _relayout_step(
         self, spec: OpSpec, loops: Sequence[LoopSpec], stage: int
     ) -> ComputeStep:
-        """One relayout: the input viewed in the output's order, then a copy.
+        """One op whose inputs are each viewed in the output's order.
 
         The step every other op gets from alignment, built from
-        ``relayout_strides`` instead: one iteration space for both views (the
-        output's device axes, split where the input splits a symbol into stick
-        and lane), the output view row-major over it, and the input view at
-        whatever strides put each of its elements under the output element it
+        ``relayout_views`` instead: one loop nest for every operand (the
+        output's device axes, split where an input splits a loop variable into
+        stick and lane), the output view row-major over it, and each input view
+        at whatever strides put each of its elements under the output element it
         becomes.  Every map is then the identity, so the op is spelled by
         ``_parallel_surface``, the same as an aligned pointwise op: a copy's
         payload arm gives a ``GENERIC`` that yields its operand.
@@ -2016,20 +2016,22 @@ class KernelPlan:
         along a buffer's own axes.  Both buffers must reach memory, because the
         layout change is a fact about how one is addressed.
         """
-        out, [source] = validated_roles(spec)
+        out, inputs = validated_roles(spec)
         dtype = dtype_of(spec)
         recipe = KtirBuilder.RECIPES[spec.op]
-        if buf_id(source) == buf_id(out):
-            raise NotImplementedError(
-                "OpSpec->KTIR: in-place ops (input aliases output) not supported"
-            )
+        for source in inputs:
+            if buf_id(source) == buf_id(out):
+                raise NotImplementedError(
+                    "OpSpec->KTIR: in-place ops (input aliases output) not supported"
+                )
         if loops or self.divisions:
             _unimplemented(
                 "relayout-tiling",
                 f"{spec.op!r} is tiled or work-divided; a relayout is emitted over "
                 "one whole, undivided iteration space (SENCORES=1)",
             )
-        self._check_copy_operands(spec, out, source)
+        for source in inputs:
+            self._check_copy_operands(spec, out, source)
         ranges = {}
         for sym, (count, _div) in spec.iteration_space.items():
             count = _static(count)
@@ -2040,16 +2042,18 @@ class KernelPlan:
                 )
             ranges[sym] = count
         arm = recipe.arm(dtype)
-        extent, in_strides, out_strides = relayout_strides(
-            list(source.device_coordinates),
-            [int(s) for s in source.device_size],
+        loop_bounds, in_strides, out_strides = relayout_views(
+            [
+                (list(source.device_coordinates), [int(s) for s in source.device_size])
+                for source in inputs
+            ],
             list(out.device_coordinates),
             [int(s) for s in out.device_size],
             ranges,
         )
         accesses = {}
-        for arg, strides in ((source, in_strides), (out, out_strides)):
-            layout = Layout(extent=extent, strides=strides)
+        for arg, strides in (*zip(inputs, in_strides), (out, out_strides)):
+            layout = Layout(extent=loop_bounds, strides=strides)
             elems = ElemTypes.of(arg.device_dtype)
             buffer = _buffer(
                 arg,
@@ -2059,14 +2063,14 @@ class KernelPlan:
                 frontend_pool_allocation=self.options.frontend_pool_allocation,
             )
             self.buffers.setdefault(buf_id(arg), buffer)
-            accesses[buf_id(arg)] = _access(arg, extent, [], layout, elems, buffer)
+            accesses[buf_id(arg)] = _access(arg, loop_bounds, [], layout, elems, buffer)
         # Every operand is viewed over the same loop nest, in the output's order,
         # so the op is spelled exactly as an aligned pointwise op is.
-        surface, indexing = _parallel_surface(arm, 1, len(extent))
+        surface, indexing = _parallel_surface(arm, len(inputs), len(loop_bounds))
         return ComputeStep(
             op=spec.op,
             surface=surface,
-            ins=((buf_id(source), accesses[buf_id(source)]),),
+            ins=tuple((buf_id(arg), accesses[buf_id(arg)]) for arg in inputs),
             out=accesses[buf_id(out)],
             out_buf_id=buf_id(out),
             stage=stage,
