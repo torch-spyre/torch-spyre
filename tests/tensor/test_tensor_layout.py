@@ -1211,12 +1211,12 @@ class TestSpyreTensorLayout(TestCase):
         self.assertEqual(list(stl.device_size), [2, 1, 32])
 
     def test_stl_v3_pickle_minus_one_loads_as_zero(self):
-        """An STL constructed with a legacy -1 in stride_map round-trips
-        through pickle with 0 in its place."""
+        """A v3 pickle written before the -1 -> 0 switch still loads, with 0."""
         fp16_df = get_device_dtype(torch.float16)
-        stl = SpyreTensorLayout([2, 1, 32], [32, -1, 1], fp16_df)
-        self.assertEqual(list(stl.stride_map), [32, 0, 1])
-        restored = pickle.loads(pickle.dumps(stl))
+        restored = SpyreTensorLayout.__new__(SpyreTensorLayout)
+        restored.__setstate__(
+            (3, [2, 1, 32], [32, -1, 1], fp16_df, ElementArrangement.STANDARD)
+        )
         self.assertEqual(list(restored.stride_map), [32, 0, 1])
 
     def test_stl_v4_pickle_minus_one_loads_as_zero(self):

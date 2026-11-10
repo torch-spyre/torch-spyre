@@ -172,9 +172,11 @@ def _compact_broadcast_device_dims(stl: SpyreTensorLayout) -> SpyreTensorLayout:
     enough to represent a broadcast stick.
 
     Only collapses dimensions whose ``device_size > 1``: a dimension already at
-    size 1 needs no rebuild and skipping it avoids an otherwise latent ordering
-    dependency — if padding inserts a stride-zero gap dim before this pass runs,
-    the size-1 skip keeps the rebuilt STL identical regardless of call order.
+    size 1 needs no rebuild.  This matters for the elided size-1 stride-0
+    dimension, which compaction would otherwise rewrite, making the resulting
+    layout depend on pass order.  It does not protect the padding gap
+    dimension (size 64): that one is safe only because the restickify/clone
+    path returns via ``_clone_layout`` before this pass runs.
     """
     device_size = list(stl.device_size)
     stride_map = list(stl.stride_map)
