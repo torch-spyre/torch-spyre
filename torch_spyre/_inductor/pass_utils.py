@@ -2438,19 +2438,6 @@ def compute_restickify_target_layout(
             return None
         old_sd_host_size, old_sd_host_stride = old_sd_size_stride
         old_var = next(iter(old_stick_expr.free_symbols))
-        # SANITY: host_size/host_stride at the single host dim carrying old_var should
-        # equal the values from _host_size_stride_for_expr; if so, we can drop the call.
-        _old_host_dims = [d for d, e in enumerate(ic) if old_var in e.free_symbols]
-        assert len(_old_host_dims) == 1, (
-            f"expected 1 host dim for old_var={old_var!r}, got {_old_host_dims}"
-        )
-        _old_d = _old_host_dims[0]
-        assert host_size[_old_d] == old_sd_host_size, (
-            f"old-side size mismatch: host_size[{_old_d}]={host_size[_old_d]} vs {old_sd_host_size}"
-        )
-        assert host_stride[_old_d] == old_sd_host_stride, (
-            f"old-side stride mismatch: host_stride[{_old_d}]={host_stride[_old_d]} vs {old_sd_host_stride}"
-        )
         old_var_outer_dims = [
             j for j in range(len(idc) - 1) if old_var in idc[j].free_symbols
         ]
@@ -2463,6 +2450,27 @@ def compute_restickify_target_layout(
         old_var = None
     if len(old_var_outer_dims) > 1:
         return None
+    # SANITY (old-side): now that old_var is non-factorized on the device side,
+    # check whether host_size/stride at the single host dim carrying old_var
+    # match what _host_size_stride_for_expr returned — if so, we can drop the call.
+    if old_var is not None:
+        _old_host_dims = [d for d, e in enumerate(ic) if old_var in e.free_symbols]
+        if len(_old_host_dims) == 1:
+            _old_d = _old_host_dims[0]
+            assert host_size[_old_d] == old_sd_host_size, (
+                f"old-side size mismatch: host_size[{_old_d}]={host_size[_old_d]} vs {old_sd_host_size}"
+            )
+            assert host_stride[_old_d] == old_sd_host_stride, (
+                f"old-side stride mismatch: host_stride[{_old_d}]={host_stride[_old_d]} vs {old_sd_host_stride}"
+            )
+        else:
+            # old_var spans multiple host dims even though device side is non-factorized
+            # (collapsed by _prepare_for_restickify). Log to understand this case.
+            assert False, (
+                f"old_var={old_var!r} spans {len(_old_host_dims)} host dims after "
+                f"device-side non-factorized guard: ic={ic!r}, old_sd_host_size={old_sd_host_size}, "
+                f"old_sd_host_stride={old_sd_host_stride}"
+            )
     old_device_size = list(stl.device_size)
     old_stride_map = list(stl.stride_map)
     old_sd_outer_dim = next(
@@ -2480,15 +2488,19 @@ def compute_restickify_target_layout(
     old_sd_free = idc[old_sd_outer_dim].free_symbols - ({old_var} if old_var else set())
     if old_sd_free or idc[new_sd_outer_dim].free_symbols - {new_var}:
         return None
-    # SANITY: verify new-side values match direct stl device layout lookup
-    assert stl.device_size[new_sd_outer_dim] == new_sd_host_size, (
-        f"new-side size mismatch: stl.device_size[{new_sd_outer_dim}]={stl.device_size[new_sd_outer_dim]} "
-        f"vs _host_size_stride_for_expr={new_sd_host_size}"
-    )
-    assert stl.stride_map[new_sd_outer_dim] == new_sd_host_stride, (
-        f"new-side stride mismatch: stl.stride_map[{new_sd_outer_dim}]={stl.stride_map[new_sd_outer_dim]} "
-        f"vs _host_size_stride_for_expr={new_sd_host_stride}"
-    )
+    # SANITY: verify new-side values match dep.ranges[new_var] and dep.index.coeff(new_var)
+    # — the proposed reliable replacement for _host_size_stride_for_expr.
+    if arg is not None and new_var in arg.dep.ranges:
+        _new_size_from_dep = concretize_expr(arg.dep.ranges[new_var])
+        _new_stride_from_dep = int(sympy.expand(arg.dep.index).coeff(new_var))
+        assert _new_size_from_dep == new_sd_host_size, (
+            f"new-side size mismatch: dep.ranges[{new_var}]={_new_size_from_dep} "
+            f"vs _host_size_stride_for_expr={new_sd_host_size}"
+        )
+        assert _new_stride_from_dep == new_sd_host_stride, (
+            f"new-side stride mismatch: dep.index.coeff({new_var})={_new_stride_from_dep} "
+            f"vs _host_size_stride_for_expr={new_sd_host_stride}"
+        )
     device_size = restickify_device_size(
         old_device_size,
         old_sd_outer_dim,
