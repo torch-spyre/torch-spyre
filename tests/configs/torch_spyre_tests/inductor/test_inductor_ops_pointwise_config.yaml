@@ -17,6 +17,8 @@ test_suite_config:
             - TestOps::test_native_int64_large_values.*
             # Negative-operand broadcast: SENUINT32 label must not corrupt signed fill values.
             - TestOps::test_native_int64_negative_broadcast.*
+            - TestOps::test_5d_neg.*
+            - TestOps::test_cos_sin.*
           mode: mandatory_success
           tags:
             - ops__inductor-pointwise
