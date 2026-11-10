@@ -2492,7 +2492,6 @@ class TestRefusals(unittest.TestCase):
             [
                 "lx-relayout",
                 "relayout-element-arrangement",
-                "relayout-format",
                 "relayout-threaded",
                 "relayout-tiling",
                 "staggered-element-arrangement",
@@ -2518,7 +2517,7 @@ class TestRefusals(unittest.TestCase):
             if isinstance(node, ast.Call)
             and getattr(node.func, "id", None) == "_unimplemented"
         ]
-        self.assertEqual(len(messages), 6)
+        self.assertEqual(len(messages), 5)
         for message in messages:
             with self.subTest(message=message[:40]):
                 for blame in ("dbo-opt", "no consumer", "nothing lowers", "scheduler"):
@@ -2938,8 +2937,6 @@ class TestRelayout(unittest.TestCase):
     def test_refusals(self):
         refusals = {
             "relayout-tiling": {"divisions": {"c1": 2}},
-            # fp16 and fp32 are emitted (``ktir.RELAYOUT_FORMATS``); int32 is not.
-            "relayout-format": {"dtype": DataFormats.IEEE_INT32},
             "relayout-threaded": {"allocations": [None, {"lx": 0}]},
             "relayout-element-arrangement": {"arrangements": [ElementArrangement.EXX2]},
         }
@@ -3073,7 +3070,6 @@ class TestRelayoutDetection(unittest.TestCase):
     def test_a_same_layout_copy_keeps_the_copy_refusals(self):
         """A plain copy is refused where a relayout would be, by the same label."""
         for label, overrides in {
-            "relayout-format": {"dtype": DataFormats.IEEE_INT32},
             "relayout-threaded": {"allocations": [None, {"lx": 0}]},
             "relayout-element-arrangement": {"arrangements": [ElementArrangement.EXX2]},
         }.items():

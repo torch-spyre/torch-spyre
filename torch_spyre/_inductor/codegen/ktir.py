@@ -1220,16 +1220,6 @@ def _access(
 THREADED_SPACES: tuple[str, ...] = ("lx",)
 POOL_SPACE = "hbm_pool"
 
-# The device formats a copy op (``Recipe.copy``) may be emitted at.  A copy's
-# payload yields its operand at whatever element type it was loaded, so the
-# format does not change what the KTIR computes; it changes the stick, which a
-# relayout reads off each coordinate's divisor (64 lanes at fp16, 32 at fp32)
-# rather than assuming.  An fp32 tensor therefore has twice as many sticks as
-# the same logical fp16 tensor along a dim that touches the stick.
-RELAYOUT_FORMATS: frozenset[DataFormats] = frozenset(
-    {DataFormats.SEN169_FP16, DataFormats.IEEE_FP32}
-)
-
 
 def is_threaded(arg: TensorArg) -> bool:
     """Whether this buffer is carried as an SSA value: no base, no view, no store.
@@ -1994,20 +1984,13 @@ class KernelPlan:
 
         Asked of every copy recipe (``Recipe.copy``), whichever path builds its
         step, so that whether an identity's operands happen to need a relayout
-        does not decide whether a threaded, fused-arrangement or unsupported-format
-        copy is let through.  Every operand, inputs and output, must pass
-        ``_check_relayout_operand``, and the op must be at one of
-        ``RELAYOUT_FORMATS``.
+        does not decide whether a threaded or fused-arrangement copy is let
+        through.  Every operand, inputs and output, must pass
+        ``_check_relayout_operand``.  Which formats a copy exists at is its arm's
+        ``dtypes``, as for every other op.
         """
         for arg in operands:
             KernelPlan._check_relayout_operand(spec, arg)
-        dtype = dtype_of(spec)
-        if dtype not in RELAYOUT_FORMATS:
-            _unimplemented(
-                "relayout-format",
-                f"{spec.op!r} at {dtype.name}; a relayout is emitted at "
-                f"{', '.join(sorted(f.name for f in RELAYOUT_FORMATS))} only",
-            )
 
     def _relayout_step(
         self, spec: OpSpec, loops: Sequence[LoopSpec], stage: int
@@ -3752,17 +3735,26 @@ class KtirBuilder:
         # ``identity`` is the same data movement when it arrives under the
         # generic name (or a plain copy, when its operands already line up).
         # Neither recipe says which path builds the step: ``needs_relayout``
-        # reads that off the operands.  The payload is format-free; which formats
-        # the plan lets through is ``_check_copy_operands``' business.
+        # reads that off the operands.  The payload is format-free; the arm
+        # claims fp16 and fp32, the formats a copy has been run at, so any other
+        # format has no arm.
         RESTICKIFY_OP: Recipe(
             arity=1,
             copy=True,
-            arms=Arm(kind=BindingKind.PAYLOAD, binding=_written_here(lambda x: x)),
+            arms=Arm(
+                kind=BindingKind.PAYLOAD,
+                binding=_written_here(lambda x: x),
+                dtypes=(DataFormats.SEN169_FP16, DataFormats.IEEE_FP32),
+            ),
         ),
         IDENTITY_OP: Recipe(
             arity=1,
             copy=True,
-            arms=Arm(kind=BindingKind.PAYLOAD, binding=_written_here(lambda x: x)),
+            arms=Arm(
+                kind=BindingKind.PAYLOAD,
+                binding=_written_here(lambda x: x),
+                dtypes=(DataFormats.SEN169_FP16, DataFormats.IEEE_FP32),
+            ),
         ),
     }
 
