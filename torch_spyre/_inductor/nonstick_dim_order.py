@@ -557,7 +557,9 @@ def _retile_entry_per_stick(
     the indexed coordinate becomes an outer device dim. This is the layout a
     host ``[N, 1]`` input already receives.
     """
-    retiled_stl = compute_size1_restickify_target(value_stl, host_layout, dep, op)
+    retiled_stl = compute_size1_restickify_target(
+        value_stl, host_layout, dep, op, indirect_sizes=sizes
+    )
     if retiled_stl is None:
         raise Unsupported(
             f"cannot re-tile {dep.name}: no size-1 stick target for {value_stl}"
