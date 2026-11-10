@@ -52,6 +52,7 @@ M=1 (decode phase) correctly.
 
 from typing import Any, Union
 import dataclasses
+import functools
 import struct
 import math
 import operator
@@ -1218,8 +1219,33 @@ class InvalidDomain(Exception):
         self.arg_index = arg_index
 
 
-def _sigmoid(x):
-    return 1.0 / (1.0 + math.exp(-x))
+# DomainRangeSolver writes unary ops as sympy expressions in this variable.
+_X = sympy.Symbol("x", real=True)
+
+_SIGMOID = 1 / (1 + sympy.exp(-_X))
+
+
+# silu(x) = x * sigmoid(x) decreases up to its minimum, ~-0.2785 at this x, and
+# increases after it.
+_SILU_ARGMIN = -1.278464542761074
+
+
+@functools.lru_cache(maxsize=None)
+def _eval_at(expr: Expr, point: Expr, approach: str | None) -> Expr:
+    """expr at x = point, or its one-sided limit when approach is "+" or "-".
+
+    A limit gives the value the op tends to at an excluded endpoint, where it
+    may not be defined (log at 0, silu at -oo). A finite value is rounded to a
+    float, like the device computes it (exp(-1e4) underflows to 0).
+    """
+    if approach is None:
+        value = expr.subs(_X, point)
+    else:
+        value = sympy.limit(expr, _X, point, approach)
+    if not value.is_finite:
+        # Infinite, or a limit sympy could not evaluate.
+        return value
+    return sympy.Float(float(value))
 
 
 # Placeholder returned by the tracers' indirect_indexing. A load whose index
@@ -1305,16 +1331,37 @@ class DomainRangeSolver(DefaultHandler):
             # other reductions can leave some garbage in padding
             return S.Reals
 
-    # only valid for monotonic functions
-    def _unary_op(self, op, x0, fallback_set=None) -> Set:
+    def _unary_op(self, expr, x0, fallback_set=None, turning_points=()) -> Set:
+        """Image of x0 under the op expr, a sympy expression in _X.
+
+        expr must be continuous on x0 and monotonic between consecutive
+        turning_points (where it changes direction, e.g. 0 for abs and square).
+        The extremes of the image of an interval then lie at its endpoints, or
+        at a turning point inside it. A closed endpoint is attained, so expr is
+        evaluated there. An open one (and so every infinite one) is not, and
+        expr only tends to its limit there, which is an open bound.
+        """
         if isinstance(x0, FiniteSet):
-            return FiniteSet(*(op(e) for e in x0))
+            return FiniteSet(*(_eval_at(expr, e, None) for e in x0))
         elif isinstance(x0, Interval):
-            _start = (op(x0.inf), x0.left_open)
-            _end = (op(x0.sup), x0.right_open)
-            if _start[0] > _end[0]:
-                _start, _end = _end, _start
-            return Interval(_start[0], _end[0], left_open=_start[1], right_open=_end[1])
+            # Each candidate is a pair of (value, open).
+            candidates = [
+                (_eval_at(expr, x0.inf, "+" if x0.left_open else None), x0.left_open),
+                (_eval_at(expr, x0.sup, "-" if x0.right_open else None), x0.right_open),
+            ]
+            # A turning point inside the interval is attained, so its value is
+            # a closed bound.
+            candidates += [
+                (_eval_at(expr, t, None), False)
+                for t in turning_points
+                if x0.contains(t) is S.true
+            ]
+            lo = min(v for v, _ in candidates)
+            hi = max(v for v, _ in candidates)
+            # A bound is open only if every candidate reaching it is open.
+            lo_open = all(o for v, o in candidates if v == lo)
+            hi_open = all(o for v, o in candidates if v == hi)
+            return Interval(lo, hi, left_open=lo_open, right_open=hi_open)
         if fallback_set is not None:
             return fallback_set
         return x0
@@ -1329,17 +1376,38 @@ class DomainRangeSolver(DefaultHandler):
             return FiniteSet(op(x0.args[0], x1.args[0]))
         return fallback_set
 
+    @staticmethod
+    def _corner(op, a, b) -> Expr | None:
+        """op at the corner (a, b) of a box.
+
+        a and b are (bound, open, is_upper) endpoints. A corner where op is
+        undefined (1/0, 0/0, 0 * oo, oo - oo) and one bound is open is not
+        attained: op only tends to its limit in that coordinate there. A corner
+        with both bounds open is dropped (None). op is monotonic in each
+        argument, so where the two iterated limits disagree (oo - oo) each is
+        also reached along an edge, at another corner. Like _eval_at, a finite
+        value is a float, so that equal bounds compare equal.
+        """
+        value = sympy.sympify(op(a[0], b[0]))
+        if value is not S.NaN and value is not S.ComplexInfinity:
+            return value if value.is_infinite else sympy.Float(float(value))
+        if a[1] and b[1]:
+            return None
+        if a[1]:
+            return _eval_at(sympy.sympify(op(_X, b[0])), a[0], "+-"[a[2]])
+        return _eval_at(sympy.sympify(op(a[0], _X)), b[0], "+-"[b[2]])
+
     def _binary_op(self, op, x0, x1, output_set=None) -> Set:
-        # Like _unary_op, assumes op is monotonic in each argument, so the
+        # Assumes op is monotonic in each argument, so the
         # extremes of the result lie at the corners of the input bounds.
         if isinstance(x0, FiniteSet) and isinstance(x1, FiniteSet):
             return FiniteSet(*(op(a, b) for a in x0 for b in x1))
 
         def pieces(x):
-            # Each piece is a pair of (bound, open) endpoints.
+            # Each piece is a pair of (bound, open, is_upper) endpoints.
             if isinstance(x, FiniteSet):
-                return [((e, False), (e, False)) for e in x]
-            return [((x.inf, x.left_open), (x.sup, x.right_open))]
+                return [((e, False, False), (e, False, True)) for e in x]
+            return [((x.inf, x.left_open, False), (x.sup, x.right_open, True))]
 
         if isinstance(x0, (FiniteSet, Interval)) and isinstance(
             x1, (FiniteSet, Interval)
@@ -1348,11 +1416,14 @@ class DomainRangeSolver(DefaultHandler):
             for a_lo, a_hi in pieces(x0):
                 for b_lo, b_hi in pieces(x1):
                     corners = [
-                        (sympy.sympify(op(a[0], b[0])), a[1] or b[1])
+                        (v, a[1] or b[1])
                         for a in (a_lo, a_hi)
                         for b in (b_lo, b_hi)
+                        if (v := self._corner(op, a, b)) is not None
                     ]
-                    if any(v is sympy.nan for v, _ in corners):
+                    if not corners or any(
+                        v is S.NaN or v.has(sympy.Limit) for v, _ in corners
+                    ):
                         return output_set if output_set is not None else x0.union(x1)
                     lo = min(v for v, _ in corners)
                     hi = max(v for v, _ in corners)
@@ -1368,7 +1439,9 @@ class DomainRangeSolver(DefaultHandler):
         return x0.union(x1)
 
     def abs(self, x0):
-        return self._unary_op(math.fabs, x0, self.positive_numbers)
+        return self._unary_op(
+            sympy.Abs(_X), x0, self.positive_numbers, turning_points=(0,)
+        )
 
     def add(self, x0, x1):
         return self._binary_op(operator.add, x0, x1)
@@ -1385,7 +1458,7 @@ class DomainRangeSolver(DefaultHandler):
         return self._singleton_set_binary(lambda x, y: x == y, x0, x1, self.booleans)
 
     def exp(self, x0):
-        return self._unary_op(math.exp, x0, self.positive_numbers)
+        return self._unary_op(sympy.exp(_X), x0, self.positive_numbers)
 
     def exx2(self, x, scale, useZeroMean):
         return self.positive_numbers
@@ -1414,7 +1487,7 @@ class DomainRangeSolver(DefaultHandler):
     def log(self, x0):
         if not x0.is_subset(self.extended_strictly_positive_numbers):
             raise InvalidDomain(self.extended_strictly_positive_numbers, "log")
-        return self._unary_op(math.log, x0, S.Reals)
+        return self._unary_op(sympy.log(_X), x0, S.Reals)
 
     def le(self, x0, x1):
         return self._singleton_set_binary(operator.le, x0, x1, self.booleans)
@@ -1428,11 +1501,44 @@ class DomainRangeSolver(DefaultHandler):
     def lt(self, x0, x1):
         return self._singleton_set_binary(operator.lt, x0, x1, self.booleans)
 
+    # max and min are constant where one argument dominates, so a bound from
+    # an open corner can still be attained (max(x, 0) = 0 for every x <= 0).
+    # Their exact image is set algebra instead: max(a, b) = a exactly when
+    # some b <= a, so max(x0, x1) = (x0 & {v >= some b}) | (x1 & {v >= some a}).
+
+    @staticmethod
+    def _at_or_above(s: Set) -> Set:
+        """The values, including oo, at or above some element of s."""
+        attained = s.contains(s.inf) is S.true
+        # sympy intervals exclude +-oo, so s.inf (if it is -oo) and oo, which
+        # is above every element, are added as points.
+        bound = FiniteSet(s.inf) if attained else S.EmptySet
+        return sympy.Union(
+            Interval(s.inf, oo, left_open=not attained), bound, FiniteSet(oo)
+        )
+
+    @staticmethod
+    def _at_or_below(s: Set) -> Set:
+        """The values, including -oo, at or below some element of s."""
+        attained = s.contains(s.sup) is S.true
+        bound = FiniteSet(s.sup) if attained else S.EmptySet
+        return sympy.Union(
+            Interval(-oo, s.sup, right_open=not attained), bound, FiniteSet(-oo)
+        )
+
     def maximum(self, x0, x1):
-        return self._binary_op(max, x0, x1)
+        if x0 is S.EmptySet or x1 is S.EmptySet:
+            return S.EmptySet
+        return x0.intersect(self._at_or_above(x1)).union(
+            x1.intersect(self._at_or_above(x0))
+        )
 
     def minimum(self, x0, x1):
-        return self._binary_op(min, x0, x1)
+        if x0 is S.EmptySet or x1 is S.EmptySet:
+            return S.EmptySet
+        return x0.intersect(self._at_or_below(x1)).union(
+            x1.intersect(self._at_or_below(x0))
+        )
 
     def mul(self, x0, x1):
         return self._binary_op(operator.mul, x0, x1)
@@ -1441,12 +1547,12 @@ class DomainRangeSolver(DefaultHandler):
         return self._singleton_set_binary(operator.ne, x0, x1, self.booleans)
 
     def neg(self, x0: Set):
-        return self._unary_op(operator.neg, x0, S.Reals)
+        return self._unary_op(-_X, x0, S.Reals)
 
     def reciprocal(self, x0):
         if not x0.is_subset(self.extended_non_zero_reals):
             raise InvalidDomain(self.extended_non_zero_reals, "reciprocal")
-        return self._unary_op(lambda x: 1 / x, x0, self.extended_non_zero_reals)
+        return self._unary_op(1 / _X, x0, self.extended_non_zero_reals)
 
     def qfp8ch(self, x):
         return x
@@ -1458,40 +1564,38 @@ class DomainRangeSolver(DefaultHandler):
         return self.positive_numbers
 
     def relu(self, x0):
-        return self._unary_op(lambda x: max(x, 0.0), x0, self.positive_numbers)
+        return self._unary_op(sympy.Max(_X, 0), x0, self.positive_numbers)
 
     def rsqrt(self, x0):
         if not x0.is_subset(self.extended_strictly_positive_numbers):
             raise InvalidDomain(self.extended_strictly_positive_numbers, "rsqrt")
         return self._unary_op(
-            lambda x: 1 / math.sqrt(x), x0, self.extended_strictly_positive_numbers
+            1 / sympy.sqrt(_X), x0, self.extended_strictly_positive_numbers
         )
 
     def sigmoid(self, x0):
         return self._unary_op(
-            _sigmoid, x0, Interval(0, 1, left_open=True, right_open=True)
+            _SIGMOID, x0, Interval(0, 1, left_open=True, right_open=True)
         )
 
     def softplus(self, x, beta, threshold):
-        def sp(x):
-            return (1.0 / beta) * math.log(1.0 + math.exp(beta * x))
-
+        sp = sympy.log(1 + sympy.exp(beta * _X)) / beta
         return self._unary_op(sp, x, Interval(-0.278, sympy.oo))
 
     def sqrt(self, x0):
         if not x0.is_subset(self.positive_numbers):
             raise InvalidDomain(self.positive_numbers, "rsqrt")
-        return self._unary_op(math.sqrt, x0, self.positive_numbers)
+        return self._unary_op(sympy.sqrt(_X), x0, self.positive_numbers)
 
     def square(self, x0):
-        return self._unary_op(lambda x: x * x, x0, self.positive_numbers)
+        return self._unary_op(_X**2, x0, self.positive_numbers, turning_points=(0,))
 
     def sub(self, x0, x1):
         return self._binary_op(operator.sub, x0, x1)
 
     def tanh(self, x0):
         return self._unary_op(
-            math.tanh, x0, Interval(-1, 1, left_open=True, right_open=True)
+            sympy.tanh(_X), x0, Interval(-1, 1, left_open=True, right_open=True)
         )
 
     def to_dtype(self, x, dtype, src_dtype=None, use_compute_types=False):
@@ -1504,7 +1608,12 @@ class DomainRangeSolver(DefaultHandler):
         return self._binary_op(operator.truediv, x0, x1)
 
     def silu(self, x0):
-        return self._unary_op(lambda x: x * _sigmoid(x), x0, Interval(-0.278, sympy.oo))
+        return self._unary_op(
+            _X * _SIGMOID,
+            x0,
+            Interval(-0.278, sympy.oo),
+            turning_points=(_SILU_ARGMIN,),
+        )
 
     def where(self, condition, input, other):
         return input.union(other)
