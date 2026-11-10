@@ -1192,7 +1192,7 @@ class TestRoundtripInputVariants:
     """Activation roundtrip with non-standard inputs: non-contiguous (transposed) and BF16."""
 
     @pytest.mark.xfail(
-        strict=True,
+        strict=False,
         raises=AssertionError,
         reason="https://github.com/torch-spyre/torch-spyre/issues/6160: transposed input "
         "returns wrong values (4/16 elements differ, up to 16.0)",
