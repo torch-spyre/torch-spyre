@@ -978,6 +978,22 @@ class TestUnsupportedGates(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             x.to("spyre")
 
+    def test_kernel_to_dtype_without_src_dtype_raises_unsupported(self):
+        """A kernel cast without src_dtype is rejected with Unsupported (#5783).
+
+        OpsHandler.to_dtype declares src_dtype optional, and some upstream
+        Inductor lowerings omit it. Spyre picks the hardware op from the
+        (src_dtype, dtype) pair, so it must reject the cast with a clear
+        message instead of failing with TypeError.
+        """
+        from torch_spyre._inductor.errors import Unsupported
+        from torch_spyre._inductor.spyre_kernel import SpyreOpFuncs
+
+        for kwargs in ({}, {"use_compute_types": False}, {"src_dtype": None}):
+            with self.subTest(**kwargs):
+                with self.assertRaisesRegex(Unsupported, "without a source dtype"):
+                    SpyreOpFuncs.to_dtype(object(), torch.float16, **kwargs)
+
 
 class TestModelIntegration(unittest.TestCase):
     """Compiled model integration tests: dtype behavior through realistic compute patterns."""
