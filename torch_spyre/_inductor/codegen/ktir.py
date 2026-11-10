@@ -2673,18 +2673,6 @@ def _written_here(fold: Callable[..., Any]) -> Callable[[], Callable[..., Any]]:
     return lambda: fold
 
 
-def _copy_recipe() -> Recipe:
-    """A recipe whose payload yields its one operand: ``Recipe(copy=True)``.
-
-    One constructor for every op that is a copy, so their recipes cannot drift.
-    """
-    return Recipe(
-        arity=1,
-        copy=True,
-        arms=Arm(kind=BindingKind.PAYLOAD, binding=_written_here(lambda x: x)),
-    )
-
-
 def _arms(arms: Arm | tuple[Arm, ...]) -> tuple[Arm, ...]:
     """\\p arms as a tuple, whether it was written as one arm or several.
 
@@ -3750,8 +3738,16 @@ class KtirBuilder:
         # Neither recipe says which path builds the step: ``needs_relayout``
         # reads that off the operands.  The payload is format-free; which formats
         # the plan lets through is ``_check_copy_operands``' business.
-        RESTICKIFY_OP: _copy_recipe(),
-        IDENTITY_OP: _copy_recipe(),
+        RESTICKIFY_OP: Recipe(
+            arity=1,
+            copy=True,
+            arms=Arm(kind=BindingKind.PAYLOAD, binding=_written_here(lambda x: x)),
+        ),
+        IDENTITY_OP: Recipe(
+            arity=1,
+            copy=True,
+            arms=Arm(kind=BindingKind.PAYLOAD, binding=_written_here(lambda x: x)),
+        ),
     }
 
     # -- emission surfaces -------------------------------------------------
