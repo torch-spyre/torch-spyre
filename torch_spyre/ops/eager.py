@@ -735,89 +735,69 @@ def spyre__zero_(self: torch.Tensor) -> torch.Tensor:
     return self
 
 
-def _scatter_row_values(self, dim, index):
-    """The 1-D ``index`` of a scatter that writes whole sticks, or ``None``.
+def _scatter_rows(self, dim, index):
+    """Bounds-check ``index`` on the host, as CPU does, and return its rows.
 
-    The backend rejects an N-D scatter index (#4409), but an index that is
-    uniform across every other dimension writes whole rows, which is
-    ``index_copy``. Index values are graph inputs under ``torch.compile``; here
-    they are concrete, so the shape of the write can be checked at runtime.
-    A row may stop short on a stick boundary (128 bytes), since a lane within a
-    stick is not addressable. ``index`` is on the host. The result can repeat a
-    row.
-    """
-    ndim = self.dim()
-    if ndim < 2:
-        return None
-    for d in range(ndim):
-        if d == dim or index.size(d) == self.size(d):
-            continue
-        if d != ndim - 1 or (index.size(d) * self.element_size()) % 128 != 0:
-            return None
-    row = index[tuple(slice(None) if d == dim else 0 for d in range(ndim))]
-    if (index != row.view([-1 if d == dim else 1 for d in range(ndim)])).any():
-        return None
-    return row.to(torch.int64)
-
-
-def _checked_scatter_row(self, dim, index):
-    """Return ``dim``, wrapped, and the row values of ``index``, or raise.
-
-    ``index`` is bounds-checked on the host, as on CPU.
+    Spyre cannot run a general scatter (#4399, #4409), but one whose index is
+    the same along every dim but ``dim`` writes whole rows, i.e. index_copy.
     """
     from torch_spyre._inductor.errors import Unsupported
 
-    dim %= max(self.dim(), 1)
-    size = self.size(dim) if self.dim() else 1
-    host_index = index.cpu()
-    bad = host_index[(host_index < 0) | (host_index >= size)]
+    n = self.dim()
+    dim %= max(n, 1)
+    size = self.size(dim) if n else 1
+    index = index.cpu()
+    bad = index[(index < 0) | (index >= size)]
     if bad.numel():
         raise RuntimeError(
             f"index {bad[0].item()} is out of bounds for dimension {dim} "
             f"with size {size}"
         )
-    row = _scatter_row_values(self, dim, host_index)
-    if row is None:
+    # Every other dim is whole, but a row may stop on a stick (128-byte) boundary.
+    whole = n >= 2 and all(
+        d == dim
+        or index.size(d) == self.size(d)
+        or (d == n - 1 and index.size(d) * self.element_size() % 128 == 0)
+        for d in range(n)
+    )
+    if whole:
+        row = index[tuple(slice(None) if d == dim else 0 for d in range(n))]
+        whole = bool(
+            (index == row.view([-1 if d == dim else 1 for d in range(n)])).all()
+        )
+    if not whole:
         raise Unsupported(
             "scatter that does not write whole rows: index must be uniform "
             f"across every dimension but {dim} and at least 2-D (#4399, #4409)"
         )
-    return dim, row
+    return dim, row.to(torch.int64)
 
 
-def _is_adjacent_rows_view(t: torch.Tensor) -> bool:
-    """Whether ``t`` is not a view, or a run of adjacent complete last-dim rows."""
+def _can_scatter_on_device(t):
+    """Whether compiled index_copy can write ``t``: not a view, or whole rows."""
     base = t._base
-    return base is None or (
+    if base is None:
+        return True
+    if not (
         t.dim() >= 1
         and t.is_contiguous()
         and base.is_contiguous()
         and t.size(-1) == base.size(-1)
-    )
-
-
-def _can_scatter_on_device(t: torch.Tensor) -> bool:
-    """Whether a compiled ``index_copy`` can read or write ``t`` in place."""
-    if t._base is None:
-        return True
-    if not _is_adjacent_rows_view(t):
+    ):
         return False
-    # An offset view goes through d2d copy_, which rejects rows that end
-    # mid-stick (128 bytes) and writes nothing for bool.
+    # An offset view goes through d2d copy_, which needs whole sticks and no bool.
     return t.storage_offset() == 0 or (
-        (t.size(-1) * t.element_size()) % 128 == 0 and t.dtype != torch.bool
+        t.size(-1) * t.element_size() % 128 == 0 and t.dtype != torch.bool
     )
 
 
 def _device_target(out, dim, row, whole_width):
-    """Where a device scatter into ``out`` should write.
+    """Return ``(target, dim, row, swapped, write_back)`` for a write into ``out``.
 
-    Returns ``(target, dim, row, swapped, write_back)`` in the terms of
-    ``target``. A view is translated to its base where its rows or columns are
-    rows or columns of the base: that needs no temporary, and reaches views
-    ``copy_`` cannot write. ``swapped`` means ``target`` is ``out`` transposed.
-    ``write_back`` means ``target`` is a clone to ``copy_`` into ``out``.
-    ``target`` is ``None`` if no route reaches ``out``.
+    A view whose rows or columns are its base's is written through the base, so
+    no temporary is needed. ``swapped`` means ``target`` is ``out`` transposed,
+    ``write_back`` that it is a clone to copy into ``out``. ``target`` is
+    ``None`` if no route reaches ``out``.
     """
     base, offset = out._base, out.storage_offset()
     if base is None or (
@@ -860,120 +840,85 @@ def _device_target(out, dim, row, whole_width):
 
 
 def _along_stick_dim(t, src, write):
-    """Run ``write(moved, moved_src)`` with the stick dim of ``t`` moved first.
+    """Run ``write(t, src)`` with the stick dim moved first (#4404).
 
-    ``index_copy`` addresses rows and not the stick dim (#4404), so the stick
-    dim is permuted forward. Both permutes need a device copy; a large ``t`` is
-    done a block of rows at a time so that copy is a block and not the tensor.
-    A block needs complete sticks, for d2d ``copy_``, and at least 2 rows.
+    A large ``t`` goes a block of rows at a time, so the device copy that
+    each permute needs is a block and not the tensor.
     """
     last = t.dim() - 1
-    front = (last, *range(last))
-    back = (*range(1, last + 1), 0)
+    front, back = (last, *range(last)), (*range(1, last + 1), 0)
 
-    def run(block, block_src):
+    def run(block, part):
         moved = block.permute(front).clone(memory_format=torch.contiguous_format)
-        if block_src is not None:
-            block_src = block_src.permute(front).clone(
-                memory_format=torch.contiguous_format
-            )
-        write(moved, block_src)
+        write(moved, part.permute(front).clone(memory_format=torch.contiguous_format))
         return moved.permute(back)
 
     rows = t.size(0)
-    step = max(_STICK_BLOCK_MIN_ROWS, rows // _STICK_BLOCKS)
-    row_bytes = t.numel() // rows * t.element_size()
-    if rows < 2 * step or row_bytes % 128 != 0:
+    step = max(64, rows // 32)
+    # A block needs at least 2 rows, and whole sticks for d2d copy_.
+    if rows < 2 * step or t[0].numel() * t.element_size() % 128:
         t.copy_(run(t, src))
         return
     stops = [*range(step, rows - step + 1, step), rows]
     for start, stop in zip((0, *stops), stops):
         block = t[start:stop]
-        block_src = None if src is None else src[start:stop].clone()
-        block.copy_(run(block.clone(), block_src))
-
-
-_STICK_BLOCK_MIN_ROWS = 64
-_STICK_BLOCKS = 32
-
-
-def _scatter_on_device(out, dim, row, whole_width, src, write):
-    """Run ``write(t, dim, row, src)`` on the tensor behind ``out``.
-
-    ``t`` is offset-0 and ``dim`` is not its stick dim, so ``write`` can use
-    ``index_select`` and ``index_copy``. ``src`` is ``None`` if there is none.
-    """
-    from torch_spyre._inductor.errors import Unsupported
-
-    target, dim, row, swapped, write_back = _device_target(out, dim, row, whole_width)
-    if target is None:
-        raise Unsupported("scatter into a view that is not a run of whole rows")
-    if swapped and src is not None:
-        src = src.permute(1, 0).clone(memory_format=torch.contiguous_format)
-    if dim == target.dim() - 1:
-        if target.dtype == torch.bool:
-            # The device permute returns wrong values for bool.
-            raise Unsupported("scatter of bool along the last (stick) dimension")
-        _along_stick_dim(target, src, lambda t, part: write(t, 0, row, part))
-    else:
-        write(target, dim, row, src)
-    if write_back:
-        out.copy_(target)
-    return out
-
-
-def _replace_rows(t, dim, row, src):
-    """Write ``src`` to rows of ``t``, keeping what a short ``src`` leaves."""
-    picked = row.to(t.device)
-    rest = t.size(-1) - src.size(-1)
-    if rest:
-        old = t.index_select(dim, picked).narrow(-1, src.size(-1), rest)
-        src = torch.cat([src, old], dim=-1)
-    torch.index_copy(t, dim, picked, src, out=t)
-
-
-def _prepare_out(self, out):
-    """Copy ``self`` to a different ``out``; the write then happens in ``out``."""
-    from torch_spyre._inductor.errors import Unsupported
-
-    if out is self:
-        return
-    if not (_can_scatter_on_device(self) and _can_scatter_on_device(out)):
-        raise Unsupported("scatter out= with a view that is not a run of whole rows")
-    out.copy_(self)
+        block.copy_(run(block.clone(), src[start:stop].clone()))
 
 
 @torch.library.register_kernel("aten::scatter.src_out", ["spyre"])  # type:ignore
 def spyre__scatter_src_out(self, dim, index, src, *, out):
-    """Scatter on Spyre; a scatter it cannot express raises rather than move.
+    """Whole-row scatter on Spyre through index_copy; others raise, #4401.
 
-    This also serves ``scatter`` and ``scatter_``. An index that is not a row
-    write is rejected by the backend (#4409) and 1-D by the scheduler (#4399).
+    This also serves ``scatter`` and ``scatter_``.
     """
+    from torch_spyre._inductor.errors import Unsupported
+
     _check_same_device([(out, True), (self, False), (index, False), (src, False)])
     if index.numel() == 0:
         return out if out is self else out.copy_(self)
-    dim, row = _checked_scatter_row(self, dim, index)
+    dim, row = _scatter_rows(self, dim, index)
     # scatter reads only the part of src that index covers.
-    if src.shape != index.shape:
-        for d, size in enumerate(index.shape):
-            src = src.narrow(d, 0, size)
-    # Rows come back sorted, so keep picks the src row of each: its last write
-    # when a row repeats, as on CPU.
-    row, inverse = row.unique(return_inverse=True)
-    positions = torch.arange(inverse.numel())
-    keep = torch.zeros_like(row).scatter_(0, inverse, positions)
-    if keep.numel() == positions.numel() and torch.equal(keep, positions):
-        keep = None
+    src = src[tuple(slice(0, n) for n in index.shape)]
+    # CPU keeps the last write to a repeated row: keep that src row only.
+    keep = None
+    unique, inverse = row.unique(return_inverse=True)
+    if unique.numel() < row.numel():
+        keep = torch.zeros_like(unique).scatter_(0, inverse, torch.arange(row.numel()))
+        row = unique
 
-    def write(t, dim, row, part):
+    if out is not self:
+        if not (_can_scatter_on_device(self) and _can_scatter_on_device(out)):
+            raise Unsupported(
+                "scatter out= with a view that is not a run of whole rows"
+            )
+        out.copy_(self)
+    whole_width = dim == out.dim() - 1 or index.size(-1) == out.size(-1)
+    target, dim, row, swapped, write_back = _device_target(out, dim, row, whole_width)
+    if target is None:
+        raise Unsupported("scatter into a view that is not a run of whole rows")
+    if swapped:
+        src = src.permute(1, 0).clone(memory_format=torch.contiguous_format)
+
+    def write(t, dim, part):
+        picked = row.to(t.device)
         if keep is not None:
             part = part.index_select(dim, keep.to(t.device))
-        _replace_rows(t, dim, row, part)
+        rest = t.size(-1) - part.size(-1)
+        if rest:  # A row that stops short keeps the rest of its old values.
+            old = t.index_select(dim, picked).narrow(-1, part.size(-1), rest)
+            part = torch.cat([part, old], dim=-1)
+        torch.index_copy(t, dim, picked, part, out=t)
 
-    _prepare_out(self, out)
-    whole_width = dim == out.dim() - 1 or index.size(-1) == out.size(-1)
-    return _scatter_on_device(out, dim, row, whole_width, src, write)
+    if dim == target.dim() - 1:
+        if target.dtype == torch.bool:
+            # The device permute returns wrong values for bool.
+            raise Unsupported("scatter of bool along the last (stick) dimension")
+        _along_stick_dim(target, src, lambda t, part: write(t, 0, part))
+    else:
+        write(target, dim, src)
+    if write_back:
+        out.copy_(target)
+    return out
 
 
 @torch.library.register_kernel("aten::uniform_", "spyre")  # type:ignore
