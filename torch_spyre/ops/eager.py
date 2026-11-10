@@ -951,13 +951,6 @@ def spyre__scatter_src_out(self, dim, index, src, *, out):
     write is rejected by the backend (#4409) and 1-D by the scheduler (#4399).
     """
     _check_same_device([(out, True), (self, False), (index, False), (src, False)])
-    # The meta kernel raises the same shape and dtype errors as CPU.
-    torch.scatter(
-        torch.empty_like(self, device="meta"),
-        dim,
-        torch.empty_like(index, device="meta"),
-        torch.empty_like(src, device="meta"),
-    )
     if index.numel() == 0:
         return out if out is self else out.copy_(self)
     dim, row = _checked_scatter_row(self, dim, index)
