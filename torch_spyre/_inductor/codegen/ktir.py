@@ -1786,7 +1786,7 @@ class KernelPlan:
         if recipe.copy:
             # A copy that a reshape or broadcast lines up still has to reach
             # memory in the same formats as the relayout does.
-            self._check_copy_operands(spec, out, inputs[0])
+            self._check_copy_operands(spec, (inputs[0], out))
         dtype = dtype_of(spec)
         for arg in inputs:
             # In-place (input buffer aliases the output) is not supported yet.
@@ -1967,28 +1967,40 @@ class KernelPlan:
         )
 
     @staticmethod
-    def _check_copy_operands(spec: OpSpec, out: TensorArg, source: TensorArg) -> None:
+    def _check_relayout_operand(spec: OpSpec, arg: TensorArg) -> None:
+        """Refuse an operand that a relayout cannot read or write.
+
+        A relayout puts the layout change into a memory view's strides, so the
+        operand must reach memory, and in the standard element arrangement (the
+        strides are worked out per element, so a fused arrangement that packs
+        two values per element would be addressed wrongly).
+        """
+        if is_threaded(arg):
+            _unimplemented(
+                "relayout-threaded",
+                f"{spec.op!r} operand {arg.name!r} is threaded; a relayout "
+                "reads and writes memory",
+            )
+        if _arrangement(arg) not in (None, ElementArrangement.STANDARD):
+            _unimplemented(
+                "relayout-element-arrangement",
+                f"{spec.op!r} operand {arg.name!r} has element arrangement "
+                f"{_arrangement(arg)!r}",
+            )
+
+    @staticmethod
+    def _check_copy_operands(spec: OpSpec, operands: Sequence[TensorArg]) -> None:
         """Refuse a copy op whose operands a copy has not been run with.
 
         Asked of every copy recipe (``Recipe.copy``), whichever path builds its
         step, so that whether an identity's operands happen to need a relayout
         does not decide whether a threaded, fused-arrangement or unsupported-format
-        copy is let through.  Both buffers must reach memory, in the standard
-        element arrangement, at one of ``RELAYOUT_FORMATS``.
+        copy is let through.  Every operand, inputs and output, must pass
+        ``_check_relayout_operand``, and the op must be at one of
+        ``RELAYOUT_FORMATS``.
         """
-        for arg in (source, out):
-            if is_threaded(arg):
-                _unimplemented(
-                    "relayout-threaded",
-                    f"{spec.op!r} operand {arg.name!r} is threaded; a relayout "
-                    "reads and writes memory",
-                )
-            if _arrangement(arg) not in (None, ElementArrangement.STANDARD):
-                _unimplemented(
-                    "relayout-element-arrangement",
-                    f"{spec.op!r} operand {arg.name!r} has element arrangement "
-                    f"{_arrangement(arg)!r}",
-                )
+        for arg in operands:
+            KernelPlan._check_relayout_operand(spec, arg)
         dtype = dtype_of(spec)
         if dtype not in RELAYOUT_FORMATS:
             _unimplemented(
@@ -2030,8 +2042,7 @@ class KernelPlan:
                 f"{spec.op!r} is tiled or work-divided; a relayout is emitted over "
                 "one whole, undivided iteration space (SENCORES=1)",
             )
-        for source in inputs:
-            self._check_copy_operands(spec, out, source)
+        self._check_copy_operands(spec, (*inputs, out))
         ranges = {}
         for sym, (count, _div) in spec.iteration_space.items():
             count = _static(count)
