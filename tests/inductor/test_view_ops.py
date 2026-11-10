@@ -28,10 +28,6 @@ Consolidates operation-level tests for the following view ops:
   §12  narrow / slice
   §13  split
 
-Excluded from this file (kept in their own files):
-  §8   permute                 → test_view_ops_permute.py
-  FVT  module-level / e2e      → test_view_ops_fvt.py
-
 Pass criteria: compare_with_cpu unless noted per subsection.
 
 Stick alignment reference:
