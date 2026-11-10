@@ -470,6 +470,29 @@ def compute_granularity(expr: Expr, max_size: int) -> int:
     )
 
 
+def loop_induction_symbols(
+    index: sympy.Expr, iteration_vars: "set | dict"
+) -> list[sympy.Symbol]:
+    """The loop induction variables an index uses, in name order.
+
+    A loop variable is an unbacked symbol (``u0``: ``splice_while_loops`` defines it
+    with a ``DynamicScalar`` op) that is not one of the op's own iteration
+    variables. This is the definition :func:`concretize_index` relies on to keep
+    the variable symbolic, so the two cannot disagree.
+    """
+    if not isinstance(index, sympy.Basic):
+        return []
+    unbacked = free_unbacked_symbols(index)
+    return sorted(
+        (
+            s
+            for s in index.free_symbols
+            if s in unbacked and s not in iteration_vars and not is_indirect(s.name)
+        ),
+        key=lambda s: s.name,
+    )
+
+
 def concretize_index(index: sympy.Expr, loop_vars: set) -> sympy.Expr:
     """Replace non-loop symbolic variables in an index expression with concrete values.
 
