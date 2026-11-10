@@ -290,6 +290,10 @@ class TestDomainRangeSolver(unittest.TestCase):
         self.assertSetEqual(self.s.maximum(S.Reals, Interval(0, 1)), _NON_NEG)
         self.assertSetEqual(self.s.maximum(S.Reals, FiniteSet(0)), _NON_NEG)
         self.assertSetEqual(self.s.minimum(S.Reals, Interval(0, 1)), Interval(-oo, 1))
+        # relu is max(x, 0): 0 is attained for every x <= 0.
+        self.assertSetEqual(self.s.relu(S.Reals), _NON_NEG)
+        self.assertSetEqual(self.s.relu(Interval.open(-1, 1)), Interval.Ropen(0, 1))
+        self.assertSetEqual(self.s.relu(Interval.open(-oo, 0)), FiniteSet(0))
 
     def test_max_min_exact_image(self) -> None:
         # Values of one argument below every value of the other are not in
@@ -402,6 +406,12 @@ class TestDomainRangeSolver(unittest.TestCase):
     def test_clamp_floor_where(self) -> None:
         self.assertSetEqual(self.s.clamp(S.Reals, 0, 1), Interval(0, 1))
         self.assertSetEqual(self.s.clamp(S.Reals, min=0), _NON_NEG)
+        # Values outside the range move to the nearest bound.
+        self.assertSetEqual(self.s.clamp(FiniteSet(5), 0, 1), FiniteSet(1))
+        self.assertSetEqual(
+            self.s.clamp(FiniteSet(-3, 0.5, 9), 0, 1), FiniteSet(0, 0.5, 1)
+        )
+        self.assertSetEqual(self.s.clamp(Interval(2, 3), 0, 1), FiniteSet(1))
         self.assertSetEqual(self.s.floor(Interval(0.5, 3)), FiniteSet(1, 2, 3))
         self.assertSetEqual(
             self.s.where(FiniteSet(1), FiniteSet(0), FiniteSet(2)), FiniteSet(0, 2)
@@ -424,7 +434,7 @@ class TestDomainRangeSolver(unittest.TestCase):
         with patch("torch_spyre._inductor.padding.padding_strict_mode", False):
             self.assertSetEqual(self.s._default("foo", (FiniteSet(0),), {}), S.Reals)
         with patch("torch_spyre._inductor.padding.padding_strict_mode", True):
-            self.assertTrue(self.s._default("foo", (FiniteSet(0),), {}).contains(S.NaN))
+            self.assertTrue(self.s._default("foo", (FiniteSet(0),), {}).has(_NAN))
 
     # -- domain checks ----------------------------------------------------------
 
@@ -528,6 +538,130 @@ class TestDomainRangeSolver(unittest.TestCase):
 
 
 instantiate_parametrized_tests(TestDomainRangeSolver)
+
+
+_NAN = padding._NAN
+_NAN_SET = FiniteSet(_NAN)
+
+
+class TestDomainRangeSolverNaN(unittest.TestCase):
+    """In strict mode the padding of unknown memory may hold NaN.
+
+    NaN is a set element (padding._NAN) that pointwise ops propagate, that
+    comparisons turn into either boolean, and that no domain admits.
+    """
+
+    def setUp(self) -> None:
+        self.s = DomainRangeSolver()
+
+    def assertSetEqual(self, actual, expected) -> None:  # noqa: N802
+        TestDomainRangeSolver.assertSetEqual(self, actual, expected)
+
+    def test_strict_mode_user_values_hold_nan(self) -> None:
+        with patch("torch_spyre._inductor.padding.padding_strict_mode", True):
+            values = padding._user_values()
+        self.assertTrue(values.has(_NAN))
+        self.assertTrue(values.is_superset(S.Reals))
+
+    def test_nan_mixes_with_numbers(self) -> None:
+        # S.NaN cannot share a set with numbers; the marker can.
+        self.assertEqual(len(FiniteSet(0, _NAN)), 2)
+        self.assertEqual(
+            padding._without_nan(Interval(0, oo).union(FiniteSet(oo, _NAN))),
+            (Interval(0, oo).union(FiniteSet(oo)), True),
+        )
+        self.assertEqual(padding._without_nan(S.Reals), (S.Reals, False))
+
+    @parametrize(
+        "op",
+        [
+            "abs",
+            "exp",
+            "floor",
+            "neg",
+            "relu",
+            "sigmoid",
+            "silu",
+            "square",
+            "tanh",
+            "gelu",
+        ],
+    )
+    def test_unary_propagates_nan(self, op) -> None:
+        for x in (_NAN_SET, S.Reals.union(_NAN_SET), FiniteSet(0, _NAN)):
+            result = getattr(self.s, op)(x)
+            self.assertTrue(result.has(_NAN), f"{op}({x}) = {result}")
+            real, _ = padding._without_nan(result)
+            self.assertSetEqual(real, getattr(self.s, op)(padding._without_nan(x)[0]))
+
+    @parametrize("op", ["add", "sub", "mul", "truediv", "maximum", "minimum"])
+    def test_binary_propagates_nan(self, op) -> None:
+        # NaN from either argument; the real values still combine.
+        fn = getattr(self.s, op)
+        self.assertSetEqual(fn(_NAN_SET, FiniteSet(1)), _NAN_SET)
+        self.assertSetEqual(fn(FiniteSet(1), _NAN_SET), _NAN_SET)
+        result = fn(FiniteSet(2, _NAN), FiniteSet(1))
+        self.assertSetEqual(result, fn(FiniteSet(2), FiniteSet(1)).union(_NAN_SET))
+
+    def test_other_pointwise_propagate_nan(self) -> None:
+        self.assertSetEqual(self.s.clamp(FiniteSet(5, _NAN), 0, 1), FiniteSet(1, _NAN))
+        self.assertSetEqual(
+            self.s.where(FiniteSet(1), FiniteSet(0, _NAN), FiniteSet(2)),
+            FiniteSet(0, 2, _NAN),
+        )
+        self.assertSetEqual(self.s.softplus(_NAN_SET, 1.0, 20.0), _NAN_SET)
+
+    @parametrize(
+        "op", ["eq", "ne", "lt", "le", "gt", "ge", "logical_and", "logical_or"]
+    )
+    def test_comparison_with_nan_gives_any_boolean(self, op) -> None:
+        fn = getattr(self.s, op)
+        self.assertSetEqual(fn(_NAN_SET, FiniteSet(1)), FiniteSet(0, 1))
+        self.assertSetEqual(fn(FiniteSet(1), FiniteSet(0, _NAN)), FiniteSet(0, 1))
+
+    def test_nan_is_in_no_domain(self) -> None:
+        # Real values outside the domain still raise, NaN alongside them or not.
+        for op in ("log", "rsqrt", "reciprocal"):
+            with self.assertRaises(InvalidDomain):
+                getattr(self.s, op)(FiniteSet(0, _NAN))
+        with self.assertRaises(InvalidDomain):
+            self.s.truediv(FiniteSet(1), FiniteSet(0, _NAN))
+        # A NaN-only operand has no real value to check: log(NaN) is NaN.
+        self.assertSetEqual(self.s.log(_NAN_SET), _NAN_SET)
+
+    def test_nan_reaching_valid_data_raises(self) -> None:
+        # Reductions, matmul and gathers would mix NaN into valid lanes.
+        nan_padding = FiniteSet(0, _NAN)
+        with self.assertRaises(InvalidDomain):
+            self.s.reduction(torch.float16, torch.float16, "sum", nan_padding)
+        with self.assertRaises(InvalidDomain):
+            self.s.reduction(
+                torch.float16,
+                torch.float16,
+                BATCH_MATMUL_OP,
+                (nan_padding, nan_padding),
+            )
+        with self.assertRaises(InvalidDomain):
+            self.s.indirect_indexing(nan_padding, 4)
+        # One zero-padded matmul operand still zeroes the products.
+        self.assertSetEqual(
+            self.s.reduction(
+                torch.float16,
+                torch.float16,
+                BATCH_MATMUL_OP,
+                (nan_padding, FiniteSet(0)),
+            ),
+            FiniteSet(0),
+        )
+
+    def test_pick_element_never_picks_nan(self) -> None:
+        self.assertEqual(padding.pick_element(FiniteSet(2, _NAN)), 2)
+        self.assertEqual(padding.pick_element(S.Reals.union(_NAN_SET)), 0)
+        with self.assertRaises(ValueError):
+            padding.pick_element(_NAN_SET)
+
+
+instantiate_parametrized_tests(TestDomainRangeSolverNaN)
 
 
 class _FixedLoadSolver(DomainRangeSolver):

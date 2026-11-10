@@ -1253,10 +1253,69 @@ def _eval_at(expr: Expr, point: Expr, approach: str | None) -> Expr:
 _INDIRECT_INDEX_SYM = sympy.Symbol("indirect_index")
 
 
+# NaN as a set element. sympy's S.NaN cannot be in a set with numbers: sets
+# sort their elements, and NaN is not comparable. A non-real symbol can, and
+# it is in no domain, so every domain check rejects it.
+_NAN = sympy.Symbol("NaN", real=False)
+
+
+def _without_nan(s: Any) -> tuple[Any, bool]:
+    """s without _NAN, and whether s held it. Non-sets pass through."""
+    if not isinstance(s, Set) or not s.has(_NAN):
+        return s, False
+    if isinstance(s, FiniteSet):
+        return FiniteSet(*(e for e in s if e != _NAN)), True
+    if isinstance(s, sympy.Union):
+        return sympy.Union(*(_without_nan(a)[0] for a in s.args)), True
+    raise TypeError(f"Cannot split NaN from {s}")
+
+
+def _nan_args(args, kwargs):
+    """args and kwargs without _NAN, and whether any of them held it."""
+    split_args = [_without_nan(a) for a in args]
+    split_kwargs = {k: _without_nan(v) for k, v in kwargs.items()}
+    had_nan = any(n for _, n in split_args) or any(n for _, n in split_kwargs.values())
+    real_args = [a for a, _ in split_args]
+    real_kwargs = {k: v for k, (v, _) in split_kwargs.items()}
+    return real_args, real_kwargs, had_nan
+
+
+def _propagates_nan(op):
+    """op(..., NaN, ...) is NaN: the IEEE-754 rule for arithmetic, and on
+    Spyre also for max and min (see _FP16_MAX). op sees only the real values,
+    and NaN is added to its result when an argument held it."""
+
+    @functools.wraps(op)
+    def wrapper(self, *args, **kwargs):
+        real_args, real_kwargs, had_nan = _nan_args(args, kwargs)
+        # A NaN-only argument has no real values, and neither has the result.
+        if any(a is S.EmptySet for a in real_args):
+            result = S.EmptySet
+        else:
+            result = op(self, *real_args, **real_kwargs)
+        return result.union(FiniteSet(_NAN)) if had_nan else result
+
+    return wrapper
+
+
+def _nan_gives_any_boolean(op):
+    """A comparison or logical op with a NaN argument may give either value
+    (IEEE-754 gives False except for ne, but the device is not guaranteed)."""
+
+    @functools.wraps(op)
+    def wrapper(self, *args, **kwargs):
+        real_args, real_kwargs, had_nan = _nan_args(args, kwargs)
+        if had_nan:
+            return self.booleans
+        return op(self, *real_args, **real_kwargs)
+
+    return wrapper
+
+
 def _user_values():
     values = S.Reals
     if padding_strict_mode:
-        values = values.union(FiniteSet(S.NaN))
+        values = values.union(FiniteSet(_NAN))
     return values
 
 
@@ -1438,40 +1497,50 @@ class DomainRangeSolver(DefaultHandler):
             return output_set
         return x0.union(x1)
 
+    @_propagates_nan
     def abs(self, x0):
         return self._unary_op(
             sympy.Abs(_X), x0, self.positive_numbers, turning_points=(0,)
         )
 
+    @_propagates_nan
     def add(self, x0, x1):
         return self._binary_op(operator.add, x0, x1)
 
+    @_propagates_nan
     def clamp(self, x, min=None, max=None):
-        return x.intersection(
-            Interval(
-                min if min is not None else -sympy.oo,
-                max if max is not None else sympy.oo,
-            )
-        )
+        # clamp(x) = min(max(x, lo), hi): values outside [lo, hi] move to the
+        # nearest bound, they are not dropped.
+        if min is not None:
+            x = self.maximum(x, FiniteSet(min))
+        if max is not None:
+            x = self.minimum(x, FiniteSet(max))
+        return x
 
+    @_nan_gives_any_boolean
     def eq(self, x0, x1):
         return self._singleton_set_binary(lambda x, y: x == y, x0, x1, self.booleans)
 
+    @_propagates_nan
     def exp(self, x0):
         return self._unary_op(sympy.exp(_X), x0, self.positive_numbers)
 
     def exx2(self, x, scale, useZeroMean):
         return self.positive_numbers
 
+    @_propagates_nan
     def floor(self, x0):
         return x0.intersection(S.Integers)
 
+    @_nan_gives_any_boolean
     def ge(self, x0, x1):
         return self._singleton_set_binary(operator.ge, x0, x1, self.booleans)
 
+    @_propagates_nan
     def gelu(self, x):
         return Interval(-0.17, sympy.oo)
 
+    @_nan_gives_any_boolean
     def gt(self, x0, x1):
         return self._singleton_set_binary(operator.gt, x0, x1, self.booleans)
 
@@ -1484,20 +1553,25 @@ class DomainRangeSolver(DefaultHandler):
     def layernormscale(self, x, eps):
         return self.positive_numbers
 
+    @_propagates_nan
     def log(self, x0):
         if not x0.is_subset(self.extended_strictly_positive_numbers):
             raise InvalidDomain(self.extended_strictly_positive_numbers, "log")
         return self._unary_op(sympy.log(_X), x0, S.Reals)
 
+    @_nan_gives_any_boolean
     def le(self, x0, x1):
         return self._singleton_set_binary(operator.le, x0, x1, self.booleans)
 
+    @_nan_gives_any_boolean
     def logical_and(self, x0, x1):
         return self._singleton_set_binary(operator.and_, x0, x1, self.booleans)
 
+    @_nan_gives_any_boolean
     def logical_or(self, x0, x1):
         return self._singleton_set_binary(operator.or_, x0, x1, self.booleans)
 
+    @_nan_gives_any_boolean
     def lt(self, x0, x1):
         return self._singleton_set_binary(operator.lt, x0, x1, self.booleans)
 
@@ -1526,6 +1600,7 @@ class DomainRangeSolver(DefaultHandler):
             Interval(-oo, s.sup, right_open=not attained), bound, FiniteSet(-oo)
         )
 
+    @_propagates_nan
     def maximum(self, x0, x1):
         if x0 is S.EmptySet or x1 is S.EmptySet:
             return S.EmptySet
@@ -1533,6 +1608,7 @@ class DomainRangeSolver(DefaultHandler):
             x1.intersect(self._at_or_above(x0))
         )
 
+    @_propagates_nan
     def minimum(self, x0, x1):
         if x0 is S.EmptySet or x1 is S.EmptySet:
             return S.EmptySet
@@ -1540,15 +1616,19 @@ class DomainRangeSolver(DefaultHandler):
             x1.intersect(self._at_or_below(x0))
         )
 
+    @_propagates_nan
     def mul(self, x0, x1):
         return self._binary_op(operator.mul, x0, x1)
 
+    @_nan_gives_any_boolean
     def ne(self, x0, x1):
         return self._singleton_set_binary(operator.ne, x0, x1, self.booleans)
 
+    @_propagates_nan
     def neg(self, x0: Set):
         return self._unary_op(-_X, x0, S.Reals)
 
+    @_propagates_nan
     def reciprocal(self, x0):
         if not x0.is_subset(self.extended_non_zero_reals):
             raise InvalidDomain(self.extended_non_zero_reals, "reciprocal")
@@ -1563,9 +1643,13 @@ class DomainRangeSolver(DefaultHandler):
     def quantscalepertokenfp8(self, x, scale_ub):
         return self.positive_numbers
 
+    @_propagates_nan
     def relu(self, x0):
-        return self._unary_op(sympy.Max(_X, 0), x0, self.positive_numbers)
+        # relu(x) = max(x, 0) is constant for x <= 0, so 0 is attained even
+        # when x0 is open below it; maximum gets that right.
+        return self.maximum(x0, FiniteSet(0))
 
+    @_propagates_nan
     def rsqrt(self, x0):
         if not x0.is_subset(self.extended_strictly_positive_numbers):
             raise InvalidDomain(self.extended_strictly_positive_numbers, "rsqrt")
@@ -1573,26 +1657,32 @@ class DomainRangeSolver(DefaultHandler):
             1 / sympy.sqrt(_X), x0, self.extended_strictly_positive_numbers
         )
 
+    @_propagates_nan
     def sigmoid(self, x0):
         return self._unary_op(
             _SIGMOID, x0, Interval(0, 1, left_open=True, right_open=True)
         )
 
+    @_propagates_nan
     def softplus(self, x, beta, threshold):
         sp = sympy.log(1 + sympy.exp(beta * _X)) / beta
         return self._unary_op(sp, x, Interval(-0.278, sympy.oo))
 
+    @_propagates_nan
     def sqrt(self, x0):
         if not x0.is_subset(self.positive_numbers):
             raise InvalidDomain(self.positive_numbers, "rsqrt")
         return self._unary_op(sympy.sqrt(_X), x0, self.positive_numbers)
 
+    @_propagates_nan
     def square(self, x0):
         return self._unary_op(_X**2, x0, self.positive_numbers, turning_points=(0,))
 
+    @_propagates_nan
     def sub(self, x0, x1):
         return self._binary_op(operator.sub, x0, x1)
 
+    @_propagates_nan
     def tanh(self, x0):
         return self._unary_op(
             sympy.tanh(_X), x0, Interval(-1, 1, left_open=True, right_open=True)
@@ -1601,12 +1691,14 @@ class DomainRangeSolver(DefaultHandler):
     def to_dtype(self, x, dtype, src_dtype=None, use_compute_types=False):
         return x
 
+    @_propagates_nan
     def truediv(self, x0, x1):
         if not x1.is_subset(self.extended_non_zero_reals):
             # realdiv is the correct key in _PADDING_MASK_VALUES
             raise InvalidDomain(self.extended_non_zero_reals, "realdiv", arg_index=1)
         return self._binary_op(operator.truediv, x0, x1)
 
+    @_propagates_nan
     def silu(self, x0):
         return self._unary_op(
             _X * _SIGMOID,
@@ -1615,6 +1707,7 @@ class DomainRangeSolver(DefaultHandler):
             turning_points=(_SILU_ARGMIN,),
         )
 
+    @_propagates_nan
     def where(self, condition, input, other):
         return input.union(other)
 
@@ -2151,7 +2244,11 @@ _POINTWISE_PADDING_OPS: set[str] = {"exp", "reciprocal", "rsqrt", "log", "realdi
 
 
 def pick_element(s: Set):
-    """Return a valid element of s, or raise ValueError."""
+    """Return a valid real element of s, or raise ValueError.
+
+    NaN is never picked: the element is a padding value to write.
+    """
+    s, _ = _without_nan(s)
 
     # Prefer zero, then one.
     for x in (0, 1):
