@@ -114,6 +114,7 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 | `torch.Tensor.unfold` | Y | Y | Spyre | View op |
 | `torch.flip` | Y | Y | Spyre | Custom decomposition to `index_select` gathers; reversing the last (stick) dimension is unsupported and raises |
 | `torch.index_copy` | Y | Y | Spyre | `index_copy.out` is registered on the compiled path (`ops/eager.py` `COMPILED_OPS`), which also serves `index_copy` and `index_copy_`. Scattering along the last (stick) dimension is unsupported and raises |
+| `torch.scatter` | Y | | Spyre | Eager only: `scatter.src_out` (`ops/eager.py`), which also serves `scatter` and `scatter_`. Runs on Spyre for an index that is uniform across every other dimension, so it writes whole rows, through `index_copy`; a row may stop on a stick boundary, and along the last (stick) dimension the tensor is permuted a block of rows at a time. Requires at least 2-D. A 1-D or element-level scatter, a write that ends mid-stick, a view whose rows or columns are not those of its base, and `bool` along the stick dimension raise `Unsupported`. `torch.compile` does not support tensor `src` scatter yet (#4399, #4404, #4409) |
 | `torch.split` | | Y | Spyre | Compiled only (lowers via `aten.slice`) |
 | `torch.slice_scatter` | | Y | Spyre | Compiled only (`lower_slice_scatter`); unit-step slices only, strided writes raise `Unsupported` |
 | `torch.expand` | | Y | Spyre | Compiled only; supported when followed by a materializing op (e.g. `clone`, `contiguous`). Used internally by `ones`, `pad`, and SDPA decompositions |
