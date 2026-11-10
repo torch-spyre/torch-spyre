@@ -250,8 +250,48 @@ def test_plan_rejects_nonconcrete_shape_entries(shape):
 
 @pytest.mark.parametrize("extent", [3, 7, 10, 15])
 def test_plan_rejects_uneven_or_empty_tail_geometry(extent):
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="shards must be equal"):
         plan_equal_shards((extent, 2), Shard(0), 8)
+
+
+@pytest.mark.parametrize(
+    "shape, dim, count, fragments",
+    [
+        # Fewer elements than shards: says so, and names the dims that divide.
+        (
+            (3, 32, 64),
+            0,
+            8,
+            [
+                "dim 0 of shape [3, 32, 64]",
+                "only 3 elements, fewer than 8",
+                "1 (size 32), 2 (size 64)",
+                "pad dim 0 to a multiple of 8",
+            ],
+        ),
+        # More elements than shards, but not a multiple.
+        (
+            (10, 16),
+            0,
+            8,
+            ["size 10 is not a multiple of 8", "1 (size 16)"],
+        ),
+        # No dim divides: says so instead of suggesting one.
+        ((10, 3), 0, 8, ["No dim of this shape is a multiple of 8"]),
+        # 16 shards, and a negative dim is reported by its normalized index.
+        ((24, 32), -2, 16, ["dim 0 of shape [24, 32]", "1 (size 32)"]),
+    ],
+)
+def test_plan_rejection_explains_and_suggests(shape, dim, count, fragments):
+    """An unshardable dim names the reason and the dims that would work.
+
+    The shard count is never reduced to fit: the request is rejected.
+    """
+    with pytest.raises(ValueError, match="shards must be equal") as error:
+        plan_equal_shards(shape, Shard(dim), count)
+    message = str(error.value)
+    for fragment in fragments:
+        assert fragment in message, (fragment, message)
 
 
 def test_planner_does_not_mutate_mutable_input():
