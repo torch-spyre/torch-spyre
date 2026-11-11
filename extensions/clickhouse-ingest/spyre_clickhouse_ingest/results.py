@@ -125,7 +125,26 @@ _PERF_NAME_RE = re.compile(
     r"_(?:ms|MB)(?:_(?P<shapes>.+))?$"
 )
 
+# measurement_<token> is on every metric name. scope_region / scope_request is
+# only on kernel and memory. They are series labels, not the shape, so leaving
+# them in the group key splits one file into two rows. Strip a leading token
+# only, at most once each, and only when text remains, so an op shape is left
+# as it was.
+_SERIES_TOKEN_RE = re.compile(
+    r"^(?:measurement_[^_]+|scope_(?:region|request))_(?P<rest>.+)$"
+)
+
 _GRANITE_CONFIG_RE = re.compile(r"bs(?P<batch_size>\d+)(?:_pl(?P<prompt_length>\d+))?")
+
+
+def _group_shapes(shapes: str) -> str:
+    rest = shapes
+    for _ in range(2):
+        match = _SERIES_TOKEN_RE.match(rest)
+        if not match:
+            break
+        rest = match.group("rest")
+    return rest
 
 
 def _is_model_record(op_name: str, tags: dict) -> bool:
@@ -253,7 +272,7 @@ def parse_benchmark_xml(
         metric = m.group("metric")
         if metric == "compiler":  # normalise the op-report spelling to Granite's
             metric = "compile"
-        shapes = m.group("shapes") or ""
+        shapes = _group_shapes(m.group("shapes") or "")
         groups[(op, shapes)][metric] = tc
 
     # ── build one row per group ─────────────────────────────────────────────
@@ -304,13 +323,19 @@ def parse_benchmark_xml(
         torch_spyre_ms = _opt_float(tags, "torch_spyre_ms")
         ratio = _opt_float(tags, "ratio")
 
-        # regression_status: read from kernel_ms testcase's tag properties
+        # regression_status and kernel_scope: the kernel testcase carries the
+        # scope-specific verdict. measurement is on every metric.
         regression_status = None
+        measurement = tags.get("measurement") or None
+        kernel_scope = None
         if "kernel" in metric_cases:
             kernel_tags = _tag_props(metric_cases["kernel"])
             regression_status = kernel_tags.get("regression_status")
             if regression_status == "N/A":
                 regression_status = None
+            kernel_scope = kernel_tags.get("kernel_scope") or None
+            if not measurement:
+                measurement = kernel_tags.get("measurement") or None
 
         is_granite = _is_model_record(op_name, tags)
         if is_granite:
@@ -353,6 +378,8 @@ def parse_benchmark_xml(
                 "num_runs": num_runs_int,
                 "custom_op_file": None,
                 "regression_status": regression_status,
+                "measurement": measurement,
+                "kernel_scope": kernel_scope,
                 "created_at": created_at,
                 "torch_spyre_ms": torch_spyre_ms,
                 "ratio": ratio,
@@ -547,6 +574,10 @@ _V2_BENCH_PROP_KEYS = (
     "is_total",
     "batch_size",
     "prompt_length",
+    # Props only. Not in _V2_BENCH_ID_KEYS: kernel_scope on the hash would move
+    # wall-clock onto a new benchmark when the kernel headline flips scope.
+    "measurement",
+    "kernel_scope",
 )
 # Deliberately NOT here and NOT in the id hash: `metric`. It selects the backend, so
 # the same kernel measured on cpu and on spyre is ONE benchmark with two backend

@@ -54,6 +54,54 @@ _EXPLICIT = [
 ]
 
 
+def test_measurement_and_scope_suffixes_stay_one_row(tmp_path):
+    op = "gemma-4-26B-A4B-it_full-mode_full_model_torch-spyre"
+    tags = [
+        f"op__{op}",
+        "mode__generate",
+        "model__gemma-4-26B-A4B-it",
+        "config__full_model",
+        "batch_size__4",
+        "prompt_length__128",
+        "measurement__generate-v1",
+    ]
+    kernel_tags = tags + [
+        "kernel_scope__request",
+        "regression_status__insufficient_data",
+    ]
+    cases = [
+        _tc(f"perf_{op}_wall_clock_ms_measurement_generate-v1_{op}", tags, "1889.869"),
+        _tc(f"perf_{op}_spyre_ms_measurement_generate-v1_{op}", tags, "1812.747"),
+        _tc(
+            f"perf_{op}_kernel_ms_measurement_generate-v1_scope_request_{op}",
+            kernel_tags,
+            "1791.818",
+        ),
+        _tc(
+            f"perf_{op}_memory_transfer_ms_measurement_generate-v1_scope_request_{op}",
+            kernel_tags,
+            "20.929",
+        ),
+    ]
+    _, rows = results.parse_benchmark_xml(_write(tmp_path, cases))
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["record_type"] == "model"
+    assert row["total_duration_ms"] == pytest.approx(1889.869)
+    assert row["spyre_ms"] == pytest.approx(1812.747)
+    assert row["kernel_mean_ms"] == pytest.approx(1791.818)
+    assert row["memory_transfer_mean_ms"] == pytest.approx(20.929)
+    assert row["regression_status"] == "insufficient_data"
+    assert row["measurement"] == "generate-v1"
+    assert row["kernel_scope"] == "request"
+    entries = results._bench_entries(rows)
+    assert entries[0]["props"]["measurement"] == "generate-v1"
+    assert entries[0]["props"]["kernel_scope"] == "request"
+    assert entries[0]["disc_keys"] == results._V2_BENCH_ID_KEYS
+    assert "kernel_scope" not in entries[0]["disc_keys"]
+    assert "measurement" not in entries[0]["disc_keys"]
+
+
 def test_benchmark_explicit_model_tags(tmp_path):
     op = "gpt-neo-125m_decode-mode_full_model"
     _, rows = results.parse_benchmark_xml(_write(tmp_path, _bench(op, _EXPLICIT)))
