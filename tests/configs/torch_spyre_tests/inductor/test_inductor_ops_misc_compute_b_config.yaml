@@ -27,6 +27,8 @@ test_suite_config:
             - TestOps::test_softplus.*
             # embedding
             - TestOps::test_embedding.*
+            # gather -- test_gather_rows.* covers all variants
+            - TestOps::test_gather_rows.*
             # isin family — test_isin.* covers all test_isin_* variants
             - TestOps::test_isin.*
             # inplace / copy — test_inplace_copy.* covers noncontiguous variant too
