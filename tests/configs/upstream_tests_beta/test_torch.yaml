@@ -9,7 +9,6 @@ test_suite_config:
         # They are classified as mandatory_success because they cover core functionalities and memory safety checks.
         # Relevant Spyre capabilities include support for bfloat16, bool, float16, float32, and int64 dtypes, and basic tensor ops.
         - names:
-            - TestDevicePrecision::test_advancedindex_mixed_devices_error
             - TestDevicePrecision::test_from_sequence
             - TestTorchDeviceType::test_index_add_mem_overlap
             - TestTorchDeviceType::test_index_copy_mem_overlap
@@ -25,6 +24,13 @@ test_suite_config:
         - names:
             - TestTorchDeviceType::test_is_signed
           mode: skip  # skip: uint8 host transfer unsupported (#1588)
+        # Upstream regression: test_advancedindex_mixed_devices_error assertRaisesRegex()
+        # against "indices should be either .* (cpu)", but aten::index.Tensor raises its own
+        # NotImplementedError ("supports only x[index] with a single 1-D int32/int64 index
+        # tensor on dim 0") before PyTorch's standard argument validation runs (#6204).
+        - names:
+            - TestDevicePrecision::test_advancedindex_mixed_devices_error
+          mode: skip  # skip: NotImplementedError before standard index validation (#6204)
         # Upstream regression: test_lazy_clone_view fails on every dtype with "views of sharded
         # Spyre tensors are not supported" (#5817).
         - names:
