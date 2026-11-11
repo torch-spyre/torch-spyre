@@ -875,16 +875,33 @@ class TestIdentityConflicts:
         assert summarize_mod.main([str(tmp_path), "--allow-mixed"]) == 0
 
 
-#: The recorder module, as text. Read rather than imported: `torch_spyre` pulls in
-#: `_C`, and this suite is labelled `unit, regression` precisely so it runs on a
-#: runner with no built extension. Importing here would make the whole file need a
-#: card -- a worse outcome than the coupling these tests exist to pin.
-_RECORDER_SRC = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "torch_spyre",
-    "_inductor",
-    "timing_recorder.py",
-)
+def _recorder_source_path():
+    """Locate `timing_recorder.py` as text, wherever `torch_spyre` lives.
+
+    Read rather than imported: importing `torch_spyre` pulls in `_C`, and this
+    suite is labelled `unit, regression` so it runs on a runner with no built
+    extension. Importing would make the whole file need a card.
+
+    Two layouts, because CI and a dev checkout differ: the test runner installs
+    `torch_spyre` into site-packages and copies only `tests/` and `tools/` into
+    the workspace, so a path built from `__file__` finds the tool but not the
+    package. `find_spec` locates the installed copy without executing it; the
+    repo-relative path is the fallback for a source tree.
+    """
+    spec = importlib.util.find_spec("torch_spyre")
+    if spec is not None and spec.origin:
+        installed = os.path.join(
+            os.path.dirname(spec.origin), "_inductor", "timing_recorder.py"
+        )
+        if os.path.exists(installed):
+            return installed
+    in_tree = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "torch_spyre",
+        "_inductor",
+        "timing_recorder.py",
+    )
+    return in_tree if os.path.exists(in_tree) else None
 
 
 class TestRecorderSeam:
@@ -899,7 +916,12 @@ class TestRecorderSeam:
 
     @staticmethod
     def _recorder_text():
-        with open(_RECORDER_SRC) as fh:
+        path = _recorder_source_path()
+        assert path is not None, (
+            "timing_recorder.py not found next to the installed torch_spyre nor in "
+            "the source tree; this seam cannot be checked"
+        )
+        with open(path) as fh:
             return fh.read()
 
     def test_driver_only_uses_recorder_names_that_exist(self):
