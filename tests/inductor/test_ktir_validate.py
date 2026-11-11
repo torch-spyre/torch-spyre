@@ -3067,19 +3067,6 @@ class TestRelayoutDetection(unittest.TestCase):
                         row_major_strides(access.extent),
                     )
 
-    def test_a_same_layout_copy_keeps_the_copy_refusals(self):
-        """A plain copy is refused where a relayout would be, by the same label."""
-        for label, overrides in {
-            "relayout-threaded": {"allocations": [None, {"lx": 0}]},
-            "relayout-element-arrangement": {"arrangements": [ElementArrangement.EXX2]},
-        }.items():
-            with self.subTest(label=label):
-                with self.assertRaises(ktir.Unimplemented) as ctx:
-                    ktir.build_kernel_plan(
-                        [make_op_spec(IDENTITY_OP, inputs=1, **overrides)]
-                    )
-                self.assertIn(label, str(ctx.exception))
-
     def test_a_compute_op_on_a_permuted_operand_keeps_its_compute(self):
         """``exp(x.T)`` reads ``x`` through the relayout's strides and is an ``exp``.
 
@@ -3139,18 +3126,6 @@ class TestRelayoutDetection(unittest.TestCase):
         with self.assertRaises(ktir.Unimplemented) as ctx:
             ktir.build_kernel_plan([spec])
         self.assertIn("lx-relayout", str(ctx.exception))
-
-    def test_a_copy_recipe_must_be_unary(self):
-        """``copy`` states that one operand passes through, so arity is 1."""
-        with self.assertRaises(ValueError):
-            ktir.Recipe(
-                arity=2,
-                copy=True,
-                arms=ktir.Arm(
-                    kind=ktir.BindingKind.PAYLOAD,
-                    binding=ktir._written_here(lambda x, y: x),
-                ),
-            )
 
 
 def make_add_transpose_spec(

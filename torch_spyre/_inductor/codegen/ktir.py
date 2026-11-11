@@ -1776,10 +1776,6 @@ class KernelPlan:
         # a reduction is not asked.
         if not spec.is_reduction and any(needs_relayout(arg, out) for arg in inputs):
             return self._relayout_step(spec, loops, stage)
-        if recipe.copy:
-            # A copy that a reshape or broadcast lines up still has to reach
-            # memory in the same formats as the relayout does.
-            self._check_copy_operands(spec, (inputs[0], out))
         dtype = dtype_of(spec)
         for arg in inputs:
             # In-place (input buffer aliases the output) is not supported yet.
@@ -1982,15 +1978,11 @@ class KernelPlan:
             )
 
     @staticmethod
-    def _check_copy_operands(spec: OpSpec, operands: Sequence[TensorArg]) -> None:
-        """Refuse a copy op whose operands a copy has not been run with.
+    def _check_relayout_operands(spec: OpSpec, operands: Sequence[TensorArg]) -> None:
+        """Refuse a relayout any of whose operands it cannot read or write.
 
-        Asked of every copy recipe (``Recipe.copy``), whichever path builds its
-        step, so that whether an identity's operands happen to need a relayout
-        does not decide whether a threaded or fused-arrangement copy is let
-        through.  Every operand, inputs and output, must pass
-        ``_check_relayout_operand``.  Which formats a copy exists at is its arm's
-        ``dtypes``, as for every other op.
+        Every operand of the step, inputs and output, is viewed over the
+        relayout's loop nest, so each must pass ``_check_relayout_operand``.
         """
         for arg in operands:
             KernelPlan._check_relayout_operand(spec, arg)
@@ -2028,7 +2020,7 @@ class KernelPlan:
                 f"{spec.op!r} is tiled or work-divided; a relayout is emitted over "
                 "one whole, undivided iteration space (SENCORES=1)",
             )
-        self._check_copy_operands(spec, (*inputs, out))
+        self._check_relayout_operands(spec, (*inputs, out))
         ranges = {}
         for sym, (count, _div) in spec.iteration_space.items():
             count = _static(count)
@@ -2843,14 +2835,6 @@ class Recipe:
     # binds it as an INSTANCE attribute, and instance attributes are not
     # descriptors, so ``self.dispatch(arms, request)`` passes no ``self``.
     dispatch: Dispatch = request_by_dtype
-    # Whether the payload yields its single operand unchanged.  This says what
-    # the op COMPUTES, not which path builds its step: whether the operand has to
-    # be moved is a fact about the operands, which ``needs_relayout`` reads off
-    # them per spec.  When it does, ``KernelPlan._relayout_step`` puts the whole
-    # layout change into the input view's strides and leaves the compute an
-    # identity -- sound only because the payload IS an identity, which is why a
-    # compute op on a permuted operand is refused instead of routed there.
-    copy: bool = False
 
     def __post_init__(self) -> None:
         if self.arity < 1:
@@ -2891,11 +2875,6 @@ class Recipe:
                 f"{self.arity})"
             )
         object.__setattr__(self, "arms", arms)
-        if self.copy and (self.arity != 1 or self.reduces):
-            raise ValueError(
-                "OpSpec->KTIR: a copy recipe passes one operand through, so it "
-                f"takes arity 1 and does not reduce; got arity {self.arity}"
-            )
 
     @property
     def reduces(self) -> bool:
@@ -3756,13 +3735,12 @@ class KtirBuilder:
         # The two copies.  A restickify is a transpose that moves the stick dim;
         # ``identity`` is the same data movement when it arrives under the
         # generic name (or a plain copy, when its operands already line up).
-        # Neither recipe says which path builds the step: ``needs_relayout``
-        # reads that off the operands.  The payload is format-free; the arm
-        # claims fp16 and fp32, the formats a copy has been run at, so any other
-        # format has no arm.
+        # Both are ordinary unary ops whose payload yields its operand: whether
+        # the operand has to be moved is ``needs_relayout``'s question, asked of
+        # every pointwise op's inputs.  The arm claims fp16 and fp32, the formats
+        # a copy has been run at, so any other format has no arm.
         RESTICKIFY_OP: Recipe(
             arity=1,
-            copy=True,
             arms=Arm(
                 kind=BindingKind.PAYLOAD,
                 binding=_written_here(lambda x: x),
@@ -3771,7 +3749,6 @@ class KtirBuilder:
         ),
         IDENTITY_OP: Recipe(
             arity=1,
-            copy=True,
             arms=Arm(
                 kind=BindingKind.PAYLOAD,
                 binding=_written_here(lambda x: x),
