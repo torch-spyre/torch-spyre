@@ -2639,14 +2639,14 @@ def compute_size1_restickify_layout(
     host_size = [concretize_expr(s) for s in host_layout.size]
     host_stride = [concretize_expr(s) for s in host_layout.stride]
     old_stick_expr = idc[-1]
+    stick_size = get_elem_in_stick(host_layout.dtype)
     ss = _host_size_stride_for_expr(
-        old_stick_expr, ic, host_size, host_stride, arg, label
+        old_stick_expr, ic, host_size, host_stride, arg, label, stick_size
     )
     if ss is None:
         return None
     old_sd_host_size, old_sd_host_stride = ss
     old_var = next(iter(old_stick_expr.free_symbols))
-    stick_size = get_elem_in_stick(host_layout.dtype)
     old_var_outer_dims = [
         j for j in range(len(idc) - 1) if old_var in idc[j].free_symbols
     ]
