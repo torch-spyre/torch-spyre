@@ -57,6 +57,12 @@ def prov_logs():
             logger.setLevel(prev_level)
 
 
+class _ReadWrites:
+    def __init__(self):
+        self.reads = []
+        self.writes = []
+
+
 class _Buf:
     """Minimal ComputedBuffer stand-in: mutable origins/origin_node."""
 
@@ -70,6 +76,12 @@ class _Buf:
 
     def get_operation_name(self):
         return self._name
+
+    def get_outputs(self):
+        return []
+
+    def get_read_writes(self):
+        return _ReadWrites()
 
 
 @dataclasses.dataclass(frozen=True)
