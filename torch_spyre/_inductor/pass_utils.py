@@ -916,6 +916,30 @@ def op_out_coords(op: ComputedBuffer) -> list[sympy.Expr]:
     return host_coordinates(eff, output_dep, sizes)
 
 
+def restickify_sweep_dim(
+    device_size: Sequence[int], device_coords: Sequence[Expr], elems_per_stick: int
+) -> int | None:
+    """Index of the gap dim a size-1 restickify sweeps on its intact operand, if any.
+
+    When the host dim on one side of a restickify has size 1, the padding pass
+    (``_pad_elided_dim``) gives the other, intact operand a size-``elems_per_stick``
+    dim that nothing indexes (coordinate 0): just outside the stick dim, or
+    outermost for a graph output.  Codegen (``_restickify_restore_elided_dim``)
+    later binds a loop variable to it, and the kernel sweeps all its slices on
+    every core.  Work division and codegen both find the dim through this rule, so
+    the span check counts the same dim the kernel sweeps.  It is the innermost
+    non-stick dim of that size with coordinate 0.
+    """
+    return next(
+        (
+            i
+            for i in range(len(device_size) - 2, -1, -1)
+            if device_size[i] == elems_per_stick and device_coords[i] == 0
+        ),
+        None,
+    )
+
+
 def is_restickify_coords(in_coords: list[Expr], out_coords: list[Expr]) -> bool:
     """Return whether a single-input pointwise copy is a RESTICKIFY (vs IDENTITY).
 
@@ -2744,15 +2768,12 @@ def is_sparse_stl(stl) -> bool:
 
 
 def expand_sparse(in_stl, output: FixedLayout) -> tuple[bool, SpyreTensorLayout]:
-    """Returns STL to transform the input into the canonical representation the output.
+    """The canonical dense STL of ``output``, and whether ``in_stl`` needs a restickify
+    into it.
 
-    If the input is sparse and the canonical output is not, an extra stick-size dimension
-    is added to the front of the canonical output representation so that restickify can
-    transpose the sparse stick dimension to make it contiguous. The index expression already
-    does the required slicing on the result.
-
-    If the input is not sparse or the output is also sparse no transformation is required
-    the canonical output STL is returned.
+    A sparse input restickifies into the dense canonical layout. That restickify is
+    size-1 on the sparse side, so the padding pass gives the target the size-64 gap
+    dim its sweep needs (``_pad_elided_dim``), as for any other size-1 restickify.
     """
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
@@ -2768,16 +2789,7 @@ def expand_sparse(in_stl, output: FixedLayout) -> tuple[bool, SpyreTensorLayout]
         assert not out_is_sparse
 
     restick = len(in_stl.device_size) > 1 and in_is_sparse and not out_is_sparse
-
-    if restick:
-        out_stl = SpyreTensorLayout(
-            [in_stl.elems_per_stick()] + out_stl.device_size,
-            [c_stride[0] * c_size[0]] + out_stl.stride_map,
-            out_stl.device_dtype,
-        )
-        return True, out_stl
-
-    return False, out_stl
+    return restick, out_stl
 
 
 def compute_restickify_needed(

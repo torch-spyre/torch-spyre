@@ -81,6 +81,7 @@ from .pass_utils import (
     indirect_access_subs_from_kernel,
     input_layout_for_operation,
     is_restickify_coords,
+    restickify_sweep_dim,
     alignment_coordinates,
     per_trip_index,
 )
@@ -2037,11 +2038,12 @@ def _restickify_restore_elided_dim(op_spec) -> None:
 
     - ELIDED operand: its stick is rebuilt as
       ``[floor(new_sym/64)] + real_dims + [Mod(new_sym, 64)]``.
-    - INTACT operand: ``new_sym`` binds to the outermost size-64 gap dim the
-      padding pass (``_pad_elided_dim``) prepended to cover the 64-plane sweep
-      (see the reuse site below).  ``new_sym`` has iteration RANGE 1, so it only
-      ever takes the value 0: SDSC codegen's back-gap mechanism absorbs the
-      size-64-vs-range-1 gap and it contributes no real stride to either operand.
+    - INTACT operand: ``new_sym`` binds to the size-64 gap dim that covers the
+      64-plane sweep (``restickify_sweep_dim``), the one the padding pass
+      (``_pad_elided_dim``) adds just outside the stick dim, or outermost for a
+      graph output.  ``new_sym`` has iteration RANGE 1, so it only ever takes the
+      value 0: SDSC codegen's back-gap mechanism absorbs the size-64-vs-range-1
+      gap and it contributes no real stride to either operand.
     """
     assert len(op_spec.args) == 2, f"restickify op_spec has {len(op_spec.args)} args"
     in_arg, out_arg = op_spec.args[0], op_spec.args[1]
@@ -2078,18 +2080,19 @@ def _restickify_restore_elided_dim(op_spec) -> None:
         )
         new_elided_size = [1] + real_sizes + [stick_size]
 
-        # Bind new_sym to the size-64 dim _pad_elided_dim prepended, so the
-        # descriptor's total size matches the grown allocation. The grow always
-        # targets the intact operand, so that dim is present here: outermost
-        # size-64 with coordinate 0 (asserted before we overwrite it).
+        # Bind new_sym to the size-64 gap dim, so the descriptor's total size
+        # matches the grown allocation. The grow always targets the intact
+        # operand, so that dim is present here (asserted before we overwrite it).
+        # Work division found it by the same rule to count its sweep in the span.
         intact_coords = list(intact_arg.device_coordinates)
         intact_size = list(intact_arg.device_size)
-        assert intact_size[0] == stick_size and intact_coords[0] == 0, (
+        gap = restickify_sweep_dim(intact_size, intact_coords, stick_size)
+        assert gap is not None, (
             f"restickify restore: expected padding-prepended size-{stick_size} "
-            f"gap dim on the intact operand, got size={intact_size[0]} "
-            f"coord={intact_coords[0]}"
+            f"gap dim on the intact operand, got size={intact_size} "
+            f"coords={intact_coords}"
         )
-        intact_coords[0] = new_sym
+        intact_coords[gap] = new_sym
 
         # Range 1, not 64: new_sym only ever takes value 0, so it contributes
         # no real stride and the size-64 device slot is just back-gap padding.

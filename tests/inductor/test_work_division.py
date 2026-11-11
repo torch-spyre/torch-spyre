@@ -5602,3 +5602,173 @@ class TestResidencyRuleRegistry(unittest.TestCase):
                 self.assertIn(
                     name, {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
                 )
+
+
+class TestRestickifyWholeStickSpan(unittest.TestCase):
+    """The per-core span counts a restickify's paired dim in whole sticks.
+
+    Modelled on ``x[2, 20, C].transpose(1, 2).clone()``: the new stick dim, 20
+    wide, sits outermost on the input, padded to 64.  The restickify walks all
+    64 slices, so the span counts 64 of them, not the 20 the index reaches.
+    """
+
+    A, S, C = 2, 20, 1310720
+
+    def _restickify_tds(self):
+        A, S, C = self.A, self.S, self.C
+        d0, d1, d2 = _isym("d0"), _isym("d1"), _isym("d2")
+        in_stl = SpyreTensorLayout(
+            [64, C // 64, A, 64], [C, 64, S * C, 1], DataFormats.SEN169_FP16
+        )
+        out_stl = SpyreTensorLayout(
+            [C, 1, A, 64], [S, 64, S * C, 1], DataFormats.SEN169_FP16
+        )
+        spyre = torch.device("spyre:0")
+        in_layout = FixedTiledLayout(
+            spyre, torch.float16, [A, S, C], [S * C, C, 1], in_stl
+        )
+        out_layout = FixedTiledLayout(
+            spyre, torch.float16, [A, C, S], [S * C, S, 1], out_stl
+        )
+        sizes = (A, C, S)
+        src = TensorDep(
+            MemoryDep("buf_x", S * C * d0 + C * d2 + d1, (d0, d1, d2), sizes),
+            in_layout,
+        )
+        dst = TensorDep(
+            MemoryDep("buf_y", S * C * d0 + S * d1 + d2, (d0, d1, d2), sizes),
+            out_layout,
+        )
+        op = _computed_buffer([A, C, S], name="buf_y")
+        work_division_module._mark_restickify_sweep_dim(op, [src], dst)
+        it_space = {d0: sympy.Integer(A), d1: sympy.Integer(C), d2: sympy.Integer(S)}
+        return src, dst, it_space, d1
+
+    def test_other_operand_stick_vars_are_marked(self):
+        src, dst, _, d1 = self._restickify_tds()
+        self.assertEqual(src.whole_stick_vars, {_isym("d2")})
+        self.assertEqual(dst.whole_stick_vars, {d1})
+
+    def test_padded_paired_dim_counts_all_its_slices(self):
+        src, _, it_space, d1 = self._restickify_tds()
+        padded_input = 64 * (self.C // 64) * self.A * 64 * 2
+        for split in (1, 32):
+            self.assertEqual(
+                work_division_module.get_per_core_span(src, {d1: split}, it_space, {}),
+                padded_input,
+            )
+
+    def test_padded_paired_dim_over_the_limit_raises(self):
+        src, dst, it_space, d1 = self._restickify_tds()
+        with self.assertRaisesRegex(Unsupported, "per-core tensor span 320.000 MB"):
+            work_division_module.raise_if_per_core_overflow(
+                [src, dst], it_space, {d1: 32}, "buf_y", {}
+            )
+
+
+class TestRestickifySweepSpan(unittest.TestCase):
+    """The per-core span counts a size-1 restickify's sweep over its gap dim.
+
+    Modelled on ``x.sum(-1) + y`` (#6083): ``y`` (``[R]``) is restickified into
+    the sum's sparse layout, and its padded copy carries an outermost size-64 gap
+    dim, ``[64, R / 64, 64]``, that every core sweeps whatever the split.
+    """
+
+    def _restickify_tds(self, rows, gap_outermost=True):
+        d0 = _isym("d0")
+        sticks = rows // 64
+        if gap_outermost:
+            size, smap = [64, sticks, 64], [-1, 64, 1]
+        else:
+            size, smap = [sticks, 64, 64], [64, -1, 1]
+        intact_stl = SpyreTensorLayout(size, smap, DataFormats.SEN169_FP16)
+        intact_layout = FixedTiledLayout(
+            torch.device("spyre:0"), torch.float16, [rows], [1], intact_stl
+        )
+        sparse_stl = SpyreTensorLayout(
+            [1, rows, 64], [-1, 1, -1], DataFormats.SEN169_FP16
+        )
+        sparse_layout = FixedTiledLayout(
+            torch.device("spyre:0"), torch.float16, [rows], [1], sparse_stl
+        )
+        intact = TensorDep(MemoryDep("buf_y", d0, (d0,), (rows,)), intact_layout)
+        elided = TensorDep(MemoryDep("buf_r", d0, (d0,), (rows,)), sparse_layout)
+        op = _computed_buffer([rows], name="buf_r")
+        work_division_module._mark_restickify_sweep_dim(op, [intact], elided)
+        return intact, elided, {d0: sympy.Integer(rows)}, d0
+
+    def test_sweep_dim_marked_on_intact_operand(self):
+        intact, elided, _, _ = self._restickify_tds(4096)
+        self.assertEqual(intact.sweep_dim, 0)
+        self.assertIsNone(elided.sweep_dim)
+
+    def test_span_is_the_whole_sweep_whatever_the_split(self):
+        rows = 2**21 + 2048
+        intact, _, it_space, d0 = self._restickify_tds(rows)
+        sweep = 64 * (rows // 64) * 64 * 2
+        for split in (1, 32):
+            self.assertEqual(
+                work_division_module.get_per_core_span(
+                    intact, {d0: split}, it_space, {}
+                ),
+                sweep,
+            )
+        self.assertGreater(sweep, work_division_module.MAX_SPAN_BYTES)
+
+    def test_overflowing_sweep_raises(self):
+        rows = 2**21 + 2048
+        intact, elided, it_space, d0 = self._restickify_tds(rows)
+        with self.assertRaisesRegex(Unsupported, "sweep over gap dim 0"):
+            work_division_module.raise_if_per_core_overflow(
+                [intact, elided], it_space, {d0: 32}, "buf_r", {}
+            )
+
+    def test_sweep_at_the_limit_passes(self):
+        intact, elided, it_space, d0 = self._restickify_tds(2**21)
+        work_division_module.raise_if_per_core_overflow(
+            [intact, elided], it_space, {d0: 32}, "buf_r", {}
+        )
+
+    def test_unfixable_sweep_commits_no_split(self):
+        # Every split leaves the sweep at its full size, so no split helps and
+        # the search keeps the op on one core rather than spreading it for nothing.
+        intact, elided, it_space, d0 = self._restickify_tds(2**21 + 2048)
+        splits = work_division_module.must_split_vars(
+            [intact],
+            it_space,
+            {d0: sympy.Integer((2**21 + 2048) // 64)},
+            {d0: 64},
+            32,
+            {},
+        )
+        self.assertTrue(all(s == 1 for s in splits.values()), splits)
+
+    def test_inner_gap_dim_sweep_shrinks_with_the_split(self):
+        # The gap dim just outside the stick dim is swept one stick apart, inside
+        # each core's share of the split dim: 32 cores cut the span 32 ways.
+        rows = 2**21 + 2048
+        intact, _, it_space, d0 = self._restickify_tds(rows, gap_outermost=False)
+        self.assertEqual(intact.sweep_dim, 1)
+        whole = 64 * (rows // 64) * 64 * 2
+        span = work_division_module.get_per_core_span
+        self.assertEqual(span(intact, {d0: 1}, it_space, {}), whole)
+        self.assertEqual(span(intact, {d0: 32}, it_space, {}), whole // 32)
+        self.assertLessEqual(whole // 32, work_division_module.MAX_SPAN_BYTES)
+
+    def test_non_restickify_op_has_no_sweep_dim(self):
+        # A copy whose stick stays on the same host dim is an identity, even when
+        # the destination happens to have an outermost size-64 coordinate-0 dim.
+        d0 = _isym("d0")
+        rows = 4096
+        stl = SpyreTensorLayout(
+            [64, rows // 64, 64], [-1, 64, 1], DataFormats.SEN169_FP16
+        )
+        layout = FixedTiledLayout(
+            torch.device("spyre:0"), torch.float16, [rows], [1], stl
+        )
+        src = TensorDep(MemoryDep("buf_a", d0, (d0,), (rows,)), layout)
+        dst = TensorDep(MemoryDep("buf_b", d0, (d0,), (rows,)), layout)
+        op = _computed_buffer([rows], name="buf_b")
+        work_division_module._mark_restickify_sweep_dim(op, [src], dst)
+        self.assertIsNone(src.sweep_dim)
+        self.assertIsNone(dst.sweep_dim)

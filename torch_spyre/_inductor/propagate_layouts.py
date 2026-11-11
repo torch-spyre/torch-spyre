@@ -84,7 +84,6 @@ from .ir import (
 from .pass_utils import (
     compute_restickify_target_layout,
     concretize_expr,
-    expand_sparse,
     find_matmul_generated_var,
     find_reduction_var,
     get_matmul_m_size,
@@ -2286,28 +2285,6 @@ def _topk_layouts(
         args, results, output_dep, op, forbidden_stick_sym=reduction_var
     )
     return results
-
-
-def _compact_layout(
-    op: Operation,
-    output: FixedLayout,
-    output_dep: MemoryDep,
-    args: list[PropArg],
-) -> list[SpyreTensorLayout]:
-    """Layout for spyre::compact: output is the default dense STL."""
-
-    if len(args) != 1:
-        raise Unsupported(f"({op.get_name()}) requires exactly one input")
-
-    in_arg = args[0]
-    out_layouts = []
-
-    for in_stl in in_arg.layouts:
-        _, out_stl = expand_sparse(in_stl, output)
-        out_layouts.append(out_stl)
-
-    op.restick_cost_fn = AnyInNode.from_args()
-    return out_layouts
 
 
 def _keep_by_index_layouts(
