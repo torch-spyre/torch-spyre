@@ -399,6 +399,8 @@ def main() -> None:
                 "name": _display_name(cfg, config_dir),
                 "config": rel,
                 "runner": runner_map.get(rel, "spyre_pf_x1"),
+                # An explicit override, even one naming the default, keeps the config off multicard.
+                "runner_overridden": rel in runner_map,
                 "flags": _suite_flags(flags_map, rel),
                 "path": str(cfg),
                 "key": _layout_key(rel),
@@ -446,6 +448,17 @@ def main() -> None:
                 f"WARNING: {args.layout_policy} not found; every config runs as its own job",
                 file=sys.stderr,
             )
+        # Long configs move to a multi-card runner first; plan() then leaves them out of buckets
+        # explicitly, so a low min_minutes can never pack two of them serially on one pod.
+        moved = (
+            test_layout.multicard_runners(results, policy, timings)
+            if test_layout
+            else {}
+        )
+        for r in results:
+            if r["key"] in moved:
+                r["runner"] = moved[r["key"]]
+                r["multicard"] = True
         buckets = test_layout.plan(results, policy, timings) if test_layout else {}
         for r in results:
             r["bucket"] = buckets.get(r["key"], "")
