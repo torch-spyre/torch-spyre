@@ -31,6 +31,7 @@ unsharded tensors too).
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import sys
@@ -484,7 +485,9 @@ def test_unsupported_ops_fail_at_compile(fn, other, match):
     "view",
     [
         lambda t: t.view(-1),
-        lambda t: t[: t.shape[0] // 2],
+        # A strided slice: not a block of the base. (Unit-step slices are
+        # box views, accepted at construction; see the box-view tests below.)
+        lambda t: t[::2],
         lambda t: t.t(),
         # Rank-increasing: the guard must reject on rank alone, before any
         # per-dimension comparison (which would read past the base's rank).
@@ -494,7 +497,8 @@ def test_unsupported_ops_fail_at_compile(fn, other, match):
 def test_views_of_sharded_inputs_fail(view):
     # A view keeps the base's shard layout, which no longer matches the
     # view's shape; chunk addressing would read permuted data. The native
-    # view constructors reject it before the tensor can reach a kernel.
+    # view constructors reject every view that is not a block of the base
+    # before it can reach a kernel.
     # TODO: positive once views of sharded tensors have a shard mapping.
     n = _num_shards()
     torch.manual_seed(0)
@@ -552,19 +556,20 @@ def test_compiled_add_over_detached_views(launched):
 
 @_requires_emulation
 @expects_raise
-def test_contiguous_prefix_view_of_sharded_fails():
+def test_contiguous_prefix_view_of_sharded_fails_at_compile():
     # The hole the copy-path guards could not see: a contiguous view from
     # storage offset zero passes every is_contiguous()/storage_offset()
-    # check, yet maps view elements onto the wrong shards (element N comes
-    # from the start of a later shard instead of the shards that back the
-    # first N elements). It must be rejected at construction, not copied.
+    # check, yet a kernel binding core c to shard c would map view elements
+    # onto the wrong shards. It is a box view (copied to the CPU correctly,
+    # see test_box_view_of_sharded_copies_to_cpu), so it is built, but the
+    # compiled path must still reject it.
+    # TODO: positive once compiled ops accept box views.
     n = _num_shards()
-    x = _sharded(torch.arange(4 * n, dtype=torch.float16), 0, n)
+    x = _sharded(torch.randn(4 * n, 64, dtype=torch.float16), 0, n)
+    prefix = x.narrow(0, 0, 2 * n)
 
-    with pytest.raises(
-        RuntimeError, match="views of sharded Spyre tensors are not supported"
-    ):
-        x.narrow(0, 0, 2 * n)
+    with pytest.raises(RuntimeError, match="no views, slices or reshapes"):
+        torch.compile(lambda a, b: a + b, dynamic=False)(prefix, prefix)
 
 
 @_requires_emulation
@@ -721,3 +726,130 @@ def test_inputs_usable_after_compile_rejection():
     expected = roundtrip + roundtrip
     assert torch.equal(c.cpu(), expected)
     assert torch.equal(a.cpu(), roundtrip)
+
+
+# ---------------------------------------------------------------------------
+# Box views (#5817): a block of a sharded base in the same dimension order.
+# They are built and copied to the CPU; every other consumer rejects them.
+# ---------------------------------------------------------------------------
+
+
+def _box_source(shape, dtype):
+    # Whole numbers below 1024: exact in fp32 and in the device fp16 format
+    # (DL16 has one fraction bit fewer than IEEE fp16, so it rounds integers
+    # above 1024), so a wrong value shows where it came from.
+    return (torch.arange(math.prod(shape)) % 1024).reshape(shape).to(dtype)
+
+
+_BOX_VIEWS = {
+    0: [
+        ("inside_one_shard", lambda t, e: t[1 : e - 1]),
+        ("one_whole_shard", lambda t, e: t[e : 2 * e]),
+        ("across_shards", lambda t, e: t[e // 2 : 3 * e + 1]),
+        ("one_row", lambda t, e: t[3 * e + 1 : 3 * e + 2]),
+        ("prefix_narrow", lambda t, e: t.narrow(0, 0, 2 * e)),
+        ("columns", lambda t, e: t[:, 16:48]),
+        ("block", lambda t, e: t[e - 1 : 2 * e + 1, 5:37]),
+        ("slice_of_slice", lambda t, e: t[e // 2 :][1 : 2 * e, 8:]),
+    ],
+    1: [
+        ("inside_one_shard", lambda t, e: t[:, 1 : e - 1]),
+        ("one_whole_shard", lambda t, e: t[:, e : 2 * e]),
+        ("across_shards", lambda t, e: t[:, e // 2 : 3 * e + 1]),
+        ("rows", lambda t, e: t[3:11]),
+        ("block", lambda t, e: t[2:9, e - 3 : 2 * e + 3]),
+        ("slice_of_slice", lambda t, e: t[:, e // 2 :][1:, 1 : 2 * e]),
+    ],
+}
+
+
+@_requires_emulation
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize(
+    "dim, name",
+    [(d, name) for d, views in _BOX_VIEWS.items() for name, _ in views],
+)
+def test_box_view_of_sharded_copies_to_cpu(dim, name, dtype):
+    n = _num_shards()
+    # Shard(1): one stick (64 fp16 or 32 fp32 elements) or more per shard.
+    shape = (4 * n, 64) if dim == 0 else (16, 64 * n)
+    extent = shape[dim] // n
+    view = dict(_BOX_VIEWS[dim])[name]
+    cpu = _box_source(shape, dtype)
+    x = _sharded(cpu, dim, n)
+
+    v = view(x, extent)
+
+    assert torch.spyre.is_sharded(v)
+    assert v.shape == view(cpu, extent).shape
+    assert torch.equal(v.cpu(), view(cpu, extent))
+    assert torch.equal(x.cpu(), cpu)
+
+
+@_requires_emulation
+def test_box_view_of_sharded_prints_its_values():
+    n = _num_shards()
+    cpu = _box_source((4 * n, 64), torch.float32)
+    x = _sharded(cpu, 0, n)
+
+    assert str(x[2:7, 3:9]).replace(", device='spyre:0'", "") == str(cpu[2:7, 3:9])
+
+
+@_requires_emulation
+@expects_raise
+@pytest.mark.parametrize(
+    "view",
+    [
+        lambda t: t[1],  # rank-reducing select
+        lambda t: t[:, ::2],  # strided slice of the stick dimension
+        lambda t: t[1:5].t(),  # a box, then transposed
+        lambda t: t.view(-1)[3:70],  # flattened slice
+        lambda t: t[:1].expand(4, 64),  # broadcast
+        lambda t: t[2:4].unsqueeze(0),  # rank-increasing
+    ],
+)
+def test_views_of_sharded_that_are_not_boxes_fail(view):
+    n = _num_shards()
+    x = _sharded(_box_source((4 * n, 64), torch.float16), 0, n)
+
+    with pytest.raises(
+        RuntimeError, match="views of sharded Spyre tensors are not supported"
+    ):
+        view(x)
+
+
+@_requires_emulation
+@expects_raise
+def test_box_views_of_sharded_fail_in_other_consumers():
+    """A box view is only copied to the CPU so far; everything else rejects
+    it and leaves the sharded tensor untouched.
+    TODO: positive one by one as #5817 follow-ups land."""
+    n = _num_shards()
+    cpu = _box_source((4 * n, 64), torch.float16)
+    x = _sharded(cpu, 0, n)
+    v = x[2 : 2 * n]
+
+    with pytest.raises(RuntimeError, match="copies into a view of a sharded"):
+        v.copy_(torch.zeros(v.shape, dtype=v.dtype))
+    with pytest.raises(RuntimeError, match="does not support sharded Spyre tensors"):
+        v.fill_(0)
+    with pytest.raises(RuntimeError, match="does not support sharded Spyre tensors"):
+        v.zero_()
+    with pytest.raises(TypeError, match="does not support views of sharded"):
+        torch.spyre.sharding_info(v)
+    with pytest.raises(RuntimeError, match="no views, slices or reshapes"):
+        torch.compile(lambda a, b: a + b, dynamic=False)(v, v)
+    # A detached block view has no _base, so the compile check must look at
+    # its shape against the sharded allocation.
+    d = x[: 2 * n].detach()
+    with pytest.raises(RuntimeError, match="no views, slices or reshapes"):
+        torch.compile(lambda a, b: a + b, dynamic=False)(d, d)
+    # In-place as_strided_ rewrites the tensor itself, so it must keep the
+    # whole shape even when the new geometry would be a box.
+    with pytest.raises(
+        RuntimeError, match="views of sharded Spyre tensors are not supported"
+    ):
+        x.as_strided_(v.shape, v.stride(), v.storage_offset())
+
+    assert torch.equal(x.cpu(), cpu)
+    assert torch.spyre.sharding_info(x).num_shards == n

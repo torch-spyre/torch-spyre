@@ -1247,6 +1247,40 @@ bool spyre_is_sharded(const at::Tensor& tensor) {
   return ctx != nullptr && ctx->sharding.has_value();
 }
 
+std::optional<std::vector<int64_t>> sharded_box_start(const at::Tensor& sharded,
+                                                      c10::IntArrayRef sizes,
+                                                      c10::IntArrayRef strides,
+                                                      int64_t storage_offset) {
+  const auto& global = sharding_of(sharded)->sharding->global_shape;
+  const size_t rank = global.size();
+  if (sizes.size() != rank || strides.size() != rank || storage_offset < 0) {
+    return std::nullopt;
+  }
+  // The base of sharded storage is contiguous (spyre_empty_sharded makes it
+  // so; resize_ and set_ are rejected), so its strides follow from its shape.
+  std::vector<int64_t> base_strides(rank);
+  int64_t stride = 1;
+  for (size_t i = rank; i-- > 0;) {
+    base_strides[i] = stride;
+    stride *= std::max<int64_t>(global[i], 1);
+  }
+  // The storage offset of a box is sum(start[i] * base_strides[i]) with
+  // 0 <= start[i] < global[i], so it decomposes uniquely.
+  std::vector<int64_t> start(rank);
+  int64_t rest = storage_offset;
+  for (size_t i = 0; i < rank; ++i) {
+    // A size-1 dimension's stride addresses nothing and PyTorch does not
+    // normalize it, so only the other strides must be the base's.
+    if (sizes[i] < 1 || (sizes[i] > 1 && strides[i] != base_strides[i])) {
+      return std::nullopt;
+    }
+    start[i] = rest / base_strides[i];
+    rest %= base_strides[i];
+    if (start[i] + sizes[i] > global[i]) return std::nullopt;
+  }
+  return start;
+}
+
 uint64_t shard_device_address(const at::Tensor& sharded, int64_t shard_index,
                               int64_t expected_num_shards,
                               int64_t expected_shard_bytes) {
@@ -1263,6 +1297,14 @@ uint64_t shard_device_address(const at::Tensor& sharded, int64_t shard_index,
   TORCH_CHECK(shard_index >= 0 && shard_index < expected_num_shards,
               "shard index ", shard_index, " is out of range for ",
               expected_num_shards, " shards");
+  // A kernel binds core c to the start of shard c, which is only right for
+  // the whole tensor; a box view (x[8:16]) starts elsewhere in the shards.
+  TORCH_CHECK(sharded.storage_offset() == 0 && sharded.is_contiguous() &&
+                  sharded.sizes().equals(c10::IntArrayRef(info.global_shape)),
+              "non-unified kernels need whole sharded tensors, not views of "
+              "them (got ",
+              sharded.sizes(), " at storage offset ", sharded.storage_offset(),
+              " of ", info.global_shape, ")");
   // Shard ordinal indexes the shard table directly: shard i backs core i, in
   // an addressable plain allocation of at least one shard.
   TORCH_CHECK(static_cast<size_t>(shard_index) < owner->shard_addrs.size(),
@@ -1416,7 +1458,8 @@ void copy_kv_page_raw(const at::Tensor& cache, size_t block_id,
 namespace {
 
 // A single-chunk, non-owning Spyre tensor over shard `shard_index` of a
-// sharded tensor, with the shard-local shape and layout. It keeps the parent
+// sharded tensor's storage, with the shard-local shape (from the recorded
+// global shape, so `sharded` may be a view) and layout. It keeps the parent
 // storage alive. Used by copy_sharded to copy one shard with the ordinary
 // copy path.
 at::Tensor spyre_shard_view(const at::Tensor& sharded, int64_t shard_index) {
@@ -1424,8 +1467,6 @@ at::Tensor spyre_shard_view(const at::Tensor& sharded, int64_t shard_index) {
   const auto& info = *owner->sharding;
   TORCH_CHECK(shard_index >= 0 && shard_index < info.num_shards, "shard index ",
               shard_index, " is out of range for ", info.num_shards, " shards");
-  TORCH_CHECK(sharded.storage_offset() == 0 && sharded.is_contiguous(),
-              "shard views require a contiguous base sharded tensor");
   // The shard table is indexed by shard ordinal by construction: shard i
   // backs core i. Exactly one shard's device bytes from the start of its
   // own allocation.
@@ -1452,13 +1493,13 @@ at::Tensor spyre_shard_view(const at::Tensor& sharded, int64_t shard_index) {
   auto view = at::detail::make_tensor_base<SpyreTensorImpl>(
       c10::Storage(std::move(storage_impl)), pu1_dks, sharded.dtype());
   auto* impl = static_cast<SpyreTensorImpl*>(view.unsafeGetTensorImpl());
-  std::vector<int64_t> shard_size = sharded.sizes().vec();
+  std::vector<int64_t> shard_size = info.global_shape;
   shard_size[info.shard_dim] /= info.num_shards;
   impl->set_sizes_contiguous(shard_size);
   const auto strides = view.strides().vec();
-  impl->spyre_layout =
-      static_cast<SpyreTensorImpl*>(sharded.unsafeGetTensorImpl())
-          ->spyre_layout;
+  // The layout every shard was allocated with (spyre_empty_sharded), rather
+  // than `sharded`'s own: a view may carry another layout.
+  impl->spyre_layout = SpyreTensorLayout(shard_size, info.dtype);
   impl->dma_sizes = shard_size;
   impl->dma_strides = strides;
   return view;
@@ -1468,14 +1509,24 @@ at::Tensor spyre_shard_view(const at::Tensor& sharded, int64_t shard_index) {
 // each shard goes through the ordinary layout-aware copy into (or out of) a
 // single-chunk view of its own chunk. Synchronous; the destination is valid
 // only after every shard copy has completed.
+//
+// A box view of a sharded tensor (see sharded_box_start) is copied to the
+// CPU from the shards it overlaps: each of them is copied whole into a CPU
+// staging buffer, and the part inside the box is copied out of it on the
+// CPU. Copies into a box view are not supported yet.
 void copy_sharded(const at::Tensor& self, const at::Tensor& dst) {
   const bool host2device = self.is_cpu() && spyre_is_sharded(dst);
   const at::Tensor& sharded = host2device ? dst : self;
   const at::Tensor& host = host2device ? self : dst;
   TORCH_CHECK(host.is_cpu(),
               "sharded Spyre tensors can only be copied to or from the CPU");
-  TORCH_CHECK(sharded.storage_offset() == 0 && sharded.is_contiguous(),
-              "sharded Spyre tensors only support whole-tensor copies");
+  const auto box = sharded_box_start(
+      sharded, sharded.sizes(), sharded.strides(), sharded.storage_offset());
+  TORCH_CHECK(box.has_value(),
+              "sharded Spyre tensors only support copies of the whole tensor "
+              "or of a block of it (view: ",
+              sharded.sizes(), " with strides ", sharded.strides(),
+              " at storage offset ", sharded.storage_offset(), ")");
   TORCH_CHECK(host.sizes() == sharded.sizes(),
               "copy shape mismatch: ", host.sizes(), " vs ", sharded.sizes());
   // Dtype-converting DMA is rejected: converting shard copies are untested
@@ -1486,23 +1537,31 @@ void copy_sharded(const at::Tensor& self, const at::Tensor& dst) {
               "change (got ",
               sharded.dtype(), " -> ", host.dtype(), ")");
   const auto& info = *sharding_of(sharded)->sharding;
-  TORCH_CHECK(sharded.sizes().equals(c10::IntArrayRef(info.global_shape)),
-              "sharded Spyre tensors only support whole-tensor copies: tensor "
-              "metadata no longer matches the sharded allocation (",
-              sharded.sizes(), " vs ", info.global_shape, ")");
-  // A same-size view(dtype) passes the identity view check but leaves a
-  // tensor whose dtype disagrees with the recorded shard layout; reject it
-  // before the copy misinterprets the bytes.
+  // A same-size view(dtype) passes the view checks but leaves a tensor whose
+  // dtype disagrees with the recorded shard layout; reject it before the copy
+  // misinterprets the bytes.
   TORCH_CHECK(sharded.scalar_type() == info.dtype,
               "sharded Spyre tensors only support whole-tensor copies: tensor "
               "dtype no longer matches the sharded allocation (",
               sharded.scalar_type(), " vs ", info.dtype, ")");
-  const int64_t extent = sharded.size(info.shard_dim) / info.num_shards;
+  const bool whole =
+      sharded.sizes().equals(c10::IntArrayRef(info.global_shape));
+  TORCH_CHECK(whole || !host2device,
+              "copies into a view of a sharded Spyre tensor are not supported "
+              "yet; only copies to the CPU are (view: ",
+              sharded.sizes(), " of ", info.global_shape, ")");
+  const int64_t dim = info.shard_dim;
+  const int64_t extent = info.global_shape[dim] / info.num_shards;
+  const int64_t box_lo = (*box)[dim];
+  const int64_t box_hi = box_lo + sharded.size(dim);
 
   SpyreStream stream = getCurrentStream(sharded.device());
-  for (int64_t i = 0; i < static_cast<int64_t>(info.num_shards); ++i) {
+  for (int64_t i = box_lo / extent; i * extent < box_hi; ++i) {
+    // The rows of shard i (along the shard dimension) inside the box.
+    const int64_t lo = std::max(box_lo, i * extent);
+    const int64_t hi = std::min(box_hi, (i + 1) * extent);
     at::Tensor shard = spyre_shard_view(sharded, i);
-    at::Tensor host_slice = host.narrow(info.shard_dim, i * extent, extent);
+    at::Tensor host_slice = host.narrow(dim, lo - box_lo, hi - lo);
     if (host2device) {
       at::Tensor staging = host_slice.contiguous();
       stream.copyAsync(staging, shard);
@@ -1512,7 +1571,11 @@ void copy_sharded(const at::Tensor& self, const at::Tensor& dst) {
       at::Tensor staging = at::empty(shard.sizes(), host.options());
       stream.copyAsync(shard, staging);
       stream.synchronize();
-      host_slice.copy_(staging);
+      at::Tensor part = staging.narrow(dim, lo - i * extent, hi - lo);
+      for (int64_t d = 0; d < sharded.dim(); ++d) {
+        if (d != dim) part = part.narrow(d, (*box)[d], sharded.size(d));
+      }
+      host_slice.copy_(part);
     }
   }
 }
