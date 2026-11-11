@@ -176,6 +176,8 @@ Task-specific guidance is available in `.claude/skills/`. These cover:
 - **check-docs** — documentation consistency and staleness audit
 - **daily-status** — automated standup updates from git activity
 - **upgrade-pytorch-version** — PyTorch dependency upgrade workflow
+- **skip-upstream-beta-failures** — triage an `upstream_tests_beta` CI
+  failure report and skip exactly the newly-failing tests
 
 Subtree-specific skills live in `torch_spyre/_inductor/.claude/skills/`
 (`inductor-overview`, `logging`); load them when working under that path.
