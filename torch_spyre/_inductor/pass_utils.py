@@ -2491,8 +2491,10 @@ def _host_size_stride(
             return None
     # Non-contiguous carrying dims (gap between them) have no well-defined
     # total_elements or per-element stride; treat as infeasible.
-    if carrying_dims != list(range(carrying_dims[0], carrying_dims[-1] + 1)):
-        return None
+    assert carrying_dims == list(range(carrying_dims[0], carrying_dims[-1] + 1)), (
+        f"non-contiguous carrying_dims={carrying_dims} for var={var}, "
+        f"host_coords={host_coords}, host_size={host_size}, host_stride={host_stride}"
+    )
     # host_coords is outermost-to-innermost, so carrying_dims[-1] has the per-element stride.
     return math.prod(host_size[d] for d in carrying_dims), host_stride[
         carrying_dims[-1]
