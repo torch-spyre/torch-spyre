@@ -419,3 +419,5 @@ def _autoload_impl():
 
     # Enable spyre code with symbolic args by default
     os.environ.setdefault("BUNDLE_SYMBOLIC_ARGS", "1")
+
+# experiment: timing the /spyre-test verdict (no functional change)
