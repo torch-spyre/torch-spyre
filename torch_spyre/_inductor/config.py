@@ -466,6 +466,13 @@ def get_cpu_count() -> int:
 # invariant violations early. Set SPYRE_VALIDATE_OP_SPECS=0 to disable.
 validate_op_specs: bool = os.environ.get("SPYRE_VALIDATE_OP_SPECS", "1") == "1"
 
+# Check that graph.operations is topologically ordered after every
+# pre-scheduling pass, not only after the last one. The check after the last
+# pass always runs and catches any pass that breaks the order; this one names
+# the pass that did. Off by default because it re-extracts the read set of
+# every operation after every pass. Set SPYRE_VALIDATE_EVERY_PASS=1 to enable.
+validate_every_pass: bool = os.environ.get("SPYRE_VALIDATE_EVERY_PASS", "0") == "1"
+
 # Solver-driven coarse tiling: let the co-optimizing solve choose a coarse
 # tiling for each op alongside its core division, and apply the tilings it
 # selects. Off by default, and inert unless a joint co-opt path is active
