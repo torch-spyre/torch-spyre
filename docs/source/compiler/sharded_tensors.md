@@ -38,8 +38,9 @@ Beyond the op set, the compiled path admits only a narrow shape regime;
 everything outside it fails at compile time with a specific message:
 
 * Every sharded operand must share one placement and have the op's exact
-  shape — no views, slices, reshapes, broadcasts or reindexing (views of
-  sharded storage are additionally rejected at construction; see
+  shape — no views, slices, reshapes, broadcasts or reindexing (most views
+  of sharded storage are additionally rejected at construction; box views
+  are allowed there but only for copies to the CPU; see
   [Runtime](#runtime-storage-and-addressing-c)).
 * Shard-local strides must equal the global ones (DeepTools strides each
   core's tiles from the global shape): the shard boundary must fall on
@@ -221,22 +222,29 @@ implements:
   shard-local `SpyreTensorLayout`, and contiguous global strides.
 * `copy_sharded` — host↔device copy, one shard at a time through
   `spyre_shard_view`, a single-chunk view of one shard's allocation that
-  keeps the parent storage alive. Copies are blocking by contract.
+  keeps the parent storage alive. Copies are blocking by contract. A box
+  view (below) is copied to the CPU from only the shards it overlaps: each
+  is copied whole into a CPU buffer and the part inside the box is taken
+  from there. Copies into a box view are rejected.
 * `shard_device_address` — the launch-time resolver: given a sharded
   tensor and a shard index, returns the device address of that shard's
   allocation. It cross-checks the tensor's actual shard count and
   per-shard bytes against what the kernel was compiled for, so a stale
-  kernel or a differently-sharded tensor fails at launch, not silently.
+  kernel or a differently-sharded tensor fails at launch, not silently. It
+  also requires the whole tensor: a box view starts elsewhere in the shards.
 * Fail-closed guards: `set_`, `resize_`, and fills reject sharded storage
   (they would reinterpret or partially write it); the view constructors and
-  in-place `as_strided_` reject any view of sharded storage that does not
-  reproduce the base tensor exactly — same sizes, strides, and storage
-  offset — because a view's shape no longer matches the shard mapping
-  (`check_sharded_view` in
-  [spyre_views.cpp](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/csrc/spyre_views.cpp);
-  identity views such as `detach` are allowed); and `copy_sharded` checks
-  the tensor's sizes against the recorded `global_shape` before mapping
-  elements onto shards;
+  in-place `as_strided_` reject any view of sharded storage that keeps no
+  mapping from its elements onto the shards (`check_sharded_view` in
+  [spyre_views.cpp](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/csrc/spyre_views.cpp)).
+  Two kinds of view are allowed: identity views such as `detach`, and
+  *box views* — a block of the base in the same dimension order (the
+  base's rank, unit steps and strides), such as `x[8:16]` or
+  `x[:, 64:128]` (`sharded_box_start` in spyre_mem.cpp works out where the
+  block starts from the recorded `global_shape`). Transposes, strided
+  slices, flattened slices, broadcasts and reshapes stay rejected. Box views
+  can only be copied to the CPU (and printed) so far: kernels, fills,
+  copies into them and `sharding_info` reject them (#5817);
   [spyre_composite_address.cpp](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/csrc/spyre_composite_address.cpp)
   rejects sharded storage anywhere a single `CompositeAddress` is
   consumed (kernels, fills, device copies).
