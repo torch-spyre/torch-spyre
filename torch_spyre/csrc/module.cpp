@@ -441,12 +441,12 @@ PYBIND11_MODULE(_C, m) {
           }));
 
   // smart_holder lets detach_pool() take the pool's unique_ptr back from
-  // Python, which flex::DetachPool() requires.
+  // Python, which flex::detachPool() requires.
   py::classh<flex::SharedPool>(m, "SharedPool")
-      .def("slot_count", &flex::SharedPool::SlotCount)
-      .def("slot_bytes", &flex::SharedPool::SlotBytes)
-      .def("name", &flex::SharedPool::Name)
-      .def("total_bytes", &flex::SharedPool::TotalBytes);
+      .def("slot_count", &flex::SharedPool::slotCount)
+      .def("slot_bytes", &flex::SharedPool::slotBytes)
+      .def("name", &flex::SharedPool::name)
+      .def("total_bytes", &flex::SharedPool::totalBytes);
 
   // (status, descriptor), with None for the descriptor on failure, like
   // attach_pool(). Builds Python objects, so call it with the GIL held.
@@ -458,7 +458,7 @@ PYBIND11_MODULE(_C, m) {
     return py::make_tuple(result.status, result.descriptor);
   };
 
-  // Delegator side: no device needed. CreatePool() and DestroyPool() wait on
+  // Delegator side: no device needed. createPool() and destroyPool() wait on
   // a per-name lock another process may hold, so release the GIL.
   m.def(
       "create_pool",
@@ -469,7 +469,7 @@ PYBIND11_MODULE(_C, m) {
         flex::PoolDescriptorResult result;
         {
           py::gil_scoped_release release;
-          result = flex::CreatePool(config_copy);
+          result = flex::createPool(config_copy);
         }
         return descriptor_result(result);
       },
@@ -480,7 +480,7 @@ PYBIND11_MODULE(_C, m) {
         flex::PoolDescriptorResult result;
         {
           py::gil_scoped_release release;
-          result = flex::OpenPool(name);
+          result = flex::openPool(name);
         }
         return descriptor_result(result);
       },
@@ -491,7 +491,7 @@ PYBIND11_MODULE(_C, m) {
         // Copy while holding the GIL, as in create_pool().
         const flex::PoolDescriptor descriptor_copy = descriptor;
         py::gil_scoped_release release;
-        return flex::DestroyPool(descriptor_copy);
+        return flex::destroyPool(descriptor_copy);
       },
       py::arg("descriptor"));
 
@@ -504,11 +504,11 @@ PYBIND11_MODULE(_C, m) {
         const flex::PoolDescriptor descriptor_copy = descriptor;
         flex::AttachResult result;
         {
-          // Release the GIL for AttachPool; the closing brace takes it back
+          // Release the GIL for attachPool; the closing brace takes it back
           // before py::make_tuple() below touches Python objects.
           py::gil_scoped_release release;
           result =
-              flex::AttachPool(spyre::GlobalRuntime::get(), descriptor_copy);
+              flex::attachPool(spyre::GlobalRuntime::get(), descriptor_copy);
         }
         return py::make_tuple(result.status, std::move(result.pool));
       },
@@ -531,7 +531,7 @@ PYBIND11_MODULE(_C, m) {
         // Unpinning and unmapping a large pool can take a while; let other
         // Python threads run meanwhile.
         py::gil_scoped_release release;
-        flex::DetachPool(std::move(owned));
+        flex::detachPool(std::move(owned));
       },
       py::arg("pool"));
 
