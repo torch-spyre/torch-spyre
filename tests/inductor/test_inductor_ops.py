@@ -1466,6 +1466,37 @@ def _build_fp32_proxy_cpu_refs(
     return kwargs
 
 
+# keep_by_index / mask_by_index cases, as (shape, k, dim, keep_by_index fill
+# value); mask_by_index always masks with -inf and ignores the fill. Each runs
+# in fp16 (plain names) and fp32 (names suffixed _fp32); see _index_masking_params.
+_INDEX_MASKING_CASES = {
+    # Stick-aligned (every dim a multiple of 64).
+    "2d_aligned_dim0": ((64, 128), 8, 0, -1.0),
+    "3d_aligned_dim0": ((64, 64, 128), 2, 0, 0.0),
+    "4d_aligned_dim2": ((2, 4, 64, 64), 16, 2, -1.0),
+    # Unaligned.
+    "2d_dim0": ((67, 256), 8, 0, -1.0),
+    "2d_dim1": ((256, 64), 12, 1, -1.0),
+    "3d_dim0": ((67, 71, 256), 2, 0, 0.0),
+    "4d_dim0": ((6, 17, 7, 64), 2, 0, -1.0),
+    "4d_dim2": ((6, 17, 64, 64), 16, 2, 0.0),
+}
+
+
+def _index_masking_params(dtype, with_fill):
+    """Param sets for _INDEX_MASKING_CASES, with values generated in ``dtype``."""
+    suffix = {torch.float16: "", torch.float32: "_fp32"}[dtype]
+    return {
+        f"{name}{suffix}": (
+            unique_randn_along_dim(shape, dim=dim, dtype=dtype),
+            k,
+            dim,
+            *((fill,) if with_fill else ()),
+        )
+        for name, (shape, k, dim, fill) in _INDEX_MASKING_CASES.items()
+    }
+
+
 class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     torch.manual_seed(0xAFFE)  # seeds cached_randn/cached_xavier calls in PARAMS below
 
@@ -2577,83 +2608,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_keep_by_index", "test_keep_by_index_cpu"): {
             "param_sets": {
-                "2d_dim0": (
-                    unique_randn_along_dim((67, 256), dim=0),
-                    8,
-                    0,
-                    -1.0,
-                ),
-                "2d_dim1": (
-                    unique_randn_along_dim((256, 64), dim=1),
-                    12,
-                    1,
-                    -1.0,
-                ),
-                "3d_dim0": (
-                    unique_randn_along_dim((67, 71, 256), dim=0),
-                    2,
-                    0,
-                    0.0,
-                ),
-                "4d_dim0": (
-                    unique_randn_along_dim((6, 17, 7, 64), dim=0),
-                    2,
-                    0,
-                    -1.0,
-                ),
-                "4d_dim2": (
-                    unique_randn_along_dim((6, 17, 64, 64), dim=2),
-                    16,
-                    2,
-                    0.0,
-                ),
+                **_index_masking_params(torch.float16, with_fill=True),
+                **_index_masking_params(torch.float32, with_fill=True),
             },
         },
         ("test_mask_by_index", "test_mask_by_index_cpu"): {
             # mask_by_index always masks with -inf, so there is no fill value.
             "param_sets": {
-                # Stick-aligned (every dim a multiple of 64).
-                "2d_aligned_dim0": (
-                    unique_randn_along_dim((64, 128), dim=0),
-                    8,
-                    0,
-                ),
-                "3d_aligned_dim0": (
-                    unique_randn_along_dim((64, 64, 128), dim=0),
-                    2,
-                    0,
-                ),
-                "4d_aligned_dim2": (
-                    unique_randn_along_dim((2, 4, 64, 64), dim=2),
-                    16,
-                    2,
-                ),
-                # Unaligned.
-                "2d_dim0": (
-                    unique_randn_along_dim((67, 256), dim=0),
-                    8,
-                    0,
-                ),
-                "2d_dim1": (
-                    unique_randn_along_dim((256, 64), dim=1),
-                    12,
-                    1,
-                ),
-                "3d_dim0": (
-                    unique_randn_along_dim((67, 71, 256), dim=0),
-                    2,
-                    0,
-                ),
-                "4d_dim0": (
-                    unique_randn_along_dim((6, 17, 7, 64), dim=0),
-                    2,
-                    0,
-                ),
-                "4d_dim2": (
-                    unique_randn_along_dim((6, 17, 64, 64), dim=2),
-                    16,
-                    2,
-                ),
+                **_index_masking_params(torch.float16, with_fill=False),
+                **_index_masking_params(torch.float32, with_fill=False),
             },
         },
         ("test_reduce_keepdim0", "test_reduce_keepdim0_cpu"): {
@@ -11067,9 +11030,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return torch.ops.spyre.keep_by_index(x, indices, dim, fill_value)
 
         compiled_fn = torch.compile(fn)
-        result_spyre = compiled_fn(
-            x.to("spyre"), indices.to(torch.float16).to("spyre")
-        ).cpu()
+        result_spyre = compiled_fn(x.to("spyre"), indices.to(x.dtype).to("spyre")).cpu()
         expected = fn(x, indices)
 
         torch.testing.assert_close(result_spyre, expected, atol=0.1, rtol=0.1)
@@ -11081,12 +11042,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return torch.ops.spyre.mask_by_index(x, indices, dim)
 
         compiled_fn = torch.compile(fn)
-        result_spyre = compiled_fn(
-            x.to("spyre"), indices.to(torch.float16).to("spyre")
-        ).cpu()
+        result_spyre = compiled_fn(x.to("spyre"), indices.to(x.dtype).to("spyre")).cpu()
         expected = fn(x, indices)
+        if x.dtype == torch.float32:
+            # The device's fp32 is a merged-NINF format, like DLFloat16: only
+            # 0x7FFFFFFF and 0xFFFFFFFF are non-finite. mask_by_index writes
+            # 0xFFFFFFFE as its -inf, which the host reads as NaN. Model that
+            # in the reference, as _dlfloat16_saturating_ref does.
+            expected = expected.masked_fill(torch.isneginf(expected), float("nan"))
 
-        torch.testing.assert_close(result_spyre, expected, atol=0.1, rtol=0.1)
+        torch.testing.assert_close(
+            result_spyre, expected, equal_nan=True, atol=0.1, rtol=0.1
+        )
 
     def test_keep_by_index_moe_router(self):
         """Repro: keep_by_index router mask -> SpyreReduction stick clash.
