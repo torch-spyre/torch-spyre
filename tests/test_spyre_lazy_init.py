@@ -158,6 +158,80 @@ class TestSpyre(TestCase):
         )
         assert out.endswith("OK"), f"unexpected stdout:\n{out}\nstderr:\n{err}"
 
+    def test_to_device_layout_first_op_initializes_runtime(self):
+        """``tensor.to("spyre", device_layout=...)`` must initialize the Spyre
+        runtime even when it is the first Spyre device operation in a fresh
+        process (issue #6129).
+
+        The ``device_layout`` branch of ``spyre_to`` calls
+        ``spyre_empty_with_layout()`` directly via pybind11, bypassing the ATen
+        dispatcher path that ordinarily self-inits the runtime. Without an
+        explicit ``_lazy_init()`` first, a fresh process raises
+        ``RuntimeError: RuntimeContext not created``.
+
+        Runs in a subprocess so an already-initialized runtime from another
+        test cannot mask the regression. Skipped when Spyre hardware is not
+        available.
+        """
+        import os
+
+        if not _is_spyre_hardware_available():
+            self.skipTest("Spyre hardware not available")
+
+        import subprocess
+        import sys
+        import textwrap
+
+        script = textwrap.dedent("""
+            import torch
+            import torch_spyre
+            from torch_spyre._C import SpyreTensorLayout
+
+            # This must be the first Spyre device operation: do not call
+            # anything that touches the runtime before this.
+            assert torch.spyre.is_initialized() is False, (
+                "runtime was initialized before the device_layout transfer"
+            )
+
+            x = torch.ones(4, 64, dtype=torch.float16)
+            stl = SpyreTensorLayout([4, 64], torch.float16)
+            y = x.to("spyre", device_layout=stl)
+
+            assert y.device.type == "spyre", f"expected spyre device, got {y.device}"
+            assert torch.equal(y.cpu(), x), "device_layout transfer corrupted data"
+            print("OK")
+        """)
+
+        env = os.environ.copy()
+        env["DT_DEEPRT_VERBOSE"] = "-1"
+        env["DTLOG_LEVEL"] = "error"
+
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            timeout=130,
+            text=True,
+        )
+        out = (proc.stdout or "").strip()
+        err = (proc.stderr or "").strip()
+        assert proc.returncode == 0, (
+            f"subprocess failed (rc={proc.returncode}).\nstdout:\n{out}\nstderr:\n{err}"
+        )
+        assert out.endswith("OK"), f"unexpected stdout:\n{out}\nstderr:\n{err}"
+
+
+def _is_spyre_hardware_available() -> bool:
+    """Return True if Spyre hardware can be initialized in this process."""
+    try:
+        import torch
+
+        x = torch.empty(1, device="spyre")
+        return x.device.type == "spyre"
+    except (ImportError, RuntimeError):
+        return False
+
 
 if __name__ == "__main__":
     run_tests()
