@@ -42,8 +42,9 @@ Options:
 
 Exit status:
     0                 the target ran to completion and every kernel was written
-    3                 scripts were written, but the target raised partway through
-                      so later kernels are missing (see ``EXIT_PARTIAL``)
+    3                 scripts were written, but the target raised or exited with a
+                      non-zero status, so later kernels may be missing (see
+                      ``EXIT_PARTIAL``)
     1                 nothing was written
 """
 
@@ -70,7 +71,7 @@ from torch_spyre._inductor import config as spyre_config
 from torch_spyre._inductor.codegen.ktir import dialect_available
 from torch_spyre._inductor.op_spec import IndirectAccess, TensorArg
 from torch_spyre._inductor.spyre_kernel import _codegen_op_spec_list, _iter_op_specs
-from torch_spyre.execution.async_compile import SpyreAsyncCompile
+from torch_spyre.execution.async_compile import SpyreAsyncCompile, _safe_kernel_name
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -110,10 +111,10 @@ _ASYNC_COMPILE = "torch_spyre.execution.async_compile"
 _KTIR_PREREQUISITES = f"{_ASYNC_COMPILE}._check_ktir_device_prerequisites"
 _COMPILE_KTIR = f"{_ASYNC_COMPILE}.SpyreAsyncCompile._compile_ktir_with_dbo"
 
-# Scripts were written, but the target raised before it finished, so the capture
-# covers only the kernels compiled up to that point.  Distinct from 1 ("nothing
-# written") and from argparse's 2, so a caller can tell a partial capture from a
-# complete one without parsing stdout.
+# Scripts were written, but the target raised or exited with a non-zero status,
+# so the capture covers only the kernels compiled before it stopped.  Distinct
+# from 1 ("nothing written") and from argparse's 2, so a caller can tell a
+# partial capture from a complete one without parsing stdout.
 EXIT_PARTIAL = 3
 
 LICENSE_HEADER = "".join(
@@ -502,6 +503,7 @@ from torch_spyre._inductor.op_spec import (
     ProvenanceTransform,
     SourceLoc,
     TensorArg,
+    TensorWorkDivision,
     UnimplementedOp,
     spyre_constant_tensor,
 )
@@ -572,11 +574,14 @@ def write_kernel(
     rec, out_dir, source, total, no_execute, save_inputs, explain_header=True
 ) -> str:
     """Write one kernel's script (and .pt) into out_dir; return the script path."""
-    path = os.path.join(out_dir, f"{rec.name}.py")
+    # A fused kernel name can fill NAME_MAX by itself, leaving no room for the
+    # suffixes below; trimmed as the compiler trims its own directories.
+    stem = _safe_kernel_name(rec.name)
+    path = os.path.join(out_dir, f"{stem}.py")
     suffix = 1
     while os.path.exists(path):
         # Two graphs in one program can produce the same fused kernel name.
-        path = os.path.join(out_dir, f"{rec.name}_{suffix}.py")
+        path = os.path.join(out_dir, f"{stem}_{suffix}.py")
         suffix += 1
     with open(path, "w") as f:
         f.write(emit_script(rec, source, total, no_execute, explain_header))
@@ -592,6 +597,13 @@ def write_kernel(
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+
+def _stopped(failure: BaseException) -> str:
+    """How the target stopped, for the notes that report it."""
+    if isinstance(failure, SystemExit):
+        return f"exited with status {failure.code}"
+    return f"raised {type(failure).__name__} (traceback above)"
 
 
 def main(argv=None) -> int:
@@ -643,12 +655,17 @@ def main(argv=None) -> int:
             "\n      still written. `tools/install-ktir.sh` installs the bindings."
         )
 
-    failure = None
+    failure: BaseException | None = None
     with capture_kernels(args.save_inputs, args.no_execute, args.emitter) as records:
         # Run as if invoked directly, so the target's __main__ block still fires.
         sys.argv = [script]
         try:
             runpy.run_path(script, run_name="__main__")
+        except SystemExit as exc:
+            # How a program ends, as in sys.exit(main()): it ran, so what it
+            # compiled is written, and only a non-zero status is a failure.
+            if exc.code not in (None, 0):
+                failure = exc
         except Exception as exc:  # noqa: BLE001 -- a crash is a capture, not a stop
             # The programs worth capturing are the ones that misbehave, and a
             # kernel holding an UnimplementedOp raises on every launch. Whatever
@@ -668,8 +685,8 @@ def main(argv=None) -> int:
     if not records:
         if failure is not None:
             raise SystemExit(
-                f"no kernels captured: {script} raised "
-                f"{type(failure).__name__} before compiling anything (traceback above)."
+                f"no kernels captured: {script} {_stopped(failure)} before "
+                "compiling anything."
             )
         raise SystemExit(
             f"no kernels captured from {script}.\n"
@@ -718,10 +735,9 @@ def main(argv=None) -> int:
         raise SystemExit("nothing written")
     if failure is not None:
         print(
-            f"\nnote: {os.path.basename(script)} raised"
-            f" {type(failure).__name__} partway through (traceback above)."
-            "\n      The scripts above cover the kernels compiled before that"
-            f"\n      point; later kernels never compiled. Exit {EXIT_PARTIAL}."
+            f"\nnote: {os.path.basename(script)} {_stopped(failure)}."
+            "\n      The scripts above cover only the kernels it compiled before"
+            f"\n      it stopped. Exit {EXIT_PARTIAL}."
         )
         return EXIT_PARTIAL
     return 0
