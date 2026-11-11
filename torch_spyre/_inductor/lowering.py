@@ -350,7 +350,11 @@ def _ensure_synthetic_origin(result, target, args: tuple) -> None:
     V.graph.env[fx_node] = result
 
 
-@register_spyre_lowering(torch.ops.spyre.scaled_mm.default)
+# type_promotion_kind=None: the default promotion casts both operands to their
+# common dtype before the lowering runs, and promote(float16, float8_e4m3fn) is
+# float8_e4m3fn, so an fp16 operand would be silently cast to FP8 and the FP8
+# operand check below would never see it (#6203).
+@register_spyre_lowering(torch.ops.spyre.scaled_mm.default, type_promotion_kind=None)
 def lower_scaled_mm(
     mat1,
     mat2,
@@ -412,7 +416,8 @@ def lower_scaled_mm(
     return result
 
 
-@register_spyre_lowering(torch.ops.spyre.bmm_fp8.default)
+# type_promotion_kind=None: see lower_scaled_mm (#6203).
+@register_spyre_lowering(torch.ops.spyre.bmm_fp8.default, type_promotion_kind=None)
 def lower_bmm_fp8(
     mat1,
     mat2,
