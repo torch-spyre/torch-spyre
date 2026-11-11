@@ -190,6 +190,32 @@ def validate_coarse_tile_groups(groups: list[tuple]) -> None:
             hint_id_to_group[hint_id] = group_idx
 
 
+def reject_nested_loops(groups: list[tuple], source: str) -> None:
+    """Raise ``Unsupported`` for a group that nests more than one loop level.
+
+    Span-overflow tiling and the allocator's own tiling build their groups for
+    ``coarse_tile_post_stickify``. That transform still takes several levels, and
+    the unit tests drive it that way. This refusal is for the lowering that is
+    meant to replace it, which builds one standalone ``LoopNode`` per group and is
+    NOT built yet: until it is, a nested group is refused here so that scope is
+    fixed before the replacement is written (#6088). Lifting it means building
+    nested nodes, one induction variable per level.
+
+    Called by the two production callers, not by the transform: it is also driven
+    directly with several levels by about 25 unit tests, and a ``for_each_tile``
+    nest never reaches either caller (``span_overflow_groups`` skips an op that
+    carries ``dim_hints``). A third caller of the transform would not be
+    covered. ``source`` names the caller in the message.
+    """
+    for group_ops, levels in groups:
+        if len(levels) > 1:
+            names = ", ".join(op.get_name() for op in group_ops)
+            raise Unsupported(
+                f"{source}: nested loop tiling is not supported in this release "
+                f"({len(levels)} levels over {names}; #6088)"
+            )
+
+
 # ---------------------------------------------------------------------------
 # Cache-invalidation helpers
 # ---------------------------------------------------------------------------
@@ -2491,7 +2517,6 @@ def _propagate_mutation_write_back(
     loop_info = op.loop_info  # type: ignore[attr-defined]
     op_ranges = list(op.data.ranges)  # already divided by _apply_plan
     mut_target = op.layout.get_buffer()  # type: ignore[attr-defined]
-    full_sizes = list(mut_target.get_size())
 
     # A raw dim tiled to per-tile extent 1 is squeezed out of op_ranges
     # entirely -- index_vars_squeeze mints no d{i} symbol for it, so
@@ -2521,11 +2546,10 @@ def _propagate_mutation_write_back(
             i for i, dims in enumerate(loop_info.loop_tiled_dims) if d in dims
         ]
         if d not in squeeze_pos:
-            # Squeezed out of op's own write -- use mut_target's own
-            # (undivided) sizes for the host_stride, not op_ranges (a dim
-            # to the right that is itself tiled has already been divided
-            # down in op_ranges, which would undercount the stride).
-            host_stride = sympy.prod(full_sizes[d + 1 :])
+            # Squeezed out of op's own write -- use mut_target's own stride.
+            # Not a product of the sizes to the right: that is the stride
+            # only for a contiguous buffer (#6093).
+            host_stride = sympy.sympify(mut_target.get_stride()[d])
             running = sympy.Integer(1)
             for level_idx in reversed(levels_tiling_d):
                 squeezed_advance[level_idx].append((host_stride, running))
@@ -3092,13 +3116,12 @@ def _insert_copy_op(
         read_level_extents: list[dict[int, Expr]] = [
             {} for _ in tiled_op_info.loop_tiled_dims
         ]
-        full_sizes_for_read = list(full_buf.get_size())
         for d in {d for level in tiled_op_info.loop_tiled_dims for d in level}:
             levels_tiling_d = [
                 i for i, dims in enumerate(tiled_op_info.loop_tiled_dims) if d in dims
             ]
             if d not in tiled_op_squeeze_pos:
-                host_stride = sympy.prod(full_sizes_for_read[d + 1 :])
+                host_stride = sympy.sympify(full_buf.get_stride()[d])
                 running = sympy.Integer(1)
                 for level_idx in reversed(levels_tiling_d):
                     read_squeezed_advance[level_idx].append((host_stride, running))
@@ -3165,28 +3188,12 @@ def _insert_copy_op(
         if d not in squeeze_pos:
             # Tiled down to extent 1 in copy_buf's own write -- no d{i}
             # symbol survives squeeze for _host_dim_to_index_symbol to find.
-            # full_buf's own canonical (squeezed-space) index coefficient
-            # for this raw dim -- product of the sizes strictly to its
-            # right, matching the units dep.index's surviving d{i} symbols
-            # already carry (Inductor mints those coefficients over the
-            # *unsqueezed* data.ranges, then squeeze only renumbers/drops
-            # symbols, never rescales them) -- not full_buf.layout.stride,
-            # which is a raw PyTorch memory stride in a different unit
-            # system that tiling_expr_to_device_expr's stride_map-based
-            # dimension selection cannot be compared against.
-            #
-            # Must use full_buf's own (pre-division) sizes here, NOT
-            # copy_ranges (== copy_buf's already-divided data.ranges): a
-            # dim strictly to the right of d that is ITSELF tiled by
-            # another loop level has already been divided down in
-            # copy_ranges, undercounting host_stride by that dim's
-            # division factor. full_buf.get_size() is allocated directly
-            # from full_ranges (see _allocate_full_buffer) in this same
-            # raw dim order and is never divided, so it gives the correct
-            # full extent for both tiled and untiled dims to the right of
-            # d (a no-op substitution for the untiled ones).
-            full_sizes = list(full_buf.get_size())
-            host_stride = sympy.prod(full_sizes[d + 1 :])
+            # full_buf's own stride for this raw dim: the units dep.index's
+            # surviving d{i} coefficients carry. Not the product of the sizes
+            # to its right, which is the stride only for a contiguous buffer
+            # (a permuted one steps by another dim's stride: #6093). full_buf
+            # is never divided, so its stride is the full-buffer one.
+            host_stride = sympy.sympify(full_buf.get_stride()[d])
             running = sympy.Integer(1)
             for level_idx in reversed(levels_tiling_d):
                 squeezed_advance[level_idx].append((host_stride, running))

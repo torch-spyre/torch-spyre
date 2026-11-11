@@ -24,6 +24,7 @@ from torch._inductor.dependencies import (
     WeakDep,
     extract_read_writes,
 )
+from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import ComputedBuffer, FixedLayout, Pointwise, Scatter
 from torch._inductor.sizevars import SizeVarAllocator
@@ -472,4 +473,36 @@ def test_compute_restickify_target_layout_synthesizes_when_no_size1_dim_exists()
     # One element per stick: the old stick's 64 elements become an outer dim
     # and the stick maps to no host stride.
     assert list(result.device_size) == [64, 4, 64]
+    assert list(result.stride_map) == [1, 64, 0]
+
+
+def test_compute_size1_restickify_layout_indirect_access():
+    """Indirect-access tensors (x[i]) must not return None from compute_size1_restickify_layout.
+
+    The gather index ``tmp0`` is an indirect symbol — absent from dep.ranges —
+    so the old matching_dim path returned None, breaking indirect-access ops.
+    _host_size_stride_for_expr handles this via the is_indirect fast path.
+    """
+    tmp0 = sympy.Symbol("tmp0", nonnegative=True, integer=True)
+    stick_size = 64
+
+    # 1-D host tensor with 512 fp16 elements (8 sticks of 64).
+    host_layout = FixedLayout(torch.device("spyre"), torch.float16, [512], [1])
+    # dep.ranges is empty: tmp0 is an indirect symbol, not a loop variable.
+    dep = MemoryDep("x", tmp0, (), ())
+    stl = SpyreTensorLayout([8, 64], [64, 1], torch.float16, [0, 1])
+    # Host coordinate for the single dim is the indirect symbol itself.
+    ic = [tmp0]
+    # Device coords: outer = which stick, inner = position within stick.
+    idc = [FloorDiv(tmp0, stick_size), ModularIndexing(tmp0, 1, stick_size)]
+    arg = PropArg(dep, host_layout, [stl])
+
+    result = pass_utils.compute_size1_restickify_layout(
+        stl, host_layout, ic, idc, arg=arg
+    )
+
+    # Must not return None: the indirect symbol is a valid dimension, not broadcast.
+    assert result is not None
+    # Each stick holds one element; host stride 1 maps to the single host dim.
+    assert list(result.device_size) == [512, 8, 64]
     assert list(result.stride_map) == [1, 64, 0]
