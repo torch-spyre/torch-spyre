@@ -16,6 +16,9 @@
 
 import json
 
+import pytest
+import regex as re
+
 from spyre_clickhouse_ingest import benchmeta, vllm
 
 TEST = "latency_granite8B_tp1_in64_out64"
@@ -154,3 +157,51 @@ def test_per_test_subdir_is_read_first_and_repeats_ignored(tmp_path):
     assert p["compile_total_s"] == "4"
     assert "outputs_prompts" not in p
     assert len(_rows(tmp_path)) == 1
+
+
+@pytest.mark.parametrize(
+    "name, doc",
+    [
+        ("env", {"cards": 5}),
+        ("env", {"cards": [{"pci": ["x"]}], "knobs": {"A": 1}, "cpu": {"threads": 1}}),
+        ("phases", {"phases": 5}),
+        ("phases", {"phases": [{"name": "p", "t_start": 0, "t_end": 10**400}]}),
+        ("host_resources", {"load": {"cpu_s": 10**400}}),
+        ("host_resources", 5),
+    ],
+)
+def test_wrong_shaped_sidecar_is_skipped_and_never_aborts(tmp_path, name, doc):
+    _bench(tmp_path)
+    (tmp_path / f"{name}.json").write_text(json.dumps(doc))
+    (tmp_path / "compile_summary.json").write_text(json.dumps({"total_s": 9.0}))
+    p = _run_props(tmp_path)
+    assert p["compile_total_s"] == "9.0"
+    assert not any(k.startswith(("phase_", "res_")) for k in p)
+
+
+def test_a_failing_sidecar_leaves_none_of_its_partial_props(tmp_path):
+    _bench(tmp_path)
+    (tmp_path / "env.json").write_text(json.dumps({"host": "n1", "cards": 5}))
+    assert "env_host" not in _run_props(tmp_path)
+
+
+def test_host_resources_keys_are_sanitized_and_capped(tmp_path):
+    _bench(tmp_path)
+    res = {f"p{i}": {"a b/c": 1, "d": 2} for i in range(500)}
+    (tmp_path / "host_resources.json").write_text(json.dumps(res))
+    got = {k: v for k, v in _run_props(tmp_path).items() if k.startswith("res_")}
+    assert len(got) == 200
+    assert "res_p0_a_b_c" in got
+    assert all(re.fullmatch(r"res_[A-Za-z0-9_]+", k) for k in got)
+
+
+@pytest.mark.parametrize("name", ["../x", "/etc/x", "a/../../x"])
+def test_test_name_cannot_leave_the_results_dir(tmp_path, name):
+    outside = tmp_path / "x"
+    outside.mkdir()
+    (outside / "env.json").write_text(json.dumps({"host": "leak"}))
+    results = tmp_path / "results"
+    results.mkdir()
+    (results / "x").mkdir()
+    (results / "x" / "env.json").write_text(json.dumps({"host": "leak"}))
+    assert benchmeta.props_for(str(results), name) == {}

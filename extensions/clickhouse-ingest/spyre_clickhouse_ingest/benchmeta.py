@@ -25,25 +25,21 @@ import hashlib
 import json
 import logging
 import os
-import re
+import regex as re
 from typing import Any
+
+from .sidecars import KINDS, SIDECAR_FILES, is_sidecar  # noqa: F401
 
 log = logging.getLogger(__name__)
 
-KINDS = ("env", "phases", "host_resources", "outputs", "compile_summary")
-SIDECAR_FILES = frozenset(f"{k}.json" for k in KINDS)
 _MAX_KNOBS = 40
+_MAX_RES = 200
 _KEY_UNSAFE = re.compile(r"[^A-Za-z0-9_]+")
 
 
-def is_sidecar(filename: str) -> bool:
-    """A `<kind>.json` or `<test_name>.<kind>.json` file; not a benchmark record file."""
-    return filename in SIDECAR_FILES or any(
-        filename.endswith(f".{k}.json") and k != "host_resources" for k in KINDS
-    )
-
-
 def _load(results_dir: str, test_name: str, kind: str) -> dict[str, Any]:
+    if not test_name or os.path.isabs(test_name) or ".." in test_name.split("/"):
+        return {}
     # <test_name>.host_resources.json is already the sampler's per-record file.
     names = [os.path.join(test_name, f"{kind}.json"), f"{kind}.json"]
     if kind != "host_resources":
@@ -123,8 +119,12 @@ def _host_resources(d: dict[str, Any], out: dict[str, str]) -> None:
         if not isinstance(scalars, dict):
             continue
         for k, v in scalars.items():
+            if len(out) >= _MAX_RES:
+                return
             if _num(v) is not None:
-                out[f"res_{_KEY_UNSAFE.sub('_', name)}_{k}"] = str(v)
+                out[
+                    f"res_{_KEY_UNSAFE.sub('_', str(name))}_{_KEY_UNSAFE.sub('_', str(k))}"
+                ] = str(v)
 
 
 def _outputs(d: dict[str, Any], out: dict[str, str]) -> None:
@@ -158,6 +158,13 @@ def props_for(results_dir: str, test_name: str) -> dict[str, str]:
     out: dict[str, str] = {}
     for kind, reader in _READERS.items():
         data = _load(results_dir, test_name, kind)
-        if data:
-            reader(data, out)
+        if not data:
+            continue
+        got: dict[str, str] = {}
+        try:
+            reader(data, got)
+        except (TypeError, ValueError, OverflowError, AttributeError):
+            log.warning("Malformed %s sidecar for %s — skipped", kind, test_name)
+            continue
+        out.update(got)
     return out

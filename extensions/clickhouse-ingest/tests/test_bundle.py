@@ -1004,3 +1004,52 @@ def test_a_sha_is_never_recorded_as_the_vllm_branch(tmp_path, branch, recorded):
         str(VLLM_DATA / "results"), branch, "881a59d2", "", "0", "wf", 0
     )
     assert {r["head_branch"] for r in rows} == {recorded}
+
+
+def test_a_vllm_bundle_carries_sidecars_and_per_test_subdirs(
+    tmp_path, monkeypatch, capsys
+):
+    from spyre_clickhouse_ingest import client, resolver, vllm
+
+    test = "latency_granite8B_tp1_in64_out64"
+    src = tmp_path / "vllm-out"
+    shutil.copytree(VLLM_DATA / "results", src)
+    (src / "env.json").write_text(json.dumps({"host": "shared"}))
+    (src / f"{test}.env.json").write_text(json.dumps({"host": "per-test"}))
+    (src / test).mkdir()
+    (src / test / "phases.json").write_text(
+        json.dumps({"phases": [{"name": "load", "t_start": 1, "t_end": 3}]})
+    )
+    (src / test / "repeats").mkdir()
+    (src / test / "repeats" / "env.json").write_text("{}")
+    out = tmp_path / "perf"
+    argv = ["results", "--offline", "--out", str(out), "--vllm-results-dir", str(src),
+            "--artifact", f"id:{AID}", "--arch", "x86_64", "--perf", "head_sha=881a59d2",
+            "--perf", "head_branch=main"]  # fmt: skip
+    assert cli(argv) == 0
+    paths = {f["path"] for f in _meta(out)["files"]}
+    assert {
+        "results/env.json",
+        f"results/{test}.env.json",
+        f"results/{test}/phases.json",
+    } <= paths
+    assert not any("repeats" in p for p in paths)
+    assert cli(["results", "--from-bundle", str(out), "--validate-only"]) == 0
+
+    ch = CapturingClient()
+    monkeypatch.setattr(client.ClickHouse, "connect", lambda **kw: ch)
+    monkeypatch.setattr(client, "tables_present", lambda *a, **kw: True)
+    monkeypatch.setattr(vllm, "tables_present", lambda *a, **kw: True)
+    monkeypatch.setattr(
+        resolver,
+        "resolve",
+        lambda *a, **kw: _resolution(AID, "x86_64", "spyre-inference"),
+    )
+    monkeypatch.setenv("CLICKHOUSE_DB_V2", "spyre_v2")
+    code, report = _ingest(out, capsys, "--bundle-url", "https://art/p/")
+    assert (code, report["status"], report["benchmark_runs"]) == (0, "ingested", 2)
+    lat = next(
+        r for r in ch.inserted["benchmark_runs"] if r["measurements"].get("avg_latency")
+    )
+    assert lat["props"]["env_host"] == "per-test"
+    assert lat["props"]["phase_load_s"] == "2.000"
