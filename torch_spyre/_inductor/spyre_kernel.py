@@ -582,6 +582,64 @@ def _non_unified_shard_bytes(name: str, layout: FixedTiledLayout) -> int:
     return placement.shard_device_bytes
 
 
+def _matching_read_deps(
+    read_deps: "list[MemoryDep]", name: str, mutation_real_name: "dict[str, str]"
+) -> "list[tuple[int, MemoryDep]]":
+    """The reads of ``name``, as (position in ``read_deps``, dependency) pairs.
+
+    ``name`` has already been resolved through ``mutation_real_name`` by load()
+    (e.g. ``coarse_tile_copy_buf19``'s dependency is named ``buf19``, tiled_op's own
+    output identity, but load() passes in ``buf2``, buf19's MutationLayoutSHOULDREMOVE
+    target, the actual underlying buffer). A dependency's name is the
+    pre-resolution identity, so it goes through the same resolution before it is
+    compared, or a dependency on a mutation alias never matches its own resolved
+    name and the access falls through to "no advance" (issue: flash-v2's B-tiled
+    denominator/output copy-out reads silently pinned to tile 0).
+
+    Both the stored-record builder and the index-based builder pick their read
+    from this list, so the two cannot disagree about which read an access is.
+    """
+    return [
+        (i, dep)
+        for i, dep in enumerate(read_deps)
+        if mutation_real_name.get(dep.name, dep.name) == name
+    ]
+
+
+def _loop_coefficient(index: sympy.Expr, variable: sympy.Symbol) -> sympy.Expr:
+    """The coefficient of the loop variable ``variable`` in ``index``.
+
+    ``Expr.coeff`` is not a safe reading of "how far one trip moves this access": it
+    returns 0 for an unexpanded product (``32*(u0 + 1)``) and for any use of the
+    variable it cannot see through (``floor(u0/2)``, ``Mod(u0, 2)``). Read as "no
+    advance", those would be silently wrong once the stored record, which makes such
+    a disagreement loud, is deleted. So the index is evaluated at 0, 1 and 2:
+
+    * it must be affine in the variable (the second difference is zero), and
+    * the step must be a number (a symbolic step cannot be projected to device
+      elements),
+
+    otherwise this raises ``Unsupported``. A variable that does not occur in the
+    index has coefficient 0. The loop variable is an integer, so ``floor(8*u0)`` is
+    ``8*u0`` and has coefficient 8.
+    """
+    if variable not in index.free_symbols:
+        return sympy.S.Zero
+    at = [sympy.expand(index.subs(variable, k)) for k in (0, 1, 2)]
+    if sympy.simplify(at[2] - 2 * at[1] + at[0]) != 0:
+        raise Unsupported(
+            f"the loop variable {variable} is used non-affinely in the index "
+            f"{index}; a per-trip advance cannot be read from it"
+        )
+    step = sympy.simplify(at[1] - at[0])
+    if not step.is_number:
+        raise Unsupported(
+            f"the loop variable {variable} has the symbolic step {step} in the "
+            f"index {index}; it cannot be projected to device elements"
+        )
+    return step
+
+
 class SpyreKernel(Kernel[CSEVariable]):
     overrides = SpyreOpFuncs  # type: ignore[assignment]
 
@@ -742,24 +800,12 @@ class SpyreKernel(Kernel[CSEVariable]):
                 for dep in ir_node.get_read_writes().reads
                 if isinstance(dep, MemoryDep)
             ]
-            # `name` has already been resolved through mutation_real_name by
-            # load() (e.g. coarse_tile_copy_buf19's dep is named "buf19" --
-            # tiled_op's own output identity -- but load() passes in "buf2",
-            # buf19's MutationLayoutSHOULDREMOVE target, since that's the
-            # actual underlying buffer). dep.name is the pre-resolution
-            # identity, so it must go through the same resolution before
-            # comparing, or a dep on a mutation alias never matches its own
-            # resolved name and this falls through to "no advance" every
-            # time (issue: flash-v2's B-tiled denominator/output copy-out
-            # reads silently pinned to tile 0).
             scheduler = getattr(V.graph, "scheduler", None)
             mutation_real_name = (
                 scheduler.mutation_real_name if scheduler is not None else {}
             )
             matching_idx = [
-                i
-                for i, dep in enumerate(read_deps)
-                if mutation_real_name.get(dep.name, dep.name) == name
+                i for i, _ in _matching_read_deps(read_deps, name, mutation_real_name)
             ]
             if not matching_idx:
                 return None
@@ -862,16 +908,29 @@ class SpyreKernel(Kernel[CSEVariable]):
         hinted = list(loop_var_ranges_from_dim_hints(ir_node))
         if not hinted:
             return None
+        if len(hinted) != len(enclosing_loops(ir_node)):
+            # Level i's variable is the i-th hint only if there is one hint per
+            # level. A different count means the pairing is not known, so this op
+            # stays on the stored record rather than guess.
+            logger.debug(
+                "%s lists %d loop variables for %d loop levels; keeping its stored "
+                "advance",
+                ir_node.get_operation_name(),
+                len(hinted),
+                len(enclosing_loops(ir_node)),
+            )
+            return None
         reads_writes = ir_node.get_read_writes()
         if is_input:
-            deps = [
-                d
-                for d in reads_writes.reads
-                if isinstance(d, MemoryDep) and d.name == name
-            ]
+            scheduler = getattr(V.graph, "scheduler", None)
+            mutation_real_name = (
+                scheduler.mutation_real_name if scheduler is not None else {}
+            )
+            read_deps = [d for d in reads_writes.reads if isinstance(d, MemoryDep)]
+            matches = _matching_read_deps(read_deps, name, mutation_real_name)
             # _general_tile_advance has already consumed one match for this call.
             consumed = self._general_tile_advance_seen.get(name, 0)
-            dep = deps[consumed - 1] if 0 < consumed <= len(deps) else None
+            dep = matches[consumed - 1][1] if 0 < consumed <= len(matches) else None
         else:
             writes = [d for d in reads_writes.writes if isinstance(d, MemoryDep)]
             dep = writes[0] if writes else None
@@ -881,7 +940,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         op_name = ir_node.get_operation_name()
         total: "sympy.Expr" = sympy.S.Zero
         for level, variable in enumerate(hinted):
-            coefficient = dep.index.coeff(variable)
+            coefficient = _loop_coefficient(dep.index, variable)
             if coefficient == 0:
                 continue
             total += tiling_expr_to_device_expr(
@@ -916,7 +975,10 @@ class SpyreKernel(Kernel[CSEVariable]):
             return recorded
         from_index, dep = indexed
         theirs = sympy.S.Zero if recorded is None else recorded
-        if sympy.simplify(theirs - from_index) != 0:
+        # The two builders give the same expression almost always, so compare
+        # structurally first: simplify is slow, and it can fail to prove two
+        # equal expressions with floor() equal, which would fail a correct compile.
+        if theirs != from_index and sympy.simplify(theirs - from_index) != 0:
             node = self.current_node.node
             raise LoopAdvanceMismatch(
                 f"{node.get_operation_name()} {'reads' if is_input else 'writes'} "

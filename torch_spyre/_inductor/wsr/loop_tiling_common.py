@@ -1023,9 +1023,13 @@ class _NameSwapHandler(WrapperHandler):
         self,
         inner,
         name_map: dict[str, tuple[str, list[Expr], list[Expr]]],
+        loop_terms: dict[str, Expr] | None = None,
     ):
         super().__init__(inner)
         self._name_map = name_map
+        # swapped name -> a loop term added to the rescaled index of a load that
+        # was swapped. A load of the new name that was NOT swapped is left alone.
+        self._loop_terms = loop_terms or {}
 
     def load(self, name, index):
         if name in self._name_map:
@@ -1033,6 +1037,8 @@ class _NameSwapHandler(WrapperHandler):
             new_index = _rescale_index(
                 index, full_strides, tile_strides, strip_constant=True
             )
+            if name in self._loop_terms:
+                new_index = new_index + self._loop_terms[name]
             return super().load(new_name, new_index)
         return super().load(name, index)
 
@@ -1049,6 +1055,12 @@ class _AddLoopTermHandler(WrapperHandler):
     The consumer lists the loop variable in its ``dim_hints``, so
     ``pass_utils.per_trip_index`` pins it in the base coordinates and it does not
     reach ``device_coordinates``.
+
+    This adds the term to EVERY load of ``source_name``, so it is for a body that
+    loads it exactly once: the staged copy, which is a pure identity
+    (``identity_load`` requires one load). A consumer body that may load the same
+    buffer on its own uses ``_NameSwapHandler(loop_terms=...)`` instead, which adds
+    the term only to the loads that were swapped.
     """
 
     def __init__(self, inner, source_name: str, loop_term: Expr):

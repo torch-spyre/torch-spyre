@@ -2867,6 +2867,35 @@ def _contract_cross_scope_input_materializations(
             return
 
 
+def _split_loop_term(
+    source_index: sympy.Expr,
+    loop_vars: "set[sympy.Symbol]",
+) -> "tuple[sympy.Expr, sympy.Expr] | None":
+    """Split a staged copy's source index into (loop term, index without it).
+
+    The loop term is the part that depends on the loop variables ``loop_vars`` (and
+    only those): the direct read that replaces the copy adds it back to its own
+    source load. Returns ``None`` when the index is not of that shape, so the caller
+    keeps the staged copy:
+
+    * a symbol other than the copy's own iteration variables and the loop
+      variables (an indirect or unbacked symbol) stays in the index, so the
+      caller's pure-identity check fails on it as it did before the term was
+      carried in the index;
+    * the loop term must not contain the copy's own iteration variables (a cross
+      term such as ``c*i*u``): they do not exist in the consumer's frame, so adding
+      such a term there would be wrong code.
+    """
+    present = {s for s in source_index.free_symbols if s in loop_vars}
+    rest = sympy.simplify(source_index.subs({s: sympy.S.Zero for s in present}))
+    loop_term = sympy.simplify(source_index - rest)
+    # Anything in the loop term that is not a loop variable is refused: the copy's
+    # own iteration variables (a cross term c*i*u) and any other symbol alike.
+    if loop_term.free_symbols - loop_vars:
+        return None
+    return loop_term, rest
+
+
 def _contract_exact_stride_input_materializations(
     graph: Any,
     pending_levels: list[tuple[sympy.Symbol, sympy.Expr, int, list[str]]],
@@ -3240,19 +3269,12 @@ def _contract_exact_stride_input_materializations(
         source_name, source_index, identity_indices = identity
         # The staged copy's source read carries the loop term in its index (stage
         # 7.2b). The shape check below is about the copy's own iteration variables,
-        # so set the loop symbols apart: ``loop_term`` is what the direct read adds
-        # back to its source load, read from the copy's index and not the record.
-        loop_symbols = [
-            symbol
-            for symbol in source_index.free_symbols
-            if symbol not in identity_indices
-        ]
-        loop_term = sympy.simplify(
-            source_index - source_index.subs({s_: sympy.S.Zero for s_ in loop_symbols})
-        )
-        source_index = sympy.simplify(
-            source_index.subs({symbol: sympy.S.Zero for symbol in loop_symbols})
-        )
+        # so set the loop term apart: it is what the direct read adds back to its
+        # source load, read from the copy's index and not from the record.
+        split = _split_loop_term(source_index, {lv for lv, *_ in pending_levels})
+        if split is None:
+            continue
+        loop_term, source_index = split
         source_base = sympy.simplify(
             source_index.subs({index: sympy.S.Zero for index in identity_indices})
         )
@@ -3324,17 +3346,14 @@ def _contract_exact_stride_input_materializations(
             *args,
             _inner=consumer_inner,
             _map=name_map,
-            _source_name=source_name,
-            _loop_term=loop_term,
+            _loop_terms={copy_name: loop_term},
         ):
-            # The swapped-in read keeps the staged copy's loop term in its index (stage
-            # 7.2b): the consumer's dim_hints list the loop variable, so per_trip_index
-            # pins it in the base coordinates, and the step comes from the index.
-            with V.set_ops_handler(
-                _AddLoopTermHandler(V.ops, _source_name, _loop_term)
-            ):
-                with V.set_ops_handler(_NameSwapHandler(V.ops, _map)):
-                    return _inner(*args)
+            # The swapped-in read keeps the staged copy's loop term in its index
+            # (stage 7.2b): the consumer's dim_hints list the loop variable, so
+            # per_trip_index pins it in the base coordinates, and the step comes
+            # from the index. Only the loads that were swapped get the term.
+            with V.set_ops_handler(_NameSwapHandler(V.ops, _map, _loop_terms)):
+                return _inner(*args)
 
         direct_tiled = copy_info.tiled_dims_per_read[0]
         direct_squeezed = (
@@ -3553,14 +3572,7 @@ def splice_while_loops(graph) -> None:
     # the complete K/V cache on each trip.
     _contract_exact_stride_input_materializations(graph, pending_levels)
 
-    # A point-shaped splice read (paged attention's in-body page index,
-    # dep.index == 32*u0) keeps its loop term in the index; it is not rebased to
-    # iteration 0 here. The kernel still takes the per-trip step from
-    # squeezed_advance_per_read, and pins the term to 0 in the base coordinates
-    # (pass_utils.per_trip_index), so the term does not reach device_coordinates.
-    # (Layout propagation accepts the loop variable; the three paged_gather
-    # fixtures compile and agree without a rebase. The rebase this call used to
-    # make is still done by the span-overflow path, loop_tiling_common.)
+    # A point read keeps its loop term in the index (not rebased to iteration 0).
 
     if pending_levels:
         # Splicing/unrolling leaves dead carry-snapshot and marker scaffolding
