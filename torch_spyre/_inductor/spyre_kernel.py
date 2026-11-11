@@ -1390,16 +1390,15 @@ class SpyreKernel(Kernel[CSEVariable]):
             )
         elif isinstance(value, TensorAccess):
             # Reshapes, transposes, and other dataops.
-            # Compute which indirect variables THIS operation actually uses:
-            # - For gather: check source index for indirect symbols
-            # - For scatter: check destination index for indirect symbols
-            # Use the same filtering logic as PointwiseOp to avoid duplication.
+            # Use gather_first=True so that a co-fused scatter's indirect sym
+            # cannot leak into a gather's output SDSC role (see _indirect_syms_used).
             indirect_syms_used = (
                 _indirect_syms_used(
                     value,
                     self.indirect_vars,
                     src_index=value.index,
                     dst_index=dst.index,
+                    gather_first=True,
                 )
                 if self.indirect_vars
                 else set()
@@ -1755,12 +1754,20 @@ def _indirect_syms_used(
     indirect_vars: "dict[sympy.Symbol, TensorAccess]",
     src_index: "sympy.Expr | None" = None,
     dst_index: "sympy.Expr | None" = None,
+    gather_first: bool = False,
 ) -> "set[sympy.Symbol]":
     """Return the subset of indirect_vars keys that appear in value's indices.
 
     For PointwiseOp: checks all argument indices (via value.arguments).
     If src_index is provided (for gather source indices), also checks it.
     If dst_index is provided (for scatter destination indices), also checks it.
+
+    When ``gather_first=True`` (used for TensorAccess dataops), the function
+    applies gather-before-scatter discrimination: src_index is checked first,
+    and dst_index is only checked when src carries no indirect symbols.  This
+    prevents a co-fused scatter's indirect sym from leaking into a gather's
+    output SDSC role (which would flip value_tensor / no_indirection and
+    produce all-zeros from hardware).
     """
     syms = set()
     if hasattr(value, "arguments"):
@@ -1771,6 +1778,16 @@ def _indirect_syms_used(
             for s in inp.index.free_symbols
             if s in indirect_vars
         }
+    if gather_first:
+        if src_index is not None:
+            src_syms = {s for s in src_index.free_symbols if s in indirect_vars}
+            if src_syms:
+                # Gather: sym found in source — never propagate to dst.
+                return syms | src_syms
+        if dst_index is not None:
+            # Scatter (or plain copy): sym is in the destination write index.
+            syms.update(s for s in dst_index.free_symbols if s in indirect_vars)
+        return syms
     if src_index is not None:
         syms.update(s for s in src_index.free_symbols if s in indirect_vars)
     if dst_index is not None:
