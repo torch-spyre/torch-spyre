@@ -29,7 +29,6 @@ provenance descriptor, and the job plan is built lazily on first use.
 
 import unittest
 
-from torch_spyre._C import SymbolicArgKind
 from torch_spyre._inductor.codegen.compute_ops import SymbolKind
 from torch_spyre.execution.kernel_runner import SpyreSDSCKernelRunner
 
@@ -155,19 +154,6 @@ class TestADimensionSlotNamesATensorAndADim(unittest.TestCase):
             _described(payload),
             [("kAddress", 0, -1), ("kDimension", 0, 0), ("kDimension", 0, 1)],
         )
-
-
-class TestTheKindsAreDistinguishable(unittest.TestCase):
-    def test_an_sdsc_dimension_symbol_is_not_a_dimension_slot(self):
-        """It never reaches here: async_compile refuses that route earlier.
-
-        If it ever did, treating it as an address is the conservative outcome,
-        because the old route's runtime payload was never built. This pins that
-        the two kinds stay distinguishable at this layer.
-        """
-        payload = _payload([SymbolKind.dimension(TILE, MAX, SYM)])
-
-        self.assertEqual(payload[0].kind, SymbolicArgKind.kAddress)
 
 
 if __name__ == "__main__":

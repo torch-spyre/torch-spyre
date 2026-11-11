@@ -66,21 +66,15 @@ class SymbolKind:
                                              ``input_arg`` params directly; LX addresses
                                              are baked constants, never symbols).
                                              Emitted as ``arith.addi %pool, value``.
-      - ``dimension(gran, max, sym)``:       dynamic iteration-space dim size from
-                                             mark_dynamic; carried in SDSC JSON as a
-                                             ``dimToSymbolMapping_`` entry.  Registered
-                                             before address symbols so their negative IDs
-                                             never collide with address symbol IDs.
       - ``loop_dimension(...)``:             a bundle loop bound, read from a launch
                                              tensor's shape.  Never reaches an SDSC.
-                                             Distinct from ``dimension`` on purpose, see
-                                             its own docstring.
     """
 
     kind: str
     base_sym_idx: int = -1
     offset: int = 0
     arg_index: int = -1
+    # The size of a symbolic bundle parameter (see bundle._dim_input_arg_type).
     granularity: int = 0
     max_value: int = 0
     pytorch_sym: str = ""
@@ -135,17 +129,6 @@ class SymbolKind:
         return cls(kind="pool")
 
     @classmethod
-    def dimension(
-        cls, granularity: int, max_value: int, pytorch_sym: str
-    ) -> "SymbolKind":
-        return cls(
-            kind="dimension",
-            granularity=granularity,
-            max_value=max_value,
-            pytorch_sym=pytorch_sym,
-        )
-
-    @classmethod
     def loop_dimension(
         cls,
         granularity: int,
@@ -156,19 +139,10 @@ class SymbolKind:
     ) -> "SymbolKind":
         """A bundle-level loop bound, read from a launch tensor's shape.
 
-        Deliberately a different variant from ``dimension``. That one lives in an
-        SDSC's ``dimToSymbolMapping_``, the symbolic-SDSC route where the symbol
-        stays inside one op's iteration space. This one never reaches an SDSC at
-        all: the loop is explicit, the body is a static tile, and the dimension
-        exists only as a bundle parameter whose value the runtime reads from
-        ``inputs_outputs[arg_index].size(dim_index)`` on every launch, via
-        ``SymbolicArgKind::kDimension``.
-
-        ``is_dimension`` stays False for this variant on purpose. The guard in
-        ``execution/async_compile`` refuses SDSC dimension symbols because that
-        route's runtime payload was never built, and a bundle carrying one would
-        reach the backend with a mismatched ``inputSym_`` slot count. That guard
-        should keep refusing the old route, and should not refuse this one.
+        It never reaches an SDSC: the loop is explicit, the body is a static
+        tile, and the dimension exists only as a bundle parameter whose value the
+        runtime reads from ``inputs_outputs[arg_index].size(dim_index)`` on every
+        launch, via ``SymbolicArgKind::kDimension``.
         """
         return cls(
             kind="loop_dimension",
@@ -190,12 +164,6 @@ class SymbolKind:
     @property
     def is_pool(self) -> bool:
         return self.kind == "pool"
-
-    @property
-    def is_dimension(self) -> bool:
-        # The old symbolic-SDSC route only. See loop_dimension for why this must
-        # not also answer True for a loop bound.
-        return self.kind == "dimension"
 
     @property
     def is_loop_dimension(self) -> bool:
@@ -694,24 +662,6 @@ def generate_sdsc(
     for tensor in sdsc_spec.args:
         if tensor.work_division is None:
             tensor.work_division = operation_work_division
-    symbolic_dims = sdsc_spec.symbolic_dims or {}
-
-    # Register dimension symbols BEFORE address symbols so their IDs never collide.
-    # IDs are laid out as: -(offset+1)..-(offset+n_dim) for dim symbols, then
-    # -(offset+n_dim+1)..-(offset+n_dim+k) for address symbols.
-    # Dim symbols carry no HBM byte value; 0 is appended to `symbols` as a placeholder.
-    dim_local_symbols: dict[str, int] = {}  # pytorch_sym_name -> negative symbol ID
-    dim_symbol_kinds: list[SymbolKind] = []
-    for sdsc_dim, (pytorch_sym, granularity, max_value) in symbolic_dims.items():
-        if pytorch_sym not in dim_local_symbols:
-            sym_id = -(symbol_id_offset + len(dim_symbol_kinds) + 1)
-            dim_local_symbols[pytorch_sym] = sym_id
-            dim_symbol_kinds.append(
-                SymbolKind.dimension(granularity, max_value, pytorch_sym)
-            )
-            symbols.append(0)  # placeholder: dim symbols have no HBM byte value
-    n_dim_syms = len(dim_symbol_kinds)
-
     # local_symbols maps address key -> globally-unique negative symbol id.
     # symbol_id_offset ensures ids are unique across all SDSCs in the bundle.
     # For tiled tensors the base is the iteration-0 address (tiled dims contribute 0);
@@ -770,10 +720,7 @@ def generate_sdsc(
             # distinct from pool offsets and sentinel values.
             key = s
         if key not in local_symbols:
-            # Address symbols start after dim symbols in the ID counter.
-            local_symbols[key] = -(
-                symbol_id_offset + n_dim_syms + len(local_symbols) + 1
-            )
+            local_symbols[key] = -(symbol_id_offset + len(local_symbols) + 1)
             symbols.append(s)
             local_symbol_kind.append(kind)
         return local_symbols[key]
@@ -1326,23 +1273,6 @@ def generate_sdsc(
                                 for dim, mask_range in sdsc_spec.coordinate_masking.items()
                             },
                             "maskingConstId_": sdsc_spec.masking_const_id,
-                            # Emit dimToSymbolMapping_ only when there are symbolic dims;
-                            # the runtime uses it to bind runtime shape values to symbols.
-                            **(
-                                {
-                                    "dimToSymbolMapping_": {
-                                        sdsc_dim: [dim_local_symbols[pytorch_sym]]
-                                        for sdsc_dim, (
-                                            pytorch_sym,
-                                            granularity,
-                                            max_value,
-                                        ) in symbolic_dims.items()
-                                        if pytorch_sym in dim_local_symbols
-                                    },
-                                }
-                                if symbolic_dims
-                                else {}
-                            ),
                             "dataStageParam_": {
                                 "0": {
                                     "ss_": {
@@ -1642,25 +1572,9 @@ def generate_sdsc(
                         }
                     }
                 ],
-                # Emit top-level symbolic metadata only when symbolic dims are present.
-                # inputSymbolsAndTags_ maps symbol ID -> pytorch symbol name for the runtime.
-                **(
-                    {
-                        "datadscs_": [],
-                        "dimToSymbolMappingOpcodeCorrection_": {},
-                        "inputSymbolsAndTags_": {
-                            str(sym_id): pytorch_sym
-                            for pytorch_sym, sym_id in dim_local_symbols.items()
-                        },
-                        "symbolDefinitions_": {},
-                    }
-                    if symbolic_dims
-                    else {}
-                ),
             }
         },
-        # Dim symbols occupy the first n_dim_syms slots (value 0); address symbols follow.
-        [0] * n_dim_syms + list(local_symbols.keys()),
+        list(local_symbols.keys()),
         affine_strides,
-        dim_symbol_kinds + local_symbol_kind,
+        local_symbol_kind,
     )

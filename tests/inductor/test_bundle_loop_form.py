@@ -254,26 +254,13 @@ class TestStrideScaling(unittest.TestCase):
 
 
 class TestLoopDimensionSymbolKind(unittest.TestCase):
-    """The new symbol kind, and the gate it deliberately does not trip."""
+    """The loop_dimension symbol kind."""
 
-    def test_loop_dimension_is_not_a_dimension(self):
-        """This is load-bearing, not a naming detail.
-
-        `execution/async_compile` refuses any bundle carrying an SDSC
-        dimension symbol, because that route's runtime payload was never
-        built. A loop bound never reaches an SDSC, so it must not answer True
-        here or the whole feature is refused at the compile boundary.
-        """
+    def test_loop_dimension_is_a_loop_dimension(self):
         sk = SymbolKind.loop_dimension(
             granularity=G, max_value=MAX, pytorch_sym=SYM, arg_index=0, dim_index=0
         )
-        self.assertFalse(sk.is_dimension, "must not trip the async_compile gate")
         self.assertTrue(sk.is_loop_dimension)
-
-    def test_the_old_dimension_kind_still_trips_it(self):
-        sk = SymbolKind.dimension(granularity=G, max_value=MAX, pytorch_sym=SYM)
-        self.assertTrue(sk.is_dimension, "the old route must stay gated")
-        self.assertFalse(sk.is_loop_dimension)
 
     def test_loop_dimension_carries_where_to_read_the_value(self):
         # The runtime fills this from inputs_outputs[arg_index].size(dim_index).
@@ -285,13 +272,12 @@ class TestLoopDimensionSymbolKind(unittest.TestCase):
         self.assertEqual(sk.granularity, G)
         self.assertEqual(sk.max_value, MAX)
 
-    def test_other_kinds_are_neither(self):
+    def test_other_kinds_are_not_loop_dimensions(self):
         for sk in (
             SymbolKind.kernel(0),
             SymbolKind.kernel_slice(0, 128),
             SymbolKind.pool(),
         ):
-            self.assertFalse(sk.is_dimension)
             self.assertFalse(sk.is_loop_dimension)
 
 

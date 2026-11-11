@@ -142,12 +142,6 @@ class SDSCSpec:
     constants: dict[str, Any]
     coordinate_masking: dict[Symbol, Any]
     conv_params: dict[str, Any] = dataclasses.field(default_factory=dict)
-    # maps SDSC dim name -> (pytorch_sym_name, granularity, max_val). Nothing
-    # fills it since the symbolic-SDSC route was removed (#5890); it goes with
-    # dimToSymbolMapping_ and SymbolKind.dimension.
-    symbolic_dims: dict[str, tuple[str, int, int]] = dataclasses.field(
-        default_factory=dict
-    )
     indirect_access_indices: list[int] = dataclasses.field(default_factory=list)
     debug_handle: DebugHandle | None = None
     # Index of "samv-maskvalue" in constants_. Constant ids are assigned by

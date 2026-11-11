@@ -34,7 +34,6 @@ from torch_spyre._C import (
 )
 from torch_spyre._inductor import config
 from torch_spyre._inductor.codegen.compute_ops import (
-    SymbolKind,
     core_idx_to_slice_offset,
     generate_constant_info,
 )
@@ -320,35 +319,6 @@ class TestAlignPoolDimLabels(InductorTestCase):
     def test_wrong_rank_ranges_raises(self):
         with self.assertRaises(ValueError):
             _align_pool_dim_labels((2, 3, 8), 5)
-
-
-class TestSymbolKindDimension(InductorTestCase):
-    """Unit tests for the dimension variant added to compute_ops.SymbolKind."""
-
-    def test_factory_sets_all_fields(self):
-        sk = SymbolKind.dimension(granularity=64, max_value=1024, pytorch_sym="s0")
-        self.assertEqual(sk.kind, "dimension")
-        self.assertEqual(sk.granularity, 64)
-        self.assertEqual(sk.max_value, 1024)
-        self.assertEqual(sk.pytorch_sym, "s0")
-
-    def test_is_dimension_true(self):
-        sk = SymbolKind.dimension(granularity=64, max_value=1024, pytorch_sym="s0")
-        self.assertTrue(sk.is_dimension)
-
-    def test_address_fields_are_sentinels(self):
-        # Address-specific fields must not be set by the dimension factory so
-        # they don't collide with kernel/pool symbol-table entries.
-        sk = SymbolKind.dimension(granularity=64, max_value=1024, pytorch_sym="s0")
-        self.assertEqual(sk.arg_index, -1)
-        self.assertEqual(sk.base_sym_idx, -1)
-        self.assertEqual(sk.offset, 0)
-
-    def test_kernel_is_not_dimension(self):
-        self.assertFalse(SymbolKind.kernel(arg_index=0).is_dimension)
-
-    def test_pool_is_not_dimension(self):
-        self.assertFalse(SymbolKind.pool().is_dimension)
 
 
 class TestOverlappingWindowCoreOffsets(InductorTestCase):
