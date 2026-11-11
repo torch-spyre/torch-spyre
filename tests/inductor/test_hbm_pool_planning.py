@@ -47,6 +47,29 @@ _LAUNCH_JOBPLAN = "torch_spyre.execution.kernel_runner.launch_jobplan"
 _PREPARE_KERNEL = "torch_spyre.execution.kernel_runner.prepare_kernel"
 
 
+def _standalone_alloc_lines(src: str, shape: str) -> list[str]:
+    """Wrapper lines allocating a standalone tensor of host shape `shape`."""
+    return [
+        line
+        for line in src.splitlines()
+        if "spyre_empty_with_layout(" in line and f"({shape})" in line
+    ]
+
+
+def _unbound_dels(src: str) -> list[str]:
+    """Names `del`-ed in the wrapper without a prior `name = ...` binding."""
+    assigned: set[str] = set()
+    unbound: list[str] = []
+    for line in src.splitlines():
+        stripped = line.strip()
+        if m := re.match(r"(buf\d+)\s*=", stripped):
+            assigned.add(m.group(1))
+        for name in re.findall(r"\bdel (buf\d+)\b", stripped):
+            if name not in assigned:
+                unbound.append(name)
+    return unbound
+
+
 class TestAllocator(unittest.TestCase):
     """Unit tests for Allocator.allocate's overflow-fallback behavior."""
 
@@ -1007,6 +1030,95 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
             # Without the alias-read guard this raises InductorError from
             # generate_bundle's pool_size assertion.
             torch.compile(fn)(x, y)
+
+    # A cat/pad output is an empty NopKernelSchedulerNode whose storage the copy
+    # kernels write through MutationLayoutSHOULDREMOVE aliases sharing its
+    # allocation dict. When hbm_pool_planning pools that dict, the nop's own
+    # standalone spyre_empty_with_layout is dead and must not be emitted.
+
+    @config.patch({"lx_planning": False})
+    def test_pooled_cat_nop_not_allocated(self):
+        def fn(a, b):
+            z = torch.cat([a * 2, b + 1], dim=-1)  # read only inside the bundle
+            return z + 1
+
+        a = torch.randn(64, 128, dtype=torch.float16, device="spyre")
+        b = torch.randn(64, 128, dtype=torch.float16, device="spyre")
+        with (
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_backend_compiler(),
+        ):
+            _, source_codes = run_and_get_code(torch.compile(fn), a, b)
+        src = source_codes[0]
+        # The cat storage is pooled (match the allocation marker, not a bare
+        # "hbm_pool" substring: this file's own path appears in SourceLoc) ...
+        self.assertIn("allocation={'hbm_pool'", src)
+        self.assertRegex(src, r"pool_size=[1-9]\d*")
+        # ... so only the graph output keeps a standalone (64, 256) tensor.
+        self.assertEqual(len(_standalone_alloc_lines(src, "64, 256")), 1, src)
+        self.assertEqual(_unbound_dels(src), [])
+
+    @config.patch({"lx_planning": False})
+    def test_pooled_pad_nop_not_allocated(self):
+        def fn(a):
+            return torch.nn.functional.pad(a * 2, (0, 64)) + 1
+
+        a = torch.randn(64, 128, dtype=torch.float16, device="spyre")
+        with (
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_backend_compiler(),
+        ):
+            _, source_codes = run_and_get_code(torch.compile(fn), a)
+        src = source_codes[0]
+        self.assertIn("allocation={'hbm_pool'", src)
+        self.assertRegex(src, r"pool_size=[1-9]\d*")
+        self.assertEqual(len(_standalone_alloc_lines(src, "64, 192")), 1, src)
+        self.assertEqual(_unbound_dels(src), [])
+
+    @config.patch({"lx_planning": False})
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_pooled_cat_nop_multi_bundle_no_dangling_del(self):
+        """With a later bundle, the nop's free is not a trailing memory-planning
+        line (those are popped), so it would be emitted as `del bufN`. It must be
+        dropped together with the allocation."""
+
+        def fn(a, b):
+            z = torch.cat([a * 2, b + 1], dim=-1) + 1
+            return torch.tril(z) + 1  # CPU fallback -- forces a bundle boundary
+
+        a = torch.randn(64, 128, dtype=torch.float16, device="spyre")
+        b = torch.randn(64, 128, dtype=torch.float16, device="spyre")
+        with (
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_backend_compiler(),
+        ):
+            _, source_codes = run_and_get_code(torch.compile(fn), a, b)
+        src = source_codes[0]
+        self.assertGreaterEqual(src.count(".run("), 2, src)
+        self.assertIn("allocation={'hbm_pool'", src)
+        self.assertEqual(_unbound_dels(src), [])
+
+    @config.patch({"lx_planning": False, "hbm_pool_planning": False})
+    def test_unpooled_cat_nop_still_allocated(self):
+        """Control: without pooling the nop IS the cat storage and must stay."""
+
+        def fn(a, b):
+            return torch.cat([a * 2, b + 1], dim=-1) + 1
+
+        a = torch.randn(64, 128, dtype=torch.float16, device="spyre")
+        b = torch.randn(64, 128, dtype=torch.float16, device="spyre")
+        with (
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_backend_compiler(),
+        ):
+            _, source_codes = run_and_get_code(torch.compile(fn), a, b)
+        src = source_codes[0]
+        self.assertNotIn("allocation={'hbm_pool'", src)
+        self.assertEqual(len(_standalone_alloc_lines(src, "64, 256")), 2, src)
 
 
 if __name__ == "__main__":
