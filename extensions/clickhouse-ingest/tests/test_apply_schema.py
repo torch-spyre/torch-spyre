@@ -31,6 +31,7 @@ class FakeServer:
         self.live = dict(live or {})
         self.ledger = {}
         self.log = []
+        self.elsewhere = set()
 
     def command(self, sql):
         self.log.append(sql)
@@ -50,7 +51,9 @@ class FakeServer:
         return None
 
     def query(self, sql, parameters=None):
-        if "formatQuerySingleLine" in sql:
+        if "clusterAllReplicas" in sql:
+            rows = [(n,) for n in self.elsewhere]
+        elif "formatQuerySingleLine" in sql:
             rows = [(" ".join(parameters["s"].split()),)]
         elif "system.tables" in sql:
             rows = list(self.live.items())
