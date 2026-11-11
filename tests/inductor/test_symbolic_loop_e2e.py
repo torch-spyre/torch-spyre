@@ -39,13 +39,14 @@ compiler adds later then reads as breaking that promise and raises
 the dim bare and the range is declared from inside the region. What a later
 bridge changes is who writes these three lines, not where they go.
 
-THE MINIMUM IS TWO TILES. ``for_each_tile`` views the operand as ``(count, G,
+THE MINIMUM IS ONE TILE. ``for_each_tile`` views the operand as ``(count, G,
 ...)``, so the tile count is a dimension of a traced tensor, and PyTorch's
 contiguity check asks ``count == 1`` before it looks at the stride. The answer
-becomes a guard, ``Ne(rows // G, 1)``, and a one-tile call then recompiles
-(#6018, upstream pytorch/pytorch#203781). Until #6060 installs the stride-first
-check, a declared range starts at ``2 * G`` and this file declares it that way.
-With ``min == G`` the headline test below counted two graphs in CI.
+would become a guard, ``Ne(rows // G, 1)``, and a one-tile call would recompile
+(#6018, upstream pytorch/pytorch#203781). ``enable_spyre_context`` installs a
+stride-first check (#6060), so the headline test below declares ``min == G``
+and calls at one tile. The canary at the end of this file fails if upstream
+changes the order, so the patch can then be removed.
 
 VERIFIED EMITTED BUNDLE, 6 Oct 2026, for the region below at 64 columns fp16::
 
@@ -96,13 +97,13 @@ from torch_spyre.execution.kernel_cache import get_cache_root_dir
 ROWS = 256
 COLS = 64
 TILE = 64
-MIN_ROWS = 2 * TILE  # two tiles, see the module docstring
+MIN_ROWS = TILE  # one tile, see the module docstring
 MAX_ROWS = 512
 SPEC = {"min": MIN_ROWS, "max": MAX_ROWS, "granularity": TILE}
-# The compile size first, then every kind of other size: the minimum (two
-# tiles), the maximum, above the compile size (where hint-sized geometry was
+# The compile size first, then every kind of other size: the minimum (one
+# tile), the maximum, above the compile size (where hint-sized geometry was
 # measured wrong), and below it.
-SIZES = [ROWS, MIN_ROWS, MAX_ROWS, 448, 192]
+SIZES = [ROWS, MIN_ROWS, MAX_ROWS, 448, 128]
 
 ATOL = 1e-2
 RTOL = 1e-2
@@ -329,6 +330,20 @@ class TestOneBinaryServesTheRange(unittest.TestCase):
         torch.testing.assert_close(
             out, torch.nn.functional.gelu(x[:ROWS].float()), atol=ATOL, rtol=RTOL
         )
+
+
+class TestUpstreamStillAsksSizeFirst(unittest.TestCase):
+    def test_upstream_still_asks_size_first(self):
+        """Fails if pytorch#203781 is fixed upstream; then delete
+        _contiguous_stride_first from patches.py."""
+        from torch._dynamo.source import ConstantSource
+        from torch._prims_common import check_contiguous_sizes_strides
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        env = ShapeEnv()
+        n = env.create_symintnode(env.create_symbol(128, ConstantSource("n")), hint=128)
+        check_contiguous_sizes_strides((n // TILE, TILE), (TILE, 1))
+        self.assertTrue(env.guards, "pytorch#203781 looks fixed: remove the patch")
 
 
 if __name__ == "__main__":
