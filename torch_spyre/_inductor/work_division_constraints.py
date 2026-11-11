@@ -51,7 +51,7 @@ from .constants import (
     BATCH_MATMUL_FP8_OP,
     CONV2D_FWD_OP,
     DEPTHWISE_CONV2D_OP,
-    KEEP_BY_INDEX_OP,
+    INDEX_MASKING_OPS,
     POOL_OPS,
     STAGGERED_EAS,
     _MAX_K_PER_CORE,
@@ -844,10 +844,10 @@ def topk_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
 
 
 def _keep_by_index_axes(ctx: WorkDivConstraintContext) -> set[Symbol] | None:
-    """Return the index-only K axes of a keep_by_index op."""
+    """Return the index-only K axes of a keep_by_index / mask_by_index op."""
     if not (
         isinstance(ctx.op.data, Reduction)
-        and ctx.op.data.reduction_type == KEEP_BY_INDEX_OP
+        and ctx.op.data.reduction_type in INDEX_MASKING_OPS
     ):
         return None
     writes = op_read_writes(ctx.op).writes
@@ -901,18 +901,18 @@ def keep_by_index_k_split_constraint(ctx: WorkDivConstraintContext) -> Constrain
 
 
 def _keep_by_index_search_axis(ctx: WorkDivConstraintContext) -> Symbol | None:
-    """The iteration symbol of the keep_by_index full-search output axis.
+    """The iteration symbol of the keep/mask_by_index full-search output axis.
 
     The search axis is the simplest output device coordinate absent from the
     semantic indices operand. A broadcast indices input can omit unrelated
     output/batch axes, so select one simplest such coordinate rather than every
-    absent symbol. Returns ``None`` for a non-keep_by_index op or when no such
+    absent symbol. Returns ``None`` for a non-index-masking op or when no such
     axis exists.
     """
     if (
         not (
             isinstance(ctx.op.data, Reduction)
-            and ctx.op.data.reduction_type == KEEP_BY_INDEX_OP
+            and ctx.op.data.reduction_type in INDEX_MASKING_OPS
         )
         or len(ctx.input_tds) < 2
     ):
@@ -1008,7 +1008,7 @@ _STRUCTURED_REDUCTION_TYPES: frozenset[str] = frozenset(
         BATCH_MATMUL_FP8_OP,
         CONV2D_FWD_OP,
         DEPTHWISE_CONV2D_OP,
-        KEEP_BY_INDEX_OP,
+        *INDEX_MASKING_OPS,
         *TOPK_OPS,
         *POOL_OPS,
     }

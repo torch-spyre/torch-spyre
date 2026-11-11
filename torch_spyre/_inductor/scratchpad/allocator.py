@@ -136,6 +136,7 @@ from torch_spyre._inductor.constants import (
     BATCH_MATMUL_FP8_OP,
     DEVICE_NAME,
     KEEP_BY_INDEX_OP,
+    MASK_BY_INDEX_OP,
     POOL_OPS,
 )
 
@@ -2383,7 +2384,8 @@ def _fused_layout_group_ops(
     :meth:`CoOptimizingAllocator._seed_aligned_division` aligns to its matmul).
     Two op kinds need this identical treatment:
 
-    * ``keepbyindex`` reproduces a fragile multi-stick search layout that its
+    * ``keepbyindex`` / ``maskbyindex`` reproduce a fragile multi-stick search
+      layout that its
       input restickifies and output clones carry too; an output clone splitting
       the search axis while the reduction keeps it whole drops the second search
       stick's kept values (silently wrong, ~2-3% of a 6x17x4x128 dim-3
@@ -3882,6 +3884,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             graph,
             {
                 KEEP_BY_INDEX_OP: "keep_by_index layout group",
+                MASK_BY_INDEX_OP: "mask_by_index layout group",
                 BATCH_MATMUL_FP8_OP: fp8_group_reason,
             },
         )

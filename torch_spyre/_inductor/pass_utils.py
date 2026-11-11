@@ -77,7 +77,7 @@ from .core_mapping import (
 )
 from .constants import (
     ELIDED_COPY_BACK_ATTR,
-    KEEP_BY_INDEX_OP,
+    INDEX_MASKING_OPS,
     MATMUL_REDUCTION_OPS,
     RESTICKIFY_SUPPORTED_DEVICE_DTYPES,
     TOPK_OPS,
@@ -2294,7 +2294,7 @@ def select_work_division_transport_indexes(
     if write is None:
         raise Unsupported(f"{op.get_name()} has no MemoryDep write for work division")
     write_index = write.index
-    if is_keep_by_index(op):
+    if is_index_masking_op(op):
         reduction_vars = set(it_space) - write_index.free_symbols
         read_index = read_with_max_reduction_overlap(rw.reads, reduction_vars)
         if read_index is not None:
@@ -3652,12 +3652,12 @@ def is_topk(op: Operation) -> bool:
     )
 
 
-def is_keep_by_index(op: Operation) -> bool:
-    """Return True iff ``op`` is a ``ComputedBuffer`` computing a keep_by_index reduction."""
+def is_index_masking_op(op: Operation) -> bool:
+    """Return True iff ``op`` is a keep_by_index or mask_by_index reduction."""
     return (
         isinstance(op, ComputedBuffer)
         and isinstance(op.data, Reduction)
-        and op.data.reduction_type == KEEP_BY_INDEX_OP
+        and op.data.reduction_type in INDEX_MASKING_OPS
     )
 
 
