@@ -11027,21 +11027,19 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_masking_ops_cpu(self, op, x, k: int, dim: int, fill_value: float):
         _, indices = torch.topk(x, k, dim=dim, largest=True)
         indices = indices.to(x.dtype)
-        expected = op(x, indices, dim, fill_value)
+
+        def fn(x, indices):
+            return op(x, indices, dim, fill_value)
+
+        compiled_fn = torch.compile(fn)
+        result_spyre = compiled_fn(x.to("spyre"), indices.to("spyre")).cpu()
+        expected = fn(x, indices)
         if x.dtype == torch.float32:
-            # The device's fp32 is a merged-NINF format, like DLFloat16: only
-            # 0x7FFFFFFF and 0xFFFFFFFF are non-finite. mask_by_index writes
-            # 0xFFFFFFFE as its -inf, which the host reads as NaN. Model that
-            # in the reference, as _dlfloat16_saturating_ref does. (keep_by_index
-            # is unaffected: its fills here are finite.)
+            # Device fp32 looks like NaN to the host
             expected = expected.masked_fill(torch.isneginf(expected), float("nan"))
-        self.compare_with_cpu(
-            lambda x, i: op(x, i, dim, fill_value),
-            x,
-            indices,
-            cpu_eager_result=expected,
-            # The spyre:: custom ops only have a compiled (lowered) path.
-            run_eager=False,
+
+        torch.testing.assert_close(
+            result_spyre, expected, equal_nan=True, atol=0.1, rtol=0.1
         )
 
     def test_keep_by_index_moe_router(self):
