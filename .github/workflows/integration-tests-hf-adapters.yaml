@@ -1,0 +1,59 @@
+name: trigger integration tests in downstream repos - hf-adapters
+on:
+  push:
+    branches: [main]
+    tags: ['*']
+  pull_request:
+    branches: [main]
+  merge_group:
+    types: [checks_requested]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ (github.event_name == 'pull_request' && github.event.pull_request.html_url) || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  checks: write
+  pull-requests: read # so that gh pr view can fetch the file list
+
+jobs:
+  run-hf-adapter-tests:
+    name: Run tests in hf-adapters repo
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve and Sanitize Branch Name
+        id: get_branch
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_REF: ${{ github.head_ref }}
+          MERGE_GROUP_HEAD_REF: ${{ github.event.merge_group.head_ref }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          RAW_BRANCH=''
+          if [[ "$EVENT_NAME" == 'pull_request' ]]; then
+            RAW_BRANCH="$HEAD_REF"
+          elif [[ "$EVENT_NAME" == 'merge_group' ]]; then
+            RAW_BRANCH="$MERGE_GROUP_HEAD_REF"
+          else
+            RAW_BRANCH="$REF_NAME"
+          fi
+          # Strip any potential leading "refs/heads/" safely
+          CLEAN_BRANCH="${RAW_BRANCH#refs/heads/}"
+          echo "branch=$CLEAN_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "Successfully resolved target branch: $CLEAN_BRANCH"
+
+      - name: Dispatch Downstream Tests
+        uses: benc-uk/workflow-dispatch@v1
+        with:
+          token: ${{ secrets.MY_TOKEN }}
+          repo: torch-spyre/hf-adapters
+          workflow: test_pull_request.yaml
+          ref: main
+          inputs: >-
+            {
+              "torch_spyre_ref": "${{ steps.get_branch.outputs.branch }}",
+              "ref": "main",
+              "repository": "https://github.com/torch-spyre/hf-adapters.git",
+              "build_torch_spyre": true
+            }
