@@ -104,7 +104,7 @@ from ..pass_utils import identity_load, format_operations
 
 if TYPE_CHECKING:
     from torch._inductor import ir
-    from torch._inductor.dependencies import Dep
+    from torch._inductor.dependencies import Dep, ReadWrites
 
 logger = get_inductor_logger("wsr.for_each_tile_lowering")
 
@@ -828,6 +828,73 @@ def _marker_substitution(
     return read_dep.name, read_dep.index, write_dep.var_names, write_dep.size
 
 
+def _host_layout_key(node: Any) -> "tuple | None":
+    """Host size/stride/offset of ``node``'s layout, or None if it has none.
+
+    A node with no layout (a ``TorchBindObject``, or a ``Buffer`` whose output
+    spec is not a ``Layout``) has no key, so its marker is not cached. Any other
+    error from ``get_layout`` propagates.
+    """
+    get_layout = getattr(node, "get_layout", None)
+    if get_layout is None:
+        return None
+    try:
+        layout = get_layout()
+    except NotImplementedError:
+        return None
+    return (tuple(layout.size), tuple(layout.stride), layout.offset)
+
+
+def _buffer_host_layout_key(name: str) -> "tuple | None":
+    """``_host_layout_key`` of the current graph's buffer ``name``, or None."""
+    graph = V.graph
+    if not hasattr(graph, "try_get_buffer"):  # no graph installed
+        return None
+    buf = graph.try_get_buffer(name)
+    return None if buf is None else _host_layout_key(buf)
+
+
+def _cached_marker_substitution(
+    marker_op: "ir.Operation",
+) -> tuple[str, sympy.Expr, tuple[sympy.Symbol, ...], tuple[sympy.Expr, ...]]:
+    """``_marker_substitution`` cached on the marker.
+
+    ``_InlineMarkerHandler`` is built on every trace of an inlined consumer's
+    ``inner_fn``, and each trace would otherwise re-extract the erased marker's
+    read/writes. The entry is reused only while what the extraction depends on
+    is unchanged: the marker's body object and ``inner_fn`` (a pass patches
+    ``inner_fn`` in place), its ``ranges`` (its write var names and size), its
+    host layout (its write index), and its input's host layout (its read index).
+    """
+    data = getattr(marker_op, "data", None)
+    inner_fn = getattr(data, "inner_fn", None)
+    layout_key = _host_layout_key(marker_op)
+    marker_key = (
+        None if layout_key is None else (layout_key, tuple(getattr(data, "ranges", ())))
+    )
+    cached = marker_op.__dict__.get("_ts_marker_substitution")
+    if cached is not None:
+        cached_data, cached_inner_fn, cached_keys, result = cached
+        input_key = _buffer_host_layout_key(result[0])
+        if (
+            cached_data is data
+            and cached_inner_fn is inner_fn
+            and cached_keys == (marker_key, input_key)
+            and input_key is not None
+        ):
+            return result
+    result = _marker_substitution(marker_op)
+    input_key = _buffer_host_layout_key(result[0])
+    if marker_key is not None and input_key is not None:
+        marker_op.__dict__["_ts_marker_substitution"] = (
+            data,
+            inner_fn,
+            (marker_key, input_key),
+            result,
+        )
+    return result
+
+
 class _InlineMarkerHandler(WrapperHandler):
     """Intercept a load of one erased tile_dim_marker, inlining its own body.
 
@@ -881,7 +948,7 @@ class _InlineMarkerHandler(WrapperHandler):
             self._marker_read_index,
             self._marker_var_names,
             self._marker_write_size,
-        ) = _marker_substitution(marker_op)
+        ) = _cached_marker_substitution(marker_op)
 
     def load(self, name, index):
         if name == self._marker_name:
@@ -1131,6 +1198,19 @@ def _consume_tile_dim_markers(
     marker_map: dict[tuple[str, Dep], int] = {}
     group_op_ids = {id(op) for op in group_ops}
 
+    # Every marker scans every op's reads, so trace each op once. An entry holds
+    # its op, so the id cannot be reused while the entry lives; a consumer whose
+    # inner_fn is patched in place is evicted below.
+    read_writes_cache: dict[int, tuple[ir.Operation, ReadWrites]] = {}
+
+    def read_writes(op: "ir.Operation") -> ReadWrites:
+        entry = read_writes_cache.get(id(op))
+        if entry is not None and entry[0] is op:
+            return entry[1]
+        rw = op.get_read_writes()
+        read_writes_cache[id(op)] = (op, rw)
+        return rw
+
     for marker_op in list(group_ops):
         dim = _marker_dim(marker_op)
         if dim is None:
@@ -1150,7 +1230,7 @@ def _consume_tile_dim_markers(
             # or replaced -- see below -- just not during this scan.)
             if candidate is marker_op:
                 continue
-            rw = candidate.get_read_writes()
+            rw = read_writes(candidate)
             for dep in rw.reads:
                 if isinstance(dep, (MemoryDep, StarDep)) and dep.name == marker_name:
                     consumers.append((candidate, dep))
@@ -1198,9 +1278,7 @@ def _consume_tile_dim_markers(
         # tile_dim_marker op has exactly one MemoryDep read (the tile it
         # marks).
         marker_reads = [
-            dep
-            for dep in marker_op.get_read_writes().reads
-            if isinstance(dep, MemoryDep)
+            dep for dep in read_writes(marker_op).reads if isinstance(dep, MemoryDep)
         ]
         if len(marker_reads) != 1:
             raise AssertionError(
@@ -1239,12 +1317,14 @@ def _consume_tile_dim_markers(
                 # not exactly one in total.
                 pre_inline_reads = [
                     d
-                    for d in consumer_op.get_read_writes().reads
+                    for d in read_writes(consumer_op).reads
                     if isinstance(d, MemoryDep) and d.name == marker_input_name
                 ]
                 new_consumer, _marker_axis_consumed = _inline_marker_into_consumer(
                     consumer_op, marker_op, operations
                 )
+                # Its inner_fn now reads through the inlined marker.
+                read_writes_cache.pop(id(consumer_op), None)
                 # _inline_marker_into_consumer swaps `operations[op_idx]` in
                 # place but returns a new object whose reads no longer include
                 # `consumer_dep` at all -- the marker's own inner_fn (its
@@ -1260,7 +1340,7 @@ def _consume_tile_dim_markers(
                 # new_consumer's reads again).
                 new_reads = [
                     d
-                    for d in new_consumer.get_read_writes().reads
+                    for d in read_writes(new_consumer).reads
                     if isinstance(d, MemoryDep) and d.name == marker_input_name
                 ]
                 brand_new_reads = [d for d in new_reads if d not in pre_inline_reads]
@@ -1318,6 +1398,9 @@ def _consume_tile_dim_markers(
                 # no-op for any reference that already points at marker_op by
                 # identity, and safely repoints any reference that doesn't.
                 _substitute_direct_input_refs([consumer_op], {marker_name: marker_op})
+                # Edited in place; its read names do not change, but evict it
+                # anyway so no later scan relies on that.
+                read_writes_cache.pop(id(consumer_op), None)
                 new_consumer = consumer_op
                 # No object reconstruction happened (unlike the ComputedBuffer
                 # branch) -- consumer_op's own identity is unchanged, and its
@@ -2880,6 +2963,25 @@ def _contract_cross_scope_input_materializations(
             return
 
 
+class _ReadsCache:
+    """``op.get_read_writes().reads`` traced once per op for one scan window.
+
+    Unlike ``op_read_writes``, nothing is stored on the op: a cache lives only as
+    long as its caller can show that no op it covers is edited. Ops are keyed by
+    identity and held, so a rebuilt op is a miss and an id is never reused.
+    """
+
+    def __init__(self) -> None:
+        self._reads: dict[int, tuple[Any, Any]] = {}
+
+    def __call__(self, op: Any) -> Any:
+        entry = self._reads.get(id(op))
+        if entry is None:
+            entry = (op, op.get_read_writes().reads)
+            self._reads[id(op)] = entry
+        return entry[1]
+
+
 def _contract_exact_stride_input_materializations(
     graph: Any,
     pending_levels: list[tuple[sympy.Symbol, sympy.Expr, int, list[str]]],
@@ -2933,6 +3035,12 @@ def _contract_exact_stride_input_materializations(
         if not identities:
             continue
 
+        # The consumer scan and the readers_by_source scan below trace the same
+        # ops, and nothing edits an op until the selected links are divided.
+        # Trace each op once for both; the divide and retile steps that follow
+        # change indexes, so they re-trace.
+        level_reads = _ReadsCache()
+
         # Every op carrying this level records its absolute group index in the
         # corresponding loop_group_id slot.  Different top-level HOPs can have
         # different tuple lengths, so resolve the slot per op instead of using
@@ -2959,11 +3067,7 @@ def _contract_exact_stride_input_materializations(
             consumer_info = getattr(consumer, "loop_info", None)
             if consumer_level is None or consumer_info is None:
                 continue
-            reads = [
-                dep
-                for dep in consumer.get_read_writes().reads
-                if isinstance(dep, MemoryDep)
-            ]
+            reads = [dep for dep in level_reads(consumer) if isinstance(dep, MemoryDep)]
             for dep_idx, dep in enumerate(reads):
                 producer = graph.try_get_buffer(dep.name)
                 if dep.name not in identities or not isinstance(
@@ -3103,7 +3207,7 @@ def _contract_exact_stride_input_materializations(
 
         readers_by_source: dict[str, set[tuple[str, object]]] = {}
         for reader in operations:
-            for dep in reader.get_read_writes().reads:
+            for dep in level_reads(reader):
                 dependency_name = getattr(dep, "name", None)
                 if dependency_name in selected:
                     readers_by_source.setdefault(dependency_name, set()).add(
@@ -3230,6 +3334,9 @@ def _contract_exact_stride_input_materializations(
         for op in operations
         if (identity := identity_load(op)) is not None
     }
+    # Each root scans every op's reads. The loop only attaches
+    # _read_copy_elision_record, which no trace reads, so trace each op once.
+    final_reads = _ReadsCache()
     for copy_name in direct_read_roots:
         copy_op = graph.try_get_buffer(copy_name)
         identity = identities.get(copy_name)
@@ -3262,7 +3369,7 @@ def _contract_exact_stride_input_materializations(
                 continue
             matching_reads = [
                 dep
-                for dep in op.get_read_writes().reads
+                for dep in final_reads(op)
                 if isinstance(dep, MemoryDep) and dep.name == copy_name
             ]
             if matching_reads:
@@ -3294,9 +3401,7 @@ def _contract_exact_stride_input_materializations(
             continue
 
         copy_info = getattr(copy_op, "loop_info", None)
-        copy_reads = [
-            dep for dep in copy_op.get_read_writes().reads if isinstance(dep, MemoryDep)
-        ]
+        copy_reads = [dep for dep in final_reads(copy_op) if isinstance(dep, MemoryDep)]
         if copy_info is None or len(copy_reads) != 1:
             continue
         full_strides = list(copy_op.layout.stride)

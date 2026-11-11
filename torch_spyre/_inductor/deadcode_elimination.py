@@ -18,6 +18,7 @@ from torch._inductor.ir import (
     MutationLayoutSHOULDREMOVE,
     Operation,
 )
+from torch._inductor.dependencies import ReadWrites
 from torch._inductor.graph import GraphLowering
 
 from .loop_info import LoopCarryRecord
@@ -42,6 +43,9 @@ def live_operations(graph: GraphLowering) -> frozenset[str]:
     live_bufs |= set(graph.graph_inputs)
     live_bufs |= set(graph.constants)
     live_ops: set[str] = set()
+    # Nothing edits an op while liveness is computed, so trace each op once
+    # rather than once per fixed-point iteration.
+    read_writes = [(op, op.get_read_writes()) for op in reversed(operations)]
 
     # A mutation is judged by whether its target is live, and in a spliced
     # while-loop body list order is not execution order: a read at the top of
@@ -53,7 +57,7 @@ def live_operations(graph: GraphLowering) -> frozenset[str]:
     # terminates.
     for _ in range(len(operations) + 1):
         before = (len(live_bufs), len(live_ops))
-        _walk_once(operations, live_bufs, live_ops)
+        _walk_once(read_writes, live_bufs, live_ops)
         if (len(live_bufs), len(live_ops)) == before:
             break
 
@@ -61,11 +65,16 @@ def live_operations(graph: GraphLowering) -> frozenset[str]:
 
 
 def _walk_once(
-    operations: list[Operation], live_bufs: set[str], live_ops: set[str]
+    read_writes: list[tuple[Operation, ReadWrites]],
+    live_bufs: set[str],
+    live_ops: set[str],
 ) -> None:
-    """One reverse liveness pass, accumulating into ``live_bufs``/``live_ops``."""
-    for op in reversed(operations):
-        rw = op.get_read_writes()
+    """One reverse liveness pass, accumulating into ``live_bufs``/``live_ops``.
+
+    ``read_writes`` pairs each operation with its read/writes, in reverse
+    topological order.
+    """
+    for op, rw in read_writes:
         # A side-effecting op is live whenever its write can still be observed.
         # A mutation into a dead target cannot be observed, so it is judged on
         # its own reachability like any pure op.

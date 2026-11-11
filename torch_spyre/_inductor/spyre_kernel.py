@@ -31,7 +31,7 @@ from torch._inductor.codegen.common import (
 )
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
 from torch._inductor.ir import ComputedBuffer, Pointwise
-from torch._inductor.dependencies import MemoryDep
+from torch._inductor.dependencies import MemoryDep, ReadWrites
 from torch._inductor.ops_handler import DefaultHandler, StoreMode
 from torch._inductor.utils import IndentedBuffer, sympy_index_symbol, sympy_subs
 from torch.utils._ordered_set import OrderedSet
@@ -591,6 +591,9 @@ class SpyreKernel(Kernel[CSEVariable]):
         self.indirect_sizes: dict[sympy.Symbol, int] = {}
         self._indirect_var_count: int = 0
         self._general_tile_advance_seen: dict[str, int] = {}
+        # (node, its read/writes): _general_tile_advance runs once per argument
+        # of a node, so trace the node once. Keyed by identity, holding the node.
+        self._general_tile_advance_rw: "tuple[Any, ReadWrites] | None" = None
         self._tile_advance_symbols: dict[int, sympy.Symbol] = {}
         self._alignment_repeat_info: dict[sympy.Symbol, dict[str, Any]] = {}
         self.scheduled_nodes: list[SchedulerNode] = []
@@ -733,13 +736,15 @@ class SpyreKernel(Kernel[CSEVariable]):
 
         op_name = ir_node.get_operation_name()
         squeezed_advance_per_level: list[list[tuple[sympy.Expr, sympy.Expr]]] = []
+        cached = self._general_tile_advance_rw
+        if cached is not None and cached[0] is ir_node:
+            rw = cached[1]
+        else:
+            rw = ir_node.get_read_writes()
+            self._general_tile_advance_rw = (ir_node, rw)
 
         if is_input:
-            read_deps = [
-                dep
-                for dep in ir_node.get_read_writes().reads
-                if isinstance(dep, MemoryDep)
-            ]
+            read_deps = [dep for dep in rw.reads if isinstance(dep, MemoryDep)]
             # `name` has already been resolved through mutation_real_name by
             # load() (e.g. coarse_tile_copy_buf19's dep is named "buf19" --
             # tiled_op's own output identity -- but load() passes in "buf2",
@@ -780,11 +785,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             if squeezed_advance_per_read and dep_idx < len(squeezed_advance_per_read):
                 squeezed_advance_per_level = squeezed_advance_per_read[dep_idx]
         else:
-            write_deps = [
-                dep
-                for dep in ir_node.get_read_writes().writes
-                if isinstance(dep, MemoryDep)
-            ]
+            write_deps = [dep for dep in rw.writes if isinstance(dep, MemoryDep)]
             if not write_deps:
                 return None
             dep = write_deps[0]
