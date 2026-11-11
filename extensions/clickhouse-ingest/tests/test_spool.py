@@ -114,7 +114,7 @@ def not_stored(c):
 
     def probe(item):
         have = sum(1 for r in item.rows if tuple(r) in set(c.rows))
-        return (item.scope_count or 0) + have
+        return have
 
     return probe
 
@@ -307,7 +307,7 @@ def test_kill_9_during_replay_loses_nothing_and_duplicates_nothing(tmp_path):
 
 def test_plain_table_ambiguous_replay_is_probed_not_resent(tmp_path):
     s = spool_of(tmp_path)
-    s.put("t", COLS, [[1, "a"], [2, "b"]], "tok-1", scope_count=0)
+    s.put("t", COLS, [[1, "a"], [2, "b"]], "tok-1", ambiguous=True)
     c = Cluster(replicated=False)
     c.rows.extend(
         [(1, "a"), (2, "b")]
@@ -318,15 +318,66 @@ def test_plain_table_ambiguous_replay_is_probed_not_resent(tmp_path):
 
 def test_plain_table_with_a_clean_probe_is_resent(tmp_path):
     s = spool_of(tmp_path)
-    s.put("t", COLS, [[1, "a"]], "tok-1", scope_count=0)
+    s.put("t", COLS, [[1, "a"]], "tok-1", ambiguous=True)
     c = Cluster(replicated=False)
     s.drain(c, replicated=False, probe=lambda item: len(c.rows), force=True, **FAST)
     assert c.rows == [(1, "a")]
 
 
-def test_plain_table_without_a_probe_is_reported_and_kept(tmp_path):
+def test_a_plain_batch_refused_before_any_write_is_resent_without_a_probe(tmp_path):
     s = spool_of(tmp_path)
     s.put("t", COLS, [[1, "a"]], "tok-1")
+    c = Cluster(replicated=False)
+    out = s.drain(c, replicated=False, probe=None, force=True, **FAST)
+    assert c.rows == [(1, "a")] and s.pending_count() == 0 and out.replayed == 1
+
+
+def test_a_spooled_batch_is_not_mistaken_for_stored_by_earlier_batches(tmp_path):
+    # Batch 1 lands, batch 2 is refused (285) and spooled; the table already holds 2 rows of
+    # this scope, which must not make batch 2 look stored.
+    c = Cluster(replicated=False, script=[None, err(285)] + [err(285)] * 9)
+    s = spool_of(tmp_path)
+    rows = [[i, "x"] for i in range(4)]
+    resilient_insert(
+        c, "t", rows, COLS, scope="r",
+        policy=Policy(batch_rows=2, deadline_s=0, backoff_s=1),
+        replicated=False, spool=s, **FAST,
+    )  # fmt: skip
+    c.script.clear()
+    s.drain(c, replicated=False, probe=lambda item: len(c.rows), force=True, **FAST)
+    assert sorted(c.rows) == sorted(map(tuple, rows)) and s.pending_count() == 0
+
+
+def test_a_partly_stored_ambiguous_batch_is_held_for_a_person(tmp_path):
+    s = spool_of(tmp_path)
+    s.put("t", COLS, [[1, "a"], [2, "b"]], "tok-1", ambiguous=True)
+    c = Cluster(replicated=False)
+    c.rows.append((1, "a"))
+    out = s.drain(c, replicated=False, probe=not_stored(c), force=True, **FAST)
+    assert out.held == 1 and s.pending_count() == 1 and c.rows == [(1, "a")]
+
+
+def test_two_spools_in_one_process_have_distinct_owners(tmp_path):
+    a = spool_of(tmp_path / "a", writer="w")
+    b = spool_of(tmp_path / "b", writer="w")
+    assert a.owner != b.owner
+
+
+def test_an_unreadable_shared_item_is_set_aside_not_retried_forever(tmp_path):
+    shared = FakeShared()
+    shared.put("w/bad.jsonl", b"{not json")
+    shared.put("w/partial.jsonl", b'{"table": "t"}')
+    s = spool_of(tmp_path, shared=shared)
+    s.drain(Cluster(), replicated=True, force=True, **FAST)
+    assert sorted(shared.files) == ["w/bad.jsonl.corrupt", "w/partial.jsonl.corrupt"]
+    assert s.pending_count() == 0
+    s.drain(Cluster(), replicated=True, force=True, **FAST)
+    assert len(shared.files) == 2
+
+
+def test_plain_table_without_a_probe_is_reported_and_kept(tmp_path):
+    s = spool_of(tmp_path)
+    s.put("t", COLS, [[1, "a"]], "tok-1", ambiguous=True)
     c = Cluster(replicated=False)
     out = s.drain(c, replicated=False, probe=None, **FAST)
     assert c.rows == [] and s.pending_count() == 1 and out.held == 1
@@ -337,7 +388,7 @@ def test_an_item_older_than_the_dedup_window_gets_the_probe_even_when_replicated
 ):
     now = [10_000.0]
     s = spool_of(tmp_path, dedup_window_s=3600, clock=lambda: now[0])
-    s.put("t", COLS, [[1, "a"]], "tok-1", scope_count=0, created=now[0] - 7200)
+    s.put("t", COLS, [[1, "a"]], "tok-1", ambiguous=True, created=now[0] - 7200)
     c = Cluster(replicated=True)
     c.rows.append(
         (1, "a")
@@ -387,6 +438,46 @@ def test_trust_comes_from_the_environment_and_defaults_closed(monkeypatch):
 def test_a_pull_request_run_is_never_trusted_even_with_the_flag(monkeypatch, event):
     monkeypatch.setenv("CH_WRITE_SHARED_SPOOL_TRUSTED", "1")
     monkeypatch.setenv("GITHUB_EVENT_NAME", event)
+    assert sp.shared_allowed() is False
+
+
+@pytest.fixture
+def actions_env(monkeypatch):
+    for k in ("GITHUB_EVENT_PATH", "GITHUB_REF_PROTECTED"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("CH_WRITE_SHARED_SPOOL_TRUSTED", "1")
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_REF_PROTECTED", "true")
+    return monkeypatch
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        "issue_comment",
+        "workflow_run",
+        "pull_request_review",
+        "pull_request_review_comment",
+        "merge_group",
+        "repository_dispatch",
+        "",
+    ],
+)
+def test_events_outside_the_allowlist_are_refused(actions_env, event):
+    actions_env.setenv("GITHUB_EVENT_NAME", event)
+    assert sp.shared_allowed() is False
+
+
+@pytest.mark.parametrize("event", ["push", "schedule", "workflow_dispatch"])
+def test_allowlisted_events_on_a_protected_ref_are_trusted(actions_env, event):
+    actions_env.setenv("GITHUB_EVENT_NAME", event)
+    assert sp.shared_allowed() is True
+
+
+@pytest.mark.parametrize("protected", ["false", ""])
+def test_an_unprotected_ref_is_refused(actions_env, protected):
+    actions_env.setenv("GITHUB_EVENT_NAME", "push")
+    actions_env.setenv("GITHUB_REF_PROTECTED", protected)
     assert sp.shared_allowed() is False
 
 

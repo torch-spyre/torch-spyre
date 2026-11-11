@@ -20,9 +20,16 @@ up the caller's own write) and only then sends its own rows.
 
 * A claim is an atomic rename. Two writers racing on one item cannot both win. A claim carries a
   lease; a writer that died leaves a claim that expires and is replayed.
-* Replicated tables: the original `insert_deduplication_token` makes a replay exactly-once while
-  the server still holds the token. An item older than the dedup window, or one a failed attempt
-  may have stored, is probed first, as a plain table always is.
+* A batch refused before any write (`ambiguous` False) is sent again as is, on any table.
+* A batch a failed attempt may have stored (`ambiguous` True) is safe to resend only on a
+  Replicated table inside its dedup window, where the original `insert_deduplication_token`
+  makes the replay exactly-once. On a plain table, or past the window, it is held until
+  `probe(item)` reports how many of THIS batch's own rows are stored: all of them drops the
+  item, none sends it, anything between holds it for a person. The probe must identify the
+  batch (its key columns or a per-batch marker), never count a whole scope: other writers' and
+  earlier batches' rows in the scope would make a lost batch look stored.
+* A crash between a successful send and the file's removal resends a plain-table batch once
+  more; only a Replicated table can absorb that.
 * The shared tier holds row data. It is used only by trusted runs (see `shared_allowed`) and any
   failure there falls back to the local directory.
 """
@@ -34,6 +41,7 @@ import json
 import os
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Protocol
@@ -41,7 +49,11 @@ from typing import Callable, Protocol
 from . import resilience as rz
 
 CLAIM = ".claimed-"
+CORRUPT = ".corrupt"
+# Conservative: ClickHouse keeps tokens for the last N blocks per table (replicated_deduplication_window)
+# and for 7 days; a busy table can evict a token well before the time bound.
 DEDUP_WINDOW_S = 3600.0
+TRUSTED_EVENTS = frozenset({"push", "schedule", "workflow_dispatch"})
 
 
 class SpoolFull(RuntimeError):
@@ -54,9 +66,11 @@ class SpoolFull(RuntimeError):
 def shared_allowed(env=None) -> bool:
     """True only for a run that may put row data in the shared store.
 
-    Default closed. An explicit CH_WRITE_SHARED_SPOOL_TRUSTED=1 is required and is still refused
-    for pull-request runs and for forks, because those run code the team did not review with
-    secrets in reach.
+    Default closed. An explicit CH_WRITE_SHARED_SPOOL_TRUSTED=1 is required. Inside GitHub Actions
+    the event must also be on an allowlist (push, schedule, workflow_dispatch) and the ref
+    protected: every other event (pull_request*, issue_comment, workflow_run, merge_group, ...)
+    can run code the team did not review with secrets in reach. Outside Actions the flag alone
+    decides.
     """
     env = os.environ if env is None else env
     if (env.get("CH_WRITE_SHARED_SPOOL_TRUSTED") or "").strip() not in (
@@ -66,8 +80,11 @@ def shared_allowed(env=None) -> bool:
     ):
         return False
     event = (env.get("GITHUB_EVENT_NAME") or "").strip()
-    if event in ("pull_request", "pull_request_target", "fork"):
-        return False
+    if env.get("GITHUB_ACTIONS") or event:
+        if event not in TRUSTED_EVENTS:
+            return False
+        if (env.get("GITHUB_REF_PROTECTED") or "").strip().lower() != "true":
+            return False
     path = env.get("GITHUB_EVENT_PATH")
     if path:
         try:
@@ -172,7 +189,7 @@ class TieredSpool:
         self.dedup_window_s = dedup_window_s
         self.max_bytes, self.max_age_s = max_bytes, max_age_s
         self.now = clock or time.time
-        self.owner = f"{os.getpid()}-{writer}"
+        self.owner = f"{os.getpid()}-{writer}-{uuid.uuid4().hex[:8]}"
 
     # -- writing ---------------------------------------------------------------
 
@@ -187,8 +204,7 @@ class TieredSpool:
         doc = {
             "table": table, "columns": list(columns), "rows": [list(r) for r in rows],
             "token": token, "database": database, "created": meta.get("created", self.now()),
-            "scope_count": meta.get("scope_count"), "ambiguous": bool(meta.get("ambiguous")),
-            "scope": meta.get("scope"),
+            "ambiguous": bool(meta.get("ambiguous")), "scope": meta.get("scope"),
         }  # fmt: skip
         self.shared.put(f"{self.writer}/{token}.jsonl", _encode(doc))
 
@@ -207,9 +223,15 @@ class TieredSpool:
 
     def _check_cap(self, rows) -> None:
         extra = len(_encode({"r": [list(r) for r in rows]}))
-        if self.stats().bytes + extra > self.max_bytes:
+        used = 0
+        for p in self.local.dir.glob("*.json"):
+            try:
+                used += p.stat().st_size
+            except OSError:
+                pass
+        if used + extra > self.max_bytes:
             raise SpoolFull(
-                f"spool at {self.stats().bytes} bytes; cap {self.max_bytes}. "
+                f"spool at {used} bytes; cap {self.max_bytes}. "
                 "Writing more would drop data; failing the write instead."
             )
 
@@ -233,7 +255,7 @@ class TieredSpool:
             return [
                 (n, a)
                 for n, a in self.shared.list()
-                if CLAIM not in n and not n.endswith(".lock")
+                if CLAIM not in n and not n.endswith((".lock", CORRUPT))
             ]
         except OSError:
             return []
@@ -348,7 +370,7 @@ class TieredSpool:
             names = [
                 n
                 for n, _ in self.shared.list()
-                if CLAIM not in n and not n.endswith(".lock")
+                if CLAIM not in n and not n.endswith((".lock", CORRUPT))
             ]
         except OSError:
             return res
@@ -359,14 +381,26 @@ class TieredSpool:
                 mine = self.shared.claim(name, self.owner)
                 if mine is None:
                     continue
-                doc = json.loads(self.shared.get(mine))
-            except (OSError, ValueError):
+                raw = self.shared.get(mine)
+            except OSError:
                 continue
-            item = rz.SpoolItem(
-                Path(name), doc["table"], doc["columns"], doc["rows"], doc["token"],
-                doc.get("database"), _num(doc.get("created")), doc.get("scope_count"),
-                bool(doc.get("ambiguous")), doc.get("scope"),
-            )  # fmt: skip
+            try:
+                doc = json.loads(raw)
+                item = rz.SpoolItem(
+                    Path(name), doc["table"], doc["columns"], doc["rows"], doc["token"],
+                    doc.get("database"), _num(doc.get("created")),
+                    bool(doc.get("ambiguous")), doc.get("scope"),
+                )  # fmt: skip
+            except (ValueError, KeyError, TypeError):
+                # Unreadable for good: set it aside so it is not claimed and failed every run.
+                try:
+                    self.shared.put(f"{name}{CORRUPT}", raw)
+                    self.shared.delete(mine)
+                except OSError:
+                    pass
+                log(f"  [spool] {name}: unreadable; set aside")
+                res.failed += 1
+                continue
             outcome = self._replay_one(
                 client, item, replicated, probe, policy, sleep, log
             )
@@ -392,36 +426,24 @@ class TieredSpool:
         aged_out = (
             item.created is not None and self.now() - item.created > self.dedup_window_s
         )
-        needs_probe = (not replicated) or aged_out or item.ambiguous
-        if needs_probe and (item.ambiguous or not replicated or aged_out):
-            if (
-                item.scope_count is not None
-                or item.ambiguous
-                or aged_out
-                or not replicated
-            ):
-                if probe is None:
-                    if not replicated or aged_out:
-                        log(
-                            f"  [spool] {item.token}: held (no row-count probe for a table without dedup)"
-                        )
-                        return "held"
-                else:
-                    try:
-                        have = probe(item)
-                    except Exception as err:  # noqa: BLE001
-                        log(
-                            f"  [spool] {item.token}: probe failed ({type(err).__name__}); held"
-                        )
-                        return "held"
-                    base = item.scope_count if item.scope_count is not None else 0
-                    if have - base >= len(item.rows):
-                        return "ok"  # already stored: nothing to send
-                    if have - base != 0:
-                        log(
-                            f"  [spool] {item.token}: {have - base:+d} rows differ; held"
-                        )
-                        return "held"
+        if item.ambiguous and (not replicated or aged_out):
+            if probe is None:
+                log(f"  [spool] {item.token}: held (may be stored; no probe to tell)")
+                return "held"
+            try:
+                have = probe(item)
+            except Exception as err:  # noqa: BLE001
+                log(
+                    f"  [spool] {item.token}: probe failed ({type(err).__name__}); held"
+                )
+                return "held"
+            if have >= len(item.rows):
+                return "ok"  # already stored: nothing to send
+            if have != 0:
+                log(
+                    f"  [spool] {item.token}: {have}/{len(item.rows)} rows stored; held"
+                )
+                return "held"
         try:
             rz._send(
                 client, item.table, item.rows, item.columns, item.database,

@@ -215,3 +215,20 @@ def test_metrics_names():
         "ch_spool_oldest_age_s",
         "ch_spool_bytes",
     }
+
+
+def test_list_ages_are_utc_whatever_the_local_timezone(monkeypatch):
+    import calendar
+    import time
+
+    monkeypatch.setenv("TZ", "America/New_York")
+    time.tzset()
+    try:
+        fake, a = make()
+        a.put("w/x.jsonl", b"1")
+        now = calendar.timegm((2026, 11, 7, 1, 0, 0))  # 1h after lastModified
+        a.clock = lambda: now
+        assert a.list()[0][1] == 3600
+    finally:
+        monkeypatch.delenv("TZ")
+        time.tzset()

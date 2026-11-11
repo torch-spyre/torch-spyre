@@ -21,7 +21,10 @@ during a pod restart, or when Keeper blips. This module keeps those writes exact
   stored) or fatal (a resend cannot help).
 * On a Replicated table every batch carries a deterministic `insert_deduplication_token`, so
   resending an ambiguous batch cannot double it. A plain table has no such guard: an ambiguous
-  batch there is reported, never resent.
+  batch there is spooled as held and resent only after a probe that identifies that batch's own
+  rows (see `spool.TieredSpool.drain`); without a spool the call raises WriteAmbiguous.
+* A batch refused before any write (quorum, read-only, too many parts) is never ambiguous and
+  is simply sent again, on either kind of table.
 * Retries back off to a total deadline. A table whose data is regenerable may then drop to a
   lower quorum; a strict one never does.
 * Past the deadline the batch goes to a durable spool, replayed later with the same token.
@@ -40,16 +43,25 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterator, Sequence
 
-# Nothing was stored: the quorum check or the read-only check fails before the write.
-RETRY_CODES = frozenset({242, 285, 286})
-# The block may be stored on some replicas: coordination, timeouts, network.
-AMBIGUOUS_CODES = frozenset({159, 209, 210, 319, 999, 1000})
+# Nothing was stored: the quorum, read-only and parts-limit checks fail before the write.
+RETRY_CODES = frozenset({242, 252, 285, 286})
+# The block may be stored on some replicas or in some views: coordination, timeouts, network,
+# and a memory limit hit while a materialized view was being fed.
+AMBIGUOUS_CODES = frozenset({159, 209, 210, 241, 319, 999, 1000})
 # A resend cannot change the answer: schema, permission, syntax and constraint errors.
 FATAL_CODES = frozenset({16, 27, 36, 43, 47, 53, 60, 62, 81, 439, 469, 497, 516})
 
 
 class WriteUnavailable(RuntimeError):
     """The cluster did not accept the write before the deadline and no spool was given."""
+
+
+class WriteAmbiguous(RuntimeError):
+    """A plain-table batch may or may not be stored and there is no spool to hold it."""
+
+    def __init__(self, message: str, outcome: "Outcome"):
+        super().__init__(message)
+        self.outcome = outcome
 
 
 def _code(err: BaseException) -> int | None:
@@ -84,10 +96,13 @@ def classify(err: BaseException) -> str:
     return "fatal"
 
 
-def batch_token(table: str, scope: str, rows: Sequence[Sequence]) -> str:
-    """A stable token for one batch: the same rows in the same order under the same scope."""
+def batch_token(
+    table: str, scope: str, rows: Sequence[Sequence], index: int = 0
+) -> str:
+    """A stable token for one batch: the same rows in the same order, at the same position,
+    under the same scope. The position keeps two identical batches in one load apart."""
     h = hashlib.sha256()
-    h.update(f"{table}\x00{scope}\x00".encode())
+    h.update(f"{table}\x00{scope}\x00{index}\x00".encode())
     h.update(json.dumps(rows, default=str, separators=(",", ":")).encode())
     return f"{table}-{h.hexdigest()[:40]}"
 
@@ -134,8 +149,6 @@ class SpoolItem:
     token: str
     database: str | None
     created: float | None = None
-    # Rows in the probed scope before this batch was attempted; None when no probe was given.
-    scope_count: int | None = None
     # True when a failed attempt may have stored the batch. A batch refused before any write
     # (quorum, read-only) is not ambiguous and can always be sent again.
     ambiguous: bool = False
@@ -159,7 +172,6 @@ class Spool:
         database=None,
         *,
         created: float | None = None,
-        scope_count: int | None = None,
         ambiguous: bool = False,
         scope: str | None = None,
     ) -> Path:
@@ -171,7 +183,6 @@ class Spool:
             "token": token,
             "database": database,
             "created": created,
-            "scope_count": scope_count,
             "ambiguous": bool(ambiguous),
             "scope": scope,
         }
@@ -210,7 +221,6 @@ class Spool:
                     d["token"],
                     d.get("database"),
                     None if d.get("created") is None else float(d["created"]),
-                    d.get("scope_count"),
                     bool(d.get("ambiguous")),
                     d.get("scope"),
                 )
@@ -280,8 +290,10 @@ def resilient_insert(
 
     `scope` names what the rows belong to (a run id, a file); it feeds the batch token so two
     different loads of identical rows are not mistaken for one. Returns an Outcome; raises
-    WriteUnavailable past the deadline when no spool is given, and the original error when it is
-    fatal.
+    WriteUnavailable past the deadline when no spool is given, WriteAmbiguous when a plain-table
+    batch may be stored and no spool can hold it, and the original error when it is fatal.
+    The deadline covers the call's first unlandable batch: once one batch is spooled the rest go
+    straight to the spool, so a dead cluster costs one deadline, not one per batch.
     """
     policy = policy or Policy()
     wait = sleep or time.sleep
@@ -298,8 +310,23 @@ def resilient_insert(
         )
     size = max(1, policy.batch_rows)
     batches = [list(rows[i : i + size]) for i in range(0, len(rows), size)]
+
+    def park(n, batch, tok, ambiguous, why):
+        meta = {"ambiguous": ambiguous, "scope": scope}
+        if hasattr(spool, "put_any"):
+            spool.put_any(table, columns, batch, tok, database, **meta)
+        else:
+            spool.put(table, columns, batch, tok, database, **meta)
+        out.spooled += len(batch)
+        log(f"  [spooled] {table} batch {n}/{len(batches)} ({len(batch)} rows): {why}")
+
+    spilled = False
     for n, batch in enumerate(batches, 1):
-        token = batch_token(table, scope, batch) if replicated else None
+        tok = batch_token(table, scope, batch, n)
+        token = tok if replicated else None
+        if spilled:
+            park(n, batch, tok, False, "earlier batch could not land")
+            continue
         start = now()
         attempt = 0
         while True:
@@ -328,9 +355,14 @@ def resilient_insert(
                 if kind == "ambiguous" and not replicated:
                     # A plain table cannot tell a stored block from a lost one.
                     out.ambiguous.append((n, repr(err)))
-                    log(
-                        f"  [ambiguous] {table} batch {n}/{len(batches)}: not resent ({err!r})"
-                    )
+                    if spool is None:
+                        raise WriteAmbiguous(
+                            f"{table}: batch {n}/{len(batches)} may be stored and cannot be "
+                            f"resent ({err!r})",
+                            out,
+                        ) from err
+                    park(n, batch, tok, True, f"ambiguous, held: {err!r}")
+                    spilled = True
                     break
                 attempt += 1
                 wait_s = min(
@@ -342,16 +374,8 @@ def resilient_insert(
                             f"{table}: batch {n}/{len(batches)} not accepted within "
                             f"{policy.deadline_s:.0f}s ({err!r})"
                         ) from err
-                    tok = token or batch_token(table, scope, batch)
-                    meta = {"ambiguous": kind == "ambiguous", "scope": scope}
-                    if hasattr(spool, "put_any"):
-                        spool.put_any(table, columns, batch, tok, database, **meta)
-                    else:
-                        spool.put(table, columns, batch, tok, database, **meta)
-                    out.spooled += len(batch)
-                    log(
-                        f"  [spooled] {table} batch {n}/{len(batches)} ({len(batch)} rows): {err!r}"
-                    )
+                    park(n, batch, tok, kind == "ambiguous", repr(err))
+                    spilled = True
                     break
                 log(
                     f"  [retry] {table} batch {n}/{len(batches)} attempt {attempt}: {err!r}; in {wait_s:.0f}s"
@@ -374,6 +398,9 @@ def replay(
     policy = policy or Policy()
     sent = 0
     for item in list(spool.pending()):
+        if item.ambiguous and not replicated:
+            log(f"  [replay] {item.path.name}: ambiguous on a plain table; held")
+            continue
         try:
             _send(
                 client,

@@ -54,6 +54,10 @@ def err(code, name="X"):
         # Quorum timeout: the block may sit on fewer replicas than asked.
         (err(159, "TIMEOUT_EXCEEDED"), "ambiguous"),
         (err(242, "TABLE_IS_READ_ONLY"), "retry"),
+        # Refused before the block is written: merges catch up, then it goes through.
+        (err(252, "TOO_MANY_PARTS"), "retry"),
+        # May hit while a materialized view is being fed, after the source block landed.
+        (err(241, "MEMORY_LIMIT_EXCEEDED"), "ambiguous"),
         (err(999, "KEEPER_EXCEPTION"), "ambiguous"),
         (OperationalError("Read timed out"), "ambiguous"),
         (ConnectionResetError("reset"), "ambiguous"),
@@ -169,8 +173,48 @@ def test_ambiguous_failure_on_a_plain_table_without_a_probe_is_spooled_not_resen
 ):
     c = Cluster(script=[err(319)], replicated=False, store_on_fail=True)
     out = run(c, spool=Spool(tmp_path))
-    assert out.stored < 7 and out.spooled == 0 and out.ambiguous
+    assert out.stored < 7 and out.spooled > 0 and out.ambiguous
+    held = list(Spool(tmp_path).pending())
+    assert held[0].ambiguous and not any(i.ambiguous for i in held[1:])
     assert c.rows.count(ROWS[0]) == 1
+
+
+def test_ambiguous_plain_batch_without_a_spool_is_loud():
+    c = Cluster(script=[err(319)], replicated=False, store_on_fail=True)
+    with pytest.raises(resilience.WriteAmbiguous) as ei:
+        run(c)
+    assert ei.value.outcome.ambiguous
+
+
+def test_a_dead_cluster_costs_one_deadline_not_one_per_batch(tmp_path):
+    now, slept = [0.0], []
+    c = Cluster(script=[err(285)] * 99)
+
+    def sleep(s):
+        slept.append(s)
+        now[0] += s
+
+    out = resilient_insert(
+        c,
+        "t",
+        [[i, "x"] for i in range(10)],
+        ["a", "b"],
+        scope="s",
+        policy=Policy(batch_rows=2, deadline_s=10, backoff_s=2, backoff_max_s=4),
+        replicated=False,
+        spool=Spool(tmp_path),
+        sleep=sleep,
+        clock=lambda: now[0],
+        log=lambda m: None,
+    )
+    assert out.spooled == 10 and out.stored == 0
+    assert sum(slept) <= 10
+    assert len(c.calls) == len(slept) + 1
+
+
+def test_identical_batches_in_one_load_get_distinct_tokens():
+    b = [[1, "a"]]
+    assert batch_token("t", "s", b, 1) != batch_token("t", "s", b, 2)
 
 
 def test_fatal_error_is_raised_at_once():
