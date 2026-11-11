@@ -78,37 +78,89 @@ def create_tensor_info(tinfo):
     return (dims, dtype)
 
 
-def launch_from_cli(path, inputs, outputs):
+def launch_from_cli(path, inputs, outputs, bindings=None):
     path = Path(path)
     import torch
 
-    tensors = []
-    for iarg in inputs:
-        shape, dtype = create_tensor_info(iarg)
-        tensor = torch.ones(
-            shape,
-            dtype=getattr(torch, dtype),
-            device="spyre",
-        )
-        tensors.append(tensor)
+    # Deferred, like the other torch-spyre imports here: launch_spec imports
+    # torch at module level, and `spyre --help` must work without it.
+    from .launch_spec import (
+        check_tensors_against_spec,
+        default_tensors,
+        load_kernelspec,
+        tensors_from_spec,
+    )
 
-    for oarg in outputs:
-        shape, dtype = create_tensor_info(oarg)
-        tensor = torch.empty(
-            shape,
-            dtype=getattr(torch, dtype),
-            device="spyre",
+    bindings = bindings or {}
+    spec = load_kernelspec(path)
+
+    if spec is None and not inputs and not outputs:
+        # Nothing to launch with: no spec to read the arguments from, and none
+        # given. Caught here rather than in the CLI, which cannot see whether
+        # the folder has a spec. Launching anyway would pass zero tensors and
+        # fail deep in the runtime with an argument-count error.
+        raise ValueError(
+            f"{path} has no launch spec, so the tensors must be described: "
+            "pass -i/-o, or recompile to get a folder that describes itself."
         )
-        tensors.append(tensor)
+
+    if spec is not None and not inputs and not outputs:
+        # The folder describes itself, so there is nothing to retype. Ones
+        # are a smoke test and said to be one: this path answers "does it
+        # run", not "is it right". A caller with real data allocates with
+        # tensors_from_spec and writes its own values.
+        tensors = tensors_from_spec(spec, bindings)
+        default_tensors(spec, tensors)
+        # By role, not by position: an output need not be a trailing argument,
+        # and an in-place arg is both. ``arg_offset`` skips the pool, which sits
+        # at 0 and is not one of ``args``.
+        out_positions = [
+            arg.arg_index + spec.arg_offset for arg in spec.args if arg.role != "input"
+        ]
+        print(f"using {spec.kernel_name} launch spec from {path}")
+    else:
+        tensors = []
+        for iarg in inputs:
+            shape, dtype = create_tensor_info(iarg)
+            tensor = torch.ones(
+                shape,
+                dtype=getattr(torch, dtype),
+                device="spyre",
+            )
+            tensors.append(tensor)
+
+        for oarg in outputs:
+            shape, dtype = create_tensor_info(oarg)
+            tensor = torch.empty(
+                shape,
+                dtype=getattr(torch, dtype),
+                device="spyre",
+            )
+            tensors.append(tensor)
+        # Explicit form appends outputs after inputs, so they are the tail.
+        out_positions = list(range(len(inputs), len(tensors)))
+
+        if spec is not None:
+            # Explicit arguments AND a spec: check them rather than trusting
+            # them. This is the case that used to launch and return wrong data.
+            problems = check_tensors_against_spec(spec, tensors, bindings)
+            if problems:
+                raise ValueError(
+                    "the tensors given do not match what this kernel expects:\n"
+                    + "\n".join(f"  - {p}" for p in problems)
+                    + "\n\nOmit -i/-o to build them from the spec instead."
+                )
 
     runner = _launch(path, tensors)
 
-    # TODO: deal with the cases when we have multiple outputs
-    # which ops would those be?
-    if len(outputs) > 1:
-        print("WARNING: multiple outputs found, but only last one printed!")
-
-    print(tensors[-1].cpu())
+    # Every output, not just the last: reading them all back is also what makes
+    # a failed launch visible, since .cpu() is where a dead kernel surfaces.
+    if not out_positions:
+        out_positions = [len(tensors) - 1]
+    for pos in out_positions:
+        if len(out_positions) > 1:
+            print(f"output (arg {pos}):")
+        print(tensors[pos].cpu())
     del runner
 
 
