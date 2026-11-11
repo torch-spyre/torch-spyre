@@ -1399,6 +1399,68 @@ void copy_kv_page_raw(const at::Tensor& cache, size_t block_id,
 }
 
 /**
+ * Whether an H2D copy into sub-view `dst` needs spyre_copy_from's
+ * read-modify-write.
+ *
+ * The DMA engine moves whole 128-byte sticks, so a slice starting or ending
+ * mid-stick cannot be written without clobbering its neighbours (#3976; flex
+ * issue 2083 tracks native sub-stick DMA). Stick-aligned slices are served
+ * natively by generate_dci (#4858) and must stay there: that is #4789's vLLM
+ * prefix copy, which a full-allocation round trip would cripple.
+ *
+ * Aligned = along the stick dimension the view starts on a stick boundary and
+ * ends on one or at the logical extent (the rest of that stick is padding).
+ */
+static bool h2d_needs_substick_rmw(const at::Tensor& dst,
+                                   const SpyreTensorImpl* spyre_impl) {
+  const int64_t eps = spyre_impl->spyre_layout.elems_per_stick();
+  // Unknown geometry: let the DCI path decide; it rejects what it cannot
+  // express rather than writing wrong data.
+  if (eps <= 1) return false;
+
+  // Stick dimension = fastest-varying allocation dimension.
+  const int dma_rank = spyre_impl->dma_strides.size();
+  int inner = -1;
+  for (int i = 0; i < dma_rank; i++) {
+    if (spyre_impl->dma_strides[i] == 1 && spyre_impl->dma_sizes[i] > 1) {
+      inner = i;
+      break;
+    }
+  }
+  if (inner < 0) return false;
+  const int64_t inner_extent = spyre_impl->dma_sizes[inner];
+
+  // The offset below only decomposes positionally when the stride above the
+  // stick dimension is the inner extent, as it is for contiguous allocations.
+  // Any other layout: stage it, which is correct and merely slower.
+  int64_t next_stride = inner_extent;
+  for (int i = 0; i < dma_rank; i++) {
+    if (spyre_impl->dma_sizes[i] <= 1) continue;
+    const int64_t stride = spyre_impl->dma_strides[i];
+    if (stride > 1 && stride < next_stride) next_stride = stride;
+  }
+  if (next_stride != inner_extent) return true;
+
+  // Elements covered along the stick dimension. No stride-1 dimension means a
+  // fully indexed scalar or a strided view (x[..., ::2]): one element per
+  // step, never aligned for eps > 1.
+  int64_t inner_size = 1;
+  for (int64_t i = 0; i < dst.dim(); i++) {
+    if (dst.sizes()[i] == 1) continue;
+    if (dst.strides()[i] == 1) {
+      inner_size = dst.sizes()[i];
+      break;
+    }
+  }
+
+  const int64_t start = dst.storage_offset() % inner_extent;
+  const bool aligned_start = (start % eps == 0);
+  const bool aligned_end =
+      ((start + inner_size) % eps == 0) || (start + inner_size == inner_extent);
+  return !(aligned_start && aligned_end);
+}
+
+/**
  * This method handles copy between devices. When copying to Spyre, this method
  * marks the tensor to compute on Spyre, but continue to use CPU tensor for now
  * such that when we run an op on the tensor on the Spyre, it will have the
@@ -1525,9 +1587,49 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
   const at::Tensor* copy_from = &self;
   const at::Tensor* copy_to = &dst;
   bool non_overlapping_and_dense = true;
+  bool h2d_staging = false;
 
   if (dst.is_privateuseone()) {
     stream = getCurrentStream(dst.device());
+    // H2D sub-stick path: a destination sub-view the DMA engine cannot write
+    // is read-modify-written instead — D2H the whole allocation, patch the
+    // slot on the CPU, H2D it back at offset 0. This costs the full
+    // allocation, hence the h2d_needs_substick_rmw() gate; drop it once flex
+    // issue 2083 lands native sub-stick DMA.
+    auto* spyre_impl = static_cast<SpyreTensorImpl*>(dst.unsafeGetTensorImpl());
+    const int64_t dma_numel = c10::multiply_integers(spyre_impl->dma_sizes);
+    const bool physical_exceeds_logical = (dma_numel > dst.numel());
+
+    if (physical_exceeds_logical && h2d_needs_substick_rmw(dst, spyre_impl)) {
+      h2d_staging = true;
+      c10::IntArrayRef alloc_sizes(spyre_impl->dma_sizes);
+      c10::IntArrayRef alloc_strides(spyre_impl->dma_strides);
+      // The staging buffer is the logical allocation, so a view reaching into
+      // the device allocation's stick padding has no slot to patch.
+      int64_t last_index = dst.storage_offset();
+      for (int64_t i = 0; i < dst.dim(); i++) {
+        last_index += (dst.sizes()[i] - 1) * dst.strides()[i];
+      }
+      TORCH_CHECK(dst.numel() == 0 || last_index < dma_numel,
+                  "Spyre H2D copy into a sub-view that extends into stick "
+                  "padding is not supported: view ends at element ",
+                  last_index, " of a ", dma_numel, "-element allocation");
+      // Step 1: D2H the allocation, in dst's dtype so elements outside the
+      // slot survive a dtype-converting copy unchanged.
+      alloc_view = at::as_strided(dst, alloc_sizes, alloc_strides,
+                                  /*storage_offset=*/0);
+      cpu_alloc =
+          at::empty(alloc_sizes, self.options().dtype(dst.scalar_type()));
+      stream.copyAsync(alloc_view, cpu_alloc);
+      stream.synchronize();
+      // Step 2: patch the slot on the CPU.
+      at::Tensor cpu_slot = cpu_alloc.as_strided(dst.sizes(), dst.strides(),
+                                                 dst.storage_offset());
+      cpu_slot.copy_(self);
+      // Step 3: H2D the whole buffer.
+      copy_from = &cpu_alloc;
+      copy_to = &alloc_view;
+    }
   } else {
     stream = getCurrentStream(self.device());
     // D2H staging path: DMA the full physical allocation into a CPU buffer
@@ -1641,11 +1743,15 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
   }
 
   stream.copyAsync(*copy_from, *copy_to);
-  if (!non_blocking) {
+  if (!non_blocking || h2d_staging || !non_overlapping_and_dense) {
+    // Staging buffers must outlive the DMA: copyAsync takes a raw void* and
+    // does not retain the tensor. H2D's cpu_alloc is function-local; D2H's
+    // must be complete before the view below reads it.
     stream.synchronize();
   }
 
   if (!non_overlapping_and_dense) {
+    // D2H: apply the logical view onto the CPU destination.
     at::Tensor cpu_view = cpu_alloc.as_strided(self.sizes(), self.strides(),
                                                self.storage_offset());
     dst.copy_(cpu_view);
