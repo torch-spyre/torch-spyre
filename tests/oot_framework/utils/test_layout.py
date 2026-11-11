@@ -120,7 +120,11 @@ def load_timings(path: Optional[str]) -> Dict[str, dict]:
 
 
 def _check_multicard(path: str, mc) -> None:
-    """`multicard`: {"enabled": bool, "runners": [{"label", "cards" >= 2, "min_minutes" > 0}]}."""
+    """`multicard`: {"enabled": bool, "runners": [{"label", "min_minutes" > 0}]}.
+
+    No card count: the runner label already names it, and run_test.sh --parallel detects the cards from
+    the pod, so a count here could only disagree with them unnoticed.
+    """
     if not isinstance(mc, dict) or set(mc) - {"enabled", "runners"}:
         raise LayoutError(
             f'{path}: multicard must be {{"enabled", "runners"}}, got {mc!r}'
@@ -133,12 +137,9 @@ def _check_multicard(path: str, mc) -> None:
     for r in runners:
         ok = (
             isinstance(r, dict)
-            and set(r) == {"label", "cards", "min_minutes"}
+            and set(r) == {"label", "min_minutes"}
             and isinstance(r["label"], str)
             and r["label"]
-            and isinstance(r["cards"], int)
-            and not isinstance(r["cards"], bool)
-            and r["cards"] >= 2
             and isinstance(r["min_minutes"], (int, float))
             and not isinstance(r["min_minutes"], bool)
             and r["min_minutes"] > 0
@@ -146,7 +147,7 @@ def _check_multicard(path: str, mc) -> None:
         if not ok:
             raise LayoutError(
                 f"{path}: multicard runner must be "
-                f'{{"label": str, "cards": int >= 2, "min_minutes": number > 0}}, got {r!r}'
+                f'{{"label": str, "min_minutes": number > 0}}, got {r!r}'
             )
 
 
@@ -155,10 +156,12 @@ def multicard_runners(
 ) -> Dict[str, str]:
     """{config key: multi-card runner label} for the long configs that move off one card.
 
-    A config moves when it is on the default runner, not excluded, has `min_runs` runs, and its
-    median reaches a runner's `min_minutes`; it gets the runner with the highest `min_minutes` it
-    reaches, so a longer config gets more cards. A shared test file does not matter here: a moved
-    config runs alone and reports under its own name, so its timings stay exact.
+    A config moves when it is on the default runner without a runner_overrides.yaml entry (even one
+    that names the default), is not excluded, has `min_runs` runs, and its median reaches a runner's
+    `min_minutes`; it gets the runner with the highest `min_minutes` it reaches, so a longer config
+    gets more cards. The median is `p50_min`: the per-run sum of case durations, not job wall time,
+    which adds pytest, collection and compile overhead on top. A shared test file does not matter
+    here: a moved config runs alone and reports under its own name, so its timings stay exact.
     """
     if policy is None or not policy["multicard"].get("enabled"):
         return {}
@@ -171,6 +174,7 @@ def multicard_runners(
         rec = timings.get(key)
         if (
             c["runner"] != DEFAULT_RUNNER
+            or c.get("runner_overridden")
             or _excluded(key, policy)
             or rec is None
             or rec["runs"] < policy["min_runs"]

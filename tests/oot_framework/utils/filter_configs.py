@@ -399,6 +399,8 @@ def main() -> None:
                 "name": _display_name(cfg, config_dir),
                 "config": rel,
                 "runner": runner_map.get(rel, "spyre_pf_x1"),
+                # An explicit override, even one naming the default, keeps the config off multicard.
+                "runner_overridden": rel in runner_map,
                 "flags": _suite_flags(flags_map, rel),
                 "path": str(cfg),
                 "key": _layout_key(rel),
