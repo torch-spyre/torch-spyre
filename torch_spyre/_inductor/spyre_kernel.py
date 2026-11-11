@@ -178,7 +178,7 @@ def _serialize_value(v):
             subs = {
                 s: V.graph.sizevars.guarding_hint_or_throw(s) for s in v.free_symbols
             }
-            concrete = float(v.subs(subs))
+            concrete = float(v.xreplace(subs))
             return repr(concrete)
         try:
             return repr(float(v))
@@ -558,7 +558,7 @@ def _tile_advance_expr_from_dep(
     subs.update(
         {sym: sympy.Integer(0) for sym in dep.index.free_symbols if sym not in subs}
     )
-    return dep.index.subs(subs)
+    return dep.index.xreplace(subs)
 
 
 def _non_unified_shard_bytes(name: str, layout: FixedTiledLayout) -> int:
@@ -625,7 +625,7 @@ def _loop_coefficient(index: sympy.Expr, variable: sympy.Symbol) -> sympy.Expr:
     """
     if variable not in index.free_symbols:
         return sympy.S.Zero
-    at = [sympy.expand(index.subs(variable, k)) for k in (0, 1, 2)]
+    at = [sympy.expand(index.xreplace({variable: k})) for k in (0, 1, 2)]
     if sympy.simplify(at[2] - 2 * at[1] + at[0]) != 0:
         raise Unsupported(
             f"the loop variable {variable} is used non-affinely in the index "
@@ -875,7 +875,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                         if sym not in subs
                     }
                 )
-                host_expr += dep.index.subs(subs)
+                host_expr += dep.index.xreplace(subs)
             for host_stride, extent in squeezed_pairs:
                 host_expr += level_symbol * extent * host_stride
             device_expr = tiling_expr_to_device_expr(device_size, stride_map, host_expr)

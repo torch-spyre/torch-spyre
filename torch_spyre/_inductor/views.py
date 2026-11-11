@@ -543,8 +543,8 @@ def _is_range_subset(expr: sympy.Expr, coord: sympy.Expr, v: sympy.Symbol) -> bo
     """
     if expr.free_symbols == {v} and coord.free_symbols == {v}:
         # Strip constant offsets if both have them
-        expr_offset = expr.subs(v, 0)
-        coord_offset = coord.subs(v, 0)
+        expr_offset = expr.xreplace({v: 0})
+        coord_offset = coord.xreplace({v: 0})
         if expr_offset != coord_offset:
             return False
         expr = expr - expr_offset

@@ -63,7 +63,7 @@ def test_matmul_time_does_not_charge_unused_available_cores(shared_weight, k_spl
     assert _matmul_execution_cost(*axes, 32, **options) == pytest.approx(estimate)
     split = sympy.Symbol("k_split", integer=True, positive=True)
     symbolic = _matmul_execution_cost(*axes[:3], (256, split), 32, **options)
-    assert float(symbolic.subs(split, k_split)) == pytest.approx(estimate)
+    assert float(symbolic.xreplace({split: k_split})) == pytest.approx(estimate)
     assert _matmul_split_cost(*axes, 32, **options) > _matmul_split_cost(
         *axes, used, **options
     )
@@ -84,7 +84,7 @@ def test_split_sum_matmul_prices_one_corelet(shared_weight):
     for k in (1, 2, 4):
         compute = (2 * 128 * 256 * 1024) / (8 * k) / wd._PEAK_MACS_US_CORE
         expected = compute * (2 if k > 1 else 1) + (k - 1) * 8192 * coefficient
-        assert float(price.subs(split, k)) == pytest.approx(expected)
+        assert float(price.xreplace({split: k})) == pytest.approx(expected)
         assert wd._matmul_execution_cost(
             *axes[:3], (1024, k), 32, shared_weight=shared_weight, include_hbm=False
         ) == pytest.approx(expected)
@@ -156,7 +156,7 @@ def test_fused_reduction_compute_keeps_core_count_symbolic():
     compute = cost_model._fused_reduction_compute_ns([op], CostParams())
 
     assert compute.free_symbols == {heads, rows}
-    assert float(compute.subs({heads: 4, rows: 8})) == pytest.approx(256)
+    assert float(compute.xreplace({heads: 4, rows: 8})) == pytest.approx(256)
 
 
 def test_fused_reduction_compute_skips_independent_boundary_reductions():
@@ -233,7 +233,7 @@ def test_matmul_split_cost_over_symbolic_splits_matches_concrete_in_budget():
         )
         assert not wd.isinf(concrete)
         point = {m: m_split, n: n_split, k: k_split}
-        assert float(symbolic.subs(point)) == pytest.approx(concrete)
+        assert float(symbolic.xreplace(point)) == pytest.approx(concrete)
 
 
 def _issue_4387_matmul(cores, m_split, n_split, k_split):
@@ -944,7 +944,9 @@ def test_store_symbolic_cost_matches_concrete():
     expression = cost_model._store_core_excess_ns([feature], params)
     for cores in (1, 2, 4, 5, 8, 16, 32):
         expected = cost_model._store_core_excess_ns([_indirect_store(cores)], params)
-        assert float(expression.subs(cores_symbol, cores)) == pytest.approx(expected)
+        assert float(expression.xreplace({cores_symbol: cores})) == pytest.approx(
+            expected
+        )
 
 
 def test_store_cost_composes_with_bundle_and_is_reported(monkeypatch):
