@@ -2238,13 +2238,62 @@ def log2(arg):
     return math.log2(arg)
 
 
+def _floor(arg):
+    """``math.floor``, symbolic-aware: ``sympy.floor`` for a SymPy expression,
+    so an undecided floor stays symbolic instead of raising."""
+    if isinstance(arg, sympy.Basic):
+        return sympy.floor(arg)
+    return math.floor(arg)
+
+
+def _is_sym(*vals) -> bool:
+    """True if any value is a sympy expression rather than a number."""
+    return any(isinstance(v, sympy.Basic) and not v.is_Number for v in vals)
+
+
+def eq(arg1, arg2):
+    """``==``, symbolic-aware: a SymPy relation when either side is SymPy."""
+    return sympy.Eq(arg1, arg2) if _is_sym(arg1, arg2) else arg1 == arg2
+
+
+def gt(arg1, arg2):
+    """``>``, symbolic-aware: a SymPy relation when either side is SymPy."""
+    return sympy.Gt(arg1, arg2) if _is_sym(arg1, arg2) else arg1 > arg2
+
+
+def ge(arg1, arg2):
+    """``>=``, symbolic-aware: a SymPy relation when either side is SymPy."""
+    return sympy.Ge(arg1, arg2) if _is_sym(arg1, arg2) else arg1 >= arg2
+
+
+def le(arg1, arg2):
+    """``<=``, symbolic-aware: a SymPy relation when either side is SymPy."""
+    return sympy.Le(arg1, arg2) if _is_sym(arg1, arg2) else arg1 <= arg2
+
+
+def _and(*args):
+    """``and``, symbolic-aware. Decided terms (Python bools, or relations SymPy
+    evaluated to ``true``/``false``, as on ``sympy.Integer`` extents) give a Python
+    ``bool``; only undecided relations are left in a ``sympy.And``."""
+    undecided = []
+    for a in args:
+        if a in [sympy.false, False]:
+            return False
+        if isinstance(a, sympy.Basic) and a is not sympy.true:
+            undecided.append(a)
+    return sympy.And(*undecided) if undecided else True
+
+
 def piecewise(*args):
     """``piecewise``, symbolic-aware, mirroring the :func:`sympy.Piecewise`
     API: each argument is an ``(expr, cond)`` pair, evaluated in order.
     Dispatches to ``sympy.Piecewise`` when a condition is symbolic, otherwise
     returns the evaluated value. The last ``cond`` must be a catch-all (e.g.
     ``True``) so the non-symbolic loop always returns."""
-    if any(isinstance(cond, sympy.Basic) for _expr, cond in args):
+    if any(
+        isinstance(cond, sympy.Basic) and cond not in (sympy.true, sympy.false)
+        for _expr, cond in args
+    ):
         return sympy.Piecewise(*args)
     for expr, cond in args:
         if cond:
@@ -2322,16 +2371,18 @@ def _decode_table_key(split: int) -> int:
 
 def _in_decode_delivery_scope(
     B, M, shared_weight, operand_bytes: float = _DTYPE_BYTES
-) -> bool:
+) -> bool | sympy.Basic:
     """Whether ``_decode_weight_delivery_us`` was measured for this matmul: a shared
-    fp16 weight (the sweep had no other operand width) reused over 2..32 rows."""
-    return (
-        shared_weight
-        and operand_bytes == _DTYPE_BYTES
-        and not isinstance(M, sympy.Basic)
-        and 1 < M <= _DECODE_MAX_ROWS
-        and B == 1
-    )
+    fp16 weight (the sweep had no other operand width) reused over 2..32 rows.
+
+    Returns a Python ``bool`` when the extents are known, including SymPy numbers
+    (``sympy.Integer(8)``, which the CP-SAT path rebuilds from a symbolic split), so
+    a candidate is priced the same in either representation. An extent with free
+    symbols gives the SymPy condition, for the caller to branch on with
+    ``piecewise``."""
+    if shared_weight in (False, sympy.false) or operand_bytes != _DTYPE_BYTES:
+        return False
+    return _and(shared_weight, gt(M, 1), le(M, _DECODE_MAX_ROWS), eq(B, 1))
 
 
 def _decode_weight_delivery_gbps(cores: int, m: int, k: int) -> float:
@@ -2388,11 +2439,34 @@ def _matmul_hbm_us(
     for the shared link, so effective bandwidth falls off with cohort size.
     """
     (B, b), (M, m), (N, n), (K, k) = b_axis, m_axis, n_axis, k_axis
-    if _in_decode_delivery_scope(B, M, shared_weight, operand_bytes):
-        io_bytes = M * K * operand_bytes + M * N * output_bytes
-        return io_bytes / (_HBM_BW_GBS * 1000) + _decode_weight_delivery_us(
-            K * N * operand_bytes, b * m * n * k, m, k
-        )
+    in_decode_scope = _in_decode_delivery_scope(B, M, shared_weight, operand_bytes)
+    cohort_us = _matmul_cohort_hbm_us(
+        b_axis, m_axis, n_axis, k_axis, shared_weight, operand_bytes, output_bytes
+    )
+    if in_decode_scope in [sympy.false, False]:
+        return cohort_us
+    # The measured delivery table is indexed by the split itself, so the decode
+    # branch needs concrete splits. Every symbolic caller passes include_hbm=False.
+    io_bytes = M * K * operand_bytes + M * N * output_bytes
+    decode_us = io_bytes / (_HBM_BW_GBS * 1000) + _decode_weight_delivery_us(
+        K * N * operand_bytes, b * m * n * k, m, k
+    )
+    if in_decode_scope in [sympy.true, True]:
+        return decode_us
+    return piecewise((decode_us, in_decode_scope), (cohort_us, True))
+
+
+def _matmul_cohort_hbm_us(
+    b_axis: tuple[int, int],
+    m_axis: tuple[int, int],
+    n_axis: tuple[int, int],
+    k_axis: tuple[int, int],
+    shared_weight: bool,
+    operand_bytes: float = _DTYPE_BYTES,
+    output_bytes: float = _DTYPE_BYTES,
+) -> float:
+    """``_matmul_hbm_us`` outside decode scope: operands broadcast to a cohort."""
+    (B, _), (M, m), (N, n), (K, _) = b_axis, m_axis, n_axis, k_axis
     weight_batches = 1 if shared_weight else B
     bytes_total = (
         B * M * K + weight_batches * K * N
@@ -2423,8 +2497,8 @@ def _matmul_execution_cost(
     sharing penalty drops out of this function with that term. ``predict_ops``
     charges shared-input delivery separately, using each operand's consumers.
 
-    Array underfill remains an efficiency factor on computation. Standalone
-    split-ranking preferences belong to ``_matmul_split_cost``, not this estimate.
+    Array underfill remains an efficiency factor on computation. Split-ranking
+    preferences belong to ``_matmul_split_cost``, not this estimate.
 
     ``operand_bytes``/``output_bytes`` are bytes-per-element, derived by the
     caller from the real tensors' own ``elems_per_stick()``. Default to
@@ -2488,10 +2562,8 @@ def _matmul_split_cost(
     operand_bytes: float = _DTYPE_BYTES,
     output_bytes: float = _DTYPE_BYTES,
 ) -> float:
-    """Standalone split-ranking score: execution estimate plus preferences.
-
-    The additive preferences preserve this chooser's existing behavior. They
-    are not operation latencies for a whole-program optimizer to sum.
+    """Standalone split-ranking score: ``_matmul_execution_cost`` plus
+    ``_matmul_split_preference_us``.
 
     ``operand_bytes``/``output_bytes`` pass straight through to
     ``_matmul_execution_cost`` (issue #4465).
@@ -2509,6 +2581,37 @@ def _matmul_split_cost(
     )
     if isinf(execution_us):
         return execution_us
+    return execution_us + _matmul_split_preference_us(
+        b_axis, m_axis, n_axis, k_axis, max_cores, shared_weight, operand_bytes
+    )
+
+
+def _matmul_split_preference_us(
+    b_axis: tuple[int, int],
+    m_axis: tuple[int, int],
+    n_axis: tuple[int, int],
+    k_axis: tuple[int, int],
+    max_cores: int,
+    shared_weight: bool | sympy.Basic = False,
+    operand_bytes: float = _DTYPE_BYTES,
+    include_batch_split: bool = True,
+) -> float:
+    """Additive split-ranking preferences, in microseconds, for one matmul call.
+
+    They stand in for effects the execution estimate does not model (backend
+    layout and fusion fallout, schedule efficiency of wide N tiles, PT
+    streaming) and were tuned on device to order candidates. The standalone
+    chooser adds them to ``_matmul_execution_cost`` (``_matmul_split_cost``).
+    The upstream cost model (``cost_model._matmul_ns_upstream``, which CP-SAT
+    uses) adds them too, so both choosers rank a matmul's splits alike (issue
+    #5799). It passes ``include_batch_split=False``: its own
+    ``_matmul_batch_split_ns`` is the device-fit form of the batch-split
+    preference, and charging both would count the batch split twice.
+
+    Every term is a fixed amount per call, not a per-element cost. The batch
+    extent enters only through the decode-scope test. Feasibility is the
+    caller's: this does not check the core budget.
+    """
     (_, b), (M, m), (N, n), (K, k) = b_axis, m_axis, n_axis, k_axis
     cores_used = b * m * n * k
     m_t = M // m if m else 1
@@ -2524,11 +2627,13 @@ def _matmul_split_cost(
     # In decode scope the measured weight delivery already charges short per-core M
     # tiles (a slice shared by many cores streams slower); this proxy would count it
     # twice and, on the 2026-09-30 sweep, push o_proj / qkv 5-7% off their best split.
-    m_tile_underfill_us = (
-        0.0
-        if _in_decode_delivery_scope(b_axis[0], M, shared_weight, operand_bytes)
-        else max(0.0, log2(_M_TILE_UNDERFILL_TARGET / max(1, m_t)))
-        * _M_TILE_UNDERFILL_PENALTY_US
+    m_tile_underfill_us = piecewise(
+        (0.0, _in_decode_delivery_scope(b_axis[0], M, shared_weight, operand_bytes)),
+        (
+            max(0.0, log2(_M_TILE_UNDERFILL_TARGET / max(1, m_t)))
+            * _M_TILE_UNDERFILL_PENALTY_US,
+            True,
+        ),
     )
 
     # Very wide output tiles lose schedule efficiency in the generated kernel.
@@ -2547,31 +2652,29 @@ def _matmul_split_cost(
     # narrow enough that more N lanes are available. Both effects are expressed
     # as ratios rather than op names or workload-specific shapes.
     filled_m_tile_factor = piecewise((1, m_t >= _M_TILE_UNDERFILL_TARGET), (0, True))
+    # ``shared_weight`` may be a SymPy condition (``cost_model`` tests the batch
+    # of one call, which can be symbolic), so the branches go through
+    # ``piecewise``.
     true_bmm_value_split_us = (
-        0.0
-        if shared_weight
-        else filled_m_tile_factor
+        filled_m_tile_factor
         * max(0.0, log2(max(1, K) / max(1, N)))
         * log2(n)
         * _LARGE_M_TILE_SHAPE_PENALTY_US
     )
     shared_narrow_tile_us = (
-        0.0
-        if not shared_weight
-        else filled_m_tile_factor
+        filled_m_tile_factor
         * max(0.0, log2(_SHARED_NARROW_OUTPUT_REF / max(1, N)))
         * max(0.0, log2(max(1, n_t) / _SHARED_N_TILE_TARGET))
         * (_LARGE_M_TILE_SHAPE_PENALTY_US / 4)
     )
     shared_down_n_split_us = (
-        0.0
-        if not shared_weight
-        else max(0.0, log2(max(1, K) / max(1, N)))
+        max(0.0, log2(max(1, K) / max(1, N)))
         * log2(n)
         * _SHARED_DOWN_N_SPLIT_PENALTY_US
     )
-    large_m_tile_shape_us = (
-        true_bmm_value_split_us + shared_narrow_tile_us + shared_down_n_split_us
+    large_m_tile_shape_us = piecewise(
+        (shared_narrow_tile_us + shared_down_n_split_us, shared_weight),
+        (true_bmm_value_split_us, True),
     )
 
     # Prefer using the full core budget, but keep this soft so measured-good
@@ -2582,11 +2685,17 @@ def _matmul_split_cost(
 
     # True BMMs often need batch parallelism to avoid tiny-M underfill. Charge a
     # small additive split overhead instead of multiplying the whole estimate.
-    batch_split_us = 0.0 if shared_weight else log2(b) * _BMM_BATCH_SPLIT_PENALTY_US
+    # Callers that charge their own batch-split latency turn this off.
+    batch_split_us = (
+        0.0
+        if not include_batch_split
+        else piecewise(
+            (0.0, shared_weight), (log2(b) * _BMM_BATCH_SPLIT_PENALTY_US, True)
+        )
+    )
 
     return (
-        execution_us
-        + m_lane_underuse_us
+        m_lane_underuse_us
         + m_tile_underfill_us
         + wide_n_us
         + large_m_tile_shape_us

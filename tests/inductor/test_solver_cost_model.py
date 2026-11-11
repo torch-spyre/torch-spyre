@@ -90,9 +90,14 @@ def test_split_sum_matmul_prices_one_corelet(shared_weight):
         ) == pytest.approx(expected)
 
 
-def test_joint_matmul_price_is_independent_of_standalone_preferences(monkeypatch):
+def test_joint_matmul_price_follows_standalone_preferences_but_not_batch_split(
+    monkeypatch,
+):
+    """CP-SAT prices a matmul with the standalone chooser's preferences (issue
+    #5799), except the batch-split one, which ``_matmul_batch_split_ns`` charges."""
     from torch_spyre._inductor import work_division as wd
 
+    monkeypatch.setattr(cost_model.config, "sencores", 32)
     op = OpFeatures(
         name="bmm",
         is_reduction=True,
@@ -108,21 +113,175 @@ def test_joint_matmul_price_is_independent_of_standalone_preferences(monkeypatch
         matmul_b_bytes=256 * 128 * 2,
     )
     params = cost_model.CostParams(use_bundled_cost_model=False)
+    *axes, shared_weight = cost_model._matmul_axes_for_split_cost(op)
+    assert (axes, shared_weight) == (
+        [(16, 16), (64, 1), (128, 1), (256, 1)],
+        False,
+    )
+    execution = wd._matmul_execution_cost(*axes, 32, include_hbm=False)
+    preference = wd._matmul_split_preference_us(*axes, 32, include_batch_split=False)
+    assert 0 < preference < wd._matmul_split_preference_us(*axes, 32)
+    assert wd._matmul_split_cost(
+        *axes, 32, include_hbm=False
+    ) - wd._matmul_split_preference_us(*axes, 32) == pytest.approx(execution)
+    assert cost_model._matmul_ns_upstream([op], params) == pytest.approx(
+        1000.0 * (execution + preference)
+        + cost_model._matmul_batch_split_ns([op], params)
+    )
+
     before = cost_model.predict_ops([op], params)
-    axes = ((16, 8), (64, 1), (128, 1), (256, 1))
-    standalone = wd._matmul_split_cost(*axes, 32)
+    monkeypatch.setattr(
+        wd, "_BMM_BATCH_SPLIT_PENALTY_US", wd._BMM_BATCH_SPLIT_PENALTY_US * 2
+    )
+    assert cost_model.predict_ops([op], params) == pytest.approx(before)
     for name in (
         "_CORE_UNDERUSE_PENALTY_US",
         "_M_TILE_UNDERFILL_PENALTY_US",
         "_M_LANE_UNDERUSE_PENALTY_US",
-        "_BMM_BATCH_SPLIT_PENALTY_US",
         "_WIDE_N_TILE_PENALTY_US",
         "_LARGE_M_TILE_SHAPE_PENALTY_US",
         "_SHARED_DOWN_N_SPLIT_PENALTY_US",
     ):
         monkeypatch.setattr(wd, name, getattr(wd, name) * 2)
-    assert cost_model.predict_ops([op], params) == pytest.approx(before)
-    assert wd._matmul_split_cost(*axes, 32) > standalone
+    assert cost_model.predict_ops([op], params) > before
+
+
+def _matmul_op(B, M, N, K, b, m, n, k, *, cores=None, broadcast_weight=False):
+    """A matmul ``[B, M, K] @ [B, K, N]`` record at split ``(b, m, n, k)``."""
+    return OpFeatures(
+        name="mm",
+        is_reduction=True,
+        dtype_bytes=2,
+        args=[ArgTraffic("arg1", "input", False, K * N, broadcast=broadcast_weight)],
+        is_matmul=True,
+        out_elems=B * M * N,
+        cores=b * m * n * k if cores is None else cores,
+        reduction_cores=k,
+        matmul_macs=B * M * N * K,
+        matmul_rows_per_core=M // m,
+        matmul_cols_per_core=N // n,
+        matmul_m_split=m,
+        matmul_n_split=n,
+        matmul_a_bytes=M * K * 2,
+        matmul_b_bytes=K * N * 2,
+    )
+
+
+# Review of #6120: one shape and split per preference term, chosen so that term is
+# nonzero. (constant, (B, M, N, K), (b, m, n, k), shared weight)
+_ACTIVE_PREFERENCE_CASES = [
+    # 1024 rows want 16 M lanes; m = 1 gives up 4 log2 steps.
+    ("_M_LANE_UNDERUSE_PENALTY_US", (1, 1024, 1024, 64), (1, 1, 32, 1), True),
+    # 8 rows per core, under the 16-row target; M = 64 is outside decode scope.
+    ("_M_TILE_UNDERFILL_PENALTY_US", (1, 64, 1024, 64), (1, 8, 4, 1), True),
+    # 4096-wide N tile, 3 log2 steps over 512.
+    ("_WIDE_N_TILE_PENALTY_US", (1, 512, 4096, 64), (1, 32, 1, 1), True),
+    # True BMM with K >> N and a split N (value-matmul geometry).
+    ("_LARGE_M_TILE_SHAPE_PENALTY_US", (16, 64, 64, 512), (16, 1, 2, 1), False),
+    # Shared down projection (K >> N) with a split N.
+    ("_SHARED_DOWN_N_SPLIT_PENALTY_US", (1, 512, 1024, 4096), (1, 8, 4, 1), True),
+    # 8 of 32 cores.
+    ("_CORE_UNDERUSE_PENALTY_US", (1, 512, 512, 64), (1, 8, 1, 1), True),
+]
+
+
+@pytest.mark.parametrize(
+    "name, shape, split, shared",
+    _ACTIVE_PREFERENCE_CASES,
+    ids=[case[0] for case in _ACTIVE_PREFERENCE_CASES],
+)
+def test_each_active_preference_term_reaches_the_joint_price(
+    monkeypatch, name, shape, split, shared
+):
+    """Doubling a preference constant on a shape where its term is nonzero raises
+    the CP-SAT price by exactly that term, once per invocation."""
+    from torch_spyre._inductor import work_division as wd
+
+    monkeypatch.setattr(cost_model.config, "sencores", 32)
+    op = _matmul_op(*shape, *split)
+    *axes, shared_weight = cost_model._matmul_axes_for_split_cost(op)
+    assert axes == [(s, p) for s, p in zip(shape, split)]
+    assert shared_weight is shared
+    params = CostParams(use_bundled_cost_model=False)
+
+    def preference():
+        return wd._matmul_split_preference_us(
+            *axes, 32, shared_weight=shared, include_batch_split=False
+        )
+
+    before_pref, before = preference(), cost_model._matmul_ns_upstream([op], params)
+    monkeypatch.setattr(wd, name, getattr(wd, name) * 2)
+    term = preference() - before_pref
+    assert term > 0
+    after = cost_model._matmul_ns_upstream([op], params)
+    assert after - before == pytest.approx(1000.0 * term)
+
+
+def test_decode_scope_drops_the_m_tile_underfill_preference(monkeypatch):
+    """Review of #6120: in decode scope (a shared weight over 2..32 rows) the
+    measured weight delivery already charges short M tiles, so the M-tile underfill
+    preference is not added to the CP-SAT price. Outside it, it is."""
+    from torch_spyre._inductor import work_division as wd
+
+    monkeypatch.setattr(cost_model.config, "sencores", 32)
+    params = CostParams(use_bundled_cost_model=False)
+    decode = _matmul_op(1, 8, 4096, 4096, 1, 8, 4, 1)
+    prefill = _matmul_op(1, 64, 4096, 4096, 1, 8, 4, 1)
+    before = [cost_model._matmul_ns_upstream([op], params) for op in (decode, prefill)]
+    monkeypatch.setattr(
+        wd, "_M_TILE_UNDERFILL_PENALTY_US", wd._M_TILE_UNDERFILL_PENALTY_US * 2
+    )
+    after = [cost_model._matmul_ns_upstream([op], params) for op in (decode, prefill)]
+    assert after[0] == pytest.approx(before[0])
+    assert after[1] > before[1]
+
+
+@pytest.mark.parametrize(
+    "shape, split",
+    [
+        ((8, 6400, 4096), (4, 4, 2)),
+        ((8, 2048, 64), (1, 32, 1)),
+        ((8, 2048, 64), (2, 16, 1)),
+        ((8, 2048, 64), (4, 8, 1)),
+        ((8, 2048, 64), (8, 4, 1)),
+    ],
+)
+def test_preferences_price_a_known_sympy_extent_like_the_int(shape, split):
+    """``shape`` is ``(M, N, K)``. Review of #6120 (B1): the CP-SAT path rebuilds
+    ``M`` as ``sympy.Integer``. The decode-scope guard rejected every ``sympy.Basic``, so the same short-row
+    shared FP16 candidate cost up to 90 us more than its int form, and the
+    ``[8, 64] @ [64, 2048]`` candidates ranked in reverse. A known number is now
+    tested like the int; an extent with free symbols gets a ``Piecewise`` that
+    agrees with both branches once substituted."""
+    from torch_spyre._inductor import work_division as wd
+
+    M, N, K = shape
+    m, n, k = split
+    assert wd._in_decode_delivery_scope(1, sympy.Integer(M), True)
+    assert wd._in_decode_delivery_scope(sympy.Integer(1), M, True)
+    sym_M = sympy.Symbol("M", integer=True, positive=True)
+    sym_scope = wd._in_decode_delivery_scope(1, sym_M, True)
+    assert isinstance(sym_scope, sympy.Basic)
+    assert sym_scope.subs(sym_M, M) == sympy.true
+    assert sym_scope.subs(sym_M, 64) == sympy.false
+
+    def price(M_, m_, n_, k_):
+        return wd._matmul_split_preference_us(
+            (1, 1), (M_, m_), (N, n_), (K, k_), 32, shared_weight=True
+        )
+
+    numeric = price(M, m, n, k)
+    assert price(sympy.Integer(M), m, n, k) == pytest.approx(numeric)
+    sm, sn, sk = (
+        sympy.Symbol(name, integer=True, positive=True) for name in ("m", "n", "k")
+    )
+    symbolic = price(sympy.Integer(M), sm, sn, sk)
+    assert isinstance(symbolic, sympy.Basic)
+    assert float(symbolic.subs({sm: m, sn: n, sk: k})) == pytest.approx(numeric)
+    symbolic_M = price(sym_M, m, n, k)
+    assert isinstance(symbolic_M, sympy.Basic)
+    assert float(symbolic_M.subs(sym_M, M)) == pytest.approx(numeric)
+    assert float(symbolic_M.subs(sym_M, 64)) == pytest.approx(price(64, m, n, k))
 
 
 def test_fused_reduction_compute_uses_work_per_active_core():
