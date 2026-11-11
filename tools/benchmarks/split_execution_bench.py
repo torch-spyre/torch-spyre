@@ -12,25 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Wall-clock benchmark: split execution (tracker on) vs single stream (off).
-
-Compares per-launch latency of back-to-back compiled mm launches with
-SPYRE_HAZARD_TRACKER=1 (HostCompute on S_prep, Compute on S_dev) against
-SPYRE_HAZARD_TRACKER=0 (every step on S_dev).
-
-The difference between the two modes is the combined effect of stream
-splitting and flex hazard tracking; the two cannot be separated with this
-flag alone. It is not a measurement of individual Signal/Wait pairs.
-
-The runtime latches the tracker flag at startup, so every measurement runs in
-its own spawned child process. Modes are interleaved round by round so slow
-drift (thermal, other device users) affects both modes equally. All children
-share one compile cache, so both modes run the same compiled program.
-
-Requires Spyre hardware. Example:
-
-    python tools/benchmarks/split_execution_bench.py --rounds 5 --json out.json
-"""
+"""Benchmark split-execution (SPYRE_HAZARD_TRACKER=1) vs single-stream (0)."""
 
 import argparse
 import json
@@ -43,23 +25,19 @@ import time
 import traceback
 from typing import Any
 
-# name -> (M, K, N). mm_large is device-bound (kernel time >> host compute).
-# mm_tiled is the same matmul split along M with for_each_tile (see TILE_SIZES),
-# so one launch carries several tiles' program corrections.
 WORKLOADS: dict[str, tuple[int, int, int]] = {
     "mm_large": (1024, 8192, 1024),
     "mm_small": (256, 1024, 256),
     "mm_tiled": (1024, 1024, 1024),
 }
 
-# Workloads built with for_each_tile: name -> tile size along M.
 TILE_SIZES: dict[str, int] = {"mm_tiled": 256}
 
 MODES = {"tracker_on": "1", "tracker_off": "0"}
 
 
 def build_compiled(tile_size: int | None) -> Any:
-    """Compiled mm; split along M into tile_size-row tiles when given."""
+    """Return compiled mm or tiled_mm with for_each_tile."""
     import torch
 
     if tile_size is None:
@@ -87,11 +65,11 @@ def _child_bench(
     reps: int,
     warmup: int,
 ) -> dict[str, Any]:
-    """Child: return per-launch latency in ms for each timed repetition."""
+    """Measure per-launch latency in ms and held memory in a child process."""
     import torch
     import torch._dynamo
 
-    import torch_spyre  # noqa: F401  # registers the backend
+    import torch_spyre  # noqa: F401
     from torch_spyre import _C
 
     m, k, n = shape
@@ -99,7 +77,6 @@ def _child_bench(
     torch.manual_seed(0)
     device = torch.device("spyre")
 
-    # Distinct inputs per launch so consecutive launches do not alias.
     pairs = [
         (
             torch.randn(m, k, dtype=torch.float16).to(device),
@@ -112,21 +89,18 @@ def _child_bench(
     held_bytes: list[int] = []
 
     def run_once() -> float:
-        # No device-to-host reads in the loop: they would serialize launches.
         torch.accelerator.synchronize(device)
         free_before, _ = torch.accelerator.get_memory_info("spyre")
         t0 = time.perf_counter()
         outs = [compiled(a, b) for a, b in pairs]
         torch.accelerator.synchronize(device)
         elapsed = time.perf_counter() - t0
-        # Outputs are still alive here: this is the memory the batch holds
-        # once drained, not the transient peak while launches are in flight.
         free_after, _ = torch.accelerator.get_memory_info("spyre")
         held_bytes.append(free_before - free_after)
         del outs
         return elapsed * 1000.0 / num_launches
 
-    compiled(*pairs[0])  # trigger compilation outside the timed region
+    compiled(*pairs[0])
     for _ in range(warmup):
         run_once()
     held_bytes.clear()
@@ -142,7 +116,6 @@ def _child_wrapper(env: dict[str, str], target: Any, args: tuple, conn: Any) -> 
     import os
 
     try:
-        # The runtime reads env vars once at startup: set them first.
         os.environ.update(env)
         conn.send((True, target(*args)))
     except Exception as e:  # noqa: BLE001
@@ -154,7 +127,6 @@ def _child_wrapper(env: dict[str, str], target: Any, args: tuple, conn: Any) -> 
 def _run_child(
     env: dict[str, str], target: Any, args: tuple, timeout: float
 ) -> dict[str, Any]:
-    """Run target(*args) in a spawned child with env applied before startup."""
     ctx = multiprocessing.get_context("spawn")
     parent_conn, child_conn = ctx.Pipe(duplex=False)
     p = ctx.Process(target=_child_wrapper, args=(env, target, args, child_conn))
@@ -191,7 +163,7 @@ def _summarize(samples: list[float]) -> dict[str, float]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--workload",
         action="append",
@@ -203,8 +175,7 @@ def main() -> int:
         type=int,
         nargs="+",
         default=[12],
-        help="launches enqueued before each sync; several values sweep the "
-        "queue depth (throughput and held memory vs depth)",
+        help="launches enqueued before each sync",
     )
     parser.add_argument("--reps", type=int, default=5, help="timed reps per child")
     parser.add_argument("--warmup", type=int, default=2, help="untimed reps per child")
@@ -212,7 +183,7 @@ def main() -> int:
         "--rounds", type=int, default=3, help="interleaved on/off child pairs"
     )
     parser.add_argument("--timeout", type=float, default=900.0, help="seconds/child")
-    parser.add_argument("--json", type=pathlib.Path, help="write results to this file")
+    parser.add_argument("--json", type=pathlib.Path, help="write results to JSON")
     ns = parser.parse_args()
 
     if any(n < 1 for n in ns.launches):

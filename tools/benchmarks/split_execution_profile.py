@@ -12,30 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Profiler-based device utilization: split execution vs single stream.
-
-Profiles back-to-back compiled mm launches with SPYRE_HAZARD_TRACKER=1 and
-=0 and reports, from the exported chrome trace:
-
-  - kernel busy time (union of ``cat == "kernel"`` intervals),
-  - kernel window (first kernel start to last kernel end),
-  - utilization = busy / window, and the idle gaps between kernels,
-  - transfer time (``cat == "gpu_memcpy"``), which includes correction H2Ds,
-  - number of ``launch::HostCompute`` CPU spans (tracker on only).
-
-Utilization is measured over the kernel window, so it shows how tightly the
-kernels are packed, not how busy the device is over the whole run.
-
-Each measurement is one profiling session in its own spawned child (the
-tracker flag is latched at startup, and re-profiling in one process can be
-disturbed by timestamp calibration). Modes are interleaved round by round and
-share one compile cache.
-
-Requires Spyre hardware and a build with the profiler (USE_SPYRE_PROFILER=1).
-Example:
-
-    python tools/benchmarks/split_execution_profile.py --rounds 5 --json p.json
-"""
+"""Profile device utilization: split execution (1) vs single-stream (0)."""
 
 import argparse
 import json
@@ -54,7 +31,6 @@ from split_execution_bench import (
     build_compiled,
 )
 
-# Profiler/calibration settings recommended for the split-execution trace tests.
 PROFILER_ENV = {
     "USE_SPYRE_PROFILER": "1",
     "FLEX_TIMESTAMP_CALIBRATION": "always",
@@ -63,7 +39,6 @@ PROFILER_ENV = {
 
 
 def _finite_complete_events(trace_events: list[dict]) -> list[dict]:
-    """Complete (ph == "X") events with a finite ts."""
     out = []
     for ev in trace_events:
         if not isinstance(ev, dict) or ev.get("ph") != "X":
@@ -79,7 +54,6 @@ def _finite_complete_events(trace_events: list[dict]) -> list[dict]:
 
 
 def _merge_intervals(intervals: list[tuple[float, float]]) -> list[tuple[float, float]]:
-    """Union of [start, end) intervals, sorted and non-overlapping."""
     merged: list[tuple[float, float]] = []
     for start, end in sorted(intervals):
         if merged and start <= merged[-1][1]:
@@ -90,7 +64,7 @@ def _merge_intervals(intervals: list[tuple[float, float]]) -> list[tuple[float, 
 
 
 def trace_metrics(trace_events: list[dict]) -> dict[str, Any]:
-    """Utilization metrics (all times in microseconds) from chrome trace events."""
+    """Extract utilization and timing metrics from Chrome trace events."""
     events = _finite_complete_events(trace_events)
     kernels = [e for e in events if e.get("cat") == "kernel"]
     memcpys = [e for e in events if e.get("cat") == "gpu_memcpy"]
@@ -132,13 +106,13 @@ def trace_metrics(trace_events: list[dict]) -> dict[str, Any]:
 def _child_profile(
     shape: tuple[int, int, int], tile_size: int | None, num_launches: int
 ) -> dict[str, Any]:
-    """Child: profile num_launches back-to-back mm launches once."""
+    """Profile back-to-back launches under torch.profiler in a child process."""
     import torch
     import torch._dynamo
     from torch.profiler import ProfilerActivity, profile
     from torch.testing._internal.common_utils import TemporaryFileName
 
-    import torch_spyre  # noqa: F401  # registers the backend
+    import torch_spyre  # noqa: F401
     from torch_spyre import _C
 
     m, k, n = shape
@@ -146,7 +120,6 @@ def _child_profile(
     torch.manual_seed(0)
     device = torch.device("spyre")
 
-    # Upload before profiling so only correction H2Ds show up in the trace.
     pairs = [
         (
             torch.randn(m, k, dtype=torch.float16).to(device),
@@ -155,14 +128,13 @@ def _child_profile(
         for _ in range(num_launches)
     ]
     compiled = build_compiled(tile_size)
-    compiled(*pairs[0])  # compile outside the profiled region
+    compiled(*pairs[0])
     torch.accelerator.synchronize(device)
 
     with TemporaryFileName(mode="w+") as trace_path:
         with profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
         ) as prof:
-            # No device-to-host reads here: they would serialize the launches.
             outs = [compiled(a, b) for a, b in pairs]
             torch.accelerator.synchronize(device)
         prof.export_chrome_trace(trace_path)
@@ -187,12 +159,11 @@ _METRIC_KEYS = (
 
 
 def _aggregate(rounds: list[dict[str, Any]]) -> dict[str, float]:
-    """Median of each metric across rounds."""
     return {key: statistics.median(r[key] for r in rounds) for key in _METRIC_KEYS}
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--workload",
         action="append",
@@ -204,7 +175,7 @@ def main() -> int:
         "--rounds", type=int, default=3, help="interleaved on/off child pairs"
     )
     parser.add_argument("--timeout", type=float, default=900.0, help="seconds/child")
-    parser.add_argument("--json", type=pathlib.Path, help="write results to this file")
+    parser.add_argument("--json", type=pathlib.Path, help="write results to JSON")
     ns = parser.parse_args()
 
     if ns.launches < 2:
