@@ -1796,8 +1796,9 @@ def _check_sen1p5_matmul_inputs(op: str, args: Sequence[TensorArg]) -> None:
     BFLOAT16 on the device (a graph input or weight copied with
     ``.to("spyre", device_layout=...)`` and a BFLOAT16 SpyreTensorLayout) is
     used as it is. Any other input is refused here with a message, instead of
-    failing later in the backend compiler. There is no on-device
-    DLFloat16-to-BFLOAT16 conversion to insert yet."""
+    failing later in the backend compiler. The backend compiler does support
+    a DLFloat16-to-BFLOAT16 conversion op, but torch-spyre does not yet insert
+    it automatically before a 1p5 matmul."""
     if not (_spyre_config.sen1p5 and op == BATCH_MATMUL_OP):
         return
     for arg in args:
