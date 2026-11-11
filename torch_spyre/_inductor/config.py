@@ -61,6 +61,20 @@ enable_lx_context_switching: bool = os.getenv(
     "yes",
 )
 
+# Move each collective's wait as late as its consumers allow, before
+# spyre_fuse_nodes bundles contiguous compute. Independent compute then sits
+# between the *_run call and wait_work in its own bundle, instead of being
+# fused with the code that reads the collective's result. Off by default:
+# collectives and compute share one in-order flex stream, so the hoisted
+# kernel still runs after the collective and the split only adds a kernel
+# launch. Set SPYRE_SINK_COLLECTIVE_WAITS=1 once collectives have their own
+# stream.
+sink_collective_waits: bool = os.getenv("SPYRE_SINK_COLLECTIVE_WAITS", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
 # Select who allocates the HBM pool for an SDSC bundle's intermediates:
 # False (default) has the backend self-allocate via
 # sdscbundle.device_mem_allocate, exactly matching pre-existing behavior.
@@ -224,6 +238,14 @@ sencores: int = int(os.getenv("SENCORES", "32"))
 # Cap on bucket count (= max_size / granularity).
 # TODO: confirm the default with the Deeptools team.
 max_buckets: int = int(os.getenv("MAX_BUCKETS", "32"))
+
+# Floor on a tensor.to("spyre", dynamic=...) reservation's `min`. The serving
+# plugin's linear wrapper branches on a row count below this, which would
+# become a branch on a symbol once that dim is dynamic. Real minima are far
+# above it today, so this holds by luck rather than by construction --
+# enforcing it at the reservation means a future caller can't quietly drop
+# below it.
+min_reserved_dim_size: int = int(os.getenv("MIN_RESERVED_DIM_SIZE", "8"))
 
 # Soft floor on the auto-derived granularity when mark_dynamic(min=...)
 # is not provided. Keeps the picked granularity from collapsing to a
@@ -438,6 +460,13 @@ def get_cpu_count() -> int:
 # OpSpec validation at pipeline stage boundaries. Enabled by default to catch
 # invariant violations early. Set SPYRE_VALIDATE_OP_SPECS=0 to disable.
 validate_op_specs: bool = os.environ.get("SPYRE_VALIDATE_OP_SPECS", "1") == "1"
+
+# Check that graph.operations is topologically ordered after every
+# pre-scheduling pass, not only after the last one. The check after the last
+# pass always runs and catches any pass that breaks the order; this one names
+# the pass that did. Off by default because it re-extracts the read set of
+# every operation after every pass. Set SPYRE_VALIDATE_EVERY_PASS=1 to enable.
+validate_every_pass: bool = os.environ.get("SPYRE_VALIDATE_EVERY_PASS", "0") == "1"
 
 # Solver-driven coarse tiling: let the co-optimizing solve choose a coarse
 # tiling for each op alongside its core division, and apply the tilings it

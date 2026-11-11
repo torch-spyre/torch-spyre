@@ -15,11 +15,13 @@
 # Helper methods to handle views
 
 from dataclasses import dataclass, astuple
+import functools
 import math
 import sympy
 from typing import Callable, Dict, Optional, Sequence, Tuple, cast
 from torch.utils._sympy.functions import ModularIndexing, FloorDiv
 
+from torch._inductor.utils import clear_on_fresh_cache
 from torch._inductor.virtualized import V
 
 from .errors import Unsupported
@@ -270,13 +272,109 @@ def compute_coordinates(
     Raises ``Unsupported`` if ``index`` walks a dimension backwards (a loop
     variable with a negative coefficient, as produced by ``prims.rev``): a
     device coordinate can only ascend.
+
+    Memoized on its arguments when they alone decide the result
+    (:func:`_coordinates_memo_key`): the planner asks the same question over and
+    over, and a Gemma 4 cold start made 196,594 calls with 6,047 distinct
+    arguments, 40 of its 42 s recomputing an answer it already had. Each call
+    gets its own list, and ``repeat_info_out`` gets copies of the repeat info.
+    A call that raises is not memoized; it is rerun uncached, so its side
+    effects and error are exactly those of :func:`_compute_coordinates_uncached`.
     """
+    key = _coordinates_memo_key(size, stride, var_ranges, index, indirect_sizes)
+    if key is not None:
+        try:
+            coordinates, repeat_info = _compute_coordinates_memo(*key)
+        except Exception:  # noqa: BLE001 - rerun uncached below to raise as before
+            pass
+        else:
+            if repeat_info_out is not None:
+                repeat_info_out.update(_copy_containers(repeat_info))
+            return list(coordinates)
+    return _compute_coordinates_uncached(
+        size, stride, var_ranges, index, indirect_sizes, repeat_info_out
+    )
+
+
+def _coordinates_memo_key(size, stride, var_ranges, index, indirect_sizes):
+    """:func:`compute_coordinates`' memo key, or ``None`` when its result may
+    depend on more than its arguments.
+
+    A symbolic range, or an index symbol that is neither an iteration nor an
+    indirect variable (a dynamic size), reaches ``_concretize_for_cmp``, which
+    branches on ``V.graph``'s size hint for it: the same arguments can then
+    map differently in another graph. Such calls are not memoized. The ranges
+    keep their order, as ``find_repeat_vars`` walks them in order.
+    """
+    concrete = (int, sympy.Integer)
+    if not all(isinstance(r, concrete) for r in var_ranges.values()):
+        return None
+    known = set(var_ranges)
+    if indirect_sizes is not None:
+        if not all(isinstance(r, concrete) for r in indirect_sizes.values()):
+            return None
+        known |= set(indirect_sizes)
+    if not getattr(index, "free_symbols", set()) <= known:
+        return None
+    return (
+        tuple(size),
+        tuple(stride),
+        tuple(var_ranges.items()),
+        index,
+        None if indirect_sizes is None else tuple(indirect_sizes.items()),
+    )
+
+
+@clear_on_fresh_cache
+@functools.lru_cache(maxsize=1 << 16)
+def _compute_coordinates_memo(size, stride, var_ranges, index, indirect_sizes):
+    """The coordinates (as a tuple) and repeat info for one memo key."""
+    repeat_info: dict = {}
+    coordinates = _compute_coordinates_uncached(
+        list(size),
+        list(stride),
+        dict(var_ranges),
+        index,
+        None if indirect_sizes is None else dict(indirect_sizes),
+        repeat_info,
+    )
+    return tuple(coordinates), repeat_info
+
+
+def _copy_containers(value):
+    """``value`` with its dicts, lists and tuples copied; the sympy leaves are
+    immutable and shared. Callers edit the repeat info they are handed
+    (``pass_utils`` snapshots its entries with ``dict(info)``)."""
+    if isinstance(value, dict):
+        return {k: _copy_containers(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_copy_containers(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_copy_containers(v) for v in value)
+    return value
+
+
+def _compute_coordinates_uncached(
+    size: Sequence[sympy.Expr],
+    stride: Sequence[sympy.Expr],
+    var_ranges: dict[sympy.Symbol, sympy.Expr],
+    index: sympy.Expr,
+    indirect_sizes: "dict[sympy.Symbol, int] | None" = None,
+    repeat_info_out: "dict[sympy.Symbol, dict] | None" = None,
+) -> list[sympy.Expr]:
+    """:func:`compute_coordinates` without the memo."""
     assert all(isinstance(s, (int, sympy.Integer)) for s in stride), (
         f"compute_coordinates requires concrete strides, got {stride}"
     )
     assert all(isinstance(s, (int, sympy.Integer)) for s in size), (
         f"compute_coordinates requires concrete sizes, got {size}"
     )
+
+    # Python ints keep the comparisons below (n^2 of them here, and n per term in
+    # add_term) out of sympy's relational machinery; sympy arithmetic in the
+    # output expressions promotes them back.
+    size = [int(s) for s in size]
+    stride = [int(s) for s in stride]
 
     # Convert ModularIndexing expressions to sympy.Mod before processing
     index = convert_modular_indexing(index)
@@ -286,7 +384,7 @@ def compute_coordinates(
 
     # find stride immediately strictly larger that dim stride
     n = len(size)
-    next_stride = [sympy.oo] * n
+    next_stride: list[int | float] = [math.inf] * n
     for i in range(n):
         for j in range(n):
             # n^2 is ok since n is small
@@ -823,16 +921,24 @@ class UnalignedStickSplit(Unsupported):
         variable: sympy.Symbol,
         boundary: int,
         stick_size: int,
+        hint: str | None = None,
     ) -> None:
         self.tensor_index = tensor_index
         self.variable = variable
         self.boundary = boundary
         self.stick_size = stick_size
-        super().__init__(
+        message = (
             "tensor alignment boundary "
             f"{boundary} for {variable} cuts tensor {tensor_index}'s "
             f"physical stick of {stick_size} elements"
         )
+        # Call-site-specific guidance, e.g. SpyreKernel._check_indirect_index_step
+        # naming the documented remedy for its own checks, rather than leaving the
+        # reader only this generic, internal-symbol-name message. Omitted by other
+        # call sites, whose alignment failures aren't tied to one documented fix.
+        if hint:
+            message = f"{message}. {hint}"
+        super().__init__(message)
 
 
 def build_alignment_inputs(

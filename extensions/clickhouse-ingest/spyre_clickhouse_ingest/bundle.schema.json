@@ -166,7 +166,7 @@
         "properties": {
           "path": {
             "type": "string",
-            "pattern": "^(results/[^/]+\\.(xml|json|txt)|attachments/[^\\s]+)$"
+            "pattern": "^(results/[^/]+\\.(xml|json|txt)|results/[^/]+/(env|phases|host_resources|outputs|compile_summary)\\.json|attachments/[^\\s]+)$"
           },
           "sha256": {
             "type": "string",
