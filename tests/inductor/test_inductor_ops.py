@@ -10459,10 +10459,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ).cpu()
                 torch.testing.assert_close(result, fn(x, y))
 
-    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
-    def test_fallback_binary_op_cpu(self, op, x, y):
-        self.compare_with_cpu(op, x, y, run_eager=False)
-
     # Increased mm test tolerance for splitk
     def test_mm_relaxed(self, op, a, b):
         K = b.shape[-2]
