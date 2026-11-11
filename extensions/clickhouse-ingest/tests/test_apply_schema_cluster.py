@@ -1064,3 +1064,75 @@ def test_migration_commands_include_syncs_and_guards():
     assert seen == ["ghost"]
     assert not any("ghost" in c for c in cmds)
     assert sum(c.startswith("SYSTEM SYNC") for c in cmds) == 1
+
+
+@pytest.mark.parametrize(
+    "drop,pops",
+    [
+        ("DROP TABLE t", True),
+        ("DROP TABLE appdb.t", True),
+        ("DROP TABLE `appdb`.`t`", True),
+        ("DROP TABLE other.t", False),
+        ("DROP TABLE `other`.`t`", False),
+        ('DROP TABLE "other"."t"', False),
+        ("DROP VIEW IF EXISTS other.t", False),
+    ],
+)
+def test_a_drop_forgets_a_pending_sync_only_for_the_working_database(drop, pops):
+    sent, un = _run(
+        [f"INSERT INTO t SELECT 1;\n{drop};\nALTER TABLE t ADD COLUMN b Int8;"]
+    )
+    synced = any(c.startswith("SYSTEM SYNC") for c in sent)
+    assert synced is (not pops)
+
+
+def test_a_printed_migration_with_the_earlier_pending_ones_seeded_matches_a_sequential_run():
+    migs = [
+        p.read_text() for p in SchemaApplier.migration_files(SchemaApplier.schema_dir())
+    ]
+    yes = lambda t: True  # noqa: E731
+    seq, un = [], {}
+    for m in migs:
+        seq.append(
+            [
+                c
+                for c, _ in SchemaApplier.migration_commands(
+                    m, CLUSTER, "appdb", un, yes
+                )
+            ]
+        )
+    assert any(c.startswith("SYSTEM SYNC") for run in seq for c in run)
+    for k, m in enumerate(migs):
+        seed = {}
+        for e in migs[:k]:
+            list(SchemaApplier.migration_commands(e, CLUSTER, "appdb", seed, yes))
+        got = [
+            c
+            for c, _ in SchemaApplier.migration_commands(m, CLUSTER, "appdb", seed, yes)
+        ]
+        assert got == seq[k], k
+        unseeded = [
+            c
+            for c, _ in SchemaApplier.migration_commands(m, CLUSTER, "appdb", None, yes)
+        ]
+        assert len(unseeded) <= len(seq[k])
+
+
+def test_the_readme_rerunnable_lists_match_the_migrations():
+    schema = SchemaApplier.schema_dir()
+    readme = " ".join((schema / "README.md").read_text().split())
+    marked, unmarked_inserting = set(), set()
+    for p in SchemaApplier.migration_files(schema):
+        text = p.read_text()
+        if SchemaApplier.RERUNNABLE.search(text):
+            marked.add(p.name[:3])
+        elif any(
+            re.match(r"INSERT\b", st, re.I) for st in SchemaApplier.statements(text)
+        ):
+            unmarked_inserting.add(p.name[:3])
+    ids = lambda m: set(re.findall(r"`(\d+)`", m.group(1)))  # noqa: E731
+    got_marked = ids(re.search(r"today ((?:`\d+`(?:,| and)? ?)+)", readme))
+    got_unmarked = ids(
+        re.search(r"unmarked ones that insert rows \(((?:`\d+`,? ?)+)\)", readme)
+    )
+    assert got_marked == marked and got_unmarked == unmarked_inserting

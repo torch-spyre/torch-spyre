@@ -186,14 +186,21 @@ unmarked ones that insert rows (`002`, `003`, `006`, `013`, `019`): look at what
 To print the statements exactly as the applier would send them, including the
 `SYSTEM SYNC REPLICA` steps and with `ON CLUSTER` and `SYNC` in place, run this and take the ones
 after the last statement that already ran. Statements under `-- IF TABLE EXISTS: <t>` are printed
-with a note and must be skipped when `<t>` does not exist:
+with a note and must be skipped when `<t>` does not exist. Syncs for tables written by an earlier
+migration depend on that migration, so list every earlier migration that was still pending in
+`earlier` (in order), or the sync before the first read of such a table is missing:
 
 ```bash
 python - <<'EOF'
 from spyre_clickhouse_ingest.apply_schema import SchemaApplier as S
+earlier = []  # paths of the earlier pending migrations, in order
 text = open("<path>").read()
 guard = lambda t: print(f"-- only if {t} exists") or True
-for cmd, _ in S.migration_commands(text, "<cluster>", "<db>", exists=guard):
+pending = {}
+for p in earlier:
+    for _ in S.migration_commands(open(p).read(), "<cluster>", "<db>", pending, lambda t: True):
+        pass
+for cmd, _ in S.migration_commands(text, "<cluster>", "<db>", pending, guard):
     print(cmd + ";")
 EOF
 ```
