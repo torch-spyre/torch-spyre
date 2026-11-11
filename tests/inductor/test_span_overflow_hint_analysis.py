@@ -67,6 +67,7 @@ from torch._inductor.virtualized import V
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 from utils_inductor import mock_backend_compiler, compare_with_cpu  # noqa: E402
 
+
 from torch_spyre._C import SpyreTensorLayout
 from torch_spyre._inductor import config
 from torch_spyre._inductor.constants import BATCH_MATMUL_OP, RESTICKIFY_OP
@@ -109,6 +110,30 @@ import torch_spyre._inductor.wsr.span_overflow_hint_analysis as soha
 
 _LAUNCH_JOBPLAN = "torch_spyre.execution.kernel_runner.launch_jobplan"
 _PREPARE_KERNEL = "torch_spyre.execution.kernel_runner.prepare_kernel"
+
+
+def rejects_nested_loops(test):
+    """Run ``test`` and expect the compile to be refused for its two-level loop.
+
+    The lowering builds one standalone loop per group and refuses a group with
+    more levels (#6088). The wrapped body is what the test did before the
+    refusal, kept so it can be restored when nested loops are supported; until
+    then it is expected to raise before reaching its assertions.
+
+    TODO: when #6088 is fixed, remove this decorator: the body is the positive
+    test.
+    """
+    import functools
+
+    @functools.wraps(test)
+    def wrapper(self, *args, **kwargs):
+        with self.assertRaisesRegex(
+            InductorError, r"nested loop tiling is not supported.*#6088"
+        ):
+            test(self, *args, **kwargs)
+
+    wrapper._expects_raise = True
+    return wrapper
 
 
 def _fixed_tiled_layout(shape, dtype=torch.float16):
@@ -6170,6 +6195,7 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
             "ignore_span_overflow_hints": False,
         }
     )
+    @rejects_nested_loops
     def test_reduction_multilevel_codegen_contains_nested_auto_loop_specs(self):
         x = torch.randn(20, 16, 64, dtype=torch.float16).to("spyre")
 
@@ -6293,6 +6319,7 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
             "ignore_span_overflow_hints": False,
         }
     )
+    @rejects_nested_loops
     def test_generic_combined_output_and_reduction_range_codegen(self):
         # Both an output dim and the reduced axis overflow -> a nested plan
         # (outer output level, inner reduction level), the same shape as BMM's
@@ -6756,7 +6783,15 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
             ((1, 17, 16, 64), ((1, 17),)),
         ):
             with self.subTest(shape=shape, levels=levels):
-                self._assert_unit_tiling_matches_cpu(shape, levels)
+                if len(levels) > 1:
+                    # TODO(#6088): a two-level group is refused; this becomes a
+                    # positive case when nested loops are supported.
+                    with self.assertRaisesRegex(
+                        InductorError, r"nested loop tiling is not supported.*#6088"
+                    ):
+                        self._assert_unit_tiling_matches_cpu(shape, levels)
+                else:
+                    self._assert_unit_tiling_matches_cpu(shape, levels)
 
     @config.patch(
         {
@@ -6782,9 +6817,19 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
             with self.subTest(out_shape=out_shape, levels=levels):
                 torch.manual_seed(0xAFFE)
                 x = torch.randn(in_shape, dtype=torch.float16)
-                self._assert_forced_tiling_matches_cpu(
-                    lambda x: x.sum(dim=0), (x,), out_shape, levels
-                )
+                if len(levels) > 1:
+                    # TODO(#6088): a two-level group is refused; this becomes a
+                    # positive case when nested loops are supported.
+                    with self.assertRaisesRegex(
+                        InductorError, r"nested loop tiling is not supported.*#6088"
+                    ):
+                        self._assert_forced_tiling_matches_cpu(
+                            lambda x: x.sum(dim=0), (x,), out_shape, levels
+                        )
+                else:
+                    self._assert_forced_tiling_matches_cpu(
+                        lambda x: x.sum(dim=0), (x,), out_shape, levels
+                    )
 
     # The three Reduction-producer directions below execute a group whose
     # PRODUCER is a tiled reduction reading a full-size buffer (a graph input).
@@ -7384,6 +7429,7 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
             "ignore_span_overflow_hints": False,
         }
     )
+    @rejects_nested_loops
     def test_generic_combined_output_and_reduction_range_numeric(self):
         """A nested plan -- outer output-dim level + inner reduction-range
         level -- on a plain ``sum``, executed for real and compared to CPU.
@@ -7534,6 +7580,7 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
         "torch_spyre._inductor.wsr.span_overflow_hint_analysis.MAX_SPAN_BYTES",
         64 * 1024,
     )
+    @rejects_nested_loops
     def test_permuted_same_size_dims_tile_numeric(self):
         """Span-overflow tiling of a permuted buffer whose two leading dims have
         the same size, which the stick tile count ceil(512/64) = 8 also equals.
@@ -7542,6 +7589,14 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
         contiguous stride, so the device layout can only be resized by the
         buffer's own strides.  Resizing by contiguous strides shrank the wrong
         device dim and gave wrong results.
+
+        The planner reaches that coincidence only with a two-level plan (a 64 KB
+        limit gives ``[4, 4]``); no one-level plan of this buffer has a tile count
+        of 8 (measured: ``[4]`` at 512 KB, ``[2]`` from 1 MB). The nested loop is
+        refused (#6088), so this regression has no coverage until that is fixed:
+        ``test_span_overflow_gate.py::test_a_forced_one_level_plan_of_a_buffer_is_right``
+        covers the permuted buffer at 4 tiles, and
+        ``..._tiled_eight_ways_at_one_level_is_right`` the coincidence at one level.
         """
         torch.manual_seed(0xAFFE)
         x = torch.randn(8, 8, 64, 512, dtype=torch.float16).permute(1, 0, 2, 3)
@@ -7738,6 +7793,7 @@ class TestAutoSpanOverflowBmmE2E(InductorTestCase):
             "enable_reduction_tiling": True,
         }
     )
+    @rejects_nested_loops
     def test_auto_span_overflow_bmm_combined_correct(self):
         """Automatic span planning selects output+K tiling without spyre_hint."""
         B, M, K, N = 1, 128, 512, 32
@@ -7789,6 +7845,7 @@ class TestAutoSpanOverflowBmmE2E(InductorTestCase):
         self.assertTrue(source_codes)
         return source_codes[0]
 
+    @rejects_nested_loops
     def test_auto_span_overflow_bmm_combined_loopspec(self):
         """Automatic M+K planning emits the expected nested loop counts."""
         src = self._auto_span_overflow_bmm_source(enable_reduction_tiling=True)

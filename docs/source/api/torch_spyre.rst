@@ -773,7 +773,8 @@ Environment Variables
    * - ``TORCH_SPYRE_TIMING``
      - Record structured per-compile frontend timings: one JSON event per
        pass pipeline and per pass, with input/output graph sizes and
-       analysis-call counts (default ``0``)
+       analysis-call counts, plus PyTorch's own compile phases (default
+       ``0``)
    * - ``TORCH_SPYRE_TIMING_OUT``
      - Destination for the ``TORCH_SPYRE_TIMING`` record. The pid is
        inserted before the suffix, so ``rec.json`` is written as
@@ -796,7 +797,9 @@ Environment Variables
    * - ``SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS``
      - Ignore the compiler-generated span-overflow coarse-tiling hints.
        Defaults to ``1`` (disabled/opt-in): set to ``0`` to enable
-       automatic span-overflow coarse tiling.
+       automatic span-overflow coarse tiling. A tiling that nests more than
+       one loop level, which a very large matmul can need, raises
+       ``Unsupported`` (#6088).
    * - ``SPYRE_INDUCTOR_SDSC_CACHE``
      - Cache and reuse ``sdsc.json`` files during codegen when two OpSpecs
        produce identical SuperDSC content, reducing bundle size for
