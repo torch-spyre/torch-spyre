@@ -117,7 +117,6 @@ from .loop_tiling_common import (  # noqa: F401
     _LOOPS_INNER_FN_OPCOUNT_KEY,
     _LOOPS_INNER_FN_STR_KEY,
     _LogicalIterationSymbol,
-    _LoopVarRebaseHandler,
     _NameSwapHandler,
     _PointReadRebaseHandler,
     _REDUCTION_FREE_SYMS_KEY,

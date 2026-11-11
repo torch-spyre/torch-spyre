@@ -675,9 +675,9 @@ class TestForEachTileE2E(_DynamoResetTestCase):
         and has no iteration dim, so this drives
         coarse_tile._point_splice_advance_for_dep (record the per-trip
         advance), leave the read direct (never staged into scratch),
-        _rebase_point_splice_reads (pin the index to iteration 0 so the
-        advance is not applied twice), and insert_restickify's per-dep advance
-        handover. Numerics, not just compilation: every one of those can be
+        keep the loop term in the index (per_trip_index pins it in the base
+        coordinates, so the advance is not applied twice), and
+        insert_restickify's per-dep advance handover. Numerics, not just compilation: every one of those can be
         got wrong in a way that compiles and re-reads the same page.
 
         Two matmuls per trip and a distinct page per trip, so an advance
