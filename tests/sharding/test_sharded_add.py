@@ -682,7 +682,11 @@ def test_fallback_consumer_fails_at_compile():
 
     # The fallback's result is the graph output: an op that combined it with
     # a sharded operand would be rejected first, as mixed sharded/unsharded.
-    with pytest.raises(RuntimeError, match="pointwise ops on sharded operands"):
+    # The message names the ops non-unified kernels support since the
+    # cross-shard-reduction work: pointwise and shard-local reductions.
+    with pytest.raises(
+        RuntimeError, match="shard-local reductions on sharded operands only"
+    ):
         torch.compile(lambda x: torch.tril(x), dynamic=False)(a)
 
 
