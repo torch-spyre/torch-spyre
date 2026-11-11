@@ -313,8 +313,8 @@ module {
         self.assertEqual(emitted, TestKtirEmitter.EXPECTED_ADD_KTIR)
 
     def test_two_divided_symbols_read_the_id_as_mixed_radix(self):
-        """``d0`` takes ``id // 4`` and ``d1`` takes ``id % 4`` of an 8-core grid,
-        from the one tile id -- the plan's ``inner`` and ``div`` spelled out.
+        """``d0`` takes ``id % 2`` and ``d1`` takes ``id // 2`` of an 8-core grid,
+        from the one tile id -- the spec's ``core_id_to_work_slice`` spelled out.
 
         Signed, because dbo-opt cannot work out a core's offset into a symbolic
         start address through ``divui`` or ``remui``."""
@@ -325,10 +325,33 @@ module {
         )
         self.assertIn("attributes {grid = [8]}", emitted)
         self.assertEqual(emitted.count("get_compute_tile_id"), 1)
-        self.assertRegex(emitted, r"arith\.divsi %0, %c4\b")
-        self.assertRegex(emitted, r"arith\.remsi %0, %c4_0\b")
+        self.assertRegex(emitted, r"%1 = arith\.remsi %0, %c2\b")
+        self.assertRegex(emitted, r"%2 = arith\.divsi %0, %c2_0\b")
         self.assertNotIn("arith.divui", emitted)
         self.assertNotIn("arith.remui", emitted)
+        # d0's portion scales d0's 8-row tile, d1's the 128-row one.
+        self.assertIn("%3 = arith.muli %1, %c8 ", emitted)
+        self.assertIn("%4 = arith.muli %2, %c128 ", emitted)
+
+    def test_the_spec_s_core_order_is_emitted(self):
+        """With ``d1`` fastest in ``core_id_to_work_slice``, ``d0`` takes ``id // 4``."""
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir(
+            "ktir_add_8",
+            [
+                make_op_spec(
+                    divisions={"d0": 2, "d1": 4},
+                    core_map={
+                        "d0": "Mod(floor(core_id/4), 2)",
+                        "d1": "Mod(core_id, 4)",
+                    },
+                )
+            ],
+        )
+        self.assertRegex(emitted, r"%1 = arith\.divsi %0, %c4\b")
+        self.assertRegex(emitted, r"%2 = arith\.remsi %0, %c4_0\b")
+        self.assertIn("%3 = arith.muli %1, %c8 ", emitted)
 
 
 @unittest.skipUnless(

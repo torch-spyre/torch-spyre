@@ -61,6 +61,8 @@ import logging
 from collections.abc import Callable, Iterator, Sequence
 from typing import TYPE_CHECKING, Any, ClassVar, NoReturn
 
+import sympy
+
 from torch_spyre._C import DataFormats, ElementArrangement
 from torch_spyre._inductor.codegen.compute_ops import num_bytes
 from torch_spyre._inductor.codegen.opspec_utils import (
@@ -68,7 +70,6 @@ from torch_spyre._inductor.codegen.opspec_utils import (
     REDUCTION,
     align_reshape_plan,
     buf_id,
-    core_divisions,
     operand_indexing,
     per_core_extent,
     placeholder_axes,
@@ -80,6 +81,7 @@ from torch_spyre._inductor.constants import (
     MAX_POOL_SIZE_BYTES,
     STAGGERED_EAS,
 )
+from torch_spyre._inductor.core_mapping import core_mappings_equal
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
 from torch_spyre._inductor.pass_utils import coeff_through_floor
@@ -278,18 +280,24 @@ class Division:
 
     A division is the outermost kind of level there is.  Where a ``Level``'s
     index comes from an ``scf.for``, a division's comes from this core's place in
-    the grid -- ``(compute_tile_id // inner) % div`` -- so the two differ only in
-    where the index value is read, and the plan carries them in one ordered list
-    (divisions first, outermost) whose coefficients ``Access.index_coeffs``
-    holds.
+    the grid, so the two differ only in where the index value is read, and the
+    plan carries them in one ordered list (divisions first, outermost) whose
+    coefficients ``Access.index_coeffs`` holds.
 
-    ``symbol`` is the iteration symbol's name, kept for messages only: emission
-    needs the two numbers.
+    Which slice a core takes is the frontend's decision, not this emitter's:
+    ``OpSpec.core_id_to_work_slice`` gives it as an expression in ``core_id``,
+    the same one the SDSC path reads.  ``steps`` is that expression as what the
+    builder applies to ``ktdp.get_compute_tile_id``, in order: ``("div", k)``
+    for ``floor(x / k)`` and ``("rem", n)`` for ``Mod(x, n)``.  A step the
+    value's range makes the identity is left out, so an empty ``steps`` is the
+    tile id itself.
+
+    ``symbol`` is the iteration symbol's name, kept for messages only.
     """
 
     symbol: str
     div: int  # how many cores share this symbol's range
-    inner: int  # the grid stride of one step of this symbol
+    steps: tuple[tuple[str, int], ...]  # tile id -> this core's slice
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1391,26 +1399,120 @@ def _divisions(specs: Sequence[Any]) -> tuple[list[Any], tuple[Division, ...]]:
     Every op in one kernel must ask for the same division: they share one grid,
     and one core runs one instance of the whole body.  The symbols come back
     outermost-first, so a division's coefficients prepend to the loop levels'.
+
+    Which slice each core takes is read from ``OpSpec.core_id_to_work_slice``,
+    as the SDSC path reads it, and every op must give each core the same slices:
+    a core runs every stage, so a value one stage leaves in a core's own memory
+    is only there for the next stage if both stages gave that core the same
+    slice.  The frontend builds the mapping and checks that it gives each core
+    one slice, so this only reads it.
     """
-    spaces = [spec.iteration_space for spec in _op_specs(specs)]
-    if not spaces:
+    op_specs = list(_op_specs(specs))
+    if not op_specs:
         return [], ()
-    divided, total = core_divisions(spaces[0])
-    for space in spaces[1:]:
-        if core_divisions(space)[0] != divided:
+
+    def divided_of(spec: OpSpec) -> list[tuple[Any, int]]:
+        return [
+            (symbol, int(div))
+            for symbol, (_range, div) in spec.iteration_space.items()
+            if int(div) > 1
+        ]
+
+    divided = divided_of(op_specs[0])
+    for spec in op_specs[1:]:
+        if divided_of(spec) != divided:
             raise NotImplementedError(
                 "OpSpec->KTIR: the ops in this kernel ask for different work "
                 "divisions, so they cannot share one grid; mixed work division "
                 "within a kernel is not supported"
             )
-    divided = list(reversed(divided))  # outermost-first
-    symbols = [symbol for symbol, _div, _inner in divided]
-    divisions = tuple(
-        Division(symbol=str(symbol), div=div, inner=inner)
-        for symbol, div, inner in divided
-    )
-    assert total == functools.reduce(lambda a, d: a * d.div, divisions, 1)
-    return symbols, divisions
+    if not divided:
+        return [], ()
+    total = functools.reduce(lambda a, d: a * d[1], divided, 1)
+
+    mappings = []
+    for spec in op_specs:
+        if spec.core_id_to_work_slice is None:
+            raise NotImplementedError(
+                f"OpSpec->KTIR: {spec.op!r} divides its work across {total} cores "
+                "but carries no core_id_to_work_slice, which says which slice each "
+                "core takes"
+            )
+        mappings.append(spec.core_id_to_work_slice)
+    for spec, mapping in zip(op_specs[1:], mappings[1:]):
+        if not core_mappings_equal(mapping, mappings[0], total):
+            raise NotImplementedError(
+                f"OpSpec->KTIR: {spec.op!r} gives the cores different slices of "
+                f"its work than {op_specs[0].op!r} does, so a core would read a "
+                "slice another stage did not leave it; a kernel whose ops assign "
+                "cores differently is not supported"
+            )
+
+    by_name = {str(symbol): expr for symbol, expr in mappings[0].items()}
+    divisions = []
+    for symbol, div in divided:
+        if str(symbol) not in by_name:
+            raise NotImplementedError(
+                f"OpSpec->KTIR: {op_specs[0].op!r} divides {symbol} but its "
+                "core_id_to_work_slice gives no slice for it"
+            )
+        steps = _core_index_steps(sympy.sympify(by_name[str(symbol)]), total)
+        divisions.append(Division(symbol=str(symbol), div=div, steps=steps))
+    return [symbol for symbol, _div in divided], tuple(divisions)
+
+
+_CORE_ID = "core_id"
+
+
+def _core_index_steps(expr: Any, total: int) -> tuple[tuple[str, int], ...]:
+    """``expr``, a slice in ``core_id``, as the steps applied to the tile id.
+
+    The forms the frontend writes (``core_mapping.core_to_slice_mapping`` and
+    its grouped variant) nest ``Mod(x, n)`` and ``floor(x / k)`` over
+    ``core_id``, each with one operand that depends on the core, so the whole
+    expression is one chain from the tile id outward.  The chain's range is
+    tracked from ``[0, total)`` so a remainder that cannot change its operand is
+    left out, as a division by 1 is.  Any other form is refused here, in the
+    plan, before the builder would have to.
+    """
+    core_id = sympy.Symbol(_CORE_ID)
+
+    def walk(node: Any) -> tuple[list[tuple[str, int]], int]:
+        # Returns (steps, bound): the steps so far and an exclusive upper bound
+        # on the value they produce.
+        if node == core_id:
+            return [], total
+        if isinstance(node, sympy.Mod):
+            inner, modulus = node.args
+            if not modulus.is_Integer or int(modulus) <= 0:
+                raise_unsupported(node)
+            steps, bound = walk(inner)
+            if bound <= int(modulus):
+                return steps, bound
+            return [*steps, ("rem", int(modulus))], int(modulus)
+        if isinstance(node, sympy.floor):
+            numerator, denominator = node.args[0].as_numer_denom()
+            if not denominator.is_Integer or int(denominator) <= 0:
+                raise_unsupported(node)
+            steps, bound = walk(numerator)
+            k = int(denominator)
+            if k == 1:
+                return steps, bound
+            return [*steps, ("div", k)], -(-bound // k)
+        raise_unsupported(node)
+
+    def raise_unsupported(node: Any) -> NoReturn:
+        raise NotImplementedError(
+            f"OpSpec->KTIR: the core slice {expr} has a term {node} that is not "
+            f"Mod or floor division of {_CORE_ID} by a constant"
+        )
+
+    if expr.is_Integer:
+        raise NotImplementedError(
+            f"OpSpec->KTIR: a divided symbol's core slice is the constant {expr}"
+        )
+    steps, _bound = walk(expr)
+    return tuple(steps)
 
 
 def _op_specs(specs: Sequence[Any]) -> Iterator[OpSpec]:
@@ -2993,10 +3095,10 @@ class KtirBuilder:
     def core_portions(self) -> list:
         """This core's index along each division, outermost-first.
 
-        One ``ktdp.get_compute_tile_id`` -- the flat grid index -- read as the
-        mixed-radix number the plan's divisions describe: ``(id // inner) % div``.
-        A term whose factor is trivial is not emitted, so a single divided symbol
-        uses the id itself and the undivided case emits nothing at all.
+        One ``ktdp.get_compute_tile_id`` -- the flat grid index -- taken through
+        each division's ``steps``, the frontend's ``core_id_to_work_slice`` as the
+        plan read it.  A single divided symbol uses the id itself and the
+        undivided case emits nothing at all.
 
         The division and remainder are signed, as Triton's are. The id is never
         negative, so the two forms agree, and dbo-opt works out each core's offset
@@ -3006,13 +3108,12 @@ class KtirBuilder:
             return []
         # A result *list*: the op is variadic in the bindings, single-result here.
         tile_id = self.val(ktdp.get_compute_tile_id([self.index_t]))
+        ops = {"div": arith.DivSIOp, "rem": arith.RemSIOp}
         portions = []
         for division in self.plan.divisions:
             index = tile_id
-            if division.inner > 1:
-                index = self.val(arith.DivSIOp(index, self.icst_index(division.inner)))
-            if division.inner * division.div != self.plan.grid[0]:
-                index = self.val(arith.RemSIOp(index, self.icst_index(division.div)))
+            for kind, by in division.steps:
+                index = self.val(ops[kind](index, self.icst_index(by)))
             portions.append(index)
         return portions
 
