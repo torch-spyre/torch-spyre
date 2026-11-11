@@ -455,7 +455,41 @@ def _convert_reads_whole_input(
     )
 
 
-def _qfp8ch_stl(stl: SpyreTensorLayout, out_dtype: torch.dtype) -> SpyreTensorLayout:
+def _qfp8ch_count_dim(stl: SpyreTensorLayout, coords: list[sympy.Expr]) -> int | None:
+    """Device dim counting the input's sticks; None if there is none to rescale.
+
+    A non-stick dim whose coordinate uses the stick variable is the count dim.
+    Otherwise the count is 1: the lone size-1, coordinate-0 dim. Raises
+    ``Unsupported`` when neither identifies one dim.
+    """
+    in_eps = stl.device_size[-1]
+    stick_syms = coords[-1].free_symbols
+    dims = range(len(stl.device_size) - 1)
+    uses_stick = [i for i in dims if coords[i].free_symbols & stick_syms]
+    if uses_stick:
+        if len(uses_stick) == 1 and stl.stride_map[uses_stick[0]] == in_eps:
+            return uses_stick[0]
+    else:
+        ones = [
+            i
+            for i in dims
+            if coords[i] == 0
+            and stl.device_size[i] == 1
+            and stl.stride_map[i] in (in_eps, -1)
+        ]
+        if len(ones) == 1:
+            return ones[0]
+        if not ones and not any(stl.stride_map[i] == in_eps for i in dims):
+            return None
+    raise Unsupported(
+        f"qfp8ch: no stick-count dim in device_size {list(stl.device_size)}, "
+        f"stride_map {list(stl.stride_map)}, coordinates {coords}"
+    )
+
+
+def _qfp8ch_stl(
+    stl: SpyreTensorLayout, out_dtype: torch.dtype, coords: list[sympy.Expr]
+) -> SpyreTensorLayout:
     """Output layout of ``qfp8ch``: fp16 (64/stick) -> fp8 (128/stick) quantization.
 
     Propagates the input device layout, preserving any padding, and rescales
@@ -466,17 +500,19 @@ def _qfp8ch_stl(stl: SpyreTensorLayout, out_dtype: torch.dtype) -> SpyreTensorLa
     conversion that consumes it rebuilds a dense layout from the host size,
     treating the partial stick exactly like any other unaligned stick dim --
     so it must never floor to a size-0 dim (issue #3604).
+
+    ``coords`` are the input's device coordinates; they pick the count dim.
     """
     in_eps = stl.device_size[-1]
     out_eps = get_elem_in_stick(out_dtype)
     out_device_size = list(stl.device_size)
     out_stride_map = list(stl.stride_map)
     out_device_size[-1] = out_eps
-    for i, s in enumerate(stl.stride_map):
-        if s == in_eps:
-            out_device_size[i] = -(-(stl.device_size[i] * in_eps) // out_eps)
-            out_stride_map[i] = out_eps
-            break
+    i = _qfp8ch_count_dim(stl, coords)
+    # A broadcast count dim (stride -1) keeps its stride.
+    if i is not None and stl.stride_map[i] == in_eps:
+        out_device_size[i] = -(-(stl.device_size[i] * in_eps) // out_eps)
+        out_stride_map[i] = out_eps
     return SpyreTensorLayout(
         out_device_size,
         out_stride_map,
@@ -853,7 +889,14 @@ def _single_arg_op_layout(
             # preserving any padding present in the input STL. Not
             # rescale_stl_for_dtype: an fp16 tensor with an odd stick count
             # ends in a partially filled fp8 stick, which that helper rejects.
-            return [_qfp8ch_stl(stl, output.dtype)]
+            coords = try_device_coordinates(stl, dep, None)
+            if coords is None:
+                return []
+            try:
+                return [_qfp8ch_stl(stl, output.dtype, coords)]
+            except Unsupported:
+                # Drop this candidate; the others stay available.
+                return []
 
         case spyreop.qfp8wt.default:
             # fp16 -> fp8 weight quantization with 2D-stick layout [2, 64].

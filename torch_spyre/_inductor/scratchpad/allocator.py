@@ -127,6 +127,7 @@ from torch_spyre._inductor.scratchpad.graph_editor import (
     unwrapped_buffer_name,
 )
 from torch_spyre._inductor.scratchpad.coarse_tiling import (
+    MAX_SEARCH_TILE_DEPTH,
     apply_chosen_tilings,
     planned_splits,
 )
@@ -4192,7 +4193,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             # keeps it and the output-only specs, preserving that order.
             readers = getattr(self, "_readers_by_name", {}).get(op.get_name(), ())
             options = [
-                t for t in enumerate_tile_options(op, readers=readers) if t.is_clean
+                t
+                for t in enumerate_tile_options(
+                    op, max_dims=MAX_SEARCH_TILE_DEPTH, readers=readers
+                )
+                if t.is_clean
             ]
         except Unsupported:
             options = list(untiled)
@@ -4942,7 +4947,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         from torch_spyre._inductor.wsr.enumerate_tilings import build_tiling_space
 
         tiling = (
-            build_tiling_space(op, readers=readers)
+            build_tiling_space(op, max_dims=MAX_SEARCH_TILE_DEPTH, readers=readers)
             if self._solver_chooses_tilings
             else None
         )

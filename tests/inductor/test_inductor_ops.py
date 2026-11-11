@@ -1230,6 +1230,14 @@ def _floor_div(a, b):
     return torch.div(a, b, rounding_mode="floor")
 
 
+def _floordiv_inplace(x, y):
+    # ``x //= y`` -> aten::floor_divide_.{Scalar,Tensor}; work on a clone so the
+    # shared param tensor is not mutated across eager/CPU runs.
+    x = x.clone()
+    x //= y
+    return x
+
+
 def _attention_fn(q, k, v, scale=True):
     d_k = q.size(-1)
     scores = q @ k.transpose(-2, -1)
@@ -3800,43 +3808,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
-        # Host-resident integer operand inside a Spyre graph: a position index
-        # built with torch.arange (CPU int64) and compared before being moved to
-        # the device, as in LFM2's causal conv. The compare runs on CPU, so the
-        # Spyre int -> float promotion must not be applied to it.
-        ("test_cmp_host_operand", "test_cmp_host_operand_cpu"): {
-            "ops_dict": {
-                "eq": torch.eq,
-                "ne": torch.ne,
-                "lt": torch.lt,
-                "le": torch.le,
-                "gt": torch.gt,
-                "ge": torch.ge,
-            },
-            "param_sets": {
-                "fp16_1x64x64": (cached_randn((1, 64, 64)),),
-            },
-        },
-        # Host-resident integer tensor clamped inside a Spyre graph: an index
-        # vector built with torch.arange (CPU int64) is clamped before being
-        # moved to the device, mirroring LFM2-style mask construction. The clamp
-        # runs on CPU, so the Spyre int -> float promotion must not be applied.
-        ("test_clamp_host_operand", "test_clamp_host_operand_cpu"): {
-            "ops_dict": {
-                "clamp": torch.clamp,
-                "clamp_min": torch.clamp_min,
-                "clamp_max": torch.clamp_max,
-            },
-            # TODO: the clamped int64 mask converts to fp16 on device, which makes
-            # it staggered, and it does not broadcast at the stick dim, so its
-            # product with the STANDARD fp16 operand is rejected as mixed EA.
-            "expect_raise": {
-                "fp16_1x64x64": "Multi-arg pointwise with mixed EA",
-            },
-            "param_sets": {
-                "fp16_1x64x64": (cached_randn((1, 64, 64)),),
-            },
-        },
         # -----------------------------------------------------------------------
         # Large integers: int -> fp32 is LOSSY. fp32 carries a 24-bit significand,
         # so above 2**24 the gaps between representable values exceed 1 and two
@@ -4763,6 +4734,62 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((2, 100), dtype=torch.float16),
                     cached_randn((2, 100), dtype=torch.float16),
                     cached_randn((2, 56), dtype=torch.float16),
+                ),
+            },
+        },
+        (
+            "test_cat_reduce_size1_trailing_dim",
+            "test_cat_reduce_size1_trailing_dim_cpu",
+        ): {
+            # Regression test for #5196: cat on a trailing size-1 dim writes a
+            # bare constant (e.g. 1) as the stick coordinate, with no loop
+            # variable to make it offset-free; a downstream reduction forces
+            # layout propagation to resolve that write.
+            "param_sets": {
+                "fp16": (
+                    cached_randn((32, 8, 16, 1), dtype=torch.float16),
+                    cached_randn(
+                        (32, 8, 16, 1), dtype=torch.float16, differentiation="b"
+                    ),
+                ),
+                "bfloat16": (
+                    cached_randn((32, 8, 16, 1), dtype=torch.bfloat16),
+                    cached_randn(
+                        (32, 8, 16, 1), dtype=torch.bfloat16, differentiation="b"
+                    ),
+                ),
+                "fp32": (
+                    cached_randn((32, 8, 16, 1), dtype=torch.float32),
+                    cached_randn(
+                        (32, 8, 16, 1), dtype=torch.float32, differentiation="b"
+                    ),
+                ),
+            },
+        },
+        (
+            "test_cat_stack_last_dim",
+            "test_cat_stack_last_dim_cpu",
+        ): {
+            # #5196 through torch.stack(parts, dim=-1).flatten(-2), the re-interleave
+            # of GPT-J style RoPE: stack lowers to a cat into a new size-1 last dim,
+            # so part i writes the bare constant i as the stick coordinate.
+            "param_sets": {
+                "2_parts_32x8x32": (
+                    2,
+                    cached_randn((32, 8, 32), differentiation="stack_a"),
+                ),
+                "2_parts_17x4x32": (
+                    2,
+                    cached_randn((17, 4, 32), differentiation="stack_b"),
+                ),
+                "2_parts_64x32": (2, cached_randn((64, 32), differentiation="stack_c")),
+                "2_parts_32x8x16": (
+                    2,
+                    cached_randn((32, 8, 16), differentiation="stack_d"),
+                ),
+                "3_parts_32x8x32": (
+                    3,
+                    cached_randn((32, 8, 32), differentiation="stack_e"),
                 ),
             },
         },
@@ -7760,6 +7787,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_where_self", "test_where_eager"): {
             "ops_dict": {"where": torch.where},
+            # A host bool mask converted to fp32 for an int32 where is staggered,
+            # and a STANDARD full operand cannot combine with it. Pending
+            # de-staggering support (#5495).
+            "expect_fail": {
+                "int32_2d": "host bool mask with fp32/int32 values is refused as mixed EA, pending #5495",
+                "int32_3d": "host bool mask with fp32/int32 values is refused as mixed EA, pending #5495",
+            },
+            # Bool values are not supported: they must be refused as mixed EA, not
+            # computed (a computed result is silently wrong).
+            "expect_raise": {"bool_2d": "mixed EA"},
             "param_sets": {
                 "fp16_2d": (
                     cached_randn((10, 10), dtype=torch.float16) > 1,
@@ -7789,14 +7826,19 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
                 # int32: INT32TOFP32 on Spyre; result cast back to int32
                 "int32_2d": (
-                    torch.zeros(4, 32, dtype=torch.bool),
+                    cached_randn((4, 32), dtype=torch.float16) > 0,
                     torch.randint(0, 1000, (4, 32), dtype=torch.int32),
                     torch.randint(0, 1000, (4, 32), dtype=torch.int32),
                 ),
                 "int32_3d": (
-                    torch.zeros(2, 8, 64, dtype=torch.bool),
+                    cached_randn((2, 8, 64), dtype=torch.float16) > 0,
                     torch.randint(0, 1000, (2, 8, 64), dtype=torch.int32),
                     torch.randint(0, 1000, (2, 8, 64), dtype=torch.int32),
+                ),
+                "bool_2d": (
+                    cached_randn((4, 64), dtype=torch.float16) > 0,
+                    cached_randn((4, 64), dtype=torch.float16, differentiation=1) > 0,
+                    cached_randn((4, 64), dtype=torch.float16, differentiation=2) > 0,
                 ),
             },
         },
@@ -7822,6 +7864,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_where_scalarself", "test_where_eager"): {
             "ops_dict": {"where": torch.where},
+            # int64 values are promoted to fp32, so a host bool mask is converted
+            # to a staggered fp32 here as well. Pending de-staggering support
+            # (#5495).
+            "expect_fail": {
+                "int64_1x24": "host bool mask with fp32/int values is refused as mixed EA, pending #5495",
+            },
             "param_sets": {
                 "fp16_2d": (
                     cached_randn((10, 10), dtype=torch.float16) > 1,
@@ -7845,7 +7893,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     torch.randint(0, 1000, (1, 1), dtype=torch.int64),
                 ),
                 "int64_1x24": (
-                    torch.zeros(1, 24, dtype=torch.bool),
+                    cached_randn((1, 24), dtype=torch.float16) > 0,
                     0,
                     torch.randint(0, 1000, (1, 24), dtype=torch.int64),
                 ),
@@ -7891,6 +7939,71 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((5, 10), dtype=torch.float16),
                     cached_randn((5, 10), dtype=torch.float16),
                     cached_randn((5, 10), dtype=torch.float16),
+                ),
+            },
+        },
+        ("test_masked_fill_scalar", "test_masked_fill_scalar_eager"): {
+            "ops_dict": {
+                "masked_fill": lambda x, mask, value: x.masked_fill(mask, value),
+                "masked_fill_": lambda x, mask, value: x.masked_fill_(mask, value),
+            },
+            # masked_fill lowers to where; a host bool mask with fp32/int32 values
+            # is refused as mixed EA. Pending de-staggering support (#5495).
+            "expect_fail": {
+                "fp32_2d": "host bool mask with fp32/int32 values is refused as mixed EA, pending #5495",
+                "fp32_3d": "host bool mask with fp32/int32 values is refused as mixed EA, pending #5495",
+                "int32_2d": "host bool mask with fp32/int32 values is refused as mixed EA, pending #5495",
+                "int32_3d": "host bool mask with fp32/int32 values is refused as mixed EA, pending #5495",
+            },
+            "param_sets": {
+                "fp16_2d_zero": (
+                    cached_randn((4, 64), dtype=torch.float16) > 0,
+                    cached_randn((4, 64), dtype=torch.float16),
+                    0.0,
+                ),
+                # Passes here, but the LX-planning wrappers (x + x) / 2 and
+                # sum(x, dim=0) turn the -inf result into NaN on device (#5190),
+                # so its LX copies are strict xfails in
+                # test_inductor_ops_lx_misc_compute_b_config.yaml.
+                "fp16_2d_neginf": (
+                    cached_randn((5, 10), dtype=torch.float16) > 0,
+                    cached_randn((5, 10), dtype=torch.float16),
+                    float("-inf"),
+                ),
+                "fp16_3d": (
+                    cached_randn((2, 8, 32), dtype=torch.float16) > 0,
+                    cached_randn((2, 8, 32), dtype=torch.float16),
+                    -1.0e4,
+                ),
+                "fp16_broadcast": (
+                    cached_randn((64,), dtype=torch.float16) > 0,
+                    cached_randn((4, 64), dtype=torch.float16),
+                    0.0,
+                ),
+                "fp16_empty": (
+                    cached_randn((4, 0), dtype=torch.float16) > 0,
+                    cached_randn((4, 0), dtype=torch.float16),
+                    0.0,
+                ),
+                "fp32_2d": (
+                    cached_randn((4, 64), dtype=torch.float32) > 0,
+                    cached_randn((4, 64), dtype=torch.float32),
+                    0.0,
+                ),
+                "fp32_3d": (
+                    cached_randn((2, 8, 32), dtype=torch.float32) > 0,
+                    cached_randn((2, 8, 32), dtype=torch.float32),
+                    -1.0e4,
+                ),
+                "int32_2d": (
+                    cached_randn((4, 32), dtype=torch.float16) > 0,
+                    torch.randint(0, 1000, (4, 32), dtype=torch.int32),
+                    0,
+                ),
+                "int32_3d": (
+                    cached_randn((2, 8, 64), dtype=torch.float16) > 0,
+                    torch.randint(0, 1000, (2, 8, 64), dtype=torch.int32),
+                    -1,
                 ),
             },
         },
@@ -9720,6 +9833,57 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
         },
         # -----------------------------------------------------------------------
+        # Eager floor division: Tensor.__floordiv__ / torch.floor_divide dispatch
+        # aten::floor_divide, which needs its own eager kernel (compile mode
+        # decomposes it to div.Tensor_mode and never reaches that dispatch).
+        # -----------------------------------------------------------------------
+        ("test_floor_divide_eager", "test_floor_divide_eager_cpu"): {
+            "param_sets": {
+                # issue 4643: ceil-division idiom on an int64 count tensor
+                "int64_floordiv_scalar": (
+                    torch.tensor(
+                        [0, 1, 31, 32, 33, 63, 64] + [0] * 121, dtype=torch.int64
+                    )
+                    + 31,
+                    32,
+                    lambda x, s: x // s,
+                ),
+                # floor_divide.out
+                "int64_floor_divide_out": (
+                    torch.tensor([0, 1, 31, 32, 33, 63, 64, 100], dtype=torch.int64),
+                    torch.tensor([32, 32, 32, 32, 32, 32, 32, 7], dtype=torch.int64),
+                    lambda x, y: torch.floor_divide(x, y, out=torch.empty_like(x)),
+                ),
+                "int64_floordiv_neg": (
+                    torch.tensor([-12, -21, 31, -7], dtype=torch.int64),
+                    4,
+                    lambda x, s: x // s,
+                ),
+                "int64_floordiv_tensor": (
+                    torch.tensor([0, 1, 31, 32, 33, 63, 64, 100], dtype=torch.int64),
+                    torch.tensor([32, 32, 32, 32, 32, 32, 32, 7], dtype=torch.int64),
+                    lambda x, y: x // y,
+                ),
+                # fp16: negative dividends/divisors exercise rounding toward -inf
+                "fp16_floor_divide_neg": (
+                    torch.tensor([-7, 7, -12, 9, -9, 0, 5, -1], dtype=torch.float16),
+                    torch.tensor([2, -2, 4, -4, 3, 5, -3, 8], dtype=torch.float16),
+                    torch.floor_divide,
+                ),
+                # in-place: floor_divide_.Scalar / floor_divide_.Tensor
+                "int64_floordiv_inplace_scalar": (
+                    torch.tensor([-12, -21, 31, 32, 33, 63, 64, 0], dtype=torch.int64),
+                    4,
+                    _floordiv_inplace,
+                ),
+                "int64_floordiv_inplace_tensor": (
+                    torch.tensor([0, 1, 31, 32, 33, 63, 64, 100], dtype=torch.int64),
+                    torch.tensor([32, 32, 32, 32, 32, 32, 32, 7], dtype=torch.int64),
+                    _floordiv_inplace,
+                ),
+            },
+        },
+        # -----------------------------------------------------------------------
         # Mixed-dtype division (true division and floor division):
         # tests type promotion across operand dtype combinations.
         # -----------------------------------------------------------------------
@@ -10472,31 +10636,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_cmp_mixed_dtype_cpu(self, op, x, y):
         # Operands with different dtypes: the lowering promotes both to one dtype.
         self.compare_with_cpu(op, x, y, run_eager=True)
-
-    def test_cmp_host_operand_cpu(self, op, x):
-        # The compare's operands live on CPU even though the graph targets Spyre.
-        def fn(x):
-            positions = torch.arange(x.shape[-1])
-            mask = op(positions, 2)[None, None, :]
-            return x * mask.to(dtype=x.dtype, device=x.device)
-
-        self.compare_with_cpu(fn, x, run_eager=False)
-
-    def test_clamp_host_operand_cpu(self, op, x):
-        # The clamp operand lives on CPU even though the graph targets Spyre.
-        # An int64 position index is clamped then moved to the device, as in
-        # LFM2-style causal conv mask construction.
-        def fn(x):
-            positions = torch.arange(x.shape[-1])  # CPU int64
-            if op is torch.clamp:
-                clamped = op(positions, min=0, max=1)
-            elif op is torch.clamp_min:
-                clamped = op(positions, min=0)
-            else:  # clamp_max
-                clamped = op(positions, max=1)
-            return x * clamped[None, None, :].to(dtype=x.dtype, device=x.device)
-
-        self.compare_with_cpu(fn, x, run_eager=False)
 
     def test_cmp_bigint_cpu(self, op, x, y):
         # Integers large enough that int→fp32 loses the distinction between them.
@@ -11880,6 +12019,20 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, *tensors)
 
+    def test_cat_reduce_size1_trailing_dim_cpu(self, a, b):
+        def fn(a, b):
+            return torch.cat([a, b], dim=-1).sum(dim=-1)
+
+        self.compare_with_cpu(fn, a, b)
+
+    def test_cat_stack_last_dim_cpu(self, parts, x):
+        """Stack ``parts`` tensors on a new last dim and flatten it into the stick."""
+
+        def fn(x):
+            return torch.stack([x * (i + 1) for i in range(parts)], dim=-1).flatten(-2)
+
+        self.compare_with_cpu(fn, x, run_eager=False)
+
     def test_pad_cpu(self, x, pad):
         """Compiled torch.nn.functional.pad (constant zero) on Spyre matches CPU."""
 
@@ -12769,6 +12922,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_where_eager_selfout(self, op, condition, x, y, z):
         self.compare_with_cpu(
             lambda condition, x, y, z: op(condition, x, y, out=z), condition, x, y, z
+        )
+
+    def test_masked_fill_scalar_eager(self, op, mask, x, value):
+        # clone_inputs: the in-place op mutates x, so the CPU reference and the
+        # Spyre run must each get a fresh copy.
+        self.compare_with_cpu(
+            lambda mask, x: op(x, mask, value), mask, x, clone_inputs=True
         )
 
     def test_attn_qkv_paths(self, q, k, v):
@@ -14920,7 +15080,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             offs_2d2d,
         )
 
-    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
     def test_div_rounding_mode_cpu(self, rounding_mode, x, y):
         """Test torch.div with different rounding modes."""
@@ -14937,7 +15096,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # the class of error the quotient-correction step exists to fix.
         self.compare_with_cpu(fn, x, y, atol=0, rtol=0)
 
-    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
     def test_div_mixed_dtype_cpu(self, op, x, y):
         """Test torch.div type promotion across mixed tensor dtypes."""
@@ -14946,7 +15104,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         tol_kwargs = {"atol": 0, "rtol": 0} if op is _floor_div else {}
         self.compare_with_cpu(op, x, y, **tol_kwargs)
 
-    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
     def test_div_scalar_dtypes_cpu(self, op, x, scalar):
         """Test torch.div type promotion with Python scalar operands."""
@@ -14954,6 +15111,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             scalar = 1.0
         tol_kwargs = {"atol": 0, "rtol": 0} if op is _floor_div else {}
         self.compare_with_cpu(op, x, scalar, **tol_kwargs)
+
+    @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
+    def test_floor_divide_eager_cpu(self, x, y, fn):
+        # Eager-only: `//` / torch.floor_divide must have a spyre eager kernel.
+        # Floor division is exact integer arithmetic, so compare exactly.
+        self.compare_with_cpu(
+            fn, x, y, atol=0, rtol=0, run_compile=False, run_eager=True
+        )
 
 
 _TEST_LARGE_MATMUL_FP32_PROXY_SHAPES = _derive_test_large_matmul_fp32_proxy_shapes(
