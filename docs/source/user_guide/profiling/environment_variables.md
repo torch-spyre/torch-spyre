@@ -98,9 +98,11 @@ The `stage:` regions are:
 |---|---|
 | `stage:compile_fx:spyre_compile` | One whole Spyre compile; every other region in this table nests inside it |
 | `stage:CustomPreSchedulingPasses:pass_loop` | The pre-scheduling pass list |
+| `stage:CustomPreSchedulingPasses:validate` | The operation-order check after the last pass |
 | `stage:CustomPreSchedulingPasses:cost_model` / `:cost_dump` | Predicted-runtime report and its per-op dump |
 | `stage:CustomPreSchedulingPasses:finalize_work_division` | Work-division ownership handoff to the scheduler |
 | `stage:CustomPreSchedulingPasses:log_before` / `:log_after` | The IR dumps, only when INFO logging is on |
+| `validate:CustomPreSchedulingPasses:<pass>` | The operation-order check after one pass, only with `SPYRE_VALIDATE_EVERY_PASS=1` |
 | `stage:GraphLowering:update_scheduler` | Upstream scheduler construction |
 | `stage:SpyreAsyncCompile:generate_bundle` / `:generate_ktir` | Backend-input generation, per kernel |
 | `stage:SpyreAsyncCompile:kernel_provenance` | Kernel provenance descriptor, per kernel |
