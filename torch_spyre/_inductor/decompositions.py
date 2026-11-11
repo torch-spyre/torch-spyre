@@ -4037,17 +4037,30 @@ def spyre_flip(input: torch.Tensor, dims: Sequence[int]) -> torch.Tensor:
     return out if reversed_any else out.clone()
 
 
-@register_spyre_decompositions([torch.ops.aten.fmod.Tensor])
+def _promote_bool_dividend(
+    a: TensorLikeType | NumberType, b: TensorLikeType | NumberType
+) -> TensorLikeType | NumberType:
+    """Cast a bool tensor dividend to the result dtype: x - q * y rejects bool."""
+    if isinstance(a, torch.Tensor) and a.dtype == torch.bool:
+        return a.to(torch.result_type(a, b))
+    return a
+
+
+@register_spyre_decompositions([torch.ops.aten.fmod.Tensor, torch.ops.aten.fmod.Scalar])
 def spyre_fmod(
     a: TensorLikeType | NumberType, b: TensorLikeType | NumberType
 ) -> torch.Tensor:
+    a = _promote_bool_dividend(a, b)
     return a - torch.div(a, b, rounding_mode="trunc") * b
 
 
-@register_spyre_decompositions([torch.ops.aten.remainder.Tensor])
+@register_spyre_decompositions(
+    [torch.ops.aten.remainder.Tensor, torch.ops.aten.remainder.Scalar]
+)
 def spyre_remainder(
     a: TensorLikeType | NumberType, b: TensorLikeType | NumberType
 ) -> torch.Tensor:
+    a = _promote_bool_dividend(a, b)
     return a - torch.div(a, b, rounding_mode="floor") * b
 
 

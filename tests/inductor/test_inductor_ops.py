@@ -1237,6 +1237,55 @@ def _trunc_div(a, b):
     return torch.div(a, b, rounding_mode="trunc")
 
 
+def _random_sign(shape, seed, dtype=torch.float16):
+    """A seeded tensor of +1 and -1 values."""
+    gen = torch.Generator().manual_seed(seed)
+    return (torch.randint(0, 2, shape, generator=gen) * 2 - 1).to(dtype)
+
+
+# fmod and remainder decompose to x - div(x, y, rounding_mode=trunc|floor) * y.
+_MOD_OPS = (torch.fmod, torch.remainder)
+
+
+def _div_tol_kwargs(op, x, y):
+    """Tolerance for a torch.div variant compared against CPU.
+
+    floor/trunc division produces an integer quotient, so it is exact.
+
+    fmod/remainder are also exact for integer dtypes, and for integer-valued
+    float inputs whose magnitudes the result format holds exactly (1024 in
+    DLFloat16, 2**24 in fp32), because then q*y and x - q*y are exact.
+
+    Otherwise the device rounds q*y once, by at most half an ulp of max|x|.
+    DLFloat16 also re-rounds fp16 inputs on transfer, which the exact CPU
+    reference does not see, and that error reaches the result through q*y.
+    So allow two ulps of max|x| in the device format (9 fraction bits for
+    DLFloat16, 23 for fp32). A wrong quotient shifts the result by |y|,
+    which is larger than this for every divisor in these tests.
+    True division keeps the default tolerance.
+    """
+    if op in (_floor_div, _trunc_div):
+        return {"atol": 0, "rtol": 0}
+    if op not in _MOD_OPS:
+        return {}
+    result_dtype = torch.result_type(x, y)
+    if not result_dtype.is_floating_point:
+        return {"atol": 0, "rtol": 0}
+    exact_int_max = 1024 if result_dtype == torch.float16 else 2**24
+    # In float64, which holds every fp16/fp32/int32 value and has abs for bool.
+    x64, y64 = (t.double() if isinstance(t, torch.Tensor) else float(t) for t in (x, y))
+    max_x = float(x64.abs().max()) if isinstance(x64, torch.Tensor) else abs(x64)
+    integer_valued = all(
+        torch.equal(t, t.trunc()) if isinstance(t, torch.Tensor) else t.is_integer()
+        for t in (x64, y64)
+    )
+    if integer_valued and max_x <= exact_int_max:
+        return {"atol": 0, "rtol": 0}
+    fraction_bits = 9 if result_dtype == torch.float16 else 23
+    ulp = 2.0 ** (math.floor(math.log2(max_x)) - fraction_bits) if max_x else 0.0
+    return {"atol": 2 * ulp, "rtol": 0}
+
+
 def _floordiv_inplace(x, y):
     # ``x //= y`` -> aten::floor_divide_.{Scalar,Tensor}; work on a clone so the
     # shared param tensor is not mutated across eager/CPU runs.
@@ -1688,66 +1737,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ((2880,), (1, 11, 2880)),
                 ]
             ),
-        },
-        (
-            "test_division_fp16",
-            "test_division_op",
-        ): {
-            "ops_dict": {
-                "floordiv": functools.partial(torch.div, rounding_mode="floor"),
-                "truncdiv": functools.partial(torch.div, rounding_mode="trunc"),
-                "fmod": torch.fmod,
-                "remainder": torch.remainder,
-            },
-            "param_sets": make_param_dict(
-                [
-                    ((256,),) * 2,
-                    ((67, 256),) * 2,
-                    ((67, 71, 256),) * 2,
-                    ((7, 12, 32, 64),) * 2,
-                    # broadcasting case
-                    ((2880,), (1, 11, 2880)),
-                ]
-            ),
-        },
-        (
-            "test_division_fp32",
-            "test_division_op",
-        ): {
-            "ops_dict": {
-                "floordiv": functools.partial(torch.div, rounding_mode="floor"),
-                "truncdiv": functools.partial(torch.div, rounding_mode="trunc"),
-                "fmod": torch.fmod,
-                "remainder": torch.remainder,
-            },
-            "param_sets": make_param_dict(
-                [
-                    ((256,),) * 2,
-                    ((67, 256),) * 2,
-                    ((67, 71, 256),) * 2,
-                    ((7, 12, 32, 64),) * 2,
-                    # broadcasting case
-                    ((2880,), (1, 11, 2880)),
-                ],
-                dtype=torch.float32,
-            ),
-        },
-        (
-            "test_division_int64",
-            "test_division_op",
-        ): {
-            "ops_dict": {
-                "floordiv": functools.partial(torch.div, rounding_mode="floor"),
-                "truncdiv": functools.partial(torch.div, rounding_mode="trunc"),
-                "fmod": torch.fmod,
-                "remainder": torch.remainder,
-            },
-            "param_sets": {
-                "1d": (
-                    torch.randint(-100, 100, (256,), dtype=torch.int64),
-                    torch.randint(-100, 100, (256,), dtype=torch.int64),
-                ),
-            },
         },
         (
             "test_pointwise_binary_op_int64",
@@ -9924,6 +9913,139 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
         },
         # -----------------------------------------------------------------------
+        # fmod and remainder: x - div(x, y, rounding_mode="trunc" / "floor") * y.
+        # fmod takes the sign of x and remainder the sign of y, so most cases mix
+        # the signs of both operands. fp16 inputs are integer-valued so that the
+        # result is exact (see _div_tol_kwargs); fp32 inputs are random.
+        # -----------------------------------------------------------------------
+        ("test_div_mod", "test_div_mod_cpu"): {
+            "ops_dict": {
+                "fmod": torch.fmod,
+                "remainder": torch.remainder,
+            },
+            "param_sets": {
+                "fp16_rand_2d": (
+                    torch.randint(
+                        -100,
+                        101,
+                        (67, 256),
+                        generator=torch.Generator().manual_seed(0xAF21),
+                    ).to(torch.float16),
+                    torch.randint(
+                        2,
+                        11,
+                        (67, 256),
+                        generator=torch.Generator().manual_seed(0xAF22),
+                    ).to(torch.float16),
+                ),
+                "fp16_mixed_sign_2d": (
+                    torch.randint(
+                        -100,
+                        101,
+                        (67, 256),
+                        generator=torch.Generator().manual_seed(0xAF23),
+                    ).to(torch.float16),
+                    _random_sign((67, 256), 0xAF24)
+                    * torch.randint(
+                        2,
+                        11,
+                        (67, 256),
+                        generator=torch.Generator().manual_seed(0xAF25),
+                    ).to(torch.float16),
+                ),
+                # 4-D, and a divisor broadcast against a lower-rank dividend.
+                "fp16_mixed_sign_4d": (
+                    torch.randint(
+                        -100,
+                        101,
+                        (7, 12, 32, 64),
+                        generator=torch.Generator().manual_seed(0xAF26),
+                    ).to(torch.float16),
+                    _random_sign((7, 12, 32, 64), 0xAF27)
+                    * torch.randint(
+                        2,
+                        11,
+                        (7, 12, 32, 64),
+                        generator=torch.Generator().manual_seed(0xAF28),
+                    ).to(torch.float16),
+                ),
+                "fp16_mixed_sign_broadcast": (
+                    torch.randint(
+                        -100,
+                        101,
+                        (2880,),
+                        generator=torch.Generator().manual_seed(0xAF29),
+                    ).to(torch.float16),
+                    _random_sign((1, 11, 2880), 0xAF2A)
+                    * torch.randint(
+                        2,
+                        11,
+                        (1, 11, 2880),
+                        generator=torch.Generator().manual_seed(0xAF2B),
+                    ).to(torch.float16),
+                ),
+                "fp32_rand_2d": (
+                    cached_randn((67, 256), dtype=torch.float32, scale=50.0),
+                    cached_randn(
+                        (67, 256),
+                        dtype=torch.float32,
+                        abs=True,
+                        scale=10.0,
+                        differentiation=1,
+                    ),
+                ),
+                "fp32_negdiv_2d": (
+                    cached_randn((67, 256), dtype=torch.float32, scale=50.0),
+                    -cached_randn(
+                        (67, 256),
+                        dtype=torch.float32,
+                        abs=True,
+                        scale=10.0,
+                        differentiation=1,
+                    ),
+                ),
+                "int64_mixed_sign_2d": (
+                    torch.randint(
+                        -200,
+                        201,
+                        (67, 256),
+                        generator=torch.Generator().manual_seed(0xAF2C),
+                    ),
+                    _random_sign((67, 256), 0xAF2D, dtype=torch.int64)
+                    * torch.randint(
+                        1,
+                        21,
+                        (67, 256),
+                        generator=torch.Generator().manual_seed(0xAF2E),
+                    ),
+                ),
+                "fp16_tensor_scalar": (
+                    torch.tensor([-10.5, -20.25, 30.75, -5.0], dtype=torch.float16),
+                    2.0,
+                ),
+                "fp16_tensor_negscalar": (
+                    torch.tensor([-10.5, -20.25, 30.75, -5.0], dtype=torch.float16),
+                    -2.0,
+                ),
+                "fp32_tensor_scalar": (
+                    torch.tensor([-10.5, -20.3, 30.7, -5.2], dtype=torch.float32),
+                    2.0,
+                ),
+                "fp32_tensor_negscalar": (
+                    torch.tensor([-10.0, -20.3, 30.7, -5.2], dtype=torch.float32),
+                    -2.0,
+                ),
+                "int64_tensor_scalar": (
+                    torch.tensor([-11, -21, 31, -7], dtype=torch.int64),
+                    2,
+                ),
+                "int64_tensor_negscalar": (
+                    torch.tensor([-12, -21, 31, -7], dtype=torch.int64),
+                    -2,
+                ),
+            },
+        },
+        # -----------------------------------------------------------------------
         # Eager floor division: Tensor.__floordiv__ / torch.floor_divide dispatch
         # aten::floor_divide, which needs its own eager kernel (compile mode
         # decomposes it to div.Tensor_mode and never reaches that dispatch).
@@ -9975,14 +10097,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
         },
         # -----------------------------------------------------------------------
-        # Mixed-dtype division (true division and floor division):
-        # tests type promotion across operand dtype combinations.
+        # Mixed-dtype division (true, floor and trunc division, fmod and
+        # remainder): tests type promotion across operand dtype combinations.
         # -----------------------------------------------------------------------
         ("test_div_mixed_dtype", "test_div_mixed_dtype_cpu"): {
             "ops_dict": {
                 "true_div": lambda a, b: torch.div(a, b),
                 "floor_div": _floor_div,
                 "trunc_div": _trunc_div,
+                "fmod": torch.fmod,
+                "remainder": torch.remainder,
             },
             # TODO: remove when multi-arg pointwise with mixed EA is supported
             "expect_raise": {
@@ -10009,6 +10133,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     "fp16 intermediate product rounding can zero the residual "
                     "and blind the +-1 correction; this case pins the pair "
                     "72.0 / 0.314453125 from that class, #5605"
+                ),
+                # remainder subtracts the same wrong floor quotient (229, not
+                # 228), so it returns about 72 - 229 * 0.3145 = -0.01 instead of
+                # 0.305; #5605
+                "remainder_fp16_fp16_1d256": (
+                    "remainder uses the floor quotient, which #5605 makes 229 "
+                    "instead of 228 for 72.0 / 0.314453125"
                 ),
             },
             "param_sets": {
@@ -10094,13 +10225,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         # -----------------------------------------------------------------------
         # Scalar division across tensor dtypes and Python scalar types:
-        # tests tensor-scalar type promotion for div and floor_div.
+        # tests tensor-scalar type promotion for div, fmod and remainder.
         # -----------------------------------------------------------------------
         ("test_div_scalar_dtypes", "test_div_scalar_dtypes_cpu"): {
             "ops_dict": {
                 "true_div": lambda a, b: torch.div(a, b),
                 "floor_div": _floor_div,
                 "trunc_div": _trunc_div,
+                "fmod": torch.fmod,
+                "remainder": torch.remainder,
             },
             "param_sets": {
                 # bool tensor vs int/float scalars
@@ -14865,55 +14998,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, x, run_eager=False)
 
-    def test_division_op(self, op, a, b):
-        """Test truncdiv, floordiv, fmod and remainder.
-
-        All four do computations on the result of div. With fp16, the
-        results can be slightly different on CPU and Spyre, but since
-        floor and trunc introduce discontinuities, this can lead to
-        results that are quite different, so this function tries to
-        massage the input data to avoid these situations. Otherwise
-        this function is basically the same as test_binary_op
-        """
-        dtype = a.dtype
-        if b.dtype.is_floating_point:
-            dtype = b.dtype
-
-        if dtype.is_floating_point:
-            # To avoid cpu mismatch due to a negative
-            # fp16 having a fraction 0b0000000001
-            a = a.to(dtype).to("spyre").cpu()
-            b = a.to(dtype).to("spyre").cpu()
-
-        # TODO: Division by 0 or near-zero differs on Spyre from CPU, sidestep for now.
-        tiny_value_mask = torch.abs(b) < FP16_EPS
-        if b.dtype.is_floating_point:
-            b[tiny_value_mask] = FP16_EPS
-        else:
-            b[tiny_value_mask] = 1
-
-        def debroadcast_mask(big, small):
-            return big.to(torch.int32).sum_to_size(small.shape).to(torch.bool)
-
-        # If the division is almost exact the result of the division
-        # could be slightly below an integer on spyre and above on CPU.
-        # Applying trunc or floor in these cases will create a significant
-        # difference in outputs. It also applies to integer because internally
-        # they are converted float32 and interesting things can happen:
-        # >>> a = torch.tensor(47,dtype=torch.float32,device="spyre")
-        # >>> torch.floor(a/a)
-        # >>> tensor(0., device='spyre:0')
-        # >>>
-        # >>> a = torch.tensor(47,dtype=torch.float16,device="spyre")
-        # >>> torch.floor(a/a)
-        # >>> tensor(1., dtype=torch.float16, device='spyre:0')
-        div_ = torch.div(a, b)
-        nearest_int = torch.round(div_)
-        almost_exact_div_mask = abs(div_ - nearest_int) < FP16_EPS
-        a[debroadcast_mask(almost_exact_div_mask, a)] = 0
-
-        self.compare_with_cpu(op, a, b)
-
     def test_matmul_bs1_3d_linear(self):
         def fn(x, w):
             return torch.matmul(x, w.T)
@@ -15236,19 +15320,28 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
     def test_div_mixed_dtype_cpu(self, op, x, y):
-        """Test torch.div type promotion across mixed tensor dtypes."""
+        """Test torch.div, fmod and remainder type promotion across tensor dtypes."""
         if isinstance(y, torch.Tensor):
             y = _bound_divisor(y, numerator=x if isinstance(x, torch.Tensor) else None)
-        tol_kwargs = {"atol": 0, "rtol": 0} if op in (_floor_div, _trunc_div) else {}
-        self.compare_with_cpu(op, x, y, **tol_kwargs)
+        self.compare_with_cpu(op, x, y, **_div_tol_kwargs(op, x, y))
 
     @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
     def test_div_scalar_dtypes_cpu(self, op, x, scalar):
-        """Test torch.div type promotion with Python scalar operands."""
+        """Test torch.div, fmod and remainder promotion with Python scalars."""
         if isinstance(scalar, (int, float)) and abs(scalar) < FP16_EPS:
             scalar = 1.0
-        tol_kwargs = {"atol": 0, "rtol": 0} if op in (_floor_div, _trunc_div) else {}
-        self.compare_with_cpu(op, x, scalar, **tol_kwargs)
+        self.compare_with_cpu(op, x, scalar, **_div_tol_kwargs(op, x, scalar))
+
+    @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
+    def test_div_mod_cpu(self, op, x, y):
+        """torch.fmod and torch.remainder: x minus a trunc or floor quotient times y.
+
+        fmod takes the sign of x and remainder the sign of y, so the cases mix
+        the signs of both operands.
+        """
+        if isinstance(y, torch.Tensor):
+            y = _bound_divisor(y, numerator=x if isinstance(x, torch.Tensor) else None)
+        self.compare_with_cpu(op, x, y, **_div_tol_kwargs(op, x, y))
 
     @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
     def test_floor_divide_eager_cpu(self, x, y, fn):
