@@ -2503,7 +2503,7 @@ def compute_restickify_target_layout(
     stl: SpyreTensorLayout,
     host_layout: FixedLayout,
     target_stick_expr,
-    ic: list,
+    host_coords: list,
     idc: list,
 ) -> "SpyreTensorLayout | None":
     """Compute the target STL that results from moving stl's stick to target_stick_expr.
@@ -2518,10 +2518,15 @@ def compute_restickify_target_layout(
     Use ``_find_existing_candidate`` in ``propagate_layouts.py`` to detect that
     case first.
 
+    The new STL's stride_map entries require the per-element host stride of each
+    swapped dimension.  ``stride_map[outer_dim]`` in the *current* STL holds a
+    per-stick stride (per-element * stick_size), not a per-element stride, so we
+    read the per-element strides directly from host_layout via ``_host_size_stride``.
+
     Returns None if the restickify is infeasible.
     """
     if target_stick_expr == sympy.S.Zero:
-        return compute_size1_restickify_layout(stl, host_layout, ic, idc)
+        return compute_size1_restickify_layout(stl, host_layout, host_coords, idc)
     if not target_stick_expr.free_symbols:
         return None
     host_size = [concretize_expr(s) for s in host_layout.size]
@@ -2529,7 +2534,7 @@ def compute_restickify_target_layout(
     new_var = next(iter(target_stick_expr.free_symbols))
     stick_size = get_elem_in_stick(host_layout.dtype)
     new_ss = _host_size_stride(
-        new_var, target_stick_expr, ic, host_size, host_stride, stick_size
+        new_var, target_stick_expr, host_coords, host_size, host_stride, stick_size
     )
     if new_ss is None:
         return None
@@ -2538,7 +2543,7 @@ def compute_restickify_target_layout(
     if old_stick_expr.free_symbols:
         old_var = next(iter(old_stick_expr.free_symbols))
         old_ss = _host_size_stride(
-            old_var, old_stick_expr, ic, host_size, host_stride, stick_size
+            old_var, old_stick_expr, host_coords, host_size, host_stride, stick_size
         )
         if old_ss is None:
             return None
@@ -2594,7 +2599,7 @@ def compute_restickify_target_layout(
 def compute_size1_restickify_layout(
     stl: SpyreTensorLayout,
     host_layout: FixedLayout,
-    ic: list,
+    host_coords: list,
     idc: list,
 ) -> "SpyreTensorLayout | None":
     """Compute the target STL that results from moving stl's stick onto a size-1 dim.
@@ -2612,7 +2617,7 @@ def compute_size1_restickify_layout(
     old_var = next(iter(old_stick_expr.free_symbols))
     stick_size = get_elem_in_stick(host_layout.dtype)
     old_ss = _host_size_stride(
-        old_var, old_stick_expr, ic, host_size, host_stride, stick_size
+        old_var, old_stick_expr, host_coords, host_size, host_stride, stick_size
     )
     if old_ss is None:
         return None
