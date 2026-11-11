@@ -53,30 +53,6 @@ class SymbolKind:
                                              ``base_sym_idx`` is the 0-based index into the
                                              global ``symbols`` list of the sliced-base symbol
                                              (either a ``kernel`` or ``kernel_slice`` entry).
-      - ``kernel_derived_symbolic(...)``:    per-core derived address when the
-                                             tensor is split across cores on a
-                                             *symbolic* dim.  The real byte offset
-                                             is ``core_idx *
-                                             ceildiv(S, split_count) *
-                                             per_element_stride`` where ``S`` is the
-                                             runtime size of the symbolic dim, so it
-                                             cannot be baked at compile time.  This
-                                             variant only TAGS the per-core address
-                                             as symbolic, carrying ``core_idx``,
-                                             ``split_count`` and the ``pytorch_sym``
-                                             it depends on.  Emitting the actual
-                                             arith formula, and computing the
-                                             per-element stride it needs, is the
-                                             bundle-arm follow-up (which depends on
-                                             the dim ``input_arg`` SSA and is out of
-                                             scope here).  ``is_derived`` stays False
-                                             so the existing bundle
-                                             ``kernel_derived`` addi branch does not
-                                             match this variant.  At the SDSC-JSON
-                                             layer this is identical to
-                                             ``kernel_derived``: the per-core entry is
-                                             a negative symbol id under
-                                             ``isStartAddrSymbolic_``.
       - ``pool()``:                          MLIR-symbol-table mirror of a
                                              ``TensorArg.allocation["hbm_pool"]``-tagged
                                              tensor (see ``hbm_pool_planning.py`` and
@@ -108,7 +84,7 @@ class SymbolKind:
     granularity: int = 0
     max_value: int = 0
     pytorch_sym: str = ""
-    # Only meaningful for the kernel_derived_symbolic variant.
+    # Only meaningful for the shard_kernel variant.
     core_idx: int = -1
     split_count: int = 0
     # Only meaningful for the loop_dimension variant: which dim of which launch
@@ -132,31 +108,6 @@ class SymbolKind:
             base_sym_idx=base_sym_idx,
             offset=offset,
             arg_index=arg_index,
-        )
-
-    @classmethod
-    def kernel_derived_symbolic(
-        cls,
-        arg_index: int,
-        core_idx: int,
-        split_count: int,
-        base_sym_idx: int,
-        pytorch_sym: str,
-    ) -> "SymbolKind":
-        """Per-core derived address for a symbolic-dim core split.
-
-        Tags the per-core address as symbolic. The runtime formula
-        ``core_idx * ceildiv(S, split_count) * per_element_stride`` and the
-        per-element stride it needs are emitted by the bundle-arm follow-up,
-        not here, so no stride is stored on this marker.
-        """
-        return cls(
-            kind="kernel_derived_symbolic",
-            arg_index=arg_index,
-            core_idx=core_idx,
-            split_count=split_count,
-            base_sym_idx=base_sym_idx,
-            pytorch_sym=pytorch_sym,
         )
 
     @classmethod
@@ -231,10 +182,6 @@ class SymbolKind:
     @property
     def is_derived(self) -> bool:
         return self.kind == "kernel_derived"
-
-    @property
-    def is_derived_symbolic(self) -> bool:
-        return self.kind == "kernel_derived_symbolic"
 
     @property
     def is_shard_kernel(self) -> bool:
@@ -598,67 +545,6 @@ def get_conv_params(tensor_num, dim, opfunc, conv_params, size, splits):
     }
 
 
-def _symbolic_split_info(
-    tensor,
-    work_slices: dict,
-    symbolic_dims: dict,
-) -> tuple[str, int, str] | None:
-    """Return ``(sdsc_dim_name, split_count, pytorch_sym)`` if ``tensor`` is
-    split across more than one core along a symbolic dim, else ``None``.
-
-    A tensor qualifies iff all of the following hold:
-      - it is a kernel tensor arg (``arg_index >= 0``); pool tensors are
-        skipped because they have no kernel base to derive from.
-      - one of the ``symbolic_dims`` has ``work_slices > 1`` (i.e. it is
-        actually split across cores).
-      - the tensor uses that dim (``tensor.scales[dim] > 0`` so the dim is
-        neither reduced nor broadcast away for this tensor).
-
-    Only the first qualifying dim is reported; the planner rejects plans with
-    multiple symbolic splits per tensor upstream.
-    """
-    if tensor.arg_index < 0:
-        return None
-    for sdsc_dim, (pytorch_sym, _granularity, _max_val) in symbolic_dims.items():
-        dim_sym = Symbol(sdsc_dim)
-        split = work_slices.get(dim_sym)
-        if split is None or split <= 1:
-            continue
-        if dim_sym not in tensor.scales or tensor.scales[dim_sym] <= 0:
-            continue
-        return sdsc_dim, int(split), pytorch_sym
-    return None
-
-
-def _tensor_has_symbolic_split(
-    tensor,
-    work_slices: dict,
-    symbolic_dims: dict,
-) -> bool:
-    """True iff ``tensor`` is split across more than one core on a symbolic
-    dim.  Thin boolean wrapper over ``_symbolic_split_info`` for sites that
-    only need the yes/no answer.
-    """
-    return _symbolic_split_info(tensor, work_slices, symbolic_dims) is not None
-
-
-def _per_core_symbolic_dim_info(symbolic_dims: dict, work_slices: dict) -> dict:
-    """Per-core ``symbolicDimInfo_`` block: granularity_/maxSize_ divided by
-    each dim's work_slices.
-
-    Shared by the ``ss_`` and ``el_`` sub-dicts of ``dataStageParam_``, which
-    must stay byte-for-byte identical -- factored out so the two never drift.
-    """
-    info = {}
-    for dim_name, (_, granularity, max_val) in symbolic_dims.items():
-        wk_slices = work_slices[Symbol(dim_name)]
-        info[dim_name] = {
-            "maxSize_": max_val // wk_slices,
-            "granularity_": max(1, granularity // wk_slices),
-        }
-    return info
-
-
 def _find_index_tensor_for_value(sdsc_spec, value_tensor_idx: int) -> int:
     """Find the index of the index tensor that references the given value tensor.
 
@@ -836,10 +722,6 @@ def generate_sdsc(
     #   ("kernel_slice", arg_index) — sliced base (raw + compile-time offset)
     #   int addr                    — per-core derived address (c>0 kernel tensors,
     #                                 always large HBM byte addresses)
-    #   ("kernel_derived_symbolic", arg_index, core_idx)
-    #                                 per-core address for a symbolic-dim split
-    #                                 (c>0), keyed by (tensor, core) so it never
-    #                                 collides with the bare-int kernel_derived key
     #   ("pool", int offset)        — pool-allocated tensor compile-time offset
     #
     # On the symbolic path, kernel sentinels are arg_index integers (0, 1, 2...).
@@ -883,11 +765,6 @@ def generate_sdsc(
             key = ("kernel_slice", kind.arg_index, kind.offset)
         elif kind.is_shard_kernel:
             key = ("shard_kernel", kind.arg_index, kind.core_idx)
-        elif kind.is_derived_symbolic:
-            # Per-core symbolic address: key by (tensor, core) so every
-            # (arg_index, core_idx) is a distinct registration and never
-            # collides with a concrete kernel_derived key (a bare int addr).
-            key = ("kernel_derived_symbolic", kind.arg_index, kind.core_idx)
         else:
             # kernel_derived: s is a large per-core HBM byte address,
             # distinct from pool offsets and sentinel values.
@@ -907,38 +784,15 @@ def generate_sdsc(
         addr: int,
         core0_addr: int,
         sliced_base_sym_idx: int,
-        symbolic_split: tuple[str, int, str] | None,
     ) -> None:
-        """Register the c>0 derived address for a kernel tensor.
+        """Register the c>0 ``kernel_derived`` address for a kernel tensor.
 
-        Routes to ``kernel_derived_symbolic`` when the tensor is split on a
-        symbolic dim (the byte offset depends on the runtime dim size and is
-        resolved by a later bundle arm), otherwise the concrete
-        ``kernel_derived`` path.  ``addr`` is the compile-time (max-shape)
-        address, used for the concrete path and as the symbols[] placeholder
-        value for the symbolic path.
+        ``addr`` is the compile-time address of core ``c``.
         """
-        if symbolic_split is not None:
-            _sdsc_dim_name, split_count, pytorch_sym = symbolic_split
-            # TODO:  only TAG the per-core address as symbolic. The
-            # runtime arith (core * ceildiv(S, split) * per_element_stride)
-            # and the per-element stride it needs are the bundle-arm
-            # follow-up, so nothing stride-related is computed here.
-            offset_as_symbol(
-                addr,
-                SymbolKind.kernel_derived_symbolic(
-                    arg_index=tensor.arg_index,
-                    core_idx=c,
-                    split_count=split_count,
-                    base_sym_idx=sliced_base_sym_idx,
-                    pytorch_sym=pytorch_sym,
-                ),
-            )
-        else:
-            offset_as_symbol(
-                addr,
-                _derived_kind(tensor.arg_index, core0_addr, addr, sliced_base_sym_idx),
-            )
+        offset_as_symbol(
+            addr,
+            _derived_kind(tensor.arg_index, core0_addr, addr, sliced_base_sym_idx),
+        )
 
     # Compute per-tensor, per-level affine strides and register base addresses.
     # affine_strides[i] is a list of dicts, one per loop-nesting level
@@ -1009,74 +863,6 @@ def generate_sdsc(
             )
             * nb
         )
-        # Per-core symbolic split: cores 1..n-1 of a kernel tensor split on a
-        # symbolic dim get kernel_derived_symbolic addresses (byte offset
-        # depends on the runtime dim size).  A symbolic-split dim that is ALSO
-        # tiled for this tensor is out of scope: the per-core address would
-        # need both a symbolic term and an affine.apply term.
-        symbolic_split = _symbolic_split_info(
-            tensor, sdsc_spec.work_slices, symbolic_dims
-        )
-        if symbolic_split is not None:
-            sym_dim_name = symbolic_split[0]
-            sym_dim = Symbol(sym_dim_name)
-            # Real-symbol fast path: s IS the dim symbol (already renamed
-            # to its SDSC dim label by symbol_mapping), so name equality
-            # against sym_dim_name is a correct, direct test.
-            #
-            # Minted-symbol path (spyre_kernel._get_or_mint_level_symbol):
-            # a minted symbol names a loop-nesting *level*, not a
-            # dimension -- _general_tile_advance (spyre_kernel.py) sums
-            # every host dim tiled at a level into ONE combined
-            # coefficient on that level's minted symbol before this
-            # tensor's device_tile_advance_expr is ever built, so by the
-            # time we get here there is no way to recover, from a
-            # nonzero coeff(minted_sym) alone, *which* of this tensor's
-            # active dims that coefficient came from (see fix-loop
-            # round-1 review: a tensor with two active dims, tiled only
-            # on one of them, previously false-positived on the other
-            # merely because it was also active and the tensor advanced
-            # via *some* dim).
-            #
-            # Absent that per-dimension provenance, the only sound test
-            # (no false positives) is: flag `sym_dim_name` only when it
-            # is this tensor's *sole* active (non-reduced) dim -- then a
-            # nonzero combined coefficient cannot be attributed to any
-            # other dim, because there is no other dim. This is a
-            # deliberate narrowing versus "any tiling at all, on any
-            # dim" -- it can under-detect (miss a real conflict on a
-            # tensor with 2+ active dims where sym_dim_name genuinely is
-            # the tiled one) but never over-detects, which is the
-            # correctness-critical direction for a False positive to
-            # avoid: it would otherwise reject support for supported
-            # ops using this check.
-            active_dims = [d for d in tensor.strides if tensor.scales.get(d, 1) > 0]
-            tensor_advances_at_some_level = (
-                tensor.device_tile_advance_expr is not None
-                and any(
-                    coeff_through_floor(tensor.device_tile_advance_expr, s)
-                    for level_syms in tiled_symbols
-                    for s in level_syms
-                )
-            )
-            tiled_on_split_dim = any(
-                str(s) == sym_dim_name
-                for level_syms in tiled_symbols
-                for s in level_syms
-                if s in tensor.strides
-            ) or (
-                sym_dim in tensor.strides
-                and tensor.scales.get(sym_dim, 1) > 0
-                and active_dims == [sym_dim]
-                and tensor_advances_at_some_level
-            )
-            if tiled_on_split_dim:
-                raise Unsupported(
-                    f"Symbolic dim '{sym_dim_name}' is both split across "
-                    f"cores and tiled on the tensor at arg_index="
-                    f"{tensor.arg_index}; per-core symbolic addresses inside "
-                    "tiled loops are not supported."
-                )
         if tensor.arg_index >= 0:
             # Kernel tensors: register the raw base address first so bundle.py
             # can emit the input_arg function parameter.
@@ -1177,7 +963,6 @@ def generate_sdsc(
                             addr,
                             core0_addr,
                             sliced_base_sym_idx,
-                            symbolic_split,
                         )
             affine_strides.append([{} for _ in tiled_symbols])
         else:
@@ -1199,16 +984,12 @@ def generate_sdsc(
                     if tensor.arg_index < 0:
                         offset_as_symbol(addr, SymbolKind.pool())
                     elif addr != core0_addr:
-                        # Symbolic split on a non-tiled dim combined with
-                        # tiling on another dim still routes through the
-                        # helper; the split==tiled case is rejected above.
                         _register_per_core_derived(
                             tensor,
                             c,
                             addr,
                             core0_addr,
                             sliced_base_sym_idx,
-                            symbolic_split,
                         )
             affine_strides.append(per_level_strides)
 
@@ -1229,13 +1010,6 @@ def generate_sdsc(
             }
         nb = num_bytes(tensor.data_format)
         is_pool_tensor = tensor.arg_index < 0 and "hbm_pool" in tensor.allocation
-        # Recompute the symbolic-split status so c>0 cores resolve to the
-        # ("kernel_derived_symbolic", arg_index, core_idx) key the per-tensor
-        # loop registered.  Pure function of the tensor + work_slices, so this
-        # matches the registration decision exactly.
-        symbolic_split = _symbolic_split_info(
-            tensor, sdsc_spec.work_slices, symbolic_dims
-        )
         # Hoist kernel-tensor compile-time offsets so they are not
         # duplicated across the c==0 and c>0 branches.
         if not is_pool_tensor:
@@ -1271,10 +1045,6 @@ def generate_sdsc(
                 # Non-split tensor: all cores share core 0's address, so no
                 # derived symbol was registered, reuse the sliced-base key.
                 key = c0_slice_key
-            elif symbolic_split is not None:
-                # Symbolic-dim split: c>0 registered a kernel_derived_symbolic
-                # symbol keyed by (tensor, core).
-                key = ("kernel_derived_symbolic", tensor.arg_index, c)
             else:
                 # c>0 concrete per-core derived address (bare int key).
                 key = addr
@@ -1582,12 +1352,7 @@ def generate_sdsc(
                                             // sdsc_spec.work_slices[dim]
                                             for dim, size in sdsc_spec.iteration_space.items()
                                         },
-                                        # Per-dim symbolic bounds (per-core slice).
-                                        # min_val / work_slices is the granularity that
-                                        # the runtime must respect when choosing a batch size.
-                                        "symbolicDimInfo_": _per_core_symbolic_dim_info(
-                                            symbolic_dims, sdsc_spec.work_slices
-                                        ),
+                                        "symbolicDimInfo_": {},
                                         "maxSymbolicVolume_": {},
                                         "coreletSplit_": {},
                                         "rowSplit_": {},
@@ -1603,9 +1368,7 @@ def generate_sdsc(
                                             // sdsc_spec.work_slices[dim]
                                             for dim, size in sdsc_spec.iteration_space.items()
                                         },
-                                        "symbolicDimInfo_": _per_core_symbolic_dim_info(
-                                            symbolic_dims, sdsc_spec.work_slices
-                                        ),
+                                        "symbolicDimInfo_": {},
                                         "maxSymbolicVolume_": {},
                                         "coreletSplit_": {},
                                         "rowSplit_": {},
