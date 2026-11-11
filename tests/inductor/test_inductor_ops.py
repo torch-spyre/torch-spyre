@@ -14360,6 +14360,326 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=True,
         )
 
+    @staticmethod
+    def _scatter_rows_index(shape, dim, indices):
+        """An index that writes whole rows of ``shape`` along ``dim``."""
+        dim %= len(shape)
+        view = [-1 if d == dim else 1 for d in range(len(shape))]
+        target = [len(indices) if d == dim else n for d, n in enumerate(shape)]
+        return torch.tensor(indices).view(view).expand(target).contiguous()
+
+    def test_scatter_eager_rows(self):
+        """Eager scatter of whole rows runs on Spyre and matches CPU, #4401."""
+
+        def inplace(dim):
+            def fn(x, index, src):
+                x = x.clone()
+                result = x.scatter_(dim, index, src)
+                assert result.data_ptr() == x.data_ptr(), (
+                    "scatter_: return value is not the same tensor as self"
+                )
+                return result
+
+            return fn
+
+        def functional(dim):
+            return lambda x, index, src: torch.scatter(x, dim, index, src)
+
+        cases = {
+            "2d_dim0": ((67, 256), 0, [1, 3]),
+            "2d_dim-2": ((67, 256), -2, [3, 1]),
+            "3d_dim0": ((4, 8, 128), 0, [1, 3]),
+            "3d_dim1": ((4, 8, 128), 1, [1, 3]),
+            "4d_dim2": ((1, 8, 64, 128), 2, [7, 0, 63]),
+            "duplicates_last_wins": ((67, 256), 0, [3, 1, 3]),
+            # Along the stick dim, through a permute
+            "2d_stick": ((8, 64), 1, [1, 3]),
+            "2d_stick_dim-1": ((8, 64), -1, [3, 1]),
+            "3d_stick": ((4, 8, 128), 2, [1, 3]),
+            "stick_duplicates_last_wins": ((8, 64), 1, [3, 1, 3]),
+        }
+        for name, (shape, dim, indices) in cases.items():
+            index = self._scatter_rows_index(shape, dim, indices)
+            x = cached_randn(shape)
+            src = cached_randn(index.shape, differentiation="src")
+            for fn in (inplace(dim), functional(dim)):
+                with self.subTest(case=name):
+                    self.compare_with_cpu(
+                        fn, x, index, src, run_compile=False, run_eager=True
+                    )
+
+        with self.subTest(case="int32_index"):
+            self.compare_with_cpu(
+                inplace(0),
+                cached_randn((67, 256)),
+                self._scatter_rows_index((67, 256), 0, [1, 3]).to(torch.int32),
+                cached_randn((2, 256), differentiation="src"),
+                run_compile=False,
+                run_eager=True,
+            )
+
+    def test_scatter_eager_views_match_cpu(self):
+        """scatter_ on a view of whole rows matches CPU across the base, #4401.
+
+        Checks the in-place contract too: it returns the view, keeps its
+        pointers, and an alias of the view sees the write.
+        """
+        rows = self._scatter_rows_index
+        cases = {
+            "rows": ((8, 64), lambda t: t[2:6], 0, rows((4, 64), 0, [0, 2])),
+            "prefix_rows": ((8, 64), lambda t: t[:4], 0, rows((4, 64), 0, [0, 2])),
+            "3d_slab": ((4, 8, 64), lambda t: t[1], 0, rows((8, 64), 0, [0, 2])),
+            "3d_rows_dim1": (
+                (4, 8, 64),
+                lambda t: t[1:3],
+                1,
+                rows((2, 8, 64), 1, [1, 3]),
+            ),
+            "view_of_view": (
+                (8, 64),
+                lambda t: t[1:7][1:5],
+                0,
+                rows((4, 64), 0, [0, 2]),
+            ),
+            "whole": ((8, 64), lambda t: t, 0, rows((8, 64), 0, [1, 3])),
+            "stick_whole": ((8, 64), lambda t: t, 1, rows((8, 64), 1, [1, 3])),
+            "stick_rows": ((8, 64), lambda t: t[2:6], 1, rows((4, 64), 1, [1, 3])),
+            "short_rows": ((8, 3), lambda t: t[2:6], 0, rows((4, 3), 0, [0, 2])),
+            "stepped_rows": ((8, 64), lambda t: t[::2], 0, rows((4, 64), 0, [0, 2])),
+            "stepped_offset": ((8, 64), lambda t: t[1::3], 0, rows((3, 64), 0, [0, 2])),
+            "transposed": ((8, 64), lambda t: t.t(), 0, rows((64, 8), 0, [1, 3])),
+            "transposed_dim1": ((8, 64), lambda t: t.t(), 1, rows((64, 8), 1, [1, 3])),
+            "cols_stick": ((8, 64), lambda t: t[:, 1:3], 1, rows((8, 2), 1, [0, 1])),
+            "partial_rows": ((8, 128), lambda t: t[2:6], 0, rows((2, 64), 0, [0, 2])),
+        }
+        for dtype in (torch.float32, torch.float16, torch.bfloat16):
+            for name, (shape, select, dim, index) in cases.items():
+                with self.subTest(case=name, dtype=dtype):
+                    base = torch.arange(1, torch.Size(shape).numel() + 1) % 97 + 1
+                    base = base.reshape(shape).to(dtype)
+                    src = torch.full(index.shape, 250, dtype=dtype)
+                    expected = base.clone()
+                    select(expected).scatter_(dim, index, src)
+
+                    x = base.to("spyre")
+                    view = select(x)
+                    alias = select(x)
+                    base_ptr, view_ptr = x.data_ptr(), view.data_ptr()
+                    result = view.scatter_(dim, index.to("spyre"), src.to("spyre"))
+
+                    self.assertIs(result, view)
+                    self.assertEqual(x.data_ptr(), base_ptr)
+                    self.assertEqual(view.data_ptr(), view_ptr)
+                    torch.testing.assert_close(x.cpu(), expected, rtol=0.002, atol=0.5)
+                    torch.testing.assert_close(
+                        alias.cpu(), select(expected), rtol=0.002, atol=0.5
+                    )
+
+    def test_scatter_eager_no_device_temporary(self):
+        """A device scatter_ of rows adds no device copy of its target, #4401.
+
+        CPU scatter_ writes in place, so a target-sized temporary here is a
+        regression. The tensors are large so a copy stands out from small
+        allocations for the index.
+        """
+        x = torch.zeros(1024, 1024, dtype=torch.float32, device="spyre")
+        src = torch.ones(2, 1024, dtype=torch.float32, device="spyre")
+        index = self._scatter_rows_index((2, 1024), 0, [0, 2]).to("spyre")
+        cases = {"whole": x, "dim0_slice": x[256:512]}
+        for name, target in cases.items():
+            target.scatter_(0, index, src)  # build the kernel first
+            with self.subTest(case=name):
+                before = torch.accelerator.memory_allocated()
+                torch.accelerator.reset_peak_memory_stats()
+                target.scatter_(0, index, src)
+                peak = torch.accelerator.max_memory_allocated() - before
+                self.assertLess(peak, target.numel() * target.element_size() // 4)
+
+    def test_scatter_eager_out(self):
+        """scatter(..., out=) writes into ``out`` on Spyre and returns it, #4401."""
+
+        def fn(dst, index, src):
+            out = torch.empty_like(dst)
+            res = torch.scatter(dst, 0, index, src, out=out)
+            assert res.data_ptr() == out.data_ptr(), "out= result is not `out`"
+            return out
+
+        self.compare_with_cpu(
+            fn,
+            cached_randn((67, 256)),
+            self._scatter_rows_index((2, 256), 0, [1, 3]),
+            cached_randn((2, 256), differentiation="src"),
+            run_compile=False,
+            run_eager=True,
+        )
+
+    def test_scatter_eager_empty_index(self):
+        """An empty index writes nothing, like CPU, #4401."""
+        base = torch.ones(8, 64, dtype=torch.float32)
+        x = base.to("spyre")
+        empty = torch.empty(0, 64, dtype=torch.int64, device="spyre")
+        src = torch.empty(0, 64, dtype=torch.float32, device="spyre")
+        self.assertIs(x.scatter_(0, empty, src), x)
+        torch.testing.assert_close(x.cpu(), base)
+
+    def test_scatter_eager_partial_width(self):
+        """A row write that stops on a stick boundary keeps the rest, #4401."""
+        rows = self._scatter_rows_index
+        cases = {
+            "fp32_half": (torch.float32, (8, 64), 0, rows((2, 32), 0, [1, 3])),
+            "fp16_half": (torch.float16, (8, 128), 0, rows((2, 64), 0, [1, 3])),
+            "3d_dim1": (torch.float32, (4, 8, 64), 1, rows((4, 2, 32), 1, [1, 3])),
+            "duplicates": (torch.float32, (8, 64), 0, rows((3, 32), 0, [3, 1, 3])),
+        }
+        for name, (dtype, shape, dim, index) in cases.items():
+            x = cached_randn(shape).to(dtype)
+            src = cached_randn(index.shape, differentiation="src").to(dtype)
+            with self.subTest(case=name):
+                self.compare_with_cpu(
+                    functools.partial(
+                        lambda d, x, i, s: torch.scatter(x, d, i, s), dim
+                    ),
+                    x,
+                    index,
+                    src,
+                    run_compile=False,
+                    run_eager=True,
+                )
+
+    def test_scatter_eager_stick_dim_blocks(self):
+        """A stick-dim scatter done in row blocks matches CPU, #4401."""
+        for shape in ((131, 64), (600, 64)):
+            index = self._scatter_rows_index(shape, 1, [1, 3, 1])
+            x = cached_randn(shape)
+            src = cached_randn(index.shape, differentiation="src")
+            with self.subTest(shape=shape):
+                self.compare_with_cpu(
+                    lambda x, index, src: torch.scatter(x, 1, index, src),
+                    x,
+                    index,
+                    src,
+                    run_compile=False,
+                    run_eager=True,
+                )
+
+    def test_scatter_eager_stick_dim_low_device_memory(self):
+        """Stick-dim blocks keep the device temporaries well under the tensor."""
+        x = torch.zeros(1024, 1024, dtype=torch.float32, device="spyre")
+        src = torch.ones(1024, 32, dtype=torch.float32, device="spyre")
+        index = self._scatter_rows_index((1024, 32), 1, list(range(32))).to("spyre")
+        x.scatter_(1, index, src)  # build the kernels first
+        before = torch.accelerator.memory_allocated()
+        torch.accelerator.reset_peak_memory_stats()
+        x.scatter_(1, index, src)
+        peak = torch.accelerator.max_memory_allocated() - before
+        self.assertLess(peak, x.numel() * x.element_size() // 4)
+
+    def test_scatter_eager_dtypes(self):
+        """Integer and bool scatters are exact, #4401."""
+        rows = self._scatter_rows_index
+        cases = {
+            "int64_rows": (torch.int64, 0, rows((2, 64), 0, [1, 3])),
+            "int64_stick": (torch.int64, 1, rows((8, 64), 1, [1, 3])),
+            "bool_rows": (torch.bool, 0, rows((2, 64), 0, [1, 3])),
+        }
+        for name, (dtype, dim, index) in cases.items():
+            with self.subTest(case=name):
+                base = (torch.arange(512) % 3).reshape(8, 64).to(dtype)
+                src = (torch.arange(index.numel()) % 5 + 1).reshape(index.shape)
+                src = src.to(dtype)
+                expected = base.scatter(dim, index, src)
+                got = base.to("spyre").scatter_(dim, index.to("spyre"), src.to("spyre"))
+                self.assertTrue(torch.equal(got.cpu(), expected))
+
+    def test_scatter_eager_src_views_and_larger_src(self):
+        """Scatter reads only the part of ``src`` that ``index`` covers, #4401."""
+        index = self._scatter_rows_index((2, 64), 0, [1, 3])
+        big = torch.rand(8, 64) + 5
+        cases = {
+            "more_rows": lambda t: t,
+            "offset_view": lambda t: t[3:5],
+            "stepped_view": lambda t: t[::2],
+        }
+        for name, select in cases.items():
+            with self.subTest(case=name):
+                base = torch.zeros(8, 64)
+                expected = base.scatter(0, index, select(big))
+                got = base.to("spyre").scatter_(
+                    0, index.to("spyre"), select(big.to("spyre"))
+                )
+                torch.testing.assert_close(got.cpu(), expected)
+
+    @expects_raise
+    def test_scatter_eager_bool_stick_dim_raises(self):
+        """Bool along the stick dim raises: the device permute corrupts it, #4401.
+
+        TODO: a missing feature. Once a bool permute is correct on the device,
+        this must become a positive test.
+        """
+        base = (torch.arange(512) % 3 == 0).reshape(8, 64)
+        index = self._scatter_rows_index((8, 64), 1, [1, 3])
+        x = base.to("spyre")
+        src = torch.ones(8, 2, dtype=torch.bool, device="spyre")
+        with pytest.raises(Unsupported, match="bool"):
+            x.scatter_(1, index.to("spyre"), src)
+        self.assertTrue(torch.equal(x.cpu(), base))
+
+    @expects_raise
+    def test_scatter_eager_unsupported_raises(self):
+        """A scatter Spyre cannot express raises and leaves its target alone, #4401.
+
+        TODO: a missing feature. The 1-D and element-level cases fail in the
+        backend scheduler (#4399, #4409); when they compile they must become
+        positive tests, and views need a device write that stays inside them.
+        """
+        rows = self._scatter_rows_index
+        cases = {
+            # The reproducer from #4401
+            "1d": ((5,), lambda t: t, torch.tensor([1, 3]), "whole rows"),
+            "element_level": (
+                (8, 64),
+                lambda t: t,
+                torch.tensor([[1] * 63 + [2], [3] * 64]),
+                "whole rows",
+            ),
+            "partial_width": (
+                (8, 64),
+                lambda t: t,
+                rows((2, 10), 0, [1, 3]),
+                "whole rows",
+            ),
+            "cols": ((8, 64), lambda t: t[:, 1:3], rows((8, 2), 0, [1, 3]), "view"),
+        }
+        for name, (shape, select, index, match) in cases.items():
+            with self.subTest(case=name):
+                base = torch.arange(1.0, torch.Size(shape).numel() + 1).reshape(shape)
+                x = base.to("spyre")
+                src = torch.ones(index.shape, device="spyre")
+                with pytest.raises(Unsupported, match=match):
+                    select(x).scatter_(0, index.to("spyre"), src)
+                torch.testing.assert_close(x.cpu(), base)
+
+    @expects_raise
+    def test_scatter_eager_invalid_index_raises(self):
+        """A bad index is rejected, never written to the device, #4401."""
+        x = torch.zeros(8, 64, dtype=torch.float32, device="spyre")
+        src = torch.ones(2, 64, dtype=torch.float32, device="spyre")
+        for name, bad in {"too_large": 8, "negative": -1}.items():
+            with self.subTest(case=name):
+                index = torch.tensor([1, bad]).unsqueeze(1).expand(2, 64)
+                with pytest.raises(RuntimeError, match="out of bounds"):
+                    x.scatter_(0, index.contiguous().to("spyre"), src)
+
+    @expects_raise
+    def test_scatter_eager_bad_operands_raise(self):
+        """Bad operands raise the same errors as CPU, #4401."""
+        x = torch.zeros(8, 64, dtype=torch.float32, device="spyre")
+        index = torch.zeros(2, 64, dtype=torch.int64, device="spyre")
+        with pytest.raises(RuntimeError, match="dtype"):
+            x.scatter_(0, index, torch.ones(2, 64, dtype=torch.float16, device="spyre"))
+        with pytest.raises(RuntimeError, match="dim"):
+            x.scatter_(0, index, torch.ones(2, 1, 64, device="spyre"))
+
     def test_repeat_cpu(self, op, x, repeats):
         shape = x.repeat(*repeats).shape
         self.compare_with_cpu(lambda a: op(a, repeats, shape), x)

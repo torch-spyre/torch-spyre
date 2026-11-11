@@ -745,6 +745,192 @@ def spyre__zero_(self: torch.Tensor) -> torch.Tensor:
     return self
 
 
+def _scatter_rows(self, dim, index):
+    """Bounds-check ``index`` on the host, as CPU does, and return its rows.
+
+    Spyre cannot run a general scatter (#4399, #4409), but one whose index is
+    the same along every dim but ``dim`` writes whole rows, i.e. index_copy.
+    """
+    from torch_spyre._inductor.errors import Unsupported
+
+    n = self.dim()
+    dim %= max(n, 1)
+    size = self.size(dim) if n else 1
+    index = index.cpu()
+    bad = index[(index < 0) | (index >= size)]
+    if bad.numel():
+        raise RuntimeError(
+            f"index {bad[0].item()} is out of bounds for dimension {dim} "
+            f"with size {size}"
+        )
+    # Every other dim is whole, but a row may stop on a stick (128-byte) boundary.
+    whole = n >= 2 and all(
+        d == dim
+        or index.size(d) == self.size(d)
+        or (d == n - 1 and index.size(d) * self.element_size() % 128 == 0)
+        for d in range(n)
+    )
+    if whole:
+        row = index[tuple(slice(None) if d == dim else 0 for d in range(n))]
+        whole = bool(
+            (index == row.view([-1 if d == dim else 1 for d in range(n)])).all()
+        )
+    if not whole:
+        raise Unsupported(
+            "scatter that does not write whole rows: index must be uniform "
+            f"across every dimension but {dim} and at least 2-D (#4399, #4409)"
+        )
+    return dim, row.to(torch.int64)
+
+
+def _can_scatter_on_device(t):
+    """Whether compiled index_copy can write ``t``: not a view, or whole rows."""
+    base = t._base
+    if base is None:
+        return True
+    if not (
+        t.dim() >= 1
+        and t.is_contiguous()
+        and base.is_contiguous()
+        and t.size(-1) == base.size(-1)
+    ):
+        return False
+    # An offset view goes through d2d copy_, which needs whole sticks and no bool.
+    return t.storage_offset() == 0 or (
+        t.size(-1) * t.element_size() % 128 == 0 and t.dtype != torch.bool
+    )
+
+
+def _device_target(out, dim, row, whole_width):
+    """Return ``(target, dim, row, swapped, write_back)`` for a write into ``out``.
+
+    A view whose rows or columns are its base's is written through the base, so
+    no temporary is needed. ``swapped`` means ``target`` is ``out`` transposed,
+    ``write_back`` that it is a clone to copy into ``out``. ``target`` is
+    ``None`` if no route reaches ``out``.
+    """
+    base, offset = out._base, out.storage_offset()
+    if base is None or (
+        offset == 0 and out.shape == base.shape and out.stride() == base.stride()
+    ):
+        return out, dim, row, False, False
+    if out.dim() == base.dim():
+        last = out.dim() - 1
+        if (
+            dim == 0
+            and out.shape[1:] == base.shape[1:]
+            and out.stride()[1:] == base.stride()[1:]
+            and offset % base.stride(0) == 0
+            and out.stride(0) % base.stride(0) == 0
+        ):
+            first, step = offset // base.stride(0), out.stride(0) // base.stride(0)
+            return base, 0, first + row * step, False, False
+        if (
+            dim == last
+            and out.shape[:-1] == base.shape[:-1]
+            and out.stride()[:-1] == base.stride()[:-1]
+            and out.stride(-1) == 1
+            and offset < base.size(-1)
+        ):
+            return base, last, row + offset, False, False
+        if (
+            out.dim() == 2
+            and whole_width
+            and offset == 0
+            and out.shape == base.shape[::-1]
+            and out.stride() == base.stride()[::-1]
+        ):
+            return base, 1 - dim, row, True, False
+    if not _can_scatter_on_device(out):
+        return None, dim, row, False, False
+    if offset == 0:
+        return out, dim, row, False, False
+    # A compiled kernel drops a storage offset, so work on an offset-0 clone.
+    return out.clone(), dim, row, False, True
+
+
+def _along_stick_dim(t, src, write):
+    """Run ``write(t, src)`` with the stick dim moved first (#4404).
+
+    A large ``t`` goes a block of rows at a time, so the device copy that
+    each permute needs is a block and not the tensor.
+    """
+    last = t.dim() - 1
+    front, back = (last, *range(last)), (*range(1, last + 1), 0)
+
+    def run(block, part):
+        moved = block.permute(front).clone(memory_format=torch.contiguous_format)
+        write(moved, part.permute(front).clone(memory_format=torch.contiguous_format))
+        return moved.permute(back)
+
+    rows = t.size(0)
+    step = max(64, rows // 32)
+    # A block needs at least 2 rows, and whole sticks for d2d copy_.
+    if rows < 2 * step or t[0].numel() * t.element_size() % 128:
+        t.copy_(run(t, src))
+        return
+    stops = [*range(step, rows - step + 1, step), rows]
+    for start, stop in zip((0, *stops), stops):
+        block = t[start:stop]
+        block.copy_(run(block.clone(), src[start:stop].clone()))
+
+
+@torch.library.register_kernel("aten::scatter.src_out", ["spyre"])  # type:ignore
+def spyre__scatter_src_out(self, dim, index, src, *, out):
+    """Whole-row scatter on Spyre through index_copy; others raise, #4401.
+
+    This also serves ``scatter`` and ``scatter_``.
+    """
+    from torch_spyre._inductor.errors import Unsupported
+
+    _check_same_device([(out, True), (self, False), (index, False), (src, False)])
+    if index.numel() == 0:
+        return out if out is self else out.copy_(self)
+    dim, row = _scatter_rows(self, dim, index)
+    # scatter reads only the part of src that index covers.
+    src = src[tuple(slice(0, n) for n in index.shape)]
+    # CPU keeps the last write to a repeated row: keep that src row only.
+    keep = None
+    unique, inverse = row.unique(return_inverse=True)
+    if unique.numel() < row.numel():
+        keep = torch.zeros_like(unique).scatter_(0, inverse, torch.arange(row.numel()))
+        row = unique
+
+    if out is not self:
+        if not (_can_scatter_on_device(self) and _can_scatter_on_device(out)):
+            raise Unsupported(
+                "scatter out= with a view that is not a run of whole rows"
+            )
+        out.copy_(self)
+    whole_width = dim == out.dim() - 1 or index.size(-1) == out.size(-1)
+    target, dim, row, swapped, write_back = _device_target(out, dim, row, whole_width)
+    if target is None:
+        raise Unsupported("scatter into a view that is not a run of whole rows")
+    if swapped:
+        src = src.permute(1, 0).clone(memory_format=torch.contiguous_format)
+
+    def write(t, dim, part):
+        picked = row.to(t.device)
+        if keep is not None:
+            part = part.index_select(dim, keep.to(t.device))
+        rest = t.size(-1) - part.size(-1)
+        if rest:  # A row that stops short keeps the rest of its old values.
+            old = t.index_select(dim, picked).narrow(-1, part.size(-1), rest)
+            part = torch.cat([part, old], dim=-1)
+        torch.index_copy(t, dim, picked, part, out=t)
+
+    if dim == target.dim() - 1:
+        if target.dtype == torch.bool:
+            # The device permute returns wrong values for bool.
+            raise Unsupported("scatter of bool along the last (stick) dimension")
+        _along_stick_dim(target, src, lambda t, part: write(t, 0, part))
+    else:
+        write(target, dim, src)
+    if write_back:
+        out.copy_(target)
+    return out
+
+
 @torch.library.register_kernel("aten::uniform_", "spyre")  # type:ignore
 def spyre__uniform_(self, from_=0.0, to=1.0, generator=None):
     # Create a new tensor on cpu
