@@ -108,6 +108,53 @@ jobs:
         uses: ./.github/actions/detect-integration-test-label
 
   # ---------------------------------------------------------------------------
+  # Job 1b: signed-commits
+  #
+  # Fails fast when a PR commit is not signed+verified: main's ruleset rejects
+  # such a PR anyway, and re-signing rewrites every SHA and re-runs the whole
+  # matrix, so the Spyre runs before the fix are wasted. PR-only: merge_group and
+  # push commits are signed by GitHub. Fails OPEN whenever the answer is
+  # inconclusive (API error, GitHub's verifier down, PR past the endpoint's
+  # 250-commit cap) -- the ruleset still enforces signatures at merge.
+  # ---------------------------------------------------------------------------
+  signed-commits:
+    name: Check commits are signed
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check commit signatures
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          NUM_COMMITS: ${{ github.event.pull_request.commits }}
+        run: |
+          set -uo pipefail
+          if [ "$NUM_COMMITS" -gt 250 ]; then
+            echo "::warning::PR has ${NUM_COMMITS} commits, more than the API lists -- skipping the signature check"
+            exit 0
+          fi
+          if ! unverified=$(gh api --paginate "repos/${REPO}/pulls/${PR}/commits" \
+                 --jq '.[] | select(.commit.verification.verified | not) | "\(.sha[:12]) \(.commit.verification.reason)"'); then
+            echo "::warning::could not list PR commits -- skipping the signature check"
+            exit 0
+          fi
+          # gpgverify_error/unavailable mean GitHub's verifier failed, not the signature.
+          unsigned=$(grep -Ev ' gpgverify_(error|unavailable)$' <<<"$unverified")
+          if [ -n "$unsigned" ]; then
+            echo "::error::unsigned or unverified commits (main requires signed commits):"
+            echo "$unsigned"
+            echo "Re-sign with 'git commit --amend -s -S --no-edit' (or 'git rebase -S') and force-push."
+            exit 1
+          fi
+          if [ -n "$unverified" ]; then
+            echo "::warning::GitHub could not verify some signatures right now -- not blocking:"
+            echo "$unverified"
+            exit 0
+          fi
+          echo "all PR commits are signed and verified"
+
+  # ---------------------------------------------------------------------------
   # Job 2: delegate to the shared test matrix
   #
   # Only runs when `changes.code_changed == 'true'`. For docs-only PRs the
@@ -120,7 +167,7 @@ jobs:
   # 815 GHA check-runs / ~21 h of runner time re-testing what the PR just passed.
   # ---------------------------------------------------------------------------
   run-tests:
-    needs: changes
+    needs: [changes, signed-commits]
     # Also skipped once auto_merge is enabled on the PR, and for every merge-queue run -- native GHA checks aren't required there; the gate below still reports green since "skipped" isn't a failure.
     if: |
       needs.changes.outputs.code_changed == 'true' &&
@@ -168,6 +215,9 @@ jobs:
   #   run-tests result = skipped -> docs-only PR, no tests -> green (instant)
   #   run-tests result = failure -> one or more suites bad -> red   (blocks merge)
   #
+  # An unsigned commit also turns it red: signed-commits failing leaves run-tests
+  # "skipped", which would otherwise read as a docs-only green.
+  #
   # This job must ALWAYS run, including for an `integration-test`-labeled commit:
   # it is a REQUIRED check, and a required check that is skipped is reported as
   # MISSING rather than green, which blocks the merge queue outright. So when the
@@ -177,13 +227,19 @@ jobs:
   run-spyre-unit-tests:
     name: Run Spyre unit tests
     runs-on: ubuntu-latest
-    needs: [changes, run-tests]
+    needs: [changes, signed-commits, run-tests]
     if: always()
     steps:
       - name: Evaluate test results
         run: |-
           RESULT="${{ needs.run-tests.result }}"
           echo "run-tests result: ${RESULT}"
+
+          SIGNED="${{ needs.signed-commits.result }}"
+          if [[ "${SIGNED}" == "failure" || "${SIGNED}" == "cancelled" ]]; then
+            echo "Commit signature check ${SIGNED} -- see 'Check commits are signed'."
+            exit 1
+          fi
 
           if [[ "${{ needs.changes.outputs.integration_labeled }}" == "true" ]]; then
             echo "integration-test label set -- the Jenkins integration run owns this"
