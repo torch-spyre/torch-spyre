@@ -2904,6 +2904,61 @@ def test_size1_restore_asserts_when_phantom_absent():
         _restickify_restore_elided_dim(op_spec)
 
 
+def _sum_plus_dense(rows):
+    """``x.sum(-1) + y[64, rows]``: ``x.sum(-1)`` is sparse (one value per stick),
+    so ``y`` is restickified from it to dense: a size-1 restickify whose target
+    needs exactly one size-64 gap dim; a second multiplied the allocation and the
+    sweep by 64 (#6105).
+    Exact: the values are small integers, sums stay under 1024.
+    """
+    x = ((torch.arange(rows * 64) * 7 + 3) % 5 - 2).to(torch.float16).reshape(rows, 64)
+    y = ((torch.arange(64 * rows) * 3 + 1) % 257).to(torch.float16).reshape(64, rows)
+    return (lambda a, b: a.sum(-1) + b), x, y
+
+
+def _restickify_output_sizes(fn, *args):
+    """Run ``fn`` compiled and return (CPU result, the device size of every
+    size-1 restickify's output after the padding pass)."""
+    import torch_spyre._inductor.padding as _padding
+    import torch_spyre._inductor.passes as _passes
+
+    sizes = []
+    pad = _padding.insert_restickify_padding
+
+    def capturing_pad(graph):
+        pad(graph)
+        for op in graph.operations:
+            if _padding.is_restickify_op(op, graph):
+                sizes.append(list(op.get_layout().device_layout.device_size))
+
+    init = _passes.CustomPreSchedulingPasses.__init__
+
+    def patched_init(self, *a, **k):
+        init(self, *a, **k)
+        self.passes = [capturing_pad if p is pad else p for p in self.passes]
+
+    with patch.object(_passes.CustomPreSchedulingPasses, "__init__", patched_init):
+        result = _compile_and_run(fn, args, DEVICE)
+    return result, sizes
+
+
+def test_sparse_to_dense_restickify_has_one_size64_dim():
+    fn, x, y = _sum_plus_dense(256)
+    result, sizes = _restickify_output_sizes(fn, x, y)
+    torch.testing.assert_close(result, fn(x, y), atol=0, rtol=0)
+    # One gap dim: [64, 4, 64], not [64, 64, 4, 64].
+    assert sizes == [[64, 4, 64]]
+
+
+@pytest.mark.parametrize("rows", [65536, 524288], ids=["8MiB", "64MiB"])
+def test_sparse_to_dense_restickify_above_4mib(rows):
+    # With two gap dims each core swept 64 x 64 x rows / 64 sticks, over the
+    # backend's 256 MiB address offset once the sparse data passed 4 MiB.
+    fn, x, y = _sum_plus_dense(rows)
+    result = _compile_and_run(fn, (x, y), DEVICE)
+    torch.testing.assert_close(result, fn(x, y), atol=0, rtol=0)
+
+
 def test_round_up_to_stick_geometry():
     """round_up_to_stick underlies the input-padding gate's read-window arithmetic
     (padded_dim_size = slice_offset + round_up_to_stick(extent)).  The gate itself
