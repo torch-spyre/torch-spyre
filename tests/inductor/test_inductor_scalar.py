@@ -416,13 +416,16 @@ class TestSdpaScalarHyperparameters:
             run_eager=(execution_mode == "eager"),
         )
 
-    def test_sdpa_causal_triu_mask_neg_inf(self, request, execution_mode):
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.float32], ids=str)
+    def test_sdpa_causal_triu_mask_neg_inf(self, request, execution_mode, dtype):
         """SDPA: causal mask via ``triu`` + ``masked_fill(..., -inf)``."""
-        if execution_mode == "eager":
+        if dtype == torch.float32:
+            # fp32 scores need the host-bool mask cast to fp32, which yields a
+            # staggered EA that is refused as mixed EA, pending #5495.
             strict_xfail(
                 request,
-                NotImplementedError,
-                "aten::masked_fill_.Scalar has no Spyre kernel (#4356)",
+                (torch._inductor.exc.InductorError, NotImplementedError),
+                "fp32 masked_fill mask refused as mixed EA, pending #5495",
             )
 
         def causal_attention(q, k, v):
@@ -438,9 +441,9 @@ class TestSdpaScalarHyperparameters:
             attn = torch.softmax(scores, dim=-1)
             return torch.matmul(attn, v)
 
-        q = cached_randn((2, 8, 128, 64), dtype=torch.float16)
-        k = cached_randn((2, 8, 128, 64), dtype=torch.float16, differentiation=1)
-        v = cached_randn((2, 8, 128, 64), dtype=torch.float16, differentiation=2)
+        q = cached_randn((2, 8, 128, 64), dtype=dtype)
+        k = cached_randn((2, 8, 128, 64), dtype=dtype, differentiation=1)
+        v = cached_randn((2, 8, 128, 64), dtype=dtype, differentiation=2)
         compare_with_cpu(
             causal_attention,
             q,
