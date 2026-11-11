@@ -3739,11 +3739,17 @@ class KtirBuilder:
         # the operand has to be moved is ``needs_relayout``'s question, asked of
         # every pointwise op's inputs.  The arm claims fp16 and fp32, the formats
         # a copy has been run at, so any other format has no arm.
+        #
+        # The payload is ``spyreop.identity``, not a body that only yields its
+        # input.  Canonicalization erases a ``linalg.generic`` that only yields
+        # its input, which leaves a load feeding a store with no compute op
+        # between them.  ``spyreop.identity`` has no folder, so the generic and
+        # its compute op survive.
         RESTICKIFY_OP: Recipe(
             arity=1,
             arms=Arm(
                 kind=BindingKind.PAYLOAD,
-                binding=_written_here(lambda x: x),
+                binding=lambda: spyreop.identity,
                 dtypes=(DataFormats.SEN169_FP16, DataFormats.IEEE_FP32),
             ),
         ),
@@ -3751,7 +3757,7 @@ class KtirBuilder:
             arity=1,
             arms=Arm(
                 kind=BindingKind.PAYLOAD,
-                binding=_written_here(lambda x: x),
+                binding=lambda: spyreop.identity,
                 dtypes=(DataFormats.SEN169_FP16, DataFormats.IEEE_FP32),
             ),
         ),

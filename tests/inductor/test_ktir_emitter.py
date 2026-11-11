@@ -122,7 +122,8 @@ class TestKtirRestickify(unittest.TestCase):
 
     The transpose lives in the input view alone -- its type is
     ``strided<[4096, 4096, 1, 64]>`` -- while the output view is plain row-major
-    and the compute is an identity ``linalg.generic``.  Verified on device.
+    and the compute is a ``linalg.generic`` whose body is ``spyreop.identity``,
+    so canonicalization cannot erase it as a no-op.
 
     Rank 4 (``n + 2`` for n = 2 loop symbols), although both sticks are a single
     stick: the output's bare ``c0`` axis is split into the loops ``(1, 64)``
@@ -142,7 +143,8 @@ module {
     %3 = tensor.empty() : tensor<1x1x64x64xf16>
     %4 = linalg.generic {indexing_maps = [#map, #map], iterator_types = ["parallel", "parallel", "parallel", "parallel"]} ins(%2 : tensor<1x1x64x64xf16>) outs(%3 : tensor<1x1x64x64xf16>) {
     ^bb0(%in: f16, %out: f16):
-      linalg.yield %in : f16
+      %7 = spyreop.identity %in : f16
+      linalg.yield %7 : f16
     } -> tensor<1x1x64x64xf16>
     %5 = ktdp.construct_memory_view %arg1, sizes: [1, 1, 64, 64], strides: [4096, 4096, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<1x1x64x64xf16>
     %6 = ktdp.construct_access_tile %5[%c0, %c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<1x1x64x64xf16> -> !ktdp.access_tile<1x1x64x64xindex>
