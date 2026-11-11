@@ -2485,6 +2485,7 @@ def compute_restickify_target_layout(
     _new_stride_from_dep = (
         concretize_expr(_new_stride_coeff) if _new_stride_coeff is not None else None
     )
+    _new_stride_from_host = host_stride[_new_host_dims[-1]] if _new_host_dims else None
     _old_stride_coeff = (
         sympy.expand(arg.dep.index).coeff(old_var)
         if arg is not None and old_var is not None
@@ -2493,20 +2494,23 @@ def compute_restickify_target_layout(
     _old_stride_from_dep = (
         concretize_expr(_old_stride_coeff) if _old_stride_coeff is not None else None
     )
+    _old_stride_from_host = host_stride[_old_host_dims[-1]] if _old_host_dims else None
     _diag = (
         f"new_var={new_var!r} old_var={old_var!r} "
         f"new_sd_host_size={new_sd_host_size!r} new_sd_host_stride={new_sd_host_stride!r} "
         f"old_sd_host_size={old_sd_host_size!r} old_sd_host_stride={old_sd_host_stride!r} "
         f"new_host_dims={_new_host_dims!r} new_size_from_host={_new_size_from_host!r} "
         f"new_stride_coeff={_new_stride_coeff!r} new_stride_from_dep={_new_stride_from_dep!r} "
+        f"new_stride_from_host={_new_stride_from_host!r} "
         f"old_host_dims={_old_host_dims!r} old_size_from_host={_old_size_from_host!r} "
         f"old_stride_coeff={_old_stride_coeff!r} old_stride_from_dep={_old_stride_from_dep!r} "
+        f"old_stride_from_host={_old_stride_from_host!r} "
         f"ic={ic!r} host_size={host_size!r} host_stride={host_stride!r} "
         f"dep_index={arg.dep.index if arg is not None else None!r} "
         f"dep_ranges={dict(arg.dep.ranges) if arg is not None else None!r}"
     )
     assert _new_size_from_host == new_sd_host_size, f"new-side size mismatch: {_diag}"
-    assert _new_stride_from_dep == new_sd_host_stride, (
+    assert _new_stride_from_host == new_sd_host_stride, (
         f"new-side stride mismatch: {_diag}"
     )
     # old_var is None when old stick is a constant (size-1 contraction dim);
@@ -2515,7 +2519,7 @@ def compute_restickify_target_layout(
         assert _old_size_from_host == old_sd_host_size, (
             f"old-side size mismatch: {_diag}"
         )
-        assert _old_stride_from_dep == old_sd_host_stride, (
+        assert _old_stride_from_host == old_sd_host_stride, (
             f"old-side stride mismatch: {_diag}"
         )
     device_size = restickify_device_size(
