@@ -628,6 +628,8 @@ at::Tensor spyre_reducescatter_run_impl(const at::Tensor& input,
   // [group_size, ceil(B/stick), A, stick] and each slab is exactly the default
   // device image of an (A, B) tensor. Reject anything else: a different layout
   // scatters the wrong elements without any error from spyre-comms.
+  // Same condition as ReduceScatterKernel.codegen (_inductor/ir.py); keep the
+  // two in sync.
   TORCH_CHECK(input.dim() == 3 && input.size(1) == group_size,
               "reduce_scatter: expected a staged (A, group_size, B) input, got "
               "sizes ",

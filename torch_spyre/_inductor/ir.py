@@ -710,7 +710,10 @@ class ReduceScatterKernel(SpyreCollectiveKernel):
 
         The upstream ``create_out_of_place`` derives the output from the
         ``reduce_scatter_tensor`` meta (``size(0) // g``), which does not hold
-        for the staged shape.
+        for the staged shape.  Building the node directly is safe because the
+        output is a plain fresh buffer: it aliases no input and mutates
+        nothing, so there are no ``MutationOutput`` or alias annotations for
+        the factory to set up.
         """
         layout = FixedLayout(
             staged.get_device(),
@@ -730,6 +733,8 @@ class ReduceScatterKernel(SpyreCollectiveKernel):
     def codegen(self, wrapper: PythonWrapperCodegen) -> None:
         _, group_size, _ = self.constant_args
         input_layout = _collective_input_layout(self.inputs[0])
+        # Same condition as the run-time check in spyre_reducescatter_run_impl
+        # (spyre_distributed.cpp); keep the two in sync.
         a_dim, g, b_dim = (int(s) for s in input_layout.size)
         expected = SpyreTensorLayout([a_dim, g, b_dim], input_layout.dtype)
         if (

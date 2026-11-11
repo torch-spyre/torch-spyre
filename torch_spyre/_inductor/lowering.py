@@ -3244,6 +3244,10 @@ def _reduce_scatter(tensor, reduce_op, group_size, group_name):
     ``(size(0) // g, *size[1:])``.  ``ReduceScatterKernel.codegen`` checks the
     committed layout, so a different one raises instead of scattering wrong
     elements.
+
+    The staging copy is needed only because spyre-comms splits a flat buffer;
+    it can go once spyre-comms offers a strided or per-rank-list
+    reduce-scatter.
     """
     sizes = [V.graph.sizevars.guard_int(s) for s in tensor.get_size()]
     if not sizes:
@@ -3257,8 +3261,11 @@ def _reduce_scatter(tensor, reduce_op, group_size, group_name):
     stick_dim = out_sizes[-1]
     a_dim = math.prod(out_sizes) // stick_dim
     if len(sizes) == 1 and stick_dim % get_elem_in_stick(tensor.get_dtype()) != 0:
-        # A 1-D chunk is the stick dim itself; (1, g, B) only lays out with
-        # g outermost when B fills whole sticks.
+        # The staged (1, g, B) layout itself is fine (e.g. (1, 2, 50) ->
+        # [2, 1, 1, 64], one padded stick per rank).  The limit is the staging
+        # clone: it splits the 1-D input's stick dim at a non-stick boundary,
+        # and the stick index 50*d0 + d1 is not a supported stick expression.
+        # TODO: support by padding each rank's chunk to whole sticks.
         raise Unsupported(
             f"reduce_scatter: 1-D per-rank chunk ({stick_dim}) must be a "
             f"multiple of the stick size "

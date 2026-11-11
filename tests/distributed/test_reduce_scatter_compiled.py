@@ -461,13 +461,14 @@ class TestReduceScatterCompiled(TestCase):
         [32, 100],
         name_fn=lambda n: f"{n}_per_rank",
     )
-    def test_reduce_scatter_plan_sub_stick_raises(self, elems_per_rank):
-        """reducescatter_plan rejects sub-stick slabs before calling spyre-comms.
+    def test_reduce_scatter_plan_partial_stick_raises(self, elems_per_rank):
+        """reducescatter_plan rejects slabs that are not whole sticks.
 
-        This is the call that crashed: spyre-comms finds no algorithm for a
-        split below one 128-byte stick and terminates the process from inside
-        plan creation (DT_ERROR, no Python exception). The plan op must raise
-        first. If this check regresses the test cannot fail cleanly -- every
+        32 per rank is below one stick; 100 per rank is above one but not a
+        multiple. This is the call that crashed: spyre-comms finds no
+        algorithm for a split that is not whole 128-byte sticks and terminates
+        the process from inside plan creation (DT_ERROR, no Python exception).
+        The plan op must raise first. If this check regresses the test cannot fail cleanly -- every
         rank exits -- which still fails the run.
         """
         from torch_spyre._inductor.ir import _dtype_to_int
@@ -488,6 +489,8 @@ class TestReduceScatterCompiled(TestCase):
 
         An unstaged (128, 128) input was the wrong-data path: spyre-comms gave
         each rank a column-stick block instead of its rows, with no error.
+        This reaches the shape check (dim() == 3, size(1) == group_size); the
+        layout branch is covered by the test below.
         """
         from torch_spyre._inductor.ir import _dtype_to_int
 
@@ -503,6 +506,37 @@ class TestReduceScatterCompiled(TestCase):
             _GROUP_NAME,
         )
         with pytest.raises(RuntimeError, match="expected a staged"):
+            torch.ops.spyre.reducescatter_run(x, plan, self.comm_size)
+
+    @expects_raise
+    def test_reduce_scatter_run_staged_shape_wrong_layout_raises(self):
+        """reducescatter_run rejects an (A, g, B) input with g not outermost.
+
+        The shape matches the staged contract, but the device layout uses
+        dim_order [1, 0, 2]: [A, ceil(B/stick), g, stick] instead of the
+        default [g, ceil(B/stick), A, stick]. Its contiguous 1/g slabs would
+        not be the per-rank chunks, so the run-time layout check must reject it.
+        """
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.ir import _dtype_to_int
+
+        a_dim, b_dim = 64, 128
+        size = [a_dim, self.comm_size, b_dim]
+        stride = [self.comm_size * b_dim, b_dim, 1]
+        stl = SpyreTensorLayout(size, stride, torch.float16, [1, 0, 2])
+        default_stl = SpyreTensorLayout(size, torch.float16)
+        self.assertNotEqual(stl, default_stl)
+        self.assertNotEqual(stl.device_size[0], self.comm_size)
+
+        x = torch.empty(size, device_layout=stl, dtype=torch.float16, device=DEVICE)
+        plan = torch.ops.spyre.reducescatter_plan(
+            a_dim * self.comm_size * b_dim,
+            _dtype_to_int(torch.float16),
+            self.comm_size,
+            "sum",
+            _GROUP_NAME,
+        )
+        with pytest.raises(RuntimeError, match="group dim outermost"):
             torch.ops.spyre.reducescatter_run(x, plan, self.comm_size)
 
 
