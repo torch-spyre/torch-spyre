@@ -28,7 +28,7 @@ import os
 import regex as re
 from typing import Any
 
-from .sidecars import KINDS, SIDECAR_FILES, is_sidecar  # noqa: F401
+from .offline import is_sidecar  # noqa: F401
 
 log = logging.getLogger(__name__)
 
@@ -51,7 +51,7 @@ def _load(results_dir: str, test_name: str, kind: str) -> dict[str, Any]:
         try:
             with open(path) as f:
                 data = json.load(f)
-        except (OSError, ValueError):
+        except (OSError, ValueError, RecursionError):
             log.warning("Unreadable %s — skipped", name)
             return {}
         return data if isinstance(data, dict) else {}
@@ -163,7 +163,14 @@ def props_for(results_dir: str, test_name: str) -> dict[str, str]:
         got: dict[str, str] = {}
         try:
             reader(data, got)
-        except (TypeError, ValueError, OverflowError, AttributeError):
+        except (
+            TypeError,
+            ValueError,
+            OverflowError,
+            AttributeError,
+            RecursionError,
+            MemoryError,
+        ):
             log.warning("Malformed %s sidecar for %s — skipped", kind, test_name)
             continue
         out.update(got)

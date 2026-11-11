@@ -205,3 +205,11 @@ def test_test_name_cannot_leave_the_results_dir(tmp_path, name):
     (results / "x").mkdir()
     (results / "x" / "env.json").write_text(json.dumps({"host": "leak"}))
     assert benchmeta.props_for(str(results), name) == {}
+
+
+def test_a_deeply_nested_sidecar_is_skipped_with_a_warning(tmp_path, caplog):
+    _bench(tmp_path)
+    (tmp_path / "env.json").write_text("[" * 200000)
+    (tmp_path / "compile_summary.json").write_text(json.dumps({"total_s": 9.0}))
+    assert _run_props(tmp_path)["compile_total_s"] == "9.0"
+    assert "skipped" in caplog.text

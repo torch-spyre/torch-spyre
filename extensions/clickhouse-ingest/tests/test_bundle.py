@@ -1053,3 +1053,59 @@ def test_a_vllm_bundle_carries_sidecars_and_per_test_subdirs(
     )
     assert lat["props"]["env_host"] == "per-test"
     assert lat["props"]["phase_load_s"] == "2.000"
+
+
+def _vllm_args(src, out):
+    return ["results", "--offline", "--out", str(out), "--vllm-results-dir", str(src),
+            "--artifact", f"id:{AID}", "--arch", "x86_64", "--perf", "head_sha=881a59d2",
+            "--perf", "head_branch=main"]  # fmt: skip
+
+
+def test_offline_bundling_does_not_follow_symlinks_out_of_the_results_dir(tmp_path):
+    src = tmp_path / "vllm-out"
+    shutil.copytree(VLLM_DATA / "results", src)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "env.json").write_text('{"host": "leak"}')
+    (src / "ext").symlink_to(outside)
+    (src / "phases.json").symlink_to(outside / "env.json")
+    (src / "linked").mkdir()
+    (src / "linked" / "env.json").symlink_to(outside / "env.json")
+    out = tmp_path / "perf"
+    assert cli(_vllm_args(src, out)) == 0
+    paths = {f["path"] for f in _meta(out)["files"]}
+    assert not {
+        p for p in paths if "ext/" in p or "linked" in p or p.endswith("phases.json")
+    }
+
+
+def test_offline_py_runs_standalone_and_bundles_sidecars(tmp_path):
+    import sys
+
+    alone = tmp_path / "alone"
+    alone.mkdir()
+    pkg = Path(offline.__file__).parent
+    shutil.copy(pkg / "offline.py", alone)
+    shutil.copy(pkg / "bundle.schema.json", alone)
+    run = [sys.executable, "-I", str(alone / "offline.py")]
+    assert subprocess.run(run + ["--help"], capture_output=True).returncode == 0
+
+    test = "latency_granite8B_tp1_in64_out64"
+    src = tmp_path / "vllm-out"
+    shutil.copytree(VLLM_DATA / "results", src)
+    (src / "env.json").write_text("{}")
+    (src / test).mkdir()
+    (src / test / "phases.json").write_text('{"phases": []}')
+    out = tmp_path / "perf"
+    done = subprocess.run(
+        run + _vllm_args(src, out)[1:], capture_output=True, text=True
+    )
+    assert done.returncode == 0, done.stderr
+    paths = {f["path"] for f in _meta(out)["files"]}
+    assert {"results/env.json", f"results/{test}/phases.json"} <= paths
+
+
+def test_the_sidecar_names_are_one_definition():
+    from spyre_clickhouse_ingest import benchmeta
+
+    assert benchmeta.is_sidecar is offline.is_sidecar

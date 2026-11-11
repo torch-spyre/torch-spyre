@@ -289,11 +289,11 @@ On a host without network access, use either:
 
 ### The bundle
 
-A folder, or a `.tgz` of one:
+A folder, or a `.tgz` of one. A vllm bundle may also hold top-level sidecars (`env.json`, `<test>.env.json`, ...) and `results/<test>/<kind>.json`; deploy this package before uploading nested bundles, since older readers reject them in `check()`. Symlinks in the results dir are not bundled.
 
 ```
 bundle.json        # bundle.schema.json
-results/           # JUnit *.xml, (kind vllm) vLLM bench *.json, (kind sendnn) report_sendnn.txt, (kind benchmarks) *.json, or (kind tables) <table>.json; flat
+results/           # JUnit *.xml, (kind vllm) vLLM bench *.json, (kind sendnn) report_sendnn.txt, (kind benchmarks) *.json, or (kind tables) <table>.json; flat, except a vllm bundle's per-test sidecars results/<test>/<kind>.json (never repeats/)
 attachments/...    # optional: logs, .cmd files; kept with the bundle, not ingested
 ```
 
