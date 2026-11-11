@@ -89,6 +89,10 @@ _SCALAR_ADD_SKIP_INT = pytest.mark.skip(
 
 _SCALAR_ADD_FALLBACK_FULL_WARN = r"torch\.ops\.spyre\.full is falling back to cpu"
 
+_EAGER_BOOL_READBACK_INT_RAISES = _expect_raise(
+    r"EA shuffle only supports FP32 and FP16 dtypes, but got"
+)
+
 
 @instantiate_parametrized_tests
 class TestSpyre(TestCase):
@@ -736,6 +740,11 @@ class TestSpyre(TestCase):
             subtest(
                 dtype,
                 name=str(dtype).removeprefix("torch."),
+                decorators=(
+                    [_EAGER_BOOL_READBACK_INT_RAISES]
+                    if dtype in (torch.int32, torch.int64)
+                    else []
+                ),
             )
             for dtype in (torch.float32, torch.int32, torch.int64)
         ],

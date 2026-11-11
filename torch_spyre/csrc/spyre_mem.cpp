@@ -563,6 +563,15 @@ auto get_device_stride_infos(
   // arrangement. The DCSIs above stay as built for STANDARD arrangement.
   dimwise_ea.clear();
   if (shuffle_ea) {
+    // EA shuffle only supports FP16 and FP32 dtypes for now.
+    // Integer formats (e.g., int32, int64) are not yet supported in deeptools.
+    TORCH_CHECK(stl.device_dtype == DataFormats::IEEE_FP32 ||
+                    stl.device_dtype == DataFormats::IEEE_FP16 ||
+                    stl.device_dtype == DataFormats::SEN169_FP16,
+                "EA shuffle only supports FP32 and FP16 dtypes, but got: ",
+                stl.device_dtype, " (element arrangement: ",
+                elementArrangementToString(stl.element_arrangement), ")");
+
     TORCH_CHECK(stick_host_dim >= 0 && !stick_ambiguous,
                 "Unable to determine the stick dimension for ",
                 elementArrangementToString(stl.element_arrangement));
