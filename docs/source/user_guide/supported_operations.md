@@ -60,6 +60,7 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 | `torch.trunc` | Y | Y | Spyre | Custom lowering `floor(\|x\|) * clip(x, -1, 1)`, since the device has no native trunc op; a negative fraction gives `0.0`, not `-0.0` |
 | `torch.ceil` | Y | Y | Spyre | Custom decomposition |
 | `torch.sign` | Y | Y | Spyre | Custom decomposition |
+| `torch.signbit` | Y | Y | Spyre | Custom decomposition |
 | `torch.logical_not` | Y | Y | Spyre | Custom decomposition |
 | `torch.bitwise_not` | Y | Y | Spyre | Custom decomposition |
 | `torch.sin` | Y | Y | Spyre | Custom decomposition (Cody-Waite range reduction + degree-9 Taylor); max abs error ~5e-5 in fp32 |
@@ -73,6 +74,8 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 | `torch.mul` | Y | Y | Spyre | int32 runs natively via `muli32toi32` |
 | `torch.div` / `torch.true_divide` | Y | Y | Spyre | `rounding_mode="floor"` supported with limits: quotient magnitude ≤1024 (fp16) or ≤2²⁴ (fp32); ~2.7% fp16 residual-blinding class (#5605); DL16 host input rounding applies. `rounding_mode="trunc"` supported with the same limits; computed as `sign(x)·sign(y)·floor(\|x\|/\|y\|)`; a zero quotient with operands of opposite sign gives `0.0`, not `-0.0` as on CPU. |
 | `torch.floor_divide` | Y | Y | Spyre | Alias for `torch.div(..., rounding_mode="floor")`; same limits apply. |
+| `torch.fmod` | Y | Y | Spyre | |
+| `torch.remainder` | Y | Y | Spyre | |
 | `torch.maximum` | Y | Y | Spyre | |
 | `torch.minimum` | Y | Y | Spyre | |
 | `torch.bitwise_and` | Y | Y | Spyre | Custom decomposition; boolean inputs run on Spyre (`logical_and`), integer inputs decompose through `bitwise_or`, which falls back to CPU |

@@ -32,12 +32,10 @@ from typing import Any, Callable, Optional, Sequence, Union
 
 import torch
 import torch._decomp as decomp
-from torch._refs import scalar_tensor
 from torch._prims_common import (
     ELEMENTWISE_TYPE_PROMOTION_KIND,
     canonicalize_dim,
     elementwise_dtypes,
-    Number,
     NumberType,
     TensorLikeType,
 )
@@ -4043,16 +4041,14 @@ def spyre_flip(input: torch.Tensor, dims: Sequence[int]) -> torch.Tensor:
 def spyre_fmod(
     a: TensorLikeType | NumberType, b: TensorLikeType | NumberType
 ) -> torch.Tensor:
-    # Wrap scalars because some references only accept tensor arguments.
-    if isinstance(a, Number) and isinstance(b, Number):
-        raise TypeError("Should be unreachable")
-    elif isinstance(b, Number) and isinstance(a, torch.Tensor):
-        b = scalar_tensor(b, dtype=a.dtype, device=a.device)
-    elif isinstance(a, Number) and isinstance(b, torch.Tensor):
-        a = scalar_tensor(a, dtype=b.dtype, device=b.device)
+    return a - torch.div(a, b, rounding_mode="trunc") * b
 
-    div_ = a / b
-    return a - torch.sign(div_) * torch.floor(torch.abs(div_)) * b
+
+@register_spyre_decompositions([torch.ops.aten.remainder.Tensor])
+def spyre_remainder(
+    a: TensorLikeType | NumberType, b: TensorLikeType | NumberType
+) -> torch.Tensor:
+    return a - torch.div(a, b, rounding_mode="floor") * b
 
 
 @register_spyre_decompositions(

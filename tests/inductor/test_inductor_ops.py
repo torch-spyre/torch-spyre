@@ -1233,6 +1233,10 @@ def _floor_div(a, b):
     return torch.div(a, b, rounding_mode="floor")
 
 
+def _trunc_div(a, b):
+    return torch.div(a, b, rounding_mode="trunc")
+
+
 def _floordiv_inplace(x, y):
     # ``x //= y`` -> aten::floor_divide_.{Scalar,Tensor}; work on a clone so the
     # shared param tensor is not mutated across eager/CPU runs.
@@ -1693,6 +1697,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "floordiv": functools.partial(torch.div, rounding_mode="floor"),
                 "truncdiv": functools.partial(torch.div, rounding_mode="trunc"),
                 "fmod": torch.fmod,
+                "remainder": torch.remainder,
             },
             "param_sets": make_param_dict(
                 [
@@ -1713,6 +1718,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "floordiv": functools.partial(torch.div, rounding_mode="floor"),
                 "truncdiv": functools.partial(torch.div, rounding_mode="trunc"),
                 "fmod": torch.fmod,
+                "remainder": torch.remainder,
             },
             "param_sets": make_param_dict(
                 [
@@ -1734,6 +1740,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "floordiv": functools.partial(torch.div, rounding_mode="floor"),
                 "truncdiv": functools.partial(torch.div, rounding_mode="trunc"),
                 "fmod": torch.fmod,
+                "remainder": torch.remainder,
             },
             "param_sets": {
                 "1d": (
@@ -9975,6 +9982,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "ops_dict": {
                 "true_div": lambda a, b: torch.div(a, b),
                 "floor_div": _floor_div,
+                "trunc_div": _trunc_div,
             },
             # TODO: remove when multi-arg pointwise with mixed EA is supported
             "expect_raise": {
@@ -10092,6 +10100,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "ops_dict": {
                 "true_div": lambda a, b: torch.div(a, b),
                 "floor_div": _floor_div,
+                "trunc_div": _trunc_div,
             },
             "param_sets": {
                 # bool tensor vs int/float scalars
@@ -14857,9 +14866,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         self.compare_with_cpu(fn, x, run_eager=False)
 
     def test_division_op(self, op, a, b):
-        """Test truncdiv, floordiv and fmod.
+        """Test truncdiv, floordiv, fmod and remainder.
 
-        All three do computations on the result of div. With fp16, the
+        All four do computations on the result of div. With fp16, the
         results can be slightly different on CPU and Spyre, but since
         floor and trunc introduce discontinuities, this can lead to
         results that are quite different, so this function tries to
@@ -15230,7 +15239,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         """Test torch.div type promotion across mixed tensor dtypes."""
         if isinstance(y, torch.Tensor):
             y = _bound_divisor(y, numerator=x if isinstance(x, torch.Tensor) else None)
-        tol_kwargs = {"atol": 0, "rtol": 0} if op is _floor_div else {}
+        tol_kwargs = {"atol": 0, "rtol": 0} if op in (_floor_div, _trunc_div) else {}
         self.compare_with_cpu(op, x, y, **tol_kwargs)
 
     @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
@@ -15238,7 +15247,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         """Test torch.div type promotion with Python scalar operands."""
         if isinstance(scalar, (int, float)) and abs(scalar) < FP16_EPS:
             scalar = 1.0
-        tol_kwargs = {"atol": 0, "rtol": 0} if op is _floor_div else {}
+        tol_kwargs = {"atol": 0, "rtol": 0} if op in (_floor_div, _trunc_div) else {}
         self.compare_with_cpu(op, x, scalar, **tol_kwargs)
 
     @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
