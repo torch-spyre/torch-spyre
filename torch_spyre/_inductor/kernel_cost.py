@@ -93,6 +93,7 @@ def record_kernel_cost(
                 return
             _written.add((pid, provenance.key))
         record = {
+            "v": 1,
             "provenance_key": provenance.key,
             "kernel": kernel_name,
             "aten_ops": list(provenance.aten_ops),

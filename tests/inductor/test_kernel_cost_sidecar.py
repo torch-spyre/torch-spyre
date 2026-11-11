@@ -111,7 +111,7 @@ def test_compile_summary_shape(no_card, tmp_path):
     _compile(tmp_path, timing=True)
     path = compile_summary.dump(str(tmp_path / "summary"))
     summary = json.loads(open(path).read())
-    assert set(summary) == {"total_s", "passes", "cache"}
+    assert set(summary) == {"v", "total_s", "passes", "cache"}
     assert summary["total_s"] > 0
     assert any(k.startswith("CustomPreSchedulingPasses:") for k in summary["passes"])
     assert all(v >= 0 for v in summary["passes"].values())

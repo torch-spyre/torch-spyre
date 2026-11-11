@@ -1192,6 +1192,11 @@ class TestFfdcAsyncCompile:
             "torch_spyre._inductor.kernel_provenance",
             build_kernel_provenance_descriptor=lambda specs: None,
         )
+        _stub_module(
+            monkeypatch,
+            "torch_spyre._inductor.kernel_cost",
+            record_kernel_cost=lambda *a, **k: None,
+        )
         codegen = _stub_module(monkeypatch, "torch_spyre._inductor.codegen")
         codegen.__path__ = []
         _stub_module(

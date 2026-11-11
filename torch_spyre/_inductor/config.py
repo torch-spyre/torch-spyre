@@ -281,6 +281,7 @@ kernel_cost_dir: str = os.environ.get("TORCH_SPYRE_KERNEL_COST_DIR", "")
 # Directory for compile_summary.<pid>.json (compile_summary.py), written at exit:
 # total compile seconds, per-pass self seconds and kernel-cache counters. Setting
 # it turns the timing recorder on, since the summary is derived from its events.
+# That is decided at import: set it in the environment, not via config.patch.
 compile_summary_dir: str = os.environ.get("TORCH_SPYRE_COMPILE_SUMMARY_DIR", "")
 
 # Structured per-compile timing records (timing_recorder.py).  Off by default;

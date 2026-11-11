@@ -63,6 +63,7 @@ def build() -> dict:
             passes[key] = passes.get(key, 0.0) + e.self_ns / 1e9
     entries = get_kernel_registry().all_entries().values()
     return {
+        "v": 1,
         "total_s": sum(
             e.inclusive_ns
             for e in events
