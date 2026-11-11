@@ -55,6 +55,7 @@ from torch._inductor.ops_handler import DefaultHandler, WrapperHandler
 from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.graph import GraphLowering
 from torch._inductor.utils import sympy_subs
+from torch.utils._sympy.functions import FloorDiv
 from torch._inductor.dependencies import MemoryDep, ReadWrites, is_indirect
 from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
 from torch._inductor.virtualized import V
@@ -75,7 +76,6 @@ from .core_mapping import (
     decompose_fused_split_view,
 )
 from .constants import (
-    BATCH_MATMUL_OP,
     ELIDED_COPY_BACK_ATTR,
     KEEP_BY_INDEX_OP,
     MATMUL_REDUCTION_OPS,
@@ -84,7 +84,9 @@ from .constants import (
 )
 from .ir import FixedTiledLayout, SpyreConstantFallback
 from .logging_utils import get_inductor_logger
+from .loop_facts import enclosing_loops
 from .loop_info import copy_op_metadata
+from .loop_node import LoopNode, all_ops
 from .pass_counters import (
     COUNTERS,
     DEVICE_COORDINATES,
@@ -97,7 +99,6 @@ from .views import (
     AlignmentInputs,
     build_alignment_inputs,
     compute_coordinates,
-    matching_dim,
 )
 
 # PyTorch's default lower bound for size symbols (sizes 0/1 are specialised).
@@ -279,9 +280,19 @@ def op_read_writes(op: Operation) -> ReadWrites:
 
     ``ComputedBuffer.get_read_writes`` re-runs sympy dependency extraction on
     every call and is not cached upstream, yet its result does not depend on
-    work-division metadata. The scratchpad pass calls it hundreds of times, so
-    we cache it under a private key only this helper reads -- a non-planner
-    caller (e.g. later-pass codegen) still goes through the real method.
+    work-division metadata. Pre-scheduling passes, the scratchpad planner and
+    its cost features ask for it hundreds of thousands of times per model, so it
+    is cached under a private key on the op.
+
+    The memo is filled from the layout passes onwards, so a pass that changes
+    what an op reads or writes ON THE SAME INSTANCE -- swapping a load name in
+    its ``inner_fn``, replacing its ``data`` -- must call
+    :func:`invalidate_op_read_writes` on it right after (``insert_restickify``
+    does). Rebuilding the op (``replace_computed_buffer_body``) needs nothing:
+    the new instance starts unmemoized. A Spyre layout change needs nothing
+    either while it leaves the host strides alone, as the stick (device layout)
+    passes do; one that changes a buffer's host strides changes the indices of
+    its writer's write and of every reader's read.
     """
     if COUNTERS.enabled:
         COUNTERS.bump(READ_WRITES_REQUESTS)
@@ -379,6 +390,120 @@ def finite_upper_or_none(expr: Expr) -> Optional[int]:
     return None
 
 
+def decompose_tiled_count(count) -> "tuple[sympy.Symbol, int] | None":
+    """Split a loop's trip count into the symbol it tiles and its tile size.
+
+    Returns ``(symbol, tile_size)``, or None when the count is not a shape the
+    loop production can produce. Only two shapes are: a tiled dimension gives
+    ``shape[dim] // tile_size``, and a tile size of 1 gives the bare symbol.
+
+    This is how the granularity is RECOVERED rather than inferred.
+    ``for_each_tile(tile_size=G)`` puts G into the count itself, so reading it
+    back here means the granularity a bundle declares and the step its loop
+    takes come from one expression and cannot disagree. Not to be confused with
+    ``compute_granularity``, which picks a divisor for the SDSC route.
+
+    Both spellings of the division are accepted, at this one point. A trip count
+    reaches codegen as ``FloorDiv(s, G)``, but the kernel serializer writes
+    expressions as ``sympify('<str>')`` and ``str`` prints ``FloorDiv`` as
+    ``(s//G)``, which sympy re-parses into ``floor(s/G)``.
+
+    That same round trip builds a fresh ``Symbol`` without its assumptions, and
+    sympy counts assumptions as part of identity, so the reloaded symbol is
+    unequal to the one the scheduler saw while printing the same. **Any map that
+    has to outlive the reload is keyed by ``str(symbol)``.** The symbol itself is
+    returned because the scheduler needs it to query the ShapeEnv, which only
+    happens before the reload.
+    """
+    if isinstance(count, sympy.Symbol):
+        return count, 1
+
+    if isinstance(count, FloorDiv):
+        numerator, denominator = count.args
+    elif isinstance(count, sympy.floor):
+        numerator, denominator = count.args[0].as_numer_denom()
+    else:
+        return None
+
+    if isinstance(numerator, sympy.Symbol) and denominator.is_Integer:
+        tile_size = int(denominator)
+        if tile_size > 0:
+            return numerator, tile_size
+    return None
+
+
+def symbolic_count_bounds(count) -> "dict[str, tuple[int, int]]":
+    """``{symbol name: (max_value, tile_size)}`` for one loop's trip count.
+
+    Resolved here, while the ShapeEnv still exists, and carried on
+    ``LoopSpec.count_symbol_bounds`` because codegen also runs in a reload phase
+    where it is gone. The bundle turns each entry into one
+    ``!sdscbundle.input_arg<index, granularity=G, max_value=M>`` parameter and
+    takes its loop bound from it.
+
+    Keyed by NAME, not by the symbol, because the reload builds a fresh symbol
+    without its assumptions. See decompose_tiled_count.
+
+    Empty when there is nothing to carry, and the caller need not distinguish
+    the reasons: a concrete count, a shape the loop production cannot produce,
+    or a symbol with no declared ceiling all give ``{}``. Each leaves a kernel
+    that specialises, which is a worse binary rather than a wrong one, so the
+    refusal belongs at emission where the message can name the symbol.
+
+    Raises:
+        Unsupported: the count involves more than one symbol after the
+            ShapeEnv's replacements are applied (what ``torch._check(a == b)``
+            records, so a tied pair counts as one). The backend asserts exactly
+            one per symbolic loop, so that is a check failure there rather than
+            a degraded kernel here.
+    """
+    replacements = getattr(
+        getattr(V.graph.sizevars, "shape_env", None), "replacements", None
+    )
+    if replacements and hasattr(count, "free_symbols"):
+        count = sympy_subs(count, replacements)
+    free_symbols = getattr(count, "free_symbols", None) or set()
+    if len(free_symbols) > 1:
+        raise Unsupported(
+            f"symbolic loop count {count} involves {len(free_symbols)} symbols, "
+            f"{sorted(map(str, free_symbols))}. A symbolic loop takes exactly "
+            f"one. If these dimensions are meant to be equal, tie them with "
+            f"torch._check before the region so they become one symbol."
+        )
+
+    decomposed = decompose_tiled_count(count)
+    if decomposed is None:
+        return {}
+
+    symbol, tile_size = decomposed
+    shape_env = V.graph.sizevars.shape_env
+    if shape_env is None:
+        return {}
+
+    upper = finite_upper_or_none(symbol)
+    if upper is None:
+        # The one empty case worth saying out loud. Without a ceiling there is
+        # nothing to build the geometry against, so the kernel specialises, and
+        # that looks identical to never having asked for a symbolic loop.
+        logger.warning(
+            "[symbolic-loop] trip count %s has no finite upper bound for %s, so "
+            "no bundle parameter can be emitted for it and this kernel will be "
+            "size-specific. Declare the range in the traced region",
+            count,
+            symbol,
+        )
+        return {}
+
+    logger.info(
+        "[symbolic-loop] %s: symbol %s max=%d tile_size=%d",
+        count,
+        symbol,
+        upper,
+        tile_size,
+    )
+    return {str(symbol): (upper, tile_size)}
+
+
 def compute_granularity(expr: Expr, max_size: int) -> int:
     """Return the granularity for a symbolic dimension. SDSC route only.
 
@@ -456,6 +581,29 @@ def compute_granularity(expr: Expr, max_size: int) -> int:
     raise Unsupported(
         f"No valid granularity for max={max_size} under "
         f"max_buckets={max_buckets}, min_default_granularity={min_default_g}"
+    )
+
+
+def loop_induction_symbols(
+    index: sympy.Expr, iteration_vars: "set | dict"
+) -> list[sympy.Symbol]:
+    """The loop induction variables an index uses, in name order.
+
+    A loop variable is an unbacked symbol (``u0``: ``splice_while_loops`` defines it
+    with a ``DynamicScalar`` op) that is not one of the op's own iteration
+    variables. This is the definition :func:`concretize_index` relies on to keep
+    the variable symbolic, so the two cannot disagree.
+    """
+    if not isinstance(index, sympy.Basic):
+        return []
+    unbacked = free_unbacked_symbols(index)
+    return sorted(
+        (
+            s
+            for s in index.free_symbols
+            if s in unbacked and s not in iteration_vars and not is_indirect(s.name)
+        ),
+        key=lambda s: s.name,
     )
 
 
@@ -889,7 +1037,7 @@ def _build_indirect_store_subs(
     """
     from sympy import IndexedBase
 
-    rw = op.get_read_writes()
+    rw = op_read_writes(op)
     writes = [
         d
         for d in rw.writes
@@ -1107,7 +1255,7 @@ def _build_indirect_load_subs(
     """
     from sympy import IndexedBase
 
-    rw = op.get_read_writes()
+    rw = op_read_writes(op)
     reads = [
         d
         for d in rw.reads
@@ -1356,8 +1504,8 @@ def broadcast_batch_vars(op: Operation, x_dep: MemoryDep, out_dep: MemoryDep) ->
     that dim's squeezed symbol entirely (broadcast), rather than genuinely
     being tiled on it too.
     """
-    loop_info = getattr(op, "loop_info", None)
-    if loop_info is None or not loop_info.loop_tiled_dims:
+    levels = enclosing_loops(op)
+    if not any(level.tiled_dims for level in levels):
         return set()
 
     # Map each squeezed output-dim position (index into out_dep.var_names) to
@@ -1375,8 +1523,8 @@ def broadcast_batch_vars(op: Operation, x_dep: MemoryDep, out_dep: MemoryDep) ->
             it_idx += 1
 
     excess: set = set()
-    for level_dims in loop_info.loop_tiled_dims:
-        for pos in level_dims:
+    for level in levels:
+        for pos in level.tiled_dims:
             squeezed = raw_to_squeezed.get(pos)
             if squeezed is None or squeezed >= len(out_dep.var_names):
                 continue
@@ -1474,6 +1622,11 @@ def is_stick_expr_offset_free(stick_expr: sympy.Expr, elems_per_stick: int) -> b
 
 def _is_stick_expr_with_offset(stick_expr: sympy.Expr, elems_per_stick: int) -> bool:
     """Return True if stick_expr is an offset variant: Mod(var, N) + c or var + c."""
+    if isinstance(stick_expr, sympy.Integer):
+        assert 0 <= int(stick_expr) < elems_per_stick, (
+            f"stick coordinate {stick_expr} outside its stick ({elems_per_stick})"
+        )
+        return stick_expr != 0
     if not isinstance(stick_expr, sympy.Add):
         return False
     free_args = [a for a in stick_expr.args if a.free_symbols]
@@ -1827,7 +1980,7 @@ def indirect_forbidden_split_syms(op: "ComputedBuffer") -> set[Symbol]:
     # (2) keys off the index's logical entry count (d.ranges[stick_var]).
     subs = indirect_access_subs_from_op(op)
     index_names = {e.args[0].name for e in subs.values() if e.args}
-    for d in op.get_read_writes().reads:
+    for d in op_read_writes(op).reads:
         if not (isinstance(d, MemoryDep) and d.name in index_names):
             continue
         layout = _fixed_read_layout(V.graph.get_buffer(d.name))
@@ -2159,8 +2312,13 @@ def finalize_work_division_for_scheduler(graph: GraphLowering) -> None:
 
     Coefficient keys cannot distinguish every symbol.  Preserve the established
     iteration-order last-wins behavior, but warn once per affected operation.
+
+    Runs after the pass loop, where ``graph.operations`` may hold LoopNodes
+    (they reach the Scheduler as one node each). The ops inside a loop are
+    finalized like any other: a LoopNode has no ownership of its own, so a
+    loop over the top level would skip its whole body without an error.
     """
-    for op in graph.operations:
+    for op in all_ops(graph.operations):
         ownership = getattr(op, "iteration_space_ownership", None)
         if ownership is None:
             continue
@@ -2311,7 +2469,6 @@ def _host_size_stride_for_expr(
     host_size: list[int],
     host_stride: list[int],
     arg: "PropArg",
-    reduction_type: str,
     label: str,
 ) -> "tuple[int, int] | None":
     """Return (host_size, host_stride) for the host dim group that expr maps to.
@@ -2328,11 +2485,17 @@ def _host_size_stride_for_expr(
     from .propagate_layouts import _factorized_chain  # noqa: PLC0415
 
     if var not in arg.dep.ranges:
-        # Broadcast dimension: this tensor does not vary along var.
+        # Indirect gather index (e.g. x[i] where i comes from another tensor):
+        # the symbol is not a loop variable so it is absent from dep.ranges, but
+        # the tensor does vary.  Indirect-access tensors are always 1D on the
+        # host; len(host_size) == 1 is the load-bearing guard that prevents
+        # silent mis-resolution if that assumption is ever violated.
+        if is_indirect(var.name) and len(host_size) == 1:
+            return host_size[0], host_stride[0]
         return None
     try:
         host_dims, _var_range, var_stride = _factorized_chain(
-            arg, host_coords, host_size, host_stride, var, reduction_type, label
+            arg, host_coords, host_size, host_stride, var, label
         )
     except Unsupported:
         return None
@@ -2356,8 +2519,7 @@ def compute_restickify_target_layout(
     ic: list,
     idc: list,
     *,
-    arg: "PropArg | None" = None,
-    reduction_type: str = "",
+    arg: "PropArg",
     label: str = "",
 ) -> "SpyreTensorLayout | None":
     """Compute the target STL that results from moving stl's stick to target_stick_expr.
@@ -2374,20 +2536,18 @@ def compute_restickify_target_layout(
 
     Returns None if the restickify is infeasible.
 
-    ``arg``, ``reduction_type``, and ``label`` are forwarded to
-    ``_host_size_stride_for_expr`` to enable resolution of factorized
-    (FloorDiv) coordinate expressions via ``_factorized_chain``.
+    ``arg`` and ``label`` are forwarded to ``_host_size_stride_for_expr`` to
+    enable resolution of factorized (FloorDiv) coordinate expressions via
+    ``_factorized_chain``.
     """
     if target_stick_expr == sympy.S.Zero:
-        return compute_size1_restickify_layout(stl, host_layout, ic, idc)
+        return compute_size1_restickify_layout(stl, host_layout, ic, idc, arg=arg)
     if not target_stick_expr.free_symbols:
-        return None
-    if arg is None:
         return None
     host_size = [concretize_expr(s) for s in host_layout.size]
     host_stride = [concretize_expr(s) for s in host_layout.stride]
     new_sd_size_stride = _host_size_stride_for_expr(
-        target_stick_expr, ic, host_size, host_stride, arg, reduction_type, label
+        target_stick_expr, ic, host_size, host_stride, arg, label
     )
     if new_sd_size_stride is None:
         return None
@@ -2397,7 +2557,7 @@ def compute_restickify_target_layout(
     stick_size = get_elem_in_stick(host_layout.dtype)
     if old_stick_expr.free_symbols:
         old_sd_size_stride = _host_size_stride_for_expr(
-            old_stick_expr, ic, host_size, host_stride, arg, reduction_type, label
+            old_stick_expr, ic, host_size, host_stride, arg, label
         )
         if old_sd_size_stride is None:
             return None
@@ -2407,11 +2567,9 @@ def compute_restickify_target_layout(
             j for j in range(len(idc) - 1) if old_var in idc[j].free_symbols
         ]
     else:
-        # Zero stick (placeholder dim with no variable): only valid for BATCH_MATMUL_OP,
-        # where a size-1 contraction dim produces a constant stick expression.
-        # For all other ops, this layout is infeasible.
-        if reduction_type != BATCH_MATMUL_OP:
-            return None
+        # Constant stick expression: the old stick dim has no variable (size-1
+        # contraction dim in matmul).  Callers are responsible for rejecting this
+        # case for non-matmul ops before calling here.
         old_sd_host_size, old_sd_host_stride = 1, 1
         old_var_outer_dims = []
         old_var = None
@@ -2458,24 +2616,30 @@ def compute_size1_restickify_layout(
     host_layout: FixedLayout,
     ic: list,
     idc: list,
+    *,
+    arg: "PropArg",
+    label: str = "",
 ) -> "SpyreTensorLayout | None":
     """Compute the target STL that results from moving stl's stick onto a size-1 dim.
 
     Each stick then holds one element. The size-1 dim need not exist on the host:
     it behaves the same whether it is real or synthetic.
 
-    This is what lets _make_output_stl in propagate_layouts.py put the stick on a
-    size-1 dim: such a layout has a stick expression of the constant 0, which
-    matching_dim cannot resolve to a host dim.
+    ``arg`` and ``label`` are forwarded to ``_host_size_stride_for_expr`` to
+    enable resolution of factorized (FloorDiv) coordinate expressions via
+    ``_factorized_chain``.
 
     Returns None if the restickify is infeasible.
     """
     host_size = [concretize_expr(s) for s in host_layout.size]
     host_stride = [concretize_expr(s) for s in host_layout.stride]
-    old_sd = matching_dim(ic, idc[-1])
-    if old_sd is None:
-        return None
     old_stick_expr = idc[-1]
+    ss = _host_size_stride_for_expr(
+        old_stick_expr, ic, host_size, host_stride, arg, label
+    )
+    if ss is None:
+        return None
+    old_sd_host_size, old_sd_host_stride = ss
     old_var = next(iter(old_stick_expr.free_symbols))
     stick_size = get_elem_in_stick(host_layout.dtype)
     old_var_outer_dims = [
@@ -2512,7 +2676,7 @@ def compute_size1_restickify_layout(
     device_size = restickify_device_size(
         list(stl.device_size),
         old_sd_outer_dim,
-        host_size[old_sd],
+        old_sd_host_size,
         new_sd_outer_dim,
         1,
         stick_size,
@@ -2520,7 +2684,7 @@ def compute_size1_restickify_layout(
     stride_map = restickify_stride_map(
         list(stl.stride_map),
         old_sd_outer_dim,
-        host_stride[old_sd],
+        old_sd_host_stride,
         new_sd_outer_dim,
         -1,
         stick_size,
@@ -2792,12 +2956,16 @@ def compute_size1_restickify_target(
     Used when the input's stick var must leave the stick (e.g. topk's
     reduction var) and no other dim can take it.
     """
+    # Local import avoids circular dependency (propagate_layouts imports pass_utils).
+    from .propagate_layouts import PropArg  # noqa: PLC0415
+
     _, _, ind_sizes = indirect_info_from_op(op)
     idc = try_device_coordinates(in_stl, in_dep, ind_sizes, op=op)
     if idc is None:
         return None
     ic = host_coordinates(in_host, in_dep, ind_sizes, op=op)
-    return compute_size1_restickify_layout(in_stl, in_host, ic, idc)
+    arg = PropArg(in_dep, in_host, [in_stl])
+    return compute_size1_restickify_layout(in_stl, in_host, ic, idc, arg=arg)
 
 
 def copy_fx_custom_meta(src: "torch.fx.Node", dst: "torch.fx.Node") -> None:
@@ -3031,6 +3199,9 @@ def redirect_computed_buffer_reads(
 
         object.__setattr__(op.data, "output_indexer", new_output_indexer)
     _invalidate_body_caches(op.data)
+    # The replacement below starts unmemoized, but op itself now reads through
+    # the patched data; a caller still holding op must not see its old reads.
+    invalidate_op_read_writes(op)
 
     # Reconstruct ComputedBuffer as a fresh object so the instance-keyed cache
     # on get_default_sizes_body can be cleanly invalidated below.
@@ -3045,7 +3216,7 @@ def redirect_computed_buffer_reads(
     )
     new_buf.operation_name = op.operation_name
     preserve_provenance(op, new_buf, pass_name=pass_name, reason=reason)
-    copy_op_metadata(op, new_buf)
+    copy_op_metadata(op, new_buf, layout_state=True)
 
     op_idx = operations.index(op)
     operations[op_idx] = new_buf
@@ -4292,15 +4463,34 @@ _STACK_TRACES_BLOCK_RE = regex.compile(
 )
 
 
+def _indent(text: str) -> str:
+    """``text`` with two spaces before every non-blank line."""
+    return "".join(
+        line if line == "\n" else f"  {line}" for line in text.splitlines(keepends=True)
+    )
+
+
 def _strip_stack_traces(text: str) -> str:
     """Remove IRNode "stack_traces = { ... }" blocks from formatted op text."""
     return _STACK_TRACES_BLOCK_RE.sub("", text)
 
 
 def format_operations(operations: list[Operation]) -> str:
-    """Format LLIR operations including torch-spyre custom metadata"""
+    """Format LLIR operations including torch-spyre custom metadata.
+
+    A LoopNode prints as a header line followed by its body, each body line
+    indented by two spaces per nesting level. A list with no LoopNode prints
+    exactly as it did before nodes existed.
+    """
     buf = io.StringIO()
     for op in operations:
+        if isinstance(op, LoopNode):
+            buf.write(
+                f"{op.get_operation_name()}: LoopNode trip_count={op.trip_count} "
+                f"induction={op.induction} carries={len(op.carries)}\n\n"
+            )
+            buf.write(_indent(format_operations(op.body)))
+            continue
         buf.write(f"{op.get_operation_name()}: {type(op).__name__}")
         if isinstance(op, ComputedBuffer):
             buf.write(f"\n  buffer={op.get_name()}")

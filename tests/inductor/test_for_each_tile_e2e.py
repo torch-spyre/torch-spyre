@@ -62,7 +62,9 @@ from torch_spyre.constants import DEVICE_NAME
 from torch_spyre._inductor import config
 from torch_spyre._inductor import passes as ts_passes
 from torch_spyre._inductor.constants import RESTICKIFY_OP
+from torch_spyre._inductor.loop_node import all_ops
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
+from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
 from torch_spyre._inductor.scratchpad.coarse_tiling import (
     PrescribedRegion,
@@ -284,6 +286,7 @@ class TestForEachTileE2E(_DynamoResetTestCase):
                         device_size=[4, rows // 32, 32],
                         stride_map=[rows, 32, 1],
                         device_dtype=get_device_dtype(torch.int32),
+                        valid_elements={(0,): 4, (1, 2): rows},
                     )
                     inputs = (
                         values.to(DEVICE_NAME),
@@ -318,6 +321,56 @@ class TestForEachTileE2E(_DynamoResetTestCase):
                 InductorError, "index rows require adjacent physical sticks"
             ):
                 compiled(values, indices, initial)
+
+    def test_scatter_carry_relayout_copies_are_in_the_loop(self):
+        """The mutation relayout of a scatter into a carry puts BOTH full-buffer
+        copies inside the scatter's loop ("so other carry readers observe the
+        preceding iteration's updates"), by node membership and not only by the
+        ``loop_group_id`` stamped on them.
+
+        ``reorder_nonstick_dims_mutation`` placed the copy-back by flat index after
+        the last body op, which the flat view puts at the top level; the copy then
+        claimed the loop without being in it. The pipeline's later ``expanded()``
+        round trip rebuilt nodes from ``loop_group_id`` and hid that, until
+        ``dedup_and_promote_constants`` stopped needing it. Without the fix the
+        compile fails in the scheduler ("Loop group (0,) is not contiguous"), which
+        is this test's regression signal; the assertions below say where each
+        member sits when it does not.
+
+        The loop's four members are the accumulate (``acc + value``), the copy-in,
+        the ``index_copy`` and the copy-back. The loop checker does not flag a
+        member outside its node: it checks that an op's index uses enclosing
+        variables, not that an op with a ``loop_group_id`` is inside the node."""
+        rows = 32  # a shape the runtime-index test compiles: the scatter is legal
+        generator = torch.Generator().manual_seed(930)
+        values = (torch.randn(4, rows, 64, generator=generator) * 0.125).to(
+            torch.float16
+        )
+        indices = torch.stack(
+            [torch.randperm(rows * 4, generator=generator)[:rows] for _ in range(4)]
+        ).to(torch.int32)
+        initial = (torch.randn(rows * 4, 64, generator=generator) * 0.125).to(
+            torch.float16
+        )
+        result: dict = {}
+        with (
+            config.patch(
+                backend_loop_unroll=False, lx_planning=True, hbm_pool_planning=True
+            ),
+            torch.inference_mode(),
+            # A cache hit would skip the pipeline this test inspects, leaving
+            # ``result`` empty.
+            torch._inductor.config.patch(force_disable_caches=True),
+            patch.object(
+                ts_passes, "CustomPreSchedulingPasses", _record_loop_membership(result)
+            ),
+        ):
+            torch.compile(scatter_carry_fn, fullgraph=True, dynamic=False)(
+                values.to(DEVICE_NAME), indices.to(DEVICE_NAME), initial.to(DEVICE_NAME)
+            )
+        self.assertIn("top_level", result, "the pipeline did not run")
+        self.assertEqual(result["top_level"], [])
+        self.assertEqual(len(result["in_body"]), 4, result["in_body"])
 
     def test_scatter_carry_preserves_old_value_read_after_update(self):
         from torch_spyre._C import SpyreTensorLayout, get_device_dtype
@@ -367,6 +420,7 @@ class TestForEachTileE2E(_DynamoResetTestCase):
                             device_size=[96, 1, 64],
                             stride_map=[64, 64, 1],
                             device_dtype=get_device_dtype(torch.float16),
+                            valid_elements={(0,): 96, (1, 2): 64},
                         )
                     }
                     if row_outermost
@@ -389,7 +443,6 @@ class TestForEachTileE2E(_DynamoResetTestCase):
                 torch.testing.assert_close(inputs[2].cpu(), initial, atol=0, rtol=0)
 
     def test_computed_where_condition_in_broadcast_tile(self):
-        from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
         from torch_spyre.ops.fallbacks import FallbackWarning
 
         def tiled_where(x):
@@ -1073,6 +1126,45 @@ class TestForEachTileNestedGatherE2E(_DynamoResetTestCase):
         )
 
 
+def _record_loop_membership(result: dict):
+    """A pre-scheduling pipeline that records, once it is done, where the ops that
+    claim a loop (by ``loop_info.loop_group_id``) sit in the node tree.
+
+    An extern constant is exempt: ``dedup_and_promote_constants`` hoists a body
+    constant to the head of the graph and it keeps its ``loop_info`` (see
+    ``counted_loop_path``), so it claims a loop from the top level by design.
+    ``result`` is filled in rather than kept on the class, so tests share no state.
+    """
+    from torch_spyre._inductor.ir import SpyreConstantFallback
+    from torch_spyre._inductor.loop_node import LoopNode
+
+    class _Record(CustomPreSchedulingPasses):
+        def __call__(self, graph) -> None:
+            super().__call__(graph)
+
+            def claims_a_loop(op):
+                return (
+                    not isinstance(op, SpyreConstantFallback)
+                    and getattr(getattr(op, "loop_info", None), "loop_group_id", None)
+                    is not None
+                )
+
+            result["top_level"] = [
+                op.get_operation_name()
+                for op in graph.operations
+                if not isinstance(op, LoopNode) and claims_a_loop(op)
+            ]
+            result["in_body"] = [
+                op.get_operation_name()
+                for node in graph.operations
+                if isinstance(node, LoopNode)
+                for op in all_ops(node.body)
+                if claims_a_loop(op)
+            ]
+
+    return _Record
+
+
 class _CollectRegions(CustomPreSchedulingPasses):
     """Pre-scheduling pipeline that records the graph's regions once it is done."""
 
@@ -1082,8 +1174,13 @@ class _CollectRegions(CustomPreSchedulingPasses):
     def __call__(self, graph) -> None:
         super().__call__(graph)
         cls = type(self)
-        cls.operations = list(graph.operations)
-        cls.regions = prescribed_regions(graph.operations)
+        # The leaf ops in program order: graph.operations now keeps its
+        # LoopNodes after the pipeline (they reach the scheduler as nodes),
+        # and its leaf ops are exactly the flat list the pipeline used to
+        # leave.  The passes that call prescribed_regions run inside the pass
+        # loop, where they see this flat view (OpsView).
+        cls.operations = list(all_ops(graph.operations))
+        cls.regions = prescribed_regions(cls.operations)
 
 
 class TestPrescribedRegionsE2E(_DynamoResetTestCase):
@@ -1350,6 +1447,61 @@ class TestForEachTileSubStickAdvanceE2E(_DynamoResetTestCase):
         compiled = torch.compile(substick_gather_fn, backend="inductor", fullgraph=True)
         with pytest.raises(InductorError, match="cuts tensor.*physical stick"):
             compiled(pool, ids, init)
+
+
+# --- Slice(dim, extent) as the for_each_tile#5763 remedy --------------------
+
+SCALE_TRIPS, SCALE_WIDTH = 4, 256
+
+
+def slice_scale_row_fn(x, scale, init):
+    from torch_spyre._inductor.wsr import Slice, for_each_tile
+
+    def fn(x, scale, init):
+        def body(carry, tiles):
+            x_tile, scale_row = tiles
+            return (carry[0] + x_tile * scale_row,), None
+
+        (acc,), _ = for_each_tile(
+            body, (x, scale), dims=(0, Slice(0, extent=1)), tile_size=1, init=(init,)
+        )
+        return acc
+
+    return fn(x, scale, init)
+
+
+class TestForEachTileSliceScaleTableE2E(_DynamoResetTestCase):
+    """Slice(dim, extent) compiled on device at the exact shape issue #5763 reports.
+
+    #5763 ("for_each_tile with a short Gather index fails") gathers one row at a
+    time from a [4, 256] fp16 scale table with a 4-long index -- the same
+    sub-stick, one-element-per-trip advance ``TestForEachTileSubStickAdvanceE2E``
+    above still refuses; Gather itself is unchanged by this PR. ``Slice(0,
+    extent=1)`` is the issue's other accepted fix: a per-trip row that is really
+    just "the next row" needs no index table at all.
+    ``test_slice_extent_differs_from_tile_size`` in test_for_each_tile.py already
+    covers this through ``_assert_lowers`` -- the post-grad graph's shape only,
+    no device involved. This test compiles the issue's own [4, 256] shape through
+    the real Spyre backend, so the fix is exercised where #5763 originally
+    failed -- codegen -- and "downstream needs no change" is checked in CI, not
+    just asserted in the PR description.
+    """
+
+    def test_slice_scale_table_compiles_at_issue_shape(self):
+        x = cached_randn((SCALE_TRIPS, SCALE_WIDTH))
+        scale = cached_randn((SCALE_TRIPS, SCALE_WIDTH), differentiation=1)
+        init = torch.zeros(1, SCALE_WIDTH, dtype=torch.float16)
+
+        ref = torch.zeros(1, SCALE_WIDTH)
+        for i in range(SCALE_TRIPS):
+            ref = ref + dl16_round(x[i : i + 1].float()) * dl16_round(
+                scale[i : i + 1].float()
+            )
+
+        compiled = torch.compile(slice_scale_row_fn, backend="inductor", fullgraph=True)
+        out = compiled(x.to(DEVICE_NAME), scale.to(DEVICE_NAME), init.to(DEVICE_NAME))
+
+        torch.testing.assert_close(out.cpu().float(), ref, atol=1e-2, rtol=1e-2)
 
 
 class TestForEachTileGraphShapesE2E(_DynamoResetTestCase):
@@ -1829,6 +1981,251 @@ class TestForEachTileCarriedSumE2E(_DynamoResetTestCase):
                     self._compile(
                         lambda v: carried_expert_sum_fn(v, split), self._named(values)
                     )
+
+
+class _RecordCarries(CustomPreSchedulingPasses):
+    """Pre-scheduling pipeline that records the loop carries twice: right after
+    the first ``deadcode_elimination`` (the pure window, before
+    ``apply_loop_carries``) and at the end."""
+
+    window: list = []
+    final: dict = {}
+
+    def __init__(self):
+        super().__init__()
+        cls = type(self)
+        out = []
+        for p in self.passes:
+            out.append(p)
+            if p is ts_passes.deadcode_elimination and not any(
+                getattr(q, "__name__", "") == "record_window" for q in out
+            ):
+
+                def record_window(graph):
+                    cls.window = [
+                        (
+                            op.get_name(),
+                            getattr(op, "_loop_carry_record", None),
+                            type(op.layout).__name__,
+                        )
+                        for op in all_ops(graph.operations)
+                    ]
+
+                out.append(record_window)
+        self.passes = out
+
+    def __call__(self, graph) -> None:
+        super().__call__(graph)
+        cls = type(self)
+        cls.final = {}
+        # After the pipeline the loops are LoopNodes in graph.operations
+        # (_hand_off_loop_nodes); the carries live on their leaf ops.
+        for op in all_ops(graph.operations):
+            record = getattr(op, "_loop_carry_record", None)
+            if record is not None and record.update_name == op.get_name():
+                storage = graph.get_buffer(record.storage_name)
+                cls.final[record.update_name] = (
+                    record.storage_name,
+                    type(op.layout).__name__,
+                    dict(getattr(storage.get_layout(), "allocation", {}) or {}),
+                )
+
+
+class TestForEachTileCarriesInPlaceE2E(_DynamoResetTestCase):
+    """Each carry is declared at the splice and put in place by
+    ``apply_loop_carries``.
+
+    Numerics alone cannot show that a carry's back edge exists: on online
+    softmax a body whose updates were never put in place still compiles, and
+    with LX offsets masked its kernel is identical. The back edge is in the
+    kernel only as the update writing the address its storage was given, so
+    these tests check that address too.
+    """
+
+    def _compile(self, fn, *args):
+        from torch._inductor.utils import run_and_get_code
+
+        _RecordCarries.window = []
+        _RecordCarries.final = {}
+        with (
+            patch.object(ts_passes, "CustomPreSchedulingPasses", _RecordCarries),
+            torch._inductor.config.patch(force_disable_caches=True),
+            config.patch(lx_planning=True),
+        ):
+            compiled = torch.compile(fn, backend="inductor", fullgraph=True)
+            out, code = run_and_get_code(compiled, *args)
+        return out, "\n".join(code)
+
+    @staticmethod
+    def _output_allocations(source):
+        """buffer name -> the output allocation of the OpSpec that writes it."""
+        import regex as re
+
+        out = {}
+        for chunk in source.split("OpSpec(\n")[1:]:
+            chain = re.search(r"ir_chain=\(([^)]*)\)", chunk)
+            allocs = re.findall(
+                r"is_input=False.*?allocation=\{'(\w+)': (\d+)\}", chunk, re.DOTALL
+            )
+            if chain and allocs:
+                names = re.findall(r"'([^']+)'", chain.group(1))
+                out.setdefault(names[-1], {allocs[-1][0]: int(allocs[-1][1])})
+        return out
+
+    def _assert_carries_in_place(self, source, expected):
+        final = _RecordCarries.final
+        self.assertEqual(len(final), expected, final)
+        written = self._output_allocations(source)
+        for update, (storage, layout, allocation) in final.items():
+            self.assertEqual(layout, "MutationLayoutSHOULDREMOVE", update)
+            self.assertIn("lx", allocation, f"carry {storage} is not in LX")
+            self.assertEqual(
+                written.get(update),
+                allocation,
+                f"update {update} does not write its storage {storage}'s address",
+            )
+
+    def test_online_softmax_carries_share_their_storage_address(self):
+        Q = cached_xavier((LQ, D))
+        K = cached_xavier((LK, D), differentiation=1)
+        V = cached_xavier((LK, D), differentiation=2)
+        ref = online_softmax_reference(
+            dl16_round(Q.float()), dl16_round(K.float()), dl16_round(V.float())
+        )
+
+        out, src = self._compile(
+            online_softmax_fn, Q.to(DEVICE_NAME), K.to(DEVICE_NAME), V.to(DEVICE_NAME)
+        )
+
+        torch.testing.assert_close(out.cpu().float(), ref, atol=1e-2, rtol=1e-2)
+        # m, denom, acc: all three stay in LX and are updated in place.
+        self._assert_carries_in_place(src, 3)
+
+    def test_carries_are_pure_until_applied(self):
+        """After the splice and dead-code elimination, each carry is declared
+        and its update still writes its own buffer."""
+        Q = cached_xavier((LQ, D))
+        K = cached_xavier((LK, D), differentiation=1)
+        V = cached_xavier((LK, D), differentiation=2)
+
+        self._compile(
+            online_softmax_fn, Q.to(DEVICE_NAME), K.to(DEVICE_NAME), V.to(DEVICE_NAME)
+        )
+
+        updates = {
+            name: layout
+            for name, record, layout in _RecordCarries.window
+            if record is not None and record.update_name == name
+        }
+        self.assertEqual(len(updates), 3, _RecordCarries.window)
+        self.assertNotIn("MutationLayoutSHOULDREMOVE", updates.values())
+        self.assertEqual(set(updates), set(_RecordCarries.final))
+
+    def test_carry_nobody_reads_after_the_loop(self):
+        """``c`` is returned by no one; only ``acc`` reads it, inside the loop.
+        Its update must survive dead-code elimination and stay in place."""
+
+        def fn(x):
+            def body(carry, ops):
+                c, acc = carry
+                (tile,) = ops
+                return (c + tile, acc + c), None
+
+            zeros = torch.zeros(64, 64, device=x.device, dtype=x.dtype)
+            (_, acc), _ = for_each_tile(
+                body, (x,), dims=(0,), tile_size=64, init=(zeros, zeros.clone())
+            )
+            return acc
+
+        # Integers 0..3: every partial sum is an integer of at most 18, exact
+        # in fp16, so a stale or missing carry shows up as a mismatch.
+        x = torch.randint(0, 4, (256, 64), generator=torch.Generator().manual_seed(0))
+        x = x.half()
+        c = torch.zeros(64, 64)
+        ref = torch.zeros(64, 64)
+        for tile in x.float().reshape(4, 64, 64):
+            ref = ref + c
+            c = c + tile
+
+        out, src = self._compile(fn, x.to(DEVICE_NAME))
+
+        torch.testing.assert_close(out.cpu().float(), ref, atol=0, rtol=0)
+        self._assert_carries_in_place(src, 2)
+
+    def test_chained_loop_result_that_is_also_returned_is_not_overwritten(self):
+        """Loop 2 takes loop 1's result as its init, and both are returned.
+
+        Loop 1's body ignores its old value, so its update is the result. While
+        that update is still pure, the result is the update's own buffer, so
+        loop 2 may write it in place only if nothing else holds it. Judged on
+        the storage alone, loop 2 overwrote ``a`` with its own final value.
+        """
+
+        def fn(x):
+            def first(carry, ops):
+                (tile,) = ops
+                return (tile * 2,), None
+
+            def second(carry, ops):
+                (acc,) = carry
+                (tile,) = ops
+                return (acc + tile,), None
+
+            zeros = torch.zeros(64, 64, device=x.device, dtype=x.dtype)
+            (a,), _ = for_each_tile(first, (x,), dims=(0,), tile_size=64, init=(zeros,))
+            (b,), _ = for_each_tile(second, (x,), dims=(0,), tile_size=64, init=(a,))
+            return a, b
+
+        # Small integers keep every value exact in fp16.
+        x = torch.randint(0, 4, (128, 64), generator=torch.Generator().manual_seed(0))
+        x = x.half()
+        t0, t1 = x.float()[:64], x.float()[64:]
+        ref_a = t1 * 2  # the last trip's value
+        ref_b = ref_a + t0 + t1  # loop 2 starts from a
+
+        a, b = self._compile(fn, x.to(DEVICE_NAME))[0]
+
+        torch.testing.assert_close(a.cpu().float(), ref_a, atol=0, rtol=0)
+        torch.testing.assert_close(b.cpu().float(), ref_b, atol=0, rtol=0)
+
+
+def _length_tiled_double_fn(x: torch.Tensor) -> torch.Tensor:
+    """for_each_tile over a varying length, so the trip count is symbolic."""
+    from torch_spyre._inductor.wsr import for_each_tile
+
+    rows = x.shape[0]
+    torch._check(rows >= 64)
+    torch._check(rows <= 512)
+    torch._check(rows % 32 == 0)
+
+    def body(_, ops):
+        (tile,) = ops
+        return None, tile * 2
+
+    _, out = for_each_tile(body, (x,), dims=(0,), tile_size=32, out_dim=0)
+    return out
+
+
+class TestASymbolicTripCountIsRefusedByName(_DynamoResetTestCase):
+    """A varying trip count reaches codegen and stops there with a clear reason.
+
+    TODO: becomes a positive test, one compile correct at several sizes, once
+    the geometry is built at the declared maximum and the launch reads the size
+    (the next pull request of the #5186 split).
+    """
+
+    @expects_raise
+    def test_a_varying_trip_count_says_what_is_missing(self):
+        from torch._inductor.exc import InductorError
+
+        x = torch.randn(128, 64, dtype=torch.float16).to(DEVICE_NAME)
+        torch._dynamo.mark_dynamic(x, 0)
+        compiled = torch.compile(_length_tiled_double_fn, fullgraph=True)
+
+        with self.assertRaisesRegex(
+            InductorError, "geometry at the declared maximum is not implemented"
+        ):
+            compiled(x)
 
 
 if __name__ == "__main__":
