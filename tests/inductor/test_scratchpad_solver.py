@@ -56,6 +56,9 @@ try:
     from torch_spyre._inductor.scratchpad.cpsat_expr_printer import (
         _CORE_INV_SCALE,
         _MAX_PRODUCT_BOUND,
+        _POWER_PWL_TOLERANCE,
+        _PRODUCT_TOTAL_BITS,
+        _TERM_BITS,
         _SympyExprToCpSat,
         _simplify_eq_conjunction,
     )
@@ -2264,8 +2267,8 @@ class TestSympyExprToCpSatPrinter(TestCase):
             1e-6 * x**2 * y + sympy.Min(0.125 * x * y, 3.25),
             1000 * y / x + 0.25 * sympy.log(x, 2),
             x * y * z * (1 - resident),
-            # The single-menu table fits, but multiplying its wide integer
-            # by z does not. The original factored terms still fit the bound.
+            # The single-menu table fits, but multiplying its wide integer by z
+            # passes the product bound, so the product is narrowed.
             sympy.Piecewise((80_000_000 * x, x <= 2), (80_000_000 * x + 1, True)) * z,
             sympy.Piecewise(
                 (0.25 * x * y, sympy.And(x >= 2, y >= 2)),
@@ -2299,7 +2302,6 @@ class TestSympyExprToCpSatPrinter(TestCase):
         with mock.patch.object(conventional, "_division_table", return_value=None):
             expected = [conventional.convert(expr) for expr in expressions]
         actual = [printer.convert(expr) for expr in expressions]
-        self.assertTrue(printer._untabled_expr_cache)
         self.assertTrue(
             any(v.name.startswith("division_cost_") for v in model.proto.variables)
         )
@@ -2313,8 +2315,13 @@ class TestSympyExprToCpSatPrinter(TestCase):
                 solver.parameters.num_search_workers = 1
                 self.assertEqual(solver.solve(fixed), cp_model.OPTIMAL)
                 for new, old in zip(actual, expected):
+                    # A table gated by residency keeps _TERM_BITS bits of its
+                    # float coefficient (_scaled_term).
+                    reference = solver.float_value(old)
                     self.assertAlmostEqual(
-                        solver.float_value(new), solver.float_value(old), places=7
+                        solver.float_value(new),
+                        reference,
+                        delta=max(abs(reference) * 2**-_TERM_BITS, 1e-7),
                     )
 
     def test_candidate_domains_without_selectors_remain_independent(self):
@@ -2347,7 +2354,7 @@ class TestSympyExprToCpSatPrinter(TestCase):
                     solver.objective_value, float(expression.subs({x: a, y: b}))
                 )
 
-    def test_division_table_reuses_affine_values_and_falls_back_for_range(self):
+    def test_division_table_reuses_affine_values_and_rounds_past_the_range(self):
         x = sympy.Symbol("split_x", integer=True)
         model = cp_model.CpModel()
         division = model.new_int_var(0, 2, "division")
@@ -2361,14 +2368,29 @@ class TestSympyExprToCpSatPrinter(TestCase):
         count = len(model.proto.variables)
         printer.convert(0.25 * x**2 + 1.5)
         self.assertEqual(len(model.proto.variables), count)
-        # The exact integer table would exceed the product bound. Preserve the
-        # original affine expression instead of inventing a rounding scale.
+        # The exact integer table would exceed the product bound, so each value
+        # is rounded against the table's range.
         wide = [1, 2, _MAX_PRODUCT_BOUND + 3]
+        model = cp_model.CpModel()
+        division = model.new_int_var(0, 2, "division")
+        wrapper = types.SimpleNamespace(division=division)
+        var = model.new_int_var(1, max(wide), "split_x")
+        model.add_element(division, wide, var)
         printer = _SympyExprToCpSat(
             model, {"split_x": var}, {"split_x": (wrapper, wide)}
         )
-        self.assertIsNone(printer._division_table(1e-6 * x))
-        self.assertEqual(len(model.proto.variables), count)
+        table = printer._division_table(1e-6 * x)
+        self.assertIsNotNone(table)
+        half_step = 1e-6 * (max(wide) - min(wide)) / _MAX_PRODUCT_BOUND / 2
+        for i, value in enumerate(wide):
+            with self.subTest(division=i):
+                fixed = model.clone()
+                fixed.add(division == i)
+                solver = cp_model.CpSolver()
+                self.assertEqual(solver.solve(fixed), cp_model.OPTIMAL)
+                self.assertAlmostEqual(
+                    solver.float_value(table), 1e-6 * value, delta=half_step
+                )
 
     def test_shared_load_penalty_lowers_for_product_degrees(self):
         from torch_spyre._inductor.work_division import _matmul_multicast_penalty
@@ -2382,7 +2404,12 @@ class TestSympyExprToCpSatPrinter(TestCase):
                 expression, {"x": (a, a), "y": (b, b), "resident": (lx, lx)}, False
             )
             expected = 8192 / 150 * (_matmul_multicast_penalty(a * b) - 1) * (1 - lx)
-            self.assertAlmostEqual(solver.ObjectiveValue(), expected, places=5)
+            # The gated product's coefficient keeps _TERM_BITS bits of its
+            # widest value.
+            widest = 8192 / 150 * _matmul_multicast_penalty(32)
+            self.assertAlmostEqual(
+                solver.ObjectiveValue(), expected, delta=widest * 2**-_TERM_BITS
+            )
 
     def test_piecewise_and_or_condition_lowering(self):
         # Exercises _print_And and _print_Or as Piecewise conditions.
@@ -2568,11 +2595,11 @@ class TestSympyExprToCpSatPrinter(TestCase):
     def test_multiply_four_int_vars_mixed_sign(self):
         self._check_multiply([(-2, 3), (1, 4), (-1, 2), (2, 3)], ["x", "y", "z", "w"])
 
-    def test_multiply_refuses_product_past_bound(self):
-        # A product whose interval bound passes _MAX_PRODUCT_BOUND needs more
-        # dynamic range than the model carries. Lowering raises instead of
-        # rescaling factors, which could round a small one such as d to 0.
-        # _minimize_cost_expr turns the ValueError into its fallback policy.
+    def test_multiply_narrows_product_past_bound(self):
+        # A product whose interval bound passes _MAX_PRODUCT_BOUND is taken over
+        # factors divided by powers of two, the widest first, so a small factor
+        # such as d keeps every bit. The maxima here are multiples of every
+        # step, so they stay exact.
         for domains in (
             {"a": (1, 2**20), "b": (1, 2**20), "d": (1, 32)},
             {"a": (1, 2**30), "d": (1, 32)},
@@ -2580,8 +2607,47 @@ class TestSympyExprToCpSatPrinter(TestCase):
         ):
             with self.subTest(domains=domains):
                 expr = sympy.Mul(*[sympy.Symbol(n, integer=True) for n in domains])
-                with self.assertRaisesRegex(ValueError, "CP-SAT bound"):
-                    self._optimize(expr, domains, maximize=True)
+                solver, _ = self._optimize(expr, domains, maximize=True)
+                exact = math.prod(hi for _, hi in domains.values())
+                self.assertEqual(solver.ObjectiveValue(), exact)
+
+    def test_narrowed_product_error_at_small_values(self):
+        # a's domain makes a * d pass the bound, so a is divided by 2**excess
+        # and rounded. Its attained value does not change that step: the
+        # product is off by up to half a step times d, and a value below half
+        # a step rounds to zero.
+        excess = (2**30).bit_length() + (32).bit_length() - _PRODUCT_TOTAL_BITS
+        half_step = 2**excess // 2
+        a, d = sympy.symbols("a d", integer=True)
+        for value in (5, 100, 2**29 + 77):
+            with self.subTest(a=value):
+                model = cp_model.CpModel()
+                sym_map = {
+                    "a": model.new_int_var(1, 2**30, "a"),
+                    "d": model.new_int_var(1, 32, "d"),
+                }
+                model.add(sym_map["a"] == value)
+                model.add(sym_map["d"] == 32)
+                model.maximize(
+                    _SympyExprToCpSat(model, dict(sym_map), {}).convert(a * d)
+                )
+                solver = cp_model.CpSolver()
+                self.assertEqual(solver.solve(model), cp_model.OPTIMAL)
+                error = abs(solver.objective_value - value * 32)
+                self.assertLessEqual(error, half_step * 32)
+                if value < half_step:
+                    self.assertEqual(solver.objective_value, 0)
+
+    def test_power_with_a_pole_at_a_candidate_is_left_alone(self):
+        # A negative power has no value at a zero candidate, so the power is
+        # returned as it came rather than lowered through its candidates.
+        t = sympy.Symbol("tile_a_o0", integer=True, nonnegative=True)
+        wrapper = types.SimpleNamespace(division=None)
+        printer = _SympyExprToCpSat(
+            cp_model.CpModel(), {}, {"tile_a_o0": (wrapper, [0, 2, 4])}
+        )
+        self.assertEqual(printer._power_pwl(t, -0.5), t**-0.5)
+        self.assertIsInstance(printer._power_pwl(t, 0.5), sympy.Piecewise)
 
     def test_multiply_at_bound_lowers_exactly(self):
         # The bound itself is inclusive: 2**15 * 2**15 lowers unscaled.
@@ -2591,10 +2657,14 @@ class TestSympyExprToCpSatPrinter(TestCase):
         )
         self.assertEqual(solver.ObjectiveValue(), _MAX_PRODUCT_BOUND)
 
-    def _pinned_split_cost(self, expr, menus, candidate, full_product=False):
+    def _pinned_split_cost(
+        self, expr, menus, candidate, full_product=False, shared=False
+    ):
         # One buffer whose split symbols take ``menus[name][i]`` under candidate
-        # division i, wired the way ``_minimize_cost_expr`` wires a real buffer,
-        # with the division pinned. Returns the objective and the model.
+        # division i, with the division pinned. Returns the objective and the
+        # model. With ``shared`` the symbols name their division selector, the
+        # way ``_minimize_cost_expr`` wires a real buffer; without it they are
+        # domain-only entries, which keep the inv_ fixed-point symbols.
         model = cp_model.CpModel()
         n = len(next(iter(menus.values())))
         division = model.new_int_var(0, n - 1, "div")
@@ -2610,7 +2680,7 @@ class TestSympyExprToCpSatPrinter(TestCase):
         for name, raw in columns.items():
             sym_map[name] = model.new_int_var(min(raw), max(raw), name)
             model.add_element(division, raw, sym_map[name])
-            buffer_map[name] = (buf, raw)
+            buffer_map[name] = (buf if shared else None, raw)
         model.minimize(_SympyExprToCpSat(model, sym_map, buffer_map).convert(expr))
         solver = cp_model.CpSolver()
         status = solver.Solve(model)
@@ -2621,6 +2691,44 @@ class TestSympyExprToCpSatPrinter(TestCase):
     def _domain_of(model, name):
         (var,) = [v for v in model.proto.variables if v.name == name]
         return min(var.domain), max(var.domain)
+
+    def test_a_power_of_one_buffers_product_is_piecewise_linear(self):
+        # With a shared selector the reciprocal of a product of one buffer's
+        # splits is one piecewise-linear power through the product's candidate
+        # values, within _POWER_PWL_TOLERANCE of the exact cost at each.
+        a, b, k = sympy.symbols("split_a split_b split_k", integer=True, positive=True)
+        menus = {
+            "split_a": [1, 2, 4, 8, 2, 4, 8, 16],
+            "split_b": [1, 3, 6, 2, 1, 2, 4, 2],
+            "split_k": [2, 1, 1, 4, 1, 2, 1, 1],
+        }
+        for i in range(len(menus["split_a"])):
+            with self.subTest(division=i):
+                got, _ = self._pinned_split_cost(
+                    1000 * k / (a * b), menus, i, shared=True
+                )
+                k_i, a_i, b_i = (menus[n][i] for n in ("split_k", "split_a", "split_b"))
+                exact = 1000 * k_i / (a_i * b_i)
+                self.assertAlmostEqual(got, exact, delta=_POWER_PWL_TOLERANCE * exact)
+
+    def test_tile_counts_are_tabulated(self):
+        # A tile count shares its buffer's division selector, so an expression
+        # over it is one division table, like one over a split.
+        t = sympy.Symbol("tile_a_o0", integer=True, positive=True)
+        menus = {"tile_a_o0": [1, 2, 4, 8]}
+        for i, count in enumerate(menus["tile_a_o0"]):
+            with self.subTest(division=i):
+                got, model = self._pinned_split_cost(
+                    1000 * t**-0.5, menus, i, shared=True
+                )
+                exact = 1000 * count**-0.5
+                self.assertAlmostEqual(got, exact, delta=_POWER_PWL_TOLERANCE * exact)
+                self.assertTrue(
+                    any(
+                        v.name.startswith("division_cost_")
+                        for v in model.proto.variables
+                    )
+                )
 
     def test_inverse_scale_is_lcm_of_candidate_splits(self):
         # Each inv_ variable is scaled by the LCM of its own candidates -- 8
@@ -3223,19 +3331,16 @@ class TestInvScale(TestCase):
 
 
 class TestObjectiveCostParams(TestCase):
-    """Every solver's objective drops the tile-height derates."""
+    """The objective prices a tile's height, so tile counts do not tie."""
 
-    def test_the_objective_neutralizes_the_derates(self):
-        from torch_spyre._inductor.cost_model import CostParams, coarse_underfill_eff
+    def test_the_objective_keeps_the_derates(self):
+        from torch_spyre._inductor.cost_model import coarse_underfill_eff
         from torch_spyre._inductor.scratchpad.allocator import _COST_PARAMS
 
-        # A symbolic tile height leaves no fractional power behind.
-        is_lx, split = sympy.symbols("is_lx_buf0 split_buf0_d0", positive=True)
-        rpc = (256 * (1 - is_lx) + 1024 * is_lx) / split
-        eff = sympy.sympify(coarse_underfill_eff(rpc, 512, _COST_PARAMS))
-        self.assertFalse(eff.free_symbols)
-        self.assertEqual(float(eff), 1.0)
-        self.assertLess(coarse_underfill_eff(2.0, 512, CostParams()), 1)
+        tile = sympy.Symbol("tile_buf0_o0", integer=True, positive=True)
+        eff = sympy.sympify(coarse_underfill_eff(1024 / tile, 512, _COST_PARAMS))
+        self.assertEqual(eff.free_symbols, {tile})
+        self.assertLess(float(eff.subs(tile, 1024)), float(eff.subs(tile, 2)))
 
 
 if __name__ == "__main__":
