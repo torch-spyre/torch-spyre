@@ -40,6 +40,7 @@ common Torch-Spyre use cases.
 | `distributed/reduce.py` | Reduce collective on Spyre |
 | `distributed/compiled/broadcast_demo_multirank.py` | Multi-rank broadcast walkthrough with pre- and post-broadcast computation |
 | `distributed/compiled/all_gather_demo_multirank.py` | Multi-rank all-gather walkthrough |
+| `distributed/compiled/all_to_all_demo_multirank.py` | Multi-rank all-to-all with uneven splits, where the output's dim 0 differs from the input's |
 | `distributed/compiled/all_reduce_demo_multirank.py` | Multi-rank allreduce via `torch.compile`'s plan/run collective ops |
 | `distributed/compiled/all_reduce_demo_multicalls_multirank.py` | Multi-rank allreduce with multiple compiled calls sharing one plan |
 

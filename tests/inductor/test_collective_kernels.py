@@ -13,8 +13,8 @@
 # limitations under the License.
 """Unit tests for the Spyre collective IR nodes, built through the factories.
 
-The lowerings build ``BroadcastKernel``, ``AllGatherKernel``, ``AllReduceKernel``
-and ``WaitKernel`` with the upstream ``_CollectiveKernel`` factories
+The lowerings build ``BroadcastKernel``, ``AllGatherKernel``, ``AllToAllKernel``,
+``AllReduceKernel`` and ``WaitKernel`` with the upstream ``_CollectiveKernel`` factories
 (``create_inplace``, ``create_out_of_place``, ``create_wait``), so their
 dependency model is stock Inductor's and can change with the torch pin. These
 tests build real nodes the same way, under a minimal graph handler and without
@@ -39,9 +39,11 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 
 from torch.spyre import SpyreTensorLayout
 
+from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.ir import (
     AllGatherKernel,
     AllReduceKernel,
+    AllToAllKernel,
     BroadcastKernel,
     FixedTiledLayout,
     WaitKernel,
@@ -82,20 +84,38 @@ class _CollectiveGraphTest(unittest.TestCase):
         stack.enter_context(V.set_current_node(next(iter(gm.graph.nodes))))
 
     @staticmethod
-    def _input(name="x"):
+    def _input(name="x", size=None):
         # Collective codegen requires a finalized device layout, as layout
         # propagation leaves it on real inputs.
+        size = list(size or _SIZE)
+        stride = [1] * len(size)
+        for i in range(len(size) - 2, -1, -1):
+            stride[i] = stride[i + 1] * size[i + 1]
         layout = FixedTiledLayout(
             torch.device("cpu"),
             torch.float16,
-            _SIZE,
-            [64, 1],
-            SpyreTensorLayout(_SIZE, torch.float16),
+            size,
+            stride,
+            SpyreTensorLayout(size, torch.float16),
         )
         buf = InputBuffer(name=name, layout=layout)
         V.graph.name_to_buffer[name] = buf
         V.graph.graph_inputs[name] = buf
         return TensorBox(StorageBox(buf))
+
+    @staticmethod
+    def _commit_default_layout(node):
+        # What finalize_layouts does for an out-of-place collective whose
+        # layout propagation picked the default STL for its own shape.
+        layout = node.get_layout()
+        node.layout = FixedTiledLayout(
+            layout.device,
+            layout.dtype,
+            list(layout.size),
+            list(layout.stride),
+            SpyreTensorLayout([int(s) for s in layout.size], layout.dtype),
+        )
+        return node
 
     @staticmethod
     def _last_op():
@@ -138,6 +158,12 @@ class TestFactoryBookkeeping(_CollectiveGraphTest):
                 (2, "group0"),
                 [2 * _SIZE[0], _SIZE[1]],
             ),
+            (
+                AllToAllKernel,
+                _c10d.all_to_all_single.default,
+                ([4, 4], [4, 4], "group0"),
+                _SIZE,
+            ),
         ]
         for cls, op, args, size in cases:
             with self.subTest(cls.__name__):
@@ -149,7 +175,11 @@ class TestFactoryBookkeeping(_CollectiveGraphTest):
                 self.assertNotIsInstance(result.layout, NoneLayout)
                 self.assertEqual(list(result.get_size()), size)
                 self.assertEqual(result.get_dtype(), torch.float16)
-                self.assertEqual(result.constant_args, args)
+                # Split lists (all_to_all) are flattened into constant_args.
+                flat = tuple(
+                    v for a in args for v in (a if isinstance(a, list) else (a,))
+                )
+                self.assertEqual(result.constant_args, flat)
                 self.assertEqual(result.mutation_outputs, [])
                 self.assertTrue(result.has_side_effects())
 
@@ -220,6 +250,98 @@ class TestCodegen(_CollectiveGraphTest):
                 f"{g} = torch.ops.spyre.allgather_run(g_in, _ag_plan_{g}, 2)",
             ],
         )
+
+    def _a2a(self, size, output_splits, input_splits, name="a_in"):
+        node = AllToAllKernel.create_out_of_place(
+            _c10d.all_to_all_single.default,
+            self._input(name, size),
+            output_splits,
+            input_splits,
+            "g0",
+        )
+        return self._commit_default_layout(node)
+
+    def test_all_to_all_codegen(self):
+        # [8, 64] fp16: each row is one 64-element stick, so 4 rows = 256
+        # device elements per peer.
+        a2a = self._a2a(_SIZE, [4, 4], [4, 4])
+        wrapper = _RecordingWrapper()
+
+        a2a.codegen(wrapper)
+
+        a = a2a.get_name()
+        self.assertEqual(
+            wrapper.header_lines(),
+            [
+                f"_a2a_plan_{a} = torch.ops.spyre.alltoall_plan("
+                f"[256, 256], [256, 256], {_FP16}, 'g0')"
+            ],
+        )
+        self.assertEqual(
+            wrapper.lines,
+            [f"{a} = torch.ops.spyre.alltoall_run(a_in, _a2a_plan_{a}, 8)"],
+        )
+
+    def test_all_to_all_uneven_codegen(self):
+        # Send 2 rows to rank 0 and 6 to rank 1; receive 3 + 1 rows, so the
+        # output has 4 rows.  Splits are passed in device elements.
+        a2a = self._a2a(_SIZE, [3, 1], [2, 6])
+        wrapper = _RecordingWrapper()
+
+        a2a.codegen(wrapper)
+
+        a = a2a.get_name()
+        self.assertEqual(list(a2a.get_size()), [4, 64])
+        self.assertEqual(
+            wrapper.header_lines(),
+            [
+                f"_a2a_plan_{a} = torch.ops.spyre.alltoall_plan("
+                f"[192, 64], [128, 384], {_FP16}, 'g0')"
+            ],
+        )
+        self.assertEqual(
+            wrapper.lines,
+            [f"{a} = torch.ops.spyre.alltoall_run(a_in, _a2a_plan_{a}, 4)"],
+        )
+
+    def test_all_to_all_uneven_1d_codegen(self):
+        # 1-D: rows are single elements; each split must be whole sticks.
+        a2a = self._a2a([256], [64, 128], [192, 64])
+        wrapper = _RecordingWrapper()
+
+        a2a.codegen(wrapper)
+
+        a = a2a.get_name()
+        self.assertEqual(
+            wrapper.header_lines(),
+            [
+                f"_a2a_plan_{a} = torch.ops.spyre.alltoall_plan("
+                f"[64, 128], [192, 64], {_FP16}, 'g0')"
+            ],
+        )
+        self.assertEqual(
+            wrapper.lines,
+            [f"{a} = torch.ops.spyre.alltoall_run(a_in, _a2a_plan_{a}, 192)"],
+        )
+
+    def test_all_to_all_rejects_rows_split_across_stick_tiles(self):
+        # [4, 128] fp16 has device_size [2, 4, 64]: dim 1's stick tiles are
+        # outside dim 0, so a flat split would interleave rows.
+        a2a = self._a2a([4, 128], [2, 2], [2, 2])
+        with self.assertRaisesRegex(Unsupported, "rows are not contiguous"):
+            a2a.codegen(_RecordingWrapper())
+
+    def test_all_to_all_rejects_split_not_stick_aligned(self):
+        # A 1-D split of 32 fp16 elements is 64 bytes, half a stick.
+        a2a = self._a2a([128], [32, 96], [32, 96])
+        with self.assertRaisesRegex(Unsupported, "multiple of 128 bytes"):
+            a2a.codegen(_RecordingWrapper())
+
+    def test_all_to_all_rejects_padded_1d(self):
+        # 96 fp16 elements pad to 128 on device; the padding would be sent.
+        a2a = self._a2a([96], [32, 64], [32, 64])
+        with self.assertRaisesRegex(Unsupported, "padded"):
+            a2a.codegen(_RecordingWrapper())
 
     def test_wait_is_a_bare_call(self):
         gathered = AllGatherKernel.create_out_of_place(

@@ -170,6 +170,7 @@ Task-specific guidance is available in `.claude/skills/`. These cover:
 
 - **project-overview** — repo layout, Spyre architecture, compilation pipeline
 - **add-spyre-operation** — patterns for adding new ops
+- **add-torch-spyre-collective** — wiring a new collective through the compiled path
 - **write-spyre-op-test** — compiled-path op test framework and patterns
 - **pr-review** — PR review checklist
 - **debug-compilation** — troubleshooting compilation failures

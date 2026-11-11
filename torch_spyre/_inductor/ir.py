@@ -685,6 +685,113 @@ class AllGatherKernel(SpyreCollectiveKernel):
         return f"torch.ops.spyre.allgather_run({input_name}, {plan_var}, {group_size})"
 
 
+_STICK_BYTES = 128
+
+
+def _dim0_row_device_elems(layout: FixedLayout, what: str) -> int:
+    """Device elements spanned by one dim-0 row, if rows are contiguous.
+
+    spyre-comms splits the *flat* device buffer, so an all_to_all along dim 0
+    is only correct when each dim-0 row is one contiguous run of device memory
+    and rows are stored in order.  That holds for a 1-D tensor without padding,
+    and for an N-D tensor whose outermost non-trivial device dim walks dim 0
+    (untiled) with everything else inside it.  It does not hold for the default
+    layout of e.g. ``(4, 128)`` fp16, ``device_size=[2, 4, 64]``, where the
+    stick tiles of dim 1 are outside dim 0.
+    """
+    if not isinstance(layout, FixedTiledLayout):
+        raise Unsupported(f"all_to_all {what} requires a finalized device layout")
+    total = _compute_device_num_elems(layout)
+    dim0 = int(layout.size[0])
+    if dim0 == 0:
+        raise Unsupported(f"all_to_all {what} must have a non-empty dim 0")
+    if dim0 == 1:
+        return total
+    stl = layout.device_layout
+    if len(layout.size) == 1:
+        if total != dim0:
+            raise Unsupported(
+                f"all_to_all {what}: a 1-D tensor of {dim0} elements is padded "
+                f"to {total} device elements; use a multiple of "
+                f"{stl.elems_per_stick()} elements"
+            )
+        return 1
+    stride0 = int(layout.stride[0])
+    non_trivial = [i for i, s in enumerate(stl.device_size) if s > 1]
+    d0 = non_trivial[0]
+    rows_contiguous = (
+        stl.stride_map[d0] == stride0
+        and stl.device_size[d0] == dim0
+        and all(
+            stl.stride_map[i] == -1 or stl.stride_map[i] < stride0
+            for i in non_trivial[1:]
+        )
+    )
+    if not rows_contiguous:
+        raise Unsupported(
+            f"all_to_all {what}: dim-0 rows are not contiguous in device memory "
+            f"(size={list(layout.size)}, device_size={stl.device_size}, "
+            f"stride_map={stl.stride_map}); the last dims must fit in one stick "
+            f"tile ({stl.elems_per_stick()} elements) or the tensor must be 1-D"
+        )
+    return total // dim0
+
+
+class AllToAllKernel(SpyreCollectiveKernel):
+    """Out-of-place ``_c10d_functional.all_to_all_single``, even or uneven splits.
+
+    Rank r's input is cut along dim 0 into ``input_split_sizes`` rows; slice j
+    goes to rank j.  The output is the concatenation, by source rank, of the
+    slices received, so its dim 0 is ``sum(output_split_sizes)``.
+    ``constant_args`` is the c10d schema's non-tensor args with the two split
+    lists flattened: ``(*output_split_sizes, *input_split_sizes, group_name)``.
+
+    The plan takes the splits in device elements of the flat device buffer,
+    which is only a correct dim-0 split when rows are contiguous on device
+    (see ``_dim0_row_device_elems``); codegen rejects other layouts.
+    """
+
+    plan_prefix = "a2a"
+
+    def _split_args(self) -> tuple[list[int], list[int], str]:
+        *splits, group_name = self.constant_args
+        half = len(splits) // 2
+        return list(splits[:half]), list(splits[half:]), group_name
+
+    def _plan_call(self, num_elems: int, dtype_code: int) -> str:
+        output_splits, input_splits, group_name = self._split_args()
+        in_layout = _collective_input_layout(self.inputs[0])
+        in_row = _dim0_row_device_elems(in_layout, "input")
+        out_row = _dim0_row_device_elems(self.get_layout(), "output")
+        if in_row != out_row:
+            raise Unsupported(
+                "all_to_all: input and output rows span different device sizes "
+                f"({in_row} vs {out_row} elements)"
+            )
+        elem_bytes = torch.tensor([], dtype=in_layout.dtype).element_size()
+        for s in output_splits + input_splits:
+            if (s * in_row * elem_bytes) % _STICK_BYTES:
+                raise Unsupported(
+                    f"all_to_all: a split of {s} rows is {s * in_row * elem_bytes}"
+                    f" bytes on device; each split must be a multiple of "
+                    f"{_STICK_BYTES} bytes (splits: output={output_splits}, "
+                    f"input={input_splits})"
+                )
+        out_elems = [s * in_row for s in output_splits]
+        in_elems = [s * in_row for s in input_splits]
+        return (
+            f"torch.ops.spyre.alltoall_plan("
+            f"{out_elems}, {in_elems}, {dtype_code}, '{group_name}')"
+        )
+
+    def _run_call(self, input_name: str, plan_var: str) -> str:
+        output_splits, _, _ = self._split_args()
+        return (
+            f"torch.ops.spyre.alltoall_run("
+            f"{input_name}, {plan_var}, {sum(output_splits)})"
+        )
+
+
 class AllReduceKernel(SpyreCollectiveKernel):
     """In-place ``_c10d_functional.all_reduce_``.
 
