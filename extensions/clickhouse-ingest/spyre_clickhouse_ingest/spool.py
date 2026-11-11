@@ -18,8 +18,13 @@ Batches a write could not land go to a local directory, or to a shared store tha
 runner. Every write, and process start, first replays what is pending (bounded, so it never holds
 up the caller's own write) and only then sends its own rows.
 
-* A claim is an atomic rename. Two writers racing on one item cannot both win. A claim carries a
-  lease; a writer that died leaves a claim that expires and is replayed.
+* A local claim is an atomic rename; the shared claim is a lock file read back (see
+  `ArtifactorySpool.claim`). A claim carries a lease; a writer that died leaves a claim that
+  expires and is replayed.
+* Write-ahead: an item is recorded as "may be stored" before every replay send, locally by one
+  atomic rename that fails if the claim is gone, on the shared tier by a PUT with the lock
+  re-verified before and after. A crash, a lost response or a lease that expires mid-send leaves a
+  held item, never a clean one that is resent. If the record cannot be made, nothing is sent.
 * A batch refused before any write (`ambiguous` False) is sent again as is, on any table.
 * A batch a failed attempt may have stored (`ambiguous` True) is safe to resend only on a
   Replicated table inside its dedup window, where the original `insert_deduplication_token`
@@ -33,8 +38,9 @@ up the caller's own write) and only then sends its own rows.
   the only live path and every ambiguous plain-table batch is held. A real probe needs a batch
   marker, such as a batch-id column or `insert_deduplication_token` on a Replicated table;
   counting rows by sort key would call a lost batch stored.
-* A crash between a successful send and the file's removal resends a plain-table batch once
-  more; only a Replicated table can absorb that.
+* A drainer paused between its last check and the send for longer than the lease margin can
+  still send after another drainer took the item; the record is in place by then, so the other
+  holds it. The ClickHouse side does not fence that one send.
 * The shared tier holds row data. It is used only by trusted runs (see `shared_allowed`) and any
   failure there falls back to the local directory.
 """
@@ -53,10 +59,11 @@ from typing import Callable, Protocol
 
 from . import resilience as rz
 
-CLAIM = ".claimed-"
+CLAIM = rz.CLAIM
 CORRUPT = ".corrupt"
-# clickhouse-connect's send_receive_timeout default; a lease must outlast one send.
-SEND_TIMEOUT_S = 300.0
+# Worst case of one send with clickhouse-connect's defaults: up to 300 s to upload the body and
+# 300 s to read the reply. A lease must outlast it.
+SEND_TIMEOUT_S = 600.0
 LEASE_MARGIN_S = 60.0
 # Conservative: ClickHouse keeps tokens for the last N blocks per table (replicated_deduplication_window)
 # and for 7 days; a busy table can evict a token well before the time bound.
@@ -66,6 +73,10 @@ TRUSTED_EVENTS = frozenset({"push", "schedule", "workflow_dispatch"})
 
 class Unreachable(OSError):
     """The shared tier refused the connection before sending anything: nothing was stored."""
+
+
+class SharedDenied(PermissionError):
+    """The shared tier rejected our credentials (HTTP 401/403): the PUT definitely did not land."""
 
 
 class SpoolFull(RuntimeError):
@@ -146,7 +157,9 @@ class LocalTier(rz.Spool):
             pass
 
     def claimed(self):
-        return sorted(self.dir.glob(f"*.json{CLAIM}*"))
+        return sorted(
+            p for p in self.dir.iterdir() if p.name[:1].isdigit() and CLAIM in p.name
+        )
 
 
 @dataclass
@@ -187,6 +200,7 @@ class TieredSpool:
         writer: str = "w",
         lease_s: float | None = None,
         send_timeout_s: float | None = SEND_TIMEOUT_S,
+        feeds_views: bool = True,
         drain_max_items: int = 20,
         drain_budget_s: float = 10.0,
         dedup_window_s: float = DEDUP_WINDOW_S,
@@ -218,6 +232,7 @@ class TieredSpool:
         self.writer, self.lease_s = writer, lease_s
         self.drain_max_items, self.drain_budget_s = drain_max_items, drain_budget_s
         self.dedup_window_s = dedup_window_s
+        self.feeds_views = feeds_views
         self.max_bytes, self.max_age_s = max_bytes, max_age_s
         self.now = clock or time.time
         self.owner = f"{os.getpid()}-{writer}-{uuid.uuid4().hex[:8]}"
@@ -232,12 +247,20 @@ class TieredSpool:
     def put_shared(self, table, columns, rows, token, database=None, **meta) -> None:
         if self.shared is None or not self.trusted:
             raise PermissionError("the shared spool is not available to this run")
+        name = f"{self.writer}/{token}.jsonl"
+        ambiguous = bool(meta.get("ambiguous"))
+        try:  # parking the same batch again never downgrades a "may be stored" record
+            ambiguous = ambiguous or bool(
+                json.loads(self.shared.get(name)).get("ambiguous")
+            )
+        except (OSError, ValueError, KeyError, AttributeError):
+            pass
         doc = {
             "table": table, "columns": list(columns), "rows": [list(r) for r in rows],
             "token": token, "database": database, "created": meta.get("created", self.now()),
-            "ambiguous": bool(meta.get("ambiguous")), "scope": meta.get("scope"),
+            "ambiguous": ambiguous, "scope": meta.get("scope"),
         }  # fmt: skip
-        self.shared.put(f"{self.writer}/{token}.jsonl", _encode(doc))
+        self.shared.put(name, _encode(doc))
 
     def put_any(self, table, columns, rows, token, database=None, **meta) -> str:
         """Shared when this run may use it and it answers, else local. Raises SpoolFull."""
@@ -246,6 +269,12 @@ class TieredSpool:
             try:
                 self.put_shared(table, columns, rows, token, database, **meta)
                 return "shared"
+            except SharedDenied:
+                print(
+                    "  [spool] the shared tier refused our credentials (HTTP 401/403); "
+                    "keeping the batch locally",
+                    file=sys.stderr,
+                )
             except (Unreachable, PermissionError):
                 pass
             except OSError:
@@ -260,7 +289,7 @@ class TieredSpool:
     def _check_cap(self, rows) -> None:
         extra = len(_encode({"r": [list(r) for r in rows]}))
         used = 0
-        for p in self.local.dir.glob("*.json"):
+        for p in self.local.files():
             try:
                 used += p.stat().st_size
             except OSError:
@@ -277,7 +306,7 @@ class TieredSpool:
         return self.local_count() + len(self._shared_names())
 
     def local_count(self) -> int:
-        return len(list(self.local.dir.glob("*.json")))
+        return len(self.local.files())
 
     def quarantined_count(self) -> int:
         return len(list(self.local.dir.glob("*.quarantine"))) + len(
@@ -300,7 +329,7 @@ class TieredSpool:
         st = Stats()
         now = self.now()
         ages = []
-        for p in self.local.dir.glob("*.json"):
+        for p in self.local.files():
             try:
                 created = json.loads(p.read_text()).get("created")
                 created = p.stat().st_mtime if created is None else created
@@ -391,18 +420,19 @@ class TieredSpool:
             if item is None:
                 self.local.release(claimed)
                 continue
+            where = {"path": claimed}
             outcome = self._replay_one(
                 client, item, replicated, probe, policy, sleep, log,
-                self._guarded(lambda amb, c=claimed: self._mark_local(c, amb)),
+                self._guarded(lambda amb, w=where: self._mark_local(w, amb)),
             )  # fmt: skip
             if outcome == "ok":
-                claimed.unlink(missing_ok=True)
+                where["path"].unlink(missing_ok=True)
                 res.replayed += 1
             elif outcome == "held":
-                self.local.release(claimed)
+                self.local.release(where["path"])
                 res.held += 1
             else:
-                self.local.release(claimed)
+                self.local.release(where["path"])
                 res.failed += 1
                 return res
 
@@ -465,21 +495,24 @@ class TieredSpool:
     # -- replay state ----------------------------------------------------------
 
     def _guarded(self, mark):
-        """Clearing "may be stored" is only safe while this drainer still plainly holds the claim.
+        """Record state changes only while this drainer plainly still holds the claim.
 
-        A drainer that outlived its lease may find the item already replayed and deleted by
-        another one; writing the clean record back would resurrect it. A send is bounded below the
-        lease, so a late clear is skipped and the item stays held.
+        The record is checked against the claim age before and after it is written; past
+        `lease_s - LEASE_MARGIN_S` nothing is sent and nothing is cleared. Safe by construction
+        of the record, not of this check: see `_mark_local` and `_mark_shared`. The residual is a
+        pause between the last check and the send; the record is already in place by then, so a
+        second drainer that takes the item afterwards finds it held.
         """
         claimed_at = self.now()
 
+        def late() -> bool:
+            return self.now() - claimed_at >= self.lease_s - LEASE_MARGIN_S
+
         def persist(ambiguous: bool) -> bool:
-            if (
-                not ambiguous
-                and self.now() - claimed_at >= self.lease_s - LEASE_MARGIN_S
-            ):
+            if late():
                 return False
-            return mark(ambiguous)
+            ok = mark(ambiguous)
+            return ok and not late()
 
         return persist
 
@@ -494,50 +527,58 @@ class TieredSpool:
     def _read_claimed(self, claimed: Path) -> rz.SpoolItem | None:
         """The item as it is on disk now: a snapshot taken before the claim may be stale."""
         try:
-            return self._item_from_doc(claimed, json.loads(claimed.read_text()))
+            item = self._item_from_doc(claimed, json.loads(claimed.read_text()))
         except (OSError, ValueError, KeyError, TypeError):
             return None
+        item.ambiguous = item.ambiguous or claimed.name.partition(CLAIM)[0].endswith(
+            rz.AMB
+        )
+        return item
 
     @staticmethod
-    def _mark_local(path: Path, ambiguous: bool, clear_twin: bool = False) -> bool:
-        """Durably rewrite `ambiguous` in the file at `path`; the original survives a failure.
+    def _mark_local(where: dict, ambiguous: bool) -> bool:
+        """Set or clear the may-be-stored marker with one atomic rename of the claimed file.
 
-        The temp name matches neither the *.json nor the claim glob, so a crash or a full disk
-        cannot leave a half-written file that a reaper would release over the good one.
+        The rename fails if the claim was reaped or taken by another drainer, so a drainer that
+        outlived its lease can neither record nor send. The marker is in the name, so there is no
+        half-written state to recover.
         """
-        tmp = path.with_name(f".rw-{uuid.uuid4().hex[:8]}.tmp")
+        src = where["path"]
+        dst = src.with_name(rz.with_marker(src.name, ambiguous))
+        if dst == src:
+            return True
         try:
-            doc = json.loads(path.read_text())
-            doc["ambiguous"] = ambiguous
-            if clear_twin:
-                doc["twin"] = None
-            with open(tmp, "w") as fh:
-                json.dump(doc, fh, default=str)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmp, path)
-            fd = os.open(path.parent, os.O_RDONLY)
+            os.rename(src, dst)
+        except OSError:
+            return False
+        where["path"] = dst
+        try:
+            fd = os.open(dst.parent, os.O_RDONLY)
             try:
                 os.fsync(fd)
             finally:
                 os.close(fd)
-            return True
-        except (OSError, ValueError):
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
-            return False
+        except OSError:
+            pass
+        return True
 
-    def _mark_shared(self, name: str, item: rz.SpoolItem, ambiguous: bool) -> bool:
+    def _mark_shared(
+        self, name: str, item: rz.SpoolItem, ambiguous: bool, claimed: bool = True
+    ) -> bool:
+        """PUT the record, with the claim re-verified before and after. If it cannot be verified
+        the caller does not send; a record written by a drainer that lost its claim leaves a held
+        item, never a clean one."""
+        owns = getattr(self.shared, "owns", None) if claimed else None
         doc = {
             "table": item.table, "columns": list(item.columns), "rows": item.rows,
             "token": item.token, "database": item.database, "created": item.created,
             "ambiguous": ambiguous, "scope": item.scope,
         }  # fmt: skip
         try:
+            if owns is not None and not owns(name, self.owner):
+                return False
             self.shared.put(name, _encode(doc))
-            return True
+            return owns is None or owns(name, self.owner)
         except OSError:
             return False
 
@@ -585,10 +626,10 @@ class TieredSpool:
         try:
             rz._send(
                 client, item.table, item.rows, item.columns, item.database,
-                rz._settings(policy, item.token, replicated, False),
+                rz._settings(policy, item.token, replicated, False, self.feeds_views),
             )  # fmt: skip
         except Exception as err:  # noqa: BLE001
-            kind = rz.classify(err)
+            kind = rz.classify(err, self.feeds_views)
             if kind == "retry" and was_clean:
                 persist(
                     False
@@ -622,37 +663,134 @@ class TieredSpool:
         return self._item_from_doc(Path(name), json.loads(self.shared.get(name)))
 
     def release_held(self, token: str) -> int:
-        """Mark items with this token as safe to resend. A person calls this only after checking
-        the table: the batch's rows are NOT stored (or may be stored twice harmlessly)."""
+        """Mark a batch safe to resend. A person calls this only after checking the table: the
+        batch's rows are NOT stored.
+
+        When both tiers hold the batch (a local twin of a shared PUT that may have landed), only
+        the shared copy is kept and released; the local one is deleted, so the rows cannot be
+        sent twice. If the shared tier cannot be asked, nothing is changed.
+        """
+        _check_token(token)
+        local = [p for p in self.local.files() if f"-{token}.json" in p.name]
+        shared = self._shared_copies(token) if self.shared is not None else []
+        had_twin = False
+        for p in local:
+            try:
+                had_twin = had_twin or bool(json.loads(p.read_text()).get("twin"))
+            except (OSError, ValueError):
+                pass
+        if had_twin and (self.shared is None or not self.trusted):
+            raise OSError(
+                "this batch has a local twin of a shared copy and this run cannot read the "
+                "shared tier; run it where it can, or drop the batch"
+            )
+        if local and shared:
+            for p in local:
+                p.unlink(missing_ok=True)
+            local = []
         n = 0
-        for p in self.local.dir.glob(f"*-{token}.json"):
-            n += self._mark_local(p, False, clear_twin=True)
-        for name, _ in self._shared_names():
-            if name.endswith(f"/{token}.jsonl"):
-                n += self._mark_shared(name, self._shared_item(name), False)
+        for p in local:
+            n += self._release_local(p)
+        for name in shared:
+            n += self._mark_shared(name, self._shared_item(name), False, claimed=False)
         return n
 
+    def _shared_copies(self, token: str) -> list[str]:
+        if self.shared is None or not self.trusted:
+            return []
+        return [
+            n
+            for n, _ in self.shared.list()
+            if n.endswith(f"/{token}.jsonl")
+            and CLAIM not in n
+            and not n.endswith(CORRUPT)
+        ]
+
+    @staticmethod
+    def _release_local(path: Path) -> int:
+        tmp = path.with_name(f".rw-{uuid.uuid4().hex[:8]}.tmp")
+        try:
+            doc = json.loads(path.read_text())
+            doc["ambiguous"], doc["twin"] = False, None
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w") as fh:
+                json.dump(doc, fh, default=str)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+            rz.Spool._mark(path, False)
+            return 1
+        except (OSError, ValueError):
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            return 0
+
     def drop(self, token: str) -> int:
-        """Delete items with this token, after a person has checked the rows are stored or not
-        wanted."""
+        """Delete every copy of a batch, in both tiers, after a person has checked the rows are
+        stored or not wanted."""
+        _check_token(token)
         n = 0
-        for p in self.local.dir.glob(f"*-{token}.json"):
+        for p in self.local.copies(token):
             p.unlink(missing_ok=True)
             n += 1
-        for name, _ in self._shared_names():
-            if name.endswith(f"/{token}.jsonl"):
-                self.shared.delete(name)
-                n += 1
+        for name in self._shared_copies(token):
+            self.shared.delete(name)
+            n += 1
         return n
 
     def _check_client_timeout(self, client) -> None:
-        """A send must finish inside the lease, or a second drainer takes the item mid-send."""
-        t = getattr(client, "timeout", None)
-        if isinstance(t, (int, float)) and t + LEASE_MARGIN_S > self.lease_s:
+        """Refuse a client whose worst-case send outlasts the lease: a second drainer would take
+        the item mid-send."""
+        worst = worst_send_s(client)
+        if worst is not None and worst + LEASE_MARGIN_S > self.lease_s:
             raise ValueError(
-                f"client timeout {t}s needs a lease_s above {t + LEASE_MARGIN_S}s "
-                f"(have {self.lease_s}s)"
+                f"the client can spend {worst:.0f}s on one send; lease_s must be at least "
+                f"{worst + LEASE_MARGIN_S:.0f}s (have {self.lease_s:.0f}s)"
             )
+
+
+_TOKEN_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+)
+
+
+def _check_token(token: str) -> None:
+    if (
+        not token
+        or len(token) > 200
+        or set(token) - _TOKEN_CHARS
+        or token in (".", "..")
+    ):
+        raise ValueError(f"not a spool token: {token!r}")
+
+
+def worst_send_s(client) -> float | None:
+    """The longest one insert can take on this client: connect, then up to a read timeout to
+    upload the body and another to read the reply (urllib3 applies it per socket operation). A
+    numeric `timeout` is the read timeout; a urllib3.Timeout is read field by field. None when
+    the client does not say."""
+
+    def num(x):
+        return (
+            float(x)
+            if isinstance(x, (int, float)) and not isinstance(x, bool)
+            else None
+        )
+
+    t = getattr(client, "timeout", None)
+    if num(t) is not None:
+        return 2 * num(t)
+    if t is None:
+        return None
+    total = num(getattr(t, "total", None))
+    if total is not None:
+        return total
+    read = num(getattr(t, "_read", None))
+    if read is None:
+        return None
+    return (num(getattr(t, "_connect", None)) or 0.0) + 2 * read
 
 
 def drain_at_start(client, spool: TieredSpool, *, replicated: bool, **kw) -> int:

@@ -14,16 +14,25 @@
 
 """Two-tier spool: drain-on-write, atomic claims, trust gate, caps, and the plain-table probe."""
 
+import json
 import multiprocessing
 import os
 import signal
 import threading
+from pathlib import Path
 
 import pytest
 from clickhouse_connect.driver.exceptions import DatabaseError
 
 from spyre_clickhouse_ingest import spool as sp
-from spyre_clickhouse_ingest.resilience import Policy, resilient_insert
+from spyre_clickhouse_ingest import resilience as _rz
+from spyre_clickhouse_ingest.resilience import Policy
+
+
+def resilient_insert(*a, **k):
+    k.setdefault("feeds_views", False)  # these clusters model clean refusals
+    return _rz.resilient_insert(*a, **k)
+
 
 ROWS = [[i, f"r{i}"] for i in range(6)]
 COLS = ["a", "b"]
@@ -120,6 +129,7 @@ def not_stored(c):
 
 
 def spool_of(tmp_path, shared=None, trusted=True, **kw):
+    kw.setdefault("feeds_views", False)  # these clusters model clean refusals
     return sp.TieredSpool(
         local=tmp_path / "local", shared=shared, trusted=trusted, **kw
     )
@@ -711,25 +721,26 @@ def test_if_the_attempt_cannot_be_recorded_the_item_is_not_sent(tmp_path):
     assert c.calls == [] and out.failed == 1 and len(shared.files) == 1
 
 
-def test_a_full_disk_while_recording_the_attempt_keeps_the_good_item_and_sends_nothing(
+def test_if_the_claim_cannot_be_marked_the_item_is_not_sent_and_stays_intact(
     tmp_path, monkeypatch
 ):
     import errno
 
     s = spool_of(tmp_path)
     s.put("t", COLS, [[1, "a"]], "tok-1")
-    real = os.fsync
+    real = os.rename
 
-    def full(fd):
-        raise OSError(errno.ENOSPC, "No space left on device")
+    def fail_marker(src, dst, *a, **k):
+        if ".json.amb" in str(dst):
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return real(src, dst, *a, **k)
 
-    monkeypatch.setattr(os, "fsync", full)
+    monkeypatch.setattr(os, "rename", fail_marker)
     c = Cluster(replicated=False)
     s.drain(c, replicated=False, force=True, **FAST)
-    monkeypatch.setattr(os, "fsync", real)
+    monkeypatch.setattr(os, "rename", real)
     names = sorted(p.name for p in (tmp_path / "local").iterdir())
     assert c.calls == [] and len(names) == 1 and names[0].endswith("-tok-1.json")
-    assert [i.rows for i in s.local.pending()] == [[[1, "a"]]]
     s.drain(c, replicated=False, force=True, **FAST)
     assert c.rows == [(1, "a")]
 
@@ -806,3 +817,261 @@ def test_the_spool_command_lists_releases_and_drops(tmp_path, monkeypatch, capsy
     assert spool_cli.main(["drop", "tok-2"]) == 0
     assert spool_cli.main(["drop", "nope"]) == 1
     assert [i["held"] for i in s.items()] == [False]
+
+
+# ── a drainer that outlives its lease can neither record nor send ─────────────
+
+
+class Owned(FakeShared):
+    """FakeShared that also answers `owns`, like ArtifactorySpool."""
+
+    def claim(self, name, owner):
+        got = super().claim(name, owner)
+        if got is not None:
+            self.holder = getattr(self, "holder", {})
+            self.holder[name] = owner
+        return got
+
+    def owns(self, name, owner):
+        return getattr(self, "holder", {}).get(name) == owner and name in self.held
+
+    def steal(self, name, owner):
+        self.held[name] = owner
+        self.holder[name] = owner
+
+
+def test_a_reaped_local_claim_cannot_be_marked_or_sent(tmp_path):
+    now = [10_000.0]
+    a = spool_of(tmp_path, clock=lambda: now[0])
+    a.put("t", COLS, [[1, "a"]], "tok-1", created=now[0])
+    listed = next(iter(a.local.pending()))
+    claimed = a.local.claim(listed, a.owner, now[0])
+    now[0] += a.lease_s + 1
+    b = spool_of(tmp_path, clock=lambda: now[0])
+    c = Cluster(replicated=False)
+    b.drain(c, replicated=False, force=True, **FAST)  # reaps A's claim, sends, deletes
+    assert c.rows == [(1, "a")]
+    assert (
+        a._mark_local({"path": claimed}, True) is False
+    )  # A pauses past the lease: no write
+    assert not any((tmp_path / "local").iterdir())
+
+
+def test_a_marker_written_before_a_pause_leaves_the_item_held_for_the_next_drainer(
+    tmp_path,
+):
+    now = [10_000.0]
+    a = spool_of(tmp_path, clock=lambda: now[0])
+    a.put("t", COLS, [[1, "a"]], "tok-1", created=now[0])
+    claimed = a.local.claim(next(iter(a.local.pending())), a.owner, now[0])
+    where = {"path": claimed}
+    assert a._mark_local(
+        where, True
+    )  # write-ahead done, then A is paused before its send
+    now[0] += a.lease_s + 1
+    b = spool_of(tmp_path, clock=lambda: now[0])
+    c = Cluster(replicated=False)
+    out = b.drain(c, replicated=False, force=True, **FAST)
+    assert c.rows == [] and out.held == 1
+
+
+def test_a_shared_claim_lost_before_the_record_is_written_writes_nothing(tmp_path):
+    shared = Owned()
+    a = spool_of(tmp_path, shared=shared)
+    a.put_shared("t", COLS, [[1, "a"]], "tok-1")
+    name = "w/tok-1.jsonl"
+    assert shared.claim(name, a.owner) == name
+    item = a._item_from_doc(Path(name), json.loads(shared.files[name]))
+    shared.steal(name, "B")
+    shared.files.pop(name)  # B replayed and deleted it
+    assert a._mark_shared(name, item, True) is False
+    assert name not in shared.files
+
+
+def test_a_shared_claim_lost_during_the_record_write_means_no_send(tmp_path):
+    shared = Owned()
+    a = spool_of(tmp_path, shared=shared)
+    a.put_shared("t", COLS, [[1, "a"]], "tok-1")
+    name = "w/tok-1.jsonl"
+    shared.claim(name, a.owner)
+    item = a._item_from_doc(Path(name), json.loads(shared.files[name]))
+    real_put = shared.put
+
+    def put_then_lose(n, d):
+        real_put(n, d)
+        shared.steal(n, "B")
+
+    shared.put = put_then_lose
+    assert a._mark_shared(name, item, True) is False
+    assert json.loads(shared.files[name])["ambiguous"] is True  # left held, not clean
+
+
+# ── twins, re-parking ─────────────────────────────────────────────────────────
+
+
+class Landing(Owned):
+    """A PUT that lands and then reports a failure."""
+
+    land_then_fail = True
+
+    def put(self, name, data):
+        super().put(name, data)
+        if self.land_then_fail:
+            raise OSError("timed out")
+
+
+def twin_pair(tmp_path):
+    shared = Landing()
+    s = spool_of(tmp_path, shared=shared)
+    s.put_any("t", COLS, [[1, "a"]], "tok-1")
+    shared.land_then_fail = False
+    return s, shared
+
+
+def test_releasing_a_twin_pair_keeps_only_the_shared_copy(tmp_path):
+    s, shared = twin_pair(tmp_path)
+    assert len(shared.files) == 1 and s.local_count() == 1
+    assert s.release_held("tok-1") == 1
+    assert s.local_count() == 0
+    c = Cluster(replicated=False)
+    s.drain(c, replicated=False, force=True, **FAST)
+    s.drain(c, replicated=False, force=True, **FAST)
+    assert c.rows == [(1, "a")]
+
+
+def test_releasing_a_twin_whose_shared_put_never_landed_releases_the_local_copy(
+    tmp_path,
+):
+    shared = Landing()
+    shared.land_then_fail = False
+    s = spool_of(tmp_path, shared=shared)
+    s.put("t", COLS, [[1, "a"]], "tok-1", ambiguous=True, twin="w/tok-1.jsonl")
+    assert s.release_held("tok-1") == 1
+    c = Cluster(replicated=False)
+    s.drain(c, replicated=False, force=True, **FAST)
+    assert c.rows == [(1, "a")]
+
+
+def test_releasing_a_twin_without_a_readable_shared_tier_changes_nothing(tmp_path):
+    s, shared = twin_pair(tmp_path)
+    shared.reachable = False
+    with pytest.raises(OSError):
+        s.release_held("tok-1")
+    assert s.local_count() == 1 and len(shared.files) == 1
+    s.shared = None
+    with pytest.raises(OSError):
+        s.release_held("tok-1")
+
+
+def test_dropping_a_twin_pair_removes_both_copies(tmp_path):
+    s, shared = twin_pair(tmp_path)
+    assert s.drop("tok-1") == 2
+    assert s.local_count() == 0 and not shared.files
+
+
+def test_parking_again_as_possibly_stored_upgrades_a_clean_local_file(tmp_path):
+    s = spool_of(tmp_path)
+    s.put("t", COLS, [[1, "a"]], "tok-1")
+    s.put("t", COLS, [[1, "a"]], "tok-1", ambiguous=True)
+    assert [i.ambiguous for i in s.local.pending()] == [True]
+    s.put("t", COLS, [[1, "a"]], "tok-1")  # and never the reverse
+    assert [i.ambiguous for i in s.local.pending()] == [True]
+    c = Cluster(replicated=False)
+    s.drain(c, replicated=False, force=True, **FAST)
+    assert c.rows == []
+
+
+def test_parking_again_upgrades_a_claimed_local_file_too(tmp_path):
+    s = spool_of(tmp_path)
+    s.put("t", COLS, [[1, "a"]], "tok-1")
+    claimed = s.local.claim(next(iter(s.local.pending())), s.owner, s.now())
+    s.put("t", COLS, [[1, "a"]], "tok-1", ambiguous=True)
+    assert not claimed.exists()  # the drainer holding it can no longer mark or send it
+    assert s._mark_local({"path": claimed}, True) is False
+
+
+def test_parking_again_never_downgrades_a_shared_record(tmp_path):
+    shared = Owned()
+    s = spool_of(tmp_path, shared=shared)
+    s.put_shared("t", COLS, [[1, "a"]], "tok-1")
+    s.put_shared("t", COLS, [[1, "a"]], "tok-1", ambiguous=True)
+    assert json.loads(shared.files["w/tok-1.jsonl"])["ambiguous"] is True
+    s.put_shared("t", COLS, [[1, "a"]], "tok-1")
+    assert json.loads(shared.files["w/tok-1.jsonl"])["ambiguous"] is True
+
+
+# ── timeouts, modes, tokens, shared failures ──────────────────────────────────
+
+
+def test_the_worst_case_send_comes_from_the_clients_timeout_object():
+    urllib3 = pytest.importorskip("urllib3")
+
+    class Client:
+        timeout = urllib3.Timeout(connect=10, read=300)
+
+    assert sp.worst_send_s(Client()) == 610
+    Client.timeout = 300
+    assert sp.worst_send_s(Client()) == 600
+    Client.timeout = urllib3.Timeout(total=100)
+    assert sp.worst_send_s(Client()) == 100
+    assert sp.worst_send_s(object()) is None
+
+
+def test_a_client_that_can_outlast_the_lease_is_refused(tmp_path):
+    urllib3 = pytest.importorskip("urllib3")
+    s = spool_of(tmp_path, lease_s=420, send_timeout_s=300)
+    c = Cluster()
+    c.timeout = urllib3.Timeout(connect=10, read=300)
+    with pytest.raises(ValueError):
+        s.drain(c, replicated=True, **FAST)
+    assert (
+        spool_of(tmp_path / "d").lease_s >= 700
+    )  # the default covers the driver defaults
+
+
+def test_spool_files_and_directory_are_owner_only(tmp_path):
+    import stat
+
+    s = spool_of(tmp_path)
+    p = s.put("t", COLS, [[1, "a"]], "tok-1", ambiguous=True)
+    mode = lambda path: stat.S_IMODE(os.stat(path).st_mode)  # noqa: E731
+    assert mode(s.local.dir) == 0o700 and mode(p) == 0o600
+    s.release_held("tok-1")
+    (q,) = s.local.files()
+    assert mode(q) == 0o600
+    claimed = s.local.claim(next(iter(s.local.pending())), s.owner, s.now())
+    assert mode(claimed) == 0o600
+    where = {"path": claimed}
+    assert s._mark_local(where, True) and mode(where["path"]) == 0o600
+
+
+@pytest.mark.parametrize("bad", ["*", "a*", "../x", "a/b", "[a]", "", "x" * 201, ".."])
+def test_release_and_drop_refuse_anything_but_a_plain_token(tmp_path, bad):
+    s = spool_of(tmp_path)
+    s.put("t", COLS, [[1, "a"]], "tok-1", ambiguous=True)
+    with pytest.raises(ValueError):
+        s.release_held(bad)
+    with pytest.raises(ValueError):
+        s.drop(bad)
+    assert s.local_count() == 1
+
+
+def test_the_spool_command_refuses_a_glob(tmp_path, monkeypatch):
+    from spyre_clickhouse_ingest import spool_cli
+
+    monkeypatch.setenv("CH_WRITE_SPOOL", str(tmp_path / "local"))
+    monkeypatch.delenv("CH_WRITE_SHARED_SPOOL_TRUSTED", raising=False)
+    s = spool_of(tmp_path, trusted=False)
+    s.put("t", COLS, [[1, "a"]], "tok-1", ambiguous=True)
+    assert spool_cli.main(["drop", "*"]) == 2 and s.local_count() == 1
+
+
+def test_a_rejected_credential_or_request_makes_no_twin(tmp_path, capsys):
+    class Denied(FakeShared):
+        def put(self, name, data):
+            raise sp.SharedDenied("HTTP 403")
+
+    s = spool_of(tmp_path, shared=Denied())
+    s.put_any("t", COLS, [[1, "a"]], "tok-1")
+    assert [(i.ambiguous, i.twin) for i in s.local.pending()] == [(False, None)]
+    assert "refused our credentials" in capsys.readouterr().err

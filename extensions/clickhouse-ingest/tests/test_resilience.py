@@ -29,8 +29,13 @@ from spyre_clickhouse_ingest.resilience import (
     Spool,
     batch_token,
     classify,
-    resilient_insert,
+    resilient_insert as _resilient_insert,
 )
+
+
+def resilient_insert(*a, **k):
+    k.setdefault("feeds_views", False)  # these clusters model clean refusals
+    return _resilient_insert(*a, **k)
 
 
 def err(code, name="X"):
@@ -54,8 +59,7 @@ def err(code, name="X"):
         # Quorum timeout: the block may sit on fewer replicas than asked.
         (err(159, "TIMEOUT_EXCEEDED"), "ambiguous"),
         (err(242, "TABLE_IS_READ_ONLY"), "retry"),
-        # A view's target can hit the limit after the source block landed.
-        (err(252, "TOO_MANY_PARTS"), "ambiguous"),
+        (err(252, "TOO_MANY_PARTS"), "retry"),
         # May hit while a materialized view is being fed, after the source block landed.
         (err(241, "MEMORY_LIMIT_EXCEEDED"), "ambiguous"),
         (err(999, "KEEPER_EXCEPTION"), "ambiguous"),
@@ -71,7 +75,13 @@ def err(code, name="X"):
     ],
 )
 def test_classification_table(error, expected):
-    assert classify(error) == expected
+    assert classify(error, feeds_views=False) == expected
+
+
+@pytest.mark.parametrize("code", [242, 252, 285, 286])
+def test_pre_write_codes_prove_nothing_when_a_view_may_have_the_block(code):
+    assert classify(err(code)) == "ambiguous"
+    assert classify(err(code), feeds_views=False) == "retry"
 
 
 def test_a_status_only_5xx_without_a_code_is_ambiguous():
@@ -83,7 +93,7 @@ def test_the_code_wins_over_the_text():
     e = DatabaseError(
         "HTTP status 500 ... Code: 60", code=285, name="TOO_FEW_LIVE_REPLICAS"
     )
-    assert classify(e) == "retry"
+    assert classify(e, feeds_views=False) == "retry"
 
 
 # ── tokens ──────────────────────────────────────────────────────────────────────
@@ -434,11 +444,11 @@ def test_kill_9_mid_write_leaves_only_whole_spool_files(tmp_path):
 
 
 def test_a_corrupt_spool_file_is_quarantined_not_fatal(tmp_path):
-    (tmp_path / "bad.json").write_text("{not json")
+    (tmp_path / "0000000000001-bad.json").write_text("{not json")
     sp = Spool(tmp_path)
     sp.put("t", ["a"], [[1]], "tok")
     assert len(list(sp.pending())) == 1
-    assert (tmp_path / "bad.json.corrupt").exists()
+    assert (tmp_path / "0000000000001-bad.json.corrupt").exists()
 
 
 def test_spool_file_is_plain_json(tmp_path):
@@ -454,16 +464,39 @@ def test_time_is_injectable_not_real():
 
 def test_a_refused_connection_is_a_retry_because_nothing_was_sent():
     assert classify(ConnectionRefusedError("refused")) == "retry"
+    try:
+        raise OperationalError("Error executing HTTP request")
+    except OperationalError as wrapped:
+        try:
+            raise ConnectionRefusedError("refused")
+        except ConnectionRefusedError as cause:
+            wrapped.__cause__ = cause
+        assert classify(wrapped) == "retry"
+    # The text alone proves nothing, and a timeout may have sent the request.
     assert (
-        classify(OperationalError("Failed to establish a new connection: refused"))
-        == "retry"
+        classify(OperationalError("Failed to establish a new connection"))
+        == "ambiguous"
     )
     assert classify(OperationalError("Read timed out")) == "ambiguous"
 
 
+def test_error_text_never_reaches_a_log_or_a_message():
+    secret = "row-data-secret"
+    logs = []
+    c = Cluster(script=[DatabaseError(f"Code: 285 {secret}", code=285)] * 5)
+    with pytest.raises(resilience.WriteUnavailable) as ei:
+        run(
+            c,
+            Policy(batch_rows=3, deadline_s=1, backoff_s=2),
+            log=logs.append,
+            sleep=lambda s: None,
+        )
+    assert secret not in str(ei.value) and not any(secret in m for m in logs)
+
+
 def test_replicated_inserts_ask_dependent_views_to_deduplicate_too():
     c = Cluster()
-    run(c)
+    run(c, feeds_views=True)
     assert all(
         s.get("deduplicate_blocks_in_dependent_materialized_views") == 1
         for s in c.calls

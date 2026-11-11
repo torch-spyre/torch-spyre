@@ -24,6 +24,7 @@ The token and URL never reach a log line; errors name the HTTP status only.
 from __future__ import annotations
 
 import calendar
+import email.utils
 import json
 import os
 import socket
@@ -33,13 +34,16 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from .spool import CLAIM, LEASE_MARGIN_S, SEND_TIMEOUT_S, Unreachable
+from .spool import CLAIM, LEASE_MARGIN_S, SEND_TIMEOUT_S, SharedDenied, Unreachable
 
 LOCK = ".lock"
 
 DEFAULT_PREFIX = "clickhouse-spool"
 # A lock must outlast one ClickHouse send, or a second drainer takes an item mid-send.
 DEFAULT_LEASE_S = SEND_TIMEOUT_S + 2 * LEASE_MARGIN_S
+# Lock stamps are the writer's clock. A runner whose clock is further off than this from the
+# server's Date header is refused rather than allowed to steal or lose a live claim.
+MAX_SKEW_S = LEASE_MARGIN_S / 2
 
 
 class ArtifactorySpool:
@@ -65,6 +69,9 @@ class ArtifactorySpool:
         self.base, self.repo, self.prefix = base.rstrip("/"), repo, prefix.strip("/")
         self.timeout, self._open, self.clock = timeout, opener, clock
         self.sleep, self.settle_s, self.lease_s = sleep, settle_s, lease_s
+        self.skew: float | None = (
+            None  # server Date minus our clock, from the last reply
+        )
 
     @classmethod
     def from_env(cls, env=None, **kw):
@@ -95,6 +102,7 @@ class ArtifactorySpool:
                 req, timeout=self.timeout, context=ssl.create_default_context()
             ) as r:
                 body = r.read()
+                self._note_date(getattr(r, "headers", None))
                 if r.status not in ok:
                     raise OSError(f"artifactory {method}: HTTP {r.status}")
                 return r.status, body
@@ -109,6 +117,22 @@ class ArtifactorySpool:
         except TimeoutError as e:
             raise OSError(f"artifactory {method}: {type(e).__name__}") from None
 
+    def _note_date(self, headers) -> None:
+        date = headers.get("Date") if headers is not None else None
+        if date:
+            try:
+                self.skew = (
+                    email.utils.parsedate_to_datetime(date).timestamp() - self.clock()
+                )
+            except (TypeError, ValueError):
+                pass
+
+    def _check_skew(self) -> None:
+        if self.skew is not None and abs(self.skew) > MAX_SKEW_S:
+            raise OSError(
+                f"this runner's clock is {self.skew:+.0f}s off the server's; claims refused"
+            )
+
     def _path(self, name: str) -> str:
         return f"{self.repo}/{self.prefix}/{urllib.parse.quote(name)}"
 
@@ -116,8 +140,13 @@ class ArtifactorySpool:
 
     def put(self, name: str, data: bytes) -> None:
         status, _ = self._req("PUT", f"{self.base}/{self._path(name)}", data)
-        if status not in (200, 201):
-            raise OSError(f"artifactory PUT: HTTP {status}")
+        if status in (200, 201):
+            return
+        if status in (401, 403):
+            raise SharedDenied(f"artifactory PUT: HTTP {status}")
+        if 400 <= status < 500:  # rejected before anything was stored
+            raise Unreachable(f"artifactory PUT: HTTP {status}")
+        raise OSError(f"artifactory PUT: HTTP {status}")
 
     def list(self) -> list[tuple[str, float]]:
         url = f"{self.base}/api/storage/{self.repo}/{self.prefix}?list&deep=1&listFolders=0"
@@ -155,6 +184,7 @@ class ArtifactorySpool:
         stamp = int(self.clock())
         mine = f"{owner}@{stamp}".encode()
         existing = self._lock_owner(lock)
+        self._check_skew()
         if existing is not None and stamp - existing[1] < self.lease_s:
             return None
         self.put(lock, mine)
@@ -163,6 +193,16 @@ class ArtifactorySpool:
         if got is None or got[0] != owner:
             return None
         return name
+
+    def owns(self, name: str, owner: str) -> bool:
+        """True while `owner` still holds the claim on `name` with room left on the lease."""
+        got = self._lock_owner(f"{name}{LOCK}")
+        self._check_skew()
+        return (
+            got is not None
+            and got[0] == owner
+            and self.clock() - got[1] < self.lease_s - LEASE_MARGIN_S
+        )
 
     def get(self, name: str) -> bytes:
         status, body = self._req("GET", f"{self.base}/{self._path(name)}")

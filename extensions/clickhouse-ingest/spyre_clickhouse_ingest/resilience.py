@@ -44,10 +44,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterator, Sequence
 
-# Nothing was stored: the quorum and read-only checks fail before the write.
-RETRY_CODES = frozenset({242, 285, 286})
-# Refused before the write, but a materialized view fed by the table may already hold the block.
-PARTS_LIMIT = 252
+# Refused before the write on the table itself (quorum, read-only, parts limit). A materialized
+# view's target can raise the same codes after the source block landed, so with a dependent view
+# they prove nothing; ClickHouse's order between the source commit and the view pushes is not
+# something the docs or chdb let us rely on.
+PRE_WRITE_CODES = frozenset({242, 252, 285, 286})
 # The block may be stored on some replicas or in some views: coordination, timeouts, network,
 # and a memory limit hit while a materialized view was being fed.
 AMBIGUOUS_CODES = frozenset({159, 209, 210, 241, 319, 999, 1000})
@@ -78,29 +79,50 @@ def _code(err: BaseException) -> int | None:
 
 
 def _never_connected(err: BaseException) -> bool:
-    """The connection was refused or the host did not resolve: no request left the client."""
-    if isinstance(err, (ConnectionRefusedError, socket.gaierror)):
-        return True
-    return any(
-        m in str(err)
-        for m in ("Failed to establish a new connection", "NewConnectionError")
-    )
+    """The connection was refused or the host did not resolve: no request left the client.
+
+    Walks the exception chain by type; the message text is not trusted (it can be hidden by the
+    driver and can carry row data).
+    """
+    try:
+        from urllib3.exceptions import MaxRetryError, NewConnectionError
+    except ImportError:  # pragma: no cover
+        MaxRetryError = NewConnectionError = ()  # type: ignore[assignment,misc]
+    seen: set[int] = set()
+    e: BaseException | None = err
+    while e is not None and id(e) not in seen:
+        seen.add(id(e))
+        if isinstance(e, (ConnectionRefusedError, socket.gaierror)):
+            return True
+        if NewConnectionError and isinstance(e, NewConnectionError):
+            return True
+        if MaxRetryError and isinstance(e, MaxRetryError):
+            if isinstance(getattr(e, "reason", None), NewConnectionError):
+                return True
+        e = e.__cause__ or e.__context__
+    return False
+
+
+def safe(err: BaseException) -> str:
+    """What may be logged or put in an exception message: the type and server code, never the
+    driver's text, which can carry row data."""
+    code = _code(err)
+    return type(err).__name__ + (f"(code={code})" if code is not None else "")
 
 
 def classify(err: BaseException, feeds_views: bool = True) -> str:
     """'retry', 'ambiguous' or 'fatal'. The server's code beats the message text.
 
-    TOO_MANY_PARTS (252) is a retry only when the table feeds no materialized view: with one, the
-    view's target can hit the limit after the source block landed. Callers that know the table
-    has no dependent views pass feeds_views=False.
+    The pre-write codes (read-only, too many parts, not enough replicas, unsatisfied quorum) are a
+    retry only when the table feeds no materialized view; with one, a view's target can raise them
+    after the source block landed. Callers that know the table has no dependent view pass
+    feeds_views=False.
     """
     code = _code(err)
-    if code == PARTS_LIMIT:
-        return "ambiguous" if feeds_views else "retry"
     if code in FATAL_CODES:
         return "fatal"
-    if code in RETRY_CODES:
-        return "retry"
+    if code in PRE_WRITE_CODES:
+        return "ambiguous" if feeds_views else "retry"
     if code in AMBIGUOUS_CODES:
         return "ambiguous"
     if _never_connected(err):
@@ -179,13 +201,54 @@ class SpoolItem:
     twin: str | None = None
 
 
+CLAIM = ".claimed-"
+# A file whose name ends in .amb is a batch that may be stored. The state lives in the name so
+# that recording it is one atomic rename of the claimed file, which fails if the claim is gone.
+AMB = ".amb"
+
+
+def is_item_name(name: str) -> bool:
+    return name[:1].isdigit() and (
+        name.endswith(".json") or name.endswith(".json" + AMB)
+    )
+
+
+def with_marker(name: str, on: bool) -> str:
+    """`name` with the may-be-stored marker set or cleared, keeping any claim suffix."""
+    base, sep, rest = name.partition(CLAIM)
+    if on and not base.endswith(AMB):
+        base += AMB
+    elif not on and base.endswith(AMB):
+        base = base[: -len(AMB)]
+    return base + sep + rest
+
+
 class Spool:
     """A directory of whole-file JSON batches. A file is written to a temp name and renamed, so
-    a kill leaves either the finished file or none."""
+    a kill leaves either the finished file or none. The directory and files are owner-only: they
+    hold row data."""
 
     def __init__(self, directory):
         self.dir = Path(directory)
-        self.dir.mkdir(parents=True, exist_ok=True)
+        self.dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            os.chmod(self.dir, 0o700)
+        except OSError:
+            pass
+
+    def files(self) -> list[Path]:
+        """Unclaimed item files, oldest first."""
+        return sorted(p for p in self.dir.iterdir() if is_item_name(p.name))
+
+    def copies(self, token: str) -> list[Path]:
+        """Every file for a token, claimed or not."""
+        return sorted(
+            p
+            for p in self.dir.iterdir()
+            if p.name[:1].isdigit()
+            and f"-{token}.json" in p.name
+            and not p.name.endswith((".corrupt", ".quarantine", ".tmp"))
+        )
 
     def put(
         self,
@@ -212,14 +275,17 @@ class Spool:
             "scope": scope,
             "twin": twin,
         }
-        # The token names the file: spooling the same batch twice leaves one file.
-        existing = [p for p in self.dir.glob(f"*-{token}.json")]
+        # The token names the file: spooling the same batch twice leaves one file. Spooling it
+        # again as possibly stored upgrades that file, never the reverse.
+        existing = self.copies(token)
         if existing:
+            if ambiguous:
+                existing = [self._mark(p, True) for p in existing]
             return existing[0]
         # Strictly increasing, so files sort in the order they were written.
         ms = max(int(created * 1000), getattr(self, "_last_ms", 0) + 1)
         self._last_ms = ms
-        final = self.dir / f"{ms:013d}-{token}.json"
+        final = self.dir / with_marker(f"{ms:013d}-{token}.json", bool(ambiguous))
         fd, tmp = tempfile.mkstemp(dir=self.dir, suffix=".tmp")
         try:
             with os.fdopen(fd, "w") as fh:
@@ -235,8 +301,20 @@ class Spool:
             raise
         return final
 
+    @staticmethod
+    def _mark(path: Path, on: bool) -> Path:
+        """Atomically set or clear the marker on one file; the original path if it is gone."""
+        target = path.with_name(with_marker(path.name, on))
+        if target == path:
+            return path
+        try:
+            os.rename(path, target)
+        except OSError:
+            return path
+        return target
+
     def pending(self) -> Iterator[SpoolItem]:
-        for p in sorted(self.dir.glob("*.json")):
+        for p in self.files():
             try:
                 d = json.loads(p.read_text())
                 yield SpoolItem(
@@ -247,7 +325,7 @@ class Spool:
                     d["token"],
                     d.get("database"),
                     None if d.get("created") is None else float(d["created"]),
-                    bool(d.get("ambiguous")),
+                    bool(d.get("ambiguous")) or p.name.endswith(AMB),
                     d.get("scope"),
                     d.get("twin"),
                 )
@@ -399,19 +477,19 @@ def resilient_insert(
                 maybe_stored = maybe_stored or kind == "ambiguous"
                 if kind == "ambiguous" and not replicated:
                     # A plain table cannot tell a stored block from a lost one.
-                    out.ambiguous.append((n, repr(err)))
+                    out.ambiguous.append((n, safe(err)))
                     if spool is None:
                         raise WriteAmbiguous(
                             f"{table}: batch {n}/{len(batches)} may be stored and cannot be "
-                            f"resent ({err!r})",
+                            f"resent ({safe(err)})",
                             out,
                         ) from err
                     try:
-                        park(n, batch, tok, True, f"ambiguous, held: {err!r}")
+                        park(n, batch, tok, True, f"ambiguous, held: {safe(err)}")
                     except Exception as full:
                         raise WriteAmbiguous(
                             f"{table}: batch {n}/{len(batches)} may be stored and could not "
-                            f"be spooled ({full!r})",
+                            f"be spooled ({safe(full)})",
                             out,
                         ) from err
                     spilled = True
@@ -424,13 +502,13 @@ def resilient_insert(
                     if spool is None:
                         raise WriteUnavailable(
                             f"{table}: batch {n}/{len(batches)} not accepted within "
-                            f"{policy.deadline_s:.0f}s ({err!r})"
+                            f"{policy.deadline_s:.0f}s ({safe(err)})"
                         ) from err
-                    park(n, batch, tok, maybe_stored, repr(err), now() - start)
+                    park(n, batch, tok, maybe_stored, safe(err), now() - start)
                     spilled = True
                     break
                 log(
-                    f"  [retry] {table} batch {n}/{len(batches)} attempt {attempt}: {err!r}; in {wait_s:.0f}s"
+                    f"  [retry] {table} batch {n}/{len(batches)} attempt {attempt}: {safe(err)}; in {wait_s:.0f}s"
                 )
                 wait(wait_s)
     return out
@@ -464,9 +542,9 @@ def replay(
             )
         except Exception as err:
             if classify(err) == "fatal":
-                log(f"  [replay] {item.path.name}: fatal {err!r}; kept")
+                log(f"  [replay] {item.path.name}: fatal {safe(err)}; kept")
             else:
-                log(f"  [replay] {item.path.name}: {err!r}; kept for the next run")
+                log(f"  [replay] {item.path.name}: {safe(err)}; kept for the next run")
             continue
         spool.done(item)
         sent += 1
