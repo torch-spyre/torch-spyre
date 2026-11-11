@@ -21,6 +21,7 @@ import pathlib
 import statistics
 import sys
 import tempfile
+import time
 from typing import Any
 
 from split_execution_bench import (
@@ -144,6 +145,9 @@ def _child_profile(
 
     result = trace_metrics(trace_data.get("traceEvents", []))
     result["tracker_enabled"] = _C.get_hazard_tracker_enabled()
+
+    del pairs, compiled
+    torch.accelerator.synchronize(device)
     return result
 
 
@@ -174,7 +178,7 @@ def main() -> int:
     parser.add_argument(
         "--rounds", type=int, default=3, help="interleaved on/off child pairs"
     )
-    parser.add_argument("--timeout", type=float, default=900.0, help="seconds/child")
+    parser.add_argument("--timeout", type=float, default=120.0, help="seconds/child")
     parser.add_argument("--json", type=pathlib.Path, help="write results to JSON")
     ns = parser.parse_args()
 
@@ -197,6 +201,11 @@ def main() -> int:
             per_mode: dict[str, list[dict[str, Any]]] = {mode: [] for mode in MODES}
             for rnd in range(ns.rounds):
                 for mode, flag in MODES.items():
+                    print(
+                        f"[{wl}] round {rnd + 1}/{ns.rounds} {mode}...",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                     env = {
                         "TORCHINDUCTOR_CACHE_DIR": cache,
                         "SPYRE_NUM_CPUS": "1",
@@ -221,7 +230,7 @@ def main() -> int:
                             "USE_SPYRE_PROFILER=1)"
                         )
                     per_mode[mode].append(out)
-                print(f"[{wl}] round {rnd + 1}/{ns.rounds} done", file=sys.stderr)
+                    time.sleep(0.5)
 
             results["workloads"][wl] = {
                 "shape_mkn": list(shape),

@@ -105,6 +105,8 @@ def _child_bench(
         run_once()
     held_bytes.clear()
     samples = [run_once() for _ in range(reps)]
+
+    torch.accelerator.synchronize(device)
     return {
         "tracker_enabled": _C.get_hazard_tracker_enabled(),
         "per_launch_ms": samples,
@@ -182,7 +184,7 @@ def main() -> int:
     parser.add_argument(
         "--rounds", type=int, default=3, help="interleaved on/off child pairs"
     )
-    parser.add_argument("--timeout", type=float, default=900.0, help="seconds/child")
+    parser.add_argument("--timeout", type=float, default=120.0, help="seconds/child")
     parser.add_argument("--json", type=pathlib.Path, help="write results to JSON")
     ns = parser.parse_args()
 
@@ -211,6 +213,11 @@ def main() -> int:
                 held: dict[str, list[float]] = {mode: [] for mode in MODES}
                 for rnd in range(ns.rounds):
                     for mode, flag in MODES.items():
+                        print(
+                            f"[{wl} x{depth}] round {rnd + 1}/{ns.rounds} {mode}...",
+                            file=sys.stderr,
+                            flush=True,
+                        )
                         env = {
                             "TORCHINDUCTOR_CACHE_DIR": cache,
                             "SPYRE_NUM_CPUS": "1",
@@ -229,10 +236,7 @@ def main() -> int:
                             )
                         samples[mode].extend(out["per_launch_ms"])
                         held[mode].append(out["held_mib"])
-                    print(
-                        f"[{wl} x{depth}] round {rnd + 1}/{ns.rounds} done",
-                        file=sys.stderr,
-                    )
+                        time.sleep(0.5)
 
                 summary = {mode: _summarize(s) for mode, s in samples.items()}
                 for mode in MODES:
