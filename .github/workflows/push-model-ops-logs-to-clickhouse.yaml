@@ -79,7 +79,7 @@ jobs:
 
       - name: Upload Logs artifact
         if: always() && steps.ingest.outputs.log-file != ''
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: model_ops_log_${{ env.TRIGGERING_SHA }}_${{ env.TRIGGERING_RUN_ID }}
           path: ${{ steps.ingest.outputs.log-file }}
@@ -87,7 +87,7 @@ jobs:
 
       - name: Upload JSON artifact
         if: always() && steps.ingest.outputs.json-file != ''
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ steps.ingest.outputs.json-file }}
           path: ${{ steps.ingest.outputs.json-file }}

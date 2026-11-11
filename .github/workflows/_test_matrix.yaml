@@ -411,7 +411,7 @@ jobs:
         run: printf '%s' "${THREADED_RUN_ID}" > run-id.txt
       - name: Upload threaded run_id
         if: ${{ inputs.run_id != '' }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: run-id
           path: run-id.txt
@@ -424,7 +424,7 @@ jobs:
           RESOLVED_TEST_TYPE: ${{ steps.filter.outputs.resolved_test_type }}
         run: printf '%s' "${RESOLVED_TEST_TYPE}" > test-type.txt
       - name: Upload suite tier
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-type
           path: test-type.txt
@@ -579,7 +579,7 @@ jobs:
           image_label: ${{ inputs.image_label }}
 
       - name: Upload torch-spyre wheel
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: torch-spyre-wheel
           path: torch-spyre/dist/*.whl
@@ -747,7 +747,7 @@ jobs:
       - name: Upload JUnit XML report
         if: always()
         continue-on-error: true  # transient artifact-service 403s must not fail a job whose tests passed
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ env.REPORT_NAME }}
           path: ${{ env.REPORT_PATH }}
@@ -776,7 +776,7 @@ jobs:
       # can hold descriptors from another call of this workflow (see call_id).
       - name: Upload failed-suite descriptor
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: failed-suite-${{ needs.generate_matrix.outputs.call_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
           path: ${{ runner.temp }}/failed_suite/suite.json
@@ -1149,7 +1149,7 @@ jobs:
       # overwrite one another.
       - name: Upload JUnit XML report
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ env.REPORT_NAME }}
           path: ${{ env.REPORT_PATH }}
@@ -1336,7 +1336,7 @@ jobs:
       - name: Upload JUnit XML report
         if: always()
         continue-on-error: true  # transient artifact-service 403s must not fail a job whose tests passed
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ env.REPORT_NAME }}
           path: ${{ env.REPORT_PATH }}
@@ -1357,7 +1357,7 @@ jobs:
       # call_id and github.run_attempt in the name: see the single-card upload above.
       - name: Upload failed-suite descriptor
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: failed-suite-multi-${{ needs.generate_matrix.outputs.call_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
           path: ${{ runner.temp }}/failed_suite/suite.json
@@ -1555,10 +1555,11 @@ jobs:
       # The first attempt's report, which this job's upload overwrites; kept as prior_* props.
       - name: Download the first attempt's JUnit XML report
         continue-on-error: true
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: ${{ env.REPORT_NAME }}
           path: ${{ runner.temp }}/replaced-report
+          digest-mismatch: warn
 
       - name: Run ${{ matrix.suite.name }} tests (pod-level retry)
         id: run_tests
@@ -1583,7 +1584,7 @@ jobs:
       - name: Upload JUnit XML report
         if: always()
         continue-on-error: true  # transient artifact-service 403s must not fail a job whose tests passed
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ env.REPORT_NAME }}
           path: ${{ env.REPORT_PATH }}
@@ -1673,10 +1674,11 @@ jobs:
       # The first attempt's report, which this job's upload overwrites; kept as prior_* props.
       - name: Download the first attempt's JUnit XML report
         continue-on-error: true
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: ${{ env.REPORT_NAME }}
           path: ${{ runner.temp }}/replaced-report
+          digest-mismatch: warn
 
       - name: Run ${{ matrix.suite.name }} tests (pod-level retry)
         uses: ./.github/actions/run-test-suite
@@ -1700,7 +1702,7 @@ jobs:
       - name: Upload JUnit XML report
         if: always()
         continue-on-error: true  # transient artifact-service 403s must not fail a job whose tests passed
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ env.REPORT_NAME }}
           path: ${{ env.REPORT_PATH }}
