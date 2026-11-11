@@ -32,8 +32,9 @@ test_suite_config:
             # inplace / copy — test_inplace_copy.* covers noncontiguous variant too
             - TestOps::test_inplace_copy.*
             - TestOps::test_inplace_op.*
-            # bitwise (fallback path)
+            # bitwise
             - TestOps::test_bitwise_and.*
+            - TestOps::test_bitwise_int32.*
             - TestOps::test_bitwise_not.*
             - TestOps::test_logical_int_mask.*
             - TestOps::test_logical_mixed_bool_mask.*

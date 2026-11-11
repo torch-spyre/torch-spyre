@@ -163,7 +163,7 @@ def register_fallback_over_decomp(fallback_ops):
     Checking both tables closes the gap where an overload is present in the
     global post-autograd table (e.g. via ``_refs`` registrations) but absent
     from Inductor's decomposition table — which is what caused the CI guard to
-    fire for ``cumsum`` and ``bitwise_xor`` after Spyre unregistered those lowerings.
+    fire for ``cumsum`` after Spyre unregistered its lowering.
     """
     added = []
     for op in fallback_ops:

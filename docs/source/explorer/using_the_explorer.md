@@ -33,18 +33,18 @@ current view. The four views below each have one worked example.
 ### Operations
 
 :::{figure} ../_static/images/decomposition-chain.svg
-:alt: aten.bitwise_and has a decomposed_by edge to the bitwise_and decomposition, which has decomposes_into edges to aten.logical_and, aten.bitwise_not, and aten.bitwise_or.
+:alt: aten.bitwise_and has a decomposed_by edge to the bitwise_and decomposition, which has a decomposes_into edge to aten.logical_and.
 :width: 100%
 :align: center
 
 The decomposition chain for `aten.bitwise_and`. The `decomposed_by` edge
-reaches the decomposition function, and the `decomposes_into` edges reach the
-ops it rewrites into.
+reaches the decomposition function, and the `decomposes_into` edge reaches the
+op it rewrites into.
 :::
 
 Start at the op node `aten.bitwise_and`, follow its `decomposed_by` edge to the
-decomposition `bitwise_and`, then follow the `decomposes_into` edges to see that
-it rewrites into `aten.logical_and`, `aten.bitwise_not`, and `aten.bitwise_or`.
+decomposition `bitwise_and`, then follow the `decomposes_into` edge to see that
+it rewrites into `aten.logical_and`, the form a bool `&` takes on Spyre.
 A different op might instead carry a `lowered_by` edge to a lowering, a
 `falls_back_to` edge (dashed) to a CPU fallback, or an `eager_via` edge to an
 eager kernel; the outgoing edge is how the backend handles that op. In the live

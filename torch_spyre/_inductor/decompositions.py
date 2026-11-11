@@ -3088,23 +3088,18 @@ def spyre_sin(input: torch.Tensor) -> torch.Tensor:
 
 @register_spyre_decompositions([torch.ops.aten.bitwise_not])
 def bitwise_not(input: torch.Tensor) -> torch.Tensor:
+    """``~x``: bool takes ``logical_not``, int32 its native op in the lowering."""
     if input.dtype is torch.bool:
         return torch.logical_not(input)
-    else:
-        neg_one = torch.ops.aten.full_like(input, -1)
-        return torch.ops.aten.bitwise_xor(input, neg_one)
+    return NotImplemented
 
 
 @register_spyre_decompositions([torch.ops.aten.bitwise_and])
 def bitwise_and(input1: torch.Tensor, input2: torch.Tensor) -> torch.Tensor:
+    """``x & y``: bool takes ``logical_and``, int32 its native op in the lowering."""
     if input1.dtype is torch.bool and input2.dtype is torch.bool:
         return torch.ops.aten.logical_and(input1, input2)
-    else:
-        return torch.ops.aten.bitwise_not(
-            torch.ops.aten.bitwise_or(
-                torch.ops.aten.bitwise_not(input1), torch.ops.aten.bitwise_not(input2)
-            )
-        )
+    return NotImplemented
 
 
 # Spyre has no native scan op (#3388), so cumsum is decomposed by result dtype:

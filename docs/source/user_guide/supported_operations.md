@@ -61,7 +61,7 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 | `torch.ceil` | Y | Y | Spyre | Custom decomposition |
 | `torch.sign` | Y | Y | Spyre | Custom decomposition |
 | `torch.logical_not` | Y | Y | Spyre | Custom decomposition |
-| `torch.bitwise_not` | Y | Y | Spyre | Custom decomposition |
+| `torch.bitwise_not` | Y | Y | Spyre | int32 runs natively via `bitwisenot`; bool runs as `logical_not`; other integer dtypes raise `Unsupported` |
 | `torch.sin` | Y | Y | Spyre | Custom decomposition (Cody-Waite range reduction + degree-9 Taylor); max abs error ~5e-5 in fp32 |
 | `torch.cos` | Y | Y | Spyre | Custom decomposition (Cody-Waite range reduction + degree-9 Taylor); max abs error ~5e-5 in fp32 |
 | `torch.clamp` | Y | Y | Spyre | Custom op + lowering |
@@ -75,7 +75,9 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 | `torch.floor_divide` | Y | Y | Spyre | Alias for `torch.div(..., rounding_mode="floor")`; same limits apply. |
 | `torch.maximum` | Y | Y | Spyre | |
 | `torch.minimum` | Y | Y | Spyre | |
-| `torch.bitwise_and` | Y | Y | Spyre | Custom decomposition; boolean inputs run on Spyre (`logical_and`), integer inputs decompose through `bitwise_or`, which falls back to CPU |
+| `torch.bitwise_and` | Y | Y | Spyre | int32 runs natively via `bitwiseand`; bool runs as `logical_and`; other integer dtypes raise `Unsupported` |
+| `torch.bitwise_or` | Y | Y | Spyre | int32 runs natively via `bitwiseor`; other dtypes raise `Unsupported` |
+| `torch.bitwise_xor` | Y | Y | Spyre | int32 runs natively via `bitwisexor`; other dtypes raise `Unsupported` |
 | `torch.where` | Y | Y | Spyre | `where.self` registered eagerly; `where.Scalar*` overloads via custom decomposition; `where.default` (condition-only form) falls back to CPU |
 | **Comparison** | | | | |
 | `torch.eq` | Y | Y | Spyre | |
@@ -147,8 +149,6 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 | `torch.arange` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.tril` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.isin` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
-| `torch.bitwise_xor` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
-| `torch.bitwise_or` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.argmax` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.argmin` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 
