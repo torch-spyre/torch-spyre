@@ -265,3 +265,82 @@ def test_a_refused_connection_is_unreachable_but_a_timeout_is_not():
     with pytest.raises(OSError) as ei:
         a.put("w/x.jsonl", b"1")
     assert not isinstance(ei.value, Unreachable)
+
+
+def _status_opener(code):
+    def opener(req, timeout=None, context=None):
+        raise urllib.error.HTTPError(req.full_url, code, "x", {}, io.BytesIO(b""))
+
+    return opener
+
+
+@pytest.mark.parametrize(
+    "code,kind",
+    [(401, "denied"), (403, "denied"), (400, "rejected"), (413, "rejected")],
+)
+def test_a_put_that_was_refused_is_known_not_to_have_landed(code, kind):
+    from spyre_clickhouse_ingest.spool import SharedDenied, Unreachable
+
+    fake, a = make()
+    a._open = _status_opener(code)
+    with pytest.raises(SharedDenied if kind == "denied" else Unreachable):
+        a.put("w/x.jsonl", b"1")
+
+
+def test_a_5xx_put_may_have_landed():
+    from spyre_clickhouse_ingest.spool import SharedDenied, Unreachable
+
+    fake, a = make()
+    a._open = _status_opener(503)
+    with pytest.raises(OSError) as ei:
+        a.put("w/x.jsonl", b"1")
+    assert not isinstance(ei.value, (SharedDenied, Unreachable))
+
+
+def test_owns_is_true_only_for_the_live_holder():
+    now = [1000.0]
+    fake, a = make(clock=lambda: now[0])
+    assert (
+        a.claim("w/x.jsonl", "me") == "w/x.jsonl"
+        if a.put("w/x.jsonl", b"1") is None
+        else False
+    )
+    assert a.owns("w/x.jsonl", "me") and not a.owns("w/x.jsonl", "other")
+    now[0] += a.lease_s  # too close to the end of the lease to be trusted
+    assert not a.owns("w/x.jsonl", "me")
+
+
+def test_a_runner_whose_clock_is_far_from_the_servers_is_refused():
+    base = FakeArtifactory()
+
+    class Dated(Resp):
+        headers = {"Date": "Sat, 07 Nov 2026 00:10:00 GMT"}
+
+    def opener(req, timeout=None, context=None):
+        r = base(req, timeout, context)
+        d = Dated(r.read(), r.status)
+        return d
+
+    import calendar
+
+    fake, a = (
+        make(
+            fake=base,
+            opener=None,
+            clock=lambda: calendar.timegm((2026, 11, 7, 0, 0, 0)),
+        )
+        if False
+        else (None, None)
+    )
+    a = ArtifactorySpool(
+        "tkn",
+        base="https://artifactory.example.test/artifactory",
+        repo="spool-repo",
+        opener=opener,
+        clock=lambda: calendar.timegm((2026, 11, 7, 0, 0, 0)),
+        sleep=lambda s: None,
+        settle_s=0,
+    )
+    a.put("w/x.jsonl", b"1")
+    with pytest.raises(OSError, match="clock"):
+        a.claim("w/x.jsonl", "me")

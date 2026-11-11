@@ -474,26 +474,43 @@ the cluster is degraded. **Nothing calls them yet and no probe exists**, so on t
 - A batch refused before any write (quorum, read-only) is resent as is. A batch that a failed or
   interrupted attempt may have stored is *held*: on a Replicated table inside its dedup window it
   is resent under its original `insert_deduplication_token`; otherwise nothing resends it.
-- Before every replay the item is first recorded as "may be stored" (write-ahead). A crash, a lost
-  response or a lease that expires mid-send then leaves a held item, never one that is resent
-  blindly. If that record cannot be written, nothing is sent. `lease_s` must exceed the client's
-  send timeout (default 300 s) by a margin; `TieredSpool` refuses a smaller lease.
+- Before every replay the item is first recorded as "may be stored" (write-ahead). Locally that is
+  one atomic rename of the claimed file to a `.amb` name, which fails if the claim was reaped, so a
+  drainer that outlived its lease can neither record nor send; on the shared tier it is a PUT with
+  the lock re-verified before and after. A crash, a lost response or a lease that expires mid-send
+  then leaves a held item, never a clean one that is resent. If the record cannot be written or
+  verified, nothing is sent. It is cleared again only on an error that proves nothing was written
+  (a refused connection, or a pre-write code when the table feeds no view).
+- Timing assumptions. `lease_s` must exceed the worst-case send plus a 60 s margin: a client's
+  `timeout` (a number, or a `urllib3.Timeout` read field by field) allows up to connect plus two
+  read timeouts per insert, 610 s with the driver defaults, so the default lease is 720 s and a
+  client that can outlast it is refused. The shared lock stamp is the writer's clock; a runner
+  whose clock is more than 30 s off the server's `Date` header is refused. What remains: a drainer
+  paused between its last check and the send, for longer than the margin, can still send after a
+  second drainer has taken the item; the record is already in place by then, so the second one
+  holds, but the first send is not fenced on the ClickHouse side. A shared PUT or lock write that
+  lands after a client-side timeout, minutes later, is not covered.
+- Spool files are mode 0600 and the directory 0700: they hold row data.
 - A held item stays until a person decides. Check the table, then:
-  `python -m spyre_clickhouse_ingest spool list` (JSON lines, \`held\` marks them),
+  `python -m spyre_clickhouse_ingest spool list` (JSON lines, `held` marks them),
   `... spool release TOKEN` (the rows are NOT stored; resend on the next drain) or
-  `... spool drop TOKEN` (the rows are stored or not wanted). It reads \`CH_WRITE_SPOOL\`.
+  `... spool drop TOKEN` (the rows are stored or not wanted). It reads `CH_WRITE_SPOOL`. TOKEN is
+  `[A-Za-z0-9._-]` only. When a batch has a local copy and a shared copy (a shared PUT that timed
+  out after landing leaves a "twin"), `release` keeps the shared copy, deletes the local one and
+  needs the shared tier to be readable; `drop` removes both.
 - Tables with a dependent materialized view: replicated inserts pass
   `deduplicate_blocks_in_dependent_materialized_views=1`, so a retry whose source block was
   deduplicated still reaches a view target that missed it (checked on chdb 26.9, single node).
   The view target needs its own dedup window (Replicated, or `non_replicated_deduplication_window`);
   without one a retry doubles the view. Not verified: Replicated tables on a real Keeper cluster and
   servers older than 26.2 (where the default is 0). Pass `feeds_views=False` only for a table with
-  no dependent view; otherwise TOO_MANY_PARTS (252) is treated as ambiguous.
+  no dependent view; otherwise the pre-write codes (242, 252, 285, 286) are treated as ambiguous
+  (a view's target can raise them after the source block landed).
 - A real probe needs a per-batch marker (a batch-id column, or the token on a Replicated table).
-  The sort keys of \`test_case_runs\`, \`benchmark_runs\` and \`artifact_results\` are not unique per
+  The sort keys of `test_case_runs`, `benchmark_runs` and `artifact_results` are not unique per
   batch, so counting rows by key would call a lost batch stored.
 - Known gaps: the 3600 s dedup window is a time bound only (ClickHouse also evicts by block count);
-  \`replay()\` on the plain \`Spool\` does not record attempts; a shared PUT that times out after
+  `replay()` on the plain `Spool` does not record attempts; a shared PUT that times out after
   landing is covered by holding the local twin, but a PUT that lands minutes later is not.
 
 ## What is deliberately NOT here

@@ -37,7 +37,11 @@ def main(argv=None) -> int:
             print(json.dumps(it))
         return 0
     if cmd in ("release", "drop") and len(rest) == 1:
-        n = s.release_held(rest[0]) if cmd == "release" else s.drop(rest[0])
+        try:
+            n = s.release_held(rest[0]) if cmd == "release" else s.drop(rest[0])
+        except (ValueError, OSError) as e:
+            print(f"{cmd}: {e}", file=sys.stderr)
+            return 2
         print(f"{cmd}: {n} item(s)")
         return 0 if n else 1
     print("usage: spool [list | release TOKEN | drop TOKEN]", file=sys.stderr)
