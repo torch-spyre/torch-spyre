@@ -448,8 +448,8 @@ def main() -> None:
                 f"WARNING: {args.layout_policy} not found; every config runs as its own job",
                 file=sys.stderr,
             )
-        # Long configs move to a multi-card runner first, so they never land in a bucket: the
-        # grouping keys on runner, and a lone config on its own runner is packed alone.
+        # Long configs move to a multi-card runner first; plan() then leaves them out of buckets
+        # explicitly, so a low min_minutes can never pack two of them serially on one pod.
         moved = (
             test_layout.multicard_runners(results, policy, timings)
             if test_layout
@@ -458,6 +458,7 @@ def main() -> None:
         for r in results:
             if r["key"] in moved:
                 r["runner"] = moved[r["key"]]
+                r["multicard"] = True
         buckets = test_layout.plan(results, policy, timings) if test_layout else {}
         for r in results:
             r["bucket"] = buckets.get(r["key"], "")

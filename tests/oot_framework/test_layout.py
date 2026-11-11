@@ -293,6 +293,9 @@ def test_plan_is_deterministic_whatever_the_input_order():
         '{"multicard": {"enabled": true, "runners": [{"label": "x", "cards": 2, "min_minutes": 5}]}}',
         '{"multicard": {"enabled": true, "runners": [{"label": "x"}]}}',
         '{"multicard": {"enabled": true, "runners": [{"label": "", "min_minutes": 5}]}}',
+        '{"multicard": {"enabled": true, "runners": [{"label": "spyre_pf_x3", "min_minutes": 5}]}}',
+        '{"multicard": {"enabled": true, "runners": [{"label": "spyre_pf_x2", "min_minutes": 10}, {"label": "spyre_pf_x4", "min_minutes": 10}]}}',
+        '{"multicard": {"enabled": true, "runners": [{"label": "spyre_pf_x2", "min_minutes": 10}, {"label": "spyre_pf_x2", "min_minutes": 16}]}}',
         "not json",
     ],
 )
@@ -507,6 +510,40 @@ def test_filter_configs_keeps_a_long_config_pinned_to_x1_in_runner_overrides(tmp
         "inductor/test_pinned_config.yaml": "spyre_pf_x1",
         "inductor/test_free_config.yaml": "spyre_pf_x2",
     }
+
+
+def test_filter_configs_never_buckets_moved_configs_even_below_the_job_target(tmp_path):
+    cfgdir = tmp_path / "configs"
+    _write_tree(
+        cfgdir,
+        {
+            f"inductor/test_{n}_config.yaml": _cfg(
+                f"${{TORCH_DEVICE_ROOT}}/tests/inductor/test_{n}.py"
+            )
+            for n in ("a", "b")
+        },
+    )
+    rc, suites, err = _run(
+        tmp_path,
+        cfgdir,
+        {
+            "target_job_minutes": 8,
+            "multicard": {
+                "enabled": True,
+                "runners": [{"label": "spyre_pf_x2", "min_minutes": 2}],
+            },
+        },
+        {
+            "inductor/test_a_config.yaml": {"p50_min": 3, "runs": 9},
+            "inductor/test_b_config.yaml": {"p50_min": 3, "runs": 9},
+        },
+    )
+    assert rc == 0, err
+    assert [(s["config"], s["runner"], bool(s.get("configs"))) for s in suites] == [
+        ("inductor/test_a_config.yaml", "spyre_pf_x2", False),
+        ("inductor/test_b_config.yaml", "spyre_pf_x2", False),
+    ]
+    assert not any(k in s for s in suites for k in ("runner_overridden", "multicard"))
 
 
 def test_filter_configs_without_a_policy_is_unchanged(tmp_path):

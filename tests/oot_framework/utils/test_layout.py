@@ -54,6 +54,9 @@ DEFAULT_POLICY: dict = {
 }
 
 DEFAULT_RUNNER = "spyre_pf_x1"
+# Runner labels the card pool serves with more than one card; anything else in `multicard` would make
+# a job that waits for a runner that never comes, so the policy is rejected instead.
+MULTICARD_LABELS = ("spyre_pf_x2", "spyre_pf_x4")
 
 
 class LayoutError(ValueError):
@@ -149,6 +152,19 @@ def _check_multicard(path: str, mc) -> None:
                 f"{path}: multicard runner must be "
                 f'{{"label": str, "min_minutes": number > 0}}, got {r!r}'
             )
+        if r["label"] not in MULTICARD_LABELS:
+            raise LayoutError(
+                f"{path}: multicard label {r['label']!r} is not a multi-card runner "
+                f"({', '.join(MULTICARD_LABELS)})"
+            )
+    # The winner is the highest min_minutes a config reaches, so a repeated threshold would make the
+    # list order decide; a repeated label is a second threshold for the same runner.
+    for field in ("label", "min_minutes"):
+        seen = [
+            float(r[field]) if field == "min_minutes" else r[field] for r in runners
+        ]
+        if len(seen) != len(set(seen)):
+            raise LayoutError(f"{path}: multicard runners repeat a {field}: {seen}")
 
 
 def multicard_runners(
@@ -160,8 +176,14 @@ def multicard_runners(
     that names the default), is not excluded, has `min_runs` runs, and its median reaches a runner's
     `min_minutes`; it gets the runner with the highest `min_minutes` it reaches, so a longer config
     gets more cards. The median is `p50_min`: the per-run sum of case durations, not job wall time,
-    which adds pytest, collection and compile overhead on top. A shared test file does not matter
-    here: a moved config runs alone and reports under its own name, so its timings stay exact.
+    which adds pytest, collection and compile overhead on top. Each case runs on one card whether the
+    job has one or several, so the sum, and the decision, does not change after a move (SWA on x2:
+    19.9-20.0 min against 19.6-20.2 on x1 the same day), and a config does not flap across the
+    threshold. A shared test file does not matter here: a moved config runs alone and reports under
+    its own name, so its timings stay exact.
+
+    A config whose tests cannot be dealt across cards (torchrun suites, say) belongs in `exclude`:
+    that is the only thing that keeps it on one card.
     """
     if policy is None or not policy["multicard"].get("enabled"):
         return {}
@@ -203,8 +225,9 @@ def plan(
 ) -> Dict[str, str]:
     """{config key: bucket name, or "" to run alone} for the configs one matrix will run.
 
-    `configs` are the tier-filtered records: key, dir, runner, flags, global, files, and
-    shared_file (some test file of it is also listed by another config on disk).
+    `configs` are the tier-filtered records: key, dir, runner, flags, global, files,
+    shared_file (some test file of it is also listed by another config on disk), and multicard (moved
+    to a multi-card runner by multicard_runners, so it runs alone whatever the thresholds are).
     """
     if policy is None:
         return {c["key"]: "" for c in configs}
@@ -218,6 +241,7 @@ def plan(
         if (
             _excluded(key, policy)
             or c.get("shared_file")
+            or c.get("multicard")
             or rec is None
             or rec["runs"] < policy["min_runs"]
         ):
