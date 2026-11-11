@@ -69,22 +69,24 @@ Device-side `kernel` and `gpu_memcpy` events that belong to a collective carry e
 | Arg | Type | Meaning |
 |---|---|---|
 | `coll_group` | string | Collective type, such as `"Allreduce"` or `"Allgather"`. |
-| `coll_algo` | string | Collective algorithm, such as `"Ring"`. |
+| `coll_algo` | string | Full collective algorithm name, such as `"AllReduce_Offload_GatherSumBcast"`. |
 | `coll_bytes` | number or `""` | Total transfer size of the collective, in bytes; `""` when unknown. |
 
 ```json
 {"ph": "X", "cat": "kernel", "name": "...",
- "args": {"coll_group": "Allreduce", "coll_algo": "Ring", "coll_bytes": 256}}
+ "args": {"coll_group": "Allreduce", "coll_algo": "AllReduce_Offload_GatherSumBcast", "coll_bytes": 256}}
 ```
 
 When each arg appears:
 
 - Events outside a collective carry none of the `coll_*` args.
 - Every collective event carries `coll_group` and `coll_bytes`.
-- `coll_algo` is present only when the control block carried the full
-  `[Coll,Algo,Bytes]` annotation. A control block labelled with a bare
-  collective name has no `coll_algo`, and its `coll_bytes` is `""`
-  because the runtime cannot recover the size.
+- `coll_algo` is present only when the collective names an algorithm.
+  Without one, `coll_bytes` is `""` when the size is zero, because a zero
+  there cannot be told apart from an unknown size.
+- Algorithm names have no length limit. A name that reads `algo_0x` followed
+  by eight hex digits is an algorithm ID the communication library never
+  registered, which points to a missing table entry.
 - A numeric `coll_bytes` of `0` is a real zero-byte transfer, not an
   unknown size.
 
