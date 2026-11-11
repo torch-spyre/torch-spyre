@@ -2920,6 +2920,7 @@ def compute_restickify_needed(
             red_var = min(reduction_vars, key=str)
             target_stick = sympy.Mod(red_var, in_stl.elems_per_stick())
 
+    sparse_target = None
     if is_sparse_stl(in_stl):
         # We want to test whether a sparse to dense conversion is possible.
         # But if there is a trailing 1 dim, the STL will create a sparse layout
@@ -2939,15 +2940,25 @@ def compute_restickify_needed(
         # have extra dimensions in which the input will be broadcasted into.
         expanded, expanded_stl = expand_sparse(in_stl, dense_in_host)
         if expanded:
-            return True, expanded_stl
+            # expand_sparse keeps the stick on the input's own last host dim. When the
+            # consumer reads another stick (a stick-dim gather written into a wider
+            # stick at an offset, as in cat), restickify straight to that stick: a
+            # second, stick-padded restickify would write at offset 0 and past it.
+            expanded_idc = try_device_coordinates(
+                expanded_stl, in_dep, ind_sizes, op=op
+            )
+            if expanded_idc is not None and stick_compatible([expanded_idc, out_idc]):
+                return True, expanded_stl
+            sparse_target = expanded_stl
 
     # Local import avoids circular dependency (propagate_layouts imports pass_utils).
     from .propagate_layouts import PropArg  # noqa: PLC0415
 
     arg = PropArg(in_dep, in_host, [in_stl])
-    return True, compute_restickify_target_layout(
+    target = compute_restickify_target_layout(
         in_stl, in_host, target_stick, ic, idc, arg=arg
     )
+    return True, sparse_target if target is None else target
 
 
 def compute_size1_restickify_target(
