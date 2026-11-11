@@ -453,6 +453,13 @@ def _init_vid_to_bufname(trace):
 def _lower_fx_node(node, gl, ops, idx):
     """Lower an FX node to a buffer and insert it into operations list.
 
+    A lowering may register more than one operation: a host fallback registers
+    a FallbackKernel and then the MultiOutput that reads it, and a lowering can
+    realize helper buffers before its result. register_operation appends them
+    all at the end of gl.operations, after the consumer being split, so all of
+    them are moved to ``idx`` in registration order to keep the list in
+    topological order.
+
     Args:
         node: FX node to lower
         gl: GraphLowering instance
@@ -460,15 +467,22 @@ def _lower_fx_node(node, gl, ops, idx):
         idx: Index position for insertion
 
     Returns:
-        The created buffer
+        The created buffer and the number of operations inserted at ``idx``
     """
+    start = len(gl.operations)
     tb = gl.run_node(node)
     gl.env[node] = tb  # run_node does not record it in the env
+    # buf is the lowering's result, not every operation it registered: for a
+    # host fallback it is the MultiOutput, registered after its FallbackKernel.
+    # new_ops below holds all of them, so the whole group moves together.
     buf = tb.data.data
-    gl.operations.remove(buf)
-    ops.insert(idx, buf)
+    new_ops = [gl.operations[i] for i in range(start, len(gl.operations))]
+    for new_op in new_ops:
+        gl.operations.remove(new_op)
+    for offset, new_op in enumerate(new_ops):
+        ops.insert(idx + offset, new_op)
     gl.name_to_buffer[buf.get_name()] = buf
-    return buf
+    return buf, len(new_ops)
 
 
 def _make_intermediate_bufs(
@@ -595,7 +609,7 @@ def _make_intermediate_bufs(
             new_node.meta["val"] = orig_node.meta["val"].to(out_dtype)
 
         # Lower the FX node; _lower_fx_node extracts, removes, and reinserts.
-        new_buf = _lower_fx_node(new_node, gl, operations, insert_idx)
+        new_buf, num_new_ops = _lower_fx_node(new_node, gl, operations, insert_idx)
         # This child node is the sole semantic origin of the new buffer.
         object.__setattr__(new_buf, "origins", OrderedSet([new_node]))
         decompose_provenance(
@@ -613,7 +627,7 @@ def _make_intermediate_bufs(
         if op_name not in op_queues:
             op_queues[op_name] = collections.deque()
         op_queues[op_name].append(buf_name)
-        insert_idx += 1
+        insert_idx += num_new_ops
 
     return constant_map, op_queues
 
