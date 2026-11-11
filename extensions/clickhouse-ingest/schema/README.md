@@ -42,6 +42,7 @@ Applying them in filename order works from an empty database.
 | `72-ops-audit-events.sql` | `ops_audit_events`, `v_ops_audit_events` | — |
 | `73-ci-access-audit.sql` | `ci_access_audit`, `v_ci_access_audit` | — |
 | `74-model-priority-events.sql` | `model_priority_events`, `v_model_priority` | — |
+| `75-artifact-sweep-runs.sql` | `artifact_sweep_runs` (append-only sweep plan/apply records) | — |
 
 Column names `chat_turns` shares with `vigil_ops.analyst_turns`, so one `UNION ALL` view can read both:
 
