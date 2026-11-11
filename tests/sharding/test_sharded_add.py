@@ -622,14 +622,19 @@ def test_dynamic_shapes_fail_at_compile():
 @_requires_emulation
 @expects_raise
 def test_fallback_consumer_fails_at_compile():
-    """An op that lowers to a fallback kernel is rejected at compile, not at
-    launch with an error that names neither the op nor the sharding."""
+    """A consumer that mixes sharded and unsharded storage is rejected at
+    compile, not at launch with an error that names neither the op nor the
+    sharding. cumsum decomposes to a matmul whose triu_mask operand is
+    unsharded, so the add over its result and a sharded tensor fails the
+    same-placement check."""
     n = _num_shards()
     torch.manual_seed(0)
     a = _sharded(torch.randn(8 * n, 64, dtype=torch.float16), 0, n)
     b = _sharded(torch.randn(8 * n, 64, dtype=torch.float16), 0, n)
 
-    with pytest.raises(RuntimeError, match="pointwise ops on sharded operands"):
+    with pytest.raises(
+        RuntimeError, match="need every operand sharded with the same placement"
+    ):
         torch.compile(lambda x, y: torch.cumsum(x, dim=1) + 0 * y, dynamic=False)(a, b)
 
 
