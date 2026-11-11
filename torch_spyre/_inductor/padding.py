@@ -83,6 +83,7 @@ from torch._inductor.ir import (
     ReinterpretView,
     MultiOutput,
     FallbackKernel,
+    TorchBindObject,
 )
 from torch._inductor.ops_handler import DefaultHandler, WrapperHandler
 from torch._inductor.utils import sympy_product
@@ -1853,6 +1854,10 @@ class DomainRangeTracer(DomainRangeSolver):
             buf = self.graph.get_buffer(dep.name)
             while isinstance(buf, MutableBox):
                 buf = buf.data
+            if isinstance(buf, TorchBindObject):
+                # An opaque script object (e.g. a process group passed to a
+                # collective) holds no tensor data, so it has no padding.
+                continue
             stl = _get_stl(self.graph, buf)
             buf_is_padded = is_padded(self.graph, buf) if stl is not None else False
             if isinstance(buf, InputBuffer):
@@ -1869,7 +1874,8 @@ class DomainRangeTracer(DomainRangeSolver):
                         self.buffer_range[dep.name] = EmptySet
             else:
                 assert dep.name in self.buffer_range, (
-                    f"Nodes seen out of order, expected {dep.name} to have been visited"
+                    f"Nodes seen out of order, expected {dep.name} "
+                    f"({type(buf).__name__}) to have been visited"
                 )
             self.current_reads[dep.name] = self.buffer_range[dep.name]
             input_buffers[dep.name] = buf

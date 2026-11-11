@@ -1514,8 +1514,8 @@ void copy_sharded(const at::Tensor& self, const at::Tensor& dst) {
  * at offset 0 whose layout sized the storage. A write through such a tensor
  * (a fill, or an H2D copy whose DCI covers it) defines every padding element.
  */
-bool covers_whole_allocation(const at::Tensor& tensor) {
-  auto* impl = static_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl());
+bool covers_whole_allocation(const at::Tensor& tensor,
+                             const SpyreTensorImpl* impl) {
   if (tensor.storage_offset() != 0 || !tensor.is_contiguous()) return false;
   if (impl->dma_sizes != tensor.sizes().vec()) return false;
   const size_t device_bytes = get_device_size_in_bytes(impl->spyre_layout);
@@ -1537,14 +1537,21 @@ void record_padding_after_write(const at::Tensor& tensor,
                                 std::optional<double> value) {
   // A write through a view changes the base's storage too; its recorded
   // padding is no longer known.
+  //
+  // Not every PrivateUse1 tensor has a SpyreTensorImpl: a view made by a
+  // generic aten kernel (not one in spyre_views.cpp) gets a plain TensorImpl.
+  // Such a tensor carries no layout, so there is no padding state to record.
   if (tensor.is_view()) {
     const at::TensorBase& base = tensor._base();
     if (base.defined() && base.is_privateuseone()) {
-      static_cast<SpyreTensorImpl*>(base.unsafeGetTensorImpl())
-          ->spyre_layout.clear_padding();
+      if (auto* base_impl =
+              dynamic_cast<SpyreTensorImpl*>(base.unsafeGetTensorImpl())) {
+        base_impl->spyre_layout.clear_padding();
+      }
     }
   }
-  auto* impl = static_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl());
+  auto* impl = dynamic_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl());
+  if (impl == nullptr) return;
   auto& stl = impl->spyre_layout;
   // The padding state takes part in layout equality, so leave layouts without
   // padding untouched: they compare (and guard) exactly as before.
@@ -1554,7 +1561,7 @@ void record_padding_after_write(const at::Tensor& tensor,
       stl.element_arrangement == ElementArrangement::STANDARD &&
       (stl.device_dtype == DataFormats::SEN169_FP16 ||
        stl.device_dtype == DataFormats::IEEE_FP32);
-  if (value.has_value() && supported && covers_whole_allocation(tensor)) {
+  if (value.has_value() && supported && covers_whole_allocation(tensor, impl)) {
     stl.set_constant_padding(*value);
   } else {
     stl.clear_padding();
