@@ -450,3 +450,26 @@ def test_spool_file_is_plain_json(tmp_path):
 
 def test_time_is_injectable_not_real():
     assert resilience.time is time
+
+
+def test_a_refused_connection_is_a_retry_because_nothing_was_sent():
+    assert classify(ConnectionRefusedError("refused")) == "retry"
+    assert (
+        classify(OperationalError("Failed to establish a new connection: refused"))
+        == "retry"
+    )
+    assert classify(OperationalError("Read timed out")) == "ambiguous"
+
+
+def test_replicated_inserts_ask_dependent_views_to_deduplicate_too():
+    c = Cluster()
+    run(c)
+    assert all(
+        s.get("deduplicate_blocks_in_dependent_materialized_views") == 1
+        for s in c.calls
+    )
+    c = Cluster()
+    resilient_insert(
+        c, "t", ROWS, ["a", "b"], scope="s", replicated=True, feeds_views=False, **FAST
+    )
+    assert "deduplicate_blocks_in_dependent_materialized_views" not in c.calls[0]

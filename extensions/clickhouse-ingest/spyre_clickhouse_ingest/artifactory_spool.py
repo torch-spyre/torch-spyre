@@ -33,11 +33,13 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from .spool import CLAIM, Unreachable
+from .spool import CLAIM, LEASE_MARGIN_S, SEND_TIMEOUT_S, Unreachable
 
 LOCK = ".lock"
 
 DEFAULT_PREFIX = "clickhouse-spool"
+# A lock must outlast one ClickHouse send, or a second drainer takes an item mid-send.
+DEFAULT_LEASE_S = SEND_TIMEOUT_S + 2 * LEASE_MARGIN_S
 
 
 class ArtifactorySpool:
@@ -53,7 +55,7 @@ class ArtifactorySpool:
         clock=time.time,
         sleep=time.sleep,
         settle_s: float = 1.0,
-        lease_s: float = 300.0,
+        lease_s: float = DEFAULT_LEASE_S,
     ):
         if not token:
             raise ValueError("an Artifactory token is required")
