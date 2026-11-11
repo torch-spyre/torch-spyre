@@ -1921,7 +1921,17 @@ def _is_supported_pointwise_layout(
         )
         c_in_size = [concretize_expr(s) for s in arg.layout.size]
         c_in_stride = [concretize_expr(s) for s in arg.layout.stride]
-        if len(c_in_size) < len(dim_order) and dim_order[-1] == -1:
+        # The projected order ends with the sparse-stick marker (-1) while
+        # c_in_size only covers the real dims, so append a dummy entry to keep
+        # size/stride/order parallel for SpyreTensorLayout. Check the projected
+        # order, not dim_order: when the input rank exceeds the output rank + 1
+        # the leading axes are prepended, so len(dim_order) is not the right
+        # bound.
+        if (
+            projected_dim_order
+            and projected_dim_order[-1] == -1
+            and len(c_in_size) < len(projected_dim_order)
+        ):
             c_in_size.append(0)
             c_in_stride.append(0)
         assert len(c_in_size) == len(projected_dim_order)
