@@ -55,6 +55,7 @@ from torch._inductor.ops_handler import DefaultHandler, WrapperHandler
 from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.graph import GraphLowering
 from torch._inductor.utils import sympy_subs
+from torch.utils._sympy.functions import FloorDiv
 from torch._inductor.dependencies import MemoryDep, ReadWrites, is_indirect
 from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
 from torch._inductor.virtualized import V
@@ -98,7 +99,6 @@ from .views import (
     AlignmentInputs,
     build_alignment_inputs,
     compute_coordinates,
-    matching_dim,
 )
 
 # PyTorch's default lower bound for size symbols (sizes 0/1 are specialised).
@@ -388,6 +388,120 @@ def finite_upper_or_none(expr: Expr) -> Optional[int]:
     if isinstance(vr.upper, sympy.Integer) and vr.upper.is_finite and int(vr.upper) > 0:
         return int(vr.upper)
     return None
+
+
+def decompose_tiled_count(count) -> "tuple[sympy.Symbol, int] | None":
+    """Split a loop's trip count into the symbol it tiles and its tile size.
+
+    Returns ``(symbol, tile_size)``, or None when the count is not a shape the
+    loop production can produce. Only two shapes are: a tiled dimension gives
+    ``shape[dim] // tile_size``, and a tile size of 1 gives the bare symbol.
+
+    This is how the granularity is RECOVERED rather than inferred.
+    ``for_each_tile(tile_size=G)`` puts G into the count itself, so reading it
+    back here means the granularity a bundle declares and the step its loop
+    takes come from one expression and cannot disagree. Not to be confused with
+    ``compute_granularity``, which picks a divisor for the SDSC route.
+
+    Both spellings of the division are accepted, at this one point. A trip count
+    reaches codegen as ``FloorDiv(s, G)``, but the kernel serializer writes
+    expressions as ``sympify('<str>')`` and ``str`` prints ``FloorDiv`` as
+    ``(s//G)``, which sympy re-parses into ``floor(s/G)``.
+
+    That same round trip builds a fresh ``Symbol`` without its assumptions, and
+    sympy counts assumptions as part of identity, so the reloaded symbol is
+    unequal to the one the scheduler saw while printing the same. **Any map that
+    has to outlive the reload is keyed by ``str(symbol)``.** The symbol itself is
+    returned because the scheduler needs it to query the ShapeEnv, which only
+    happens before the reload.
+    """
+    if isinstance(count, sympy.Symbol):
+        return count, 1
+
+    if isinstance(count, FloorDiv):
+        numerator, denominator = count.args
+    elif isinstance(count, sympy.floor):
+        numerator, denominator = count.args[0].as_numer_denom()
+    else:
+        return None
+
+    if isinstance(numerator, sympy.Symbol) and denominator.is_Integer:
+        tile_size = int(denominator)
+        if tile_size > 0:
+            return numerator, tile_size
+    return None
+
+
+def symbolic_count_bounds(count) -> "dict[str, tuple[int, int]]":
+    """``{symbol name: (max_value, tile_size)}`` for one loop's trip count.
+
+    Resolved here, while the ShapeEnv still exists, and carried on
+    ``LoopSpec.count_symbol_bounds`` because codegen also runs in a reload phase
+    where it is gone. The bundle turns each entry into one
+    ``!sdscbundle.input_arg<index, granularity=G, max_value=M>`` parameter and
+    takes its loop bound from it.
+
+    Keyed by NAME, not by the symbol, because the reload builds a fresh symbol
+    without its assumptions. See decompose_tiled_count.
+
+    Empty when there is nothing to carry, and the caller need not distinguish
+    the reasons: a concrete count, a shape the loop production cannot produce,
+    or a symbol with no declared ceiling all give ``{}``. Each leaves a kernel
+    that specialises, which is a worse binary rather than a wrong one, so the
+    refusal belongs at emission where the message can name the symbol.
+
+    Raises:
+        Unsupported: the count involves more than one symbol after the
+            ShapeEnv's replacements are applied (what ``torch._check(a == b)``
+            records, so a tied pair counts as one). The backend asserts exactly
+            one per symbolic loop, so that is a check failure there rather than
+            a degraded kernel here.
+    """
+    replacements = getattr(
+        getattr(V.graph.sizevars, "shape_env", None), "replacements", None
+    )
+    if replacements and hasattr(count, "free_symbols"):
+        count = sympy_subs(count, replacements)
+    free_symbols = getattr(count, "free_symbols", None) or set()
+    if len(free_symbols) > 1:
+        raise Unsupported(
+            f"symbolic loop count {count} involves {len(free_symbols)} symbols, "
+            f"{sorted(map(str, free_symbols))}. A symbolic loop takes exactly "
+            f"one. If these dimensions are meant to be equal, tie them with "
+            f"torch._check before the region so they become one symbol."
+        )
+
+    decomposed = decompose_tiled_count(count)
+    if decomposed is None:
+        return {}
+
+    symbol, tile_size = decomposed
+    shape_env = V.graph.sizevars.shape_env
+    if shape_env is None:
+        return {}
+
+    upper = finite_upper_or_none(symbol)
+    if upper is None:
+        # The one empty case worth saying out loud. Without a ceiling there is
+        # nothing to build the geometry against, so the kernel specialises, and
+        # that looks identical to never having asked for a symbolic loop.
+        logger.warning(
+            "[symbolic-loop] trip count %s has no finite upper bound for %s, so "
+            "no bundle parameter can be emitted for it and this kernel will be "
+            "size-specific. Declare the range in the traced region",
+            count,
+            symbol,
+        )
+        return {}
+
+    logger.info(
+        "[symbolic-loop] %s: symbol %s max=%d tile_size=%d",
+        count,
+        symbol,
+        upper,
+        tile_size,
+    )
+    return {str(symbol): (upper, tile_size)}
 
 
 def compute_granularity(expr: Expr, max_size: int) -> int:
@@ -2366,7 +2480,13 @@ def _host_size_stride_for_expr(
     from .propagate_layouts import _factorized_chain  # noqa: PLC0415
 
     if var not in arg.dep.ranges:
-        # Broadcast dimension: this tensor does not vary along var.
+        # Indirect gather index (e.g. x[i] where i comes from another tensor):
+        # the symbol is not a loop variable so it is absent from dep.ranges, but
+        # the tensor does vary.  Indirect-access tensors are always 1D on the
+        # host; len(host_size) == 1 is the load-bearing guard that prevents
+        # silent mis-resolution if that assumption is ever violated.
+        if is_indirect(var.name) and len(host_size) == 1:
+            return host_size[0], host_stride[0]
         return None
     try:
         host_dims, _var_range, var_stride = _factorized_chain(
@@ -2416,7 +2536,7 @@ def compute_restickify_target_layout(
     ``_factorized_chain``.
     """
     if target_stick_expr == sympy.S.Zero:
-        return compute_size1_restickify_layout(stl, host_layout, ic, idc)
+        return compute_size1_restickify_layout(stl, host_layout, ic, idc, arg=arg)
     if not target_stick_expr.free_symbols:
         return None
     host_size = [concretize_expr(s) for s in host_layout.size]
@@ -2491,24 +2611,30 @@ def compute_size1_restickify_layout(
     host_layout: FixedLayout,
     ic: list,
     idc: list,
+    *,
+    arg: "PropArg",
+    label: str = "",
 ) -> "SpyreTensorLayout | None":
     """Compute the target STL that results from moving stl's stick onto a size-1 dim.
 
     Each stick then holds one element. The size-1 dim need not exist on the host:
     it behaves the same whether it is real or synthetic.
 
-    This is what lets _make_output_stl in propagate_layouts.py put the stick on a
-    size-1 dim: such a layout has a stick expression of the constant 0, which
-    matching_dim cannot resolve to a host dim.
+    ``arg`` and ``label`` are forwarded to ``_host_size_stride_for_expr`` to
+    enable resolution of factorized (FloorDiv) coordinate expressions via
+    ``_factorized_chain``.
 
     Returns None if the restickify is infeasible.
     """
     host_size = [concretize_expr(s) for s in host_layout.size]
     host_stride = [concretize_expr(s) for s in host_layout.stride]
-    old_sd = matching_dim(ic, idc[-1])
-    if old_sd is None:
-        return None
     old_stick_expr = idc[-1]
+    ss = _host_size_stride_for_expr(
+        old_stick_expr, ic, host_size, host_stride, arg, label
+    )
+    if ss is None:
+        return None
+    old_sd_host_size, old_sd_host_stride = ss
     old_var = next(iter(old_stick_expr.free_symbols))
     stick_size = get_elem_in_stick(host_layout.dtype)
     old_var_outer_dims = [
@@ -2545,7 +2671,7 @@ def compute_size1_restickify_layout(
     device_size = restickify_device_size(
         list(stl.device_size),
         old_sd_outer_dim,
-        host_size[old_sd],
+        old_sd_host_size,
         new_sd_outer_dim,
         1,
         stick_size,
@@ -2553,7 +2679,7 @@ def compute_size1_restickify_layout(
     stride_map = restickify_stride_map(
         list(stl.stride_map),
         old_sd_outer_dim,
-        host_stride[old_sd],
+        old_sd_host_stride,
         new_sd_outer_dim,
         -1,
         stick_size,
@@ -2825,12 +2951,16 @@ def compute_size1_restickify_target(
     Used when the input's stick var must leave the stick (e.g. topk's
     reduction var) and no other dim can take it.
     """
+    # Local import avoids circular dependency (propagate_layouts imports pass_utils).
+    from .propagate_layouts import PropArg  # noqa: PLC0415
+
     _, _, ind_sizes = indirect_info_from_op(op)
     idc = try_device_coordinates(in_stl, in_dep, ind_sizes, op=op)
     if idc is None:
         return None
     ic = host_coordinates(in_host, in_dep, ind_sizes, op=op)
-    return compute_size1_restickify_layout(in_stl, in_host, ic, idc)
+    arg = PropArg(in_dep, in_host, [in_stl])
+    return compute_size1_restickify_layout(in_stl, in_host, ic, idc, arg=arg)
 
 
 def copy_fx_custom_meta(src: "torch.fx.Node", dst: "torch.fx.Node") -> None:
