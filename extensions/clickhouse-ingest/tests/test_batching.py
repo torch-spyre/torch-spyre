@@ -329,7 +329,7 @@ def test_table_insert_passes_the_scope_and_idempotence_through():
 
 
 def test_every_replacing_merge_tree_model_is_marked_idempotent():
-    import re
+    import regex as re
     from pathlib import Path
 
     from spyre_clickhouse_ingest import schema

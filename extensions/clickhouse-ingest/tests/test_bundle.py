@@ -1004,3 +1004,114 @@ def test_a_sha_is_never_recorded_as_the_vllm_branch(tmp_path, branch, recorded):
         str(VLLM_DATA / "results"), branch, "881a59d2", "", "0", "wf", 0
     )
     assert {r["head_branch"] for r in rows} == {recorded}
+
+
+def test_a_vllm_bundle_carries_sidecars_and_per_test_subdirs(
+    tmp_path, monkeypatch, capsys
+):
+    from spyre_clickhouse_ingest import client, resolver, vllm
+
+    test = "latency_granite8B_tp1_in64_out64"
+    src = tmp_path / "vllm-out"
+    shutil.copytree(VLLM_DATA / "results", src)
+    (src / "env.json").write_text(json.dumps({"host": "shared"}))
+    (src / f"{test}.env.json").write_text(json.dumps({"host": "per-test"}))
+    (src / test).mkdir()
+    (src / test / "phases.json").write_text(
+        json.dumps({"phases": [{"name": "load", "t_start": 1, "t_end": 3}]})
+    )
+    (src / test / "repeats").mkdir()
+    (src / test / "repeats" / "env.json").write_text("{}")
+    out = tmp_path / "perf"
+    argv = ["results", "--offline", "--out", str(out), "--vllm-results-dir", str(src),
+            "--artifact", f"id:{AID}", "--arch", "x86_64", "--perf", "head_sha=881a59d2",
+            "--perf", "head_branch=main"]  # fmt: skip
+    assert cli(argv) == 0
+    paths = {f["path"] for f in _meta(out)["files"]}
+    assert {
+        "results/env.json",
+        f"results/{test}.env.json",
+        f"results/{test}/phases.json",
+    } <= paths
+    assert not any("repeats" in p for p in paths)
+    assert cli(["results", "--from-bundle", str(out), "--validate-only"]) == 0
+
+    ch = CapturingClient()
+    monkeypatch.setattr(client.ClickHouse, "connect", lambda **kw: ch)
+    monkeypatch.setattr(client, "tables_present", lambda *a, **kw: True)
+    monkeypatch.setattr(vllm, "tables_present", lambda *a, **kw: True)
+    monkeypatch.setattr(
+        resolver,
+        "resolve",
+        lambda *a, **kw: _resolution(AID, "x86_64", "spyre-inference"),
+    )
+    monkeypatch.setenv("CLICKHOUSE_DB_V2", "spyre_v2")
+    code, report = _ingest(out, capsys, "--bundle-url", "https://art/p/")
+    assert (code, report["status"], report["benchmark_runs"]) == (0, "ingested", 2)
+    lat = next(
+        r for r in ch.inserted["benchmark_runs"] if r["measurements"].get("avg_latency")
+    )
+    assert lat["props"]["env_host"] == "per-test"
+    assert lat["props"]["phase_load_s"] == "2.000"
+
+
+def _vllm_args(src, out):
+    return ["results", "--offline", "--out", str(out), "--vllm-results-dir", str(src),
+            "--artifact", f"id:{AID}", "--arch", "x86_64", "--perf", "head_sha=881a59d2",
+            "--perf", "head_branch=main"]  # fmt: skip
+
+
+def test_offline_bundling_does_not_follow_symlinks_out_of_the_results_dir(tmp_path):
+    src = tmp_path / "vllm-out"
+    shutil.copytree(VLLM_DATA / "results", src)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "env.json").write_text('{"host": "leak"}')
+    (src / "ext").symlink_to(outside)
+    (src / "phases.json").symlink_to(outside / "env.json")
+    (src / "linked").mkdir()
+    (src / "linked" / "env.json").symlink_to(outside / "env.json")
+    out = tmp_path / "perf"
+    assert cli(_vllm_args(src, out)) == 0
+    paths = {f["path"] for f in _meta(out)["files"]}
+    assert not {
+        p for p in paths if "ext/" in p or "linked" in p or p.endswith("phases.json")
+    }
+
+
+def test_offline_py_runs_standalone_and_bundles_sidecars(tmp_path):
+    import sys
+
+    alone = tmp_path / "alone"
+    alone.mkdir()
+    pkg = Path(offline.__file__).parent
+    shutil.copy(pkg / "offline.py", alone)
+    shutil.copy(pkg / "bundle.schema.json", alone)
+    run = [sys.executable, "-I", str(alone / "offline.py")]
+    assert subprocess.run(run + ["--help"], capture_output=True).returncode == 0
+
+    test = "latency_granite8B_tp1_in64_out64"
+    src = tmp_path / "vllm-out"
+    shutil.copytree(VLLM_DATA / "results", src)
+    (src / "env.json").write_text("{}")
+    (src / test).mkdir()
+    (src / test / "phases.json").write_text('{"phases": []}')
+    out = tmp_path / "perf"
+    done = subprocess.run(
+        run + _vllm_args(src, out)[1:], capture_output=True, text=True
+    )
+    assert done.returncode == 0, done.stderr
+    paths = {f["path"] for f in _meta(out)["files"]}
+    assert {"results/env.json", f"results/{test}/phases.json"} <= paths
+
+
+def test_the_sidecar_names_are_one_definition():
+    from spyre_clickhouse_ingest import benchmeta
+
+    assert benchmeta.is_sidecar is offline.is_sidecar
+
+
+def test_trace_bundle_files_are_not_mistaken_for_sidecars():
+    root = Path(__file__).parent / "data" / "vllm_trace"
+    names = {p.name for p in root.rglob("*.json") if offline.is_sidecar(p.name)}
+    assert names <= {"env.json", "compile_summary.json"}
