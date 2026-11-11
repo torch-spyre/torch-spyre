@@ -364,7 +364,7 @@ def test_a_migration_syncs_replicas_after_filling_a_scratch_table(tmp_path):
         },
     )
     log = server.log
-    sync = f"SYSTEM SYNC REPLICA ON CLUSTER {CLUSTER} scratch"
+    sync = f"SYSTEM SYNC REPLICA ON CLUSTER {CLUSTER} `db`.scratch"
     assert sync in log
     assert (
         log.index("INSERT INTO scratch SELECT 1")
@@ -382,7 +382,7 @@ def test_a_migration_syncs_an_existing_table_it_inserted_into_before_reading_it(
     )
     server, _ = _apply(tmp_path, {"10-a.sql": T + ";"}, {"001-x.sql": mig})
     log = server.log
-    sync = f"SYSTEM SYNC REPLICA ON CLUSTER {CLUSTER} a"
+    sync = f"SYSTEM SYNC REPLICA ON CLUSTER {CLUSTER} `{DB}`.a"
     assert log.count(sync) == 1
     assert log.index(sync) < next(
         i for i, c in enumerate(log) if c.startswith("DELETE FROM a")
@@ -396,7 +396,7 @@ def test_a_migration_does_not_sync_a_table_nothing_reads_afterwards(tmp_path):
     server, _ = _apply(
         tmp_path, {"10-a.sql": T + ";"}, {"001-x.sql": "INSERT INTO a SELECT 1;"}
     )
-    assert f"SYSTEM SYNC REPLICA ON CLUSTER {CLUSTER} a" not in server.log
+    assert not any(c.startswith("SYSTEM SYNC REPLICA ON CLUSTER") for c in server.log)
 
 
 def test_a_migration_does_not_sync_a_table_it_is_about_to_drop(tmp_path):
@@ -666,9 +666,11 @@ class Blind(FakeServer):
             and "system.one" not in sql
             and self.mode == "blind"
         ):
-            return type("R", (), {"result_rows": [("h1", 1, []), ("h2", 0, [])]})()
+            return type(
+                "R", (), {"result_rows": [("h1", 9000, 1, []), ("h2", 9000, 0, [])]}
+            )()
         if "system.one" in sql and self.mode == "blind":
-            return type("R", (), {"result_rows": [("h1",), ("h2",)]})()
+            return type("R", (), {"result_rows": [("h1", 9000), ("h2", 9000)]})()
         return super().query(sql, parameters)
 
 
@@ -681,3 +683,207 @@ def test_an_unreadable_replica_stops_apply_before_anything_is_created(tmp_path, 
         SchemaApplier.apply(server, DB, f, m, CLUSTER)
     assert not any(c.startswith("CREATE TABLE a") for c in server.log)
     assert not any("REFRESH" in c for c in server.log)
+
+
+# ---- cluster mode: literals, anchoring, prerequisites --------------------------------
+
+
+@pytest.mark.parametrize(
+    "stmt,want",
+    [
+        (
+            "ALTER TABLE t MODIFY COLUMN x String COMMENT 'rerun ON CLUSTER later'",
+            f"ALTER TABLE t {Q} MODIFY COLUMN x String COMMENT 'rerun ON CLUSTER later'",
+        ),
+        (
+            "ALTER TABLE t UPDATE x = 'ON CLUSTER' WHERE 1",
+            f"ALTER TABLE t {Q} UPDATE x = 'ON CLUSTER' WHERE 1",
+        ),
+        (
+            "DELETE FROM t WHERE x = 'on cluster'",
+            f"DELETE FROM t {Q} WHERE x = 'on cluster'",
+        ),
+        (
+            "RENAME TABLE a TO `ON CLUSTER x`",
+            f"RENAME TABLE a TO `ON CLUSTER x` {Q}",
+        ),
+    ],
+)
+def test_on_cluster_inside_a_literal_does_not_count_as_present(stmt, want):
+    assert SchemaApplier.clustered_migration(stmt, CLUSTER) == want
+
+
+@pytest.mark.parametrize(
+    "stmt",
+    [
+        f"ALTER TABLE t {Q} ADD COLUMN a UInt8",
+        f"DELETE FROM t {Q} WHERE 1",
+        f"DROP TABLE t {Q} SYNC",
+        f"RENAME TABLE a TO b {Q}",
+        f"EXCHANGE TABLES a AND b {Q}",
+        f"CREATE VIEW v {Q} AS SELECT 1",
+        f"CREATE MATERIALIZED VIEW m {Q} TO t AS SELECT 1 AS a",
+    ],
+)
+def test_a_real_on_cluster_is_left_alone(stmt):
+    assert SchemaApplier.clustered_migration(stmt, CLUSTER) == stmt
+
+
+def test_literals_never_hide_or_fake_an_engine_or_as_select():
+    sql = (
+        "CREATE TABLE t (a String DEFAULT 'AS SELECT 1' COMMENT 'ENGINE = Log(x)') "
+        "ENGINE = MergeTree ORDER BY a"
+    )
+    out = SchemaApplier.clustered(sql, "table", CLUSTER, "db", "t")
+    assert "ReplicatedMergeTree('/clickhouse/test_cluster/tables/{shard}/db/t'" in out
+    assert "COMMENT 'ENGINE = Log(x)'" in out and "DEFAULT 'AS SELECT 1'" in out
+
+
+@pytest.mark.parametrize(
+    "engine,args",
+    [
+        ("SummingMergeTree((a, b))", "(a, b)"),
+        ("ReplacingMergeTree(toInt8(v))", "toInt8(v)"),
+        ("ReplacingMergeTree(f(g(v), 1))", "f(g(v), 1)"),
+    ],
+)
+def test_nested_parentheses_in_engine_arguments_are_kept(engine, args):
+    out = SchemaApplier.clustered(
+        f"CREATE TABLE t (a UInt8, b UInt8, v UInt8) ENGINE = {engine} ORDER BY a",
+        "table",
+        CLUSTER,
+        "db",
+        "t",
+    )
+    assert f"'{{replica}}', {args}) ORDER BY a" in out
+
+
+def test_drop_table_no_delay_is_not_given_sync():
+    out = SchemaApplier.clustered_migration("DROP TABLE t NO DELAY", CLUSTER)
+    assert out == f"DROP TABLE t {Q} NO DELAY"
+
+
+def test_an_escaped_backtick_in_a_name_is_handled():
+    out = SchemaApplier.clustered_migration("DROP VIEW IF EXISTS `a``b`", CLUSTER)
+    assert out == f"DROP VIEW IF EXISTS `a``b` {Q}"
+    assert SchemaApplier.bare("`a``b`") == "a`b"
+
+
+@pytest.mark.parametrize(
+    "stmt,token",
+    [
+        ("INSERT INTO t SELECT 1", "t"),
+        ("INSERT INTO TABLE t SELECT 1", "t"),
+        ("INSERT INTO other.`t x` SELECT 1", "other.`t x`"),
+        ("WITH 1 AS one INSERT INTO t SELECT one", "t"),
+        ("INSERT INTO table (a) VALUES (1)", "table"),
+        ("SELECT 'INSERT INTO t'", ""),
+    ],
+)
+def test_insert_targets_are_tokenised_like_names(stmt, token):
+    assert SchemaApplier.insert_target(stmt) == token
+
+
+def test_the_sync_target_is_quoted_qualified_and_has_a_long_timeout(tmp_path):
+    server = FakeServer({"a": replicated(T, DB, "a"), "t x": replicated(T, DB, "t x")})
+    sent = []
+    orig = server.command
+    server.command = lambda sql, settings=None: (
+        sent.append((sql, settings)),
+        orig(sql),
+    )[1]
+    d = _schema(
+        tmp_path,
+        {"10-a.sql": T + ";"},
+        {
+            "001-x.sql": "INSERT INTO `t x` SELECT 1;\nINSERT INTO other.a SELECT 1;\nDELETE FROM a WHERE 1 IN (SELECT x FROM `t x`);\nSELECT 1 FROM a;"
+        },
+    )
+    SchemaApplier.apply(
+        server,
+        DB,
+        SchemaApplier.selected_files(d),
+        SchemaApplier.migration_files(d),
+        CLUSTER,
+    )
+    syncs = {c: st for c, st in sent if c.startswith("SYSTEM SYNC REPLICA ON CLUSTER")}
+    assert f"SYSTEM SYNC REPLICA ON CLUSTER {CLUSTER} `{DB}`.`t x`" in syncs
+    assert f"SYSTEM SYNC REPLICA ON CLUSTER {CLUSTER} other.a" in syncs
+    assert all(st == SchemaApplier.SYNC_SETTINGS for st in syncs.values())
+
+
+def test_two_replicas_on_one_host_are_told_apart(tmp_path):
+    class TwoPorts(FakeServer):
+        def query(self, sql, parameters=None):
+            if "clusterAllReplicas" in sql and "system.one" in sql:
+                return type("R", (), {"result_rows": [("h", 9000), ("h", 9001)]})()
+            if "clusterAllReplicas" in sql:
+                return type("R", (), {"result_rows": [("h", 9000, 1, [])]})()
+            return super().query(sql, parameters)
+
+    d = _schema(tmp_path, {"10-a.sql": T + ";"})
+    f, m = SchemaApplier.selected_files(d), SchemaApplier.migration_files(d)
+    with pytest.raises(RuntimeError, match="9001"):
+        SchemaApplier.apply(TwoPorts(), DB, f, m, CLUSTER)
+
+
+def test_a_replica_that_cannot_be_queried_reports_the_real_error(tmp_path):
+    server = Blind("denied")
+    d = _schema(tmp_path, {"10-a.sql": T + ";"})
+    f, m = SchemaApplier.selected_files(d), SchemaApplier.migration_files(d)
+    with pytest.raises(RuntimeError, match="ACCESS_DENIED.*down or unreachable"):
+        SchemaApplier.apply(server, DB, f, m, CLUSTER)
+
+
+PLAIN_LEDGER = {"schema_migrations": SchemaApplier.LEDGER_DDL}
+
+
+def test_an_unconverted_ledger_stops_apply_and_plan_before_any_write(tmp_path):
+    server = FakeServer(dict(PLAIN_LEDGER))
+    d = _schema(tmp_path, {"10-a.sql": T + ";"})
+    f, m = SchemaApplier.selected_files(d), SchemaApplier.migration_files(d)
+    for call in (SchemaApplier.apply, SchemaApplier.plan):
+        with pytest.raises(ValueError, match="schema_migrations"):
+            call(server, DB, f, m, CLUSTER)
+    assert not any(c.startswith(("CREATE", "SYSTEM", "INSERT")) for c in server.log)
+
+
+def test_a_migration_inserting_into_an_unconverted_table_stops_before_any_write(
+    tmp_path,
+):
+    server = FakeServer({"a": T})
+    d = _schema(
+        tmp_path,
+        {"10-a.sql": T + ";"},
+        {"001-x.sql": "INSERT INTO a SELECT 1;\nDELETE FROM a WHERE 1;"},
+    )
+    f, m = SchemaApplier.selected_files(d), SchemaApplier.migration_files(d)
+    with pytest.raises(ValueError, match="not Replicated.*: a "):
+        SchemaApplier.apply(server, DB, f, m, CLUSTER)
+    with pytest.raises(ValueError, match="not Replicated"):
+        SchemaApplier.plan(server, DB, f, m, CLUSTER)
+    assert not any(
+        c.startswith(("CREATE", "INSERT", "DELETE", "SYSTEM")) for c in server.log
+    )
+    assert not server.ledger
+
+
+def test_an_unconverted_table_no_migration_inserts_into_is_not_a_prerequisite(tmp_path):
+    server, steps = _apply(
+        tmp_path,
+        {"10-a.sql": T + ";"},
+        {"001-x.sql": "ALTER TABLE a ADD COLUMN y UInt8;"},
+        live={"a": replicated(T, DB, "a")},
+    )
+    assert ("migrate", "001-x.sql", "") in steps
+
+
+def test_no_preflight_query_is_made_without_a_cluster(tmp_path):
+    server, _ = _apply(
+        tmp_path,
+        {"10-a.sql": T + ";"},
+        {"001-x.sql": "INSERT INTO a SELECT 1;"},
+        cluster="",
+    )
+    assert not any("SYSTEM" in c for c in server.log)
+    assert not any("has(" in q or "clusterAllReplicas" in q for q in server.queries)
