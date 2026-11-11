@@ -51,7 +51,11 @@ import xml.etree.ElementTree as etree
 from datetime import datetime, timezone
 from pathlib import Path
 
+
 SCHEMA_VERSION = 1
+# Run-context files beside a vLLM bench's results; benchmeta imports these.
+SIDECAR_KINDS = ("env", "phases", "host_resources", "outputs", "compile_summary")
+SIDECAR_FILES = frozenset(f"{k}.json" for k in SIDECAR_KINDS)
 BUNDLE_FILE = "bundle.json"
 FAILED, REJECTED, INCOMPLETE = 1, 2, 3
 STATUS = {FAILED: "failed", REJECTED: "rejected", INCOMPLETE: "incomplete"}
@@ -292,11 +296,26 @@ def shapes(name: str) -> dict:
     return out
 
 
+def is_sidecar(filename: str) -> bool:
+    """A `<kind>.json` or `<test_name>.<kind>.json` file; not a benchmark record file."""
+    return filename in SIDECAR_FILES or any(
+        filename.endswith(f".{k}.json") and k != "host_resources" for k in SIDECAR_KINDS
+    )
+
+
+def _nested_sidecar(path: str) -> bool:
+    """`results/<test>/<kind>.json`, the per-test sidecar layout."""
+    parts = path.split("/")
+    return len(parts) == 3 and parts[2] in SIDECAR_FILES
+
+
 def check_vllm(root: Path, meta: dict, results: list) -> None:
     """Each results/*.json is a vLLM bench result named as the runner names it, consistent
     with `perf`. The ingest re-reads them through the live leg's extraction."""
     perf = meta.get("perf", {})
     for p in results:
+        if is_sidecar(Path(p).name):
+            continue
         host = Path(p).name.endswith(HOST_RESOURCES_SUFFIX)
         name = (
             Path(p)
@@ -501,7 +520,10 @@ def check(root: Path) -> dict:
     present = bundle_files(root)
     stray = [p for p in present if not p.startswith(("results/", "attachments/"))]
     if stray or any(
-        "/" in p.removeprefix("results/") for p in present if p.startswith("results/")
+        "/" in p.removeprefix("results/")
+        and not (kind == "vllm" and _nested_sidecar(p))
+        for p in present
+        if p.startswith("results/")
     ):
         errors.append(
             f"files belong in results/ (flat) or attachments/: {stray or present}"
@@ -623,6 +645,7 @@ def _arch(value: str) -> str:
 def write(args) -> Path:
     """The bundle these `results` flags describe, written to --out (a folder, or a .tgz)."""
     kind = "vllm" if (args.kind == "vllm" or args.vllm_results_dir) else args.kind
+    src = None
     if getattr(args, "benchmarks_dir", ""):
         kind = "benchmarks"
     if getattr(args, "tables_dir", ""):
@@ -643,7 +666,13 @@ def write(args) -> Path:
         if not args.vllm_results_dir:
             raise BundleError("--kind vllm needs --vllm-results-dir")
         src = Path(args.vllm_results_dir)
-        results = sorted(src.glob("*.json"))
+        results = sorted(p for p in src.glob("*.json") if not p.is_symlink()) + sorted(
+            p
+            for p in src.glob("*/*.json")
+            if p.name in SIDECAR_FILES
+            and p.parent.name != "repeats"
+            and not (p.is_symlink() or p.parent.is_symlink())
+        )
         extra = sorted(
             p for p in src.iterdir() if p.is_file() and p.suffix in (".cmd", ".log")
         )
@@ -687,7 +716,9 @@ def write(args) -> Path:
         raise BundleError(f"{root} is not empty")
     (root / "results").mkdir(parents=True, exist_ok=True)
     for p in results:
-        shutil.copy2(p, root / "results" / p.name)
+        dest = root / "results" / (p.relative_to(src) if src else p.name)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(p, dest)
     if extra:
         (root / "attachments").mkdir(exist_ok=True)
         for p in extra:
