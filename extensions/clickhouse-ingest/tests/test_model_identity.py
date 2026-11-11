@@ -54,7 +54,7 @@ _EXPLICIT = [
 ]
 
 
-def test_measurement_and_scope_suffixes_stay_one_row(tmp_path):
+def test_measurement_and_scope_suffixes_stay_one_row(tmp_path, capsys):
     op = "gemma-4-26B-A4B-it_full-mode_full_model_torch-spyre"
     tags = [
         f"op__{op}",
@@ -95,11 +95,108 @@ def test_measurement_and_scope_suffixes_stay_one_row(tmp_path):
     assert row["measurement"] == "generate-v1"
     assert row["kernel_scope"] == "request"
     entries = results._bench_entries(rows)
-    assert entries[0]["props"]["measurement"] == "generate-v1"
-    assert entries[0]["props"]["kernel_scope"] == "request"
+    assert entries[0]["run_props"]["measurement"] == "generate-v1"
+    assert entries[0]["run_props"]["kernel_scope"] == "request"
+    assert "measurement" not in entries[0]["props"]
+    assert "kernel_scope" not in entries[0]["props"]
     assert entries[0]["disc_keys"] == results._V2_BENCH_ID_KEYS
     assert "kernel_scope" not in entries[0]["disc_keys"]
     assert "measurement" not in entries[0]["disc_keys"]
+    err = capsys.readouterr().err
+    assert "duplicate" not in err
+    assert "disagrees" not in err
+
+
+def test_measurement_value_with_underscore_stays_one_row(tmp_path):
+    op = "gemma-4-26B-A4B-it_full-mode_full_model_torch-spyre"
+    tags = [f"op__{op}", "model__gemma-4-26B-A4B-it", "measurement__generate_v2"]
+    cases = [
+        _tc(f"perf_{op}_wall_clock_ms_measurement_generate_v2_{op}", tags, "10"),
+        _tc(f"perf_{op}_spyre_ms_measurement_generate_v2_{op}", tags, "9"),
+        _tc(
+            f"perf_{op}_kernel_ms_measurement_generate_v2_scope_request_{op}",
+            tags + ["kernel_scope__request"],
+            "8",
+        ),
+    ]
+    _, rows = results.parse_benchmark_xml(_write(tmp_path, cases))
+    assert len(rows) == 1
+    assert rows[0]["total_duration_ms"] == pytest.approx(10)
+    assert rows[0]["spyre_ms"] == pytest.approx(9)
+    assert rows[0]["kernel_mean_ms"] == pytest.approx(8)
+    assert rows[0]["measurement"] == "generate_v2"
+    assert results._group_shapes("bs1_pl512") == "bs1_pl512"
+    assert results._group_shapes("measurement_generate_v2_bs1_pl512") == "bs1_pl512"
+    assert results._group_shapes("measurement_generate_v2") == "measurement_generate_v2"
+    assert results._group_shapes("measurement_generate-v1") == "measurement_generate-v1"
+
+
+def test_duplicate_metric_after_scope_collapse_warns(tmp_path, capsys):
+    op = "gemma-4-26B-A4B-it_full-mode_full_model_torch-spyre"
+    tags = [f"op__{op}", "model__gemma-4-26B-A4B-it"]
+    region = f"perf_{op}_kernel_ms_measurement_generate-v1_scope_region_{op}"
+    request = f"perf_{op}_kernel_ms_measurement_generate-v1_scope_request_{op}"
+    cases = [
+        _tc(region, tags + ["kernel_scope__region"], "10"),
+        _tc(request, tags + ["kernel_scope__request"], "20"),
+    ]
+    _, rows = results.parse_benchmark_xml(_write(tmp_path, cases))
+    assert len(rows) == 1
+    assert rows[0]["kernel_mean_ms"] == pytest.approx(10)
+    assert rows[0]["kernel_scope"] == "region"
+    err = capsys.readouterr().err
+    assert "duplicate kernel" in err
+    assert region in err
+    assert request in err
+
+
+def test_two_measurement_values_warn_and_keep_first(tmp_path, capsys):
+    op = "gemma"
+    first = f"perf_{op}_wall_clock_ms_measurement_generate-v1_{op}"
+    second = f"perf_{op}_wall_clock_ms_measurement_generate_v2_{op}"
+    cases = [
+        _tc(first, ["model__gemma", "measurement__generate-v1"], "11"),
+        _tc(second, ["model__gemma", "measurement__generate_v2"], "22"),
+    ]
+    _, rows = results.parse_benchmark_xml(_write(tmp_path, cases))
+    assert len(rows) == 1
+    assert rows[0]["total_duration_ms"] == pytest.approx(11)
+    assert rows[0]["measurement"] == "generate-v1"
+    err = capsys.readouterr().err
+    assert "duplicate wall_clock" in err
+    assert first in err and second in err
+
+
+def test_shape_prefixed_with_scope_stays_its_own_row(tmp_path, capsys):
+    real = "perf_matmul_wall_clock_ms_64x64"
+    prefixed = "perf_matmul_wall_clock_ms_scope_region_64x64"
+    _, rows = results.parse_benchmark_xml(
+        _write(
+            tmp_path,
+            [_tc(real, ["op__matmul"], "9"), _tc(prefixed, ["op__matmul"], "1")],
+        )
+    )
+    assert sorted(r["input_shapes"] for r in rows) == ["64x64", "scope_region_64x64"]
+    assert "duplicate" not in capsys.readouterr().err
+    assert results._group_shapes("scope_region_64x64") == "scope_region_64x64"
+    assert results._group_shapes("measurement_generate-v1_scope_request_op") == "op"
+    assert results._group_shapes("scope_request_measurement_generate_v2_op") == "op"
+
+
+def test_mixed_scope_across_metrics_warns(tmp_path, capsys):
+    op = "gemma"
+    kernel = f"perf_{op}_kernel_ms_measurement_generate-v1_scope_region_{op}"
+    memory = f"perf_{op}_memory_transfer_ms_measurement_generate-v1_scope_request_{op}"
+    cases = [
+        _tc(kernel, ["model__gemma", "kernel_scope__region"], "10"),
+        _tc(memory, ["model__gemma", "kernel_scope__request"], "99"),
+    ]
+    _, rows = results.parse_benchmark_xml(_write(tmp_path, cases))
+    assert len(rows) == 1
+    assert rows[0]["kernel_mean_ms"] == pytest.approx(10)
+    assert rows[0]["memory_transfer_mean_ms"] == pytest.approx(99)
+    err = capsys.readouterr().err
+    assert "kernel_scope" in err and "disagrees" in err
 
 
 def test_benchmark_explicit_model_tags(tmp_path):

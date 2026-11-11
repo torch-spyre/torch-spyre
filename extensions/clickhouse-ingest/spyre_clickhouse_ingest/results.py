@@ -125,13 +125,18 @@ _PERF_NAME_RE = re.compile(
     r"_(?:ms|MB)(?:_(?P<shapes>.+))?$"
 )
 
-# measurement_<token> is on every metric name. scope_region / scope_request is
+# measurement_<value> is on every metric name. scope_region / scope_request is
 # only on kernel and memory. They are series labels, not the shape, so leaving
 # them in the group key splits one file into two rows. Strip a leading token
 # only, at most once each, and only when text remains, so an op shape is left
-# as it was.
+# as it was. <value> is a hyphenated token plus an optional _v<digits>
+# (generate-v1, generate_v2). Stopping at the first underscore would leave
+# v2_<shape> in the key.
 _SERIES_TOKEN_RE = re.compile(
-    r"^(?:measurement_[^_]+|scope_(?:region|request))_(?P<rest>.+)$"
+    # Possessive `_vN`: otherwise the engine gives `_v2` back and the
+    # following `_` splits the value, turning a bare token into `v2`.
+    r"^(?:measurement_[A-Za-z0-9-]+(?:_v\d+)?+"
+    r"|scope_(?:region|request))_(?P<rest>.+)$"
 )
 
 _GRANITE_CONFIG_RE = re.compile(r"bs(?P<batch_size>\d+)(?:_pl(?P<prompt_length>\d+))?")
@@ -139,9 +144,15 @@ _GRANITE_CONFIG_RE = re.compile(r"bs(?P<batch_size>\d+)(?:_pl(?P<prompt_length>\
 
 def _group_shapes(shapes: str) -> str:
     rest = shapes
+    # scope_* is only a series label when measurement_ is on the same name.
+    # A shape that itself starts with scope_region_ must not be rewritten.
+    saw_measurement = "measurement_" in shapes
     for _ in range(2):
         match = _SERIES_TOKEN_RE.match(rest)
         if not match:
+            break
+        peeled = rest[: match.start("rest")]
+        if peeled.startswith("scope_") and not saw_measurement:
             break
         rest = match.group("rest")
     return rest
@@ -273,7 +284,33 @@ def parse_benchmark_xml(
         if metric == "compiler":  # normalise the op-report spelling to Granite's
             metric = "compile"
         shapes = _group_shapes(m.group("shapes") or "")
-        groups[(op, shapes)][metric] = tc
+        bucket = groups[(op, shapes)]
+        new_tags = _tag_props(tc)
+        for key in ("measurement", "kernel_scope"):
+            new = new_tags.get(key) or ""
+            if not new:
+                continue
+            old = ""
+            for prev in bucket.values():
+                old = _tag_props(prev).get(key) or ""
+                if old:
+                    break
+            if old and old != new:
+                print(
+                    f"  [warn] {name!r} {key}={new!r} disagrees with "
+                    f"{old!r} already grouped for op={op!r} "
+                    f"shapes={shapes!r}",
+                    file=sys.stderr,
+                )
+        if metric in bucket:
+            kept = bucket[metric].get("name", "")
+            print(
+                f"  [warn] duplicate {metric} for op={op!r} "
+                f"shapes={shapes!r}: keeping {kept!r}, dropping {name!r}",
+                file=sys.stderr,
+            )
+            continue
+        bucket[metric] = tc
 
     # ── build one row per group ─────────────────────────────────────────────
     benchmarks = []
@@ -574,8 +611,15 @@ _V2_BENCH_PROP_KEYS = (
     "is_total",
     "batch_size",
     "prompt_length",
-    # Props only. Not in _V2_BENCH_ID_KEYS: kernel_scope on the hash would move
-    # wall-clock onto a new benchmark when the kernel headline flips scope.
+)
+# Per-run labels, not identity. benchmarks is insert-if-absent
+# (Table.insert_identities): the first props are kept, so a later kernel_scope
+# never updates the dimension row. benchmark_runs.props is written on every
+# run. Not in _V2_BENCH_ID_KEYS: hashing kernel_scope would move wall-clock
+# onto a new benchmark when the kernel headline flips. The verdict series is
+# still (component, benchmark_id, backend, arch, source_job) and does not read
+# these keys, so region and request kernel numbers share one baseline.
+_V2_BENCH_RUN_PROP_KEYS = (
     "measurement",
     "kernel_scope",
 )
@@ -708,6 +752,11 @@ def _bench_entries(records: list) -> list:
                 "props": {
                     k: str(rec[k])
                     for k in _V2_BENCH_PROP_KEYS
+                    if rec.get(k) is not None and str(rec[k]) != ""
+                },
+                "run_props": {
+                    k: str(rec[k])
+                    for k in _V2_BENCH_RUN_PROP_KEYS
                     if rec.get(k) is not None and str(rec[k]) != ""
                 },
                 "measurements": {
