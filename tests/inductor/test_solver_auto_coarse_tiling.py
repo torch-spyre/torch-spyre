@@ -55,6 +55,7 @@ from torch_spyre._inductor.scratchpad import sa_cooptimizer as sa
 from torch_spyre._inductor.scratchpad.allocator import (
     CoOptimizingAllocator,
     _spec_within_read_distance,
+    commit_divisions as allocator_commit_divisions,
     commit_lx_views,
     select_allocator,
 )
@@ -261,11 +262,14 @@ class CollectTilingPasses(CustomPreSchedulingPasses):
     of them to its committed core division over its output: the split factor
     of each dim, keyed by that dim's stride in the output index.
     ``lx_resident`` names those of them whose buffer was placed in LX.
+    ``read_names`` maps each of them to the buffers it reads, in the order of
+    its ``tiled_dims_per_read`` and ``squeezed_advance_per_read`` entries.
     """
 
     tiling: dict[str, CoarseTileInfo] = {}
     core_splits: dict[str, dict[int, int]] = {}
     lx_resident: set[str] = set()
+    read_names: dict[str, list[str]] = {}
 
     def __call__(self, graph: GraphLowering) -> None:
         super().__call__(graph)
@@ -286,6 +290,14 @@ class CollectTilingPasses(CustomPreSchedulingPasses):
             op.get_name()
             for op in tiled
             if "lx" in getattr(op.get_layout(), "allocation", {})
+        }
+        type(self).read_names = {
+            op.get_name(): [
+                dep.name
+                for dep in op.get_read_writes().reads
+                if isinstance(dep, MemoryDep)
+            ]
+            for op in tiled
         }
 
 
@@ -858,6 +870,36 @@ def _reads_graph_inputs_only(op) -> bool:
     return all(dep.name in graph_inputs for dep in op.get_read_writes().reads)
 
 
+def _hold_division_on_the_tiled_axis(factor: int):
+    """Commit the division that splits each buffer's own tiled axis ``factor``
+    ways, whatever the objective preferred.
+
+    Holds the pattern under test so the body checks the addressing codegen
+    gives it, not which division the cost model happens to rank first: that
+    ranking is the cost model's business and moves with it. A buffer with no
+    such candidate (an untiled op, or a copy the apply synthesised) keeps the
+    solver's own choice.
+
+    The candidate names its own tiled axis in ``tile_splits``, so the wanted
+    division is the one splitting that same symbol -- no symbol-name matching.
+    """
+    target = "torch_spyre._inductor.scratchpad.allocator.commit_divisions"
+    original = allocator_commit_divisions
+
+    def commit(graph, allocation):
+        for buf in allocation:
+            for index, candidate in enumerate(getattr(buf, "core_divisions", ())):
+                if len(candidate.tile_splits) != 1:
+                    continue
+                ((axis, _),) = candidate.tile_splits
+                if candidate.splits == {axis: factor}:
+                    buf.chosen_division = index
+                    break
+        return original(graph, allocation)
+
+    return patch(target, commit)
+
+
 @unittest.skipUnless(_HAS_ORTOOLS, "the cpsat solver needs ortools")
 class TileOwnershipGroupingTests(unittest.TestCase):
     """A consumer shares its producer's loop nest only where it reads it tile by
@@ -1076,23 +1118,31 @@ class TileOwnershipGroupingTests(unittest.TestCase):
         self.assertIsNone(_nest_mismatch(nests[0], (4,)), _describe(tiling))
 
     def test_a_tile_is_divided_across_cores_along_its_tiled_dim(self):
-        # Every op runs one d0:4 nest, 16 rows to a tile. The solve owns each
-        # op's division and ties the divisions of the nest together, so it may
-        # give each core a slice of the tiled dim itself. The balanced division
-        # it prefers does: 4 cores along those 16 rows.
+        # Every op runs one d0:4 nest, 16 rows to a tile, and each core takes a
+        # slice of the tiled dim itself: codegen has to address a tile that is
+        # cut twice, once in time and once across cores.
+        #
+        # The division is held rather than solved for. Which division is
+        # cheapest is the cost model's business and changes with it -- it
+        # currently prices every split of a memory-bound bundle above no split
+        # at all -- so a test of this addressing asserts what codegen does with
+        # the pattern, never that the objective picks it.
         x = torch.randn(64, 64, 128, dtype=torch.float16)
         y = torch.randn(64, 64, 128, dtype=torch.float16)
-        cpu, device, tiling = self._compile(
-            lambda x, y: (x + y) * 2 + 1, (x, y), consumer_menu=[_D0_BY_4]
-        )
+        with _hold_division_on_the_tiled_axis(4):
+            cpu, device, tiling = self._compile(
+                lambda x, y: (x + y) * 2 + 1, (x, y), consumer_menu=[_D0_BY_4]
+            )
         self._assert_close(device, cpu)
         (nest,) = _nests(tiling).values()
         model_ops = self._model_ops(nest)
         self.assertEqual(len(model_ops), 3, _describe(tiling))
         dim_0_stride = 64 * 128
         for name in model_ops:
+            # The held division reached codegen: without this the body would
+            # pass on an undivided plan and test nothing.
             splits = CollectTilingPasses.core_splits[name]
-            self.assertGreater(splits.get(dim_0_stride, 1), 1, f"{name}: {splits}")
+            self.assertEqual(splits.get(dim_0_stride, 1), 4, f"{name}: {splits}")
 
     def test_a_cut_tile_resides_on_the_tiled_graph(self):
         # The producer is tiled and its readers are not, so it is a cut: its
@@ -1179,6 +1229,76 @@ class TileOwnershipGroupingTests(unittest.TestCase):
         # dim 0: without this the body would pass on a read held still.
         outer_levels = [levels[0] for levels in tiling[consumer].tiled_dims_per_read]
         self.assertIn([(0, 16)], outer_levels, _describe(tiling))
+
+    def _assert_redirected_read_steps_one_row(self, tiling):
+        """The 64-trip nest's read from outside it advances one producer row
+        (64 * 128 elements) per trip, and by nothing else."""
+        consumer_nest = {
+            name: info
+            for name, info in tiling.items()
+            if tuple(info.loop_count) == (64,)
+            and not name.startswith("coarse_tile_copy_")
+        }
+        # Only the read that leaves the consumer's nest is redirected.
+        redirected = [
+            (dims, steps)
+            for name, info in consumer_nest.items()
+            for dep_name, dims, steps in zip(
+                CollectTilingPasses.read_names[name],
+                info.tiled_dims_per_read,
+                info.squeezed_advance_per_read,
+            )
+            if dep_name not in consumer_nest
+        ]
+        self.assertEqual(redirected, [([[]], [[(64 * 128, 1)]])], _describe(tiling))
+
+    def test_a_unit_row_consumer_in_the_next_nest_advances_its_read(self):
+        # The producer takes two tiles of 64 rows; the repeat after it takes
+        # one row per tile in a nest of its own, so it is redirected to the
+        # producer's full buffer. Its own tiling divides its row dim down to
+        # one element, which leaves no symbol for that dim in its read, and
+        # every trip read the producer's row 0.
+        x = torch.randn(128, 64, 128, dtype=torch.float16)
+        y = torch.randn(128, 64, 128, dtype=torch.float16)
+        halves = TileSpec((TileAxis(host_dim=0, count=2),))
+        unit_rows = TileSpec((TileAxis(host_dim=0, count=64),))
+
+        def offered(alloc, op, max_cores):
+            return [halves] if _reads_graph_inputs_only(op) else [unit_rows]
+
+        with patch.object(CoOptimizingAllocator, "_tiling_candidates", offered):
+            cpu, device, tiling = self._compile(
+                lambda x, y: (x + y)[:64].repeat(1, 2, 1) * 2, (x, y)
+            )
+        self._assert_close(device, cpu)
+        self.assertEqual(len(_nests(tiling)), 2, _describe(tiling))
+        # The redirected read reached codegen advancing one producer row
+        # (64 * 128 elements) per trip: without this the body would pass on a
+        # read held still.
+        self._assert_redirected_read_steps_one_row(tiling)
+
+    def test_a_unit_row_consumer_of_a_tiled_reduction_advances_its_read(self):
+        # As above, but the producer is a sum tiled along its reduced dim, so
+        # the repeat is redirected to the reduction's accumulator, not to a
+        # copied-out buffer. The redirect once added the unit dim back to the
+        # read's entry, on top of the step planning had recorded for it.
+        x = torch.randn(128, 8, 64, 128, dtype=torch.float16)
+        reduced_halves = TileSpec((TileAxis(host_dim=0, count=2, is_reduction=True),))
+        unit_rows = TileSpec((TileAxis(host_dim=0, count=64),))
+
+        def offered(alloc, op, max_cores):
+            return [reduced_halves] if _reads_graph_inputs_only(op) else [unit_rows]
+
+        with patch.object(CoOptimizingAllocator, "_tiling_candidates", offered):
+            cpu, device, tiling = self._compile(
+                lambda x: x.sum(dim=1)[:64].repeat(1, 2, 1) * 2, (x,)
+            )
+        self._assert_close(device, cpu)
+        self.assertTrue(
+            any(any(info.loop_tiled_reduction_dims) for info in tiling.values()),
+            _describe(tiling),
+        )
+        self._assert_redirected_read_steps_one_row(tiling)
 
     def test_untiled_op_splits_a_skip_connection_into_two_nests(self):
         # a -> b -> c with a -> c as well. a and c may only be tiled d0:4 and
