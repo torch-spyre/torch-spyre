@@ -88,6 +88,7 @@ from torch_spyre._C import (
 
 from .constants import BATCH_MATMUL_FP8_OP, MATMUL_REDUCTION_OPS
 from .errors import Unsupported
+from .loop_node import insert_after
 from .insert_restickify import (
     _create_restickify_node,
     _fixed_tiled,
@@ -1223,7 +1224,9 @@ def _insert_mutation_relayout_copy(
     )
     buf_copyback.layout = MutationLayoutSHOULDREMOVE(target_buf)
     operations.remove(buf_copyback)
-    operations.insert(mutation_op_index + 2, buf_copyback)
+    # Right after the mutation op, in the list that holds it: a flat index past the
+    # last op of a loop body would put the copy outside the loop.
+    insert_after(operations, mutation_op, buf_copyback)
 
     # A loop-carried destination changes on every trip, even though its base
     # address is fixed. Both full-buffer copies must stay inside the scatter's

@@ -1526,6 +1526,50 @@ class TestSpliceWhileLoops(unittest.TestCase):
                 ):
                     lowering.splice_while_loops(graph)
 
+    def test_a_symint_operand_the_body_reads_splices(self):
+        # The SymInt operand drops out of while_op.inputs, so the bridge rebuilds
+        # the operand list. The body names the same symbol as the parent, so
+        # the spliced body stays bound and no WhileLoop is left behind.
+        from torch._inductor import ir
+
+        from torch_spyre._inductor.wsr import for_each_tile_lowering as lowering
+
+        x = torch.randn(128, 64)
+        torch._dynamo.mark_dynamic(x, 0)
+        graph = self._run_graph(_length_scaled_fn, (x,))
+        (loop,) = [op for op in graph.operations if isinstance(op, ir.WhileLoop)]
+        self.assertLess(
+            len(loop.inputs), len(loop.body_subgraph.graph.graph_inputs), loop.inputs
+        )
+
+        with V.set_graph_handler(graph):
+            lowering.splice_while_loops(graph)
+
+        self.assertFalse(any(isinstance(op, ir.WhileLoop) for op in graph.operations))
+
+    @expects_raise
+    def test_a_symint_operand_the_body_names_differently_is_refused(self):
+        # If the body's placeholder were a symbol other than the operand's own,
+        # the spliced reads would name a symbol the parent never binds. Refuse
+        # that at the splice instead of failing later on a missing symbol.
+        import sympy
+        from torch._inductor import ir
+
+        from torch_spyre._inductor.errors import Unsupported
+        from torch_spyre._inductor.wsr import for_each_tile_lowering as lowering
+
+        x = torch.randn(128, 64)
+        torch._dynamo.mark_dynamic(x, 0)
+        graph = self._run_graph(_length_scaled_fn, (x,))
+        (loop,) = [op for op in graph.operations if isinstance(op, ir.WhileLoop)]
+        body_inputs = loop.body_subgraph.graph.graph_inputs
+        (name,) = [k for k, v in body_inputs.items() if isinstance(v, sympy.Expr)]
+        body_inputs[name] = sympy.Symbol("s_unbound", integer=True, positive=True)
+
+        with V.set_graph_handler(graph):
+            with self.assertRaisesRegex(Unsupported, "does not bind"):
+                lowering.splice_while_loops(graph)
+
     def test_every_nested_level_is_checked(self):
         # Break only the INNER loop's step: the outer loop splices fine, then the
         # inner loop is found and must still be refused.
@@ -3007,7 +3051,9 @@ class TestTryProveForEachTile(unittest.TestCase):
                 enable_spyre_lowerings(),
             ):
                 graph.run(counter)
-                self.assertEqual(_extract_trip_count(graph), 16)
+                result = _extract_trip_count(graph)
+                self.assertTrue(result.accepted, result.reason)
+                self.assertEqual(result.trip_count, 16)
                 self.assertEqual(len(graph.operations), 1)
                 self.assertIsInstance(graph.operations[0], ir.ComputedBuffer)
 
@@ -3044,7 +3090,8 @@ class TestTryProveForEachTile(unittest.TestCase):
         # insert a to_dtype cast for 0-dim integer predicates compared against
         # an int.  If it does, the cond graph grows a second op (n_ops == 2)
         # and the bound becomes float(N) instead of int(N), both of which make
-        # _extract_trip_count return None, causing silently wrong loop counts.
+        # _extract_trip_count decline, and splice_while_loops then refuses the
+        # loop.
         while_op = _find_while_loop_ir_op_with_spyre_cmp_lowerings(
             split_m_fn, matmul_inputs()[0]
         )
@@ -3274,11 +3321,41 @@ class TestTryProveForEachTile(unittest.TestCase):
                     self.assertTrue(result.accepted, result.reason)
                     self.assertIsInstance(loop, ir.WhileLoop)
 
+    def test_a_symint_operand_leaves_the_counter_first(self):
+        # A symbolic trip count brings a SymInt into the loop's operands. The
+        # counter must still be carried_inputs[0], since every proof above reads
+        # it by position.
+        x = torch.randn(128, 64)
+        torch._dynamo.mark_dynamic(x, 0)
+
+        (loop,) = self._all_while_loops(_length_scaled_fn, (x,))
+        result = try_prove_for_each_tile(loop)
+
+        self.assertTrue(result.accepted, result.reason)
+        self.assertTrue(result.trip_count.free_symbols, result.trip_count)
+
     def _all_while_loops(self, fn, args):
         from torch._inductor import ir
 
         graph = TestSpliceWhileLoops()._run_graph(fn, args)
         return [op for op in graph.operations if isinstance(op, ir.WhileLoop)]
+
+
+def _length_scaled_fn(x: torch.Tensor) -> torch.Tensor:
+    """A symbolic-length loop whose body reads the length, a SymInt operand."""
+    from torch_spyre._inductor.wsr import for_each_tile
+
+    rows = x.shape[0]
+    torch._check(rows >= 64)
+    torch._check(rows <= 512)
+    torch._check(rows % 32 == 0)
+
+    def body(_, ops):
+        (tile,) = ops
+        return None, tile * rows
+
+    _, out = for_each_tile(body, (x,), dims=(0,), tile_size=32, out_dim=0)
+    return out
 
 
 class TestPassPipelineRegistration(unittest.TestCase):
@@ -5813,6 +5890,45 @@ class TestHoistedInputCloneOnRealGraph(unittest.TestCase):
             if any(dep.name == clone_name for dep in n.unmet_dependencies)
         ]
         self.assertTrue(readers)
+
+
+class TestRepointRefsToBuffer(unittest.TestCase):
+    """An outside consumer of a spliced loop output is repointed at the carry."""
+
+    def test_in_place_collective_mutation_follows_its_operand(self):
+        """create_inplace records the mutation on MutationOutputs and
+        alias_names, which an .inputs rewrite alone never reaches: left alone
+        they name the removed loop output and the scheduler fails on it."""
+        import types
+
+        from torch._inductor import ir
+
+        from torch_spyre._inductor.ir import AllReduceKernel
+        from torch_spyre._inductor.wsr.while_loop_bridge import (
+            _repoint_refs_to_buffer,
+        )
+
+        def buffer(name):
+            buf = mock.MagicMock(spec=ir.ComputedBuffer)
+            buf.get_name.return_value = name
+            return buf
+
+        all_reduce = AllReduceKernel.__new__(AllReduceKernel)
+        all_reduce.inputs = [ir.TensorBox(ir.StorageBox(buffer("loop_out")))]
+        all_reduce.mutation_outputs = [
+            types.SimpleNamespace(mutation_names=["loop_out"])
+        ]
+        all_reduce.alias_names = ["loop_out"]
+        graph = types.SimpleNamespace(
+            graph_outputs=[], operations=[all_reduce], mutated_buffers=set()
+        )
+
+        _repoint_refs_to_buffer(graph, "loop_out", buffer("carry"))
+
+        self.assertEqual(all_reduce.inputs[0].get_name(), "carry")
+        self.assertEqual(all_reduce.mutation_outputs[0].mutation_names, ["carry"])
+        self.assertEqual(all_reduce.alias_names, ["carry"])
+        self.assertIn("carry", graph.mutated_buffers)
 
 
 class TestRecoverSpyreHints(unittest.TestCase):

@@ -54,13 +54,15 @@ from .constants import (
 )
 from .errors import Unsupported
 from .ir import (
-    AllGatherAsyncFallback,
-    AllReduceAsyncFallback,
-    BroadcastAsyncFallback,
+    AllGatherKernel,
+    AllReduceKernel,
+    BroadcastKernel,
     SpyreConstantFallback,
     SpyreEmptyFallback,
     SpyreReduction,
-    WaitWorkFallback,
+    WaitKernel,
+    copy_back_view,
+    get_copy_back_producer,
 )
 from .logging_utils import get_inductor_logger
 
@@ -221,29 +223,12 @@ def enable_spyre_lowerings():
             saved = {}
 
             # Capture stock Inductor lowerings before overwriting them, so the
-            # adapters below can fall back to them for host-side (CPU) tensors.
-            # (Same pattern as _register_cmp_lowerings captures stock_tensor /
-            # stock_scalar before enable_spyre_lowerings() installs its overlay.)
+            # last exit can restore them.
             all_clamp_ovs = [
                 ov for ov in [clamp_min_ov, clamp_max_ov] if ov is not None
             ]
             for ov in all_clamp_ovs:
                 saved[ov] = lowering.lowerings.get(ov)
-
-            def _make_clamp_adapter(stock_key, spyre_fn):
-                """Route to stock Inductor for CPU tensors, Spyre lowering otherwise."""
-
-                def _adapter(*args, **kwargs):
-                    # ATen uses "self" as the first positional argument name.
-                    x = args[0] if args else kwargs.get("self")
-                    if x is not None and hasattr(x, "get_device"):
-                        if x.get_device().type != DEVICE_NAME:
-                            stock = saved.get(stock_key)
-                            if stock is not None:
-                                return stock(*args, **kwargs)
-                    return spyre_fn(*args, **kwargs)
-
-                return _adapter
 
             def _spyre_clamp_min(x, min):
                 return lower_clamp(x, min=min, max=None)
@@ -252,13 +237,9 @@ def enable_spyre_lowerings():
                 return lower_clamp(x, min=None, max=max)
 
             if clamp_min_ov is not None:
-                lowering.lowerings[clamp_min_ov] = _make_clamp_adapter(
-                    clamp_min_ov, _spyre_clamp_min
-                )
+                lowering.lowerings[clamp_min_ov] = _spyre_clamp_min
             if clamp_max_ov is not None:
-                lowering.lowerings[clamp_max_ov] = _make_clamp_adapter(
-                    clamp_max_ov, _spyre_clamp_max
-                )
+                lowering.lowerings[clamp_max_ov] = _spyre_clamp_max
 
             # Attach to the function so we can restore on last exit
             enable_spyre_lowerings._saved_aten_lowerings = saved
@@ -2452,6 +2433,24 @@ def lower_where(condition, self, other):
     )
 
     converted_condition = condition if skip_cast else to_dtype(condition, val_dtype)
+    if (
+        not skip_cast
+        and condition.get_dtype() != val_dtype
+        and result_dtype != torch.bool
+    ):
+        # The cast is realized under this where, so its only origin is
+        # aten.where.self. Layout propagation finds a dtype conversion, and the
+        # element arrangement it creates (e.g. dl16tofp32 -> DL16_TO_FP32), by the
+        # convert_element_type origin; without one the cast is recorded as
+        # STANDARD and a staggered mask is read as standard by where3.
+        origin = (
+            condition.get_origin_node() if isinstance(condition, ir.IRNode) else None
+        )
+        _ensure_synthetic_origin(
+            converted_condition,
+            torch.ops.prims.convert_element_type.default,
+            () if origin is None else (origin,),
+        )
     if not skip_cast:
         # Spliced loop bodies no longer have FX bindings for splitting this cast.
         converted_condition.realize()
@@ -2903,12 +2902,14 @@ def _lower_cmp_impl(x, y, pointwise_fn):
 def _is_host_cmp(x, y):
     """True when no tensor operand of a comparison lives on the Spyre device.
 
-    enable_spyre_lowerings() overlays these lowerings on every node of the
-    graph, including host-side compares such as ``torch.arange(n) < k`` that a
-    model computes on CPU before moving the mask to the device. The int ->
-    float promotion exists only because Spyre has no integer compare; applied
-    to a CPU tensor it routes the cast through ``spyre::to_dtype_cpu``, which
-    has no CPU kernel.
+    enable_spyre_lowerings() overlays these lowerings on every node of a Spyre
+    graph, including the host-side compare in the condition of each while loop
+    that ``scan`` and ``for_each_tile`` lower to: Inductor's
+    ``decompose_scan_to_while_loop`` keeps that loop's counter as a host int64
+    scalar and tests ``counter < N``. The int -> float promotion exists only
+    because Spyre has no integer compare. Applied to that host compare it would
+    add a conversion the trip-count prover (``_extract_trip_count``) does not
+    accept, so the stock lowering keeps it a single ``lt``.
     """
     devices = [v.get_device() for v in (x, y) if hasattr(v, "get_device")]
     return not any(d is not None and d.type == DEVICE_NAME for d in devices)
@@ -3156,6 +3157,12 @@ def lower_any_def(x):
 # ============================================================================
 # Direct c10d Lowerings
 # ============================================================================
+# These mirror torch/_inductor/comm_lowering.py: nodes are built with the
+# upstream _CollectiveKernel factories (create_inplace / create_out_of_place /
+# create_wait), and only codegen is Spyre-specific (see SpyreCollectiveKernel).
+_c10d = torch.ops._c10d_functional
+
+
 def _realize_collective_input(tensor):
     # Views can retain their base allocation's padded descriptor. A copy
     # obtains a finalized device layout for exactly the contributed elements.
@@ -3165,147 +3172,108 @@ def _realize_collective_input(tensor):
     return tensor
 
 
-@register_spyre_lowering(torch.ops._c10d_functional.broadcast.default)
-def lower_c10d_broadcast_async(tensor, src_rank, group_name):
-    """
-    Direct lowering for _c10d_functional.broadcast using ASYNC pattern.
-
-    Creates an async broadcast operation that returns immediately without blocking.
-    This provides the infrastructure for potential communication-compute overlap,
-    though actual overlap depends on scheduler decisions.
-
-    Flow:
-      _c10d_functional.broadcast → This lowering → BroadcastAsyncFallback
-      → Generated code: torch.ops.spyre.broadcast_async() → C++ → spyre-comms (non-blocking)
-    """
+@register_spyre_lowering(_c10d.broadcast.default)
+def lower_c10d_broadcast(tensor, src_rank, group_name):
+    """Out-of-place broadcast: broadcast_run writes a fresh output tensor."""
     logger.debug(
-        "Lowering _c10d_functional.broadcast to BroadcastAsyncFallback "
-        "(src_rank=%s, group_name='%s')",
+        "Lowering _c10d_functional.broadcast (src_rank=%s, group_name='%s')",
         src_rank,
         group_name,
     )
-
     tensor = _realize_collective_input(tensor)
     return ir.TensorBox.create(
-        BroadcastAsyncFallback(
-            torch.ops.spyre.broadcast_async.default,
-            tensor,
-            src_rank,
-            group_name,
+        BroadcastKernel.create_out_of_place(
+            _c10d.broadcast.default, tensor, src_rank, group_name
         )
     )
 
 
-@register_spyre_lowering(torch.ops._c10d_functional.wait_tensor.default)
-def lower_c10d_wait_tensor_async(tensor):
+@register_spyre_lowering(_c10d.wait_tensor.default)
+def lower_c10d_wait_tensor(tensor):
+    """Block until the collective producing *tensor* completes.
+
+    The wait mutates *tensor*, so returning it orders every later reader after
+    the wait.  When the collective operated on a materialized view (copy-back
+    case), the result is written back to the original mutation target.
     """
-    Direct lowering for _c10d_functional.wait_tensor using ASYNC pattern.
-
-    Synchronizes on the async collective operation, blocking until communication completes.
-
-    Flow:
-      _c10d_functional.wait_tensor → This lowering → WaitWorkFallback
-      → Generated code: torch.ops.spyre.wait_work() → C++ → work->wait()
-    """
-    logger.debug("Lowering _c10d_functional.wait_tensor to WaitWorkFallback")
-
+    logger.debug("Lowering _c10d_functional.wait_tensor")
     tensor.realize()
-    producer = WaitWorkFallback.get_copy_back_producer(tensor)
+    producer = get_copy_back_producer(tensor)
     if producer is not None and producer.copy_back_result is not None:
-        # The first wait already copied back. Preserve aliases of the current
-        # target, including mutations performed since that wait.
-        return WaitWorkFallback.copy_back_view(
-            tensor, producer, producer.copy_back_result
-        )
-    wait = WaitWorkFallback(torch.ops.spyre.wait_work.default, tensor)
-    result = ir.TensorBox.create(wait)
-    if wait.copy_back_producer is not None:
-        producer = wait.copy_back_producer
+        return copy_back_view(tensor, producer, producer.copy_back_result)
+    if producer is None:
+        WaitKernel.create_wait(_c10d.wait_tensor.default, tensor)
+    else:
+        # Even a wait on a slice must complete and copy back the entire
+        # in-place contribution, so wait on the full temporary buffer.
+        result = ir.TensorBox(ir.StorageBox(producer))
+        WaitKernel.create_wait(_c10d.wait_tensor.default, result)
         target = lowering.mutate_to(producer.mutation_target, result)
         producer.copy_back_result = target
-        return wait.copy_back_view(wait.waited_tensor, producer, target)
-    return result
+        return copy_back_view(tensor, producer, target)
+    return tensor
 
 
-@register_spyre_lowering(torch.ops._c10d_functional.all_gather_into_tensor.default)
-def lower_c10d_all_gather_async(tensor, group_size, group_name):
-    """
-    Direct lowering for _c10d_functional.all_gather_into_tensor using ASYNC pattern.
+def _all_gather(tensor, group_size, group_name):
+    tensor = _realize_collective_input(tensor)
+    return ir.TensorBox.create(
+        AllGatherKernel.create_out_of_place(
+            _c10d.all_gather_into_tensor.default, tensor, group_size, group_name
+        )
+    )
 
-    Creates an async all_gather operation that returns immediately without blocking.
-    Output tensor has shape[0] = input.shape[0] * group_size (concatenation of all ranks).
 
-    Flow:
-      _c10d_functional.all_gather_into_tensor → This lowering
-      → AllGatherAsyncFallback → Generated code:
-      torch.ops.spyre.all_gather_async() → C++ → spyre-comms (non-blocking)
-    """
-    logger.info(
-        "Lowering _c10d_functional.all_gather_into_tensor to "
-        "SpyreAllGatherAsyncFallback (group_size=%s, group_name='%s')",
+@register_spyre_lowering(_c10d.all_gather_into_tensor.default)
+def lower_c10d_all_gather(tensor, group_size, group_name):
+    """Out-of-place all_gather: output shape[0] = input.shape[0] * group_size."""
+    logger.debug(
+        "Lowering _c10d_functional.all_gather_into_tensor "
+        "(group_size=%s, group_name='%s')",
         group_size,
         group_name,
     )
-
-    tensor = _realize_collective_input(tensor)
-    return ir.TensorBox.create(
-        AllGatherAsyncFallback(
-            torch.ops.spyre.all_gather_async.default,
-            tensor,
-            group_size,
-            group_name,
-        )
-    )
+    return _all_gather(tensor, group_size, group_name)
 
 
-@register_spyre_lowering(torch.ops._c10d_functional.all_reduce.default)
-def lower_c10d_all_reduce_async(tensor, reduce_op, group_name):
-    """
-    Direct lowering for _c10d_functional.all_reduce using ASYNC pattern.
-
-    Creates an async all_reduce operation that returns immediately without blocking.
-    Output tensor has shape[0] = input.shape[0].
-    """
-    tensor = _realize_collective_input(tensor)
-    logger.debug(
-        "Lowering _c10d_functional.all_reduce to AllReduceAsyncFallback "
-        "(reduce_op=%s, group_name='%s')",
-        reduce_op,
-        group_name,
-    )
-    return ir.TensorBox.create(
-        AllReduceAsyncFallback(
-            torch.ops.spyre.all_reduce_async.default,
-            tensor,
-            reduce_op,
-            group_name,
-        )
-    )
-
-
-@register_spyre_lowering(torch.ops._c10d_functional.all_reduce_.default)
-def lower_c10d_all_reduce_inplace(tensor, reduce_op, group_name):
-    """
-    Lowering for _c10d_functional.all_reduce_ (in-place variant).
-
-    Inductor's reinplace pass converts the functional all_reduce to the in-place
-    all_reduce_ when the output shape matches the input. This lowering catches
-    that case and emits the same Spyre all_reduce op (always in-place on device).
-    """
+def _all_reduce_inplace(tensor, reduce_op, group_name):
     mutation_target = tensor if isinstance(tensor.data, ir.BaseView) else None
     tensor = _realize_collective_input(tensor)
+    AllReduceKernel.create_inplace(
+        _c10d.all_reduce_.default, tensor, reduce_op, group_name
+    )
+    if mutation_target is not None:
+        # Tag the temporary buffer the kernel mutates; the wait lowering finds
+        # it through the waited tensor's alias chain and copies it back.
+        buf = tensor.data
+        while isinstance(buf, (ir.MutableBox, ir.BaseView)):
+            buf = buf.data
+        buf.mutation_target = mutation_target
+        buf.copy_back_result = None
+    return tensor
+
+
+@register_spyre_lowering(_c10d.all_reduce.default)
+def lower_c10d_all_reduce(tensor, reduce_op, group_name):
+    """Functional all_reduce, lowered as all_reduce_ on a clone of the input.
+
+    Inductor's reinplace pass already rewrites all_reduce to all_reduce_ when
+    the input is not needed afterwards, so reaching this lowering means the
+    input must be preserved.
+    """
     logger.debug(
-        "Lowering _c10d_functional.all_reduce_ to AllReduceAsyncFallback "
-        "(reduce_op=%s, group_name='%s')",
+        "Lowering _c10d_functional.all_reduce (reduce_op=%s, group_name='%s')",
         reduce_op,
         group_name,
     )
-    return ir.TensorBox.create(
-        AllReduceAsyncFallback(
-            torch.ops._c10d_functional.all_reduce_.default,
-            tensor,
-            reduce_op,
-            group_name,
-            mutation_target=mutation_target,
-        )
+    return _all_reduce_inplace(clone(tensor), reduce_op, group_name)
+
+
+@register_spyre_lowering(_c10d.all_reduce_.default)
+def lower_c10d_all_reduce_inplace(tensor, reduce_op, group_name):
+    """In-place all_reduce_ (produced by the reinplace pass)."""
+    logger.debug(
+        "Lowering _c10d_functional.all_reduce_ (reduce_op=%s, group_name='%s')",
+        reduce_op,
+        group_name,
     )
+    return _all_reduce_inplace(tensor, reduce_op, group_name)

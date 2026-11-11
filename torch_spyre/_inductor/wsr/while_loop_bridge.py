@@ -1290,13 +1290,30 @@ def _repoint_refs_to_buffer(
         else:
             outputs[i] = new_tb
 
-    name_map = {old_name: new_buf.get_name()}
+    new_name = new_buf.get_name()
+    name_map = {old_name: new_name}
     for i, op in enumerate(graph.operations):
         inputs = getattr(op, "inputs", None)
         if inputs:
             for j, inp in enumerate(inputs):
                 if getattr(inp, "get_name", lambda: None)() == old_name:
                     inputs[j] = new_tb
+        # An in-place collective or wait (create_inplace / create_wait) also
+        # names its operand on its MutationOutput buffers and alias_names,
+        # which no .inputs rewrite reaches; left alone they name a buffer the
+        # splice removes.
+        mutated = False
+        for mutation in getattr(op, "mutation_outputs", None) or ():
+            if old_name in mutation.mutation_names:
+                mutation.mutation_names = [
+                    new_name if n == old_name else n for n in mutation.mutation_names
+                ]
+                mutated = True
+        alias_names = getattr(op, "alias_names", None)
+        if alias_names and old_name in alias_names:
+            op.alias_names = [new_name if n == old_name else n for n in alias_names]
+        if mutated:
+            graph.mutated_buffers.add(new_name)
         if redirect_readers and isinstance(op, ir.ComputedBuffer):
             reads = {dep.name for dep in op.get_read_writes().reads}
             if old_name in reads:
@@ -1385,6 +1402,14 @@ def splice_while_loop(
     DynamicScalar's direct input) -- so both maps are populated for every
     carry regardless of shape, rather than assuming shape predicts read
     kind.
+
+    Operand order: the body's placeholders are ``[*carried, *additional]``,
+    the order _trace_while_loop traced the body in, and the counter is
+    ``carried[0]``. ``while_op.inputs`` is that list with SymInt operands
+    removed, so when it is shorter than the placeholders the operands are
+    rebuilt from ``carried_inputs`` and ``additional_inputs``. A SymInt operand
+    gets no read redirection, since it has no buffer. It is accepted only when
+    the body's placeholder is the operand's own symbol, and refused otherwise.
 
     Returns the spliced body ops (graph.operations, still in topological
     order) so the caller can build a coarse-tile (ops, levels) group from
@@ -1512,10 +1537,68 @@ def splice_while_loop(
         name_map[placeholder_name] = read_target.get_name()
         ref_map[placeholder_name] = read_target
 
+    # ``.inputs`` stays the default: it is what the rest of this pass patches.
+    # It is not always positionally aligned with the body's placeholders, though,
+    # because ``ExternKernel.__init__`` repacks ``[*carried, *additional]``
+    # through ``_split_by_sym_type`` into a tensor-only ``.inputs``, so a SymInt
+    # operand -- how a varying dimension arrives -- drops out of it while the
+    # body graph still lists its placeholder.
+    #
+    # Fall back only when the lengths say an operand went missing:
+    # ``.carried_inputs``/``.additional_inputs`` hold different objects, so
+    # swapping unconditionally changes which buffer a concrete operand resolves
+    # to. _trace_while_loop traced the body as fn(*carried, *additional), so that
+    # concatenation is the placeholder order.
+    operands = while_op.inputs
+    if len(operands) < len(body_graph_input_names):
+        operands = [
+            *(while_op.carried_inputs or ()),
+            *(while_op.additional_inputs or ()),
+        ]
+        if len(operands) < len(body_graph_input_names):
+            raise AssertionError(
+                f"while_loop body has {len(body_graph_input_names)} placeholders "
+                f"but only {len(operands)} operands "
+                f"(inputs={len(while_op.inputs)}, "
+                f"carried={len(while_op.carried_inputs or ())}, "
+                f"additional={len(while_op.additional_inputs or ())}). The body "
+                f"graph and the operand list disagree, which this pass cannot "
+                f"reconcile."
+            )
+
     for i in range(len(carries), len(body_graph_input_names)):
         placeholder_name = body_graph_input_names[i]
-        real_input = while_op.inputs[i]
-        real_name = real_input.get_name()
+        real_input = operands[i]
+
+        # A SymInt operand is a shape expression, not a buffer, so there is
+        # nothing for the read redirection to point at.
+        #
+        # Keyed on get_name() raising, because that is exactly the condition:
+        # ShapeAsConstantBuffer subclasses IRNode rather than Buffer and inherits
+        # a raising get_name(). Not hasattr, which is True for an attribute that
+        # raises only when called, and not _storage_name, which insists on
+        # reaching an ir.Buffer and so skips operands this pass needs.
+        #
+        # Skipping it is only safe because the body names the same symbol the
+        # parent binds: its placeholder resolves to the operand's own
+        # expression, so the spliced reads stay bound. If they differ, the body
+        # reads a symbol nothing in the parent defines, which surfaces much
+        # later as a KeyError or a silently wrong size. Refuse it here instead.
+        try:
+            real_name = real_input.get_name()
+        except NotImplementedError:
+            body_expr = while_op.body_subgraph.graph.graph_inputs.get(placeholder_name)
+            operand_expr = getattr(real_input, "expr", None)
+            if operand_expr is None or body_expr != operand_expr:
+                raise Unsupported(
+                    f"while_loop body placeholder {placeholder_name} is the SymInt "
+                    f"{body_expr}, but the operand at its position is "
+                    f"{operand_expr if operand_expr is not None else real_input!r}. "
+                    "The spliced body would read a symbol the enclosing graph "
+                    "does not bind."
+                ) from None
+            continue
+
         name_map[placeholder_name] = real_name
         ref_map[placeholder_name] = real_input
 

@@ -44,6 +44,7 @@ from torch._inductor.ir import ComputedBuffer, Operation, Reduction
 from ..errors import Unsupported
 from ..ir import FixedTiledLayout
 from ..logging_utils import get_inductor_logger
+from ..loop_facts import counted_loop_path
 from ..pass_utils import (
     _prepare_per_core_view,
     iteration_space_from_op,
@@ -58,11 +59,18 @@ from ..wsr.coarse_tile import (
     _loop_var_to_reduction_ranges_pos,
     coarse_tile_post_stickify,
     reduction_loop_vars,
+    reject_nested_loops,
     validate_coarse_tile_groups,
 )
 from ..wsr.span_overflow_hint_analysis import _layout_has_static_span_metadata
 from .plan_solver import CoreDivisionBuffer, TileSpec
 from .utils import buffer_not_read_in_full
+
+# The deepest nest the allocator's search may propose. The lowering builds one
+# standalone loop per group and refuses a group with more levels
+# (``reject_nested_loops``, #6088); under the SA co-optimizer a refusal is a
+# compile failure, so the search must not offer what the lowering will refuse.
+MAX_SEARCH_TILE_DEPTH = 1
 
 logger = get_inductor_logger("scratchpad.coarse_tiling")
 
@@ -442,7 +450,7 @@ def prescribed_regions(operations: Sequence[Operation]) -> list[PrescribedRegion
     for pos, op in enumerate(operations):
         if not _is_spliced(op):
             continue
-        outer = op.loop_info.loop_group_id[0]  # type: ignore[attr-defined]
+        outer = counted_loop_path(op, include_extern=True)[0]
         span = spans.setdefault(outer, [pos, pos])
         span[1] = pos
     regions: list[PrescribedRegion] = []
@@ -678,9 +686,9 @@ def _derive_group_idx_offset(graph: GraphLowering) -> int:
     ``_maybe_coarse_tile_span_overflow`` uses to avoid a ``loop_group_id``
     collision with a for_each_tile group stamped pre-stickification."""
     used = [
-        op.loop_info.loop_group_id[0]
+        path[0]
         for op in graph.operations
-        if getattr(op, "loop_info", None) is not None
+        if (path := counted_loop_path(op, include_extern=True))
     ]
     return max(used, default=-1) + 1
 
@@ -766,6 +774,7 @@ def apply_tilings(choices: Mapping[str, TileSpec], graph: GraphLowering) -> None
             )
         groups.append((group_ops, levels))
     validate_coarse_tile_groups(groups)
+    reject_nested_loops(groups, "allocator coarse tiling")
     # This pass runs inside scratchpad/LX planning -- after stickification
     # (insert_restickify) and the post-stickify span-overflow WSR pass -- so
     # every op already carries a committed FixedTiledLayout. Use the
