@@ -465,6 +465,12 @@ It does not leave the HUD projection (`schema/70`). Its rows stay in `oss_ci_ben
 branch and commit stay in the metadata dropdowns too. The HUD reads these tables with PREWHERE, which
 a view cannot serve, so they cannot be filtered by a view. The follow-up is torch-spyre#5446.
 
+## Replicated clusters
+
+`apply_schema --cluster <name>` (or `CLICKHOUSE_CLUSTER`, `CLICKHOUSE_KEEPER_PATH`) applies the
+schema `ON CLUSTER` onto Replicated tables; see
+[`schema/README.md`](schema/README.md#applying-on-a-replicated-cluster).
+
 ## What is deliberately NOT here
 
 - **v1 write paths whose TARGET TABLE differs per repo.** `hf_test_runs` vs `test_runs` cannot share

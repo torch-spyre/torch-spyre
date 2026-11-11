@@ -125,6 +125,105 @@ Mechanical constraints behind those rules:
 - The server rejects `CREATE OR REPLACE VIEW` (`renameat2() is not supported`), and dropping a
   base table silently drops its views.
 
+## Applying on a Replicated cluster
+
+Off by default: with no cluster set the applier sends exactly the SQL it always did. Set
+`--cluster <name>` or `CLICKHOUSE_CLUSTER=<name>` (a plain identifier) and it instead:
+
+- adds `ON CLUSTER <name>` to every `CREATE`, to migration DDL (`ALTER`, `DROP`, `TRUNCATE`,
+  `RENAME`, `EXCHANGE TABLES`) and to migration `DELETE`;
+- creates tables on the matching `Replicated*MergeTree` engine (`MergeTree`, `ReplacingMergeTree`,
+  `SummingMergeTree`, `AggregatingMergeTree`; any other engine raises), including the
+  `schema_migrations` ledger and tables a migration creates;
+- keeps the table in Keeper at `/clickhouse/<cluster>/tables/{shard}/<db>/<table>`, or at
+  `CLICKHOUSE_KEEPER_PATH` if set: a template with `{table}` (or `{uuid}`), and optionally `{db}`
+  and `{shard}`; a template without `{table}`/`{uuid}` raises, since all tables would share a path;
+- treats a Replicated table as equal to its plain file, so a converted table is never drift.
+
+Data statements in a migration (`INSERT`) run once on the connected server and reach the others by
+replication; before a later statement reads a table the migration inserted into, the applier runs
+`SYSTEM SYNC REPLICA ON CLUSTER` on it. The ledger is synced on the connected replica before it is
+read.
+
+A refreshable MV appends on a schedule, so it exists on **one** replica only, never `ON CLUSTER`.
+Before creating one, the applier reads `system.tables` on every replica through
+`clusterAllReplicas` and skips creating it if any replica already has it, so it does not matter
+which replica a later run connects to. That read needs `SELECT` on `system.tables` on every replica
+as the cluster's inter-server user; if any replica cannot show `schema_migrations` the run stops
+before creating anything, because a replica that cannot see tables would hide its MV. Rerun after
+fixing the grant. A migration that creates a refreshable MV also creates it on the connected server
+only.
+
+Refused with an error, not run on one server: `CREATE OR REPLACE`, `CREATE DICTIONARY`,
+`CREATE TABLE ... AS SELECT` or `AS <table>`, an MV with its own `ENGINE` (use `TO <table>`),
+`DROP TABLE a, b`, `RENAME`/`EXCHANGE` with `SETTINGS`, `OPTIMIZE`, `ATTACH`/`DETACH`/`UNDROP`,
+`SYSTEM`, `GRANT`/`REVOKE`, and an explicit `ON CLUSTER` on a non-Replicated table. Errors in new
+tables or pending migrations surface from `--check` and before the first `CREATE` of an apply.
+
+Prerequisite: every table, and the ledger, must already be Replicated. `SYSTEM SYNC REPLICA`
+refuses a plain table, and `CREATE ... IF NOT EXISTS ON CLUSTER` does not convert an existing one.
+Convert the existing tables to Replicated engines first, for example with a table-conversion tool
+for your deployment. The applier checks the ledger, and every existing table a pending migration
+inserts into, on the connected server before any write, and raises naming the ones that are not
+Replicated. It sees only what the login's `system.tables` shows: a pending migration that inserts
+into a table the login cannot see, or into another database, is refused rather than skipped.
+`--check` also runs `SYSTEM SYNC REPLICA` on the ledger, so a read-only login needs that grant too.
+
+Rows a migration inserted are synced before any later statement, in the same or a later migration,
+reads that table by name. Known view gap: a view over a table is not seen, so a migration that
+inserts into a table and then reads it only through a view is not synced in between, and rows still
+unsynced when the last migration finishes (for example `010` into `run_case_counters`, `019` into
+`artifact_subscription_versions`) reach the other replicas by ordinary replication, so a view read
+on another replica right after an apply can lag.
+
+If a migration still fails part-way (a sync times out, a replica goes down), the DDL it started may
+keep running on the other replicas, and its ledger row is not written. Migrations marked
+`-- RERUNNABLE` (`grep -l RERUNNABLE schema/migrations/*.sql`: today `007`, `009`, `010`, `012` and
+`023`) can be run again with `--cluster <c> --rerun <migration.sql>`, which first re-checks that the
+tables it inserts into are Replicated. Any other migration must not be rerun, in particular the
+unmarked ones that insert rows (`002`, `003`, `006`, `013`, `019`): look at what ran
+(`system.query_log`), run its remaining statements by hand on the connected replica, and record it.
+To print the statements exactly as the applier would send them, including the
+`SYSTEM SYNC REPLICA` steps and with `ON CLUSTER` and `SYNC` in place, run this and take the ones
+after the last statement that already ran. Statements under `-- IF TABLE EXISTS: <t>` are printed
+with a note and must be skipped when `<t>` does not exist. Syncs for tables written by an earlier
+migration depend on that migration, so list every earlier migration that was still pending in
+`earlier` (in order), or the sync before the first read of such a table is missing:
+
+```bash
+python - <<'EOF'
+from spyre_clickhouse_ingest.apply_schema import SchemaApplier as S
+earlier = []  # paths of the earlier pending migrations, in order
+text = open("<path>").read()
+guard = lambda t: print(f"-- only if {t} exists") or True
+pending = {}
+for p in earlier:
+    for _ in S.migration_commands(open(p).read(), "<cluster>", "<db>", pending, lambda t: True):
+        pass
+for cmd, _ in S.migration_commands(text, "<cluster>", "<db>", pending, guard):
+    print(cmd + ";")
+EOF
+```
+
+The migration's ledger row uses the checksum from this one-liner (`<path>` is the file's path):
+
+```bash
+python -c "from spyre_clickhouse_ingest.apply_schema import SchemaApplier as S; print(S.checksum(open('<path>').read()))"
+```
+
+```sql
+INSERT INTO schema_migrations (migration_id, checksum) VALUES ('<migration-stem>.sql', '<checksum>')
+```
+
+`<migration-stem>` is the file name without `.sql` (for example `006_case_id_without_run_context`);
+`--rerun` takes the full name `<migration.sql>`. Syncs wait up to an hour
+(`distributed_ddl_task_timeout`).
+
+What it does not do: convert an existing plain table to Replicated, lock against two appliers
+running at once (run it from one place), or make `INSERT`s quorum writes. The tests run on
+single-node chdb, which proves the SQL rewriting only; `ON CLUSTER` and Replicated behaviour are
+not exercised there.
+
 ## Sandboxes
 
 User guide, MCP tool reference and security model: [`docs/sandbox.md`](../docs/sandbox.md).

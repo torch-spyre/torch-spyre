@@ -31,8 +31,10 @@ class FakeServer:
         self.live = dict(live or {})
         self.ledger = {}
         self.log = []
+        self.elsewhere = set()
+        self.queries = []
 
-    def command(self, sql):
+    def command(self, sql, settings=None):
         self.log.append(sql)
         if sql.startswith("SELECT version()"):
             return "26.3.12.3"
@@ -42,13 +44,33 @@ class FakeServer:
             self.live.pop(sql.split()[-1], None)
             return None
         stmt = re.sub(r"IF\s+NOT\s+EXISTS\s+", "", sql, count=1, flags=re.I)
+        # A server stores a definition without the ON CLUSTER clause it was created with.
+        stmt = re.sub(r"\s+ON\s+CLUSTER\s+\w+", "", stmt, count=1, flags=re.I)
         m = self.NAME.match(stmt)
         if m and m.group(1) not in self.live:
             self.live[m.group(1)] = stmt
         return None
 
     def query(self, sql, parameters=None):
-        if "formatQuerySingleLine" in sql:
+        self.queries.append(sql)
+        if "has(%(names)s" in sql:
+            rows = [
+                (
+                    n,
+                    "ReplicatedMergeTree"
+                    if "ENGINE = Replicated" in self.live[n]
+                    else "MergeTree",
+                )
+                for n in parameters["names"]
+                if n in self.live
+            ]
+        elif "clusterAllReplicas" in sql:
+            rows = (
+                [("h1", 9000)]
+                if "system.one" in sql
+                else [("h1", 9000, 1, sorted(self.elsewhere))]
+            )
+        elif "formatQuerySingleLine" in sql:
             rows = [(" ".join(parameters["s"].split()),)]
         elif "system.tables" in sql:
             rows = list(self.live.items())
