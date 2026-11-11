@@ -468,6 +468,10 @@ COMPILED_OPS = [
     aten.trunc,
     aten.index_select,
     aten.index_copy.out,
+    aten.index_fill.int_Scalar,
+    aten.index_fill.int_Tensor,
+    aten.index_fill.int_Scalar_out,
+    aten.index_fill.int_Tensor_out,
     aten.log,
     aten.mean,
     aten.mul,
@@ -593,6 +597,17 @@ def _make_inplace_kernel(functional_op):
     return kernel
 
 
+# In-place ops that write through their compiled ``out=`` overload instead of
+# the functional-compute + ``copy_`` kernel, mapped to that ``out`` overload.
+# The copy-back kernel materializes a full ``self``-sized result even when the
+# op touches a few slices; ``out=self`` scatters into an offset-0 ``self``
+# directly, the path ``index_copy_`` already takes via ``index_copy.out``.
+_OUT_ROUTED_INPLACE_OPS = {
+    aten.index_fill_.int_Scalar: aten.index_fill.int_Scalar_out,
+    aten.index_fill_.int_Tensor: aten.index_fill.int_Tensor_out,
+}
+
+
 def register_inplace_kernels(ops):
     """Register the in-place sibling of every compiled op in ``ops``.
 
@@ -605,6 +620,8 @@ def register_inplace_kernels(ops):
     Pairs are accepted only when the in-place and functional signatures match
     modulo the write-alias, and only when the resolved functional overload
     actually got a compiled kernel above -- see :func:`_functional_sibling`.
+    Ops in ``_OUT_ROUTED_INPLACE_OPS`` are skipped; they get their kernel from
+    :func:`register_out_routed_inplace_kernels`.
     """
     compiled = {op.name() for op in _compile_kernel_overloads(ops)}
     base_names = {name.partition(".")[0].split("::")[1] for name in compiled}
@@ -620,6 +637,8 @@ def register_inplace_kernels(ops):
             except RuntimeError:
                 # schema-only entries such as ``add_.t`` have no dispatcher op
                 continue
+            if inplace_op in _OUT_ROUTED_INPLACE_OPS:
+                continue
             sibling = _functional_sibling(inplace_op)
             if sibling is None or sibling.name() not in compiled:
                 continue
@@ -628,7 +647,36 @@ def register_inplace_kernels(ops):
             )
 
 
+def _make_out_routed_inplace_kernel(out_op):
+    """Build an in-place kernel that calls ``out_op(self, ..., out=self)``.
+
+    The compiled ``out`` kernel takes ``out`` as a runtime argument, so an
+    offset-0 ``self`` is written without a full copy. A ``self`` view with a
+    storage offset goes through :func:`_make_offset_safe_dispatch`, which
+    clones the view and copies the result back.
+    """
+
+    def kernel(self, *args):
+        return out_op(self, *args, out=self)
+
+    return kernel
+
+
+def register_out_routed_inplace_kernels(ops):
+    """Register the in-place kernels listed in ``_OUT_ROUTED_INPLACE_OPS``.
+
+    Only ops whose ``out`` overload got a compiled kernel are registered.
+    """
+    compiled = {op.name() for op in _compile_kernel_overloads(ops)}
+    for inplace_op, out_op in _OUT_ROUTED_INPLACE_OPS.items():
+        if out_op.name() in compiled:
+            torch.library.register_kernel(inplace_op.name(), ["spyre"])(
+                _make_out_routed_inplace_kernel(out_op)
+            )
+
+
 register_inplace_kernels(COMPILED_OPS)
+register_out_routed_inplace_kernels(COMPILED_OPS)
 
 # ``register_inplace_kernels`` cannot derive ``floor_divide_.Tensor``: it pairs
 # overloads by name, but the functional (Tensor, Tensor) overload is
