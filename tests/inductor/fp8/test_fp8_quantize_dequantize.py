@@ -69,13 +69,6 @@ _XFAIL_3999 = pytest.mark.xfail(
     "this stick-unaligned K to two FP16 sticks",
 )
 
-_XFAIL_3026 = pytest.mark.xfail(
-    strict=True,
-    raises=InductorError,
-    reason="https://github.com/torch-spyre/torch-spyre/issues/3026: head_dim=64 roundtrip "
-    "fails to compile: 'Unexpected stick expression d2 + 64*(Mod(d1, 2))' or its 4D form",
-)
-
 
 def _quantize_fn(x, scale):
     return torch.ops.spyre.quantize_fp8_with_scale(x, scale)
@@ -914,7 +907,7 @@ class TestRoundtripShapes:
     @pytest.mark.parametrize(
         "shape",
         [
-            pytest.param((2, 128, 64), marks=_XFAIL_3026),
+            (2, 128, 64),
             (4, 64, 256),
             (2, 32, 4096),
             (1, 512, 4096),
@@ -978,7 +971,16 @@ class TestRoundtripShapes:
 
     @pytest.mark.parametrize(
         "shape",
-        [pytest.param((2, 8, 64, 64), marks=_XFAIL_3026), (1, 4, 32, 128)],
+        [
+            pytest.param(
+                (2, 8, 64, 64),
+                marks=pytest.mark.skip(
+                    reason="https://github.com/torch-spyre/torch-spyre/issues/6159: "
+                    "device reports Compute CB hardware error 0x9b01 (RAS HardwareError)"
+                ),
+            ),
+            (1, 4, 32, 128),
+        ],
         ids=["2x8x64x64", "1x4x32x128"],
     )
     def test_4d_attention_layout(self, shape):
@@ -1190,11 +1192,10 @@ class TestRoundtripInputVariants:
     """Activation roundtrip with non-standard inputs: non-contiguous (transposed) and BF16."""
 
     @pytest.mark.xfail(
-        strict=True,
-        raises=InductorError,
-        reason="https://github.com/torch-spyre/torch-spyre/issues/2526: transposed input "
-        "fails to compile: dbo-opt raises DtException 'Expect valid lower and upper bound "
-        "parameters'",
+        strict=False,
+        raises=AssertionError,
+        reason="https://github.com/torch-spyre/torch-spyre/issues/6160: transposed input "
+        "returns wrong values (4/16 elements differ, up to 16.0)",
     )
     def test_transposed_non_contiguous_input(self):
         """Transposed non-contiguous input, non-uniform."""
