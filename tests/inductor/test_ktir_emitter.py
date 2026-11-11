@@ -26,6 +26,7 @@ Self-contained otherwise: no live Inductor graph, no compiler run.
 import unittest
 
 from test_ktir_validate import (
+    make_add_transpose_spec,
     make_broadcast_op_spec,
     make_chained_op_specs,
     make_nested_op_spec,
@@ -155,6 +156,52 @@ module {
         from torch_spyre._inductor.codegen.ktir import generate_ktir
 
         emitted = generate_ktir("ktir_restickify_0", [make_relayout_op_spec()])
+        self.assertEqual(emitted, self.EXPECTED)
+
+
+@unittest.skipUnless(
+    _mlir_ktdp_available(),
+    "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
+)
+class TestKtirAddTranspose(unittest.TestCase):
+    """``c = a + b.T`` on [64, 64] fp16: one ``linalg.add`` over a strided ``b``.
+
+    The add keeps the spelling an aligned add has, ``linalg.add``, and the
+    transpose lives in ``b``'s view alone: ``strided<[4096, 4096, 1, 64]>``, the
+    input strides of the restickify of the same layout.  ``a`` and ``c`` are
+    viewed over the same rank-4 nest at row-major strides -- the same memory as
+    an aligned add's rank-3 views, with one more unit axis.  No intermediate
+    buffer and no copy stage.
+    """
+
+    EXPECTED = """\
+#map = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+#set = affine_set<(d0, d1, d2, d3) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 >= 0, d2 >= 0, -d2 + 63 >= 0, d3 >= 0, -d3 + 63 >= 0)>
+module {
+  func.func @ktir_fused_add_t_0(%arg0: index, %arg1: index, %arg2: index) attributes {grid = [1]} {
+    %c0 = arith.constant 0 : index
+    %0 = ktdp.construct_memory_view %arg0, sizes: [1, 1, 64, 64], strides: [4096, 4096, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<1x1x64x64xf16>
+    %1 = ktdp.construct_access_tile %0[%c0, %c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<1x1x64x64xf16> -> !ktdp.access_tile<1x1x64x64xindex>
+    %2 = ktdp.load %1 : <1x1x64x64xindex> -> tensor<1x1x64x64xf16>
+    %3 = ktdp.construct_memory_view %arg1, sizes: [1, 1, 64, 64], strides: [4096, 4096, 1, 64] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<1x1x64x64xf16, strided<[4096, 4096, 1, 64]>>
+    %4 = ktdp.construct_access_tile %3[%c0, %c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<1x1x64x64xf16, strided<[4096, 4096, 1, 64]>> -> !ktdp.access_tile<1x1x64x64xindex>
+    %5 = ktdp.load %4 : <1x1x64x64xindex> -> tensor<1x1x64x64xf16>
+    %6 = tensor.empty() : tensor<1x1x64x64xf16>
+    %7 = linalg.add ins(%2, %5 : tensor<1x1x64x64xf16>, tensor<1x1x64x64xf16>) outs(%6 : tensor<1x1x64x64xf16>) -> tensor<1x1x64x64xf16>
+    %8 = ktdp.construct_memory_view %arg2, sizes: [1, 1, 64, 64], strides: [4096, 4096, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<1x1x64x64xf16>
+    %9 = ktdp.construct_access_tile %8[%c0, %c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<1x1x64x64xf16> -> !ktdp.access_tile<1x1x64x64xindex>
+    ktdp.store %7, %9 : tensor<1x1x64x64xf16>, <1x1x64x64xindex>
+    return
+  }
+}
+"""
+
+    def test_add_transpose_golden(self):
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir(
+            "ktir_fused_add_t_0", [make_add_transpose_spec((1,), square_dim_size=64)]
+        )
         self.assertEqual(emitted, self.EXPECTED)
 
 

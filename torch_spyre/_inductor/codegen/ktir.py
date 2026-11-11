@@ -1766,12 +1766,15 @@ class KernelPlan:
                 f"{spec.op!r} moves {inputs[0].name!r} between scratchpad owners; "
                 "a core-to-core relayout is not emitted",
             )
-        # Whether the operand has to be MOVED is read off the operands, and whether
-        # the op may be emitted as that move is read off the recipe: a copy is the
-        # only op whose payload survives being replaced by a strided read.  A
-        # compute op on a permuted operand falls through and is refused by the
-        # pointwise path's alignment, rather than losing its compute.
-        if recipe.copy and needs_relayout(inputs[0], out):
+        # Whether an input has to be MOVED is a fact about that input, read off
+        # its coordinates against the output's, not about the op.  If any input
+        # of a pointwise op is laid out differently from the output, every input
+        # is viewed in the output's order (``_relayout_step``) and the op's own
+        # payload runs over those views: ``a + b.T`` reads ``b`` through
+        # transposed strides and is still an ``add``.  A reduction's input is
+        # never in its output's order -- the output drops the reduced axes -- so
+        # a reduction is not asked.
+        if not spec.is_reduction and any(needs_relayout(arg, out) for arg in inputs):
             return self._relayout_step(spec, loops, stage)
         if recipe.copy:
             # A copy that a reshape or broadcast lines up still has to reach
@@ -1995,7 +1998,7 @@ class KernelPlan:
     def _relayout_step(
         self, spec: OpSpec, loops: Sequence[LoopSpec], stage: int
     ) -> ComputeStep:
-        """One op whose inputs are each viewed in the output's order.
+        """A pointwise op whose inputs are each viewed in the output's order.
 
         The step every other op gets from alignment, built from
         ``relayout_views`` instead: one loop nest for every operand (the
@@ -2045,6 +2048,18 @@ class KernelPlan:
             [int(s) for s in out.device_size],
             ranges,
         )
+        # A stage has one view per buffer, so one buffer read at two sets of
+        # strides -- ``x + x.T`` -- cannot be stated: the second view would
+        # silently take the first one's place.
+        strides_of_buffer: dict[str, tuple[int, ...]] = {}
+        for source, strides in zip(inputs, in_strides):
+            earlier = strides_of_buffer.setdefault(buf_id(source), strides)
+            if earlier != strides:
+                raise NotImplementedError(
+                    f"OpSpec->KTIR: {spec.op!r} reads buffer {buf_id(source)!r} "
+                    f"at strides {earlier} and at {strides}; a stage has one view "
+                    "per buffer, so one buffer read in two layouts is not supported"
+                )
         accesses = {}
         for arg, strides in (*zip(inputs, in_strides), (out, out_strides)):
             layout = Layout(extent=loop_bounds, strides=strides)
@@ -2061,6 +2076,12 @@ class KernelPlan:
         # Every operand is viewed over the same loop nest, in the output's order,
         # so the op is spelled exactly as an aligned pointwise op is.
         surface, indexing = _parallel_surface(arm, len(inputs), len(loop_bounds))
+        # The scalars the payload takes beyond its operands (``softplus``'s beta),
+        # read here for the same reason ``_compute_step`` reads them: a malformed
+        # one is refused by the plan, not by emission.
+        attrs: tuple[tuple[str, float], ...] = ()
+        if recipe.attrs is not None:
+            attrs = tuple(recipe.attrs(spec.op_info).items())
         return ComputeStep(
             op=spec.op,
             surface=surface,
@@ -2069,6 +2090,7 @@ class KernelPlan:
             out_buf_id=buf_id(out),
             stage=stage,
             indexing=indexing,
+            attrs=attrs,
             dtype=dtype,
             store=True,
         )

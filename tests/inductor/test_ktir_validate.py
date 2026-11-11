@@ -3080,10 +3080,27 @@ class TestRelayoutDetection(unittest.TestCase):
                     )
                 self.assertIn(label, str(ctx.exception))
 
-    def test_a_compute_op_on_a_permuted_operand_is_refused(self):
-        """``exp`` is not a copy, so a permuted operand must not drop its compute."""
-        with self.assertRaisesRegex(NotImplementedError, "restickify"):
-            ktir.build_kernel_plan([make_relayout_op_spec("2d_64x64", op="exp")])
+    def test_a_compute_op_on_a_permuted_operand_keeps_its_compute(self):
+        """``exp(x.T)`` reads ``x`` through the relayout's strides and is an ``exp``.
+
+        The input view is the one the restickify of the same layout gets, and
+        the payload is ``exp``'s, not a copy's: the relayout is in the view, the
+        compute is the op's.
+        """
+        for case, fp32, (
+            loop_bounds,
+            in_strides,
+            out_strides,
+        ) in TestRelayout().expectations():
+            with self.subTest(case=case, fp32=fp32):
+                spec = make_relayout_op_spec(case, fp32=fp32, op="exp")
+                [step] = ktir.build_kernel_plan([spec]).steps
+                self.assertEqual(step.op, "exp")
+                self.assertIs(step.surface, ktir.Surface.GENERIC)
+                [(_name, source)] = step.ins
+                self.assertEqual(source.extent, loop_bounds)
+                self.assertEqual(source.buffer.layout.strides, in_strides)
+                self.assertEqual(step.out.buffer.layout.strides, out_strides)
 
     def test_a_padded_transpose_is_refused_by_relayout(self):
         """Detected as a relayout, then refused because a stick would be padded."""
@@ -3133,6 +3150,99 @@ class TestRelayoutDetection(unittest.TestCase):
                     kind=ktir.BindingKind.PAYLOAD,
                     binding=ktir._written_here(lambda x, y: x),
                 ),
+            )
+
+
+def make_add_transpose_spec(
+    relayouted: tuple[int, ...],
+    *,
+    square_dim_size: int = 128,
+    lanes_per_stick: int = 64,
+    names: list | None = None,
+) -> OpSpec:
+    """``c = a + b`` on ``[square_dim_size] * 2``, with the inputs in ``relayouted``
+    stored transposed relative to ``c``.
+
+    ``c`` keeps its stick on ``c1``; a relayouted input keeps its stick on
+    ``c0``, the layout the frontend gives ``b`` in ``a + b.T``.  At
+    ``lanes_per_stick=32`` the format is fp32.
+    """
+    c0, c1 = _C0, _C1
+    floor, mod = sympy.floor, sympy.Mod
+    lanes = lanes_per_stick
+    physicalized_tensor_size = [square_dim_size // lanes, square_dim_size, lanes]
+    like_c = [floor(c1 / lanes), c0, mod(c1, lanes)]
+    transposed = [floor(c0 / lanes), c1, mod(c0, lanes)]
+    in_coords = [transposed if i in relayouted else like_c for i in range(2)]
+    return make_op_spec(
+        "add",
+        inputs=2,
+        names=names,
+        sizes=[physicalized_tensor_size] * 3,
+        coords_per_arg=[*in_coords, like_c],
+        space={c0: (square_dim_size, 1), c1: (square_dim_size, 1)},
+        dtype=DataFormats.IEEE_FP32 if lanes == 32 else FP16,
+    )
+
+
+class TestRelayoutOnAPointwiseOp(unittest.TestCase):
+    """``c = a + b.T``: a relayout is a property of each input, not of the op.
+
+    Every input is viewed over one loop nest in ``c``'s order, an input laid
+    out like ``c`` at ``c``'s own strides, and the op keeps its own spelling:
+    ``add`` is the named ``linalg.add``.  The strides are worked by hand for
+    ``[128, 128]``: ``c`` and an aligned input are row-major over the nest, and
+    ``b``'s address ``floor(c0/L)*S + c1*L + c0 % L`` (``L`` lanes per stick,
+    ``S = 128 * L``) puts ``c1``'s stick and lane loops at ``L*L`` and ``L``,
+    and ``c0``'s at ``S`` and ``1``.
+    """
+
+    # lanes_per_stick -> (loop_bounds, c's strides, b's strides)
+    EXPECTED = {
+        64: ((2, 2, 64, 64), (8192, 4096, 64, 1), (4096, 8192, 1, 64)),
+        32: ((4, 4, 32, 32), (4096, 1024, 32, 1), (1024, 4096, 1, 32)),
+    }
+
+    def step(self, relayouted, **kwargs):
+        [step] = ktir.build_kernel_plan(
+            [make_add_transpose_spec(relayouted, **kwargs)]
+        ).steps
+        return step
+
+    def test_either_input_may_be_the_relayouted_one(self):
+        """The relayouted input gets ``b``'s strides, the other ``c``'s, either way."""
+        for lanes, (loop_bounds, c_strides, b_strides) in self.EXPECTED.items():
+            for relayouted in ((0,), (1,), (0, 1)):
+                with self.subTest(lanes_per_stick=lanes, relayouted=relayouted):
+                    step = self.step(relayouted, lanes_per_stick=lanes)
+                    self.assertEqual(step.op, "add")
+                    for position, (_name, access) in enumerate(step.ins):
+                        self.assertEqual(access.extent, loop_bounds)
+                        self.assertEqual(
+                            access.buffer.layout.strides,
+                            b_strides if position in relayouted else c_strides,
+                        )
+                    self.assertEqual(step.out.extent, loop_bounds)
+                    self.assertEqual(step.out.buffer.layout.strides, c_strides)
+
+    def test_add_stays_the_named_linalg_add(self):
+        """The op is spelled as an aligned ``add`` is: ``linalg.add``, no maps."""
+        step = self.step((1,))
+        self.assertIs(step.surface, ktir.Surface.BARE)
+        self.assertIsNone(step.indexing)
+
+    def test_an_aligned_add_does_not_take_the_relayout_path(self):
+        """With no input relayouted, the add keeps its ordinary rank-3 views."""
+        step = self.step(())
+        self.assertIs(step.surface, ktir.Surface.BARE)
+        for _name, access in (*step.ins, (None, step.out)):
+            self.assertEqual(access.extent, (2, 128, 64))
+
+    def test_one_buffer_read_in_two_layouts_is_refused(self):
+        """``x + x.T``: one buffer cannot have two views in one stage."""
+        with self.assertRaisesRegex(NotImplementedError, "two layouts"):
+            ktir.build_kernel_plan(
+                [make_add_transpose_spec((1,), names=["x", "x", "c"])]
             )
 
 
