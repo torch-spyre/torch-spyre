@@ -921,16 +921,24 @@ class UnalignedStickSplit(Unsupported):
         variable: sympy.Symbol,
         boundary: int,
         stick_size: int,
+        hint: str | None = None,
     ) -> None:
         self.tensor_index = tensor_index
         self.variable = variable
         self.boundary = boundary
         self.stick_size = stick_size
-        super().__init__(
+        message = (
             "tensor alignment boundary "
             f"{boundary} for {variable} cuts tensor {tensor_index}'s "
             f"physical stick of {stick_size} elements"
         )
+        # Call-site-specific guidance, e.g. SpyreKernel._check_indirect_index_step
+        # naming the documented remedy for its own checks, rather than leaving the
+        # reader only this generic, internal-symbol-name message. Omitted by other
+        # call sites, whose alignment failures aren't tied to one documented fix.
+        if hint:
+            message = f"{message}. {hint}"
+        super().__init__(message)
 
 
 def build_alignment_inputs(

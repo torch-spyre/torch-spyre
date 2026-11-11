@@ -753,6 +753,35 @@ def _patch_tensor_for_spyre():
         warnings.warn(f"Failed to install safetensors Spyre patches: {e}")
 
 
+def _patch_fake_tensor_device_init():
+    """Force ``FakeTensorMode.avoid_device_init`` to True for the Spyre backend.
+
+    A workaround to let FakeTensors on Spyre really be Fake - ie not use the device.
+    Without this patch, we observe device memcpy's during compilation
+    where this is not expected/needed.
+
+    TODO: Once upstream Pytorch issue: #203190 is resolved, this can be removed.
+    """
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    # using __dict__ to be resilient to changes in FakeTensorMode
+    # such as the open PR: https://github.com/pytorch/pytorch/pull/202561
+    current = FakeTensorMode.__dict__.get("avoid_device_init", None)
+
+    if current is None:
+        import warnings
+
+        warnings.warn(
+            "Failed to install patch to avoid device init under FakeTensor: real tensors used on Spyre for compilation!"
+        )
+        return
+
+    def _spyre_avoid_device_init(self):
+        return True
+
+    FakeTensorMode.avoid_device_init = property(_spyre_avoid_device_init)
+
+
 def _patch_invoke_subgraph_decompositions():
     """Thread the Spyre decomp table into invoke_subgraph subgraph re-traces.
 
