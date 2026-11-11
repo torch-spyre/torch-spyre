@@ -12,18 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Split-execution trace tests (issue #2889)."""
+"""Split-execution trace tests (issue #2889).
+
+Every test runs in a child process with the profiler and hazard tracker
+environment variables configured at process startup. The parent pytest process
+never opens the device directly.
+"""
 
 import json
 import math
+import multiprocessing
+import pathlib
+import traceback
 
 import pytest
 import torch
-import torch._dynamo
-from torch.profiler import ProfilerActivity, profile
-from torch.testing._internal.common_utils import TemporaryFileName
-
-import torch_spyre  # noqa: F401  # registers the backend
 
 # Device-bound shape: kernel time >> host compute time.
 _MM_M, _MM_K, _MM_N = 2048, 8192, 2048
@@ -32,6 +35,19 @@ _NUM_LAUNCHES = 12
 # Minimum share of launches (after the first) that must pass each overlap check.
 _MIN_RAN_AHEAD_FRACTION = 0.8
 _MIN_PARTLY_INSIDE_FRACTION = 0.5
+
+_PROFILER_ENV = {
+    "USE_SPYRE_PROFILER": "1",
+    "SPYRE_HAZARD_TRACKER": "1",
+    "FLEX_TIMESTAMP_CALIBRATION": "always",
+    "FLEX_SKIP_TIMESTAMP_CALIBRATION": "0",
+}
+
+
+@pytest.fixture(scope="session")
+def shared_compile_cache(tmp_path_factory) -> pathlib.Path:
+    """One compile cache shared by every child."""
+    return tmp_path_factory.mktemp("spyre_profiler_compile_cache", numbered=False)
 
 
 def _complete_events(trace_events: list[dict]) -> list[dict]:
@@ -100,40 +116,18 @@ def _skew_us(events: list[dict]) -> float:
     return deltas[mid] if len(deltas) % 2 else (deltas[mid - 1] + deltas[mid]) / 2.0
 
 
-def _starts_inside(inner: dict, outer: dict) -> bool:
-    return outer["ts"] <= inner["ts"] < outer["ts"] + outer.get("dur", 0)
+def _child_profile_back_to_back(num_launches: int) -> dict:
+    """Child: run mm under the profiler with env vars applied at startup."""
+    import torch
+    import torch._dynamo
+    from torch.profiler import ProfilerActivity, profile
+    from torch.testing._internal.common_utils import TemporaryFileName
 
+    import torch_spyre  # noqa: F401  # registers backend
 
-def _ends_before(a: dict, b: dict) -> bool:
-    return (a["ts"] + a.get("dur", 0)) < (b["ts"] + b.get("dur", 0))
-
-
-@pytest.fixture(scope="module")
-def compiled_mm():
-    """Compile and warm up mm once, in the pytest process (the profiler cannot
-    span processes)."""
     torch._dynamo.reset()
-    torch.manual_seed(0)
-    device = torch.device("spyre")
-
-    a = torch.randn(_MM_M, _MM_K, dtype=_MM_DTYPE).to(device)
-    b = torch.randn(_MM_K, _MM_N, dtype=_MM_DTYPE).to(device)
-
-    fn = torch.compile(torch.mm, backend="inductor")
-    fn(a, b)
-    torch.accelerator.synchronize(device)
-    return fn
-
-
-def _profile_back_to_back(compiled_fn, num_launches: int) -> dict:
-    """Run mm num_launches times under the profiler.
-
-    Returns "events" (calibrated timestamps, unadjusted), "outputs", "refs" and
-    "skew_us" (diagnostic only). No extra skew correction: it would absorb real
-    queuing delay and could fake overlap.
-    """
-    device = torch.device("spyre")
     torch.manual_seed(3)
+    device = torch.device("spyre")
 
     pairs_cpu = [
         (
@@ -144,9 +138,12 @@ def _profile_back_to_back(compiled_fn, num_launches: int) -> dict:
     ]
     # Upload before profiling so only correction H2Ds appear in the trace.
     pairs_spyre = [(a.to(device), b.to(device)) for a, b in pairs_cpu]
+
+    compiled_fn = torch.compile(torch.mm, backend="inductor")
+    compiled_fn(pairs_spyre[0][0], pairs_spyre[0][1])
     torch.accelerator.synchronize(device)
 
-    refs = [torch.mm(a.float(), b.float()) for a, b in pairs_cpu]
+    refs = [torch.mm(a.float(), b.float()).numpy() for a, b in pairs_cpu]
 
     with TemporaryFileName(mode="w+") as trace_path:
         with profile(
@@ -160,10 +157,9 @@ def _profile_back_to_back(compiled_fn, num_launches: int) -> dict:
         with open(trace_path) as f:
             trace_data = json.load(f)
 
-    outputs_cpu = [out.cpu().float() for out in outs]
+    outputs_cpu = [out.cpu().float().numpy() for out in outs]
 
     raw_events = _complete_events(trace_data.get("traceEvents", []))
-    # Skew is printed only, never applied to events.
     skew = _skew_us(raw_events)
 
     return {
@@ -172,6 +168,136 @@ def _profile_back_to_back(compiled_fn, num_launches: int) -> dict:
         "refs": refs,
         "skew_us": skew,
     }
+
+
+def _child_reprofiled_window() -> dict:
+    """Child: run two consecutive profiling sessions to verify post-calibration clock."""
+    import torch
+    import torch._dynamo
+    from torch.profiler import ProfilerActivity, profile
+    from torch.testing._internal.common_utils import TemporaryFileName
+
+    import torch_spyre  # noqa: F401
+
+    torch._dynamo.reset()
+    torch.manual_seed(5)
+    device = torch.device("spyre")
+
+    compiled_mm = torch.compile(torch.mm, backend="inductor")
+
+    a = torch.randn(_MM_M, _MM_K, dtype=_MM_DTYPE).to(device)
+    b = torch.randn(_MM_K, _MM_N, dtype=_MM_DTYPE).to(device)
+
+    with TemporaryFileName(mode="w+") as _:
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
+        ) as prof1:
+            compiled_mm(a, b)
+            torch.accelerator.synchronize(device)
+        prof1.export_chrome_trace(_)
+
+    a2 = torch.randn(_MM_M, _MM_K, dtype=_MM_DTYPE).to(device)
+    b2 = torch.randn(_MM_K, _MM_N, dtype=_MM_DTYPE).to(device)
+
+    with TemporaryFileName(mode="w+") as trace_path:
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
+        ) as prof2:
+            compiled_mm(a2, b2)
+            torch.accelerator.synchronize(device)
+        prof2.export_chrome_trace(trace_path)
+        with open(trace_path) as f:
+            trace_data = json.load(f)
+
+    events = _complete_events(trace_data.get("traceEvents", []))
+    kernels = _kernel_events(events)
+
+    return {
+        "events": events,
+        "kernels": kernels,
+    }
+
+
+def _child_wrapper(
+    env_overrides: dict,
+    target,
+    args: tuple,
+    conn,
+) -> None:
+    """Apply env overrides, run target, send back (ok, result)."""
+    import os
+
+    try:
+        for k, v in env_overrides.items():
+            os.environ[k] = v
+        result = target(*args)
+        conn.send((True, result))
+    except Exception as e:  # noqa: BLE001
+        conn.send((False, f"{e}\n{traceback.format_exc()}"))
+    finally:
+        conn.close()
+
+
+def _run_in_child(
+    target,
+    args: tuple,
+    env_overrides: dict,
+    cache_dir: pathlib.Path,
+    timeout: float = 180.0,
+) -> dict:
+    """Run target in a spawned child with env overrides; return its result."""
+    all_overrides = {
+        "TORCHINDUCTOR_CACHE_DIR": str(cache_dir),
+        "SPYRE_NUM_CPUS": "1",
+    }
+    all_overrides.update(env_overrides)
+
+    ctx = multiprocessing.get_context("spawn")
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
+    p = ctx.Process(
+        target=_child_wrapper, args=(all_overrides, target, args, child_conn)
+    )
+    p.start()
+    child_conn.close()
+
+    success: bool | None = None
+    payload: dict | None = None
+    if parent_conn.poll(timeout):
+        try:
+            success, payload = parent_conn.recv()
+        except EOFError:
+            pass
+
+    p.join(timeout=5.0)
+    if p.is_alive():
+        p.terminate()
+        p.join()
+        raise TimeoutError(f"Child process timed out after {timeout}s")
+
+    parent_conn.close()
+
+    if p.exitcode != 0 and success is None:
+        raise RuntimeError(f"Child process exited with code {p.exitcode}")
+
+    if success is False:
+        raise RuntimeError(f"Child process failed:\n{payload}")
+    if success is None or payload is None:
+        raise RuntimeError(
+            f"Child process exited without returning a result (exitcode={p.exitcode})"
+        )
+
+    return payload
+
+
+@pytest.fixture(scope="module")
+def profiled_trace(shared_compile_cache: pathlib.Path) -> dict:
+    """Run mm _NUM_LAUNCHES times under profiler in a spawned child process."""
+    return _run_in_child(
+        _child_profile_back_to_back,
+        args=(_NUM_LAUNCHES,),
+        env_overrides=_PROFILER_ENV,
+        cache_dir=shared_compile_cache,
+    )
 
 
 def _print_overlap_counts(
@@ -233,34 +359,18 @@ def _print_overlap_counts(
     return ran_ahead, partly_inside, launches
 
 
-@pytest.mark.requires_spyre_profiler
 class TestSplitExecutionTrace:
-    """Trace checks for split execution (issue #2889).
+    """Trace checks for split execution (issue #2889)."""
 
-    Needs SPYRE_HAZARD_TRACKER=1 (latched at startup) and USE_SPYRE_PROFILER=1.
-    Set FLEX_TIMESTAMP_CALIBRATION=always and FLEX_SKIP_TIMESTAMP_CALIBRATION=0
-    to avoid per-session DMA stalls.
-    """
-
-    @pytest.fixture(autouse=True)
-    def _require_tracker_on(self):
-        import os
-
-        if os.environ.get("SPYRE_HAZARD_TRACKER") != "1":
-            pytest.skip(
-                "SPYRE_HAZARD_TRACKER=1 is required for split-execution trace tests"
-            )
-
-    def test_host_compute_span_present(self, compiled_mm):
+    def test_host_compute_span_present(self, profiled_trace: dict):
         """The launch::HostCompute CPU span is in the trace."""
-        result = _profile_back_to_back(compiled_mm, _NUM_LAUNCHES)
-        hc_spans = _host_compute_spans(result["events"])
+        hc_spans = _host_compute_spans(profiled_trace["events"])
         assert hc_spans, (
             "No launch::HostCompute spans in the trace: AIUPTI events are "
             "missing (check USE_SPYRE_PROFILER=1) or the span was removed."
         )
 
-    def test_host_compute_runs_ahead_of_kernel(self, compiled_mm):
+    def test_host_compute_runs_ahead_of_kernel(self, profiled_trace: dict):
         """HostCompute for later launches overlaps earlier kernels.
 
         ran_ahead: HostCompute[m] ends before kernel[m-1] ends.
@@ -270,9 +380,12 @@ class TestSplitExecutionTrace:
         The counts are the same with the tracker off, so this checks
         asynchronous dispatch, not the split itself.
         """
-        result = _profile_back_to_back(compiled_mm, _NUM_LAUNCHES)
-        kernels = sorted(_kernel_events(result["events"]), key=lambda e: e["ts"])
-        hc_spans = sorted(_host_compute_spans(result["events"]), key=lambda e: e["ts"])
+        kernels = sorted(
+            _kernel_events(profiled_trace["events"]), key=lambda e: e["ts"]
+        )
+        hc_spans = sorted(
+            _host_compute_spans(profiled_trace["events"]), key=lambda e: e["ts"]
+        )
         num_spans = min(len(kernels), len(hc_spans))
         assert num_spans >= 2, (
             f"Need at least 2 kernels and 2 HostCompute spans, got "
@@ -280,10 +393,9 @@ class TestSplitExecutionTrace:
         )
 
         print(
-            f"\nskew_us={result['skew_us']:.2f} (diagnostic only)  spans={num_spans - 1}"
+            f"\nskew_us={profiled_trace['skew_us']:.2f} (diagnostic only)  spans={num_spans - 1}"
         )
         ran_ahead, partly_inside, launches = _print_overlap_counts(kernels, hc_spans)
-        # Worst of 10 device runs: ran_ahead 11/11, partly_inside 7/11.
         min_ran_ahead = math.ceil(_MIN_RAN_AHEAD_FRACTION * launches)
         min_partly_inside = math.ceil(_MIN_PARTLY_INSIDE_FRACTION * launches)
         assert ran_ahead >= min_ran_ahead, (
@@ -297,12 +409,14 @@ class TestSplitExecutionTrace:
             f"host prep is not running concurrently with device compute."
         )
 
-    def test_raw_edge_kernel_after_h2d(self, compiled_mm):
+    def test_raw_edge_kernel_after_h2d(self, profiled_trace: dict):
         """RAW edge: kernel k starts after its own correction H2D ends."""
-        result = _profile_back_to_back(compiled_mm, _NUM_LAUNCHES)
-
-        kernels = sorted(_kernel_events(result["events"]), key=lambda e: e["ts"])
-        memcpys = sorted(_memcpy_events(result["events"]), key=lambda e: e["ts"])
+        kernels = sorted(
+            _kernel_events(profiled_trace["events"]), key=lambda e: e["ts"]
+        )
+        memcpys = sorted(
+            _memcpy_events(profiled_trace["events"]), key=lambda e: e["ts"]
+        )
 
         assert kernels, "No kernel events — check AIUPTI."
         assert memcpys, "No memcpy (H2D) events — check AIUPTI."
@@ -329,18 +443,18 @@ class TestSplitExecutionTrace:
             "RAW edge violation(s) — kernel(s) started before their correction "
             "H2D completed:\n"
             + "\n".join(violations)
-            + f"\nskew_us={result['skew_us']:.2f}"
+            + f"\nskew_us={profiled_trace['skew_us']:.2f}"
         )
 
-    def test_war_edge_h2d_after_preceding_kernel(self, compiled_mm):
+    def test_war_edge_h2d_after_preceding_kernel(self, profiled_trace: dict):
         """WAR edge: correction H2D k+1 starts after kernel k ends."""
-        result = _profile_back_to_back(compiled_mm, _NUM_LAUNCHES)
-
-        kernels = sorted(_kernel_events(result["events"]), key=lambda e: e["ts"])
+        kernels = sorted(
+            _kernel_events(profiled_trace["events"]), key=lambda e: e["ts"]
+        )
         h2ds = sorted(
             [
                 m
-                for m in _memcpy_events(result["events"])
+                for m in _memcpy_events(profiled_trace["events"])
                 if "HtoD" in m.get("name", "")
             ],
             key=lambda e: e["ts"],
@@ -365,55 +479,39 @@ class TestSplitExecutionTrace:
             "WAR edge violation(s) — H2D started before preceding kernel "
             "completed (missing WAR hazard edge):\n"
             + "\n".join(violations)
-            + f"\nskew_us={result['skew_us']:.2f}"
+            + f"\nskew_us={profiled_trace['skew_us']:.2f}"
         )
 
-    def test_profiled_outputs_match_cpu(self, compiled_mm):
+    def test_profiled_outputs_match_cpu(self, profiled_trace: dict):
         """Outputs collected inside the profiled region match the CPU reference."""
-        result = _profile_back_to_back(compiled_mm, _NUM_LAUNCHES)
-
-        for k, (out, ref) in enumerate(zip(result["outputs"], result["refs"])):
-            rel_frob = (torch.linalg.norm(out - ref) / torch.linalg.norm(ref)).item()
+        for k, (out, ref) in enumerate(
+            zip(profiled_trace["outputs"], profiled_trace["refs"])
+        ):
+            out_t = torch.as_tensor(out)
+            ref_t = torch.as_tensor(ref)
+            rel_frob = (
+                torch.linalg.norm(out_t - ref_t) / torch.linalg.norm(ref_t)
+            ).item()
             assert rel_frob < 0.01, (
                 f"Launch {k}: relative Frobenius error {rel_frob:.4e} exceeds 1% "
                 f"inside profiled region — profiling may have corrupted execution."
             )
 
-    def test_reprofiled_window_after_calibration(self, compiled_mm):
+    def test_reprofiled_window_after_calibration(
+        self, shared_compile_cache: pathlib.Path
+    ):
         """A second profiling session still yields valid kernel events.
 
         Needs FLEX_TIMESTAMP_CALIBRATION=always and
         FLEX_SKIP_TIMESTAMP_CALIBRATION=0 (calibrate at startup, not in-session).
         """
-        device = torch.device("spyre")
-        torch.manual_seed(5)
-
-        a = torch.randn(_MM_M, _MM_K, dtype=_MM_DTYPE).to(device)
-        b = torch.randn(_MM_K, _MM_N, dtype=_MM_DTYPE).to(device)
-
-        with TemporaryFileName(mode="w+") as _:
-            with profile(
-                activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
-            ) as prof1:
-                compiled_mm(a, b)
-                torch.accelerator.synchronize(device)
-            prof1.export_chrome_trace(_)
-
-        a2 = torch.randn(_MM_M, _MM_K, dtype=_MM_DTYPE).to(device)
-        b2 = torch.randn(_MM_K, _MM_N, dtype=_MM_DTYPE).to(device)
-
-        with TemporaryFileName(mode="w+") as trace_path:
-            with profile(
-                activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
-            ) as prof2:
-                compiled_mm(a2, b2)
-                torch.accelerator.synchronize(device)
-            prof2.export_chrome_trace(trace_path)
-            with open(trace_path) as f:
-                trace_data = json.load(f)
-
-        events = _complete_events(trace_data.get("traceEvents", []))
-        kernels = _kernel_events(events)
+        result = _run_in_child(
+            _child_reprofiled_window,
+            args=(),
+            env_overrides=_PROFILER_ENV,
+            cache_dir=shared_compile_cache,
+        )
+        kernels = result["kernels"]
 
         assert kernels, (
             "No kernel events in re-profiled window (second session).  "
