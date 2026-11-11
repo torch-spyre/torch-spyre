@@ -14,16 +14,16 @@
 
 """The shared spool tier on an Artifactory generic repository.
 
-Layout: <repo>/<prefix>/<writer>/<token>.jsonl. A claim is the Artifactory MOVE API renaming the
-file to <name>.claimed-<owner>. Checked against the live service: of six parallel MOVEs of one
-file exactly one returned 200 and the other five returned 400, so the rename is atomic enough to
-act as the lock. A claim that its owner never finishes is renamed back once its lease has run out.
+Layout: <repo>/<prefix>/<writer>/<token>.jsonl, with a sibling <name>.lock holding the claimer's
+owner id and time. The claim is last-writer-wins plus a read-back (see `claim`); it is not
+atomic. A lock whose owner never finishes is removed once its lease has run out.
 
 The token and URL never reach a log line; errors name the HTTP status only.
 """
 
 from __future__ import annotations
 
+import calendar
 import json
 import os
 import ssl
@@ -121,10 +121,9 @@ class ArtifactorySpool:
         for f in json.loads(body).get("files", []):
             uri = f["uri"].lstrip("/")
             try:
-                ts = time.mktime(
+                ts = calendar.timegm(
                     time.strptime(f["lastModified"][:19], "%Y-%m-%dT%H:%M:%S")
                 )
-                ts -= time.timezone  # lastModified is UTC
             except (KeyError, ValueError):
                 ts = now
             out.append((uri, max(0.0, now - ts)))
@@ -137,8 +136,9 @@ class ArtifactorySpool:
         parallel claimers win (1 to 4 of 6) and `If-None-Match: *` is ignored (all 6 win). What
         did give one winner every time is last-writer-wins: write your owner id to a lock file,
         wait, read it back, and win only if your id survived. A second claimer that slips past
-        still cannot double a row on a Replicated table (same token); the plain-table path
-        probes before it sends, so a double claim costs a held item, not a duplicate.
+        still cannot double a row on a Replicated table (same token). On a plain table a double
+        claim can resend a refused-before-write batch twice: the owner ids are unique per
+        process, which keeps that to a true same-instant race.
         """
         if CLAIM in name or LOCK in name:
             return None
