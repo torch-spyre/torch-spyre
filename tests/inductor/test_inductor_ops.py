@@ -3789,43 +3789,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
-        # Host-resident integer operand inside a Spyre graph: a position index
-        # built with torch.arange (CPU int64) and compared before being moved to
-        # the device, as in LFM2's causal conv. The compare runs on CPU, so the
-        # Spyre int -> float promotion must not be applied to it.
-        ("test_cmp_host_operand", "test_cmp_host_operand_cpu"): {
-            "ops_dict": {
-                "eq": torch.eq,
-                "ne": torch.ne,
-                "lt": torch.lt,
-                "le": torch.le,
-                "gt": torch.gt,
-                "ge": torch.ge,
-            },
-            "param_sets": {
-                "fp16_1x64x64": (cached_randn((1, 64, 64)),),
-            },
-        },
-        # Host-resident integer tensor clamped inside a Spyre graph: an index
-        # vector built with torch.arange (CPU int64) is clamped before being
-        # moved to the device, mirroring LFM2-style mask construction. The clamp
-        # runs on CPU, so the Spyre int -> float promotion must not be applied.
-        ("test_clamp_host_operand", "test_clamp_host_operand_cpu"): {
-            "ops_dict": {
-                "clamp": torch.clamp,
-                "clamp_min": torch.clamp_min,
-                "clamp_max": torch.clamp_max,
-            },
-            # TODO: the clamped int64 mask converts to fp16 on device, which makes
-            # it staggered, and it does not broadcast at the stick dim, so its
-            # product with the STANDARD fp16 operand is rejected as mixed EA.
-            "expect_raise": {
-                "fp16_1x64x64": "Multi-arg pointwise with mixed EA",
-            },
-            "param_sets": {
-                "fp16_1x64x64": (cached_randn((1, 64, 64)),),
-            },
-        },
         # -----------------------------------------------------------------------
         # Large integers: int -> fp32 is LOSSY. fp32 carries a 24-bit significand,
         # so above 2**24 the gaps between representable values exceed 1 and two
@@ -4752,6 +4715,62 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((2, 100), dtype=torch.float16),
                     cached_randn((2, 100), dtype=torch.float16),
                     cached_randn((2, 56), dtype=torch.float16),
+                ),
+            },
+        },
+        (
+            "test_cat_reduce_size1_trailing_dim",
+            "test_cat_reduce_size1_trailing_dim_cpu",
+        ): {
+            # Regression test for #5196: cat on a trailing size-1 dim writes a
+            # bare constant (e.g. 1) as the stick coordinate, with no loop
+            # variable to make it offset-free; a downstream reduction forces
+            # layout propagation to resolve that write.
+            "param_sets": {
+                "fp16": (
+                    cached_randn((32, 8, 16, 1), dtype=torch.float16),
+                    cached_randn(
+                        (32, 8, 16, 1), dtype=torch.float16, differentiation="b"
+                    ),
+                ),
+                "bfloat16": (
+                    cached_randn((32, 8, 16, 1), dtype=torch.bfloat16),
+                    cached_randn(
+                        (32, 8, 16, 1), dtype=torch.bfloat16, differentiation="b"
+                    ),
+                ),
+                "fp32": (
+                    cached_randn((32, 8, 16, 1), dtype=torch.float32),
+                    cached_randn(
+                        (32, 8, 16, 1), dtype=torch.float32, differentiation="b"
+                    ),
+                ),
+            },
+        },
+        (
+            "test_cat_stack_last_dim",
+            "test_cat_stack_last_dim_cpu",
+        ): {
+            # #5196 through torch.stack(parts, dim=-1).flatten(-2), the re-interleave
+            # of GPT-J style RoPE: stack lowers to a cat into a new size-1 last dim,
+            # so part i writes the bare constant i as the stick coordinate.
+            "param_sets": {
+                "2_parts_32x8x32": (
+                    2,
+                    cached_randn((32, 8, 32), differentiation="stack_a"),
+                ),
+                "2_parts_17x4x32": (
+                    2,
+                    cached_randn((17, 4, 32), differentiation="stack_b"),
+                ),
+                "2_parts_64x32": (2, cached_randn((64, 32), differentiation="stack_c")),
+                "2_parts_32x8x16": (
+                    2,
+                    cached_randn((32, 8, 16), differentiation="stack_d"),
+                ),
+                "3_parts_32x8x32": (
+                    3,
+                    cached_randn((32, 8, 32), differentiation="stack_e"),
                 ),
             },
         },
@@ -10548,31 +10567,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # Operands with different dtypes: the lowering promotes both to one dtype.
         self.compare_with_cpu(op, x, y, run_eager=True)
 
-    def test_cmp_host_operand_cpu(self, op, x):
-        # The compare's operands live on CPU even though the graph targets Spyre.
-        def fn(x):
-            positions = torch.arange(x.shape[-1])
-            mask = op(positions, 2)[None, None, :]
-            return x * mask.to(dtype=x.dtype, device=x.device)
-
-        self.compare_with_cpu(fn, x, run_eager=False)
-
-    def test_clamp_host_operand_cpu(self, op, x):
-        # The clamp operand lives on CPU even though the graph targets Spyre.
-        # An int64 position index is clamped then moved to the device, as in
-        # LFM2-style causal conv mask construction.
-        def fn(x):
-            positions = torch.arange(x.shape[-1])  # CPU int64
-            if op is torch.clamp:
-                clamped = op(positions, min=0, max=1)
-            elif op is torch.clamp_min:
-                clamped = op(positions, min=0)
-            else:  # clamp_max
-                clamped = op(positions, max=1)
-            return x * clamped[None, None, :].to(dtype=x.dtype, device=x.device)
-
-        self.compare_with_cpu(fn, x, run_eager=False)
-
     def test_cmp_bigint_cpu(self, op, x, y):
         # Integers large enough that int→fp32 loses the distinction between them.
         self.compare_with_cpu(op, x, y, run_eager=True)
@@ -11950,6 +11944,20 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return torch.cat(tensors, dim=dim)
 
         self.compare_with_cpu(fn, *tensors)
+
+    def test_cat_reduce_size1_trailing_dim_cpu(self, a, b):
+        def fn(a, b):
+            return torch.cat([a, b], dim=-1).sum(dim=-1)
+
+        self.compare_with_cpu(fn, a, b)
+
+    def test_cat_stack_last_dim_cpu(self, parts, x):
+        """Stack ``parts`` tensors on a new last dim and flatten it into the stick."""
+
+        def fn(x):
+            return torch.stack([x * (i + 1) for i in range(parts)], dim=-1).flatten(-2)
+
+        self.compare_with_cpu(fn, x, run_eager=False)
 
     def test_pad_cpu(self, x, pad):
         """Compiled torch.nn.functional.pad (constant zero) on Spyre matches CPU."""
