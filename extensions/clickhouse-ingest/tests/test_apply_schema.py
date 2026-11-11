@@ -52,7 +52,11 @@ class FakeServer:
 
     def query(self, sql, parameters=None):
         if "clusterAllReplicas" in sql:
-            rows = [(n,) for n in self.elsewhere]
+            rows = (
+                [("h1",)]
+                if "system.one" in sql
+                else [("h1", 1, sorted(self.elsewhere))]
+            )
         elif "formatQuerySingleLine" in sql:
             rows = [(" ".join(parameters["s"].split()),)]
         elif "system.tables" in sql:
