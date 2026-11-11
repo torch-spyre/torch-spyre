@@ -102,10 +102,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                         )
 
         def fn(t):
-            # aten.cumsum is a CPU fallback (torch_spyre/ops/fallbacks.py);
-            # aten.sin no longer is -- it has a Spyre decomposition now.
-            t = torch.cumsum(t, dim=0)  # fallback op
-            return t
+            # aten.isin is a CPU fallback (torch_spyre/ops/fallbacks.py);
+            # aten.cumsum no longer is -- its Spyre decomposition stays on
+            # device, so it emits no FallbackWarning to count.
+            return torch.isin(t, t[:1])  # fallback op
 
         before_decomps = copy.deepcopy(decompositions)
         before_post_autograd_decomposition_table = copy.deepcopy(
@@ -117,13 +117,23 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         with pytest.warns(torch_spyre.ops.fallbacks.FallbackWarning) as record:
             # run_eager=False: the eager path also triggers a FallbackWarning
-            # (cumsum dispatches to the CPU fallback kernel), and pytest.warns
+            # (isin dispatches to the CPU fallback kernel), and pytest.warns
             # overrides the module-level "once" filter, so we'd capture 2
             # warnings instead of 1.  This test only cares about decomposition
             # table integrity, so skip eager.
             compare_with_cpu(fn, x, cpu_compile=True, run_eager=False)
 
-        assert len(record) == 1, "Exactly one FallbackWarning should be encountered!"
+        # pytest.warns records every warning raised in the block, not just
+        # FallbackWarning (e.g. torch's once-per-process dynamo_pgo UserWarning
+        # when caches are force-disabled), so count only the category we check.
+        fallback_warnings = [
+            w
+            for w in record
+            if issubclass(w.category, torch_spyre.ops.fallbacks.FallbackWarning)
+        ]
+        assert len(fallback_warnings) == 1, (
+            "Exactly one FallbackWarning should be encountered!"
+        )
 
         after_decomps = copy.deepcopy(decompositions)
         after_post_autograd_decomposition_table = copy.deepcopy(

@@ -149,6 +149,19 @@ Physical-frame (PF) and virtual-frame (VF) execution are *not* allocator strateg
 | VF (Virtual Frame) | `FLEX_DEVICE=VF` | Virtualized hardware, used in multi-tenant deployments. |
 | MOCK | `FLEX_DEVICE=MOCK` | Software simulation with no hardware; device count comes from `AIU_WORLD_SIZE`. |
 
+### Pinned host memory
+
+The backend registers a host pinned-memory allocator through the PrivateUse1
+hooks interface (`getPinnedMemoryAllocator` and `isPinnedPtr` in
+`csrc/module.cpp`), backed by `SpyrePinnedAllocator` in
+`csrc/spyre_pinned_allocator.cpp`. This makes host pinned buffers available to
+PyTorch, so `pin_memory=True` host tensors and DataLoader pinning work with the
+Spyre backend, which speeds up host-to-LPDDR5 transfers.
+
+Pinning applies to host buffers only. A device tensor cannot be pinned: a
+`device="spyre"` allocation with `pin_memory=True` is rejected in
+`spyre_mem.cpp`.
+
 ## Eager Operations
 
 Eager kernels reach the Spyre dispatch key from two Python sources.
@@ -159,7 +172,7 @@ In-place variants are *derived* from that same list by `register_inplace_kernels
 
 The match requires the same overload name *and* an identical argument signature modulo the `(a!)` write-alias, so a same-named pair with different operand order is rejected rather than mis-paired: `pow_.Scalar(Tensor self, Scalar exponent)` versus `pow.Scalar(Scalar self, Tensor exponent)` would otherwise yield a kernel computing `other ** self`. The kernel also enforces PyTorch's in-place dtype contract, raising if the promoted result cannot be cast back to `self`.
 
-The second is CPU fallbacks in [`torch_spyre/ops/fallbacks.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/ops/fallbacks.py), registered through `@register_fallback` (or the `register_fallback_default` helper for plain pass-throughs). These cover the long tail: `arange`, `embedding`, `cumsum`, `tril`, `isin`, `bitwise_xor`/`bitwise_or`, `argmax`, and similar.
+The second is CPU fallbacks in [`torch_spyre/ops/fallbacks.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/ops/fallbacks.py), registered through `@register_fallback` (or the `register_fallback_default` helper for plain pass-throughs). These cover the long tail: `arange`, `embedding`, `tril`, `isin`, `bitwise_xor`/`bitwise_or`, `argmax`, and similar.
 
 Inductor decompositions registered through `register_spyre_decomposition` also dispatch eagerly when the underlying ATen op does not already have a PrivateUse1 kernel. See the [supported operations table](../user_guide/supported_operations.md) for the full list.
 

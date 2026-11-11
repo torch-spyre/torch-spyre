@@ -56,6 +56,7 @@ this file's rewrite sites depend on.
 from __future__ import annotations
 
 
+import contextlib
 import dataclasses
 import logging
 from typing import NamedTuple
@@ -72,6 +73,7 @@ from torch._inductor.ir import (
     Buffer,
     ComputedBuffer,
     FixedLayout,
+    Layout,
     MutableBox,
     MutationLayoutSHOULDREMOVE,
     Operation,
@@ -115,10 +117,10 @@ from .loop_tiling_common import (  # noqa: F401
     _LOOPS_INNER_FN_OPCOUNT_KEY,
     _LOOPS_INNER_FN_STR_KEY,
     _LogicalIterationSymbol,
-    _LoopVarRebaseHandler,
     _NameSwapHandler,
     _PointReadRebaseHandler,
     _REDUCTION_FREE_SYMS_KEY,
+    _ReadThroughLayout,
     _RetileLoadIndexHandler,
     _RetiledBufferInfo,
     _affine_point_read_index,
@@ -185,6 +187,32 @@ def validate_coarse_tile_groups(groups: list[tuple]) -> None:
                     "tiling."
                 )
             hint_id_to_group[hint_id] = group_idx
+
+
+def reject_nested_loops(groups: list[tuple], source: str) -> None:
+    """Raise ``Unsupported`` for a group that nests more than one loop level.
+
+    Span-overflow tiling and the allocator's own tiling build their groups for
+    ``coarse_tile_post_stickify``. That transform still takes several levels, and
+    the unit tests drive it that way. This refusal is for the lowering that is
+    meant to replace it, which builds one standalone ``LoopNode`` per group and is
+    NOT built yet: until it is, a nested group is refused here so that scope is
+    fixed before the replacement is written (#6088). Lifting it means building
+    nested nodes, one induction variable per level.
+
+    Called by the two production callers, not by the transform: it is also driven
+    directly with several levels by about 25 unit tests, and a ``for_each_tile``
+    nest never reaches either caller (``span_overflow_groups`` skips an op that
+    carries ``dim_hints``). A third caller of the transform would not be
+    covered. ``source`` names the caller in the message.
+    """
+    for group_ops, levels in groups:
+        if len(levels) > 1:
+            names = ", ".join(op.get_name() for op in group_ops)
+            raise Unsupported(
+                f"{source}: nested loop tiling is not supported in this release "
+                f"({len(levels)} levels over {names}; #6088)"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -2488,7 +2516,6 @@ def _propagate_mutation_write_back(
     loop_info = op.loop_info  # type: ignore[attr-defined]
     op_ranges = list(op.data.ranges)  # already divided by _apply_plan
     mut_target = op.layout.get_buffer()  # type: ignore[attr-defined]
-    full_sizes = list(mut_target.get_size())
 
     # A raw dim tiled to per-tile extent 1 is squeezed out of op_ranges
     # entirely -- index_vars_squeeze mints no d{i} symbol for it, so
@@ -2518,11 +2545,10 @@ def _propagate_mutation_write_back(
             i for i, dims in enumerate(loop_info.loop_tiled_dims) if d in dims
         ]
         if d not in squeeze_pos:
-            # Squeezed out of op's own write -- use mut_target's own
-            # (undivided) sizes for the host_stride, not op_ranges (a dim
-            # to the right that is itself tiled has already been divided
-            # down in op_ranges, which would undercount the stride).
-            host_stride = sympy.prod(full_sizes[d + 1 :])
+            # Squeezed out of op's own write -- use mut_target's own stride.
+            # Not a product of the sizes to the right: that is the stride
+            # only for a contiguous buffer (#6093).
+            host_stride = sympy.sympify(mut_target.get_stride()[d])
             running = sympy.Integer(1)
             for level_idx in reversed(levels_tiling_d):
                 squeezed_advance[level_idx].append((host_stride, running))
@@ -2692,7 +2718,10 @@ def _propagate_tiled_op(
 
     # Capture before _insert_copy_op overwrites op.layout.
     old_stride = tuple(op.layout.stride)
-    old_size = tuple(op.layout.size)
+    # The layout object every outside consumer's loader is bound to -- the one
+    # _divide_ranges shrank to the tile. Their reads are derived from full_buf
+    # through it (see _patch_consumers).
+    consumer_bound_layout = op.layout
 
     # Every cross-loop-group write always takes the copy-op path: the real
     # compute op keeps its own natural, input-derived, tile-sized layout,
@@ -2777,16 +2806,18 @@ def _propagate_tiled_op(
         # level.
         loop_info.output_tiled_dims = []
 
-    # Patch outside consumers and graph outputs to read full_buf.
+    # Patch outside consumers and graph outputs to read full_buf. An outside
+    # consumer belongs to another loop nest; full_buf, in HBM, is the only
+    # thing it shares with this one, so its read is derived from full_buf's
+    # layout, never from this op's tile.
     full_name = full_buf.get_name()
-    retile_info = _RetiledBufferInfo(
-        old_stride,
-        tuple(full_buf.layout.stride),
-        old_size,
-        tuple(full_buf.layout.size),
-    )
     _patch_consumers(
-        outside_consumers, read_lookup_name, full_name, operations, retile_info
+        outside_consumers,
+        read_lookup_name,
+        full_name,
+        operations,
+        producer_layout=consumer_bound_layout,
+        read_layout=full_buf.layout,
     )
     if is_graph_output:
         _patch_graph_outputs(propagation.graph_output_name or buf_name, full_buf)
@@ -3084,13 +3115,12 @@ def _insert_copy_op(
         read_level_extents: list[dict[int, Expr]] = [
             {} for _ in tiled_op_info.loop_tiled_dims
         ]
-        full_sizes_for_read = list(full_buf.get_size())
         for d in {d for level in tiled_op_info.loop_tiled_dims for d in level}:
             levels_tiling_d = [
                 i for i, dims in enumerate(tiled_op_info.loop_tiled_dims) if d in dims
             ]
             if d not in tiled_op_squeeze_pos:
-                host_stride = sympy.prod(full_sizes_for_read[d + 1 :])
+                host_stride = sympy.sympify(full_buf.get_stride()[d])
                 running = sympy.Integer(1)
                 for level_idx in reversed(levels_tiling_d):
                     read_squeezed_advance[level_idx].append((host_stride, running))
@@ -3157,28 +3187,12 @@ def _insert_copy_op(
         if d not in squeeze_pos:
             # Tiled down to extent 1 in copy_buf's own write -- no d{i}
             # symbol survives squeeze for _host_dim_to_index_symbol to find.
-            # full_buf's own canonical (squeezed-space) index coefficient
-            # for this raw dim -- product of the sizes strictly to its
-            # right, matching the units dep.index's surviving d{i} symbols
-            # already carry (Inductor mints those coefficients over the
-            # *unsqueezed* data.ranges, then squeeze only renumbers/drops
-            # symbols, never rescales them) -- not full_buf.layout.stride,
-            # which is a raw PyTorch memory stride in a different unit
-            # system that tiling_expr_to_device_expr's stride_map-based
-            # dimension selection cannot be compared against.
-            #
-            # Must use full_buf's own (pre-division) sizes here, NOT
-            # copy_ranges (== copy_buf's already-divided data.ranges): a
-            # dim strictly to the right of d that is ITSELF tiled by
-            # another loop level has already been divided down in
-            # copy_ranges, undercounting host_stride by that dim's
-            # division factor. full_buf.get_size() is allocated directly
-            # from full_ranges (see _allocate_full_buffer) in this same
-            # raw dim order and is never divided, so it gives the correct
-            # full extent for both tiled and untiled dims to the right of
-            # d (a no-op substitution for the untiled ones).
-            full_sizes = list(full_buf.get_size())
-            host_stride = sympy.prod(full_sizes[d + 1 :])
+            # full_buf's own stride for this raw dim: the units dep.index's
+            # surviving d{i} coefficients carry. Not the product of the sizes
+            # to its right, which is the stride only for a contiguous buffer
+            # (a permuted one steps by another dim's stride: #6093). full_buf
+            # is never divided, so its stride is the full-buffer one.
+            host_stride = sympy.sympify(full_buf.get_stride()[d])
             running = sympy.Integer(1)
             for level_idx in reversed(levels_tiling_d):
                 squeezed_advance[level_idx].append((host_stride, running))
@@ -3810,21 +3824,37 @@ def _patch_consumers(
     new_name: str,
     operations: list[Operation],
     retile_info: _RetiledBufferInfo | None = None,
+    *,
+    producer_layout: Layout | None = None,
+    read_layout: Layout | None = None,
 ) -> None:
-    """Redirect outside consumers from old_name to new_name.
+    """Redirect consumers from old_name to new_name.
 
-    Patches each consumer's inner_fn via NameSwapHandler (or
-    _NameAndIndexSwapHandler, when retile_info's old/new strides differ) and
-    reconstructs the ComputedBuffer to invalidate the sizes cache.
+    Patches each consumer's inner_fn with a NameSwapHandler and reconstructs
+    the ComputedBuffer to invalidate the sizes cache. The load index is
+    handled one of two ways:
 
-    retile_info carries the old (tile-local) and new (full-size) strides of
-    the renamed buffer, needed whenever new_name isn't addressing-equivalent
-    to old_name (e.g. a coarse-tiled dim's stride scaled up for the full
-    buffer) — plain NameSwapHandler forwards the load index unmodified,
-    which computes wrong addresses when the strides differ.
+    ``read_layout`` (with ``producer_layout``, the layout object the
+    consumers' loaders are bound to): the consumer is traced with
+    ``producer_layout`` presenting ``read_layout``'s host shape
+    (``_ReadThroughLayout``), so its index is derived from the buffer it now
+    reads. This is the copy-out path: an outside consumer belongs to another
+    loop nest, and the full buffer is the only thing the two nests share.
+
+    ``retile_info`` carries the old (tile-local) and new (full-size) strides
+    of the renamed buffer, and the index traced against the tile is rescaled
+    (``_NameAndIndexSwapHandler``) when they differ. This is the reduction
+    accumulator path, which redirects same-nest consumers as well.
     """
     if not consumers or old_name == new_name:
         return
+    assert (producer_layout is None) == (read_layout is None), (
+        "_patch_consumers: producer_layout and read_layout go together"
+    )
+    assert retile_info is None or read_layout is None, (
+        "_patch_consumers: a consumer's index is either derived from the read "
+        "buffer or rescaled from the tile, not both"
+    )
 
     from ..pass_utils import NameSwapHandler
 
@@ -3842,6 +3872,8 @@ def _patch_consumers(
             _info=retile_info if has_retile else None,
             _orig=orig_inner,
             _consumer=consumer,
+            _bound=producer_layout,
+            _read=read_layout,
         ):
             if _info is not None:
                 handler = _NameAndIndexSwapHandler(
@@ -3849,7 +3881,12 @@ def _patch_consumers(
                 )
             else:
                 handler = NameSwapHandler(V.ops, _map)
-            with V.set_ops_handler(handler):
+            read_through = (
+                _ReadThroughLayout(_bound, _read)
+                if _read is not None
+                else contextlib.nullcontext()
+            )
+            with read_through, V.set_ops_handler(handler):
                 return _orig(*args)
 
         object.__setattr__(consumer.data, "inner_fn", new_inner_fn)
