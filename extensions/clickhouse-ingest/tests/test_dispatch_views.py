@@ -17,6 +17,7 @@ matches for the same filters stored as a subscription, and seen_at / matched_at 
 late verdict after the events that landed before it."""
 
 import json
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from spyre_clickhouse_ingest.apply_schema import SCHEMA_DIR, SchemaApplier
@@ -380,6 +381,11 @@ def test_every_version_of_a_subscription_is_kept(db):
 
 
 def test_dispatch_targets_reads_the_latest_publish_only(db):
+    # Relative to now: dispatch_targets has a 30-day TTL.
+    def ago(hours):
+        at = datetime.now(timezone.utc) - timedelta(hours=hours)
+        return at.strftime("%Y-%m-%d %H:%M:%S.000")
+
     def publish(at, run, *lines):
         rows = [
             {
@@ -400,12 +406,12 @@ def test_dispatch_targets_reads_the_latest_publish_only(db):
         )
 
     publish(
-        "2026-10-10 10:00:00.000",
+        ago(3),
         "run-1",
         ("webhook", "https://hooks.example.com/", "example-webhook-token"),
     )
     publish(
-        "2026-10-11 10:00:00.000",
+        ago(2),
         "run-2",
         ("jenkins", "Example/folder/", ""),
         ("gha_dispatch", "example/", "example-app"),
@@ -425,5 +431,5 @@ def test_dispatch_targets_reads_the_latest_publish_only(db):
         },
     ]
     # An emptied list is one sentinel row: the view shows no targets, not the previous list.
-    publish("2026-10-12 10:00:00.000", "run-3", ("", "", ""))
+    publish(ago(1), "run-3", ("", "", ""))
     assert current() == []
