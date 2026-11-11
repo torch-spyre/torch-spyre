@@ -2509,10 +2509,15 @@ def compute_restickify_target_layout(
     assert _new_stride_from_dep == new_sd_host_stride, (
         f"new-side stride mismatch: {_diag}"
     )
-    assert _old_size_from_host == old_sd_host_size, f"old-side size mismatch: {_diag}"
-    assert _old_stride_from_dep == old_sd_host_stride, (
-        f"old-side stride mismatch: {_diag}"
-    )
+    # old_var is None when old stick is a constant (size-1 contraction dim);
+    # _host_size_stride_for_expr returns (1, 1) for that case, but scan gives None.
+    if old_var is not None:
+        assert _old_size_from_host == old_sd_host_size, (
+            f"old-side size mismatch: {_diag}"
+        )
+        assert _old_stride_from_dep == old_sd_host_stride, (
+            f"old-side stride mismatch: {_diag}"
+        )
     device_size = restickify_device_size(
         old_device_size,
         old_sd_outer_dim,
