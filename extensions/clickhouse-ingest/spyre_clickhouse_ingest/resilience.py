@@ -43,8 +43,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterator, Sequence
 
-# Nothing was stored: the quorum, read-only and parts-limit checks fail before the write.
-RETRY_CODES = frozenset({242, 252, 285, 286})
+# Nothing was stored: the quorum and read-only checks fail before the write.
+RETRY_CODES = frozenset({242, 285, 286})
+# Refused before the write, but a materialized view fed by the table may already hold the block.
+PARTS_LIMIT = 252
 # The block may be stored on some replicas or in some views: coordination, timeouts, network,
 # and a memory limit hit while a materialized view was being fed.
 AMBIGUOUS_CODES = frozenset({159, 209, 210, 241, 319, 999, 1000})
@@ -74,9 +76,16 @@ def _code(err: BaseException) -> int | None:
     return int(digits) if found and digits else None
 
 
-def classify(err: BaseException) -> str:
-    """'retry', 'ambiguous' or 'fatal'. The server's code beats the message text."""
+def classify(err: BaseException, feeds_views: bool = True) -> str:
+    """'retry', 'ambiguous' or 'fatal'. The server's code beats the message text.
+
+    TOO_MANY_PARTS (252) is a retry only when the table feeds no materialized view: with one, the
+    view's target can hit the limit after the source block landed. Callers that know the table
+    has no dependent views pass feeds_views=False.
+    """
     code = _code(err)
+    if code == PARTS_LIMIT:
+        return "ambiguous" if feeds_views else "retry"
     if code in FATAL_CODES:
         return "fatal"
     if code in RETRY_CODES:
@@ -281,6 +290,7 @@ def resilient_insert(
     probe: Callable[[Any], int] | None = None,
     sleep: Callable[[float], None] | None = None,
     clock: Callable[[], float] | None = None,
+    feeds_views: bool = True,
     log: Callable[[str], None] = lambda m: print(m, file=sys.stderr),
 ) -> Outcome:
     """Insert `rows` in batches, surviving quorum and Keeper failures.
@@ -311,8 +321,14 @@ def resilient_insert(
     size = max(1, policy.batch_rows)
     batches = [list(rows[i : i + size]) for i in range(0, len(rows), size)]
 
-    def park(n, batch, tok, ambiguous, why):
-        meta = {"ambiguous": ambiguous, "scope": scope}
+    wall = getattr(spool, "now", time.time)
+
+    def park(n, batch, tok, ambiguous, why, first_attempt_ago=0.0):
+        meta = {
+            "ambiguous": ambiguous,
+            "scope": scope,
+            "created": wall() - first_attempt_ago,
+        }
         if hasattr(spool, "put_any"):
             spool.put_any(table, columns, batch, tok, database, **meta)
         else:
@@ -329,6 +345,7 @@ def resilient_insert(
             continue
         start = now()
         attempt = 0
+        maybe_stored = False  # sticky: set by the first ambiguous error of this batch
         while True:
             elapsed = now() - start
             degraded = bool(
@@ -349,9 +366,10 @@ def resilient_insert(
                 out.degraded = out.degraded or degraded
                 break
             except Exception as err:
-                kind = classify(err)
+                kind = classify(err, feeds_views)
                 if kind == "fatal":
                     raise
+                maybe_stored = maybe_stored or kind == "ambiguous"
                 if kind == "ambiguous" and not replicated:
                     # A plain table cannot tell a stored block from a lost one.
                     out.ambiguous.append((n, repr(err)))
@@ -361,7 +379,14 @@ def resilient_insert(
                             f"resent ({err!r})",
                             out,
                         ) from err
-                    park(n, batch, tok, True, f"ambiguous, held: {err!r}")
+                    try:
+                        park(n, batch, tok, True, f"ambiguous, held: {err!r}")
+                    except Exception as full:
+                        raise WriteAmbiguous(
+                            f"{table}: batch {n}/{len(batches)} may be stored and could not "
+                            f"be spooled ({full!r})",
+                            out,
+                        ) from err
                     spilled = True
                     break
                 attempt += 1
@@ -374,7 +399,7 @@ def resilient_insert(
                             f"{table}: batch {n}/{len(batches)} not accepted within "
                             f"{policy.deadline_s:.0f}s ({err!r})"
                         ) from err
-                    park(n, batch, tok, kind == "ambiguous", repr(err))
+                    park(n, batch, tok, maybe_stored, repr(err), now() - start)
                     spilled = True
                     break
                 log(

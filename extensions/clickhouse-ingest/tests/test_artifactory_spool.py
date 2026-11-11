@@ -232,3 +232,36 @@ def test_list_ages_are_utc_whatever_the_local_timezone(monkeypatch):
     finally:
         monkeypatch.delenv("TZ")
         time.tzset()
+
+
+def test_a_failed_delete_or_release_raises_instead_of_pretending():
+    fake, a = make()
+    a.put("w/x.jsonl", b"1")
+
+    def broken(req, timeout=None, context=None):
+        raise urllib.error.HTTPError(req.full_url, 500, "boom", {}, io.BytesIO(b""))
+
+    a._open = broken
+    with pytest.raises(OSError):
+        a.delete("w/x.jsonl")
+    with pytest.raises(OSError):
+        a.release("w/x.jsonl")
+
+
+def test_a_refused_connection_is_unreachable_but_a_timeout_is_not():
+    from spyre_clickhouse_ingest.spool import Unreachable
+
+    def refused(req, timeout=None, context=None):
+        raise urllib.error.URLError(ConnectionRefusedError())
+
+    def timed_out(req, timeout=None, context=None):
+        raise TimeoutError()
+
+    fake, a = make()
+    a._open = refused
+    with pytest.raises(Unreachable):
+        a.put("w/x.jsonl", b"1")
+    a._open = timed_out
+    with pytest.raises(OSError) as ei:
+        a.put("w/x.jsonl", b"1")
+    assert not isinstance(ei.value, Unreachable)
