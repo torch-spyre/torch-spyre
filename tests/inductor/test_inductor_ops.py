@@ -1092,6 +1092,22 @@ _SCALED_BMM_REJECTED_SHAPES = {
     "3d_3d_batch_mismatch": ((8, 4, 128), (2, 128, 128)),
 }
 
+# One FP8 operand and one fp16 operand. Default dtype promotion would cast the fp16
+# one to FP8 before the lowering's FP8 operand check (#6203).
+# (op, mat1_shape, mat2_shape, fp16_operand)
+_FP8_SCALED_MM_FP16_OPERAND = {
+    "mat1": ("scaled_mm", (128, 128), (128, 128), "mat1"),
+    "mat2": ("scaled_mm", (128, 128), (128, 128), "mat2"),
+}
+_FP8_SCALED_BMM_FP16_OPERAND = {
+    "mat1": ("scaled_bmm", (1, 32, 128, 128), (1, 32, 128, 128), "mat1"),
+    "mat2": ("scaled_bmm", (1, 32, 128, 128), (1, 32, 128, 128), "mat2"),
+}
+_FP16_OPERAND_REJECTED = {
+    "mat1": "Expected FP8 input for mat1, got torch.float16",
+    "mat2": "Expected FP8 input for mat2, got torch.float16",
+}
+
 
 _SCALED_BMM_SHAPES = {
     # 3D @ 2D, one mat2 shared across the batch
@@ -9228,6 +9244,20 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 _SCALED_BMM_REJECTED_SHAPES, "bmm_fp8 with shapes"
             ),
         },
+        (
+            "test_fp8_scaled_mm_rejects_fp16_operand",
+            "test_fp8_matmul_rejects_fp16_operand_cpu",
+        ): {
+            "param_sets": _FP8_SCALED_MM_FP16_OPERAND,
+            "expect_raise": _FP16_OPERAND_REJECTED,
+        },
+        (
+            "test_fp8_scaled_bmm_rejects_fp16_operand",
+            "test_fp8_matmul_rejects_fp16_operand_cpu",
+        ): {
+            "param_sets": _FP8_SCALED_BMM_FP16_OPERAND,
+            "expect_raise": _FP16_OPERAND_REJECTED,
+        },
         ("test_fp8_scaled_bmm_kt_view", "test_fp8_scaled_bmm_kt_view_cpu"): {
             "param_sets": SCALED_BMM_QK_TESTS,
         },
@@ -14654,6 +14684,34 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             q_b = torch.ops.spyre.quantize_weight_fp8_with_scale(b, scale)
             return torch.ops.spyre.scaled_bmm(
                 q_a, q_b, scale_a=scale, scale_b=scale, out_dtype=torch.float16
+            )
+
+        _compile_and_run(spyre_fn, [a, b, scale], "spyre")
+
+    def test_fp8_matmul_rejects_fp16_operand_cpu(
+        self, op, mat1_shape, mat2_shape, fp16_operand
+    ):
+        """An FP8 matmul given one fp16 operand rejects it by name (#6203).
+
+        The other operand is quantized in the graph. promote(float16,
+        float8_e4m3fn) is float8_e4m3fn, so with default dtype promotion Inductor
+        cast the fp16 operand to FP8 before the lowering ran, the lowering's FP8
+        operand check never fired, and the caller got an unrelated stick
+        incompatibility error from the inserted cast.
+        """
+        a = torch.rand(mat1_shape, dtype=torch.float16)
+        b = torch.rand(mat2_shape, dtype=torch.float16)
+        scale = torch.tensor(1.0, dtype=torch.float16)
+
+        def spyre_fn(a, b, scale):
+            if fp16_operand != "mat1":
+                a = torch.ops.spyre.quantize_fp8_with_scale(a, scale)
+            if fp16_operand != "mat2":
+                b = torch.ops.spyre.quantize_weight_fp8_with_scale(b, scale)
+            if op == "scaled_mm":
+                return torch.ops.spyre.scaled_mm(a, b, out_dtype=torch.float16)
+            return torch.ops.spyre.scaled_bmm(
+                a, b, scale_a=scale, scale_b=scale, out_dtype=torch.float16
             )
 
         _compile_and_run(spyre_fn, [a, b, scale], "spyre")
