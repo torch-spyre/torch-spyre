@@ -1032,6 +1032,120 @@ def test_split_preferences_share_the_weight_of_one_call(monkeypatch):
         )
 
 
+def test_split_preferences_use_one_call_with_a_symbolic_trip(monkeypatch):
+    """A symbolic trip count still prices the preferences on one call: the
+    stationary ``[T, N]`` and stacked ``[E, T, N]`` forms of an ``E``-trip loop,
+    with ``E`` a free symbol, both cost ``E`` one-call shared-weight preferences
+    rather than the stacked form keeping ``B = E``. ``T`` is in decode scope, so
+    a stacked form priced on ``B = E`` would also lose the decode-scope exemption
+    from the M-tile underfill preference."""
+    import sympy
+
+    from torch_spyre._inductor import cost_model as cm
+    from torch_spyre._inductor import work_division as wd
+    from torch_spyre._inductor.cost_model import ArgTraffic, OpFeatures
+
+    monkeypatch.setattr(cm.config, "sencores", 32)
+    E = sympy.Symbol("s0", integer=True, positive=True)
+    T, N, K, m, n = 16, 128, 512, 4, 8
+
+    def record(out_elems):
+        return OpFeatures(
+            name="mm",
+            is_reduction=True,
+            dtype_bytes=2,
+            args=[ArgTraffic("arg1", "input", False, K * N)],
+            is_matmul=True,
+            out_elems=out_elems,
+            cores=m * n,
+            loop_trip=E,
+            matmul_macs=E * T * N * K,
+            matmul_rows_per_core=T // m,
+            matmul_cols_per_core=N // n,
+            matmul_m_split=m,
+            matmul_n_split=n,
+            matmul_a_bytes=T * K * 2,
+            matmul_b_bytes=K * N * 2,
+        )
+
+    one_call = wd._matmul_split_preference_us(
+        (1, 1), (T, m), (N, n), (K, 1), 32, shared_weight=True,
+        include_batch_split=False,
+    )  # fmt: skip
+    # Axes as ``_matmul_axes_for_split_cost`` describes one pass over each buffer.
+    forms = [
+        (record(T * N), ((1, 1), (T, m), (N, n), (K, 1), True)),
+        (record(E * T * N), ((E, 1), (T, m), (N, n), (K, 1), False)),
+    ]
+    for feature, axes in forms:
+        preference = cm._matmul_split_preference_us(feature, axes)
+        assert sympy.simplify(preference - E * one_call) == 0
+
+
+def test_split_preferences_branch_on_an_undecided_whole_call_batch(monkeypatch):
+    """A symbolic batch SymPy cannot prove whole (``s0`` buffers over 2 trips is
+    ``s0 / 2`` per call) branches on it: substituting an even ``s0`` prices one
+    call of ``s0 / 2``, an odd one keeps the buffer batch and sharing."""
+    import sympy
+
+    from torch_spyre._inductor import cost_model as cm
+    from torch_spyre._inductor import work_division as wd
+    from torch_spyre._inductor.cost_model import ArgTraffic, OpFeatures
+
+    monkeypatch.setattr(cm.config, "sencores", 32)
+    s = sympy.Symbol("s0", integer=True, positive=True)
+    # K >> N with N split, so sharing and the decode-scope batch both move the price.
+    T, N, K, m, n, trips = 16, 128, 2048, 4, 8, 2
+    feature = OpFeatures(
+        name="mm",
+        is_reduction=True,
+        dtype_bytes=2,
+        args=[ArgTraffic("arg1", "input", False, K * N)],
+        is_matmul=True,
+        out_elems=s * T * N,
+        cores=m * n,
+        loop_trip=trips,
+        matmul_macs=s * T * N * K,
+        matmul_rows_per_core=T // m,
+        matmul_cols_per_core=N // n,
+        matmul_m_split=m,
+        matmul_n_split=n,
+        matmul_a_bytes=T * K * 2,
+        matmul_b_bytes=K * N * 2,
+    )
+    preference = cm._matmul_split_preference_us(
+        feature, ((s, 1), (T, m), (N, n), (K, 1), False)
+    )
+
+    def priced(B, shared):
+        return trips * wd._matmul_split_preference_us(
+            (B, 1), (T, m), (N, n), (K, 1), 32, shared_weight=shared,
+            include_batch_split=False,
+        )  # fmt: skip
+
+    # The even cases tell a call batch from the buffer batch and its sharing.
+    assert priced(1, True) not in (priced(2, True), priced(2, False))
+    assert priced(2, False) != priced(2, True)
+    for value, B, shared in ((2, 1, True), (4, 2, False), (3, 3, False)):
+        assert float(preference.subs(s, value)) == pytest.approx(priced(B, shared))
+
+
+def test_split_preferences_branch_on_a_symbolic_shared_weight():
+    """A symbolic sharing condition gives a ``Piecewise`` over both branches."""
+    import sympy
+
+    from torch_spyre._inductor import work_division as wd
+
+    s = sympy.Symbol("s0", integer=True, positive=True)
+    axes = (s, 1), (64, 4), (128, 8), (512, 1)
+    preference = wd._matmul_split_preference_us(*axes, 32, shared_weight=sympy.Eq(s, 1))
+    for value, shared in ((1, True), (2, False)):
+        expected = wd._matmul_split_preference_us(
+            (value, 1), *axes[1:], 32, shared_weight=shared
+        )
+        assert float(preference.subs(s, value)) == pytest.approx(expected)
+
+
 def test_an_uneven_call_batch_keeps_the_buffer_batch(monkeypatch):
     """A buffer batch that is not a whole number of calls is not rounded to a
     made-up batch: a ``[6, T, N]`` buffer over 4 trips (1.5 per call) keeps

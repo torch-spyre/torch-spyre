@@ -207,6 +207,11 @@ from .work_division import (
     max,
     log2,
     isinf,
+    eq,
+    ge,
+    piecewise,
+    _and,
+    _floor,
     _is_sym,
 )
 from . import config
@@ -2113,10 +2118,12 @@ def _matmul_split_preference_us(o, axes) -> float | sympy.Expr:
     same body chose different preference branches (the decode-scope exemption,
     the shared-weight shape terms) and were priced milliseconds apart.
 
-    A symbolic trip count or pass count, or a buffer batch that is not a whole
-    number of calls, keeps the buffer-level batch and sharing rather than a
-    rounded one. ``_matmul_ns_upstream`` and ``explain`` both call this, so they
-    cannot drift.
+    A buffer batch that is not a whole number of calls keeps the buffer-level
+    batch and sharing rather than a rounded one. With a symbolic trip
+    count, pass count or batch the test is a SymPy condition, so the batch and
+    the sharing flag become ``Piecewise`` expressions over it.
+    ``_matmul_ns_upstream`` and ``explain`` both call this, so they cannot
+    drift.
 
     Operands are priced at ``_DTYPE_BYTES``, as the execution estimate here is:
     the feature extractor builds matmul records only for ``BATCH_MATMUL_OP``, not
@@ -2125,14 +2132,21 @@ def _matmul_split_preference_us(o, axes) -> float | sympy.Expr:
     (B, b), m_axis, n_axis, k_axis, shared_weight = axes
     trip = max(1, getattr(o, "loop_trip", 1) or 1)
     passes = _matmul_passes(o, k_axis[0])
-    if not _is_sym(trip, passes, B):
-        call_batch = float(B) * float(passes) / float(trip)
-        call_B = round(call_batch)
-        if call_B >= 1 and math.isclose(call_batch, call_B, rel_tol=1e-9):
-            B = call_B
-            shared_weight = B == 1 or any(
-                a.role == "input" and a.broadcast for a in o.args
-            )
+    broadcast = any(a.role == "input" and a.broadcast for a in o.args)
+    call_batch = B * passes / trip
+    # A whole number of at least one call: a Python bool when known, otherwise a
+    # SymPy condition the branches below (and the preferences) carry.
+    whole = _and(ge(call_batch, 1), eq(_floor(call_batch), call_batch))
+    B = piecewise((call_batch, whole), (B, True))
+    shared_weight = (
+        True
+        if broadcast
+        else piecewise((eq(call_batch, 1), whole), (shared_weight, True))
+    )
+    if isinstance(shared_weight, sympy.Piecewise):
+        # A Piecewise of conditions is not a SymPy Boolean, so ``sympy.And``
+        # (``_in_decode_delivery_scope``) rejects it; the ITE form is one.
+        shared_weight = shared_weight.rewrite(sympy.ITE)
     return trip * _wd_matmul_split_preference_us(
         (B, b),
         m_axis,
