@@ -167,19 +167,35 @@ every existing table a pending migration inserts into, on the connected server b
 and raises naming the ones that are not Replicated. A table only a view reads from is not tracked:
 a migration that inserts into a table and then reads it through a view is not synced in between.
 
+The check sees only what the login's `system.tables` shows. A pending migration that inserts into
+a table the login cannot see, or into another database, is refused rather than skipped. `--check`
+also runs `SYSTEM SYNC REPLICA` on the ledger, so a read-only login needs that grant too. Rows a
+migration inserted are synced before any later statement, in the same or a later migration, reads
+that table by name.
+
 If a migration still fails part-way (a sync times out, a replica goes down), the DDL it started may
-keep running on the other replicas, and its ledger row is not written. The migrations that
-backfill (`006`, `007`) are not rerunnable, so do not rerun them: look at which statements ran
-(`system.query_log`), run the remaining statements of the file by hand on the connected replica,
-then record it:
+keep running on the other replicas, and its ledger row is not written. A migration marked
+`-- RERUNNABLE` (check with `grep -l RERUNNABLE schema/migrations/*.sql`; today every backfill
+except `006`) can be run again with `--cluster <c> --rerun <file>`, which first re-checks that the
+tables it inserts into are Replicated. An unmarked one (`006`) must not be rerun: look at what ran
+(`system.query_log`), and run the remaining statements by hand on the connected replica exactly as
+the applier would have sent them, with their `ON CLUSTER` and `SYNC`. Print them with:
+
+```bash
+python -c "from spyre_clickhouse_ingest.apply_schema import SchemaApplier as S; [print(sql + ';') for _, sql in S.migration_statements(open('<path>').read(), '<cluster>', '<db>')]"
+```
+
+Then record it with the checksum from this one-liner:
+
+```bash
+python -c "from spyre_clickhouse_ingest.apply_schema import SchemaApplier as S; print(S.checksum(open('<path>').read()))"
+```
 
 ```sql
 INSERT INTO schema_migrations (migration_id, checksum) VALUES ('<file>.sql', '<checksum>')
 ```
 
-with the checksum from `python -c "from spyre_clickhouse_ingest.apply_schema import SchemaApplier
-as S; print(S.checksum(open('<path>').read()))"`. A migration marked `-- RERUNNABLE` can instead be
-run again with `--rerun`. Syncs wait up to an hour (`distributed_ddl_task_timeout`).
+Syncs wait up to an hour (`distributed_ddl_task_timeout`).
 
 What it does not do: convert an existing plain table to Replicated, lock against two appliers
 running at once (run it from one place), or make `INSERT`s quorum writes. The tests run on

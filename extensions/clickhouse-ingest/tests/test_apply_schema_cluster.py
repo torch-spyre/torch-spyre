@@ -796,7 +796,7 @@ def test_the_sync_target_is_quoted_qualified_and_has_a_long_timeout(tmp_path):
         tmp_path,
         {"10-a.sql": T + ";"},
         {
-            "001-x.sql": "INSERT INTO `t x` SELECT 1;\nINSERT INTO other.a SELECT 1;\nDELETE FROM a WHERE 1 IN (SELECT x FROM `t x`);\nSELECT 1 FROM a;"
+            "001-x.sql": "INSERT INTO `t x` SELECT 1;\nINSERT INTO db.a SELECT 1;\nDELETE FROM a WHERE 1 IN (SELECT x FROM `t x`);\nSELECT 1 FROM a;"
         },
     )
     SchemaApplier.apply(
@@ -808,7 +808,7 @@ def test_the_sync_target_is_quoted_qualified_and_has_a_long_timeout(tmp_path):
     )
     syncs = {c: st for c, st in sent if c.startswith("SYSTEM SYNC REPLICA ON CLUSTER")}
     assert f"SYSTEM SYNC REPLICA ON CLUSTER {CLUSTER} `{DB}`.`t x`" in syncs
-    assert f"SYSTEM SYNC REPLICA ON CLUSTER {CLUSTER} other.a" in syncs
+    assert f"SYSTEM SYNC REPLICA ON CLUSTER {CLUSTER} db.a" in syncs
     assert all(st == SchemaApplier.SYNC_SETTINGS for st in syncs.values())
 
 
@@ -887,3 +887,103 @@ def test_no_preflight_query_is_made_without_a_cluster(tmp_path):
     )
     assert not any("SYSTEM" in c for c in server.log)
     assert not any("has(" in q or "clusterAllReplicas" in q for q in server.queries)
+
+
+# ---- cluster mode: reruns, carry-over, visibility; non-cluster drift ------------------
+
+
+def _mig(tmp_path, files, migrations, live):
+    server = FakeServer(live)
+    d = _schema(tmp_path, files, migrations)
+    return server, SchemaApplier.selected_files(d), SchemaApplier.migration_files(d)
+
+
+def test_rerun_checks_tables_are_replicated_before_running_anything(tmp_path):
+    server = FakeServer({"a": T, "schema_migrations": SchemaApplier.LEDGER_DDL})
+    p = tmp_path / "001-x.sql"
+    p.write_text("-- RERUNNABLE\nINSERT INTO a SELECT 1;\nDELETE FROM a WHERE 1;")
+    with pytest.raises(ValueError, match="not Replicated.*: a "):
+        SchemaApplier.rerun(server, p, CLUSTER, DB)
+    assert server.log == []
+    server = FakeServer({"a": replicated(T, DB, "a")})
+    SchemaApplier.rerun(server, p, CLUSTER, DB)
+    assert f"SYSTEM SYNC REPLICA ON CLUSTER {CLUSTER} `{DB}`.a" in server.log
+
+
+def test_rows_left_unsynced_by_one_migration_are_synced_before_the_next_reads_them(
+    tmp_path,
+):
+    server, f, m = _mig(
+        tmp_path,
+        {"10-a.sql": T + ";"},
+        {"001-x.sql": "INSERT INTO a SELECT 1;", "002-y.sql": "DELETE FROM a WHERE 1;"},
+        {},
+    )
+    SchemaApplier.apply(server, DB, f, m, CLUSTER)
+    log = server.log
+    sync = f"SYSTEM SYNC REPLICA ON CLUSTER {CLUSTER} `{DB}`.a"
+    assert (
+        log.index("INSERT INTO a SELECT 1")
+        < log.index(sync)
+        < next(i for i, c in enumerate(log) if c.startswith("DELETE FROM a"))
+    )
+
+
+def test_insert_into_function_is_not_a_sync_target():
+    assert (
+        SchemaApplier.insert_target("INSERT INTO FUNCTION remote('h', db, t) SELECT 1")
+        == ""
+    )
+
+
+def test_an_insert_into_another_database_is_refused(tmp_path):
+    server, f, m = _mig(
+        tmp_path,
+        {"10-a.sql": T + ";"},
+        {"001-x.sql": "INSERT INTO other.a SELECT 1;"},
+        {},
+    )
+    with pytest.raises(ValueError, match="outside"):
+        SchemaApplier.apply(server, DB, f, m, CLUSTER)
+    assert server.log == [] or not any(c.startswith("CREATE") for c in server.log)
+
+
+def test_an_insert_into_a_table_the_login_cannot_see_is_refused(tmp_path):
+    server, f, m = _mig(
+        tmp_path,
+        {"10-a.sql": T + ";"},
+        {"001-x.sql": "INSERT INTO ghost SELECT 1;"},
+        {},
+    )
+    with pytest.raises(ValueError, match="ghost.*not visible"):
+        SchemaApplier.apply(server, DB, f, m, CLUSTER)
+    assert not any(c.startswith("CREATE") for c in server.log)
+
+
+def test_an_if_table_exists_guarded_insert_is_not_refused(tmp_path):
+    server, f, m = _mig(
+        tmp_path,
+        {"10-a.sql": T + ";"},
+        {"001-x.sql": "-- IF TABLE EXISTS: ghost\nINSERT INTO ghost SELECT 1;"},
+        {},
+    )
+    SchemaApplier.apply(server, DB, f, m, CLUSTER)
+
+
+def test_a_comment_only_change_is_still_drift_without_a_cluster():
+    plain = "CREATE TABLE t (a UInt8) ENGINE = MergeTree ORDER BY a"
+    obj = _obj(plain)
+    for stored in (plain + " COMMENT 'x'", plain + " COMMENT 'y'"):
+        assert SchemaApplier.differs(FormatOnly(), obj, stored, "db") != ""
+    commented = _obj(plain + " COMMENT 'x'")
+    assert SchemaApplier.differs(FormatOnly(), commented, plain, "db") != ""
+    assert (
+        SchemaApplier.differs(FormatOnly(), commented, plain + " COMMENT 'x'", "db")
+        == ""
+    )
+
+
+def test_a_comment_on_a_converted_table_is_still_ignored():
+    plain = "CREATE TABLE t (a UInt8) ENGINE = MergeTree ORDER BY a"
+    conv = replicated(plain, "db", "t") + " COMMENT 'converted'"
+    assert SchemaApplier.differs(FormatOnly(), _obj(plain), conv, "db") == ""
