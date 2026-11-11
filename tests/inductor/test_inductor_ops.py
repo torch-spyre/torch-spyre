@@ -784,11 +784,11 @@ TO_DTYPE_OP_RESCALE_REJECTED = {
     for shape in _RESCALE_REJECTED_SHAPES
 }
 
-# After type conversion elements are staggered on device, in D2H path they are restored
+# After type conversion elements are staggered on device, in DCI path they are restored
 # to STANDARD format except for these cases.  fp16/bf16 -> fp32: a 16-bit stick dim
 # narrower than 64 is converted to a single fp32 stick, so half of each stick pair has
-# nowhere to go and the D2H restore rejects it instead of reading back wrong data.
-_D2H_PAIR_REJECTION = "D2H requires whole stick pairs along the stick dimension"
+# nowhere to go and the DCO restore rejects it instead of reading back wrong data.
+_D2H_PAIR_REJECTION = "requires whole stick pairs"
 _D2H_PAIR_REJECTED_SHAPES = ("4x16", "4x32", "4x63")
 TO_DTYPE_OP_D2H_PAIR_REJECTED = {
     f"{src}_to_float32_{shape}"

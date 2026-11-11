@@ -895,7 +895,7 @@ def _build_ea_dci_tests(is_h2d: bool = False):
         (8, 16, 160),
     }
 
-    _D2H_XFAIL_SHAPES = _XFAIL_SHAPES | {(8, 16, 100)}
+    _D2H_XFAIL_SHAPES = _XFAIL_SHAPES
     _H2D_XFAIL_SHAPES = _XFAIL_SHAPES | {(68,), (4, 68)}
 
     EA = ElementArrangement
