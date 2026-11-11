@@ -21,7 +21,10 @@ host_timeline; any subset) and, from the run dir, the artifact (`spyre_artifact.
 flags), the env fingerprint and an optional `kernel_cost*.jsonl`. Raw traces are not analyzed here.
 Rows: record_type trace_phase | trace_step | trace_kernel | compile_pass, linked to the artifact
 by a performance verdict, as vllm.py's rows are.
-Counts outside UInt32 are stored as 0 (not stated); a duplicate (phase, kernel) keeps its first row.
+Counts outside UInt32 are stored as 0 (not stated); a row whose benchmark id repeats an earlier one's
+(a phase or kernel differing only in case or spacing) is dropped.
+`arch unresolved` (no arch in the artifact block) rejects a live run, and also a `--dry-run` when
+CLICKHOUSE_HOST is set; a dry-run without a host reports it and carries on.
 Re-ingesting under the same `<id12>:<label>` reports 'duplicate' even if the workload differs, and a
 failure after the first 5000-row batch leaves a partial run that later reads as duplicate (the shared
 writer's behaviour).
@@ -40,7 +43,7 @@ from pathlib import Path
 from typing import Any
 
 from . import benchmeta
-from .identity import RunId
+from .identity import BenchmarkId, RunId
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +51,7 @@ REPORT_KIND = "vllm-trace"
 # schema/62-benchmark-verdicts.sql excludes exactly these from the regression verdicts.
 RECORD_TYPES = ("trace_phase", "trace_step", "trace_kernel", "compile_pass")
 RT_PHASE, RT_STEP, RT_KERNEL, RT_COMPILE = RECORD_TYPES
+MAX_LABEL = 128
 MAX_COUNT = 2**32 - 1  # iterations is UInt32
 MAX_F32 = 3.4e38  # artifact_results.duration_s is Float32
 BACKEND = "spyre"
@@ -295,8 +299,15 @@ def load(run_dir, analyzed=None, label="", **workload) -> dict:
     )
     # Harness bundles all sit in a dir named `trace`: their manifest names the run.
     label = str(label or manifest.get("label") or run.name)
-    if not label or "/" in label or "\\" in label or ".." in label or "\0" in label:
-        raise TraceError(f"unsafe label {label!r}: no path separators, '..' or NUL")
+    if (
+        not label
+        or len(label) > MAX_LABEL
+        or label == ".."
+        or any(c in label for c in "/\\\0")
+    ):
+        raise TraceError(
+            f"unsafe label {label[:40]!r}: 1-{MAX_LABEL} chars, no path separator or NUL, not '..'"
+        )
     found = {}
     for kind in ("res", "roof", "host"):
         for p in (ana / f"{label}.{kind}.json", ana / f"{kind}.json"):
@@ -442,11 +453,13 @@ def entries(ctx: dict, bundle_url: str = "") -> list[dict]:
     def add(suffix, props, measurements, iterations=0, extra=None):
         if not measurements:
             return
-        if suffix in seen:
+        props = {**shared, **props}
+        # The writer merges rows of one benchmark_id and sums their iterations: keep ids unique.
+        bid = BenchmarkId.derive(COMPONENT, f"{config}:{suffix}", [], props, ID_KEYS)
+        if bid in seen:
             log.warning("Duplicate %s:%s — first row kept", config, suffix)
             return
-        seen.add(suffix)
-        props = {**shared, **props}
+        seen.add(bid)
         out.append(
             {
                 "name": f"{config}:{suffix}",
@@ -624,7 +637,7 @@ def main(argv=None) -> int:
             raise TraceError(
                 "no artifact: no spyre_artifact.json/template.json/manifest.json, no --artifact"
             )
-    except TraceError as err:
+    except (TraceError, OSError) as err:
         print(json.dumps({"status": "rejected", "reason": str(err)}))
         return 2
 

@@ -515,10 +515,23 @@ def test_a_non_utf8_or_deeply_nested_file_is_skipped_with_a_warning_naming_it(
     assert "w1.res.json" in caplog.text and "w1.host.json" in caplog.text
 
 
-@pytest.mark.parametrize("label", ["../x", "a/b", "a\\b", "x\0y", "a..b"])
+@pytest.mark.parametrize("label", ["../x", "a/b", "a\\b", "x\0y", "..", "a" * 129])
 def test_an_unsafe_label_is_rejected(label):
     with pytest.raises(vllm_trace.TraceError, match="unsafe label"):
         vllm_trace.load(FLEET / "out" / "w1", FLEET / "rep", label)
+
+
+def test_dots_inside_a_label_are_fine():
+    assert vllm_trace.load(FLEET / "out" / "w1", FLEET / "rep", "w1")["label"] == "w1"
+    for label in ("v1..2", "a" * 128):
+        with pytest.raises(vllm_trace.TraceError, match="no w1|no v1|no aaa"):
+            vllm_trace.load(FLEET / "out" / "w1", FLEET / "rep", label)
+
+
+def test_a_very_long_label_is_rejected_by_the_cli_not_a_traceback(capsys):
+    rc = cli(["vllm-trace", str(FLEET / "out" / "w1"), "--analyzed", str(FLEET / "rep"),
+              "--label", "x" * 300, "--dry-run"])  # fmt: skip
+    assert rc == 2 and json.loads(capsys.readouterr().out)["status"] == "rejected"
 
 
 def test_an_unsafe_manifest_label_is_rejected(tmp_path):
@@ -562,6 +575,48 @@ def test_the_verdict_view_excludes_exactly_the_record_types():
     sql = (
         Path(__file__).parents[1] / "schema" / "62-benchmark-verdicts.sql"
     ).read_text()
-    m = re.search(r"record_type NOT IN \(([^)]*)\)", sql)
+    clause = sql[sql.index("FROM v_benchmark_results_enriched") :]
+    m = re.search(r"record_type NOT IN \(([^)]*)\)", clause)
     assert m and tuple(re.findall(r"'([^']+)'", m[1])) == vllm_trace.RECORD_TYPES
     assert set(vllm_trace.RECORD_TYPES) == set(TRACE_TYPES)
+
+
+def _stored_facts(rows):
+    """The benchmark_runs rows the writer's merge produces for these entries."""
+    from spyre_clickhouse_ingest import writer
+
+    got = []
+
+    def flush(cls, client, db, idents, facts, *a, **k):
+        got.extend(facts)
+        return len(facts)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(writer.BenchmarkWriter, "_flush", classmethod(flush))
+        writer.insert_benchmarks(
+            None, "db", vllm_trace.COMPONENT, "rid", rows, report_kind="vllm-trace"
+        )
+    return got
+
+
+@pytest.mark.parametrize("variant", ["Decode", "decode "])
+def test_case_variant_phases_never_sum_into_an_unstorable_count(variant, caplog):
+    ctx = fleet_ctx()
+    ctx["res"]["phases"]["decode"]["n_samples"] = 4_000_000_000
+    ctx["res"]["phases"][variant] = {**ctx["res"]["phases"]["decode"]}
+    facts = _stored_facts(vllm_trace.entries(ctx))
+    _encodes(facts)
+    assert max(f["iterations"] for f in facts) == 4_000_000_000
+    assert "Duplicate" in caplog.text
+
+
+def test_case_variant_kernel_keys_never_merge_two_kernels():
+    ctx = fleet_ctx()
+    k = ctx["roof"]["kernels"][0]
+    ctx["roof"]["kernels"][0]["calls"] = 3_000_000_000
+    ctx["roof"]["kernels"].append(
+        {**k, "key": k["key"].upper(), "calls": 3_000_000_000}
+    )
+    facts = _stored_facts(vllm_trace.entries(ctx))
+    _encodes(facts)
+    assert len(facts) == len(vllm_trace.entries(fleet_ctx()))
