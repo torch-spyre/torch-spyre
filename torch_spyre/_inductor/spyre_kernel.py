@@ -390,10 +390,15 @@ class SpyreOpFuncs:
         return PointwiseOp("tanh", [x])
 
     @staticmethod
-    def to_dtype(x, dtype, src_dtype, use_compute_types=False):
+    def to_dtype(x, dtype, src_dtype=None, use_compute_types=False):
         # PT 2.12 passes a new `use_compute_types` kwarg through OpsHandler.
         # Spyre maps directly to fixed hardware ops via DtypeOpTable and
         # cannot honor compute-type promotion, so accept and ignore.
+        if src_dtype is None:
+            # OpsHandler.to_dtype declares src_dtype optional, and some upstream
+            # Inductor lowerings omit it. The hardware op is chosen from the
+            # (src_dtype, dtype) pair, so the conversion cannot be lowered (#5783).
+            raise Unsupported(f"type conversion to {dtype} without a source dtype")
         assert dtype != src_dtype
 
         if src_dtype == torch.bool:
