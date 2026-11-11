@@ -2419,6 +2419,36 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     128,
                     0,
                 ),
+                "2d_k8_dim1_fp16": (
+                    unique_randn_along_dim((128, 64), dim=1),
+                    8,
+                    1,
+                ),
+                "2d_k32_dim1_fp16": (
+                    unique_randn_along_dim((128, 64), dim=1),
+                    32,
+                    1,
+                ),
+                "2d_k8_dim0_fp32": (
+                    unique_randn_along_dim((128, 64), dim=0, dtype=torch.float32),
+                    8,
+                    0,
+                ),
+                "3d_k8_dim1_fp32": (
+                    unique_randn_along_dim((4, 128, 64), dim=1, dtype=torch.float32),
+                    8,
+                    1,
+                ),
+                "3d_k32_dim1_fp32": (
+                    unique_randn_along_dim((4, 128, 64), dim=1, dtype=torch.float32),
+                    32,
+                    1,
+                ),
+                "3d_k8_dim2_fp16": (
+                    unique_randn_along_dim((4, 128, 64), dim=2),
+                    8,
+                    2,
+                ),
                 # Leading-dim-1 shapes where the reduction dim is the
                 # tensor's only non-trivial axis, so the natural device
                 # layout would otherwise stick the reduction dim itself.
