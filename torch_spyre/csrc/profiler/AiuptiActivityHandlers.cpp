@@ -532,15 +532,72 @@ void AiuptiActivityProfilerSession::handleRuntimeActivity(
     case AIUPTI_RUNTIME_TRACE_CBID_FILE_TRANSFER_FTOM:
     case AIUPTI_RUNTIME_TRACE_CBID_DATA_TRANSFER_DTOH:
     case AIUPTI_RUNTIME_TRACE_CBID_DATA_TRANSFER_HTOD:
+    case AIUPTI_RUNTIME_TRACE_CBID_P2P_RDMA_MULTICAST:
+    case AIUPTI_RUNTIME_TRACE_CBID_STREAM_DMA_H2D:
+    case AIUPTI_RUNTIME_TRACE_CBID_STREAM_DMA_D2H:
+    case AIUPTI_RUNTIME_TRACE_CBID_STREAM_COPY_RAW:
+    case AIUPTI_RUNTIME_TRACE_CBID_STREAM_SYNC_FILL:
+    case AIUPTI_RUNTIME_TRACE_CBID_STREAM_ASYNC_FILL:
+    case AIUPTI_RUNTIME_TRACE_CBID_STREAM_HOST_COMPUTE:
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULE_DMA_H2D:
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULE_DMA_D2H:
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULE_FILL:
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULE_P2P_FIRMWARE_SIGNAL:
       runtime_activity->addMetadata("bytes", activity->data);
+      break;
+
+    case AIUPTI_RUNTIME_TRACE_CBID_STREAM_COMPUTE:
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULE_COMPUTE:
+      runtime_activity->addMetadata("num_tensors", activity->data);
+      break;
+
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULER_ENQUEUE_OPERATION:
+      runtime_activity->addMetadata("queue_depth", activity->data);
+      break;
+
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULER_PLAN_HAZARDS:
+      runtime_activity->addMetadata("num_edges", activity->data);
+      break;
+
+    case AIUPTI_RUNTIME_TRACE_CBID_STREAM_SYNCHRONIZE:
+    case AIUPTI_RUNTIME_TRACE_CBID_STREAM_IDLE_WAIT:
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULER_SYNCHRONIZE:
+      runtime_activity->addMetadata("pending_at_entry", activity->data);
+      break;
+
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULER_RELEASE_STREAM:
+      runtime_activity->addMetadata("dropped_ops", activity->data);
+      break;
+
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULER_PROCESS_OPERATION:
+      runtime_activity->addMetadata("op_type", activity->data);
+      break;
+
+    case AIUPTI_RUNTIME_TRACE_CBID_STREAM_EVENT_SIGNAL:
+    case AIUPTI_RUNTIME_TRACE_CBID_STREAM_EVENT_WAIT:
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULER_EVENT_SIGNAL:
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULER_EVENT_WAIT:
+      runtime_activity->addMetadata("event_key", activity->data);
+      break;
+
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULE_P2P_FIRMWARE_WAIT:
+      runtime_activity->addMetadata("expected_count", activity->data);
+      break;
+
+    case AIUPTI_RUNTIME_TRACE_CBID_STREAM_NULL_OP:
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULE_NULL_OP:
+      runtime_activity->addMetadata("pipeline_barrier",
+                                    (activity->data & 1) != 0 ? 1 : 0);
+      runtime_activity->addMetadata("skip_hazard",
+                                    (activity->data & 2) != 0 ? 1 : 0);
+      break;
+
+    case AIUPTI_RUNTIME_TRACE_CBID_STREAM_HOST_CALLBACK:
+      runtime_activity->addMetadata("pipeline_barrier", activity->data);
       break;
 
     case AIUPTI_RUNTIME_TRACE_CBID_ISSUE_BARRIER:
       runtime_activity->addMetadata("fence_size", activity->data);
-      break;
-
-    case AIUPTI_RUNTIME_TRACE_CBID_P2P_RDMA_MULTICAST:
-      runtime_activity->addMetadata("bytes", activity->data);
       break;
 
     case AIUPTI_RUNTIME_TRACE_CBID_P2P_RDMA_WAIT:
