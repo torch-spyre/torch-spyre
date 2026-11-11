@@ -28,7 +28,7 @@ from torch._inductor.compile_worker.subproc_pool import SubprocException
 from torch._inductor.runtime.runtime_utils import cache_dir
 from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor import timing_recorder
-from torch_spyre._inductor.logging_utils import get_inductor_logger
+from torch_spyre._inductor.logging_utils import get_inductor_logger, warn_once
 from torch_spyre._inductor.op_spec import (
     LoopSpec,
     OpSpec,
@@ -597,7 +597,9 @@ class SpyreAsyncCompile(AsyncCompile):
                     ktir_device_mlir=ktir_device_mlir,
                 )
             except RuntimeError as e:
-                logger.warning(
+                warn_once(
+                    logger,
+                    "kernel_cache_key_failure",
                     "Kernel cache disabled for %s: could not compute cache key: %s. "
                     "Set SPYRE_KERNEL_CACHE=0 to suppress this warning.",
                     kernel_name,
