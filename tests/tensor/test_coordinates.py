@@ -34,6 +34,7 @@ from torch_spyre._inductor.constants import (
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.pass_utils import (
     device_coordinates,
+    is_stick_expr_offset_free,
     try_device_coordinates,
 )
 from torch_spyre._inductor.nonstick_dim_order import _flat_dense_projection_x_layout
@@ -1439,6 +1440,292 @@ class TestFlatDenseProjectionLayout(TestCase):
             x, y, output, out_dep, contraction, M, N
         )
         self.assertIsNone(result)
+
+
+class TestReshapeReadCoordinates(TestCase):
+    """Unit tests for bounded mixed-radix coordinate decomposition (issue #5872).
+
+    Covers exactness and simplification of coordinates produced from unaligned,
+    flattened, non-divisible stride, and multi-variable index expressions on
+    tiled device layouts.
+    """
+
+    def test_unaligned_flatten_read_exact_coordinates(self):
+        """[8, 65] read flat: c0 in [0, 520) accesses row c0 // 65, col c0 % 65."""
+        # Device shape: (col_sticks=2, rows=8, stick_elems=64), strides: (64, 65, 1)
+        cx = compute_coordinates(
+            [2, 8, 64],
+            [64, 65, 1],
+            {p0: 520},
+            p0,
+        )
+        # Expected coordinates:
+        # col_stick: floor((p0 % 65) / 64)
+        # row: floor(p0 / 65)
+        # elem_in_stick: (p0 % 65) % 64
+        expected = [
+            sympy.floor(sympy.Mod(p0, 65) / 64),
+            sympy.floor(p0 / 65),
+            sympy.Mod(sympy.Mod(p0, 65), 64),
+        ]
+        self.assertEqual(cx, expected)
+
+        # Numerically verify all 520 points against true physical memory mapping
+        for i in range(520):
+            expected_row = i // 65
+            expected_col = i % 65
+            expected_stick = expected_col // 64
+            expected_elem = expected_col % 64
+            expected_addr = expected_stick * 64 + expected_row * 65 + expected_elem * 1
+
+            actual_addr = int(
+                cx[0].subs({p0: i}) * 64
+                + cx[1].subs({p0: i}) * 65
+                + cx[2].subs({p0: i}) * 1
+            )
+            self.assertEqual(actual_addr, expected_addr)
+
+        # Stick coordinate has nested Mod (Mod(Mod(p0, 65), 64)), which crosses
+        # stick boundary and must NOT be considered offset-free.
+        self.assertFalse(is_stick_expr_offset_free(cx[2], {p0: 520}))
+
+    def test_non_divisible_step_coordinates(self):
+        """[3, 128] reshaped to [8, 48]: step 48 does not divide stride 64."""
+        # Device shape: (col_sticks=2, rows=3, stick_elems=64), strides: (64, 128, 1)
+        cx = compute_coordinates(
+            [2, 3, 64],
+            [64, 128, 1],
+            {p0: 8, p1: 48},
+            48 * p0 + p1,
+        )
+
+        # Numerically verify all 8x48 = 384 points
+        for r in range(8):
+            for c in range(48):
+                flat_idx = 48 * r + c
+                expected_row = flat_idx // 128
+                expected_col = flat_idx % 128
+                expected_stick = expected_col // 64
+                expected_elem = expected_col % 64
+                expected_addr = (
+                    expected_stick * 64 + expected_row * 128 + expected_elem * 1
+                )
+
+                actual_addr = int(
+                    cx[0].subs({p0: r, p1: c}) * 64
+                    + cx[1].subs({p0: r, p1: c}) * 128
+                    + cx[2].subs({p0: r, p1: c}) * 1
+                )
+                self.assertEqual(actual_addr, expected_addr)
+
+        self.assertFalse(is_stick_expr_offset_free(cx[2], {p0: 8, p1: 48}))
+
+    def test_multi_variable_carry_coordinates(self):
+        """[8, 96] reshaped to [12, 64]: step 64 carries across row stride 96."""
+        # Device shape: (col_sticks=2, rows=8, stick_elems=64), strides: (64, 96, 1)
+        cx = compute_coordinates(
+            [2, 8, 64],
+            [64, 96, 1],
+            {p0: 12, p1: 64},
+            64 * p0 + p1,
+        )
+
+        # Numerically verify all 12x64 = 768 points
+        for r in range(12):
+            for c in range(64):
+                flat_idx = 64 * r + c
+                expected_row = flat_idx // 96
+                expected_col = flat_idx % 96
+                expected_stick = expected_col // 64
+                expected_elem = expected_col % 64
+                expected_addr = (
+                    expected_stick * 64 + expected_row * 96 + expected_elem * 1
+                )
+
+                actual_addr = int(
+                    cx[0].subs({p0: r, p1: c}) * 64
+                    + cx[1].subs({p0: r, p1: c}) * 96
+                    + cx[2].subs({p0: r, p1: c}) * 1
+                )
+                self.assertEqual(actual_addr, expected_addr)
+
+        self.assertFalse(is_stick_expr_offset_free(cx[2], {p0: 12, p1: 64}))
+
+    def test_unaligned_2d_matrix_transpose_read(self):
+        """[8, 65] read with transposed 2D index (stride 1 across rows)."""
+        # Device shape: (col_sticks=2, rows=8, stick_elems=64), strides: (64, 65, 1)
+        cx = compute_coordinates(
+            [2, 8, 64],
+            [64, 65, 1],
+            {p0: 65, p1: 8},
+            65 * p1 + p0,
+        )
+
+        for col in range(65):
+            for row in range(8):
+                expected_stick = col // 64
+                expected_elem = col % 64
+                expected_addr = expected_stick * 64 + row * 65 + expected_elem * 1
+
+                actual_addr = int(
+                    cx[0].subs({p0: col, p1: row}) * 64
+                    + cx[1].subs({p0: col, p1: row}) * 65
+                    + cx[2].subs({p0: col, p1: row}) * 1
+                )
+                self.assertEqual(actual_addr, expected_addr)
+
+    def _assert_exact_over_grid(self, rows, cols, stick, k):
+        """x[rows, cols].reshape(-1, k) read: every grid point maps to the
+        address of the element it reads."""
+        m = rows * cols // k
+        num_sticks = (cols + stick - 1) // stick
+        cx = compute_coordinates(
+            [num_sticks, rows, stick],
+            [stick, cols, 1],
+            {p0: m, p1: k},
+            k * p0 + p1,
+        )
+        for r in range(m):
+            for c in range(k):
+                flat = k * r + c
+                row, col = divmod(flat, cols)
+                expected = (col // stick) * stick + row * cols + col % stick
+                actual = int(
+                    cx[0].subs({p0: r, p1: c}) * stick
+                    + cx[1].subs({p0: r, p1: c}) * cols
+                    + cx[2].subs({p0: r, p1: c})
+                )
+                self.assertEqual(actual, expected, f"({r}, {c})")
+        return cx
+
+    def test_stick_coordinate_drops_whole_stick_terms(self):
+        """[3, 64] stick 32 read as [-1, 96]: 32*Mod(p0, 2) is a whole number of
+        sticks, so the stick coordinate is just Mod(p1, 32), a form the stick
+        check accepts."""
+        cx = self._assert_exact_over_grid(3, 64, 32, 96)
+        self.assertEqual(cx[2], sympy.Mod(p1, 32))
+        self.assertTrue(is_stick_expr_offset_free(cx[2], 32))
+
+    def test_stick_coordinate_of_multiple_of_row_step_is_plain_mod(self):
+        """[2, 192] read as [-1, 128]: the stick coordinate is Mod(p1, 64)."""
+        cx = self._assert_exact_over_grid(2, 192, 64, 128)
+        self.assertEqual(cx[2], sympy.Mod(p1, 64))
+        self.assertTrue(is_stick_expr_offset_free(cx[2], 64))
+
+    def test_several_variables_crossing_a_row_stride_are_exact(self):
+        """The stick coordinate must not be accepted unless it is exact: here
+        p0 steps by 32 (a whole stick) yet the row width 112 is not a multiple
+        of it, so reads cross rows."""
+        cx = self._assert_exact_over_grid(2, 112, 32, 32)
+        self.assertFalse(is_stick_expr_offset_free(cx[2], 32))
+
+
+class TestUnboundedSymbolCoordinates(TestCase):
+    """Symbols whose range is not a plain ``var_ranges`` integer (issue #5872).
+
+    The decomposition may only prune a carry (``floor``/``Mod``) when it can
+    bound the term, so each kind of symbol must reach it with a usable range.
+    """
+
+    def test_index_that_is_a_single_non_iteration_symbol(self):
+        """A bare symbol outside var_ranges/indirect_sizes is dropped, and the
+        result stays a list of sympy values (not a Python int)."""
+        tmp0 = sympy.Symbol("tmp0", integer=True)
+        cx = compute_coordinates([128, 64], [1, -1], {}, tmp0)
+        self.assertEqual(cx, [0, 0])
+
+    def test_indirect_symbol_range_comes_from_indirect_sizes(self):
+        """tmp0 < 128 is known only from indirect_sizes. Without it the
+        decomposition cannot prove 64*tmp0 never carries into the p0 dim."""
+        tmp0 = sympy.Symbol("tmp0", integer=True)
+        cx = compute_coordinates(
+            [8, 128, 1, 1, 64],
+            [8192, 64, 64, -1, 1],
+            {p0: 8, p1: 64},
+            8192 * p0 + p1 + 64 * tmp0,
+            {tmp0: 128},
+        )
+        self.assertEqual(cx, [p0, tmp0, 0, 0, p1])
+
+    def test_symbolic_range_uses_the_size_hint(self):
+        """A dynamic range s0 is bounded by its size hint, so a term that fits
+        in one row keeps clean coordinates instead of floor/Mod."""
+        s0 = sympy.Symbol("s0", integer=True, positive=True)
+        graph = SimpleNamespace(
+            sizevars=SimpleNamespace(optimization_hint=lambda e: int(e.subs(s0, 64)))
+        )
+        with V.set_graph_handler(graph):
+            cx = compute_coordinates([4, 64], [64, 1], {p0: s0, p1: s0}, 64 * p0 + p1)
+        self.assertEqual(cx, [p0, p1])
+
+
+class TestReshapeSweepCoordinates(TestCase):
+    """Parametric sweep over matrix shapes and reshape targets verifying 100% exactness."""
+
+    def test_reshape_coordinates_sweep_exactness(self):
+        rows_list = (2, 3, 5, 8)
+        cols_list = (16, 33, 64, 65, 96, 100, 128, 129)
+        sticks = (32, 64)
+        k_list = (16, 32, 48, 64, 96, 128)
+
+        total_tested = 0
+        for rows in rows_list:
+            for cols in cols_list:
+                for stick in sticks:
+                    num_sticks = (cols + stick - 1) // stick
+                    device_size = [num_sticks, rows, stick]
+                    device_stride = [stick, cols, 1]
+                    total_elems = rows * cols
+
+                    for k in k_list:
+                        if total_elems % k != 0:
+                            continue
+                        m = total_elems // k
+                        var_ranges = {p0: m, p1: k}
+                        index_expr = k * p0 + p1
+
+                        cx = compute_coordinates(
+                            device_size, device_stride, var_ranges, index_expr
+                        )
+                        total_tested += 1
+
+                        # Test sample points (endpoints, boundaries, center)
+                        sample_points = [
+                            (0, 0),
+                            (0, k - 1),
+                            (m - 1, 0),
+                            (m - 1, k - 1),
+                            (m // 2, k // 2),
+                        ]
+                        if k > 1:
+                            sample_points.append((0, 1))
+                        if m > 1:
+                            sample_points.append((1, 0))
+
+                        for r, c in sample_points:
+                            flat_idx = k * r + c
+                            expected_row = flat_idx // cols
+                            expected_col = flat_idx % cols
+                            expected_stick = expected_col // stick
+                            expected_elem = expected_col % stick
+                            expected_addr = (
+                                expected_stick * stick
+                                + expected_row * cols
+                                + expected_elem
+                            )
+
+                            actual_addr = int(
+                                cx[0].subs({p0: r, p1: c}) * stick
+                                + cx[1].subs({p0: r, p1: c}) * cols
+                                + cx[2].subs({p0: r, p1: c})
+                            )
+                            self.assertEqual(
+                                actual_addr,
+                                expected_addr,
+                                f"Mismatch on shape ({rows}, {cols}), stick={stick}, k={k} at ({r}, {c})",
+                            )
+
+        self.assertGreater(total_tested, 50)
 
 
 if __name__ == "__main__":
