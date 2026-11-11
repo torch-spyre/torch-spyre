@@ -1876,6 +1876,24 @@ def lower_restickify(x):
     return pw
 
 
+@register_spyre_lowering(torch.ops.spyre.rebase_copy)
+def lower_rebase_copy(x):
+    # Read through x's view (not its base, unlike restickify) into a new,
+    # realized buffer of x's logical shape: an explicit same-stick copy that
+    # Inductor cannot inline back into the consumer.
+    loader = x.make_loader()
+    pw = Pointwise.create(
+        device=x.get_device(),
+        dtype=x.get_dtype(),
+        inner_fn=loader,
+        ranges=x.get_size(),
+        origin_node=V.get_current_node(),
+        traceback=x.get_traceback(),
+    )
+    pw.realize()
+    return pw
+
+
 @register_spyre_lowering(
     torch.ops.spyre.tile_dim_marker,
     type_promotion_kind=None,

@@ -43,6 +43,7 @@ from .pass_counters import COUNTERS
 from .provenance import SpyreGraphTransformObserver, reset_provenance_warnings
 
 from .padding import insert_bmm_padding, insert_restickify_padding
+from .stick_reshape_pivot import pivot_unaligned_stick_reshapes
 from .temp_passes import (
     bmm_unflatten_pass,
     decompose_addmm,
@@ -312,6 +313,10 @@ class CustomPostPasses(_SpyreGraphPassPipeline):
                 decompose_addmm,
                 mm_to_bmm_pass.apply,
                 bmm_unflatten_pass.apply,
+                # Last, so the bmm passes above still see the original views
+                # they fold away. Rewrites reshapes that split/merge the stick
+                # dim off a stick boundary (W=160 rows of 2.5 sticks, #1353).
+                pivot_unaligned_stick_reshapes,
             ]
         )
 

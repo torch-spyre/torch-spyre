@@ -866,21 +866,18 @@ def normalize_coordinates(
             fused_term.num == 1
             and fused_term.var == term.var
             and fused_term.den == term.mod
+            # Two digits of one variable fuse into one dim only when the inner
+            # dim is exactly one outer step wide. A padded inner dim (W=160
+            # stored in 3 sticks = 192 lanes) leaves a gap between outer
+            # steps, and fusing would read across it.
+            and fused_term.den == term.den * term.dim_size
             # Fusing *across* a placeholder must not change the address that
-            # any (dim, coordinate) pair encodes.  It provably does not when
-            # the pair is densely packed (``den == term.den * term.dim_size``),
-            # the inner term skips no elements (``num == 1``), and the outer
-            # term carries no offset -- the outer offset counts in units of the
-            # outer ``den`` and is not rescaled when ``den`` shrinks on fusion.
-            # Adjacent terms keep the historical predicate unchanged.
-            and (
-                not skipped_placeholder
-                or (
-                    term.num == 1
-                    and fused_term.offset == 0
-                    and fused_term.den == term.den * term.dim_size
-                )
-            )
+            # any (dim, coordinate) pair encodes.  Dense packing is required
+            # above for every fusion; across a placeholder the inner term must
+            # additionally skip no elements (``num == 1``) and the outer term
+            # carry no offset -- the outer offset counts in units of the outer
+            # ``den`` and is not rescaled when ``den`` shrinks on fusion.
+            and (not skipped_placeholder or (term.num == 1 and fused_term.offset == 0))
         ):
             # fuse terms
             fused_term.num = term.num
