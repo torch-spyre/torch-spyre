@@ -26,6 +26,7 @@ and the clone's one load is priced separately, outside the readers' bundle turna
 No Spyre device or backend compiler is required; features are built directly.
 """
 
+import dataclasses
 import logging
 from types import SimpleNamespace
 
@@ -45,6 +46,130 @@ from torch_spyre._inductor.cost_model import (
 
 ELEMS, DTYPE = 1024, 2
 BYTES = ELEMS * DTYPE
+
+
+@pytest.mark.parametrize(
+    "shape,splits,shared,dtype_bytes",
+    [
+        ((8, 512, 128, 512), (4, 2, 2, 2), False, 2),
+        ((1, 512, 1024, 4096), (1, 8, 4, 1), True, 2),
+        ((1, 32, 1024, 4096), (1, 8, 2, 2), True, 2),
+        ((1, 32, 1024, 4096), (1, 8, 2, 2), True, 1),
+        ((1, 117, 3072, 4096), (1, 3, 1, 1), True, 2),
+        ((8, 120, 1024, 4096), (1, 3, 1, 1), False, 2),
+    ],
+)
+def test_matmul_preference_price_matches_standalone(
+    monkeypatch, shape, splits, shared, dtype_bytes
+):
+    from torch_spyre._inductor import work_division as wd
+
+    monkeypatch.setattr(cost_model.config, "sencores", 32)
+    axes = tuple(zip(shape, splits))
+    options = {
+        "shared_weight": shared,
+        "include_hbm": False,
+        "operand_bytes": dtype_bytes,
+    }
+    delta = wd._matmul_split_cost(*axes, 32, **options) - wd._matmul_execution_cost(
+        *axes, 32, **options
+    )
+    assert cost_model._matmul_preference_price(axes + (shared,), dtype_bytes) == round(
+        1000 * delta
+    )
+    terms = wd._matmul_split_preferences(*axes, 32, shared, dtype_bytes)
+    if shape[1] == 32:
+        assert (terms["m_tile_underfill"] == 0) == (dtype_bytes == 2)
+    assert (terms["batch_split"] > 0) == (not shared and splits[0] > 1)
+
+
+@pytest.mark.parametrize("stacked,passes", [(1, 1), (1, 4), (4, 1)])
+def test_matmul_objective_replaces_batch_charge_once(monkeypatch, stacked, passes):
+    from torch_spyre._inductor import work_division as wd
+
+    monkeypatch.setattr(cost_model.config, "sencores", 32)
+    op = OpFeatures(
+        "bmm",
+        True,
+        stacked * 8 * 512 * 128,
+        32,
+        2,
+        [],
+        is_matmul=True,
+        reduction_cores=2,
+        loop_trip=4,
+        matmul_macs=stacked * 8 * 512 * 128 * 512 * passes,
+        matmul_rows_per_core=256,
+        matmul_cols_per_core=64,
+        matmul_m_split=2,
+        matmul_n_split=2,
+        matmul_a_bytes=512 * 512 * 2,
+        matmul_b_bytes=512 * 128 * 2,
+    )
+    axes = cost_model._matmul_axes_for_split_cost(op)
+    execution_ns = 1000 * wd._matmul_execution_cost(*axes[:4], 32, include_hbm=False)
+    preference_ns = cost_model._matmul_preference_price(axes, op.dtype_bytes)
+    plain = CostParams(use_bundled_cost_model=False)
+    ranked = dataclasses.replace(plain, restore_matmul_split_preferences=True)
+    assert cost_model._matmul_ns_upstream([op], plain) > execution_ns * passes
+    expected = (execution_ns + preference_ns) * passes
+    assert cost_model._matmul_ns_upstream([op], ranked) == pytest.approx(expected)
+    # A second graph batch charge must not enter the ranked objective.
+    changed_batch = dataclasses.replace(ranked, mm_batch_split_ns_per_step=1e9)
+    assert cost_model._matmul_ns_upstream([op], changed_batch) == pytest.approx(
+        expected
+    )
+    # With no traffic, predict_ops must expose exactly that compute-side score.
+    assert cost_model.predict_ops([op], ranked) == pytest.approx(expected)
+    explanation = cost_model.explain([op], ranked)
+    assert "shape preferences:" in explanation
+    assert "objective_score" in explanation
+    assert "batched-matmul batch splits:" not in explanation
+    assert "T_model" not in explanation
+
+
+def test_matmul_preferences_lower_to_exact_candidate_prices(monkeypatch):
+    from ortools.sat.python import cp_model
+
+    from torch_spyre._inductor.scratchpad.cpsat_expr_printer import cost_expr_to_cpsat
+
+    monkeypatch.setattr(cost_model.config, "sencores", 32)
+    shape = (8, 120, 1024, 4096)
+    keys = ("b", "m", "n", "k")
+    symbols = sympy.symbols("b m n k", integer=True, positive=True)
+    splits = [(1, 3, 2, 1), (4, 2, 2, 2), (2, 4, 2, 1), (1, 8, 4, 1)]
+    expression = cost_model._matmul_preference_price(
+        tuple(zip(shape, symbols)) + (False,), 2
+    )
+    model = cp_model.CpModel()
+    selector = model.new_int_var(0, len(splits) - 1, "division")
+    wrapper = SimpleNamespace(
+        division=selector,
+        buffer=SimpleNamespace(
+            sym_division=sympy.Symbol("division", integer=True),
+            sym_core_divs=dict(zip(keys, symbols)),
+            core_divisions=[SimpleNamespace(splits=dict(zip(keys, s))) for s in splits],
+        ),
+    )
+    sym_map, buffer_map = {}, {}
+    for index, symbol in enumerate(symbols):
+        values = [s[index] for s in splits]
+        var = model.new_int_var(min(values), max(values), symbol.name)
+        model.add_element(selector, values, var)
+        sym_map[symbol.name] = var
+        buffer_map[symbol.name] = (wrapper, values)
+    model.minimize(cost_expr_to_cpsat(model, sym_map, buffer_map, expression))
+    for index, split in enumerate(splits):
+        fixed = model.clone()
+        fixed.add(selector == index)
+        solver = cp_model.CpSolver()
+        solver.parameters.num_search_workers = 1
+        assert solver.solve(fixed) == cp_model.OPTIMAL
+        expected = cost_model._matmul_preference_price(
+            tuple(zip(shape, split)) + (False,), 2
+        )
+        assert expected > 0
+        assert solver.objective_value == expected
 
 
 @pytest.mark.parametrize("shared_weight", [False, True])
