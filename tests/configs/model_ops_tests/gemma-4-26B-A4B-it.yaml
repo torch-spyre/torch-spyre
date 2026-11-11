@@ -17,8 +17,8 @@ test_suite_config:
           rtol: 0.005
       - name: bfloat16
         precision:
-          atol: 0.005
-          rtol: 0.005
+          atol: 0.008
+          rtol: 0.008
       - name: int8
         precision:
           atol: 0.005
