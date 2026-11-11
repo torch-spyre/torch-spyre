@@ -53,6 +53,7 @@ from torch_spyre._inductor.loop_node import (
     expand,
     expanded,
     in_building_loop,
+    insert_after,
     owning_list,
     peel_non_members,
 )
@@ -545,6 +546,63 @@ class TestOpsView(unittest.TestCase):
         self.assertIs(view[-1], x)
         del view[-1]
         self.assertEqual(len(view), 6)
+
+
+class TestOpsViewCrossingNodes(unittest.TestCase):
+    """The two view edits that cross a node boundary on purpose."""
+
+    def test_hoist_to_front_takes_ops_out_of_every_level(self):
+        real, outer, inner, (a, b, c, d, e, f) = _nested()
+        OpsView(real).hoist_to_front([d, b])
+        # d left two levels, b one; they head the top-level list in the order given
+        self.assertEqual(real[:2], [d, b])
+        self.assertEqual(inner.body, [c])
+        self.assertEqual(outer.body, [inner, e])
+        self.assertEqual(real[2:], [a, outer, f])
+
+    def test_hoist_to_front_drops_the_cached_flat_order(self):
+        real, _, _, (a, b, c, d, e, f) = _nested()
+        view = OpsView(real)
+        self.assertEqual(list(view), [a, b, c, d, e, f])  # fills the cache
+        view.hoist_to_front([d])
+        self.assertEqual(list(view), [d, a, b, c, e, f])
+        self.assertEqual(list(view), list(all_ops(real)))
+
+    def test_hoisting_every_op_leaves_an_empty_node_in_place(self):
+        """The pass can take a body's only members out. The node is kept, empty:
+        nothing here decides what an empty node means."""
+        x, y = _Op("x"), _Op("y")
+        node = _node("loop", [x, y])
+        real = [node]
+        OpsView(real).hoist_to_front([x, y])
+        self.assertEqual(real, [x, y, node])
+        self.assertEqual(node.body, [])
+
+    def test_hoist_to_front_of_an_op_not_in_the_graph_raises(self):
+        real, *_ = _nested()
+        with self.assertRaises(ValueError):
+            OpsView(real).hoist_to_front([_Op("stranger")])
+
+    def test_insert_after_through_the_view_stays_beside_the_anchor(self):
+        """``view.insert`` past the last flat position goes to the top level; the
+        function puts the op next to its anchor, inside the body."""
+        x, y, z = _Op("x"), _Op("y"), _Op("z")
+        node = _node("loop", [x, y])
+        real = [node, z]
+        view = OpsView(real)
+        w = _Op("w")
+        insert_after(view, y, w)  # y is the last op of the body
+        self.assertEqual(node.body, [x, y, w])
+        self.assertEqual(real, [node, z])
+        self.assertEqual(list(view), [x, y, w, z])  # and the cache was dropped
+
+    def test_insert_after_a_node_is_outside_it(self):
+        x, z = _Op("x"), _Op("z")
+        node = _node("loop", [x])
+        real = [node, z]
+        w = _Op("w")
+        insert_after(OpsView(real), node, w)
+        self.assertEqual(real, [node, w, z])
 
 
 class TestPeelNonMembers(unittest.TestCase):
