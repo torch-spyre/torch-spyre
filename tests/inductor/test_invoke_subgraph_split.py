@@ -161,6 +161,50 @@ class TestInvokeSubgraphSplit(unittest.TestCase):
         )
         torch.testing.assert_close(out.cpu(), outer(x.cpu()), atol=0.1, rtol=0.1)
 
+    def test_region_dtype_conversion(self):
+        """An fp16 <-> fp32 conversion inside a reused region keeps its layout rule.
+
+        The region's buffers inherit the parent graph's ``invoke_subgraph`` node
+        as their first origin; layout propagation must pick the conversion's
+        own node, or the upcast output loses its DL16_TO_FP32 arrangement and
+        later ops read it in the wrong order.
+        """
+
+        @nested_compile_region
+        def r(h):
+            return (h.float() * 2.0 + 1.0).half()
+
+        def outer(x):
+            # Several calls: a single call is inlined and no invoke_subgraph remains.
+            return r(r(r(x)))
+
+        seen_hops = []
+
+        def backend(gm, example_inputs):
+            seen_hops.append(
+                [
+                    n
+                    for n in gm.graph.nodes
+                    if "invoke_subgraph" in str(getattr(n, "target", ""))
+                ]
+            )
+            from torch._inductor.compile_fx import compile_fx
+
+            return compile_fx(gm, example_inputs)
+
+        # Multiples of 1/64 in [-1, 1): every step stays exact in fp16 and fp32,
+        # so an element read from the wrong lane cannot hide in a tolerance.
+        x = ((torch.arange(128 * 128) * 7 % 129 - 64) / 64).reshape(128, 128).half()
+        compiled = torch.compile(outer, backend=backend, dynamic=False, fullgraph=True)
+        out = compiled(x.to(DEVICE_NAME))
+
+        self.assertGreaterEqual(
+            len(seen_hops[0]),
+            2,
+            f"expected repeated invoke_subgraph calls, got {[n.name for n in seen_hops[0]]}",
+        )
+        torch.testing.assert_close(out.cpu(), outer(x), atol=0, rtol=0)
+
 
 if __name__ == "__main__":
     unittest.main()

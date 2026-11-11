@@ -828,25 +828,27 @@ def _default_pointwise_layout(
 
 
 def _origin_target(data: Pointwise | Reduction):
-    """The target of the first origin of ``data``, skipping enclosing loops.
+    """The target of the first origin of ``data``, skipping enclosing HOPs.
 
-    A buffer lowered inside a ``while_loop`` body (``for_each_tile``) inherits
-    the origins of the enclosing lowering context, which come first: the loop
-    HOP, its subgraph ``get_attr`` nodes and other nodes of the graph holding
-    the loop. Origins in a graph that holds a loop HOP are therefore skipped,
-    leaving the body's own nodes; a buffer with no origin elsewhere keeps its
-    first one. (``origin_node`` is no substitute: some lowerings set it to
-    their input's node.)
+    A buffer lowered inside a higher-order op's subgraph, such as a
+    ``while_loop`` body (``for_each_tile``) or a reused
+    ``nested_compile_region`` (``invoke_subgraph``), inherits the origins of the
+    enclosing lowering context, which come first: the HOP, its subgraph
+    ``get_attr`` nodes and other nodes of the graph holding the HOP. Origins in
+    a graph that holds a HOP are therefore skipped, leaving the subgraph's own
+    nodes; a buffer with no origin elsewhere keeps its first one.
+    (``origin_node`` is no substitute: some lowerings set it to their input's
+    node.)
     """
     if not data.origins:
         return None
-    loop_graphs = {
+    hop_graphs = {
         n.graph
         for n in data.origins
         if isinstance(n.target, torch._ops.HigherOrderOperator)
     }
     node = next(
-        (n for n in data.origins if n.graph not in loop_graphs),
+        (n for n in data.origins if n.graph not in hop_graphs),
         next(iter(data.origins)),
     )
     return node.target
