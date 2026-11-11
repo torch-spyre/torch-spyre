@@ -447,8 +447,14 @@ def test_unsupported_shardings_fail_at_compile(shape_per_shard, dim):
         # redistribution; positive once that exists.
         (lambda x, y: x + y, "unsharded", "every operand sharded with the same"),
         (lambda x, y: x + y, "shard1", "every operand sharded with the same"),
-        # Non-unified reductions are not implemented.
-        (lambda x, y: x.sum(0) + y.sum(0), "shard0", "pointwise ops only"),
+        # TODO: a full reduction reduces more than the shard dim, which needs
+        # more than one split reduced dim. Reductions that are supported are
+        # covered in test_sharded_reduction.py.
+        (
+            lambda x, y: x.sum() + y.sum(),
+            "shard0",
+            "must reduce the shard dim only",
+        ),
         # TODO: in-place writes into sharded storage.
         (lambda x, y: x.add_(y), "shard0", "in-place writes into sharded"),
         # TODO: sharded intermediates.
@@ -616,14 +622,19 @@ def test_dynamic_shapes_fail_at_compile():
 @_requires_emulation
 @expects_raise
 def test_fallback_consumer_fails_at_compile():
-    """An op that lowers to a fallback kernel is rejected at compile, not at
-    launch with an error that names neither the op nor the sharding."""
+    """A consumer that mixes sharded and unsharded storage is rejected at
+    compile, not at launch with an error that names neither the op nor the
+    sharding. cumsum decomposes to a matmul whose triu_mask operand is
+    unsharded, so the add over its result and a sharded tensor fails the
+    same-placement check."""
     n = _num_shards()
     torch.manual_seed(0)
     a = _sharded(torch.randn(8 * n, 64, dtype=torch.float16), 0, n)
     b = _sharded(torch.randn(8 * n, 64, dtype=torch.float16), 0, n)
 
-    with pytest.raises(RuntimeError, match="pointwise ops on sharded operands"):
+    with pytest.raises(
+        RuntimeError, match="need every operand sharded with the same placement"
+    ):
         torch.compile(lambda x, y: torch.cumsum(x, dim=1) + 0 * y, dynamic=False)(a, b)
 
 
@@ -713,8 +724,8 @@ def test_inputs_usable_after_compile_rejection():
     a = _sharded(src, 0, n)
     b = _sharded(src.clone(), 0, n)
 
-    with pytest.raises(RuntimeError, match="pointwise ops only"):
-        torch.compile(lambda x, y: x.sum(0) + y.sum(0), dynamic=False)(a, b)
+    with pytest.raises(RuntimeError, match="must reduce the shard dim only"):
+        torch.compile(lambda x, y: x.sum() + y.sum(), dynamic=False)(a, b)
 
     # Same tensors still work in a supported compile afterwards.
     c = torch.compile(lambda x, y: x + y, dynamic=False)(a, b)

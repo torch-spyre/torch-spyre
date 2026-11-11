@@ -12,12 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Non-unified pointwise kernels over sharded storage.
+"""Non-unified kernels over sharded storage.
 
 A sharded tensor (``torch.spyre.to_sharded``) keeps shard *c* in its own
-device chunk, which belongs to core *c*. A pointwise op whose operands are
-sharded compiles to a non-unified kernel: core *c* reads and writes only
-chunk *c*, each through its own start address (``nonUnifiedAllocInHBM_``).
+device chunk, which belongs to core *c*. An op whose operands are sharded
+compiles to a non-unified kernel: core *c* reads and writes only chunk *c*,
+each through its own start address (``nonUnifiedAllocInHBM_``).
+
+Two op kinds are admitted:
+
+- same-shape pointwise ops: the result has the operands' placement;
+- shard-local reductions: a reduction over dims that do not include the
+  shard dim. Each core reduces its own shard and writes its own output
+  shard, so no data crosses shards. The result is sharded along the
+  remapped shard dim (``s`` with ``keepdim``, else ``s`` minus the number of
+  reduced dims before ``s``) and gets its own shard size.
 
 The shard plan, not the work-division planner, sets the work split: this
 pass pins it to ``num_shards`` on the shard dim before work division runs.
@@ -36,6 +45,7 @@ from torch._inductor.ir import (
     ComputedBuffer,
     MutationLayoutSHOULDREMOVE,
     Pointwise,
+    Reduction,
     ReinterpretView,
 )
 from torch._inductor.virtualized import V
@@ -111,6 +121,17 @@ def check_sharded_input(
             f"{name}: non-unified kernels need sharded inputs that are base "
             "tensors from to_sharded (no views, slices or reshapes)"
         )
+
+
+def _shard_device_bytes(
+    size: list[int], dtype: torch.dtype, shard_dim: int, num_shards: int
+) -> int:
+    """Device bytes of one shard of ``size``, as ``_spyre_empty_sharded``."""
+    from torch_spyre._C import get_device_size_in_bytes
+
+    return get_device_size_in_bytes(
+        _local_layout(size, dtype, ShardedPlacement(shard_dim, num_shards, 0))
+    )
 
 
 def _check_core_match(placement: ShardedPlacement) -> None:
@@ -208,11 +229,31 @@ def _mutation_target(op: ComputedBuffer) -> str | None:
     return target.get_name() if hasattr(target, "get_name") else None
 
 
+def verify_mixed_ring_args(sdsc_spec, shard_kernel_args) -> None:
+    """Codegen guard for a ring reduction: sharded inputs, one plain output.
+
+    A cross-shard reduction reads sharded storage (non-unified, one start per
+    core) and writes an ordinary tensor that the ring chain's end core fills.
+    Every non-sharded argument must be that output.
+    """
+    # SDSC args list inputs first and the output last. (For a reduction,
+    # ``num_inputs`` counts the output too, because it is also the
+    # accumulator, so position is the reliable test.)
+    plain = [i for i, t in enumerate(sdsc_spec.args) if not t.non_unified]
+    if plain != [len(sdsc_spec.args) - 1] or not shard_kernel_args:
+        raise Unsupported(
+            "non-unified kernels need every tensor argument sharded, except the "
+            "single output of a cross-shard (ring) reduction"
+        )
+
+
 def verify_non_unified_split(sdsc_spec, shard_kernel_args) -> None:
     """Codegen guard: core c's work slice is shard c, and nothing else splits.
 
     The pass pins the split; this re-checks the committed division the SDSC
     is emitted from, so a later pass cannot silently re-divide a sharded op.
+    The split dim may be a reduction dim (a ring reduction over the shard
+    dim): the check is the same, core c's slice of it is shard c.
     """
     n = sdsc_spec.num_cores
     try:
@@ -265,19 +306,208 @@ def verify_non_unified_split(sdsc_spec, shard_kernel_args) -> None:
             )
 
 
+# Reductions whose value over one shard needs nothing from other shards when
+# the shard dim is not reduced. ``mean`` divides by the reduced extent, which
+# is the same on every core because the reduced dims are not split.
+_SHARD_LOCAL_REDUCTIONS = ("sum", "mean", "max", "min")
+
+
+def _input_dim_symbols(read: MemoryDep, in_size: list[int]) -> dict[int, sympy.Symbol]:
+    """Input dim -> its iteration symbol (validated by ``_reduced_input_dims``)."""
+    strides = [math.prod(in_size[d + 1 :]) for d in range(len(in_size))]
+    return {
+        d: sym
+        for d, extent in enumerate(in_size)
+        if extent != 1
+        for sym, rng in read.ranges.items()
+        if read.index.coeff(sym) == strides[d] and int(rng) == extent
+    }
+
+
+def _reduced_input_dims(
+    name: str, read: MemoryDep, write: MemoryDep, in_size: list[int]
+) -> tuple[list[int], dict[int, sympy.Symbol]]:
+    """Which input dims a reduction reduces, and the kept dims' symbols.
+
+    The read index walks a contiguous input: input dim ``d`` is the symbol
+    whose coefficient is ``stride(d)`` and whose range is ``in_size[d]``. A
+    dim is reduced when its symbol does not appear in the write index.
+    Returns the reduced dims and, for each kept dim, its symbol.
+    """
+    strides = [math.prod(in_size[d + 1 :]) for d in range(len(in_size))]
+    dim_symbol: dict[int, sympy.Symbol] = {}
+    for d, extent in enumerate(in_size):
+        if extent == 1:
+            continue
+        matches = [
+            sym
+            for sym, rng in read.ranges.items()
+            if read.index.coeff(sym) == strides[d] and int(rng) == extent
+        ]
+        if len(matches) != 1:
+            raise Unsupported(
+                f"{name}: non-unified reductions need a plain read of a "
+                f"contiguous sharded input; cannot find input dim {d} in "
+                f"{read.index} (ranges {read.ranges})"
+            )
+        dim_symbol[d] = matches[0]
+    if len(set(dim_symbol.values())) != len(dim_symbol) or set(read.ranges) != set(
+        dim_symbol.values()
+    ):
+        raise Unsupported(
+            f"{name}: non-unified reductions need one iteration symbol per input "
+            f"dim; got {read.index} (ranges {read.ranges})"
+        )
+    write_symbols = write.index.free_symbols
+    reduced = [d for d, sym in dim_symbol.items() if sym not in write_symbols]
+    kept = {d: sym for d, sym in dim_symbol.items() if sym in write_symbols}
+    return reduced, kept
+
+
+def _plan_cross_shard_reduction(
+    op: ComputedBuffer,
+    name: str,
+    in_size: list[int],
+    reduced: list[int],
+    dim_symbol: dict[int, sympy.Symbol],
+    placement: ShardedPlacement,
+) -> None:
+    """Admit a reduction over the shard dim as one ring-combined program.
+
+    The reduced shard dim is split across cores along the shard boundaries,
+    so core c's work slice is input shard c. DeepTools' cross-core reduction
+    then passes each core's partial over the ring, and the chain's end core
+    writes the result, which is an ordinary (unsharded) tensor. Nothing is
+    recorded for the output in the shard plan.
+    """
+    s = placement.shard_dim
+    # mean is admitted: the ring templates divide once by the global reduced
+    # extent (measured: the result matches CPU within fp16 rounding, closer
+    # than the unsharded device mean). Shards are equal, so this is the
+    # global mean.
+    if reduced != [s]:
+        raise Unsupported(
+            f"{name}: cross-shard reductions must reduce the shard dim only "
+            f"(DeepTools splits at most one reduced dim across cores); "
+            f"reduced dims {reduced}"
+        )
+    if s == len(in_size) - 1:
+        raise Unsupported(
+            f"{name}: cross-shard reductions over the stick dim are not supported"
+        )
+    _check_local_strides(name, in_size, op.get_dtype(), placement)
+    op.shard_pinned_splits = {dim_symbol[s]: placement.num_shards}
+    op.shard_ring_reduction = True
+
+
+def _plan_shard_local_reduction(
+    graph: GraphLowering,
+    op: ComputedBuffer,
+    read: MemoryDep,
+    write: MemoryDep,
+    placement: ShardedPlacement,
+) -> ShardedPlacement | None:
+    """Admit a reduction of one sharded operand; return the result placement.
+
+    If the shard dim is kept, every core reduces only its own shard, so the
+    result is sharded along the shard dim's position in the output, and each
+    output shard is written by the core that read the matching input shard.
+
+    If the shard dim is reduced, the reduction is cross-shard and is planned
+    for the ring (``_plan_cross_shard_reduction``); the result is unsharded
+    and None is returned.
+    """
+    name = op.get_name()
+    if (
+        not isinstance(op.data, Reduction)
+        or op.data.reduction_type not in _SHARD_LOCAL_REDUCTIONS
+    ):
+        kind = getattr(op.data, "reduction_type", type(op.data).__name__)
+        raise Unsupported(
+            f"{name}: non-unified kernels support shard-local "
+            f"{', '.join(_SHARD_LOCAL_REDUCTIONS)} reductions only; got {kind}"
+        )
+    in_buf = graph.get_buffer(read.name)
+    in_size = [int(s) for s in in_buf.get_size()]
+    out_size = [int(s) for s in op.get_size()]
+    if in_buf.get_dtype() != op.get_dtype():
+        raise Unsupported(
+            f"{name}: non-unified kernels need operands and result of one "
+            f"dtype; got {in_buf.get_dtype()} -> {op.get_dtype()}"
+        )
+    reduced, kept = _reduced_input_dims(name, read, write, in_size)
+    s = placement.shard_dim
+    if in_size[s] % placement.num_shards:
+        raise Unsupported(
+            f"{name}: non-unified kernels need the shard dim to divide evenly"
+        )
+    if s not in kept:
+        dim_symbol = _input_dim_symbols(read, in_size)
+        _plan_cross_shard_reduction(op, name, in_size, reduced, dim_symbol, placement)
+        return None
+    stick_dim = len(in_size) - 1
+    if stick_dim in reduced:
+        raise Unsupported(
+            f"{name}: non-unified reductions over the stick dim are not "
+            "supported (they change the device layout of each shard)"
+        )
+    # Output position of the shard dim: kept dims appear in the write index
+    # in input order, and keepdim inserts size-1 dims for reduced ones.
+    out_strides = [math.prod(out_size[d + 1 :]) for d in range(len(out_size))]
+    shard_sym = kept[s]
+    coeff = write.index.coeff(shard_sym)
+    out_dims = [
+        d
+        for d, extent in enumerate(out_size)
+        if out_strides[d] == coeff and extent == in_size[s]
+    ]
+    if len(out_dims) != 1:
+        raise Unsupported(
+            f"{name}: cannot find the shard dim of the reduction result in "
+            f"{write.index} (output shape {out_size})"
+        )
+    out_shard_dim = out_dims[0]
+    expected = s if len(out_size) == len(in_size) else s - sum(r < s for r in reduced)
+    if out_shard_dim != expected:
+        raise Unsupported(
+            f"{name}: reduction result puts shard dim {s} at {out_shard_dim}, "
+            f"expected {expected}"
+        )
+    out_placement = ShardedPlacement(
+        shard_dim=out_shard_dim,
+        num_shards=placement.num_shards,
+        shard_device_bytes=_shard_device_bytes(
+            out_size, op.get_dtype(), out_shard_dim, placement.num_shards
+        ),
+    )
+    _check_local_strides(name, in_size, op.get_dtype(), placement)
+    _check_local_strides(name, out_size, op.get_dtype(), out_placement)
+    op.shard_pinned_splits = {shard_sym: placement.num_shards}
+    return out_placement
+
+
 def plan_sharded_hbm(graph: GraphLowering) -> None:
     """Pin the work split of ops on sharded operands to their shard plan.
 
-    Requires same-shape pointwise ops whose memory reads are all sharded with
-    one placement and the same index as the write (no broadcast, no
-    redistribution). The output gets the same placement and is allocated
-    sharded. The split is ``{shard_dim: num_shards}``; ``work_distribution``
-    commits it instead of choosing one, and LX planning keeps it fixed.
+    Admits two kinds of op whose memory reads are all sharded with one
+    placement (no broadcast, no redistribution):
+
+    - same-shape pointwise ops that read each operand with the write's index;
+      the output gets the same placement;
+    - shard-local reductions (see ``_plan_shard_local_reduction``) of one
+      sharded operand; the output gets the remapped placement.
+
+    The output is allocated sharded. The split is ``{shard_dim: num_shards}``;
+    ``work_distribution`` commits it instead of choosing one, and LX planning
+    keeps it fixed.
     """
     placements = graph_placements(graph)
     if not placements:
         return
     outputs = set(graph.get_output_names())
+    # Cross-shard reductions planned for the ring: they read sharded storage
+    # but produce an ordinary (unsharded) result.
+    ring_reductions: set[str] = set()
     for op in graph.operations:
         if not isinstance(op, ComputedBuffer):
             continue
@@ -293,8 +523,12 @@ def plan_sharded_hbm(graph: GraphLowering) -> None:
         if not sharded:
             continue
         name = op.get_name()
-        if not isinstance(op.data, Pointwise):
-            raise Unsupported(f"{name}: non-unified kernels support pointwise ops only")
+        is_reduction = isinstance(op.data, Reduction)
+        if not isinstance(op.data, Pointwise) and not is_reduction:
+            raise Unsupported(
+                f"{name}: non-unified kernels support pointwise ops and "
+                "shard-local reductions only"
+            )
         if not all(isinstance(s, (int, sympy.Integer)) for s in op.get_size()):
             raise Unsupported(
                 f"{name}: non-unified kernels need static shapes; compile with "
@@ -319,6 +553,20 @@ def plan_sharded_hbm(graph: GraphLowering) -> None:
                 f"{name}: non-unified kernels need BUNDLE_SYMBOLIC_ARGS=1"
             )
         _check_core_match(placement)
+        if is_reduction:
+            write = next(iter(rw.writes))
+            if len(reads) != 1 or not isinstance(write, MemoryDep):
+                raise Unsupported(
+                    f"{name}: non-unified reductions need exactly one sharded operand"
+                )
+            out_placement = _plan_shard_local_reduction(
+                graph, op, reads[0], write, placement
+            )
+            if out_placement is not None:
+                placements[name] = out_placement
+            else:
+                ring_reductions.add(name)
+            continue
         for dep in reads:
             buf = graph.get_buffer(dep.name)
             if buf is None or list(buf.get_size()) != list(op.get_size()):
@@ -368,12 +616,12 @@ def plan_sharded_hbm(graph: GraphLowering) -> None:
     # kernel over sharded storage and fail only at launch, with an error that
     # names neither the op nor the sharding: reject it here instead.
     for op in graph.operations:
-        if op.get_name() in placements:
+        if op.get_name() in placements or op.get_name() in ring_reductions:
             continue
         rw = op_read_writes(op)
         if any(dep.name in placements for dep in rw.reads):
             raise Unsupported(
-                f"{op.get_name()}: non-unified kernels support pointwise ops on "
-                "sharded operands only (this consumer of sharded storage is not "
-                "one)"
+                f"{op.get_name()}: non-unified kernels support pointwise ops and "
+                "shard-local reductions on sharded operands only (this consumer "
+                "of sharded storage is not one)"
             )
