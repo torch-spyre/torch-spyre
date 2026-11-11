@@ -24,13 +24,16 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 | `torch.bmm` | Y | Y | Spyre | |
 | `torch._grouped_mm` | Y | Y | Spyre | All four upstream shape variants; the ragged ones pack/`bmm`/unpack with host-computed routing tables. BF16 only; `offs` must be a Spyre tensor; raises if routing is too skewed for the static per-expert capacity. |
 | `torch._scaled_mm` | Y | Y | Spyre | Decomposed to `spyre.scaled_mm` (decomposition in `_inductor/decompositions.py`, lowering in `_inductor/lowering.py`); eager dispatch compiles the op through the `COMPILED_OPS` kernel in `ops/eager.py` |
-| `torch.ops.spyre.quantscalepertokenfp8` | | Y | Spyre | Compiled only; no eager fallback. Fused per-token amax + scale computation for FP8 activation quantization |
+| `torch.ops.spyre.quantscalepertokenfp8` | Y | Y | Spyre | Fused per-token amax + scale computation for FP8 activation quantization |
 | `torch.ops.spyre.quantize_fp8_with_scale` | Y | Y | Spyre | Quantize FP16 activation to FP8 using a pre-computed scale (`qfp8ch` layout) |
 | `torch.ops.spyre.quantize_weight_fp8_with_scale` | Y | Y | Spyre | Quantize FP16 weight to FP8 using a pre-computed scale (`qfp8wt` layout) |
 | `torch.ops.spyre.dequantize_fp8_with_scale` | Y | Y | Spyre | Dequantize FP8 tensor to FP16 using a pre-computed scale |
+| `torch.ops.spyre.scaled_bmm` | | Y | Spyre | Compiled-only FP8 batched matmul (3D@2D, 3D@3D, 4D@4D); batched counterpart to `spyre.scaled_mm`. `spyre.bmm_fp8` is the unscaled variant |
 | `torch.nn.functional.linear` | Y | Y | Spyre | Decomposed to `matmul` + `add` |
-| `torch.nn.functional.conv2d` | Y | Y | Spyre | Custom decomposition (`conv2d_via_bmm`); CPU fallback for the im2col step |
+| `torch.conv1d` | Y | Y | Spyre | Lowers through the `conv2d` path (`conv2d_via_bmm_decomp` or the native conv SDSC) |
+| `torch.nn.functional.conv2d` | Y | Y | Spyre | Custom decomposition (`conv2d_via_bmm_decomp`) running entirely on device; a native conv2d SDSC path (`lower_convolution`) is also available |
 | `torch.nn.functional.avg_pool2d` | | Y | Spyre | Compiled only; custom lowering |
+| `torch.nn.functional.max_pool2d` | | Y | Spyre | Compiled only; native maxpool SDSC (`lower_max_pool2d_with_indices`) |
 | `torch.triu` | Y | Y | Spyre | Compiled via mask-multiply decomposition; integer dtypes and `out=` variant fall back to CPU |
 | **Activation Functions** | | | | |
 | `torch.nn.functional.softmax` | Y | Y | Spyre | |
@@ -65,9 +68,9 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 | `torch.pow` | Y | Y | Spyre | `pow.Tensor_Scalar` custom decomposition (`exp(n·log(x))` with an integer fast path); an integer base raises |
 | `torch.nn.functional.mish` | Y | Y | Spyre | Eager via `aten.mish.out` |
 | **Pointwise Binary** | | | | |
-| `torch.add` | Y | Y | Spyre | Supports `alpha` parameter; int32 runs natively via `addi32toi32` |
+| `torch.add` | Y | Y | Spyre | Supports `alpha` parameter; int32/int64 run natively via `addi32toi32` |
 | `torch.sub` | Y | Y | Spyre | Supports `alpha` parameter |
-| `torch.mul` | Y | Y | Spyre | int32 runs natively via `muli32toi32` |
+| `torch.mul` | Y | Y | Spyre | int32/int64 run natively via `muli32toi32` |
 | `torch.div` / `torch.true_divide` | Y | Y | Spyre | `rounding_mode="floor"` supported with limits: quotient magnitude ≤1024 (fp16) or ≤2²⁴ (fp32); ~2.7% fp16 residual-blinding class (#5605); DL16 host input rounding applies. `rounding_mode="trunc"` not yet implemented (#3610). |
 | `torch.floor_divide` | Y | Y | Spyre | Alias for `torch.div(..., rounding_mode="floor")`; same limits apply. |
 | `torch.maximum` | Y | Y | Spyre | |
@@ -96,6 +99,7 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 | `torch.aminmax` | | Y | Spyre | Compiled only; eager not yet supported |
 | `torch.any` | Y | Y | Spyre | Custom lowering; reduces over `dim`/`dims` or the full tensor |
 | `torch.all` | Y | Y | Spyre | Custom decomposition (`abs` + `amin`) |
+| `torch.cumsum` | Y | Y | Spyre | Custom decomposition: matmul with a triangular matrix for fp16/bf16, a parallel prefix scan for fp32/int32/int64. A bool input, or a dtype conversion that changes the element width, falls back to CPU |
 | **View Ops** [^views] | | | | |
 | `torch.reshape` / `torch.view` | | Y | Spyre | Includes `_reshape_alias` (a C++ device view, not an Inductor lowering) |
 | `torch.transpose` | Y | Y | Spyre | |
@@ -133,6 +137,7 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 | **Indexing** | | | | |
 | `torch.embedding` | Y | Y | Spyre | Registered on the compiled path (`ops/eager.py`) |
 | `torch.index_select` | Y | Y | Spyre | Registered on the compiled path (`ops/eager.py`) |
+| `x[index]` (`aten.index.Tensor`) | Y | Y | Spyre | Eager supports one 1-D int32/int64 index on dim 0 (CPU or Spyre), run as `index_select`; an index dtype other than long/int/byte/bool raises `IndexError` as on CPU, and other index forms (including boolean/uint8 masks) and bool source tensors raise `NotImplementedError`. The index is bounds-checked on the host, so a Spyre index takes a D2H round trip; `out=` is not supported. Inherits `index_select`'s limits and compiles once per index length and source shape/layout |
 | `torch.index_add` | | Y | Spyre | Compiled only; custom decomposition (gather + add + overwrite-scatter); requires unique indices |
 | `torch.masked_scatter` | Y | Y | Spyre | Custom decomposition; supported for masks that broadcast along the last (stick) dimension, other masks raise `Unsupported` |
 | **Utility** | | | | |
@@ -146,7 +151,6 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 | `torch.bitwise_or` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.argmax` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.argmin` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
-| `torch.cumsum` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 
 > **Column key:**
 >

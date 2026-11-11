@@ -232,7 +232,6 @@ def register_fallback_default(ops):
 
 register_fallback_default(
     [
-        aten.cumsum,
         aten.arange,
         aten.isin,
         aten.tril,

@@ -33,14 +33,22 @@ from torch._inductor.utils import sympy_index_symbol
 import torch
 from sympy import Symbol
 from torch._inductor.dependencies import MemoryDep, StarDep, WeakDep
+from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     ComputedBuffer,
     FixedLayout,
     FlexibleLayout,
+    InputBuffer,
+    Loops,
+    MutationLayoutSHOULDREMOVE,
     Pointwise,
     Reduction,
+    ReinterpretView,
+    StorageBox,
+    TensorBox,
 )
 from torch._inductor.utils import fresh_cache
+from torch._inductor.virtualized import V
 from torch.utils._sympy.functions import ModularIndexing
 from torch.utils._ordered_set import OrderedSet
 
@@ -51,6 +59,7 @@ from torch_spyre._C import (
     get_device_dtype,
 )
 from torch_spyre._inductor import passes
+from torch_spyre._inductor.loop_carries import apply_loop_carries
 from torch_spyre._inductor import work_division_constraints
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.ir import FixedTiledLayout
@@ -84,6 +93,7 @@ from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 from torch_spyre._inductor.scratchpad.ilp_solver_ortools import CpSatLayoutSolver
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionBuffer,
+    LifetimeBoundBuffer,
     TileAxis,
     TileSpec,
 )
@@ -3467,6 +3477,160 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         with self._patches():
             edges = allocator._parent_residency_edges(None, [], {}, {}, self.residency)
             self.assertEqual(allocator._cd_parent_matches(edges, [], {}), {})
+
+
+class TestCarryWriterEdges(unittest.TestCase):
+    """Writers of a loop carry besides its update, on real IR.
+
+    An ``all_reduce_`` of the loop result leaves a copy-back that writes the
+    carry's storage after the loop. It must own the storage as the storage's
+    producer does, or the storage stays in HBM.
+    """
+
+    SHAPE = (8, 128)
+
+    def setUp(self):
+        self.graph = GraphLowering(torch.fx.symbolic_trace(lambda: None))
+        handler = V.set_graph_handler(self.graph)
+        handler.__enter__()
+        self.addCleanup(handler.__exit__, None, None, None)
+        self.graph.operations = []
+        for name in ("x", "reduced"):
+            buf = InputBuffer(name=name, layout=_fixed_tiled_layout(self.SHAPE))
+            self.graph.name_to_buffer[name] = buf
+            self.graph.graph_inputs[name] = TensorBox(StorageBox(buf))
+        storage = self._op("storage", ["x"])
+        self.update = self._op("upd", ["storage", "x"])
+        record = LoopCarryRecord("storage", "upd", None)
+        storage._loop_carry_record = record
+        self.update._loop_carry_record = record
+        self.graph.graph_outputs = [TensorBox(StorageBox(self.update))]
+        self.allocator = CoOptimizingAllocator(_UNBUILT_SOLVER, size=1)
+        self.residency = {"storage": None}
+
+    def _op(self, name, reads, size=SHAPE, body=Pointwise):
+        def inner_fn(index):
+            offset = index[0] * size[1] + index[1]
+            value = V.ops.load(reads[0], offset)
+            for read in reads[1:]:
+                value = V.ops.add(value, V.ops.load(read, offset))
+            return value
+
+        op = ComputedBuffer(
+            name=name,
+            layout=_fixed_tiled_layout(size),
+            data=body(
+                device=torch.device("spyre:0"),
+                dtype=torch.float16,
+                inner_fn=inner_fn,
+                ranges=list(size),
+            ),
+        )
+        op.operation_name = name
+        self.graph.name_to_buffer[name] = op
+        self.graph.name_to_op[name] = op
+        self.graph.operations.append(op)
+        return op
+
+    def _copy_back(self, name, size=SHAPE, offset=0, body=Pointwise):
+        """The splice's copy of the reduced value into the loop result."""
+        op = self._op(name, ["reduced"], size, body)
+        target = self.update
+        if offset or tuple(size) != self.SHAPE:
+            target = ReinterpretView(
+                data=self.update,
+                layout=FixedLayout(
+                    torch.device("spyre:0"),
+                    torch.float16,
+                    list(size),
+                    FlexibleLayout.contiguous_strides(list(size)),
+                    offset,
+                ),
+            )
+        op.layout = MutationLayoutSHOULDREMOVE(target)
+        return op
+
+    def _carry_edges(self):
+        """The carry edges ``_build_cd_bound_buffers`` would build."""
+        apply_loop_carries(self.graph)
+        op_by_name = {op.get_name(): op for op in self.graph.operations}
+        update_edge = self.allocator._loop_carry_update_edge(
+            op_by_name["upd"], op_by_name, {}, graph=self.graph
+        )
+        edges = {"upd": update_edge}
+        self.allocator._add_carry_writer_edges(
+            self.graph, op_by_name, {}, self.residency, edges
+        )
+        return edges
+
+    def _divisions(self):
+        rows, sticks = sorted(
+            next(iter(op_read_writes(self.graph.get_buffer("storage")).writes)).ranges,
+            key=str,
+        )
+        return [
+            CoreDivision(),
+            CoreDivision(splits={rows: 4}),
+            CoreDivision(splits={sticks: 2}),
+            CoreDivision(splits={rows: 2}),
+        ]
+
+    def test_copy_back_owns_the_storage_like_its_producer(self):
+        copy_back = self._copy_back("copy_back")
+        edge = self._carry_edges()["copy_back"]
+        self.assertEqual(edge.buf_name, "storage")
+        self.assertIs(edge.consumer_op, copy_back)
+        divisions = self._divisions()
+        self.assertEqual(
+            edge.match_pairs(divisions[:3], divisions),
+            [(0, 0), (1, 1), (2, 2)],
+        )
+        self.assertIsNone(self.residency["storage"])
+
+    def test_copy_back_into_an_offset_slice_admits_no_division(self):
+        """It writes only part of the storage, and the edge cannot prove a
+        partial write lands on the cores owning those rows, so the storage
+        cannot be resident."""
+        self._copy_back("copy_back", size=(4, 128), offset=512)
+        edge = self._carry_edges()["copy_back"]
+        self.assertEqual(edge.buf_name, "storage")
+        divisions = self._divisions()
+        self.assertEqual(edge.match_pairs(divisions, divisions), [])
+
+    def test_spill_warning_names_every_writer_once(self):
+        self._copy_back("copy_back")
+        self._copy_back("copy_back_2")
+        self._carry_edges()
+        self.assertEqual(
+            self.allocator._carry_writers, {"storage": ["copy_back", "copy_back_2"]}
+        )
+        storage = LifetimeBoundBuffer("storage", 2048, [0, 1])
+        with self.assertLogs(allocator_module.logger, "WARNING") as logs:
+            self.allocator._warn_spilled_carries([storage])
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("copy_back, copy_back_2", logs.output[0])
+        storage.address = 0
+        with self.assertNoLogs(allocator_module.logger, "WARNING"):
+            self.allocator._warn_spilled_carries([storage])
+
+    def test_writer_without_an_edge_keeps_the_storage_in_hbm_and_warns_once(self):
+        """A ``Loops`` body records no write, so the second copy-back has no
+        edge. The storage leaves the solve with every edge on it, including
+        the first copy-back's."""
+        self._copy_back("copy_back")
+        self._copy_back("no_write", body=Loops)
+        with self.assertLogs(allocator_module.logger, "WARNING") as logs:
+            edges = self._carry_edges()
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("no_write has no ownership edge", logs.output[0])
+        self.assertEqual(edges, {})
+        self.assertEqual(
+            self.residency["storage"], "loop carry writer ownership unavailable"
+        )
+        with self.assertNoLogs(allocator_module.logger, "WARNING"):
+            self.allocator._warn_spilled_carries(
+                [LifetimeBoundBuffer("storage", 2048, [0, 1])]
+            )
 
 
 class TestCloneDivisionMatching(unittest.TestCase):

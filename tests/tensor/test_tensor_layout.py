@@ -18,6 +18,7 @@ import copy
 import json
 import pickle
 
+import sympy
 import torch
 from torch.testing._internal.common_utils import (
     TestCase,
@@ -28,6 +29,7 @@ from torch.testing._internal.common_utils import (
 )
 from torch.spyre import SpyreTensorLayout, get_device_dtype
 from torch_spyre._C import DataFormats, ElementArrangement, get_device_size_in_bytes
+from torch_spyre._inductor.views import compute_coordinates
 
 
 def _valid_elements_for_explicit_layout(sizes, strides, dim_order, dtype=torch.float16):
@@ -1072,6 +1074,13 @@ class TestSpyreTensorLayout(TestCase):
         from torch_spyre._C import ElementArrangement
         from torch_spyre._inductor.propagate_layouts import _qfp8ch_stl
 
+        def _coords(stl, rows, cols):
+            # Device coordinates of a dense read of a host [rows, cols] tensor.
+            r, c = sympy.symbols("r c", integer=True, nonnegative=True)
+            return compute_coordinates(
+                stl.device_size, stl.stride_map, {r: rows, c: cols}, r * cols + c
+            )
+
         fp16 = get_device_dtype(torch.float16)
         one_stick = SpyreTensorLayout(
             [1, 4, 64],
@@ -1080,31 +1089,82 @@ class TestSpyreTensorLayout(TestCase):
             {(0, 2): 64, (1,): 4},
             ElementArrangement.STANDARD,
         )
-        out = _qfp8ch_stl(one_stick, torch.float8_e4m3fn)
+        out = _qfp8ch_stl(one_stick, torch.float8_e4m3fn, _coords(one_stick, 4, 64))
         self.assertEqual(list(out.device_size), [1, 4, 128])
         self.assertEqual(list(out.stride_map), [128, 64, 1])
         self.assertEqual(out.element_arrangement, ElementArrangement.QFP8CH)
         three_sticks = SpyreTensorLayout(
             [3, 4, 64],
-            [64, 64, 1],
+            [64, 192, 1],
             fp16,
             {(0, 2): 192, (1,): 4},
             ElementArrangement.STANDARD,
         )
         self.assertEqual(
-            list(_qfp8ch_stl(three_sticks, torch.float8_e4m3fn).device_size),
+            list(
+                _qfp8ch_stl(
+                    three_sticks, torch.float8_e4m3fn, _coords(three_sticks, 4, 192)
+                ).device_size
+            ),
             [2, 4, 128],
         )
         two_sticks = SpyreTensorLayout(
             [2, 4, 64],
-            [64, 64, 1],
+            [64, 128, 1],
             fp16,
             {(0, 2): 128, (1,): 4},
             ElementArrangement.STANDARD,
         )
         self.assertEqual(
-            list(_qfp8ch_stl(two_sticks, torch.float8_e4m3fn).device_size), [1, 4, 128]
+            list(
+                _qfp8ch_stl(
+                    two_sticks, torch.float8_e4m3fn, _coords(two_sticks, 4, 128)
+                ).device_size
+            ),
+            [1, 4, 128],
         )
+
+    def test_qfp8ch_layout_rescales_the_stick_count_dim_not_a_row_dim(self):
+        """A sequence-rows dim with the stick stride, placed first, must not be
+        taken for the stick-count dim."""
+        from torch_spyre._C import ElementArrangement
+        from torch_spyre._inductor.errors import Unsupported
+        from torch_spyre._inductor.propagate_layouts import _qfp8ch_stl
+
+        a, b, c, d = sympy.symbols("a b c d", integer=True, nonnegative=True)
+        fp16 = get_device_dtype(torch.float16)
+        stl = SpyreTensorLayout(
+            [8, 64, 1, 2, 64],
+            [4096, 64, 64, 32768, 1],
+            fp16,
+            ElementArrangement.STANDARD,
+        )
+        coords = compute_coordinates(
+            stl.device_size,
+            stl.stride_map,
+            {a: 2, b: 8, c: 64, d: 64},
+            a * 32768 + b * 4096 + c * 64 + d,
+        )
+        out = _qfp8ch_stl(stl, torch.float8_e4m3fn, coords)
+        self.assertEqual(list(out.device_size), [8, 64, 1, 2, 128])
+        self.assertEqual(list(out.stride_map), [4096, 64, 128, 32768, 1])
+        # No count dim: must raise rather than rescale a rows dim.
+        with self.assertRaises(Unsupported):
+            _qfp8ch_stl(stl, torch.float8_e4m3fn, [a, b, c, a, d])
+        # Dim 0 (size 2) is not a one-stick count, so the size-1 zero dim 1 is
+        # the count dim. Synthetic: a size-2 constant-0 dim does not arise from
+        # a dense access.
+        skewed = SpyreTensorLayout(
+            [2, 1, 1, 64],
+            [64, 64, 64, 1],
+            fp16,
+            ElementArrangement.STANDARD,
+        )
+        out = _qfp8ch_stl(
+            skewed, torch.float8_e4m3fn, [sympy.S.Zero, sympy.S.Zero, c, d]
+        )
+        self.assertEqual(list(out.device_size), [2, 1, 1, 128])
+        self.assertEqual(list(out.stride_map), [64, 128, 64, 1])
 
     def test_qfp8wt_layout_puts_k_next_to_the_stick(self):
         """qfp8wt's QFP8WT output pairs K with N in a 2D stick, but the device

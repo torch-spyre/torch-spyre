@@ -127,6 +127,7 @@ from torch_spyre._inductor.scratchpad.graph_editor import (
     unwrapped_buffer_name,
 )
 from torch_spyre._inductor.scratchpad.coarse_tiling import (
+    MAX_SEARCH_TILE_DEPTH,
     apply_chosen_tilings,
     planned_splits,
 )
@@ -305,6 +306,25 @@ def _is_loop_carry_storage(op: Any) -> bool:
 
     record = getattr(op, "_loop_carry_record", None)
     return isinstance(record, LoopCarryRecord) and record.storage_name == op.get_name()
+
+
+def _loop_carry_mutation_target(
+    op: Operation, op_by_name: Mapping[str, Operation]
+) -> Optional[str]:
+    """The loop-carry storage ``op`` writes in place, if any."""
+    layout = getattr(op, "layout", None)
+    if not isinstance(op, ComputedBuffer) or not isinstance(
+        layout, MutationLayoutSHOULDREMOVE
+    ):
+        return None
+    name = layout.get_buffer().get_name()
+    record = getattr(op_by_name.get(name), "_loop_carry_record", None)
+    if not isinstance(record, LoopCarryRecord) or name not in (
+        record.storage_name,
+        record.update_name,
+    ):
+        return None
+    return record.storage_name
 
 
 def _collective_stage_storage_is_private(
@@ -3623,6 +3643,21 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         )
         self._stage_collective_outputs(graph, allocation, accepted_lx_relayouts)
         log_solver_decisions(graph, allocation)
+        self._warn_spilled_carries(allocation)
+
+    def _warn_spilled_carries(self, allocation: Sequence[Any]) -> None:
+        """Warn for each carry whose extra writers all had an ownership edge
+        but which the solve still left in HBM."""
+        carry_writers = getattr(self, "_carry_writers", {})
+        for buffer in allocation:
+            writers = carry_writers.get(buffer.name)
+            if writers and buffer.address is None:
+                logger.warning(
+                    "loop carry %s with writers %s spilled to HBM: %s",
+                    buffer.name,
+                    ", ".join(writers),
+                    buffer.spill_reason or "not chosen by the solve",
+                )
 
     def _stage_collective_outputs(
         self,
@@ -4155,7 +4190,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             # keeps it and the output-only specs, preserving that order.
             readers = getattr(self, "_readers_by_name", {}).get(op.get_name(), ())
             options = [
-                t for t in enumerate_tile_options(op, readers=readers) if t.is_clean
+                t
+                for t in enumerate_tile_options(
+                    op, max_dims=MAX_SEARCH_TILE_DEPTH, readers=readers
+                )
+                if t.is_clean
             ]
         except Unsupported:
             options = list(untiled)
@@ -4358,6 +4397,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 continue
             if residency_by_buf.get(record.storage_name) is None:
                 carry_update_edges[record.update_name] = edge
+        self._add_carry_writer_edges(
+            graph, op_by_name, prep_cache, residency_by_buf, carry_update_edges
+        )
 
         input_clone_matches: dict[str, dict[str, list[tuple[int, int]]]] = {}
         # Consumer op name -> input clones for which it is the last reader, and so
@@ -4669,35 +4711,94 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             return None
         if record.update_name != update_op.get_name():
             return None
-        storage_op = op_by_name.get(record.storage_name)
+        return CoOptimizingAllocator._carry_writer_edge(
+            update_op, record.storage_name, op_by_name, prep_cache, graph=graph
+        )
+
+    def _add_carry_writer_edges(
+        self,
+        graph: GraphLowering,
+        op_by_name: dict[str, Operation],
+        prep_cache: dict,
+        residency_by_buf: dict[str, Optional[str]],
+        carry_update_edges: dict[str, ResidencyEdge],
+    ) -> None:
+        """Give each other writer of a carry, e.g. the copy-back of an
+        all_reduce_ into the loop result, the storage's ownership edge.
+
+        A writer without one leaves the storage in HBM and drops every edge
+        on it. Records the writers of each storage in ``_carry_writers``.
+        """
+        self._carry_writers: dict[str, list[str]] = {}
+        for writer in graph.operations:
+            storage_name = _loop_carry_mutation_target(writer, op_by_name)
+            if storage_name is None or writer.get_name() in carry_update_edges:
+                continue
+            if residency_by_buf.get(storage_name) is not None:
+                continue
+            edge = self._carry_writer_edge(
+                writer, storage_name, op_by_name, prep_cache, graph=graph
+            )
+            if edge is not None:
+                carry_update_edges[writer.get_name()] = edge
+                self._carry_writers.setdefault(storage_name, []).append(
+                    writer.get_name()
+                )
+                continue
+            logger.warning(
+                "loop carry %s stays in HBM: its writer %s has no ownership edge",
+                storage_name,
+                writer.get_name(),
+            )
+            # Warned here, so _warn_spilled_carries must not warn again.
+            self._carry_writers.pop(storage_name, None)
+            residency_by_buf[storage_name] = "loop carry writer ownership unavailable"
+            for name in [
+                name
+                for name, edge in carry_update_edges.items()
+                if edge.buf_name == storage_name
+            ]:
+                del carry_update_edges[name]
+
+    @staticmethod
+    def _carry_writer_edge(
+        writer: Operation,
+        storage_name: str,
+        op_by_name: dict[str, Operation],
+        prep_cache: dict,
+        *,
+        graph: GraphLowering | None = None,
+    ) -> Optional[ResidencyEdge]:
+        """The ownership edge for ``writer``'s write through carry ``storage_name``."""
+        storage_op = op_by_name.get(storage_name)
         if storage_op is None:
             return None
         storage_write = next(
             (
                 dep
                 for dep in op_read_writes(storage_op).writes
-                if dep.name == record.storage_name and isinstance(dep, MemoryDep)
+                if dep.name == storage_name and isinstance(dep, MemoryDep)
             ),
             None,
         )
-        update_write = next(
+        write = next(
             (
                 dep
-                for dep in op_read_writes(update_op).writes
-                if dep.name == record.update_name and isinstance(dep, MemoryDep)
+                for dep in op_read_writes(writer).writes
+                if dep.name == writer.get_name() and isinstance(dep, MemoryDep)
             ),
             None,
         )
-        if storage_write is None or update_write is None:
+        if storage_write is None or write is None:
             return None
         return ResidencyEdge(
-            buf_name=record.storage_name,
+            buf_name=storage_name,
             parent_op=storage_op,
-            consumer_op=update_op,
+            consumer_op=writer,
             write_dep=storage_write,
-            read_deps=(update_write.rename({record.update_name: record.storage_name}),),
+            read_deps=(write.rename({writer.get_name(): storage_name}),),
             prep_cache=prep_cache,
-            local_read_geometry=local_lx_read_geometry(graph, storage_op, update_op)
+            local_read_geometry=local_lx_read_geometry(graph, storage_op, writer)
             if graph is not None
             else None,
         )
@@ -4843,7 +4944,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         from torch_spyre._inductor.wsr.enumerate_tilings import build_tiling_space
 
         tiling = (
-            build_tiling_space(op, readers=readers)
+            build_tiling_space(op, max_dims=MAX_SEARCH_TILE_DEPTH, readers=readers)
             if self._solver_chooses_tilings
             else None
         )

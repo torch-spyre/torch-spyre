@@ -773,7 +773,8 @@ Environment Variables
    * - ``TORCH_SPYRE_TIMING``
      - Record structured per-compile frontend timings: one JSON event per
        pass pipeline and per pass, with input/output graph sizes and
-       analysis-call counts (default ``0``)
+       analysis-call counts, plus PyTorch's own compile phases (default
+       ``0``)
    * - ``TORCH_SPYRE_TIMING_OUT``
      - Destination for the ``TORCH_SPYRE_TIMING`` record. The pid is
        inserted before the suffix, so ``rec.json`` is written as
@@ -796,7 +797,9 @@ Environment Variables
    * - ``SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS``
      - Ignore the compiler-generated span-overflow coarse-tiling hints.
        Defaults to ``1`` (disabled/opt-in): set to ``0`` to enable
-       automatic span-overflow coarse tiling.
+       automatic span-overflow coarse tiling. A tiling that nests more than
+       one loop level, which a very large matmul can need, raises
+       ``Unsupported`` (#6088).
    * - ``SPYRE_INDUCTOR_SDSC_CACHE``
      - Cache and reuse ``sdsc.json`` files during codegen when two OpSpecs
        produce identical SuperDSC content, reducing bundle size for
@@ -804,6 +807,11 @@ Environment Variables
    * - ``SPYRE_VALIDATE_OP_SPECS``
      - Validate OpSpecs at pipeline stage boundaries to catch invariant
        violations early (default ``1``; set ``0`` to disable)
+   * - ``SPYRE_VALIDATE_EVERY_PASS``
+     - Check the topological order of ``graph.operations`` after every
+       pre-scheduling pass, to name the pass that broke it. The check
+       after the last pass always runs (default ``0``; set ``1`` to
+       enable)
    * - ``SPYRE_CONV2D_DIRECT``
      - Emit a native conv2d SDSC (``opFuncName="conv2d"`` on the ``pt``
        unit) instead of the im2col + matmul decomposition. Off by default
@@ -880,6 +888,23 @@ Environment Variables
        count is derived from the cgroup v2 quota, then ``psutil``, then
        ``os.cpu_count()``. Not part of the compile cache key, so a cached
        compile is reused whatever the value
+   * - ``AUTO_COARSE_TILING``
+     - Let the co-optimizing solver choose coarse tiling for ops the search
+       deems tileable (default ``0``)
+   * - ``SPYRE_SINK_COLLECTIVE_WAITS``
+     - Schedule each collective wait as late as its consumers allow, so
+       compute that does not depend on the collective runs in its own bundle
+       rather than being fused behind the wait (default ``0``)
+   * - ``SPYRE_LX_EXTENDED_OWNERSHIP``
+     - Enable the optional ownership proofs and local reads added after prefix
+       support (default ``1``; set ``0`` to keep the earlier ownership and
+       prefix rules)
+   * - ``SPYRE_NDO_MATMUL_OUTPUT_REORDER``
+     - Extend the phase-2 matmul perf reorder (NDO) to the matmul's own output
+       buffer in addition to its input buffers (default ``0``)
+   * - ``MIN_RESERVED_DIM_SIZE``
+     - Minimum size a reserved dimension is held to when reserving HBM for a
+       dynamic shape (default ``8``)
 
 **Device enumeration** (``torch_spyre/csrc/spyre_device_enum.cpp``):
 

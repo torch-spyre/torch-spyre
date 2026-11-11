@@ -412,7 +412,7 @@ class TestFP8Operations:
         fp8todl16 (dequantize uses a 1D flat read), so a naive quantize→dequantize
         roundtrip will not match a CPU reference. Numerical correctness of the
         qfp8wt → batchmatmulfp8 path is covered by test_fp8_scaled_mm in
-        test_inductor_ops.py.
+        test_inductor_ops.py and by fp8/test_fp8_scaled_mm.py.
         """
         weight = cached_randn((128, 128), dtype=torch.float16, scale=1.0)
         scale = torch.max(torch.abs(weight)).reshape(1)
