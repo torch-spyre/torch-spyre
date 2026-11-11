@@ -47,6 +47,7 @@ from .ir import (
     FixedTiledLayout,
     SpyreConstantFallback,
     SpyreEmptyFallback,
+    SpyreArangeFallback,
 )
 from .logging_utils import get_inductor_logger
 from .op_spec import IndirectAccess
@@ -2860,9 +2861,18 @@ def _iter_computed_buffers(operations: list[Operation]):
         elif isinstance(op, MultiOutput):
             pass
         elif isinstance(op, ExternKernel):
-            if isinstance(op, (SpyreConstantFallback, SpyreEmptyFallback, DeviceCopy)):
+            if isinstance(
+                op,
+                (
+                    SpyreConstantFallback,
+                    SpyreEmptyFallback,
+                    SpyreArangeFallback,
+                    DeviceCopy,
+                ),
+            ):
                 # Work division not supported on allocation/constant kernels, nor
-                # on DeviceCopy.
+                # on DeviceCopy.  A coordinate is materialized by the runtime
+                # rather than by a kernel, so it has no iteration space to divide.
                 pass
             else:
                 logger.warning(f"unhandled node type {type(op)}")
