@@ -1449,6 +1449,61 @@ class TestForEachTileSubStickAdvanceE2E(_DynamoResetTestCase):
             compiled(pool, ids, init)
 
 
+# --- Slice(dim, extent) as the for_each_tile#5763 remedy --------------------
+
+SCALE_TRIPS, SCALE_WIDTH = 4, 256
+
+
+def slice_scale_row_fn(x, scale, init):
+    from torch_spyre._inductor.wsr import Slice, for_each_tile
+
+    def fn(x, scale, init):
+        def body(carry, tiles):
+            x_tile, scale_row = tiles
+            return (carry[0] + x_tile * scale_row,), None
+
+        (acc,), _ = for_each_tile(
+            body, (x, scale), dims=(0, Slice(0, extent=1)), tile_size=1, init=(init,)
+        )
+        return acc
+
+    return fn(x, scale, init)
+
+
+class TestForEachTileSliceScaleTableE2E(_DynamoResetTestCase):
+    """Slice(dim, extent) compiled on device at the exact shape issue #5763 reports.
+
+    #5763 ("for_each_tile with a short Gather index fails") gathers one row at a
+    time from a [4, 256] fp16 scale table with a 4-long index -- the same
+    sub-stick, one-element-per-trip advance ``TestForEachTileSubStickAdvanceE2E``
+    above still refuses; Gather itself is unchanged by this PR. ``Slice(0,
+    extent=1)`` is the issue's other accepted fix: a per-trip row that is really
+    just "the next row" needs no index table at all.
+    ``test_slice_extent_differs_from_tile_size`` in test_for_each_tile.py already
+    covers this through ``_assert_lowers`` -- the post-grad graph's shape only,
+    no device involved. This test compiles the issue's own [4, 256] shape through
+    the real Spyre backend, so the fix is exercised where #5763 originally
+    failed -- codegen -- and "downstream needs no change" is checked in CI, not
+    just asserted in the PR description.
+    """
+
+    def test_slice_scale_table_compiles_at_issue_shape(self):
+        x = cached_randn((SCALE_TRIPS, SCALE_WIDTH))
+        scale = cached_randn((SCALE_TRIPS, SCALE_WIDTH), differentiation=1)
+        init = torch.zeros(1, SCALE_WIDTH, dtype=torch.float16)
+
+        ref = torch.zeros(1, SCALE_WIDTH)
+        for i in range(SCALE_TRIPS):
+            ref = ref + dl16_round(x[i : i + 1].float()) * dl16_round(
+                scale[i : i + 1].float()
+            )
+
+        compiled = torch.compile(slice_scale_row_fn, backend="inductor", fullgraph=True)
+        out = compiled(x.to(DEVICE_NAME), scale.to(DEVICE_NAME), init.to(DEVICE_NAME))
+
+        torch.testing.assert_close(out.cpu().float(), ref, atol=1e-2, rtol=1e-2)
+
+
 class TestForEachTileGraphShapesE2E(_DynamoResetTestCase):
     """for_each_tile bodies that exercise passes beyond plain tiling.
 

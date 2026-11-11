@@ -99,7 +99,6 @@ from .views import (
     AlignmentInputs,
     build_alignment_inputs,
     compute_coordinates,
-    matching_dim,
 )
 
 # PyTorch's default lower bound for size symbols (sizes 0/1 are specialised).
@@ -1623,6 +1622,11 @@ def is_stick_expr_offset_free(stick_expr: sympy.Expr, elems_per_stick: int) -> b
 
 def _is_stick_expr_with_offset(stick_expr: sympy.Expr, elems_per_stick: int) -> bool:
     """Return True if stick_expr is an offset variant: Mod(var, N) + c or var + c."""
+    if isinstance(stick_expr, sympy.Integer):
+        assert 0 <= int(stick_expr) < elems_per_stick, (
+            f"stick coordinate {stick_expr} outside its stick ({elems_per_stick})"
+        )
+        return stick_expr != 0
     if not isinstance(stick_expr, sympy.Add):
         return False
     free_args = [a for a in stick_expr.args if a.free_symbols]
@@ -2482,7 +2486,13 @@ def _host_size_stride_for_expr(
     from .propagate_layouts import _factorized_chain  # noqa: PLC0415
 
     if var not in arg.dep.ranges:
-        # Broadcast dimension: this tensor does not vary along var.
+        # Indirect gather index (e.g. x[i] where i comes from another tensor):
+        # the symbol is not a loop variable so it is absent from dep.ranges, but
+        # the tensor does vary.  Indirect-access tensors are always 1D on the
+        # host; len(host_size) == 1 is the load-bearing guard that prevents
+        # silent mis-resolution if that assumption is ever violated.
+        if is_indirect(var.name) and len(host_size) == 1:
+            return host_size[0], host_stride[0]
         return None
     try:
         host_dims, _var_range, var_stride = _factorized_chain(
@@ -2536,7 +2546,7 @@ def compute_restickify_target_layout(
     ``_factorized_chain``.
     """
     if target_stick_expr == sympy.S.Zero:
-        return compute_size1_restickify_layout(stl, host_layout, ic, idc)
+        return compute_size1_restickify_layout(stl, host_layout, ic, idc, arg=arg)
     if not target_stick_expr.free_symbols:
         return None
     host_size = [concretize_expr(s) for s in host_layout.size]
@@ -2611,24 +2621,30 @@ def compute_size1_restickify_layout(
     host_layout: FixedLayout,
     ic: list,
     idc: list,
+    *,
+    arg: "PropArg",
+    label: str = "",
 ) -> "SpyreTensorLayout | None":
     """Compute the target STL that results from moving stl's stick onto a size-1 dim.
 
     Each stick then holds one element. The size-1 dim need not exist on the host:
     it behaves the same whether it is real or synthetic.
 
-    This is what lets _make_output_stl in propagate_layouts.py put the stick on a
-    size-1 dim: such a layout has a stick expression of the constant 0, which
-    matching_dim cannot resolve to a host dim.
+    ``arg`` and ``label`` are forwarded to ``_host_size_stride_for_expr`` to
+    enable resolution of factorized (FloorDiv) coordinate expressions via
+    ``_factorized_chain``.
 
     Returns None if the restickify is infeasible.
     """
     host_size = [concretize_expr(s) for s in host_layout.size]
     host_stride = [concretize_expr(s) for s in host_layout.stride]
-    old_sd = matching_dim(ic, idc[-1])
-    if old_sd is None:
-        return None
     old_stick_expr = idc[-1]
+    ss = _host_size_stride_for_expr(
+        old_stick_expr, ic, host_size, host_stride, arg, label
+    )
+    if ss is None:
+        return None
+    old_sd_host_size, old_sd_host_stride = ss
     old_var = next(iter(old_stick_expr.free_symbols))
     stick_size = get_elem_in_stick(host_layout.dtype)
     old_var_outer_dims = [
@@ -2665,7 +2681,7 @@ def compute_size1_restickify_layout(
     device_size = restickify_device_size(
         list(stl.device_size),
         old_sd_outer_dim,
-        host_size[old_sd],
+        old_sd_host_size,
         new_sd_outer_dim,
         1,
         stick_size,
@@ -2673,7 +2689,7 @@ def compute_size1_restickify_layout(
     stride_map = restickify_stride_map(
         list(stl.stride_map),
         old_sd_outer_dim,
-        host_stride[old_sd],
+        old_sd_host_stride,
         new_sd_outer_dim,
         -1,
         stick_size,
@@ -2945,12 +2961,16 @@ def compute_size1_restickify_target(
     Used when the input's stick var must leave the stick (e.g. topk's
     reduction var) and no other dim can take it.
     """
+    # Local import avoids circular dependency (propagate_layouts imports pass_utils).
+    from .propagate_layouts import PropArg  # noqa: PLC0415
+
     _, _, ind_sizes = indirect_info_from_op(op)
     idc = try_device_coordinates(in_stl, in_dep, ind_sizes, op=op)
     if idc is None:
         return None
     ic = host_coordinates(in_host, in_dep, ind_sizes, op=op)
-    return compute_size1_restickify_layout(in_stl, in_host, ic, idc)
+    arg = PropArg(in_dep, in_host, [in_stl])
+    return compute_size1_restickify_layout(in_stl, in_host, ic, idc, arg=arg)
 
 
 def copy_fx_custom_meta(src: "torch.fx.Node", dst: "torch.fx.Node") -> None:

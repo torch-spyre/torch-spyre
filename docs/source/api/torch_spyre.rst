@@ -807,6 +807,11 @@ Environment Variables
    * - ``SPYRE_VALIDATE_OP_SPECS``
      - Validate OpSpecs at pipeline stage boundaries to catch invariant
        violations early (default ``1``; set ``0`` to disable)
+   * - ``SPYRE_VALIDATE_EVERY_PASS``
+     - Check the topological order of ``graph.operations`` after every
+       pre-scheduling pass, to name the pass that broke it. The check
+       after the last pass always runs (default ``0``; set ``1`` to
+       enable)
    * - ``SPYRE_CONV2D_DIRECT``
      - Emit a native conv2d SDSC (``opFuncName="conv2d"`` on the ``pt``
        unit) instead of the im2col + matmul decomposition. Off by default

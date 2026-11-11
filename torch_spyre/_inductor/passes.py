@@ -16,7 +16,7 @@ import contextlib
 import inspect
 import logging
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Iterable
 from typing import Optional, Any, Callable
 
 import torch
@@ -33,11 +33,12 @@ except ImportError:
 
 
 from torch._inductor.graph import GraphLowering
-from torch._inductor.ir import Operation
+from torch._inductor.ir import MultiOutput, Operation
 from torch._inductor.scheduler import BaseSchedulerNode
 
 from . import timing_recorder
 from .logging_utils import get_inductor_logger
+from . import pass_counters
 from .pass_counters import COUNTERS
 from .provenance import SpyreGraphTransformObserver, reset_provenance_warnings
 
@@ -700,6 +701,17 @@ class CustomPreSchedulingPasses:
                     raise
                 _hand_off_loop_nodes(graph)
 
+            # Always on, once: a pass that breaks the order is caught here even
+            # with the per-pass check (config.validate_every_pass) off. Its own
+            # region, so the pass loop's time is the passes' alone. all_ops
+            # descends into any LoopNode the hand-off kept.
+            with timing_recorder.stage(f"stage:{pipeline}:validate"):
+                try:
+                    check_final_operation_order(all_ops(graph.operations), pipeline)
+                except BaseException:
+                    expand(graph)
+                    raise
+
             if logger.isEnabledFor(logging.INFO):
                 with timing_recorder.stage(f"stage:{pipeline}:log_after"):
                     logger.info(
@@ -765,6 +777,13 @@ class CustomPreSchedulingPasses:
             event.meta["output_operations"] = _count_ops(graph.operations)
             event.meta.update(COUNTERS.since(pass_counts))
 
+        # Opt-in, to name the pass that broke the order once the check after the
+        # last pass has said that one did. Outside the pass's region and its
+        # counter deltas, so neither is charged for the check.
+        if config.validate_every_pass:
+            with timing_recorder.stage(f"validate:{pipeline}:{pass_name}"):
+                check_operation_order(all_ops(graph.operations), pass_name)
+
         if logger.isEnabledFor(logging.INFO):
             logger.info(
                 "elapsed %5dms  %s",
@@ -780,3 +799,113 @@ class CustomPreSchedulingPasses:
 
     def uuid(self) -> Any | None:
         return _uuid(self.passes)
+
+
+class InvalidGraphError(AssertionError):
+    """A pre-scheduling pass left ``graph.operations`` ill formed."""
+
+
+def _output_names(op: Operation) -> list[str]:
+    names = [op.get_name()]
+    try:
+        names.extend(buf.get_name() for buf in op.get_outputs())
+    except NotImplementedError:
+        pass
+    return names
+
+
+def _read_names(op: Operation) -> set[str]:
+    """Names of the buffers ``op`` reads.
+
+    Uses ``get_read_writes()``, which the Scheduler builds its dependencies
+    from and which nothing caches on the node. ``get_read_names()`` caches the
+    traced body (``inner_fn_opcount``), which could leave a stale answer for a
+    later reader once a pass rewrites the body, and ``get_reads()`` raises
+    ``NotImplementedError`` on a ``Reduction`` body.
+
+    An operation whose ``get_read_writes()`` raises ``NotImplementedError``
+    (some extern kernels) falls back to ``get_read_names()``, the cached path
+    above, so for those operations a pass that changes their inputs could
+    leave a stale answer. Only extern kernels that do not describe their reads
+    take this path.
+    """
+    try:
+        names = {dep.name for dep in op.get_read_writes().reads}
+    except NotImplementedError:
+        # An operation that does not describe its reads (some extern kernels).
+        names = set(op.get_read_names())
+    # A MultiOutput reads its parent; say so even if get_read_writes() stops
+    # reporting it, since the order of the two is what codegen relies on.
+    if isinstance(op, MultiOutput):
+        names.update(inp.get_name() for inp in op.inputs if hasattr(inp, "get_name"))
+    return names
+
+
+def _order_violation(operations: Iterable[Operation]) -> Optional[str]:
+    """Describe the first read of a buffer produced later, or None if none.
+
+    Each operation must come after the producer of every buffer it reads. A name
+    that no operation in the list produces (a graph input, a constant, a buffer
+    of an enclosing graph) is outside the check. A read of an operation's own
+    output is allowed: a mutation reads the buffer it updates in place.
+
+    The read sets are extracted afresh (see :func:`_read_names`), which is not
+    the work the pass counters describe, so counting is paused meanwhile:
+    otherwise the check would be charged to the enclosing pass or pipeline and
+    move the bounds in ``test_frontend_work_bounds.py``.
+    """
+    with pass_counters.paused():
+        ops = list(operations)
+        producer: dict[str, int] = {}
+        for i, op in enumerate(ops):
+            for name in _output_names(op):
+                producer.setdefault(name, i)
+
+        for i, op in enumerate(ops):
+            for name in sorted(_read_names(op)):
+                j = producer.get(name)
+                if j is not None and j > i:
+                    return (
+                        f"operation {op.get_name()} ({type(op).__name__}) at "
+                        f"position {i} reads {name}, which {ops[j].get_name()} "
+                        f"({type(ops[j]).__name__}) produces later, at position {j}"
+                    )
+    return None
+
+
+def check_operation_order(operations: Iterable[Operation], pass_name: str) -> None:
+    """Raise :class:`InvalidGraphError` unless ``operations`` is topologically
+    ordered after the pass ``pass_name``.
+
+    Runs after every pre-scheduling pass when ``config.validate_every_pass`` is
+    on. See :func:`_order_violation` for what is checked.
+
+    Args:
+        operations: The flat list of leaf operations, in program order.
+        pass_name: The pass that just ran, named in the error.
+    """
+    violation = _order_violation(operations)
+    if violation is not None:
+        raise InvalidGraphError(f"after pre-scheduling pass {pass_name}: {violation}")
+
+
+def check_final_operation_order(operations: Iterable[Operation], pipeline: str) -> None:
+    """Raise :class:`InvalidGraphError` unless ``operations`` is topologically
+    ordered at the end of the pipeline ``pipeline``.
+
+    Always runs, once per compile. It cannot say which pass broke the order, so
+    the error tells the developer how to find out.
+
+    Args:
+        operations: The flat list of leaf operations, in program order.
+        pipeline: The pipeline that just ran, named in the error.
+    """
+    violation = _order_violation(operations)
+    if violation is not None:
+        raise InvalidGraphError(
+            f"after the {pipeline} pre-scheduling passes: {violation}. A pass "
+            "left graph.operations out of topological order. To find which, "
+            "rerun with SPYRE_VALIDATE_EVERY_PASS=1 (or "
+            "torch_spyre._inductor.config.validate_every_pass = True), which "
+            "checks the order after every pass and names the one that broke it."
+        )
