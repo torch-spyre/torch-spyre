@@ -91,6 +91,7 @@ from .pass_utils import (
     get_matmul_n_size,
     identify_matmul_inputs,
     host_coordinates,
+    host_sparse_layout,
     device_coordinates,
     try_device_coordinates,
     indirect_info_from_op,
@@ -100,6 +101,7 @@ from .pass_utils import (
     iter_var_id,
     op_read_writes,
     rescale_stl_for_dtype,
+    sparse_layout_serves_read,
 )
 from .optimize_restickify import AllSameNode, AnyInNode, FixedInOutNode
 from .views import compute_coordinates, matching_dim
@@ -595,16 +597,25 @@ def _reduction_layout_from_stl(
     )
     stick_size = get_elem_in_stick(out_dtype_for_layout)
 
+    c_size = [concretize_expr(s) for s in output.size]
+    c_stride = [concretize_expr(s) for s in output.stride]
+
     x_dev_coords = try_device_coordinates(stl, dep, None)
     if x_dev_coords is None:
+        # TODO(#5966): as in _default_pointwise_layout, try a dense relocation of
+        # the stick before returning the sparse output, and derive the output
+        # candidates below from the relocated layout.
+        if sparse_layout_serves_read(stl, in_layout, dep) is not None:
+            # As for a pointwise op below.
+            # TODO(#5872): return the sparse output as one candidate next to the
+            # normal ones, not early; compute_restickify_needed does not check
+            # that its sparse target is stick_compatible with the output.
+            return [host_sparse_layout(output, out_dtype_for_layout)]
         return []
     x_stick_expr = x_dev_coords[-1]
     reduction_var = next(
         iter(dep.index.free_symbols - output_dep.index.free_symbols), None
     )
-
-    c_size = [concretize_expr(s) for s in output.size]
-    c_stride = [concretize_expr(s) for s in output.stride]
 
     # Do not preserve the input layout for reduction ops listed in
     # REDUCTIONS_NON_STICK_DIM_ONLY when reducing along the stick
@@ -800,6 +811,20 @@ def _default_pointwise_layout(
     c_stride = [concretize_expr(s) for s in output.stride]
     in_device_coords = try_device_coordinates(stl, dep, None)
     if in_device_coords is None:
+        # TODO(#5966): before returning the sparse output, try a dense
+        # relocation of the stick (see compute_restickify_needed) and derive the
+        # output candidates below from the relocated layout, as for any other
+        # input layout. The sparse output stays as the fallback for a read with
+        # no dim to move the stick to.
+        if sparse_layout_serves_read(stl, in_layout, dep) is not None:
+            # A read the input's layout cannot serve (flattening [8, 65] into
+            # [520] splits a stick): compute_restickify_needed moves the input to
+            # its sparse layout, and the output is sparse on its own host dims.
+            # TODO(#5872): return the sparse output as one candidate next to the
+            # normal ones, not early. A rule that also offers a dense output for
+            # this read would get a sparse target that cannot feed it, because
+            # compute_restickify_needed does not check stick_compatible.
+            return [host_sparse_layout(output, out_dtype_for_layout)]
         return []
     stick_expr = in_device_coords[-1]
     stick_exprs = _compatible_output_stick_exprs(stick_expr, out_coords, dep)
