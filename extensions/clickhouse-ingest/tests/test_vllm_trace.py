@@ -19,7 +19,7 @@ import shutil
 from pathlib import Path
 
 import pytest
-from spyre_clickhouse_ingest import vllm_trace
+from spyre_clickhouse_ingest import benchmeta, vllm_trace
 from spyre_clickhouse_ingest.__main__ import main as cli
 from spyre_clickhouse_ingest.identity import benchmark_id_for
 
@@ -368,3 +368,74 @@ def test_by_pass_as_bare_seconds_still_reads():
     rows = by_type(vllm_trace.entries(ctx))["compile_pass"]
     assert [(r["props"]["pass"], r["measurements"]["self_s"], r["iterations"])
             for r in rows] == [("Pre:a", [1.5], 0)]  # fmt: skip
+
+
+def _fleet_copy(tmp_path):
+    run, ana = tmp_path / "w1", tmp_path / "rep"
+    shutil.copytree(FLEET / "out" / "w1", run)
+    shutil.copytree(FLEET / "rep", ana)
+    return run, ana
+
+
+def _counts(rows):
+    return {k: len(v) for k, v in by_type(rows).items()}
+
+
+@pytest.mark.parametrize(
+    "path, text",
+    [
+        ("rep/w1.res.json", "[1, 2]"),
+        ("rep/w1.res.json", "{broken"),
+        ("rep/w1.roof.json", '{"kernels": 5}'),
+        ("rep/w1.roof.json", '{"kernels": [5, null, {"key": 7, "phase": []}]}'),
+        ("rep/w1.host.json", "5"),
+        ("rep/w1.host.json", "[5]"),
+        ("rep/w1.host.json", "[" * 200000),
+        ("out/w1/manifest.json", "[1]"),
+        ("out/w1/env.json", "[1]"),
+        ("out/w1/rank0/compile_summary.json", '"x"'),
+        ("out/w1/rank0/kernel_cost.jsonl", '5\n[1]\n{"cost": 3, "key": "k"}\n\xff'),
+        ("out/w1/rank0/phases.jsonl", '{"t": 1e999}\n'),
+        ("out/w1/rank0/phases.jsonl", "[1]"),
+    ],
+)
+def test_a_wrong_shaped_optional_file_never_aborts_the_ingest(tmp_path, path, text):
+    run, ana = _fleet_copy(tmp_path)
+    target = tmp_path / path.replace("rep/", "rep/").replace("out/w1", "w1")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(text, errors="surrogateescape")
+    ctx = vllm_trace.load(run, ana, "w1")
+    assert vllm_trace.entries(ctx)
+
+
+def test_wrong_typed_fields_drop_that_record_and_keep_the_rest():
+    ctx = fleet_ctx()
+    good = _counts(vllm_trace.entries(ctx))
+    res, roof = ctx["res"], ctx["roof"]
+    res["phases"]["init"] = 5
+    res["phases"]["import"]["wall_s"] = 10**400
+    res["phases"]["decode"]["top_thread_groups"] = [1]
+    res["steps"] = {"prefill": [1], "decode": {"n": "x", "wall_ms": float("nan")}}
+    res["compile"]["by_pass"]["bad"] = {"self_s": "x", "n": [1]}
+    res["compile"]["by_pass"][3] = 4
+    roof["kernels"][0]["aten"] = [1, None, "aten.mm.default"]
+    roof["kernels"][1]["calls"] = "many"
+    roof["kernels"][2]["median_us"] = float("inf")
+    ctx["host"]["decode_summary"] = {
+        "fallback_ops": {"op": 5, "ok": {"ms_per_step": "x"}}
+    }
+    rows = vllm_trace.entries(ctx)
+    assert vllm_trace.run_props(ctx)
+    c = _counts(rows)
+    assert c["trace_kernel"] == good["trace_kernel"]
+    assert c["trace_phase"] == good["trace_phase"] - 1
+    for r in rows:
+        for v in r["measurements"].values():
+            assert all(x == x and abs(x) != float("inf") for x in v)
+
+
+def test_benchmeta_flatten_swallows_malformed_data():
+    assert benchmeta.flatten("env", {"cards": 5, "host": "n1"}) == {}
+    assert benchmeta.flatten("compile_summary", {"total_s": 4}) == {
+        "compile_total_s": "4"
+    }

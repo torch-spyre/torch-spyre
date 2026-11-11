@@ -1109,3 +1109,9 @@ def test_the_sidecar_names_are_one_definition():
     from spyre_clickhouse_ingest import benchmeta
 
     assert benchmeta.is_sidecar is offline.is_sidecar
+
+
+def test_trace_bundle_files_are_not_mistaken_for_sidecars():
+    root = Path(__file__).parent / "data" / "vllm_trace"
+    names = {p.name for p in root.rglob("*.json") if offline.is_sidecar(p.name)}
+    assert names <= {"env.json", "compile_summary.json"}

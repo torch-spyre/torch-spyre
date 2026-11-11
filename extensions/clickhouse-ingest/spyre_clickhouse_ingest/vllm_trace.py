@@ -26,6 +26,8 @@ by a performance verdict, as vllm.py's rows are.
 import argparse
 import glob
 import json
+import logging
+import math
 import regex as re
 import sys
 from collections import Counter
@@ -35,6 +37,8 @@ from typing import Any
 
 from . import benchmeta
 from .identity import RunId
+
+log = logging.getLogger(__name__)
 
 REPORT_KIND = "vllm-trace"
 BACKEND = "spyre"
@@ -97,15 +101,41 @@ def _num(v: Any) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool)
 
 
+def _f(v: Any) -> float | None:
+    """v as a finite float; None for a non-number, NaN, infinity or an int beyond float."""
+    if not _num(v):
+        return None
+    try:
+        x = float(v)
+    except OverflowError:
+        return None
+    return x if math.isfinite(x) else None
+
+
+def _n(v: Any) -> int:
+    x = _f(v)
+    return int(x) if x is not None else 0
+
+
+def _dict(v: Any) -> dict:
+    return v if isinstance(v, dict) else {}
+
+
+def _list(v: Any) -> list:
+    return v if isinstance(v, list) else []
+
+
 def _json(path: Path) -> Any:
+    """The parsed file; None when unreadable, since every file here describes a run and never decides one."""
     try:
         return json.loads(path.read_text())
-    except (OSError, ValueError) as err:
-        raise TraceError(f"unreadable {path}: {err}") from None
+    except (OSError, ValueError, RecursionError) as err:
+        log.warning("Unreadable %s (%s) — skipped", path, err)
+        return None
 
 
 def _measure(src: dict, fields: dict[str, str]) -> dict[str, list[float]]:
-    return {to: [float(src[k])] for k, to in fields.items() if _num(src.get(k))}
+    return {to: [x] for k, to in fields.items() if (x := _f(src.get(k))) is not None}
 
 
 def family(aten: list[str]) -> str:
@@ -149,7 +179,7 @@ def _artifact(run: Path) -> tuple[dict, dict]:
         p = run / name
         if not p.is_file():
             continue
-        d = _json(p)
+        d = _dict(_json(p))
         block = d if key is None else d.get(key)
         if (
             isinstance(block, dict)
@@ -173,9 +203,13 @@ def _run_utc(run: Path) -> str:
         if p.is_file():
             try:
                 t = json.loads(p.read_text().splitlines()[0])["t"]
-            except (IndexError, KeyError, ValueError):
+                return datetime.fromtimestamp(t, timezone.utc).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+            except (
+                IndexError, KeyError, TypeError, ValueError, OverflowError, OSError, RecursionError
+            ):  # fmt: skip
                 continue
-            return datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     return ""
 
 
@@ -186,15 +220,23 @@ def _predicted(run: Path) -> dict[str, float]:
         str(run / "*" / "kernel_cost*.jsonl")
     )
     for path in sorted(paths):
-        for line in Path(path).read_text().splitlines():
+        try:
+            lines = Path(path).read_text().splitlines()
+        except (OSError, ValueError):
+            continue
+        for line in lines:
             try:
-                r = json.loads(line)
-            except ValueError:
+                r = _dict(json.loads(line))
+            except (ValueError, RecursionError):
                 continue
-            cost = r.get("cost")
+            cost = _dict(r.get("cost"))
             key = r.get("provenance_key") or r.get("key")
-            if key and isinstance(cost, dict) and _num(cost.get("predicted_us")):
-                out[key] = float(cost["predicted_us"])
+            if (
+                isinstance(key, str)
+                and key
+                and (x := _f(cost.get("predicted_us"))) is not None
+            ):
+                out[key] = x
     return out
 
 
@@ -240,24 +282,29 @@ def load(run_dir, analyzed=None, label="", **workload) -> dict:
     """Everything the rows need, from the run dir and its analyzed JSON."""
     run = Path(run_dir)
     ana = Path(analyzed) if analyzed else run
-    manifest = _json(run / "manifest.json") if (run / "manifest.json").is_file() else {}
+    manifest = (
+        _dict(_json(run / "manifest.json")) if (run / "manifest.json").is_file() else {}
+    )
     # Harness bundles all sit in a dir named `trace`: their manifest names the run.
     label = label or manifest.get("label") or run.name
     found = {}
     for kind in ("res", "roof", "host"):
         for p in (ana / f"{label}.{kind}.json", ana / f"{kind}.json"):
             if p.is_file():
-                found[kind] = _json(p)
-                break
+                got = _json(p)
+                if got is not None:
+                    found[kind] = got
+                    break
     if not found:
         raise TraceError(f"no {label}.res/roof/host.json in {ana}")
     host = found.get("host")
     n_ranks = len(host) if isinstance(host, list) else None
     if isinstance(host, list):
         host = host[0] if host else None
+    host = _dict(host)
     art, env = _artifact(run)
-    e2e_json = _first_json(run, "e2e.json") or {}
-    args = e2e_json.get("args", {})
+    e2e_json = _dict(_first_json(run, "e2e.json"))
+    args = _dict(e2e_json.get("args"))
     w = {
         "model": workload.get("model") or args.get("model"),
         "tp": workload.get("tp") or args.get("tp"),
@@ -273,21 +320,21 @@ def load(run_dir, analyzed=None, label="", **workload) -> dict:
     w["model"] = model_name(str(w["model"]))
     logged = _logged_args(run)
     w.update(_engine_limits(logged, args, w["batch_size"], workload))
-    rc = env.get("runtime_config") or {}
+    rc = _dict(env.get("runtime_config"))
     for k in ("dtype", "task"):
         w[k] = str(rc.get(k) or args.get(k) or logged.get(k) or "")
     return {
         "label": label,
-        "res": found.get("res"),
-        "roof": found.get("roof"),
+        "res": _dict(found.get("res")),
+        "roof": _dict(found.get("roof")),
         "host": host,
         "artifact": art,
         "env": env,
         "workload": w,
         "predicted": _predicted(run),
         "run_utc": _run_utc(run),
-        "compile_summary": _first_json(run, "compile_summary.json"),
-        "series_files": _series_files(run, (host or {}).get("trace") or ""),
+        "compile_summary": _dict(_first_json(run, "compile_summary.json")),
+        "series_files": _series_files(run, str(host.get("trace") or "")),
         "n_ranks": n_ranks,
         "profile_level": manifest.get("profile_level") or e2e_json.get("profile_level"),
     }
@@ -321,8 +368,8 @@ def run_props(ctx: dict, bundle_url: str = "") -> dict[str, str]:
     art = ctx["artifact"]
     w = ctx["workload"]
     out = benchmeta.flatten("env", {**ctx["env"], "artifact": art})
-    res = ctx["res"] or {}
-    comp = res.get("compile") or ctx["compile_summary"] or {}
+    res = ctx["res"]
+    comp = _dict(res.get("compile")) or ctx["compile_summary"]
     cache = comp.get("kernel_cache") or comp.get("cache")
     out.update(
         benchmeta.flatten(
@@ -339,7 +386,7 @@ def run_props(ctx: dict, bundle_url: str = "") -> dict[str, str]:
         ("compile_n_compiles", comp.get("n_compiles")),
         ("profile_level", ctx.get("profile_level")),
         ("n_ranks", ctx.get("n_ranks")),
-        ("dev_mem_total_b", (res.get("device_memory") or {}).get("total_b")),
+        ("dev_mem_total_b", _dict(res.get("device_memory")).get("total_b")),
         (
             "series_files",
             json.dumps(ctx["series_files"], separators=(",", ":"))
@@ -399,55 +446,56 @@ def entries(ctx: dict, bundle_url: str = "") -> list[dict]:
             }
         )
 
-    res = ctx["res"] or {}
-    for phase, p in (res.get("phases") or {}).items():
+    res = ctx["res"]
+    for phase, p in _dict(res.get("phases")).items():
+        if not isinstance(p, dict):
+            continue
         add(
             f"phase:{phase}",
             {"record_type": "trace_phase", "run_mode": "trace", "phase": phase},
             _measure(p, PHASE_FIELDS),
-            p.get("n_samples") or 0,
+            _n(p.get("n_samples")),
             _extra(
                 top_thread_groups=_compact(
                     {
-                        g: v
-                        for g, v in (p.get("top_thread_groups") or {}).items()
-                        if _num(v)
+                        g: x
+                        for g, v in _dict(p.get("top_thread_groups")).items()
+                        if (x := _f(v)) is not None
                     },
                     TOP_THREAD_GROUPS,
                 )
             ),
         )
 
-    host = ctx["host"] or {}
-    steps = res.get("steps") or {}
+    host = ctx["host"]
+    steps = _dict(res.get("steps"))
     for kind in ("prefill", "decode", "mixed"):
-        s = host.get(f"{kind}_summary") or steps.get(kind) or {}
+        s = _dict(host.get(f"{kind}_summary")) or _dict(steps.get(kind))
         m = _measure(s, STEP_FIELDS)
         waterfall = s.get("waterfall_ms_per_step")
         if isinstance(waterfall, dict):
             # The waterfall lists only nonzero classes: an absent cpu_fallback is a measured 0.
             for cls, ms in {"cpu_fallback": 0.0, **waterfall}.items():
-                if _num(ms):
-                    m[f"host_{cls}_ms"] = [float(ms)]
-        fb = (
+                if (x := _f(ms)) is not None:
+                    m[f"host_{cls}_ms"] = [x]
+        fb = _dict(
             s.get("fallback_ops")
-            or ((steps.get("cpu_fallback") or {}).get(kind) or {}).get("ops")
-            or {}
+            or _dict(_dict(steps.get("cpu_fallback")).get(kind)).get("ops")
         )
         fb = {
             op: {
-                a: round(v[a], 4)
+                a: round(x, 4)
                 for a in ("calls_per_step", "ms_per_step")
-                if _num(v.get(a))
+                if (x := _f(v.get(a))) is not None
             }
             for op, v in fb.items()
-            if isinstance(v, dict) and _num(v.get("ms_per_step"))
+            if isinstance(v, dict) and _f(v.get("ms_per_step")) is not None
         }
         add(
             f"step:{kind}",
             {"record_type": "trace_step", "run_mode": kind, "phase": kind},
             m,
-            s.get("n") or 0,
+            _n(s.get("n")),
             _extra(
                 fallback_ops=_compact(
                     fb, TOP_FALLBACK_OPS, key=lambda kv: -kv[1]["ms_per_step"]
@@ -455,16 +503,20 @@ def entries(ctx: dict, bundle_url: str = "") -> list[dict]:
             ),
         )
 
-    for k in (ctx["roof"] or {}).get("kernels") or []:
+    kernels = ctx["roof"].get("kernels")
+    for k in kernels if isinstance(kernels, list) else []:
+        if not isinstance(k, dict):
+            continue
         key, phase = k.get("key"), k.get("phase")
-        if not (key and phase):
+        if not (isinstance(key, str) and isinstance(phase, str) and key and phase):
             continue
         m = _measure(k, KERNEL_FIELDS)
-        if _num(k.get("floor_us")) and _num(k.get("median_us")):
-            m["floor_valid"] = [float(k["median_us"] >= k["floor_us"])]
+        floor, median = _f(k.get("floor_us")), _f(k.get("median_us"))
+        if floor is not None and median is not None:
+            m["floor_valid"] = [float(median >= floor)]
         if key in ctx["predicted"]:
             m["predicted_us"] = [ctx["predicted"][key]]
-        aten = sorted(k.get("aten") or [])
+        aten = sorted(a for a in _list(k.get("aten")) if isinstance(a, str))
         add(
             f"{phase}:{key}",
             {
@@ -477,26 +529,24 @@ def entries(ctx: dict, bundle_url: str = "") -> list[dict]:
                 "aten_ops": ",".join(aten),
             },
             m,
-            k.get("calls") or 0,
+            _n(k.get("calls")),
             _extra(bound=k.get("bound")),
         )
 
-    comp = res.get("compile") or {}
+    comp = _dict(res.get("compile"))
     # by_pass values are {self_s, n}, or bare self seconds in older bundles.
     passes = {
-        n: (v.get("self_s"), v.get("n") or 0) if isinstance(v, dict) else (v, 0)
-        for n, v in (comp.get("by_pass") or {}).items()
-    } or {
-        n: (v, 0)
-        for n, v in ((ctx["compile_summary"] or {}).get("passes") or {}).items()
-    }
+        n: (v.get("self_s"), v.get("n")) if isinstance(v, dict) else (v, 0)
+        for n, v in _dict(comp.get("by_pass")).items()
+    } or {n: (v, 0) for n, v in _dict(ctx["compile_summary"].get("passes")).items()}
     for name, (self_s, n) in passes.items():
-        pname = name.removeprefix("pass:")
+        pname = str(name).removeprefix("pass:")
+        x = _f(self_s)
         add(
             f"compile:{pname}",
             {"record_type": "compile_pass", "run_mode": "trace", "pass": pname},
-            {"self_s": [float(self_s)]} if _num(self_s) else {},
-            n,
+            {"self_s": [x]} if x is not None else {},
+            _n(n),
         )
     return out
 
@@ -628,7 +678,7 @@ def main(argv=None) -> int:
     insert_artifact_result(
         out, db, artifact_id=aid, run_id=rid, test_type="perf", state="passed", arch=arch,
         result_kind="performance", duration_s=sum(
-            p["wall_s"] for p in ((ctx["res"] or {}).get("phases") or {}).values() if _num(p.get("wall_s"))
+            x for p in _dict(ctx["res"].get("phases")).values() if (x := _f(_dict(p).get("wall_s"))) is not None
         ),
         props={"source": REPORT_KIND, "trace_bundle_url": args.trace_bundle_url},
     )  # fmt: skip
