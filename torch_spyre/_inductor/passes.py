@@ -47,7 +47,7 @@ from .temp_passes import (
     decompose_addmm,
     mm_to_bmm_pass,
 )
-from .wsr.coarse_tile import validate_coarse_tile_groups
+from .wsr.coarse_tile import reject_nested_loops, validate_coarse_tile_groups
 from .wsr.coarse_tile_span_overflow import span_overflow_groups
 from .wsr.for_each_tile_lowering import clear_marker_maps, splice_while_loops
 from . import config
@@ -421,6 +421,7 @@ def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
     op_order = {id(op): idx for idx, op in enumerate(graph.operations)}
     groups.sort(key=lambda group: op_order.get(id(group[0][0]), len(op_order)))
     validate_coarse_tile_groups(groups)
+    reject_nested_loops(groups, "span-overflow coarse tiling")
     coarse_tile_post_stickify(
         graph,
         groups=groups,
