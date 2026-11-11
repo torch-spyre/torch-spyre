@@ -19,7 +19,6 @@ import os
 import sys
 import torch
 from torch.utils import _pytree as pytree
-from torch.testing import FileCheck
 
 from torch._dynamo.testing import make_test_cls_with_patches
 
@@ -231,9 +230,12 @@ class _LxPlanningTwoOpTestBase(unittest.TestCase):
         raise NotImplementedError
 
     def compare_with_cpu(self, fn, *args, dlfloat16_reference=None, **kwargs):
-        def source_check(source):
-            FileCheck().check("{lx: 0}").run(source)
-
+        # TODO(#6097): this suite meant to assert that a buffer is placed at LX
+        # offset 0 (FileCheck().check("{lx: 0}")). That check never ran, because
+        # compare_with_cpu did not call source_check (#6094), and it matches
+        # nothing: the code contains 'lx': 0. With that pattern about a fifth of a
+        # sample still fails. Passing no source_check keeps what the suite does
+        # today until #6097 decides what to assert.
         kwargs["cpu_compile"] = False
         if dlfloat16_reference is not None:
             kwargs["cpu_eager_result"] = self.wrap_dlfloat16_reference(
@@ -261,9 +263,7 @@ class _LxPlanningTwoOpTestBase(unittest.TestCase):
                 _build_fp32_proxy_cpu_refs(fn, args[0], args[1], wrap=self.wrap)
             )
 
-        return compare_with_cpu(
-            self.wrap(fn), source_check=source_check, *args, **kwargs
-        )
+        return compare_with_cpu(self.wrap(fn), *args, **kwargs)
 
     def compare(
         self,

@@ -170,6 +170,25 @@ def counting(install: bool = True) -> Iterator[PassCounters]:
 
 
 @contextlib.contextmanager
+def paused() -> Iterator[None]:
+    """Stop counting for the duration, then resume if counting was on.
+
+    For work that is not part of what the counters describe, such as a
+    validation check that re-extracts every operation's read set. Counting it
+    would charge the check to the enclosing pass or pipeline and move the
+    bounds in ``test_frontend_work_bounds.py``. Like the counters themselves
+    this is per-process: another thread compiling meanwhile is not counted
+    either.
+    """
+    was_enabled = COUNTERS.enabled
+    COUNTERS.enabled = False
+    try:
+        yield
+    finally:
+        COUNTERS.enabled = was_enabled
+
+
+@contextlib.contextmanager
 def counted_region() -> Iterator[dict[str, int]]:
     """Yield a dict that, on exit, holds the counts accrued inside the region.
 
@@ -198,4 +217,5 @@ __all__ = [
     "READ_WRITES_REQUESTS",
     "counted_region",
     "counting",
+    "paused",
 ]
