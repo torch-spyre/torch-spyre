@@ -56,6 +56,7 @@ from .errors import Unsupported
 from .ir import (
     AllGatherKernel,
     AllReduceKernel,
+    AllToAllKernel,
     BroadcastKernel,
     SpyreConstantFallback,
     SpyreEmptyFallback,
@@ -3233,6 +3234,71 @@ def lower_c10d_all_gather(tensor, group_size, group_name):
         group_name,
     )
     return _all_gather(tensor, group_size, group_name)
+
+
+@register_spyre_lowering(_c10d.all_to_all_single.default)
+def lower_c10d_all_to_all_single(
+    tensor, output_split_sizes, input_split_sizes, group_name
+):
+    """Out-of-place all_to_all along dim 0, with even or uneven splits.
+
+    Slice j (``input_split_sizes[j]`` rows) of this rank's input goes to rank
+    j; the output concatenates, by source rank, the ``output_split_sizes[j]``
+    rows received from rank j, so its dim 0 is ``sum(output_split_sizes)``.
+    Only static splits are supported.  Device-layout and alignment limits are
+    checked at codegen (``AllToAllKernel``); that the splits agree across ranks
+    is checked by spyre-comms when the plan is built.
+    """
+    group_size = len(input_split_sizes)
+    if group_size == 0 or len(output_split_sizes) != group_size:
+        raise Unsupported(
+            "all_to_all_single: input/output split lists must be non-empty and "
+            f"of equal length (input_split_sizes={input_split_sizes}, "
+            f"output_split_sizes={output_split_sizes})"
+        )
+    splits = [*input_split_sizes, *output_split_sizes]
+    if not all(isinstance(s, (int, sympy.Integer)) for s in splits):
+        raise Unsupported(
+            "all_to_all_single: split sizes must be static integers "
+            f"(input_split_sizes={input_split_sizes}, "
+            f"output_split_sizes={output_split_sizes})"
+        )
+    input_split_sizes = [int(s) for s in input_split_sizes]
+    output_split_sizes = [int(s) for s in output_split_sizes]
+    dim0 = tensor.get_size()[0]
+    # TODO: allow zero splits once spyre-comms alltoallw handles them; today
+    # it segfaults applying tensors to such a plan.
+    if any(s == 0 for s in [*input_split_sizes, *output_split_sizes]):
+        raise Unsupported(
+            "all_to_all_single: zero-size splits are not supported yet "
+            f"(input_split_sizes={input_split_sizes}, "
+            f"output_split_sizes={output_split_sizes})"
+        )
+    if any(s < 0 for s in splits) or sum(input_split_sizes) != dim0:
+        raise Unsupported(
+            "all_to_all_single: split sizes must be non-negative and "
+            f"input_split_sizes must sum to dim 0 (input_split_sizes="
+            f"{input_split_sizes}, output_split_sizes={output_split_sizes}, "
+            f"dim0={dim0})"
+        )
+
+    logger.debug(
+        "Lowering _c10d_functional.all_to_all_single (input_split_sizes=%s, "
+        "output_split_sizes=%s, group_name='%s')",
+        input_split_sizes,
+        output_split_sizes,
+        group_name,
+    )
+    tensor = _realize_collective_input(tensor)
+    return ir.TensorBox.create(
+        AllToAllKernel.create_out_of_place(
+            _c10d.all_to_all_single.default,
+            tensor,
+            output_split_sizes,
+            input_split_sizes,
+            group_name,
+        )
+    )
 
 
 def _all_reduce_inplace(tensor, reduce_op, group_name):

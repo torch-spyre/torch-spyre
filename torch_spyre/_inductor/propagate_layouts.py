@@ -76,6 +76,7 @@ from .constants import (
 )
 from .ir import (
     FixedTiledLayout,
+    AllToAllKernel,
     BroadcastKernel,
     SpyreCollectiveKernel,
     SpyreConstantFallback,
@@ -3616,10 +3617,20 @@ def propagate_spyre_tensor_layouts(
             # their output buffer.
             if isinstance(op.layout, NoneLayout):
                 pass
-            elif isinstance(op, BroadcastKernel):
-                # Same shape as the input; broadcast_run allocates it alike.
+            elif isinstance(op, BroadcastKernel) or (
+                isinstance(op, AllToAllKernel)
+                and list(op.get_size()) == list(op.inputs[0].get_size())
+            ):
+                # Same shape as the input; the run op allocates it alike.
                 input_buf = V.graph.get_buffer(op.inputs[0].get_name())
                 op.layouts = list(input_buf.layouts)
+                op.restick_cost_fn = AnyInNode.from_args()
+            elif isinstance(op, AllToAllKernel):
+                # Uneven splits change dim 0, so the input's layouts do not fit.
+                # alltoall_run allocates the default layout for the output's
+                # shape; AllToAllKernel codegen checks that its dim-0 rows have
+                # the same contiguous device extent as the input's.
+                op.layouts = [generic_layout(op)]
                 op.restick_cost_fn = AnyInNode.from_args()
             elif isinstance(op, SpyreCollectiveKernel):
                 op.layouts = [generic_layout(op)]
