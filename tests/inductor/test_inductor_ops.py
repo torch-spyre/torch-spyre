@@ -14208,6 +14208,79 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=True,
         )
 
+    def _index_reduce_all_modes(self, dst, dim, index, src):
+        """Compiled and eager index_reduce_ match CPU for every reduce mode.
+
+        amax/amin are exact and prod/mean combine at most a few fp16 values,
+        so 0.01 covers the DL16 rounding of the device result.
+        """
+        for reduce in ("amax", "amin", "prod", "mean"):
+            for include_self in (True, False):
+
+                def fn(d, i, s):
+                    return d.clone().index_reduce_(
+                        dim, i, s, reduce, include_self=include_self
+                    )
+
+                with self.subTest(reduce=reduce, include_self=include_self):
+                    torch._dynamo.reset()
+                    self.compare_with_cpu(fn, dst, index, src, atol=0.01, rtol=0.01)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_index_reduce_2d_dim0(self):
+        """The #4634 repro shape (dim 0 of a 4x8 tensor) with unique indices."""
+        dst = (torch.arange(4 * 8, dtype=torch.float32) / 7.0).reshape(4, 8)
+        src = (torch.arange(3 * 8, dtype=torch.float32) / 3.0).reshape(3, 8)
+        self._index_reduce_all_modes(
+            dst.to(torch.float16),
+            0,
+            torch.tensor([2, 0, 3]),
+            src.to(torch.float16),
+        )
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_index_reduce_3d_middle_dim(self):
+        """A non-leading, non-stick dim; slot 1 is never hit and keeps self."""
+        self._index_reduce_all_modes(
+            cached_randn((2, 4, 64), abs=True),
+            1,
+            torch.tensor([3, 0, 2]),
+            cached_randn((2, 3, 64), abs=True, differentiation="src"),
+        )
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_index_reduce_multi_stick_index(self):
+        """K = 70 unique indices span two sticks of the padded index column."""
+        self._index_reduce_all_modes(
+            cached_randn((140, 64), abs=True) + 0.5,
+            0,
+            torch.arange(0, 140, 2),
+            cached_randn((70, 64), abs=True, differentiation="src") + 0.5,
+        )
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_index_reduce_inplace_returns_self(self):
+        """Eager index_reduce_ writes into ``self`` and returns that tensor."""
+        dst = cached_randn((4, 64)).to("spyre")
+        src = cached_randn((3, 64), differentiation="src")
+        index = torch.tensor([2, 0, 3])
+        expected = dst.cpu().index_reduce_(0, index, src, "amax")
+        res = dst.index_reduce_(0, index.to("spyre"), src.to("spyre"), "amax")
+        assert res.data_ptr() == dst.data_ptr(), "index_reduce_ did not return self"
+        torch.testing.assert_close(dst.cpu(), expected, atol=0.01, rtol=0.01)
+
+    @expects_raise
+    def test_index_reduce_stick_dim_raises(self):
+        """index_reduce along the stick (last) dim is rejected with Unsupported.
+
+        TODO(#4404): make this a positive test once a stick-dim scatter lowers.
+        """
+        dst = torch.randn(4, 64, dtype=torch.float16, device="spyre")
+        src = torch.randn(4, 3, dtype=torch.float16, device="spyre")
+        index = torch.tensor([1, 5, 1], device="spyre")
+        with pytest.raises(Exception, match="stick \\(last\\) dim"):
+            dst.index_reduce(1, index, src, "amax")
+
     def test_repeat_cpu(self, op, x, repeats):
         shape = x.repeat(*repeats).shape
         self.compare_with_cpu(lambda a: op(a, repeats, shape), x)
