@@ -54,8 +54,8 @@ def err(code, name="X"):
         # Quorum timeout: the block may sit on fewer replicas than asked.
         (err(159, "TIMEOUT_EXCEEDED"), "ambiguous"),
         (err(242, "TABLE_IS_READ_ONLY"), "retry"),
-        # Refused before the block is written: merges catch up, then it goes through.
-        (err(252, "TOO_MANY_PARTS"), "retry"),
+        # A view's target can hit the limit after the source block landed.
+        (err(252, "TOO_MANY_PARTS"), "ambiguous"),
         # May hit while a materialized view is being fed, after the source block landed.
         (err(241, "MEMORY_LIMIT_EXCEEDED"), "ambiguous"),
         (err(999, "KEEPER_EXCEPTION"), "ambiguous"),
@@ -179,10 +179,48 @@ def test_ambiguous_failure_on_a_plain_table_without_a_probe_is_spooled_not_resen
     assert c.rows.count(ROWS[0]) == 1
 
 
+def test_too_many_parts_retries_only_when_the_table_feeds_no_view():
+    assert classify(err(252), feeds_views=False) == "retry"
+    assert classify(err(252)) == "ambiguous"
+
+
+def test_ambiguity_survives_later_refusals_and_dates_from_the_first_attempt(tmp_path):
+    # Attempt 1 times out but is stored; attempts 2 and 3 are refused until the deadline.
+    now = [1000.0]
+    c = Cluster(script=[err(319), err(285), err(285), err(285)], store_on_fail=True)
+    sp = Spool(tmp_path)
+    sp.now = lambda: now[0]
+
+    def sleep(s):
+        now[0] += s
+
+    resilient_insert(
+        c, "t", ROWS[:3], ["a", "b"], scope="s",
+        policy=Policy(batch_rows=3, deadline_s=5, backoff_s=2),
+        replicated=True, spool=sp, sleep=sleep, clock=lambda: now[0], log=lambda m: None,
+    )  # fmt: skip
+    (item,) = list(sp.pending())
+    assert item.ambiguous
+    assert item.created == pytest.approx(1000.0)
+
+
 def test_ambiguous_plain_batch_without_a_spool_is_loud():
     c = Cluster(script=[err(319)], replicated=False, store_on_fail=True)
     with pytest.raises(resilience.WriteAmbiguous) as ei:
         run(c)
+    assert ei.value.outcome.ambiguous
+
+
+def test_a_full_spool_does_not_hide_an_ambiguous_plain_batch(tmp_path):
+    from spyre_clickhouse_ingest import spool as spool_mod
+
+    class Full(Spool):
+        def put(self, *a, **k):
+            raise spool_mod.SpoolFull("full")
+
+    c = Cluster(script=[err(319)], replicated=False, store_on_fail=True)
+    with pytest.raises(resilience.WriteAmbiguous) as ei:
+        run(c, spool=Full(tmp_path))
     assert ei.value.outcome.ambiguous
 
 

@@ -357,6 +357,104 @@ def test_a_partly_stored_ambiguous_batch_is_held_for_a_person(tmp_path):
     assert out.held == 1 and s.pending_count() == 1 and c.rows == [(1, "a")]
 
 
+class StoresThenTimesOut(Cluster):
+    """The first insert is stored, then the response is lost."""
+
+    def insert(self, table, data, column_names=None, database=None, settings=None):
+        if self.script:
+            self.script.pop(0)
+            self.rows.extend(map(tuple, data))
+            raise err(319)
+        super().insert(table, data, column_names, database, settings)
+
+
+@pytest.mark.parametrize("probe", [None, "probe"])
+def test_a_replay_that_times_out_after_storing_is_not_resent_blindly(tmp_path, probe):
+    s = spool_of(tmp_path)
+    s.put("t", COLS, [[8, "v8"]], "tok-8")  # refused before any write
+    c = StoresThenTimesOut(replicated=False, script=[1])
+    p = (
+        None
+        if probe is None
+        else (lambda item: sum(r in c.rows for r in map(tuple, item.rows)))
+    )
+    s.drain(c, replicated=False, probe=p, force=True, **FAST)
+    assert [i.ambiguous for i in s.local.pending()] == [True]
+    s.drain(c, replicated=False, probe=p, force=True, **FAST)
+    assert c.rows.count((8, "v8")) == 1
+
+
+def test_a_shared_replay_that_times_out_after_storing_is_marked_ambiguous(tmp_path):
+    shared = FakeShared()
+    s = spool_of(tmp_path, shared=shared)
+    s.put_shared("t", COLS, [[8, "v8"]], "tok-8")
+    c = StoresThenTimesOut(replicated=False, script=[1])
+    s.drain(c, replicated=False, force=True, **FAST)
+    s.drain(c, replicated=False, force=True, **FAST)
+    assert c.rows.count((8, "v8")) == 1 and len(shared.files) == 1
+
+
+def test_an_ambiguous_replay_on_a_replicated_table_stays_marked_for_after_the_window(
+    tmp_path,
+):
+    now = [10_000.0]
+    s = spool_of(tmp_path, dedup_window_s=3600, clock=lambda: now[0])
+    s.put("t", COLS, [[1, "a"]], "tok-1", created=now[0])
+    c = StoresThenTimesOut(replicated=True, script=[1])
+    s.drain(c, replicated=True, force=True, **FAST)
+    now[0] += 7200  # the token has aged out of the server's window
+    c.tokens.clear()
+    s.drain(c, replicated=True, force=True, **FAST)
+    assert c.rows.count((1, "a")) == 1 and s.pending_count() == 1
+
+
+def test_held_items_do_not_starve_a_fresh_one(tmp_path):
+    s = spool_of(tmp_path, drain_max_items=20)
+    for i in range(25):
+        s.put("t", COLS, [[i, "h"]], f"held-{i:02d}", ambiguous=True)
+    s.put("t", COLS, [[99, "fresh"]], "zzz-fresh")
+    c = Cluster(replicated=False)
+    for _ in range(3):
+        s.drain(c, replicated=False, probe=None, **FAST)
+    assert (99, "fresh") in c.rows and s.pending_count() == 25
+
+
+def test_a_failed_shared_put_that_may_have_landed_makes_the_local_copy_ambiguous(
+    tmp_path,
+):
+    class Flaky(FakeShared):
+        def put(self, name, data):
+            raise OSError("timed out")
+
+    s = spool_of(tmp_path, shared=Flaky())
+    assert s.put_any("t", COLS, ROWS, "tok-1") == "local"
+    assert [i.ambiguous for i in s.local.pending()] == [True]
+
+
+def test_a_shared_put_refused_at_connect_leaves_the_local_copy_resendable(tmp_path):
+    class Down(FakeShared):
+        def put(self, name, data):
+            raise sp.Unreachable("refused")
+
+    s = spool_of(tmp_path, shared=Down())
+    s.put_any("t", COLS, ROWS, "tok-1")
+    assert [i.ambiguous for i in s.local.pending()] == [False]
+
+
+def test_a_stored_but_undeletable_shared_item_is_marked_so_it_is_not_resent(tmp_path):
+    class NoDelete(FakeShared):
+        def delete(self, name):
+            raise OSError("HTTP 500")
+
+    shared = NoDelete()
+    s = spool_of(tmp_path, shared=shared)
+    s.put_shared("t", COLS, [[1, "a"]], "tok-1")
+    c = Cluster(replicated=False)
+    s.drain(c, replicated=False, force=True, **FAST)
+    s.drain(c, replicated=False, force=True, **FAST)
+    assert c.rows == [(1, "a")]
+
+
 def test_two_spools_in_one_process_have_distinct_owners(tmp_path):
     a = spool_of(tmp_path / "a", writer="w")
     b = spool_of(tmp_path / "b", writer="w")

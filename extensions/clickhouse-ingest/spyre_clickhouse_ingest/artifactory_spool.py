@@ -26,13 +26,14 @@ from __future__ import annotations
 import calendar
 import json
 import os
+import socket
 import ssl
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
-from .spool import CLAIM
+from .spool import CLAIM, Unreachable
 
 LOCK = ".lock"
 
@@ -97,7 +98,13 @@ class ArtifactorySpool:
                 return r.status, body
         except urllib.error.HTTPError as e:
             return e.code, b""
-        except (urllib.error.URLError, TimeoutError) as e:
+        except urllib.error.URLError as e:
+            if isinstance(e.reason, (ConnectionRefusedError, socket.gaierror)):
+                raise Unreachable(
+                    f"artifactory {method}: {type(e.reason).__name__}"
+                ) from None
+            raise OSError(f"artifactory {method}: {type(e).__name__}") from None
+        except TimeoutError as e:
             raise OSError(f"artifactory {method}: {type(e).__name__}") from None
 
     def _path(self, name: str) -> str:
@@ -161,9 +168,14 @@ class ArtifactorySpool:
             raise OSError(f"artifactory GET: HTTP {status}")
         return body
 
+    def _gone(self, name: str) -> None:
+        status, _ = self._req("DELETE", f"{self.base}/{self._path(name)}")
+        if status not in (200, 204, 404):
+            raise OSError(f"artifactory DELETE: HTTP {status}")
+
     def delete(self, name: str) -> None:
-        self._req("DELETE", f"{self.base}/{self._path(name)}")
-        self._req("DELETE", f"{self.base}/{self._path(name + LOCK)}")
+        self._gone(name)
+        self._gone(name + LOCK)
 
     def _lock_owner(self, lock: str):
         status, body = self._req("GET", f"{self.base}/{self._path(lock)}")
@@ -176,7 +188,7 @@ class ArtifactorySpool:
             return None
 
     def release(self, name: str) -> None:
-        self._req("DELETE", f"{self.base}/{self._path(name + LOCK)}")
+        self._gone(name + LOCK)
 
     def reap(self, lease_s: float) -> int:
         """Remove locks whose lease ran out (their owner died); the item is claimable again."""

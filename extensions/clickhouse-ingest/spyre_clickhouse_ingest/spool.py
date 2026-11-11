@@ -28,6 +28,11 @@ up the caller's own write) and only then sends its own rows.
   item, none sends it, anything between holds it for a person. The probe must identify the
   batch (its key columns or a per-batch marker), never count a whole scope: other writers' and
   earlier batches' rows in the scope would make a lost batch look stored.
+* Nothing in the repo calls `resilient_insert` or `TieredSpool` yet, and no probe exists. The
+  schema has no per-batch marker (the sort keys are not unique per batch), so `probe=None` is
+  the only live path and every ambiguous plain-table batch is held. A real probe needs a batch
+  marker, such as a batch-id column or `insert_deduplication_token` on a Replicated table;
+  counting rows by sort key would call a lost batch stored.
 * A crash between a successful send and the file's removal resends a plain-table batch once
   more; only a Replicated table can absorb that.
 * The shared tier holds row data. It is used only by trusted runs (see `shared_allowed`) and any
@@ -54,6 +59,10 @@ CORRUPT = ".corrupt"
 # and for 7 days; a busy table can evict a token well before the time bound.
 DEDUP_WINDOW_S = 3600.0
 TRUSTED_EVENTS = frozenset({"push", "schedule", "workflow_dispatch"})
+
+
+class Unreachable(OSError):
+    """The shared tier refused the connection before sending anything: nothing was stored."""
 
 
 class SpoolFull(RuntimeError):
@@ -215,8 +224,12 @@ class TieredSpool:
             try:
                 self.put_shared(table, columns, rows, token, database, **meta)
                 return "shared"
-            except (OSError, PermissionError):
+            except (Unreachable, PermissionError):
                 pass
+            except OSError:
+                # The PUT may have landed before it failed; the local copy must not be resent
+                # blindly beside it.
+                meta["ambiguous"] = True
         meta.setdefault("created", self.now())
         self.local.put(table, columns, rows, token, database, **meta)
         return "local"
@@ -340,7 +353,7 @@ class TieredSpool:
 
         def room() -> bool:
             return (
-                res.replayed + res.held + res.failed < cap
+                res.replayed + res.failed < cap  # held items must not starve the rest
                 and self.now() - start < budget
             )
 
@@ -350,9 +363,12 @@ class TieredSpool:
             claimed = self.local.claim(item, self.owner, self.now())
             if claimed is None:
                 continue
+            was_ambiguous = item.ambiguous
             outcome = self._replay_one(
                 client, item, replicated, probe, policy, sleep, log
             )
+            if outcome == "failed" and item.ambiguous and not was_ambiguous:
+                self._rewrite_local(claimed, log)
             if outcome == "ok":
                 claimed.unlink(missing_ok=True)
                 res.replayed += 1
@@ -401,12 +417,24 @@ class TieredSpool:
                 log(f"  [spool] {name}: unreadable; set aside")
                 res.failed += 1
                 continue
+            was_ambiguous = item.ambiguous
             outcome = self._replay_one(
                 client, item, replicated, probe, policy, sleep, log
             )
+            if outcome == "failed" and item.ambiguous and not was_ambiguous:
+                if not self._rewrite_shared(name, item, log):
+                    return res  # keep the claim: releasing would allow a blind resend
             try:
                 if outcome == "ok":
-                    self.shared.delete(mine)
+                    try:
+                        self.shared.delete(mine)
+                    except OSError:
+                        # Sent but still listed: a later replay must not resend it blindly.
+                        res.replayed += 1
+                        res.from_shared += 1
+                        self._rewrite_shared(name, item, log, force_ambiguous=True)
+                        log(f"  [spool] {name}: stored but could not be deleted")
+                        return res
                     res.replayed += 1
                     res.from_shared += 1
                 elif outcome == "held":
@@ -419,6 +447,30 @@ class TieredSpool:
             except OSError:
                 return res
         return res
+
+    def _rewrite_local(self, claimed: Path, log) -> None:
+        """Persist ambiguous=True on a claimed local file before it is released."""
+        try:
+            doc = json.loads(claimed.read_text())
+            doc["ambiguous"] = True
+            tmp = claimed.with_name(claimed.name + ".tmp")
+            tmp.write_text(json.dumps(doc, default=str))
+            os.replace(tmp, claimed)
+        except (OSError, ValueError):
+            log(f"  [spool] {claimed.name}: could not record that it may be stored")
+
+    def _rewrite_shared(self, name, item, log, force_ambiguous=False) -> bool:
+        doc = {
+            "table": item.table, "columns": list(item.columns), "rows": item.rows,
+            "token": item.token, "database": item.database, "created": item.created,
+            "ambiguous": True if force_ambiguous else item.ambiguous, "scope": item.scope,
+        }  # fmt: skip
+        try:
+            self.shared.put(name, _encode(doc))
+            return True
+        except OSError:
+            log(f"  [spool] {name}: could not record that it may be stored")
+            return False
 
     def _replay_one(self, client, item, replicated, probe, policy, sleep, log) -> str:
         """'ok', 'held' (needs a person or a probe) or 'failed' (try again later)."""
@@ -451,6 +503,10 @@ class TieredSpool:
             )  # fmt: skip
         except Exception as err:  # noqa: BLE001
             kind = rz.classify(err)
+            if kind == "ambiguous":
+                item.ambiguous = (
+                    True  # the caller persists it before releasing the item
+                )
             log(f"  [spool] {item.token}: {kind} ({type(err).__name__}); kept")
             return "held" if kind == "fatal" else "failed"
         return "ok"
