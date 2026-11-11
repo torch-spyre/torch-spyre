@@ -20,7 +20,6 @@ import torch.fx as fx
 from torch._inductor.ir import (
     ComputedBuffer,
     FixedLayout,
-    MultiOutput,
     MutationLayoutSHOULDREMOVE,
     Pointwise,
     Reduction,
@@ -454,13 +453,6 @@ def _init_vid_to_bufname(trace):
 def _lower_fx_node(node, gl, ops, idx):
     """Lower an FX node to a buffer and insert it into operations list.
 
-    A lowering may register more than one operation: a host fallback registers
-    a FallbackKernel and then the MultiOutput that reads it, and a lowering can
-    realize helper buffers before its result. register_operation appends them
-    all at the end of gl.operations, after the consumer being split, so all of
-    them are moved to ``idx`` in registration order to keep the list in
-    topological order.
-
     Args:
         node: FX node to lower
         gl: GraphLowering instance
@@ -468,19 +460,15 @@ def _lower_fx_node(node, gl, ops, idx):
         idx: Index position for insertion
 
     Returns:
-        The created buffer and the number of operations inserted at ``idx``
+        The created buffer
     """
-    start = len(gl.operations)
     tb = gl.run_node(node)
     gl.env[node] = tb  # run_node does not record it in the env
     buf = tb.data.data
-    new_ops = [gl.operations[i] for i in range(start, len(gl.operations))]
-    for new_op in new_ops:
-        gl.operations.remove(new_op)
-    for offset, new_op in enumerate(new_ops):
-        ops.insert(idx + offset, new_op)
+    gl.operations.remove(buf)
+    ops.insert(idx, buf)
     gl.name_to_buffer[buf.get_name()] = buf
-    return buf, len(new_ops)
+    return buf
 
 
 def _make_intermediate_bufs(
@@ -607,7 +595,7 @@ def _make_intermediate_bufs(
             new_node.meta["val"] = orig_node.meta["val"].to(out_dtype)
 
         # Lower the FX node; _lower_fx_node extracts, removes, and reinserts.
-        new_buf, num_new_ops = _lower_fx_node(new_node, gl, operations, insert_idx)
+        new_buf = _lower_fx_node(new_node, gl, operations, insert_idx)
         # This child node is the sole semantic origin of the new buffer.
         object.__setattr__(new_buf, "origins", OrderedSet([new_node]))
         decompose_provenance(
@@ -625,7 +613,7 @@ def _make_intermediate_bufs(
         if op_name not in op_queues:
             op_queues[op_name] = collections.deque()
         op_queues[op_name].append(buf_name)
-        insert_idx += num_new_ops
+        insert_idx += 1
 
     return constant_map, op_queues
 
@@ -992,23 +980,3 @@ def split_multi_ops(graph: GraphLowering):
             op.get_name(),
             len(intermediate_ops),
         )
-
-    _check_multi_output_order(operations)
-
-
-def _check_multi_output_order(operations) -> None:
-    """Assert every MultiOutput comes after the FallbackKernel it reads.
-
-    Lowering an intermediate can register a FallbackKernel and its MultiOutput;
-    _lower_fx_node must move both ahead of the consumer, in order.
-    """
-    pos = {id(op): i for i, op in enumerate(operations)}
-    for i, op in enumerate(operations):
-        if isinstance(op, MultiOutput):
-            parent = op.inputs[0]
-            j = pos.get(id(parent))
-            if j is None or j > i:
-                raise AssertionError(
-                    f"split_multi_ops: {op.get_name()} at {i} precedes its parent "
-                    f"{parent.get_name()} at {j}"
-                )
