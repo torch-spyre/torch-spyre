@@ -162,40 +162,55 @@ tables or pending migrations surface from `--check` and before the first `CREATE
 
 Prerequisite: every table, and the ledger, must already be Replicated. `SYSTEM SYNC REPLICA`
 refuses a plain table, and `CREATE ... IF NOT EXISTS ON CLUSTER` does not convert an existing one.
-Convert first with the conversion job (spyre-frameworks #2819). The applier checks the ledger, and
-every existing table a pending migration inserts into, on the connected server before any write,
-and raises naming the ones that are not Replicated. A table only a view reads from is not tracked:
-a migration that inserts into a table and then reads it through a view is not synced in between.
+Convert the existing tables to Replicated engines first, for example with a table-conversion tool
+for your deployment. The applier checks the ledger, and every existing table a pending migration
+inserts into, on the connected server before any write, and raises naming the ones that are not
+Replicated. It sees only what the login's `system.tables` shows: a pending migration that inserts
+into a table the login cannot see, or into another database, is refused rather than skipped.
+`--check` also runs `SYSTEM SYNC REPLICA` on the ledger, so a read-only login needs that grant too.
 
-The check sees only what the login's `system.tables` shows. A pending migration that inserts into
-a table the login cannot see, or into another database, is refused rather than skipped. `--check`
-also runs `SYSTEM SYNC REPLICA` on the ledger, so a read-only login needs that grant too. Rows a
-migration inserted are synced before any later statement, in the same or a later migration, reads
-that table by name.
+Rows a migration inserted are synced before any later statement, in the same or a later migration,
+reads that table by name. Known view gap: a view over a table is not seen, so a migration that
+inserts into a table and then reads it only through a view is not synced in between, and rows still
+unsynced when the last migration finishes (for example `010` into `run_case_counters`, `019` into
+`artifact_subscription_versions`) reach the other replicas by ordinary replication, so a view read
+on another replica right after an apply can lag.
 
 If a migration still fails part-way (a sync times out, a replica goes down), the DDL it started may
-keep running on the other replicas, and its ledger row is not written. A migration marked
-`-- RERUNNABLE` (check with `grep -l RERUNNABLE schema/migrations/*.sql`; today every backfill
-except `006`) can be run again with `--cluster <c> --rerun <file>`, which first re-checks that the
-tables it inserts into are Replicated. An unmarked one (`006`) must not be rerun: look at what ran
-(`system.query_log`), and run the remaining statements by hand on the connected replica exactly as
-the applier would have sent them, with their `ON CLUSTER` and `SYNC`. Print them with:
+keep running on the other replicas, and its ledger row is not written. Migrations marked
+`-- RERUNNABLE` (`grep -l RERUNNABLE schema/migrations/*.sql`: today `007`, `009`, `010`, `012` and
+`023`) can be run again with `--cluster <c> --rerun <migration.sql>`, which first re-checks that the
+tables it inserts into are Replicated. Any other migration must not be rerun, in particular the
+unmarked ones that insert rows (`002`, `003`, `006`, `013`, `019`): look at what ran
+(`system.query_log`), run its remaining statements by hand on the connected replica, and record it.
+To print the statements exactly as the applier would send them, including the
+`SYSTEM SYNC REPLICA` steps and with `ON CLUSTER` and `SYNC` in place, run this and take the ones
+after the last statement that already ran. Statements under `-- IF TABLE EXISTS: <t>` are printed
+with a note and must be skipped when `<t>` does not exist:
 
 ```bash
-python -c "from spyre_clickhouse_ingest.apply_schema import SchemaApplier as S; [print(sql + ';') for _, sql in S.migration_statements(open('<path>').read(), '<cluster>', '<db>')]"
+python - <<'EOF'
+from spyre_clickhouse_ingest.apply_schema import SchemaApplier as S
+text = open("<path>").read()
+guard = lambda t: print(f"-- only if {t} exists") or True
+for cmd, _ in S.migration_commands(text, "<cluster>", "<db>", exists=guard):
+    print(cmd + ";")
+EOF
 ```
 
-Then record it with the checksum from this one-liner:
+The migration's ledger row uses the checksum from this one-liner (`<path>` is the file's path):
 
 ```bash
 python -c "from spyre_clickhouse_ingest.apply_schema import SchemaApplier as S; print(S.checksum(open('<path>').read()))"
 ```
 
 ```sql
-INSERT INTO schema_migrations (migration_id, checksum) VALUES ('<file>.sql', '<checksum>')
+INSERT INTO schema_migrations (migration_id, checksum) VALUES ('<migration-stem>.sql', '<checksum>')
 ```
 
-Syncs wait up to an hour (`distributed_ddl_task_timeout`).
+`<migration-stem>` is the file name without `.sql` (for example `006_case_id_without_run_context`);
+`--rerun` takes the full name `<migration.sql>`. Syncs wait up to an hour
+(`distributed_ddl_task_timeout`).
 
 What it does not do: convert an existing plain table to Replicated, lock against two appliers
 running at once (run it from one place), or make `INSERT`s quorum writes. The tests run on

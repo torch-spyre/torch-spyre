@@ -987,3 +987,80 @@ def test_a_comment_on_a_converted_table_is_still_ignored():
     plain = "CREATE TABLE t (a UInt8) ENGINE = MergeTree ORDER BY a"
     conv = replicated(plain, "db", "t") + " COMMENT 'converted'"
     assert SchemaApplier.differs(FormatOnly(), _obj(plain), conv, "db") == ""
+
+
+# ---- cluster mode: the command sequence ------------------------------------------------
+
+
+class Rec:
+    def __init__(self):
+        self.sent = []
+
+    def command(self, sql, settings=None):
+        self.sent.append(sql)
+        return 1
+
+
+def _run(migs, db="appdb"):
+    rec, un = Rec(), {}
+    for m in migs:
+        SchemaApplier.run_migration(rec, m, CLUSTER, db, un)
+    return rec.sent, un
+
+
+S_CREATE = "CREATE TABLE s (a UInt8) ENGINE = MergeTree ORDER BY a"
+
+
+def test_a_dropped_table_leaves_no_pending_sync_for_a_later_table_of_that_name():
+    sent, un = _run(
+        [f"{S_CREATE};\nINSERT INTO s VALUES (1);\nDROP TABLE s;", f"{S_CREATE};"]
+    )
+    assert not any(c.startswith("SYSTEM SYNC") for c in sent)
+    assert un == {}
+
+
+def test_a_dropped_view_or_if_exists_table_is_forgotten_too():
+    sent, un = _run(
+        [
+            f"{S_CREATE};\nINSERT INTO s VALUES (1);\nDROP TABLE IF EXISTS s;",
+            f"{S_CREATE};",
+        ]
+    )
+    assert un == {} and not any(c.startswith("SYSTEM SYNC") for c in sent)
+
+
+def test_a_truncated_table_keeps_its_pending_sync_until_read():
+    sent, un = _run([f"{S_CREATE};\nINSERT INTO s VALUES (1);\nTRUNCATE TABLE s;"])
+    assert "s" in un and not any(c.startswith("SYSTEM SYNC") for c in sent)
+
+
+def test_rename_and_exchange_sync_the_tables_they_read_first():
+    sent, un = _run([f"{S_CREATE};\nINSERT INTO s VALUES (1);\nRENAME TABLE s TO s2;"])
+    assert sent.index(
+        "SYSTEM SYNC REPLICA ON CLUSTER test_cluster appdb.s".replace(
+            "appdb.s", "`appdb`.s"
+        )
+    ) < next(i for i, c in enumerate(sent) if c.startswith("RENAME"))
+    assert "s" not in un
+    sent, un = _run(
+        [f"{S_CREATE};\nINSERT INTO s VALUES (1);\nEXCHANGE TABLES s AND t;"]
+    )
+    assert any(c.startswith("SYSTEM SYNC") for c in sent[:-1]) and un.get("s") is None
+
+
+def test_migration_commands_include_syncs_and_guards():
+    text = (
+        f"{S_CREATE};\nINSERT INTO s VALUES (1);\n"
+        "-- IF TABLE EXISTS: ghost\nDELETE FROM s WHERE a IN (SELECT a FROM ghost);\n"
+        "DELETE FROM s WHERE 1;"
+    )
+    seen = []
+    cmds = [
+        c
+        for c, _ in SchemaApplier.migration_commands(
+            text, CLUSTER, "appdb", exists=lambda t: seen.append(t) or False
+        )
+    ]
+    assert seen == ["ghost"]
+    assert not any("ghost" in c for c in cmds)
+    assert sum(c.startswith("SYSTEM SYNC") for c in cmds) == 1

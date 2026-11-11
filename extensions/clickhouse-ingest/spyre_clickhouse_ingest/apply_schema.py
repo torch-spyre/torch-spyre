@@ -409,6 +409,39 @@ class SchemaApplier:
         return out
 
     @classmethod
+    def migration_commands(
+        cls, text: str, cluster: str = "", db: str = "", unsynced=None, exists=None
+    ):
+        """(command, settings) pairs in the order a migration is sent, syncs and guards included.
+
+        `exists(table)` answers each `-- IF TABLE EXISTS` guard; a guarded statement is skipped when
+        it is false. `unsynced` carries tables with unsynced inserts across migrations."""
+        unsynced = {} if unsynced is None else unsynced
+        for table, sql in cls.migration_statements(text, cluster, db):
+            if table and exists is not None and not exists(table):
+                continue
+            mk = cls.mask(sql)
+            drop = re.match(
+                rf"DROP\s+(?:TABLE|VIEW)\s+(?:IF\s+EXISTS\s+)?({cls.QNAME})", mk, re.I
+            )
+            if cluster and drop:
+                unsynced.pop(cls.bare(drop.group(1)), None)
+            elif cluster and not re.match(r"TRUNCATE\b", mk, re.I):
+                for name in sorted(unsynced):
+                    if cls.mentions(mk, name):
+                        for target in sorted(unsynced.pop(name)):
+                            yield (
+                                f"SYSTEM SYNC REPLICA ON CLUSTER {cluster} {target}",
+                                cls.SYNC_SETTINGS,
+                            )
+            yield sql, None
+            token = cls.insert_target(sql) if cluster else ""
+            if token:
+                unsynced.setdefault(cls.bare(token), set()).add(
+                    cls.sync_target(token, db)
+                )
+
+    @classmethod
     def run_migration(
         cls, client, text: str, cluster: str = "", db: str = "", unsynced=None
     ) -> None:
@@ -417,25 +450,17 @@ class SchemaApplier:
         With a cluster, structural statements run on every replica. Other data statements run once, on
         the connected server, and reach the others by replication; a table inserted into is synced
         on every replica before a later statement reads it. `unsynced` carries that across migrations."""
-        unsynced = {} if unsynced is None else unsynced
-        for table, sql in cls.migration_statements(text, cluster, db):
-            if table and not client.command(f"EXISTS TABLE {table}"):
-                continue
-            mk = cls.mask(sql)
-            if cluster and not re.match(r"(?:DROP|TRUNCATE)\b", mk, re.I):
-                for name in sorted(unsynced):
-                    if cls.mentions(mk, name):
-                        for target in sorted(unsynced.pop(name)):
-                            client.command(
-                                f"SYSTEM SYNC REPLICA ON CLUSTER {cluster} {target}",
-                                settings=cls.SYNC_SETTINGS,
-                            )
-            client.command(sql)
-            token = cls.insert_target(sql) if cluster else ""
-            if token:
-                unsynced.setdefault(cls.bare(token), set()).add(
-                    cls.sync_target(token, db)
-                )
+        for sql, settings in cls.migration_commands(
+            text,
+            cluster,
+            db,
+            unsynced,
+            lambda t: client.command(f"EXISTS TABLE {t}"),
+        ):
+            if settings is None:
+                client.command(sql)
+            else:
+                client.command(sql, settings=settings)
 
     @classmethod
     def required_version(cls, text: str) -> tuple:
