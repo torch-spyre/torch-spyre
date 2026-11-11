@@ -146,7 +146,6 @@ def _child_profile(
     result = trace_metrics(trace_data.get("traceEvents", []))
     result["tracker_enabled"] = _C.get_hazard_tracker_enabled()
 
-    del pairs, compiled
     torch.accelerator.synchronize(device)
     return result
 
@@ -178,7 +177,7 @@ def main() -> int:
     parser.add_argument(
         "--rounds", type=int, default=3, help="interleaved on/off child pairs"
     )
-    parser.add_argument("--timeout", type=float, default=120.0, help="seconds/child")
+    parser.add_argument("--timeout", type=float, default=180.0, help="seconds/child")
     parser.add_argument("--json", type=pathlib.Path, help="write results to JSON")
     ns = parser.parse_args()
 

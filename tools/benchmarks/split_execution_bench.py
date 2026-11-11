@@ -119,11 +119,13 @@ def _child_wrapper(env: dict[str, str], target: Any, args: tuple, conn: Any) -> 
 
     try:
         os.environ.update(env)
-        conn.send((True, target(*args)))
+        result = target(*args)
+        conn.send((True, result))
     except Exception as e:  # noqa: BLE001
         conn.send((False, f"{e}\n{traceback.format_exc()}"))
     finally:
         conn.close()
+        os._exit(0)
 
 
 def _run_child(
@@ -142,11 +144,14 @@ def _run_child(
             ok, payload = parent_conn.recv()
         except EOFError:
             pass
-    p.join(timeout=5.0)
+
+    p.join(timeout=10.0)
     if p.is_alive():
         p.terminate()
         p.join()
-        raise TimeoutError(f"child timed out after {timeout}s")
+        if ok is None:
+            raise TimeoutError(f"child timed out after {timeout}s")
+
     parent_conn.close()
 
     if ok is not True:
@@ -184,7 +189,7 @@ def main() -> int:
     parser.add_argument(
         "--rounds", type=int, default=3, help="interleaved on/off child pairs"
     )
-    parser.add_argument("--timeout", type=float, default=120.0, help="seconds/child")
+    parser.add_argument("--timeout", type=float, default=180.0, help="seconds/child")
     parser.add_argument("--json", type=pathlib.Path, help="write results to JSON")
     ns = parser.parse_args()
 
