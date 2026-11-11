@@ -415,7 +415,8 @@ class SchemaApplier:
         """(command, settings) pairs in the order a migration is sent, syncs and guards included.
 
         `exists(table)` answers each `-- IF TABLE EXISTS` guard; a guarded statement is skipped when
-        it is false. `unsynced` carries tables with unsynced inserts across migrations."""
+        it is false. `unsynced` carries tables with unsynced inserts across migrations; a caller
+        printing one migration passes the tables earlier pending migrations left unsynced."""
         unsynced = {} if unsynced is None else unsynced
         for table, sql in cls.migration_statements(text, cluster, db):
             if table and exists is not None and not exists(table):
@@ -425,7 +426,9 @@ class SchemaApplier:
                 rf"DROP\s+(?:TABLE|VIEW)\s+(?:IF\s+EXISTS\s+)?({cls.QNAME})", mk, re.I
             )
             if cluster and drop:
-                unsynced.pop(cls.bare(drop.group(1)), None)
+                qual = re.fullmatch(rf"({cls.IDENT})\.{cls.IDENT}", drop.group(1))
+                if not qual or cls.bare(qual.group(1)) == db:
+                    unsynced.pop(cls.bare(drop.group(1)), None)
             elif cluster and not re.match(r"TRUNCATE\b", mk, re.I):
                 for name in sorted(unsynced):
                     if cls.mentions(mk, name):
