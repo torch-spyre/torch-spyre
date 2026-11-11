@@ -44,6 +44,7 @@ from torch._inductor.ir import ComputedBuffer, Operation, Reduction
 from ..errors import Unsupported
 from ..ir import FixedTiledLayout
 from ..logging_utils import get_inductor_logger
+from ..loop_facts import counted_loop_path
 from ..pass_utils import (
     _prepare_per_core_view,
     iteration_space_from_op,
@@ -58,11 +59,18 @@ from ..wsr.coarse_tile import (
     _loop_var_to_reduction_ranges_pos,
     coarse_tile_post_stickify,
     reduction_loop_vars,
+    reject_nested_loops,
     validate_coarse_tile_groups,
 )
 from ..wsr.span_overflow_hint_analysis import _layout_has_static_span_metadata
 from .plan_solver import CoreDivisionBuffer, TileSpec
 from .utils import buffer_not_read_in_full
+
+# The deepest nest the allocator's search may propose. The lowering builds one
+# standalone loop per group and refuses a group with more levels
+# (``reject_nested_loops``, #6088); under the SA co-optimizer a refusal is a
+# compile failure, so the search must not offer what the lowering will refuse.
+MAX_SEARCH_TILE_DEPTH = 1
 
 logger = get_inductor_logger("scratchpad.coarse_tiling")
 
@@ -265,6 +273,51 @@ def _repeated_read_reason(op: ComputedBuffer, loop_var: sympy.Symbol) -> str | N
     return None
 
 
+def _tiled_term(index: sympy.Expr, loop_var: sympy.Symbol) -> sympy.Expr:
+    """``loop_var``'s own additive term in ``index``, zero when it has none.
+
+    The whole term rather than its coefficient, so a non-affine walk -- a
+    reshape's ``floor``/``Mod`` digits -- is compared as it stands instead of
+    collapsing to the 0 that ``Expr.coeff`` returns for a symbol it cannot see
+    inside.
+    """
+    index = convert_modular_indexing(index)
+    terms = index.args if isinstance(index, sympy.Add) else (index,)
+    return sympy.Add(*(t for t in terms if loop_var in t.free_symbols))
+
+
+def _disagreeing_reads_reason(op: ComputedBuffer, loop_var: sympy.Symbol) -> str | None:
+    """Why ``loop_var`` cannot be tiled when two reads of one buffer walk it
+    differently, or ``None``.
+
+    ``a + a.permute(1, 0, 2)`` reads one producer twice, once in step with the
+    tiling and once across it; ``a + a[0:1]`` reads it in step and broadcast.
+    Each read is given its own advance, and each advance is right on its own,
+    but on the device only the first tile comes out right: tiled ``d0:4``, a
+    64x64x128 pointwise chain returns 70% wrong values, every tile but the
+    first reading elements of the producer that belong to another tile.
+
+    Reads that agree on the term are left alone however they walk it: two
+    in-step reads share one nest, two transposed reads share one advance, and
+    both are exact. Only the disagreement is refused.
+    """
+    terms: dict[str, set[sympy.Expr]] = {}
+    for dep in op_read_writes(op).reads:
+        if not isinstance(dep, MemoryDep) or loop_var not in dep.ranges:
+            continue
+        terms.setdefault(dep.name, set()).add(_tiled_term(dep.index, loop_var))
+    for name, walks in terms.items():
+        if len(walks) > 1:
+            shown = ", ".join(str(walk) for walk in sorted(walks, key=str))
+            return (
+                f"coarse tiling: {op.get_name()} reads {name} along {loop_var} "
+                f"two ways ({shown}); each read advances on its own axis but the "
+                f"op has one tile, so every tile after the first would read the "
+                f"wrong elements of {name}."
+            )
+    return None
+
+
 def try_resolve_tile_axis_loop_vars(
     op: ComputedBuffer, spec: TileSpec
 ) -> tuple[list[sympy.Symbol] | None, str | None]:
@@ -284,7 +337,8 @@ def try_resolve_tile_axis_loop_vars(
 
     A non-empty ``spec`` on an op with a symbolic extent is rejected whatever
     its axes (:func:`_symbolic_extent_reason`), and so is an axis some read of
-    the op repeats along (:func:`_repeated_read_reason`).
+    the op repeats along (:func:`_repeated_read_reason`) or that two reads of
+    one buffer walk differently (:func:`_disagreeing_reads_reason`).
     """
     if spec.axes:
         reason = _symbolic_extent_reason(op)
@@ -301,6 +355,9 @@ def try_resolve_tile_axis_loop_vars(
         if loop_var is None:
             return None, reason
         reason = _repeated_read_reason(op, loop_var)
+        if reason is not None:
+            return None, reason
+        reason = _disagreeing_reads_reason(op, loop_var)
         if reason is not None:
             return None, reason
         loop_vars.append(loop_var)
@@ -393,7 +450,7 @@ def prescribed_regions(operations: Sequence[Operation]) -> list[PrescribedRegion
     for pos, op in enumerate(operations):
         if not _is_spliced(op):
             continue
-        outer = op.loop_info.loop_group_id[0]  # type: ignore[attr-defined]
+        outer = counted_loop_path(op, include_extern=True)[0]
         span = spans.setdefault(outer, [pos, pos])
         span[1] = pos
     regions: list[PrescribedRegion] = []
@@ -629,9 +686,9 @@ def _derive_group_idx_offset(graph: GraphLowering) -> int:
     ``_maybe_coarse_tile_span_overflow`` uses to avoid a ``loop_group_id``
     collision with a for_each_tile group stamped pre-stickification."""
     used = [
-        op.loop_info.loop_group_id[0]
+        path[0]
         for op in graph.operations
-        if getattr(op, "loop_info", None) is not None
+        if (path := counted_loop_path(op, include_extern=True))
     ]
     return max(used, default=-1) + 1
 
@@ -717,6 +774,7 @@ def apply_tilings(choices: Mapping[str, TileSpec], graph: GraphLowering) -> None
             )
         groups.append((group_ops, levels))
     validate_coarse_tile_groups(groups)
+    reject_nested_loops(groups, "allocator coarse tiling")
     # This pass runs inside scratchpad/LX planning -- after stickification
     # (insert_restickify) and the post-stickify span-overflow WSR pass -- so
     # every op already carries a committed FixedTiledLayout. Use the
