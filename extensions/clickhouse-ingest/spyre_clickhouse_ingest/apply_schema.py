@@ -104,7 +104,6 @@ class SchemaApplier:
     # Where a table made by the applier keeps its replication metadata: CLICKHOUSE_KEEPER_PATH, a
     # template with {shard}, else /clickhouse/<cluster>/tables/{shard}/<db>/<table>.
     KEEPER_PATH = "/clickhouse/%s/tables/{shard}/%s/%s"
-    ENGINE = re.compile(r"\bENGINE\s*=\s*(\w+)\s*(?:\(([^()]*)\))?")
     # The stored form of a Replicated engine: 'path', 'replica' and then the plain engine's own arguments.
     REPLICATED_ENGINE = re.compile(
         r"\bENGINE\s*=\s*Replicated(\w*MergeTree)\s*\(\s*'[^']*'\s*,\s*'[^']*'\s*(?:,\s*([^()]*?))?\s*\)"
@@ -124,12 +123,19 @@ class SchemaApplier:
         re.IGNORECASE,
     )
     # An identifier, plain or `quoted` / "quoted", optionally db-qualified.
-    IDENT = r'(?:`[^`]+`|"[^"]+"|\w+)'
+    IDENT = r'(?:`(?:[^`\\]|``|\\.)+`|"(?:[^"\\]|""|\\.)+"|\w+)'
     QNAME = rf"(?:{IDENT}\.)?{IDENT}"
     MIGRATION_CREATE_TABLE = re.compile(
         rf"^CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?({QNAME})", re.IGNORECASE
     )
-    INSERT_INTO = re.compile(rf"^INSERT\s+INTO\s+({QNAME})", re.IGNORECASE)
+    INSERT_INTO = re.compile(
+        rf"^(?:WITH\b.*?\b)?INSERT\s+INTO\s+(?:TABLE\s+)?({QNAME})",
+        re.IGNORECASE | re.DOTALL,
+    )
+    LITERAL = re.compile(r"'(?:[^'\\]|\\.|'')*'")
+    # Long enough for a large table to catch up; the default (180 s) fails the migration while
+    # the sync carries on in the background.
+    SYNC_SETTINGS = {"distributed_ddl_task_timeout": 3600}
     CREATE_AS_SELECT = re.compile(r"\bAS\s+(?:SELECT|WITH)\b", re.IGNORECASE)
 
     @classmethod
@@ -160,10 +166,63 @@ class SchemaApplier:
         return len(re.findall(r"(?<!\\)'", sql[:pos])) % 2 == 1
 
     @classmethod
+    def mask(cls, sql: str) -> str:
+        """`sql` with the inside of every string literal blanked (same length), so a keyword or
+        parenthesis in a literal is never matched."""
+        return cls.LITERAL.sub(lambda m: "'" + "_" * (len(m.group()) - 2) + "'", sql)
+
+    @classmethod
     def bare(cls, qname: str) -> str:
         """The table part of a possibly qualified or quoted name."""
         last = re.findall(cls.IDENT, qname)[-1]
-        return last.strip('`"')
+        if last[0] in '`"':
+            return last[1:-1].replace(last[0] * 2, last[0])
+        return last
+
+    @staticmethod
+    def quote(name: str) -> str:
+        return "`" + name.replace("`", "``") + "`"
+
+    @classmethod
+    def sync_target(cls, token: str, db: str) -> str:
+        """`token` as written, qualified with `db` when it is not already."""
+        if re.fullmatch(rf"{cls.IDENT}\.{cls.IDENT}", token) or not db:
+            return token
+        return f"{cls.quote(db)}.{token}"
+
+    @classmethod
+    def insert_target(cls, stmt: str) -> str:
+        """The table token an INSERT statement writes to, as written, else ''."""
+        m = cls.INSERT_INTO.match(cls.mask(stmt))
+        return m.group(1) if m else ""
+
+    @classmethod
+    def mentions(cls, masked: str, name: str) -> bool:
+        forms = (name, cls.quote(name), '"' + name.replace('"', '""') + '"')
+        return any(
+            re.search(rf"(?<![\w`\"]){re.escape(q)}(?![\w`\"])", masked) for q in forms
+        )
+
+    @classmethod
+    def engine_span(cls, masked: str):
+        """(start, end, name, args) of the ENGINE clause in `masked`, args balanced; None if absent."""
+        m = re.search(r"\bENGINE\s*=\s*(\w+)", masked, re.I)
+        if not m:
+            return None
+        k = m.end()
+        while masked[k : k + 1].isspace():
+            k += 1
+        if masked[k : k + 1] != "(":
+            return m.start(), m.end(), m.group(1), ""
+        depth = 0
+        for i in range(k, len(masked)):
+            depth += masked[i] == "("
+            depth -= masked[i] == ")"
+            if depth == 0:
+                return m.start(), i + 1, m.group(1), (k, i)
+        raise ValueError(
+            f"unbalanced parentheses in ENGINE clause: '{masked[m.start() :][:80]}'"
+        )
 
     @classmethod
     def clustered(cls, sql: str, kind: str, cluster: str, db: str, name: str) -> str:
@@ -177,13 +236,16 @@ class SchemaApplier:
             rf"^(CREATE\s+(?:MATERIALIZED\s+VIEW|TABLE|VIEW)\s+(?:IF\s+NOT\s+EXISTS\s+)?{cls.QNAME})",
             re.I,
         )
-        if re.match(rf"{head.pattern}\s+ON\s+CLUSTER\b", sql, re.I):
-            return sql
-        sql, n = head.subn(lambda m: f"{m.group(1)} ON CLUSTER {cluster}", sql, count=1)
-        if not n:
+        h = head.match(cls.mask(sql))
+        if not h:
             raise ValueError(f"{name}: cannot place ON CLUSTER in '{sql[:80]}'")
+        if re.match(r"\s+ON\s+CLUSTER\b", cls.mask(sql)[h.end() :], re.I):
+            return sql
+        sql = sql[: h.end()] + f" ON CLUSTER {cluster}" + sql[h.end() :]
+        mk = cls.mask(sql)
         if kind == "mv":
-            prefix = re.split(cls.CREATE_AS_SELECT, sql, maxsplit=1)[0]
+            asq = cls.CREATE_AS_SELECT.search(mk)
+            prefix = mk[: asq.start()] if asq else mk
             if re.search(r"\bENGINE\s*=", prefix) and not re.search(
                 r"\bTO\s+\S", prefix
             ):
@@ -193,20 +255,22 @@ class SchemaApplier:
                 )
         if kind != "table":
             return sql
-        if re.match(
+        bare_mk = mk.replace(f" ON CLUSTER {cluster}", "", 1)
+        if cls.CREATE_AS_SELECT.search(mk) or re.match(
             rf"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?{cls.QNAME}[^()]*?\bAS\s+{cls.QNAME}",
-            sql.replace(f" ON CLUSTER {cluster}", "", 1),
+            bare_mk,
             re.I,
-        ) or cls.CREATE_AS_SELECT.search(sql):
+        ):
             raise ValueError(
                 f"{name}: CREATE TABLE ... AS <table or SELECT> is not supported in cluster mode"
             )
-        m = cls.ENGINE.search(sql)
-        if not m or m.group(1) not in cls.REPLICATED:
+        eng = cls.engine_span(mk)
+        if not eng or eng[2] not in cls.REPLICATED:
             raise ValueError(
-                f"{name}: cannot make engine {m.group(1) if m else '?'} Replicated"
+                f"{name}: cannot make engine {eng[2] if eng else '?'} Replicated"
             )
-        args = (m.group(2) or "").strip()
+        start, end, engine, span = eng
+        args = sql[span[0] + 1 : span[1]].strip() if span else ""
         path = os.environ.get("CLICKHOUSE_KEEPER_PATH", "").strip()
         if path and "{table}" not in path and "{uuid}" not in path:
             raise ValueError(
@@ -218,10 +282,10 @@ class SchemaApplier:
             else cls.KEEPER_PATH % (cluster, db, name)
         )
         new = f"'{path}', '{{replica}}'" + (f", {args}" if args else "")
-        tail = sql[m.end() :]
+        tail = sql[end:]
         return (
-            sql[: m.start()]
-            + f"ENGINE = {cls.REPLICATED[m.group(1)]}({new})"
+            sql[:start]
+            + f"ENGINE = {cls.REPLICATED[engine]}({new})"
             + ("" if tail[:1].isspace() or not tail else " ")
             + tail
         )
@@ -232,49 +296,58 @@ class SchemaApplier:
 
         A table a migration creates is made Replicated like a schema table, so a scratch table holds
         the same rows on every replica. A refreshable MV stays on the connected server (it appends
-        on a schedule). Structural DDL with no rewrite raises instead of running on one server."""
+        on a schedule). Structural DDL with no rewrite raises instead of running on one server.
+        Matching ignores string literals, and ON CLUSTER counts only where the statement puts it."""
         if not cluster:
             return stmt
-        if cls.REFRESHABLE.match(stmt):
+        mk = cls.mask(stmt)
+        if cls.REFRESHABLE.match(mk):
             return stmt
-        has_cluster = re.search(r"\bON\s+CLUSTER\b", stmt, re.I)
-        ct = cls.MIGRATION_CREATE_TABLE.match(stmt)
-        if ct and not re.search(r"\bENGINE\s*=\s*Replicated", stmt, re.I):
-            if has_cluster:
+
+        def has_cluster(end: int) -> bool:
+            return bool(re.match(r"\s+ON\s+CLUSTER\b", mk[end:], re.I))
+
+        ct = cls.MIGRATION_CREATE_TABLE.match(mk)
+        if ct:
+            if cls.CREATE_AS_SELECT.search(mk):
                 raise ValueError(
-                    f"{cls.bare(ct.group(1))}: ON CLUSTER needs a Replicated engine"
+                    f"{cls.bare(ct.group(1))}: CREATE TABLE ... AS SELECT is not supported in cluster mode"
                 )
-            return cls.clustered(stmt, "table", cluster, db, cls.bare(ct.group(1)))
+            if not re.search(r"\bENGINE\s*=\s*Replicated", mk, re.I):
+                if has_cluster(ct.end()):
+                    raise ValueError(
+                        f"{cls.bare(ct.group(1))}: ON CLUSTER needs a Replicated engine"
+                    )
+                return cls.clustered(stmt, "table", cluster, db, cls.bare(ct.group(1)))
         cmv = re.match(
             rf"^CREATE\s+MATERIALIZED\s+VIEW\s+(?:IF\s+NOT\s+EXISTS\s+)?({cls.QNAME})",
-            stmt,
+            mk,
             re.I,
         )
-        if cmv and not has_cluster:
+        if cmv:
+            if has_cluster(cmv.end()):
+                return stmt
             return cls.clustered(stmt, "mv", cluster, db, cls.bare(cmv.group(1)))
-        if has_cluster:
-            return stmt
-        m = cls.MIGRATION_DDL.match(stmt)
+        m = cls.MIGRATION_DDL.match(mk)
         if not m:
-            if re.match(rf"^DELETE\s+FROM\s+{cls.QNAME}", stmt, re.I):
-                return re.sub(
-                    rf"^(DELETE\s+FROM\s+{cls.QNAME})",
-                    rf"\1 ON CLUSTER {cluster}",
-                    stmt,
-                    count=1,
-                    flags=re.I,
-                )
-            if cls.UNCLUSTERABLE.match(stmt):
+            dm = re.match(rf"^DELETE\s+FROM\s+{cls.QNAME}", mk, re.I)
+            if dm:
+                if has_cluster(dm.end()):
+                    return stmt
+                return stmt[: dm.end()] + f" ON CLUSTER {cluster}" + stmt[dm.end() :]
+            if cls.UNCLUSTERABLE.match(mk):
                 raise ValueError(
                     f"cannot run on a cluster: '{stmt.splitlines()[0][:80]}'"
                 )
             return stmt
         verb = re.sub(r"\s+", " ", m.group(1).upper())
         if verb in ("RENAME TABLE", "EXCHANGE TABLES"):
-            if re.search(r"\bSETTINGS\b", stmt, re.I):
+            if re.search(r"\bSETTINGS\b", mk, re.I):
                 raise ValueError(
                     f"cannot run on a cluster (SETTINGS after {verb}): '{stmt[:80]}'"
                 )
+            if re.search(rf"\bON\s+CLUSTER\s+{cls.IDENT}\s*$", mk, re.I):
+                return stmt
             return f"{stmt} ON CLUSTER {cluster}"
         target = rf"(?:IF\s+(?:NOT\s+)?EXISTS\s+)?{cls.QNAME}"
         pat = {
@@ -285,14 +358,15 @@ class SchemaApplier:
         }.get(verb)
         if verb.startswith("CREATE"):
             pat = rf"^(CREATE\s+(?:MATERIALIZED\s+)?(?:VIEW|TABLE)\s+{target})"
-        out, n = re.subn(pat, rf"\1 ON CLUSTER {cluster}", stmt, count=1, flags=re.I)
-        if not n:
+        tm = re.match(pat, mk, re.I)
+        if not tm:
             raise ValueError(f"cannot place ON CLUSTER in '{stmt[:80]}'")
-        if verb in ("DROP TABLE", "DROP VIEW") and re.match(
-            r"\s*,", stmt[re.match(pat, stmt, re.I).end() :]
-        ):
+        if has_cluster(tm.end()):
+            return stmt
+        if verb in ("DROP TABLE", "DROP VIEW") and re.match(r"\s*,", mk[tm.end() :]):
             raise ValueError(f"cannot run on a cluster (several tables): '{stmt[:80]}'")
-        if verb == "DROP TABLE" and not re.search(r"\bSYNC\b", out, re.I):
+        out = stmt[: tm.end()] + f" ON CLUSTER {cluster}" + stmt[tm.end() :]
+        if verb == "DROP TABLE" and not re.search(r"\b(?:SYNC|NO\s+DELAY)\b", mk, re.I):
             out += " SYNC"
         return out
 
@@ -338,21 +412,25 @@ class SchemaApplier:
         With a cluster, structural statements run on every replica. Other data statements run once, on
         the connected server, and reach the others by replication; a table the migration inserted
         into is synced on every replica before a later statement reads it."""
-        unsynced: set = set()
+        unsynced: dict = {}
         for table, sql in cls.migration_statements(text, cluster, db):
             if table and not client.command(f"EXISTS TABLE {table}"):
                 continue
-            if cluster and not re.match(r"(?:DROP|TRUNCATE)\b", sql, re.I):
+            mk = cls.mask(sql)
+            if cluster and not re.match(r"(?:DROP|TRUNCATE)\b", mk, re.I):
                 for name in sorted(unsynced):
-                    if re.search(rf"\b{re.escape(name)}\b", sql):
-                        client.command(
-                            f"SYSTEM SYNC REPLICA ON CLUSTER {cluster} {name}"
-                        )
-                        unsynced.discard(name)
+                    if cls.mentions(mk, name):
+                        for target in sorted(unsynced.pop(name)):
+                            client.command(
+                                f"SYSTEM SYNC REPLICA ON CLUSTER {cluster} {target}",
+                                settings=cls.SYNC_SETTINGS,
+                            )
             client.command(sql)
-            ins = cls.INSERT_INTO.match(sql)
-            if cluster and ins:
-                unsynced.add(cls.bare(ins.group(1)))
+            token = cls.insert_target(sql) if cluster else ""
+            if token:
+                unsynced.setdefault(cls.bare(token), set()).add(
+                    cls.sync_target(token, db)
+                )
 
     @classmethod
     def required_version(cls, text: str) -> tuple:
@@ -441,48 +519,75 @@ class SchemaApplier:
             return set()
         try:
             hosts = {
-                r[0]
+                tuple(r)
                 for r in client.query(
-                    f"SELECT hostName() FROM clusterAllReplicas('{cluster}', system.one)"
+                    f"SELECT hostName(), tcpPort() FROM clusterAllReplicas('{cluster}', system.one)"
                 ).result_rows
             }
             rows = client.query(
-                "SELECT hostName(), countIf(name = %(ledger)s), "
+                "SELECT hostName(), tcpPort(), countIf(name = %(ledger)s), "
                 "groupArrayIf(name, engine = 'MaterializedView') "
                 f"FROM clusterAllReplicas('{cluster}', system.tables) "
-                "WHERE database = %(db)s GROUP BY hostName()",
+                "WHERE database = %(db)s GROUP BY hostName(), tcpPort()",
                 parameters={"db": db, "ledger": cls.LEDGER},
             ).result_rows
         except Exception as e:
             raise RuntimeError(
-                f"cannot read system.tables on every replica of cluster {cluster} "
-                "(needs SHOW TABLES / SELECT on system.tables there); nothing past "
-                f"this point was applied, rerun once it is granted: {e}"
+                f"reading system.tables on every replica of cluster {cluster} failed: {e} -- "
+                "a replica may be down or unreachable, or lack SELECT on system.tables; nothing "
+                "past this point was applied, rerun once it is fixed"
             ) from e
-        blind = hosts - {r[0] for r in rows if r[1]}
+        blind = hosts - {tuple(r[:2]) for r in rows if r[2]}
         if blind:
             raise RuntimeError(
                 f"replica(s) {sorted(blind)} of cluster {cluster} do not show {cls.LEDGER} in "
                 "system.tables: a missing grant, missing cluster secret or lagging replica would "
                 "hide a refreshable MV; fix that and rerun"
             )
-        return {n for r in rows for n in r[2]}
+        return {n for r in rows for n in r[3]}
+
+    @classmethod
+    def require_replicated(cls, client, db: str, names) -> None:
+        """Raise if any of `names` exists in `db` on a non-Replicated engine.
+
+        Cluster mode syncs the ledger and tables a migration inserts into, which a plain table
+        refuses part-way through a migration. Checked on the connected server before any write."""
+        names = sorted(set(names))
+        if not names:
+            return
+        rows = client.query(
+            "SELECT name, engine FROM system.tables WHERE database = %(db)s AND has(%(names)s, name)",
+            parameters={"db": db, "names": names},
+        ).result_rows
+        plain = sorted(n for n, e in rows if not e.startswith("Replicated"))
+        if plain:
+            raise ValueError(
+                f"cluster mode needs every table converted to a Replicated engine first; "
+                f"not Replicated in {db}: {', '.join(plain)} (see schema/README.md, "
+                "'Applying on a Replicated cluster')"
+            )
 
     @classmethod
     def validate_cluster(
-        cls, objs: list, live: dict, pending: list, cluster: str, db: str
+        cls, client, objs: list, live: dict, pending: list, cluster: str, db: str
     ) -> None:
-        """Raise before anything is created if a new table or pending migration cannot run on a cluster."""
+        """Raise before anything is written if a new table or pending migration cannot run on a
+        cluster, or a migration would insert into an existing table that is not Replicated."""
         if not cluster:
             return
         for o in objs:
             if o.kind in ("table", "mv") and o.name not in live:
                 cls.clustered(o.sql, o.kind, cluster, db, o.name)
+        inserted: set = set()
         for p in pending:
             try:
-                cls.migration_statements(p.read_text(), cluster, db)
+                for _, sql in cls.migration_statements(p.read_text(), cluster, db):
+                    token = cls.insert_target(sql)
+                    if token and cls.bare(token) in live:
+                        inserted.add(cls.bare(token))
             except ValueError as e:
                 raise ValueError(f"{p.name}: {e}") from None
+        cls.require_replicated(client, db, inserted)
 
     @classmethod
     def ledger_ddl(cls, cluster: str, db: str) -> str:
@@ -565,10 +670,12 @@ class SchemaApplier:
         A Replicated table compares equal to its plain file, so a converted table is never drift;
         `cluster` only decides what the apply would do, not what the plan reports."""
         live = cls.live(client, db)
+        if cluster:
+            cls.require_replicated(client, db, [cls.LEDGER])
         done = cls.applied(client, db, cluster)
         objs = [o for path, text in files for o in cls.objects(path, text)]
         pending = [p for p in migrations if p.name not in done]
-        cls.validate_cluster(objs, live, pending, cluster, db)
+        cls.validate_cluster(client, objs, live, pending, cluster, db)
         elsewhere = cls.refresh_mvs_on_cluster(
             client,
             db,
@@ -635,8 +742,10 @@ class SchemaApplier:
         objs = [o for path, text in files for o in cls.objects(path, text)]
         steps = []
         if cluster:
+            cls.require_replicated(client, db, [cls.LEDGER])
             done = cls.applied(client, db, cluster)
             cls.validate_cluster(
+                client,
                 objs,
                 cls.live(client, db),
                 [p for p in migrations if p.name not in done],

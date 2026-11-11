@@ -32,8 +32,9 @@ class FakeServer:
         self.ledger = {}
         self.log = []
         self.elsewhere = set()
+        self.queries = []
 
-    def command(self, sql):
+    def command(self, sql, settings=None):
         self.log.append(sql)
         if sql.startswith("SELECT version()"):
             return "26.3.12.3"
@@ -51,11 +52,23 @@ class FakeServer:
         return None
 
     def query(self, sql, parameters=None):
-        if "clusterAllReplicas" in sql:
+        self.queries.append(sql)
+        if "has(%(names)s" in sql:
+            rows = [
+                (
+                    n,
+                    "ReplicatedMergeTree"
+                    if "ENGINE = Replicated" in self.live[n]
+                    else "MergeTree",
+                )
+                for n in parameters["names"]
+                if n in self.live
+            ]
+        elif "clusterAllReplicas" in sql:
             rows = (
-                [("h1",)]
+                [("h1", 9000)]
                 if "system.one" in sql
-                else [("h1", 1, sorted(self.elsewhere))]
+                else [("h1", 9000, 1, sorted(self.elsewhere))]
             )
         elif "formatQuerySingleLine" in sql:
             rows = [(" ".join(parameters["s"].split()),)]

@@ -160,6 +160,27 @@ Refused with an error, not run on one server: `CREATE OR REPLACE`, `CREATE DICTI
 `SYSTEM`, `GRANT`/`REVOKE`, and an explicit `ON CLUSTER` on a non-Replicated table. Errors in new
 tables or pending migrations surface from `--check` and before the first `CREATE` of an apply.
 
+Prerequisite: every table, and the ledger, must already be Replicated. `SYSTEM SYNC REPLICA`
+refuses a plain table, and `CREATE ... IF NOT EXISTS ON CLUSTER` does not convert an existing one.
+Convert first with the conversion job (spyre-frameworks #2819). The applier checks the ledger, and
+every existing table a pending migration inserts into, on the connected server before any write,
+and raises naming the ones that are not Replicated. A table only a view reads from is not tracked:
+a migration that inserts into a table and then reads it through a view is not synced in between.
+
+If a migration still fails part-way (a sync times out, a replica goes down), the DDL it started may
+keep running on the other replicas, and its ledger row is not written. The migrations that
+backfill (`006`, `007`) are not rerunnable, so do not rerun them: look at which statements ran
+(`system.query_log`), run the remaining statements of the file by hand on the connected replica,
+then record it:
+
+```sql
+INSERT INTO schema_migrations (migration_id, checksum) VALUES ('<file>.sql', '<checksum>')
+```
+
+with the checksum from `python -c "from spyre_clickhouse_ingest.apply_schema import SchemaApplier
+as S; print(S.checksum(open('<path>').read()))"`. A migration marked `-- RERUNNABLE` can instead be
+run again with `--rerun`. Syncs wait up to an hour (`distributed_ddl_task_timeout`).
+
 What it does not do: convert an existing plain table to Replicated, lock against two appliers
 running at once (run it from one place), or make `INSERT`s quorum writes. The tests run on
 single-node chdb, which proves the SQL rewriting only; `ON CLUSTER` and Replicated behaviour are
