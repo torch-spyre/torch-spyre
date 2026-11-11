@@ -22,6 +22,8 @@ Each test class covers one category from the Hash Coverage Table:
   TestIterationSpaceHashed     — different iter-space sizes → different hash
   TestOpFuncHashed             — different op names → different hash
   TestDebugHandleStripped      — debug_handle_ is stripped before hashing
+  TestLoopBoundaryHashed       — where a LoopSpec ends changes the hash
+  TestTileSymbolNameNotHashed  — minted tile-symbol names do not change the hash; stride position does
 """
 
 import json
@@ -182,6 +184,72 @@ class TestLoopSpecTripCount(unittest.TestCase):
         )
 
 
+class TestLoopBoundaryHashed(unittest.TestCase):
+    """The extent of each LoopSpec must be part of the hash. Ops after a loop
+    run once; ops inside it run count times (bundle.py emits them outside vs
+    inside the scf.for), so trees that differ only in where a loop ends must
+    produce different keys."""
+
+    def _ops(self):
+        # A and B are distinct and untiled; B is the op whose position moves.
+        return _make_op_spec(op="add"), _make_op_spec(op="mul")
+
+    def _assert_differs(self, left, right, msg):
+        for use_symbols in (False, True):
+            with self.subTest(use_symbols=use_symbols):
+                self.assertNotEqual(
+                    _hash(left, use_symbols=use_symbols),
+                    _hash(right, use_symbols=use_symbols),
+                    msg,
+                )
+
+    def test_op_after_loop_vs_inside_loop(self):
+        from torch_spyre._inductor.op_spec import LoopSpec
+
+        a, b = self._ops()
+        self._assert_differs(
+            [LoopSpec(count=4, body=[a]), b],
+            [LoopSpec(count=4, body=[a, b])],
+            "[Loop(4,[A]), B] and [Loop(4,[A,B])] must hash differently.",
+        )
+
+    def test_nested_inner_loop_boundary(self):
+        from torch_spyre._inductor.op_spec import LoopSpec
+
+        a, b = self._ops()
+        self._assert_differs(
+            [LoopSpec(count=2, body=[LoopSpec(count=3, body=[a]), b])],
+            [LoopSpec(count=2, body=[LoopSpec(count=3, body=[a, b])])],
+            "Moving B out of an inner loop (still inside the outer) must change "
+            "the hash.",
+        )
+
+    def test_sibling_loops_vs_nested_loops(self):
+        # Prefix variant: identical token prefix loop_count:4||A||loop_count:2||B
+        from torch_spyre._inductor.op_spec import LoopSpec
+
+        a, b = self._ops()
+        self._assert_differs(
+            [LoopSpec(count=4, body=[a]), LoopSpec(count=2, body=[b])],
+            [LoopSpec(count=4, body=[a, LoopSpec(count=2, body=[b])])],
+            "Sibling loops and nested loops must hash differently.",
+        )
+
+    def test_identical_trees_still_hash_equal(self):
+        from torch_spyre._inductor.op_spec import LoopSpec
+
+        def tree():
+            a, b = self._ops()
+            return [LoopSpec(count=4, body=[a]), b]
+
+        for use_symbols in (False, True):
+            with self.subTest(use_symbols=use_symbols):
+                self.assertEqual(
+                    _hash(tree(), use_symbols=use_symbols),
+                    _hash(tree(), use_symbols=use_symbols),
+                )
+
+
 class TestSymbolKindTagging(unittest.TestCase):
     """When use_symbols=True, pool / kernel_slice / kernel_derived offsets
     must be included in the hash so that two graphs with identical SDSC JSON
@@ -240,7 +308,12 @@ class TestAffineStridesHashed(unittest.TestCase):
     different cache keys so they do not share a cache entry.
     """
 
-    def _make_tiled_op_spec(self, tile_stride_bytes: int, size: int = 256):
+    def _make_tiled_op_spec(
+        self,
+        tile_stride_bytes: int,
+        size: int = 256,
+        sym_name: str = "_tile_adv_add_lvl0",
+    ):
         """Return an OpSpec that has a non-empty device_tile_advance_expr.
 
         tile_stride_bytes simulates the per-element advance for a coarse-tiled
@@ -253,7 +326,7 @@ class TestAffineStridesHashed(unittest.TestCase):
 
         c0 = Symbol("c0")
         # Minted level symbol — the kind used by spyre_kernel._get_or_mint_level_symbol
-        lvl_sym = Symbol("_tile_adv_add_lvl0")
+        lvl_sym = Symbol(sym_name)
 
         in_arg = TensorArg(
             is_input=True,
@@ -307,6 +380,77 @@ class TestAffineStridesHashed(unittest.TestCase):
             h256,
             "Ops with different tile strides must produce different hashes — "
             "affine_strides must be included in compute_specs_hash.",
+        )
+
+    def test_minted_symbol_op_name_does_not_change_hash(self):
+        """Renaming only the minted level symbol (its op-name part) must not
+        change the hash: bundle.py consumes the stride values, not the name."""
+        for use_symbols in (False, True):
+            with self.subTest(use_symbols=use_symbols):
+                op3 = self._make_tiled_op_spec(
+                    tile_stride_bytes=128, sym_name="_tile_adv_op3_lvl0"
+                )
+                op4 = self._make_tiled_op_spec(
+                    tile_stride_bytes=128, sym_name="_tile_adv_op4_lvl0"
+                )
+                self.assertEqual(
+                    _hash([op3], use_symbols=use_symbols),
+                    _hash([op4], use_symbols=use_symbols),
+                    "Structurally identical tiled ops from different Inductor "
+                    "ops must share a cache key.",
+                )
+
+    def test_different_strides_still_differ_with_renamed_symbols(self):
+        op3 = self._make_tiled_op_spec(
+            tile_stride_bytes=128, sym_name="_tile_adv_op3_lvl0"
+        )
+        op4 = self._make_tiled_op_spec(
+            tile_stride_bytes=256, sym_name="_tile_adv_op4_lvl0"
+        )
+        self.assertNotEqual(
+            _hash([op3]),
+            _hash([op4]),
+            "Different tile strides must still produce different hashes.",
+        )
+
+
+class TestTileSymbolNameNotHashed(unittest.TestCase):
+    """Stride *position* (tensor, level) and value are hashed; the symbol
+    name used as the dict key is not (bundle.py consumes only values)."""
+
+    _JSON = {"0_add": {"numCoresUsed_": 1}}
+
+    def _hash_with_strides(self, affine_strides):
+        stub = MagicMock(return_value=(self._JSON, [], affine_strides, []))
+        with patch("torch_spyre._inductor.codegen.superdsc.compile_op_spec", stub):
+            return _hash([_make_op_spec()])
+
+    def test_symbol_names_ignored(self):
+        s3, s4 = Symbol("_tile_adv_op3_lvl0"), Symbol("_tile_adv_op4_lvl0")
+        self.assertEqual(
+            self._hash_with_strides([[{s3: 128}], [{}]]),
+            self._hash_with_strides([[{s4: 128}], [{}]]),
+        )
+
+    def test_stride_on_different_tensor_differs(self):
+        s = Symbol("_tile_adv_op_lvl0")
+        self.assertNotEqual(
+            self._hash_with_strides([[{s: 128}], [{}]]),
+            self._hash_with_strides([[{}], [{s: 128}]]),
+        )
+
+    def test_stride_at_different_level_differs(self):
+        s0, s1 = Symbol("_tile_adv_op_lvl0"), Symbol("_tile_adv_op_lvl1")
+        self.assertNotEqual(
+            self._hash_with_strides([[{s0: 128}, {}]]),
+            self._hash_with_strides([[{}, {s1: 128}]]),
+        )
+
+    def test_swapped_strides_between_tensors_differ(self):
+        s = Symbol("_tile_adv_op_lvl0")
+        self.assertNotEqual(
+            self._hash_with_strides([[{s: 128}], [{s: 256}]]),
+            self._hash_with_strides([[{s: 256}], [{s: 128}]]),
         )
 
 
