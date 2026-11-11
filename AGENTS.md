@@ -21,7 +21,9 @@ via the PrivateUse1 mechanism.
   for any commit. `U` or `E` can still be valid, because `%G?` verifies
   against the local keyring; GitHub's
   `gh api repos/torch-spyre/torch-spyre/commits/<sha> --jq .commit.verification.verified`
-  is authoritative. Fix the last commit with `git commit --amend -s -S --no-edit`.
+  is authoritative. Fix the last commit with `git commit --amend -s -S --no-edit`;
+  fix every commit on the branch with
+  `git rebase --force-rebase --signoff -S "$(git merge-base origin/main HEAD)"`.
 - **Linting:** Run `pre-commit run --all-files` before pushing. Hooks include
   ruff, clang-format, cpplint, mypy, pymarkdown, and yamlfmt.
 - **Line length:** 88 characters (ruff).

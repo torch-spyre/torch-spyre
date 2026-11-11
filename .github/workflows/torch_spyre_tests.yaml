@@ -140,11 +140,14 @@ jobs:
             exit 0
           fi
           # gpgverify_error/unavailable mean GitHub's verifier failed, not the signature.
-          unsigned=$(grep -Ev ' gpgverify_(error|unavailable)$' <<<"$unverified")
+          # `|| true`: the step runs under `bash -e`, and grep exits 1 when it filters out
+          # every line, which would abort before the fail-open warning below.
+          unsigned=$(grep -Ev ' gpgverify_(error|unavailable)$' <<<"$unverified" || true)
           if [ -n "$unsigned" ]; then
             echo "::error::unsigned or unverified commits (main requires signed commits):"
             echo "$unsigned"
-            echo "Re-sign with 'git commit --amend -s -S --no-edit' (or 'git rebase -S') and force-push."
+            echo "Re-sign every PR commit with 'git rebase --force-rebase --signoff -S \$(git merge-base origin/main HEAD)'"
+            echo "and push with 'git push --force-with-lease'."
             exit 1
           fi
           if [ -n "$unverified" ]; then

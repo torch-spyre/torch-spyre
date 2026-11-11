@@ -79,13 +79,22 @@ Every commit needs both, and they are separate checks:
 
 ```bash
 gh api --paginate repos/torch-spyre/torch-spyre/pulls/<number>/commits \
-  --jq '.[] | "\(.sha[:12]) verified=\(.commit.verification.verified) \(.commit.verification.reason) signoff=\(.commit.message | test("Signed-off-by:"))"'
+  --jq '.[] | "\(.sha[:12]) verified=\(.commit.verification.verified) \(.commit.verification.reason) signoff=\(.commit.message | [splits("\n")] | any(test("^Signed-off-by: \\S")))"'
 ```
 
 Flag any commit with `verified=false` or `signoff=false` as a BLOCKER. A
 `gpgverify_error` or `gpgverify_unavailable` reason means GitHub's verifier
-failed, not the signature: recheck later. The fix is
-`git commit --amend -s -S --no-edit` (or `git rebase -S`) and a force-push.
+failed, not the signature: recheck later. The `signoff` column only looks for a
+line starting with `Signed-off-by:`; check that the signer is the author.
+
+To fix only the tip commit: `git commit --amend -s -S --no-edit`. To fix every
+commit on the PR, replay them all (`--force-rebase`, or a bare `rebase -S` with
+nothing new upstream just fast-forwards without re-signing):
+
+```bash
+git rebase --force-rebase --signoff -S "$(git merge-base origin/main HEAD)"
+git push --force-with-lease
+```
 
 ### 4. Tensor Layout Correctness
 
