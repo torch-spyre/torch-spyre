@@ -1865,19 +1865,18 @@ const at::Tensor& spyre_resize_(
   return self;
 }
 
-at::Tensor spyre_fill_tensor(const at::Tensor& self, double value) {
-  TORCH_CHECK(self.is_privateuseone(),
-              "spyre_fill_tensor: tensor must be on spyre device");
-  TORCH_CHECK(self.numel() > 0, "spyre_fill_tensor: cannot fill empty tensor");
+namespace {
 
+// Launch a device-side MEMORY_FILL DMA over one composite address: every
+// stick of it, padding included. createFillAsyncParams converts value to the
+// dtype-specific fill pattern; launchFillAsync submits it.
+void launch_device_fill(const flex::CompositeAddress* addr, double value,
+                        c10::ScalarType scalar_type) {
   // Map torch dtype to DataFormats for the value->pattern conversion, which
   // flex::createFillAsyncParams performs internally.
-  DataFormats dtype = get_device_dtype(self.scalar_type());
-
-  // Launch a device-side MEMORY_FILL DMA. createFillAsyncParams converts value
-  // to the dtype-specific fill pattern; launchFillAsync submits it.
-  auto* params = flex::createFillAsyncParams(get_composite_address(self), value,
-                                             dtype, /*use_dmai=*/true);
+  DataFormats dtype = get_device_dtype(scalar_type);
+  auto* params =
+      flex::createFillAsyncParams(addr, value, dtype, /*use_dmai=*/true);
   struct Guard {
     flex::FillAsyncParams* p;
     ~Guard() {
@@ -1886,7 +1885,100 @@ at::Tensor spyre_fill_tensor(const at::Tensor& self, double value) {
   } guard{params};
   SpyreStream stream;
   stream.launchFillAsync(params);
+}
 
+// Fill a sharded tensor one shard at a time: each shard is its own
+// single-chunk allocation, so a fill of each shard view covers the whole
+// tensor. Only whole sharded tensors reach this (views of sharded tensors are
+// rejected when created); the checks mirror copy_sharded's.
+void fill_sharded(const at::Tensor& sharded, double value) {
+  TORCH_CHECK(sharded.storage_offset() == 0 && sharded.is_contiguous(),
+              "sharded Spyre tensors only support whole-tensor fills");
+  const auto& info = *sharding_of(sharded)->sharding;
+  TORCH_CHECK(sharded.sizes().equals(c10::IntArrayRef(info.global_shape)),
+              "sharded Spyre tensors only support whole-tensor fills: tensor "
+              "metadata no longer matches the sharded allocation (",
+              sharded.sizes(), " vs ", info.global_shape, ")");
+  TORCH_CHECK(sharded.scalar_type() == info.dtype,
+              "sharded Spyre tensors only support whole-tensor fills: tensor "
+              "dtype no longer matches the sharded allocation (",
+              sharded.scalar_type(), " vs ", info.dtype, ")");
+  for (int64_t i = 0; i < static_cast<int64_t>(info.num_shards); ++i) {
+    at::Tensor shard = spyre_shard_view(sharded, i);
+    launch_device_fill(get_composite_address(shard), value,
+                       shard.scalar_type());
+  }
+}
+
+}  // namespace
+
+at::Tensor spyre_fill_tensor(const at::Tensor& self, double value) {
+  TORCH_CHECK(self.is_privateuseone(),
+              "spyre_fill_tensor: tensor must be on spyre device");
+  TORCH_CHECK(self.numel() > 0, "spyre_fill_tensor: cannot fill empty tensor");
+
+  // A sharded tensor's layout describes one shard, not the whole tensor, so
+  // the view checks below do not apply to it; fill_sharded fills each shard
+  // and rejects anything but the whole tensor.
+  if (spyre_is_sharded(self)) {
+    fill_sharded(self, value);
+    return self;
+  }
+
+  // The device-side MEMORY_FILL below writes every stick of the composite
+  // address, i.e. the whole storage, so it is only correct when self covers
+  // every element of the tensor that owns the storage, each exactly once. A
+  // partial view (d[8:16], d[:, 32:], d[:8], ...) would otherwise silently
+  // overwrite the elements outside it.
+  //  - self must be non-overlapping and dense: a broadcast view such as
+  //    d[:1].expand(64, 64) has the base's offset and element count but
+  //    covers only row 0. A transpose (d.t()) is dense and still fills.
+  //  - A tracked view is compared with its base: partial means a different
+  //    storage offset or fewer elements than the base.
+  //  - Anything else (a base, or a tensor sharing storage without view
+  //    tracking, e.g. d[8:16].detach()) is compared with the elements its
+  //    layout holds. For a reservation (to("spyre", dynamic=...)) the layout
+  //    is sized for the reserved max, and the space beyond the current shape
+  //    holds no other tensor's data, so the current shape is the whole
+  //    tensor.
+  //  - A layout whose valid_elements is unknown ({}) is not checked.
+  // TODO(brunhe704): fill partial views that cover whole sticks with per-run
+  // fills.
+  TORCH_CHECK(self.is_non_overlapping_and_dense(),
+              "fill_/zero_ of a broadcast or overlapping view of a Spyre "
+              "tensor is not supported yet: the device fill writes every "
+              "stick of the storage once (view: ",
+              self.sizes(), " with strides ", self.strides(),
+              "). Fill the underlying tensor, or a CPU copy, instead.");
+  const auto* impl = static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl());
+  int64_t whole_offset = 0;
+  int64_t whole_elements = -1;  // -1: unknown, do not check
+  if (self.is_view()) {
+    const at::TensorBase& base = self._base();
+    whole_offset = base.storage_offset();
+    whole_elements = base.numel();
+  } else if (impl->has_intact_reservation()) {
+    whole_elements = self.numel();
+  } else if (!impl->spyre_layout.valid_elements.empty()) {
+    whole_elements = 1;
+    for (const auto& [dims, count] : impl->spyre_layout.valid_elements) {
+      whole_elements *= count;
+    }
+  }
+  if (whole_elements >= 0) {
+    TORCH_CHECK(
+        self.storage_offset() == whole_offset && self.numel() == whole_elements,
+        "fill_/zero_ of a partial view of a Spyre tensor is not supported "
+        "yet: the "
+        "device fill writes whole sticks of the storage, so it would also "
+        "overwrite the elements outside the view (view: ",
+        self.sizes(), " at storage offset ", self.storage_offset(),
+        "; the whole tensor has ", whole_elements,
+        " elements at storage offset ", whole_offset,
+        "). Fill the whole tensor, or fill a CPU copy and copy it back.");
+  }
+
+  launch_device_fill(get_composite_address(self), value, self.scalar_type());
   return self;
 }
 
