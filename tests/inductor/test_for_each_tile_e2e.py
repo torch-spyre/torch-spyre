@@ -322,6 +322,56 @@ class TestForEachTileE2E(_DynamoResetTestCase):
             ):
                 compiled(values, indices, initial)
 
+    def test_scatter_carry_relayout_copies_are_in_the_loop(self):
+        """The mutation relayout of a scatter into a carry puts BOTH full-buffer
+        copies inside the scatter's loop ("so other carry readers observe the
+        preceding iteration's updates"), by node membership and not only by the
+        ``loop_group_id`` stamped on them.
+
+        ``reorder_nonstick_dims_mutation`` placed the copy-back by flat index after
+        the last body op, which the flat view puts at the top level; the copy then
+        claimed the loop without being in it. The pipeline's later ``expanded()``
+        round trip rebuilt nodes from ``loop_group_id`` and hid that, until
+        ``dedup_and_promote_constants`` stopped needing it. Without the fix the
+        compile fails in the scheduler ("Loop group (0,) is not contiguous"), which
+        is this test's regression signal; the assertions below say where each
+        member sits when it does not.
+
+        The loop's four members are the accumulate (``acc + value``), the copy-in,
+        the ``index_copy`` and the copy-back. The loop checker does not flag a
+        member outside its node: it checks that an op's index uses enclosing
+        variables, not that an op with a ``loop_group_id`` is inside the node."""
+        rows = 32  # a shape the runtime-index test compiles: the scatter is legal
+        generator = torch.Generator().manual_seed(930)
+        values = (torch.randn(4, rows, 64, generator=generator) * 0.125).to(
+            torch.float16
+        )
+        indices = torch.stack(
+            [torch.randperm(rows * 4, generator=generator)[:rows] for _ in range(4)]
+        ).to(torch.int32)
+        initial = (torch.randn(rows * 4, 64, generator=generator) * 0.125).to(
+            torch.float16
+        )
+        result: dict = {}
+        with (
+            config.patch(
+                backend_loop_unroll=False, lx_planning=True, hbm_pool_planning=True
+            ),
+            torch.inference_mode(),
+            # A cache hit would skip the pipeline this test inspects, leaving
+            # ``result`` empty.
+            torch._inductor.config.patch(force_disable_caches=True),
+            patch.object(
+                ts_passes, "CustomPreSchedulingPasses", _record_loop_membership(result)
+            ),
+        ):
+            torch.compile(scatter_carry_fn, fullgraph=True, dynamic=False)(
+                values.to(DEVICE_NAME), indices.to(DEVICE_NAME), initial.to(DEVICE_NAME)
+            )
+        self.assertIn("top_level", result, "the pipeline did not run")
+        self.assertEqual(result["top_level"], [])
+        self.assertEqual(len(result["in_body"]), 4, result["in_body"])
+
     def test_scatter_carry_preserves_old_value_read_after_update(self):
         from torch_spyre._C import SpyreTensorLayout, get_device_dtype
         from torch_spyre.ops.fallbacks import FallbackWarning
@@ -1074,6 +1124,45 @@ class TestForEachTileNestedGatherE2E(_DynamoResetTestCase):
         torch.testing.assert_close(
             out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
         )
+
+
+def _record_loop_membership(result: dict):
+    """A pre-scheduling pipeline that records, once it is done, where the ops that
+    claim a loop (by ``loop_info.loop_group_id``) sit in the node tree.
+
+    An extern constant is exempt: ``dedup_and_promote_constants`` hoists a body
+    constant to the head of the graph and it keeps its ``loop_info`` (see
+    ``counted_loop_path``), so it claims a loop from the top level by design.
+    ``result`` is filled in rather than kept on the class, so tests share no state.
+    """
+    from torch_spyre._inductor.ir import SpyreConstantFallback
+    from torch_spyre._inductor.loop_node import LoopNode
+
+    class _Record(CustomPreSchedulingPasses):
+        def __call__(self, graph) -> None:
+            super().__call__(graph)
+
+            def claims_a_loop(op):
+                return (
+                    not isinstance(op, SpyreConstantFallback)
+                    and getattr(getattr(op, "loop_info", None), "loop_group_id", None)
+                    is not None
+                )
+
+            result["top_level"] = [
+                op.get_operation_name()
+                for op in graph.operations
+                if not isinstance(op, LoopNode) and claims_a_loop(op)
+            ]
+            result["in_body"] = [
+                op.get_operation_name()
+                for node in graph.operations
+                if isinstance(node, LoopNode)
+                for op in all_ops(node.body)
+                if claims_a_loop(op)
+            ]
+
+    return _Record
 
 
 class _CollectRegions(CustomPreSchedulingPasses):

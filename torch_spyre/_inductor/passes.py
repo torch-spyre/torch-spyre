@@ -454,14 +454,12 @@ def _maybe_scratchpad_planning(graph: GraphLowering) -> None:
 
 
 # Passes the flat view cannot run as they run today, so they run on the
-# expanded list and the nodes are rebuilt after them.
-# ``dedup_and_promote_constants`` ends with ``operations[:] = constants +
-# non_constants``: it hoists every constant to the head of the WHOLE list. The
-# view keeps a constant that sits in a body inside that body (it cannot tell
-# whether a reorder means to cross a node boundary), and the node then sorts by
-# that constant, ahead of top-level ops it used to follow. On nested graphs that
-# changes the op order and the kernel (spec B.7, pass 18).
-_PASSES_RUN_EXPANDED = frozenset({"dedup_and_promote_constants"})
+# expanded list and the nodes are rebuilt after them. None at present: the only
+# one was ``dedup_and_promote_constants``, which hoists every constant to the head
+# of the whole graph, and now does so across node boundaries itself
+# (``OpsView.hoist_to_front``). The mechanism stays, with ``expanded()``, until the
+# flat view is deleted.
+_PASSES_RUN_EXPANDED: frozenset[str] = frozenset()
 
 
 @contextlib.contextmanager
