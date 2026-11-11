@@ -120,21 +120,6 @@ class TestFormatOpSpecList:
         assert "OpSpec(op='add'" in result
         assert "is_reduction=False" in result
         assert "tiled_symbols" not in result
-        assert "symbolic_dim_bounds" not in result
-
-    def test_op_spec_with_symbolic_dim_bounds(self):
-        op = OpSpec(
-            op="conv2d",
-            is_reduction=False,
-            iteration_space={m: (sympify(128), 1)},
-            args=[_make_tensor_arg(True, 0, [128, 64], [m, n])],
-            op_info={},
-            symbolic_dim_bounds={"s97": (256, 64)},
-        )
-        result = format_op_spec_list([op])
-
-        assert "symbolic_dim_bounds=" in result
-        assert "'s97': (256, 64)" in result
 
     def test_single_loop_spec(self):
         matmul = _make_matmul_op()

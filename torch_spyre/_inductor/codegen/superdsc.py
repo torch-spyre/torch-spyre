@@ -142,7 +142,9 @@ class SDSCSpec:
     constants: dict[str, Any]
     coordinate_masking: dict[Symbol, Any]
     conv_params: dict[str, Any] = dataclasses.field(default_factory=dict)
-    # maps SDSC dim name -> (pytorch_sym_name, granularity, max_val)
+    # maps SDSC dim name -> (pytorch_sym_name, granularity, max_val). Nothing
+    # fills it since the symbolic-SDSC route was removed (#5890); it goes with
+    # dimToSymbolMapping_ and SymbolKind.dimension.
     symbolic_dims: dict[str, tuple[str, int, int]] = dataclasses.field(
         default_factory=dict
     )
@@ -1936,29 +1938,14 @@ def _concretize_for_sdsc(expr: Expr) -> int:
     return int(expr)
 
 
-def _resolve_sdsc_size(expr: Expr, symbolic_dim_bounds: dict) -> int:
+def _resolve_sdsc_size(expr: Expr) -> int:
     """Resolve an iteration-space size for SDSC generation.
 
-    For symbolic dims, reads the max from symbolic_dim_bounds (computed at
-    codegen time from ShapeEnv, serialized as plain ints into the generated
-    file) so this works during the reload phase when ShapeEnv is gone.
-    Falls back to _concretize_for_sdsc for concrete expressions.
-
-    The symbolic branch is deprecated: only the symbolic-SDSC route reaches it.
-    The explicit-loop route that supersedes that one puts no dimension symbol in
-    an SDSC, so every size here is already concrete and takes the fallback.
-    TODO(issue#5890): drop the symbolic branch with the symbolic-SDSC route.
+    Every size here is concrete: a varying size outside a ``for_each_tile`` loop
+    is refused in ``create_op_spec``, and inside a loop the body is a static
+    tile. A size symbol without a declared maximum still resolves through
+    ``_concretize_for_sdsc``.
     """
-    # ``symbolic_dim_bounds`` is keyed by a single symbol name, so it can only
-    # answer for a single-symbol expression; a multi-symbol one falls through to
-    # ``_concretize_for_sdsc``, which resolves the whole expression. Reading one
-    # arbitrary symbol's bound out of the ``free_symbols`` set both answered the
-    # wrong question and made the answer depend on PYTHONHASHSEED.
-    syms = getattr(expr, "free_symbols", None)
-    if syms and len(syms) == 1:
-        sym_name = str(next(iter(syms)))
-        if sym_name in symbolic_dim_bounds:
-            return symbolic_dim_bounds[sym_name][0]  # max
     return _concretize_for_sdsc(expr)
 
 
@@ -2301,23 +2288,10 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         ", ".join(f"{k} -> {v}" for k, v in symbol_mapping.items()),
     )
 
-    # For symbolic dims, use the max from symbolic_dim_bounds as the iteration-space size
-    # so the emitted SDSC JSON is generated max sizes baked in, not symbols.
     sdsc_iteration_space = {
-        symbol_mapping[sym]: _resolve_sdsc_size(size, op_spec.symbolic_dim_bounds)
+        symbol_mapping[sym]: _resolve_sdsc_size(size)
         for sym, (size, _) in op_spec.iteration_space.items()
     }
-
-    # Build the SDSC dim name -> (pytorch_sym_name, granularity, max_val) map
-    # for any iteration-space dims.
-    # This drives symbolicDimInfo_ and dimToSymbolMapping_ in the generated JSON.
-    symbolic_dims: dict[str, tuple[str, int, int]] = {}
-    for sym, (size_expr, _) in op_spec.iteration_space.items():
-        sdsc_dim_name = str(symbol_mapping[sym])
-        sym_str = str(size_expr)
-        if sym_str in op_spec.symbolic_dim_bounds:
-            max_val, granularity = op_spec.symbolic_dim_bounds[sym_str]
-            symbolic_dims[sdsc_dim_name] = (sym_str, granularity, max_val)
 
     dim_splits = {
         symbol_mapping[dim]: value[-1] for dim, value in op_spec.iteration_space.items()
@@ -2878,7 +2852,6 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             masking_const_id=masking_const_id,
             conv_params=conv_params,
             coordinate_masking=coordinate_masking,
-            symbolic_dims=symbolic_dims,
             indirect_access_indices=indirect_access_indices,
             completed_producer_cores=op_spec.completed_producer_cores,
             debug_handle=op_spec.debug_handle,

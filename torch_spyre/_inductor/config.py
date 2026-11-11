@@ -230,12 +230,7 @@ dxp_lx_frac_avail: float = float(os.environ.get("DXP_LX_FRAC_AVAIL", "0.2"))
 
 sencores: int = int(os.getenv("SENCORES", "32"))
 
-# Symbolic-dim knobs consumed by compute_granularity in pass_utils.py.
-# The pointwise work-division PR (#2499) wires that helper into the
-# compilation pipeline; until then these knobs are read only by the
-# helper and its unit tests. See #2284, #2287 for the design.
-
-# Cap on bucket count (= max_size / granularity).
+# Cap on the bucket count (= max / granularity) of a symbolic dimension.
 # TODO: confirm the default with the Deeptools team.
 max_buckets: int = int(os.getenv("MAX_BUCKETS", "32"))
 
@@ -246,11 +241,6 @@ max_buckets: int = int(os.getenv("MAX_BUCKETS", "32"))
 # enforcing it at the reservation means a future caller can't quietly drop
 # below it.
 min_reserved_dim_size: int = int(os.getenv("MIN_RESERVED_DIM_SIZE", "8"))
-
-# Soft floor on the auto-derived granularity when mark_dynamic(min=...)
-# is not provided. Keeps the picked granularity from collapsing to a
-# very small divisor when max_size has many of them.
-min_default_granularity: int = int(os.getenv("MIN_DEFAULT_GRANULARITY", "4"))
 
 # Ignore spyre_hint(work_div=...) and use the automatic work-distribution planner.
 ignore_work_division_hints: bool = (

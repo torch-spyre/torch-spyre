@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import warnings
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -47,15 +46,8 @@ from torch_spyre._inductor.codegen.superdsc import (
     parse_op_spec,
 )
 from torch_spyre._inductor.core_mapping import derive_operation_mapping
-from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.op_spec import OpSpec, TensorArg
 from utils_inductor import mock_backend_compiler
-from torch_spyre._inductor.work_division import (
-    _collect_symbol_metadata,
-    _effective_size,
-    _valid_divisor_basis,
-    adjust_it_space_for_sticks,
-)
 
 
 def _total_core_split(source: str) -> int:
@@ -120,111 +112,6 @@ class TestSpyreConfig(InductorTestCase):
         # Co-optimization spreads the split across dims; the product of the
         # per-dim split factors must add up to the configured core count.
         self.assertEqual(_total_core_split(source_codes[0]), config.sencores)
-
-    @config.patch({"sencores": 32})
-    def test_symbolic_batch_dim_pointwise_split(self):
-        """Symbolic batch dim must split by ``granularity`` not ``max_size`` (#2287).
-
-        ``[s, 128]`` fp16 with ``s in [64, 1024]`` (granularity = 64). The planner picks the largest
-        divisor of granularity ≤ SENCORES = 32, so the batch dim absorbs all
-        32 cores and the static stick dim gets split 1.
-        """
-        fn = torch.add
-        x = torch.randn((1024, 128), dtype=torch.float16)
-        y = torch.randn_like(x)
-        torch._dynamo.mark_dynamic(x, 0, min=64, max=1024)
-        torch._dynamo.mark_dynamic(y, 0, min=64, max=1024)
-        # dynamic=True not needed: mark_dynamic already makes dim 0 symbolic.
-        comp_fn = torch.compile(fn, dynamic=False)
-        _, source_codes = run_and_get_code(comp_fn, x.to("spyre"), y.to("spyre"))
-        # Iteration space embeds (size_expr, split). The symbolic batch dim's
-        # split must equal SENCORES=32; the static stick dim's split must be 1.
-        FileCheck().check("sdsc_fused_add").run(source_codes[0])
-        # Co-optimization spreads the split across dims; the product of the
-        # per-dim split factors must add up to the configured core count.
-        self.assertEqual(_total_core_split(source_codes[0]), config.sencores)
-
-    # ------------------------------------------------------------------
-    # Unit tests for the symbolic-shape sidecar in work_division.py
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _mock_v(lower=None, upper=None, optimization_hint=None):
-        """
-        Mock V whose ShapeEnv reports the given lower / upper bounds.
-        """
-        shape_env = SimpleNamespace(
-            bound_sympy=lambda _e: SimpleNamespace(lower=lower, upper=upper)
-        )
-        sizevars = SimpleNamespace(shape_env=shape_env)
-        if optimization_hint is not None:
-            sizevars.optimization_hint = lambda _e: optimization_hint
-        return SimpleNamespace(graph=SimpleNamespace(sizevars=sizevars))
-
-    def test_collect_symbol_metadata_opt_in(self):
-        """
-        User-marked dynamic dim (finite max) enters the metadata dict.
-        """
-        s0 = sympy.Symbol("s0", integer=True, positive=True)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            with patch(
-                "torch_spyre._inductor.pass_utils.V",
-                self._mock_v(lower=sympy.Integer(2), upper=sympy.Integer(512)),
-            ):
-                result = _collect_symbol_metadata({s0: s0})
-        # max comes straight from the ShapeEnv upper bound;
-        # granularity is the smallest divisor of 512 with d >= 4 and
-        # 512/d <= 32, which is 16.
-        self.assertEqual(result, {s0: (512, 16)})
-
-    def test_collect_symbol_metadata_auto_dynamic_skipped(self):
-        """
-        Dynamo-promoted symbols (no finite max) are skipped, not assigned.
-        """
-        s0 = sympy.Symbol("s0", integer=True, positive=True)
-        with patch(
-            "torch_spyre._inductor.pass_utils.V",
-            self._mock_v(
-                lower=sympy.Integer(2), upper=sympy.oo, optimization_hint=1024
-            ),
-        ):
-            self.assertEqual(_collect_symbol_metadata({s0: s0}), {})
-
-    def test_dispatch_helpers_symbolic_vs_concrete(self):
-        """
-        ``_effective_size`` and ``_valid_divisor_basis`` dispatch on ``v in meta``.
-        """
-        s0 = sympy.Symbol("s0")
-        it_space = {s0: sympy.Integer(128)}
-        meta = {s0: (512, 16)}
-        # In meta: use the (max, granularity) tuple.
-        self.assertEqual(_effective_size(s0, it_space, meta), 512)
-        self.assertEqual(_valid_divisor_basis(s0, it_space, meta), 16)
-        # Not in meta: fall through to concretize_expr(it_space[v]).
-        self.assertEqual(_effective_size(s0, it_space, meta={}), 128)
-        self.assertEqual(_valid_divisor_basis(s0, it_space, meta={}), 128)
-
-    def test_symbolic_stick_dim_raises_unsupported(self):
-        """
-        A symbolic dim that lands on a tensor's stick coord is rejected.
-        This is a follow up work.
-        """
-        s0 = sympy.Symbol("s0", integer=True, positive=True)
-        # Minimal TensorDep stand-in: the function only reads
-        # device_coords[-1], dep.name, and layout.device_layout.elems_per_stick().
-        fake_td = SimpleNamespace(
-            dep=SimpleNamespace(name="fake_buf"),
-            layout=SimpleNamespace(
-                device_layout=SimpleNamespace(elems_per_stick=lambda: 64)
-            ),
-            device_coords=[s0],
-        )
-        with self.assertRaises(Unsupported) as cm:
-            adjust_it_space_for_sticks(
-                {s0: sympy.Integer(128)}, [fake_td], {s0: (512, 64)}
-            )
-        self.assertIn("symbolic stick dim", str(cm.exception))
 
     def test_inplace_op_run_call_deduplicates_args(self):
         """An inplace op (x *= 2) must not pass the same tensor twice to .run().
@@ -352,18 +239,13 @@ class TestResolveSdscSize(InductorTestCase):
     """Unit tests for superdsc._resolve_sdsc_size."""
 
     def test_concrete_sympy_integer(self):
-        self.assertEqual(_resolve_sdsc_size(sympy.Integer(256), {}), 256)
+        self.assertEqual(_resolve_sdsc_size(sympy.Integer(256)), 256)
 
     def test_concrete_python_int(self):
-        self.assertEqual(_resolve_sdsc_size(128, {}), 128)
+        self.assertEqual(_resolve_sdsc_size(128), 128)
 
-    def test_symbolic_in_bounds_returns_max(self):
-        # bounds carries (max, granularity); index [0] is max.
-        s0 = sympy.Symbol("s0", integer=True, positive=True)
-        self.assertEqual(_resolve_sdsc_size(s0, {"s0": (1024, 64)}), 1024)
-
-    def test_symbolic_not_in_bounds_uses_guarding_hint(self):
-        # Symbol absent from bounds → _concretize_for_sdsc → guarding_hint_or_throw.
+    def test_symbolic_uses_guarding_hint(self):
+        # A size symbol resolves through _concretize_for_sdsc → guarding_hint_or_throw.
         # The SDSC/DeepTools boundary is correctness-critical, so it must resolve
         # the *true* concrete size (guarding_hint_or_throw), not an optimization
         # heuristic that could silently emit a fallback (e.g. sys.maxsize).
@@ -371,9 +253,9 @@ class TestResolveSdscSize(InductorTestCase):
         sizevars = SimpleNamespace(guarding_hint_or_throw=lambda _: 128)
         mock_v = SimpleNamespace(graph=SimpleNamespace(sizevars=sizevars))
         with patch("torch_spyre._inductor.codegen.superdsc.V", mock_v):
-            self.assertEqual(_resolve_sdsc_size(s0, {}), 128)
+            self.assertEqual(_resolve_sdsc_size(s0), 128)
 
-    def test_symbolic_not_in_bounds_raises_on_unbacked(self):
+    def test_symbolic_raises_on_unbacked(self):
         # An unbacked symbol at the SDSC boundary must fail loudly rather than
         # produce a bogus concrete size, so guarding_hint_or_throw's raise
         # propagates out of _concretize_for_sdsc.
@@ -386,7 +268,7 @@ class TestResolveSdscSize(InductorTestCase):
         mock_v = SimpleNamespace(graph=SimpleNamespace(sizevars=sizevars))
         with patch("torch_spyre._inductor.codegen.superdsc.V", mock_v):
             with self.assertRaises(RuntimeError):
-                _resolve_sdsc_size(s0, {})
+                _resolve_sdsc_size(s0)
 
 
 class TestAlignPoolDimLabels(InductorTestCase):
@@ -467,67 +349,6 @@ class TestSymbolKindDimension(InductorTestCase):
 
     def test_pool_is_not_dimension(self):
         self.assertFalse(SymbolKind.pool().is_dimension)
-
-
-class TestSdscJsonSymbolicDimSmoke(InductorTestCase):
-    """Smoke test: a symbolic iteration-space dim survives end-to-end through
-    compile_op_spec (parse_op_spec + generate_sdsc) into the emitted SDSC
-    JSON's dimToSymbolMapping_ field.
-
-    Fixture uses a [512, 256] fp16 stick-layout tensor with the row dim
-    made symbolic. Because _resolve_sdsc_size resolves a symbolic dim to
-    its declared max (512), every downstream computation (padding,
-    stick-dim detection, core slicing) runs identically to the equivalent
-    concrete case -- only the symbolic_dims side-channel asserted on here
-    differs.
-    """
-
-    _DEVICE_SIZE = [4, 512, 64]
-    _HBM_BASE = 0x400000000
-
-    def _make_symbolic_op_spec(self) -> OpSpec:
-        c_row, c_col = sympy.Symbol("c_row"), sympy.Symbol("c_col")
-        s0 = sympy.Symbol("s0", integer=True, positive=True)
-        coords = [c_col // 64, c_row, sympy.Mod(c_col, 64)]
-
-        def _tensor_arg(is_input, arg_index, hbm_base):
-            return TensorArg(
-                is_input=is_input,
-                arg_index=arg_index,
-                device_dtype=DataFormats.SEN169_FP16,
-                device_size=list(self._DEVICE_SIZE),
-                device_coordinates=coords,
-                allocation={"hbm": hbm_base},
-            )
-
-        iteration_space = {
-            c_row: (s0, 1),
-            c_col: (sympy.Integer(256), 1),
-        }
-        return OpSpec(
-            op="add",
-            is_reduction=False,
-            iteration_space=iteration_space,
-            core_id_to_work_slice=derive_operation_mapping(iteration_space),
-            args=[
-                _tensor_arg(True, 0, self._HBM_BASE),
-                _tensor_arg(True, 1, self._HBM_BASE + 0x1000),
-                _tensor_arg(False, 2, self._HBM_BASE + 0x100000000),
-            ],
-            op_info={},
-            symbolic_dim_bounds={"s0": (512, 64)},  # (max, granularity)
-        )
-
-    def test_symbolic_dim_fields_in_sdsc_json(self):
-        op_spec = self._make_symbolic_op_spec()
-        sdsc_json, _, _, _ = compile_op_spec(idx=0, op_spec=op_spec, symbols=[])
-
-        top = next(iter(sdsc_json.values()))
-        dsc = next(iter(top["dscs_"][0].values()))
-
-        # "s0" is registered as dim-symbol id -1 and bound to the SDSC "mb"
-        # dim (c_row maps to the first non-output dim label for a 2-dim op).
-        self.assertEqual(dsc["dimToSymbolMapping_"], {"mb": [-1]})
 
 
 class TestOverlappingWindowCoreOffsets(InductorTestCase):
@@ -943,68 +764,6 @@ class TestSdscIgnoresSymbolIdentity(InductorTestCase):
                     self._sdsc(build(), distinct_stick=True),
                     self._sdsc(build(), distinct_stick=False),
                 )
-
-
-class TestGenerateSdscSymbolicPerCoreAddresses(InductorTestCase):
-    """Symbol-id ordering for a symbolic-batch add split across 8 cores.
-
-    Fixture mirrors TestSdscJsonSymbolicDimSmoke but with work_slices that
-    actually split the symbolic dim across 8 cores (s0 max=512, granularity=64).
-    """
-
-    _DEVICE_SIZE = [4, 512, 64]
-    _HBM_BASE = 0x400000000
-    _NUM_CORES = 8
-
-    def _make_symbolic_op_spec(self) -> OpSpec:
-        c_row, c_col = sympy.Symbol("c_row"), sympy.Symbol("c_col")
-        s0 = sympy.Symbol("s0", integer=True, positive=True)
-        coords = [c_col // 64, c_row, sympy.Mod(c_col, 64)]
-
-        def _tensor_arg(is_input, arg_index, hbm_base):
-            return TensorArg(
-                is_input=is_input,
-                arg_index=arg_index,
-                device_dtype=DataFormats.SEN169_FP16,
-                device_size=list(self._DEVICE_SIZE),
-                device_coordinates=coords,
-                allocation={"hbm": hbm_base},
-            )
-
-        iteration_space = {
-            c_row: (s0, self._NUM_CORES),
-            c_col: (sympy.Integer(256), 1),
-        }
-        return OpSpec(
-            op="add",
-            is_reduction=False,
-            iteration_space=iteration_space,
-            core_id_to_work_slice=derive_operation_mapping(iteration_space),
-            args=[
-                _tensor_arg(True, 0, self._HBM_BASE),
-                _tensor_arg(True, 1, self._HBM_BASE + 0x1000),
-                _tensor_arg(False, 2, self._HBM_BASE + 0x100000000),
-            ],
-            op_info={},
-            symbolic_dim_bounds={"s0": (512, 64)},
-        )
-
-    def test_dim_symbol_ids_lower_magnitude_than_address_ids(self):
-        # Dim symbols must occupy the smallest-magnitude (closest to zero) ids
-        # in the SDSC's local range, before any address symbol. A future change
-        # that inverts this would silently shift bundle.mlir operand positions.
-        op_spec = self._make_symbolic_op_spec()
-        _, _, _, symbol_kinds = compile_op_spec(idx=0, op_spec=op_spec, symbols=[])
-        first_address = next(
-            i for i, sk in enumerate(symbol_kinds) if not sk.is_dimension
-        )
-        # All dimension kinds come before any address kind.
-        for sk in symbol_kinds[:first_address]:
-            self.assertTrue(sk.is_dimension)
-        for sk in symbol_kinds[first_address:]:
-            self.assertFalse(sk.is_dimension)
-        # And at least one per-core derived address was registered.
-        self.assertTrue(any(sk.is_derived for sk in symbol_kinds[first_address:]))
 
 
 class TestClipConstants(InductorTestCase):
