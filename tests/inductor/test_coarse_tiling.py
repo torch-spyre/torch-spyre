@@ -4642,7 +4642,7 @@ class TestGenerateBundleMlir(unittest.TestCase):
         k = Symbol("K")
         a = _make_minimal_op_spec("a")
         loop = LoopSpec(count=k, body=[a])
-        with self.assertRaises(NotImplementedError):
+        with self.assertRaises(Unsupported):
             self._bundle([loop])
 
 
