@@ -337,9 +337,11 @@ by the number of calls one pass spans, `loop_trip / passes`, and the shared-weig
 is re-derived from that batch. In the example above both loops price the preferences of
 a `[64, 128]` call with batch 1, 128 times. Without this the stacked form saw batch 128,
 lost the decode-scope and shared-weight branches, and was priced milliseconds apart
-from the same body writing one buffer. When the trip or pass count is symbolic, or the
-buffer batch is not a whole number of calls, the buffer-level batch and sharing are
-kept rather than rounded.
+from the same body writing one buffer. When the buffer batch is not a whole number of
+calls, the buffer-level batch and sharing are kept rather than rounded. When the trip
+count, pass count or batch is symbolic, that test is a SymPy condition, and the batch
+and the shared-weight flag become `Piecewise` expressions over it, which the
+preferences branch on with `piecewise`.
 
 The preferences are ranking regularizers, not measured service times. Each is 10 to
 30 µs per log2 step away from its target (`_M_LANE_UNDERUSE_PENALTY_US`,
