@@ -26,12 +26,15 @@ Tests all 4 conversion cases:
 
 import pytest
 import torch
+import math
 from torch._inductor.exc import InductorError
 from torch_spyre._C import ElementArrangement, get_spyre_tensor_layout
-from torch_spyre._inductor import config
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
 from torch_spyre._inductor.constants import DEVICE_NAME
-from utils_inductor import expects_raise
+from utils_inductor import shapes2key, expects_raise
+
+
+EA = ElementArrangement
 
 
 def _run(fn, *args, mode="compile"):
@@ -349,83 +352,6 @@ def test_upcast_consumed_on_partial_stick(shape):
     torch.testing.assert_close(result.cpu(), fn(x), rtol=0, atol=0)
 
 
-def _stagger_fn(x, fp16):
-    """fp32 → fp16(staggered) → stagger_to_standard_ea → standard EA fp16."""
-    return torch.ops.spyre.stagger_to_standard_ea(x.to(dtype=fp16))
-
-
-@pytest.mark.parametrize(
-    "x",
-    [
-        # 1-D: stick-aligned
-        torch.randn(64, dtype=torch.float32),
-        torch.randn(128, dtype=torch.float32),
-        # 1-D: non-stick-aligned (padded to 64-multiple)
-        torch.nn.functional.pad(torch.randn(44, dtype=torch.float32), (0, 20)),
-        # 2-D: stick-aligned
-        torch.randn(4, 64, dtype=torch.float32),
-        torch.randn(7, 128, dtype=torch.float32),
-        # 2-D: non-stick-aligned (padded)
-        torch.nn.functional.pad(torch.randn(7, 44, dtype=torch.float32), (0, 20)),
-        # 3-D: stick-aligned
-        torch.randn(2, 4, 64, dtype=torch.float32),
-        torch.randn(3, 5, 128, dtype=torch.float32),
-        # 3-D: non-stick-aligned (padded)
-        torch.nn.functional.pad(torch.randn(2, 4, 44, dtype=torch.float32), (0, 20)),
-        # 4-D: stick-aligned
-        torch.randn(2, 3, 4, 64, dtype=torch.float32),
-        torch.randn(2, 3, 4, 128, dtype=torch.float32),
-        # 4-D: non-stick-aligned (padded)
-        torch.nn.functional.pad(torch.randn(2, 3, 4, 44, dtype=torch.float32), (0, 20)),
-    ],
-)
-@pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
-@pytest.mark.parametrize(
-    "fp16",
-    DtypeOpTable.fp16_types(),
-    ids=lambda dt: str(dt).replace("torch.", ""),
-)
-def test_stagger_to_standard_ea(x, fp16):
-    """stagger_to_standard_ea restores standard EA after fp32→fp16 (fp32todl16).
-
-    Verifies:
-      1. Output values match a plain x.to(fp16) on CPU (logical correctness).
-      2. Output EA is STANDARD (layout correctness).
-    """
-    expected = x.to(fp16)
-
-    compiled_fn = torch.compile(_stagger_fn, backend="inductor")
-
-    # 1. Value correctness: Spyre result matches CPU fp16 cast.
-    # fp32→fp16 rounding differs slightly (Spyre uses DF16); use fp16 tolerances.
-    result = compiled_fn(x.to("spyre"), fp16).cpu()
-    torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
-
-    # 2. Layout correctness: output EA must be STANDARD.
-    spyre_result = compiled_fn(x.to("spyre"), fp16)
-    ea = get_spyre_tensor_layout(spyre_result).element_arrangement
-    assert ea == ElementArrangement.STANDARD, f"Expected STANDARD EA, got {ea}"
-
-
-@pytest.mark.parametrize("lx_planning", [False, True], ids=["hbm", "lx"])
-@pytest.mark.parametrize(
-    "fp16",
-    DtypeOpTable.fp16_types(),
-    ids=lambda dt: str(dt).replace("torch.", ""),
-)
-def test_stagger_to_standard_ea_one_core_row_order(lx_planning, fp16):
-    """Keep conflicting physical row segments local to one core (#4703)."""
-    torch._dynamo.reset()
-    # Distinct, exactly representable rows make a row permutation unambiguous.
-    x = torch.arange(8, dtype=torch.float32).reshape(2, 4, 1)
-    x = x.expand(2, 4, 64).contiguous()
-    with config.patch({"sencores": 1, "lx_planning": lx_planning}):
-        compiled_fn = torch.compile(_stagger_fn, backend="inductor", fullgraph=True)
-        result = compiled_fn(x.to(DEVICE_NAME), fp16)
-    torch.testing.assert_close(result.cpu(), x.to(fp16), atol=0, rtol=0)
-    assert_ea(result, ElementArrangement.STANDARD)
-
-
 _SLICED_RMSNORM_SHAPES = {
     "gemma3-1b": (4, 1, 256, 1152),
     "gemma4-global": (32, 4, 512, 5376),
@@ -574,7 +500,8 @@ _FRESH_ALLOCATION_PROGRAMS = {
 
 def _small_int_fp16(shape, modulus, base=0):
     # Integers <= 1024 are exact in DLFloat16, so results compare bit-exact.
-    return (torch.arange(shape[0] * shape[1]) % modulus + base).reshape(shape).half()
+    numel = math.prod(shape)
+    return (torch.arange(numel) % modulus + base).reshape(shape).half()
 
 
 @pytest.mark.parametrize("conversion", list(_STAGGERING_CONVERSIONS))
@@ -780,6 +707,172 @@ def test_fp32_reduction_cast_into_matmul(tokens, fp16):
     m = torch.randint(-1, 2, (128, 128)).to(fp16)
     result = torch.compile(fn)(y.to(DEVICE_NAME), w.to(DEVICE_NAME), m.to(DEVICE_NAME))
     torch.testing.assert_close(result.cpu(), fn(y, w, m), rtol=0, atol=0)
+
+
+# ---------------------------------------------------------------------------
+# Shuffle op correctness verification to apply or restore element arrangement
+# ---------------------------------------------------------------------------
+_WHOLE_STICK_PAIRS = "requires whole FP32 stick pairs"
+_RESCALE_REJECTION = "cannot rescale device layout"
+_NOT_DIVISIBLE = "cannot be divided safely"
+
+
+class TestEAShuffle:
+    # The stick dim is a whole number of 64-element sticks.
+    _STICK_ALIGNED_SHAPES = [
+        (64,),
+        (128,),
+        (256,),  # row has more than one fp32 stick pair, to verify mb=1
+        (2, 64),
+        (4, 64),
+        (4, 128),
+        (2, 4, 64),
+        (3, 5, 128),
+        (2, 3, 4, 64),
+        (64, 256),
+        # an odd number (>= 3) of fp32 stick pairs when staggered as DL16_TO_FP32
+        (4, 192),
+        (4, 320),
+    ]
+    # The stick dim is shorter than a stick, or ends a stick early.
+    _SMALL_N_SHAPES = [(2,), (16,), (32,), (63,), (2, 2), (4, 16), (4, 32)]
+    # The stick dim ends inside a stick.
+    _PARTIAL_STICK_SHAPES = [(44,), (100,), (7, 44), (4, 100), (2, 4, 44), (8, 16, 100)]
+
+    # fp16 -> fp32: the staggered operand is the fp32 one (DL16_TO_FP32). Its
+    # stick dim may hold an odd number of fp32 sticks, padded to a whole pair.
+    _DL16_TO_FP32_SHAPES = (
+        STICK_ONLY_SHAPES
+        + _STICK_ALIGNED_SHAPES
+        + _SMALL_N_SHAPES
+        + _PARTIAL_STICK_SHAPES
+        + [(68,), (4, 68), (4, 69), (4, 96), (4, 160)]
+    )
+    # fp32 -> fp16: the staggered operand is the fp16 one (FP32_TO_DL16). The
+    # compiler only accepts an even number of 32-element fp32 sticks
+    # (rescale_stl_for_dtype), so the odd-stick shapes above are left out.
+    _FP32_TO_DL16_SHAPES = (
+        STICK_ONLY_SHAPES
+        + _STICK_ALIGNED_SHAPES
+        + _SMALL_N_SHAPES
+        + _PARTIAL_STICK_SHAPES
+    )
+
+    # Shapes the compiler rejects today, with a fragment of the error. They are
+    # left out of the shuffle cases on the device and checked by
+    # test_ea_shuffle_rejected.
+    _DL16_TO_FP32_REJECTED = {
+        # fewer than a whole pair of 32-element fp32 sticks
+        (2,): _WHOLE_STICK_PAIRS,
+        (16,): _WHOLE_STICK_PAIRS,
+        (32,): _WHOLE_STICK_PAIRS,
+        (2, 2): _WHOLE_STICK_PAIRS,
+        (4, 16): _WHOLE_STICK_PAIRS,
+        (4, 32): _WHOLE_STICK_PAIRS,
+        # a rank >= 3 read of the shuffled stick dim is not affine
+        (2, 4, 64): _NOT_DIVISIBLE,
+        (2, 3, 4, 64): _NOT_DIVISIBLE,
+    }
+    _FP32_TO_DL16_REJECTED = {
+        # one 32-element fp32 stick is not a whole 64-element fp16 stick
+        (32,): _RESCALE_REJECTION,
+        (4, 32): _RESCALE_REJECTION,
+    }
+
+    # The shapes run on the device, without the rejected ones. A broadcast stick
+    # (STICK_ONLY_SHAPES) gets no shuffle: its order is moot.
+    _DL16_TO_FP32_RUN = sorted(
+        set(_DL16_TO_FP32_SHAPES)
+        - set(_DL16_TO_FP32_REJECTED)
+        - set(STICK_ONLY_SHAPES),
+        key=_DL16_TO_FP32_SHAPES.index,
+    )
+    _FP32_TO_DL16_RUN = sorted(
+        set(_FP32_TO_DL16_SHAPES)
+        - set(_FP32_TO_DL16_REJECTED)
+        - set(STICK_ONLY_SHAPES),
+        key=_FP32_TO_DL16_SHAPES.index,
+    )
+    _RUN_CASES = [
+        pytest.param(EA.DL16_TO_FP32, s, id=f"dl16_to_fp32-{shapes2key((s,))}")
+        for s in _DL16_TO_FP32_RUN
+    ] + [
+        pytest.param(EA.FP32_TO_DL16, s, id=f"fp32_to_dl16-{shapes2key((s,))}")
+        for s in _FP32_TO_DL16_RUN
+    ]
+    _REJECTED_CASES = [
+        pytest.param(EA.DL16_TO_FP32, s, m, id=f"dl16_to_fp32-{shapes2key((s,))}")
+        for s, m in _DL16_TO_FP32_REJECTED.items()
+    ] + [
+        pytest.param(EA.FP32_TO_DL16, s, m, id=f"fp32_to_dl16-{shapes2key((s,))}")
+        for s, m in _FP32_TO_DL16_REJECTED.items()
+    ]
+
+    # Pointwise ops and chains of them; ``s`` is the staggered operand and ``std``
+    # the STANDARD one. The last chain reads ``s`` three times (one shared shuffle).
+    POINTWISE_FNS = {
+        "add": torch.add,
+        "mul": torch.mul,
+        "eq": torch.eq,
+        "rsub": lambda s, std: std - s,
+        "add_then_mul": lambda s, std: (s + std) * 2.0,
+        "mul_then_add": lambda s, std: s * std + std,
+        "rsub_then_mul": lambda s, std: (std - s) * 2.0,
+        "reuse_staggered": lambda s, std: (s * std + s) + std,
+    }
+
+    _FP16 = pytest.mark.parametrize(
+        "fp16",
+        DtypeOpTable.fp16_types(),
+        ids=lambda dt: str(dt).replace("torch.", ""),
+    )
+
+    @staticmethod
+    def _operands(ea, shape, fp16):
+        """Inputs for ``ea``: ``x`` is converted to the dtype of ``y`` (STANDARD)."""
+        if ea == EA.DL16_TO_FP32:
+            x_dtype, y_dtype = fp16, torch.float32
+        else:
+            x_dtype, y_dtype = torch.float32, fp16
+        x = _small_int_fp16(shape, 7).to(x_dtype)
+        y = _small_int_fp16(shape, 5, base=3).to(y_dtype)
+        return x, y
+
+    def _check_shuffle(self, ea, shape, fp16, op=torch.add):
+        x, y = self._operands(ea, shape, fp16)
+
+        def fn(x, y):
+            return op(x.to(y.dtype), y)
+
+        result = _run(fn, x.to(DEVICE_NAME), y.to(DEVICE_NAME))
+
+        assert_ea(result, EA.STANDARD)
+        assert torch.equal(result.cpu(), fn(x, y))
+
+    @_FP16
+    @pytest.mark.parametrize("ea, shape", _RUN_CASES)
+    def test_ea_shuffle(self, ea, shape, fp16):
+        """A staggered operand added to a STANDARD one is shuffled, on every shape."""
+        self._check_shuffle(ea, shape, fp16)
+
+    @expects_raise
+    @_FP16
+    @pytest.mark.parametrize("ea, shape, match", _REJECTED_CASES)
+    def test_ea_shuffle_rejected(self, ea, shape, match, fp16):
+        """Shapes the compiler cannot shuffle yet fail with a stable error."""
+        with pytest.raises(InductorError, match=match):
+            self._check_shuffle(ea, shape, fp16)
+
+    @_FP16
+    @pytest.mark.parametrize(
+        "ea", [EA.DL16_TO_FP32, EA.FP32_TO_DL16], ids=["dl16_to_fp32", "fp32_to_dl16"]
+    )
+    @pytest.mark.parametrize(
+        "pointwise", list(POINTWISE_FNS.values()), ids=list(POINTWISE_FNS)
+    )
+    def test_shuffle_pointwise(self, ea, fp16, pointwise):
+        """Each pointwise op, and chains of them, read a shuffled operand."""
+        self._check_shuffle(ea, (2, 64), fp16, pointwise)
 
 
 # Made with Bob
