@@ -352,6 +352,7 @@ The key elements of metadata are:
 - `stride_map`: a vector of the same length as `device_size` giving the host stride for each device dimension (-1 for synthetic or padded dimensions).
 - `device_dtype`: the datatype of the Tensor.
 - `element_arrangement`: how elements are packed within a stick. Defaults to `STANDARD` and appears in the `repr` only when it is non-standard.
+- `valid_elements`: a map from each group of device dimensions to its valid (non-padded) element count, so padded dimensions carry their true logical extent. It is always shown in the `repr`.
 
 As a concrete example, run the following program:
 
@@ -366,12 +367,15 @@ print(stl)
 You should see something like:
 
 ```
-SpyreTensorLayout(device_size=[100, 3, 5, 64], stride_map =[150, 64, 15000, 1], device_dtype=DataFormats.SEN169_FP16)
+SpyreTensorLayout(device_size=[100, 3, 5, 64], stride_map =[150, 64, 15000, 1], device_dtype=DataFormats.SEN169_FP16, valid_elements={...})
 ```
 
 The 3-D tensor has a 4-D `device_size`.
 A float16 is two bytes, therefore each stick contains 64 data values.
 The stick dimension of `150` has been padded to `192` and broken into two device dimensions of (`3` and `64`).
+The `valid_elements` map, elided as `{...}` above, records the valid
+(non-padded) element count for each group of device dimensions, which is how
+the padded stick dimension keeps its logical extent of `150`.
 
 ### Specifiying Alternate Layouts
 
@@ -393,7 +397,7 @@ print(y.device_tensor_layout())
 You should see exactly the same output as before:
 
 ```
-SpyreTensorLayout(device_size=[100, 3, 5, 64], stride_map =[150, 64, 15000, 1], device_dtype=DataFormats.SEN169_FP16)
+SpyreTensorLayout(device_size=[100, 3, 5, 64], stride_map =[150, 64, 15000, 1], device_dtype=DataFormats.SEN169_FP16, valid_elements={...})
 ```
 
 A second constructor of `SpyreTensorLayout` enables finer-grained control.
@@ -411,7 +415,7 @@ stl = SpyreTensorLayout((5, 100, 150), (15000, 150, 1), torch.float16, [1,0,2])
 yields a tensor with the tiling inverted:
 
 ```
-SpyreTensorLayout(device_size=[5, 3, 100, 64], stride_map =[15000, 64, 150, 1], device_dtype=DataFormats.SEN169_FP16)
+SpyreTensorLayout(device_size=[5, 3, 100, 64], stride_map =[15000, 64, 150, 1], device_dtype=DataFormats.SEN169_FP16, valid_elements={...})
 ```
 
 See the [tensor layout example](https://github.com/torch-spyre/torch-spyre/blob/main/docs/source/user_guide/examples/tensor_layout.py) for a runnable
