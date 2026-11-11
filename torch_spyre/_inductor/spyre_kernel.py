@@ -625,7 +625,7 @@ def _loop_coefficient(index: sympy.Expr, variable: sympy.Symbol) -> sympy.Expr:
     """
     if variable not in index.free_symbols:
         return sympy.S.Zero
-    at = [sympy.expand(index.subs(variable, k)) for k in (0, 1, 2)]
+    at = [sympy.expand(index.xreplace({variable: k})) for k in (0, 1, 2)]
     if sympy.simplify(at[2] - 2 * at[1] + at[0]) != 0:
         raise Unsupported(
             f"the loop variable {variable} is used non-affinely in the index "

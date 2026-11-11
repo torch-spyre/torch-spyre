@@ -2885,7 +2885,7 @@ def _split_loop_term(
       such a term there would be wrong code.
     """
     present = {s for s in source_index.free_symbols if s in loop_vars}
-    rest = sympy.simplify(source_index.subs({s: sympy.S.Zero for s in present}))
+    rest = sympy.simplify(source_index.xreplace({s: sympy.S.Zero for s in present}))
     loop_term = sympy.simplify(source_index - rest)
     # Anything in the loop term that is not a loop variable is refused: the copy's
     # own iteration variables (a cross term c*i*u) and any other symbol alike.
