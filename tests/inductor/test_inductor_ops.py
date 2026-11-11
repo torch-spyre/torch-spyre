@@ -618,6 +618,35 @@ def _cached_fp32_for_int32_cast(shape):
     return src_int.to(torch.float32)
 
 
+_INT32_BIT_PATTERNS = (
+    0,
+    -1,
+    -(2**31),
+    2**31 - 1,
+    0x0000FFFF,
+    -65536,  # 0xFFFF0000
+    0x55555555,
+    -0x55555556,  # 0xAAAAAAAA
+)
+
+
+@functools.lru_cache(maxsize=None)
+def _cached_int32_bits(shape, differentiation=None):
+    """int32 words over the full 32-bit range, edge bit patterns first.
+
+    Bitwise ops must not depend on how a word reads as a number, so the values
+    cover every bit; the leading elements pair each edge pattern with each
+    other one once the second operand is drawn with another ``differentiation``.
+    """
+    gen = utils_inductor._make_generator(shape, differentiation, torch.int32)
+    t = torch.randint(-(2**31), 2**31 - 1, shape, dtype=torch.int32, generator=gen)
+    edges = torch.tensor(_INT32_BIT_PATTERNS, dtype=torch.int32)
+    flat = t.view(-1)
+    n = min(len(edges), flat.numel())
+    flat[:n] = (edges if differentiation is None else edges.flip(0))[:n]
+    return t
+
+
 @functools.lru_cache(maxsize=None)
 def _cached_grouped_mm_offs(num_experts: int, total: int, seed: int = 500123):
     """Return deterministic cumsum offsets for grouped_mm tests.
@@ -5072,7 +5101,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         (
             "test_bitwise_not",
-            "test_fallback_unary_op_cpu",
+            "test_bitwise_unary_op",
         ): {
             "ops_dict": {
                 "bitwise_not": torch.bitwise_not,
@@ -5082,15 +5111,21 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "bool_2d": (cached_randn((128, 256), dtype=torch.float16) > 0,),
                 "bool_3d": (cached_randn((8, 32, 128), dtype=torch.float16) > 0,),
                 "bool_4d": (cached_randn((2, 8, 32, 64), dtype=torch.float16) > 0,),
-                "int_1d": (torch.randint(-128, 127, (256,), dtype=torch.int8),),
-                "int_2d": (torch.randint(-128, 127, (128, 256), dtype=torch.int8),),
-                "int_3d": (torch.randint(-128, 127, (8, 32, 128), dtype=torch.int8),),
-                "int_4d": (torch.randint(-128, 127, (2, 8, 32, 64), dtype=torch.int8),),
+                "int32_1d": (_cached_int32_bits((256,)),),
+                "int32_2d": (_cached_int32_bits((67, 256)),),
+                "int32_3d": (_cached_int32_bits((8, 32, 128)),),
+                "int32_4d": (_cached_int32_bits((2, 8, 32, 64)),),
+                "int32_pad_2d": (_cached_int32_bits((4, 17)),),
+                "int8_2d": (torch.randint(-128, 127, (128, 256), dtype=torch.int8),),
+            },
+            # TODO: int8 has no device bitwise op; when one exists this must pass.
+            "expect_raise": {
+                "int8_2d": "bitwise_not on operands other than IEEE_INT32 tensors",
             },
         },
         (
             "test_bitwise_and",
-            "test_fallback_binary_op_cpu",
+            "test_bitwise_binary_op",
         ): {
             "ops_dict": {
                 "bitwise_and": torch.bitwise_and,
@@ -5112,21 +5147,48 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((2, 8, 32, 64), dtype=torch.float16) > 0,
                     cached_randn((2, 8, 32, 64), dtype=torch.float16) > 0,
                 ),
-                "int_1d": (
-                    torch.randint(-128, 127, (256,), dtype=torch.int8),
-                    torch.randint(-128, 127, (256,), dtype=torch.int8),
-                ),
-                "int_2d": (
+                "int8_2d": (
                     torch.randint(-128, 127, (128, 256), dtype=torch.int8),
                     torch.randint(-128, 127, (128, 256), dtype=torch.int8),
                 ),
-                "int_3d": (
-                    torch.randint(-128, 127, (8, 32, 128), dtype=torch.int8),
-                    torch.randint(-128, 127, (8, 32, 128), dtype=torch.int8),
+            },
+            # TODO: int8 has no device bitwise op; when one exists this must pass.
+            "expect_raise": {
+                "int8_2d": "bitwise_and on operands other than IEEE_INT32 tensors",
+            },
+        },
+        (
+            "test_bitwise_int32",
+            "test_bitwise_binary_op",
+        ): {
+            "ops_dict": {
+                "and": torch.bitwise_and,
+                "or": torch.bitwise_or,
+                "xor": torch.bitwise_xor,
+            },
+            "param_sets": {
+                "1d": (_cached_int32_bits((256,)), _cached_int32_bits((256,), 1)),
+                "2d": (
+                    _cached_int32_bits((67, 256)),
+                    _cached_int32_bits((67, 256), 1),
                 ),
-                "int_4d": (
-                    torch.randint(-128, 127, (2, 8, 32, 64), dtype=torch.int8),
-                    torch.randint(-128, 127, (2, 8, 32, 64), dtype=torch.int8),
+                "3d": (
+                    _cached_int32_bits((8, 32, 128)),
+                    _cached_int32_bits((8, 32, 128), 1),
+                ),
+                "4d": (
+                    _cached_int32_bits((2, 8, 32, 64)),
+                    _cached_int32_bits((2, 8, 32, 64), 1),
+                ),
+                "pad_2d": (
+                    _cached_int32_bits((4, 17)),
+                    _cached_int32_bits((4, 17), 1),
+                ),
+                # a cipher-style 16-bit mask
+                "mask_scalar": (_cached_int32_bits((67, 256)), 0xFFFF),
+                "bcast_row": (
+                    _cached_int32_bits((67, 256)),
+                    _cached_int32_bits((67, 1), 1),
                 ),
             },
         },
@@ -10051,6 +10113,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_fallback_unary_op_cpu(self, op, x):
         self.compare_with_cpu(op, x)
 
+    def test_bitwise_unary_op(self, op, x):
+        self.compare_with_cpu(op, x, atol=0, rtol=0)
+
+    def test_bitwise_binary_op(self, op, a, b):
+        self.compare_with_cpu(op, a, b, atol=0, rtol=0)
+
     def test_logical_int_mask_compiled(self, op, a, b):
         # Exercise compiled layouts without requiring eager logical kernels.
         # LX wrappers leave bool/int outputs unchanged, but the reduction wrapper
@@ -10390,10 +10458,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     x.to("spyre"), y.to("spyre")
                 ).cpu()
                 torch.testing.assert_close(result, fn(x, y))
-
-    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
-    def test_fallback_binary_op_cpu(self, op, x, y):
-        self.compare_with_cpu(op, x, y, run_eager=False)
 
     # Increased mm test tolerance for splitk
     def test_mm_relaxed(self, op, a, b):

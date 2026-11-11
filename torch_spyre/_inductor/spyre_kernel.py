@@ -192,8 +192,9 @@ def _serialize_value(v):
 def _has_int32_operands(*operands: RValue) -> bool:
     """Whether the operands are loaded IEEE_INT32 tensors.
 
-    The add/mul lowerings apply default type promotion, so int32 never meets
-    another format here; a mix means that invariant was broken upstream.
+    The add/mul and bitwise lowerings apply default type promotion, so int32
+    never meets another format here; a mix means that invariant was broken
+    upstream.
     """
     kinds = [
         x.layout.device_layout.device_dtype if isinstance(x, TensorAccess) else None
@@ -208,6 +209,17 @@ def _has_int32_operands(*operands: RValue) -> bool:
         ]
         raise Unsupported(f"IEEE_INT32 operand mixed with other operands: {described}")
     return True
+
+
+def _require_int32_bitwise_operands(op: str, *operands: RValue) -> None:
+    """Refuse a bitwise op whose operands are not all loaded IEEE_INT32 tensors.
+
+    The backend's bitwise ops work on 32-bit words only; bool takes the logical
+    ops in the decompositions, and int64 or narrower integers have no device op.
+    """
+    if not _has_int32_operands(*operands):
+        # TODO: int64 and the narrower integer dtypes have no device bitwise op.
+        raise Unsupported(f"{op} on operands other than IEEE_INT32 tensors")
 
 
 class SpyreOpFuncs:
@@ -226,6 +238,26 @@ class SpyreOpFuncs:
         if _has_int32_operands(a, b):
             return PointwiseOp("addi32toi32", [a, b])
         return PointwiseOp("add", [a, b])
+
+    @staticmethod
+    def bitwise_and(a, b):
+        _require_int32_bitwise_operands("bitwise_and", a, b)
+        return PointwiseOp("bitwiseand", [a, b])
+
+    @staticmethod
+    def bitwise_not(x):
+        _require_int32_bitwise_operands("bitwise_not", x)
+        return PointwiseOp("bitwisenot", [x])
+
+    @staticmethod
+    def bitwise_or(a, b):
+        _require_int32_bitwise_operands("bitwise_or", a, b)
+        return PointwiseOp("bitwiseor", [a, b])
+
+    @staticmethod
+    def bitwise_xor(a, b):
+        _require_int32_bitwise_operands("bitwise_xor", a, b)
+        return PointwiseOp("bitwisexor", [a, b])
 
     @staticmethod
     def clamp(x, min, max):
