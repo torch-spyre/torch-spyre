@@ -129,7 +129,7 @@ class SchemaApplier:
         rf"^CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?({QNAME})", re.IGNORECASE
     )
     INSERT_INTO = re.compile(
-        rf"^(?:WITH\b.*?\b)?INSERT\s+INTO\s+(?:TABLE\s+)?({QNAME})",
+        rf"^(?:WITH\b.*?\b)?INSERT\s+INTO\s+(?!FUNCTION\b)(?:TABLE\s+)?({QNAME})",
         re.IGNORECASE | re.DOTALL,
     )
     LITERAL = re.compile(r"'(?:[^'\\]|\\.|'')*'")
@@ -158,7 +158,10 @@ class SchemaApplier:
             out.append(f"ENGINE = {m.group(1)}" + (f"({args.strip()})" if args else ""))
             last = m.end()
         out.append(sql[last:])
-        return cls.COMMENT.sub("", "".join(out))
+        text = "".join(out)
+        # The conversion marker is only dropped from a converted table, so a plain table's
+        # COMMENT still counts as drift.
+        return cls.COMMENT.sub("", text) if last else text
 
     @staticmethod
     def _in_literal(sql: str, pos: int) -> bool:
@@ -406,13 +409,15 @@ class SchemaApplier:
         return out
 
     @classmethod
-    def run_migration(cls, client, text: str, cluster: str = "", db: str = "") -> None:
+    def run_migration(
+        cls, client, text: str, cluster: str = "", db: str = "", unsynced=None
+    ) -> None:
         """Run a migration's statements, skipping each one whose IF_TABLE is absent.
 
         With a cluster, structural statements run on every replica. Other data statements run once, on
-        the connected server, and reach the others by replication; a table the migration inserted
-        into is synced on every replica before a later statement reads it."""
-        unsynced: dict = {}
+        the connected server, and reach the others by replication; a table inserted into is synced
+        on every replica before a later statement reads it. `unsynced` carries that across migrations."""
+        unsynced = {} if unsynced is None else unsynced
         for table, sql in cls.migration_statements(text, cluster, db):
             if table and not client.command(f"EXISTS TABLE {table}"):
                 continue
@@ -579,14 +584,35 @@ class SchemaApplier:
             if o.kind in ("table", "mv") and o.name not in live:
                 cls.clustered(o.sql, o.kind, cluster, db, o.name)
         inserted: set = set()
+        created = {o.name for o in objs}
+        stmts = {}
         for p in pending:
             try:
-                for _, sql in cls.migration_statements(p.read_text(), cluster, db):
-                    token = cls.insert_target(sql)
-                    if token and cls.bare(token) in live:
-                        inserted.add(cls.bare(token))
+                stmts[p.name] = cls.migration_statements(p.read_text(), cluster, db)
             except ValueError as e:
                 raise ValueError(f"{p.name}: {e}") from None
+            for _, sql in stmts[p.name]:
+                ct = cls.MIGRATION_CREATE_TABLE.match(cls.mask(sql))
+                if ct:
+                    created.add(cls.bare(ct.group(1)))
+        for name, items in stmts.items():
+            for guard, sql in items:
+                token = cls.insert_target(sql)
+                if not token:
+                    continue
+                qual = re.fullmatch(rf"({cls.IDENT})\.{cls.IDENT}", token)
+                if qual and cls.bare(qual.group(1)) != db:
+                    raise ValueError(
+                        f"{name}: INSERT into {token} is outside {db}; cluster mode syncs only {db}"
+                    )
+                t = cls.bare(token)
+                if t in live:
+                    inserted.add(t)
+                elif t not in created and not guard:
+                    raise ValueError(
+                        f"{name}: INSERT target {token} is not visible in {db}'s system.tables "
+                        "(missing or no SELECT grant), so it cannot be checked or synced"
+                    )
         cls.require_replicated(client, db, inserted)
 
     @classmethod
@@ -753,6 +779,7 @@ class SchemaApplier:
                 db,
             )
         client.command(cls.ledger_ddl(cluster, db))
+        unsynced: dict = {}
         cls.refresh_mvs_on_cluster(client, db, cluster)
         live = cls.live(client, db)
         for o in objs:
@@ -766,7 +793,7 @@ class SchemaApplier:
                 if done[path.name] != cls.checksum(text):
                     print(f"  [warn] {path.name} changed after it was applied")
                 continue
-            cls.run_migration(client, text, cluster, db)
+            cls.run_migration(client, text, cluster, db, unsynced)
             client.insert(
                 cls.LEDGER,
                 [[path.name, cls.checksum(text)]],
@@ -819,6 +846,8 @@ class SchemaApplier:
         text = path.read_text()
         if not cls.RERUNNABLE.search(text):
             raise ValueError(f"{path.name} is not marked -- RERUNNABLE")
+        if cluster:
+            cls.validate_cluster(client, [], cls.live(client, db), [path], cluster, db)
         cls.run_migration(client, text, cluster, db)
 
 
