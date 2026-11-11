@@ -33,6 +33,7 @@ from unittest.mock import MagicMock, patch
 
 from torch._inductor import config as t_inductor_config
 from torch._inductor.dependencies import MemoryDep
+from torch._inductor.exc import InductorError
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import ComputedBuffer, FlexibleLayout, Pointwise, Reduction
 from torch._inductor.virtualized import V
@@ -46,6 +47,9 @@ from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.loop_info import CoarseTileInfo
 from torch_spyre._inductor.pass_utils import PerCoreView
+
+from utils_inductor import expects_raise
+from torch_spyre._inductor.loop_node import all_ops
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 from torch_spyre._inductor.scratchpad import sa_cooptimizer as sa
 from torch_spyre._inductor.scratchpad.allocator import (
@@ -265,8 +269,12 @@ class CollectTilingPasses(CustomPreSchedulingPasses):
 
     def __call__(self, graph: GraphLowering) -> None:
         super().__call__(graph)
+        # Leaf ops: graph.operations keeps its LoopNodes after the pipeline
+        # (they reach the scheduler as nodes); a LoopNode has no loop_info.
         tiled = [
-            op for op in graph.operations if getattr(op, "loop_info", None) is not None
+            op
+            for op in all_ops(graph.operations)
+            if getattr(op, "loop_info", None) is not None
         ]
         type(self).tiling = {op.get_name(): op.loop_info for op in tiled}
         type(self).core_splits = {
@@ -987,6 +995,35 @@ class TileOwnershipGroupingTests(unittest.TestCase):
             self._compile(lambda x, y: (x + y).repeat(1, 2, 1) * 2, (x, y))
         self.assertIn("more than once along", str(refusal.exception))
 
+    @expects_raise
+    def test_apply_refuses_a_nested_tiling(self):
+        """A two-level choice makes one group with two loop levels, and the
+        lowering builds one standalone loop per group (#6088). The search is
+        bounded to one level (``MAX_SEARCH_TILE_DEPTH``); forcing a nest checks the
+        apply itself.
+
+        TODO: when nested loops are supported this becomes a positive test."""
+        x = torch.randn(64, 64, 128, dtype=torch.float16)
+        y = torch.randn(64, 64, 128, dtype=torch.float16)
+        nested = TileSpec(
+            (TileAxis(host_dim=0, count=2), TileAxis(host_dim=1, count=2))
+        )
+
+        def chosen(graph, allocation):
+            return {
+                op.get_operation_name(): nested
+                for op in graph.operations
+                if isinstance(op, ComputedBuffer)
+            }
+
+        with (
+            patch(_CHOSEN_TILINGS, chosen),
+            self.assertRaises(InductorError) as refusal,
+        ):
+            self._compile(lambda x, y: (x + y) * 2, (x, y))
+        self.assertIn("nested loop tiling is not supported", str(refusal.exception))
+        self.assertIn("#6088", str(refusal.exception))
+
     def test_apply_accepts_a_consumer_that_reads_in_step(self):
         x = torch.randn(64, 64, 128, dtype=torch.float16)
         y = torch.randn(64, 64, 128, dtype=torch.float16)
@@ -1113,6 +1150,36 @@ class TileOwnershipGroupingTests(unittest.TestCase):
         for name in model_ops:
             self.assertIn(name, CollectTilingPasses.lx_resident, _describe(tiling))
 
+    def test_a_consumer_in_the_next_nest_reads_every_row_of_a_unit_row_producer(
+        self,
+    ):
+        # The producer takes one row per tile; the consumer runs a nest of its
+        # own, so it is redirected to the producer's full buffer, and it is
+        # re-traced against the producer's one-row tile on the way. A size-1
+        # dim has no term in an index, so the consumer's row vanished from
+        # its read and every row of a consumer tile read the first of its 16.
+        x = torch.randn(64, 64, 128, dtype=torch.float16)
+        y = torch.randn(64, 64, 128, dtype=torch.float16)
+        unit_rows = TileSpec((TileAxis(host_dim=0, count=64),))
+
+        def offered(alloc, op, max_cores):
+            return [unit_rows] if _reads_graph_inputs_only(op) else [_D0_BY_4]
+
+        with patch.object(CoOptimizingAllocator, "_tiling_candidates", offered):
+            cpu, device, tiling = self._compile(lambda x, y: (x + y) * 2, (x, y))
+        self._assert_close(device, cpu)
+        self.assertEqual(len(_nests(tiling)), 2, _describe(tiling))
+        (consumer,) = [
+            name
+            for name, info in tiling.items()
+            if tuple(info.loop_count) == (4,)
+            and not name.startswith("coarse_tile_copy_")
+        ]
+        # The redirected read reached codegen advancing a tile's 16 rows along
+        # dim 0: without this the body would pass on a read held still.
+        outer_levels = [levels[0] for levels in tiling[consumer].tiled_dims_per_read]
+        self.assertIn([(0, 16)], outer_levels, _describe(tiling))
+
     def test_untiled_op_splits_a_skip_connection_into_two_nests(self):
         # a -> b -> c with a -> c as well. a and c may only be tiled d0:4 and
         # b, between them, only untiled. Loop groups are consecutive runs, so
@@ -1179,6 +1246,76 @@ class TileOwnershipGroupingTests(unittest.TestCase):
 
         cpu, device, _ = self._compile(fn, (x, y))
         self._assert_close(device, cpu)
+
+    def _assert_disagreeing_reads_refused(self, fn):
+        """Forced onto an op whose two reads of one buffer walk the tiled axis
+        differently, the apply refuses the spec instead of compiling it.
+
+        Each read does get its own advance, and each is right on its own, but
+        the device returned 70% wrong values: of the four d0 tiles only the
+        first came out right, the rest reading elements of the producer that
+        belong to another tile. The enumerator does not offer such an axis either --
+        both come from the one authority, try_resolve_tile_axis_loop_vars -- so
+        forcing it is what checks the refusal.
+        """
+        x = torch.randn(64, 64, 128, dtype=torch.float16)
+        y = torch.randn(64, 64, 128, dtype=torch.float16)
+        with self.assertRaises(Exception) as refusal:
+            self._compile_with_both_tiled_d0(fn, (x, y))
+        self.assertIn("two ways", str(refusal.exception))
+
+    def test_apply_refuses_a_transposed_second_read_of_one_producer(self):
+        def fn(x, y):
+            a = x + y
+            return a + a.permute(1, 0, 2)
+
+        self._assert_disagreeing_reads_refused(fn)
+
+    def test_apply_refuses_a_broadcast_second_read_of_one_producer(self):
+        # The broadcast read holds still on the tiled axis while the other read
+        # advances along it, which is the same disagreement.
+        def fn(x, y):
+            a = x + y
+            return a + a[0:1]
+
+        self._assert_disagreeing_reads_refused(fn)
+
+    def test_apply_takes_two_reads_that_agree(self):
+        # Both reads walk the tiled axis the same way, so there is nothing to
+        # disagree about: in step they share one nest, transposed they share one
+        # advance, and both are exact.
+        x = torch.randn(64, 64, 128, dtype=torch.float16)
+        y = torch.randn(64, 64, 128, dtype=torch.float16)
+
+        def in_step_twice(x, y):
+            a = x + y
+            return a + a
+
+        def transposed_twice(x, y):
+            a = x + y
+            return a.permute(1, 0, 2) + a.permute(1, 0, 2)
+
+        for fn, nests in ((in_step_twice, 1), (transposed_twice, 2)):
+            with self.subTest(fn=fn.__name__):
+                cpu, device, tiling = self._compile_with_both_tiled_d0(fn, (x, y))
+                self._assert_close(device, cpu)
+                self.assertEqual(len(_nests(tiling)), nests, _describe(tiling))
+
+    def test_apply_takes_two_reads_that_agree_only_on_the_tiled_axis(self):
+        # The comparison is per axis. Along d0 both reads move the same way,
+        # so they want the same advance and the tile is exact; that one read
+        # holds still on d1 where the other walks it does not matter, because
+        # d1 is not the axis being tiled.
+        x = torch.randn(64, 64, 128, dtype=torch.float16)
+        y = torch.randn(64, 64, 128, dtype=torch.float16)
+
+        def fn(x, y):
+            a = x + y
+            return a + a[:, 0:1]
+
+        cpu, device, tiling = self._compile_with_both_tiled_d0(fn, (x, y))
+        self._assert_close(device, cpu)
+        self.assertEqual(self._model_ops(tiling), ["buf0", "buf1"], _describe(tiling))
 
     def test_consumer_that_repeats_its_producer(self):
         # Unforced. repeat walks dim 1 of its input twice. The solve once tiled
