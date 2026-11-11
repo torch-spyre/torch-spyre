@@ -310,8 +310,18 @@ class SpyreTensorLayout {
   }
 
   bool operator==(const SpyreTensorLayout& other) const {
-    // Include valid_elements (and update std::hash) after deprecated
-    // constructor call sites have migrated to the valid_elements overload.
+    // TODO(#5905): also compare valid_elements, and update std::hash to match,
+    // once the deprecated constructor's call sites have migrated to the
+    // valid_elements overload. Comparisons that must keep ignoring the valid
+    // extents then call equals_ignoring_valid_elements directly.
+    return equals_ignoring_valid_elements(other);
+  }
+
+  /**
+   * Equality ignoring `valid_elements`: what `operator==` compares today, and
+   * what it will no longer compare once the TODO above is resolved.
+   */
+  bool equals_ignoring_valid_elements(const SpyreTensorLayout& other) const {
     return this->device_size == other.device_size &&
            this->stride_map == other.stride_map &&
            this->device_dtype == other.device_dtype &&
