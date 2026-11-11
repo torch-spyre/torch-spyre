@@ -35,6 +35,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import socket
 import sys
 import tempfile
 import time
@@ -76,6 +77,16 @@ def _code(err: BaseException) -> int | None:
     return int(digits) if found and digits else None
 
 
+def _never_connected(err: BaseException) -> bool:
+    """The connection was refused or the host did not resolve: no request left the client."""
+    if isinstance(err, (ConnectionRefusedError, socket.gaierror)):
+        return True
+    return any(
+        m in str(err)
+        for m in ("Failed to establish a new connection", "NewConnectionError")
+    )
+
+
 def classify(err: BaseException, feeds_views: bool = True) -> str:
     """'retry', 'ambiguous' or 'fatal'. The server's code beats the message text.
 
@@ -92,6 +103,8 @@ def classify(err: BaseException, feeds_views: bool = True) -> str:
         return "retry"
     if code in AMBIGUOUS_CODES:
         return "ambiguous"
+    if _never_connected(err):
+        return "retry"
     if isinstance(err, OSError):
         return "ambiguous"
     try:
@@ -162,6 +175,8 @@ class SpoolItem:
     # (quorum, read-only) is not ambiguous and can always be sent again.
     ambiguous: bool = False
     scope: str | None = None
+    # Name of a shared-tier copy that may exist beside this one; the local copy is then held.
+    twin: str | None = None
 
 
 class Spool:
@@ -183,6 +198,7 @@ class Spool:
         created: float | None = None,
         ambiguous: bool = False,
         scope: str | None = None,
+        twin: str | None = None,
     ) -> Path:
         created = time.time() if created is None else float(created)
         doc = {
@@ -194,6 +210,7 @@ class Spool:
             "created": created,
             "ambiguous": bool(ambiguous),
             "scope": scope,
+            "twin": twin,
         }
         # The token names the file: spooling the same batch twice leaves one file.
         existing = [p for p in self.dir.glob(f"*-{token}.json")]
@@ -232,6 +249,7 @@ class Spool:
                     None if d.get("created") is None else float(d["created"]),
                     bool(d.get("ambiguous")),
                     d.get("scope"),
+                    d.get("twin"),
                 )
             except (ValueError, KeyError, OSError):
                 try:
@@ -255,12 +273,21 @@ class Outcome:
 
 
 def _settings(
-    policy: Policy, token: str | None, replicated: bool, degraded: bool
+    policy: Policy,
+    token: str | None,
+    replicated: bool,
+    degraded: bool,
+    feeds_views: bool = True,
 ) -> dict:
     s: dict[str, Any] = {}
     if replicated:
         if token:
             s["insert_deduplication_token"] = token
+        if feeds_views:
+            # Without it a retry whose source block was deduplicated may skip a view target that
+            # missed the block the first time (older servers default to 0). The target needs its
+            # own dedup window (Replicated, or non_replicated_deduplication_window).
+            s["deduplicate_blocks_in_dependent_materialized_views"] = 1
         s["async_insert_deduplicate"] = 1
         s["wait_for_async_insert"] = 1
         quorum = policy.degrade_to if degraded else policy.quorum
@@ -360,7 +387,7 @@ def resilient_insert(
                     batch,
                     columns,
                     database,
-                    _settings(policy, token, replicated, degraded),
+                    _settings(policy, token, replicated, degraded, feeds_views),
                 )
                 out.stored += len(batch)
                 out.degraded = out.degraded or degraded

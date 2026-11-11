@@ -254,7 +254,7 @@ def test_two_writers_racing_on_the_shared_tier_replay_each_item_once(tmp_path):
 
 def test_a_stale_claim_expires_and_is_replayed(tmp_path):
     now = [1000.0]
-    s = spool_of(tmp_path, lease_s=60, clock=lambda: now[0])
+    s = spool_of(tmp_path, lease_s=60, send_timeout_s=None, clock=lambda: now[0])
     s.put("t", COLS, [[1, "a"]], "tok-1")
     item = next(iter(s.local.pending()))
     claimed = s.local.claim(item, owner="dead-pid", now=now[0])
@@ -639,3 +639,170 @@ def test_rows_never_appear_in_a_log_line(tmp_path):
         force=True,
     )
     assert not any("SECRET-ROW-VALUE" in m for m in logs)
+
+
+# ── write-ahead: a possibly-stored item is never resendable by accident ───────
+
+
+class Crash(BaseException):
+    """The process dies here."""
+
+
+class StoresThenDies(Cluster):
+    def insert(self, table, data, column_names=None, database=None, settings=None):
+        self.rows.extend(map(tuple, data))
+        raise Crash()
+
+
+@pytest.mark.parametrize("replicated", [False, True])
+def test_a_crash_mid_replay_leaves_a_held_item_not_a_blind_resend(tmp_path, replicated):
+    now = [10_000.0]
+    s = spool_of(tmp_path, clock=lambda: now[0], dedup_window_s=3600)
+    s.put("t", COLS, [[1, "a"]], "tok-1", created=now[0])
+    c = StoresThenDies(replicated=replicated)
+    with pytest.raises(Crash):
+        s.drain(c, replicated=replicated, force=True, **FAST)
+    now[0] += 7200  # the lease is long gone and the token has aged out of the window
+    c.tokens.clear()
+    c.insert = lambda *a, **k: c.rows.append(
+        (1, "a")
+    )  # a blind resend would store it again
+    s2 = spool_of(tmp_path, clock=lambda: now[0], dedup_window_s=3600)
+    s2.drain(c, replicated=replicated, force=True, **FAST)
+    assert c.rows.count((1, "a")) == 1 and s2.pending_count() == 1
+
+
+def test_a_lease_that_expires_during_a_slow_send_does_not_let_a_second_drainer_resend(
+    tmp_path,
+):
+    now = [10_000.0]
+    s = spool_of(tmp_path, clock=lambda: now[0])
+    s.put("t", COLS, [[1, "a"]], "tok-1", created=now[0])
+    c = Cluster(replicated=False)
+    real = c.insert
+
+    def slow(table, data, column_names=None, database=None, settings=None):
+        now[0] += s.lease_s + 1
+        spool_of(tmp_path, clock=lambda: now[0]).drain(
+            c, replicated=False, force=True, **FAST
+        )
+        real(table, data, column_names, database, settings)
+
+    c.insert = slow
+    s.drain(c, replicated=False, force=True, **FAST)
+    assert c.rows == [(1, "a")]
+
+
+def test_if_the_attempt_cannot_be_recorded_the_item_is_not_sent(tmp_path):
+    class NoPut(FakeShared):
+        fail = False
+
+        def put(self, name, data):
+            if self.fail:
+                raise OSError("shared down")
+            super().put(name, data)
+
+    shared = NoPut()
+    s = spool_of(tmp_path, shared=shared)
+    s.put_shared("t", COLS, [[1, "a"]], "tok-1")
+    shared.fail = True
+    c = Cluster(replicated=False)
+    out = s.drain(c, replicated=False, force=True, **FAST)
+    assert c.calls == [] and out.failed == 1 and len(shared.files) == 1
+
+
+def test_a_full_disk_while_recording_the_attempt_keeps_the_good_item_and_sends_nothing(
+    tmp_path, monkeypatch
+):
+    import errno
+
+    s = spool_of(tmp_path)
+    s.put("t", COLS, [[1, "a"]], "tok-1")
+    real = os.fsync
+
+    def full(fd):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(os, "fsync", full)
+    c = Cluster(replicated=False)
+    s.drain(c, replicated=False, force=True, **FAST)
+    monkeypatch.setattr(os, "fsync", real)
+    names = sorted(p.name for p in (tmp_path / "local").iterdir())
+    assert c.calls == [] and len(names) == 1 and names[0].endswith("-tok-1.json")
+    assert [i.rows for i in s.local.pending()] == [[[1, "a"]]]
+    s.drain(c, replicated=False, force=True, **FAST)
+    assert c.rows == [(1, "a")]
+
+
+def test_a_refused_connection_during_replay_leaves_the_item_resendable(tmp_path):
+    class Refused(Cluster):
+        def insert(self, *a, **k):
+            raise ConnectionRefusedError("refused")
+
+    s = spool_of(tmp_path)
+    s.put("t", COLS, [[1, "a"]], "tok-1")
+    s.drain(Refused(replicated=False), replicated=False, force=True, **FAST)
+    assert [i.ambiguous for i in s.local.pending()] == [False]
+    c = Cluster(replicated=False)
+    s.drain(c, replicated=False, force=True, **FAST)
+    assert c.rows == [(1, "a")]
+
+
+def test_a_lease_shorter_than_one_send_is_refused(tmp_path):
+    with pytest.raises(ValueError):
+        spool_of(tmp_path, lease_s=100)
+    s = spool_of(tmp_path)
+    c = Cluster()
+    c.timeout = s.lease_s
+    with pytest.raises(ValueError):
+        s.drain(c, replicated=True, **FAST)
+
+
+def test_a_twin_of_a_possibly_landed_shared_put_is_held_for_a_person(tmp_path):
+    class Flaky(FakeShared):
+        def put(self, name, data):
+            raise OSError("timed out")
+
+    s = spool_of(tmp_path, shared=Flaky())
+    s.put_any("t", COLS, [[1, "a"]], "tok-1")
+    c = Cluster(replicated=True)
+    out = s.drain(c, replicated=True, force=True, **FAST)
+    assert c.calls == [] and out.held == 1
+
+
+# ── held items: list, release, drop ───────────────────────────────────────────
+
+
+def test_a_person_can_list_release_and_drop_held_items(tmp_path):
+    s = spool_of(tmp_path)
+    s.put("t", COLS, [[1, "a"]], "tok-1", ambiguous=True)
+    s.put("t", COLS, [[2, "b"]], "tok-2", ambiguous=True)
+    listed = {i["token"]: i for i in s.items()}
+    assert listed["tok-1"]["held"] and listed["tok-1"]["rows"] == 1
+    c = Cluster(replicated=False)
+    s.drain(c, replicated=False, force=True, **FAST)
+    assert c.rows == []
+    assert s.release_held("tok-1") == 1 and s.drop("tok-2") == 1
+    s.drain(c, replicated=False, force=True, **FAST)
+    assert c.rows == [(1, "a")] and s.pending_count() == 0
+
+
+def test_the_spool_command_lists_releases_and_drops(tmp_path, monkeypatch, capsys):
+    import json
+
+    from spyre_clickhouse_ingest import spool_cli
+
+    monkeypatch.setenv("CH_WRITE_SPOOL", str(tmp_path / "local"))
+    monkeypatch.delenv("CH_WRITE_SHARED_SPOOL_TRUSTED", raising=False)
+    s = spool_of(tmp_path, trusted=False)
+    s.put("t", COLS, [[1, "a"]], "tok-1", ambiguous=True)
+    s.put("t", COLS, [[2, "b"]], "tok-2", ambiguous=True)
+    assert spool_cli.main(["list"]) == 0
+    rows = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert {r["token"] for r in rows} == {"tok-1", "tok-2"} and all(
+        r["held"] for r in rows
+    )
+    assert spool_cli.main(["release", "tok-1"]) == 0
+    assert spool_cli.main(["drop", "tok-2"]) == 0
+    assert spool_cli.main(["drop", "nope"]) == 1
+    assert [i["held"] for i in s.items()] == [False]

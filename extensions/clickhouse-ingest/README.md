@@ -465,6 +465,37 @@ It does not leave the HUD projection (`schema/70`). Its rows stay in `oss_ci_ben
 branch and commit stay in the metadata dropdowns too. The HUD reads these tables with PREWHERE, which
 a view cannot serve, so they cannot be filtered by a view. The follow-up is torch-spyre#5446.
 
+## Write resilience and the spool
+
+`resilience.resilient_insert` and `spool.TieredSpool` keep a write from being lost or doubled when
+the cluster is degraded. **Nothing calls them yet and no probe exists**, so on the live path
+(`probe=None`) every batch that may already be stored is held for a person.
+
+- A batch refused before any write (quorum, read-only) is resent as is. A batch that a failed or
+  interrupted attempt may have stored is *held*: on a Replicated table inside its dedup window it
+  is resent under its original `insert_deduplication_token`; otherwise nothing resends it.
+- Before every replay the item is first recorded as "may be stored" (write-ahead). A crash, a lost
+  response or a lease that expires mid-send then leaves a held item, never one that is resent
+  blindly. If that record cannot be written, nothing is sent. `lease_s` must exceed the client's
+  send timeout (default 300 s) by a margin; `TieredSpool` refuses a smaller lease.
+- A held item stays until a person decides. Check the table, then:
+  `python -m spyre_clickhouse_ingest spool list` (JSON lines, \`held\` marks them),
+  `... spool release TOKEN` (the rows are NOT stored; resend on the next drain) or
+  `... spool drop TOKEN` (the rows are stored or not wanted). It reads \`CH_WRITE_SPOOL\`.
+- Tables with a dependent materialized view: replicated inserts pass
+  `deduplicate_blocks_in_dependent_materialized_views=1`, so a retry whose source block was
+  deduplicated still reaches a view target that missed it (checked on chdb 26.9, single node).
+  The view target needs its own dedup window (Replicated, or `non_replicated_deduplication_window`);
+  without one a retry doubles the view. Not verified: Replicated tables on a real Keeper cluster and
+  servers older than 26.2 (where the default is 0). Pass `feeds_views=False` only for a table with
+  no dependent view; otherwise TOO_MANY_PARTS (252) is treated as ambiguous.
+- A real probe needs a per-batch marker (a batch-id column, or the token on a Replicated table).
+  The sort keys of \`test_case_runs\`, \`benchmark_runs\` and \`artifact_results\` are not unique per
+  batch, so counting rows by key would call a lost batch stored.
+- Known gaps: the 3600 s dedup window is a time bound only (ClickHouse also evicts by block count);
+  \`replay()\` on the plain \`Spool\` does not record attempts; a shared PUT that times out after
+  landing is covered by holding the local twin, but a PUT that lands minutes later is not.
+
 ## What is deliberately NOT here
 
 - **v1 write paths whose TARGET TABLE differs per repo.** `hf_test_runs` vs `test_runs` cannot share
