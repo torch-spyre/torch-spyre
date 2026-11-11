@@ -1466,10 +1466,9 @@ def _build_fp32_proxy_cpu_refs(
     return kwargs
 
 
-# keep_by_index / mask_by_index cases, as (shape, k, dim, keep_by_index fill
-# value); mask_by_index always masks with -inf and ignores the fill. Each runs
-# in fp16 (plain names) and fp32 (names suffixed _fp32); see _index_masking_params.
-_INDEX_MASKING_CASES = {
+# keep_by_index / mask_by_index cases, as (shape, k, dim, fill value). Each runs
+# in fp16 (plain names) and fp32 (names suffixed _fp32); see _masking_ops_params.
+_MASKING_OPS_CASES = {
     # Stick-aligned (every dim a multiple of 64).
     "2d_aligned_dim0": ((64, 128), 8, 0, -1.0),
     "3d_aligned_dim0": ((64, 64, 128), 2, 0, 0.0),
@@ -1483,17 +1482,17 @@ _INDEX_MASKING_CASES = {
 }
 
 
-def _index_masking_params(dtype, with_fill):
-    """Param sets for _INDEX_MASKING_CASES, with values generated in ``dtype``."""
+def _masking_ops_params(dtype):
+    """Param sets for _MASKING_OPS_CASES, with values generated in ``dtype``."""
     suffix = {torch.float16: "", torch.float32: "_fp32"}[dtype]
     return {
         f"{name}{suffix}": (
             unique_randn_along_dim(shape, dim=dim, dtype=dtype),
             k,
             dim,
-            *((fill,) if with_fill else ()),
+            fill,
         )
-        for name, (shape, k, dim, fill) in _INDEX_MASKING_CASES.items()
+        for name, (shape, k, dim, fill) in _MASKING_OPS_CASES.items()
     }
 
 
@@ -2606,17 +2605,19 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
-        ("test_keep_by_index", "test_keep_by_index_cpu"): {
-            "param_sets": {
-                **_index_masking_params(torch.float16, with_fill=True),
-                **_index_masking_params(torch.float32, with_fill=True),
+        ("test", "test_masking_ops_cpu"): {
+            "ops_dict": {
+                "keep_by_index": lambda x, i, dim, fill: (
+                    torch.ops.spyre.keep_by_index(x, i, dim, fill)
+                ),
+                # mask_by_index always masks with -inf, so it ignores the fill.
+                "mask_by_index": lambda x, i, dim, fill: (
+                    torch.ops.spyre.mask_by_index(x, i, dim)
+                ),
             },
-        },
-        ("test_mask_by_index", "test_mask_by_index_cpu"): {
-            # mask_by_index always masks with -inf, so there is no fill value.
             "param_sets": {
-                **_index_masking_params(torch.float16, with_fill=False),
-                **_index_masking_params(torch.float32, with_fill=False),
+                **_masking_ops_params(torch.float16),
+                **_masking_ops_params(torch.float32),
             },
         },
         ("test_reduce_keepdim0", "test_reduce_keepdim0_cpu"): {
@@ -11023,36 +11024,24 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=False,
         )
 
-    def test_keep_by_index_cpu(self, x, k: int, dim: int, fill_value: float):
+    def test_masking_ops_cpu(self, op, x, k: int, dim: int, fill_value: float):
         _, indices = torch.topk(x, k, dim=dim, largest=True)
-
-        def fn(x, indices):
-            return torch.ops.spyre.keep_by_index(x, indices, dim, fill_value)
-
-        compiled_fn = torch.compile(fn)
-        result_spyre = compiled_fn(x.to("spyre"), indices.to(x.dtype).to("spyre")).cpu()
-        expected = fn(x, indices)
-
-        torch.testing.assert_close(result_spyre, expected, atol=0.1, rtol=0.1)
-
-    def test_mask_by_index_cpu(self, x, k: int, dim: int):
-        _, indices = torch.topk(x, k, dim=dim, largest=True)
-
-        def fn(x, indices):
-            return torch.ops.spyre.mask_by_index(x, indices, dim)
-
-        compiled_fn = torch.compile(fn)
-        result_spyre = compiled_fn(x.to("spyre"), indices.to(x.dtype).to("spyre")).cpu()
-        expected = fn(x, indices)
+        indices = indices.to(x.dtype)
+        expected = op(x, indices, dim, fill_value)
         if x.dtype == torch.float32:
             # The device's fp32 is a merged-NINF format, like DLFloat16: only
             # 0x7FFFFFFF and 0xFFFFFFFF are non-finite. mask_by_index writes
             # 0xFFFFFFFE as its -inf, which the host reads as NaN. Model that
-            # in the reference, as _dlfloat16_saturating_ref does.
+            # in the reference, as _dlfloat16_saturating_ref does. (keep_by_index
+            # is unaffected: its fills here are finite.)
             expected = expected.masked_fill(torch.isneginf(expected), float("nan"))
-
-        torch.testing.assert_close(
-            result_spyre, expected, equal_nan=True, atol=0.1, rtol=0.1
+        self.compare_with_cpu(
+            lambda x, i: op(x, i, dim, fill_value),
+            x,
+            indices,
+            cpu_eager_result=expected,
+            # The spyre:: custom ops only have a compiled (lowered) path.
+            run_eager=False,
         )
 
     def test_keep_by_index_moe_router(self):
