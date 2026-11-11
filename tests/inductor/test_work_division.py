@@ -1580,7 +1580,6 @@ class TestWorkDivisionContextAnswers(unittest.TestCase):
             it_space={i0: 8, i1: 8},
             it_space_adjusted={i0: 8, i1: 1},  # i1 looks trivial only here
             stick_vars={i1: 64},
-            symbol_meta={},
             tensor_deps=[],
             reduction_vars=[],
             constraints=ConstraintResult(),
@@ -2205,7 +2204,6 @@ class TestConvSpatialBlockedVars(unittest.TestCase):
             output_td,
             {},
             32,
-            {},
             {i, j},
             {},
         )
@@ -3810,7 +3808,6 @@ class TestCoOptimizingAllocator(unittest.TestCase):
             it_space={i0: 8, i1: 8},
             it_space_adjusted={i0: 8, i1: 8},
             stick_vars={},
-            symbol_meta={},
             tensor_deps=[],
             reduction_vars=[],
             constraints=ConstraintResult(),

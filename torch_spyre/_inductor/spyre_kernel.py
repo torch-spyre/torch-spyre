@@ -159,10 +159,6 @@ def _serialize_value(v):
 
     This is needed because ``op_info`` dicts may contain symbolic scalars
     (e.g. ``1.0 / s97``) that came from Inductor's symbolic analysis.
-
-    TODO(issue#220): once SDSC generation produces symbolic JSON
-    (``symbolDefinitions_``), this function should emit symbolic references
-    rather than concretizing.
     """
     if isinstance(v, sympy.Integer):
         return repr(int(v))

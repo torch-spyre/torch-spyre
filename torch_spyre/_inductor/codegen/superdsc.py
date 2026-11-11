@@ -1909,15 +1909,11 @@ def _get_op_func(
 def _concretize_for_sdsc(expr: Expr) -> int:
     """Concretize a symbolic expression at the SDSC generation boundary.
 
-    SDSC generation (and the downstream DeepTools backend compiler) currently
-    requires all iteration-space sizes to be concrete integers.  This is the
-    final concretization point in the pipeline: everything upstream may be
-    symbolic, but the SDSC JSON emitted here is fully concrete.
-
-    TODO(issue#220): once SDSC generation emits ``symbolDefinitions_`` and
-    ``symbolicDimInfo_`` for the DeepTools VariableDefinition DAG, this
-    function can be replaced with symbolic expression serialisation and
-    iteration-space sizes can remain symbolic all the way through.
+    Every SDSC is fully concrete, so this is the final concretization point in
+    the pipeline. A declared dimension never reaches it: outside a
+    ``for_each_tile`` loop it is refused in ``create_op_spec``, and inside one
+    the body is a static tile. Any other size symbol is resolved to this
+    compile's size by ``guarding_hint_or_throw``, which raises when it cannot.
     """
     if isinstance(expr, int):
         return expr
@@ -1930,17 +1926,6 @@ def _concretize_for_sdsc(expr: Expr) -> int:
         # ones, rather than silently emitting a fallback (e.g. sys.maxsize) size.
         return V.graph.sizevars.guarding_hint_or_throw(expr)
     return int(expr)
-
-
-def _resolve_sdsc_size(expr: Expr) -> int:
-    """Resolve an iteration-space size for SDSC generation.
-
-    Every size here is concrete: a varying size outside a ``for_each_tile`` loop
-    is refused in ``create_op_spec``, and inside a loop the body is a static
-    tile. A size symbol without a declared maximum still resolves through
-    ``_concretize_for_sdsc``.
-    """
-    return _concretize_for_sdsc(expr)
 
 
 def _ref_arg(op_spec):
@@ -2283,7 +2268,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     )
 
     sdsc_iteration_space = {
-        symbol_mapping[sym]: _resolve_sdsc_size(size)
+        symbol_mapping[sym]: _concretize_for_sdsc(size)
         for sym, (size, _) in op_spec.iteration_space.items()
     }
 

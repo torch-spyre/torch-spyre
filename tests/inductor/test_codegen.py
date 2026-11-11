@@ -40,7 +40,7 @@ from torch_spyre._inductor.codegen.compute_ops import (
 from torch_spyre._inductor.codegen import superdsc
 from torch_spyre._inductor.codegen.superdsc import (
     _align_pool_dim_labels,
-    _resolve_sdsc_size,
+    _concretize_for_sdsc,
     compile_op_spec,
     parse_op_spec,
 )
@@ -234,17 +234,17 @@ class TestSpyreConfig(InductorTestCase):
         )
 
 
-class TestResolveSdscSize(InductorTestCase):
-    """Unit tests for superdsc._resolve_sdsc_size."""
+class TestConcretizeForSdsc(InductorTestCase):
+    """Unit tests for superdsc._concretize_for_sdsc."""
 
     def test_concrete_sympy_integer(self):
-        self.assertEqual(_resolve_sdsc_size(sympy.Integer(256)), 256)
+        self.assertEqual(_concretize_for_sdsc(sympy.Integer(256)), 256)
 
     def test_concrete_python_int(self):
-        self.assertEqual(_resolve_sdsc_size(128), 128)
+        self.assertEqual(_concretize_for_sdsc(128), 128)
 
     def test_symbolic_uses_guarding_hint(self):
-        # A size symbol resolves through _concretize_for_sdsc → guarding_hint_or_throw.
+        # A size symbol resolves through guarding_hint_or_throw.
         # The SDSC/DeepTools boundary is correctness-critical, so it must resolve
         # the *true* concrete size (guarding_hint_or_throw), not an optimization
         # heuristic that could silently emit a fallback (e.g. sys.maxsize).
@@ -252,12 +252,12 @@ class TestResolveSdscSize(InductorTestCase):
         sizevars = SimpleNamespace(guarding_hint_or_throw=lambda _: 128)
         mock_v = SimpleNamespace(graph=SimpleNamespace(sizevars=sizevars))
         with patch("torch_spyre._inductor.codegen.superdsc.V", mock_v):
-            self.assertEqual(_resolve_sdsc_size(s0), 128)
+            self.assertEqual(_concretize_for_sdsc(s0), 128)
 
     def test_symbolic_raises_on_unbacked(self):
         # An unbacked symbol at the SDSC boundary must fail loudly rather than
         # produce a bogus concrete size, so guarding_hint_or_throw's raise
-        # propagates out of _concretize_for_sdsc.
+        # propagates.
         s0 = sympy.Symbol("s0", integer=True, positive=True)
 
         def _raise(_e):
@@ -267,7 +267,7 @@ class TestResolveSdscSize(InductorTestCase):
         mock_v = SimpleNamespace(graph=SimpleNamespace(sizevars=sizevars))
         with patch("torch_spyre._inductor.codegen.superdsc.V", mock_v):
             with self.assertRaises(RuntimeError):
-                _resolve_sdsc_size(s0)
+                _concretize_for_sdsc(s0)
 
 
 class TestAlignPoolDimLabels(InductorTestCase):

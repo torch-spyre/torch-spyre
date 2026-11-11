@@ -1295,12 +1295,10 @@ def align_tensors_pure(
     # Restore original symbolic expressions wherever the algorithm left the
     # concretized value unchanged (i.e. no splits were applied to that dim).
     # Only restore when the symbol carries a finite bound (e.g. the user
-    # passed mark_dynamic(max=...)) -- downstream passes (work_division,
-    # SDSC codegen) need a bound to size buffers/loops. Auto-dynamic symbols
-    # (Dynamo promoting an int on retrace, with no finite max) have no such
-    # bound, so fall back to the concretized size-hint instead of
-    # propagating an unbounded symbol. See work_division.py's symbol_meta
-    # for the same distinction.
+    # passed mark_dynamic(max=...)) -- downstream passes need a bound to size
+    # buffers/loops. Auto-dynamic symbols (Dynamo promoting an int on retrace,
+    # with no finite max) have no such bound, so fall back to the concretized
+    # size-hint instead of propagating an unbounded symbol.
     for var, restored_expr in inputs.restored_ranges.items():
         if var not in new_var_ranges or new_var_ranges[var] != var_ranges[var]:
             continue

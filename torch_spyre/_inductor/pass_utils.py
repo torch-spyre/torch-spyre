@@ -338,8 +338,7 @@ def concretize_expr(expr: Union[Expr, int]) -> int:
     Key invariant: only structural parameters (sizes, strides, split
     counts) are concretized.  Symbolic loop variables inside coordinate
     output expressions are never touched, so the generated coordinate
-    expressions remain symbolic and will carry through to the SDSC when
-    symbolic SDSC generation is implemented.
+    expressions remain symbolic.
 
     A structural parameter that depends on a DECLARED dimension, one the caller
     moved with ``tensor.to("spyre", dynamic={d: {min, max, granularity}})``,
