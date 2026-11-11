@@ -57,7 +57,9 @@ _DTYPE_OPS = frozenset({"to_dtype", "convert_element_type"})
 # When the final op is one of these, intermediate constant ops must NOT be materialized
 # as SpyreConstantFallback buffers — they must remain as V.ops.constant() scalars so
 # SpyreOpFuncs.clamp / layernormscale / softplus can read them out of the RValue tree.
-_OPS_WITH_CONSTANT_ARGS = frozenset({"clamp", "layernormscale", "softplus"})
+_OPS_WITH_CONSTANT_ARGS = frozenset(
+    {"clamp", "layernormscale", "shift_left", "shift_right", "softplus"}
+)
 
 # Mapping of operation names to their FX graph targets when there is no 1-1 mapping.
 _OP_TARGET_TABLE = {

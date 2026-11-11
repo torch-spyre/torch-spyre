@@ -212,6 +212,20 @@ def _has_int32_operands(*operands: RValue) -> bool:
     return True
 
 
+def _require_int32_shift_operand(op: str, x: RValue) -> None:
+    """Refuse a shift whose operand is not a loaded IEEE_INT32 tensor."""
+    if not _has_int32_operands(x):
+        raise Unsupported(f"{op} on an operand other than an IEEE_INT32 tensor")
+
+
+def _shift_amount(amount: Union[int, RValue]) -> int:
+    """The constant amount of a shift, as the int the back end encodes."""
+    value = amount.value if isinstance(amount, Constant) else amount
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 31:
+        raise Unsupported(f"shift by {amount!r}: needs a constant int in [0, 31]")
+    return value
+
+
 class SpyreOpFuncs:
     """
     Pointwise torch ops that are directly supported by the backend compiler for the Spyre device.
@@ -228,6 +242,16 @@ class SpyreOpFuncs:
         if _has_int32_operands(a, b):
             return PointwiseOp("addi32toi32", [a, b])
         return PointwiseOp("add", [a, b])
+
+    @staticmethod
+    def bitwise_left_shift(a, b):
+        # TODO: a tensor shift amount; the device shift takes a constant only.
+        raise Unsupported("bitwise_left_shift by a tensor amount")
+
+    @staticmethod
+    def bitwise_right_shift(a, b):
+        # TODO: a tensor shift amount; the device shift takes a constant only.
+        raise Unsupported("bitwise_right_shift by a tensor amount")
 
     @staticmethod
     def clamp(x, min, max):
@@ -374,6 +398,18 @@ class SpyreOpFuncs:
             }
         }
         return PointwiseOp("softplus", [x], op_info)
+
+    @staticmethod
+    def shift_left(x, amount):
+        _require_int32_shift_operand("shift_left", x)
+        op_info = {"constants": {"shiftAmount": _shift_amount(amount)}}
+        return PointwiseOp("bitwiseleftshift", [x], op_info)
+
+    @staticmethod
+    def shift_right(x, amount):
+        _require_int32_shift_operand("shift_right", x)
+        op_info = {"constants": {"shiftAmount": _shift_amount(amount)}}
+        return PointwiseOp("bitwiserightshift", [x], op_info)
 
     @staticmethod
     def sqrt(x):

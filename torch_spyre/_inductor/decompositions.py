@@ -3107,6 +3107,52 @@ def bitwise_and(input1: torch.Tensor, input2: torch.Tensor) -> torch.Tensor:
         )
 
 
+def _device_int32_shift_amount(op: str, input: torch.Tensor, other) -> Optional[int]:
+    """The amount of a shift that runs on device, or None to leave it alone.
+
+    Host tensors keep the stock path. On device only int32 shifts by a Python
+    int are served: the amount becomes an instruction immediate.
+    """
+    if input.device.type != DEVICE_NAME:
+        return None
+    if input.dtype != torch.int32:
+        # TODO: int64 lives in 32-bit words on device, so a left shift would drop
+        # bits torch keeps; narrower integers have no device shift.
+        raise Unsupported(f"{op} on {input.dtype}")
+    if isinstance(other, bool) or not isinstance(other, int):
+        # TODO: a tensor amount (the .Tensor overloads lower to the op handler,
+        # which refuses it the same way).
+        raise Unsupported(f"{op} by {type(other).__name__}")
+    return other
+
+
+@register_spyre_decompositions(
+    [torch.ops.aten.bitwise_left_shift.Tensor_Scalar, torch.ops.aten.__lshift__.Scalar]
+)
+def bitwise_left_shift_by_constant(input: torch.Tensor, other) -> torch.Tensor:
+    """``x << k`` on int32: torch gives 0 for ``k`` outside [0, 32)."""
+    amount = _device_int32_shift_amount("bitwise_left_shift", input, other)
+    if amount is None:
+        return NotImplemented
+    if not 0 <= amount <= 31:
+        return torch.zeros_like(input)
+    return torch.ops.spyre.shift_left(input, amount)
+
+
+@register_spyre_decompositions(
+    [
+        torch.ops.aten.bitwise_right_shift.Tensor_Scalar,
+        torch.ops.aten.__rshift__.Scalar,
+    ]
+)
+def bitwise_right_shift_by_constant(input: torch.Tensor, other) -> torch.Tensor:
+    """``x >> k`` on int32, sign-filling: ``k`` outside [0, 32) acts as 31."""
+    amount = _device_int32_shift_amount("bitwise_right_shift", input, other)
+    if amount is None:
+        return NotImplemented
+    return torch.ops.spyre.shift_right(input, amount if 0 <= amount <= 31 else 31)
+
+
 # Spyre has no native scan op (#3388), so cumsum is decomposed by result dtype:
 # fp16/bf16 multiply by a triangular matrix of ones, fp32/int32/int64 run a
 # doubling prefix scan. Every other dtype falls back to CPU.
