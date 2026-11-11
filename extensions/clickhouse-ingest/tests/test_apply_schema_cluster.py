@@ -335,3 +335,164 @@ def test_the_keeper_path_can_be_set_by_a_template(monkeypatch):
         live_ddl("events"), "table", CLUSTER, "vigil_ops", "events"
     )
     assert "ReplicatedMergeTree('/zk/{shard}/vigil_ops.events', '{replica}')" in sql
+
+
+# ---- cluster mode: migrations, refreshable MVs, validation ------------------------
+
+SCRATCH = "CREATE TABLE scratch (a UInt8) ENGINE = MergeTree ORDER BY a"
+
+
+def test_a_migration_scratch_table_is_replicated_and_synced_before_it_is_read():
+    mig = (
+        f"{SCRATCH};\nINSERT INTO scratch SELECT 1;\n"
+        "DELETE FROM t WHERE a IN (SELECT a FROM scratch);\nDROP TABLE scratch;"
+    )
+    sent = [s for _, s in SchemaApplier.migration_statements(mig, CLUSTER, "db")]
+    assert f"CREATE TABLE scratch ON CLUSTER {CLUSTER}" in sent[0]
+    assert (
+        "ReplicatedMergeTree('/clickhouse/test_cluster/tables/{shard}/db/scratch'"
+        in sent[0]
+    )
+
+
+def test_a_migration_syncs_replicas_after_filling_a_scratch_table(tmp_path):
+    server, _ = _apply(
+        tmp_path,
+        {"10-a.sql": T + ";"},
+        {
+            "001-x.sql": f"{SCRATCH};\nINSERT INTO scratch SELECT 1;\nDELETE FROM a WHERE x IN (SELECT a FROM scratch);"
+        },
+    )
+    log = server.log
+    sync = f"SYSTEM SYNC REPLICA ON CLUSTER {CLUSTER} scratch"
+    assert sync in log
+    assert (
+        log.index("INSERT INTO scratch SELECT 1")
+        < log.index(sync)
+        < next(i for i, c in enumerate(log) if c.startswith("DELETE FROM a"))
+    )
+
+
+def test_a_migration_does_not_sync_inserts_into_existing_tables(tmp_path):
+    server, _ = _apply(
+        tmp_path, {"10-a.sql": T + ";"}, {"001-x.sql": "INSERT INTO a SELECT 1;"}
+    )
+    assert not any(c.startswith("SYSTEM SYNC") for c in server.log)
+
+
+def test_a_plain_scratch_table_with_on_cluster_is_refused():
+    with pytest.raises(ValueError, match="Replicated"):
+        SchemaApplier.clustered_migration(
+            f"CREATE TABLE s ON CLUSTER {CLUSTER} (a UInt8) ENGINE = MergeTree ORDER BY a",
+            CLUSTER,
+        )
+
+
+def test_a_scratch_table_on_an_unsupported_engine_is_refused():
+    with pytest.raises(ValueError, match="engine"):
+        SchemaApplier.clustered_migration(
+            "CREATE TABLE s (a UInt8) ENGINE = Memory", CLUSTER
+        )
+
+
+def test_rename_and_exchange_get_on_cluster_at_the_end():
+    f = lambda s: SchemaApplier.clustered_migration(s, CLUSTER)  # noqa: E731
+    assert f("RENAME TABLE a TO b") == f"RENAME TABLE a TO b ON CLUSTER {CLUSTER}"
+    assert (
+        f("RENAME TABLE a TO b, c TO d")
+        == f"RENAME TABLE a TO b, c TO d ON CLUSTER {CLUSTER}"
+    )
+    assert (
+        f("EXCHANGE TABLES a AND b") == f"EXCHANGE TABLES a AND b ON CLUSTER {CLUSTER}"
+    )
+
+
+@pytest.mark.parametrize(
+    "stmt",
+    [
+        "CREATE OR REPLACE TABLE t (a UInt8) ENGINE = MergeTree ORDER BY a",
+        "CREATE DICTIONARY d (a UInt8) PRIMARY KEY a SOURCE(NULL()) LAYOUT(FLAT()) LIFETIME(0)",
+        "OPTIMIZE TABLE t FINAL",
+        "ATTACH TABLE t",
+        "DETACH TABLE t",
+        "SYSTEM STOP MERGES t",
+    ],
+)
+def test_ddl_with_no_cluster_rewrite_is_refused_not_run_on_one_server(stmt):
+    with pytest.raises(ValueError, match="cannot run on a cluster"):
+        SchemaApplier.clustered_migration(stmt, CLUSTER)
+    assert SchemaApplier.clustered_migration(stmt, "") == stmt
+
+
+def test_a_refreshable_mv_in_a_migration_stays_on_the_connected_server():
+    sql = "CREATE MATERIALIZED VIEW r REFRESH EVERY 15 MINUTE APPEND TO t AS SELECT 1"
+    assert SchemaApplier.clustered_migration(sql, CLUSTER) == sql
+
+
+def test_a_refreshable_mv_another_replica_owns_is_not_created_again(tmp_path):
+    files = {"10-a.sql": T + ";\n" + R + ";"}
+    server = FakeServer({"a": T})
+    server.elsewhere = {"r"}
+    d = _schema(tmp_path, files)
+    f, m = SchemaApplier.selected_files(d), SchemaApplier.migration_files(d)
+    steps = SchemaApplier.apply(server, DB, f, m, CLUSTER)
+    assert not any("REFRESH" in c for c in server.log)
+    assert ("create", "r", "10-a.sql") not in steps
+    assert SchemaApplier.plan(server, DB, f, m, CLUSTER) == []
+
+
+def test_a_refreshable_mv_nobody_owns_is_created_once(tmp_path):
+    server, steps = _apply(tmp_path, {"10-a.sql": T + ";\n" + R + ";"})
+    assert ("create", "r", "10-a.sql") in steps
+
+
+def test_without_a_cluster_no_replica_query_is_made(tmp_path):
+    server = FakeServer()
+    d = _schema(tmp_path, {"10-a.sql": T + ";\n" + R + ";"})
+    SchemaApplier.apply(
+        server, DB, SchemaApplier.selected_files(d), SchemaApplier.migration_files(d)
+    )
+    assert SchemaApplier.refresh_mvs_on_cluster(server, DB, "") == set()
+
+
+def test_plan_refuses_an_unsupported_engine_before_anything_is_created(tmp_path):
+    bad = "CREATE TABLE b (a UInt8) ENGINE = Log"
+    server = FakeServer()
+    d = _schema(tmp_path, {"10-a.sql": T + ";\n" + bad + ";"})
+    f, m = SchemaApplier.selected_files(d), SchemaApplier.migration_files(d)
+    with pytest.raises(ValueError, match="engine"):
+        SchemaApplier.plan(server, DB, f, m, CLUSTER)
+    with pytest.raises(ValueError, match="engine"):
+        SchemaApplier.apply(server, DB, f, m, CLUSTER)
+    assert not [c for c in server.log if c.startswith("CREATE TABLE a")]
+
+
+def test_apply_refuses_an_unclusterable_migration_before_creating_tables(tmp_path):
+    server = FakeServer()
+    d = _schema(
+        tmp_path, {"10-a.sql": T + ";"}, {"001-x.sql": "OPTIMIZE TABLE a FINAL;"}
+    )
+    f, m = SchemaApplier.selected_files(d), SchemaApplier.migration_files(d)
+    with pytest.raises(ValueError, match="001-x.sql"):
+        SchemaApplier.apply(server, DB, f, m, CLUSTER)
+    assert not [c for c in server.log if c.startswith("CREATE TABLE a")]
+    assert not server.ledger
+
+
+def test_every_repo_migration_can_run_on_a_cluster():
+    for path in SchemaApplier.migration_files(SchemaApplier.schema_dir()):
+        SchemaApplier.migration_statements(path.read_text(), CLUSTER, "db")
+
+
+def test_the_repo_migrations_are_unchanged_without_a_cluster():
+    for path in SchemaApplier.migration_files(SchemaApplier.schema_dir()):
+        got = [s for _, s in SchemaApplier.migration_statements(path.read_text())]
+        want = [
+            s.rpartition("\0")[2].strip()
+            for s in SchemaApplier.statements(
+                SchemaApplier.IF_TABLE.sub(
+                    lambda m: f"\0{m.group(1)}\0", path.read_text()
+                )
+            )
+        ]
+        assert got == want, path.name

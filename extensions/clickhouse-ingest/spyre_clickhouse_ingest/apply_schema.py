@@ -114,9 +114,19 @@ class SchemaApplier:
     # Statements in a migration that change structure on every replica, and the ones that only move data.
     MIGRATION_DDL = re.compile(
         r"^(ALTER\s+TABLE|DROP\s+TABLE|DROP\s+VIEW|TRUNCATE\s+TABLE|CREATE\s+(?:MATERIALIZED\s+)?VIEW|"
-        r"CREATE\s+TABLE|RENAME\s+TABLE)\b",
+        r"CREATE\s+TABLE|RENAME\s+TABLE|EXCHANGE\s+TABLES)\b",
         re.IGNORECASE,
     )
+    # Anything that changes structure but that cluster mode has no rewrite for is refused rather
+    # than run on the connected server alone.
+    UNCLUSTERABLE = re.compile(
+        r"^(?:CREATE|ALTER|DROP|RENAME|EXCHANGE|TRUNCATE|ATTACH|DETACH|UNDROP|OPTIMIZE|SYSTEM)\b",
+        re.IGNORECASE,
+    )
+    MIGRATION_CREATE_TABLE = re.compile(
+        r"^CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:\w+\.)?(\w+)", re.IGNORECASE
+    )
+    INSERT_INTO = re.compile(r"^INSERT\s+INTO\s+(?:\w+\.)?(\w+)", re.IGNORECASE)
 
     @classmethod
     def cluster(cls) -> str:
@@ -184,9 +194,25 @@ class SchemaApplier:
         )
 
     @classmethod
-    def clustered_migration(cls, stmt: str, cluster: str) -> str:
-        """A migration statement that changes structure, run on every replica; data statements stay as they are."""
-        if not cluster or re.search(r"\bON\s+CLUSTER\b", stmt, re.I):
+    def clustered_migration(
+        cls, stmt: str, cluster: str, db: str = "", name: str = ""
+    ) -> str:
+        """A migration statement that changes structure, run on every replica; data statements stay as they are.
+
+        A table a migration creates is made Replicated like a schema table, so a scratch table holds
+        the same rows on every replica. A refreshable MV stays on the connected server (it appends
+        on a schedule). Structural DDL with no rewrite raises instead of running on one server."""
+        if not cluster:
+            return stmt
+        if cls.REFRESHABLE.match(stmt):
+            return stmt
+        has_cluster = re.search(r"\bON\s+CLUSTER\b", stmt, re.I)
+        ct = cls.MIGRATION_CREATE_TABLE.match(stmt)
+        if ct and not re.search(r"\bENGINE\s*=\s*Replicated", stmt, re.I):
+            if has_cluster:
+                raise ValueError(f"{ct.group(1)}: ON CLUSTER needs a Replicated engine")
+            return cls.clustered(stmt, "table", cluster, db, ct.group(1))
+        if has_cluster:
             return stmt
         m = cls.MIGRATION_DDL.match(stmt)
         if not m:
@@ -198,20 +224,23 @@ class SchemaApplier:
                     count=1,
                     flags=re.I,
                 )
+            if cls.UNCLUSTERABLE.match(stmt):
+                raise ValueError(
+                    f"cannot run on a cluster: '{stmt.splitlines()[0][:80]}'"
+                )
             return stmt
         verb = re.sub(r"\s+", " ", m.group(1).upper())
+        if verb in ("RENAME TABLE", "EXCHANGE TABLES"):
+            return f"{stmt} ON CLUSTER {cluster}"
         target = r"(?:IF\s+(?:NOT\s+)?EXISTS\s+)?[\w.]+"
         pat = {
             "ALTER TABLE": rf"^(ALTER\s+TABLE\s+{target})",
             "TRUNCATE TABLE": rf"^(TRUNCATE\s+TABLE\s+{target})",
             "DROP TABLE": rf"^(DROP\s+TABLE\s+{target})",
             "DROP VIEW": rf"^(DROP\s+VIEW\s+{target})",
-            "RENAME TABLE": None,
         }.get(verb)
         if verb.startswith("CREATE"):
             pat = rf"^(CREATE\s+(?:MATERIALIZED\s+)?(?:VIEW|TABLE)\s+{target})"
-        if not pat:
-            return stmt
         out = re.sub(pat, rf"\1 ON CLUSTER {cluster}", stmt, count=1, flags=re.I)
         if verb == "DROP TABLE" and not re.search(r"\bSYNC\b", out, re.I):
             out += " SYNC"
@@ -241,18 +270,39 @@ class SchemaApplier:
         return [s.strip() for s in stripped.split(";") if s.strip()]
 
     @classmethod
-    def run_migration(cls, client, text: str, cluster: str = "") -> None:
-        """Run a migration's statements, skipping each one whose IF_TABLE is absent.
-
-        With a cluster, structural statements run on every replica; INSERT and similar data
-        statements run once, on the connected server, and reach the others by replication."""
+    def migration_statements(cls, text: str, cluster: str = "", db: str = "") -> list:
+        """(IF_TABLE name or '', statement as it will run) for each statement of a migration."""
         marked = cls.IF_TABLE.sub(lambda m: f"\0{m.group(1)}\0", text)
+        out = []
         for stmt in cls.statements(marked):
             table, _, sql = stmt.rpartition("\0")
-            table = table.strip("\0")
+            out.append(
+                (table.strip("\0"), cls.clustered_migration(sql.strip(), cluster, db))
+            )
+        return out
+
+    @classmethod
+    def run_migration(cls, client, text: str, cluster: str = "", db: str = "") -> None:
+        """Run a migration's statements, skipping each one whose IF_TABLE is absent.
+
+        With a cluster, structural statements run on every replica. Other data statements run once, on
+        the connected server, and reach the others by replication; rows inserted into a table the
+        migration created are synced to every replica before the next statement reads them."""
+        scratch: set = set()
+        for table, sql in cls.migration_statements(text, cluster, db):
             if table and not client.command(f"EXISTS TABLE {table}"):
                 continue
-            client.command(cls.clustered_migration(sql.strip(), cluster))
+            client.command(sql)
+            if not cluster:
+                continue
+            created = cls.MIGRATION_CREATE_TABLE.match(sql)
+            if created:
+                scratch.add(created.group(1))
+            ins = cls.INSERT_INTO.match(sql)
+            if ins and ins.group(1) in scratch:
+                client.command(
+                    f"SYSTEM SYNC REPLICA ON CLUSTER {cluster} {ins.group(1)}"
+                )
 
     @classmethod
     def required_version(cls, text: str) -> tuple:
@@ -326,6 +376,37 @@ class SchemaApplier:
             parameters={"db": db},
         ).result_rows
         return {name: ddl for name, ddl in rows}
+
+    @classmethod
+    def refresh_mvs_on_cluster(cls, client, db: str, cluster: str) -> set:
+        """Names of materialized views present on ANY replica; empty without a cluster.
+
+        A refreshable MV exists on one replica only, so the connected server alone cannot tell
+        whether another already owns it."""
+        if not cluster:
+            return set()
+        rows = client.query(
+            f"SELECT DISTINCT name FROM clusterAllReplicas('{cluster}', system.tables) "
+            "WHERE database = %(db)s AND engine = 'MaterializedView'",
+            parameters={"db": db},
+        ).result_rows
+        return {r[0] for r in rows}
+
+    @classmethod
+    def validate_cluster(
+        cls, objs: list, live: dict, pending: list, cluster: str, db: str
+    ) -> None:
+        """Raise before anything is created if a new table or pending migration cannot run on a cluster."""
+        if not cluster:
+            return
+        for o in objs:
+            if o.kind in ("table", "mv") and o.name not in live:
+                cls.clustered(o.sql, o.kind, cluster, db, o.name)
+        for p in pending:
+            try:
+                cls.migration_statements(p.read_text(), cluster, db)
+            except ValueError as e:
+                raise ValueError(f"{p.name}: {e}") from None
 
     @classmethod
     def ledger_ddl(cls, cluster: str, db: str) -> str:
@@ -406,6 +487,8 @@ class SchemaApplier:
         done = cls.applied(client, db)
         objs = [o for path, text in files for o in cls.objects(path, text)]
         pending = [p for p in migrations if p.name not in done]
+        cls.validate_cluster(objs, live, pending, cluster, db)
+        elsewhere = cls.refresh_mvs_on_cluster(client, db, cluster)
         added = cls.pending_adds(pending)
         replaced = cls.pending_adds(pending, cls.ADDS_CONSTRAINT)
         # An MV a pending migration drops and recreates matches its file once that migration runs.
@@ -450,7 +533,7 @@ class SchemaApplier:
         steps += [
             ("create", o.name, o.file)
             for o in objs
-            if o.kind == "refresh" and o.name not in live
+            if o.kind == "refresh" and o.name not in live and o.name not in elsewhere
         ]
         return steps
 
@@ -467,6 +550,11 @@ class SchemaApplier:
         objs = [o for path, text in files for o in cls.objects(path, text)]
         steps = []
         live = cls.live(client, db)
+        if cluster:
+            done = cls.applied(client, db)
+            cls.validate_cluster(
+                objs, live, [p for p in migrations if p.name not in done], cluster, db
+            )
         for o in objs:
             if o.kind in ("table", "mv") and o.name not in live:
                 client.command(cls.clustered(o.sql, o.kind, cluster, db, o.name))
@@ -478,7 +566,7 @@ class SchemaApplier:
                 if done[path.name] != cls.checksum(text):
                     print(f"  [warn] {path.name} changed after it was applied")
                 continue
-            cls.run_migration(client, text, cluster)
+            cls.run_migration(client, text, cluster, db)
             client.insert(
                 cls.LEDGER,
                 [[path.name, cls.checksum(text)]],
@@ -511,8 +599,11 @@ class SchemaApplier:
                 client.command(f"DROP VIEW IF EXISTS {o.name}{oc}")
                 client.command(cls.clustered(o.sql, o.kind, cluster, db, o.name))
                 steps.append(("recreate", o.name, o.file))
+        elsewhere = cls.refresh_mvs_on_cluster(client, db, cluster)
         for o in objs:
             if o.kind == "refresh" and o.name not in live:
+                if o.name in elsewhere:
+                    continue
                 # Never ON CLUSTER: it appends on a schedule, so one server must own it.
                 if cluster:
                     print(
@@ -523,12 +614,12 @@ class SchemaApplier:
         return steps
 
     @classmethod
-    def rerun(cls, client, path: Path, cluster: str = "") -> None:
+    def rerun(cls, client, path: Path, cluster: str = "", db: str = "") -> None:
         """Run a migration again; refused unless it is marked `-- RERUNNABLE`."""
         text = path.read_text()
         if not cls.RERUNNABLE.search(text):
             raise ValueError(f"{path.name} is not marked -- RERUNNABLE")
-        cls.run_migration(client, text, cluster)
+        cls.run_migration(client, text, cluster, db)
 
 
 SCHEMA_DIR = SchemaApplier.schema_dir()
@@ -610,7 +701,7 @@ def main() -> None:
 
     if args.rerun:
         SchemaApplier.rerun(
-            client, args.schema_dir / "migrations" / args.rerun, cluster
+            client, args.schema_dir / "migrations" / args.rerun, cluster, db
         )
         print(f"[info] reran {args.rerun} on {db}")
         return
