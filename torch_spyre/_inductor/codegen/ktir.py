@@ -817,9 +817,12 @@ def _divide(
     The one place work division touches an access.  A division walks the axis
     its symbol addresses one per-core extent at a time, so its step along that
     axis *is* that extent, and the cores between them cover ``device_size``
-    exactly (``A * D``).  The view is unaffected -- ``_solve_layout`` builds it
-    from the whole ``device_size``, because every core addresses the same buffer
-    -- so nothing else in the emitter has to know that cores exist.
+    exactly (``A * D``).  The view of an HBM buffer is unaffected --
+    ``_solve_layout`` builds it from the whole ``device_size``, because every
+    core addresses the same buffer -- so nothing else in the emitter has to know
+    that cores exist.  An LX buffer is the exception: each core holds only its own
+    share, so ``_access_of`` views the per-core extent this returns and drops its
+    rows.
 
     ``symbols`` is outermost-first, matching the plan's division order; the rows
     come back in that order so they prepend to the loop levels' rows.
@@ -1204,21 +1207,45 @@ def _access(
 # reads no spec, so it cannot discover a reason to refuse half-way through.
 
 
-# The memory-planning spaces this emitter recognises, each named once.  LX is
-# on-chip scratchpad with no base the kernel is given, so an LX buffer is carried
-# as an SSA value; ``hbm_pool`` is an offset into a base the kernel IS given.
-THREADED_SPACES: tuple[str, ...] = ("lx",)
+# The memory-planning spaces this emitter recognises, each named once.  ``lx`` is
+# a byte address in each core's on-chip scratchpad that memory planning chose;
+# ``hbm_pool`` is an offset into a base the kernel IS given.  THREADED_SPACES are
+# carried as an SSA value instead, with no address at all: none today, since every
+# allocation the frontend writes is an address.  A register allocation, once
+# memory planning gives one, is the space that belongs there.
+THREADED_SPACES: tuple[str, ...] = ()
+LX_SPACE = "lx"
 POOL_SPACE = "hbm_pool"
 
 
 def is_threaded(arg: TensorArg) -> bool:
     """Whether this buffer is carried as an SSA value: no base, no view, no store.
 
-    True for LX only, because nothing hands the kernel an LX base to store to.  A
-    threaded value cannot cross a compute stage, which is what
+    True for a ``THREADED_SPACES`` allocation, which has no memory for the kernel
+    to store to.  A threaded value cannot cross a compute stage, which is what
     ``_check_owned_buffers`` refuses.
     """
     return any(space in (arg.allocation or {}) for space in THREADED_SPACES)
+
+
+def lx_address_of(arg: TensorArg) -> int | None:
+    """``arg``'s LX byte address, or None if memory planning did not put it in LX.
+
+    An ABSOLUTE per-core byte address, the same number the SDSC path passes on as
+    a start address: LX planning owns its part of every core's scratchpad from
+    address zero, and nothing adds a base to it.  Key presence, not truthiness:
+    address 0 is the first buffer in LX.
+    """
+    allocation = arg.allocation or {}
+    if LX_SPACE not in allocation:
+        return None
+    address = allocation[LX_SPACE]
+    if address is None:
+        raise NotImplementedError(
+            f"OpSpec->KTIR: buffer {arg.name!r} has an unassigned {LX_SPACE!r} "
+            "address (None); memory planning must run before KTIR emission"
+        )
+    return int(address)
 
 
 def pool_offset_of(arg: TensorArg) -> int | None:
@@ -1331,9 +1358,40 @@ def _buffer(
             space="HBM",
             pool_offset=pool_offset,
         )
+    lx_address = lx_address_of(arg)
+    if lx_address is not None:
+        # LX planning's address is honoured as it stands: the buffer is a
+        # core-local view at that address, stored where it is produced and loaded
+        # where it is read, as the SDSC path places it.  Neither form of address
+        # applies -- no func parameter (nothing passes an LX buffer) and no
+        # ``bake_addresses`` choice (an LX address is always a constant).
+        assert arg.arg_index < 0, (
+            f"{arg.name!r} is in LX but also kernel argument {arg.arg_index}"
+        )
+        size = num_bytes(arg.device_dtype)
+        # ``lx_address`` is in BYTES and a memory view's offset counts ELEMENTS,
+        # so the base is the byte address divided by the element size.  This
+        # checks only that the division is exact -- that the address is on an
+        # element boundary -- since a remainder would otherwise be dropped and
+        # the view would start before the buffer.  It does not check stick
+        # alignment; LX planning places buffers on 128-byte sticks, which is why
+        # this is expected to hold.
+        if lx_address < 0 or lx_address % size:
+            raise NotImplementedError(
+                f"OpSpec->KTIR: buffer {arg.name!r} has LX address {lx_address}, "
+                f"which is not a non-negative multiple of its {size}-byte element"
+            )
+        return Buffer(
+            buf_id=buf_id(arg),
+            arg_index=-1,
+            elems=elems,
+            layout=layout,
+            base_elements=lx_address // size,
+            space="LX",
+        )
     # ``arg_index`` stays -1 for buffers the frontend does not pass to the
-    # kernel, which today means an LX or HBM-pool allocation.  This emitter
-    # constructs HBM memory views only.
+    # kernel, which with LX and the HBM pool handled above leaves only an
+    # allocation this emitter does not know.
     if arg.arg_index < 0:
         raise NotImplementedError(
             f"OpSpec->KTIR: buffer {arg.name!r} is not a kernel argument "
@@ -1423,11 +1481,15 @@ def _op_specs(specs: Sequence[Any]) -> Iterator[OpSpec]:
 
 
 # How a kernel comes to own a buffer, keyed by the kind
-# ``KernelPlan._check_owned_buffers`` works in, so one refusal covers both.
+# ``KernelPlan._check_owned_buffers`` works in, so one refusal covers them all.
 _OWNERSHIP: dict[str, str] = {
     "threaded": (
-        "its allocation is lx, so it is threaded as a value rather than stored "
-        "and loaded"
+        "its allocation has no address, so it is threaded as a value rather than "
+        "stored and loaded"
+    ),
+    "lx": (
+        "its allocation is lx, so it lives in each core's scratchpad for the "
+        "length of this kernel"
     ),
     "pooled": (
         "its allocation is hbm_pool, so it lives in a pool tensor the wrapper "
@@ -1546,6 +1608,15 @@ class KernelPlan:
         """
         return [e for e in self.buffers.values() if e.pool_offset is not None]
 
+    @property
+    def lx_buffers(self) -> list[Buffer]:
+        """The buffers memory planning put in LX, in registration order.
+
+        No slot of their own either: each one's base is its LX address, a
+        constant, whether or not the kernel's other addresses are baked.
+        """
+        return [e for e in self.buffers.values() if e.space == "LX"]
+
     def add_specs(self, specs: Sequence[OpSpec | LoopSpec | UnimplementedOp]) -> None:
         """Plan ``specs`` into this plan's grid, buffers and steps."""
         # BEFORE the fusion, from the predicate the wrapper uses: it reads these
@@ -1594,21 +1665,19 @@ class KernelPlan:
     def _check_owned_buffers(self, steps: Sequence[Step]) -> None:
         """A buffer this kernel owns must be produced before it is read, and read.
 
-        BOTH ENDS, and for both kinds of owned buffer -- threaded and pooled --
-        because neither kind's memory outlives the call: a threaded value has
-        none, and a pooled one sits in a tensor the wrapper allocates before
-        ``.run()`` and frees after it.  Either end missing means the fusion
-        decision and the kernel boundary disagree, and the buffer needs
-        materialising instead.
+        BOTH ENDS, and for every kind of owned buffer -- threaded, LX and pooled
+        -- because none of them outlives the call: a threaded value has no memory,
+        an LX buffer is left to the next kernel's planning, and a pooled one sits
+        in a tensor the wrapper allocates before ``.run()`` and frees after it.
+        Either end missing means the fusion decision and the kernel boundary
+        disagree, and the buffer needs materialising instead.
 
-        The stage crossing is asked of threaded buffers only.  A threaded value
-        cannot cross a compute stage, because each stage's schedule is extracted
-        into a module of its own; a pooled buffer has a base and so crosses as a
-        passed-in buffer does.  The refusal names ``LX_PLANNING=0``, that being
-        the flag which stops a buffer being threaded.
+        The stage crossing is asked of threaded buffers only.  An LX or a pooled
+        buffer has an address, so it crosses as a passed-in buffer does: stored
+        by the stage that produces it and loaded by the stage that reads it.
         """
-        # ``buf_id -> "threaded" | "pooled"``, produced and not yet read.  The
-        # kind is kept because it decides which refusal the unread end raises.
+        # ``buf_id -> "threaded" | "lx" | "pooled"``, produced and not yet read.
+        # The kind is kept because it decides which refusal the unread end raises.
         unread: dict[str, str] = {}
         produced: set[str] = set()
         # The stage each owned buffer was produced in, so that a read from a
@@ -1617,9 +1686,11 @@ class KernelPlan:
         produced_in: dict[str, int] = {}
 
         def kind_of(access: Access) -> str | None:
-            """ "threaded" / "pooled" for a buffer the kernel owns, else None."""
+            """ "threaded" / "lx" / "pooled" for a buffer the kernel owns, else None."""
             if access.buffer is None:
                 return "threaded"
+            if access.buffer.space == "LX":
+                return "lx"
             if access.buffer.pool_offset is not None:
                 return "pooled"
             return None  # passed in: its memory outlives the call
@@ -1645,13 +1716,9 @@ class KernelPlan:
                             f"OpSpec->KTIR: buffer {read_id!r} is an intermediate "
                             "this kernel owns, so it is threaded as a value -- but "
                             f"it is written in stage {produced_in[read_id]} and read "
-                            f"in stage {step.stage}, and a value cannot cross a "
-                            "compute stage: the backend aborts on it. LX planning "
-                            "claimed this buffer, and LX is scratchpad with no base "
-                            "to address it by, which is what makes it threaded; set "
-                            "LX_PLANNING=0 so it stays an ordinary HBM buffer that "
-                            "the wrapper allocates and passes, and this kernel emits "
-                            "a store and a load instead"
+                            f"in stage {step.stage}, and the backend does not yet "
+                            "compile a value carried from one stage into another: "
+                            "the program it fuses them into produces no binary"
                         )
                     unread.pop(read_id, None)
                 kind = "threaded" if not step.store else kind_of(step.out)
@@ -1890,10 +1957,13 @@ class KernelPlan:
         # different elements, so a division no output axis follows is cores
         # duplicating each other rather than sharing.  An *input* may legitimately
         # not follow one (every core reads the same operand), which is why this
-        # asks the output only.
-        out_coeffs = accesses[buf_id(out)].index_coeffs
+        # asks the output only.  It asks the division of the TENSOR, not the
+        # output access's index: an LX output is each core's own share, so its
+        # access has no core offset although the cores still write different
+        # elements.
+        _, division_rows = _divide(out, self._symbols, self._divisors)
         for level, division in enumerate(self.divisions):
-            if not any(row[level] for row in out_coeffs):
+            if not any(division_rows[level]):
                 raise NotImplementedError(
                     f"OpSpec->KTIR: work division splits {division.symbol} across "
                     f"{division.div} cores, but no device axis of the output "
@@ -1921,8 +1991,9 @@ class KernelPlan:
             broadcast=broadcast,
             # A threaded buffer never reaches memory: it is carried as a value,
             # so it gets no store, no func parameter, no view and no address.  A
-            # pooled one does reach memory -- at the pool base plus its offset --
-            # so it is stored like any passed-in buffer.
+            # pooled or an LX one does reach memory -- at the pool base plus its
+            # offset, or at the address LX planning chose -- so it is stored like
+            # any passed-in buffer.
             store=not is_threaded(out),
         )
 
@@ -1955,6 +2026,19 @@ class KernelPlan:
         plain element type although the buffer holds fused statistics -- the mean
         out of the head of a pair's stick, as ``f16``.
         """
+        # The divisions are the outermost levels, so their steps come first.
+        extent, rows = _divide(arg, self._symbols, self._divisors)
+        if lx_address_of(arg) is not None:
+            # An LX buffer is PER CORE: LX planning sizes it to one core's share
+            # (``size_per_core``) and places that share at the same address in
+            # every core's own scratchpad.  So its view is the share, not the
+            # whole ``device_size`` every core shares in HBM, and the share
+            # starts at the view's origin on every core: each division's row is
+            # zero.  The rows are kept, zeroed, because the builder zips one
+            # coefficient per open level, divisions included.  Loop levels still
+            # walk the share.
+            arg = dataclasses.replace(arg, device_size=list(extent))
+            rows = [tuple(0 for _ in row) for row in rows]
         layout, q = _solve_layout(arg, levels)
         elems = ElemTypes.of(arg.device_dtype, None if unfused else _arrangement(arg))
         buffer = None
@@ -1977,8 +2061,6 @@ class KernelPlan:
                 frontend_pool_allocation=self.options.frontend_pool_allocation,
             )
             self.buffers.setdefault(buf_id(arg), buffer)
-        # The divisions are the outermost levels, so their steps come first.
-        extent, rows = _divide(arg, self._symbols, self._divisors)
         if head:
             extent = (*extent[:-1], 1)
         return _access(arg, extent, [*rows, *q], layout, elems, buffer)
@@ -2982,6 +3064,12 @@ class KtirBuilder:
                         assert pool_base is not None and buffer.pool_offset is not None
                         self.bases[buffer.buf_id] = self.val(
                             arith.AddIOp(pool_base, self.icst_index(buffer.pool_offset))
+                        )
+                    for buffer in self.plan.lx_buffers:
+                        # ``_buffer`` resolves every LX buffer's address.
+                        assert buffer.base_elements is not None
+                        self.bases[buffer.buf_id] = self.icst_index(
+                            buffer.base_elements
                         )
                     yield
                     func.ReturnOp([])  # no operands, matching the signature
