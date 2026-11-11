@@ -2470,6 +2470,7 @@ def _host_size_stride_for_expr(
     host_stride: list[int],
     arg: "PropArg",
     label: str,
+    stick_size: int,
 ) -> "tuple[int, int] | None":
     """Return (host_size, host_stride) for the host dim group that expr maps to.
 
@@ -2503,11 +2504,15 @@ def _host_size_stride_for_expr(
         # Genuine factorized layout across multiple host dims.
         return math.prod(host_size[d] for d in host_dims), var_stride
     # Single host dim: _factorized_chain ignores coord offsets; verify that the
-    # coord is offset-compatible with the expression (e.g. a sliced tensor with
-    # ic=[d0, d1+32] and expr=Mod(d1,64) is invalid because offsets differ: 32 vs 0).
+    # coord is offset-compatible with the expression modulo the stick size (e.g.
+    # a sliced tensor with ic=[d0, d1+32] and expr=Mod(d1,64) is invalid because
+    # 32 is not a multiple of 64). A coord offset that is itself a whole number
+    # of sticks (e.g. +704 with stick_size=64) leaves the stick expression's
+    # reduced form unchanged and is a valid, stick-aligned slice.
     d = host_dims[0]
     coord = host_coords[d]
-    if coord.subs(var, 0) != expr.subs(var, 0):
+    offset_diff = coord.subs(var, 0) - expr.subs(var, 0)
+    if sympy.Mod(offset_diff, stick_size) != 0:
         return None
     return host_size[d], host_stride[d]
 
@@ -2546,18 +2551,18 @@ def compute_restickify_target_layout(
         return None
     host_size = [concretize_expr(s) for s in host_layout.size]
     host_stride = [concretize_expr(s) for s in host_layout.stride]
+    stick_size = get_elem_in_stick(host_layout.dtype)
     new_sd_size_stride = _host_size_stride_for_expr(
-        target_stick_expr, ic, host_size, host_stride, arg, label
+        target_stick_expr, ic, host_size, host_stride, arg, label, stick_size
     )
     if new_sd_size_stride is None:
         return None
     new_sd_host_size, new_sd_host_stride = new_sd_size_stride
     old_stick_expr = idc[-1]
     new_var = next(iter(target_stick_expr.free_symbols))
-    stick_size = get_elem_in_stick(host_layout.dtype)
     if old_stick_expr.free_symbols:
         old_sd_size_stride = _host_size_stride_for_expr(
-            old_stick_expr, ic, host_size, host_stride, arg, label
+            old_stick_expr, ic, host_size, host_stride, arg, label, stick_size
         )
         if old_sd_size_stride is None:
             return None
@@ -2634,14 +2639,14 @@ def compute_size1_restickify_layout(
     host_size = [concretize_expr(s) for s in host_layout.size]
     host_stride = [concretize_expr(s) for s in host_layout.stride]
     old_stick_expr = idc[-1]
+    stick_size = get_elem_in_stick(host_layout.dtype)
     ss = _host_size_stride_for_expr(
-        old_stick_expr, ic, host_size, host_stride, arg, label
+        old_stick_expr, ic, host_size, host_stride, arg, label, stick_size
     )
     if ss is None:
         return None
     old_sd_host_size, old_sd_host_stride = ss
     old_var = next(iter(old_stick_expr.free_symbols))
-    stick_size = get_elem_in_stick(host_layout.dtype)
     old_var_outer_dims = [
         j for j in range(len(idc) - 1) if old_var in idc[j].free_symbols
     ]
