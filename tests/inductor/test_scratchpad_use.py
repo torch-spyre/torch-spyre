@@ -250,6 +250,8 @@ class BaseTestScratchpadUsage(unittest.TestCase):
 
     def setUp(self):
         torch.manual_seed(0xAFFE)
+        # Per test, so a pass added by one test cannot reach another.
+        self.our_pre_scheduling_passes = []
 
         self.patchers.append(t_inductor_config.patch("force_disable_caches", True))
         self.patchers.append(
@@ -291,8 +293,12 @@ class BaseTestScratchpadUsage(unittest.TestCase):
             f(graph)
 
         self.our_pre_scheduling_passes.append(new_pass)
-        yield
-        self.our_pre_scheduling_passes.remove(new_pass)
+        try:
+            yield
+        finally:
+            # Without this, a compile that raises leaves the pass installed and
+            # it runs inside every later test's compile.
+            self.our_pre_scheduling_passes.remove(new_pass)
 
     def compile_and_collect_mem_usage(
         self, f: Callable[[Unpack[Ts]], torch.Tensor], args: tuple[Unpack[Ts]]
