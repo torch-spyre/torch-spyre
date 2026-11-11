@@ -1820,9 +1820,12 @@ class DomainRangeTracer(DomainRangeSolver):
 
         if do_coord_mask or do_pad:
             if padded:
-                # set the propagated output padding
-                pad_set = self.buffer_range[op.name]
-                output_padding = float(pick_element(pad_set))
+                # Record the output padding only when it is proven to be one
+                # value. Later graphs trust a recorded value and skip masking,
+                # so picking an element of a wider set (e.g. the Reals a
+                # masked reduction leaves) would claim a padding that is
+                # not there.
+                output_padding = _single_padding_value(self.buffer_range[op.name])
 
             for arg_name, pad_set in self.buffer_input[op.name].items():
                 overwrites[arg_name] = float(pick_element(pad_set))
@@ -2400,6 +2403,15 @@ _ASSUMED_PADDING: dict[type, Set] = {
 }
 
 
+def _single_padding_value(pad_set: Set) -> float | None:
+    """The padding value pad_set proves, or None if it is not one finite value."""
+    if isinstance(pad_set, FiniteSet) and len(pad_set) == 1:
+        (value,) = pad_set
+        if value.is_finite and value.is_real:
+            return float(value)
+    return None
+
+
 def get_or_pick_pad_value(inv_domain: InvalidDomain, dtype: torch.dtype):
     pad_value = get_pad_value(inv_domain.func, dtype)
     if pad_value is None or not inv_domain.domain.contains(pad_value):
@@ -2463,8 +2475,6 @@ def _record_mutated_input_padding(
         stl = _get_stl(graph, graph.get_buffer(name))
         if pad_set is None or stl is None or not _can_record_padding(stl):
             continue
-        if isinstance(pad_set, FiniteSet) and len(pad_set) == 1:
-            (value,) = pad_set
-            if value.is_finite and value.is_real:
-                padding[name] = float(value)
+        if (value := _single_padding_value(pad_set)) is not None:
+            padding[name] = value
     graph._spyre_input_padding = padding  # type: ignore[attr-defined]
