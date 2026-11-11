@@ -109,6 +109,9 @@ class TestSpyreProfiler(TestCase):
         device = "spyre"
         x = torch.randn(4, device=device)
 
+        # NOTE: TestSpyreProfiler tests share one process and libaiupti keeps
+        # process-global buffer state. If a later test stalls, suspect state left
+        # behind by an earlier one (see #3516 / libaiupti#114).
         with profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
             with_stack=True,

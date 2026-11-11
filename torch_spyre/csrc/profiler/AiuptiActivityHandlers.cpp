@@ -13,7 +13,14 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
- * Portions derived from libkineto AIU plugin.
+ * Portions derived from the libkineto AIU plugin, formerly at
+ * libkineto/src/plugin/aiupti in https://github.com/pytorch/kineto
+ * (last present at commit 44196e07; removed in pytorch/kineto#1366):
+ *
+ *     Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * Those portions are licensed under the BSD 3-Clause License; see
+ * LICENSE in that repository for the full license text.
  */
 #include <libaiupti/aiupti_runtime_cbid.h>
 
