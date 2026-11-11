@@ -7872,3 +7872,36 @@ class TestAutoSpanOverflowBmmE2E(InductorTestCase):
             "no combined split.*makes all spans fit",
         ):
             self._auto_span_overflow_bmm_source(enable_reduction_tiling=False)
+
+
+class TestCompareWithCpuSourceCheck(InductorTestCase):
+    """``compare_with_cpu(..., source_check=fn)`` calls ``fn`` with the generated code.
+
+    Many tests in this file pass a ``source_check`` (the ``LoopSpec`` and ``count=``
+    assertions of ``_assert_forced_tiling_matches_cpu``). The helper once compared
+    ``device == "spyre"`` where ``device`` is a ``torch.device``, which is ``False``,
+    so none of them ran. These pin that it runs."""
+
+    @staticmethod
+    def _run(source_check):
+        x = torch.randn(64, 64, dtype=torch.float16)
+        compare_with_cpu(
+            lambda x: x + 1,
+            x,
+            run_compile=True,
+            run_eager=False,
+            source_check=source_check,
+        )
+
+    def test_source_check_is_called_with_the_generated_code(self):
+        seen = []
+        self._run(seen.append)
+        self.assertEqual(len(seen), 1)
+        self.assertIn("OpSpec(", seen[0])
+
+    def test_a_failing_source_check_fails_the_test(self):
+        def refuse(source):
+            raise AssertionError("source_check ran")
+
+        with self.assertRaisesRegex(AssertionError, "source_check ran"):
+            self._run(refuse)
