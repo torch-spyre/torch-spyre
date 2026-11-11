@@ -480,10 +480,10 @@ def test_compute_restickify_target_layout_synthesizes_when_no_size1_dim_exists()
     )
 
     assert result is not None
-    # Matches SpyreTensorLayout([4, 64, 1]): the size-1 dim is device dim 1 and
-    # the one-element stick maps to no host stride.
-    assert list(result.device_size) == [64, 1, 4, 64]
-    assert list(result.stride_map) == [1, -1, 64, -1]
+    # One element per stick: the old stick's 64 elements become an outer dim
+    # and the stick maps to no host stride.
+    assert list(result.device_size) == [64, 4, 64]
+    assert list(result.stride_map) == [1, 64, -1]
 
 
 _FP16 = get_device_dtype(torch.float16)
@@ -839,33 +839,6 @@ def test_rescale_stl_for_dtype_matches_fp32_host_layout():
     assert math.prod(out.valid_elements.values()) == 2 * 4 * 64
 
 
-def test_size1_restickify_in_place_matches_size1_host_layout():
-    """Host [4, 128] restickified onto a synthetic size-1 dim.
-
-    Must match SpyreTensorLayout([4, 128, 1]): the size-1 dim is inserted as
-    device dim 1, the old stick's 128 elements stay on dim 0, and the stick
-    holds one element per stick on dim 3. Counts multiply to 4 * 128.
-    """
-    stl = SpyreTensorLayout([4, 128], torch.float16)
-    hl = FixedLayout(torch.device("cpu"), torch.float16, [4, 128], [128, 1])
-    c0, c1 = sympy.symbols("c0 c1")
-    idc = [sympy.floor(c1 / 64), c0, sympy.Mod(c1, 64)]
-    out = pass_utils.compute_size1_restickify_layout(stl, hl, [c0, c1], idc)
-    oracle = SpyreTensorLayout([4, 128, 1], torch.float16)
-    assert out is not None
-    assert list(out.device_size) == list(oracle.device_size) == [128, 1, 4, 64]
-    assert list(out.stride_map) == list(oracle.stride_map) == [1, -1, 128, -1]
-    assert (
-        out.valid_elements
-        == oracle.valid_elements
-        == {
-            (0,): 128,
-            (1, 3): 1,
-            (2,): 4,
-        }
-    )
-
-
 def test_compute_size1_restickify_layout_indirect_access():
     """Indirect-access tensors (x[i]) must not return None from compute_size1_restickify_layout.
 
@@ -880,7 +853,8 @@ def test_compute_size1_restickify_layout_indirect_access():
     host_layout = FixedLayout(torch.device("spyre"), torch.float16, [512], [1])
     # dep.ranges is empty: tmp0 is an indirect symbol, not a loop variable.
     dep = MemoryDep("x", tmp0, (), ())
-    stl = SpyreTensorLayout([8, 64], [64, 1], torch.float16, [0, 1])
+    # 512 elements as 8 sticks of 64: device [8, 64].
+    stl = SpyreTensorLayout([512], torch.float16)
     # Host coordinate for the single dim is the indirect symbol itself.
     ic = [tmp0]
     # Device coords: outer = which stick, inner = position within stick.
@@ -893,7 +867,7 @@ def test_compute_size1_restickify_layout_indirect_access():
 
     # Must not return None: the indirect symbol is a valid dimension, not broadcast.
     assert result is not None
-    # The old stick's 512 host elements stay on dim 0; a size-1 dim is inserted
-    # after it and the one-element stick maps to no host stride.
-    assert list(result.device_size) == [512, 1, 64]
-    assert list(result.stride_map) == [1, -1, -1]
+    # The old stick's 512 host elements stay on dim 0 and the one-element stick
+    # maps to no host stride.
+    assert list(result.device_size) == [512, 64]
+    assert list(result.stride_map) == [1, -1]

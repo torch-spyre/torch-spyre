@@ -2826,8 +2826,8 @@ def compute_size1_restickify_layout(
     # Reuse a device dim of size 1 whose coordinate is the literal 0 (a real size-1
     # dim, or padding). A larger dim can also read as 0 when the access is pinned
     # to its first entry (e.g. x[0] of a [64, 128] tensor); reusing it would drop
-    # the rest of the buffer from the layout. Without one, a size-1 device dim is
-    # inserted after the old outer dim (see _insert_size1_device_dim).
+    # the rest of the buffer from the layout. Without one, the old stick's
+    # elements take over its own outer dim, one element per stick.
     new_sd_outer_dim = next(
         (
             j
@@ -2838,16 +2838,6 @@ def compute_size1_restickify_layout(
         ),
         old_sd_outer_dim,
     )
-    if old_sd_outer_dim == new_sd_outer_dim:
-        # No size-1 device dim to reuse: insert one right after the old outer dim.
-        # The old stick's elements stay on that outer dim (old_sd_host_size) and
-        # the one-element stick moves onto the new dim, as in the layout that
-        # SpyreTensorLayout gives the host shape with a trailing size-1 dim.
-        dev_size, dev_stride = _insert_size1_device_dim(
-            stl, old_sd_outer_dim, old_sd_host_size, old_sd_host_stride
-        )
-        new_ve = _insert_size1_valid_elements(stl, old_sd_outer_dim, old_sd_host_size)
-        return SpyreTensorLayout(dev_size, dev_stride, stl.device_dtype, new_ve)
     # A size-1 dim has one element and maps to no host stride, as in
     # dim_map_to_stride_map in spyre_tensor_impl.cpp.
     device_size = restickify_device_size(
@@ -2866,61 +2856,29 @@ def compute_size1_restickify_layout(
         -1,
         stick_size,
     )
-    new_ve = restickify_valid_elements(
-        stl,
-        old_sd_outer_dim,
-        old_sd_host_size,
-        new_sd_outer_dim,
-        1,
-    )
+    if old_sd_outer_dim == new_sd_outer_dim:
+        # Synthetic size-1 dim reuses the old outer slot: the stick group keeps
+        # its key but its count becomes 1 (one element per stick).
+        stick_dim = len(stl.device_size) - 1
+        old_stick_key = next((k for k in stl.valid_elements if stick_dim in k), None)
+        # No stick group (extents unknown): nothing to update, so stay unknown.
+        new_ve = (
+            {}
+            if old_stick_key is None
+            else {
+                k: (1 if k == old_stick_key else v)
+                for k, v in stl.valid_elements.items()
+            }
+        )
+    else:
+        new_ve = restickify_valid_elements(
+            stl,
+            old_sd_outer_dim,
+            old_sd_host_size,
+            new_sd_outer_dim,
+            1,
+        )
     return SpyreTensorLayout(device_size, stride_map, stl.device_dtype, new_ve)
-
-
-def _insert_size1_device_dim(
-    stl: SpyreTensorLayout, outer: int, outer_size: int, outer_stride: int
-) -> tuple[list[int], list[int]]:
-    """Device size and stride map with a size-1 dim inserted after ``outer``.
-
-    ``outer`` holds the old stick's elements (``outer_size``, ``outer_stride``).
-    The new size-1 dim sits at ``outer + 1`` and the stick is last, both with
-    stride -1 (no host stride, one element per stick).
-    """
-    device_size = list(stl.device_size)
-    stride_map = list(stl.stride_map)
-    device_size[outer] = outer_size
-    stride_map[outer] = outer_stride
-    device_size.insert(outer + 1, 1)
-    stride_map.insert(outer + 1, -1)
-    stride_map[-1] = -1
-    return device_size, stride_map
-
-
-def _insert_size1_valid_elements(
-    stl: SpyreTensorLayout, outer: int, outer_size: int
-) -> dict[tuple[int, ...], int]:
-    """valid_elements after _insert_size1_device_dim.
-
-    Dims at or above ``outer`` shift up by one. Keys touching the old outer dim
-    or the stick are split: the outer dim keeps ``outer_size`` and the new
-    size-1 dim joins the stick with a count of 1, so the product of counts still
-    equals the host extents. Other dims split out with count 1.
-    """
-    stick_dim = len(stl.device_size) - 1
-    touched = {outer, stick_dim}
-
-    def shift(d: int) -> int:
-        return d if d <= outer else d + 1
-
-    result: dict[tuple[int, ...], int] = {}
-    for key, val in stl.valid_elements.items():
-        if touched.isdisjoint(key):
-            result[tuple(shift(d) for d in key)] = val
-        else:
-            for d in set(key) - touched:
-                result[(shift(d),)] = 1
-    result[(outer,)] = outer_size
-    result[(outer + 1, len(stl.device_size))] = 1
-    return result
 
 
 def stick_compatible(coords: "list[list[sympy.Expr]]") -> bool:
