@@ -29,7 +29,6 @@
 #include <cstdlib>     // std::getenv
 #include <filesystem>  // NOLINT(build/c++17)
 #include <flex/flex.hpp>
-#include <flex/memory_interface/pool_lifecycle.hpp>
 #include <iostream>
 #include <map>
 #include <memory>
