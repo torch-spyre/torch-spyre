@@ -549,6 +549,114 @@ def spyre_constant_tensor(const_val, device, dtype=torch.float16):
         return t
 
 
+# Smallest coordinate buffer built, in elements.  Growth starts here and
+# doubles, so every cached length is a whole number of sticks at either served
+# width and a shorter request slices out of one without narrowing a stick.  Set
+# above one stick because a coordinate is small next to what reads it: 256
+# elements is 512 bytes at fp16, and starting there spares the doublings a mask
+# of ordinary extent would otherwise walk through on its first pass.
+_ARANGE_SEED_LEN = 256
+
+# Longest coordinate kept, per form.  A cached buffer lives for the process, so
+# without a bound one long request would pin its memory for good.  A longer
+# request is still built on device, at its exact length, but not kept.  The
+# column is the costly form: a ``[N, 1]`` buffer spends a whole stick on each
+# element (128 bytes), against 2 or 4 for the ramp.  Its readers are mask rows,
+# which float16 and bfloat16 tile into blocks of at most 1024, so a few blocks'
+# worth covers them; the ramp's bound is 4 MB at float32.  Both are a seed
+# multiple by a power of two, so growth by doubling lands on them exactly.
+_ARANGE_MAX_LEN = {False: 1 << 20, True: 1 << 13}
+
+# One entry per (device, dtype, form), each holding the longest coordinate built
+# so far, up to its form's ``_ARANGE_MAX_LEN``.  Requests shorter than that are
+# served as slices, so an entry only ever grows: a coordinate buffer is a
+# prefix of every longer one, which a per-length cache cannot exploit.  The
+# ramp and the column are kept apart so a plain ``arange`` never builds the
+# costlier column.
+_ARANGE_TENSOR_CACHE: dict[tuple, tuple[int, torch.Tensor]] = {}
+
+
+def clear_arange_tensor_cache():
+    """Release every cached coordinate buffer.
+
+    Companion to ``clear_constant_tensor_cache`` for test isolation: a cached
+    coordinate outlives ``torch.compiler.reset()`` the same way a scalar
+    constant does.
+    """
+    _ARANGE_TENSOR_CACHE.clear()
+
+
+def _build_arange_tensor(length, device, dtype, column):
+    host = torch.arange(length, dtype=dtype)
+    if column:
+        host = host.unsqueeze(-1).clone()
+    return host.to(device)
+
+
+def spyre_arange_tensor(length, device, dtype=torch.float16, column=False):
+    """A cached coordinate of ``length``: the ramp, or a mask's row coordinate.
+
+    ``column=False`` gives the ``[length]`` ramp ``[0, length)``; ``column=True``
+    gives the ``[length, 1]`` form ``out[i][0] = i``.  The column is a distinct
+    buffer rather than a view of the ramp because a ``[N]`` vector admits exactly
+    one device layout (stick on its only dim), leaving ``ramp[:, None]`` against
+    ``ramp[None, :]`` with no feasible assignment.
+
+    WARNING: returns a view of a buffer shared across every forward pass, which
+    MUST NEVER be mutated in place.  Inductor upholds this via
+    ``SpyreArangeFallback.should_allocate() == False`` and its empty
+    ``get_mutation_names()``; any pass that changes that contract must update
+    this function.
+
+    The slice is taken here rather than left to the caller because
+    ``SpyreArangeFallback`` declares its device layout from the requested
+    length, so the result must be exactly that long while the buffer behind it
+    may be longer.  Slicing the column's leading dim keeps its trailing stick
+    dim whole.
+
+    Each form keeps only its longest request, up to ``_ARANGE_MAX_LEN``, and a
+    shorter one is served as a slice of it.  A request past that bound is built
+    afresh on every call and not kept.
+    """
+    if isinstance(device, str):
+        device = torch.device(device)
+    if device.type != "spyre":
+        # Reached only from generated wrapper code, which emits the device the
+        # node was laid out for.
+        raise ValueError(f"spyre_arange_tensor requires a spyre device, got {device}")
+
+    length = int(length)
+    column = bool(column)
+    max_len = _ARANGE_MAX_LEN[column]
+    if length > max_len:
+        return _build_arange_tensor(length, device, dtype, column)
+
+    cache_key = ((device.type, device.index), dtype, column)
+
+    with _CACHE_LOCK:
+        cached = _ARANGE_TENSOR_CACHE.get(cache_key)
+
+    if cached is None or cached[0] < length:
+        # Build outside the lock: the host arange and the H2D copy are the
+        # expensive part and need no exclusion, and a duplicate build on a race
+        # is wasteful but correct.
+        grown = _ARANGE_SEED_LEN
+        while grown < length:
+            grown *= 2
+        entry = (grown, _build_arange_tensor(grown, device, dtype, column))
+
+        with _CACHE_LOCK:
+            cached = _ARANGE_TENSOR_CACHE.get(cache_key)
+            if cached is None or cached[0] < grown:
+                # A shorter entry is replaced rather than kept: any slice already
+                # handed out keeps its own reference, so the old buffer lives
+                # exactly as long as it is still read.
+                _ARANGE_TENSOR_CACHE[cache_key] = entry
+                cached = entry
+
+    return cached[1][:length]
+
+
 def find_unimplemented(specs: list) -> UnimplementedOp | None:
     """Return the first UnimplementedOp in specs (recursing into LoopSpec), or None."""
     for entry in specs:

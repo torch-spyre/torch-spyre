@@ -4926,7 +4926,35 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "end": (64.0,),
                 "start_end": (64.0, 128.0),
                 "start_end_step": (0.0, 128.0, 2.0),
+                # float32 is what the dtype-less spelling resolves to.
+                "end_fp32": (64.0, torch.float32),
+                "start_end_step_fp32": (5.0, 133.0, 3.0, torch.float32),
+                "end_bf16": (256.0, torch.bfloat16),
+                # An integer type computes in float32 and converts once, so any
+                # length is served, including one that ends inside a stick.
+                "end_int64": (64, torch.int64),
+                "start_end_int64": (5, 69, torch.int64),
+                "start_end_step_int64": (0, 192, 3, torch.int64),
+                "end_int64_part_stick": (65, torch.int64),
+                "start_end_int64_part_stick": (5, 64, torch.int64),
+                "end_int32": (64, torch.int32),
+                "start_end_step_int32": (-5, 60, 3, torch.int32),
+                "end_int32_part_stick": (10, torch.int32),
+                "start_end_int64_past_2p24": (2**24 - 64, 2**24 + 64, torch.int64),
+                "start_end_step_int32_past_2p24": (
+                    0,
+                    2**24 + 2**16 + 1,
+                    2**16,
+                    torch.int32,
+                ),
             },
+            # TODO: past 2**24 float32 no longer holds every integer, so an integer
+            # arange there is refused rather than rounded; serving it needs integer
+            # arithmetic on device.
+            "expect_raise": dict.fromkeys(
+                ["start_end_int64_past_2p24", "start_end_step_int32_past_2p24"],
+                "the float32 it computes in cannot hold exactly",
+            ),
         },
         (
             "test_empty_like",
@@ -5791,10 +5819,71 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             }
         },
+        ("test_tril_bool", "test_tril_bool_cpu"): {
+            "ops_dict": {
+                "tril": lambda b: b.tril(),
+                "triu1": lambda b: b.triu(1),
+            },
+            "param_sets": {
+                # A bool from the host or from a float16 compare is stored in the
+                # float16 format, which the mask is built in.
+                "host_64": ("host", 64),
+                "host_unaligned": ("host", 70),
+                "host_multi_block": ("host", 1100),
+                "f16cmp_64": ("f16cmp", 64),
+                "f16cmp_unaligned": ("f16cmp", 70),
+                # A bool from a float32 or integer compare is stored in the float32
+                # format, which the decomposition cannot see.
+                "f32cmp_64": ("f32cmp", 64),
+                "i32cmp_64": ("i32cmp", 64),
+                "f32cmp_unaligned": ("f32cmp", 70),
+            },
+            "expect_fail": {
+                case: "a float32-format bool converts to a staggered float16, which "
+                "the standard float16 mask is multiplied with without refusing "
+                "it (wrong values); fixed once #5495 restores the arrangement"
+                for case in ("f32cmp_64", "i32cmp_64")
+            },
+            # TODO: serve it once #5495 lands; #5048 turns this refusal into the
+            # staggered multiply above.
+            "expect_raise": {"f32cmp_unaligned": "cannot rescale device layout"},
+        },
         ("test_tril", "test_tril_cpu"): {
             "param_sets": {
                 "2d": (cached_randn((64, 64)),),
                 "3d": (cached_randn((32, 64, 64)),),
+                # Past one stick, and past one mask block: 2048 needs the mask
+                # tiled from block-local coordinates, since a 2048-valued
+                # coordinate is not representable in DLFloat16.
+                "2d_128": (cached_randn((128, 128)),),
+                "2d_1024": (cached_randn((1024, 1024)),),
+                "2d_2048": (cached_randn((2048, 2048)),),
+                "2d_nonsquare": (cached_randn((2048, 1024)),),
+                # A partial trailing block, 1152 = 1024 + 128.
+                "2d_partial_block": (cached_randn((1152, 1152)),),
+                # A trailing extent that is not a whole number of sticks, served
+                # by rounding the stick dim up and slicing the mask back.
+                "2d_unaligned": (cached_randn((1000, 1032)),),
+                # float32 builds the mask from the same host ramp and comparison
+                # as float16, so both widths are served at any extent. Natively
+                # float32 on both operands, since an in-graph upcast is
+                # staggered and would compare an Element Arrangement rather
+                # than the mask.
+                "2d_fp32": (cached_randn((64, 64), dtype=torch.float32),),
+                "2d_fp32_unaligned": (cached_randn((100, 100), dtype=torch.float32),),
+                # bfloat16 holds integers exactly only to 256, which bounds a
+                # block's coordinates, not the values the mask keeps.
+                "2d_bf16": (cached_randn((64, 64), dtype=torch.bfloat16),),
+                "2d_bf16_unaligned": (cached_randn((100, 100), dtype=torch.bfloat16),),
+                "2d_bf16_multi_block": (
+                    cached_randn((512, 512), dtype=torch.bfloat16),
+                ),
+                # The integer types mask at float32, so a small payload
+                # round-trips exactly.
+                "2d_int64": (cached_randint((64, 64)),),
+                "2d_int64_unaligned": (cached_randint((100, 100)),),
+                "2d_int32": (cached_randint((64, 64), dtype=torch.int32),),
+                "2d_int32_unaligned": (cached_randint((100, 100), dtype=torch.int32),),
             }
         },
         ("test_triu", "test_triu_cpu"): {
@@ -5816,6 +5905,88 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     torch.full((64, 64), float("inf"), dtype=torch.float16),
                     1,
                 ),
+                "2d_2048": (
+                    cached_randn((2048, 2048)),
+                    0,
+                ),
+                "2d_partial_block": (
+                    cached_randn((1152, 1152)),
+                    0,
+                ),
+                # A trailing extent that is not a whole number of sticks, served
+                # by rounding the stick dim up and slicing the mask back.
+                "2d_unaligned_multiblock": (
+                    cached_randn((1000, 1032)),
+                    0,
+                ),
+                # A non-zero diagonal shifts the band off the block
+                # diagonal, so past one block it straddles a block column and
+                # every block carries its own local diagonal.
+                "2d_1024_diagonal": (
+                    cached_randn((1024, 1024)),
+                    5,
+                ),
+                "2d_2048_diagonal": (
+                    cached_randn((2048, 2048)),
+                    5,
+                ),
+                # float32 with a shifted band, so the ``sub`` on the column ramp
+                # runs at the wider element type too.
+                "2d_fp32_diagonal": (
+                    cached_randn((128, 128), dtype=torch.float32),
+                    3,
+                ),
+                # A shifted band runs the column ramp's ``sub`` at both types.
+                "2d_bf16_diagonal": (
+                    cached_randn((128, 128), dtype=torch.bfloat16),
+                    3,
+                ),
+                "2d_bf16_multi_block_diagonal": (
+                    cached_randn((512, 512), dtype=torch.bfloat16),
+                    -3,
+                ),
+                "2d_int64_diagonal": (
+                    cached_randint((128, 128)),
+                    3,
+                ),
+                "2d_int64_unaligned_diagonal": (
+                    cached_randint((100, 100)),
+                    -3,
+                ),
+                "2d_int32_diagonal": (
+                    cached_randint((128, 128), dtype=torch.int32),
+                    3,
+                ),
+            }
+        },
+        ("test_eye", "test_eye_cpu"): {
+            "param_sets": {
+                # eye is the same coordinate mask, keeping col == row, so the
+                # served extents follow tril's, with 2048 needing the mask tiled
+                # from block-local coordinates.
+                "64": (64,),
+                "1024": (1024,),
+                "2048": (2048,),
+                "nonsquare": (2048, 1024),
+                "nonsquare_wide": (1024, 2048),
+                # A partial trailing block, 1152 = 1024 + 128.
+                "partial_block": (1152,),
+                # Extents that are not a whole number of sticks, served by
+                # rounding the stick dim up and slicing the mask back.
+                "non_stick": (100,),
+                "non_stick_nonsquare": (1000, 1032),
+                # A trailing dtype selects the other served element types.
+                "bf16": (64, torch.bfloat16),
+                "bf16_non_stick": (100, torch.bfloat16),
+                "bf16_multi_block": (512, torch.bfloat16),
+                "int64": (64, torch.int64),
+                "int64_non_stick": (100, torch.int64),
+                "int32": (64, torch.int32),
+                "int32_non_stick": (100, torch.int32),
+                "fp32": (64, torch.float32),
+                # bool builds its mask in float16, the format it takes on device.
+                "bool": (64, torch.bool),
+                "bool_non_stick": (100, torch.bool),
             }
         },
         ("test_triu_int", "test_triu_int_cpu"): {
@@ -11434,8 +11605,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_flip_cpu(self, dims, x):
         # Spyre decomposes aten.flip into index_select gathers with a
-        # descending index (see spyre_flip); the arange building that index
-        # falls back to CPU, hence the filtered FallbackWarning.
+        # descending index (see spyre_flip).
         self.compare_with_cpu(lambda x: torch.flip(x, dims), x)
 
     def test_transpose_2d_cpu(self, dim0: int, dim1: int, x):
@@ -11796,12 +11966,47 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             f"All captured: {[str(w.message) for w in captured]}"
         )
 
-    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    @pytest.mark.filterwarnings("error::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_arange_cpu(self, *args):
-        def fn(device=None):
-            return torch.arange(*args, dtype=torch.float16, device=device)
+        # A trailing dtype is optional, so a bounds-only entry reads as float16.
+        if args and isinstance(args[-1], torch.dtype):
+            *bounds, dtype = args
+        else:
+            bounds, dtype = args, torch.float16
 
-        self.compare_with_cpu(fn, needs_device=True)
+        def fn(device=None):
+            return torch.arange(*bounds, dtype=dtype, device=device)
+
+        # A host-built ramp owes exact integers, not merely close ones.
+        self.compare_with_cpu(fn, needs_device=True, atol=0.0, rtol=0.0)
+
+    @pytest.mark.filterwarnings("error::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_arange_result_is_writable_cpu(self):
+        """``torch.arange`` owes its caller a tensor the caller may write to.
+
+        The coordinate behind it is cached and shared across calls, so a result
+        that aliased the cache would let one caller's write change what a later
+        call returns.  Two compiled calls with a mutation between them see the
+        aliasing if it is there: the second call reads the same cache entry.
+
+        Values stay at or below 1024 so the compare cannot trip on DLFloat16
+        rounding.
+        """
+
+        def fn(device=None):
+            return torch.arange(512.0, dtype=torch.float16, device=device)
+
+        compiled = torch.compile(fn, backend="inductor")
+        expected = fn()
+
+        first = compiled(device="spyre")
+        first.add_(1000.0)
+
+        second = compiled(device="spyre")
+        assert torch.equal(second.cpu(), expected), (
+            f"mutating an arange result changed a later call: "
+            f"max={second.cpu().max().item()} expected={expected.max().item()}"
+        )
 
     def test_empty_like_cpu(self, x):
         def fn(x):
@@ -12326,7 +12531,23 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         assert not torch.all(x_cpu == x_cpu[0]), "random_ produced all identical values"
         torch.testing.assert_close(x_cpu, y_cpu, rtol=0.0, atol=0.0)
 
-    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    @pytest.mark.filterwarnings("error::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_tril_bool_cpu(self, op, source, n):
+        """Bool tril/triu on device, the bool taken from ``source``."""
+        values = ((torch.arange(n * n) * 7) % 5).reshape(n, n)
+        if source == "host":
+            self.compare_with_cpu(op, values > 1, atol=0, rtol=0)
+            return
+        operand = {
+            "f16cmp": torch.float16,
+            "f32cmp": torch.float32,
+            "i32cmp": torch.int32,
+        }[source]
+        self.compare_with_cpu(
+            lambda t: op(t > 1), values.to(operand), atol=0, rtol=0, run_eager=False
+        )
+
+    @pytest.mark.filterwarnings("error::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_tril_cpu(self, x):
         def fn(input):
             return torch.tril(input)
@@ -12353,12 +12574,26 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         else:
             self.compare_with_cpu(fn, x, diagonal)
 
-    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    @pytest.mark.filterwarnings("error::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_triu_int_cpu(self, x, diagonal):
         def fn(input, diagonal):
             return torch.triu(input, diagonal)
 
         self.compare_with_cpu(fn, x, diagonal)
+
+    @pytest.mark.filterwarnings("error::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_eye_cpu(self, *args):
+        # A trailing dtype is optional, so a shape-only entry reads as float16.
+        if args and isinstance(args[-1], torch.dtype):
+            *shape, dtype = args
+        else:
+            shape, dtype = args, torch.float16
+
+        def fn(device=None):
+            return torch.eye(*shape, dtype=dtype, device=device)
+
+        # 0 and 1 are exact in every served type, so agreement is bit for bit.
+        self.compare_with_cpu(fn, needs_device=True, atol=0.0, rtol=0.0)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     @inductor_config.patch({"cpsat_time_limit_seconds": 30})
