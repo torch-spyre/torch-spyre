@@ -24,7 +24,6 @@ from torch._inductor.ir import (
     Pointwise,
     Reduction,
 )
-from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch.fx.traceback import NodeSource, NodeSourceAction
 from torch._inductor.ops_handler import WrapperHandler
@@ -39,9 +38,7 @@ from .pass_utils import (
     patch_env,
     find_fx_node,
 )
-from .constants import is_ea_compatible
 from .provenance import decompose_provenance
-from torch_spyre._C import SpyreTensorLayout, ElementArrangement
 from torch_spyre.constants import DEVICE_NAME
 
 logger = get_inductor_logger("split_multi_ops")
@@ -713,97 +710,6 @@ def _patch_original_buf(
             direct_inner_fn=direct_inner_fn,
         )
     V.graph.name_to_buffer[new_op.get_name()] = new_op
-
-
-def _get_op_name(op) -> str:
-    """Extract the operation name from a node for validation."""
-    if not hasattr(op.data, "origins") or not op.data.origins:
-        return ""
-
-    # Prefer the origin in the current lowering graph (subgraph-safe); fall back
-    # to an arbitrary origin when no graph context is available. That fallback
-    # may yield a parent-graph node for a subgraph buffer, which is safe *here*
-    # because this function only extracts a name string and never inserts into
-    # or mutates a graph. Do not gate graph-mutating logic on the result.
-    gl = V.graph
-    origin_node = None
-    if hasattr(gl, "graph"):
-        origin_node = origin_in_graph(op.data.origins, gl.graph)
-    if origin_node is None:
-        origin_node = next(iter(op.data.origins))
-
-    # Try to get the target and its name
-    target = getattr(origin_node, "target", None)
-    if target and hasattr(target, "name"):
-        full_name = target.name()
-        if "::" in full_name:
-            # Extract just the operation name (e.g., "add" from "aten::add.Tensor")
-            return full_name.split("::")[1].split(".")[0]
-        return full_name
-
-    # If we got here, just return the target as string
-    return str(target) if target else str(origin_node)
-
-
-def validate_ops(graph: GraphLowering) -> None:
-    """Validate inputs to ops have same ElementArrangement.
-
-    This pass need to be run after propagate_spyre_tensor_layouts so that it
-    has all the required SpyreTensorLayouts.
-    """
-    for op in graph.operations:
-        if not hasattr(op, "data"):
-            continue
-        if not isinstance(op.data, Pointwise):
-            continue
-
-        read_writes = op.get_read_writes()
-        inputs = [r for r in read_writes.reads if isinstance(r, MemoryDep)]
-
-        # Exclude single input ops
-        if len(inputs) <= 1:
-            continue
-
-        layouts = []
-        input_names = []
-        for inp in inputs:
-            buf = V.graph.get_buffer(inp.name)
-            # Skip buffers without layouts
-            if not hasattr(buf, "layouts"):
-                continue
-            for layout in buf.layouts:
-                if isinstance(layout, SpyreTensorLayout):
-                    layouts.append(layout)
-                    input_names.append(inp.name)
-
-        if len(layouts) <= 1:
-            continue
-
-        op_name = _get_op_name(op)
-
-        # Check ElementArrangement compatibility
-        stl_eas = [layout.element_arrangement for layout in layouts]
-
-        # Skip ops with special ElementArrangement e.g. layernormnorm/scale with ElementArrangement.EXX2
-        skip_ops = {"layernormnorm", "layernormscale"}
-        skip_eas = {ElementArrangement.EXX2}
-        if op_name in skip_ops and any(ea in skip_eas for ea in stl_eas):
-            continue
-
-        # Valid EA patterns (see is_ea_compatible):
-        # 1. All operands share one EA.
-        # 2. Exactly one distinct non-STANDARD EA (not EXX2) mixed with STANDARD
-        #    operands (the broadcast pattern).
-        if not is_ea_compatible(stl_eas):
-            args_str = ", ".join(
-                f'"{name}": {ea}' for name, ea in zip(input_names, stl_eas)
-            )
-            raise Unsupported(
-                f"Incompatible ElementArrangement in multi-arg op. "
-                f"Valid patterns: all inputs share one EA, or one non-STANDARD EA "
-                f"broadcast against STANDARD inputs. "
-                f"op: {op_name}, args: {args_str}"
-            )
 
 
 def _validate_split_supported(op, trace, intermediate_ops) -> None:
