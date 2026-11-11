@@ -1158,6 +1158,14 @@ def align_tensors_pure(
                 bases[v] = int(basis)
                 new_op_it_space_splits[v] = math.gcd(div, basis)
                 div //= new_op_it_space_splits[v]
+            if div != 1:
+                # The split segments cannot absorb the whole work division, so
+                # the division of this iteration-space dim would change.
+                raise Unsupported(
+                    f"Work division {op_it_space_splits.get(var, 1)} of {var} "
+                    f"cannot be preserved when splitting it into "
+                    f"{[(v, bases[v]) for v in remap[var]]}"
+                )
             work_division_remap[var] = tuple((v, bases[v]) for v in remap[var])
         else:
             # no splits keep existing var, range, and work division
