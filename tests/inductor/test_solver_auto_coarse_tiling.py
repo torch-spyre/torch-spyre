@@ -33,6 +33,7 @@ from unittest.mock import MagicMock, patch
 
 from torch._inductor import config as t_inductor_config
 from torch._inductor.dependencies import MemoryDep
+from torch._inductor.exc import InductorError
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import ComputedBuffer, FlexibleLayout, Pointwise, Reduction
 from torch._inductor.virtualized import V
@@ -46,6 +47,8 @@ from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.loop_info import CoarseTileInfo
 from torch_spyre._inductor.pass_utils import PerCoreView
+
+from utils_inductor import expects_raise
 from torch_spyre._inductor.loop_node import all_ops
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 from torch_spyre._inductor.scratchpad import sa_cooptimizer as sa
@@ -1002,6 +1005,35 @@ class TileOwnershipGroupingTests(unittest.TestCase):
         ):
             self._compile(lambda x, y: (x + y).repeat(1, 2, 1) * 2, (x, y))
         self.assertIn("more than once along", str(refusal.exception))
+
+    @expects_raise
+    def test_apply_refuses_a_nested_tiling(self):
+        """A two-level choice makes one group with two loop levels, and the
+        lowering builds one standalone loop per group (#6088). The search is
+        bounded to one level (``MAX_SEARCH_TILE_DEPTH``); forcing a nest checks the
+        apply itself.
+
+        TODO: when nested loops are supported this becomes a positive test."""
+        x = torch.randn(64, 64, 128, dtype=torch.float16)
+        y = torch.randn(64, 64, 128, dtype=torch.float16)
+        nested = TileSpec(
+            (TileAxis(host_dim=0, count=2), TileAxis(host_dim=1, count=2))
+        )
+
+        def chosen(graph, allocation):
+            return {
+                op.get_operation_name(): nested
+                for op in graph.operations
+                if isinstance(op, ComputedBuffer)
+            }
+
+        with (
+            patch(_CHOSEN_TILINGS, chosen),
+            self.assertRaises(InductorError) as refusal,
+        ):
+            self._compile(lambda x, y: (x + y) * 2, (x, y))
+        self.assertIn("nested loop tiling is not supported", str(refusal.exception))
+        self.assertIn("#6088", str(refusal.exception))
 
     def test_apply_accepts_a_consumer_that_reads_in_step(self):
         x = torch.randn(64, 64, 128, dtype=torch.float16)
