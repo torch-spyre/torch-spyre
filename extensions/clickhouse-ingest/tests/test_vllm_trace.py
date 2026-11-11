@@ -19,6 +19,7 @@ import shutil
 from pathlib import Path
 
 import pytest
+import regex as re
 from spyre_clickhouse_ingest import benchmeta, vllm_trace
 from spyre_clickhouse_ingest.__main__ import main as cli
 from spyre_clickhouse_ingest.identity import benchmark_id_for
@@ -439,3 +440,128 @@ def test_benchmeta_flatten_swallows_malformed_data():
     assert benchmeta.flatten("compile_summary", {"total_s": 4}) == {
         "compile_total_s": "4"
     }
+
+
+def _encodes(rows, duration=None):
+    """Push the insert's numeric columns through clickhouse-connect's real native encoder."""
+    from clickhouse_connect.datatypes.registry import get_from_name
+    from clickhouse_connect.driver.insert import InsertContext
+    from clickhouse_connect.driver.transform import NativeTransform
+
+    cols = [("UInt32", [r["iterations"] for r in rows])]
+    cols += [("Array(Float64)", [v for r in rows for v in r["measurements"].values()])]
+    if duration is not None:
+        cols.append(("Float32", [duration]))
+    for typ, data in cols:
+        ctx = InsertContext("t", ["c"], [get_from_name(typ)], data=[[x] for x in data])
+        ctx.compression = None
+        list(NativeTransform().build_insert(ctx))
+        assert ctx.insert_exception is None, (typ, ctx.insert_exception)
+
+
+BAD_COUNTS = [-5, 1e300, 10**400, 2**32, float("nan"), True, "7", None]
+
+
+@pytest.mark.parametrize("bad", BAD_COUNTS)
+def test_an_out_of_range_count_is_stored_as_zero_and_the_row_survives(bad):
+    ctx = fleet_ctx()
+    good = vllm_trace.entries(ctx)
+    ctx["res"]["phases"]["decode"]["n_samples"] = bad
+    ctx["res"]["steps"]["decode"]["n"] = bad
+    ctx["roof"]["kernels"][0]["calls"] = bad
+    ctx["res"]["compile"]["by_pass"] = {"p": {"self_s": 1.0, "n": bad}}
+    rows = vllm_trace.entries(ctx)
+    _encodes(rows, vllm_trace._duration(ctx))
+    assert (
+        len(rows) == len(good) - 2
+    )  # the fleet's other two compile passes are replaced
+    named = {r["name"].split(":", 1)[1]: r["iterations"] for r in rows}
+    assert named["phase:decode"] == 0 and named["compile:p"] == 0
+
+
+def test_the_largest_uint32_count_is_kept():
+    ctx = fleet_ctx()
+    ctx["res"]["phases"]["decode"]["n_samples"] = 2**32 - 1
+    rows = {r["name"].split(":", 1)[1]: r for r in vllm_trace.entries(ctx)}
+    assert rows["phase:decode"]["iterations"] == 2**32 - 1
+    _encodes(list(rows.values()))
+
+
+def test_a_huge_total_duration_is_stored_as_zero():
+    ctx = fleet_ctx()
+    for p in ctx["res"]["phases"].values():
+        p["wall_s"] = 1e308
+    assert vllm_trace._duration(ctx) == 0.0
+    _encodes([], vllm_trace._duration(ctx))
+
+
+def test_a_bom_in_the_analyzed_json_does_not_lose_the_file(tmp_path):
+    run, ana = _fleet_copy(tmp_path)
+    p = ana / "w1.res.json"
+    p.write_bytes(b"\xef\xbb\xbf" + p.read_bytes())
+    assert _counts(vllm_trace.entries(vllm_trace.load(run, ana, "w1"))) == _counts(
+        vllm_trace.entries(fleet_ctx())
+    )
+
+
+def test_a_non_utf8_or_deeply_nested_file_is_skipped_with_a_warning_naming_it(
+    tmp_path, caplog
+):
+    run, ana = _fleet_copy(tmp_path)
+    (ana / "w1.res.json").write_bytes(b'{"phases": "\xff\xfe"}')
+    (ana / "w1.host.json").write_text("[" * 200000)
+    ctx = vllm_trace.load(run, ana, "w1")
+    assert _counts(vllm_trace.entries(ctx)).get("trace_kernel")
+    assert "w1.res.json" in caplog.text and "w1.host.json" in caplog.text
+
+
+@pytest.mark.parametrize("label", ["../x", "a/b", "a\\b", "x\0y", "a..b"])
+def test_an_unsafe_label_is_rejected(label):
+    with pytest.raises(vllm_trace.TraceError, match="unsafe label"):
+        vllm_trace.load(FLEET / "out" / "w1", FLEET / "rep", label)
+
+
+def test_an_unsafe_manifest_label_is_rejected(tmp_path):
+    run, ana = _fleet_copy(tmp_path)
+    (run / "manifest.json").write_text(json.dumps({"label": "../../etc"}))
+    with pytest.raises(vllm_trace.TraceError, match="unsafe label"):
+        vllm_trace.load(run, ana)
+
+
+def test_a_duplicate_kernel_keeps_its_first_row_and_warns(caplog):
+    ctx = fleet_ctx()
+    k = ctx["roof"]["kernels"][0]
+    ctx["roof"]["kernels"].append({**k, "calls": 99, "median_us": 1.0})
+    rows = [
+        r
+        for r in vllm_trace.entries(ctx)
+        if r["props"]["record_type"] == "trace_kernel"
+    ]
+    assert len(rows) == 4 and len({r["name"] for r in rows}) == 4
+    assert (
+        next(r for r in rows if r["props"]["kernel_name"] == k["key"])["iterations"]
+        == k["calls"]
+    )
+    assert "Duplicate" in caplog.text
+
+
+def test_dry_run_without_an_arch_says_it_is_unresolved(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("CLICKHOUSE_HOST", raising=False)
+    run, ana = _fleet_copy(tmp_path)
+    art = json.loads((run / "spyre_artifact.json").read_text())
+    art.pop("arch")
+    (run / "spyre_artifact.json").write_text(json.dumps(art))
+    rc = cli(
+        ["vllm-trace", str(run), "--analyzed", str(ana), "--label", "w1", "--dry-run"]
+    )
+    report = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert rc == 0 and report["run_id"] == "" and report["arch"] == "unresolved"
+
+
+def test_the_verdict_view_excludes_exactly_the_record_types():
+    sql = (
+        Path(__file__).parents[1] / "schema" / "62-benchmark-verdicts.sql"
+    ).read_text()
+    m = re.search(r"record_type NOT IN \(([^)]*)\)", sql)
+    assert m and tuple(re.findall(r"'([^']+)'", m[1])) == vllm_trace.RECORD_TYPES
+    assert set(vllm_trace.RECORD_TYPES) == set(TRACE_TYPES)

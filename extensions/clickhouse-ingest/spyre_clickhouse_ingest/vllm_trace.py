@@ -21,6 +21,10 @@ host_timeline; any subset) and, from the run dir, the artifact (`spyre_artifact.
 flags), the env fingerprint and an optional `kernel_cost*.jsonl`. Raw traces are not analyzed here.
 Rows: record_type trace_phase | trace_step | trace_kernel | compile_pass, linked to the artifact
 by a performance verdict, as vllm.py's rows are.
+Counts outside UInt32 are stored as 0 (not stated); a duplicate (phase, kernel) keeps its first row.
+Re-ingesting under the same `<id12>:<label>` reports 'duplicate' even if the workload differs, and a
+failure after the first 5000-row batch leaves a partial run that later reads as duplicate (the shared
+writer's behaviour).
 """
 
 import argparse
@@ -41,6 +45,11 @@ from .identity import RunId
 log = logging.getLogger(__name__)
 
 REPORT_KIND = "vllm-trace"
+# schema/62-benchmark-verdicts.sql excludes exactly these from the regression verdicts.
+RECORD_TYPES = ("trace_phase", "trace_step", "trace_kernel", "compile_pass")
+RT_PHASE, RT_STEP, RT_KERNEL, RT_COMPILE = RECORD_TYPES
+MAX_COUNT = 2**32 - 1  # iterations is UInt32
+MAX_F32 = 3.4e38  # artifact_results.duration_s is Float32
 BACKEND = "spyre"
 COMPONENT = "spyre-inference"
 # Workload and engine limits are in every hash: they change the compiled programs. Unknown limits hash empty.
@@ -113,8 +122,9 @@ def _f(v: Any) -> float | None:
 
 
 def _n(v: Any) -> int:
+    """A count for the UInt32 `iterations`; 0 (not stated) for anything outside 0..2**32-1."""
     x = _f(v)
-    return int(x) if x is not None else 0
+    return int(x) if x is not None and 0 <= x <= MAX_COUNT else 0
 
 
 def _dict(v: Any) -> dict:
@@ -128,7 +138,7 @@ def _list(v: Any) -> list:
 def _json(path: Path) -> Any:
     """The parsed file; None when unreadable, since every file here describes a run and never decides one."""
     try:
-        return json.loads(path.read_text())
+        return json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError, RecursionError) as err:
         log.warning("Unreadable %s (%s) — skipped", path, err)
         return None
@@ -202,7 +212,8 @@ def _run_utc(run: Path) -> str:
         p = d / "phases.jsonl"
         if p.is_file():
             try:
-                t = json.loads(p.read_text().splitlines()[0])["t"]
+                with p.open(encoding="utf-8-sig", errors="replace") as fh:
+                    t = json.loads(fh.readline())["t"]
                 return datetime.fromtimestamp(t, timezone.utc).strftime(
                     "%Y-%m-%d %H:%M:%S"
                 )
@@ -221,22 +232,19 @@ def _predicted(run: Path) -> dict[str, float]:
     )
     for path in sorted(paths):
         try:
-            lines = Path(path).read_text().splitlines()
-        except (OSError, ValueError):
+            with open(path, encoding="utf-8-sig", errors="replace") as fh:
+                for line in fh:
+                    try:
+                        r = _dict(json.loads(line))
+                    except (ValueError, RecursionError):
+                        continue
+                    cost = _dict(r.get("cost"))
+                    key = r.get("provenance_key") or r.get("key")
+                    x = _f(cost.get("predicted_us"))
+                    if isinstance(key, str) and key and x is not None:
+                        out[key] = x
+        except OSError:
             continue
-        for line in lines:
-            try:
-                r = _dict(json.loads(line))
-            except (ValueError, RecursionError):
-                continue
-            cost = _dict(r.get("cost"))
-            key = r.get("provenance_key") or r.get("key")
-            if (
-                isinstance(key, str)
-                and key
-                and (x := _f(cost.get("predicted_us"))) is not None
-            ):
-                out[key] = x
     return out
 
 
@@ -286,7 +294,9 @@ def load(run_dir, analyzed=None, label="", **workload) -> dict:
         _dict(_json(run / "manifest.json")) if (run / "manifest.json").is_file() else {}
     )
     # Harness bundles all sit in a dir named `trace`: their manifest names the run.
-    label = label or manifest.get("label") or run.name
+    label = str(label or manifest.get("label") or run.name)
+    if not label or "/" in label or "\\" in label or ".." in label or "\0" in label:
+        raise TraceError(f"unsafe label {label!r}: no path separators, '..' or NUL")
     found = {}
     for kind in ("res", "roof", "host"):
         for p in (ana / f"{label}.{kind}.json", ana / f"{kind}.json"):
@@ -427,10 +437,15 @@ def entries(ctx: dict, bundle_url: str = "") -> list[dict]:
     }
     rprops = run_props(ctx, bundle_url)
     out: list[dict] = []
+    seen: set[str] = set()
 
     def add(suffix, props, measurements, iterations=0, extra=None):
         if not measurements:
             return
+        if suffix in seen:
+            log.warning("Duplicate %s:%s — first row kept", config, suffix)
+            return
+        seen.add(suffix)
         props = {**shared, **props}
         out.append(
             {
@@ -439,7 +454,7 @@ def entries(ctx: dict, bundle_url: str = "") -> list[dict]:
                 "backend": BACKEND,
                 "props": props,
                 "measurements": measurements,
-                "iterations": int(iterations),
+                "iterations": _n(iterations),
                 "run_props": {**rprops, "run_mode": props["run_mode"], **(extra or {})},
                 "disc": props,
                 "disc_keys": ID_KEYS,
@@ -452,7 +467,7 @@ def entries(ctx: dict, bundle_url: str = "") -> list[dict]:
             continue
         add(
             f"phase:{phase}",
-            {"record_type": "trace_phase", "run_mode": "trace", "phase": phase},
+            {"record_type": RT_PHASE, "run_mode": "trace", "phase": phase},
             _measure(p, PHASE_FIELDS),
             _n(p.get("n_samples")),
             _extra(
@@ -493,7 +508,7 @@ def entries(ctx: dict, bundle_url: str = "") -> list[dict]:
         }
         add(
             f"step:{kind}",
-            {"record_type": "trace_step", "run_mode": kind, "phase": kind},
+            {"record_type": RT_STEP, "run_mode": kind, "phase": kind},
             m,
             _n(s.get("n")),
             _extra(
@@ -520,7 +535,7 @@ def entries(ctx: dict, bundle_url: str = "") -> list[dict]:
         add(
             f"{phase}:{key}",
             {
-                "record_type": "trace_kernel",
+                "record_type": RT_KERNEL,
                 "run_mode": phase,
                 "phase": phase,
                 "kernel_name": key,
@@ -544,11 +559,20 @@ def entries(ctx: dict, bundle_url: str = "") -> list[dict]:
         x = _f(self_s)
         add(
             f"compile:{pname}",
-            {"record_type": "compile_pass", "run_mode": "trace", "pass": pname},
+            {"record_type": RT_COMPILE, "run_mode": "trace", "pass": pname},
             {"self_s": [x]} if x is not None else {},
             _n(n),
         )
     return out
+
+
+def _duration(ctx: dict) -> float:
+    total = sum(
+        x
+        for p in _dict(ctx["res"].get("phases")).values()
+        if (x := _f(_dict(p).get("wall_s"))) is not None
+    )
+    return total if math.isfinite(total) and total <= MAX_F32 else 0.0
 
 
 def write(client, db: str, component: str, rid: str, rows: list[dict]) -> int:
@@ -656,10 +680,22 @@ def main(argv=None) -> int:
         return 2
     key = args.run_key or f"{art.get('id12') or aid[:12]}:{ctx['label']}"
     rid = RunId.derive(REPORT_KIND, key, arch, "perf")
+    if not rid and client:
+        print(
+            json.dumps(
+                {
+                    "status": "rejected",
+                    "reason": "arch unresolved: no arch in the artifact block",
+                }
+            )
+        )
+        return 2
     report = {
         "run_id": rid, "artifact_id": aid, "artifact_checked": bool(client), "report_kind": REPORT_KIND,
         "rows": dict(sorted(Counter(r["props"]["record_type"] for r in rows).items())),
     }  # fmt: skip
+    if not rid:
+        report["arch"] = "unresolved"
     if client and not tables_present(
         client, db, tables=(BENCHMARKS, BENCHMARK_RUNS, ARTIFACT_RESULTS)
     ):
@@ -677,9 +713,7 @@ def main(argv=None) -> int:
     n = write(out, db, component, rid, rows)
     insert_artifact_result(
         out, db, artifact_id=aid, run_id=rid, test_type="perf", state="passed", arch=arch,
-        result_kind="performance", duration_s=sum(
-            x for p in _dict(ctx["res"].get("phases")).values() if (x := _f(_dict(p).get("wall_s"))) is not None
-        ),
+        result_kind="performance", duration_s=_duration(ctx),
         props={"source": REPORT_KIND, "trace_bundle_url": args.trace_bundle_url},
     )  # fmt: skip
     if args.dry_run:
