@@ -24,15 +24,18 @@ instead of an ``L x L`` score matrix::
 The op computes the unnormalized part of this (``S`` and ``phi(q) S``) in
 chunks. This script shows the three things a caller owns:
 
-1. the feature map (``elu(x) + 1``, applied on the host here because ``elu`` is
-   not a listed Spyre op),
+1. the feature map (``elu(x) + 1``), computed on the device inside the compiled
+   region. ``F.elu`` does not compile for Spyre because Inductor decomposes it
+   through ``expm1``, which Spyre has no kernel for, so the feature map is
+   written with ``exp``, ``minimum`` and ``relu``,
 2. the normalizer, computed in the *same* op call by appending a block of ones
    to ``V`` so the last ``STICK`` columns of the output are ``phi(q) z``, and
 3. continuing a sequence by feeding one call's ``final_state`` into the next,
    which is how chunked prefill and token-by-token decode work.
 
 It compares the compiled Spyre result against a float64 quadratic-form
-reference on CPU. It requires a Spyre device to run.
+reference on CPU that uses ``F.elu`` directly. It requires a Spyre device to
+run.
 """
 
 import torch
@@ -48,17 +51,29 @@ EPS = 1e-3
 
 
 def feature_map(x):
-    """Positive feature map from Katharopoulos et al. (2020)."""
-    return F.elu(x) + 1.0
+    """``elu(x) + 1`` (alpha = 1), the positive feature map of Katharopoulos et
+    al. (2020), built only from operations Spyre supports.
 
-
-def normalized_linear_attention(q, k, v, initial_state=None):
-    """Compiled-region body: one op call yields the output and the normalizer.
-
-    ``v`` is extended with ``STICK`` columns of ones, so the state becomes
-    ``[Dk, Dv + STICK]`` and its last block accumulates ``sum_t phi(k_t)``. The
-    extra width keeps every dimension stick-aligned.
+    It is ``exp(x)`` for negative ``x`` and ``x + 1`` for nonnegative ``x``. The
+    argument of ``exp`` never exceeds zero, so a large positive input cannot
+    overflow in the branch that is not selected.
     """
+    return torch.exp(torch.minimum(x, torch.zeros_like(x))) + torch.relu(x)
+
+
+def normalized_linear_attention(q_raw, k_raw, v, initial_state=None):
+    """Compiled-region body: feature map, then one op call that yields the
+    output and the normalizer.
+
+    ``q_raw`` and ``k_raw`` are the projections before the feature map. ``k`` is
+    scaled by ``D ** -0.5`` so the fp16 state stays well in range; the scale
+    cancels in the normalized output up to ``EPS``. ``v`` is extended with ``STICK`` columns
+    of ones, so the state becomes ``[Dk, Dv + STICK]`` and its last block
+    accumulates ``sum_t phi(k_t)``. The extra width keeps every dimension
+    stick-aligned.
+    """
+    q = feature_map(q_raw)
+    k = feature_map(k_raw) * D**-0.5
     ones = torch.ones(*v.shape[:-1], STICK, dtype=v.dtype, device=v.device)
     v_aug = torch.cat([v, ones], dim=-1)
     out_aug, state = torch.ops.spyre.linear_attention(
@@ -69,24 +84,27 @@ def normalized_linear_attention(q, k, v, initial_state=None):
     return numerator / (denominator + EPS), state
 
 
-def reference(q, k, v):
-    """Quadratic-form normalized causal linear attention in float64."""
-    q, k, v = q.double(), k.double(), v.double()
+def reference(q_raw, k_raw, v):
+    """Quadratic-form normalized causal linear attention in float64, with the
+    feature map written as ``F.elu`` rather than the device formulation."""
+    q = F.elu(q_raw.double()) + 1.0
+    k = (F.elu(k_raw.double()) + 1.0) * D**-0.5
+    v = v.double()
     scores = torch.einsum("bhlk,bhmk->bhlm", q, k)
     scores = scores * torch.tril(torch.ones(q.size(2), q.size(2), dtype=torch.double))
     return (scores @ v) / (scores.sum(-1, keepdim=True) + EPS)
 
 
-# Build inputs on CPU. Keys are scaled so the fp16 state stays well in range.
-Q = feature_map(torch.randn(B, H, L, D)).half()
-K = (feature_map(torch.randn(B, H, L, D)) * D**-0.5).half()
+# Build raw (pre-feature-map) inputs on CPU. The feature map runs on the device.
+Q_RAW = torch.randn(B, H, L, D, dtype=torch.float16)
+K_RAW = torch.randn(B, H, L, D, dtype=torch.float16)
 V = torch.randn(B, H, L, D, dtype=torch.float16)
 
 # Compute the reference on CPU
-cpu_result = reference(Q, K, V).half()
+cpu_result = reference(Q_RAW, K_RAW, V).half()
 
 # Send inputs to device
-Q_device, K_device, V_device = Q.to(DEVICE), K.to(DEVICE), V.to(DEVICE)
+Q_device, K_device, V_device = Q_RAW.to(DEVICE), K_RAW.to(DEVICE), V.to(DEVICE)
 
 # Compute on the device in compiled mode and bring the result back to the host.
 # The op has no eager implementation on Spyre, so it must run under torch.compile.

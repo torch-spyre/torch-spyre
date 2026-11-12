@@ -34,11 +34,17 @@ For the chunk covering rows ``[s, e)``, with ``S`` the state *before* it::
     o_c   = scale * (inter + intra)
     S     = S + K_c^T V_c
 
-Everything here is plain ``matmul``, ``transpose().contiguous()``, an
-elementwise multiply with a small ``[C, C]`` mask, ``add`` and ``cat``: the same
-primitives ``flash_attention.py`` already runs on Spyre. This module imports no
-torch_spyre code, so the algorithm can be tested against the reference below on
-CPU without a device.
+Everything inside a chunk is plain ``matmul``, ``transpose().contiguous()``, an
+elementwise multiply with a small ``[C, C]`` mask and ``add``: the same
+primitives ``flash_attention.py`` already runs on Spyre. The loop over chunks
+is a ``for_each_tile`` loop. ``S`` is its tensor carry, Q, K and V are sliced
+along the sequence axis, the mask is an invariant operand, and each step's
+output chunk is laid back along the same axis. The traced graph therefore holds
+one copy of the chunk body however long the sequence is.
+
+The algorithm needs no Spyre device, so it can be tested against the reference
+below on CPU. It does import ``for_each_tile`` from the Spyre frontend, so the
+``torch_spyre`` package must be importable.
 
 Phase 1 scope (see ``check_linear_attention`` for what is rejected):
 
@@ -46,8 +52,9 @@ Phase 1 scope (see ``check_linear_attention`` for what is rejected):
   and any normalization are the caller's job.
 * Equal query, key and value head counts (no grouped-query form) and equal
   query, key and value lengths.
-* The chunk loop is unrolled into the graph. ``MAX_CHUNKS`` bounds the graph
-  size; a loop-based lowering and a fused kernel are the follow-ups.
+* There is no limit on the number of chunks here. The backend compiler unrolls
+  counted loops by default (``SPYRE_BACKEND_LOOP_UNROLL``), so its build time
+  still grows with the chunk count even though the traced graph does not.
 """
 
 import math
@@ -56,15 +63,12 @@ from typing import Optional
 import torch
 
 from .sliding_window_plan import STICK
+from .wsr import for_each_tile
 
 # The intra-chunk score tile is [chunk_size, chunk_size] per (batch, head), so
 # the chunk size bounds the largest temporary this algorithm creates.
 MAX_CHUNK_SIZE = 512
 DEFAULT_CHUNK_SIZE = STICK
-# The chunk loop is unrolled, so the number of chunks is the number of copies of
-# the loop body in the traced graph. Refusing past this keeps compile time
-# bounded and tells the caller to raise ``chunk_size`` instead.
-MAX_CHUNKS = 128
 
 
 def default_scale(key_dim: int) -> float:
@@ -90,6 +94,8 @@ def check_linear_attention(
     Reads only ``shape``, ``dtype`` and ``device``, so it works on fake and
     meta tensors and can run at trace time.
     """
+    # This loop runs once per argument at trace time and emits no tensor ops, so
+    # it is validation, not part of the compiled graph.
     for name, tensor in (("query", query), ("key", key), ("value", value)):
         if tensor.dim() != 4:
             return (
@@ -147,12 +153,6 @@ def check_linear_attention(
         return f"chunk_size={chunk_size} must be a positive multiple of {STICK}"
     if chunk_size > MAX_CHUNK_SIZE:
         return f"chunk_size={chunk_size} exceeds the maximum of {MAX_CHUNK_SIZE}"
-    num_chunks = padded_sequence_length(seqlen, chunk_size) // chunk_size
-    if num_chunks > MAX_CHUNKS:
-        return (
-            f"{num_chunks} chunks of {chunk_size} rows exceed the unrolled-loop "
-            f"limit of {MAX_CHUNKS}; raise chunk_size (maximum {MAX_CHUNK_SIZE})"
-        )
     if scale is not None and not math.isfinite(scale):
         return f"scale={scale} must be finite"
     return None
@@ -195,7 +195,8 @@ def chunkwise_linear_attention(
     the query dtype holding 1 on and below the diagonal and 0 above it. It is
     an argument so the Spyre path can build it with a device-side custom op
     while CPU tests pass ``torch.tril``. Masking multiplies, so scores must be
-    finite.
+    finite. The loop body receives it as an invariant operand: a
+    ``for_each_tile`` body may not close over a tensor.
 
     Non-causal calls need no loop at all: every row reads the same state, the
     sum of ``K^T V`` over the whole sequence.
@@ -206,7 +207,8 @@ def chunkwise_linear_attention(
             f"sequence length {length} must be a multiple of chunk_size {chunk_size}"
         )
 
-    # Scale Q once, as SDPA does, rather than once per chunk.
+    # Scale Q once, as SDPA does, rather than once per chunk. It is also what
+    # lets the loop body take Q as an operand instead of closing over a scale.
     q = query * scale
 
     if not is_causal:
@@ -218,30 +220,47 @@ def chunkwise_linear_attention(
     if intra_mask is None:
         raise ValueError("a causal call requires intra_mask")
 
-    state = initial_state
-    outputs = []
-    for start in range(0, length, chunk_size):
-        end = start + chunk_size
-        q_c = q[:, :, start:end, :]
-        k_c = key[:, :, start:end, :]
-        v_c = value[:, :, start:end, :]
+    batch, heads, _, key_dim = query.shape
+    value_dim = value.size(-1)
+    if initial_state is None:
+        initial = torch.zeros(
+            (batch, heads, key_dim, value_dim), dtype=query.dtype, device=query.device
+        )
+    else:
+        # The carry must keep its metadata (shape, dtype and strides) from one
+        # step to the next, and ``state + update`` returns a dense tensor.
+        initial = initial_state.contiguous()
+
+    def chunk_step(state, tiles):
+        q_c, k_c, v_c, mask = tiles
 
         # K^T for this chunk feeds both the intra-chunk scores and the state
         # update, so materialize it once.
         keys_t = k_c.transpose(-1, -2).contiguous()
-        scores = torch.matmul(q_c, keys_t) * intra_mask
-        out_c = torch.matmul(scores, v_c)
-        if state is not None:
-            # The first chunk of a call with no initial state has nothing
-            # earlier to read, so skip the Q @ S matmul against zeros.
-            out_c = out_c + torch.matmul(q_c, state)
-        outputs.append(out_c)
+        scores = torch.matmul(q_c, keys_t) * mask
+        # Read ``state`` for the output before producing ``next_state``: the
+        # loop lowering can then update the carry in place without keeping a
+        # snapshot of the old value for a later reader.
+        out_c = torch.matmul(scores, v_c) + torch.matmul(q_c, state)
+        next_state = state + torch.matmul(keys_t, v_c)
+        return next_state, out_c
 
-        update = torch.matmul(keys_t, v_c)
-        state = update if state is None else state + update
+    operands = (q, key, value, intra_mask)
+    num_chunks = length // chunk_size
+    if num_chunks == 1:
+        # One chunk is not worth a loop (this is every single-token decode),
+        # and the SDPA decomposition does the same for a one-tile map.
+        state, output = chunk_step(initial, operands)
+        return output, state
 
-    assert state is not None  # length > 0, so the loop ran at least once
-    output = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=-2)
+    state, output = for_each_tile(
+        chunk_step,
+        operands,
+        dims=(2, 2, 2, None),  # Q, K, V along L; the mask is read whole.
+        tile_size=chunk_size,
+        init=initial,
+        out_dim=2,
+    )
     return output, state
 
 
@@ -259,6 +278,12 @@ def reference_linear_attention(
     accumulates in fp32 whatever the input dtype and casts the results back,
     so it is the accuracy yardstick for the half-precision device path. Cost is
     one small step per token, which is fine for tests and useless for serving.
+
+    The ``for t in range(seqlen)`` loop below is intentionally a Python loop. This
+    function only ever runs eagerly on CPU, as the registered CPU kernel of
+    ``spyre::linear_attention`` and as the test oracle, and is never traced
+    into a Spyre graph. Expressing it with ``for_each_tile`` would make the
+    yardstick share the machinery it is there to check.
     """
     batch, heads, seqlen, key_dim = query.shape
     value_dim = value.size(-1)

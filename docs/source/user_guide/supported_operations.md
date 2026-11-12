@@ -252,14 +252,32 @@ normalization. [`linear_attention.py`](examples/linear_attention.py) shows how
 to get the normalizer from the same call by appending a block of ones to the
 value.
 
+Spyre has no kernel for `expm1`, and Inductor decomposes `F.elu` through it, so
+compiling `F.elu(x) + 1` on device fails with `unimplemented operation expm1`.
+For the default `alpha=1` feature map use operations Spyre already supports:
+
+```python
+def feature_map(x):
+    return torch.exp(torch.minimum(x, torch.zeros_like(x))) + torch.relu(x)
+```
+
+This equals `exp(x)` for negative inputs and `x + 1` for nonnegative ones. The
+argument of `exp` never exceeds zero, so a large positive input cannot
+overflow in the branch that is not selected. It computes `elu(x) + 1` directly,
+so it does not need the numerical care that replacing a general `expm1(x)` with
+`exp(x) - 1` would near zero.
+
 Phase 1 limits, each rejected with an `Unsupported` error that names the
 problem:
 
 - Query, key and value must share a dtype, device, batch, heads and length;
   there is no grouped-query form and no cross-length form.
 - No gating or decay (so not GLA, RetNet, Mamba-2, or the delta-rule family).
-- The chunk loop is unrolled into the graph, so `ceil(L / chunk_size)` is
-  capped at 128. Raise `chunk_size` for longer sequences.
+- The chunk loop is a `for_each_tile` loop with the state as its carry, so the
+  traced graph does not grow with `ceil(L / chunk_size)` and the number of
+  chunks is not capped. The backend compiler unrolls counted loops by default
+  (`SPYRE_BACKEND_LOOP_UNROLL`), so build time still grows with the chunk
+  count; raise `chunk_size` to reduce it.
 - The state is accumulated in the input dtype (fp16 by default), so keep `L`
   and the key scale such that the state stays well inside fp16 range.
 

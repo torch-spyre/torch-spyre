@@ -2802,8 +2802,8 @@ def spyre_linear_attention(
     is processed with the intra-chunk masked matmul plus a read of the carried
     state, and the padding is sliced off the output. See ``linear_attention.py``
     for the algorithm and why end-padding leaves the output and final state
-    exact. Phase 1 unrolls the chunk loop; ``check_linear_attention`` bounds the
-    unrolled count.
+    exact. The chunk loop is a ``for_each_tile`` loop with the state as its
+    carry, so the traced graph does not grow with the number of chunks.
     """
     reason = check_linear_attention(query, key, value, initial_state, chunk_size, scale)
     if reason is not None:

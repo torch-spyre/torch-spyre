@@ -1458,9 +1458,9 @@ def linear_attention(  # type: ignore[empty-body]
 
     Phase 1 limits, enforced by ``check_linear_attention``: query, key and
     value share one shape apart from ``Dv``; no grouped-query form; no gating or
-    decay; the chunk loop is unrolled, so ``ceil(L / chunk_size)`` is capped.
-    The state is accumulated in the input dtype, so prefer ``L`` that keeps the
-    state well inside fp16 range.
+    decay. The chunk loop is a ``for_each_tile`` loop, so the number of chunks
+    is not capped. The state is accumulated in the input dtype, so prefer ``L``
+    that keeps the state well inside fp16 range.
 
     On a Spyre device this MUST be called under torch.compile(backend="inductor");
     the real implementation is the decomposition in decompositions.py, and this
