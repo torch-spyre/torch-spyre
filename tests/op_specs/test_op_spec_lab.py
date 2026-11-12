@@ -42,6 +42,7 @@ from torch_spyre._inductor.op_spec import (
     OpSpec,
     SourceLoc,
     TensorArg,
+    TensorWorkDivision,
     UnimplementedOp,
 )
 from torch_spyre.execution.async_compile import SpyreAsyncCompile
@@ -49,6 +50,7 @@ from torch_spyre.execution.async_compile import SpyreAsyncCompile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import capture  # noqa: E402
+import compare  # noqa: E402
 import explain  # noqa: E402
 import runner  # noqa: E402
 
@@ -356,6 +358,26 @@ def test_emitted_script_executes_its_definitions():
     assert namespace["INPUTS_PT"] == "/tmp/captured/sdsc_add_0.inputs.pt"
 
 
+def test_emitted_script_round_trips_a_work_division():
+    """The operands of an LX relayout spec carry a TensorWorkDivision, which the
+    spec printer writes as a constructor call. Both printer branches: with and
+    without ``num_cores``."""
+    c0 = sympify("c0")
+    divisions = [
+        TensorWorkDivision({c0: 2}, {c0: sympify("floor(core_id/16)")}, num_cores=32),
+        TensorWorkDivision({c0: 32}, {c0: sympify("core_id")}),
+    ]
+    op = _add_op()
+    op.args[0].work_division, op.args[2].work_division = divisions
+    rec = _record()
+    rec.specs = [op]
+    src = capture.emit_script(rec, "prog.py", 1, False)
+    namespace: dict = {"__file__": "/tmp/captured/sdsc_add_0.py"}
+    exec(compile(src, "<emitted>", "exec"), namespace)  # noqa: S102
+    (emitted,) = namespace["ops"]
+    assert [emitted.args[0].work_division, emitted.args[2].work_division] == divisions
+
+
 def test_emitted_script_forwards_the_pool_size():
     """A pool kernel bundles only if pool_size reaches sdsc().
 
@@ -517,6 +539,71 @@ def test_run_recorder_records_the_first_launch_only():
     assert proxy.code_dir == inner.code_dir  # unknown attributes forward
 
 
+class _HostBacked:
+    """A device-tensor stand-in over a host tensor; .cpu() snapshots it."""
+
+    def __init__(self, values):
+        self.values = values
+        self.shape = values.shape
+        self.dtype = values.dtype
+
+    def device_tensor_layout(self):
+        return _FakeLayout()
+
+    def cpu(self):
+        return self.values.clone()
+
+
+class _Doubler:
+    """A runner whose launch writes twice its first arg into its last."""
+
+    def run(self, *args):
+        args[-1].values.copy_(2 * args[0].values)
+
+
+def test_run_recorder_saves_what_the_first_launch_wrote():
+    rec = capture.KernelRecord(
+        name="k", specs=[_add_op()], index=0, sencores=32, bundle_symbolic_args=True
+    )
+    proxy = capture._RunRecorder(_Doubler(), rec, True, launches=iter(range(5, 9)))
+    x, out = _HostBacked(torch.ones(4)), _HostBacked(torch.zeros(4))
+
+    proxy.run(x, out)
+    proxy.run(_HostBacked(torch.full((4,), 3.0)), out)
+
+    assert rec.launch == 5
+    assert torch.equal(rec.args[1].values, torch.zeros(4))
+    assert torch.equal(rec.args[1].after, torch.full((4,), 2.0))
+
+
+def test_saved_outputs_reach_the_replay(tmp_path):
+    rec = _record()
+    rec.launch = 7
+    for i, arg in enumerate(rec.args):
+        arg.values, arg.after = torch.zeros(2), torch.full((2,), float(i))
+    path = capture.write_kernel(rec, str(tmp_path), "prog.py", 1, False, True)
+
+    assert torch.load(os.path.splitext(path)[0] + ".inputs.pt")["launch"] == 7
+    namespace: dict = {"__file__": path}
+    exec(compile(open(path).read(), path, "exec"), namespace)  # noqa: S102
+    observed = namespace["observed_outputs"]()
+    assert [o.tolist() for o in observed] == [[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]]
+
+
+def test_replay_compares_its_launch_with_the_captured_one(capsys):
+    def launch(name, ops, tensors, **kwargs):
+        tensors[1].copy_(tensors[0] + 1)
+
+    tensors = [torch.ones(3), torch.zeros(3)]
+    observed = [torch.ones(3), torch.tensor([2.0, 2.0, 2.5])]
+    with patch.object(runner, "run_op_specs", launch):
+        runner.main("k", [], tensors, argv=[], observed=observed)
+
+    first, second = capsys.readouterr().out.splitlines()[-2:]
+    assert first.endswith("max|got - observed| = 0")
+    assert second.endswith("max|got - observed| = 0.5")
+
+
 def test_capture_preserves_compile_future_until_runner_resolution():
     class _FakeCompileFuture(CodeCacheFuture):
         def __init__(self, runner):
@@ -590,6 +677,60 @@ def test_capture_of_a_clean_program_exits_zero(tmp_path):
         assert capture.main([str(program), "--out", str(out_dir)]) == 0
 
     assert (out_dir / "sdsc_ok_0.py").exists()
+
+
+def test_capture_of_a_program_that_calls_sys_exit(tmp_path, capsys):
+    """``sys.exit(main())`` is how a program ends -- a pytest run among them --
+    so its kernels are written; only a non-zero status reads as partial."""
+    body = "SpyreAsyncCompile().sdsc('sdsc_ok_0', [])\nimport sys\nsys.exit({})\n"
+    for status, expected in ((0, 0), (1, capture.EXIT_PARTIAL)):
+        program = _stub_sdsc_program(tmp_path, body.format(status))
+        out_dir = tmp_path / f"captured_{status}"
+        with patch.object(SpyreAsyncCompile, "sdsc", _fake_sdsc):
+            assert capture.main([str(program), "--out", str(out_dir)]) == expected
+        assert (out_dir / "sdsc_ok_0.py").exists()
+    assert "exited with status 1" in capsys.readouterr().out
+
+
+class _HardExit(BaseException):
+    """Stands in for os._exit, which would end the test run too."""
+
+
+def test_capture_of_a_program_that_ends_the_process_itself(tmp_path):
+    """spyre-inference's pytest plugin ends a Spyre-host run with os._exit once
+    the exit handlers have run, so main() never gets control back."""
+    handlers = []
+
+    def hard_exit():
+        for func, args in handlers:
+            func(*args)
+        raise _HardExit
+
+    body = "SpyreAsyncCompile().sdsc('sdsc_ok_0', [])\nimport hard_exit as h\nh.now()\n"
+    program = _stub_sdsc_program(tmp_path, body)
+    out_dir = tmp_path / "captured"
+    with (
+        patch.object(SpyreAsyncCompile, "sdsc", _fake_sdsc),
+        patch("atexit.register", lambda func, *args: handlers.append((func, args))),
+        patch("atexit.unregister"),
+        patch.dict(sys.modules, {"hard_exit": types.SimpleNamespace(now=hard_exit)}),
+        pytest.raises(_HardExit),
+    ):
+        capture.main([str(program), "--out", str(out_dir)])
+    assert (out_dir / "sdsc_ok_0.py").exists()
+
+
+def test_write_kernel_fits_a_name_that_fills_name_max(tmp_path):
+    """A fused kernel name can be 255 bytes by itself; the script, its
+    disambiguated twin and their .pt files must still be writable."""
+    name = "sdsc_fused_" + "x" * 244
+    rec, out = _record(name=name), str(tmp_path)
+    paths = [capture.write_kernel(rec, out, "prog.py", 2, False, True) for _ in "ab"]
+    assert len(set(paths)) == 2
+    for path in paths:
+        assert len(os.path.basename(path).encode()) < 255
+        assert os.path.exists(os.path.splitext(path)[0] + ".inputs.pt")
+        assert f'KERNEL_NAME = "{name}"' in open(path).read()
 
 
 def test_capture_blames_the_crash_when_nothing_compiled(tmp_path):
@@ -801,3 +942,49 @@ def test_dedup_ignores_provenance_only_differences():
     other = _add_op()
     other.op = "mul"
     assert capture.dedup_key([_add_op()]) != capture.dedup_key([other])
+
+
+def _save_launch(directory, name, launch, inputs, outputs):
+    directory.mkdir(exist_ok=True)
+    record = {"tensors": inputs, "outputs": outputs, "launch": launch}
+    torch.save(record, directory / f"{name}.inputs.pt")
+
+
+def test_compare_blames_the_first_kernel_to_part(tmp_path, capsys):
+    """k1 gets the same inputs in both runs and writes different outputs; k2
+    only inherits the difference."""
+    x = torch.arange(4.0)
+    good, bad = tmp_path / "good", tmp_path / "bad"
+    for directory, k1_out in ((good, 2 * x), (bad, 2 * x + 9)):
+        _save_launch(directory, "k0", 0, [x, torch.zeros(4)], [x, x + 1])
+        _save_launch(directory, "k1", 1, [x + 1, torch.zeros(4)], [x + 1, k1_out])
+        _save_launch(directory, "k2", 2, [k1_out, torch.zeros(4)], [k1_out, k1_out])
+
+    assert compare.main([str(good), str(bad)]) == 1
+    out = capsys.readouterr().out
+    assert out.count("<-- parts here") == 1
+    assert "first to part: k1 (launch 1)" in out
+
+
+def test_compare_pairs_kernels_by_name_and_shapes(tmp_path, capsys):
+    """Two kernels of one name compiled in the other order get each other's
+    ``_1`` suffix; they are still paired by what they take."""
+    one, many = [torch.ones(8), torch.zeros(1)], [torch.ones(8), torch.zeros(4)]
+    good, bad = tmp_path / "good", tmp_path / "bad"
+    for directory, (first, second) in ((good, (one, many)), (bad, (many, one))):
+        for i, (stem, inputs) in enumerate((("k", first), ("k_1", second))):
+            record = {"name": "k", "tensors": inputs, "outputs": inputs, "launch": i}
+            directory.mkdir(exist_ok=True)
+            torch.save(record, directory / f"{stem}.inputs.pt")
+
+    assert compare.main([str(good), str(bad)]) == 0
+    out = capsys.readouterr().out
+    assert "k (= k_1)" in out and "k_1 (= k)" in out
+    assert "inf" not in out
+
+
+def test_compare_of_captures_within_tolerance(tmp_path):
+    x = torch.arange(1.0, 5.0)
+    for directory, out in ((tmp_path / "good", x + 1e-4), (tmp_path / "bad", x + 2e-4)):
+        _save_launch(directory, "k0", 0, [x, torch.zeros(4)], [x, out])
+    assert compare.main([str(tmp_path / "good"), str(tmp_path / "bad")]) == 0
