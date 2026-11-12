@@ -1,0 +1,5 @@
+test_suite_config:
+  labels: [unit, regression, integration, trunk]
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/fp8/test_scaled_bmm.py
+      unlisted_test_mode: mandatory_success

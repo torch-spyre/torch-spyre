@@ -24,14 +24,24 @@ Covers:
   2. load_fp8_model_to_spyre: loads FP8 Linear weights of an nn.Module
      into QFP8WT KERNEL layout; non-FP8 weights use the normal path.
   3. _scaled_mm with pre-quantized FP8 weight in KERNEL layout.
+  4. Section 12 of the FP8 scaled_bmm FVT plan (SBDMA-01..SBDMA-08): rank-2/3/4
+     transfers at Granite shapes, and the loader at Granite Linear shapes.
 """
 
 import pytest
 import torch
 from torch import nn
-from utils_inductor import DEVICE, compare_with_pytorch
+from utils_inductor import (
+    DEVICE,
+    _compile_and_run,
+    cached_randn,
+    compare_with_pytorch,
+    strict_xfail,
+)
 
 import torch_spyre  # noqa: F401 — registers Spyre as the inductor backend
+from torch_spyre._inductor import config
+from torch_spyre._inductor.constants import FP8_E4M3FN_MAX
 
 DEVICE_TYPE = DEVICE.type  # 'spyre' — used for device.type comparisons
 
@@ -469,3 +479,149 @@ class TestQuantScalePerTokenFp8WithPrequantizedWeight:
         # atol=4.0: FP8 quantization error accumulated over K terms (see
         # test_prequantized_closed_over for tolerance justification).
         torch.testing.assert_close(out_cpu, cpu_ref, atol=4.0, rtol=0.1)
+
+
+SENCORES_BASE = (1, 32)
+# KERNEL-layout [.., K, N] weights: Granite k_proj / v_proj and KV-cache shapes.
+DMA_SHAPES = [
+    ("SBDMA-01", (4096, 1024)),
+    ("SBDMA-02", (32, 128, 128)),
+    ("SBDMA-03", (32, 128, 2048)),
+    ("SBDMA-04", (1, 32, 128, 512)),
+    ("SBDMA-05", (1, 32, 128, 2048)),
+    ("SBDMA-06", (1, 32, 2048, 128)),
+    ("SBDMA-07", (2, 32, 128, 128)),
+]
+# Granite-3.3-8B-Instruct-FP8 Linear weights [N, K].
+LOADER_SHAPES = [(4096, 4096), (1024, 4096), (12800, 4096), (4096, 12800)]
+
+
+def _shape_id(shape):
+    return "x".join(map(str, shape))
+
+
+def _fp8_weight(shape, tag):
+    return cached_randn(shape, differentiation=tag).to(torch.float8_e4m3fn)
+
+
+def _read_back(q_weight, k):
+    """Read a KERNEL-layout FP8 weight back as FP16 via an FP8 identity matmul.
+
+    A plain copy does not undo the QFP8WT layout; each output here is 1 * w, so
+    every FP8 value should come back exactly.
+    """
+    lead = tuple(q_weight.shape[:-2])
+    eye = torch.eye(k, dtype=torch.float16).expand(*lead, k, k).contiguous()
+    one = torch.tensor(1.0, dtype=torch.float16)
+
+    def fn(eye, q_weight, one):
+        q_eye = torch.ops.spyre.quantize_fp8_with_scale(eye, one)
+        if q_weight.dim() == 2:
+            return torch.ops.aten._scaled_mm(
+                q_eye, q_weight, scale_a=one, scale_b=one, out_dtype=torch.float16
+            )
+        return torch.ops.spyre.scaled_bmm(
+            q_eye, q_weight, scale_a=one, scale_b=one, out_dtype=torch.float16
+        )
+
+    return _compile_and_run(fn, (eye, q_weight, one), DEVICE)
+
+
+class TestPrequantizedFp8ModelShapes:
+    """FVT Section 12: pre-quantized FP8 weights reach Spyre unchanged (FRS 8.3)."""
+
+    @pytest.mark.parametrize(
+        "shape,sencores",
+        [
+            pytest.param(shape, n, id=f"{_shape_id(shape)}-cores{n}")
+            for _, shape in DMA_SHAPES
+            for n in SENCORES_BASE
+        ],
+    )
+    def test_dma_round_trip(self, shape, sencores, request):
+        """SBDMA-01..SBDMA-07: dtype, shape and device kept; every value exact."""
+        if len(shape) > 2:
+            strict_xfail(
+                request,
+                raises=AssertionError,
+                reason="#5633: Support rank-3/4 pre-quantized FP8 weights in "
+                "_dma_to_spyre_fp8_kernel",
+            )
+        else:
+            strict_xfail(
+                request,
+                raises=AssertionError,
+                reason="#6067: [fp8] FP8 subnormals mis-decoded in the matmul",
+            )
+        from torch_spyre.model_utils import _dma_to_spyre_fp8_kernel
+
+        w = _fp8_weight(shape, ("SBDMA", shape))
+        dev = _dma_to_spyre_fp8_kernel(w)
+        assert dev.device.type == DEVICE_TYPE
+        assert dev.dtype == torch.float8_e4m3fn
+        assert list(dev.shape) == list(shape)
+        with config.patch({"sencores": sencores}):
+            back = _read_back(dev, shape[-2])
+        assert torch.equal(back, w.to(torch.float16)), "FP8 values changed"
+
+    @pytest.mark.parametrize("m", [1, 4, 64])
+    @pytest.mark.parametrize("variant", ["loader", "contiguous"])
+    @pytest.mark.parametrize(
+        "n_out,k_in,sencores",
+        [
+            pytest.param(n, k, c, id=f"{n}x{k}-cores{c}")
+            for n, k in LOADER_SHAPES
+            for c in SENCORES_BASE
+        ],
+    )
+    def test_loader_matches_reference(self, n_out, k_in, variant, m, sencores, request):
+        """SBDMA-08: the FP8 linear on a transferred weight gives the CPU result.
+
+        "loader" transfers the weight through load_fp8_model_to_spyre, which passes
+        the view p.t(); "contiguous" passes w.t().contiguous().
+        """
+        if variant == "loader":
+            strict_xfail(
+                request,
+                raises=AssertionError,
+                reason="#6064: [fp8] FP8 model loader silently produces wrong weights:"
+                " it passes a transposed view, not a copy",
+            )
+        from torch_spyre.model_utils import (
+            _dma_to_spyre_fp8_kernel,
+            load_fp8_model_to_spyre,
+        )
+
+        w_fp8 = _fp8_weight((n_out, k_in), ("SBDMA-08-weight", n_out, k_in))
+        if variant == "loader":
+            model = nn.Sequential(nn.Linear(k_in, n_out, bias=False))
+            model[0].weight = nn.Parameter(w_fp8.clone(), requires_grad=False)
+            load_fp8_model_to_spyre(model)
+            w_dev = model[0].weight  # [K, N] KERNEL layout on Spyre
+        else:
+            w_dev = _dma_to_spyre_fp8_kernel(w_fp8.t().contiguous())
+
+        act = cached_randn((m, k_in), differentiation=("SBDMA-08-act", k_in))
+
+        def fn(x):
+            scale = torch.ops.spyre.quantscalepertokenfp8(x)
+            q = torch.ops.spyre.quantize_fp8_with_scale(x, scale)
+            return torch.ops.aten._scaled_mm(
+                q,
+                w_dev,
+                scale_a=scale,
+                scale_b=torch.ones((), dtype=torch.float16, device=x.device),
+                bias=None,
+                out_dtype=torch.float16,
+            )
+
+        with config.patch({"sencores": sencores}):
+            out = _compile_and_run(fn, (act,), DEVICE)
+
+        amax = act.float().abs().amax(dim=-1, keepdim=True).clamp(min=1e-5)
+        s = amax / FP8_E4M3FN_MAX
+        q_ref = (act.float() / s).clamp(-FP8_E4M3FN_MAX, FP8_E4M3FN_MAX)
+        ref = (q_ref.to(torch.float8_e4m3fn).float() * s) @ w_fp8.float().T
+        # FP8 rounding gives ~1-2% relative L2 error; a mis-laid-out weight ~140%.
+        rel = ((out.float() - ref).norm() / ref.norm()).item()
+        assert rel < 0.05, f"relative L2 error {rel:.3f} vs CPU reference"
