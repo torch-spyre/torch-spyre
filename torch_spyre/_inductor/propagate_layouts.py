@@ -909,6 +909,57 @@ def _single_arg_op_layout(
     return _default_pointwise_layout(stl, dep, in_layout, output, output_dep, aten_op)
 
 
+def _new_stick_split_target(
+    arg: PropArg,
+    stick_expr: sympy.Expr,
+    out_stl: SpyreTensorLayout,
+    output_dep: MemoryDep,
+) -> SpyreTensorLayout | None:
+    """Return the size-1-stick input STL for a clone that broadcasts into a new
+    stick, or None when the clone does not need split.
+
+    The split is required when the output stick symbol is absent from every
+    device coordinate of the input and the input stick is symbolic: RESTICKIFY_OP
+    cannot move the input stick off and fill the new one in one copy, and
+    padding has no input dim to pad (``_pad_restickify_input``).  The test
+    mirrors ``is_restickify_coords``: both sides are device coordinates, which
+    ``device_coordinates`` sets over the op's iteration.
+
+    Returns None, keeping ``AnyInNode``, when any candidate input
+    layout already has a constant stick (the clone is an identity broadcast
+    fill from it) or no candidate has a size-1 restickify target.
+    """
+    if not stick_expr.free_symbols:
+        return None
+    out_coords = try_device_coordinates(out_stl, output_dep, None)
+    if out_coords is None:
+        return None
+    out_stick_syms = out_coords[-1].free_symbols & output_dep.ranges.keys()
+    if not out_stick_syms:
+        return None
+    in_dep = arg.dep
+    feasible: list[tuple[SpyreTensorLayout, list[sympy.Expr]]] = []
+    for cand in arg.layouts:
+        coords = try_device_coordinates(cand, in_dep, None)
+        if coords is None:
+            continue
+        in_syms = set().union(*(c.free_symbols for c in coords))
+        if not coords[-1].free_symbols or not out_stick_syms.isdisjoint(in_syms):
+            return None
+        if is_stick_expr_offset_free(coords[-1], cand.elems_per_stick()):
+            feasible.append((cand, coords))
+    if not feasible:
+        return None
+    in_host_coords = host_coordinates(arg.layout, in_dep, None)
+    for cand, coords in feasible:
+        target = compute_restickify_target_layout(
+            cand, arg.layout, sympy.S.Zero, in_host_coords, coords, arg=arg
+        )
+        if target is not None:
+            return target
+    return None
+
+
 def _clone_layout(
     op: Operation,
     output: FixedLayout,
@@ -921,6 +972,13 @@ def _clone_layout(
     Case 1: Input has supported stick expression
       - No restickify insertion needed
       - Clone op becomes identity if input is already row-major, otherwise becomes restickify
+
+    Case 1b: Output stick is a broadcast dim the input does not index
+      (e.g., ``x.unsqueeze(1).expand(T, K).clone()``)
+      - RESTICKIFY_OP cannot both move the input stick off and fill the new
+        stick in one copy, and padding has no input dim to pad
+      - hence, restickify the input onto a size-1 stick before the clone
+      - clone op then becomes an identity broadcast fill upto interleaved value.
 
     Case 2: Input has unsupported stick expression (due to offset)
       - Insert restickify before clone to swap stick with non-stick dimension
@@ -953,6 +1011,15 @@ def _clone_layout(
     )
 
     if is_stick_expr_offset_free(stick_expr, stick_size):
+        required_in_stl = _new_stick_split_target(
+            args[0], stick_expr, out_stl, output_dep
+        )
+        if required_in_stl is not None:
+            # Case 1b: move the input stick onto a size-1 dim (target stick 0).
+            op.restick_cost_fn = FixedInOutNode.from_args(
+                args, out_stl, [required_in_stl], op, output_dep
+            )
+            return [out_stl]
         # Case 1: No restickify insertion needed.
         # Use AnyInNode to produce the fixed output layout.
         op.restick_cost_fn = AnyInNode.from_args()

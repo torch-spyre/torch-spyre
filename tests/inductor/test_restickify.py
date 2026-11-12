@@ -34,7 +34,8 @@ from torch.spyre import SpyreTensorLayout
 
 import torch_spyre._inductor.optimize_restickify as _optimize_restickify
 from torch_spyre._inductor import config
-from utils_inductor import _compile_and_run, compare_with_cpu
+from torch._inductor.exc import InductorError
+from utils_inductor import _compile_and_run, compare_with_cpu, expects_raise
 
 DEVICE = torch.device("spyre")
 S = 128  # must be a multiple of 64
@@ -2490,6 +2491,118 @@ def test_broadcast_input_transpose_clone():
 
     x = _arange(1, 67, 1, 2, 1, 64)
     _strict(fn, x)
+
+
+# A clone that broadcasts a 1d input into a new stick dim (#4648):
+# ``x.unsqueeze(1).expand(T, K).clone()`` writes stick d1, which the input
+# ``x[d0]`` does not index.  One copy cannot move d0 from the stick and fill d1,
+# so _clone_layout fn restickifies x onto a size-1 stick first and the
+# clone becomes an identity broadcast/interleave/splash fill.
+# repeat_interleave on a 1d tensor decomposes to this pattern.
+BROADCAST_NEW_STICK = [
+    (torch.int32, (64, 8)),
+    (torch.int32, (64, 32)),
+    (torch.int32, (67, 8)),
+    (torch.int64, (64, 8)),
+    (torch.float16, (64, 8)),
+    (torch.float16, (64, 64)),
+    (torch.float16, (64, 67)),
+]
+
+
+@pytest.mark.parametrize(
+    "dtype, shape",
+    BROADCAST_NEW_STICK,
+    ids=[f"{str(d).split('.')[-1]}-{t}x{k}" for d, (t, k) in BROADCAST_NEW_STICK],
+)
+def test_broadcast_new_stick_clone(dtype, shape):
+    T, K = shape
+    x = _arange(T, dtype=dtype)
+    _strict(lambda x: x.unsqueeze(1).expand(T, K).clone(), x)
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.int64, torch.float16], ids=lambda d: str(d).split(".")[-1]
+)
+def test_repeat_interleave_1d(dtype):
+    x = _arange(64, dtype=dtype)
+    _strict(lambda x: x.repeat_interleave(8), x)
+
+
+def test_broadcast_new_stick_plan():
+    """The broadcast clone takes the size-1 split, not a zero-cost restickify.
+
+    Exactly one restickify is planned, and its target stick is a size-1 dim:
+    stride_map[-1] == 0, one element per stick (a size-1 dim maps to no host
+    stride, as in dim_map_to_stride_map in spyre_tensor_impl.cpp).
+    """
+    T, K = 64, 8
+    x = _arange(T)
+
+    def fn(x):
+        return x.unsqueeze(1).expand(T, K).clone()
+
+    spyre, plan = _compile_and_run_plan_capture(fn, x)
+    assert torch.equal(spyre.cpu(), fn(x))
+    entries = [e for es in plan.values() for e in es]
+    assert len(entries) == 1, f"expected one restickify, got {plan}"
+    dl = entries[0].target_layout.device_layout
+    sm_last = int(list(dl.stride_map)[-1])
+    assert sm_last == 0, (
+        f"expected a size-1 target stick, got stride_map={list(dl.stride_map)} "
+        f"device_size={list(dl.device_size)}"
+    )
+
+
+# multi-dim inputs broadcast into a new last (stick) dim: the size-1 restickify
+# goes through the multi-dim branches of
+# compute_size1_restickify_layout (old stick var on an outer device dim for an
+# unaligned M, a size-1 outer device dim for an aligned M).
+BROADCAST_NEW_STICK_ND = [
+    (torch.float16, (8, 64), 8),
+    (torch.float16, (8, 67), 8),
+    (torch.int32, (8, 64), 4),
+    (torch.float16, (2, 4, 64), 8),
+]
+
+
+@pytest.mark.parametrize(
+    "dtype, in_shape, k",
+    BROADCAST_NEW_STICK_ND,
+    ids=[
+        f"{str(d).split('.')[-1]}-{'x'.join(map(str, s))}x{k}"
+        for d, s, k in BROADCAST_NEW_STICK_ND
+    ],
+)
+def test_broadcast_new_stick_clone_nd(dtype, in_shape, k):
+    x = _arange(*in_shape, dtype=dtype)
+    _strict(lambda x: x.unsqueeze(-1).expand(*in_shape, k).clone(), x)
+
+
+def test_broadcast_new_stick_clone_bool():
+    """A bool clone builds its layout from the input's device format
+    (bool_layout_dtype), while the size-1 target takes its stick size from the
+    host dtype; both must agree for the split to be correct.
+    """
+    T, K = 64, 8
+    x = _arange(T, dtype=torch.int32) % 3 == 0
+    _strict(lambda x: x.unsqueeze(1).expand(T, K).clone(), x)
+
+
+@expects_raise
+def test_broadcast_new_stick_clone_offset():
+    """Broadcast clone of an offset view (x[3:]).
+
+    TODO(#4648 follow-up): _clone_layout's offset path has no one-value-per-stick
+    split, so this is rejected before the split is tried.  Make this a positive
+    test when it lands.
+    """
+    T, K = 64, 8
+    x = _arange(T + 3, dtype=torch.int32)
+    with pytest.raises(
+        InductorError, match="No supported layout found for stick expression"
+    ):
+        _strict(lambda x: x[3:].unsqueeze(1).expand(T, K).clone(), x)
 
 
 # Matmul with a SUB-STICK contraction dim (D) reached through a permuted key,
