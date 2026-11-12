@@ -19,7 +19,7 @@
 #include <ATen/ATen.h>
 #include <c10/util/intrusive_ptr.h>
 
-#include <flex/memory_interface/shared_host_pool.hpp>
+#include <flex/flex.hpp>
 
 #include "module.h"
 
