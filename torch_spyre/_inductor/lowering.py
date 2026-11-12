@@ -2286,7 +2286,9 @@ def with_int64_fallback(fn, *args, convert_output=True):
     Args:
         fn: The lowering function to call
         *args: Arguments to pass to fn
-        convert_output: If True, convert output back to int64.
+        convert_output: If True, convert the output to the dtype the operands
+                       promote to: int64 when every operand is an integer,
+                       otherwise the float dtype (int64 - fp32 -> fp32).
                        Set to False for operations like div that should return float.
     """
     # Skip constants (int/float literals) that don't have get_dtype()
@@ -2322,8 +2324,14 @@ def with_int64_fallback(fn, *args, convert_output=True):
     output = fn(*[convert(x) for x in args])
 
     if convert_output:
-        # The ops served here combine integer values into integer values.
-        return to_dtype(output, torch.int64, skip_trunc=True)
+        result_dtype = _promoted_dtype(
+            *args, kind=ELEMENTWISE_TYPE_PROMOTION_KIND.NO_OPMATH
+        )
+        if result_dtype == torch.int64:
+            # Integer operands combine into an integer value.
+            return to_dtype(output, torch.int64, skip_trunc=True)
+        if output.get_dtype() != result_dtype:
+            return to_dtype(output, result_dtype)
 
     return output
 
@@ -2509,14 +2517,21 @@ def lower_mul(x, y):
 
 # NOTE (follow-up): int64 sub still goes through the fp32 round-trip in
 # with_int64_fallback, so unlike add/mul it is inexact above 2**24. The planned
-# fix is to rewrite ``x - alpha * y`` as ``x + (-alpha) * y`` so that int32/int64
-# sub reuses the native addi32toi32 / muli32toi32 path.
+# fix is to rewrite ``x - alpha * y`` as ``x + (-alpha) * y`` so that int64
+# sub reuses the native add/mul path, as int32 sub already does below.
 @register_spyre_lowering(
     torch.ops.aten.sub.Tensor,
     type_promotion_kind=None,
     broadcast=True,
 )
 def lower_sub(x, y, *, alpha=1):
+    result_dtype = _promoted_dtype(x, y, kind=ELEMENTWISE_TYPE_PROMOTION_KIND.NO_OPMATH)
+    if result_dtype == torch.int32:
+        # There is no subi32toi32 intrinsic: compute x + (-alpha) * y with the
+        # native addi32toi32 / muli32toi32 ops instead.
+        if isinstance(y, (int, float)):
+            return lowering.add(x, -alpha * y)
+        return lowering.add(x, lowering.mul(y, -alpha))
     if alpha != 1:
         alpha_tensor = lower_full(
             y.get_size(),

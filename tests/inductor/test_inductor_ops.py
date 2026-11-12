@@ -10141,6 +10141,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     "remainder uses the floor quotient, which #5605 makes 229 "
                     "instead of 228 for 72.0 / 0.314453125"
                 ),
+                # fmod subtracts the trunc quotient, which for positive operands
+                # is the same wrong 229, so it returns 0 instead of 0.305; #5605
+                "fmod_fp16_fp16_1d256": (
+                    "fmod uses the trunc quotient, which #5605 makes 229 "
+                    "instead of 228 for 72.0 / 0.314453125"
+                ),
             },
             "param_sets": {
                 # fp16 -> fp32 is stick-reordering: blocked by mixed EA
