@@ -2496,7 +2496,7 @@ def _legal_fixed_division(
     ):
         logger.debug("keep upstream division for %s: %s", op.name, reason)
         return fixed
-    raise Unsupported(f"{op.name}: fixed split violates hard domain.")
+    raise Unsupported(_hard_domain_violation(op, division.splits, division, "fixed"))
 
 
 def _split_option_is_legal(op: Operation, splits: dict[sympy.Symbol, int]) -> bool:
@@ -2510,6 +2510,7 @@ def _hard_domain_violation(
     op: Operation,
     splits: dict[sympy.Symbol, int],
     division: Optional[CoreDivision],
+    split_kind: str = "chosen",
 ) -> str:
     """The ``Unsupported`` message for ``splits`` failing ``op``'s hard domains."""
     assert isinstance(op, ComputedBuffer), "only a ComputedBuffer has hard domains"
@@ -2520,13 +2521,15 @@ def _hard_domain_violation(
         failed.append("op constraints")
     if not ctx.meets_span_floors(splits):
         failed.append(f"span floors {ctx.span_min_splits}")
+    if not ctx.representable_by_index_coeff(splits):
+        failed.append("scheduler coefficient-keyed transport")
     chosen = (
         f"division {division.label}, tiling {division.tiling.label}, "
         if division is not None
         else ""
     )
     return (
-        f"{op.name}: chosen split {splits} violates hard domain "
+        f"{op.name}: {split_kind} split {splits} violates hard domain "
         f"(fails {' and '.join(failed)}; {chosen}"
         f"ranges {[str(r) for r in op.data.ranges]})"
     )
@@ -3048,8 +3051,9 @@ def commit_divisions(
             # ownership for it and let the division land.
             if not isinstance(op, ComputedBuffer) or not op_splits:
                 continue
-        # The solve chose a tiled op's division on its untiled frame, which its
-        # hard domains and span floors are still keyed by.
+        # Joint tiling/division candidates were filtered by
+        # WorkDivisionContext.is_legal on the un-tiled frame before the solver
+        # saw them. Do not re-check resized tiled ranges here.
         if not getattr(
             op, JOINT_TILING_AND_DIVISION_ATTR, False
         ) and not _split_option_is_legal(op, op_splits):
