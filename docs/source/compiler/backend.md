@@ -46,7 +46,7 @@ Each `dscs_` entry is a complete description of one compute configuration:
 | `dataStageParam_` | Per-core dimension sizes for the steady-state (`ss_`) and epilogue (`el_`) passes. Tells the runtime how to partition data for transfer into scratchpad. |
 | `primaryDsInfo_` | Tiling information per logical role (`INPUT`, `KERNEL`, `OUTPUT`, `KERNEL_IDX`): `layoutDimOrder_`, `stickDimOrder_`, `stickSize_`. |
 | `labeledDs_` | Tensor descriptors. Each entry pairs a tensor argument with its `dsType_` (tiling layout class), `dataFormat_` (for example `SEN169_FP16`), and `memOrg_` (HBM or LX residency). The `layoutDimOrder_` of each entry is independent: two arguments of the same op can pick different dim orders. |
-| `scheduleTree_` | Allocate nodes, one per tensor, with memory placement (HBM or LX scratchpad), dimension ordering, per-core start addresses via fold mappings, and coordinate information. |
+| `scheduleTree_` | Allocate nodes, one per tensor, with memory placement (HBM or LX scratchpad), dimension ordering, per-core start addresses via fold mappings, and coordinate information. A shuffle can give its source and destination separate slice mappings. Each mapping lists the physical cores that own that tensor. |
 | `computeOp_` | One entry per operation, encoding the execution unit (`PT` or `SFP`), op name, data format, fidelity, and input/output tensor references. |
 | `debug_handle_` | Per-operation provenance metadata linking the DSC back to source code. Contains a stable content hash and a `SourceLoc` (file, line, function) extracted from the FX graph's `stack_trace`. |
 
