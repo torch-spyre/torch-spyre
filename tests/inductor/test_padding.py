@@ -2019,6 +2019,28 @@ class TestCoordinateMasking(unittest.TestCase):
         )
 
     @parametrize("dtype", COORD_MASK_DTYPES)
+    @parametrize("half_sticks", [1, 5, 11])
+    def test_division_by_broadcast_records_no_padding(self, dtype, half_sticks) -> None:
+        # The sum leaves its padding unknown, so realdiv asks for a mask on the
+        # divisor. The divisor is broadcast along the padded stick dim, so
+        # codegen drops that mask, and the quotient's padding is whatever
+        # x / garbage gives: no padding value may be recorded for it.
+        full, half = full_half_stick(dtype)
+        width = half * half_sticks
+        a_spyre = torch.full((full, width), 3, dtype=dtype, device="spyre")
+
+        def fn(x):
+            return x / x.sum(-1, keepdim=True)
+
+        compiled = torch.compile(fn, fullgraph=True, dynamic=False)
+        result = compiled(a_spyre)
+
+        self.assertIsNone(result.device_tensor_layout().padding_value)
+        torch.testing.assert_close(
+            result.cpu(), torch.full((full, width), 1.0 / width, dtype=dtype)
+        )
+
+    @parametrize("dtype", COORD_MASK_DTYPES)
     @parametrize("shape", SHAPES)
     def test_exp(self, shape, dtype) -> None:
         # The reinterpreted view carries a fresh layout with no recorded

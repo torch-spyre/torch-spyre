@@ -1816,6 +1816,13 @@ class DomainRangeTracer(DomainRangeSolver):
         else:
             do_coord_mask = do_pad = False
 
+        if do_coord_mask and _drops_pointwise_mask(op, self.graph):
+            # Codegen will not mask this op, so its inputs keep the padding
+            # that made the trace ask for a mask, and the output padding is
+            # whatever the op computes from it.
+            do_coord_mask, do_pad = False, True
+            self.buffer_range[op.name] = _user_values()
+
         if not padded:
             self.buffer_range[op.name] = EmptySet
         elif is_restickify_op(op, self.graph):
@@ -2336,6 +2343,41 @@ def _call_innner(op):
         store_fn(syms, r_syms)
     else:
         store_fn(syms)
+
+
+def _drops_pointwise_mask(op: Operation, graph: GraphLowering) -> bool:
+    """Whether codegen leaves pointwise op unmasked even if it asks for a mask.
+
+    _get_coordinate_mask in codegen/superdsc.py skips the pointwise mask when
+    an input does not iterate a padded dim, i.e. is broadcast along it (as in
+    x / x.sum(-1, keepdim=True)): SAMV would substitute the mask value only
+    into the other inputs. A padded dim is a stick dim of one of the op's
+    tensors whose extent is not a whole number of sticks, and an input does
+    not iterate it when the dim's symbol is missing from its index.
+
+    This errs towards True (e.g. for a dynamic extent), which only gives up
+    the mask.
+    """
+    if not isinstance(op, ComputedBuffer) or not isinstance(op.data, Pointwise):
+        return False
+    write = _write_dep(op)
+    reads = [d for d in op_read_writes(op).reads if isinstance(d, MemoryDep)]
+    padded_syms = set()
+    for dep in (write, *reads):
+        buf = graph.get_buffer(dep.name)
+        stl = _get_stl(graph, buf) if buf is not None else None
+        if stl is None or (sym := _stick_symbol(stl, dep)) is None:
+            continue
+        extent = dep.ranges.get(sym)
+        if extent is None:
+            continue
+        if not extent.is_Integer or compute_padding(
+            int(extent), graph.get_dtype(dep.name)
+        ):
+            padded_syms.add(sym)
+    return any(
+        sym not in dep.index.free_symbols for dep in reads for sym in padded_syms
+    )
 
 
 def is_spyre_layout(layout: Layout):
