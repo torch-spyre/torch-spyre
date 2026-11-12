@@ -2132,6 +2132,14 @@ def coarse_tile_post_stickify(
     """
     operations = graph.operations
 
+    if config.loop_tiling_lowering == "plan":
+        # Deferred: loop_tiling_lowering imports this module.
+        from .loop_tiling_lowering import build_loop_tiling_plan, lower_loop_tiling
+
+        return lower_loop_tiling(
+            graph, build_loop_tiling_plan(operations, groups, group_idx_offset)
+        )
+
     # Planning: decide every op's tiling attributes with zero mutation.
     # If any op needs carry propagation or requests disabled reduction
     # tiling, this raises Unsupported before any transformation runs.
@@ -3945,7 +3953,9 @@ def _patch_consumers(
         # loop_info stamped at all -- there is no tiled_dims_per_read to fix
         # up, and this consumer isn't part of any loop group's
         # _general_tile_advance machinery in the first place.
-        if not hasattr(new_consumer, "loop_info"):
+        if not isinstance(getattr(new_consumer, "loop_info", None), CoarseTileInfo):
+            # No record, or a LoopShim: a shim op keeps no per-read lists, its
+            # redirected read advances by its index.
             continue
         new_loop_info = new_consumer.loop_info  # type: ignore[attr-defined]
 

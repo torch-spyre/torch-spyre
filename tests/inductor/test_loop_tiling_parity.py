@@ -20,24 +20,49 @@ the gate (``test_span_overflow_gate``) does not reach, on the legacy transform, 
 later lowering is held to what legacy does, not to what it was thought to do.
 """
 
+from unittest import mock
+
 import pytest
 import torch  # noqa: F401  (must precede torch_spyre._inductor imports)
 
+from torch_spyre._inductor import config, passes
+
 from utils_inductor import expects_raise
 from test_span_overflow_gate import (
+    CASES,
     MB,
     _relative_error,
     _shaped,
     compile_span_overflow,
 )
 
-LOWERINGS = ["legacy"]
+LOWERINGS = ["legacy"]  # the pinned reduction cases below: "plan" lowers pointwise only
+# Cases beyond the gate's: a tiled producer read outside the loop (by a small slice
+# that is not itself tiled), with and without the producer being a graph output.
+EXTRA_CASES = {
+    "pointwise_outside_consumers": (
+        lambda a, b: (lambda y: y[:8] * 2 + y[8:16])(a + b),
+        [(4096, 1024)] * 2,
+        4 * MB,
+    ),
+    "pointwise_outside_consumer_and_graph_output": (
+        lambda a, b: (lambda y: (y, y[:8] * 2))(a + b),
+        [(4096, 1024)] * 2,
+        4 * MB,
+    ),
+}
+PLAN_VS_LEGACY = [
+    "pointwise_copy_out",
+    "pointwise_chain",
+    "pointwise_independent_pair",
+    *EXTRA_CASES,
+]
 
 
 def compile_with(lowering, fn, args, limit_bytes):
     """``compile_span_overflow`` under ``config.loop_tiling_lowering == lowering``."""
-    assert lowering == "legacy", lowering
-    return compile_span_overflow(fn, args, limit_bytes)
+    with config.patch({"loop_tiling_lowering": lowering}):
+        return compile_span_overflow(fn, args, limit_bytes)
 
 
 def _is_k_tiled(compiled):
@@ -116,3 +141,49 @@ def test_a_k_tiled_matmul_whose_accumulator_is_a_graph_output(lowering):
     compiled = compile_with(lowering, fn, args, 1 * MB)
     assert _is_k_tiled(compiled), compiled.added
     assert _relative_error(compiled.outputs, fn(*[a.float() for a in args])) < 2e-2
+
+
+def _nodes(fn, args, limit, lowering):
+    """Compile under ``lowering``; also return the loop nodes (name, trip count,
+    leaf op names) as the pass loop leaves them just before the scheduler."""
+    from test_span_overflow_loop_terms import _nodes_of
+
+    from torch_spyre._inductor.loop_node import all_ops
+
+    seen = []
+    original = passes._hand_off_loop_nodes
+
+    def spy(graph):
+        seen.extend(
+            (
+                n.get_name(),
+                n.trip_count,
+                [o.get_operation_name() for o in all_ops(n.body)],
+            )
+            for n in _nodes_of(graph.operations)
+        )
+        return original(graph)
+
+    with mock.patch.object(passes, "_hand_off_loop_nodes", spy):
+        compiled = compile_with(lowering, fn, args, limit)
+    return compiled, seen
+
+
+@pytest.mark.parametrize("case", PLAN_VS_LEGACY)
+def test_pointwise_plan_matches_legacy_kernel_text(case):
+    """The same graph under both lowerings: the same groups, the same added ops, the
+    same loop nodes, the same normalised kernel text (LX offsets included) and the
+    same numbers."""
+    from test_span_overflow_loop_terms import _normalised
+
+    fn, shapes, limit, *_ = {**CASES, **EXTRA_CASES}[case]
+    args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
+    legacy, legacy_nodes = _nodes(fn, args, limit, "legacy")
+    plan, plan_nodes = _nodes(fn, args, limit, "plan")
+    assert legacy_nodes, "no loop node was built"
+    assert plan_nodes == legacy_nodes
+    assert plan.groups == legacy.groups
+    assert plan.added == legacy.added
+    assert _normalised(plan.code) == _normalised(legacy.code)
+    reference = fn(*[a.float() for a in args])
+    assert _relative_error(plan.outputs, reference) < 2e-2
