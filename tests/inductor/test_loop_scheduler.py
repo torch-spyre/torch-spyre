@@ -386,6 +386,93 @@ class TestLoopSchedulerNode(_Graph):
         snode = self._scheduler().create_scheduler_node(self._loop("loopnode0", [t, u]))
         self.assertEqual({d.name for d in snode.read_writes.reads}, {"x"})
 
+    def _refresh(self):
+        """Inductor's rebuild of a group node's dependencies, as the patch wraps it."""
+        # ls.refresh_group_node_dependencies is the function as imported, before the
+        # patches setUp installed.
+        return ls._refresh_keeping_fake_deps(ls.refresh_group_node_dependencies)
+
+    def test_stock_refresh_drops_the_loops_own_fake_dep(self):
+        # Why the wrapper exists: fusion scoring calls this, and the children never
+        # saw the fake dependency compute_dependencies gave the loop.
+        loop, _, _ = self._flat_loop()
+        self._input("y")
+        snode = self._scheduler().create_scheduler_node(loop)
+        snode.add_fake_dep(StarDep("other"))
+        ls.refresh_group_node_dependencies(snode)
+        self.assertNotIn("other", {d.name for d in snode.read_writes.reads})
+        self.assertNotIn("other", {d.name for d in snode.unmet_dependencies})
+
+    def test_the_wrapped_refresh_keeps_the_loops_fake_dep(self):
+        loop, _, _ = self._flat_loop()
+        self._input("y")
+        snode = self._scheduler().create_scheduler_node(loop)
+        snode.add_fake_dep(StarDep("other"))
+        self._refresh()(snode)
+        self.assertIn("other", {d.name for d in snode.read_writes.reads})
+        self.assertIn("other", {d.name for d in snode.unmet_dependencies})
+        # the rebuild still did its own work: the internal buffers stay internal
+        self.assertNotIn("t", {d.name for d in snode.unmet_dependencies})
+
+    def test_the_wrapped_refresh_does_not_resurrect_a_pruned_fake_dep(self):
+        # A pruner (prune_deps for a graph input, prune_weak_deps after dead-code
+        # elimination, _prune_redundant_deps) may remove a fake dependency; a later
+        # refresh must not put it back, or compute_ancestors would look up a name that
+        # is not in name_to_buf.
+        from torch.utils._ordered_set import OrderedSet
+
+        loop, _, _ = self._flat_loop()
+        self._input("y")
+        snode = self._scheduler().create_scheduler_node(loop)
+        dep = StarDep("other")
+        snode.add_fake_dep(dep)
+        snode.set_read_writes(snode.read_writes.remove_reads(OrderedSet([dep])))
+        self._refresh()(snode)
+        self.assertNotIn("other", {d.name for d in snode.read_writes.reads})
+        self.assertNotIn("other", {d.name for d in snode.unmet_dependencies})
+
+    def test_the_wrapped_refresh_does_not_resurrect_a_dep_pruned_from_unmet_only(self):
+        # prune_deps leaves a graph input in the reads and drops it from the unmet
+        # set; the refresh keeps it the same way.
+        loop, _, _ = self._flat_loop()
+        self._input("y")
+        snode = self._scheduler().create_scheduler_node(loop)
+        snode.add_fake_dep(StarDep("other"))
+        snode.unmet_dependencies = type(snode.unmet_dependencies)(
+            d for d in snode.unmet_dependencies if d.name != "other"
+        )
+        self._refresh()(snode)
+        self.assertIn("other", {d.name for d in snode.read_writes.reads})
+        self.assertNotIn("other", {d.name for d in snode.unmet_dependencies})
+
+    def test_a_refresh_replaced_inside_the_block_is_detected(self):
+        from torch._inductor import scheduler as stock
+
+        self._p.__exit__(None, None, None)
+        original = stock.refresh_group_node_dependencies
+        try:
+            with self.assertRaises(AssertionError):
+                with ls._replace_refresh():
+                    stock.refresh_group_node_dependencies = lambda group: None
+            # and it is put back even then
+            self.assertIs(stock.refresh_group_node_dependencies, original)
+        finally:
+            stock.refresh_group_node_dependencies = original
+            self._p = apply_loop_scheduler_patches()
+            self._p.__enter__()
+
+    def test_the_refresh_patch_is_installed_for_the_block_and_restored(self):
+        from torch._inductor import scheduler as stock
+
+        # setUp has the patches installed already; leave them for the check.
+        self._p.__exit__(None, None, None)
+        original = stock.refresh_group_node_dependencies
+        with apply_loop_scheduler_patches():
+            self.assertIsNot(stock.refresh_group_node_dependencies, original)
+        self.assertIs(stock.refresh_group_node_dependencies, original)
+        self._p = apply_loop_scheduler_patches()
+        self._p.__enter__()
+
     def test_add_fake_dep_ignores_internal_adds_external(self):
         loop, _, _ = self._flat_loop()
         self._input("y")

@@ -3173,6 +3173,21 @@ class TestCoarseTileNested(unittest.TestCase):
                     self.assertIsNotNone(getattr(op, "loop_info", None))
 
 
+def _legacy_lowering_only(cls):
+    """Run a test class against the legacy lowering alone.
+
+    These tests assert what the transform itself records and divides (hint lists,
+    ``loop_info`` fields, layouts) on mocked ops. The loop-term pass of stage 7a.2
+    appends one hint per op and reads real buffers, which a mocked graph does not
+    have; it has its own tests on real graphs (``test_span_overflow_loop_terms.py``).
+    """
+    return patch(
+        "torch_spyre._inductor.wsr.coarse_tile.add_loop_terms",
+        lambda *args, **kwargs: {},
+    )(cls)
+
+
+@_legacy_lowering_only
 class TestCoarseTileTiledDimsPerRead(unittest.TestCase):
     """Real-IR tests for CoarseTileInfo.tiled_dims_per_read /
     output_tiled_dims, using the small example from
@@ -7949,6 +7964,7 @@ def _ftl_pointwise_reading_twice(shape, permutation, name="buf0"):
     return op
 
 
+@_legacy_lowering_only
 class TestPredictFrame(unittest.TestCase):
     """predict_frame == what coarse_tile actually applies, and mutates no IR."""
 
@@ -9636,6 +9652,7 @@ class TestDerivedBases(unittest.TestCase):
         self.assertEqual(_derive_group_idx_offset(_graph([op])), 4)
 
 
+@_legacy_lowering_only
 class TestApplyTilingsEquivalence(unittest.TestCase):
     """``apply_tilings`` reduces to the hint path.
 

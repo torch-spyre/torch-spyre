@@ -45,6 +45,7 @@ from ..errors import Unsupported
 from ..ir import FixedTiledLayout
 from ..logging_utils import get_inductor_logger
 from ..loop_facts import counted_loop_path
+from ..loop_node import request_loop_nodes
 from ..pass_utils import (
     _prepare_per_core_view,
     iteration_space_from_op,
@@ -786,7 +787,12 @@ def apply_tilings(choices: Mapping[str, TileSpec], graph: GraphLowering) -> None
         for group_ops, _levels in groups
         for op in group_ops
     }
-    coarse_tile_post_stickify(graph, groups=groups, group_idx_offset=group_idx_offset)
+    request_loop_nodes(
+        graph,
+        coarse_tile_post_stickify(
+            graph, groups=groups, group_idx_offset=group_idx_offset
+        ),
+    )
     for op in graph.operations:
         was = untiled_symbols.get(op.get_name())
         if was is None or not isinstance(op, ComputedBuffer):
