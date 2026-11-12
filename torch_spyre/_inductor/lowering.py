@@ -1622,6 +1622,50 @@ def lower_keep_by_index(values, indices, dim, fill_value):
     return result
 
 
+@register_spyre_lowering(torch.ops.spyre.mask_by_index)
+def lower_mask_by_index(values, indices, dim):
+    # Unlike keep_by_index, no "maskval" constant is passed: the backend
+    # maskbyindex always masks with -inf and ignores any such constant.
+    from .pass_utils import concretize_expr
+
+    x_size = values.get_size()
+    ndim = len(x_size)
+
+    # Concretize dim if symbolic
+    if isinstance(dim, sympy.Basic):
+        norm_dim = int(concretize_expr(dim)) % ndim
+    else:
+        norm_dim = dim % ndim
+
+    indices_size = indices.get_size()
+    values_loader = values.make_loader()
+    indices_loader = indices.make_loader()
+
+    ranges = list(x_size)
+    reduction_ranges = [indices_size[norm_dim]]
+
+    def inner_fn(index, rindex):
+        values_index = list(index)
+        # indices has K at norm_dim position
+        indices_index = list(index)
+        indices_index[norm_dim] = rindex[0]
+        return (values_loader(values_index), indices_loader(indices_index))
+
+    result = SpyreReduction.create(
+        reduction_type="maskbyindex",
+        input_node=[values, indices],
+        device=values.get_device(),
+        dst_dtype=values.get_dtype(),
+        src_dtype=values.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=ranges,
+        reduction_ranges=reduction_ranges,
+        op_info={},
+    )
+    result.realize()
+    return result
+
+
 @register_spyre_lowering(torch.ops.aten.clone.default, type_promotion_kind=None)
 def clone(x, *, memory_format=None):
     result = lowering.clone(x, memory_format=memory_format)
@@ -2086,6 +2130,18 @@ def lower_cat(inputs, dim=0):
         )
         lowering.mutate_to(sliced_output, input_tensor)
         offset += input_tensor.get_size()[dim]
+
+    # Workaround pending #6263: patch_env cannot recover the env entry for this
+    # buffer (it is not in name_to_users), so the lookup in split_multi_ops fails
+    # with "No FX node for bufN" when a fused body loads the cat result directly.
+    # Register a dummy node here instead. Remove when #6263 is resolved.
+    fx_graph = V.graph.graph
+    first_compute_node = next(n for n in fx_graph.nodes if n.op != "placeholder")
+    with fx_graph.inserting_before(first_compute_node):
+        fx_node = fx_graph.create_node("call_function", torch.ops.aten.cat.default, ())
+    with V.fake_mode:
+        fx_node.meta["val"] = ir.ir_node_to_tensor(output)
+    V.graph.env[fx_node] = output
 
     return output
 

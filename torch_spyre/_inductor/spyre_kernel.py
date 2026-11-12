@@ -276,6 +276,10 @@ class SpyreOpFuncs:
         return ReductionOp("keepbyindex", [x, indices])
 
     @staticmethod
+    def mask_by_index(x, indices):
+        return ReductionOp("maskbyindex", [x, indices])
+
+    @staticmethod
     def layernormnorm(*args):
         return PointwiseOp("layernormnorm", list(args))
 

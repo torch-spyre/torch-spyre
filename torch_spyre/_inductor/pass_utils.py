@@ -79,7 +79,7 @@ from .core_mapping import (
 )
 from .constants import (
     ELIDED_COPY_BACK_ATTR,
-    KEEP_BY_INDEX_OP,
+    INDEX_MASKING_OPS,
     MATMUL_REDUCTION_OPS,
     RESTICKIFY_SUPPORTED_DEVICE_DTYPES,
     TOPK_OPS,
@@ -2610,7 +2610,7 @@ def select_work_division_transport_indexes(
     if write is None:
         raise Unsupported(f"{op.get_name()} has no MemoryDep write for work division")
     write_index = write.index
-    if is_keep_by_index(op):
+    if is_index_masking_op(op):
         reduction_vars = set(it_space) - write_index.free_symbols
         read_index = read_with_max_reduction_overlap(rw.reads, reduction_vars)
         if read_index is not None:
@@ -3246,7 +3246,21 @@ def compute_restickify_needed(
         # have extra dimensions in which the input will be broadcasted into.
         expanded, expanded_stl = expand_sparse(in_stl, dense_in_host)
         if expanded:
-            return True, expanded_stl
+            # expanded_stl expands the sparse layout to the natural dense form,
+            # whose stick always points along the host's last (fastest-varying)
+            # dim.  When target_stick asks for a *different* dim (e.g. the row
+            # axis of a [64, 256] tensor for a topk-along-dim-1 consumer), the
+            # expanded form has the wrong stick and would cause a
+            # "different stick loop variables" error in parse_op_spec.  Fall
+            # through to compute_restickify_target_layout, which can target the
+            # correct dim, when the sticks differ.
+            exp_idc = try_device_coordinates(expanded_stl, in_dep, ind_sizes, op=op)
+            exp_stick = exp_idc[-1] if exp_idc else None
+            if (
+                exp_stick is not None
+                and exp_stick.free_symbols == target_stick.free_symbols
+            ):
+                return True, expanded_stl
 
     # Local import avoids circular dependency (propagate_layouts imports pass_utils).
     from .propagate_layouts import PropArg  # noqa: PLC0415
@@ -3959,12 +3973,12 @@ def is_topk(op: Operation) -> bool:
     )
 
 
-def is_keep_by_index(op: Operation) -> bool:
-    """Return True iff ``op`` is a ``ComputedBuffer`` computing a keep_by_index reduction."""
+def is_index_masking_op(op: Operation) -> bool:
+    """Return True iff ``op`` is a keep_by_index or mask_by_index reduction."""
     return (
         isinstance(op, ComputedBuffer)
         and isinstance(op.data, Reduction)
-        and op.data.reduction_type == KEEP_BY_INDEX_OP
+        and op.data.reduction_type in INDEX_MASKING_OPS
     )
 
 
