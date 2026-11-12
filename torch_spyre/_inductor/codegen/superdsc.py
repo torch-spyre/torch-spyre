@@ -1658,14 +1658,18 @@ def _create_sdsc_tensors(
                 )
                 else None
             )
+            if dim_coord is not None and not isinstance(dim_coord, IndirectAccess):
+                # Even with no gap in its dim: an inner dim split off a flat one
+                # (normalize_coordinates) can carry an offset that walks into
+                # the next outer dim, ``[z0, c0 + 1]`` over ``[7, 7]``.
+                dim_offset = int(dim_coord.as_coeff_Add()[0])
+                coord_without_offset = dim_coord.as_coeff_Add()[1]
+                offsets[dim] = dim_offset * dim_device_stride
             if (
                 dim_coord is not None
                 and not isinstance(dim_coord, IndirectAccess)
                 and dev_dim_size != it_dim_size
             ):
-                dim_offset = int(dim_coord.as_coeff_Add()[0])
-                coord_without_offset = dim_coord.as_coeff_Add()[1]
-                offsets[dim] = dim_offset * dim_device_stride
                 # conv2d addresses the difference between device and iteration space sizes
                 # through the window/padding machinery in _conv2d_sdsc_fields, which already
                 # accounts for the gap between the device extent and the
