@@ -46,6 +46,7 @@ from .kernel_runner import (
     SpyreUnimplementedRunner,
 )
 from .kernel_cache import (
+    PrecomputedKernelKeyMismatch,
     allocate_compile_dir,
     commit_compile_dir,
     compute_specs_hash,
@@ -53,6 +54,8 @@ from .kernel_cache import (
     get_kernel_registry,
     load_symbol_kinds,
     record_kernel_name,
+    register_precomputed_key,
+    resolve_precomputed_key,
     save_symbol_kinds,
     _move_to_failed_dir,
 )
@@ -530,11 +533,80 @@ class SpyreAsyncCompile(AsyncCompile):
         self._pending_spyre_futures.append(future)
         return future
 
+    def _kernel_cache_key(
+        self,
+        kernel_name: str,
+        specs: Sequence[OpSpec | LoopSpec | UnimplementedOp],
+        pool_size: int,
+        backend_loop_unroll: bool,
+        ktir_device_mlir: str,
+        precomputed_key: str | None,
+    ) -> str | None:
+        """Return the kernel-cache key, or None to compile without the cache.
+
+        With config.precomputed_kernel_key == "1" the key codegen stored in the
+        wrapper is used when its fingerprint matches this process; a cache miss
+        then compiles and commits under it exactly as under a computed key,
+        since it is the value compute_specs_hash() returns for these specs.
+        Otherwise the key is computed; with "verify" both are and a difference
+        raises PrecomputedKernelKeyMismatch.
+        """
+        mode = _spyre_config.precomputed_kernel_key
+        trusted_key = None
+        if mode in ("1", "verify"):
+            trusted_key = resolve_precomputed_key(
+                precomputed_key,
+                pool_size,
+                backend_loop_unroll=backend_loop_unroll,
+                ktir_device_mlir=ktir_device_mlir,
+            )
+        if trusted_key is not None and mode == "1":
+            register_precomputed_key(trusted_key, kernel_name, specs)
+            return trusted_key
+        if trusted_key is None and mode == "verify" and precomputed_key:
+            logger.debug(
+                "Precomputed kernel key not verified  kernel=%s: its fingerprint "
+                "does not match this process",
+                kernel_name,
+            )
+
+        cache_key = None
+        try:
+            cache_key = compute_specs_hash(
+                specs,
+                kernel_name=kernel_name,
+                pool_size=pool_size,
+                backend_loop_unroll=backend_loop_unroll,
+                ktir_device_mlir=ktir_device_mlir,
+            )
+        except RuntimeError as e:
+            logger.warning(
+                "Kernel cache disabled for %s: could not compute cache key: %s. "
+                "Set SPYRE_KERNEL_CACHE=0 to suppress this warning.",
+                kernel_name,
+                e,
+            )
+        # A key that could not be computed (warned above) leaves nothing to
+        # compare with; that is not a mismatch.
+        if trusted_key is not None and cache_key is not None:
+            if trusted_key != cache_key:
+                raise PrecomputedKernelKeyMismatch(
+                    f"precomputed kernel key {trusted_key} for {kernel_name} "
+                    f"differs from compute_specs_hash() = {cache_key}"
+                )
+            logger.info(
+                "Precomputed kernel key verified  kernel=%s  key=%s",
+                kernel_name,
+                cache_key,
+            )
+        return cache_key
+
     def sdsc(
         self,
         kernel_name: str,
         specs: Sequence[OpSpec | LoopSpec | UnimplementedOp],
         pool_size: int = 0,
+        precomputed_key: str | None = None,
     ):
         unimp = find_unimplemented(list(specs))
         if unimp is not None:
@@ -590,22 +662,15 @@ class SpyreAsyncCompile(AsyncCompile):
             # Hash the specs in-memory before compiling.  On a cache hit
             # neither generate_bundle nor the backend compiler runs at all
             # (only the kernel_name.txt marker is touched).
-            try:
-                cache_key = compute_specs_hash(
-                    specs,
-                    kernel_name=kernel_name,
-                    pool_size=pool_size,
-                    backend_loop_unroll=backend_loop_unroll,
-                    ktir_device_mlir=ktir_device_mlir,
-                )
-            except RuntimeError as e:
-                logger.warning(
-                    "Kernel cache disabled for %s: could not compute cache key: %s. "
-                    "Set SPYRE_KERNEL_CACHE=0 to suppress this warning.",
-                    kernel_name,
-                    e,
-                )
-            else:
+            cache_key = self._kernel_cache_key(
+                kernel_name,
+                specs,
+                pool_size,
+                backend_loop_unroll,
+                ktir_device_mlir,
+                precomputed_key,
+            )
+            if cache_key is not None:
                 logger.debug("Bundle cache key: %s", cache_key)
 
                 cached_dir = get_cached_kernel_dir(cache_key)
