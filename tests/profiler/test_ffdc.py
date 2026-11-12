@@ -22,6 +22,7 @@ import pytest
 import torch
 
 from torch_spyre import make_spyre_module  # type: ignore[attr-defined]
+from torch_spyre._inductor.timing_recorder import BACKEND_COMPILE_EVENT
 from torch_spyre.constants import DEVICE_NAME
 from torch_spyre.profiler import get_diagnostic_report as profiler_get_diagnostic_report
 from torch_spyre.profiler._ffdc import (
@@ -1158,6 +1159,8 @@ class TestFfdcAsyncCompile:
                 return False
 
         class _FakeTimingRecorder:
+            BACKEND_COMPILE_EVENT = BACKEND_COMPILE_EVENT
+
             @staticmethod
             def stage(*_a, **_k):
                 from contextlib import nullcontext
@@ -1234,7 +1237,7 @@ class TestFfdcAsyncCompile:
         mod = _reimport(monkeypatch, "torch_spyre.execution.async_compile")
         # Run the process-local compiler and FFDC mocks inline.
         monkeypatch.setattr(torch._inductor.config, "compile_threads", 1)
-        monkeypatch.setattr(mod, "get_output_dir", lambda name: out_dir)
+        monkeypatch.setattr(mod, "get_output_dir", lambda name, prefix=None: out_dir)
         monkeypatch.setattr(mod, "generate_bundle", lambda *a, **k: [])
         monkeypatch.setattr(mod, "find_unimplemented", lambda specs: None)
         return mod, out_dir
@@ -1379,7 +1382,7 @@ class TestFfdcKernelRunner:
 
         mod = _reimport(monkeypatch, "torch_spyre.execution.kernel_runner")
         monkeypatch.setattr(mod, "launch_jobplan", _launch)
-        monkeypatch.setattr(mod, "prepare_kernel", lambda path: "fake_jobplan")
+        monkeypatch.setattr(mod, "prepare_kernel", lambda path, **kw: "fake_jobplan")
         monkeypatch.setattr(mod, "register_kernel_provenance", lambda *a, **k: True)
         return mod
 

@@ -296,10 +296,22 @@ void SpyreStream::copyAsync(const at::Tensor& src,
     // two products are always equal here. Both halves are kept anyway as
     // defense-in-depth, in case the size precondition is ever relaxed or
     // copyAsync gains a caller that bypasses spyre_copy_'s check.
+    //
+    // On big-endian hosts the device is little-endian, and a raw DMA skips
+    // the byte-order conversion that deeptools::ConvertData performs, so
+    // multi-byte elements would arrive byte-swapped. Single-byte elements
+    // have no byte order, so they may still take the raw-DMA fast path.
+    // dci_is_identity_copy requires matching data formats, so the CPU and
+    // device element sizes are equal here.
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    const bool byte_order_safe = cpu_tensor->element_size() == 1;
+#else
+    const bool byte_order_safe = true;
+#endif
     const auto* allocation = get_composite_address(*dev_tensor);
     const size_t dev_total_size = static_cast<size_t>(allocation->total_size());
     const DataConversionInfo* dci_arg =
-        (dci_is_identity_copy(dci) &&
+        (byte_order_safe && dci_is_identity_copy(dci) &&
          static_cast<size_t>(cpu_tensor->numel() *
                              cpu_tensor->element_size()) == dev_total_size &&
          static_cast<size_t>(dev_tensor->numel() *
@@ -437,14 +449,6 @@ void SpyreStream::copyAsyncImpl(void* cpu_ptr, size_t host_capacity,
           /*pipeline_barrier=*/false,
           /*skip_hazard=*/false, std::move(host_lifetime));
     }
-    // Neither factory forwards the D2H conversion out-buffer capacity: flex's
-    // handleDmaDataConversionD2H reads host_capacity_bytes (falling back to
-    // the device-format dma_size, which under-reports the host buffer for
-    // dtype-upscaling conversions like bf16 -> fp32).
-    // TODO(#2149-flex): writing a public DmaParams field after the factory is
-    // fragile — flex should take the D2H out-capacity as a factory argument.
-    // Tracked in a flex issue; remove this write once the factory is extended.
-    params->host_capacity_bytes = host_capacity;
     try {
       launchD2H(params);
     }
@@ -486,6 +490,11 @@ void SpyreStream::launchHostCallback(flex::HostCallbackParams* params) const {
 
 void SpyreStream::launchFillAsync(flex::FillAsyncParams* params) const {
   RECORD_FUNCTION("launch::Memset", {});
+  resolveRuntimeHandle()->launchOperation(params);
+}
+
+void SpyreStream::launchCopyRaw(flex::CopyRawParams* params) const {
+  RECORD_FUNCTION("launch::CopyRaw", {});
   resolveRuntimeHandle()->launchOperation(params);
 }
 

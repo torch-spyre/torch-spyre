@@ -33,16 +33,18 @@ from torch._inductor.ir import (
     MutableBox,
     MutationLayoutSHOULDREMOVE,
     MultiOutput,
+    NoneLayout,
     ReinterpretView,
     Operation,
     Pointwise,
     Reduction,
     StorageBox,
     TensorBox,
+    _CollectiveKernel,
 )
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
-from torch._inductor.scheduler import SchedulerNode
+from torch._inductor.scheduler import FusedSchedulerNode, SchedulerNode
 from torch._inductor.virtualized import V
 
 from . import config
@@ -68,17 +70,16 @@ from .constants import (
     COPY_BACK_CANDIDATE_ATTR,
     DEVICE_NAME,
     ELIDED_COPY_BACK_ATTR,
+    MATMUL_REDUCTION_OPS,
     REDUCTIONS_NON_STICK_DIM_ONLY,
     STAGGERED_EAS,
 )
 from .ir import (
-    AllGatherAsyncFallback,
-    AllReduceAsyncFallback,
     FixedTiledLayout,
+    BroadcastKernel,
+    SpyreCollectiveKernel,
     SpyreConstantFallback,
     SpyreEmptyFallback,
-    BroadcastAsyncFallback,
-    WaitWorkFallback,
 )
 from .pass_utils import (
     compute_restickify_target_layout,
@@ -97,6 +98,7 @@ from .pass_utils import (
     is_stick_expr_offset_free,
     is_topk,
     iter_var_id,
+    op_read_writes,
     rescale_stl_for_dtype,
 )
 from .optimize_restickify import AllSameNode, AnyInNode, FixedInOutNode
@@ -164,12 +166,18 @@ def _compact_broadcast_device_dims(stl: SpyreTensorLayout) -> SpyreTensorLayout:
 
     The generic layout constructor retains a broadcast dimension's logical
     extent in ``device_size`` even though its zero ``stride_map`` makes every
-    access land at coordinate zero.  That is useful for host transfers, which
-    materialize expanded tensors, but it needlessly multiplies the allocation
+    access land at coordinate zero.  That needlessly multiplies the allocation
     and span of compiler-generated overlapping buffers such as coarse-tile read
     copies.  Collapse every such non-stick device dimension to one.  The final
-    device dimension remains a full hardware stick; making its stride sparse is
+    device dimension remains a full hardware stick; making its stride zero is
     enough to represent a broadcast stick.
+
+    Only collapses dimensions whose ``device_size > 1``: a dimension already at
+    size 1 needs no rebuild.  This matters for the elided size-1 stride-0
+    dimension, which compaction would otherwise rewrite, making the resulting
+    layout depend on pass order.  It does not protect the padding gap
+    dimension (size 64): that one is safe only because the restickify/clone
+    path returns via ``_clone_layout`` before this pass runs.
     """
     device_size = list(stl.device_size)
     stride_map = list(stl.stride_map)
@@ -177,10 +185,9 @@ def _compact_broadcast_device_dims(stl: SpyreTensorLayout) -> SpyreTensorLayout:
     for dim, stride in enumerate(stride_map):
         if stride != 0:
             continue
-        stride_map[dim] = -1
-        if dim != len(device_size) - 1:
+        if dim != len(device_size) - 1 and device_size[dim] != 1:
             device_size[dim] = 1
-        changed = True
+            changed = True
     if not changed:
         return stl
     return SpyreTensorLayout(
@@ -452,7 +459,41 @@ def _convert_reads_whole_input(
     )
 
 
-def _qfp8ch_stl(stl: SpyreTensorLayout, out_dtype: torch.dtype) -> SpyreTensorLayout:
+def _qfp8ch_count_dim(stl: SpyreTensorLayout, coords: list[sympy.Expr]) -> int | None:
+    """Device dim counting the input's sticks; None if there is none to rescale.
+
+    A non-stick dim whose coordinate uses the stick variable is the count dim.
+    Otherwise the count is 1: the lone size-1, coordinate-0 dim. Raises
+    ``Unsupported`` when neither identifies one dim.
+    """
+    in_eps = stl.device_size[-1]
+    stick_syms = coords[-1].free_symbols
+    dims = range(len(stl.device_size) - 1)
+    uses_stick = [i for i in dims if coords[i].free_symbols & stick_syms]
+    if uses_stick:
+        if len(uses_stick) == 1 and stl.stride_map[uses_stick[0]] == in_eps:
+            return uses_stick[0]
+    else:
+        ones = [
+            i
+            for i in dims
+            if coords[i] == 0
+            and stl.device_size[i] == 1
+            and stl.stride_map[i] in (in_eps, -1)
+        ]
+        if len(ones) == 1:
+            return ones[0]
+        if not ones and not any(stl.stride_map[i] == in_eps for i in dims):
+            return None
+    raise Unsupported(
+        f"qfp8ch: no stick-count dim in device_size {list(stl.device_size)}, "
+        f"stride_map {list(stl.stride_map)}, coordinates {coords}"
+    )
+
+
+def _qfp8ch_stl(
+    stl: SpyreTensorLayout, out_dtype: torch.dtype, coords: list[sympy.Expr]
+) -> SpyreTensorLayout:
     """Output layout of ``qfp8ch``: fp16 (64/stick) -> fp8 (128/stick) quantization.
 
     Propagates the input device layout, preserving any padding, and rescales
@@ -463,17 +504,19 @@ def _qfp8ch_stl(stl: SpyreTensorLayout, out_dtype: torch.dtype) -> SpyreTensorLa
     conversion that consumes it rebuilds a dense layout from the host size,
     treating the partial stick exactly like any other unaligned stick dim --
     so it must never floor to a size-0 dim (issue #3604).
+
+    ``coords`` are the input's device coordinates; they pick the count dim.
     """
     in_eps = stl.device_size[-1]
     out_eps = get_elem_in_stick(out_dtype)
     out_device_size = list(stl.device_size)
     out_stride_map = list(stl.stride_map)
     out_device_size[-1] = out_eps
-    for i, s in enumerate(stl.stride_map):
-        if s == in_eps:
-            out_device_size[i] = -(-(stl.device_size[i] * in_eps) // out_eps)
-            out_stride_map[i] = out_eps
-            break
+    i = _qfp8ch_count_dim(stl, coords)
+    # A broadcast count dim (stride -1) keeps its stride.
+    if i is not None and stl.stride_map[i] == in_eps:
+        out_device_size[i] = -(-(stl.device_size[i] * in_eps) // out_eps)
+        out_stride_map[i] = out_eps
     return SpyreTensorLayout(
         out_device_size,
         out_stride_map,
@@ -534,7 +577,7 @@ def _qfp8wt_stl(
     )
 
 
-def _reduction_layout(
+def _reduction_layout_from_stl(
     op: Operation,
     output: FixedLayout,
     output_dep: MemoryDep,
@@ -542,10 +585,11 @@ def _reduction_layout(
     in_layout: FixedLayout,
     stl: SpyreTensorLayout,
 ) -> list[SpyreTensorLayout]:
-    """Output STL candidates for a reduction op.
+    """Output STL candidates of a reduction for one candidate input STL.
 
     Tries to preserve the input layout first (mapped through the reduction),
-    then falls back to scanning alternative input dims.
+    then falls back to scanning alternative input dims. An empty result means
+    this candidate cannot produce a supported output layout.
     """
     data = op.data
     # Bool physical format resolution: see bool_layout_dtype's docstring.
@@ -666,22 +710,23 @@ def _convert_layout(
             in_coords = host_coordinates(in_layout, dep, None)
             source_device_coords = device_coordinates(stl, dep, None)
             staggered_arg = PropArg(dep, in_layout, [stl])
-            for target_stick_expr in in_coords:
-                if not target_stick_expr.free_symbols:
-                    continue
-                target_stl = compute_restickify_target_layout(
-                    stl,
-                    in_layout,
-                    target_stick_expr,
-                    in_coords,
-                    source_device_coords,
-                    arg=staggered_arg,
-                )
-                if target_stl is None:
-                    continue
-                candidate = rescale_stl_for_dtype(target_stl, output.dtype, fmt)
-                if candidate not in layouts:
-                    layouts.append(candidate)
+            if source_device_coords[-1].free_symbols:
+                for target_stick_expr in in_coords:
+                    if not target_stick_expr.free_symbols:
+                        continue
+                    target_stl = compute_restickify_target_layout(
+                        stl,
+                        in_layout,
+                        target_stick_expr,
+                        in_coords,
+                        source_device_coords,
+                        arg=staggered_arg,
+                    )
+                    if target_stl is None:
+                        continue
+                    candidate = rescale_stl_for_dtype(target_stl, output.dtype, fmt)
+                    if candidate not in layouts:
+                        layouts.append(candidate)
 
         # Under the current EA map, an already-staggered input is the
         # reverse staggered-to-STANDARD restoration. It needs no
@@ -795,7 +840,7 @@ def _single_arg_op_layout(
     in_layout: FixedLayout,
     stl: SpyreTensorLayout,
 ) -> list[SpyreTensorLayout]:
-    """Compute output STL(s) for one candidate input STL of a single-arg op.
+    """Compute output STL(s) for one candidate input STL of a single-arg pointwise op.
 
     Called once per candidate input STL to produce corresponding output STL(s).
     An empty result means this candidate cannot produce a supported output layout;
@@ -803,10 +848,7 @@ def _single_arg_op_layout(
     """
     data = op.data
 
-    if isinstance(data, Reduction):
-        return _reduction_layout(op, output, output_dep, dep, in_layout, stl)
-
-    # Single-arg pointwise
+    # Reductions are laid out by _reduction_layouts.
     assert isinstance(data, Pointwise)
     aten_op = next(iter(data.origins)).target if data.origins else None
     match aten_op:
@@ -851,7 +893,14 @@ def _single_arg_op_layout(
             # preserving any padding present in the input STL. Not
             # rescale_stl_for_dtype: an fp16 tensor with an odd stick count
             # ends in a partially filled fp8 stick, which that helper rejects.
-            return [_qfp8ch_stl(stl, output.dtype)]
+            coords = try_device_coordinates(stl, dep, None)
+            if coords is None:
+                return []
+            try:
+                return [_qfp8ch_stl(stl, output.dtype, coords)]
+            except Unsupported:
+                # Drop this candidate; the others stay available.
+                return []
 
         case spyreop.qfp8wt.default:
             # fp16 -> fp8 weight quantization with 2D-stick layout [2, 64].
@@ -1069,7 +1118,6 @@ def _factorized_chain(
     host_size: list,
     host_stride: list,
     var: sympy.Symbol,
-    reduction_type: str,
     label: str,
 ) -> tuple[list[int], int, int]:
     """Validate the host dims that jointly carry ``var`` as one contiguous chain.
@@ -1122,7 +1170,7 @@ def _factorized_chain(
         or host_stride[chain[-1]] != var_stride
     ):
         raise Unsupported(
-            f"{reduction_type}: cannot canonicalize factorized {label}_var="
+            f"cannot canonicalize factorized {label}_var="
             f"{var}; expected an affine contiguous host dimension chain "
             f"covering a window of whole inner dims, got host coordinates "
             f"{host_coords}, size={list(arg.layout.size)}, "
@@ -1191,7 +1239,7 @@ def _rebuild_stl_for_matmul(
         if var is None:
             continue
         hdims, _, var_stride = _factorized_chain(
-            arg, host_coords, host_size, host_stride, var, reduction_type, label
+            arg, host_coords, host_size, host_stride, var, label
         )
         if len(hdims) == 1 and not is_stick:
             continue
@@ -1297,20 +1345,25 @@ def _find_quantized_candidate(
     stick_var: sympy.Symbol,
     reduction_type: str,
 ) -> "SpyreTensorLayout | None":
-    """Return the first quantized (FP8/QFP8) candidate that is usable, or None.
+    """Return the first non-STANDARD candidate that is usable, or None.
 
     Quantized arrangements carry their own contraction structure and are
     returned immediately without restickify logic.
-    Exception: BATCH_MATMUL_FP8_OP requires stick_var on the stick — a sparse
-    QFP8CH candidate without it is skipped so the dense candidate can be used.
+    Exceptions that require stick_var on the stick:
+    - BATCH_MATMUL_FP8_OP: a sparse QFP8CH candidate without it is skipped so
+      the dense candidate can be used.
+    - Staggered arrangements: the later strategies skip non-STANDARD
+      candidates, so one without stick_var on the stick would be used as is.
     """
     for stl, dev_coords in candidates:
-        if stl.element_arrangement == ElementArrangement.STANDARD:
+        ea = stl.element_arrangement
+        if ea == ElementArrangement.STANDARD:
             continue
-        if reduction_type != BATCH_MATMUL_FP8_OP or (
-            stick_var in dev_coords[-1].free_symbols
-        ):
-            return stl
+        if (
+            reduction_type == BATCH_MATMUL_FP8_OP or ea in STAGGERED_EAS
+        ) and stick_var not in dev_coords[-1].free_symbols:
+            continue
+        return stl
     return None
 
 
@@ -1394,6 +1447,11 @@ def _stl_via_restickify(
         if target_stick_expr is None:
             continue
         stl, dev_coords = _prepare_for_restickify(stl, dev_coords, reduction_type)
+        if (
+            not dev_coords[-1].free_symbols
+            and reduction_type not in MATMUL_REDUCTION_OPS
+        ):
+            continue
         result = compute_restickify_target_layout(
             stl,
             arg.layout,
@@ -1401,7 +1459,6 @@ def _stl_via_restickify(
             arg_host_coords,
             dev_coords,
             arg=arg,
-            reduction_type=reduction_type,
             label=label,
         )
         if result is not None:
@@ -1701,7 +1758,7 @@ def _broadcast_split(
 ) -> tuple[list[SpyreTensorLayout], list[SpyreTensorLayout]]:
     """Partition arg.layouts into (broadcast, non_broadcast) candidates.
 
-    A stick is a broadcast when stride_map[-1] == -1 (sparse last device dim).
+    A stick is a broadcast when stride_map[-1] == 0 (sparse last device dim).
     Scalars (0-d layout) are always broadcastable.
     """
     if len(arg.layout.size) == 0:
@@ -1709,7 +1766,7 @@ def _broadcast_split(
     broadcast: list[SpyreTensorLayout] = []
     non_broadcast: list[SpyreTensorLayout] = []
     for stl in arg.layouts:
-        (broadcast if stl.stride_map[-1] == -1 else non_broadcast).append(stl)
+        (broadcast if stl.stride_map[-1] == 0 else non_broadcast).append(stl)
     return broadcast, non_broadcast
 
 
@@ -1763,7 +1820,7 @@ def _resolve_pointwise_ea(ea_args: list[PropArg]) -> ElementArrangement:
     # A device *stick* is a broadcast (carries at most one distinct host
     # element) exactly when it maps to a size-1 / sparse host axis. In an STL
     # the stick is the last device dim and the layout constructor
-    # (spyre_tensor_impl.cpp) sets `stride_map[-1] == -1` precisely in that
+    # (spyre_tensor_impl.cpp) sets `stride_map[-1] == 0` precisely in that
     # case. This is the correct, dim_order-independent test — reading
     # `arg.layout.size[-1]` only works under an identity dim_order (e.g. host
     # size [1, 64, 1] with the stick on a size-1 axis that is not last would
@@ -1810,7 +1867,7 @@ def _resolve_pointwise_ea(ea_args: list[PropArg]) -> ElementArrangement:
         #
         # ElementArrangement changes only the order of elements *within* a
         # stick. Every candidate retained here has a sparse stick
-        # (stride_map[-1] == -1), so all its logical loads address the same
+        # (stride_map[-1] == 0), so all its logical loads address the same
         # within-stick element and the stagger is unobservable. Its outer
         # device geometry may still be noncanonical (dtype conversion keeps
         # its producer's geometry); that geometry remains on the input and
@@ -2120,6 +2177,65 @@ def _multi_arg_pointwise_layouts(
     return results
 
 
+def _reduction_layouts(
+    op: Operation,
+    output: FixedLayout,
+    output_dep: MemoryDep,
+    args: list[PropArg],
+    *,
+    cost_args: list[PropArg] | None = None,
+    out_deps: MemoryDep | list[MemoryDep] | None = None,
+) -> list[SpyreTensorLayout]:
+    """Output STL candidates and restickify cost for a reduction.
+
+    The candidates follow the first input, the one being reduced; any further
+    inputs (the weight of a depthwise conv) are matched by the cost node.
+    ``cost_args`` and ``out_deps`` default to ``args`` and ``output_dep``; a
+    mutation op passes its full reads and the co-output dep of its target.
+
+    A ``REDUCTIONS_NON_STICK_DIM_ONLY`` op (``prod``) cannot reduce along the
+    stick, so an input whose stick carries the reduced dim is restickified off
+    it (``forbidden_stick_sym`` in ``AllSameNode.from_args``). When its output
+    keeps only size-1 dims, as for ``prod`` of a ``(1, N)`` tensor over dim 1,
+    no dim can carry the output stick, so the output takes a synthetic stick
+    (one element per stick), as in ``_topk_layouts``.
+    """
+    arg = args[0]
+    layouts = []
+    for stl in arg.layouts:
+        layouts.extend(
+            _reduction_layout_from_stl(op, output, output_dep, arg.dep, arg.layout, stl)
+        )
+    non_stick_only = op.data.reduction_type in REDUCTIONS_NON_STICK_DIM_ONLY
+    if (
+        not layouts
+        and non_stick_only
+        and all(c == 0 for c in host_coordinates(output, output_dep, None))
+    ):
+        c_size = [concretize_expr(s) for s in output.size]
+        c_stride = [concretize_expr(s) for s in output.stride]
+        dim_order = list(range(len(output.size))) + [-1]
+        layouts.append(SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order))
+    if any(stride == 0 for stride in output.stride):
+        layouts = [_compact_broadcast_device_dims(stl) for stl in layouts]
+    if not layouts:
+        raise Unsupported(
+            f"{op.get_name()} ({op.data.reduction_type}): no supported output "
+            f"layout found for any of {len(arg.layouts)} candidate input layouts; "
+            f"output size={output.size}"
+        )
+    op.restick_cost_fn = AllSameNode.from_args(
+        args if cost_args is None else cost_args,
+        layouts,
+        output_dep if out_deps is None else out_deps,
+        op,
+        forbidden_stick_sym=(
+            find_reduction_var((arg.dep,), output_dep) if non_stick_only else None
+        ),
+    )
+    return layouts
+
+
 def _topk_layouts(
     op: Operation,
     output: FixedLayout,
@@ -2331,6 +2447,9 @@ def compute_layouts(
 
     if is_keep_by_index(op):
         return _keep_by_index_layouts(op, output, output_dep, args)
+
+    if isinstance(data, Reduction):
+        return _reduction_layouts(op, output, output_dep, args)
 
     aten_op = next(iter(data.origins)).target if data.origins else None
 
@@ -2581,9 +2700,7 @@ def _align_single_source_producer(
     """
     if not isinstance(target_buffer, ComputedBuffer):
         return
-    reads = [
-        r for r in target_buffer.get_read_writes().reads if isinstance(r, MemoryDep)
-    ]
+    reads = [r for r in op_read_writes(target_buffer).reads if isinstance(r, MemoryDep)]
     if len(reads) != 1:
         return
     producer_name = reads[0].name
@@ -2619,7 +2736,7 @@ def _scan_mutation_layout_inputs(
     for op in operations:
         if not isinstance(op, ComputedBuffer):
             continue
-        for read in op.get_read_writes().reads:
+        for read in op_read_writes(op).reads:
             if isinstance(read, MemoryDep):
                 consumer_counts[read.name] += 1
         if not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
@@ -2652,7 +2769,7 @@ def _scan_mutation_layout_inputs(
             target_stl = generic_layout(target_buffer)
         is_graph_input = name in V.graph.graph_inputs
         for op in group:
-            rw = op.get_read_writes()
+            rw = op_read_writes(op)
             output_dep = next(iter(rw.writes))
             # Only the first read is offered, and strict=False drops it when it
             # has no layout yet -- an internal buffer's producer, say. With no
@@ -2702,7 +2819,7 @@ def _fresh_allocation_layout(
     for writer in writers:
         reads = [
             r
-            for r in writer.get_read_writes().reads
+            for r in op_read_writes(writer).reads
             if r.name != name and _carries_element_arrangement(r, op.get_dtype())
         ]
         # TODO: a source computed after the allocation, as in
@@ -2740,7 +2857,7 @@ def _carries_element_arrangement(read, dtype: torch.dtype) -> bool:
     if not isinstance(buf, ComputedBuffer):
         return True
     # A buffer with no reads, such as an arange, is not a constant fill.
-    fill_reads = [r for r in buf.get_read_writes().reads if isinstance(r, MemoryDep)]
+    fill_reads = [r for r in op_read_writes(buf).reads if isinstance(r, MemoryDep)]
     return not fill_reads or not all(
         isinstance(V.graph.get_buffer(r.name), SpyreConstantFallback)
         for r in fill_reads
@@ -2775,7 +2892,7 @@ def _check_whole_stagger_units(
     if stick_dim is None:
         return
     unit = get_elem_in_stick(torch.float16)
-    output_dep = next(iter(writer.get_read_writes().writes))
+    output_dep = next(iter(op_read_writes(writer).writes))
     coord = host_coordinates(target_layout, output_dep, None)[stick_dim]
     syms = coord.free_symbols
     offset = coord.subs({s: 0 for s in syms})
@@ -2884,7 +3001,7 @@ def _resolve_copy_back_candidates(operations: list[Operation]) -> None:
     names_read: set[str] = set()
 
     for op in operations:
-        read_writes = op.get_read_writes()
+        read_writes = op_read_writes(op)
         for write in read_writes.writes:
             writer_by_name[write.name] = op
             write_counts[write.name] += 1
@@ -2905,7 +3022,7 @@ def _resolve_copy_back_candidates(operations: list[Operation]) -> None:
         ):
             continue
 
-        read_writes = copy_op.get_read_writes()
+        read_writes = op_read_writes(copy_op)
         source = _one_mem_dep(read_writes.reads)
         destination = _one_mem_dep(read_writes.writes)
         if source is None or destination is None:
@@ -2958,6 +3075,8 @@ def _resolve_copy_back_candidates(operations: list[Operation]) -> None:
         if len(producer_layouts) != 1:
             continue
 
+        # _same_host_layout above keeps the write index, so the producer's
+        # memoized op_read_writes stays valid.
         producer.layout = copy_op.layout
         producer.layouts = [target_stl]
         producer.committed_stl = target_stl
@@ -2972,7 +3091,7 @@ def _resolve_copy_back_candidates(operations: list[Operation]) -> None:
         )
 
     for op in removed_ops:
-        for write in op.get_read_writes().writes:
+        for write in op_read_writes(op).writes:
             V.graph.removed_buffers.add(write.name)
         operations.remove(op)
 
@@ -3086,13 +3205,13 @@ def _handle_multi_candidate_cooutput(
     enforces this; restickify may only be inserted on real input edges, not on
     the output buffer itself (issue #3845).
     """
-    target_write_dep = _one_mem_dep(target_buf.get_read_writes().writes)
+    target_write_dep = _one_mem_dep(op_read_writes(target_buf).writes)
     assert target_write_dep is not None, (
         f"{op.get_name()}: mutation target {target_name!r} "
         f"must have exactly one write MemoryDep to synthesize "
         f"a coupling edge"
     )
-    rw = op.get_read_writes()
+    rw = op_read_writes(op)
     output_dep = next(iter(rw.writes))
     args = _get_prop_args(rw.reads)  # real inputs only (e.g. src)
     op.layouts = list(target_buf_layouts)  # inherit target's candidates
@@ -3119,7 +3238,7 @@ def _handle_empty_fallback_mutation(
         target_name,
         type(target_buf).__name__,
     )
-    rw = op.get_read_writes()
+    rw = op_read_writes(op)
     output_dep = next(iter(rw.writes))
     all_args = _get_prop_args(rw.reads)
     # Exclude the target read-back (dep.name == target_name) from
@@ -3178,34 +3297,20 @@ def _handle_empty_fallback_mutation(
         op.layouts = candidates
     elif isinstance(op.data, Reduction):
         # The non-target input is the reduction's un-reduced,
-        # higher-rank input. Must use _single_arg_op_layout, not the
-        # broadcast-oriented pointwise join path.
+        # higher-rank input. Must use the reduction candidates, not
+        # the broadcast-oriented pointwise join path.
         assert len(new_value_args) == 1, (
             "Reduction mutation op should have exactly one non-target "
             f"input, got {len(new_value_args)} for {op.get_name()}"
         )
-        accum_layout = target_buf.get_layout()
-        in_arg = new_value_args[0]
-        candidates = []
-        for stl in in_arg.layouts:
-            candidates.extend(
-                _single_arg_op_layout(
-                    op,
-                    accum_layout,
-                    output_dep,
-                    in_arg.dep,
-                    in_arg.layout,
-                    stl,
-                )
-            )
-        if not candidates:
-            raise Unsupported(
-                f"{op.get_name()}: no supported output layout "
-                f"found for any of {len(in_arg.layouts)} "
-                f"candidate input layouts; target size="
-                f"{accum_layout.size}"
-            )
-        op.restick_cost_fn = AllSameNode.from_args(all_args, candidates, out_deps, op)
+        candidates = _reduction_layouts(
+            op,
+            target_buf.get_layout(),
+            output_dep,
+            new_value_args,
+            cost_args=all_args,
+            out_deps=out_deps,
+        )
         target_buf.layouts = candidates
         op.layouts = candidates
     else:
@@ -3355,6 +3460,8 @@ def propagate_spyre_tensor_layouts(
                         )
                     new_layout = _eager_view_input_layout(real_input, ptl, name)
                     if new_layout is not None:
+                        # Keeps stride and offset, so readers' memoized
+                        # op_read_writes indices stay valid.
                         tb.data.data.layout = new_layout
                     tb.layouts = [stl]
 
@@ -3426,7 +3533,7 @@ def propagate_spyre_tensor_layouts(
                     # expected, not exceptional.
                     _handle_empty_fallback_mutation(op, target_buf, target_name)
                     continue
-                rw = op.get_read_writes()
+                rw = op_read_writes(op)
                 output_dep = next(iter(rw.writes))
                 args = _get_prop_args(rw.reads)
 
@@ -3480,7 +3587,7 @@ def propagate_spyre_tensor_layouts(
                 )
                 continue
             op.decide_layout()
-            rw = op.get_read_writes()
+            rw = op_read_writes(op)
             output_dep = next(iter(rw.writes))
             args = _get_prop_args(rw.reads)
             output = op.get_layout()
@@ -3507,6 +3614,23 @@ def propagate_spyre_tensor_layouts(
                 op.layouts = compute_layouts(op, output, output_dep, args)
             else:
                 logger.warning(f"Warning: unhandled node type {type(op.data)}")
+        elif isinstance(op, _CollectiveKernel):
+            # Must precede the FallbackKernel branch (_CollectiveKernel is one).
+            # In-place collectives and waits have NoneLayout and own no buffer:
+            # their inputs keep their layouts.  Out-of-place collectives own
+            # their output buffer.
+            if isinstance(op.layout, NoneLayout):
+                pass
+            elif isinstance(op, BroadcastKernel):
+                # Same shape as the input; broadcast_run allocates it alike.
+                input_buf = V.graph.get_buffer(op.inputs[0].get_name())
+                op.layouts = list(input_buf.layouts)
+                op.restick_cost_fn = AnyInNode.from_args()
+            elif isinstance(op, SpyreCollectiveKernel):
+                op.layouts = [generic_layout(op)]
+                op.restick_cost_fn = AnyInNode.from_args()
+            else:
+                logger.warning(f"unhandled collective type {type(op)}")
         elif isinstance(op, FallbackKernel):
             # FallbackKernel.create in PyTorch produces three cases:
             #   Case 1 (single tensor)  -> FixedLayout on the FallbackKernel itself
@@ -3546,21 +3670,6 @@ def propagate_spyre_tensor_layouts(
                 op.layouts = [generic_layout(op)]
                 op.restick_cost_fn = AnyInNode.from_args()
 
-        elif isinstance(
-            op,
-            (
-                BroadcastAsyncFallback,
-                WaitWorkFallback,
-                AllReduceAsyncFallback,
-            ),
-        ):
-            input_name = op.inputs[0].get_name()
-            input_buf = V.graph.get_buffer(input_name)
-            op.layouts = list(input_buf.layouts)
-            op.restick_cost_fn = AnyInNode.from_args()
-        elif isinstance(op, AllGatherAsyncFallback):
-            op.layouts = [generic_layout(op)]
-            op.restick_cost_fn = AnyInNode.from_args()
         elif isinstance(op, ExternKernel):
             logger.warning(f"unhandled node type {type(op)}")
         else:
@@ -3689,6 +3798,35 @@ def _clean_mutation_op_output_layout(node: ComputedBuffer) -> FixedLayout:
     )
 
 
+def _resolve_none_layout_reads(reads):
+    """Rename reads of NoneLayout mutation outputs to the buffer they mutate.
+
+    This pass runs after scheduler init, so a read that follows an in-place op
+    with no buffer of its own (e.g. a ``WaitKernel``) has been renamed to that
+    op's ``MutationOutput``.  Its layout lives on the mutated buffer.
+    """
+    real_names = V.graph.scheduler.mutation_real_name
+    renames = {}
+    for dep in reads:
+        real_name = real_names.get(dep.name)
+        if real_name is not None and isinstance(
+            V.graph.get_buffer(dep.name).layout, NoneLayout
+        ):
+            renames[dep.name] = real_name
+    if not renames:
+        return reads
+    return [dep.rename(renames) for dep in reads]
+
+
+def _leaf_scheduler_nodes(nodes):
+    """Every node in ``nodes``, descending into ``FusedSchedulerNode``s."""
+    for n in nodes:
+        if isinstance(n, FusedSchedulerNode):
+            yield from _leaf_scheduler_nodes(n.get_nodes())
+        else:
+            yield n
+
+
 def propagate_mutation_layouts(
     nodes: list,
 ) -> list:
@@ -3700,8 +3838,12 @@ def propagate_mutation_layouts(
     mutation layout during its initialisation to set up mutation tracking.
     This pass runs as a _pre_fusion_custom_pass (after scheduler init) to
     assign FixedTiledLayout to those remaining mutation ops.
+
+    A counted loop reaches this pass as one ``LoopSchedulerNode`` (a
+    ``FusedSchedulerNode``); its body's mutation ops are handled like any
+    other, so the pass descends into it.
     """
-    for n in nodes:
+    for n in _leaf_scheduler_nodes(nodes):
         if not (isinstance(n, SchedulerNode) and isinstance(n.node, ComputedBuffer)):
             continue
         if not isinstance(n.node.layout, MutationLayoutSHOULDREMOVE):
@@ -3715,7 +3857,7 @@ def propagate_mutation_layouts(
             else:
                 rw = n.read_writes
                 output_dep = next(iter(rw.writes))
-                args = _get_prop_args(rw.reads)
+                args = _get_prop_args(_resolve_none_layout_reads(rw.reads))
                 output = _clean_mutation_op_output_layout(n.node)
                 if not args:
                     # No propagatable args -- e.g. a constant_pad_nd fill whose only
