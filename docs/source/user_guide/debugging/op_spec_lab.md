@@ -192,6 +192,41 @@ Two things follow from `--emitter ktir` being a *capture-time* choice:
 | Also wrong | The **back-end** mis-executes a spec that faithfully describes the intent. You now have a minimal reproducer with no model or graph in it. |
 | Correct | The bug is **upstream** — in lowering, fusion, stickification or layout. The spec is not what you meant. |
 
+### Comparing two runs
+
+When a program is right one way and wrong another (a config flag, a commit, an
+environment variable), capture it both ways with `--save-inputs`. Each kernel's
+`.inputs.pt` then also holds what its first launch wrote and when it ran, and
+`compare.py` finds the first kernel whose inputs agree but whose outputs do not:
+
+```bash
+python tests/op_specs/capture.py prog.py --save-inputs --out good
+SOME_FLAG=1 python tests/op_specs/capture.py prog.py --save-inputs --out bad
+python tests/op_specs/compare.py good bad
+```
+
+Values are compared as host tensors, so it does not matter that the two runs lay
+them out differently on the device. Kernels pair by name and argument shapes,
+and the table runs in launch order:
+
+```
+launch     inputs    outputs  kernel
+    34          0    0.00345  sdsc_fused_convolution_0
+    35    0.00345       1.75  sdsc_fused_cat_0  <-- parts here
+    37       1.75       1.74  sdsc_fused_add_0_5
+```
+
+`compare.py` then prints how to replay the bad capture's script on the good
+capture's inputs. A replay prints `max|got - observed|` for every arg, here
+against the good outputs, so the table in [4. Interpret](#4-interpret) applies
+with the good run as the expected answer. The kernel's specs and SDSC from the
+two captures (`diff`, and `--stage bundle` on each) show what changed.
+
+A program that runs only under pytest needs a script for `capture.py` to run,
+one that ends in `sys.exit(pytest.main([...]))`. If the program hands its work
+to subprocesses, keep it in one process: for vLLM, set
+`VLLM_ENABLE_V1_MULTIPROCESSING=0`.
+
 ---
 
 ## Why a captured file needs nothing but itself
