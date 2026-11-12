@@ -2008,11 +2008,35 @@ def _resolve_sdsc_size(expr: Expr, symbolic_dim_bounds: dict) -> int:
     return _concretize_for_sdsc(expr)
 
 
-def _ref_arg(op_spec):
-    if op_spec.is_reduction:
-        return op_spec.args[0]
+def _merged_reduction_dim_order(op_spec, symbol_mapping):
+    """Union op_dim_order/op_stick_dim across every reduction operand.
 
-    return op_spec.args[-1]
+    A single operand's own dim_order usually has full visibility into the
+    op's dims and stick, which is why using just op_spec.args[-1] normally
+    suffices (see the non-reduction branch in parse_op_spec). But a
+    broadcast reduction input (e.g. expand() feeding sum())
+    collapses the dims it doesn't vary over to a constant, dropping them
+    from its own dim_order -- while the destination/accumulator's own stick
+    is routinely elided to a constant too (normal, and harmless on its own:
+    see the non-broadcast case, where the same elision on the destination
+    causes no issue because the input still carries every dim and the real
+    stick symbol). When the input is *also* a broadcast, neither operand
+    alone carries both the full dim set and a real stick symbol, so basing
+    op_dim_order on just one of them silently drops dims from every
+    operand's SDSC descriptor -- which the backend can't reconcile
+    ("Could not find any suitable dimension mapping", issue #5237). Merge
+    across all args instead of trusting one.
+    """
+    merged_order: list[Symbol] = []
+    merged_stick: Symbol | None = None
+    for arg in op_spec.args:
+        order, stick = _get_device_dim_order(arg, symbol_mapping)
+        if merged_stick is None:
+            merged_stick = stick
+        for sym in order:
+            if sym not in merged_order:
+                merged_order.append(sym)
+    return merged_order, merged_stick
 
 
 def _round_up_to_stick(
@@ -2436,8 +2460,14 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         work_slices,
     )
 
-    ref_arg = _ref_arg(op_spec)
-    op_dim_order, op_stick_dim = _get_device_dim_order(ref_arg, symbol_mapping)
+    if op_spec.is_reduction:
+        op_dim_order, op_stick_dim = _merged_reduction_dim_order(
+            op_spec, symbol_mapping
+        )
+    else:
+        op_dim_order, op_stick_dim = _get_device_dim_order(
+            op_spec.args[-1], symbol_mapping
+        )
 
     # A dtype conversion that changes the elements per stick (DL16TOFP32,
     # FP32TODL16, FP8TODL16, qfp8ch, qfp8wt) requires at least one outer spatial
