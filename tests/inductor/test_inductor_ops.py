@@ -7797,16 +7797,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_where_self", "test_where_eager"): {
             "ops_dict": {"where": torch.where},
-            # A host bool mask converted to fp32 for an int32 where is staggered,
-            # and a STANDARD full operand cannot combine with it. Pending
-            # de-staggering support (#5495).
-            "expect_fail": {
-                "int32_2d": "host bool mask with fp32/int32 values is refused as mixed EA, pending #5495",
-                "int32_3d": "host bool mask with fp32/int32 values is refused as mixed EA, pending #5495",
-            },
             # Bool values are not supported: they must be refused as mixed EA, not
             # computed (a computed result is silently wrong).
-            "expect_raise": {"bool_2d": "mixed EA"},
+            "expect_raise": {
+                # The shuffle rejects a (4, 32) row: one 32-element fp32 stick per core.
+                "int32_2d": _WHOLE_STICK_PAIRS,
+            },
             "param_sets": {
                 "fp16_2d": (
                     cached_randn((10, 10), dtype=torch.float16) > 1,
@@ -7957,13 +7953,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "masked_fill": lambda x, mask, value: x.masked_fill(mask, value),
                 "masked_fill_": lambda x, mask, value: x.masked_fill_(mask, value),
             },
-            # masked_fill lowers to where; a host bool mask with fp32/int32 values
-            # is refused as mixed EA. Pending de-staggering support (#5495).
-            "expect_fail": {
-                "fp32_2d": "host bool mask with fp32/int32 values is refused as mixed EA, pending #5495",
-                "fp32_3d": "host bool mask with fp32/int32 values is refused as mixed EA, pending #5495",
-                "int32_2d": "host bool mask with fp32/int32 values is refused as mixed EA, pending #5495",
-                "int32_3d": "host bool mask with fp32/int32 values is refused as mixed EA, pending #5495",
+            # The shuffle rejects rows of one 32-element fp32 stick per core:
+            # (2, 8, 32) fp32 and (4, 32) int32.
+            "expect_raise": {
+                "fp32_3d": _WHOLE_STICK_PAIRS,
+                "int32_2d": _WHOLE_STICK_PAIRS,
             },
             "param_sets": {
                 "fp16_2d_zero": (
@@ -9911,6 +9905,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     "72.0 / 0.314453125 from that class, #5605"
                 ),
                 "floor_div_int32_fp16_1d256": (
+                    "the graph output is committed DL16_TO_FP32 and the "
+                    "device-to-host copy returns it permuted, #4393"
+                ),
+                "floor_div_fp32_fp16_1d256": (
                     "the graph output is committed DL16_TO_FP32 and the "
                     "device-to-host copy returns it permuted, #4393"
                 ),
