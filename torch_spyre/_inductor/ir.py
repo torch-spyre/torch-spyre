@@ -599,8 +599,8 @@ class SpyreCollectiveKernel(ir._CollectiveKernel, metaclass=abc.ABCMeta):
 
     * ``create_inplace`` (all_reduce): ``NoneLayout`` node plus a
       ``MutationOutput`` on each input; the lowering returns the input.
-    * ``create_out_of_place`` (broadcast, all_gather): the node is the output
-      buffer.
+    * ``create_out_of_place`` (broadcast, all_gather, reduce_scatter): the
+      node is the output buffer.
 
     ``op_overload`` is the ``_c10d_functional`` op, whose Meta impl drives
     ``process_kernel``; ``constant_args`` are its non-tensor args in schema
@@ -686,6 +686,86 @@ class AllGatherKernel(SpyreCollectiveKernel):
     def _run_call(self, input_name: str, plan_var: str) -> str:
         group_size, _ = self.constant_args
         return f"torch.ops.spyre.allgather_run({input_name}, {plan_var}, {group_size})"
+
+
+class ReduceScatterKernel(SpyreCollectiveKernel):
+    """Out-of-place ``_c10d_functional.reduce_scatter_tensor``.
+
+    The input is the ``(A, g, B)`` staging buffer built by the lowering
+    (``_reduce_scatter``); the output is one rank's ``(A, B)`` chunk.
+    spyre-comms hands rank ``r`` the ``r``-th contiguous ``1/g`` of the device
+    buffer, which is ``chunk(0)[r]`` only when that buffer's default device
+    layout has ``g`` outermost, as checked in ``codegen``.
+    """
+
+    plan_prefix = "rs"
+
+    @classmethod
+    def create_staged(
+        cls,
+        staged: IRNode,
+        reduce_op: str,
+        group_size: int,
+        group_name: str,
+        out_size: list[int],
+    ) -> "ReduceScatterKernel":
+        """Build the node for a staged ``(A, g, B)`` input with an ``(A, B)`` output.
+
+        The upstream ``create_out_of_place`` derives the output from the
+        ``reduce_scatter_tensor`` meta (``size(0) // g``), which does not hold
+        for the staged shape.  Building the node directly is safe because the
+        output is a plain fresh buffer: it aliases no input and mutates
+        nothing, so there are no ``MutationOutput`` or alias annotations for
+        the factory to set up.
+        """
+        layout = FixedLayout(
+            staged.get_device(),
+            staged.get_dtype(),
+            [sympy.Integer(s) for s in out_size],
+        )
+        node = cls(
+            layout,
+            torch.ops._c10d_functional.reduce_scatter_tensor.default,
+            [staged],
+            [reduce_op, group_size, group_name],
+            lambda *a: a,
+        )
+        node.outputs = [node]
+        return node
+
+    def codegen(self, wrapper: PythonWrapperCodegen) -> None:
+        _, group_size, _ = self.constant_args
+        input_layout = _collective_input_layout(self.inputs[0])
+        # Same condition as the run-time check in spyre_reducescatter_run_impl
+        # (spyre_distributed.cpp); keep the two in sync.
+        a_dim, g, b_dim = (int(s) for s in input_layout.size)
+        expected = SpyreTensorLayout([a_dim, g, b_dim], input_layout.dtype)
+        if (
+            g != group_size
+            or input_layout.device_layout != expected
+            or expected.device_size[0] != group_size
+        ):
+            raise Unsupported(
+                f"reduce_scatter: staged input must use the default device "
+                f"layout with the group dim outermost ({expected}) so each "
+                f"rank's chunk is one contiguous device slab; got "
+                f"{input_layout.device_layout}"
+            )
+        super().codegen(wrapper)
+
+    def _plan_call(self, num_elems: int, dtype_code: int) -> str:
+        reduce_op, group_size, group_name = self.constant_args
+        return (
+            f"torch.ops.spyre.reducescatter_plan("
+            f"{num_elems}, {dtype_code}, {group_size}, "
+            f"'{reduce_op}', '{group_name}')"
+        )
+
+    def _run_call(self, input_name: str, plan_var: str) -> str:
+        _, group_size, _ = self.constant_args
+        return (
+            f"torch.ops.spyre.reducescatter_run({input_name}, {plan_var}, {group_size})"
+        )
 
 
 class AllReduceKernel(SpyreCollectiveKernel):

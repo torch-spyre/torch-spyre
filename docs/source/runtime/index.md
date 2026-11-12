@@ -338,7 +338,10 @@ The following collectives are implemented:
 `async_op=True`; wait for completion with the returned work handle's `wait()`.
 The remaining process-group entries (`scatter`, `reduce_scatter`, `alltoall`,
 `alltoall_base`, `_allgather_base`, `allreduce_coalesced`) raise
-`SpyreCCLNotSupportedException`. `recvAnysource` is intentionally
+`SpyreCCLNotSupportedException`. These entries describe the eager process
+group only: under `torch.compile`, `_c10d_functional.reduce_scatter_tensor`
+and the coalesced allreduce and all-gather ops lower directly to spyre-comms.
+`recvAnysource` is intentionally
 unsupported: the protocol overhead is high and call sites are rare.
 
 ### BF16 collective tensors

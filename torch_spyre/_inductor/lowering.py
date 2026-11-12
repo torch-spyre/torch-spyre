@@ -59,6 +59,7 @@ from .ir import (
     BroadcastKernel,
     SpyreConstantFallback,
     SpyreEmptyFallback,
+    ReduceScatterKernel,
     SpyreReduction,
     WaitKernel,
     copy_back_view,
@@ -3160,6 +3161,9 @@ def lower_any_def(x):
 # These mirror torch/_inductor/comm_lowering.py: nodes are built with the
 # upstream _CollectiveKernel factories (create_inplace / create_out_of_place /
 # create_wait), and only codegen is Spyre-specific (see SpyreCollectiveKernel).
+# spyre-comms only supports single-tensor WSIs, so coalesced variants are
+# decomposed into per-tensor collectives; the C++ wsi_cache_ deduplicates plans
+# for same-shaped tensors.
 _c10d = torch.ops._c10d_functional
 
 
@@ -3235,6 +3239,90 @@ def lower_c10d_all_gather(tensor, group_size, group_name):
     return _all_gather(tensor, group_size, group_name)
 
 
+@register_spyre_lowering(_c10d.all_gather_into_tensor_coalesced.default)
+def lower_c10d_all_gather_coalesced(tensors, group_size, group_name):
+    """Decompose coalesced all_gather into per-tensor all_gather calls."""
+    return [_all_gather(t, group_size, group_name) for t in tensors]
+
+
+def _reduce_scatter(tensor, reduce_op, group_size, group_name):
+    """Stage the input so each rank's dim-0 chunk is one contiguous device slab.
+
+    spyre-comms splits the flat device buffer into ``group_size`` equal
+    contiguous slabs; it has no strided or per-rank-list variant.  Under the
+    default stick layout host dim 0 sits next to the stick dim, so the slab
+    rank ``r`` receives is not ``chunk(0)[r]`` (see #4273).
+
+    Instead, collapse the input to ``(g, A, B)`` -- ``B`` the stick (last) dim,
+    ``A`` everything else of one rank's chunk -- and materialize it as
+    ``(A, g, B)``.  Its default device layout is ``[g, ceil(B/stick), A,
+    stick]``: ``g`` is outermost and each slab is exactly the default device
+    image of an ``(A, B)`` tensor, which is what ``reducescatter_run``
+    allocates for the output.  The result is then viewed back to
+    ``(size(0) // g, *size[1:])``.  ``ReduceScatterKernel.codegen`` checks the
+    committed layout, so a different one raises instead of scattering wrong
+    elements.
+
+    The staging copy is needed only because spyre-comms splits a flat buffer;
+    it can go once spyre-comms offers a strided or per-rank-list
+    reduce-scatter.
+    """
+    sizes = [V.graph.sizevars.guard_int(s) for s in tensor.get_size()]
+    if not sizes:
+        raise Unsupported("reduce_scatter requires an input with at least 1 dim")
+    if sizes[0] % group_size != 0:
+        raise Unsupported(
+            f"reduce_scatter: input dim 0 ({sizes[0]}) must be divisible by "
+            f"group_size ({group_size})"
+        )
+    out_sizes = [sizes[0] // group_size, *sizes[1:]]
+    stick_dim = out_sizes[-1]
+    a_dim = math.prod(out_sizes) // stick_dim
+    if len(sizes) == 1 and stick_dim % get_elem_in_stick(tensor.get_dtype()) != 0:
+        # The staged (1, g, B) layout itself is fine (e.g. (1, 2, 50) ->
+        # [2, 1, 1, 64], one padded stick per rank).  The limit is the staging
+        # clone: it splits the 1-D input's stick dim at a non-stick boundary,
+        # and the stick index 50*d0 + d1 is not a supported stick expression.
+        # TODO: support by padding each rank's chunk to whole sticks.
+        raise Unsupported(
+            f"reduce_scatter: 1-D per-rank chunk ({stick_dim}) must be a "
+            f"multiple of the stick size "
+            f"({get_elem_in_stick(tensor.get_dtype())})"
+        )
+
+    staged = lowering.view(tensor, [group_size, a_dim, stick_dim])
+    staged = lowering.permute(staged, [1, 0, 2])
+    # Spyre's clone freezes the contiguous stride order (upstream ignores it).
+    staged = clone(staged, memory_format=torch.contiguous_format)
+    staged.realize()
+
+    result = ir.TensorBox.create(
+        ReduceScatterKernel.create_staged(
+            staged, reduce_op, group_size, group_name, [a_dim, stick_dim]
+        )
+    )
+    return lowering.view(result, out_sizes)
+
+
+@register_spyre_lowering(_c10d.reduce_scatter_tensor.default)
+def lower_c10d_reduce_scatter(tensor, reduce_op, group_size, group_name):
+    """Out-of-place reduce_scatter: output shape[0] = input.shape[0] // group_size."""
+    logger.debug(
+        "Lowering _c10d_functional.reduce_scatter_tensor "
+        "(reduce_op=%s, group_size=%s, group_name='%s')",
+        reduce_op,
+        group_size,
+        group_name,
+    )
+    return _reduce_scatter(tensor, reduce_op, group_size, group_name)
+
+
+@register_spyre_lowering(_c10d.reduce_scatter_tensor_coalesced.default)
+def lower_c10d_reduce_scatter_coalesced(tensors, reduce_op, group_size, group_name):
+    """Decompose coalesced reduce_scatter into per-tensor reduce_scatter calls."""
+    return [_reduce_scatter(t, reduce_op, group_size, group_name) for t in tensors]
+
+
 def _all_reduce_inplace(tensor, reduce_op, group_name):
     mutation_target = tensor if isinstance(tensor.data, ir.BaseView) else None
     tensor = _realize_collective_input(tensor)
@@ -3277,3 +3365,15 @@ def lower_c10d_all_reduce_inplace(tensor, reduce_op, group_name):
         group_name,
     )
     return _all_reduce_inplace(tensor, reduce_op, group_name)
+
+
+@register_spyre_lowering(_c10d.all_reduce_coalesced.default)
+def lower_c10d_all_reduce_coalesced(tensors, reduce_op, group_name):
+    """Decompose coalesced all_reduce into per-tensor all_reduce_ on clones."""
+    return [_all_reduce_inplace(clone(t), reduce_op, group_name) for t in tensors]
+
+
+@register_spyre_lowering(_c10d.all_reduce_coalesced_.default)
+def lower_c10d_all_reduce_coalesced_inplace(tensors, reduce_op, group_name):
+    """In-place variant of the coalesced all_reduce decomposition."""
+    return [_all_reduce_inplace(t, reduce_op, group_name) for t in tensors]
