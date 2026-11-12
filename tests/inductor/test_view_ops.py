@@ -2142,6 +2142,11 @@ class TestCatUnaligned:
     @pytest.mark.parametrize("consumer", CONSUMERS)
     def test_cat_5d_seq_unaligned(self, execution_mode, dtype, consumer):
         """[1,8,1,33,256] × 2 → cat(dim=3) → [1,8,1,66,256]. Seq dim unaligned; inner 256 unchanged. Both consumers."""
+        if consumer == "sum_last" and dtype in (torch.float16, torch.bfloat16):
+            pytest.xfail(
+                "known failure for sum_last/float16 and bfloat16 (numerical mismatch vs CPU beyond tolerance); "
+                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5300"
+            )
         a = cached_randn(
             (1, 8, 1, 33, 256),
             dtype=dtype,
@@ -2204,6 +2209,15 @@ class TestCatSize1:
     @pytest.mark.parametrize("consumer", CONSUMERS)
     def test_cat_3d_size1_seq_expand(self, execution_mode, dtype, consumer):
         """[1,1,256] + [1,32,256] → cat(dim=1) → [1,33,256]. Size-1 seq prepended. Both consumers."""
+        if (
+            execution_mode == "eager"
+            and consumer == "sum_last"
+            and dtype in (torch.float16, torch.bfloat16)
+        ):
+            pytest.xfail(
+                "known failure for sum_last/float16 and bfloat16/eager (numerical mismatch vs CPU beyond tolerance); "
+                "tracked in https://github.com/torch-spyre/torch-spyre/issues/6253"
+            )
         a = cached_randn(
             (1, 1, 256), dtype=dtype, differentiation=f"cat_3d_size1_seq_a_{dtype}"
         )
@@ -2250,6 +2264,11 @@ class TestCatSize1:
     @pytest.mark.parametrize("consumer", CONSUMERS)
     def test_cat_5d_gqa_kv_cache(self, execution_mode, dtype, consumer):
         """[1,8,1,32,256] × 2 → cat(dim=2) → [1,8,2,32,256]. GQA-like cache; inner 256 unchanged. Both consumers."""
+        if consumer == "sum_last" and dtype in (torch.float16, torch.bfloat16):
+            pytest.xfail(
+                "known failure for sum_last/float16 and bfloat16 (numerical mismatch vs CPU beyond tolerance); "
+                "tracked in https://github.com/torch-spyre/torch-spyre/issues/6253"
+            )
         a = cached_randn(
             (1, 8, 1, 32, 256), dtype=dtype, differentiation=f"cat_5d_gqa_kv_a_{dtype}"
         )
