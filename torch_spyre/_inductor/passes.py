@@ -116,7 +116,11 @@ from .dump_cost_model import dump_cost_model
 # ``from .cost_model_pass import LAST_REPORT`` would bind one thread's value forever.
 from . import cost_model_pass as cost_model_pass_module
 from .cost_model_pass import CostReport, cost_model_pass
-from .split_multi_ops import split_multi_ops, validate_ops
+from .split_multi_ops import split_multi_ops
+from .element_arrangement import (
+    insert_ea_shuffle,
+    validate_ops,
+)
 
 
 logger = get_inductor_logger("passes")
@@ -630,6 +634,8 @@ class CustomPreSchedulingPasses:
             # tiled_dims_per_read for a stage that is actually tiled -- a
             # wrong-answer, not a crash.
             insert_restickify,
+            # Insert shuffle nodes to apply or restore element arrangement.
+            insert_ea_shuffle,
             validate_no_restickify_on_mutation_targets,
             enforce_indirect_access_layout,
             reorder_nonstick_dims_mutation,

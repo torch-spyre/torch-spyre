@@ -2433,11 +2433,7 @@ def lower_where(condition, self, other):
     )
 
     converted_condition = condition if skip_cast else to_dtype(condition, val_dtype)
-    if (
-        not skip_cast
-        and condition.get_dtype() != val_dtype
-        and result_dtype != torch.bool
-    ):
+    if not skip_cast and condition.get_dtype() != val_dtype:
         # The cast is realized under this where, so its only origin is
         # aten.where.self. Layout propagation finds a dtype conversion, and the
         # element arrangement it creates (e.g. dl16tofp32 -> DL16_TO_FP32), by the
