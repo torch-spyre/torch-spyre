@@ -1482,6 +1482,35 @@ def lower_silu(x):
     return pw
 
 
+def _lower_shift_by_constant(op, x, amount: int):
+    """A shift as its own kernel, the amount passed as a scalar like clamp's bounds.
+
+    The amount becomes the instruction immediate, so it must reach the op
+    handler as a Python int and not as a constant buffer.
+    """
+    fn = lowering.ops_wrapper(op.__name__)
+    pw = Pointwise.create(
+        device=x.get_device(),
+        dtype=x.get_dtype(),
+        inner_fn=lambda index: fn(x.make_loader()(index), amount),
+        ranges=x.get_size(),
+        origin_node=x.get_origin_node(),
+        traceback=x.get_traceback(),
+    )
+    pw.realize()
+    return pw
+
+
+@register_spyre_lowering(torch.ops.spyre.shift_left)
+def lower_shift_left(x, amount):
+    return _lower_shift_by_constant(torch.ops.spyre.shift_left, x, amount)
+
+
+@register_spyre_lowering(torch.ops.spyre.shift_right)
+def lower_shift_right(x, amount):
+    return _lower_shift_by_constant(torch.ops.spyre.shift_right, x, amount)
+
+
 @register_spyre_lowering(torch.ops.spyre.softplus)
 def lower_softplus(x, beta=1.0, threshold=20.0):
     fn = lowering.ops_wrapper(torch.ops.spyre.softplus.__name__)

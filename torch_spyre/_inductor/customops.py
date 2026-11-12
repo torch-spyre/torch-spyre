@@ -266,6 +266,36 @@ def _(
     return input.new_empty(input.size())
 
 
+@torch.library.custom_op("spyre::shift_left", mutates_args=(), device_types="spyre")
+def shift_left(input: torch.Tensor, amount: int) -> torch.Tensor:
+    """``input << amount`` on int32, ``amount`` a constant in [0, 31].
+
+    The amount is an instruction immediate on the device, so it is an ``int``
+    rather than a tensor; the ``aten`` shift decompositions bring other amounts
+    to their torch result before reaching this op.
+    """
+    pass
+
+
+@shift_left.register_fake
+def _(input: torch.Tensor, amount: int):
+    return input.new_empty(input.size())
+
+
+@torch.library.custom_op("spyre::shift_right", mutates_args=(), device_types="spyre")
+def shift_right(input: torch.Tensor, amount: int) -> torch.Tensor:
+    """``input >> amount`` (sign-filling) on int32, ``amount`` a constant in [0, 31].
+
+    See ``shift_left``.
+    """
+    pass
+
+
+@shift_right.register_fake
+def _(input: torch.Tensor, amount: int):
+    return input.new_empty(input.size())
+
+
 @torch.library.custom_op("spyre::empty", mutates_args=(), device_types="spyre")
 def spyre_empty(
     size: Sequence[int],

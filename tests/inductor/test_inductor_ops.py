@@ -5097,6 +5097,56 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
         },
         (
+            "test_bitwise_shift",
+            "test_bitwise_shift_op",
+        ): {
+            # int32 words over the full 32-bit range, negative ones included.
+            # -1, 32 and 40 are outside the device immediate's 0..31: torch gives
+            # 0 for `<<` and the sign fill for `>>`.
+            "ops_dict": {
+                "lshift_0": lambda x: x << 0,
+                "lshift_1": lambda x: x << 1,
+                "lshift_15": lambda x: x << 15,
+                "lshift_31": lambda x: x << 31,
+                "lshift_32": lambda x: x << 32,
+                "lshift_neg1": lambda x: x << -1,
+                "rshift_1": lambda x: x >> 1,
+                "rshift_16": lambda x: x >> 16,
+                "rshift_31": lambda x: x >> 31,
+                "rshift_40": lambda x: x >> 40,
+                "rshift_neg1": lambda x: x >> -1,
+            },
+            "param_sets": {
+                "int32_2d": (cached_randint((67, 256), low=-(2**31), high=2**31 - 1),),
+                "int32_pad_2d": (
+                    cached_randint((4, 17), low=-(2**31), high=2**31 - 1),
+                ),
+            },
+        },
+        (
+            "test_bitwise_shift_unsupported",
+            "test_bitwise_shift_op",
+        ): {
+            "ops_dict": {
+                "lshift_3": lambda x: x << 3,
+                "rshift_by_tensor": lambda x: x >> x,
+            },
+            "param_sets": {
+                "int8": (torch.randint(-128, 127, (4, 64), dtype=torch.int8),),
+                "int64": (torch.randint(0, 1000, (4, 64), dtype=torch.int64),),
+                "int32": (cached_randint((4, 64), low=0, high=31),),
+            },
+            # TODO: the device shift is int32 only and takes a constant amount;
+            # when either grows, the matching case must pass instead.
+            "expect_raise": {
+                "lshift_3_int8": "bitwise_left_shift on torch.int8",
+                "lshift_3_int64": "bitwise_left_shift on torch.int64",
+                "rshift_by_tensor_int8": "bitwise_right_shift by a tensor amount",
+                "rshift_by_tensor_int64": "bitwise_right_shift by a tensor amount",
+                "rshift_by_tensor_int32": "bitwise_right_shift by a tensor amount",
+            },
+        },
+        (
             "test_bitwise_and",
             "test_fallback_binary_op_cpu",
         ): {
@@ -10205,6 +10255,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_fallback_unary_op_cpu(self, op, x):
         self.compare_with_cpu(op, x)
+
+    def test_bitwise_shift_op(self, op, x):
+        self.compare_with_cpu(op, x, atol=0, rtol=0)
 
     def test_logical_int_mask_compiled(self, op, a, b):
         # Exercise compiled layouts without requiring eager logical kernels.
