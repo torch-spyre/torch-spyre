@@ -285,31 +285,14 @@ def parse_benchmark_xml(
             metric = "compile"
         shapes = _group_shapes(m.group("shapes") or "")
         bucket = groups[(op, shapes)]
-        new_tags = _tag_props(tc)
-        for key in ("measurement", "kernel_scope"):
-            new = new_tags.get(key) or ""
-            if not new:
-                continue
-            old = ""
-            for prev in bucket.values():
-                old = _tag_props(prev).get(key) or ""
-                if old:
-                    break
-            if old and old != new:
-                print(
-                    f"  [warn] {name!r} {key}={new!r} disagrees with "
-                    f"{old!r} already grouped for op={op!r} "
-                    f"shapes={shapes!r}",
-                    file=sys.stderr,
-                )
+        # Last-wins: a retry later in the file replaces an earlier attempt.
         if metric in bucket:
-            kept = bucket[metric].get("name", "")
+            dropped = bucket[metric].get("name", "")
             print(
                 f"  [warn] duplicate {metric} for op={op!r} "
-                f"shapes={shapes!r}: keeping {kept!r}, dropping {name!r}",
+                f"shapes={shapes!r}: replacing {dropped!r} with {name!r}",
                 file=sys.stderr,
             )
-            continue
         bucket[metric] = tc
 
     # ── build one row per group ─────────────────────────────────────────────
@@ -360,19 +343,40 @@ def parse_benchmark_xml(
         torch_spyre_ms = _opt_float(tags, "torch_spyre_ms")
         ratio = _opt_float(tags, "ratio")
 
-        # regression_status and kernel_scope: the kernel testcase carries the
-        # scope-specific verdict. measurement is on every metric.
+        # regression_status and kernel_scope: prefer the kernel testcase; fall
+        # back to memory_transfer when the report has no kernel row.
         regression_status = None
         measurement = tags.get("measurement") or None
-        kernel_scope = None
-        if "kernel" in metric_cases:
-            kernel_tags = _tag_props(metric_cases["kernel"])
+        kernel_tags = (
+            _tag_props(metric_cases["kernel"]) if "kernel" in metric_cases else {}
+        )
+        mem_tags = (
+            _tag_props(metric_cases["memory_transfer"])
+            if "memory_transfer" in metric_cases
+            else {}
+        )
+        if kernel_tags:
             regression_status = kernel_tags.get("regression_status")
             if regression_status == "N/A":
                 regression_status = None
-            kernel_scope = kernel_tags.get("kernel_scope") or None
             if not measurement:
                 measurement = kernel_tags.get("measurement") or None
+        if not measurement:
+            measurement = mem_tags.get("measurement") or None
+        scope_kernel = kernel_tags.get("kernel_scope") or ""
+        scope_mem = mem_tags.get("kernel_scope") or ""
+        if scope_kernel and scope_mem and scope_kernel != scope_mem:
+            print(
+                f"  [warn] kernel_scope disagrees for op={op_name!r} "
+                f"shapes={shapes_str!r}: kernel={scope_kernel!r} "
+                f"memory_transfer={scope_mem!r}; dropping both metrics",
+                file=sys.stderr,
+            )
+            kernel_ms = None
+            mem_ms = None
+            kernel_scope = None
+        else:
+            kernel_scope = scope_kernel or scope_mem or None
 
         is_granite = _is_model_record(op_name, tags)
         if is_granite:
@@ -612,17 +616,6 @@ _V2_BENCH_PROP_KEYS = (
     "batch_size",
     "prompt_length",
 )
-# Per-run labels, not identity. benchmarks is insert-if-absent
-# (Table.insert_identities): the first props are kept, so a later kernel_scope
-# never updates the dimension row. benchmark_runs.props is written on every
-# run. Not in _V2_BENCH_ID_KEYS: hashing kernel_scope would move wall-clock
-# onto a new benchmark when the kernel headline flips. The verdict series is
-# still (component, benchmark_id, backend, arch, source_job) and does not read
-# these keys, so region and request kernel numbers share one baseline.
-_V2_BENCH_RUN_PROP_KEYS = (
-    "measurement",
-    "kernel_scope",
-)
 # Deliberately NOT here and NOT in the id hash: `metric`. It selects the backend, so
 # the same kernel measured on cpu and on spyre is ONE benchmark with two backend
 # rows -- putting it in the identity would split them and make the comparison a
@@ -645,6 +638,14 @@ _V2_BENCH_METRIC_KEYS = (
     "sendnn_ms",
     "ratio",
 )
+# Scope is only on kernel and memory. When a report carries kernel_scope, those
+# two metrics get their own benchmark_id (measurement + kernel_scope in the
+# hash) so region and request do not share a baseline. Wall-clock stays on the
+# unscoped id: flipping the kernel headline must not move its history.
+# measurement alone (no scope) stays on one id for every metric, so generate-v1
+# does not share a baseline with a legacy file. Absent both: one entry, same
+# disc_keys as before (sendnn / pre-generate reports).
+_SCOPE_METRIC_KEYS = ("kernel_mean_ms", "memory_transfer_mean_ms")
 # Not stored: torch_spyre_ms is the tsp time of the case whose tags were read, so it only
 # ever repeats duration_ms (kernel rows) or total_duration_ms (report rows).
 
@@ -725,6 +726,29 @@ def _bench_backend(rec: dict) -> str:
     return "spyre"
 
 
+def _bench_entry(rec: dict, metric_keys, disc_keys, extra_props=()) -> dict:
+    """One writer entry for `rec`, keeping only `metric_keys` and hashing `disc_keys`."""
+    num_runs = rec.get("num_runs")
+    prop_keys = _V2_BENCH_PROP_KEYS + tuple(extra_props)
+    return {
+        "name": rec.get("operation_name") or "",
+        "tags": sorted({t for t in (rec.get("tags") or []) if t}),
+        "backend": _bench_backend(rec),
+        "props": {
+            k: str(rec[k])
+            for k in prop_keys
+            if rec.get(k) is not None and str(rec[k]) != ""
+        },
+        "run_props": {},
+        "measurements": {
+            k: [float(rec[k])] for k in metric_keys if rec.get(k) is not None
+        },
+        "iterations": int(num_runs) if num_runs is not None else 0,
+        "disc": rec,
+        "disc_keys": disc_keys,
+    }
+
+
 def _bench_entries(records: list) -> list:
     """This producer's perf records in the shared writer's entry shape.
 
@@ -743,32 +767,38 @@ def _bench_entries(records: list) -> list:
     }
     entries = []
     for rec in records:
-        num_runs = rec.get("num_runs")
-        entries.append(
-            {
-                "name": rec.get("operation_name") or "",
-                "tags": sorted({t for t in (rec.get("tags") or []) if t}),
-                "backend": _bench_backend(rec),
-                "props": {
-                    k: str(rec[k])
-                    for k in _V2_BENCH_PROP_KEYS
-                    if rec.get(k) is not None and str(rec[k]) != ""
-                },
-                "run_props": {
-                    k: str(rec[k])
-                    for k in _V2_BENCH_RUN_PROP_KEYS
-                    if rec.get(k) is not None and str(rec[k]) != ""
-                },
-                "measurements": {
-                    k: [float(rec[k])]
-                    for k in _V2_BENCH_METRIC_KEYS
-                    if rec.get(k) is not None and k not in uncaptured
-                },
-                "iterations": int(num_runs) if num_runs is not None else 0,
-                "disc": rec,
-                "disc_keys": _V2_BENCH_ID_KEYS,
-            }
-        )
+        metrics = tuple(k for k in _V2_BENCH_METRIC_KEYS if k not in uncaptured)
+        measurement = rec.get("measurement")
+        kernel_scope = rec.get("kernel_scope")
+        if kernel_scope:
+            wall_keys = tuple(k for k in metrics if k not in _SCOPE_METRIC_KEYS)
+            scope_keys = tuple(k for k in metrics if k in _SCOPE_METRIC_KEYS)
+            wall_disc = _V2_BENCH_ID_KEYS + (("measurement",) if measurement else ())
+            if wall_keys and any(rec.get(k) is not None for k in wall_keys):
+                entries.append(
+                    _bench_entry(
+                        rec,
+                        wall_keys,
+                        wall_disc,
+                        ("measurement",) if measurement else (),
+                    )
+                )
+            if scope_keys and any(rec.get(k) is not None for k in scope_keys):
+                scope_extra = tuple(
+                    k for k in ("measurement", "kernel_scope") if rec.get(k)
+                )
+                entries.append(
+                    _bench_entry(
+                        rec,
+                        scope_keys,
+                        _V2_BENCH_ID_KEYS + scope_extra,
+                        scope_extra,
+                    )
+                )
+            continue
+        disc = _V2_BENCH_ID_KEYS + (("measurement",) if measurement else ())
+        extra = ("measurement",) if measurement else ()
+        entries.append(_bench_entry(rec, metrics, disc, extra))
     return entries
 
 
