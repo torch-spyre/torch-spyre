@@ -242,7 +242,7 @@ CONV2D_LAYOUT_LABELS = ["OUTPUT", "INPUT", "KERNEL", "KERNEL_IDX"]
 # Most extreme *finite* fp16 values, used as max/min reduction identities.
 #
 # Used by codegen for reduction padding masks (_get_mask_value) and by the
-# max_pool2d lowering to fill the explicitly-materialized pad halo.
+# max_pool2d lowering as the padval the scheduler fills the LX pad lanes with.
 # See codegen/superdsc.py for more details
 FP16_MAX = 65504.0
 FP16_MIN = -65504.0

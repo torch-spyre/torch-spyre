@@ -780,8 +780,57 @@ def normalize_coordinates(
             cum_size *= dim_terms[i].dim_size
             # append corrected term
             split_dim_terms.append(dim_terms[i])
-        # set last dim_size to residual size and append
-        dim_terms[-1].dim_size = dim_size // cum_size
+        # Set last dim_size to the residual size and append.
+        #
+        # The residual is a FLOOR, so when ``cum_size`` does not divide the axis
+        # extent it can land BELOW the range of the variable this term carries --
+        # and that range must be representable in the device dim, or the outermost
+        # loop positions have no slot at all.
+        #
+        # A windowed read with stride > kernel is where this is problematic.  A pool
+        # over a 128-wide axis at ``k=5 s=10`` has the coordinate ``10*c0 + c3`` with
+        # ``c0`` over 13 output positions: the inner term takes ``dim_size`` 10 (the
+        # stride), leaving a residual of ``128 // 10 == 12`` for ``c0``.  Output
+        # position 12 -- reading columns 120..124, which fit inside the axis --
+        # then has nowhere to live, the input device_size becomes
+        # ``[1, 12, 10, 12, 10, 64]`` covering only 120 of 128 columns, and the
+        # emitted per-core addresses advance 1181 pixels per output row instead of
+        # 1280 (issue: gapped pools wrong when ``W_in % stride >= kernel``).
+        # ``s=9`` escapes only by luck: ``128 // 9 == 14`` already equals c0's range.
+        #
+        # The clamp below raises the residual only up to the number of positions
+        # the term actually carries, so the floor stands wherever it is already
+        # sufficient (every exactly-tiling and every ``s <= k`` geometry is
+        # untouched: ``s=9`` keeps 14, ``s=5`` keeps 25) and the extent never falls
+        # below the loop range it must hold.  Deliberately NOT a plain
+        # ``ceil(dim_size / cum_size)``: that inflates the extent past the range
+        # whenever the axis does not divide evenly (``ceil(128/9) == 15`` against a
+        # range of 14), re-introducing the spurious-backGap class of bug the
+        # comment above warns about.
+        residual = dim_size // cum_size
+        last = dim_terms[-1]
+        # Only a dim that was actually SPLIT can have a floored residual.  With a
+        # single term ``cum_size`` is 1, so ``residual`` is the declared size
+        # itself -- authoritative by construction, and legitimately SMALLER than
+        # the coordinate span when the layout has a gap (a 3-wide dim addressed by
+        # ``floor(Mod(c1,256)/64)``, whose span is 4: 3*64 < 256).  Clamping there
+        # would destroy the gap; see test_fusion_declined_when_pair_is_not_dense.
+        if len(dim_terms) > 1 and last.mod is not None and last.den is not None:
+            try:
+                # Positions this term carries is ``ceil(mod / den)``, NOT ``mod``:
+                # with a divisor present (a mixed-radix digit such as
+                # ``floor(c1/128)`` over a 2048-range var) ``mod`` is the whole
+                # variable range and only ``mod // den`` of it lands on this dim.
+                # Clamping to ``mod`` there inflated a 16-wide dim to 2048 and
+                # broke five coordinate fusion tests.
+                span = -(-int(last.mod) // int(last.den))
+                if int(residual) < span:
+                    residual = sympy.Integer(span)
+            except (TypeError, ValueError):
+                # Symbolic residual, range or divisor (dynamic shapes): leave the
+                # floor alone rather than emit an unresolvable Max().
+                pass
+        dim_terms[-1].dim_size = residual
         split_dim_terms.append(dim_terms[-1])
 
         # accumulate terms in reverse order to ensure non-increasing device strides
