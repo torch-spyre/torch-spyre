@@ -114,14 +114,6 @@ def access_step(
     return sympy.sympify(buffer_stride) * extent
 
 
-# A group holding an op of this kind keeps the legacy lowering alone: a mutation
-# write-back advances a buffer the group reads back (no span-overflow graph has been
-# seen to produce one, and no test builds one). A ``reduction`` group (a partial op
-# plus the combine into an accumulator) is converted since stage 7a.3, with the
-# accumulator declared as a loop carry.
-_LEGACY_ONLY_KINDS = frozenset({"mutation_write_back"})
-
-
 def _taken_symbols(graph: Any, operations: Iterable[Any]) -> list[sympy.Basic]:
     """Every symbol a loop variable's name could collide with.
 
@@ -487,7 +479,7 @@ def add_loop_terms(
     has just built.
 
     ``groups`` are the ``(ops, levels)`` the transform was given. A group with an
-    op of a legacy-only kind, with more than one level, or with an access this
+    op with no planned kind, with more than one level, or with an access this
     module cannot express (a symbolic trip count or extent, a squeezed dim of a
     buffer whose rank differs from the op's) is left alone, whole: the legacy
     record still drives it. Stage 7.4 turns that into an ``Unsupported``. For the
@@ -513,13 +505,7 @@ def add_loop_terms(
             for op in operations
             if isinstance(op, ComputedBuffer) and _group_index(op) == group_idx
         ]
-        if (
-            not members
-            or len(levels) != 1
-            or any(
-                _kind(op) is None or _kind(op) in _LEGACY_ONLY_KINDS for op in members
-            )
-        ):
+        if not members or len(levels) != 1 or any(_kind(op) is None for op in members):
             continue
         try:
             edits = [_plan_op(graph, op) for op in members]
