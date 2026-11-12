@@ -4157,7 +4157,9 @@ def spyre_index_add(
     gathered = torch.index_select(self, dim, index)
     updated = gathered + source
     indices: list[Optional[torch.Tensor]] = [None] * dim + [index]
-    return torch.index_put(self, indices, updated, accumulate=False)
+    # The aten overload takes the schema's ``Tensor?[]``; the torch.index_put
+    # binding demands a TensorList and rejects a None that selects a whole dim.
+    return torch.ops.aten.index_put.default(self, indices, updated, accumulate=False)
 
 
 def _grouped_mm_capacity(n: int, num_experts: int) -> int:
