@@ -88,7 +88,7 @@ from .pass_utils import (
 from .views import align_tensors, tiling_expr_to_device_expr
 from .logging_utils import get_inductor_logger
 from .loop_checker import LoopAdvanceMismatch
-from .loop_facts import enclosing_loops
+from .loop_facts import _loop_coefficient, enclosing_loops
 from .op_spec import (
     IndirectAccess,
     LX_RELAYOUT_INFO_KEY,
@@ -604,40 +604,6 @@ def _matching_read_deps(
         for i, dep in enumerate(read_deps)
         if mutation_real_name.get(dep.name, dep.name) == name
     ]
-
-
-def _loop_coefficient(index: sympy.Expr, variable: sympy.Symbol) -> sympy.Expr:
-    """The coefficient of the loop variable ``variable`` in ``index``.
-
-    ``Expr.coeff`` is not a safe reading of "how far one trip moves this access": it
-    returns 0 for an unexpanded product (``32*(u0 + 1)``) and for any use of the
-    variable it cannot see through (``floor(u0/2)``, ``Mod(u0, 2)``). Read as "no
-    advance", those would be silently wrong once the stored record, which makes such
-    a disagreement loud, is deleted. So the index is evaluated at 0, 1 and 2:
-
-    * it must be affine in the variable (the second difference is zero), and
-    * the step must be a number (a symbolic step cannot be projected to device
-      elements),
-
-    otherwise this raises ``Unsupported``. A variable that does not occur in the
-    index has coefficient 0. The loop variable is an integer, so ``floor(8*u0)`` is
-    ``8*u0`` and has coefficient 8.
-    """
-    if variable not in index.free_symbols:
-        return sympy.S.Zero
-    at = [sympy.expand(index.subs(variable, k)) for k in (0, 1, 2)]
-    if sympy.simplify(at[2] - 2 * at[1] + at[0]) != 0:
-        raise Unsupported(
-            f"the loop variable {variable} is used non-affinely in the index "
-            f"{index}; a per-trip advance cannot be read from it"
-        )
-    step = sympy.simplify(at[1] - at[0])
-    if not step.is_number:
-        raise Unsupported(
-            f"the loop variable {variable} has the symbolic step {step} in the "
-            f"index {index}; it cannot be projected to device elements"
-        )
-    return step
 
 
 class SpyreKernel(Kernel[CSEVariable]):
