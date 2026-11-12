@@ -20,7 +20,10 @@ The device tests need ``SENCORES`` in (8, 16) and a Flex device mode that
 admits sharded allocations (``FLEX_DEVICE=EMUL1p5``), fixed at process
 start. ``test_device_suite_in_emulation_shape`` runs this file in a
 subprocess for each shape, so a plain ``pytest`` run (and CI) covers all of
-them; the per-shape tests skip in a process without that environment.
+them; the per-shape tests skip in a process without that environment. It
+also runs the file once more per shape with a small DMA slice size
+(``FLEX_DATA_TRANSFER_BUFFER_SIZE``), so every shard copy is split into
+several DMA slices; the multi-slice round-trip tests run only there.
 
 Results are compared with the same add on unsharded device tensors. A CPU
 comparison is not exact: fp16 goes through the device fp16 format (L9), and
@@ -66,9 +69,16 @@ _requires_emulation = pytest.mark.skipif(
 
 # The Flex device mode that admits sharded allocations (the scheduler
 # factory routes it to the multi-chunk scheduler): the EMUL1p5 device
-# always admits.
+# always admits. "EMUL1p5-small-dma" also lowers the DMA slice size, which
+# Flex reads once at runtime start, so each shard's copy becomes several
+# DMA slices (256 MiB by default: a test shard would take one).
+_SMALL_DMA_SLICE_BYTES = 4096
 _DEVICE_MODES = {
     "EMUL1p5": {"FLEX_DEVICE": "EMUL1p5"},
+    "EMUL1p5-small-dma": {
+        "FLEX_DEVICE": "EMUL1p5",
+        "FLEX_DATA_TRANSFER_BUFFER_SIZE": str(_SMALL_DMA_SLICE_BYTES),
+    },
 }
 
 
@@ -641,6 +651,75 @@ def test_bundle_symbolic_args_disabled_fails_at_compile(monkeypatch):
 
     with pytest.raises(RuntimeError, match="BUNDLE_SYMBOLIC_ARGS=1"):
         torch.compile(lambda x, y: x + y, dynamic=False)(a, a)
+
+
+def _exact_source(shape, dtype) -> torch.Tensor:
+    # Whole numbers below 1024: exact in fp32 and in the device fp16 format
+    # (DL16 has one fraction bit fewer than IEEE fp16, so it rounds integers
+    # above 1024), so the round trips can be compared exactly.
+    return (torch.arange(torch.Size(shape).numel()) % 1024).reshape(shape).to(dtype)
+
+
+@_requires_emulation
+@pytest.mark.parametrize(
+    "shape_per_shard, dim, dtype",
+    [
+        # Rows of 50 elements end partway through a stick (32 fp32 or 64 fp16
+        # per stick), so each shard is padded on the device.
+        ((2, 50), 0, torch.float32),
+        ((2, 50), 0, torch.float16),
+        ((50,), 0, torch.float32),
+        ((3, 7, 50), 1, torch.float32),
+        # Shard(1) with 50 columns per shard: every shard row is padded.
+        ((16, 50), 1, torch.float32),
+    ],
+)
+def test_padded_shards_round_trip(shape_per_shard, dim, dtype):
+    """Shards that end partway through a stick copy to and from the CPU."""
+    n = _num_shards()
+    shape = list(shape_per_shard)
+    shape[dim] *= n
+    cpu = _exact_source(shape, dtype)
+
+    # Control: if the unsharded round trip fails too, the fault is not in the
+    # sharded path.
+    assert torch.equal(cpu.to("spyre").cpu(), cpu)
+    assert torch.equal(_sharded(cpu, dim, n).cpu(), cpu)
+
+
+_DMA_SLICE_BYTES = int(
+    os.environ.get("FLEX_DATA_TRANSFER_BUFFER_SIZE", 256 * 1024 * 1024)
+)
+
+
+@_requires_emulation
+@pytest.mark.skipif(
+    _DMA_SLICE_BYTES > _SMALL_DMA_SLICE_BYTES,
+    reason="needs FLEX_DATA_TRANSFER_BUFFER_SIZE <= "
+    f"{_SMALL_DMA_SLICE_BYTES} at process start; "
+    "test_device_suite_in_emulation_shape runs it in the EMUL1p5-small-dma mode",
+)
+@pytest.mark.parametrize(
+    "shape_per_shard, dim, dtype",
+    [
+        ((8, 512), 0, torch.float32),  # 16 KiB per shard
+        ((64, 128), 1, torch.float32),  # 32 KiB per shard
+        ((16, 512), 0, torch.float16),  # 16 KiB per shard
+        ((40, 50), 0, torch.float32),  # padded rows, several slices per shard
+    ],
+)
+def test_shards_larger_than_one_dma_slice_round_trip(shape_per_shard, dim, dtype):
+    """A shard whose copy is split into several DMA slices round-trips exactly."""
+    n = _num_shards()
+    shape = list(shape_per_shard)
+    shape[dim] *= n
+    cpu = _exact_source(shape, dtype)
+    x = _sharded(cpu, dim, n)
+
+    # Several slices per shard, or the test proves nothing about splitting.
+    assert torch.spyre.sharding_info(x).shard_device_bytes > 2 * _DMA_SLICE_BYTES
+    assert torch.equal(cpu.to("spyre").cpu(), cpu)
+    assert torch.equal(x.cpu(), cpu)
 
 
 @_requires_emulation
