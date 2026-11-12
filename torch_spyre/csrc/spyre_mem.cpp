@@ -1093,7 +1093,47 @@ at::Tensor spyre_empty_reserved(c10::IntArrayRef size, c10::IntArrayRef stride,
 
   auto padded_size = size.vec();
   padded_size[dim] = max_size;
-  auto device_layout = SpyreTensorLayout(padded_size, dtype);
+
+  // The default dim order puts dim 0 just inside the stick dimension, so a
+  // copy of fewer than max_size rows leaves a gap in every outer position of
+  // the layout and the runtime DMAs each outer position separately instead
+  // of in one transfer (#6026). Putting the reserved dim outermost makes the
+  // first n rows one contiguous prefix of the allocation.
+  SpyreTensorLayout device_layout;
+  if (padded_size.size() >= 3) {
+    std::vector<int32_t> dim_order = {1, 0};
+    for (int32_t i = 2; i < static_cast<int32_t>(padded_size.size()); ++i) {
+      dim_order.push_back(i);
+    }
+    std::vector<int64_t> padded_strides(padded_size.size());
+    int64_t running_stride = 1;
+    for (int64_t i = static_cast<int64_t>(padded_size.size()) - 1; i >= 0;
+         --i) {
+      padded_strides[i] = running_stride;
+      running_stride *= padded_size[i];
+    }
+    device_layout =
+        SpyreTensorLayout(padded_size, padded_strides, dtype, dim_order);
+  } else {
+    // Rank 2 (rank 1 is rejected above): no dim_order can put dim 0 outside
+    // the stick-count dim, so swap the default layout's two outer device dims.
+    SpyreTensorLayout row_inner(padded_size, dtype);
+    std::vector<int64_t> device_size = {row_inner.device_size[1],
+                                        row_inner.device_size[0],
+                                        row_inner.device_size[2]};
+    std::vector<int64_t> stride_map = {row_inner.stride_map[1],
+                                       row_inner.stride_map[0],
+                                       row_inner.stride_map[2]};
+    std::map<std::vector<int64_t>, int64_t> valid_elements;
+    for (const auto& [device_dims, count] : row_inner.valid_elements) {
+      std::vector<int64_t> swapped;
+      for (int64_t d : device_dims) swapped.push_back(d < 2 ? 1 - d : d);
+      std::sort(swapped.begin(), swapped.end());
+      valid_elements[swapped] = count;
+    }
+    device_layout = SpyreTensorLayout(device_size, stride_map,
+                                      row_inner.device_dtype, valid_elements);
+  }
 
   size_t device_size_bytes = get_device_size_in_bytes(device_layout);
   // Overflow-checked (throws), unlike a bare accumulate: a huge `max` must
