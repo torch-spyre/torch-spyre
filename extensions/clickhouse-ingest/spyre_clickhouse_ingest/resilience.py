@@ -12,22 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Writes that survive a degraded replicated cluster.
+"""Writes that survive a degraded replicated cluster, without losing or doubling a batch.
 
 With insert_quorum set, an INSERT fails while fewer replicas are up than the quorum asks for,
-during a pod restart, or when Keeper blips. This module keeps those writes exactly-once:
+during a pod restart, or when Keeper blips.
 
 * `classify` sorts an error into retry (nothing was stored), ambiguous (the block may be
   stored) or fatal (a resend cannot help).
 * On a Replicated table every batch carries a deterministic `insert_deduplication_token`, so
-  resending an ambiguous batch cannot double it. A plain table has no such guard: an ambiguous
-  batch there is spooled as held and resent only after a probe that identifies that batch's own
-  rows (see `spool.TieredSpool.drain`); without a spool the call raises WriteAmbiguous.
-* A batch refused before any write (quorum, read-only, too many parts) is never ambiguous and
-  is simply sent again, on either kind of table.
+  resending an ambiguous batch inside the dedup window cannot double it, and neither can a second
+  sender.
+* A plain table has no such guard: a batch that may be stored is never sent again here. It is
+  parked for a person, or the call raises WriteAmbiguous when there is no spool to hold it.
 * Retries back off to a total deadline. A table whose data is regenerable may then drop to a
   lower quorum; a strict one never does.
-* Past the deadline the batch goes to a durable spool, replayed later with the same token.
+* Past the deadline a batch is parked as a file, with the token it was sent under. Nothing in
+  this module sends parked batches again: see the README for how a person handles them.
 """
 
 from __future__ import annotations
@@ -37,7 +37,6 @@ import json
 import os
 import socket
 import sys
-import tempfile
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -58,6 +57,10 @@ FATAL_CODES = frozenset({16, 27, 36, 43, 47, 53, 60, 62, 81, 439, 469, 497, 516}
 
 class WriteUnavailable(RuntimeError):
     """The cluster did not accept the write before the deadline and no spool was given."""
+
+
+class SpoolFull(RuntimeError):
+    """The spool is at its size cap; the write fails loudly instead of dropping a batch."""
 
 
 class WriteAmbiguous(RuntimeError):
@@ -194,60 +197,55 @@ class SpoolItem:
     database: str | None
     created: float | None = None
     # True when a failed attempt may have stored the batch. A batch refused before any write
-    # (quorum, read-only) is not ambiguous and can always be sent again.
+    # (quorum, read-only) is not ambiguous.
     ambiguous: bool = False
     scope: str | None = None
-    # Name of a shared-tier copy that may exist beside this one; the local copy is then held.
-    twin: str | None = None
 
 
-CLAIM = ".claimed-"
-# A file whose name ends in .amb is a batch that may be stored. The state lives in the name so
-# that recording it is one atomic rename of the claimed file, which fails if the claim is gone.
-AMB = ".amb"
-
-
-def is_item_name(name: str) -> bool:
-    return name[:1].isdigit() and (
-        name.endswith(".json") or name.endswith(".json" + AMB)
-    )
-
-
-def with_marker(name: str, on: bool) -> str:
-    """`name` with the may-be-stored marker set or cleared, keeping any claim suffix."""
-    base, sep, rest = name.partition(CLAIM)
-    if on and not base.endswith(AMB):
-        base += AMB
-    elif not on and base.endswith(AMB):
-        base = base[: -len(AMB)]
-    return base + sep + rest
+def _write_private(path: Path, doc: dict) -> None:
+    """Write `doc` to `path` through an owner-only temp file, so a kill leaves the old file or
+    the new one."""
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex[:8]}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(doc, fh, default=str)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 class Spool:
-    """A directory of whole-file JSON batches. A file is written to a temp name and renamed, so
-    a kill leaves either the finished file or none. The directory and files are owner-only: they
-    hold row data."""
+    """A directory of whole-file JSON batches that could not be sent. It holds row data, so the
+    directory is 0700 and the files 0600. Nothing here sends a batch again.
 
-    def __init__(self, directory):
+    A batch a failed attempt may have stored carries `"ambiguous": true` in its JSON. Parking the
+    same token again keeps one file and can only set that flag, never clear it. A full spool
+    raises SpoolFull instead of dropping anything.
+    """
+
+    def __init__(
+        self, directory, *, max_bytes: int = 256 * 1024 * 1024, clock=time.time
+    ):
         self.dir = Path(directory)
         self.dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        try:
-            os.chmod(self.dir, 0o700)
-        except OSError:
-            pass
+        os.chmod(self.dir, 0o700)
+        self.max_bytes, self.clock = max_bytes, clock
 
-    def files(self) -> list[Path]:
-        """Unclaimed item files, oldest first."""
-        return sorted(p for p in self.dir.iterdir() if is_item_name(p.name))
-
-    def copies(self, token: str) -> list[Path]:
-        """Every file for a token, claimed or not."""
+    def files(self, token: str | None = None) -> list[Path]:
+        """Item files, oldest first; only those of one batch when `token` is given."""
         return sorted(
             p
             for p in self.dir.iterdir()
             if p.name[:1].isdigit()
-            and f"-{token}.json" in p.name
-            and not p.name.endswith((".corrupt", ".quarantine", ".tmp"))
+            and p.name.endswith(".json")
+            and (token is None or p.name.endswith(f"-{token}.json"))
         )
 
     def put(
@@ -261,9 +259,8 @@ class Spool:
         created: float | None = None,
         ambiguous: bool = False,
         scope: str | None = None,
-        twin: str | None = None,
     ) -> Path:
-        created = time.time() if created is None else float(created)
+        created = self.clock() if created is None else float(created)
         doc = {
             "table": table,
             "columns": list(columns),
@@ -273,45 +270,26 @@ class Spool:
             "created": created,
             "ambiguous": bool(ambiguous),
             "scope": scope,
-            "twin": twin,
         }
-        # The token names the file: spooling the same batch twice leaves one file. Spooling it
-        # again as possibly stored upgrades that file, never the reverse.
-        existing = self.copies(token)
+        existing = self.files(token)
         if existing:
             if ambiguous:
-                existing = [self._mark(p, True) for p in existing]
+                old = json.loads(existing[0].read_text())
+                if not old.get("ambiguous"):
+                    old["ambiguous"] = True
+                    _write_private(existing[0], old)
             return existing[0]
+        used = sum(p.stat().st_size for p in self.files())
+        if used + len(json.dumps(doc, default=str)) > self.max_bytes:
+            raise SpoolFull(
+                f"spool holds {used} bytes; cap {self.max_bytes}. Writing more would drop data"
+            )
         # Strictly increasing, so files sort in the order they were written.
         ms = max(int(created * 1000), getattr(self, "_last_ms", 0) + 1)
         self._last_ms = ms
-        final = self.dir / with_marker(f"{ms:013d}-{token}.json", bool(ambiguous))
-        fd, tmp = tempfile.mkstemp(dir=self.dir, suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w") as fh:
-                json.dump(doc, fh, default=str)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmp, final)
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+        final = self.dir / f"{ms:013d}-{token}.json"
+        _write_private(final, doc)
         return final
-
-    @staticmethod
-    def _mark(path: Path, on: bool) -> Path:
-        """Atomically set or clear the marker on one file; the original path if it is gone."""
-        target = path.with_name(with_marker(path.name, on))
-        if target == path:
-            return path
-        try:
-            os.rename(path, target)
-        except OSError:
-            return path
-        return target
 
     def pending(self) -> Iterator[SpoolItem]:
         for p in self.files():
@@ -325,9 +303,8 @@ class Spool:
                     d["token"],
                     d.get("database"),
                     None if d.get("created") is None else float(d["created"]),
-                    bool(d.get("ambiguous")) or p.name.endswith(AMB),
+                    bool(d.get("ambiguous")),
                     d.get("scope"),
-                    d.get("twin"),
                 )
             except (ValueError, KeyError, OSError):
                 try:
@@ -335,11 +312,43 @@ class Spool:
                 except OSError:
                     pass
 
-    def done(self, item: SpoolItem) -> None:
-        try:
-            item.path.unlink()
-        except OSError:
-            pass
+    def items(self) -> list[dict]:
+        """One summary per parked batch, without its rows."""
+        return [
+            {
+                "token": i.token,
+                "table": i.table,
+                "rows": len(i.rows),
+                "held": i.ambiguous,
+                "created": i.created,
+                "file": i.path.name,
+            }  # fmt: skip
+            for i in self.pending()
+        ]
+
+    def drop(self, token: str) -> int:
+        """Delete a parked batch, after a person has dealt with its rows."""
+        check_token(token)
+        files = self.files(token)
+        for p in files:
+            p.unlink(missing_ok=True)
+        return len(files)
+
+
+_TOKEN_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+)
+
+
+def check_token(token: str) -> None:
+    """A token is plain characters only: it is matched against file names."""
+    if (
+        not token
+        or len(token) > 200
+        or set(token) - _TOKEN_CHARS
+        or token in (".", "..")
+    ):
+        raise ValueError(f"not a spool token: {token!r}")
 
 
 @dataclass
@@ -391,8 +400,7 @@ def resilient_insert(
     policy: Policy | None = None,
     replicated: bool = False,
     database: str | None = None,
-    spool: Any = None,
-    probe: Callable[[Any], int] | None = None,
+    spool: Spool | None = None,
     sleep: Callable[[float], None] | None = None,
     clock: Callable[[], float] | None = None,
     feeds_views: bool = True,
@@ -400,8 +408,7 @@ def resilient_insert(
 ) -> Outcome:
     """Insert `rows` in batches, surviving quorum and Keeper failures.
 
-    With a TieredSpool the call first drains what earlier writes spooled (bounded by the spool's
-    own item and time budget), then sends its own rows; whatever it cannot land goes to the spool.
+    Whatever the call cannot land goes to `spool`, which never sends it again.
 
     `scope` names what the rows belong to (a run id, a file); it feeds the batch token so two
     different loads of identical rows are not mistaken for one. Returns an Outcome; raises
@@ -414,19 +421,10 @@ def resilient_insert(
     wait = sleep or time.sleep
     now = clock or time.monotonic
     out = Outcome()
-    if spool is not None and hasattr(spool, "drain"):
-        spool.drain(
-            client,
-            replicated=replicated,
-            probe=probe,
-            policy=policy,
-            sleep=wait,
-            log=log,
-        )
     size = max(1, policy.batch_rows)
     batches = [list(rows[i : i + size]) for i in range(0, len(rows), size)]
 
-    wall = getattr(spool, "now", time.time)
+    wall = spool.clock if spool is not None else time.time
 
     def park(n, batch, tok, ambiguous, why, first_attempt_ago=0.0):
         meta = {
@@ -434,10 +432,7 @@ def resilient_insert(
             "scope": scope,
             "created": wall() - first_attempt_ago,
         }
-        if hasattr(spool, "put_any"):
-            spool.put_any(table, columns, batch, tok, database, **meta)
-        else:
-            spool.put(table, columns, batch, tok, database, **meta)
+        spool.put(table, columns, batch, tok, database, **meta)
         out.spooled += len(batch)
         log(f"  [spooled] {table} batch {n}/{len(batches)} ({len(batch)} rows): {why}")
 
@@ -512,43 +507,6 @@ def resilient_insert(
                 )
                 wait(wait_s)
     return out
-
-
-def replay(
-    client,
-    spool: Spool,
-    *,
-    replicated: bool = True,
-    policy: Policy | None = None,
-    sleep: Callable[[float], None] | None = None,
-    clock: Callable[[], float] | None = None,
-    log: Callable[[str], None] = lambda m: print(m, file=sys.stderr),
-) -> int:
-    """Send every spooled batch with its original token; delete each that lands. Returns count."""
-    policy = policy or Policy()
-    sent = 0
-    for item in list(spool.pending()):
-        if item.ambiguous and not replicated:
-            log(f"  [replay] {item.path.name}: ambiguous on a plain table; held")
-            continue
-        try:
-            _send(
-                client,
-                item.table,
-                item.rows,
-                item.columns,
-                item.database,
-                _settings(policy, item.token, replicated, False),
-            )
-        except Exception as err:
-            if classify(err) == "fatal":
-                log(f"  [replay] {item.path.name}: fatal {safe(err)}; kept")
-            else:
-                log(f"  [replay] {item.path.name}: {safe(err)}; kept for the next run")
-            continue
-        spool.done(item)
-        sent += 1
-    return sent
 
 
 def new_scope() -> str:

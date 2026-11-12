@@ -198,8 +198,7 @@ def test_ambiguity_survives_later_refusals_and_dates_from_the_first_attempt(tmp_
     # Attempt 1 times out but is stored; attempts 2 and 3 are refused until the deadline.
     now = [1000.0]
     c = Cluster(script=[err(319), err(285), err(285), err(285)], store_on_fail=True)
-    sp = Spool(tmp_path)
-    sp.now = lambda: now[0]
+    sp = Spool(tmp_path, clock=lambda: now[0])
 
     def sleep(s):
         now[0] += s
@@ -221,17 +220,18 @@ def test_ambiguous_plain_batch_without_a_spool_is_loud():
     assert ei.value.outcome.ambiguous
 
 
-def test_a_full_spool_does_not_hide_an_ambiguous_plain_batch(tmp_path):
-    from spyre_clickhouse_ingest import spool as spool_mod
-
-    class Full(Spool):
-        def put(self, *a, **k):
-            raise spool_mod.SpoolFull("full")
-
+def test_a_full_spool_raises_and_does_not_hide_an_ambiguous_plain_batch(tmp_path):
     c = Cluster(script=[err(319)], replicated=False, store_on_fail=True)
     with pytest.raises(resilience.WriteAmbiguous) as ei:
-        run(c, spool=Full(tmp_path))
+        run(c, spool=Spool(tmp_path, max_bytes=1))
     assert ei.value.outcome.ambiguous
+    c = Cluster(script=[err(285)] * 99, replicated=False)
+    with pytest.raises(resilience.SpoolFull):
+        run(
+            c,
+            Policy(batch_rows=3, deadline_s=0, backoff_s=1),
+            spool=Spool(tmp_path / "b", max_bytes=1),
+        )
 
 
 def test_a_dead_cluster_costs_one_deadline_not_one_per_batch(tmp_path):
@@ -397,26 +397,6 @@ def test_spool_roundtrip_keeps_the_token_and_the_rows(tmp_path):
     )
 
 
-def test_replay_is_exactly_once_even_when_run_twice(tmp_path):
-    sp = Spool(tmp_path)
-    tok = batch_token("t", "s", ROWS)
-    sp.put("t", ["a", "b"], ROWS, tok)
-    c = Cluster()
-    assert resilience.replay(c, sp, replicated=True, **FAST) == 1
-    sp.put("t", ["a", "b"], ROWS, tok)  # a second copy of the same batch
-    assert resilience.replay(c, sp, replicated=True, **FAST) == 1
-    assert c.rows == ROWS
-    assert list(sp.pending()) == []
-
-
-def test_a_failed_replay_keeps_the_file(tmp_path):
-    sp = Spool(tmp_path)
-    sp.put("t", ["a", "b"], ROWS, batch_token("t", "s", ROWS))
-    c = Cluster(script=[err(285)] * 99)
-    assert resilience.replay(c, sp, replicated=True, **FAST) == 0
-    assert len(list(sp.pending())) == 1
-
-
 def _writer(path, started):
     sp = Spool(path)
     for i in range(500):
@@ -437,10 +417,7 @@ def test_kill_9_mid_write_leaves_only_whole_spool_files(tmp_path):
     assert len(items) >= 20
     for it in items:
         assert it.rows and it.token  # every file parses; none is truncated
-    assert not [f for f in os.listdir(tmp_path) if f.endswith(".tmp")] or True
-    c = Cluster()
-    resilience.replay(c, sp, replicated=True, **FAST)
-    assert len(c.rows) == len({tuple(r) for r in c.rows}) == len(items)
+    assert len({i.token for i in items}) == len(items)
 
 
 def test_a_corrupt_spool_file_is_quarantined_not_fatal(tmp_path):
@@ -506,3 +483,70 @@ def test_replicated_inserts_ask_dependent_views_to_deduplicate_too():
         c, "t", ROWS, ["a", "b"], scope="s", replicated=True, feeds_views=False, **FAST
     )
     assert "deduplicate_blocks_in_dependent_materialized_views" not in c.calls[0]
+
+
+# ── the plain spool ───────────────────────────────────────────────────────────
+
+
+def test_spool_files_and_directory_are_owner_only(tmp_path):
+    import stat
+
+    sp = Spool(tmp_path / "s")
+    p = sp.put("t", ["a"], [[1]], "tok", ambiguous=True)
+    assert stat.S_IMODE(os.stat(sp.dir).st_mode) == 0o700
+    assert stat.S_IMODE(os.stat(p).st_mode) == 0o600
+    sp.put("t", ["a"], [[1]], "tok")
+    sp.put("t", ["a"], [[1]], "tok2")
+    assert {stat.S_IMODE(os.stat(f).st_mode) for f in sp.files()} == {0o600}
+
+
+def test_ambiguity_is_a_field_in_the_json(tmp_path):
+    sp = Spool(tmp_path)
+    p = sp.put("t", ["a"], [[1]], "tok", ambiguous=True)
+    assert json.loads(p.read_text())["ambiguous"] is True
+    assert p.name.endswith("-tok.json")
+
+
+def test_parking_a_token_again_never_clears_ambiguity(tmp_path):
+    sp = Spool(tmp_path)
+    sp.put("t", ["a"], [[1]], "tok")
+    sp.put("t", ["a"], [[1]], "tok", ambiguous=True)
+    assert [i.ambiguous for i in sp.pending()] == [True]
+    sp.put("t", ["a"], [[1]], "tok")  # e.g. a rerun of the same load
+    assert [i.ambiguous for i in sp.pending()] == [True] and len(sp.files()) == 1
+
+
+def test_a_full_spool_raises_instead_of_dropping(tmp_path):
+    sp = Spool(tmp_path, max_bytes=300)
+    sp.put("t", ["a"], [[1]], "tok-1")
+    with pytest.raises(resilience.SpoolFull):
+        for i in range(2, 50):
+            sp.put("t", ["a"], [[i]], f"tok-{i}")
+    assert len(sp.files()) >= 1  # nothing already parked was removed
+
+
+@pytest.mark.parametrize("bad", ["*", "a*", "../x", "a/b", "[a]", "", "x" * 201, ".."])
+def test_drop_refuses_anything_but_a_plain_token(tmp_path, bad):
+    sp = Spool(tmp_path)
+    sp.put("t", ["a"], [[1]], "tok")
+    with pytest.raises(ValueError):
+        sp.drop(bad)
+    assert len(sp.files()) == 1
+
+
+def test_the_spool_command_lists_and_drops(tmp_path, monkeypatch, capsys):
+    from spyre_clickhouse_ingest import spool_cli
+
+    monkeypatch.setenv("CH_WRITE_SPOOL", str(tmp_path))
+    sp = Spool(tmp_path)
+    sp.put("t", ["a"], [[1]], "tok-1", ambiguous=True)
+    sp.put("t", ["a"], [[2]], "tok-2")
+    assert spool_cli.main(["list"]) == 0
+    rows = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert {r["token"]: r["held"] for r in rows} == {"tok-1": True, "tok-2": False}
+    assert "rows" in rows[0] and "[[" not in json.dumps(rows)  # row data is not printed
+    assert spool_cli.main(["drop", "*"]) == 2 and len(sp.files()) == 2
+    assert spool_cli.main(["drop", "tok-1"]) == 0 and len(sp.files()) == 1
+    assert spool_cli.main(["drop", "nope"]) == 1
+    monkeypatch.setenv("CH_WRITE_SPOOL", str(tmp_path / "missing"))
+    assert spool_cli.main(["list"]) == 2
