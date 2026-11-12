@@ -1167,6 +1167,9 @@ class TestFfdcAsyncCompile:
 
                 return nullcontext()
 
+            def __getattr__(self, _name):
+                return lambda *_a, **_k: None
+
         inductor = _stub_module(
             monkeypatch,
             "torch_spyre._inductor",

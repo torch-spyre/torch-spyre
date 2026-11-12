@@ -58,6 +58,7 @@ from .kernel_cache import (
 )
 
 if TYPE_CHECKING:
+    from torch_spyre._inductor.codegen.compute_ops import SymbolKind
     from torch_spyre._inductor.kernel_provenance import KernelProvenanceDescriptor
 
 logger = get_inductor_logger("sdsc_compile")
@@ -357,7 +358,7 @@ def _prepare_kernel(
     kernel_name: str,
     output_dir: str,
     kernel_provenance: "KernelProvenanceDescriptor | None",
-    symbol_kinds: Any = None,
+    symbol_kinds: "list[SymbolKind] | None" = None,
     sdsc_bundle_dir_prefix: str | None = None,
 ) -> SpyreSDSCKernelRunner:
     with timing_recorder.stage(
