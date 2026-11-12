@@ -1511,6 +1511,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": {
                 "1d_abs_nz": (cached_randn((64,), abs=True) + FP16_EPS,),
                 "2d_abs_nz": (cached_randn((67, 256), abs=True) + FP16_EPS,),
+                # Intentionally FP32_EPS (1.19e-7), not FP16_EPS: in fp16 this is
+                # ~2 subnormal steps, so the case covers rsqrt on subnormal inputs.
                 "4d_abs_nz": (cached_randn((8, 64, 128, 128), abs=True) + FP32_EPS,),
                 "5d_abs_nz": (cached_randn((1, 2, 3, 4, 5), abs=True) + FP16_EPS,),
                 "4d_zero": (torch.zeros((8, 64, 128, 128), dtype=torch.float16),),
@@ -1520,7 +1522,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "5d_ones": (torch.ones((1, 2, 3, 4, 5), dtype=torch.float16),),
                 "5d_neg": (-cached_randn((1, 2, 3, 4, 5), dtype=torch.float16).abs(),),
                 "5d_inf": (
-                    (torch.full((1, 2, 3, 4, 5), float("inf"), dtype=torch.float16),)
+                    torch.full((1, 2, 3, 4, 5), float("inf"), dtype=torch.float16),
                 ),
                 "4d_inf": (
                     torch.full((8, 64, 128, 128), float("inf"), dtype=torch.float16),
@@ -1608,7 +1610,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
                 "zero_val": (torch.zeros((64,), dtype=torch.float16),),
                 "5d_abs_nz": (cached_randn((2, 3, 4, 8, 8), abs=True) + FP16_EPS,),
-                "5d_zeros": (
+                "5d_fp16_eps": (
                     torch.zeros((1, 1, 1, 1, 1), dtype=torch.float16) + FP16_EPS,
                 ),
                 "5d_ones": (torch.ones((2, 3, 4, 8, 8), dtype=torch.float16),),
@@ -1729,8 +1731,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "5d_2pi": (
                     torch.full((2, 3, 8, 32, 32), torch.pi * 2, dtype=torch.float32),
                 ),
-                "5d_zeros": (torch.zeros((1, 1, 1, 1, 1)) + FP16_EPS,),
-                "5d_neg": (-cached_randn((1, 3, 1, 64, 64), dtype=torch.float32),),
+                "5d_zeros": (torch.zeros((1, 1, 1, 1, 1)),),
+                "5d_neg": (
+                    -cached_randn((1, 3, 1, 64, 64), dtype=torch.float32).abs(),
+                ),
                 "5d_nan": (
                     torch.full((2, 3, 4, 5, 6), float("nan"), dtype=torch.float16),
                 ),
@@ -4459,16 +4463,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     -1.0,
                     1.0,
                 ),
-                "5d_min_only": (
-                    cached_randn((1, 2, 3, 4, 5), dtype=torch.float16),
-                    -0.5,
-                    None,
-                ),
-                "5d_max_only": (
-                    cached_randn((4, 8, 16, 32, 64), dtype=torch.float16),
-                    None,
-                    2.0,
-                ),
                 "5d_asymmetric_mingtmax": (
                     cached_randn((2, 4, 6, 8, 10), dtype=torch.float16),
                     1.5,
@@ -4491,8 +4485,27 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
                 "5d_inf": (
                     torch.full((2, 3, 4, 5, 6), float("inf"), dtype=torch.float16),
-                    None,
+                    1.0,
                     -100,
+                ),
+            },
+        },
+        ("test_clamp_without_min_or_max", "test_clamp_inplace_cpu"): {
+            "ops_dict": {
+                "clamp_": torch.Tensor.clamp_,
+            },
+            "param_sets": {
+                # without max
+                "5d_min_only": (
+                    cached_randn((1, 2, 3, 4, 5), dtype=torch.float16),
+                    -0.5,
+                    None,
+                ),
+                # without min
+                "5d_max_only": (
+                    cached_randn((4, 8, 16, 32, 64), dtype=torch.float16),
+                    None,
+                    2.0,
                 ),
             },
         },
@@ -5526,14 +5539,26 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     torch.zeros(128, 256, dtype=torch.float16),
                     cached_randn((256, 128)).t(),
                 ),
+                # (dst, src): the smallest normal fp16 value is copied into zeros.
                 "5d_small_values": (
-                    torch.full((2, 3, 4, 5, 6), 1e-38),
-                    torch.zeros(2, 3, 4, 5, 6),
+                    torch.zeros(2, 3, 4, 5, 6, dtype=torch.float16),
+                    torch.full(
+                        (2, 3, 4, 5, 6),
+                        torch.finfo(torch.float16).tiny,
+                        dtype=torch.float16,
+                    ),
                 ),
-                # Test with non-contiguous memory
+                # (dst, src): half the fp16 max (32752) is copied from a
+                # non-contiguous source into zeros. The full max (65504) would
+                # overflow the CPU reference in the LX wraps' (x + x) / 2 and
+                # sum(dim=0), but not the device (DLFloat16).
                 "5d_large_strided": (
-                    torch.full((4, 6, 8, 16, 32), 1e38)[::2, ::2, ::2, ::2, ::2],
-                    torch.zeros(2, 3, 4, 8, 16),
+                    torch.zeros(2, 3, 4, 8, 16, dtype=torch.float16),
+                    torch.full(
+                        (4, 6, 8, 16, 32),
+                        torch.finfo(torch.float16).max / 2,
+                        dtype=torch.float16,
+                    )[::2, ::2, ::2, ::2, ::2],
                 ),
                 "5d_nan_with_inf": (
                     torch.full((2, 3, 4, 8, 8), float("inf")),
@@ -5726,6 +5751,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((128), dtype=torch.float16),
                     torch.zeros([128], dtype=torch.float16),
                 ),
+                "2d_fp32": (
+                    cached_randn((256, 128), dtype=torch.float32),
+                    cached_randn((128), dtype=torch.float32),
+                    cached_randn((128), dtype=torch.float32, differentiation=1),
+                ),
+                "2d_fp32_transposed": (
+                    cached_randn((128, 256), dtype=torch.float32).transpose(0, 1),
+                    cached_randn((128), dtype=torch.float32),
+                    cached_randn((128), dtype=torch.float32, differentiation=1),
+                ),
             },
         },
         ("test_rmsnorm", "test_rmsnorm_cpu"): {
@@ -5838,14 +5873,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
                 "5d_negative_saturation": (
                     torch.full((2, 3, 4, 5, 6), -50.0, dtype=torch.float16),
-                ),
-                "5d_low_beta": (
-                    cached_randn((1, 1, 7, 13, 19), dtype=torch.float16),
-                    0.5,
-                ),
-                "5d_high_beta": (
-                    cached_randn((1, 1, 7, 13, 19), dtype=torch.float16),
-                    50.0,
                 ),
                 "5d_nan": (
                     torch.full((2, 3, 4, 5, 6), float("nan"), dtype=torch.float16),
@@ -6051,8 +6078,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d": (cached_randn((8, 64, 1024), dtype=torch.float16), 1.5),
                 "4d": (cached_randn((2, 4, 64, 1024), dtype=torch.float16), 2.4),
                 "5d": (cached_randn((2, 3, 4, 8, 8), dtype=torch.float16), 2.4),
-                "5d_zeros": (cached_randn((2, 3, 4, 8, 8), dtype=torch.float16), 0.0),
-                "5d_negative": (torch.ones((2, 3, 4, 8, 8), dtype=torch.float16), -0.5),
+                "5d_zeros": (torch.zeros((2, 3, 4, 8, 8), dtype=torch.float16), 0.0),
+                "5d_negative": (
+                    -torch.ones((2, 3, 4, 8, 8), dtype=torch.float16),
+                    -0.5,
+                ),
                 "3d_fp32": (cached_randn((8, 64, 1024), dtype=torch.float32), 1.5),
                 "4d_fp32": (cached_randn((2, 4, 64, 1024), dtype=torch.float32), 2.4),
             },
@@ -8749,7 +8779,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     64,
                     [[32, 32, 1, 1, 64], [3, 3, 1, 1, 64]],
-                    [[32, 1, -1, 65536, 1024], [1, 3, -1, 9, 9]],
+                    [[32, 1, 0, 65536, 1024], [1, 3, 0, 9, 9]],
                 ),
                 "2x64_ksize5_stride2": (
                     cached_randn((2, 64, 32, 32)),
@@ -8759,7 +8789,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (2, 2),
                     64,
                     [[32, 32, 1, 2, 64], [5, 5, 1, 1, 64]],
-                    [[32, 1, -1, 65536, 1024], [1, 5, -1, 25, 25]],
+                    [[32, 1, 0, 65536, 1024], [1, 5, 0, 25, 25]],
                 ),
                 "8x64_ksize3": (
                     cached_randn((8, 64, 128, 128)),
@@ -8769,7 +8799,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     64,
                     [[128, 128, 1, 8, 64], [3, 3, 1, 1, 64]],
-                    [[128, 1, -1, 1048576, 16384], [1, 3, -1, 9, 9]],
+                    [[128, 1, 0, 1048576, 16384], [1, 3, 0, 9, 9]],
                 ),
                 # Same shape/layouts as 8x64_ksize3, padding=(1, 1): xfail, see
                 # the expect_fail note above.  The layouts are inherited from the
@@ -8782,7 +8812,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     64,
                     [[128, 128, 1, 8, 64], [3, 3, 1, 1, 64]],
-                    [[128, 1, -1, 1048576, 16384], [1, 3, -1, 9, 9]],
+                    [[128, 1, 0, 1048576, 16384], [1, 3, 0, 9, 9]],
                 ),
                 "1x3x64_ksize3": (
                     cached_randn((1, 3, 64, 64)),
@@ -8792,7 +8822,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     3,
                     [[64, 64, 1, 1, 64], [3, 3, 1, 1, 64]],
-                    [[64, 1, -1, 12288, 4096], [1, 3, -1, 9, 9]],
+                    [[64, 1, 0, 12288, 4096], [1, 3, 0, 9, 9]],
                 ),
                 # C == 1 (single-channel depthwise), strided.  The activation's
                 # channel axis is size 1, so its device stick is degenerate (stick
@@ -8807,7 +8837,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (2, 2),
                     1,
                     [[128, 128, 1, 8, 64], [3, 3, 1, 1, 64]],
-                    [[128, 1, -1, 16384, -1], [1, 3, -1, 9, -1]],
+                    [[128, 1, 0, 16384, 0], [1, 3, 0, 9, 0]],
                 ),
                 "1x3x64_ksize_1x3": (
                     cached_randn((1, 3, 64, 64)),
@@ -8817,7 +8847,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     3,
                     [[64, 64, 1, 1, 64], [3, 1, 1, 1, 64]],
-                    [[64, 1, -1, 12288, 4096], [1, 3, -1, 3, 3]],
+                    [[64, 1, 0, 12288, 4096], [1, 3, 0, 3, 3]],
                 ),
                 "1x3x64_ksize_3x1": (
                     cached_randn((1, 3, 64, 64)),
@@ -8827,7 +8857,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     3,
                     [[64, 64, 1, 1, 64], [1, 3, 1, 1, 64]],
-                    [[64, 1, -1, 12288, 4096], [1, 1, -1, 3, 3]],
+                    [[64, 1, 0, 12288, 4096], [1, 1, 0, 3, 3]],
                 ),
                 "1x3x64x1_ksize_3x1": (
                     cached_randn((1, 3, 64, 1)),
@@ -8837,7 +8867,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     3,
                     [[1, 64, 1, 1, 64], [1, 3, 1, 1, 64]],
-                    [[1, 1, -1, 192, 64], [1, 1, -1, 3, 3]],
+                    [[1, 1, 0, 192, 64], [1, 1, 0, 3, 3]],
                 ),
                 "1x3x64x1_ksize_1x1": (
                     cached_randn((1, 3, 64, 1)),
@@ -8847,7 +8877,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     3,
                     [[1, 64, 1, 1, 64], [1, 1, 1, 1, 64]],
-                    [[1, 1, -1, 192, 64], [1, 1, -1, 1, 1]],
+                    [[1, 1, 0, 192, 64], [1, 1, 0, 1, 1]],
                 ),
                 "2x3x32_ksize1": (
                     cached_randn((2, 3, 32, 32)),
@@ -8857,7 +8887,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     3,
                     [[32, 32, 1, 2, 64], [1, 1, 1, 1, 64]],
-                    [[32, 1, -1, 3072, 1024], [1, 1, -1, 1, 1]],
+                    [[32, 1, 0, 3072, 1024], [1, 1, 0, 1, 1]],
                 ),
                 "1x16x64_ksize3": (
                     cached_randn((1, 16, 64, 64)),
@@ -8867,7 +8897,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     16,
                     [[64, 64, 1, 1, 64], [3, 3, 1, 1, 64]],
-                    [[64, 1, -1, 65536, 4096], [1, 3, -1, 9, 9]],
+                    [[64, 1, 0, 65536, 4096], [1, 3, 0, 9, 9]],
                 ),
                 "2x32_ksize1_stride2": (
                     cached_randn((2, 32, 64, 64)),
@@ -8877,7 +8907,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (2, 2),
                     32,
                     [[64, 64, 1, 2, 64], [1, 1, 1, 1, 64]],
-                    [[64, 1, -1, 131072, 4096], [1, 1, -1, 1, 1]],
+                    [[64, 1, 0, 131072, 4096], [1, 1, 0, 1, 1]],
                 ),
                 "1x3x128_ksize5": (
                     cached_randn((1, 3, 128, 128)),
@@ -8887,7 +8917,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     3,
                     [[128, 128, 1, 1, 64], [5, 5, 1, 1, 64]],
-                    [[128, 1, -1, 49152, 16384], [1, 5, -1, 25, 25]],
+                    [[128, 1, 0, 49152, 16384], [1, 5, 0, 25, 25]],
                 ),
                 # With bias, conv2d_with_bias decomposes to spyre.conv2d + add, so
                 # the depthwise output is an intermediate the add reads rather than
@@ -8901,7 +8931,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     64,
                     [[32, 32, 1, 1, 64], [3, 3, 1, 1, 64]],
-                    [[32, 1, -1, 65536, 1024], [1, 3, -1, 9, 9]],
+                    [[32, 1, 0, 65536, 1024], [1, 3, 0, 9, 9]],
                 ),
                 "2x32_ksize1_stride2_bias": (
                     cached_randn((2, 32, 64, 64)),
@@ -8911,7 +8941,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (2, 2),
                     32,
                     [[64, 64, 1, 2, 64], [1, 1, 1, 1, 64]],
-                    [[64, 1, -1, 131072, 4096], [1, 1, -1, 1, 1]],
+                    [[64, 1, 0, 131072, 4096], [1, 1, 0, 1, 1]],
                 ),
             },
         },
@@ -8999,7 +9029,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                     64,
                     [[32, 1, 1, 64], [3, 1, 1, 64]],
-                    [[1, -1, 2048, 32], [1, -1, 3, 3]],
+                    [[1, 0, 2048, 32], [1, 0, 3, 3]],
                 ),
                 "8x64_ksize3": (
                     cached_randn((8, 64, 128)),
@@ -9009,7 +9039,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                     64,
                     [[128, 1, 8, 64], [3, 1, 1, 64]],
-                    [[1, -1, 8192, 128], [1, -1, 3, 3]],
+                    [[1, 0, 8192, 128], [1, 0, 3, 3]],
                 ),
                 # Same shape/layouts as 8x64_ksize3, padding=1: rejected, see
                 # the expect_raise note above.  The layouts are inherited from the
@@ -9022,7 +9052,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                     64,
                     [[128, 1, 8, 64], [3, 1, 1, 64]],
-                    [[1, -1, 8192, 128], [1, -1, 3, 3]],
+                    [[1, 0, 8192, 128], [1, 0, 3, 3]],
                 ),
                 "1x3x64_ksize3": (
                     cached_randn((1, 3, 64)),
@@ -9032,7 +9062,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                     3,
                     [[64, 1, 1, 64], [3, 1, 1, 64]],
-                    [[1, -1, 4096, 64], [1, -1, 3, 3]],
+                    [[1, 0, 4096, 64], [1, 0, 3, 3]],
                 ),
                 "1x3x64_ksize_1": (
                     cached_randn((1, 3, 64)),
@@ -9042,7 +9072,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                     3,
                     [[64, 1, 1, 64], [1, 1, 1, 64]],
-                    [[1, -1, 192, 64], [1, -1, 1, 1]],
+                    [[1, 0, 192, 64], [1, 0, 1, 1]],
                 ),
                 "2x3x32_ksize1": (
                     cached_randn((2, 3, 32)),
@@ -9052,7 +9082,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                     3,
                     [[32, 1, 2, 64], [1, 1, 1, 64]],
-                    [[1, -1, 96, 32], [1, -1, 1, 1]],
+                    [[1, 0, 96, 32], [1, 0, 1, 1]],
                 ),
                 "1x16x64_ksize3": (
                     cached_randn((1, 16, 64)),
@@ -9062,7 +9092,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                     16,
                     [[64, 1, 1, 64], [3, 1, 1, 64]],
-                    [[1, -1, 1024, 64], [1, -1, 3, 3]],
+                    [[1, 0, 1024, 64], [1, 0, 3, 3]],
                 ),
                 "2x32_ksize1_stride2": (
                     cached_randn((2, 32, 64)),
@@ -9072,7 +9102,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     2,
                     32,
                     [[64, 1, 2, 64], [1, 1, 1, 64]],
-                    [[1, -1, 2048, 64], [1, -1, 1, 1]],
+                    [[1, 0, 2048, 64], [1, 0, 1, 1]],
                 ),
                 "1x3x128_ksize5": (
                     cached_randn((1, 3, 128)),
@@ -9082,7 +9112,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                     3,
                     [[128, 1, 1, 64], [5, 1, 1, 64]],
-                    [[1, -1, 384, 128], [1, -1, 5, 5]],
+                    [[1, 0, 384, 128], [1, 0, 5, 5]],
                 ),
             },
         },
@@ -12016,17 +12046,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         graph must write the result back into its input buffer. (Clamping
         ``a.clone()`` would be functionalized into a plain out-of-place clamp
         and never exercise the write-back.)
-         Note:
-            Because clamp_, clamp_min_, and clamp_max_ share the same test
-            definition, param sets with min_val=None or max_val=None will skip
-            for clamp_min_ and clamp_max_ respectively.
         """
-        # clamp_min_/clamp_max_ require their bound; only clamp_ accepts None.
-        if op is torch.Tensor.clamp_min_ and min_val is None:
-            pytest.skip("clamp_min_ requires min_val")
-        if op is torch.Tensor.clamp_max_ and max_val is None:
-            pytest.skip("clamp_max_ requires max_val")
-
         atol, rtol = _clamp_tol(x.dtype)
         if op is torch.Tensor.clamp_:
 

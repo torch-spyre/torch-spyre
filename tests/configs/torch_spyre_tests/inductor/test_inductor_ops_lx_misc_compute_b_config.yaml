@@ -28,6 +28,9 @@ test_suite_config:
             - LxPlanning.*::test_masked_fill_scalar.*fp16_2d_neginf_lx_planning_(pointwise|reduction)
             # Issue#6054 : Hardware vector addition on positive infinity (+inf + +inf) evaluates to NaN instead of +inf
             - LxPlanning.*::test_softplus_5d_pos_inf.*_lx_planning_(pointwise|reduction)
+            # add_ with inf passes without LX planning (finite + inf = inf). The LX
+            # wrappers then compute (y + y) / 2 or sum(y, dim=0) on that inf result,
+            # which is inf + inf and gives NaN (#6054).
             - LxPlanning.*::test_inplace_op_add_5d_with_inf.*_lx_planning_(pointwise|reduction)
           mode: xfail_strict
         - names:
@@ -69,4 +72,3 @@ test_suite_config:
             - LxPlanning.*::test_div_scalar_dtypes_true_div_bool_int_scalar_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_div_scalar_dtypes_floor_div_bool_int_scalar_lx_planning_(pointwise|reduction)
           mode: mandatory_success
-
