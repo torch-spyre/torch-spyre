@@ -23,9 +23,11 @@ import unittest
 from unittest.mock import patch
 from typing import Any, Callable, Optional, TypeVarTuple, Unpack, override
 
+import pytest
 import sympy
 from sympy import FiniteSet, Interval, S, oo
 import torch
+from torch._dynamo.testing import CompileCounter
 import torch.fx as fx
 from torch._inductor import config as t_inductor_config
 from torch._inductor.ir import (
@@ -2287,6 +2289,34 @@ class TestRecordedPadding(unittest.TestCase):
         x = torch.ones(4, 64, dtype=torch.float16)
         result = torch.compile(fn, fullgraph=True, dynamic=True)(x.to("spyre"))
         torch.testing.assert_close(result.cpu(), fn(x))
+
+    # TODO(mbayser): SpyreTensorLayout's operator== (and std::hash) skip the
+    # padding fields for now, so the layout guard does not recompile when only
+    # an input's recorded padding changes; see the TODO in
+    # torch_spyre/csrc/spyre_tensor_impl.h. Remove this xfail when they are
+    # compared again.
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason=(
+            "SpyreTensorLayout equality ignores the recorded padding, so a graph "
+            "compiled for one padding value is reused for another"
+        ),
+    )
+    def test_recorded_padding_change_recompiles(self) -> None:
+        # The padding analysis trusts an input's recorded padding, so a graph
+        # compiled for padding 0 must not be reused for padding 5.
+        zero_padded = torch.ones(self.SIZE, dtype=torch.float16).to("spyre")
+        five_padded = self._filled(5.0)
+        self.assertEqual(zero_padded.device_tensor_layout().padding_value, 0.0)
+        self.assertEqual(five_padded.device_tensor_layout().padding_value, 5.0)
+
+        counter = CompileCounter()
+        compiled = torch.compile(lambda x: x.sum(), backend=counter, dynamic=False)
+        compiled(zero_padded)
+        self.assertEqual(counter.frame_count, 1)
+        compiled(five_padded)
+        self.assertEqual(counter.frame_count, 2)
 
     def test_unmaskable_op_on_unrecorded_padding_warns(self) -> None:
         # Depthwise conv needs zero padding on both inputs and cannot be

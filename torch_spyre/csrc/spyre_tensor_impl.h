@@ -383,12 +383,22 @@ class SpyreTensorLayout {
   bool operator==(const SpyreTensorLayout& other) const {
     // Include valid_elements (and update std::hash) after deprecated
     // constructor call sites have migrated to the valid_elements overload.
+    //
+    // TODO(mbayser): Compare padding and padding_value too (and update
+    // std::hash to match). The Dynamo recompile guard in _monkey_patch.py
+    // compares layouts with ==, so including the padding state makes a compiled
+    // graph recompile whenever an input's recorded padding changes (for
+    // example, after an in-place op clears it). That is correct, since the
+    // padding analysis of the graph trusts the recorded padding of its inputs,
+    // but the extra recompilations affect users and have to be introduced
+    // carefully. Until then a graph compiled for one padding state can be
+    // reused for another.
     return this->device_size == other.device_size &&
            this->stride_map == other.stride_map &&
            this->device_dtype == other.device_dtype &&
-           this->element_arrangement == other.element_arrangement &&
-           this->padding == other.padding &&
-           this->padding_value == other.padding_value;
+           this->element_arrangement == other.element_arrangement;
+    //     && this->padding == other.padding &&
+    //     this->padding_value == other.padding_value;
   }
 };
 
@@ -512,10 +522,14 @@ struct hash<spyre::SpyreTensorLayout> {
         seed, std::hash<size_t>{}(static_cast<size_t>(layout.device_dtype)));
     seed = c10::hash_combine(
         seed, std::hash<int>{}(static_cast<int>(layout.element_arrangement)));
-    seed = c10::hash_combine(
-        seed, std::hash<int>{}(static_cast<int>(layout.padding)));
-    for (uint8_t b : layout.padding_value)
-      seed = c10::hash_combine(seed, std::hash<uint8_t>{}(b));
+    // TODO(mbayser): Hash padding and padding_value once operator== compares
+    // them; see the TODO there. The hash must not depend on fields equality
+    // ignores.
+    //
+    // seed = c10::hash_combine(
+    //     seed, std::hash<int>{}(static_cast<int>(layout.padding)));
+    // for (uint8_t b : layout.padding_value)
+    //   seed = c10::hash_combine(seed, std::hash<uint8_t>{}(b));
     return seed;
   }
 };
