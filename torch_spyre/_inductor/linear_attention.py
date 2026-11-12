@@ -63,7 +63,7 @@ from typing import Optional
 import torch
 
 from .sliding_window_plan import STICK
-from .wsr import for_each_tile
+from .wsr.for_each_tile import for_each_tile
 
 # The intra-chunk score tile is [chunk_size, chunk_size] per (batch, head), so
 # the chunk size bounds the largest temporary this algorithm creates.
