@@ -5548,15 +5548,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                         dtype=torch.float16,
                     ),
                 ),
-                # (dst, src): half the fp16 max (32752) is copied from a
-                # non-contiguous source into zeros. The full max (65504) would
-                # overflow the CPU reference in the LX wraps' (x + x) / 2 and
-                # sum(dim=0), but not the device (DLFloat16).
+                # (dst, src): a quarter of the fp16 max (16376) is copied from a
+                # non-contiguous source into zeros. The LX wraps add the value
+                # to itself ((x + x) / 2, sum(dim=0)), so it must stay well
+                # below the fp16 max: 65504 overflows the CPU reference, and
+                # 32752 overflows on the device, where it rounds up to 32768
+                # and the sum reaches 65536.
                 "5d_large_strided": (
                     torch.zeros(2, 3, 4, 8, 16, dtype=torch.float16),
                     torch.full(
                         (4, 6, 8, 16, 32),
-                        torch.finfo(torch.float16).max / 2,
+                        torch.finfo(torch.float16).max / 4,
                         dtype=torch.float16,
                     )[::2, ::2, ::2, ::2, ::2],
                 ),
