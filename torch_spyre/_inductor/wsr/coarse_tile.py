@@ -994,6 +994,18 @@ def _zero_reads_of_fixed_buffers_planned(
     }
     if not fixed_names:
         return
+    # A copy-out buffer's readers in another loop nest are redirected to its
+    # full buffer, which has the producer's undivided layout. Their planned
+    # read is already that read, so it keeps its own nest's advance.
+    copied_out_nest = {
+        op.get_name(): info.loop_group_id[0]
+        for op in operations
+        if isinstance(op, ComputedBuffer)
+        and op.get_name() in fixed_names
+        and (info := plan.get(id(op))) is not None
+        and info.propagation is not None
+        and info.propagation.kind == "copy_out"
+    }
 
     for op in operations:
         if not isinstance(op, ComputedBuffer):
@@ -1006,12 +1018,13 @@ def _zero_reads_of_fixed_buffers_planned(
         if not info.tiled_dims_per_read:
             continue
         reads = [d for d in op.get_read_writes().reads if isinstance(d, MemoryDep)]
+        reader_nest = info.loop_group_id[0]
         for i, dep in enumerate(reads):
             if dep.name in fixed_names and info.tiled_dims_per_read[i]:
-                # This makes the read address stationary while it names the
-                # producer's per-tile scratch.  It does not make the value
-                # invariant: that scratch is rewritten every trip, and an
-                # outside consumer may later be redirected to a full buffer.
+                if copied_out_nest.get(dep.name, reader_nest) != reader_nest:
+                    continue
+                # A reader in the producer's own nest reads its per-tile
+                # scratch, which stays in place while it is rewritten.
                 info.tiled_dims_per_read[i] = []
 
 
@@ -3906,6 +3919,12 @@ def _patch_consumers(
             )
         ]
 
+        # A copy-out read was planned as the read of the full buffer it now
+        # names (_zero_reads_of_fixed_buffers_planned keeps it), so the
+        # consumer's own nest already decided how it advances.
+        if read_layout is not None:
+            continue
+
         # new_consumer.loop_info (copied verbatim from consumer by
         # copy_op_metadata inside replace_computed_buffer_body) still carries
         # tiled_dims_per_read as planned when this consumer's own read of
@@ -3919,10 +3938,9 @@ def _patch_consumers(
         # to get_read_writes().reads purely positionally) does not silently
         # treat the redirected read as loop-invariant.
         #
-        # A consumer that was never planned into any coarse-tile group (e.g.
-        # a plain outside consumer of a copy_out buffer) never had
-        # loop_info stamped at all -- there is no tiled_dims_per_read to fix
-        # up, and this consumer isn't part of any loop group's
+        # A consumer that was never planned into any coarse-tile group never
+        # had loop_info stamped at all -- there is no tiled_dims_per_read to
+        # fix up, and this consumer isn't part of any loop group's
         # _general_tile_advance machinery in the first place.
         if not hasattr(new_consumer, "loop_info"):
             continue

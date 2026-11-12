@@ -1085,6 +1085,16 @@ one but the full buffer in HBM.  In particular a dim the tile consumed whole,
 which has size 1 in the tile and so gets no term in an index traced against
 it, keeps its term.
 
+How an outside consumer's own loop advances that read is decided when its
+nest is planned, against the same full buffer.  Planning empties the
+`tiled_dims_per_read` entry of a read of a copied-out buffer only for readers
+in the producer's nest, which read the per-tile scratch.  A reader in another
+nest keeps its entry, which planning computed before any op was divided, from
+the producer's undivided layout, the layout the full buffer has.  A dim the
+consumer's own tile divides to one element therefore gets its step from
+`_plan_direct_unit_steps` like any other read, and the redirect itself only
+renames the buffer.
+
 Beyond closing the post-stickify safety gap described above, splitting the
 crossing into two ops buys two more things for free, because the copy op is
 a fresh, single-input edge that nothing else depends on yet:
