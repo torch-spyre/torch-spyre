@@ -213,6 +213,15 @@ def _match_axes(
     # Within-stick lanes: the last input axis always maps to the last output axis.
     reshape_to[out_rank - 1] = in_block[in_rank - 1]
     used.add(in_rank - 1)
+    # ...but only if the two lane axes walk the same loop variable the same way,
+    # or the input's lanes are a constant (one value broadcast across them).
+    # Pairing them by position alone is safe for a pointwise op only because
+    # ``_check_stick_all_same`` (``op_spec_validation.py``) already makes every
+    # arg share one stick symbol; a lane axis that walks another variable is
+    # data moved across the stick, not a broadcast.
+    in_lane = in_info[in_rank - 1]
+    if in_lane[0] != _DIM_CONST and in_lane != _dim_info(out_coords[out_rank - 1]):
+        return reshape_to, False
     matched_seq: list[int] = []  # input axes matched to output axes, in out order
     for o in range(out_rank - 1):
         okind, osym = _dim_info(out_coords[o])
@@ -283,18 +292,38 @@ def align_reshape_plan(
             needs a restickify; and, from ``_dim_info``, for a coordinate form
             it cannot classify.
     """
-    in_block = [int(b) for b in in_block]
-    out_block = [int(b) for b in out_block]
-    if list(in_coords) == list(out_coords) and in_block == out_block:
-        return None
-    reshape_to, aligned = _match_axes(in_coords, in_block, out_coords)
+    aligned, plan = _alignment(in_coords, in_block, out_coords, out_block)
     if not aligned:
         raise NotImplementedError(
             "OpSpec alignment: pointwise operand needs a transpose (restickify) "
             "to align device axes; not supported yet"
         )
+    return plan
+
+
+def _alignment(
+    in_coords: Sequence[sympy.Expr],
+    in_block: Sequence[int],
+    out_coords: Sequence[sympy.Expr],
+    out_block: Sequence[int],
+) -> tuple[bool, tuple[list[int], list[int] | None] | None]:
+    """``(aligned, plan)``: the one answer ``align_reshape_plan`` and
+    ``needs_relayout`` both read.
+
+    ``aligned`` is False when no reshape or broadcast lines the operand up with
+    the output (``_match_axes``).  ``plan`` is then None; otherwise it is what
+    ``align_reshape_plan`` returns: None when the operand already matches the
+    output, else ``(reshape_to, broadcast_to)``.
+    """
+    in_block = [int(b) for b in in_block]
+    out_block = [int(b) for b in out_block]
+    if list(in_coords) == list(out_coords) and in_block == out_block:
+        return True, None
+    reshape_to, aligned = _match_axes(list(in_coords), in_block, list(out_coords))
+    if not aligned:
+        return False, None
     broadcast_to = out_block if reshape_to != out_block else None
-    return (reshape_to, broadcast_to)
+    return True, (reshape_to, broadcast_to)
 
 
 def needs_relayout(source: TensorArg, out: TensorArg) -> bool:
@@ -304,25 +333,22 @@ def needs_relayout(source: TensorArg, out: TensorArg) -> bool:
     split differs, so no reshape or broadcast lines them up.  False when they
     already match or a reshape or broadcast lines them up.
 
-    Reads the same ``_match_axes`` result that ``align_reshape_plan`` refuses on,
-    so the pointwise path and this detector cannot disagree.  It is a necessary
-    condition for ``relayout_strides``, not a sufficient one -- a padded stick or
-    a broadcast combined with a transpose is detected here and then refused by
-    ``relayout_strides`` with its own message.
-
-    Per operand, not per op: a pointwise op with several inputs may need a
-    relayout on any subset of them.
+    Built on ``_alignment``, the answer ``align_reshape_plan`` gives: True
+    exactly where ``align_reshape_plan`` would refuse the operand as needing a
+    transpose, so the pointwise path and this detector cannot disagree.  It is
+    a necessary condition for ``relayout_strides``, not a sufficient one -- a
+    padded stick or a broadcast combined with a transpose is detected here and
+    then refused by ``relayout_strides`` with its own message.
 
     Raises ``NotImplementedError`` (from ``_dim_info``) for a coordinate form it
     cannot classify, rather than reporting it as a relayout.
     """
-    in_coords = list(source.device_coordinates)
-    in_block = [int(s) for s in source.device_size]
-    out_coords = list(out.device_coordinates)
-    out_block = [int(s) for s in out.device_size]
-    if in_coords == out_coords and in_block == out_block:
-        return False
-    _reshape_to, aligned = _match_axes(in_coords, in_block, out_coords)
+    aligned, _plan = _alignment(
+        list(source.device_coordinates),
+        [int(s) for s in source.device_size],
+        list(out.device_coordinates),
+        [int(s) for s in out.device_size],
+    )
     return not aligned
 
 
