@@ -2418,11 +2418,8 @@ class TestDivideRanges(unittest.TestCase):
             _resize_device_layout(stl, [1, 128], [4, 128])
 
     def test_resize_device_layout_keeps_a_broadcast_stick_sparse(self):
-        """A broadcast stick compacted to stride_map -1 stays -1 when another
-        dim shrinks, so the tile's layout is the one compaction gives the tile.
-        The host stride, 0, would undo the compaction, and
-        _multi_arg_pointwise_layouts recognizes a broadcast stick only by -1.
-        Device coordinates ignore both, so either addresses the same element."""
+        """A broadcast stick compacted to stride_map 0 stays 0 when another
+        dim shrinks, so the tile's layout is the one compaction gives the tile."""
         from torch_spyre._C import SpyreTensorLayout
         from torch_spyre._inductor.propagate_layouts import (
             _compact_broadcast_device_dims,
@@ -2441,7 +2438,7 @@ class TestDivideRanges(unittest.TestCase):
                 stl = _compact_broadcast_device_dims(
                     SpyreTensorLayout(size, stride, torch.float16, order)
                 )
-                self.assertEqual(stl.stride_map[-1], -1)
+                self.assertEqual(stl.stride_map[-1], 0)
                 result = _resize_device_layout(
                     stl,
                     size,
@@ -2465,7 +2462,7 @@ class TestDivideRanges(unittest.TestCase):
         order = [0, 1, 2, 3]
         stl = SpyreTensorLayout(size, stride, torch.float16, order)
         self.assertEqual(list(stl.device_size), [20, 1, 1, 1, 64])
-        self.assertEqual(list(stl.stride_map), [32, -1, 32, -1, 1])
+        self.assertEqual(list(stl.stride_map), [32, 0, 32, 0, 1])
 
         tile_size, tile_stride = [1, 10, 1, 32], [320, 32, 32, 1]
         result = _resize_device_layout(
@@ -2583,8 +2580,8 @@ class TestDivideRanges(unittest.TestCase):
         from torch_spyre._inductor.wsr.coarse_tile import _resize_device_layout
 
         # [128] reduction output: SpyreTensorLayout([128], [1], fp16, [0]).
-        # device_size=[1, 128, 64], stride_map=[-1, 1, -1] — tile-count dim is
-        # frozen at 1 (stick collapsed), inner stick frozen at -1.
+        # device_size=[1, 128, 64], stride_map=[0, 1, 0] — tile-count dim is
+        # frozen at 1 (stick collapsed), inner stick frozen at 0.
         stl = SpyreTensorLayout([128], [1], torch.float16, [0])
         # Tile the non-stick dim: [128] -> [64].
         result = _resize_device_layout(stl, [128], [64])
@@ -2600,7 +2597,7 @@ class TestDivideRanges(unittest.TestCase):
         Flash-attention QK^T output: logical [B, H, Sq, Skv] with Sq == Skv,
         stored transposed.  The device layout is byte-identical whether Sq or
         Skv is the stick dim (device_size=[32,512,8,1,64],
-        stride_map=[512,16384,64,-1,1]), so size-based elimination cannot tell
+        stride_map=[512,16384,64,0,1]), so size-based elimination cannot tell
         the two size-512 host dims apart.
 
         Without identity (``stick_host_dim=None``) this is genuinely ambiguous
@@ -2617,7 +2614,7 @@ class TestDivideRanges(unittest.TestCase):
         # is a non-stick dim of the same size (512), so they collide by size.
         stl = SpyreTensorLayout(
             [32, 512, 8, 1, 64],
-            [512, 16384, 64, -1, 1],
+            [512, 16384, 64, 0, 1],
             dev,
             {(0,): 32, (1,): 512, (2, 4): 512, (3,): 1},
         )
@@ -2632,7 +2629,7 @@ class TestDivideRanges(unittest.TestCase):
             stl, host_size, [1, 32, 256, 512], stick_host_dim=3
         )
         self.assertEqual(list(result.device_size), [32, 256, 8, 1, 64])
-        self.assertEqual(list(result.stride_map), [512, 16384, 64, -1, 1])
+        self.assertEqual(list(result.stride_map), [512, 16384, 64, 0, 1])
 
     def test_resize_device_layout_follows_permuted_host_strides(self):
         """A buffer written in a permuted order: host dim 1 is the outer one,
@@ -8114,7 +8111,7 @@ class TestPredictFrame(unittest.TestCase):
         With a stick host dim of exactly one stick (64 elems at fp16), the
         tile-count dim has size 1 too. ``_resize_device_layout`` used to match
         it to host dim 0 by size once level 1 put that at extent 1, collapsing
-        its stride to ``-1`` at level 2, which a one-shot full->tile resize
+        its stride to ``0`` at level 2, which a one-shot full->tile resize
         never did; hence ``_predict_output_layout`` resizes once per level,
         as ``_divide_ranges`` does.
         """
@@ -8493,7 +8490,7 @@ class TestValidateTiling(unittest.TestCase):
         dl = op.layout.device_layout
         op.layout.device_layout = SpyreTensorLayout(
             [64, 80, 1, 64],
-            [5120, 64, -1, 1],
+            [5120, 64, 0, 1],
             dl.device_dtype,
             {(0,): 64, (1,): 80, (2, 3): 64},
             dl.element_arrangement,
