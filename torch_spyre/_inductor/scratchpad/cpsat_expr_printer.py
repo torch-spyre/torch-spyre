@@ -33,6 +33,7 @@ products and ``int_prod``s of tables.
 
 from __future__ import annotations
 
+from collections import Counter
 import functools
 import logging
 import math
@@ -60,6 +61,15 @@ __all__ = ["cost_expr_to_cpsat"]
 
 logger = logging.getLogger(__name__)
 
+# constant to scale log of core split. error ~0.5%
+_CORE_LOG_SCALE = 32.0
+# cap on the scale for the inverse of a core split, and the scale itself when
+# the split has no candidate values (see _SympyExprToCpSat._inv_scale).
+# error <= ~4%
+_CORE_INV_SCALE = 1024
+# largest value _CORE_INV_SCALE is sized for: the core count. Past it (a tile
+# count can be any divisor of its axis) the cap grows in step, see _inv_scale.
+_CORE_INV_SCALE_MAX_VALUE = 32
 # constant limit on product terms to avoid int32 overflow in CP-SAT
 _MAX_PRODUCT_BOUND = 2**30
 # Bits each factor of a multiplication keeps, so the product of two of them
@@ -123,6 +133,61 @@ def _simplify_eq_conjunction(expr):
                 continue  # implied by Eq(lhs, eqs[lhs])
         kept.append(arg)
     return sympy.And(*kept)
+
+
+_inv_rel_op = {
+    sympy.Eq: sympy.Eq,
+    sympy.Ge: sympy.Le,
+    sympy.Le: sympy.Ge,
+    sympy.Gt: sympy.Lt,
+    sympy.Lt: sympy.Gt,
+}
+
+
+class _LazyMin(sympy.Min):
+    """``Min`` built without canonicalization. An evaluated ``Min``/``Max`` runs
+    sympy's pairwise dominance check on its arguments (``_find_localzeros``),
+    which for the split-symbol expressions of the cost objective goes through
+    the assumptions system (``is_ge`` -> ``_monotonic_sign`` -> ``factor_terms``);
+    every rewrite pass below rebuilds these nodes, so on the 304-op spyre_attn
+    decode graph that check was ~60% of the planner's Python time (59.6 s of
+    the rewrite passes; 2.0 s with these classes). The printer lowers a
+    ``Min``/``Max`` structurally and never needs the canonical form."""
+
+    def __new__(cls, *args, **kwargs):
+        kwargs["evaluate"] = False
+        return super().__new__(cls, *args, **kwargs)
+
+
+class _LazyMax(sympy.Max):
+    """``Max`` counterpart of :class:`_LazyMin`."""
+
+    def __new__(cls, *args, **kwargs):
+        kwargs["evaluate"] = False
+        return super().__new__(cls, *args, **kwargs)
+
+
+_LAZY = {sympy.Min: _LazyMin, sympy.Max: _LazyMax}
+
+
+def _lazy_minmax(expr: sympy.Expr) -> sympy.Expr:
+    """Rebuild every ``Min``/``Max`` node of ``expr`` as its lazy counterpart.
+
+    A hand-rolled bottom-up rebuild rather than ``Basic.replace``: ``replace``
+    reconstructs a node whose children changed with its ORIGINAL class before
+    applying the substitution, so a ``Min`` nested inside a ``Max`` was
+    canonicalized once more on the way up (13 s on the 304-op graph's
+    objective). Here a ``Min``/``Max`` is built lazy in the first place and
+    every other node is rebuilt only when a child actually changed."""
+    if not expr.args:
+        return expr
+    args = [_lazy_minmax(a) for a in expr.args]
+    lazy = _LAZY.get(type(expr))
+    if lazy is not None:
+        return lazy(*args)
+    if all(a is b for a, b in zip(args, expr.args)):
+        return expr
+    return expr.func(*args)
 
 
 def _reduce(op):
@@ -289,6 +354,300 @@ class _SympyExprToCpSat(Printer):
         ``sym_map`` (``sympy symbol -> CP-SAT var``)."""
         logger.debug("[CP-SAT layout solver] cost expr: %s", cost_expr)
         return self._print(cost_expr)
+
+    def _rewrite(self, cost_expr: sympy.Expr) -> sympy.Expr:
+        """The symbolic rewrites that bring ``cost_expr`` into the form the
+        printer lowers: floors dropped, logs of Min/Max pushed inside, split
+        logs and inverses replaced by table symbols, scalars pushed into
+        Min/Max/Piecewise, floats truncated. Min/Max are rebuilt lazily first
+        (see :class:`_LazyMin`)."""
+        cost_expr = _lazy_minmax(cost_expr)
+        cost_expr = cost_expr.replace(
+            lambda e: e.func == sympy.floor,
+            lambda e: e.args[0],
+        )
+        cost_expr = sympy.expand(cost_expr)
+        cost_expr = cost_expr.replace(
+            lambda e: e.func in [sympy.log, sympy.Piecewise],
+            lambda e: self._piecewise_canonical(self._log_min(e)),
+        )
+        cost_expr = sympy.expand(cost_expr)
+        cost_expr = cost_expr.replace(
+            lambda e: e.func in [sympy.log, sympy.Pow, sympy.Mul],
+            self._inv_log_sym,
+        )
+        cost_expr = cost_expr.replace(
+            lambda e: e.func == sympy.Mul,
+            lambda e: self._min_piecewise_expand(e),
+        )
+        cost_expr = self._integerize_minmax(cost_expr)
+        return cost_expr
+
+    @classmethod
+    def _log_min(cls, expr):
+        # rewrite log(min(a, b)) as min(log(a), log(b))
+        if expr.func is not sympy.log:
+            return expr
+        arg = expr.args[0]
+        if isinstance(arg, (sympy.Min, sympy.Max)):
+            # n() here is to get a numeric value instead of log(2)
+            return arg.func(*[sympy.log(a.n()) for a in arg.args])
+        if (
+            isinstance(arg, sympy.Mul)
+            and len(arg.args) == 2
+            and isinstance(arg.args[0], sympy.Number)
+            and isinstance(arg.args[1], (sympy.Min, sympy.Max))
+        ):
+            return arg.func(
+                *[sympy.log((a * arg.args[0]).n()) for a in arg.args[1].args]
+            )
+        else:
+            return expr
+
+    @staticmethod
+    def _is_split_sym(expr):
+        # A tile count is, like a core split, a positive integer tabulated over
+        # its buffer's candidate divisions, so its log and inverse lower the
+        # same way.
+        return expr.is_Symbol and expr.name.startswith(("split_", "tile_"))
+
+    def _inv_scale(self, name: str) -> int:
+        """Fixed-point scale of ``inv_<name>``: the LCM of ``name``'s values
+        across the candidate divisions, so every ``scale // v`` is exact and the
+        variable spans only the bits it needs. ``_CORE_INV_SCALE`` when there
+        are no values, or a value with many divisors if the LCM exceeds the cap.
+
+        The cap is ``_CORE_INV_SCALE`` for values up to the core count and
+        doubles with each doubling past it, so a tile count, which can far
+        exceed any core split, keeps the resolution a split has rather than
+        flattening to ``scale // v == 0``."""
+        _, raw = self._buffer_map.get(name, (None, ()))
+        if not raw or min(raw) < 1:
+            return _CORE_INV_SCALE
+
+        ints = [int(r) for r in raw]
+        widen = max(
+            0, (max(ints) - 1).bit_length() - _CORE_INV_SCALE_MAX_VALUE.bit_length() + 1
+        )
+        cap = _CORE_INV_SCALE << widen
+        lcm = math.lcm(*ints)
+        if lcm <= cap:
+            return lcm
+
+        # Otherwise: find the highest power of 2 in ints; among its multiples,
+        # find which has the most entries of ints as divisors, and use that.
+        # (We weight entries of ints by multiplicity.)
+        cnt = Counter(ints)
+        pow2 = max((a for a in cnt if a & (a - 1) == 0), default=1)
+        # The cap is sized past every value, so this holds by construction.
+        assert pow2 < cap, f"expected cap={cap} past every value, found {pow2}"
+        scaled_core_inv_scale = cap // pow2
+        counts = np.zeros(scaled_core_inv_scale + 1, dtype=np.int64)
+        for a, mult in cnt.items():
+            step = a // math.gcd(a, pow2)
+            if step <= scaled_core_inv_scale:
+                counts[step::step] += mult
+
+        # Among those, the one whose worst-rounded entry rounds best: the error
+        # of an inexact v is (scale % v) / scale, so width is what buys
+        # accuracy. A worst case does not accumulate, so unlike the count above
+        # this weighs each value once. Ties -- frequent, since a scale and its
+        # multiples often round alike -- go to the narrowest, keeping the
+        # products in _print_multiply clear of _MAX_PRODUCT_BOUND.
+        candidates = pow2 * (np.flatnonzero(counts[1:] == counts[1:].max()) + 1)
+        values = sorted(cnt)
+        return min(
+            (int(c) for c in candidates),
+            key=lambda s: (Fraction(max(s % v for v in values), s), s),
+        )
+
+    def _inv_log_sym(self, expr):
+        # replaces log(sym) with log2_sym and 1/sym with inv_sym
+        arg = expr.args[0]
+        if expr.func == sympy.log:
+            if self._is_split_sym(arg):
+                return (
+                    sympy.Symbol(f"log2_{arg.name}", integer=True, nonnegative=True)
+                    * sympy.log(2.0)
+                    / _CORE_LOG_SCALE
+                )
+            elif arg.is_Number:
+                return math.log(float(arg))
+        elif expr.func == sympy.Pow:
+            if not self._is_split_sym(arg):
+                return expr
+            # Core splits only: a tile count can exceed 32.
+            if (
+                expr.exp.is_Number
+                and math.isclose(expr.exp, 0.25)
+                and arg.name.startswith("split_")
+            ):
+                # Discrete piecewise linear approximation of x^(1/4) over the interval [1, 32],
+                # pinned to return 1 at x=1, generated using tools/approximate-power.py.
+                # since we check that the base is a _split_ symbol, it is an integer in the
+                # range [1, 32]
+                # Max 4.5% deviation for two segments;
+                # we would get:
+                #   max 1.6% deviation with 3 segments;
+                #   max 0.074% deviation with 8 segments;
+                #   max 0.019% deviation with 12 segments;
+                #   no deviation with 16 segments.
+                # script at https://github.com/user-attachments/files/31975789/approximate-power.py
+                return sympy.Piecewise(
+                    (0.139980295504224 * arg + 0.860019704495776, arg <= 5),
+                    (0.0287191888771944 * arg + 1.45940018593522, True),
+                )
+            if expr.exp == -1:
+                return sympy.Symbol(
+                    f"inv_{arg.name}", integer=True, nonnegative=True
+                ) / self._inv_scale(arg.name)
+        elif expr.func == sympy.Mul:
+            symbols = [
+                arg
+                for arg in expr.args
+                if arg.is_Symbol and arg.name.startswith("inv_")
+            ]
+            if len(symbols) <= 2:
+                return expr
+            product = "_product_" + "_".join(
+                sorted([symbol.name[4:] for symbol in symbols])
+            )
+            if product in self._sym_map:
+                # The coefficient already divides by each factor's own scale;
+                # swap those for the product's scale to keep the magnitude.
+                result = sympy.Symbol(f"inv_{product}", integer=True, nonnegative=True)
+                result *= sympy.Rational(
+                    math.prod(self._inv_scale(s.name[4:]) for s in symbols),
+                    self._inv_scale(product),
+                )
+                result *= math.prod([arg for arg in expr.args if arg not in symbols])
+                return result
+        return expr
+
+    @classmethod
+    def _piecewise_canonical(cls, expr):
+        # re-write 1/x < 1/5 as x > 5, then tighten to an equivalent integer
+        # bound (e.g. x < 4/3 as x <= 1) when x is integer-valued and the
+        # bound is numeric.
+        if not expr.is_Piecewise:
+            return expr
+        args = []
+        for value, cond in expr.args:
+            if (
+                cond.is_Relational
+                and cond.lhs.is_Pow
+                and cond.lhs.exp == -1
+                and cond.lhs.base.is_Symbol
+                and cond.lhs.base.is_nonnegative
+            ):
+                args.append(
+                    (
+                        value,
+                        cls._tighten_integer_bound(
+                            _inv_rel_op[cond.func], 1 / cond.lhs, 1 / cond.rhs
+                        ),
+                    )
+                )
+            else:
+                args.append((value, cond))
+        return expr.func(*args)
+
+    @staticmethod
+    def _tighten_integer_bound(rel_op, lhs, rhs):
+        if not (lhs.is_Symbol and lhs.is_integer and rhs.is_Number):
+            return rel_op(lhs, rhs)
+        if rel_op is sympy.Lt:
+            return sympy.Le(lhs, sympy.ceiling(rhs) - 1)
+        if rel_op is sympy.Gt:
+            return sympy.Ge(lhs, sympy.floor(rhs) + 1)
+        if rel_op is sympy.Le:
+            return sympy.Le(lhs, sympy.floor(rhs))
+        if rel_op is sympy.Ge:
+            return sympy.Ge(lhs, sympy.ceiling(rhs))
+        return rel_op(lhs, rhs)
+
+    @staticmethod
+    def _min_piecewise_expand(expr):
+        # re-writes 2.1*Min(x, y) as Min(2.1*x, 2.1*y)
+        # len(expr.args) may exceed 2 when extra scalar factors ride alongside
+        # the leading number and the (single) Min/Max/Piecewise factor this
+        # rewrites, e.g. 2.1*a*Min(x, y); only the first such factor is expanded
+        # per call, with the rest folded back in as a plain multiplier.
+        if len(expr.args) < 2 or not isinstance(expr.args[0], sympy.Number):
+            return expr
+        if any(
+            isinstance(arg, (sympy.Min, sympy.Max, sympy.Piecewise))
+            for arg in expr.args[1:]
+        ):
+            idx, arg = next(
+                (
+                    (idx, a)
+                    for idx, a in enumerate(expr.args)
+                    if isinstance(a, (sympy.Min, sympy.Max, sympy.Piecewise))
+                )
+            )
+            m = expr.args[0]
+
+            def apply(arg):
+                if isinstance(arg, (tuple, sympy.Tuple)):
+                    return (apply(arg[0]), *arg[1:])
+                else:
+                    new_arg = arg * abs(m)
+                    return new_arg.replace(
+                        lambda e: e.func == sympy.Mul,
+                        lambda e: _SympyExprToCpSat._min_piecewise_expand(e),
+                    )
+
+            new_args = [apply(a) for a in arg.args]
+            return (
+                arg.func(*new_args)
+                * sympy.sign(m)
+                * sympy.Mul(*(expr.args[1:idx] + expr.args[idx + 1 :]))
+            )
+        return expr
+
+    @classmethod
+    def _integerize_minmax(cls, expr):
+        # Only Min/Max constraints require integer operands. A conditional
+        # objective supports float values directly; rounding its coefficients
+        # can erase a large cost multiplied by scaled reciprocal variables.
+        # Keep upstream's lazy Min/Max classes when rebuilding their subtrees.
+        if isinstance(expr, (sympy.Min, sympy.Max)):
+            return expr.replace(
+                lambda e: isinstance(e, (sympy.Min, sympy.Max, sympy.Piecewise)),
+                cls._truncate_floats_min,
+            )
+        if not expr.has(sympy.Min, sympy.Max):
+            return expr
+        return expr.func(*(cls._integerize_minmax(arg) for arg in expr.args))
+
+    @staticmethod
+    def _truncate_floats_min(expr):
+        # re-writes Min(x*0.5, y*0.5) as Min(x, y)/2
+        m = 10000
+        func = expr.func
+
+        def _process_inner(expr):
+            if isinstance(expr, sympy.Mul) and isinstance(expr.args[0], sympy.Number):
+                a = (expr.args[0] * m).round()
+                r = sympy.Mul(a, *expr.args[1:])
+            elif isinstance(expr, sympy.Number):
+                r = (expr * m).round()
+            else:
+                r = expr * m
+            return r
+
+        def _process_outer(expr):
+            if isinstance(expr, sympy.Add):
+                return sympy.Add(*[_process_inner(a) for a in expr.args])
+            elif isinstance(expr, sympy.Tuple):
+                return (_process_outer(expr[0]), *expr[1:])
+            else:
+                return _process_inner(expr)
+
+        result = list(map(_process_outer, expr.args))
+
+        return func(*result) / m
 
     # -- Tables ---------------------------------------------------------------
     #
@@ -851,7 +1210,23 @@ class _SympyExprToCpSat(Printer):
     def _print_Symbol(self, expr):
         if expr.name in self._sym_map:
             return self._sym_map[expr.name]
-        raise NotImplementedError(f"not implemented. expr: {expr}")
+        if not expr.name.startswith(("log2_", "inv_")):
+            raise NotImplementedError(f"not implemented. expr: {expr}")
+        name = expr.name[5:] if expr.name.startswith("log2_") else expr.name[4:]
+        b, raw = self._buffer_map[name]
+
+        if expr.name.startswith("log2_"):
+            values = [int(round(_CORE_LOG_SCALE * math.log2(v))) for v in raw]
+            domain = cp_model.Domain.FromValues(values)
+            cp_var = self._model.new_int_var_from_domain(domain, expr.name)
+            self._model.add_element(b.division, values, cp_var)
+        else:
+            scale = self._inv_scale(name)
+            values = [scale // v for v in raw]
+            cp_var = self._model.new_int_var(min(values), max(values), expr.name)
+            self._model.add_division_equality(cp_var, scale, self._sym_map[name])
+        self._sym_map[expr.name] = cp_var
+        return cp_var
 
     def _print_KroneckerDelta(self, expr):
         """``KroneckerDelta(division_X, k)`` -> the reified literal
