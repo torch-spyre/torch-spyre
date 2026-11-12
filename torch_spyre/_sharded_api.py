@@ -32,6 +32,7 @@ from torch_spyre.sharding import (
     ShardedReceipt,
     SpyreShardingSpec,
     _require_exact_int,
+    _require_int_list,
     _require_shard_count,
 )
 
@@ -186,6 +187,18 @@ def sharding_info(tensor: torch.Tensor) -> ShardedTensorInfo:
     from torch_spyre import _C
 
     native = _C._spyre_sharding_info(tensor)
+    # The record describes the storage, so it is only the tensor's own
+    # sharding when the tensor covers all of it. A block view of a sharded
+    # tensor (x[8:16]) shares the storage but is not sharded the same way.
+    # TODO: report the block's own sharding (#5817).
+    global_shape = _require_int_list("global_shape", native["global_shape"])
+    if tensor.storage_offset() != 0 or list(tensor.shape) != global_shape:
+        raise TypeError(
+            "sharding_info does not support views of sharded Spyre tensors "
+            f"yet (view of shape {list(tensor.shape)} at storage offset "
+            f"{tensor.storage_offset()} of a sharded tensor of shape "
+            f"{global_shape})"
+        )
     shard_dim = _require_exact_int("shard_dim", native["shard_dim"])
     num_shards = _require_exact_int("num_shards", native["num_shards"])
     shard_device_bytes = _require_exact_int(

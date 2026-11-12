@@ -47,6 +47,12 @@ def _require_exact_int(name: str, value: object) -> int:
     return value
 
 
+def _require_int_list(name: str, value: object) -> list[int]:
+    if not isinstance(value, (list, tuple)):
+        raise TypeError(f"{name} must be a list of concrete ints")
+    return [_require_exact_int(name, item) for item in value]
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class ShardChunkBinding:
     """One semantic shard bound to its backend placement slot and core.

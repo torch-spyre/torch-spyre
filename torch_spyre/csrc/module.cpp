@@ -1174,6 +1174,9 @@ PYBIND11_MODULE(_C, m) {
         result["num_shards"] = info.num_shards;
         result["shard_device_bytes"] = info.shard_device_bytes;
         result["total_bytes"] = ctx->composite_addr.total_size();
+        // The shape the storage was allocated for; a view of it has a
+        // different shape.
+        result["global_shape"] = info.global_shape;
         py::list entries;
         // The shard table is indexed by shard ordinal; shard i backs core i.
         // logical_core_id and is_device_addressable are asserted by
