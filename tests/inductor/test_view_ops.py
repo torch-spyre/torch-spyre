@@ -438,7 +438,10 @@ class TestReshapeRestickify:
 
         _compare_modes(execution_mode, fn, x)
 
-    @pytest.mark.xfail
+    @pytest.mark.xfail(
+        reason="known failure across eager and compiled (fp16 -> fp32 cast result read back to host has elements in wrong order); "
+        "tracked in https://github.com/torch-spyre/torch-spyre/issues/6033"
+    )
     def test_restickify_reshape_then_dtype_cast(self, execution_mode):
         """Non-offset-free layout after reshape; dtype cast crosses stick-width boundary."""
         x = cached_randn(
@@ -2139,7 +2142,6 @@ class TestCatUnaligned:
     @pytest.mark.parametrize("consumer", CONSUMERS)
     def test_cat_5d_seq_unaligned(self, execution_mode, dtype, consumer):
         """[1,8,1,33,256] × 2 → cat(dim=3) → [1,8,1,66,256]. Seq dim unaligned; inner 256 unchanged. Both consumers."""
-        pytest.xfail()
         a = cached_randn(
             (1, 8, 1, 33, 256),
             dtype=dtype,
@@ -2202,7 +2204,6 @@ class TestCatSize1:
     @pytest.mark.parametrize("consumer", CONSUMERS)
     def test_cat_3d_size1_seq_expand(self, execution_mode, dtype, consumer):
         """[1,1,256] + [1,32,256] → cat(dim=1) → [1,33,256]. Size-1 seq prepended. Both consumers."""
-        pytest.xfail()
         a = cached_randn(
             (1, 1, 256), dtype=dtype, differentiation=f"cat_3d_size1_seq_a_{dtype}"
         )
@@ -2249,7 +2250,6 @@ class TestCatSize1:
     @pytest.mark.parametrize("consumer", CONSUMERS)
     def test_cat_5d_gqa_kv_cache(self, execution_mode, dtype, consumer):
         """[1,8,1,32,256] × 2 → cat(dim=2) → [1,8,2,32,256]. GQA-like cache; inner 256 unchanged. Both consumers."""
-        pytest.xfail()
         a = cached_randn(
             (1, 8, 1, 32, 256), dtype=dtype, differentiation=f"cat_5d_gqa_kv_a_{dtype}"
         )
@@ -2606,8 +2606,6 @@ class TestNarrowUnaligned:
     @pytest.mark.parametrize("consumer", CONSUMERS)
     def test_narrow_6d_inner_unaligned(self, execution_mode, dtype, consumer):
         """[1,2,4,8,16,128]→narrow(5,0,33)→[1,2,4,8,16,33]. 6D; inner changes 128→33 < 64. Both consumers."""
-        if consumer == "sum_last" and dtype == torch.float16:
-            pytest.xfail()
         if consumer == "sum_last" and dtype == torch.float32:
             pytest.xfail(
                 "known failure for sum_last/float32 (SubprocException); "
