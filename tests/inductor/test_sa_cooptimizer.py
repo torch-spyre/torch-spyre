@@ -1679,6 +1679,34 @@ class TilingInTheConfigTest(TestCase):
         ):
             self.assertIsNone(source.anchor(tiled, rnd.Random(0)))
 
+    def test_an_anchor_draws_from_the_tilings_own_domain(self):
+        """A tiling's per-tile frame computes its own span floors, so its
+        domain can hold a factor below the untiled floor. The anchor redraws
+        from the kept tiling's domain, or that split is never proposed."""
+        # Untiled, axis 0 has a span floor of 4; the tiling lowers it to 2.
+        space = mock_op_split_space(
+            {_AXIS_0: [4], _AXIS_1: [1, 2]},
+            {_AXIS_0, _AXIS_1},
+            tiling=_tiling_space(),
+        )
+        untiled = space.context
+        tiled = mock.MagicMock()
+        tiled.axes = untiled.axes
+        tiled.is_legal.side_effect = lambda splits: True
+        tiled.factor_domain.side_effect = {_AXIS_0: [2, 4], _AXIS_1: [1, 2]}.get
+        space._context = lambda tiling: untiled if tiling.is_untiled else tiled
+        source = _GeneratedDivisions(space, _menu_seed())
+        seed = source.config_for(space.division({_AXIS_0: 4}))
+        rng = rnd.Random(0)
+        with mock.patch.object(source, "_draw_tiling", return_value=_TILE_2):
+            anchors = [source.anchor(seed, rng) for _ in range(40)]
+        self.assertNotIn(None, anchors)
+        self.assertEqual({anchor.division.tiling for anchor in anchors}, {_TILE_2})
+        # 2 lies below the untiled floor and is only in the tiled domain.
+        self.assertEqual(
+            {anchor.division.splits.get(_AXIS_0, 1) for anchor in anchors}, {2, 4}
+        )
+
 
 class GeneratedWriteBackTest(TestCase):
     """A generated division carries no menu position, so the write-back is

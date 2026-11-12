@@ -1097,9 +1097,9 @@ def _has_untileable_reduction_span(op: ComputedBuffer, max_cores: int) -> bool:
     ``plan_span_overflow_tile``), unaffected by the config check here.
 
     Without this check (and when not disabled) the span is silently dropped,
-    ``span_reduction_pass`` cannot split the reduced axis either (multi-axis
-    plain reductions are pinned to split=1), and the op reaches the backend
-    over the limit.
+    the span floors (``work_division.span_floors``) cannot split the reduced
+    axis either (multi-axis plain reductions are pinned to split=1), and the
+    op reaches the backend over the limit.
     """
     if not isinstance(op.data, Reduction) or _supports_reduction_range_tiling(op):
         return False

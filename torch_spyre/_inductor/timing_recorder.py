@@ -24,7 +24,7 @@ Off unless ``config.timing``. Enable it with ``TORCH_SPYRE_TIMING=1`` and point
 ``TORCH_SPYRE_TIMING_OUT`` at a path to get a record::
 
     {"meta": {...},
-     "events": [{"name": "pass:CustomPreSchedulingPasses:span_reduction",
+     "events": [{"name": "pass:CustomPreSchedulingPasses:plan_sharded_hbm",
                  "ordinal": 4, "parent_ordinal": 1,
                  "t_start_ns": ..., "t_end_ns": ...,
                  "inclusive_ns": ..., "self_ns": ...,

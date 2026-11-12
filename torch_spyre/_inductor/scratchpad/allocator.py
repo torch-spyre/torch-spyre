@@ -62,6 +62,7 @@ from torch_spyre._inductor.work_division import (
     divide_deferred_ops,
     enumerate_work_division_candidates,
     has_resolved_work_div_hint,
+    span_floors,
     work_division_context_for_op,
     work_division_splits_are_legal,
     _core_division,
@@ -2554,10 +2555,8 @@ _FACTORED_B_FACTORS: tuple[int, ...] = (8, 4, 2)
 
 def _seed_splits(op: Operation) -> dict[sympy.Symbol, int]:
     ownership = getattr(op, "iteration_space_ownership", None)
-    return {
-        sym: int(ownership.work_slices.get(sym, 1)) if ownership is not None else 1
-        for sym in iteration_space_from_op(op)
-    }
+    seed = ownership.work_slices if ownership is not None else span_floors(op)
+    return {sym: int(seed.get(sym, 1)) for sym in iteration_space_from_op(op)}
 
 
 def _output_stride_to_device_size(op: Operation) -> dict[int, int]:
@@ -3051,9 +3050,11 @@ def commit_divisions(
             # ownership for it and let the division land.
             if not isinstance(op, ComputedBuffer) or not op_splits:
                 continue
-        # Joint tiling/division candidates were filtered by
-        # WorkDivisionContext.is_legal on the un-tiled frame before the solver
-        # saw them. Do not re-check resized tiled ranges here.
+        # The solve judged a tiled op's division with
+        # WorkDivisionContext.is_legal before choosing it: hard domains and
+        # span floors in the per-tile frame it predicted for the tiling, and
+        # the scheduler transport on the op's full frame. Do not re-check it
+        # on the resized ranges of the op the apply built.
         if not getattr(
             op, JOINT_TILING_AND_DIVISION_ATTR, False
         ) and not _split_option_is_legal(op, op_splits):

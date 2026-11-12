@@ -202,9 +202,10 @@ contracted dimension of the input. External kernels, which include custom ops an
 receive a safe default tiled layout.
 
 **Core work division** also runs on the LoopLevel IR, after layout propagation. Two passes
-cooperate. `span_reduction()` identifies which iteration dimensions can be parallelized across
-cores and how the span of each reduction partitions. `work_distribution()` then assigns those
-spans to the 32 cores and embeds the plan into the IR for codegen to consume.
+cooperate. `cost_model_matmul_division()` picks the split of matmuls from a cost model, and
+`work_distribution()` assigns the iteration dimensions of every other op to the 32 cores. Both
+start from the op's span floors, the minimum splits that keep each core's memory span within
+the hardware limit, and embed the plan into the IR for codegen to consume.
 
 One caveat is worth mentioning. The scheduler pass hooks are underscore-prefixed private APIs.
 They have been stable for us, but they can change between PyTorch releases without notice. We
@@ -322,8 +323,9 @@ Three components cooperate to produce a SuperDSC artifact for each scheduled nod
 
 Two passes run after layout propagation, and together they handle one of the decisions that
 differs most from a GPU. That decision is the static partitioning of work across all 32 cores
-at compile time. `span_reduction()` analyzes the iteration space of each reduction and determines
-how its span can be split. `work_distribution()` then assigns those spans to cores.
+at compile time. `cost_model_matmul_division()` prices matmul splits with a cost model, and
+`work_distribution()` assigns the iteration dimensions of every other op to cores. Both start
+from the op's span floors (`span_floors()`), which they compute when they choose the split.
 
 The algorithm does four things. It identifies which iteration dimensions can be parallelized
 across cores. It uses a two-pass approach that first satisfies the minimum splits required per
@@ -787,7 +789,7 @@ module. `flex::RuntimeContext::create()` starts only on the first device use.
 |---|---|---|---|
 | `FixedTiledLayout` | `inductor.ir.FixedLayout` (subclass) | Bridges the PyTorch stride model and Spyre tiled memory | Carries a `SpyreTensorLayout` descriptor with tiled device shape, dimension mapping (stick dims appear twice, once as tile index and once as intra-stick offset), stride mapping, and 128-byte padding |
 | `propagate_spyre_tensor_layouts()` | `CustomPreSchedulingPasses` (runs before `Scheduler` construction through a `GraphLowering._update_scheduler` monkey-patch) | Converts `FixedLayout` to `FixedTiledLayout` across the operation graph | Topological traversal of IR operations. Pointwise ops inherit the input layout. Matmul and reduction require special handling for the contracted output dimension. External kernels use a generic stick format. |
-| `span_reduction()` and `work_distribution()` | `CustomPreSchedulingPasses` (run after `propagate_spyre_tensor_layouts` in the same pre-scheduling pass) | Partitions iteration dimensions across 32 cores at compile time | Constrained by `SENCORES=32`. `span_reduction` determines how the span of each reduction can be split. `work_distribution` assigns spans to cores. Each core receives an equal number of sticks. Enforces the per-core addressable device memory limit (a hardware constraint that is distinct from the 2 MB LX SRAM scratchpad). Two-pass algorithm: minimum splits first, then remaining cores by priority. |
+| `cost_model_matmul_division()` and `work_distribution()` | `CustomPreSchedulingPasses` (run after `propagate_spyre_tensor_layouts` in the same pre-scheduling pass) | Partitions iteration dimensions across 32 cores at compile time | Constrained by `SENCORES=32`. Every split meets the op's span floors (`span_floors()`), computed when the split is chosen. `cost_model_matmul_division` picks matmul splits, and `work_distribution` assigns the rest. Each core receives an equal number of sticks. Enforces the per-core addressable device memory limit (a hardware constraint that is distinct from the 2 MB LX SRAM scratchpad). Two-pass algorithm: minimum splits first, then remaining cores by priority. |
 
 *Why the scheduler phase.* Tiled layouts must be resolved before codegen because they are
 needed for memory planning and core work division. Propagating through Dynamo and FakeTensor
