@@ -42,6 +42,7 @@ from torch_spyre._inductor.op_spec import (
     OpSpec,
     SourceLoc,
     TensorArg,
+    TensorWorkDivision,
     UnimplementedOp,
 )
 from torch_spyre.execution.async_compile import SpyreAsyncCompile
@@ -356,6 +357,26 @@ def test_emitted_script_executes_its_definitions():
     assert namespace["INPUTS_PT"] == "/tmp/captured/sdsc_add_0.inputs.pt"
 
 
+def test_emitted_script_round_trips_a_work_division():
+    """The operands of an LX relayout spec carry a TensorWorkDivision, which the
+    spec printer writes as a constructor call. Both printer branches: with and
+    without ``num_cores``."""
+    c0 = sympify("c0")
+    divisions = [
+        TensorWorkDivision({c0: 2}, {c0: sympify("floor(core_id/16)")}, num_cores=32),
+        TensorWorkDivision({c0: 32}, {c0: sympify("core_id")}),
+    ]
+    op = _add_op()
+    op.args[0].work_division, op.args[2].work_division = divisions
+    rec = _record()
+    rec.specs = [op]
+    src = capture.emit_script(rec, "prog.py", 1, False)
+    namespace: dict = {"__file__": "/tmp/captured/sdsc_add_0.py"}
+    exec(compile(src, "<emitted>", "exec"), namespace)  # noqa: S102
+    (emitted,) = namespace["ops"]
+    assert [emitted.args[0].work_division, emitted.args[2].work_division] == divisions
+
+
 def test_emitted_script_forwards_the_pool_size():
     """A pool kernel bundles only if pool_size reaches sdsc().
 
@@ -590,6 +611,43 @@ def test_capture_of_a_clean_program_exits_zero(tmp_path):
         assert capture.main([str(program), "--out", str(out_dir)]) == 0
 
     assert (out_dir / "sdsc_ok_0.py").exists()
+
+
+def test_capture_of_a_program_that_calls_sys_exit(tmp_path, capsys):
+    """``sys.exit(main())`` is how a program ends -- a pytest run among them --
+    so its kernels are written; only a non-zero status reads as partial."""
+    body = "SpyreAsyncCompile().sdsc('sdsc_ok_0', [])\nimport pytest, sys\n"
+    statuses = {
+        "0": 0,
+        "1": capture.EXIT_PARTIAL,
+        # What sys.exit(pytest.main([...])) passes for a passing run.
+        "pytest.ExitCode.OK": 0,
+        "'no device'": capture.EXIT_PARTIAL,
+    }
+    for i, (status, expected) in enumerate(statuses.items()):
+        program = _stub_sdsc_program(tmp_path, body + f"sys.exit({status})\n")
+        out_dir = tmp_path / f"captured_{i}"
+        with patch.object(SpyreAsyncCompile, "sdsc", _fake_sdsc):
+            assert capture.main([str(program), "--out", str(out_dir)]) == expected
+        assert (out_dir / "sdsc_ok_0.py").exists()
+    out = capsys.readouterr().out
+    assert "exited with status 1" in out
+    assert "exited with 'no device'" in out
+
+
+def test_write_kernel_fits_names_that_fill_name_max(tmp_path):
+    """A fused kernel name can be 255 bytes by itself. Two that differ only past
+    the trim share a stem, so the second gets ``_1``; both scripts and their .pt
+    files must still be writable."""
+    names = ["sdsc_fused_" + "x" * 243 + tail for tail in "ab"]
+    out = str(tmp_path)
+    records = [_record(name=name) for name in names]
+    paths = [capture.write_kernel(r, out, "prog.py", 2, False, True) for r in records]
+    assert paths[1] == paths[0].removesuffix(".py") + "_1.py"
+    for name, path in zip(names, paths):
+        assert len(os.path.basename(path).encode()) < 255
+        assert os.path.exists(os.path.splitext(path)[0] + ".inputs.pt")
+        assert f'KERNEL_NAME = "{name}"' in open(path).read()
 
 
 def test_capture_blames_the_crash_when_nothing_compiled(tmp_path):
