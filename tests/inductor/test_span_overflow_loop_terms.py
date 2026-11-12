@@ -65,12 +65,10 @@ def test_step_uses_the_stride_when_the_dim_is_squeezed():
     assert access_step(512 * d1, d0, sympy.Integer(1), 32768) == 32768
 
 
-def test_step_is_not_the_product_of_the_sizes_to_the_right():
-    # (8, 8, 64, 512) permuted (1, 0, 2, 3): strides (32768, 262144, 512, 1).
-    # Dim 0 tiled 8 ways is squeezed to extent 1; the product of the sizes to its
-    # right is 262144 (dim 1's stride), the buffer's stride for dim 0 is 32768.
-    strides = (32768, 262144, 512, 1)
-    assert access_step(sympy.S.Zero, None, sympy.Integer(1), strides[0]) == 32768
+def test_a_non_affine_index_is_unsupported():
+    # floor(d0/2) holds d0 but has no coefficient for it; reading 0 would drop the term
+    with pytest.raises(Unsupported, match="not affine"):
+        access_step(sympy.floor(d0 / 2) + d1, d0, sympy.Integer(4), 1)
 
 
 def test_a_symbolic_extent_is_unsupported():
@@ -392,6 +390,9 @@ def test_the_term_survives_every_core_split(case, sencores):
         compiled, looped = _recording(lambda: compile_span_overflow(fn, args, limit))
     assert looped
     assert all(len(op.loop_vars) == 1 for op in looped)
+    # work division really split the op across cores when there are several, and not
+    # when there is one, so the pinned loop variable is exercised under a split
+    assert ("(core_id" in compiled.code) == (sencores > 1), sencores
     assert _relative_error(compiled.outputs, fn(*[a.float() for a in args])) < 2e-2
 
 
@@ -516,3 +517,63 @@ def test_only_the_converted_group_becomes_a_node_next_to_a_flat_k_tiled_loop():
     assert violations == [], violations
     a, b, c, d = (t.float() for t in args)
     assert _relative_error(compiled.outputs, (a @ b, c + d)) < 2e-2
+
+
+def _compile_forced_view(view, levels):
+    """Compile ``abs(view(x)) + 1`` with the span-overflow plan forced to ``levels``
+    (over the view's shape), x a contiguous (64, 8, 512) fp16 input. Returns
+    ``(fraction of elements wrong, [_Looped])``."""
+    from test_span_overflow_hint_analysis import _forced_span_plan
+    from torch._inductor.utils import run_and_get_code
+
+    from torch_spyre._inductor import config
+    from torch_spyre.constants import DEVICE_NAME
+
+    torch.manual_seed(0xAFFE)
+    x = torch.randn(64, 8, 512, dtype=torch.float16)
+    fn = lambda x: torch.abs(view(x)) + 1  # noqa: E731
+    reference = fn(x.float())
+    shape = tuple(view(x).shape)
+
+    def run():
+        torch._dynamo.reset()
+        with (
+            mock.patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow."
+                "plan_span_overflow_tile",
+                _forced_span_plan(shape, levels),
+            ),
+            config.patch({"sencores": 4, "ignore_span_overflow_hints": False}),
+            torch._inductor.config.patch(force_disable_caches=True),
+        ):
+            out, _ = run_and_get_code(
+                torch.compile(fn, backend="inductor", fullgraph=True), x.to(DEVICE_NAME)
+            )
+        return ((out.cpu().float() - reference).abs() > 0.05).float().mean().item()
+
+    return _recording(run)
+
+
+def test_a_read_through_a_permuted_view_keeps_the_legacy_lowering():
+    """The op iterates (8, 64, 512) over an input stored (64, 8, 512): its dim 0 is
+    the buffer's dim 1. Tiled 8 ways on dim 0 that dim is squeezed to extent one, so
+    its step cannot come from the index and the buffer's stride for 'dim 0' would be
+    the wrong dim's (4096, not 512). The pass must see that and leave the group whole:
+    it still compiles, still right, with no loop variable and no term on any op."""
+    wrong, looped = _compile_forced_view(lambda t: t.permute(1, 0, 2), [(0, 8)])
+    assert wrong == 0.0, wrong
+    assert looped, "the forced plan formed no loop"
+    for op in looped:
+        assert op.loop_vars == [], (op.name, op.loop_vars)
+        assert not any(
+            regex.search(r"\bu\d+\b", i)
+            for i in (*op.reads.values(), *op.writes.values())
+        ), (op.name, op.reads, op.writes)
+
+
+def test_a_read_through_a_plain_view_is_still_converted():
+    """Control for the test above: the same forced plan on the input as stored
+    (same dim order, a squeezed dim 0) is converted."""
+    wrong, looped = _compile_forced_view(lambda t: t, [(0, 64)])
+    assert wrong == 0.0, wrong
+    assert looped and all(len(op.loop_vars) == 1 for op in looped), looped

@@ -45,7 +45,7 @@ relies on, so a torch upgrade knows exactly what to re-verify.
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterator, Sequence
 
 import torch
 from torch._inductor import dependencies, ir
@@ -243,34 +243,6 @@ class LoopSchedulerNode(CountedLoopSchedulerNode):
         self._fake_deps = (*getattr(self, "_fake_deps", ()), dep)
         BaseSchedulerNode.add_fake_dep(self, dep)
 
-    def set_read_writes(self, rw: dependencies.ReadWrites) -> None:
-        # Stock Inductor rebuilds a group node's reads from its children (fusion
-        # scoring does: ``_try_reindex_pointwise_for_reduction`` calls
-        # ``refresh_group_node_dependencies``). The children never saw the fake
-        # dependencies ``compute_dependencies`` gave the LOOP, so the rebuild would
-        # drop them. One of them is the loop's ordering after the prior writer of
-        # a buffer it mutates (the allocation of a span-overflow copy-out's full
-        # output): without it the loop can be scheduled before that allocation.
-        for dep in getattr(self, "_fake_deps", ()):
-            if dep not in rw.reads:
-                rw = rw.with_read(dep)
-        super().set_read_writes(rw)
-
-    # ``refresh_group_node_dependencies`` assigns ``unmet_dependencies`` straight
-    # from the children right after ``set_read_writes``, so the fake dependencies
-    # have to survive that assignment too: the memory-ordering pass reads them from
-    # here, not from ``read_writes``.
-    @property
-    def unmet_dependencies(self) -> OrderedSet[dependencies.Dep]:  # type: ignore[override]
-        return self.__dict__.get("_unmet_dependencies", OrderedSet())
-
-    @unmet_dependencies.setter
-    def unmet_dependencies(self, value: Iterable[dependencies.Dep]) -> None:
-        unmet = OrderedSet(value)
-        for dep in getattr(self, "_fake_deps", ()):
-            unmet.add(dep)
-        self.__dict__["_unmet_dependencies"] = unmet
-
     def update_mutated_names(self, renames: dict[str, str]) -> None:
         # The loop's external reads take the current names, as any node's do,
         # so the loop is ordered after an earlier mutation of what it reads.
@@ -427,6 +399,57 @@ _PATCHED = (
 )
 
 
+def _refresh_keeping_fake_deps(original):
+    """Wrap ``refresh_group_node_dependencies`` so a loop keeps its own fake deps.
+
+    Stock Inductor rebuilds a group node's reads and ``unmet_dependencies`` from
+    its children (fusion scoring does: ``_try_reindex_pointwise_for_reduction``).
+    The children never saw the fake dependencies ``compute_dependencies`` gave the
+    LOOP, so the rebuild drops them. One of them is the loop's ordering after the
+    prior writer of a buffer it mutates (the allocation of a span-overflow
+    copy-out's full output): without it ``reorder_for_peak_memory`` can place the
+    loop before that allocation.
+
+    Only the dependencies still present when the rebuild starts are put back, so
+    whatever a pruner has already removed (``prune_deps``, ``prune_weak_deps``,
+    ``_prune_redundant_deps``) stays removed.
+    """
+
+    def refresh(group_snode):
+        if not isinstance(group_snode, LoopSchedulerNode):
+            return original(group_snode)
+        fake = getattr(group_snode, "_fake_deps", ())
+        reads = [d for d in fake if d in group_snode.read_writes.reads]
+        unmet = [d for d in reads if d in group_snode.unmet_dependencies]
+        original(group_snode)
+        read_writes = group_snode.read_writes
+        for dep in reads:
+            if dep not in read_writes.reads:
+                read_writes = read_writes.with_read(dep)
+        group_snode.read_writes = read_writes
+        group_snode.clear_read_writes_dependent_caches()
+        group_snode.unmet_dependencies = OrderedSet(
+            [*group_snode.unmet_dependencies, *unmet]
+        )
+
+    return refresh
+
+
+@contextlib.contextmanager
+def _replace_refresh() -> Iterator[None]:
+    """Install :func:`_refresh_keeping_fake_deps` on Inductor's scheduler module
+    for the block (it calls the function through its module globals)."""
+    import torch._inductor.scheduler as scheduler_module
+
+    saved = scheduler_module.refresh_group_node_dependencies
+    scheduler_module.refresh_group_node_dependencies = _refresh_keeping_fake_deps(saved)
+    try:
+        yield
+    finally:
+        scheduler_module.refresh_group_node_dependencies = saved
+        assert scheduler_module.refresh_group_node_dependencies is saved
+
+
 @contextlib.contextmanager
 def _replace(replacements: dict) -> Iterator[None]:
     """Install ``replacements`` on ``Scheduler`` for the block; afterwards
@@ -533,13 +556,16 @@ def apply_loop_scheduler_patches() -> Iterator[None]:
                     buf.set_users([*buf.users, NodeUser(loop)])
         return result
 
-    with _replace(
-        {
-            "create_scheduler_node": create_scheduler_node,
-            "update_zero_dim_cpu_tensor": update_zero_dim_cpu_tensor,
-            "compute_ancestors": compute_ancestors,
-            "dead_node_elimination": dead_node_elimination,
-        }
+    with (
+        _replace(
+            {
+                "create_scheduler_node": create_scheduler_node,
+                "update_zero_dim_cpu_tensor": update_zero_dim_cpu_tensor,
+                "compute_ancestors": compute_ancestors,
+                "dead_node_elimination": dead_node_elimination,
+            }
+        ),
+        _replace_refresh(),
     ):
         yield
 

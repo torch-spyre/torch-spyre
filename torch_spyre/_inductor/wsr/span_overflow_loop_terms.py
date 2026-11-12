@@ -85,7 +85,8 @@ def access_step(
     never the product of the sizes to the right of the dim, which is the stride
     only for a contiguous buffer (#6093).
 
-    Raises ``Unsupported`` for an extent that is not an integer.
+    Raises ``Unsupported`` for an extent that is not an integer, and for an index
+    that holds the symbol without a plain coefficient for it.
     """
     if not isinstance(extent, sympy.Integer):
         raise Unsupported(
@@ -94,8 +95,14 @@ def access_step(
         )
     if dim_symbol is not None and dim_symbol in index.free_symbols:
         coefficient = index.coeff(dim_symbol)
-        if coefficient != 0:
-            return coefficient * extent
+        if coefficient == 0:
+            # The symbol is there but not as a plain term (floor, modulo, a product
+            # with another symbol): there is no coefficient to read.
+            raise Unsupported(
+                f"span-overflow loop term: the index {index} is not affine in "
+                f"{dim_symbol}."
+            )
+        return coefficient * extent
     return sympy.sympify(buffer_stride) * extent
 
 
@@ -152,6 +159,44 @@ def _stride(graph: Any, buffer_name: str, rank: int, dim: int) -> sympy.Expr:
     return sympy.sympify(buffer.get_stride()[dim])
 
 
+def _require_same_dim_order(
+    graph: Any, op: ComputedBuffer, dep: MemoryDep, buffer_name: str
+) -> None:
+    """Refuse a squeezed dim whose read is not a plain view of the buffer.
+
+    A dim tiled down to extent one has no symbol left in the index, so its step is
+    taken from the buffer's stride for the SAME dim number. That holds only when
+    the op's dims are the buffer's dims in the same order: for each dim that
+    survives, the index must step by the buffer's stride for that dim. A read
+    through a permute, a slice with a step or a reshape fails that, and the group
+    stays on the legacy record, which reads the step from the index before the
+    divide.
+    """
+    from ..spyre_kernel import SpyreKernel
+
+    rank = len(op.data.ranges)
+    buffer = graph.get_buffer(buffer_name)
+    if len(buffer.get_size()) != rank:
+        raise Unsupported(
+            f"span-overflow loop term: {buffer_name} has rank "
+            f"{len(buffer.get_size())} but {op.get_operation_name()} iterates "
+            f"{rank} dims."
+        )
+    for dim in range(rank):
+        if op.data.ranges[dim] == 1:
+            continue
+        symbol = SpyreKernel._host_dim_to_index_symbol(op, dim)
+        if symbol in dep.index.free_symbols and (
+            dep.index.coeff(symbol) != sympy.sympify(buffer.get_stride()[dim])
+        ):
+            raise Unsupported(
+                f"span-overflow loop term: {op.get_operation_name()} reads "
+                f"{buffer_name} through a view that reorders or strides its dims "
+                f"(dim {dim}: index step {dep.index.coeff(symbol)}, buffer stride "
+                f"{buffer.get_stride()[dim]})."
+            )
+
+
 def _access_term(
     graph: Any,
     op: Any,
@@ -181,9 +226,8 @@ def _access_term(
         )
         total += access_step(dep.index, symbol, sympy.sympify(extent), stride)
     if squeezed:
-        dims = [
-            d for d in op.loop_info.loop_tiled_dims[0] if int(op.data.ranges[d]) == 1
-        ]
+        _require_same_dim_order(graph, op, dep, buffer_name)
+        dims = [d for d in op.loop_info.loop_tiled_dims[0] if op.data.ranges[d] == 1]
         if len(dims) != len(squeezed):
             raise Unsupported(
                 f"span-overflow loop term: {op.get_operation_name()} records "
