@@ -459,7 +459,7 @@ def _relayout_loops(
     split_by_input: dict[sympy.Symbol, int],
     ranges: dict[sympy.Symbol, int],
 ) -> tuple[list[int], list[int], dict[sympy.Symbol, list[tuple[int, int]]]]:
-    """Phase 1 of ``relayout_views``: the loop extents, built from the output.
+    """Phase 1 of ``relayout_strides``: the loop extents, built from the output.
 
     There is one loop per output device axis, in the output's order, with one
     exception: a bare output axis over a symbol that an input stores as stick +
@@ -591,7 +591,7 @@ def _relayout_input_strides(
     symbol_dims: dict[sympy.Symbol, list[tuple[int, int]]],
     ranges: dict[sympy.Symbol, int],
 ) -> list[int]:
-    """Phase 2 of ``relayout_views``: one input's strides over the loops.
+    """Phase 2 of ``relayout_strides``: one input's strides over the loops.
 
     Each input axis adds its own row-major stride to the loops its coordinate
     is made of.  For example, an input axis ``Mod(c1, 64)`` with row-major
@@ -734,101 +734,20 @@ def relayout_strides(
             disagrees with its symbol's range -- or a coordinate is not a bare
             symbol, a stick index or a lane.
     """
-    loop_bounds, [in_strides], out_strides = relayout_views(
-        [(in_coords, in_size)], out_coords, out_size, ranges
-    )
-    return loop_bounds, in_strides, out_strides
-
-
-def relayout_views(
-    inputs: Sequence[tuple[Sequence[sympy.Expr], Sequence[int]]],
-    out_coords: Sequence[sympy.Expr],
-    out_physicalized_tensor_size: Sequence[int],
-    ranges: dict[sympy.Symbol, int],
-) -> tuple[tuple[int, ...], list[tuple[int, ...]], tuple[int, ...]]:
-    """One loop nest for an op's output and all of its inputs, and each one's strides.
-
-    ``relayout_strides`` for any number of inputs.  An op whose inputs are not
-    all laid out like its output -- ``a + b.T``, where ``b``'s stick runs along
-    ``a``'s rows -- reads every input in the output's order.  So every operand
-    needs its strides over ONE loop nest; then each indexing map is the identity
-    and the op's own payload runs unchanged.
-
-    The nest follows the output's physicalized axes, in the output's order.  An
-    axis is split in two, ``(n_sticks, lanes_per_stick)``, when the output walks
-    a loop variable on it whole but some input stores that variable as stick +
-    lane (phase 1, ``_relayout_loops``, given every input's splits at once).
-    Every input then gets its strides over that nest (phase 2,
-    ``_relayout_input_strides``).  An input laid out like the output gets the
-    output's strides: the same memory, viewed with the same axes.
-
-    Example, ``a + b.T`` on 128 x 128 at fp16.  ``c0`` and ``c1`` are the loop
-    variables, so the op computes ``out[c0, c1] = a[c0, c1] + b[c1, c0]``.  Each
-    operand is ``(coords, physicalized_tensor_size)``: where element
-    ``[c0, c1]`` sits in that buffer's stick-tiled layout in Spyre memory, and
-    that layout's sizes::
-
-        inputs = [
-            ([floor(c1/64), c0, Mod(c1, 64)], [2, 128, 64]),   # a: like out
-            ([floor(c0/64), c1, Mod(c0, 64)], [2, 128, 64]),   # b: stick on c0
-        ]
-        out_coords                   = [floor(c1/64), c0, Mod(c1, 64)]
-        out_physicalized_tensor_size = [2, 128, 64]
-        ranges                       = {c0: 128, c1: 128}
-
-        -> loop_bounds (2, 2, 64, 64)
-           in_strides  [(8192, 4096, 64, 1), (4096, 8192, 1, 64)]
-           out_strides (8192, 4096, 64, 1)
-
-    Here ``b`` stores ``c0`` as stick + lane, so the output's 128-row ``c0``
-    axis becomes the two loops ``(2, 64)``, for every operand.  The product of
-    ``loop_bounds`` is always the number of elements, and its length is the
-    output's rank plus one for each distinct loop variable the output walks
-    whole and some input stores as stick + lane.
-
-    Args:
-        inputs: ``(coords, physicalized_tensor_size)`` for each input.
-            ``coords`` gives, for each axis of the input's stick-tiled layout,
-            its coordinate in terms of the loop variables;
-            ``physicalized_tensor_size`` is that layout's size along each axis
-            (``TensorArg.device_size``).
-        out_coords, out_physicalized_tensor_size: the same for the output.
-        ranges: how many values each loop variable takes.
-
-    Returns:
-        loop_bounds: how many times each loop of the shared nest runs.
-        in_strides: how far each input's address moves per loop, in input order.
-        out_strides: the output's strides, always row-major.
-
-    Raises:
-        NotImplementedError: when the operands are not a pure re-indexing of
-            the output -- padding, a broadcast, a reduction, a loop variable
-            walked twice, a loop variable two inputs split at different stick
-            sizes, a size that disagrees with its loop variable's range -- or a
-            coordinate is not a whole loop variable, a stick index or a lane.
-    """
-    out_physicalized_tensor_size = [int(s) for s in out_physicalized_tensor_size]
-    if len(out_coords) != len(out_physicalized_tensor_size) or any(
-        len(coords) != len(size) for coords, size in inputs
-    ):
+    in_size = [int(s) for s in in_size]
+    out_size = [int(s) for s in out_size]
+    if len(in_coords) != len(in_size) or len(out_coords) != len(out_size):
         raise NotImplementedError(
             "OpSpec relayout: a coordinate list and its device size differ in rank"
         )
     # For each axis: the loop variable it walks, and whether it walks the whole
     # variable, its stick number or its lane (``_stick_term``).
     out_axis_loop_vars = [_stick_term(coord) for coord in out_coords]
-    # One entry per operand, the output first: (name for messages, what each
-    # axis walks, the size of each axis).
-    operands = [("output", out_axis_loop_vars, out_physicalized_tensor_size)]
-    for index, (coords, size) in enumerate(inputs):
-        operands.append(
-            (
-                f"input {index}",
-                [_stick_term(coord) for coord in coords],
-                [int(s) for s in size],
-            )
-        )
-    for operand_name, axis_loop_vars, physicalized_tensor_size in operands:
+    in_axis_loop_vars = [_stick_term(coord) for coord in in_coords]
+    for operand_name, axis_loop_vars, physicalized_tensor_size in (
+        ("output", out_axis_loop_vars, out_size),
+        ("input", in_axis_loop_vars, in_size),
+    ):
         for axis, (kind, _loop_var, _lanes) in enumerate(axis_loop_vars):
             if kind == _DIM_CONST and physicalized_tensor_size[axis] != 1:
                 raise NotImplementedError(
@@ -836,40 +755,26 @@ def relayout_views(
                     "constant coordinate over "
                     f"{physicalized_tensor_size[axis]} elements"
                 )
-    # Each loop variable some input stores as stick + lane, and how many lanes
-    # its stick has (64 at fp16, 32 at fp32): the output axes over these are the
-    # ones phase 1 may split in two.
+    # Each loop variable the input stores as stick + lane, and how many lanes its
+    # stick has (64 at fp16, 32 at fp32): the output axes over these are the ones
+    # phase 1 may split in two.
     stick_split_loop_vars: dict[sympy.Symbol, int] = {}
-    for operand_name, in_axis_loop_vars, _size in operands[1:]:
-        for kind, loop_var, lanes_per_stick in in_axis_loop_vars:
-            if kind in (_DIM_WITHIN_STICK, _DIM_OUTER_STICK):
-                earlier = stick_split_loop_vars.setdefault(loop_var, lanes_per_stick)
-                if earlier != lanes_per_stick:
-                    raise NotImplementedError(
-                        f"OpSpec relayout: {operand_name} splits {loop_var} into "
-                        f"{lanes_per_stick}-lane sticks, and another input splits "
-                        f"it into {earlier}-lane sticks"
-                    )
+    for kind, loop_var, lanes_per_stick in in_axis_loop_vars:
+        if kind in (_DIM_WITHIN_STICK, _DIM_OUTER_STICK):
+            if stick_split_loop_vars.setdefault(loop_var, lanes_per_stick) != (
+                lanes_per_stick
+            ):
+                raise NotImplementedError(
+                    f"OpSpec relayout: the input splits {loop_var} at two stick sizes"
+                )
 
     loop_bounds, out_strides, loops_of_loop_var = _relayout_loops(
-        out_axis_loop_vars,
-        out_physicalized_tensor_size,
-        stick_split_loop_vars,
-        ranges,
+        out_axis_loop_vars, out_size, stick_split_loop_vars, ranges
     )
-    in_strides = [
-        tuple(
-            _relayout_input_strides(
-                in_axis_loop_vars,
-                in_physicalized_tensor_size,
-                loop_bounds,
-                loops_of_loop_var,
-                ranges,
-            )
-        )
-        for _name, in_axis_loop_vars, in_physicalized_tensor_size in operands[1:]
-    ]
-    return tuple(loop_bounds), in_strides, tuple(out_strides)
+    in_strides = _relayout_input_strides(
+        in_axis_loop_vars, in_size, loop_bounds, loops_of_loop_var, ranges
+    )
+    return tuple(loop_bounds), tuple(in_strides), tuple(out_strides)
 
 
 def placeholder_axes(

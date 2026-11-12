@@ -36,7 +36,6 @@ import sys
 import unittest
 from unittest import mock
 
-import numpy as np
 import regex as re
 import sympy
 
@@ -46,7 +45,6 @@ from torch_spyre._inductor.codegen.opspec_utils import (
     align_reshape_plan,
     needs_relayout,
     relayout_strides,
-    relayout_views,
     row_major_strides,
 )
 from torch_spyre._inductor.constants import (
@@ -2708,182 +2706,6 @@ class TestRelayout(unittest.TestCase):
                 }
                 self.assertEqual(got, expected)
 
-    def test_one_input_views_are_the_relayout_strides(self):
-        """``relayout_views`` with one input is ``relayout_strides``, case by case."""
-        for case, fp32, expected in self.expectations():
-            table = RELAYOUT_CASES_FP32 if fp32 else RELAYOUT_CASES
-            _op, (in_size, in_coords), (out_size, out_coords), ranges = table[case]
-            with self.subTest(case=case, fp32=fp32):
-                loop_bounds, [in_strides], out_strides = relayout_views(
-                    [(in_coords, in_size)], out_coords, out_size, ranges
-                )
-                self.assertEqual((loop_bounds, in_strides, out_strides), expected)
-
-    def test_an_aligned_input_gets_the_output_strides(self):
-        """``c = a + b.T``: ``a`` is read through the same nest, at ``c``'s strides.
-
-        ``b`` stores ``c0`` as stick + lane, so ``c``'s ``c0`` axis is split for
-        every operand; ``a``, laid out like ``c``, is the same memory viewed with
-        that one extra axis.  Checked at one and two sticks per dim, and at fp16
-        (64 lanes per stick) and fp32 (32), so the stick size is read off the
-        coordinates rather than assumed.
-        """
-        c0, c1 = _C0, _C1
-        floor, mod = sympy.floor, sympy.Mod
-        for square_dim_size, lanes_per_stick in (
-            (128, 64),
-            (64, 64),
-            (128, 32),
-            (64, 32),
-        ):
-            # Both logical dims are square_dim_size long.
-            sticks_per_dim = square_dim_size // lanes_per_stick
-            physicalized_tensor_size = [
-                sticks_per_dim,
-                square_dim_size,
-                lanes_per_stick,
-            ]
-            c_layout = (
-                [floor(c1 / lanes_per_stick), c0, mod(c1, lanes_per_stick)],
-                physicalized_tensor_size,
-            )
-            b_layout = (
-                [floor(c0 / lanes_per_stick), c1, mod(c0, lanes_per_stick)],
-                physicalized_tensor_size,
-            )
-            ranges = {c0: square_dim_size, c1: square_dim_size}
-            with self.subTest(
-                square_dim_size=square_dim_size, lanes_per_stick=lanes_per_stick
-            ):
-                loop_bounds, [a_strides, b_strides], c_strides = relayout_views(
-                    [c_layout, b_layout], *c_layout, ranges
-                )
-                self.assertEqual(
-                    loop_bounds,
-                    (sticks_per_dim, sticks_per_dim, lanes_per_stick, lanes_per_stick),
-                )
-                self.assertEqual(a_strides, c_strides)
-                self.assertEqual(list(c_strides), row_major_strides(loop_bounds))
-                self.assertEqual(
-                    (loop_bounds, b_strides, c_strides),
-                    relayout_strides(*b_layout, *c_layout, ranges),
-                )
-
-    def test_two_inputs_moving_the_stick_split_two_axes(self):
-        """Each loop variable some input splits is split once, for every operand.
-
-        ``c = x + y`` on ``[128, 128, 128]`` at fp16.  ``c`` has its stick on
-        ``c2``, ``x`` on ``c1`` and ``y`` on ``c0``, so ``c``'s ``c0`` and ``c1``
-        axes are both split: rank 4 + 2.  Each dim is two real 64-lane sticks,
-        so both splits are ``(2, 64)``.  Checked element by element against the
-        coordinates.
-        """
-        c0, c1, c2 = _C0, _C1, _C2
-        floor, mod = sympy.floor, sympy.Mod
-        fp16_lanes_per_stick = 64
-        dim_size = 128
-        sticks_per_dim = dim_size // fp16_lanes_per_stick
-        physicalized_tensor_size = [
-            dim_size,
-            sticks_per_dim,
-            dim_size,
-            fp16_lanes_per_stick,
-        ]
-
-        def stick_on(stick_var, outer, middle):
-            return (
-                [
-                    outer,
-                    floor(stick_var / fp16_lanes_per_stick),
-                    middle,
-                    mod(stick_var, fp16_lanes_per_stick),
-                ],
-                physicalized_tensor_size,
-            )
-
-        c_layout = stick_on(c2, c0, c1)
-        x_layout = stick_on(c1, c0, c2)
-        y_layout = stick_on(c0, c1, c2)
-        ranges = {c0: dim_size, c1: dim_size, c2: dim_size}
-        loop_bounds, in_strides, c_strides = relayout_views(
-            [x_layout, y_layout, c_layout], *c_layout, ranges
-        )
-        self.assertEqual(len(loop_bounds), len(physicalized_tensor_size) + 2)
-        self.assertEqual(math.prod(loop_bounds), dim_size**3)
-        self.assertEqual(in_strides[2], c_strides)
-        for name, layout, strides in (
-            ("x", x_layout, in_strides[0]),
-            ("y", y_layout, in_strides[1]),
-        ):
-            with self.subTest(input=name):
-                self.assertTrue(
-                    self.strides_match_coords(
-                        loop_bounds, strides, c_strides, layout, c_layout, ranges
-                    )
-                )
-
-    def test_two_inputs_splitting_a_loop_var_at_two_stick_sizes_are_refused(self):
-        """A 64-lane and a 32-lane split of one loop variable have no common nest."""
-        c0, c1 = _C0, _C1
-        floor, mod = sympy.floor, sympy.Mod
-        c_layout = ([floor(c1 / 64), c0, mod(c1, 64)], [1, 64, 64])
-        b_64_lanes = ([floor(c0 / 64), c1, mod(c0, 64)], [1, 64, 64])
-        b_32_lanes = ([floor(c0 / 32), c1, mod(c0, 32)], [2, 64, 32])
-        with self.assertRaisesRegex(
-            NotImplementedError, "input 1 splits c0 into 32-lane sticks.*64-lane"
-        ):
-            relayout_views([b_64_lanes, b_32_lanes], *c_layout, {c0: 64, c1: 64})
-
-    @staticmethod
-    def strides_match_coords(
-        loop_bounds, in_strides, out_strides, in_layout, out_layout, ranges
-    ) -> bool:
-        """Whether the strides read, for every output element, the input element
-        the coordinates say it comes from.
-
-        Evaluated with numpy over every point at once, so a real-stick-size
-        tensor (millions of elements) is checked exactly in about a second.
-        Both sides are reduced to an ``output address -> input address`` array.
-        """
-
-        def address_from_strides(strides):
-            index = np.indices(loop_bounds).reshape(len(loop_bounds), -1)
-            return (np.array(strides)[:, None] * index).sum(0)
-
-        loop_vars = list(ranges)
-        grid = np.indices([ranges[v] for v in loop_vars]).reshape(len(loop_vars), -1)
-
-        def address_from_coords(layout):
-            coords, size = layout
-            axis_values = [
-                np.broadcast_to(
-                    sympy.lambdify(loop_vars, coord, modules="numpy")(*grid),
-                    grid.shape[1:],
-                )
-                for coord in coords
-            ]
-            return sum(
-                np.asarray(v, dtype=np.int64) * s
-                for v, s in zip(axis_values, row_major_strides(size))
-            )
-
-        total = math.prod(loop_bounds)
-        for addresses in (
-            address_from_strides(out_strides),
-            address_from_coords(out_layout),
-        ):
-            # Every output element is written exactly once, so the arrays below
-            # are filled completely and compare whole.
-            if len(np.unique(addresses)) != total:
-                return False
-        from_strides = np.empty(total, dtype=np.int64)
-        from_strides[address_from_strides(out_strides)] = address_from_strides(
-            in_strides
-        )
-        from_coords = np.empty(total, dtype=np.int64)
-        from_coords[address_from_coords(out_layout)] = address_from_coords(in_layout)
-        return bool((from_strides == from_coords).all())
-
     def test_a_padded_stick_is_refused(self):
         """63 elements in a 64-lane stick: the split would read a padding lane."""
         c0, c1 = _C0, _C1
@@ -3187,7 +3009,7 @@ class TestRelayoutOnAPointwiseOp(unittest.TestCase):
     def test_either_input_may_be_the_relayouted_one(self):
         """The relayouted input gets ``b``'s strides, the other ``c``'s, either way."""
         for lanes, (loop_bounds, c_strides, b_strides) in self.EXPECTED.items():
-            for relayouted in ((0,), (1,), (0, 1)):
+            for relayouted in ((0,), (1,)):
                 with self.subTest(lanes_per_stick=lanes, relayouted=relayouted):
                     step = self.step(relayouted, lanes_per_stick=lanes)
                     self.assertEqual(step.op, "add")
@@ -3199,6 +3021,15 @@ class TestRelayoutOnAPointwiseOp(unittest.TestCase):
                         )
                     self.assertEqual(step.out.extent, loop_bounds)
                     self.assertEqual(step.out.buffer.layout.strides, c_strides)
+
+    def test_two_relayouted_inputs_are_refused(self):
+        """Only one input is read through a relayout's strides.
+
+        A second would need the loop nest refined for both inputs at once, which
+        the single-input ``relayout_strides`` does not build.
+        """
+        with self.assertRaisesRegex(NotImplementedError, "2 inputs laid out"):
+            ktir.build_kernel_plan([make_add_transpose_spec((0, 1))])
 
     def test_add_stays_the_named_linalg_add(self):
         """The op is spelled as an aligned ``add`` is: ``linalg.add``, no maps."""

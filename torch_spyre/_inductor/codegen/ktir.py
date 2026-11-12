@@ -74,7 +74,7 @@ from torch_spyre._inductor.codegen.opspec_utils import (
     per_core_extent,
     placeholder_axes,
     reduction_indexing,
-    relayout_views,
+    relayout_strides,
     row_major_strides,
 )
 from torch_spyre._inductor.constants import (
@@ -1990,14 +1990,15 @@ class KernelPlan:
     def _relayout_step(
         self, spec: OpSpec, loops: Sequence[LoopSpec], stage: int
     ) -> ComputeStep:
-        """A pointwise op whose inputs are each viewed in the output's order.
+        """A pointwise op with one input laid out differently from its output.
 
         The step every other op gets from alignment, built from
-        ``relayout_views`` instead: one loop nest for every operand (the
-        output's device axes, split where an input splits a loop variable into
-        stick and lane), the output view row-major over it, and each input view
-        at whatever strides put each of its elements under the output element it
-        becomes.  Every map is then the identity, so the op is spelled by
+        ``relayout_strides`` instead: one loop nest for every operand (the
+        output's device axes, split where the relayouted input splits a loop
+        variable into stick and lane), the output view row-major over it, the
+        relayouted input at whatever strides put each of its elements under the
+        output element it becomes, and every other input -- laid out like the
+        output -- at the output's strides.  Every map is then the identity, so the op is spelled by
         ``_parallel_surface``, the same as an aligned pointwise op: a copy's
         payload arm gives a ``GENERIC`` that yields its operand.
 
@@ -2031,15 +2032,38 @@ class KernelPlan:
                 )
             ranges[sym] = count
         arm = recipe.arm(dtype)
-        loop_bounds, in_strides, out_strides = relayout_views(
-            [
-                (list(source.device_coordinates), [int(s) for s in source.device_size])
-                for source in inputs
-            ],
+        # One input is read through a relayout's strides; every other input must
+        # be laid out like the output, and is read at the output's strides.  Two
+        # relayouted inputs would need one loop nest refined for both, which the
+        # single-input ``relayout_strides`` does not build.
+        relayouted = [source for source in inputs if needs_relayout(source, out)]
+        if len(relayouted) != 1:
+            raise NotImplementedError(
+                f"OpSpec->KTIR: {spec.op!r} has {len(relayouted)} inputs laid out "
+                "differently from its output; a relayout reads exactly one"
+            )
+        [moved] = relayouted
+        for source in inputs:
+            if source is not moved and (
+                list(source.device_coordinates) != list(out.device_coordinates)
+                or [int(s) for s in source.device_size]
+                != [int(s) for s in out.device_size]
+            ):
+                raise NotImplementedError(
+                    f"OpSpec->KTIR: {spec.op!r} input {source.name!r} is neither the "
+                    "relayouted input nor laid out like the output; a relayout's other "
+                    "inputs are read at the output's strides"
+                )
+        loop_bounds, moved_strides, out_strides = relayout_strides(
+            list(moved.device_coordinates),
+            [int(s) for s in moved.device_size],
             list(out.device_coordinates),
             [int(s) for s in out.device_size],
             ranges,
         )
+        in_strides = [
+            moved_strides if source is moved else out_strides for source in inputs
+        ]
         # A stage has one view per buffer, so one buffer read at two sets of
         # strides -- ``x + x.T`` -- cannot be stated: the second view would
         # silently take the first one's place.
