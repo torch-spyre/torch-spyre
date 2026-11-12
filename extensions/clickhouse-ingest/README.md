@@ -480,8 +480,12 @@ What it promises:
   deterministic `insert_deduplication_token` (table, scope, position, rows), so every resend uses
   the same token and a second sender is harmless. Rerunning a load with the same `scope` inside the
   window resends under the same tokens.
-- **A plain table never has a batch sent again once a send may have stored it.** It is parked
-  with `"ambiguous": true` for a person.
+- **A plain table never has a batch sent again by the retry loop once a send may have stored it.**
+  It is parked with `"ambiguous": true` for a person. This holds inside one call only:
+  `resilient_insert` does not look for an existing parked file, so rerunning a plain-table load
+  with the same `scope` while a parked batch exists sends it again, and a process killed between
+  a send and the park leaves no record. Do not rerun a plain-table load until its parked batches
+  are dealt with.
 - **A batch refused before any write is retried inside the call that made it**, with backoff to
   the deadline, and may drop to a lower quorum only for a table that allows it.
 
@@ -514,7 +518,9 @@ python -m spyre_clickhouse_ingest spool drop TOKEN   # TOKEN is [A-Za-z0-9._-], 
 
 A `held` batch may already be stored. Check the table (the rows are in the file), send the missing
 rows yourself, then `drop` it. A batch that is not held was refused before any write and is safe
-to send. There is no `release`: with no automatic replay it would have nothing to release into.
+to send. The spool has no lock: two processes parking one token can leave two files, one held and
+one not, so treat a token listed twice as held. `drop` matches by token suffix. The spool
+directory is set by `CH_WRITE_SPOOL` for the CLI only; `Spool` itself takes a path. There is no `release`: with no automatic replay it would have nothing to release into.
 
 ## What is deliberately NOT here
 
