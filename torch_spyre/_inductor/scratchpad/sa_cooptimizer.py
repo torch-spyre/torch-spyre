@@ -122,8 +122,19 @@ def _positive_config(name: str) -> int:
 def _step_budget(n: int) -> int:
     """One restart's step count for ``n`` buffers that carry a division
     decision: ``config.sa_coopt_steps_per_buffer`` each, capped at
-    ``_MAX_STEPS``."""
-    return min(_MAX_STEPS, _positive_config("sa_coopt_steps_per_buffer") * n)
+    ``_MAX_STEPS``. Logs when the cap binds."""
+    per_buffer = _positive_config("sa_coopt_steps_per_buffer")
+    if per_buffer * n > _MAX_STEPS:
+        logger.debug(
+            "SA co-optimizer step budget clamped to %d for %d buffers (%d "
+            "steps/buffer would ask for %d); layout quality is traded for "
+            "bounded compile time.",
+            _MAX_STEPS,
+            n,
+            per_buffer,
+            per_buffer * n,
+        )
+    return min(_MAX_STEPS, per_buffer * n)
 
 
 # Fixed proposal weights over the move types. Reorder's weight is effectively 0
@@ -821,6 +832,8 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         # The division vector ``W``: one config per buffer, positionally. Set at
         # the seed (see :meth:`_seed_configs`); declared here for the types.
         self.chosen: list[DivisionConfig]
+        # Each restart's step budget, computed once per solve (set in _prepare).
+        self._steps: int
         # The seed state every restart starts from (set in _prepare); never
         # adopted itself, only copies of it.
         self._seed_state: _Snapshot
@@ -866,19 +879,6 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         restarts = _positive_config("sa_coopt_restarts")
         if not self._bufs:
             return list(self._bufs)
-        n = self._n_decisions()
-        steps = _step_budget(n)
-        per_buffer = spyre_config.sa_coopt_steps_per_buffer
-        if steps < per_buffer * n:
-            logger.debug(
-                "SA co-optimizer step budget clamped to %d for %d buffers (%d "
-                "steps/buffer would ask for %d); layout quality is traded for "
-                "bounded compile time.",
-                _MAX_STEPS,
-                n,
-                per_buffer,
-                per_buffer * n,
-            )
 
         self._prepare(cost_expr)
         start = time.perf_counter()
@@ -886,7 +886,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         wall_s = time.perf_counter() - start
         results.sort(key=lambda r: (r.score, r.seed))
         self._install(results[0])
-        self._record_restarts(results, steps, wall_s)
+        self._record_restarts(results, wall_s)
 
         self._log_tilings()
         self._write_back()
@@ -902,9 +902,11 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
     # -- restarts ------------------------------------------------------------
 
     def _prepare(self, cost_expr: Optional[sympy.Expr]) -> None:
-        """Everything up to the anneal, shared by every restart: the objective,
-        the static topology, and the seed state (every op at its committed
-        division, ``pi`` from FirstFit), kept as :attr:`_seed_state`."""
+        """Everything up to the anneal, shared by every restart: the step
+        budget, the objective, the static topology, and the seed state (every
+        op at its committed division, ``pi`` from FirstFit), kept as
+        :attr:`_seed_state`."""
+        self._steps = _step_budget(self._n_decisions())
         self._score_fn = self._build_score_fn(cost_expr)
         if self._score_fn is None:
             logger.info(
@@ -944,9 +946,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         self.best_score = result.score
         self._adopt(result.snapshot)
 
-    def _record_restarts(
-        self, results: list[_RestartResult], steps: int, wall_s: float
-    ) -> None:
+    def _record_restarts(self, results: list[_RestartResult], wall_s: float) -> None:
         """Fill :attr:`last_solve_stats` from ``results`` (sorted, winner
         first) and log the solve."""
         ns = 1000.0 / utils.US_FIXED_POINT_SCALE
@@ -957,7 +957,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
                 for r in results
             ],
             "winner_seed": winner.seed,
-            "steps_per_restart": steps,
+            "steps_per_restart": self._steps,
             "workers": 1,
             "wall_s": wall_s,
         }
@@ -2760,7 +2760,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         weights, from the state :meth:`_begin_restart` set up; the best state
         seen ends up in ``_best_score`` / ``_best_snap``. Returns the number of
         steps run."""
-        steps = _step_budget(self._n_decisions())
+        steps = self._steps
         cur = self._best_score
         run = 0
 

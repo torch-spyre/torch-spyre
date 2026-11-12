@@ -145,17 +145,14 @@ def _all_cases_incl_synthetic():
 
 def _primed(buffers, capacity):
     """A solver primed to the seed state (seed configs, FirstFit ``pi``): the
-    prefix of ``plan_layout_and_core_divisions`` up to the anneal, so a unit test
-    can drive the move / snapshot machinery -- or read the seed score -- directly.
+    prefix of ``plan_layout_and_core_divisions`` up to the first restart's
+    anneal, through the solver's own ``_prepare`` and ``_begin_restart`` so it
+    cannot drift from them, so a unit test can drive the move / snapshot
+    machinery -- or read the seed score -- directly.
     """
     solver = SaCoOptimizingSolver(buffers, capacity, 128)
-    solver._rng = rnd.Random(0)
-    solver._precompute_topology()
-    solver.chosen = solver._seed_configs()
-    solver.packer = solver._build_seed_packer()
-    solver._flippable_ops = solver._flippable()
-    solver._best_score = solver._score()
-    solver._best_snap = solver._snapshot()
+    solver._prepare(None)
+    solver._begin_restart(0)
     return solver
 
 
