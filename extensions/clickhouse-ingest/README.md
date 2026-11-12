@@ -465,6 +465,63 @@ It does not leave the HUD projection (`schema/70`). Its rows stay in `oss_ci_ben
 branch and commit stay in the metadata dropdowns too. The HUD reads these tables with PREWHERE, which
 a view cannot serve, so they cannot be filtered by a view. The follow-up is torch-spyre#5446.
 
+## Write resilience
+
+`resilience.resilient_insert` sends rows in batches and survives a degraded cluster (a pod restart,
+a Keeper blip, an `insert_quorum` that is briefly unmet). **Nothing calls it yet and there is no
+probe.** It is a building block with deliberately small promises.
+
+What it promises:
+
+- **Nothing is lost silently.** A batch it cannot land inside the call's deadline is parked as a
+  file in the `Spool`. If the spool is full, or a plain-table batch may be stored and there is no
+  spool, the call raises (`SpoolFull`, `WriteAmbiguous`, `WriteUnavailable`) instead of dropping it.
+- **Replicated tables are exactly-once inside the dedup window.** Every batch is sent with a
+  deterministic `insert_deduplication_token` (table, scope, position, rows), so every resend uses
+  the same token and a second sender is harmless. Rerunning a load with the same `scope` inside the
+  window resends under the same tokens.
+- **A plain table never has a batch sent again by the retry loop once a send may have stored it.**
+  It is parked with `"ambiguous": true` for a person. This holds inside one call only:
+  `resilient_insert` does not look for an existing parked file, so rerunning a plain-table load
+  with the same `scope` while a parked batch exists sends it again, and a process killed between
+  a send and the park leaves no record. Do not rerun a plain-table load until its parked batches
+  are dealt with.
+- **A batch refused before any write is retried inside the call that made it**, with backoff to
+  the deadline, and may drop to a lower quorum only for a table that allows it.
+
+What it does not promise:
+
+- No automatic replay. Parked batches stay until a person acts. Replaying a plain table would need
+  a claim and a lease, and the safe-looking Replicated-only replay still needs to know the dedup
+  window has not passed; neither is small enough to ship without a probe.
+- No exactly-once outside the dedup window (ClickHouse also evicts tokens by block count), and none
+  on a plain table.
+- `feeds_views` defaults to `True`: a table with a dependent materialized view can raise 242, 252,
+  285 or 286 from the view's target after the source block landed, so on a plain table a first such
+  error is held, not retried. Pass `feeds_views=False` to `resilient_insert` (the one place the knob
+  lives) for a table with no dependent view. Replicated inserts also send
+  `deduplicate_blocks_in_dependent_materialized_views=1` so a retry reaches a view target that
+  missed the block (checked on single-node chdb 26.9; the view target needs its own dedup window,
+  and Keeper-backed Replicated tables and servers older than 26.2, where the default is 0, are not
+  verified).
+- A probe (is this batch already stored?) needs a per-batch marker, such as a batch-id column. The
+  sort keys of `test_case_runs`, `benchmark_runs` and `artifact_results` are not unique per batch,
+  so counting rows by key would call a lost batch stored.
+
+Handling parked batches by hand. The spool directory (`CH_WRITE_SPOOL`) is 0700 and its files are
+0600 plain JSON: they hold row data.
+
+```text
+python -m spyre_clickhouse_ingest spool list         # token, table, row count, held?
+python -m spyre_clickhouse_ingest spool drop TOKEN   # TOKEN is [A-Za-z0-9._-], max 200
+```
+
+A `held` batch may already be stored. Check the table (the rows are in the file), send the missing
+rows yourself, then `drop` it. A batch that is not held was refused before any write and is safe
+to send. The spool has no lock: two processes parking one token can leave two files, one held and
+one not, so treat a token listed twice as held. `drop` matches by token suffix. The spool
+directory is set by `CH_WRITE_SPOOL` for the CLI only; `Spool` itself takes a path. There is no `release`: with no automatic replay it would have nothing to release into.
+
 ## What is deliberately NOT here
 
 - **v1 write paths whose TARGET TABLE differs per repo.** `hf_test_runs` vs `test_runs` cannot share
