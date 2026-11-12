@@ -88,6 +88,7 @@ def _pointwise(name, *reads, layout=None):
     buf = ComputedBuffer(name=name, layout=layout or _layout(), data=pw.data.data)
     buf.operation_name = f"op_{name}"
     V.graph.name_to_buffer[name] = buf
+    V.graph.name_to_op[buf.operation_name] = buf
     return buf
 
 

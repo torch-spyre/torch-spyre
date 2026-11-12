@@ -37,6 +37,7 @@ from torch._inductor.ir import MultiOutput, Operation
 from torch._inductor.scheduler import BaseSchedulerNode
 
 from . import timing_recorder
+from .graph_validation import validate_graph
 from .logging_utils import get_inductor_logger
 from . import pass_counters
 from .pass_counters import COUNTERS
@@ -745,6 +746,7 @@ class CustomPreSchedulingPasses:
     def _run_pass_loop(self, graph: GraphLowering) -> None:
         """Run the pass list. Split out so it gets its own timed region."""
         pipeline = type(self).__name__
+        prev_buf_count = len(graph.buffers)
         for pass_fn in self.passes:
             pass_name = _get_pass_name(pass_fn)
             with _flat_operations(graph, pass_name):
@@ -752,6 +754,14 @@ class CustomPreSchedulingPasses:
             # After the view is put back: the checker reads the real tree, and a
             # violation then names the pass that left it.
             check_loops(graph, where=pass_name)
+
+            if config.validate_graph_invariants:
+                validate_graph(
+                    graph,
+                    pass_name=pass_name,
+                    prev_buffer_count=prev_buf_count,
+                )
+            prev_buf_count = len(graph.buffers)
 
     def _run_one_pass(
         self,
