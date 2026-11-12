@@ -47,6 +47,7 @@ from torch_spyre._C import (  # noqa: E402
     get_device_dtype,
     get_elem_in_stick,
 )
+from torch_spyre._inductor.errors import Unsupported  # noqa: E402
 
 
 # The backend scheduler's rejection of a scatter bundle (#4409), as it appears in
@@ -1683,6 +1684,53 @@ class _ScatterScenarios:
             return torch.masked_scatter(inp, mask, src)
 
         self.check(kernel, inp, mask, src, expect=CRASHED)
+
+    # -- masked_scatter in eager mode ------------------------------------------
+    def test_masked_scatter_eager_row_mask(self):
+        """Eager masked_scatter with an un-expanded [rows, 1] row mask.
+
+        The form real models pass, e.g. Mistral's
+        inputs_embeds.masked_scatter(image_mask, image_features).
+        """
+        for rows in (5, 6, 7, 8, 9, 31):
+            with self.subTest(rows=rows):
+                g = torch.Generator().manual_seed(rows)
+                mask = torch.rand(rows, 1, generator=g) > 0.5
+                x = torch.randn(rows, 64, dtype=torch.float16, generator=g)
+                src = torch.randn(rows, 64, dtype=torch.float16, generator=g)
+                expected = x.masked_scatter(mask, src)
+                out = x.to("spyre").masked_scatter(mask.to("spyre"), src.to("spyre"))
+                # fp16 values round-trip with 1-ulp error on device, so not exact.
+                torch.testing.assert_close(out.cpu(), expected)
+
+    def test_masked_scatter_eager_inplace_row_mask(self):
+        """Eager masked_scatter_ writes into ``self`` and returns it.
+
+        masked_scatter_ had no Spyre kernel and failed at ATen lookup (#4437).
+        """
+        rows = 7
+        g = torch.Generator().manual_seed(0)
+        mask = torch.rand(rows, 1, generator=g) > 0.5
+        x = torch.randn(rows, 64, dtype=torch.float16, generator=g)
+        src = torch.randn(rows, 64, dtype=torch.float16, generator=g)
+        expected = x.clone().masked_scatter_(mask, src)
+        x_spyre = x.to("spyre")
+        out = x_spyre.masked_scatter_(mask.to("spyre"), src.to("spyre"))
+        self.assertIs(out, x_spyre)
+        torch.testing.assert_close(x_spyre.cpu(), expected)
+
+    def test_masked_scatter_eager_inplace_element_mask_rejected(self):
+        """Eager masked_scatter_ with a per-element mask raises Unsupported.
+
+        A deliberate rejection: a lane within a stick is not addressable on
+        Spyre (#4437). In-place now reaches it instead of failing at ATen
+        lookup with NotImplementedError.
+        """
+        x = torch.zeros(4, dtype=torch.float16, device="spyre")
+        mask = torch.tensor([True, False, True, False], device="spyre")
+        src = torch.tensor([10.0, 20.0], dtype=torch.float16, device="spyre")
+        with self.assertRaisesRegex(Unsupported, "masked_scatter needs a mask"):
+            x.masked_scatter_(mask, src)
 
 
 # Op-behaviour scenarios run once at the default 32 cores. They classify / lower
