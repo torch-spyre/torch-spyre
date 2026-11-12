@@ -4162,6 +4162,105 @@ def spyre_index_add(
     return torch.ops.aten.index_put.default(self, indices, updated, accumulate=False)
 
 
+_INDEX_REDUCE_TYPES = ("prod", "mean", "amax", "amin")
+_INDEX_REDUCE_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+
+@register_spyre_decompositions([torch.ops.aten.index_reduce.default])
+def spyre_index_reduce(
+    self: torch.Tensor,
+    dim: int,
+    index: torch.Tensor,
+    source: torch.Tensor,
+    reduce: str,
+    *,
+    include_self: bool = True,
+) -> torch.Tensor:
+    """``index_reduce`` for unique indices as gather + combine + overwrite.
+
+    Upstream Inductor lowers ``mean`` through ``index_add`` and falls back to
+    the (missing) eager kernel for ``prod`` / ``amax`` / ``amin``. With unique
+    indices each slot receives at most one source slice, so a plain
+    read-modify-write is exact -- the same pattern as :func:`spyre_index_add`::
+
+        gathered = self[index]                      # include_self only
+        final    = reduce(gathered, source)         # or source itself
+        out      = index_put(self, index, final)    # overwrite
+
+    PRECONDITION -- ``index`` must contain NO DUPLICATE values. Spyre's
+    indirect store only overwrites, so colliding writes keep just one source
+    slice and the result is SILENTLY WRONG. It cannot be detected on device:
+    ``torch._assert_async`` does not fire on Spyre. Once the backend gains a
+    combining scatter (max / min / prod / add on collision), duplicates can be
+    handled here by scattering ``source`` with that reduce instead.
+
+    Only a non-stick ``dim`` is supported: the gather/scatter along the last
+    dim does not lower (the same limit as ``index_copy``, #4404).
+    """
+    if reduce not in _INDEX_REDUCE_TYPES:
+        raise RuntimeError(
+            f"index_reduce(): Expected reduce to be one of prod, mean, amax or "
+            f"amin but got {reduce}."
+        )
+    dtype = self.dtype
+    if dtype not in _INDEX_REDUCE_DTYPES:
+        raise Unsupported(
+            f"index_reduce on {dtype}: only float16, bfloat16 and float32"
+        )
+    if source.dtype != dtype:
+        raise RuntimeError(
+            f"index_reduce_(): self ({dtype}) and source ({source.dtype}) must "
+            f"have the same scalar type"
+        )
+    if index.dim() > 1:
+        raise RuntimeError("index_reduce_(): Index is supposed to be a vector")
+    ndim = self.dim()
+    if ndim == 0:
+        raise Unsupported("index_reduce on a 0-d tensor")
+    dim = dim % ndim
+    if dim == ndim - 1:
+        raise Unsupported(
+            "index_reduce along the stick (last) dim: its gather/scatter along "
+            "the stick does not lower on Spyre (#4404)"
+        )
+    if index.numel() == 0 or self.numel() == 0:
+        return self.clone()
+
+    if include_self:
+        gathered = torch.index_select(self, dim, index)
+        if reduce == "amax":
+            final = torch.maximum(gathered, source)
+        elif reduce == "amin":
+            final = torch.minimum(gathered, source)
+        elif reduce == "prod":
+            final = gathered * source
+        else:  # mean of self and one source slice
+            final = (gathered + source) / 2.0
+    else:
+        # One source slice per slot: its amax / amin / prod / mean is itself.
+        final = source
+    indices: list[Optional[torch.Tensor]] = [None] * dim + [index]
+    # The aten op, not torch.index_put: only it accepts None placeholders for
+    # the leading dims when called eagerly.
+    return torch.ops.aten.index_put.default(self, indices, final, False)
+
+
+@register_spyre_decompositions([torch.ops.aten.index_reduce_.default])
+def spyre_index_reduce_(
+    self: torch.Tensor,
+    dim: int,
+    index: torch.Tensor,
+    source: torch.Tensor,
+    reduce: str,
+    *,
+    include_self: bool = True,
+) -> torch.Tensor:
+    """In-place ``index_reduce_``: compute :func:`spyre_index_reduce`, copy back."""
+    return self.copy_(
+        spyre_index_reduce(self, dim, index, source, reduce, include_self=include_self)
+    )
+
+
 def _grouped_mm_capacity(n: int, num_experts: int) -> int:
     """Static per-expert capacity: 2 * ceil_to_64(n / num_experts), clamped to [64, n].
 
