@@ -750,6 +750,7 @@ class _ScatterScenarios:
                     return y
 
                 self._assert_compiled_matches_cpu(kernel, y, src, idx)
+
     # ===== scatter through a view of the destination =====================
     # The scatter writes through a view, so the shape the index uses and the
     # shape the destination was allocated with are not the same.
