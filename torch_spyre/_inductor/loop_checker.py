@@ -25,6 +25,23 @@ What it checks:
 2. Every loop variable in an op's read and write indices is the induction
    variable of a loop that encloses the op.
 3. Every carry's update is an op in its node's body.
+4. An op that runs in a counted loop that a node covers (its ``loop_info``
+   names that loop) sits inside that node: not outside it, and not in the body
+   of another loop's node.
+5. A node's body holds no op that is not a member of the loop BETWEEN two of
+   its members.
+
+A loop no node covers is not checked: span-overflow tiling still stamps flat
+loop ops (stage 7a replaces it), and ``build_loop_scheduler_nodes`` groups them
+later. So rule 4 fires only when a node already claims the op's loop, which is
+how a copy-back placed after its loop by a flat index (#6101) is told from a
+flat loop.
+
+Rules 4 and 5 compare each op's ``loop_info`` with the node it sits in, using
+the same group path that builds the nodes (:func:`counted_loop_path`, which
+gives an ``ExternKernel`` the empty path). They see only the leaf ops, so a node
+built by hand from ops with no ``loop_info`` (the unit tests do) is not checked
+by them.
 
 What it cannot check: that a read which SHOULD advance carries the induction
 variable. That was the padding bug (#5573); only a comparison against the
@@ -56,6 +73,7 @@ from torch._inductor import ir
 from torch._inductor.dependencies import MemoryDep
 
 from .logging_utils import get_inductor_logger
+from .loop_facts import counted_loop_path
 from .loop_node import LoopNode, all_ops, in_building_loop
 
 logger = get_inductor_logger("loop_checker")
@@ -81,6 +99,17 @@ class LoopStructureError(RuntimeError):
             "(a compiler bug; set TORCH_SPYRE_CHECK_LOOPS=0 to skip this check):\n  "
             + "\n  ".join(self.problems)
         )
+
+
+class LoopAdvanceMismatch(RuntimeError):
+    """A loop access's advance read from its stored record differs from the one
+    read from its index (stage 7.2).
+
+    Raised while the kernel builds a ``TensorArg``, so ``TORCH_SPYRE_CHECK_LOOPS``
+    does not apply. A compiler bug, not a user error, so not ``Unsupported``
+    (see :class:`LoopStructureError`). Until the stored fields are deleted
+    (stage 7.4) an op can carry both; they must agree.
+    """
 
 
 _TRUE = frozenset({"1", "true", "yes", "on"})
@@ -152,6 +181,107 @@ def _index_symbols(op: ir.Operation) -> set[sympy.Symbol]:
     return used
 
 
+def _node_key(node: LoopNode, depth: int) -> tuple[int, ...] | None:
+    """The group path prefix of ``node``'s members at ``depth``, from its first
+    member that has one (the same rule as ``loop_node._node_key``)."""
+    for leaf in all_ops(node.body):
+        path = counted_loop_path(leaf)
+        if len(path) > depth:
+            return path[: depth + 1]
+    return None
+
+
+def _covered_keys(
+    entries: list[ir.Operation], depth: int = 0, out: set[tuple[int, ...]] | None = None
+) -> set[tuple[int, ...]]:
+    """The group path key of every node in ``entries``, at every depth."""
+    out = set() if out is None else out
+    for entry in entries:
+        if isinstance(entry, LoopNode):
+            key = _node_key(entry, depth)
+            if key is not None:
+                out.add(key)
+            _covered_keys(entry.body, depth + 1, out)
+    return out
+
+
+def _claimed(path: tuple[int, ...], covered: set[tuple[int, ...]]) -> bool:
+    """Whether some node covers ``path`` or a prefix of it."""
+    return any(path[: len(key)] == key for key in covered)
+
+
+def _membership_problems(
+    entries: list[ir.Operation],
+    depth: int,
+    enclosing: tuple[int, ...],
+    problems: list[str],
+    covered: set[tuple[int, ...]],
+) -> None:
+    """Rule 4 for ``entries``, which sit directly in a node whose key is
+    ``enclosing`` (``()`` at the top level). ``covered`` holds every node's key."""
+    for entry in entries:
+        if isinstance(entry, LoopNode):
+            key = _node_key(entry, depth)
+            if key is not None:
+                if key[: len(enclosing)] != enclosing:
+                    problems.append(
+                        f"{entry.get_name()} is a loop of group path {key} "
+                        f"nested in a loop of group path {enclosing}"
+                    )
+                _membership_problems(entry.body, depth + 1, key, problems, covered)
+            else:
+                _membership_problems(
+                    entry.body, depth + 1, enclosing, problems, covered
+                )
+            continue
+        path = counted_loop_path(entry)
+        if path and not enclosing:
+            if not _claimed(path, covered):
+                continue  # a flat loop no node covers
+            problems.append(
+                f"{entry.get_name()} runs in the counted loop {path} but sits "
+                "outside every loop node"
+            )
+        elif path and path[: len(enclosing)] != enclosing:
+            problems.append(
+                f"{entry.get_name()} runs in the counted loop {path} but sits "
+                f"in the body of the loop {enclosing}"
+            )
+
+
+def _interior_non_members(
+    entries: list[ir.Operation], depth: int, problems: list[str]
+) -> None:
+    """Rule 5: an op that is not a member of its node, between two members.
+
+    Head and tail non-members are allowed here: an allocator that inserts "before
+    the loop" through the flat view puts the op in the body, and
+    ``peel_non_members`` moves it out at the hand-off. An ``ExternKernel`` is
+    allowed anywhere (a once-op stays in the body until the scheduler hoists it).
+    """
+    for entry in entries:
+        if not isinstance(entry, LoopNode):
+            continue
+        key = _node_key(entry, depth)
+        if key is not None:
+            member = [
+                isinstance(op, LoopNode)
+                or bool(counted_loop_path(op))
+                or isinstance(op, ir.ExternKernel)
+                for op in entry.body
+            ]
+            real = [i for i, m in enumerate(member) if m]
+            if real:
+                for i in range(real[0], real[-1] + 1):
+                    if not member[i]:
+                        problems.append(
+                            f"{entry.body[i].get_name()} is in the body of "
+                            f"{entry.get_name()} between two of its members "
+                            "but is not a member of the loop"
+                        )
+        _interior_non_members(entry.body, depth + 1, problems)
+
+
 def find_violations(operations: list[ir.Operation]) -> list[str]:
     """Every structural violation in ``operations``, as messages."""
     problems: list[str] = []
@@ -188,6 +318,8 @@ def find_violations(operations: list[ir.Operation]) -> list[str]:
             carries(entry.body)
 
     carries(operations)
+    _membership_problems(operations, 0, (), problems, _covered_keys(operations))
+    _interior_non_members(operations, 0, problems)
     return problems
 
 

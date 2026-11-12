@@ -70,6 +70,8 @@ from .pass_utils import (
     commit_iteration_space_ownership,
     op_out_coords,
     op_read_writes,
+    unrepresentable_splits_by_index_coeff,
+    work_division_transport_indexes,
     _per_core_view_from_prep,
     _prepare_per_core_view,
     tile_ownership_view,
@@ -830,7 +832,26 @@ def collect_tensor_deps(
 
 
 def apply_splits(op: ComputedBuffer, splits: dict) -> None:
-    """Commit symbol-keyed work division; scheduler transport is finalized later."""
+    """Commit symbol-keyed work division; scheduler transport is finalized later.
+
+    The gate span_reduction, the default greedy distributor, the cost-model
+    matmul re-pricer, and user hints all commit a split through -- so none of
+    them can individually forget to reject a split the scheduler's
+    coefficient-keyed transport cannot carry losslessly (see
+    ``unrepresentable_splits_by_index_coeff``). An op with no ``MemoryDep``
+    write never goes through that transport, so nothing is checked for it
+    here.
+
+    The LX co-optimizer (``scratchpad.allocator.commit_divisions``) does not
+    go through this gate: it commits its chosen division directly via
+    ``commit_iteration_space_ownership``, but its candidates come from
+    ``enumerate_work_division_candidates``, which already filters through
+    ``WorkDivisionContext.is_legal`` -- the same representability check --
+    before the solver ever sees them.
+    """
+    work_division_transport_indexes(
+        op, op_read_writes(op), iteration_space_from_op(op), splits
+    )
     commit_iteration_space_ownership(op, splits)
 
 
@@ -863,8 +884,16 @@ class WorkDivisionContext:
     constraints: ConstraintResult
     # Hard per-axis floors ``span_reduction_pass`` has already committed.
     span_min_splits: dict[Symbol, int]
+    # The write/read indexes the scheduler transport uses; None means no
+    # indexed write exists.
+    write_index: Expr | None
+    read_index: Expr | None
+    # The transport's unit-axis carve-out must use the same full frame as
+    # commit-time checks, even when this context was built for a tiled frame.
+    # Cache it once rather than re-deriving the sympy iteration space per candidate.
+    transport_it_space: dict[Symbol, Expr] | None = None
     # factor_domain is asked once per axis by the enumeration and again per
-    # candidate by is_legal; the derivation is sympy-heavy, so memoize it.
+    # candidate by is_legal; memoize its sympy-heavy derivation.
     _factor_domains: dict[Symbol, list[int]] = dataclasses.field(
         default_factory=dict, init=False, repr=False, compare=False
     )
@@ -908,6 +937,22 @@ class WorkDivisionContext:
             and self._spans_within_cap(splits)
             and self._in_split_domains(splits)
             and self.meets_span_floors(splits)
+            and self.representable_by_index_coeff(splits)
+        )
+
+    def representable_by_index_coeff(self, splits: dict[Symbol, int]) -> bool:
+        """Whether the scheduler's coefficient-keyed transport can carry
+        ``splits`` without loss, using the op's full, un-tiled iteration space.
+        """
+        if self.write_index is None:
+            return True
+        full_it_space = (
+            self.transport_it_space
+            if self.transport_it_space is not None
+            else self.it_space
+        )
+        return not unrepresentable_splits_by_index_coeff(
+            splits, full_it_space, self.write_index, self.read_index
         )
 
     def obeys_op_constraints(self, splits: dict[Symbol, int]) -> bool:
@@ -996,7 +1041,8 @@ def work_division_context_for_op(
     rejects by value, and would silently disagree with the frame the allocator
     prices the same candidate on.
     """
-    it_space = iteration_space_from_op(op)
+    transport_it_space = iteration_space_from_op(op)
+    it_space = transport_it_space
     if tiling is not None and not tiling.is_untiled:
         from .wsr.tile_prediction import predict_frame
 
@@ -1004,9 +1050,10 @@ def work_division_context_for_op(
         if frame is None:
             return None
         it_space = frame.iter_space
+    rw = op_read_writes(op)
     input_tds, output_td = collect_tensor_deps(
         op,
-        _apply_input_layout_overrides(op, get_mem_deps_from_rw(op_read_writes(op))),
+        _apply_input_layout_overrides(op, get_mem_deps_from_rw(rw)),
     )
     symbol_meta = _collect_symbol_metadata(it_space)
     it_space_adjusted, stick_vars = adjust_it_space_for_sticks(
@@ -1031,6 +1078,8 @@ def work_division_context_for_op(
             committed_splits={},
         )
     )
+    indexes = work_division_transport_indexes(op, rw, it_space)
+    write_index, read_index = indexes if indexes is not None else (None, None)
     return WorkDivisionContext(
         op=op,
         max_cores=max_cores,
@@ -1042,6 +1091,9 @@ def work_division_context_for_op(
         reduction_vars=reduction_vars,
         constraints=constraint_result,
         span_min_splits=_span_min_splits(op),
+        write_index=write_index,
+        read_index=read_index,
+        transport_it_space=transport_it_space,
     )
 
 
@@ -1077,11 +1129,10 @@ def enumerate_work_division_candidates(
 def work_division_splits_are_legal(
     op: ComputedBuffer, splits: dict[Symbol, int]
 ) -> bool:
-    """Return whether symbol-keyed splits obey this op's hard constraints.
+    """Whether splits obey hard constraints and scheduler transport.
 
-    The op's own constraints only: unlike :meth:`WorkDivisionContext.is_legal`
-    this asks nothing about a core budget or per-core spans, because the splits
-    are already committed rather than proposed.
+    Unlike :meth:`WorkDivisionContext.is_legal`, this checks neither a core
+    budget nor per-core spans.
     """
     layout = op.get_layout()
     if isinstance(layout, MutationLayoutSHOULDREMOVE):
@@ -1091,7 +1142,11 @@ def work_division_splits_are_legal(
 
     ctx = work_division_context_for_op(op)
     assert ctx is not None  # untiled: never rejected
-    return ctx.obeys_op_constraints(splits) and ctx.meets_span_floors(splits)
+    return (
+        ctx.obeys_op_constraints(splits)
+        and ctx.meets_span_floors(splits)
+        and ctx.representable_by_index_coeff(splits)
+    )
 
 
 # Per-candidate core-division machinery: the questions a solver asks of
@@ -1919,6 +1974,13 @@ def _apply_user_hint(
             f"{conflicting_domains} or span floors {below_span_floor}."
         )
 
+    work_division_transport_indexes(
+        op,
+        op_read_writes(op),
+        iteration_space_from_op(op),
+        splits,
+        message_prefix="work_division_hint:",
+    )
     return splits
 
 
