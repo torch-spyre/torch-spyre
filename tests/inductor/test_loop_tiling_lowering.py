@@ -21,13 +21,14 @@ running both at the same call, on the same undivided graph.
 
 import contextlib
 import dataclasses
+import os
 from unittest import mock
 
 import pytest
 import torch  # noqa: F401  (must precede torch_spyre._inductor imports)
 from torch._inductor.ir import ComputedBuffer
 
-from torch_spyre._inductor import config
+from torch_spyre._inductor import config, passes
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.wsr import coarse_tile
 from torch_spyre._inductor.wsr.loop_tiling_lowering import (
@@ -38,6 +39,7 @@ from torch_spyre._inductor.wsr.loop_tiling_lowering import (
     build_loop_tiling_plan,
 )
 
+from utils_inductor import expects_raise
 from test_span_overflow_gate import (
     CASES,
     _forced_one_level,
@@ -257,3 +259,70 @@ def test_the_group_index_counts_from_the_offset():
     with mock.patch.object(coarse_tile, "plan_coarse_tile_groups", spy):
         compile_span_overflow(fn, args, limit)
     assert seen == [([0], [5])], seen
+
+
+def test_the_switch_defaults_and_rejects_nonsense():
+    assert config._choose_loop_tiling_lowering("plan") == "plan"
+    assert config._choose_loop_tiling_lowering("legacy") == "legacy"
+    with pytest.raises(ValueError, match="bogus"):
+        config._choose_loop_tiling_lowering("bogus")
+    # Unset in the environment the default is the legacy lowering (until Task 9).
+    if "SPYRE_INDUCTOR_LOOP_TILING_LOWERING" not in os.environ:
+        assert config.loop_tiling_lowering == "legacy"
+
+
+@expects_raise
+def test_a_group_holding_an_op_with_loop_info_is_refused():
+    from torch_spyre._inductor.loop_info import CoarseTileInfo
+
+    fn, shapes, limit, *_ = CASES["pointwise_copy_out"]
+    args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
+    original = coarse_tile.coarse_tile_post_stickify
+
+    def spy(graph, groups, group_idx_offset=0):
+        groups[0][0][0].loop_info = CoarseTileInfo(
+            loop_group_id=(9,),
+            loop_count=[2],
+            loop_tiled_dims=[[0]],
+            loop_tiled_reduction_dims=[[]],
+        )
+        return original(graph, groups=groups, group_idx_offset=group_idx_offset)
+
+    with (
+        mock.patch.object(coarse_tile, "coarse_tile_post_stickify", spy),
+        mock.patch.object(passes, "coarse_tile_post_stickify", spy),
+        config.patch({"loop_tiling_lowering": "plan"}),
+        pytest.raises(Exception, match="existing loop_info"),
+    ):
+        compile_span_overflow(fn, args, limit)
+
+
+@pytest.mark.parametrize("case", ["pointwise_copy_out", "pointwise_chain"])
+def test_the_new_lowering_stamps_a_shim_and_no_stored_lists(case):
+    """Every looped op carries a LoopShim, and the stage-7a.2 pass that adds terms to
+    a legacy record is not involved."""
+    from torch_spyre._inductor.loop_info import CoarseTileInfo, LoopShim
+    from torch_spyre._inductor.loop_node import all_ops
+
+    fn, shapes, limit, *_ = CASES[case]
+    args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
+    infos = []
+    original = passes._hand_off_loop_nodes
+
+    def spy(graph):
+        infos.extend(
+            getattr(op, "loop_info", None)
+            for op in all_ops(graph.operations)
+            if getattr(op, "loop_info", None) is not None
+        )
+        return original(graph)
+
+    with (
+        mock.patch.object(passes, "_hand_off_loop_nodes", spy),
+        mock.patch.object(coarse_tile, "add_loop_terms") as add_loop_terms,
+        config.patch({"loop_tiling_lowering": "plan"}),
+    ):
+        compile_span_overflow(fn, args, limit)
+    assert infos and all(isinstance(i, LoopShim) for i in infos), infos
+    assert not any(isinstance(i, CoarseTileInfo) for i in infos)
+    add_loop_terms.assert_not_called()
