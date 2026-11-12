@@ -76,3 +76,292 @@ def test_step_is_not_the_product_of_the_sizes_to_the_right():
 def test_a_symbolic_extent_is_unsupported():
     with pytest.raises(Unsupported, match="not an integer"):
         access_step(d0, d0, sympy.Symbol("s0"), 1)
+
+
+# ---------------------------------------------------------------------------
+# Device tests: the term is in the index and the kernel agrees with the record.
+# ---------------------------------------------------------------------------
+
+from unittest import mock  # noqa: E402
+
+import regex  # noqa: E402
+from torch._inductor.dependencies import MemoryDep  # noqa: E402
+from torch._inductor.ir import Pointwise  # noqa: E402
+
+from torch_spyre._inductor import passes  # noqa: E402
+from torch_spyre._inductor.wsr import coarse_tile  # noqa: E402
+
+from test_span_overflow_gate import (  # noqa: E402
+    CASES,
+    _PERMUTE_SHAPE,
+    _forced_one_level,
+    _permuted,
+    _relative_error,
+    _shaped,
+    compile_span_overflow,
+    normalise,
+)
+from utils_inductor import expects_raise  # noqa: E402
+
+# Everything the gate compiles except the K-tiled matmul, which keeps the legacy
+# lowering alone (stage 7a.3).
+COPY_OUT_CASES = sorted(set(CASES) - {"matmul_k_tiled"})
+
+
+class _Looped:
+    """What the lowering left on one looped op, read right after the transform."""
+
+    def __init__(self, op):
+        self.name = op.get_operation_name()
+        reads_writes = op.get_read_writes()
+        self.reads = {
+            d.name: str(d.index) for d in reads_writes.reads if isinstance(d, MemoryDep)
+        }
+        self.writes = {
+            d.name: str(d.index)
+            for d in reads_writes.writes
+            if isinstance(d, MemoryDep)
+        }
+        self.loop_vars = [
+            h.loop_var
+            for h in getattr(op, "dim_hints", None) or ()
+            if h.loop_var_range is not None
+        ]
+        self.group = op.loop_info.loop_group_id[0]
+
+
+def _recording(run, *, terms=True):
+    """Run ``run()`` (a compile) with a spy on the transform. Returns
+    ``(result, [_Looped])``; ``terms=False`` switches the new pass off, which gives
+    the legacy lowering to compare against."""
+    seen: list[_Looped] = []
+    original = coarse_tile.coarse_tile_post_stickify
+
+    def spy(graph, groups, group_idx_offset=0):
+        result = original(graph, groups=groups, group_idx_offset=group_idx_offset)
+        seen.extend(
+            _Looped(op)
+            for op in graph.operations
+            if getattr(op, "loop_info", None) is not None
+            and hasattr(op, "data")
+            and op.loop_info.loop_group_id[0] >= group_idx_offset
+        )
+        return result
+
+    patches = [
+        mock.patch.object(coarse_tile, "coarse_tile_post_stickify", spy),
+        mock.patch.object(passes, "coarse_tile_post_stickify", spy),
+    ]
+    if not terms:
+        patches.append(
+            mock.patch.object(coarse_tile, "add_loop_terms", lambda *a, **k: {})
+        )
+    with contextlib_exit_stack(patches):
+        return run(), seen
+
+
+def contextlib_exit_stack(patches):
+    import contextlib
+
+    stack = contextlib.ExitStack()
+    for p in patches:
+        stack.enter_context(p)
+    return stack
+
+
+def _compile_case(case, **kwargs):
+    fn, shapes, limit, *_ = CASES[case]
+    args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
+    compiled, looped = _recording(
+        lambda: compile_span_overflow(fn, args, limit), **kwargs
+    )
+    return compiled, looped, fn, args
+
+
+_STEP_SYMBOLS = (
+    (r"_tile_adv_\w+?_lvl\d+", "SYM"),
+    (r"\bu\d+\b", "SYM"),
+    (r"floor\(([^()]*SYM)\)", r"\1"),
+)
+
+
+def _normalised(code):
+    code = normalise(code)
+    for pattern, replacement in _STEP_SYMBOLS:
+        code = regex.sub(pattern, replacement, code)
+    return code
+
+
+@pytest.mark.parametrize("case", COPY_OUT_CASES)
+def test_every_looped_op_lists_the_loop_variable_and_some_access_carries_it(case):
+    compiled, looped, fn, args = _compile_case(case)
+    assert looped, "the transform formed no loop"
+    for op in looped:
+        assert len(op.loop_vars) == 1, (op.name, op.loop_vars)
+    variables = {op.loop_vars[0] for op in looped if op.group == looped[0].group}
+    assert len(variables) == 1
+    name = next(iter(variables)).name
+    carrying = [
+        op.name
+        for op in looped
+        if any(
+            regex.search(rf"\b{name}\b", index)
+            for index in (*op.reads.values(), *op.writes.values())
+        )
+    ]
+    assert carrying, (case, [(o.name, o.reads, o.writes) for o in looped])
+    assert _relative_error(compiled.outputs, fn(*[a.float() for a in args])) < 2e-2
+
+
+@pytest.mark.parametrize(
+    "case, read_step, write_step",
+    [
+        ("pointwise_copy_out", 512, 512),
+        ("matmul_output_tiled_m", 128, 128),
+        ("matmul_output_tiled_n", 4096, 4096),
+    ],
+)
+def test_the_step_in_the_index_is_the_tile_advance(case, read_step, write_step):
+    _, looped, _, _ = _compile_case(case)
+    reads = [i for op in looped for i in op.reads.values()]
+    writes = [i for op in looped for i in op.writes.values()]
+    assert any(regex.search(rf"\b{read_step}\*u\d+\b", i) for i in reads), reads
+    assert any(regex.search(rf"\b{write_step}\*u\d+\b", i) for i in writes), writes
+
+
+@pytest.mark.parametrize("case", COPY_OUT_CASES)
+def test_the_kernel_text_equals_the_legacy_lowerings_modulo_names(case):
+    with_terms, _, _, _ = _compile_case(case)
+    legacy, _, _, _ = _compile_case(case, terms=False)
+    assert _normalised(with_terms.code) == _normalised(legacy.code)
+    assert with_terms.groups == legacy.groups
+    assert with_terms.added == legacy.added
+
+
+@pytest.mark.parametrize("dim, step", [(0, 32768), (1, 262144)])
+def test_a_permuted_buffer_tiled_eight_ways_uses_its_own_stride(dim, step):
+    """Dim 0 is squeezed to extent one, so no symbol survives in the index: the
+    step is the buffer's stride (32768), not the product of the sizes to its right
+    (262144), which is what #6093 wrote."""
+    (outcome, looped) = _recording(
+        lambda: _forced_one_level(_PERMUTE_SHAPE, [(dim, 8)], _permuted)
+    )
+    wrong, loops, counts = outcome
+    assert (loops, counts) == (1, [8]), (loops, counts)
+    assert wrong == 0.0, wrong
+    indexes = [i for op in looped for i in (*op.reads.values(), *op.writes.values())]
+    assert any(regex.search(rf"\b{step}\*u\d+\b", i) for i in indexes), indexes
+
+
+def test_a_group_with_a_reduction_accumulator_is_left_alone():
+    compiled, looped, _, _ = _compile_case("matmul_k_tiled")
+    assert compiled.groups == [(1, ["Reduction"], [8])]
+    assert looped, "expected the K-tiled matmul to form a loop"
+    for op in looped:
+        assert op.loop_vars == [], (op.name, op.loop_vars)
+        assert not any(
+            regex.search(r"\bu\d+\b", i)
+            for i in (*op.reads.values(), *op.writes.values())
+        )
+
+
+@expects_raise
+def test_a_later_pass_that_rebuilds_the_op_data_fails_loudly():
+    """The term lives in wrappers on ``op.data``. A pass that rebuilt the data from
+    ``inner_fn`` and ``ranges`` would lose the write's wrapper and compile a kernel
+    that writes every tile to tile zero. The kernel's check must raise."""
+    original = coarse_tile.add_loop_terms
+
+    def add_then_drop_the_write_wrapper(graph, groups, group_idx_offset=0):
+        result = original(graph, groups, group_idx_offset)
+        for op in graph.operations:
+            if op.get_operation_name().startswith("coarse_tile_copy_"):
+                op.data = Pointwise(
+                    device=op.data.get_device(),
+                    dtype=op.data.get_dtype(),
+                    inner_fn=op.data.inner_fn,
+                    ranges=list(op.data.ranges),
+                )
+        return result
+
+    fn, shapes, limit, *_ = CASES["pointwise_copy_out"]
+    args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
+    with (
+        mock.patch.object(
+            coarse_tile, "add_loop_terms", add_then_drop_the_write_wrapper
+        ),
+        pytest.raises(Exception, match="LoopAdvanceMismatch"),
+    ):
+        compile_span_overflow(fn, args, limit)
+
+
+def test_the_memoized_read_writes_see_the_term():
+    """Passes ask for reads and writes through ``pass_utils.op_read_writes``, which
+    memoizes per op and is never refreshed by itself. The memo is already filled by
+    the time the term is added, so the pass must invalidate it: a pass that kept
+    reading the old index would not see the loop."""
+    from torch_spyre._inductor.pass_utils import op_read_writes
+
+    original = coarse_tile.add_loop_terms
+    memoized: dict[str, str] = {}
+
+    def fill_the_memo_then_add(graph, groups, group_idx_offset=0):
+        for op in graph.operations:
+            if getattr(op, "loop_info", None) is not None and hasattr(op, "data"):
+                op_read_writes(op)
+        result = original(graph, groups, group_idx_offset)
+        for op in graph.operations:
+            if getattr(op, "loop_info", None) is not None and hasattr(op, "data"):
+                reads_writes = op_read_writes(op)
+                memoized[op.get_operation_name()] = " ".join(
+                    str(d.index)
+                    for d in (*reads_writes.reads, *reads_writes.writes)
+                    if isinstance(d, MemoryDep)
+                )
+        return result
+
+    fn, shapes, limit, *_ = CASES["pointwise_copy_out"]
+    args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
+    with mock.patch.object(coarse_tile, "add_loop_terms", fill_the_memo_then_add):
+        compile_span_overflow(fn, args, limit)
+    assert memoized
+    assert any(regex.search(r"\bu\d+\b", text) for text in memoized.values()), memoized
+
+
+def test_a_for_each_tile_loop_and_a_span_overflow_group_have_distinct_variables():
+    """Both families are named ``u<n>``: the for_each_tile loop's is an unbacked
+    scalar Inductor allocated, the span-overflow one is minted here. A graph with
+    both must not give two loops one name."""
+    from for_each_tile_fixtures import split_m_fn
+
+    def fn(x, y, a, b):
+        return split_m_fn(x, y), a + b
+
+    shapes = [(256, 256), (256, 64), (4096, 1024), (4096, 1024)]
+    args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
+    seen: dict[int, set[str]] = {}
+    original = coarse_tile.coarse_tile_post_stickify
+
+    def spy(graph, groups, group_idx_offset=0):
+        result = original(graph, groups=groups, group_idx_offset=group_idx_offset)
+        for op in graph.operations:
+            info = getattr(op, "loop_info", None)
+            if info is None:
+                continue
+            for hint in getattr(op, "dim_hints", None) or ():
+                if hint.loop_var_range is not None:
+                    seen.setdefault(info.loop_group_id[0], set()).add(
+                        hint.loop_var.name
+                    )
+        return result
+
+    with (
+        mock.patch.object(coarse_tile, "coarse_tile_post_stickify", spy),
+        mock.patch.object(passes, "coarse_tile_post_stickify", spy),
+    ):
+        compiled = compile_span_overflow(fn, args, 4 * 1024 * 1024)
+    assert compiled.groups, "no span-overflow group formed"
+    assert len(seen) >= 2, seen  # the for_each_tile loop and the span-overflow group
+    assert all(len(names) == 1 for names in seen.values()), seen
+    names = [next(iter(v)) for v in seen.values()]
+    assert len(set(names)) == len(names), seen
