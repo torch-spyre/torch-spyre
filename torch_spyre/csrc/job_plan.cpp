@@ -135,7 +135,6 @@ void JobPlanStepCompute::write(std::ostream& os) const {
      << "\n";
 }
 
-// NOTE: kDimension is not yet implemented; only kAddress is supported.
 std::vector<flex::HostComputeArg> JobPlanStepHostCompute::resolveSymbolicArgs(
     const std::vector<at::Tensor>& tensors,
     const std::vector<SymbolicArg>& symbolic_args) {
@@ -155,10 +154,45 @@ std::vector<flex::HostComputeArg> JobPlanStepHostCompute::resolveSymbolicArgs(
         resolved[i] = static_cast<int64_t>(shard_device_address(
             tensors[arg.tensor_id], arg.dim_index, arg.num_shards, arg.value));
         break;
-      case SymbolicArgKind::kDimension:
-        TORCH_CHECK(false,
-                    "SymbolicArgKind::kDimension is not yet implemented");
+      case SymbolicArgKind::kDimension: {
+        // A varying dimension behind a symbolic loop bound. The bundle
+        // declares it as
+        //   !sdscbundle.input_arg<index, granularity=G, max_value=M>
+        // and the trip count is derived from it at dispatch, so the value
+        // bound here is the ONLY place the runtime size enters the program.
+        // Nothing in the program body is rewritten for it, which is the whole
+        // point: an address or stride derived from this size would instead
+        // have to be recomputed on every dispatch.
+        //
+        // size(), i.e. the LOGICAL size. Under a max-strided reservation the
+        // allocation is deliberately larger, and it is the logical size that
+        // varies per call and that the trip count must track.
+        const at::Tensor& tensor = tensors[arg.tensor_id];
+        TORCH_CHECK(arg.dim_index >= 0 && arg.dim_index < tensor.dim(),
+                    "symbolic_args dim_index ", arg.dim_index,
+                    " is out of range for the rank-", tensor.dim(),
+                    " tensor at inputs_outputs[", arg.tensor_id, "]");
+        const int64_t size = tensor.size(arg.dim_index);
+        if (arg.granularity > 0 && arg.max_value > 0) {
+          // The declaration's contract (#5179), the bundle's loop was built
+          // for exactly it. The torch._check lines inside the trace and the
+          // checks at the declaring transfer enforce it first; this is the
+          // backstop for a path that reaches the launch without them. The
+          // lower bound matters on its own: the backend clamps the trip count
+          // only from above and its first slot always runs, so a size of 0
+          // would pass a divisibility check alone and execute one tile.
+          TORCH_CHECK(size >= arg.granularity && size <= arg.max_value &&
+                          size % arg.granularity == 0,
+                      "symbolic_args kDimension: size ", size,
+                      " of inputs_outputs[", arg.tensor_id, "] along dim ",
+                      arg.dim_index,
+                      " is outside the declared contract, a positive multiple "
+                      "of the granularity ",
+                      arg.granularity, " up to the maximum ", arg.max_value);
+        }
+        resolved[i] = size;
         break;
+      }
       default:
         TORCH_CHECK(false, "Unknown SymbolicArgKind value: ",
                     static_cast<int32_t>(arg.kind));
