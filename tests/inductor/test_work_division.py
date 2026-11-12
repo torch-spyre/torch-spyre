@@ -5949,11 +5949,13 @@ def _with_gap_dim(layout, outermost=True):
             return "buf_y"
 
     class _Graph:
+        operations = []
+
         def get_output_names(self):
             return ["buf_y"] if outermost else []
 
     buf = _Buf(layout)
-    padding._pad_elided_dim(buf, _Graph())
+    padding._pad_elided_dim(buf, None, _Graph())
     return buf.layout
 
 
