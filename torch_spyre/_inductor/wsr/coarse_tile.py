@@ -226,6 +226,48 @@ def reject_nested_loops(groups: list[tuple], source: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def resolve_level_positions(
+    op: ComputedBuffer, levels: list[tuple]
+) -> tuple[list[list[int]], list[list[int]], dict[int, sympy.Symbol]]:
+    """Where each of a group's loop levels tiles ``op``.
+
+    Returns ``(tiled_dims, tiled_reduction_dims, unattributed_loop_vars)``:
+    per level, the op's output-range position tiled there (a list of zero or one)
+    and its reduction-range position; and the splice loop variables this op has no
+    dim to attribute (see ``_point_splice_advance_for_dep``). Shared by the legacy
+    planner and ``wsr.loop_tiling_lowering.build_loop_tiling_plan``, so the two
+    agree on positions by construction.
+
+    ``_hint_ranges_pos`` returns (position, is-a-reduction-dim) and is
+    authoritative on which channel the dim lands in: see its docstring for why a
+    WhileLoop-splice hint's own ``is_reduction`` cannot decide that per op.
+    """
+    op_out = op_out_coords(op)
+    hint_id_to_ranges_pos: dict[int, int] = {}
+    hint_id_to_reduction_ranges_pos: dict[int, int] = {}
+    unattributed_loop_vars: dict[int, sympy.Symbol] = {}
+    for h in getattr(op, "dim_hints", []):
+        if h.loop_var is None:
+            continue
+        pos, resolved_is_reduction = _hint_ranges_pos(op, h, op_out)
+        if pos is None:
+            if h.loop_var_range is not None:
+                unattributed_loop_vars[h.hint_id] = h.loop_var
+            continue
+        if resolved_is_reduction:
+            hint_id_to_reduction_ranges_pos[h.hint_id] = pos
+        else:
+            hint_id_to_ranges_pos[h.hint_id] = pos
+    tiled_dims: list[list[int]] = []
+    tiled_reduction_dims: list[list[int]] = []
+    for hint_id, _count in levels:
+        opos = hint_id_to_ranges_pos.get(hint_id)
+        rpos = hint_id_to_reduction_ranges_pos.get(hint_id)
+        tiled_dims.append([opos] if opos is not None else [])
+        tiled_reduction_dims.append([rpos] if rpos is not None else [])
+    return tiled_dims, tiled_reduction_dims, unattributed_loop_vars
+
+
 def plan_coarse_tile_groups(
     operations: list[Operation],
     groups: list[tuple],
@@ -287,40 +329,13 @@ def plan_coarse_tile_groups(
             # to 0 avoided the OS-5 crash but silently zeroed a real
             # per-trip advance).
 
-            op_out = op_out_coords(op)
             rw = op_read_writes(op)
             read_deps = [d for d in rw.reads if isinstance(d, MemoryDep)]
             write_deps = [d for d in rw.writes if isinstance(d, MemoryDep)]
 
-            # _hint_ranges_pos returns (position, is-a-reduction-dim) and is
-            # authoritative on which channel the dim lands in -- see its
-            # docstring for why a WhileLoop-splice hint's own is_reduction
-            # cannot decide that per op.
-            hint_id_to_ranges_pos: dict[int, int] = {}
-            hint_id_to_reduction_ranges_pos: dict[int, int] = {}
-            # Splice loop vars this op has no dim to attribute -- see
-            # _point_splice_advance_for_dep.
-            unattributed_loop_vars: dict[int, sympy.Symbol] = {}
-            for h in getattr(op, "dim_hints", []):
-                if h.loop_var is None:
-                    continue
-                pos, resolved_is_reduction = _hint_ranges_pos(op, h, op_out)
-                if pos is None:
-                    if h.loop_var_range is not None:
-                        unattributed_loop_vars[h.hint_id] = h.loop_var
-                    continue
-                if resolved_is_reduction:
-                    hint_id_to_reduction_ranges_pos[h.hint_id] = pos
-                else:
-                    hint_id_to_ranges_pos[h.hint_id] = pos
-
-            op_tiled_dims: list[list[int]] = []
-            op_tiled_reduction_dims: list[list[int]] = []
-            for hint_id, _count in levels:
-                opos = hint_id_to_ranges_pos.get(hint_id)
-                rpos = hint_id_to_reduction_ranges_pos.get(hint_id)
-                op_tiled_dims.append([opos] if opos is not None else [])
-                op_tiled_reduction_dims.append([rpos] if rpos is not None else [])
+            op_tiled_dims, op_tiled_reduction_dims, unattributed_loop_vars = (
+                resolve_level_positions(op, levels)
+            )
 
             has_tiled_reduction = any(op_tiled_reduction_dims)
             if has_tiled_reduction and not config.enable_reduction_tiling:
