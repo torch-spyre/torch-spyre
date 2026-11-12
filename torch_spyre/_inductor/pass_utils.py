@@ -2489,9 +2489,13 @@ def _host_size_stride(
         offset_diff = host_coords[carrying_dims[0]].subs(var, 0) - expr.subs(var, 0)
         if sympy.Mod(offset_diff, stick_size) != 0:
             return None
-    # Non-contiguous carrying dims (gap between them) have no well-defined
-    # total_elements or per-element stride; treat as infeasible.
-    assert carrying_dims == list(range(carrying_dims[0], carrying_dims[-1] + 1)), (
+    # Non-contiguous carrying dims with a size-1 gap are fine — the size-1 dim
+    # contributes nothing to the product or stride.  Only assert when a gap dim
+    # has size > 1, which would make total_elements/stride ill-defined.
+    expected = list(range(carrying_dims[0], carrying_dims[-1] + 1))
+    assert carrying_dims == expected or all(
+        host_size[d] == 1 for d in expected if d not in carrying_dims
+    ), (
         f"non-contiguous carrying_dims={carrying_dims} for var={var}, "
         f"host_coords={host_coords}, host_size={host_size}, host_stride={host_stride}"
     )
