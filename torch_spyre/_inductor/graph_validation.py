@@ -44,7 +44,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterable
 
-from torch._inductor.dependencies import MemoryDep
+from torch._inductor.dependencies import MemoryDep, ReadWrites
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     NoneAsConstantBuffer,
@@ -52,9 +52,29 @@ from torch._inductor.ir import (
     ShapeAsConstantBuffer,
 )
 
-from .pass_utils import op_read_writes
-
 logger = logging.getLogger(__name__)
+
+# Private key under which ``pass_utils.op_read_writes`` memoizes an op's
+# ``get_read_writes()`` result.
+_READ_WRITES_MEMO_KEY = "_ts_cached_read_writes"
+
+
+def _peek_read_writes(op: Operation) -> ReadWrites:
+    """``op``'s read/write set, without filling the ``op_read_writes`` memo.
+
+    Reuses a memoized result when one exists, else computes a fresh one and
+    does not store it. The validator runs after every pass, including the
+    passes before stickification that edit an op's dependencies in place
+    without invalidating the memo (``apply_loop_carries`` repointing a
+    collective's ``.inputs``), because the memo is not expected to be filled
+    that early. Filling it here would leave those ops with a stale entry and
+    change what later passes see, e.g. the LX planner missing a collective
+    as an accessor of a loop carry and skipping its post-loop drain.
+    """
+    cached = getattr(op, "__dict__", {}).get(_READ_WRITES_MEMO_KEY)
+    if cached is not None:
+        return cached
+    return op.get_read_writes()
 
 
 def _leaf_operations(graph: GraphLowering) -> Iterable[Operation]:
@@ -344,7 +364,7 @@ def _check_reads_from_defined_buffers(
     for op in _leaf_operations(graph):
         op_label = op.operation_name if op.operation_name is not None else repr(op)
         try:
-            rw = op_read_writes(op)
+            rw = _peek_read_writes(op)
         except Exception as e:
             logger.debug(
                 "validate_graph: skipping read/write check for %r: %s",
