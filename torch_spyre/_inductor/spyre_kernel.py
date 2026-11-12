@@ -216,6 +216,11 @@ def _has_int32_operands(*operands: RValue) -> bool:
     return True
 
 
+def _require_int32_stage_operands(a: RValue, b: RValue) -> None:
+    if not _has_int32_operands(a, b):
+        raise Unsupported("Threefry stage ops take IEEE_INT32 tensors")
+
+
 class SpyreOpFuncs:
     """
     Pointwise torch ops that are directly supported by the backend compiler for the Spyre device.
@@ -378,6 +383,56 @@ class SpyreOpFuncs:
             }
         }
         return PointwiseOp("softplus", [x], op_info)
+
+    @staticmethod
+    def threefry_inj0a(a, b):
+        _require_int32_stage_operands(a, b)
+        return PointwiseOp("threefryinj0a", [a, b])
+
+    @staticmethod
+    def threefry_r0123a(a, b):
+        _require_int32_stage_operands(a, b)
+        return PointwiseOp("threefryr0123a", [a, b])
+
+    @staticmethod
+    def threefry_r0123b(a, b):
+        _require_int32_stage_operands(a, b)
+        return PointwiseOp("threefryr0123b", [a, b])
+
+    @staticmethod
+    def threefry_inj1a(a, b):
+        _require_int32_stage_operands(a, b)
+        return PointwiseOp("threefryinj1a", [a, b])
+
+    @staticmethod
+    def threefry_inj1b(a, b):
+        _require_int32_stage_operands(a, b)
+        return PointwiseOp("threefryinj1b", [a, b])
+
+    @staticmethod
+    def threefry_r4567a(a, b):
+        _require_int32_stage_operands(a, b)
+        return PointwiseOp("threefryr4567a", [a, b])
+
+    @staticmethod
+    def threefry_r4567b(a, b):
+        _require_int32_stage_operands(a, b)
+        return PointwiseOp("threefryr4567b", [a, b])
+
+    @staticmethod
+    def threefry_inj2b(a, b):
+        _require_int32_stage_operands(a, b)
+        return PointwiseOp("threefryinj2b", [a, b])
+
+    @staticmethod
+    def threefry_inj3a(a, b):
+        _require_int32_stage_operands(a, b)
+        return PointwiseOp("threefryinj3a", [a, b])
+
+    @staticmethod
+    def threefry_r12a(a, b):
+        _require_int32_stage_operands(a, b)
+        return PointwiseOp("threefryr12a", [a, b])
 
     @staticmethod
     def sqrt(x):
