@@ -33,8 +33,9 @@ both ways compiles it twice (see :func:`dedup_key`).
 Options:
     --out DIR         where to write the scripts (default: ./captured)
     --kernel NAME     only emit kernels whose name contains NAME
-    --save-inputs     also dump recorded input values to a .pt beside each
-                      script, for byte-exact replay
+    --save-inputs     also dump each kernel's recorded inputs, and what its
+                      launch wrote, to a .pt beside its script, for byte-exact
+                      replay and for compare.py
     --no-execute      capture without a device or backend compiler (see below)
     --emitter EMITTER sdsc (default) or ktir: which backend the frontend targets
     --no-explain-header
@@ -49,9 +50,11 @@ Exit status:
 """
 
 import argparse
-from collections.abc import Callable
+import atexit
+from collections.abc import Callable, Iterator
 import contextlib
 import dataclasses
+import itertools
 import os
 from pathlib import Path
 import runpy
@@ -144,7 +147,12 @@ LICENSE_HEADER = "".join(
 
 @dataclasses.dataclass
 class ArgRecord:
-    """One tensor observed being passed to a kernel's .run()."""
+    """One tensor observed being passed to a kernel's .run().
+
+    With ``--save-inputs``, ``values`` is what it held going in and ``after``
+    what it held when the launch returned, or None if the launch left it as it
+    was: a weight would otherwise be held twice.
+    """
 
     shape: tuple
     dtype: torch.dtype
@@ -154,6 +162,7 @@ class ArgRecord:
     element_arrangement_name: str
     valid_elements: dict = dataclasses.field(default_factory=dict)
     values: object = None
+    after: object = None
 
 
 @dataclasses.dataclass
@@ -185,6 +194,10 @@ class KernelRecord:
     ktir_emitter: bool = False
     args: list = dataclasses.field(default_factory=list)
     observed_run: bool = False
+    # Order of its first launch among the capture's kernels, and whether that
+    # launch raised.
+    launch: int | None = None
+    raised: bool = False
 
 
 def _record_args(rec: KernelRecord, args: tuple, save_inputs: bool) -> None:
@@ -217,20 +230,34 @@ class _RunRecorder:
     overwriting the inputs.
     """
 
-    def __init__(self, inner, rec: KernelRecord, save_inputs: bool):
+    def __init__(
+        self, inner, rec: KernelRecord, save_inputs: bool, launches: Iterator[int]
+    ):
         self._inner = inner
         self._rec = rec
         self._save_inputs = save_inputs
+        self._launches = launches
 
     def __getattr__(self, name):
         # Only reached for names the proxy itself does not define.
         return getattr(self._inner, name)
 
     def run(self, *args, **kwargs):
-        if not self._rec.observed_run:
-            _record_args(self._rec, args, self._save_inputs)
-            self._rec.observed_run = True
-        return self._inner.run(*args, **kwargs)
+        if self._rec.observed_run:
+            return self._inner.run(*args, **kwargs)
+        _record_args(self._rec, args, self._save_inputs)
+        self._rec.observed_run = True
+        self._rec.launch = next(self._launches)
+        try:
+            result = self._inner.run(*args, **kwargs)
+        except BaseException:
+            self._rec.raised = True
+            raise
+        if self._save_inputs:
+            for arg, tensor in zip(self._rec.args, args):
+                after = tensor.cpu()
+                arg.after = None if torch.equal(after, arg.values) else after
+        return result
 
 
 class _RunRecorderFuture(CodeCacheFuture):
@@ -241,16 +268,20 @@ class _RunRecorderFuture(CodeCacheFuture):
         inner: CodeCacheFuture,
         rec: KernelRecord,
         save_inputs: bool,
+        launches: Iterator[int],
     ) -> None:
         self._inner = inner
         self._rec = rec
         self._save_inputs = save_inputs
+        self._launches = launches
         self._runner: _RunRecorder | None = None
 
     def result(self, timeout: float | None = None):
         if self._runner is None:
             runner = self._inner.result(timeout=timeout)
-            self._runner = _RunRecorder(runner, self._rec, self._save_inputs)
+            self._runner = _RunRecorder(
+                runner, self._rec, self._save_inputs, self._launches
+            )
         return self._runner
 
 
@@ -273,6 +304,7 @@ def capture_kernels(
     flag, and one missed method is a silent empty capture.
     """
     records: list = []
+    launches = itertools.count()
     # ``Callable`` without a signature on purpose: the two methods differ in
     # arity, and an inferred union makes the pool_size call below unresolvable
     # statically.
@@ -308,8 +340,8 @@ def capture_kernels(
                     precomputed_key=precomputed_key,
                 )
             if isinstance(runner, CodeCacheFuture):
-                return _RunRecorderFuture(runner, rec, save_inputs)
-            return _RunRecorder(runner, rec, save_inputs)
+                return _RunRecorderFuture(runner, rec, save_inputs, launches)
+            return _RunRecorder(runner, rec, save_inputs, launches)
 
         return wrapper
 
@@ -522,6 +554,7 @@ KTIR_EMITTER = {rec.ktir_emitter}
 # name, and write_kernel disambiguates the scripts (name_1.py) -- so a
 # kernel-keyed .pt would be shared and the second capture would clobber the first.
 INPUTS_PT = os.path.splitext(os.path.abspath(__file__))[0] + ".inputs.pt"
+SAVED = torch.load(INPUTS_PT) if os.path.exists(INPUTS_PT) else None
 
 # Host (shape, dtype) per kernel arg, in arg_index order.
 SHAPES = [
@@ -542,10 +575,9 @@ def build_tensors():
     Integer args get zeros, not random values: they are usually indirect-access
     indices, where random data would be out of bounds.
     """
-    if os.path.exists(INPUTS_PT):
-        saved = torch.load(INPUTS_PT)
+    if SAVED is not None:
         print(f"inputs: replayed from {{INPUTS_PT}}")
-        return saved["tensors"]
+        return SAVED["tensors"]
     torch.manual_seed(0xAFFE)
     tensors = []
     for shape, dtype in SHAPES:
@@ -563,6 +595,16 @@ def build_tensors():
 {runner_template()}
 
 
+def observed_outputs():
+    """What each arg held once the captured launch returned, if it was saved."""
+    if SAVED is None or SAVED.get("outputs") is None or SAVED.get("raised"):
+        return None
+    # None marks an arg the launch left as it was. Its input is copied, since
+    # the replay writes its results into the tensors build_tensors returns.
+    pairs = zip(SAVED["tensors"], SAVED["outputs"])
+    return [t.clone() if o is None else o for t, o in pairs]
+
+
 if __name__ == "__main__":
     main(
         KERNEL_NAME,
@@ -572,6 +614,7 @@ if __name__ == "__main__":
         pool_size=POOL_SIZE,
         bundle_symbolic_args=BUNDLE_SYMBOLIC_ARGS,
         ktir_emitter=KTIR_EMITTER,
+        observed=observed_outputs(),
     )
 '''
 
@@ -592,9 +635,24 @@ def write_kernel(
     with open(path, "w") as f:
         f.write(emit_script(rec, source, total, no_execute, explain_header))
     if save_inputs and rec.observed_run:
+        read = {
+            arg.arg_index
+            for op in _iter_op_specs(rec.specs)
+            for arg in op.args
+            if isinstance(arg, TensorArg) and arg.is_input
+        }
         # Keyed on the script path, so a disambiguated script gets its own .pt.
         torch.save(
-            {"tensors": [a.values for a in rec.args]},
+            {
+                "name": rec.name,
+                "tensors": [a.values for a in rec.args],
+                "outputs": [a.after for a in rec.args],
+                "raised": rec.raised,
+                # A pure output's incoming contents are whatever was there.
+                "reads": [i in read for i in range(len(rec.args))],
+                "launch": rec.launch,
+                "arrangements": [a.element_arrangement_name for a in rec.args],
+            },
             os.path.splitext(path)[0] + ".inputs.pt",
         )
     return path
@@ -626,7 +684,7 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--save-inputs",
         action="store_true",
-        help="Dump recorded input values and pool bytes to a .pt for exact replay.",
+        help="Dump each kernel's recorded inputs, and what its launch wrote, to a .pt.",
     )
     parser.add_argument(
         "--no-execute",
@@ -667,6 +725,11 @@ def main(argv=None) -> int:
 
     failure: BaseException | None = None
     with capture_kernels(args.save_inputs, args.no_execute, args.emitter) as records:
+        capture = _Capture(args, script, records)
+        # A target can end the process itself once the exit handlers have run,
+        # as spyre-inference's pytest plugin does on a Spyre host, and never
+        # return here.
+        atexit.register(capture.write_at_exit)
         # Run as if invoked directly, so the target's __main__ block still fires.
         sys.argv = [script]
         try:
@@ -676,14 +739,21 @@ def main(argv=None) -> int:
             # compiled is written, and only a non-zero status is a failure.
             if exc.code not in (None, 0):
                 failure = exc
-        except Exception as exc:  # noqa: BLE001 -- a crash is a capture, not a stop
-            # The programs worth capturing are the ones that misbehave, and a
-            # kernel holding an UnimplementedOp raises on every launch. Whatever
-            # was recorded before the failure is still a valid reproducer, so
-            # write it out and report the exception at the end.
+        except (Exception, KeyboardInterrupt) as exc:  # noqa: BLE001
+            # A crash is a capture, not a stop: the programs worth capturing are
+            # the ones that misbehave, and a kernel holding an UnimplementedOp
+            # raises on every launch. Whatever was recorded before the failure is
+            # still a valid reproducer, so write it out and report the exception
+            # at the end. Ctrl-C as well, so an interrupted capture reads as one.
             failure = exc
             traceback.print_exc()
 
+    atexit.unregister(capture.write_at_exit)
+    return capture.write(failure)
+
+
+def _write_capture(args, script: str, records: list, failure) -> int:
+    """Write the captured kernels; return capture.py's exit status."""
     if args.no_execute:
         # Said here as well as in the emitted header: by the time anyone reads
         # the header they have already seen the meaningless number.
@@ -751,6 +821,34 @@ def main(argv=None) -> int:
         )
         return EXIT_PARTIAL
     return 0
+
+
+@dataclasses.dataclass
+class _Capture:
+    """Writes a capture once: when the target returns, or from an exit handler if
+    the target ends the process itself. A target that runs the exit handlers and
+    then returns would otherwise get every kernel written twice."""
+
+    args: argparse.Namespace
+    script: str
+    records: list
+    written: bool = False
+    # What main() returns; stays 1 ("nothing written") if writing raises.
+    status: int = 1
+
+    def write(self, failure: BaseException | None) -> int:
+        if not self.written:
+            self.written = True
+            self.status = _write_capture(self.args, self.script, self.records, failure)
+        return self.status
+
+    def write_at_exit(self) -> None:
+        try:
+            self.write(None)
+        except SystemExit as exc:
+            print(exc.code, file=sys.stderr)
+        # The target may end the process with os._exit next, which flushes nothing.
+        sys.stdout.flush()
 
 
 if __name__ == "__main__":
