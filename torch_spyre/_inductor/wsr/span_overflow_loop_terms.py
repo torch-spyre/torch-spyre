@@ -35,10 +35,17 @@ from typing import Any
 import regex
 import sympy
 from torch._inductor.dependencies import MemoryDep
-from torch._inductor.ir import ComputedBuffer, MutationLayoutSHOULDREMOVE
+from torch._inductor.ir import (
+    ComputedBuffer,
+    MutationLayoutSHOULDREMOVE,
+    Pointwise,
+    Reduction,
+)
 from torch._inductor.virtualized import V
 
 from ..errors import Unsupported
+from ..loop_facts import counted_loop_path
+from ..loop_info import LoopCarryRecord
 from ..pass_utils import invalidate_op_read_writes
 from ..propagate_hints import DimHint
 from .loop_tiling_common import _AddLoopTermHandler
@@ -107,10 +114,12 @@ def access_step(
     return sympy.sympify(buffer_stride) * extent
 
 
-# A group holding an op of one of these kinds keeps the legacy lowering alone: the
-# reduction kinds carry an accumulator (stage 7a.3), and a mutation write-back
-# advances a buffer the group reads back.
-_LEGACY_ONLY_KINDS = frozenset({"reduction", "mutation_write_back"})
+# A group holding an op of this kind keeps the legacy lowering alone: a mutation
+# write-back advances a buffer the group reads back (no span-overflow graph has been
+# seen to produce one, and no test builds one). A ``reduction`` group (a partial op
+# plus the combine into an accumulator) is converted since stage 7a.3, with the
+# accumulator declared as a loop carry.
+_LEGACY_ONLY_KINDS = frozenset({"mutation_write_back"})
 
 
 def _taken_symbols(graph: Any, operations: Iterable[Any]) -> list[sympy.Basic]:
@@ -370,10 +379,112 @@ def _apply_edit(edit: _OpEdit, induction: sympy.Symbol) -> None:
     invalidate_op_read_writes(op)
 
 
+@dataclasses.dataclass
+class _CarryEdit:
+    """A loop carry to declare: the accumulator's storage, the op that updates it
+    each trip, and the record that names both."""
+
+    update: ComputedBuffer
+    storage: Any
+    record: LoopCarryRecord
+
+
+def _plan_carries(graph: Any, members: list[ComputedBuffer]) -> list[_CarryEdit]:
+    """The loop carries of a group of ``reduction`` kind, or ``[]`` for any other.
+
+    The legacy lowering of a reduction tiled on its reduction dim is a partial op
+    (a ``Reduction`` into a scratch tile) and a combine (a ``Pointwise`` that
+    writes the accumulator in place, ``MutationLayoutSHOULDREMOVE``); the fill that
+    zeroes the accumulator runs once, before the loop. The accumulator is a carry:
+    its storage is the buffer the combine mutates, its update the combine.
+
+    Raises ``Unsupported`` (the group then stays whole on the legacy record) when a
+    partial op has no combine, when the storage is a loop member or already
+    declares a carry (a ``for_each_tile`` one), or when anything but the combine
+    touches the storage inside the loop: the record promises that the update is the
+    storage's only in-loop access.
+    """
+    reductions = [op for op in members if _kind(op) == "reduction"]
+    if not reductions:
+        return []
+    partials = [op for op in reductions if isinstance(op.data, Reduction)]
+    updates = [
+        op
+        for op in reductions
+        if isinstance(op.data, Pointwise)
+        and isinstance(op.layout, MutationLayoutSHOULDREMOVE)
+    ]
+    if len(partials) != len(updates) or len(partials) + len(updates) != len(reductions):
+        raise Unsupported(
+            f"span-overflow loop term: {len(partials)} partial reductions and "
+            f"{len(updates)} combines among {len(reductions)} reduction-kind ops "
+            "of one group."
+        )
+    # By buffer name (``get_name``), as the record, the allocator and
+    # ``apply_loop_carries`` key it: an extern op's name is op1, its buffer's buf1.
+    live = {op.get_name(): op for op in graph.operations}
+    touched = {
+        op.get_operation_name(): {
+            dep.name
+            for dep in (*op.get_read_writes().reads, *op.get_read_writes().writes)
+        }
+        for op in members
+    }
+    edits = []
+    for update in updates:
+        storage_name = update.layout.get_buffer().get_name()
+        storage = live.get(storage_name)
+        if storage is None:
+            raise Unsupported(
+                f"span-overflow loop term: the accumulator {storage_name} of "
+                f"{update.get_operation_name()} is not an operation of the graph."
+            )
+        if getattr(storage, "_loop_carry_record", None) is not None:
+            raise Unsupported(
+                f"span-overflow loop term: {storage_name} already declares a carry."
+            )
+        if counted_loop_path(storage):
+            raise Unsupported(
+                f"span-overflow loop term: the accumulator {storage_name} is a "
+                "member of the loop."
+            )
+        others = [
+            name
+            for name, names in touched.items()
+            if name != update.get_operation_name() and storage_name in names
+        ]
+        if others:
+            raise Unsupported(
+                f"span-overflow loop term: {others} also touch the accumulator "
+                f"{storage_name} inside the loop."
+            )
+        edits.append(
+            _CarryEdit(
+                update,
+                storage,
+                LoopCarryRecord(
+                    storage_name=storage_name,
+                    update_name=update.get_name(),
+                    loop_origin=None,
+                ),
+            )
+        )
+    return edits
+
+
+def _apply_carries(edits: list[_CarryEdit]) -> None:
+    """Stamp each record on its storage and on its update, where the allocator, the
+    loop checker and the node (``LoopNode.carries``) look for it."""
+    for edit in edits:
+        edit.storage._loop_carry_record = edit.record
+        edit.update._loop_carry_record = edit.record
+
+
 def add_loop_terms(
     graph: Any, groups: list[tuple], group_idx_offset: int = 0
 ) -> dict[int, sympy.Symbol]:
-    """Add the loop to every ``copy_out`` group the legacy lowering has just built.
+    """Add the loop to every ``copy_out`` and ``reduction`` group the legacy lowering
+    has just built.
 
     ``groups`` are the ``(ops, levels)`` the transform was given. A group with an
     op of a legacy-only kind, with more than one level, or with an access this
@@ -383,7 +494,8 @@ def add_loop_terms(
     others each member op, the copy-outs the transform added included, gets a loop
     variable in ``dim_hints`` and ``step * u`` in the index of every access the
     planner says advances. The stored record is untouched: the kernel compares the
-    two (``LoopAdvanceMismatch``) until stage 7.4 deletes the record.
+    two (``LoopAdvanceMismatch``) until stage 7.4 deletes the record. A ``reduction``
+    group also declares its accumulator as a loop carry (:func:`_plan_carries`).
 
     Returns ``{group index: loop variable}``, keyed by the first entry of the
     group's ``loop_group_id``, which is how ``loop_node.collapse`` keys inductions.
@@ -411,6 +523,7 @@ def add_loop_terms(
             continue
         try:
             edits = [_plan_op(graph, op) for op in members]
+            carries = _plan_carries(graph, members)
         except Unsupported as error:
             # The legacy lowering still handles this group on its record alone, so
             # leave it whole: no hint and no term on any of its ops.
@@ -420,5 +533,6 @@ def add_loop_terms(
         taken.append(induction)
         for edit in edits:
             _apply_edit(edit, induction)
+        _apply_carries(carries)
         inductions[group_idx] = induction
     return inductions
