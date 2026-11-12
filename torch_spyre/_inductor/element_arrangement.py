@@ -106,7 +106,8 @@ def _operand_stls(
 
 
 def _is_broadcast(stl: SpyreTensorLayout) -> bool:
-    return stl.stride_map[-1] == -1
+    """True if every element of a stick is the same (sparse stick dim)."""
+    return stl.stride_map[-1] <= 0
 
 
 def _with_ea(layout: FixedTiledLayout, ea: ElementArrangement) -> FixedTiledLayout:
