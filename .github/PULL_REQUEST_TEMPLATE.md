@@ -27,8 +27,3 @@ Fixes #<issue number>
 #### Does this PR introduce a user-facing change?
 
 #### Additional note:
-
-#### Checklist:
-
-- [ ] My commits include a `Signed-off-by:` line (DCO compliance)
-- [ ] My commits are signed with a GPG or SSH key registered on GitHub (`git commit -S`)
