@@ -232,9 +232,19 @@ def _resolve_scan_shapes_by_expression():
 
 
 @contextmanager
-def enable_spyre_context(example_inputs: list[InputType]):
+def enable_spyre_context(
+    example_inputs: list[InputType],
+    declared_dims: "dict[str, tuple[int, int, int]] | None" = None,
+):
     """
     Context manager that sets up the complete Spyre compilation environment.
+
+    ``declared_dims`` maps the ShapeEnv symbol name of every graph input
+    dimension declared with ``tensor.to("spyre", dynamic=...)`` to its
+    ``(min, max, granularity)``. It is made the compile's declared set for the
+    whole block (``pass_utils.declared_dims``), so ``concretize_expr`` builds a
+    declared dimension's geometry at its declared maximum from the first
+    lowering call on.
 
     This CM configures PyTorch Inductor to compile graphs for the Spyre device by:
       - Enabling Spyre-specific data type handling
@@ -369,10 +379,15 @@ def enable_spyre_context(example_inputs: list[InputType]):
     # release, so only a LoopNode handed to the scheduler is refused there
     # (CustomPreSchedulingPasses refuses one earlier, naming the release).
     # On a graph with no LoopNode each patched method takes its original path.
+    # Local import: pass_utils pulls in the lowering machinery, which this module
+    # is imported ahead of.
+    from .pass_utils import declared_dims as _declared_dims_for_compile
+
     with (
         # First in the header: the same ``with`` closes it however the body, or
         # the entry of a later manager, exits.
         loop_scheduler_patches_for_compile(),
+        _declared_dims_for_compile(declared_dims),
         spyre_data_types(),
         _preserve_spyre_input_storage_offsets(),
         _unique_operation_names(),

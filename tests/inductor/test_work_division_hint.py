@@ -22,7 +22,7 @@ import math
 import regex as re
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch as mock_patch
+from unittest.mock import MagicMock, patch as mock_patch
 
 import pytest
 import sympy
@@ -37,6 +37,7 @@ from torch._dynamo.test_case import (
 from torch._functorch.aot_autograd import aot_module_simplified
 from torch._functorch._aot_autograd.utils import make_boxed_func
 from torch._inductor.test_case import TestCase as InductorTestCase
+from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ir import NoneLayout
 from torch._inductor.utils import run_and_get_code, InputType
 
@@ -144,8 +145,17 @@ class TestNamedWorkDivisionHint(InductorTestCase):
         )
 
     def _fake_op(self, loop_var_dims):
+        from torch._inductor.ir import Pointwise
+
+        ranges = {sym: 512 for sym in loop_var_dims}
+        data = MagicMock(spec=Pointwise)
+        data.ranges = ranges
         return SimpleNamespace(
+            data=data,
             get_name=lambda: "fake_op",
+            get_read_writes=lambda: SimpleNamespace(
+                writes=[SimpleNamespace(ranges=ranges)], reads=[]
+            ),
             work_div_loop_info=loop_var_dims,
         )
 
@@ -330,6 +340,51 @@ class TestNamedWorkDivisionHint(InductorTestCase):
                 max_cores=32,
                 allowed_splits={m: frozenset({1})},
             )
+
+    def test_apply_work_div_hint_rejects_unrepresentable_split(self):
+        from torch._inductor.ir import Pointwise
+
+        i0, i1 = Symbol("i0"), Symbol("i1")
+        op = self._fake_op({i0: ["H0"], i1: ["H1"]})
+        op.data = MagicMock(spec=Pointwise)
+        op.data.ranges = {i0: 8, i1: 8}
+        write = MemoryDep("fake_op", 8 * i0 + 8 * i1, (i0, i1), (8, 8))
+        op.get_read_writes = lambda: SimpleNamespace(writes=[write], reads=[])
+
+        with self.assertRaisesRegex(
+            _wd.Unsupported,
+            "work_division_hint: fake_op split .* cannot be represented by the "
+            "scheduler's coefficient-keyed transport",
+        ):
+            _wd._apply_user_hint(
+                op,
+                {i0: 2},
+                {i0: 8, i1: 8},
+                self._fake_output_td([i0, i1]),
+                max_cores=32,
+            )
+
+    def test_apply_work_div_hint_propagates_attribute_error(self):
+        from torch._inductor.ir import Pointwise
+
+        h = Symbol("H")
+        op = self._fake_op({h: ["H"]})
+        op.data = MagicMock(spec=Pointwise)
+        op.data.ranges = {h: 64}
+        write = MemoryDep("fake_op", h, (h,), (64,))
+        op.get_read_writes = lambda: SimpleNamespace(writes=[write], reads=[])
+        with mock_patch(
+            "torch_spyre._inductor.work_division.work_division_transport_indexes",
+            side_effect=AttributeError("broken operation guard"),
+        ):
+            with self.assertRaisesRegex(AttributeError, "broken operation guard"):
+                _wd._apply_user_hint(
+                    op,
+                    {h: 2},
+                    {h: 64},
+                    self._fake_output_td([h]),
+                    max_cores=32,
+                )
 
     @config.patch({"sencores": 8})
     def test_pointwise_work_div_hint_applied(self):
