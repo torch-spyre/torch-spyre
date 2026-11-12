@@ -2439,13 +2439,20 @@ def _input_padding_range(layout: SpyreTensorLayout) -> Set:
     graph or eager kernel, so the padding is only known when the runtime
     recorded a constant padding value in the tensor's layout.
 
-    TODO: the dynamo guard does not compare the padding state yet (see the
-    TODO on SpyreTensorLayout::operator== in spyre_tensor_impl.h), so a graph
-    compiled for a recorded value can be reused for an input without one.
+    The recorded value is not trusted yet: the dynamo guard does not compare
+    the padding state (see the TODO on SpyreTensorLayout::operator== in
+    spyre_tensor_impl.h), so a graph compiled for a recorded value could be
+    reused for an input without one. TODO: set _TRUST_RECORDED_PADDING once
+    the guard compares the padding state.
     """
-    if (value := layout.padding_value) is not None:
+    if _TRUST_RECORDED_PADDING and (value := layout.padding_value) is not None:
         return FiniteSet(value)
     return _user_values()
+
+
+# Whether _input_padding_range uses the padding value recorded in an input's
+# layout. Off until the recompile guard covers it; tests patch it on.
+_TRUST_RECORDED_PADDING = False
 
 
 _ASSUMED_PADDING: dict[type, Set] = {

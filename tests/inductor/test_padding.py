@@ -2250,6 +2250,7 @@ class TestMatmulPaddingNaN(unittest.TestCase):
         self._assert_matches_cpu_and_has_no_nan(result, expected)
 
 
+@instantiate_parametrized_tests
 class TestRecordedPadding(unittest.TestCase):
     """The padding value recorded on a tensor's layout must stay true.
 
@@ -2405,6 +2406,42 @@ class TestRecordedPadding(unittest.TestCase):
     def test_h2d_records_zero_padding(self) -> None:
         t = torch.tensor([1.0, -2.0, 3.0], dtype=torch.float16).to("spyre")
         self.assertEqual(t.device_tensor_layout().padding_value, 0.0)
+
+    @parametrize("trust", [False, True])
+    def test_recorded_padding_trusted_only_when_enabled(self, trust) -> None:
+        # The sum needs zero padding. The H2D copy records 0, but until the
+        # recompile guard covers the padding state the analysis must not rely
+        # on it, so the sum is still masked.
+        # TODO: drop the parametrization when _TRUST_RECORDED_PADDING goes away.
+        from torch_spyre._inductor import padding
+
+        masked: dict[str, bool] = {}
+        track = padding.track_padding_value
+
+        def capture(graph: GraphLowering) -> None:
+            tracer_cls = padding.DomainRangeTracer
+            orig_run = tracer_cls.run_node
+
+            def run_node(tracer, op):
+                decision = orig_run(tracer, op)
+                if isinstance(op, ComputedBuffer):
+                    masked[op.get_name()] = decision.do_mask
+                return decision
+
+            with patch.object(tracer_cls, "run_node", run_node):
+                track(graph)
+
+        x = torch.tensor([1.0, -2.0, 3.0], dtype=torch.float16)
+        x_spyre = x.to("spyre")
+        self.assertEqual(x_spyre.device_tensor_layout().padding_value, 0.0)
+        with (
+            patch.object(passes, "track_padding_value", capture),
+            patch.object(padding, "_TRUST_RECORDED_PADDING", trust),
+        ):
+            result = torch.compile(lambda a: a.sum(), dynamic=False)(x_spyre)
+        self.assertTrue(masked, "no op traced")
+        self.assertEqual(any(masked.values()), not trust, masked)
+        torch.testing.assert_close(result.cpu(), x.sum(), atol=0.05, rtol=0.05)
 
     def test_allocation_padding_is_unknown_not_nan(self) -> None:
         # insert_bmm_padding pads y's K through constant_pad_nd, whose first op
