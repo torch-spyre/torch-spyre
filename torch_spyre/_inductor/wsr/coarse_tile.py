@@ -59,7 +59,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import logging
-from typing import NamedTuple
+from typing import NamedTuple, NoReturn
 
 import sympy
 from sympy import Expr
@@ -616,6 +616,26 @@ def _compute_fill_loop_info_planned(
     )
 
 
+def _refuse_mutation_write_back(op: ComputedBuffer, target_name: str) -> NoReturn:
+    """Refuse an op that writes in place into ``target_name`` while advancing tile by
+    tile, with no copy-out.
+
+    The planner used to classify three shapes this way (a write into a graph input
+    that is also a graph output, a ``for_each_tile`` stacking write, a local
+    accumulator read back by the next tile). None occurs in the test suites or in
+    anything a user program produces here, and a group of that kind stayed a flat
+    legacy loop with no loop variable, which blocked deleting the stored advance
+    and the legacy transform (#5863). The handling that followed the classification
+    (``_propagate_mutation_write_back`` and the validators' branches) is now
+    unreachable and goes with the legacy transform in stage 7a.6.
+    """
+    raise Unsupported(
+        f"span-overflow coarse tiling: {op.get_operation_name()} writes in place "
+        f"into {target_name} while advancing through the loop (a mutation "
+        "write-back); not supported in this release (#6256)."
+    )
+
+
 def _plan_tiling_propagation(
     operations: list[Operation],
     groups: list[tuple],
@@ -840,14 +860,7 @@ def _plan_tiling_propagation(
                         and target_is_output
                         and mut_target is not None
                     ):
-                        full_ranges = _compute_full_ranges_planned(op, info)
-                        info.propagation = PropagationPlan(
-                            kind="mutation_write_back",
-                            full_ranges=full_ranges,
-                            full_strides=tuple(mut_target.layout.stride),
-                            is_graph_output=True,
-                        )
-                        continue
+                        _refuse_mutation_write_back(op, mut_target_name)
                     # A WhileLoop-splice stacking write (see
                     # while_loop_bridge.py's CarryBinding.stacking) already
                     # targets the final, full-size destination: the bridge
@@ -866,14 +879,7 @@ def _plan_tiling_propagation(
                         and _splice_loop_vars(op)
                         and _splice_write_targets_full_buffer(op, mut_target)
                     ):
-                        full_ranges = _compute_full_ranges_planned(op, info)
-                        info.propagation = PropagationPlan(
-                            kind="mutation_write_back",
-                            full_ranges=full_ranges,
-                            full_strides=tuple(mut_target.layout.stride),
-                            is_graph_output=target_is_output,
-                        )
-                        continue
+                        _refuse_mutation_write_back(op, mut_target_name)
                     # Locally-created mutation target that IS the graph
                     # output, and/or is read by other ops outside this loop
                     # group (e.g. copy_forced(src, acc) where acc is a local
@@ -924,14 +930,7 @@ def _plan_tiling_propagation(
                             for candidate in group_ops
                         )
                         if in_loop_carry:
-                            full_ranges = _compute_full_ranges_planned(op, info)
-                            info.propagation = PropagationPlan(
-                                kind="mutation_write_back",
-                                full_ranges=full_ranges,
-                                full_strides=tuple(mut_target.layout.stride),
-                                is_graph_output=False,
-                            )
-                            continue
+                            _refuse_mutation_write_back(op, mut_target_name)
                 info.propagation = PropagationPlan(kind="loop_internal")
                 continue
 
