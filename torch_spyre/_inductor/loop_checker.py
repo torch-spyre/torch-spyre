@@ -101,6 +101,17 @@ class LoopStructureError(RuntimeError):
         )
 
 
+class LoopAdvanceMismatch(RuntimeError):
+    """A loop access's advance read from its stored record differs from the one
+    read from its index (stage 7.2).
+
+    Raised while the kernel builds a ``TensorArg``, so ``TORCH_SPYRE_CHECK_LOOPS``
+    does not apply. A compiler bug, not a user error, so not ``Unsupported``
+    (see :class:`LoopStructureError`). Until the stored fields are deleted
+    (stage 7.4) an op can carry both; they must agree.
+    """
+
+
 _TRUE = frozenset({"1", "true", "yes", "on"})
 _FALSE = frozenset({"0", "false", "no", "off", ""})
 

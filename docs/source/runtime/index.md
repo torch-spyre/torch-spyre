@@ -104,7 +104,7 @@ A standard PyTorch `(size, stride)` pair cannot describe a tiled device tensor, 
 The `SpyreTensorLayout` holds:
 
 - `device_size`: the tensor's shape on device, including the extra tiling and padding dims.
-- `stride_map`: the host stride for each device dim. A `-1` here means the dim is synthetic or fully padded.
+- `stride_map`: the host stride for each device dim. A `0` here means the dim is synthetic, fully padded, or broadcast.
 - `device_dtype`: the on-device data format, for example `SEN169_FP16`.
 - `element_arrangement`: how elements are packed within a stick (defaults to `STANDARD`).
 

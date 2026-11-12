@@ -1230,6 +1230,14 @@ def _floor_div(a, b):
     return torch.div(a, b, rounding_mode="floor")
 
 
+def _floordiv_inplace(x, y):
+    # ``x //= y`` -> aten::floor_divide_.{Scalar,Tensor}; work on a clone so the
+    # shared param tensor is not mutated across eager/CPU runs.
+    x = x.clone()
+    x //= y
+    return x
+
+
 def _attention_fn(q, k, v, scale=True):
     d_k = q.size(-1)
     scores = q @ k.transpose(-2, -1)
@@ -5441,6 +5449,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((128), dtype=torch.float16),
                     torch.zeros([128], dtype=torch.float16),
                 ),
+                "2d_fp32": (
+                    cached_randn((256, 128), dtype=torch.float32),
+                    cached_randn((128), dtype=torch.float32),
+                    cached_randn((128), dtype=torch.float32, differentiation=1),
+                ),
+                "2d_fp32_transposed": (
+                    cached_randn((128, 256), dtype=torch.float32).transpose(0, 1),
+                    cached_randn((128), dtype=torch.float32),
+                    cached_randn((128), dtype=torch.float32, differentiation=1),
+                ),
             },
         },
         ("test_rmsnorm", "test_rmsnorm_cpu"): {
@@ -7768,6 +7786,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_where_self", "test_where_eager"): {
             "ops_dict": {"where": torch.where},
+            # A host bool mask converted to fp32 for an int32 where is staggered,
+            # and a STANDARD full operand cannot combine with it. Pending
+            # de-staggering support (#5495).
+            "expect_fail": {
+                "int32_2d": "host bool mask with fp32/int32 values is refused as mixed EA, pending #5495",
+                "int32_3d": "host bool mask with fp32/int32 values is refused as mixed EA, pending #5495",
+            },
+            # Bool values are not supported: they must be refused as mixed EA, not
+            # computed (a computed result is silently wrong).
+            "expect_raise": {"bool_2d": "mixed EA"},
             "param_sets": {
                 "fp16_2d": (
                     cached_randn((10, 10), dtype=torch.float16) > 1,
@@ -7797,14 +7825,19 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
                 # int32: INT32TOFP32 on Spyre; result cast back to int32
                 "int32_2d": (
-                    torch.zeros(4, 32, dtype=torch.bool),
+                    cached_randn((4, 32), dtype=torch.float16) > 0,
                     torch.randint(0, 1000, (4, 32), dtype=torch.int32),
                     torch.randint(0, 1000, (4, 32), dtype=torch.int32),
                 ),
                 "int32_3d": (
-                    torch.zeros(2, 8, 64, dtype=torch.bool),
+                    cached_randn((2, 8, 64), dtype=torch.float16) > 0,
                     torch.randint(0, 1000, (2, 8, 64), dtype=torch.int32),
                     torch.randint(0, 1000, (2, 8, 64), dtype=torch.int32),
+                ),
+                "bool_2d": (
+                    cached_randn((4, 64), dtype=torch.float16) > 0,
+                    cached_randn((4, 64), dtype=torch.float16, differentiation=1) > 0,
+                    cached_randn((4, 64), dtype=torch.float16, differentiation=2) > 0,
                 ),
             },
         },
@@ -7830,6 +7863,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_where_scalarself", "test_where_eager"): {
             "ops_dict": {"where": torch.where},
+            # int64 values are promoted to fp32, so a host bool mask is converted
+            # to a staggered fp32 here as well. Pending de-staggering support
+            # (#5495).
+            "expect_fail": {
+                "int64_1x24": "host bool mask with fp32/int values is refused as mixed EA, pending #5495",
+            },
             "param_sets": {
                 "fp16_2d": (
                     cached_randn((10, 10), dtype=torch.float16) > 1,
@@ -7853,7 +7892,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     torch.randint(0, 1000, (1, 1), dtype=torch.int64),
                 ),
                 "int64_1x24": (
-                    torch.zeros(1, 24, dtype=torch.bool),
+                    cached_randn((1, 24), dtype=torch.float16) > 0,
                     0,
                     torch.randint(0, 1000, (1, 24), dtype=torch.int64),
                 ),
@@ -7899,6 +7938,71 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((5, 10), dtype=torch.float16),
                     cached_randn((5, 10), dtype=torch.float16),
                     cached_randn((5, 10), dtype=torch.float16),
+                ),
+            },
+        },
+        ("test_masked_fill_scalar", "test_masked_fill_scalar_eager"): {
+            "ops_dict": {
+                "masked_fill": lambda x, mask, value: x.masked_fill(mask, value),
+                "masked_fill_": lambda x, mask, value: x.masked_fill_(mask, value),
+            },
+            # masked_fill lowers to where; a host bool mask with fp32/int32 values
+            # is refused as mixed EA. Pending de-staggering support (#5495).
+            "expect_fail": {
+                "fp32_2d": "host bool mask with fp32/int32 values is refused as mixed EA, pending #5495",
+                "fp32_3d": "host bool mask with fp32/int32 values is refused as mixed EA, pending #5495",
+                "int32_2d": "host bool mask with fp32/int32 values is refused as mixed EA, pending #5495",
+                "int32_3d": "host bool mask with fp32/int32 values is refused as mixed EA, pending #5495",
+            },
+            "param_sets": {
+                "fp16_2d_zero": (
+                    cached_randn((4, 64), dtype=torch.float16) > 0,
+                    cached_randn((4, 64), dtype=torch.float16),
+                    0.0,
+                ),
+                # Passes here, but the LX-planning wrappers (x + x) / 2 and
+                # sum(x, dim=0) turn the -inf result into NaN on device (#5190),
+                # so its LX copies are strict xfails in
+                # test_inductor_ops_lx_misc_compute_b_config.yaml.
+                "fp16_2d_neginf": (
+                    cached_randn((5, 10), dtype=torch.float16) > 0,
+                    cached_randn((5, 10), dtype=torch.float16),
+                    float("-inf"),
+                ),
+                "fp16_3d": (
+                    cached_randn((2, 8, 32), dtype=torch.float16) > 0,
+                    cached_randn((2, 8, 32), dtype=torch.float16),
+                    -1.0e4,
+                ),
+                "fp16_broadcast": (
+                    cached_randn((64,), dtype=torch.float16) > 0,
+                    cached_randn((4, 64), dtype=torch.float16),
+                    0.0,
+                ),
+                "fp16_empty": (
+                    cached_randn((4, 0), dtype=torch.float16) > 0,
+                    cached_randn((4, 0), dtype=torch.float16),
+                    0.0,
+                ),
+                "fp32_2d": (
+                    cached_randn((4, 64), dtype=torch.float32) > 0,
+                    cached_randn((4, 64), dtype=torch.float32),
+                    0.0,
+                ),
+                "fp32_3d": (
+                    cached_randn((2, 8, 32), dtype=torch.float32) > 0,
+                    cached_randn((2, 8, 32), dtype=torch.float32),
+                    -1.0e4,
+                ),
+                "int32_2d": (
+                    cached_randn((4, 32), dtype=torch.float16) > 0,
+                    torch.randint(0, 1000, (4, 32), dtype=torch.int32),
+                    0,
+                ),
+                "int32_3d": (
+                    cached_randn((2, 8, 64), dtype=torch.float16) > 0,
+                    torch.randint(0, 1000, (2, 8, 64), dtype=torch.int32),
+                    -1,
                 ),
             },
         },
@@ -8347,7 +8451,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     64,
                     [[32, 32, 1, 1, 64], [3, 3, 1, 1, 64]],
-                    [[32, 1, -1, 65536, 1024], [1, 3, -1, 9, 9]],
+                    [[32, 1, 0, 65536, 1024], [1, 3, 0, 9, 9]],
                 ),
                 "2x64_ksize5_stride2": (
                     cached_randn((2, 64, 32, 32)),
@@ -8357,7 +8461,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (2, 2),
                     64,
                     [[32, 32, 1, 2, 64], [5, 5, 1, 1, 64]],
-                    [[32, 1, -1, 65536, 1024], [1, 5, -1, 25, 25]],
+                    [[32, 1, 0, 65536, 1024], [1, 5, 0, 25, 25]],
                 ),
                 "8x64_ksize3": (
                     cached_randn((8, 64, 128, 128)),
@@ -8367,7 +8471,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     64,
                     [[128, 128, 1, 8, 64], [3, 3, 1, 1, 64]],
-                    [[128, 1, -1, 1048576, 16384], [1, 3, -1, 9, 9]],
+                    [[128, 1, 0, 1048576, 16384], [1, 3, 0, 9, 9]],
                 ),
                 # Same shape/layouts as 8x64_ksize3, padding=(1, 1): xfail, see
                 # the expect_fail note above.  The layouts are inherited from the
@@ -8380,7 +8484,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     64,
                     [[128, 128, 1, 8, 64], [3, 3, 1, 1, 64]],
-                    [[128, 1, -1, 1048576, 16384], [1, 3, -1, 9, 9]],
+                    [[128, 1, 0, 1048576, 16384], [1, 3, 0, 9, 9]],
                 ),
                 "1x3x64_ksize3": (
                     cached_randn((1, 3, 64, 64)),
@@ -8390,7 +8494,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     3,
                     [[64, 64, 1, 1, 64], [3, 3, 1, 1, 64]],
-                    [[64, 1, -1, 12288, 4096], [1, 3, -1, 9, 9]],
+                    [[64, 1, 0, 12288, 4096], [1, 3, 0, 9, 9]],
                 ),
                 # C == 1 (single-channel depthwise), strided.  The activation's
                 # channel axis is size 1, so its device stick is degenerate (stick
@@ -8405,7 +8509,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (2, 2),
                     1,
                     [[128, 128, 1, 8, 64], [3, 3, 1, 1, 64]],
-                    [[128, 1, -1, 16384, -1], [1, 3, -1, 9, -1]],
+                    [[128, 1, 0, 16384, 0], [1, 3, 0, 9, 0]],
                 ),
                 "1x3x64_ksize_1x3": (
                     cached_randn((1, 3, 64, 64)),
@@ -8415,7 +8519,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     3,
                     [[64, 64, 1, 1, 64], [3, 1, 1, 1, 64]],
-                    [[64, 1, -1, 12288, 4096], [1, 3, -1, 3, 3]],
+                    [[64, 1, 0, 12288, 4096], [1, 3, 0, 3, 3]],
                 ),
                 "1x3x64_ksize_3x1": (
                     cached_randn((1, 3, 64, 64)),
@@ -8425,7 +8529,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     3,
                     [[64, 64, 1, 1, 64], [1, 3, 1, 1, 64]],
-                    [[64, 1, -1, 12288, 4096], [1, 1, -1, 3, 3]],
+                    [[64, 1, 0, 12288, 4096], [1, 1, 0, 3, 3]],
                 ),
                 "1x3x64x1_ksize_3x1": (
                     cached_randn((1, 3, 64, 1)),
@@ -8435,7 +8539,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     3,
                     [[1, 64, 1, 1, 64], [1, 3, 1, 1, 64]],
-                    [[1, 1, -1, 192, 64], [1, 1, -1, 3, 3]],
+                    [[1, 1, 0, 192, 64], [1, 1, 0, 3, 3]],
                 ),
                 "1x3x64x1_ksize_1x1": (
                     cached_randn((1, 3, 64, 1)),
@@ -8445,7 +8549,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     3,
                     [[1, 64, 1, 1, 64], [1, 1, 1, 1, 64]],
-                    [[1, 1, -1, 192, 64], [1, 1, -1, 1, 1]],
+                    [[1, 1, 0, 192, 64], [1, 1, 0, 1, 1]],
                 ),
                 "2x3x32_ksize1": (
                     cached_randn((2, 3, 32, 32)),
@@ -8455,7 +8559,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     3,
                     [[32, 32, 1, 2, 64], [1, 1, 1, 1, 64]],
-                    [[32, 1, -1, 3072, 1024], [1, 1, -1, 1, 1]],
+                    [[32, 1, 0, 3072, 1024], [1, 1, 0, 1, 1]],
                 ),
                 "1x16x64_ksize3": (
                     cached_randn((1, 16, 64, 64)),
@@ -8465,7 +8569,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     16,
                     [[64, 64, 1, 1, 64], [3, 3, 1, 1, 64]],
-                    [[64, 1, -1, 65536, 4096], [1, 3, -1, 9, 9]],
+                    [[64, 1, 0, 65536, 4096], [1, 3, 0, 9, 9]],
                 ),
                 "2x32_ksize1_stride2": (
                     cached_randn((2, 32, 64, 64)),
@@ -8475,7 +8579,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (2, 2),
                     32,
                     [[64, 64, 1, 2, 64], [1, 1, 1, 1, 64]],
-                    [[64, 1, -1, 131072, 4096], [1, 1, -1, 1, 1]],
+                    [[64, 1, 0, 131072, 4096], [1, 1, 0, 1, 1]],
                 ),
                 "1x3x128_ksize5": (
                     cached_randn((1, 3, 128, 128)),
@@ -8485,7 +8589,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     3,
                     [[128, 128, 1, 1, 64], [5, 5, 1, 1, 64]],
-                    [[128, 1, -1, 49152, 16384], [1, 5, -1, 25, 25]],
+                    [[128, 1, 0, 49152, 16384], [1, 5, 0, 25, 25]],
                 ),
                 # With bias, conv2d_with_bias decomposes to spyre.conv2d + add, so
                 # the depthwise output is an intermediate the add reads rather than
@@ -8499,7 +8603,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     64,
                     [[32, 32, 1, 1, 64], [3, 3, 1, 1, 64]],
-                    [[32, 1, -1, 65536, 1024], [1, 3, -1, 9, 9]],
+                    [[32, 1, 0, 65536, 1024], [1, 3, 0, 9, 9]],
                 ),
                 "2x32_ksize1_stride2_bias": (
                     cached_randn((2, 32, 64, 64)),
@@ -8509,7 +8613,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (2, 2),
                     32,
                     [[64, 64, 1, 2, 64], [1, 1, 1, 1, 64]],
-                    [[64, 1, -1, 131072, 4096], [1, 1, -1, 1, 1]],
+                    [[64, 1, 0, 131072, 4096], [1, 1, 0, 1, 1]],
                 ),
             },
         },
@@ -8597,7 +8701,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                     64,
                     [[32, 1, 1, 64], [3, 1, 1, 64]],
-                    [[1, -1, 2048, 32], [1, -1, 3, 3]],
+                    [[1, 0, 2048, 32], [1, 0, 3, 3]],
                 ),
                 "8x64_ksize3": (
                     cached_randn((8, 64, 128)),
@@ -8607,7 +8711,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                     64,
                     [[128, 1, 8, 64], [3, 1, 1, 64]],
-                    [[1, -1, 8192, 128], [1, -1, 3, 3]],
+                    [[1, 0, 8192, 128], [1, 0, 3, 3]],
                 ),
                 # Same shape/layouts as 8x64_ksize3, padding=1: rejected, see
                 # the expect_raise note above.  The layouts are inherited from the
@@ -8620,7 +8724,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                     64,
                     [[128, 1, 8, 64], [3, 1, 1, 64]],
-                    [[1, -1, 8192, 128], [1, -1, 3, 3]],
+                    [[1, 0, 8192, 128], [1, 0, 3, 3]],
                 ),
                 "1x3x64_ksize3": (
                     cached_randn((1, 3, 64)),
@@ -8630,7 +8734,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                     3,
                     [[64, 1, 1, 64], [3, 1, 1, 64]],
-                    [[1, -1, 4096, 64], [1, -1, 3, 3]],
+                    [[1, 0, 4096, 64], [1, 0, 3, 3]],
                 ),
                 "1x3x64_ksize_1": (
                     cached_randn((1, 3, 64)),
@@ -8640,7 +8744,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                     3,
                     [[64, 1, 1, 64], [1, 1, 1, 64]],
-                    [[1, -1, 192, 64], [1, -1, 1, 1]],
+                    [[1, 0, 192, 64], [1, 0, 1, 1]],
                 ),
                 "2x3x32_ksize1": (
                     cached_randn((2, 3, 32)),
@@ -8650,7 +8754,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                     3,
                     [[32, 1, 2, 64], [1, 1, 1, 64]],
-                    [[1, -1, 96, 32], [1, -1, 1, 1]],
+                    [[1, 0, 96, 32], [1, 0, 1, 1]],
                 ),
                 "1x16x64_ksize3": (
                     cached_randn((1, 16, 64)),
@@ -8660,7 +8764,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                     16,
                     [[64, 1, 1, 64], [3, 1, 1, 64]],
-                    [[1, -1, 1024, 64], [1, -1, 3, 3]],
+                    [[1, 0, 1024, 64], [1, 0, 3, 3]],
                 ),
                 "2x32_ksize1_stride2": (
                     cached_randn((2, 32, 64)),
@@ -8670,7 +8774,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     2,
                     32,
                     [[64, 1, 2, 64], [1, 1, 1, 64]],
-                    [[1, -1, 2048, 64], [1, -1, 1, 1]],
+                    [[1, 0, 2048, 64], [1, 0, 1, 1]],
                 ),
                 "1x3x128_ksize5": (
                     cached_randn((1, 3, 128)),
@@ -8680,7 +8784,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                     3,
                     [[128, 1, 1, 64], [5, 1, 1, 64]],
-                    [[1, -1, 384, 128], [1, -1, 5, 5]],
+                    [[1, 0, 384, 128], [1, 0, 5, 5]],
                 ),
             },
         },
@@ -9725,6 +9829,57 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "trunc_int64_rand_2d": "rounding_mode='trunc' is not yet implemented",
                 "trunc_fp16_rand_2d": "rounding_mode='trunc' is not yet implemented",
                 "trunc_fp32_rand_2d": "rounding_mode='trunc' is not yet implemented",
+            },
+        },
+        # -----------------------------------------------------------------------
+        # Eager floor division: Tensor.__floordiv__ / torch.floor_divide dispatch
+        # aten::floor_divide, which needs its own eager kernel (compile mode
+        # decomposes it to div.Tensor_mode and never reaches that dispatch).
+        # -----------------------------------------------------------------------
+        ("test_floor_divide_eager", "test_floor_divide_eager_cpu"): {
+            "param_sets": {
+                # issue 4643: ceil-division idiom on an int64 count tensor
+                "int64_floordiv_scalar": (
+                    torch.tensor(
+                        [0, 1, 31, 32, 33, 63, 64] + [0] * 121, dtype=torch.int64
+                    )
+                    + 31,
+                    32,
+                    lambda x, s: x // s,
+                ),
+                # floor_divide.out
+                "int64_floor_divide_out": (
+                    torch.tensor([0, 1, 31, 32, 33, 63, 64, 100], dtype=torch.int64),
+                    torch.tensor([32, 32, 32, 32, 32, 32, 32, 7], dtype=torch.int64),
+                    lambda x, y: torch.floor_divide(x, y, out=torch.empty_like(x)),
+                ),
+                "int64_floordiv_neg": (
+                    torch.tensor([-12, -21, 31, -7], dtype=torch.int64),
+                    4,
+                    lambda x, s: x // s,
+                ),
+                "int64_floordiv_tensor": (
+                    torch.tensor([0, 1, 31, 32, 33, 63, 64, 100], dtype=torch.int64),
+                    torch.tensor([32, 32, 32, 32, 32, 32, 32, 7], dtype=torch.int64),
+                    lambda x, y: x // y,
+                ),
+                # fp16: negative dividends/divisors exercise rounding toward -inf
+                "fp16_floor_divide_neg": (
+                    torch.tensor([-7, 7, -12, 9, -9, 0, 5, -1], dtype=torch.float16),
+                    torch.tensor([2, -2, 4, -4, 3, 5, -3, 8], dtype=torch.float16),
+                    torch.floor_divide,
+                ),
+                # in-place: floor_divide_.Scalar / floor_divide_.Tensor
+                "int64_floordiv_inplace_scalar": (
+                    torch.tensor([-12, -21, 31, 32, 33, 63, 64, 0], dtype=torch.int64),
+                    4,
+                    _floordiv_inplace,
+                ),
+                "int64_floordiv_inplace_tensor": (
+                    torch.tensor([0, 1, 31, 32, 33, 63, 64, 100], dtype=torch.int64),
+                    torch.tensor([32, 32, 32, 32, 32, 32, 32, 7], dtype=torch.int64),
+                    _floordiv_inplace,
+                ),
             },
         },
         # -----------------------------------------------------------------------
@@ -12764,6 +12919,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             lambda condition, x, y, z: op(condition, x, y, out=z), condition, x, y, z
         )
 
+    def test_masked_fill_scalar_eager(self, op, mask, x, value):
+        # clone_inputs: the in-place op mutates x, so the CPU reference and the
+        # Spyre run must each get a fresh copy.
+        self.compare_with_cpu(
+            lambda mask, x: op(x, mask, value), mask, x, clone_inputs=True
+        )
+
     def test_attn_qkv_paths(self, q, k, v):
         # This tests the dataflows between rope/qkv projection and SDPA for q, k, and v
         def fn(q, k, v):
@@ -14913,7 +15075,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             offs_2d2d,
         )
 
-    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
     def test_div_rounding_mode_cpu(self, rounding_mode, x, y):
         """Test torch.div with different rounding modes."""
@@ -14930,7 +15091,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # the class of error the quotient-correction step exists to fix.
         self.compare_with_cpu(fn, x, y, atol=0, rtol=0)
 
-    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
     def test_div_mixed_dtype_cpu(self, op, x, y):
         """Test torch.div type promotion across mixed tensor dtypes."""
@@ -14939,7 +15099,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         tol_kwargs = {"atol": 0, "rtol": 0} if op is _floor_div else {}
         self.compare_with_cpu(op, x, y, **tol_kwargs)
 
-    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
     def test_div_scalar_dtypes_cpu(self, op, x, scalar):
         """Test torch.div type promotion with Python scalar operands."""
@@ -14947,6 +15106,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             scalar = 1.0
         tol_kwargs = {"atol": 0, "rtol": 0} if op is _floor_div else {}
         self.compare_with_cpu(op, x, scalar, **tol_kwargs)
+
+    @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
+    def test_floor_divide_eager_cpu(self, x, y, fn):
+        # Eager-only: `//` / torch.floor_divide must have a spyre eager kernel.
+        # Floor division is exact integer arithmetic, so compare exactly.
+        self.compare_with_cpu(
+            fn, x, y, atol=0, rtol=0, run_compile=False, run_eager=True
+        )
 
 
 _TEST_LARGE_MATMUL_FP32_PROXY_SHAPES = _derive_test_large_matmul_fp32_proxy_shapes(
