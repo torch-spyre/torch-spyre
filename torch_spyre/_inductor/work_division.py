@@ -35,6 +35,7 @@ from torch._inductor.ir import (
     Operation,
     Pointwise,
     Reduction,
+    _CollectiveKernel,
 )
 
 from torch_spyre._C import ElementArrangement
@@ -43,13 +44,9 @@ from . import config
 from .constants import BATCH_MATMUL_FP8_OP, BATCH_MATMUL_OP, DEVICE_NAME
 from .errors import Unsupported
 from .ir import (
-    AllGatherAsyncFallback,
-    AllReduceAsyncFallback,
-    BroadcastAsyncFallback,
     FixedTiledLayout,
     SpyreConstantFallback,
     SpyreEmptyFallback,
-    WaitWorkFallback,
 )
 from .logging_utils import get_inductor_logger
 from .op_spec import IndirectAccess
@@ -73,6 +70,8 @@ from .pass_utils import (
     commit_iteration_space_ownership,
     op_out_coords,
     op_read_writes,
+    unrepresentable_splits_by_index_coeff,
+    work_division_transport_indexes,
     _per_core_view_from_prep,
     _prepare_per_core_view,
     tile_ownership_view,
@@ -833,7 +832,26 @@ def collect_tensor_deps(
 
 
 def apply_splits(op: ComputedBuffer, splits: dict) -> None:
-    """Commit symbol-keyed work division; scheduler transport is finalized later."""
+    """Commit symbol-keyed work division; scheduler transport is finalized later.
+
+    The gate span_reduction, the default greedy distributor, the cost-model
+    matmul re-pricer, and user hints all commit a split through -- so none of
+    them can individually forget to reject a split the scheduler's
+    coefficient-keyed transport cannot carry losslessly (see
+    ``unrepresentable_splits_by_index_coeff``). An op with no ``MemoryDep``
+    write never goes through that transport, so nothing is checked for it
+    here.
+
+    The LX co-optimizer (``scratchpad.allocator.commit_divisions``) does not
+    go through this gate: it commits its chosen division directly via
+    ``commit_iteration_space_ownership``, but its candidates come from
+    ``enumerate_work_division_candidates``, which already filters through
+    ``WorkDivisionContext.is_legal`` -- the same representability check --
+    before the solver ever sees them.
+    """
+    work_division_transport_indexes(
+        op, op_read_writes(op), iteration_space_from_op(op), splits
+    )
     commit_iteration_space_ownership(op, splits)
 
 
@@ -866,8 +884,16 @@ class WorkDivisionContext:
     constraints: ConstraintResult
     # Hard per-axis floors ``span_reduction_pass`` has already committed.
     span_min_splits: dict[Symbol, int]
+    # The write/read indexes the scheduler transport uses; None means no
+    # indexed write exists.
+    write_index: Expr | None
+    read_index: Expr | None
+    # The transport's unit-axis carve-out must use the same full frame as
+    # commit-time checks, even when this context was built for a tiled frame.
+    # Cache it once rather than re-deriving the sympy iteration space per candidate.
+    transport_it_space: dict[Symbol, Expr] | None = None
     # factor_domain is asked once per axis by the enumeration and again per
-    # candidate by is_legal; the derivation is sympy-heavy, so memoize it.
+    # candidate by is_legal; memoize its sympy-heavy derivation.
     _factor_domains: dict[Symbol, list[int]] = dataclasses.field(
         default_factory=dict, init=False, repr=False, compare=False
     )
@@ -911,6 +937,22 @@ class WorkDivisionContext:
             and self._spans_within_cap(splits)
             and self._in_split_domains(splits)
             and self.meets_span_floors(splits)
+            and self.representable_by_index_coeff(splits)
+        )
+
+    def representable_by_index_coeff(self, splits: dict[Symbol, int]) -> bool:
+        """Whether the scheduler's coefficient-keyed transport can carry
+        ``splits`` without loss, using the op's full, un-tiled iteration space.
+        """
+        if self.write_index is None:
+            return True
+        full_it_space = (
+            self.transport_it_space
+            if self.transport_it_space is not None
+            else self.it_space
+        )
+        return not unrepresentable_splits_by_index_coeff(
+            splits, full_it_space, self.write_index, self.read_index
         )
 
     def obeys_op_constraints(self, splits: dict[Symbol, int]) -> bool:
@@ -999,7 +1041,8 @@ def work_division_context_for_op(
     rejects by value, and would silently disagree with the frame the allocator
     prices the same candidate on.
     """
-    it_space = iteration_space_from_op(op)
+    transport_it_space = iteration_space_from_op(op)
+    it_space = transport_it_space
     if tiling is not None and not tiling.is_untiled:
         from .wsr.tile_prediction import predict_frame
 
@@ -1007,9 +1050,10 @@ def work_division_context_for_op(
         if frame is None:
             return None
         it_space = frame.iter_space
+    rw = op_read_writes(op)
     input_tds, output_td = collect_tensor_deps(
         op,
-        _apply_input_layout_overrides(op, get_mem_deps_from_rw(op_read_writes(op))),
+        _apply_input_layout_overrides(op, get_mem_deps_from_rw(rw)),
     )
     symbol_meta = _collect_symbol_metadata(it_space)
     it_space_adjusted, stick_vars = adjust_it_space_for_sticks(
@@ -1034,6 +1078,8 @@ def work_division_context_for_op(
             committed_splits={},
         )
     )
+    indexes = work_division_transport_indexes(op, rw, it_space)
+    write_index, read_index = indexes if indexes is not None else (None, None)
     return WorkDivisionContext(
         op=op,
         max_cores=max_cores,
@@ -1045,6 +1091,9 @@ def work_division_context_for_op(
         reduction_vars=reduction_vars,
         constraints=constraint_result,
         span_min_splits=_span_min_splits(op),
+        write_index=write_index,
+        read_index=read_index,
+        transport_it_space=transport_it_space,
     )
 
 
@@ -1080,11 +1129,10 @@ def enumerate_work_division_candidates(
 def work_division_splits_are_legal(
     op: ComputedBuffer, splits: dict[Symbol, int]
 ) -> bool:
-    """Return whether symbol-keyed splits obey this op's hard constraints.
+    """Whether splits obey hard constraints and scheduler transport.
 
-    The op's own constraints only: unlike :meth:`WorkDivisionContext.is_legal`
-    this asks nothing about a core budget or per-core spans, because the splits
-    are already committed rather than proposed.
+    Unlike :meth:`WorkDivisionContext.is_legal`, this checks neither a core
+    budget nor per-core spans.
     """
     layout = op.get_layout()
     if isinstance(layout, MutationLayoutSHOULDREMOVE):
@@ -1094,7 +1142,11 @@ def work_division_splits_are_legal(
 
     ctx = work_division_context_for_op(op)
     assert ctx is not None  # untiled: never rejected
-    return ctx.obeys_op_constraints(splits) and ctx.meets_span_floors(splits)
+    return (
+        ctx.obeys_op_constraints(splits)
+        and ctx.meets_span_floors(splits)
+        and ctx.representable_by_index_coeff(splits)
+    )
 
 
 # Per-candidate core-division machinery: the questions a solver asks of
@@ -1261,7 +1313,10 @@ class OpSplitSpace:
                 context = work_division_context_for_op(
                     self.op, self.context.max_cores, tiling
                 )
-            except Unsupported:
+            except Unsupported as exc:
+                logger.debug(
+                    "dropping tiling %s on %s: %s", tiling, self.op.get_name(), exc
+                )
                 context = None
             self._contexts[tiling] = context
         return self._contexts[tiling]
@@ -1782,6 +1837,9 @@ def has_resolved_work_div_hint(op: ComputedBuffer) -> bool:
 
     ``spyre_hint`` annotates every node in its scope, so an op can carry a
     ``work_div`` hint naming none of its dims; that op gets a default split.
+    Shard-pinned ops are not excluded here: the scratchpad allocator's
+    "shard plan" branch commits their division first, so this predicate never
+    decides for them.
     """
     return (
         isinstance(op.data, (Pointwise, Reduction))
@@ -1916,6 +1974,13 @@ def _apply_user_hint(
             f"{conflicting_domains} or span floors {below_span_floor}."
         )
 
+    work_division_transport_indexes(
+        op,
+        op_read_writes(op),
+        iteration_space_from_op(op),
+        splits,
+        message_prefix="work_division_hint:",
+    )
     return splits
 
 
@@ -2126,8 +2191,21 @@ def work_distribution_pass(
     blocked = constraint_result.blocked
     allowed_splits = constraint_result.allowed_splits
 
-    if not config.ignore_work_division_hints:
-        user_splits = _resolve_work_div_hint(op, it_space_adjusted)
+    # A shard plan (sharded_hbm.plan_sharded_hbm) is a correctness constraint,
+    # not a preference, so it applies even when hints are ignored.
+    shard_splits = getattr(op, "shard_pinned_splits", None)
+    if shard_splits:
+        if not config.ignore_work_division_hints and has_work_div_hint(op):
+            # The shard plan wins over a user work_div hint by design; say so
+            # instead of dropping the hint silently.
+            logger.info(
+                "work_distribution(shard-plan) %s: shard plan %s overrides the "
+                "work_div hint (the split must follow the shards)",
+                op.get_name(),
+                shard_splits,
+            )
+    if shard_splits or not config.ignore_work_division_hints:
+        user_splits = shard_splits or _resolve_work_div_hint(op, it_space_adjusted)
         if user_splits is not None:
             user_splits = _apply_user_hint(
                 op,
@@ -2831,11 +2909,15 @@ def _iter_computed_buffers(operations: list[Operation]):
             if layout is None or layout.device.type != DEVICE_NAME:
                 continue
             yield op
+        elif isinstance(op, _CollectiveKernel):
+            # Collectives run in spyre-comms; no work division.
+            pass
         elif isinstance(op, FallbackKernel):
-            # FallbackKernel produces 0..N trailing MultiOutputs
-            # (see torch_spyre/_inductor/propagate_layouts.py).
-            # Work division is not supported on either; the MultiOutputs
-            # are skipped in their own branch below.
+            # FallbackKernel either carries a single output itself or
+            # produces trailing MultiOutputs (see
+            # torch_spyre/_inductor/propagate_layouts.py). Work division is
+            # not supported on either; the MultiOutputs are skipped in their
+            # own branch below.
             pass
         elif isinstance(op, MultiOutput):
             pass
@@ -2843,16 +2925,6 @@ def _iter_computed_buffers(operations: list[Operation]):
             if isinstance(op, (SpyreConstantFallback, SpyreEmptyFallback, DeviceCopy)):
                 # Work division not supported on allocation/constant kernels, nor
                 # on DeviceCopy.
-                pass
-            elif isinstance(
-                op,
-                (
-                    BroadcastAsyncFallback,
-                    WaitWorkFallback,
-                    AllGatherAsyncFallback,
-                    AllReduceAsyncFallback,
-                ),
-            ):
                 pass
             else:
                 logger.warning(f"unhandled node type {type(op)}")
@@ -2908,12 +2980,17 @@ def work_distribution(
     for op in _iter_computed_buffers(operations):
         if op in preassigned_ops:
             continue
-        rw = op_read_writes(op)
-        args = _apply_input_layout_overrides(op, get_mem_deps_from_rw(rw))
-        if isinstance(op.data, Pointwise):
-            divide_pointwise_op(op, args, max_cores, work_distribution_pass)
-        elif isinstance(op.data, Reduction):
-            divide_reduction_op(op, args, max_cores, work_distribution_pass)
+        _work_distribution_op(op, max_cores)
+
+
+def _work_distribution_op(op: ComputedBuffer, max_cores: int) -> None:
+    """Pass 3 for one op: commit its default split."""
+    rw = op_read_writes(op)
+    args = _apply_input_layout_overrides(op, get_mem_deps_from_rw(rw))
+    if isinstance(op.data, Pointwise):
+        divide_pointwise_op(op, args, max_cores, work_distribution_pass)
+    elif isinstance(op.data, Reduction):
+        divide_reduction_op(op, args, max_cores, work_distribution_pass)
 
 
 def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
@@ -3039,3 +3116,62 @@ def cost_model_matmul_division(graph: GraphLowering) -> list[Operation]:
         if _cost_model_divide_op(op, max_cores):
             cost_model_ops.append(op)
     return cost_model_ops
+
+
+# The ops ``defer_work_division`` left undivided, by name. Stored on the
+# GraphLowering, so it lives exactly as long as one compile.
+_DEFERRED_WORK_DIVISION = "_spyre_deferred_work_division"
+
+
+def defer_work_division(graph: GraphLowering) -> None:
+    """Leave Pass 2 and Pass 3 to the joint LX planning solve.
+
+    The co-optimizing solve re-chooses the split of every op it can enumerate,
+    so a split these passes commit up front is overwritten. Record the ops they
+    would have divided instead. The allocator divides one on demand when it pins
+    the op to that split (:func:`divide_deferred_op`), counts the solve's commit
+    as the op's division, and divides whatever the solve leaves
+    (:func:`divide_deferred_ops`), so every op ends with the split it had when
+    the passes ran up front. Span floors are unaffected: ``span_reduction``
+    still runs first.
+    """
+    setattr(
+        graph,
+        _DEFERRED_WORK_DIVISION,
+        {
+            op.get_name()
+            for op in _iter_computed_buffers(graph.operations)
+            if isinstance(op.data, (Pointwise, Reduction))
+        },
+    )
+
+
+def deferred_work_division(graph: GraphLowering) -> set[str]:
+    """Names of the ops whose deferred division is still undecided.
+
+    Empty when nothing was deferred. The set is live: discarding a name marks
+    that op divided.
+    """
+    return getattr(graph, _DEFERRED_WORK_DIVISION, set())
+
+
+def divide_deferred_op(graph: GraphLowering, op: Operation) -> None:
+    """Commit the split Pass 2 or Pass 3 would have given ``op``, if its
+    division was deferred and nothing has decided it since."""
+    deferred = deferred_work_division(graph)
+    if op.get_name() not in deferred:
+        return
+    deferred.discard(op.get_name())
+    assert isinstance(op, ComputedBuffer)
+    max_cores = _validate_max_cores()
+    if not _cost_model_divide_op(op, max_cores):
+        _work_distribution_op(op, max_cores)
+
+
+def divide_deferred_ops(graph: GraphLowering) -> None:
+    """Divide every op whose deferred division is still undecided, in graph
+    order: the ones the solve neither pinned nor committed."""
+    if not deferred_work_division(graph):
+        return
+    for op in graph.operations:
+        divide_deferred_op(graph, op)

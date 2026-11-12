@@ -66,13 +66,19 @@ from .lx_read_contracts import (
     normalize_local_read as normalize_local_lx_subrange,
 )
 from .ir import FixedTiledLayout, SpyreConstantFallback
+from .sharded_hbm import placement_of
 from .scratchpad.lx_relayout import (
     materialized_lx_relayout_for_destination,
 )
 from .pass_utils import (
     concretize_expr,
+    declared_dims_in,
     op_read_writes,
     compute_symbolic_bounds,
+    max_trip_count,
+    require_declared_count,
+    symbolic_count_bounds,
+    with_shape_env_replacements,
     finite_upper_or_none,
     iteration_space,
     iteration_space_with_splits,
@@ -80,10 +86,12 @@ from .pass_utils import (
     input_layout_for_operation,
     is_restickify_coords,
     alignment_coordinates,
+    loop_var_ranges_from_dim_hints,
     per_trip_index,
 )
 from .views import align_tensors, tiling_expr_to_device_expr
 from .logging_utils import get_inductor_logger
+from .loop_checker import LoopAdvanceMismatch
 from .loop_facts import enclosing_loops
 from .op_spec import (
     IndirectAccess,
@@ -95,6 +103,7 @@ from .op_spec import (
     UnimplementedOp as OpSpecUnimplementedOp,
     format_op_spec_list,
     is_lx_relayout_identity,
+    walk_loop_specs,
 )
 from .op_spec_validation import validate_op_specs
 from torch_spyre._inductor.provenance import build_debug_handle
@@ -556,6 +565,85 @@ def _tile_advance_expr_from_dep(
     return dep.index.subs(subs)
 
 
+def _non_unified_shard_bytes(name: str, layout: FixedTiledLayout) -> int:
+    """Per-shard device bytes of a sharded kernel tensor, else 0.
+
+    The chunks hold shards in the default layout of the shard-local shape, so
+    the tensor's committed layout must be the default global layout; a
+    restickified or otherwise relaid tensor cannot use chunk addressing.
+    """
+    placement = placement_of(name)
+    if placement is None:
+        return 0
+    from torch_spyre._C import SpyreTensorLayout
+
+    size = [int(s) for s in layout.size]
+    if layout.device_layout != SpyreTensorLayout(size, layout.dtype):
+        raise Unsupported(
+            f"{name}: non-unified kernels need sharded tensors in the default "
+            f"device layout; got {layout.device_layout}"
+        )
+    return placement.shard_device_bytes
+
+
+def _matching_read_deps(
+    read_deps: "list[MemoryDep]", name: str, mutation_real_name: "dict[str, str]"
+) -> "list[tuple[int, MemoryDep]]":
+    """The reads of ``name``, as (position in ``read_deps``, dependency) pairs.
+
+    ``name`` has already been resolved through ``mutation_real_name`` by load()
+    (e.g. ``coarse_tile_copy_buf19``'s dependency is named ``buf19``, tiled_op's own
+    output identity, but load() passes in ``buf2``, buf19's MutationLayoutSHOULDREMOVE
+    target, the actual underlying buffer). A dependency's name is the
+    pre-resolution identity, so it goes through the same resolution before it is
+    compared, or a dependency on a mutation alias never matches its own resolved
+    name and the access falls through to "no advance" (issue: flash-v2's B-tiled
+    denominator/output copy-out reads silently pinned to tile 0).
+
+    Both the stored-record builder and the index-based builder pick their read
+    from this list, so the two cannot disagree about which read an access is.
+    """
+    return [
+        (i, dep)
+        for i, dep in enumerate(read_deps)
+        if mutation_real_name.get(dep.name, dep.name) == name
+    ]
+
+
+def _loop_coefficient(index: sympy.Expr, variable: sympy.Symbol) -> sympy.Expr:
+    """The coefficient of the loop variable ``variable`` in ``index``.
+
+    ``Expr.coeff`` is not a safe reading of "how far one trip moves this access": it
+    returns 0 for an unexpanded product (``32*(u0 + 1)``) and for any use of the
+    variable it cannot see through (``floor(u0/2)``, ``Mod(u0, 2)``). Read as "no
+    advance", those would be silently wrong once the stored record, which makes such
+    a disagreement loud, is deleted. So the index is evaluated at 0, 1 and 2:
+
+    * it must be affine in the variable (the second difference is zero), and
+    * the step must be a number (a symbolic step cannot be projected to device
+      elements),
+
+    otherwise this raises ``Unsupported``. A variable that does not occur in the
+    index has coefficient 0. The loop variable is an integer, so ``floor(8*u0)`` is
+    ``8*u0`` and has coefficient 8.
+    """
+    if variable not in index.free_symbols:
+        return sympy.S.Zero
+    at = [sympy.expand(index.subs(variable, k)) for k in (0, 1, 2)]
+    if sympy.simplify(at[2] - 2 * at[1] + at[0]) != 0:
+        raise Unsupported(
+            f"the loop variable {variable} is used non-affinely in the index "
+            f"{index}; a per-trip advance cannot be read from it"
+        )
+    step = sympy.simplify(at[1] - at[0])
+    if not step.is_number:
+        raise Unsupported(
+            f"the loop variable {variable} has the symbolic step {step} in the "
+            f"index {index}; it cannot be projected to device elements"
+        )
+    return step
+
+
 class SpyreKernel(Kernel[CSEVariable]):
     overrides = SpyreOpFuncs  # type: ignore[assignment]
 
@@ -716,24 +804,12 @@ class SpyreKernel(Kernel[CSEVariable]):
                 for dep in ir_node.get_read_writes().reads
                 if isinstance(dep, MemoryDep)
             ]
-            # `name` has already been resolved through mutation_real_name by
-            # load() (e.g. coarse_tile_copy_buf19's dep is named "buf19" --
-            # tiled_op's own output identity -- but load() passes in "buf2",
-            # buf19's MutationLayoutSHOULDREMOVE target, since that's the
-            # actual underlying buffer). dep.name is the pre-resolution
-            # identity, so it must go through the same resolution before
-            # comparing, or a dep on a mutation alias never matches its own
-            # resolved name and this falls through to "no advance" every
-            # time (issue: flash-v2's B-tiled denominator/output copy-out
-            # reads silently pinned to tile 0).
             scheduler = getattr(V.graph, "scheduler", None)
             mutation_real_name = (
                 scheduler.mutation_real_name if scheduler is not None else {}
             )
             matching_idx = [
-                i
-                for i, dep in enumerate(read_deps)
-                if mutation_real_name.get(dep.name, dep.name) == name
+                i for i, _ in _matching_read_deps(read_deps, name, mutation_real_name)
             ]
             if not matching_idx:
                 return None
@@ -815,6 +891,107 @@ class SpyreKernel(Kernel[CSEVariable]):
 
         return total_device_expr
 
+    def _index_tile_advance(
+        self, tensor: TensorAccess, is_input: bool, name: str
+    ) -> "tuple[sympy.Expr, MemoryDep] | None":
+        """The advance read from the INDEX alone: each level's loop variable's
+        coefficient in ``dep.index``, projected to device elements.
+
+        Level ``i``'s variable is the ``i``-th loop-variable hint of the op's
+        ``dim_hints`` (``loop_var_ranges_from_dim_hints``, outermost first), which
+        is what ``per_trip_index`` already reads; every op in a loop node that
+        indexes with a node's induction variable lists it there (measured on 1,545
+        ops, none disagrees). Returns ``None`` when the op has no hinted variable
+        or no matching dependency, so the caller compares nothing. Otherwise the
+        advance and the dependency it was read from (for an error message).
+
+        Uses the same ``_tile_advance_symbols`` as the record-based builder, so the
+        two expressions are comparable term by term.
+        """
+        ir_node = self.current_node.node
+        hinted = list(loop_var_ranges_from_dim_hints(ir_node))
+        if not hinted:
+            return None
+        if len(hinted) != len(enclosing_loops(ir_node)):
+            # Level i's variable is the i-th hint only if there is one hint per
+            # level. A different count means the pairing is not known, so this op
+            # stays on the stored record rather than guess.
+            logger.debug(
+                "%s lists %d loop variables for %d loop levels; keeping its stored "
+                "advance",
+                ir_node.get_operation_name(),
+                len(hinted),
+                len(enclosing_loops(ir_node)),
+            )
+            return None
+        reads_writes = ir_node.get_read_writes()
+        if is_input:
+            scheduler = getattr(V.graph, "scheduler", None)
+            mutation_real_name = (
+                scheduler.mutation_real_name if scheduler is not None else {}
+            )
+            read_deps = [d for d in reads_writes.reads if isinstance(d, MemoryDep)]
+            matches = _matching_read_deps(read_deps, name, mutation_real_name)
+            # _general_tile_advance has already consumed one match for this call.
+            consumed = self._general_tile_advance_seen.get(name, 0)
+            dep = matches[consumed - 1][1] if 0 < consumed <= len(matches) else None
+        else:
+            writes = [d for d in reads_writes.writes if isinstance(d, MemoryDep)]
+            dep = writes[0] if writes else None
+        if dep is None:
+            return None
+        layout = tensor.layout.device_layout
+        op_name = ir_node.get_operation_name()
+        total: "sympy.Expr" = sympy.S.Zero
+        for level, variable in enumerate(hinted):
+            coefficient = _loop_coefficient(dep.index, variable)
+            if coefficient == 0:
+                continue
+            total += tiling_expr_to_device_expr(
+                layout.device_size,
+                layout.stride_map,
+                coefficient * self._get_or_mint_level_symbol(level, op_name),
+            )
+        return total, dep
+
+    def _checked_tile_advance(
+        self, tensor: TensorAccess, is_input: bool, name: str
+    ) -> "sympy.Expr | None":
+        """The advance, read from the index and checked against the stored record.
+
+        An op that lists a loop variable in its ``dim_hints`` gets the advance from
+        the INDEX: each level's variable's coefficient in ``dep.index``. Until the
+        stored per-read fields are deleted (stage 7.4) the record is still built, and
+        the two must agree: a difference is a compiler bug (a pass edited one source
+        and not the other), so it raises instead of emitting a kernel that advances
+        by the wrong amount. Every other op (span-overflow and the allocator's
+        tiling have no loop variable) keeps the record.
+        """
+        seen_before = self._general_tile_advance_seen.get(name, 0)
+        recorded = self._general_tile_advance(tensor, is_input, name)
+        if is_input and self._general_tile_advance_seen.get(name, 0) == seen_before:
+            # No new match was consumed: this is a repeat load of a buffer the op
+            # reads once (``x + x`` deduplicates to one dependency), and the
+            # record builder answers it with None. There is nothing to compare.
+            return recorded
+        indexed = self._index_tile_advance(tensor, is_input, name)
+        if indexed is None:
+            return recorded
+        from_index, dep = indexed
+        theirs = sympy.S.Zero if recorded is None else recorded
+        # The two builders give the same expression almost always, so compare
+        # structurally first: simplify is slow, and it can fail to prove two
+        # equal expressions with floor() equal, which would fail a correct compile.
+        if theirs != from_index and sympy.simplify(theirs - from_index) != 0:
+            node = self.current_node.node
+            raise LoopAdvanceMismatch(
+                f"{node.get_operation_name()} {'reads' if is_input else 'writes'} "
+                f"{name}: the stored record gives {theirs} and the index gives "
+                f"{from_index} (index {dep.index})"
+            )
+        # "No advance" is None, not a zero: consumers test ``is not None``.
+        return None if from_index == 0 else from_index
+
     def create_tensor_arg(
         self,
         is_input: bool,
@@ -889,7 +1066,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         # zero in the base coordinates so the raw unbacked symbol neither
         # leaks into the OpSpec iteration space nor applies the same
         # advance a second time.
-        device_tile_advance_expr = self._general_tile_advance(tensor, is_input, name)
+        device_tile_advance_expr = self._checked_tile_advance(tensor, is_input, name)
         base_index = per_trip_index(operation, tensor.index)
         device_coords = alignment_coordinates(
             tensor.layout.device_layout,
@@ -918,6 +1095,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             work_division=work_division,
             kernel_local=kernel_local,
             replicated_scalar=replicated_scalar,
+            non_unified_shard_bytes=_non_unified_shard_bytes(name, tensor.layout),
         )
         if (
             _spyre_config.lx_planner_relayout
@@ -990,8 +1168,31 @@ class SpyreKernel(Kernel[CSEVariable]):
             if step == 0:
                 continue
             if int(step) % elems_per_stick != 0:
+                # Only a step of exactly 1 is really "one element per trip"; a
+                # larger sub-stick step (e.g. a Kind.SLICE operand tiled narrower
+                # than a stick) is a different advance, so the specific remedy
+                # below only applies to the former. Either way, point at the one
+                # documented fix (the counted-loop index-table layout note) rather
+                # than restating it here with different wording, so the two don't
+                # drift out of sync.
+                hint = (
+                    "See the counted-loop index-table layout note in "
+                    "docs/source/compiler/working_set_reduction.md for the "
+                    "supported SpyreTensorLayout."
+                )
+                if step == 1:
+                    hint = (
+                        "A bare index read one element per trip can't be "
+                        "stick-aligned. If this operand's per-trip row is really "
+                        "just the next contiguous chunk, use Slice(dim, extent) "
+                        "instead of Gather so no index table is needed. "
+                    ) + hint
                 raise UnalignedStickSplit(
-                    idx_arg.arg_index, sym, int(step), elems_per_stick
+                    idx_arg.arg_index,
+                    sym,
+                    int(step),
+                    elems_per_stick,
+                    hint=hint,
                 )
 
     def create_op_spec(
@@ -1103,7 +1304,10 @@ class SpyreKernel(Kernel[CSEVariable]):
                     level_syms.append(self._get_or_mint_level_symbol(lvl, op_name))
                 tiled_syms_per_level_outermost.append(level_syms)
                 if lvl < len(loop_count):
-                    trip_count = int(loop_count[lvl])
+                    # Not int(): a symbolic count has no single value and int()
+                    # on one raises. What the SDSC needs here is the dimension's
+                    # largest extent. See max_trip_count.
+                    trip_count = max_trip_count(loop_count[lvl])
                     for sym in level_syms:
                         tiled_symbol_trip_counts[sym] = trip_count
             # Reverse so index 0 = innermost level.
@@ -1117,6 +1321,24 @@ class SpyreKernel(Kernel[CSEVariable]):
         for _, (size_expr, _) in it_space_extended.items():
             if not (hasattr(size_expr, "free_symbols") and size_expr.free_symbols):
                 continue
+            declared = declared_dims_in(size_expr)
+            if declared:
+                # A declared dimension reaches a kernel only as the trip count of
+                # a for_each_tile loop over it: the body is one static tile and
+                # the loop runs for the size the launch reads. An op whose own
+                # iteration space depends on it has no such loop, so it would be
+                # built at one size, right there and silently wrong at every
+                # other (#5937), or at the maximum and writing past an output
+                # allocated at the real size. Refuse instead.
+                raise Unsupported(
+                    f"{op} ({ir_node.get_operation_name()}): its iteration space "
+                    f"has size {size_expr}, which depends on the dimension(s) "
+                    f"{sorted(declared)} declared with "
+                    'tensor.to("spyre", dynamic=...), outside any for_each_tile '
+                    "loop. A declared dimension is consumed by a for_each_tile "
+                    "loop over it (dims=(d,), tile_size=granularity), whose body "
+                    "sees one tile and whose trip count is bound at launch."
+                )
             if finite_upper_or_none(size_expr) is None:
                 logger.debug(
                     f"[work_division/symbolic] skipping auto-dynamic symbol "
@@ -1475,8 +1697,30 @@ class SpyreKernel(Kernel[CSEVariable]):
 
     def wrap_op_specs_in_loop(self, count: sympy.Expr) -> None:
         """Replace the current op_specs list with a single LoopSpec of the given count."""
-        body = self.op_specs
-        self.op_specs = [LoopSpec(count=count, body=body)]
+        self.op_specs = [self.counted_loop(count, self.op_specs)]
+
+    @staticmethod
+    def counted_loop(count: sympy.Expr, body: list) -> LoopSpec:
+        """The one place a LoopSpec is built from a trip count.
+
+        The outermost loop (wrap_op_specs_in_loop) and every nested level (the
+        scheduler's _codegen_loop_body) both come through here, so each level's
+        per-symbol bounds are resolved exactly once, and at codegen time, the
+        last point the ShapeEnv is available.
+
+        The ShapeEnv's replacements are applied to the count here, once, so a
+        pair tied with ``torch._check(a == b)`` reaches the LoopSpec, its
+        bounds, its sources and the bundle as the one surviving symbol. A count
+        over a dimension nobody declared is refused here, the one place every
+        level passes (see ``require_declared_count``).
+        """
+        count = with_shape_env_replacements(count)
+        require_declared_count(count)
+        return LoopSpec(
+            count=count,
+            body=body,
+            count_symbol_bounds=symbolic_count_bounds(count),
+        )
 
     def check_op_specs(self) -> None:
         """Validate and log the finished operation sequence after loop wrapping."""
@@ -1489,6 +1733,80 @@ class SpyreKernel(Kernel[CSEVariable]):
                 format_op_spec_list(self.op_specs),
             )
 
+    def _logical_size_for(self, name: str) -> "list | None":
+        """The LOGICAL, PyTorch-visible size of a launch argument, or None.
+
+        Not the device geometry. Under a max-strided reservation the two differ
+        deliberately, and it is the logical size that varies per call, which is
+        what a loop bound has to track. Reading the device size here would make
+        every launch run the maximum number of trips while appearing to work.
+        """
+        node = getattr(V.graph, "graph_inputs", {}).get(name)
+        if node is None:
+            # The name may not be a buffer at all. try_get_buffer says so with
+            # None, where get_buffer raises.
+            node = V.graph.try_get_buffer(name)
+            if node is None:
+                return None
+        try:
+            return list(node.get_size())
+        except NotImplementedError:
+            # A nameless IRNode, e.g. a shape expression rather than a buffer.
+            return None
+
+    def _resolve_loop_dimension_sources(self, actuals: list[str]) -> None:
+        """Record which launch argument and dim each symbolic count reads from.
+
+        The bundle declares one ``input_arg`` per varying dimension and the
+        runtime fills it from ``inputs_outputs[arg_index].size(dim_index)`` on
+        every launch. Nothing downstream can work that mapping out: ``TensorArg``
+        carries device geometry rather than logical sizes, and by bundle
+        generation the FX graph is gone. Here both the argument ordering and the
+        buffer layouts are still live, and ``actuals`` is the same list
+        ``arg_index`` is assigned from just above, so the indices agree by
+        construction.
+
+        A symbol that cannot be placed is LEFT OUT rather than guessed, and
+        bundle generation then refuses to declare a parameter for it. That is the
+        right failure: a wrong ``(arg_index, dim_index)`` would bind the wrong
+        number and be silently wrong on every launch rather than once.
+
+        Matched by symbol NAME, because that is what survives the reload. See
+        pass_utils.decompose_tiled_count.
+        """
+        loops = [
+            loop for loop in walk_loop_specs(self.op_specs) if loop.count_symbol_bounds
+        ]
+        if not loops:
+            return
+
+        sizes = {name: self._logical_size_for(name) for name in actuals}
+        for loop in loops:
+            sources: dict[str, tuple[int, int]] = {}
+            for sym_name in loop.count_symbol_bounds:
+                placed = _place_symbol(sym_name, actuals, sizes)
+                if placed is None:
+                    logger.warning(
+                        "[symbolic-loop] could not place symbol %s on any launch "
+                        "argument, so the runtime has nothing to bind and the "
+                        "bundle will refuse to declare a parameter for it. "
+                        "Looked at %s",
+                        sym_name,
+                        {
+                            name: [str(e) for e in (size or [])]
+                            for name, size in sizes.items()
+                        },
+                    )
+                    continue
+                sources[sym_name] = placed
+            loop.count_symbol_sources = sources
+            if sources:
+                logger.info(
+                    "[symbolic-loop] count=%s reads its dimension(s) from %s",
+                    loop.count,
+                    {name: f"args[{a}].size({d})" for name, (a, d) in sources.items()},
+                )
+
     def codegen_kernel(self):
         """Bind the argument list and HBM addresses, then print the finalized OpSpecs.
 
@@ -1496,12 +1814,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         afterwards is bound here.
         """
 
-        def sympy_str(x: sympy.Expr) -> str:
-            if isinstance(x, IndirectAccess):
-                name_sym = x.args[0]
-                return f"IndirectAccess('{name_sym}')"
-            return "sympify('" + str(x) + "')"
-
+        sympy_str = _sympy_literal
         self.remove_kernel_local_buffers()
         # Compute live, deduped call-arg list from names in spyre_kernel_args.
         # python_argdefs() includes all registered names from load()/store(),
@@ -1535,6 +1848,8 @@ class SpyreKernel(Kernel[CSEVariable]):
                     if has_pool_allocations
                     else tensor_arg.arg_index
                 ]
+
+        self._resolve_loop_dimension_sources(actuals)
 
         buf = IndentedBuffer()
         buf.writeline("[")
@@ -1673,6 +1988,42 @@ def uses_hbm_pool(specs) -> bool:
     )
 
 
+def _place_symbol(sym_name: str, actuals: list[str], sizes: dict) -> "tuple | None":
+    """The first ``(arg_index, dim_index)`` whose extent is this symbol.
+
+    First rather than only: a dimension tied across two arguments is one symbol
+    and either position binds the same value, so the first is as good as any.
+    ``actuals`` order is what ``arg_index`` means, so it is iterated rather than
+    the dict.
+
+    Only an extent that IS the symbol matches. An argument whose dimension is a
+    derived expression such as ``2*s0`` carries the size, but the runtime reads
+    one dimension as is and cannot divide it back, so it is not a place to read
+    ``s0`` from. With no exact match this returns None and bundle generation
+    refuses the symbol, which is the safe failure.
+    """
+    for arg_index, name in enumerate(actuals):
+        for dim_index, extent in enumerate(sizes.get(name) or ()):
+            if str(extent) == sym_name:
+                return arg_index, dim_index
+    return None
+
+
+def _sympy_literal(x: sympy.Expr) -> str:
+    """One expression as a line of the generated kernel source.
+
+    Module level rather than a closure so a round-trip test can serialize
+    through the same function the real codegen uses. Note what this costs on the
+    way back: ``sympify`` re-parses ``//`` into ``floor`` and drops the symbol's
+    assumptions, so anything reading these back accepts both spellings and keys
+    by name. See pass_utils.decompose_tiled_count.
+    """
+    if isinstance(x, IndirectAccess):
+        name_sym = x.args[0]
+        return f"IndirectAccess('{name_sym}')"
+    return "sympify('" + str(x) + "')"
+
+
 def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
     """Emit Python source for a list of OpSpec / UnimplementedOp / LoopSpec entries."""
     for op_spec in specs:
@@ -1682,6 +2033,18 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
             buf.writeline("LoopSpec(")
             with buf.indent():
                 buf.writeline(f"count={sympy_str(op_spec.count)},")
+                # Plain ints keyed by name, so this survives the round trip that
+                # the count expression itself does not.
+                if op_spec.count_symbol_bounds:
+                    buf.writeline(
+                        "count_symbol_bounds="
+                        f"{_serialize_value(op_spec.count_symbol_bounds)},"
+                    )
+                if op_spec.count_symbol_sources:
+                    buf.writeline(
+                        "count_symbol_sources="
+                        f"{_serialize_value(op_spec.count_symbol_sources)},"
+                    )
                 buf.writeline("body=[")
                 with buf.indent():
                     _codegen_op_spec_list(op_spec.body, buf, sympy_str)
@@ -1690,7 +2053,7 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
         elif isinstance(op_spec, (UnimplementedOp, OpSpecUnimplementedOp)):
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(f"op_spec: UnimplementedOp({op_spec.op})")
-            buf.writeline(f"UnimplementedOp(op='{op_spec.op}')")
+            buf.writeline(f"UnimplementedOp(op='{op_spec.op}'),")
         else:
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
@@ -1786,6 +2149,11 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                                 buf.writeline("kernel_local=True,")
                             if arg.replicated_scalar:
                                 buf.writeline("replicated_scalar=True,")
+                            if arg.non_unified:
+                                buf.writeline(
+                                    "non_unified_shard_bytes="
+                                    f"{arg.non_unified_shard_bytes},"
+                                )
                             if arg.device_tile_advance_expr is not None:
                                 buf.writeline(
                                     "device_tile_advance_expr="

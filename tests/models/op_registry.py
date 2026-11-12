@@ -12,13 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
 
 from torch.testing._internal.opinfo.core import (  # noqa: F401
     SampleInput,
 )
+
+# Imported both as tests.models.op_registry (v1) and as top-level op_registry (v2).
+try:
+    from .op_numerics import assert_matmul_close, scaled_mm_reference
+except ImportError:
+    from op_numerics import assert_matmul_close, scaled_mm_reference  # type: ignore[no-redef]
 
 
 @dataclass(frozen=True)
@@ -36,12 +42,27 @@ class OpAdapter:
         fn: The actual callable to execute (e.g., torch.mul or a wrapper function)
         is_inplace: Whether this operation modifies tensors in-place
         pre: Optional preprocessing hook to normalize SampleInput before execution
+        arg_arrangements: Optional ElementArrangement name per positional arg
+            (input first) that the tensor must have on the device; None
+            entries, or args past the end, use the default placement
+        arg_host_dtypes: Optional dtype per positional arg (input first) the
+            tensor is cast to on the host before it is placed for the device
+            run; None entries, or args past the end, keep their dtype. The
+            reference still sees the original CPU tensor
+        reference: Optional CPU reference called with the CPU SampleInput in
+            place of fn; its result is what `compare` receives as reference
+        compare: Optional comparator(ref, got, *, case_name, description)
+            replacing the default atol/rtol comparison
     """
 
     name: str
     fn: Callable[..., Any]
     is_inplace: bool = False
     pre: Optional[Callable[[SampleInput], SampleInput]] = None
+    arg_arrangements: Optional[Tuple[Optional[str], ...]] = None
+    arg_host_dtypes: Optional[Tuple[Optional[torch.dtype], ...]] = None
+    reference: Optional[Callable[..., Any]] = None
+    compare: Optional[Callable[..., None]] = None
 
 
 # -----------------------------
@@ -280,6 +301,19 @@ def _aten_index(x, indices):
     return pkt(x, indices)
 
 
+def _scaled_mm_qfp8ch(mat1: torch.Tensor, mat2: torch.Tensor, **kwargs):
+    """aten._scaled_mm with mat1 quantized on the device, as the model does.
+
+    batchmatmulfp8 reads its activation in the element order qfp8ch writes,
+    which neither a STANDARD nor a QFP8CH host DMA reproduces. So mat1 comes
+    in as the FP16 image of the FP8 test input (FP8 -> FP16 is exact) and is
+    re-quantized here with a unit scale, which gives back the same FP8 values.
+    """
+    one = torch.ones(1, dtype=torch.float16, device=mat1.device)
+    mat1 = torch.ops.spyre.quantize_fp8_with_scale(mat1, one)
+    return torch.ops.aten._scaled_mm(mat1, mat2, **kwargs)
+
+
 def _scalar_tensor(val, *, dtype=None, device=None):
     # torch.scalar_tensor exists in recent versions
     return torch.scalar_tensor(val, dtype=dtype, device=device)
@@ -464,6 +498,16 @@ OP_REGISTRY: Dict[str, OpAdapter] = {
     "torch.clamp_": OpAdapter("torch.clamp_", _tensor_clamp_, is_inplace=True),
     "torch.Tensor.truediv": OpAdapter("torch.Tensor.truediv", _tensor_truediv),
     "torch._grouped_mm": OpAdapter("torch._grouped_mm", torch._grouped_mm),
+    # The model quantizes the activation in-graph (qfp8ch) and feeds a QFP8WT
+    # KERNEL weight; the device run reproduces both (see _scaled_mm_qfp8ch).
+    "torch.ops.aten._scaled_mm": OpAdapter(
+        "torch.ops.aten._scaled_mm",
+        _scaled_mm_qfp8ch,
+        arg_arrangements=(None, "QFP8WT"),
+        arg_host_dtypes=(torch.float16, None),
+        reference=scaled_mm_reference,
+        compare=assert_matmul_close,
+    ),
     "torch.ops.transformers.grouped_mm_fallback": OpAdapter(
         "torch.ops.transformers.grouped_mm_fallback", _grouped_mm_fallback
     ),

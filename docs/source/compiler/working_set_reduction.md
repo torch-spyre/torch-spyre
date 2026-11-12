@@ -82,11 +82,16 @@ def for_each_tile(
         operands: flat sequence of every input -- sliced, gathered and invariant.
         dims: per-operand tile spec as a tuple, or a single spec broadcast to all of
             them. ``int d`` slices the operand into ``tile_size``-wide contiguous views
-            along ``d``; ``None`` passes it whole every step; ``Gather(axis, index)``
-            takes one pool row per step.
-        tile_size: the tile's size along each tiled axis. The loop's trip count is
-            derived: ``shape[dim] // tile_size`` per sliced operand, ``len(index)`` per
-            gathered one. All of them must agree.
+            along ``d``, ``tile_size`` shared by every such entry; ``None`` passes it
+            whole every step; ``Gather(axis, index)`` takes one pool row per step;
+            ``Slice(dim, extent)`` is the same contiguous slicing as ``int d``, but
+            with its own ``extent`` instead of sharing ``tile_size`` -- for an operand
+            that needs a different per-trip width than the rest, e.g. one row of a
+            per-step scale/lookup table alongside operands tiled much wider.
+        tile_size: the tile's size along each tiled axis for every plain ``int d`` dims
+            entry. The loop's trip count is derived: ``shape[dim] // tile_size`` per
+            such sliced operand, ``shape[dim] // extent`` per ``Slice``, ``len(index)``
+            per gathered one. All of them must agree.
         init: carry init (tensor or pytree of tensors); ``None`` means no carry.
         out_dim: ``int d`` lays step ``i``'s tile at ``narrow(d, i*extent, extent)``
             of each returned output leaf. Tiles may be a tensor or a pytree of
@@ -100,12 +105,22 @@ def for_each_tile(
 
 `dims=`/`tile_size=` directly describe the tiling of the arguments passed to
 `for_each_tile` itself, and the trip count is derived from the operand
-shapes rather than supplied by hand. Three kinds of operand are supported
+shapes rather than supplied by hand. Four kinds of operand are supported
 per the `dims` entry:
 
 - **Sliced** (`dims[i]` is an `int`): the operand is cut into `tile_size`-wide
   contiguous views along that dimension; step `i` sees
-  `narrow(dim, i * tile_size, tile_size)`.
+  `narrow(dim, i * tile_size, tile_size)`. `tile_size` is shared by every
+  `int` entry in the same call.
+- **Sliced, own extent** (`dims[i]` is a `Slice(dim, extent)`): the same
+  contiguous narrowing as the plain-`int` form, but with its own `extent`
+  instead of sharing `tile_size` -- for an operand that needs a narrower (or
+  wider) per-trip view than the rest, e.g. one row of a per-step scale table
+  alongside operands tiled much wider. A bare `Gather` index cannot be
+  stepped per-trip on Spyre outside a nested `for_each_tile` (see
+  `SpyreKernel._check_indirect_index_step` below); `Slice` sidesteps that
+  entirely for an operand whose per-trip selection is just "the next
+  `extent`-wide chunk," with no index tensor needed at all.
 - **Invariant** (`dims[i]` is `None`): the operand is passed whole, unchanged,
   every step.
 - **Gathered** (`dims[i]` is a `Gather(axis, index)`): step `i` sees one row
@@ -142,8 +157,19 @@ the row's sticks and is unsupported when both outer axes have extent greater
 than one. `SpyreKernel._check_indirect_index_step` rejects this layout during
 code generation; it previously could produce incorrect rows without an error.
 
+An accumulator carry is declared, not rewritten, by `splice_while_loop`: a
+`LoopCarryRecord` on the carry's storage (its initial buffer, or the pre-loop
+copy of it when the initial buffer is not private to the loop) and on its
+update names both, and the spliced body stays pure, with the loop's result the
+update's own buffer. The `apply_loop_carries` pass, which runs just before
+layout propagation, then makes the update an in-place write of the storage and
+sends every reader of the update to the storage, so every later pass sees the
+carry in place. Until then, `deadcode_elimination` judges a declared update
+like the mutation it will become: it is live while its storage is.
+
 Partial scatter carries deliberately have no `LoopCarryRecord`: that record
-opts full-buffer accumulators into LX residency. Scatter destinations remain
+opts full-buffer accumulators into LX residency. Their write is made in place
+at the splice. Scatter destinations remain
 in HBM, with mutation dependencies preserving their lifetime across iterations,
 including when `LX_PLANNING=1` and `HBM_POOL_PLANNING=1`.
 

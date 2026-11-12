@@ -91,6 +91,23 @@ def cached_randn(
 
 
 @functools.lru_cache(maxsize=None)
+def cached_randint(
+    shape,
+    differentiation=None,
+    low=0,
+    high=512,
+    dtype=torch.int32,
+):
+    """Return a cached integer tensor with the given shape and dtype.
+
+    Uses a stable seed derived from the arguments so results are identical
+    across processes regardless of PYTHONHASHSEED.
+    """
+    gen = _make_generator(shape, differentiation, low, high, dtype)
+    return torch.randint(low, high, shape, dtype=dtype, generator=gen)
+
+
+@functools.lru_cache(maxsize=None)
 def cached_xavier(
     shape,
     differentiation=None,
@@ -461,6 +478,13 @@ def make_param_dict(cases, rand_type="randn"):
     }
 
 
+def _safe_test_name(name: str) -> str:
+    # PyTorch >= 2.14 rejects generated test names containing "." (pytorch#192648),
+    # since unittest.TestLoader.loadTestsFromName splits on it. Param keys built
+    # from floats (e.g. "alpha_0.5") are spelled with "p" instead ("alpha_0p5").
+    return name.replace(".", "p")
+
+
 # ParameterizedTestMeta injects parameterized test methods
 # based on PARAMS of the subclass.
 # The metaclass looks through the keys in the PARAMS dict,
@@ -509,6 +533,8 @@ def make_param_dict(cases, rand_type="randn"):
 # - If parameterization is not needed for a concrete test case,
 #   simply implement it in TestOps without adding an item
 #   to PARAMS. It will be executed by unittests.
+# - Any "." in a materialized name is replaced with "p"
+#   (e.g. "alpha_0.5" -> "alpha_0p5"); see _safe_test_name.
 def _generated_names(cases):
     """The case names one PARAMS item can be addressed by: ``case`` or ``op_case``."""
     ops = cases.get("ops_dict") or {}
@@ -648,7 +674,9 @@ class ParameterizedTestMeta(type):
                                 )
                             return test
 
-                        test_name = f"{test_name_prefix}_{op_name}_{test_case}"
+                        test_name = _safe_test_name(
+                            f"{test_name_prefix}_{op_name}_{test_case}"
+                        )
                         assert test_name not in namespace, (
                             f"Test name conflict: {test_name}"
                         )
@@ -725,7 +753,7 @@ class ParameterizedTestMeta(type):
                             )
                         return test
 
-                    test_name = f"{test_name_prefix}_{test_case}"
+                    test_name = _safe_test_name(f"{test_name_prefix}_{test_case}")
                     assert test_name not in namespace, (
                         f"Test name conflict: {test_name}"
                     )
@@ -806,7 +834,7 @@ def _compile_and_run(
     if compile:
         comp_func = torch.compile(fn, backend=backend)
 
-        if source_check is not None and device == "spyre":
+        if source_check is not None and device.type == "spyre":
             result, source_codes = run_and_get_code(
                 comp_func, *device_args, **device_kwargs
             )
@@ -1050,8 +1078,8 @@ def capture_backend_output_dirs():
     output_dirs = []
     get_output_dir = async_compile_module.get_output_dir
 
-    def capture(kernel_name):
-        output_dir = get_output_dir(kernel_name)
+    def capture(kernel_name, sdsc_bundle_dir_prefix=None):
+        output_dir = get_output_dir(kernel_name, sdsc_bundle_dir_prefix)
         output_dirs.append(Path(output_dir))
         return output_dir
 

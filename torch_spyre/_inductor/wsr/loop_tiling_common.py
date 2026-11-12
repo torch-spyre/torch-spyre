@@ -29,12 +29,13 @@ from sympy import Expr
 
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ops_handler import WrapperHandler
-from torch._inductor.utils import sympy_index_symbol, sympy_subs
+from torch._inductor.utils import sympy_index_symbol
 from torch._inductor.ir import (
     ComputedBuffer,
     FixedLayout,
     Layout,
     Loops,
+    MutationLayoutSHOULDREMOVE,
     Operation,
     Pointwise,
     Reduction,
@@ -128,6 +129,51 @@ def _clear_cache(obj: object, key: str) -> None:
         object.__delattr__(obj, key)
 
 
+class _ReadThroughLayout:
+    """Trace a consumer against the buffer it reads, not the producer's tile.
+
+    A consumer's ``inner_fn`` holds the loader Inductor bound to the producer
+    at lowering, and that loader rebuilds its indexer from the producer's
+    layout at every trace (``Buffer.make_loader``). After ``_divide_ranges``
+    that layout is the tile's, so a consumer in another loop nest, which reads
+    the producer's full buffer in HBM, would derive its index from a shape it
+    never reads: a dim the tile consumed whole has size 1 there and gets no
+    term at all (``_fixed_indexer``). For the duration of the trace, make the
+    producer's layout describe ``read`` instead, so the index comes out as if
+    the consumer had been lowered against that buffer.
+
+    The host fields are swapped on the shared layout object itself: a
+    consumer's loader may hold an earlier ``ComputedBuffer`` object for the
+    producer, and every such object shares this layout
+    (``replace_computed_buffer_body`` passes ``layout=op.layout``), exactly as
+    ``_divide_ranges`` relies on when it shrinks it in place. The device
+    layout is not touched: codegen resolves it by the name the load carries.
+    """
+
+    def __init__(self, layout: Layout, read: Layout):
+        if isinstance(layout, MutationLayoutSHOULDREMOVE):
+            # Readers of a mutation target hold the target's own layout.
+            layout = layout.real_layout()
+        self._layout = layout
+        self._read = read
+        self._saved: tuple[list[Expr], list[Expr], Expr] | None = None
+
+    def __enter__(self) -> None:
+        layout = self._layout
+        self._saved = (list(layout.size), list(layout.stride), layout.offset)
+        layout.size = list(self._read.size)
+        layout.stride = list(self._read.stride)
+        layout.offset = self._read.offset
+        _clear_cache(layout, _LAYOUT_FREE_SYMS_KEY)
+
+    def __exit__(self, *exc: object) -> None:
+        assert self._saved is not None
+        layout = self._layout
+        layout.size, layout.stride, layout.offset = self._saved
+        self._saved = None
+        _clear_cache(layout, _LAYOUT_FREE_SYMS_KEY)
+
+
 def _raw_to_squeezed_pos(ir_node: ComputedBuffer) -> dict[int, int]:
     """Map ir_node's raw host-range positions to their squeezed d{i} number.
 
@@ -212,9 +258,9 @@ def _stick_host_dim(op: ComputedBuffer, device_layout) -> int | None:
     """Authoritative stick host-dim index for ``op``'s output, recovered from
     coordinate identity (issue #3116).
 
-    ``SpyreTensorLayout`` discards its ``dim_map`` at construction, so the
-    host<->device dim identity is not carried on the layout object.  We recover
-    only the stick host dim: the device layout's inner-stick coordinate has a
+    A ``SpyreTensorLayout`` does not record which host dim each device dim came
+    from, so the host<->device dim identity is not carried on the layout object.
+    We recover only the stick host dim: the device layout's inner-stick coordinate has a
     single iteration symbol that also drives exactly one host coordinate, so
     ``matching_dim`` resolves it unambiguously — even when two host dims share a
     size (transposed flash-attn QK^T with ``Sq == Skv``), which defeats the
@@ -977,9 +1023,13 @@ class _NameSwapHandler(WrapperHandler):
         self,
         inner,
         name_map: dict[str, tuple[str, list[Expr], list[Expr]]],
+        loop_terms: dict[str, Expr] | None = None,
     ):
         super().__init__(inner)
         self._name_map = name_map
+        # swapped name -> a loop term added to the rescaled index of a load that
+        # was swapped. A load of the new name that was NOT swapped is left alone.
+        self._loop_terms = loop_terms or {}
 
     def load(self, name, index):
         if name in self._name_map:
@@ -987,29 +1037,40 @@ class _NameSwapHandler(WrapperHandler):
             new_index = _rescale_index(
                 index, full_strides, tile_strides, strip_constant=True
             )
+            if name in self._loop_terms:
+                new_index = new_index + self._loop_terms[name]
             return super().load(new_name, new_index)
         return super().load(name, index)
 
 
-class _LoopVarRebaseHandler(WrapperHandler):
-    """Pin one advancing source load to its iteration-zero base address.
+class _AddLoopTermHandler(WrapperHandler):
+    """Add a loop term to the index of every load of one buffer.
 
-    A spliced ``for_each_tile`` body carries its induction variable directly
-    in graph-input load indexes.  A staged copy removes that term and
-    represents it through ``device_tile_advance_expr`` instead.  A direct
-    read restored after planning must use the same single representation;
-    otherwise the offset is applied twice and the raw unbacked symbol leaks
-    into the OpSpec coordinates.
+    The direct read that replaces a staged copy reads the copy's source buffer.
+    The copy's own read of that source carries the loop's advance as a term in
+    its index (``step * u``); the swapped-in read must carry the same term, or
+    the index and the stored per-trip step disagree. The term is taken from the
+    copy's index (``loop_term``), not from the record.
+
+    The consumer lists the loop variable in its ``dim_hints``, so
+    ``pass_utils.per_trip_index`` pins it in the base coordinates and it does not
+    reach ``device_coordinates``.
+
+    This adds the term to EVERY load of ``source_name``, so it is for a body that
+    loads it exactly once: the staged copy, which is a pure identity
+    (``identity_load`` requires one load). A consumer body that may load the same
+    buffer on its own uses ``_NameSwapHandler(loop_terms=...)`` instead, which adds
+    the term only to the loads that were swapped.
     """
 
-    def __init__(self, inner, source_name: str, loop_var_zeros: dict[Expr, Expr]):
+    def __init__(self, inner, source_name: str, loop_term: Expr):
         super().__init__(inner)
         self._source_name = source_name
-        self._loop_var_zeros = loop_var_zeros
+        self._loop_term = loop_term
 
     def load(self, name, index):
         if name == self._source_name:
-            index = sympy_subs(index, self._loop_var_zeros)
+            index = index + self._loop_term
         return super().load(name, index)
 
 

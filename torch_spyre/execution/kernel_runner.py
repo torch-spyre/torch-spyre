@@ -35,6 +35,38 @@ from torch_spyre.profiler._ffdc import (
 logger = get_inductor_logger("kernel_runner")
 
 
+def _symbolic_arg(sk: SymbolKind, arg_offset: int) -> SymbolicArg:
+    """The launch-time resolution of one bundle input_arg."""
+    if sk.is_shard_kernel:
+        # Core sk.core_idx's own shard of a sharded tensor (non-unified HBM).
+        return SymbolicArg(
+            kind=SymbolicArgKind.kShardAddress,
+            tensor_id=sk.arg_index + arg_offset,
+            dim_index=sk.core_idx,
+            value=sk.offset,
+            num_shards=sk.split_count,
+        )
+    if sk.is_loop_dimension:
+        # The varying dimension behind a symbolic loop bound. The descriptor
+        # stays invariant across launches; what varies is the value read through
+        # it, which is the tensor's LOGICAL size along that dim. Under a
+        # max-strided reservation (#5179) that is deliberately smaller than the
+        # allocated extent, and reading the allocated one would run the maximum
+        # number of trips on every call while appearing to work. The declared
+        # contract rides along so the launch can refuse a size the bundle was
+        # not built for.
+        return SymbolicArg(
+            kind=SymbolicArgKind.kDimension,
+            tensor_id=sk.arg_index + arg_offset,
+            dim_index=sk.dim_index,
+            granularity=sk.granularity,
+            max_value=sk.max_value,
+        )
+    return SymbolicArg(
+        kind=SymbolicArgKind.kAddress, tensor_id=sk.arg_index + arg_offset
+    )
+
+
 class SpyreUnimplementedRunner:
     def __init__(self, name: str, op: str):
         self.kernel_name = name
@@ -88,6 +120,7 @@ class SpyreSDSCKernelRunner:
         code_dir: str,
         kernel_provenance: KernelProvenanceDescriptor | None = None,
         symbol_kinds: list[SymbolKind] | None = None,
+        sdsc_bundle_dir_prefix: str | None = None,
     ):
         self.kernel_name = name
         self.code_dir = code_dir
@@ -97,6 +130,7 @@ class SpyreSDSCKernelRunner:
             symbol_kinds if symbol_kinds is not None else []
         )
         self.profiler_event_name: str | None
+        self.sdsc_bundle_dir_prefix = sdsc_bundle_dir_prefix or ""
         self._jobplan = None  # initialised lazily, not pickled
 
         if kernel_provenance is None:
@@ -125,21 +159,10 @@ class SpyreSDSCKernelRunner:
                 # tensors only, so add 1 to account for the pool.
                 self._symbolic_args: list[SymbolicArg] | None = (
                     [SymbolicArg(kind=SymbolicArgKind.kAddress, tensor_id=0)]
-                ) + (
-                    [
-                        SymbolicArg(
-                            kind=SymbolicArgKind.kAddress,
-                            tensor_id=sk.arg_index + 1,
-                        )
-                        for sk in self.symbol_kinds[1:]
-                    ]
-                )
+                ) + ([_symbolic_arg(sk, 1) for sk in self.symbol_kinds[1:]])
             else:
                 # No pool param — arg_index maps directly to args position.
-                self._symbolic_args = [
-                    SymbolicArg(kind=SymbolicArgKind.kAddress, tensor_id=sk.arg_index)
-                    for sk in self.symbol_kinds
-                ]
+                self._symbolic_args = [_symbolic_arg(sk, 0) for sk in self.symbol_kinds]
         else:
             self._symbolic_args = None
 
@@ -153,15 +176,17 @@ class SpyreSDSCKernelRunner:
             # prepare_kernel(), which calls into JobPlanBuilder/getDefaultStream().
             torch.spyre._impl._lazy_init()
             spyrecode_dir = self.code_dir + "/spyreCodeDir"
-            if self.profiler_event_name is None:
-                self._jobplan = prepare_kernel(spyrecode_dir)
-            else:
-                with torch.profiler.record_function(
-                    f"prepare_kernel:{self.kernel_name}"
-                ):
+            with torch.profiler.record_function(f"prepare_kernel:{self.kernel_name}"):
+                if self.profiler_event_name is None:
                     self._jobplan = prepare_kernel(
                         spyrecode_dir,
-                        profiler_name=self.profiler_event_name,
+                        sdsc_bundle_dir_prefix=self.sdsc_bundle_dir_prefix,
+                    )
+                else:
+                    self._jobplan = prepare_kernel(
+                        spyrecode_dir,
+                        profiler_event_name=self.profiler_event_name,
+                        sdsc_bundle_dir_prefix=self.sdsc_bundle_dir_prefix,
                     )
         return self._jobplan
 

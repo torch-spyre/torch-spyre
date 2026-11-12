@@ -64,6 +64,7 @@ from spyre_clickhouse_ingest import (
     source_and_external_run_id,
     tables_present,
 )
+from spyre_clickhouse_ingest.batching import insert_chunks
 from spyre_clickhouse_ingest.junit import _runner_run_id, _threaded_run_id
 from spyre_clickhouse_ingest.offline import add_offline_options
 from spyre_clickhouse_ingest.offline import main as offline_main
@@ -1264,10 +1265,18 @@ def insert_run(client, run_id: str, run: dict, args):
     )
 
 
+def _count_rows(client, sql: str, params: dict) -> int:
+    """Row count for a v1 insert's scope. Another writer sharing the scope makes a failed
+    batch look kept, which fails safe as BatchAmbiguous; case ids cannot narrow it (fresh
+    uuids, and a 35k-id list exceeds http_max_field_value_size)."""
+    return int(client.query(sql, parameters=params).result_rows[0][0])
+
+
 def insert_cases(client, run_id: str, cases: list[dict], workflow: str = ""):
     if not cases:
         return
-    client.insert(
+    insert_chunks(
+        client,
         "test_cases",
         [
             [
@@ -1298,6 +1307,11 @@ def insert_cases(client, run_id: str, cases: list[dict], workflow: str = ""):
             "triggered_at",
             "workflow",
         ],
+        already_landed=lambda: _count_rows(
+            client,
+            "SELECT count() FROM test_cases WHERE run_id = {r:String} AND workflow = {w:String}",
+            {"r": run_id, "w": workflow},
+        ),
     )
 
 
@@ -1314,7 +1328,8 @@ def insert_properties(client, run_id: str, cases: list[dict]):
         for pname, pvalue in c["properties"]
     ]
     if rows:
-        client.insert(
+        insert_chunks(
+            client,
             "run_properties",
             [
                 [
@@ -1333,6 +1348,11 @@ def insert_properties(client, run_id: str, cases: list[dict]):
                 "prop_value",
                 "triggered_at",
             ],
+            already_landed=lambda: _count_rows(
+                client,
+                "SELECT count() FROM run_properties WHERE run_id = {r:String}",
+                {"r": run_id},
+            ),
         )
 
 
@@ -1758,6 +1778,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="artifact_results prop k=v, repeatable; `source` replaces the jenkins/gha default",
     )
     parser.add_argument(
+        "--case-prop",
+        dest="case_props",
+        action="append",
+        type=pair,
+        default=[],
+        help="test_case_runs prop k=v added to every case row, repeatable (not part of any id)",
+    )
+    parser.add_argument(
         "--strict",
         action="store_true",
         help="exit 1 when --artifact/--artifact-id named an artifact but its verdicts were not "
@@ -1833,6 +1861,7 @@ def main(argv=None):
         or args.vllm_results_dir
         or args.sendnn_report
         or args.benchmarks_dir
+        or args.tables_dir
     ):
         return _ingest_kind(argv, args)
     args.arch = args.arch or _platform.machine() or ""
@@ -2221,6 +2250,7 @@ def main(argv=None):
                             xml_path.name,
                             attempt=args.run_attempt,
                             arch=args.platform or run["platform"],
+                            row_props=dict(_opt(args, "case_props") or []),
                         )
                         print(f"  v2: {_n} test_case_runs under run_id={_v2_run_id}")
 
