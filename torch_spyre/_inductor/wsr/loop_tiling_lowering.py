@@ -39,6 +39,7 @@ from torch._inductor.ir import (
     MutationLayoutSHOULDREMOVE,
     Operation,
     Pointwise,
+    Reduction,
     StorageBox,
     TensorBox,
 )
@@ -219,7 +220,11 @@ def _extent(op: ComputedBuffer, position: int, trip: sympy.Integer) -> sympy.Int
 
 
 def _tile_step(
-    op: ComputedBuffer, position: int, dep: MemoryDep, extent: sympy.Integer
+    graph: Any,
+    op: ComputedBuffer,
+    position: int,
+    dep: MemoryDep,
+    extent: sympy.Integer,
 ) -> sympy.Expr:
     """The host advance of one access per trip: the coefficient of the tiled dim's
     index symbol times the tile extent, read from the access BEFORE the divide. A
@@ -231,7 +236,28 @@ def _tile_step(
     symbol = SpyreKernel._host_dim_to_index_symbol(op, position)
     if symbol not in dep.index.free_symbols:
         return sympy.S.Zero
+    _require_plain_view(graph, op, position, symbol, dep)
     return access_step(dep.index, symbol, extent, sympy.S.Zero)
+
+
+def _require_plain_view(
+    graph: Any, op: ComputedBuffer, position: int, symbol: sympy.Symbol, dep: MemoryDep
+) -> None:
+    """Refuse a read of a buffer of the op's own rank through a view that reorders or
+    strides the tiled dim: the op's dim ``position`` is then another dim of the
+    buffer, and the plan models no such view. A buffer of another rank (a
+    broadcast, a matmul operand) is read through its index as it is."""
+    buffer = graph.get_buffer(dep.name)
+    if len(buffer.get_size()) != len(op.data.ranges):
+        return
+    stride = sympy.sympify(buffer.get_stride()[position])
+    coefficient = dep.index.coeff(symbol)
+    if coefficient != stride:
+        raise Unsupported(
+            f"lower_loop_tiling: {op.get_operation_name()} reads {dep.name} through "
+            f"a view that reorders or strides its dims (dim {position}: index step "
+            f"{coefficient}, buffer stride {stride})."
+        )
 
 
 @dataclass
@@ -251,6 +277,7 @@ class _Facts:
 
 
 def _facts(
+    graph: Any,
     group: LoopTilingGroup,
     members: list[ComputedBuffer],
     operations: list[Operation],
@@ -271,7 +298,9 @@ def _facts(
     for member in members:
         name = member.get_operation_name()
         tiled = tiling[name]
-        if not isinstance(member.data, Pointwise) or (tiled and tiled.in_reduction):
+        if not isinstance(member.data, (Pointwise, Reduction)) or (
+            tiled and tiled.in_reduction
+        ):
             raise Unsupported(
                 f"lower_loop_tiling: {name} ({type(member.data).__name__}"
                 f"{', reduction dim' if tiled and tiled.in_reduction else ''}) is "
@@ -307,7 +336,7 @@ def _facts(
                 step = (
                     sympy.S.Zero
                     if dep.name in scratch_names
-                    else _tile_step(member, tiled.position, dep, extent)
+                    else _tile_step(graph, member, tiled.position, dep, extent)
                 )
                 if read_steps.setdefault(dep.name, step) != step:
                     raise Unsupported(
@@ -318,7 +347,9 @@ def _facts(
             if kind == "copy_out":
                 if not writes:
                     raise Unsupported(f"lower_loop_tiling: {name} has no write.")
-                write_step = _tile_step(member, tiled.position, writes[0], extent)
+                write_step = _tile_step(
+                    graph, member, tiled.position, writes[0], extent
+                )
                 if write_step == 0:
                     raise Unsupported(
                         f"lower_loop_tiling: the tiled dim of {name} is not in "
@@ -406,7 +437,7 @@ def _lower_group(graph: Any, group: LoopTilingGroup, induction: sympy.Symbol) ->
         {op.get_operation_name(): i for i, op in enumerate(operations)},
         (group.index,),
     )
-    facts = _facts(group, members, operations)
+    facts = _facts(graph, group, members, operations)
 
     # Divide the tiled ops and stamp the shim on every member.
     retiled: dict[str, _RetiledBufferInfo] = {}
