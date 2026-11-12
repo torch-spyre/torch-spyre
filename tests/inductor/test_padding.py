@@ -437,9 +437,9 @@ class TestDomainRangeSolver(unittest.TestCase):
         self.assertSetEqual(self.s.to_dtype(FiniteSet(3), torch.float32), FiniteSet(3))
 
     def test_unknown_op_returns_user_values(self) -> None:
-        with patch("torch_spyre._inductor.padding.padding_strict_mode", False):
+        with patch("torch_spyre._inductor.config.padding_strict_mode", False):
             self.assertSetEqual(self.s._default("foo", (FiniteSet(0),), {}), S.Reals)
-        with patch("torch_spyre._inductor.padding.padding_strict_mode", True):
+        with patch("torch_spyre._inductor.config.padding_strict_mode", True):
             self.assertTrue(self.s._default("foo", (FiniteSet(0),), {}).has(_NAN))
 
     # -- domain checks ----------------------------------------------------------
@@ -451,7 +451,7 @@ class TestDomainRangeSolver(unittest.TestCase):
         self.assertRaisesDomain(self.s.rsqrt, zero, func="rsqrt")
         self.assertRaisesDomain(self.s.reciprocal, zero, func="reciprocal")
         self.assertRaisesDomain(
-            self.s.sqrt, FiniteSet(-1), func="rsqrt", domain=_NON_NEG
+            self.s.sqrt, FiniteSet(-1), func="sqrt", domain=_NON_NEG
         )
         # truediv blames the divisor and uses the realdiv mask key.
         self.assertRaisesDomain(
@@ -563,7 +563,7 @@ class TestDomainRangeSolverNaN(unittest.TestCase):
         TestDomainRangeSolver.assertSetEqual(self, actual, expected)
 
     def test_strict_mode_user_values_hold_nan(self) -> None:
-        with patch("torch_spyre._inductor.padding.padding_strict_mode", True):
+        with patch("torch_spyre._inductor.config.padding_strict_mode", True):
             values = padding._user_values()
         self.assertTrue(values.has(_NAN))
         self.assertTrue(values.is_superset(S.Reals))
