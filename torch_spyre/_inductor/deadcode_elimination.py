@@ -20,6 +20,7 @@ from torch._inductor.ir import (
 )
 from torch._inductor.graph import GraphLowering
 
+from .loop_info import LoopCarryRecord
 from .loop_node import LoopNode, all_ops
 
 
@@ -81,11 +82,23 @@ def _walk_once(
 
 
 def _mutation_target(op: Operation) -> str | None:
-    """The buffer a ``MutationLayoutSHOULDREMOVE`` op writes into, else None."""
-    if isinstance(op, ComputedBuffer) and isinstance(
-        op.layout, MutationLayoutSHOULDREMOVE
-    ):
+    """The buffer ``op`` writes into in place, else None.
+
+    That is a ``MutationLayoutSHOULDREMOVE`` op's target, or the declared
+    storage of a loop-carry update still in its pure form: between the splice
+    and ``loop_carries.apply_loop_carries`` the update writes its own buffer,
+    but its ``LoopCarryRecord`` says it will write the storage, and its value
+    reaches the next trip only through that write. Judging it as the mutation
+    it is about to become keeps a carry whose result nobody reads after the
+    loop, exactly as when the splice made the write in place itself.
+    """
+    if not isinstance(op, ComputedBuffer):
+        return None
+    if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
         return op.layout.get_buffer().get_name()
+    record = getattr(op, "_loop_carry_record", None)
+    if isinstance(record, LoopCarryRecord) and record.update_name == op.get_name():
+        return record.storage_name
     return None
 
 

@@ -19,6 +19,8 @@
 #include <ATen/ATen.h>
 #include <c10/util/intrusive_ptr.h>
 
+#include <flex/flex.hpp>
+
 #include "module.h"
 
 namespace spyre {
@@ -31,6 +33,10 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
 
 at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
                            bool non_blocking);
+
+void copy_kv_page_raw(const at::Tensor& cache, size_t block_id,
+                      const flex::SharedPool& pool, size_t slot_id,
+                      bool to_device);
 
 /**
  * Uses flex::RuntimeStream::fillAsync() to perform the fill entirely
@@ -48,6 +54,29 @@ at::Tensor spyre_empty_with_layout(
     c10::IntArrayRef size, c10::IntArrayRef stride, c10::ScalarType dtype,
     SpyreTensorLayout device_layout,
     std::optional<c10::Device> device_opt = std::nullopt);
+
+/**
+ * Allocate a Spyre tensor whose logical size/stride are `size`/`stride`
+ * (i.e. what PyTorch sees) but whose physical layout and storage are sized
+ * as if dimension `dim` were `max_size`. Only `dim == 0` is supported (and
+ * never the innermost/stick dimension): padding any other dimension changes
+ * the host stride of the dimensions outside it. This lets a single allocation
+ * absorb any later in-place resize of `dim` up to `max_size` (see
+ * spyre_resize_) without reallocating or changing the SpyreTensorLayout
+ * that recompile guards compare against. `min_size`/`granularity` are
+ * stored on the resulting tensor (SpyreTensorImpl::reserved_dims) for the
+ * runtime guard to check on every later resize_; they do not affect the
+ * allocation itself, which is always sized for `max_size`. They are also
+ * validated at this boundary (range, positivity, `max_size % granularity
+ * == 0`), so this function does not purely trust its caller even though
+ * Python's `dynamic=` parsing re-checks the same rules for a better
+ * message. Backs `tensor.to("spyre", dynamic={dim: {min, max,
+ * granularity}})`.
+ */
+at::Tensor spyre_empty_reserved(c10::IntArrayRef size, c10::IntArrayRef stride,
+                                c10::ScalarType dtype, int64_t dim,
+                                int64_t min_size, int64_t max_size,
+                                int64_t granularity);
 
 at::Tensor empty_with_layout(
     c10::IntArrayRef size, SpyreTensorLayout device_layout,

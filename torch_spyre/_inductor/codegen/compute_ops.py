@@ -24,6 +24,7 @@ from torch_spyre._inductor.constants import (
     DEPTHWISE_CONV2D_OP,
     DLFLOAT16_MAX,
     FP8_2D_STICK_OPS,
+    POOL_OPS,
 )
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.sharded_hbm import verify_non_unified_split
@@ -35,7 +36,7 @@ from torch_spyre._inductor.pass_utils import coeff_through_floor
 class SymbolKind:
     """Classifies a symbol registered in the bundle symbol table.
 
-    Five variants (constructed via class methods):
+    Six variants (constructed via class methods):
       - ``kernel(arg_index)``:               raw HBM base address of a kernel tensor arg;
                                              emitted as a ``!sdscbundle.input_arg`` param
                                              named ``%arg_{arg_index}``.  Value =
@@ -94,6 +95,10 @@ class SymbolKind:
                                              ``dimToSymbolMapping_`` entry.  Registered
                                              before address symbols so their negative IDs
                                              never collide with address symbol IDs.
+      - ``loop_dimension(...)``:             a bundle loop bound, read from a launch
+                                             tensor's shape.  Never reaches an SDSC.
+                                             Distinct from ``dimension`` on purpose, see
+                                             its own docstring.
     """
 
     kind: str
@@ -106,6 +111,9 @@ class SymbolKind:
     # Only meaningful for the kernel_derived_symbolic variant.
     core_idx: int = -1
     split_count: int = 0
+    # Only meaningful for the loop_dimension variant: which dim of which launch
+    # tensor the runtime reads this symbol's value from.
+    dim_index: int = -1
 
     @classmethod
     def kernel(cls, arg_index: int) -> "SymbolKind":
@@ -186,6 +194,40 @@ class SymbolKind:
             pytorch_sym=pytorch_sym,
         )
 
+    @classmethod
+    def loop_dimension(
+        cls,
+        granularity: int,
+        max_value: int,
+        pytorch_sym: str,
+        arg_index: int,
+        dim_index: int,
+    ) -> "SymbolKind":
+        """A bundle-level loop bound, read from a launch tensor's shape.
+
+        Deliberately a different variant from ``dimension``. That one lives in an
+        SDSC's ``dimToSymbolMapping_``, the symbolic-SDSC route where the symbol
+        stays inside one op's iteration space. This one never reaches an SDSC at
+        all: the loop is explicit, the body is a static tile, and the dimension
+        exists only as a bundle parameter whose value the runtime reads from
+        ``inputs_outputs[arg_index].size(dim_index)`` on every launch, via
+        ``SymbolicArgKind::kDimension``.
+
+        ``is_dimension`` stays False for this variant on purpose. The guard in
+        ``execution/async_compile`` refuses SDSC dimension symbols because that
+        route's runtime payload was never built, and a bundle carrying one would
+        reach the backend with a mismatched ``inputSym_`` slot count. That guard
+        should keep refusing the old route, and should not refuse this one.
+        """
+        return cls(
+            kind="loop_dimension",
+            granularity=granularity,
+            max_value=max_value,
+            pytorch_sym=pytorch_sym,
+            arg_index=arg_index,
+            dim_index=dim_index,
+        )
+
     @property
     def is_derived(self) -> bool:
         return self.kind == "kernel_derived"
@@ -204,7 +246,13 @@ class SymbolKind:
 
     @property
     def is_dimension(self) -> bool:
+        # The old symbolic-SDSC route only. See loop_dimension for why this must
+        # not also answer True for a loop bound.
         return self.kind == "dimension"
+
+    @property
+    def is_loop_dimension(self) -> bool:
+        return self.kind == "loop_dimension"
 
 
 def core_idx_to_slice_offset(
@@ -1360,16 +1408,36 @@ def generate_sdsc(
         each core.  Dividing the *total* padded input span by the core count
         instead (the plain path) undercounts for an overlapping window
         (stride < kernel): e.g. in=8, cores=6 gives 1 < kernel, so the ki loop
-        has nothing to distribute.  Conv-only: avgpool keeps the plain path (for
-        its non-overlapping stride==kernel windows the two coincide anyway).
+        has nothing to distribute.
+
+        Applies to every windowed op -- conv2d and the pools alike.
         """
         ps = sdsc_spec.padding_sizes.get(str(dim)) if is_input else None
-        if sdsc_spec.opfunc == "conv2d" and ps is not None and "windowDim_" in ps:
+        if ps is not None and "windowDim_" in ps:
             out_per_core = sdsc_spec.iteration_space[dim] // nsplits
             stride = int(ps.get("stride_", 1))
             dilation = int(ps.get("dilation_", 1))
             k = int(sdsc_spec.iteration_space.get(Symbol(ps["windowDim_"]), 1))
-            return (out_per_core - 1) * stride + dilation * (k - 1) + 1
+            span = (out_per_core - 1) * stride + dilation * (k - 1) + 1
+            # The window span is what each core READS, and it equals the axis
+            # extent only when the windows tile it exactly.  When stride > kernel
+            # the span UNDERRUNS the declared extent (k=4 s=6 on 8: span 4 of 8),
+            # and on an unsplit axis the coordinate fold must still expose the
+            # whole extent -- elem_arr_0 factor 8, not 4, alongside totalSize_ 8.
+            # Exposing only the span there reads a short extent and returns
+            # elements from the wrong window.  Only widen when unsplit: with
+            # nsplits > 1 the span is deliberately the per-core read (see
+            # _coord_core_stride).
+            # elem_arr_0 must expose the extent this stage addresses, which is
+            # the window span PLUS any declared slack -- for a split strided pool
+            # (e.g. 1x64x16x16 k4 s5, i split 3 ways) that is elem_arr_0 factor
+            # 6 = span 4 + unneededPad_ 2, not the bare span.  Exposing only the
+            # span reads a short extent per core and returns elements from the
+            # wrong window.
+            declared = int(ps.get("totalSize_", span))
+            if nsplits == 1:
+                return max(span, declared)
+            return max(span, span + int(ps.get("unneededPad_", 0)))
         return (
             _coord_size(str(dim), sdsc_spec.iteration_space[dim], is_input) // nsplits
         )
@@ -1378,14 +1446,19 @@ def generate_sdsc(
         """Core-fold stride (advance per core) for a windowed input spatial dim.
 
         Returns ``out_per_core * stride`` -- how far the input window origin moves
-        between adjacent cores -- so overlapping windows (conv stride < kernel)
-        step correctly while each core still reads the full window span
-        (_coord_per_core_size).  Returns None for non-windowed dims (and for
-        avgpool), where gen_coord_info_value defaults the core stride to the
-        per-core size -- so avgpool's original behavior is unchanged.
+        between adjacent cores -- so overlapping windows (stride < kernel) step
+        correctly while each core still reads the full window span
+        (_coord_per_core_size).  Returns None for non-windowed dims, where
+        gen_coord_info_value defaults the core stride to the per-core size.
+
+        Must stay in lockstep with _coord_per_core_size: that helper widens each
+        core's read to the window span, which for an overlapping window is wider
+        than the stride between cores.  Defaulting the stride to the (now wider)
+        per-core size would over-advance and skip input rows, so both helpers
+        cover the same ops -- conv2d and the pools.
         """
         ps = sdsc_spec.padding_sizes.get(str(dim)) if is_input else None
-        if sdsc_spec.opfunc == "conv2d" and ps is not None and "windowDim_" in ps:
+        if ps is not None and "windowDim_" in ps:
             out_per_core = sdsc_spec.iteration_space[dim] // nsplits
             return out_per_core * int(ps.get("stride_", 1))
         return None
@@ -1443,8 +1516,20 @@ def generate_sdsc(
                 "numWkSlicesPerDim_": {
                     str(dim): num_wk_slices
                     for dim, num_wk_slices in sdsc_spec.work_slices.items()
+                    if sdsc_spec.opfunc not in POOL_OPS
+                    or str(dim) not in sdsc_spec.window_dims
                 },
-                "coreIdToWkSlice_": core_id_to_wk_slice,
+                # Window dims (ki/kj) are not real dims of any tensor for pool
+                # operations and hence should not be emitted
+                "coreIdToWkSlice_": {
+                    core: {
+                        dim: slc
+                        for dim, slc in slices.items()
+                        if sdsc_spec.opfunc not in POOL_OPS
+                        or dim not in sdsc_spec.window_dims
+                    }
+                    for core, slices in core_id_to_wk_slice.items()
+                },
                 "coreIdToDscSchedule": {
                     str(c): [[-1, 0, 0, 0]] for c in active_core_ids
                 },
