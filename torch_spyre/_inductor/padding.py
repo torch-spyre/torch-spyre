@@ -61,6 +61,7 @@ from torch._inductor.ir import (
     Buffer,
     ComputedBuffer,
     FixedLayout,
+    MutationLayoutSHOULDREMOVE,
     Operation,
     Pointwise,
     Reduction,
@@ -673,7 +674,38 @@ def _pad_device_dim(
     )
 
 
-def _pad_elided_dim(buf: ComputedBuffer, graph: GraphLowering) -> None:
+def _read_by_other_restickify(
+    buf: ComputedBuffer, restickify: Operation | None, graph: GraphLowering
+) -> bool:
+    """Whether a restickify other than ``restickify`` reads ``buf``, including one
+    that writes straight into a slice of another buffer (a ``torch.cat`` piece)."""
+    for op in graph.operations:
+        if not isinstance(op, ComputedBuffer):
+            continue
+        # By name: redirecting the restickify's read to a padded clone of its
+        # input replaces its ComputedBuffer in graph.operations.
+        if restickify is not None and op.get_name() == restickify.get_name():
+            continue
+        if not isinstance(op.data, Pointwise):
+            continue
+        in_dep, _in_buf, in_layout = _restickify_input(op, graph)
+        if in_dep is None or in_dep.name != buf.get_name():
+            continue
+        out_layout = op.get_layout()
+        if isinstance(out_layout, MutationLayoutSHOULDREMOVE):
+            out_layout = out_layout.real_layout()
+        if not isinstance(out_layout, FixedTiledLayout):
+            continue
+        in_coords = device_coordinates(in_layout.device_layout, in_dep)
+        out_coords = device_coordinates(out_layout.device_layout, _write_dep(op))
+        if in_coords and out_coords and is_restickify_coords(in_coords, out_coords):
+            return True
+    return False
+
+
+def _pad_elided_dim(
+    buf: ComputedBuffer, restickify: Operation | None, graph: GraphLowering
+) -> None:
     """Pad ``buf``'s allocation with a size-64 gap dim, for a restickify whose
     transposed dim was elided to a size-1 device dim.
 
@@ -691,8 +723,9 @@ def _pad_elided_dim(buf: ComputedBuffer, graph: GraphLowering) -> None:
     ``_restickify_restore_elided_dim``, creates the shared iteration variable that
     pairs this dim with the stick on the other operand.
 
-    A graph output keeps the gap dim outermost, and with it the 256 MiB limit,
-    which the per-core span check reports as ``Unsupported``.
+    A graph output, or a buffer that another restickify also reads, keeps the gap
+    dim outermost, and with it the 256 MiB limit, which the per-core span check
+    reports as ``Unsupported``.
     """
     layout = buf.get_layout()
     assert isinstance(layout, FixedTiledLayout)
@@ -702,6 +735,11 @@ def _pad_elided_dim(buf: ComputedBuffer, graph: GraphLowering) -> None:
         # TODO: place the gap dim inside for a graph output too; the
         # host<->device copy finds the stick-count dim by position and rejects
         # an inner gap dim at three or more host dims.
+        at = 0
+    elif _read_by_other_restickify(buf, restickify, graph):
+        # TODO: place the gap dim inside here too. The other restickify iterates
+        # the gap dim once, and with it just outside the stick the device faults
+        # (torch.cat on a trailing size-1 dim, cat([a, b], -1).sum(-1)).
         at = 0
     else:
         at = len(stl.device_size) - 1
@@ -745,7 +783,7 @@ def _pad_restickify_output(op: Operation, graph: GraphLowering) -> None:
     stl = out_layout.device_layout
 
     if old_sym is None:
-        _pad_elided_dim(op, graph)
+        _pad_elided_dim(op, op, graph)
         logger.debug(
             "insert_restickify_padding: grew size-1 output %s allocation",
             op.get_name(),
@@ -1124,7 +1162,7 @@ def _pad_restickify_input(op: Operation, graph: GraphLowering) -> None:
     if size1:
         # Add a size-64 gap dim so the elided size-1 dim's allocation covers the
         # full stick the restickify sweeps.
-        _pad_elided_dim(in_buf, graph)
+        _pad_elided_dim(in_buf, op, graph)
     else:
         assert new_stick_dim is not None  # set in the size>1 gate above
         assert padded_dim_size is not None  # computed alongside it

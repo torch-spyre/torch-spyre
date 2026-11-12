@@ -2817,6 +2817,7 @@ def _size1_collapsed_buf():
 class _StubGraph:
     def __init__(self, outputs):
         self._outputs = outputs
+        self.operations = []
 
     def get_output_names(self):
         return self._outputs
@@ -2826,7 +2827,7 @@ def test_size1_grow_inserts_size64_gap_dim_outside_stick():
     from torch_spyre._inductor.padding import _pad_elided_dim
 
     buf = _size1_collapsed_buf()
-    _pad_elided_dim(buf, _StubGraph([]))
+    _pad_elided_dim(buf, None, _StubGraph([]))
 
     dl = buf.layout.device_layout
     # A size-64 gap dim (stride_map -1) goes just outside the stick dim, so its
@@ -2847,11 +2848,99 @@ def test_size1_grow_prepends_size64_gap_dim_for_graph_output():
     # The host<->device copy cannot place an inner gap dim on every graph output,
     # so a graph output keeps it outermost.
     buf = _size1_collapsed_buf()
-    _pad_elided_dim(buf, _StubGraph(["buf0"]))
+    _pad_elided_dim(buf, None, _StubGraph(["buf0"]))
 
     dl = buf.layout.device_layout
     assert list(dl.device_size) == [_SIZE1_STICK, *_SIZE1_COLLAPSED_DEVICE_SIZE]
     assert list(dl.stride_map) == [-1, *_SIZE1_COLLAPSED_STRIDE_MAP]
+
+
+def _transpose_reader_graph(include_reader=True):
+    """A padded buffer ``buf0`` (host [64, 128]), the size-1 restickify padding it,
+    and optionally a second restickify ``buf2`` that reads ``buf0`` transposed.
+
+    The padding restickify appears in ``graph.operations`` as a different object
+    with the same name, as after its read is redirected to a padded clone.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    import sympy
+    from torch._inductor.dependencies import MemoryDep
+    from torch._inductor.ir import ComputedBuffer, Pointwise
+    from torch_spyre._C import DataFormats
+    from torch_spyre._C import SpyreTensorLayout as _CSpyreTensorLayout
+    from torch_spyre._inductor.ir import FixedTiledLayout
+
+    def tiled(size, stride, device_size, stride_map):
+        stl = _CSpyreTensorLayout(device_size, stride_map, DataFormats.SEN169_FP16)
+        return FixedTiledLayout(DEVICE, torch.float16, size, stride, stl)
+
+    def op(name, layout):
+        data = MagicMock(spec=Pointwise)
+        buf = ComputedBuffer(name=name, layout=layout, data=data)
+        buf.operation_name = name
+        return buf
+
+    c0, c1 = sympy.symbols("c0 c1", integer=True, nonnegative=True)
+    padded = op("buf0", tiled([64, 128], [128, 1], [2, 64, 64], [64, 128, 1]))
+    transposed = tiled([128, 64], [64, 1], [1, 128, 64], [64, 64, 1])
+    padding_restickify = op("buf1", transposed)
+    padding_restickify_copy = op("buf1", transposed)
+    reader = op("buf2", transposed)
+    read_writes = {
+        "buf0": SimpleNamespace(
+            reads=[], writes=[MemoryDep("buf0", 128 * c0 + c1, (c0, c1), (64, 128))]
+        ),
+        "buf1": SimpleNamespace(
+            reads=[MemoryDep("buf0", 128 * c0 + c1, (c0, c1), (64, 128))],
+            writes=[MemoryDep("buf1", 64 * c1 + c0, (c0, c1), (64, 128))],
+        ),
+        "buf2": SimpleNamespace(
+            reads=[MemoryDep("buf0", 128 * c1 + c0, (c0, c1), (128, 64))],
+            writes=[MemoryDep("buf2", 64 * c0 + c1, (c0, c1), (128, 64))],
+        ),
+    }
+    operations = [padded, padding_restickify_copy] + (
+        [reader] if include_reader else []
+    )
+
+    class _Graph(_StubGraph):
+        def get_buffer(self, name):
+            return {
+                "buf0": padded,
+                "buf1": padding_restickify_copy,
+                "buf2": reader,
+            }.get(name)
+
+    graph = _Graph([])
+    graph.operations = operations
+    return padded, padding_restickify, graph, read_writes
+
+
+@pytest.mark.parametrize("include_reader", [True, False])
+def test_size1_grow_keeps_gap_dim_outermost_when_another_restickify_reads(
+    include_reader,
+):
+    """A buffer that another restickify also reads keeps its gap dim outermost: an
+    inner gap dim faults the device there (cat(...).sum(-1) on a trailing size-1
+    dim). The padding restickify itself does not count as another reader."""
+    import torch_spyre._inductor.padding as padding
+
+    buf, restickify, graph, read_writes = _transpose_reader_graph(include_reader)
+    with patch.object(padding, "op_read_writes", lambda op: read_writes[op.get_name()]):
+        assert (
+            padding._read_by_other_restickify(buf, restickify, graph) is include_reader
+        )
+        padding._pad_elided_dim(buf, restickify, graph)
+
+    dl = buf.layout.device_layout
+    if include_reader:
+        assert list(dl.device_size) == [_SIZE1_STICK, 2, 64, 64]
+        assert list(dl.stride_map) == [-1, 64, 128, 1]
+    else:
+        assert list(dl.device_size) == [2, 64, _SIZE1_STICK, 64]
+        assert list(dl.stride_map) == [64, 128, -1, 1]
 
 
 def _size1_restickify_op_spec():
