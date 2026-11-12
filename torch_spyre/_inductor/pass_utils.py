@@ -2566,6 +2566,16 @@ def compute_restickify_target_layout(
         old_var = None
     if len(old_var_outer_dims) > 1:
         return None
+    if not old_var_outer_dims and old_var is not None and old_sd_host_size > stick_size:
+        # _host_size_stride returned the full size of a fused host dim (e.g.
+        # host_coords=[..., 64*d3+d4] → host_size=128) rather than d4's range
+        # (64). This only happens when old_var shares a host coordinate with
+        # another variable; in that case the range is exactly stick_size.
+        old_var_host_dim = next(
+            (c for c in host_coords if old_var in c.free_symbols), None
+        )
+        if old_var_host_dim is not None and len(old_var_host_dim.free_symbols) > 1:
+            old_sd_host_size = stick_size
     old_device_size = list(stl.device_size)
     old_stride_map = list(stl.stride_map)
     old_sd_outer_dim = next(
