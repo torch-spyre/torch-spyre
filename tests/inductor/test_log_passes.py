@@ -156,6 +156,10 @@ def _make_spyre_graph():
     op = MagicMock()
     op.get_device.return_value = torch.device("spyre")
     op.get_name.return_value = "buf0"
+    # The pass pipeline finalizes only operations with committed work division.
+    # MagicMock fabricates missing attributes on access, so make the absent
+    # ownership explicit for finalize_work_division_for_scheduler's guard.
+    op.iteration_space_ownership = None
     graph = MagicMock()
     graph.operations = [op]
     return graph
