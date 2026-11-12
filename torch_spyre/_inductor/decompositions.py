@@ -1911,6 +1911,8 @@ def spyre_topk(
     idxs_list = []
     curr_input = input
     remaining_k = padded_k
+
+    # TODO: (#6261) Reconfigure this peeling to use a for_each_tile instead of looping like this
     while remaining_k > 0:
         chunk_k = min(remaining_k, TOPK_MAX_K)
         v = torch.ops.spyre.topkvalue(curr_input, chunk_k, dim)

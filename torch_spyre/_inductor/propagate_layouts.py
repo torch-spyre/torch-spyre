@@ -2924,9 +2924,9 @@ def _find_alt_target_stl(
         target_coords, output_dep, c_size, c_stride, write_stick, dtype_for_layout
     )
     if not candidates:
-        # Try restickify so each stick holds one element and the write is
-        # offset-free. Not for a graph input: its layout is caller-visible and
-        # would grow by a stick per element.
+        # Try restickify so the write is offset-free before giving up.
+        # Not for a graph input: the caller owns the allocation and
+        # is not expecting it to grow.
         if not is_graph_input:
             result = compute_size1_restickify_target(
                 target_stl, target_layout, output_dep

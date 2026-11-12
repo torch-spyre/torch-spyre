@@ -2152,11 +2152,10 @@ def lower_cat(inputs, dim=0):
         lowering.mutate_to(sliced_output, input_tensor)
         offset += input_tensor.get_size()[dim]
 
-    # The output buffer is filled only through mutate_to, so its own body reads
-    # no buffer and never reaches name_to_users; the interpreter also drops the
-    # cat node's env entry after its last user is lowered. split_multi_ops
-    # resolves a fused body's loads to FX nodes through env by buffer name, so
-    # keep a durable entry (e.g. for the float32 -> int64 cast of a cat result).
+    # Workaround pending #6263: patch_env cannot recover the env entry for this
+    # buffer (it is not in name_to_users), so the lookup in split_multi_ops fails
+    # with "No FX node for bufN" when a fused body loads the cat result directly.
+    # Register a dummy node here instead. Remove when #6263 is resolved.
     fx_graph = V.graph.graph
     first_compute_node = next(n for n in fx_graph.nodes if n.op != "placeholder")
     with fx_graph.inserting_before(first_compute_node):
