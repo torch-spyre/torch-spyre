@@ -56,6 +56,7 @@ __all__: list[str] = [
     "set_downcast_warning",
     "set_spyre_tensor_layout",
     "spyre_empty_reserved",
+    "set_tensor_padding_value",
     "spyre_empty_with_layout",
     "start_runtime",
     "to_with_layout",
@@ -263,6 +264,12 @@ class SpyreTensorLayout:
     def stride_map(self) -> list[int]: ...
     @property
     def valid_elements(self) -> dict[tuple[int, ...], int]: ...
+    # The constant padding value (rounded to device_dtype), or None when the
+    # padding is uninitialized. Assigning None resets it to uninitialized.
+    @property
+    def padding_value(self) -> float | None: ...
+    @padding_value.setter
+    def padding_value(self, value: float | None) -> None: ...
 
 class _SpyreStreamBase:
     """
@@ -595,6 +602,7 @@ def set_downcast_warning(arg0: bool) -> None:
     """
 
 def set_spyre_tensor_layout(arg0: torch.Tensor, arg1: SpyreTensorLayout) -> None: ...
+def set_tensor_padding_value(tensor: torch.Tensor, value: float | None) -> None: ...
 def spyre_empty_reserved(
     size: tuple[int, ...],
     stride: tuple[int, ...],
@@ -611,6 +619,7 @@ def spyre_empty_reserved(
     stored on the tensor for the runtime resize_ guard to check. Backs
     tensor.to("spyre", dynamic={dim: {min, max, granularity}}).
     """
+    ...
 
 def spyre_empty_with_layout(
     size: tuple[int, ...],

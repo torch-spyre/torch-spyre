@@ -23,8 +23,11 @@ import unittest
 from unittest.mock import patch
 from typing import Any, Callable, Optional, TypeVarTuple, Unpack, override
 
+import pytest
 import sympy
+from sympy import FiniteSet, Interval, S, oo
 import torch
+from torch._dynamo.testing import CompileCounter
 import torch.fx as fx
 from torch._inductor import config as t_inductor_config
 from torch._inductor.ir import (
@@ -35,7 +38,7 @@ from torch._inductor.ir import (
     Reduction,
 )
 from torch._inductor.graph import GraphLowering
-from torch._inductor.virtualized import V
+from torch._inductor.virtualized import V, ops
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
     parametrize,
@@ -48,7 +51,13 @@ from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 from torch_spyre._inductor.constants import BATCH_MATMUL_OP
 from torch_spyre._inductor.ir import FixedTiledLayout, SpyreConstantFallback
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
+from torch_spyre._inductor import padding
 from torch_spyre._inductor.padding import (
+    ArgNameToIndexTracer,
+    DomainRangeSolver,
+    InvalidDomain,
+    SetDtype,
+    SetDtypeTracer,
     _compute_digits,
     _is_dense_flattened_coordinate,
     _is_nonoverlapping_aligned_stick_coordinate,
@@ -57,7 +66,6 @@ from torch_spyre._inductor.padding import (
 from torch_spyre._inductor.scratchpad import allocator
 from torch_spyre._inductor.scratchpad import utils as scratchpad_utils
 from utils_inductor import try_reinterpret_host_shape
-
 
 Ts = TypeVarTuple("Ts")
 
@@ -163,6 +171,739 @@ class TestRestickifyInputCoordinate(unittest.TestCase):
             ),
             128,
         )
+
+
+# ---------------------------------------------------------------------------
+# Padding-value propagation: DomainRangeSolver, SetDtypeTracer,
+# ArgNameToIndexTracer. These are pure set computations and need no device.
+# ---------------------------------------------------------------------------
+
+_I = sympy.Symbol("i")
+_NON_NEG = Interval(0, oo)
+_NAN = padding._NAN
+
+
+def _rationalize(s):
+    return s.xreplace({f: sympy.nsimplify(f) for f in s.atoms(sympy.Float)})
+
+
+class TestDomainRangeSolver(unittest.TestCase):
+    """The solver maps the set of possible padding values through each op.
+
+    The image it returns must contain every value the op can produce from the
+    input set (soundness); where it can, it is the exact image.
+    """
+
+    def setUp(self) -> None:
+        self.s = DomainRangeSolver()
+
+    def assertSetEqual(self, actual, expected) -> None:
+        # Compare by inclusion: sympy compares sets structurally, so {0.0} and
+        # {0}, or Range(1, 4) and {1, 2, 3}, are not ==. Floats become
+        # rationals so that inclusion of float and integer bounds is decidable.
+        actual, expected = _rationalize(actual), _rationalize(expected)
+        self.assertTrue(
+            actual.is_subset(expected) and expected.is_subset(actual),
+            f"{actual} != {expected}",
+        )
+
+    def assertSubset(self, sub, sup) -> None:
+        self.assertTrue(sub.is_subset(sup), f"{sub} is not a subset of {sup}")
+
+    def assertRaisesDomain(
+        self, fn, *args, func: str, domain=None, arg_index: int = 0
+    ) -> InvalidDomain:
+        with self.assertRaises(InvalidDomain) as ctx:
+            fn(*args)
+        self.assertEqual(ctx.exception.func, func)
+        self.assertEqual(ctx.exception.arg_index, arg_index)
+        if domain is not None:
+            self.assertSetEqual(ctx.exception.domain, domain)
+        return ctx.exception
+
+    # -- finite sets: evaluated exactly ----------------------------------------
+
+    def test_constant_is_singleton(self) -> None:
+        self.assertSetEqual(self.s.constant(2.5, torch.float16), FiniteSet(2.5))
+
+    def test_unary_on_finite_set_maps_each_element(self) -> None:
+        self.assertSetEqual(self.s.exp(FiniteSet(0)), FiniteSet(1.0))
+        self.assertSetEqual(self.s.relu(FiniteSet(-2, 3)), FiniteSet(0, 3))
+        self.assertSetEqual(self.s.neg(FiniteSet(1, -4)), FiniteSet(-1, 4))
+        self.assertSetEqual(self.s.abs(FiniteSet(-2, 3)), FiniteSet(2, 3))
+        self.assertSetEqual(self.s.square(FiniteSet(-2, 1)), FiniteSet(1, 4))
+        self.assertSetEqual(self.s.sigmoid(FiniteSet(0)), FiniteSet(0.5))
+        self.assertSetEqual(self.s.tanh(FiniteSet(0)), FiniteSet(0))
+        self.assertSetEqual(self.s.silu(FiniteSet(0)), FiniteSet(0))
+        self.assertSetEqual(self.s.reciprocal(FiniteSet(2)), FiniteSet(0.5))
+        self.assertSetEqual(
+            self.s.softplus(FiniteSet(0), 1.0, 20.0), FiniteSet(math.log(2))
+        )
+        # Above the threshold softplus is the identity, as in torch.
+        self.assertSetEqual(self.s.softplus(FiniteSet(100), 1.0, 20.0), FiniteSet(100))
+
+    def test_binary_on_finite_sets_is_cartesian(self) -> None:
+        self.assertSetEqual(
+            self.s.add(FiniteSet(0, 1), FiniteSet(10)), FiniteSet(10, 11)
+        )
+        self.assertSetEqual(
+            self.s.mul(FiniteSet(0, 2), FiniteSet(3, 4)), FiniteSet(0, 6, 8)
+        )
+        self.assertSetEqual(
+            self.s.sub(FiniteSet(0), FiniteSet(1, 2)), FiniteSet(-1, -2)
+        )
+        self.assertSetEqual(self.s.truediv(FiniteSet(0), FiniteSet(2)), FiniteSet(0))
+        self.assertSetEqual(
+            self.s.maximum(FiniteSet(0), FiniteSet(-1, 2)), FiniteSet(0, 2)
+        )
+        self.assertSetEqual(
+            self.s.minimum(FiniteSet(0), FiniteSet(-1, 2)), FiniteSet(-1, 0)
+        )
+
+    def test_equal_values_of_different_types_merge(self) -> None:
+        # sympy keeps {0, 0.0} as two elements; every result is a float.
+        self.assertEqual(len(self.s.add(FiniteSet(0), FiniteSet(0, 0.0))), 1)
+
+    def test_finite_set_values_like_the_device(self) -> None:
+        # Overflow and underflow as in floating point.
+        self.assertSetEqual(self.s.exp(FiniteSet(1000)), FiniteSet(oo))
+        self.assertSetEqual(self.s.exp(FiniteSet(-1e4)), FiniteSet(0))
+        self.assertSetEqual(self.s.sigmoid(FiniteSet(-1000)), FiniteSet(0))
+        self.assertSetEqual(self.s.square(FiniteSet(1e300)), FiniteSet(oo))
+        # Undefined results are NaN, not a crash.
+        self.assertSetEqual(self.s.mul(FiniteSet(0), FiniteSet(oo)), FiniteSet(_NAN))
+        self.assertSetEqual(self.s.add(FiniteSet(oo), FiniteSet(-oo)), FiniteSet(_NAN))
+        self.assertSetEqual(self.s.log(FiniteSet(oo)), FiniteSet(oo))
+
+    def test_comparisons(self) -> None:
+        self.assertSetEqual(self.s.eq(FiniteSet(0), FiniteSet(0)), FiniteSet(1))
+        self.assertSetEqual(self.s.lt(FiniteSet(1), FiniteSet(0)), FiniteSet(0))
+        self.assertSetEqual(self.s.ne(FiniteSet(0, 1), FiniteSet(0)), FiniteSet(0, 1))
+        self.assertSetEqual(
+            self.s.logical_and(FiniteSet(1), FiniteSet(0)), FiniteSet(0)
+        )
+        self.assertSetEqual(self.s.logical_or(FiniteSet(1), FiniteSet(0)), FiniteSet(1))
+        # Not both finite sets: any boolean.
+        self.assertSetEqual(self.s.lt(FiniteSet(0), S.Reals), FiniteSet(0, 1))
+
+    # -- anything else: the signs of the result, within the op's range --------
+
+    @parametrize(
+        "op,image",
+        [
+            ("abs", Interval(0, oo)),
+            ("exp", Interval(0, oo).union(FiniteSet(oo))),
+            ("neg", S.Reals),
+            ("sigmoid", Interval(0, 1)),
+            ("silu", Interval(-0.279, oo)),
+            ("square", Interval(0, oo).union(FiniteSet(oo))),
+            ("tanh", Interval(-1, 1)),
+        ],
+    )
+    def test_unary_on_unknown_values_is_the_range(self, op, image) -> None:
+        self.assertSetEqual(getattr(self.s, op)(S.Reals), image)
+
+    def test_unary_keeps_the_sign(self) -> None:
+        pos = Interval.open(0, oo)
+        self.assertSetEqual(self.s.abs(pos), pos)
+        self.assertSetEqual(self.s.neg(pos), Interval.open(-oo, 0))
+        self.assertSetEqual(self.s.tanh(pos), Interval.Lopen(0, 1))
+        # exp of a negative underflows to 0 but is not negative.
+        self.assertSetEqual(self.s.exp(Interval.open(-oo, 0)), _NON_NEG)
+        self.assertSetEqual(self.s.reciprocal(pos), pos.union(FiniteSet(oo)))
+
+    def test_sign_rule_models_underflow_and_overflow(self) -> None:
+        pos = Interval.open(0, oo)
+        # A sum of positives is at least the larger one: never 0, maybe inf.
+        self.assertSetEqual(self.s.add(pos, pos), pos.union(FiniteSet(oo)))
+        # A product of positives can underflow to 0.
+        self.assertSetEqual(self.s.mul(pos, pos), _NON_NEG.union(FiniteSet(oo)))
+        # silu and square of a tiny positive underflow to 0.
+        self.assertTrue(self.s.silu(pos).contains(0))
+        self.assertTrue(self.s.square(pos).contains(0))
+        # Without a sign to go on, overflow makes +-inf possible.
+        self.assertSetEqual(
+            self.s.add(S.Reals, S.Reals), S.Reals.union(FiniteSet(-oo, oo))
+        )
+        self.assertSetEqual(self.s.sub(pos, pos), S.Reals)
+
+    def test_sign_rule_finds_undefined_results(self) -> None:
+        # 0 * oo is NaN: it is possible when the operands can be 0 and oo.
+        extended = _NON_NEG.union(FiniteSet(oo))
+        self.assertTrue(self.s.mul(extended, extended).has(_NAN))
+        self.assertFalse(self.s.mul(_NON_NEG, _NON_NEG).has(_NAN))
+
+    def test_device_saturates_to_range_bounds(self) -> None:
+        # sigmoid(-20) is 0 and tanh(10) is 1 in fp16, so the bounds are closed.
+        self.assertTrue(self.s.sigmoid(S.Reals).contains(0))
+        self.assertTrue(self.s.sigmoid(S.Reals).contains(1))
+        self.assertTrue(self.s.tanh(S.Reals).contains(-1))
+        self.assertTrue(self.s.exp(S.Reals).contains(0))
+        # silu's fp16 minimum is -0.27856, below the real minimum -0.27846.
+        self.assertTrue(self.s.silu(S.Reals).contains(-0.27856))
+
+    def test_positive_denominator_needs_no_mask(self) -> None:
+        # 1 / (1 + exp(-x)): a positive plus a non-negative is positive.
+        denominator = self.s.add(FiniteSet(1), self.s.exp(self.s.neg(S.Reals)))
+        self.assertFalse(denominator.contains(0))
+        self.assertTrue(denominator.is_subset(self.s.extended_non_zero_reals))
+        self.s.reciprocal(denominator)
+        self.s.truediv(FiniteSet(1), denominator)
+
+    def test_epsilon_keeps_rsqrt_in_domain(self) -> None:
+        # rsqrt(v + eps) for a non-negative v (a variance or a square).
+        variance = _NON_NEG.union(FiniteSet(oo))
+        self.s.rsqrt(self.s.add(variance, FiniteSet(1e-5)))
+        # x * x of an unknown x is not known to be non-negative: the solver
+        # cannot tell x * x from x * y (TODO: track repeated operands).
+        with self.assertRaises(InvalidDomain):
+            self.s.rsqrt(self.s.add(self.s.mul(S.Reals, S.Reals), FiniteSet(1e-5)))
+
+    def test_log_of_sigmoid_masks(self) -> None:
+        # sigmoid saturates to 0 on the device, so log's input may be 0.
+        with self.assertRaises(InvalidDomain):
+            self.s.log(self.s.sigmoid(S.Reals))
+
+    # -- max, min, relu, clamp: exact set algebra ---------------------------------
+
+    def test_max_min_bound_attained_where_one_argument_dominates(self) -> None:
+        # max(x, 0) = 0 for every x <= 0, so 0 is attained.
+        self.assertSetEqual(self.s.maximum(S.Reals, Interval(0, 1)), _NON_NEG)
+        self.assertSetEqual(self.s.maximum(S.Reals, FiniteSet(0)), _NON_NEG)
+        self.assertSetEqual(self.s.minimum(S.Reals, Interval(0, 1)), Interval(-oo, 1))
+        # relu is max(x, 0): 0 is attained for every x <= 0.
+        self.assertSetEqual(self.s.relu(S.Reals), _NON_NEG)
+        self.assertSetEqual(self.s.relu(Interval.open(-1, 1)), Interval.Ropen(0, 1))
+        self.assertSetEqual(self.s.relu(Interval.open(-oo, 0)), FiniteSet(0))
+
+    def test_max_min_exact_image(self) -> None:
+        # Values of one argument below every value of the other are not in
+        # the image of max.
+        self.assertSetEqual(
+            self.s.maximum(Interval.Lopen(0, 1), Interval.Ropen(0, 1)),
+            Interval.Lopen(0, 1),
+        )
+        self.assertSetEqual(
+            self.s.maximum(Interval.open(0, 1), Interval.open(0, 1)),
+            Interval.open(0, 1),
+        )
+        self.assertSetEqual(self.s.maximum(S.EmptySet, S.Reals), S.EmptySet)
+
+    def test_max_min_keep_infinities(self) -> None:
+        # max(oo, 1) = oo: an extended set keeps its infinite points.
+        extended = _NON_NEG.union(FiniteSet(oo))
+        self.assertSetEqual(
+            self.s.maximum(extended, FiniteSet(1)),
+            Interval(1, oo).union(FiniteSet(oo)),
+        )
+        self.assertSetEqual(self.s.minimum(extended, FiniteSet(1)), Interval(0, 1))
+        neg_extended = Interval(-oo, 0).union(FiniteSet(-oo))
+        self.assertSetEqual(self.s.minimum(neg_extended, FiniteSet(1)), neg_extended)
+
+    def test_clamp_floor_where(self) -> None:
+        self.assertSetEqual(self.s.clamp(S.Reals, 0, 1), Interval(0, 1))
+        self.assertSetEqual(self.s.clamp(S.Reals, min=0), _NON_NEG)
+        # Values outside the range move to the nearest bound.
+        self.assertSetEqual(self.s.clamp(FiniteSet(5), 0, 1), FiniteSet(1))
+        self.assertSetEqual(
+            self.s.clamp(FiniteSet(-3, 0.5, 9), 0, 1), FiniteSet(0, 0.5, 1)
+        )
+        self.assertSetEqual(self.s.clamp(Interval(2, 3), 0, 1), FiniteSet(1))
+        # floor(0.5) = 0 is in the image although 0 is not in the input.
+        self.assertSetEqual(self.s.floor(Interval(0.5, 3)), FiniteSet(0, 1, 2, 3))
+        self.assertSetEqual(self.s.floor(FiniteSet(0.5)), FiniteSet(0))
+        self.assertSetEqual(self.s.floor(FiniteSet(-0.5, 2.7)), FiniteSet(-1, 2))
+        self.assertSetEqual(self.s.floor(Interval(0.2, 0.7)), FiniteSet(0))
+        self.assertSetEqual(self.s.floor(S.Reals), S.Integers)
+        self.assertSetEqual(
+            self.s.floor(Interval(-oo, 1.5).union(FiniteSet(-oo))),
+            S.Integers.intersect(Interval(-oo, 1)).union(FiniteSet(-oo)),
+        )
+        self.assertSetEqual(self.s.floor(FiniteSet(oo, -oo)), FiniteSet(oo, -oo))
+        # The motivating case: sigmoid of zero padding is 0.5, whose floor is
+        # 0, so a following reciprocal must see 0 in its input, not EmptySet.
+        floored = self.s.floor(self.s.sigmoid(FiniteSet(0)))
+        self.assertSetEqual(floored, FiniteSet(0))
+        with self.assertRaises(padding.InvalidDomain):
+            self.s.reciprocal(floored)
+        self.assertSetEqual(
+            self.s.where(FiniteSet(1), FiniteSet(0), FiniteSet(2)), FiniteSet(0, 2)
+        )
+
+    def test_range_fallbacks_contain_the_range(self) -> None:
+        # Ops without an exact image return a superset of their range.
+        self.assertSubset(Interval(-0.17, 5), self.s.gelu(S.Reals))
+        self.assertSubset(_NON_NEG, self.s.layernormscale(S.Reals, 1e-5))
+        self.assertSetEqual(self.s.to_dtype(FiniteSet(3), torch.float32), FiniteSet(3))
+
+    def test_unknown_op_returns_user_values(self) -> None:
+        with patch("torch_spyre._inductor.config.padding_strict_mode", False):
+            self.assertSetEqual(self.s._default("foo", (FiniteSet(0),), {}), S.Reals)
+        with patch("torch_spyre._inductor.config.padding_strict_mode", True):
+            self.assertTrue(self.s._default("foo", (FiniteSet(0),), {}).has(_NAN))
+
+    # -- domain checks ----------------------------------------------------------
+
+    def test_domain_violations_raise(self) -> None:
+        zero = FiniteSet(0)
+        self.assertRaisesDomain(self.s.log, zero, func="log")
+        self.assertRaisesDomain(self.s.log, FiniteSet(-1), func="log")
+        self.assertRaisesDomain(self.s.rsqrt, zero, func="rsqrt")
+        self.assertRaisesDomain(self.s.reciprocal, zero, func="reciprocal")
+        self.assertRaisesDomain(
+            self.s.sqrt, FiniteSet(-1), func="sqrt", domain=_NON_NEG
+        )
+        # truediv blames the divisor and uses the realdiv mask key.
+        self.assertRaisesDomain(
+            self.s.truediv, FiniteSet(1), zero, func="realdiv", arg_index=1
+        )
+
+    def test_domain_satisfied_does_not_raise(self) -> None:
+        self.assertSetEqual(self.s.log(FiniteSet(1)), FiniteSet(0))
+        self.assertSetEqual(self.s.rsqrt(FiniteSet(4)), FiniteSet(0.5))
+        self.assertSetEqual(self.s.sqrt(FiniteSet(0)), FiniteSet(0))
+        # The mask values for these ops (inf, see _PADDING_MASK_VALUES) are
+        # in the extended domain.
+        self.assertSetEqual(self.s.reciprocal(FiniteSet(oo)), FiniteSet(0))
+        self.assertSetEqual(self.s.rsqrt(FiniteSet(oo)), FiniteSet(0))
+        self.assertSetEqual(self.s.truediv(FiniteSet(1), FiniteSet(oo)), FiniteSet(0))
+
+    def test_indirect_indexing_requires_zero_padding(self) -> None:
+        self.assertEqual(
+            self.s.indirect_indexing(FiniteSet(0), 4), padding._INDIRECT_INDEX_SYM
+        )
+        self.assertRaisesDomain(
+            self.s.indirect_indexing,
+            FiniteSet(0, 1),
+            4,
+            func="indirect_indexing",
+            domain=FiniteSet(0),
+        )
+
+    # -- reductions -------------------------------------------------------------
+
+    def test_sum_reduction(self) -> None:
+        self.assertSetEqual(
+            self.s.reduction(torch.float16, torch.float16, "sum", FiniteSet(0)),
+            S.Reals,
+        )
+        self.assertRaisesDomain(
+            self.s.reduction,
+            torch.float16,
+            torch.float16,
+            "sum",
+            FiniteSet(0, 1),
+            func="sum",
+            domain=FiniteSet(0),
+        )
+
+    @parametrize(
+        "reduction_type,dtype,pad",
+        [
+            ("max", torch.float16, padding._FP16_MIN),
+            ("min", torch.float16, padding._FP16_MAX),
+            ("max", torch.float32, padding._FP32_MIN),
+            ("min", torch.float32, padding._FP32_MAX),
+        ],
+    )
+    def test_max_min_reduction_requires_identity(
+        self, reduction_type, dtype, pad
+    ) -> None:
+        self.assertRaisesDomain(
+            self.s.reduction,
+            dtype,
+            dtype,
+            reduction_type,
+            FiniteSet(0),
+            func=reduction_type,
+            domain=FiniteSet(pad),
+        )
+        self.assertSetEqual(
+            self.s.reduction(dtype, dtype, reduction_type, FiniteSet(pad)), S.Reals
+        )
+
+    def test_batchmatmul_needs_one_zero_padded_operand(self) -> None:
+        for value in [
+            (FiniteSet(0), S.Reals),
+            (S.Reals, FiniteSet(0)),
+            (FiniteSet(0), FiniteSet(0)),
+        ]:
+            self.assertSetEqual(
+                self.s.reduction(torch.float16, torch.float16, BATCH_MATMUL_OP, value),
+                FiniteSet(0),
+            )
+        self.assertRaisesDomain(
+            self.s.reduction,
+            torch.float16,
+            torch.float16,
+            BATCH_MATMUL_OP,
+            (S.Reals, S.Reals),
+            func=BATCH_MATMUL_OP,
+            domain=FiniteSet(0),
+        )
+
+
+instantiate_parametrized_tests(TestDomainRangeSolver)
+
+
+_NAN_SET = FiniteSet(_NAN)
+
+
+class TestDomainRangeSolverNaN(unittest.TestCase):
+    """In strict mode the padding of unknown memory may hold NaN.
+
+    NaN is a set element (padding._NAN) that pointwise ops propagate, that
+    comparisons turn into either boolean, and that no domain admits.
+    """
+
+    def setUp(self) -> None:
+        self.s = DomainRangeSolver()
+
+    def assertSetEqual(self, actual, expected) -> None:  # noqa: N802
+        TestDomainRangeSolver.assertSetEqual(self, actual, expected)
+
+    def test_strict_mode_user_values_hold_nan(self) -> None:
+        with patch("torch_spyre._inductor.config.padding_strict_mode", True):
+            values = padding._user_values()
+        self.assertTrue(values.has(_NAN))
+        self.assertTrue(values.is_superset(S.Reals))
+
+    def test_nan_mixes_with_numbers(self) -> None:
+        # S.NaN cannot share a set with numbers; the marker can.
+        self.assertEqual(len(FiniteSet(0, _NAN)), 2)
+        self.assertEqual(
+            padding._without_nan(Interval(0, oo).union(FiniteSet(oo, _NAN))),
+            (Interval(0, oo).union(FiniteSet(oo)), True),
+        )
+        self.assertEqual(padding._without_nan(S.Reals), (S.Reals, False))
+
+    @parametrize(
+        "op",
+        [
+            "abs",
+            "exp",
+            "floor",
+            "neg",
+            "relu",
+            "sigmoid",
+            "silu",
+            "square",
+            "tanh",
+            "gelu",
+        ],
+    )
+    def test_unary_propagates_nan(self, op) -> None:
+        for x in (_NAN_SET, S.Reals.union(_NAN_SET), FiniteSet(0, _NAN)):
+            result = getattr(self.s, op)(x)
+            self.assertTrue(result.has(_NAN), f"{op}({x}) = {result}")
+            real, _ = padding._without_nan(result)
+            self.assertSetEqual(real, getattr(self.s, op)(padding._without_nan(x)[0]))
+
+    @parametrize("op", ["add", "sub", "mul", "truediv", "maximum", "minimum"])
+    def test_binary_propagates_nan(self, op) -> None:
+        # NaN from either argument; the real values still combine.
+        fn = getattr(self.s, op)
+        self.assertSetEqual(fn(_NAN_SET, FiniteSet(1)), _NAN_SET)
+        self.assertSetEqual(fn(FiniteSet(1), _NAN_SET), _NAN_SET)
+        result = fn(FiniteSet(2, _NAN), FiniteSet(1))
+        self.assertSetEqual(result, fn(FiniteSet(2), FiniteSet(1)).union(_NAN_SET))
+
+    def test_other_pointwise_propagate_nan(self) -> None:
+        self.assertSetEqual(self.s.clamp(FiniteSet(5, _NAN), 0, 1), FiniteSet(1, _NAN))
+        self.assertSetEqual(
+            self.s.where(FiniteSet(1), FiniteSet(0, _NAN), FiniteSet(2)),
+            FiniteSet(0, 2, _NAN),
+        )
+        self.assertSetEqual(self.s.softplus(_NAN_SET, 1.0, 20.0), _NAN_SET)
+
+    @parametrize(
+        "op", ["eq", "ne", "lt", "le", "gt", "ge", "logical_and", "logical_or"]
+    )
+    def test_comparison_with_nan_gives_any_boolean(self, op) -> None:
+        fn = getattr(self.s, op)
+        self.assertSetEqual(fn(_NAN_SET, FiniteSet(1)), FiniteSet(0, 1))
+        self.assertSetEqual(fn(FiniteSet(1), FiniteSet(0, _NAN)), FiniteSet(0, 1))
+
+    def test_nan_is_in_no_domain(self) -> None:
+        # Real values outside the domain still raise, NaN alongside them or not.
+        for op in ("log", "rsqrt", "reciprocal"):
+            with self.assertRaises(InvalidDomain):
+                getattr(self.s, op)(FiniteSet(0, _NAN))
+        with self.assertRaises(InvalidDomain):
+            self.s.truediv(FiniteSet(1), FiniteSet(0, _NAN))
+        # A NaN-only operand has no real value to check: log(NaN) is NaN.
+        self.assertSetEqual(self.s.log(_NAN_SET), _NAN_SET)
+
+    def test_nan_reaching_valid_data_raises(self) -> None:
+        # Reductions, matmul and gathers would mix NaN into valid lanes.
+        nan_padding = FiniteSet(0, _NAN)
+        with self.assertRaises(InvalidDomain):
+            self.s.reduction(torch.float16, torch.float16, "sum", nan_padding)
+        with self.assertRaises(InvalidDomain):
+            self.s.reduction(
+                torch.float16,
+                torch.float16,
+                BATCH_MATMUL_OP,
+                (nan_padding, nan_padding),
+            )
+        with self.assertRaises(InvalidDomain):
+            self.s.indirect_indexing(nan_padding, 4)
+        # One zero-padded matmul operand still zeroes the products.
+        self.assertSetEqual(
+            self.s.reduction(
+                torch.float16,
+                torch.float16,
+                BATCH_MATMUL_OP,
+                (nan_padding, FiniteSet(0)),
+            ),
+            FiniteSet(0),
+        )
+
+    def test_pick_element_never_picks_nan(self) -> None:
+        self.assertEqual(padding.pick_element(FiniteSet(2, _NAN)), 2)
+        self.assertEqual(padding.pick_element(S.Reals.union(_NAN_SET)), 0)
+        with self.assertRaises(ValueError):
+            padding.pick_element(_NAN_SET)
+
+
+instantiate_parametrized_tests(TestDomainRangeSolverNaN)
+
+
+class _FixedLoadSolver(DomainRangeSolver):
+    """A DomainRangeSolver whose loads return a fixed set per buffer."""
+
+    def __init__(self, ranges: dict[str, Any]) -> None:
+        super().__init__()
+        self.ranges = ranges
+
+    def load(self, name, index):
+        return self.ranges[name]
+
+
+class _DtypeGraph:
+    """Stands in for V.graph: SetDtypeTracer.load only calls get_dtype."""
+
+    def __init__(self, dtypes: dict[str, torch.dtype]) -> None:
+        self.dtypes = dtypes
+
+    def get_dtype(self, name: str) -> torch.dtype:
+        return self.dtypes[name]
+
+
+class TestSetDtypeTracer(unittest.TestCase):
+    """SetDtypeTracer pairs each set with the value's dtype."""
+
+    def _run(self, fn, inputs: dict[str, tuple[Any, torch.dtype]]):
+        ranges = {name: s for name, (s, _) in inputs.items()}
+        dtypes = {name: d for name, (_, d) in inputs.items()}
+        tracer = SetDtypeTracer(_FixedLoadSolver(ranges))
+        with V.set_graph_handler(_DtypeGraph(dtypes)), V.set_ops_handler(tracer):
+            r = fn()
+        # ops.* wraps the handler's result in an OpsValue.
+        return getattr(r, "value", r)
+
+    def _load(self, name: str):
+        return ops.load(name, _I)
+
+    def test_load_carries_buffer_dtype(self) -> None:
+        r = self._run(lambda: self._load("x"), {"x": (FiniteSet(0), torch.float16)})
+        self.assertEqual(r, SetDtype(FiniteSet(0), torch.float16))
+
+    def test_constant_carries_its_dtype(self) -> None:
+        r = self._run(lambda: ops.constant(2.0, torch.float32), {})
+        self.assertEqual(r, SetDtype(FiniteSet(2.0), torch.float32))
+
+    def test_pointwise_propagates_set_and_dtype(self) -> None:
+        r = self._run(
+            lambda: ops.mul(self._load("x"), ops.constant(2.0, torch.float16)),
+            {"x": (FiniteSet(3), torch.float16)},
+        )
+        self.assertEqual(r, SetDtype(FiniteSet(6.0), torch.float16))
+
+    def test_binary_promotes_dtype(self) -> None:
+        r = self._run(
+            lambda: ops.add(self._load("x"), self._load("y")),
+            {"x": (FiniteSet(1), torch.float16), "y": (FiniteSet(2), torch.float32)},
+        )
+        self.assertEqual(r, SetDtype(FiniteSet(3.0), torch.float32))
+
+    def test_comparison_is_bool(self) -> None:
+        r = self._run(
+            lambda: ops.lt(self._load("x"), self._load("y")),
+            {"x": (FiniteSet(1), torch.float16), "y": (FiniteSet(2), torch.float16)},
+        )
+        self.assertEqual(r, SetDtype(FiniteSet(1), torch.bool))
+
+    def test_to_dtype_changes_dtype_keeps_set(self) -> None:
+        r = self._run(
+            lambda: ops.to_dtype(self._load("x"), torch.float32),
+            {"x": (FiniteSet(50), torch.float16)},
+        )
+        self.assertEqual(r, SetDtype(FiniteSet(50), torch.float32))
+
+    def test_reduction_dtype(self) -> None:
+        r = self._run(
+            lambda: ops.reduction(torch.float32, torch.float16, "sum", self._load("x")),
+            {"x": (FiniteSet(0), torch.float16)},
+        )
+        self.assertEqual(r, SetDtype(S.Reals, torch.float32))
+
+    def test_unknown_input_dtype_stays_unknown(self) -> None:
+        tracer = SetDtypeTracer(_FixedLoadSolver({}))
+        with V.set_ops_handler(tracer):
+            r = ops.add(SetDtype(FiniteSet(1), None), SetDtype(FiniteSet(2), None))
+        self.assertEqual(r, SetDtype(FiniteSet(3), None))
+
+    def test_wrapped_domain_checks_still_raise(self) -> None:
+        with self.assertRaises(InvalidDomain) as ctx:
+            self._run(
+                lambda: ops.log(self._load("x")),
+                {"x": (FiniteSet(0), torch.float16)},
+            )
+        self.assertEqual(ctx.exception.func, "log")
+
+    @parametrize(
+        "dtype,value,overflows",
+        [
+            (torch.float16, 11.0, False),
+            (torch.float16, 12.0, True),
+            (torch.bfloat16, 12.0, True),
+            (torch.float32, 50.0, False),
+            (torch.float32, 89.0, True),
+        ],
+    )
+    def test_exp_domain_depends_on_dtype(self, dtype, value, overflows) -> None:
+        def fn():
+            return ops.exp(self._load("x"))
+
+        inputs = {"x": (FiniteSet(value), dtype)}
+        if overflows:
+            with self.assertRaises(InvalidDomain) as ctx:
+                self._run(fn, inputs)
+            self.assertEqual(ctx.exception.func, "exp")
+            self.assertFalse(ctx.exception.domain.contains(value))
+        else:
+            r = self._run(fn, inputs)
+            self.assertEqual(r.dtype, dtype)
+            self.assertAlmostEqual(float(next(iter(r.set))), math.exp(value), 2)
+
+    def test_exp_uses_dtype_after_upcast(self) -> None:
+        # 50 overflows exp in fp16 but not after an upcast to fp32.
+        r = self._run(
+            lambda: ops.exp(ops.to_dtype(self._load("x"), torch.float32)),
+            {"x": (FiniteSet(50), torch.float16)},
+        )
+        self.assertEqual(r.dtype, torch.float32)
+
+    def test_exp_mask_value_is_in_domain(self) -> None:
+        # The fp16 exp mask value must pass the fp16 exp domain check.
+        pad = padding.get_pad_value("exp", torch.float16)
+        r = self._run(
+            lambda: ops.exp(self._load("x")), {"x": (FiniteSet(pad), torch.float16)}
+        )
+        self.assertEqual(r.set, FiniteSet(0.0))
+
+
+instantiate_parametrized_tests(TestSetDtypeTracer)
+
+
+class TestArgNameToIndexTracer(unittest.TestCase):
+    """inx2arg maps InvalidDomain.arg_index back to the buffer it blames."""
+
+    def _trace(self, fn) -> list[str]:
+        tracer = ArgNameToIndexTracer()
+        with V.set_ops_handler(tracer):
+            fn()
+        return tracer.get_inx2arg()
+
+    def _load(self, name: str):
+        return ops.load(name, _I)
+
+    def test_binary_op(self) -> None:
+        self.assertEqual(
+            self._trace(lambda: ops.mul(self._load("x"), self._load("y"))), ["x", "y"]
+        )
+
+    def test_operand_order_is_argument_order(self) -> None:
+        # truediv(y, x): arg_index=1 (the divisor) must resolve to x.
+        self.assertEqual(
+            self._trace(lambda: ops.truediv(self._load("y"), self._load("x"))),
+            ["y", "x"],
+        )
+
+    def test_same_buffer_twice(self) -> None:
+        self.assertEqual(
+            self._trace(lambda: ops.mul(self._load("x"), self._load("x"))), ["x", "x"]
+        )
+
+    def test_constant_takes_a_slot(self) -> None:
+        inx = self._trace(
+            lambda: ops.truediv(ops.constant(1.0, torch.float16), self._load("x"))
+        )
+        self.assertEqual(len(inx), 2)
+        self.assertTrue(inx[0].startswith("__const_"))
+        self.assertEqual(inx[1], "x")
+
+    def test_ternary_op(self) -> None:
+        self.assertEqual(
+            self._trace(
+                lambda: ops.where(self._load("c"), self._load("a"), self._load("b"))
+            ),
+            ["c", "a", "b"],
+        )
+
+    def test_store_is_ignored(self) -> None:
+        self.assertEqual(
+            self._trace(lambda: ops.store("out", _I, ops.exp(self._load("x")))), ["x"]
+        )
+
+    def test_reduction(self) -> None:
+        self.assertEqual(
+            self._trace(
+                lambda: ops.store_reduction(
+                    "out",
+                    _I,
+                    ops.reduction(
+                        torch.float16,
+                        torch.float16,
+                        BATCH_MATMUL_OP,
+                        (self._load("x"), self._load("y")),
+                    ),
+                )
+            ),
+            ["x", "y"],
+        )
+
+    def test_indirect_indexing(self) -> None:
+        tracer = ArgNameToIndexTracer()
+        with V.set_ops_handler(tracer):
+            idx = ops.indirect_indexing(self._load("idx"), 4)
+            self.assertEqual(idx, padding._INDIRECT_INDEX_SYM)
+        self.assertEqual(tracer.get_inx2arg(), ["idx"])
+
+    def test_buffer_passed_as_kwarg_is_rejected(self) -> None:
+        with self.assertRaisesRegex(AssertionError, "kwargs"):
+            self._trace(lambda: ops.clamp(self._load("x"), min=self._load("y")))
+
+    def test_nested_operands_index_within_their_own_op(self) -> None:
+        # Expected behavior, not a bug. Each load records its position among
+        # the ArgName args of the op that consumes it, and the positions of
+        # different ops are merged, so for exp(a) * (b / c) the indices are
+        # a: 0 (in exp), b: 0 and c: 1 (in truediv). The merged list is then
+        # not the operand order of any single op: index 1 resolves to b, not
+        # to truediv's divisor c. This is fine on Spyre because split_multi_ops
+        # runs before track_padding_value and leaves one arithmetic op per
+        # body, so inx2arg only sees single-op bodies, where arg_index is the
+        # op's own operand position. If padding analysis ever runs on unsplit
+        # bodies, this mapping must change.
+        tracer = ArgNameToIndexTracer()
+        with V.set_ops_handler(tracer):
+            ops.mul(
+                ops.exp(self._load("a")),
+                ops.truediv(self._load("b"), self._load("c")),
+            )
+        self.assertEqual(tracer.name2inx, {"a": [0], "b": [0], "c": [1]})
+        self.assertEqual(tracer.get_inx2arg(), ["a", "b", "c"])
 
 
 # ---------------------------------------------------------------------------
@@ -1231,8 +1972,10 @@ class TestCoordinateMasking(unittest.TestCase):
     @parametrize("dtype", COORD_MASK_DTYPES)
     @parametrize("shape", SHAPES)
     def test_division(self, shape, dtype) -> None:
-        a_spyre = torch.full(shape, 2, dtype=dtype, device="spyre")
-        b_spyre = torch.full(shape, 2, dtype=dtype, device="spyre")
+        # Copied from the host, so the padding is recorded as 0: 0 / 0 must be
+        # coordinate-masked.
+        a_spyre = torch.full(shape, 2, dtype=dtype).to("spyre")
+        b_spyre = torch.full(shape, 2, dtype=dtype).to("spyre")
 
         def fn(x, y):
             return x / y
@@ -1244,8 +1987,6 @@ class TestCoordinateMasking(unittest.TestCase):
         exposed_padding = try_reinterpret_host_shape(result, unpadded).cpu()[
             :, shape[-1] :
         ]
-        print(f"{exposed_padding.shape=}")
-        print(f"{exposed_padding=}")
         assert (exposed_padding == 0).all().item()
 
     @parametrize("dtype", COORD_MASK_DTYPES)
@@ -1278,8 +2019,33 @@ class TestCoordinateMasking(unittest.TestCase):
         )
 
     @parametrize("dtype", COORD_MASK_DTYPES)
+    @parametrize("half_sticks", [1, 5, 11])
+    def test_division_by_broadcast_records_no_padding(self, dtype, half_sticks) -> None:
+        # The sum leaves its padding unknown, so realdiv asks for a mask on the
+        # divisor. The divisor is broadcast along the padded stick dim, so
+        # codegen drops that mask, and the quotient's padding is whatever
+        # x / garbage gives: no padding value may be recorded for it.
+        full, half = full_half_stick(dtype)
+        width = half * half_sticks
+        a_spyre = torch.full((full, width), 3, dtype=dtype, device="spyre")
+
+        def fn(x):
+            return x / x.sum(-1, keepdim=True)
+
+        compiled = torch.compile(fn, fullgraph=True, dynamic=False)
+        result = compiled(a_spyre)
+
+        self.assertIsNone(result.device_tensor_layout().padding_value)
+        torch.testing.assert_close(
+            result.cpu(), torch.full((full, width), 1.0 / width, dtype=dtype)
+        )
+
+    @parametrize("dtype", COORD_MASK_DTYPES)
     @parametrize("shape", SHAPES)
     def test_exp(self, shape, dtype) -> None:
+        # The reinterpreted view carries a fresh layout with no recorded
+        # padding value, so the analysis must assume the padding (222s from
+        # the full allocation) can hold anything.
         unpadded = unpad_shape(shape, dtype)
         a_spyre_full = torch.full(unpadded, 222, dtype=dtype, device="spyre")
         a_spyre = try_reinterpret_host_shape(a_spyre_full, shape)
@@ -1298,7 +2064,9 @@ class TestCoordinateMasking(unittest.TestCase):
     @parametrize("dtype", COORD_MASK_DTYPES)
     @parametrize("shape", SHAPES)
     def test_pow_neg(self, shape, dtype) -> None:
-        a_spyre = torch.full(shape, 0.5, dtype=dtype, device="spyre")
+        # Copied from the host, so the padding is recorded as 0, which the op
+        # cannot take: the kernel must coordinate-mask it.
+        a_spyre = torch.full(shape, 0.5, dtype=dtype).to("spyre")
 
         def fn(x):
             return torch.pow(x, -1.0)
@@ -1315,7 +2083,9 @@ class TestCoordinateMasking(unittest.TestCase):
     @parametrize("dtype", COORD_MASK_DTYPES)
     @parametrize("shape", SHAPES)
     def test_reciprocal(self, shape, dtype) -> None:
-        a_spyre = torch.full(shape, 0.5, dtype=dtype, device="spyre")
+        # Copied from the host, so the padding is recorded as 0, which the op
+        # cannot take: the kernel must coordinate-mask it.
+        a_spyre = torch.full(shape, 0.5, dtype=dtype).to("spyre")
 
         def fn(x):
             return torch.reciprocal(x)
@@ -1333,7 +2103,9 @@ class TestCoordinateMasking(unittest.TestCase):
     @parametrize("shape", SHAPES)
     def test_rsqrt(self, shape, dtype) -> None:
         full, half = full_half_stick(dtype)
-        a_spyre = torch.full(shape, 0.5, dtype=dtype, device="spyre")
+        # Copied from the host, so the padding is recorded as 0, which the op
+        # cannot take: the kernel must coordinate-mask it.
+        a_spyre = torch.full(shape, 0.5, dtype=dtype).to("spyre")
 
         def fn(x):
             return torch.rsqrt(x)
@@ -1350,7 +2122,9 @@ class TestCoordinateMasking(unittest.TestCase):
     @parametrize("dtype", COORD_MASK_DTYPES)
     @parametrize("shape", SHAPES)
     def test_log(self, shape, dtype) -> None:
-        a_spyre = torch.full(shape, 0.5, dtype=dtype, device="spyre")
+        # Copied from the host, so the padding is recorded as 0, which the op
+        # cannot take: the kernel must coordinate-mask it.
+        a_spyre = torch.full(shape, 0.5, dtype=dtype).to("spyre")
 
         def fn(x):
             return torch.log(x)
@@ -1474,6 +2248,240 @@ class TestMatmulPaddingNaN(unittest.TestCase):
         result = compiled(a_spyre, b_spyre)
         expected = fn(a_cpu, b_cpu)
         self._assert_matches_cpu_and_has_no_nan(result, expected)
+
+
+@instantiate_parametrized_tests
+class TestRecordedPadding(unittest.TestCase):
+    """The padding value recorded on a tensor's layout must stay true.
+
+    A fill records its value as the padding, and the padding analysis of a
+    later graph trusts it for a graph input. A graph that writes the input must
+    update the record (the wrapper's set_tensor_padding_value), or the next
+    graph reads padding it no longer holds.
+    """
+
+    # 3 fp16 elements in a 64-element stick: 61 padding elements.
+    SIZE = 3
+
+    def setUp(self) -> None:
+        # Compile every graph afresh: a cached graph skips track_padding_value,
+        # and the dynamic-shape tests would then pass without exercising it.
+        torch._dynamo.reset()
+        patcher = t_inductor_config.patch("force_disable_caches", True)
+        patcher.__enter__()
+        self.addCleanup(patcher.__exit__, None, None, None)
+
+    def _filled(self, value: float) -> torch.Tensor:
+        t = torch.empty(self.SIZE, dtype=torch.float16, device="spyre")
+        t.fill_(value)
+        self.assertEqual(t.device_tensor_layout().padding_value, value)
+        return t
+
+    def test_compiled_inplace_clears_recorded_padding(self) -> None:
+        t = self._filled(5.0)
+
+        def scale(x):
+            x.mul_(2)
+            return x
+
+        torch.compile(scale, fullgraph=True, dynamic=False)(t)
+        self.assertIsNone(t.device_tensor_layout().padding_value)
+        # The sum must not count the padding, whatever it now holds.
+        result = torch.compile(lambda x: x.sum(), dynamic=False)(t)
+        torch.testing.assert_close(result.cpu(), torch.tensor(30.0).half())
+
+    def test_compiled_double_inplace_clears_recorded_padding(self) -> None:
+        # A second mutation must not reseed the input from its pre-graph
+        # padding (5), which the first mutation already overwrote.
+        t = self._filled(5.0)
+
+        def scale_shift(x):
+            x.mul_(2)
+            x.add_(1)
+            return x
+
+        torch.compile(scale_shift, fullgraph=True, dynamic=False)(t)
+        self.assertIsNone(t.device_tensor_layout().padding_value)
+        torch.testing.assert_close(t.cpu(), torch.full((self.SIZE,), 11.0).half())
+
+    def test_dynamic_recompile_of_inplace(self) -> None:
+        # The second call recompiles with a symbolic size. The slice check in
+        # track_padding_value must not compare it with the concrete
+        # valid_elements of the layout ("cannot determine truth value").
+        def scale(x):
+            x.mul_(2)
+            return x
+
+        compiled = torch.compile(scale, fullgraph=True)
+        compiled(self._filled(5.0))
+        t = torch.empty(64, dtype=torch.float16, device="spyre")
+        t.fill_(1.0)
+        compiled(t)
+        torch.testing.assert_close(t.cpu(), torch.full((64,), 2.0).half())
+
+    def test_dynamic_slice_is_masked(self) -> None:
+        # A symbolic slice of the stick dim leaves valid input elements in the
+        # output padding; the following sum must still count only the slice.
+        def fn(x):
+            return (x[:, : x.shape[1] - 3] + 1).sum(dim=1)
+
+        x = torch.ones(4, 64, dtype=torch.float16)
+        result = torch.compile(fn, fullgraph=True, dynamic=True)(x.to("spyre"))
+        torch.testing.assert_close(result.cpu(), fn(x))
+
+    # TODO(mbayser): SpyreTensorLayout's operator== (and std::hash) skip the
+    # padding fields for now, so the layout guard does not recompile when only
+    # an input's recorded padding changes; see the TODO in
+    # torch_spyre/csrc/spyre_tensor_impl.h. Remove this xfail when they are
+    # compared again.
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason=(
+            "SpyreTensorLayout equality ignores the recorded padding, so a graph "
+            "compiled for one padding value is reused for another"
+        ),
+    )
+    def test_recorded_padding_change_recompiles(self) -> None:
+        # The padding analysis trusts an input's recorded padding, so a graph
+        # compiled for padding 0 must not be reused for padding 5.
+        zero_padded = torch.ones(self.SIZE, dtype=torch.float16).to("spyre")
+        five_padded = self._filled(5.0)
+        self.assertEqual(zero_padded.device_tensor_layout().padding_value, 0.0)
+        self.assertEqual(five_padded.device_tensor_layout().padding_value, 5.0)
+
+        counter = CompileCounter()
+        compiled = torch.compile(lambda x: x.sum(), backend=counter, dynamic=False)
+        compiled(zero_padded)
+        self.assertEqual(counter.frame_count, 1)
+        compiled(five_padded)
+        self.assertEqual(counter.frame_count, 2)
+
+    def test_unmaskable_op_on_unrecorded_padding_warns(self) -> None:
+        # Depthwise conv needs zero padding on both inputs and cannot be
+        # coordinate-masked. With no recorded padding on either input the
+        # analysis must ask for zero padding on each input in turn: the
+        # reduction has to name the input it rejects (arg_index), or the retries
+        # keep blaming input 0 and end in "Infinite loop". No pass rewrites
+        # padding yet, so the result is the "incompatible values" warning.
+        from torch_spyre._C import SpyreTensorLayout, get_device_dtype
+
+        dtype = get_device_dtype(torch.float16)
+        x = torch.randn(1, 16, 64, dtype=torch.float16)
+        w = torch.randn(16, 1, 3, dtype=torch.float16)
+        # 16 channels in a 64-wide stick: 48 padding elements per stick.
+        x_dev = x.to(
+            device_layout=SpyreTensorLayout([64, 1, 1, 64], [1, -1, 1024, 64], dtype)
+        )
+        w_dev = w.to(
+            device_layout=SpyreTensorLayout([3, 1, 1, 64], [1, -1, 3, 3], dtype)
+        )
+        # An in-place compiled graph leaves the padding unrecorded.
+        for t in (x_dev, w_dev):
+            torch.compile(lambda a: a.mul_(1), dynamic=False)(t)
+            self.assertIsNone(t.device_tensor_layout().padding_value)
+
+        def conv(x, w):
+            return torch.conv1d(x, w, None, stride=1, padding=0, groups=16)
+
+        with self.assertLogs("spyre.inductor.padding", level="WARNING") as logs:
+            result = torch.compile(conv, dynamic=False)(x_dev, w_dev)
+        self.assertTrue(any("incompatible values" in m for m in logs.output))
+        # The padding is in fact still zero here, so the result is correct.
+        torch.testing.assert_close(result.cpu(), conv(x, w), atol=0.5, rtol=0.1)
+
+    def test_eager_inplace_clears_recorded_padding(self) -> None:
+        # In-place eager ops write self through a compiled copy_from_d2d.
+        t = self._filled(5.0)
+        t.add_(1)
+        self.assertIsNone(t.device_tensor_layout().padding_value)
+        torch.testing.assert_close(t.sum().cpu(), torch.tensor(18.0).half())
+
+    def test_view_does_not_inherit_recorded_padding(self) -> None:
+        t = self._filled(5.0)
+        self.assertIsNone(t.view(self.SIZE).device_tensor_layout().padding_value)
+        self.assertIsNone(t.detach().device_tensor_layout().padding_value)
+        self.assertEqual(t.device_tensor_layout().padding_value, 5.0)
+
+    def test_h2d_records_zero_padding(self) -> None:
+        t = torch.tensor([1.0, -2.0, 3.0], dtype=torch.float16).to("spyre")
+        self.assertEqual(t.device_tensor_layout().padding_value, 0.0)
+
+    @parametrize("trust", [False, True])
+    def test_recorded_padding_trusted_only_when_enabled(self, trust) -> None:
+        # The sum needs zero padding. The H2D copy records 0, but until the
+        # recompile guard covers the padding state the analysis must not rely
+        # on it, so the sum is still masked.
+        # TODO: drop the parametrization when _TRUST_RECORDED_PADDING goes away.
+        from torch_spyre._inductor import padding
+
+        masked: dict[str, bool] = {}
+        track = padding.track_padding_value
+
+        def capture(graph: GraphLowering) -> None:
+            tracer_cls = padding.DomainRangeTracer
+            orig_run = tracer_cls.run_node
+
+            def run_node(tracer, op):
+                decision = orig_run(tracer, op)
+                if isinstance(op, ComputedBuffer):
+                    masked[op.get_name()] = decision.do_mask
+                return decision
+
+            with patch.object(tracer_cls, "run_node", run_node):
+                track(graph)
+
+        x = torch.tensor([1.0, -2.0, 3.0], dtype=torch.float16)
+        x_spyre = x.to("spyre")
+        self.assertEqual(x_spyre.device_tensor_layout().padding_value, 0.0)
+        with (
+            patch.object(passes, "track_padding_value", capture),
+            patch.object(padding, "_TRUST_RECORDED_PADDING", trust),
+        ):
+            result = torch.compile(lambda a: a.sum(), dynamic=False)(x_spyre)
+        self.assertTrue(masked, "no op traced")
+        self.assertEqual(any(masked.values()), not trust, masked)
+        torch.testing.assert_close(result.cpu(), x.sum(), atol=0.05, rtol=0.05)
+
+    def test_allocation_padding_is_unknown_not_nan(self) -> None:
+        # insert_bmm_padding pads y's K through constant_pad_nd, whose first op
+        # is an empty() allocation. Inductor gives it zero ranges, so tracing
+        # it would load nop_loader_fn's NaN constant: sympy's NaN, which no set
+        # can hold beside a number. The allocation's padding is unknown memory.
+        from torch_spyre._inductor import padding
+
+        ranges: dict[str, Any] = {}
+        track = padding.track_padding_value
+
+        def capture(graph: GraphLowering) -> None:
+            tracer_cls = padding.DomainRangeTracer
+            orig_run = tracer_cls.run_node
+
+            def run_node(tracer, op):
+                decision = orig_run(tracer, op)
+                ranges[op.get_name()] = tracer.buffer_range.get(op.get_name())
+                return decision
+
+            with patch.object(tracer_cls, "run_node", run_node):
+                track(graph)
+
+        x = torch.randn(4, 3, dtype=torch.float16)
+        w = torch.randn(3, 8, dtype=torch.float16)
+        with patch.object(passes, "track_padding_value", capture):
+            result = torch.compile(lambda a, b: a @ b, dynamic=False)(
+                x.to("spyre"), w.to("spyre")
+            )
+        allocations = [
+            name
+            for name, r in ranges.items()
+            if r is not None and r.is_superset(S.Reals)
+        ]
+        self.assertTrue(allocations, f"no unknown-padding buffer in {ranges}")
+        for name, r in ranges.items():
+            self.assertFalse(
+                r is not None and r.has(S.NaN), f"{name} padding range is {r}"
+            )
+        torch.testing.assert_close(result.cpu(), x @ w, atol=0.05, rtol=0.05)
 
 
 if __name__ == "__main__":

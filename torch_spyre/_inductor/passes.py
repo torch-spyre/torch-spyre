@@ -42,7 +42,7 @@ from . import pass_counters
 from .pass_counters import COUNTERS
 from .provenance import SpyreGraphTransformObserver, reset_provenance_warnings
 
-from .padding import insert_bmm_padding, insert_restickify_padding
+from .padding import insert_bmm_padding, insert_restickify_padding, track_padding_value
 from .temp_passes import (
     bmm_unflatten_pass,
     decompose_addmm,
@@ -617,6 +617,7 @@ class CustomPreSchedulingPasses:
             optimize_restickify_locations,
             reorder_nonstick_dims,
             finalize_layouts,
+            track_padding_value,
             # insert_restickify's advance-transfer logic (see its own
             # docstring) branches on whether old_name already has
             # `loop_info` stamped, to decide whether the per-trip advance
