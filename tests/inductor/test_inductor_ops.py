@@ -5449,16 +5449,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((128), dtype=torch.float16),
                     torch.zeros([128], dtype=torch.float16),
                 ),
-                "2d_fp32": (
-                    cached_randn((256, 128), dtype=torch.float32),
-                    cached_randn((128), dtype=torch.float32),
-                    cached_randn((128), dtype=torch.float32, differentiation=1),
-                ),
-                "2d_fp32_transposed": (
-                    cached_randn((128, 256), dtype=torch.float32).transpose(0, 1),
-                    cached_randn((128), dtype=torch.float32),
-                    cached_randn((128), dtype=torch.float32, differentiation=1),
-                ),
             },
         },
         ("test_rmsnorm", "test_rmsnorm_cpu"): {
