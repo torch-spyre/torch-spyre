@@ -638,6 +638,15 @@ torch.library.register_kernel("aten::floor_divide_.Tensor", ["spyre"])(
     _make_inplace_kernel(aten.floor_divide.default)
 )
 
+# ``masked_scatter`` reaches eager through its Spyre decomposition (see
+# ``spyre_masked_scatter``), not ``COMPILED_OPS``, so ``register_inplace_kernels``
+# does not pick up its in-place sibling. Without this, ``masked_scatter_`` has
+# no Spyre kernel at all and fails at ATen lookup, even for the row-broadcast
+# masks the functional op supports (issue #4437).
+torch.library.register_kernel("aten::masked_scatter_", ["spyre"])(
+    _make_inplace_kernel(aten.masked_scatter.default)
+)
+
 
 # cumsum's decomposition covers only aten.cumsum.default; out= and in-place
 # (cumsum_ reaches cumsum.out) run it and copy_ the result, like

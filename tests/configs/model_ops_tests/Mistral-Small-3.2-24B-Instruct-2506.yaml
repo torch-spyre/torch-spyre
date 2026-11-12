@@ -1858,34 +1858,6 @@ test_suite_config:
                   tags:
                     - constant
                     - torch.eq.2
-                - name: torch.masked_scatter
-                  sample_inputs_func:
-                    args:
-                      - tensor:
-                          shape: [1, 855, 5120]
-                          stride: [4377600, 5120, 1]
-                          storage_offset: 0
-                          dtype: torch.bfloat16
-                          device: cuda:0
-                          init: rand
-                      - tensor:
-                          shape: [1, 855, 1]
-                          stride: [855, 1, 1]
-                          storage_offset: 0
-                          dtype: torch.bool
-                          device: cuda:0
-                      - tensor:
-                          shape: [266, 5120]
-                          stride: [5120, 1]
-                          storage_offset: 0
-                          dtype: torch.bfloat16
-                          device: cuda:0
-                          init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mistral3/modeling_mistral3.py#L305 in torch_dynamo_resume_in_forward_at_307,
-                    code: inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)'
-                  tags:
-                    - bf16operation
-                    - torch.masked_scatter.1
                 - name: torch.arange
                   sample_inputs_func:
                     args:
@@ -4269,3 +4241,42 @@ test_suite_config:
                     - bf16operation
                     - constant
                     - torch.nn.functional.linear.18
+        # masked_scatter with a row mask ([1, 855, 1] broadcast along the last dim)
+        # lowers to a row gather and matches CPU, so it is held to mandatory_success
+        # instead of the model-wide xfail above (#4437).
+        - names:
+            - TestSpyreModelOps::test_model_ops_db
+          mode: mandatory_success
+          tags:
+            - model__Mistral-Small-3.2-24B-Instruct-2506
+          edits:
+            ops:
+              include:
+                - name: torch.masked_scatter
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 855, 5120]
+                          stride: [4377600, 5120, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 855, 1]
+                          stride: [855, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.bool
+                          device: cuda:0
+                      - tensor:
+                          shape: [266, 5120]
+                          stride: [5120, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mistral3/modeling_mistral3.py#L305 in torch_dynamo_resume_in_forward_at_307,
+                    code: inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)'
+                  tags:
+                    - bf16operation
+                    - torch.masked_scatter.1
