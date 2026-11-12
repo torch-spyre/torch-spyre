@@ -365,3 +365,23 @@ def test_a_for_each_tile_loop_and_a_span_overflow_group_have_distinct_variables(
     assert all(len(names) == 1 for names in seen.values()), seen
     names = [next(iter(v)) for v in seen.values()]
     assert len(set(names)) == len(names), seen
+
+
+@pytest.mark.parametrize("sencores", [1, 4, 32])
+@pytest.mark.parametrize(
+    "case",
+    ["pointwise_copy_out", "matmul_output_tiled_n", "matmul_pointwise_consumer"],
+)
+def test_the_term_survives_every_core_split(case, sencores):
+    """Work division may split the tiled dim across cores. The loop variable is
+    pinned to zero in the base coordinates, so a split must neither drop the term
+    nor apply it twice: the result matches fp32 and the kernel's check is silent."""
+    from torch_spyre._inductor import config
+
+    fn, shapes, limit, *_ = CASES[case]
+    args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
+    with config.patch({"sencores": sencores}):
+        compiled, looped = _recording(lambda: compile_span_overflow(fn, args, limit))
+    assert looped
+    assert all(len(op.loop_vars) == 1 for op in looped)
+    assert _relative_error(compiled.outputs, fn(*[a.float() for a in args])) < 2e-2
