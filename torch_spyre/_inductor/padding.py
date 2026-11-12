@@ -128,7 +128,7 @@ from torch_spyre._C import (
     SpyreTensorLayout,
     get_elem_in_stick,
 )
-from .config import padding_strict_mode
+import torch_spyre._inductor.config as config
 
 
 logger = get_inductor_logger("padding")
@@ -1388,7 +1388,7 @@ def _nan_gives_any_boolean(op):
 
 def _user_values():
     values = S.Reals
-    if padding_strict_mode:
+    if config.padding_strict_mode:
         values = values.union(FiniteSet(_NAN))
     return values
 
@@ -1668,7 +1668,7 @@ class DomainRangeSolver(DefaultHandler):
     @_propagates_nan
     def sqrt(self, x0):
         if not x0.is_subset(self.positive_numbers):
-            raise InvalidDomain(self.positive_numbers, "rsqrt")
+            raise InvalidDomain(self.positive_numbers, "sqrt")
         return self._unary_op(math.sqrt, x0, self.positive_numbers)
 
     @_propagates_nan
