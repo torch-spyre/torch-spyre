@@ -35,7 +35,7 @@ SuperDSC (Super Design Space Config) is a JSON-based intermediate representation
 |---|---|
 | `coreFoldProp_` | How the iteration space is divided across cores (for example `{"factor_": 2}` for a 2-core split). |
 | `numWkSlicesPerDim_` | Number of work slices per iteration dimension. `{"c0": 2, "c1": 1}` says dim `c0` is split two ways and dim `c1` is not split. |
-| `coreIdToWkSlice_` | Maps each core ID to the slice indices it owns. |
+| `coreIdToWkSlice_` | Maps each active core ID to the slice indices it owns. Inactive positions in a sparse core fold are not listed. |
 | `dscs_` | Array of `DesignSpaceConfig` entries, one per compute configuration. |
 
 Each `dscs_` entry is a complete description of one compute configuration:

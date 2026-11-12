@@ -50,7 +50,11 @@ from torch_spyre._inductor.constants import (
     TOPK_OPS,
     KEEP_BY_INDEX_OP,
 )
-from torch_spyre._inductor.core_mapping import matmul_reduction_dim
+from torch_spyre._inductor.core_mapping import (
+    apply_core_stride,
+    matmul_reduction_dim,
+    resolve_core_stride,
+)
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
 from torch_spyre._inductor.indirect_access import (
     compute_indirect_max_dim_sizes,
@@ -2173,8 +2177,20 @@ def _finalize_tensor_work_divisions(
         )
         tensor_cores = effective.num_cores or num_cores
         tensor_owners = math.prod(effective.work_slices.values())
+        # A strided (sparse) assignment widens the operation's core span
+        # (num_cores = slices * stride) while only the strided ids are
+        # dispatched, so the slice count divides the span instead of equalling
+        # it. That shape is admitted only when the dispatched list is exactly
+        # one core per slice.
+        sparse_span = (
+            num_cores > tensor_owners
+            and num_cores % tensor_owners == 0
+            and tensor_cores == num_cores
+            and bool(completed_producer_cores)
+            and len(completed_producer_cores) == tensor_owners
+        )
         valid = (
-            tensor_cores == num_cores == tensor_owners
+            tensor_cores == num_cores == tensor_owners or sparse_span
             if not is_lx_relayout
             else num_cores % tensor_cores == 0
             and tensor_cores % tensor_owners == 0
@@ -2812,6 +2828,21 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
                 )
                 for dim, owner in core_id_to_work_slice.items()
             }
+    # Sparse core placement. The backend's core fold is positional: its size
+    # is the highest id in use + 1, every per-core data blob must carry one
+    # entry per fold position, and coreIdsUsed_ only lists the dispatched
+    # cores. apply_core_stride spreads num_cores logical slices evenly across
+    # the card's physical cores when that count divides evenly, widening the
+    # fold and dispatching only the strided ids. Relayouts keep their separate
+    # core-domain handling above. The emitted work-slice map includes only
+    # active core ids; this is required for sparse K-split matmuls as well as
+    # other operations (see the K-split core-placement experiment artifacts).
+    completed_producer_cores = op_spec.completed_producer_cores
+    if not is_relayout and resolve_core_stride(num_cores, _spyre_config.sencores) > 1:
+        core_id_to_work_slice, num_cores, completed_producer_cores = apply_core_stride(
+            core_id_to_work_slice, num_cores, _spyre_config.sencores
+        )
+
     for dim in mapping_dims:
         if dim not in core_id_to_work_slice:
             if int(dim_splits[dim]) != 1:
@@ -2824,7 +2855,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         core_id_to_work_slice,
         num_cores,
         is_relayout,
-        op_spec.completed_producer_cores,
+        completed_producer_cores,
     )
     # Collect index tensor indices for indirect access
     indirect_access_indices = [
@@ -2880,7 +2911,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             coordinate_masking=coordinate_masking,
             symbolic_dims=symbolic_dims,
             indirect_access_indices=indirect_access_indices,
-            completed_producer_cores=op_spec.completed_producer_cores,
+            completed_producer_cores=completed_producer_cores,
             debug_handle=op_spec.debug_handle,
             # At most one of these is non-empty for a given op (pool / depthwise
             # / forward-conv are mutually exclusive), so the keys never collide.

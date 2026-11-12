@@ -590,6 +590,49 @@ def core_to_slice_mapping(
     return result
 
 
+def resolve_core_stride(num_cores: int, physical_cores: int) -> int:
+    """Spread ``num_cores`` logical slices evenly over a wider physical span.
+
+    Returns the largest ``S`` with ``num_cores * S <= physical_cores`` and
+    ``physical_cores % num_cores == 0``, so slice ``i`` lands on physical core
+    ``i * S`` and every placement uses equally spaced ids. Returns 1 (no
+    spreading) when ``num_cores`` does not divide ``physical_cores``, when
+    either count is non-positive, or when there is only one slice to place:
+    with nothing to space out, widening the fold would only add overhead.
+    """
+    if num_cores <= 1 or physical_cores <= 0 or physical_cores % num_cores != 0:
+        return 1
+    return physical_cores // num_cores
+
+
+def apply_core_stride(
+    core_map: Mapping[Symbol, Expr], num_cores: int, physical_cores: int
+) -> tuple[dict[Symbol, Expr], int, tuple[int, ...]]:
+    """Place ``num_cores`` logical slices onto a strided physical core span.
+
+    ``core_map`` holds formulas in ``Symbol("core_id")`` over the logical
+    range ``0..num_cores-1``. The backend's core fold is positional: its size
+    is the highest id in use plus one, and the dispatched set is whatever ids
+    are actually listed, so a wider, evenly spaced span is a legal physical
+    placement as long as exactly one physical id per logical slice is
+    dispatched. ``resolve_core_stride`` picks that spacing from the physical
+    core count; a stride of 1 returns ``core_map`` unchanged.
+
+    Returns the rewritten map, the widened fold size (``num_cores * stride``),
+    and the dispatched physical ids.
+    """
+    stride = resolve_core_stride(num_cores, physical_cores)
+    if stride == 1:
+        return dict(core_map), num_cores, tuple(range(num_cores))
+    core_id = Symbol("core_id")
+    rewritten = {
+        dim: owner.xreplace({core_id: floor(core_id / stride)})
+        for dim, owner in core_map.items()
+    }
+    span = num_cores * stride
+    return rewritten, span, tuple(range(0, span, stride))
+
+
 def matmul_reduction_dim(
     iteration_space: Iterable[Symbol], args: Iterable[TensorArg]
 ) -> Symbol | None:

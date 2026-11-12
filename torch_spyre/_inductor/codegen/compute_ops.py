@@ -1522,13 +1522,13 @@ def generate_sdsc(
                 # Window dims (ki/kj) are not real dims of any tensor for pool
                 # operations and hence should not be emitted
                 "coreIdToWkSlice_": {
-                    core: {
-                        dim: slc
-                        for dim, slc in slices.items()
+                    str(core): {
+                        str(dim): slc
+                        for dim, slc in core_id_to_wk_slice[str(core)].items()
                         if sdsc_spec.opfunc not in POOL_OPS
                         or dim not in sdsc_spec.window_dims
                     }
-                    for core, slices in core_id_to_wk_slice.items()
+                    for core in active_core_ids
                 },
                 "coreIdToDscSchedule": {
                     str(c): [[-1, 0, 0, 0]] for c in active_core_ids
