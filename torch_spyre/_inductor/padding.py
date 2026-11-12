@@ -1510,7 +1510,21 @@ class DomainRangeSolver(DefaultHandler):
 
     @_propagates_nan
     def floor(self, x0):
-        return x0.intersection(S.Integers)
+        # floor maps each value to an integer, not necessarily one in x0
+        # (floor(0.5) = 0), so x0 cannot simply be intersected with the
+        # integers. +-oo map to themselves.
+        if isinstance(x0, FiniteSet):
+            return FiniteSet(*(e if e.is_infinite else sympy.floor(e) for e in x0))
+        if x0.is_empty:
+            return S.EmptySet
+        # floor is monotonic, so the image of the finite values lies in the
+        # integers between floor(inf) and floor(sup). Every integer there is
+        # attained when x0 is an interval; for other sets this over-
+        # approximates, which is safe.
+        low = x0.inf if x0.inf.is_infinite else sympy.floor(x0.inf)
+        high = x0.sup if x0.sup.is_infinite else sympy.floor(x0.sup)
+        finite = S.Integers.intersect(Interval(low, high))
+        return finite.union(x0.intersect(FiniteSet(-oo, oo)))
 
     @_nan_gives_any_boolean
     def ge(self, x0, x1):

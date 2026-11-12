@@ -409,7 +409,23 @@ class TestDomainRangeSolver(unittest.TestCase):
             self.s.clamp(FiniteSet(-3, 0.5, 9), 0, 1), FiniteSet(0, 0.5, 1)
         )
         self.assertSetEqual(self.s.clamp(Interval(2, 3), 0, 1), FiniteSet(1))
-        self.assertSetEqual(self.s.floor(Interval(0.5, 3)), FiniteSet(1, 2, 3))
+        # floor(0.5) = 0 is in the image although 0 is not in the input.
+        self.assertSetEqual(self.s.floor(Interval(0.5, 3)), FiniteSet(0, 1, 2, 3))
+        self.assertSetEqual(self.s.floor(FiniteSet(0.5)), FiniteSet(0))
+        self.assertSetEqual(self.s.floor(FiniteSet(-0.5, 2.7)), FiniteSet(-1, 2))
+        self.assertSetEqual(self.s.floor(Interval(0.2, 0.7)), FiniteSet(0))
+        self.assertSetEqual(self.s.floor(S.Reals), S.Integers)
+        self.assertSetEqual(
+            self.s.floor(Interval(-oo, 1.5).union(FiniteSet(-oo))),
+            S.Integers.intersect(Interval(-oo, 1)).union(FiniteSet(-oo)),
+        )
+        self.assertSetEqual(self.s.floor(FiniteSet(oo, -oo)), FiniteSet(oo, -oo))
+        # The motivating case: sigmoid of zero padding is 0.5, whose floor is
+        # 0, so a following reciprocal must see 0 in its input, not EmptySet.
+        floored = self.s.floor(self.s.sigmoid(FiniteSet(0)))
+        self.assertSetEqual(floored, FiniteSet(0))
+        with self.assertRaises(padding.InvalidDomain):
+            self.s.reciprocal(floored)
         self.assertSetEqual(
             self.s.where(FiniteSet(1), FiniteSet(0), FiniteSet(2)), FiniteSet(0, 2)
         )
