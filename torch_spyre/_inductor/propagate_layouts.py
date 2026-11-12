@@ -709,7 +709,6 @@ def _convert_layout(
         if fmt in STAGGERED_EAS and input_ea == ElementArrangement.STANDARD:
             in_coords = host_coordinates(in_layout, dep, None)
             source_device_coords = device_coordinates(stl, dep, None)
-            staggered_arg = PropArg(dep, in_layout, [stl])
             if source_device_coords[-1].free_symbols:
                 for target_stick_expr in in_coords:
                     if not target_stick_expr.free_symbols:
@@ -720,7 +719,6 @@ def _convert_layout(
                         target_stick_expr,
                         in_coords,
                         source_device_coords,
-                        arg=staggered_arg,
                     )
                     if target_stl is None:
                         continue
@@ -976,7 +974,6 @@ def _clone_layout(
             target_stick,
             in_host_coords,
             in_device_coords,
-            arg=args[0],
         )
         if target_stl is not None:
             required_in_stl = target_stl
@@ -1101,8 +1098,6 @@ def _find_layout_avoiding_var_on_stick(
             target_stick_expr,
             arg_host_coords,
             dev_coords,
-            arg=arg,
-            label=label,
         )
         if result is not None:
             return result
@@ -1458,8 +1453,6 @@ def _stl_via_restickify(
             target_stick_expr,
             arg_host_coords,
             dev_coords,
-            arg=arg,
-            label=label,
         )
         if result is not None:
             if nosplit_var is not None:
@@ -2979,7 +2972,6 @@ def _find_alt_target_stl(
                     target_stick,
                     in_host_coords,
                     in_device_coords,
-                    arg=in_arg,
                 )
                 is not None
             ):
