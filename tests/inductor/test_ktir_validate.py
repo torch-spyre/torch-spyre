@@ -43,7 +43,7 @@ from torch_spyre._C import DataFormats, ElementArrangement
 from torch_spyre._inductor.codegen import ktir
 from torch_spyre._inductor.codegen.opspec_utils import (
     align_reshape_plan,
-    needs_relayout,
+    operand_alignment,
     relayout_strides,
     row_major_strides,
 )
@@ -313,6 +313,21 @@ RELAYOUT_CASES_FP32 = {
         {_C0: 4, _C1: 8, _C2: 64},
     ),
 }
+
+
+def needs_relayout(source: TensorArg, out: TensorArg) -> bool:
+    """Whether ``operand_alignment`` reports ``source`` as not aligned with ``out``.
+
+    The question ``KernelPlan._compute_step`` asks to find the input a relayout
+    reads through strided memory.
+    """
+    aligned, _plan = operand_alignment(
+        list(source.device_coordinates),
+        [int(s) for s in source.device_size],
+        list(out.device_coordinates),
+        [int(s) for s in out.device_size],
+    )
+    return not aligned
 
 
 def make_relayout_op_spec(

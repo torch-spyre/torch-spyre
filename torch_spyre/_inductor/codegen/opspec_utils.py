@@ -47,7 +47,7 @@ __all__ = [
     "align_reshape_plan",
     "buf_id",
     "core_divisions",
-    "needs_relayout",
+    "operand_alignment",
     "per_core_extent",
     "placeholder_axes",
     "reduction_indexing",
@@ -292,7 +292,7 @@ def align_reshape_plan(
             needs a restickify; and, from ``_dim_info``, for a coordinate form
             it cannot classify.
     """
-    aligned, plan = _alignment(in_coords, in_block, out_coords, out_block)
+    aligned, plan = operand_alignment(in_coords, in_block, out_coords, out_block)
     if not aligned:
         raise NotImplementedError(
             "OpSpec alignment: pointwise operand needs a transpose (restickify) "
@@ -301,19 +301,28 @@ def align_reshape_plan(
     return plan
 
 
-def _alignment(
+def operand_alignment(
     in_coords: Sequence[sympy.Expr],
     in_block: Sequence[int],
     out_coords: Sequence[sympy.Expr],
     out_block: Sequence[int],
 ) -> tuple[bool, tuple[list[int], list[int] | None] | None]:
-    """``(aligned, plan)``: the one answer ``align_reshape_plan`` and
-    ``needs_relayout`` both read.
+    """``(aligned, plan)`` for one pointwise operand against the output.
+
+    The one answer both callers read: ``align_reshape_plan`` returns the plan or
+    refuses, and the KTIR plan (``KernelPlan._compute_step``) reads ``aligned``
+    to find an input laid out differently from its output -- the input a
+    relayout reads through strided memory.
 
     ``aligned`` is False when no reshape or broadcast lines the operand up with
-    the output (``_match_axes``).  ``plan`` is then None; otherwise it is what
-    ``align_reshape_plan`` returns: None when the operand already matches the
-    output, else ``(reshape_to, broadcast_to)``.
+    the output (``_match_axes``): its axes are permuted, an axis holding data
+    pairs with nothing, or its lanes walk another loop variable.  ``plan`` is
+    then None.  Otherwise ``plan`` is what ``align_reshape_plan`` returns: None
+    when the operand already matches the output, else
+    ``(reshape_to, broadcast_to)``.
+
+    Raises ``NotImplementedError`` (from ``_dim_info``) for a coordinate form it
+    cannot classify, rather than reporting it as not aligned.
     """
     in_block = [int(b) for b in in_block]
     out_block = [int(b) for b in out_block]
@@ -324,32 +333,6 @@ def _alignment(
         return False, None
     broadcast_to = out_block if reshape_to != out_block else None
     return True, (reshape_to, broadcast_to)
-
-
-def needs_relayout(source: TensorArg, out: TensorArg) -> bool:
-    """Whether ``source``'s elements must be moved to line up with ``out``'s.
-
-    True when ``source``'s device axes are a reordering of ``out``'s, or a stick
-    split differs, so no reshape or broadcast lines them up.  False when they
-    already match or a reshape or broadcast lines them up.
-
-    Built on ``_alignment``, the answer ``align_reshape_plan`` gives: True
-    exactly where ``align_reshape_plan`` would refuse the operand as needing a
-    transpose, so the pointwise path and this detector cannot disagree.  It is
-    a necessary condition for ``relayout_strides``, not a sufficient one -- a
-    padded stick or a broadcast combined with a transpose is detected here and
-    then refused by ``relayout_strides`` with its own message.
-
-    Raises ``NotImplementedError`` (from ``_dim_info``) for a coordinate form it
-    cannot classify, rather than reporting it as a relayout.
-    """
-    aligned, _plan = _alignment(
-        list(source.device_coordinates),
-        [int(s) for s in source.device_size],
-        list(out.device_coordinates),
-        [int(s) for s in out.device_size],
-    )
-    return not aligned
 
 
 def operand_indexing(
