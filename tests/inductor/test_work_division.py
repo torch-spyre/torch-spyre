@@ -113,8 +113,11 @@ from torch_spyre._inductor.work_division import (
     _matmul_hbm_us,
     _matmul_multicast_penalty,
     _matmul_split_cost,
+    _work_distribution_op,
     adjust_it_space_for_sticks,
     apply_splits,
+    defer_work_division,
+    deferred_work_division,
     enumerate_work_division_candidates,
     multi_dim_iteration_space_split,
     span_floors,
@@ -2843,6 +2846,33 @@ class TestSpanFloors(unittest.TestCase):
             self.assertRaisesRegex(Unsupported, "at most 1"),
         ):
             span_floors(op)
+
+    def test_infeasible_floors_fail_the_same_with_and_without_the_solve(self):
+        """Infeasible floors raise wherever they are first computed, with one
+        message. Without the solve that is work distribution. With division
+        left to the solve, the op's menu raises first; the solve then falls
+        back to the split work distribution would commit, which raises again."""
+        o, r0, r1 = (_isym(name) for name in ("o", "r0", "r1"))
+        op = _computed_buffer((8,), name="infeasible_floors")
+        output_td = _tensor_dep("infeasible_floors", (8,), (o,))
+        graph = MagicMock(operations=[op])
+        allocator = CoOptimizingAllocator(_UNBUILT_SOLVER, size=1)
+        with self._context_inputs(
+            op,
+            {o: 8, r0: 8, r1: 8},
+            output_td,
+            ConstraintResult(),
+            floors={r0: 2, r1: 2},
+        ):
+            with self.assertRaisesRegex(Unsupported, "at most 1") as no_solve:
+                _work_distribution_op(op, max_cores=32)
+            defer_work_division(graph)
+            with self.assertRaises(Unsupported) as solve:
+                allocator._enumerate_core_divisions(op, 32, graph)
+        self.assertEqual(str(solve.exception), str(no_solve.exception))
+        # Raised by the fallback, not by the menu alone: dividing the deferred
+        # op took it off the deferred set.
+        self.assertEqual(deferred_work_division(graph), set())
 
     def test_ops_that_are_not_divided_have_no_floors(self):
         """No context is built for them, so nothing about them is asked."""
