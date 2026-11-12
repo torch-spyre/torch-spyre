@@ -150,6 +150,7 @@ class Sandbox:
         ("chat_turns", "ts >= now() - INTERVAL {days} DAY", "(turn_id, ts)"),
         ("chat_turn_retention", "ts >= now() - INTERVAL {days} DAY", "(actor, ts)"),
         ("model_priority_events", "ts >= now() - INTERVAL {days} DAY", "(event_id)"),
+        ("artifact_sweep_runs", "ts >= now() - INTERVAL {days} DAY", "(ts, run_id)"),
         (
             "dispatch_targets",
             "published_at >= now() - INTERVAL {days} DAY",
