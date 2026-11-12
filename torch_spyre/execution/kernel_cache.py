@@ -428,16 +428,6 @@ def compute_specs_hash(
                                 sk.arg_index,
                                 sk.offset,
                             )
-                        elif sk.kind == "kernel_derived_symbolic":
-                            tag = f"derived_sym:{sk.pytorch_sym}:{sk.split_count}:{sk.core_idx}"
-                            content_parts.append(tag.encode())
-                            _debug_pool_offsets.append(tag)
-                            logger.debug(
-                                "  [hash]   derived_sym %s split=%d core=%d",
-                                sk.pytorch_sym,
-                                sk.split_count,
-                                sk.core_idx,
-                            )
 
     _collect(specs_list)
 

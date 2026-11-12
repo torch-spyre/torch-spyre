@@ -68,7 +68,6 @@ _EXPECTED_OP_SPEC_SCHEMA = {
     "tiled_symbols": "list[list[Symbol]]",
     "core_id_to_work_slice": "dict[Symbol, Expr] | None",
     "tiled_symbol_trip_counts": "dict[Symbol, int]",
-    "symbolic_dim_bounds": "dict[str, tuple[int, int]]",
     "node_output_ranges": "tuple[Expr, ...] | None",
     "completed_producer_cores": "tuple[int, ...]",
     "debug_handle": "DebugHandle | None",
@@ -266,7 +265,6 @@ def _canonical_spec(spec: object) -> object:
                 for level in spec.tiled_symbols
             ],
             "tiled_symbol_trip_counts": _canonical_value(spec.tiled_symbol_trip_counts),
-            "symbolic_dim_bounds": _canonical_value(spec.symbolic_dim_bounds),
             "node_output_ranges": _canonical_value(spec.node_output_ranges),
             # Preserve position and multiplicity in the bundle fingerprint.
             # The descriptor separately deduplicates its consumer-facing list.

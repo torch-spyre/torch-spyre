@@ -72,7 +72,7 @@ def _dedup_syms(
     """First-seen canonicalization of symbol indices.
 
     Multiple SDSCs operating on different slices of the same logical tensor
-    (or the same dimension symbol) emit duplicate symbols that must map to one
+    emit duplicate symbols that must map to one
     function parameter. Returns the sym_idx of the first symbol matching each
     distinct ``key``, in first-seen order, and a map from duplicate sym_idx to
     its canonical (first-seen) sym_idx.
@@ -148,9 +148,7 @@ def generate_bundle(
     entries are supported).
 
     HBM tensor addresses are emitted as runtime symbols (``%sym_N``
-    constants) in ``bundle.mlir``. Dimension symbols (from ``mark_dynamic``)
-    always produce
-    ``!sdscbundle.input_arg<index, granularity=G, max_value=M>`` parameters.
+    constants) in ``bundle.mlir``.
 
     Requires ``config.bundle_symbolic_args`` to be True: the SDSC path
     (this function) unconditionally emits symbolic addresses, but
@@ -171,7 +169,7 @@ def generate_bundle(
       body — there is no ``%pool_base_addr`` function parameter.
     - ``True``: emitted as a ``%pool_base_addr: !sdscbundle.input_arg<index>``
       function parameter (ordered first, before any
-      ``kernel_arg_sym_indices``/``dimension_sym_indices`` params) plus an
+      ``kernel_arg_sym_indices`` params) plus an
       ``sdscbundle.input_arg_extract value from %pool_base_addr`` statement
       producing ``%pool`` as the first statement of the bundle body. The
       caller (``SpyreKernel.call_kernel()``) is then responsible for
@@ -263,20 +261,10 @@ def generate_bundle(
     compiled_iter = iter(compiled)
     addr_counter = [0]
 
-    # Flatten symbol kinds from all SDSCs. sym_idx_to_dim_origin records
-    # (sdsc_idx, ordinal) for each dimension symbol to generate its MLIR name.
-    symbol_kinds: list[SymbolKind] = []
-    sym_idx_to_dim_origin: dict[int, tuple[int, int]] = {}
-    for sdsc_idx, (_, _, _, local_kinds, _) in enumerate(compiled):
-        local_dim_ordinal = 0
-        for lk in local_kinds:
-            if lk.is_dimension:
-                local_dim_ordinal += 1
-                sym_idx_to_dim_origin[len(symbol_kinds)] = (
-                    sdsc_idx,
-                    local_dim_ordinal,
-                )
-            symbol_kinds.append(lk)
+    # Flatten symbol kinds from all SDSCs.
+    symbol_kinds: list[SymbolKind] = [
+        lk for (_, _, _, local_kinds, _) in compiled for lk in local_kinds
+    ]
 
     # Determine whether a pool parameter is needed (any pool symbol present).
     has_pool = any(sk.is_pool for sk in symbol_kinds)
@@ -310,22 +298,6 @@ def generate_bundle(
     shard_names: dict[int, str] = {
         idx: f"%arg_{symbol_kinds[idx].arg_index}_shard_{symbol_kinds[idx].core_idx}"
         for idx in shard_sym_indices
-    }
-
-    # Deduplicate dimension symbols by pytorch_sym (same shape var may appear
-    # in every SDSC with a different local ID).
-    dimension_sym_indices, dimension_dup_canonical = _dedup_syms(
-        symbol_kinds,
-        matches=lambda sk: sk.is_dimension,
-        key=lambda sk: sk.pytorch_sym,
-    )
-    # MLIR name for each canonical dimension symbol, e.g. "%sym_0_1".
-    dim_param_names: dict[int, str] = {
-        sym_idx: (
-            f"%sym_{sym_idx_to_dim_origin[sym_idx][0]}"
-            f"_{sym_idx_to_dim_origin[sym_idx][1]}"
-        )
-        for sym_idx in dimension_sym_indices
     }
 
     # Loop-bound dimensions come from the SPEC TREE, not from symbol_kinds. That
@@ -364,20 +336,16 @@ def generate_bundle(
         #     present: one %pool_base_addr !sdscbundle.input_arg<index>
         #     param, emitted first
         #   - one !sdscbundle.input_arg<index> param per kernel tensor arg
-        #   - one !sdscbundle.input_arg<index, granularity=G, max_value=M> param
-        #     per unique dynamic-shape (mark_dynamic) symbol; emitted whenever
-        #     present.
         # Otherwise (default), pool allocation is emitted in the body as
         # device_mem_allocate, not as a function parameter.
         emit_pool_param = has_pool and _spyre_config.frontend_pool_allocation
         # Built in lock-step with the params list so the two can never diverge.
-        # Order: pool (when frontend_pool_allocation), kernel addresses, dimensions.
+        # Order: pool (when frontend_pool_allocation), kernel addresses, shards.
         param_symbol_kinds: list[SymbolKind] = []
         if (
             emit_pool_param
             or kernel_arg_sym_indices
             or shard_sym_indices
-            or dimension_sym_indices
             or loop_dim_bounds
         ):
             params = []
@@ -391,12 +359,6 @@ def generate_bundle(
             for sym_idx in shard_sym_indices:
                 params.append(
                     f"{shard_names[sym_idx]}_addr: !sdscbundle.input_arg<index>"
-                )
-                param_symbol_kinds.append(symbol_kinds[sym_idx])
-            for sym_idx in dimension_sym_indices:
-                dim_sk = symbol_kinds[sym_idx]
-                params.append(
-                    f"{dim_param_names[sym_idx]}_base: {_dim_input_arg_type(dim_sk)}"
                 )
                 param_symbol_kinds.append(symbol_kinds[sym_idx])
             # Last, so adding a loop dimension never shifts an existing
@@ -466,14 +428,6 @@ def generate_bundle(
                 f"\t\t{name} = sdscbundle.input_arg_extract value from"
                 f" {name}_addr : !sdscbundle.input_arg<index> -> index\n"
             )
-        for sym_idx in dimension_sym_indices:
-            dim_sk = symbol_kinds[sym_idx]
-            name = dim_param_names[sym_idx]
-            f.write(
-                f"\t\t{name} = sdscbundle.input_arg_extract value from"
-                f" {name}_base : {_dim_input_arg_type(dim_sk)} -> index\n"
-            )
-
         # Before the loop constants on purpose: a symbolic bound IS one of these
         # SSA values, so it has to be in scope by the time the loop setup below
         # refers to it.
@@ -514,8 +468,6 @@ def generate_bundle(
         #                         deduped by (sliced_base_ssa, per_core_offset)
         #   - "pool"            → arith.addi %pool, <pool_offset>
         #                         deduped by pool offset value
-        #   - "dimension"       → skipped; replaced by function parameter above,
-        #                         resolved at use-sites via sym_canonical
         #   - anything else     → arith.constant (non-symbolic path)
         # All kernel sym indices to skip during emission (canonical + duplicates).
         kernel_arg_sym_set = set(kernel_arg_sym_indices) | set(kernel_dup_canonical)
@@ -539,14 +491,6 @@ def generate_bundle(
         sym_canonical.update(
             (dup_idx, shard_names[canon_idx])
             for dup_idx, canon_idx in shard_dup_canonical.items()
-        )
-        # Dimension symbols resolve to their input_arg_extract result.
-        sym_canonical.update(
-            (sym_idx, dim_param_names[sym_idx]) for sym_idx in dimension_sym_indices
-        )
-        sym_canonical.update(
-            (dup_idx, dim_param_names[canon_idx])
-            for dup_idx, canon_idx in dimension_dup_canonical.items()
         )
         # slice_addi_emitted[(arg_index, slice_offset)] → SSA name for sliced base
         slice_addi_emitted: dict[tuple[int, int], str] = {}
@@ -618,7 +562,7 @@ def generate_bundle(
                     )
                     pool_addi_emitted[value] = addi_ssa
                 sym_canonical[sym_idx] = pool_addi_emitted[value]
-            elif sk is not None and (sk.is_dimension or sk.is_shard_kernel):
+            elif sk is not None and sk.is_shard_kernel:
                 continue  # replaced by function parameter; resolved via sym_canonical
             else:
                 f.write(f"\t\t%sym_{sym_idx + 1} = arith.constant {value} : index\n")
@@ -1149,22 +1093,12 @@ def _emit_specs(
 
 
 def _extract_symbol_ids(sdsc_json: dict) -> list[int]:
-    """Extract all negative symbol IDs from an SDSC JSON, dimension IDs first.
-
-    Dimension IDs (``dimToSymbolMapping_``) have lower-magnitude negatives than
-    HBM address IDs, so scanning them first keeps ``ids`` sorted naturally.
-    """
+    """Extract all negative symbol IDs from an SDSC JSON."""
     ids: list[int] = []
     seen: set[int] = set()
     for top_val in sdsc_json.values():
         for dsc_entry in top_val.get("dscs_", []):
             for op_val in dsc_entry.values():
-                for dim_syms in op_val.get("dimToSymbolMapping_", {}).values():
-                    for v in dim_syms:
-                        sym_id = int(v)
-                        if sym_id < 0 and sym_id not in seen:
-                            ids.append(sym_id)
-                            seen.add(sym_id)
                 for node in op_val.get("scheduleTree_", []):
                     # NOTE: "hbm" is an sdsc component field and is
                     # distinct from and NOT to be confused with the internal

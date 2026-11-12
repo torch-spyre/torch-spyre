@@ -1269,7 +1269,6 @@ class _CandidateCase:
         it_space_adjusted=None,
         stick_vars=None,
         constraints=None,
-        symbol_meta=None,
     ):
         self.name = name
         self.op = op
@@ -1285,7 +1284,6 @@ class _CandidateCase:
         )
         self.stick_vars = stick_vars or {}
         self.constraints = constraints or ConstraintResult()
-        self.symbol_meta = symbol_meta
 
     def patches(self):
         """Patch the module inputs a work-division context is derived from."""
@@ -1309,11 +1307,7 @@ class _CandidateCase:
                 "collect_work_division_constraints",
                 {"return_value": self.constraints},
             ),
-        ] + (
-            []
-            if self.symbol_meta is None
-            else [("_collect_symbol_metadata", {"return_value": self.symbol_meta})]
-        ):
+        ]:
             stack.enter_context(
                 patch(
                     f"torch_spyre._inductor.work_division.{target}",
@@ -1491,22 +1485,6 @@ def _candidate_cases():
                 _Probe({x: 8, y: 4}, committed=True, proposed=True),
             ],
         ),
-        _CandidateCase(
-            name="symbolic_granularity",
-            op=_computed_buffer((1024,), name="symbolic_out"),
-            it_space={x: 1024},
-            output_td=_tensor_dep("symbolic_out", (1024,), (x,)),
-            symbol_meta={x: (1024, 256)},
-            max_cores=32,
-            axes=(x,),
-            # Factors come off the granularity, capped by the core budget.
-            candidates=[{x: 1}, {x: 2}, {x: 4}, {x: 8}, {x: 16}, {x: 32}],
-            probes=[
-                _Probe({x: 1}, committed=True, proposed=True),
-                _Probe({x: 4}, committed=True, proposed=True),
-                _Probe({x: 8}, committed=True, proposed=True),
-            ],
-        ),
     ]
 
 
@@ -1602,7 +1580,6 @@ class TestWorkDivisionContextAnswers(unittest.TestCase):
             it_space={i0: 8, i1: 8},
             it_space_adjusted={i0: 8, i1: 1},  # i1 looks trivial only here
             stick_vars={i1: 64},
-            symbol_meta={},
             tensor_deps=[],
             reduction_vars=[],
             constraints=ConstraintResult(),
@@ -2227,7 +2204,6 @@ class TestConvSpatialBlockedVars(unittest.TestCase):
             output_td,
             {},
             32,
-            {},
             {i, j},
             {},
         )
@@ -3832,7 +3808,6 @@ class TestCoOptimizingAllocator(unittest.TestCase):
             it_space={i0: 8, i1: 8},
             it_space_adjusted={i0: 8, i1: 8},
             stick_vars={},
-            symbol_meta={},
             tensor_deps=[],
             reduction_vars=[],
             constraints=ConstraintResult(),

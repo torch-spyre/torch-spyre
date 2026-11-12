@@ -188,16 +188,6 @@ class TestTheDimensionReachesTheBundle(_BundleHarness):
         self.assertEqual(loop_dims[0].granularity, TILE)
         self.assertEqual(loop_dims[0].max_value, MAX)
 
-    def test_it_is_not_an_sdsc_dimension_symbol(self):
-        """So the compile-boundary gate keeps refusing the old route only."""
-        _bundle, kinds = self._run([self._symbolic_loop()], [self._entry(TILE_STRIDE)])
-
-        self.assertFalse(
-            any(k.is_dimension for k in kinds),
-            "a loop dimension was classified as an SDSC dimension symbol, which "
-            "async_compile refuses at the compile boundary",
-        )
-
     def test_the_parameter_comes_last(self):
         """Adding one must never shift an existing parameter's position.
 

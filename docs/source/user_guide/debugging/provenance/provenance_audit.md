@@ -180,7 +180,7 @@ Each scheduled `ComputedBuffer` becomes an `OpSpec` (the device op); `debug_hand
 
 Tracked fields: `origins` (FX nodes that lowered into this buffer), `origin_node` (single representative FX node (nullable)), `debug_handle` (source-to-kernel record (id, source, aten_op, ir_chain, fused_from)).
 
-`OpSpec` declared fields: `['op', 'is_reduction', 'iteration_space', 'args', 'op_info', 'tiled_symbols', 'symbolic_dim_bounds', 'debug_handle']`.
+`OpSpec` declared fields: `['op', 'is_reduction', 'iteration_space', 'args', 'op_info', 'tiled_symbols', 'debug_handle']`.
 
 | Spyre op | buffer | `origins` | `origin_node` | `debug_handle` id | source line |
 | --- | --- | --- | --- | --- | --- |

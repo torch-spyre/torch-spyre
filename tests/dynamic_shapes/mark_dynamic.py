@@ -15,11 +15,10 @@
 
 # Compiled via torch.compile with an explicit dynamic dimension registered
 # through torch._dynamo.mark_dynamic.  Dim 0 is annotated with min=1, max=576,
-# so the ShapeEnv records a finite upper bound for that symbol. This is planned to
-# exercise the path where compute_max_size can return the
-# ShapeEnv bound directly rather than falling back to optimization_hint.
-# Right now this is a work in progress- the bound is not yet propagated into
-# the SDSC.
+# so the ShapeEnv records a finite upper bound for that symbol. Outside a
+# for_each_tile loop such a bound does not compile: only a dimension declared
+# with tensor.to("spyre", dynamic=...) and consumed by a for_each_tile loop can
+# vary at runtime.
 
 
 import torch

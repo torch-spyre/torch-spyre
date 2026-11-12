@@ -336,7 +336,6 @@ sdsc_fused_add_copy__mul_select_view_0 = async_compile.sdsc('sdsc_fused_add_copy
                     tiled_symbols=[[sympify('_tile_adv_while_loop_body_graph_0_0_op8_lvl0')]],
                     tiled_symbol_trip_counts={sympify('_tile_adv_while_loop_body_graph_0_0_op8_lvl0'): 8},
                     core_id_to_work_slice={sympify('c0'): sympify('0'), sympify('c1'): sympify('Mod(core_id, 4)')},
-                    symbolic_dim_bounds={},
                     args=[
                         TensorArg(              # input a (HBM, full tensor)
                             is_input=True, arg_index=0, device_dtype=DataFormats.SEN169_FP16,
@@ -368,7 +367,6 @@ sdsc_fused_add_copy__mul_select_view_0 = async_compile.sdsc('sdsc_fused_add_copy
                     tiled_symbols=[[sympify('_tile_adv_while_loop_body_graph_0_0_op9_lvl0')]],
                     tiled_symbol_trip_counts={sympify('_tile_adv_while_loop_body_graph_0_0_op9_lvl0'): 8},
                     core_id_to_work_slice={sympify('c0'): sympify('0'), sympify('c1'): sympify('Mod(core_id, 4)')},
-                    symbolic_dim_bounds={},
                     args=[
                         TensorArg(              # input y_tile (LX scratchpad)
                             is_input=True, arg_index=-1, device_dtype=DataFormats.SEN169_FP16,
@@ -399,7 +397,6 @@ sdsc_fused_add_copy__mul_select_view_0 = async_compile.sdsc('sdsc_fused_add_copy
                     tiled_symbols=[[sympify('_tile_adv_while_loop_body_graph_0_0_op15_lvl0')]],
                     tiled_symbol_trip_counts={sympify('_tile_adv_while_loop_body_graph_0_0_op15_lvl0'): 8},
                     core_id_to_work_slice={sympify('c0'): sympify('0'), sympify('c1'): sympify('Mod(core_id, 4)')},
-                    symbolic_dim_bounds={},
                     args=[
                         TensorArg(              # input z_tile (LX scratchpad)
                             is_input=True, arg_index=-1, device_dtype=DataFormats.SEN169_FP16,
@@ -1603,7 +1600,6 @@ class OpSpec:
     op_info: dict[str, Any]
     tiled_symbols: list[list[Symbol]] = field(default_factory=list)
     tiled_symbol_trip_counts: dict[Symbol, int] = field(default_factory=dict)
-    symbolic_dim_bounds: dict[str, tuple[int, int]] = field(default_factory=dict)
     debug_handle: DebugHandle | None = None
 
 @dataclasses.dataclass
@@ -1641,11 +1637,6 @@ ops not inside a `LoopSpec`**.  Every enclosing loop level has an entry
 depth.  Two ops in the same loop group can have different `tiled_symbols`
 if work division or stickification places the batch dimension at
 different positions in each op's iteration space.
-
-`OpSpec.symbolic_dim_bounds` maps a PyTorch symbol name (e.g. `"s97"`) to
-`(max, granularity)` bounds for dynamic-shape dims; it is populated by
-`compute_symbolic_bounds` during `create_op_spec` and empty for concrete
-dims.
 
 `OpSpec.tiled_symbol_trip_counts` maps each minted level symbol appearing
 in `tiled_symbols` to that level's own trip count

@@ -377,12 +377,6 @@ class OpSpec:
     tiled_symbol_trip_counts: dict[Symbol, int] = dataclasses.field(
         default_factory=dict
     )
-    # Maps PyTorch symbol name (e.g. 's97') -> (max, granularity) bounds.
-    # Populated by compute_symbolic_bounds during
-    # create_op_spec; empty for concrete dims.
-    symbolic_dim_bounds: dict[str, tuple[int, int]] = dataclasses.field(
-        default_factory=dict
-    )
     # Full logical output ranges of the write/reduction node (NCHW for pools),
     # including unit dims.  Distinct from the squeezed, permuted iteration_space:
     # pool codegen derives which dim roles survived (and the channel count) from
@@ -605,10 +599,6 @@ def format_op_spec_list(specs: list, indent: int = 0) -> str:
                 )
             if item.tiled_symbols:
                 lines.append(f"{prefix}  tiled_symbols={item.tiled_symbols}")
-            if item.symbolic_dim_bounds:
-                lines.append(
-                    f"{prefix}  symbolic_dim_bounds={item.symbolic_dim_bounds}"
-                )
         elif isinstance(item, UnimplementedOp):
             lines.append(f"{prefix}UnimplementedOp(op={item.op!r})")
         elif isinstance(item, _LoopClose):

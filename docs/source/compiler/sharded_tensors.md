@@ -278,8 +278,8 @@ core) pair** — every core executes the same kernel on its own shard:
 * [bundle.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/codegen/bundle.py)
   introduces the `kShardAddress` symbol kind: a sharded kernel argument
   is emitted as N symbolic shard-address args (one per core), deduplicated
-  by `(arg_index, core)`. Ordinary kernel args and dimension symbols are
-  deduplicated in the same pass.
+  by `(arg_index, core)`. Ordinary kernel args are deduplicated in the
+  same pass.
 * [compute_ops.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/codegen/compute_ops.py)
   builds the non-unified kernel form for sharded consumption and verifies
   (via `verify_non_unified_split` in `sharded_hbm.py`) that each core's

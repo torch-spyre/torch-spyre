@@ -84,7 +84,6 @@ def _op(
     op_info=None,
     tiled_symbols=None,
     tiled_symbol_trip_counts=None,
-    symbolic_dim_bounds=None,
     node_output_ranges=None,
     completed_producer_cores=(),
 ) -> OpSpec:
@@ -97,9 +96,6 @@ def _op(
         tiled_symbols=[] if tiled_symbols is None else tiled_symbols,
         tiled_symbol_trip_counts=(
             {} if tiled_symbol_trip_counts is None else tiled_symbol_trip_counts
-        ),
-        symbolic_dim_bounds=(
-            {} if symbolic_dim_bounds is None else symbolic_dim_bounds
         ),
         node_output_ranges=node_output_ranges,
         completed_producer_cores=completed_producer_cores,
@@ -205,7 +201,7 @@ class TestKernelProvenanceDescriptor:
         reverse = build_kernel_provenance_descriptor([_op(second), _op(first)])
 
         assert independently_reconstructed == forward
-        assert forward.key == "vsancadvtjfcq6cv"
+        assert forward.key == "3nn5uq6adb74jsx3"
         assert reverse.key != forward.key
         assert len(forward.key) == KERNEL_PROVENANCE_KEY_BASE32_WIDTH
         assert set(forward.key) <= set("abcdefghijklmnopqrstuvwxyz234567")
@@ -343,7 +339,6 @@ class TestKernelProvenanceDescriptor:
             },
             tiled_symbols=[[c0]],
             tiled_symbol_trip_counts={c0: 4},
-            symbolic_dim_bounds={"s0": (128, 64)},
             node_output_ranges=(Integer(1), Integer(2), c0, Integer(64)),
         )
 
@@ -356,7 +351,7 @@ class TestKernelProvenanceDescriptor:
             "aten.mm.default",
             "aten.permute.default",
         )
-        assert descriptor.key == "2y3kqixggcejkcas"
+        assert descriptor.key == "spw6vyuxztgfdllj"
 
     def test_generated_wrapper_roundtrip_reproduces_descriptor(self):
         constituent = _handle(8, aten_op="aten.permute.default")
@@ -384,7 +379,6 @@ class TestKernelProvenanceDescriptor:
                         op_info={"constants": {"alpha": 1.0}},
                         tiled_symbols=[[c0]],
                         tiled_symbol_trip_counts={c0: 2},
-                        symbolic_dim_bounds={"s0": (128, 64)},
                         node_output_ranges=(Integer(1), Integer(2), c0),
                     )
                 ],
