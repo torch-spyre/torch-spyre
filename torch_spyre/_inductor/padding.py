@@ -2437,9 +2437,11 @@ def _input_padding_range(layout: SpyreTensorLayout) -> Set:
 
     A graph input may have been DMA'd from the host or written by an earlier
     graph or eager kernel, so the padding is only known when the runtime
-    recorded a constant padding value in the tensor's layout. The layout,
-    padding state included, is part of the dynamo guard, so a kernel compiled
-    for a known padding value is not reused for a tensor without one.
+    recorded a constant padding value in the tensor's layout.
+
+    TODO: the dynamo guard does not compare the padding state yet (see the
+    TODO on SpyreTensorLayout::operator== in spyre_tensor_impl.h), so a graph
+    compiled for a recorded value can be reused for an input without one.
     """
     if (value := layout.padding_value) is not None:
         return FiniteSet(value)
@@ -2476,6 +2478,17 @@ def get_or_pick_pad_value(inv_domain: InvalidDomain, dtype: torch.dtype):
 
 
 def track_padding_value(graph: GraphLowering) -> None:
+    """Infer the padding of every buffer and decide which inputs to mask.
+
+    Runs after split_multi_ops, so each op is a single SDSC op and a mask
+    value applies to that op alone.
+
+    TODO: the passes that run after this one (insert_restickify,
+    insert_post_mutation_restickify, insert_restickify_padding) are assumed to
+    either copy a buffer's padding unchanged or fill it with 0. They do not
+    re-run the analysis, so a pass that breaks that assumption must update the
+    padding it changes.
+    """
     operations = graph.operations
     tracer = DomainRangeTracer(graph)
 

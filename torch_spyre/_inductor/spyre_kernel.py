@@ -1479,6 +1479,9 @@ class SpyreKernel(Kernel[CSEVariable]):
         ir_node = self.current_node.node
         if input_pad_values := getattr(ir_node, "input_mask_values", None):
             mask_values = set(input_pad_values.values())
+            # SDSC takes one mask value per op. No domain rule constrains two
+            # inputs of one op differently yet (truediv constrains only the
+            # divisor). TODO: when one does, fall back to overwriting instead.
             assert len(mask_values) <= 1
             mask_value = next(iter(mask_values), None)
 
