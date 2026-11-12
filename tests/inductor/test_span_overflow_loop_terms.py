@@ -182,6 +182,14 @@ _STEP_SYMBOLS = (
     (r"_tile_adv_\w+?_lvl\d+", "SYM"),
     (r"\bu\d+\b", "SYM"),
     (r"floor\(([^()]*SYM)\)", r"\1"),
+    # A comment in the generated file: the fused kernel's list of fx placeholders. The
+    # full output buffer the copy-out mutates (``empty_default``) is listed as an input
+    # of the flat loop, and not of the LoopSchedulerNode, which orders itself after the
+    # allocation through a dependency it carries itself. No kernel code differs.
+    (
+        r"(?m)^#\s+%empty_default\w* : Tensor .*PlaceHolder\[target=empty_default\w*\]\n",
+        "",
+    ),
 )
 
 
@@ -385,3 +393,126 @@ def test_the_term_survives_every_core_split(case, sencores):
     assert looped
     assert all(len(op.loop_vars) == 1 for op in looped)
     assert _relative_error(compiled.outputs, fn(*[a.float() for a in args])) < 2e-2
+
+
+# ---------------------------------------------------------------------------
+# The converted groups become LoopNodes (stage 7a.2, Task 5).
+# ---------------------------------------------------------------------------
+
+
+def _nodes_of(operations):
+    from torch_spyre._inductor.loop_node import LoopNode
+
+    for op in operations:
+        if isinstance(op, LoopNode):
+            yield op
+            yield from _nodes_of(op.body)
+
+
+def _compile_seeing_nodes(fn, args, limit):
+    """Compile, and return ``(compiled, nodes, violations)`` as the pass loop leaves
+    the operations just before the scheduler: every ``LoopNode`` (nested ones
+    included) with the names of its leaf ops, and what the loop checker finds."""
+    from torch_spyre._inductor.loop_checker import find_violations
+    from torch_spyre._inductor.loop_node import all_ops
+
+    seen: dict = {}
+    original = passes._hand_off_loop_nodes
+
+    def spy(graph):
+        seen["nodes"] = [
+            (
+                node.get_name(),
+                node.induction,
+                node.trip_count,
+                [o.get_operation_name() for o in all_ops(node.body)],
+            )
+            for node in _nodes_of(graph.operations)
+        ]
+        seen["violations"] = find_violations(list(graph.operations))
+        return original(graph)
+
+    with mock.patch.object(passes, "_hand_off_loop_nodes", spy):
+        compiled = compile_span_overflow(fn, args, limit)
+    return compiled, seen["nodes"], seen["violations"]
+
+
+@pytest.mark.parametrize("case", COPY_OUT_CASES)
+def test_a_span_overflow_group_is_one_loop_node(case):
+    fn, shapes, limit, groups, _ = CASES[case]
+    args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
+    compiled, nodes, violations = _compile_seeing_nodes(fn, args, limit)
+    assert len(nodes) == len(groups) == 1, nodes
+    name, induction, trip, members = nodes[0]
+    assert induction is not None and induction.name.startswith("u"), induction
+    assert trip == groups[0][2][0], (trip, groups)
+    # the tile ops and the copy-outs the transform added all sit in the node
+    assert any(m.startswith("coarse_tile_copy_") for m in members), members
+    assert len(members) >= groups[0][0] + 1, members
+    assert violations == [], violations
+    assert _relative_error(compiled.outputs, fn(*[a.float() for a in args])) < 2e-2
+
+
+def test_a_group_with_a_reduction_accumulator_stays_a_flat_loop():
+    fn, shapes, limit, *_ = CASES["matmul_k_tiled"]
+    args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
+    compiled, nodes, violations = _compile_seeing_nodes(fn, args, limit)
+    assert nodes == [], nodes
+    assert violations == [], violations
+    assert _relative_error(compiled.outputs, fn(*[a.float() for a in args])) < 2e-2
+
+
+def test_a_for_each_tile_node_and_a_span_overflow_node_in_one_graph():
+    """The graph already holds a node when the span-overflow pass runs, so the pass
+    sees the flat view of it; the new node is built after the pass, beside the
+    existing one, with its own name and its own variable."""
+    from for_each_tile_fixtures import split_m_fn
+
+    def fn(x, y, a, b):
+        return split_m_fn(x, y), a + b
+
+    shapes = [(256, 256), (256, 64), (4096, 1024), (4096, 1024)]
+    args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
+    compiled, nodes, violations = _compile_seeing_nodes(fn, args, 4 * 1024 * 1024)
+    assert len(nodes) == 2, nodes
+    names = [n[0] for n in nodes]
+    inductions = [n[1] for n in nodes]
+    assert len(set(names)) == 2, names
+    assert len({i for i in inductions if i is not None}) == 2, inductions
+    assert violations == [], violations
+    x, y, a, b = (t.float() for t in args)
+    assert _relative_error(compiled.outputs, (x @ y, a + b)) < 2e-2
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="#6243: span-overflow tiling returns wrong values for a transposed "
+    "consumer of a tiled pointwise producer (about 60% of elements)",
+)
+def test_a_transposed_consumer_of_a_tiled_producer_is_right():
+    fn = lambda a, b: (a + b).t() * 2  # noqa: E731
+    args = [_shaped((4096, 1024), seed) for seed in range(2)]
+    compiled = compile_span_overflow(fn, args, 4 * 1024 * 1024)
+    reference = fn(*[a.float() for a in args])
+    wrong = ((compiled.outputs[0] - reference).abs() > 0.05).float().mean().item()
+    assert wrong == 0.0, wrong
+
+
+def test_only_the_converted_group_becomes_a_node_next_to_a_flat_k_tiled_loop():
+    """A K-tiled group keeps the legacy lowering and its flat loop (stage 7a.3); the
+    copy_out group beside it is converted. Only the converted one is wrapped: the
+    flat loop has no induction variable and no node to carry one."""
+
+    def fn(a, b, c, d):
+        return a @ b, c + d
+
+    shapes = [(2048, 2048), (2048, 256), (2048, 512), (2048, 512)]
+    args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
+    compiled, nodes, violations = _compile_seeing_nodes(fn, args, 1024 * 1024)
+    assert compiled.groups == [(1, ["Reduction"], [8]), (1, ["Pointwise"], [2])]
+    assert len(nodes) == 1, nodes
+    assert nodes[0][2] == 2 and nodes[0][1] is not None, nodes
+    assert violations == [], violations
+    a, b, c, d = (t.float() for t in args)
+    assert _relative_error(compiled.outputs, (a @ b, c + d)) < 2e-2

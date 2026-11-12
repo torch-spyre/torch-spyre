@@ -45,7 +45,7 @@ relies on, so a torch upgrade knows exactly what to re-verify.
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 
 import torch
 from torch._inductor import dependencies, ir
@@ -240,7 +240,36 @@ class LoopSchedulerNode(CountedLoopSchedulerNode):
         # as a dependency of the loop on itself it is a KeyError later.
         if dep.name in self.get_buffer_names():
             return
+        self._fake_deps = (*getattr(self, "_fake_deps", ()), dep)
         BaseSchedulerNode.add_fake_dep(self, dep)
+
+    def set_read_writes(self, rw: dependencies.ReadWrites) -> None:
+        # Stock Inductor rebuilds a group node's reads from its children (fusion
+        # scoring does: ``_try_reindex_pointwise_for_reduction`` calls
+        # ``refresh_group_node_dependencies``). The children never saw the fake
+        # dependencies ``compute_dependencies`` gave the LOOP, so the rebuild would
+        # drop them. One of them is the loop's ordering after the prior writer of
+        # a buffer it mutates (the allocation of a span-overflow copy-out's full
+        # output): without it the loop can be scheduled before that allocation.
+        for dep in getattr(self, "_fake_deps", ()):
+            if dep not in rw.reads:
+                rw = rw.with_read(dep)
+        super().set_read_writes(rw)
+
+    # ``refresh_group_node_dependencies`` assigns ``unmet_dependencies`` straight
+    # from the children right after ``set_read_writes``, so the fake dependencies
+    # have to survive that assignment too: the memory-ordering pass reads them from
+    # here, not from ``read_writes``.
+    @property
+    def unmet_dependencies(self) -> OrderedSet[dependencies.Dep]:  # type: ignore[override]
+        return self.__dict__.get("_unmet_dependencies", OrderedSet())
+
+    @unmet_dependencies.setter
+    def unmet_dependencies(self, value: Iterable[dependencies.Dep]) -> None:
+        unmet = OrderedSet(value)
+        for dep in getattr(self, "_fake_deps", ()):
+            unmet.add(dep)
+        self.__dict__["_unmet_dependencies"] = unmet
 
     def update_mutated_names(self, renames: dict[str, str]) -> None:
         # The loop's external reads take the current names, as any node's do,
