@@ -1313,12 +1313,30 @@ class TestSpyreTensorLayout(TestCase):
         )
         self.assertEqual(list(restored.stride_map), [32, 0, 1])
 
-    def test_stl_pickle_writes_v5(self):
+    def test_stl_pickle_writes_v6(self):
         fp16_df = get_device_dtype(torch.float16)
         stl = SpyreTensorLayout([2, 1, 32], [32, 0, 1], fp16_df)
         state = stl.__getstate__()
-        self.assertEqual(state[0], 5)
-        self.assertEqual(len(state), 6)
+        self.assertEqual(state[0], 6)
+        self.assertEqual(len(state), 8)
+
+    def test_stl_v5_pickle_loads_without_padding(self):
+        """A v5 pickle (no padding fields) loads with UNINITIALIZED padding."""
+        fp16_df = get_device_dtype(torch.float16)
+        stl = SpyreTensorLayout([2, 1, 32], [32, 0, 1], fp16_df)
+        restored = SpyreTensorLayout.__new__(SpyreTensorLayout)
+        restored.__setstate__(
+            (
+                5,
+                [2, 1, 32],
+                [32, 0, 1],
+                fp16_df,
+                stl.element_arrangement,
+                dict(stl.valid_elements),
+            )
+        )
+        self.assertEqual(restored, stl)
+        self.assertIsNone(restored.padding_value)
 
 
 @instantiate_parametrized_tests

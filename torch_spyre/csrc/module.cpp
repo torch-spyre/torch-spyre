@@ -71,7 +71,7 @@ namespace fs = std::filesystem;
 
 namespace spyre {
 
-static constexpr int32_t kSpyreTensorLayoutPickleVersion = 5;
+static constexpr int32_t kSpyreTensorLayoutPickleVersion = 6;
 static constexpr int32_t kPoolDescriptorPickleVersion = 1;
 
 std::atomic<bool> g_downcast_warn_enabled{true};
@@ -678,11 +678,11 @@ PYBIND11_MODULE(_C, m) {
                   t[2].cast<std::vector<int64_t>>(), t[3].cast<DataFormats>(),
                   t[5].cast<std::map<std::vector<int64_t>, int64_t>>(),
                   t[4].cast<spyre::ElementArrangement>());
-            } else if (version == 5) {
-              // Version 5: v4 + (padding, padding_value bytes)
+            } else if (version == 6) {
+              // Version 6: v5 + (padding, padding_value bytes)
               if (t.size() != 8) {
                 throw py::value_error(
-                    "Invalid SpyreTensorLayout pickle v5: wrong tuple size");
+                    "Invalid SpyreTensorLayout pickle v6: wrong tuple size");
               }
               auto stl = spyre::SpyreTensorLayout(
                   t[1].cast<std::vector<int64_t>>(),
