@@ -27,6 +27,7 @@ import torch  # noqa: F401  (must precede torch_spyre._inductor imports)
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.wsr.span_overflow_loop_terms import (
     _access_term,
+    _plan_carries,
     _taken_symbols,
     access_step,
     add_loop_terms,
@@ -155,6 +156,135 @@ def test_a_pair_whose_symbol_is_not_in_the_index_does_not_advance():
     assert _access_term(graph, op, plain, "a", [(0, 2048)], []) == 512 * 2048
 
 
+# --- the carry declaration, on stub ops (no device) ----------------------------
+
+
+def _carry_member(
+    name, data_cls, *, target=None, reads=(), writes=(), kind="reduction"
+):
+    """A group member with just what ``_plan_carries`` reads."""
+    from types import SimpleNamespace
+
+    from torch._inductor.ir import MutationLayoutSHOULDREMOVE
+
+    layout = object()
+    if target is not None:
+        layout = mock.MagicMock(spec=MutationLayoutSHOULDREMOVE)
+        layout.get_buffer.return_value = target
+    return SimpleNamespace(
+        data=mock.MagicMock(spec=data_cls),
+        layout=layout,
+        loop_info=SimpleNamespace(propagation=SimpleNamespace(kind=kind)),
+        get_read_writes=lambda: SimpleNamespace(
+            reads=[SimpleNamespace(name=n) for n in reads],
+            writes=[SimpleNamespace(name=n) for n in writes],
+        ),
+        get_name=lambda: name,
+        get_operation_name=lambda: name,
+    )
+
+
+def _carry_storage(name, **attrs):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(get_name=lambda: name, **attrs)
+
+
+def _carry_graph(*ops):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(operations=list(ops))
+
+
+def _k_tiled_group(acc="buf1", suffix=""):
+    from torch._inductor.ir import Pointwise, Reduction
+
+    storage = _carry_storage(acc)
+    partial = _carry_member(
+        f"op0{suffix}", Reduction, reads=["a", "b"], writes=[f"scratch{suffix}"]
+    )
+    combine = _carry_member(
+        f"combine{suffix}",
+        Pointwise,
+        target=storage,
+        reads=[f"scratch{suffix}", acc],
+        writes=[f"combine{suffix}"],
+    )
+    return storage, partial, combine
+
+
+def test_a_reduction_group_declares_one_carry_naming_its_storage_and_update():
+    storage, partial, combine = _k_tiled_group()
+    (edit,) = _plan_carries(_carry_graph(storage, partial, combine), [partial, combine])
+    assert edit.update is combine and edit.storage is storage
+    assert (edit.record.storage_name, edit.record.update_name) == ("buf1", "combine")
+    assert edit.record.loop_origin is None
+
+
+def test_a_group_that_is_not_a_reduction_declares_nothing():
+    storage, partial, combine = _k_tiled_group()
+    for op in (partial, combine):
+        op.loop_info.propagation.kind = "copy_out"
+    assert (
+        _plan_carries(_carry_graph(storage, partial, combine), [partial, combine]) == []
+    )
+
+
+def test_two_reductions_in_one_group_declare_two_distinct_carries():
+    s1, p1, c1 = _k_tiled_group("buf1", "_a")
+    s2, p2, c2 = _k_tiled_group("buf2", "_b")
+    edits = _plan_carries(_carry_graph(s1, s2, p1, c1, p2, c2), [p1, c1, p2, c2])
+    assert [(e.record.storage_name, e.record.update_name) for e in edits] == [
+        ("buf1", "combine_a"),
+        ("buf2", "combine_b"),
+    ]
+    assert edits[0].record is not edits[1].record
+
+
+@pytest.mark.parametrize(
+    "case, match",
+    [
+        ("partial_without_a_combine", "partial reductions and"),
+        ("another_op_touches_the_accumulator", "also touch the accumulator"),
+        ("storage_already_declares_a_carry", "already declares a carry"),
+        ("storage_is_not_in_the_graph", "is not an operation of the graph"),
+    ],
+)
+def test_a_reduction_group_that_cannot_declare_its_carry_is_left_whole(case, match):
+    from torch._inductor.ir import Pointwise
+
+    storage, partial, combine = _k_tiled_group()
+    members = [partial, combine]
+    graph = _carry_graph(storage, partial, combine)
+    if case == "partial_without_a_combine":
+        members = [partial]
+    elif case == "another_op_touches_the_accumulator":
+        extra = _carry_member(
+            "reader", Pointwise, reads=["buf1"], writes=["out"], kind="loop_internal"
+        )
+        members = [partial, combine, extra]
+    elif case == "storage_already_declares_a_carry":
+        storage._loop_carry_record = object()
+    elif case == "storage_is_not_in_the_graph":
+        graph = _carry_graph(partial, combine)
+    with pytest.raises(Unsupported, match=match):
+        _plan_carries(graph, members)
+
+
+def test_a_storage_that_is_a_loop_member_is_left_whole():
+    from types import SimpleNamespace
+
+    storage, partial, combine = _k_tiled_group()
+    storage.loop_info = SimpleNamespace(loop_group_id=(3,), loop_count=[4])
+    # a ComputedBuffer in a counted loop has a loop path; the stub stands for one
+    with mock.patch(
+        "torch_spyre._inductor.wsr.span_overflow_loop_terms.counted_loop_path",
+        lambda op: (3,) if op is storage else (),
+    ):
+        with pytest.raises(Unsupported, match="member of the loop"):
+            _plan_carries(_carry_graph(storage, partial, combine), [partial, combine])
+
+
 def test_a_symbolic_extent_is_unsupported():
     with pytest.raises(Unsupported, match="not an integer"):
         access_step(d0, d0, sympy.Symbol("s0"), 1)
@@ -172,6 +302,7 @@ from torch._inductor.ir import Pointwise  # noqa: E402
 
 from torch_spyre._inductor import passes  # noqa: E402
 from torch_spyre._inductor.wsr import coarse_tile  # noqa: E402
+from torch_spyre._inductor.wsr import span_overflow_loop_terms as slt  # noqa: E402
 
 from test_span_overflow_gate import (  # noqa: E402
     CASES,
@@ -185,9 +316,10 @@ from test_span_overflow_gate import (  # noqa: E402
 )
 from utils_inductor import expects_raise  # noqa: E402
 
-# Everything the gate compiles except the K-tiled matmul, which keeps the legacy
-# lowering alone (stage 7a.3).
+# The gate's cases that write each tile through a copy-out, and all of them (the
+# K-tiled matmul carries an accumulator instead, stage 7a.3).
 COPY_OUT_CASES = sorted(set(CASES) - {"matmul_k_tiled"})
+ALL_CASES = sorted(CASES)
 
 
 class _Looped:
@@ -319,7 +451,7 @@ def test_the_step_in_the_index_is_the_tile_advance(case, read_step, write_step):
     assert any(regex.search(rf"\b{write_step}\*u\d+\b", i) for i in writes), writes
 
 
-@pytest.mark.parametrize("case", COPY_OUT_CASES)
+@pytest.mark.parametrize("case", ALL_CASES)
 def test_the_kernel_text_equals_the_legacy_lowerings_modulo_names(case):
     with_terms, _, _, _ = _compile_case(case)
     legacy, _, _, _ = _compile_case(case, terms=False)
@@ -343,15 +475,19 @@ def test_a_permuted_buffer_tiled_eight_ways_uses_its_own_stride(dim, step):
     assert any(regex.search(rf"\b{step}\*u\d+\b", i) for i in indexes), indexes
 
 
-def test_a_group_with_a_reduction_accumulator_is_left_alone():
+def test_a_k_tiled_matmul_carries_the_loop_in_the_index():
+    """Both reads advance along the REDUCTION dim (the K tile), by the coefficient
+    times the tile extent; the combine and the scratch partial do not advance, so
+    there is no write term."""
     compiled, looped, _, _ = _compile_case("matmul_k_tiled")
     assert compiled.groups == [(1, ["Reduction"], [8])]
-    assert looped, "expected the K-tiled matmul to form a loop"
+    assert looped and all(len(op.loop_vars) == 1 for op in looped), looped
+    reads = {n: i for op in looped for n, i in op.reads.items() if n.startswith("arg")}
+    assert regex.search(r"\b256\*u\d+\b", reads["arg0_1"]), reads
+    assert regex.search(r"\b65536\*u\d+\b", reads["arg1_1"]), reads
     for op in looped:
-        assert op.loop_vars == [], (op.name, op.loop_vars)
-        assert not any(
-            regex.search(r"\bu\d+\b", i)
-            for i in (*op.reads.values(), *op.writes.values())
+        assert not any(regex.search(r"\bu\d+\b", i) for i in op.writes.values()), (
+            op.name
         )
 
 
@@ -522,7 +658,7 @@ def _compile_seeing_nodes(fn, args, limit):
     return compiled, seen["nodes"], seen["violations"]
 
 
-@pytest.mark.parametrize("case", COPY_OUT_CASES)
+@pytest.mark.parametrize("case", ALL_CASES)
 def test_a_span_overflow_group_is_one_loop_node(case):
     fn, shapes, limit, groups, _ = CASES[case]
     args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
@@ -531,20 +667,103 @@ def test_a_span_overflow_group_is_one_loop_node(case):
     name, induction, trip, members = nodes[0]
     assert induction is not None and induction.name.startswith("u"), induction
     assert trip == groups[0][2][0], (trip, groups)
-    # the tile ops and the copy-outs the transform added all sit in the node
-    assert any(m.startswith("coarse_tile_copy_") for m in members), members
+    # the tile ops and the copy-outs (or the combines) the transform added all sit in
+    # the node
+    assert any(
+        m.startswith(("coarse_tile_copy_", "coarse_tile_combine_")) for m in members
+    ), members
     assert len(members) >= groups[0][0] + 1, members
     assert violations == [], violations
     assert _relative_error(compiled.outputs, fn(*[a.float() for a in args])) < 2e-2
 
 
-def test_a_group_with_a_reduction_accumulator_stays_a_flat_loop():
+def _compile_seeing_carries(fn, args, limit):
+    """Compile, and return ``(compiled, [(node name, [(storage, update, storage is a
+    carry storage to the allocator, storage op has the record, update has it)])])``
+    as the pass loop leaves the nodes just before the scheduler."""
+    from torch_spyre._inductor.loop_node import all_ops
+    from torch_spyre._inductor.scratchpad.allocator import _is_loop_carry_storage
+
+    seen: dict = {}
+    original = passes._hand_off_loop_nodes
+
+    def spy(graph):
+        live = {o.get_name(): o for o in all_ops(graph.operations)}
+        seen["carries"] = [
+            (
+                node.get_name(),
+                [
+                    (
+                        r.storage_name,
+                        r.update_name,
+                        _is_loop_carry_storage(live[r.storage_name]),
+                        getattr(live[r.storage_name], "_loop_carry_record", None) is r,
+                        getattr(live[r.update_name], "_loop_carry_record", None) is r,
+                        r.loop_origin,
+                    )
+                    for r in node.carries
+                ],
+            )
+            for node in _nodes_of(graph.operations)
+        ]
+        return original(graph)
+
+    with mock.patch.object(passes, "_hand_off_loop_nodes", spy):
+        compiled = compile_span_overflow(fn, args, limit)
+    return compiled, seen["carries"]
+
+
+def test_a_k_tiled_matmul_is_a_node_with_its_accumulator_declared_as_a_carry():
     fn, shapes, limit, *_ = CASES["matmul_k_tiled"]
     args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
-    compiled, nodes, violations = _compile_seeing_nodes(fn, args, limit)
-    assert nodes == [], nodes
-    assert violations == [], violations
+    compiled, carries = _compile_seeing_carries(fn, args, limit)
+    assert len(carries) == 1, carries
+    _, records = carries[0]
+    assert len(records) == 1, records
+    storage, update, is_storage, on_storage, on_update, origin = records[0]
+    assert update.startswith("coarse_tile_combine_"), update
+    assert is_storage and on_storage and on_update, records
+    # a span-overflow loop has no FX while_loop: the post-loop drain plan declines
+    # and the accumulator keeps its HBM behaviour
+    assert origin is None, origin
     assert _relative_error(compiled.outputs, fn(*[a.float() for a in args])) < 2e-2
+
+
+@pytest.mark.parametrize(
+    "fn, name",
+    [(lambda x: x.sum(dim=1), "sum"), (lambda x: x.amax(dim=1), "amax")],
+    ids=["sum", "amax"],
+)
+def test_a_reduction_over_a_tiled_dim_declares_its_accumulator(fn, name):
+    args = [_shaped((256, 16384), 0)]
+    compiled, carries = _compile_seeing_carries(fn, args, 1024 * 1024)
+    assert compiled.groups == [(1, ["Reduction"], [8])], compiled.groups
+    assert len(carries) == 1 and len(carries[0][1]) == 1, carries
+    assert carries[0][1][0][2:5] == (True, True, True), carries
+    assert _relative_error(compiled.outputs, fn(args[0].float())) < 2e-2
+
+
+@pytest.mark.parametrize(
+    "case, fn, shapes",
+    [
+        ("k_tiled_matmul", CASES["matmul_k_tiled"][0], CASES["matmul_k_tiled"][1]),
+        (
+            "small_accumulator_read_later",
+            lambda a, b, c: (a @ b) + c,
+            [(256, 16384), (16384, 64), (256, 64)],
+        ),
+    ],
+    ids=["k_tiled_matmul", "small_accumulator_read_later"],
+)
+def test_declaring_the_carry_does_not_change_the_kernel(case, fn, shapes):
+    """The record is for what plans after the lowering; at these sizes the allocator
+    makes the same choices with and without it, so the generated kernel is the same."""
+    limit = CASES["matmul_k_tiled"][2] if case == "k_tiled_matmul" else 2 * 1024 * 1024
+    args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
+    with_record = compile_span_overflow(fn, args, limit)
+    with mock.patch.object(slt, "_apply_carries", lambda edits: None):
+        without = compile_span_overflow(fn, args, limit)
+    assert _normalised(with_record.code) == _normalised(without.code)
 
 
 def test_a_for_each_tile_node_and_a_span_overflow_node_in_one_graph():
@@ -584,10 +803,9 @@ def test_a_transposed_consumer_of_a_tiled_producer_is_right():
     assert wrong == 0.0, wrong
 
 
-def test_only_the_converted_group_becomes_a_node_next_to_a_flat_k_tiled_loop():
-    """A K-tiled group keeps the legacy lowering and its flat loop (stage 7a.3); the
-    copy_out group beside it is converted. Only the converted one is wrapped: the
-    flat loop has no induction variable and no node to carry one."""
+def test_a_k_tiled_group_and_a_copy_out_group_become_two_nodes():
+    """Two groups in one graph, each its own node with its own loop variable; only
+    the K-tiled one declares a carry."""
 
     def fn(a, b, c, d):
         return a @ b, c + d
@@ -596,8 +814,9 @@ def test_only_the_converted_group_becomes_a_node_next_to_a_flat_k_tiled_loop():
     args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
     compiled, nodes, violations = _compile_seeing_nodes(fn, args, 1024 * 1024)
     assert compiled.groups == [(1, ["Reduction"], [8]), (1, ["Pointwise"], [2])]
-    assert len(nodes) == 1, nodes
-    assert nodes[0][2] == 2 and nodes[0][1] is not None, nodes
+    assert len(nodes) == 2, nodes
+    assert sorted(n[2] for n in nodes) == [2, 8], nodes
+    assert len({n[1] for n in nodes}) == 2 and None not in {n[1] for n in nodes}, nodes
     assert violations == [], violations
     a, b, c, d = (t.float() for t in args)
     assert _relative_error(compiled.outputs, (a @ b, c + d)) < 2e-2
