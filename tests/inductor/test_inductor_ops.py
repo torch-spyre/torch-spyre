@@ -7797,11 +7797,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_where_self", "test_where_eager"): {
             "ops_dict": {"where": torch.where},
-            # Bool values are not supported: they must be refused as mixed EA, not
-            # computed (a computed result is silently wrong).
             "expect_raise": {
                 # The shuffle rejects a (4, 32) row: one 32-element fp32 stick per core.
                 "int32_2d": _WHOLE_STICK_PAIRS,
+            },
+            # The host bool values and mask are all cast to a staggered fp32
+            # (DL16_TO_FP32), so no shuffle is needed and where3 is correct on device.
+            # The bool result keeps that staggered arrangement and the device-to-host
+            # copy ignores it (eager.py), so the host reads it permuted.
+            "expect_fail": {
+                "bool_2d": "a staggered bool result is read back without restoring "
+                "its order (#4393)",
             },
             "param_sets": {
                 "fp16_2d": (
