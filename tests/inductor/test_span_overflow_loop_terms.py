@@ -26,7 +26,10 @@ import torch  # noqa: F401  (must precede torch_spyre._inductor imports)
 
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.wsr.span_overflow_loop_terms import (
+    _access_term,
+    _taken_symbols,
     access_step,
+    add_loop_terms,
     mint_induction,
 )
 
@@ -69,6 +72,87 @@ def test_a_non_affine_index_is_unsupported():
     # floor(d0/2) holds d0 but has no coefficient for it; reading 0 would drop the term
     with pytest.raises(Unsupported, match="not affine"):
         access_step(sympy.floor(d0 / 2) + d1, d0, sympy.Integer(4), 1)
+
+
+def test_a_symbolic_coefficient_is_unsupported():
+    # coeff(d0) of d0*d1 is d1: not zero, but not a number either
+    with pytest.raises(Unsupported, match="numeric coefficient"):
+        access_step(d0 * d1, d0, sympy.Integer(4), 1)
+    with pytest.raises(Unsupported, match="numeric coefficient"):
+        access_step(d0 * d1 + d0, d0, sympy.Integer(4), 1)
+
+
+def _graph_with(*, var_to_range=(), inputs=(), operations=()):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        sizevars=SimpleNamespace(
+            shape_env=SimpleNamespace(var_to_range=dict.fromkeys(var_to_range, 1))
+        ),
+        graph_inputs={
+            f"arg{i}": SimpleNamespace(get_size=lambda s=s: s)
+            for i, s in enumerate(inputs)
+        },
+        operations=list(operations),
+    )
+
+
+def test_mint_avoids_every_symbol_the_shape_env_allocated():
+    # an unbacked scalar that appears in no index (a data-dependent size, say)
+    graph = _graph_with(var_to_range=[u0, u1])
+    assert mint_induction(_taken_symbols(graph, [])).name == "u2"
+
+
+def test_taken_symbols_reads_graph_input_and_op_sizes():
+    from types import SimpleNamespace
+
+    rw = SimpleNamespace(reads=[], writes=[])
+    op = SimpleNamespace(
+        get_size=lambda: [u1, 8],
+        get_read_writes=lambda: rw,
+        get_operation_name=lambda: "op0",
+    )
+    graph = _graph_with(inputs=[[u0, 4]], operations=[op])
+    names = {
+        s.name
+        for item in _taken_symbols(graph, [op])
+        for s in getattr(item, "free_symbols", ())
+    }
+    assert {"u0", "u1"} <= names
+
+
+def test_unreadable_reads_and_writes_convert_nothing():
+    """A name that was not seen could be handed out twice, so when an op's reads and
+    writes cannot be read the pass converts no group at all."""
+    from types import SimpleNamespace
+
+    def broken():
+        raise RuntimeError("no read/write view")
+
+    op = SimpleNamespace(get_read_writes=broken, get_operation_name=lambda: "op0")
+    graph = _graph_with(operations=[op])
+    with pytest.raises(Unsupported, match="op0"):
+        _taken_symbols(graph, [op])
+    assert add_loop_terms(graph, [([op], [(0, 2)])], 0) == {}
+
+
+def test_a_pair_whose_symbol_is_not_in_the_index_does_not_advance():
+    """A read that does not depend on the tiled dim (a broadcast) advances by
+    nothing along it, as the stored record does; a buffer stride would be wrong
+    whenever the op's dims are not the buffer's."""
+    from types import SimpleNamespace
+
+    from torch._inductor.utils import sympy_index_symbol
+
+    i0, i1 = sympy_index_symbol("d0"), sympy_index_symbol("d1")
+    op = SimpleNamespace(
+        data=SimpleNamespace(ranges=[sympy.Integer(2048), sympy.Integer(512)])
+    )
+    graph = SimpleNamespace()  # never asked for a buffer: no stride is needed
+    broadcast = SimpleNamespace(index=i1)  # no d0
+    assert _access_term(graph, op, broadcast, "b", [(0, 2048)], []) == 0
+    plain = SimpleNamespace(index=512 * i0 + i1)
+    assert _access_term(graph, op, plain, "a", [(0, 2048)], []) == 512 * 2048
 
 
 def test_a_symbolic_extent_is_unsupported():
@@ -577,3 +661,27 @@ def test_a_read_through_a_plain_view_is_still_converted():
     wrong, looped = _compile_forced_view(lambda t: t, [(0, 64)])
     assert wrong == 0.0, wrong
     assert looped and all(len(op.loop_vars) == 1 for op in looped), looped
+
+
+@expects_raise
+def test_an_unsupported_release_refuses_a_span_overflow_graph_with_a_clear_error():
+    """A converted group is a LoopNode, so its graph needs a release the loop
+    scheduler supports, as a for_each_tile graph does. On any other the failure must
+    be the one clear Unsupported naming the release, not a late error in the
+    generated wrapper.
+
+    TODO: if span-overflow loops are ever lowered without a LoopNode on an
+    unsupported release, this becomes a positive test."""
+    from torch._inductor.exc import InductorError
+
+    from torch_spyre._inductor import loop_scheduler
+
+    fn, shapes, limit, *_ = CASES["pointwise_copy_out"]
+    args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
+    with (
+        mock.patch.object(loop_scheduler, "loop_scheduler_supported", lambda: False),
+        pytest.raises(
+            InductorError, match=r"LoopNode scheduler patch supports only torch"
+        ),
+    ):
+        compile_span_overflow(fn, args, limit)

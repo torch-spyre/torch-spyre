@@ -86,7 +86,7 @@ def access_step(
     only for a contiguous buffer (#6093).
 
     Raises ``Unsupported`` for an extent that is not an integer, and for an index
-    that holds the symbol without a plain coefficient for it.
+    that holds the symbol without a plain numeric coefficient for it.
     """
     if not isinstance(extent, sympy.Integer):
         raise Unsupported(
@@ -95,12 +95,13 @@ def access_step(
         )
     if dim_symbol is not None and dim_symbol in index.free_symbols:
         coefficient = index.coeff(dim_symbol)
-        if coefficient == 0:
-            # The symbol is there but not as a plain term (floor, modulo, a product
-            # with another symbol): there is no coefficient to read.
+        if coefficient == 0 or coefficient.free_symbols:
+            # The symbol is there but not as a plain term: inside a floor or modulo
+            # (coefficient 0), or multiplied by another symbol (coefficient d1 in
+            # d0*d1). There is no numeric step to read.
             raise Unsupported(
                 f"span-overflow loop term: the index {index} is not affine in "
-                f"{dim_symbol}."
+                f"{dim_symbol} with a numeric coefficient."
             )
         return coefficient * extent
     return sympy.sympify(buffer_stride) * extent
@@ -112,18 +113,39 @@ def access_step(
 _LEGACY_ONLY_KINDS = frozenset({"reduction", "mutation_write_back"})
 
 
-def _taken_symbols(operations: Iterable[Any]) -> list[sympy.Basic]:
-    """Every symbol a loop variable's name could collide with: the free symbols of
-    each op's indexes and the loop variables its ``dim_hints`` already list."""
+def _taken_symbols(graph: Any, operations: Iterable[Any]) -> list[sympy.Basic]:
+    """Every symbol a loop variable's name could collide with.
+
+    The free symbols of each op's indexes and sizes, the loop variables its
+    ``dim_hints`` already list, the graph inputs' sizes, and everything the shape
+    environment has allocated (a ``for_each_tile`` loop variable is an unbacked
+    scalar from there, and so is a data-dependent size that appears in no index).
+
+    Raises ``Unsupported`` when an op's reads and writes cannot be read: a name
+    that was not seen could be handed out twice, so the caller does nothing.
+    """
     taken: list[sympy.Basic] = []
+    shape_env = getattr(getattr(graph, "sizevars", None), "shape_env", None)
+    taken.extend(getattr(shape_env, "var_to_range", None) or ())
+    for value in (getattr(graph, "graph_inputs", None) or {}).values():
+        get_size = getattr(value, "get_size", None)
+        if get_size is not None:
+            taken.extend(get_size())
     for op in operations:
         for hint in getattr(op, "dim_hints", None) or ():
             if hint.loop_var is not None:
                 taken.append(hint.loop_var)
+        get_size = getattr(op, "get_size", None)
+        if get_size is not None:
+            taken.extend(get_size())
         try:
             reads_writes = op.get_read_writes()
-        except Exception:  # an op with no read/write view cannot name a symbol
-            continue
+        except Exception as error:
+            raise Unsupported(
+                f"span-overflow loop term: cannot read the reads and writes of "
+                f"{op.get_operation_name()} ({type(error).__name__}), so the names "
+                "already in use are not known."
+            ) from error
         taken.extend(
             dep.index
             for dep in (*reads_writes.reads, *reads_writes.writes)
@@ -219,12 +241,13 @@ def _access_term(
     total: sympy.Expr = sympy.S.Zero
     for dim, extent in pairs:
         symbol = SpyreKernel._host_dim_to_index_symbol(op, dim)
-        stride = (
-            _stride(graph, buffer_name, rank, dim)
-            if symbol not in dep.index.free_symbols
-            else sympy.S.Zero
-        )
-        total += access_step(dep.index, symbol, sympy.sympify(extent), stride)
+        if symbol not in dep.index.free_symbols:
+            # The access does not depend on this dim (a broadcast read), so it does
+            # not advance along it. The stored record substitutes into the index and
+            # gets the same zero; a buffer stride here would be wrong whenever the
+            # op's dims are not the buffer's.
+            continue
+        total += access_step(dep.index, symbol, sympy.sympify(extent), sympy.S.Zero)
     if squeezed:
         _require_same_dim_order(graph, op, dep, buffer_name)
         dims = [d for d in op.loop_info.loop_tiled_dims[0] if op.data.ranges[d] == 1]
@@ -366,7 +389,11 @@ def add_loop_terms(
     group's ``loop_group_id``, which is how ``loop_node.collapse`` keys inductions.
     """
     operations = list(graph.operations)
-    taken = _taken_symbols(operations)
+    try:
+        taken = _taken_symbols(graph, operations)
+    except Unsupported as error:
+        logger.debug("no span-overflow group is converted: %s", error)
+        return {}
     inductions: dict[int, sympy.Symbol] = {}
     for group_idx, (_, levels) in enumerate(groups, start=group_idx_offset):
         members = [

@@ -445,6 +445,22 @@ class TestLoopSchedulerNode(_Graph):
         self.assertIn("other", {d.name for d in snode.read_writes.reads})
         self.assertNotIn("other", {d.name for d in snode.unmet_dependencies})
 
+    def test_a_refresh_replaced_inside_the_block_is_detected(self):
+        from torch._inductor import scheduler as stock
+
+        self._p.__exit__(None, None, None)
+        original = stock.refresh_group_node_dependencies
+        try:
+            with self.assertRaises(AssertionError):
+                with ls._replace_refresh():
+                    stock.refresh_group_node_dependencies = lambda group: None
+            # and it is put back even then
+            self.assertIs(stock.refresh_group_node_dependencies, original)
+        finally:
+            stock.refresh_group_node_dependencies = original
+            self._p = apply_loop_scheduler_patches()
+            self._p.__enter__()
+
     def test_the_refresh_patch_is_installed_for_the_block_and_restored(self):
         from torch._inductor import scheduler as stock
 
