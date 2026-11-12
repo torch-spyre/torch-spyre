@@ -54,6 +54,230 @@ _EXPLICIT = [
 ]
 
 
+def test_measurement_and_scope_suffixes_stay_one_row(tmp_path, capsys):
+    op = "gemma-4-26B-A4B-it_full-mode_full_model_torch-spyre"
+    tags = [
+        f"op__{op}",
+        "mode__generate",
+        "model__gemma-4-26B-A4B-it",
+        "config__full_model",
+        "batch_size__4",
+        "prompt_length__128",
+        "measurement__generate-v1",
+    ]
+    kernel_tags = tags + [
+        "kernel_scope__request",
+        "regression_status__insufficient_data",
+    ]
+    cases = [
+        _tc(f"perf_{op}_wall_clock_ms_measurement_generate-v1_{op}", tags, "1889.869"),
+        _tc(f"perf_{op}_spyre_ms_measurement_generate-v1_{op}", tags, "1812.747"),
+        _tc(
+            f"perf_{op}_kernel_ms_measurement_generate-v1_scope_request_{op}",
+            kernel_tags,
+            "1791.818",
+        ),
+        _tc(
+            f"perf_{op}_memory_transfer_ms_measurement_generate-v1_scope_request_{op}",
+            kernel_tags,
+            "20.929",
+        ),
+    ]
+    _, rows = results.parse_benchmark_xml(_write(tmp_path, cases))
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["record_type"] == "model"
+    assert row["total_duration_ms"] == pytest.approx(1889.869)
+    assert row["spyre_ms"] == pytest.approx(1812.747)
+    assert row["kernel_mean_ms"] == pytest.approx(1791.818)
+    assert row["memory_transfer_mean_ms"] == pytest.approx(20.929)
+    assert row["regression_status"] == "insufficient_data"
+    assert row["measurement"] == "generate-v1"
+    assert row["kernel_scope"] == "request"
+    entries = results._bench_entries(rows)
+    assert len(entries) == 2
+    wall, scoped = entries
+    assert set(wall["measurements"]) == {"total_duration_ms", "spyre_ms"}
+    assert set(scoped["measurements"]) == {
+        "kernel_mean_ms",
+        "memory_transfer_mean_ms",
+    }
+    assert wall["props"]["measurement"] == "generate-v1"
+    assert "kernel_scope" not in wall["props"]
+    assert "kernel_scope" not in wall["disc_keys"]
+    assert "measurement" in wall["disc_keys"]
+    assert scoped["props"]["kernel_scope"] == "request"
+    assert scoped["props"]["measurement"] == "generate-v1"
+    assert "kernel_scope" in scoped["disc_keys"]
+    assert "measurement" in scoped["disc_keys"]
+    err = capsys.readouterr().err
+    assert "duplicate" not in err
+    assert "disagrees" not in err
+
+
+def test_measurement_value_with_underscore_stays_one_row(tmp_path):
+    op = "gemma-4-26B-A4B-it_full-mode_full_model_torch-spyre"
+    tags = [f"op__{op}", "model__gemma-4-26B-A4B-it", "measurement__generate_v2"]
+    cases = [
+        _tc(f"perf_{op}_wall_clock_ms_measurement_generate_v2_{op}", tags, "10"),
+        _tc(f"perf_{op}_spyre_ms_measurement_generate_v2_{op}", tags, "9"),
+        _tc(
+            f"perf_{op}_kernel_ms_measurement_generate_v2_scope_request_{op}",
+            tags + ["kernel_scope__request"],
+            "8",
+        ),
+    ]
+    _, rows = results.parse_benchmark_xml(_write(tmp_path, cases))
+    assert len(rows) == 1
+    assert rows[0]["total_duration_ms"] == pytest.approx(10)
+    assert rows[0]["spyre_ms"] == pytest.approx(9)
+    assert rows[0]["kernel_mean_ms"] == pytest.approx(8)
+    assert rows[0]["measurement"] == "generate_v2"
+    assert results._group_shapes("bs1_pl512") == "bs1_pl512"
+    assert results._group_shapes("measurement_generate_v2_bs1_pl512") == "bs1_pl512"
+    assert results._group_shapes("measurement_generate_v2") == "measurement_generate_v2"
+    assert results._group_shapes("measurement_generate-v1") == "measurement_generate-v1"
+
+
+def test_duplicate_metric_after_scope_collapse_keeps_last(tmp_path, capsys):
+    op = "gemma-4-26B-A4B-it_full-mode_full_model_torch-spyre"
+    tags = [f"op__{op}", "model__gemma-4-26B-A4B-it"]
+    region = f"perf_{op}_kernel_ms_measurement_generate-v1_scope_region_{op}"
+    request = f"perf_{op}_kernel_ms_measurement_generate-v1_scope_request_{op}"
+    cases = [
+        _tc(region, tags + ["kernel_scope__region"], "10"),
+        _tc(request, tags + ["kernel_scope__request"], "20"),
+    ]
+    _, rows = results.parse_benchmark_xml(_write(tmp_path, cases))
+    assert len(rows) == 1
+    assert rows[0]["kernel_mean_ms"] == pytest.approx(20)
+    assert rows[0]["kernel_scope"] == "request"
+    err = capsys.readouterr().err
+    assert "duplicate kernel" in err
+    assert "replacing" in err
+    assert region in err
+    assert request in err
+
+
+def test_two_measurement_values_keep_last(tmp_path, capsys):
+    op = "gemma"
+    first = f"perf_{op}_wall_clock_ms_measurement_generate-v1_{op}"
+    second = f"perf_{op}_wall_clock_ms_measurement_generate_v2_{op}"
+    cases = [
+        _tc(first, ["model__gemma", "measurement__generate-v1"], "11"),
+        _tc(second, ["model__gemma", "measurement__generate_v2"], "22"),
+    ]
+    _, rows = results.parse_benchmark_xml(_write(tmp_path, cases))
+    assert len(rows) == 1
+    assert rows[0]["total_duration_ms"] == pytest.approx(22)
+    assert rows[0]["measurement"] == "generate_v2"
+    err = capsys.readouterr().err
+    assert "duplicate wall_clock" in err
+    assert first in err and second in err
+
+
+def test_shape_prefixed_with_scope_stays_its_own_row(tmp_path, capsys):
+    real = "perf_matmul_wall_clock_ms_64x64"
+    prefixed = "perf_matmul_wall_clock_ms_scope_region_64x64"
+    _, rows = results.parse_benchmark_xml(
+        _write(
+            tmp_path,
+            [_tc(real, ["op__matmul"], "9"), _tc(prefixed, ["op__matmul"], "1")],
+        )
+    )
+    assert sorted(r["input_shapes"] for r in rows) == ["64x64", "scope_region_64x64"]
+    assert "duplicate" not in capsys.readouterr().err
+    assert results._group_shapes("scope_region_64x64") == "scope_region_64x64"
+    assert results._group_shapes("measurement_generate-v1_scope_request_op") == "op"
+    assert results._group_shapes("scope_request_measurement_generate_v2_op") == "op"
+
+
+def test_mixed_scope_drops_kernel_and_memory(tmp_path, capsys):
+    op = "gemma"
+    wall = f"perf_{op}_wall_clock_ms_measurement_generate-v1_{op}"
+    kernel = f"perf_{op}_kernel_ms_measurement_generate-v1_scope_region_{op}"
+    memory = f"perf_{op}_memory_transfer_ms_measurement_generate-v1_scope_request_{op}"
+    cases = [
+        _tc(wall, ["model__gemma", "measurement__generate-v1"], "11"),
+        _tc(kernel, ["model__gemma", "kernel_scope__region"], "10"),
+        _tc(memory, ["model__gemma", "kernel_scope__request"], "99"),
+    ]
+    _, rows = results.parse_benchmark_xml(_write(tmp_path, cases))
+    assert len(rows) == 1
+    assert rows[0]["total_duration_ms"] == pytest.approx(11)
+    assert rows[0]["kernel_mean_ms"] is None
+    assert rows[0]["memory_transfer_mean_ms"] is None
+    assert rows[0]["kernel_scope"] is None
+    err = capsys.readouterr().err
+    assert "kernel_scope disagrees" in err
+    assert "dropping both metrics" in err
+
+
+def test_memory_only_scope_falls_back(tmp_path):
+    op = "gemma"
+    mem = f"perf_{op}_memory_transfer_ms_measurement_generate-v1_scope_request_{op}"
+    _, rows = results.parse_benchmark_xml(
+        _write(
+            tmp_path,
+            [_tc(mem, ["model__gemma", "kernel_scope__request"], "5")],
+        )
+    )
+    assert rows[0]["memory_transfer_mean_ms"] == pytest.approx(5)
+    assert rows[0]["kernel_scope"] == "request"
+
+
+def test_v1_insert_ignores_measurement_and_kernel_scope():
+    from datetime import UTC, datetime
+
+    class Client:
+        def __init__(self):
+            self.column_names = None
+            self.rows = None
+
+        def query(self, sql, parameters=None):
+            class R:
+                # All optional columns present so the insert list stays full.
+                result_rows = [(c,) for c in results._PERF_BENCHMARK_OPTIONAL_COLUMNS]
+
+            return R()
+
+        def insert(self, table, rows, column_names=None):
+            self.column_names = column_names
+            self.rows = rows
+
+    row = {
+        "benchmark_id": 1,
+        "record_type": "model",
+        "operation_name": "gemma",
+        "config_name": "full_model",
+        "input_shapes": None,
+        "batch_size": 4,
+        "prompt_length": 128,
+        "run_mode": "generate",
+        "total_duration_ms": 1.0,
+        "cpu_ms": None,
+        "spyre_ms": None,
+        "kernel_mean_ms": None,
+        "memory_transfer_mean_ms": None,
+        "compile_ms": None,
+        "runtime_ms": None,
+        "mem_size_mb": None,
+        "pt_util_percent": None,
+        "num_runs": None,
+        "custom_op_file": None,
+        "regression_status": None,
+        "measurement": "generate-v1",
+        "kernel_scope": "request",
+        "created_at": datetime(2026, 11, 11, tzinfo=UTC),
+    }
+    client = Client()
+    results.insert_perf_benchmarks(client, 42, [row])
+    assert client.column_names == list(results._PERF_BENCHMARK_COLUMNS)
+    assert "measurement" not in client.column_names
+    assert "kernel_scope" not in client.column_names
+    assert len(client.rows) == 1
+
+
 def test_benchmark_explicit_model_tags(tmp_path):
     op = "gpt-neo-125m_decode-mode_full_model"
     _, rows = results.parse_benchmark_xml(_write(tmp_path, _bench(op, _EXPLICIT)))
