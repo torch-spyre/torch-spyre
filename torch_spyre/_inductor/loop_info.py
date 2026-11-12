@@ -364,6 +364,12 @@ class LoopShim:
     loop_tiled_reduction_dims: list[list[int]]
 
 
+# What a reader tests ``loop_info`` against when it needs the loop's own facts (group
+# id, count, tiled dims) and nothing about advances. ``isinstance(x, CoarseTileInfo)``
+# alone reads as False for a ``LoopShim``; stage 9 deletes this with the shim.
+COUNTED_LOOP_INFO = (CoarseTileInfo, LoopShim)
+
+
 _SPYRE_METADATA_ATTRS = (
     "dim_hints",
     "work_div_loop_info",

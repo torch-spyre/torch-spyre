@@ -35,6 +35,7 @@ from torch_spyre._inductor.loop_facts import (
     output_advances_anywhere,
     read_advance,
     read_advances_anywhere,
+    shim_advancing_levels,
 )
 from torch_spyre._inductor.loop_info import CoarseTileInfo, LoopShim
 from torch_spyre._inductor.propagate_hints import DimHint
@@ -133,6 +134,26 @@ def test_two_levels_use_the_loop_variables_outermost_first():
     assert read_advances_anywhere(op2, only_inner) is True
 
 
+def test_the_advancing_levels_of_a_shim_op_are_the_levels_any_access_moves_on():
+    read = _dep("arg0_1", 100 * u1 + d0)
+    other = _dep("arg1_1", d0)
+    write = _dep("buf0", 4 * u0 + d0)
+    hints = [_hint(u0, 2), _hint(u1, 4)]
+    op = _op(_shim(levels=2), [read, other], [write], hints)
+    assert shim_advancing_levels(op) == frozenset({0, 1})
+    no_write_term = _op(_shim(levels=2), [read, other], [_dep("buf0", d0)], hints)
+    assert shim_advancing_levels(no_write_term) == frozenset({1})
+    still = _op(_shim(levels=2), [other], [_dep("buf0", d0)], hints)
+    assert shim_advancing_levels(still) == frozenset()
+    assert shim_advancing_levels(_op(_shim(levels=2), [], [], hints)) == frozenset()
+
+
+def test_the_advancing_levels_of_a_coarsetileinfo_op_are_not_asked_of_the_index():
+    dep = _dep("arg0_1", 100 * u1 + d0)
+    op = _op(_equal_infos()[1], [dep], [], [_hint(u0, 2)])
+    assert shim_advancing_levels(op) == frozenset()
+
+
 def test_an_ordinary_hint_is_not_a_loop_variable():
     """A span-overflow hint (loop_var is an iteration symbol, no loop_var_range)
     must not be taken for the loop's variable."""
@@ -178,3 +199,202 @@ def test_a_coarsetileinfo_op_still_reads_its_lists():
     assert read_advances_anywhere(op, read) is True
     assert output_advance(op) == (512,)
     assert output_advances_anywhere(op) is True
+
+
+# ---------------------------------------------------------------------------
+# The readers that can see a shim op (the inventory is tests/inductor/
+# loop_shim_audit.py; the sites below are what it found)
+# ---------------------------------------------------------------------------
+
+import ast  # noqa: E402
+import pathlib  # noqa: E402
+from unittest import mock  # noqa: E402
+
+from torch._inductor.ir import Pointwise  # noqa: E402
+
+from torch_spyre._inductor import read_copy_elision, spyre_kernel  # noqa: E402
+from torch_spyre._inductor.ir import FixedTiledLayout  # noqa: E402
+from torch_spyre._inductor.scratchpad.allocator import (  # noqa: E402
+    _coarse_tile_loop_trip_count,
+    _is_coarse_tiled,
+)
+
+
+def _equal_infos():
+    shim = _shim()
+    legacy = CoarseTileInfo(
+        loop_group_id=shim.loop_group_id,
+        loop_count=list(shim.loop_count),
+        loop_tiled_dims=[list(d) for d in shim.loop_tiled_dims],
+        loop_tiled_reduction_dims=[list(d) for d in shim.loop_tiled_reduction_dims],
+    )
+    return shim, legacy
+
+
+def test_the_allocator_treats_a_shim_op_as_coarse_tiled():
+    """``_coarse_tile_loop_trip_count`` answers 1 for anything that is not coarse
+    tiled, which for a shim op would silently drop the loop's trips from the
+    relayout prices."""
+    shim, legacy = _equal_infos()
+    for info in (shim, legacy):
+        op = SimpleNamespace(loop_info=info)
+        assert _is_coarse_tiled(op) is True
+        assert _coarse_tile_loop_trip_count(op) == 8
+    assert _is_coarse_tiled(SimpleNamespace()) is False
+    assert _coarse_tile_loop_trip_count(SimpleNamespace(loop_info=None)) == 1
+
+
+# Where a bare ``isinstance(x, CoarseTileInfo)`` is correct, and why. Anything else
+# must test for the shim as well (``COUNTED_LOOP_INFO``).
+_BARE_ISINSTANCE_ALLOWED = {
+    # pass 0: runs before any shim can exist, on for_each_tile ops only
+    "wsr/for_each_tile_lowering.py": "for_each_tile ops are stamped at pass 0",
+    # declines by design: it keeps a copy for an op without a complete address record
+    "read_copy_elision.py": "keeps the copy for a shim consumer (decided)",
+}
+
+
+def test_every_bare_isinstance_coarsetileinfo_site_is_classified():
+    root = pathlib.Path(__file__).resolve().parents[2] / "torch_spyre" / "_inductor"
+    unclassified = []
+    for path in sorted(root.rglob("*.py")):
+        rel = str(path.relative_to(root))
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "isinstance"
+                and len(node.args) == 2
+                and ast.unparse(node.args[1]) == "CoarseTileInfo"
+                and rel not in _BARE_ISINSTANCE_ALLOWED
+            ):
+                unclassified.append(f"{rel}:{node.lineno}")
+    assert unclassified == [], (
+        "these tests would read as False for a LoopShim op; widen them to "
+        f"COUNTED_LOOP_INFO or classify them above: {unclassified}"
+    )
+
+
+def _kernel_for(op_loop_info, *, reads=()):
+    """A kernel positioned on a stub op, with the real bookkeeping and a stub
+    ``_index_tile_advance``."""
+    kernel = spyre_kernel.SpyreKernel.__new__(spyre_kernel.SpyreKernel)
+    kernel._general_tile_advance_seen = {}
+    node = SimpleNamespace(
+        loop_info=op_loop_info,
+        get_operation_name=lambda: "op7",
+        get_read_writes=lambda: SimpleNamespace(reads=list(reads), writes=[]),
+    )
+    kernel.current_node = SimpleNamespace(node=node)
+
+    def never(*args, **kwargs):
+        raise AssertionError("the stored-record builder ran for a shim op")
+
+    kernel._general_tile_advance = never
+    return kernel
+
+
+def _patched_v():
+    return mock.patch.object(
+        spyre_kernel, "V", SimpleNamespace(graph=SimpleNamespace(scheduler=None))
+    )
+
+
+def test_the_kernel_skips_the_advance_check_for_a_shim_op():
+    """No stored record exists to compare with; the advance is the index's."""
+    kernel = _kernel_for(_shim(), reads=[_dep("arg0_1", 512 * u0)])
+    advance = 512 * sympy.Symbol("u0")
+    kernel._index_tile_advance = lambda tensor, is_input, name: (advance, None)
+    with _patched_v():
+        assert kernel._checked_tile_advance(None, True, "arg0_1") == advance
+
+
+def test_a_zero_advance_of_a_shim_op_is_none():
+    kernel = _kernel_for(_shim(), reads=[_dep("arg0_1", d1)])
+    kernel._index_tile_advance = lambda tensor, is_input, name: (sympy.S.Zero, None)
+    with _patched_v():
+        assert kernel._checked_tile_advance(None, True, "arg0_1") is None
+
+
+def test_the_kernel_counts_each_read_of_a_shim_op_and_a_repeat_load_is_none():
+    """``_index_tile_advance`` picks a read by how many the kernel has counted;
+    the record builder is bypassed, so the shim branch must count them itself, or
+    every read of a shim op would answer 'no advance'."""
+    reads = [_dep("x", 512 * u0), _dep("x", 256 * u0)]
+    kernel = _kernel_for(_shim(), reads=reads)
+    seen_at_call = []
+
+    def index_advance(tensor, is_input, name):
+        seen_at_call.append(kernel._general_tile_advance_seen.get(name, 0))
+        return sympy.Integer(len(seen_at_call)) * sympy.Symbol("u0"), None
+
+    kernel._index_tile_advance = index_advance
+    with _patched_v():
+        first = kernel._checked_tile_advance(None, True, "x")
+        second = kernel._checked_tile_advance(None, True, "x")
+        third = kernel._checked_tile_advance(None, True, "x")  # nothing left to read
+    assert seen_at_call == [1, 2]
+    assert first == sympy.Symbol("u0") and second == 2 * sympy.Symbol("u0")
+    assert third is None
+
+
+def test_a_shim_op_with_no_index_advance_is_loud():
+    kernel = _kernel_for(_shim(), reads=[_dep("arg0_1", 512 * u0)])
+    kernel._index_tile_advance = lambda tensor, is_input, name: None
+    with _patched_v(), pytest.raises(RuntimeError, match="loop variable"):
+        kernel._checked_tile_advance(None, True, "arg0_1")
+
+
+@pytest.mark.parametrize(
+    "consumer_is_shim, copy_is_shim",
+    [(True, False), (False, True), (True, True)],
+    ids=["shim_consumer", "shim_copy", "both_shim"],
+)
+def test_read_copy_elision_keeps_a_copy_when_either_op_is_a_shim(
+    consumer_is_shim, copy_is_shim
+):
+    """Decided: it does not migrate; an op without a complete loop-address record
+    keeps its copy, and says so, not crashes. It tests the consumer and the copy
+    separately and returns the same reason for both, so each combination is run:
+    a test with both shim could not tell which check declined."""
+    _, legacy = _equal_infos()
+    other = _dep("other", d0)
+    cp = _dep("cp", d0 + d1)
+    out = _dep("out", d0 + d1)
+    layout = object()
+    consumer = SimpleNamespace(
+        get_name=lambda: "c",
+        data=mock.MagicMock(spec=Pointwise),
+        get_read_writes=lambda: SimpleNamespace(reads=[cp, other], writes=[out]),
+        get_layout=lambda: layout,
+        loop_info=_shim() if consumer_is_shim else legacy,
+    )
+    copy_op = SimpleNamespace(
+        get_layout=lambda: mock.MagicMock(spec=FixedTiledLayout),
+        get_read_writes=lambda: SimpleNamespace(
+            reads=[_dep("src", d0 + d1)], writes=[cp]
+        ),
+        loop_info=_shim() if copy_is_shim else legacy,
+    )
+    direct = SimpleNamespace(
+        get_read_writes=lambda: SimpleNamespace(
+            reads=[_dep("src", d0 + d1), other], writes=[out]
+        ),
+        get_layout=lambda: layout,
+    )
+    record = SimpleNamespace(
+        consumer_name="c",
+        source_name="src",
+        copy_name="cp",
+        direct_tiled_dims_per_level=None,
+        direct_squeezed_advance_per_level=None,
+    )
+    with mock.patch.object(
+        read_copy_elision, "_clone_direct_consumer", lambda *a: direct
+    ):
+        built, reason = read_copy_elision._prove_matmul_direct_read(
+            consumer, copy_op, record
+        )
+    assert built is None
+    assert reason == "copy has no complete loop-address record"

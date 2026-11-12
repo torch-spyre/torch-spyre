@@ -389,3 +389,22 @@ def output_advances_anywhere(op: Operation) -> bool:
         return True
     squeezed = getattr(loop_info, "squeezed_advance_output", None) or []
     return any(level for level in squeezed)
+
+
+def shim_advancing_levels(op: Operation) -> frozenset[int]:
+    """The loop levels at which any read or the write of a ``LoopShim`` op moves.
+
+    The kernel names a loop-level symbol for a level only if something at that
+    level advances.  A ``CoarseTileInfo`` op answers that from its stored lists;
+    a shim op has none, so the answer comes from the index.  Empty for an op
+    that does not carry a shim.
+    """
+    if not isinstance(getattr(op, "loop_info", None), LoopShim):
+        return frozenset()
+    levels: set[int] = set()
+    for dep in _memory_reads(op):
+        levels.update(i for i, a in enumerate(_shim_advance(op, dep)) if a != 0)
+    write = _first_memory_write(op)
+    if write is not None:
+        levels.update(i for i, a in enumerate(_shim_advance(op, write)) if a != 0)
+    return frozenset(levels)
