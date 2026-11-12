@@ -36,17 +36,26 @@ torch or torch-spyre package, so they are recognised by file and ignored.
 The ledger records every user compile whatever the mode.
 """
 
+import inspect
 import os
 import time
 import warnings
 
 import torch
 
+from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre.ops.warning_types import RecompileWarning
+
+logger = get_inductor_logger("recompile_check")
 
 MODE_ENV = "TORCH_SPYRE_RECOMPILE_CHECK"
 _MODES = ("warn", "error", "all", "off")
 _DEFAULT_MODE = "warn"
+
+# The private Dynamo names the hook depends on, and the signature it wraps.
+# A PyTorch upgrade that removes or changes them leaves Dynamo alone and
+# logs a warning, rather than wrapping something the hook no longer matches.
+CALLBACK_FROM_STANCE_PARAMS = ("callback",)
 
 _TORCH_DIR = os.path.dirname(os.path.abspath(torch.__file__)) + os.sep
 _SPYRE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + os.sep
@@ -177,12 +186,50 @@ def _wrap(callback):
     return wrapped
 
 
-def install_recompile_check():
-    """Wrap Dynamo's per-miss callback once. Safe to call more than once."""
+def _missing_dynamo_hooks():
+    """Why the hook cannot be installed on this torch, or None if it can."""
     import torch._dynamo.eval_frame as ef
+    from torch._C._dynamo import eval_frame as c_ef
 
     original = getattr(ef, "_callback_from_stance", None)
-    if original is None or getattr(original, "_spyre_recompile_check", False):
+    if original is None:
+        return "torch._dynamo.eval_frame._callback_from_stance is absent"
+    try:
+        params = tuple(inspect.signature(original).parameters)
+    except (TypeError, ValueError):
+        params = None
+    if params != CALLBACK_FROM_STANCE_PARAMS and not getattr(
+        original, "_spyre_recompile_check", False
+    ):
+        return (
+            f"torch._dynamo.eval_frame._callback_from_stance has parameters "
+            f"{params}, the hook was written for {CALLBACK_FROM_STANCE_PARAMS}"
+        )
+    if getattr(c_ef, "_debug_get_cache_entry_list", None) is None:
+        return "torch._C._dynamo.eval_frame._debug_get_cache_entry_list is absent"
+    return None
+
+
+def install_recompile_check():
+    """Wrap Dynamo's per-miss callback once. Safe to call more than once.
+
+    Installed only over the private names and signature it was written
+    against. On a torch where they are gone or changed, Dynamo is left alone
+    and a warning says the recompile check is off.
+    """
+    import torch._dynamo.eval_frame as ef
+
+    problem = _missing_dynamo_hooks()
+    if problem is not None:
+        logger.warning(
+            "The recompile check (%s) is not installed: %s. Update or remove "
+            "torch_spyre/_inductor/recompile_check.py for this torch version",
+            MODE_ENV,
+            problem,
+        )
+        return
+    original = ef._callback_from_stance
+    if getattr(original, "_spyre_recompile_check", False):
         return
 
     def callback_from_stance(callback):

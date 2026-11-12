@@ -21,6 +21,7 @@ stand in for a declaration by patching ``_declaration_of``. The device tests
 need a Spyre device and the ``dynamic=`` reservation of #5179.
 """
 
+import inspect
 import os
 import unittest
 import warnings
@@ -31,6 +32,7 @@ import torch
 import torch_spyre  # noqa: F401  registers the "spyre" device
 from torch_spyre._inductor import recompile_check
 from torch_spyre._inductor.recompile_check import (
+    CALLBACK_FROM_STANCE_PARAMS,
     MODE_ENV,
     RecompileError,
     compile_ledger,
@@ -194,6 +196,60 @@ class TestRecompileCheckCPU(_Base):
         self.assertEqual(len(reports), 2)
         self.assertFalse(any("_test_helper.py" in r for r in reports))
         self.assertTrue(any("resume_in_calls_helper" in r for r in reports))
+
+
+class TestTheDynamoHooks(unittest.TestCase):
+    """The hook wraps private Dynamo names; a torch upgrade must not pass blind."""
+
+    def test_upstream_still_has_the_names_the_hook_expects(self):
+        import torch._dynamo.eval_frame as ef
+        from torch._C._dynamo import eval_frame as c_ef
+
+        original = getattr(ef, "_callback_from_stance", None)
+        self.assertIsNotNone(original, "_callback_from_stance is gone")
+        if not getattr(original, "_spyre_recompile_check", False):
+            self.assertEqual(
+                tuple(inspect.signature(original).parameters),
+                CALLBACK_FROM_STANCE_PARAMS,
+                "_callback_from_stance changed its signature, so the recompile "
+                "check is no longer installed; update recompile_check.py",
+            )
+        self.assertTrue(
+            hasattr(c_ef, "_debug_get_cache_entry_list"),
+            "_debug_get_cache_entry_list is gone, so the recompile check is "
+            "no longer installed; update recompile_check.py",
+        )
+
+    def _assert_left_alone(self, callback_from_stance, cache_entry_reader):
+        """Install over the given names; Dynamo must be left as it was."""
+        import torch._dynamo.eval_frame as ef
+        from torch._C._dynamo import eval_frame as c_ef
+
+        with (
+            mock.patch.object(ef, "_callback_from_stance", callback_from_stance),
+            mock.patch.object(c_ef, "_debug_get_cache_entry_list", cache_entry_reader),
+            self.assertLogs(recompile_check.logger.name, level="WARNING") as log,
+        ):
+            install_recompile_check()
+            self.assertIs(ef._callback_from_stance, callback_from_stance)
+        (record,) = log.records
+        self.assertIn(MODE_ENV, record.args)
+
+    @staticmethod
+    def _unwrappable(callback):
+        raise AssertionError("the guard should not wrap or call this")
+
+    def test_a_changed_signature_is_left_alone_and_warned_about(self):
+        def callback_from_stance(callback, extra=None):
+            raise AssertionError("the guard should not wrap or call this")
+
+        self._assert_left_alone(callback_from_stance, lambda code: [])
+
+    def test_an_absent_callback_is_left_alone_and_warned_about(self):
+        self._assert_left_alone(None, lambda code: [])
+
+    def test_an_absent_cache_entry_reader_is_left_alone_and_warned_about(self):
+        self._assert_left_alone(self._unwrappable, None)
 
 
 def _region(branch):
