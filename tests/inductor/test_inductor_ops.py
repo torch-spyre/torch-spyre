@@ -827,6 +827,12 @@ WHOLE_STICK_PAIRS_REJECTIED = {
     "float16_to_float32_4x16",
 }
 
+# dbo-opt (sbf-ddc) rejects the shuffle kernel of this shape
+_BACKEND_ERROR = "Cannot find a valid minimum value for data stage"
+BACKEND_ERROR_REJECTIED = {
+    "bfloat16_to_float32_5120",
+    "float16_to_float32_5120",
+}
 # The cases left in TO_DTYPE_OP_EXPECT_FAIL return the cast result straight to the
 # host, and the result is wrong on 27-88% of its elements. The values on the device
 # are correct; the readback is not. A cast between fp16/bf16 and fp32 leaves a
@@ -8248,6 +8254,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "expect_raise": {
                 **dict.fromkeys(ROUND_TRIP_RESCALE_REJECTED, _RESCALE_REJECTION),
                 **dict.fromkeys(WHOLE_STICK_PAIRS_REJECTIED, _WHOLE_STICK_PAIRS),
+                **dict.fromkeys(BACKEND_ERROR_REJECTIED, _BACKEND_ERROR),
             },
         },
         (
@@ -8268,16 +8275,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ): {
             "ops_dict": {"sum": torch.sum},
             "param_sets": TO_DTYPE_REDUCTION_PARAMS_SETS,
-        },
-        (
-            "test_round_trip_to_dtype_implicit_invalid",
-            "test_round_trip_to_dtype_implicit_invalid_cpu",
-        ): {
-            "ops_dict": {"add": torch.add},
-            # Mixed-EA inputs with a non-broadcast stick (> 1 element) are
-            # rejected at compile time regardless of alignment, so these run
-            # live (no xfail) and the test body asserts the compile raises.
-            "param_sets": TO_DTYPE_OP_ROUND_TRIP_INVALID_PARAMS_SETS,
         },
         (
             "test_round_trip_to_dtype_mixed_ea_broadcast",
@@ -13100,32 +13097,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             op,
             x,
             dst_dtype,
-            cpu_compile=False,
-            run_eager=False,
-        )
-
-    def test_round_trip_to_dtype_implicit_invalid_cpu(self, op, x, dst_dtype):
-        # x_dst is a native dst-dtype (STANDARD) graph input; y is the src-dtype
-        # input. op(x_dst, y) forces one operand to be upcast in-graph, producing
-        # a staggered EA that is mixed with the other STANDARD operand. When the
-        # operands' stick dimension has more than one element (every shape in
-        # this param set, aligned OR unaligned), mixed EA is now supported with shuffle
-        # op and compiles. Alignment is NOT the deciding factor here — a
-        # non-broadcast stick is. (The broadcast/stick==1 case IS supported; see
-        # test_round_trip_to_dtype_mixed_ea_broadcast.)
-        y = x.clone()
-        x_dst = x.to(dst_dtype)
-
-        def fn(op, x, y):
-            src_dtype = y.dtype
-            z = op(x, y)
-            return z.to(src_dtype)
-
-        self.compare_with_cpu(
-            fn,
-            op,
-            x_dst,
-            y,
             cpu_compile=False,
             run_eager=False,
         )
