@@ -187,11 +187,18 @@ SPYRE_FP32_OPS = [
 ]
 
 # Native integer op names.  SpyreOpFuncs.add/mul emit these names directly when
-# their operands are IEEE_INT32 tensors.  Every check that needs to recognise a
-# native int32 op uses this set as its single source of truth.
+# their operands are IEEE_INT32 tensors, and simon32x2 takes int32 only.  Every
+# check that needs to recognise a native int32 op uses this set as its single
+# source of truth.
 ADDI32TOI32_OP = "addi32toi32"
 MULI32TOI32_OP = "muli32toi32"
-SPYRE_INT32_OPS: frozenset[str] = frozenset({ADDI32TOI32_OP, MULI32TOI32_OP})
+SIMON32X2_OP = "simon32x2"
+SPYRE_INT32_OPS: frozenset[str] = frozenset(
+    {ADDI32TOI32_OP, MULI32TOI32_OP, SIMON32X2_OP}
+)
+# 32 random bits (int32) to an fp32 uniform in (0, 1); its formats are those of
+# int32tofp32.
+BITS2UNIFORM_OP = "bits2uniform"
 
 # DLFloat16's largest finite value (0x7FFE); 0x7FFF is NaN-Infinity.
 DLFLOAT16_MAX = (1.0 + 510.0 / 512.0) * float(2**32)

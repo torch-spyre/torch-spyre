@@ -25,6 +25,7 @@ from torch._inductor.virtualized import V
 from torch_spyre._C import DataFormats, ElementArrangement
 from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.constants import (
+    BITS2UNIFORM_OP,
     CONV2D_DIM_LABELS,
     CONV2D_FWD_OP,
     CONV2D_LAYOUT_LABELS,
@@ -37,6 +38,7 @@ from torch_spyre._inductor.constants import (
     IDENTITY_OP,
     INPUT_DIM_LABELS,
     INT32TOFP32_OP,
+    KEEP_BY_INDEX_OP,
     LAYOUT_LABELS,
     MATMUL_DIM_LABELS,
     MATMUL_LAYOUT_LABELS,
@@ -48,7 +50,6 @@ from torch_spyre._inductor.constants import (
     RESTICKIFY_OP,
     SPYRE_INT32_OPS,
     TOPK_OPS,
-    KEEP_BY_INDEX_OP,
 )
 from torch_spyre._inductor.core_mapping import matmul_reduction_dim
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
@@ -1271,7 +1272,7 @@ def _get_sdsc_spec_data_format(op, arg_data_format):
     muli32toi32) are bound to IEEE_FP32.  All other ops pass the tensor
     format through unchanged.
     """
-    if op in (FP32TOINT32_OP, INT32TOFP32_OP, *SPYRE_INT32_OPS):
+    if op in (FP32TOINT32_OP, INT32TOFP32_OP, BITS2UNIFORM_OP, *SPYRE_INT32_OPS):
         return DataFormats.IEEE_FP32
     return arg_data_format
 
