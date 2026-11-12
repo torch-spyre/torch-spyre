@@ -465,53 +465,56 @@ It does not leave the HUD projection (`schema/70`). Its rows stay in `oss_ci_ben
 branch and commit stay in the metadata dropdowns too. The HUD reads these tables with PREWHERE, which
 a view cannot serve, so they cannot be filtered by a view. The follow-up is torch-spyre#5446.
 
-## Write resilience and the spool
+## Write resilience
 
-`resilience.resilient_insert` and `spool.TieredSpool` keep a write from being lost or doubled when
-the cluster is degraded. **Nothing calls them yet and no probe exists**, so on the live path
-(`probe=None`) every batch that may already be stored is held for a person.
+`resilience.resilient_insert` sends rows in batches and survives a degraded cluster (a pod restart,
+a Keeper blip, an `insert_quorum` that is briefly unmet). **Nothing calls it yet and there is no
+probe.** It is a building block with deliberately small promises.
 
-- A batch refused before any write (quorum, read-only) is resent as is. A batch that a failed or
-  interrupted attempt may have stored is *held*: on a Replicated table inside its dedup window it
-  is resent under its original `insert_deduplication_token`; otherwise nothing resends it.
-- Before every replay the item is first recorded as "may be stored" (write-ahead). Locally that is
-  one atomic rename of the claimed file to a `.amb` name, which fails if the claim was reaped, so a
-  drainer that outlived its lease can neither record nor send; on the shared tier it is a PUT with
-  the lock re-verified before and after. A crash, a lost response or a lease that expires mid-send
-  then leaves a held item, never a clean one that is resent. If the record cannot be written or
-  verified, nothing is sent. It is cleared again only on an error that proves nothing was written
-  (a refused connection, or a pre-write code when the table feeds no view).
-- Timing assumptions. `lease_s` must exceed the worst-case send plus a 60 s margin: a client's
-  `timeout` (a number, or a `urllib3.Timeout` read field by field) allows up to connect plus two
-  read timeouts per insert, 610 s with the driver defaults, so the default lease is 720 s and a
-  client that can outlast it is refused. The shared lock stamp is the writer's clock; a runner
-  whose clock is more than 30 s off the server's `Date` header is refused. What remains: a drainer
-  paused between its last check and the send, for longer than the margin, can still send after a
-  second drainer has taken the item; the record is already in place by then, so the second one
-  holds, but the first send is not fenced on the ClickHouse side. A shared PUT or lock write that
-  lands after a client-side timeout, minutes later, is not covered.
-- Spool files are mode 0600 and the directory 0700: they hold row data.
-- A held item stays until a person decides. Check the table, then:
-  `python -m spyre_clickhouse_ingest spool list` (JSON lines, `held` marks them),
-  `... spool release TOKEN` (the rows are NOT stored; resend on the next drain) or
-  `... spool drop TOKEN` (the rows are stored or not wanted). It reads `CH_WRITE_SPOOL`. TOKEN is
-  `[A-Za-z0-9._-]` only. When a batch has a local copy and a shared copy (a shared PUT that timed
-  out after landing leaves a "twin"), `release` keeps the shared copy, deletes the local one and
-  needs the shared tier to be readable; `drop` removes both.
-- Tables with a dependent materialized view: replicated inserts pass
-  `deduplicate_blocks_in_dependent_materialized_views=1`, so a retry whose source block was
-  deduplicated still reaches a view target that missed it (checked on chdb 26.9, single node).
-  The view target needs its own dedup window (Replicated, or `non_replicated_deduplication_window`);
-  without one a retry doubles the view. Not verified: Replicated tables on a real Keeper cluster and
-  servers older than 26.2 (where the default is 0). Pass `feeds_views=False` only for a table with
-  no dependent view; otherwise the pre-write codes (242, 252, 285, 286) are treated as ambiguous
-  (a view's target can raise them after the source block landed).
-- A real probe needs a per-batch marker (a batch-id column, or the token on a Replicated table).
-  The sort keys of `test_case_runs`, `benchmark_runs` and `artifact_results` are not unique per
-  batch, so counting rows by key would call a lost batch stored.
-- Known gaps: the 3600 s dedup window is a time bound only (ClickHouse also evicts by block count);
-  `replay()` on the plain `Spool` does not record attempts; a shared PUT that times out after
-  landing is covered by holding the local twin, but a PUT that lands minutes later is not.
+What it promises:
+
+- **Nothing is lost silently.** A batch it cannot land inside the call's deadline is parked as a
+  file in the `Spool`. If the spool is full, or a plain-table batch may be stored and there is no
+  spool, the call raises (`SpoolFull`, `WriteAmbiguous`, `WriteUnavailable`) instead of dropping it.
+- **Replicated tables are exactly-once inside the dedup window.** Every batch is sent with a
+  deterministic `insert_deduplication_token` (table, scope, position, rows), so every resend uses
+  the same token and a second sender is harmless. Rerunning a load with the same `scope` inside the
+  window resends under the same tokens.
+- **A plain table never has a batch sent again once a send may have stored it.** It is parked
+  with `"ambiguous": true` for a person.
+- **A batch refused before any write is retried inside the call that made it**, with backoff to
+  the deadline, and may drop to a lower quorum only for a table that allows it.
+
+What it does not promise:
+
+- No automatic replay. Parked batches stay until a person acts. Replaying a plain table would need
+  a claim and a lease, and the safe-looking Replicated-only replay still needs to know the dedup
+  window has not passed; neither is small enough to ship without a probe.
+- No exactly-once outside the dedup window (ClickHouse also evicts tokens by block count), and none
+  on a plain table.
+- `feeds_views` defaults to `True`: a table with a dependent materialized view can raise 242, 252,
+  285 or 286 from the view's target after the source block landed, so on a plain table a first such
+  error is held, not retried. Pass `feeds_views=False` to `resilient_insert` (the one place the knob
+  lives) for a table with no dependent view. Replicated inserts also send
+  `deduplicate_blocks_in_dependent_materialized_views=1` so a retry reaches a view target that
+  missed the block (checked on single-node chdb 26.9; the view target needs its own dedup window,
+  and Keeper-backed Replicated tables and servers older than 26.2, where the default is 0, are not
+  verified).
+- A probe (is this batch already stored?) needs a per-batch marker, such as a batch-id column. The
+  sort keys of `test_case_runs`, `benchmark_runs` and `artifact_results` are not unique per batch,
+  so counting rows by key would call a lost batch stored.
+
+Handling parked batches by hand. The spool directory (`CH_WRITE_SPOOL`) is 0700 and its files are
+0600 plain JSON: they hold row data.
+
+```text
+python -m spyre_clickhouse_ingest spool list         # token, table, row count, held?
+python -m spyre_clickhouse_ingest spool drop TOKEN   # TOKEN is [A-Za-z0-9._-], max 200
+```
+
+A `held` batch may already be stored. Check the table (the rows are in the file), send the missing
+rows yourself, then `drop` it. A batch that is not held was refused before any write and is safe
+to send. There is no `release`: with no automatic replay it would have nothing to release into.
 
 ## What is deliberately NOT here
 

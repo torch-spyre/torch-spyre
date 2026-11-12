@@ -12,39 +12,41 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""`spool list|release TOKEN|drop TOKEN`: what a person does with held spool items.
+"""`spool [list | drop TOKEN]`: look at and clear batches parked in CH_WRITE_SPOOL.
 
-A held item is a batch a failed or interrupted attempt may have stored; nothing resends it on its
-own. Check the table first, then `release` it (the rows are NOT stored: it is resent on the next
-drain) or `drop` it (the rows are stored, or not wanted).
+A parked batch is one a write could not land. Nothing sends it again: check the table, send the
+rows yourself if they are missing (the file is plain JSON), then `drop` it.
 """
 
 import json
+import os
 import sys
+from pathlib import Path
 
-from . import spool
+from .resilience import Spool
 
 
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    s = spool.from_env("cli")
-    if s is None:
-        print("CH_WRITE_SPOOL is not set: no spool to look at", file=sys.stderr)
+    where = (os.environ.get("CH_WRITE_SPOOL") or "").strip()
+    if not where or not Path(where).is_dir():
+        print("CH_WRITE_SPOOL is not set to an existing directory", file=sys.stderr)
         return 2
+    spool = Spool(where)
     cmd, rest = (argv[0] if argv else "list"), argv[1:]
-    if cmd == "list":
-        for it in s.items():
-            print(json.dumps(it))
+    if cmd == "list" and not rest:
+        for item in spool.items():
+            print(json.dumps(item))
         return 0
-    if cmd in ("release", "drop") and len(rest) == 1:
+    if cmd == "drop" and len(rest) == 1:
         try:
-            n = s.release_held(rest[0]) if cmd == "release" else s.drop(rest[0])
-        except (ValueError, OSError) as e:
-            print(f"{cmd}: {e}", file=sys.stderr)
+            n = spool.drop(rest[0])
+        except ValueError as e:
+            print(f"drop: {e}", file=sys.stderr)
             return 2
-        print(f"{cmd}: {n} item(s)")
+        print(f"drop: {n} item(s)")
         return 0 if n else 1
-    print("usage: spool [list | release TOKEN | drop TOKEN]", file=sys.stderr)
+    print("usage: spool [list | drop TOKEN]", file=sys.stderr)
     return 2
 
 
