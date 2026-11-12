@@ -43,7 +43,7 @@ from torch_spyre._C import ElementArrangement, SpyreTensorLayout
 
 from .constants import STAGGERED_EAS, is_ea_compatible
 from .errors import Unsupported
-from .ir import FixedTiledLayout
+from .ir import FixedTiledLayout, SpyreConstantFallback
 from .logging_utils import get_inductor_logger
 from .pass_utils import (
     indirect_info_from_op,
@@ -344,6 +344,16 @@ def _shuffle_targets(
     }
 
 
+def _without_constants(
+    graph: GraphLowering, stls: dict[str, SpyreTensorLayout]
+) -> dict[str, SpyreTensorLayout]:
+    return {
+        n: s
+        for n, s in stls.items()
+        if not isinstance(graph.try_get_buffer(n), SpyreConstantFallback)
+    }
+
+
 def _mark_mismatched_ea(
     graph: GraphLowering,
 ) -> list[tuple[ComputedBuffer, dict[str, ElementArrangement]]]:
@@ -364,7 +374,9 @@ def _mark_mismatched_ea(
             _check_indirect_op(op, stls)
             continue
         _check_staggered_eas(op, stls)
-        targets = _shuffle_targets(stls, out_stl.element_arrangement)
+        targets = _shuffle_targets(
+            _without_constants(graph, stls), out_stl.element_arrangement
+        )
         _log_op(graph, op, stls, targets)
         if not targets:
             continue
