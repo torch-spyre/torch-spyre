@@ -1948,15 +1948,8 @@ class DomainRangeTracer(DomainRangeSolver):
             except InvalidDomain as inv_domain:
                 name = index2arg[inv_domain.arg_index]
                 buf = input_buffers[name]
-                if can_coord_mask(inv_domain.func, buf.layout.dtype):
-                    do_coord_mask = True
-                    # For now this is true for all operations that are padded
-                    if op.layout.dtype in (torch.float16, torch.bfloat16):
-                        self.buffer_range[op.name] = FiniteSet(0)
-                    else:
-                        self.buffer_range[op.name] = Interval(0, 1e-2)
-                else:
-                    do_pad = True
+                do_coord_mask = can_coord_mask(inv_domain.func, buf.layout.dtype)
+                do_pad = not do_coord_mask
 
                 try:
                     pad_value = get_or_pick_pad_value(inv_domain, buf.layout.dtype)
