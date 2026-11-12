@@ -1509,12 +1509,12 @@ class TestHostSparseLayout(TestCase):
     def test_2d_layout(self):
         sp = host_sparse_layout(_contiguous_host([8, 65]))
         self.assertEqual(list(sp.device_size), [65, 1, 8, 64])
-        self.assertEqual(list(sp.stride_map), [1, -1, 65, -1])
+        self.assertEqual(list(sp.stride_map), [1, 0, 65, 0])
 
     def test_3d_former_stick_dim_is_outermost(self):
         sp = host_sparse_layout(_contiguous_host([2, 3, 65]))
         self.assertEqual(list(sp.device_size), [65, 3, 1, 2, 64])
-        self.assertEqual(list(sp.stride_map), [1, 65, -1, 195, -1])
+        self.assertEqual(list(sp.stride_map), [1, 65, 0, 195, 0])
 
     def test_former_stick_dim_outermost_for_every_rank(self):
         for shape in ([8, 65], [2, 3, 65], [4, 2, 100], [2, 3, 4, 65]):
@@ -1528,7 +1528,7 @@ class TestHostSparseLayout(TestCase):
         self.assertEqual(sorted(sp.device_size), sorted([65, 3, 4, 1, 2, 64]))
         # One device dim per host dim plus the new size-1 dim and the stick; the
         # host strides are kept, the new dims have none.
-        self.assertEqual(sorted(sp.stride_map), sorted([1, 260, 65, -1, 780, -1]))
+        self.assertEqual(sorted(sp.stride_map), sorted([1, 260, 65, 0, 780, 0]))
 
     def test_size_one_dims_do_not_change_the_rule(self):
         for shape in ([1, 65], [2, 1, 65], [1, 3, 65], [1, 1, 65]):
@@ -1564,7 +1564,7 @@ class TestSparseLayoutServesRead(TestCase):
             values = [int(c.subs({c0: flat})) for c in coords]
             # The stick and any size-1 dim sit at coordinate 0.
             for value, stride in zip(values, strides):
-                if stride == -1:
+                if stride == 0:
                     self.assertEqual(value, 0, f"c0={flat}")
             # Contiguous host: the host offset of the element is the flat index.
             offset = sum(v * st for v, st in zip(values, strides) if st > 0)
