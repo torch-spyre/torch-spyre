@@ -1,7 +1,9 @@
 -- One row per artifactory-sweep plan or apply attempt, including refused and skipped ones. Append-only:
 -- a later attempt is a new row. 'started' is the claim an apply writes before deleting; its final row (applied,
 -- partial or failed) follows, and a lone started row means the run died mid-way: treat the digest as possibly
--- partially applied. plan_digest is the sha256 of the plan; a plan row's props carry plan_build.
+-- partially applied. A digest with any started, applied, partial or failed apply row is spent and needs a fresh plan;
+-- a failure before the claim is written as refused. Rows can repeat when a writer retries: do not rely on exact counts.
+-- plan_digest is the sha256 of the plan; a plan row's props carry plan_build.
 CREATE TABLE IF NOT EXISTS artifact_sweep_runs
 (
     ts              DateTime64(3, 'UTC') DEFAULT now64(3),
