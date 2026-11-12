@@ -37,6 +37,7 @@ from torch_spyre._inductor.constants import (
     IDENTITY_OP,
     INPUT_DIM_LABELS,
     INT32TOFP32_OP,
+    KEEP_BY_INDEX_OP,
     LAYOUT_LABELS,
     MATMUL_DIM_LABELS,
     MATMUL_LAYOUT_LABELS,
@@ -48,7 +49,6 @@ from torch_spyre._inductor.constants import (
     RESTICKIFY_OP,
     SPYRE_INT32_OPS,
     TOPK_OPS,
-    KEEP_BY_INDEX_OP,
 )
 from torch_spyre._inductor.core_mapping import (
     apply_core_stride,
@@ -94,6 +94,7 @@ class SDSCArgs:
     start_address: int | Symbol
     backGap: dict[Symbol, int]
     work_division: TensorWorkDivision | None = None
+    active_core_ids: tuple[int, ...] = ()
     arg_index: int = -1
     is_index_tensor: bool = False
     related_value_tensor_idx: int = -1
@@ -168,6 +169,8 @@ class SDSCSpec:
     input_coord_sizes: dict = dataclasses.field(default_factory=dict)
     emit_memorg_padding: bool = False
     completed_producer_cores: tuple[int, ...] = ()
+    # Explicit relayout dispatch; completed_producer_cores remains a reduction route.
+    active_core_ids: tuple[int, ...] = ()
 
     def __str__(self) -> str:
         iter_space = ", ".join(f"{k}={v}" for k, v in self.iteration_space.items())
@@ -2805,6 +2808,11 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     # into backend labels. They are unsplit and therefore owned at slice zero.
     # Every non-unit dimension must already have a final assignment.
     mapping_dims = tuple(sdsc_iteration_space)
+    for dim in mapping_dims:
+        if dim not in core_id_to_work_slice:
+            if int(dim_splits[dim]) != 1:
+                raise ValueError(f"final core mapping is missing split dimension {dim}")
+            core_id_to_work_slice[dim] = Integer(0)
     if is_relayout:
         operation_cores = num_cores
         num_cores = max(
@@ -2828,35 +2836,59 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
                 )
                 for dim, owner in core_id_to_work_slice.items()
             }
-    # Sparse core placement. The backend's core fold is positional: its size
-    # is the highest id in use + 1, every per-core data blob must carry one
-    # entry per fold position, and coreIdsUsed_ only lists the dispatched
-    # cores. apply_core_stride spreads num_cores logical slices evenly across
-    # the card's physical cores when that count divides evenly, widening the
-    # fold and dispatching only the strided ids. Relayouts keep their separate
-    # core-domain handling above. The emitted work-slice map includes only
-    # active core ids; this is required for sparse K-split matmuls as well as
-    # other operations (see the K-split core-placement experiment artifacts).
+    # Relayouts can read and write different physical core domains. Preserve
+    # each tensor's logical ownership until finalization, then place its owners
+    # independently. Dispatch the union so transfers can use both domains.
     completed_producer_cores = op_spec.completed_producer_cores
-    if not is_relayout and resolve_core_stride(num_cores, _spyre_config.sencores) > 1:
+    active_core_ids: tuple[int, ...] = ()
+    if is_relayout:
+        _finalize_tensor_work_divisions(
+            args,
+            mapping_dims,
+            work_slices,
+            core_id_to_work_slice,
+            num_cores,
+            True,
+            completed_producer_cores,
+        )
+        operation_cores = math.prod(dim_splits.values())
+        core_id_to_work_slice, operation_span, destination_ids = apply_core_stride(
+            core_id_to_work_slice, operation_cores, _spyre_config.sencores
+        )
+        active = set(destination_ids)
+        num_cores = max(num_cores, operation_span)
+        for index, arg in enumerate(args):
+            division = arg.work_division
+            assert division is not None
+            logical_cores = division.num_cores or num_cores
+            owner_map, physical_span, tensor_ids = apply_core_stride(
+                division.core_id_to_work_slice, logical_cores, _spyre_config.sencores
+            )
+            num_cores = max(num_cores, physical_span)
+            if index == 0 and completed_producer_cores:
+                stride = resolve_core_stride(logical_cores, _spyre_config.sencores)
+                tensor_ids = tuple(core * stride for core in completed_producer_cores)
+                completed_producer_cores = tensor_ids
+            arg.active_core_ids = tensor_ids
+            active.update(tensor_ids)
+            arg.work_division = TensorWorkDivision(
+                division.work_slices, owner_map, num_cores=physical_span
+            )
+        active_core_ids = tuple(sorted(active))
+    elif resolve_core_stride(num_cores, _spyre_config.sencores) > 1:
         core_id_to_work_slice, num_cores, completed_producer_cores = apply_core_stride(
             core_id_to_work_slice, num_cores, _spyre_config.sencores
         )
-
-    for dim in mapping_dims:
-        if dim not in core_id_to_work_slice:
-            if int(dim_splits[dim]) != 1:
-                raise ValueError(f"final core mapping is missing split dimension {dim}")
-            core_id_to_work_slice[dim] = Integer(0)
-    _finalize_tensor_work_divisions(
-        args,
-        mapping_dims,
-        work_slices,
-        core_id_to_work_slice,
-        num_cores,
-        is_relayout,
-        completed_producer_cores,
-    )
+    if not is_relayout:
+        _finalize_tensor_work_divisions(
+            args,
+            mapping_dims,
+            work_slices,
+            core_id_to_work_slice,
+            num_cores,
+            False,
+            completed_producer_cores,
+        )
     # Collect index tensor indices for indirect access
     indirect_access_indices = [
         i for i, arg in enumerate(op_spec.args) if is_index_tensor(arg, op_spec)
@@ -2912,6 +2944,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             symbolic_dims=symbolic_dims,
             indirect_access_indices=indirect_access_indices,
             completed_producer_cores=completed_producer_cores,
+            active_core_ids=active_core_ids,
             debug_handle=op_spec.debug_handle,
             # At most one of these is non-empty for a given op (pool / depthwise
             # / forward-conv are mutually exclusive), so the keys never collide.
