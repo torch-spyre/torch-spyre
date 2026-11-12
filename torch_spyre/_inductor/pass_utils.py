@@ -2599,6 +2599,21 @@ def compute_restickify_target_layout(
         new_sd_host_stride,
         stick_size,
     )
+    old_total = math.prod(stl.device_size)
+    new_total = math.prod(device_size)
+    assert old_total == new_total, (
+        f"restickify changed total device size: {old_total} -> {new_total}\n"
+        f"  stl={stl}\n"
+        f"  host_size={host_size}\n"
+        f"  host_stride={host_stride}\n"
+        f"  host_coords={host_coords}\n"
+        f"  idc={idc}\n"
+        f"  target_stick_expr={target_stick_expr}\n"
+        f"  old_sd_outer_dim={old_sd_outer_dim}, new_sd_outer_dim={new_sd_outer_dim}\n"
+        f"  old_sd_host_size={old_sd_host_size}, old_sd_host_stride={old_sd_host_stride}\n"
+        f"  new_sd_host_size={new_sd_host_size}, new_sd_host_stride={new_sd_host_stride}\n"
+        f"  -> device_size={device_size}, stride_map={stride_map}"
+    )
     return SpyreTensorLayout(device_size, stride_map, stl.device_dtype)
 
 
