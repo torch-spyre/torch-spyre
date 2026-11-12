@@ -616,24 +616,35 @@ def test_capture_of_a_clean_program_exits_zero(tmp_path):
 def test_capture_of_a_program_that_calls_sys_exit(tmp_path, capsys):
     """``sys.exit(main())`` is how a program ends -- a pytest run among them --
     so its kernels are written; only a non-zero status reads as partial."""
-    body = "SpyreAsyncCompile().sdsc('sdsc_ok_0', [])\nimport sys\nsys.exit({})\n"
-    for status, expected in ((0, 0), (1, capture.EXIT_PARTIAL)):
-        program = _stub_sdsc_program(tmp_path, body.format(status))
-        out_dir = tmp_path / f"captured_{status}"
+    body = "SpyreAsyncCompile().sdsc('sdsc_ok_0', [])\nimport pytest, sys\n"
+    statuses = {
+        "0": 0,
+        "1": capture.EXIT_PARTIAL,
+        # What sys.exit(pytest.main([...])) passes for a passing run.
+        "pytest.ExitCode.OK": 0,
+        "'no device'": capture.EXIT_PARTIAL,
+    }
+    for i, (status, expected) in enumerate(statuses.items()):
+        program = _stub_sdsc_program(tmp_path, body + f"sys.exit({status})\n")
+        out_dir = tmp_path / f"captured_{i}"
         with patch.object(SpyreAsyncCompile, "sdsc", _fake_sdsc):
             assert capture.main([str(program), "--out", str(out_dir)]) == expected
         assert (out_dir / "sdsc_ok_0.py").exists()
-    assert "exited with status 1" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "exited with status 1" in out
+    assert "exited with 'no device'" in out
 
 
-def test_write_kernel_fits_a_name_that_fills_name_max(tmp_path):
-    """A fused kernel name can be 255 bytes by itself; the script, its
-    disambiguated twin and their .pt files must still be writable."""
-    name = "sdsc_fused_" + "x" * 244
-    rec, out = _record(name=name), str(tmp_path)
-    paths = [capture.write_kernel(rec, out, "prog.py", 2, False, True) for _ in "ab"]
-    assert len(set(paths)) == 2
-    for path in paths:
+def test_write_kernel_fits_names_that_fill_name_max(tmp_path):
+    """A fused kernel name can be 255 bytes by itself. Two that differ only past
+    the trim share a stem, so the second gets ``_1``; both scripts and their .pt
+    files must still be writable."""
+    names = ["sdsc_fused_" + "x" * 243 + tail for tail in "ab"]
+    out = str(tmp_path)
+    records = [_record(name=name) for name in names]
+    paths = [capture.write_kernel(r, out, "prog.py", 2, False, True) for r in records]
+    assert paths[1] == paths[0].removesuffix(".py") + "_1.py"
+    for name, path in zip(names, paths):
         assert len(os.path.basename(path).encode()) < 255
         assert os.path.exists(os.path.splitext(path)[0] + ".inputs.pt")
         assert f'KERNEL_NAME = "{name}"' in open(path).read()

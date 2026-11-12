@@ -574,8 +574,8 @@ def write_kernel(
     rec, out_dir, source, total, no_execute, save_inputs, explain_header=True
 ) -> str:
     """Write one kernel's script (and .pt) into out_dir; return the script path."""
-    # A fused kernel name can fill NAME_MAX by itself, leaving no room for the
-    # suffixes below; trimmed as the compiler trims its own directories.
+    # A fused kernel name can fill NAME_MAX by itself. The compiler's trim keeps
+    # 24 bytes free; the longest file name below, <stem>_NN.inputs.pt, needs 13.
     stem = _safe_kernel_name(rec.name)
     path = os.path.join(out_dir, f"{stem}.py")
     suffix = 1
@@ -602,7 +602,11 @@ def write_kernel(
 def _stopped(failure: BaseException) -> str:
     """How the target stopped, for the notes that report it."""
     if isinstance(failure, SystemExit):
-        return f"exited with status {failure.code}"
+        code = failure.code
+        # sys.exit("message") carries the message as its code (status 1).
+        if isinstance(code, int):
+            return f"exited with status {code}"
+        return f"exited with {code!r}"
     return f"raised {type(failure).__name__} (traceback above)"
 
 
