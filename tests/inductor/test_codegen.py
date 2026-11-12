@@ -586,6 +586,47 @@ class TestSdscJsonSymbolicDimSmoke(InductorTestCase):
             self.assertEqual(sym_info, {"mb": {"maxSize_": 512, "granularity_": 64}})
 
 
+class TestSplitDimOffsets(InductorTestCase):
+    def test_offset_on_an_inner_split_dim_is_kept(self):
+        """cat([cls, patches], dim=1) with patches laid out [w, sticks, h]: the
+        output row 7*h + w + 1 is split into [h, w + 1] over [7, 7], so the +1
+        sits on a dim with no gap, and still moves every write by one row."""
+        w, h, channel = sympy.symbols("c0 z0 c1")
+        iteration_space = {
+            w: (sympy.Integer(7), 1),
+            h: (sympy.Integer(7), 7),
+            channel: (sympy.Integer(768), 4),
+        }
+        sticks, lane = sympy.floor(channel / 64), sympy.Mod(channel, 64)
+        spec = OpSpec(
+            op="identity",
+            is_reduction=False,
+            iteration_space=iteration_space,
+            core_id_to_work_slice=derive_operation_mapping(iteration_space),
+            args=[
+                TensorArg(
+                    is_input=True,
+                    arg_index=0,
+                    device_dtype=DataFormats.SEN169_FP16,
+                    device_size=[7, 12, 7, 64],
+                    device_coordinates=[w, sticks, h, lane],
+                    allocation={"hbm": 0},
+                ),
+                TensorArg(
+                    is_input=False,
+                    arg_index=1,
+                    device_dtype=DataFormats.SEN169_FP16,
+                    device_size=[7, 7, 12, 64],
+                    device_coordinates=[h, w + 1, sticks, lane],
+                    allocation={"hbm": 1},
+                ),
+            ],
+            op_info={},
+        )
+        sdsc, mapping = parse_op_spec(spec)
+        self.assertEqual(sdsc.args[1].offsets[mapping[w]], 12 * 64)
+
+
 class TestOverlappingWindowCoreOffsets(InductorTestCase):
     def test_restickify_preserves_negative_window_gap(self):
         """Restickify must not replace an unfold gap with a padding gap."""
