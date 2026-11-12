@@ -1014,10 +1014,7 @@ class MemoryPlanSolver(ABC):
     @classmethod
     @abstractmethod
     def chooses_tilings(cls) -> bool:
-        """Chooses each op's coarse tiling jointly with its core division. With
-        ``linear_cost_only`` too, the allocator hands it no cost expression
-        while ``auto_coarse_tiling`` is on: the cost model cannot score tile
-        size or cut count."""
+        """Chooses each op's coarse tiling jointly with its core division."""
 
     @classmethod
     @abstractmethod
@@ -1026,19 +1023,12 @@ class MemoryPlanSolver(ABC):
         enumerates, rather than generating its own. The allocator enumerates
         tiled candidates only for such a solver."""
 
-    @classmethod
-    @abstractmethod
-    def linear_cost_only(cls) -> bool:
-        """Can only minimize a cost expression that lowers to linear terms, so
-        the objective must avoid the cost model's fractional powers."""
-
     _CAPABILITIES = (
         "supports_paired_buffers",
         "decides_lx_relayouts",
         "generates_divisions",
         "chooses_tilings",
         "tilings_from_menu",
-        "linear_cost_only",
     )
 
     def __init_subclass__(cls, **kwargs) -> None:
@@ -1063,7 +1053,6 @@ class MemoryPlanSolver(ABC):
             ("decides_lx_relayouts", "chooses_core_divisions"),
             ("generates_divisions", "chooses_core_divisions"),
             ("chooses_tilings", "chooses_core_divisions"),
-            ("linear_cost_only", "chooses_core_divisions"),
             ("tilings_from_menu", "chooses_tilings"),
         ):
             if getattr(cls, implied)() and not getattr(cls, prerequisite)():
