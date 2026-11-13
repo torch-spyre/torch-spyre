@@ -131,10 +131,23 @@ def install_missing_buf_debug() -> None:
                 if missing in reads:
                     w(f"  READ BY {n.get_name()} ({type(n.node).__name__}):")
                     w("    all reads:", sorted(reads))
+                    try:
+                        ir_reads = {d.name for d in n.node.get_read_writes().reads}
+                        w("    reads per the IR op itself:", sorted(ir_reads))
+                        w(
+                            "    extra reads added at scheduling:",
+                            sorted(reads - ir_reads),
+                        )
+                    except Exception as exc:
+                        w("    (could not read the IR op's own reads:", exc, ")")
                     w("    writes   :", sorted(d.name for d in n.read_writes.writes))
                     w("    origins  :", [str(o) for o in list(n.node.origins)[:5]])
                 if missing in {d.name for d in n.read_writes.writes}:
                     w(f"  WRITTEN BY {n.get_name()}")
+            for table_name in ("additional_buffer_deps", "additional_star_deps"):
+                for key, vals in getattr(V.graph, table_name, {}).items():
+                    if missing in vals:
+                        w(f"  V.graph.{table_name}[{key!r}] contains {missing}")
             w("  buffers the scheduler knows:", sorted(self.name_to_buf)[:40])
             raise
 
