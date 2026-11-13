@@ -548,9 +548,6 @@ What is refused, with an error naming `for_each_tile`:
   made dynamic, with no `dynamic=` declaration. Without the reservation each
   size is a new allocation and a new layout, so there is no one binary to build,
   and the loop is refused with the declaration named as the fix.
-- A declared minimum equal to the granularity: declare `min` as at least
-  `2 * granularity` for now (issue #6018). The one-tile call recompiles on a
-  PyTorch contiguity guard, which #6060 removes.
 
 What changed: before the compile half landed (PR #6066), a compiled graph over a
 reserved tensor was built for the size it was first compiled at and could return

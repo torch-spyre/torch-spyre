@@ -39,13 +39,14 @@ compiler adds later then reads as breaking that promise and raises
 the dim bare and the range is declared from inside the region. What a later
 bridge changes is who writes these three lines, not where they go.
 
-THE MINIMUM IS TWO TILES. ``for_each_tile`` views the operand as ``(count, G,
+THE MINIMUM IS ONE TILE. ``for_each_tile`` views the operand as ``(count, G,
 ...)``, so the tile count is a dimension of a traced tensor, and PyTorch's
 contiguity check asks ``count == 1`` before it looks at the stride. The answer
-becomes a guard, ``Ne(rows // G, 1)``, and a one-tile call then recompiles
-(#6018, upstream pytorch/pytorch#203781). Until #6060 installs the stride-first
-check, a declared range starts at ``2 * G`` and this file declares it that way.
-With ``min == G`` the headline test below counted two graphs in CI.
+would become a guard, ``Ne(rows // G, 1)``, and a one-tile call would recompile
+(#6018, upstream pytorch/pytorch#203781). ``enable_spyre_context`` installs a
+stride-first check (#6060), so the headline test below declares ``min == G``
+and calls at one tile. tests/inductor/test_contiguity_patch.py checks the
+patch against upstream's function.
 
 VERIFIED EMITTED BUNDLE, 6 Oct 2026, for the region below at 64 columns fp16::
 
@@ -96,11 +97,11 @@ from torch_spyre.execution.kernel_cache import get_cache_root_dir
 ROWS = 256
 COLS = 64
 TILE = 64
-MIN_ROWS = 2 * TILE  # two tiles, see the module docstring
+MIN_ROWS = TILE  # one tile, see the module docstring
 MAX_ROWS = 512
 SPEC = {"min": MIN_ROWS, "max": MAX_ROWS, "granularity": TILE}
-# The compile size first, then every kind of other size: the minimum (two
-# tiles), the maximum, above the compile size (where hint-sized geometry was
+# The compile size first, then every kind of other size: the minimum (one
+# tile), the maximum, above the compile size (where hint-sized geometry was
 # measured wrong), and below it.
 SIZES = [ROWS, MIN_ROWS, MAX_ROWS, 448, 192]
 
