@@ -916,27 +916,6 @@ def compute_max_size(expr: Union[Expr, int]) -> int:
     return V.graph.sizevars.optimization_hint(expr)
 
 
-def compute_symbolic_bounds(expr: Union[Expr, int]) -> "tuple[int, int] | None":
-    """Return (max_size, granularity) bounds for a symbolic expression from ShapeEnv.
-
-    Returns None for concrete expressions (no free symbols).
-    max_size is the computed maximum size,
-    granularity from compute_granularity.
-    """
-    if isinstance(expr, (int, sympy.Integer)):
-        return None
-    if not (hasattr(expr, "free_symbols") and expr.free_symbols):
-        return None
-    shape_env = V.graph.sizevars.shape_env
-    if shape_env is None:
-        return None
-
-    max_size = compute_max_size(expr)
-    granularity = compute_granularity(expr, max_size)
-
-    return (max_size, granularity)
-
-
 def get_mem_deps_from_rw(read_writes: ReadWrites) -> list[SchedNodeArg]:
     res: list[SchedNodeArg] = []
     for arg in read_writes.reads:
