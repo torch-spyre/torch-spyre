@@ -4050,11 +4050,19 @@ def spyre_fmod(
 
 
 @register_spyre_decompositions(
-    [torch.ops.aten.remainder.Tensor, torch.ops.aten.remainder.Scalar]
+    [
+        torch.ops.aten.remainder.Tensor,
+        torch.ops.aten.remainder.Scalar,
+        torch.ops.aten.remainder.Scalar_Tensor,
+    ]
 )
 def spyre_remainder(
     a: TensorLikeType | NumberType, b: TensorLikeType | NumberType
 ) -> torch.Tensor:
+    if not isinstance(a, torch.Tensor):
+        # Scalar_Tensor (``5 % x``): torch.div takes no scalar dividend, so
+        # broadcast it to the divisor's shape in the promoted dtype.
+        a = torch.full_like(b, a, dtype=torch.result_type(a, b))
     a = _promote_bool_dividend(a, b)
     return a - torch.div(a, b, rounding_mode="floor") * b
 

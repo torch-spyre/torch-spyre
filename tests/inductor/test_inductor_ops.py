@@ -10289,6 +10289,68 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        # remainder with a Python scalar dividend (aten.remainder.Scalar_Tensor,
+        # ``5 % y``). fmod has no such overload. The divisors mix signs, so the
+        # result takes the sign of y; integer-valued fp16 keeps it exact.
+        ("test_div_mod_scalar_dividend", "test_div_mod_scalar_dividend_cpu"): {
+            "ops_dict": {"remainder": torch.remainder},
+            "param_sets": {
+                **{
+                    f"fp16_{name}": (
+                        scalar,
+                        _random_sign((67, 256), 0xAF30)
+                        * torch.randint(
+                            2,
+                            11,
+                            (67, 256),
+                            generator=torch.Generator().manual_seed(0xAF31),
+                        ).to(torch.float16),
+                    )
+                    for name, scalar in [("37", 37.0), ("neg37", -37.0)]
+                },
+                "fp32_frac": (
+                    -12.75,
+                    # |y| >= 0.5 keeps the quotient far inside the 2**24 bound.
+                    _random_sign((67, 256), 0xAF32, dtype=torch.float32)
+                    * (
+                        cached_randn(
+                            (67, 256),
+                            dtype=torch.float32,
+                            abs=True,
+                            scale=10.0,
+                            differentiation=2,
+                        )
+                        + 0.5
+                    ),
+                ),
+                **{
+                    f"{_dtype_name(dtype)}_{name}": (
+                        scalar,
+                        _random_sign((67, 256), 0xAF33, dtype=dtype)
+                        * torch.randint(
+                            1,
+                            21,
+                            (67, 256),
+                            dtype=dtype,
+                            generator=torch.Generator().manual_seed(0xAF34),
+                        ),
+                    )
+                    for dtype in [torch.int32, torch.int64]
+                    for name, scalar in [("101", 101), ("neg101", -101)]
+                },
+                # An int scalar with a float divisor promotes to the float dtype.
+                "fp16_int_scalar": (
+                    37,
+                    _random_sign((67, 256), 0xAF35)
+                    * torch.randint(
+                        2,
+                        11,
+                        (67, 256),
+                        generator=torch.Generator().manual_seed(0xAF36),
+                    ).to(torch.float16),
+                ),
+            },
+        },
         # -----------------------------------------------------------------------
         # Mixed-dtype division (true, floor and trunc division, fmod and
         # remainder): tests type promotion across operand dtype combinations.
@@ -15550,6 +15612,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         if isinstance(y, torch.Tensor):
             y = _bound_divisor(y, numerator=x if isinstance(x, torch.Tensor) else None)
         self.compare_with_cpu(op, x, y, **_div_tol_kwargs(op, x, y))
+
+    @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
+    def test_div_mod_scalar_dividend_cpu(self, op, scalar, y):
+        """op(scalar, y) for a Python scalar dividend and a tensor divisor."""
+        y = _bound_divisor(y)
+        self.compare_with_cpu(
+            lambda t: op(scalar, t), y, **_div_tol_kwargs(op, scalar, y)
+        )
 
     @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
     def test_floor_divide_eager_cpu(self, x, y, fn):
