@@ -1,4 +1,4 @@
-# Copyright 2025 The Torch-Spyre Authors.
+# Copyright 2025-2026 The Torch-Spyre Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,17 +21,16 @@ test_cross_kernel_reserved_dims.py.
 
 import unittest
 from types import SimpleNamespace
-from unittest import mock
 
 import sympy
 import torch
 from torch._inductor.ir import FixedLayout, InputBuffer, StorageBox, TensorBox
-from torch._inductor.virtualized import V
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.utils._sympy.functions import FloorDiv
 from torch.utils._sympy.numbers import int_oo
 from torch.utils._sympy.value_ranges import ValueRanges
 
+from torch_spyre._inductor import pass_utils
 from torch_spyre._inductor import reserved_dims_contract as contract
 from torch_spyre._inductor.errors import Unsupported
 
@@ -67,20 +66,16 @@ def add_input(graph, name, size):
     buffer = InputBuffer(name=name, layout=layout)
     graph.graph_input_names.append(name)
     graph.graph_inputs[name] = TensorBox(StorageBox(buffer))
-    return torch.empty(0)
 
 
-def run_pass(graph, tensor, reserved_dims):
-    """Run the read pass with ``reserved_dims`` standing in for the tensor's own."""
-    with V.set_real_inputs([tensor]):
-        with mock.patch.object(
-            contract, "get_reserved_dims", lambda _tensor: reserved_dims
-        ):
-            contract.apply_reserved_dims_contract(graph)
+def run_pass(graph, declared_by_name):
+    """Run the read pass with ``declared_by_name`` standing in for _DECLARED_DIMS."""
+    with pass_utils.declared_dims(declared_by_name):
+        contract.apply_reserved_dims_contract(graph)
 
 
-def declared(dim_min, dim_max, granularity):
-    return {0: {"min": dim_min, "max": dim_max, "granularity": granularity}}
+def declared(dim_min, dim_max, granularity, *, symbol=s0):
+    return {str(symbol): (dim_min, dim_max, granularity)}
 
 
 class TestOutputGranularity(unittest.TestCase):
@@ -128,9 +123,9 @@ class TestOutputGranularity(unittest.TestCase):
 class TestApplyReservedDimsContract(unittest.TestCase):
     def test_declared_range_and_granularity_reach_the_compile(self):
         graph = make_graph(ranges={s0: (2, None)})
-        x = add_input(graph, "arg0", [s0, COLS])
+        add_input(graph, "arg0", [s0, COLS])
 
-        run_pass(graph, x, declared(128, 512, 64))
+        run_pass(graph, declared(128, 512, 64))
 
         bounds = graph.sizevars.shape_env.bound_sympy(s0)
         self.assertEqual((bounds.lower, bounds.upper), (128, 512))
@@ -139,9 +134,9 @@ class TestApplyReservedDimsContract(unittest.TestCase):
 
     def test_a_contract_only_tightens_an_existing_range(self):
         graph = make_graph(ranges={s0: (200, 1000)})
-        x = add_input(graph, "arg0", [s0, COLS])
+        add_input(graph, "arg0", [s0, COLS])
 
-        run_pass(graph, x, declared(128, 512, 64))
+        run_pass(graph, declared(128, 512, 64))
 
         bounds = graph.sizevars.shape_env.bound_sympy(s0)
         self.assertEqual((bounds.lower, bounds.upper), (200, 512))
@@ -149,9 +144,9 @@ class TestApplyReservedDimsContract(unittest.TestCase):
     def test_input_without_a_contract_is_left_alone(self):
         # Every ordinary compile takes this path.
         graph = make_graph(ranges={s0: (2, None)})
-        x = add_input(graph, "arg0", [s0, COLS])
+        add_input(graph, "arg0", [s0, COLS])
 
-        run_pass(graph, x, None)
+        run_pass(graph, None)
 
         self.assertEqual(contract.get_dim_contracts(graph), {})
         bounds = graph.sizevars.shape_env.bound_sympy(s0)
@@ -159,9 +154,9 @@ class TestApplyReservedDimsContract(unittest.TestCase):
 
     def test_static_dim_has_no_symbol_to_constrain(self):
         graph = make_graph()
-        x = add_input(graph, "arg0", [128, COLS])
+        add_input(graph, "arg0", [128, COLS])
 
-        run_pass(graph, x, declared(128, 512, 64))
+        run_pass(graph, declared(128, 512, 64))
 
         self.assertEqual(contract.get_dim_contracts(graph), {})
 
@@ -194,6 +189,17 @@ class TestOutputReservedDims(unittest.TestCase):
     def test_more_than_one_symbolic_dim_is_refused(self):
         with self.assertRaisesRegex(Unsupported, "more than one symbolic dim"):
             contract.output_reserved_dims(self.graph(), (s0, s1, COLS))
+
+    def test_a_derived_contract_over_the_bucket_cap_is_refused(self):
+        # s0 + 16 over 128..512 step 64 derives granularity 16 (every legal
+        # input size shifts by 16, a multiple of 16), so both ends of the
+        # derived triple divide evenly by construction: min=144 (144 % 16 ==
+        # 0), max=528 (528 % 16 == 0). What construction does not guarantee is
+        # the bucket count: 528 / 16 = 33, one over the default cap of 32.
+        # Nothing before this stamp step checks that, so without this
+        # refusal the next kernel over the output would build 33 buckets.
+        with self.assertRaisesRegex(Unsupported, "buckets"):
+            contract.output_reserved_dims(self.graph(), (s0 + 16, COLS))
 
 
 if __name__ == "__main__":
