@@ -1,0 +1,83 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://schemas.bench.invalid/v1alpha1/tool-output/invalidation.shape.json",
+ "title": "bench/v1alpha1 tool output: invalidation",
+ "type": "object",
+ "additionalProperties": false,
+ "properties": {
+  "id": {
+   "type": "string",
+   "description": "invalidation_id; a restored event names it in `restores`"
+  },
+  "scope_kind": {
+   "enum": [
+    "run",
+    "run_benchmark",
+    "node",
+    "device",
+    "placement",
+    "query"
+   ],
+   "description": "query is reserved: the writer rejects it until enabled"
+  },
+  "state": {
+   "enum": [
+    "invalid",
+    "suspect",
+    "restored"
+   ]
+  },
+  "run_id": {
+   "type": "string"
+  },
+  "benchmark_id": {
+   "type": "string"
+  },
+  "repeat": {
+   "type": "integer",
+   "minimum": 1
+  },
+  "node": {
+   "type": "string"
+  },
+  "device": {
+   "type": "string"
+  },
+  "placement_id": {
+   "type": "string"
+  },
+  "match": {
+   "type": "string"
+  },
+  "from": {
+   "type": "string",
+   "format": "date-time"
+  },
+  "to": {
+   "type": "string",
+   "format": "date-time"
+  },
+  "code": {
+   "enum": [
+    "faulty_hardware",
+    "measurement_bug",
+    "bad_config",
+    "under_investigation",
+    "other"
+   ]
+  },
+  "reason": {
+   "type": "string",
+   "minLength": 1
+  },
+  "restores": {
+   "type": "string"
+  }
+ },
+ "required": [
+  "scope_kind",
+  "state",
+  "reason"
+ ],
+ "description": "TOOL-WRITTEN row written by the invalidation writer"
+}

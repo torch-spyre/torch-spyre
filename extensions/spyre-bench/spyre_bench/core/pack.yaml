@@ -1,0 +1,88 @@
+# yaml-language-server: $schema=schemas/resources.schema.json
+# The core registers itself like any pack: store types, generic attributes, CPU/storage/network device classes.
+apiVersion: bench/v1alpha1
+kind: Pack
+metadata: {name: core, description: "domain-agnostic core"}
+spec:
+  prefix: core
+  version: 0.2.0
+  types:
+    - {name: artifactory, for: Store, schema: schemas/store-artifactory.json}
+    - {name: hf, for: Store, schema: schemas/store-hf.json}
+    - {name: filesystem, for: Store, schema: schemas/store-filesystem.json}
+    - {name: http, for: Store, schema: schemas/store-http.json}
+  vocabularies:
+    test_types: [perf, quality]
+    levels: [service]
+    purposes: [pr, nightly, weekly, release, reference, qualification, investigate]
+  device_classes:
+    - name: cpu/socket
+      kind: cpu
+      attributes:
+        - {name: cpu.arch, type: string, values: [x86_64, ppc64le, s390x, aarch64]}
+        - {name: cpu.base_ghz, type: float}
+        - {name: cpu.cores, type: int}
+    - name: storage/nvme
+      kind: storage
+      attributes: [{name: storage.min_iops, type: int}]
+    - name: net/link
+      kind: network
+      attributes: [{name: net.gbps, type: float}]
+  attributes:
+    - {key: case.type, class: identity, role: root, type: string, stored_in: benchmarks.props}
+    - {key: case.load.executor, class: identity, role: root, type: enum, values: [closed, open, batch, iterations, ramp], stored_in: benchmarks.props}
+    - {key: case.load.concurrency, class: identity, role: root, type: int, order: numeric, plot: true, stored_in: benchmarks.props}
+    - {key: case.load.requests, class: identity, role: root, type: int, order: numeric, stored_in: benchmarks.props}
+    - {key: case.load.rate, class: identity, role: root, type: float, order: numeric, plot: true, stored_in: benchmarks.props}
+    - {key: case.load.iterations, class: identity, role: root, type: int, order: numeric, stored_in: benchmarks.props}
+    - {key: system.type, class: identity, role: root, type: string, stored_in: benchmarks.props}
+    - {key: system.backend, class: run, role: root, type: string, plot: true, stored_in: benchmark_runs.props}
+    - {key: "input.<name>.asset", class: identity, role: root, type: string, stored_in: benchmarks.props}
+    - {key: "input.<name>.select", class: identity, role: root, type: string, stored_in: benchmarks.props}
+    - {key: "input.<name>.subset", class: run, role: root, type: string, stored_in: benchmarks.props}
+    - {key: subject.id, class: subject, role: root, type: uuid, stored_in: artifact_results}
+    - {key: "subject.dep.<name>", class: subject, role: derived, derived_from: subject.id, type: string}
+    - {key: subject.lineage, class: subject, role: root, type: string, stored_in: artifact_results}
+    - {key: env.id, class: environment, role: root, type: string, fingerprint: false, description: "hash of the fingerprint attributes"}
+    - {key: env.placement_id, class: environment, role: root, type: string, fingerprint: false}
+    - {key: env.node, class: environment, role: root, type: string, fingerprint: false}
+    - {key: env.uptime_s, class: environment, role: root, type: int, fingerprint: false}
+    - {key: "env.label.<name>", class: label, role: root, type: string, plot: true}
+    - {key: env.fp.kernel, class: environment, role: root, type: string, fingerprint: true}
+    - {key: env.fp.os.version, class: environment, role: root, type: string, fingerprint: true}
+    - {key: env.fp.governor, class: environment, role: root, type: string, fingerprint: true}
+    - {key: env.fp.cpu.model, class: environment, role: root, type: string, fingerprint: true}
+    - {key: env.fp.cpu.base_ghz, class: environment, role: root, type: float, unit: GHz, order: numeric, plot: true, fingerprint: true}
+    - {key: env.fp.device.firmware, class: environment, role: root, type: string, fingerprint: true}
+    - {key: env.fp.device.driver, class: environment, role: root, type: string, fingerprint: true}
+    - {key: run.repeat, class: run, role: root, type: int}
+    - {key: run.tier, class: run, role: root, type: string, order: declared, stored_in: benchmark_runs.props}
+    - {key: "run.suite.<name>", class: run, role: root, type: bool, stored_in: benchmark_runs.props}
+    - {key: run.validity, class: run, role: root, type: enum, values: [valid, shared_env, unqualified_env, suspect, invalid, external], stored_in: benchmark_runs.props}
+    - {key: run.validity_policy, class: run, role: root, type: string, stored_in: benchmark_runs.props, description: "spec_digest of the ValidityPolicy that judged the run"}
+    - {key: run.trust, class: run, role: root, type: enum, values: [internal, external], stored_in: benchmark_runs.props}
+    - {key: run.purpose, class: run, role: root, type: string, stored_in: benchmark_runs.props}
+    - {key: run.profile_level, class: run, role: root, type: enum, values: [off, light, full], stored_in: benchmark_runs.props}
+    - {key: run.cache, class: run, role: root, type: enum, values: [warm, cold, both]}
+    - {key: run.clean.exclusive, class: run, role: root, type: enum, values: [enforced, observed, none, unknown], stored_in: benchmark_runs.props, description: "enforced = exclusive access verified; observed = no exclusive access, load check clean; none = load check dirty; unknown = not determinable"}
+    - {key: run.clean.access, class: run, role: root, type: string, stored_in: benchmark_runs.props}
+    - {key: run.clean.wait_s, class: run, role: root, type: float, unit: s, order: numeric, stored_in: benchmark_runs.props}
+    - {key: run.clean.hold_s, class: run, role: root, type: float, unit: s, order: numeric, stored_in: benchmark_runs.props}
+    - {key: run.clean.other_load, class: run, role: root, type: string, stored_in: benchmark_runs.props, description: "start/end counts of other workloads, e.g. 0/0; unknown when not listed, never 0 by default"}
+    - {key: run.clean.devices_exclusive, class: run, role: root, type: enum, values: [enforced, none, unknown], stored_in: benchmark_runs.props, description: "enforced whenever a claim shows the card reserved to the one workload"}
+    - {key: run.clean.load_clean, class: run, role: root, type: bool, stored_in: benchmark_runs.props, description: "probe before/during/after load check came back clean"}
+    - {key: run.clean.throttled, class: run, role: root, type: bool}
+  metrics:
+    - {name: core.duration, unit: s, direction: lower_is_better, category: diagnostic, statistic: value, compare: relative,
+       description: "wall time of one case execution"}
+  probes:
+    - {name: host, protocol: process/v1, command: [spyre-bench, probe, host],
+       produces: [env.fp.kernel, env.fp.os.version, env.fp.governor, env.fp.cpu.model, env.fp.cpu.base_ghz, env.node]}
+  gates:
+    - {id: core.env_complete, phase: pre, reason: ENV_PARTIAL, check: "share of fingerprint attributes present >= 0.8"}
+    - {id: core.warmup, phase: in, reason: MEAS_WARMUP_INCOMPLETE}
+    - {id: core.incomplete, phase: in, reason: MEAS_INCOMPLETE}
+    - {id: core.repeats_min, phase: post, reason: MEAS_SAMPLES_SHORT}
+    - {id: core.repeat_cv, phase: post, reason: MEAS_REPEAT_CV, check: "robust CV <= 2 x class noise floor"}
+    - {id: core.env_changed, phase: ingest, reason: ENV_CHANGED}
+    - {id: core.node_quarantined, phase: ingest, reason: NODE_QUARANTINED}

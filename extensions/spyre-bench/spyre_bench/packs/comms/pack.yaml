@@ -1,0 +1,19 @@
+# yaml-language-server: $schema=../../core/schemas/resources.schema.json
+apiVersion: bench/v1alpha1
+kind: Pack
+metadata: {name: comms, description: "collective communication benchmarks"}
+spec:
+  prefix: comms
+  version: 0.2.0
+  requires: {core: "0.2"}
+  types:
+    - {name: collective-library, for: System, schema: schemas/system-collective-library.json}
+    - {name: collective, for: Workload, schema: schemas/workload-collective.json, levels: [collective], runner: comms-bench,
+       load: [iterations], default_metrics: [comms.latency, comms.bus_bandwidth]}
+  vocabularies:
+    levels: [collective]
+  runners:
+    - {name: comms-bench, protocol: process/v1, command: [python3, -m, spyre_bench.comms.runner]}
+  metrics:
+    - {name: comms.latency, unit: s, direction: lower_is_better, category: performance, statistic: mean, compare: relative, noise: {min_repeats: 3}}
+    - {name: comms.bus_bandwidth, unit: By/s, direction: higher_is_better, category: performance, statistic: mean, compare: relative, noise: {min_repeats: 3}}

@@ -1,0 +1,31 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+# The chat workload over an input/output length grid at fixed SLOs; reference nodes only (Suite grid).
+apiVersion: bench/v1alpha1
+kind: Benchmark
+metadata: {name: serve-grid-demo-llm-a, owner: example-team}
+spec:
+  type: perf
+  level: service
+  tier: core
+  system: demo-llm-a-tp4-fp16
+  workload: {base: chat-slo}
+  environment: ref-8card-one-node
+  metrics: {required: [llm.goodput_at_slo, llm.ttft.p99, llm.tpot.p99], headline: [llm.goodput_at_slo]}
+  run: {cache: warm, repeats: 5, timeout: 90m, est: 40m}
+  matrix:
+    name_template: serve_{system.token}_tp{system.tp}_chat_{isl}_{osl}
+    axes:
+      isl: {path: workload.input_len, values: [1024, 8192], token: "in{}"}
+      osl: {path: workload.output_len, values: [1024, 8192], token: "out{}"}
+    exclude:
+      - {isl: in8192, osl: out8192}
+---
+apiVersion: bench/v1alpha1
+kind: Expectation
+metadata: {name: chat-goodput-no-regression, owner: example-team}
+spec:
+  selector: {benchmarks: [serve-grid-demo-llm-a]}
+  metric: llm.goodput_at_slo
+  baseline: {kind: rolling, window: 20, min_n: 10, purposes: [nightly], match: {environment: id}}
+  tolerance: {pct: 10}
+  severity: advisory

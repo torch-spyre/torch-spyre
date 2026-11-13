@@ -1,0 +1,28 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://schemas.bench.invalid/v1alpha1/packs/llm-serving/workload-throughput.json",
+ "title": "llm/throughput: offline batch",
+ "type": "object",
+ "additionalProperties": false,
+ "properties": {
+  "input_len": {
+   "type": "integer",
+   "minimum": 1
+  },
+  "output_len": {
+   "type": "integer",
+   "minimum": 1
+  },
+  "prompts": {
+   "type": "integer",
+   "minimum": 1
+  },
+  "flags": {
+   "type": "object",
+   "description": "tool flags verbatim (native names); identity unless listed in non_identity"
+  }
+ },
+ "required": [
+  "prompts"
+ ]
+}

@@ -1,0 +1,20 @@
+# yaml-language-server: $schema=../../spyre_bench/core/schemas/resources.schema.json
+# A NodeClass is policy: expected host profile and how long a qualification keeps a node reference-grade.
+apiVersion: bench/v1alpha1
+kind: NodeClass
+metadata: {name: x86-ref-pool, description: "reserved reference pool"}
+spec:
+  arch: x86_64
+  match: {labels: {example.com/pool: reference}}
+  host_profile: {governor: performance, turbo: "on", smt: "on", cstate_policy: fixed, thp: madvise, cpu_quota_min_cores: 8}
+  qualification: {expiry_days: 14, probe: repeat-probe, cv_limit_pct: 2.0, checks: [host_profile, firmware, governor]}
+  extensions: {spyre: {device_function: pf}}
+---
+apiVersion: bench/v1alpha1
+kind: NodeClass
+metadata: {name: x86-shared-pool}
+spec:
+  arch: x86_64
+  match: {labels: {example.com/pool: shared}}
+  host_profile: {governor: performance, turbo: "on", smt: "on", cstate_policy: fixed, thp: madvise}
+  extensions: {spyre: {device_function: pf}}

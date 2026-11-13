@@ -1,0 +1,41 @@
+[project]
+name = "spyre-bench"
+version = "0.1.0"
+description = "Benchmark catalog engine: bench/v1alpha1 schemas, packs, identity, planning and validity"
+readme = "README.md"
+requires-python = ">=3.11"
+# Stdlib `re` is forbidden repo-wide (enforce-import-regex-instead-of-re), so `regex` is a hard dependency.
+# jsonschema is optional: without it the engine falls back to a stdlib validator for the schema subset.
+dependencies = [
+    "pyyaml",
+    "regex",
+]
+
+[project.scripts]
+spyre-bench = "spyre_bench.cli:main"
+
+[project.optional-dependencies]
+jsonschema = ["jsonschema>=4"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "jsonschema>=4",
+]
+
+# Core schemas and packs are data read from the package directory at run time.
+[tool.setuptools]
+packages = ["spyre_bench"]
+
+[tool.setuptools.package-data]
+spyre_bench = [
+    "core/pack.yaml",
+    "core/schemas/*.json",
+    "core/schemas/tool-output/*.json",
+    "packs/index.yaml",
+    "packs/*/pack.yaml",
+    "packs/*/schemas/*.json",
+]
+
+[tool.ruff]
+line-length = 120

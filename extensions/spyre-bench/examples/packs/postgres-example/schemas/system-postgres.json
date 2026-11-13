@@ -1,0 +1,33 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://schemas.bench.invalid/v1alpha1/packs/postgres-example/system-postgres.json",
+ "title": "pg/postgres server configuration",
+ "type": "object",
+ "additionalProperties": false,
+ "properties": {
+  "major": {
+   "type": "integer",
+   "minimum": 12
+  },
+  "settings": {
+   "type": "object",
+   "additionalProperties": {
+    "anyOf": [
+     {
+      "type": "string"
+     },
+     {
+      "type": "number"
+     },
+     {
+      "type": "boolean"
+     }
+    ]
+   },
+   "description": "postgresql.conf GUCs; identity"
+  }
+ },
+ "required": [
+  "major"
+ ]
+}
