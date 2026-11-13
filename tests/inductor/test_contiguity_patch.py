@@ -37,7 +37,9 @@ from torch_spyre._inductor.patches import _contiguous_stride_first
 # sha256 of inspect.getsource(torch._prims_common.check_contiguous_sizes_strides)
 # for the torch this copy was checked against. A torch bump that changes the
 # upstream function changes this, so the copy is reviewed before it ships.
-UPSTREAM_SOURCE_SHA256 = "eba4d232cddd0629030955b42e2b03dc3a7202c9fb71081a73cc7daaf9281b24"
+UPSTREAM_SOURCE_SHA256 = (
+    "eba4d232cddd0629030955b42e2b03dc3a7202c9fb71081a73cc7daaf9281b24"
+)
 
 TILE = 64
 
