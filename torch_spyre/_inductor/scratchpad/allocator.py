@@ -178,12 +178,6 @@ _COST_PARAMS = CostParams(
     # which optimizes compute only when there's a matmul
     overlap_gamma=0.46,
     use_bundled_cost_model=False,
-    # The LX-spill derate: zero exponents drop the tile height (``rpc**0 == 1``), so
-    # it is exactly 1. For a committed tiling its working set counts the output's
-    # rows by residency (cost_features' full-buffer rows), so it would charge
-    # LX residency as a spill.
-    lx_spill_exp=0.0,
-    mm_spill_ws_exp=0.0,
     # The loop-invariant re-read: ``read_bytes`` already charges a tiled matmul's
     # invariant operand once per iteration through its ``loop_factor``, and
     # ``_loop_reread_bytes`` charges the repeats again.
