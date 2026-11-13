@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import sympy
+from sympy.logic.boolalg import ITE
 from sympy.printing.printer import Printer
 
 if TYPE_CHECKING:
@@ -60,6 +61,28 @@ _CORE_INV_SCALE = 1024
 _CORE_INV_SCALE_MAX_VALUE = 32
 # constant limit on product terms to avoid int32 overflow in CP-SAT
 _MAX_PRODUCT_BOUND = 2**30
+# Relative miss at a candidate past which a fractional power's linearization
+# keeps it as a breakpoint (see ramer_douglas_peucker).
+_LINEARIZE_TOLERANCE = 0.01
+# Most breakpoints a linearized power may take; past it the lowering raises.
+_LINEARIZE_MAX_BREAKPOINTS = 64
+# Relative rounding error allowed when a curve's values, or a Min/Max's
+# coefficients, are put on an integer scale.
+_QUANTIZE_TOLERANCE = 0.01
+# Largest scale a Min/Max over quantized curves may take to meet
+# _QUANTIZE_TOLERANCE.
+_MAX_MINMAX_SCALE = 2**14
+# Relative rounding error allowed for the coefficients of a Min/Max over no
+# quantized curve, and the largest scale it may take to meet it: its operands
+# are linear, so a wide scale costs no product bound.
+_MINMAX_TOLERANCE = 1e-5
+_MAX_EXACT_MINMAX_SCALE = 2**40
+# Largest a Min/Max's scaled coefficient may grow, leaving CP-SAT's 64-bit
+# linear sums room for its variables' ranges.
+_MAX_MINMAX_COEFFICIENT = 2**40
+# Resolution such a Min/Max starts from: the power of two nearest the old fixed
+# 10000, which some objectives already fill near CP-SAT's 64-bit range.
+_MIN_FLOAT_MINMAX_SCALE = 2**13
 
 
 _operator_map = {
@@ -70,6 +93,62 @@ _operator_map = {
     "==": operator.eq,
     "!=": operator.ne,
 }
+
+
+def power_of_two_scale(values, tolerance: float, limit: int, base: int = 1):
+    """The smallest ``base * 2**k`` up to ``limit`` at which rounding
+    ``scale * v`` to an integer misses every nonzero ``v`` by at most
+    ``tolerance``, relative; None when no such scale is within ``limit``."""
+    scale = base
+    while scale <= limit:
+        if all(
+            abs(round(scale * v) - scale * v) <= tolerance * abs(scale * v)
+            for v in values
+            if v
+        ):
+            return scale
+        scale *= 2
+    return None
+
+
+class _CurveTable(sympy.Function):
+    """``table[i]`` where ``arg == values[i]``: a linearized power over one
+    buffer's menu, at each value its argument takes. Its entries are the
+    curve's floats until quantized, once, where it is printed: as integers on
+    a Min/Max's scale (``_truncate_floats_min``) or on its own
+    (``_print__CurveTable``). An integer table prints through
+    ``_division_table`` as one element lookup."""
+
+    nargs = 3
+    # A number, like any value; its Tuple arguments would otherwise leave
+    # sympy unable to tell, and a coefficient would not distribute over it.
+    is_commutative = True
+
+    @classmethod
+    def eval(cls, arg, values, table):
+        return None
+
+
+def ramer_douglas_peucker(xs, ys, tolerance: float) -> list[int]:
+    """Indices of the points ``(xs[i], ys[i])`` that Ramer-Douglas-Peucker keeps
+    as breakpoints: the two ends, then, segment by segment, the point the
+    segment misses by the most, while that miss exceeds ``tolerance`` relative
+    to the point's own value. ``xs`` is increasing. The line through the
+    returned points meets every point within ``tolerance``."""
+    keep = {0, len(xs) - 1}
+    stack = [(0, len(xs) - 1)]
+    while stack:
+        lo, hi = stack.pop()
+        slope = (ys[hi] - ys[lo]) / (xs[hi] - xs[lo]) if hi > lo else 0.0
+        worst, at = tolerance, None
+        for i in range(lo + 1, hi):
+            miss = abs(ys[lo] + slope * (xs[i] - xs[lo]) - ys[i])
+            if miss > worst * abs(ys[i]):
+                worst, at = miss / abs(ys[i]), i
+        if at is not None:
+            keep.add(at)
+            stack += [(lo, at), (at, hi)]
+    return sorted(keep)
 
 
 def _eq_fact(rel):
@@ -196,6 +275,9 @@ class _SympyExprToCpSat(Printer):
     ) -> None:
         self._model = model
         self._count = 0
+        # Each linearized power -> its (symbol, exponent), so a product of one
+        # buffer's powers can be merged into one curve (_merge_linearized).
+        self._linearized: dict = {}
         self._sym_map = sym_map
         self._buffer_map = buffer_map
         self._allow_tables = True
@@ -230,6 +312,18 @@ class _SympyExprToCpSat(Printer):
         return self._candidate_cache[expr]
 
     def _evaluate_candidates(self, expr):
+        if isinstance(expr, _CurveTable):
+            evaluated = self._candidate_values(expr.args[0])
+            if evaluated is None:
+                return None
+            owner, values = evaluated
+            lookup = {
+                int(x): int(v) if v.is_Integer else float(v)
+                for x, v in zip(expr.args[1], expr.args[2])
+            }
+            if owner is None:
+                return None, lookup[int(values)]
+            return owner, np.asarray([lookup[int(v)] for v in values], dtype=object)
         if expr in (sympy.true, sympy.false):
             return None, bool(expr)
         if expr.is_Number:
@@ -365,8 +459,9 @@ class _SympyExprToCpSat(Printer):
         )
         cost_expr = sympy.expand(cost_expr)
         cost_expr = cost_expr.replace(
-            lambda e: e.func in [sympy.log, sympy.Piecewise],
-            lambda e: self._piecewise_canonical(self._log_min(e)),
+            lambda e: e.func in [sympy.log, sympy.Piecewise]
+            or self._is_pushed_power(e),
+            lambda e: self._piecewise_canonical(self._log_min(self._push_power(e))),
         )
         cost_expr = sympy.expand(cost_expr)
         cost_expr = cost_expr.replace(
@@ -375,7 +470,7 @@ class _SympyExprToCpSat(Printer):
         )
         cost_expr = cost_expr.replace(
             lambda e: e.func == sympy.Mul,
-            lambda e: self._min_piecewise_expand(e),
+            lambda e: self._min_piecewise_expand(self._push_into_byte_minmax(e)),
         )
         cost_expr = self._integerize_minmax(cost_expr)
         return cost_expr
@@ -473,32 +568,16 @@ class _SympyExprToCpSat(Printer):
         elif expr.func == sympy.Pow:
             if not self._is_split_sym(arg):
                 return expr
-            # Core splits only: a tile count can exceed 32.
-            if (
-                expr.exp.is_Number
-                and math.isclose(expr.exp, 0.25)
-                and arg.name.startswith("split_")
-            ):
-                # Discrete piecewise linear approximation of x^(1/4) over the interval [1, 32],
-                # pinned to return 1 at x=1, generated using tools/approximate-power.py.
-                # since we check that the base is a _split_ symbol, it is an integer in the
-                # range [1, 32]
-                # Max 4.5% deviation for two segments;
-                # we would get:
-                #   max 1.6% deviation with 3 segments;
-                #   max 0.074% deviation with 8 segments;
-                #   max 0.019% deviation with 12 segments;
-                #   no deviation with 16 segments.
-                # script at https://github.com/user-attachments/files/31975789/approximate-power.py
-                return sympy.Piecewise(
-                    (0.139980295504224 * arg + 0.860019704495776, arg <= 5),
-                    (0.0287191888771944 * arg + 1.45940018593522, True),
-                )
+            if expr.exp.is_Number and not expr.exp.is_Integer:
+                return self._linearize_power(expr)
             if expr.exp == -1:
                 return sympy.Symbol(
                     f"inv_{arg.name}", integer=True, nonnegative=True
                 ) / self._inv_scale(arg.name)
         elif expr.func == sympy.Mul:
+            expr = self._merge_linearized(expr)
+            if not expr.is_Mul:
+                return expr
             symbols = [
                 arg
                 for arg in expr.args
@@ -521,6 +600,234 @@ class _SympyExprToCpSat(Printer):
                 return result
         return expr
 
+    def _candidates(self, sym):
+        """The sorted values a split or tile symbol takes over its buffer's
+        division menu; a split with no menu takes the core range."""
+        _, raw = self._buffer_map.get(sym.name, (None, ()))
+        if raw:
+            return sorted({int(v) for v in raw})
+        if sym.name.startswith("split_"):
+            return list(range(1, _CORE_INV_SCALE_MAX_VALUE + 1))
+        return None
+
+    def _linearize_power(self, expr):
+        """A fractional power of a split or tile symbol, through its candidate
+        values (see :meth:`_linearize`). Left as is when the candidates are
+        unknown or include a pole."""
+        arg, exponent = expr.base, float(expr.exp)
+        xs = self._candidates(arg)
+        if xs is None or (exponent < 0 and xs[0] <= 0):
+            return expr
+        owner = self._buffer_map.get(arg.name, (None, None))[0]
+        return self._linearize(arg, xs, exponent, owner is not None)
+
+    def _merge_linearized(self, expr):
+        """A product's linearized powers of one buffer's split and tile symbols
+        under one exponent, as one curve over the product of the symbols: the
+        product of their curves is not linear."""
+        groups: dict = {}
+        for factor in expr.args:
+            entry = self._linearized.get(factor)
+            if entry is None:
+                continue
+            sym, exponent = entry
+            owner = self._buffer_map.get(sym.name, (None, None))[0]
+            if owner is not None:
+                groups.setdefault((id(owner), exponent), []).append(factor)
+        merged = [group for group in groups.values() if len(group) > 1]
+        if not merged:
+            return expr
+        dropped = {factor for group in merged for factor in group}
+        factors = [factor for factor in expr.args if factor not in dropped]
+        for group in merged:
+            syms = [self._linearized[factor][0] for factor in group]
+            columns = zip(*(self._buffer_map[sym.name][1] for sym in syms))
+            xs = sorted({math.prod(int(v) for v in column) for column in columns})
+            exponent = self._linearized[group[0]][1]
+            factors.append(self._linearize(sympy.Mul(*syms), xs, exponent, True))
+        return sympy.Mul(*factors)
+
+    def _linearize(self, arg, xs, exponent, tabulate):
+        """``arg**exponent`` as the piecewise-linear function through the values
+        ``xs`` that ``arg`` can take, at the breakpoints ``ramer_douglas_peucker``
+        keeps: exact at every breakpoint, within _LINEARIZE_TOLERANCE elsewhere.
+        Raises past _LINEARIZE_MAX_BREAKPOINTS rather than lowering a coarser
+        function.
+
+        Over one buffer's menu (``tabulate``) the curve is its values at
+        ``xs``, a ``_CurveTable`` quantized where it is printed."""
+        ys = [x**exponent for x in xs]
+        if len(xs) == 1:
+            return sympy.Float(ys[0])
+        points = ramer_douglas_peucker(xs, ys, _LINEARIZE_TOLERANCE)
+        if len(points) > _LINEARIZE_MAX_BREAKPOINTS:
+            raise ValueError(
+                f"{len(points)} breakpoints for {arg}**{exponent} past the "
+                f"{_LINEARIZE_MAX_BREAKPOINTS} limit"
+            )
+        if tabulate:
+            curve = np.interp(xs, [xs[i] for i in points], [ys[i] for i in points])
+            table = _CurveTable(
+                arg, sympy.Tuple(*xs), sympy.Tuple(*map(sympy.Float, curve))
+            )
+            self._linearized[table] = (arg, exponent)
+            return table
+        pieces = []
+        for lo, hi in zip(points, points[1:]):
+            slope = (ys[hi] - ys[lo]) / (xs[hi] - xs[lo])
+            line = slope * arg + (ys[lo] - slope * xs[lo])
+            pieces.append((line, True if hi == points[-1] else arg <= xs[hi]))
+        result = sympy.Piecewise(*pieces)
+        self._linearized[result] = (arg, exponent)
+        return result
+
+    @classmethod
+    def _push_into_byte_minmax(cls, expr):
+        """``c * Min(R, W) * D`` as ``sign(c) * Min(|c| * R * D, |c| * W * D)``,
+        where ``Min(R, W)`` is the product's bytes factor and D its other Min/Max
+        factors (the derates): each operand is then a sum of terms times D,
+        rather than a product of variables whose bounds compound. The bytes
+        factor is the one Min/Max without a quantized curve, or, when none has
+        one (a committed split leaves a derate linear in residency), the one
+        with the largest coefficient. The factors are costs and derates, so D
+        is nonnegative."""
+        if not expr.is_Mul:
+            return expr
+        branching = [a for a in expr.args if isinstance(a, (sympy.Min, sympy.Max))]
+        if len(branching) < 2:
+            return expr
+        plain = [a for a in branching if not a.has(_CurveTable)]
+        if len(plain) == 1:
+            (target,) = plain
+        elif len(plain) == len(branching):
+            target = max(branching, key=cls._largest_coefficient)
+        else:
+            return expr
+        coefficient, _ = expr.as_coeff_Mul()
+        rest = sympy.Mul(*(a for a in expr.args if a is not target)) / coefficient
+        func = _LAZY.get(type(target), type(target))
+        return sympy.sign(coefficient) * func(
+            *(
+                sympy.Add(
+                    *map(
+                        cls._push_into_byte_minmax,
+                        sympy.Add.make_args(
+                            sympy.expand(abs(coefficient) * arg * rest)
+                        ),
+                    )
+                )
+                for arg in target.args
+            )
+        )
+
+    @staticmethod
+    def _largest_coefficient(minmax):
+        """The largest number multiplying a term of ``minmax``'s operands."""
+        return max(
+            abs(float(term.as_coeff_Mul()[0]))
+            for arg in minmax.args
+            for term in sympy.Add.make_args(arg)
+        )
+
+    @staticmethod
+    def _residency_literal(expr):
+        """The one residency literal (``is_lx_<buffer>``, 0 or 1) in ``expr``;
+        None for none or several."""
+        literals = [s for s in expr.free_symbols if s.name.startswith("is_lx_")]
+        return literals[0] if len(literals) == 1 else None
+
+    @classmethod
+    def _is_pushed_power(cls, expr):
+        """A power :meth:`_push_power` lowers: of a Min, Max or Piecewise, or of
+        a sum over one residency literal."""
+        if not (
+            expr.is_Pow
+            and expr.exp.is_Number
+            and not (expr.exp.is_Integer and expr.exp > 0)
+        ):
+            return False
+        if isinstance(expr.base, (sympy.Min, sympy.Max, sympy.Piecewise)):
+            return True
+        return expr.base.is_Add and cls._residency_literal(expr.base) is not None
+
+    @classmethod
+    def _push_power(cls, expr):
+        """A fractional or negative power of a Min, Max or Piecewise as the Min,
+        Max or Piecewise of its operands' powers: a power is monotone over the
+        positive values a cost takes, so a negative exponent swaps Min and Max."""
+        if not cls._is_pushed_power(expr):
+            return expr
+        base, exponent = expr.base, expr.exp
+
+        def power(arg):
+            if isinstance(arg, (sympy.Min, sympy.Max, sympy.Piecewise)):
+                return cls._push_power(sympy.Pow(arg, exponent, evaluate=False))
+            result = arg**exponent
+            if result.is_Mul:
+                return sympy.Mul(*(cls._push_power(f) for f in result.args))
+            return cls._push_power(result)
+
+        if base.is_Add:
+            # Exact at both values of the literal: f(lit)**p as
+            # f(0)**p + (f(1)**p - f(0)**p) * lit.
+            lit = cls._residency_literal(base)
+            off, on = (power(base.subs(lit, value)) for value in (0, 1))
+            return off + (on - off) * lit
+        if base.is_Piecewise:
+            return sympy.Piecewise(*((power(v), c) for v, c in base.args))
+        is_min = isinstance(base, sympy.Min)
+        func = _LazyMin if is_min == (exponent > 0) else _LazyMax
+        return func(*(power(arg) for arg in base.args))
+
+    @classmethod
+    def _canonical_condition(cls, cond):
+        """A branch condition with each ITE as And/Or, and each comparison of a
+        fractional power of a product of split or tile symbols against a number
+        as the product's comparison against the matching bound."""
+        if cond.has(ITE):
+            cond = cond.replace(lambda e: isinstance(e, ITE), lambda e: e.to_nnf())
+        inverted = {}
+        for rel in cond.atoms(sympy.core.relational.Relational):
+            bound = cls._inverted_power_bound(rel)
+            lit = cls._residency_literal(rel)
+            if bound is None and lit is not None and rel.has(sympy.Pow):
+                # One branch per value of the literal, each inverted on its own.
+                branches = []
+                for value in (0, 1):
+                    branch = rel.subs(lit, value)
+                    if branch.is_Relational:
+                        bounded = cls._inverted_power_bound(branch)
+                        branch = branch if bounded is None else bounded
+                    branches.append(sympy.And(sympy.Eq(lit, value), branch))
+                bound = sympy.Or(*branches)
+            if bound is not None:
+                inverted[rel] = bound
+        return cond.xreplace(inverted) if inverted else cond
+
+    @classmethod
+    def _inverted_power_bound(cls, rel):
+        """``c * prod(s)**p <op> k`` as ``prod(s) <op'> (k / c)**(1 / p)``; None
+        for any other comparison."""
+        lhs, rhs, op = rel.lhs, rel.rhs, type(rel)
+        if lhs.is_Number:
+            lhs, rhs, op = rhs, lhs, _inv_rel_op.get(op)
+        if op not in (sympy.Ge, sympy.Gt, sympy.Le, sympy.Lt) or not rhs.is_Number:
+            return None
+        coefficient, rest = lhs.as_coeff_Mul()
+        powers = [factor.as_base_exp() for factor in sympy.Mul.make_args(rest)]
+        exponents = {exponent for _, exponent in powers}
+        if coefficient <= 0 or rhs <= 0 or len(exponents) != 1:
+            return None
+        (exponent,) = exponents
+        if not exponent.is_Number or exponent.is_Integer:
+            return None
+        if not all(cls._is_split_sym(base) for base, _ in powers):
+            return None
+        bound = sympy.Float((rhs / coefficient) ** (1 / exponent))
+        op = op if exponent > 0 else _inv_rel_op[op]
+        product = sympy.Mul(*(base for base, _ in powers))
+        return cls._tighten_integer_bound(op, product, bound)
+
     @classmethod
     def _piecewise_canonical(cls, expr):
         # re-write 1/x < 1/5 as x > 5, then tighten to an equivalent integer
@@ -530,6 +837,7 @@ class _SympyExprToCpSat(Printer):
             return expr
         args = []
         for value, cond in expr.args:
+            cond = cls._canonical_condition(cond)
             if (
                 cond.is_Relational
                 and cond.lhs.is_Pow
@@ -551,7 +859,7 @@ class _SympyExprToCpSat(Printer):
 
     @staticmethod
     def _tighten_integer_bound(rel_op, lhs, rhs):
-        if not (lhs.is_Symbol and lhs.is_integer and rhs.is_Number):
+        if not (lhs.is_integer and rhs.is_Number):
             return rel_op(lhs, rhs)
         if rel_op is sympy.Lt:
             return sympy.Le(lhs, sympy.ceiling(rhs) - 1)
@@ -572,10 +880,15 @@ class _SympyExprToCpSat(Printer):
         # per call, with the rest folded back in as a plain multiplier.
         if len(expr.args) < 2 or not isinstance(expr.args[0], sympy.Number):
             return expr
-        if any(
-            isinstance(arg, (sympy.Min, sympy.Max, sympy.Piecewise))
+        branching = [
+            arg
             for arg in expr.args[1:]
-        ):
+            if isinstance(arg, (sympy.Min, sympy.Max, sympy.Piecewise))
+        ]
+        # A product of two such factors stays a product of two small variables;
+        # the number pushed into one of them would scale that product past
+        # _MAX_PRODUCT_BOUND.
+        if len(branching) == 1:
             idx, arg = next(
                 (
                     (idx, a)
@@ -611,7 +924,9 @@ class _SympyExprToCpSat(Printer):
         # Keep upstream's lazy Min/Max classes when rebuilding their subtrees.
         if isinstance(expr, (sympy.Min, sympy.Max)):
             return expr.replace(
-                lambda e: isinstance(e, (sympy.Min, sympy.Max, sympy.Piecewise)),
+                lambda e: isinstance(
+                    e, (sympy.Min, sympy.Max, sympy.Piecewise, _CurveTable)
+                ),
                 cls._truncate_floats_min,
             )
         if not expr.has(sympy.Min, sympy.Max):
@@ -620,12 +935,79 @@ class _SympyExprToCpSat(Printer):
 
     @staticmethod
     def _truncate_floats_min(expr):
-        # re-writes Min(x*0.5, y*0.5) as Min(x, y)/2
-        m = 10000
+        # re-writes Min(x*0.5, y*0.5) as Min(x, y)/2: with exact coefficients
+        # only, on the LCM of their denominators (an inverse's scale), so they
+        # stay exact at the narrowest width; over quantized curves, at the
+        # smallest multiple of it that keeps every term within
+        # _QUANTIZE_TOLERANCE, a number times a curve becoming one integer
+        # curve on that scale; otherwise at the smallest such multiple within
+        # _MINMAX_TOLERANCE.
         func = expr.func
+        m = 1
+        if isinstance(expr, _CurveTable):
+            # A curve inside an operand, on the Min/Max scale; a number times a
+            # curve is re-quantized on its Min/Max's own scale below.
+            arg, xs, table = expr.args
+            if all(v.is_Integer for v in table):
+                return expr
+            scale = power_of_two_scale(
+                [float(v) for v in table], _MINMAX_TOLERANCE, _MAX_EXACT_MINMAX_SCALE
+            )
+            values = (int(round(scale * float(v))) for v in table)
+            return _CurveTable(arg, xs, sympy.Tuple(*values)) / scale
+
+        def curve_term(term):
+            coefficient, rest = term.as_coeff_Mul()
+            if isinstance(rest, _CurveTable):
+                return coefficient, rest
+            return None
+
+        def expanded(value):
+            # A number times a sum: each term's own coefficient is rounded.
+            if value.is_Mul and any(a.is_Add for a in value.args):
+                return sympy.expand(value)
+            return value
+
+        terms = [
+            term
+            for arg in expr.args
+            for term in sympy.Add.make_args(
+                expanded(arg[0] if isinstance(arg, sympy.Tuple) else arg)
+            )
+        ]
+        exact, values = [], []
+        for term in terms:
+            curve = curve_term(term)
+            if curve is not None:
+                coefficient = float(curve[0])
+                values += [coefficient * float(v) for v in curve[1].args[2]]
+                continue
+            coefficient = term.as_coeff_Mul()[0]
+            if coefficient.is_Rational:
+                exact.append(coefficient)
+            else:
+                values.append(float(coefficient))
+        base = math.lcm(*(int(c.q) for c in exact)) if exact else 1
+        tolerance, limit = _MINMAX_TOLERANCE, _MAX_EXACT_MINMAX_SCALE
+        if expr.has(_CurveTable):
+            tolerance, limit = _QUANTIZE_TOLERANCE, _MAX_MINMAX_SCALE
+        elif values:
+            base *= _MIN_FLOAT_MINMAX_SCALE
+        largest = max((abs(float(c)) for c in [*exact, *values]), default=1.0)
+        limit = max(base, min(limit, int(_MAX_MINMAX_COEFFICIENT / max(largest, 1.0))))
+        # Past the limit, the terms round as finely as it allows.
+        m = power_of_two_scale(values, tolerance, limit, base) or (
+            base << max(0, (limit // base).bit_length() - 1)
+        )
 
         def _process_inner(expr):
-            if isinstance(expr, sympy.Mul) and isinstance(expr.args[0], sympy.Number):
+            curve = curve_term(expr) if expr.has(_CurveTable) else None
+            if curve is not None:
+                coefficient, table = curve
+                scale = m * float(coefficient)
+                values = (int(round(scale * float(v))) for v in table.args[2])
+                r = _CurveTable(table.args[0], table.args[1], sympy.Tuple(*values))
+            elif isinstance(expr, sympy.Mul) and isinstance(expr.args[0], sympy.Number):
                 a = (expr.args[0] * m).round()
                 r = sympy.Mul(a, *expr.args[1:])
             elif isinstance(expr, sympy.Number):
@@ -635,6 +1017,7 @@ class _SympyExprToCpSat(Printer):
             return r
 
         def _process_outer(expr):
+            expr = expanded(expr)
             if isinstance(expr, sympy.Add):
                 return sympy.Add(*[_process_inner(a) for a in expr.args])
             elif isinstance(expr, sympy.Tuple):
@@ -645,6 +1028,22 @@ class _SympyExprToCpSat(Printer):
         result = list(map(_process_outer, expr.args))
 
         return func(*result) / m
+
+    def _print__CurveTable(self, expr):
+        """A curve outside any Min/Max, quantized on its own: its values on the
+        smallest power-of-two scale that keeps each within _QUANTIZE_TOLERANCE,
+        an integer table ``_division_table`` prints."""
+        values = [float(v) for v in expr.args[2]]
+        if all(float(v).is_integer() for v in values):
+            raise ValueError(f"curve over {expr.args[0]} is not tabulable")
+        scale = power_of_two_scale(values, _QUANTIZE_TOLERANCE, _MAX_PRODUCT_BOUND)
+        if scale is None:
+            raise ValueError(
+                f"curve over {expr.args[0]} has no integer scale within "
+                f"{_QUANTIZE_TOLERANCE} under {_MAX_PRODUCT_BOUND}"
+            )
+        table = sympy.Tuple(*(int(round(scale * v)) for v in values))
+        return self._print(_CurveTable(expr.args[0], expr.args[1], table)) * (1 / scale)
 
     def _print_Integer(self, expr):
         return int(expr.p)
@@ -712,6 +1111,14 @@ class _SympyExprToCpSat(Printer):
     def _print_multiply(self, args):
         ints = [arg for arg in args if isinstance(arg, cp_model.IntVar)]
         nonints = [arg for arg in args if not isinstance(arg, cp_model.IntVar)]
+        exprs = [arg for arg in nonints if not isinstance(arg, (int, float))]
+        if len(exprs) > 1:
+            # Two linear factors (e.g. two tabulated derates): multiply them
+            # variable by variable rather than as Python expressions.
+            result = exprs[0]
+            for factor in exprs[1:] + ints:
+                result = self._print_multiply_two(result, factor)
+            return math.prod(a for a in nonints if isinstance(a, (int, float))) * result
         if len(ints) == 1:
             return self._print_multiply_two(math.prod(nonints), ints[0])
         elif len(ints) == 0:
