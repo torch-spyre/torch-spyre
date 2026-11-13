@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import sympy
+from sympy.logic.boolalg import ITE
 from sympy.printing.printer import Printer
 
 if TYPE_CHECKING:
@@ -223,6 +224,9 @@ class _SympyExprToCpSat(Printer):
     ) -> None:
         self._model = model
         self._count = 0
+        # Each linearized power -> its (symbol, exponent), so a product of one
+        # buffer's powers can be merged into one curve (_merge_linearized).
+        self._linearized: dict = {}
         self._sym_map = sym_map
         self._buffer_map = buffer_map
         self._allow_tables = True
@@ -392,8 +396,8 @@ class _SympyExprToCpSat(Printer):
         )
         cost_expr = sympy.expand(cost_expr)
         cost_expr = cost_expr.replace(
-            lambda e: e.func in [sympy.log, sympy.Piecewise],
-            lambda e: self._piecewise_canonical(self._log_min(e)),
+            lambda e: e.func in [sympy.log, sympy.Piecewise] or self._is_pushed_power(e),
+            lambda e: self._piecewise_canonical(self._log_min(self._push_power(e))),
         )
         cost_expr = sympy.expand(cost_expr)
         cost_expr = cost_expr.replace(
@@ -507,6 +511,9 @@ class _SympyExprToCpSat(Printer):
                     f"inv_{arg.name}", integer=True, nonnegative=True
                 ) / self._inv_scale(arg.name)
         elif expr.func == sympy.Mul:
+            expr = self._merge_linearized(expr)
+            if not expr.is_Mul:
+                return expr
             symbols = [
                 arg
                 for arg in expr.args
@@ -540,23 +547,57 @@ class _SympyExprToCpSat(Printer):
         return None
 
     def _linearize_power(self, expr):
-        """A fractional power of a split or tile symbol as the piecewise-linear
-        function through its candidate values at the breakpoints
-        ``ramer_douglas_peucker`` keeps. Exact at every breakpoint, within
-        _LINEARIZE_TOLERANCE elsewhere. Left as is when the candidates are
-        unknown or include a pole; raises past _LINEARIZE_MAX_BREAKPOINTS rather
-        than lowering a coarser function."""
+        """A fractional power of a split or tile symbol, through its candidate
+        values (see :meth:`_linearize`). Left as is when the candidates are
+        unknown or include a pole."""
         arg, exponent = expr.base, float(expr.exp)
         xs = self._candidates(arg)
         if xs is None or (exponent < 0 and xs[0] <= 0):
             return expr
+        result = self._linearize(arg, xs, exponent)
+        self._linearized[result] = (arg, exponent)
+        return result
+
+    def _merge_linearized(self, expr):
+        """A product's linearized powers of one buffer's split and tile symbols
+        under one exponent, as one curve over the product of the symbols: the
+        product of their curves is not linear."""
+        groups: dict = {}
+        for factor in expr.args:
+            entry = self._linearized.get(factor)
+            if entry is None:
+                continue
+            sym, exponent = entry
+            owner = self._buffer_map.get(sym.name, (None, None))[0]
+            if owner is not None:
+                groups.setdefault((id(owner), exponent), []).append(factor)
+        merged = [group for group in groups.values() if len(group) > 1]
+        if not merged:
+            return expr
+        dropped = {factor for group in merged for factor in group}
+        factors = [factor for factor in expr.args if factor not in dropped]
+        for group in merged:
+            syms = [self._linearized[factor][0] for factor in group]
+            columns = zip(*(self._buffer_map[sym.name][1] for sym in syms))
+            xs = sorted({math.prod(int(v) for v in column) for column in columns})
+            exponent = self._linearized[group[0]][1]
+            factors.append(self._linearize(sympy.Mul(*syms), xs, exponent))
+        return sympy.Mul(*factors)
+
+    @staticmethod
+    def _linearize(arg, xs, exponent):
+        """``arg**exponent`` as the piecewise-linear function through the values
+        ``xs`` that ``arg`` can take, at the breakpoints ``ramer_douglas_peucker``
+        keeps. Exact at every breakpoint, within _LINEARIZE_TOLERANCE elsewhere;
+        raises past _LINEARIZE_MAX_BREAKPOINTS rather than lowering a coarser
+        function."""
         ys = [x**exponent for x in xs]
         if len(xs) == 1:
             return sympy.Float(ys[0])
         points = ramer_douglas_peucker(xs, ys, _LINEARIZE_TOLERANCE)
         if len(points) > _LINEARIZE_MAX_BREAKPOINTS:
             raise ValueError(
-                f"{len(points)} breakpoints for {expr} past the "
+                f"{len(points)} breakpoints for {arg}**{exponent} past the "
                 f"{_LINEARIZE_MAX_BREAKPOINTS} limit"
             )
         pieces = []
@@ -565,6 +606,77 @@ class _SympyExprToCpSat(Printer):
             line = slope * arg + (ys[lo] - slope * xs[lo])
             pieces.append((line, True if hi == points[-1] else arg <= xs[hi]))
         return sympy.Piecewise(*pieces)
+
+    @staticmethod
+    def _is_pushed_power(expr):
+        """A power of a Min, Max or Piecewise that :meth:`_push_power` lowers."""
+        return (
+            expr.is_Pow
+            and isinstance(expr.base, (sympy.Min, sympy.Max, sympy.Piecewise))
+            and expr.exp.is_Number
+            and not (expr.exp.is_Integer and expr.exp > 0)
+        )
+
+    @classmethod
+    def _push_power(cls, expr):
+        """A fractional or negative power of a Min, Max or Piecewise as the Min,
+        Max or Piecewise of its operands' powers: a power is monotone over the
+        positive values a cost takes, so a negative exponent swaps Min and Max."""
+        if not cls._is_pushed_power(expr):
+            return expr
+        base, exponent = expr.base, expr.exp
+
+        def power(arg):
+            if isinstance(arg, (sympy.Min, sympy.Max, sympy.Piecewise)):
+                return cls._push_power(sympy.Pow(arg, exponent, evaluate=False))
+            result = arg**exponent
+            if result.is_Mul:
+                return sympy.Mul(*(cls._push_power(f) for f in result.args))
+            return cls._push_power(result)
+
+        if base.is_Piecewise:
+            return sympy.Piecewise(*((power(v), c) for v, c in base.args))
+        is_min = isinstance(base, sympy.Min)
+        func = _LazyMin if is_min == (exponent > 0) else _LazyMax
+        return func(*(power(arg) for arg in base.args))
+
+    @classmethod
+    def _canonical_condition(cls, cond):
+        """A branch condition with each ITE as And/Or, and each comparison of a
+        fractional power of a product of split or tile symbols against a number
+        as the product's comparison against the matching bound."""
+        if cond.has(ITE):
+            cond = cond.replace(lambda e: isinstance(e, ITE), lambda e: e.to_nnf())
+        inverted = {}
+        for rel in cond.atoms(sympy.core.relational.Relational):
+            bound = cls._inverted_power_bound(rel)
+            if bound is not None:
+                inverted[rel] = bound
+        return cond.xreplace(inverted) if inverted else cond
+
+    @classmethod
+    def _inverted_power_bound(cls, rel):
+        """``c * prod(s)**p <op> k`` as ``prod(s) <op'> (k / c)**(1 / p)``; None
+        for any other comparison."""
+        lhs, rhs, op = rel.lhs, rel.rhs, type(rel)
+        if lhs.is_Number:
+            lhs, rhs, op = rhs, lhs, _inv_rel_op.get(op)
+        if op not in (sympy.Ge, sympy.Gt, sympy.Le, sympy.Lt) or not rhs.is_Number:
+            return None
+        coefficient, rest = lhs.as_coeff_Mul()
+        powers = [factor.as_base_exp() for factor in sympy.Mul.make_args(rest)]
+        exponents = {exponent for _, exponent in powers}
+        if coefficient <= 0 or rhs <= 0 or len(exponents) != 1:
+            return None
+        (exponent,) = exponents
+        if not exponent.is_Number or exponent.is_Integer:
+            return None
+        if not all(cls._is_split_sym(base) for base, _ in powers):
+            return None
+        bound = sympy.Float((rhs / coefficient) ** (1 / exponent))
+        op = op if exponent > 0 else _inv_rel_op[op]
+        product = sympy.Mul(*(base for base, _ in powers))
+        return cls._tighten_integer_bound(op, product, bound)
 
     @classmethod
     def _piecewise_canonical(cls, expr):
@@ -575,6 +687,7 @@ class _SympyExprToCpSat(Printer):
             return expr
         args = []
         for value, cond in expr.args:
+            cond = cls._canonical_condition(cond)
             if (
                 cond.is_Relational
                 and cond.lhs.is_Pow
@@ -596,7 +709,7 @@ class _SympyExprToCpSat(Printer):
 
     @staticmethod
     def _tighten_integer_bound(rel_op, lhs, rhs):
-        if not (lhs.is_Symbol and lhs.is_integer and rhs.is_Number):
+        if not (lhs.is_integer and rhs.is_Number):
             return rel_op(lhs, rhs)
         if rel_op is sympy.Lt:
             return sympy.Le(lhs, sympy.ceiling(rhs) - 1)
@@ -617,10 +730,15 @@ class _SympyExprToCpSat(Printer):
         # per call, with the rest folded back in as a plain multiplier.
         if len(expr.args) < 2 or not isinstance(expr.args[0], sympy.Number):
             return expr
-        if any(
-            isinstance(arg, (sympy.Min, sympy.Max, sympy.Piecewise))
+        branching = [
+            arg
             for arg in expr.args[1:]
-        ):
+            if isinstance(arg, (sympy.Min, sympy.Max, sympy.Piecewise))
+        ]
+        # A product of two such factors stays a product of two small variables;
+        # the number pushed into one of them would scale that product past
+        # _MAX_PRODUCT_BOUND.
+        if len(branching) == 1:
             idx, arg = next(
                 (
                     (idx, a)

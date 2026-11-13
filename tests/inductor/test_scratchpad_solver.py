@@ -2190,6 +2190,82 @@ class TestSympyExprToCpSatPrinter(TestCase):
             _LINEARIZE_TOLERANCE * exact[best],
         )
 
+    def test_an_ite_condition_becomes_and_or(self):
+        tile, split = sympy.symbols("tile_x split_x", integer=True, positive=True)
+        cond = sympy.ITE(tile > 1, split < 4, False)
+        got = _SympyExprToCpSat._canonical_condition(cond)
+        self.assertFalse(got.has(sympy.ITE))
+        for t, s in itertools.product(range(1, 4), range(1, 6)):
+            self.assertEqual(bool(got.subs({tile: t, split: s})), t > 1 and s < 4)
+
+    def test_a_power_bound_becomes_a_bound_on_the_product(self):
+        # The underfill's raw >= e0 test: a decreasing power of the tile and
+        # split product, compared against a number, is a bound on the product.
+        split, tile = sympy.symbols("split_x tile_x", integer=True, positive=True)
+        rel = 17.5 / (split**0.5 * tile**0.5) >= 0.248
+        got = _SympyExprToCpSat._canonical_condition(rel)
+        self.assertFalse(
+            [n for n in sympy.preorder_traversal(got) if n.is_Pow], f"power in {got}"
+        )
+        for s, t in itertools.product((1, 7, 49, 71, 97), (1, 9, 64, 70, 71)):
+            want = 17.5 / (s * t) ** 0.5 >= 0.248
+            self.assertEqual(bool(got.subs({split: s, tile: t})), want, (s, t))
+
+    def test_a_reciprocal_of_a_min_is_the_max_of_reciprocals(self):
+        # 1 / eff, eff = min(1, underfill): the reciprocal reaches the powers.
+        split, tile = sympy.symbols("split_x tile_x", integer=True, positive=True)
+        underfill = sympy.Piecewise(
+            (sympy.Min(1.08, 17.28 / (split**0.5 * tile**0.5)), tile > 1), (1.0, True)
+        )
+        expr = sympy.Pow(sympy.Min(1.0, underfill), -1, evaluate=False)
+        got = _SympyExprToCpSat._push_power(expr)
+        for n in sympy.preorder_traversal(got):
+            if n.is_Pow and isinstance(n.base, (sympy.Min, sympy.Max, sympy.Piecewise)):
+                self.fail(f"power left over {n}")
+        for s, t in itertools.product((1, 4, 32), (1, 2, 64, 512)):
+            want = 1 / min(1.0, min(1.08, 17.28 / (s * t) ** 0.5) if t > 1 else 1.0)
+            value = got.subs({split: s, tile: t}).replace(
+                lambda e: isinstance(e, (sympy.Min, sympy.Max)),
+                lambda e: (sympy.Min if isinstance(e, sympy.Min) else sympy.Max)(*e.args),
+            )
+            self.assertAlmostEqual(float(value), want)
+
+    def test_one_buffers_powers_lower_as_one_curve_over_their_product(self):
+        # (a*b*t)**0.25 reaches the rewrite as a**0.25 * b**0.25 * t**0.25; one
+        # buffer's factors merge into one curve over the product, so the solve
+        # over that buffer's menu picks what a brute force over the exact
+        # power picks.
+        menu = {
+            "split_a": [1, 2, 4, 8, 2, 4],
+            "split_b": [1, 1, 2, 4, 8, 8],
+            "tile_a": [1, 2, 8, 2, 32, 32],
+        }
+        model = cp_model.CpModel()
+        division = model.new_int_var(0, 5, "division")
+        owner = types.SimpleNamespace(division=division)
+        sym_map, buffer_map = {}, {}
+        for name, raw in menu.items():
+            sym_map[name] = model.new_int_var(min(raw), max(raw), name)
+            model.add_element(division, raw, sym_map[name])
+            buffer_map[name] = (owner, raw)
+        a, b, t = (sympy.Symbol(n, integer=True, positive=True) for n in menu)
+        expr = sympy.Max(300 * (a * b * t) ** 0.25, 1600 - 50 * a * b * t)
+        printer = _SympyExprToCpSat(model, sym_map, buffer_map)
+        rewritten = printer._rewrite(expr)
+        self.assertFalse(
+            [n for n in sympy.preorder_traversal(rewritten) if n.is_Pow],
+            f"power left in {rewritten}",
+        )
+        model.minimize(printer._print(rewritten))
+        solver = cp_model.CpSolver()
+        self.assertEqual(solver.solve(model), cp_model.OPTIMAL)
+        products = [math.prod(c) for c in zip(*menu.values())]
+        exact = [max(300 * p**0.25, 1600 - 50 * p) for p in products]
+        self.assertEqual(exact[solver.value(division)], min(exact))
+        self.assertLessEqual(
+            abs(solver.objective_value - min(exact)), _LINEARIZE_TOLERANCE * min(exact)
+        )
+
     def test_negated_and_unnamed_boolean_products_preserve_every_assignment(self):
         model = cp_model.CpModel()
         a, b = [model.new_bool_var("") for _ in range(2)]
