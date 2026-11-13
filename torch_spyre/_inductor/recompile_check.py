@@ -33,6 +33,13 @@ torch or torch-spyre package, so they are recognised by file and ignored.
   shows a declaration lost through ``clone``/``view``/a graph break.
 - ``off``: report nothing.
 
+An unknown value falls back to ``warn`` with a logged warning.
+
+Declared inputs are found among the function's arguments and locals, including
+one level inside a list or tuple. A declared tensor inside a dict, an attribute
+or deeper nesting is not recognised here; ``all`` mode still reports the
+recompile, and the narrowing check still sees the declaration.
+
 The ledger records every user compile whatever the mode.
 """
 
@@ -44,6 +51,7 @@ import warnings
 import torch
 
 from torch_spyre._inductor.logging_utils import get_inductor_logger
+from torch_spyre.constants import DEVICE_NAME
 from torch_spyre.ops.warning_types import RecompileWarning
 
 logger = get_inductor_logger("recompile_check")
@@ -63,16 +71,32 @@ _SPYRE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + os.se
 # {"name (file:line)": {"compiles": int, "seconds": float}}
 _ledger: dict[str, dict[str, float]] = {}
 
+# Unknown mode values already warned about, so each is logged once.
+_warned_modes: set[str] = set()
+
 
 class RecompileError(RuntimeError):
     """A recompile broke a declared size range, in ``error`` mode."""
 
 
 def _mode():
+    """The mode from the environment; an unknown value falls back to warn.
+
+    A bad value must not fail a compile, so it is logged once instead.
+    """
     mode = os.environ.get(MODE_ENV, _DEFAULT_MODE).lower()
-    if mode not in _MODES:
-        raise ValueError(f"{MODE_ENV}={mode!r}: expected one of {', '.join(_MODES)}")
-    return mode
+    if mode in _MODES:
+        return mode
+    if mode not in _warned_modes:
+        _warned_modes.add(mode)
+        logger.warning(
+            "%s=%r is not one of %s; using %s",
+            MODE_ENV,
+            mode,
+            ", ".join(_MODES),
+            _DEFAULT_MODE,
+        )
+    return _DEFAULT_MODE
 
 
 def _is_internal(filename):
@@ -81,7 +105,13 @@ def _is_internal(filename):
 
 
 def _declaration_of(tensor):
-    """The tensor's ``{dim: {min, max, granularity}}`` declaration, or None."""
+    """The tensor's ``{dim: {min, max, granularity}}`` declaration, or None.
+
+    Only a Spyre tensor can carry a declaration, so any other tensor is None
+    without a call into the runtime.
+    """
+    if tensor.device.type != DEVICE_NAME:
+        return None
     from torch_spyre import _C
 
     return _C.get_reserved_dims(tensor)

@@ -27,6 +27,7 @@ import sympy
 import torch
 
 import torch_spyre  # noqa: F401  registers the "spyre" device
+from torch_spyre._inductor import narrowing_check
 from torch_spyre._inductor.narrowing_check import (
     MODE_ENV,
     DeclaredRangeNarrowedError,
@@ -74,6 +75,15 @@ class TestHelpers(unittest.TestCase):
 
     def test_unevaluable_guard_is_skipped_not_raised(self):
         self.assertIsNone(rejected_sizes(_UnevaluableGuard(self.s), self.sym_legal))
+
+    def test_unknown_mode_falls_back_to_warn(self):
+        # A bad value must not fail a compile: it is logged, and warn is used.
+        with (
+            mock.patch.dict(os.environ, {MODE_ENV: "not-a-mode"}),
+            self.assertLogs(narrowing_check.logger.name, level="WARNING") as log,
+        ):
+            self.assertEqual(narrowing_check._mode(), "warn")
+        self.assertIn("not-a-mode", log.output[0])
 
 
 def _make_region(min_rows, narrowing=None):

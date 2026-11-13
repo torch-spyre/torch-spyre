@@ -23,7 +23,8 @@ and reports the ones that reject any.
 
 ``TORCH_SPYRE_NARROWING_CHECK`` sets what a report does, the same for every
 guard: ``warn`` (default) warns and lets the compile through, ``error`` stops
-the compile, ``off`` skips the check.
+the compile, ``off`` skips the check. An unknown value falls back to ``warn``
+with a logged warning.
 """
 
 import os
@@ -31,11 +32,17 @@ import warnings
 
 from torch._guards import TracingContext
 
+from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre.ops.warning_types import DeclaredRangeNarrowedWarning
+
+logger = get_inductor_logger("narrowing_check")
 
 MODE_ENV = "TORCH_SPYRE_NARROWING_CHECK"
 _MODES = ("warn", "error", "off")
 _DEFAULT_MODE = "warn"
+
+# Unknown mode values already warned about, so each is logged once.
+_warned_modes: set[str] = set()
 
 
 class DeclaredRangeNarrowedError(RuntimeError):
@@ -43,10 +50,23 @@ class DeclaredRangeNarrowedError(RuntimeError):
 
 
 def _mode():
+    """The mode from the environment; an unknown value falls back to warn.
+
+    A bad value must not fail a compile, so it is logged once instead.
+    """
     mode = os.environ.get(MODE_ENV, _DEFAULT_MODE).lower()
-    if mode not in _MODES:
-        raise ValueError(f"{MODE_ENV}={mode!r}: expected one of {', '.join(_MODES)}")
-    return mode
+    if mode in _MODES:
+        return mode
+    if mode not in _warned_modes:
+        _warned_modes.add(mode)
+        logger.warning(
+            "%s=%r is not one of %s; using %s",
+            MODE_ENV,
+            mode,
+            ", ".join(_MODES),
+            _DEFAULT_MODE,
+        )
+    return _DEFAULT_MODE
 
 
 def declared_symbols(declared):

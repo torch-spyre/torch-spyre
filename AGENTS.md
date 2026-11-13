@@ -134,6 +134,8 @@ them with `PARAMS`, and `pr-review` checks them.
 | `TORCH_SPYRE_TIMING_OUT` | Where to write them (pid inserted: `rec.json` -> `rec.<pid>.json`) |
 | `SPYRE_BACKEND_COMPILE_TIMEOUT_SECONDS` | Seconds allowed for each `dbo-opt` invocation (default 60; non-positive disables) |
 | `TORCH_SPYRE_FRONTEND_ONLY=1` | Stop each compile before the backend compiler; no runnable kernel, measurement only |
+| `TORCH_SPYRE_NARROWING_CHECK` | Guards that split a `dynamic=` range: `warn` (default), `error`, `off` |
+| `TORCH_SPYRE_RECOMPILE_CHECK` | Recompiles that break a `dynamic=` range: `warn` (default), `error`, `all`, `off` |
 
 ## Spyre Hardware Basics
 
