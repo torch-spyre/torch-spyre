@@ -42,6 +42,7 @@ from torch_spyre._inductor.wsr.loop_tiling_lowering import (
 from utils_inductor import expects_raise
 from test_span_overflow_gate import (
     CASES,
+    MB,
     _forced_one_level,
     _permuted,
     _plain,
@@ -326,3 +327,65 @@ def test_the_new_lowering_stamps_a_shim_and_no_stored_lists(case):
     assert infos and all(isinstance(i, LoopShim) for i in infos), infos
     assert not any(isinstance(i, CoarseTileInfo) for i in infos)
     add_loop_terms.assert_not_called()
+
+
+def _carries(fn, args, limit):
+    from test_span_overflow_loop_terms import _compile_seeing_carries
+
+    with config.patch({"loop_tiling_lowering": "plan"}):
+        return _compile_seeing_carries(fn, args, limit)
+
+
+def test_the_k_tiled_accumulator_is_declared_as_a_carry_under_plan():
+    """The record of stage 7a.3: the accumulator's storage, the combine as its update,
+    no FX origin; the allocator takes the storage for a carry."""
+    fn, shapes, limit, *_ = CASES["matmul_k_tiled"]
+    args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
+    compiled, carries = _carries(fn, args, limit)
+    assert len(carries) == 1, carries
+    _, records = carries[0]
+    assert len(records) == 1, records
+    storage, update, is_storage, on_storage, on_update, origin = records[0]
+    assert update.startswith("coarse_tile_combine_"), update
+    assert is_storage and on_storage and on_update, records
+    assert origin is None, origin
+    assert compiled.added[-2:] == [
+        a for a in compiled.added if "_fill_" in a or "_combine_" in a
+    ], compiled.added
+
+
+@expects_raise
+def test_a_nested_accumulator_is_refused():
+    """A matmul too large for one level nests two (``[4, 4]``): refused for the loop
+    builder, with the issue that tracks it (#6088).
+
+    TODO: when nested loops are supported this becomes a positive test."""
+    args = [_shaped((4096, 4096), seed) for seed in range(2)]
+    with (
+        config.patch({"loop_tiling_lowering": "plan"}),
+        pytest.raises(Exception, match="#6088"),
+    ):
+        compile_span_overflow(lambda a, b: a @ b, args, 4 * MB)
+
+
+@expects_raise
+def test_an_inexpressible_group_raises_under_plan_and_does_not_run_legacy():
+    """A group the plan cannot lower raises; it does not fall back to the legacy
+    transform."""
+    fn, shapes, limit, *_ = CASES["matmul_k_tiled"]
+    args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
+
+    def fail(*a, **k):
+        raise AssertionError("the legacy transform ran under the plan setting")
+
+    with (
+        config.patch({"loop_tiling_lowering": "plan"}),
+        mock.patch.object(coarse_tile, "_apply_plan", fail),
+        mock.patch.object(coarse_tile, "_insert_all_reduction_ops", fail),
+        mock.patch(
+            "torch_spyre._inductor.wsr.loop_tiling_lowering._plan_carries",
+            side_effect=Unsupported("carry cannot be declared"),
+        ),
+        pytest.raises(Exception, match="carry cannot be declared"),
+    ):
+        compile_span_overflow(fn, args, limit)
