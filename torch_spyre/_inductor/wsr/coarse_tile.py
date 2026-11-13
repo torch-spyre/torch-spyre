@@ -3305,6 +3305,55 @@ def _insert_copy_op(
 # ---------------------------------------------------------------------------
 
 
+def _make_combine_buffer(
+    tiled_op: ComputedBuffer, accum_buf: ComputedBuffer
+) -> ComputedBuffer:
+    """The pointwise op that folds ``tiled_op``'s partial result into ``accum_buf``
+    in place (``MutationLayoutSHOULDREMOVE`` onto the accumulator), without loop
+    metadata: the caller stamps that and inserts it."""
+    from torch._inductor.virtualized import ops as vops
+
+    reduction_type = tiled_op.data.reduction_type
+    partial_loader = tiled_op.make_loader()
+    accum_loader = accum_buf.make_loader()
+
+    def combine_inner_fn(index):
+        partial = partial_loader(index)
+        accum = accum_loader(index)
+        if reduction_type in ("sum", BATCH_MATMUL_OP):
+            return vops.add(accum, partial)
+        if reduction_type == "xor_sum":
+            return vops.bitwise_xor(accum, partial)
+        if reduction_type == "prod":
+            return vops.mul(accum, partial)
+        if reduction_type == "max":
+            return vops.maximum(accum, partial)
+        if reduction_type == "min":
+            return vops.minimum(accum, partial)
+        if reduction_type == "any":
+            return vops.logical_or(accum, partial)
+        raise RuntimeError(
+            f"coarse_tile: _insert_combine_op: unsupported reduction_type "
+            f"{reduction_type!r}"
+        )
+
+    combine_data = Pointwise(
+        device=tiled_op.get_device(),
+        dtype=tiled_op.get_dtype(),
+        inner_fn=combine_inner_fn,
+        ranges=list(tiled_op.data.ranges),
+    )
+    combine_name = V.graph.qualify_name(f"coarse_tile_combine_{tiled_op.get_name()}")
+    combine_buf = ComputedBuffer(
+        name=combine_name,
+        layout=MutationLayoutSHOULDREMOVE(TensorBox(StorageBox(accum_buf))),
+        data=combine_data,
+    )
+    combine_buf.origins = tiled_op.origins
+    combine_buf.operation_name = combine_name
+    return combine_buf
+
+
 def _insert_combine_op(
     tiled_op: ComputedBuffer,
     accum_buf: ComputedBuffer,
@@ -3349,46 +3398,9 @@ def _insert_combine_op(
     that flag's removal regressed into silent wrong numerics instead
     (test_min_2d_512x256_reduce_dim0_A4_B4).
     """
-    from torch._inductor.virtualized import ops as vops
-
-    reduction_type = tiled_op.data.reduction_type
-    partial_loader = tiled_op.make_loader()
-    accum_loader = accum_buf.make_loader()
-
-    def combine_inner_fn(index):
-        partial = partial_loader(index)
-        accum = accum_loader(index)
-        if reduction_type in ("sum", BATCH_MATMUL_OP):
-            return vops.add(accum, partial)
-        if reduction_type == "xor_sum":
-            return vops.bitwise_xor(accum, partial)
-        if reduction_type == "prod":
-            return vops.mul(accum, partial)
-        if reduction_type == "max":
-            return vops.maximum(accum, partial)
-        if reduction_type == "min":
-            return vops.minimum(accum, partial)
-        if reduction_type == "any":
-            return vops.logical_or(accum, partial)
-        raise RuntimeError(
-            f"coarse_tile: _insert_combine_op: unsupported reduction_type "
-            f"{reduction_type!r}"
-        )
-
-    combine_data = Pointwise(
-        device=tiled_op.get_device(),
-        dtype=tiled_op.get_dtype(),
-        inner_fn=combine_inner_fn,
-        ranges=list(tiled_op.data.ranges),
-    )
-    combine_name = V.graph.qualify_name(f"coarse_tile_combine_{tiled_op.get_name()}")
-    combine_buf = ComputedBuffer(
-        name=combine_name,
-        layout=MutationLayoutSHOULDREMOVE(TensorBox(StorageBox(accum_buf))),
-        data=combine_data,
-    )
-    combine_buf.origins = tiled_op.origins
-    combine_buf.operation_name = combine_name
+    combine_buf = _make_combine_buffer(tiled_op, accum_buf)
+    combine_data = combine_buf.data
+    combine_name = combine_buf.get_name()
 
     # tiled_op's own partial output is per-tile-fixed scratch that never
     # advances across the inner tiled loop (all-empty per-level extents, same

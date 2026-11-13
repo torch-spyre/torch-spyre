@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from typing import Any, NamedTuple
 
 import sympy
+import torch
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ir import (
     ComputedBuffer,
@@ -45,16 +46,22 @@ from torch._inductor.ir import (
 )
 from torch._inductor.virtualized import V
 
+from torch_spyre._C import SpyreTensorLayout
+
 from .. import config
 from ..errors import Unsupported
+from ..ir import FixedTiledLayout, SpyreConstantFallback
 from ..loop_info import LoopShim
 from ..pass_utils import op_read_writes
 from .coarse_tile import (
     _allocate_full_buffer,
     _apply_work_div_symbol_remap,
     _check_matmul_broadcast_batch_tiling,
+    _divide_reduction_ranges,
+    _find_outside_consumers,
     _find_outside_consumers_planned,
     _group_reduction_tiled_levels_in_group,
+    _make_combine_buffer,
     _patch_consumers,
     _patch_graph_outputs,
     _plan_is_loop_invariant_at_reduction_levels,
@@ -62,6 +69,7 @@ from .coarse_tile import (
     _planned_tile_extents_per_level,
     _reads_buffer,
     _reads_incomplete_reduction,
+    _reduction_identity_value,
     _validate_contiguous,
     _validate_planned_reduction_tiling,
     reject_nested_loops,
@@ -75,7 +83,9 @@ from .loop_tiling_common import (
 )
 from .span_overflow_loop_terms import (
     _OpEdit,
+    _apply_carries,
     _apply_edit,
+    _plan_carries,
     _taken_symbols,
     access_step,
     mint_induction,
@@ -207,9 +217,14 @@ def _outer_key(op: Any) -> int | None:
     return group[0] if group else None
 
 
-def _extent(op: ComputedBuffer, position: int, trip: sympy.Integer) -> sympy.Integer:
-    """The tile's extent along ``position``, from the undivided range."""
-    size = op.data.ranges[position]
+def _extent(op: ComputedBuffer, tiled: TiledDim, trip: sympy.Integer) -> sympy.Integer:
+    """The tile's extent along the tiled dim, from the undivided range."""
+    position = tiled.position
+    size = (
+        op.data.reduction_ranges[position]
+        if tiled.in_reduction
+        else op.data.ranges[position]
+    )
     if not isinstance(size, sympy.Integer) or size % trip != 0:
         raise Unsupported(
             f"lower_loop_tiling: op {op.get_name()!r} loop var d{position} range "
@@ -222,7 +237,7 @@ def _extent(op: ComputedBuffer, position: int, trip: sympy.Integer) -> sympy.Int
 def _tile_step(
     graph: Any,
     op: ComputedBuffer,
-    position: int,
+    tiled: TiledDim,
     dep: MemoryDep,
     extent: sympy.Integer,
 ) -> sympy.Expr:
@@ -233,10 +248,13 @@ def _tile_step(
     broadcast read) does not advance."""
     from ..spyre_kernel import SpyreKernel
 
-    symbol = SpyreKernel._host_dim_to_index_symbol(op, position)
+    # A reduction dim is keyed after the op's output dims (see the kernel).
+    key = len(op.data.ranges) + tiled.position if tiled.in_reduction else tiled.position
+    symbol = SpyreKernel._host_dim_to_index_symbol(op, key)
     if symbol not in dep.index.free_symbols:
         return sympy.S.Zero
-    _require_plain_view(graph, op, position, symbol, dep)
+    if not tiled.in_reduction:
+        _require_plain_view(graph, op, tiled.position, symbol, dep)
     return access_step(dep.index, symbol, extent, sympy.S.Zero)
 
 
@@ -267,7 +285,7 @@ class _Facts:
 
     op: ComputedBuffer
     tiled: TiledDim | None
-    kind: str  # "copy_out" or "loop_internal"
+    kind: str  # "copy_out", "reduction" or "loop_internal"
     read_steps: dict[str, sympy.Expr]
     write_step: sympy.Expr | None
     full_ranges: list[sympy.Expr]
@@ -299,12 +317,11 @@ def _facts(
         name = member.get_operation_name()
         tiled = tiling[name]
         if not isinstance(member.data, (Pointwise, Reduction)) or (
-            tiled and tiled.in_reduction
+            tiled and tiled.in_reduction and not isinstance(member.data, Reduction)
         ):
             raise Unsupported(
-                f"lower_loop_tiling: {name} ({type(member.data).__name__}"
-                f"{', reduction dim' if tiled and tiled.in_reduction else ''}) is "
-                "not lowered by the plan yet."
+                f"lower_loop_tiling: {name} ({type(member.data).__name__}) is not "
+                "lowered by the plan."
             )
         if isinstance(member.layout, MutationLayoutSHOULDREMOVE):
             raise Unsupported(
@@ -312,23 +329,39 @@ def _facts(
                 "lower a mutation yet."
             )
         buf_name = member.get_name()
+        if tiled and tiled.in_reduction:
+            # The accumulator is complete only after the loop, so no member of the
+            # loop may read the partial result.
+            readers = [
+                o.get_operation_name()
+                for o in members
+                if o is not member and _reads_buffer(o, buf_name)
+            ]
+            if readers:
+                raise Unsupported(
+                    f"lower_loop_tiling: {readers} read the partial result of "
+                    f"{name} inside the loop that accumulates it."
+                )
         consumers, is_graph_output = (
             _find_outside_consumers_planned(
                 buf_name, (group.index,), operations, key_of
             )
-            if tiled
+            if tiled and not tiled.in_reduction
             else ([], False)
         )
-        kind = (
-            "copy_out" if tiled and (consumers or is_graph_output) else "loop_internal"
-        )
+        if tiled and tiled.in_reduction:
+            kind = "reduction"
+        elif tiled and (consumers or is_graph_output):
+            kind = "copy_out"
+        else:
+            kind = "loop_internal"
         read_steps: dict[str, sympy.Expr] = {}
         write_step = None
         full_ranges = list(member.data.ranges)
         for d, loop_var_range in _loop_var_hinted_ranges(member).items():
             full_ranges[d] = full_ranges[d] * loop_var_range
         if tiled:
-            extent = _extent(member, tiled.position, trip)
+            extent = _extent(member, tiled, trip)
             rw = op_read_writes(member)
             for dep in (d for d in rw.reads if isinstance(d, MemoryDep)):
                 # A read of a tiled member's own scratch does not advance: the
@@ -336,7 +369,7 @@ def _facts(
                 step = (
                     sympy.S.Zero
                     if dep.name in scratch_names
-                    else _tile_step(graph, member, tiled.position, dep, extent)
+                    else _tile_step(graph, member, tiled, dep, extent)
                 )
                 if read_steps.setdefault(dep.name, step) != step:
                     raise Unsupported(
@@ -347,9 +380,7 @@ def _facts(
             if kind == "copy_out":
                 if not writes:
                     raise Unsupported(f"lower_loop_tiling: {name} has no write.")
-                write_step = _tile_step(
-                    graph, member, tiled.position, writes[0], extent
-                )
+                write_step = _tile_step(graph, member, tiled, writes[0], extent)
                 if write_step == 0:
                     raise Unsupported(
                         f"lower_loop_tiling: the tiled dim of {name} is not in "
@@ -376,7 +407,7 @@ def _insert_copy_out(
     full_buf: ComputedBuffer,
     operations: list[Operation],
     group: LoopTilingGroup,
-    position: int,
+    tiled: TiledDim,
 ) -> ComputedBuffer:
     """The op that drains ``tiled_op``'s tile into ``full_buf``, inside the loop.
 
@@ -397,19 +428,129 @@ def _insert_copy_out(
     )
     copy_buf.origins = tiled_op.origins
     copy_buf.operation_name = copy_name
-    copy_buf.loop_info = _shim(group, position)  # type: ignore[attr-defined]
+    copy_buf.loop_info = _shim(group, tiled)  # type: ignore[attr-defined]
     V.graph.name_to_buffer[copy_name] = copy_buf
     operations.insert(operations.index(tiled_op) + 1, copy_buf)
     return copy_buf
 
 
-def _shim(group: LoopTilingGroup, position: int | None) -> LoopShim:
+def _shim(group: LoopTilingGroup, tiled: TiledDim | None) -> LoopShim:
     return LoopShim(
         loop_group_id=(group.index,),
         loop_count=[sympy.Integer(group.trip_count)],
-        loop_tiled_dims=[[] if position is None else [position]],
-        loop_tiled_reduction_dims=[[]],
+        loop_tiled_dims=[[tiled.position] if tiled and not tiled.in_reduction else []],
+        loop_tiled_reduction_dims=[
+            [tiled.position] if tiled and tiled.in_reduction else []
+        ],
     )
+
+
+def _insert_fill(
+    op: ComputedBuffer,
+    accum: ComputedBuffer,
+    operations: list[Operation],
+    identity: float,
+    ranges: list[sympy.Expr],
+) -> None:
+    """The op that writes the reduction's identity into ``accum`` once, before the
+    loop: it has no ``loop_info``, so it runs outside every loop.
+
+    The identity is a ``SpyreConstantFallback`` scalar, which the kernel expresses as
+    an IDENTITY_OP broadcast; its layout is built by hand because layout finalizing
+    has already run."""
+    dtype = op.get_dtype()
+    device = op.get_device()
+    assert device is not None
+    scalar_op = SpyreConstantFallback(
+        torch.ops.spyre.constant.default, float(identity), dtype, device
+    )
+    # A 0-d broadcast scalar in the device coordinate system.
+    scalar_op.layout = FixedTiledLayout(
+        device, dtype, [], [], SpyreTensorLayout([], dtype)
+    )
+    scalar_loader = TensorBox.create(scalar_op).make_loader()
+    fill_name = V.graph.qualify_name(f"coarse_tile_fill_{op.get_name()}")
+    fill_buf = ComputedBuffer(
+        name=fill_name,
+        layout=MutationLayoutSHOULDREMOVE(TensorBox(StorageBox(accum))),
+        data=Pointwise(
+            device=device,
+            dtype=dtype,
+            inner_fn=lambda index, _loader=scalar_loader: _loader([]),
+            ranges=ranges,
+        ),
+    )
+    fill_buf.origins = op.origins
+    fill_buf.operation_name = fill_name
+    # Its write is read only by the next trip's combine: a dependency across
+    # iterations that the pre-unroll IR does not show, so dead-code elimination
+    # would drop it.
+    fill_buf._coarse_tile_force_live = True  # type: ignore[attr-defined]
+    V.graph.name_to_buffer[fill_name] = fill_buf
+    at = operations.index(accum)
+    # The scalar was appended to the operations when it was created: move it to
+    # just after the accumulator, then the fill after it.
+    operations.remove(scalar_op)
+    operations.insert(at + 1, scalar_op)
+    operations.insert(at + 2, fill_buf)
+
+
+def _lower_reduction(
+    fact: _Facts, operations: list[Operation], group: LoopTilingGroup
+) -> str:
+    """A reduction tiled on its reduction dim: an accumulator the size of the output,
+    filled with the identity once before the loop, and a combine op in the loop that
+    folds each trip's partial result into it. Everything outside the loop that read
+    the result reads the accumulator. Returns the combine's name."""
+    op = fact.op
+    buf_name = op.get_name()
+    assert fact.tiled is not None
+    start = next(
+        i
+        for i, o in enumerate(operations)
+        if isinstance(o, ComputedBuffer) and _outer_key(o) == group.index
+    )
+    accum = _allocate_full_buffer(
+        op,
+        fact.full_ranges,
+        fact.full_strides,
+        operations,
+        start,
+        device_layout=fact.full_device_layout,
+    )
+    _insert_fill(
+        op,
+        accum,
+        operations,
+        _reduction_identity_value(op.data.reduction_type, op.get_dtype()),
+        fact.full_ranges,
+    )
+    combine = _make_combine_buffer(op, accum)
+    combine.loop_info = _shim(group, fact.tiled)  # type: ignore[attr-defined]
+    V.graph.name_to_buffer[combine.get_name()] = combine
+    operations.insert(operations.index(op) + 1, combine)
+
+    # finalize_layouts gives the accumulator the reduction's device layout.
+    op._tiled_reduction_accum_name = accum.get_name()  # type: ignore[attr-defined]
+
+    outside, is_graph_output = _find_outside_consumers(
+        buf_name, (group.index,), operations
+    )
+    _patch_consumers(
+        outside,
+        buf_name,
+        accum.get_name(),
+        operations,
+        _RetiledBufferInfo(
+            tuple(op.layout.stride),
+            tuple(accum.layout.stride),
+            tuple(op.layout.size),
+            tuple(accum.layout.size),
+        ),
+    )
+    if is_graph_output:
+        _patch_graph_outputs(buf_name, accum)
+    return combine.get_operation_name()
 
 
 def _resolve(operations: list[Operation], names: list[str]) -> list[ComputedBuffer]:
@@ -442,14 +583,24 @@ def _lower_group(graph: Any, group: LoopTilingGroup, induction: sympy.Symbol) ->
     # Divide the tiled ops and stamp the shim on every member.
     retiled: dict[str, _RetiledBufferInfo] = {}
     for fact in facts:
-        if fact.tiled is not None:
+        if fact.tiled is not None and fact.tiled.in_reduction:
+            _apply_work_div_symbol_remap(
+                fact.op, _divide_reduction_ranges(fact.op, trip, [fact.tiled.position])
+            )
+        elif fact.tiled is not None:
             result = _divide_ranges(fact.op, trip, [fact.tiled.position])
             _apply_work_div_symbol_remap(fact.op, result.symbol_remap)
             if result.retiled_info is not None:
                 retiled[fact.op.get_name()] = result.retiled_info
-        fact.op.loop_info = _shim(  # type: ignore[attr-defined]
-            group, None if fact.tiled is None else fact.tiled.position
-        )
+        fact.op.loop_info = _shim(group, fact.tiled)  # type: ignore[attr-defined]
+
+    # Accumulate every reduction tiled on its reduction dim.
+    combines: dict[str, str] = {}
+    for fact in facts:
+        if fact.kind == "reduction":
+            combines[fact.op.get_operation_name()] = _lower_reduction(
+                fact, operations, group
+            )
 
     # Drain every tile that something outside the loop reads into a full buffer.
     copies: dict[str, tuple[str, sympy.Expr]] = {}
@@ -480,9 +631,7 @@ def _lower_group(graph: Any, group: LoopTilingGroup, induction: sympy.Symbol) ->
             device_layout=fact.full_device_layout,
         )
         bound_layout = op.layout
-        copy_buf = _insert_copy_out(
-            op, full_buf, operations, group, fact.tiled.position
-        )
+        copy_buf = _insert_copy_out(op, full_buf, operations, group, fact.tiled)
         assert fact.write_step is not None
         copies[copy_buf.get_operation_name()] = (buf_name, fact.write_step)
         _patch_consumers(
@@ -511,6 +660,17 @@ def _lower_group(graph: Any, group: LoopTilingGroup, induction: sympy.Symbol) ->
         _apply_edit(
             _OpEdit(copy, trip, {}, copies[copy.get_operation_name()][1]), induction
         )
+    for combine in _resolve(operations, list(combines.values())):
+        _apply_edit(_OpEdit(combine, trip, {}, None), induction)
+    if combines:
+        # Each accumulator is a loop carry: its storage is the buffer the combine
+        # mutates, its update the combine.
+        loop = [
+            op
+            for op in operations
+            if isinstance(op, ComputedBuffer) and _outer_key(op) == group.index
+        ]
+        _apply_carries(_plan_carries(graph, loop, {*combines, *combines.values()}))
 
 
 def lower_loop_tiling(graph: Any, plan: LoopTilingPlan) -> dict[int, sympy.Symbol]:

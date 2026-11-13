@@ -29,7 +29,7 @@ runs (issue #2797).
 import contextlib
 import dataclasses
 import logging
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from typing import Any
 
 import regex
@@ -381,7 +381,11 @@ class _CarryEdit:
     record: LoopCarryRecord
 
 
-def _plan_carries(graph: Any, members: list[ComputedBuffer]) -> list[_CarryEdit]:
+def _plan_carries(
+    graph: Any,
+    members: list[ComputedBuffer],
+    reduction_names: Collection[str] | None = None,
+) -> list[_CarryEdit]:
     """The loop carries of a group of ``reduction`` kind, or ``[]`` for any other.
 
     The legacy lowering of a reduction tiled on its reduction dim is a partial op
@@ -396,7 +400,15 @@ def _plan_carries(graph: Any, members: list[ComputedBuffer]) -> list[_CarryEdit]
     touches the storage inside the loop: the record promises that the update is the
     storage's only in-loop access.
     """
-    reductions = [op for op in members if _kind(op) == "reduction"]
+    reductions = [
+        op
+        for op in members
+        if (
+            _kind(op) == "reduction"
+            if reduction_names is None
+            else op.get_operation_name() in reduction_names
+        )
+    ]
     if not reductions:
         return []
     partials = [op for op in reductions if isinstance(op.data, Reduction)]
