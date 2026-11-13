@@ -66,22 +66,32 @@ from torch_spyre._inductor.codegen.compute_ops import num_bytes
 from torch_spyre._inductor.codegen.opspec_utils import (
     PARALLEL,
     REDUCTION,
-    align_reshape_plan,
     buf_id,
     core_divisions,
+    operand_alignment,
     operand_indexing,
     per_core_extent,
     placeholder_axes,
     reduction_indexing,
+    relayout_strides,
     row_major_strides,
 )
 from torch_spyre._inductor.constants import (
     ABSMAX_OP,
+    IDENTITY_OP,
     MAX_POOL_SIZE_BYTES,
+    RESTICKIFY_OP,
+    RESTICKIFY_SUPPORTED_DEVICE_DTYPES,
     STAGGERED_EAS,
 )
 from torch_spyre._inductor.logging_utils import get_inductor_logger
-from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
+from torch_spyre._inductor.op_spec import (
+    LoopSpec,
+    OpSpec,
+    TensorArg,
+    UnimplementedOp,
+    is_lx_relayout_identity,
+)
 from torch_spyre._inductor.pass_utils import coeff_through_floor
 
 # The module's one logger, and the reason it has one is ``PlanFusion``: a table
@@ -1079,13 +1089,12 @@ def _parallel_surface(
 ) -> tuple[Surface, Indexing | None]:
     """Which shape carries a non-reducing payload whose operands are ALIGNED.
 
-    Nothing is *derived* here and nothing needs to be: ``align_reshape_plan`` has
-    already answered that every operand's coordinates and extents equal the
-    output's, which is precisely the identity condition, so the maps are known
-    rather than read off the coordinates.  Deriving them instead would make the
-    emitted form of ``add`` hostage to the dim-reuse rule ``reduction_indexing``
-    needs -- a coordinate list that repeated a classification would yield a
-    non-identity map and silently turn a ``linalg.add`` into a ``linalg.generic``.
+    The caller has established that corresponding positions in the constructed
+    views represent corresponding elements. Ordinary accesses already share
+    the output's coordinates; relayout accesses put the permutation in their
+    strides. Both therefore use identity indexing, even when the original
+    OpSpec coordinates differ. Broadcast operands use ``_broadcast_surface``
+    instead, because their positions require explicit projection maps.
 
     So the choice is only about spelling, and it follows from the binding: a
     ``NAMED`` builder is an op the dialect already has, which says its own
@@ -1462,6 +1471,29 @@ class ParamSlot:
     buffer: Buffer | None = None
 
 
+def _record_access(
+    spec: OpSpec, accesses: dict[str, Access], arg: TensorArg, access: Access
+) -> None:
+    """Add ``arg``'s ``access`` to ``accesses``, refusing a second element type.
+
+    Two accesses to one buffer at two element types WITHIN ONE STAGE: the views
+    are keyed ``(stage, buf_id)``, so the second would silently take the first's
+    view and load the wrong element type.  Refused rather than keyed more
+    finely, because neither target needs it: the chain's stage 2 reads the pair
+    base only as f16, and the two types it does need are in two different
+    stages.  Asked of every pointwise access, relayout or not.
+    """
+    earlier = accesses.get(buf_id(arg))
+    if earlier is not None and earlier.elems != access.elems:
+        raise NotImplementedError(
+            f"OpSpec->KTIR: op {spec.op!r} reads buffer {buf_id(arg)!r} as "
+            f"both {earlier.elems.storage} and {access.elems.storage} in one "
+            "stage; a stage has one view per buffer, so two element types "
+            "in one stage are not supported"
+        )
+    accesses[buf_id(arg)] = access
+
+
 class KernelPlan:
     """One kernel, resolved: its grid, its buffers, and the steps for its body.
 
@@ -1745,9 +1777,18 @@ class KernelPlan:
         access is built from, so a view and the tiles into it cannot disagree, and
         emission has nothing left to derive.
         """
-        out, inputs = validated_roles(spec)
-        dtype = dtype_of(spec)
         recipe = KtirBuilder.RECIPES[spec.op]
+        out, inputs = validated_roles(spec)
+        if is_lx_relayout_identity(spec.op, spec.args, spec.op_info):
+            # A planner-certified move between LX owners: the elements change
+            # cores, not addresses within one buffer, so neither a copy nor a
+            # strided view states it.
+            _unimplemented(
+                "lx-relayout",
+                f"{spec.op!r} moves {inputs[0].name!r} between scratchpad owners; "
+                "a core-to-core relayout is not emitted",
+            )
+        dtype = dtype_of(spec)
         for arg in inputs:
             # In-place (input buffer aliases the output) is not supported yet.
             if buf_id(arg) == buf_id(out):
@@ -1783,6 +1824,7 @@ class KernelPlan:
                 indexing = Indexing(iters=iters, maps=(in_map, out_map))
         levels = _levels(spec, loops)
         broadcast = False
+        relayouted: list[TensorArg] = []
         if not spec.is_reduction:
             # A read of a statistic is squeezed the way its PRODUCER's output was,
             # so the reader's access has the rank of the buffer the producer
@@ -1827,7 +1869,8 @@ class KernelPlan:
                 else:
                     read.append(arg)
             inputs = read
-            # ``align_reshape_plan`` is the SWITCH, not a refusal (see
+            # ``operand_alignment`` -- the answer ``align_reshape_plan`` gives --
+            # is the SWITCH, not a refusal (see
             # ``_broadcast_surface``).  Asked of every operand, because it is a
             # property of the whole op: one broadcast operand makes the op a
             # generic, and the aligned operands then need their (identity) rows
@@ -1835,47 +1878,60 @@ class KernelPlan:
             # ARM is chosen on it and the surface is chosen from the arm; what needs
             # the accesses is ``_broadcast_surface``, whose map rows are about TILE
             # extents, and that call stays below them.
-            broadcast = any(
-                align_reshape_plan(
+            #
+            # The same answer also finds an input laid out DIFFERENTLY from the
+            # output -- not aligned, so no reshape or broadcast lines it up:
+            # ``a + b.T``'s ``b``, or a restickify's source.  Such an input is
+            # read through a relayout's strided view (``_relayout_accesses``),
+            # and the op is otherwise planned exactly like any other.
+            alignments = [
+                operand_alignment(
                     list(arg.device_coordinates),
                     [int(s) for s in arg.device_size],
                     list(out.device_coordinates),
                     [int(s) for s in out.device_size],
                 )
-                is not None
                 for arg in inputs
+            ]
+            relayouted = [
+                arg
+                for arg, (aligned, _plan) in zip(inputs, alignments, strict=True)
+                if not aligned
+            ]
+            broadcast = any(
+                aligned and plan is not None for aligned, plan in alignments
             )
         # The op's spelling, chosen ONCE, from the whole request: the format, plus
         # whether an operand is broadcast (never, for a reduction, whose shape comes
         # from ``_reduce_surface`` -- the arm is asked for there only so that an op
         # that does not exist at this format is refused by the plan regardless).
         arm = recipe.arm(dtype, broadcast=broadcast)
-        # Positions are the inputs in operand order and then the result, which is
-        # what ``Recipe.unfused`` names: the element type an access reads a buffer
-        # AT is the op's business, not the buffer's arrangement (see ``unfused``).
-        accesses: dict[str, Access] = {}
-        for position, arg in enumerate((*inputs, out)):
-            access = self._access_of(
-                arg,
-                levels,
-                head=_reads_stick_head(arg),
-                unfused=position in recipe.unfused,
+        # The scalar arguments the payload builder takes beyond its operands, read
+        # from ``op_info`` here so that a malformed one is refused by the plan
+        # rather than by a KeyError with a half-built module in hand.
+        attrs: tuple[tuple[str, float], ...] = ()
+        if recipe.attrs is not None:
+            attrs = tuple(recipe.attrs(spec.op_info).items())
+        # Both routes return accesses in input order followed by the output.
+        # Only the memory geometry differs; checks and computation stay shared.
+        arguments = (*inputs, out)
+        if relayouted:
+            ordered_accesses = self._relayout_accesses(
+                spec, loops, recipe, inputs, out, relayouted
             )
-            earlier = accesses.get(buf_id(arg))
-            if earlier is not None and earlier.elems != access.elems:
-                # Two accesses to one buffer at two element types WITHIN ONE STAGE.
-                # The views are keyed ``(stage, buf_id)``, so the second would
-                # silently take the first's view and load the wrong element type --
-                # refused rather than keyed more finely, because neither target
-                # needs it: the chain's stage 2 reads the pair base only as f16,
-                # and the two types it does need are in two different stages.
-                raise NotImplementedError(
-                    f"OpSpec->KTIR: op {spec.op!r} reads buffer {buf_id(arg)!r} as "
-                    f"both {earlier.elems.storage} and {access.elems.storage} in one "
-                    "stage; a stage has one view per buffer, so two element types "
-                    "in one stage are not supported"
+        else:
+            ordered_accesses = tuple(
+                self._access_of(
+                    arg,
+                    levels,
+                    head=_reads_stick_head(arg),
+                    unfused=position in recipe.unfused,
                 )
-            accesses[buf_id(arg)] = access
+                for position, arg in enumerate(arguments)
+            )
+        accesses: dict[str, Access] = {}
+        for arg, access in zip(arguments, ordered_accesses, strict=True):
+            _record_access(spec, accesses, arg, access)
         if not spec.is_reduction:
             # The two shapes a pointwise op can take, on the same bit that chose
             # the arm: the arm says what can be spelled, ``broadcast`` says what
@@ -1886,27 +1942,7 @@ class KernelPlan:
                 surface, indexing = _parallel_surface(
                     arm, len(inputs), len(accesses[buf_id(out)].extent)
                 )
-        # Every division must move this op's output: cores divide work by writing
-        # different elements, so a division no output axis follows is cores
-        # duplicating each other rather than sharing.  An *input* may legitimately
-        # not follow one (every core reads the same operand), which is why this
-        # asks the output only.
-        out_coeffs = accesses[buf_id(out)].index_coeffs
-        for level, division in enumerate(self.divisions):
-            if not any(row[level] for row in out_coeffs):
-                raise NotImplementedError(
-                    f"OpSpec->KTIR: work division splits {division.symbol} across "
-                    f"{division.div} cores, but no device axis of the output "
-                    f"{out.name!r} follows it, so every core would compute the "
-                    "same elements; dividing the within-stick axis or a reduced "
-                    "axis (which needs a cross-core combine) reads like this"
-                )
-        # The scalar arguments the payload builder takes beyond its operands, read
-        # from ``op_info`` here so that a malformed one is refused by the plan
-        # rather than by a KeyError with a half-built module in hand.
-        attrs: tuple[tuple[str, float], ...] = ()
-        if recipe.attrs is not None:
-            attrs = tuple(recipe.attrs(spec.op_info).items())
+        self._check_divisions_follow_output(out, accesses[buf_id(out)])
         return ComputeStep(
             op=spec.op,
             surface=surface,
@@ -1925,6 +1961,150 @@ class KernelPlan:
             # so it is stored like any passed-in buffer.
             store=not is_threaded(out),
         )
+
+    @staticmethod
+    def _check_relayout_operand(spec: OpSpec, arg: TensorArg) -> None:
+        """Refuse an operand that a relayout cannot read or write.
+
+        A relayout puts the layout change into a memory view's strides, so the
+        operand must reach memory, and in the standard element arrangement (the
+        strides are worked out per element, so a fused arrangement that packs
+        two values per element would be addressed wrongly).
+        """
+        if is_threaded(arg):
+            _unimplemented(
+                "relayout-threaded",
+                f"{spec.op!r} operand {arg.name!r} is threaded; a relayout "
+                "reads and writes memory",
+            )
+        if _arrangement(arg) not in (None, ElementArrangement.STANDARD):
+            _unimplemented(
+                "relayout-element-arrangement",
+                f"{spec.op!r} operand {arg.name!r} has element arrangement "
+                f"{_arrangement(arg)!r}",
+            )
+
+    def _check_divisions_follow_output(
+        self, out: TensorArg, out_access: Access
+    ) -> None:
+        """Refuse a work division that no axis of the output follows.
+
+        Every division must move this op's output: cores divide work by writing
+        different elements, so a division no output axis follows is cores
+        duplicating each other rather than sharing.  An *input* may legitimately
+        not follow one (every core reads the same operand), which is why this
+        asks the output only.  Asked of every pointwise step, relayout or not.
+        """
+        for level, division in enumerate(self.divisions):
+            if not any(row[level] for row in out_access.index_coeffs):
+                raise NotImplementedError(
+                    f"OpSpec->KTIR: work division splits {division.symbol} across "
+                    f"{division.div} cores, but no device axis of the output "
+                    f"{out.name!r} follows it, so every core would compute the "
+                    "same elements; dividing the within-stick axis or a reduced "
+                    "axis (which needs a cross-core combine) reads like this"
+                )
+
+    def _relayout_accesses(
+        self,
+        spec: OpSpec,
+        loops: Sequence[LoopSpec],
+        recipe: Recipe,
+        inputs: Sequence[TensorArg],
+        out: TensorArg,
+        relayouted: Sequence[TensorArg],
+    ) -> tuple[Access, ...]:
+        """Build accesses for a pointwise op with exactly one permuted input.
+
+        Inputs must already have undergone scalar/statistic preparation and
+        alignment classification. Returns accesses in input order, then output
+        order, without selecting arithmetic or constructing a ComputeStep.
+        The caller records and checks the accesses before building the step.
+
+        The permuted input is read through strides derived from its coordinates
+        against the output. Every other input must have exactly the output's
+        coordinates and sizes, so it can use the output's strides over the same
+        iteration space. The recipe supplies only the plain-element-type
+        positions used to construct these accesses.
+
+        Rejects multiple permuted inputs, broadcast alongside a permutation,
+        tiling or work division, a threaded (LX) operand, unsupported storage
+        arrangements, an iteration range that is not a whole number, and a buffer
+        read through two layouts. Each access retains its own buffer view;
+        the buffer registry keeps the first record for parameter binding.
+        """
+        if len(relayouted) != 1:
+            raise NotImplementedError(
+                f"OpSpec->KTIR: {spec.op!r} has {len(relayouted)} inputs laid out "
+                "differently from its output; a relayout reads exactly one"
+            )
+        [moved] = relayouted
+        for source in inputs:
+            if source is not moved and (
+                list(source.device_coordinates) != list(out.device_coordinates)
+                or [int(s) for s in source.device_size]
+                != [int(s) for s in out.device_size]
+            ):
+                raise NotImplementedError(
+                    f"OpSpec->KTIR: {spec.op!r} input {source.name!r} is neither the "
+                    "relayouted input nor laid out like the output; a relayout's other "
+                    "inputs are read at the output's strides"
+                )
+        if loops or self.divisions:
+            _unimplemented(
+                "relayout-tiling",
+                f"{spec.op!r} is tiled or work-divided; a relayout is emitted over "
+                "one whole, undivided iteration space (SENCORES=1)",
+            )
+        for arg in (*inputs, out):
+            self._check_relayout_operand(spec, arg)
+        ranges = {}
+        for sym, (count, _div) in spec.iteration_space.items():
+            count = _static(count)
+            if not isinstance(count, int):
+                raise NotImplementedError(
+                    f"OpSpec->KTIR: {spec.op!r} iterates {sym} over {count}; a "
+                    "relayout's ranges must be whole numbers"
+                )
+            ranges[sym] = count
+        loop_bounds, moved_strides, out_strides = relayout_strides(
+            list(moved.device_coordinates),
+            [int(s) for s in moved.device_size],
+            list(out.device_coordinates),
+            [int(s) for s in out.device_size],
+            ranges,
+        )
+        # A stage has one view per buffer, so one buffer read at two sets of
+        # strides -- ``x + x.T`` -- cannot be stated: the second view would
+        # silently take the first one's place.
+        for source in inputs:
+            if source is not moved and buf_id(source) == buf_id(moved):
+                raise NotImplementedError(
+                    f"OpSpec->KTIR: {spec.op!r} reads buffer {buf_id(moved)!r} at "
+                    f"strides {out_strides} and at {moved_strides}; a stage has one "
+                    "view per buffer, so one buffer read in two layouts is not "
+                    "supported"
+                )
+        accesses: list[Access] = []
+        for position, arg in enumerate((*inputs, out)):
+            layout = Layout(
+                extent=loop_bounds,
+                strides=moved_strides if arg is moved else out_strides,
+            )
+            elems = ElemTypes.of(
+                arg.device_dtype,
+                None if position in recipe.unfused else _arrangement(arg),
+            )
+            buffer = _buffer(
+                arg,
+                layout,
+                elems,
+                bake_addresses=self.options.bake_addresses,
+                frontend_pool_allocation=self.options.frontend_pool_allocation,
+            )
+            self.buffers.setdefault(buf_id(arg), buffer)
+            accesses.append(_access(arg, loop_bounds, [], layout, elems, buffer))
+        return tuple(accesses)
 
     def _access_of(
         self,
@@ -3104,7 +3284,17 @@ class KtirBuilder:
         )
         sizes = [int(e) for e in buffer.layout.extent]
         strides = [int(s) for s in buffer.layout.strides]
-        memref_t = ir.MemRefType.get(sizes, self.named_type(buffer.elems.storage))
+        # A view at other than row-major strides says so in its type as well as
+        # in its operands -- a relayout's input, viewed in its output's order.
+        # A row-major one keeps the plain type every other view has.
+        layout = (
+            None
+            if strides == row_major_strides(sizes)
+            else ir.StridedLayoutAttr.get(0, strides)
+        )
+        memref_t = ir.MemRefType.get(
+            sizes, self.named_type(buffer.elems.storage), layout=layout
+        )
         # The ``memory_space`` builder takes the tablegen-generated
         # ``MemorySpaceKind``, not a
         # spelling, so the mapping names enum members.  ``global_`` carries the
@@ -3560,6 +3750,34 @@ class KtirBuilder:
         "realdiv": Recipe(
             arity=2,
             arms=Arm(kind=BindingKind.PAYLOAD, binding=lambda: spyreop.realdiv),
+        ),
+        # The two copies.  A restickify is a transpose that moves the stick dim;
+        # ``identity`` is the same data movement when it arrives under the
+        # generic name (or a plain copy, when its operands already line up).
+        # Both are ordinary unary ops whose payload yields its operand: whether
+        # the operand has to be moved is ``operand_alignment``'s question, asked
+        # of every pointwise op's inputs in ``_compute_step``.
+        #
+        # The payload is ``spyreop.identity``, not a body that only yields its
+        # input.  Canonicalization erases a ``linalg.generic`` that only yields
+        # its input, which leaves a load feeding a store with no compute op
+        # between them.  ``spyreop.identity`` has no folder, so the generic and
+        # its compute op survive.
+        RESTICKIFY_OP: Recipe(
+            arity=1,
+            arms=Arm(
+                kind=BindingKind.PAYLOAD,
+                binding=lambda: spyreop.identity,
+                dtypes=tuple(RESTICKIFY_SUPPORTED_DEVICE_DTYPES),
+            ),
+        ),
+        IDENTITY_OP: Recipe(
+            arity=1,
+            arms=Arm(
+                kind=BindingKind.PAYLOAD,
+                binding=lambda: spyreop.identity,
+                dtypes=(DataFormats.SEN169_FP16, DataFormats.IEEE_FP32),
+            ),
         ),
     }
 

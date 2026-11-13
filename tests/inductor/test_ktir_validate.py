@@ -30,6 +30,8 @@ import contextlib
 import dataclasses
 import importlib
 import inspect
+import itertools
+import math
 import sys
 import unittest
 from unittest import mock
@@ -39,8 +41,26 @@ import sympy
 
 from torch_spyre._C import DataFormats, ElementArrangement
 from torch_spyre._inductor.codegen import ktir
-from torch_spyre._inductor.constants import MAX_POOL_SIZE_BYTES, STAGGERED_EAS
-from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
+from torch_spyre._inductor.codegen.opspec_utils import (
+    align_reshape_plan,
+    operand_alignment,
+    relayout_strides,
+    row_major_strides,
+)
+from torch_spyre._inductor.constants import (
+    IDENTITY_OP,
+    MAX_POOL_SIZE_BYTES,
+    RESTICKIFY_OP,
+    STAGGERED_EAS,
+)
+from torch_spyre._inductor.op_spec import (
+    LX_RELAYOUT_INFO_KEY,
+    LoopSpec,
+    OpSpec,
+    TensorArg,
+    TensorWorkDivision,
+    UnimplementedOp,
+)
 
 # ---------------------------------------------------------------------------
 # Building a spec
@@ -180,6 +200,159 @@ def make_op_spec(
         op_info=op_info or {},
         tiled_symbols=tiled or [],
         tiled_symbol_trip_counts=trips or {},
+    )
+
+
+# ``x.transpose(..).contiguous()`` as the frontend hands it over: the input and
+# output coordinates of each OpSpec, copied from a live compile.  Symbols are
+# ``c0, c1, ...`` there, and the dict keys say which shape each one is.
+_C0, _C1, _C2, _C3 = sympy.symbols("c0 c1 c2 c3")
+RELAYOUT_CASES = {
+    # 2D [64, 64] transposed: the stick dim moves, one stick on each side.
+    "2d_64x64": (
+        "ReStickifyOpHBM",
+        ([1, 64, 64], [sympy.floor(_C0 / 64), _C1, sympy.Mod(_C0, 64)]),
+        ([1, 64, 64], [sympy.floor(_C1 / 64), _C0, sympy.Mod(_C1, 64)]),
+        {_C0: 64, _C1: 64},
+    ),
+    # 2D [128, 256] transposed: several sticks a side, so c0 is split.
+    "2d_128x256": (
+        "ReStickifyOpHBM",
+        ([4, 128, 64], [sympy.floor(_C0 / 64), _C1, sympy.Mod(_C0, 64)]),
+        ([2, 256, 64], [sympy.floor(_C1 / 64), _C0, sympy.Mod(_C1, 64)]),
+        {_C0: 256, _C1: 128},
+    ),
+    # 3D [512, 256, 128] transposed on dims 1 and 2: the stick dim moves, and a
+    # bare outer dim sits between each side's stick and lane axes.
+    "3d_stick": (
+        "ReStickifyOpHBM",
+        ([256, 2, 512, 64], [_C2, sympy.floor(_C1 / 64), _C0, sympy.Mod(_C1, 64)]),
+        ([128, 4, 512, 64], [_C1, sympy.floor(_C2 / 64), _C0, sympy.Mod(_C2, 64)]),
+        {_C0: 512, _C1: 128, _C2: 256},
+    ),
+    # [128, 64, 128].transpose(1, 2).contiguous(): the output's single
+    # stick axis precedes c1, unlike the multi-stick 3D case above.
+    "3d_128x64x128": (
+        "ReStickifyOpHBM",
+        ([64, 2, 128, 64], [_C2, sympy.floor(_C1 / 64), _C0, sympy.Mod(_C1, 64)]),
+        ([1, 128, 128, 64], [sympy.floor(_C2 / 64), _C1, _C0, sympy.Mod(_C2, 64)]),
+        {_C0: 128, _C1: 128, _C2: 64},
+    ),
+    # [128, 128, 64].transpose(1, 2).contiguous(): the stick moves, and only
+    # the OUTPUT's stick symbol (c2, 128) spans more than one stick.  The
+    # input's stick symbol c1 is one stick, the mirror of 3d_128x64x128.
+    "p021_128x128x64": (
+        "ReStickifyOpHBM",
+        ([1, 128, 128, 64], [sympy.floor(_C1 / 64), _C2, _C0, sympy.Mod(_C1, 64)]),
+        ([64, 2, 128, 64], [_C1, sympy.floor(_C2 / 64), _C0, sympy.Mod(_C2, 64)]),
+        {_C0: 128, _C1: 64, _C2: 128},
+    ),
+    # [2, 2, 64, 64].permute(1, 0, 3, 2).contiguous(): rank 4, the stick
+    # moves (c2 -> c3) AND two bare dims swap (c0 <-> c1) in the same op.
+    "r4_2x2x64x64_p1032": (
+        "ReStickifyOpHBM",
+        (
+            [1, 2, 64, 2, 64],
+            [sympy.floor(_C2 / 64), _C0, _C3, _C1, sympy.Mod(_C2, 64)],
+        ),
+        (
+            [1, 2, 64, 2, 64],
+            [sympy.floor(_C3 / 64), _C1, _C2, _C0, sympy.Mod(_C3, 64)],
+        ),
+        {_C0: 2, _C1: 2, _C2: 64, _C3: 64},
+    ),
+    # [128, 128, 128].permute(2, 0, 1).contiguous(): a 3-cycle through the
+    # stick (output dims 0, 1, 2 read input dims 2, 0, 1), and both stick
+    # symbols, c0 on the input and c2 on the output, span two sticks.
+    "p201_128x128x128": (
+        "ReStickifyOpHBM",
+        ([128, 2, 128, 64], [_C2, sympy.floor(_C0 / 64), _C1, sympy.Mod(_C0, 64)]),
+        ([128, 2, 128, 64], [_C1, sympy.floor(_C2 / 64), _C0, sympy.Mod(_C2, 64)]),
+        {_C0: 128, _C1: 128, _C2: 128},
+    ),
+    # [4, 8, 64].permute(1, 0, 2).contiguous() as ``identity``: the stick dim
+    # stays, only the two bare dims swap -- the same data movement as a
+    # restickify, under the generic name.
+    "p102_4x8x64": (
+        IDENTITY_OP,
+        ([8, 1, 4, 64], [_C1, sympy.floor(_C2 / 64), _C0, sympy.Mod(_C2, 64)]),
+        ([4, 1, 8, 64], [_C0, sympy.floor(_C2 / 64), _C1, sympy.Mod(_C2, 64)]),
+        {_C0: 4, _C1: 8, _C2: 64},
+    ),
+}
+
+
+# The same transposes at fp32, as the frontend hands them over.  A stick is 128
+# bytes, so it holds 32 fp32 lanes where it holds 64 fp16 ones: a dim that
+# touches the stick has twice as many sticks as it does at fp16, and the
+# coordinates divide by 32.  Each key names its shape; the fp16 entry of the
+# same name in ``RELAYOUT_CASES`` (where there is one) is the same logical
+# tensor.  Every entry here is at ``DataFormats.IEEE_FP32``.
+RELAYOUT_CASES_FP32 = {
+    # 2D [64, 64] transposed: one stick a side at fp16, two at fp32.
+    "2d_64x64": (
+        "ReStickifyOpHBM",
+        ([2, 64, 32], [sympy.floor(_C0 / 32), _C1, sympy.Mod(_C0, 32)]),
+        ([2, 64, 32], [sympy.floor(_C1 / 32), _C0, sympy.Mod(_C1, 32)]),
+        {_C0: 64, _C1: 64},
+    ),
+    # [128, 64, 128].transpose(1, 2): c2 (64) is one stick at fp16 and two at
+    # fp32, so at fp32 both stick symbols span more than one stick.
+    "3d_128x64x128": (
+        "ReStickifyOpHBM",
+        ([64, 4, 128, 32], [_C2, sympy.floor(_C1 / 32), _C0, sympy.Mod(_C1, 32)]),
+        ([128, 2, 128, 32], [_C1, sympy.floor(_C2 / 32), _C0, sympy.Mod(_C2, 32)]),
+        {_C0: 128, _C1: 128, _C2: 64},
+    ),
+    # [4, 8, 64].permute(1, 0, 2) as ``identity``: the stick stays, and at fp32
+    # its 64 elements are two sticks.
+    "p102_4x8x64": (
+        IDENTITY_OP,
+        ([8, 2, 4, 32], [_C1, sympy.floor(_C2 / 32), _C0, sympy.Mod(_C2, 32)]),
+        ([4, 2, 8, 32], [_C0, sympy.floor(_C2 / 32), _C1, sympy.Mod(_C2, 32)]),
+        {_C0: 4, _C1: 8, _C2: 64},
+    ),
+}
+
+
+def needs_relayout(source: TensorArg, out: TensorArg) -> bool:
+    """Whether ``operand_alignment`` reports ``source`` as not aligned with ``out``.
+
+    The question ``KernelPlan._compute_step`` asks to find the input a relayout
+    reads through strided memory.
+    """
+    aligned, _plan = operand_alignment(
+        list(source.device_coordinates),
+        [int(s) for s in source.device_size],
+        list(out.device_coordinates),
+        [int(s) for s in out.device_size],
+    )
+    return not aligned
+
+
+def make_relayout_op_spec(
+    case: str = "2d_64x64", *, fp32: bool = False, **overrides
+) -> OpSpec:
+    """One relayout from ``RELAYOUT_CASES``, or ``RELAYOUT_CASES_FP32`` at fp32.
+
+    ``fp32=True`` takes the fp32 coordinates (32-lane sticks) and sets the
+    format to ``IEEE_FP32``; giving fp16 coordinates an fp32 format would
+    describe a layout the frontend never produces.
+    """
+    table = RELAYOUT_CASES_FP32 if fp32 else RELAYOUT_CASES
+    op, (in_size, in_coords), (out_size, out_coords), ranges = table[case]
+    if fp32:
+        overrides.setdefault("dtype", DataFormats.IEEE_FP32)
+    divisions = overrides.pop("divisions", {})
+    return make_op_spec(
+        overrides.pop("op", op),
+        inputs=1,
+        sizes=[in_size, out_size],
+        coords_per_arg=[in_coords, out_coords],
+        space={
+            sym: (count, divisions.get(str(sym), 1)) for sym, count in ranges.items()
+        },
+        **overrides,
     )
 
 
@@ -2327,7 +2500,16 @@ class TestRefusals(unittest.TestCase):
         source = inspect.getsource(ktir)
         labels = re.findall(r'_unimplemented\(\s*\n?\s*"([^"]+)"', source)
         self.assertEqual(sorted(labels), sorted(set(labels)))
-        self.assertEqual(sorted(labels), ["staggered-element-arrangement"])
+        self.assertEqual(
+            sorted(labels),
+            [
+                "lx-relayout",
+                "relayout-element-arrangement",
+                "relayout-threaded",
+                "relayout-tiling",
+                "staggered-element-arrangement",
+            ],
+        )
 
     def test_no_refusal_message_blames_a_consumer(self):
         """A refusal says what is missing here, not what someone else rejects.
@@ -2348,11 +2530,541 @@ class TestRefusals(unittest.TestCase):
             if isinstance(node, ast.Call)
             and getattr(node.func, "id", None) == "_unimplemented"
         ]
-        self.assertEqual(len(messages), 1)
+        self.assertEqual(len(messages), 5)
         for message in messages:
             with self.subTest(message=message[:40]):
                 for blame in ("dbo-opt", "no consumer", "nothing lowers", "scheduler"):
                     self.assertNotIn(blame, message)
+
+
+class TestRelayout(unittest.TestCase):
+    """A transpose: the input viewed in the output's order, then a copy."""
+
+    # (extent, input strides, output strides) per case, worked by hand from the
+    # coordinates; ``test_strides_agree_with_the_coordinates`` checks the method.
+    #
+    # Loop count, for n loop symbols: a moved stick always gives n + 2 loops.
+    # The output's stick symbol is already two axes (stick, lane), and the
+    # output's bare axis over the input's stick symbol is split into
+    # (n_sticks, 64).  That split is made even when n_sticks is 1, where it
+    # could collapse to one loop for n + 1; the collapse is not done.  A stick
+    # that stays gives n + 1.
+    EXPECTED_SHAPE_STRIDES = {
+        # n = 2, stick moves c0 -> c1.  Both are a single stick, so c0's split
+        # is (1, 64): n + 2 = 4 loops, not the collapsible n + 1 = 3.
+        "2d_64x64": ((1, 1, 64, 64), (4096, 4096, 1, 64), (4096, 4096, 64, 1)),
+        # n = 2, stick moves c0 -> c1.  c0 is 4 sticks, split (4, 64): n + 2.
+        "2d_128x256": ((2, 4, 64, 64), (4096, 8192, 1, 64), (16384, 4096, 64, 1)),
+        # n = 3, stick moves c1 -> c2.  c1 is 2 sticks, split (2, 64): n + 2.
+        "3d_stick": (
+            (2, 64, 4, 512, 64),
+            (32768, 1, 4194304, 64, 65536),
+            (8388608, 131072, 32768, 64, 1),
+        ),
+        # n = 3, stick moves c1 -> c2.  c2 is one stick on the output side and
+        # c1 is 2 sticks, split (2, 64): n + 2.
+        "3d_128x64x128": (
+            (1, 2, 64, 128, 64),
+            (1048576, 8192, 1, 64, 16384),
+            (1048576, 524288, 8192, 64, 1),
+        ),
+        # n = 3, stick moves c1 -> c2.  c2 is 2 sticks on the output side and
+        # c1 is one stick, split (1, 64) anyway: n + 2.
+        "p021_128x128x64": (
+            (1, 64, 2, 128, 64),
+            (1048576, 1, 524288, 64, 8192),
+            (1048576, 16384, 8192, 64, 1),
+        ),
+        # n = 4, stick moves c2 -> c3, and c0, c1 swap.  Both sticks are one
+        # stick; c2's split is (1, 64): n + 2 = 6 loops.
+        "r4_2x2x64x64_p1032": (
+            (1, 2, 1, 64, 2, 64),
+            (8192, 64, 16384, 1, 8192, 128),
+            (16384, 8192, 8192, 128, 64, 1),
+        ),
+        # n = 3, a 3-cycle: the stick moves c0 -> c2.  c0 is 2 sticks, split
+        # (2, 64); c2 is 2 sticks on the output side: n + 2.
+        "p201_128x128x128": (
+            (128, 2, 2, 64, 64),
+            (64, 1048576, 8192, 1, 16384),
+            (16384, 8192, 4096, 64, 1),
+        ),
+    }
+
+    # The same as ``EXPECTED_SHAPE_STRIDES``, for ``RELAYOUT_CASES_FP32``.  A stick
+    # is 32 lanes at fp32, so every split is ``(n_sticks, 32)`` and a dim that
+    # touches the stick has twice the sticks it has at fp16.
+    EXPECTED_SHAPE_STRIDES_FP32 = {
+        # n = 2, stick moves c0 -> c1.  c0 is 2 sticks, split (2, 32): n + 2.
+        # At fp16 the same tensor is (1, 1, 64, 64).
+        "2d_64x64": ((2, 2, 32, 32), (1024, 2048, 1, 32), (2048, 1024, 32, 1)),
+        # n = 3, stick moves c1 -> c2.  c1 is 4 sticks, split (4, 32); c2 is 2
+        # sticks on the output side: n + 2.  At fp16 c2 is a single stick.
+        "3d_128x64x128": (
+            (4, 32, 2, 128, 32),
+            (4096, 1, 524288, 32, 16384),
+            (262144, 8192, 4096, 32, 1),
+        ),
+        # n = 3, the stick stays: n + 1.  Its 64 elements are 2 sticks at fp32.
+        "p102_4x8x64": ((4, 2, 8, 32), (32, 128, 256, 1), (512, 256, 32, 1)),
+    }
+
+    @staticmethod
+    def strides(case: str, *, fp32: bool = False) -> tuple:
+        table = RELAYOUT_CASES_FP32 if fp32 else RELAYOUT_CASES
+        _op, (in_size, in_coords), (out_size, out_coords), ranges = table[case]
+        return relayout_strides(in_coords, in_size, out_coords, out_size, ranges)
+
+    def expectations(self):
+        """``(case, fp32, expected)`` for every case at both formats."""
+        for case, expected in self.EXPECTED_SHAPE_STRIDES.items():
+            yield case, False, expected
+        for case, expected in self.EXPECTED_SHAPE_STRIDES_FP32.items():
+            yield case, True, expected
+
+    def test_strides_for_the_frontend_shapes(self):
+        for case, fp32, expected in self.expectations():
+            with self.subTest(case=case, fp32=fp32):
+                self.assertEqual(self.strides(case, fp32=fp32), expected)
+
+    def test_every_fp32_case_has_an_expectation(self):
+        """The fp32 table and its expectations name the same cases."""
+        self.assertEqual(
+            sorted(self.EXPECTED_SHAPE_STRIDES_FP32), sorted(RELAYOUT_CASES_FP32)
+        )
+
+    def test_fp32_sticks_are_32_lanes(self):
+        """Every split of an fp32 case is 32 lanes, and none is 64.
+
+        The stick size is read off each coordinate's divisor rather than
+        assumed, so an fp32 relayout must never produce a 64-lane loop: the
+        innermost loop is a lane, and so is the inner half of each split.
+        """
+        for case in RELAYOUT_CASES_FP32:
+            with self.subTest(case=case):
+                extent, _in_strides, _out_strides = self.strides(case, fp32=True)
+                self.assertEqual(extent[-1], 32)
+                self.assertNotIn(64, extent)
+
+    def test_fp32_has_twice_the_sticks_of_fp16(self):
+        """A dim that touches the stick has twice the sticks at fp32.
+
+        Compared on the device sizes the two tables give for the same logical
+        tensor: the product of each buffer's sizes is the same element count,
+        and the lane axis is half as wide at fp32.
+        """
+        for case, fp32 in RELAYOUT_CASES_FP32.items():
+            with self.subTest(case=case):
+                fp16 = RELAYOUT_CASES[case]
+                self.assertEqual(fp16[3], fp32[3])  # the same logical ranges
+                for side in (1, 2):  # input, output
+                    size16, size32 = fp16[side][0], fp32[side][0]
+                    self.assertEqual(math.prod(size16), math.prod(size32))
+                    self.assertEqual((size16[-1], size32[-1]), (64, 32))
+
+    def test_the_output_is_row_major_and_only_the_input_is_strided(self):
+        for case, fp32, _expected in self.expectations():
+            with self.subTest(case=case, fp32=fp32):
+                extent, in_strides, out_strides = self.strides(case, fp32=fp32)
+                self.assertEqual(list(out_strides), row_major_strides(extent))
+                self.assertNotEqual(list(in_strides), row_major_strides(extent))
+
+    def test_strides_agree_with_the_coordinates(self):
+        """Every output element is read from the input element it transposes.
+
+        Brute force over shapes small enough to enumerate: the address pair the
+        coordinates give for each iteration point, against the pair the strides
+        give for each point of the refined iteration space.
+        """
+        c0, c1, c2 = _C0, _C1, _C2
+        floor, mod = sympy.floor, sympy.Mod
+        cases = [
+            (
+                [floor(c0 / 64), c1, mod(c0, 64)],
+                [2, 64, 64],
+                [floor(c1 / 64), c0, mod(c1, 64)],
+                [1, 128, 64],
+                {c0: 128, c1: 64},
+            ),
+            (
+                [c2, floor(c1 / 64), c0, mod(c1, 64)],
+                [192, 2, 3, 64],
+                [c1, floor(c2 / 64), c0, mod(c2, 64)],
+                [128, 3, 3, 64],
+                {c0: 3, c1: 128, c2: 192},
+            ),
+        ]
+        for in_coords, in_size, out_coords, out_size, ranges in cases:
+            with self.subTest(in_size=in_size, out_size=out_size):
+                extent, in_strides, out_strides = relayout_strides(
+                    in_coords, in_size, out_coords, out_size, ranges
+                )
+                syms = list(ranges)
+                expected = {}
+                for values in itertools.product(*(range(ranges[s]) for s in syms)):
+                    env = dict(zip(syms, values))
+
+                    def address(coords, size, env=env):
+                        point = [int(sympy.sympify(c).subs(env)) for c in coords]
+                        return sum(
+                            p * s for p, s in zip(point, row_major_strides(size))
+                        )
+
+                    expected[address(out_coords, out_size)] = address(
+                        in_coords, in_size
+                    )
+                got = {
+                    sum(i * s for i, s in zip(index, out_strides)): sum(
+                        i * s for i, s in zip(index, in_strides)
+                    )
+                    for index in itertools.product(*(range(e) for e in extent))
+                }
+                self.assertEqual(got, expected)
+
+    def test_a_padded_stick_is_refused(self):
+        """63 elements in a 64-lane stick: the split would read a padding lane."""
+        c0, c1 = _C0, _C1
+        with self.assertRaisesRegex(NotImplementedError, "padded|range"):
+            relayout_strides(
+                [sympy.floor(c0 / 64), c1, sympy.Mod(c0, 64)],
+                [1, 64, 64],
+                [sympy.floor(c1 / 64), c0, sympy.Mod(c1, 64)],
+                [1, 63, 64],
+                {c0: 63, c1: 64},
+            )
+
+    def test_a_broadcast_is_not_a_copy(self):
+        """An output dim the input does not walk would copy one element to many."""
+        c0, c1 = _C0, _C1
+        with self.assertRaisesRegex(NotImplementedError, "many outputs"):
+            relayout_strides(
+                [sympy.Integer(0), sympy.floor(c1 / 64), sympy.Mod(c1, 64)],
+                [1, 1, 64],
+                [c0, sympy.floor(c1 / 64), sympy.Mod(c1, 64)],
+                [8, 1, 64],
+                {c0: 8, c1: 64},
+            )
+
+    def test_the_plan_step_is_an_identity_generic_over_a_strided_input(self):
+        """Each frontend layout reaches a copy plan with its derived strides.
+
+        At both formats: an fp32 relayout is the same copy over 32-lane sticks,
+        and both of its accesses are typed ``f32``.
+        """
+        for case, fp32, expected in self.expectations():
+            extent, in_strides, out_strides = expected
+            with self.subTest(case=case, fp32=fp32):
+                plan = ktir.build_kernel_plan([make_relayout_op_spec(case, fp32=fp32)])
+                [step] = plan.steps
+                identity = tuple(range(len(extent)))
+                self.assertIs(step.surface, ktir.Surface.GENERIC)
+                self.assertEqual(step.indexing.maps, (identity, identity))
+                self.assertEqual(step.indexing.iters, (ktir.PARALLEL,) * len(extent))
+                [(_name, source)] = step.ins
+                self.assertEqual(source.extent, extent)
+                self.assertEqual(source.buffer.layout.strides, in_strides)
+                self.assertEqual(step.out.extent, extent)
+                self.assertEqual(step.out.buffer.layout.strides, out_strides)
+                self.assertTrue(step.store)
+                elem = "f32" if fp32 else "f16"
+                self.assertEqual(
+                    (source.elems.storage, step.out.elems.storage), (elem, elem)
+                )
+
+    def test_refusals(self):
+        refusals = {
+            "relayout-tiling": {"divisions": {"c1": 2}},
+            "relayout-threaded": {"allocations": [None, {"lx": 0}]},
+            "relayout-element-arrangement": {"arrangements": [ElementArrangement.EXX2]},
+        }
+        for label, overrides in refusals.items():
+            with self.subTest(label=label):
+                with self.assertRaises(ktir.Unimplemented) as ctx:
+                    ktir.build_kernel_plan([make_relayout_op_spec(**overrides)])
+                self.assertIn(label, str(ctx.exception))
+
+
+class TestRelayoutDetection(unittest.TestCase):
+    """Whether a copy is a relayout is read off its operands, not its op name."""
+
+    @staticmethod
+    def args(case: str) -> tuple[TensorArg, TensorArg]:
+        spec = make_relayout_op_spec(case)
+        return spec.args[0], spec.args[1]
+
+    def test_every_frontend_layout_is_detected(self):
+        """Each case, restickify or identity, needs its operand moved.
+
+        At fp32 too: detection reads the coordinates, whose stick divisor is 32.
+        """
+        for fp32, table in ((False, RELAYOUT_CASES), (True, RELAYOUT_CASES_FP32)):
+            for case in table:
+                with self.subTest(case=case, fp32=fp32):
+                    spec = make_relayout_op_spec(case, fp32=fp32)
+                    self.assertTrue(needs_relayout(spec.args[0], spec.args[1]))
+
+    def test_aligned_and_broadcast_operands_are_not_relayouts(self):
+        """A reshape or broadcast (or nothing) lines these up, so no move."""
+        aligned = make_op_spec(IDENTITY_OP, inputs=1)
+        row = make_broadcast_op_spec("row")
+        for name, (source, out) in (
+            ("aligned", (aligned.args[0], aligned.args[1])),
+            ("row-broadcast", (row.args[1], row.args[2])),
+        ):
+            with self.subTest(operand=name):
+                self.assertFalse(needs_relayout(source, out))
+
+    def test_alignment_refuses_exactly_the_two_restickify_cases(self):
+        """The permute and the moved stick are refused as needing a restickify."""
+        c0, c1 = _C0, _C1
+        floor, mod = sympy.floor, sympy.Mod
+        permute = ([c1, c0, mod(c1, 64)], [8, 4, 64], [c0, c1, mod(c1, 64)], [4, 8, 64])
+        moved_stick = (
+            [floor(c0 / 64), c1, mod(c0, 64)],
+            [2, 64, 64],
+            [floor(c1 / 64), c0, mod(c1, 64)],
+            [1, 128, 64],
+        )
+        for name, case in (("permute", permute), ("moved-stick", moved_stick)):
+            with self.subTest(case=name):
+                with self.assertRaisesRegex(NotImplementedError, "restickify"):
+                    align_reshape_plan(*case)
+
+    def test_an_unclassifiable_coordinate_raises_instead_of_reporting(self):
+        """An unknown coordinate is an error, not a relayout.
+
+        ``needs_relayout`` returns a bool for the two restickify cases and must
+        not turn ``_dim_info``'s refusal into ``True``.
+        """
+        c0, c1 = _C0, _C1
+        mod = sympy.Mod
+        spec = make_op_spec(
+            IDENTITY_OP,
+            inputs=1,
+            sizes=[[4, 64], [4, 64]],
+            coords_per_arg=[[2 * c0 + 1, mod(c1, 64)], [c0, mod(c1, 64)]],
+            space={c0: (4, 1), c1: (64, 1)},
+        )
+        with self.assertRaisesRegex(NotImplementedError, "classification"):
+            needs_relayout(spec.args[0], spec.args[1])
+
+    def test_a_unit_axis_swap_is_detected_and_relayout_accepts_it(self):
+        """A size-1 bare axis moved past the stick axis: detected, and copied.
+
+        Alignment counts the unit axis among the matched ones, so it reports a
+        permute although no element moves; ``relayout_strides`` builds a valid
+        (trivial) view for it, so a copy still goes through.
+        """
+        c0, c1 = _C0, _C1
+        floor, mod = sympy.floor, sympy.Mod
+        source = ([c1, floor(c0 / 64), mod(c0, 64)], [1, 2, 64])
+        out = ([floor(c0 / 64), c1, mod(c0, 64)], [2, 1, 64])
+        with self.assertRaisesRegex(NotImplementedError, "restickify"):
+            align_reshape_plan(source[0], source[1], out[0], out[1])
+        extent, _in_strides, _out_strides = relayout_strides(
+            source[0], source[1], out[0], out[1], {c0: 128, c1: 1}
+        )
+        self.assertEqual(math.prod(extent), 128)
+
+    def test_an_identity_permute_builds_a_relayout_step(self):
+        """``identity`` with permuted operands reaches the strided copy."""
+        _op, (in_size, in_coords), (out_size, out_coords), ranges = RELAYOUT_CASES[
+            "p102_4x8x64"
+        ]
+        extent, in_strides, out_strides = relayout_strides(
+            in_coords, in_size, out_coords, out_size, ranges
+        )
+        plan = ktir.build_kernel_plan([make_relayout_op_spec("p102_4x8x64")])
+        [step] = plan.steps
+        self.assertIs(step.surface, ktir.Surface.GENERIC)
+        [(_name, source)] = step.ins
+        self.assertEqual(source.buffer.layout.strides, in_strides)
+        self.assertEqual(step.out.buffer.layout.strides, out_strides)
+        self.assertNotEqual(list(in_strides), row_major_strides(extent))
+
+    def test_a_same_layout_copy_is_a_plain_copy(self):
+        """Aligned operands take the pointwise path, for either copy op.
+
+        The copy payload is a body written here, so the pointwise path states it
+        as a generic with identity maps over row-major views -- no strided read.
+        """
+        for op in (IDENTITY_OP, RESTICKIFY_OP):
+            with self.subTest(op=op):
+                spec = make_op_spec(op, inputs=1)
+                plan = ktir.build_kernel_plan([spec])
+                [step] = plan.steps
+                rank = len(spec.args[-1].device_size)
+                identity = tuple(range(rank))
+                self.assertIs(step.surface, ktir.Surface.GENERIC)
+                self.assertEqual(step.indexing.maps, (identity, identity))
+                [(_name, source)] = step.ins
+                for access in (source, step.out):
+                    self.assertEqual(
+                        list(access.buffer.layout.strides),
+                        row_major_strides(access.extent),
+                    )
+
+    def test_a_compute_op_on_a_permuted_operand_keeps_its_compute(self):
+        """``exp(x.T)`` reads ``x`` through the relayout's strides and is an ``exp``.
+
+        The input view is the one the restickify of the same layout gets, and
+        the payload is ``exp``'s, not a copy's: the relayout is in the view, the
+        compute is the op's.
+        """
+        for case, fp32, (
+            loop_bounds,
+            in_strides,
+            out_strides,
+        ) in TestRelayout().expectations():
+            with self.subTest(case=case, fp32=fp32):
+                spec = make_relayout_op_spec(case, fp32=fp32, op="exp")
+                [step] = ktir.build_kernel_plan([spec]).steps
+                self.assertEqual(step.op, "exp")
+                self.assertIs(step.surface, ktir.Surface.GENERIC)
+                [(_name, source)] = step.ins
+                self.assertEqual(source.extent, loop_bounds)
+                self.assertEqual(source.buffer.layout.strides, in_strides)
+                self.assertEqual(step.out.buffer.layout.strides, out_strides)
+
+    def test_a_padded_transpose_is_refused_by_relayout(self):
+        """Detected as a relayout, then refused because a stick would be padded."""
+        c0, c1 = _C0, _C1
+        floor, mod = sympy.floor, sympy.Mod
+        spec = make_op_spec(
+            IDENTITY_OP,
+            inputs=1,
+            sizes=[[1, 64, 64], [1, 32, 64]],
+            coords_per_arg=[
+                [floor(c0 / 64), c1, mod(c0, 64)],
+                [floor(c1 / 64), c0, mod(c1, 64)],
+            ],
+            space={c0: (32, 1), c1: (64, 1)},
+        )
+        self.assertTrue(needs_relayout(spec.args[0], spec.args[1]))
+        with self.assertRaisesRegex(NotImplementedError, "padded|range"):
+            ktir.build_kernel_plan([spec])
+
+    def test_an_lx_certified_identity_is_refused(self):
+        """A move between scratchpad owners is neither a copy nor a relayout."""
+        head = sympy.Symbol("c0")
+        owner = {head: sympy.Symbol("core_id")}
+        divisions = [
+            TensorWorkDivision({head: 2}, owner),
+            TensorWorkDivision({head: 1}, {head: sympy.Integer(0)}),
+        ]
+        spec = make_op_spec(
+            IDENTITY_OP,
+            inputs=1,
+            allocations=[{"lx": 0}, {"lx": 0}],
+            op_info={LX_RELAYOUT_INFO_KEY: True},
+        )
+        for arg, division in zip(spec.args, divisions):
+            arg.work_division = division
+        with self.assertRaises(ktir.Unimplemented) as ctx:
+            ktir.build_kernel_plan([spec])
+        self.assertIn("lx-relayout", str(ctx.exception))
+
+
+def make_add_transpose_spec(
+    relayouted: tuple[int, ...],
+    *,
+    square_dim_size: int = 128,
+    lanes_per_stick: int = 64,
+    names: list | None = None,
+) -> OpSpec:
+    """``c = a + b`` on ``[square_dim_size] * 2``, with the inputs in ``relayouted``
+    stored transposed relative to ``c``.
+
+    ``c`` keeps its stick on ``c1``; a relayouted input keeps its stick on
+    ``c0``, the layout the frontend gives ``b`` in ``a + b.T``.  At
+    ``lanes_per_stick=32`` the format is fp32.
+    """
+    c0, c1 = _C0, _C1
+    floor, mod = sympy.floor, sympy.Mod
+    lanes = lanes_per_stick
+    physicalized_tensor_size = [square_dim_size // lanes, square_dim_size, lanes]
+    like_c = [floor(c1 / lanes), c0, mod(c1, lanes)]
+    transposed = [floor(c0 / lanes), c1, mod(c0, lanes)]
+    in_coords = [transposed if i in relayouted else like_c for i in range(2)]
+    return make_op_spec(
+        "add",
+        inputs=2,
+        names=names,
+        sizes=[physicalized_tensor_size] * 3,
+        coords_per_arg=[*in_coords, like_c],
+        space={c0: (square_dim_size, 1), c1: (square_dim_size, 1)},
+        dtype=DataFormats.IEEE_FP32 if lanes == 32 else FP16,
+    )
+
+
+class TestRelayoutOnAPointwiseOp(unittest.TestCase):
+    """``c = a + b.T``: a relayout is a property of each input, not of the op.
+
+    Every input is viewed over one loop nest in ``c``'s order, an input laid
+    out like ``c`` at ``c``'s own strides, and the op keeps its own spelling:
+    ``add`` is the named ``linalg.add``.  The strides are worked by hand for
+    ``[128, 128]``: ``c`` and an aligned input are row-major over the nest, and
+    ``b``'s address ``floor(c0/L)*S + c1*L + c0 % L`` (``L`` lanes per stick,
+    ``S = 128 * L``) puts ``c1``'s stick and lane loops at ``L*L`` and ``L``,
+    and ``c0``'s at ``S`` and ``1``.
+    """
+
+    # lanes_per_stick -> (loop_bounds, c's strides, b's strides)
+    EXPECTED = {
+        64: ((2, 2, 64, 64), (8192, 4096, 64, 1), (4096, 8192, 1, 64)),
+        32: ((4, 4, 32, 32), (4096, 1024, 32, 1), (1024, 4096, 1, 32)),
+    }
+
+    def step(self, relayouted, **kwargs):
+        [step] = ktir.build_kernel_plan(
+            [make_add_transpose_spec(relayouted, **kwargs)]
+        ).steps
+        return step
+
+    def test_either_input_may_be_the_relayouted_one(self):
+        """The relayouted input gets ``b``'s strides, the other ``c``'s, either way."""
+        for lanes, (loop_bounds, c_strides, b_strides) in self.EXPECTED.items():
+            for relayouted in ((0,), (1,)):
+                with self.subTest(lanes_per_stick=lanes, relayouted=relayouted):
+                    step = self.step(relayouted, lanes_per_stick=lanes)
+                    self.assertEqual(step.op, "add")
+                    for position, (_name, access) in enumerate(step.ins):
+                        self.assertEqual(access.extent, loop_bounds)
+                        self.assertEqual(
+                            access.buffer.layout.strides,
+                            b_strides if position in relayouted else c_strides,
+                        )
+                    self.assertEqual(step.out.extent, loop_bounds)
+                    self.assertEqual(step.out.buffer.layout.strides, c_strides)
+
+    def test_two_relayouted_inputs_are_refused(self):
+        """Only one input is read through a relayout's strides.
+
+        A second would need the loop nest refined for both inputs at once, which
+        the single-input ``relayout_strides`` does not build.
+        """
+        with self.assertRaisesRegex(NotImplementedError, "2 inputs laid out"):
+            ktir.build_kernel_plan([make_add_transpose_spec((0, 1))])
+
+    def test_add_stays_the_named_linalg_add(self):
+        """The op is spelled as an aligned ``add`` is: ``linalg.add``, no maps."""
+        step = self.step((1,))
+        self.assertIs(step.surface, ktir.Surface.BARE)
+        self.assertIsNone(step.indexing)
+
+    def test_an_aligned_add_does_not_take_the_relayout_path(self):
+        """With no input relayouted, the add keeps its ordinary rank-3 views."""
+        step = self.step(())
+        self.assertIs(step.surface, ktir.Surface.BARE)
+        for _name, access in (*step.ins, (None, step.out)):
+            self.assertEqual(access.extent, (2, 128, 64))
+
+    def test_one_buffer_read_in_two_layouts_is_refused(self):
+        """``x + x.T``: one buffer cannot have two views in one stage."""
+        with self.assertRaisesRegex(NotImplementedError, "two layouts"):
+            ktir.build_kernel_plan(
+                [make_add_transpose_spec((1,), names=["x", "x", "c"])]
+            )
 
 
 class TestBroadcastOperands(unittest.TestCase):
