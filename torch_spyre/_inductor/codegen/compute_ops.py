@@ -1510,7 +1510,12 @@ def generate_sdsc(
                 },
                 "coreFoldProp_": {"factor_": sdsc_spec.num_cores, "label_": "core"},
                 "coreletFoldProp_": {"factor_": 1, "label_": "corelet"},
-                "numCoresUsed_": len(active_core_ids),
+                # The SuperDSC count covers the positional core fold, including
+                # its unused positions. The nested DSC count and coreIdsUsed_
+                # still describe only the cores that execute this operation.
+                # A smaller top-level count aliases runtime correction symbols
+                # for nonadjacent cores in a sparse HBM output copy.
+                "numCoresUsed_": sdsc_spec.num_cores,
                 "coreIdToDsc_": {str(c): 0 for c in active_core_ids},
                 # The top-level map is the operation schedule. Each shuffle
                 # tensor's physical owners are carried separately on its
