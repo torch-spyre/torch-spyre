@@ -24,9 +24,13 @@ test_suite_config:
             - TestIndexing::test_out_of_bound_index
             - TestIndexing::test_setitem_expansion_error
             - TestIndexing::test_single_int
-            - TestIndexing::test_unravel_index_errors
             - TestIndexing::test_zero_dim_index
           mode: mandatory_success
+        # torch.unravel_index calls floor_divide, which now runs, and then remainder, which is not
+        # registered: Could not run 'aten::remainder.Tensor_out'. https://github.com/torch-spyre/torch-spyre/issues/4416
+        - names:
+            - TestIndexing::test_unravel_index_errors  # issue 4416
+          mode: xfail  # xfail: Could not run 'aten::remainder.Tensor_out'
         # Upstream regression: test_boolean_assignment_value_mismatch now fails on the Spyre
         # backend. The int64->float32 dtype cast lowers to spyre.to_dtype_cpu, whose output
         # FallbackKernel lacks a FixedTiledLayout, raising torch._inductor.exc.InductorError.
@@ -36,7 +40,7 @@ test_suite_config:
 
         # The slice itself succeeds; the assertEqual that follows compares int64 tensors and
         # compile fails with "abs on DataFormats.IEEE_INT32".
-        # No open issue yet: https://github.com/torch-spyre/torch-spyre/issues/6199
+        # https://github.com/torch-spyre/torch-spyre/issues/6199
         - names:
             - TestIndexing::test_step  # issue 6199
             - TestIndexing::test_variable_slicing  # issue 6199
@@ -106,8 +110,8 @@ test_suite_config:
             - TestIndexing::test_multiple_byte_mask  # issue 1219, 4498
           mode: xfail  # xfail: Spyre aten::index.Tensor supports only x[index] with a single 1-D int32/int64 index tensor on dim 0
 
-        # Skipped, not xfail: this test puts the Spyre runtime stream into an error state
-        # ([flex_runtime_stream] ERRR) even though it is reported as XFAIL. Every later test
+        # Skipped, not xfail: an xfail would run the body, which puts the Spyre runtime stream
+        # into an error state ([flex_runtime_stream] ERRR) even though it is reported as XFAIL. Every later test
         # that touches the device then fails with "StreamInErrorState: cannot launch H2D"
         # (e.g. test_index_tensor_empty_indices, test_invalid_index, test_single_int).
         # The mask-indexing form it uses is the one in
@@ -309,7 +313,7 @@ test_suite_config:
         # ---------------------------------------------------------------------------
         # Error-type validation. CPU raises IndexError / RuntimeError from its own argument
         # checks; Spyre's aten::index.Tensor raises NotImplementedError first, so the
-        # expected exception type is wrong. No open issue yet: https://github.com/torch-spyre/torch-spyre/issues/6204
+        # expected exception type is wrong. https://github.com/torch-spyre/torch-spyre/issues/6204
         # ---------------------------------------------------------------------------
         - names:
             - NumpyTests::test_boolean_shape_mismatch  # issue 6204
@@ -371,7 +375,7 @@ test_suite_config:
 
         # ---------------------------------------------------------------------------
         # torch.index_add — indirect accumulation via index tensor
-        # test_index_add_large_index_vectorized_path passes on Spyre.
+        # test_index_add_large_index_vectorized_path passes on Spyre (mandatory_success below).
         # Upstream dtype coverage: @dtypes(*all_types_and(torch.half, torch.bfloat16))
         # Active after filter: float16, int64, bfloat16
         # ---------------------------------------------------------------------------

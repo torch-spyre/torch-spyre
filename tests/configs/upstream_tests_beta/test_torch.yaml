@@ -233,9 +233,11 @@ test_suite_config:
         # before the missing op is even reached.
         # Tensor sizes: output [1, 32, 16384, 6144] bfloat16 ≈ 6 GB on device.
         # Observed wall-clock: 1145 s (run N), 890 s (run N-1) — worsening each run.
+        # An xfail would still run the body, so the hang would remain; a skip is the only option.
         # Use mode: skip (not xfail) so CI does not wait for the timeout at all.
         # Remove this entry once aten::index_add.out is implemented on Spyre.
-        # Covered by https://github.com/torch-spyre/torch-spyre/issues/3507
+        # Covered by https://github.com/torch-spyre/torch-spyre/issues/3507 (Enable Tensor.index_add_,
+        # which includes aten::index_add.out). #4538 is a different bug (incorrect bf16 results).
         # ---------------------------------------------------------------------------
         - names:
             - TestTorchDeviceType::test_index_add_large_inputs  # issue 3507
@@ -360,11 +362,12 @@ test_suite_config:
         # ---------------------------------------------------------------------------
         # Failures grouped by the op or condition that raises.
         # ---------------------------------------------------------------------------
-        # aten::masked_fill_.Scalar not registered. https://github.com/torch-spyre/torch-spyre/issues/4356
+        # aten::masked_fill_.Scalar is registered now, but masked_fill_ with a 1-D mask fails in
+        # layout propagation (mixed EA). https://github.com/torch-spyre/torch-spyre/issues/1004
         - names:
-            - TestTorchDeviceType::test_masked_fill_bool_tensor  # issue 4356
-            - TestTorchDeviceType::test_masked_fill_mem_overlap  # issue 4356
-          mode: xfail  # xfail: Could not run 'aten::masked_fill_.Scalar'
+            - TestTorchDeviceType::test_masked_fill_bool_tensor  # issue 1004
+            - TestTorchDeviceType::test_masked_fill_mem_overlap  # issue 1004
+          mode: xfail  # xfail: Unsupported: Multi-arg pointwise with mixed EA, STANDARD input must broadcast
         # aten::remainder.Tensor_out not registered. https://github.com/torch-spyre/torch-spyre/issues/4416
         - names:
             - TestTorchDeviceType::test_scalar_check  # issue 4416
@@ -482,11 +485,16 @@ test_suite_config:
         - names:
             - TestTorchDeviceType::test_tensor_shape_empty  # issue 3455
           mode: xfail  # xfail: Unexpected stick expression 30*d0 + 6*d2 + d3
+        # Same assertion in _restickify_restore_elided_dim as https://github.com/torch-spyre/torch-spyre/issues/4404
+        # (there for scatter on fp16), here from cdist on transposed 5-D inputs: expected a size-32
+        # gap dim on the intact operand, got size=7.
+        - names:
+            - TestTorchDeviceType::test_cdist_non_contiguous_batch  # issue 4404
+          mode: xfail  # xfail: AssertionError: restickify restore: expected padding-prepended size-32 gap dim
         # batchmatmul on DataFormats.IEEE_FP32. https://github.com/torch-spyre/torch-spyre/issues/5779
         - names:
             - TestTorchDeviceType::test_cdist_euclidean_large  # issue 5779
             - TestTorchDeviceType::test_cdist_non_contiguous  # issue 5779
-            - TestTorchDeviceType::test_cdist_non_contiguous_batch  # issue 5779
             - TestTorchDeviceType::test_grad_scaling_accumulation  # issue 5779
             - TestTorchDeviceType::test_grad_scaling_clipping  # issue 5779
             - TestTorchDeviceType::test_grad_scaling_multiple  # issue 5779
@@ -586,7 +594,7 @@ test_suite_config:
           mode: xfail  # xfail: the compiled Spyre kernel for aten.eq.Tensor_out re-entered itself
         # Each fn parametrization fails differently, so the test is one entry:
         #   add, div, max, min, mul, sub: assertEqual -> aten::isnan (https://github.com/torch-spyre/torch-spyre/issues/1738)
-        #   masked_fill: aten::masked_fill_.Scalar (https://github.com/torch-spyre/torch-spyre/issues/4356)
+        #   masked_fill: assertEqual -> aten::isnan (https://github.com/torch-spyre/torch-spyre/issues/1738)
         #   remainder: aten::remainder.Tensor_out (https://github.com/torch-spyre/torch-spyre/issues/4416)
         #   masked_select: aten::masked_select (https://github.com/torch-spyre/torch-spyre/issues/4371)
         #   masked_scatter: masked_scatter needs a mask broadcast along the last dim (https://github.com/torch-spyre/torch-spyre/issues/4437)
