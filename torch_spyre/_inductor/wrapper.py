@@ -28,6 +28,7 @@ from torch._inductor.sizevars import SizeVarAllocator
 
 from .errors import Unsupported
 from .ir import FixedTiledLayout
+from .reserved_dims_contract import output_reserved_dims
 from .sharded_hbm import placement_of
 
 

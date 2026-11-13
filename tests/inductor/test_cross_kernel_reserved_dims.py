@@ -167,14 +167,16 @@ class TestCrossKernelContract(unittest.TestCase):
 
     @expects_raise
     def test_second_kernel_is_refused_without_the_stamp(self):
-        # The counterpart of the test above: with the stamp switched off, the
-        # second kernel's loop count has no upper bound and cannot be built.
+        # The counterpart of the test above: with the stamp switched off, mid
+        # carries no reserved_dims, so the second kernel's for_each_tile count
+        # is over an undeclared symbol and require_declared_count refuses it
+        # first
         x, _ = declared_input(MIN_ROWS)
         with mock.patch.object(wrapper, "output_reserved_dims", return_value=None):
             mid = compiled(tiled_sum)(x)
         self.assertIsNone(get_reserved_dims(mid))
 
-        with pytest.raises(InductorError, match="no finite upper bound"):
+        with pytest.raises(InductorError, match="declaration covers"):
             compiled(tiled_triple)(mid)
 
     def test_chain_is_correct_at_every_legal_size(self):
@@ -201,11 +203,16 @@ class TestCrossKernelContract(unittest.TestCase):
 
     @expects_raise
     def test_output_with_two_symbolic_dims_is_refused(self):
-        # Reservations cover one dim today, so a second symbolic dim has no home.
+        # Reservations cover one dim today, so a second symbolic dim has no
+        # home. Combining two declared dims outside for_each_tile is refused
+        # before output_reserved_dims's own "more than one symbolic dim" check
+        # is ever reached; that
+        # check is exercised directly by
+        # test_reserved_dims_propagation.py::test_more_than_one_symbolic_dim_is_refused.
         a, _ = declared_input(MIN_ROWS)
         b, _ = declared_input(MIN_ROWS)
 
-        with pytest.raises(InductorError, match="more than one symbolic dim"):
+        with pytest.raises(InductorError, match="outside any for_each_tile loop"):
             compiled(lambda a, b: a.unsqueeze(1) + b.unsqueeze(0))(a, b)
 
 
