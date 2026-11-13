@@ -87,7 +87,6 @@ from .span_overflow_loop_terms import (
     _apply_edit,
     _plan_carries,
     _taken_symbols,
-    access_step,
     mint_induction,
 )
 
@@ -235,7 +234,6 @@ def _extent(op: ComputedBuffer, tiled: TiledDim, trip: sympy.Integer) -> sympy.I
 
 
 def _tile_step(
-    graph: Any,
     op: ComputedBuffer,
     tiled: TiledDim,
     dep: MemoryDep,
@@ -255,7 +253,16 @@ def _tile_step(
     symbol = SpyreKernel._host_dim_to_index_symbol(op, key)
     if symbol not in dep.index.free_symbols:
         return sympy.S.Zero
-    return access_step(dep.index, symbol, extent, sympy.S.Zero)
+    # The delta of the whole index over one trip, which must be a number: the
+    # coefficient at one point is not the step of an index that is only partly affine
+    # in the symbol (``d0 + 7*floor(d0/8)``), and a symbolic one (``d0*d1``) has none.
+    delta = sympy.simplify(dep.index.subs(symbol, symbol + extent) - dep.index)
+    if delta.free_symbols:
+        raise Unsupported(
+            f"lower_loop_tiling: the index {dep.index} of {dep.name} is not affine in "
+            f"{symbol} with a numeric step, so the loop has no per-trip advance for it."
+        )
+    return delta
 
 
 @dataclass
@@ -340,6 +347,22 @@ def _facts(
         full_ranges = list(member.data.ranges)
         for d, loop_var_range in _loop_var_hinted_ranges(member).items():
             full_ranges[d] = full_ranges[d] * loop_var_range
+        if tiled is None:
+            reads_a_tile = sorted(
+                {
+                    d.name
+                    for d in op_read_writes(member).reads
+                    if isinstance(d, MemoryDep)
+                }
+                & scratch_names
+            )
+            if reads_a_tile:
+                raise Unsupported(
+                    f"lower_loop_tiling: the loop does not tile {name}, but it reads "
+                    f"{reads_a_tile}, the tile of a member it does tile: that buffer "
+                    "is rewritten every trip and is smaller than the range "
+                    f"{name} iterates."
+                )
         if tiled:
             extent = _extent(member, tiled, trip)
             rw = op_read_writes(member)
@@ -349,7 +372,7 @@ def _facts(
                 step = (
                     sympy.S.Zero
                     if dep.name in scratch_names
-                    else _tile_step(graph, member, tiled, dep, extent)
+                    else _tile_step(member, tiled, dep, extent)
                 )
                 if read_steps.setdefault(dep.name, step) != step:
                     raise Unsupported(
@@ -360,7 +383,7 @@ def _facts(
             if kind == "copy_out":
                 if not writes:
                     raise Unsupported(f"lower_loop_tiling: {name} has no write.")
-                write_step = _tile_step(graph, member, tiled, writes[0], extent)
+                write_step = _tile_step(member, tiled, writes[0], extent)
                 if write_step == 0:
                     raise Unsupported(
                         f"lower_loop_tiling: the tiled dim of {name} is not in "
