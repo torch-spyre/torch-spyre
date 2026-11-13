@@ -240,8 +240,6 @@ register_fallback_default(
         aten.bitwise_xor.Tensor_out,
         aten.bitwise_or.Tensor,
         aten.bitwise_or.Tensor_out,
-        aten.argmax.default,
-        aten.argmin.default,
         aten.where.default,
     ]
 )

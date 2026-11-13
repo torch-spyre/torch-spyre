@@ -94,6 +94,8 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 | `torch.max` | Y | Y | Spyre | `max.dim` via custom decomposition; int64 falls back to CPU |
 | `torch.min` | | Y | Spyre | `min.dim` via custom decomposition; eager `aten::min.dim_min` is not yet supported; int64 falls back to CPU |
 | `torch.topk` | | Y | Spyre | Custom decomposition + custom ops (`spyre::topkvalue`, `spyre::topkindex`) |
+| `torch.argmax` | Y | Y | Spyre | Via k=1 `spyre::topkindex` |
+| `torch.argmin` | Y | Y | Spyre | As `torch.argmax` |
 | `torch.linalg.vector_norm` | | Y | Spyre | Compiled only; eager misroutes the `ord` argument |
 | `torch.linalg.matrix_norm` | | Y | Spyre | Compiled only; eager misroutes the `ord` argument |
 | `torch.linalg.norm` | | Y | Spyre | Compiled only; eager misroutes the `ord` argument |
@@ -150,8 +152,6 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 | `torch.isin` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.bitwise_xor` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.bitwise_or` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
-| `torch.argmax` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
-| `torch.argmin` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 
 > **Column key:**
 >
