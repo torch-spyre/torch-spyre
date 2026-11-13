@@ -171,6 +171,27 @@ def _(x: torch.Tensor, k: int, dim: int) -> torch.Tensor:
     return x.new_empty(out_size, dtype=x.dtype)
 
 
+@torch.library.custom_op("spyre::to_int_floored", mutates_args=(), device_types="spyre")
+def to_int_floored(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Convert a tensor to an integer dtype, rounding toward -inf.
+
+    The device's own float -> int conversion, without the trunc a cast adds to
+    round toward zero: exact for integer-valued input such as a topk index, and
+    it saves the trunc's ops there. dtype is torch.int32 or torch.int64.
+    """
+    pass
+
+
+@to_int_floored.register_fake
+def _(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    return x.new_empty(x.size(), dtype=dtype)
+
+
+@torch.library.register_kernel("spyre::to_int_floored", ["cpu"])
+def to_int_floored_cpu(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    return torch.floor(x).to(dtype)
+
+
 @torch.library.custom_op("spyre::keep_by_index", mutates_args=(), device_types="spyre")
 def keep_by_index(
     values: torch.Tensor,

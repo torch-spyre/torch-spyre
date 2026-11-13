@@ -62,6 +62,7 @@ test_suite_config:
             - TestOps::test_int32_int64_.*
             - TestOps::test_gather_staggered_index_amax.*
             - TestOps::test_trunc_.*
+            - TestOps::test_to_int_floored_.*
             - TestOps::test_add_constant.*
             - TestOps::test_repeat.*
             # multiops split test

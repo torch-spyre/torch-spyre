@@ -909,6 +909,14 @@ def lower_topkvalue(x, k, dim):
     return result
 
 
+@register_spyre_lowering(torch.ops.spyre.to_int_floored)
+def lower_to_int_floored(x, dtype):
+    if dtype not in (torch.int32, torch.int64):
+        raise Unsupported(f"to_int_floored to {dtype}: expected int32 or int64")
+    # The device conversion floors, so skipping the trunc gives floor.
+    return to_dtype(x, dtype, skip_trunc=True)
+
+
 @register_spyre_lowering(torch.ops.spyre.topkindex)
 def lower_topkindex(x, k, dim):
     result = Reduction.create(

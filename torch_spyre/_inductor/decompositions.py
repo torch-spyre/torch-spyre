@@ -2823,6 +2823,100 @@ def spyre_max_dim_decomp(input, dim, keepdim=False):
         return torch.return_types.max((values, indices))
 
 
+# float16 and bfloat16 are both DLFloat16 on the device, whose index is exact up
+# to 1024: a row this long is ranked as is, a longer one is upcast to float32.
+_ARG_REDUCE_DL16_MAX_ELEMENTS = 1024
+
+
+def _topk_index_fp32(x: torch.Tensor, dim: int, largest: bool) -> torch.Tensor:
+    """k=1 topk index of an fp32 tensor: the largest (or smallest) element.
+
+    The device topk returns equal values lowest index first and ranks a positive
+    NaN above every number, so a NaN wins as in PyTorch. For the smallest, x is
+    negated; negating a NaN on the device sets its sign bit, which the device
+    ranks below every number, so NaN positions are written as positive NaN.
+    abs(x) <= inf is false only for a NaN.
+    """
+    if not largest:
+        x = torch.where(x.abs() <= float("inf"), -x, float("nan"))
+    return torch.ops.spyre.topkindex(x, 1, dim)
+
+
+def _topk_index_dl16(x: torch.Tensor, dim: int, largest: bool) -> torch.Tensor:
+    """k=1 topk index of a float16/bfloat16 tensor, a NaN found by its own topk.
+
+    Both dtypes are DLFloat16 on the device. Its topk returns equal values
+    lowest index first but does not rank a NaN, so the first NaN comes from a
+    topk of the NaN mask, the best number from a topk of the values with NaN set
+    to -inf, and a where picks the NaN index for a row that holds one. The index
+    is in the input dtype, exact up to 1024.
+    """
+    # TODO: rank a NaN above every number in DLFloat16 topkindex, as fp32 does;
+    # then this is a single topk like _topk_index_fp32.
+    is_nan = ~(x.abs() <= float("inf"))
+    nan_mask = is_nan.to(x.dtype)
+    nan_index = torch.ops.spyre.topkindex(nan_mask, 1, dim)
+    has_nan = torch.amax(nan_mask, dim=dim, keepdim=True) > 0
+    values = torch.where(is_nan, float("-inf"), x if largest else -x)
+    value_index = torch.ops.spyre.topkindex(values, 1, dim)
+    return torch.where(has_nan, nan_index, value_index)
+
+
+def _arg_reduce(
+    input: torch.Tensor, dim: Optional[int], keepdim: bool, largest: bool
+) -> torch.Tensor:
+    """argmax (largest) or argmin of ``input`` along ``dim``, as PyTorch picks it.
+
+    The lowest index wins among equal values, and a NaN wins over any number.
+    The index is a k=1 topk index converted to int64. A float16/bfloat16 row of at
+    most 1024 elements is ranked as is; a longer one is upcast to float32, whose
+    index is exact past 1024. ``dim=None`` ranks a 1-D tensor.
+    """
+    if input.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        # TODO: integer inputs; an fp32 upcast is not exact past 2**24.
+        raise Unsupported(f"argmax/argmin of {input.dtype}")
+    if dim is None:
+        if input.dim() > 1:
+            # TODO: support it; flattening the input does not compile today (#5850).
+            raise Unsupported("argmax/argmin with dim=None of a multi-dim tensor")
+        shape = [1] * input.dim() if keepdim else []
+        return _arg_reduce(input.reshape(-1), 0, False, largest).reshape(shape)
+    if input.dim() == 0 or input.shape[dim] == 1:
+        # A single candidate is the answer. topkindex of a size-1 dim returns
+        # the value instead of index 0.
+        shape = list(input.shape)
+        if input.dim() > 0:
+            if keepdim:
+                shape[dim] = 1
+            else:
+                del shape[dim]
+        return input.new_zeros(shape, dtype=torch.int64)
+    if input.dtype == torch.float32:
+        index = _topk_index_fp32(input, dim, largest)
+    elif input.shape[dim] <= _ARG_REDUCE_DL16_MAX_ELEMENTS:
+        index = _topk_index_dl16(input, dim, largest)
+    else:
+        index = _topk_index_fp32(input.to(torch.float32), dim, largest)
+    if not keepdim:
+        index = index.squeeze(dim)
+    # The index is integer-valued, so flooring converts it exactly.
+    return torch.ops.spyre.to_int_floored(index, torch.int64)
+
+
+@register_spyre_decompositions([torch.ops.aten.argmax.default])
+def spyre_argmax(
+    input: torch.Tensor, dim: Optional[int] = None, keepdim: bool = False
+) -> torch.Tensor:
+    return _arg_reduce(input, dim, keepdim, largest=True)
+
+
+@register_spyre_decompositions([torch.ops.aten.argmin.default])
+def spyre_argmin(
+    input: torch.Tensor, dim: Optional[int] = None, keepdim: bool = False
+) -> torch.Tensor:
+    return _arg_reduce(input, dim, keepdim, largest=False)
+
+
 @register_spyre_decompositions([torch.ops.aten.min.dim])
 def spyre_min_dim_decomp(input, dim, keepdim=False):
     """
