@@ -585,7 +585,19 @@ class JobPlanStepHostCompute final : public JobPlanStep {
     handle_ = flex::createHostComputeHandle(std::move(hcm));
   }
 
-  void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
+  void construct(LaunchContext& ctx, const SpyreStream& stream) const override {
+    construct(ctx, stream, nullptr);
+  }
+
+  /**
+   * @brief Construct host compute step with an optional explicit DMA stream.
+   *
+   * Runs the host compute calculation on @p stream and submits any unbatched
+   * correction H2D transfer to @p dma_stream (or @p stream if @p dma_stream is
+   * nullptr).
+   */
+  void construct(LaunchContext& ctx, const SpyreStream& stream,
+                 const SpyreStream* dma_stream) const;
 
   void write(std::ostream& os) const override;
 
