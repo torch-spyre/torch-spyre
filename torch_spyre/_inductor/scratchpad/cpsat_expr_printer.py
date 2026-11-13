@@ -60,6 +60,11 @@ _CORE_INV_SCALE = 1024
 _CORE_INV_SCALE_MAX_VALUE = 32
 # constant limit on product terms to avoid int32 overflow in CP-SAT
 _MAX_PRODUCT_BOUND = 2**30
+# Relative miss at a candidate past which RDP keeps it as a breakpoint of a
+# fractional power's piecewise-linear lowering (see _SympyExprToCpSat._pwl).
+_PWL_TOLERANCE = 0.01
+# Most breakpoints a lowered power may take; past it the lowering raises.
+_PWL_MAX_KNOTS = 64
 
 
 _operator_map = {
@@ -473,27 +478,8 @@ class _SympyExprToCpSat(Printer):
         elif expr.func == sympy.Pow:
             if not self._is_split_sym(arg):
                 return expr
-            # Core splits only: a tile count can exceed 32.
-            if (
-                expr.exp.is_Number
-                and math.isclose(expr.exp, 0.25)
-                and arg.name.startswith("split_")
-            ):
-                # Discrete piecewise linear approximation of x^(1/4) over the interval [1, 32],
-                # pinned to return 1 at x=1, generated using tools/approximate-power.py.
-                # since we check that the base is a _split_ symbol, it is an integer in the
-                # range [1, 32]
-                # Max 4.5% deviation for two segments;
-                # we would get:
-                #   max 1.6% deviation with 3 segments;
-                #   max 0.074% deviation with 8 segments;
-                #   max 0.019% deviation with 12 segments;
-                #   no deviation with 16 segments.
-                # script at https://github.com/user-attachments/files/31975789/approximate-power.py
-                return sympy.Piecewise(
-                    (0.139980295504224 * arg + 0.860019704495776, arg <= 5),
-                    (0.0287191888771944 * arg + 1.45940018593522, True),
-                )
+            if expr.exp.is_Number and not expr.exp.is_Integer:
+                return self._power_pwl(expr)
             if expr.exp == -1:
                 return sympy.Symbol(
                     f"inv_{arg.name}", integer=True, nonnegative=True
@@ -520,6 +506,63 @@ class _SympyExprToCpSat(Printer):
                 result *= math.prod([arg for arg in expr.args if arg not in symbols])
                 return result
         return expr
+
+    def _candidates(self, sym):
+        """The sorted values a split or tile symbol takes over its buffer's
+        division menu; a split with no menu takes the core range."""
+        _, raw = self._buffer_map.get(sym.name, (None, ()))
+        if raw:
+            return sorted({int(v) for v in raw})
+        if sym.name.startswith("split_"):
+            return list(range(1, _CORE_INV_SCALE_MAX_VALUE + 1))
+        return None
+
+    def _power_pwl(self, expr):
+        """A fractional power of a split or tile symbol as a piecewise-linear
+        function through its candidate values (see :meth:`_pwl`). Left as is
+        when the candidates are unknown or include a pole."""
+        arg, exponent = expr.base, float(expr.exp)
+        xs = self._candidates(arg)
+        if xs is None or (exponent < 0 and xs[0] <= 0):
+            return expr
+        return self._pwl(arg, xs, [x**exponent for x in xs])
+
+    @staticmethod
+    def _pwl(arg, xs, ys):
+        """A piecewise-linear function of ``arg`` through ``(xs, ys)``, the
+        values ``arg`` can take and the function's value at each. Breakpoints
+        are chosen by Ramer-Douglas-Peucker: a candidate becomes one when the
+        segment past it misses by more than _PWL_TOLERANCE, relative. Exact at
+        every breakpoint; raises past _PWL_MAX_KNOTS breakpoints rather than
+        lowering a coarser function."""
+        if len(xs) == 1:
+            return sympy.Float(ys[0])
+        keep = {0, len(xs) - 1}
+        stack = [(0, len(xs) - 1)]
+        while stack:
+            lo, hi = stack.pop()
+            slope = (ys[hi] - ys[lo]) / (xs[hi] - xs[lo])
+            worst, at = 0.0, None
+            for i in range(lo + 1, hi):
+                miss = abs(ys[lo] + slope * (xs[i] - xs[lo]) - ys[i]) / max(
+                    abs(ys[i]), 1e-300
+                )
+                if miss > worst:
+                    worst, at = miss, i
+            if at is not None and worst > _PWL_TOLERANCE:
+                keep.add(at)
+                stack += [(lo, at), (at, hi)]
+        if len(keep) > _PWL_MAX_KNOTS:
+            raise ValueError(
+                f"{len(keep)} breakpoints for {arg} past the {_PWL_MAX_KNOTS} limit"
+            )
+        points = sorted(keep)
+        pieces = []
+        for lo, hi in zip(points, points[1:]):
+            slope = (ys[hi] - ys[lo]) / (xs[hi] - xs[lo])
+            line = slope * arg + (ys[lo] - slope * xs[lo])
+            pieces.append((line, True if hi == points[-1] else arg <= xs[hi]))
+        return sympy.Piecewise(*pieces)
 
     @classmethod
     def _piecewise_canonical(cls, expr):
