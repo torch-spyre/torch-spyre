@@ -293,9 +293,9 @@ every division scores identically and the search has nothing left to optimize on
 side that traffic term is the first level of the lexicographic ladder in
 [CpSatLayoutSolver](scratchpad_planning.md#cpsatlayoutsolver), whose later levels break the
 remaining ties by cut count, parallelism, division balance and tile count; CP-SAT also takes
-that ladder when `cost_expr_to_cpsat` cannot lower the expression, and whenever
-`auto_coarse_tiling` is on, since the allocator then withholds the expression (the model is flat
-in tile size and cut count).
+that ladder when `cost_expr_to_cpsat` cannot lower the expression. With `auto_coarse_tiling` on,
+CP-SAT minimizes the same expression, its tile counts priced by the coarse underfill and LX-spill
+derates.
 
 :::{warning}
 Even when the expression survives, parts of the model go quiet. Both engines price the *same*
@@ -303,8 +303,8 @@ expression, built once by the allocator, so both inherit the same limitation: a 
 branch on a decision the solver has not made yet (issue `#4233`). Terms that would branch on a
 still-symbolic shape or residency guard themselves (`_is_sym`, or an
 `isinstance(..., sympy.Basic)` check) and return their neutral value instead — the coarse
-underfill derate (`coarse_underfill_eff`), `_lx_spill_bw_derate` (in its
-`_lx_spill_working_set` helper, not the derate itself), `_matmul_mac_peak`,
+underfill derate (`coarse_underfill_eff`) and `_lx_spill_bw_derate` for a dynamic-shape width
+(a symbolic tile height or residency they price), `_matmul_mac_peak`,
 `_reduction_bw_cores_factor`, the bundled model's split-reread term, and `_eff_bw`'s per-op
 access-pattern overrides, which a symbolic `is_lx` drops back to the default turnaround.
 Nothing raises, and nothing reports it: the plan is just ranked by a model short those
