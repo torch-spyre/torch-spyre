@@ -2369,6 +2369,34 @@ class TestSympyExprToCpSatPrinter(TestCase):
         self.assertIsNone(printer._emit(printer._axes(expr), printer._values(expr)))
         self.assertEqual(len(model.proto.variables), count)
 
+    def test_a_table_linear_in_its_decision_is_a_linear_expression(self):
+        x, resident = sympy.symbols("split_x resident", integer=True)
+        model = cp_model.CpModel()
+        division = model.new_int_var(0, 2, "division")
+        wrapper = types.SimpleNamespace(division=division)
+        var = model.new_int_var(1, 5, "split_x")
+        model.add_element(division, [1, 3, 5], var)
+        lit = model.new_bool_var("resident")
+        printer = _SympyExprToCpSat(
+            model,
+            {"split_x": var, "resident": lit},
+            {"split_x": (wrapper, [1, 3, 5])},
+        )
+        elements = len(model.proto.constraints)
+        # 2*x + 1 over the menu is 3, 7, 11: one step per division index.
+        over_division = printer.convert(sympy.Max(2 * x + 1, 0))
+        over_literal = printer.convert(sympy.Piecewise((5, resident > 0), (2, True)))
+        self.assertEqual(len(model.proto.constraints), elements)
+        for i, flag in itertools.product(range(3), (0, 1)):
+            with self.subTest(division=i, resident=flag):
+                fixed = model.clone()
+                fixed.add(division == i)
+                fixed.add(lit == flag)
+                solver = cp_model.CpSolver()
+                self.assertEqual(solver.solve(fixed), cp_model.OPTIMAL)
+                self.assertEqual(solver.value(over_division), 2 * [1, 3, 5][i] + 1)
+                self.assertEqual(solver.value(over_literal), 5 if flag else 2)
+
     def test_shared_load_penalty_lowers_for_product_degrees(self):
         from torch_spyre._inductor.work_division import _matmul_multicast_penalty
 

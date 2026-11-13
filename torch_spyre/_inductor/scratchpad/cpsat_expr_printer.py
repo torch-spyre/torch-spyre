@@ -280,7 +280,8 @@ class _SympyExprToCpSat(Printer):
         self._axes_cache: dict = {}
         self._values_cache: dict = {}
         self._lookup_cache: dict = {}
-        # Axis id (a division variable's index) -> (variable, size). See _axes.
+        # Axis id (a variable's index) -> (variable, size, is a residency
+        # literal). See _axes.
         self._axis: dict = {}
         super().__init__()
 
@@ -290,10 +291,11 @@ class _SympyExprToCpSat(Printer):
         return self._expr_cache[expr]
 
     def _lower(self, expr, **kwargs):
-        """A node that reads at most one buffer's division is finished as one
-        table: :meth:`_values` evaluates it at every candidate and
-        :meth:`_emit` hands CP-SAT a constant or one ``element`` lookup, and
-        nothing under the node is lowered. Otherwise the printer method for its
+        """A node that reads at most one decision (a buffer's division or a
+        residency literal) is finished as one table: :meth:`_values` evaluates
+        it at every point of that decision and :meth:`_emit` hands CP-SAT a
+        constant, a linear expression or one ``element`` lookup, and nothing
+        under the node is lowered. Otherwise the printer method for its
         type lowers it and recurses into the operands through ``_print``.
 
         Tables evaluate the rewritten expression, including its reciprocal/log
@@ -308,10 +310,10 @@ class _SympyExprToCpSat(Printer):
         return super()._print(expr, **kwargs)
 
     # A table is a node's value at every point of its axis: a buffer's
-    # division index over its enumerated menu.
+    # division index over its enumerated menu, or a residency literal.
 
-    def _add_axis(self, var, size):
-        self._axis.setdefault(var.index, (var, size))
+    def _add_axis(self, var, size, literal=False):
+        self._axis.setdefault(var.index, (var, size, literal))
         return var.index
 
     def _shape(self, axes):
@@ -319,8 +321,8 @@ class _SympyExprToCpSat(Printer):
 
     def _axes(self, expr):
         """The axes ``expr`` is a function of, as a tuple of at most one axis
-        id, or ``None`` when it is not a table: it reads a variable that is no
-        buffer's division, holds a node :data:`_TABLE_OPS` does not evaluate,
+        id, or ``None`` when it is not a table: it reads a variable that is
+        neither a buffer's division nor a residency literal, holds a node :data:`_TABLE_OPS` does not evaluate,
         or reads more than one division."""
         if expr not in self._axes_cache:
             self._axes_cache[expr] = self._find_axes(expr)
@@ -344,8 +346,8 @@ class _SympyExprToCpSat(Printer):
     def _leaf_axes(self, symbol):
         """A symbol's axes, its values recorded in ``_values_cache``: a column
         of its buffer's menu (through the rewrite's reciprocal or log scale for
-        an ``inv_``/``log2_`` symbol) or a division index. A constant has
-        none."""
+        an ``inv_``/``log2_`` symbol), a division index, or a residency
+        literal. A constant has none."""
         name = symbol.name
         mapped = self._sym_map.get(name)
         if isinstance(mapped, (int, float)):
@@ -357,6 +359,9 @@ class _SympyExprToCpSat(Printer):
         if wrapper is None:
             wrapper = self._sym_map.get(f"_division_of_{name}")
             if wrapper is None:
+                if getattr(mapped, "is_boolean", False):
+                    self._values_cache[symbol] = np.arange(2, dtype=float)
+                    return (self._add_axis(mapped, 2, literal=True),)
                 # Domain-only entries set reciprocal scales without a shared
                 # division selector; they are not a table.
                 return None
@@ -393,7 +398,8 @@ class _SympyExprToCpSat(Printer):
         return np.reshape(self._values(expr), shape)
 
     def _emit(self, axes, values):
-        """A table as a CP-SAT expression: a constant or a lookup. None when an
+        """A table as a CP-SAT expression: a constant, a linear expression
+        where the table is linear in its axis, else a lookup. None when an
         entry is not finite -- a pole that a branch's guard excludes, which
         then lowers branch by branch -- or has no exact lookup."""
         values = np.asarray(values)
@@ -401,6 +407,9 @@ class _SympyExprToCpSat(Printer):
             flat = values.ravel()
             if not axes or (flat == flat[0]).all():
                 return bool(flat[0])
+            var, _, literal = self._axis[axes[0]]
+            if literal:
+                return var if flat[1] else var.Not()
             return self._lookup(axes, flat.astype(int))
         values = values.astype(float)
         if not np.isfinite(values).all():
@@ -408,7 +417,22 @@ class _SympyExprToCpSat(Printer):
         flat = values.ravel()
         if not axes or (flat == flat[0]).all():
             return _number(flat[0])
+        linear = self._linear(axes, flat)
+        if linear is not None:
+            return linear
         return self._lookup(axes, flat)
+
+    def _linear(self, axes, flat):
+        """``flat`` as ``offset + slope * axis`` where every step is the same,
+        else None. A table over a literal always is."""
+        steps = np.diff(flat)
+        if not (steps == steps[0]).all():
+            return None
+        (axis,) = axes
+        var, slope, offset = self._axis[axis][0], steps[0], flat[0]
+        if slope == 1 and offset == 0:
+            return var
+        return _number(slope) * var + _number(offset)
 
     def _lookup(self, axes, flat):
         """One ``element`` lookup of a level variable, ``offset + coefficient *
