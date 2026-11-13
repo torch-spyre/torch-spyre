@@ -1079,6 +1079,10 @@ class InputsEdits(BaseModel):
                     except (ValueError, SyntaxError):
                         # If conversion fails, keep as string
                         pass
+                # slice(...) recorded as a string (e.g. 'slice(None, 1, None)');
+                # ast.literal_eval cannot parse it, so use the restricted evaluator.
+                elif isinstance(val, str) and val.startswith("slice("):
+                    val = _eval_py_literal(val)
                 # Tuples and lists are already valid Python values
                 elif isinstance(val, (tuple, list)):
                     pass
