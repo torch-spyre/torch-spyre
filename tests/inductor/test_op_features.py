@@ -38,12 +38,14 @@ import sympy
 
 from torch_spyre._inductor.cost_model import (
     ArgTraffic,
+    CostParams,
     OpFeatures,
     _loop_reread_bytes,
     op_from_dict,
     predict_by_bundle,
     predict_ops,
 )
+from torch_spyre._inductor.scratchpad.allocator import _COST_PARAMS
 from torch_spyre._inductor.scratchpad.plan_solver import CoreDivision
 from torch_spyre._inductor.scratchpad.sa_cooptimizer import _work_slices
 
@@ -202,6 +204,23 @@ class DiscriminationTest(TestCase):
                 )
 
 
+#: The default model with the tile-height derates neutralized as the solver's
+#: ``_COST_PARAMS`` neutralizes them.
+_DERATES_OFF = dataclasses.replace(
+    CostParams(),
+    **{
+        name: getattr(_COST_PARAMS, name)
+        for name in (
+            "coarse_underfill_exp",
+            "coarse_underfill_col_exp",
+            "coarse_underfill_cap",
+            "lx_spill_exp",
+            "mm_spill_ws_exp",
+        )
+    },
+)
+
+
 class SymbolicTiledFeatureTest(TestCase):
     """Coarse-tiled features carrying the co-optimizer's UNDECIDED symbols.
 
@@ -267,7 +286,7 @@ class SymbolicTiledFeatureTest(TestCase):
                     continue
                 op = self._symbolize(op_from_dict(raw))
                 # The bug: this raised TypeError rather than returning anything.
-                expr = sympy.sympify(predict_ops([op]))
+                expr = sympy.sympify(predict_ops([op], _DERATES_OFF))
                 self.assertFalse(
                     self._leaked_symbols(expr),
                     f"{gname}/{bname}: a non-residency symbol leaked into the cost "
@@ -288,7 +307,9 @@ class SymbolicTiledFeatureTest(TestCase):
             raw = next((f for f in b["features"] if f is not None), None)
             if raw is None:
                 continue
-            expr = sympy.sympify(predict_ops([self._symbolize(op_from_dict(raw))]))
+            expr = sympy.sympify(
+                predict_ops([self._symbolize(op_from_dict(raw))], _DERATES_OFF)
+            )
             self.assertFalse(expr.atoms(sympy.Piecewise))
             for pow_ in expr.atoms(sympy.Pow):
                 self.assertEqual(pow_.exp, -1, f"non-invertible power {pow_}")
@@ -449,7 +470,9 @@ class SymbolicTiledFeatureTest(TestCase):
         with patch(
             "torch_spyre._inductor.fusion.estimate_bundles", return_value=[fake_ops]
         ):
-            expr = sympy.sympify(predict_by_bundle(fake_ops, features_by_buffer))
+            expr = sympy.sympify(
+                predict_by_bundle(fake_ops, features_by_buffer, _DERATES_OFF)
+            )
         self.assertFalse(
             self._leaked_symbols(expr),
             "a non-residency symbol leaked into the bundle-level cost",
