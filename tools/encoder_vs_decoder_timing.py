@@ -218,30 +218,31 @@ def run_topology(name: str, args) -> dict | None:
 
 
 def print_phase_times(rounds: list[tuple[dict, dict]]) -> None:
-    """Per round: load, compile and each run pattern, with the 3-stream minus
-    2-stream difference for every row. No averaging across rounds."""
+    """Per round: load, compile and each run pattern, with the 3-stream vs
+    2-stream difference in percent for every row. No averaging across rounds."""
     rows = [
         ("load (s)", lambda r: r["load_s"]),
         ("compile estimate (s)", lambda r: r["compile_s"]),
         *((f"run {p} (ms/step)", lambda r, p=p: r[p]["per_step_ms"]) for p in PATTERNS),
     ]
 
-    def fmt(v: float | None, signed: bool = False) -> str:
-        if v is None:
-            return f"{'n/a':>12}"
-        return f"{v:>+12.3f}" if signed else f"{v:>12.3f}"
+    def fmt(v: float | None) -> str:
+        return f"{v:>12.3f}" if v is not None else f"{'n/a':>12}"
+
+    def fmt_pct(v: float | None) -> str:
+        return f"{v:>+11.1f}%" if v is not None else f"{'n/a':>12}"
 
     for i, (two, three) in enumerate(rounds, 1):
         print()
         print(f"round {i}")
-        print(f"  {'phase':<28}{'2-stream':>12}{'3-stream':>12}{'3 - 2':>12}")
+        print(f"  {'phase':<28}{'2-stream':>12}{'3-stream':>12}{'3 vs 2':>12}")
         for label, fn in rows:
             a, b = fn(two), fn(three)
-            diff = None if a is None or b is None else b - a
-            print(f"  {label:<28}{fmt(a)}{fmt(b)}{fmt(diff, signed=True)}")
+            pct = None if not a or b is None else (b / a - 1) * 100
+            print(f"  {label:<28}{fmt(a)}{fmt(b)}{fmt_pct(pct)}")
     print()
     print("compile = first call minus a warm call; run excludes load and compile.")
-    print("3 - 2 is negative where 3-stream is faster.")
+    print("3 vs 2 is negative where 3-stream is faster.")
 
 
 # A round's 3-vs-2 delta smaller than this is treated as no difference.
