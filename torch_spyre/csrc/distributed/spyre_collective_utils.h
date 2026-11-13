@@ -29,7 +29,7 @@ inline void check_collective_device(const at::Tensor& tensor) {
   if (tensor.scalar_type() == c10::ScalarType::BFloat16) {
     TORCH_CHECK(
         get_spyre_tensor_layout(tensor).device_dtype ==
-            DataFormats::SEN169_FP16,
+            deeptools::DataFormats::SEN169_FP16,
         "BF16 collectives require DL16 device storage; explicit non-DL16 "
         "device layouts are not supported");
   }

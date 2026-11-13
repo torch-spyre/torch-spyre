@@ -47,7 +47,7 @@ bool can_borrow_linear_dl16_storage(const at::Tensor& tensor) {
     return false;
   }
   const auto layout = spyre::get_spyre_tensor_layout(tensor);
-  if (layout.device_dtype != DataFormats::SEN169_FP16 ||
+  if (layout.device_dtype != deeptools::DataFormats::SEN169_FP16 ||
       layout.element_arrangement != spyre::ElementArrangement::STANDARD) {
     return false;
   }

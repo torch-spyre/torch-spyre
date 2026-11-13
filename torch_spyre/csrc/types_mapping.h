@@ -54,35 +54,68 @@ inline std::unordered_map<c10::ScalarType, std::string> torchScalarToString = {
     {c10::kQUInt2x4, "quint2x4"},
     {c10::ScalarType::Undefined, "undefined"}};
 
-inline std::pair<DataFormats, DataFormats> stringToDTDataFormatPair(
-    const std::string& type_name) {
+inline std::pair<deeptools::DataFormats, deeptools::DataFormats>
+stringToDTDataFormatPair(const std::string& type_name) {
   /* val-1 = type on CPU-side
    * val-2 = type on Spyre-side
    */
-  static const std::unordered_map<std::string,
-                                  std::pair<DataFormats, DataFormats>>
+  static const std::unordered_map<
+      std::string, std::pair<deeptools::DataFormats, deeptools::DataFormats>>
       type_map = {
-          {"float16", {DataFormats::IEEE_FP16, DataFormats::SEN169_FP16}},
-          {"float32", {DataFormats::IEEE_FP32, DataFormats::IEEE_FP32}},
-          {"int8", {DataFormats::SENINT8, DataFormats::SENINT8}},
-          {"int16", {DataFormats::SENINT16, DataFormats::SENINT16}},
-          {"int32", {DataFormats::IEEE_INT32, DataFormats::IEEE_INT32}},
-          {"int64", {DataFormats::IEEE_INT64, DataFormats::IEEE_INT32}},
-          {"bool", {DataFormats::BOOL, DataFormats::SEN169_FP16}},
-          {"bfloat16", {DataFormats::BFLOAT16, DataFormats::SEN169_FP16}},
-          {"quint8", {DataFormats::SENUINT32, DataFormats::SENUINT32}},
-          {"qint8", {DataFormats::SENINT8, DataFormats::SENINT8}},
-          {"quint4x2", {DataFormats::SENUINT2, DataFormats::SENUINT2}},
-          {"quint2x4", {DataFormats::SENUINT2, DataFormats::SENUINT2}},
+          {"float16",
+           {deeptools::DataFormats::IEEE_FP16,
+            deeptools::DataFormats::SEN169_FP16}},
+          {"float32",
+           {deeptools::DataFormats::IEEE_FP32,
+            deeptools::DataFormats::IEEE_FP32}},
+          {"int8",
+           {deeptools::DataFormats::SENINT8, deeptools::DataFormats::SENINT8}},
+          {"int16",
+           {deeptools::DataFormats::SENINT16,
+            deeptools::DataFormats::SENINT16}},
+          {"int32",
+           {deeptools::DataFormats::IEEE_INT32,
+            deeptools::DataFormats::IEEE_INT32}},
+          {"int64",
+           {deeptools::DataFormats::IEEE_INT64,
+            deeptools::DataFormats::IEEE_INT32}},
+          {"bool",
+           {deeptools::DataFormats::BOOL, deeptools::DataFormats::SEN169_FP16}},
+          {"bfloat16",
+           {deeptools::DataFormats::BFLOAT16,
+            deeptools::DataFormats::SEN169_FP16}},
+          {"quint8",
+           {deeptools::DataFormats::SENUINT32,
+            deeptools::DataFormats::SENUINT32}},
+          {"qint8",
+           {deeptools::DataFormats::SENINT8, deeptools::DataFormats::SENINT8}},
+          {"quint4x2",
+           {deeptools::DataFormats::SENUINT2,
+            deeptools::DataFormats::SENUINT2}},
+          {"quint2x4",
+           {deeptools::DataFormats::SENUINT2,
+            deeptools::DataFormats::SENUINT2}},
           // 1-byte host leg matching PyTorch's storage; the device has no
           // 1-byte unsigned format, so values live as SENUINT32 there.
-          {"uint8", {DataFormats::SENUINT8, DataFormats::SENUINT32}},
-          {"int4", {DataFormats::SENINT4, DataFormats::SENINT4}},
-          {"int2", {DataFormats::SENINT2, DataFormats::SENINT2}},
-          {"fp8_143", {DataFormats::SEN143_FP8, DataFormats::SEN143_FP8}},
-          {"fp8_152", {DataFormats::SEN152_FP8, DataFormats::SEN152_FP8}},
-          {"fp9_153", {DataFormats::SEN153_FP9, DataFormats::SEN153_FP9}},
-          {"int24", {DataFormats::SENINT24, DataFormats::SENINT24}},
+          {"uint8",
+           {deeptools::DataFormats::SENUINT8,
+            deeptools::DataFormats::SENUINT32}},
+          {"int4",
+           {deeptools::DataFormats::SENINT4, deeptools::DataFormats::SENINT4}},
+          {"int2",
+           {deeptools::DataFormats::SENINT2, deeptools::DataFormats::SENINT2}},
+          {"fp8_143",
+           {deeptools::DataFormats::SEN143_FP8,
+            deeptools::DataFormats::SEN143_FP8}},
+          {"fp8_152",
+           {deeptools::DataFormats::SEN152_FP8,
+            deeptools::DataFormats::SEN152_FP8}},
+          {"fp9_153",
+           {deeptools::DataFormats::SEN153_FP9,
+            deeptools::DataFormats::SEN153_FP9}},
+          {"int24",
+           {deeptools::DataFormats::SENINT24,
+            deeptools::DataFormats::SENINT24}},
           // Add more mappings as needed
       };
 
@@ -105,20 +138,21 @@ inline std::pair<DataFormats, DataFormats> stringToDTDataFormatPair(
     }
     return it->second;
   }
-  return {DataFormats::INVALID, DataFormats::INVALID};
+  return {deeptools::DataFormats::INVALID, deeptools::DataFormats::INVALID};
 }
 
 // Returns true if deeptools ConvertData_general_shuffle supports the given
-// (src, dst) DataFormats pair.  The set of supported pairs is derived from
-// the exhaustive if/else-if chain in
+// (src, dst) deeptools::DataFormats pair.  The set of supported pairs is
+// derived from the exhaustive if/else-if chain in
 // deeptools/spyrecode-host-functions/sendataconvert/sen_data_convert.cpp ::
 // ConvertData_general_shuffle.
-inline bool isDCIConversionSupported(DataFormats src, DataFormats dst) {
+inline bool isDCIConversionSupported(deeptools::DataFormats src,
+                                     deeptools::DataFormats dst) {
   // clang-format off
-  using DF = DataFormats;
+  using DF = deeptools::DataFormats;
   // Pairs listed as (src, dst) matching the order in
   // ConvertData_general_shuffle.
-  static const std::pair<DataFormats, DataFormats> kSupported[] = {
+  static const std::pair<DF, DF> kSupported[] = {
       {DF::IEEE_FP32,   DF::IEEE_FP32},
       {DF::SEN169_FP16, DF::IEEE_FP32},
       {DF::IEEE_FP16,   DF::IEEE_FP32},
@@ -169,25 +203,25 @@ inline bool isDCIConversionSupported(DataFormats src, DataFormats dst) {
 
 // Bytes per element of a host DataFormat as deeptools' bounds check sees it
 // (elemBytesForBoundCheck); 0 for packed sub-byte formats.
-inline size_t hostFormatBytes(DataFormats df) {
+inline size_t hostFormatBytes(deeptools::DataFormats df) {
   switch (df) {
-    case DataFormats::IEEE_INT64:
+    case deeptools::DataFormats::IEEE_INT64:
       return 8;
-    case DataFormats::IEEE_FP32:
-    case DataFormats::SENUINT32:
-    case DataFormats::IEEE_INT32:
+    case deeptools::DataFormats::IEEE_FP32:
+    case deeptools::DataFormats::SENUINT32:
+    case deeptools::DataFormats::IEEE_INT32:
       return 4;
-    case DataFormats::BFLOAT16:
-    case DataFormats::SEN169_FP16:
-    case DataFormats::IEEE_FP16:
-    case DataFormats::SENINT16:
+    case deeptools::DataFormats::BFLOAT16:
+    case deeptools::DataFormats::SEN169_FP16:
+    case deeptools::DataFormats::IEEE_FP16:
+    case deeptools::DataFormats::SENINT16:
       return 2;
-    case DataFormats::SENINT8:
-    case DataFormats::SENUINT8:
-    case DataFormats::SEN080_FP8:
-    case DataFormats::SEN143_FP8:
-    case DataFormats::SEN152_FP8:
-    case DataFormats::BOOL:
+    case deeptools::DataFormats::SENINT8:
+    case deeptools::DataFormats::SENUINT8:
+    case deeptools::DataFormats::SEN080_FP8:
+    case deeptools::DataFormats::SEN143_FP8:
+    case deeptools::DataFormats::SEN152_FP8:
+    case deeptools::DataFormats::BOOL:
       return 1;
     default:
       return 0;  // sub-byte or unknown: no single byte width

@@ -172,10 +172,10 @@ void freeRuntime() {
   GlobalRuntime::reset();
 }
 
-uint32_t encodeConstant(float torch_const, DataFormats df) {
+uint32_t encodeConstant(float torch_const, deeptools::DataFormats df) {
   uint32_t sen_const;
 
-  if (df == DataFormats::IEEE_FP32) {
+  if (df == deeptools::DataFormats::IEEE_FP32) {
     sen_const =
         deeptools::BinaryConvert<uint32_t>(static_cast<float>(torch_const));
   } else {
@@ -191,7 +191,7 @@ int64_t get_elem_in_stick(c10::ScalarType torch_dtype) {
   return elems_per_stick(sen_dtype_dev);
 }
 
-DataFormats get_device_dtype(c10::ScalarType torch_dtype) {
+deeptools::DataFormats get_device_dtype(c10::ScalarType torch_dtype) {
   auto str_type = torchScalarToString[torch_dtype];
   const auto [sen_dtype_cpu, sen_dtype_dev] =
       stringToDTDataFormatPair(str_type);
@@ -202,8 +202,8 @@ bool is_supported_dtype(c10::ScalarType dtype) {
   // TODO(kmehant,yoheiueda): Replace this heuristic with a reliable method to
   // determine supported dtypes. Using elems_per_stick can miss certain
   // unsupported dtypes. See #950
-  DataFormats sen_dtype_dev = get_device_dtype(dtype);
-  return sen_dtype_dev != DataFormats::INVALID &&
+  deeptools::DataFormats sen_dtype_dev = get_device_dtype(dtype);
+  return sen_dtype_dev != deeptools::DataFormats::INVALID &&
          elems_per_stick(sen_dtype_dev) > 0;
 }
 int device_count() {
@@ -568,14 +568,15 @@ PYBIND11_MODULE(_C, m) {
            py::arg("dim_order"),
            py::arg("element_arrangement") = spyre::ElementArrangement::STANDARD)
       .def(
-          py::init<std::vector<int64_t>, std::vector<int64_t>, DataFormats,
-                   spyre::ElementArrangement,
+          py::init<std::vector<int64_t>, std::vector<int64_t>,
+                   deeptools::DataFormats, spyre::ElementArrangement,
                    std::map<std::vector<int64_t>, int64_t>>(),
           py::arg("device_size"), py::arg("stride_map"),
           py::arg("device_dtype"),
           py::arg("element_arrangement") = spyre::ElementArrangement::STANDARD,
           py::arg("valid_elements") = std::map<std::vector<int64_t>, int64_t>{})
-      .def(py::init<std::vector<int64_t>, std::vector<int64_t>, DataFormats,
+      .def(py::init<std::vector<int64_t>, std::vector<int64_t>,
+                    deeptools::DataFormats,
                     std::map<std::vector<int64_t>, int64_t>,
                     spyre::ElementArrangement>(),
            py::arg("device_size"), py::arg("stride_map"),
@@ -603,18 +604,20 @@ PYBIND11_MODULE(_C, m) {
                 throw py::value_error(
                     "Invalid SpyreTensorLayout pickle v1: wrong tuple size");
               }
-              return spyre::SpyreTensorLayout(t[1].cast<std::vector<int64_t>>(),
-                                              t[3].cast<std::vector<int64_t>>(),
-                                              t[4].cast<DataFormats>());
+              return spyre::SpyreTensorLayout(
+                  t[1].cast<std::vector<int64_t>>(),
+                  t[3].cast<std::vector<int64_t>>(),
+                  t[4].cast<deeptools::DataFormats>());
             } else if (version == 2) {
               // Version 2: (version, device_size, stride_map, device_dtype)
               if (t.size() != 4) {
                 throw py::value_error(
                     "Invalid SpyreTensorLayout pickle v2: wrong tuple size");
               }
-              return spyre::SpyreTensorLayout(t[1].cast<std::vector<int64_t>>(),
-                                              t[2].cast<std::vector<int64_t>>(),
-                                              t[3].cast<DataFormats>());
+              return spyre::SpyreTensorLayout(
+                  t[1].cast<std::vector<int64_t>>(),
+                  t[2].cast<std::vector<int64_t>>(),
+                  t[3].cast<deeptools::DataFormats>());
             } else if (version == 3) {
               // Version 3: (version, device_size, stride_map, device_dtype,
               // element_arrangement) — stride_map may contain legacy -1
@@ -625,7 +628,8 @@ PYBIND11_MODULE(_C, m) {
               }
               return spyre::SpyreTensorLayout(
                   t[1].cast<std::vector<int64_t>>(),
-                  t[2].cast<std::vector<int64_t>>(), t[3].cast<DataFormats>(),
+                  t[2].cast<std::vector<int64_t>>(),
+                  t[3].cast<deeptools::DataFormats>(),
                   t[4].cast<spyre::ElementArrangement>());
             } else if (version == 4 || version == 5) {
               // Version 4: (version, device_size, stride_map, device_dtype,
@@ -639,7 +643,8 @@ PYBIND11_MODULE(_C, m) {
               }
               return spyre::SpyreTensorLayout(
                   t[1].cast<std::vector<int64_t>>(),
-                  t[2].cast<std::vector<int64_t>>(), t[3].cast<DataFormats>(),
+                  t[2].cast<std::vector<int64_t>>(),
+                  t[3].cast<deeptools::DataFormats>(),
                   t[5].cast<std::map<std::vector<int64_t>, int64_t>>(),
                   t[4].cast<spyre::ElementArrangement>());
             } else {
@@ -667,28 +672,29 @@ PYBIND11_MODULE(_C, m) {
   m.def("reinterpret_tensor_with_layout",
         &spyre::reinterpret_tensor_with_layout);
 
-  py::enum_<DataFormats>(m, "DataFormats")
-      .value("SEN169_FP16", DataFormats::SEN169_FP16)
-      .value("IEEE_FP32", DataFormats::IEEE_FP32)
-      .value("INVALID", DataFormats::INVALID)
-      .value("SEN143_FP8", DataFormats::SEN143_FP8)
-      .value("SEN152_FP8", DataFormats::SEN152_FP8)
-      .value("SEN153_FP9", DataFormats::SEN153_FP9)
-      .value("SENINT2", DataFormats::SENINT2)
-      .value("SENINT4", DataFormats::SENINT4)
-      .value("SENINT8", DataFormats::SENINT8)
-      .value("SENINT16", DataFormats::SENINT16)
-      .value("SENINT24", DataFormats::SENINT24)
-      .value("IEEE_INT64", DataFormats::IEEE_INT64)
-      .value("IEEE_INT32", DataFormats::IEEE_INT32)
-      .value("SENUINT32", DataFormats::SENUINT32)
-      .value("SENUINT2", DataFormats::SENUINT2)
-      .value("IEEE_FP16", DataFormats::IEEE_FP16)
-      .value("BOOL", DataFormats::BOOL)
-      .value("BFLOAT16", DataFormats::BFLOAT16)
-      .value("SEN18F_FP24", DataFormats::SEN18F_FP24)
-      .def("elems_per_stick",
-           [](const DataFormats& df) { return spyre::elems_per_stick(df); });
+  py::enum_<deeptools::DataFormats>(m, "DataFormats")
+      .value("SEN169_FP16", deeptools::DataFormats::SEN169_FP16)
+      .value("IEEE_FP32", deeptools::DataFormats::IEEE_FP32)
+      .value("INVALID", deeptools::DataFormats::INVALID)
+      .value("SEN143_FP8", deeptools::DataFormats::SEN143_FP8)
+      .value("SEN152_FP8", deeptools::DataFormats::SEN152_FP8)
+      .value("SEN153_FP9", deeptools::DataFormats::SEN153_FP9)
+      .value("SENINT2", deeptools::DataFormats::SENINT2)
+      .value("SENINT4", deeptools::DataFormats::SENINT4)
+      .value("SENINT8", deeptools::DataFormats::SENINT8)
+      .value("SENINT16", deeptools::DataFormats::SENINT16)
+      .value("SENINT24", deeptools::DataFormats::SENINT24)
+      .value("IEEE_INT64", deeptools::DataFormats::IEEE_INT64)
+      .value("IEEE_INT32", deeptools::DataFormats::IEEE_INT32)
+      .value("SENUINT32", deeptools::DataFormats::SENUINT32)
+      .value("SENUINT2", deeptools::DataFormats::SENUINT2)
+      .value("IEEE_FP16", deeptools::DataFormats::IEEE_FP16)
+      .value("BOOL", deeptools::DataFormats::BOOL)
+      .value("BFLOAT16", deeptools::DataFormats::BFLOAT16)
+      .value("SEN18F_FP24", deeptools::DataFormats::SEN18F_FP24)
+      .def("elems_per_stick", [](const deeptools::DataFormats& df) {
+        return spyre::elems_per_stick(df);
+      });
 
   m.def("get_spyre_tensor_layout", &spyre::get_spyre_tensor_layout);
   m.def("get_device_size_in_bytes",
@@ -697,7 +703,8 @@ PYBIND11_MODULE(_C, m) {
         py::arg("layout"),
         "Return padded storage bytes for a layout with known device geometry.");
   m.def("get_device_size_in_bytes",
-        py::overload_cast<const std::vector<int64_t>&, const DataFormats&>(
+        py::overload_cast<const std::vector<int64_t>&,
+                          const deeptools::DataFormats&>(
             &spyre::get_device_size_in_bytes),
         py::arg("device_size"), py::arg("device_dtype"),
         "Return whole-stick storage bytes; reject undefined format geometry.");
@@ -1028,7 +1035,7 @@ PYBIND11_MODULE(_C, m) {
   m.def(
       "_host_compute_bytes",
       [](const std::string& hcm_json, size_t correction_size) {
-        auto hcm = std::make_unique<Hcm>();
+        auto hcm = std::make_unique<deeptools::Hcm>();
         TORCH_CHECK(hcm->importJsonStr(hcm_json), "Failed to import Hcm");
         auto handle = flex::createHostComputeHandle(std::move(hcm));
         auto* params = flex::createHostComputeParams(
