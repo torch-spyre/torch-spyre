@@ -618,13 +618,24 @@ def test_dynamic_shapes_fail_at_compile():
 def test_fallback_consumer_fails_at_compile():
     """An op that lowers to a fallback kernel is rejected at compile, not at
     launch with an error that names neither the op nor the sharding."""
+    from torch_spyre.ops.fallbacks import fallback_ops
+
+    # The op must still be a Spyre fallback. An op that gets a lowering becomes
+    # a ComputedBuffer, which the op-kind check rejects first, so this test
+    # would no longer reach the fallback-consumer check (torch.cumsum, used
+    # here before, got a lowering in #3389).
+    assert torch.ops.aten.tril.default in fallback_ops, (
+        "aten.tril is no longer a Spyre fallback; pick another op from "
+        "torch_spyre/ops/fallbacks.py"
+    )
     n = _num_shards()
     torch.manual_seed(0)
     a = _sharded(torch.randn(8 * n, 64, dtype=torch.float16), 0, n)
-    b = _sharded(torch.randn(8 * n, 64, dtype=torch.float16), 0, n)
 
+    # The fallback's result is the graph output: an op that combined it with
+    # a sharded operand would be rejected first, as mixed sharded/unsharded.
     with pytest.raises(RuntimeError, match="pointwise ops on sharded operands"):
-        torch.compile(lambda x, y: torch.cumsum(x, dim=1) + 0 * y, dynamic=False)(a, b)
+        torch.compile(lambda x: torch.tril(x), dynamic=False)(a)
 
 
 @_requires_emulation
