@@ -1080,11 +1080,21 @@ class TileOwnershipGroupingTests(unittest.TestCase):
         # op's division and ties the divisions of the nest together, so it may
         # give each core a slice of the tiled dim itself. The balanced division
         # it prefers does: 4 cores along those 16 rows.
+        # The division is the lexicographic ladder's, which balances cores: the
+        # priced objective prices a core split of this memory-bound nest higher
+        # (underfill), and the test is about slicing a tile across cores.
+        from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
+            CpSatLayoutSolver,
+        )
+
         x = torch.randn(64, 64, 128, dtype=torch.float16)
         y = torch.randn(64, 64, 128, dtype=torch.float16)
-        cpu, device, tiling = self._compile(
-            lambda x, y: (x + y) * 2 + 1, (x, y), consumer_menu=[_D0_BY_4]
-        )
+        with patch.object(
+            CpSatLayoutSolver, "_minimize_cost_expr", lambda *a, **k: None
+        ):
+            cpu, device, tiling = self._compile(
+                lambda x, y: (x + y) * 2 + 1, (x, y), consumer_menu=[_D0_BY_4]
+            )
         self._assert_close(device, cpu)
         (nest,) = _nests(tiling).values()
         model_ops = self._model_ops(nest)
@@ -1552,3 +1562,75 @@ class HeldSolverTilingTests(unittest.TestCase):
         actual = actual.to("cpu").float()
         rel_l2 = float((actual - expected).norm() / expected.norm())
         self.assertLess(rel_l2, 0.01)  # fp16 lands at 0.003
+
+
+@unittest.skipUnless(_HAS_ORTOOLS, "the cpsat solver needs ortools")
+class PricedAutoTilingTests(unittest.TestCase):
+    """Under ``auto_coarse_tiling`` CP-SAT minimizes the priced cost objective --
+    the coarse-tiling derates price tile size and cut count -- rather than its
+    lexicographic fallback, and the tiling it picks reaches ``CoarseTileInfo``."""
+
+    def setUp(self):
+        torch.manual_seed(0x7E5)
+        torch.compiler.reset()
+        self.addCleanup(torch.compiler.reset)
+
+    def test_the_tiling_solve_is_priced_and_its_tiling_applied(self):
+        from torch_spyre._inductor.scratchpad import coarse_tiling
+        from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
+            CpSatLayoutSolver,
+        )
+
+        stats, choices = [], {}
+        minimize, choose = (
+            CpSatLayoutSolver._minimize_cost_expr,
+            coarse_tiling.chosen_tilings,
+        )
+
+        def recorded_minimize(solver, *args, **kwargs):
+            status = minimize(solver, *args, **kwargs)
+            stats.append(dict(solver.last_solve_stats))
+            return status
+
+        def recorded_choice(graph, planned):
+            choices.update(choose(graph, planned))
+            return choices
+
+        def fn(x, y):
+            return (x + y) * 2 + 1
+
+        # 128 MiB a tensor: too big for LX on every core, so only a tiling
+        # makes the intermediates resident.
+        x = torch.randn(16384, 4096, dtype=torch.float16)
+        y = torch.randn(16384, 4096, dtype=torch.float16)
+        CollectTilingPasses.tiling = {}
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(torch.no_grad())
+            stack.enter_context(t_inductor_config.patch(force_disable_caches=True))
+            stack.enter_context(
+                ts_inductor_config.patch(
+                    co_optimizing_lx_planning=True,
+                    auto_coarse_tiling=True,
+                    layout_solver="cpsat",
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    ts_passes, "CustomPreSchedulingPasses", CollectTilingPasses
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    CpSatLayoutSolver, "_minimize_cost_expr", recorded_minimize
+                )
+            )
+            stack.enter_context(
+                patch.object(coarse_tiling, "chosen_tilings", recorded_choice)
+            )
+            compiled = torch.compile(fn, fullgraph=True)
+            device = compiled(x.to(DEVICE_NAME), y.to(DEVICE_NAME)).to("cpu")
+        torch.testing.assert_close(device, fn(x, y), atol=0.1, rtol=0.05)
+        self.assertTrue(stats)
+        self.assertTrue(all(s.get("objective_used") for s in stats), stats)
+        self.assertTrue(choices, "the priced solve chose no tiling")
+        self.assertTrue(CollectTilingPasses.tiling, "the chosen tiling was not applied")
