@@ -12814,7 +12814,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         elif beta * x.max() <= -2.0:
             # Every output here is below 0.13, under the default atol of 0.1, so an
             # all-zero result would pass. Bound the error relative to the value
-            # instead: 2% covers fp16 rounding of e^x and the series.
+            # instead: 2% covers fp16 rounding of e^x and of log1p.
             self.compare_with_cpu(fn, x, atol=1e-7, rtol=2e-2)
         else:
             self.compare_with_cpu(fn, x)
