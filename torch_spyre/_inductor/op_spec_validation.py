@@ -115,6 +115,7 @@ BINARY_OPS = frozenset(
         "sub",
         "mul",
         "muli32toi32",
+        "simon32x2",
         "realdiv",
         "maximum",
         "minimum",

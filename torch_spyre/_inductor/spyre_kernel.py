@@ -41,6 +41,7 @@ from torch._inductor.virtualized import V
 from .constants import (
     SPYRE_FP32_OPS,
     SPYRE_INT32_OPS,
+    BITS2UNIFORM_OP,
     CONV_OPS,
     DEPTHWISE_CONV_REDUCTION_OPS,
     IDENTITY_OP,
@@ -234,6 +235,12 @@ class SpyreOpFuncs:
         return PointwiseOp("add", [a, b])
 
     @staticmethod
+    def bits_to_uniform(x):
+        if not _has_int32_operands(x):
+            raise Unsupported("bits_to_uniform takes an IEEE_INT32 tensor")
+        return PointwiseOp("bits2uniform", [x])
+
+    @staticmethod
     def clamp(x, min, max):
         op_info = {
             "constants": {
@@ -378,6 +385,12 @@ class SpyreOpFuncs:
             }
         }
         return PointwiseOp("softplus", [x], op_info)
+
+    @staticmethod
+    def simon32x2(state, keys):
+        if not _has_int32_operands(state, keys):
+            raise Unsupported("simon32x2 takes IEEE_INT32 tensors")
+        return PointwiseOp("simon32x2", [state, keys])
 
     @staticmethod
     def sqrt(x):
@@ -1219,6 +1232,12 @@ class SpyreKernel(Kernel[CSEVariable]):
                 or (op in SPYRE_FP32_OPS and arg.device_dtype == DataFormats.IEEE_FP32)
                 or (
                     op in SPYRE_INT32_OPS and arg.device_dtype == DataFormats.IEEE_INT32
+                )
+                or (
+                    # int32 bits in, fp32 uniform out
+                    op == BITS2UNIFORM_OP
+                    and arg.device_dtype
+                    in (DataFormats.IEEE_INT32, DataFormats.IEEE_FP32)
                 )
                 or arg.device_dtype == DataFormats.SEN169_FP16
                 or (

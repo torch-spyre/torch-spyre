@@ -1482,6 +1482,35 @@ def lower_silu(x):
     return pw
 
 
+def _pointwise_of(name, dtype, *inputs):
+    fn = lowering.ops_wrapper(name)
+    loaders = [x.make_loader() for x in inputs]
+    return Pointwise.create(
+        device=inputs[0].get_device(),
+        dtype=dtype,
+        inner_fn=lambda index: fn(*(load(index) for load in loaders)),
+        ranges=inputs[0].get_size(),
+        origin_node=inputs[0].get_origin_node(),
+        traceback=inputs[0].get_traceback(),
+    )
+
+
+@register_spyre_lowering(
+    torch.ops.spyre.simon32x2, type_promotion_kind=None, broadcast=True
+)
+def lower_simon32x2(state, keys):
+    return _pointwise_of("simon32x2", torch.int32, state, keys)
+
+
+@register_spyre_lowering(
+    torch.ops.spyre.bits_to_uniform,
+    type_promotion_kind=None,
+    override_return_dtype=torch.float32,
+)
+def lower_bits_to_uniform(bits):
+    return _pointwise_of("bits_to_uniform", torch.float32, bits)
+
+
 @register_spyre_lowering(torch.ops.spyre.softplus)
 def lower_softplus(x, beta=1.0, threshold=20.0):
     fn = lowering.ops_wrapper(torch.ops.spyre.softplus.__name__)

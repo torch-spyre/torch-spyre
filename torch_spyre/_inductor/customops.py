@@ -266,6 +266,40 @@ def _(
     return input.new_empty(input.size())
 
 
+@torch.library.custom_op("spyre::simon32x2", mutates_args=(), device_types="spyre")
+def simon32x2(state: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
+    """Two Simon32/64 rounds on int32 states ``x << 16 | y``.
+
+    ``keys`` packs the two round keys inverted, ``~k_a & 0xFFFF |
+    (~k_b & 0xFFFF) << 16``, and broadcasts against ``state`` (one pair per
+    row, ``[rows, 1]``). Six calls from the counter give Simon32/64-12; see
+    ``torch_spyre.rng``.
+    """
+    pass
+
+
+@simon32x2.register_fake
+def _(state: torch.Tensor, keys: torch.Tensor):
+    return state.new_empty(torch.broadcast_shapes(state.shape, keys.shape))
+
+
+@torch.library.custom_op(
+    "spyre::bits_to_uniform", mutates_args=(), device_types="spyre"
+)
+def bits_to_uniform(bits: torch.Tensor) -> torch.Tensor:
+    """32 random bits (int32) to fp32 ``(v + 0.5) * 2**-23``, ``v`` the top 23 bits.
+
+    The result is exact and lies in ``[2**-24, 1 - 2**-24]``: never 0 or 1, so
+    ``-log(u)`` and ``-log(-log(u))`` are finite.
+    """
+    pass
+
+
+@bits_to_uniform.register_fake
+def _(bits: torch.Tensor):
+    return bits.new_empty(bits.size(), dtype=torch.float32)
+
+
 @torch.library.custom_op("spyre::empty", mutates_args=(), device_types="spyre")
 def spyre_empty(
     size: Sequence[int],
