@@ -2296,14 +2296,12 @@ class TestSympyExprToCpSatPrinter(TestCase):
             buffer_map[name] = wrappers[owner], raw
         printer = _SympyExprToCpSat(model, dict(sym_map), buffer_map)
         conventional = _SympyExprToCpSat(model, dict(sym_map), buffer_map)
-        with mock.patch.object(conventional, "_division_table", return_value=None):
+        with mock.patch.object(conventional, "_emit", return_value=None):
             expected = [conventional.convert(expr) for expr in expressions]
         actual = [printer.convert(expr) for expr in expressions]
         self.assertTrue(printer._untabled_expr_cache)
-        self.assertTrue(
-            any(v.name.startswith("division_cost_") for v in model.proto.variables)
-        )
-        self.assertIsNone(printer._division_table(x * z))
+        self.assertTrue(any(v.name.startswith("table_") for v in model.proto.variables))
+        self.assertIsNone(printer._axes(x * z))
         for i, j, flag in itertools.product(range(4), range(2), (0, 1)):
             with self.subTest(division=i, other=j, resident=flag):
                 fixed = model.clone()
@@ -2367,7 +2365,8 @@ class TestSympyExprToCpSatPrinter(TestCase):
         printer = _SympyExprToCpSat(
             model, {"split_x": var}, {"split_x": (wrapper, wide)}
         )
-        self.assertIsNone(printer._division_table(1e-6 * x))
+        expr = 1e-6 * x
+        self.assertIsNone(printer._emit(printer._axes(expr), printer._values(expr)))
         self.assertEqual(len(model.proto.variables), count)
 
     def test_shared_load_penalty_lowers_for_product_degrees(self):

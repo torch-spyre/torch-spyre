@@ -26,9 +26,11 @@ name -> ``(wrapper, candidate values)``). A wrapper supplies ``buffer``,
 from __future__ import annotations
 
 from collections import Counter
+import functools
 import logging
 import math
 import operator
+import sys
 from fractions import Fraction
 from functools import cache
 from typing import TYPE_CHECKING
@@ -164,6 +166,77 @@ def _lazy_minmax(expr: sympy.Expr) -> sympy.Expr:
     return expr.func(*args)
 
 
+def _reduce(op):
+    return lambda args: functools.reduce(op, args)
+
+
+def _piecewise(args):
+    """A Piecewise's values at every point: the first branch whose condition
+    holds. NaN where none does, so a table that reaches it is refused."""
+    result = np.nan
+    for value, cond in reversed(list(zip(args[::2], args[1::2]))):
+        result = np.where(cond, value, result)
+    return result
+
+
+# The evaluator behind the tables: for each sympy node type, the numpy
+# function _values applies to the node's operands, each already evaluated at
+# every point of the node's decision. An n-ary node folds its function over the
+# operands; a Piecewise takes the first branch whose condition holds
+# (_piecewise). A type absent here is one the tables cannot evaluate, so
+# _find_axes returns None for it and the node lowers through its own printer
+# method: a ``RelayoutCharge`` or ``KroneckerDelta`` onto the solver's own
+# division literals, an implemented function through _print_AppliedUndef.
+_TABLE_OPS = {
+    sympy.Add: _reduce(np.add),
+    sympy.Mul: _reduce(np.multiply),
+    sympy.Pow: lambda a: np.power(np.asarray(a[0], dtype=float), a[1]),
+    sympy.Min: _reduce(np.minimum),
+    sympy.Max: _reduce(np.maximum),
+    sympy.floor: lambda a: np.floor(a[0]),
+    sympy.ceiling: lambda a: np.ceil(a[0]),
+    sympy.log: lambda a: np.log(a[0]),
+    sympy.exp: lambda a: np.exp(a[0]),
+    sympy.Abs: lambda a: np.abs(a[0]),
+    sympy.Mod: lambda a: np.mod(a[0], a[1]),
+    sympy.And: _reduce(np.logical_and),
+    sympy.Or: _reduce(np.logical_or),
+    sympy.Not: lambda a: np.logical_not(a[0]),
+    sympy.ITE: lambda a: np.where(a[0], a[1], a[2]),
+    sympy.Piecewise: _piecewise,
+}
+
+
+def _table_op(expr):
+    """The function that evaluates ``expr`` over its operands' tables, or None."""
+    if expr.is_Relational:
+        compare = _operator_map[expr.rel_op]
+        return lambda a: compare(a[0], a[1])
+    for cls in type(expr).__mro__:
+        if cls in _TABLE_OPS:
+            return _TABLE_OPS[cls]
+    return None
+
+
+def _table_operands(expr):
+    if expr.is_Piecewise:
+        return [part for pair in expr.args for part in pair]
+    return expr.args
+
+
+# A float holds every integer below this exactly; a larger "integer" entry is
+# a rounded float and stays one.
+_FLOAT_EXACT_INTEGER = 1 << sys.float_info.mant_dig
+
+
+def _number(value):
+    """A table entry as the constant the model takes: an int where it is one."""
+    value = float(value)
+    if value.is_integer() and abs(value) < _FLOAT_EXACT_INTEGER:
+        return int(value)
+    return value
+
+
 class memoize_method:
     """Descriptor that memoizes a method separately for each instance.
 
@@ -204,145 +277,172 @@ class _SympyExprToCpSat(Printer):
         self._expr_cache: dict = {}
         self._untabled_expr_cache: dict = {}
         self._conjunction_cache: dict = {}
-        self._candidate_cache: dict = {}
-        self._division_table_cache: dict = {}
+        self._axes_cache: dict = {}
+        self._values_cache: dict = {}
+        self._lookup_cache: dict = {}
+        # Axis id (a division variable's index) -> (variable, size). See _axes.
+        self._axis: dict = {}
         super().__init__()
 
     def _print(self, expr, **kwargs):
         if expr not in self._expr_cache:
-            table = (
-                self._division_table(expr) if self._allow_tables and expr.args else None
-            )
-            self._expr_cache[expr] = (
-                super()._print(expr, **kwargs) if table is None else table
-            )
+            self._expr_cache[expr] = self._lower(expr, **kwargs)
         return self._expr_cache[expr]
 
-    def _candidate_values(self, expr):
-        """Evaluate an expression over at most one buffer's division menu.
+    def _lower(self, expr, **kwargs):
+        """A node that reads at most one buffer's division is finished as one
+        table: :meth:`_values` evaluates it at every candidate and
+        :meth:`_emit` hands CP-SAT a constant or one ``element`` lookup, and
+        nothing under the node is lowered. Otherwise the printer method for its
+        type lowers it and recurses into the operands through ``_print``.
 
-        Residency and other free decisions stop evaluation at that node. Work
-        on the rewritten expression, including its reciprocal/log scales and
-        Min/Max rounding, so tabulation does not change the cost model.
-        """
-        if expr not in self._candidate_cache:
-            self._candidate_cache[expr] = self._evaluate_candidates(expr)
-        return self._candidate_cache[expr]
+        Tables evaluate the rewritten expression, including its reciprocal/log
+        scales and Min/Max rounding, so tabulation does not change the cost
+        model."""
+        if self._allow_tables and expr.args:
+            axes = self._axes(expr)
+            if axes is not None:
+                table = self._emit(axes, self._values(expr))
+                if table is not None:
+                    return table
+        return super()._print(expr, **kwargs)
 
-    def _evaluate_candidates(self, expr):
-        if expr in (sympy.true, sympy.false):
-            return None, bool(expr)
-        if expr.is_Number:
-            return None, int(expr) if expr.is_Integer else float(expr)
+    # A table is a node's value at every point of its axis: a buffer's
+    # division index over its enumerated menu.
+
+    def _add_axis(self, var, size):
+        self._axis.setdefault(var.index, (var, size))
+        return var.index
+
+    def _shape(self, axes):
+        return tuple(self._axis[a][1] for a in axes)
+
+    def _axes(self, expr):
+        """The axes ``expr`` is a function of, as a tuple of at most one axis
+        id, or ``None`` when it is not a table: it reads a variable that is no
+        buffer's division, holds a node :data:`_TABLE_OPS` does not evaluate,
+        or reads more than one division."""
+        if expr not in self._axes_cache:
+            self._axes_cache[expr] = self._find_axes(expr)
+        return self._axes_cache[expr]
+
+    def _find_axes(self, expr):
+        if expr.is_Number or expr in (sympy.true, sympy.false):
+            return ()
         if expr.is_Symbol:
-            mapped = self._sym_map.get(expr.name)
-            if isinstance(mapped, (int, float)):
-                return None, mapped
-            name = expr.name
-            prefix = next((p for p in ("inv_", "log2_") if name.startswith(p)), "")
-            raw_name = name[len(prefix) :]
-            entry = self._buffer_map.get(raw_name)
-            if entry is None:
-                wrapper = self._sym_map.get(f"_division_of_{name}")
-                if wrapper is None:
-                    return None
-                entry = wrapper, range(len(wrapper.buffer.core_divisions))
-            wrapper, raw = entry
-            if wrapper is None:
-                # Domain-only entries can set reciprocal scales without a
-                # shared division selector. Keep their arithmetic symbolic;
-                # their candidate arrays are not scalar constants or a table.
+            return self._leaf_axes(expr)
+        if _table_op(expr) is None:
+            return None
+        found: set = set()
+        for arg in _table_operands(expr):
+            axes = self._axes(arg)
+            if axes is None:
                 return None
-            if prefix == "inv_":
-                scale = self._inv_scale(raw_name)
-                raw = [scale // v for v in raw]
-            elif prefix == "log2_":
-                raw = [int(round(_CORE_LOG_SCALE * math.log2(v))) for v in raw]
-            values = np.asarray(raw, dtype=object)
-            if all(v == values[0] for v in values):
-                return None, values[0]
-            return wrapper, values
+            found.update(axes)
+        return tuple(found) if len(found) <= 1 else None
 
-        if expr.is_Piecewise and expr.args[-1][1] != sympy.true:
-            return None  # Preserve the ordinary printer's required default.
-        args = (
-            [part for pair in expr.args for part in pair]
-            if expr.is_Piecewise
-            else expr.args
-        )
-        evaluated = [self._candidate_values(arg) for arg in args]
-        if any(value is None for value in evaluated):
-            return None
-        owners = [value[0] for value in evaluated if value[0] is not None]
-        owner = owners[0] if owners else None
-        if any(other is not owner for other in owners):
-            return None
-        values = [value[1] for value in evaluated]
-        if expr.is_Add:
-            result = sum(values)
-        elif expr.is_Mul:
-            result = math.prod(values)
-        elif expr.is_Pow:
-            result = values[0] ** values[1]
-        elif isinstance(expr, (sympy.Min, sympy.Max)):
-            operation = np.minimum if isinstance(expr, sympy.Min) else np.maximum
-            result = values[0]
-            for value in values[1:]:
-                result = operation(result, value)
-        elif expr.is_Relational:
-            result = _operator_map[expr.rel_op](*values)
-        elif expr.func in (sympy.And, sympy.Or):
-            operation = np.logical_and if expr.func is sympy.And else np.logical_or
-            result = values[0]
-            for value in values[1:]:
-                result = operation(result, value)
-        elif expr.is_Piecewise:
-            result = values[-2]
-            for value, cond in reversed(list(zip(values[:-2:2], values[1:-2:2]))):
-                result = np.where(cond, value, result)
-        elif expr.func is sympy.KroneckerDelta:
-            result = np.equal(*values)
-        else:
-            return None
-        return owner, result
+    def _leaf_axes(self, symbol):
+        """A symbol's axes, its values recorded in ``_values_cache``: a column
+        of its buffer's menu (through the rewrite's reciprocal or log scale for
+        an ``inv_``/``log2_`` symbol) or a division index. A constant has
+        none."""
+        name = symbol.name
+        mapped = self._sym_map.get(name)
+        if isinstance(mapped, (int, float)):
+            self._values_cache[symbol] = np.asarray(float(mapped))
+            return ()
+        prefix = next((p for p in ("inv_", "log2_") if name.startswith(p)), "")
+        raw_name = name[len(prefix) :]
+        wrapper, raw = self._buffer_map.get(raw_name, (None, None))
+        if wrapper is None:
+            wrapper = self._sym_map.get(f"_division_of_{name}")
+            if wrapper is None:
+                # Domain-only entries set reciprocal scales without a shared
+                # division selector; they are not a table.
+                return None
+            raw = range(len(wrapper.buffer.core_divisions))
+        if prefix == "inv_":
+            scale = self._inv_scale(raw_name)
+            raw = [scale // v for v in raw]
+        elif prefix == "log2_":
+            raw = [int(round(_CORE_LOG_SCALE * math.log2(v))) for v in raw]
+        self._values_cache[symbol] = np.asarray(raw, dtype=float)
+        return (self._add_axis(wrapper.division, len(raw)),)
 
-    def _division_table(self, expr):
-        evaluated = self._candidate_values(expr)
-        if evaluated is None:
+    def _values(self, expr):
+        """``expr`` at every point of its :meth:`_axes`, one array dimension
+        per axis."""
+        if expr not in self._values_cache:
+            if expr.is_Number:
+                return np.asarray(float(expr))
+            if expr in (sympy.true, sympy.false):
+                return np.asarray(bool(expr))
+            axes = self._axes(expr)  # a leaf records its own values
+            if expr not in self._values_cache:
+                operands = [self._broadcast(a, axes) for a in _table_operands(expr)]
+                with np.errstate(all="ignore"):
+                    values = _table_op(expr)(operands)
+                self._values_cache[expr] = np.broadcast_to(values, self._shape(axes))
+        return self._values_cache[expr]
+
+    def _broadcast(self, expr, axes):
+        """``expr``'s table shaped to broadcast over ``axes``, a superset of
+        its own."""
+        own = self._axes(expr)
+        shape = [self._axis[a][1] if a in own else 1 for a in axes]
+        return np.reshape(self._values(expr), shape)
+
+    def _emit(self, axes, values):
+        """A table as a CP-SAT expression: a constant or a lookup. None when an
+        entry is not finite -- a pole that a branch's guard excludes, which
+        then lowers branch by branch -- or has no exact lookup."""
+        values = np.asarray(values)
+        if values.dtype == bool:
+            flat = values.ravel()
+            if not axes or (flat == flat[0]).all():
+                return bool(flat[0])
+            return self._lookup(axes, flat.astype(int))
+        values = values.astype(float)
+        if not np.isfinite(values).all():
             return None
-        owner, values = evaluated
-        if owner is None:
-            return np.asarray(values).item()
-        raw = np.asarray(values, dtype=object).reshape(-1).tolist()
-        # An exact affine encoding of the binary floating values, without
-        # introducing another rounding scale. If its integer range is too
-        # large, lower the expression normally and try its smaller children.
-        if not all(math.isfinite(v) for v in raw):
-            return None
-        rationals = [Fraction(v) for v in raw]
+        flat = values.ravel()
+        if not axes or (flat == flat[0]).all():
+            return _number(flat[0])
+        return self._lookup(axes, flat)
+
+    def _lookup(self, axes, flat):
+        """One ``element`` lookup of a level variable, ``offset + coefficient *
+        level``: an exact affine encoding of the binary floating entries,
+        without introducing another rounding scale. None when the levels pass
+        _MAX_PRODUCT_BOUND; the node then lowers normally and its smaller
+        children get their own chance."""
+        rationals = [Fraction(float(v)) for v in flat]
         base = min(rationals)
         denominator = math.lcm(*(v.denominator for v in rationals))
         differences = [int((v - base) * denominator) for v in rationals]
         divisor = math.gcd(*differences)
-        if divisor == 0:
-            return raw[0]
         table = tuple(v // divisor for v in differences)
-        if max(table) > _MAX_PRODUCT_BOUND:
-            return None
         scale = Fraction(divisor, denominator)
-        offset = int(base) if base.denominator == 1 else float(base)
-        coefficient = int(scale) if scale.denominator == 1 else float(scale)
-        if Fraction(offset) != base or Fraction(coefficient) != scale:
+        offset, coefficient = _number(base), _number(scale)
+        if (
+            max(table) > _MAX_PRODUCT_BOUND
+            or Fraction(offset) != base
+            or Fraction(coefficient) != scale
+        ):
             return None
-        key = owner.division.index, table
-        if key not in self._division_table_cache:
+        key = axes, table
+        if key not in self._lookup_cache:
+            (axis,) = axes
             var = self._model.new_int_var_from_domain(
-                cp_model.Domain.FromValues(table), f"division_cost_{self._count}"
+                cp_model.Domain.FromValues(table), f"table_{self._count}"
             )
             self._count += 1
-            self._model.add_element(owner.division, table, var)
-            self._division_table_cache[key] = var
-        return coefficient * self._division_table_cache[key] + offset
+            self._model.add_element(self._axis[axis][0], table, var)
+            self._lookup_cache[key] = var
+        var = self._lookup_cache[key]
+        if coefficient == 1 and offset == 0:
+            return var
+        return coefficient * var + offset
 
     def convert(self, cost_expr: sympy.Expr) -> "cp_model.LinearExpr":
         """Return the CP-SAT expression equivalent to ``cost_expr`` under
