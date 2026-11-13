@@ -72,8 +72,17 @@ _QUANTIZE_TOLERANCE = 0.01
 # Largest scale a Min/Max over quantized curves may take to meet
 # _QUANTIZE_TOLERANCE.
 _MAX_MINMAX_SCALE = 2**14
-# Fixed scale of every other Min/Max's float coefficients.
-_MINMAX_SCALE = 10000
+# Relative rounding error allowed for the coefficients of a Min/Max over no
+# quantized curve, and the largest scale it may take to meet it: its operands
+# are linear, so a wide scale costs no product bound.
+_MINMAX_TOLERANCE = 1e-5
+_MAX_EXACT_MINMAX_SCALE = 2**40
+# Largest a Min/Max's scaled coefficient may grow, leaving CP-SAT's 64-bit
+# linear sums room for its variables' ranges.
+_MAX_MINMAX_COEFFICIENT = 2**40
+# Resolution such a Min/Max starts from: the power of two nearest the old fixed
+# 10000, which some objectives already fill near CP-SAT's 64-bit range.
+_MIN_FLOAT_MINMAX_SCALE = 2**13
 
 
 _operator_map = {
@@ -672,17 +681,25 @@ class _SympyExprToCpSat(Printer):
     @classmethod
     def _push_into_byte_minmax(cls, expr):
         """``Min(R, W) * D`` as ``Min(R * D, W * D)`` (``Max`` when the number in
-        front is negative), where D is the product's Min/Max factors over
-        quantized curves (the derates) and ``Min(R, W)`` its one other Min/Max
-        (bytes): each operand is then a sum of terms times D, rather than a
-        product of variables whose bounds compound."""
+        front is negative), where ``Min(R, W)`` is the product's bytes factor and
+        D its other Min/Max factors (the derates): each operand is then a sum of
+        terms times D, rather than a product of variables whose bounds compound.
+        The bytes factor is the one Min/Max without a quantized curve, or, when
+        none has one (a committed split leaves a derate linear in residency),
+        the one with the largest coefficient. The factors are costs and
+        derates, so D is nonnegative."""
         if not expr.is_Mul:
             return expr
         branching = [a for a in expr.args if isinstance(a, (sympy.Min, sympy.Max))]
-        targets = [a for a in branching if not a.has(_CurveTable)]
-        if len(branching) < 2 or len(targets) != 1:
+        if len(branching) < 2:
             return expr
-        (target,) = targets
+        plain = [a for a in branching if not a.has(_CurveTable)]
+        if len(plain) == 1:
+            (target,) = plain
+        elif len(plain) == len(branching):
+            target = max(branching, key=cls._largest_coefficient)
+        else:
+            return expr
         coefficient, _ = expr.as_coeff_Mul()
         rest = sympy.Mul(*(a for a in expr.args if a is not target)) / coefficient
         func = type(target)
@@ -705,14 +722,34 @@ class _SympyExprToCpSat(Printer):
         )
 
     @staticmethod
-    def _is_pushed_power(expr):
-        """A power of a Min, Max or Piecewise that :meth:`_push_power` lowers."""
-        return (
+    def _largest_coefficient(minmax):
+        """The largest number multiplying a term of ``minmax``'s operands."""
+        return max(
+            abs(float(term.as_coeff_Mul()[0]))
+            for arg in minmax.args
+            for term in sympy.Add.make_args(arg)
+        )
+
+    @staticmethod
+    def _residency_literal(expr):
+        """The one residency literal (``is_lx_<buffer>``, 0 or 1) in ``expr``;
+        None for none or several."""
+        literals = [s for s in expr.free_symbols if s.name.startswith("is_lx_")]
+        return literals[0] if len(literals) == 1 else None
+
+    @classmethod
+    def _is_pushed_power(cls, expr):
+        """A power :meth:`_push_power` lowers: of a Min, Max or Piecewise, or of
+        a sum over one residency literal."""
+        if not (
             expr.is_Pow
-            and isinstance(expr.base, (sympy.Min, sympy.Max, sympy.Piecewise))
             and expr.exp.is_Number
             and not (expr.exp.is_Integer and expr.exp > 0)
-        )
+        ):
+            return False
+        if isinstance(expr.base, (sympy.Min, sympy.Max, sympy.Piecewise)):
+            return True
+        return expr.base.is_Add and cls._residency_literal(expr.base) is not None
 
     @classmethod
     def _push_power(cls, expr):
@@ -731,6 +768,12 @@ class _SympyExprToCpSat(Printer):
                 return sympy.Mul(*(cls._push_power(f) for f in result.args))
             return cls._push_power(result)
 
+        if base.is_Add:
+            # Exact at both values of the literal: f(lit)**p as
+            # f(0)**p + (f(1)**p - f(0)**p) * lit.
+            lit = cls._residency_literal(base)
+            off, on = (power(base.subs(lit, value)) for value in (0, 1))
+            return off + (on - off) * lit
         if base.is_Piecewise:
             return sympy.Piecewise(*((power(v), c) for v, c in base.args))
         is_min = isinstance(base, sympy.Min)
@@ -747,6 +790,17 @@ class _SympyExprToCpSat(Printer):
         inverted = {}
         for rel in cond.atoms(sympy.core.relational.Relational):
             bound = cls._inverted_power_bound(rel)
+            lit = cls._residency_literal(rel)
+            if bound is None and lit is not None and rel.has(sympy.Pow):
+                # One branch per value of the literal, each inverted on its own.
+                branches = []
+                for value in (0, 1):
+                    branch = rel.subs(lit, value)
+                    if branch.is_Relational:
+                        bounded = cls._inverted_power_bound(branch)
+                        branch = branch if bounded is None else bounded
+                    branches.append(sympy.And(sympy.Eq(lit, value), branch))
+                bound = sympy.Or(*branches)
             if bound is not None:
                 inverted[rel] = bound
         return cond.xreplace(inverted) if inverted else cond
@@ -887,17 +941,21 @@ class _SympyExprToCpSat(Printer):
         # stay exact at the narrowest width; over quantized curves, at the
         # smallest multiple of it that keeps every term within
         # _QUANTIZE_TOLERANCE, a number times a curve becoming one integer
-        # curve on that scale; otherwise on _MINMAX_SCALE.
+        # curve on that scale; otherwise at the smallest such multiple within
+        # _MINMAX_TOLERANCE.
         func = expr.func
-        m = _MINMAX_SCALE
+        m = 1
         if isinstance(expr, _CurveTable):
             # A curve inside an operand, on the Min/Max scale; a number times a
             # curve is re-quantized on its Min/Max's own scale below.
             arg, xs, table = expr.args
             if all(v.is_Integer for v in table):
                 return expr
-            values = (int(round(m * float(v))) for v in table)
-            return _CurveTable(arg, xs, sympy.Tuple(*values)) / m
+            scale = power_of_two_scale(
+                [float(v) for v in table], _MINMAX_TOLERANCE, _MAX_EXACT_MINMAX_SCALE
+            )
+            values = (int(round(scale * float(v))) for v in table)
+            return _CurveTable(arg, xs, sympy.Tuple(*values)) / scale
 
         def curve_term(term):
             coefficient, rest = term.as_coeff_Mul()
@@ -931,14 +989,17 @@ class _SympyExprToCpSat(Printer):
             else:
                 values.append(float(coefficient))
         base = math.lcm(*(int(c.q) for c in exact)) if exact else 1
-        if not values:
-            m = base
-        elif expr.has(_CurveTable):
-            limit = max(base, _MAX_MINMAX_SCALE)
-            # Past the limit, the terms round as finely as it allows.
-            m = power_of_two_scale(values, _QUANTIZE_TOLERANCE, limit, base) or (
-                base << max(0, (limit // base).bit_length() - 1)
-            )
+        tolerance, limit = _MINMAX_TOLERANCE, _MAX_EXACT_MINMAX_SCALE
+        if expr.has(_CurveTable):
+            tolerance, limit = _QUANTIZE_TOLERANCE, _MAX_MINMAX_SCALE
+        elif values:
+            base *= _MIN_FLOAT_MINMAX_SCALE
+        largest = max((abs(float(c)) for c in [*exact, *values]), default=1.0)
+        limit = max(base, min(limit, int(_MAX_MINMAX_COEFFICIENT / max(largest, 1.0))))
+        # Past the limit, the terms round as finely as it allows.
+        m = power_of_two_scale(values, tolerance, limit, base) or (
+            base << max(0, (limit // base).bit_length() - 1)
+        )
 
         def _process_inner(expr):
             curve = curve_term(expr) if expr.has(_CurveTable) else None

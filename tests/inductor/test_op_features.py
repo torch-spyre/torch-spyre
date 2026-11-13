@@ -206,20 +206,14 @@ class DiscriminationTest(TestCase):
                 )
 
 
-#: The default model with the tile-height derates neutralized as the solver's
-#: ``_COST_PARAMS`` neutralizes them.
+#: The default model with the tile-height derates neutralized.
 _DERATES_OFF = dataclasses.replace(
     CostParams(),
-    **{
-        name: getattr(_COST_PARAMS, name)
-        for name in (
-            "coarse_underfill_exp",
-            "coarse_underfill_col_exp",
-            "coarse_underfill_cap",
-            "lx_spill_exp",
-            "mm_spill_ws_exp",
-        )
-    },
+    coarse_underfill_exp=0.0,
+    coarse_underfill_col_exp=0.0,
+    coarse_underfill_cap=1.0,
+    lx_spill_exp=0.0,
+    mm_spill_ws_exp=0.0,
 )
 
 
@@ -297,24 +291,50 @@ class SymbolicTiledFeatureTest(TestCase):
                 checked += 1
         self.assertGreater(checked, 10)
 
-    def test_the_tiled_cost_expression_stays_linearizable(self):
-        """``_SympyExprToCpSat`` handles Add/Mul/Min/Max and ``symbol**-1`` only.
+    def test_the_tiled_cost_expression_lowers_to_cp_sat(self):
+        """With the coarse underfill priced as the solver prices it
+        (``_COST_PARAMS``), each captured op's tiled cost lowers through the
+        real CP-SAT converter: its fractional powers of the symbolic tile
+        height, over a residency literal and a split, linearize."""
+        try:
+            from ortools.sat.python import cp_model
+        except ImportError:
+            self.skipTest("the cpsat converter needs ortools")
+        from torch_spyre._inductor.scratchpad.cpsat_expr_printer import (
+            cost_expr_to_cpsat,
+        )
 
-        A symbolic derate would be a ``Piecewise`` over a fractional ``Pow``,
-        which does not linearize -- CP-SAT then discards the WHOLE cost
-        objective and falls back to its lexicographic solve, so neutralising the
-        derate is what keeps the objective usable, not a shortcut around it.
-        """
+        params = dataclasses.replace(
+            CostParams(),
+            lx_spill_exp=_COST_PARAMS.lx_spill_exp,
+            mm_spill_ws_exp=_COST_PARAMS.mm_spill_ws_exp,
+        )
+        # Named as the allocator names a split (plan_solver.sym_core_divs).
+        split = sympy.Symbol("split_buf0_d0", integer=True, positive=True)
+        checked = 0
         for _, _, b in _entries():
             raw = next((f for f in b["features"] if f is not None), None)
             if raw is None:
                 continue
             expr = sympy.sympify(
-                predict_ops([self._symbolize(op_from_dict(raw))], _DERATES_OFF)
-            )
-            self.assertFalse(expr.atoms(sympy.Piecewise))
-            for pow_ in expr.atoms(sympy.Pow):
-                self.assertEqual(pow_.exp, -1, f"non-invertible power {pow_}")
+                predict_ops([self._symbolize(op_from_dict(raw))], params)
+            ).xreplace({self.SPLIT: split})
+            # Wired as _minimize_cost_expr wires a split: a variable tied to
+            # its buffer's division menu.
+            model = cp_model.CpModel()
+            menu = list(range(1, 33))
+            division = model.new_int_var(0, len(menu) - 1, "division_buf0")
+            sym_map = {
+                sym.name: model.new_bool_var(sym.name)
+                for sym in expr.free_symbols
+                if sym.name.startswith("is_lx_")
+            }
+            sym_map[split.name] = model.new_int_var(1, 32, split.name)
+            model.add_element(division, menu, sym_map[split.name])
+            owner = SimpleNamespace(division=division)
+            cost_expr_to_cpsat(model, sym_map, {split.name: (owner, menu)}, expr)
+            checked += 1
+        self.assertGreater(checked, 10)
 
     def test_a_loop_reread_arg_does_not_consult_symbolic_mem(self):
         """``ArgTraffic.mem`` REJECTS a symbolic ``is_lx``, and

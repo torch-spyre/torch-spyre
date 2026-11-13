@@ -2352,6 +2352,29 @@ class TestSympyExprToCpSatPrinter(TestCase):
         self.assertLessEqual(costs[chosen] - best, budget * best)
         self.assertLessEqual(abs(solver.objective_value - best), budget * best)
 
+    def test_a_curve_free_derate_is_pushed_into_the_byte_min(self):
+        # A committed split leaves the derate linear in residency, with no curve:
+        # the bytes factor is then the one with the largest coefficient. Exact
+        # at every residency assignment.
+        model = cp_model.CpModel()
+        lits = {n: model.new_bool_var(n) for n in ("is_lx_a", "is_lx_b")}
+        a, b = (sympy.Symbol(n, integer=True, nonnegative=True) for n in lits)
+        derate = sympy.Max(0.9259, 0.7027 - 0.4542 * a)
+        mem = sympy.Min(17825792 - 4194304 * a - 524288 * b, 9437184 - 524288 * b)
+        expr = 5.74e-7 * mem * derate * sympy.Max(1, 1.3 - 0.2 * b)
+        cp_expr = _SympyExprToCpSat(model, dict(lits), {}).convert(expr)
+        for va, vb in itertools.product((0, 1), (0, 1)):
+            with self.subTest(a=va, b=vb):
+                fixed = model.clone()
+                fixed.add(lits["is_lx_a"] == va)
+                fixed.add(lits["is_lx_b"] == vb)
+                solver = cp_model.CpSolver()
+                self.assertEqual(solver.solve(fixed), cp_model.OPTIMAL)
+                want = float(expr.subs({a: va, b: vb}))
+                self.assertAlmostEqual(
+                    solver.float_value(cp_expr), want, delta=1e-3 * want
+                )
+
     def test_negated_and_unnamed_boolean_products_preserve_every_assignment(self):
         model = cp_model.CpModel()
         a, b = [model.new_bool_var("") for _ in range(2)]
@@ -3441,19 +3464,40 @@ class TestInvScale(TestCase):
 
 
 class TestObjectiveCostParams(TestCase):
-    """Every solver's objective drops the tile-height derates."""
+    """The objective prices the coarse underfill, and CP-SAT lowers it."""
 
-    def test_the_objective_neutralizes_the_derates(self):
-        from torch_spyre._inductor.cost_model import CostParams, coarse_underfill_eff
+    @unittest.skipUnless(_HAS_ORTOOLS, "lowering needs ortools")
+    def test_the_objective_prices_the_underfill_and_lowers(self):
+        from torch_spyre._inductor.cost_model import coarse_underfill_eff
         from torch_spyre._inductor.scratchpad.allocator import _COST_PARAMS
+        from torch_spyre._inductor.scratchpad.cpsat_expr_printer import (
+            cost_expr_to_cpsat,
+        )
 
-        # A symbolic tile height leaves no fractional power behind.
-        is_lx, split = sympy.symbols("is_lx_buf0 split_buf0_d0", positive=True)
+        # A committed tiling's tile height depends on its output's residency.
+        is_lx = sympy.Symbol("is_lx_buf0", integer=True, nonnegative=True)
+        split = sympy.Symbol("split_buf0_d0", integer=True, positive=True)
         rpc = (256 * (1 - is_lx) + 1024 * is_lx) / split
-        eff = sympy.sympify(coarse_underfill_eff(rpc, 512, _COST_PARAMS))
-        self.assertFalse(eff.free_symbols)
-        self.assertEqual(float(eff), 1.0)
-        self.assertLess(coarse_underfill_eff(2.0, 512, CostParams()), 1)
+        expr = 1000 / sympy.sympify(coarse_underfill_eff(rpc, 512, _COST_PARAMS))
+        self.assertEqual(expr.free_symbols, {is_lx, split})
+        model = cp_model.CpModel()
+        sym_map = {
+            "is_lx_buf0": model.new_bool_var("is_lx_buf0"),
+            "split_buf0_d0": model.new_int_var(1, 32, "split_buf0_d0"),
+        }
+        cp_expr = cost_expr_to_cpsat(model, sym_map, {}, expr)
+        budget = (1 + _LINEARIZE_TOLERANCE) * (1 + _QUANTIZE_TOLERANCE) - 1
+        for s, r in itertools.product((1, 2, 3, 8, 13, 32), (0, 1)):
+            with self.subTest(split=s, is_lx=r):
+                fixed = model.clone()
+                fixed.add(sym_map["split_buf0_d0"] == s)
+                fixed.add(sym_map["is_lx_buf0"] == r)
+                solver = cp_model.CpSolver()
+                self.assertEqual(solver.solve(fixed), cp_model.OPTIMAL)
+                want = float(expr.subs({split: s, is_lx: r}))
+                self.assertLessEqual(
+                    abs(solver.float_value(cp_expr) - want), budget * want
+                )
 
 
 if __name__ == "__main__":
