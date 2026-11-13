@@ -123,7 +123,14 @@ class TestNarrowingCheckOnDevice(unittest.TestCase):
         torch._dynamo.reset()
 
     def _run_recording(self, *args, **kwargs):
-        with warnings.catch_warnings(record=True) as caught:
+        # The caches are off because a hit on the FX graph cache adds the cached
+        # graph's guards to this compile: the branch test's graph at 192 rows
+        # equals the clean region's, so its "rows <= 256" guard would be
+        # reported in the clean test.
+        with (
+            warnings.catch_warnings(record=True) as caught,
+            torch._inductor.config.patch(force_disable_caches=True),
+        ):
             warnings.simplefilter("always")
             out = _compile_and_run(*args, **kwargs)
         return out, _reports(caught)
@@ -131,7 +138,7 @@ class TestNarrowingCheckOnDevice(unittest.TestCase):
     def test_clean_region_gets_no_report(self):
         out, reports = self._run_recording(min_rows=128)
         self.assertEqual(tuple(out.shape), (ROWS, COLS))
-        self.assertEqual(reports, [])
+        self.assertFalse(reports, "\n".join(reports))
 
     def test_branch_warns_by_default_naming_the_line(self):
         out, reports = self._run_recording(min_rows=128, narrowing="branch")
@@ -157,7 +164,7 @@ class TestNarrowingCheckOnDevice(unittest.TestCase):
         with mock.patch.dict(os.environ, {MODE_ENV: "off"}):
             out, reports = self._run_recording(min_rows=128, narrowing="branch")
         self.assertEqual(tuple(out.shape), (ROWS, COLS))
-        self.assertEqual(reports, [])
+        self.assertFalse(reports, "\n".join(reports))
 
     def test_encoder_like_region_gets_no_report(self):
         # Matmul, an RMS-style norm over the hidden axis, gelu and a residual
