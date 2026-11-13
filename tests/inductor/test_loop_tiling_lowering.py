@@ -619,3 +619,104 @@ def test_lx_offsets_compare_by_which_buffers_share_an_address():
     merged = "a allocation={'lx': 0} b allocation={'lx': 0} c allocation={'lx': 0}"
     assert _comparable(two) == _comparable(swapped)
     assert _comparable(two) != _comparable(merged)
+
+
+def _compile_with_menu(fn, args, menu):
+    """Compile ``fn`` under the plan with the allocator offered ``menu(op)`` for each
+    op; returns ``(device result, cpu result, {op: loop_info}, {op: per-read advances})``."""
+    from test_solver_auto_coarse_tiling import CollectTilingPasses
+    from torch._inductor import config as t_inductor_config
+
+    from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
+
+    cpu = fn(*args)
+    torch._dynamo.reset()
+    CollectTilingPasses.tiling = {}
+    CollectTilingPasses.read_advances = {}
+    with (
+        mock.patch.object(
+            CoOptimizingAllocator, "_tiling_candidates", lambda a, op, cores: menu(op)
+        ),
+        torch.no_grad(),
+        t_inductor_config.patch(force_disable_caches=True),
+        config.patch(
+            {
+                "co_optimizing_lx_planning": True,
+                "auto_coarse_tiling": True,
+                "layout_solver": "cpsat",
+                "allow_all_ops_in_lx_planning": True,
+                "loop_tiling_lowering": "plan",
+            }
+        ),
+        mock.patch.object(passes, "CustomPreSchedulingPasses", CollectTilingPasses),
+    ):
+        device = torch.compile(fn, fullgraph=True)(*(a.to("spyre") for a in args))
+    return (
+        device.cpu(),
+        cpu,
+        dict(CollectTilingPasses.tiling),
+        dict(CollectTilingPasses.read_advances),
+    )
+
+
+def _one_row_consumer_reads_the_whole_producer(infos, advances):
+    """The 64-trip nest's read of what the other nest produced advances one producer
+    row (64 * 128 elements) per trip."""
+    consumer_nest = [
+        name
+        for name, info in infos.items()
+        if tuple(info.loop_count) == (64,) and not name.startswith("coarse_tile_copy_")
+    ]
+    assert consumer_nest, sorted(infos)
+    assert any(
+        advance[0] == 64 * 128 for name in consumer_nest for advance in advances[name]
+    ), {name: advances[name] for name in consumer_nest}
+
+
+def test_a_unit_row_consumer_in_the_next_nest_reads_every_row_of_a_copied_out_producer():
+    """The producer takes two tiles of 64 rows; the repeat after it takes one row per
+    tile in a nest of its own and reads the producer's full buffer. Its own tiling
+    divides its row dim down to one element, which leaves no symbol for that dim in
+    the read. The legacy transform returned about 95% wrong values here (every trip
+    read the producer's row 0), and carries a fix for it in its own record. The plan
+    reads the step from the index before dividing, so the dim has not vanished."""
+    from test_solver_auto_coarse_tiling import (
+        TileAxis,
+        TileSpec,
+        _reads_graph_inputs_only,
+    )
+
+    x = torch.randn(128, 64, 128, dtype=torch.float16)
+    y = torch.randn(128, 64, 128, dtype=torch.float16)
+    halves = TileSpec((TileAxis(host_dim=0, count=2),))
+    unit_rows = TileSpec((TileAxis(host_dim=0, count=64),))
+    device, cpu, infos, advances = _compile_with_menu(
+        lambda x, y: (x + y)[:64].repeat(1, 2, 1) * 2,
+        (x, y),
+        lambda op: [halves] if _reads_graph_inputs_only(op) else [unit_rows],
+    )
+    torch.testing.assert_close(device, cpu, atol=0.1, rtol=0.05)
+    _one_row_consumer_reads_the_whole_producer(infos, advances)
+
+
+def test_a_unit_row_consumer_in_the_next_nest_reads_every_row_of_a_tiled_reduction():
+    """As above, but the producer is a sum tiled along its reduced dim, so the repeat
+    reads the reduction's accumulator and not a copied-out buffer (also about 95%
+    wrong under the legacy transform)."""
+    from test_solver_auto_coarse_tiling import (
+        TileAxis,
+        TileSpec,
+        _reads_graph_inputs_only,
+    )
+
+    x = torch.randn(128, 8, 64, 128, dtype=torch.float16)
+    reduced_halves = TileSpec((TileAxis(host_dim=0, count=2, is_reduction=True),))
+    unit_rows = TileSpec((TileAxis(host_dim=0, count=64),))
+    device, cpu, infos, advances = _compile_with_menu(
+        lambda x: x.sum(dim=1)[:64].repeat(1, 2, 1) * 2,
+        (x,),
+        lambda op: [reduced_halves] if _reads_graph_inputs_only(op) else [unit_rows],
+    )
+    torch.testing.assert_close(device, cpu, atol=0.1, rtol=0.05)
+    assert any(any(info.loop_tiled_reduction_dims) for info in infos.values()), infos
+    _one_row_consumer_reads_the_whole_producer(infos, advances)
