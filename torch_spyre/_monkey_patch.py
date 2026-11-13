@@ -111,35 +111,18 @@ def _parse_dynamic_spec(dynamic, size) -> _DynamicSpec:
             raise ValueError(
                 f"dynamic={{{dim}: ...}}: {name}={value!r} must be a positive int"
             )
-    if dim_min > dim_max:
-        raise ValueError(f"dynamic={{{dim}: ...}}: min={dim_min} exceeds max={dim_max}")
-    if dim_max % granularity != 0:
-        raise ValueError(
-            f"dynamic={{{dim}: ...}}: max={dim_max} is not a multiple of "
-            f"granularity={granularity}"
-        )
-
     # Local import: this file must stay importable before torch_spyre's
     # own submodules are guaranteed ready (see _UNSET above), and reading
     # the Inductor layer's config from the eager transfer path is itself
-    # a deliberate dependency edge -- a single source of truth for
-    # max_buckets and min_reserved_dim_size beats duplicated constants that
-    # can drift from it.
+    # a deliberate dependency edge -- one validator shared with the
+    # compiler's derived output contracts (reserved_dims_contract.py) beats
+    # a duplicated, independently maintained copy of the same rules.
     from torch_spyre._inductor import config as inductor_config
 
-    if dim_min < inductor_config.min_reserved_dim_size:
-        raise ValueError(
-            f"dynamic={{{dim}: ...}}: min={dim_min} is below the minimum "
-            f"supported reservation floor ({inductor_config.min_reserved_dim_size})"
-        )
-
-    num_buckets = dim_max // granularity
-    if num_buckets > inductor_config.max_buckets:
-        raise ValueError(
-            f"dynamic={{{dim}: ...}}: max={dim_max} / granularity={granularity} = "
-            f"{num_buckets} buckets, exceeding the cap of "
-            f"{inductor_config.max_buckets} (config.max_buckets)"
-        )
+    for violation in inductor_config.reservation_violations(
+        dim_min, dim_max, granularity
+    ):
+        raise ValueError(f"dynamic={{{dim}: ...}}: {violation}")
 
     if not (0 <= dim < len(size)):
         raise ValueError(

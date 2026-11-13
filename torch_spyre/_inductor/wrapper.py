@@ -28,6 +28,7 @@ from torch._inductor.sizevars import SizeVarAllocator
 
 from .errors import Unsupported
 from .ir import FixedTiledLayout
+from .reserved_dims_contract import output_reserved_dims
 from .sharded_hbm import placement_of
 
 
@@ -76,10 +77,17 @@ class _SpyreWrapperCodegenMixin(PythonWrapperCodegen):
             f"{codegen_stride_tuple}, "
             f"{layout.dtype}, "
             f"{layout.device_layout!r}, "
-            f"device=torch.device('{layout.device}'))"
+            f"device=torch.device('{layout.device}')"
         )
 
-        return out
+        # Cross-kernel contract: a graph output that feeds another compiled
+        # region carries its (min, max, granularity) so that region can read it.
+        if name in V.graph.get_output_names():
+            reserved = output_reserved_dims(V.graph, tuple(layout.size))
+            if reserved:
+                out += f", reserved_dims={reserved!r}"
+
+        return out + ")"
 
     def generate_const_tensor_fallback(self, node):
         value = node.constant_args[0]

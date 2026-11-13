@@ -252,6 +252,72 @@ min_reserved_dim_size: int = int(os.getenv("MIN_RESERVED_DIM_SIZE", "8"))
 # very small divisor when max_size has many of them.
 min_default_granularity: int = int(os.getenv("MIN_DEFAULT_GRANULARITY", "4"))
 
+
+def reservation_violations(
+    dim_min: int,
+    dim_max: int,
+    granularity: int,
+    *,
+    enforce_min_floor: bool = True,
+) -> list[str]:
+    """Problems with ``(dim_min, dim_max, granularity)`` as a reservation contract.
+
+    Shared by the two places such a triple is created: a user's own
+    ``tensor.to("spyre", dynamic=...)`` declaration (``_monkey_patch.py``) and
+    a derived output contract handed from one compiled kernel to the next
+    (``reserved_dims_contract.py``'s ``output_reserved_dims``). A derived
+    contract is held to the same structural bar as a typed one, instead of
+    silently carrying a triple the declare-time path would have rejected.
+
+    ``enforce_min_floor`` defaults on for a user-typed declaration, where
+    ``min_reserved_dim_size`` matters (the serving plugin's eager row-count
+    branching, see that constant's own docstring). A derived output contract
+    is purely an internal compiler value with no such caller, and a real
+    kernel-to-kernel contract routinely has a ``min`` under that floor (a
+    reduction's output row count, say) -- so ``output_reserved_dims`` passes
+    ``False``. The two divisibility rules hold on a derived contract by
+    construction, given a valid input; the bucket cap does not (a derived
+    granularity can be finer than any input's), so it is the one rule that
+    genuinely needs checking there too.
+
+    Empty when the triple is valid. Callers decide how to report a
+    violation: a user-typed declaration raises ``ValueError``; a
+    compiler-derived contract that fails the cap raises ``Unsupported``
+    rather than silently stamping it or silently loosening the cap.
+    """
+    # install_config_module (below) moves every config value off this
+    # module's plain globals and onto its own accessor, so a bare reference
+    # to max_buckets/min_reserved_dim_size from here -- a function living in
+    # this same file -- would raise NameError once the module is installed.
+    # Re-importing it by name resolves through that accessor instead, the
+    # same way every external caller (e.g. pass_utils.py) already reads it.
+    from torch_spyre._inductor import config as _config
+
+    violations = []
+    if dim_min > dim_max:
+        violations.append(f"min={dim_min} exceeds max={dim_max}")
+    if dim_max % granularity != 0:
+        violations.append(
+            f"max={dim_max} is not a multiple of granularity={granularity}"
+        )
+    if dim_min % granularity != 0:
+        violations.append(
+            f"min={dim_min} is not a multiple of granularity={granularity}"
+        )
+    if enforce_min_floor and dim_min < _config.min_reserved_dim_size:
+        violations.append(
+            f"min={dim_min} is below the minimum supported reservation floor "
+            f"({_config.min_reserved_dim_size})"
+        )
+    num_buckets = dim_max // granularity
+    if num_buckets > _config.max_buckets:
+        violations.append(
+            f"max={dim_max} / granularity={granularity} = {num_buckets} buckets, "
+            f"exceeding the cap of {_config.max_buckets} (config.max_buckets)"
+        )
+    return violations
+
+
 # Ignore spyre_hint(work_div=...) and use the automatic work-distribution planner.
 ignore_work_division_hints: bool = (
     os.environ.get("SPYRE_INDUCTOR_IGNORE_WORK_DIV_HINTS", "0") == "1"
