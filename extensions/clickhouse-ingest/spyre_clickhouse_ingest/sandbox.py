@@ -155,6 +155,21 @@ class Sandbox:
             "published_at >= now() - INTERVAL {days} DAY",
             "(published_at, target_type, target_prefix)",
         ),
+        ("environments", "1", "(name, spec_digest)"),
+        ("node_classes", "1", "(name, spec_digest)"),
+        ("environment_fingerprints", "1", "(env_id, fingerprint_version)"),
+        ("environment_nodes", "1", "(node, valid_from)"),
+        (
+            "environment_qualifications",
+            "ts >= now() - INTERVAL {days} DAY",
+            "(env_id, node, qualified_at)",
+        ),
+        ("run_placements", "{runs}", "(run_id, repeat)"),
+        (
+            "result_invalidations",
+            "ts >= now() - INTERVAL {days} DAY",
+            "(invalidation_id, ts)",
+        ),
     )
 
     @classmethod
