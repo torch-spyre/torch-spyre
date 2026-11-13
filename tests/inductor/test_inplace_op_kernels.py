@@ -66,12 +66,16 @@ INPLACE_SCALAR = [
     (aten.add_, "Scalar", 2.0),
     (aten.sub_, "Scalar", 1.5),
     (aten.div_, "Scalar", 4.0),
+    (aten.fmod_, "Scalar", 3.0),
+    (aten.remainder_, "Scalar", 3.0),
 ]
 INPLACE_TENSOR = [
     (aten.mul_, "Tensor"),
     (aten.add_, "Tensor"),
     (aten.sub_, "Tensor"),
     (aten.div_, "Tensor"),
+    (aten.fmod_, "Tensor"),
+    (aten.remainder_, "Tensor"),
 ]
 
 
@@ -184,6 +188,26 @@ def test_floor_divide_tensor_inplace_has_spyre_kernel():
     assert torch._C._dispatch_has_kernel_for_dispatch_key(
         aten.floor_divide_.Tensor.name(), "PrivateUse1"
     )
+
+
+MOD_INPLACE_OPS = [
+    aten.fmod_.Tensor,
+    aten.fmod_.Scalar,
+    aten.remainder_.Tensor,
+    aten.remainder_.Scalar,
+]
+
+
+@pytest.mark.parametrize("op", MOD_INPLACE_OPS, ids=lambda o: o.name())
+def test_mod_inplace_has_spyre_kernel(op):
+    """``fmod_``/``remainder_`` are registered explicitly, not derived.
+
+    Their functional ops are decompositions, not ``COMPILED_OPS``, so
+    :func:`_spyre_kernel_ops` never includes them. Without the explicit
+    registration ``x.fmod_(y)`` fails with "Could not run
+    'aten::fmod.Tensor_out' ... 'spyre' backend".
+    """
+    assert torch._C._dispatch_has_kernel_for_dispatch_key(op.name(), "PrivateUse1")
 
 
 @pytest.mark.parametrize("op", _spyre_kernel_ops(), ids=lambda o: o.name())
@@ -328,6 +352,32 @@ def test_div_rounding_mode(rounding_mode, scalar_operand):
 
     ref = _apply(op, base.clone(), other, rounding_mode=rounding_mode)
     torch.testing.assert_close(dev.to("cpu").float(), ref.float(), atol=ATOL, rtol=0)
+
+
+@pytest.mark.parametrize("method", ["fmod_", "remainder_", "__imod__"])
+@pytest.mark.parametrize("scalar_operand", [True, False], ids=["Scalar", "Tensor"])
+def test_mod_inplace_values(method, scalar_operand):
+    """``fmod_``, ``remainder_`` and ``%=`` mutate ``self`` with exact values.
+
+    fmod takes the sign of ``self`` and remainder the sign of ``other``, so both
+    operands mix signs. Integer-valued fp16 inputs keep the result exact.
+    """
+    gen = torch.Generator().manual_seed(7)
+    base = torch.randint(-100, 101, (8, 64), generator=gen).to(DTYPE)
+    if scalar_operand:
+        other = -3.0
+        dev_other = other
+    else:
+        sign = torch.randint(0, 2, (8, 64), generator=gen) * 2 - 1
+        other = (torch.randint(2, 11, (8, 64), generator=gen) * sign).to(DTYPE)
+        dev_other = other.to(DEVICE)
+
+    dev = base.to(DEVICE)
+    returned = getattr(dev, method)(dev_other)
+
+    ref = getattr(base.clone(), method)(other)
+    assert returned.data_ptr() == dev.data_ptr()  # true in-place, not a copy
+    torch.testing.assert_close(dev.to("cpu"), ref, atol=0, rtol=0)
 
 
 def test_div_rounding_mode_matches_functional_op():

@@ -638,6 +638,24 @@ torch.library.register_kernel("aten::floor_divide_.Tensor", ["spyre"])(
     _make_inplace_kernel(aten.floor_divide.default)
 )
 
+# fmod and remainder are not in COMPILED_OPS: their functional overloads run the
+# Spyre decomposition eagerly (see ``register_spyre_decompositions``), so
+# ``register_inplace_kernels`` does not derive their in-place siblings. Without
+# these registrations ``x.fmod_(y)``, ``x.remainder_(y)`` and ``x %= y`` reach
+# the ``{fmod,remainder}.Tensor_out`` composite, which has no Spyre kernel.
+for _inplace_op in (
+    aten.fmod_.Tensor,
+    aten.fmod_.Scalar,
+    aten.remainder_.Tensor,
+    aten.remainder_.Scalar,
+):
+    _sibling = _functional_sibling(_inplace_op)
+    assert _sibling is not None, f"{_inplace_op.name()} has no functional sibling"
+    torch.library.register_kernel(_inplace_op.name(), ["spyre"])(
+        _make_inplace_kernel(_sibling)
+    )
+del _inplace_op, _sibling
+
 
 # cumsum's decomposition covers only aten.cumsum.default; out= and in-place
 # (cumsum_ reaches cumsum.out) run it and copy_ the result, like
