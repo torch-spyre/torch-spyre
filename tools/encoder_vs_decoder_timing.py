@@ -161,6 +161,27 @@ def install_removed_buffer_trace(name: str) -> None:
                 print(f"[trace-removed] {name} added to removed_buffers by:",
                       file=sys.stderr, flush=True)  # fmt: skip
                 traceback.print_stack(limit=8, file=sys.stderr)
+                # Who writes and who reads `name` in graph.operations right now?
+                # (The op being removed is still in the list at this point.)
+                w = lambda *a: print("[trace-removed]", *a, file=sys.stderr, flush=True)  # noqa: E731
+                for op in list(V.graph.operations):
+                    try:
+                        rw = op.get_read_writes()
+                        reads = {d.name for d in rw.reads}
+                        writes = {d.name for d in rw.writes}
+                    except Exception as exc:
+                        w(f"  could not read deps of {op.get_operation_name()}: {exc}")
+                        continue
+                    if name in writes:
+                        origins = [str(o) for o in list(getattr(op, "origins", ()))[:4]]
+                        w(f"  WRITTEN BY {op.get_operation_name()} "
+                          f"({type(op).__name__}) origins={origins}")  # fmt: skip
+                    if name in reads:
+                        w(
+                            f"  READ BY    {op.get_operation_name()} ({type(op).__name__})"
+                        )
+                w("  (no READ BY line above = nothing in graph.operations read it "
+                  "when it was removed)")  # fmt: skip
         return orig_add(self, elem)
 
     OrderedSet.add = add
