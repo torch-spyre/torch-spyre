@@ -263,17 +263,21 @@ def align_reshape_plan(
     """Plan the reshape + broadcast that lines a pointwise operand up with the output.
 
     A pointwise op's operands may carry their device axes in a different order
-    (and rank) from the output tile: a per-row reduction result broadcasts over
-    the outer-stick dim, a channel weight broadcasts over the row dim, etc.
-    Elementwise broadcast typically only auto-aligns *leading* unit dims, so a
-    misaligned operand (outer-stick where the output has rows) must be reshaped
-    to the output order first.  ``_match_axes`` does the pairing.
+    (and rank) from the output tile.  Broadcasting only lines up an operand
+    whose axes already sit where the output's do, so an operand whose axes sit
+    elsewhere must first be reshaped into the output's axis order.
+    ``_match_axes`` pairs each operand axis with an output axis.
 
-    Example, a per-row value read by a [16, 8, 64] op::
+    Example, a bias ``b[128]`` added to every row of ``y[64, 128]`` at fp16.
+    128 columns are two 64-element sticks, so both tensors have a stick-index
+    axis ``floor(c1/64)`` beside the lane axis ``Mod(c1, 64)``.  The bias holds
+    it at axis 1, behind a unit axis; the output holds it at axis 0, ahead of
+    the rows ``c0``.  The bias is reshaped to the output's order, with a unit
+    axis for the rows, then broadcast over them::
 
-        in_coords  [c0, Mod(c2, 64)]          in_block  [16, 64]
-        out_coords [c0, c1, Mod(c2, 64)]      out_block [16, 8, 64]
-        -> ([16, 1, 64], [16, 8, 64])
+        in_coords  [0, floor(c1/64), Mod(c1, 64)]    in_block  [1, 2, 64]
+        out_coords [floor(c1/64), c0, Mod(c1, 64)]   out_block [2, 64, 64]
+        -> ([2, 1, 64], [2, 64, 64])
 
     Args:
         in_coords, in_block: the operand's device coordinates and sizes.
