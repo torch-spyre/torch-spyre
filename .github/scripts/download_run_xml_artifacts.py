@@ -14,6 +14,15 @@ Usage (called by the GHA workflow):
         --repo "$GITHUB_REPOSITORY" \
         --run-id "$GITHUB_RUN_ID" \
         --output-dir xml_artifacts
+
+    # Or a single named artifact (e.g. the merged upstream-beta-reports-<sha>
+    # bundle on a completed run, which does not end in .xml and so is missed
+    # by the default filter):
+    python3 download_run_xml_artifacts.py \
+        --repo "$GITHUB_REPOSITORY" \
+        --run-id "$GITHUB_RUN_ID" \
+        --artifact-name upstream-beta-reports-<sha> \
+        --output-dir xml_artifacts
 """
 
 import argparse
@@ -59,11 +68,21 @@ def main() -> None:
     parser.add_argument(
         "--output-dir", required=True, help="Directory to unzip artifacts into"
     )
+    parser.add_argument(
+        "--artifact-name",
+        default="",
+        help="Download only the artifact with this exact name. Default: "
+        "every artifact whose name ends in .xml.",
+    )
     args = parser.parse_args()
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    if args.artifact_name:
+        name_filter = f'.name == "{args.artifact_name}"'
+    else:
+        name_filter = '.name | endswith(".xml")'
     listing = subprocess.run(
         [
             "gh",
@@ -71,7 +90,7 @@ def main() -> None:
             "--paginate",
             f"/repos/{args.repo}/actions/runs/{args.run_id}/artifacts",
             "--jq",
-            '.artifacts[] | select(.name | endswith(".xml")) | {id: .id, name: .name}',
+            f".artifacts[] | select({name_filter}) | {{id: .id, name: .name}}",
         ],
         capture_output=True,
         check=True,
