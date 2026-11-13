@@ -108,12 +108,15 @@ def output_reserved_dims(graph: GraphLowering, sizes) -> Optional[dict]:
     the ShapeEnv's bounds on the size expression, which already carry an input
     range through arithmetic; granularity from ``output_granularity``.
 
-    Returns None, meaning "unknown" and never "static", when no dim is symbolic
-    or when the ShapeEnv has no finite upper bound (the compiler would then be
-    sizing from the optimization hint).
+    Returns None, meaning "unknown" and never "static", when no dim is symbolic,
+    when none of the symbolic dims trace back to a declared ``dynamic=``
+    contract (an ordinary Dynamo-dynamic dim unrelated to this feature has
+    nothing to propagate), or when the ShapeEnv has no finite upper bound (the
+    compiler would then be sizing from the optimization hint).
 
-    Raises ``Unsupported`` for more than one symbolic dim: reservations cover a
-    single dim today (see ``spyre_empty_reserved`` and the ``resize_`` guard).
+    Raises ``Unsupported`` for more than one symbolic dim that *is* tied to a
+    declared contract: reservations cover a single dim today (see
+    ``spyre_empty_reserved`` and the ``resize_`` guard).
     """
     symbolic_dims = [
         dim
@@ -122,13 +125,20 @@ def output_reserved_dims(graph: GraphLowering, sizes) -> Optional[dict]:
     ]
     if not symbolic_dims:
         return None
-    if len(symbolic_dims) > 1:
+
+    contracts = get_dim_contracts(graph)
+    reserved_dims = [
+        dim for dim in symbolic_dims if sizes[dim].free_symbols & contracts.keys()
+    ]
+    if not reserved_dims:
+        return None
+    if len(reserved_dims) > 1:
         raise Unsupported(
-            f"graph output has {len(symbolic_dims)} symbolic dims {symbolic_dims} "
+            f"graph output has {len(reserved_dims)} symbolic dims {reserved_dims} "
             f"(sizes {tuple(sizes)}); more than one symbolic dim on an output "
             f"is not yet supported"
         )
-    dim = symbolic_dims[0]
+    dim = reserved_dims[0]
     expr = sizes[dim]
     bounds = graph.sizevars.shape_env.bound_sympy(expr)
     if not (isinstance(bounds.upper, sympy.Integer) and int(bounds.upper) > 0):
