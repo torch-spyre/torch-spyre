@@ -389,3 +389,82 @@ def test_an_inexpressible_group_raises_under_plan_and_does_not_run_legacy():
         pytest.raises(Exception, match="carry cannot be declared"),
     ):
         compile_span_overflow(fn, args, limit)
+
+
+class _RecordPostCallState:
+    """Substituted for the pre-scheduling pipeline: records, per loop op, what the
+    allocator's ``apply_tilings`` leaves on it after the lowering returns."""
+
+    seen: dict = {}
+
+
+def _allocator_post_call_state(lowering):
+    """Compile ``(x + y) * 2`` with the allocator tiling every op d0 by 4, under
+    ``lowering``; per op in a loop: ``(has symbols_on_tile, joint-division flag)``."""
+    from test_solver_auto_coarse_tiling import (
+        _D0_BY_4,
+        CollectTilingPasses,
+    )
+    from torch._inductor import config as t_inductor_config
+
+    from torch_spyre._inductor.loop_node import all_ops
+    from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
+    from torch_spyre._inductor.work_division_constraints import (
+        JOINT_TILING_AND_DIVISION_ATTR,
+    )
+    from torch_spyre.constants import DEVICE_NAME
+
+    seen: dict = {}
+
+    class Record(CollectTilingPasses):
+        def __call__(self, graph):
+            super().__call__(graph)
+            seen.update(
+                {
+                    op.get_name(): (
+                        hasattr(op, "symbols_on_tile"),
+                        bool(getattr(op, JOINT_TILING_AND_DIVISION_ATTR, False)),
+                    )
+                    for op in all_ops(graph.operations)
+                    if getattr(op, "loop_info", None) is not None
+                }
+            )
+
+    x = torch.randn(64, 64, 128, dtype=torch.float16)
+    y = torch.randn(64, 64, 128, dtype=torch.float16)
+    fn = lambda x, y: (x + y) * 2  # noqa: E731
+    torch._dynamo.reset()
+    with (
+        mock.patch.object(
+            CoOptimizingAllocator, "_tiling_candidates", lambda *a, **k: [_D0_BY_4]
+        ),
+        torch.no_grad(),
+        t_inductor_config.patch(force_disable_caches=True),
+        config.patch(
+            {
+                "co_optimizing_lx_planning": True,
+                "auto_coarse_tiling": True,
+                "layout_solver": "cpsat",
+                "allow_all_ops_in_lx_planning": True,
+                "loop_tiling_lowering": lowering,
+            }
+        ),
+        mock.patch.object(passes, "CustomPreSchedulingPasses", Record),
+    ):
+        out = torch.compile(fn, fullgraph=True)(x.to(DEVICE_NAME), y.to(DEVICE_NAME))
+    torch.testing.assert_close(out.cpu(), fn(x, y), atol=0.1, rtol=0.05)
+    return seen
+
+
+def test_the_post_call_contract_is_kept_under_plan():
+    """The allocator reads two things after the lowering returns: ``symbols_on_tile`` on
+    each op it tiled, and ``JOINT_TILING_AND_DIVISION_ATTR`` on the tiled ops and on
+    the ops the lowering added. Both are set by ``apply_tilings`` around the call, so
+    they must hold under the plan exactly as under the legacy lowering."""
+    legacy = _allocator_post_call_state("legacy")
+    plan = _allocator_post_call_state("plan")
+    assert plan == legacy
+    assert plan, "no op was tiled"
+    assert any(n.startswith("coarse_tile_copy_") for n in plan), sorted(plan)
+    assert all(joint for _, joint in plan.values()), plan
+    assert any(symbols for symbols, _ in plan.values()), plan
