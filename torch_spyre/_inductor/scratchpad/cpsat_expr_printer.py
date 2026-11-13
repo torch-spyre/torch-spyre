@@ -466,10 +466,7 @@ class _SympyExprToCpSat(Printer):
         evaluates: an ``element`` lookup of a division, or ``f(0) + (f(1) -
         f(0)) * lit`` for a literal. None otherwise, or when an entry is not
         finite."""
-        if not term.free_symbols or not all(
-            n.is_Atom or _table_op(n) is not None
-            for n in sympy.preorder_traversal(term)
-        ):
+        if not term.free_symbols or not self._evaluable(term):
             return None
         columns = {}
         decision = None
@@ -500,6 +497,15 @@ class _SympyExprToCpSat(Printer):
         if decision.is_boolean:
             return _number(values[0]) + _number(values[1] - values[0]) * decision
         return self._term_lookup(decision, values)
+
+    @staticmethod
+    def _evaluable(expr):
+        """Whether :data:`_TABLE_OPS` evaluates every node of ``expr``."""
+        if expr.is_Atom:
+            return True
+        if _table_op(expr) is None:
+            return False
+        return all(_SympyExprToCpSat._evaluable(arg) for arg in _table_operands(expr))
 
     def _term_values(self, expr, columns):
         """``expr`` at every value of its term's decision."""

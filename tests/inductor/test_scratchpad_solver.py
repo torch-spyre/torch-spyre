@@ -2370,6 +2370,32 @@ class TestSympyExprToCpSatPrinter(TestCase):
         self.assertIsNone(printer._division_table(1e-6 * x))
         self.assertEqual(len(model.proto.variables), count)
 
+    def test_a_piecewise_term_over_one_division_is_a_table(self):
+        x = sympy.Symbol("split_x", integer=True, positive=True)
+        menu = [1, 2, 4, 8]
+        model = cp_model.CpModel()
+        division = model.new_int_var(0, len(menu) - 1, "division")
+        var = model.new_int_var(1, 8, "split_x")
+        model.add_element(division, menu, var)
+        printer = _SympyExprToCpSat(
+            model,
+            {"split_x": var},
+            {"split_x": (types.SimpleNamespace(division=division), menu)},
+        )
+        term = sympy.Piecewise((1000 / x + sympy.floor(10 / x), x > 1), (7, True))
+        lowered = printer.convert(term)
+        names = [v.name for v in model.proto.variables]
+        self.assertEqual(sum(n.startswith("term_table_") for n in names), 1, names)
+        for i, value in enumerate(menu):
+            with self.subTest(split=value):
+                fixed = model.clone()
+                fixed.add(division == i)
+                solver = cp_model.CpSolver()
+                self.assertEqual(solver.solve(fixed), cp_model.OPTIMAL)
+                self.assertAlmostEqual(
+                    solver.float_value(lowered), float(term.subs(x, value))
+                )
+
     def test_shared_load_penalty_lowers_for_product_degrees(self):
         from torch_spyre._inductor.work_division import _matmul_multicast_penalty
 
