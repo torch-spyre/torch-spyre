@@ -422,9 +422,10 @@ class _SympyExprToCpSat(Printer):
             result = values[0] ** values[1]
         elif isinstance(expr, (sympy.Min, sympy.Max)):
             operation = np.minimum if isinstance(expr, sympy.Min) else np.maximum
-            result = values[0]
+            # As objects: a scaled integer can outgrow int64.
+            result = np.asarray(values[0], dtype=object)
             for value in values[1:]:
-                result = operation(result, value)
+                result = operation(result, np.asarray(value, dtype=object))
         elif expr.is_Relational:
             result = _operator_map[expr.rel_op](*values)
         elif expr.func in (sympy.And, sympy.Or):

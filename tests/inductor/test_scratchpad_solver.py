@@ -2438,6 +2438,18 @@ class TestSympyExprToCpSatPrinter(TestCase):
             round(8820.2702261091 * 2**31),
         )
 
+    def test_a_min_over_integers_past_int64_evaluates_without_overflow(self):
+        # Exactly rounded Min/Max operands can outgrow int64; their candidate
+        # values compare as Python integers.
+        model = cp_model.CpModel()
+        division = model.new_int_var(0, 2, "division")
+        owner = types.SimpleNamespace(division=division)
+        printer = _SympyExprToCpSat(model, {}, {"split_a": (owner, [1, 2, 4])})
+        a = sympy.Symbol("split_a", integer=True, positive=True)
+        expr = sympy.Min(2**70 * a, 3 * 2**70)
+        _, values = printer._candidate_values(expr)
+        self.assertEqual(list(values), [2**70, 2**71, 3 * 2**70])
+
     def test_negated_and_unnamed_boolean_products_preserve_every_assignment(self):
         model = cp_model.CpModel()
         a, b = [model.new_bool_var("") for _ in range(2)]
