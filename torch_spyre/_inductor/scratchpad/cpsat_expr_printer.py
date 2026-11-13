@@ -219,6 +219,10 @@ class _LazyMax(sympy.Max):
 
 _LAZY = {sympy.Min: _LazyMin, sympy.Max: _LazyMax}
 
+# The nodes inside a Min/Max whose numbers _truncate_floats_min puts on an
+# integer scale.
+_TRUNCATED = (sympy.Min, sympy.Max, sympy.Piecewise, _CurveTable)
+
 
 def _lazy_minmax(expr: sympy.Expr) -> sympy.Expr:
     """Rebuild every ``Min``/``Max`` node of ``expr`` as its lazy counterpart.
@@ -272,9 +276,6 @@ class _SympyExprToCpSat(Printer):
     ) -> None:
         self._model = model
         self._count = 0
-        # Each linearized power -> its (symbol, exponent), so a product of one
-        # buffer's powers can be merged into one curve (_merge_linearized).
-        self._linearized: dict = {}
         self._sym_map = sym_map
         self._buffer_map = buffer_map
         self._allow_tables = True
@@ -309,6 +310,8 @@ class _SympyExprToCpSat(Printer):
         return self._candidate_cache[expr]
 
     def _evaluate_candidates(self, expr):
+        if expr.is_Pow and (lowered := self._linearize_power(expr)) is not expr:
+            return self._candidate_values(lowered)
         if isinstance(expr, _CurveTable):
             evaluated = self._candidate_values(expr.args[0])
             if evaluated is None:
@@ -565,8 +568,6 @@ class _SympyExprToCpSat(Printer):
         elif expr.func == sympy.Pow:
             if not self._is_split_sym(arg):
                 return expr
-            if expr.exp.is_Number and not expr.exp.is_Integer:
-                return self._linearize_power(expr)
             if expr.exp == -1:
                 return sympy.Symbol(
                     f"inv_{arg.name}", integer=True, nonnegative=True
@@ -607,10 +608,18 @@ class _SympyExprToCpSat(Printer):
             return list(range(1, _CORE_INV_SCALE_MAX_VALUE + 1))
         return None
 
+    @memoize_method
     def _linearize_power(self, expr):
         """A fractional power of a split or tile symbol, through its candidate
-        values (see :meth:`_linearize`). Left as is when the candidates are
-        unknown or include a pole."""
+        values (see :meth:`_linearize`). Any other node, or a power whose
+        candidates are unknown or include a pole, is left as is."""
+        if not (
+            expr.is_Pow
+            and self._is_split_sym(expr.base)
+            and expr.exp.is_Number
+            and not expr.exp.is_Integer
+        ):
+            return expr
         arg, exponent = expr.base, float(expr.exp)
         xs = self._candidates(arg)
         if xs is None or (exponent < 0 and xs[0] <= 0):
@@ -619,28 +628,24 @@ class _SympyExprToCpSat(Printer):
         return self._linearize(arg, xs, exponent, owner is not None)
 
     def _merge_linearized(self, expr):
-        """A product's linearized powers of one buffer's split and tile symbols
+        """A product's fractional powers of one buffer's split and tile symbols
         under one exponent, as one curve over the product of the symbols: the
         product of their curves is not linear."""
         groups: dict = {}
         for factor in expr.args:
-            entry = self._linearized.get(factor)
-            if entry is None:
-                continue
-            sym, exponent = entry
-            owner = self._buffer_map.get(sym.name, (None, None))[0]
-            if owner is not None:
-                groups.setdefault((id(owner), exponent), []).append(factor)
+            if isinstance(self._linearize_power(factor), _CurveTable):
+                owner = self._buffer_map[factor.base.name][0]
+                groups.setdefault((id(owner), float(factor.exp)), []).append(factor)
         merged = [group for group in groups.values() if len(group) > 1]
         if not merged:
             return expr
         dropped = {factor for group in merged for factor in group}
         factors = [factor for factor in expr.args if factor not in dropped]
         for group in merged:
-            syms = [self._linearized[factor][0] for factor in group]
+            syms = [factor.base for factor in group]
             columns = zip(*(self._buffer_map[sym.name][1] for sym in syms))
             xs = sorted({math.prod(int(v) for v in column) for column in columns})
-            exponent = self._linearized[group[0]][1]
+            exponent = float(group[0].exp)
             factors.append(self._linearize(sympy.Mul(*syms), xs, exponent, True))
         return sympy.Mul(*factors)
 
@@ -664,22 +669,17 @@ class _SympyExprToCpSat(Printer):
             )
         if tabulate:
             curve = np.interp(xs, [xs[i] for i in points], [ys[i] for i in points])
-            table = _CurveTable(
+            return _CurveTable(
                 arg, sympy.Tuple(*xs), sympy.Tuple(*map(sympy.Float, curve))
             )
-            self._linearized[table] = (arg, exponent)
-            return table
         pieces = []
         for lo, hi in zip(points, points[1:]):
             slope = (ys[hi] - ys[lo]) / (xs[hi] - xs[lo])
             line = slope * arg + (ys[lo] - slope * xs[lo])
             pieces.append((line, True if hi == points[-1] else arg <= xs[hi]))
-        result = sympy.Piecewise(*pieces)
-        self._linearized[result] = (arg, exponent)
-        return result
+        return sympy.Piecewise(*pieces)
 
-    @classmethod
-    def _push_into_byte_minmax(cls, expr):
+    def _push_into_byte_minmax(self, expr):
         """``Min(R, W) * D`` as ``Min(R * D, W * D)`` (``Max`` when the number in
         front is negative), where ``Min(R, W)`` is the product's bytes factor and
         D its other Min/Max factors (the derates): each operand is then a sum of
@@ -693,11 +693,11 @@ class _SympyExprToCpSat(Printer):
         branching = [a for a in expr.args if isinstance(a, (sympy.Min, sympy.Max))]
         if len(branching) < 2:
             return expr
-        plain = [a for a in branching if not a.has(_CurveTable)]
+        plain = [a for a in branching if not self._has_curve(a)]
         if len(plain) == 1:
             (target,) = plain
         elif len(plain) == len(branching):
-            target = max(branching, key=cls._largest_coefficient)
+            target = max(branching, key=self._largest_coefficient)
         else:
             return expr
         coefficient, _ = expr.as_coeff_Mul()
@@ -711,7 +711,7 @@ class _SympyExprToCpSat(Printer):
             *(
                 sympy.Add(
                     *map(
-                        cls._push_into_byte_minmax,
+                        self._push_into_byte_minmax,
                         sympy.Add.make_args(
                             sympy.expand(abs(coefficient) * arg * rest)
                         ),
@@ -719,6 +719,14 @@ class _SympyExprToCpSat(Printer):
                 )
                 for arg in target.args
             )
+        )
+
+    def _has_curve(self, expr):
+        """Whether ``expr`` holds a curve over one buffer's menu, or a power
+        that lowers to one."""
+        return any(
+            isinstance(self._linearize_power(a), _CurveTable)
+            for a in expr.atoms(sympy.Pow, _CurveTable)
         )
 
     @staticmethod
@@ -917,22 +925,25 @@ class _SympyExprToCpSat(Printer):
             )
         return expr
 
-    @classmethod
-    def _integerize_minmax(cls, expr):
+    def _integerize_minmax(self, expr):
         # Only Min/Max constraints require integer operands. A conditional
         # objective supports float values directly; rounding its coefficients
         # can erase a large cost multiplied by scaled reciprocal variables.
         # Keep upstream's lazy Min/Max classes when rebuilding their subtrees.
+        # A power inside a Min/Max is lowered here, not in the printer: its
+        # curve is quantized on the Min/Max's scale.
         if isinstance(expr, (sympy.Min, sympy.Max)):
             return expr.replace(
-                lambda e: isinstance(
-                    e, (sympy.Min, sympy.Max, sympy.Piecewise, _CurveTable)
-                ),
-                cls._truncate_floats_min,
+                lambda e: e.is_Pow or isinstance(e, _TRUNCATED),
+                self._integerize_node,
             )
         if not expr.has(sympy.Min, sympy.Max):
             return expr
-        return expr.func(*(cls._integerize_minmax(arg) for arg in expr.args))
+        return expr.func(*(self._integerize_minmax(arg) for arg in expr.args))
+
+    def _integerize_node(self, expr):
+        expr = self._linearize_power(expr)
+        return self._truncate_floats_min(expr) if isinstance(expr, _TRUNCATED) else expr
 
     @staticmethod
     def _truncate_floats_min(expr):
@@ -1309,6 +1320,9 @@ class _SympyExprToCpSat(Printer):
         return var
 
     def _print_Pow(self, expr):
+        lowered = self._linearize_power(expr)
+        if lowered is not expr:
+            return self._print(lowered)
         if expr.exp == 2:
             base = self._print(expr.base)
             return self._print_multiply_two(base, base)

@@ -2134,7 +2134,7 @@ class TestSympyExprToCpSatPrinter(TestCase):
             printer = _SympyExprToCpSat(cp_model.CpModel(), {}, buffer_map)
             for exp in (0.25, sympy.Rational(1, 4), 0.15, 0.68, 0.75, -0.25):
                 with self.subTest(name=name, exp=exp):
-                    approx = printer._inv_log_sym(sym**exp)
+                    approx = printer._linearize_power(sym**exp)
                     self.assertIsInstance(approx, sympy.Piecewise)
                     for v in values:
                         want = v ** float(exp)
@@ -2145,7 +2145,7 @@ class TestSympyExprToCpSatPrinter(TestCase):
         n = sympy.Symbol("n")
         split = sympy.Symbol("split_x", integer=True, positive=True)
         printer = _SympyExprToCpSat(cp_model.CpModel(), {}, {})
-        self.assertEqual(printer._inv_log_sym(split**n), split**n)
+        self.assertEqual(printer._linearize_power(split**n), split**n)
 
     def test_ramer_douglas_peucker_keeps_the_points_a_line_misses(self):
         # Collinear points keep only the ends; a kink is kept, and points
@@ -2170,12 +2170,12 @@ class TestSympyExprToCpSatPrinter(TestCase):
         module = "torch_spyre._inductor.scratchpad.cpsat_expr_printer"
         with mock.patch(f"{module}._LINEARIZE_MAX_BREAKPOINTS", 2):
             with self.assertRaisesRegex(ValueError, "breakpoints"):
-                printer._inv_log_sym(split**0.25)
+                printer.convert(split**0.25)
 
     def test_negative_power_with_a_zero_candidate_is_left_alone(self):
         tile = sympy.Symbol("tile_x", integer=True, nonnegative=True)
         printer = _SympyExprToCpSat(cp_model.CpModel(), {}, {"tile_x": (None, [0, 2])})
-        self.assertEqual(printer._inv_log_sym(tile**-0.5), tile**-0.5)
+        self.assertEqual(printer._linearize_power(tile**-0.5), tile**-0.5)
 
     def test_fractional_power_inside_max_matches_brute_force(self):
         # The power sits inside a Max, as the PT efficiency sits inside the cost
@@ -2305,23 +2305,27 @@ class TestSympyExprToCpSatPrinter(TestCase):
 
     def test_a_curve_over_one_buffer_is_its_quantized_value_table(self):
         # Within the RDP and quantization budgets of the exact power at every
-        # division, through one element lookup.
+        # division, through one element lookup. A power of one symbol reaches
+        # the printer, which lowers it; one of a product is merged first.
         menu = {"split_a": [1, 2, 4, 8, 16, 32], "tile_a": [1, 4, 2, 64, 8, 512]}
-        model, division, sym_map, buffer_map, (a, t) = self._one_buffer(menu)
-        expr = 7.0 * (a * t) ** 0.15
-        printer = _SympyExprToCpSat(model, sym_map, buffer_map)
-        cp_expr = printer.convert(expr)
         budget = (1 + _LINEARIZE_TOLERANCE) * (1 + _QUANTIZE_TOLERANCE) - 1
-        for i, values in enumerate(zip(*menu.values())):
-            with self.subTest(division=i):
-                fixed = model.clone()
-                fixed.add(division == i)
-                solver = cp_model.CpSolver()
-                self.assertEqual(solver.solve(fixed), cp_model.OPTIMAL)
-                exact = 7.0 * math.prod(values) ** 0.15
-                self.assertLessEqual(
-                    abs(solver.float_value(cp_expr) - exact), budget * exact
-                )
+        for merged in (True, False):
+            model, division, sym_map, buffer_map, (a, t) = self._one_buffer(menu)
+            expr = 7.0 * (a * t if merged else a) ** 0.15
+            printer = _SympyExprToCpSat(model, sym_map, buffer_map)
+            self.assertEqual(printer._rewrite(expr).has(sympy.Pow), not merged)
+            cp_expr = printer.convert(expr)
+            for i, values in enumerate(zip(*menu.values())):
+                with self.subTest(merged=merged, division=i):
+                    fixed = model.clone()
+                    fixed.add(division == i)
+                    solver = cp_model.CpSolver()
+                    self.assertEqual(solver.solve(fixed), cp_model.OPTIMAL)
+                    product = math.prod(values) if merged else values[0]
+                    exact = 7.0 * product**0.15
+                    self.assertLessEqual(
+                        abs(solver.float_value(cp_expr) - exact), budget * exact
+                    )
 
     def test_a_derate_product_is_pushed_into_the_byte_min(self):
         # mem * (1 / eff) * (1 / spill): residency-gated bytes in a Min times two
