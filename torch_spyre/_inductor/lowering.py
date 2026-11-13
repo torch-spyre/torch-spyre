@@ -1450,6 +1450,65 @@ def lower_mean_default(x, *, dtype=None):
     return lower_mean(x, axis=axis, keepdim=False, dtype=dtype)
 
 
+def _lower_sum_impl(x, axis, keepdim, dtype=None):
+    comp_dtype = _promoted_dtype(x, kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT)
+
+    if dtype is not None:
+        result_dtype = dtype
+    elif not x.get_dtype().is_floating_point:
+        result_dtype = torch.int64
+    else:
+        result_dtype = x.get_dtype()
+
+    if x.get_dtype() != comp_dtype:
+        x_comp = to_dtype(x, comp_dtype)
+        origin = x.get_origin_node() if isinstance(x, ir.IRNode) else None
+        _ensure_synthetic_origin(
+            x_comp,
+            torch.ops.prims.convert_element_type.default,
+            () if origin is None else (origin,),
+        )
+        x_comp.realize()
+    else:
+        x_comp = x
+
+    kwargs = lowering._make_reduction_inner(
+        x_comp,
+        axis=axis,
+        keepdims=keepdim,
+        dtype=comp_dtype,
+        override_return_dtype=None,
+    )
+    result = Reduction.create(
+        reduction_type="sum",
+        input_node=x_comp,
+        **kwargs,
+    )
+    result.realize()
+
+    if comp_dtype != result_dtype:
+        skip_trunc = not x.get_dtype().is_floating_point
+        return to_dtype(result, result_dtype, skip_trunc=skip_trunc)
+    return result
+
+
+@register_spyre_lowering(torch.ops.aten.sum.dim_IntList, type_promotion_kind=None)
+def lower_sum_dim(x, dim=None, keepdim=False, *, dtype=None):
+    if dim is None:
+        axis = list(range(len(x.get_size())))
+    elif isinstance(dim, int):
+        axis = [dim]
+    else:
+        axis = list(dim)
+    return _lower_sum_impl(x, axis=axis, keepdim=keepdim, dtype=dtype)
+
+
+@register_spyre_lowering(torch.ops.aten.sum.default, type_promotion_kind=None)
+def lower_sum_default(x, *, dtype=None):
+    axis = list(range(len(x.get_size())))
+    return _lower_sum_impl(x, axis=axis, keepdim=False, dtype=dtype)
+
+
 @register_spyre_lowering(torch.ops.spyre.gelu)
 def lower_gelu(x, approximate="none"):
     pw = Pointwise.create(
