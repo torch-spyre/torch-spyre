@@ -61,6 +61,15 @@ EXTRA_CASES["matmul_bias_tiled_n"] = (
     [(256, 64), (64, 8192), (8192,)],
     2 * MB,
 )
+# A bmm that consumes a tiled bmm over a shared batch dim joins its producer's group
+# (two Reductions, one loop). A pointwise producer or a 2D matmul feeding a matmul never
+# does: the grouper refuses it ("cannot join them"), so this is the one case of a matmul
+# consuming a tiled producer.
+EXTRA_CASES["bmm_consuming_a_tiled_bmm"] = (
+    lambda a, b, c: torch.bmm(torch.bmm(a, b), c),
+    [(8, 2048, 64), (8, 64, 256), (8, 256, 64)],
+    4 * MB,
+)
 PLAN_VS_LEGACY = [
     "pointwise_copy_out",
     "pointwise_chain",
@@ -415,3 +424,11 @@ def test_a_transposed_consumer_is_checked_numerically_only(lowering):
     reference = fn(*[a.float() for a in args])
     wrong = ((compiled.outputs[0] - reference).abs() > 0.05).float().mean().item()
     assert wrong == 0.0, wrong
+
+
+def test_a_bmm_consuming_a_tiled_bmm_is_one_two_op_group():
+    fn, shapes, limit = EXTRA_CASES["bmm_consuming_a_tiled_bmm"]
+    args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
+    compiled = compile_with("plan", fn, args, limit)
+    assert compiled.groups == [(2, ["Reduction", "Reduction"], [2])], compiled.groups
+    assert _relative_error(compiled.outputs, fn(*[a.float() for a in args])) < 2e-2
