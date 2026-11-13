@@ -51,6 +51,31 @@ def _run(fn, *args):
     return torch.compile(fn, dynamic=False)(*[a.to("spyre") for a in args]).cpu()
 
 
+def _scalar_key_pairs(key):
+    """The six key pairs of one key, from the scalar key schedule."""
+    rk = rng.simon32_round_keys(key)
+    return [(~rk[2 * j] & M16) | ((~rk[2 * j + 1] & M16) << 16) for j in range(6)]
+
+
+@pytest.mark.parametrize("rows", [1, 300])
+@pytest.mark.parametrize("as_tensor", [False, True])
+def test_key_pairs_match_scalar_schedule(rows, as_tensor):
+    rng_ = np.random.default_rng(3)
+    keys = [int(k) for k in rng_.integers(0, 2**64, rows, dtype=np.uint64)]
+    keys[: min(rows, 4)] = [0, 2**63 - 1, 2**63, 2**64 - 1][: min(rows, 4)]
+    arg = (
+        torch.tensor([k - 2**64 if k >= 2**63 else k for k in keys])
+        if as_tensor
+        else keys
+    )
+    got = rng.simon32_key_pairs(arg, device="cpu")
+    assert len(got) == 6
+    for j, pair in enumerate(got):
+        assert pair.shape == (rows, 1) and pair.dtype == torch.int32
+        want = [_scalar_key_pairs(k)[j] for k in keys]
+        assert pair.view(-1).numpy().view(np.uint32).tolist() == want
+
+
 @pytest.mark.parametrize("shape", [(3, 256), (4, 130)])
 def test_simon32x2_two_rounds(shape):
     rng_ = np.random.default_rng(1)

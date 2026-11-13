@@ -28,6 +28,7 @@ Typical use, with one 64-bit key per row and the token index as the counter::
 
 from typing import Sequence
 
+import numpy as np
 import torch
 
 _M16 = 0xFFFF
@@ -52,23 +53,42 @@ def simon32_round_keys(key: int, rounds: int = ROUNDS) -> list[int]:
     return rk
 
 
+def _as_uint64_keys(keys: Sequence[int] | torch.Tensor) -> np.ndarray:
+    """64-bit keys as a uint64 host array (an int64 tensor is read as unsigned)."""
+    if isinstance(keys, torch.Tensor):
+        return (
+            keys.to(device="cpu", dtype=torch.int64).reshape(-1).numpy().view(np.uint64)
+        )
+    return np.array([int(k) & (2**64 - 1) for k in keys], dtype=np.uint64)
+
+
 def simon32_key_pairs(
     keys: Sequence[int] | torch.Tensor, device="spyre"
 ) -> list[torch.Tensor]:
     """The six ``keys`` inputs of ``spyre::simon32x2`` for one 64-bit key per row.
 
     Each is an int32 ``[rows, 1]`` tensor holding two round keys, inverted:
-    ``~k_a & 0xFFFF | (~k_b & 0xFFFF) << 16``.
+    ``~k_a & 0xFFFF | (~k_b & 0xFFFF) << 16``. The key schedule runs on the
+    host for all rows at once, and the six tensors reach ``device`` in one copy.
     """
-    if isinstance(keys, torch.Tensor):
-        keys = [int(k) & (2**64 - 1) for k in keys.tolist()]
-    pairs: list[list[int]] = [[] for _ in range(ROUNDS // 2)]
-    for key in keys:
-        rk = simon32_round_keys(key)
-        for j in range(ROUNDS // 2):
-            v = (~rk[2 * j] & _M16) | ((~rk[2 * j + 1] & _M16) << 16)
-            pairs[j].append(v - 2**32 if v >= 2**31 else v)
-    return [torch.tensor(p, dtype=torch.int32).view(-1, 1).to(device) for p in pairs]
+    m = np.uint64(_M16)
+
+    def rotl(x, r):
+        return ((x << np.uint64(r)) | (x >> np.uint64(16 - r))) & m
+
+    k64 = _as_uint64_keys(keys)
+    k = [(k64 >> np.uint64(16 * i)) & m for i in range(4)]
+    rk = []
+    for i in range(ROUNDS):
+        rk.append(k[0])
+        tmp = rotl(k[3], 13) ^ k[1]
+        tmp ^= rotl(tmp, 15)
+        new = (~k[0] & m) ^ tmp ^ np.uint64(int(_Z0[i % 62]) ^ 3)
+        k = [k[1], k[2], k[3], new]
+    rk_a = np.stack(rk)  # [ROUNDS, rows]
+    pairs = (~rk_a[0::2] & m) | ((~rk_a[1::2] & m) << np.uint64(16))
+    t = torch.from_numpy(pairs.astype(np.uint32).view(np.int32))
+    return list(t.reshape(ROUNDS // 2, -1, 1).to(device).unbind(0))
 
 
 def simon32_bits(counter: torch.Tensor, key_pairs: Sequence[torch.Tensor]):
