@@ -34,23 +34,30 @@ test_suite_config:
             - NumpyTests::test_boolean_assignment_value_mismatch
           mode: skip  # skip: InductorError (missing FixedTiledLayout) on upstream PyTorch bump
 
-        # Slice itself can succeed; assertEqual → isclose on int64 dies on
-        # bool from IEEE_INT32. Covered by
-        # https://github.com/torch-spyre/torch-spyre/issues/4332
+        # The slice itself succeeds; the assertEqual that follows compares int64 tensors and
+        # compile fails with "abs on DataFormats.IEEE_INT32".
+        # No open issue yet: https://github.com/torch-spyre/torch-spyre/issues/6199
         - names:
-            - TestIndexing::test_step  # issue 4332
-            - TestIndexing::test_variable_slicing  # issue 4332
-          mode: xfail  # xfail: torch.bool result from operands with IEEE_INT32
+            - TestIndexing::test_step  # issue 6199
+            - TestIndexing::test_variable_slicing  # issue 6199
+            - NumpyTests::test_empty_tuple_index  # issue 6199
+            - NumpyTests::test_ellipsis_index  # issue 6199
+            - NumpyTests::test_single_int_index  # issue 6199
+            - NumpyTests::test_single_bool_index  # issue 6199
+          mode: xfail  # xfail: Spyre backend does not support: abs on DataFormats.IEEE_INT32
 
         # ---------------------------------------------------------------------------
         # torch.Tensor.__setitem__ with step slices and integer row assignment.
         # These use slice_scatter and basic row setitem — NOT tensor-index indirect
-        # access — and have known failures on Spyre. Excluded from CI.
+        # access. Both die on copy_from_d2d of a sliced view whose storage_offset is
+        # not stick-aligned (test_step_assignment: float32, offset 1;
+        # test_int_assignment: int64, offset 2).
+        # Covered by https://github.com/torch-spyre/torch-spyre/issues/4329
         # ---------------------------------------------------------------------------
         - names:
-            - TestIndexing::test_step_assignment
-            - TestIndexing::test_int_assignment
-          mode: skip
+            - TestIndexing::test_step_assignment  # issue 4329
+            - TestIndexing::test_int_assignment  # issue 4329
+          mode: xfail  # xfail: copy_from_d2d sliced view requires stick-aligned storage_offset
 
         # ===========================================================================
         # INDIRECT ACCESS — ALL tests below exercise tensor-index-mediated memory
@@ -59,58 +66,55 @@ test_suite_config:
 
         # ---------------------------------------------------------------------------
         # aten::index.Tensor — indirect read via tensor index
-        # YAML first abort: aten::index.Tensor_out.
-        # https://github.com/torch-spyre/torch-spyre/issues/1219
+        # The first failure in these two is the assertEqual that follows the index:
+        # aten::isnan (https://github.com/torch-spyre/torch-spyre/issues/1738)
         # ---------------------------------------------------------------------------
         - names:
-            - TestIndexing::test_index  # issue 1219
-          mode: xfail  # xfail: aten::index.Tensor_out not registered
+            - TestIndexing::test_index  # issue 1738
+            - TestIndexing::test_advancedindex  # issue 1738
+          mode: xfail  # xfail: aten::isnan not registered
+
+        # These two raised before aten::index.Tensor gained the x[index] kernel and now
+        # pass on the latest image (confirmed locally with the normal run and --runxfail).
+        - names:
+            - TestIndexing::test_advancedindex_big
+            - TestIndexing::test_index_getitem_copy_bools_slices
+          mode: mandatory_success
 
         # ---------------------------------------------------------------------------
-        # Advanced (fancy) indexing with integer tensor indices
-        # Same aten::index.Tensor_out as test_index.
+        # Advanced (fancy) indexing with a list of index tensors, a bool/byte mask, or an
+        # index on a dim other than 0. Spyre aten::index.Tensor implements only
+        # x[index] with a single 1-D int32/int64 index tensor on dim 0 and raises
+        # NotImplementedError for every other form. Covered by the open request to
+        # implement index.Tensor with a list of index tensors:
         # https://github.com/torch-spyre/torch-spyre/issues/1219
+        # Bool/byte masks additionally need aten::nonzero (#4498).
         # ---------------------------------------------------------------------------
         - names:
-            - TestIndexing::test_advancedindex  # issue 1219
-            - TestIndexing::test_advancedindex_big  # issue 1219
             - TestIndexing::test_int_indices  # issue 1219
             - TestIndexing::test_int_indices2d  # issue 1219
             - TestIndexing::test_int_indices_broadcast  # issue 1219
             - TestIndexing::test_list_indices  # issue 1219
             - TestIndexing::test_basic_advanced_combined  # issue 1219
             - TestIndexing::test_ellipsis_tensor  # issue 1219
-          mode: xfail  # xfail: aten::index.Tensor_out not registered
-
-        # ---------------------------------------------------------------------------
-        # Boolean / byte mask — first abort is NOT the same for every name.
-        # Tensor_out: test_index_scalar_with_bool_mask,
-        #   test_index_getitem_copy_bools_slices → #1219
-        # nonzero: test_bool_indices*, test_byte_mask* (except assignment)
-        # _index_put_impl_: *_assignment
-        # ---------------------------------------------------------------------------
-        - names:
-            - TestIndexing::test_index_getitem_copy_bools_slices  # issue 1219
-          mode: xfail  # xfail: aten::index.Tensor_out not registered
+            - TestIndexing::test_bool_indices  # issue 1219, 4498
+            - TestIndexing::test_bool_indices_accumulate  # issue 1219, 4498
+            - TestIndexing::test_multiple_bool_indices  # issue 1219, 4498
+            - TestIndexing::test_multi_dimensional_bool_mask  # issue 1219, 4498
+            - TestIndexing::test_byte_mask  # issue 1219, 4498
+            - TestIndexing::test_byte_mask_accumulate  # issue 1219, 4498
+            - TestIndexing::test_multiple_byte_mask  # issue 1219, 4498
+          mode: xfail  # xfail: Spyre aten::index.Tensor supports only x[index] with a single 1-D int32/int64 index tensor on dim 0
 
         # Skipped, not xfail: this test puts the Spyre runtime stream into an error state
         # ([flex_runtime_stream] ERRR) even though it is reported as XFAIL. Every later test
         # that touches the device then fails with "StreamInErrorState: cannot launch H2D"
         # (e.g. test_index_tensor_empty_indices, test_invalid_index, test_single_int).
-        # Same root cause as https://github.com/torch-spyre/torch-spyre/issues/1219.
+        # The mask-indexing form it uses is the one in
+        # https://github.com/torch-spyre/torch-spyre/issues/1219
         - names:
             - TestIndexing::test_index_scalar_with_bool_mask  # issue 1219
           mode: skip  # skip: corrupts runtime stream (StreamInErrorState) for later tests
-
-        - names:
-            - TestIndexing::test_bool_indices  # issue 4498
-            - TestIndexing::test_bool_indices_accumulate  # issue 4498
-            - TestIndexing::test_multiple_bool_indices  # issue 4498
-            - TestIndexing::test_multi_dimensional_bool_mask  # issue 4498
-            - TestIndexing::test_byte_mask  # issue 4498
-            - TestIndexing::test_byte_mask_accumulate  # issue 4498
-            - TestIndexing::test_multiple_byte_mask  # issue 4498
-          mode: xfail  # xfail: aten::nonzero not registered
 
         - names:
             - TestIndexing::test_bool_mask_assignment  # issue 692
@@ -124,17 +128,21 @@ test_suite_config:
             - TestIndexing::test_index_setitem_bools_slices  # issue 1738
           mode: xfail  # xfail: aten::isnan not registered
 
-        # Dies on (c > 0).sum() before v[c > 0]. Same missing sum(bool)→int64
-        # as https://github.com/torch-spyre/torch-spyre/issues/461
+        # Dies on (c > 0).sum() before v[c > 0]: compile fails with "unexpected argument
+        # PointwiseOp(op='identity' ... torch.bool ... to fp32t". The bool→int64 sum is the
+        # request in https://github.com/torch-spyre/torch-spyre/issues/461
         - names:
             - TestIndexing::test_byte_mask2d  # issue 461
-          mode: xfail  # xfail: sum on DataFormats.IEEE_INT32
+          mode: xfail  # xfail: unexpected argument PointwiseOp(op='identity') on torch.bool input
 
         # ---------------------------------------------------------------------------
         # aten::index_put / index_put_ — indirect write via tensor index
         # YAML first abort: aten::_index_put_impl_ — already #692.
         # https://github.com/torch-spyre/torch-spyre/issues/692
-        # test_index_src_datatype is a READ (Tensor_out), not put.
+        # test_index_src_datatype is a READ followed by a write; the first failure
+        # differs per dtype, so each has its own entry:
+        #   bfloat16 / float32 / int64 — aten::_index_put_impl_ (#692)
+        #   bool — Spyre aten::index.Tensor does not support bool source tensors (#6043)
         # Upstream dtype coverage:
         #   test_index_put_accumulate_large_tensor  no @dtypes — runs once
         #   test_index_put_src_datatype @dtypes(float16, float32, int8, int16, int32, int64, bfloat16)
@@ -142,8 +150,16 @@ test_suite_config:
         #   test_index_src_datatype     same @dtypes set; same exclusions apply
         # ---------------------------------------------------------------------------
         - names:
-            - TestIndexing::test_index_src_datatype  # issue 1219
-          mode: xfail  # xfail: aten::index.Tensor_out not registered
+            - TestIndexing::test_index_src_datatype  # issue 6043
+          mode: xfail  # xfail: Spyre aten::index.Tensor does not support bool source tensors
+          edits:
+            dtypes:
+              include:
+                - name: bool
+
+        - names:
+            - TestIndexing::test_index_src_datatype  # issue 692
+          mode: xfail  # xfail: aten::_index_put_impl_ not registered
 
         - names:
             - TestIndexing::test_index_put_accumulate_large_tensor  # issue 692
@@ -177,13 +193,22 @@ test_suite_config:
 
         # ---------------------------------------------------------------------------
         # torch.index_copy / index_copy_ — indirect write at indexed positions
-        # YAML first abort is aten::randperm.generator_out (setup), not index_copy.
-        # test_index_copy_scalars currently PASSes (CPU fallback).
-        # test_index_copy dtypes:  — aten::randperm.generator_out (#4499).
+        # test_index_copy: aten::randperm.generator_out (#4499) in setup.
+        # test_index_copy_scalars: bool fails on the bool result from IEEE_INT32
+        # (#4332); the other dtypes pass. The bool entry is listed first so it is
+        # selected before the entry with no dtype restriction.
         # ---------------------------------------------------------------------------
         - names:
             - TestIndexing::test_index_copy  # issue 4499
           mode: xfail  # xfail: aten::randperm.generator_out not registered
+
+        - names:
+            - TestIndexing::test_index_copy_scalars  # issue 4332
+          mode: xfail  # xfail: torch.bool result from operands with device format IEEE_INT32
+          edits:
+            dtypes:
+              include:
+                - name: bool
 
         - names:
             - TestIndexing::test_index_copy_scalars
@@ -210,47 +235,54 @@ test_suite_config:
 
         # ---------------------------------------------------------------------------
         # torch.index_select — selects along a dimension using an index tensor
-        # YAML xfails the whole function name (runner cannot split dtypes).
-        # First error is NOT the same for every parametrization:
-        #   fp16 / fp32 / int64 — copy_from_d2d index offset=1  (#4329)
+        # The first error differs per dtype, so each dtype group has its own entry:
+        #   float16 / float32 / int64 — copy_from_d2d storage_offset 1  (#4329)
         #   bool — torch.bool from IEEE_INT32  (#4332)
         #   bfloat16 — aten::isnan in assertEqual  (#1738)
-        #   float8_e4m3fnuz / float8_e5m2 — dtype not supported,
-        #     not #4329. is_supported_dtype / spyre_empty. FR #4497.
-        #   float8_e4m3fn / float8_e5m2fnuz — allocated, then same #4329
-        #     index clone (src dtype is coincidental).
-        # Covered for CI by https://github.com/torch-spyre/torch-spyre/issues/4329
-        # https://github.com/torch-spyre/torch-spyre/issues/4497
         # @onlyNativeDeviceTypes: privateuse1 IS treated as native — collected on Spyre.
         # Upstream dtype coverage:
         #   @dtypes(*all_types_complex_float8_and(torch.half, torch.bool, torch.bfloat16))
         #   Active after filter: float16, float32, int64, bfloat16, bool
         # ---------------------------------------------------------------------------
         - names:
-            - TestIndexing::test_index_select  # issue 4329 (fp16/fp32/int64 first error)
+            - TestIndexing::test_index_select  # issue 4329
           mode: xfail  # xfail: copy_from_d2d sliced view requires stick-aligned storage_offset
+          edits:
+            dtypes:
+              include:
+                - name: float16
+                - name: float32
+                - name: int64
+
+        - names:
+            - TestIndexing::test_index_select  # issue 4332
+          mode: xfail  # xfail: torch.bool result from operands with device format IEEE_INT32
+          edits:
+            dtypes:
+              include:
+                - name: bool
+
+        - names:
+            - TestIndexing::test_index_select  # issue 1738
+          mode: xfail  # xfail: aten::isnan not registered
+          edits:
+            dtypes:
+              include:
+                - name: bfloat16
 
         # ---------------------------------------------------------------------------
         # NumpyTests — integer fancy indexing
-        # test_empty_fancy_index: Tensor_out (#1219)
+        # test_empty_fancy_index: fills an empty tensor (RuntimeError, https://github.com/torch-spyre/torch-spyre/issues/6268)
         # test_index_is_larger / test_broadcast_subspace: _index_put_impl_ (#692)
         # ---------------------------------------------------------------------------
         - names:
-            - NumpyTests::test_empty_fancy_index  # issue 1219
-          mode: xfail  # xfail: aten::index.Tensor_out not registered
+            - NumpyTests::test_empty_fancy_index  # issue 6268
+          mode: xfail  # xfail: RuntimeError: spyre_fill_tensor: cannot fill empty tensor
 
         - names:
             - NumpyTests::test_index_is_larger  # issue 692
             - NumpyTests::test_broadcast_subspace  # issue 692
           mode: xfail  # xfail: aten::_index_put_impl_ not registered
-
-        # assertEqual / isclose on int64 views. Covered by
-        # https://github.com/torch-spyre/torch-spyre/issues/4332
-        - names:
-            - NumpyTests::test_empty_tuple_index  # issue 4332
-            - NumpyTests::test_ellipsis_index  # issue 4332
-            - NumpyTests::test_single_int_index  # issue 4332
-          mode: xfail  # xfail: torch.bool result from operands with IEEE_INT32
 
         # Dies on ind[-1] = 10 (offset=19) before the IndexError check.
         # Covered by https://github.com/torch-spyre/torch-spyre/issues/4329
@@ -260,53 +292,48 @@ test_suite_config:
 
         # ---------------------------------------------------------------------------
         # NumpyTests — boolean mask indexing
-        # Tensor_out (#1219): single_bool, weirdness*, alldims
-        # nonzero: onedim, twodim, boolean_list_indexing
-        # _index_put_impl_ (#692): broaderrors_indexing
+        # Mask / list indexing is the x[index] subset limit (#1219), plus aten::nonzero
+        # (#4498) for the bool forms. test_broaderrors_indexing hits the same limit
+        # before it reaches _index_put_impl_.
         # ---------------------------------------------------------------------------
         - names:
-            - NumpyTests::test_single_bool_index  # issue 1219
             - NumpyTests::test_boolean_indexing_weirdness  # issue 1219
             - NumpyTests::test_boolean_indexing_weirdness_tensors  # issue 1219
             - NumpyTests::test_boolean_indexing_alldims  # issue 1219
-          mode: xfail  # xfail: aten::index.Tensor_out not registered
-
-        - names:
-            - NumpyTests::test_boolean_indexing_onedim  # issue 4498
-            - NumpyTests::test_boolean_indexing_twodim  # issue 4498
-            - NumpyTests::test_boolean_list_indexing  # issue 4498
-          mode: xfail  # xfail: aten::nonzero not registered
-
-        - names:
-            - NumpyTests::test_broaderrors_indexing  # issue 692
-          mode: xfail  # xfail: aten::_index_put_impl_ not registered
+            - NumpyTests::test_broaderrors_indexing  # issue 1219
+            - NumpyTests::test_boolean_indexing_onedim  # issue 1219, 4498
+            - NumpyTests::test_boolean_indexing_twodim  # issue 1219, 4498
+            - NumpyTests::test_boolean_list_indexing  # issue 1219, 4498
+          mode: xfail  # xfail: Spyre aten::index.Tensor supports only x[index] with a single 1-D int32/int64 index tensor on dim 0
 
         # ---------------------------------------------------------------------------
-        # Boolean shape mismatch validation
-        # IndexError fires at Python/ATen dimension-check before reaching Spyre kernel.
+        # Error-type validation. CPU raises IndexError / RuntimeError from its own argument
+        # checks; Spyre's aten::index.Tensor raises NotImplementedError first, so the
+        # expected exception type is wrong. No open issue yet: https://github.com/torch-spyre/torch-spyre/issues/6204
         # ---------------------------------------------------------------------------
         - names:
-            - NumpyTests::test_boolean_shape_mismatch
-          mode: mandatory_success
+            - NumpyTests::test_boolean_shape_mismatch  # issue 6204
+            - TestIndexing::test_index_tensor_empty_indices  # issue 6204
+          mode: xfail  # xfail: NotImplementedError raised where IndexError is expected
 
-        # ---------------------------------------------------------------------------
-        # Error-validation tests: IndexError / RuntimeError at Python/ATen layer
-        # before kernel dispatch. All exercise the indexing path.
-        # ---------------------------------------------------------------------------
         - names:
-            - TestIndexing::test_index_tensor_empty_indices
             - TestIndexing::test_empty_ndim_index_bool
             - TestIndexing::test_index_limits
           mode: mandatory_success
 
         # ---------------------------------------------------------------------------
-        # aten::index.Tensor extended edge cases — Tensor_out
-        # https://github.com/torch-spyre/torch-spyre/issues/1219
+        # aten::index.Tensor extended edge cases
+        # test_empty_ndim_index: x[index] subset limit (#1219).
+        # test_empty_index: compile fails on a stick expression (3*d0 + d1), same family
+        # as https://github.com/torch-spyre/torch-spyre/issues/3454
         # ---------------------------------------------------------------------------
         - names:
-            - TestIndexing::test_empty_index  # issue 1219
             - TestIndexing::test_empty_ndim_index  # issue 1219
-          mode: xfail  # xfail: aten::index.Tensor_out not registered
+          mode: xfail  # xfail: Spyre aten::index.Tensor supports only x[index] with a single 1-D int32/int64 index tensor on dim 0
+
+        - names:
+            - TestIndexing::test_empty_index  # issue 3454
+          mode: xfail  # xfail: Unexpected stick expression 3*d0 + d1
 
         # assertEqual(a[0], a[zero]) → isclose → aten::isnan. Covered by
         # https://github.com/torch-spyre/torch-spyre/issues/1738
@@ -325,11 +352,11 @@ test_suite_config:
 
         # ---------------------------------------------------------------------------
         # aten::index_put extended cases — indirect write (#692)
-        # test_index_ind_dtype is a READ (Tensor_out #1219).
+        # test_index_ind_dtype is a READ with a non-int32/int64 index dtype (#1219).
         # ---------------------------------------------------------------------------
         - names:
             - TestIndexing::test_index_ind_dtype  # issue 1219
-          mode: xfail  # xfail: aten::index.Tensor_out not registered
+          mode: xfail  # xfail: Spyre aten::index.Tensor supports only x[index] with a single 1-D int32/int64 index tensor on dim 0
 
         - names:
             - TestIndexing::test_index_put_accumulate_expanded_values  # issue 692
@@ -337,14 +364,14 @@ test_suite_config:
           mode: xfail  # xfail: aten::_index_put_impl_ not registered
 
         # Hardcodes torch.double on the device (except MPS). Same spyre_empty
-        # guard as closed https://github.com/torch-spyre/torch-spyre/issues/1228
+        # guard as the open https://github.com/torch-spyre/torch-spyre/issues/1228
         - names:
             - TestIndexing::test_index_put_accumulate_duplicate_indices  # issue 1228
-          mode: skip  # skip: Spyre backend does not support dtype Double
+          mode: xfail  # xfail: Spyre backend does not support dtype Double
 
         # ---------------------------------------------------------------------------
         # torch.index_add — indirect accumulation via index tensor
-        # Not yet implemented on Spyre.
+        # test_index_add_large_index_vectorized_path passes on Spyre.
         # Upstream dtype coverage: @dtypes(*all_types_and(torch.half, torch.bfloat16))
         # Active after filter: float16, int64, bfloat16
         # ---------------------------------------------------------------------------

@@ -19,7 +19,6 @@ test_suite_config:
         # Stick expression 2*d0 + d1 — contiguous 2D dtype-cast of EmbeddingBag
         # weight (5, 2) via arange().view_as(weight).to(dtype).
         # Covered by https://github.com/torch-spyre/torch-spyre/issues/3455
-        # 37 parametrized cases
         # ---------------------------------------------------------------------------
         - names:
             - TestEmbeddingNNDeviceType::test_EmbeddingBag_empty_per_sample_weights_and_offsets  # issue 3455
@@ -56,23 +55,21 @@ test_suite_config:
             - TestEmbeddingNNDeviceType::test_embedding_max_norm_device  # issue 4320
           mode: xfail  # xfail: Could not run 'aten::embedding_renorm_' 
         # ---------------------------------------------------------------------------
-        # int32 aten.mul has no SDSC mapping (sdsc: 0_mul). Upstream builds
-        # offsets with arange(0, B, dtype=int32).mul_(L).
-        # Covered by https://github.com/torch-spyre/torch-spyre/issues/4325
-        # YAML xfails the whole function name. The int64 parametrization of
-        # this test actually dies later on fp32 softmax / issue 2534.
+        # EmbeddingBag with per_sample_weights and no offsets (int32 and int64
+        # parametrizations): aten::_embedding_bag is not registered.
+        # Covered by https://github.com/torch-spyre/torch-spyre/issues/4319
         # ---------------------------------------------------------------------------
         - names:
-            - TestEmbeddingNNDeviceType::test_EmbeddingBag_per_sample_weights_and_no_offsets  # issue 4325
-          mode: xfail  # xfail: Scheduler failed to find a suitable op mapping for sdsc: 0_mul 
+            - TestEmbeddingNNDeviceType::test_EmbeddingBag_per_sample_weights_and_no_offsets  # issue 4319
+          mode: xfail  # xfail: NotImplementedError: aten::_embedding_bag is not registered
         # ---------------------------------------------------------------------------
-        # fp32 reduction on a padded stick — coordinate masking only up to 16bit.
-        # output[0][0].sum() on embedding dim 20. Covered by
-        # https://github.com/torch-spyre/torch-spyre/issues/2534
+        # F.embedding with padding_idx (float32): copy_from_d2d requires a
+        # stick-aligned storage_offset (storage_offset: 120, elems_per_stick=32).
+        # Covered by https://github.com/torch-spyre/torch-spyre/issues/4329
         # ---------------------------------------------------------------------------
         - names:
-            - TestEmbeddingNNDeviceType::test_embedding_padding_idx  # issue 2534
-          mode: xfail  # xfail: Coordinate masking is supported only up to 16bit element types 
+            - TestEmbeddingNNDeviceType::test_embedding_padding_idx  # issue 4329
+          mode: xfail  # xfail: copy_from_d2d sliced view requires stick-aligned storage_offset
         # ---------------------------------------------------------------------------
         # Eager clone of a 1-D int64 select at storage_offset=1: copy_from_d2d
         # requires a stick-aligned offset (elems_per_stick=32). Test dies on
@@ -93,24 +90,39 @@ test_suite_config:
         # ---------------------------------------------------------------------------
         # On-device float64 (Double) is not supported. Tests hardcode
         # torch.double / torch.float64 on the Spyre device, so YAML
-        # supported_dtypes cannot filter them. Same traceback as closed
+        # supported_dtypes cannot filter them. Covered by the open issue
         # https://github.com/torch-spyre/torch-spyre/issues/1228
         # ---------------------------------------------------------------------------
         - names:
-            - TestEmbeddingNNDeviceType::test_EmbeddingBag_per_sample_weights_failures  # dtype Double
-            - TestEmbeddingNNDeviceType::test_embedding_bag_dimension_errors  # dtype Double
-          mode: skip  # skip: Spyre backend does not support dtype Double 
+            - TestEmbeddingNNDeviceType::test_EmbeddingBag_per_sample_weights_failures  # issue 1228
+            - TestEmbeddingNNDeviceType::test_embedding_bag_dimension_errors  # issue 1228
+          mode: xfail  # xfail: Spyre backend does not support dtype Double
         # ---------------------------------------------------------------------------
-        # Training / backward / autograd 
+        # Backward / autograd tests. Each fails on a different op.
         # ---------------------------------------------------------------------------
+        # aten::_embedding_bag / _embedding_bag_forward_only not registered.
+        # Covered by https://github.com/torch-spyre/torch-spyre/issues/4319
         - names:
-            - TestEmbeddingNNDeviceType::test_embedding_backward_atomic_accumulate_kernel
-            - TestEmbeddingNNDeviceType::test_embedding_backward_atomic_accumulate_kernel_with_padding_idx
-            - TestEmbeddingNNDeviceType::test_embedding_backward_large_batch_overflow
-            - TestEmbeddingNNDeviceType::test_embedding_bag_per_sample_weights_grad
-            - TestEmbeddingNNDeviceType::test_embedding_max_norm_backward
-            - TestEmbeddingNNDeviceType::test_embedding_max_norm_fwd_AD
-          mode: skip
+            - TestEmbeddingNNDeviceType::test_embedding_bag_per_sample_weights_grad  # issue 4319
+          mode: xfail  # xfail: Could not run 'aten::_embedding_bag[_forward_only]'
+        # aten::embedding_renorm_ not registered (max_norm).
+        # Covered by https://github.com/torch-spyre/torch-spyre/issues/4320
+        - names:
+            - TestEmbeddingNNDeviceType::test_embedding_max_norm_backward  # issue 4320
+            - TestEmbeddingNNDeviceType::test_embedding_max_norm_fwd_AD  # issue 4320
+          mode: xfail  # xfail: Could not run 'aten::embedding_renorm_'
+        # Embedding backward (float16, float32): buf0 (aten.repeat.default) has
+        # no supported output layout; output size=[5000] (4000 with padding_idx).
+        # https://github.com/torch-spyre/torch-spyre/issues/6196
+        - names:
+            - TestEmbeddingNNDeviceType::test_embedding_backward_atomic_accumulate_kernel  # issue 6196
+            - TestEmbeddingNNDeviceType::test_embedding_backward_atomic_accumulate_kernel_with_padding_idx  # issue 6196
+          mode: xfail  # xfail: buf0 (aten.repeat.default): no supported output layout found for any of 1 candidate input layouts
+        # Embedding backward (bfloat16): sum on an IEEE_INT32 tensor is unsupported.
+        # Same missing sum(bool/int) -> int64 as https://github.com/torch-spyre/torch-spyre/issues/461
+        - names:
+            - TestEmbeddingNNDeviceType::test_embedding_backward_large_batch_overflow  # issue 461
+          mode: xfail  # xfail: Unsupported: sum on DataFormats.IEEE_INT32
         # These tests exercise embedding and embedding bag operations across various dtypes and tensor configurations.
         # They are classified as 'skip' on the Spyre backend because they do not engage the torch-spyre layer, indicating they bypass Spyre-specific optimizations or capabilities.
         # The most relevant Spyre limitations include unsupported dtypes like Double, which caused a failure in the test_embedding_dense_grad.
