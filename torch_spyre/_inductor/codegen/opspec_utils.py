@@ -520,16 +520,12 @@ def _relayout_loops(
             stick or leave a stick axis without its lane axis.
     """
     extent: list[int] = []
-    out_strides: list[int] = []
     symbol_dims: dict[sympy.Symbol, list[tuple[int, int]]] = {}
-    out_row_major = row_major_strides(out_size)
     # A stick axis seen without its lane axis yet: sym -> (stick, sticks).
     pending_lane: dict[sympy.Symbol, tuple[int, int]] = {}
     for axis, (kind, sym, stick) in enumerate(out_terms):
-        stride = out_row_major[axis]
         if kind == _DIM_CONST:
             extent.append(1)
-            out_strides.append(stride)
             continue
         if sym in symbol_dims and kind != _DIM_WITHIN_STICK:
             raise NotImplementedError(
@@ -554,16 +550,13 @@ def _relayout_loops(
                     )
                 hi = len(extent)
                 extent += [size // in_stick, in_stick]
-                out_strides += [stride * in_stick, stride]
                 symbol_dims[sym] = [(hi, in_stick), (hi + 1, 1)]
             else:
                 symbol_dims[sym] = [(len(extent), 1)]
                 extent.append(size)
-                out_strides.append(stride)
             continue
         dim = len(extent)
         extent.append(out_size[axis])
-        out_strides.append(stride)
         if kind == _DIM_OUTER_STICK:
             symbol_dims[sym] = [(dim, stick)]
             pending_lane[sym] = (stick, out_size[axis])
@@ -587,10 +580,7 @@ def _relayout_loops(
             f"OpSpec relayout: output stick axes {sorted(map(str, pending_lane))} "
             "have no lane axis"
         )
-    assert tuple(out_strides) == tuple(row_major_strides(extent)), (
-        "a refined output layout must stay row major"
-    )
-    return extent, out_strides, symbol_dims
+    return extent, row_major_strides(extent), symbol_dims
 
 
 def _relayout_input_strides(
