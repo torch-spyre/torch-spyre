@@ -2240,6 +2240,69 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ]
             ),
         },
+        # int32 sub has no native intrinsic, so lower_sub computes it as
+        # x + (-alpha) * y with addi32toi32 / muli32toi32. Integer results are
+        # exact, so compare_with_cpu's tolerance does not hide an off-by-one.
+        ("test_sub_alpha_int32", "test_exact_op_cpu"): {
+            "ops_dict": {
+                "sub": torch.sub,
+                "sub_alpha_3": lambda a, b: torch.sub(a, b, alpha=3),
+                "sub_alpha_neg2": lambda a, b: torch.sub(a, b, alpha=-2),
+            },
+            "param_sets": {
+                "67x256": (
+                    torch.randint(
+                        -1000,
+                        1001,
+                        (67, 256),
+                        dtype=torch.int32,
+                        generator=torch.Generator().manual_seed(0x5B00),
+                    ),
+                    torch.randint(
+                        -1000,
+                        1001,
+                        (67, 256),
+                        dtype=torch.int32,
+                        generator=torch.Generator().manual_seed(0x5B01),
+                    ),
+                ),
+                "broadcast": (
+                    torch.randint(
+                        -1000,
+                        1001,
+                        (2880,),
+                        dtype=torch.int32,
+                        generator=torch.Generator().manual_seed(0x5B02),
+                    ),
+                    torch.randint(
+                        -1000,
+                        1001,
+                        (1, 11, 2880),
+                        dtype=torch.int32,
+                        generator=torch.Generator().manual_seed(0x5B03),
+                    ),
+                ),
+            },
+        },
+        # The same int32 rewrite with a Python scalar y: x + (-alpha * y).
+        ("test_sub_scalar_int32", "test_exact_op_cpu"): {
+            "ops_dict": {
+                "sub_scalar_5": lambda x: torch.sub(x, 5),
+                "sub_scalar_neg7_alpha_3": lambda x: torch.sub(x, -7, alpha=3),
+                "sub_scalar_4_alpha_neg2": lambda x: torch.sub(x, 4, alpha=-2),
+            },
+            "param_sets": {
+                "67x256": (
+                    torch.randint(
+                        -1000,
+                        1001,
+                        (67, 256),
+                        dtype=torch.int32,
+                        generator=torch.Generator().manual_seed(0x5B04),
+                    ),
+                ),
+            },
+        },
         (
             "test_alias_operands",
             "test_unary_op",
@@ -7728,6 +7791,126 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "67x71x256": (cached_randn((67, 71, 256), dtype=torch.float32),),
             },
         },
+        # sign, signbit and ceil on the non-fp16 dtypes their decompositions
+        # special-case: integer sign is a clamp to [-1, 1] and ceil of an integer
+        # input is a copy (bool inputs are tested below).
+        # The inputs hold zeros, so sign(0) and signbit(0) are checked, and the
+        # int32 extremes check that the clamp does not overflow. -0.0 is not
+        # tested: the device cannot tell it from 0.0 (see spyre_signbit).
+        (
+            "test_pointwise_unary_op_dtypes",
+            "test_exact_op_cpu",
+        ): {
+            "ops_dict": {
+                "sign": torch.sign,
+                "signbit": torch.signbit,
+                "ceil": torch.ceil,
+            },
+            "param_sets": {
+                # Multiples of 0.25, so ceil also sees fractions of both signs.
+                "fp32_67x256": (
+                    torch.randint(
+                        -400,
+                        401,
+                        (67, 256),
+                        generator=torch.Generator().manual_seed(0x51A0),
+                    ).to(torch.float32)
+                    / 4,
+                ),
+                "int32_67x256": (
+                    torch.randint(
+                        -100,
+                        101,
+                        (67, 256),
+                        dtype=torch.int32,
+                        generator=torch.Generator().manual_seed(0x51A1),
+                    ),
+                ),
+                "int32_large_256": (
+                    torch.tensor(
+                        [0, 1, -1, 70000, -70000, 2**31 - 1, -(2**31)] * 36
+                        + [0, 5, -5, 0],
+                        dtype=torch.int32,
+                    ),
+                ),
+                "int64_67x256": (
+                    torch.randint(
+                        -100,
+                        101,
+                        (67, 256),
+                        dtype=torch.int64,
+                        generator=torch.Generator().manual_seed(0x51A2),
+                    ),
+                ),
+            },
+        },
+        # Bool sign is a copy and bool signbit is all False. ceil is left out:
+        # CPU has no bool ceil kernel to compare against.
+        (
+            "test_pointwise_unary_op_bool",
+            "test_exact_op_cpu",
+        ): {
+            "ops_dict": {
+                "sign": torch.sign,
+                "signbit": torch.signbit,
+            },
+            "param_sets": {
+                "256": (
+                    torch.randint(
+                        0,
+                        2,
+                        (256,),
+                        generator=torch.Generator().manual_seed(0x51A7),
+                    ).to(torch.bool),
+                ),
+            },
+        },
+        # with_int64_fallback computes int64 operands in fp32 and converts the
+        # output to the promoted dtype: fp32 when the other operand is fp32, not
+        # int64. compare_with_cpu checks the result dtype as well as the values.
+        (
+            "test_pointwise_int64_fp32_promotion",
+            "test_exact_op_cpu",
+        ): {
+            "ops_dict": {
+                "sub": torch.sub,
+                "sub_alpha_3": lambda a, b: torch.sub(a, b, alpha=3),
+                "maximum": torch.maximum,
+                "minimum": torch.minimum,
+            },
+            "param_sets": {
+                "int64_fp32_67x256": (
+                    torch.randint(
+                        -100,
+                        101,
+                        (67, 256),
+                        generator=torch.Generator().manual_seed(0x51A3),
+                    ),
+                    torch.randint(
+                        -400,
+                        401,
+                        (67, 256),
+                        generator=torch.Generator().manual_seed(0x51A4),
+                    ).to(torch.float32)
+                    / 4,
+                ),
+                "fp32_int64_67x256": (
+                    torch.randint(
+                        -400,
+                        401,
+                        (67, 256),
+                        generator=torch.Generator().manual_seed(0x51A5),
+                    ).to(torch.float32)
+                    / 4,
+                    torch.randint(
+                        -100,
+                        101,
+                        (67, 256),
+                        generator=torch.Generator().manual_seed(0x51A6),
+                    ),
+                ),
+            },
+        },
         (
             "test_exp_fp16",
             "test_unary_op",
@@ -10426,6 +10609,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_unary_op_cpu(self, op, x):
         self.compare_with_cpu(op, x)
+
+    @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
+    def test_exact_op_cpu(self, op, *args):
+        """Compare with CPU exactly, for ops whose result is exact on Spyre.
+
+        The default tolerance (atol=rtol=0.1) would accept an off-by-one integer
+        result. assert_close also checks the result dtype.
+        """
+        self.compare_with_cpu(op, *args, atol=0, rtol=0)
 
     def test_pow(self, shape, exponent, err):
         """``pow`` over a positive base near 1, where x**n stays in DLFloat16's

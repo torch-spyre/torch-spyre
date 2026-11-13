@@ -1767,41 +1767,36 @@ def spyre_sign(input: torch.Tensor) -> torch.Tensor:
     if input.dtype.is_complex:
         raise NotImplementedError("sign is not supported for complex inputs")
 
-    orig_dtype = input.dtype
+    if input.dtype == torch.bool:
+        return input.clone()
 
     if not input.dtype.is_floating_point:
-        # Spyre backend does not support bool result from int32 operands
-        input = input.to(torch.float16)
+        # Exact for integers, and needs no cast: a cast to a float dtype gives
+        # the operand a layout that cannot be mixed with the comparison's
+        # other operand ("Multi-arg pointwise with mixed EA").
+        return torch.clamp(input, -1, 1)
 
     zeros = torch.zeros_like(input)
     pos = torch.gt(input, zeros).to(input.dtype)
     neg = torch.lt(input, zeros).to(input.dtype)
-
-    return (pos - neg).to(orig_dtype)
+    return pos - neg
 
 
 @register_spyre_decompositions([torch.ops.aten.signbit.default])
 def spyre_signbit(input: torch.Tensor) -> torch.Tensor:
     """Implements signbit without support for -0.0.
 
-    Without bitwise operations, the sign of -0.0 can be
-    detected on cpu with torch.reciprocal(-0.0) because it
-    returns -inf and -inf < 0.0 is True. But on sypre it just
-    returns inf.
+    Without bitwise operations, the sign of -0.0 can be detected on CPU with
+    torch.reciprocal(-0.0), because it returns -inf and -inf < 0.0 is True.
+    On Spyre it returns inf, so signbit(-0.0) is False here, not True.
     """
-
     if input.dtype.is_complex:
         raise NotImplementedError("signbit is not supported for complex inputs")
 
-    if not input.dtype.is_floating_point:
-        # Spyre backend does not support bool result from int32 operands
-        input = input.to(torch.float16)
+    if input.dtype == torch.bool:
+        return torch.zeros_like(input)
 
-    zeros = torch.zeros_like(input)
-    result = torch.lt(input, zeros)
-    if input.dtype == torch.float32:
-        return result.to(torch.float32).to(torch.int32).to(torch.bool)
-    return result
+    return torch.lt(input, 0)
 
 
 ###############################################################################
