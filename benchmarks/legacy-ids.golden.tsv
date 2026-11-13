@@ -1,0 +1,13 @@
+component	name	row	input_shapes	kernel_name	benchmark_id
+torch-spyre	matmul	report	1_512_4096__4096_4096		ca0a80b2-3610-59d3-9af2-1ec73250ac0d
+torch-spyre	matmul	kernel	1_512_4096__4096_4096	spyre_kernel_v1_fused_add#2@2	e756b63d-6012-5617-b487-9d3c52cbee47
+torch-spyre	matmul	kernel	1_512_4096__4096_4096	spyre_kernel_v1_fused_add#2@1	a1ffc1ca-20c0-5d91-a36d-8089f1fbcb9f
+torch-spyre	matmul	total	1_512_4096__4096_4096	Total	be8a6293-d023-525c-a8c5-6adc506940f6
+torch-spyre	pointwise_add	report	1_512_4096__4096_4096		a3f641e5-1e92-55b6-b530-dc2245fedb9f
+torch-spyre	pointwise_add	kernel	1_512_4096__4096_4096	spyre_kernel_v1_fused_add#2@2	78c588c1-cf56-54bd-9aec-9303029400ec
+torch-spyre	pointwise_add	kernel	1_512_4096__4096_4096	spyre_kernel_v1_fused_add#2@1	587dd475-2a20-54c6-ad6f-bc1254b4473b
+torch-spyre	pointwise_add	total	1_512_4096__4096_4096	Total	9f8e8621-e431-5061-8ec8-9825e543d853
+torch-spyre	softmax	report	1_512_4096__4096_4096		c754d519-198d-5492-92c5-783284305245
+torch-spyre	softmax	kernel	1_512_4096__4096_4096	spyre_kernel_v1_fused_add#2@2	7256b70e-6c9a-5ba8-9003-f544fc58557d
+torch-spyre	softmax	kernel	1_512_4096__4096_4096	spyre_kernel_v1_fused_add#2@1	ad0d8be5-ba49-52ac-a5f6-a12fabd90a9b
+torch-spyre	softmax	total	1_512_4096__4096_4096	Total	6d14e18d-2e0d-5660-a8f2-2b563daec032
