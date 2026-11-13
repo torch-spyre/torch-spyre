@@ -3717,6 +3717,45 @@ class TestCarryWriterEdges(unittest.TestCase):
                 [LifetimeBoundBuffer("storage", 2048, [0, 1])]
             )
 
+    def _relayout_sources_asked(self):
+        """The parents that the relayout enumeration hands to the edge gate
+        for a reader of the carry after the loop."""
+        reader = self._op("reader", ["storage"])
+        self._carry_edges()
+        asked = []
+        with (
+            patch.object(self.allocator, "_decides_lx_relayouts", True),
+            allocator_module.config.patch(lx_solver_relayout=True, ktir_emitter=False),
+            patch.object(
+                allocator_module,
+                "solver_relayout_edge_context",
+                lambda graph, producer, *args: asked.append(producer.get_name()),
+            ),
+        ):
+            relayouts = self.allocator._cd_parent_relayouts(
+                self.graph,
+                reader,
+                [CoreDivision()],
+                ["storage"],
+                {"storage": [CoreDivision()]},
+                {op.get_name(): op for op in self.graph.operations},
+                {},
+                self.residency,
+            )
+        self.assertEqual(relayouts, {})
+        self.assertIsNone(self.residency["storage"])
+        return asked
+
+    def test_a_carry_that_only_its_loop_writes_is_a_relayout_source(self):
+        self.assertEqual(self._relayout_sources_asked(), ["storage"])
+
+    def test_a_carry_written_after_its_loop_is_no_relayout_source(self):
+        """One copy serves every reader of its view, so a reader after the
+        copy-back could get the values from before it."""
+        self._copy_back("copy_back")
+        self.assertEqual(self._relayout_sources_asked(), [])
+        self.assertEqual(self.allocator._carry_writers, {"storage": ["copy_back"]})
+
 
 class TestCloneDivisionMatching(unittest.TestCase):
     """The clone-in seam: the pairs a graph input's synthesized menu admits.

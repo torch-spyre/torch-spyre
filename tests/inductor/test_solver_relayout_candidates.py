@@ -634,6 +634,97 @@ def test_consumer_rules_are_shared_with_the_committed_collector(monkeypatch):
     assert grouped_gather_rejection(pointwise, 2, _FOUR_ON_8) is None  # a broadcast
 
 
+def test_a_sum_takes_a_relayout_only_from_a_loop_carry(monkeypatch):
+    """The sum after a counted loop reads every core group's part of the
+    loop's carry, so the solver may offer it a relayout copy. Another
+    reduction kind, a sum inside a loop and a sum of any other producer keep
+    the earlier answer (no relayout)."""
+    from torch._inductor.ir import Pointwise, Reduction
+
+    from torch_spyre._inductor.loop_info import LoopCarryRecord
+
+    def op(name, data=None, carry_of=None, loop_info=None):
+        obj = SimpleNamespace(get_name=lambda: name, data=data, loop_info=loop_info)
+        if carry_of is not None:
+            obj._loop_carry_record = LoopCarryRecord(
+                storage_name=carry_of, update_name="buf_update"
+            )
+        return obj
+
+    def reduction(kind):
+        data = Reduction.__new__(Reduction)
+        object.__setattr__(data, "reduction_type", kind)
+        return data
+
+    matmul = op("mm")
+    monkeypatch.setattr(lx_relayout, "_is_matmul_op", lambda o: o is matmul)
+    total = op("sum", reduction("sum"))
+    pointwise = op("mul", Pointwise.__new__(Pointwise))
+    carry = op("buf52", carry_of="buf52")
+    update = op("buf_update", carry_of="buf52")  # the record's other end
+    plain = op("buf7")
+    supported = lx_relayout._relayout_consumer_kind_supported
+    assert supported(carry, total)
+    assert not supported(plain, total)
+    assert not supported(update, total)
+    assert not supported(carry, op("max", reduction("max")))
+    assert not supported(carry, op("in_loop", reduction("sum"), loop_info=object()))
+    for producer in (carry, plain):
+        assert supported(producer, pointwise)
+        assert supported(producer, matmul)
+    assert not supported(carry, op("extern"))
+
+
+def test_an_edge_needs_an_fx_origin_at_both_ends(monkeypatch):
+    """GraphEditor puts the copy's FX node after the producer's and replaces
+    it in each consumer's. A compiler-made buffer has no node in the lowering
+    graph (the pre-loop copy of a caller-owned loop carry), so such an edge
+    stops before the consumer rule, which gets the producer and the consumer."""
+    from torch._inductor.ir import ComputedBuffer
+    from torch.fx import Graph
+
+    from torch_spyre._inductor.ir import FixedTiledLayout
+
+    fx_graph = Graph()
+    local = fx_graph.placeholder("local")
+    foreign = Graph().placeholder("foreign")
+
+    def end(origins=(), origin_node=None):
+        op = ComputedBuffer.__new__(ComputedBuffer)
+        op.layout = FixedTiledLayout.__new__(FixedTiledLayout)
+        op.loop_info, op.origins, op.origin_node = None, list(origins), origin_node
+        return op
+
+    asked = []
+    monkeypatch.setattr(lx_relayout, "_single_write", lambda op, name: object())
+    monkeypatch.setattr(lx_relayout, "_is_activation_source", lambda *args: True)
+    monkeypatch.setattr(lx_relayout, "_supported_consumer_layout", lambda *args: True)
+    monkeypatch.setattr(
+        lx_relayout,
+        "_relayout_consumer_kind_supported",
+        lambda producer, consumer: asked.append((producer, consumer)),
+    )
+    graph = SimpleNamespace(graph=fx_graph)
+
+    def reaches_the_consumer_rule(producer, consumer):
+        asked.clear()
+        context = lx_relayout.solver_relayout_edge_context(
+            graph, producer, consumer, "buf0", {}
+        )
+        assert context is None  # the stub of the consumer rule declines
+        assert asked in ([], [(producer, consumer)])
+        return bool(asked)
+
+    assert reaches_the_consumer_rule(end([local]), end([local]))
+    # GraphEditor takes the producer's origin in this graph, and a consumer's
+    # origin_node as it is.
+    assert reaches_the_consumer_rule(end([foreign, local]), end(origin_node=foreign))
+    assert not reaches_the_consumer_rule(end(), end([local]))
+    assert not reaches_the_consumer_rule(end([foreign]), end([local]))
+    assert not reaches_the_consumer_rule(end([local]), end())
+    assert not reaches_the_consumer_rule(end([local]), end([foreign]))
+
+
 @pytest.mark.parametrize(
     "enabled,violation",
     [

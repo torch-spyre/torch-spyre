@@ -577,9 +577,14 @@ With `SPYRE_LX_PLANNER_RELAYOUT=1`, a supported LX copy can connect
 different producer and consumer partitions. A matmul's split reduction makes
 its output partial, not its input: input placement uses the values each
 consumer actually needs. Expansion to more cores uses the same ownership
-proof for pointwise and matmul consumers. Existing core-domain, capacity,
-lifetime and whole-source fallback restrictions still apply; this does
-not change the work chooser's policy.
+proof for pointwise and matmul consumers. One reduction can take the copy:
+a sum that reads a counted-loop carry after the loop, for example the sum
+over the per-group accumulators of a `for_each_tile` loop. Only a
+co-optimizing solve that decides relayouts offers this copy, and only for
+a carry that no other op writes after the loop. If the solve takes it and
+kernel preparation keeps it, the carry and its in-loop updates stay in LX.
+Existing core-domain, capacity, lifetime and whole-source fallback
+restrictions still apply; this does not change the work chooser's policy.
 
 #### Split-K results in LX
 
