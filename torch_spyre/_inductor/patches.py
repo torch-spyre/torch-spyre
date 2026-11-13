@@ -234,10 +234,12 @@ def _resolve_scan_shapes_by_expression():
 def _contiguous_stride_first(sizes, strides, false_if_dde=False):
     """torch's check_contiguous_sizes_strides, but compares the stride before
     asking size == 1, so a correct stride installs no Ne(size, 1) guard (#6018).
-    Remove once upstream does the same."""
+    Remove if upstream does the same (pytorch/pytorch#203781).
+    tests/inductor/test_contiguity_patch.py checks it against upstream."""
     from torch.fx.experimental.symbolic_shapes import (
         guard_or_false,
         guard_or_true,
+        is_nested_int,
         statically_known_true,
     )
 
@@ -253,13 +255,17 @@ def _contiguous_stride_first(sizes, strides, false_if_dde=False):
             continue
         elif maybe_true(y != expected) and maybe_true(y != expected_max):
             return False
-        expected_max *= torch.sym_max(x, 1)
+        expected_max *= x if is_nested_int(x) else torch.sym_max(x, 1)
         expected *= x
     return True
 
 
 @contextmanager
 def _contiguity_stride_first():
+    # Replaces the module attribute, so it reaches only callers that look it up
+    # at call time: the callers inside torch._prims_common do. A caller that
+    # imported the name earlier keeps upstream's version, and torch's C++
+    # contiguity path never calls it.
     import torch._prims_common as prims_common
 
     original = prims_common.check_contiguous_sizes_strides

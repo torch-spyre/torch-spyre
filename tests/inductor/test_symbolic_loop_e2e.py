@@ -45,8 +45,8 @@ contiguity check asks ``count == 1`` before it looks at the stride. The answer
 would become a guard, ``Ne(rows // G, 1)``, and a one-tile call would recompile
 (#6018, upstream pytorch/pytorch#203781). ``enable_spyre_context`` installs a
 stride-first check (#6060), so the headline test below declares ``min == G``
-and calls at one tile. The canary at the end of this file fails if upstream
-changes the order, so the patch can then be removed.
+and calls at one tile. tests/inductor/test_contiguity_patch.py checks the
+patch against upstream's function.
 
 VERIFIED EMITTED BUNDLE, 6 Oct 2026, for the region below at 64 columns fp16::
 
@@ -103,7 +103,7 @@ SPEC = {"min": MIN_ROWS, "max": MAX_ROWS, "granularity": TILE}
 # The compile size first, then every kind of other size: the minimum (one
 # tile), the maximum, above the compile size (where hint-sized geometry was
 # measured wrong), and below it.
-SIZES = [ROWS, MIN_ROWS, MAX_ROWS, 448, 128]
+SIZES = [ROWS, MIN_ROWS, MAX_ROWS, 448, 192]
 
 ATOL = 1e-2
 RTOL = 1e-2
@@ -330,20 +330,6 @@ class TestOneBinaryServesTheRange(unittest.TestCase):
         torch.testing.assert_close(
             out, torch.nn.functional.gelu(x[:ROWS].float()), atol=ATOL, rtol=RTOL
         )
-
-
-class TestUpstreamStillAsksSizeFirst(unittest.TestCase):
-    def test_upstream_still_asks_size_first(self):
-        """Fails if pytorch#203781 is fixed upstream; then delete
-        _contiguous_stride_first from patches.py."""
-        from torch._dynamo.source import ConstantSource
-        from torch._prims_common import check_contiguous_sizes_strides
-        from torch.fx.experimental.symbolic_shapes import ShapeEnv
-
-        env = ShapeEnv()
-        n = env.create_symintnode(env.create_symbol(128, ConstantSource("n")), hint=128)
-        check_contiguous_sizes_strides((n // TILE, TILE), (TILE, 1))
-        self.assertTrue(env.guards, "pytorch#203781 looks fixed: remove the patch")
 
 
 if __name__ == "__main__":
