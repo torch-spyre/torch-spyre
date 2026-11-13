@@ -121,6 +121,7 @@ from torch_spyre._inductor.scratchpad.utils import (
     counted_loop_entry,
     counted_loop_group_path,
     counted_loop_lifetime_overrides,
+    is_loop_carry_storage as _is_loop_carry_storage,
 )
 from torch_spyre._inductor.scratchpad.graph_editor import (
     GraphEditor,
@@ -299,13 +300,6 @@ def _multi_output_extern_kernel_in_live_range(
         if outputs is not None and len(outputs) > 1:
             return True
     return False
-
-
-def _is_loop_carry_storage(op: Any) -> bool:
-    """True only for storage explicitly created as a counted-loop carry."""
-
-    record = getattr(op, "_loop_carry_record", None)
-    return isinstance(record, LoopCarryRecord) and record.storage_name == op.get_name()
 
 
 def _loop_carry_mutation_target(
@@ -5290,7 +5284,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         the producer could stay LX-resident by paying a shuffle - as
         :class:`RelayoutCandidate` records priced by the fitted relayout law. The division-independent edge gates (single non-indirect
         write, activation source, pointwise-or-matmul consumer, ...) mirror
-        ``collect_lx_relayout_plans``; the per-pair gates (permutation
+        ``collect_lx_relayout_plans``, with one addition that only this path
+        has: the sum after a counted loop may read a copy of the loop's carry
+        (``solver_relayout_edge_context``). A carry that another op writes
+        after the loop is no source. The per-pair gates (permutation
         compatibility, projectable ownership on both frames, the law's fitted
         split range) live in ``solver_relayout_pair_cost``. Gated on the
         solver's ``decides_lx_relayouts`` and on ``config.lx_solver_relayout``.
@@ -5314,6 +5311,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 continue
             # The source must be residency-eligible: a relayout keeps it in LX.
             if residency_by_buf.get(parent, "not in graph") is not None:
+                continue
+            # One copy serves every reader of its view. A carry that another op
+            # writes after the loop (the copy-back of an in-place collective)
+            # has readers before and after that write, so it is no source.
+            if parent in getattr(self, "_carry_writers", {}):
                 continue
             parent_op = op_by_name[parent]
             padded_axis = prefix_lx_contraction_axis(parent_op, consumer_op)

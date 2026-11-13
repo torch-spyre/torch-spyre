@@ -87,6 +87,8 @@ class _Observed:
         self.source_layouts: dict = {}
         self.copy_layouts: dict = {}
         self.consumer_reads: dict[str, set[str]] = {}
+        # The plans whose source is the storage of a counted-loop carry.
+        self.carry_plans: list = []
         real_materialize = alloc_mod.materialize_lx_relayouts
 
         def spy_materialize(graph, plans):
@@ -95,8 +97,14 @@ class _Observed:
                 collect_lx_relayout_plans,
                 materialized_lx_relayouts,
             )
+            from torch_spyre._inductor.scratchpad.utils import is_loop_carry_storage
 
             self.plans.extend(plans)
+            self.carry_plans.extend(
+                plan
+                for plan in plans
+                if is_loop_carry_storage(graph.get_buffer(plan.source_name))
+            )
             # Divisions are committed by now and nothing is materialized yet:
             # exactly the state the committed collector expects.
             self.committed.extend(collect_lx_relayout_plans(graph))
@@ -211,8 +219,25 @@ class _Observed:
         eligible edge on economics or capacity.) A solver segment's consumers
         are a subset of the committed plan's, which groups every consumer of a
         destination view together.
+
+        One source is outside this parity: the storage of a counted-loop
+        carry. The committed path never keeps a carry in LX (there it is a
+        mutation target), and its collector rejects a source that an in-place
+        update reads. So only the solver can fire such an edge, and for it
+        this asserts that the collector certifies nothing from that source.
         """
         for plan in self.plans:
+            if any(plan is carry_plan for carry_plan in self.carry_plans):
+                certified = [
+                    (c.source_name, c.consumer_names)
+                    for c in self.committed
+                    if c.source_name == plan.source_name
+                ]
+                assert not certified, (
+                    f"the committed collector now certifies the loop carry "
+                    f"{plan.source_name}: {certified}; give it the ordinary parity"
+                )
+                continue
             twins = [
                 c
                 for c in self.committed
@@ -404,6 +429,138 @@ def test_relayout_off_spills_the_hinted_edge(monkeypatch):
     observed.assert_nothing_emitted()
     ref = torch.relu(torch.neg(host.float())).to(torch.float16)
     torch.testing.assert_close(out.cpu(), ref, rtol=1e-3, atol=1e-3)
+
+
+def _run_grouped_carry_sum(monkeypatch, *, group=4, caller_init=False, **options):
+    """Compile ``grouped_carry_group_sum_fn`` for 32 cores under the
+    co-optimizing solve and run it.
+
+    Returns the relayout observations, the device result, the expected result
+    and the op summaries of the generated kernels. The slabs are small
+    integers, so each partial sum is exact in the device fp16 format. Each
+    carry part and each 8-row block (the rows of one core of the sum) has its
+    own value pattern: a part that is lost, read twice or taken from another
+    block changes the result.
+    """
+    from torch._inductor.utils import run_and_get_code
+
+    from for_each_tile_fixtures import grouped_carry_group_sum_fn
+    from utils_inductor import opspec_summaries
+
+    observed = _Observed(monkeypatch, force=False)
+    cores, tokens, width = 32, 256, 512
+    experts = 2 * group
+    e = torch.arange(experts).reshape(experts, 1, 1)
+    t = torch.arange(tokens).reshape(1, tokens, 1)
+    c = torch.arange(width).reshape(1, 1, width)
+    slabs = ((e % 4 + 1) * (t % 7 + 1) + (t // 8) % 5 + c % 3).to(torch.float16)
+    expected = slabs.float().sum(0)
+    args = [slabs.to("spyre")]
+    first = None
+    if caller_init:
+        first = (
+            torch.arange(1, group + 1, dtype=torch.float16)
+            .reshape(group, 1, 1)
+            .expand(group, tokens, width)
+            .contiguous()
+        )
+        expected = expected + first.float().sum(0)
+        args.append(first.to("spyre"))
+
+    def fn(values, init=None):
+        return grouped_carry_group_sum_fn(values, group, cores, init)
+
+    with config.patch({**_COOPT, "sencores": cores, **options}):
+        out, code = run_and_get_code(
+            torch.compile(fn, dynamic=False, fullgraph=True), *args
+        )
+    if first is not None:
+        assert torch.equal(args[1].cpu(), first), "the caller's first value changed"
+    return observed, out.cpu().float(), expected, opspec_summaries("\n".join(code))
+
+
+def _accumulate_allocations(ops):
+    """Where the in-loop accumulate's tensors live. It reads and writes the
+    carry in place, so two ``lx`` entries or more mean a carry in LX."""
+    return [op["allocations"] for op in ops if op["op"] == "add"]
+
+
+def test_post_loop_sum_reads_a_relayout_of_a_grouped_carry(monkeypatch):
+    """A loop adds four slabs per trip into a carry split {G: 4, T: 8}; the sum
+    over G after the loop is split {T: 32}. Each core of the sum needs its
+    rows from all four parts of the carry, which are on four cores, so the
+    two divisions do not match. The solver takes one copy after the loop, and
+    the carry stays in LX through its in-loop updates."""
+    observed, out, expected, ops = _run_grouped_carry_sum(monkeypatch)
+
+    observed.assert_emitted_in_lx(expected_plans=1)
+    (plan,) = observed.plans
+    assert observed.carry_plans == [plan]
+    assert plan.num_cores == 32
+    # The carry [G, T, C] is [T, C / 64, G, 64] on device: dim 0 <- T, dim 2 <- G.
+    assert dict(plan.source_view.work_slice_dims) == {0: 8, 2: 4}
+    assert dict(plan.destination_view.work_slice_dims) == {0: 32}
+    adds = _accumulate_allocations(ops)
+    assert adds and all(a.count("lx") >= 2 for a in adds), adds
+    assert torch.equal(out, expected)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        # The solver is offered no relayout.
+        {"lx_solver_relayout": False},
+        # Sixteen parts per core of the sum: above the shuffle fan-in budget.
+        {"group": 16},
+        # The carry is a compiler-made copy, with no FX origin for the clone.
+        {"caller_init": True},
+    ],
+    ids=["relayout_off", "fan_in_16", "caller_owned_init"],
+)
+def test_grouped_carry_without_a_copy_spills_and_keeps_its_values(monkeypatch, case):
+    """Where the sum after the loop gets no copy, the carry spills as before."""
+    observed, out, expected, ops = _run_grouped_carry_sum(monkeypatch, **case)
+
+    observed.assert_nothing_emitted()
+    adds = _accumulate_allocations(ops)
+    assert adds and all(a.count("lx") <= 1 for a in adds), adds
+    assert torch.equal(out, expected)
+
+
+def test_grouped_carry_keeps_its_values_when_its_copy_is_demoted(monkeypatch):
+    """Kernel preparation can still reject the copy. The carry then leaves LX
+    with its relayout group, each kernel is prepared again, and the in-loop
+    update follows its storage to HBM."""
+    import torch_spyre._inductor.scheduler as sched_mod
+    from torch._inductor.virtualized import V
+    from torch_spyre._inductor.scratchpad.lx_relayout import (
+        materialized_lx_relayouts,
+    )
+
+    real_prepare = sched_mod.SuperDSCScheduling.prepare_kernel
+    rejected = []
+
+    def prepare(backend, bundle, kernel):
+        if not rejected:
+            copies = {name for name, _ in materialized_lx_relayouts(V.graph).values()}
+            for node in sched_mod._all_scheduler_nodes([bundle]):
+                if any(dep.name in copies for dep in node.read_writes.writes):
+                    rejected.append(node.get_name())
+                    kernel.failed_node = node
+                    raise ValueError("test: reject the LX finalization of the copy")
+        return real_prepare(backend, bundle, kernel)
+
+    monkeypatch.setattr(sched_mod.SuperDSCScheduling, "prepare_kernel", prepare)
+    observed, out, expected, ops = _run_grouped_carry_sum(monkeypatch)
+
+    assert rejected, "the fixture did not reach the copy's kernel"
+    (plan,) = observed.plans
+    assert observed.carry_plans == [plan]
+    assert plan.source_name in {source for source, _ in observed.demotions}
+    assert not observed.emitted and not observed.emitted_ops
+    adds = _accumulate_allocations(ops)
+    assert adds and all(a.count("lx") <= 1 for a in adds), adds
+    assert torch.equal(out, expected)
 
 
 @pytest.mark.parametrize("fragments", [8, 10])

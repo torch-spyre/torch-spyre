@@ -31,6 +31,7 @@ from torch._inductor.ir import (
     MutationLayoutSHOULDREMOVE,
     Operation,
     Pointwise,
+    Reduction,
     Scatter,
 )
 from torch_spyre._C import ElementArrangement
@@ -72,9 +73,10 @@ from ..pass_utils import (
     iteration_space_with_splits,
     make_iteration_space_ownership,
     op_read_writes,
+    origin_in_graph,
     try_device_coordinates,
 )
-from .utils import _op_num_cores, storage_has_single_writer
+from .utils import _op_num_cores, is_loop_carry_storage, storage_has_single_writer
 
 logger = get_inductor_logger("lx_relayout")
 _DESTINATION_PREFIX = "__spyre_lx_relayout__"
@@ -864,6 +866,33 @@ def _persistent_scatter_storage_safe(graph, producer, consumer, source_name):
     return storage_has_single_writer(graph, producer)
 
 
+def _relayout_consumer_kind_supported(producer: Operation, consumer: Operation) -> bool:
+    """Whether the solver may offer ``consumer`` a relayout copy of ``producer``.
+
+    A pointwise or matmul consumer qualifies. A reduction qualifies in one
+    case: a ``sum`` outside every loop that reads the storage of a counted-loop
+    carry. The loop's core map splits the carry (for example one accumulator
+    per core group), and the sum after the loop reads every part of it. A
+    division of the sum that keeps whole rows on a core then matches no
+    division of the carry, and the carry, with each in-loop update of it,
+    would live in HBM. The copy gives the sum the per-core view that its own
+    division reads, as it does for a pointwise consumer.
+
+    The carry clause is a limit of scope, not of legality: it is the reduction
+    that has a test. The copy is still subject to every later gate (movement
+    fan-in, LX capacity for the carry and the copy together, price).
+    """
+    data = getattr(consumer, "data", None)
+    if _is_matmul_op(consumer) or isinstance(data, Pointwise):
+        return True
+    return (
+        isinstance(data, Reduction)
+        and data.reduction_type == "sum"
+        and getattr(consumer, "loop_info", None) is None
+        and is_loop_carry_storage(producer)
+    )
+
+
 def _supported_consumer_layout(graph, producer, consumer, source_name) -> bool:
     return isinstance(consumer, ComputedBuffer) and (
         not isinstance(consumer.layout, MutationLayoutSHOULDREMOVE)
@@ -883,7 +912,12 @@ def solver_relayout_edge_context(
     The same structural gates ``collect_lx_relayout_plans`` applies on the
     committed graph, restricted to what does not depend on a chosen division, so
     the solver's candidate enumeration can run them once per edge before any
-    per-division-pair work. Returns ``(write_dep, read_dep, producer_coords,
+    per-division-pair work. Two things are the solver's alone. A counted-loop
+    carry is a source only here: the committed path never keeps a carry in
+    LX, and its collector rejects a source that an in-place update reads; of
+    the reductions, the sum after the loop may take the copy
+    (``_relayout_consumer_kind_supported``). And both ends of an edge need an
+    FX origin in the lowering graph. Returns ``(write_dep, read_dep, producer_coords,
     consumer_coords, producer_space, consumer_space)`` - the two spaces are the
     loop-symbol -> extent mappings ``work_division_from_view`` projects into -
     or ``None`` when the edge can never host a relayout.
@@ -926,9 +960,19 @@ def solver_relayout_edge_context(
         or not _is_activation_source(graph, operations, producer)
     ):
         return None
+    # The copy's FX node goes after the producer's and replaces it in the
+    # consumer's (GraphEditor asserts both). A compiler-made buffer has none:
+    # the pre-loop copy of a caller-owned loop carry, for example. Such a
+    # buffer is no end of an edge.
+    fx_graph = getattr(graph, "graph", None)
+    if origin_in_graph(getattr(producer, "origins", ()), fx_graph) is None or (
+        getattr(consumer, "origin_node", None) is None
+        and origin_in_graph(getattr(consumer, "origins", ()), fx_graph) is None
+    ):
+        return None
     if not _supported_consumer_layout(graph, producer, consumer, source_name):
         return None
-    if not _is_matmul_op(consumer) and not isinstance(consumer.data, Pointwise):
+    if not _relayout_consumer_kind_supported(producer, consumer):
         return None
     consumer_deps = [
         d for d in op_read_writes(consumer).reads if isinstance(d, MemoryDep)
