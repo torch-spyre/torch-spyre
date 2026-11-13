@@ -1752,6 +1752,12 @@ class TestTUnaligned:
                 AssertionError,
                 "AssertionError: Tensor-likes are not close (spyre <-> cpu mismatch beyond tolerance), #5302",
             )
+        if consumer == "sum_last" and dtype == torch.bfloat16:
+            strict_xfail(
+                request,
+                AssertionError,
+                "AssertionError: Tensor-likes are not close (spyre <-> cpu mismatch beyond tolerance), #6275",
+            )
         x = cached_randn(
             (33, 70), dtype=dtype, differentiation=f"t_2d_both_unaligned_{dtype}"
         )
@@ -2034,8 +2040,13 @@ class TestCatUnaligned:
     """1D–6D inputs with unaligned innermost dimension."""
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_cat_1d_unaligned_halves(self, execution_mode, dtype, consumer):
+    def test_cat_1d_unaligned_halves(self, request, execution_mode, dtype, consumer):
         """[33] + [33] → cat(dim=0) → [66]. Output inner 66; 66%64=2. Both consumers."""
+        strict_xfail(
+            request,
+            InductorError,
+            "Unsupported: no offset-free alternative stick dim for mutation target, #3916",
+        )
         a = cached_randn(
             (33,), dtype=dtype, differentiation=f"cat_1d_unaligned_a_{dtype}"
         )
@@ -2742,6 +2753,28 @@ class TestSplitUnaligned:
                 (InductorError, LoweringException),
                 "Unsupported: copy_from_d2d of a sliced view requires a stick-aligned storage_offset, #5383",
             )
+        if (
+            execution_mode == "eager"
+            and consumer == "sum_last"
+            and dtype == torch.float32
+        ):
+            strict_xfail(
+                request,
+                InductorError,
+                "SubprocException: dbo-opt DtException: Coordinate masking is supported only up to 16bit element types, #5224",
+            )
+        if execution_mode == "compiled" and consumer == "sum_last":
+            strict_xfail(
+                request,
+                InductorError,
+                "Unsupported: no offset-free alternative stick dim for mutation target, #3916",
+            )
+        if execution_mode == "compiled" and consumer == "pointwise":
+            strict_xfail(
+                request,
+                InductorError,
+                "NotImplementedError: no mechanism to resolve stick incompatibility, #5216",
+            )
         x = cached_randn(
             (8, 130),
             dtype=dtype,
@@ -2769,6 +2802,32 @@ class TestSplitUnaligned:
                 (InductorError, LoweringException),
                 "Unsupported: copy_from_d2d of a sliced view requires a stick-aligned storage_offset, #5383",
             )
+        if (
+            execution_mode == "eager"
+            and consumer == "sum_last"
+            and dtype == torch.float32
+        ):
+            strict_xfail(
+                request,
+                InductorError,
+                "SubprocException: dbo-opt DtException: Coordinate masking is supported only up to 16bit element types, #5224",
+            )
+        if execution_mode == "compiled" and consumer == "pointwise":
+            strict_xfail(
+                request,
+                InductorError,
+                "NotImplementedError: no mechanism to resolve stick incompatibility, #5216",
+            )
+        if (
+            execution_mode == "compiled"
+            and consumer == "sum_last"
+            and dtype in (torch.float16, torch.bfloat16)
+        ):
+            strict_xfail(
+                request,
+                AssertionError,
+                "AssertionError: Tensor-likes are not close (spyre <-> cpu mismatch beyond tolerance), #6274",
+            )
         x = cached_randn(
             (4, 32, 140),
             dtype=dtype,
@@ -2793,6 +2852,32 @@ class TestSplitUnaligned:
                 request,
                 (InductorError, LoweringException),
                 "Unsupported: copy_from_d2d of a sliced view requires a stick-aligned storage_offset, #5383",
+            )
+        if (
+            execution_mode == "eager"
+            and consumer == "sum_last"
+            and dtype == torch.float32
+        ):
+            strict_xfail(
+                request,
+                InductorError,
+                "SubprocException: dbo-opt DtException: Coordinate masking is supported only up to 16bit element types, #5224",
+            )
+        if execution_mode == "compiled" and consumer == "pointwise":
+            strict_xfail(
+                request,
+                InductorError,
+                "NotImplementedError: no mechanism to resolve stick incompatibility, #5216",
+            )
+        if (
+            execution_mode == "compiled"
+            and consumer == "sum_last"
+            and dtype == torch.float16
+        ):
+            strict_xfail(
+                request,
+                AssertionError,
+                "AssertionError: Tensor-likes are not close (spyre <-> cpu mismatch beyond tolerance), #6274",
             )
         x = cached_randn(
             (1, 16, 32, 130),
