@@ -565,10 +565,6 @@ def _relayout_loops(
         extent.append(out_size[axis])
         out_strides.append(stride)
         if kind == _DIM_OUTER_STICK:
-            if sym in symbol_dims:
-                raise NotImplementedError(
-                    f"OpSpec relayout: the output walks {sym}'s stick twice"
-                )
             symbol_dims[sym] = [(dim, stick)]
             pending_lane[sym] = (stick, out_size[axis])
         else:
