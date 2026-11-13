@@ -743,14 +743,14 @@ class _SympyExprToCpSat(Printer):
         return sympy.Piecewise(*pieces)
 
     def _push_into_byte_minmax(self, expr):
-        """``Min(R, W) * D`` as ``Min(R * D, W * D)`` (``Max`` when the number in
-        front is negative), where ``Min(R, W)`` is the product's bytes factor and
-        D its other Min/Max factors (the derates): each operand is then a sum of
-        terms times D, rather than a product of variables whose bounds compound.
-        The bytes factor is the one Min/Max without a quantized curve, or, when
-        none has one (a committed split leaves a derate linear in residency),
-        the one with the largest coefficient. The factors are costs and
-        derates, so D is nonnegative."""
+        """``c * Min(R, W) * D`` as ``sign(c) * Min(|c| * R * D, |c| * W * D)``,
+        where ``Min(R, W)`` is the product's bytes factor and D its other Min/Max
+        factors (the derates): each operand is then a sum of terms times D,
+        rather than a product of variables whose bounds compound. The bytes
+        factor is the one Min/Max without a quantized curve, or, when none has
+        one (a committed split leaves a derate linear in residency), the one
+        with the largest coefficient. The factors are costs and derates, so D
+        is nonnegative."""
         if not expr.is_Mul:
             return expr
         branching = [a for a in expr.args if isinstance(a, (sympy.Min, sympy.Max))]
@@ -765,11 +765,7 @@ class _SympyExprToCpSat(Printer):
             return expr
         coefficient, _ = expr.as_coeff_Mul()
         rest = sympy.Mul(*(a for a in expr.args if a is not target)) / coefficient
-        func = type(target)
-        if coefficient < 0:
-            func = _LazyMax if isinstance(target, sympy.Min) else _LazyMin
-        elif func not in (_LazyMin, _LazyMax):
-            func = _LAZY[func]
+        func = _LAZY.get(type(target), type(target))
         return sympy.sign(coefficient) * func(
             *(
                 sympy.Add(
