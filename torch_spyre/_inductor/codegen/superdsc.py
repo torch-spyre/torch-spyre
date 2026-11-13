@@ -34,6 +34,7 @@ from torch_spyre._inductor.constants import (
     FP16_MAX,
     FP16_MIN,
     FP32TOINT32_OP,
+    FP8_2D_STICK_OPS,
     IDENTITY_OP,
     INPUT_DIM_LABELS,
     INT32TOFP32_OP,
@@ -52,6 +53,7 @@ from torch_spyre._inductor.constants import (
 )
 from torch_spyre._inductor.core_mapping import matmul_reduction_dim
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
+from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.indirect_access import (
     compute_indirect_max_dim_sizes,
     get_index_tensor_for_value,
@@ -1319,6 +1321,39 @@ def _collect_index_tensor_layouts(
     return index_tensor_layouts, index_active_dims
 
 
+# A QFP8WT 2D stick packs 2 K rows x 64 N columns into 128 bytes, so a K row is
+# 64 bytes, while dim_device_stride counts 128. A K start offset is therefore
+# halved; K is device coordinate -2, directly outside the stick.
+_QFP8WT_ROWS_PER_STICK = 2
+
+
+def _is_qfp8wt_2d_stick(arg: TensorArg, op: str) -> bool:
+    """True if op reads or writes arg as QFP8WT [2, 64] sticks."""
+    return (
+        arg.element_arrangement == ElementArrangement.QFP8WT and op in FP8_2D_STICK_OPS
+    )
+
+
+def _check_qfp8wt_offset(arg: TensorArg) -> None:
+    """Reject a QFP8WT offset that cannot be addressed.
+
+    An odd K start falls inside a stick, and offsets on other axes (column
+    slices) are not modelled; either would read the wrong data.
+    """
+    origin = [c.subs({s: 0 for s in c.free_symbols}) for c in arg.device_coordinates]
+    k_axis = len(origin) - 2
+    if any(o != 0 for axis, o in enumerate(origin) if axis != k_axis):
+        raise Unsupported(
+            f"a column offset into a QFP8WT weight (device origin {origin}); "
+            "only a row slice of a QFP8WT weight is supported"
+        )
+    if origin[k_axis] % _QFP8WT_ROWS_PER_STICK:
+        raise Unsupported(
+            f"a slice starting at row {origin[k_axis]} of a QFP8WT weight; a "
+            f"row slice must start on a multiple of {_QFP8WT_ROWS_PER_STICK} rows"
+        )
+
+
 def _create_sdsc_tensors(
     op_spec: OpSpec,
     symbol_mapping: dict,
@@ -1375,6 +1410,9 @@ def _create_sdsc_tensors(
     matmul_n_dim = injected_dims.get("matmul_n_dim")
 
     for i, arg in enumerate(op_spec.args):
+        is_qfp8wt_2d_stick = _is_qfp8wt_2d_stick(arg, op_spec.op)
+        if is_qfp8wt_2d_stick:
+            _check_qfp8wt_offset(arg)
         # Step 1: Determine dimension order and stick dimension.
         # Index tensors use their pre-computed layout (their coords have no IndirectAccess).
         if has_indirect_access and i in index_tensor_layouts:
@@ -1665,6 +1703,9 @@ def _create_sdsc_tensors(
             ):
                 dim_offset = int(dim_coord.as_coeff_Add()[0])
                 coord_without_offset = dim_coord.as_coeff_Add()[1]
+                n_coords = len(arg.device_coordinates)
+                if is_qfp8wt_2d_stick and coord_idx % n_coords == n_coords - 2:
+                    dim_offset //= _QFP8WT_ROWS_PER_STICK
                 offsets[dim] = dim_offset * dim_device_stride
                 # conv2d addresses the difference between device and iteration space sizes
                 # through the window/padding machinery in _conv2d_sdsc_fields, which already

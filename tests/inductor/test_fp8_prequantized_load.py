@@ -29,7 +29,8 @@ Covers:
 import pytest
 import torch
 from torch import nn
-from utils_inductor import DEVICE, compare_with_pytorch
+from torch._inductor.exc import InductorError
+from utils_inductor import DEVICE, compare_with_pytorch, expects_raise
 
 import torch_spyre  # noqa: F401 — registers Spyre as the inductor backend
 
@@ -469,3 +470,101 @@ class TestQuantScalePerTokenFp8WithPrequantizedWeight:
         # atol=4.0: FP8 quantization error accumulated over K terms (see
         # test_prequantized_closed_over for tolerance justification).
         torch.testing.assert_close(out_cpu, cpu_ref, atol=4.0, rtol=0.1)
+
+
+# ---------------------------------------------------------------------------
+# Row slice of a pre-quantized FP8 weight
+# ---------------------------------------------------------------------------
+
+
+def _row_slice_spyre_fn(act, q_weight, scale_a, scale_b):
+    q_act = torch.ops.spyre.quantize_fp8_with_scale(act, scale_a)
+    return torch.ops.aten._scaled_mm(
+        q_act,
+        q_weight,
+        scale_a=scale_a,
+        scale_b=scale_b,
+        bias=None,
+        out_dtype=torch.float16,
+    )
+
+
+class TestScaledMmPrequantizedRowSlice:
+    """_scaled_mm with a K-row slice of a QFP8WT weight (issue #5764).
+
+    A QFP8WT K row is 64 bytes, but the slice start was counted at 128 bytes
+    per row, so block kb read block 2 * kb. Weight [K=512, N=256], 128-row
+    blocks.
+    """
+
+    @pytest.mark.parametrize(
+        "kb, path",
+        [(1, "eager_view"), (1, "in_graph_slice"), (3, "eager_view")],
+        ids=["kb1-eager_view", "kb1-in_graph_slice", "kb3-eager_view"],
+    )
+    def test_row_slice_matches_standalone_slab(self, kb, path):
+        """A row slice matches the same rows loaded as their own weight (#5764).
+
+        Same data and ops, so the outputs must be bit-identical. eager_view
+        slices before torch.compile; in_graph_slice slices inside the graph.
+        """
+        from torch_spyre.model_utils import _dma_to_spyre_fp8_kernel
+
+        rows = slice(kb * 128, (kb + 1) * 128)
+        torch.manual_seed(0)
+        codes = (torch.randn(512, 256) * 50).clamp(-448.0, 448.0)
+        codes = codes.to(torch.float8_e4m3fn)
+        w_full = _dma_to_spyre_fp8_kernel(codes)
+        w_slab = _dma_to_spyre_fp8_kernel(codes[rows].contiguous())
+        act = torch.randn(4, 128, dtype=torch.float16).to(DEVICE)
+        scale_a = torch.full((1,), 1.0, dtype=torch.float16).to(DEVICE)
+        scale_b = torch.full((1,), 1.0, dtype=torch.float16).to(DEVICE)
+
+        def sliced_fn(act, q_weight, scale_a, scale_b):
+            if path == "in_graph_slice":
+                q_weight = q_weight[rows]
+            return _row_slice_spyre_fn(act, q_weight, scale_a, scale_b)
+
+        q_weight = w_full if path == "in_graph_slice" else w_full[rows]
+
+        # Reset so each case compiles its own kernels; dynamic=False keeps the
+        # slice offset a compile-time constant.
+        torch._dynamo.reset()
+        expected = torch.compile(_row_slice_spyre_fn, dynamic=False)(
+            act, w_slab, scale_a, scale_b
+        )
+        actual = torch.compile(sliced_fn, dynamic=False)(
+            act, q_weight, scale_a, scale_b
+        )
+
+        torch.testing.assert_close(actual.cpu(), expected.cpu(), rtol=0, atol=0)
+
+    @expects_raise
+    @pytest.mark.parametrize(
+        "act_k, take_slice, match",
+        [
+            (128, lambda w: w[1:129], "multiple of 2 rows"),
+            (512, lambda w: w[:, 128:256], "column offset"),
+        ],
+        ids=["odd_row_start", "column_start"],
+    )
+    def test_unsupported_qfp8wt_slice_raises(self, act_k, take_slice, match):
+        """A QFP8WT slice that cannot be addressed is rejected (#5764).
+
+        odd_row_start begins inside a 2-row stick; column_start has a column
+        offset, which is not modelled. Either would read the wrong data.
+        """
+        from torch_spyre.model_utils import _dma_to_spyre_fp8_kernel
+
+        torch.manual_seed(0)
+        codes = (torch.randn(512, 256) * 50).clamp(-448.0, 448.0)
+        w_full = _dma_to_spyre_fp8_kernel(codes.to(torch.float8_e4m3fn))
+        act = torch.randn(4, act_k, dtype=torch.float16).to(DEVICE)
+        scale = torch.full((1,), 1.0, dtype=torch.float16).to(DEVICE)
+
+        # The helper is shared, so reset: the error must come from this compile.
+        torch._dynamo.reset()
+        with pytest.raises(InductorError, match=match):
+            torch.compile(_row_slice_spyre_fn, dynamic=False)(
+                act, take_slice(w_full), scale, scale
+            )
