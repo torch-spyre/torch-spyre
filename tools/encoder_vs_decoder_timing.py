@@ -113,23 +113,38 @@ def measure(args) -> dict:
 
     dtype = getattr(torch, args.dtype)
     torch.manual_seed(0)
-    model = build_model(args.layers).to(args.device, dtype=dtype)
-    compiled = torch.compile(model, dynamic=False)
-
-    shape = (args.seq, args.batch_size, D_MODEL)
-    xs = [torch.randn(shape).to(args.device, dtype=dtype) for _ in range(args.iters)]
-    n = args.iters
     out = {}
 
     def sync():
         torch.spyre.synchronize()
 
+    # ---- load: build the model and put weights and inputs on the device ----
+    t0 = time.perf_counter()
+    model = build_model(args.layers).to(args.device, dtype=dtype)
+    shape = (args.seq, args.batch_size, D_MODEL)
+    xs = [torch.randn(shape).to(args.device, dtype=dtype) for _ in range(args.iters)]
+    sync()
+    out["load_s"] = time.perf_counter() - t0
+
+    compiled = torch.compile(model, dynamic=False)
+    n = args.iters
+
     with torch.no_grad():
+        # ---- compile: first call = compile + one run ----
         t0 = time.perf_counter()
-        compiled(xs[0]).cpu()  # first call = compile (+ one run)
+        compiled(xs[0]).cpu()
         out["first_s"] = time.perf_counter() - t0
+        warm = []
         for _ in range(args.warmup):
+            t0 = time.perf_counter()
             compiled(xs[0]).cpu()
+            warm.append(time.perf_counter() - t0)
+        # Estimate, first call minus one warm call.
+        out["compile_s"] = (
+            max(out["first_s"] - statistics.mean(warm), 0.0) if warm else None
+        )
+
+        # ---- run: steady-state per-step time for each call pattern ----
 
         def run_independent():
             outs = [compiled(x) for x in xs]
@@ -202,6 +217,29 @@ def run_topology(name: str, args) -> dict | None:
     return result
 
 
+def print_phase_times(rounds: list[tuple[dict, dict]]) -> None:
+    """Median over rounds of load, compile and run for each topology."""
+
+    def med(idx: int, fn) -> float | None:
+        vals = [fn(r[idx]) for r in rounds]
+        vals = [v for v in vals if v is not None]
+        return statistics.median(vals) if vals else None
+
+    def fmt(v: float | None, scale: float = 1.0) -> str:
+        return f"{v * scale:>12.3f}" if v is not None else f"{'n/a':>12}"
+
+    run_ms = lambda r: statistics.mean(r[p]["per_step_ms"] for p in PATTERNS)  # noqa: E731
+    print()
+    print(f"{'phase (median of rounds)':<28}{'2-stream':>12}{'3-stream':>12}")
+    for label, fn, scale in [
+        ("load (s)", lambda r: r["load_s"], 1.0),
+        ("compile estimate (s)", lambda r: r["compile_s"], 1.0),
+        ("run (ms/step, mean of 3)", run_ms, 1.0),
+    ]:
+        print(f"{label:<28}{fmt(med(0, fn), scale)}{fmt(med(1, fn), scale)}")
+    print("compile = first call minus a warm call; run excludes load and compile.")
+
+
 # A round's 3-vs-2 delta smaller than this is treated as no difference.
 MIN_EFFECT_PCT = 2.0
 
@@ -227,6 +265,7 @@ def print_verdict(rounds: list[tuple[dict, dict]], args) -> None:
         b = statistics.mean(three[p]["per_step_ms"] for p in PATTERNS)
         print(f"{i:<8}{a:>14.3f}{b:>14.3f}{d:>+9.1f}%")
     print("(ms = mean over the three call patterns)")
+    print_phase_times(rounds)
 
     median = statistics.median(deltas)
     faster = sum(d < -MIN_EFFECT_PCT for d in deltas)
