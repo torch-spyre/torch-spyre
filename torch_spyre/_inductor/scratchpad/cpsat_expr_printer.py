@@ -60,11 +60,11 @@ _CORE_INV_SCALE = 1024
 _CORE_INV_SCALE_MAX_VALUE = 32
 # constant limit on product terms to avoid int32 overflow in CP-SAT
 _MAX_PRODUCT_BOUND = 2**30
-# Relative miss at a candidate past which RDP keeps it as a breakpoint of a
-# fractional power's piecewise-linear lowering (see _SympyExprToCpSat._pwl).
-_PWL_TOLERANCE = 0.01
-# Most breakpoints a lowered power may take; past it the lowering raises.
-_PWL_MAX_KNOTS = 64
+# Relative miss at a candidate past which a fractional power's linearization
+# keeps it as a breakpoint (see ramer_douglas_peucker).
+_LINEARIZE_TOLERANCE = 0.01
+# Most breakpoints a linearized power may take; past it the lowering raises.
+_LINEARIZE_MAX_BREAKPOINTS = 64
 
 
 _operator_map = {
@@ -75,6 +75,28 @@ _operator_map = {
     "==": operator.eq,
     "!=": operator.ne,
 }
+
+
+def ramer_douglas_peucker(xs, ys, tolerance: float) -> list[int]:
+    """Indices of the points ``(xs[i], ys[i])`` that Ramer-Douglas-Peucker keeps
+    as breakpoints: the two ends, then, segment by segment, the point the
+    segment misses by the most, while that miss exceeds ``tolerance`` relative
+    to the point's own value. ``xs`` is increasing. The line through the
+    returned points meets every point within ``tolerance``."""
+    keep = {0, len(xs) - 1}
+    stack = [(0, len(xs) - 1)]
+    while stack:
+        lo, hi = stack.pop()
+        slope = (ys[hi] - ys[lo]) / (xs[hi] - xs[lo]) if hi > lo else 0.0
+        worst, at = tolerance, None
+        for i in range(lo + 1, hi):
+            miss = abs(ys[lo] + slope * (xs[i] - xs[lo]) - ys[i])
+            if miss > worst * abs(ys[i]):
+                worst, at = miss / abs(ys[i]), i
+        if at is not None:
+            keep.add(at)
+            stack += [(lo, at), (at, hi)]
+    return sorted(keep)
 
 
 def _eq_fact(rel):
@@ -479,7 +501,7 @@ class _SympyExprToCpSat(Printer):
             if not self._is_split_sym(arg):
                 return expr
             if expr.exp.is_Number and not expr.exp.is_Integer:
-                return self._power_pwl(expr)
+                return self._linearize_power(expr)
             if expr.exp == -1:
                 return sympy.Symbol(
                     f"inv_{arg.name}", integer=True, nonnegative=True
@@ -517,46 +539,26 @@ class _SympyExprToCpSat(Printer):
             return list(range(1, _CORE_INV_SCALE_MAX_VALUE + 1))
         return None
 
-    def _power_pwl(self, expr):
-        """A fractional power of a split or tile symbol as a piecewise-linear
-        function through its candidate values (see :meth:`_pwl`). Left as is
-        when the candidates are unknown or include a pole."""
+    def _linearize_power(self, expr):
+        """A fractional power of a split or tile symbol as the piecewise-linear
+        function through its candidate values at the breakpoints
+        ``ramer_douglas_peucker`` keeps. Exact at every breakpoint, within
+        _LINEARIZE_TOLERANCE elsewhere. Left as is when the candidates are
+        unknown or include a pole; raises past _LINEARIZE_MAX_BREAKPOINTS rather
+        than lowering a coarser function."""
         arg, exponent = expr.base, float(expr.exp)
         xs = self._candidates(arg)
         if xs is None or (exponent < 0 and xs[0] <= 0):
             return expr
-        return self._pwl(arg, xs, [x**exponent for x in xs])
-
-    @staticmethod
-    def _pwl(arg, xs, ys):
-        """A piecewise-linear function of ``arg`` through ``(xs, ys)``, the
-        values ``arg`` can take and the function's value at each. Breakpoints
-        are chosen by Ramer-Douglas-Peucker: a candidate becomes one when the
-        segment past it misses by more than _PWL_TOLERANCE, relative. Exact at
-        every breakpoint; raises past _PWL_MAX_KNOTS breakpoints rather than
-        lowering a coarser function."""
+        ys = [x**exponent for x in xs]
         if len(xs) == 1:
             return sympy.Float(ys[0])
-        keep = {0, len(xs) - 1}
-        stack = [(0, len(xs) - 1)]
-        while stack:
-            lo, hi = stack.pop()
-            slope = (ys[hi] - ys[lo]) / (xs[hi] - xs[lo])
-            worst, at = 0.0, None
-            for i in range(lo + 1, hi):
-                miss = abs(ys[lo] + slope * (xs[i] - xs[lo]) - ys[i]) / max(
-                    abs(ys[i]), 1e-300
-                )
-                if miss > worst:
-                    worst, at = miss, i
-            if at is not None and worst > _PWL_TOLERANCE:
-                keep.add(at)
-                stack += [(lo, at), (at, hi)]
-        if len(keep) > _PWL_MAX_KNOTS:
+        points = ramer_douglas_peucker(xs, ys, _LINEARIZE_TOLERANCE)
+        if len(points) > _LINEARIZE_MAX_BREAKPOINTS:
             raise ValueError(
-                f"{len(keep)} breakpoints for {arg} past the {_PWL_MAX_KNOTS} limit"
+                f"{len(points)} breakpoints for {expr} past the "
+                f"{_LINEARIZE_MAX_BREAKPOINTS} limit"
             )
-        points = sorted(keep)
         pieces = []
         for lo, hi in zip(points, points[1:]):
             slope = (ys[hi] - ys[lo]) / (xs[hi] - xs[lo])

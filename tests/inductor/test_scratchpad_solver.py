@@ -56,9 +56,10 @@ try:
     from torch_spyre._inductor.scratchpad.cpsat_expr_printer import (
         _CORE_INV_SCALE,
         _MAX_PRODUCT_BOUND,
-        _PWL_TOLERANCE,
+        _LINEARIZE_TOLERANCE,
         _SympyExprToCpSat,
         _simplify_eq_conjunction,
+        ramer_douglas_peucker,
     )
     from torch_spyre._inductor.scratchpad.ilp_solver_ortools import CpSatLayoutSolver
 
@@ -2136,11 +2137,28 @@ class TestSympyExprToCpSatPrinter(TestCase):
                     for v in values:
                         want = v ** float(exp)
                         got = float(approx.subs(sym, v))
-                        self.assertLessEqual(abs(got - want), _PWL_TOLERANCE * want)
+                        self.assertLessEqual(
+                            abs(got - want), _LINEARIZE_TOLERANCE * want
+                        )
         n = sympy.Symbol("n")
         split = sympy.Symbol("split_x", integer=True, positive=True)
         printer = _SympyExprToCpSat(cp_model.CpModel(), {}, {})
         self.assertEqual(printer._inv_log_sym(split**n), split**n)
+
+    def test_ramer_douglas_peucker_keeps_the_points_a_line_misses(self):
+        # Collinear points keep only the ends; a kink is kept, and points
+        # within the tolerance of the line through their neighbours are not.
+        xs = list(range(10))
+        self.assertEqual(
+            ramer_douglas_peucker(xs, [2 * x + 1 for x in xs], 0.0), [0, 9]
+        )
+        kinked = [6 - abs(x - 4) for x in xs]
+        self.assertEqual(ramer_douglas_peucker(xs, kinked, 0.01), [0, 4, 9])
+        bumped = [10.0, 10.0, 10.05, 10.0, 10.0]
+        self.assertEqual(ramer_douglas_peucker(range(5), bumped, 0.01), [0, 4])
+        self.assertEqual(
+            ramer_douglas_peucker(range(5), bumped, 0.001), [0, 1, 2, 3, 4]
+        )
 
     def test_fractional_power_past_the_knot_limit_raises(self):
         # A curve that needs more breakpoints than the limit is a lowering
@@ -2148,7 +2166,7 @@ class TestSympyExprToCpSatPrinter(TestCase):
         split = sympy.Symbol("split_x", integer=True, positive=True)
         printer = _SympyExprToCpSat(cp_model.CpModel(), {}, {})
         module = "torch_spyre._inductor.scratchpad.cpsat_expr_printer"
-        with mock.patch(f"{module}._PWL_MAX_KNOTS", 2):
+        with mock.patch(f"{module}._LINEARIZE_MAX_BREAKPOINTS", 2):
             with self.assertRaisesRegex(ValueError, "breakpoints"):
                 printer._inv_log_sym(split**0.25)
 
@@ -2168,7 +2186,8 @@ class TestSympyExprToCpSatPrinter(TestCase):
         best = min(exact, key=exact.get)
         self.assertEqual(solver.Value(sym_map["split_s"]), best)
         self.assertLessEqual(
-            abs(solver.ObjectiveValue() - exact[best]), _PWL_TOLERANCE * exact[best]
+            abs(solver.ObjectiveValue() - exact[best]),
+            _LINEARIZE_TOLERANCE * exact[best],
         )
 
     def test_negated_and_unnamed_boolean_products_preserve_every_assignment(self):
