@@ -1,0 +1,38 @@
+# yaml-language-server: $schema=../../spyre_bench/core/schemas/resources.schema.json
+# Datasets add semantics over assets: role, schema, named subsets. Each subset is a `select` and has its own identity.
+apiVersion: bench/v1alpha1
+kind: Dataset
+metadata: {name: all-sequences}
+spec:
+  asset: trace-all-files
+  role: trace
+  schema: {record: {prompt: text, output_len: int}, id: {field: seq_id}}
+  subsets: {smoke-200: {limit: 200, order: sequential}}
+---
+apiVersion: bench/v1alpha1
+kind: Dataset
+metadata: {name: trace-x}
+spec:
+  asset: trace-x-files
+  role: trace
+  subsets: {smoke-200: {limit: 200, order: sequential}}
+---
+apiVersion: bench/v1alpha1
+kind: Dataset
+metadata: {name: trace-y}
+spec:
+  asset: trace-y-files
+  role: trace
+  subsets:
+    smoke-200: {limit: 200, order: sequential}
+    stratified: {sample: {n: 1000, seed: 0, stratify_by: bucket}}
+---
+apiVersion: bench/v1alpha1
+kind: Dataset
+metadata: {name: random-isl-osl, description: "seeded random prompts; lengths come from the workload"}
+spec: {asset: random-prompts-gen, role: trace}
+---
+apiVersion: bench/v1alpha1
+kind: Dataset
+metadata: {name: parity-prompts}
+spec: {asset: parity-prompts-files, role: eval}

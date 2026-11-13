@@ -1,0 +1,30 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+apiVersion: bench/v1alpha1
+kind: System
+metadata: {name: demo-llm-a-hfa-fp16}
+spec: {type: llm/lm-eval-model, backend: hf-demo, token: demoa, model: demo-llm-a, precision: fp16}
+---
+apiVersion: bench/v1alpha1
+kind: System
+metadata: {name: demo-llm-a-fp8-hfa-fp8}
+spec: {type: llm/lm-eval-model, backend: hf-demo, token: demoa-fp8, model: demo-llm-a-fp8, precision: fp8}
+---
+apiVersion: bench/v1alpha1
+kind: Benchmark
+metadata: {name: eval-gsm8k}
+spec:
+  type: quality
+  level: model
+  tier: core
+  system: demo-llm-a-hfa-fp16
+  workload:
+    type: llm/lm-eval
+    inputs: [{name: tasks, dataset: gsm8k, subset: test-first-50, expect: {records: 50}}]
+    eval: {task: gsm8k, num_fewshot: 5, seed: 1234, filter: strict-match}
+  run: {cache: warm, timeout: 120m, est: 30m}
+  matrix:
+    name_template: eval_gsm8k_{system.token}_{system.precision}_l50
+    axes:
+      model:
+        - {token: fp16, patch: {tier: sanity}}
+        - {token: fp8, patch: {system: demo-llm-a-fp8-hfa-fp8}}
