@@ -30,25 +30,55 @@ _ATOL_BF16 = 2e-2
 _ATOL_F32 = 1e-5
 
 
-_INDEX_EAGER = (1219, "aten::index.Tensor_out is not registered on Spyre.")
-_GATHER_EAGER = (4328, "aten::gather.out is not registered on Spyre.")
+_GATHER_EAGER = (
+    4328,
+    "aten::gather.out is not registered on Spyre.",
+    r"Could not run 'aten::gather.out'",
+)
+_SCATTER_ADD_EAGER = (
+    4396,
+    "aten::scatter_add.out is not registered on Spyre.",
+    r"Could not run 'aten::scatter_add.out'",
+)
+_SLICE_OFFSET_ALIGNMENT = (
+    5383,
+    "compile copy_from_d2d of a sliced view requires a stick-aligned storage_offset.",
+    r"copy_from_d2d of a sliced view requires a stick-aligned storage_offset",
+)
 _POINTWISE_NO_LAYOUT = (
     4306,
-    "compile Multi-arg pointwise no supported output layout found.",
+    "compile Multi-arg pointwise: no supported output layout found.",
+    r"Multi-arg pointwise .*no supported output layout found",
 )
 _RESTICKIFY_3ARGS = (
     4327,
-    "compile gather / index_select dim>=1 restickify op_spec has 3 args.",
+    "gather / index_select dim>=1 mismatches CPU (the issue reported an 'op_spec has 3 args' abort; today it is a numerical mismatch).",
+    r"spyre <-> cpu\S* mismatch",
 )
-_MATMUL_MISMATCH = (4722, "Gather then matmul / QKV split compiled numerical mismatch.")
-_LN_MIXED_EA = (4714, "Compile LayerNorm after gather multi-arg pointwise mixed EA.")
+_MATMUL_MISMATCH = (
+    4722,
+    "compile gather followed by matmul / linear numerical mismatch.",
+    r"spyre <-> cpu\S* mismatch",
+)
+_LN_MIXED_EA = (
+    4714,
+    "compile LayerNorm after gather: multi-arg pointwise with mixed EA.",
+    r"Multi-arg pointwise with mixed EA",
+)
+_LN_EAGER_SUBPROC = (
+    "Pending issue: eager LayerNorm after gather raises SubprocException",
+    "Eager LayerNorm after gather raises SubprocException in the compile subprocess.",
+    r"SubprocException",
+)
 _SCATTER_STICK = (
-    3265,
-    "Compile scatter buf (Scatter): no mechanism to resolve stick incompatibility.",
+    "Pending issue: compile gather then scatter_add numerical mismatch",
+    "compile gather followed by scatter_add produces numerical mismatch vs CPU.",
+    r"compiled spyre <-> cpu\S* mismatch",
 )
 _CHUNK_REDUCE_MUTATION = (
-    3916,
-    "Compile chunk reduce no offset-free alternative stick dim for mutation target.",
+    4754,
+    "compile chunk reduce: no offset-free alternative stick dim for mutation target.",
+    r"no offset-free alternative stick dim for mutation target",
 )
 
 
@@ -66,8 +96,6 @@ class TestGatherComposedChainsAndEndToEndPipelines:
 
     def test_two_sequential_gathers(self, execution_mode):
         """Two back-to-back gather ops; second gather feeds into first output."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         table1 = cached_randn((64, 32), differentiation="ch01t1", dtype=torch.float16)
         table2 = cached_randn((64, 32), differentiation="ch01t2", dtype=torch.float16)
         idx = torch.randint(0, 64, (16,), dtype=torch.int64)
@@ -83,8 +111,6 @@ class TestGatherComposedChainsAndEndToEndPipelines:
 
     def test_gather_then_gather_on_output(self, execution_mode):
         """Second gather re-indexes the output of the first gather."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         table = cached_randn((64, 32), differentiation="ch02", dtype=torch.float16)
         idx1 = torch.randint(0, 64, (32,), dtype=torch.int64)
         idx2 = torch.randint(0, 32, (16,), dtype=torch.int64)
@@ -100,9 +126,10 @@ class TestGatherComposedChainsAndEndToEndPipelines:
 
     def test_gather_then_matmul(self, execution_mode):
         """Gather followed by matmul; fused downstream linear."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4722
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER, compiled=_MATMUL_MISMATCH)
+        _xfail_existing(
+            execution_mode, eager=_MATMUL_MISMATCH, compiled=_MATMUL_MISMATCH
+        )
         emb = cached_randn((256, 128), differentiation="ch03e", dtype=torch.float16)
         w = cached_randn((128, 64), differentiation="ch03w", dtype=torch.float16)
         idx = torch.randint(0, 256, (32,), dtype=torch.int64)
@@ -118,9 +145,8 @@ class TestGatherComposedChainsAndEndToEndPipelines:
 
     def test_gather_then_layer_norm(self, execution_mode):
         """Gather output into layer_norm; end-to-end embedding + norm."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4714
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER, compiled=_LN_MIXED_EA)
+        _xfail_existing(execution_mode, eager=_LN_EAGER_SUBPROC, compiled=_LN_MIXED_EA)
         emb = cached_randn((256, 128), differentiation="ch04e", dtype=torch.float16)
         idx = torch.randint(0, 256, (32,), dtype=torch.int64)
         compare_mode(
@@ -134,8 +160,6 @@ class TestGatherComposedChainsAndEndToEndPipelines:
 
     def test_gather_add_residual(self, execution_mode):
         """Gathered embedding added to residual stream."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         emb = cached_randn((256, 128), differentiation="ch05e", dtype=torch.float16)
         residual = cached_randn((32, 128), differentiation="ch05r", dtype=torch.float16)
         idx = torch.randint(0, 256, (32,), dtype=torch.int64)
@@ -151,8 +175,6 @@ class TestGatherComposedChainsAndEndToEndPipelines:
 
     def test_gather_split_rope_apply(self, execution_mode):
         """Gather cos/sin cache, split Q/K, apply RoPE."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         cos_sin = cached_randn(
             (4096, 128), differentiation="ch06cs", dtype=torch.float16
         )
@@ -168,8 +190,6 @@ class TestGatherComposedChainsAndEndToEndPipelines:
 
     def test_gather_two_tables_add(self, execution_mode):
         """Lookup from two separate embedding tables, element-wise add."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         t1 = cached_randn((128, 64), differentiation="ch07t1", dtype=torch.float16)
         t2 = cached_randn((128, 64), differentiation="ch07t2", dtype=torch.float16)
         idx = torch.randint(0, 128, (32,), dtype=torch.int64)
@@ -188,9 +208,11 @@ class TestGatherComposedChainsAndEndToEndPipelines:
 
         Standalone grouped_mm scatter_add is in test_scatter_ops.py.
         """
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4396
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/3265
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER, compiled=_SCATTER_STICK)
+        _xfail_existing(
+            execution_mode, eager=_SCATTER_ADD_EAGER, compiled=_SCATTER_STICK
+        )
         expert_w = cached_randn(
             (8, 32, 64), differentiation="ch08", dtype=torch.float16
         )
@@ -210,8 +232,6 @@ class TestGatherComposedChainsAndEndToEndPipelines:
 
     def test_chunk_gather_cos_sin(self, execution_mode):
         """Gather cos_sin[pos]; torch.chunk → cos, sin halves."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         cos_sin = cached_randn(
             (4096, 128), differentiation="chnk01", dtype=torch.float16
         )
@@ -227,9 +247,10 @@ class TestGatherComposedChainsAndEndToEndPipelines:
 
     def test_split_gather_qkv(self, execution_mode):
         """QKV split after token embedding gather + linear projection."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4722
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER, compiled=_MATMUL_MISMATCH)
+        _xfail_existing(
+            execution_mode, eager=_MATMUL_MISMATCH, compiled=_MATMUL_MISMATCH
+        )
         emb = cached_randn((512, 128), differentiation="chnk02e", dtype=torch.float16)
         W = cached_randn((128, 384), differentiation="chnk02w", dtype=torch.float16)
         idx = torch.randint(0, 512, (32,), dtype=torch.int64)
@@ -245,8 +266,6 @@ class TestGatherComposedChainsAndEndToEndPipelines:
 
     def test_rope_gather_broadcast(self, execution_mode):
         """Gather RoPE freqs then broadcast over head dim."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         freqs = cached_randn((4096, 64), differentiation="chnk04", dtype=torch.float16)
         pos = torch.randint(0, 4096, (32,), dtype=torch.int64)
         compare_mode(
@@ -260,8 +279,6 @@ class TestGatherComposedChainsAndEndToEndPipelines:
 
     def test_gather_concat(self, execution_mode):
         """Two gathers from separate caches; concat along seq dim."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         k1 = cached_randn((256, 8, 64), differentiation="chnk05a", dtype=torch.float16)
         k2 = cached_randn((256, 8, 64), differentiation="chnk05b", dtype=torch.float16)
         i1 = torch.randint(0, 256, (32,), dtype=torch.int64)
@@ -279,10 +296,11 @@ class TestGatherComposedChainsAndEndToEndPipelines:
 
     def test_chunk_then_reduce(self, execution_mode):
         """Gather + chunk + per-chunk sum reduction; each quarter summed independently."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/3916
         _xfail_existing(
-            execution_mode, eager=_INDEX_EAGER, compiled=_CHUNK_REDUCE_MUTATION
+            execution_mode,
+            eager=_CHUNK_REDUCE_MUTATION,
+            compiled=_CHUNK_REDUCE_MUTATION,
         )
         x = cached_randn((64, 256), differentiation="chnk06", dtype=torch.float16)
         idx = torch.randint(0, 64, (32,), dtype=torch.int64)
@@ -299,8 +317,8 @@ class TestGatherComposedChainsAndEndToEndPipelines:
 
     def test_rope_gather_mul(self, execution_mode):
         """Gather cos[pos] * q + sin[pos] * rotate90(q) RoPE pattern."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4399
+        _xfail_existing(execution_mode, eager=_SLICE_OFFSET_ALIGNMENT)
         cos = cached_randn((4096, 64), differentiation="chnk07c", dtype=torch.float16)
         sin = cached_randn((4096, 64), differentiation="chnk07s", dtype=torch.float16)
         q = cached_randn((32, 64), differentiation="chnk07q", dtype=torch.float16)
@@ -321,8 +339,8 @@ class TestGatherComposedChainsAndEndToEndPipelines:
 
     def test_gather_unbind_stack(self, execution_mode):
         """Gather + unbind + stack at new axis."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4399
+        _xfail_existing(execution_mode, eager=_SLICE_OFFSET_ALIGNMENT)
         x = cached_randn((64, 4, 32), differentiation="chnk08", dtype=torch.float16)
         idx = torch.randint(0, 64, (16,), dtype=torch.int64)
         compare_mode(
@@ -336,8 +354,6 @@ class TestGatherComposedChainsAndEndToEndPipelines:
 
     def test_chunk_gather_parallel_k_v(self, execution_mode):
         """Parallel K and V gather in single fn; both correct."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         k = cached_randn((512, 8, 64), differentiation="chnk10k", dtype=torch.float16)
         v = cached_randn((512, 8, 64), differentiation="chnk10v", dtype=torch.float16)
         idx = torch.randint(0, 512, (64,), dtype=torch.int64)
@@ -353,8 +369,6 @@ class TestGatherComposedChainsAndEndToEndPipelines:
 
     def test_gather_reshape_chunk(self, execution_mode):
         """Gather + reshape + chunk for multi-head split."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         emb = cached_randn((512, 512), differentiation="chnk11", dtype=torch.float16)
         idx = torch.randint(0, 512, (32,), dtype=torch.int64)
         compare_mode(
@@ -368,8 +382,6 @@ class TestGatherComposedChainsAndEndToEndPipelines:
 
     def test_gather_split_apply_merge(self, execution_mode):
         """Gather → split → per-head op → merge back."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         emb = cached_randn((512, 256), differentiation="chnk12", dtype=torch.float16)
         idx = torch.randint(0, 512, (16,), dtype=torch.int64)
         compare_mode(
@@ -387,8 +399,6 @@ class TestGatherComposedChainsAndEndToEndPipelines:
 
     def test_e2e_decode_token_lookup(self, execution_mode):
         """GE2E-01: Full decode step: token embed + KV read + minimal attention."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         vocab = cached_randn((512, 128), differentiation="e2e01v", dtype=torch.float16)
         kv = cached_randn((512, 8, 64), differentiation="e2e01kv", dtype=torch.float16)
         tok_id = torch.randint(0, 512, (1,), dtype=torch.int64)
@@ -406,8 +416,6 @@ class TestGatherComposedChainsAndEndToEndPipelines:
 
     def test_e2e_decode_single_step(self, execution_mode):
         """GE2E-03: Single autoregressive decode; 1 new token lookup."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         vocab = cached_randn((512, 128), differentiation="e2e03v", dtype=torch.float16)
         kv_k = cached_randn((512, 8, 64), differentiation="e2e03k", dtype=torch.float16)
         kv_v = cached_randn(
@@ -429,8 +437,6 @@ class TestGatherComposedChainsAndEndToEndPipelines:
 
     def test_e2e_prefill_kv_fill(self, execution_mode):
         """GE2E-05: Gather prefill KV tokens from paged cache; 32 positions from 128-slot pool."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         cache = cached_randn((128, 8, 64), differentiation="e2e05", dtype=torch.float16)
         pos = torch.arange(32, dtype=torch.int64)
         compare_mode(
@@ -444,8 +450,6 @@ class TestGatherComposedChainsAndEndToEndPipelines:
 
     def test_e2e_kv_decode_extend(self, execution_mode):
         """GE2E-07: Decode extends prefill; gather 128 prefill + 1 decode position from paged cache."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         cache = cached_randn((256, 8, 64), differentiation="e2e07", dtype=torch.float16)
         all_pos = torch.arange(129, dtype=torch.int64)
         compare_mode(
@@ -472,8 +476,6 @@ class TestGatherComposedChainsAndEndToEndPipelines:
 
     def test_e2e_continuous_batch(self, execution_mode):
         """GE2E-10: Continuous batch: 4 prefill + 8 decode requests in one gather."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         kv = cached_randn((512, 8, 64), differentiation="e2e10", dtype=torch.float16)
         prefill_slots = torch.randint(0, 512, (128,), dtype=torch.int64)
         decode_slots = torch.randint(0, 512, (8,), dtype=torch.int64)
@@ -511,8 +513,6 @@ class TestGatherComposedChainsAndEndToEndPipelines:
 
     def test_e2e_full_pipeline_bfloat16(self, execution_mode):
         """GE2E-14: bfloat16 end-to-end: embed + KV read + decode output."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         vocab = cached_randn((512, 128), differentiation="e2e14v", dtype=torch.bfloat16)
         kv = cached_randn((512, 8, 64), differentiation="e2e14kv", dtype=torch.bfloat16)
         tok = torch.randint(0, 512, (8,), dtype=torch.int64)
@@ -532,11 +532,11 @@ class TestGatherComposedChainsAndEndToEndPipelines:
 
     def test_rope_neox_qk_both(self, execution_mode):
         """NeoX rotate-half RoPE applied to both Q and K after position gather."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4399
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4306
         _xfail_existing(
             execution_mode,
-            eager=_INDEX_EAGER,
+            eager=_SLICE_OFFSET_ALIGNMENT,
             compiled=_POINTWISE_NO_LAYOUT,
         )
         cos_sin = cached_randn(
@@ -568,8 +568,8 @@ class TestGatherComposedChainsAndEndToEndPipelines:
 
     def test_rope_interleaved_separate_cos_sin_caches(self, execution_mode):
         """Interleaved RoPE with separate cos/sin caches; both gathered then applied to Q and K."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4399
+        _xfail_existing(execution_mode, eager=_SLICE_OFFSET_ALIGNMENT)
         cos = cached_randn((2048, 64), differentiation="ropi03c", dtype=torch.float16)
         sin = cached_randn((2048, 64), differentiation="ropi03s", dtype=torch.float16)
         q = cached_randn((32, 64), differentiation="ropi03q", dtype=torch.float16)

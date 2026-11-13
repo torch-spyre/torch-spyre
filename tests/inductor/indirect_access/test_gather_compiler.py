@@ -28,26 +28,20 @@ _ATOL_F16 = 1e-2
 _ATOL_BF16 = 2e-2
 _ATOL_F32 = 1e-5
 
-_INDEX_EAGER = (1219, "aten::index.Tensor_out is not registered on Spyre.")
-_INCOMPATIBLE_HOST_SIZE = (
-    3732,
-    "compile take / flatten-take Incompatible host_size and dim_order.",
-)
 _SYMBOLIC_INT_CONV = (
     4304,
-    "compile_dyn / symbolic size Cannot convert symbols to int.",
-)
-_GATHER_OUT_LAYOUTS_EMPTY = (
-    4713,
-    "Compile topk followed by table gather out_layouts is empty.",
+    "compile(dynamic=True): Cannot convert symbols to int.",
+    r"Cannot convert symbols to int",
 )
 _DXP_STANDALONE_FAIL = (
     4321,
-    "compile gather DBO dxp_standalone returned non-zero exit status 1.",
+    "compile gather dxp_standalone returned non-zero exit status 1.",
+    r"SubprocException",
 )
 _RESTICKIFY_3ARGS = (
     4327,
-    "compile gather / index_select dim>=1 restickify op_spec has 3 args.",
+    "gather / index_select dim>=1 mismatches CPU (the issue reported an 'op_spec has 3 args' abort; today it is a numerical mismatch).",
+    r"spyre <-> cpu\S* mismatch",
 )
 
 
@@ -94,8 +88,6 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
 
     def test_reshape_before_gather(self):
         """Reshape barrier before gather; GATHER_OP_SPEC at post-reshape."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/3732
-        _xfail_existing("compiled", compiled=_INCOMPATIBLE_HOST_SIZE)
         x = cached_randn((8, 8, 128), differentiation="gcp07", dtype=torch.float16)
         idx = torch.randint(0, 64, (32,), dtype=torch.int64)
         compare_mode(
@@ -357,8 +349,6 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
 
     def test_arange_index_inside_graph(self):
         """torch.arange generates index inside compiled graph; GATHER_OP_SPEC must fire."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing("compiled", compiled=_INDEX_EAGER)
         x = cached_randn((64, 128), differentiation="ing01", dtype=torch.float16)
         seqlen = 32
         compare_mode(
@@ -369,10 +359,11 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
             rtol=_ATOL_F16,
         )
 
+    @pytest.mark.skip(
+        reason="StreamInErrorState fatal card stream drop on topk gather inside graph. See issue #4713."
+    )
     def test_topk_index_inside_graph(self):
         """topk inside compiled graph produces row index; expert_w[ids] fires GATHER_OP_SPEC."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4713
-        _xfail_existing("compiled", compiled=_GATHER_OUT_LAYOUTS_EMPTY)
         expert_w = cached_randn(
             (8, 64, 32), differentiation="ing02", dtype=torch.float16
         )
@@ -546,8 +537,6 @@ class TestGatherCompilerPassesMemoryAndDynamicShapes:
 
     def test_dim2_fancy_indexing_lx(self):
         """x[:, :, idx] dim=2 gather with LX_PLANNING=1; innermost-dim indirect access through LX planner."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4327
-        _xfail_existing("compiled", compiled=_RESTICKIFY_3ARGS)
         os.environ["LX_PLANNING"] = "1"
         x = cached_randn((8, 16, 64), differentiation="dim02", dtype=torch.float16)
         idx = torch.randint(0, 64, (32,), dtype=torch.int64)

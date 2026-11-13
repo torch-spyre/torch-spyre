@@ -27,11 +27,22 @@ from conftest import _xfail_existing, compare_mode  # noqa: E402
 _ATOL_F16 = 1e-2
 _ATOL_BF16 = 2e-2
 _ATOL_F32 = 1e-5
+_ATOL_F32_DEVICE = 1e-3
 
-_INDEX_EAGER = (1219, "aten::index.Tensor_out is not registered on Spyre.")
+_NUMERICAL_MISMATCH = (
+    "Pending issue: eager gather + downstream op numerical mismatch",
+    "Eager gather followed by a downstream op mismatches CPU.",
+    r"spyre <-> cpu\S* mismatch",
+)
+_FP16_TO_FP32_EAGER = (
+    5856,
+    "Eager FP16 to FP32 device dtype conversion produces numerical mismatch.",
+    r"eager spyre <-> (precomputed )?cpu\S*( ref)? mismatch",
+)
 _CLIP_FP32 = (
-    4720,
-    "Compile F.normalize / clamp_min / clip on IEEE_FP32 is unsupported.",
+    "Pending issue: eager and compiled gather + exp float32 numerical mismatch",
+    "Eager and compiled gather followed by exp on float32 mismatch CPU.",
+    r"spyre <-> cpu\S* mismatch",
 )
 
 
@@ -58,8 +69,6 @@ class TestGatherFusedDownstreamOperations:
     )
     def test_gather_3d_unary(self, execution_mode, op, diff_key):
         """3D gather on (8,32,128) + unary op co-scheduled."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         x = cached_randn((8, 32, 128), differentiation=diff_key, dtype=torch.float16)
         idx = torch.randint(0, 8, (4,), dtype=torch.int64)
         compare_mode(
@@ -73,8 +82,6 @@ class TestGatherFusedDownstreamOperations:
 
     def test_gather_sqrt_bfloat16(self, execution_mode):
         """bfloat16 gather + sqrt downstream; abs input for valid sqrt."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         x = cached_randn(
             (32, 128), differentiation="gds04", dtype=torch.bfloat16, abs=True
         )
@@ -89,10 +96,14 @@ class TestGatherFusedDownstreamOperations:
         )
 
     def test_gather_exp_float32(self, execution_mode):
-        """float32 gather + exp downstream; no fp16 precision loss."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
+        """float32 gather + exp downstream; test with device float32 tolerance."""
+        # TODO: Pending issue: numerical precision mismatch between Spyre device and CPU reference
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4720
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER, compiled=_CLIP_FP32)
+        _xfail_existing(
+            execution_mode,
+            eager=_NUMERICAL_MISMATCH,
+            compiled=_CLIP_FP32,
+        )
         x = cached_randn((32, 128), differentiation="gds05", dtype=torch.float32)
         x = x.abs()
         idx = torch.randint(0, 32, (16,), dtype=torch.int64)
@@ -107,8 +118,6 @@ class TestGatherFusedDownstreamOperations:
 
     def test_gather_triple_unary(self, execution_mode):
         """Triple-chained exp → tanh → sigmoid after gather."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         x = cached_randn((32, 256), differentiation="gds06", dtype=torch.float16)
         idx = torch.randint(0, 32, (16,), dtype=torch.int64)
         compare_mode(
@@ -122,8 +131,6 @@ class TestGatherFusedDownstreamOperations:
 
     def test_gather_scalar_sub(self, execution_mode):
         """Scalar subtraction (- 0.5) after gather."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         x = cached_randn((32, 128), differentiation="gds07", dtype=torch.float16)
         idx = torch.randint(0, 32, (16,), dtype=torch.int64)
         compare_mode(
@@ -137,8 +144,6 @@ class TestGatherFusedDownstreamOperations:
 
     def test_gather_scalar_div(self, execution_mode):
         """Scalar divide (/ 8.0) — attention head scale."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         x = cached_randn((32, 256), differentiation="gds08", dtype=torch.float16)
         idx = torch.randint(0, 32, (16,), dtype=torch.int64)
         compare_mode(
@@ -152,8 +157,6 @@ class TestGatherFusedDownstreamOperations:
 
     def test_gather_mean_reduction(self, execution_mode):
         """mean(dim=1) after gather; output collapses to (16,)."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         x = cached_randn((32, 128), differentiation="gds09", dtype=torch.float16)
         idx = torch.randint(0, 32, (16,), dtype=torch.int64)
         compare_mode(
@@ -167,8 +170,6 @@ class TestGatherFusedDownstreamOperations:
 
     def test_gather_sum_dim0(self, execution_mode):
         """sum(dim=0) after gather; output shape (128,)."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         x = cached_randn((32, 128), differentiation="gds10", dtype=torch.float16)
         idx = torch.randint(0, 32, (16,), dtype=torch.int64)
         compare_mode(
@@ -182,8 +183,8 @@ class TestGatherFusedDownstreamOperations:
 
     def test_gather_cos_cpu_fallback(self, execution_mode):
         """cos has no Spyre kernel; gather on Spyre, cos falls back to CPU."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/5856
+        _xfail_existing(execution_mode, eager=_FP16_TO_FP32_EAGER)
         x = cached_randn((32, 64), differentiation="gds11", dtype=torch.float16)
         idx = torch.randint(0, 32, (16,), dtype=torch.int64)
         compare_mode(
@@ -197,9 +198,8 @@ class TestGatherFusedDownstreamOperations:
 
     def test_gather_log_cpu_fallback(self, execution_mode):
         """log unsupported on Spyre; gather on Spyre, log on CPU."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4720
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER, compiled=_CLIP_FP32)
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/5856
+        _xfail_existing(execution_mode, eager=_FP16_TO_FP32_EAGER)
         x = cached_randn(
             (32, 64), differentiation="gds12", dtype=torch.float16, abs=True
         )
@@ -215,8 +215,8 @@ class TestGatherFusedDownstreamOperations:
 
     def test_gather_softmax(self, execution_mode):
         """gather + softmax(dim=-1); rows sum to 1.0."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/5856
+        _xfail_existing(execution_mode, eager=_FP16_TO_FP32_EAGER)
         x = cached_randn((32, 128), differentiation="gds13", dtype=torch.float16)
         idx = torch.randint(0, 32, (16,), dtype=torch.int64)
         compare_mode(
@@ -230,8 +230,6 @@ class TestGatherFusedDownstreamOperations:
 
     def test_gather_abs_then_sum(self, execution_mode):
         """abs → sum(dim=1) two-stage downstream chain."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         x = cached_randn((32, 256), differentiation="gds14", dtype=torch.float16)
         idx = torch.randint(0, 32, (16,), dtype=torch.int64)
         compare_mode(
@@ -245,8 +243,6 @@ class TestGatherFusedDownstreamOperations:
 
     def test_gather_scalar_mul_3d(self, execution_mode):
         """Scalar multiply (* 2.0) on 3D gathered output (4,16,64)."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         x = cached_randn((8, 16, 64), differentiation="gds15", dtype=torch.float16)
         idx = torch.randint(0, 8, (4,), dtype=torch.int64)
         compare_mode(
@@ -269,8 +265,6 @@ class TestGatherFusedDownstreamOperations:
 
     def test_named_embedding(self, execution_mode):
         """Embedding table naming: vocab, dim axes labeled."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         w = cached_randn((32000, 128), differentiation="ndm04", dtype=torch.float16)
         idx = torch.randint(0, 32000, (32,), dtype=torch.int64)
         self._name_dims(w, {"vocab": 32000, "dim": 128})
@@ -281,8 +275,6 @@ class TestGatherFusedDownstreamOperations:
 
     def test_named_with_downstream(self, execution_mode):
         """Named dims preserved through gather → exp → sum chain."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         x = cached_randn((32, 128), differentiation="ndm10", dtype=torch.float16)
         idx = torch.randint(0, 32, (16,), dtype=torch.int64)
         self._name_dims(x, {"M": 32, "N": 128})
@@ -300,8 +292,6 @@ class TestGatherFusedDownstreamOperations:
 
     def test_fusion_disabled(self, execution_mode):
         """ENABLE_FUSION=0 — gather and downstream as separate kernels."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         os.environ["SPYRE_INDUCTOR_ENABLE_FUSION"] = "0"
         x = cached_randn((32, 256), differentiation="gem10", dtype=torch.float16)
         idx = torch.randint(0, 32, (16,), dtype=torch.int64)
@@ -325,8 +315,6 @@ class TestGatherFusedDownstreamOperations:
 
     def test_gather_then_add_broadcast_bias(self, execution_mode):
         """Gather rows then add broadcast bias; common transformer pre-norm pattern."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         x = cached_randn((64, 128), differentiation="ds_bias01", dtype=torch.float16)
         bias = cached_randn((128,), differentiation="ds_bias01b", dtype=torch.float16)
         idx = torch.randint(0, 64, (16,), dtype=torch.int64)
@@ -342,8 +330,6 @@ class TestGatherFusedDownstreamOperations:
 
     def test_gather_then_mul_and_add_residual(self, execution_mode):
         """Gather rows, scale by gate, add residual; MoE output accumulation pattern."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         x = cached_randn((64, 128), differentiation="ds_gate01", dtype=torch.float16)
         residual = cached_randn(
             (16, 128), differentiation="ds_gate01r", dtype=torch.float16

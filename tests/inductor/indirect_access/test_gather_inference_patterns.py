@@ -28,39 +28,80 @@ _ATOL_F16 = 1e-2
 _ATOL_BF16 = 2e-2
 _ATOL_F32 = 1e-5
 
-_INDEX_EAGER = (1219, "aten::index.Tensor_out is not registered on Spyre.")
+_INDEX_2D_EAGER = (
+    "Pending issue: aten::index.Tensor eager accepts only a single 1-D int index on dim 0 (no 2-D, bool-mask or nonzero-style index)",
+    "Eager Spyre aten::index.Tensor supports only x[index] with a single 1-D int32/int64 index tensor on dim 0.",
+    r"supports only x\[index\] with a single 1-D int32/int64 index tensor on dim 0",
+)
+_FP16_TO_FP32_EAGER = (
+    5856,
+    "Eager FP16 to FP32 device dtype conversion produces numerical mismatch.",
+    r"eager spyre <-> (precomputed )?cpu\S*( ref)? mismatch",
+)
+_POINTWISE_NO_LAYOUT = (
+    "Pending issue: compile topk routing: aten.clamp has no supported output layout",
+    "compile topk-2 routing: aten.clamp.default has no supported output layout for any candidate input layout.",
+    r"aten\.clamp\.default\): no supported output layout found",
+)
 _SYMBOLIC_INT_CONV = (
     4304,
-    "compile dynamic symbolic size cannot convert symbols to int.",
+    "compile(dynamic=True): Cannot convert symbols to int.",
+    r"Cannot convert symbols to int",
 )
-_GATHER_OUT_EAGER = (4328, "aten::gather.out is not registered on Spyre.")
-_RESTICKIFY_3ARGS = (4327, "restickify op_spec has 3 args.")
+_GATHER_OUT_EAGER = (
+    4328,
+    "aten::gather.out is not registered on Spyre.",
+    r"Could not run 'aten::gather.out'",
+)
+_RESTICKIFY_3ARGS = (
+    4327,
+    "gather / index_select dim>=1 mismatches CPU (the issue reported an 'op_spec has 3 args' abort; today it is a numerical mismatch).",
+    r"spyre <-> cpu\S* mismatch",
+)
 _STICK_INCOMPATIBLE = (
-    3265,
-    "buf0 (Reduction): no mechanism to resolve stick incompatibility.",
+    "Pending issue: eager topk routing: no mechanism to resolve stick incompatibility",
+    "Eager topk MoE routing: no mechanism to resolve stick incompatibility.",
+    r"no mechanism to resolve stick incompatibility",
+)
+_STICK_TOP1_MISMATCH = (
+    "Pending issue: eager topk-1 routing gather numerical mismatch",
+    "Eager topk-1 MoE routing gather mismatches CPU.",
+    r"eager spyre <-> (precomputed )?cpu\S*( ref)? mismatch",
+)
+_STICK_TOP2_EAGER = (
+    "Pending issue: eager topk-2 routing: Unexpected stick expression floor(d0/2)",
+    "Eager topk-2 MoE routing: Unexpected stick expression floor(d0/2).",
+    r"Unexpected stick expression floor\(d0/2\)",
 )
 _CANNOT_RESCALE = (
     4392,
-    "cannot rescale device layout [1, 4, 32] for conversion to torch.float16.",
+    "compile: cannot rescale device layout for conversion to torch.float16.",
+    r"cannot rescale device layout",
 )
-_OUT_LAYOUTS_EMPTY = (4713, "AllSameNode.from_args: out_layouts is empty.")
+_OUT_LAYOUTS_EMPTY = (
+    "Pending issue: eager topk + table gather numerical mismatch",
+    "Eager topk followed by a table gather mismatches CPU.",
+    r"eager spyre <-> (precomputed )?cpu\S*( ref)? mismatch",
+)
 _TOPK_K_PER_CORE = (
     4716,
     "topk(k=16): no divisor within 1 cores gives k_per_core <= 4.",
+    r"no divisor within 1 cores gives k_per_core",
 )
-_TOPKINDEX_STICK = (
-    4718,
-    "topkindex stick must not contain the reduction or k dimension.",
-)
-_DXP_STANDALONE = (4321, "dxp_standalone returned non-zero exit status 1.")
 _GATHER_EXPANDED_MISMATCH = (
     4840,
-    "torch.compile gather along dim=1 with 3D expanded index produces numerical mismatch.",
+    "compile gather along dim>=1 with expanded index produces numerical mismatch vs CPU.",
+    r"compiled spyre <-> cpu\S* mismatch",
 )
-_INDEX_PUT_IMPL_EAGER = (692, "aten::_index_put_impl_ is not registered on Spyre.")
+_INDEX_PUT_IMPL_EAGER = (
+    692,
+    "aten::_index_put_impl_ is not registered on Spyre.",
+    r"Could not run 'aten::_index_put_impl_'",
+)
 _INDEX_PUT_NO_LAYOUT = (
     4636,
-    "buf0 (aten.index_put.default): no supported output layout found.",
+    "compile index_put: no supported output layout for aten.index_put.default.",
+    r"aten\.index_put\.default\): no supported output layout found",
 )
 
 
@@ -90,13 +131,10 @@ class TestGatherInferencePatternsEagerCompile:
     )
     def test_moe_expert_routing(self, execution_mode, shape, P, dtype, atol, diff_key):
         """MoE expert weight gather: expert_w[ids] across shapes and dtypes."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         w = cached_randn(shape, differentiation=diff_key, dtype=dtype)
         ids = torch.randint(0, shape[0], (P,), dtype=torch.int64)
         compare_mode(execution_mode, lambda w, i: w[i], w, ids, atol=atol, rtol=atol)
 
-    @pytest.mark.skip(reason="This test is throwing crash error at copy_tensor.")
     def test_moe_expert_aggregation(self, execution_mode):
         """Route via gather then weighted-sum aggregation."""
         w = cached_randn((8, 64, 32), differentiation="moe09", dtype=torch.float16)
@@ -114,8 +152,6 @@ class TestGatherInferencePatternsEagerCompile:
 
     def test_moe_multi_layer(self, execution_mode):
         """Two consecutive MoE routing layers; two GATHER_OP_SPECs."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         w1 = cached_randn((8, 64, 32), differentiation="moe10a", dtype=torch.float16)
         w2 = cached_randn((8, 32, 16), differentiation="moe10b", dtype=torch.float16)
         ids = torch.randint(0, 8, (16,), dtype=torch.int64)
@@ -148,16 +184,12 @@ class TestGatherInferencePatternsEagerCompile:
         self, execution_mode, kv_shape, P, dtype, atol, diff_key
     ):
         """Paged KV pool gather: kv[idx] across pool shapes, head configs, and dtypes."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         kv = cached_randn(kv_shape, differentiation=diff_key, dtype=dtype)
         idx = torch.randint(0, kv_shape[0], (P,), dtype=torch.int64)
         compare_mode(execution_mode, lambda x, i: x[i], kv, idx, atol=atol, rtol=atol)
 
     def test_paged_kv_block_table(self, execution_mode):
         """Block table: slot = block_table[b, t] * page_size + offset."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         kv = cached_randn((512, 8, 64), differentiation="gpa12", dtype=torch.float16)
         block_table = torch.randint(0, 32, (4, 8), dtype=torch.int64)
         page_size = 16
@@ -173,8 +205,6 @@ class TestGatherInferencePatternsEagerCompile:
 
     def test_paged_kv_page_reuse(self, execution_mode):
         """Prefix caching: same page referenced by multiple requests."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         kv = cached_randn((512, 8, 64), differentiation="gpa13", dtype=torch.float16)
         shared_page = 42
         idx = torch.full((32,), shared_page, dtype=torch.int64)
@@ -184,8 +214,8 @@ class TestGatherInferencePatternsEagerCompile:
 
     def test_paged_kv_online_softmax(self, execution_mode):
         """K gather + attention scores + softmax."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/5856
+        _xfail_existing(execution_mode, eager=_FP16_TO_FP32_EAGER)
         kv = cached_randn((512, 8, 64), differentiation="gpa14", dtype=torch.float16)
         q = cached_randn((8, 4, 64), differentiation="gpa14q", dtype=torch.float16)
         idx = torch.randint(0, 512, (64,), dtype=torch.int64)
@@ -203,8 +233,8 @@ class TestGatherInferencePatternsEagerCompile:
 
     def test_paged_kv_full_attention(self, execution_mode):
         """Full paged attention: gather K + V + attention + weighted V sum."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/5856
+        _xfail_existing(execution_mode, eager=_FP16_TO_FP32_EAGER)
         kv_k = cached_randn((512, 8, 64), differentiation="gpa15k", dtype=torch.float16)
         kv_v = cached_randn((512, 8, 64), differentiation="gpa15v", dtype=torch.float16)
         q = cached_randn((8, 4, 64), differentiation="gpa15q", dtype=torch.float16)
@@ -225,8 +255,6 @@ class TestGatherInferencePatternsEagerCompile:
 
     def test_paged_kv_two_gathers(self, execution_mode):
         """K and V gathered from same pool; two GATHER_OP_SPECs."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         k = cached_randn((512, 8, 64), differentiation="gpa21k", dtype=torch.float16)
         v = cached_randn((512, 8, 64), differentiation="gpa21v", dtype=torch.float16)
         idx = torch.randint(0, 512, (4 * 32,), dtype=torch.int64)
@@ -256,8 +284,6 @@ class TestGatherInferencePatternsEagerCompile:
 
     def test_paged_kv_5d_split_kv(self, execution_mode):
         """FMS 5D combined K+V along dim=1; gather + split downstream."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         kv = cached_randn(
             (128, 2, 8, 16, 64), differentiation="gpa24", dtype=torch.float16
         )
@@ -273,8 +299,6 @@ class TestGatherInferencePatternsEagerCompile:
 
     def test_paged_kv_sentinel_boundary(self, execution_mode):
         """Page boundary values; no off-by-one at slot boundaries."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         kv = cached_randn((512, 8, 64), differentiation="gpa25", dtype=torch.float16)
         page_size = 16
         boundary_slots = torch.tensor(
@@ -327,8 +351,6 @@ class TestGatherInferencePatternsEagerCompile:
 
     def test_vllm_4d_kv_layout(self, execution_mode):
         """vLLM native 4D KV layout (num_blocks, block_sz, kv_h, head_d)."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         kv = cached_randn(
             (64, 16, 8, 64), differentiation="vllm07", dtype=torch.float16
         )
@@ -354,8 +376,6 @@ class TestGatherInferencePatternsEagerCompile:
 
     def test_vllm_llama31_8b(self, execution_mode):
         """Llama-3.1-8B shapes; token emb + KV cache dual gather."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         kv = cached_randn(
             (512, 8, 128), differentiation="vllm11kv", dtype=torch.float16
         )
@@ -375,8 +395,6 @@ class TestGatherInferencePatternsEagerCompile:
 
     def test_vllm_mistral_small_24b(self, execution_mode):
         """Mistral-Small-3.2-24B sliding-window KV gather."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         kv = cached_randn((512, 16, 128), differentiation="vllm12", dtype=torch.float16)
         idx = torch.randint(0, 512, (4 * 64,), dtype=torch.int64)
         compare_mode(
@@ -417,8 +435,6 @@ class TestGatherInferencePatternsEagerCompile:
     )
     def test_fms_4d_layout(self, execution_mode, P, dtype, atol, diff_key):
         """FMS 4D KV (128,8,16,128) gather across dtypes and output sizes."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         kv = cached_randn((128, 8, 16, 128), differentiation=diff_key, dtype=dtype)
         idx = torch.randint(0, 128, (P,), dtype=torch.int64)
         compare_mode(execution_mode, lambda x, i: x[i], kv, idx, atol=atol, rtol=atol)
@@ -435,8 +451,6 @@ class TestGatherInferencePatternsEagerCompile:
     )
     def test_model_kv_prefill_decode(self, execution_mode, kv_shape, P, diff_key):
         """Model-specific KV gather at production prefill/decode sizes."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         kv = cached_randn(kv_shape, differentiation=diff_key, dtype=torch.float16)
         idx = torch.randint(0, kv_shape[0], (P,), dtype=torch.int64)
         compare_mode(
@@ -460,8 +474,8 @@ class TestGatherInferencePatternsEagerCompile:
 
     def test_token_unpadding(self, execution_mode):
         """Packed token gather: each seq pos from flat packed buffer."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
+        # TODO: Pending issue: 2D index tensor not supported on Spyre eager
+        _xfail_existing(execution_mode, eager=_INDEX_2D_EAGER)
         packed = cached_randn((64, 128), differentiation="mdl12", dtype=torch.float16)
         pos_ids = torch.randint(0, 64, (4, 16), dtype=torch.int64)
         compare_mode(
@@ -484,8 +498,8 @@ class TestGatherInferencePatternsEagerCompile:
         self, execution_mode, kv_shape, idx_shape, diff_key
     ):
         """Paged KV: 2D (B,Lk) slot_idxs into 3D cache — FRS paged gather pattern."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
+        # TODO: Pending issue: 2D index tensor not supported on Spyre eager
+        _xfail_existing(execution_mode, eager=_INDEX_2D_EAGER)
         kv = cached_randn(kv_shape, differentiation=diff_key, dtype=torch.float16)
         slot_idxs = torch.randint(0, kv_shape[0], idx_shape, dtype=torch.int64)
         compare_mode(
@@ -502,7 +516,7 @@ class TestGatherInferencePatternsEagerCompile:
     def test_topk_moe_routing_top1(self, execution_mode):
         """MoE top-1 routing: softmax → topk(1) → index → gather expert weights."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/3265
-        _xfail_existing(execution_mode, eager=_STICK_INCOMPATIBLE)
+        _xfail_existing(execution_mode, eager=_STICK_TOP1_MISMATCH)
         n_experts = 8
         expert_w = cached_randn(
             (n_experts, 64, 32), differentiation="topk01", dtype=torch.float16
@@ -526,7 +540,12 @@ class TestGatherInferencePatternsEagerCompile:
     def test_topk_moe_routing_top2(self, execution_mode):
         """MoE top-2 routing: topk(2) flattened → gather 2 experts per token."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/3265
-        _xfail_existing(execution_mode, eager=_STICK_INCOMPATIBLE)
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4306
+        _xfail_existing(
+            execution_mode,
+            eager=_STICK_TOP2_EAGER,
+            compiled=_POINTWISE_NO_LAYOUT,
+        )
         n_experts = 8
         expert_w = cached_randn(
             (n_experts, 32, 64), differentiation="topk02", dtype=torch.float16
@@ -583,7 +602,6 @@ class TestGatherInferencePatternsEagerCompile:
             patch_sencores=patch_sencores,
             eager=_OUT_LAYOUTS_EMPTY,
             compiled_1=_TOPK_K_PER_CORE,
-            compiled_32=_TOPKINDEX_STICK,
         )
         embed = cached_randn((512, 128), differentiation="topk04", dtype=torch.float16)
         scores = cached_randn((512,), differentiation="topk04s", dtype=torch.float16)
@@ -596,13 +614,6 @@ class TestGatherInferencePatternsEagerCompile:
 
     def test_topk_beam_search_kv_reorder(self, execution_mode):
         """Beam search: topk beam scores → gather KV rows for top beams."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4321
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4713
-        _xfail_existing(
-            execution_mode,
-            eager=_DXP_STANDALONE,
-            compiled=_OUT_LAYOUTS_EMPTY,
-        )
         kv = cached_randn((8, 8, 64), differentiation="topk05", dtype=torch.float16)
         beam_scores = cached_randn((8,), differentiation="topk05s", dtype=torch.float16)
 
@@ -618,8 +629,6 @@ class TestGatherInferencePatternsEagerCompile:
 
     def test_multi_layer_shared_slot_index(self, execution_mode):
         """4 transformer layers; same slot_idxs reused with separate KV cache per layer."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         pool, H, D = 256, 8, 64
         slot_idxs = torch.randint(0, pool, (32,), dtype=torch.int64)
         for layer_id in range(4):
@@ -641,8 +650,6 @@ class TestGatherInferencePatternsEagerCompile:
 
     def test_multi_layer_growing_decode_history(self, execution_mode):
         """Decode grows: same KV cache read at 4 increasing history lengths across layers."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         pool, H, D = 512, 8, 64
         kv = cached_randn((pool, H, D), differentiation="mlt02", dtype=torch.float16)
         for step in (1, 8, 32, 64):
@@ -658,8 +665,6 @@ class TestGatherInferencePatternsEagerCompile:
 
     def test_multi_layer_4d_kv_per_layer(self, execution_mode):
         """4-layer 4D KV (pool, H, blk, D); per-layer gather at decode with unique tensors."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         pool, H, blk, D = 64, 8, 4, 32
         for layer_id in range(4):
             kv = cached_randn(
@@ -679,8 +684,6 @@ class TestGatherInferencePatternsEagerCompile:
 
     def test_multi_layer_bfloat16_kv(self, execution_mode):
         """4 transformer layers; bfloat16 KV caches, same slot pattern per layer."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         pool, H, D = 256, 8, 64
         slot_idxs = torch.randint(0, pool, (16,), dtype=torch.int64)
         for layer_id in range(4):
@@ -698,8 +701,6 @@ class TestGatherInferencePatternsEagerCompile:
 
     def test_float32_kv_cache_access(self, execution_mode):
         """float32 3D KV pool (512,8,64) gather; 4-byte element, int64 slot index."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         pool, H, D = 512, 8, 64
         kv = cached_randn((pool, H, D), differentiation="f32kv01", dtype=torch.float32)
         slots = torch.randint(0, pool, (32,), dtype=torch.int64)
@@ -728,7 +729,7 @@ class TestGatherInferencePatternsEagerCompile:
         compare_mode(execution_mode, fn, x, slots, values, atol=0, rtol=0)
 
     def test_index_put_3d_view_of_4d(self, execution_mode):
-        """index_put_ on cache.view(-1, 8, 128) from 4-D dest (#4451)."""
+        """index_put_ on cache.view(-1, 8, 128) from 4-D dest."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/692
         _xfail_existing(execution_mode, eager=_INDEX_PUT_IMPL_EAGER)
         cache = torch.zeros(4, 4, 8, 128, dtype=torch.float16)

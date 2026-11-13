@@ -29,13 +29,14 @@ only when the compiled dest can split across cores.
 """
 
 import os
+import regex as re
 import sys
 
 import pytest
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from utils_inductor import compare_with_cpu  # noqa: E402
+from utils_inductor import compare_with_cpu, strict_xfail  # noqa: E402
 
 try:
     from torch_spyre._inductor import config as _spyre_config
@@ -46,6 +47,18 @@ except ImportError:
 
 # Single-core and chip-max; MULTICORE_SENCORES subset.
 MULTICORE_SENCORES = (1, _max_sencores)
+
+
+def pytest_configure(config):
+    """Ensure OpSpec validation is enabled and dynamo recompile limits are high."""
+    os.environ["SPYRE_VALIDATE_OP_SPECS"] = "1"
+    try:
+        import torch._dynamo.config
+
+        torch._dynamo.config.accumulated_recompile_limit = 65536
+        torch._dynamo.config.recompile_limit = 65536
+    except Exception:
+        pass
 
 
 def _parametrized_argnames(metafunc):
@@ -109,6 +122,51 @@ def patch_sencores(sencores):
         yield sencores
 
 
+_current_request = None
+
+
+@pytest.fixture(autouse=True)
+def _track_current_test(request):
+    """Track the current test request so xfail_existing can use strict_xfail."""
+    global _current_request
+    _current_request = request
+    yield
+    _current_request = None
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """Strict error validation: an xfail only counts if the message matches.
+
+    strict_xfail (AGENTS.md Test Invariants) checks the exception *type* via
+    raises=. That still lets a different failure of the same type hide behind
+    the xfail. xfail_existing records the expected message pattern on the item;
+    here, a failure whose message does not match is turned into a real FAILED
+    so the stale or wrong reason is noticed. XPASS stays a strict failure.
+    """
+    outcome = yield
+    rep = outcome.get_result()
+    pattern = getattr(item, "_xfail_match", None)
+    if (
+        call.when != "call"
+        or pattern is None
+        or call.excinfo is None
+        or not hasattr(rep, "wasxfail")
+    ):
+        return
+    message = str(call.excinfo.value)
+    if re.search(pattern, message, re.DOTALL):
+        return
+    del rep.wasxfail
+    rep.outcome = "failed"
+    rep.longrepr = (
+        "Strict error validation: the test failed, but not with the error its "
+        f"xfail reason documents.\n  expected message to match: {pattern!r}\n"
+        f"  xfail reason: {item._xfail_reason}\n"
+        f"  actual: {type(call.excinfo.value).__name__}: {message[:600]}"
+    )
+
+
 def xfail_existing(
     execution_mode,
     *,
@@ -117,11 +175,17 @@ def xfail_existing(
     compiled=None,
     compiled_32=None,
     compiled_1=None,
+    raises=(NotImplementedError, RuntimeError, AssertionError),
 ):
-    """Xfail this mode when the abort already has a GitHub issue.
+    """Register expected failure using torch-spyre's built-in strict_xfail.
 
-    eager/compiled/compiled_32/compiled_1 are (issue_number, reason) or None.
+    eager/compiled/compiled_32/compiled_1 are (issue, reason, match) or None.
+    ``issue`` is an open GitHub issue number. ``match`` is a regex that must
+    match the exception message; a different failure of an allowed type is
+    reported as FAILED (see pytest_runtest_makereport above), and a pass is a
+    strict XPASS failure.
     """
+    global _current_request
     if execution_mode == "eager":
         spec = eager
     elif patch_sencores == _max_sencores and compiled_32 is not None:
@@ -131,10 +195,21 @@ def xfail_existing(
     else:
         spec = compiled
 
-    if spec is None:
-        return
-    issue, reason = spec
-    pytest.xfail(reason=f"{reason} See issue #{issue}.")
+    if spec is not None and _current_request is not None:
+        issue, reason, match = spec
+        issue_str = (
+            f"See issue #{issue}."
+            if isinstance(issue, int)
+            else (f"({issue})" if issue else "")
+        )
+        reason_msg = f"{reason} {issue_str}".strip()
+        _current_request.node._xfail_match = match
+        _current_request.node._xfail_reason = reason_msg
+        strict_xfail(
+            _current_request,
+            raises=raises,
+            reason=reason_msg,
+        )
 
 
 _xfail_existing = xfail_existing
@@ -143,9 +218,8 @@ _xfail_existing = xfail_existing
 def compare_mode(execution_mode, fn, *args, atol=0.1, rtol=0.1):
     """Run fn in exactly one execution mode and compare result with CPU.
 
-    Pair with an ``execution_mode`` argument (pytest_generate_tests) so each
-    mode is a separate test record — a failure in eager does not prevent
-    compiled from running and vice versa.
+    Executes the full graph on Spyre hardware without manual try/except.
+    Torch-Spyre's strict_xfail manages the expected failure validation.
     """
     compare_with_cpu(
         fn,

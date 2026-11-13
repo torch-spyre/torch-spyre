@@ -30,24 +30,51 @@ _ATOL_BF16 = 2e-2
 _ATOL_SDPA = 2e-2
 
 
-_INDEX_EAGER = (1219, "aten::index.Tensor_out is not registered on Spyre.")
+_INDEX_2D_EAGER = (
+    "Pending issue: aten::index.Tensor eager accepts only a single 1-D int index on dim 0 (no 2-D, bool-mask or nonzero-style index)",
+    "Eager Spyre aten::index.Tensor supports only x[index] with a single 1-D int32/int64 index tensor on dim 0.",
+    r"supports only x\[index\] with a single 1-D int32/int64 index tensor on dim 0",
+)
+_COPY_D2D_UNALIGNED = (
+    5383,
+    "compile copy_from_d2d of a sliced view requires a stick-aligned storage_offset.",
+    r"copy_from_d2d of a sliced view requires a stick-aligned storage_offset",
+)
 _POINTWISE_NO_LAYOUT = (
     4306,
-    "compile Multi-arg pointwise no supported output layout found.",
+    "compile Multi-arg pointwise: no supported output layout found.",
+    r"Multi-arg pointwise .*no supported output layout found",
 )
-_PAD_COMPILED = (
-    4715,
-    "compile SDPA lower_pad_sequence expected exactly dim=2 to be padded.",
+_SDPA_EAGER_LIN_MISMATCH = (
+    "Pending issue: eager SDPA followed by linear projection numerical mismatch",
+    "Eager SDPA followed by an output linear projection mismatches CPU.",
+    r"eager spyre <-> (precomputed )?cpu\S*( ref)? mismatch",
 )
 _SDPA_LIN_MISMATCH = (
     4728,
     "compile paged-KV SDPA followed by output linear projection numerical mismatch.",
+    r"compiled spyre <-> cpu\S* mismatch",
 )
 _RESTICKIFY_MOD = (
     4760,
-    "compile 4D KV cache reshape-before-permute: insert_restickify_padding does not "
-    "yet handle Mod/FloorDiv multi-symbol host coordinates produced by coarse tiling "
-    "of a merged post-gather dimension.",
+    "compile batched SDPA decode: insert_restickify_padding new-stick extent needs a re-base copy.",
+    r"insert_restickify_padding: new-stick extent .* requires a re-base copy",
+)
+_CANON_FACTORIZED = (
+    "Pending issue: compile 4D KV cache gather: cannot canonicalize factorized y_var",
+    "compile 4D KV cache layout/reshape-before-permute: cannot canonicalize factorized y_var "
+    "(expected an affine contiguous host dimension chain).",
+    r"cannot canonicalize factorized y_var",
+)
+_SUBPROC_EAGER = (
+    "Pending issue: eager 4D KV reshape-before-permute raises SubprocException",
+    "Eager 4D KV reshape-before-permute raises SubprocException in the compile subprocess.",
+    r"SubprocException",
+)
+_SDPA_LOOP_SCHEDULER_MEMBERS = (
+    "Pending issue: SDPA counted loop loopnode0 holds kernel ops not all members",
+    "SDPA eager decomposition: counted loop loopnode0 holds kernel ops that are not all members of it.",
+    r"counted loop loopnode0 holds kernel ops that are not all members",
 )
 
 
@@ -66,8 +93,6 @@ class TestGatherPagedAttentionAndSDPA:
 
     def test_sdpa_paged_decode_basic(self, execution_mode):
         """Single-token decode: gather 32 KV slots from (512,8,64) pool → SDPA output."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         pool, H, D = 512, 8, 64
         k_cache = cached_randn(
             (pool, H, D), differentiation="attn01k", dtype=torch.float16
@@ -96,8 +121,6 @@ class TestGatherPagedAttentionAndSDPA:
 
     def test_sdpa_paged_prefill_full_context(self, execution_mode):
         """Prefill: gather 64 slots for context → SDPA self-attention over full context."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         pool, H, D, Lq = 512, 8, 64, 64
         k_cache = cached_randn(
             (pool, H, D), differentiation="attn02k", dtype=torch.float16
@@ -126,8 +149,6 @@ class TestGatherPagedAttentionAndSDPA:
 
     def test_sdpa_gqa_32q_8kv(self, execution_mode):
         """GQA: 32 Q heads, 8 KV heads (group=4); gather KV → expand → SDPA."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         pool, H_q, H_kv, D = 512, 32, 8, 64
         k_cache = cached_randn(
             (pool, H_kv, D), differentiation="attn03k", dtype=torch.float16
@@ -166,8 +187,6 @@ class TestGatherPagedAttentionAndSDPA:
 
     def test_sdpa_mqa_single_kv_head(self, execution_mode):
         """MQA: 8 Q heads, 1 KV head; paged gather + broadcast + SDPA."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         pool, H_q, H_kv, D = 512, 8, 1, 64
         k_cache = cached_randn(
             (pool, H_kv, D), differentiation="attn04k", dtype=torch.float16
@@ -196,8 +215,6 @@ class TestGatherPagedAttentionAndSDPA:
 
     def test_sdpa_bfloat16_paged_decode(self, execution_mode):
         """bfloat16 KV cache gather + SDPA; wordLength=2 throughout pipeline."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         pool, H, D = 512, 8, 64
         k_cache = cached_randn(
             (pool, H, D), differentiation="attn05k", dtype=torch.bfloat16
@@ -226,14 +243,6 @@ class TestGatherPagedAttentionAndSDPA:
 
     def test_sdpa_attention_bias_neg_inf_padding(self, execution_mode, patch_sencores):
         """Attention bias with -inf for padded positions; gather + biased SDPA."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4715
-        _xfail_existing(
-            execution_mode,
-            patch_sencores=patch_sencores,
-            eager=_INDEX_EAGER,
-            compiled_32=_PAD_COMPILED,
-        )
         pool, H, D, Lq, Lk = 512, 8, 64, 4, 32
         k_cache = cached_randn(
             (pool, H, D), differentiation="attn07k", dtype=torch.float16
@@ -265,8 +274,13 @@ class TestGatherPagedAttentionAndSDPA:
 
     def test_sdpa_batch_decode_b4(self, execution_mode):
         """Batched decode B=4; each request gathers 8 slots → SDPA per request."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
+        # TODO: Pending issue: SDPA counted loop loopnode0 holds kernel ops not all members
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4760
+        _xfail_existing(
+            execution_mode,
+            eager=_SDPA_LOOP_SCHEDULER_MEMBERS,
+            compiled=_RESTICKIFY_MOD,
+        )
         pool, H, D, Lk = 512, 8, 64, 8
         k_cache = cached_randn(
             (pool, H, D), differentiation="attn08k", dtype=torch.float16
@@ -293,10 +307,19 @@ class TestGatherPagedAttentionAndSDPA:
             rtol=_ATOL_SDPA,
         )
 
-    def test_sdpa_2d_slot_index_batched_decode(self, execution_mode):
+    def test_sdpa_2d_slot_index_batched_decode(self, execution_mode, patch_sencores):
         """2D slot_idxs (B=4, Lk=16): paged batch decode; each row is one request."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
+        # TODO: Pending issue: 2D index tensor not supported on Spyre eager
+        _xfail_existing(
+            execution_mode,
+            eager=_INDEX_2D_EAGER,
+        )
+        if execution_mode == "compiled" and patch_sencores == 32:
+            pytest.skip(
+                "RuntimeError: Bad responses and/or bad response blocks detected "
+                "on 32-core SDPA with 2D slot indexing (poisons device stream). "
+                "Pending issue: sdpa_2d_slot_index_32core_bad_response (see #4083, closed)."
+            )
         pool, H, D, B, Lk = 512, 8, 64, 4, 16
         k_cache = cached_randn(
             (pool, H, D), differentiation="attn12k", dtype=torch.float16
@@ -325,11 +348,11 @@ class TestGatherPagedAttentionAndSDPA:
 
     def test_sdpa_rope_gather_then_attention(self, execution_mode):
         """Gather RoPE position embeddings → apply rotate-half → SDPA."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4399
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4306
         _xfail_existing(
             execution_mode,
-            eager=_INDEX_EAGER,
+            eager=_COPY_D2D_UNALIGNED,
             compiled=_POINTWISE_NO_LAYOUT,
         )
         pool, H, D, Lk = 512, 8, 64, 32
@@ -378,8 +401,6 @@ class TestGatherPagedAttentionAndSDPA:
 
     def test_sdpa_chunked_prefill_then_single_decode(self, execution_mode):
         """4 prefill chunks of 32 tokens each, then 1 single-token decode; all via paged gather."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         pool, H, D = 512, 8, 64
         k_cache = cached_randn(
             (pool, H, D), differentiation="attn14k", dtype=torch.float16
@@ -432,8 +453,6 @@ class TestGatherPagedAttentionAndSDPA:
 
     def test_sdpa_large_kv_pool_decode(self, execution_mode):
         """Large pool (1024 slots), 128-slot decode gather → SDPA correctness."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         pool, H, D = 1024, 8, 64
         k_cache = cached_randn(
             (pool, H, D), differentiation="attn15k", dtype=torch.float16
@@ -462,8 +481,6 @@ class TestGatherPagedAttentionAndSDPA:
 
     def test_sdpa_separate_k_v_caches_different_shapes(self, execution_mode):
         """Separate K (512,8,64) and V (512,8,64) cache shapes with different sequence slots; both gathered → SDPA."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         pool, H, D = 512, 8, 64
         k_cache = cached_randn(
             (pool, H, D), differentiation="attn16k", dtype=torch.float16
@@ -492,15 +509,13 @@ class TestGatherPagedAttentionAndSDPA:
 
     def test_sdpa_output_then_linear_projection(self, execution_mode, patch_sencores):
         """Gather KV → SDPA → linear output projection; full attention block pattern."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4715
+        # TODO: Pending issue: eager SDPA followed by linear projection numerical mismatch
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4728
         _xfail_existing(
             execution_mode,
             patch_sencores=patch_sencores,
-            eager=_INDEX_EAGER,
-            compiled_1=_SDPA_LIN_MISMATCH,
-            compiled_32=_PAD_COMPILED,
+            eager=_SDPA_EAGER_LIN_MISMATCH,
+            compiled=_SDPA_LIN_MISMATCH,
         )
         pool, H, D = 512, 8, 64
         k_cache = cached_randn(
@@ -537,8 +552,8 @@ class TestGatherPagedAttentionAndSDPA:
 
     def test_sdpa_beam_reorder_then_attend(self, execution_mode):
         """Beam search KV reorder via index_select → SDPA on reordered KV."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
+        # TODO: Pending issue: SDPA counted loop loopnode0 holds kernel ops not all members
+        _xfail_existing(execution_mode, eager=_SDPA_LOOP_SCHEDULER_MEMBERS)
         pool, H, D, B_beam = 512, 8, 64, 4
         k_cache = cached_randn(
             (pool, H, D), differentiation="attn18k", dtype=torch.float16
@@ -573,14 +588,6 @@ class TestGatherPagedAttentionAndSDPA:
 
     def test_sdpa_speculative_draft_verify(self, execution_mode, patch_sencores):
         """Speculative decode: draft tokens verified via SDPA score comparison."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4715
-        _xfail_existing(
-            execution_mode,
-            patch_sencores=patch_sencores,
-            eager=_INDEX_EAGER,
-            compiled_32=_PAD_COMPILED,
-        )
         pool, H, D, Ldraft = 512, 8, 64, 5
         k_cache = cached_randn(
             (pool, H, D), differentiation="attn19k", dtype=torch.float16
@@ -620,8 +627,11 @@ class TestGatherPagedAttentionAndSDPA:
         See test_sdpa_4d_kv_reshape_before_permute for the reshape-before-permute
         variant (tracked compiler gap).
         """
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
+        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4760
+        _xfail_existing(
+            execution_mode,
+            compiled=_CANON_FACTORIZED,
+        )
         pool, H, blk, D = 128, 8, 4, 32
         k_cache = cached_randn(
             (pool, H, blk, D), differentiation="attn20k", dtype=torch.float16
@@ -662,11 +672,12 @@ class TestGatherPagedAttentionAndSDPA:
         Mod/FloorDiv multi-symbol host coordinate after coarse tiling that
         insert_restickify_padding does not yet handle.
 
-        Tracked: see _RESTICKIFY_MOD issue marker.
+        Tracked: see _CANON_FACTORIZED / _SUBPROC_EAGER markers.
         """
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4760
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER, compiled=_RESTICKIFY_MOD)
+        _xfail_existing(
+            execution_mode, eager=_SUBPROC_EAGER, compiled=_CANON_FACTORIZED
+        )
         pool, H, blk, D = 128, 8, 4, 32
         k_cache = cached_randn(
             (pool, H, blk, D), differentiation="attn21k", dtype=torch.float16

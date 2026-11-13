@@ -28,26 +28,46 @@ _ATOL_F16 = 1e-2
 _ATOL_BF16 = 2e-2
 _ATOL_F32 = 1e-5
 
-_INDEX_EAGER = (1219, "aten::index.Tensor_out is not registered on Spyre.")
-_GATHER_EAGER = (4328, "aten::gather.out is not registered on Spyre.")
-_REMAINDER_EAGER = (4416, "aten::remainder.Tensor_out is not registered on Spyre.")
+_INDEX_2D_EAGER = (
+    "Pending issue: aten::index.Tensor eager accepts only a single 1-D int index on dim 0 (no 2-D, bool-mask or nonzero-style index)",
+    "Eager Spyre aten::index.Tensor supports only x[index] with a single 1-D int32/int64 index tensor on dim 0.",
+    r"supports only x\[index\] with a single 1-D int32/int64 index tensor on dim 0",
+)
+_GATHER_EAGER = (
+    4328,
+    "aten::gather.out is not registered on Spyre.",
+    r"Could not run 'aten::gather.out'",
+)
+_REMAINDER_EAGER = (
+    4416,
+    "aten::remainder.Tensor_out is not registered on Spyre.",
+    r"Could not run 'aten::remainder.Tensor_out'",
+)
 _DXP_STANDALONE_FAIL = (
     4321,
-    "compile gather DBO dxp_standalone returned non-zero exit status 1.",
+    "compile gather dxp_standalone returned non-zero exit status 1.",
+    r"SubprocException",
 )
 _RESTICKIFY_3ARGS = (
     4327,
-    "compile gather / index_select dim>=1 restickify op_spec has 3 args.",
+    "gather / index_select dim>=1 mismatches CPU (the issue reported an 'op_spec has 3 args' abort; today it is a numerical mismatch).",
+    r"spyre <-> cpu\S* mismatch",
 )
 _INCOMPATIBLE_HOST_SIZE = (
-    3732,
-    "compile take / flatten-take Incompatible host_size and dim_order.",
+    "Pending issue: compile take: cannot re-tile / no mechanism to resolve stick incompatibility",
+    "compile take / flatten-take: cannot re-tile or no mechanism to resolve stick incompatibility.",
+    r"no mechanism to resolve stick incompatibility|cannot re-tile \S+: no size-1 stick target",
 )
 _WRAPPER_SYNTAX_ERROR = (
     4333,
-    "Failed to import inductor wrapper inner SyntaxError: invalid syntax.",
+    "compile take_along_dim: failed to import inductor wrapper, inner SyntaxError.",
+    r"SyntaxError",
 )
-_MULTIPLE_INDIRECT_SYMBOLS = (4471, "Unsupported: multiple indirect symbols in arg.")
+_MULTIPLE_INDIRECT_SYMBOLS = (
+    4471,
+    "Unsupported: multiple indirect symbols in arg.",
+    r"multiple indirect symbols",
+)
 
 
 class TestGatherShapeRankAndIndexPatterns:
@@ -69,8 +89,6 @@ class TestGatherShapeRankAndIndexPatterns:
     )
     def test_gather_2d_basic_shapes(self, execution_mode, shape, P, diff_key):
         """Basic 2D gather across diverse (M, N) shapes and output sizes."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         x = cached_randn(shape, differentiation=diff_key, dtype=torch.float16)
         idx = torch.randint(0, shape[0], (P,), dtype=torch.int64)
         compare_mode(
@@ -79,8 +97,6 @@ class TestGatherShapeRankAndIndexPatterns:
 
     def test_gather_2d_large_m256(self, execution_mode, patch_sencores):
         """(256, 64) P=128 — M large enough to split across cores."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         x = cached_randn((256, 64), differentiation="gfc04", dtype=torch.float16)
         idx = torch.randint(0, 256, (128,), dtype=torch.int64)
         compare_mode(
@@ -89,8 +105,6 @@ class TestGatherShapeRankAndIndexPatterns:
 
     def test_gather_2d_non_power_of_2_inner(self, execution_mode):
         """N=100 not a multiple of 64; stick padding must not leak."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         x = cached_randn((16, 100), differentiation="gfc06", dtype=torch.float16)
         idx = torch.randint(0, 16, (8,), dtype=torch.int64)
         compare_mode(
@@ -99,8 +113,6 @@ class TestGatherShapeRankAndIndexPatterns:
 
     def test_gather_2d_full_range(self, execution_mode):
         """Index = full row permutation; every row accessed exactly once."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         x = cached_randn((32, 64), differentiation="gfc07", dtype=torch.float16)
         idx = torch.randperm(32, dtype=torch.int64)
         compare_mode(
@@ -109,8 +121,6 @@ class TestGatherShapeRankAndIndexPatterns:
 
     def test_gather_2d_all_same_row(self, execution_mode):
         """All idx values = 0; repeated reads of row 0."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         x = cached_randn((32, 64), differentiation="gfc08", dtype=torch.float16)
         idx = torch.zeros(16, dtype=torch.int64)
         compare_mode(
@@ -119,8 +129,6 @@ class TestGatherShapeRankAndIndexPatterns:
 
     def test_gather_2d_ascending_idx(self, execution_mode):
         """Sequential ascending idx [0..15]; cache-friendly access."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         x = cached_randn((32, 128), differentiation="gfc09", dtype=torch.float16)
         idx = torch.arange(16, dtype=torch.int64)
         compare_mode(
@@ -129,8 +137,6 @@ class TestGatherShapeRankAndIndexPatterns:
 
     def test_gather_2d_descending_idx(self, execution_mode):
         """Descending idx [31..16]; reverse access order."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         x = cached_randn((32, 128), differentiation="gfc10", dtype=torch.float16)
         idx = torch.arange(31, 15, -1, dtype=torch.int64)
         compare_mode(
@@ -139,8 +145,6 @@ class TestGatherShapeRankAndIndexPatterns:
 
     def test_gather_2d_repeated_idx(self, execution_mode):
         """idx has repeated values; duplicate output rows must be identical."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         x = cached_randn((32, 64), differentiation="gfc11", dtype=torch.float16)
         idx = torch.tensor(
             [0, 1, 2, 0, 1, 2, 3, 4, 5, 3, 4, 5, 6, 7, 8, 9, 6, 7, 8, 9],
@@ -152,8 +156,6 @@ class TestGatherShapeRankAndIndexPatterns:
 
     def test_gather_3d_wide(self, execution_mode):
         """3D tensor (8,32,512), dim=0 gather, P=16."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         x = cached_randn((8, 32, 512), differentiation="gfc12", dtype=torch.float16)
         idx = torch.randint(0, 8, (16,), dtype=torch.int64)
         compare_mode(
@@ -162,8 +164,6 @@ class TestGatherShapeRankAndIndexPatterns:
 
     def test_gather_3d_small(self, execution_mode):
         """Smallest valid 3D tensor (4,4,16), sub-stick inner dims."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         x = cached_randn((4, 4, 16), differentiation="gfc13", dtype=torch.float16)
         idx = torch.randint(0, 4, (2,), dtype=torch.int64)
         compare_mode(
@@ -185,8 +185,6 @@ class TestGatherShapeRankAndIndexPatterns:
 
     def test_gather_4d_data(self, execution_mode):
         """4D tensor (2,8,4,64), gather at dim=0, P=4."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         x = cached_randn((2, 8, 4, 64), differentiation="gfc15", dtype=torch.float16)
         idx = torch.randint(0, 2, (4,), dtype=torch.int64)
         compare_mode(
@@ -271,8 +269,6 @@ class TestGatherShapeRankAndIndexPatterns:
 
     def test_gather_result_exact(self, execution_mode):
         """Integer-representable fp16 values (powers of 2); no rounding at output."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         vals = [float(2**k) for k in range(64)]
         x = torch.tensor([vals] * 16, dtype=torch.float16)
         idx = torch.randint(0, 16, (8,), dtype=torch.int64)
@@ -280,8 +276,6 @@ class TestGatherShapeRankAndIndexPatterns:
 
     def test_gather_2d_interleaved_idx(self, execution_mode):
         """Interleaved idx [0,16,1,17,...]; alternating low/high row access."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         x = cached_randn((32, 128), differentiation="gfc20", dtype=torch.float16)
         idx = torch.tensor(
             [v for pair in zip(range(16), range(16, 32)) for v in pair],
@@ -295,8 +289,6 @@ class TestGatherShapeRankAndIndexPatterns:
 
     def test_idx_hotspot_80pct(self, execution_mode):
         """80% of idx values point to the same row (heavy hotspot)."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         x = cached_randn((32, 128), differentiation="gidx02", dtype=torch.float16)
         hot = [5] * 19 + [torch.randint(0, 32, (1,)).item() for _ in range(5)]
         idx = torch.tensor(hot[:24], dtype=torch.int64)
@@ -306,8 +298,6 @@ class TestGatherShapeRankAndIndexPatterns:
 
     def test_idx_strided(self, execution_mode):
         """Strided access [0,4,8,...]; stride=4 row selection."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         x = cached_randn((64, 64), differentiation="gidx04", dtype=torch.float16)
         idx = torch.arange(0, 64, 4, dtype=torch.int64)
         compare_mode(
@@ -316,8 +306,6 @@ class TestGatherShapeRankAndIndexPatterns:
 
     def test_idx_oversize(self, execution_mode):
         """P=32 > M=16; each input row read multiple times."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         x = cached_randn((16, 64), differentiation="gidx06", dtype=torch.float16)
         idx = torch.randint(0, 16, (32,), dtype=torch.int64)
         compare_mode(
@@ -326,8 +314,6 @@ class TestGatherShapeRankAndIndexPatterns:
 
     def test_idx_two_elements(self, execution_mode):
         """Minimal index P=2; smallest valid gather output."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         x = cached_randn((32, 128), differentiation="gidx07", dtype=torch.float16)
         idx = torch.randint(0, 32, (2,), dtype=torch.int64)
         compare_mode(
@@ -336,8 +322,6 @@ class TestGatherShapeRankAndIndexPatterns:
 
     def test_idx_single_row(self, execution_mode):
         """P=1 — single-element index; validates compile succeeds."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         x = cached_randn((32, 256), differentiation="gidx08", dtype=torch.float16)
         idx = torch.randint(0, 32, (1,), dtype=torch.int64)
         compare_mode(
@@ -346,8 +330,8 @@ class TestGatherShapeRankAndIndexPatterns:
 
     def test_idx_2d_shape(self, execution_mode):
         """2D-shaped index (8,4) on (16,64) value tensor."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
+        # TODO: Pending issue: 2D index tensor not supported on Spyre eager
+        _xfail_existing(execution_mode, eager=_INDEX_2D_EAGER)
         x = cached_randn((16, 64), differentiation="gidx10", dtype=torch.float16)
         idx = torch.randint(0, 16, (8, 4), dtype=torch.int64)
         compare_mode(
@@ -356,8 +340,6 @@ class TestGatherShapeRankAndIndexPatterns:
 
     def test_idx_boundary_values(self, execution_mode):
         """Both boundary rows (0 and M-1=31) plus mid values."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
-        _xfail_existing(execution_mode, eager=_INDEX_EAGER)
         x = cached_randn((32, 64), differentiation="gidx13", dtype=torch.float16)
         idx = torch.tensor(
             [0, 31, 5, 10, 15, 20, 25, 3, 8, 13, 18, 23, 28, 1, 16, 30],
@@ -501,11 +483,11 @@ class TestGatherShapeRankAndIndexPatterns:
 
     def test_advanced_index_2d_coordinate(self, execution_mode):
         """x[idx0, idx1] two-tensor coordinate indexing; each (idx0[i], idx1[i]) pair selects one element."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
+        # TODO: Pending issue: 2D index tensor not supported on Spyre eager
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4471
         _xfail_existing(
             execution_mode,
-            eager=_INDEX_EAGER,
+            eager=_INDEX_2D_EAGER,
             compiled=_MULTIPLE_INDIRECT_SYMBOLS,
         )
         x = cached_randn((8, 16), differentiation="adv2d_01", dtype=torch.float16)
