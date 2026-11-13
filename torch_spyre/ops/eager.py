@@ -15,9 +15,10 @@
 import torch
 from torch_spyre._C import fill_tensor, copy_tensor, SpyreTensorLayout
 import torch_spyre.ops.fallbacks  # noqa: F401
-from .fallbacks import _get_op_overloads
+from .fallbacks import _get_op_overloads, warn_fallback
 from .warning_types import RetileWarning
 import warnings
+import collections
 import contextlib
 import functools
 import inspect
@@ -155,6 +156,130 @@ def _materialize_offset_view(x):
         return x
     if isinstance(x, (list, tuple)):
         return type(x)(_materialize_offset_view(e) for e in x)
+    return x
+
+
+# Compiled view rebuilders by (base shape, base dtype, view geometry).  Bounded
+# like ``_layout_serves_view``: a workload with many shapes would otherwise keep
+# one compiled function per geometry forever.
+_VIEW_REBUILDER_CACHE_SIZE = 256
+_view_rebuilders: collections.OrderedDict = collections.OrderedDict()
+
+
+def _rebuild_view_on_device(x):
+    """Copy the Spyre view ``x`` into a fresh tensor with the canonical layout,
+    without leaving the device.
+
+    ``x.clone()``, ``copy_`` and ``contiguous()`` read the view through its base's
+    layout, which is the read that fails, so they cannot be used.  Compiling
+    ``base.as_strided(...)`` followed by a real pointwise op reads the BASE buffer,
+    as the compiled path does.  ``-(-t)`` flips the sign twice: it is exact in any
+    float format (``t * 2 * 0.5`` turns ``inf`` into ``nan`` on the device), and a
+    plain copy such as ``+ 0`` or ``* 1.0`` is folded away and fails like
+    ``clone()``.  ``bool`` has no ``neg``, so it uses ``logical_not`` twice.
+
+    One compiled function per geometry, each with its own code object so dynamo
+    gives it its own cache line (see ``_op_frame``).
+    """
+    base = x._base
+    size, stride, offset = tuple(x.shape), tuple(x.stride()), x.storage_offset()
+    key = (tuple(base.shape), base.dtype, size, stride, offset)
+    rebuild = _view_rebuilders.get(key)
+    if rebuild is not None:
+        _view_rebuilders.move_to_end(key)
+    else:
+        twice = torch.logical_not if x.dtype == torch.bool else torch.neg
+
+        def view_copy(b):
+            return twice(twice(b.as_strided(size, stride, offset)))
+
+        view_copy.__code__ = view_copy.__code__.replace(
+            co_varnames=view_copy.__code__.co_varnames
+        )
+        rebuild = torch.compile(view_copy, dynamic=False)
+        _view_rebuilders[key] = rebuild
+        if len(_view_rebuilders) > _VIEW_REBUILDER_CACHE_SIZE:
+            _view_rebuilders.popitem(last=False)
+    return rebuild(base)
+
+
+def _layout_serves_own_view(x) -> bool:
+    """Whether ``x``'s device layout can express reads of ``x``'s own host view.
+
+    A view shares its base's device layout.  ``x[8, 65].reshape(-1)`` or
+    ``x[1, 2, 4, 8, 7].reshape(1, 8, 56)`` keep a layout whose stick coordinate
+    for the new shape is ``Mod(Mod(c0, 65), 64)`` or ``Mod(d1, 7)``, which the
+    compiler cannot represent, so every op reading the view fails.
+
+    The answer depends only on the layout and the view's geometry, so it is
+    cached on them: a view seen before costs one dict lookup, not a coordinate
+    computation.
+    """
+    from torch_spyre._C import get_spyre_tensor_layout
+
+    return _layout_serves_view(
+        get_spyre_tensor_layout(x),
+        tuple(x.shape),
+        tuple(x.stride()),
+    )
+
+
+@functools.lru_cache(maxsize=4096)
+def _layout_serves_view(stl, size, stride) -> bool:
+    # Imported here: torch_spyre._inductor imports this module's package.
+    import sympy
+
+    from torch_spyre._inductor.errors import Unsupported
+    from torch_spyre._inductor.pass_utils import _check_stick_expr_supported
+    from torch_spyre._inductor.views import compute_coordinates
+
+    syms = [
+        sympy.Symbol(f"d{i}", integer=True, nonnegative=True) for i in range(len(size))
+    ]
+    ranges = {s: n for s, n in zip(syms, size) if n > 1}
+    index = sum((s * st for s, st in zip(syms, stride) if s in ranges), sympy.S.Zero)
+    try:
+        coords = compute_coordinates(
+            list(stl.device_size), list(stl.stride_map), ranges, index
+        )
+        _check_stick_expr_supported(coords[-1], stl.elems_per_stick())
+    except Unsupported:
+        return False
+    return True
+
+
+def _materialize_unservable_view(x):
+    """Return a canonical-layout copy of a Spyre view whose inherited device
+    layout cannot serve its own shape; pass everything else through unchanged.
+
+    The eager op gets the view as a graph input with its base's layout, and the
+    restickify that ``insert_restickify`` adds has to read the input through that
+    same view, which ``device_coordinates`` rejects in ``insert_restickify_padding``.
+    The compiled path restickifies the base buffer, so the copy is made the same
+    way, on the device (``_rebuild_view_on_device``).
+
+    Inside a compiled graph's fallback (``_in_compiled_fallback``) the copy goes
+    through the host instead, as in ``_normalize_result_layout``: compiling again
+    from there nests ``torch.compile`` inside the kernel being compiled. That costs
+    a device-to-host and a host-to-device transfer, so it emits a
+    ``FallbackWarning``.
+    """
+    if isinstance(x, torch.Tensor):
+        if (
+            x.device.type == "spyre"
+            and x._base is not None
+            and x.dim() > 0
+            and not _layout_serves_own_view(x)
+        ):
+            if not _in_compiled_fallback():
+                return _rebuild_view_on_device(x)
+            warn_fallback("reading an unaligned view of a Spyre tensor")
+            out = torch.zeros(x.shape, dtype=x.dtype, device=x.device)
+            out.copy_(x.to("cpu"))
+            return out
+        return x
+    if isinstance(x, (list, tuple)):
+        return type(x)(_materialize_unservable_view(e) for e in x)
     return x
 
 
@@ -403,12 +528,15 @@ def _make_offset_safe_dispatch(op):
                 return type(x)(prep_write(e) for e in x)
             return x
 
+        def prep_read(x):
+            return _materialize_unservable_view(_materialize_offset_view(x))
+
         args = tuple(
-            prep_write(a) if i in write_positions else _materialize_offset_view(a)
+            prep_write(a) if i in write_positions else prep_read(a)
             for i, a in enumerate(args)
         )
         kwargs = {
-            k: (prep_write(v) if k in write_names else _materialize_offset_view(v))
+            k: (prep_write(v) if k in write_names else prep_read(v))
             for k, v in kwargs.items()
         }
 

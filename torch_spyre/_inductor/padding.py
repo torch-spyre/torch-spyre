@@ -61,6 +61,7 @@ from torch._inductor.ir import (
     Buffer,
     ComputedBuffer,
     FixedLayout,
+    MutationLayoutSHOULDREMOVE,
     Operation,
     Pointwise,
     Reduction,
@@ -618,6 +619,48 @@ def _stick_symbol(stl: SpyreTensorLayout, dep) -> object | None:
     return next(iter(syms))
 
 
+def _raise_if_sliced_restickify(op: Operation, graph: GraphLowering) -> None:
+    """Raise ``Unsupported`` for a restickify written straight into a slice of
+    another buffer (the pieces of a ``torch.cat``).
+
+    ``is_restickify_op`` needs a ``FixedTiledLayout`` output, and a write into a
+    slice has a ``MutationLayoutSHOULDREMOVE`` one, so the padding pass would skip
+    it.  Codegen still sees a restickify (``is_restickify_coords``) and asserts in
+    ``_restickify_restore_elided_dim`` that the padding pass added the gap dim,
+    which it never did.
+
+    Only a restickify with exactly one elided operand counts: that is the case the
+    codegen assert covers (one operand's within-stick coordinate has no loop
+    symbol).  When both operands carry one, the restore is a no-op and the slice
+    write compiles correctly (``torch.cat([a, b], -1).sum(-1)`` on
+    ``(32, 8, 16, 1)``, or the copy-back into a mutated graph input).
+
+    TODO(#6163): restickify into a fresh buffer sized to a stick multiple, then
+    copy it into the slice (see the TODO in ``_pad_restickify_output``); then
+    this check goes away.
+    """
+    if not isinstance(op, ComputedBuffer) or not isinstance(op.data, Pointwise):
+        return
+    layout = op.get_layout()
+    if not isinstance(layout, MutationLayoutSHOULDREMOVE):
+        return
+    real = layout.real_layout()
+    in_dep, _in_buf, in_layout = _restickify_input(op, graph)
+    if in_dep is None or not isinstance(real, FixedTiledLayout):
+        return
+    write_dep = _write_dep(op)
+    in_coords = device_coordinates(in_layout.device_layout, in_dep)
+    out_coords = device_coordinates(real.device_layout, write_dep)
+    if not (in_coords and out_coords and is_restickify_coords(in_coords, out_coords)):
+        return
+    if bool(in_coords[-1].free_symbols) != bool(out_coords[-1].free_symbols):
+        raise Unsupported(
+            f"insert_restickify_padding: restickify written into a slice of "
+            f"another buffer on {op.get_name()} (for example torch.cat of "
+            f"tensors that need a restickify) cannot be padded in place"
+        )
+
+
 def is_restickify_op(op: Operation, graph: GraphLowering) -> bool:
     """Return whether ``op`` is a restickify: a single-input pointwise copy
     between two FixedTiledLayouts that lands a *different* host dim within the
@@ -1170,6 +1213,7 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
     symbol, so swapping the pass order fails loudly rather than silently.
     """
     for op in list(graph.operations):
+        _raise_if_sliced_restickify(op, graph)
         if is_restickify_op(op, graph):
             _pad_restickify_output(op, graph)
             _pad_restickify_input(op, graph)
