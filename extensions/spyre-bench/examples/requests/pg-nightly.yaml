@@ -1,0 +1,9 @@
+# A run request as CI submits it (the input to engine.plan). A request, not a resource: it has no envelope and no status.
+purpose: nightly
+environment: pg-oltp-host
+subject:
+  artifact_id: 3b1e6a52-9c0d-5f47-8a21-7d4c0e9b5f10
+  resolver: pg/build
+  attrs: {subject.dep.postgres: "16.6", subject.lineage: main}
+selection: {tier: core, type: perf}
+reuse: {mode: never}

@@ -1,0 +1,11 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+# An Analysis is a query over stored results, not a run. Same kind of setup (env.id), same build: which exact hardware?
+apiVersion: bench/v1alpha1
+kind: Analysis
+metadata: {name: card-to-card-spread, owner: example-team}
+spec:
+  select: {benchmarks: [serve-demo-llm-a]}
+  metric: llm.itl.median
+  hold: ["case.*", "system.*", "input.*", "subject.id", "env.id"]
+  vary: ["env.placement_id", "env.node"]
+  output: {controlled_sets: true, rank_variables: false, noise: series_floor, chart: dots-per-vary-key}

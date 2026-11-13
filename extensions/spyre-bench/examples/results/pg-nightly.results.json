@@ -1,0 +1,1523 @@
+[
+ {
+  "apiVersion": "bench/v1alpha1",
+  "kind": "Result",
+  "metadata": {
+   "name": "pgbench-tpcb/system=default/clients=c1"
+  },
+  "status": {
+   "case": {
+    "benchmark_id": "efee611d-cc67-54e5-a654-0fe5b008df16",
+    "component": "pg-perf",
+    "name": "pgbench-tpcb",
+    "tags": [],
+    "disc": {
+     "case.type": "pg/pgbench",
+     "case.script": "tpcb-like",
+     "case.jobs": "4",
+     "case.protocol": "prepared",
+     "case.load.executor": "closed",
+     "case.load.concurrency": "1",
+     "case.load.duration": "300.0",
+     "case.load.warmup": "60.0",
+     "system.type": "pg/postgres",
+     "system.major": "16",
+     "system.settings.max_connections": "200",
+     "input.data.asset": "56929b7b-1d06-504e-8919-a938bf71ed91",
+     "input.data.select": "{}"
+    },
+    "props": {
+     "system.name": "pg16-default",
+     "system.backend": "postgres",
+     "input.data.asset_name": "pgbench-data-sf100"
+    }
+   },
+   "subject": {
+    "artifact_id": "3b1e6a52-9c0d-5f47-8a21-7d4c0e9b5f10",
+    "resolver": "pg/build",
+    "attrs": {
+     "subject.dep.postgres": "16.6",
+     "subject.lineage": "main"
+    }
+   },
+   "environment": {
+    "env_id": "2c505752-a050-5a2a-8714-7442b3ece7bb",
+    "fingerprint_version": 1,
+    "fingerprint": {
+     "env.fp.kernel": "6.8.0-45",
+     "env.fp.os.version": "os-a",
+     "env.fp.governor": "performance",
+     "env.fp.cpu.model": "cpu-model-a",
+     "env.fp.cpu.base_ghz": 2.4,
+     "env.fp.pg.server_version": "16.6"
+    },
+    "observations": {
+     "env.node": "host-a",
+     "env.uptime_s": 86400
+    },
+    "labels": {
+     "env.label.node.class": "db-metal-nvme",
+     "env.label.storage.class": "nvme-local"
+    },
+    "request": {
+     "name": "pg-oltp-host",
+     "spec_digest": "f70667bf-8885-53be-8d21-b34497b26699"
+    }
+   },
+   "series": {
+    "key": "f0858683-089e-5955-a335-4397ade7a90f",
+    "labels": {
+     "env.label.node.class": "db-metal-nvme",
+     "env.label.storage.class": "nvme-local"
+    }
+   },
+   "repeats": [
+    {
+     "run.repeat": 1,
+     "status": "ok",
+     "placement": {
+      "nodes": [
+       "host-a"
+      ],
+      "devices": [
+       {
+        "serial": "serial-a"
+       }
+      ],
+      "id": "cc3569e7-e3cb-5d45-a140-7c8d8bdd919a"
+     },
+     "clean": {
+      "exclusive": "observed",
+      "load_clean": true,
+      "devices_exclusive": "enforced",
+      "other_load": "unknown"
+     },
+     "samples": {
+      "pg.tps": [
+       101.0,
+       101.1,
+       101.2,
+       101.3,
+       101.4
+      ],
+      "pg.latency.mean": [
+       0.009901,
+       0.009891,
+       0.009881,
+       0.009872,
+       0.009862
+      ]
+     }
+    },
+    {
+     "run.repeat": 2,
+     "status": "ok",
+     "placement": {
+      "nodes": [
+       "host-b"
+      ],
+      "devices": [
+       {
+        "serial": "serial-b"
+       }
+      ],
+      "id": "db08aaa2-1acc-52ba-9ea3-14fe4275b279"
+     },
+     "clean": {
+      "exclusive": "observed",
+      "load_clean": true,
+      "devices_exclusive": "enforced",
+      "other_load": "unknown"
+     },
+     "samples": {
+      "pg.tps": [
+       102.0,
+       102.1,
+       102.2,
+       102.3,
+       102.4
+      ],
+      "pg.latency.mean": [
+       0.009804,
+       0.009794,
+       0.009785,
+       0.009775,
+       0.009766
+      ]
+     }
+    },
+    {
+     "run.repeat": 3,
+     "status": "ok",
+     "placement": {
+      "nodes": [
+       "host-a"
+      ],
+      "devices": [
+       {
+        "serial": "serial-a"
+       }
+      ],
+      "id": "cc3569e7-e3cb-5d45-a140-7c8d8bdd919a"
+     },
+     "clean": {
+      "exclusive": "observed",
+      "load_clean": true,
+      "devices_exclusive": "enforced",
+      "other_load": "unknown"
+     },
+     "samples": {
+      "pg.tps": [
+       103.0,
+       103.1,
+       103.2,
+       103.3,
+       103.4
+      ],
+      "pg.latency.mean": [
+       0.009709,
+       0.009699,
+       0.00969,
+       0.009681,
+       0.009671
+      ]
+     }
+    }
+   ],
+   "aggregate": {
+    "statistic": "median",
+    "outliers": "none",
+    "n": 3,
+    "metrics": {
+     "pg.tps": {
+      "value": 102.2,
+      "unit": "{transaction}/s"
+     },
+     "pg.latency.mean": {
+      "value": 0.009785,
+      "unit": "s"
+     }
+    }
+   },
+   "reused_from": null,
+   "validity": {
+    "state": "valid",
+    "reasons": [],
+    "policy_digest": "8d61f6f0-203c-57e3-ae1a-7e8ab4ad00e5",
+    "purpose": "nightly"
+   },
+   "run_props": {
+    "run.validity": "valid",
+    "run.validity_policy": "8d61f6f0-203c-57e3-ae1a-7e8ab4ad00e5",
+    "run.purpose": "nightly",
+    "run.trust": "internal"
+   }
+  }
+ },
+ {
+  "apiVersion": "bench/v1alpha1",
+  "kind": "Result",
+  "metadata": {
+   "name": "pgbench-tpcb/system=default/clients=c8"
+  },
+  "status": {
+   "case": {
+    "benchmark_id": "694407af-134d-5252-b1e3-81b60e9f1ee1",
+    "component": "pg-perf",
+    "name": "pgbench-tpcb",
+    "tags": [],
+    "disc": {
+     "case.type": "pg/pgbench",
+     "case.script": "tpcb-like",
+     "case.jobs": "4",
+     "case.protocol": "prepared",
+     "case.load.executor": "closed",
+     "case.load.concurrency": "8",
+     "case.load.duration": "300.0",
+     "case.load.warmup": "60.0",
+     "system.type": "pg/postgres",
+     "system.major": "16",
+     "system.settings.max_connections": "200",
+     "input.data.asset": "56929b7b-1d06-504e-8919-a938bf71ed91",
+     "input.data.select": "{}"
+    },
+    "props": {
+     "system.name": "pg16-default",
+     "system.backend": "postgres",
+     "input.data.asset_name": "pgbench-data-sf100"
+    }
+   },
+   "subject": {
+    "artifact_id": "3b1e6a52-9c0d-5f47-8a21-7d4c0e9b5f10",
+    "resolver": "pg/build",
+    "attrs": {
+     "subject.dep.postgres": "16.6",
+     "subject.lineage": "main"
+    }
+   },
+   "environment": {
+    "env_id": "2c505752-a050-5a2a-8714-7442b3ece7bb",
+    "fingerprint_version": 1,
+    "fingerprint": {
+     "env.fp.kernel": "6.8.0-45",
+     "env.fp.os.version": "os-a",
+     "env.fp.governor": "performance",
+     "env.fp.cpu.model": "cpu-model-a",
+     "env.fp.cpu.base_ghz": 2.4,
+     "env.fp.pg.server_version": "16.6"
+    },
+    "observations": {
+     "env.node": "host-a",
+     "env.uptime_s": 86401
+    },
+    "labels": {
+     "env.label.node.class": "db-metal-nvme",
+     "env.label.storage.class": "nvme-local"
+    },
+    "request": {
+     "name": "pg-oltp-host",
+     "spec_digest": "f70667bf-8885-53be-8d21-b34497b26699"
+    }
+   },
+   "series": {
+    "key": "7613fc28-6f80-500b-8fed-48524a639737",
+    "labels": {
+     "env.label.node.class": "db-metal-nvme",
+     "env.label.storage.class": "nvme-local"
+    }
+   },
+   "repeats": [
+    {
+     "run.repeat": 1,
+     "status": "ok",
+     "placement": {
+      "nodes": [
+       "host-a"
+      ],
+      "devices": [
+       {
+        "serial": "serial-a"
+       }
+      ],
+      "id": "cc3569e7-e3cb-5d45-a140-7c8d8bdd919a"
+     },
+     "clean": {
+      "exclusive": "observed",
+      "load_clean": true,
+      "devices_exclusive": "enforced",
+      "other_load": "unknown"
+     },
+     "samples": {
+      "pg.tps": [
+       104.0,
+       104.1,
+       104.2,
+       104.3,
+       104.4
+      ],
+      "pg.latency.mean": [
+       0.009615,
+       0.009606,
+       0.009597,
+       0.009588,
+       0.009579
+      ]
+     }
+    },
+    {
+     "run.repeat": 2,
+     "status": "ok",
+     "placement": {
+      "nodes": [
+       "host-b"
+      ],
+      "devices": [
+       {
+        "serial": "serial-b"
+       }
+      ],
+      "id": "db08aaa2-1acc-52ba-9ea3-14fe4275b279"
+     },
+     "clean": {
+      "exclusive": "observed",
+      "load_clean": true,
+      "devices_exclusive": "enforced",
+      "other_load": "unknown"
+     },
+     "samples": {
+      "pg.tps": [
+       105.0,
+       105.1,
+       105.2,
+       105.3,
+       105.4
+      ],
+      "pg.latency.mean": [
+       0.009524,
+       0.009515,
+       0.009506,
+       0.009497,
+       0.009488
+      ]
+     }
+    },
+    {
+     "run.repeat": 3,
+     "status": "ok",
+     "placement": {
+      "nodes": [
+       "host-a"
+      ],
+      "devices": [
+       {
+        "serial": "serial-a"
+       }
+      ],
+      "id": "cc3569e7-e3cb-5d45-a140-7c8d8bdd919a"
+     },
+     "clean": {
+      "exclusive": "observed",
+      "load_clean": true,
+      "devices_exclusive": "enforced",
+      "other_load": "unknown"
+     },
+     "samples": {
+      "pg.tps": [
+       106.0,
+       106.1,
+       106.2,
+       106.3,
+       106.4
+      ],
+      "pg.latency.mean": [
+       0.009434,
+       0.009425,
+       0.009416,
+       0.009407,
+       0.009398
+      ]
+     }
+    }
+   ],
+   "aggregate": {
+    "statistic": "median",
+    "outliers": "none",
+    "n": 3,
+    "metrics": {
+     "pg.tps": {
+      "value": 105.2,
+      "unit": "{transaction}/s"
+     },
+     "pg.latency.mean": {
+      "value": 0.009506,
+      "unit": "s"
+     }
+    }
+   },
+   "reused_from": null,
+   "validity": {
+    "state": "valid",
+    "reasons": [],
+    "policy_digest": "8d61f6f0-203c-57e3-ae1a-7e8ab4ad00e5",
+    "purpose": "nightly"
+   },
+   "run_props": {
+    "run.validity": "valid",
+    "run.validity_policy": "8d61f6f0-203c-57e3-ae1a-7e8ab4ad00e5",
+    "run.purpose": "nightly",
+    "run.trust": "internal"
+   }
+  }
+ },
+ {
+  "apiVersion": "bench/v1alpha1",
+  "kind": "Result",
+  "metadata": {
+   "name": "pgbench-tpcb/system=default/clients=c32"
+  },
+  "status": {
+   "case": {
+    "benchmark_id": "c74356a6-ccc2-571f-882b-6c6761cdaf47",
+    "component": "pg-perf",
+    "name": "pgbench-tpcb",
+    "tags": [],
+    "disc": {
+     "case.type": "pg/pgbench",
+     "case.script": "tpcb-like",
+     "case.jobs": "4",
+     "case.protocol": "prepared",
+     "case.load.executor": "closed",
+     "case.load.concurrency": "32",
+     "case.load.duration": "300.0",
+     "case.load.warmup": "60.0",
+     "system.type": "pg/postgres",
+     "system.major": "16",
+     "system.settings.max_connections": "200",
+     "input.data.asset": "56929b7b-1d06-504e-8919-a938bf71ed91",
+     "input.data.select": "{}"
+    },
+    "props": {
+     "system.name": "pg16-default",
+     "system.backend": "postgres",
+     "input.data.asset_name": "pgbench-data-sf100"
+    }
+   },
+   "subject": {
+    "artifact_id": "3b1e6a52-9c0d-5f47-8a21-7d4c0e9b5f10",
+    "resolver": "pg/build",
+    "attrs": {
+     "subject.dep.postgres": "16.6",
+     "subject.lineage": "main"
+    }
+   },
+   "environment": {
+    "env_id": "2c505752-a050-5a2a-8714-7442b3ece7bb",
+    "fingerprint_version": 1,
+    "fingerprint": {
+     "env.fp.kernel": "6.8.0-45",
+     "env.fp.os.version": "os-a",
+     "env.fp.governor": "performance",
+     "env.fp.cpu.model": "cpu-model-a",
+     "env.fp.cpu.base_ghz": 2.4,
+     "env.fp.pg.server_version": "16.6"
+    },
+    "observations": {
+     "env.node": "host-a",
+     "env.uptime_s": 86402
+    },
+    "labels": {
+     "env.label.node.class": "db-metal-nvme",
+     "env.label.storage.class": "nvme-local"
+    },
+    "request": {
+     "name": "pg-oltp-host",
+     "spec_digest": "f70667bf-8885-53be-8d21-b34497b26699"
+    }
+   },
+   "series": {
+    "key": "735c8eb9-aa08-5920-be3a-794c2cf7671e",
+    "labels": {
+     "env.label.node.class": "db-metal-nvme",
+     "env.label.storage.class": "nvme-local"
+    }
+   },
+   "repeats": [
+    {
+     "run.repeat": 1,
+     "status": "ok",
+     "placement": {
+      "nodes": [
+       "host-a"
+      ],
+      "devices": [
+       {
+        "serial": "serial-a"
+       }
+      ],
+      "id": "cc3569e7-e3cb-5d45-a140-7c8d8bdd919a"
+     },
+     "clean": {
+      "exclusive": "observed",
+      "load_clean": true,
+      "devices_exclusive": "enforced",
+      "other_load": "unknown"
+     },
+     "samples": {
+      "pg.tps": [
+       107.0,
+       107.1,
+       107.2,
+       107.3,
+       107.4
+      ],
+      "pg.latency.mean": [
+       0.009346,
+       0.009337,
+       0.009328,
+       0.00932,
+       0.009311
+      ]
+     }
+    },
+    {
+     "run.repeat": 2,
+     "status": "ok",
+     "placement": {
+      "nodes": [
+       "host-b"
+      ],
+      "devices": [
+       {
+        "serial": "serial-b"
+       }
+      ],
+      "id": "db08aaa2-1acc-52ba-9ea3-14fe4275b279"
+     },
+     "clean": {
+      "exclusive": "observed",
+      "load_clean": true,
+      "devices_exclusive": "enforced",
+      "other_load": "unknown"
+     },
+     "samples": {
+      "pg.tps": [
+       108.0,
+       108.1,
+       108.2,
+       108.3,
+       108.4
+      ],
+      "pg.latency.mean": [
+       0.009259,
+       0.009251,
+       0.009242,
+       0.009234,
+       0.009225
+      ]
+     }
+    },
+    {
+     "run.repeat": 3,
+     "status": "ok",
+     "placement": {
+      "nodes": [
+       "host-a"
+      ],
+      "devices": [
+       {
+        "serial": "serial-a"
+       }
+      ],
+      "id": "cc3569e7-e3cb-5d45-a140-7c8d8bdd919a"
+     },
+     "clean": {
+      "exclusive": "observed",
+      "load_clean": true,
+      "devices_exclusive": "enforced",
+      "other_load": "unknown"
+     },
+     "samples": {
+      "pg.tps": [
+       109.0,
+       109.1,
+       109.2,
+       109.3,
+       109.4
+      ],
+      "pg.latency.mean": [
+       0.009174,
+       0.009166,
+       0.009158,
+       0.009149,
+       0.009141
+      ]
+     }
+    }
+   ],
+   "aggregate": {
+    "statistic": "median",
+    "outliers": "none",
+    "n": 3,
+    "metrics": {
+     "pg.tps": {
+      "value": 108.2,
+      "unit": "{transaction}/s"
+     },
+     "pg.latency.mean": {
+      "value": 0.009242,
+      "unit": "s"
+     }
+    }
+   },
+   "reused_from": null,
+   "validity": {
+    "state": "valid",
+    "reasons": [],
+    "policy_digest": "8d61f6f0-203c-57e3-ae1a-7e8ab4ad00e5",
+    "purpose": "nightly"
+   },
+   "run_props": {
+    "run.validity": "valid",
+    "run.validity_policy": "8d61f6f0-203c-57e3-ae1a-7e8ab4ad00e5",
+    "run.purpose": "nightly",
+    "run.trust": "internal"
+   }
+  }
+ },
+ {
+  "apiVersion": "bench/v1alpha1",
+  "kind": "Result",
+  "metadata": {
+   "name": "pgbench-tpcb/system=tuned/clients=c1"
+  },
+  "status": {
+   "case": {
+    "benchmark_id": "259b3a8b-7d07-5db7-83fb-9f4bfb718523",
+    "component": "pg-perf",
+    "name": "pgbench-tpcb",
+    "tags": [],
+    "disc": {
+     "case.type": "pg/pgbench",
+     "case.script": "tpcb-like",
+     "case.jobs": "4",
+     "case.protocol": "prepared",
+     "case.load.executor": "closed",
+     "case.load.concurrency": "1",
+     "case.load.duration": "300.0",
+     "case.load.warmup": "60.0",
+     "system.type": "pg/postgres",
+     "system.major": "16",
+     "system.settings.max_connections": "200",
+     "system.settings.shared_buffers": "32GB",
+     "system.settings.effective_cache_size": "96GB",
+     "system.settings.wal_buffers": "64MB",
+     "system.settings.synchronous_commit": "off",
+     "input.data.asset": "56929b7b-1d06-504e-8919-a938bf71ed91",
+     "input.data.select": "{}"
+    },
+    "props": {
+     "system.name": "pg16-tuned",
+     "system.backend": "postgres",
+     "input.data.asset_name": "pgbench-data-sf100"
+    }
+   },
+   "subject": {
+    "artifact_id": "3b1e6a52-9c0d-5f47-8a21-7d4c0e9b5f10",
+    "resolver": "pg/build",
+    "attrs": {
+     "subject.dep.postgres": "16.6",
+     "subject.lineage": "main"
+    }
+   },
+   "environment": {
+    "env_id": "2c505752-a050-5a2a-8714-7442b3ece7bb",
+    "fingerprint_version": 1,
+    "fingerprint": {
+     "env.fp.kernel": "6.8.0-45",
+     "env.fp.os.version": "os-a",
+     "env.fp.governor": "performance",
+     "env.fp.cpu.model": "cpu-model-a",
+     "env.fp.cpu.base_ghz": 2.4,
+     "env.fp.pg.server_version": "16.6"
+    },
+    "observations": {
+     "env.node": "host-a",
+     "env.uptime_s": 86403
+    },
+    "labels": {
+     "env.label.node.class": "db-metal-nvme",
+     "env.label.storage.class": "nvme-local"
+    },
+    "request": {
+     "name": "pg-oltp-host",
+     "spec_digest": "f70667bf-8885-53be-8d21-b34497b26699"
+    }
+   },
+   "series": {
+    "key": "1c6042e3-09d9-5bca-9d90-6467667f787d",
+    "labels": {
+     "env.label.node.class": "db-metal-nvme",
+     "env.label.storage.class": "nvme-local"
+    }
+   },
+   "repeats": [
+    {
+     "run.repeat": 1,
+     "status": "ok",
+     "placement": {
+      "nodes": [
+       "host-a"
+      ],
+      "devices": [
+       {
+        "serial": "serial-a"
+       }
+      ],
+      "id": "cc3569e7-e3cb-5d45-a140-7c8d8bdd919a"
+     },
+     "clean": {
+      "exclusive": "observed",
+      "load_clean": true,
+      "devices_exclusive": "enforced",
+      "other_load": "unknown"
+     },
+     "samples": {
+      "pg.tps": [
+       110.0,
+       110.1,
+       110.2,
+       110.3,
+       110.4
+      ],
+      "pg.latency.mean": [
+       0.009091,
+       0.009083,
+       0.009074,
+       0.009066,
+       0.009058
+      ]
+     }
+    },
+    {
+     "run.repeat": 2,
+     "status": "ok",
+     "placement": {
+      "nodes": [
+       "host-b"
+      ],
+      "devices": [
+       {
+        "serial": "serial-b"
+       }
+      ],
+      "id": "db08aaa2-1acc-52ba-9ea3-14fe4275b279"
+     },
+     "clean": {
+      "exclusive": "observed",
+      "load_clean": true,
+      "devices_exclusive": "enforced",
+      "other_load": "unknown"
+     },
+     "samples": {
+      "pg.tps": [
+       111.0,
+       111.1,
+       111.2,
+       111.3,
+       111.4
+      ],
+      "pg.latency.mean": [
+       0.009009,
+       0.009001,
+       0.008993,
+       0.008985,
+       0.008977
+      ]
+     }
+    },
+    {
+     "run.repeat": 3,
+     "status": "ok",
+     "placement": {
+      "nodes": [
+       "host-a"
+      ],
+      "devices": [
+       {
+        "serial": "serial-a"
+       }
+      ],
+      "id": "cc3569e7-e3cb-5d45-a140-7c8d8bdd919a"
+     },
+     "clean": {
+      "exclusive": "observed",
+      "load_clean": true,
+      "devices_exclusive": "enforced",
+      "other_load": "unknown"
+     },
+     "samples": {
+      "pg.tps": [
+       112.0,
+       112.1,
+       112.2,
+       112.3,
+       112.4
+      ],
+      "pg.latency.mean": [
+       0.008929,
+       0.008921,
+       0.008913,
+       0.008905,
+       0.008897
+      ]
+     }
+    }
+   ],
+   "aggregate": {
+    "statistic": "median",
+    "outliers": "none",
+    "n": 3,
+    "metrics": {
+     "pg.tps": {
+      "value": 111.2,
+      "unit": "{transaction}/s"
+     },
+     "pg.latency.mean": {
+      "value": 0.008993,
+      "unit": "s"
+     }
+    }
+   },
+   "reused_from": null,
+   "validity": {
+    "state": "valid",
+    "reasons": [],
+    "policy_digest": "8d61f6f0-203c-57e3-ae1a-7e8ab4ad00e5",
+    "purpose": "nightly"
+   },
+   "run_props": {
+    "run.validity": "valid",
+    "run.validity_policy": "8d61f6f0-203c-57e3-ae1a-7e8ab4ad00e5",
+    "run.purpose": "nightly",
+    "run.trust": "internal"
+   }
+  }
+ },
+ {
+  "apiVersion": "bench/v1alpha1",
+  "kind": "Result",
+  "metadata": {
+   "name": "pgbench-tpcb/system=tuned/clients=c8"
+  },
+  "status": {
+   "case": {
+    "benchmark_id": "caff5263-6397-5c25-a80d-cb0a89225fea",
+    "component": "pg-perf",
+    "name": "pgbench-tpcb",
+    "tags": [],
+    "disc": {
+     "case.type": "pg/pgbench",
+     "case.script": "tpcb-like",
+     "case.jobs": "4",
+     "case.protocol": "prepared",
+     "case.load.executor": "closed",
+     "case.load.concurrency": "8",
+     "case.load.duration": "300.0",
+     "case.load.warmup": "60.0",
+     "system.type": "pg/postgres",
+     "system.major": "16",
+     "system.settings.max_connections": "200",
+     "system.settings.shared_buffers": "32GB",
+     "system.settings.effective_cache_size": "96GB",
+     "system.settings.wal_buffers": "64MB",
+     "system.settings.synchronous_commit": "off",
+     "input.data.asset": "56929b7b-1d06-504e-8919-a938bf71ed91",
+     "input.data.select": "{}"
+    },
+    "props": {
+     "system.name": "pg16-tuned",
+     "system.backend": "postgres",
+     "input.data.asset_name": "pgbench-data-sf100"
+    }
+   },
+   "subject": {
+    "artifact_id": "3b1e6a52-9c0d-5f47-8a21-7d4c0e9b5f10",
+    "resolver": "pg/build",
+    "attrs": {
+     "subject.dep.postgres": "16.6",
+     "subject.lineage": "main"
+    }
+   },
+   "environment": {
+    "env_id": "2c505752-a050-5a2a-8714-7442b3ece7bb",
+    "fingerprint_version": 1,
+    "fingerprint": {
+     "env.fp.kernel": "6.8.0-45",
+     "env.fp.os.version": "os-a",
+     "env.fp.governor": "performance",
+     "env.fp.cpu.model": "cpu-model-a",
+     "env.fp.cpu.base_ghz": 2.4,
+     "env.fp.pg.server_version": "16.6"
+    },
+    "observations": {
+     "env.node": "host-a",
+     "env.uptime_s": 86404
+    },
+    "labels": {
+     "env.label.node.class": "db-metal-nvme",
+     "env.label.storage.class": "nvme-local"
+    },
+    "request": {
+     "name": "pg-oltp-host",
+     "spec_digest": "f70667bf-8885-53be-8d21-b34497b26699"
+    }
+   },
+   "series": {
+    "key": "908a1caa-649a-5f36-b7a2-073cc152c73a",
+    "labels": {
+     "env.label.node.class": "db-metal-nvme",
+     "env.label.storage.class": "nvme-local"
+    }
+   },
+   "repeats": [
+    {
+     "run.repeat": 1,
+     "status": "ok",
+     "placement": {
+      "nodes": [
+       "host-a"
+      ],
+      "devices": [
+       {
+        "serial": "serial-a"
+       }
+      ],
+      "id": "cc3569e7-e3cb-5d45-a140-7c8d8bdd919a"
+     },
+     "clean": {
+      "exclusive": "observed",
+      "load_clean": true,
+      "devices_exclusive": "enforced",
+      "other_load": "unknown"
+     },
+     "samples": {
+      "pg.tps": [
+       113.0,
+       113.1,
+       113.2,
+       113.3,
+       113.4
+      ],
+      "pg.latency.mean": [
+       0.00885,
+       0.008842,
+       0.008834,
+       0.008826,
+       0.008818
+      ]
+     }
+    },
+    {
+     "run.repeat": 2,
+     "status": "ok",
+     "placement": {
+      "nodes": [
+       "host-b"
+      ],
+      "devices": [
+       {
+        "serial": "serial-b"
+       }
+      ],
+      "id": "db08aaa2-1acc-52ba-9ea3-14fe4275b279"
+     },
+     "clean": {
+      "exclusive": "observed",
+      "load_clean": true,
+      "devices_exclusive": "enforced",
+      "other_load": "unknown"
+     },
+     "samples": {
+      "pg.tps": [
+       114.0,
+       114.1,
+       114.2,
+       114.3,
+       114.4
+      ],
+      "pg.latency.mean": [
+       0.008772,
+       0.008764,
+       0.008757,
+       0.008749,
+       0.008741
+      ]
+     }
+    },
+    {
+     "run.repeat": 3,
+     "status": "ok",
+     "placement": {
+      "nodes": [
+       "host-a"
+      ],
+      "devices": [
+       {
+        "serial": "serial-a"
+       }
+      ],
+      "id": "cc3569e7-e3cb-5d45-a140-7c8d8bdd919a"
+     },
+     "clean": {
+      "exclusive": "observed",
+      "load_clean": true,
+      "devices_exclusive": "enforced",
+      "other_load": "unknown"
+     },
+     "samples": {
+      "pg.tps": [
+       115.0,
+       115.1,
+       115.2,
+       115.3,
+       115.4
+      ],
+      "pg.latency.mean": [
+       0.008696,
+       0.008688,
+       0.008681,
+       0.008673,
+       0.008666
+      ]
+     }
+    }
+   ],
+   "aggregate": {
+    "statistic": "median",
+    "outliers": "none",
+    "n": 3,
+    "metrics": {
+     "pg.tps": {
+      "value": 114.2,
+      "unit": "{transaction}/s"
+     },
+     "pg.latency.mean": {
+      "value": 0.008757,
+      "unit": "s"
+     }
+    }
+   },
+   "reused_from": null,
+   "validity": {
+    "state": "valid",
+    "reasons": [],
+    "policy_digest": "8d61f6f0-203c-57e3-ae1a-7e8ab4ad00e5",
+    "purpose": "nightly"
+   },
+   "run_props": {
+    "run.validity": "valid",
+    "run.validity_policy": "8d61f6f0-203c-57e3-ae1a-7e8ab4ad00e5",
+    "run.purpose": "nightly",
+    "run.trust": "internal"
+   }
+  }
+ },
+ {
+  "apiVersion": "bench/v1alpha1",
+  "kind": "Result",
+  "metadata": {
+   "name": "pgbench-tpcb/system=tuned/clients=c32"
+  },
+  "status": {
+   "case": {
+    "benchmark_id": "06d6ea5c-5e1b-5daf-b5f3-fde0653bd634",
+    "component": "pg-perf",
+    "name": "pgbench-tpcb",
+    "tags": [],
+    "disc": {
+     "case.type": "pg/pgbench",
+     "case.script": "tpcb-like",
+     "case.jobs": "4",
+     "case.protocol": "prepared",
+     "case.load.executor": "closed",
+     "case.load.concurrency": "32",
+     "case.load.duration": "300.0",
+     "case.load.warmup": "60.0",
+     "system.type": "pg/postgres",
+     "system.major": "16",
+     "system.settings.max_connections": "200",
+     "system.settings.shared_buffers": "32GB",
+     "system.settings.effective_cache_size": "96GB",
+     "system.settings.wal_buffers": "64MB",
+     "system.settings.synchronous_commit": "off",
+     "input.data.asset": "56929b7b-1d06-504e-8919-a938bf71ed91",
+     "input.data.select": "{}"
+    },
+    "props": {
+     "system.name": "pg16-tuned",
+     "system.backend": "postgres",
+     "input.data.asset_name": "pgbench-data-sf100"
+    }
+   },
+   "subject": {
+    "artifact_id": "3b1e6a52-9c0d-5f47-8a21-7d4c0e9b5f10",
+    "resolver": "pg/build",
+    "attrs": {
+     "subject.dep.postgres": "16.6",
+     "subject.lineage": "main"
+    }
+   },
+   "environment": {
+    "env_id": "2c505752-a050-5a2a-8714-7442b3ece7bb",
+    "fingerprint_version": 1,
+    "fingerprint": {
+     "env.fp.kernel": "6.8.0-45",
+     "env.fp.os.version": "os-a",
+     "env.fp.governor": "performance",
+     "env.fp.cpu.model": "cpu-model-a",
+     "env.fp.cpu.base_ghz": 2.4,
+     "env.fp.pg.server_version": "16.6"
+    },
+    "observations": {
+     "env.node": "host-a",
+     "env.uptime_s": 86405
+    },
+    "labels": {
+     "env.label.node.class": "db-metal-nvme",
+     "env.label.storage.class": "nvme-local"
+    },
+    "request": {
+     "name": "pg-oltp-host",
+     "spec_digest": "f70667bf-8885-53be-8d21-b34497b26699"
+    }
+   },
+   "series": {
+    "key": "51d9ea96-e0fc-536a-bd21-ab0153c88b08",
+    "labels": {
+     "env.label.node.class": "db-metal-nvme",
+     "env.label.storage.class": "nvme-local"
+    }
+   },
+   "repeats": [
+    {
+     "run.repeat": 1,
+     "status": "ok",
+     "placement": {
+      "nodes": [
+       "host-a"
+      ],
+      "devices": [
+       {
+        "serial": "serial-a"
+       }
+      ],
+      "id": "cc3569e7-e3cb-5d45-a140-7c8d8bdd919a"
+     },
+     "clean": {
+      "exclusive": "observed",
+      "load_clean": true,
+      "devices_exclusive": "enforced",
+      "other_load": "unknown"
+     },
+     "samples": {
+      "pg.tps": [
+       116.0,
+       116.1,
+       116.2,
+       116.3,
+       116.4
+      ],
+      "pg.latency.mean": [
+       0.008621,
+       0.008613,
+       0.008606,
+       0.008598,
+       0.008591
+      ]
+     }
+    },
+    {
+     "run.repeat": 2,
+     "status": "ok",
+     "placement": {
+      "nodes": [
+       "host-b"
+      ],
+      "devices": [
+       {
+        "serial": "serial-b"
+       }
+      ],
+      "id": "db08aaa2-1acc-52ba-9ea3-14fe4275b279"
+     },
+     "clean": {
+      "exclusive": "observed",
+      "load_clean": true,
+      "devices_exclusive": "enforced",
+      "other_load": "unknown"
+     },
+     "samples": {
+      "pg.tps": [
+       117.0,
+       117.1,
+       117.2,
+       117.3,
+       117.4
+      ],
+      "pg.latency.mean": [
+       0.008547,
+       0.00854,
+       0.008532,
+       0.008525,
+       0.008518
+      ]
+     }
+    },
+    {
+     "run.repeat": 3,
+     "status": "ok",
+     "placement": {
+      "nodes": [
+       "host-a"
+      ],
+      "devices": [
+       {
+        "serial": "serial-a"
+       }
+      ],
+      "id": "cc3569e7-e3cb-5d45-a140-7c8d8bdd919a"
+     },
+     "clean": {
+      "exclusive": "observed",
+      "load_clean": true,
+      "devices_exclusive": "enforced",
+      "other_load": "unknown"
+     },
+     "samples": {
+      "pg.tps": [
+       118.0,
+       118.1,
+       118.2,
+       118.3,
+       118.4
+      ],
+      "pg.latency.mean": [
+       0.008475,
+       0.008467,
+       0.00846,
+       0.008453,
+       0.008446
+      ]
+     }
+    }
+   ],
+   "aggregate": {
+    "statistic": "median",
+    "outliers": "none",
+    "n": 3,
+    "metrics": {
+     "pg.tps": {
+      "value": 117.2,
+      "unit": "{transaction}/s"
+     },
+     "pg.latency.mean": {
+      "value": 0.008532,
+      "unit": "s"
+     }
+    }
+   },
+   "reused_from": null,
+   "validity": {
+    "state": "valid",
+    "reasons": [],
+    "policy_digest": "8d61f6f0-203c-57e3-ae1a-7e8ab4ad00e5",
+    "purpose": "nightly"
+   },
+   "run_props": {
+    "run.validity": "valid",
+    "run.validity_policy": "8d61f6f0-203c-57e3-ae1a-7e8ab4ad00e5",
+    "run.purpose": "nightly",
+    "run.trust": "internal"
+   }
+  }
+ },
+ {
+  "apiVersion": "bench/v1alpha1",
+  "kind": "Result",
+  "metadata": {
+   "name": "pgbench-tpcb/system=tuned/clients=c64"
+  },
+  "status": {
+   "case": {
+    "benchmark_id": "dbc12f4a-5273-5f17-9d50-d9834fe8f8fa",
+    "component": "pg-perf",
+    "name": "pgbench-tpcb",
+    "tags": [],
+    "disc": {
+     "case.type": "pg/pgbench",
+     "case.script": "tpcb-like",
+     "case.jobs": "4",
+     "case.protocol": "prepared",
+     "case.load.executor": "closed",
+     "case.load.concurrency": "64",
+     "case.load.duration": "300.0",
+     "case.load.warmup": "60.0",
+     "system.type": "pg/postgres",
+     "system.major": "16",
+     "system.settings.max_connections": "200",
+     "system.settings.shared_buffers": "32GB",
+     "system.settings.effective_cache_size": "96GB",
+     "system.settings.wal_buffers": "64MB",
+     "system.settings.synchronous_commit": "off",
+     "input.data.asset": "56929b7b-1d06-504e-8919-a938bf71ed91",
+     "input.data.select": "{}"
+    },
+    "props": {
+     "system.name": "pg16-tuned",
+     "system.backend": "postgres",
+     "input.data.asset_name": "pgbench-data-sf100"
+    }
+   },
+   "subject": {
+    "artifact_id": "3b1e6a52-9c0d-5f47-8a21-7d4c0e9b5f10",
+    "resolver": "pg/build",
+    "attrs": {
+     "subject.dep.postgres": "16.6",
+     "subject.lineage": "main"
+    }
+   },
+   "environment": {
+    "env_id": "2c505752-a050-5a2a-8714-7442b3ece7bb",
+    "fingerprint_version": 1,
+    "fingerprint": {
+     "env.fp.kernel": "6.8.0-45",
+     "env.fp.os.version": "os-a",
+     "env.fp.governor": "performance",
+     "env.fp.cpu.model": "cpu-model-a",
+     "env.fp.cpu.base_ghz": 2.4,
+     "env.fp.pg.server_version": "16.6"
+    },
+    "observations": {
+     "env.node": "host-a",
+     "env.uptime_s": 86406
+    },
+    "labels": {
+     "env.label.node.class": "db-metal-nvme",
+     "env.label.storage.class": "nvme-local"
+    },
+    "request": {
+     "name": "pg-oltp-host",
+     "spec_digest": "f70667bf-8885-53be-8d21-b34497b26699"
+    }
+   },
+   "series": {
+    "key": "02c7d55f-c7ad-5225-9891-e21956d7a303",
+    "labels": {
+     "env.label.node.class": "db-metal-nvme",
+     "env.label.storage.class": "nvme-local"
+    }
+   },
+   "repeats": [
+    {
+     "run.repeat": 1,
+     "status": "ok",
+     "placement": {
+      "nodes": [
+       "host-a"
+      ],
+      "devices": [
+       {
+        "serial": "serial-a"
+       }
+      ],
+      "id": "cc3569e7-e3cb-5d45-a140-7c8d8bdd919a"
+     },
+     "clean": {
+      "exclusive": "observed",
+      "load_clean": true,
+      "devices_exclusive": "enforced",
+      "other_load": "unknown"
+     },
+     "samples": {
+      "pg.tps": [
+       119.0,
+       119.1,
+       119.2,
+       119.3,
+       119.4
+      ],
+      "pg.latency.mean": [
+       0.008403,
+       0.008396,
+       0.008389,
+       0.008382,
+       0.008375
+      ]
+     }
+    },
+    {
+     "run.repeat": 2,
+     "status": "ok",
+     "placement": {
+      "nodes": [
+       "host-b"
+      ],
+      "devices": [
+       {
+        "serial": "serial-b"
+       }
+      ],
+      "id": "db08aaa2-1acc-52ba-9ea3-14fe4275b279"
+     },
+     "clean": {
+      "exclusive": "observed",
+      "load_clean": true,
+      "devices_exclusive": "enforced",
+      "other_load": "unknown"
+     },
+     "samples": {
+      "pg.tps": [
+       120.0,
+       120.1,
+       120.2,
+       120.3,
+       120.4
+      ],
+      "pg.latency.mean": [
+       0.008333,
+       0.008326,
+       0.008319,
+       0.008313,
+       0.008306
+      ]
+     }
+    },
+    {
+     "run.repeat": 3,
+     "status": "ok",
+     "placement": {
+      "nodes": [
+       "host-a"
+      ],
+      "devices": [
+       {
+        "serial": "serial-a"
+       }
+      ],
+      "id": "cc3569e7-e3cb-5d45-a140-7c8d8bdd919a"
+     },
+     "clean": {
+      "exclusive": "observed",
+      "load_clean": true,
+      "devices_exclusive": "enforced",
+      "other_load": "unknown"
+     },
+     "samples": {
+      "pg.tps": [
+       121.0,
+       121.1,
+       121.2,
+       121.3,
+       121.4
+      ],
+      "pg.latency.mean": [
+       0.008264,
+       0.008258,
+       0.008251,
+       0.008244,
+       0.008237
+      ]
+     }
+    }
+   ],
+   "aggregate": {
+    "statistic": "median",
+    "outliers": "none",
+    "n": 3,
+    "metrics": {
+     "pg.tps": {
+      "value": 120.2,
+      "unit": "{transaction}/s"
+     },
+     "pg.latency.mean": {
+      "value": 0.008319,
+      "unit": "s"
+     }
+    }
+   },
+   "reused_from": null,
+   "validity": {
+    "state": "valid",
+    "reasons": [],
+    "policy_digest": "8d61f6f0-203c-57e3-ae1a-7e8ab4ad00e5",
+    "purpose": "nightly"
+   },
+   "run_props": {
+    "run.validity": "valid",
+    "run.validity_policy": "8d61f6f0-203c-57e3-ae1a-7e8ab4ad00e5",
+    "run.purpose": "nightly",
+    "run.trust": "internal"
+   }
+  }
+ }
+]

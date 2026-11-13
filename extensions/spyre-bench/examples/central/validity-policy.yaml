@@ -1,0 +1,45 @@
+# yaml-language-server: $schema=../../spyre_bench/core/schemas/resources.schema.json
+# Per purpose: the gates a result must pass to earn `valid`, and the validity floor an Environment may only tighten.
+# Results from sources marked external never earn reference grade or serve as baselines, whatever the purpose.
+apiVersion: bench/v1alpha1
+kind: ValidityPolicy
+metadata: {name: demo-default, owner: example-team, description: "default purposes as typed gates, central"}
+spec:
+  purposes:
+    pr:
+      description: "ordinary CI on shared nodes: usable for a PR check, never a baseline"
+      floor: shared_env
+      requires: {qualification: any, clean: any, min_repeats: 1, max_cv_pct: 10, discard_warmup: 1, placement: optional}
+      baseline: false
+      reference: false
+    investigate:
+      floor: suspect
+      requires: {qualification: any, clean: any, min_repeats: 1, discard_warmup: 0, placement: optional}
+      baseline: false
+      reference: false
+    nightly:
+      floor: shared_env
+      requires: {qualification: current, clean: any, min_repeats: 3, max_cv_pct: 5, discard_warmup: 1, placement: required}
+      baseline: true
+      reference: false
+    weekly:
+      floor: shared_env
+      requires: {qualification: current, clean: any, min_repeats: 5, max_cv_pct: 5, discard_warmup: 1, placement: required}
+      baseline: true
+      reference: false
+    release:
+      floor: valid
+      requires: {qualification: current, clean: clean, min_repeats: 5, max_cv_pct: 3, discard_warmup: 1, placement: required}
+      baseline: true
+      reference: true
+    reference:
+      floor: valid
+      requires: {qualification: current, clean: enforced, min_repeats: 5, max_cv_pct: 2, discard_warmup: 2, placement: required}
+      baseline: true
+      reference: true
+    qualification:
+      description: "A/A probe runs that create qualification rows; they cannot require what they establish"
+      floor: unqualified_env
+      requires: {qualification: any, clean: clean, min_repeats: 5, max_cv_pct: 2, discard_warmup: 2, placement: required}
+      baseline: false
+      reference: false

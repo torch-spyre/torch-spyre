@@ -50,7 +50,8 @@ repos:
       - id: yamlfmt
         args: [--mapping, '2', --sequence, '4', --offset, '2', --preserve_null, --implicit_start]
         files: \.(yml|yaml)$
-        exclude: codegen/.*
+        # spyre-bench catalogs are read as YAML 1.1; yamlfmt strips the quotes that keep on/off/1 strings.
+        exclude: codegen/.*|extensions/spyre-bench/.*
   - repo: local
     hooks:
       - id: forbid-pytest-ini

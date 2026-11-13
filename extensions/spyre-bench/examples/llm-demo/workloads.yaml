@@ -1,0 +1,34 @@
+# yaml-language-server: $schema=../../spyre_bench/core/schemas/resources.schema.json
+# Reusable loads. A Workload names no System and no hardware; the SLO is case identity. Values are synthetic placeholders.
+apiVersion: bench/v1alpha1
+kind: Workload
+metadata: {name: trace-replay}
+spec:
+  type: llm/serve
+  endpoint: /v1/completions
+  load: {executor: closed, concurrency: 5, requests: 200, warmup_requests: 8}
+  output_len: -1
+  sampling: {temperature: 0.1, ignore_eos: true}
+  flags: {dataset-name: custom, disable-shuffle: true}
+---
+apiVersion: bench/v1alpha1
+kind: Workload
+metadata: {name: chat-slo, owner: example-team, description: "interactive chat"}
+spec:
+  type: llm/serve
+  card: chat
+  endpoint: /v1/completions
+  inputs: [{name: prompts, dataset: random-isl-osl}]
+  load: {executor: open, rate: inf, requests: 500}
+  slo: {llm.ttft.p99: {lte: 2.0s}, llm.tpot.p99: {lte: 50ms}}
+  flags: {dataset-name: random, ignore-eos: true}
+---
+apiVersion: bench/v1alpha1
+kind: Workload
+metadata: {name: serve-scenario-server, description: "scenario preset: the scenario fills the load block, explicit fields override"}
+spec:
+  type: llm/serve
+  scenario: server
+  endpoint: /v1/completions
+  inputs: [{name: prompts, dataset: trace-y, subset: stratified}]
+  slo: {llm.ttft.p99: {lte: 2.0s}, llm.tpot.p99: {lte: 0.2s}}

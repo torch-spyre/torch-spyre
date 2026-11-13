@@ -1,0 +1,46 @@
+# yaml-language-server: $schema=../../spyre_bench/core/schemas/resources.schema.json
+# Environments and NodeClasses are central: validate with --central examples/central.
+apiVersion: bench/v1alpha1
+kind: Project
+metadata: {name: kernel-demo}
+spec:
+  packs: [{name: kernel, version: "0.2"}, {name: spyre, version: "0.2"}]
+  default_suites: [ops]
+  default_environment: ref-1card
+  visibility: public
+  series_labels: [env.label.device.count, env.label.node.class]
+---
+apiVersion: bench/v1alpha1
+kind: Suite
+metadata: {name: ops}
+spec: {type: perf}
+---
+apiVersion: bench/v1alpha1
+kind: Suite
+metadata: {name: layer-sweep}
+spec: {type: perf}
+---
+apiVersion: bench/v1alpha1
+kind: Store
+metadata: {name: demo-store}
+spec: {type: core/artifactory, endpoint: {env: STORE_BASE_URL}, auth: {mode: token, refs: [{env: STORE_TOKEN}]}, visibility: internal}
+---
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata: {name: ops-extended-files}
+spec:
+  type: fileset
+  format: json
+  version: "2026.11"
+  license: Apache-2.0
+  visibility: internal
+  source: {store: demo-store, path: datasets/shape_set/ops-extended/2026.11}
+  integrity: {files: [{path: ops-extended.json, sha256: "2222222222222222222222222222222222222222222222222222222222222222"}]}
+---
+apiVersion: bench/v1alpha1
+kind: Dataset
+metadata: {name: ops-extended}
+spec:
+  asset: ops-extended-files
+  role: shapes
+  schema: {record: {op: string, shape: text}, id: {field: shape_id}}

@@ -1,0 +1,88 @@
+# yaml-language-server: $schema=../../spyre_bench/core/schemas/resources.schema.json
+# llm-demo: benchmarks/project.yaml. Suite order here is the catalogue and plan order.
+# Environments and NodeClasses are central: validate with --central examples/central.
+apiVersion: bench/v1alpha1
+kind: Project
+metadata: {name: llm-demo, owner: example-team}
+spec:
+  component: llm-demo
+  packs: [{name: llm-serving, version: "0.2"}, {name: spyre, version: "0.2"}]
+  default_suites: [decoder, encoder, startup, quality]
+  default_environment: ref-8card-one-node
+  visibility: public
+  groupings:
+    - {name: tier, ordered: true, cardinality: one, values: [sanity, core, extended]}
+    - {name: suite, ordered: false, cardinality: many}
+    - {name: headline, ordered: false, cardinality: one, values: ["true", "false"]}
+  series_labels: [env.label.device.count, env.label.node.class]
+---
+apiVersion: bench/v1alpha1
+kind: Suite
+metadata: {name: decoder, owner: example-team}
+spec: {type: perf}
+---
+apiVersion: bench/v1alpha1
+kind: Suite
+metadata: {name: encoder, owner: example-team}
+spec: {type: perf}
+---
+apiVersion: bench/v1alpha1
+kind: Suite
+metadata: {name: startup, owner: example-team}
+spec: {type: perf}
+---
+apiVersion: bench/v1alpha1
+kind: Suite
+metadata: {name: grid, description: "chat workload over a length grid at fixed SLOs"}
+spec: {type: perf, pr_selectable: false, requires_reference: true}
+---
+apiVersion: bench/v1alpha1
+kind: Suite
+metadata: {name: pinned, description: "pinned set run on a fixed reference subject, never the build under test"}
+spec: {type: perf, pr_selectable: false}
+---
+apiVersion: bench/v1alpha1
+kind: Suite
+metadata: {name: quality, owner: example-team}
+spec: {type: quality}
+---
+apiVersion: bench/v1alpha1
+kind: Selection
+metadata: {name: pinned@head}
+spec:
+  cases: [latency_pinned_demo-llm-c_tp1_in64_out64]
+  run: {max_minutes: 2, subject: pinned_ref}
+---
+apiVersion: bench/v1alpha1
+kind: Selection
+metadata: {name: release-parity, owner: example-team}
+spec:
+  cases: [serve_demoa_tp4_c5_all, serve_demoa_tp4_c5_trace-y]
+  run: {repeats_min: 5}
+---
+apiVersion: bench/v1alpha1
+kind: Selection
+metadata: {name: headline}
+spec:
+  selector: {types: [perf], groupings: {tier: {at_most: core}, headline: {eq: "true"}}}
+---
+apiVersion: bench/v1alpha1
+kind: Selection
+metadata: {name: sanity-with-reuse, description: "a stored result serves a PR when case, build and environment id all match"}
+spec:
+  selector: {types: [perf], groupings: {tier: {at_most: sanity}}}
+  reuse:
+    mode: if_valid
+    match: {case: exact, subject: exact, environment: id, validity: at_least_request, repeats: at_least_request}
+    force: []
+    grain: [result, asset, point]
+---
+apiVersion: bench/v1alpha1
+kind: Selection
+metadata: {name: nightly-reuse-by-label, description: "relaxed: any environment with the same device count"}
+spec:
+  selector: {types: [perf], groupings: {tier: {at_most: core}}}
+  reuse:
+    mode: prefer
+    match: {environment: {labels: [env.label.device.count]}}
+    max_age: 14d

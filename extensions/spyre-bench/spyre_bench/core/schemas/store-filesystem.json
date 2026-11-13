@@ -1,0 +1,16 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://schemas.bench.invalid/v1alpha1/types/store-filesystem.json",
+ "title": "core/filesystem",
+ "type": "object",
+ "additionalProperties": false,
+ "properties": {
+  "path": {
+   "type": "string",
+   "minLength": 1
+  }
+ },
+ "required": [
+  "path"
+ ]
+}

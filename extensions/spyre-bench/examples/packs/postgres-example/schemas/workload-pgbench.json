@@ -1,0 +1,35 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://schemas.bench.invalid/v1alpha1/packs/postgres-example/workload-pgbench.json",
+ "title": "pg/pgbench",
+ "type": "object",
+ "additionalProperties": false,
+ "properties": {
+  "script": {
+   "enum": [
+    "tpcb-like",
+    "simple-update",
+    "select-only",
+    "custom"
+   ]
+  },
+  "jobs": {
+   "type": "integer",
+   "minimum": 1
+  },
+  "protocol": {
+   "enum": [
+    "simple",
+    "extended",
+    "prepared"
+   ]
+  },
+  "progress_s": {
+   "type": "integer",
+   "minimum": 1
+  }
+ },
+ "required": [
+  "script"
+ ]
+}

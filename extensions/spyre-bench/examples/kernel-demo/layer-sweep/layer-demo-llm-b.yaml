@@ -1,0 +1,21 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+apiVersion: bench/v1alpha1
+kind: Benchmark
+metadata: {name: layer-demo-llm-b, description: "one decoder layer per sequence bucket (layer sweep)"}
+spec:
+  type: perf
+  level: layer
+  tier: core
+  system: kernel-demo-fp16
+  workload:
+    type: kernel/layer
+    model: example-org/demo-llm-b-instruct
+    layer: decoder
+    load: {executor: iterations, iterations: 20, warmup_iterations: 5}
+  run: {est: 5m}
+  matrix:
+    name_template: layer_demob_decoder_{bucket}
+    axes:
+      bucket:
+        - {token: b1-s512, patch: {workload: {bucket: [1, 512]}}}
+        - {token: b4-s2048, patch: {workload: {bucket: [4, 2048]}}}

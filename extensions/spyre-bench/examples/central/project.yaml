@@ -1,0 +1,8 @@
+# yaml-language-server: $schema=../../spyre_bench/core/schemas/resources.schema.json
+# Shared host classes and Environments, passed to every catalog with --central.
+apiVersion: bench/v1alpha1
+kind: Project
+metadata: {name: central, owner: example-team}
+spec:
+  packs: [{name: spyre, version: "0.2"}, {name: llm-serving, version: "0.2"}]
+  visibility: internal

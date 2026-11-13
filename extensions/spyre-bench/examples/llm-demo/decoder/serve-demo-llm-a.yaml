@@ -1,0 +1,78 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+# A Benchmark file is a TEMPLATE: the matrix expands into cases and a case id is its benchmark_id.
+apiVersion: bench/v1alpha1
+kind: System
+metadata: {name: demo-llm-a-tp4-fp16}
+spec:
+  type: llm/vllm
+  backend: spyre
+  token: demoa
+  model: demo-llm-a
+  precision: fp16
+  tp: 4
+  flags: {load-format: auto, max-model-len: 1000, max-num-seqs: 10, enable-chunked-prefill: true, enable-prefix-caching: true}
+  extensions:
+    spyre: {mode: a}
+---
+apiVersion: bench/v1alpha1
+kind: Benchmark
+metadata: {name: serve-demo-llm-a, owner: example-team}
+spec:
+  type: perf
+  level: service
+  tier: core
+  groupings: {headline: true}
+  system: demo-llm-a-tp4-fp16
+  workload: {base: trace-replay}
+  environment: ref-8card-one-node
+  metrics: {required: [llm.ttft.p99, llm.itl.median, llm.output_throughput], headline: [llm.itl.median]}
+  profile: {supported: ["off", light, full], default: "off", on_regression: full}
+  env: {DEMO_FLAG_A: 64, DEMO_FLAG_B: error}
+  run: {repeats: 3, cache: warm, isolation: session, timeout: 40m}
+  relations:
+    - {type: see_also, target: serve-grid-demo-llm-a}
+  matrix:
+    name_template: serve_{system.token}_tp{system.tp}_{concurrency}_{data}
+    axes:
+      concurrency: {path: workload.load.concurrency, values: [1, 5, 16], token: "c{}"}
+      data:
+        - token: all
+          patch: {tier: sanity, run: {est: 22m}, workload: {inputs: [{name: prompts, dataset: all-sequences, subset: smoke-200, expect: {records: 200}}]}}
+        - token: trace-x
+          patch: {tier: extended, run: {est: 25m}, workload: {inputs: [{name: prompts, dataset: trace-x, subset: smoke-200}]}}
+        - token: trace-y
+          patch: {run: {est: 25m}, workload: {inputs: [{name: prompts, dataset: trace-y, subset: smoke-200}]}}
+    exclude:
+      - {concurrency: c1, data: trace-x}
+      - {concurrency: c16, data: trace-x}
+---
+apiVersion: bench/v1alpha1
+kind: Expectation
+metadata: {name: itl-no-regression, owner: example-team, description: "median ITL must not get worse than the last 20 valid nightly/weekly/release runs of the same series"}
+spec:
+  selector: {benchmarks: [serve-demo-llm-a]}
+  metric: llm.itl.median
+  baseline:
+    kind: rolling
+    window: 20
+    min_n: 10
+    purposes: [nightly, weekly, release]
+    match: {environment: id}
+  tolerance: {pct: 5}
+  noise: {sigmas: 2, source: baseline_mad}
+  severity: gating
+---
+apiVersion: bench/v1alpha1
+kind: Expectation
+metadata: {name: ttft-p99-advisory, owner: example-team}
+spec:
+  selector: {benchmarks: [serve-demo-llm-a], groupings: {tier: {at_most: core}}}
+  metric: llm.ttft.p99
+  baseline:
+    kind: rolling
+    window: 20
+    min_n: 10
+    purposes: [nightly, weekly, release]
+    match: {environment: {labels: [env.label.device.count]}}
+  tolerance: {pct: 8}
+  noise: {sigmas: 2, source: series_cv}

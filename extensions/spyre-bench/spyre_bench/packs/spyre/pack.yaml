@@ -1,0 +1,37 @@
+# yaml-language-server: $schema=../../core/schemas/resources.schema.json
+# Spyre accelerator: device classes, node-class and System extensions, startup facts, qualification gates.
+apiVersion: bench/v1alpha1
+kind: Pack
+metadata: {name: spyre, owner: example-team}
+spec:
+  prefix: spyre
+  version: 0.2.0
+  requires: {core: "0.2"}
+  extensions:
+    - {for: NodeClass, schema: schemas/ext-nodeclass.json}
+    - {for: System, schema: schemas/ext-system.json}
+  vocabularies:
+    levels: [compile]
+  device_classes:
+    - name: spyre/pf
+      kind: accelerator
+      attributes:
+        - {name: spyre.profile, type: string, values: [a, b]}
+  attributes:
+    - {key: env.label.pool, class: label, role: root, type: enum, values: [a, b]}
+    - {key: env.label.device.count, class: label, role: root, type: int, order: numeric, plot: true}
+    - {key: env.label.node.class, class: label, role: root, type: string}
+    - {key: system.ext.spyre.mode, class: run, role: root, type: enum, values: [a, b], plot: true, stored_in: benchmark_runs.props}
+    - {key: system.ext.spyre.tag, class: run, role: root, type: string, stored_in: benchmark_runs.props}
+  metrics:
+    - {name: spyre.compiled_graphs, unit: "{graph}", direction: none, category: diagnostic, statistic: count, compare: exact}
+    - {name: spyre.compile.time, unit: s, direction: lower_is_better, category: performance, statistic: value, compare: relative}
+  resolvers:
+    - {name: spyre/artifact, produces: [subject.id, "subject.dep.<name>"]}
+  probes:
+    - {name: spyre-env, protocol: process/v1, command: [python3, -m, spyre_bench.spyre.probe],
+       produces: [env.fp.device.firmware, env.fp.device.driver]}
+  gates:
+    - {id: spyre.host_governor, phase: pre, reason: ENV_GOVERNOR, check: "env.fp.governor == NodeClass host_profile.governor"}
+    - {id: spyre.card_health, phase: pre, reason: CARD_UNHEALTHY}
+    - {id: spyre.node_qualified, phase: pre, reason: NODE_UNQUALIFIED, check: "qualification not expired (NodeClass.qualification.expiry_days)"}

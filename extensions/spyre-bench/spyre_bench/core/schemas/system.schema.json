@@ -1,0 +1,1484 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://schemas.bench.invalid/v1alpha1/system.schema.json",
+ "title": "bench/v1alpha1 System",
+ "type": "object",
+ "additionalProperties": false,
+ "properties": {
+  "apiVersion": {
+   "const": "bench/v1alpha1"
+  },
+  "kind": {
+   "const": "System"
+  },
+  "metadata": {
+   "type": "object",
+   "additionalProperties": false,
+   "properties": {
+    "name": {
+     "$ref": "#/$defs/name"
+    },
+    "description": {
+     "type": "string"
+    },
+    "owner": {
+     "$ref": "#/$defs/owner"
+    },
+    "labels": {
+     "$ref": "#/$defs/labels"
+    },
+    "tags": {
+     "$ref": "#/$defs/tags"
+    },
+    "links": {
+     "$ref": "#/$defs/links"
+    },
+    "annotations": {
+     "$ref": "#/$defs/annotations"
+    }
+   },
+   "required": [
+    "name"
+   ]
+  },
+  "spec": {
+   "type": "object",
+   "additionalProperties": true,
+   "properties": {
+    "base": {
+     "$ref": "#/$defs/name"
+    },
+    "patch": {
+     "type": "object"
+    },
+    "type": {
+     "$ref": "#/$defs/type_ref"
+    },
+    "token": {
+     "type": "string",
+     "pattern": "^[a-z0-9][a-z0-9.-]*$"
+    },
+    "backend": {
+     "type": "string",
+     "pattern": "^[a-z0-9][a-z0-9._-]*$"
+    },
+    "extensions": {
+     "$ref": "#/$defs/extensions"
+    }
+   },
+   "description": "configuration under test; typed. `backend` and `extensions` are unhashed (the comparison axis)"
+  }
+ },
+ "required": [
+  "apiVersion",
+  "kind",
+  "metadata",
+  "spec"
+ ],
+ "$defs": {
+  "name": {
+   "type": "string",
+   "pattern": "^[a-z0-9]([a-z0-9._@-]{0,126}[a-z0-9])?$"
+  },
+  "case_name": {
+   "type": "string",
+   "pattern": "^[a-z0-9][a-z0-9._=/,@-]{0,199}$",
+   "description": "label of a case; not identity (benchmark_id is derived)"
+  },
+  "type_ref": {
+   "type": "string",
+   "pattern": "^[a-z][a-z0-9]*/[a-z][a-z0-9-]*$",
+   "description": "<pack prefix>/<registered name>, e.g. llm/serve"
+  },
+  "prefix": {
+   "type": "string",
+   "pattern": "^[a-z][a-z0-9]{0,15}$"
+  },
+  "attr": {
+   "type": "string",
+   "pattern": "^[a-z][a-z0-9_]*(\\.[a-z0-9_<>-]+)+$",
+   "description": "registry key; <name> marks a variable segment"
+  },
+  "attr_glob": {
+   "type": "string",
+   "pattern": "^[a-z][a-z0-9_]*(\\.[a-z0-9_<>*-]+)*(\\.\\*)?$",
+   "description": "attribute key or glob over registry keys"
+  },
+  "metric": {
+   "type": "string",
+   "pattern": "^[a-z][a-z0-9_]*(\\.[a-z0-9_]+)+$"
+  },
+  "owner": {
+   "type": "string",
+   "pattern": "^[A-Za-z0-9][A-Za-z0-9-]*$|^<[a-z-]+>$"
+  },
+  "labels": {
+   "type": "object",
+   "additionalProperties": {
+    "type": "string",
+    "maxLength": 63
+   },
+   "description": "selector key/values"
+  },
+  "tags": {
+   "type": "array",
+   "items": {
+    "type": "string",
+    "pattern": "^[a-z0-9][a-z0-9_-]{0,62}$"
+   },
+   "description": "hashed into benchmark_id unless in a run-context namespace (platform__, testtype__, cadence__)"
+  },
+  "links": {
+   "type": "array",
+   "items": {
+    "type": "string",
+    "minLength": 1
+   }
+  },
+  "annotations": {
+   "type": "object",
+   "additionalProperties": {
+    "type": "string"
+   }
+  },
+  "arch": {
+   "enum": [
+    "x86_64",
+    "ppc64le",
+    "s390x",
+    "aarch64"
+   ]
+  },
+  "duration": {
+   "type": "string",
+   "pattern": "^[0-9]+(\\.[0-9]+)?(s|m|h|d)$",
+   "description": "e.g. 90s, 10m, 2h"
+  },
+  "env": {
+   "type": "object",
+   "additionalProperties": {
+    "anyOf": [
+     {
+      "type": "string"
+     },
+     {
+      "type": "number"
+     },
+     {
+      "type": "boolean"
+     }
+    ]
+   },
+   "description": "process environment knobs; run attributes"
+  },
+  "extensions": {
+   "type": "object",
+   "additionalProperties": {
+    "type": "object"
+   },
+   "description": "pack prefix -> block validated by that pack's extension schema for this kind"
+  },
+  "valref": {
+   "type": "object",
+   "additionalProperties": false,
+   "properties": {
+    "env": {
+     "type": "string"
+    },
+    "value": {
+     "type": "string"
+    }
+   },
+   "description": "a value or the name of an environment variable; never a secret"
+  },
+  "predicate": {
+   "type": "object",
+   "additionalProperties": false,
+   "properties": {
+    "field": {
+     "type": "string"
+    },
+    "eq": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "number"
+      },
+      {
+       "type": "boolean"
+      }
+     ]
+    },
+    "ne": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "number"
+      },
+      {
+       "type": "boolean"
+      }
+     ]
+    },
+    "gt": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "number"
+      },
+      {
+       "type": "boolean"
+      }
+     ]
+    },
+    "gte": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "number"
+      },
+      {
+       "type": "boolean"
+      }
+     ]
+    },
+    "lt": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "number"
+      },
+      {
+       "type": "boolean"
+      }
+     ]
+    },
+    "lte": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "number"
+      },
+      {
+       "type": "boolean"
+      }
+     ]
+    },
+    "in": {
+     "type": "array",
+     "items": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "number"
+       },
+       {
+        "type": "boolean"
+       }
+      ]
+     }
+    },
+    "notin": {
+     "type": "array",
+     "items": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "number"
+       },
+       {
+        "type": "boolean"
+       }
+      ]
+     }
+    },
+    "between": {
+     "type": "array",
+     "items": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "number"
+       },
+       {
+        "type": "boolean"
+       }
+      ]
+     },
+     "minItems": 2,
+     "maxItems": 2
+    },
+    "exists": {
+     "type": "boolean"
+    },
+    "matches": {
+     "type": "string"
+    },
+    "any": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/predicate"
+     },
+     "minItems": 1
+    },
+    "not": {
+     "$ref": "#/$defs/predicate"
+    }
+   },
+   "description": "structured filter predicate: {field, one op}, or {any: [...]}, or {not: {...}}"
+  },
+  "select": {
+   "type": "object",
+   "additionalProperties": false,
+   "properties": {
+    "from": {
+     "type": "string",
+     "description": "asset name inside the Dataset"
+    },
+    "files": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     }
+    },
+    "split": {
+     "type": "string"
+    },
+    "filter": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/predicate"
+     }
+    },
+    "columns": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     }
+    },
+    "order": {
+     "anyOf": [
+      {
+       "enum": [
+        "sequential"
+       ]
+      },
+      {
+       "type": "object",
+       "additionalProperties": false,
+       "properties": {
+        "shuffle": {
+         "type": "object",
+         "additionalProperties": false,
+         "properties": {
+          "seed": {
+           "type": "integer"
+          }
+         },
+         "required": [
+          "seed"
+         ]
+        }
+       },
+       "required": [
+        "shuffle"
+       ]
+      }
+     ]
+    },
+    "offset": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "limit": {
+     "type": "integer",
+     "minimum": 1
+    },
+    "sample": {
+     "type": "object",
+     "additionalProperties": false,
+     "properties": {
+      "n": {
+       "type": "integer",
+       "minimum": 1
+      },
+      "fraction": {
+       "type": "number",
+       "minimum": 0,
+       "maximum": 1
+      },
+      "seed": {
+       "type": "integer"
+      },
+      "stratify_by": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "seed"
+     ]
+    },
+    "ids": {
+     "type": "object",
+     "additionalProperties": false,
+     "properties": {
+      "file": {
+       "type": "string"
+      },
+      "sha256": {
+       "type": "string",
+       "pattern": "^[0-9a-f]{64}$"
+      }
+     },
+     "required": [
+      "file",
+      "sha256"
+     ]
+    },
+    "repeat": {
+     "enum": [
+      "none",
+      "cycle"
+     ]
+    }
+   },
+   "description": "pure function of (asset contents, select); every random operation carries a seed"
+  },
+  "input": {
+   "type": "object",
+   "additionalProperties": false,
+   "properties": {
+    "name": {
+     "$ref": "#/$defs/name"
+    },
+    "dataset": {
+     "$ref": "#/$defs/name"
+    },
+    "asset": {
+     "$ref": "#/$defs/name"
+    },
+    "model": {
+     "$ref": "#/$defs/name"
+    },
+    "subset": {
+     "type": "string",
+     "description": "named subset of the Dataset; inline select fields override it"
+    },
+    "select": {
+     "$ref": "#/$defs/select"
+    },
+    "expect": {
+     "type": "object",
+     "additionalProperties": false,
+     "properties": {
+      "records": {
+       "type": "integer",
+       "minimum": 0
+      },
+      "selection_digest": {
+       "type": "string",
+       "pattern": "^sha256:[0-9a-f]{64}$"
+      }
+     }
+    },
+    "digest": {
+     "enum": [
+      "off",
+      "on_expect",
+      "always"
+     ],
+     "description": "selection_digest policy; default on_expect"
+    },
+    "access": {
+     "enum": [
+      "path",
+      "reader"
+     ]
+    }
+   },
+   "required": [
+    "name"
+   ],
+   "description": "exactly one of dataset, asset, model"
+  },
+  "load": {
+   "type": "object",
+   "additionalProperties": false,
+   "properties": {
+    "executor": {
+     "enum": [
+      "closed",
+      "open",
+      "batch",
+      "iterations",
+      "ramp"
+     ]
+    },
+    "concurrency": {
+     "type": "integer",
+     "minimum": 1
+    },
+    "requests": {
+     "type": "integer",
+     "minimum": 1
+    },
+    "duration": {
+     "$ref": "#/$defs/duration"
+    },
+    "rate": {
+     "anyOf": [
+      {
+       "type": "number",
+       "minimum": 0
+      },
+      {
+       "const": "inf"
+      }
+     ]
+    },
+    "arrival": {
+     "enum": [
+      "poisson",
+      "uniform"
+     ]
+    },
+    "warmup": {
+     "$ref": "#/$defs/duration"
+    },
+    "warmup_requests": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "iterations": {
+     "type": "integer",
+     "minimum": 1
+    },
+    "warmup_iterations": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "stages": {
+     "type": "array",
+     "items": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+       "duration": {
+        "$ref": "#/$defs/duration"
+       },
+       "target": {
+        "type": "number",
+        "minimum": 0
+       }
+      },
+      "required": [
+       "duration",
+       "target"
+      ]
+     },
+     "minItems": 1
+    }
+   },
+   "required": [
+    "executor"
+   ],
+   "description": "closed {concurrency, requests|duration}; open {rate, requests|duration}; batch {requests}; iterations {iterations}; ramp {stages}"
+  },
+  "slo": {
+   "type": "object",
+   "additionalProperties": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+     "lte": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "string",
+        "pattern": "^[0-9]+(\\.[0-9]+)?(us|ms|s)$"
+       }
+      ]
+     },
+     "gte": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "string",
+        "pattern": "^[0-9]+(\\.[0-9]+)?(us|ms|s)$"
+       }
+      ]
+     }
+    }
+   },
+   "description": "metric name -> bound; hashed in base units"
+  },
+  "workload_inline": {
+   "type": "object",
+   "additionalProperties": true,
+   "properties": {
+    "base": {
+     "$ref": "#/$defs/name"
+    },
+    "patch": {
+     "type": "object"
+    },
+    "type": {
+     "$ref": "#/$defs/type_ref"
+    }
+   },
+   "description": "a named Workload extended with `patch`, or a typed inline spec"
+  },
+  "system_inline": {
+   "type": "object",
+   "additionalProperties": true,
+   "properties": {
+    "base": {
+     "$ref": "#/$defs/name"
+    },
+    "patch": {
+     "type": "object"
+    },
+    "type": {
+     "$ref": "#/$defs/type_ref"
+    }
+   }
+  },
+  "tier": {
+   "type": "string",
+   "pattern": "^[a-z][a-z0-9_]*$"
+  },
+  "groupings_value": {
+   "anyOf": [
+    {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "number"
+      },
+      {
+       "type": "boolean"
+      }
+     ]
+    },
+    {
+     "type": "array",
+     "items": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "number"
+       },
+       {
+        "type": "boolean"
+       }
+      ]
+     },
+     "minItems": 1
+    }
+   ]
+  },
+  "run": {
+   "type": "object",
+   "additionalProperties": false,
+   "properties": {
+    "cache": {
+     "enum": [
+      "warm",
+      "cold",
+      "both"
+     ]
+    },
+    "repeats": {
+     "type": "integer",
+     "minimum": 1
+    },
+    "isolation": {
+     "enum": [
+      "session",
+      "process"
+     ]
+    },
+    "timeout": {
+     "$ref": "#/$defs/duration"
+    },
+    "est": {
+     "$ref": "#/$defs/duration"
+    },
+    "runner": {
+     "type": "string",
+     "pattern": "^[a-z0-9]([a-z0-9._@-]{0,126}[a-z0-9])?$"
+    },
+    "seed": {
+     "type": "integer"
+    },
+    "fresh_cache": {
+     "type": "boolean"
+    }
+   },
+   "description": "run attributes: never identity; overridable at run time"
+  },
+  "profile": {
+   "type": "object",
+   "additionalProperties": false,
+   "properties": {
+    "supported": {
+     "type": "array",
+     "items": {
+      "enum": [
+       "off",
+       "light",
+       "full"
+      ]
+     },
+     "minItems": 1
+    },
+    "default": {
+     "enum": [
+      "off",
+      "light",
+      "full"
+     ]
+    },
+    "on_regression": {
+     "enum": [
+      "off",
+      "light",
+      "full"
+     ]
+    }
+   },
+   "description": "profile level is a run attribute: same benchmark_id at every level"
+  },
+  "metrics": {
+   "anyOf": [
+    {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/metric"
+     }
+    },
+    {
+     "type": "object",
+     "additionalProperties": false,
+     "properties": {
+      "required": {
+       "type": "array",
+       "items": {
+        "$ref": "#/$defs/metric"
+       }
+      },
+      "headline": {
+       "type": "array",
+       "items": {
+        "$ref": "#/$defs/metric"
+       }
+      }
+     }
+    }
+   ]
+  },
+  "relation": {
+   "type": "object",
+   "additionalProperties": false,
+   "properties": {
+    "type": {
+     "type": "string",
+     "pattern": "^([a-z_]+|[a-z][a-z0-9]*/[a-z][a-z0-9-]*)$"
+    },
+    "target": {
+     "type": "string",
+     "minLength": 1
+    },
+    "via": {
+     "type": "object",
+     "additionalProperties": false,
+     "properties": {
+      "decompose": {
+       "enum": [
+        "sum",
+        "max",
+        "mean"
+       ]
+      }
+     }
+    }
+   },
+   "required": [
+    "type",
+    "target"
+   ]
+  },
+  "patch": {
+   "type": "object",
+   "additionalProperties": false,
+   "properties": {
+    "tier": {
+     "$ref": "#/$defs/tier"
+    },
+    "groupings": {
+     "type": "object",
+     "additionalProperties": true,
+     "properties": {}
+    },
+    "system": {
+     "anyOf": [
+      {
+       "$ref": "#/$defs/name"
+      },
+      {
+       "$ref": "#/$defs/system_inline"
+      }
+     ]
+    },
+    "workload": {
+     "anyOf": [
+      {
+       "$ref": "#/$defs/name"
+      },
+      {
+       "$ref": "#/$defs/workload_inline"
+      }
+     ]
+    },
+    "environment": {
+     "$ref": "#/$defs/name"
+    },
+    "metrics": {
+     "$ref": "#/$defs/metrics"
+    },
+    "env": {
+     "$ref": "#/$defs/env"
+    },
+    "run": {
+     "$ref": "#/$defs/run"
+    },
+    "profile": {
+     "$ref": "#/$defs/profile"
+    }
+   },
+   "description": "JSON Merge Patch (RFC 7386) over the Benchmark spec"
+  },
+  "variant": {
+   "type": "object",
+   "additionalProperties": false,
+   "properties": {
+    "name": {
+     "$ref": "#/$defs/case_name"
+    },
+    "description": {
+     "type": "string"
+    },
+    "previous_names": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/case_name"
+     }
+    },
+    "tier": {
+     "$ref": "#/$defs/tier"
+    },
+    "groupings": {
+     "type": "object",
+     "additionalProperties": true,
+     "properties": {}
+    },
+    "system": {
+     "anyOf": [
+      {
+       "$ref": "#/$defs/name"
+      },
+      {
+       "$ref": "#/$defs/system_inline"
+      }
+     ]
+    },
+    "workload": {
+     "anyOf": [
+      {
+       "$ref": "#/$defs/name"
+      },
+      {
+       "$ref": "#/$defs/workload_inline"
+      }
+     ]
+    },
+    "environment": {
+     "$ref": "#/$defs/name"
+    },
+    "metrics": {
+     "$ref": "#/$defs/metrics"
+    },
+    "env": {
+     "$ref": "#/$defs/env"
+    },
+    "run": {
+     "$ref": "#/$defs/run"
+    },
+    "profile": {
+     "$ref": "#/$defs/profile"
+    }
+   },
+   "required": [
+    "name"
+   ]
+  },
+  "axis_value": {
+   "type": "object",
+   "additionalProperties": false,
+   "properties": {
+    "token": {
+     "type": "string",
+     "pattern": "^[a-z0-9][a-z0-9.-]*$"
+    },
+    "patch": {
+     "$ref": "#/$defs/patch"
+    }
+   },
+   "required": [
+    "token",
+    "patch"
+   ]
+  },
+  "axis_sweep": {
+   "type": "object",
+   "additionalProperties": false,
+   "properties": {
+    "path": {
+     "type": "string",
+     "pattern": "^[a-z_]+(\\.[A-Za-z0-9_-]+)+$",
+     "description": "dotted path into the patch"
+    },
+    "values": {
+     "type": "array",
+     "items": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "number"
+       },
+       {
+        "type": "boolean"
+       }
+      ]
+     },
+     "minItems": 1
+    },
+    "range": {
+     "type": "object",
+     "additionalProperties": false,
+     "properties": {
+      "from": {
+       "type": "number"
+      },
+      "to": {
+       "type": "number"
+      },
+      "step": {
+       "anyOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "string",
+         "pattern": "^x[0-9.]+$"
+        }
+       ]
+      }
+     },
+     "required": [
+      "from",
+      "to",
+      "step"
+     ],
+     "description": "numeric sweep; step N adds, step xK multiplies"
+    },
+    "token": {
+     "type": "string",
+     "description": "format, {} = value; default <axis>{}"
+    }
+   },
+   "required": [
+    "path"
+   ]
+  },
+  "matrix": {
+   "type": "object",
+   "additionalProperties": false,
+   "properties": {
+    "name_template": {
+     "type": "string",
+     "minLength": 1,
+     "description": "default <benchmark>/<axis>=<token>/..."
+    },
+    "axes": {
+     "type": "object",
+     "additionalProperties": {
+      "anyOf": [
+       {
+        "type": "array",
+        "items": {
+         "$ref": "#/$defs/axis_value"
+        },
+        "minItems": 1
+       },
+       {
+        "$ref": "#/$defs/axis_sweep"
+       }
+      ]
+     }
+    },
+    "exclude": {
+     "type": "array",
+     "items": {
+      "type": "object",
+      "additionalProperties": {
+       "type": "string"
+      }
+     }
+    }
+   },
+   "required": [
+    "axes"
+   ]
+  },
+  "selector": {
+   "type": "object",
+   "additionalProperties": false,
+   "properties": {
+    "suites": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/name"
+     }
+    },
+    "types": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     }
+    },
+    "levels": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     }
+    },
+    "workload_types": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/type_ref"
+     }
+    },
+    "tags": {
+     "$ref": "#/$defs/tags"
+    },
+    "groupings": {
+     "type": "object",
+     "additionalProperties": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+       "at_most": {
+        "anyOf": [
+         {
+          "type": "string"
+         },
+         {
+          "type": "number"
+         },
+         {
+          "type": "boolean"
+         }
+        ]
+       },
+       "at_least": {
+        "anyOf": [
+         {
+          "type": "string"
+         },
+         {
+          "type": "number"
+         },
+         {
+          "type": "boolean"
+         }
+        ]
+       },
+       "eq": {
+        "anyOf": [
+         {
+          "type": "string"
+         },
+         {
+          "type": "number"
+         },
+         {
+          "type": "boolean"
+         }
+        ]
+       },
+       "in": {
+        "type": "array",
+        "items": {
+         "anyOf": [
+          {
+           "type": "string"
+          },
+          {
+           "type": "number"
+          },
+          {
+           "type": "boolean"
+          }
+         ]
+        }
+       },
+       "any": {
+        "type": "array",
+        "items": {
+         "anyOf": [
+          {
+           "type": "string"
+          },
+          {
+           "type": "number"
+          },
+          {
+           "type": "boolean"
+          }
+         ]
+        }
+       }
+      }
+     }
+    }
+   },
+   "description": "AND of the given terms; groupings select on any Project grouping (at_most/at_least need an ordered one)"
+  },
+  "derive": {
+   "type": "object",
+   "additionalProperties": false,
+   "properties": {
+    "from": {
+     "$ref": "#/$defs/selector"
+    },
+    "per": {
+     "enum": [
+      "system"
+     ]
+    },
+    "name_template": {
+     "type": "string",
+     "minLength": 1
+    }
+   },
+   "required": [
+    "from",
+    "per",
+    "name_template"
+   ]
+  },
+  "selector_term": {
+   "type": "object",
+   "additionalProperties": false,
+   "properties": {
+    "attribute": {
+     "type": "string"
+    },
+    "eq": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "number"
+      },
+      {
+       "type": "boolean"
+      }
+     ]
+    },
+    "ne": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "number"
+      },
+      {
+       "type": "boolean"
+      }
+     ]
+    },
+    "gt": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "number"
+      },
+      {
+       "type": "boolean"
+      }
+     ]
+    },
+    "gte": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "number"
+      },
+      {
+       "type": "boolean"
+      }
+     ]
+    },
+    "lt": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "number"
+      },
+      {
+       "type": "boolean"
+      }
+     ]
+    },
+    "lte": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "number"
+      },
+      {
+       "type": "boolean"
+      }
+     ]
+    },
+    "in": {
+     "type": "array",
+     "items": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "number"
+       },
+       {
+        "type": "boolean"
+       }
+      ]
+     }
+    }
+   },
+   "description": "structured device selector"
+  },
+  "device_request": {
+   "type": "object",
+   "additionalProperties": false,
+   "properties": {
+    "name": {
+     "$ref": "#/$defs/name"
+    },
+    "device_class": {
+     "type": "string",
+     "pattern": "^[a-z0-9-]+/[a-z0-9-]+$"
+    },
+    "count": {
+     "type": "integer",
+     "minimum": 1,
+     "description": "default 1"
+    },
+    "per_node": {
+     "type": "boolean"
+    },
+    "selectors": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/selector_term"
+     }
+    }
+   },
+   "required": [
+    "name",
+    "device_class"
+   ]
+  },
+  "device_constraint": {
+   "type": "object",
+   "additionalProperties": false,
+   "properties": {
+    "match_attribute": {
+     "type": "string"
+    },
+    "requests": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/name"
+     },
+     "minItems": 1
+    },
+    "scope": {
+     "enum": [
+      "per_node",
+      "all"
+     ]
+    }
+   },
+   "required": [
+    "match_attribute",
+    "requests"
+   ]
+  },
+  "host_profile": {
+   "type": "object",
+   "additionalProperties": false,
+   "properties": {
+    "governor": {
+     "enum": [
+      "performance",
+      "powersave",
+      "schedutil",
+      "n/a"
+     ]
+    },
+    "turbo": {
+     "enum": [
+      "on",
+      "off",
+      "n/a"
+     ]
+    },
+    "smt": {
+     "type": "string"
+    },
+    "cstate_policy": {
+     "enum": [
+      "fixed",
+      "c1-only",
+      "default",
+      "n/a"
+     ]
+    },
+    "thp": {
+     "enum": [
+      "always",
+      "madvise",
+      "never"
+     ]
+    },
+    "numa_balancing": {
+     "enum": [
+      0,
+      1
+     ]
+    },
+    "cpu_quota_min_cores": {
+     "type": "number",
+     "minimum": 0
+    }
+   }
+  },
+  "store_inline": {
+   "type": "object",
+   "additionalProperties": true,
+   "properties": {
+    "type": {
+     "$ref": "#/$defs/type_ref"
+    }
+   },
+   "required": [
+    "type"
+   ]
+  },
+  "asset_source": {
+   "type": "object",
+   "additionalProperties": false,
+   "properties": {
+    "store": {
+     "anyOf": [
+      {
+       "$ref": "#/$defs/name"
+      },
+      {
+       "$ref": "#/$defs/store_inline"
+      }
+     ]
+    },
+    "path": {
+     "type": "string"
+    },
+    "uri": {
+     "type": "string"
+    },
+    "revision": {
+     "type": "string"
+    },
+    "config": {
+     "type": "string"
+    },
+    "split": {
+     "type": "string"
+    },
+    "generator": {
+     "type": "object",
+     "additionalProperties": false,
+     "properties": {
+      "tool": {
+       "type": "string",
+       "minLength": 1
+      },
+      "seed": {
+       "type": "integer"
+      },
+      "params": {
+       "type": "object"
+      }
+     },
+     "required": [
+      "tool",
+      "seed"
+     ]
+    }
+   },
+   "description": "exactly one of store+path, uri, generator"
+  }
+ }
+}

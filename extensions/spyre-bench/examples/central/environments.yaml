@@ -1,0 +1,62 @@
+# yaml-language-server: $schema=../../spyre_bench/core/schemas/resources.schema.json
+# An Environment is the REQUEST: devices, host and labels. A placer decides how to satisfy it.
+apiVersion: bench/v1alpha1
+kind: Environment
+metadata: {name: ref-8card-one-node, description: "eight PF cards in one group on a qualified reference node"}
+spec:
+  devices:
+    requests:
+      - {name: cards, device_class: spyre/pf, count: 8, selectors: [{attribute: spyre.profile, eq: a}]}
+  host: {node_class: x86-ref-pool, arch: x86_64, reference_node: true, exclusive: true}
+  labels: {device.count: 8, node.class: x86-ref-pool}
+  policy: {validity_floor: valid}
+---
+apiVersion: bench/v1alpha1
+kind: Environment
+metadata: {name: ref-8card-reference-clean, description: "reference/release purpose: clear the node via exclusive access, run clean, release"}
+spec:
+  base: ref-8card-one-node
+  patch: {host: {clean: {mode: wait, max_wait: 4h, max_hold: 3h}}}
+---
+apiVersion: bench/v1alpha1
+kind: Environment
+metadata: {name: ref-8card-pr, description: "PR purpose: ordinary CI, co-tenants are observed, not excluded"}
+spec:
+  base: ref-8card-one-node
+  patch: {host: {reference_node: false, exclusive: false}, policy: {validity_floor: shared_env}}
+---
+apiVersion: bench/v1alpha1
+kind: Environment
+metadata: {name: ref-1card, description: "one PF card; lists replace under patch, so the request is written in full"}
+spec:
+  base: ref-8card-one-node
+  patch:
+    devices:
+      requests:
+        - {name: cards, device_class: spyre/pf, count: 1, selectors: [{attribute: spyre.profile, eq: a}]}
+    labels: {device.count: 1}
+---
+apiVersion: bench/v1alpha1
+kind: Environment
+metadata: {name: cpu-2node, description: "multi-node, CPU only: the interconnect is part of what the case needs"}
+spec:
+  nodes: 2
+  devices:
+    requests:
+      - {name: sockets, device_class: cpu/socket, count: 1, per_node: true}
+    constraints:
+      - {match_attribute: cpu.cores, requests: [sockets], scope: per_node}
+  interconnect:
+    requests:
+      - {name: fabric, device_class: net/link, count: 1, selectors: [{attribute: net.gbps, gte: 10}]}
+  host: {node_class: x86-ref-pool, arch: x86_64, exclusive: true}
+  labels: {device.count: 0, node.class: x86-ref-pool}
+---
+apiVersion: bench/v1alpha1
+kind: Environment
+metadata: {name: shared-1card}
+spec:
+  devices: {requests: [{name: cards, device_class: spyre/pf, count: 1, selectors: [{attribute: spyre.profile, eq: a}]}]}
+  host: {node_class: x86-shared-pool, arch: x86_64, exclusive: true}
+  labels: {device.count: 1, node.class: x86-shared-pool}
+  policy: {validity_floor: shared_env}

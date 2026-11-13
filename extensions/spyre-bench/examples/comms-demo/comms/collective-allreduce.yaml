@@ -1,0 +1,37 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+# Intra-node collectives on a single-node environment.
+apiVersion: bench/v1alpha1
+kind: System
+metadata: {name: comms-demo-ws2}
+spec: {type: comms/collective-library, backend: spyre, token: ws2, library: lib-a, precision: fp16, world_size: 2}
+---
+apiVersion: bench/v1alpha1
+kind: System
+metadata: {name: comms-demo-ws4}
+spec: {base: comms-demo-ws2, token: ws4, patch: {world_size: 4}}
+---
+apiVersion: bench/v1alpha1
+kind: Benchmark
+metadata: {name: collective-allreduce, owner: example-team}
+spec:
+  type: perf
+  level: collective
+  tier: core
+  system: comms-demo-ws2
+  workload:
+    type: comms/collective
+    op: allreduce
+    algorithm: ring
+    protocol: proto-a
+    msg_bytes: 8388608
+    load: {executor: iterations, iterations: 100, warmup_iterations: 10}
+  run: {repeats: 3, timeout: 20m, est: 6m}
+  matrix:
+    name_template: collective_allreduce_{protocol}_ring_{system.token}_{size}
+    axes:
+      protocol:
+        - {token: proto-a, patch: {}}
+        - {token: proto-b, patch: {system: comms-demo-ws4, workload: {protocol: proto-b}, env: {DEMO_FLAG_B: 1}}}
+      size:
+        - {token: sz8m, patch: {tier: sanity}}
+        - {token: sz64m, patch: {workload: {msg_bytes: 67108864}}}
