@@ -674,8 +674,8 @@ class _SympyExprToCpSat(Printer):
 
     @classmethod
     def _push_into_byte_minmax(cls, expr):
-        """``Min(R, W) * D`` as ``Min(R * D, W * D)`` (``Max`` when the number in
-        front is negative), where D is the product's Min/Max factors over
+        """``c * Min(R, W) * D`` as ``sign(c) * Min(|c| * R * D, |c| * W * D)``,
+        where D is the product's Min/Max factors over
         quantized curves (the derates) and ``Min(R, W)`` its one other Min/Max
         (bytes): each operand is then a sum of terms times D, rather than a
         product of variables whose bounds compound."""
@@ -688,11 +688,7 @@ class _SympyExprToCpSat(Printer):
         (target,) = targets
         coefficient, _ = expr.as_coeff_Mul()
         rest = sympy.Mul(*(a for a in expr.args if a is not target)) / coefficient
-        func = type(target)
-        if coefficient < 0:
-            func = _LazyMax if isinstance(target, sympy.Min) else _LazyMin
-        elif func not in (_LazyMin, _LazyMax):
-            func = _LAZY[func]
+        func = _LAZY.get(type(target), type(target))
         return sympy.sign(coefficient) * func(
             *(
                 sympy.Add(
