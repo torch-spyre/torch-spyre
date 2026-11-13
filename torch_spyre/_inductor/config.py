@@ -339,8 +339,8 @@ ignore_span_overflow_hints: bool = (
 
 # Which lowering tiles span-overflow and allocator-driven groups. "legacy" is the
 # CoarseTileInfo transform; "plan" is wsr/loop_tiling_lowering.py, which builds
-# a LoopTilingPlan and keeps every advance in the index. The default moves to
-# "plan" when the new lowering is complete.
+# a LoopTilingPlan and keeps every advance in the index. "legacy" stays until
+# the CoarseTileInfo transform is deleted.
 def _choose_loop_tiling_lowering(value: str) -> str:
     if value not in ("legacy", "plan"):
         raise ValueError(
@@ -351,7 +351,7 @@ def _choose_loop_tiling_lowering(value: str) -> str:
 
 
 loop_tiling_lowering: str = _choose_loop_tiling_lowering(
-    os.environ.get("SPYRE_INDUCTOR_LOOP_TILING_LOWERING", "legacy")
+    os.environ.get("SPYRE_INDUCTOR_LOOP_TILING_LOWERING", "plan")
 )
 
 # Enable reduction-dim (Lk-style) coarse tiling. Defaults to enabled — this

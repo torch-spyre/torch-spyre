@@ -41,6 +41,7 @@ from torch_spyre._inductor.wsr.loop_tiling_lowering import (
 
 from utils_inductor import expects_raise
 from test_span_overflow_gate import (
+    _relative_error,
     CASES,
     MB,
     _forced_one_level,
@@ -106,7 +107,10 @@ def _built_beside_the_legacy_planner(into, *, regroup=None):
         into.append((positions, built, [int(c) for _, lv in groups for _, c in lv]))
         return legacy
 
-    with mock.patch.object(coarse_tile, "plan_coarse_tile_groups", spy):
+    with (
+        mock.patch.object(coarse_tile, "plan_coarse_tile_groups", spy),
+        config.patch({"loop_tiling_lowering": "legacy"}),
+    ):
         yield
 
 
@@ -185,7 +189,10 @@ def test_a_reduction_with_reduction_tiling_disabled_is_refused():
                 seen.append(str(error))
         return original(operations, groups)
 
-    with mock.patch.object(coarse_tile, "plan_coarse_tile_groups", spy):
+    with (
+        mock.patch.object(coarse_tile, "plan_coarse_tile_groups", spy),
+        config.patch({"loop_tiling_lowering": "legacy"}),
+    ):
         compile_span_overflow(fn, args, limit)
     assert seen and "enable_reduction_tiling" in seen[0], seen
 
@@ -237,7 +244,10 @@ def test_two_levels_are_refused():
 
     fn, shapes, limit, *_ = CASES["pointwise_copy_out"]
     args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
-    with mock.patch.object(coarse_tile, "plan_coarse_tile_groups", spy):
+    with (
+        mock.patch.object(coarse_tile, "plan_coarse_tile_groups", spy),
+        config.patch({"loop_tiling_lowering": "legacy"}),
+    ):
         compile_span_overflow(fn, args, limit)
     assert seen and "nested" in seen[0].lower(), seen
 
@@ -257,7 +267,10 @@ def test_the_group_index_counts_from_the_offset():
         )
         return original(operations, groups)
 
-    with mock.patch.object(coarse_tile, "plan_coarse_tile_groups", spy):
+    with (
+        mock.patch.object(coarse_tile, "plan_coarse_tile_groups", spy),
+        config.patch({"loop_tiling_lowering": "legacy"}),
+    ):
         compile_span_overflow(fn, args, limit)
     assert seen == [([0], [5])], seen
 
@@ -267,9 +280,9 @@ def test_the_switch_defaults_and_rejects_nonsense():
     assert config._choose_loop_tiling_lowering("legacy") == "legacy"
     with pytest.raises(ValueError, match="bogus"):
         config._choose_loop_tiling_lowering("bogus")
-    # Unset in the environment the default is the legacy lowering (until Task 9).
+    # Unset in the environment the default is the plan.
     if "SPYRE_INDUCTOR_LOOP_TILING_LOWERING" not in os.environ:
-        assert config.loop_tiling_lowering == "legacy"
+        assert config.loop_tiling_lowering == "plan"
 
 
 @expects_raise
@@ -468,3 +481,55 @@ def test_the_post_call_contract_is_kept_under_plan():
     assert any(n.startswith("coarse_tile_copy_") for n in plan), sorted(plan)
     assert all(joint for _, joint in plan.values()), plan
     assert any(symbols for symbols, _ in plan.values()), plan
+
+
+def _mixed_graph():
+    from for_each_tile_fixtures import split_m_fn
+
+    def fn(x, y, a, b):
+        return split_m_fn(x, y), a + b
+
+    shapes = [(256, 256), (256, 64), (4096, 1024), (4096, 1024)]
+    return fn, [_shaped(shape, seed) for seed, shape in enumerate(shapes)], 4 * MB
+
+
+def test_no_for_each_tile_op_has_a_loop_shim():
+    """A graph with a ``for_each_tile`` loop and a span-overflow loop, compiled under
+    the plan: each loop node holds one kind of record, the ``for_each_tile`` one a
+    ``CoarseTileInfo`` and the span-overflow one a ``LoopShim``, never the reverse."""
+    from test_span_overflow_loop_terms import _nodes_of
+
+    from torch_spyre._inductor.loop_info import CoarseTileInfo, LoopShim
+    from torch_spyre._inductor.loop_node import all_ops
+
+    fn, args, limit = _mixed_graph()
+    kinds: list[set] = []
+    original = passes._hand_off_loop_nodes
+
+    def spy(graph):
+        kinds.extend(
+            {type(getattr(op, "loop_info", None)) for op in all_ops(node.body)}
+            for node in _nodes_of(graph.operations)
+        )
+        return original(graph)
+
+    with (
+        mock.patch.object(passes, "_hand_off_loop_nodes", spy),
+        config.patch({"loop_tiling_lowering": "plan"}),
+    ):
+        compiled = compile_span_overflow(fn, args, limit)
+    assert sorted(map(sorted, ([t.__name__ for t in k] for k in kinds))) == [
+        ["CoarseTileInfo"],
+        ["LoopShim"],
+    ], kinds
+    assert CoarseTileInfo and LoopShim
+    x, y, a, b = (t.float() for t in args)
+    assert _relative_error(compiled.outputs, (x @ y, a + b)) < 2e-2
+
+
+def test_a_for_each_tile_loop_beside_a_span_overflow_loop_matches_legacy():
+    """The ``for_each_tile`` kernel is untouched by the setting."""
+    from test_loop_tiling_parity import _assert_parity
+
+    fn, args, limit = _mixed_graph()
+    _assert_parity(fn, args, limit)

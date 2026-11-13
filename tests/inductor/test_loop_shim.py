@@ -251,6 +251,9 @@ _BARE_ISINSTANCE_ALLOWED = {
     "wsr/for_each_tile_lowering.py": "for_each_tile ops are stamped at pass 0",
     # declines by design: it keeps a copy for an op without a complete address record
     "read_copy_elision.py": "keeps the copy for a shim consumer (decided)",
+    # patches the per-read lists a CoarseTileInfo consumer stores; a shim consumer
+    # keeps none, and its redirected read advances by its index
+    "wsr/coarse_tile.py": "_patch_consumers skips a LoopShim consumer on purpose",
 }
 
 
