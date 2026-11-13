@@ -136,14 +136,6 @@ class TestExplicitConversion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, run_eager=False)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "eager .to(torch.float16) on a spyre fp32 tensor returns values "
-            "that differ from the CPU result (#2847)"
-        ),
-    )
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_eager_to_dtype_fp32_to_fp16(self):
         """Eager fp32→fp16 cast on a Spyre tensor."""
@@ -194,15 +186,6 @@ class TestExplicitConversion(unittest.TestCase):
         self.assertEqual(fn(x).dtype, torch.float16)
         self.compare_with_cpu(fn, x, run_eager=False)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "the fp32 to fp16 cast leaves a staggered element arrangement and the "
-            "device-to-host copy reads it as standard, so the elements come back "
-            "permuted (#4393)"
-        ),
-    )
     def test_half_shortcut_value_correctness(self):
         """fp32.half() shortcut — FP32TODL16_OP path, SKIP #2205."""
         x = cached_randn((4, 64), dtype=torch.float32, differentiation="sc02_half")
@@ -221,15 +204,6 @@ class TestExplicitConversion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, run_eager=False)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "the fp32 to bf16 cast leaves a staggered element arrangement and the "
-            "device-to-host copy reads it as standard, so the elements come back "
-            "permuted (#4393)"
-        ),
-    )
     def test_bfloat16_shortcut_from_fp32_value_correctness(self):
         """fp32.bfloat16() uses FP32TODL16_OP, SKIP #2205."""
         x = cached_randn(
