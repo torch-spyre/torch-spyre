@@ -105,6 +105,7 @@ from .loop_node import (
     peel_non_members,
 )
 from . import loop_scheduler
+from .materialize_scalar_fill import materialize_scalar_fill
 from .dedup_constants import dedup_and_promote_constants
 from .read_copy_elision import elide_proven_read_copies
 from .materialize_hinted_views import materialize_hinted_views
@@ -304,6 +305,13 @@ class CustomPostPasses(_SpyreGraphPassPipeline):
     def __init__(self):
         super().__init__(
             [
+                # A scalar-valued indexed write (index_fill, scatter.value, ...)
+                # arrives as a stride-0 broadcast of a scalar_tensor, which has
+                # no memory for the indirect-access engine to read.  Rewrite it
+                # to a real `full` here, while the expand still carries its
+                # shape -- after lowering it is folded into an index expression
+                # and can only be rebuilt by hand (#2797).
+                materialize_scalar_fill,
                 # Undo the post-grad re-fusion of add(input, mm(a, b)) back into
                 # aten.addmm, so the resulting mul.Scalar alpha/beta nodes (whose
                 # constants are materialized later by the LoopLevel IR multi-ops
