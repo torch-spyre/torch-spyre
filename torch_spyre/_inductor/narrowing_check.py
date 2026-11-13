@@ -29,7 +29,6 @@ the compile, ``off`` skips the check.
 import os
 import warnings
 
-import torch
 from torch._guards import TracingContext
 
 from torch_spyre.ops.warning_types import DeclaredRangeNarrowedWarning
@@ -50,34 +49,16 @@ def _mode():
     return mode
 
 
-def declared_symbols(gm, example_inputs):
-    """Map the size symbol of every declared dim to its legal sizes.
+def declared_symbols(declared):
+    """Map each declared symbol's name to its legal sizes.
 
-    Dynamo hands ``compile_fx`` the real input tensors, which still carry the
-    declaration, and each graph placeholder's ``example_value`` holds the
-    symbolic shape. Pairing them links a symbol to its declared range.
+    ``declared`` is ``{symbol name: (min, max, granularity)}``, as
+    ``_declared_dims_of`` returns it for this compile.
     """
-    from torch_spyre import _C
-
-    get_reserved_dims = getattr(_C, "get_reserved_dims", None)
-    if get_reserved_dims is None:  # no dynamic= reservation in this build
-        return {}
-
-    placeholders = [n for n in gm.graph.nodes if n.op == "placeholder"]
-    result = {}
-    for node, t in zip(placeholders, example_inputs):
-        if not isinstance(t, torch.Tensor):
-            continue
-        decl = get_reserved_dims(t)
-        fake = node.meta.get("example_value")
-        if not decl or fake is None:
-            continue
-        for d, spec in decl.items():
-            size = fake.shape[d]
-            if isinstance(size, torch.SymInt):
-                legal = range(spec["min"], spec["max"] + 1, spec["granularity"])
-                result[size.node.expr] = list(legal)
-    return result
+    return {
+        name: list(range(lo, hi + 1, granularity))
+        for name, (lo, hi, granularity) in declared.items()
+    }
 
 
 def rejected_sizes(expr, sym_legal):
@@ -90,10 +71,10 @@ def rejected_sizes(expr, sym_legal):
     if len(expr.free_symbols) != 1:
         return None
     (sym,) = expr.free_symbols
-    if sym not in sym_legal:
+    if str(sym) not in sym_legal:
         return None
     bad = []
-    for n in sym_legal[sym]:
+    for n in sym_legal[str(sym)]:
         try:
             if not bool(expr.xreplace({sym: n})):
                 bad.append(n)
@@ -107,8 +88,11 @@ def _where(sloc):
     return sloc.maybe_user_loc or str(sloc).strip("()")
 
 
-def check_declared_ranges(gm, example_inputs):
-    """Report guards that split a declared range. Call after the compile."""
+def check_declared_ranges(declared):
+    """Report guards that split a declared range. Call after the compile.
+
+    ``declared`` is what ``_declared_dims_of`` returned for this compile.
+    """
     mode = _mode()
     if mode == "off":
         return
@@ -116,7 +100,7 @@ def check_declared_ranges(gm, example_inputs):
     shape_env = getattr(getattr(ctx, "fake_mode", None), "shape_env", None)
     if shape_env is None:
         return
-    sym_legal = declared_symbols(gm, example_inputs)
+    sym_legal = declared_symbols(declared)
     if not sym_legal:
         return
 

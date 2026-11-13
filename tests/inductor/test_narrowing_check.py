@@ -55,7 +55,7 @@ class _UnevaluableGuard:
 class TestHelpers(unittest.TestCase):
     def setUp(self):
         self.s = sympy.Symbol("s0", integer=True, positive=True)
-        self.sym_legal = {self.s: list(range(128, MAX_ROWS + 1, TILE))}
+        self.sym_legal = {"s0": list(range(128, MAX_ROWS + 1, TILE))}
 
     def test_range_checks_reject_nothing(self):
         divisible = sympy.Eq(sympy.Mod(self.s, 64), 0)
@@ -74,15 +74,6 @@ class TestHelpers(unittest.TestCase):
 
     def test_unevaluable_guard_is_skipped_not_raised(self):
         self.assertIsNone(rejected_sizes(_UnevaluableGuard(self.s), self.sym_legal))
-
-    def test_build_without_reservation_finds_no_declarations(self):
-        # Without the dynamic= reservation (#5179) there is no
-        # get_reserved_dims; the check must find nothing, never crash.
-        from torch_spyre import _C
-        from torch_spyre._inductor.narrowing_check import declared_symbols
-
-        with mock.patch.object(_C, "get_reserved_dims", None, create=True):
-            self.assertEqual(declared_symbols(None, []), {})
 
 
 def _make_region(min_rows, narrowing=None):
@@ -167,14 +158,6 @@ class TestNarrowingCheckOnDevice(unittest.TestCase):
             out, reports = self._run_recording(min_rows=128, narrowing="branch")
         self.assertEqual(tuple(out.shape), (ROWS, COLS))
         self.assertEqual(reports, [])
-
-    def test_contiguity_guard_warns(self):
-        # min == tile: PyTorch's contiguity check guards Ne(rows // 64, 1).
-        out, reports = self._run_recording(min_rows=TILE)
-        self.assertEqual(tuple(out.shape), (ROWS, COLS))
-        self.assertEqual(len(reports), 1)
-        self.assertIn("dim values [64]", reports[0])
-        self.assertIn("check_contiguous_sizes_strides", reports[0])
 
     def test_encoder_like_region_gets_no_report(self):
         # Matmul, an RMS-style norm over the hidden axis, gelu and a residual

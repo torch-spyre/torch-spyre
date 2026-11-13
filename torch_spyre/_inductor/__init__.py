@@ -291,7 +291,7 @@ def enable_spyre_compile_fx_wrapper():
                                     check_declared_ranges,
                                 )
 
-                                check_declared_ranges(gm, example_inputs)
+                                check_declared_ranges(declared)
                                 return compiled
                     finally:
                         _compile_state.in_spyre_compile = _prev_in_spyre
