@@ -2286,7 +2286,9 @@ def with_int64_fallback(fn, *args, convert_output=True):
     Args:
         fn: The lowering function to call
         *args: Arguments to pass to fn
-        convert_output: If True, convert output back to int64.
+        convert_output: If True, convert the output to the dtype the operands
+                       promote to: int64 when every operand is an integer,
+                       otherwise the float dtype (int64 - fp32 -> fp32).
                        Set to False for operations like div that should return float.
     """
     # Skip constants (int/float literals) that don't have get_dtype()
@@ -2322,8 +2324,14 @@ def with_int64_fallback(fn, *args, convert_output=True):
     output = fn(*[convert(x) for x in args])
 
     if convert_output:
-        # The ops served here combine integer values into integer values.
-        return to_dtype(output, torch.int64, skip_trunc=True)
+        result_dtype = _promoted_dtype(
+            *args, kind=ELEMENTWISE_TYPE_PROMOTION_KIND.NO_OPMATH
+        )
+        if result_dtype == torch.int64:
+            # Integer operands combine into an integer value.
+            return to_dtype(output, torch.int64, skip_trunc=True)
+        if output.get_dtype() != result_dtype:
+            return to_dtype(output, result_dtype)
 
     return output
 
@@ -2509,14 +2517,21 @@ def lower_mul(x, y):
 
 # NOTE (follow-up): int64 sub still goes through the fp32 round-trip in
 # with_int64_fallback, so unlike add/mul it is inexact above 2**24. The planned
-# fix is to rewrite ``x - alpha * y`` as ``x + (-alpha) * y`` so that int32/int64
-# sub reuses the native addi32toi32 / muli32toi32 path.
+# fix is to rewrite ``x - alpha * y`` as ``x + (-alpha) * y`` so that int64
+# sub reuses the native add/mul path, as int32 sub already does below.
 @register_spyre_lowering(
     torch.ops.aten.sub.Tensor,
     type_promotion_kind=None,
     broadcast=True,
 )
 def lower_sub(x, y, *, alpha=1):
+    result_dtype = _promoted_dtype(x, y, kind=ELEMENTWISE_TYPE_PROMOTION_KIND.NO_OPMATH)
+    if result_dtype == torch.int32:
+        # There is no subi32toi32 intrinsic: compute x + (-alpha) * y with the
+        # native addi32toi32 / muli32toi32 ops instead.
+        if isinstance(y, (int, float)):
+            return lowering.add(x, -alpha * y)
+        return lowering.add(x, lowering.mul(y, -alpha))
     if alpha != 1:
         alpha_tensor = lower_full(
             y.get_size(),
@@ -2555,16 +2570,16 @@ def _div_operand_dtypes(x, y):
       fp32 / fp32     | fp32      | fp32         | no
       fp16 / fp16     | fp16      | fp16         | no
       fp16 / fp32     | fp32      | fp32         | no
-      int32 / int32   | fp32      | int32        | yes (floor only)
-      int64 / int64   | fp32      | int64        | yes (floor only)
+      int32 / int32   | fp32      | int32        | yes (floor/trunc)
+      int64 / int64   | fp32      | int64        | yes (floor/trunc)
       int32 / fp32    | fp32      | fp32         | no
       int32 / fp16    | fp16      | fp16         | no (fp16 dominates)
       int64 / fp32    | fp32      | fp32         | no
       int64 / fp16    | fp16      | fp16         | no (fp16 dominates)
       bool / fp16     | fp16      | fp16         | no (fp16 dominates)
       bool / fp32     | fp32      | fp32         | no (fp32 dominates)
-      bool / int32    | fp32      | int32        | yes (floor only)
-      bool / int64    | fp32      | int64        | yes (floor only)
+      bool / int32    | fp32      | int32        | yes (floor/trunc)
+      bool / int64    | fp32      | int64        | yes (floor/trunc)
     """
     if not any(hasattr(v, "get_dtype") for v in (x, y)):
         return None, None
@@ -2598,7 +2613,13 @@ def _lower_div_impl(x, y, *, rounding_mode=None):
                              Emits ~20 realize() barriers for a tensor divisor
                              (~15 for a scalar divisor) — one per SDSC op; this
                              is the minimum required for the sign-aware correction.
-    - rounding_mode="trunc": not yet implemented (raises Unsupported).
+    - rounding_mode="trunc": comp_dtype for the correction arithmetic; cast back
+                             to result_dtype at the end (int inputs → int out).
+                             Runs the "floor" correction on |x| / |y|, where it
+                             needs no sign handling, then applies sign(x)*sign(y)
+                             by negation (exact). Emits ~18 realize() barriers
+                             for a tensor divisor (~15 for a scalar divisor,
+                             whose |y| and sign fold at compile time).
 
     The scalar-divisor sign optimisation (y < 0 fold) requires y to be a
     concrete Python int or float; sympy/symbolic scalars are not supported.
@@ -2608,6 +2629,9 @@ def _lower_div_impl(x, y, *, rounding_mode=None):
     if comp_dtype is not None:
         x = _convert_to_dtype(x, comp_dtype)
         y = _convert_to_dtype(y, comp_dtype)
+
+    aten_ge = lowering.lowerings[torch.ops.aten.ge.Tensor]
+    aten_lt = lowering.lowerings[torch.ops.aten.lt.Tensor]
 
     if rounding_mode == "floor":
         # All operands are now at comp_dtype (fp32 for integer inputs).
@@ -2651,8 +2675,6 @@ def _lower_div_impl(x, y, *, rounding_mode=None):
         #   rem_s <  0      => qf overestimated  by 1  (subtract 1)
         # The two conditions are mutually exclusive (rem_s < 0 and rem_s >= abs_y
         # cannot both hold), so at most one correction is applied per element.
-        aten_ge = lowering.lowerings[torch.ops.aten.ge.Tensor]
-        aten_lt = lowering.lowerings[torch.ops.aten.lt.Tensor]
         prod = _realized(lowering.mul(qf, y))
         rem = _realized(lowering.sub(x, prod))
         if hasattr(y, "get_dtype"):
@@ -2702,8 +2724,60 @@ def _lower_div_impl(x, y, *, rounding_mode=None):
         return qf
 
     elif rounding_mode == "trunc":
-        # TODO(PR#3610): implement trunc-mode floor-division
-        raise Unsupported("div with rounding_mode='trunc' is not yet implemented")
+        # trunc(x/y) = sign(x)*sign(y) * floor(|x| / |y|). Negation is exact, so
+        # the quotient is computed on magnitudes with the same residual correction
+        # as the "floor" branch, and the sign is applied last.
+        # Same barrier / built-in conventions as the "floor" branch; the same
+        # quotient-magnitude bound, residual-destruction and DL16 limits apply.
+        #
+        # With both operands non-negative, the floor branch's special cases go
+        # away:
+        #   - sign(|y|) = +1, so rem needs no normalisation (no rem_s / abs_y
+        #     select).
+        #   - |x| < |y| => the quotient is 0, never -1. If div rounds |x|/|y| up
+        #     to 1.0, then |y|/2 <= |x| < |y| and rem = |x| - |y| is exact
+        #     (Sterbenz) and negative, so under_est corrects it to 0.
+        #   - |x/y| underflowing floors to +0, which is already correct, so no
+        #     qf_initial < 0 restore is needed.
+        abs_x = _realized(lowering.abs(x))
+        if hasattr(y, "get_dtype"):
+            abs_y = _realized(lowering.abs(y))
+        else:
+            # y is a Python scalar: fold |y| and its sign at compile time.
+            assert isinstance(y, (int, float)), (
+                f"_lower_div_impl: scalar divisor must be int or float, got {type(y)}"
+            )
+            abs_y = -y if y < 0 else y
+        qf = _realized(lowering.div(abs_x, abs_y))
+        qf = _realized(lowering.floor(qf))
+        # Residual via multiply-subtract (exact), as in the "floor" branch.
+        # Correct truncation of magnitudes satisfies 0 <= rem < abs_y.
+        prod = _realized(lowering.mul(qf, abs_y))
+        rem = _realized(lowering.sub(abs_x, prod))
+        over_est = _realized(aten_ge(rem, abs_y))
+        under_est = _realized(aten_lt(rem, 0.0))
+        qf_plus1 = _realized(lowering.add(qf, 1.0))
+        qf = _realized(lowering.where(over_est, qf_plus1, qf))
+        # qf_minus1 must derive from the UPDATED qf, so the two corrections
+        # compose instead of the second silently discarding the first.
+        qf_minus1 = _realized(lowering.sub(qf, 1.0))
+        qf = _realized(lowering.where(under_est, qf_minus1, qf))
+        # Apply sign(x)*sign(y) as two selects rather than a bool ne(x<0, y<0).
+        # Do not test mul(x, y) < 0: the product can underflow to 0 or overflow.
+        # On device, negating qf = +0 gives +0.0, so e.g. -1.0 / 2.0 (trunc) is
+        # 0.0 where CPU gives -0.0 (same as lower_trunc). The values compare
+        # equal; only signbit differs.
+        x_neg = _realized(aten_lt(x, 0.0))
+        qf = _realized(lowering.where(x_neg, _realized(lowering.neg(qf)), qf))
+        if hasattr(y, "get_dtype"):
+            y_neg = _realized(aten_lt(y, 0.0))
+            qf = _realized(lowering.where(y_neg, _realized(lowering.neg(qf)), qf))
+        elif y < 0:
+            qf = _realized(lowering.neg(qf))
+        # Cast back to result_dtype (e.g. fp32 → int32/int64 for integer inputs).
+        if result_dtype is not None and result_dtype != comp_dtype:
+            return to_dtype(qf, result_dtype, skip_trunc=True)
+        return qf
 
     else:
         # rounding_mode=None (true division): result is always comp_dtype (float),

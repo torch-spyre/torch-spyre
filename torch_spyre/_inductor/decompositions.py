@@ -36,6 +36,8 @@ from torch._prims_common import (
     ELEMENTWISE_TYPE_PROMOTION_KIND,
     canonicalize_dim,
     elementwise_dtypes,
+    NumberType,
+    TensorLikeType,
 )
 
 from .constants import DEVICE_NAME, FP8_E4M3FN_MAX, FP8_E4M3FN_MIN
@@ -1762,12 +1764,39 @@ def logical_not_decomp(input: torch.Tensor) -> torch.Tensor:
 
 @register_spyre_decompositions([torch.ops.aten.sign.default])
 def spyre_sign(input: torch.Tensor) -> torch.Tensor:
-    zero = torch.zeros_like(input)
-    return torch.where(
-        torch.gt(input, zero),
-        torch.ones_like(input),
-        torch.where(torch.lt(input, zero), -torch.ones_like(input), zero),
-    )
+    if input.dtype.is_complex:
+        raise NotImplementedError("sign is not supported for complex inputs")
+
+    if input.dtype == torch.bool:
+        return input.clone()
+
+    if not input.dtype.is_floating_point:
+        # Exact for integers, and needs no cast: a cast to a float dtype gives
+        # the operand a layout that cannot be mixed with the comparison's
+        # other operand ("Multi-arg pointwise with mixed EA").
+        return torch.clamp(input, -1, 1)
+
+    zeros = torch.zeros_like(input)
+    pos = torch.gt(input, zeros).to(input.dtype)
+    neg = torch.lt(input, zeros).to(input.dtype)
+    return pos - neg
+
+
+@register_spyre_decompositions([torch.ops.aten.signbit.default])
+def spyre_signbit(input: torch.Tensor) -> torch.Tensor:
+    """Implements signbit without support for -0.0.
+
+    Without bitwise operations, the sign of -0.0 can be detected on CPU with
+    torch.reciprocal(-0.0), because it returns -inf and -inf < 0.0 is True.
+    On Spyre it returns inf, so signbit(-0.0) is False here, not True.
+    """
+    if input.dtype.is_complex:
+        raise NotImplementedError("signbit is not supported for complex inputs")
+
+    if input.dtype == torch.bool:
+        return torch.zeros_like(input)
+
+    return torch.lt(input, 0)
 
 
 ###############################################################################
@@ -2897,6 +2926,12 @@ def spyre_amin_decomp(
 
 @register_spyre_decompositions([torch.ops.aten.ceil.default])
 def spyre_ceil(input: torch.Tensor) -> torch.Tensor:
+    if input.dtype.is_complex:
+        raise NotImplementedError("ceil is not supported for complex inputs")
+
+    if not input.dtype.is_floating_point:
+        return input.clone()
+
     return torch.ops.aten.neg.default(
         torch.ops.aten.floor.default(torch.ops.aten.neg.default(input))
     )
@@ -3995,6 +4030,41 @@ def spyre_flip(input: torch.Tensor, dims: Sequence[int]) -> torch.Tensor:
     # aten.flip always returns a fresh tensor; clone so the no-op case does
     # not alias its input.
     return out if reversed_any else out.clone()
+
+
+def _promote_bool_dividend(
+    a: TensorLikeType | NumberType, b: TensorLikeType | NumberType
+) -> TensorLikeType | NumberType:
+    """Cast a bool tensor dividend to the result dtype: x - q * y rejects bool."""
+    if isinstance(a, torch.Tensor) and a.dtype == torch.bool:
+        return a.to(torch.result_type(a, b))
+    return a
+
+
+@register_spyre_decompositions([torch.ops.aten.fmod.Tensor, torch.ops.aten.fmod.Scalar])
+def spyre_fmod(
+    a: TensorLikeType | NumberType, b: TensorLikeType | NumberType
+) -> torch.Tensor:
+    a = _promote_bool_dividend(a, b)
+    return a - torch.div(a, b, rounding_mode="trunc") * b
+
+
+@register_spyre_decompositions(
+    [
+        torch.ops.aten.remainder.Tensor,
+        torch.ops.aten.remainder.Scalar,
+        torch.ops.aten.remainder.Scalar_Tensor,
+    ]
+)
+def spyre_remainder(
+    a: TensorLikeType | NumberType, b: TensorLikeType | NumberType
+) -> torch.Tensor:
+    if not isinstance(a, torch.Tensor):
+        # Scalar_Tensor (``5 % x``): torch.div takes no scalar dividend, so
+        # broadcast it to the divisor's shape in the promoted dtype.
+        a = torch.full_like(b, a, dtype=torch.result_type(a, b))
+    a = _promote_bool_dividend(a, b)
+    return a - torch.div(a, b, rounding_mode="floor") * b
 
 
 @register_spyre_decompositions(

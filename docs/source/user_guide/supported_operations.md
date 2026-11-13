@@ -60,6 +60,7 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 | `torch.trunc` | Y | Y | Spyre | Custom lowering `floor(\|x\|) * clip(x, -1, 1)`, since the device has no native trunc op; a negative fraction gives `0.0`, not `-0.0` |
 | `torch.ceil` | Y | Y | Spyre | Custom decomposition |
 | `torch.sign` | Y | Y | Spyre | Custom decomposition |
+| `torch.signbit` | Y | Y | Spyre | Custom decomposition; `signbit(-0.0)` gives `False`, since the device cannot tell `-0.0` from `0.0` |
 | `torch.logical_not` | Y | Y | Spyre | Custom decomposition |
 | `torch.bitwise_not` | Y | Y | Spyre | Custom decomposition |
 | `torch.sin` | Y | Y | Spyre | Custom decomposition (Cody-Waite range reduction + degree-9 Taylor); max abs error ~5e-5 in fp32 |
@@ -71,8 +72,10 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 | `torch.add` | Y | Y | Spyre | Supports `alpha` parameter; int32/int64 run natively via `addi32toi32` |
 | `torch.sub` | Y | Y | Spyre | Supports `alpha` parameter |
 | `torch.mul` | Y | Y | Spyre | int32/int64 run natively via `muli32toi32` |
-| `torch.div` / `torch.true_divide` | Y | Y | Spyre | `rounding_mode="floor"` supported with limits: quotient magnitude ≤1024 (fp16) or ≤2²⁴ (fp32); ~2.7% fp16 residual-blinding class (#5605); DL16 host input rounding applies. `rounding_mode="trunc"` not yet implemented (#3610). |
+| `torch.div` / `torch.true_divide` | Y | Y | Spyre | `rounding_mode="floor"` supported with limits: quotient magnitude ≤1024 (fp16) or ≤2²⁴ (fp32); ~2.7% fp16 residual-blinding class (#5605); DL16 host input rounding applies. `rounding_mode="trunc"` supported with the same limits; computed as `sign(x)·sign(y)·floor(\|x\|/\|y\|)`; a zero quotient with operands of opposite sign gives `0.0`, not `-0.0` as on CPU. Zero and near-zero divisors are not tested for trunc and may differ from CPU. |
 | `torch.floor_divide` | Y | Y | Spyre | Alias for `torch.div(..., rounding_mode="floor")`; same limits apply. |
+| `torch.fmod` | Y | Y | Spyre | Custom decomposition `x - div(x, y, rounding_mode="trunc") * y`, so the trunc-division limits apply: quotient magnitude ≤1024 (fp16) or ≤2²⁴ (fp32) and the fp16 residual-blinding class (#5605), where a quotient off by one shifts the result by `\|y\|`. Exact for integer inputs and for integer-valued float inputs of magnitude ≤1024 (fp16) or ≤2²⁴ (fp32); otherwise about two ulps of `max\|x\|`. Zero and near-zero divisors are not tested and may differ from CPU. |
+| `torch.remainder` | Y | Y | Spyre | Custom decomposition `x - div(x, y, rounding_mode="floor") * y`; same limits and accuracy as `torch.fmod`. A Python scalar dividend (`5 % x`, `torch.remainder(5, x)`) is broadcast to the divisor's shape first. |
 | `torch.maximum` | Y | Y | Spyre | |
 | `torch.minimum` | Y | Y | Spyre | |
 | `torch.bitwise_and` | Y | Y | Spyre | Custom decomposition; boolean inputs run on Spyre (`logical_and`), integer inputs decompose through `bitwise_or`, which falls back to CPU |
