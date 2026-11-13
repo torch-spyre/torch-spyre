@@ -2294,8 +2294,10 @@ class TestSympyExprToCpSatPrinter(TestCase):
             model.add_element(selectors[owner], raw, var)
             sym_map[name] = var
             buffer_map[name] = wrappers[owner], raw
-        printer = _SympyExprToCpSat(model, dict(sym_map), buffer_map)
-        conventional = _SympyExprToCpSat(model, dict(sym_map), buffer_map)
+        # Terms over several menus are printed, not taken as one table.
+        with config.patch({"cpsat_max_table_entries": 1}):
+            printer = _SympyExprToCpSat(model, dict(sym_map), buffer_map)
+            conventional = _SympyExprToCpSat(model, dict(sym_map), buffer_map)
         with mock.patch.object(conventional, "_division_table", return_value=None):
             expected = [conventional.convert(expr) for expr in expressions]
         actual = [printer.convert(expr) for expr in expressions]
@@ -2369,6 +2371,75 @@ class TestSympyExprToCpSatPrinter(TestCase):
         )
         self.assertIsNone(printer._division_table(1e-6 * x))
         self.assertEqual(len(model.proto.variables), count)
+
+    def test_a_piecewise_term_over_one_division_is_a_table(self):
+        x = sympy.Symbol("split_x", integer=True, positive=True)
+        menu = [1, 2, 4, 8]
+        model = cp_model.CpModel()
+        division = model.new_int_var(0, len(menu) - 1, "division")
+        var = model.new_int_var(1, 8, "split_x")
+        model.add_element(division, menu, var)
+        printer = _SympyExprToCpSat(
+            model,
+            {"split_x": var},
+            {"split_x": (types.SimpleNamespace(division=division), menu)},
+        )
+        term = sympy.Piecewise((1000 / x + sympy.floor(10 / x), x > 1), (7, True))
+        lowered = printer.convert(term)
+        names = [v.name for v in model.proto.variables]
+        self.assertEqual(sum(n.startswith("term_table_") for n in names), 1, names)
+        for i, value in enumerate(menu):
+            with self.subTest(split=value):
+                fixed = model.clone()
+                fixed.add(division == i)
+                solver = cp_model.CpSolver()
+                self.assertEqual(solver.solve(fixed), cp_model.OPTIMAL)
+                self.assertAlmostEqual(
+                    solver.float_value(lowered), float(term.subs(x, value))
+                )
+
+    def test_a_term_over_a_division_and_a_literal_is_a_gated_table_per_value(self):
+        x, resident = sympy.symbols("split_x resident", integer=True, positive=True)
+        menu = [1, 2, 4, 8]
+        # One term: a product, which convert() does not split.
+        term = (sympy.Max(512 / x, 96) + sympy.floor(30 / x) * resident) * (
+            2 - resident
+        )
+
+        def lower(limit):
+            model = cp_model.CpModel()
+            division = model.new_int_var(0, len(menu) - 1, "division")
+            var = model.new_int_var(1, 8, "split_x")
+            model.add_element(division, menu, var)
+            lit = model.new_bool_var("resident")
+            with config.patch({"cpsat_max_table_entries": limit}):
+                printer = _SympyExprToCpSat(
+                    model,
+                    {"split_x": var, "resident": lit},
+                    {"split_x": (types.SimpleNamespace(division=division), menu)},
+                )
+            lowered = printer.convert(term)
+            names = [v.name for v in model.proto.variables]
+            return model, division, lit, lowered, names
+
+        model, division, lit, lowered, names = lower(2 * len(menu))
+        # One table over the division per value of the literal, gated on it.
+        self.assertEqual(sum(n.startswith("term_table_") for n in names), 2, names)
+        self.assertEqual(sum(n.startswith("_term_gate_") for n in names), 2, names)
+        for (i, value), flag in itertools.product(enumerate(menu), (0, 1)):
+            with self.subTest(split=value, resident=flag):
+                fixed = model.clone()
+                fixed.add(division == i)
+                fixed.add(lit == flag)
+                solver = cp_model.CpSolver()
+                self.assertEqual(solver.solve(fixed), cp_model.OPTIMAL)
+                self.assertAlmostEqual(
+                    solver.float_value(lowered),
+                    float(term.subs({x: value, resident: flag})),
+                )
+        # Past the limit the term is rewritten and printed instead.
+        *_, names = lower(2 * len(menu) - 1)
+        self.assertFalse(any(n.startswith("term_table_") for n in names), names)
 
     def test_shared_load_penalty_lowers_for_product_degrees(self):
         from torch_spyre._inductor.work_division import _matmul_multicast_penalty
@@ -2618,6 +2689,13 @@ class TestSympyExprToCpSatPrinter(TestCase):
         return solver.ObjectiveValue(), model
 
     @staticmethod
+    def _scale_of(name, values):
+        # A term over one buffer is tabulated before the rewrite, so the scale
+        # an ``inv_`` symbol takes in the rewritten terms is checked directly.
+        printer = _SympyExprToCpSat(cp_model.CpModel(), {}, {name: (None, values)})
+        return printer._inv_scale(name)
+
+    @staticmethod
     def _domain_of(model, name):
         (var,) = [v for v in model.proto.variables if v.name == name]
         return min(var.domain), max(var.domain)
@@ -2638,8 +2716,8 @@ class TestSympyExprToCpSatPrinter(TestCase):
             k_i, a_i, b_i = (menus[n][i] for n in ("split_k", "split_a", "split_b"))
             exact = 1000 * k_i / (a_i * b_i)
             self.assertAlmostEqual(got, exact, delta=1e-6 * exact)
-        self.assertEqual(self._domain_of(model, "inv_split_a"), (1, 8))
-        self.assertEqual(self._domain_of(model, "inv_split_b"), (1, 6))
+        self.assertEqual(self._scale_of("split_a", menus["split_a"]), 8)
+        self.assertEqual(self._scale_of("split_b", menus["split_b"]), 6)
 
     def test_inverse_scale_keeps_magnitude_through_full_product(self):
         # Three or more inverses covering every split of a buffer collapse into
@@ -2657,9 +2735,8 @@ class TestSympyExprToCpSatPrinter(TestCase):
             )
             cores = menus["split_a"][i] * menus["split_b"][i] * menus["split_c"][i]
             self.assertAlmostEqual(got, 1000 / cores, delta=1e-6 * 1000 / cores)
-        # Core counts [1, 6, 8, 6] -> LCM 24, values 24 // cores.
-        name = "inv__product_split_a_split_b_split_c"
-        self.assertEqual(self._domain_of(model, name), (3, 24))
+        # Core counts [1, 6, 8, 6] -> LCM 24.
+        self.assertEqual(self._scale_of("_product", [1, 6, 8, 6]), 24)
 
     def test_inverse_scale_falls_back_past_cap(self):
         # 7 * 11 * 13 = 1001 fits under the cap and stays exact. 7 * 11 * 17 =
@@ -2670,9 +2747,7 @@ class TestSympyExprToCpSatPrinter(TestCase):
         under_cap_values = [1, 7, 11, 13]
         lcm_scale = 7 * 11 * 13
         _, model = self._pinned_split_cost(1 / a, {"split_a": under_cap_values}, 0)
-        self.assertEqual(
-            self._domain_of(model, "inv_split_a"), (lcm_scale // 13, lcm_scale)
-        )
+        self.assertEqual(self._scale_of("split_a", under_cap_values), lcm_scale)
 
         over_cap_values = [1, 7, 11, 17]
         fallback_scale = 5 * 7 * 17
@@ -2681,12 +2756,11 @@ class TestSympyExprToCpSatPrinter(TestCase):
         got, model = self._pinned_split_cost(
             numerator / a, {"split_a": over_cap_values}, pinned
         )
-        self.assertEqual(
-            self._domain_of(model, "inv_split_a"),
-            (fallback_scale // 17, fallback_scale),
-        )
-        # 7 divides the fallback scale, so the pinned division is priced exactly.
-        self.assertAlmostEqual(got, numerator / 7)
+        self.assertEqual(self._scale_of("split_a", over_cap_values), fallback_scale)
+        # The term is one table: no exact integer levels for these values, so
+        # it is rounded against its span, off by at most half a level.
+        step = (numerator - numerator / 17) / _MAX_PRODUCT_BOUND
+        self.assertAlmostEqual(got, numerator / 7, delta=step / 2)
 
     @staticmethod
     def _lin_max_operand_sizes(model):
@@ -2712,7 +2786,9 @@ class TestSympyExprToCpSatPrinter(TestCase):
             expr = minmax(reads, writes)
             model = cp_model.CpModel()
             sym_map = {x.name: model.new_int_var(0, 1, x.name) for x in lits}
-            cp_expr = _SympyExprToCpSat(model, dict(sym_map), {}).convert(expr)
+            # Too wide to tabulate, as the cost model's turnaround term is.
+            with config.patch({"cpsat_max_table_entries": 1}):
+                cp_expr = _SympyExprToCpSat(model, dict(sym_map), {}).convert(expr)
             sizes = self._lin_max_operand_sizes(model)
             self.assertTrue(sizes)
             self.assertLessEqual(max(sizes), 1, sizes)
