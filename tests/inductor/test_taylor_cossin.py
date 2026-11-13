@@ -467,10 +467,9 @@ _DEVICE_INTEGRAL_DTYPES = [
         id="bool",
         marks=pytest.mark.xfail(
             strict=True,
-            raises=AssertionError,
-            reason="the float32 result is staggered and read back without "
-            "restoring its order (#4393), and its 17-wide rows are not padded to "
-            "whole stick pairs (#3999)",
+            raises=RuntimeError,
+            reason="D2H requires whole stick pairs along the stick dimension; "
+            "bool promotion to fp32 produces a single partial stick (#5361)",
         ),
     ),
 ]
