@@ -52,6 +52,7 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 | `torch.neg` | Y | Y | Spyre | |
 | `torch.exp` | Y | Y | Spyre | |
 | `torch.log` | Y | Y | Spyre | |
+| `torch.log1p` | Y | Y | Spyre | |
 | `torch.sqrt` | Y | Y | Spyre | |
 | `torch.rsqrt` | Y | Y | Spyre | |
 | `torch.reciprocal` | Y | Y | Spyre | |

@@ -600,6 +600,7 @@ COMPILED_OPS = [
     aten.index_select,
     aten.index_copy.out,
     aten.log,
+    aten.log1p,
     aten.mean,
     aten.mul,
     aten.reciprocal,

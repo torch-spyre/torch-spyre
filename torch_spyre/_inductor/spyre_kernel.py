@@ -295,6 +295,10 @@ class SpyreOpFuncs:
         return PointwiseOp("log", [x])
 
     @staticmethod
+    def log1p(x):
+        return PointwiseOp("log1p", [x])
+
+    @staticmethod
     def logical_and(x, y):
         return PointwiseOp("mul", [x, y])
 
