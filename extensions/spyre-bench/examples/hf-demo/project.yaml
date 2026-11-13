@@ -1,0 +1,82 @@
+# yaml-language-server: $schema=../../spyre_bench/core/schemas/resources.schema.json
+# Environments and NodeClasses are central: validate with --central examples/central.
+apiVersion: bench/v1alpha1
+kind: Project
+metadata: {name: hf-demo}
+spec:
+  packs: [{name: llm-serving, version: "0.2"}, {name: spyre, version: "0.2"}]
+  default_suites: [hf-models]
+  default_environment: ref-1card
+  visibility: public
+  series_labels: [env.label.device.count, env.label.node.class]
+---
+apiVersion: bench/v1alpha1
+kind: Suite
+metadata: {name: hf-models}
+spec: {type: perf}
+---
+apiVersion: bench/v1alpha1
+kind: Suite
+metadata: {name: lm-eval}
+spec: {type: quality}
+---
+apiVersion: bench/v1alpha1
+kind: Selection
+metadata: {name: lm-eval-pr, description: "quality smoke a PR may request"}
+spec:
+  selector: {suites: [lm-eval], groupings: {tier: {at_most: sanity}}}
+---
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata: {name: gsm8k-test-table}
+spec:
+  type: table
+  format: parquet
+  version: "1"
+  license: MIT
+  visibility: public
+  source: {uri: "hf://datasets/openai/gsm8k", revision: 740312add88f781978c0658806c59bfa2a2e4a1e, config: main, split: test}
+  integrity: {revision_pinned: true}
+---
+apiVersion: bench/v1alpha1
+kind: Dataset
+metadata: {name: gsm8k}
+spec:
+  asset: gsm8k-test-table
+  role: eval
+  schema: {record: {question: text, answer: text}}
+  subsets: {test-first-50: {limit: 50, order: sequential}}
+---
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata: {name: demo-llm-a-weights}
+spec:
+  type: fileset
+  format: safetensors
+  version: "1"
+  license: Apache-2.0
+  visibility: public
+  source: {uri: "hf://models/example-org/demo-llm-a", revision: 8f2c4a6e1b3d5f708192a3b4c5d6e7f8091a2b3c}
+  integrity: {revision_pinned: true}
+---
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata: {name: demo-llm-a-fp8-weights}
+spec:
+  type: fileset
+  format: safetensors
+  version: "1"
+  license: Apache-2.0
+  visibility: public
+  source: {uri: "hf://models/example-org/demo-llm-a-fp8", revision: 3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f}
+  integrity: {revision_pinned: true}
+---
+apiVersion: bench/v1alpha1
+kind: Model
+metadata: {name: demo-llm-a}
+spec: {assets: [{role: weights, asset: demo-llm-a-weights}], family: demo, architecture: decoder-only}
+---
+apiVersion: bench/v1alpha1
+kind: Model
+metadata: {name: demo-llm-a-fp8}
+spec: {assets: [{role: weights, asset: demo-llm-a-fp8-weights}], family: demo, architecture: decoder-only, native_precision: fp8}

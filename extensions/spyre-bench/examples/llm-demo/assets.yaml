@@ -1,0 +1,108 @@
+# yaml-language-server: $schema=../../spyre_bench/core/schemas/resources.schema.json
+# Assets are physical: where the bytes are and how to verify them. asset_id is content-addressed.
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata: {name: trace-all-files}
+spec:
+  type: fileset
+  format: jsonl
+  version: 0000.00.00-0000000
+  license: internal
+  visibility: internal
+  source: {store: demo-store, path: datasets/trace/all-sequences/0000.00.00-0000000}
+  integrity: {files: [{path: all_sequences.jsonl, sha256: 000000000000000000000000000000000000000000000000000000000000000c}]}
+---
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata: {name: trace-x-files}
+spec:
+  type: fileset
+  format: jsonl
+  version: 0000.00.00-0000000
+  license: internal
+  visibility: internal
+  source: {store: demo-store, path: datasets/trace/trace-x/0000.00.00-0000000}
+  integrity: {files: [{path: trace-x.jsonl, sha256: 000000000000000000000000000000000000000000000000000000000000000a}]}
+---
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata: {name: trace-y-files}
+spec:
+  type: fileset
+  format: jsonl
+  version: 0000.00.00-0000000
+  license: internal
+  visibility: internal
+  source: {store: demo-store, path: datasets/trace/trace-y/0000.00.00-0000000}
+  integrity: {files: [{path: trace-y.jsonl, sha256: 000000000000000000000000000000000000000000000000000000000000000b, size: 1024}]}
+---
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata: {name: random-prompts-gen, description: "a pure function of (tool, seed, params): nothing is stored"}
+spec:
+  type: generator
+  version: "1"
+  license: Apache-2.0
+  visibility: public
+  source: {generator: {tool: vllm-bench-random, seed: 0, params: {range_ratio: 0.0}}}
+---
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata: {name: parity-prompts-files}
+spec:
+  type: fileset
+  format: jsonl
+  version: "1"
+  license: Apache-2.0
+  visibility: internal
+  source: {store: demo-cache, path: corpus/parity-prompts/1}
+  integrity: {files: [{path: prompts.jsonl, sha256: "5555555555555555555555555555555555555555555555555555555555555555"}]}
+---
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata: {name: demo-llm-a-reference-outputs, description: "output of running a model: stored, content-addressed, with lineage"}
+spec:
+  type: generated
+  format: jsonl
+  version: "1"
+  visibility: internal
+  produced_by: {benchmark: reference-outputs-demo-llm-a, output: outputs, policy: {regenerate: if_inputs_change}}
+  source: {store: demo-store, path: datasets/generated/demo-llm-a-reference-outputs/1}
+  integrity: {manifest: {path: SHA256SUMS, sha256: "6666666666666666666666666666666666666666666666666666666666666666"}}
+---
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata: {name: demo-llm-a-weights}
+spec:
+  type: fileset
+  format: safetensors
+  version: "1"
+  license: Apache-2.0
+  visibility: public
+  source: {uri: "hf://models/example-org/demo-llm-a", revision: 8f2c4a6e1b3d5f708192a3b4c5d6e7f8091a2b3c}
+  integrity: {revision_pinned: true}
+  access: {mode: pull, resolve: [node-cache, primary], offline: use-cache}
+---
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata: {name: demo-embed-a-weights}
+spec:
+  type: fileset
+  format: safetensors
+  version: "1"
+  license: Apache-2.0
+  visibility: public
+  source: {uri: "hf://models/example-org/demo-embed-a", revision: 1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d}
+  integrity: {revision_pinned: true}
+---
+apiVersion: bench/v1alpha1
+kind: Asset
+metadata: {name: demo-llm-c-weights}
+spec:
+  type: fileset
+  format: safetensors
+  version: "1"
+  license: Apache-2.0
+  visibility: public
+  source: {uri: "hf://models/example-org/demo-llm-c", revision: 5b6c7d8e9f00112233445566778899aabbccddee}
+  integrity: {revision_pinned: true}
