@@ -1,0 +1,33 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://schemas.bench.invalid/v1alpha1/packs/llm-serving/system-lm-eval.json",
+ "title": "llm/lm-eval-model",
+ "type": "object",
+ "additionalProperties": false,
+ "properties": {
+  "model": {
+   "type": "string",
+   "minLength": 1,
+   "description": "name of a Model resource"
+  },
+  "precision": {
+   "enum": [
+    "fp32",
+    "bf16",
+    "fp16",
+    "fp8",
+    "fp4",
+    "int8",
+    "int4"
+   ]
+  },
+  "flags": {
+   "type": "object",
+   "description": "tool flags verbatim (native names); identity unless listed in non_identity"
+  }
+ },
+ "required": [
+  "model",
+  "precision"
+ ]
+}

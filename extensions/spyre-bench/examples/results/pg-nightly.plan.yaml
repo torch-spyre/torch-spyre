@@ -1,0 +1,419 @@
+purpose: nightly
+leg:
+  arch: x86_64
+  devices:
+    cpu/socket: 2
+    storage/nvme: 1
+  nodes: 1
+  reference_node: true
+  env_id: 2c505752-a050-5a2a-8714-7442b3ece7bb
+cases:
+- name: pgbench-tpcb/system=default/clients=c1
+  benchmark_id: efee611d-cc67-54e5-a654-0fe5b008df16
+  series_key: f0858683-089e-5955-a335-4397ade7a90f
+  run_props:
+    run.tier: core
+    run.suite.oltp: 'true'
+    run.purpose: nightly
+    run.validity_policy: 8d61f6f0-203c-57e3-ae1a-7e8ab4ad00e5
+    run.profile_level: 'off'
+  action: run
+  reason: ''
+  reused_from: null
+  type: perf
+  level: transaction
+  workload_type: pg/pgbench
+  environment: pg-oltp-host
+  runner: pgbench
+  repeats: 3
+  cache: warm
+  profile_level: 'off'
+  accelerators: 0
+  timeout_min: 30.0
+  est_min: 6.0
+  case_props:
+    system.name: pg16-default
+    system.backend: postgres
+    input.data.asset_name: pgbench-data-sf100
+  validity:
+    expectations:
+    - name: pg-tps-no-regression
+      metric: pg.tps
+      baseline: rolling
+      severity: gating
+      spec_digest: c88dc28c-658b-5b06-b1aa-55e398d59afa
+    policy:
+      name: pg-default
+      spec_digest: 8d61f6f0-203c-57e3-ae1a-7e8ab4ad00e5
+      purpose: nightly
+      floor: shared_env
+      requires:
+        qualification: current
+        clean: any
+        min_repeats: 3
+        max_cv_pct: 5
+        discard_warmup: 1
+        placement: required
+      baseline: true
+      reference: false
+  clean:
+    requested: false
+    expected_exclusive: observed
+  inputs:
+  - name: data
+    asset_ids:
+    - 56929b7b-1d06-504e-8919-a938bf71ed91
+    select: {}
+    expect: {}
+    selection_digest: 'off'
+- name: pgbench-tpcb/system=default/clients=c8
+  benchmark_id: 694407af-134d-5252-b1e3-81b60e9f1ee1
+  series_key: 7613fc28-6f80-500b-8fed-48524a639737
+  run_props:
+    run.tier: core
+    run.suite.oltp: 'true'
+    run.purpose: nightly
+    run.validity_policy: 8d61f6f0-203c-57e3-ae1a-7e8ab4ad00e5
+    run.profile_level: 'off'
+  action: run
+  reason: ''
+  reused_from: null
+  type: perf
+  level: transaction
+  workload_type: pg/pgbench
+  environment: pg-oltp-host
+  runner: pgbench
+  repeats: 3
+  cache: warm
+  profile_level: 'off'
+  accelerators: 0
+  timeout_min: 30.0
+  est_min: 6.0
+  case_props:
+    system.name: pg16-default
+    system.backend: postgres
+    input.data.asset_name: pgbench-data-sf100
+  validity:
+    expectations:
+    - name: pg-tps-no-regression
+      metric: pg.tps
+      baseline: rolling
+      severity: gating
+      spec_digest: c88dc28c-658b-5b06-b1aa-55e398d59afa
+    policy:
+      name: pg-default
+      spec_digest: 8d61f6f0-203c-57e3-ae1a-7e8ab4ad00e5
+      purpose: nightly
+      floor: shared_env
+      requires:
+        qualification: current
+        clean: any
+        min_repeats: 3
+        max_cv_pct: 5
+        discard_warmup: 1
+        placement: required
+      baseline: true
+      reference: false
+  clean:
+    requested: false
+    expected_exclusive: observed
+  inputs:
+  - name: data
+    asset_ids:
+    - 56929b7b-1d06-504e-8919-a938bf71ed91
+    select: {}
+    expect: {}
+    selection_digest: 'off'
+- name: pgbench-tpcb/system=default/clients=c32
+  benchmark_id: c74356a6-ccc2-571f-882b-6c6761cdaf47
+  series_key: 735c8eb9-aa08-5920-be3a-794c2cf7671e
+  run_props:
+    run.tier: core
+    run.suite.oltp: 'true'
+    run.purpose: nightly
+    run.validity_policy: 8d61f6f0-203c-57e3-ae1a-7e8ab4ad00e5
+    run.profile_level: 'off'
+  action: run
+  reason: ''
+  reused_from: null
+  type: perf
+  level: transaction
+  workload_type: pg/pgbench
+  environment: pg-oltp-host
+  runner: pgbench
+  repeats: 3
+  cache: warm
+  profile_level: 'off'
+  accelerators: 0
+  timeout_min: 30.0
+  est_min: 6.0
+  case_props:
+    system.name: pg16-default
+    system.backend: postgres
+    input.data.asset_name: pgbench-data-sf100
+  validity:
+    expectations:
+    - name: pg-tps-no-regression
+      metric: pg.tps
+      baseline: rolling
+      severity: gating
+      spec_digest: c88dc28c-658b-5b06-b1aa-55e398d59afa
+    policy:
+      name: pg-default
+      spec_digest: 8d61f6f0-203c-57e3-ae1a-7e8ab4ad00e5
+      purpose: nightly
+      floor: shared_env
+      requires:
+        qualification: current
+        clean: any
+        min_repeats: 3
+        max_cv_pct: 5
+        discard_warmup: 1
+        placement: required
+      baseline: true
+      reference: false
+  clean:
+    requested: false
+    expected_exclusive: observed
+  inputs:
+  - name: data
+    asset_ids:
+    - 56929b7b-1d06-504e-8919-a938bf71ed91
+    select: {}
+    expect: {}
+    selection_digest: 'off'
+- name: pgbench-tpcb/system=tuned/clients=c1
+  benchmark_id: 259b3a8b-7d07-5db7-83fb-9f4bfb718523
+  series_key: 1c6042e3-09d9-5bca-9d90-6467667f787d
+  run_props:
+    run.tier: core
+    run.suite.oltp: 'true'
+    run.purpose: nightly
+    run.validity_policy: 8d61f6f0-203c-57e3-ae1a-7e8ab4ad00e5
+    run.profile_level: 'off'
+  action: run
+  reason: ''
+  reused_from: null
+  type: perf
+  level: transaction
+  workload_type: pg/pgbench
+  environment: pg-oltp-host
+  runner: pgbench
+  repeats: 3
+  cache: warm
+  profile_level: 'off'
+  accelerators: 0
+  timeout_min: 30.0
+  est_min: 6.0
+  case_props:
+    system.name: pg16-tuned
+    system.backend: postgres
+    input.data.asset_name: pgbench-data-sf100
+  validity:
+    expectations:
+    - name: pg-tps-no-regression
+      metric: pg.tps
+      baseline: rolling
+      severity: gating
+      spec_digest: c88dc28c-658b-5b06-b1aa-55e398d59afa
+    policy:
+      name: pg-default
+      spec_digest: 8d61f6f0-203c-57e3-ae1a-7e8ab4ad00e5
+      purpose: nightly
+      floor: shared_env
+      requires:
+        qualification: current
+        clean: any
+        min_repeats: 3
+        max_cv_pct: 5
+        discard_warmup: 1
+        placement: required
+      baseline: true
+      reference: false
+  clean:
+    requested: false
+    expected_exclusive: observed
+  inputs:
+  - name: data
+    asset_ids:
+    - 56929b7b-1d06-504e-8919-a938bf71ed91
+    select: {}
+    expect: {}
+    selection_digest: 'off'
+- name: pgbench-tpcb/system=tuned/clients=c8
+  benchmark_id: caff5263-6397-5c25-a80d-cb0a89225fea
+  series_key: 908a1caa-649a-5f36-b7a2-073cc152c73a
+  run_props:
+    run.tier: core
+    run.suite.oltp: 'true'
+    run.purpose: nightly
+    run.validity_policy: 8d61f6f0-203c-57e3-ae1a-7e8ab4ad00e5
+    run.profile_level: 'off'
+  action: run
+  reason: ''
+  reused_from: null
+  type: perf
+  level: transaction
+  workload_type: pg/pgbench
+  environment: pg-oltp-host
+  runner: pgbench
+  repeats: 3
+  cache: warm
+  profile_level: 'off'
+  accelerators: 0
+  timeout_min: 30.0
+  est_min: 6.0
+  case_props:
+    system.name: pg16-tuned
+    system.backend: postgres
+    input.data.asset_name: pgbench-data-sf100
+  validity:
+    expectations:
+    - name: pg-tps-no-regression
+      metric: pg.tps
+      baseline: rolling
+      severity: gating
+      spec_digest: c88dc28c-658b-5b06-b1aa-55e398d59afa
+    policy:
+      name: pg-default
+      spec_digest: 8d61f6f0-203c-57e3-ae1a-7e8ab4ad00e5
+      purpose: nightly
+      floor: shared_env
+      requires:
+        qualification: current
+        clean: any
+        min_repeats: 3
+        max_cv_pct: 5
+        discard_warmup: 1
+        placement: required
+      baseline: true
+      reference: false
+  clean:
+    requested: false
+    expected_exclusive: observed
+  inputs:
+  - name: data
+    asset_ids:
+    - 56929b7b-1d06-504e-8919-a938bf71ed91
+    select: {}
+    expect: {}
+    selection_digest: 'off'
+- name: pgbench-tpcb/system=tuned/clients=c32
+  benchmark_id: 06d6ea5c-5e1b-5daf-b5f3-fde0653bd634
+  series_key: 51d9ea96-e0fc-536a-bd21-ab0153c88b08
+  run_props:
+    run.tier: core
+    run.suite.oltp: 'true'
+    run.purpose: nightly
+    run.validity_policy: 8d61f6f0-203c-57e3-ae1a-7e8ab4ad00e5
+    run.profile_level: 'off'
+  action: run
+  reason: ''
+  reused_from: null
+  type: perf
+  level: transaction
+  workload_type: pg/pgbench
+  environment: pg-oltp-host
+  runner: pgbench
+  repeats: 3
+  cache: warm
+  profile_level: 'off'
+  accelerators: 0
+  timeout_min: 30.0
+  est_min: 6.0
+  case_props:
+    system.name: pg16-tuned
+    system.backend: postgres
+    input.data.asset_name: pgbench-data-sf100
+  validity:
+    expectations:
+    - name: pg-tps-no-regression
+      metric: pg.tps
+      baseline: rolling
+      severity: gating
+      spec_digest: c88dc28c-658b-5b06-b1aa-55e398d59afa
+    policy:
+      name: pg-default
+      spec_digest: 8d61f6f0-203c-57e3-ae1a-7e8ab4ad00e5
+      purpose: nightly
+      floor: shared_env
+      requires:
+        qualification: current
+        clean: any
+        min_repeats: 3
+        max_cv_pct: 5
+        discard_warmup: 1
+        placement: required
+      baseline: true
+      reference: false
+  clean:
+    requested: false
+    expected_exclusive: observed
+  inputs:
+  - name: data
+    asset_ids:
+    - 56929b7b-1d06-504e-8919-a938bf71ed91
+    select: {}
+    expect: {}
+    selection_digest: 'off'
+- name: pgbench-tpcb/system=tuned/clients=c64
+  benchmark_id: dbc12f4a-5273-5f17-9d50-d9834fe8f8fa
+  series_key: 02c7d55f-c7ad-5225-9891-e21956d7a303
+  run_props:
+    run.tier: core
+    run.suite.oltp: 'true'
+    run.purpose: nightly
+    run.validity_policy: 8d61f6f0-203c-57e3-ae1a-7e8ab4ad00e5
+    run.profile_level: 'off'
+  action: run
+  reason: ''
+  reused_from: null
+  type: perf
+  level: transaction
+  workload_type: pg/pgbench
+  environment: pg-oltp-host
+  runner: pgbench
+  repeats: 3
+  cache: warm
+  profile_level: 'off'
+  accelerators: 0
+  timeout_min: 30.0
+  est_min: 6.0
+  case_props:
+    system.name: pg16-tuned
+    system.backend: postgres
+    input.data.asset_name: pgbench-data-sf100
+  validity:
+    expectations:
+    - name: pg-tps-no-regression
+      metric: pg.tps
+      baseline: rolling
+      severity: gating
+      spec_digest: c88dc28c-658b-5b06-b1aa-55e398d59afa
+    policy:
+      name: pg-default
+      spec_digest: 8d61f6f0-203c-57e3-ae1a-7e8ab4ad00e5
+      purpose: nightly
+      floor: shared_env
+      requires:
+        qualification: current
+        clean: any
+        min_repeats: 3
+        max_cv_pct: 5
+        discard_warmup: 1
+        placement: required
+      baseline: true
+      reference: false
+  clean:
+    requested: false
+    expected_exclusive: observed
+  inputs:
+  - name: data
+    asset_ids:
+    - 56929b7b-1d06-504e-8919-a938bf71ed91
+    select: {}
+    expect: {}
+    selection_digest: 'off'
+estimate:
+  wall_min: 42.0
+  device_hours: 0.0

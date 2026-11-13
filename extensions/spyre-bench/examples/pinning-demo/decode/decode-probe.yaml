@@ -1,0 +1,23 @@
+# yaml-language-server: $schema=../../../spyre_bench/core/schemas/resources.schema.json
+# Two output lengths of the same latency workload; the Analysis turns the pair into a per-token decode cost.
+apiVersion: bench/v1alpha1
+kind: System
+metadata: {name: demo-llm-a-hf-fp16}
+spec: {type: llm/hf-transformers, backend: hf-demo, token: demoa, model: demo-llm-a, precision: fp16}
+---
+apiVersion: bench/v1alpha1
+kind: Benchmark
+metadata: {name: decode-probe}
+spec:
+  type: perf
+  level: model
+  tier: sanity
+  system: demo-llm-a-hf-fp16
+  workload:
+    type: llm/latency
+    shape: {batch_size: 1, input_len: 512, output_len: 1}
+    load: {executor: iterations, iterations: 10, warmup_iterations: 2}
+  run: {timeout: 30m, est: 10m}
+  matrix:
+    axes:
+      out: {path: workload.shape.output_len, values: [1, 129], token: "out{}"}
