@@ -119,6 +119,11 @@ def _positive_config(name: str) -> int:
     return value
 
 
+def _fixed_to_ns(score: int) -> float:
+    """A fixed-point score (see :meth:`SaCoOptimizingSolver._score`) in ns."""
+    return score * 1000.0 / utils.US_FIXED_POINT_SCALE
+
+
 def _step_budget(n: int) -> int:
     """One restart's step count for ``n`` buffers that carry a division
     decision: ``config.sa_coopt_steps_per_buffer`` each, capped at
@@ -949,11 +954,11 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
     def _record_restarts(self, results: list[_RestartResult], wall_s: float) -> None:
         """Fill :attr:`last_solve_stats` from ``results`` (sorted, winner
         first) and log the solve."""
-        ns = 1000.0 / utils.US_FIXED_POINT_SCALE
+        ns = _fixed_to_ns
         winner = results[0]
         self.last_solve_stats = {
             "restarts": [
-                {"seed": r.seed, "score_ns": r.score * ns, "steps": r.steps}
+                {"seed": r.seed, "score_ns": ns(r.score), "steps": r.steps}
                 for r in results
             ],
             "winner_seed": winner.seed,
@@ -965,7 +970,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             logger.debug(
                 "SA co-optimizer restart seed %d: %.1f ns after %d steps",
                 r.seed,
-                r.score * ns,
+                ns(r.score),
                 r.steps,
             )
         logger.info(
@@ -973,8 +978,8 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             "(spread %.1f ns) in %.2f s",
             len(results),
             winner.seed,
-            winner.score * ns,
-            (results[-1].score - winner.score) * ns,
+            ns(winner.score),
+            ns(results[-1].score - winner.score),
             wall_s,
         )
 
@@ -1987,7 +1992,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
     def score_ns(self) -> Optional[float]:
         if not self._bufs:
             return None
-        return self._score() * 1000.0 / utils.US_FIXED_POINT_SCALE
+        return _fixed_to_ns(self._score())
 
     def _score(self) -> int:
         """The shared objective for the current state, in integer fixed-point
