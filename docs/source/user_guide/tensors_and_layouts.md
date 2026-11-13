@@ -537,6 +537,18 @@ The three `torch._check` lines restate the declared range inside the traced
 function. They are what give the compiler a finite range in the trace today and
 have to be written by hand.
 
+Code in the compiled function can still split the range without an error: a
+branch such as `if rows > 256` makes the sizes above 256 compile a second
+program. Two checks report this, both warning by default:
+
+- After each compile, a guard that rejects some declared sizes is reported with
+  the sizes and the source line, for example
+  `guard s0 <= 256 causes a recompile for dim values [320, 384, 448, 512]`.
+  Set `TORCH_SPYRE_NARROWING_CHECK` to `error` or `off` to change this.
+- A recompile while a declared input has one of its declared sizes is reported
+  with PyTorch's reason. Set `TORCH_SPYRE_RECOMPILE_CHECK` to `error`, `all` or
+  `off` to change this.
+
 What is refused, with an error naming `for_each_tile`:
 
 - A plain op over the declared dimension outside a loop, such as
