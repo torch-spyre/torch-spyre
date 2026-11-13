@@ -1148,7 +1148,7 @@ def _single_arg_op_layout(
     )
 
 
-def _new_stick_split_target(
+def _clone_absent_stick_input_target(
     arg: PropArg,
     stick_expr: sympy.Expr,
     out_stl: SpyreTensorLayout,
@@ -1250,7 +1250,7 @@ def _clone_layout(
     )
 
     if is_stick_expr_offset_free(stick_expr, stick_size):
-        required_in_stl = _new_stick_split_target(
+        required_in_stl = _clone_absent_stick_input_target(
             args[0], stick_expr, out_stl, output_dep
         )
         if required_in_stl is not None:
