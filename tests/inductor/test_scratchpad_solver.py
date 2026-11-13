@@ -2379,6 +2379,38 @@ class TestSympyExprToCpSatPrinter(TestCase):
                     solver.float_value(cp_expr), want, delta=1e-3 * want
                 )
 
+    def test_a_negative_product_pushed_into_a_min_keeps_its_value(self):
+        # c * Min(R, W) * D with c < 0, D a derate over a buffer's curve (the
+        # overlap term subtracts such a product): pushed into the Min, the sign
+        # stays outside it, so the lowered value is the expression's at every
+        # assignment, within the curve's budget.
+        model, division, sym_map, buffer_map, (a,) = self._one_buffer(
+            {"split_a": [1, 2, 4, 8]}
+        )
+        x, y = sympy.symbols("x y", integer=True, nonnegative=True)
+        sym_map["x"] = model.new_int_var(0, 50, "x")
+        sym_map["y"] = model.new_int_var(0, 50, "y")
+        derate = sympy.Max(1, 4 / a**0.5)
+        term = sympy.Min(10 * x + 7, 6 * y + 20) * derate
+        expr = 1000 - 2 * term
+        cp_expr = _SympyExprToCpSat(model, sym_map, buffer_map).convert(expr)
+        budget = (1 + _LINEARIZE_TOLERANCE) * (1 + _QUANTIZE_TOLERANCE) - 1
+        cases = itertools.product(range(4), ((0, 0), (1, 5), (5, 1), (3, 3)))
+        for i, (vx, vy) in cases:
+            with self.subTest(division=i, x=vx, y=vy):
+                fixed = model.clone()
+                fixed.add(division == i)
+                fixed.add(sym_map["x"] == vx)
+                fixed.add(sym_map["y"] == vy)
+                solver = cp_model.CpSolver()
+                self.assertEqual(solver.solve(fixed), cp_model.OPTIMAL)
+                values = {a: [1, 2, 4, 8][i], x: vx, y: vy}
+                want = float(expr.subs(values))
+                size = float(2 * term.subs(values))
+                self.assertLessEqual(
+                    abs(solver.float_value(cp_expr) - want), budget * size
+                )
+
     def test_negated_and_unnamed_boolean_products_preserve_every_assignment(self):
         model = cp_model.CpModel()
         a, b = [model.new_bool_var("") for _ in range(2)]
