@@ -170,7 +170,7 @@ class TestOutputReservedDims(unittest.TestCase):
     def graph(self, upper=512):
         return make_graph(
             ranges={s0: (128, upper), s1: (96, 384)},
-            contracts={s0: (128, 512, 64)},
+            contracts={s0: (128, 512, 64), s1: (96, 384, 96)},
         )
 
     def test_static_output_is_not_stamped(self):
