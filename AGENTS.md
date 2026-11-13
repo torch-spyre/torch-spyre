@@ -12,7 +12,18 @@ via the PrivateUse1 mechanism.
 - **Style:** Google Python Style Guide, Google C++ Style Guide.
 - **Imports:** Use `import regex` (aliased as `re` when needed), **never**
   `import re`. A pre-commit hook enforces this.
-- **Commits:** Sign off every commit with `git commit -s` (DCO).
+- **Commits:** Every commit needs a DCO sign-off (`-s`) and a GPG or SSH
+  signature (`-S`): `git commit -s -S`. `main`'s ruleset requires signed
+  commits, so an unsigned commit blocks the PR even with a valid sign-off. The
+  sign-off email must match your GitHub email, and the signing key must be
+  registered on your GitHub account. Before pushing,
+  `git log --format='%h %G? %s' origin/main..` must not print `N` (unsigned)
+  for any commit. `U` or `E` can still be valid, because `%G?` verifies
+  against the local keyring; GitHub's
+  `gh api repos/torch-spyre/torch-spyre/commits/<sha> --jq .commit.verification.verified`
+  is authoritative. Fix the last commit with `git commit --amend -s -S --no-edit`;
+  fix every commit on the branch with
+  `git rebase --force-rebase --signoff -S "$(git merge-base origin/main HEAD)"`.
 - **Linting:** Run `pre-commit run --all-files` before pushing. Hooks include
   ruff, clang-format, cpplint, mypy, pymarkdown, and yamlfmt.
 - **Line length:** 88 characters (ruff).

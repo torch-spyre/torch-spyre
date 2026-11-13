@@ -68,12 +68,32 @@ The PR must pass all pre-commit hooks:
 - **yamlfmt** — YAML formatting
 - **enforce-import-regex** — Must use `import regex`, never `import re`
 
-### 3. Signed Commits (DCO)
+### 3. DCO Sign-off and Signed Commits
 
-Every commit must have a `Signed-off-by:` line. Check with:
+Every commit needs both, and they are separate checks:
+
+- **DCO sign-off:** a `Signed-off-by:` line (`git commit -s`).
+- **Signature:** a GPG or SSH signature that GitHub verifies (`git commit -S`).
+  `main`'s ruleset requires signed commits, so an unsigned commit blocks the
+  merge even with a valid sign-off.
 
 ```bash
-gh pr view <number> --json commits --jq '.commits[].messageBody'
+gh api --paginate repos/torch-spyre/torch-spyre/pulls/<number>/commits \
+  --jq '.[] | "\(.sha[:12]) verified=\(.commit.verification.verified) \(.commit.verification.reason) signoff=\(.commit.message | [splits("\n")] | any(test("^Signed-off-by: \\S")))"'
+```
+
+Flag any commit with `verified=false` or `signoff=false` as a BLOCKER. A
+`gpgverify_error` or `gpgverify_unavailable` reason means GitHub's verifier
+failed, not the signature: recheck later. The `signoff` column only looks for a
+line starting with `Signed-off-by:`; check that the signer is the author.
+
+To fix only the tip commit: `git commit --amend -s -S --no-edit`. To fix every
+commit on the PR, replay them all (`--force-rebase`, or a bare `rebase -S` with
+nothing new upstream just fast-forwards without re-signing):
+
+```bash
+git rebase --force-rebase --signoff -S "$(git merge-base origin/main HEAD)"
+git push --force-with-lease
 ```
 
 ### 4. Tensor Layout Correctness

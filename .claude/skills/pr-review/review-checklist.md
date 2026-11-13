@@ -6,7 +6,9 @@ Quick reference for reviewing torch-spyre pull requests.
 
 - [ ] **Apache 2.0 headers** on all new source files (Python: 14-line block,
   C++: `/* */` block)
-- [ ] **Signed commits** — every commit has `Signed-off-by:` (DCO)
+- [ ] **DCO sign-off** — every commit has `Signed-off-by:`
+- [ ] **Signed commits** — every commit has a verified GPG/SSH signature
+  (`main` requires it)
 - [ ] **Pre-commit passes** — ruff, clang-format, cpplint, mypy, pymarkdown
 - [ ] **`import regex`** — never `import re` in Python files
 - [ ] **Tests exist** for new/changed functionality
