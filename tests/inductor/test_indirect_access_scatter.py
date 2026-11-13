@@ -323,8 +323,9 @@ class _ScatterScenarios:
         out[2,4,8,16,64], src[2,4,3,16,64], and an int64 index with src's shape
         whose entries along dim 2 are 3 unique rows (constant over every other
         dim, so there is no write collision). The frontend reaches a scatter op
-        spec, then dbo-opt rejects the bundle. The same compile with a 1-D index
-        (index_copy_ / index_put, see test_index_copy_5d_each_dim_e2e) works.
+        spec, then dbo-opt rejects the bundle (#4844). The same compile with a
+        1-D index (index_copy_ / index_put, see test_index_copy_5d_each_dim_e2e)
+        works.
         """
         shape, P = (2, 4, 8, 16, 64), 3
         src_shape = (*shape[:2], P, *shape[3:])
@@ -338,13 +339,13 @@ class _ScatterScenarios:
 
         self.check(kernel, out, src, index, expect=SCATTER_OP_SPEC)
 
-        # TODO: a full-rank torch.scatter index does not compile (dbo-opt asserts in
-        # GatherIndexConversion.cpp; torch.gather with a 2-D index fails the same
-        # way, see test_torch_gather). Cite the open issue here, and once it is
-        # fixed turn this into a positive test that compares with the CPU result.
+        # TODO(#4844): a full-rank torch.scatter index does not compile (dbo-opt
+        # asserts in GatherIndexConversion.cpp; torch.gather with a 2-D index fails
+        # the same way, see test_torch_gather). Once it is fixed turn this into a
+        # positive test that compares with the CPU result.
         torch._dynamo.reset()
         with pytest.raises(
-            (BackendCompilerFailed, InductorError),
+            BackendCompilerFailed,
             match=_GATHER_INDEX_CONVERSION_ERROR,
         ):
             torch.compile(kernel, dynamic=False)(out, src, index)
@@ -727,6 +728,7 @@ class _ScatterScenarios:
         P = self._SCATTER_5D_P
         src_shape = list(shape)
         src_shape[dim] = P
+        torch.manual_seed(0)  # reproducible failures; rows are unique either way
         y = torch.zeros(shape, dtype=torch.float16).to("spyre")
         src = torch.rand(src_shape, dtype=torch.float16).to("spyre")
         # Unique rows: repeated indices have no defined winner.
@@ -1554,6 +1556,14 @@ class _ScatterScenarios:
         def kernel(dst, src, idx):
             return torch.index_add(dst, 0, idx, src)
 
+        # sdsc=False: spyre_index_add (decompositions.py) lowers index_add to
+        # index_select (gather) + add + index_put (overwrite scatter), so the
+        # bundle holds both a gather and a scatter. It still classifies as
+        # SCATTER_OP_SPEC (terminal indirect store), but assert_indirect_sdsc_fields
+        # (kind="scatter") requires every indirect value tensor to be the output;
+        # the gather's value tensor is an input, so the check would fail on a
+        # correct bundle. Only that field check is skipped: the classification and
+        # the on-device result vs. CPU are still asserted (see NOTE above).
         self._stage_and_e2e(kernel, dst, src, idx, expect=SCATTER_OP_SPEC, sdsc=False)
 
     def test_index_put_accumulate_2d_row_bf16(self):
@@ -1564,6 +1574,11 @@ class _ScatterScenarios:
         def kernel(dst, src, idx):
             return dst.index_put_((idx,), src, accumulate=True)
 
+        # sdsc stays True (default): index_put_ is not decomposed into a gather
+        # first, so the bundle is a pure scatter and the scatter-only SDSC check
+        # applies (same as the fp16 test_index_put_accumulate above). It guards
+        # the bf16 indirect-access encoding: index/value cross-links, HBM-only
+        # int32 index tensor, and the value tensor being the output.
         self._stage_and_e2e(kernel, dst, src, idx, expect=SCATTER_OP_SPEC)
 
     def test_scatter_add_functional(self):
