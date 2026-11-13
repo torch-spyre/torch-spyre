@@ -1,0 +1,475 @@
+name: crcr-regression-triage
+
+# Reacts to completed push-pytorch-dispatch-to-clickhouse runs (the CRCR
+# entry point): detects failing upstream-beta tests from the merged JUnit
+# reports, files/updates bucketed tracking issues that cc the CODEOWNERS
+# for each area, and -- opt-in, see the vars below -- runs the
+# skip-upstream-beta-failures skill headlessly (Claude Code) to open a PR
+# moving exactly the newly-failing tests to mode: skip in
+# tests/configs/upstream_tests_beta/. The tracking issue is the demand for
+# a fix; the skip PR only quarantines the failure so new regressions stay
+# visible. Nothing is ever auto-merged.
+#
+# Standalone workflow_run workflow (like retry-failed-tests.yaml) rather
+# than a step inside build_test_pytorch_source.yaml: the LLM-driven write
+# permissions stay off the CRCR reporting path, and the whole pipeline is
+# dry-runnable against any historical run via workflow_dispatch.
+#
+# NEVER gates on the watched run's conclusion: upstream-beta tests run
+# with mode: validate, so a run full of failures still completes
+# 'success'. The merged upstream-beta-reports-<sha> JUnit artifact is the
+# only authoritative per-test signal.
+#
+# Opt-in switches (repo variables, set by an admin):
+#   CRCR_DIAGNOSE    = 'true' -> diagnose job runs (Claude comments the
+#                     failure classification on the tracking issues;
+#                     issues: write only).
+#   CRCR_AUTO_RECOVER = 'true' -> auto-recover job runs (Claude opens the
+#                     skip PR; contents+pull-requests write via the
+#                     SPYRE_BOT app so PR checks trigger). Takes over
+#                     diagnosis from CRCR_DIAGNOSE.
+# Both need secrets.ANTHROPIC_API_KEY. Detect + notify always run.
+on:
+  workflow_run:
+    workflows:
+      - push-pytorch-dispatch-to-clickhouse
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: >-
+          Completed push-pytorch-dispatch-to-clickhouse run to triage
+          (empty = latest nightly)
+        type: string
+        required: false
+        default: ''
+      dry_run:
+        description: >-
+          Detect and notify only; never run the Claude diagnose/recover
+          steps
+        type: boolean
+        default: true
+
+concurrency:
+  # One triage per triggering run: reruns of the watched run
+  # (retry-failed-tests) re-complete the same run id and must not stack.
+  group: crcr-regression-triage-${{ github.event.workflow_run.id || github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read # list/download the triggering run's artifacts
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  detect:
+    name: Detect upstream-beta failures
+    # Prefilter to spare the runner pool: most repository_dispatch
+    # completions are gate-rejected synchronize/opened events that finish
+    # in ~a minute with no artifacts (gate-passing merged-PR runs are
+    # always "(closed)"). The artifact check below is authoritative -- if
+    # the relay's run-name format ever changes, only runner pressure
+    # increases, not correctness.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion != 'cancelled' &&
+       (github.event.workflow_run.event != 'repository_dispatch' ||
+        endsWith(github.event.workflow_run.display_title, '(closed)')))
+    runs-on:
+      - x86_64
+      - linux
+      - image_ingest
+    timeout-minutes: 10
+    outputs:
+      has_failures: ${{ steps.detect.outputs.has_failures }}
+      failure_count: ${{ steps.detect.outputs.failure_count }}
+      total_tests: ${{ steps.detect.outputs.total_tests }}
+      new_failure_count: ${{ steps.detect.outputs.new_failure_count }}
+      mass_failure: ${{ steps.detect.outputs.mass_failure }}
+      skip_needed: ${{ steps.detect.outputs.skip_needed }}
+      run_url: ${{ steps.resolve.outputs.run_url }}
+      matrix_run_url: ${{ steps.resolve.outputs.matrix_run_url }}
+      pytorch_sha: ${{ steps.resolve.outputs.pytorch_sha }}
+      torch_spyre_sha: ${{ steps.resolve.outputs.torch_spyre_sha }}
+      report_artifact: ${{ steps.resolve.outputs.artifact_name }}
+    steps:
+      - name: Setup the GitHub CLI
+        env:
+          GH_CLI_VERSION: 2.97.0
+        run: |
+          curl -fsSL \
+            "https://github.com/cli/cli/releases/download/v${GH_CLI_VERSION}/gh_${GH_CLI_VERSION}_linux_amd64.tar.gz" \
+            -o "${RUNNER_TEMP}/gh-cli.tar.gz"
+          mkdir -p "${RUNNER_TEMP}/gh-cli"
+          tar -xzf "${RUNNER_TEMP}/gh-cli.tar.gz" -C "${RUNNER_TEMP}/gh-cli" --strip-components=1
+          echo "${RUNNER_TEMP}/gh-cli/bin" >> "${GITHUB_PATH}"
+
+      - name: Resolve triggering run and artifact
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_RUN_ID: ${{ inputs.run_id }}
+          WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
+          WORKFLOW_RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          RUN_ID="${INPUT_RUN_ID:-${WORKFLOW_RUN_ID}}"
+          if [ -z "${RUN_ID}" ]; then
+            # workflow_dispatch with no run_id: triage the latest nightly.
+            RUN_ID="$(gh run list -R "${{ github.repository }}" \
+              --workflow push-pytorch-dispatch-to-clickhouse \
+              --event schedule --limit 1 --json databaseId \
+              --jq '.[0].databaseId')"
+          fi
+          ARTIFACT="$(gh api \
+            "repos/${{ github.repository }}/actions/runs/${RUN_ID}/artifacts" \
+            --jq '.artifacts[] | select(.name | startswith("upstream-beta-reports-")) | .name' \
+            | head -1)"
+          if [ -z "${ARTIFACT}" ]; then
+            # Gate-rejected dispatch or build-failed run: nothing to triage.
+            echo "has_failures=false" >> "${GITHUB_OUTPUT}"
+            echo "No upstream-beta-reports artifact on run ${RUN_ID}; nothing to triage."
+            exit 0
+          fi
+          PYTORCH_SHA="${ARTIFACT#upstream-beta-reports-}"
+          TORCH_SPYRE_SHA="$(gh run view "${RUN_ID}" -R "${{ github.repository }}" \
+            --json headSha --jq .headSha)"
+          # The dispatched matrix run embeds the caller's correlation id
+          # "(<callerRunId>-...)" in its run name; recover it for links.
+          MATRIX_RUN_ID="$(gh run list -R "${{ github.repository }}" \
+            --workflow _upstream_tests_beta_matrix.yaml \
+            --event workflow_dispatch --limit 100 \
+            --json databaseId,displayTitle \
+            --jq ".[] | select(.displayTitle | contains(\"(${RUN_ID}-\")) | .databaseId" \
+            | head -1)"
+          if [ -n "${WORKFLOW_RUN_URL}" ]; then
+            RUN_URL="${WORKFLOW_RUN_URL}"
+          else
+            RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${RUN_ID}"
+          fi
+          {
+            echo "run_id=${RUN_ID}"
+            echo "artifact_name=${ARTIFACT}"
+            echo "pytorch_sha=${PYTORCH_SHA}"
+            echo "torch_spyre_sha=${TORCH_SPYRE_SHA}"
+            echo "run_url=${RUN_URL}"
+          } >> "${GITHUB_OUTPUT}"
+          if [ -n "${MATRIX_RUN_ID}" ]; then
+            echo "matrix_run_url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${MATRIX_RUN_ID}" \
+              >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Checkout scripts
+        if: steps.resolve.outputs.artifact_name != ''
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          sparse-checkout: .github/scripts
+
+      - name: Download merged JUnit reports
+        if: steps.resolve.outputs.artifact_name != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 .github/scripts/download_run_xml_artifacts.py \
+            --repo "${{ github.repository }}" \
+            --run-id "${{ steps.resolve.outputs.run_id }}" \
+            --artifact-name "${{ steps.resolve.outputs.artifact_name }}" \
+            --output-dir xml_artifacts
+
+      - name: Install uv
+        if: steps.resolve.outputs.artifact_name != ''
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          # latest-known, not "latest": see dependabot.yaml's comment.
+          version: latest-known
+
+      - name: Detect failures
+        id: detect
+        if: steps.resolve.outputs.artifact_name != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          uv run --no-project --with regex python3 \
+            .github/scripts/detect_crcr_failures.py \
+            --xml-dir xml_artifacts \
+            --repo "${{ github.repository }}" \
+            --run-url "${{ steps.resolve.outputs.run_url }}" \
+            --matrix-run-url "${{ steps.resolve.outputs.matrix_run_url }}" \
+            --pytorch-sha "${{ steps.resolve.outputs.pytorch_sha }}" \
+            --torch-spyre-sha "${{ steps.resolve.outputs.torch_spyre_sha }}" \
+            --report-artifact "${{ steps.resolve.outputs.artifact_name }}" \
+            --output-file failures.json
+
+      - name: Upload triage inputs
+        if: steps.resolve.outputs.artifact_name != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: crcr-triage-inputs
+          path: |
+            xml_artifacts/
+            failures.json
+          retention-days: 7
+          if-no-files-found: error
+
+  notify:
+    name: File or update tracking issues
+    needs: detect
+    if: needs.detect.outputs.has_failures == 'true'
+    runs-on:
+      - x86_64
+      - linux
+      - image_ingest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+      issues: write # gh issue create/comment + gh label create
+    steps:
+      - name: Checkout scripts and CODEOWNERS
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          sparse-checkout: |
+            .github/scripts
+            CODEOWNERS
+
+      - name: Download triage inputs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: crcr-triage-inputs
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: latest-known
+
+      - name: Open or update bucketed issues
+        id: issues
+        # Best-effort: a failure here must not block diagnose/auto-recover.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+        run: |
+          extra_args=()
+          if [ "${DRY_RUN}" = "true" ]; then
+            extra_args+=(--dry-run)
+          fi
+          uv run --no-project --with regex python3 \
+            .github/scripts/report_test_failures_issue.py \
+            --xml-dir xml_artifacts \
+            --repo "${{ github.repository }}" \
+            --run-url "${{ needs.detect.outputs.run_url }}" \
+            --matrix-run-url "${{ needs.detect.outputs.matrix_run_url }}" \
+            --pytorch-sha "${{ needs.detect.outputs.pytorch_sha }}" \
+            --torch-spyre-sha "${{ needs.detect.outputs.torch_spyre_sha }}" \
+            --report-artifact "${{ needs.detect.outputs.report_artifact }}" \
+            --output-json issue_map.json \
+            "${extra_args[@]}"
+
+      - name: Upload issue map
+        if: always() && steps.issues.outcome != 'skipped'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: crcr-triage-issues
+          path: issue_map.json
+          retention-days: 7
+          if-no-files-found: warn
+
+  diagnose:
+    name: Diagnose new failures (Claude, comment-only)
+    needs: [detect, notify]
+    # Phase 2 of the rollout: classification comments on the tracking
+    # issues. Skipped once CRCR_AUTO_RECOVER is on (that prompt includes
+    # the diagnosis, and running both would double-comment).
+    if: >-
+      !cancelled() &&
+      needs.detect.outputs.has_failures == 'true' &&
+      needs.detect.outputs.new_failure_count != '0' &&
+      needs.detect.outputs.new_failure_count != '' &&
+      needs.detect.outputs.mass_failure == 'false' &&
+      (github.event_name != 'workflow_dispatch' || !inputs.dry_run) &&
+      vars.CRCR_DIAGNOSE == 'true' &&
+      vars.CRCR_AUTO_RECOVER != 'true'
+    runs-on:
+      - x86_64
+      - spyre_pf_x0
+      - linux
+      - image_spyre_backend
+    timeout-minutes: 30
+    continue-on-error: true # advisory only; never blocks anything
+    permissions:
+      contents: read
+      actions: read
+      issues: write # comment the diagnosis on the tracking issues
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Download triage inputs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: crcr-triage-inputs
+
+      - name: Download issue map
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: crcr-triage-issues
+
+      - name: Merge triage inputs
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          failures = json.loads(Path("failures.json").read_text())
+          issue_map = {"buckets": {}}
+          if Path("issue_map.json").is_file():
+              issue_map = json.loads(Path("issue_map.json").read_text())
+          failures["issue_map"] = issue_map.get("buckets", {})
+          Path("triage_input.json").write_text(json.dumps(failures, indent=2))
+          PY
+
+      - name: Install Claude Code CLI
+        run: |
+          if command -v npm >/dev/null 2>&1; then
+            npm install -g @anthropic-ai/claude-code
+          else
+            curl -fsSL https://claude.ai/install.sh | bash
+            echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+          fi
+
+      - name: Run Claude (diagnosis only)
+        id: claude
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          claude -p "$(cat .github/scripts/crcr_diagnose_prompt.md)" \
+            --permission-mode bypassPermissions \
+            --max-turns 30 --output-format json > claude_result.json || true
+          python3 -c "import json; \
+          print(json.load(open('claude_result.json')).get('result', '')[:2000])" \
+            >> "${GITHUB_STEP_SUMMARY}" || true
+
+  auto-recover:
+    name: Auto-skip newly failing tests (Claude)
+    needs: [detect, notify]
+    if: >-
+      !cancelled() &&
+      needs.detect.outputs.has_failures == 'true' &&
+      needs.detect.outputs.skip_needed == 'true' &&
+      needs.detect.outputs.mass_failure == 'false' &&
+      (github.event_name != 'workflow_dispatch' || !inputs.dry_run) &&
+      vars.CRCR_AUTO_RECOVER == 'true'
+    runs-on:
+      - x86_64
+      - spyre_pf_x0
+      - linux
+      - image_spyre_backend
+    timeout-minutes: 60
+    continue-on-error: true # advisory only; never blocks anything
+    permissions:
+      contents: write # push the crcr/auto-skip-<sha> branch
+      actions: read
+      pull-requests: write # open the skip PR
+    steps:
+      - name: Create SPYRE_BOT token
+        # App token, not GITHUB_TOKEN: pushes/PRs made with the workflow's
+        # own GITHUB_TOKEN do not trigger CI checks on the PR.
+        id: app-token
+        uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
+        with:
+          app-id: ${{ vars.SPYRE_BOT_APP_ID }}
+          private-key: ${{ secrets.SPYRE_BOT_PRIVATE_KEY }}
+
+      - name: Checkout torch-spyre @ default branch
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          fetch-depth: 1
+
+      - name: Download triage inputs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: crcr-triage-inputs
+
+      - name: Download issue map
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: crcr-triage-issues
+
+      - name: Merge triage inputs
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          failures = json.loads(Path("failures.json").read_text())
+          issue_map = {"buckets": {}}
+          if Path("issue_map.json").is_file():
+              issue_map = json.loads(Path("issue_map.json").read_text())
+          failures["issue_map"] = issue_map.get("buckets", {})
+          Path("triage_input.json").write_text(json.dumps(failures, indent=2))
+          PY
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: latest-known
+
+      - name: Install pre-commit
+        # The skill's yamlfmt validation step needs it.
+        run: uv tool install pre-commit
+
+      - name: Configure git identity
+        run: |
+          git config user.name "spyre-bot[bot]"
+          git config user.email "spyre-bot[bot]@users.noreply.github.com"
+
+      - name: Install Claude Code CLI
+        run: |
+          if command -v npm >/dev/null 2>&1; then
+            npm install -g @anthropic-ai/claude-code
+          else
+            curl -fsSL https://claude.ai/install.sh | bash
+            echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+          fi
+
+      - name: Run Claude (headless skill)
+        id: claude
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          claude -p "$(cat .github/scripts/crcr_auto_recover_prompt.md)" \
+            --permission-mode bypassPermissions \
+            --max-turns 50 --output-format json > claude_result.json || true
+          python3 -c "import json; \
+          print(json.load(open('claude_result.json')).get('result', '')[:2000])" \
+            >> "${GITHUB_STEP_SUMMARY}" || true
+
+      - name: Guardrail - skip PRs touch only upstream-beta configs
+        # Checks every open crcr-auto-skip PR (the run may have appended to
+        # a pre-existing one): any file outside tests/configs/upstream_tests_beta/
+        # gets the PR closed automatically.
+        if: always()
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          status=0
+          for pr in $(gh pr list -R "${{ github.repository }}" \
+              --state open --label crcr-auto-skip \
+              --json number --jq '.[].number'); do
+            bad="$(gh pr view "${pr}" -R "${{ github.repository }}" \
+              --json files \
+              --jq '[.files[].path | select(startswith("tests/configs/upstream_tests_beta/") | not)] | length')"
+            if [ "${bad}" != "0" ]; then
+              gh pr close "${pr}" -R "${{ github.repository }}" \
+                --comment "Closed automatically by crcr-regression-triage: a crcr-auto-skip PR may only touch tests/configs/upstream_tests_beta/."
+              echo "::error::PR #${pr} touched files outside tests/configs/upstream_tests_beta/ and was closed"
+              status=1
+            fi
+          done
+          exit "${status}"
