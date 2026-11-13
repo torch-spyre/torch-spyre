@@ -896,7 +896,7 @@ class _SympyExprToCpSat(Printer):
             arg, xs, table = expr.args
             if all(v.is_Integer for v in table):
                 return expr
-            values = (int(round(m * v)) for v in table)
+            values = (int(round(m * float(v))) for v in table)
             return _CurveTable(arg, xs, sympy.Tuple(*values)) / m
 
         def curve_term(term):
@@ -922,10 +922,14 @@ class _SympyExprToCpSat(Printer):
         for term in terms:
             curve = curve_term(term)
             if curve is not None:
-                values += [float(curve[0] * v) for v in curve[1].args[2]]
+                coefficient = float(curve[0])
+                values += [coefficient * float(v) for v in curve[1].args[2]]
                 continue
             coefficient = term.as_coeff_Mul()[0]
-            (exact if coefficient.is_Rational else values).append(coefficient)
+            if coefficient.is_Rational:
+                exact.append(coefficient)
+            else:
+                values.append(float(coefficient))
         base = math.lcm(*(int(c.q) for c in exact)) if exact else 1
         if not values:
             m = base
@@ -940,7 +944,8 @@ class _SympyExprToCpSat(Printer):
             curve = curve_term(expr) if expr.has(_CurveTable) else None
             if curve is not None:
                 coefficient, table = curve
-                values = (int(round(m * coefficient * v)) for v in table.args[2])
+                scale = m * float(coefficient)
+                values = (int(round(scale * float(v))) for v in table.args[2])
                 r = _CurveTable(table.args[0], table.args[1], sympy.Tuple(*values))
             elif isinstance(expr, sympy.Mul) and isinstance(expr.args[0], sympy.Number):
                 a = (expr.args[0] * m).round()
