@@ -4162,33 +4162,24 @@ def spyre_index_add(
     return torch.ops.aten.index_put.default(self, indices, updated, accumulate=False)
 
 
-@register_spyre_decompositions([torch.ops.aten.index_fill.int_Scalar])
-def spyre_index_fill(
-    self: torch.Tensor,
-    dim: int,
-    index: torch.Tensor,
-    value: Union[int, float, bool],
-) -> torch.Tensor:
-    """`index_fill` as a materialized `full` plus an overwrite-scatter.
-
-    ``value`` is built into a tensor shaped like the written slice -- ``self``'s
-    shape with the filled dim narrowed to ``index.numel()`` -- and stored with
-    ``index_put``, which runs on the indirect-access engine. ``new_full`` carries
-    ``self``'s dtype and device, so no promotion is introduced.
-
-    ``indices`` selects the filled dim positionally: ``None`` covers a dim whole,
-    so ``[None] * dim + [index]`` is the list form of ``self[..., index]`` at
-    ``dim``. ``accumulate=False`` makes the write an overwrite.
-
-    Duplicate entries in ``index`` are safe here: every writer to a slot stores
-    the same value, so the surviving writer does not matter.
-    """
-    dim = dim % self.dim()
-    fill_shape = list(self.shape)
-    fill_shape[dim] = index.numel()
-    src = self.new_full(fill_shape, value)
-    indices: list[Optional[torch.Tensor]] = [None] * dim + [index]
-    return torch.index_put(self, indices, src, accumulate=False)
+# -- Scalar-valued stores ------------------------------------------------
+#
+# A write whose value is a bare number reaches ``SpyreKernel.store`` as an
+# ``ops.constant`` and is rejected ("store value of unexpected type Constant"):
+# codegen can only store from an allocated buffer. The fix is always to
+# materialize the number into a real tensor first, but where that belongs
+# depends on how the op carries it:
+#
+#   * ``index_fill.int_Scalar`` -- upstream's own decomposition turns the value
+#     into a broadcast ``scalar_tensor``, a graph node, so ``materialize_scalar_fill``
+#     (a post-grad pass) rewrites it there. One rewrite serves every op spelled
+#     that way, so no decomposition is registered here.
+#   * ``scatter.value`` -- no decomposition exists upstream, so the number stays
+#     an argument of the op and never becomes a node. A pass has nothing to
+#     match; only rewriting the op itself works, which is what this does.
+#
+# ``masked_fill`` needs no entry: it decomposes to ``where``, handled by the
+# ``where.Scalar*`` decompositions above.
 
 
 @register_spyre_decompositions([torch.ops.aten.scatter.value])
@@ -4201,11 +4192,13 @@ def spyre_scatter_value(
     """`scatter.value` as `scatter.src` with the scalar materialized.
 
     ``scatter.src`` takes its written values from a tensor shaped like ``index``
-    -- one value per index entry -- so ``value`` is built to that shape and
-    forwarded. ``new_full`` carries ``self``'s dtype and device.
+    -- one value per index entry -- so the block is built to that shape and
+    forwarded. ``new_full`` carries ``self``'s dtype and device, so no promotion
+    is introduced, and it allocates: an ``expand`` of the scalar would put the
+    constant straight back into the store it is being materialized out of.
 
-    As in :func:`spyre_index_fill`, duplicate index entries are safe: every
-    writer stores the same value.
+    Duplicate entries in ``index`` are safe here: every writer to a slot stores
+    the same value, so the surviving writer does not matter.
     """
     dim = dim % self.dim()
     src = self.new_full(list(index.shape), value)
