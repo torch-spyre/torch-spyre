@@ -111,6 +111,9 @@ class _CurveTable(sympy.Function):
     ``_division_table`` as one element lookup."""
 
     nargs = 3
+    # A number, like any value; its Tuple arguments would otherwise leave
+    # sympy unable to tell, and a coefficient would not distribute over it.
+    is_commutative = True
 
     @classmethod
     def eval(cls, arg, values, table):
