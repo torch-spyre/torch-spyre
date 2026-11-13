@@ -74,9 +74,10 @@ reaches the search untiled: `span_reduction_pass` refuses it, unless the opt-in 
 has tiled it first, and an op already tiled is offered no tiling. So this search still only finds
 tilings that pay through LX residency.
 
-That payoff is not a derate. Every tiling-sensitive derate in the cost model is bounded by 1.0, and
-the objective's `_COST_PARAMS` pins them at 1.0 besides, so none can rank a tiling above not
-tiling. What a tiling does is divide `_per_core_size` by `output_tile_count` as well as
+That payoff is not a derate. The tiling-sensitive derates price how a tile's height and working
+set slow its stream: the coarse underfill derate rises to `coarse_underfill_cap` at most, and the
+LX-spill derate never speeds a stream up, so they rank a tiling above not tiling by no more than
+that cap. What a tiling does is divide `_per_core_size` by `output_tile_count` as well as
 `output_partition`, which can bring a buffer under `_eligible`'s capacity gate and be repaid in the
 HBM traffic residency then frees.
 

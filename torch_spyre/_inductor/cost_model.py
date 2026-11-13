@@ -1071,6 +1071,15 @@ def _select(flag, if_true, if_false):
     return if_true if flag else if_false
 
 
+def _given(flag, value):
+    """``value`` where ``flag`` holds: ``_select(flag, x, y)`` is ``x`` there. For use
+    inside a branch already selected by ``flag``, so the other arm -- an untiled op's
+    zero tile height -- never reaches a reciprocal or a power."""
+    if isinstance(value, sympy.Piecewise) and value.args[0][1] == flag:
+        return value.args[0][0]
+    return value
+
+
 def coarse_underfill_eff(
     rpc: float,
     cols: float,
@@ -1155,36 +1164,35 @@ def coarse_underfill_eff_matmul(rpc: float, params: CostParams | None = None) ->
     )
 
 
-def _lx_spill_working_set(ops: list) -> float:
-    """Per-core LX working set (bytes) of a coarse-tiled bundle: ~2 live intermediate tiles,
-    each ``tile_rows_per_core * cols`` elements. 0.0 if nothing is output-tiled."""
-    ws = 0.0
+def _lx_spill_bw_derate(ops: list, params: CostParams | None = None) -> float:
+    """Bandwidth derate when a coarse-tiled kernel's per-core working set overflows LX. The
+    spilled intermediates are already counted as HBM bytes, but that traffic runs slower, so
+    ``BW *= (lx_spill_cap / ws)**lx_spill_exp`` for ``ws > cap``. Gated to non-matmul coarse
+    tiling (softmax-calibrated); 1.0 when it does not apply.
+
+    The working set is ~2 live intermediate tiles of ``tile_rows_per_core * cols``
+    elements. Taken op by op, ``min(1, (cap / ws)**exp)`` under each op's own
+    ``tiles_output_dim``, which is the derate of the largest working set and keeps an
+    untiled op's zero out of the power."""
+    p = params or CostParams()
+    _cap, _exp = p.lx_spill_cap_bytes, p.lx_spill_exp
+    if any(getattr(o, "is_matmul", False) for o in ops):
+        _cap, _exp = p.mm_spill_ws_cap_bytes, p.mm_spill_ws_exp
+    derate = 1.0
     for o in ops:
-        rpc = o.tile_rows_per_core
         cols = _op_cols(o)
         # A symbolic `cols` is a dynamic-shape width, not a solver variable: it
         # must not reach the cost (see `coarse_underfill_eff`).
         if _is_sym(cols):
             continue
-        ws = max(ws, _select(o.tiles_output_dim, 2.0 * rpc * cols * o.dtype_bytes, 0))
-    return ws
-
-
-def _lx_spill_bw_derate(ops: list, params: CostParams | None = None) -> float:
-    """Bandwidth derate when a coarse-tiled kernel's per-core working set overflows LX. The
-    spilled intermediates are already counted as HBM bytes, but that traffic runs slower, so
-    ``BW *= (lx_spill_cap / ws)**lx_spill_exp`` for ``ws > cap``. Gated to non-matmul coarse
-    tiling (softmax-calibrated); 1.0 when it does not apply."""
-    p = params or CostParams()
-    ws = _lx_spill_working_set(ops)
-    _cap, _exp = p.lx_spill_cap_bytes, p.lx_spill_exp
-    if any(getattr(o, "is_matmul", False) for o in ops):
-        _cap, _exp = p.mm_spill_ws_cap_bytes, p.mm_spill_ws_exp
-    # `max(ws, _cap)` rather than `min(1.0, (_cap / ws) ** _exp)`: the same
-    # value, but no division by zero when nothing is output-tiled (ws == 0).
-    if ws == 0:
-        return 1.0
-    return _cap**_exp / max(ws**_exp, _cap**_exp)
+        rpc = _given(o.tiles_output_dim, o.tile_rows_per_core)
+        ws = 2.0 * rpc * cols * o.dtype_bytes
+        if not _is_sym(ws) and ws <= 0:
+            continue
+        derate = min(
+            derate, _select(o.tiles_output_dim, min(1.0, (_cap / ws) ** _exp), 1.0)
+        )
+    return derate
 
 
 def _bmm_layout_pair(o) -> tuple:
@@ -2831,7 +2839,9 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
             eff,
             _select(
                 o.tiles_output_dim,
-                coarse_underfill_eff(o.tile_rows_per_core, _op_cols(o), p),
+                coarse_underfill_eff(
+                    _given(o.tiles_output_dim, o.tile_rows_per_core), _op_cols(o), p
+                ),
                 1.0,
             ),
         )

@@ -211,6 +211,31 @@ def _residency_graph(producer, output_names=()):
     )
 
 
+class TestSymbolicMinMax(unittest.TestCase):
+    """``work_division.max``/``min`` take a single iterable as the builtins do."""
+
+    def test_a_generator_is_read_once(self):
+        values = [3, 1024, 5]
+        self.assertEqual(work_division_module.max((v for v in values), default=0), 1024)
+        self.assertEqual(work_division_module.min((v for v in values), default=0), 3)
+        self.assertEqual(work_division_module.max((v for v in []), default=7), 7)
+        x = sympy.Symbol("x", positive=True)
+        self.assertEqual(work_division_module.max(v for v in (x, 2)), sympy.Max(x, 2))
+
+    def test_an_op_width_reaches_the_cost_model(self):
+        from torch_spyre._inductor.cost_model import ArgTraffic, OpFeatures, _op_cols
+
+        op = OpFeatures(
+            name="softmax",
+            is_reduction=False,
+            out_elems=4096,
+            cores=32,
+            dtype_bytes=2,
+            args=[ArgTraffic("in0", "input", False, 4096, logical=[4, 1024])],
+        )
+        self.assertEqual(_op_cols(op), 1024)
+
+
 class TestLoopCarryLxEligibility(unittest.TestCase):
     def setUp(self):
         self.allocator = ScratchpadAllocator(GreedyLayoutSolver, 2**20)
