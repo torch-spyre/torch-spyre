@@ -441,6 +441,10 @@ class _SympyExprToCpSat(Printer):
             result = np.equal(*values)
         else:
             return None
+        if isinstance(result, np.ndarray) and result.dtype != object:
+            # Comparisons and np.where give bool or int64 arrays; kept as
+            # objects, a later sum or product can outgrow int64.
+            result = result.astype(object)
         return owner, result
 
     def _division_table(self, expr):

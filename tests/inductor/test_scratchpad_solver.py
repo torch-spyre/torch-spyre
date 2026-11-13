@@ -2438,18 +2438,25 @@ class TestSympyExprToCpSatPrinter(TestCase):
             round(8820.2702261091 * 2**31),
         )
 
-    def test_a_min_over_integers_past_int64_evaluates_without_overflow(self):
-        # Exactly rounded Min/Max operands can outgrow int64; their candidate
-        # values compare as Python integers.
+    def test_integers_past_int64_evaluate_without_overflow(self):
+        # Exactly rounded coefficients can outgrow int64; candidate values are
+        # Python integers through every operation.
         model = cp_model.CpModel()
         division = model.new_int_var(0, 2, "division")
         owner = types.SimpleNamespace(division=division)
         printer = _SympyExprToCpSat(model, {}, {"split_a": (owner, [1, 2, 4])})
         a = sympy.Symbol("split_a", integer=True, positive=True)
         # A Piecewise of small integers evaluates to an int64 array.
-        expr = sympy.Min(sympy.Piecewise((1, a > 1), (2, True)), 3 * 2**70)
-        _, values = printer._candidate_values(expr)
-        self.assertEqual(list(values), [2, 1, 1])
+        branch = sympy.Piecewise((1, a > 1), (2, True))
+        big = 3 * 2**70
+        for expr, want in (
+            (sympy.Min(branch, big), [2, 1, 1]),
+            (branch + big, [big + 2, big + 1, big + 1]),
+            (branch * big, [2 * big, big, big]),
+        ):
+            with self.subTest(expr=type(expr).__name__):
+                _, values = printer._candidate_values(expr)
+                self.assertEqual(list(values), want)
 
     def test_a_negative_product_pushed_into_a_min_keeps_its_value(self):
         # c * Min(R, W) * D with c < 0, D a derate over a buffer's curve (the
