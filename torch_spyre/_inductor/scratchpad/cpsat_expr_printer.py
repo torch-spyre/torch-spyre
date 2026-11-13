@@ -62,10 +62,6 @@ _CORE_INV_SCALE = 1024
 _CORE_INV_SCALE_MAX_VALUE = 32
 # constant limit on product terms to avoid int32 overflow in CP-SAT
 _MAX_PRODUCT_BOUND = 2**30
-# Levels of a term table (see _SympyExprToCpSat._term_lookup). A term enters
-# the objective as a sum, never as a factor, so it is held to the objective's
-# precision rather than to _MAX_PRODUCT_BOUND.
-_TERM_TABLE_BOUND = 2**40
 
 
 _operator_map = {
@@ -523,7 +519,9 @@ class _SympyExprToCpSat(Printer):
     def _term_lookup(self, division, values):
         """One ``element`` lookup of ``division``, ``offset + coefficient *
         level``: exact where the entries' common denominator keeps the levels
-        inside _TERM_TABLE_BOUND, else rounded against the entries' span."""
+        inside _MAX_PRODUCT_BOUND, else rounded against the entries' span. A
+        wider level, though it only enters the objective as a sum, leaves
+        CP-SAT's scaling of a float objective too coarse to tell plans apart."""
         rationals = [Fraction(float(v)) for v in values]
         base = min(rationals)
         denominator = math.lcm(*(v.denominator for v in rationals))
@@ -531,8 +529,8 @@ class _SympyExprToCpSat(Printer):
         divisor = math.gcd(*differences)
         table = tuple(v // divisor for v in differences)
         offset, coefficient = _number(base), _number(Fraction(divisor, denominator))
-        if max(table) > _TERM_TABLE_BOUND:
-            step = (max(rationals) - base) / _TERM_TABLE_BOUND
+        if max(table) > _MAX_PRODUCT_BOUND:
+            step = (max(rationals) - base) / _MAX_PRODUCT_BOUND
             table = tuple(round((v - base) / step) for v in rationals)
             coefficient = float(step)
         key = division.index, table

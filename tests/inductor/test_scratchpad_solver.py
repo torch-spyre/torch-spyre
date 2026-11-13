@@ -2712,8 +2712,10 @@ class TestSympyExprToCpSatPrinter(TestCase):
             numerator / a, {"split_a": over_cap_values}, pinned
         )
         self.assertEqual(self._scale_of("split_a", over_cap_values), fallback_scale)
-        # 7 divides the fallback scale, so the pinned division is priced exactly.
-        self.assertAlmostEqual(got, numerator / 7)
+        # The term is one table: no exact integer levels for these values, so
+        # it is rounded against its span, off by at most half a level.
+        step = (numerator - numerator / 17) / _MAX_PRODUCT_BOUND
+        self.assertAlmostEqual(got, numerator / 7, delta=step / 2)
 
     @staticmethod
     def _lin_max_operand_sizes(model):
