@@ -81,6 +81,7 @@ from torch_spyre._inductor.constants import (
     IDENTITY_OP,
     MAX_POOL_SIZE_BYTES,
     RESTICKIFY_OP,
+    RESTICKIFY_SUPPORTED_DEVICE_DTYPES,
     STAGGERED_EAS,
 )
 from torch_spyre._inductor.logging_utils import get_inductor_logger
@@ -3755,8 +3756,7 @@ class KtirBuilder:
         # generic name (or a plain copy, when its operands already line up).
         # Both are ordinary unary ops whose payload yields its operand: whether
         # the operand has to be moved is ``operand_alignment``'s question, asked
-        # of every pointwise op's inputs in ``_compute_step``.  The arm claims fp16 and fp32, the formats
-        # a copy has been run at, so any other format has no arm.
+        # of every pointwise op's inputs in ``_compute_step``.
         #
         # The payload is ``spyreop.identity``, not a body that only yields its
         # input.  Canonicalization erases a ``linalg.generic`` that only yields
@@ -3768,7 +3768,7 @@ class KtirBuilder:
             arms=Arm(
                 kind=BindingKind.PAYLOAD,
                 binding=lambda: spyreop.identity,
-                dtypes=(DataFormats.SEN169_FP16, DataFormats.IEEE_FP32),
+                dtypes=tuple(RESTICKIFY_SUPPORTED_DEVICE_DTYPES),
             ),
         ),
         IDENTITY_OP: Recipe(
