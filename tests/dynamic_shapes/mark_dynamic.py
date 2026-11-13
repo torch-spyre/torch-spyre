@@ -15,11 +15,10 @@
 
 # Compiled via torch.compile with an explicit dynamic dimension registered
 # through torch._dynamo.mark_dynamic.  Dim 0 is annotated with min=1, max=576,
-# so the ShapeEnv records a finite upper bound for that symbol. This is planned to
-# exercise the path where compute_max_size can return the
-# ShapeEnv bound directly rather than falling back to optimization_hint.
-# Right now this is a work in progress- the bound is not yet propagated into
-# the SDSC.
+# so the ShapeEnv records a finite upper bound for that symbol. Outside a
+# for_each_tile loop such a size is refused at compile: only a dimension declared
+# with tensor.to("spyre", dynamic=...) and consumed by a for_each_tile loop can
+# vary at runtime.
 
 
 import torch
@@ -42,20 +41,16 @@ dynamo.mark_dynamic(x_device, 0, min=1, max=576)
 compiled_fn = torch.compile(gelu_fn)
 cpu_result = gelu_fn(x)
 
-# EXPECTED FAILURE: dispatch currently fails here. bundle.py emits an extra
-# input_arg parameter for the mark_dynamic bound, but the runtime (.run() /
-# launch_jobplan) isn't yet wired to supply that extra argument, so Deeptools
-# raises a "Number of inputs mismatches." DtException. Tracked in #2434.
-# Kept as a reproducer for that issue rather than removed or silently fixed
-# up here.
-_EXPECTED_MSG_SUBSTRINGS = ("Number of inputs mismatches",)
+# EXPECTED FAILURE: the compile refuses a mark_dynamic(max=...) size outside a
+# for_each_tile loop and names the supported interface.
+_EXPECTED_MSG_SUBSTRINGS = ("but no declaration",)
 
 try:
     compiled_result = compiled_fn(x_device).cpu()
 except RuntimeError as e:
     if not any(s in str(e) for s in _EXPECTED_MSG_SUBSTRINGS):
         raise
-    print(f"Expected dispatch failure (see #2434): {e}")
+    print(f"Expected compile refusal: {e}")
 else:
     # Compare results
     print(f"CPU result\n{cpu_result}")

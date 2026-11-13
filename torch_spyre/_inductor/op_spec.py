@@ -378,8 +378,8 @@ class OpSpec:
         default_factory=dict
     )
     # Maps PyTorch symbol name (e.g. 's97') -> (max, granularity) bounds.
-    # Populated by compute_symbolic_bounds during
-    # create_op_spec; empty for concrete dims.
+    # create_op_spec no longer populates it (it refuses mark_dynamic(max=...)
+    # sizes outside for_each_tile), so it is empty in every compile.
     symbolic_dim_bounds: dict[str, tuple[int, int]] = dataclasses.field(
         default_factory=dict
     )

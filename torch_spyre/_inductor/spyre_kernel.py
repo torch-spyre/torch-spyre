@@ -74,7 +74,6 @@ from .pass_utils import (
     concretize_expr,
     declared_dims_in,
     op_read_writes,
-    compute_symbolic_bounds,
     max_trip_count,
     require_declared_count,
     symbolic_count_bounds,
@@ -1313,11 +1312,6 @@ class SpyreKernel(Kernel[CSEVariable]):
             # Reverse so index 0 = innermost level.
             tiled_syms = list(reversed(tiled_syms_per_level_outermost))
 
-        # Collect (max, granularity) bounds for any symbolic iteration-space
-        # dims. These are passed through OpSpec so SDSC codegen can emit
-        # symbolicDimInfo_ without needing the live ShapeEnv (which is gone
-        # during the codegen phase).
-        symbolic_dim_bounds: dict[str, tuple[int, int]] = {}
         for _, (size_expr, _) in it_space_extended.items():
             if not (hasattr(size_expr, "free_symbols") and size_expr.free_symbols):
                 continue
@@ -1341,13 +1335,23 @@ class SpyreKernel(Kernel[CSEVariable]):
                 )
             if finite_upper_or_none(size_expr) is None:
                 logger.debug(
-                    f"[work_division/symbolic] skipping auto-dynamic symbol "
-                    f"{size_expr}; use mark_dynamic(max=...) to enable symbolic planning"
+                    f"[create_op_spec] {size_expr} has no maximum and is specialised "
+                    "to this compile's size; to vary it at runtime, declare it with "
+                    'tensor.to("spyre", dynamic=...) and loop over it with for_each_tile'
                 )
                 continue
-            bounds = compute_symbolic_bounds(size_expr)
-            if bounds is not None:
-                symbolic_dim_bounds[str(size_expr)] = bounds
+            # A size with a finite maximum (mark_dynamic(max=...) or torch._check)
+            # but no declaration has no for_each_tile loop to carry it, and the
+            # SDSC can only be built at one concrete size. Refuse here rather
+            # than emit an SDSC dimension symbol that async_compile rejects.
+            raise Unsupported(
+                f"{op} ({ir_node.get_operation_name()}): its iteration space "
+                f"has size {size_expr}, which has a finite maximum "
+                "(mark_dynamic(max=...) or torch._check) but no declaration. A "
+                'varying size is declared with tensor.to("spyre", dynamic=...) '
+                "and consumed by a for_each_tile loop over it (dims=(d,), "
+                "tile_size=granularity)."
+            )
 
         # Provenance is a debug-only feature: a failure building the handle must
         # never break a compile. build_debug_handle is best-effort, but guard the
@@ -1406,7 +1410,6 @@ class SpyreKernel(Kernel[CSEVariable]):
             op_info,
             tiled_symbols=tiled_syms,
             tiled_symbol_trip_counts=tiled_symbol_trip_counts,
-            symbolic_dim_bounds=symbolic_dim_bounds,
             node_output_ranges=node_output_ranges,
             completed_producer_cores=(
                 relayout_plans[0].completed_producer_cores if relayout_plans else ()
