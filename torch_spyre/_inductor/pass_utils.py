@@ -3094,12 +3094,23 @@ def expand_sparse(in_stl, output: FixedLayout) -> tuple[bool, SpyreTensorLayout]
     return False, out_stl
 
 
-def host_sparse_layout(
+def sparse_stl_from_host(
     host: FixedLayout, dtype: "torch.dtype | None" = None
 ) -> SpyreTensorLayout:
-    """The sparse layout a restickify of ``host`` reaches by moving the stick onto
-    a new size-1 dim and leaving the other dims in place: the former stick dim
+    """Build a SpyreTensorLayout from the host shape of ``host``: the stick moves
+    onto a new size-1 dim and the other host dims are kept.  The former stick dim
     becomes the outermost device dim.
+
+    Used only when no device layout of the input can be restickified, so the host
+    shape is the only source of dims (see ``propagate_layouts``).
+
+    dim_order convention (``SpyreTensorLayout`` in spyre_tensor_impl.cpp): the
+    C++ constructor puts ``dim_order[1]`` in the OUTERMOST device slot, the entry
+    ``-1`` (the new size-1 dim) in the slot second from the innermost, and
+    ``dim_order[0]`` in the slot just before the stick.  So for rank above 2 the
+    list is rebuilt as ``[outer_first[0], outer_first[-1]] + outer_first[1:-1]``:
+    the stick (smallest stride, ``outer_first[-1]``) is ``dim_order[1]``, outermost.
+    Do not "simplify" this to a plain sort; TestHostSparseLayout checks the result.
 
     The former stick dim is the one padded to a whole number of sticks, and the
     padding is added at the end of that dim.  Only when it is outermost does the
@@ -3119,7 +3130,46 @@ def host_sparse_layout(
     )
 
 
-def sparse_layout_serves_read(
+def restickify_dense_stl_to_sparse(
+    stl: SpyreTensorLayout, in_host: FixedLayout
+) -> "SpyreTensorLayout | None":
+    """The sparse layout of ``in_host`` that keeps the outer dim order of the dense
+    ``stl`` and moves the stick to the outermost device slot.
+
+    The device dims of ``stl`` are read outermost first, and each is matched to a
+    host dim by its stride.  The stick's outer part (stride ``stick_size`` times the
+    stick's host stride) is the stick dim itself, so it is skipped here.  The
+    result is built with the ``dim_order`` convention of ``sparse_stl_from_host``.
+
+    Returns None when a device dim cannot be matched to a host dim.
+    """
+    sizes = [int(concretize_expr(v)) for v in in_host.size]
+    strides = [int(concretize_expr(v)) for v in in_host.stride]
+    stick_size = stl.elems_per_stick()
+    stick_stride = stl.stride_map[-1]
+    stick_dim = next(
+        (d for d in range(len(sizes)) if sizes[d] > 1 and strides[d] == stick_stride),
+        None,
+    )
+    if stick_dim is None:
+        return None
+    outer_first = [stick_dim]
+    for j in range(len(stl.device_size) - 1):
+        s = stl.stride_map[j]
+        if stl.device_size[j] == 1 or s == 0 or s == stick_size * stick_stride:
+            continue
+        d = next(
+            (d for d in range(len(sizes)) if sizes[d] > 1 and strides[d] == s), None
+        )
+        if d is None or d in outer_first:
+            return None
+        outer_first.append(d)
+    outer_first += [d for d in range(len(sizes)) if d not in outer_first]
+    dim_order = [outer_first[-1]] + outer_first[:-1] + [-1]
+    return SpyreTensorLayout(sizes, strides, in_host.dtype, dim_order)
+
+
+def sparse_target_for_unservable_read(
     stl: SpyreTensorLayout,
     in_host: FixedLayout,
     dep: MemoryDep,
@@ -3127,14 +3177,15 @@ def sparse_layout_serves_read(
     *,
     op: "Operation | None" = None,
 ) -> "SpyreTensorLayout | None":
-    """The host sparse layout of ``in_host`` when it can serve the read of ``dep``
-    that ``stl`` cannot, else ``None``.
+    """The sparse restickify target for ``in_host`` when it serves the read of
+    ``dep`` that the dense ``stl`` cannot, else ``None``.
 
     A read whose device coordinates are unsupported on ``stl`` (for example the
     flatten of ``[8, 65]`` into ``[520]``, which splits a stick) may still be
-    representable on the input's sparse layout, where the stick sits on a new
-    size-1 dim and has no variable left to split.  Only a STANDARD input in a
-    restickify format can be moved there.
+    representable with the stick on a new size-1 dim.  The target keeps the dims
+    of ``stl`` (``restickify_dense_stl_to_sparse``) and is returned only if it
+    serves the read; otherwise the host-shape layout is tried.  Only a STANDARD
+    input in a restickify format can be moved.
     """
     if (
         stl.device_dtype not in RESTICKIFY_SUPPORTED_DEVICE_DTYPES
@@ -3143,10 +3194,17 @@ def sparse_layout_serves_read(
         or try_device_coordinates(stl, dep, indirect_sizes, op=op) is not None
     ):
         return None
-    sparse = host_sparse_layout(in_host)
-    if try_device_coordinates(sparse, dep, indirect_sizes, op=op) is None:
-        return None
-    return sparse
+    candidates = [
+        restickify_dense_stl_to_sparse(stl, in_host),
+        sparse_stl_from_host(in_host),
+    ]
+    for target in candidates:
+        if (
+            target is not None
+            and try_device_coordinates(target, dep, indirect_sizes, op=op) is not None
+        ):
+            return target
+    return None
 
 
 def compute_restickify_needed(
@@ -3187,7 +3245,9 @@ def compute_restickify_needed(
         # dims first, the former stick dim outermost) on which
         # try_device_coordinates serves this read. Keep the sparse layout below
         # as the fallback for a read with no such dim, such as a flatten to 1-D.
-        sparse = sparse_layout_serves_read(in_stl, in_host, in_dep, ind_sizes, op=op)
+        sparse = sparse_target_for_unservable_read(
+            in_stl, in_host, in_dep, ind_sizes, op=op
+        )
         if sparse is not None:
             return True, sparse
         # The layouts has a stick expression the backend cannot

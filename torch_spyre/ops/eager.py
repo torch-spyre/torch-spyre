@@ -18,6 +18,7 @@ import torch_spyre.ops.fallbacks  # noqa: F401
 from .fallbacks import _get_op_overloads, warn_fallback
 from .warning_types import RetileWarning
 import warnings
+import collections
 import contextlib
 import functools
 import inspect
@@ -158,8 +159,11 @@ def _materialize_offset_view(x):
     return x
 
 
-# Compiled view rebuilders by (base shape, base dtype, view geometry).
-_view_rebuilders: dict = {}
+# Compiled view rebuilders by (base shape, base dtype, view geometry).  Bounded
+# like ``_layout_serves_view``: a workload with many shapes would otherwise keep
+# one compiled function per geometry forever.
+_VIEW_REBUILDER_CACHE_SIZE = 256
+_view_rebuilders: collections.OrderedDict = collections.OrderedDict()
 
 
 def _rebuild_view_on_device(x):
@@ -181,7 +185,9 @@ def _rebuild_view_on_device(x):
     size, stride, offset = tuple(x.shape), tuple(x.stride()), x.storage_offset()
     key = (tuple(base.shape), base.dtype, size, stride, offset)
     rebuild = _view_rebuilders.get(key)
-    if rebuild is None:
+    if rebuild is not None:
+        _view_rebuilders.move_to_end(key)
+    else:
         twice = torch.logical_not if x.dtype == torch.bool else torch.neg
 
         def view_copy(b):
@@ -192,6 +198,8 @@ def _rebuild_view_on_device(x):
         )
         rebuild = torch.compile(view_copy, dynamic=False)
         _view_rebuilders[key] = rebuild
+        if len(_view_rebuilders) > _VIEW_REBUILDER_CACHE_SIZE:
+            _view_rebuilders.popitem(last=False)
     return rebuild(base)
 
 

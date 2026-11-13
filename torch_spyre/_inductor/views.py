@@ -298,6 +298,24 @@ def _has_misaligned_step(index, vars, var_ranges, size, stride) -> bool:
     return False
 
 
+def _minimal_wrap_chain(strides: list) -> list:
+    """Reduce strides (descending) to the wrap chain used by the coordinate modulo.
+
+    ``Mod(Mod(x, a), b) == Mod(x, b)`` when ``b`` divides ``a``, so a stride that a
+    later, smaller one divides adds nothing and is dropped.  This is done here
+    instead of relying on sympy, which folds the chain wrongly (it turns
+    ``Mod(64*Mod(d0, 12), 256)`` into ``64*Mod(Mod(d0, 12)**2, 4)``).  Shared by
+    the per-variable and the whole-index coordinate paths.
+    """
+    wraps: list = []
+    for s in strides:
+        if wraps and wraps[-1] % s == 0:
+            wraps[-1] = s
+        else:
+            wraps.append(s)
+    return wraps
+
+
 def compute_coordinates(
     size: Sequence[sympy.Expr],
     stride: Sequence[sympy.Expr],
@@ -484,14 +502,8 @@ def _compute_coordinates_uncached(
             # and does not rely on sympy folding it: sympy turns
             # Mod(64*Mod(d0, 12), 256) into 64*Mod(Mod(d0, 12)**2, 4), which is
             # wrong.
-            wraps: list = []
-            for s in enclosing:
-                if wraps and wraps[-1] % s == 0:
-                    wraps[-1] = s
-                else:
-                    wraps.append(s)
             term = var * step
-            for s in wraps:
+            for s in _minimal_wrap_chain(enclosing):
                 term = term % s
             return term // target_stride
 
@@ -541,13 +553,15 @@ def _compute_coordinates_uncached(
             if size[dim] == 1 or st <= 0 or st > limit:
                 continue
             term = index
-            for enclosing in sorted(
-                {
-                    _concretize_for_cmp(stride[j])
-                    for j in range(n)
-                    if size[j] > 1 and st < _concretize_for_cmp(stride[j]) <= limit
-                },
-                reverse=True,
+            for enclosing in _minimal_wrap_chain(
+                sorted(
+                    {
+                        _concretize_for_cmp(stride[j])
+                        for j in range(n)
+                        if size[j] > 1 and st < _concretize_for_cmp(stride[j]) <= limit
+                    },
+                    reverse=True,
+                )
             ):
                 term = term % enclosing
             coordinates[dim] += term // st

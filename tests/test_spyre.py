@@ -1359,6 +1359,26 @@ class TestSpyre(TestCase):
                         restored.cpu(), expected, atol=atol, rtol=rtol
                     )
 
+    def test_unservable_view_in_compiled_fallback_uses_host_copy(self):
+        """Inside a compiled fallback the unservable view is copied through the
+        host and warns, instead of compiling a rebuild (no nested torch.compile)."""
+        from torch_spyre.ops.eager import (
+            _materialize_unservable_view,
+            _run_compiled_fallback,
+        )
+        from torch_spyre.ops.fallbacks import FallbackWarning
+
+        base_cpu = torch.arange(8 * 65, dtype=torch.float16).reshape(8, 65)
+        base = base_cpu.to("spyre")
+        view = base.reshape(-1)  # [8, 65] flattened splits a stick: unservable
+        expected = base_cpu.reshape(-1)
+
+        with self.assertWarnsRegex(FallbackWarning, "unaligned view"):
+            copied = _run_compiled_fallback(_materialize_unservable_view, view)
+
+        self.assertEqual(copied.device.type, "spyre")
+        torch.testing.assert_close(copied.cpu(), expected)
+
     def test_unsupported_d2d_dtype_conversion_falls_back(self):
         """Unsupported native D2D pairs retain the CPU fallback behavior."""
         from torch_spyre._C import ElementArrangement, get_spyre_tensor_layout
