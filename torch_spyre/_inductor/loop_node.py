@@ -502,6 +502,7 @@ def _wrap(
     prefix: tuple[int, ...],
     inductions: Mapping[int, sympy.Symbol],
     counter: list[int],
+    only: frozenset[int] | None = None,
 ) -> list[ir.Operation]:
     """Wrap runs of ``ops`` sharing a ``loop_group_id`` prefix of length
     ``depth + 1`` (and extending ``prefix``) into ``LoopNode``s, recursively.
@@ -517,7 +518,11 @@ def _wrap(
     i = 0
     while i < len(ops):
         path = _group_path(ops[i])
-        if len(path) <= depth or path[:depth] != prefix:
+        if (
+            len(path) <= depth
+            or path[:depth] != prefix
+            or (only is not None and depth == 0 and path[0] not in only)
+        ):
             out.append(ops[i])
             i += 1
             continue
@@ -534,11 +539,58 @@ def _wrap(
             trip_count=ops[i].loop_info.loop_count[depth],  # type: ignore[attr-defined]
         )
         counter[0] += 1
-        node.body = _wrap(run, depth + 1, key, inductions, counter)
+        node.body = _wrap(run, depth + 1, key, inductions, counter, only)
         node.carries = _carries_of(node.body)
         out.append(node)
         i = last + 1
     return out
+
+
+_PENDING_ATTR = "pending_loop_inductions"
+
+
+def request_loop_nodes(graph: Any, inductions: Mapping[int, sympy.Symbol]) -> None:
+    """Ask for the loops whose group index is in ``inductions`` to become nodes.
+
+    A lowering that builds a loop in the middle of the pass pipeline records it
+    here instead of wrapping it: the pass that called it may still be iterating
+    ``graph.operations`` (a flat view, or the real list), and a node wrapped under
+    it would change what the rest of the pass sees. The pass loop calls
+    :func:`build_pending_loop_nodes` once the pass has returned.
+    """
+    if inductions:
+        pending = getattr(graph, _PENDING_ATTR, None) or {}
+        pending.update(inductions)
+        setattr(graph, _PENDING_ATTR, pending)
+
+
+def build_pending_loop_nodes(graph: Any) -> None:
+    """Wrap the loops :func:`request_loop_nodes` named, leaving every other op
+    (existing nodes, flat loops no lowering has converted yet) where it is.
+
+    Called with the real list, after the pass that built the loops has returned.
+    Node names continue after the nodes already present.
+    """
+    pending = getattr(graph, _PENDING_ATTR, None)
+    if not pending:
+        return
+    setattr(graph, _PENDING_ATTR, None)
+    if not BUILD_LOOP_NODES:
+        return
+    operations = graph.operations
+    assert not isinstance(operations, OpsView), "needs the real list"
+    existing = sum(1 for _ in _nodes_in(operations))
+    with building_loop():
+        operations[:] = _wrap(
+            list(operations), 0, (), pending, [existing], frozenset(pending)
+        )
+
+
+def _nodes_in(operations: Iterable[ir.Operation]) -> Iterator["LoopNode"]:
+    for op in operations:
+        if isinstance(op, LoopNode):
+            yield op
+            yield from _nodes_in(op.body)
 
 
 def collapse(

@@ -59,7 +59,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import logging
-from typing import NamedTuple
+from typing import NamedTuple, NoReturn
 
 import sympy
 from sympy import Expr
@@ -154,6 +154,7 @@ from .loop_tiling_common import (  # noqa: F401
     logger,
     reduction_loop_vars,
 )
+from .span_overflow_loop_terms import add_loop_terms
 
 
 # ---------------------------------------------------------------------------
@@ -225,6 +226,48 @@ def reject_nested_loops(groups: list[tuple], source: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def resolve_level_positions(
+    op: ComputedBuffer, levels: list[tuple]
+) -> tuple[list[list[int]], list[list[int]], dict[int, sympy.Symbol]]:
+    """Where each of a group's loop levels tiles ``op``.
+
+    Returns ``(tiled_dims, tiled_reduction_dims, unattributed_loop_vars)``:
+    per level, the op's output-range position tiled there (a list of zero or one)
+    and its reduction-range position; and the splice loop variables this op has no
+    dim to attribute (see ``_point_splice_advance_for_dep``). Shared by the legacy
+    planner and ``wsr.loop_tiling_lowering.build_loop_tiling_plan``, so the two
+    agree on positions by construction.
+
+    ``_hint_ranges_pos`` returns (position, is-a-reduction-dim) and is
+    authoritative on which channel the dim lands in: see its docstring for why a
+    WhileLoop-splice hint's own ``is_reduction`` cannot decide that per op.
+    """
+    op_out = op_out_coords(op)
+    hint_id_to_ranges_pos: dict[int, int] = {}
+    hint_id_to_reduction_ranges_pos: dict[int, int] = {}
+    unattributed_loop_vars: dict[int, sympy.Symbol] = {}
+    for h in getattr(op, "dim_hints", []):
+        if h.loop_var is None:
+            continue
+        pos, resolved_is_reduction = _hint_ranges_pos(op, h, op_out)
+        if pos is None:
+            if h.loop_var_range is not None:
+                unattributed_loop_vars[h.hint_id] = h.loop_var
+            continue
+        if resolved_is_reduction:
+            hint_id_to_reduction_ranges_pos[h.hint_id] = pos
+        else:
+            hint_id_to_ranges_pos[h.hint_id] = pos
+    tiled_dims: list[list[int]] = []
+    tiled_reduction_dims: list[list[int]] = []
+    for hint_id, _count in levels:
+        opos = hint_id_to_ranges_pos.get(hint_id)
+        rpos = hint_id_to_reduction_ranges_pos.get(hint_id)
+        tiled_dims.append([opos] if opos is not None else [])
+        tiled_reduction_dims.append([rpos] if rpos is not None else [])
+    return tiled_dims, tiled_reduction_dims, unattributed_loop_vars
+
+
 def plan_coarse_tile_groups(
     operations: list[Operation],
     groups: list[tuple],
@@ -286,40 +329,13 @@ def plan_coarse_tile_groups(
             # to 0 avoided the OS-5 crash but silently zeroed a real
             # per-trip advance).
 
-            op_out = op_out_coords(op)
             rw = op_read_writes(op)
             read_deps = [d for d in rw.reads if isinstance(d, MemoryDep)]
             write_deps = [d for d in rw.writes if isinstance(d, MemoryDep)]
 
-            # _hint_ranges_pos returns (position, is-a-reduction-dim) and is
-            # authoritative on which channel the dim lands in -- see its
-            # docstring for why a WhileLoop-splice hint's own is_reduction
-            # cannot decide that per op.
-            hint_id_to_ranges_pos: dict[int, int] = {}
-            hint_id_to_reduction_ranges_pos: dict[int, int] = {}
-            # Splice loop vars this op has no dim to attribute -- see
-            # _point_splice_advance_for_dep.
-            unattributed_loop_vars: dict[int, sympy.Symbol] = {}
-            for h in getattr(op, "dim_hints", []):
-                if h.loop_var is None:
-                    continue
-                pos, resolved_is_reduction = _hint_ranges_pos(op, h, op_out)
-                if pos is None:
-                    if h.loop_var_range is not None:
-                        unattributed_loop_vars[h.hint_id] = h.loop_var
-                    continue
-                if resolved_is_reduction:
-                    hint_id_to_reduction_ranges_pos[h.hint_id] = pos
-                else:
-                    hint_id_to_ranges_pos[h.hint_id] = pos
-
-            op_tiled_dims: list[list[int]] = []
-            op_tiled_reduction_dims: list[list[int]] = []
-            for hint_id, _count in levels:
-                opos = hint_id_to_ranges_pos.get(hint_id)
-                rpos = hint_id_to_reduction_ranges_pos.get(hint_id)
-                op_tiled_dims.append([opos] if opos is not None else [])
-                op_tiled_reduction_dims.append([rpos] if rpos is not None else [])
+            op_tiled_dims, op_tiled_reduction_dims, unattributed_loop_vars = (
+                resolve_level_positions(op, levels)
+            )
 
             has_tiled_reduction = any(op_tiled_reduction_dims)
             if has_tiled_reduction and not config.enable_reduction_tiling:
@@ -615,6 +631,26 @@ def _compute_fill_loop_info_planned(
     )
 
 
+def _refuse_mutation_write_back(op: ComputedBuffer, target_name: str) -> NoReturn:
+    """Refuse an op that writes in place into ``target_name`` while advancing tile by
+    tile, with no copy-out.
+
+    The planner used to classify three shapes this way (a write into a graph input
+    that is also a graph output, a ``for_each_tile`` stacking write, a local
+    accumulator read back by the next tile). None occurs in the test suites or in
+    anything a user program produces here, and a group of that kind stayed a flat
+    legacy loop with no loop variable, which blocked deleting the stored advance
+    and the legacy transform (#5863). The handling that followed the classification
+    (``_propagate_mutation_write_back`` and the validators' branches) is now
+    unreachable and goes with the legacy transform in stage 7a.6.
+    """
+    raise Unsupported(
+        f"span-overflow coarse tiling: {op.get_operation_name()} writes in place "
+        f"into {target_name} while advancing through the loop (a mutation "
+        "write-back); not supported in this release (#6256)."
+    )
+
+
 def _plan_tiling_propagation(
     operations: list[Operation],
     groups: list[tuple],
@@ -839,14 +875,7 @@ def _plan_tiling_propagation(
                         and target_is_output
                         and mut_target is not None
                     ):
-                        full_ranges = _compute_full_ranges_planned(op, info)
-                        info.propagation = PropagationPlan(
-                            kind="mutation_write_back",
-                            full_ranges=full_ranges,
-                            full_strides=tuple(mut_target.layout.stride),
-                            is_graph_output=True,
-                        )
-                        continue
+                        _refuse_mutation_write_back(op, mut_target_name)
                     # A WhileLoop-splice stacking write (see
                     # while_loop_bridge.py's CarryBinding.stacking) already
                     # targets the final, full-size destination: the bridge
@@ -865,14 +894,7 @@ def _plan_tiling_propagation(
                         and _splice_loop_vars(op)
                         and _splice_write_targets_full_buffer(op, mut_target)
                     ):
-                        full_ranges = _compute_full_ranges_planned(op, info)
-                        info.propagation = PropagationPlan(
-                            kind="mutation_write_back",
-                            full_ranges=full_ranges,
-                            full_strides=tuple(mut_target.layout.stride),
-                            is_graph_output=target_is_output,
-                        )
-                        continue
+                        _refuse_mutation_write_back(op, mut_target_name)
                     # Locally-created mutation target that IS the graph
                     # output, and/or is read by other ops outside this loop
                     # group (e.g. copy_forced(src, acc) where acc is a local
@@ -923,14 +945,7 @@ def _plan_tiling_propagation(
                             for candidate in group_ops
                         )
                         if in_loop_carry:
-                            full_ranges = _compute_full_ranges_planned(op, info)
-                            info.propagation = PropagationPlan(
-                                kind="mutation_write_back",
-                                full_ranges=full_ranges,
-                                full_strides=tuple(mut_target.layout.stride),
-                                is_graph_output=False,
-                            )
-                            continue
+                            _refuse_mutation_write_back(op, mut_target_name)
                 info.propagation = PropagationPlan(kind="loop_internal")
                 continue
 
@@ -2090,7 +2105,7 @@ def coarse_tile_post_stickify(
     graph: GraphLowering,
     groups: list[tuple],
     group_idx_offset: int = 0,
-) -> None:
+) -> dict[int, sympy.Symbol]:
     """Span-overflow coarse tiling.  Runs POST-stickification.
 
     Parameters
@@ -2116,6 +2131,14 @@ def coarse_tile_post_stickify(
     Plan then transform: stamp loop_group_id / loop_count and scale ranges.
     """
     operations = graph.operations
+
+    if config.loop_tiling_lowering == "plan":
+        # Deferred: loop_tiling_lowering imports this module.
+        from .loop_tiling_lowering import build_loop_tiling_plan, lower_loop_tiling
+
+        return lower_loop_tiling(
+            graph, build_loop_tiling_plan(operations, groups, group_idx_offset)
+        )
 
     # Planning: decide every op's tiling attributes with zero mutation.
     # If any op needs carry propagation or requests disabled reduction
@@ -2203,6 +2226,12 @@ def coarse_tile_post_stickify(
     _log_propagation_self_check(operations, predicted_kind_by_name)
     validate_writer_tile_advance(operations)
     validate_reader_tile_advance(operations)
+
+    # The legacy lowering records each access's advance and leaves the index
+    # without a loop term. Add the term to every copy_out group, so the kernel
+    # reads the advance from the index and checks it against that record
+    # (stage 7a.2). Returns {group index: loop variable} for the groups it did.
+    return add_loop_terms(graph, groups, group_idx_offset)
 
 
 def validate_writer_tile_advance(operations: list[Operation]) -> None:
@@ -3276,6 +3305,55 @@ def _insert_copy_op(
 # ---------------------------------------------------------------------------
 
 
+def _make_combine_buffer(
+    tiled_op: ComputedBuffer, accum_buf: ComputedBuffer
+) -> ComputedBuffer:
+    """The pointwise op that folds ``tiled_op``'s partial result into ``accum_buf``
+    in place (``MutationLayoutSHOULDREMOVE`` onto the accumulator), without loop
+    metadata: the caller stamps that and inserts it."""
+    from torch._inductor.virtualized import ops as vops
+
+    reduction_type = tiled_op.data.reduction_type
+    partial_loader = tiled_op.make_loader()
+    accum_loader = accum_buf.make_loader()
+
+    def combine_inner_fn(index):
+        partial = partial_loader(index)
+        accum = accum_loader(index)
+        if reduction_type in ("sum", BATCH_MATMUL_OP):
+            return vops.add(accum, partial)
+        if reduction_type == "xor_sum":
+            return vops.bitwise_xor(accum, partial)
+        if reduction_type == "prod":
+            return vops.mul(accum, partial)
+        if reduction_type == "max":
+            return vops.maximum(accum, partial)
+        if reduction_type == "min":
+            return vops.minimum(accum, partial)
+        if reduction_type == "any":
+            return vops.logical_or(accum, partial)
+        raise RuntimeError(
+            f"coarse_tile: _insert_combine_op: unsupported reduction_type "
+            f"{reduction_type!r}"
+        )
+
+    combine_data = Pointwise(
+        device=tiled_op.get_device(),
+        dtype=tiled_op.get_dtype(),
+        inner_fn=combine_inner_fn,
+        ranges=list(tiled_op.data.ranges),
+    )
+    combine_name = V.graph.qualify_name(f"coarse_tile_combine_{tiled_op.get_name()}")
+    combine_buf = ComputedBuffer(
+        name=combine_name,
+        layout=MutationLayoutSHOULDREMOVE(TensorBox(StorageBox(accum_buf))),
+        data=combine_data,
+    )
+    combine_buf.origins = tiled_op.origins
+    combine_buf.operation_name = combine_name
+    return combine_buf
+
+
 def _insert_combine_op(
     tiled_op: ComputedBuffer,
     accum_buf: ComputedBuffer,
@@ -3320,46 +3398,9 @@ def _insert_combine_op(
     that flag's removal regressed into silent wrong numerics instead
     (test_min_2d_512x256_reduce_dim0_A4_B4).
     """
-    from torch._inductor.virtualized import ops as vops
-
-    reduction_type = tiled_op.data.reduction_type
-    partial_loader = tiled_op.make_loader()
-    accum_loader = accum_buf.make_loader()
-
-    def combine_inner_fn(index):
-        partial = partial_loader(index)
-        accum = accum_loader(index)
-        if reduction_type in ("sum", BATCH_MATMUL_OP):
-            return vops.add(accum, partial)
-        if reduction_type == "xor_sum":
-            return vops.bitwise_xor(accum, partial)
-        if reduction_type == "prod":
-            return vops.mul(accum, partial)
-        if reduction_type == "max":
-            return vops.maximum(accum, partial)
-        if reduction_type == "min":
-            return vops.minimum(accum, partial)
-        if reduction_type == "any":
-            return vops.logical_or(accum, partial)
-        raise RuntimeError(
-            f"coarse_tile: _insert_combine_op: unsupported reduction_type "
-            f"{reduction_type!r}"
-        )
-
-    combine_data = Pointwise(
-        device=tiled_op.get_device(),
-        dtype=tiled_op.get_dtype(),
-        inner_fn=combine_inner_fn,
-        ranges=list(tiled_op.data.ranges),
-    )
-    combine_name = V.graph.qualify_name(f"coarse_tile_combine_{tiled_op.get_name()}")
-    combine_buf = ComputedBuffer(
-        name=combine_name,
-        layout=MutationLayoutSHOULDREMOVE(TensorBox(StorageBox(accum_buf))),
-        data=combine_data,
-    )
-    combine_buf.origins = tiled_op.origins
-    combine_buf.operation_name = combine_name
+    combine_buf = _make_combine_buffer(tiled_op, accum_buf)
+    combine_data = combine_buf.data
+    combine_name = combine_buf.get_name()
 
     # tiled_op's own partial output is per-tile-fixed scratch that never
     # advances across the inner tiled loop (all-empty per-level extents, same
@@ -3924,7 +3965,9 @@ def _patch_consumers(
         # loop_info stamped at all -- there is no tiled_dims_per_read to fix
         # up, and this consumer isn't part of any loop group's
         # _general_tile_advance machinery in the first place.
-        if not hasattr(new_consumer, "loop_info"):
+        if not isinstance(getattr(new_consumer, "loop_info", None), CoarseTileInfo):
+            # No record, or a LoopShim: a shim op keeps no per-read lists, its
+            # redirected read advances by its index.
             continue
         new_loop_info = new_consumer.loop_info  # type: ignore[attr-defined]
 

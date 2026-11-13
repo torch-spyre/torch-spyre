@@ -183,6 +183,9 @@ class LoopSchedulerNode(CountedLoopSchedulerNode):
                 f"counted loop {loop_node.get_name()} whose body has no kernel"
             )
         BaseSchedulerNode.__init__(self, scheduler)
+        # The loop's own fake dependencies (see add_fake_dep), kept across a rebuild
+        # of its dependencies from its children (_refresh_keeping_fake_deps).
+        self._fake_deps: tuple[dependencies.Dep, ...] = ()
         self.snodes = list(snodes)
         self.loop_count = loop_node.trip_count
         self.node = loop_node
@@ -240,6 +243,7 @@ class LoopSchedulerNode(CountedLoopSchedulerNode):
         # as a dependency of the loop on itself it is a KeyError later.
         if dep.name in self.get_buffer_names():
             return
+        self._fake_deps = (*self._fake_deps, dep)
         BaseSchedulerNode.add_fake_dep(self, dep)
 
     def update_mutated_names(self, renames: dict[str, str]) -> None:
@@ -398,6 +402,62 @@ _PATCHED = (
 )
 
 
+def _refresh_keeping_fake_deps(original):
+    """Wrap ``refresh_group_node_dependencies`` so a loop keeps its own fake deps.
+
+    Stock Inductor rebuilds a group node's reads and ``unmet_dependencies`` from
+    its children (fusion scoring does: ``_try_reindex_pointwise_for_reduction``).
+    The children never saw the fake dependencies ``compute_dependencies`` gave the
+    LOOP, so the rebuild drops them. One of them is the loop's ordering after the
+    prior writer of a buffer it mutates (the allocation of a span-overflow
+    copy-out's full output): without it ``reorder_for_peak_memory`` can place the
+    loop before that allocation.
+
+    Only the dependencies still present when the rebuild starts are put back, so
+    whatever a pruner has already removed (``prune_deps``, ``prune_weak_deps``,
+    ``_prune_redundant_deps``) stays removed.
+    """
+
+    def refresh(group_snode):
+        if not isinstance(group_snode, LoopSchedulerNode):
+            return original(group_snode)
+        reads = [
+            d for d in group_snode._fake_deps if d in group_snode.read_writes.reads
+        ]
+        unmet = [d for d in reads if d in group_snode.unmet_dependencies]
+        original(group_snode)
+        read_writes = group_snode.read_writes
+        for dep in reads:
+            if dep not in read_writes.reads:
+                read_writes = read_writes.with_read(dep)
+        group_snode.read_writes = read_writes
+        group_snode.clear_read_writes_dependent_caches()
+        group_snode.unmet_dependencies = OrderedSet(
+            [*group_snode.unmet_dependencies, *unmet]
+        )
+
+    return refresh
+
+
+@contextlib.contextmanager
+def _replace_refresh() -> Iterator[None]:
+    """Install :func:`_refresh_keeping_fake_deps` on Inductor's scheduler module
+    for the block (it calls the function through its module globals)."""
+    import torch._inductor.scheduler as scheduler_module
+
+    saved = scheduler_module.refresh_group_node_dependencies
+    wrapper = _refresh_keeping_fake_deps(saved)
+    scheduler_module.refresh_group_node_dependencies = wrapper
+    try:
+        yield
+    finally:
+        current = scheduler_module.refresh_group_node_dependencies
+        scheduler_module.refresh_group_node_dependencies = saved
+        # Nested blocks restore in order, so what is installed now is this block's
+        # own wrapper; anything else means something replaced it while it was active.
+        assert current is wrapper, "refresh_group_node_dependencies was replaced"
+
+
 @contextlib.contextmanager
 def _replace(replacements: dict) -> Iterator[None]:
     """Install ``replacements`` on ``Scheduler`` for the block; afterwards
@@ -504,13 +564,16 @@ def apply_loop_scheduler_patches() -> Iterator[None]:
                     buf.set_users([*buf.users, NodeUser(loop)])
         return result
 
-    with _replace(
-        {
-            "create_scheduler_node": create_scheduler_node,
-            "update_zero_dim_cpu_tensor": update_zero_dim_cpu_tensor,
-            "compute_ancestors": compute_ancestors,
-            "dead_node_elimination": dead_node_elimination,
-        }
+    with (
+        _replace(
+            {
+                "create_scheduler_node": create_scheduler_node,
+                "update_zero_dim_cpu_tensor": update_zero_dim_cpu_tensor,
+                "compute_ancestors": compute_ancestors,
+                "dead_node_elimination": dead_node_elimination,
+            }
+        ),
+        _replace_refresh(),
     ):
         yield
 

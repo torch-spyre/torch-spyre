@@ -30,6 +30,9 @@ from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ir import ExternKernel, Operation
 from torch._inductor.scheduler import BaseSchedulerNode, SchedulerNode
 
+from .errors import Unsupported
+from .loop_info import LoopShim
+
 
 @dataclass(frozen=True)
 class LoopLevel:
@@ -212,6 +215,64 @@ def _per_level_advance(
     return tuple(out)
 
 
+def _loop_coefficient(index: sympy.Expr, variable: sympy.Symbol) -> sympy.Expr:
+    """The coefficient of the loop variable ``variable`` in ``index``.
+
+    ``Expr.coeff`` is not a safe reading of "how far one trip moves this access": it
+    returns 0 for an unexpanded product (``32*(u0 + 1)``) and for any use of the
+    variable it cannot see through (``floor(u0/2)``, ``Mod(u0, 2)``). Read as "no
+    advance", those would be silently wrong once the stored record, which makes such
+    a disagreement loud, is deleted. So the index is evaluated at 0, 1 and 2:
+
+    * it must be affine in the variable (the second difference is zero), and
+    * the step must be a number (a symbolic step cannot be projected to device
+      elements),
+
+    otherwise this raises ``Unsupported``. A variable that does not occur in the
+    index has coefficient 0. The loop variable is an integer, so ``floor(8*u0)`` is
+    ``8*u0`` and has coefficient 8.
+
+    Lives here (``spyre_kernel`` imports it) because the advance accessors below
+    read a shim op's advances with it.
+    """
+    if variable not in index.free_symbols:
+        return sympy.S.Zero
+    at = [sympy.expand(index.subs(variable, k)) for k in (0, 1, 2)]
+    if sympy.simplify(at[2] - 2 * at[1] + at[0]) != 0:
+        raise Unsupported(
+            f"the loop variable {variable} is used non-affinely in the index "
+            f"{index}; a per-trip advance cannot be read from it"
+        )
+    step = sympy.simplify(at[1] - at[0])
+    if not step.is_number:
+        raise Unsupported(
+            f"the loop variable {variable} has the symbolic step {step} in the "
+            f"index {index}; it cannot be projected to device elements"
+        )
+    return step
+
+
+def _shim_advance(op, dep: MemoryDep) -> tuple[sympy.Expr, ...]:
+    """A shim op's advance per level: the coefficient of each loop variable in
+    ``dep.index``. The loop variables are the ``dim_hints`` entries that carry a
+    ``loop_var_range``, outermost first; an ordinary iteration-symbol hint is not
+    one. The count must equal the loop depth, else the pairing of variable to level
+    is unknown and nothing here can guess it."""
+    variables = [
+        h.loop_var
+        for h in getattr(op, "dim_hints", None) or ()
+        if h.loop_var is not None and h.loop_var_range is not None
+    ]
+    depth = _depth(op.loop_info)
+    if len(variables) != depth:
+        raise RuntimeError(
+            f"{op.get_operation_name() if hasattr(op, 'get_operation_name') else op} "
+            f"has {depth} loop level(s) but {len(variables)} loop variable "
+            "hint(s): its advances cannot be read from the index"
+        )
+    return tuple(_loop_coefficient(dep.index, v) for v in variables)
+
+
 def _depth(loop_info) -> int:
     return len(_group_path(loop_info))
 
@@ -237,6 +298,8 @@ def read_advance(op: Operation, dep: MemoryDep) -> tuple[sympy.Expr, ...]:
     if found is None:
         return ()
     loop_info, idx = found
+    if isinstance(loop_info, LoopShim):
+        return _shim_advance(op, dep)
     tiled = loop_info.tiled_dims_per_read
     if idx >= len(tiled):
         # The kernel emits no advance for a read past the record.
@@ -267,6 +330,8 @@ def output_advance(op: Operation) -> tuple[sympy.Expr, ...]:
     dep = _first_memory_write(op)
     if dep is None:
         return ()
+    if isinstance(loop_info, LoopShim):
+        return _shim_advance(op, dep)
     return _per_level_advance(
         op,
         dep,
@@ -296,6 +361,8 @@ def read_advances_anywhere(
     if found is None:
         return False
     loop_info, idx = found
+    if isinstance(loop_info, LoopShim):
+        return any(a != 0 for a in _shim_advance(op, dep))
     if idx >= len(loop_info.tiled_dims_per_read):
         return False
     if any(loop_info.tiled_dims_per_read[idx]):
@@ -315,7 +382,29 @@ def output_advances_anywhere(op: Operation) -> bool:
     loop_info = getattr(op, "loop_info", None)
     if loop_info is None:
         return False
+    if isinstance(loop_info, LoopShim):
+        dep = _first_memory_write(op)
+        return dep is not None and any(a != 0 for a in _shim_advance(op, dep))
     if any(dims for dims in loop_info.output_tiled_dims):
         return True
     squeezed = getattr(loop_info, "squeezed_advance_output", None) or []
     return any(level for level in squeezed)
+
+
+def shim_advancing_levels(op: Operation) -> frozenset[int]:
+    """The loop levels at which any read or the write of a ``LoopShim`` op moves.
+
+    The kernel names a loop-level symbol for a level only if something at that
+    level advances.  A ``CoarseTileInfo`` op answers that from its stored lists;
+    a shim op has none, so the answer comes from the index.  Empty for an op
+    that does not carry a shim.
+    """
+    if not isinstance(getattr(op, "loop_info", None), LoopShim):
+        return frozenset()
+    levels: set[int] = set()
+    for dep in _memory_reads(op):
+        levels.update(i for i, a in enumerate(_shim_advance(op, dep)) if a != 0)
+    write = _first_memory_write(op)
+    if write is not None:
+        levels.update(i for i, a in enumerate(_shim_advance(op, write)) if a != 0)
+    return frozenset(levels)

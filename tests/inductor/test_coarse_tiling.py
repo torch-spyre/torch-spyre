@@ -39,12 +39,14 @@ Covers six areas, each in its own class group:
 No Spyre device or backend compiler is required.
 """
 
+import contextlib
 import os
 import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 import sympy
 from sympy import Integer, Mod, Symbol, floor, simplify, sympify  # noqa: F401
 
@@ -93,6 +95,8 @@ from torch_spyre._inductor.wsr.coarse_tile import (
     plan_coarse_tile_groups,
     reduction_loop_vars,
 )
+
+
 from torch_spyre._inductor.wsr.tile_prediction import (
     _rejection_reason,
     predict_frame,
@@ -136,6 +140,16 @@ from utils_inductor import (
     ir_input_loader,
     patch_tiling_helper,
 )
+
+
+@pytest.fixture(autouse=True)
+def _legacy_transform():
+    """This file tests the legacy transform's internals (the CoarseTileInfo it stamps,
+    its planner and its phases), which ``coarse_tile_post_stickify`` runs only under
+    ``loop_tiling_lowering == "legacy"``. They go with the transform."""
+    with config.patch({"loop_tiling_lowering": "legacy"}):
+        yield
+
 
 _FP16 = DataFormats.SEN169_FP16
 
@@ -3173,6 +3187,21 @@ class TestCoarseTileNested(unittest.TestCase):
                     self.assertIsNotNone(getattr(op, "loop_info", None))
 
 
+def _legacy_lowering_only(cls):
+    """Run a test class against the legacy lowering alone.
+
+    These tests assert what the transform itself records and divides (hint lists,
+    ``loop_info`` fields, layouts) on mocked ops. The loop-term pass of stage 7a.2
+    appends one hint per op and reads real buffers, which a mocked graph does not
+    have; it has its own tests on real graphs (``test_span_overflow_loop_terms.py``).
+    """
+    return patch(
+        "torch_spyre._inductor.wsr.coarse_tile.add_loop_terms",
+        lambda *args, **kwargs: {},
+    )(cls)
+
+
+@_legacy_lowering_only
 class TestCoarseTileTiledDimsPerRead(unittest.TestCase):
     """Real-IR tests for CoarseTileInfo.tiled_dims_per_read /
     output_tiled_dims, using the small example from
@@ -5668,6 +5697,84 @@ class TestPlanTilingPropagation(unittest.TestCase):
         self.assertEqual(propagation.kind, "copy_out")
         self.assertTrue(propagation.is_graph_output)
 
+    # --- the in-place write that advances through its target is refused (#6256) --
+
+    def _mutation_op(self, name, target_name):
+        """A tiled op whose layout is an in-place write into ``target_name``."""
+        from torch._inductor.ir import MutationLayoutSHOULDREMOVE
+
+        op = _make_tiled_op(name, [Integer(16)], (0,), [Integer(4)], [[0]])
+        target = MagicMock()
+        target.get_name.return_value = target_name
+        target.layout.stride = [Integer(1)]
+        op.layout = MagicMock(spec=MutationLayoutSHOULDREMOVE)
+        op.layout.get_buffer.return_value = target
+        return op
+
+    def _plan_mutation(self, group_ops, *, outputs=(), graph_inputs=(), splice=False):
+        from types import SimpleNamespace
+
+        from torch_spyre._inductor.wsr.coarse_tile import _plan_tiling_propagation
+
+        op = group_ops[0]
+        plan = {id(op): op.loop_info}
+        levels = [(0, Integer(4))]
+        fake_v = MagicMock()
+        fake_v.graph = SimpleNamespace(graph_inputs={n: object() for n in graph_inputs})
+        patches = [
+            patch("torch_spyre._inductor.wsr.coarse_tile.V", fake_v),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile._graph_output_names",
+                return_value=set(outputs),
+            ),
+        ]
+        if splice:
+            patches += [
+                patch(
+                    "torch_spyre._inductor.wsr.coarse_tile._splice_loop_vars",
+                    return_value=[Symbol("u0")],
+                ),
+                patch(
+                    "torch_spyre._inductor.wsr.coarse_tile."
+                    "_splice_write_targets_full_buffer",
+                    return_value=True,
+                ),
+            ]
+        with contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            _plan_tiling_propagation(group_ops, [(group_ops, levels)], plan)
+        return op.loop_info.propagation
+
+    @expects_raise
+    def test_a_write_into_a_graph_input_that_is_also_an_output_is_refused(self):
+        """TODO(#6256): supporting it needs a write term on the op's own store and no
+        copy-out; this becomes a positive test then."""
+        op = self._mutation_op("op0", "arg0_1")
+        with self.assertRaisesRegex(Unsupported, r"in place into arg0_1.*#6256"):
+            self._plan_mutation([op], outputs={"arg0_1"}, graph_inputs={"arg0_1"})
+
+    @expects_raise
+    def test_a_for_each_tile_stacking_write_is_refused(self):
+        op = self._mutation_op("op0", "buf9")
+        with self.assertRaisesRegex(Unsupported, r"in place into buf9.*#6256"):
+            self._plan_mutation([op], splice=True)
+
+    @expects_raise
+    def test_a_local_accumulator_read_by_the_next_tile_is_refused(self):
+        """The flash-attention running-max shape: a pure intra-loop carry."""
+        op = self._mutation_op("op0", "acc")
+        reader = _make_inside_consumer_op("op1", "acc", (0,))
+        with self.assertRaisesRegex(Unsupported, r"in place into acc.*#6256"):
+            self._plan_mutation([op, reader])
+
+    def test_an_in_place_write_nothing_reads_is_not_refused(self):
+        """Control: the refusal is for a write that advances through its target. A
+        local target with no reader and no graph output stays loop_internal."""
+        op = self._mutation_op("op0", "acc")
+        propagation = self._plan_mutation([op])
+        self.assertEqual(propagation.kind, "loop_internal")
+
     def test_tiled_reduction_matches_reduction_kind(self):
         """A Reduction op tiling a reduction dim -> kind="reduction", with
         the same identity/nesting decisions _propagate_tiled_reduction_op
@@ -7949,6 +8056,7 @@ def _ftl_pointwise_reading_twice(shape, permutation, name="buf0"):
     return op
 
 
+@_legacy_lowering_only
 class TestPredictFrame(unittest.TestCase):
     """predict_frame == what coarse_tile actually applies, and mutates no IR."""
 
@@ -9636,6 +9744,7 @@ class TestDerivedBases(unittest.TestCase):
         self.assertEqual(_derive_group_idx_offset(_graph([op])), 4)
 
 
+@_legacy_lowering_only
 class TestApplyTilingsEquivalence(unittest.TestCase):
     """``apply_tilings`` reduces to the hint path.
 
