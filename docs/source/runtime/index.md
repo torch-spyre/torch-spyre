@@ -104,7 +104,7 @@ A standard PyTorch `(size, stride)` pair cannot describe a tiled device tensor, 
 The `SpyreTensorLayout` holds:
 
 - `device_size`: the tensor's shape on device, including the extra tiling and padding dims.
-- `stride_map`: the host stride for each device dim. A `-1` here means the dim is synthetic or fully padded.
+- `stride_map`: the host stride for each device dim. A `0` here means the dim is synthetic, fully padded, or broadcast.
 - `device_dtype`: the on-device data format, for example `SEN169_FP16`.
 - `element_arrangement`: how elements are packed within a stick (defaults to `STANDARD`).
 
@@ -148,6 +148,19 @@ Physical-frame (PF) and virtual-frame (VF) execution are *not* allocator strateg
 | PF (Physical Frame) | `FLEX_DEVICE=PF` | Direct hardware execution path. |
 | VF (Virtual Frame) | `FLEX_DEVICE=VF` | Virtualized hardware, used in multi-tenant deployments. |
 | MOCK | `FLEX_DEVICE=MOCK` | Software simulation with no hardware; device count comes from `AIU_WORLD_SIZE`. |
+
+### Pinned host memory
+
+The backend registers a host pinned-memory allocator through the PrivateUse1
+hooks interface (`getPinnedMemoryAllocator` and `isPinnedPtr` in
+`csrc/module.cpp`), backed by `SpyrePinnedAllocator` in
+`csrc/spyre_pinned_allocator.cpp`. This makes host pinned buffers available to
+PyTorch, so `pin_memory=True` host tensors and DataLoader pinning work with the
+Spyre backend, which speeds up host-to-LPDDR5 transfers.
+
+Pinning applies to host buffers only. A device tensor cannot be pinned: a
+`device="spyre"` allocation with `pin_memory=True` is rejected in
+`spyre_mem.cpp`.
 
 ## Eager Operations
 

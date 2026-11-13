@@ -30,12 +30,13 @@ different question over the same corpus, so it is a separate file.
 
 What it pins:
 
-* every access in the corpus agrees, except the block-table reads of the
-  ``paged_gather*`` fixtures. Those are POINT reads whose index
-  ``_rebase_point_splice_reads`` rewrites to ``0`` on purpose, because layout
-  propagation rejects the loop variable. The exceptions are pinned per fixture
-  (``POINT_READS``: one, two and one reads, by buffer name), so an extra
-  disagreement in any of the three, or in any other graph, fails.
+* every access in the corpus agrees, including the block-table reads of the
+  ``paged_gather*`` fixtures. Those are POINT reads (no iteration variable) whose
+  index used to be rewritten to ``0`` by ``_rebase_point_splice_reads`` because
+  layout propagation was thought to reject the loop variable, so their advance
+  survived only in the stored record. Stage 7.2 removed that rewrite (layout
+  propagation accepts the variable: the three fixtures compile and give the same
+  result), so the index carries the term and the comparison now holds for them too.
 * a padded weight read (K = 67) agrees. Padding used to drop the loop term from
   its index and let the stored record cover for it (#6049); it now keeps the term
   at the padded buffer's stride. Three weights are covered because the stride a
@@ -176,18 +177,6 @@ def _compile_and_probe(fn, args, ctx=None):
     return probe
 
 
-# The block-table reads of the paged-gather fixtures: a point read has no
-# iteration variable, its index is ``32*u0`` at the splice and is rebased to
-# ``0`` afterwards, so the advance survives only in the record.
-# Fixture -> the reads that differ (buffer name), measured. Pinned exactly: a
-# second point read in a fixture, or a different buffer, fails the test.
-POINT_READS = {
-    "paged_gather": ["arg1_1"],
-    "paged_gather_kv": ["arg1_1", "arg1_1"],
-    "paged_gather_nested": ["arg2_1"],
-}
-
-
 @pytest.mark.parametrize("case", sorted(CORPUS))
 def test_the_index_gives_the_kernels_advance(case):
     fn, args, ctx = CORPUS[case]()
@@ -195,19 +184,9 @@ def test_the_index_gives_the_kernels_advance(case):
     assert probe.rows, f"{case}: the kernel built no TensorArg with a loop_info"
 
     differing = [r for r in probe.rows if not r[6]]
-    if case in POINT_READS:
-        # Exactly the point reads differ, and for the stated reason: the index
-        # is the constant 0 while the kernel advances.
-        assert sorted(r[2] for r in differing) == sorted(POINT_READS[case]), [
-            (r[0], r[1], r[2], r[3]) for r in differing
-        ]
-        for op, kind, name, index, kernel_expr, from_index, _ in differing:
-            assert kind == "read" and index == "0", (op, kind, name, index)
-            assert kernel_expr != 0 and from_index == 0, (op, kernel_expr, from_index)
-    else:
-        assert not differing, [
-            (r[0], r[1], r[2], r[3], str(r[4]), str(r[5])) for r in differing
-        ]
+    assert not differing, [
+        (r[0], r[1], r[2], r[3], str(r[4]), str(r[5])) for r in differing
+    ]
 
     advancing = [r for r in probe.rows if r[4] != 0]
     assert advancing, f"{case}: nothing advanced, so the comparison proves nothing"
