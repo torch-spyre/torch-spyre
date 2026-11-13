@@ -218,26 +218,30 @@ def run_topology(name: str, args) -> dict | None:
 
 
 def print_phase_times(rounds: list[tuple[dict, dict]]) -> None:
-    """Median over rounds of load, compile and run for each topology."""
+    """Per round: load, compile and each run pattern, with the 3-stream minus
+    2-stream difference for every row. No averaging across rounds."""
+    rows = [
+        ("load (s)", lambda r: r["load_s"]),
+        ("compile estimate (s)", lambda r: r["compile_s"]),
+        *((f"run {p} (ms/step)", lambda r, p=p: r[p]["per_step_ms"]) for p in PATTERNS),
+    ]
 
-    def med(idx: int, fn) -> float | None:
-        vals = [fn(r[idx]) for r in rounds]
-        vals = [v for v in vals if v is not None]
-        return statistics.median(vals) if vals else None
+    def fmt(v: float | None, signed: bool = False) -> str:
+        if v is None:
+            return f"{'n/a':>12}"
+        return f"{v:>+12.3f}" if signed else f"{v:>12.3f}"
 
-    def fmt(v: float | None, scale: float = 1.0) -> str:
-        return f"{v * scale:>12.3f}" if v is not None else f"{'n/a':>12}"
-
-    run_ms = lambda r: statistics.mean(r[p]["per_step_ms"] for p in PATTERNS)  # noqa: E731
+    for i, (two, three) in enumerate(rounds, 1):
+        print()
+        print(f"round {i}")
+        print(f"  {'phase':<28}{'2-stream':>12}{'3-stream':>12}{'3 - 2':>12}")
+        for label, fn in rows:
+            a, b = fn(two), fn(three)
+            diff = None if a is None or b is None else b - a
+            print(f"  {label:<28}{fmt(a)}{fmt(b)}{fmt(diff, signed=True)}")
     print()
-    print(f"{'phase (median of rounds)':<28}{'2-stream':>12}{'3-stream':>12}")
-    for label, fn, scale in [
-        ("load (s)", lambda r: r["load_s"], 1.0),
-        ("compile estimate (s)", lambda r: r["compile_s"], 1.0),
-        ("run (ms/step, mean of 3)", run_ms, 1.0),
-    ]:
-        print(f"{label:<28}{fmt(med(0, fn), scale)}{fmt(med(1, fn), scale)}")
     print("compile = first call minus a warm call; run excludes load and compile.")
+    print("3 - 2 is negative where 3-stream is faster.")
 
 
 # A round's 3-vs-2 delta smaller than this is treated as no difference.
