@@ -868,17 +868,16 @@ def _(input: torch.Tensor) -> torch.Tensor:
 
 
 # Both quantize_fp8_with_scale and quantize_weight_fp8_with_scale share the same
-# four-step pipeline; the only difference is the final format-conversion kernel:
-#   1. Compute inverse scale: inv_scale = 1 / scale  (reciprocal, hardware sfp unit)
-#   2. Scale the input:       x_scaled = x * inv_scale  (POINTWISE)
-#   3. Clamp to FP8 E4M3:    x_clamped = clamp(x_scaled, -448, 448)  (POINTWISE)
-#   4. Format conversion:     qfp8ch (activation) or qfp8wt (weight)  (POINTWISE)
+# pipeline; the only difference is the final format-conversion kernel:
+#   1. Compute inverse scale: safe_recip = where(scale == 0, 1.0, 1 / scale)
+#   2. Scale and clamp:       x_clamped = clamp(x * safe_recip, -448, 448)
+#   3. Format conversion:     qfp8ch (activation) or qfp8wt (weight)  (POINTWISE)
 #
-# The reciprocal in step 1 is emitted as a separate hardware op. For scalar or
-# broadcast scales the compiler does not currently fuse it into a single multiply,
-# so there is one sfp-unit op for 1/scale and one for x * inv_scale.  Callers with
-# a hot-path constraint can pre-compute inv_scale and pass it directly to the
-# underlying spyre.qfp8ch / spyre.qfp8wt decomposition ops instead.
+# Step 1 guards against reciprocal(0.0) evaluating to NaN on Spyre hardware so
+# that scaled inputs remain finite and dequantize with scale=0 evaluates to 0.0
+# (see #3037). For callers with hot-path constraints, inv_scale can be
+# pre-computed and passed directly to the underlying spyre.qfp8ch / spyre.qfp8wt
+# decomposition ops.
 
 
 @torch.library.custom_op(
