@@ -60,6 +60,11 @@ _CORE_INV_SCALE = 1024
 _CORE_INV_SCALE_MAX_VALUE = 32
 # constant limit on product terms to avoid int32 overflow in CP-SAT
 _MAX_PRODUCT_BOUND = 2**30
+# Relative miss at a candidate past which a fractional power's linearization
+# keeps it as a breakpoint (see ramer_douglas_peucker).
+_LINEARIZE_TOLERANCE = 0.01
+# Most breakpoints a linearized power may take; past it the lowering raises.
+_LINEARIZE_MAX_BREAKPOINTS = 64
 
 
 _operator_map = {
@@ -70,6 +75,28 @@ _operator_map = {
     "==": operator.eq,
     "!=": operator.ne,
 }
+
+
+def ramer_douglas_peucker(xs, ys, tolerance: float) -> list[int]:
+    """Indices of the points ``(xs[i], ys[i])`` that Ramer-Douglas-Peucker keeps
+    as breakpoints: the two ends, then, segment by segment, the point the
+    segment misses by the most, while that miss exceeds ``tolerance`` relative
+    to the point's own value. ``xs`` is increasing. The line through the
+    returned points meets every point within ``tolerance``."""
+    keep = {0, len(xs) - 1}
+    stack = [(0, len(xs) - 1)]
+    while stack:
+        lo, hi = stack.pop()
+        slope = (ys[hi] - ys[lo]) / (xs[hi] - xs[lo]) if hi > lo else 0.0
+        worst, at = tolerance, None
+        for i in range(lo + 1, hi):
+            miss = abs(ys[lo] + slope * (xs[i] - xs[lo]) - ys[i])
+            if miss > worst * abs(ys[i]):
+                worst, at = miss / abs(ys[i]), i
+        if at is not None:
+            keep.add(at)
+            stack += [(lo, at), (at, hi)]
+    return sorted(keep)
 
 
 def _eq_fact(rel):
@@ -473,27 +500,8 @@ class _SympyExprToCpSat(Printer):
         elif expr.func == sympy.Pow:
             if not self._is_split_sym(arg):
                 return expr
-            # Core splits only: a tile count can exceed 32.
-            if (
-                expr.exp.is_Number
-                and math.isclose(expr.exp, 0.25)
-                and arg.name.startswith("split_")
-            ):
-                # Discrete piecewise linear approximation of x^(1/4) over the interval [1, 32],
-                # pinned to return 1 at x=1, generated using tools/approximate-power.py.
-                # since we check that the base is a _split_ symbol, it is an integer in the
-                # range [1, 32]
-                # Max 4.5% deviation for two segments;
-                # we would get:
-                #   max 1.6% deviation with 3 segments;
-                #   max 0.074% deviation with 8 segments;
-                #   max 0.019% deviation with 12 segments;
-                #   no deviation with 16 segments.
-                # script at https://github.com/user-attachments/files/31975789/approximate-power.py
-                return sympy.Piecewise(
-                    (0.139980295504224 * arg + 0.860019704495776, arg <= 5),
-                    (0.0287191888771944 * arg + 1.45940018593522, True),
-                )
+            if expr.exp.is_Number and not expr.exp.is_Integer:
+                return self._linearize_power(expr)
             if expr.exp == -1:
                 return sympy.Symbol(
                     f"inv_{arg.name}", integer=True, nonnegative=True
@@ -520,6 +528,43 @@ class _SympyExprToCpSat(Printer):
                 result *= math.prod([arg for arg in expr.args if arg not in symbols])
                 return result
         return expr
+
+    def _candidates(self, sym):
+        """The sorted values a split or tile symbol takes over its buffer's
+        division menu; a split with no menu takes the core range."""
+        _, raw = self._buffer_map.get(sym.name, (None, ()))
+        if raw:
+            return sorted({int(v) for v in raw})
+        if sym.name.startswith("split_"):
+            return list(range(1, _CORE_INV_SCALE_MAX_VALUE + 1))
+        return None
+
+    def _linearize_power(self, expr):
+        """A fractional power of a split or tile symbol as the piecewise-linear
+        function through its candidate values at the breakpoints
+        ``ramer_douglas_peucker`` keeps. Exact at every breakpoint, within
+        _LINEARIZE_TOLERANCE elsewhere. Left as is when the candidates are
+        unknown or include a pole; raises past _LINEARIZE_MAX_BREAKPOINTS rather
+        than lowering a coarser function."""
+        arg, exponent = expr.base, float(expr.exp)
+        xs = self._candidates(arg)
+        if xs is None or (exponent < 0 and xs[0] <= 0):
+            return expr
+        ys = [x**exponent for x in xs]
+        if len(xs) == 1:
+            return sympy.Float(ys[0])
+        points = ramer_douglas_peucker(xs, ys, _LINEARIZE_TOLERANCE)
+        if len(points) > _LINEARIZE_MAX_BREAKPOINTS:
+            raise ValueError(
+                f"{len(points)} breakpoints for {expr} past the "
+                f"{_LINEARIZE_MAX_BREAKPOINTS} limit"
+            )
+        pieces = []
+        for lo, hi in zip(points, points[1:]):
+            slope = (ys[hi] - ys[lo]) / (xs[hi] - xs[lo])
+            line = slope * arg + (ys[lo] - slope * xs[lo])
+            pieces.append((line, True if hi == points[-1] else arg <= xs[hi]))
+        return sympy.Piecewise(*pieces)
 
     @classmethod
     def _piecewise_canonical(cls, expr):
