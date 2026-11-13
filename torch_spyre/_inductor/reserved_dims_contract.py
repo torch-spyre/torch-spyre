@@ -144,7 +144,7 @@ def output_reserved_dims(graph: GraphLowering, sizes) -> Optional[dict]:
 
 
 def apply_reserved_dims_contract(graph: GraphLowering) -> None:
-    """Apply each graph input's ``reserved_dims`` to the ShapeEnv (see module doc)."""
+    """Apply each graph input's ``reserved_dims`` to the ShapeEnv."""
     contracts: dict = {}
     graph._spyre_dim_contracts = contracts  # type: ignore[attr-defined]
     if not graph.graph_input_names:

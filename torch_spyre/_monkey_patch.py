@@ -118,6 +118,15 @@ def _parse_dynamic_spec(dynamic, size) -> _DynamicSpec:
             f"dynamic={{{dim}: ...}}: max={dim_max} is not a multiple of "
             f"granularity={granularity}"
         )
+    if dim_min % granularity != 0:
+        raise ValueError(
+            f"dynamic={{{dim}: ...}}: min={dim_min} is not a multiple of "
+            f"granularity={granularity}"
+        )
+    if dim_max % dim_min != 0:
+        raise ValueError(
+            f"dynamic={{{dim}: ...}}: max={dim_max} is not a multiple of min={dim_min}"
+        )
 
     # Local import: this file must stay importable before torch_spyre's
     # own submodules are guaranteed ready (see _UNSET above), and reading
