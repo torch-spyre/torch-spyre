@@ -697,7 +697,11 @@ def _convert_layout(
     """
     staggered = fmt in STAGGERED_EAS or input_ea in STAGGERED_EAS
     if staggered and _convert_reads_whole_input(in_layout, output, dep, output_dep):
-        layouts = [rescale_stl_for_dtype(stl, output.dtype, fmt)]
+        layouts = [
+            rescale_stl_for_dtype(
+                stl, output.dtype, fmt, try_device_coordinates(stl, dep, None)
+            )
+        ]
 
         # A conversion that creates a staggered EA must also expose
         # outputs reachable by restickifying its STANDARD input first.
@@ -724,7 +728,19 @@ def _convert_layout(
                     )
                     if target_stl is None:
                         continue
-                    candidate = rescale_stl_for_dtype(target_stl, output.dtype, fmt)
+                    try:
+                        candidate = rescale_stl_for_dtype(
+                            target_stl,
+                            output.dtype,
+                            fmt,
+                            try_device_coordinates(target_stl, dep, None),
+                        )
+                    except Unsupported:
+                        # These restickified targets are optional extra
+                        # choices; one the conversion cannot rescale is
+                        # dropped rather than failing the compile, since the
+                        # inherited layout above is already valid (#2619).
+                        continue
                     if candidate not in layouts:
                         layouts.append(candidate)
 
