@@ -178,16 +178,10 @@ _COST_PARAMS = CostParams(
     # which optimizes compute only when there's a matmul
     overlap_gamma=0.46,
     use_bundled_cost_model=False,
-    # The coarse underfill and LX-spill derates: zero exponents drop the tile height
-    # from both (``rpc**0 == 1``) and the 1.0 cap pins the underfill there, so each
-    # derate is exactly 1. CP-SAT cannot lower their fractional powers of a symbolic
-    # tile height at all (the whole cost objective would fall back to the
-    # lexicographic one). The annealer can, but is misled by them: the underfill
-    # derate divides a whole bundle's memory term by the efficiency of its smallest
-    # tile, which over-prices a tile several times over on real decoder blocks.
-    coarse_underfill_exp=0.0,
-    coarse_underfill_col_exp=0.0,
-    coarse_underfill_cap=1.0,
+    # The LX-spill derate: zero exponents drop the tile height (``rpc**0 == 1``), so
+    # it is exactly 1. For a committed tiling its working set counts the output's
+    # rows by residency (cost_features' full-buffer rows), so it would charge
+    # LX residency as a spill.
     lx_spill_exp=0.0,
     mm_spill_ws_exp=0.0,
     # The loop-invariant re-read: ``read_bytes`` already charges a tiled matmul's
