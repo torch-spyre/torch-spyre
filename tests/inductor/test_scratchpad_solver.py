@@ -57,8 +57,10 @@ try:
         _CORE_INV_SCALE,
         _MAX_PRODUCT_BOUND,
         _LINEARIZE_TOLERANCE,
+        _QUANTIZE_TOLERANCE,
         _SympyExprToCpSat,
         _simplify_eq_conjunction,
+        power_of_two_scale,
         ramer_douglas_peucker,
     )
     from torch_spyre._inductor.scratchpad.ilp_solver_ortools import CpSatLayoutSolver
@@ -2267,6 +2269,88 @@ class TestSympyExprToCpSatPrinter(TestCase):
         self.assertLessEqual(
             abs(solver.objective_value - min(exact)), _LINEARIZE_TOLERANCE * min(exact)
         )
+
+    def test_a_product_of_two_max_factors_keeps_its_number_outside(self):
+        # mem * (1 / eff) * (1 / spill): pushed into one factor, the number
+        # would scale the product of the two past _MAX_PRODUCT_BOUND.
+        x, y = sympy.symbols("split_x split_y", integer=True, positive=True)
+        expr = 1e9 * sympy.Max(3, x) * sympy.Max(3, y)
+        self.assertEqual(_SympyExprToCpSat._min_piecewise_expand(expr), expr)
+        solver, _ = self._optimize(
+            expr, {"split_x": (1, 8), "split_y": (1, 8)}, maximize=True
+        )
+        self.assertAlmostEqual(solver.ObjectiveValue(), 64e9)
+
+    def test_power_of_two_scale_is_the_smallest_within_tolerance(self):
+        self.assertEqual(power_of_two_scale([1.0, 2.0], 0.01, 1024), 1)
+        # 0.926 rounds within 1% from 64 on; a base keeps an LCM in the scale.
+        self.assertEqual(power_of_two_scale([0.926], 0.01, 1024), 64)
+        self.assertEqual(power_of_two_scale([0.926], 0.01, 1024, base=6), 96)
+        self.assertIsNone(power_of_two_scale([1e-6], 0.01, 1024))
+
+    @staticmethod
+    def _one_buffer(menu):
+        """A model with one buffer choosing among ``menu``'s columns."""
+        model = cp_model.CpModel()
+        n = len(next(iter(menu.values())))
+        division = model.new_int_var(0, n - 1, "division")
+        owner = types.SimpleNamespace(division=division)
+        sym_map, buffer_map = {}, {}
+        for name, raw in menu.items():
+            sym_map[name] = model.new_int_var(min(raw), max(raw), name)
+            model.add_element(division, raw, sym_map[name])
+            buffer_map[name] = (owner, raw)
+        symbols = [sympy.Symbol(n, integer=True, positive=True) for n in menu]
+        return model, division, sym_map, buffer_map, symbols
+
+    def test_a_curve_over_one_buffer_is_its_quantized_value_table(self):
+        # Within the RDP and quantization budgets of the exact power at every
+        # division, through one element lookup.
+        menu = {"split_a": [1, 2, 4, 8, 16, 32], "tile_a": [1, 4, 2, 64, 8, 512]}
+        model, division, sym_map, buffer_map, (a, t) = self._one_buffer(menu)
+        expr = 7.0 * (a * t) ** 0.15
+        printer = _SympyExprToCpSat(model, sym_map, buffer_map)
+        cp_expr = printer.convert(expr)
+        budget = (1 + _LINEARIZE_TOLERANCE) * (1 + _QUANTIZE_TOLERANCE) - 1
+        for i, values in enumerate(zip(*menu.values())):
+            with self.subTest(division=i):
+                fixed = model.clone()
+                fixed.add(division == i)
+                solver = cp_model.CpSolver()
+                self.assertEqual(solver.solve(fixed), cp_model.OPTIMAL)
+                exact = 7.0 * math.prod(values) ** 0.15
+                self.assertLessEqual(
+                    abs(solver.float_value(cp_expr) - exact), budget * exact
+                )
+
+    def test_a_derate_product_is_pushed_into_the_byte_min(self):
+        # mem * (1 / eff) * (1 / spill): residency-gated bytes in a Min times two
+        # derate curves. Lowered as Min(R * D, W * D), every product stays within
+        # bounds, and the solve picks what a brute force over the exact powers
+        # picks.
+        menu = {"split_a": [1, 2, 4, 8, 16], "tile_a": [8, 4, 2, 64, 1]}
+        model, division, sym_map, buffer_map, (a, t) = self._one_buffer(menu)
+        sym_map["is_lx_x"] = model.new_bool_var("is_lx_x")
+        lx = sympy.Symbol("is_lx_x", integer=True, nonnegative=True)
+        derates = sympy.Max(1, 4 / (a * t) ** 0.5) * sympy.Max(1, 0.9 * (a * t) ** 0.06)
+        mem = sympy.Min(8e6 * (1 - lx) + 2e5, 6e6 * (1 - lx) + 5e6)
+        expr = 3e-3 * mem * derates + 2000 * lx
+        printer = _SympyExprToCpSat(model, sym_map, buffer_map)
+        model.minimize(printer.convert(expr))
+        solver = cp_model.CpSolver()
+        self.assertEqual(solver.solve(model), cp_model.OPTIMAL)
+
+        def exact(p, r):
+            d = max(1, 4 / p**0.5) * max(1, 0.9 * p**0.06)
+            return 3e-3 * min(8e6 * (1 - r) + 2e5, 6e6 * (1 - r) + 5e6) * d + 2000 * r
+
+        products = [math.prod(c) for c in zip(*menu.values())]
+        costs = {(i, r): exact(p, r) for i, p in enumerate(products) for r in (0, 1)}
+        best = min(costs.values())
+        chosen = (solver.value(division), solver.value(sym_map["is_lx_x"]))
+        budget = 2 * ((1 + _LINEARIZE_TOLERANCE) * (1 + _QUANTIZE_TOLERANCE) - 1)
+        self.assertLessEqual(costs[chosen] - best, budget * best)
+        self.assertLessEqual(abs(solver.objective_value - best), budget * best)
 
     def test_negated_and_unnamed_boolean_products_preserve_every_assignment(self):
         model = cp_model.CpModel()
