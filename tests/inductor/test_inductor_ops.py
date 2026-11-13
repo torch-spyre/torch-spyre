@@ -6631,6 +6631,44 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     True,
                     cached_randn((3, 7, 9, 31), dtype=torch.float32, scale=0.1),
                 ),
+                "bool_1d_dim_0": (
+                    0,
+                    True,
+                    cached_randint((64,), high=2) > 0,
+                ),
+                "bool_2d_dim_0": (
+                    0,
+                    True,
+                    cached_randint((67, 256), high=2) > 0,
+                ),
+                "bool_2d_dim_1": (
+                    1,
+                    True,
+                    cached_randint((67, 256), high=2) > 0,
+                ),
+                "int32_2d_dim_0": (
+                    0,
+                    True,
+                    cached_randint((67, 256), dtype=torch.int32),
+                ),
+                "int32_2d_dim_1": (
+                    1,
+                    True,
+                    cached_randint((67, 256), dtype=torch.int32),
+                ),
+                "int64_2d_dim_0": (
+                    0,
+                    True,
+                    cached_randint((67, 256), dtype=torch.int64),
+                ),
+                "int64_2d_dim_1": (
+                    1,
+                    True,
+                    cached_randint((67, 256), dtype=torch.int64),
+                ),
+            },
+            "expect_fail": {
+                "bool_2d_dim_0": "non-stick dimension reduction on bool input is unsupported due to staggered DL16_TO_FP32 EA from bool-to-fp32 upcast",
             },
         },
         ("test_sum_keepdim0", "test_sum_eager"): {
@@ -6751,6 +6789,56 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     False,
                     cached_randn((3, 7, 9, 31), dtype=torch.float32, scale=0.1),
                 ),
+                "bool_2d_dim_0": (
+                    0,
+                    False,
+                    cached_randint((67, 256), high=2) > 0,
+                ),
+                "bool_2d_dim_1": (
+                    1,
+                    False,
+                    cached_randint((67, 256), high=2) > 0,
+                ),
+                "int32_2d_dim_0": (
+                    0,
+                    False,
+                    cached_randint((67, 256), dtype=torch.int32),
+                ),
+                "int32_2d_dim_1": (
+                    1,
+                    False,
+                    cached_randint((67, 256), dtype=torch.int32),
+                ),
+                "int64_2d_dim_0": (
+                    0,
+                    False,
+                    cached_randint((67, 256), dtype=torch.int64),
+                ),
+                "int64_2d_dim_1": (
+                    1,
+                    False,
+                    cached_randint((67, 256), dtype=torch.int64),
+                ),
+            },
+            "expect_fail": {
+                "bool_2d_dim_0": "non-stick dimension reduction on bool input is unsupported due to staggered DL16_TO_FP32 EA from bool-to-fp32 upcast",
+            },
+        },
+        ("test_sum_default", "test_reduce_cpu"): {
+            "ops_dict": {
+                "sum": torch.sum,
+            },
+            "param_sets": {
+                "bool_1d": (cached_randint((64,), high=2) > 0,),
+                "bool_2d": (cached_randint((67, 256), high=2) > 0,),
+                "int32_1d": (cached_randint((64,), dtype=torch.int32),),
+                "int32_2d": (cached_randint((67, 256), dtype=torch.int32),),
+                "int64_1d": (cached_randint((64,), dtype=torch.int64),),
+                "int64_2d": (cached_randint((67, 256), dtype=torch.int64),),
+                "fp16_1d": (cached_randn((64,), dtype=torch.float16),),
+                "fp16_2d": (cached_randn((67, 256), dtype=torch.float16),),
+                "fp32_1d": (cached_randn((64,), dtype=torch.float32),),
+                "fp32_2d": (cached_randn((67, 256), dtype=torch.float32),),
             },
         },
         ("test_mean_keepdim1", "test_mean_eager"): {
