@@ -1,0 +1,22 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/torch-spyre/torch-spyre/main/extensions/spyre-bench/spyre_bench/core/schemas/resources.schema.json
+apiVersion: bench/v1alpha1
+kind: Benchmark
+metadata:
+  name: pointwise_add
+  annotations:
+    legacy.record_type: op
+    legacy.run_mode: op_benchmark
+spec:
+  type: perf
+  level: kernel
+  tier: core
+  system: op-library
+  workload:
+    type: kernel/op
+    op: pointwise_add
+    load:
+      executor: iterations
+      iterations: 100
+      warmup_iterations: 3
+  variants:
+    - name: pointwise_add
