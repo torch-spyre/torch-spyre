@@ -43,7 +43,7 @@ cpu_result = gelu_fn(x)
 
 # EXPECTED FAILURE: the compile refuses a mark_dynamic(max=...) size outside a
 # for_each_tile loop and names the supported interface.
-_EXPECTED_MSG_SUBSTRINGS = ("mark_dynamic(max=...) but no declaration",)
+_EXPECTED_MSG_SUBSTRINGS = ("but no declaration",)
 
 try:
     compiled_result = compiled_fn(x_device).cpu()

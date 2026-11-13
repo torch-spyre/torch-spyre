@@ -1333,19 +1333,25 @@ class SpyreKernel(Kernel[CSEVariable]):
                     "loop over it (dims=(d,), tile_size=granularity), whose body "
                     "sees one tile and whose trip count is bound at launch."
                 )
-            if finite_upper_or_none(size_expr) is not None:
-                # A size with a maximum from mark_dynamic(max=...) but no
-                # declaration has no for_each_tile loop to carry it, and the
-                # SDSC can only be built at one concrete size. Refuse here rather
-                # than emit an SDSC dimension symbol that async_compile rejects.
-                raise Unsupported(
-                    f"{op} ({ir_node.get_operation_name()}): its iteration space "
-                    f"has size {size_expr}, which has a maximum from "
-                    "mark_dynamic(max=...) but no declaration. A varying size is "
-                    'declared with tensor.to("spyre", dynamic=...) and consumed '
-                    "by a for_each_tile loop over it (dims=(d,), "
-                    "tile_size=granularity)."
+            if finite_upper_or_none(size_expr) is None:
+                logger.debug(
+                    f"[create_op_spec] {size_expr} has no maximum and is specialised "
+                    "to this compile's size; to vary it at runtime, declare it with "
+                    'tensor.to("spyre", dynamic=...) and loop over it with for_each_tile'
                 )
+                continue
+            # A size with a finite maximum (mark_dynamic(max=...) or torch._check)
+            # but no declaration has no for_each_tile loop to carry it, and the
+            # SDSC can only be built at one concrete size. Refuse here rather
+            # than emit an SDSC dimension symbol that async_compile rejects.
+            raise Unsupported(
+                f"{op} ({ir_node.get_operation_name()}): its iteration space "
+                f"has size {size_expr}, which has a finite maximum "
+                "(mark_dynamic(max=...) or torch._check) but no declaration. A "
+                'varying size is declared with tensor.to("spyre", dynamic=...) '
+                "and consumed by a for_each_tile loop over it (dims=(d,), "
+                "tile_size=granularity)."
+            )
 
         # Provenance is a debug-only feature: a failure building the handle must
         # never break a compile. build_debug_handle is best-effort, but guard the
