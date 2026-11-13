@@ -307,6 +307,9 @@ class ArtifactIdentity:
     kind: str = "image"
     ref: str = ""
     content_digest: str = ""
+    # Where the exact bytes live, when the ref names them indirectly (a wheel's
+    # pip spec): stored as artifact_refs.index_uri. Not a hash input.
+    download_uri: str = ""
     # Hash inputs kept readable beside the opaque id (e.g. base_artifact_id, installed).
     inputs: tuple = ()
 
@@ -388,11 +391,20 @@ class ArtifactIdentity:
 
     @classmethod
     def from_wheel(
-        cls, ref: str, arch: str, component: str = "", name: str = "", id12: str = ""
+        cls,
+        ref: str,
+        arch: str,
+        component: str = "",
+        name: str = "",
+        id12: str = "",
+        download_uri: str = "",
     ) -> "ArtifactIdentity":
         """A wheel by `name==version`, file name or URL; id12 is the 12-hex identity token
         ending its local version (`+<id12>`, `+cpu.<id12>`)."""
         raw = (ref or "").strip()
+        # A URL names the same wheel the pip spec does, and additionally says where
+        # the exact bytes live: kept as download_uri rather than dropped.
+        url = raw if "://" in raw else download_uri
         if "==" in raw:
             dist, _, version = raw.partition("==")
         else:
@@ -409,6 +421,7 @@ class ArtifactIdentity:
             arch=DerivedId.arch(arch),
             kind="wheel",
             ref=f"{dist}=={version}",
+            download_uri=url,
         )
 
     @classmethod

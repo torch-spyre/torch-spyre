@@ -141,6 +141,7 @@ BATCH_KEYS = {
         "kind",
         "ref",
         "content_digest",
+        "download_uri",
     },
     # An entry names its artifact by `artifact` (the hash inputs, authoritative) or by `spec`
     # (any resolver spec, resolved with the rest of the options).
@@ -201,6 +202,7 @@ def batch_identity(a: dict) -> ArtifactIdentity:
         kind=a.get("kind") or "image",
         ref=a.get("ref", ""),
         content_digest=a.get("content_digest", ""),
+        download_uri=a.get("download_uri", ""),
     )
 
 

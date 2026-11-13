@@ -1002,7 +1002,9 @@ class ArtifactWriter:
                 "artifact_id": aid,
                 "method": method,
                 "ref_kind": ref_kind,
-                "index_uri": cls._index_uri(identity.ref),
+                # download_uri is the exact file address (a wheel's pip spec names no
+                # host); the derivation covers refs that embed one (image pullspecs).
+                "index_uri": identity.download_uri or cls._index_uri(identity.ref),
                 "ref": identity.ref,
                 "content_digest": identity.content_digest,
                 "props": cls._props({"id12": identity.id12}),
