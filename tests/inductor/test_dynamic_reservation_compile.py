@@ -21,10 +21,7 @@ What the compiler does with the declared dimension: a ``for_each_tile`` loop
 over it is built at the declared maximum and runs for the size the launch reads,
 so one kernel is right at every size. ``tests/inductor/test_symbolic_loop_e2e.py``
 is the full statement of that, and the positive tests here repeat it with this
-file's granularity. ``max`` must be a multiple of both ``granularity`` and
-``min`` (enforced at declaration time, ``_monkey_patch.py``): the compiler's
-own granularity bucketing (``compute_granularity``, ``pass_utils.py``) treats
-a declared ``min`` as a divisor of ``max``.
+file's odd granularity.
 
 What it refuses: a plain op whose own iteration space depends on the declared
 dimension, outside any ``for_each_tile`` loop. Such a kernel has no loop to
@@ -53,10 +50,10 @@ from torch_spyre.execution.kernel_cache import get_cache_root_dir
 
 DEVICE = torch.device("spyre")
 COLS = 1024
-SPEC = {"min": 140, "max": 700, "granularity": 70}
+SPEC = {"min": 140, "max": 630, "granularity": 70}
 TILE = SPEC["granularity"]
 # The compile size first (the minimum), then the maximum, then sizes between.
-SIZES = [140, 700, 350, 630, 210]
+SIZES = [140, 630, 280, 560, 210]
 
 # fp16 results of ops on values in [0, 1), against an fp32 reference: one ulp
 # is about 1e-3 near 1 and sum(dim=0) over 140 rows measured a relative error

@@ -1,4 +1,4 @@
-# Copyright 2025 The Torch-Spyre Authors.
+# Copyright 2025-2026 The Torch-Spyre Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -170,7 +170,7 @@ class TestCrossKernelContract(unittest.TestCase):
         # The counterpart of the test above: with the stamp switched off, mid
         # carries no reserved_dims, so the second kernel's for_each_tile count
         # is over an undeclared symbol and require_declared_count refuses it
-        # first
+        # first.
         x, _ = declared_input(MIN_ROWS)
         with mock.patch.object(wrapper, "output_reserved_dims", return_value=None):
             mid = compiled(tiled_sum)(x)

@@ -1,4 +1,4 @@
-# Copyright 2025 The Torch-Spyre Authors.
+# Copyright 2025-2026 The Torch-Spyre Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,11 +19,13 @@ on that tensor as ``reserved_dims``. Every ``torch.compile`` region has its own
 ShapeEnv, so a later kernel would see the dim as a new symbol with no range.
 This module has both halves of the fix:
 
-* ``apply_reserved_dims_contract`` reads a graph input's ``reserved_dims`` into
-  the ShapeEnv. ``min``/``max`` go into ``shape_env.var_to_range``, intersected
-  with the range already there, so a contract can only tighten a range. The full
-  triple goes into ``graph._spyre_dim_contracts``, keyed by the symbol, because
-  the ShapeEnv has no notion of granularity.
+* ``apply_reserved_dims_contract`` reads each declared dimension (via
+  ``pass_utils.declared_dims_in``, the single registry ``_declared_dims_of``
+  already built for this compile) into the ShapeEnv. ``min``/``max`` go into
+  ``shape_env.var_to_range``, intersected with the range already there, so a
+  contract can only tighten a range. The full triple goes into
+  ``graph._spyre_dim_contracts``, keyed by the symbol, because the ShapeEnv has
+  no notion of granularity.
 * ``output_reserved_dims`` works out the contract of a graph output from its
   symbolic size, for the wrapper to attach to the allocated tensor.
 """
@@ -33,16 +35,14 @@ import math
 from typing import Optional
 
 import sympy
-import torch
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import FixedLayout, InputBuffer, StorageBox, TensorBox
-from torch._inductor.virtualized import V
 from torch.utils._sympy.value_ranges import ValueRanges
 
-from torch_spyre._C import get_reserved_dims
-
+from . import config
 from .errors import Unsupported
 from .logging_utils import get_inductor_logger
+from .pass_utils import declared_dims_in
 
 logger = get_inductor_logger("reserved_dims_contract")
 
@@ -116,7 +116,15 @@ def output_reserved_dims(graph: GraphLowering, sizes) -> Optional[dict]:
 
     Raises ``Unsupported`` for more than one symbolic dim that *is* tied to a
     declared contract: reservations cover a single dim today (see
-    ``spyre_empty_reserved`` and the ``resize_`` guard).
+    ``spyre_empty_reserved`` and the ``resize_`` guard). Also raises
+    ``Unsupported`` when the derived triple itself fails the bucket cap
+    (``config.reservation_violations``, floor exempted -- see its own
+    docstring): the two divisibility rules hold on a derived triple by
+    construction given a valid input, but a derived granularity can be finer
+    than any input's, so the cap does not. Refused with a message rather than
+    silently stamped or silently loosened, since the next kernel over this
+    output would otherwise build more buckets than ``config.max_buckets``
+    allows.
     """
     symbolic_dims = [
         dim
@@ -144,30 +152,37 @@ def output_reserved_dims(graph: GraphLowering, sizes) -> Optional[dict]:
     if not (isinstance(bounds.upper, sympy.Integer) and int(bounds.upper) > 0):
         return None
     lower = int(bounds.lower) if isinstance(bounds.lower, sympy.Integer) else 0
-    return {
-        dim: (
-            max(lower, 0),
-            int(bounds.upper),
-            output_granularity(expr, get_dim_contracts(graph)),
+    dim_min = max(lower, 0)
+    dim_max = int(bounds.upper)
+    granularity = output_granularity(expr, get_dim_contracts(graph))
+    violations = config.reservation_violations(
+        dim_min, dim_max, granularity, enforce_min_floor=False
+    )
+    if violations:
+        raise Unsupported(
+            f"graph output {dim} would stamp a derived reservation contract "
+            f"(min={dim_min}, max={dim_max}, granularity={granularity}) that "
+            f"violates it: {'; '.join(violations)}"
         )
-    }
+    return {dim: (dim_min, dim_max, granularity)}
 
 
 def apply_reserved_dims_contract(graph: GraphLowering) -> None:
-    """Apply each graph input's ``reserved_dims`` to the ShapeEnv."""
+    """Apply each declared dimension to this compile's ShapeEnv.
+
+    Reads declared_dims_in (pass_utils.py), backed by _DECLARED_DIMS -- set
+    once per compile by _declared_dims_of (torch_spyre/_inductor/__init__.py)
+    before lowering starts -- instead of independently re-deriving the
+    declaration from get_reserved_dims(real_input). That keeps one source of
+    truth for a tensor's reservation: _declared_dims_of's own refusals
+    (conflicting declarations across inputs, a symbol shared with an
+    undeclared input) already ran before this pass ever sees the symbol.
+    """
     contracts: dict = {}
     graph._spyre_dim_contracts = contracts  # type: ignore[attr-defined]
-    if not graph.graph_input_names:
-        return
 
     shape_env = graph.sizevars.shape_env
-    for name, real_input in zip(graph.graph_input_names, V.get_real_inputs()):
-        if not isinstance(real_input, torch.Tensor):
-            continue
-        reserved = get_reserved_dims(real_input)
-        if not reserved:
-            continue
-
+    for name in graph.graph_input_names:
         tb = graph.graph_inputs[name]
         if (
             not isinstance(tb, TensorBox)
@@ -178,26 +193,23 @@ def apply_reserved_dims_contract(graph: GraphLowering) -> None:
             continue
         layout = tb.data.data.layout
 
-        for dim, info in reserved.items():
-            if dim >= len(layout.size):
-                continue
-            sym = layout.size[dim]
+        for sym in layout.size:
             # A static dim has no symbol to constrain: nothing to record.
             if not isinstance(sym, sympy.Symbol):
                 continue
-            dim_min = info["min"]
-            dim_max = info["max"]
-            granularity = info["granularity"]
+            declared = declared_dims_in(sym).get(str(sym))
+            if declared is None:
+                continue
+            dim_min, dim_max, granularity = declared
             current = shape_env.var_to_range.get(sym)
-            declared = ValueRanges(dim_min, dim_max)
+            new_range = ValueRanges(dim_min, dim_max)
             shape_env.var_to_range[sym] = (
-                declared if current is None else current & declared
+                new_range if current is None else current & new_range
             )
             contracts[sym] = (dim_min, dim_max, granularity)
             logger.debug(
-                "input %s dim %d: %s in [%d, %d], granularity %d",
+                "input %s: %s in [%d, %d], granularity %d",
                 name,
-                dim,
                 sym,
                 dim_min,
                 dim_max,
