@@ -2446,9 +2446,10 @@ class TestSympyExprToCpSatPrinter(TestCase):
         owner = types.SimpleNamespace(division=division)
         printer = _SympyExprToCpSat(model, {}, {"split_a": (owner, [1, 2, 4])})
         a = sympy.Symbol("split_a", integer=True, positive=True)
-        expr = sympy.Min(2**70 * a, 3 * 2**70)
+        # A Piecewise of small integers evaluates to an int64 array.
+        expr = sympy.Min(sympy.Piecewise((1, a > 1), (2, True)), 3 * 2**70)
         _, values = printer._candidate_values(expr)
-        self.assertEqual(list(values), [2**70, 2**71, 3 * 2**70])
+        self.assertEqual(list(values), [2, 1, 1])
 
     def test_negated_and_unnamed_boolean_products_preserve_every_assignment(self):
         model = cp_model.CpModel()
