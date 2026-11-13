@@ -122,7 +122,7 @@ def measure(args) -> dict:
     out = {}
 
     def sync():
-        torch_spyre.synchronize()
+        torch.spyre.synchronize()
 
     with torch.no_grad():
         t0 = time.perf_counter()
@@ -202,25 +202,47 @@ def run_topology(name: str, args) -> dict | None:
     return result
 
 
-def print_comparison(results: dict, args) -> None:
+# A round's 3-vs-2 delta smaller than this is treated as no difference.
+MIN_EFFECT_PCT = 2.0
+
+
+def round_delta_pct(two: dict, three: dict) -> float:
+    """Mean over patterns of (3-stream / 2-stream - 1) in percent."""
+    return statistics.mean(
+        (three[p]["per_step_ms"] / two[p]["per_step_ms"] - 1) * 100 for p in PATTERNS
+    )
+
+
+def print_verdict(rounds: list[tuple[dict, dict]], args) -> None:
+    deltas = [round_delta_pct(two, three) for two, three in rounds]
     print()
     print(
         f"seq={args.seq} layers={args.layers} batch={args.batch_size} "
         f"steps/pattern={args.iters} repeats={args.repeats} dtype={args.dtype}"
     )
     print()
-    print(f"{'ms / step':<16}{'2-stream':>12}{'3-stream':>12}{'3 vs 2':>10}")
-    for pat in PATTERNS:
-        a, b = (
-            results[n][pat]["per_step_ms"] if results[n] else None for n in TOPOLOGIES
-        )
-        if a is None or b is None:
-            print(f"{pat:<16}{'FAILED':>12}{'FAILED':>12}")
-        else:
-            print(f"{pat:<16}{a:>12.3f}{b:>12.3f}{(b / a - 1) * 100:>+9.1f}%")
+    print(f"{'round':<8}{'2-stream ms':>14}{'3-stream ms':>14}{'3 vs 2':>10}")
+    for i, ((two, three), d) in enumerate(zip(rounds, deltas), 1):
+        a = statistics.mean(two[p]["per_step_ms"] for p in PATTERNS)
+        b = statistics.mean(three[p]["per_step_ms"] for p in PATTERNS)
+        print(f"{i:<8}{a:>14.3f}{b:>14.3f}{d:>+9.1f}%")
+    print("(ms = mean over the three call patterns)")
+
+    median = statistics.median(deltas)
+    faster = sum(d < -MIN_EFFECT_PCT for d in deltas)
+    slower = sum(d > MIN_EFFECT_PCT for d in deltas)
     print()
-    print("Hypothesis 'decoders gain less from the DMA stream' predicts the")
-    print("3-vs-2 delta shrinks (or flips sign) going down this table.")
+    if faster == len(deltas):
+        print(f"VERDICT: 3-stream is FASTER in all {len(deltas)} rounds "
+              f"(median {-median:.1f}% faster).")  # fmt: skip
+    elif slower == len(deltas):
+        print(f"VERDICT: 3-stream is SLOWER in all {len(deltas)} rounds "
+              f"(median {median:.1f}% slower).")  # fmt: skip
+    else:
+        print(f"VERDICT: INCONCLUSIVE - 3-stream faster in {faster}, slower in "
+              f"{slower}, within +/-{MIN_EFFECT_PCT:.0f}% in "
+              f"{len(deltas) - faster - slower} of {len(deltas)} rounds.")  # fmt: skip
+        print("Round-to-round noise is as large as any topology effect.")
 
 
 def main() -> None:
@@ -235,6 +257,12 @@ def main() -> None:
     p.add_argument("--repeats", type=int, default=5)
     p.add_argument("--device", default="spyre")
     p.add_argument("--dtype", default="float16", choices=["float16", "float32"])
+    p.add_argument(
+        "--rounds",
+        type=int,
+        default=3,
+        help="alternating 2-stream/3-stream rounds (order flips each round)",
+    )
     p.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = p.parse_args()
 
@@ -242,10 +270,17 @@ def main() -> None:
         print(RESULT_PREFIX + json.dumps(measure(args)), flush=True)
         return
 
-    results = {n: run_topology(n, args) for n in TOPOLOGIES}
-    print_comparison(results, args)
-    if any(r is None for r in results.values()):
-        sys.exit(1)
+    rounds = []
+    for i in range(args.rounds):
+        order = list(TOPOLOGIES)
+        if i % 2:
+            order.reverse()  # cancel any first-process-runs-first effect
+        print(f"--- round {i + 1}/{args.rounds} ---", flush=True)
+        res = {n: run_topology(n, args) for n in order}
+        if any(r is None for r in res.values()):
+            sys.exit(1)
+        rounds.append((res["2-stream"], res["3-stream"]))
+    print_verdict(rounds, args)
 
 
 if __name__ == "__main__":
