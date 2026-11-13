@@ -39,7 +39,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from utils_inductor import compare_with_cpu, cached_randn
+from torch._inductor.exc import InductorError, LoweringException
+from utils_inductor import compare_with_cpu, cached_randn, strict_xfail
 
 torch.manual_seed(0xAFFE)
 
@@ -167,11 +168,12 @@ class TestReshapeUnaligned:
     """All ranks 1D–6D with non-multiple innermost dimensions."""
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_reshape_unaligned_1d_to_2d(self, execution_mode, dtype, consumer):
+    def test_reshape_unaligned_1d_to_2d(self, request, execution_mode, dtype, consumer):
         """[520]→reshape(8,65)→[8,65]. Inner 65: 65%64=1. Both consumers exercised."""
-        pytest.xfail(
-            "known failure across all dtypes and consumers; "
-            "tracked in https://github.com/torch-spyre/torch-spyre/issues/1353"
+        strict_xfail(
+            request,
+            InductorError,
+            "Unsupported: view code cannot represent the non-unit stride fraction in the coordinate expression, #1353",
         )
         x = cached_randn(
             (520,), dtype=dtype, differentiation=f"reshape_1d_to_2d_{dtype}"
@@ -181,11 +183,12 @@ class TestReshapeUnaligned:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_reshape_unaligned_2d_to_1d(self, execution_mode, dtype, consumer):
+    def test_reshape_unaligned_2d_to_1d(self, request, execution_mode, dtype, consumer):
         """[8,65]→reshape(-1)→[520]. 1D output; sum_last reduces to scalar (valid)."""
-        pytest.xfail(
-            "known failure across all dtypes and consumers (UnalignedStickSplit); "
-            "tracked in https://github.com/torch-spyre/torch-spyre/issues/5197"
+        strict_xfail(
+            request,
+            InductorError,
+            "UnalignedStickSplit: tensor alignment boundary 65 cuts the physical stick, #5197",
         )
         x = cached_randn(
             (8, 65), dtype=dtype, differentiation=f"reshape_2d_to_1d_{dtype}"
@@ -195,25 +198,29 @@ class TestReshapeUnaligned:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_reshape_unaligned_3d_to_2d_33(self, execution_mode, dtype, consumer):
+    def test_reshape_unaligned_3d_to_2d_33(
+        self, request, execution_mode, dtype, consumer
+    ):
         """[4,8,33]→reshape(32,33)→[32,33]. Inner 33 < 64. Both consumers."""
         if (
             consumer == "sum_last"
             and dtype == torch.float32
             and execution_mode == "eager"
         ):
-            pytest.xfail(
-                "known failure for sum_last/float32/eager; "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/1353"
+            strict_xfail(
+                request,
+                InductorError,
+                "Unsupported: view code cannot represent the non-unit stride fraction in the coordinate expression, #1353",
             )
         if (
             consumer == "sum_last"
             and dtype == torch.float32
             and execution_mode == "compiled"
         ):
-            pytest.xfail(
-                "known failure for sum_last/float32/compiled; "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5224"
+            strict_xfail(
+                request,
+                InductorError,
+                "SubprocException: dbo-opt DtException: Coordinate masking is supported only up to 16bit element types, #5224",
             )
         x = cached_randn(
             (4, 8, 33), dtype=dtype, differentiation=f"reshape_3d_to_2d_33_{dtype}"
@@ -223,11 +230,14 @@ class TestReshapeUnaligned:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_reshape_unaligned_3d_to_4d_260(self, execution_mode, dtype, consumer):
+    def test_reshape_unaligned_3d_to_4d_260(
+        self, request, execution_mode, dtype, consumer
+    ):
         """[1,32,2080]→reshape(1,32,8,260)→[1,32,8,260]. Output inner 260: 260%64=4. Both consumers."""
-        pytest.xfail(
-            "known failure across all dtypes and consumers; "
-            "tracked in https://github.com/torch-spyre/torch-spyre/issues/1353"
+        strict_xfail(
+            request,
+            InductorError,
+            "Unsupported: view code cannot represent the non-unit stride fraction in the coordinate expression, #1353",
         )
         x = cached_randn(
             (1, 32, 2080), dtype=dtype, differentiation=f"reshape_3d_to_4d_260_{dtype}"
@@ -239,11 +249,14 @@ class TestReshapeUnaligned:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_reshape_unaligned_4d_to_3d_129(self, execution_mode, dtype, consumer):
+    def test_reshape_unaligned_4d_to_3d_129(
+        self, request, execution_mode, dtype, consumer
+    ):
         """[1,32,8,129]→reshape(1,32,1032)→[1,32,1032]. Inner 1032; 1032%64=8. Both consumers."""
-        pytest.xfail(
-            "known failure across all dtypes and consumers (reshape across unaligned inner dim reads wrong values); "
-            "tracked in https://github.com/torch-spyre/torch-spyre/issues/5320"
+        strict_xfail(
+            request,
+            AssertionError,
+            "AssertionError: Tensor-likes are not close, reshape across unaligned inner dimension reads wrong values, #5320",
         )
         x = cached_randn(
             (1, 32, 8, 129),
@@ -257,12 +270,20 @@ class TestReshapeUnaligned:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_reshape_unaligned_5d_to_3d(self, execution_mode, dtype, consumer):
+    def test_reshape_unaligned_5d_to_3d(self, request, execution_mode, dtype, consumer):
         """[1,2,4,8,7]→reshape(1,8,56)→[1,8,56]. Input inner 7; output 56: 56%64≠0. Both consumers."""
-        pytest.xfail(
-            "known failure across all dtypes and consumers (Unexpected stick expression / no supported output layout); "
-            "tracked in https://github.com/torch-spyre/torch-spyre/issues/5214"
-        )
+        if execution_mode == "eager":
+            strict_xfail(
+                request,
+                InductorError,
+                "Unsupported: Unexpected stick expression Mod(d1, 7) in optimize_restickify_locations, #5198",
+            )
+        else:
+            strict_xfail(
+                request,
+                InductorError,
+                "Unsupported: no supported output layout found for any candidate input layout, #5214",
+            )
         x = cached_randn(
             (1, 2, 4, 8, 7), dtype=dtype, differentiation=f"reshape_5d_to_3d_{dtype}"
         )
@@ -271,11 +292,12 @@ class TestReshapeUnaligned:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_reshape_unaligned_6d_to_3d(self, execution_mode, dtype, consumer):
+    def test_reshape_unaligned_6d_to_3d(self, request, execution_mode, dtype, consumer):
         """[1,2,4,8,4,7]→reshape(1,8,224)→[1,8,224]. Inner 224: 224%64=32. Both consumers."""
-        pytest.xfail(
-            "known failure across all dtypes and consumers (Unexpected stick expression / no supported output layout); "
-            "tracked in https://github.com/torch-spyre/torch-spyre/issues/5214"
+        strict_xfail(
+            request,
+            InductorError,
+            "Unsupported: no supported output layout found for any candidate input layout, #5214",
         )
         x = cached_randn(
             (1, 2, 4, 8, 4, 7), dtype=dtype, differentiation=f"reshape_6d_to_3d_{dtype}"
@@ -337,12 +359,13 @@ class TestReshapeSize1:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_reshape_4d_two_size1_to_2d(self, execution_mode, dtype, consumer):
+    def test_reshape_4d_two_size1_to_2d(self, request, execution_mode, dtype, consumer):
         """[1,8,1,256]→reshape(8,256)→[8,256]. Inner unchanged 256→256. Both consumers."""
         if consumer == "sum_last" and dtype == torch.bfloat16:
-            pytest.xfail(
-                "known failure for sum_last/bfloat16 (numerical mismatch vs CPU beyond tolerance); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5321"
+            strict_xfail(
+                request,
+                AssertionError,
+                "AssertionError: Tensor-likes are not close (spyre <-> cpu mismatch beyond tolerance), #5321",
             )
         x = cached_randn(
             (1, 8, 1, 256),
@@ -354,12 +377,15 @@ class TestReshapeSize1:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_reshape_4d_size1_trailing_to_3d(self, execution_mode, dtype, consumer):
+    def test_reshape_4d_size1_trailing_to_3d(
+        self, request, execution_mode, dtype, consumer
+    ):
         """[2,8,32,1]→reshape(2,8,32)→[2,8,32]. Inner changes 1→32. Both consumers."""
         if consumer == "sum_last" and dtype == torch.float16:
-            pytest.xfail(
-                "known failure for sum_last/float16 (numerical mismatch vs CPU beyond tolerance); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5321"
+            strict_xfail(
+                request,
+                AssertionError,
+                "AssertionError: Tensor-likes are not close (spyre <-> cpu mismatch beyond tolerance), #5321",
             )
         x = cached_randn(
             (2, 8, 32, 1),
@@ -439,8 +465,9 @@ class TestReshapeRestickify:
         _compare_modes(execution_mode, fn, x)
 
     @pytest.mark.xfail(
-        reason="known failure across eager and compiled (fp16 -> fp32 cast result read back to host has elements in wrong order); "
-        "tracked in https://github.com/torch-spyre/torch-spyre/issues/6033"
+        strict=True,
+        raises=AssertionError,
+        reason="AssertionError: fp16 -> fp32 cast result read back to host has elements in wrong order, #6033",
     )
     def test_restickify_reshape_then_dtype_cast(self, execution_mode):
         """Non-offset-free layout after reshape; dtype cast crosses stick-width boundary."""
@@ -592,12 +619,15 @@ class TestSqueezeUnaligned:
     """1D–6D inputs producing unaligned innermost dim after squeeze."""
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_squeeze_2d_leading_unaligned_33(self, execution_mode, dtype, consumer):
+    def test_squeeze_2d_leading_unaligned_33(
+        self, request, execution_mode, dtype, consumer
+    ):
         """[1,33]→squeeze(0)→[33]. Non-trailing squeeze; inner 33 unchanged. Both consumers."""
         if consumer == "sum_last" and dtype == torch.float32:
-            pytest.xfail(
-                "known failure for sum_last/float32 (SubprocException); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5224"
+            strict_xfail(
+                request,
+                InductorError,
+                "SubprocException: dbo-opt DtException: Coordinate masking is supported only up to 16bit element types, #5224",
             )
         x = cached_randn(
             (1, 33), dtype=dtype, differentiation=f"squeeze_2d_unaligned_33_{dtype}"
@@ -607,12 +637,15 @@ class TestSqueezeUnaligned:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_squeeze_3d_mid_unaligned_70(self, execution_mode, dtype, consumer):
+    def test_squeeze_3d_mid_unaligned_70(
+        self, request, execution_mode, dtype, consumer
+    ):
         """[2,1,70]→squeeze(1)→[2,70]. Non-trailing squeeze; inner 70 unchanged. Both consumers."""
         if consumer == "sum_last" and dtype == torch.float32:
-            pytest.xfail(
-                "known failure for sum_last/float32 (SubprocException); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5224"
+            strict_xfail(
+                request,
+                InductorError,
+                "SubprocException: dbo-opt DtException: Coordinate masking is supported only up to 16bit element types, #5224",
             )
         x = cached_randn(
             (2, 1, 70),
@@ -624,12 +657,15 @@ class TestSqueezeUnaligned:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_squeeze_4d_decode_unaligned_65(self, execution_mode, dtype, consumer):
+    def test_squeeze_4d_decode_unaligned_65(
+        self, request, execution_mode, dtype, consumer
+    ):
         """[1,1,16,65]→squeeze(1)→[1,16,65]. Non-trailing squeeze; inner 65 unchanged. Both consumers."""
         if consumer == "sum_last" and dtype == torch.float32:
-            pytest.xfail(
-                "known failure for sum_last/float32 (SubprocException); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5224"
+            strict_xfail(
+                request,
+                InductorError,
+                "SubprocException: dbo-opt DtException: Coordinate masking is supported only up to 16bit element types, #5224",
             )
         x = cached_randn(
             (1, 1, 16, 65),
@@ -641,12 +677,15 @@ class TestSqueezeUnaligned:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_squeeze_4d_tuple_unaligned_33(self, execution_mode, dtype, consumer):
+    def test_squeeze_4d_tuple_unaligned_33(
+        self, request, execution_mode, dtype, consumer
+    ):
         """[1,16,1,33]→squeeze((0,2))→[16,33]. Neither dim trailing; inner 33 unchanged. Both consumers."""
         if consumer == "sum_last" and dtype == torch.float32:
-            pytest.xfail(
-                "known failure for sum_last/float32 (SubprocException); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5224"
+            strict_xfail(
+                request,
+                InductorError,
+                "SubprocException: dbo-opt DtException: Coordinate masking is supported only up to 16bit element types, #5224",
             )
         x = cached_randn(
             (1, 16, 1, 33),
@@ -658,12 +697,15 @@ class TestSqueezeUnaligned:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_squeeze_5d_all_singletons_unaligned(self, execution_mode, dtype, consumer):
+    def test_squeeze_5d_all_singletons_unaligned(
+        self, request, execution_mode, dtype, consumer
+    ):
         """[1,1,32,1,30]→squeeze()→[32,30]. Inner 30 unchanged. Both consumers."""
         if consumer == "sum_last" and dtype == torch.float32:
-            pytest.xfail(
-                "known failure for sum_last/float32 (SubprocException); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5224"
+            strict_xfail(
+                request,
+                InductorError,
+                "SubprocException: dbo-opt DtException: Coordinate masking is supported only up to 16bit element types, #5224",
             )
         x = cached_randn(
             (1, 1, 32, 1, 30),
@@ -675,12 +717,15 @@ class TestSqueezeUnaligned:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_squeeze_6d_leading_unaligned_13(self, execution_mode, dtype, consumer):
+    def test_squeeze_6d_leading_unaligned_13(
+        self, request, execution_mode, dtype, consumer
+    ):
         """[1,2,4,1,8,13]→squeeze(0)→[2,4,1,8,13]. Non-trailing squeeze; inner 13 unchanged. Both consumers."""
         if consumer == "sum_last" and dtype == torch.float32:
-            pytest.xfail(
-                "known failure for sum_last/float32 (SubprocException); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5224"
+            strict_xfail(
+                request,
+                InductorError,
+                "SubprocException: dbo-opt DtException: Coordinate masking is supported only up to 16bit element types, #5224",
             )
         x = cached_randn(
             (1, 2, 4, 1, 8, 13),
@@ -758,12 +803,13 @@ class TestSqueezeSize1:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_squeeze_5d_size1_inner(self, execution_mode, dtype, consumer):
+    def test_squeeze_5d_size1_inner(self, request, execution_mode, dtype, consumer):
         """[2,1,32,1,256]→squeeze()→[2,32,256]. Inner 256 unchanged. Both consumers."""
         if consumer == "sum_last" and dtype == torch.float16:
-            pytest.xfail(
-                "known failure for sum_last/float16 (numerical mismatch vs CPU beyond tolerance); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5374"
+            strict_xfail(
+                request,
+                AssertionError,
+                "AssertionError: Tensor-likes are not close (spyre <-> cpu mismatch beyond tolerance), #5374",
             )
         x = cached_randn(
             (2, 1, 32, 1, 256),
@@ -775,12 +821,19 @@ class TestSqueezeSize1:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_squeeze_6d_size1_to_3d(self, execution_mode, dtype, consumer):
+    def test_squeeze_6d_size1_to_3d(self, request, execution_mode, dtype, consumer):
         """[1,1,4,1,8,256]→squeeze()→[4,8,256]. Inner 256 unchanged. Both consumers."""
-        if consumer == "sum_last" and dtype in (torch.float16, torch.bfloat16):
-            pytest.xfail(
-                "known failure for sum_last/float16 and bfloat16 (numerical mismatch vs CPU beyond tolerance); float16: #5301, bfloat16: #5374; "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5301, https://github.com/torch-spyre/torch-spyre/issues/5374"
+        if consumer == "sum_last" and dtype == torch.float16:
+            strict_xfail(
+                request,
+                AssertionError,
+                "AssertionError: Tensor-likes are not close (spyre <-> cpu mismatch beyond tolerance), #5301",
+            )
+        if consumer == "sum_last" and dtype == torch.bfloat16:
+            strict_xfail(
+                request,
+                AssertionError,
+                "AssertionError: Tensor-likes are not close (spyre <-> cpu mismatch beyond tolerance), #5374",
             )
         x = cached_randn(
             (1, 1, 4, 1, 8, 256),
@@ -792,12 +845,15 @@ class TestSqueezeSize1:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_squeeze_chain_multi_then_reshape(self, execution_mode, dtype, consumer):
+    def test_squeeze_chain_multi_then_reshape(
+        self, request, execution_mode, dtype, consumer
+    ):
         """[1,8,1,256]→squeeze(0).squeeze(1).reshape(-1)→[2048]. Both consumers."""
         if consumer == "sum_last" and dtype == torch.bfloat16:
-            pytest.xfail(
-                "known failure for sum_last/bfloat16 (numerical mismatch vs CPU beyond tolerance); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5374"
+            strict_xfail(
+                request,
+                AssertionError,
+                "AssertionError: Tensor-likes are not close (spyre <-> cpu mismatch beyond tolerance), #5374",
             )
         x = cached_randn(
             (1, 8, 1, 256),
@@ -884,12 +940,15 @@ class TestUnsqueezeUnaligned:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_unsqueeze_1d_to_2d_unaligned_70(self, execution_mode, dtype, consumer):
+    def test_unsqueeze_1d_to_2d_unaligned_70(
+        self, request, execution_mode, dtype, consumer
+    ):
         """[70]→unsqueeze(0)→[1,70]. Non-trailing; inner 70 unchanged. Both consumers."""
         if consumer == "sum_last" and dtype == torch.float32:
-            pytest.xfail(
-                "known failure for sum_last/float32 (SubprocException); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5224"
+            strict_xfail(
+                request,
+                InductorError,
+                "SubprocException: dbo-opt DtException: Coordinate masking is supported only up to 16bit element types, #5224",
             )
         x = cached_randn(
             (70,), dtype=dtype, differentiation=f"unsqueeze_1d_to_2d_70_{dtype}"
@@ -899,12 +958,15 @@ class TestUnsqueezeUnaligned:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_unsqueeze_2d_to_3d_unaligned_33(self, execution_mode, dtype, consumer):
+    def test_unsqueeze_2d_to_3d_unaligned_33(
+        self, request, execution_mode, dtype, consumer
+    ):
         """[32,33]→unsqueeze(0)→[1,32,33]. Non-trailing; inner 33 unchanged. Both consumers."""
         if consumer == "sum_last" and dtype == torch.float32:
-            pytest.xfail(
-                "known failure for sum_last/float32 (SubprocException); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5224"
+            strict_xfail(
+                request,
+                InductorError,
+                "SubprocException: dbo-opt DtException: Coordinate masking is supported only up to 16bit element types, #5224",
             )
         x = cached_randn(
             (32, 33), dtype=dtype, differentiation=f"unsqueeze_2d_to_3d_33_{dtype}"
@@ -915,13 +977,14 @@ class TestUnsqueezeUnaligned:
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
     def test_unsqueeze_3d_to_4d_rope_unaligned_65(
-        self, execution_mode, dtype, consumer
+        self, request, execution_mode, dtype, consumer
     ):
         """[1,32,65]→unsqueeze(2)→[1,32,1,65]. Non-trailing; inner 65 unchanged. Both consumers."""
         if consumer == "sum_last" and dtype == torch.float32:
-            pytest.xfail(
-                "known failure for sum_last/float32 (SubprocException); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5224"
+            strict_xfail(
+                request,
+                InductorError,
+                "SubprocException: dbo-opt DtException: Coordinate masking is supported only up to 16bit element types, #5224",
             )
         x = cached_randn(
             (1, 32, 65), dtype=dtype, differentiation=f"unsqueeze_3d_to_4d_65_{dtype}"
@@ -931,17 +994,28 @@ class TestUnsqueezeUnaligned:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_unsqueeze_4d_to_5d_gqa_unaligned_65(self, execution_mode, dtype, consumer):
+    def test_unsqueeze_4d_to_5d_gqa_unaligned_65(
+        self, request, execution_mode, dtype, consumer
+    ):
         """[2,8,32,65]→unsqueeze(2)→[2,8,1,32,65]. Non-trailing; inner 65 unchanged. Both consumers."""
         if consumer == "sum_last" and dtype == torch.float16:
-            pytest.xfail(
-                "known failure for sum_last/float16 (numerical mismatch vs CPU beyond tolerance); eager: #5317, compiled: #5318; "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5317, https://github.com/torch-spyre/torch-spyre/issues/5318"
-            )
+            if execution_mode == "eager":
+                strict_xfail(
+                    request,
+                    AssertionError,
+                    "AssertionError: Tensor-likes are not close (spyre <-> cpu mismatch beyond tolerance), #5317",
+                )
+            else:
+                strict_xfail(
+                    request,
+                    AssertionError,
+                    "AssertionError: Tensor-likes are not close (spyre <-> cpu mismatch beyond tolerance), #5318",
+                )
         if consumer == "sum_last" and dtype == torch.float32:
-            pytest.xfail(
-                "known failure for sum_last/float32 (SubprocException); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5224"
+            strict_xfail(
+                request,
+                InductorError,
+                "SubprocException: dbo-opt DtException: Coordinate masking is supported only up to 16bit element types, #5224",
             )
         x = cached_randn(
             (2, 8, 32, 65),
@@ -953,12 +1027,15 @@ class TestUnsqueezeUnaligned:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_unsqueeze_5d_to_6d_unaligned_13(self, execution_mode, dtype, consumer):
+    def test_unsqueeze_5d_to_6d_unaligned_13(
+        self, request, execution_mode, dtype, consumer
+    ):
         """[1,2,4,8,13]→unsqueeze(3)→[1,2,4,1,8,13]. Non-trailing (dim 3); inner 13 unchanged. Both consumers."""
         if consumer == "sum_last" and dtype == torch.float32:
-            pytest.xfail(
-                "known failure for sum_last/float32 (SubprocException); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5224"
+            strict_xfail(
+                request,
+                InductorError,
+                "SubprocException: dbo-opt DtException: Coordinate masking is supported only up to 16bit element types, #5224",
             )
         x = cached_randn(
             (1, 2, 4, 8, 13),
@@ -1062,12 +1139,13 @@ class TestUnsqueezeSize1:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_unsqueeze_5d_to_6d_aligned(self, execution_mode, dtype, consumer):
+    def test_unsqueeze_5d_to_6d_aligned(self, request, execution_mode, dtype, consumer):
         """[1,2,4,8,256]→unsqueeze(3)→[1,2,4,1,8,256]. Non-trailing (dim 3); inner 256 unchanged. Both consumers."""
         if consumer == "sum_last" and dtype in (torch.float16, torch.bfloat16):
-            pytest.xfail(
-                "known failure for sum_last/float16 and bfloat16 (numerical mismatch vs CPU beyond tolerance); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5318"
+            strict_xfail(
+                request,
+                AssertionError,
+                "AssertionError: Tensor-likes are not close (spyre <-> cpu mismatch beyond tolerance), #5318",
             )
         x = cached_randn(
             (1, 2, 4, 8, 256),
@@ -1186,12 +1264,15 @@ class TestExpandUnaligned:
     """0D–6D inputs with unaligned innermost dimension."""
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_expand_0d_scalar_to_4d_unaligned(self, execution_mode, dtype, consumer):
+    def test_expand_0d_scalar_to_4d_unaligned(
+        self, request, execution_mode, dtype, consumer
+    ):
         """[]→expand(1,16,32,70)→[1,16,32,70]. Inner 70: 70%64=6. Both consumers."""
         if consumer == "sum_last":
-            pytest.xfail(
-                "known failure for sum_last across all dtypes (AssertionError); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5219"
+            strict_xfail(
+                request,
+                InductorError,
+                "AssertionError: sum(map(len, sizes)) == sum(map(len, index_vars)), #5219",
             )
         x = torch.tensor(1.0, dtype=dtype)
         _compare_modes(
@@ -1201,12 +1282,15 @@ class TestExpandUnaligned:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_expand_1d_bias_unaligned_70(self, execution_mode, dtype, consumer):
+    def test_expand_1d_bias_unaligned_70(
+        self, request, execution_mode, dtype, consumer
+    ):
         """[70]→expand(2,32,70)→[2,32,70]. Inner 70 unchanged. Both consumers."""
         if consumer == "sum_last":
-            pytest.xfail(
-                "known failure for sum_last across all dtypes (SubprocException / DtException); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5237"
+            strict_xfail(
+                request,
+                InductorError,
+                "SubprocException: dbo-opt DtException: Could not find any suitable dimension mapping, #5237",
             )
         x = cached_randn(
             (70,), dtype=dtype, differentiation=f"expand_1d_bias_70_{dtype}"
@@ -1216,12 +1300,15 @@ class TestExpandUnaligned:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_expand_2d_batch_unaligned_33(self, execution_mode, dtype, consumer):
+    def test_expand_2d_batch_unaligned_33(
+        self, request, execution_mode, dtype, consumer
+    ):
         """[1,33]→expand(4,33)→[4,33]. Inner 33 unchanged. Both consumers."""
         if consumer == "sum_last":
-            pytest.xfail(
-                "known failure for sum_last across all dtypes (SubprocException / DtException); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5237"
+            strict_xfail(
+                request,
+                InductorError,
+                "SubprocException: dbo-opt DtException: Could not find any suitable dimension mapping, #5237",
             )
         x = cached_randn(
             (1, 33), dtype=dtype, differentiation=f"expand_2d_batch_33_{dtype}"
@@ -1231,12 +1318,15 @@ class TestExpandUnaligned:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_expand_3d_batch_unaligned_33(self, execution_mode, dtype, consumer):
+    def test_expand_3d_batch_unaligned_33(
+        self, request, execution_mode, dtype, consumer
+    ):
         """[1,32,33]→expand(4,32,33)→[4,32,33]. Inner 33 unchanged. Both consumers."""
         if consumer == "sum_last":
-            pytest.xfail(
-                "known failure for sum_last across all dtypes (SubprocException / DtException); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5237"
+            strict_xfail(
+                request,
+                InductorError,
+                "SubprocException: dbo-opt DtException: Could not find any suitable dimension mapping, #5237",
             )
         x = cached_randn(
             (1, 32, 33), dtype=dtype, differentiation=f"expand_3d_batch_33_{dtype}"
@@ -1246,12 +1336,13 @@ class TestExpandUnaligned:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_expand_5d_gqa_unaligned_65(self, execution_mode, dtype, consumer):
+    def test_expand_5d_gqa_unaligned_65(self, request, execution_mode, dtype, consumer):
         """[1,8,1,32,65]→expand(1,8,2,32,65)→[1,8,2,32,65]. Inner 65 unchanged. Both consumers."""
         if consumer == "sum_last":
-            pytest.xfail(
-                "known failure for sum_last across all dtypes (SubprocException / DtException); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5237"
+            strict_xfail(
+                request,
+                InductorError,
+                "SubprocException: dbo-opt DtException: Could not find any suitable dimension mapping, #5237",
             )
         x = cached_randn(
             (1, 8, 1, 32, 65), dtype=dtype, differentiation=f"expand_5d_gqa_65_{dtype}"
@@ -1263,12 +1354,15 @@ class TestExpandUnaligned:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_expand_4d_mask_unaligned_seq33(self, execution_mode, dtype, consumer):
+    def test_expand_4d_mask_unaligned_seq33(
+        self, request, execution_mode, dtype, consumer
+    ):
         """[1,1,33,33]→expand(2,8,33,33)→[2,8,33,33]. Inner 33 unchanged. Both consumers."""
         if consumer == "sum_last":
-            pytest.xfail(
-                "known failure for sum_last across all dtypes (SubprocException / DtException); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5237"
+            strict_xfail(
+                request,
+                InductorError,
+                "SubprocException: dbo-opt DtException: Could not find any suitable dimension mapping, #5237",
             )
         x = cached_randn(
             (1, 1, 33, 33), dtype=dtype, differentiation=f"expand_4d_mask_33_{dtype}"
@@ -1280,12 +1374,15 @@ class TestExpandUnaligned:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_expand_3d_minus_one_unaligned(self, execution_mode, dtype, consumer):
+    def test_expand_3d_minus_one_unaligned(
+        self, request, execution_mode, dtype, consumer
+    ):
         """[2,1,70]→expand(-1,16,-1)→[2,16,70]. -1 preserves dim; inner 70 unchanged. Both consumers."""
         if consumer == "sum_last":
-            pytest.xfail(
-                "known failure for sum_last across all dtypes (SubprocException / DtException); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5237"
+            strict_xfail(
+                request,
+                InductorError,
+                "SubprocException: dbo-opt DtException: Could not find any suitable dimension mapping, #5237",
             )
         x = cached_randn(
             (2, 1, 70), dtype=dtype, differentiation=f"expand_3d_minus_one_70_{dtype}"
@@ -1295,12 +1392,13 @@ class TestExpandUnaligned:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_expand_6d_unaligned_inner(self, execution_mode, dtype, consumer):
+    def test_expand_6d_unaligned_inner(self, request, execution_mode, dtype, consumer):
         """[1,2,1,4,1,13]→expand(1,2,8,4,16,13)→[1,2,8,4,16,13]. 6D; inner 13 unchanged. Both consumers."""
         if consumer == "sum_last":
-            pytest.xfail(
-                "known failure for sum_last across all dtypes (SubprocException / DtException); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5237"
+            strict_xfail(
+                request,
+                InductorError,
+                "SubprocException: dbo-opt DtException: Could not find any suitable dimension mapping, #5237",
             )
         x = cached_randn(
             (1, 2, 1, 4, 1, 13),
@@ -1326,12 +1424,15 @@ class TestExpandSize1:
     """0D–6D. Size-1 innermost can stay size-1 or be broadcast to aligned."""
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_expand_0d_scalar_to_4d_aligned(self, execution_mode, dtype, consumer):
+    def test_expand_0d_scalar_to_4d_aligned(
+        self, request, execution_mode, dtype, consumer
+    ):
         """[]→expand(1,16,32,256)→[1,16,32,256]. 0D broadcast; inner 256 unchanged. Both consumers."""
         if consumer == "sum_last":
-            pytest.xfail(
-                "known failure for sum_last across all dtypes (AssertionError); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5219"
+            strict_xfail(
+                request,
+                InductorError,
+                "AssertionError: sum(map(len, sizes)) == sum(map(len, index_vars)), #5219",
             )
         x = torch.tensor(1.0, dtype=dtype)
         _compare_modes(
@@ -1351,12 +1452,13 @@ class TestExpandSize1:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_expand_1d_size1_to_aligned(self, execution_mode, dtype, consumer):
+    def test_expand_1d_size1_to_aligned(self, request, execution_mode, dtype, consumer):
         """[1]→expand(256)→[256]. 1D size-1 broadcast to aligned 256. Both consumers."""
         if consumer == "sum_last":
-            pytest.xfail(
-                "known failure for sum_last across all dtypes (AssertionError); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5219"
+            strict_xfail(
+                request,
+                InductorError,
+                "AssertionError: sum(map(len, sizes)) == sum(map(len, index_vars)), #5219",
             )
         x = cached_randn(
             (1,), dtype=dtype, differentiation=f"expand_1d_size1_to_aligned_{dtype}"
@@ -1366,12 +1468,15 @@ class TestExpandSize1:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_expand_2d_size1_inner_to_2816(self, execution_mode, dtype, consumer):
+    def test_expand_2d_size1_inner_to_2816(
+        self, request, execution_mode, dtype, consumer
+    ):
         """[32,1]→expand(32,2816)→[32,2816]. Size-1 innermost broadcast to aligned 2816. Both consumers."""
         if consumer == "sum_last":
-            pytest.xfail(
-                "known failure for sum_last across all dtypes (AssertionError); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5219"
+            strict_xfail(
+                request,
+                InductorError,
+                "AssertionError: sum(map(len, sizes)) == sum(map(len, index_vars)), #5219",
             )
         x = cached_randn(
             (32, 1), dtype=dtype, differentiation=f"expand_2d_size1_to_2816_{dtype}"
@@ -1381,12 +1486,15 @@ class TestExpandSize1:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_expand_3d_moe_trailing1_broadcast(self, execution_mode, dtype, consumer):
+    def test_expand_3d_moe_trailing1_broadcast(
+        self, request, execution_mode, dtype, consumer
+    ):
         """[32,8,1]→expand(32,8,2816)→[32,8,2816]. MoE routing trailing-1 broadcast. Both consumers."""
         if consumer == "sum_last":
-            pytest.xfail(
-                "known failure for sum_last across all dtypes (AssertionError); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5219"
+            strict_xfail(
+                request,
+                InductorError,
+                "AssertionError: sum(map(len, sizes)) == sum(map(len, index_vars)), #5219",
             )
         x = cached_randn(
             (32, 8, 1), dtype=dtype, differentiation=f"expand_3d_moe_trailing1_{dtype}"
@@ -1398,12 +1506,15 @@ class TestExpandSize1:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_expand_4d_all_size1_except_inner(self, execution_mode, dtype, consumer):
+    def test_expand_4d_all_size1_except_inner(
+        self, request, execution_mode, dtype, consumer
+    ):
         """[1,1,1,256]→expand(4,16,32,256)→[4,16,32,256]. All outer size-1; inner 256 unchanged. Both consumers."""
         if consumer == "sum_last":
-            pytest.xfail(
-                "known failure for sum_last across all dtypes (SubprocException / DtException); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5237"
+            strict_xfail(
+                request,
+                InductorError,
+                "SubprocException: dbo-opt DtException: Could not find any suitable dimension mapping, #5237",
             )
         x = cached_randn(
             (1, 1, 1, 256),
@@ -1417,12 +1528,13 @@ class TestExpandSize1:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_expand_4d_mqa_16x(self, execution_mode, dtype, consumer):
+    def test_expand_4d_mqa_16x(self, request, execution_mode, dtype, consumer):
         """[1,1,1,256]→expand(1,16,32,256)→[1,16,32,256]. MQA (KV=1) 16× broadcast. Both consumers."""
         if consumer == "sum_last":
-            pytest.xfail(
-                "known failure for sum_last across all dtypes (SubprocException / DtException); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5237"
+            strict_xfail(
+                request,
+                InductorError,
+                "SubprocException: dbo-opt DtException: Could not find any suitable dimension mapping, #5237",
             )
         x = cached_randn(
             (1, 1, 1, 256), dtype=dtype, differentiation=f"expand_4d_mqa_16x_{dtype}"
@@ -1434,12 +1546,15 @@ class TestExpandSize1:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_expand_5d_size1_inner_aligned(self, execution_mode, dtype, consumer):
+    def test_expand_5d_size1_inner_aligned(
+        self, request, execution_mode, dtype, consumer
+    ):
         """[16,1,4,16,1]→expand(16,8,4,16,256)→[16,8,4,16,256]. 5D; size-1 inner → aligned 256. Both consumers."""
         if consumer == "sum_last":
-            pytest.xfail(
-                "known failure for sum_last across all dtypes (AssertionError); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5219"
+            strict_xfail(
+                request,
+                InductorError,
+                "AssertionError: sum(map(len, sizes)) == sum(map(len, index_vars)), #5219",
             )
         x = cached_randn(
             (16, 1, 4, 16, 1),
@@ -1467,12 +1582,13 @@ class TestExpandSize1:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_expand_6d_size1_to_aligned(self, execution_mode, dtype, consumer):
+    def test_expand_6d_size1_to_aligned(self, request, execution_mode, dtype, consumer):
         """[1,1,1,4,1,256]→expand(2,8,4,4,16,256)→[2,8,4,4,16,256]. 6D; multiple size-1 broadcast. Both consumers."""
         if consumer == "sum_last":
-            pytest.xfail(
-                "known failure for sum_last across all dtypes (SubprocException / DtException); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5237"
+            strict_xfail(
+                request,
+                InductorError,
+                "SubprocException: dbo-opt DtException: Could not find any suitable dimension mapping, #5237",
             )
         x = cached_randn(
             (1, 1, 1, 4, 1, 256),
@@ -1486,12 +1602,13 @@ class TestExpandSize1:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_expand_6d_aligned(self, execution_mode, dtype, consumer):
+    def test_expand_6d_aligned(self, request, execution_mode, dtype, consumer):
         """[1,2,1,4,1,256]→expand(8,2,4,4,16,256)→[8,2,4,4,16,256]. 6D aligned; inner 256 unchanged. Both consumers."""
         if consumer == "sum_last":
-            pytest.xfail(
-                "known failure for sum_last across all dtypes (SubprocException / DtException); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5237"
+            strict_xfail(
+                request,
+                InductorError,
+                "SubprocException: dbo-opt DtException: Could not find any suitable dimension mapping, #5237",
             )
         x = cached_randn(
             (1, 2, 1, 4, 1, 256),
@@ -1521,12 +1638,15 @@ class TestTransposeUnaligned:
     """2D–6D inputs with unaligned innermost dimension."""
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_transpose_2d_unaligned_inner_swap(self, execution_mode, dtype, consumer):
+    def test_transpose_2d_unaligned_inner_swap(
+        self, request, execution_mode, dtype, consumer
+    ):
         """[65,256]→transpose(0,1)→[256,65]. Inner changes 256→65; 65%64=1. Both consumers."""
         if dtype == torch.float16:
-            pytest.xfail(
-                "known failure for float16 (sum_last: numerical mismatch vs CPU beyond tolerance); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5319"
+            strict_xfail(
+                request,
+                AssertionError,
+                "AssertionError: Tensor-likes are not close (spyre <-> cpu mismatch beyond tolerance), #5319",
             )
         x = cached_randn(
             (65, 256),
@@ -1538,12 +1658,15 @@ class TestTransposeUnaligned:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_transpose_3d_last_two_unaligned(self, execution_mode, dtype, consumer):
+    def test_transpose_3d_last_two_unaligned(
+        self, request, execution_mode, dtype, consumer
+    ):
         """[4,32,70]→transpose(1,2)→[4,70,32]. Inner changes 70→32; input inner 70 unaligned. Both consumers."""
         if dtype in (torch.float16, torch.bfloat16):
-            pytest.xfail(
-                "known failure for float16 and bfloat16 (sum_last: numerical mismatch vs CPU beyond tolerance); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5319"
+            strict_xfail(
+                request,
+                AssertionError,
+                "AssertionError: Tensor-likes are not close (spyre <-> cpu mismatch beyond tolerance), #5319",
             )
         x = cached_randn(
             (4, 32, 70),
@@ -1555,12 +1678,15 @@ class TestTransposeUnaligned:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_transpose_4d_key_unaligned_65(self, execution_mode, dtype, consumer):
+    def test_transpose_4d_key_unaligned_65(
+        self, request, execution_mode, dtype, consumer
+    ):
         """[1,16,32,65]→transpose(2,3)→[1,16,65,32]. Inner changes 65→32. Both consumers."""
         if dtype in (torch.float16, torch.bfloat16):
-            pytest.xfail(
-                "known failure for float16 and bfloat16 (sum_last: numerical mismatch vs CPU beyond tolerance); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5319"
+            strict_xfail(
+                request,
+                AssertionError,
+                "AssertionError: Tensor-likes are not close (spyre <-> cpu mismatch beyond tolerance), #5319",
             )
         x = cached_randn(
             (1, 16, 32, 65), dtype=dtype, differentiation=f"transpose_4d_key_65_{dtype}"
@@ -1571,18 +1697,20 @@ class TestTransposeUnaligned:
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
     def test_transpose_4d_head_swap_unaligned_inner(
-        self, execution_mode, dtype, consumer
+        self, request, execution_mode, dtype, consumer
     ):
         """[2,32,8,70]→transpose(1,2)→[2,8,32,70]. Inner 70 unchanged; 70%64=6. Both consumers."""
         if dtype == torch.float16:
-            pytest.xfail(
-                "known failure for float16 (sum_last: numerical mismatch vs CPU beyond tolerance); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5319"
+            strict_xfail(
+                request,
+                AssertionError,
+                "AssertionError: Tensor-likes are not close (spyre <-> cpu mismatch beyond tolerance), #5319",
             )
         if dtype == torch.float32:
-            pytest.xfail(
-                "known failure for float32; "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5224"
+            strict_xfail(
+                request,
+                InductorError,
+                "SubprocException: dbo-opt DtException: Coordinate masking is supported only up to 16bit element types, #5224",
             )
         x = cached_randn(
             (2, 32, 8, 70),
@@ -1594,17 +1722,19 @@ class TestTransposeUnaligned:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_transpose_5d_unaligned(self, execution_mode, dtype, consumer):
+    def test_transpose_5d_unaligned(self, request, execution_mode, dtype, consumer):
         """[1,8,1,32,65]→transpose(1,3)→[1,32,1,8,65]. Inner 65 unchanged. Both consumers."""
         if dtype == torch.float16:
-            pytest.xfail(
-                "known failure for float16 (sum_last: numerical mismatch vs CPU beyond tolerance); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5319"
+            strict_xfail(
+                request,
+                AssertionError,
+                "AssertionError: Tensor-likes are not close (spyre <-> cpu mismatch beyond tolerance), #5319",
             )
         if dtype == torch.float32:
-            pytest.xfail(
-                "known failure for float32; "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5224"
+            strict_xfail(
+                request,
+                InductorError,
+                "SubprocException: dbo-opt DtException: Coordinate masking is supported only up to 16bit element types, #5224",
             )
         x = cached_randn(
             (1, 8, 1, 32, 65),
@@ -1616,12 +1746,13 @@ class TestTransposeUnaligned:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_transpose_6d_unaligned(self, execution_mode, dtype, consumer):
+    def test_transpose_6d_unaligned(self, request, execution_mode, dtype, consumer):
         """[1,2,4,8,16,13]→transpose(1,4)→[1,16,4,8,2,13]. Inner 13 unchanged; 13 < 64. Both consumers."""
         if dtype == torch.float32:
-            pytest.xfail(
-                "known failure for float32; "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5224"
+            strict_xfail(
+                request,
+                InductorError,
+                "SubprocException: dbo-opt DtException: Coordinate masking is supported only up to 16bit element types, #5224",
             )
         x = cached_randn(
             (1, 2, 4, 8, 16, 13),
@@ -1727,12 +1858,15 @@ class TestTUnaligned:
         _compare_modes(execution_mode, lambda t: _apply_consumer(t.t(), consumer), x)
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_t_2d_unaligned_inner_to_outer(self, execution_mode, dtype, consumer):
+    def test_t_2d_unaligned_inner_to_outer(
+        self, request, execution_mode, dtype, consumer
+    ):
         """[65,256].t()→[256,65]. New inner 65; 65%64=1. Both consumers."""
         if consumer == "sum_last" and dtype == torch.float16:
-            pytest.xfail(
-                "known failure for sum_last/float16 (numerical mismatch vs CPU beyond tolerance); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5302"
+            strict_xfail(
+                request,
+                AssertionError,
+                "AssertionError: Tensor-likes are not close (spyre <-> cpu mismatch beyond tolerance), #5302",
             )
         x = cached_randn(
             (65, 256),
@@ -1742,12 +1876,13 @@ class TestTUnaligned:
         _compare_modes(execution_mode, lambda t: _apply_consumer(t.t(), consumer), x)
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_t_2d_both_unaligned(self, execution_mode, dtype, consumer):
+    def test_t_2d_both_unaligned(self, request, execution_mode, dtype, consumer):
         """[33,70].t()→[70,33]. New inner 33 < 64; both dims unaligned. Both consumers."""
         if consumer == "sum_last" and dtype == torch.float16:
-            pytest.xfail(
-                "known failure for sum_last/float16 (numerical mismatch vs CPU beyond tolerance); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5302"
+            strict_xfail(
+                request,
+                AssertionError,
+                "AssertionError: Tensor-likes are not close (spyre <-> cpu mismatch beyond tolerance), #5302",
             )
         x = cached_randn(
             (33, 70), dtype=dtype, differentiation=f"t_2d_both_unaligned_{dtype}"
@@ -1755,12 +1890,13 @@ class TestTUnaligned:
         _compare_modes(execution_mode, lambda t: _apply_consumer(t.t(), consumer), x)
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_t_2d_aligned_swap(self, execution_mode, dtype, consumer):
+    def test_t_2d_aligned_swap(self, request, execution_mode, dtype, consumer):
         """[128,64].t()→[64,128]. New inner 128; both aligned; inner changes. Both consumers."""
         if consumer == "sum_last" and dtype in (torch.float16, torch.bfloat16):
-            pytest.xfail(
-                "known failure for sum_last/float16 and bfloat16 (numerical mismatch vs CPU beyond tolerance); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5302"
+            strict_xfail(
+                request,
+                AssertionError,
+                "AssertionError: Tensor-likes are not close (spyre <-> cpu mismatch beyond tolerance), #5302",
             )
         x = cached_randn(
             (128, 64), dtype=dtype, differentiation=f"t_2d_aligned_swap_{dtype}"
@@ -1886,17 +2022,19 @@ class TestCloneUnaligned:
         )
         _compare_modes(execution_mode, lambda t: t.clone(), x)
 
-    def test_clone_3d_unaligned_after_transpose(self, execution_mode, dtype):
+    def test_clone_3d_unaligned_after_transpose(self, request, execution_mode, dtype):
         """[4,256,65].transpose(1,2).clone()→[4,65,256]. Clone of non-contiguous; output inner 256."""
         if dtype == torch.float32 and execution_mode == "eager":
-            pytest.xfail(
-                "known failure (no mechanism to resolve stick incompatibility); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5216"
+            strict_xfail(
+                request,
+                InductorError,
+                "NotImplementedError: no mechanism to resolve stick incompatibility, #5216",
             )
         if dtype == torch.float32 and execution_mode == "compiled":
-            pytest.xfail(
-                "known failure (ReStickifyOpHBM on DataFormats.IEEE_FP32); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5216"
+            strict_xfail(
+                request,
+                InductorError,
+                "NotImplementedError: no mechanism to resolve stick incompatibility, #5216",
             )
         x = cached_randn(
             (4, 256, 65),
@@ -2040,11 +2178,12 @@ class TestCatUnaligned:
     """1D–6D inputs with unaligned innermost dimension."""
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_cat_1d_unaligned_halves(self, execution_mode, dtype, consumer):
+    def test_cat_1d_unaligned_halves(self, request, execution_mode, dtype, consumer):
         """[33] + [33] → cat(dim=0) → [66]. Output inner 66; 66%64=2. Both consumers."""
-        pytest.xfail(
-            "known failure across all dtypes and consumers; "
-            "tracked in https://github.com/torch-spyre/torch-spyre/issues/3916"
+        strict_xfail(
+            request,
+            InductorError,
+            "Unsupported: no offset-free alternative stick dim for mutation target, #3916",
         )
         a = cached_randn(
             (33,), dtype=dtype, differentiation=f"cat_1d_unaligned_a_{dtype}"
@@ -2060,17 +2199,19 @@ class TestCatUnaligned:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_cat_2d_trailing_unaligned(self, execution_mode, dtype, consumer):
+    def test_cat_2d_trailing_unaligned(self, request, execution_mode, dtype, consumer):
         """[32,33] + [32,33] → cat(dim=-1) → [32,66]. Output inner 66 unaligned. Both consumers."""
-        if consumer == "sum_last":
-            pytest.xfail(
-                "known failure for sum_last (numerical mismatch vs CPU beyond tolerance); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5300"
+        if consumer == "sum_last" and dtype in (torch.float16, torch.bfloat16):
+            strict_xfail(
+                request,
+                AssertionError,
+                "AssertionError: Tensor-likes are not close (spyre <-> cpu mismatch beyond tolerance), #5300",
             )
         if dtype == torch.float32:
-            pytest.xfail(
-                "known failure for float32 (no mechanism to resolve stick incompatibility); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5216"
+            strict_xfail(
+                request,
+                InductorError,
+                "NotImplementedError: no mechanism to resolve stick incompatibility, #5216",
             )
         a = cached_randn(
             (32, 33),
@@ -2090,12 +2231,14 @@ class TestCatUnaligned:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_cat_3d_seq_dim_unaligned(self, execution_mode, dtype, consumer):
+    def test_cat_3d_seq_dim_unaligned(self, request, execution_mode, dtype, consumer):
         """[1,33,256] + [1,33,256] → cat(dim=1) → [1,66,256]. Seq dim unaligned; inner 256 unchanged. Both consumers."""
-        pytest.xfail(
-            "known failure (sum_last: numerical mismatch vs CPU beyond tolerance); "
-            "tracked in https://github.com/torch-spyre/torch-spyre/issues/5300"
-        )
+        if consumer == "sum_last" and dtype in (torch.float16, torch.bfloat16):
+            strict_xfail(
+                request,
+                AssertionError,
+                "AssertionError: Tensor-likes are not close (spyre <-> cpu mismatch beyond tolerance), #5300",
+            )
         a = cached_randn(
             (1, 33, 256), dtype=dtype, differentiation=f"cat_3d_seq_unaligned_a_{dtype}"
         )
@@ -2110,17 +2253,21 @@ class TestCatUnaligned:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_cat_4d_unaligned_inner_halves(self, execution_mode, dtype, consumer):
+    def test_cat_4d_unaligned_inner_halves(
+        self, request, execution_mode, dtype, consumer
+    ):
         """[1,16,32,33] × 2 → cat(dim=-1) → [1,16,32,66]. Unaligned inputs → unaligned output. Both consumers."""
         if dtype == torch.float32:
-            pytest.xfail(
-                "known failure for float32 (no mechanism to resolve stick incompatibility); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5216"
+            strict_xfail(
+                request,
+                InductorError,
+                "NotImplementedError: no mechanism to resolve stick incompatibility, #5216",
             )
         if consumer == "sum_last" and dtype in (torch.float16, torch.bfloat16):
-            pytest.xfail(
-                "known failure for sum_last/float16/bfloat16 (spyre <-> cpu mismatch); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5216"
+            strict_xfail(
+                request,
+                AssertionError,
+                "AssertionError: Tensor-likes are not close (spyre <-> cpu mismatch beyond tolerance), #5300",
             )
         a = cached_randn(
             (1, 16, 32, 33),
@@ -2140,12 +2287,13 @@ class TestCatUnaligned:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_cat_5d_seq_unaligned(self, execution_mode, dtype, consumer):
+    def test_cat_5d_seq_unaligned(self, request, execution_mode, dtype, consumer):
         """[1,8,1,33,256] × 2 → cat(dim=3) → [1,8,1,66,256]. Seq dim unaligned; inner 256 unchanged. Both consumers."""
         if consumer == "sum_last" and dtype in (torch.float16, torch.bfloat16):
-            pytest.xfail(
-                "known failure for sum_last/float16 and bfloat16 (numerical mismatch vs CPU beyond tolerance); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5300"
+            strict_xfail(
+                request,
+                AssertionError,
+                "AssertionError: Tensor-likes are not close (spyre <-> cpu mismatch beyond tolerance), #5300",
             )
         a = cached_randn(
             (1, 8, 1, 33, 256),
@@ -2165,17 +2313,19 @@ class TestCatUnaligned:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_cat_6d_inner_unaligned(self, execution_mode, dtype, consumer):
+    def test_cat_6d_inner_unaligned(self, request, execution_mode, dtype, consumer):
         """[1,2,4,8,16,13] × 2 → cat(dim=-1) → [1,2,4,8,16,26]. 6D; inner 26 < 64. Both consumers."""
         if dtype == torch.float32:
-            pytest.xfail(
-                "known failure for float32 (no mechanism to resolve stick incompatibility); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5216"
+            strict_xfail(
+                request,
+                InductorError,
+                "NotImplementedError: no mechanism to resolve stick incompatibility, #5216",
             )
         if consumer == "sum_last" and dtype in (torch.float16, torch.bfloat16):
-            pytest.xfail(
-                "known failure for sum_last/float16/bfloat16 (spyre <-> cpu mismatch); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5216"
+            strict_xfail(
+                request,
+                AssertionError,
+                "AssertionError: Tensor-likes are not close (spyre <-> cpu mismatch beyond tolerance), #5300",
             )
         a = cached_randn(
             (1, 2, 4, 8, 16, 13),
@@ -2207,16 +2357,17 @@ class TestCatSize1:
     """Size-1 dimension interactions."""
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_cat_3d_size1_seq_expand(self, execution_mode, dtype, consumer):
+    def test_cat_3d_size1_seq_expand(self, request, execution_mode, dtype, consumer):
         """[1,1,256] + [1,32,256] → cat(dim=1) → [1,33,256]. Size-1 seq prepended. Both consumers."""
         if (
             execution_mode == "eager"
             and consumer == "sum_last"
             and dtype in (torch.float16, torch.bfloat16)
         ):
-            pytest.xfail(
-                "known failure for sum_last/float16 and bfloat16/eager (numerical mismatch vs CPU beyond tolerance); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/6253"
+            strict_xfail(
+                request,
+                AssertionError,
+                "AssertionError: Tensor-likes are not close (spyre <-> cpu mismatch beyond tolerance), #6253",
             )
         a = cached_randn(
             (1, 1, 256), dtype=dtype, differentiation=f"cat_3d_size1_seq_a_{dtype}"
@@ -2232,17 +2383,21 @@ class TestCatSize1:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_cat_4d_size1_trailing_halves(self, execution_mode, dtype, consumer):
+    def test_cat_4d_size1_trailing_halves(
+        self, request, execution_mode, dtype, consumer
+    ):
         """[32,8,16,1] × 2 → cat(dim=-1) → [32,8,16,2]. Two size-1 halves → size-2 inner. Both consumers."""
         if dtype == torch.float16:
-            pytest.xfail(
-                "known failure for 16 elements/stick dtype (float16); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5196"
+            strict_xfail(
+                request,
+                InductorError,
+                "Unsupported: Unexpected stick expression 1, #5196",
             )
         if dtype in (torch.bfloat16, torch.float32):
-            pytest.xfail(
-                "known failure for 32 elements/stick dtypes (bfloat16, float32); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5196"
+            strict_xfail(
+                request,
+                InductorError,
+                "Unsupported: Unexpected stick expression 1, #5196",
             )
         a = cached_randn(
             (32, 8, 16, 1),
@@ -2262,12 +2417,13 @@ class TestCatSize1:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_cat_5d_gqa_kv_cache(self, execution_mode, dtype, consumer):
+    def test_cat_5d_gqa_kv_cache(self, request, execution_mode, dtype, consumer):
         """[1,8,1,32,256] × 2 → cat(dim=2) → [1,8,2,32,256]. GQA-like cache; inner 256 unchanged. Both consumers."""
         if consumer == "sum_last" and dtype in (torch.float16, torch.bfloat16):
-            pytest.xfail(
-                "known failure for sum_last/float16 and bfloat16 (numerical mismatch vs CPU beyond tolerance); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/6253"
+            strict_xfail(
+                request,
+                AssertionError,
+                "AssertionError: Tensor-likes are not close (spyre <-> cpu mismatch beyond tolerance), #6253",
             )
         a = cached_randn(
             (1, 8, 1, 32, 256), dtype=dtype, differentiation=f"cat_5d_gqa_kv_a_{dtype}"
@@ -2366,12 +2522,15 @@ class TestSelectUnaligned:
     """Unaligned innermost dimension."""
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_select_2d_leading_unaligned(self, execution_mode, dtype, consumer):
+    def test_select_2d_leading_unaligned(
+        self, request, execution_mode, dtype, consumer
+    ):
         """[8,70] → select(0,0) → [70]. Inner 70 unchanged; 70%64=6. Both consumers."""
         if consumer == "sum_last" and dtype == torch.float32:
-            pytest.xfail(
-                "known failure for sum_last/float32 (SubprocException); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5224"
+            strict_xfail(
+                request,
+                InductorError,
+                "SubprocException: dbo-opt DtException: Coordinate masking is supported only up to 16bit element types, #5224",
             )
         x = cached_randn(
             (8, 70), dtype=dtype, differentiation=f"select_2d_leading_unaligned_{dtype}"
@@ -2382,13 +2541,14 @@ class TestSelectUnaligned:
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
     def test_select_3d_trailing_unaligned_new_inner(
-        self, execution_mode, dtype, consumer
+        self, request, execution_mode, dtype, consumer
     ):
         """[4,256,33] → select(1,0) → [4,33]. Inner 33 unchanged from dim-2; 33 < 64. Both consumers."""
         if consumer == "sum_last" and dtype == torch.float32:
-            pytest.xfail(
-                "known failure for sum_last/float32 (SubprocException); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5224"
+            strict_xfail(
+                request,
+                InductorError,
+                "SubprocException: dbo-opt DtException: Coordinate masking is supported only up to 16bit element types, #5224",
             )
         x = cached_randn(
             (4, 256, 33),
@@ -2400,17 +2560,19 @@ class TestSelectUnaligned:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_select_4d_unaligned_inner(self, execution_mode, dtype, consumer):
+    def test_select_4d_unaligned_inner(self, request, execution_mode, dtype, consumer):
         """[1,16,32,65] → select(1,0) → [1,32,65]. Inner 65 unchanged; 65%64=1. Both consumers."""
         if consumer == "sum_last" and dtype == torch.float16:
-            pytest.xfail(
-                "known failure for sum_last/float16 (numerical mismatch vs CPU beyond tolerance); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5322"
+            strict_xfail(
+                request,
+                AssertionError,
+                "AssertionError: Tensor-likes are not close (spyre <-> cpu mismatch beyond tolerance), #5322",
             )
         if consumer == "sum_last" and dtype == torch.float32:
-            pytest.xfail(
-                "known failure for sum_last/float32 (SubprocException); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5224"
+            strict_xfail(
+                request,
+                InductorError,
+                "SubprocException: dbo-opt DtException: Coordinate masking is supported only up to 16bit element types, #5224",
             )
         x = cached_randn(
             (1, 16, 32, 65),
@@ -2454,12 +2616,13 @@ class TestSelectSize1:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_select_5d_size1_dim(self, execution_mode, dtype, consumer):
+    def test_select_5d_size1_dim(self, request, execution_mode, dtype, consumer):
         """[1,8,1,32,256] → select(2,0) → [1,8,32,256]. Select the size-1 dim; inner 256 unchanged. Both consumers."""
         if consumer == "sum_last" and dtype in (torch.float16, torch.bfloat16):
-            pytest.xfail(
-                "known failure for sum_last/float16 and bfloat16 (numerical mismatch vs CPU beyond tolerance); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5322"
+            strict_xfail(
+                request,
+                AssertionError,
+                "AssertionError: Tensor-likes are not close (spyre <-> cpu mismatch beyond tolerance), #5322",
             )
         x = cached_randn(
             (1, 8, 1, 32, 256),
@@ -2530,12 +2693,13 @@ class TestNarrowUnaligned:
     """1D–6D inputs with unaligned output innermost dimension."""
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_narrow_1d_unaligned_result(self, execution_mode, dtype, consumer):
+    def test_narrow_1d_unaligned_result(self, request, execution_mode, dtype, consumer):
         """[256]→narrow(0,0,65)→[65]. Output inner 65; 65%64=1. Both consumers."""
         if consumer == "sum_last" and dtype == torch.float32:
-            pytest.xfail(
-                "known failure for sum_last/float32 (SubprocException); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5224"
+            strict_xfail(
+                request,
+                InductorError,
+                "SubprocException: dbo-opt DtException: Coordinate masking is supported only up to 16bit element types, #5224",
             )
         x = cached_randn(
             (256,), dtype=dtype, differentiation=f"narrow_1d_unaligned_{dtype}"
@@ -2545,12 +2709,15 @@ class TestNarrowUnaligned:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_narrow_2d_trailing_unaligned(self, execution_mode, dtype, consumer):
+    def test_narrow_2d_trailing_unaligned(
+        self, request, execution_mode, dtype, consumer
+    ):
         """[8,128]→narrow(1,0,33)→[8,33]. Inner changes 128→33; 33 < 64. Both consumers."""
         if consumer == "sum_last" and dtype == torch.float32:
-            pytest.xfail(
-                "known failure for sum_last/float32 (SubprocException); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5224"
+            strict_xfail(
+                request,
+                InductorError,
+                "SubprocException: dbo-opt DtException: Coordinate masking is supported only up to 16bit element types, #5224",
             )
         x = cached_randn(
             (8, 128),
@@ -2562,17 +2729,19 @@ class TestNarrowUnaligned:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_narrow_3d_inner_unaligned(self, execution_mode, dtype, consumer):
+    def test_narrow_3d_inner_unaligned(self, request, execution_mode, dtype, consumer):
         """[1,32,128]→narrow(2,0,70)→[1,32,70]. Inner changes 128→70; 70%64=6. Both consumers."""
         if consumer == "sum_last" and dtype == torch.float16:
-            pytest.xfail(
-                "known failure for sum_last/float16 (numerical mismatch vs CPU beyond tolerance); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5377"
+            strict_xfail(
+                request,
+                AssertionError,
+                "AssertionError: Tensor-likes are not close (spyre <-> cpu mismatch beyond tolerance), #5377",
             )
         if consumer == "sum_last" and dtype == torch.float32:
-            pytest.xfail(
-                "known failure for sum_last/float32 (SubprocException); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5224"
+            strict_xfail(
+                request,
+                InductorError,
+                "SubprocException: dbo-opt DtException: Coordinate masking is supported only up to 16bit element types, #5224",
             )
         x = cached_randn(
             (1, 32, 128),
@@ -2584,17 +2753,27 @@ class TestNarrowUnaligned:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_narrow_4d_head_dim_unaligned(self, execution_mode, dtype, consumer):
+    def test_narrow_4d_head_dim_unaligned(
+        self, request, execution_mode, dtype, consumer
+    ):
         """[1,16,32,256]→narrow(3,0,65)→[1,16,32,65]. Inner changes 256→65. Both consumers."""
-        if consumer == "sum_last" and dtype in (torch.float16, torch.bfloat16):
-            pytest.xfail(
-                "known failure for sum_last/float16 and bfloat16 (numerical mismatch vs CPU beyond tolerance); float16: #5299, bfloat16: #5377; "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5299, https://github.com/torch-spyre/torch-spyre/issues/5377"
+        if consumer == "sum_last" and dtype == torch.float16:
+            strict_xfail(
+                request,
+                AssertionError,
+                "AssertionError: Tensor-likes are not close (spyre <-> cpu mismatch beyond tolerance), #5299",
+            )
+        if consumer == "sum_last" and dtype == torch.bfloat16:
+            strict_xfail(
+                request,
+                AssertionError,
+                "AssertionError: Tensor-likes are not close (spyre <-> cpu mismatch beyond tolerance), #5377",
             )
         if consumer == "sum_last" and dtype == torch.float32:
-            pytest.xfail(
-                "known failure for sum_last/float32 (SubprocException); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5224"
+            strict_xfail(
+                request,
+                InductorError,
+                "SubprocException: dbo-opt DtException: Coordinate masking is supported only up to 16bit element types, #5224",
             )
         x = cached_randn(
             (1, 16, 32, 256),
@@ -2606,12 +2785,15 @@ class TestNarrowUnaligned:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_narrow_5d_inner_below_stick(self, execution_mode, dtype, consumer):
+    def test_narrow_5d_inner_below_stick(
+        self, request, execution_mode, dtype, consumer
+    ):
         """[1,2,4,8,128]→narrow(4,0,13)→[1,2,4,8,13]. Inner changes 128→13 < 64. Both consumers."""
         if consumer == "sum_last" and dtype == torch.float32:
-            pytest.xfail(
-                "known failure for sum_last/float32 (SubprocException); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5224"
+            strict_xfail(
+                request,
+                InductorError,
+                "SubprocException: dbo-opt DtException: Coordinate masking is supported only up to 16bit element types, #5224",
             )
         x = cached_randn(
             (1, 2, 4, 8, 128),
@@ -2623,12 +2805,13 @@ class TestNarrowUnaligned:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_narrow_6d_inner_unaligned(self, execution_mode, dtype, consumer):
+    def test_narrow_6d_inner_unaligned(self, request, execution_mode, dtype, consumer):
         """[1,2,4,8,16,128]→narrow(5,0,33)→[1,2,4,8,16,33]. 6D; inner changes 128→33 < 64. Both consumers."""
         if consumer == "sum_last" and dtype == torch.float32:
-            pytest.xfail(
-                "known failure for sum_last/float32 (SubprocException); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5224"
+            strict_xfail(
+                request,
+                InductorError,
+                "SubprocException: dbo-opt DtException: Coordinate masking is supported only up to 16bit element types, #5224",
             )
         x = cached_randn(
             (1, 2, 4, 8, 16, 128),
@@ -2799,33 +2982,40 @@ class TestSplitUnaligned:
     """2D–5D inputs with unaligned output innermost dimension."""
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_split_2d_unaligned_result_trailing(self, execution_mode, dtype, consumer):
+    def test_split_2d_unaligned_result_trailing(
+        self, request, execution_mode, dtype, consumer
+    ):
         """[8,130]→split(65,dim=-1)→[8,65] × 2. Inner changes 130→65; 65%64=1. Both consumers."""
         if execution_mode == "eager" and (
             consumer == "pointwise"
             or (consumer == "sum_last" and dtype in (torch.float16, torch.bfloat16))
         ):
-            pytest.xfail(
-                "known issue tracked in https://github.com/torch-spyre/torch-spyre/issues/5383"
+            strict_xfail(
+                request,
+                (InductorError, LoweringException),
+                "Unsupported: copy_from_d2d of a sliced view requires a stick-aligned storage_offset, #5383",
             )
         if (
             execution_mode == "eager"
             and consumer == "sum_last"
             and dtype == torch.float32
         ):
-            pytest.xfail(
-                "known failure for sum_last/float32/eager; "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5224"
+            strict_xfail(
+                request,
+                InductorError,
+                "SubprocException: dbo-opt DtException: Coordinate masking is supported only up to 16bit element types, #5224",
             )
         if execution_mode == "compiled" and consumer == "sum_last":
-            pytest.xfail(
-                "known failure for compiled/sum_last; "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/3916"
+            strict_xfail(
+                request,
+                InductorError,
+                "Unsupported: no offset-free alternative stick dim for mutation target, #3916",
             )
         if execution_mode == "compiled" and consumer == "pointwise":
-            pytest.xfail(
-                "known failure (no mechanism to resolve stick incompatibility); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5216"
+            strict_xfail(
+                request,
+                InductorError,
+                "NotImplementedError: no mechanism to resolve stick incompatibility, #5216",
             )
         x = cached_randn(
             (8, 130),
@@ -2841,28 +3031,34 @@ class TestSplitUnaligned:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_split_3d_unaligned_trailing(self, execution_mode, dtype, consumer):
+    def test_split_3d_unaligned_trailing(
+        self, request, execution_mode, dtype, consumer
+    ):
         """[4,32,140]→split(70,dim=-1)→[4,32,70] × 2. Inner 70; 70%64=6. Both consumers."""
         if execution_mode == "eager" and (
             consumer == "pointwise"
             or (consumer == "sum_last" and dtype in (torch.float16, torch.bfloat16))
         ):
-            pytest.xfail(
-                "known issue tracked in https://github.com/torch-spyre/torch-spyre/issues/5383"
+            strict_xfail(
+                request,
+                (InductorError, LoweringException),
+                "Unsupported: copy_from_d2d of a sliced view requires a stick-aligned storage_offset, #5383",
             )
         if (
             execution_mode == "eager"
             and consumer == "sum_last"
             and dtype == torch.float32
         ):
-            pytest.xfail(
-                "known failure for sum_last/float32/eager; "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5224"
+            strict_xfail(
+                request,
+                InductorError,
+                "SubprocException: dbo-opt DtException: Coordinate masking is supported only up to 16bit element types, #5224",
             )
         if execution_mode == "compiled":
-            pytest.xfail(
-                "known failure (no mechanism to resolve stick incompatibility); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5216"
+            strict_xfail(
+                request,
+                InductorError,
+                "NotImplementedError: no mechanism to resolve stick incompatibility, #5216",
             )
         x = cached_randn(
             (4, 32, 140),
@@ -2878,28 +3074,32 @@ class TestSplitUnaligned:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_split_4d_unaligned_inner(self, execution_mode, dtype, consumer):
+    def test_split_4d_unaligned_inner(self, request, execution_mode, dtype, consumer):
         """[1,16,32,130]→split(65,dim=-1)→[1,16,32,65] × 2. Inner 65 unaligned. Both consumers."""
         if execution_mode == "eager" and (
             consumer == "pointwise"
             or (consumer == "sum_last" and dtype in (torch.float16, torch.bfloat16))
         ):
-            pytest.xfail(
-                "known issue tracked in https://github.com/torch-spyre/torch-spyre/issues/5383"
+            strict_xfail(
+                request,
+                (InductorError, LoweringException),
+                "Unsupported: copy_from_d2d of a sliced view requires a stick-aligned storage_offset, #5383",
             )
         if (
             execution_mode == "eager"
             and consumer == "sum_last"
             and dtype == torch.float32
         ):
-            pytest.xfail(
-                "known failure for sum_last/float32/eager; "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5224"
+            strict_xfail(
+                request,
+                InductorError,
+                "SubprocException: dbo-opt DtException: Coordinate masking is supported only up to 16bit element types, #5224",
             )
         if execution_mode == "compiled":
-            pytest.xfail(
-                "known failure (no mechanism to resolve stick incompatibility); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5216"
+            strict_xfail(
+                request,
+                InductorError,
+                "NotImplementedError: no mechanism to resolve stick incompatibility, #5216",
             )
         x = cached_randn(
             (1, 16, 32, 130),
@@ -2915,17 +3115,21 @@ class TestSplitUnaligned:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_split_5d_unaligned_non_trailing(self, execution_mode, dtype, consumer):
+    def test_split_5d_unaligned_non_trailing(
+        self, request, execution_mode, dtype, consumer
+    ):
         """[1,2,4,8,256]→split(2,dim=2)→[1,2,2,8,256] × 2. Non-trailing split; inner 256 unchanged. Both consumers."""
         if consumer == "sum_last" and dtype in (torch.float16, torch.bfloat16):
-            pytest.xfail(
-                "known failure for sum_last/float16 and bfloat16 (numerical mismatch vs CPU beyond tolerance); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5378"
+            strict_xfail(
+                request,
+                AssertionError,
+                "AssertionError: Tensor-likes are not close (spyre <-> cpu mismatch beyond tolerance), #5378",
             )
         if consumer == "sum_last" and dtype == torch.float32:
-            pytest.xfail(
-                "known failure (no mechanism to resolve stick incompatibility); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5216"
+            strict_xfail(
+                request,
+                InductorError,
+                "NotImplementedError: no mechanism to resolve stick incompatibility, #5216",
             )
         x = cached_randn(
             (1, 2, 4, 8, 256),
@@ -2953,16 +3157,21 @@ class TestSplitSize1:
     """Size-1 dimension interactions."""
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_split_3d_trailing_size1_result(self, execution_mode, dtype, consumer):
+    def test_split_3d_trailing_size1_result(
+        self, request, execution_mode, dtype, consumer
+    ):
         """[4,32,2]→split(1,dim=-1)→[4,32,1] × 2. Inner changes 2→1. Both consumers."""
         if execution_mode == "eager":
-            pytest.xfail(
-                "known issue tracked in https://github.com/torch-spyre/torch-spyre/issues/5383"
+            strict_xfail(
+                request,
+                (InductorError, LoweringException),
+                "Unsupported: copy_from_d2d of a sliced view requires a stick-aligned storage_offset, #5383",
             )
         if execution_mode == "compiled":
-            pytest.xfail(
-                "known failure (no supported output layout); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5214"
+            strict_xfail(
+                request,
+                InductorError,
+                "Unsupported: no supported output layout found for any candidate input layout, #5214",
             )
         x = cached_randn(
             (4, 32, 2), dtype=dtype, differentiation=f"split_3d_trailing_size1_{dtype}"
@@ -2976,12 +3185,13 @@ class TestSplitSize1:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_split_4d_size1_dim(self, execution_mode, dtype, consumer):
+    def test_split_4d_size1_dim(self, request, execution_mode, dtype, consumer):
         """[1,8,32,256]→split(1,dim=0)→([1,8,32,256],). Single chunk. Both consumers."""
         if consumer == "sum_last" and dtype in (torch.float16, torch.bfloat16):
-            pytest.xfail(
-                "known failure for sum_last/float16 and bfloat16 (numerical mismatch vs CPU beyond tolerance); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5378"
+            strict_xfail(
+                request,
+                AssertionError,
+                "AssertionError: Tensor-likes are not close (spyre <-> cpu mismatch beyond tolerance), #5378",
             )
         x = cached_randn(
             (1, 8, 32, 256), dtype=dtype, differentiation=f"split_4d_size1_dim_{dtype}"
@@ -2993,17 +3203,19 @@ class TestSplitSize1:
         )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
-    def test_split_5d_size1_head_chunks(self, execution_mode, dtype, consumer):
+    def test_split_5d_size1_head_chunks(self, request, execution_mode, dtype, consumer):
         """[1,8,1,32,256]→split(4,dim=1)→[1,4,1,32,256] × 2. GQA-like chunks; inner 256 unchanged. Both consumers."""
         if consumer == "sum_last" and dtype in (torch.float16, torch.bfloat16):
-            pytest.xfail(
-                "known failure for sum_last/float16 and bfloat16 (numerical mismatch vs CPU beyond tolerance); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5378"
+            strict_xfail(
+                request,
+                AssertionError,
+                "AssertionError: Tensor-likes are not close (spyre <-> cpu mismatch beyond tolerance), #5378",
             )
         if consumer == "sum_last" and dtype == torch.float32:
-            pytest.xfail(
-                "known failure (no mechanism to resolve stick incompatibility); "
-                "tracked in https://github.com/torch-spyre/torch-spyre/issues/5216"
+            strict_xfail(
+                request,
+                InductorError,
+                "NotImplementedError: no mechanism to resolve stick incompatibility, #5216",
             )
         x = cached_randn(
             (1, 8, 1, 32, 256),
