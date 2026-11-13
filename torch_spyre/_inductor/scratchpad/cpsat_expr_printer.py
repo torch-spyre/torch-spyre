@@ -396,7 +396,8 @@ class _SympyExprToCpSat(Printer):
         )
         cost_expr = sympy.expand(cost_expr)
         cost_expr = cost_expr.replace(
-            lambda e: e.func in [sympy.log, sympy.Piecewise] or self._is_pushed_power(e),
+            lambda e: e.func in [sympy.log, sympy.Piecewise]
+            or self._is_pushed_power(e),
             lambda e: self._piecewise_canonical(self._log_min(self._push_power(e))),
         )
         cost_expr = sympy.expand(cost_expr)
@@ -730,15 +731,10 @@ class _SympyExprToCpSat(Printer):
         # per call, with the rest folded back in as a plain multiplier.
         if len(expr.args) < 2 or not isinstance(expr.args[0], sympy.Number):
             return expr
-        branching = [
-            arg
+        if any(
+            isinstance(arg, (sympy.Min, sympy.Max, sympy.Piecewise))
             for arg in expr.args[1:]
-            if isinstance(arg, (sympy.Min, sympy.Max, sympy.Piecewise))
-        ]
-        # A product of two such factors stays a product of two small variables;
-        # the number pushed into one of them would scale that product past
-        # _MAX_PRODUCT_BOUND.
-        if len(branching) == 1:
+        ):
             idx, arg = next(
                 (
                     (idx, a)

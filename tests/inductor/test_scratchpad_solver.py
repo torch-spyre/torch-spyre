@@ -2226,7 +2226,9 @@ class TestSympyExprToCpSatPrinter(TestCase):
             want = 1 / min(1.0, min(1.08, 17.28 / (s * t) ** 0.5) if t > 1 else 1.0)
             value = got.subs({split: s, tile: t}).replace(
                 lambda e: isinstance(e, (sympy.Min, sympy.Max)),
-                lambda e: (sympy.Min if isinstance(e, sympy.Min) else sympy.Max)(*e.args),
+                lambda e: (sympy.Min if isinstance(e, sympy.Min) else sympy.Max)(
+                    *e.args
+                ),
             )
             self.assertAlmostEqual(float(value), want)
 
