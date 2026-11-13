@@ -162,6 +162,158 @@ auto get_tile_map(c10::IntArrayRef sizes, c10::IntArrayRef strides,
   return tile_map;
 }
 
+auto is_ea_staggered(const ElementArrangement ea) -> bool {
+  return ea == ElementArrangement::DL16_TO_FP32 ||
+         ea == ElementArrangement::FP32_TO_DL16;
+}
+
+/**
+ * DL16_TO_FP32: host col = pair*64 + group*8 + stick_in_pair*4 + elem.
+ *
+ * Fills the logical split of the stick dim coordinate (sub_elems, innermost
+ * first) and the stride of each piece in the device column space (sub_stride).
+ */
+void ea_shuffle_fp16tofp32(int64_t elems_per_stick, int64_t sticks,
+                           int64_t elems_per_group, int64_t sticks_per_pair,
+                           std::vector<int64_t>& sub_elems,
+                           std::vector<int64_t>& sub_stride) {
+  sub_elems = {elems_per_group, sticks_per_pair,
+               elems_per_stick / elems_per_group, sticks / sticks_per_pair};
+  sub_stride = {1, elems_per_stick, elems_per_group,
+                sticks_per_pair * elems_per_stick};
+}
+
+/**
+ * FP32_TO_DL16: host col = stick*64 + half*32 + group*4 + elem.
+ *
+ * Same outputs as ea_shuffle_fp16tofp32.
+ */
+void ea_shuffle_fp32tofp16(int64_t elems_per_stick, int64_t sticks,
+                           int64_t elems_per_group, int64_t halves_per_stick,
+                           std::vector<int64_t>& sub_elems,
+                           std::vector<int64_t>& sub_stride) {
+  const int64_t groups_per_half =
+      elems_per_stick / elems_per_group / halves_per_stick;
+  sub_elems = {elems_per_group, groups_per_half, halves_per_stick, sticks};
+  sub_stride = {1, halves_per_stick * elems_per_group, elems_per_group,
+                elems_per_stick};
+}
+
+/**
+ * Inverts a shuffle given as (sub_elems, sub_stride). The strides must be the
+ * place values of some ordering of the pieces (true for both staggers).
+ * Sorting the pieces by stride gives the radix order of the staggered
+ * coordinate, and the old place values become the new strides.
+ */
+void ea_invert_shuffle(std::vector<int64_t>& sub_elems,
+                       std::vector<int64_t>& sub_stride) {
+  const size_t n = sub_elems.size();
+  std::vector<int64_t> place(n, 1);
+  for (size_t m = 1; m < n; m++) place[m] = place[m - 1] * sub_elems[m - 1];
+
+  std::vector<size_t> order(n);
+  std::iota(order.begin(), order.end(), 0);
+  std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+    return sub_stride[a] < sub_stride[b];
+  });
+
+  std::vector<int64_t> inv_elems(n), inv_stride(n);
+  for (size_t k = 0; k < n; k++) {
+    inv_elems[k] = sub_elems[order[k]];
+    inv_stride[k] = place[order[k]];
+  }
+  sub_elems = std::move(inv_elems);
+  sub_stride = std::move(inv_stride);
+}
+
+/**
+ * Fills `dim` (the stick dim) with the permutation between the STANDARD
+ * element arrangement and the staggered one of `stl`, for Dimwise_ea
+ * (DataConvertOpFuncs::GENERAL_SHUFFLE). Let c be the standard (host order)
+ * coordinate and p(c) = sum(digit_m(c) * subStride_[m]), digits taken in mixed
+ * radix over subElems_ (innermost first). p(c) is the staggered coordinate.
+ *
+ *   - D2H (restore): the entry goes to input_dimwise_ea_ and the engine
+ *     computes out[layout(c)] = in[layout(p(c))].
+ *   - H2D (apply): the entry goes to output_dimwise_ea_ and the engine
+ *     computes out[layout(p(c))] = in[layout(c)].
+ *
+ * The entry itself does not depend on the direction. The DCSIs are not
+ * touched.
+ *
+ * The permutation covers the allocated (padded) extent of the stick dim, so a
+ * partial last stick or pair needs no special case.
+ *
+ * @param stl SpyreTensorLayout describing the element arrangement.
+ * @param device_elem_stride Device stride of one element inside a stick.
+ * @param device_stick_stride Device stride between two sticks.
+ * @param allocated_sticks Number of sticks allocated along the stick dim.
+ * @param dim Entry of the stick dim, filled by this function.
+ */
+void ea_shuffle(const SpyreTensorLayout& stl, int64_t device_elem_stride,
+                int64_t device_stick_stride, int64_t allocated_sticks,
+                perdim_element_arrangement& dim, bool invert) {
+  constexpr int64_t kElemsPerGroup = 4;
+  constexpr int64_t kSticksPerPair = 2;
+  constexpr int64_t kHalvesPerStick = 2;
+
+  const ElementArrangement ea = stl.element_arrangement;
+  TORCH_CHECK(is_ea_staggered(ea),
+              "Element arrangement expected DL16_TO_FP32 or FP32_TO_DL16, "
+              "got: ",
+              elementArrangementToString(ea));
+
+  const int64_t elems_per_stick = stl.elems_per_stick();
+  TORCH_CHECK(elems_per_stick > 0 &&
+                  elems_per_stick % (kSticksPerPair * kElemsPerGroup) == 0,
+              "Unsupported stick size ", elems_per_stick,
+              " for element arrangement ", elementArrangementToString(ea));
+  TORCH_CHECK(allocated_sticks > 0, "No sticks allocated for ",
+              elementArrangementToString(ea), " element arrangement");
+
+  dim.dimShape_ = allocated_sticks * elems_per_stick;
+  dim.cumElemsBefore_ = {1, elems_per_stick};
+  dim.cumOffset_ = {device_elem_stride, device_stick_stride};
+
+  if (ea == ElementArrangement::DL16_TO_FP32) {
+    TORCH_CHECK(allocated_sticks % kSticksPerPair == 0,
+                "DL16_TO_FP32 element arrangement requires whole stick pairs "
+                "along the stick dimension, but ",
+                allocated_sticks, " sticks are allocated");
+    ea_shuffle_fp16tofp32(elems_per_stick, allocated_sticks, kElemsPerGroup,
+                          kSticksPerPair, dim.subElems_, dim.subStride_);
+  } else {
+    ea_shuffle_fp32tofp16(elems_per_stick, allocated_sticks, kElemsPerGroup,
+                          kHalvesPerStick, dim.subElems_, dim.subStride_);
+  }
+
+  if (invert) {
+    ea_invert_shuffle(dim.subElems_, dim.subStride_);
+  }
+}
+
+/**
+ * Entry that leaves the coordinate of a host dim unchanged and lays it out over
+ * the device dims `tiles` (innermost first, as stored in the tile map).
+ * Device dims of size 1 are skipped.
+ */
+auto identity_dim_ea(const std::vector<int>& tiles,
+                     const std::vector<int64_t>& device_size,
+                     const std::vector<int64_t>& device_strides)
+    -> perdim_element_arrangement {
+  perdim_element_arrangement dim;
+  dim.dimShape_ = 1;
+  for (const int tile : tiles) {
+    if (device_size[tile] == 1) continue;
+    dim.cumElemsBefore_.push_back(dim.dimShape_);
+    dim.cumOffset_.push_back(device_strides[tile]);
+    dim.dimShape_ *= device_size[tile];
+  }
+  dim.subElems_ = {dim.dimShape_};
+  dim.subStride_ = {1};
+  return dim;
+}
+
 /*
  * Fills out size and strides for each dimension of the tensor.
  *
@@ -171,17 +323,48 @@ auto get_tile_map(c10::IntArrayRef sizes, c10::IntArrayRef strides,
  * @param device_offset: storage offset of the dev tensor
  * @param stl: SpyreTensorLayout of dev tensor
  * @param host2device: direction of data conversion
+ * @param dimwise_ea: EA shuffle: receives, one entry per host dim (outermost
+ *                    first), the permutation between STANDARD and the
+ *                    staggered element arrangement of stl. The caller puts it
+ *                    on the input side for D2H (restore) and on the output
+ *                    side for H2D (apply). Left empty unless the layout is
+ *                    staggered.
  * @return description of data conversion
  */
-auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
-                             int64_t cpu_offset, int64_t device_offset,
-                             SpyreTensorLayout stl, bool host2device)
+auto get_device_stride_infos(
+    c10::IntArrayRef sizes, c10::IntArrayRef strides, int64_t cpu_offset,
+    int64_t device_offset, SpyreTensorLayout stl, bool host2device,
+    std::vector<perdim_element_arrangement>& dimwise_ea)
     -> std::vector<DataConversionStrideInfo> {
   const std::vector<std::vector<int>> tile_map =
       get_tile_map(sizes, strides, stl.device_size, stl.stride_map);
 
   const int host_rank = strides.size();
   const int device_rank = stl.stride_map.size();
+
+  // EA shuffle: copies of staggered layouts (D2H restore, H2D apply) need the
+  // element arrangement shuffled.
+  const bool shuffle_ea = is_ea_staggered(stl.element_arrangement);
+
+  // EA shuffle: stick tiling facts. The innermost device dim holds the elements
+  // of a stick, the host dim tiled into it is the stick dim, and the other
+  // device dim that host dim is tiled into counts the sticks.
+  const int stick_elem_dim = device_rank - 1;
+  int stick_host_dim = -1;
+  int stick_count_dev_dim = -1;
+  bool stick_ambiguous = false;
+  for (int i = 0; shuffle_ea && i < host_rank; i++) {
+    const auto& tiles = tile_map[i];
+    if (std::find(tiles.begin(), tiles.end(), stick_elem_dim) == tiles.end()) {
+      continue;
+    }
+    stick_host_dim = i;
+    for (const int tile : tiles) {
+      if (tile == stick_elem_dim) continue;
+      stick_ambiguous |= stick_count_dev_dim >= 0;
+      stick_count_dev_dim = tile;
+    }
+  }
 
   // The host strides based on stride_map, used for remainder calculation.
   std::vector<int64_t> host_strides(device_rank, 1);
@@ -383,6 +566,36 @@ auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
       info.offset_dst_ += offset_dst;
       stride_infos.push_back(info);
     }
+  }
+
+  // EA shuffle: describe the permutation between STANDARD and the staggered
+  // arrangement. The DCSIs above stay as built for STANDARD arrangement.
+  dimwise_ea.clear();
+  if (shuffle_ea) {
+    // Guard EA shuffle against unsupported dtypes.
+    TORCH_CHECK(stl.device_dtype == DataFormats::IEEE_FP32 ||
+                    stl.device_dtype == DataFormats::IEEE_FP16 ||
+                    stl.device_dtype == DataFormats::IEEE_INT64 ||
+                    stl.device_dtype == DataFormats::IEEE_INT32 ||
+                    stl.device_dtype == DataFormats::SEN169_FP16,
+                "EA shuffle unsupported dtype, got: ", stl.device_dtype,
+                " (element arrangement: ",
+                elementArrangementToString(stl.element_arrangement), ")");
+
+    TORCH_CHECK(stick_host_dim >= 0 && !stick_ambiguous,
+                "Unable to determine the stick dimension for ",
+                elementArrangementToString(stl.element_arrangement));
+
+    for (int i = 0; i < host_rank; i++) {
+      dimwise_ea.push_back(
+          identity_dim_ea(tile_map[i], stl.device_size, device_strides));
+    }
+
+    const bool has_stick_count = stick_count_dev_dim >= 0;
+    ea_shuffle(stl, device_strides[stick_elem_dim],
+               has_stick_count ? device_strides[stick_count_dev_dim] : 0,
+               has_stick_count ? stl.device_size[stick_count_dev_dim] : 1,
+               dimwise_ea[stick_host_dim], host2device);
   }
 
   return stride_infos;
@@ -838,8 +1051,22 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
     dci.output_shape_ = host2device ? expanded_dev_shape : cpu_sizes;
     dci.input_shape_ = host2device ? cpu_sizes : device_sizes;
   } else {
-    dci.dcsi_ = get_device_stride_infos(cpu_sizes, cpu_strides, cpu_offset,
-                                        device_offset, stl, host2device);
+    // EA shuffle: dimwise_ea is filled only for copies of staggered layouts.
+    std::vector<perdim_element_arrangement> dimwise_ea;
+    dci.dcsi_ =
+        get_device_stride_infos(cpu_sizes, cpu_strides, cpu_offset,
+                                device_offset, stl, host2device, dimwise_ea);
+    if (!dimwise_ea.empty()) {
+      // The shapes of the DCI are innermost first, so the per-dim EA is too.
+      std::reverse(dimwise_ea.begin(), dimwise_ea.end());
+      // The device side carries the arrangement: the input of a D2H copy
+      // (restore STANDARD) or the output of a H2D copy (apply staggered).
+      if (host2device) {
+        dci.output_dimwise_ea_ = std::move(dimwise_ea);
+      } else {
+        dci.input_dimwise_ea_ = std::move(dimwise_ea);
+      }
+    }
 
     // Reverse PyTorch ordering
     std::reverse(cpu_sizes.begin(), cpu_sizes.end());
