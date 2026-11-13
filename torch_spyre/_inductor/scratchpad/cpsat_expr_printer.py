@@ -26,9 +26,11 @@ name -> ``(wrapper, candidate values)``). A wrapper supplies ``buffer``,
 from __future__ import annotations
 
 from collections import Counter
+import functools
 import logging
 import math
 import operator
+import sys
 from fractions import Fraction
 from functools import cache
 from typing import TYPE_CHECKING
@@ -164,6 +166,74 @@ def _lazy_minmax(expr: sympy.Expr) -> sympy.Expr:
     return expr.func(*args)
 
 
+def _reduce(op):
+    return lambda args: functools.reduce(op, args)
+
+
+def _piecewise(args):
+    """A Piecewise's values at every point: the first branch whose condition
+    holds. NaN where none does, so a table that reaches it is refused."""
+    result = np.nan
+    for value, cond in reversed(list(zip(args[::2], args[1::2]))):
+        result = np.where(cond, value, result)
+    return result
+
+
+# The evaluator behind the term tables: for each sympy node type, the numpy
+# function _values applies to the node's operands, each already evaluated at
+# every value of the term's decision. An n-ary node folds its function over
+# the operands; a Piecewise takes the first branch whose condition holds
+# (_piecewise). A term holding a type absent here is not tabulated.
+_TABLE_OPS = {
+    sympy.Add: _reduce(np.add),
+    sympy.Mul: _reduce(np.multiply),
+    sympy.Pow: lambda a: np.power(np.asarray(a[0], dtype=float), a[1]),
+    sympy.Min: _reduce(np.minimum),
+    sympy.Max: _reduce(np.maximum),
+    sympy.floor: lambda a: np.floor(a[0]),
+    sympy.ceiling: lambda a: np.ceil(a[0]),
+    sympy.log: lambda a: np.log(a[0]),
+    sympy.exp: lambda a: np.exp(a[0]),
+    sympy.Abs: lambda a: np.abs(a[0]),
+    sympy.Mod: lambda a: np.mod(a[0], a[1]),
+    sympy.And: _reduce(np.logical_and),
+    sympy.Or: _reduce(np.logical_or),
+    sympy.Not: lambda a: np.logical_not(a[0]),
+    sympy.ITE: lambda a: np.where(a[0], a[1], a[2]),
+    sympy.Piecewise: _piecewise,
+}
+
+
+def _table_op(expr):
+    """The function that evaluates ``expr`` over its operands' values, or None."""
+    if expr.is_Relational:
+        compare = _operator_map[expr.rel_op]
+        return lambda a: compare(a[0], a[1])
+    for cls in type(expr).__mro__:
+        if cls in _TABLE_OPS:
+            return _TABLE_OPS[cls]
+    return None
+
+
+def _table_operands(expr):
+    if expr.is_Piecewise:
+        return [part for pair in expr.args for part in pair]
+    return expr.args
+
+
+# A float holds every integer below this exactly; a larger "integer" entry is
+# a rounded float and stays one.
+_FLOAT_EXACT_INTEGER = 1 << sys.float_info.mant_dig
+
+
+def _number(value):
+    """A table entry as the constant the model takes: an int where it is one."""
+    value = float(value)
+    if value.is_integer() and abs(value) < _FLOAT_EXACT_INTEGER:
+        return int(value)
+    return value
+
+
 class memoize_method:
     """Descriptor that memoizes a method separately for each instance.
 
@@ -206,6 +276,8 @@ class _SympyExprToCpSat(Printer):
         self._conjunction_cache: dict = {}
         self._candidate_cache: dict = {}
         self._division_table_cache: dict = {}
+        self._term_values_cache: dict = {}
+        self._term_table_cache: dict = {}
         super().__init__()
 
     def _print(self, expr, **kwargs):
@@ -346,11 +418,130 @@ class _SympyExprToCpSat(Printer):
 
     def convert(self, cost_expr: sympy.Expr) -> "cp_model.LinearExpr":
         """Return the CP-SAT expression equivalent to ``cost_expr`` under
-        ``sym_map`` (``sympy symbol -> CP-SAT var``)."""
+        ``sym_map`` (``sympy symbol -> CP-SAT var``).
+
+        A term that reads a single enumerated decision is evaluated as written
+        at each of its values and handed to CP-SAT as one table
+        (:meth:`_term_table`). Only the remaining terms are rewritten and
+        printed."""
         logger.debug("[CP-SAT layout solver] cost expr (raw): %s", cost_expr)
-        cost_expr = self._rewrite(cost_expr)
+        tables, rest = [], []
+        for term in sympy.Add.make_args(cost_expr):
+            table = self._term_table(term)
+            if table is None:
+                rest.append(term)
+            else:
+                tables.append(table)
+        cost_expr = self._rewrite(sympy.Add(*rest))
         logger.debug("[CP-SAT layout solver] cost expr (linearized): %s", cost_expr)
-        return self._print(cost_expr)
+        return sum(tables, self._print(cost_expr))
+
+    def _decision(self, symbol):
+        """``(variable, values)``: the enumerated decision ``symbol`` reads and
+        its value at each point of it -- a column of its buffer's menu, a
+        division index, or a residency literal -- or ``(None, value)`` for a
+        constant. None for any other symbol."""
+        name = symbol.name
+        mapped = self._sym_map.get(name)
+        if isinstance(mapped, (int, float)):
+            return None, float(mapped)
+        wrapper, raw = self._buffer_map.get(name, (None, None))
+        if wrapper is None:
+            wrapper = self._sym_map.get(f"_division_of_{name}")
+            if wrapper is not None:
+                raw = range(len(wrapper.buffer.core_divisions))
+        if wrapper is not None:
+            return wrapper.division, np.asarray(raw, dtype=float)
+        if getattr(mapped, "is_boolean", False):
+            return mapped, np.arange(2, dtype=float)
+        return None
+
+    def _term_table(self, term):
+        """``term`` as one table when every symbol it reads is the same
+        enumerated decision and every node in it is one :data:`_TABLE_OPS`
+        evaluates: an ``element`` lookup of a division, or ``f(0) + (f(1) -
+        f(0)) * lit`` for a literal. None otherwise, or when an entry is not
+        finite."""
+        if not term.free_symbols or not self._evaluable(term):
+            return None
+        columns = {}
+        decision = None
+        for symbol in term.free_symbols:
+            found = self._decision(symbol)
+            if found is None:
+                return None
+            var, values = found
+            if var is not None:
+                if decision is not None and decision.index != var.index:
+                    return None
+                decision = var
+            columns[symbol] = values
+        if decision is None:
+            return None
+        size = (
+            2
+            if decision.is_boolean
+            else len(next(v for v in columns.values() if np.ndim(v)))
+        )
+        with np.errstate(all="ignore"):
+            values = np.broadcast_to(self._term_values(term, columns), (size,))
+        values = values.astype(float)
+        if not np.isfinite(values).all():
+            return None
+        if (values == values[0]).all():
+            return _number(values[0])
+        if decision.is_boolean:
+            return _number(values[0]) + _number(values[1] - values[0]) * decision
+        return self._term_lookup(decision, values)
+
+    @staticmethod
+    def _evaluable(expr):
+        """Whether :data:`_TABLE_OPS` evaluates every node of ``expr``."""
+        if expr.is_Atom:
+            return True
+        if _table_op(expr) is None:
+            return False
+        return all(_SympyExprToCpSat._evaluable(arg) for arg in _table_operands(expr))
+
+    def _term_values(self, expr, columns):
+        """``expr`` at every value of its term's decision."""
+        if expr.is_Symbol:
+            return columns[expr]
+        if expr.is_Number:
+            return float(expr)
+        if expr in (sympy.true, sympy.false):
+            return bool(expr)
+        if expr not in self._term_values_cache:
+            operands = [self._term_values(a, columns) for a in _table_operands(expr)]
+            self._term_values_cache[expr] = _table_op(expr)(operands)
+        return self._term_values_cache[expr]
+
+    def _term_lookup(self, division, values):
+        """One ``element`` lookup of ``division``, ``offset + coefficient *
+        level``: exact where the entries' common denominator keeps the levels
+        inside _MAX_PRODUCT_BOUND, else rounded against the entries' span. A
+        wider level, though it only enters the objective as a sum, leaves
+        CP-SAT's scaling of a float objective too coarse to tell plans apart."""
+        rationals = [Fraction(float(v)) for v in values]
+        base = min(rationals)
+        denominator = math.lcm(*(v.denominator for v in rationals))
+        differences = [int((v - base) * denominator) for v in rationals]
+        divisor = math.gcd(*differences)
+        table = tuple(v // divisor for v in differences)
+        offset, coefficient = _number(base), _number(Fraction(divisor, denominator))
+        if max(table) > _MAX_PRODUCT_BOUND:
+            step = (max(rationals) - base) / _MAX_PRODUCT_BOUND
+            table = tuple(round((v - base) / step) for v in rationals)
+            coefficient = float(step)
+        key = division.index, table
+        if key not in self._term_table_cache:
+            var = self._model.new_int_var_from_domain(
+                cp_model.Domain.FromValues(table), f"term_table_{self._count}"
+            )
+            self._count += 1
+            self._model.add_element(division, table, var)
+            self._term_table_cache[key] = var
+        return coefficient * self._term_table_cache[key] + offset
 
     def _rewrite(self, cost_expr: sympy.Expr) -> sympy.Expr:
         """The symbolic rewrites that bring ``cost_expr`` into the form the
