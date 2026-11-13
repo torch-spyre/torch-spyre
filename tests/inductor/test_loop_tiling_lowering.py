@@ -25,6 +25,7 @@ import os
 from unittest import mock
 
 import pytest
+import sympy
 import torch  # noqa: F401  (must precede torch_spyre._inductor imports)
 from torch._inductor.ir import ComputedBuffer
 
@@ -533,3 +534,88 @@ def test_a_for_each_tile_loop_beside_a_span_overflow_loop_matches_legacy():
 
     fn, args, limit = _mixed_graph()
     _assert_parity(fn, args, limit)
+
+
+def _stub_op(ranges):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        data=SimpleNamespace(ranges=[sympy.Integer(r) for r in ranges]),
+        get_operation_name=lambda: "op0",
+    )
+
+
+def _dep(index):
+    from torch._inductor.dependencies import MemoryDep
+
+    return MemoryDep("buf0", index, (), ())
+
+
+def test_the_step_is_the_per_trip_delta_of_an_affine_index():
+    from torch._inductor.utils import sympy_index_symbol
+
+    from torch_spyre._inductor.wsr.loop_tiling_lowering import TiledDim, _tile_step
+
+    d0, d1 = sympy_index_symbol("d0"), sympy_index_symbol("d1")
+    step = _tile_step(
+        _stub_op([64, 32]), TiledDim(0, False), _dep(32 * d0 + d1), sympy.Integer(8)
+    )
+    assert step == 256
+
+
+def test_an_index_that_is_only_partly_affine_is_stepped_by_its_delta_or_refused():
+    """``d0 + 7*floor(d0/8)`` has coefficient 1 at ``d0 = 0``, so ``coefficient x
+    extent`` would read the wrong address on every trip after the first. A tile of 8
+    moves it by 15 every trip, and that is the step; a tile of 5 moves it by 5 or 6
+    depending on the trip, so there is no step and the group is refused."""
+    from torch._inductor.utils import sympy_index_symbol
+
+    from torch_spyre._inductor.wsr.loop_tiling_lowering import TiledDim, _tile_step
+
+    d0 = sympy_index_symbol("d0")
+    dep = _dep(d0 + 7 * sympy.floor(d0 / 8))
+    tiled = TiledDim(0, False)
+    assert _tile_step(_stub_op([64, 32]), tiled, dep, sympy.Integer(8)) == 15
+    with pytest.raises(Unsupported, match="affine"):
+        _tile_step(_stub_op([60, 32]), tiled, dep, sympy.Integer(5))
+
+
+@expects_raise
+def test_a_member_the_loop_does_not_tile_may_not_read_a_tiled_members_tile():
+    """The tile is rewritten every trip and is smaller than the full range an untiled
+    member would iterate over it.
+
+    TODO: if such a member is ever lowered (it would have to be tiled too), this
+    becomes a positive test."""
+    import dataclasses
+
+    from torch_spyre._inductor.wsr import loop_tiling_lowering as lowering
+
+    fn, shapes, limit, *_ = CASES["pointwise_chain"]
+    args = [_shaped(shape, seed) for seed, shape in enumerate(shapes)]
+    original = lowering.build_loop_tiling_plan
+
+    def untile_the_consumer(operations, groups, group_idx_offset=0):
+        plan = original(operations, groups, group_idx_offset)
+        (group,) = plan.groups
+        ops = (group.ops[0], dataclasses.replace(group.ops[1], tiled=None))
+        return lowering.LoopTilingPlan((dataclasses.replace(group, ops=ops),))
+
+    with (
+        mock.patch.object(lowering, "build_loop_tiling_plan", untile_the_consumer),
+        config.patch({"loop_tiling_lowering": "plan"}),
+        pytest.raises(Exception, match="does not tile"),
+    ):
+        compile_span_overflow(fn, args, limit)
+
+
+def test_lx_offsets_compare_by_which_buffers_share_an_address():
+    from test_loop_tiling_parity import _comparable
+
+    two = "a allocation={'lx': 0} b allocation={'lx': 262144} c allocation={'lx': 0}"
+    swapped = (
+        "a allocation={'lx': 262144} b allocation={'lx': 0} c allocation={'lx': 262144}"
+    )
+    merged = "a allocation={'lx': 0} b allocation={'lx': 0} c allocation={'lx': 0}"
+    assert _comparable(two) == _comparable(swapped)
+    assert _comparable(two) != _comparable(merged)

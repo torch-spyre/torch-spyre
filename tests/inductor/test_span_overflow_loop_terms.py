@@ -491,7 +491,6 @@ def test_a_k_tiled_matmul_carries_the_loop_in_the_index():
         )
 
 
-@expects_raise
 @pytest.fixture
 def legacy_lowering():
     """These tests exercise the legacy transform's own internals (``add_loop_terms``,
@@ -500,6 +499,7 @@ def legacy_lowering():
         yield
 
 
+@expects_raise
 @pytest.mark.usefixtures("legacy_lowering")
 def test_a_later_pass_that_rebuilds_the_op_data_fails_loudly():
     """The term lives in wrappers on ``op.data``. A pass that rebuilt the data from

@@ -188,15 +188,23 @@ def _nodes(fn, args, limit, lowering):
 
 
 def _comparable(code):
-    """The normalised kernel text with the LX offsets masked.
+    """The normalised kernel text with each LX offset replaced by the order in which
+    it first appears.
 
     Where the allocator puts a buffer in LX is not stable when the SAME graph is
-    compiled twice with the legacy lowering: it depends on what was compiled before in
-    the process (a bias case flipped 0 and 262144 against itself, legacy against
-    legacy). Everything else is compared as it is."""
+    compiled twice with the legacy lowering (CP-SAT in the LX planner; a bias case
+    flipped 0 and 262144 against itself). What a lowering must keep is WHICH buffers
+    share an address, so the offsets are compared as that partition, not as numbers:
+    a carry whose back edge is lost, or a buffer wrongly placed beside another,
+    changes the partition."""
     from test_span_overflow_loop_terms import _normalised
 
-    return regex.sub(r"'lx': \d+", "'lx': N", _normalised(code))
+    labels: dict[str, str] = {}
+
+    def label(match):
+        return "'lx': #" + labels.setdefault(match.group(1), str(len(labels)))
+
+    return regex.sub(r"'lx': (\d+)", label, _normalised(code))
 
 
 def _assert_same_text(legacy_run, legacy_first, plan_run, plan_first):
@@ -234,8 +242,8 @@ def _assert_same_text(legacy_run, legacy_first, plan_run, plan_first):
 
 def _assert_parity(fn, args, limit):
     """The same graph under both lowerings: the same groups, the same added ops, the
-    same loop nodes, the same normalised kernel text (LX offsets included) and the
-    same numbers."""
+    same loop nodes, the same normalised kernel text (LX offsets compared as which buffers share an
+    address) and the same numbers."""
     legacy, legacy_nodes = _nodes(fn, args, limit, "legacy")
     plan, plan_nodes = _nodes(fn, args, limit, "plan")
     assert legacy_nodes, "no loop node was built"
