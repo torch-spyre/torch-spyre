@@ -2618,6 +2618,13 @@ class TestSympyExprToCpSatPrinter(TestCase):
         return solver.ObjectiveValue(), model
 
     @staticmethod
+    def _scale_of(name, values):
+        # A term over one buffer is tabulated before the rewrite, so the scale
+        # an ``inv_`` symbol takes in the rewritten terms is checked directly.
+        printer = _SympyExprToCpSat(cp_model.CpModel(), {}, {name: (None, values)})
+        return printer._inv_scale(name)
+
+    @staticmethod
     def _domain_of(model, name):
         (var,) = [v for v in model.proto.variables if v.name == name]
         return min(var.domain), max(var.domain)
@@ -2638,8 +2645,8 @@ class TestSympyExprToCpSatPrinter(TestCase):
             k_i, a_i, b_i = (menus[n][i] for n in ("split_k", "split_a", "split_b"))
             exact = 1000 * k_i / (a_i * b_i)
             self.assertAlmostEqual(got, exact, delta=1e-6 * exact)
-        self.assertEqual(self._domain_of(model, "inv_split_a"), (1, 8))
-        self.assertEqual(self._domain_of(model, "inv_split_b"), (1, 6))
+        self.assertEqual(self._scale_of("split_a", menus["split_a"]), 8)
+        self.assertEqual(self._scale_of("split_b", menus["split_b"]), 6)
 
     def test_inverse_scale_keeps_magnitude_through_full_product(self):
         # Three or more inverses covering every split of a buffer collapse into
@@ -2657,9 +2664,8 @@ class TestSympyExprToCpSatPrinter(TestCase):
             )
             cores = menus["split_a"][i] * menus["split_b"][i] * menus["split_c"][i]
             self.assertAlmostEqual(got, 1000 / cores, delta=1e-6 * 1000 / cores)
-        # Core counts [1, 6, 8, 6] -> LCM 24, values 24 // cores.
-        name = "inv__product_split_a_split_b_split_c"
-        self.assertEqual(self._domain_of(model, name), (3, 24))
+        # Core counts [1, 6, 8, 6] -> LCM 24.
+        self.assertEqual(self._scale_of("_product", [1, 6, 8, 6]), 24)
 
     def test_inverse_scale_falls_back_past_cap(self):
         # 7 * 11 * 13 = 1001 fits under the cap and stays exact. 7 * 11 * 17 =
@@ -2670,9 +2676,7 @@ class TestSympyExprToCpSatPrinter(TestCase):
         under_cap_values = [1, 7, 11, 13]
         lcm_scale = 7 * 11 * 13
         _, model = self._pinned_split_cost(1 / a, {"split_a": under_cap_values}, 0)
-        self.assertEqual(
-            self._domain_of(model, "inv_split_a"), (lcm_scale // 13, lcm_scale)
-        )
+        self.assertEqual(self._scale_of("split_a", under_cap_values), lcm_scale)
 
         over_cap_values = [1, 7, 11, 17]
         fallback_scale = 5 * 7 * 17
@@ -2681,10 +2685,7 @@ class TestSympyExprToCpSatPrinter(TestCase):
         got, model = self._pinned_split_cost(
             numerator / a, {"split_a": over_cap_values}, pinned
         )
-        self.assertEqual(
-            self._domain_of(model, "inv_split_a"),
-            (fallback_scale // 17, fallback_scale),
-        )
+        self.assertEqual(self._scale_of("split_a", over_cap_values), fallback_scale)
         # 7 divides the fallback scale, so the pinned division is priced exactly.
         self.assertAlmostEqual(got, numerator / 7)
 
