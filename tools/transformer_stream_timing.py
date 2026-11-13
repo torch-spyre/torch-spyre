@@ -21,10 +21,12 @@ topology runs in its own subprocess because the hazard tracker is latched at
 runtime start. Topologies alternate over several rounds, order flipped each
 round.
 
-Softmax is written as exp/sum so Inductor does not rewrite attention into the
-multi-output SDPA kernel (that rewrite currently breaks compile with
-KeyError 'bufN' once the model has two or more attention layers). There is no
-max-subtraction, so values are only meaningful for timing.
+Each block is compiled as its own graph. Compiling two or more attention
+layers in one graph currently fails with KeyError 'bufN' (see
+encoder_vs_decoder_timing.py), and spelling attention out as plain bmm/exp/sum
+fails earlier with "cannot restickify" / "no mechanism to resolve stick
+incompatibility". One attention call per graph avoids both. Blocks run one
+after another, so there is a graph boundary between layers.
 
 Usage:
     python3 tools/transformer_stream_timing.py [--layers 6] [--seq 128]
@@ -82,8 +84,7 @@ def build_model(layers: int):
             q = (self.q_proj(x) * self.scaling).view(T, B * H, Dh).transpose(0, 1)
             k = self.k_proj(x).view(T, B * H, Dh).transpose(0, 1)
             v = self.v_proj(x).view(T, B * H, Dh).transpose(0, 1)
-            e = torch.bmm(q, k.transpose(1, 2)).exp()
-            attn = e / e.sum(-1, keepdim=True)
+            attn = torch.bmm(q, k.transpose(1, 2)).softmax(-1)
             out = torch.bmm(attn, v).transpose(0, 1).contiguous().view(T, B, H * Dh)
             x = self.norm1(x + self.out_proj(out))
             return self.norm2(x + self.linear2(F.relu(self.linear1(x))))
@@ -120,7 +121,12 @@ def measure(args) -> dict:
     sync()
     out["load_s"] = time.perf_counter() - t0
 
-    compiled = torch.compile(model, dynamic=False)
+    blocks = [torch.compile(b, dynamic=False) for b in model.blocks]
+
+    def compiled(x):
+        for b in blocks:
+            x = b(x)
+        return x
 
     with torch.no_grad():
         # compile: first call = compile + one run
