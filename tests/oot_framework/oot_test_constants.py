@@ -58,7 +58,9 @@ _VALID_DTYPE_STRINGS = {
     "bool",
     "half",
     "float8_e4m3fn",
+    "float8_e4m3fnuz",
     "float8_e5m2",
+    "float8_e5m2fnuz",
 }
 # -------------------------------------------
 # Valid tensor generation strategies
@@ -114,7 +116,9 @@ DTYPE_STR_MAP: Dict[str, torch.dtype] = {
     "bool": torch.bool,
     "half": torch.half,
     "float8_e4m3fn": torch.float8_e4m3fn,
+    "float8_e4m3fnuz": torch.float8_e4m3fnuz,
     "float8_e5m2": torch.float8_e5m2,
+    "float8_e5m2fnuz": torch.float8_e5m2fnuz,
 }
 
 DTYPE_NAMES_ORDERED = sorted(DTYPE_STR_MAP.keys(), key=len, reverse=True)

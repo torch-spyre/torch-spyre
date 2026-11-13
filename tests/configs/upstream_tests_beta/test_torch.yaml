@@ -24,13 +24,6 @@ test_suite_config:
         - names:
             - TestTorchDeviceType::test_is_signed
           mode: skip  # skip: uint8 host transfer unsupported (#1588)
-        # Upstream regression: test_advancedindex_mixed_devices_error assertRaisesRegex()
-        # against "indices should be either .* (cpu)", but aten::index.Tensor raises its own
-        # NotImplementedError ("supports only x[index] with a single 1-D int32/int64 index
-        # tensor on dim 0") before PyTorch's standard argument validation runs (#6204).
-        - names:
-            - TestDevicePrecision::test_advancedindex_mixed_devices_error
-          mode: skip  # skip: NotImplementedError before standard index validation (#6204)
         # Upstream regression: test_lazy_clone_view fails on every dtype with "views of sharded
         # Spyre tensors are not supported" (#5817).
         - names:
@@ -40,6 +33,222 @@ test_suite_config:
         - names:
             - TestTorch::test_normal_shape
           mode: skip
+        # ---------------------------------------------------------------------------
+        # Indirect access — mandatory_success
+        # Supported gather / scatter / mask / put / embedding operations (forward /
+        # inference path).
+        # ---------------------------------------------------------------------------
+        - names:
+            - TestTorch::test_index_select
+            - TestTorch::test_gather_neg_dim
+            - TestTorch::test_index_select_neg_dim
+            - TestTorch::test_index_copy_neg_dim
+            - TestTorch::test_index_fill_neg_dim
+            - TestTorch::test_index_add_neg_dim
+            - TestTorch::test_scatter_neg_dim
+            - TestTorch::test_index_add
+            - TestTorch::test_index_add_all_dtypes
+            - TestTorch::test_index_add_cornercase
+            - TestTorch::test_index_add_correctness
+            - TestTorchDeviceType::test_scatter_zero_size_index
+            - TestTorchDeviceType::test_masked_scatter_large_tensor
+          mode: mandatory_success
+
+        # ---------------------------------------------------------------------------
+        # torch.repeat_interleave — YAML unique abort is Mod(d0, 2)
+        # https://github.com/torch-spyre/torch-spyre/issues/4531
+        # ---------------------------------------------------------------------------
+        - names:
+            - TestTorchDeviceType::test_repeat_interleave  # issue 4531
+          mode: xfail  # xfail: Unexpected stick expression Mod(d0, 2)
+
+        # ---------------------------------------------------------------------------
+        # Tensor.scatter_(reduce=) — unique abort is
+        # aten::scatter.reduce_out (analysis label copy_from_d2d is wrong for the
+        # pytest first abort). Same string as #4413.
+        # test_scatter_reduce_scalar is #4552 value_reduce_out.
+        # https://github.com/torch-spyre/torch-spyre/issues/4413
+        # ---------------------------------------------------------------------------
+        - names:
+            - TestTorchDeviceType::test_scatter_reduce_non_unique_index  # issue 4413
+            - TestTorchDeviceType::test_scatter_reduce_operations_to_large_input  # issue 4413
+          mode: xfail  # xfail: aten::scatter.reduce_out not registered
+
+        # ---------------------------------------------------------------------------
+        # index_add bfloat16 — unique abort is Tensor-likes not close
+        # (1/15, abs 0.03125). YAML precision: cannot override explicit
+        # assertEqual(atol=1e-2, rtol=0).
+        # https://github.com/torch-spyre/torch-spyre/issues/4538
+        # ---------------------------------------------------------------------------
+        - names:
+            - TestDevicePrecision::test_index_add_bfloat16  # issue 4538
+          mode: xfail  # xfail: bfloat16 index_add disagrees with CPU (abs 0.03125)
+
+        # ---------------------------------------------------------------------------
+        # stride-2 last-dim clone — unique abort is 2*d1
+        # (#3454 Case 2 k*d linear form).
+        # Keep test_masked_select on #4553 (int16 DCI, different first abort).
+        # https://github.com/torch-spyre/torch-spyre/issues/3454
+        # ---------------------------------------------------------------------------
+        - names:
+            - TestTorchDeviceType::test_masked_select_discontiguous  # issue 3454
+          mode: xfail  # xfail: Unexpected stick expression 2*d1
+
+        # ---------------------------------------------------------------------------
+        # Tensor.put_ / torch.put — unique abort is aten::put_
+        # https://github.com/torch-spyre/torch-spyre/issues/4540
+        # ---------------------------------------------------------------------------
+        - names:
+            - TestTorchDeviceType::test_put  # issue 4540
+            - TestTorchDeviceType::test_put_empty  # issue 4540
+            - TestTorchDeviceType::test_put_accumulate  # issue 4540
+            - TestTorchDeviceType::test_nondeterministic_alert_put  # issue 4540
+            - TestTorchDeviceType::test_nondeterministic_alert_put_accumulate  # issue 4540
+          mode: xfail  # xfail: aten::put_ not registered
+
+        # ---------------------------------------------------------------------------
+        # torch.take — unique abort is aten::take
+        # https://github.com/torch-spyre/torch-spyre/issues/4307
+        # ---------------------------------------------------------------------------
+        - names:
+            - TestTorchDeviceType::test_take  # issue 4307
+            - TestTorchDeviceType::test_take_empty  # issue 4307
+          mode: xfail  # xfail: aten::take not registered
+
+        # ---------------------------------------------------------------------------
+        # Tensor.masked_scatter_ — eager abort is aten::masked_scatter_
+        # Compiled of the same 1-D call is #4437 (mask broadcast).
+        # https://github.com/torch-spyre/torch-spyre/issues/4437
+        # ---------------------------------------------------------------------------
+        - names:
+            - TestTorchDeviceType::test_masked_scatter  # issue 4437
+            - TestTorchDeviceType::test_masked_scatter_bool_tensor  # issue 4437
+          mode: xfail  # xfail: aten::masked_scatter_ not registered (eager); compile is #4437
+
+        # ---------------------------------------------------------------------------
+        # torch.scatter_add — unique abort is aten::scatter_add.out
+        # https://github.com/torch-spyre/torch-spyre/issues/4396
+        # ---------------------------------------------------------------------------
+        - names:
+            - TestTorchDeviceType::test_scatter_add_bool  # issue 4396
+            - TestTorchDeviceType::test_scatter_add_non_unique_index  # issue 4396
+            - TestTorchDeviceType::test_scatter_add_one_dim_deterministic  # issue 4396
+            - TestTorchDeviceType::test_scatter_add_to_large_input  # issue 4396
+          mode: xfail  # xfail: aten::scatter_add.out not registered
+
+        # ---------------------------------------------------------------------------
+        # torch.scatter / Tensor.scatter_ — unique abort is
+        # aten::scatter.src_out. Same string as #1002 (#4401 same kernel).
+        # https://github.com/torch-spyre/torch-spyre/issues/1002
+        # ---------------------------------------------------------------------------
+        - names:
+            - TestTorchDeviceType::test_scatter_bool  # issue 1002
+            - TestTorchDeviceType::test_scatter_to_large_input  # issue 1002
+          mode: xfail  # xfail: aten::scatter.src_out not registered
+
+        # ---------------------------------------------------------------------------
+        # advanced indexing mixed CPU/device — unique abort is
+        # aten::index.Tensor_out. Same string as #1219.
+        # https://github.com/torch-spyre/torch-spyre/issues/1219
+        # ---------------------------------------------------------------------------
+        - names:
+            - TestDevicePrecision::test_advancedindex_mixed_cpu_devices  # issue 1219
+            - TestTorchDeviceType::test_deterministic_interpolate_bilinear  # issue 1219
+            - TestTorchDeviceType::test_no_nondeterministic_alert_interpolate_bilinear  # issue 1219
+            - TestTorchDeviceType::test_no_nondeterministic_alert_interpolate_trilinear  # issue 1219
+          mode: xfail  # xfail: Spyre aten::index.Tensor supports only x[index] with a single 1-D int32/int64 index tensor on dim 0
+
+        # CPU raises RuntimeError "indices should be either on cpu or on the same device as
+        # the indexed tensor"; Spyre's aten::index.Tensor raises NotImplementedError first,
+        # so assertRaisesRegex does not match. https://github.com/torch-spyre/torch-spyre/issues/6204
+        - names:
+            - TestDevicePrecision::test_advancedindex_mixed_devices_error  # issue 6204
+          mode: xfail  # xfail: NotImplementedError raised where RuntimeError "indices should be either on cpu ..." is expected
+
+        # ---------------------------------------------------------------------------
+        # index_put mem overlap — unique abort is
+        # aten::_index_put_impl_. Same string as #692.
+        # Dies on x.index_put_ before the overlap check.
+        # https://github.com/torch-spyre/torch-spyre/issues/692
+        # ---------------------------------------------------------------------------
+        - names:
+            - TestTorchDeviceType::test_index_put_mem_overlap  # issue 692
+          mode: xfail  # xfail: aten::_index_put_impl_ not registered
+
+        # ---------------------------------------------------------------------------
+        # nn.EmbeddingBag — unique abort is aten::_embedding_bag
+        # Same string as #4319.
+        # Not #4320 (embedding_renorm_).
+        # https://github.com/torch-spyre/torch-spyre/issues/4319
+        # ---------------------------------------------------------------------------
+        - names:
+            - TestTorchDeviceType::test_nondeterministic_alert_EmbeddingBag_max  # issue 4319
+          mode: xfail  # xfail: aten::_embedding_bag not registered
+
+        # ---------------------------------------------------------------------------
+        # Tensor.index_fill_ — unique abort is
+        # aten::index_fill_.int_Scalar. Same string as #4414.
+        # https://github.com/torch-spyre/torch-spyre/issues/4414
+        # ---------------------------------------------------------------------------
+        - names:
+            - TestTorchDeviceType::test_index_fill_mem_overlap  # issue 4414
+          mode: xfail  # xfail: aten::index_fill_.int_Scalar not registered
+
+        # ---------------------------------------------------------------------------
+        # Tensor.scatter_(value=, reduce=) — unique abort is
+        # aten::scatter.value_reduce_out (eager).
+        # https://github.com/torch-spyre/torch-spyre/issues/4552
+        # ---------------------------------------------------------------------------
+        - names:
+            - TestTorchDeviceType::test_scatter_reduce_scalar  # issue 4552
+          mode: xfail  # xfail: aten::scatter.value_reduce_out not registered
+
+        # ---------------------------------------------------------------------------
+        # int16 DMA — unique abort is Unsupported DCI
+        # cpu_type=int16, dev_type=int16. test_masked_select setup randint
+        # maskType=int16 (uint8/int8 PASS).
+        # https://github.com/torch-spyre/torch-spyre/issues/4553
+        # ---------------------------------------------------------------------------
+        - names:
+            - TestTorchDeviceType::test_masked_select  # issue 4553
+          mode: xfail  # xfail: Unsupported DCI int16 DMA
+
+        # ---------------------------------------------------------------------------
+        # transpose then contiguous — leftover unique abort is
+        # no mechanism to resolve stick incompatibility. Same string as #3265
+        # (x.t().clone()). Dies on t.transpose(0,1).contiguous() before
+        # masked_scatter_. 
+        # https://github.com/torch-spyre/torch-spyre/issues/3265
+        # ---------------------------------------------------------------------------
+        - names:
+            - TestTorchDeviceType::test_masked_scatter_inplace_noncontiguous  # issue 3265
+          mode: xfail  # xfail: no mechanism to resolve stick incompatibility
+
+        # ---------------------------------------------------------------------------
+        # torch.index_add_ on very large tensors — skip entirely to avoid CI hang.
+        # Root cause: aten::index_add.out is not registered for the Spyre backend.
+        # The test does NOT fail fast — it first runs a 524,288-iteration Python
+        # reference loop (32 × 16,384 steps) where every iteration calls .item()
+        # for a synchronous device-to-host scalar transfer, consuming ~19 minutes
+        # before the missing op is even reached.
+        # Tensor sizes: output [1, 32, 16384, 6144] bfloat16 ≈ 6 GB on device.
+        # Observed wall-clock: 1145 s (run N), 890 s (run N-1) — worsening each run.
+        # An xfail would still run the body, so the hang would remain; a skip is the only option.
+        # Use mode: skip (not xfail) so CI does not wait for the timeout at all.
+        # Remove this entry once aten::index_add.out is implemented on Spyre.
+        # Covered by https://github.com/torch-spyre/torch-spyre/issues/3507 (Enable Tensor.index_add_,
+        # which includes aten::index_add.out). #4538 is a different bug (incorrect bf16 results).
+        # ---------------------------------------------------------------------------
+        - names:
+            - TestTorchDeviceType::test_index_add_large_inputs  # issue 3507
+          mode: skip  # skip: hangs ~19 min before reaching the missing aten::index_add.out
+        # ---------------------------------------------------------------------------
+        # Gather backward. aten::gather is not enabled on Spyre.
+        # Covered by https://github.com/torch-spyre/torch-spyre/issues/4328
+        # ---------------------------------------------------------------------------
+        - names:
+            - TestTorchDeviceType::test_gather_backward_deterministic_path  # issue 4328
+          mode: xfail  # xfail: aten::gather not enabled on Spyre
         # Upstream regression: these assertRaisesRegex() against a specific CPU error message
         # (e.g. "Empty tensor not supported", "unsupported operation", "Expected all tensors to
         # be on the same device", "CPU Scalar support for tensor1 argument"), but on Spyre the
@@ -65,33 +274,43 @@ test_suite_config:
             dtypes:
               exclude:
                 - name: float32
-        # # These tests exercise tensor operations with various dtypes, including unsupported ones like float8_e4m3fn and float8_e5m2fnuz.
-        # # They are classified as mandatory_success because the Spyre backend must support all listed dtypes and ops for full compatibility.
-        # # The most relevant Spyre limitations are the lack of support for certain dtypes and the unimplemented "mul_cpu_reduced_float" op.
-        # - names:
-        #     - TestTorchDeviceType::test_item
-        #   mode: mandatory_success
-        #   edits:
-        #     dtypes:
-        #       exclude:
-        #         - name: bool
-        #         - name: float16
-        #         - name: float32
+        # These tests validate error-message handling for non-native device operations.
+        - names:
+            - TestTorchDeviceType::test_assertRaisesRegex_ignore_msg_non_native_device
+          mode: mandatory_success
+
+        # ---------------------------------------------------------------------------
+        # torch.Tensor.item. Supported dtypes PASS.
+        # float8_e4m3fn / float8_e5m2fnuz — RuntimeOperationFill (#4506)
+        # float8_e4m3fnuz / float8_e5m2 — does not support dtype (#4497)
+        # https://github.com/torch-spyre/torch-spyre/issues/4506
+        # https://github.com/torch-spyre/torch-spyre/issues/4497
+        # ---------------------------------------------------------------------------
+        - names:
+            - TestTorchDeviceType::test_item
+          mode: mandatory_success
+        - names:
+            - TestTorchDeviceType::test_item  # issue 4506 / 4497
+          mode: xfail  # xfail: RuntimeOperationFill / dtype not supported (float8)
+          edits:
+            dtypes:
+              include:
+                - name: float8_e4m3fn
+                - name: float8_e4m3fnuz
+                - name: float8_e5m2
+                - name: float8_e5m2fnuz
+
         # These tests exercise a wide range of PyTorch operations, including tensor manipulations, mathematical operations, and gradient scaling, across various data types.
         # They are classified as xfail on the Spyre backend due to unsupported operations, data types, and memory formats, as well as missing features like deterministic paths and non-deterministic alerts.
         # The most relevant Spyre capabilities include support for bfloat16, bool, float16, float32, and int64 data types, and a subset of operations that are fully supported across all these types. Limitations include unsupported complex half data types, non-contiguous memory formats, and missing deterministic paths for certain operations.
         - names:
-            - TestDevicePrecision::test_advancedindex_mixed_cpu_devices
             - TestTorchDeviceType::test_addcmul
-            - TestTorchDeviceType::test_assertRaisesRegex_ignore_msg_non_native_device
             - TestTorchDeviceType::test_clone_all_dtypes_and_devices
             - TestTorchDeviceType::test_complex_half_experimental_warning
             - TestTorchDeviceType::test_conv_transposed_backward_agnostic_to_memory_format
             - TestTorchDeviceType::test_copy_all_dtypes_and_devices
-            - TestTorchDeviceType::test_deterministic_interpolate_bilinear
             - TestTorchDeviceType::test_deterministic_replication_pad2d
             - TestTorchDeviceType::test_exponential_no_zero
-            - TestTorchDeviceType::test_gather_backward_deterministic_path
             - TestTorchDeviceType::test_grad_scale_will_not_overflow
             - TestTorchDeviceType::test_grad_scaler_deprecated_warning
             - TestTorchDeviceType::test_grad_scaling_autocast
@@ -101,22 +320,17 @@ test_suite_config:
             - TestTorchDeviceType::test_invalid_shapes_grid_sampler
             - TestTorchDeviceType::test_lazy_clone_binary_op_no_materialize
             - TestTorchDeviceType::test_lazy_clone_view_materialize
-            - TestTorchDeviceType::test_masked_scatter_inplace_noncontiguous
-            - TestTorchDeviceType::test_masked_select_discontiguous
             - TestTorchDeviceType::test_memory_format_factory_like_functions_preserve
             - TestTorchDeviceType::test_memory_format_preserved_after_permute
             - TestTorchDeviceType::test_memory_format_propagation_rules
             - TestTorchDeviceType::test_memory_format_type_shortcuts
             - TestTorchDeviceType::test_multinomial_empty_w_replacement
             - TestTorchDeviceType::test_multinomial_empty_wo_replacement
-            - TestTorchDeviceType::test_no_nondeterministic_alert_interpolate_bilinear
-            - TestTorchDeviceType::test_no_nondeterministic_alert_interpolate_trilinear
             - TestTorchDeviceType::test_nondeterministic_alert_AdaptiveAvgPool2d
             - TestTorchDeviceType::test_nondeterministic_alert_AdaptiveAvgPool3d
             - TestTorchDeviceType::test_nondeterministic_alert_AdaptiveMaxPool2d
             - TestTorchDeviceType::test_nondeterministic_alert_AvgPool3d
             - TestTorchDeviceType::test_nondeterministic_alert_CTCLoss
-            - TestTorchDeviceType::test_nondeterministic_alert_EmbeddingBag_max
             - TestTorchDeviceType::test_nondeterministic_alert_FractionalMaxPool2d
             - TestTorchDeviceType::test_nondeterministic_alert_FractionalMaxPool3d
             - TestTorchDeviceType::test_nondeterministic_alert_MaxPool3d
@@ -137,174 +351,266 @@ test_suite_config:
             - TestTorchDeviceType::test_nondeterministic_alert_interpolate_bilinear
             - TestTorchDeviceType::test_nondeterministic_alert_interpolate_linear
             - TestTorchDeviceType::test_nondeterministic_alert_interpolate_trilinear
-            - TestTorchDeviceType::test_nondeterministic_alert_put_accumulate
             - TestTorchDeviceType::test_nondeterministic_resize_quantized
             - TestTorchDeviceType::test_params_invalidated_with_grads_invalidated_and_graph_partition
             - TestTorchDeviceType::test_params_invalidated_with_grads_invalidated_between_unscale_and_step
             - TestTorchDeviceType::test_reduced_type_float_copy
-            - TestTorchDeviceType::test_scatter_add_non_unique_index
-            - TestTorchDeviceType::test_scatter_add_one_dim_deterministic
-            - TestTorchDeviceType::test_scatter_reduce_non_unique_index
-            - TestTorchDeviceType::test_scatter_reduce_operations_to_large_input
-            - TestTorchDeviceType::test_scatter_reduce_scalar
             - TestTorchDeviceType::test_storage_all_devices
             - TestTorchDeviceType::test_storage_meta_from_tensor
             - TestTorchDeviceType::test_where_scalar_handcrafted_values
-            - TestTorchDeviceType::test_item
           mode: xfail   # xfail: dxp_standalone not detected
-        # These tests exercise various tensor operations and dtypes, including clamp, copy_, diff, gradient, and put_accumulate.
-        # They are classified as xfail due to NotImplementedError and InductorError, indicating unsupported ops or dtypes.
-        # Relevant Spyre limitations include missing support for certain dtypes and ops, such as random_ and dxp_standalone.
+        # ---------------------------------------------------------------------------
+        # Failures grouped by the op or condition that raises.
+        # ---------------------------------------------------------------------------
+        # aten::masked_fill_.Scalar is registered now, but masked_fill_ with a 1-D mask fails in
+        # layout propagation (mixed EA). https://github.com/torch-spyre/torch-spyre/issues/1004
         - names:
-            - TestDevicePrecision::test_clamp
-            - TestTorchDeviceType::test_diff
-            - TestTorchDeviceType::test_diff_noncontig
-            - TestTorchDeviceType::test_put_accumulate
-          mode: skip  # xfail: NotImplementedError, torch._inductor.exc.InductorError
-        # These tests exercise tensor comparison and upsampling operations, respectively.
-        # They are classified as xfail due to AssertionErrors, indicating precision issues or memory limitations.
-        # The relevant Spyre limitations include precision discrepancies in tensor comparisons and memory allocation constraints.
+            - TestTorchDeviceType::test_masked_fill_bool_tensor  # issue 1004
+            - TestTorchDeviceType::test_masked_fill_mem_overlap  # issue 1004
+          mode: xfail  # xfail: Unsupported: Multi-arg pointwise with mixed EA, STANDARD input must broadcast
+        # aten::remainder.Tensor_out not registered. https://github.com/torch-spyre/torch-spyre/issues/4416
         - names:
-            - TestDevicePrecision::test_copy_broadcast
-            - TestTorchDeviceType::test_int64_upsample3d
-          mode: skip  # xfail: AssertionError
-        # These tests exercise various tensor operations and memory format transformations, including type conversions and non-contiguous memory handling.
-        # They are classified as xfail due to Spyre backend limitations in handling type conversions during tensor operations and unsupported memory formats.
-        # The most relevant Spyre capabilities are its support for contiguous memory format and its current lack of support for complex dtypes and non-contiguous memory operations.
+            - TestTorchDeviceType::test_scalar_check  # issue 4416
+          mode: xfail  # xfail: Could not run 'aten::remainder.Tensor_out'
+        # Prefix-scan ops not registered (aten::_cummax_helper, _cummin_helper, cumprod.out,
+        # _logcumsumexp). https://github.com/torch-spyre/torch-spyre/issues/3388
         - names:
-            - TestDevicePrecision::test_copy_noncontig
-            - TestTorchDeviceType::test_bool_tensor_value_change
-            - TestTorchDeviceType::test_check_tensor_all
-            - TestTorchDeviceType::test_check_tensor_internal
-            - TestTorchDeviceType::test_discontiguous_out_cumsum
-            - TestTorchDeviceType::test_gradient_type_promotion
-            - TestTorchDeviceType::test_hook_remove
-            - TestTorchDeviceType::test_memory_format_clone
-            - TestTorchDeviceType::test_memory_format_empty_like
-            - TestTorchDeviceType::test_memory_format_operators
-            - TestTorchDeviceType::test_memory_format_to
-            - TestTorchDeviceType::test_memory_format_type
-            - TestTorchDeviceType::test_scatter_add_to_large_input
-            - TestTorchDeviceType::test_scatter_to_large_input
-            - TestTorchDeviceType::test_untyped_storage_meta
-          mode: skip  # xfail: RuntimeError
-        # These tests exercise a variety of tensor operations and data types, including random number generation, cumulative operations, and tensor manipulation.
-        # They are classified as xfail on the Spyre backend due to missing or unimplemented operators, such as `aten::_efficientzerotensor`, `aten::set_.source_Storage`, and `aten::index_add.out`.
-        # The most relevant Spyre capabilities or limitations include the lack of support for certain tensor operations and data types, which are essential for these tests to pass.
+            - TestTorchDeviceType::test_cummax_cummin  # issue 3388
+            - TestTorchDeviceType::test_cummax_discontiguous  # issue 3388
+            - TestTorchDeviceType::test_cummin_discontiguous  # issue 3388
+            - TestTorchDeviceType::test_cumprod  # issue 3388
+            - TestTorchDeviceType::test_logcumsumexp  # issue 3388
+          mode: xfail  # xfail: Could not run 'aten::_cummax_helper' / '_cummin_helper' / 'cumprod.out' / '_logcumsumexp'
+        # aten::glu.out not registered. https://github.com/torch-spyre/torch-spyre/issues/496
         - names:
-            - TestDevicePrecision::test_cuda_device_idx
-            - TestDevicePrecision::test_device_serialization
-            - TestDevicePrecision::test_index_add_bfloat16
-            - TestTorchDeviceType::test_bernoulli_p
-            - TestTorchDeviceType::test_bernoulli_self
-            - TestTorchDeviceType::test_bytes_to_scalar
-            - TestTorchDeviceType::test_cauchy
-            - TestTorchDeviceType::test_cdist_empty
-            - TestTorchDeviceType::test_cdist_norm
-            - TestTorchDeviceType::test_cdist_norm_batch
-            - TestTorchDeviceType::test_cummax_cummin
-            - TestTorchDeviceType::test_cumprod
-            - TestTorchDeviceType::test_deepcopy
-            - TestTorchDeviceType::test_deepcopy_scalar
-            - TestTorchDeviceType::test_dim_function_empty
-            - TestTorchDeviceType::test_exponential
-            - TestTorchDeviceType::test_gather_backward_one_dim
-            - TestTorchDeviceType::test_geometric
-            - TestTorchDeviceType::test_index_add_large_inputs
-            - TestTorchDeviceType::test_index_fill_mem_overlap
-            - TestTorchDeviceType::test_index_put_mem_overlap
-            - TestTorchDeviceType::test_is_set_to
-            - TestTorchDeviceType::test_log_normal
-            - TestTorchDeviceType::test_logcumsumexp
-            - TestTorchDeviceType::test_masked_fill_bool_tensor
-            - TestTorchDeviceType::test_masked_fill_mem_overlap
-            - TestTorchDeviceType::test_masked_scatter_bool_tensor
-            - TestTorchDeviceType::test_masked_select
-            - TestTorchDeviceType::test_pairwise_distance_empty
-            - TestTorchDeviceType::test_pdist_empty
-            - TestTorchDeviceType::test_pdist_norm_large
-            - TestTorchDeviceType::test_put
-            - TestTorchDeviceType::test_put_empty
-            - TestTorchDeviceType::test_scalar_check
-            - TestTorchDeviceType::test_scatter_add_bool
-            - TestTorchDeviceType::test_scatter_bool
-            - TestTorchDeviceType::test_set_storage
-            - TestTorchDeviceType::test_storage
-            - TestTorchDeviceType::test_sync_warning
-            - TestTorchDeviceType::test_take
-            - TestTorchDeviceType::test_take_empty
-            - TestTorchDeviceType::test_tensor_shape_empty
-          mode: skip  # xfail: NotImplementedError
-        # These tests exercise various broadcasting operations across different tensor operations and data types.
-        # They are classified as xfail due to missing or unsupported operators and file access errors on the Spyre backend.
-        # Relevant Spyre limitations include missing support for certain tensor operations and file system dependencies.
+            - TestTorchDeviceType::test_dim_function_empty  # issue 496
+          mode: xfail  # xfail: Could not run 'aten::glu.out'
+        # aten::gather.out not registered. https://github.com/torch-spyre/torch-spyre/issues/4328
         - names:
-            - TestTorchDeviceType::test_broadcast
-          mode: skip  # xfail: NotImplementedError, RuntimeError, torch._inductor.exc.InductorError
-        # These tests exercise a variety of operations and tensor behaviors, including non-contiguous tensors, gradient scaling, and cumulative operations.
-        # They are classified as xfail due to unsupported operations, missing features, or errors related to the Spyre backend.
-        # Relevant Spyre limitations include unsupported mutation operations, missing standalone executables, and unsupported data formats.
+            - TestTorchDeviceType::test_gather_backward_one_dim  # issue 4328
+          mode: xfail  # xfail: Could not run 'aten::gather.out'
+        # Random sampling ops not registered (aten::bernoulli_.Tensor, bernoulli_.float, exponential_).
+        # https://github.com/torch-spyre/torch-spyre/issues/5851
         - names:
-            - TestTorchDeviceType::test_cdist_cuda_backward
-            - TestTorchDeviceType::test_cdist_euclidean_large
-            - TestTorchDeviceType::test_cdist_grad_p_lt_1_no_nan
-            - TestTorchDeviceType::test_cdist_non_contiguous
-            - TestTorchDeviceType::test_cdist_non_contiguous_batch
-            - TestTorchDeviceType::test_cdist_same_inputs
-            - TestTorchDeviceType::test_copy_math_view
-            - TestTorchDeviceType::test_corrcoef
-            - TestTorchDeviceType::test_cov
-            - TestTorchDeviceType::test_cummax_discontiguous
-            - TestTorchDeviceType::test_cummin_discontiguous
-            - TestTorchDeviceType::test_deterministic_cumsum
-            - TestTorchDeviceType::test_dist
-            - TestTorchDeviceType::test_grad_scaler_pass_itself
-            - TestTorchDeviceType::test_grad_scaling_accumulation
-            - TestTorchDeviceType::test_grad_scaling_clipping
-            - TestTorchDeviceType::test_grad_scaling_multiple
-            - TestTorchDeviceType::test_grad_scaling_penalty
+            - TestTorchDeviceType::test_bernoulli_p  # issue 5851
+            - TestTorchDeviceType::test_bernoulli_self  # issue 5851
+            - TestTorchDeviceType::test_exponential  # issue 5851
+          mode: xfail  # xfail: Could not run 'aten::bernoulli_.Tensor' / 'bernoulli_.float' / 'exponential_'
+        # aten::cauchy_, geometric_ and log_normal_ not registered. https://github.com/torch-spyre/torch-spyre/issues/5851
+        - names:
+            - TestTorchDeviceType::test_cauchy  # issue 5851
+            - TestTorchDeviceType::test_geometric  # issue 5851
+            - TestTorchDeviceType::test_log_normal  # issue 5851
+          mode: xfail  # xfail: Could not run 'aten::cauchy_' / 'geometric_' / 'log_normal_'
+        # assertEqual -> isclose -> aten::isnan. https://github.com/torch-spyre/torch-spyre/issues/1738
+        - names:
+            - TestTorchDeviceType::test_copy_math_view  # issue 1738
+            - TestTorchDeviceType::test_deterministic_cumsum  # issue 1738
+            - TestTorchDeviceType::test_hook_remove  # issue 1738
+            - TestTorchDeviceType::test_narrow_copy_non_contiguous  # issue 1738
+          mode: xfail  # xfail: Could not run 'aten::isnan'
+        # bfloat16 / float16 / float32: assertEqual -> aten::isnan. https://github.com/torch-spyre/torch-spyre/issues/1738
+        - names:
+            - TestTorchDeviceType::test_deterministic_empty  # issue 1738
+          mode: xfail  # xfail: Could not run 'aten::isnan'
+          edits:
+            dtypes:
+              include:
+                - name: bfloat16
+                - name: float16
+                - name: float32
+        # bool / int64: the filled-memory check returns False. https://github.com/torch-spyre/torch-spyre/issues/6260
+        - names:
+            - TestTorchDeviceType::test_deterministic_empty  # issue 6260
+          mode: xfail  # xfail: AssertionError: tensor(False, device='spyre:0') is not true
+          edits:
+            dtypes:
+              include:
+                - name: bool
+                - name: int64
+        # Stick expression 2*d1 (stride-2 write). https://github.com/torch-spyre/torch-spyre/issues/3454
+        - names:
+            - TestTorchDeviceType::test_discontiguous_out_cumsum  # issue 3454
+          mode: xfail  # xfail: Unexpected stick expression 2*d1
+        # float32 / int64: constant stick expression 1. https://github.com/torch-spyre/torch-spyre/issues/5196
+        - names:
+            - TestTorchDeviceType::test_diff  # issue 5196
+          mode: xfail  # xfail: Unexpected stick expression 1
+          edits:
+            dtypes:
+              include:
+                - name: float32
+                - name: int64
+        # bool: wrong values (Tensor-likes are not close, 1 / 1 elements); a 1-element bool
+        # clone() returns the wrong value too. https://github.com/torch-spyre/torch-spyre/issues/6043
+        - names:
+            - TestTorchDeviceType::test_diff  # issue 6043
+          mode: xfail  # xfail: AssertionError: Tensor-likes are not close
+          edits:
+            dtypes:
+              include:
+                - name: bool
+        # float16 / float32 / int64: copy_from_d2d storage_offset not stick-aligned. https://github.com/torch-spyre/torch-spyre/issues/4329
+        - names:
+            - TestTorchDeviceType::test_diff_noncontig  # issue 4329
+          mode: xfail  # xfail: copy_from_d2d sliced view requires stick-aligned storage_offset
+          edits:
+            dtypes:
+              include:
+                - name: float16
+                - name: float32
+                - name: int64
+        # bool: copy_from_d2d of a bool view at a non-zero offset raises NotImplementedError. https://github.com/torch-spyre/torch-spyre/issues/4501
+        - names:
+            - TestTorchDeviceType::test_diff_noncontig  # issue 4501
+          mode: xfail  # xfail: NotImplementedError in spyre.copy_from_d2d (bool view, non-zero offset)
+          edits:
+            dtypes:
+              include:
+                - name: bool
+        # copy_from_d2d of a sliced view needs a stick-aligned storage_offset. https://github.com/torch-spyre/torch-spyre/issues/4329
+        - names:
+            - TestDevicePrecision::test_clamp  # issue 4329
+            - TestTorchDeviceType::test_multinomial  # issue 4329
+            - TestTorchDeviceType::test_tolist_with_grad  # issue 4329
+          mode: xfail  # xfail: copy_from_d2d sliced view requires stick-aligned storage_offset
+        # copy_from_d2d of a 0-dim bool view at a non-zero offset raises NotImplementedError. https://github.com/torch-spyre/torch-spyre/issues/4501
+        - names:
+            - TestTorchDeviceType::test_bool_tensor_value_change  # issue 4501
+            - TestTorchDeviceType::test_check_tensor_all  # issue 4501
+            - TestTorchDeviceType::test_check_tensor_internal  # issue 4501
+          mode: xfail  # xfail: NotImplementedError in spyre.copy_from_d2d (0-dim bool, non-zero offset)
+        # x.repeat(9, 7, 5, 2, 3) on a (0, 1, 3, 0) tensor: multi-variable linear stick expression
+        # 30*d0 + 6*d2 + d3, the same family as https://github.com/torch-spyre/torch-spyre/issues/3455
+        - names:
+            - TestTorchDeviceType::test_tensor_shape_empty  # issue 3455
+          mode: xfail  # xfail: Unexpected stick expression 30*d0 + 6*d2 + d3
+        # Same assertion in _restickify_restore_elided_dim as https://github.com/torch-spyre/torch-spyre/issues/4404
+        # (there for scatter on fp16), here from cdist on transposed 5-D inputs: expected a size-32
+        # gap dim on the intact operand, got size=7.
+        - names:
+            - TestTorchDeviceType::test_cdist_non_contiguous_batch  # issue 4404
+          mode: xfail  # xfail: AssertionError: restickify restore: expected padding-prepended size-32 gap dim
+        # batchmatmul on DataFormats.IEEE_FP32. https://github.com/torch-spyre/torch-spyre/issues/5779
+        - names:
+            - TestTorchDeviceType::test_cdist_euclidean_large  # issue 5779
+            - TestTorchDeviceType::test_cdist_non_contiguous  # issue 5779
+            - TestTorchDeviceType::test_grad_scaling_accumulation  # issue 5779
+            - TestTorchDeviceType::test_grad_scaling_clipping  # issue 5779
+            - TestTorchDeviceType::test_grad_scaling_multiple  # issue 5779
+            - TestTorchDeviceType::test_grad_scaling_penalty  # issue 5779
+          mode: xfail  # xfail: Unsupported: batchmatmul on DataFormats.IEEE_FP32
+        # tangents_1 does not have FixedTiledLayout. https://github.com/torch-spyre/torch-spyre/issues/6140
+        - names:
+            - TestTorchDeviceType::test_grad_scaler_pass_itself  # issue 6140
+          mode: xfail  # xfail: Unsupported: tangents_1 does not have FixedTiledLayout
+        # The upstream test asserts isinstance(s1._scale, torch.FloatTensor), a CPU tensor class.
+        # On Spyre the scale is float32 on spyre:0 and load_state_dict restores every field,
+        # so the assertion has no meaning for this device.
+        - names:
             - TestTorchDeviceType::test_grad_scaling_state_dict
-            - TestTorchDeviceType::test_large_cumprod
-            - TestTorchDeviceType::test_large_cumsum
-            - TestTorchDeviceType::test_masked_scatter
-            - TestTorchDeviceType::test_multinomial
-            - TestTorchDeviceType::test_narrow_copy_non_contiguous
-            - TestTorchDeviceType::test_nondeterministic_alert_put
+          mode: skip  # skip: upstream asserts the CPU-only torch.FloatTensor class
+        # aten::set_.source_Storage / set_.source_Tensor not registered. https://github.com/torch-spyre/torch-spyre/issues/6134
+        - names:
+            - TestDevicePrecision::test_device_serialization  # issue 6134
+            - TestTorchDeviceType::test_bytes_to_scalar  # issue 6134
+            - TestTorchDeviceType::test_deepcopy  # issue 6134
+            - TestTorchDeviceType::test_deepcopy_scalar  # issue 6134
+            - TestTorchDeviceType::test_deterministic_resize  # issue 6134
+            - TestTorchDeviceType::test_set_storage  # issue 6134
+            - TestTorchDeviceType::test_storage  # issue 6134
+            - TestTorchDeviceType::test_is_set_to  # issue 6134
+          mode: xfail  # xfail: Could not run 'aten::set_.source_Storage' / 'set_.source_Tensor'
+        # TypedStorage / UntypedStorage on a spyre tensor. https://github.com/torch-spyre/torch-spyre/issues/6134
+        - names:
+            - TestTorchDeviceType::test_tensor_from_storage  # issue 6134
+            - TestTorchDeviceType::test_tensor_storage_type  # issue 6134
+            - TestTorchDeviceType::test_typed_storage_meta  # issue 6134
+            - TestTorchDeviceType::test_untyped_storage_meta  # issue 6134
+          mode: xfail  # xfail: ValueError / AssertionError / RuntimeError from the storage constructors and storage metadata
+        # aten::_cdist_forward, _pdist_forward and norm.out not registered. https://github.com/torch-spyre/torch-spyre/issues/6133
+        - names:
+            - TestTorchDeviceType::test_cdist_cuda_backward  # issue 6133
+            - TestTorchDeviceType::test_cdist_empty  # issue 6133
+            - TestTorchDeviceType::test_cdist_grad_p_lt_1_no_nan  # issue 6133
+            - TestTorchDeviceType::test_cdist_norm  # issue 6133
+            - TestTorchDeviceType::test_cdist_norm_batch  # issue 6133
+            - TestTorchDeviceType::test_cdist_same_inputs  # issue 6133
+            - TestTorchDeviceType::test_pdist_empty  # issue 6133
+            - TestTorchDeviceType::test_pdist_norm_large  # issue 6133
+            - TestTorchDeviceType::test_dist  # issue 6133
+            - TestTorchDeviceType::test_pairwise_distance_empty  # issue 6133
+          mode: xfail  # xfail: Could not run 'aten::_cdist_forward' / '_pdist_forward' / 'norm.out'
+        # aten::equal not registered. https://github.com/torch-spyre/torch-spyre/issues/6136
+        - names:
+            - TestTorchDeviceType::test_corrcoef  # issue 6136
+            - TestTorchDeviceType::test_cov  # issue 6136
+          mode: xfail  # xfail: Could not run 'aten::equal'
+        # Spyre backend only supports contiguous memory format (ChannelsLast rejected). https://github.com/torch-spyre/torch-spyre/issues/6138
+        - names:
+            - TestTorchDeviceType::test_memory_format_clone  # issue 6138
+            - TestTorchDeviceType::test_memory_format_empty_like  # issue 6138
+            - TestTorchDeviceType::test_memory_format_operators  # issue 6138
+            - TestTorchDeviceType::test_memory_format_to  # issue 6138
+            - TestTorchDeviceType::test_memory_format_type  # issue 6138
+          mode: xfail  # xfail: Spyre backend only supports contiguous memory format, got: ChannelsLast
+        # The failure is in the test setup, before any cumsum/cumprod runs: x[::3] = -3 on a
+        # 2**30 + 200 element float16 tensor goes through copy_from_d2d, which compiles with
+        # splits={d0: 1} and a per-core span of 2048 MB (357914008 float16 elements) over the
+        # 256 MB hardware limit. https://github.com/torch-spyre/torch-spyre/issues/3417
+        - names:
+            - TestTorchDeviceType::test_large_cumprod  # issue 3417
+            - TestTorchDeviceType::test_large_cumsum  # issue 3417
+          mode: xfail  # xfail: Unsupported: buf0: per-core tensor span 2048.000 MB exceeds hardware limit of 256.00 MB
+        # aten::_efficientzerotensor not registered. https://github.com/torch-spyre/torch-spyre/issues/6137
+        - names:
+            - TestDevicePrecision::test_cuda_device_idx  # issue 6137
+          mode: xfail  # xfail: Could not run 'aten::_efficientzerotensor'
+        # CUDA-only: CudaSyncGuard calls torch.cuda.set_sync_debug_mode, so the test has no Spyre meaning.
+        - names:
+            - TestTorchDeviceType::test_sync_warning
+          mode: skip  # skip: CUDA-only test (torch.cuda sync debug mode), not applicable to Spyre
+        # float32 -> int64 host copy: Unsupported DCI data format conversion. https://github.com/torch-spyre/torch-spyre/issues/6273
+        - names:
+            - TestDevicePrecision::test_copy_noncontig  # issue 6273
+          mode: xfail  # xfail: RuntimeError: Unsupported DCI data format conversion: src=1 dst=12 (float32 -> int64)
+        # complex64 is not supported on Spyre; the test builds a complex64 input.
+        - names:
+            - TestTorchDeviceType::test_gradient_type_promotion
+          mode: skip  # skip: complex dtypes are not supported on Spyre
+        # H2D copy into a broadcast target: Invalid device sizes for host sizes. https://github.com/torch-spyre/torch-spyre/issues/6200
+        # TestTorch::test_copy_broadcast has the same base name and shares this entry; it is
+        # CPU-only and XPASSes (XFAIL is non-strict).
+        - names:
+            - TestDevicePrecision::test_copy_broadcast  # issue 6200
+          mode: xfail  # xfail: RuntimeError: Invalid device sizes for host sizes. Expected: 10 5, got: 5
+        # FlexAllocator OutOfMemory (RequestedBytes 60397977600). https://github.com/torch-spyre/torch-spyre/issues/6201
+        - names:
+            - TestTorchDeviceType::test_int64_upsample3d  # issue 6201
+          mode: xfail  # xfail: INTL::FLEXALLOCATOR::OutOfMemory
+        # The compiled aten.eq.Tensor_out kernel re-enters itself. https://github.com/torch-spyre/torch-spyre/issues/6202
+        - names:
+            - TestTorchDeviceType::test_strides_propagation  # issue 6202
+          mode: xfail  # xfail: the compiled Spyre kernel for aten.eq.Tensor_out re-entered itself
+        # Each fn parametrization fails differently, so the test is one entry:
+        #   add, div, max, min, mul, sub: assertEqual -> aten::isnan (https://github.com/torch-spyre/torch-spyre/issues/1738)
+        #   masked_fill: assertEqual -> aten::isnan (https://github.com/torch-spyre/torch-spyre/issues/1738)
+        #   remainder: aten::remainder.Tensor_out (https://github.com/torch-spyre/torch-spyre/issues/4416)
+        #   masked_select: aten::masked_select (https://github.com/torch-spyre/torch-spyre/issues/4371)
+        #   masked_scatter: masked_scatter needs a mask broadcast along the last dim (https://github.com/torch-spyre/torch-spyre/issues/4437)
+        #   eq, ge, gt, le, lt, ne: bitwise_and() got an unexpected keyword argument 'out'. https://github.com/torch-spyre/torch-spyre/issues/6190
+        #   addcdiv, addcmul, atan2, fmod, lerp: aten::<op>.out not registered. https://github.com/torch-spyre/torch-spyre/issues/6190
+        #   dist: aten::norm.out not registered. https://github.com/torch-spyre/torch-spyre/issues/6133
+        #   copy: copy_from_d2d expect_true failed (broadcast source). https://github.com/torch-spyre/torch-spyre/issues/6200
+        #   map, map2: only implemented on CPU tensors (same on CUDA, so not a Spyre defect)
+        #   pow: sdsc_fused_pow contains unimplemented operation pow. https://github.com/torch-spyre/torch-spyre/issues/3179
+        # The runner picks an entry by dtype, so one fn cannot be split off.
+        - names:
+            - TestTorchDeviceType::test_broadcast  # see comment
+          mode: xfail  # xfail: per fn, see comment above
+        - names:
             - TestTorchDeviceType::test_pickle_gradscaler
-            - TestTorchDeviceType::test_repeat_interleave
-            - TestTorchDeviceType::test_strides_propagation
-            - TestTorchDeviceType::test_tolist_with_grad
-          mode: skip  # xfail: torch._inductor.exc.InductorError
-        # These tests exercise the `empty` operation across various dtypes, including unsupported ones like `bfloat16` and `int64`.
-        # They are classified as `xfail` due to Spyre's lack of support for certain dtypes and operations like `aten::isnan`.
-        # Relevant Spyre limitations include unsupported dtypes and operations, as well as handling of large constants.
-        - names:
-            - TestTorchDeviceType::test_deterministic_empty
-          mode: skip  # xfail: NotImplementedError, torch._inductor.exc.InductorError
-        # These tests exercise deterministic resizing across various dtypes, including bfloat16, bool, float16, float32, and int64.
-        # They are classified as xfail due to the Spyre backend's lack of support for the 'aten::set_.source_Storage' operator.
-        # The primary limitation is the unimplemented operator, affecting dtype-specific tensor manipulations.
-        - names:
-            - TestTorchDeviceType::test_deterministic_resize
-          mode: skip  # xfail: NotImplementedError
-        # These tests exercise tensor creation from storage across various dtypes.
-        # They are classified as xfail due to missing support for 'aten::random_.from' and shape determination issues.
-        # Relevant Spyre limitations include incomplete support for certain tensor operations and dtype-specific errors.
-        - names:
-            - TestTorchDeviceType::test_tensor_from_storage
-          mode: skip  # xfail: NotImplementedError, ValueError
-        # These tests verify tensor storage types across various dtypes, including unsupported ones like int64.
-        # They are classified as xfail due to Spyre's lack of support for certain dtypes and ops, causing AssertionErrors and NotImplementedErrors.
-        # The primary limitation is Spyre's incomplete support for all dtypes and ops required by PyTorch's tensor storage tests.
-        - names:
-            - TestTorchDeviceType::test_tensor_storage_type
-          mode: skip  # xfail: AssertionError, NotImplementedError
-        # These tests verify the behavior of typed storage metadata across various dtypes.
-        # They are classified as xfail due to consistent AssertionErrors indicating discrepancies in storage size.
-        # The relevant Spyre limitation is the inability to accurately compute storage metadata for certain dtypes.
-        - names:
-            - TestTorchDeviceType::test_typed_storage_meta
-          mode: skip  # xfail: AssertionError
+          mode: mandatory_success
         - names:
             - TestDevicePrecision::test_multidevice_serialization
             - TestDevicePrecision::test_type_conversions_same_device
@@ -328,7 +634,6 @@ test_suite_config:
             - TestTorchDeviceType::test_grad_scaling_unscale
             - TestTorchDeviceType::test_lognormal_kstest
             - TestTorchDeviceType::test_masked_fill
-            - TestTorchDeviceType::test_masked_scatter_large_tensor
             - TestTorchDeviceType::test_memory_format_cpu_and_cuda_ops
             - TestTorchDeviceType::test_module_share_memory
             - TestTorchDeviceType::test_multinomial_cpu
@@ -338,7 +643,6 @@ test_suite_config:
             - TestTorchDeviceType::test_normal_kstest
             - TestTorchDeviceType::test_nullary_op_mem_overlap
             - TestTorchDeviceType::test_pin_memory_from_constructor
-            - TestTorchDeviceType::test_scatter_zero_size_index
             - TestTorchDeviceType::test_serialization
             - TestTorchDeviceType::test_set_default_tensor_type_warnings
             - TestTorchDeviceType::test_skip_xla
@@ -371,7 +675,6 @@ test_suite_config:
             - TestTorch::test_conj_neg_tolist
             - TestTorch::test_conj_physical_meta_stride
             - TestTorch::test_contains
-            - TestTorch::test_copy_broadcast
             - TestTorch::test_copy_dtypes
             - TestTorch::test_copy_float16
             - TestTorch::test_copy_many_to_one
@@ -404,10 +707,6 @@ test_suite_config:
             - TestTorch::test_get_cpu_capability
             - TestTorch::test_has_internal_overlap
             - TestTorch::test_has_storage
-            - TestTorch::test_index_add
-            - TestTorch::test_index_add_all_dtypes
-            - TestTorch::test_index_add_cornercase
-            - TestTorch::test_index_add_correctness
             - TestTorch::test_invalid_arg_error_handling
             - TestTorch::test_invalid_generator_raises
             - TestTorch::test_is_nonzero
@@ -550,6 +849,21 @@ test_suite_config:
       - name: float16
       - name: float32
       - name: int64
+      # -----------------------------------------------------------------------
+      # Excluded dtypes — present in upstream @dtypes but NOT yet supported on Spyre.
+      # Applies to indirect access tests that use all_types_and_complex_and(...):
+      #   test_take, test_put, test_put_accumulate, test_masked_scatter,
+      #   test_masked_select, test_scatter_reduce_non_unique_index,
+      #   test_scatter_reduce_operations_to_large_input, test_scatter_reduce_scalar,
+      #   test_scatter_add_one_dim_deterministic (torch.int = int32 excluded)
+      # -----------------------------------------------------------------------
+      # - name: float64    # reason: Spyre maximum floating-point precision is float32.
+      # - name: int8       # reason: 8-bit integer ops not supported on Spyre.
+      # - name: int16      # reason: 16-bit integer ops not supported on Spyre.
+      # - name: int32      # reason: 32-bit integer ops not supported on Spyre.
+      # - name: uint8      # reason: unsigned integer ops not supported on Spyre.
+      # - name: complex64  # reason: complex arithmetic not supported on Spyre.
+      # - name: complex128 # reason: complex arithmetic not supported on Spyre.
     supported_ops:
       - name: _scaled_dot_product_fused_attention_overrideable
         dtypes:
