@@ -141,12 +141,39 @@ def install_missing_buf_debug() -> None:
     Scheduler.compute_ancestors = compute_ancestors
 
 
+def install_removed_buffer_trace(name: str) -> None:
+    """Print the call stack at the moment `name` is added to the graph's
+    removed_buffers, which names the pass that removed it."""
+    import traceback
+
+    from torch._inductor.virtualized import V
+    from torch.utils._ordered_set import OrderedSet
+
+    orig_add = OrderedSet.add
+
+    def add(self, elem):
+        if elem == name:
+            try:
+                is_removed = self is V.graph.removed_buffers
+            except Exception:
+                is_removed = False
+            if is_removed:
+                print(f"[trace-removed] {name} added to removed_buffers by:",
+                      file=sys.stderr, flush=True)  # fmt: skip
+                traceback.print_stack(limit=8, file=sys.stderr)
+        return orig_add(self, elem)
+
+    OrderedSet.add = add
+
+
 def measure(args) -> dict:
     import torch
     import torch_spyre  # noqa: F401
 
     if args.debug_missing_buf:
         install_missing_buf_debug()
+    if args.trace_removed:
+        install_removed_buffer_trace(args.trace_removed)
 
     dtype = getattr(torch, args.dtype)
     torch.manual_seed(0)
@@ -349,6 +376,12 @@ def main() -> None:
         action="store_true",
         help="with --worker: on KeyError 'bufN' in compute_ancestors, print who "
         "reads the missing buffer",
+    )
+    p.add_argument(
+        "--trace-removed",
+        metavar="BUF",
+        help="with --worker: print the call stack when BUF (e.g. buf9) is added "
+        "to removed_buffers",
     )
     p.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = p.parse_args()
