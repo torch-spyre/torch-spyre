@@ -38,12 +38,16 @@ import sympy
 
 from torch_spyre._inductor.cost_model import (
     ArgTraffic,
+    CostParams,
     OpFeatures,
     _loop_reread_bytes,
+    _lx_spill_bw_derate,
+    _select,
     op_from_dict,
     predict_by_bundle,
     predict_ops,
 )
+from torch_spyre._inductor.scratchpad.allocator import _COST_PARAMS
 from torch_spyre._inductor.scratchpad.plan_solver import CoreDivision
 from torch_spyre._inductor.scratchpad.sa_cooptimizer import _work_slices
 
@@ -202,6 +206,23 @@ class DiscriminationTest(TestCase):
                 )
 
 
+#: The default model with the tile-height derates neutralized as the solver's
+#: ``_COST_PARAMS`` neutralizes them.
+_DERATES_OFF = dataclasses.replace(
+    CostParams(),
+    **{
+        name: getattr(_COST_PARAMS, name)
+        for name in (
+            "coarse_underfill_exp",
+            "coarse_underfill_col_exp",
+            "coarse_underfill_cap",
+            "lx_spill_exp",
+            "mm_spill_ws_exp",
+        )
+    },
+)
+
+
 class SymbolicTiledFeatureTest(TestCase):
     """Coarse-tiled features carrying the co-optimizer's UNDECIDED symbols.
 
@@ -267,7 +288,7 @@ class SymbolicTiledFeatureTest(TestCase):
                     continue
                 op = self._symbolize(op_from_dict(raw))
                 # The bug: this raised TypeError rather than returning anything.
-                expr = sympy.sympify(predict_ops([op]))
+                expr = sympy.sympify(predict_ops([op], _DERATES_OFF))
                 self.assertFalse(
                     self._leaked_symbols(expr),
                     f"{gname}/{bname}: a non-residency symbol leaked into the cost "
@@ -288,7 +309,9 @@ class SymbolicTiledFeatureTest(TestCase):
             raw = next((f for f in b["features"] if f is not None), None)
             if raw is None:
                 continue
-            expr = sympy.sympify(predict_ops([self._symbolize(op_from_dict(raw))]))
+            expr = sympy.sympify(
+                predict_ops([self._symbolize(op_from_dict(raw))], _DERATES_OFF)
+            )
             self.assertFalse(expr.atoms(sympy.Piecewise))
             for pow_ in expr.atoms(sympy.Pow):
                 self.assertEqual(pow_.exp, -1, f"non-invertible power {pow_}")
@@ -381,7 +404,7 @@ class SymbolicTiledFeatureTest(TestCase):
         )
 
     def test_a_working_set_with_symbolic_cols_does_not_break_the_spill_gate(self):
-        """``_lx_spill_working_set`` multiplies ``rpc * _op_cols(o)``; a
+        """``_lx_spill_bw_derate`` multiplies ``rpc * _op_cols(o)``; a
         symbolic ``rpc`` is a solver variable it keeps, but ``_op_cols`` -- an
         arg's own LOGICAL row width, e.g. a dynamic-shape symbol, NOT a
         co-optimizer variable -- was not guarded. ``_lx_spill_bw_derate`` then
@@ -449,7 +472,9 @@ class SymbolicTiledFeatureTest(TestCase):
         with patch(
             "torch_spyre._inductor.fusion.estimate_bundles", return_value=[fake_ops]
         ):
-            expr = sympy.sympify(predict_by_bundle(fake_ops, features_by_buffer))
+            expr = sympy.sympify(
+                predict_by_bundle(fake_ops, features_by_buffer, _DERATES_OFF)
+            )
         self.assertFalse(
             self._leaked_symbols(expr),
             "a non-residency symbol leaked into the bundle-level cost",
@@ -748,6 +773,78 @@ class SymbolicTileCountCostTest(TestCase):
             ],
         )
         self.assertEqual(_reduction_rows(op), 256)
+
+
+def _may_be_zero(expr) -> bool:
+    """Whether a Min/Max/Piecewise operand or a factor of ``expr`` is zero: what a
+    negative power pushed through it would turn into a pole."""
+    if isinstance(expr, (sympy.Min, sympy.Max)) or expr.is_Mul:
+        return any(_may_be_zero(a) for a in expr.args)
+    if isinstance(expr, sympy.Piecewise):
+        return any(_may_be_zero(value) for value, _ in expr.args)
+    return bool(expr.is_zero)
+
+
+class TestCoarseTilingDerateForms(TestCase):
+    """The coarse-tiling derates at their ``CostParams`` defaults, over a symbolic
+    tiling: equal to the numeric derates at every candidate, with an untiled op's
+    zero tile height kept out of every power."""
+
+    ROWS, COLS = 4096, 1024
+
+    def _op(self, tiled, rpc, trip=1):
+        return OpFeatures(
+            name="softmax",
+            loop_trip=trip,
+            is_reduction=False,
+            out_elems=self.ROWS * self.COLS,
+            cores=32,
+            dtype_bytes=2,
+            tiles_output_dim=tiled,
+            tile_rows_per_core=rpc,
+            args=[
+                ArgTraffic("out0", "output", False, self.ROWS * self.COLS),
+                ArgTraffic(
+                    "in0",
+                    "input",
+                    False,
+                    self.ROWS * self.COLS,
+                    logical=[self.ROWS, self.COLS],
+                ),
+            ],
+        )
+
+    def test_the_symbolic_derates_match_the_numeric_ones(self):
+        split, tile = sympy.symbols("split_x tile_x", integer=True, positive=True)
+        flag = sympy.Gt(tile, 1)
+        params = CostParams()
+        expr = sympy.sympify(
+            predict_ops(
+                [self._op(flag, _select(flag, self.ROWS / (split * tile), 0.0), tile)],
+                params,
+            )
+        )
+        for n in sympy.preorder_traversal(expr):
+            if n.is_Pow and n.exp.is_Number and n.exp < 0:
+                self.assertFalse(_may_be_zero(n.base), f"a zero under {n}")
+        for s, t in ((1, 1), (1, 2), (2, 4), (8, 2), (4, 64), (32, 16)):
+            with self.subTest(split=s, tile=t):
+                rpc = self.ROWS / (s * t) if t > 1 else 0.0
+                want = predict_ops([self._op(t > 1, rpc, t)], params)
+                got = float(expr.subs({split: s, tile: t}))
+                self.assertAlmostEqual(got, want, delta=1e-9 * want)
+
+    def test_the_spill_derate_is_that_of_the_largest_working_set(self):
+        # cap**exp / max(ws**exp, cap**exp) over the bundle's largest working
+        # set, an untiled op counting as none.
+        params = CostParams()
+        ops = [self._op(True, 4.0), self._op(True, 64.0), self._op(False, 0.0)]
+        ws = 2.0 * 64.0 * self.COLS * 2
+        cap, exp = params.lx_spill_cap_bytes, params.lx_spill_exp
+        self.assertAlmostEqual(
+            _lx_spill_bw_derate(ops, params), cap**exp / max(ws**exp, cap**exp)
+        )
+        self.assertEqual(_lx_spill_bw_derate(ops[2:], params), 1.0)
 
 
 if __name__ == "__main__":
