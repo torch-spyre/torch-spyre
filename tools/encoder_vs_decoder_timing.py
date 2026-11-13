@@ -107,9 +107,46 @@ def build_model(layers: int):
     return Stack().eval()
 
 
+def install_missing_buf_debug() -> None:
+    """On KeyError in Scheduler.compute_ancestors, say who reads the missing
+    buffer and whether anything produces or removed it. Installed before the
+    compile, so spyre's own per-compile wrapper sits on top of this one."""
+    from torch._inductor.scheduler import Scheduler
+    from torch._inductor.virtualized import V
+
+    orig = Scheduler.compute_ancestors
+
+    def compute_ancestors(self):
+        try:
+            return orig(self)
+        except KeyError as e:
+            missing = e.args[0]
+            w = lambda *a: print("[debug-missing-buf]", *a, file=sys.stderr, flush=True)  # noqa: E731
+            w("missing buffer:", missing)
+            w("  in graph.removed_buffers:", missing in V.graph.removed_buffers)
+            w("  in graph.name_to_buffer :", missing in V.graph.name_to_buffer)
+            w("  in scheduler.name_to_buf:", missing in self.name_to_buf)
+            for n in self.nodes:
+                reads = {d.name for d in n.read_writes.reads}
+                if missing in reads:
+                    w(f"  READ BY {n.get_name()} ({type(n.node).__name__}):")
+                    w("    all reads:", sorted(reads))
+                    w("    writes   :", sorted(d.name for d in n.read_writes.writes))
+                    w("    origins  :", [str(o) for o in list(n.node.origins)[:5]])
+                if missing in {d.name for d in n.read_writes.writes}:
+                    w(f"  WRITTEN BY {n.get_name()}")
+            w("  buffers the scheduler knows:", sorted(self.name_to_buf)[:40])
+            raise
+
+    Scheduler.compute_ancestors = compute_ancestors
+
+
 def measure(args) -> dict:
     import torch
     import torch_spyre  # noqa: F401
+
+    if args.debug_missing_buf:
+        install_missing_buf_debug()
 
     dtype = getattr(torch, args.dtype)
     torch.manual_seed(0)
@@ -306,6 +343,12 @@ def main() -> None:
         type=int,
         default=3,
         help="alternating 2-stream/3-stream rounds (order flips each round)",
+    )
+    p.add_argument(
+        "--debug-missing-buf",
+        action="store_true",
+        help="with --worker: on KeyError 'bufN' in compute_ancestors, print who "
+        "reads the missing buffer",
     )
     p.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = p.parse_args()
