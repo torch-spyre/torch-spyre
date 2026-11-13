@@ -166,12 +166,18 @@ def _compact_broadcast_device_dims(stl: SpyreTensorLayout) -> SpyreTensorLayout:
 
     The generic layout constructor retains a broadcast dimension's logical
     extent in ``device_size`` even though its zero ``stride_map`` makes every
-    access land at coordinate zero.  That is useful for host transfers, which
-    materialize expanded tensors, but it needlessly multiplies the allocation
+    access land at coordinate zero.  That needlessly multiplies the allocation
     and span of compiler-generated overlapping buffers such as coarse-tile read
     copies.  Collapse every such non-stick device dimension to one.  The final
-    device dimension remains a full hardware stick; making its stride sparse is
+    device dimension remains a full hardware stick; making its stride zero is
     enough to represent a broadcast stick.
+
+    Only collapses dimensions whose ``device_size > 1``: a dimension already at
+    size 1 needs no rebuild.  This matters for the elided size-1 stride-0
+    dimension, which compaction would otherwise rewrite, making the resulting
+    layout depend on pass order.  It does not protect the padding gap
+    dimension (size 64): that one is safe only because the restickify/clone
+    path returns via ``_clone_layout`` before this pass runs.
     """
     device_size = list(stl.device_size)
     stride_map = list(stl.stride_map)
@@ -179,10 +185,9 @@ def _compact_broadcast_device_dims(stl: SpyreTensorLayout) -> SpyreTensorLayout:
     for dim, stride in enumerate(stride_map):
         if stride != 0:
             continue
-        stride_map[dim] = -1
-        if dim != len(device_size) - 1:
+        if dim != len(device_size) - 1 and device_size[dim] != 1:
             device_size[dim] = 1
-        changed = True
+            changed = True
     if not changed:
         return stl
     return SpyreTensorLayout(
@@ -454,7 +459,41 @@ def _convert_reads_whole_input(
     )
 
 
-def _qfp8ch_stl(stl: SpyreTensorLayout, out_dtype: torch.dtype) -> SpyreTensorLayout:
+def _qfp8ch_count_dim(stl: SpyreTensorLayout, coords: list[sympy.Expr]) -> int | None:
+    """Device dim counting the input's sticks; None if there is none to rescale.
+
+    A non-stick dim whose coordinate uses the stick variable is the count dim.
+    Otherwise the count is 1: the lone size-1, coordinate-0 dim. Raises
+    ``Unsupported`` when neither identifies one dim.
+    """
+    in_eps = stl.device_size[-1]
+    stick_syms = coords[-1].free_symbols
+    dims = range(len(stl.device_size) - 1)
+    uses_stick = [i for i in dims if coords[i].free_symbols & stick_syms]
+    if uses_stick:
+        if len(uses_stick) == 1 and stl.stride_map[uses_stick[0]] == in_eps:
+            return uses_stick[0]
+    else:
+        ones = [
+            i
+            for i in dims
+            if coords[i] == 0
+            and stl.device_size[i] == 1
+            and stl.stride_map[i] in (in_eps, -1)
+        ]
+        if len(ones) == 1:
+            return ones[0]
+        if not ones and not any(stl.stride_map[i] == in_eps for i in dims):
+            return None
+    raise Unsupported(
+        f"qfp8ch: no stick-count dim in device_size {list(stl.device_size)}, "
+        f"stride_map {list(stl.stride_map)}, coordinates {coords}"
+    )
+
+
+def _qfp8ch_stl(
+    stl: SpyreTensorLayout, out_dtype: torch.dtype, coords: list[sympy.Expr]
+) -> SpyreTensorLayout:
     """Output layout of ``qfp8ch``: fp16 (64/stick) -> fp8 (128/stick) quantization.
 
     Propagates the input device layout, preserving any padding, and rescales
@@ -465,17 +504,19 @@ def _qfp8ch_stl(stl: SpyreTensorLayout, out_dtype: torch.dtype) -> SpyreTensorLa
     conversion that consumes it rebuilds a dense layout from the host size,
     treating the partial stick exactly like any other unaligned stick dim --
     so it must never floor to a size-0 dim (issue #3604).
+
+    ``coords`` are the input's device coordinates; they pick the count dim.
     """
     in_eps = stl.device_size[-1]
     out_eps = get_elem_in_stick(out_dtype)
     out_device_size = list(stl.device_size)
     out_stride_map = list(stl.stride_map)
     out_device_size[-1] = out_eps
-    for i, s in enumerate(stl.stride_map):
-        if s == in_eps:
-            out_device_size[i] = -(-(stl.device_size[i] * in_eps) // out_eps)
-            out_stride_map[i] = out_eps
-            break
+    i = _qfp8ch_count_dim(stl, coords)
+    # A broadcast count dim (stride -1) keeps its stride.
+    if i is not None and stl.stride_map[i] == in_eps:
+        out_device_size[i] = -(-(stl.device_size[i] * in_eps) // out_eps)
+        out_stride_map[i] = out_eps
     return SpyreTensorLayout(
         out_device_size,
         out_stride_map,
@@ -852,7 +893,14 @@ def _single_arg_op_layout(
             # preserving any padding present in the input STL. Not
             # rescale_stl_for_dtype: an fp16 tensor with an odd stick count
             # ends in a partially filled fp8 stick, which that helper rejects.
-            return [_qfp8ch_stl(stl, output.dtype)]
+            coords = try_device_coordinates(stl, dep, None)
+            if coords is None:
+                return []
+            try:
+                return [_qfp8ch_stl(stl, output.dtype, coords)]
+            except Unsupported:
+                # Drop this candidate; the others stay available.
+                return []
 
         case spyreop.qfp8wt.default:
             # fp16 -> fp8 weight quantization with 2D-stick layout [2, 64].
@@ -1710,7 +1758,7 @@ def _broadcast_split(
 ) -> tuple[list[SpyreTensorLayout], list[SpyreTensorLayout]]:
     """Partition arg.layouts into (broadcast, non_broadcast) candidates.
 
-    A stick is a broadcast when stride_map[-1] == -1 (sparse last device dim).
+    A stick is a broadcast when stride_map[-1] == 0 (sparse last device dim).
     Scalars (0-d layout) are always broadcastable.
     """
     if len(arg.layout.size) == 0:
@@ -1718,7 +1766,7 @@ def _broadcast_split(
     broadcast: list[SpyreTensorLayout] = []
     non_broadcast: list[SpyreTensorLayout] = []
     for stl in arg.layouts:
-        (broadcast if stl.stride_map[-1] == -1 else non_broadcast).append(stl)
+        (broadcast if stl.stride_map[-1] == 0 else non_broadcast).append(stl)
     return broadcast, non_broadcast
 
 
@@ -1772,7 +1820,7 @@ def _resolve_pointwise_ea(ea_args: list[PropArg]) -> ElementArrangement:
     # A device *stick* is a broadcast (carries at most one distinct host
     # element) exactly when it maps to a size-1 / sparse host axis. In an STL
     # the stick is the last device dim and the layout constructor
-    # (spyre_tensor_impl.cpp) sets `stride_map[-1] == -1` precisely in that
+    # (spyre_tensor_impl.cpp) sets `stride_map[-1] == 0` precisely in that
     # case. This is the correct, dim_order-independent test — reading
     # `arg.layout.size[-1]` only works under an identity dim_order (e.g. host
     # size [1, 64, 1] with the stick on a size-1 axis that is not last would
@@ -1819,7 +1867,7 @@ def _resolve_pointwise_ea(ea_args: list[PropArg]) -> ElementArrangement:
         #
         # ElementArrangement changes only the order of elements *within* a
         # stick. Every candidate retained here has a sparse stick
-        # (stride_map[-1] == -1), so all its logical loads address the same
+        # (stride_map[-1] == 0), so all its logical loads address the same
         # within-stick element and the stagger is unobservable. Its outer
         # device geometry may still be noncanonical (dtype conversion keeps
         # its producer's geometry); that geometry remains on the input and
