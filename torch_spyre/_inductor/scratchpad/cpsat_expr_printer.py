@@ -27,6 +27,7 @@ from __future__ import annotations
 
 from collections import Counter
 import functools
+import itertools
 import logging
 import math
 import operator
@@ -38,6 +39,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 import sympy
 from sympy.printing.printer import Printer
+
+from torch_spyre._inductor import config
 
 if TYPE_CHECKING:
     from ortools.sat.python import cp_model, cp_model_helper
@@ -278,6 +281,8 @@ class _SympyExprToCpSat(Printer):
         self._division_table_cache: dict = {}
         self._term_values_cache: dict = {}
         self._term_table_cache: dict = {}
+        # Points a term table may span over several decisions.
+        self._max_table_entries = config.cpsat_max_table_entries
         super().__init__()
 
     def _print(self, expr, **kwargs):
@@ -420,8 +425,9 @@ class _SympyExprToCpSat(Printer):
         """Return the CP-SAT expression equivalent to ``cost_expr`` under
         ``sym_map`` (``sympy symbol -> CP-SAT var``).
 
-        A term that reads a single enumerated decision is evaluated as written
-        at each of its values and handed to CP-SAT as one table
+        A term that reads only enumerated decisions, at most
+        ``config.cpsat_max_table_entries`` points of them jointly, is evaluated
+        as written at each point and handed to CP-SAT as one table
         (:meth:`_term_table`). Only the remaining terms are rewritten and
         printed."""
         logger.debug("[CP-SAT layout solver] cost expr (raw): %s", cost_expr)
@@ -457,42 +463,95 @@ class _SympyExprToCpSat(Printer):
         return None
 
     def _term_table(self, term):
-        """``term`` as one table when every symbol it reads is the same
-        enumerated decision and every node in it is one :data:`_TABLE_OPS`
-        evaluates: an ``element`` lookup of a division, or ``f(0) + (f(1) -
-        f(0)) * lit`` for a literal. None otherwise, or when an entry is not
+        """``term`` as one table when every symbol it reads is an enumerated
+        decision, every node in it is one :data:`_TABLE_OPS` evaluates, and its
+        decisions span at most ``max_table_entries`` points jointly (one
+        decision any size): ``f(0) + (f(1) - f(0)) * lit`` for one literal
+        alone, an ``element`` lookup of the divisions' row-major index, and
+        with literals one such lookup per assignment of them, gated on it
+        (:meth:`_gated_term_tables`). None otherwise, or when an entry is not
         finite."""
         if not term.free_symbols or not self._evaluable(term):
             return None
-        columns = {}
-        decision = None
+        found = {}
         for symbol in term.free_symbols:
-            found = self._decision(symbol)
-            if found is None:
+            found[symbol] = self._decision(symbol)
+            if found[symbol] is None:
                 return None
-            var, values = found
-            if var is not None:
-                if decision is not None and decision.index != var.index:
-                    return None
-                decision = var
-            columns[symbol] = values
-        if decision is None:
+        decisions = {
+            var.index: (var, len(values))
+            for var, values in found.values()
+            if var is not None
+        }
+        if not decisions:
             return None
-        size = (
-            2
-            if decision.is_boolean
-            else len(next(v for v in columns.values() if np.ndim(v)))
-        )
+        axes = tuple(sorted(decisions))
+        shape = tuple(decisions[a][1] for a in axes)
+        if len(axes) > 1 and math.prod(shape) > self._max_table_entries:
+            return None
+        columns = {
+            symbol: values
+            if var is None
+            else np.reshape(
+                values, [n if a == var.index else 1 for a, n in zip(axes, shape)]
+            )
+            for symbol, (var, values) in found.items()
+        }
         with np.errstate(all="ignore"):
-            values = np.broadcast_to(self._term_values(term, columns), (size,))
-        values = values.astype(float)
+            values = np.broadcast_to(self._term_values(term, columns, axes), shape)
+        values = values.astype(float).ravel()
         if not np.isfinite(values).all():
             return None
         if (values == values[0]).all():
             return _number(values[0])
-        if decision.is_boolean:
-            return _number(values[0]) + _number(values[1] - values[0]) * decision
-        return self._term_lookup(decision, values)
+        variables = [decisions[a][0] for a in axes]
+        if len(variables) == 1 and variables[0].is_boolean:
+            return _number(values[0]) + _number(values[1] - values[0]) * variables[0]
+        if any(v.is_boolean for v in variables):
+            return self._gated_term_tables(variables, shape, values)
+        return self._term_lookup(variables, shape, values)
+
+    def _gated_term_tables(self, variables, shape, values):
+        """A table over divisions and residency literals as one table over the
+        divisions per assignment of the literals, each gated on its assignment:
+        a variable equal to the table's level while the assignment holds and 0
+        otherwise. One lookup on an index that folds the literals in would be
+        exact too, but its relaxation lets a fractional literal pick any entry,
+        and the solve slows."""
+        grid = values.reshape(shape)
+        literals = [i for i, v in enumerate(variables) if v.is_boolean]
+        divisions = [i for i in range(len(variables)) if i not in literals]
+        result = 0
+        for bits in itertools.product((0, 1), repeat=len(literals)):
+            point = [slice(None)] * len(variables)
+            for i, bit in zip(literals, bits):
+                point[i] = bit
+            part = grid[tuple(point)].ravel()
+            lits = [
+                variables[i] if bit else variables[i].Not()
+                for i, bit in zip(literals, bits)
+            ]
+            gate = lits[0] if len(lits) == 1 else self._conjunction(lits)
+            holds = gate if isinstance(gate, cp_model.IntVar) else 1 - gate.Not()
+            if (part == part[0]).all():
+                result = result + _number(part[0]) * holds
+                continue
+            table = self._term_lookup(
+                [variables[i] for i in divisions],
+                tuple(shape[i] for i in divisions),
+                part,
+            )
+            flat = cp_model.FlatFloatExpr(table)
+            (level,), (coefficient,) = flat.vars, flat.coeffs
+            key = f"_term_gate_{level.index}_{gate.index}"
+            if key not in self._sym_map:
+                lb, ub = level.domain.min(), level.domain.max()
+                gated = self._model.new_int_var(min(0, lb), max(0, ub), key)
+                self._model.add(gated == level).only_enforce_if(gate)
+                self._model.add(gated == 0).only_enforce_if(gate.Not())
+                self._sym_map[key] = gated
+            result = result + coefficient * self._sym_map[key] + flat.offset * holds
+        return result
 
     @staticmethod
     def _evaluable(expr):
@@ -503,25 +562,30 @@ class _SympyExprToCpSat(Printer):
             return False
         return all(_SympyExprToCpSat._evaluable(arg) for arg in _table_operands(expr))
 
-    def _term_values(self, expr, columns):
-        """``expr`` at every value of its term's decision."""
+    def _term_values(self, expr, columns, axes):
+        """``expr`` at every point of its term's decisions ``axes``, one array
+        dimension per decision."""
         if expr.is_Symbol:
             return columns[expr]
         if expr.is_Number:
             return float(expr)
         if expr in (sympy.true, sympy.false):
             return bool(expr)
-        if expr not in self._term_values_cache:
-            operands = [self._term_values(a, columns) for a in _table_operands(expr)]
-            self._term_values_cache[expr] = _table_op(expr)(operands)
-        return self._term_values_cache[expr]
+        key = expr, axes
+        if key not in self._term_values_cache:
+            operands = [
+                self._term_values(a, columns, axes) for a in _table_operands(expr)
+            ]
+            self._term_values_cache[key] = _table_op(expr)(operands)
+        return self._term_values_cache[key]
 
-    def _term_lookup(self, division, values):
-        """One ``element`` lookup of ``division``, ``offset + coefficient *
-        level``: exact where the entries' common denominator keeps the levels
-        inside _MAX_PRODUCT_BOUND, else rounded against the entries' span. A
-        wider level, though it only enters the objective as a sum, leaves
-        CP-SAT's scaling of a float objective too coarse to tell plans apart."""
+    def _term_lookup(self, variables, shape, values):
+        """One ``element`` lookup of the decisions' row-major index, ``offset +
+        coefficient * level``: exact where the entries' common denominator keeps
+        the levels inside _MAX_PRODUCT_BOUND, else rounded against the entries'
+        span. A wider level, though it only enters the objective as a sum,
+        leaves CP-SAT's scaling of a float objective too coarse to tell plans
+        apart."""
         rationals = [Fraction(float(v)) for v in values]
         base = min(rationals)
         denominator = math.lcm(*(v.denominator for v in rationals))
@@ -533,14 +597,18 @@ class _SympyExprToCpSat(Printer):
             step = (max(rationals) - base) / _MAX_PRODUCT_BOUND
             table = tuple(round((v - base) / step) for v in rationals)
             coefficient = float(step)
-        key = division.index, table
+        key = tuple(v.index for v in variables), table
         if key not in self._term_table_cache:
-            var = self._model.new_int_var_from_domain(
+            index, stride = 0, 1
+            for var, size in zip(reversed(variables), reversed(shape)):
+                index = index + stride * var
+                stride *= size
+            level = self._model.new_int_var_from_domain(
                 cp_model.Domain.FromValues(table), f"term_table_{self._count}"
             )
             self._count += 1
-            self._model.add_element(division, table, var)
-            self._term_table_cache[key] = var
+            self._model.add_element(index, table, level)
+            self._term_table_cache[key] = level
         return coefficient * self._term_table_cache[key] + offset
 
     def _rewrite(self, cost_expr: sympy.Expr) -> sympy.Expr:

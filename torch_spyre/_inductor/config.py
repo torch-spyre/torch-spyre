@@ -484,6 +484,11 @@ auto_coarse_tiling: bool = os.environ.get("AUTO_COARSE_TILING", "0") == "1"
 
 # When symbolic cost_expr fails, use the fallback cost instead of erroring out
 _cpsat_warn_on_cost_expr: bool = True
+# Points a table of the CP-SAT cost objective may span over several decisions
+# (scratchpad/cpsat_expr_printer.py). A term over one decision is a table
+# whatever its size; a term over more points than this is rewritten and
+# printed instead. A solve-time knob, not a correctness one.
+cpsat_max_table_entries: int = 2**12
 # Enable persistent on-disk caching of compiled Spyre kernels across
 # invocations.
 # Set SPYRE_KERNEL_CACHE=0 to disable.

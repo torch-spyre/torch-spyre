@@ -2294,8 +2294,10 @@ class TestSympyExprToCpSatPrinter(TestCase):
             model.add_element(selectors[owner], raw, var)
             sym_map[name] = var
             buffer_map[name] = wrappers[owner], raw
-        printer = _SympyExprToCpSat(model, dict(sym_map), buffer_map)
-        conventional = _SympyExprToCpSat(model, dict(sym_map), buffer_map)
+        # Terms over several menus are printed, not taken as one table.
+        with config.patch({"cpsat_max_table_entries": 1}):
+            printer = _SympyExprToCpSat(model, dict(sym_map), buffer_map)
+            conventional = _SympyExprToCpSat(model, dict(sym_map), buffer_map)
         with mock.patch.object(conventional, "_division_table", return_value=None):
             expected = [conventional.convert(expr) for expr in expressions]
         actual = [printer.convert(expr) for expr in expressions]
@@ -2395,6 +2397,49 @@ class TestSympyExprToCpSatPrinter(TestCase):
                 self.assertAlmostEqual(
                     solver.float_value(lowered), float(term.subs(x, value))
                 )
+
+    def test_a_term_over_a_division_and_a_literal_is_a_gated_table_per_value(self):
+        x, resident = sympy.symbols("split_x resident", integer=True, positive=True)
+        menu = [1, 2, 4, 8]
+        # One term: a product, which convert() does not split.
+        term = (sympy.Max(512 / x, 96) + sympy.floor(30 / x) * resident) * (
+            2 - resident
+        )
+
+        def lower(limit):
+            model = cp_model.CpModel()
+            division = model.new_int_var(0, len(menu) - 1, "division")
+            var = model.new_int_var(1, 8, "split_x")
+            model.add_element(division, menu, var)
+            lit = model.new_bool_var("resident")
+            with config.patch({"cpsat_max_table_entries": limit}):
+                printer = _SympyExprToCpSat(
+                    model,
+                    {"split_x": var, "resident": lit},
+                    {"split_x": (types.SimpleNamespace(division=division), menu)},
+                )
+            lowered = printer.convert(term)
+            names = [v.name for v in model.proto.variables]
+            return model, division, lit, lowered, names
+
+        model, division, lit, lowered, names = lower(2 * len(menu))
+        # One table over the division per value of the literal, gated on it.
+        self.assertEqual(sum(n.startswith("term_table_") for n in names), 2, names)
+        self.assertEqual(sum(n.startswith("_term_gate_") for n in names), 2, names)
+        for (i, value), flag in itertools.product(enumerate(menu), (0, 1)):
+            with self.subTest(split=value, resident=flag):
+                fixed = model.clone()
+                fixed.add(division == i)
+                fixed.add(lit == flag)
+                solver = cp_model.CpSolver()
+                self.assertEqual(solver.solve(fixed), cp_model.OPTIMAL)
+                self.assertAlmostEqual(
+                    solver.float_value(lowered),
+                    float(term.subs({x: value, resident: flag})),
+                )
+        # Past the limit the term is rewritten and printed instead.
+        *_, names = lower(2 * len(menu) - 1)
+        self.assertFalse(any(n.startswith("term_table_") for n in names), names)
 
     def test_shared_load_penalty_lowers_for_product_degrees(self):
         from torch_spyre._inductor.work_division import _matmul_multicast_penalty
@@ -2741,7 +2786,9 @@ class TestSympyExprToCpSatPrinter(TestCase):
             expr = minmax(reads, writes)
             model = cp_model.CpModel()
             sym_map = {x.name: model.new_int_var(0, 1, x.name) for x in lits}
-            cp_expr = _SympyExprToCpSat(model, dict(sym_map), {}).convert(expr)
+            # Too wide to tabulate, as the cost model's turnaround term is.
+            with config.patch({"cpsat_max_table_entries": 1}):
+                cp_expr = _SympyExprToCpSat(model, dict(sym_map), {}).convert(expr)
             sizes = self._lin_max_operand_sizes(model)
             self.assertTrue(sizes)
             self.assertLessEqual(max(sizes), 1, sizes)
