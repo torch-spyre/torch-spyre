@@ -111,6 +111,14 @@ def power_of_two_scale(values, tolerance: float, limit: int, base: int = 1):
     return None
 
 
+def round_scaled(number: sympy.Number, scale: int) -> sympy.Integer:
+    """``number * scale`` rounded to the nearest integer (ties to even): exact
+    for a rational, in double precision for a float."""
+    if number.is_Rational:
+        return sympy.Integer(round(Fraction(int(number.p), int(number.q)) * scale))
+    return sympy.Integer(round(float(number) * scale))
+
+
 class _CurveTable(sympy.Function):
     """``table[i]`` where ``arg == values[i]``: a linearized power over one
     buffer's menu, at each value its argument takes. Its entries are the
@@ -217,27 +225,53 @@ class _LazyMax(sympy.Max):
         return super().__new__(cls, *args, **kwargs)
 
 
+class _LazyPiecewise(sympy.Piecewise):
+    """``Piecewise`` counterpart of :class:`_LazyMin`: built without
+    ``Piecewise.eval``, whose argument collapsing compares each condition with
+    the earlier ones through the same assumptions queries."""
+
+    def __new__(cls, *args, **kwargs):
+        kwargs["evaluate"] = False
+        return super().__new__(cls, *args, **kwargs)
+
+
 _LAZY = {sympy.Min: _LazyMin, sympy.Max: _LazyMax}
 
 
-def _lazy_minmax(expr: sympy.Expr) -> sympy.Expr:
-    """Rebuild every ``Min``/``Max`` node of ``expr`` as its lazy counterpart.
+def _lazy_form(expr: sympy.Expr, hide) -> sympy.Expr:
+    """``expr`` with floors dropped, every ``Min``/``Max``/``Piecewise`` rebuilt
+    as its lazy counterpart, and each ``Piecewise`` condition replaced by
+    ``hide(condition)``.
 
     A hand-rolled bottom-up rebuild rather than ``Basic.replace``: ``replace``
     reconstructs a node whose children changed with its ORIGINAL class before
     applying the substitution, so a ``Min`` nested inside a ``Max`` was
     canonicalized once more on the way up (13 s on the 304-op graph's
-    objective). Here a ``Min``/``Max`` is built lazy in the first place and
-    every other node is rebuilt only when a child actually changed."""
-    if not expr.args:
-        return expr
-    args = [_lazy_minmax(a) for a in expr.args]
-    lazy = _LAZY.get(type(expr))
-    if lazy is not None:
-        return lazy(*args)
-    if all(a is b for a, b in zip(args, expr.args)):
-        return expr
-    return expr.func(*args)
+    objective). Here a node is built lazy in the first place and every other
+    node is rebuilt only when a child actually changed."""
+    done: dict = {}
+
+    def walk(node):
+        if not node.args:
+            return node
+        if node not in done:
+            if node.func is sympy.floor:
+                done[node] = walk(node.args[0])
+            elif isinstance(node, sympy.Piecewise):
+                pairs = ((walk(v), hide(walk(c))) for v, c in node.args)
+                done[node] = _LazyPiecewise(*pairs)
+            else:
+                args = [walk(a) for a in node.args]
+                lazy = _LAZY.get(type(node))
+                if lazy is not None:
+                    done[node] = lazy(*args)
+                elif all(a is b for a, b in zip(args, node.args)):
+                    done[node] = node
+                else:
+                    done[node] = node.func(*args)
+        return done[node]
+
+    return walk(expr)
 
 
 class memoize_method:
@@ -275,6 +309,9 @@ class _SympyExprToCpSat(Printer):
         # Each linearized power -> its (symbol, exponent), so a product of one
         # buffer's powers can be merged into one curve (_merge_linearized).
         self._linearized: dict = {}
+        # Each Piecewise condition the rewrite hid (see _hide), both ways.
+        self._conditions: dict = {}
+        self._hidden: dict = {}
         self._sym_map = sym_map
         self._buffer_map = buffer_map
         self._allow_tables = True
@@ -309,6 +346,8 @@ class _SympyExprToCpSat(Printer):
         return self._candidate_cache[expr]
 
     def _evaluate_candidates(self, expr):
+        if expr in self._conditions:
+            return self._candidate_values(self._condition(expr))
         if isinstance(expr, _CurveTable):
             evaluated = self._candidate_values(expr.args[0])
             if evaluated is None:
@@ -447,18 +486,19 @@ class _SympyExprToCpSat(Printer):
         """The symbolic rewrites that bring ``cost_expr`` into the form the
         printer lowers: floors dropped, logs of Min/Max pushed inside, split
         logs and inverses replaced by table symbols, scalars pushed into
-        Min/Max/Piecewise, floats truncated. Min/Max are rebuilt lazily first
-        (see :class:`_LazyMin`)."""
-        cost_expr = _lazy_minmax(cost_expr)
+        Min/Max/Piecewise, floats truncated. Min/Max/Piecewise are rebuilt
+        lazily and conditions hidden first (see :meth:`_hide`).
+
+        Powers of a Min, Max, Piecewise or residency sum are pushed here, not
+        where they are printed: the pushed Min/Max is the derate factor
+        ``_push_into_byte_minmax`` multiplies into the byte Min, its operands
+        are what ``_integerize_minmax`` puts on an integer scale, and the
+        exponent each base form ends up with is the one ``_inv_log_sym``
+        linearizes."""
+        cost_expr = _lazy_form(cost_expr, self._hide)
         cost_expr = cost_expr.replace(
-            lambda e: e.func == sympy.floor,
-            lambda e: e.args[0],
-        )
-        cost_expr = sympy.expand(cost_expr)
-        cost_expr = cost_expr.replace(
-            lambda e: e.func in [sympy.log, sympy.Piecewise]
-            or self._is_pushed_power(e),
-            lambda e: self._piecewise_canonical(self._log_min(self._push_power(e))),
+            lambda e: e.func is sympy.log or self._is_pushed_power(e),
+            lambda e: self._log_min(self._push_power(e)),
         )
         cost_expr = sympy.expand(cost_expr)
         cost_expr = cost_expr.replace(
@@ -471,6 +511,25 @@ class _SympyExprToCpSat(Printer):
         )
         cost_expr = self._integerize_minmax(cost_expr)
         return cost_expr
+
+    def _hide(self, cond):
+        """A Piecewise condition as the symbol the rewrite carries in its place,
+        so the rewrite never rebuilds the condition or lowers a power inside
+        it; the printer canonicalizes it (:meth:`_condition`). A condition
+        with the same truth value at both values of its residency literal is
+        that value: a branch it rules out never reaches the Min/Max integer
+        scales."""
+        lit = self._residency_literal(cond)
+        if lit is not None:
+            off, on = (cond.subs(lit, value) for value in (0, 1))
+            if off == on:
+                cond = off
+        if cond in (sympy.true, sympy.false):
+            return cond
+        if cond not in self._hidden:
+            self._hidden[cond] = sympy.Symbol(f"_cond_{len(self._hidden)}")
+            self._conditions[self._hidden[cond]] = cond
+        return self._hidden[cond]
 
     @classmethod
     def _log_min(cls, expr):
@@ -775,7 +834,7 @@ class _SympyExprToCpSat(Printer):
             off, on = (power(base.subs(lit, value)) for value in (0, 1))
             return off + (on - off) * lit
         if base.is_Piecewise:
-            return sympy.Piecewise(*((power(v), c) for v, c in base.args))
+            return _LazyPiecewise(*((power(v), c) for v, c in base.args))
         is_min = isinstance(base, sympy.Min)
         func = _LazyMin if is_min == (exponent > 0) else _LazyMax
         return func(*(power(arg) for arg in base.args))
@@ -783,7 +842,7 @@ class _SympyExprToCpSat(Printer):
     @classmethod
     def _canonical_condition(cls, cond):
         """A branch condition with each ITE as And/Or, and each comparison of a
-        fractional power of a product of split or tile symbols against a number
+        fractional or negative power of a product of symbols against a number
         as the product's comparison against the matching bound."""
         if cond.has(ITE):
             cond = cond.replace(lambda e: isinstance(e, ITE), lambda e: e.to_nnf())
@@ -807,8 +866,9 @@ class _SympyExprToCpSat(Printer):
 
     @classmethod
     def _inverted_power_bound(cls, rel):
-        """``c * prod(s)**p <op> k`` as ``prod(s) <op'> (k / c)**(1 / p)``; None
-        for any other comparison."""
+        """``c * prod(s)**p <op> k`` as ``prod(s) <op'> (k / c)**(1 / p)``, for
+        nonnegative symbols ``s`` under a fractional or negative exponent ``p``;
+        None for any other comparison."""
         lhs, rhs, op = rel.lhs, rel.rhs, type(rel)
         if lhs.is_Number:
             lhs, rhs, op = rhs, lhs, _inv_rel_op.get(op)
@@ -820,43 +880,16 @@ class _SympyExprToCpSat(Printer):
         if coefficient <= 0 or rhs <= 0 or len(exponents) != 1:
             return None
         (exponent,) = exponents
-        if not exponent.is_Number or exponent.is_Integer:
+        if not exponent.is_Number or exponent.is_Integer and exponent > 0:
             return None
-        if not all(cls._is_split_sym(base) for base, _ in powers):
+        if not all(base.is_Symbol and base.is_nonnegative for base, _ in powers):
             return None
-        bound = sympy.Float((rhs / coefficient) ** (1 / exponent))
+        bound = (rhs / coefficient) ** (1 / exponent)
+        if not bound.is_Rational:
+            bound = sympy.Float(bound)
         op = op if exponent > 0 else _inv_rel_op[op]
         product = sympy.Mul(*(base for base, _ in powers))
         return cls._tighten_integer_bound(op, product, bound)
-
-    @classmethod
-    def _piecewise_canonical(cls, expr):
-        # re-write 1/x < 1/5 as x > 5, then tighten to an equivalent integer
-        # bound (e.g. x < 4/3 as x <= 1) when x is integer-valued and the
-        # bound is numeric.
-        if not expr.is_Piecewise:
-            return expr
-        args = []
-        for value, cond in expr.args:
-            cond = cls._canonical_condition(cond)
-            if (
-                cond.is_Relational
-                and cond.lhs.is_Pow
-                and cond.lhs.exp == -1
-                and cond.lhs.base.is_Symbol
-                and cond.lhs.base.is_nonnegative
-            ):
-                args.append(
-                    (
-                        value,
-                        cls._tighten_integer_bound(
-                            _inv_rel_op[cond.func], 1 / cond.lhs, 1 / cond.rhs
-                        ),
-                    )
-                )
-            else:
-                args.append((value, cond))
-        return expr.func(*args)
 
     @staticmethod
     def _tighten_integer_bound(rel_op, lhs, rhs):
@@ -1009,10 +1042,10 @@ class _SympyExprToCpSat(Printer):
                 values = (int(round(scale * float(v))) for v in table.args[2])
                 r = _CurveTable(table.args[0], table.args[1], sympy.Tuple(*values))
             elif isinstance(expr, sympy.Mul) and isinstance(expr.args[0], sympy.Number):
-                a = (expr.args[0] * m).round()
+                a = round_scaled(expr.args[0], m)
                 r = sympy.Mul(a, *expr.args[1:])
             elif isinstance(expr, sympy.Number):
-                r = (expr * m).round()
+                r = round_scaled(expr, m)
             else:
                 r = expr * m
             return r
@@ -1315,6 +1348,12 @@ class _SympyExprToCpSat(Printer):
         return self._print(expr.base) ** self._print(expr.exp)
 
     @memoize_method
+    def _condition(self, cond):
+        """A Piecewise condition, from behind the symbol the rewrite hid it
+        behind, in the form ``_print_condition`` lowers."""
+        return self._canonical_condition(self._conditions.get(cond, cond))
+
+    @memoize_method
     def _print_condition(self, cond):
         cond_expr = self._print(cond)
         if isinstance(cond_expr, (cp_model.IntVar, cp_model_helper.NotBooleanVariable)):
@@ -1366,6 +1405,7 @@ class _SympyExprToCpSat(Printer):
         result = 0
         none_prev = sympy.true  # no earlier condition held
         for val, cond in args:
+            cond = self._condition(cond)
             lit = _simplify_eq_conjunction(sympy.And(none_prev, cond))
             if lit == sympy.false:
                 continue
@@ -1376,6 +1416,10 @@ class _SympyExprToCpSat(Printer):
             result += self._print_multiply_two(piecewise_var, self._print(val))
             none_prev = sympy.And(none_prev, sympy.Not(cond))
         return result
+
+    def _print__LazyPiecewise(self, expr):
+        # The printer dispatches a renamed Function subclass on its own name.
+        return self._print_Piecewise(expr)
 
     def _print_Not(self, expr):
         return self._print_condition(expr.args[0]).Not()

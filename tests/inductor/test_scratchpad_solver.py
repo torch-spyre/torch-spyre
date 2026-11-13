@@ -57,11 +57,13 @@ try:
         _CORE_INV_SCALE,
         _MAX_PRODUCT_BOUND,
         _LINEARIZE_TOLERANCE,
+        _MINMAX_TOLERANCE,
         _QUANTIZE_TOLERANCE,
         _SympyExprToCpSat,
         _simplify_eq_conjunction,
         power_of_two_scale,
         ramer_douglas_peucker,
+        round_scaled,
     )
     from torch_spyre._inductor.scratchpad.ilp_solver_ortools import CpSatLayoutSolver
 
@@ -2374,6 +2376,63 @@ class TestSympyExprToCpSatPrinter(TestCase):
                 self.assertAlmostEqual(
                     solver.float_value(cp_expr), want, delta=1e-3 * want
                 )
+
+    def test_a_power_condition_selects_its_branch_exactly(self):
+        # Conditions are lowered where they are printed, never through a
+        # linearized power: products either side of the bound, within the
+        # curve's tolerance of it, still take their own branch.
+        menu = {"split_a": [1, 70, 71, 4, 83], "tile_a": [1, 71, 70, 1, 60]}
+        model, division, sym_map, buffer_map, (a, t) = self._one_buffer(menu)
+        sym_map["split_x"] = model.new_int_var(1, 32, "split_x")
+        x = sympy.Symbol("split_x", integer=True, positive=True)
+        expr = sympy.Piecewise(
+            (1000, 17.5 / (a * t) ** 0.5 >= 0.248), (10, True)
+        ) + sympy.Piecewise((1, 1 / x >= sympy.Rational(5, 64)), (2, True))
+        cp_expr = _SympyExprToCpSat(model, sym_map, buffer_map).convert(expr)
+        for i, s in itertools.product(range(len(menu["tile_a"])), (1, 12, 13, 32)):
+            with self.subTest(division=i, split_x=s):
+                fixed = model.clone()
+                fixed.add(division == i)
+                fixed.add(sym_map["split_x"] == s)
+                solver = cp_model.CpSolver()
+                self.assertEqual(solver.solve(fixed), cp_model.OPTIMAL)
+                values = {a: menu["split_a"][i], t: menu["tile_a"][i], x: s}
+                self.assertEqual(solver.value(cp_expr), int(expr.subs(values)))
+
+    def test_a_condition_true_at_both_residency_values_drops_its_branch(self):
+        # A tile height set by residency alone: the branch the condition rules
+        # out at both values never reaches the Min's integer scale.
+        model = cp_model.CpModel()
+        sym_map = {"is_lx_x": model.new_bool_var("is_lx_x")}
+        lx = sympy.Symbol("is_lx_x", integer=True, nonnegative=True)
+        rows = 14.2 * lx + 2.0
+        eff = sympy.Piecewise(
+            (sympy.Min(1.08, rows**0.5), rows**0.5 >= 0.248),
+            (0.285 * rows**0.05, True),
+        )
+        expr = 1e6 / sympy.Min(1.0, eff)
+        printer = _SympyExprToCpSat(model, sym_map, {})
+        self.assertFalse(printer._rewrite(expr).has(sympy.Piecewise))
+        cp_expr = printer.convert(expr)
+        for r in (0, 1):
+            with self.subTest(is_lx=r):
+                fixed = model.clone()
+                fixed.add(sym_map["is_lx_x"] == r)
+                solver = cp_model.CpSolver()
+                self.assertEqual(solver.solve(fixed), cp_model.OPTIMAL)
+                want = float(expr.subs(lx, r))
+                self.assertAlmostEqual(
+                    solver.float_value(cp_expr), want, delta=_MINMAX_TOLERANCE * want
+                )
+
+    def test_round_scaled_rounds_half_to_even_at_full_precision(self):
+        self.assertEqual(round_scaled(sympy.Rational(5, 2), 1), 2)
+        self.assertEqual(round_scaled(sympy.Rational(7, 2), 1), 4)
+        self.assertEqual(round_scaled(sympy.Float(0.1), 2**40), round(0.1 * 2**40))
+        self.assertEqual(
+            round_scaled(sympy.Float(8820.2702261091), 2**31),
+            round(8820.2702261091 * 2**31),
+        )
 
     def test_negated_and_unnamed_boolean_products_preserve_every_assignment(self):
         model = cp_model.CpModel()
