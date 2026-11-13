@@ -123,11 +123,31 @@ jobs:
               --event schedule --limit 1 --json databaseId \
               --jq '.[0].databaseId')"
           fi
+          # The dispatched matrix run embeds the caller's correlation id
+          # "(<callerRunId>-...)" in its run name; recover it for links and
+          # as the per-suite-XML fallback below.
+          MATRIX_RUN_ID="$(gh run list -R "${{ github.repository }}" \
+            --workflow _upstream_tests_beta_matrix.yaml \
+            --event workflow_dispatch --limit 100 \
+            --json databaseId,displayTitle \
+            --jq ".[] | select(.displayTitle | contains(\"(${RUN_ID}-\")) | .databaseId" \
+            | head -1)"
           ARTIFACT="$(gh api \
             "repos/${{ github.repository }}/actions/runs/${RUN_ID}/artifacts" \
             --jq '.artifacts[] | select(.name | startswith("upstream-beta-reports-")) | .name' \
             | head -1)"
-          if [ -z "${ARTIFACT}" ]; then
+          if [ -n "${ARTIFACT}" ]; then
+            # Preferred source: the merged bundle on the caller run.
+            XML_SOURCE="merged"
+            XML_RUN_ID="${RUN_ID}"
+          elif [ -n "${MATRIX_RUN_ID}" ]; then
+            # Merged bundle missing (never uploaded, or deleted): fall back
+            # to the matrix run's per-suite XML artifacts (90-day retention
+            # vs. the merged bundle's 30).
+            XML_SOURCE="matrix"
+            XML_RUN_ID="${MATRIX_RUN_ID}"
+            ARTIFACT="upstream-beta-reports-unknown"
+          else
             # Gate-rejected dispatch or build-failed run: nothing to triage.
             echo "has_failures=false" >> "${GITHUB_OUTPUT}"
             echo "No upstream-beta-reports artifact on run ${RUN_ID}; nothing to triage."
@@ -136,14 +156,6 @@ jobs:
           PYTORCH_SHA="${ARTIFACT#upstream-beta-reports-}"
           TORCH_SPYRE_SHA="$(gh run view "${RUN_ID}" -R "${{ github.repository }}" \
             --json headSha --jq .headSha)"
-          # The dispatched matrix run embeds the caller's correlation id
-          # "(<callerRunId>-...)" in its run name; recover it for links.
-          MATRIX_RUN_ID="$(gh run list -R "${{ github.repository }}" \
-            --workflow _upstream_tests_beta_matrix.yaml \
-            --event workflow_dispatch --limit 100 \
-            --json databaseId,displayTitle \
-            --jq ".[] | select(.displayTitle | contains(\"(${RUN_ID}-\")) | .databaseId" \
-            | head -1)"
           if [ -n "${WORKFLOW_RUN_URL}" ]; then
             RUN_URL="${WORKFLOW_RUN_URL}"
           else
@@ -151,6 +163,8 @@ jobs:
           fi
           {
             echo "run_id=${RUN_ID}"
+            echo "xml_source=${XML_SOURCE}"
+            echo "xml_run_id=${XML_RUN_ID}"
             echo "artifact_name=${ARTIFACT}"
             echo "pytorch_sha=${PYTORCH_SHA}"
             echo "torch_spyre_sha=${TORCH_SPYRE_SHA}"
@@ -162,24 +176,33 @@ jobs:
           fi
 
       - name: Checkout scripts
-        if: steps.resolve.outputs.artifact_name != ''
+        if: steps.resolve.outputs.xml_source != ''
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           sparse-checkout: .github/scripts
 
-      - name: Download merged JUnit reports
-        if: steps.resolve.outputs.artifact_name != ''
+      - name: Download JUnit reports
+        if: steps.resolve.outputs.xml_source != ''
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          python3 .github/scripts/download_run_xml_artifacts.py \
-            --repo "${{ github.repository }}" \
-            --run-id "${{ steps.resolve.outputs.run_id }}" \
-            --artifact-name "${{ steps.resolve.outputs.artifact_name }}" \
-            --output-dir xml_artifacts
+          if [ "${{ steps.resolve.outputs.xml_source }}" = "merged" ]; then
+            python3 .github/scripts/download_run_xml_artifacts.py \
+              --repo "${{ github.repository }}" \
+              --run-id "${{ steps.resolve.outputs.xml_run_id }}" \
+              --artifact-name "${{ steps.resolve.outputs.artifact_name }}" \
+              --output-dir xml_artifacts
+          else
+            # Per-suite artifacts on the dispatched matrix run (the merged
+            # bundle on the caller is missing).
+            python3 .github/scripts/download_run_xml_artifacts.py \
+              --repo "${{ github.repository }}" \
+              --run-id "${{ steps.resolve.outputs.xml_run_id }}" \
+              --output-dir xml_artifacts
+          fi
 
       - name: Install uv
-        if: steps.resolve.outputs.artifact_name != ''
+        if: steps.resolve.outputs.xml_source != ''
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           # latest-known, not "latest": see dependabot.yaml's comment.
@@ -187,7 +210,7 @@ jobs:
 
       - name: Detect failures
         id: detect
-        if: steps.resolve.outputs.artifact_name != ''
+        if: steps.resolve.outputs.xml_source != ''
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -203,7 +226,7 @@ jobs:
             --output-file failures.json
 
       - name: Upload triage inputs
-        if: steps.resolve.outputs.artifact_name != ''
+        if: steps.resolve.outputs.xml_source != ''
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: crcr-triage-inputs
