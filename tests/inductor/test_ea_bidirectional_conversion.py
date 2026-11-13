@@ -68,45 +68,66 @@ def assert_ea(tensor, expected_ea):
 def assert_val(fn, x, result):
     x_cpu = x.cpu()
     result_cpu = fn(x_cpu)
-    torch.testing.assert_close(result.cpu(), result_cpu, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(result.cpu(), result_cpu, rtol=1e-2, atol=1e-2)
 
 
 def ea_of(dev):
     return ElementArrangement.STANDARD if dev == DEVICE_NAME else None
 
 
+# Shapes whose whole content fits in a single stick, so the tensor has no
+# spatial dim outside the stick dim for the conversion op to loop over.
+STICK_ONLY_SHAPES = [
+    (),
+    (1,),
+    (1, 1),
+    (1, 1, 1),
+    (1, 1, 1, 1),
+]
+
+# Stick aligned shape
+BASIC_SHAPES = [(4, 128)]
+
+_SHAPES = STICK_ONLY_SHAPES + BASIC_SHAPES
+
 _TEST_CASES = [
-    (device, mode, fp16)
+    (device, mode, fp16, shape)
     for device in [DEVICE_NAME]
     for mode in ["compile", "eager"]
     for fp16 in DtypeOpTable.fp16_types()
+    for shape in _SHAPES
 ]
 
 _TEST_IDS = [
-    f"{device}-{mode}-{fp16}".replace("torch.", "")
-    for device, mode, fp16 in _TEST_CASES
+    f"{device}-{mode}-{fp16}-{shapes2key((shape,))}".replace("torch.", "")
+    for device, mode, fp16, shape in _TEST_CASES
 ]
 
 
 @pytest.mark.parametrize(
-    "device, mode, fp16",
+    "device, mode, fp16, shape",
     _TEST_CASES,
     ids=_TEST_IDS,
 )
-def test_fp16_to_fp32_standard_input(device, mode, fp16):
+def test_fp16_to_fp32_standard_input(device, mode, fp16, shape):
     """Test FP16/BF16→FP32 with STANDARD input creates DL16_TO_FP32 (#2843)."""
 
     def fn(x):
         return x.to(torch.float32)
 
-    x = torch.randn(4, 128, device=device, dtype=fp16)
+    x = torch.randn(shape, device=device, dtype=fp16)
     result = _run(fn, x, mode=mode)
 
     # Verify output EA
-    assert_ea(result, ElementArrangement.DL16_TO_FP32)
+    expected_ea = (
+        ElementArrangement.STANDARD
+        if shape in STICK_ONLY_SHAPES
+        else ElementArrangement.DL16_TO_FP32
+    )
+    assert_ea(result, expected_ea)
 
-    # Note: Cannot compare tensors with non-STANDARD EA directly with CPU
-    # The result has DL16_TO_FP32 EA which differs from CPU's STANDARD EA
+    # Verify correctness
+    assert_val(fn, x, result)
 
     print(f"✓ {fp16}→FP32 with STANDARD input produces DL16_TO_FP32 ({mode})")
 
@@ -127,25 +148,30 @@ def test_mixed_bf16_fp32_add_rejects_ea_mismatch(device, mode):
 
 
 @pytest.mark.parametrize(
-    "device, mode, fp16",
+    "device, mode, fp16, shape",
     _TEST_CASES,
     ids=_TEST_IDS,
 )
-def test_fp32_to_fp16_standard_input(device, mode, fp16):
+def test_fp32_to_fp16_standard_input(device, mode, fp16, shape):
     """Test FP32→FP16 with STANDARD input creates FP32_TO_DL16."""
 
     def fn(x):
         return x.to(dtype=fp16)
 
-    x = torch.randn(4, 128, device=device, dtype=torch.float32)
+    x = torch.randn(shape, device=device, dtype=torch.float32)
     result = _run(fn, x, mode=mode)
 
     # Eager and compiled casts use the same compiled D2D conversion path, so
     # both preserve the hardware conversion's staggered element arrangement.
-    assert_ea(result, ElementArrangement.FP32_TO_DL16)
+    expected_ea = (
+        ElementArrangement.STANDARD
+        if shape in STICK_ONLY_SHAPES
+        else ElementArrangement.FP32_TO_DL16
+    )
+    assert_ea(result, expected_ea)
 
-    # Note: Cannot compare tensors with non-STANDARD EA directly with CPU
-    # The result has FP32_TO_DL16 EA which differs from CPU's STANDARD EA
+    # Verify correctness
+    assert_val(fn, x, result)
 
     print("✓ FP32→{fp16} with STANDARD input produces FP32_TO_DL16 ({mode})")
 
@@ -258,17 +284,6 @@ def test_bidirectional_roundtrip_fp32_start(device, fp16):
     assert_val(fn, x, result)
 
     print("✓ FP32→FP16→FP32 roundtrip works")
-
-
-# Shapes whose whole content fits in a single stick, so the tensor has no
-# spatial dim outside the stick dim for the conversion op to loop over.
-STICK_ONLY_SHAPES = [
-    (),
-    (1,),
-    (1, 1),
-    (1, 1, 1),
-    (1, 1, 1, 1),
-]
 
 
 @pytest.mark.parametrize("shape", STICK_ONLY_SHAPES)

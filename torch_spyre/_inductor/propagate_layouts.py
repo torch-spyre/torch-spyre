@@ -883,6 +883,25 @@ def _single_arg_op_layout(
                 ea_src_dtype = bool_layout_dtype(stl.device_dtype, "conversion source")
 
             fmt = DtypeOpTable.ea_map(ea_src_dtype, output.dtype, input_ea)
+
+            # Force STANDARD for 0-dim and 1-element tensors where staggering is
+            # meaningless or invalid for D2H restore. See #5361.
+            if fmt in STAGGERED_EAS:
+                num_elems = 1
+                for s in in_layout.size:
+                    num_elems *= concretize_expr(s)
+
+                # Fallback to STANDARD only for num_elems <= 1.
+                # - Scalars/0-dim tensors lack a stick dimension to interleave, making
+                #   STANDARD exact.
+                # - Shapes with 1 < num_elems < pair_columns are deliberately
+                #   kept staggered.
+                # - These small shapes are expected to fail loudly at copy time
+                #   ("requires whole stick pairs").
+                # - Forcing STANDARD broadly would change layout strategy
+                if num_elems <= 1:
+                    fmt = ElementArrangement.STANDARD
+
             return _convert_layout(
                 stl, dep, in_layout, output, output_dep, fmt, input_ea
             )
