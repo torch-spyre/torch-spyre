@@ -4086,6 +4086,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         "torch_spyre._inductor.wsr.coarse_tile_span_overflow.op_out_coords",
         _out_coords_for_bhld,
     )
+    @config.patch({"loop_tiling_lowering": "legacy"})  # reads the legacy stamp
     def test_coarse_tile_consumes_auto_group_and_stamps_op(self):
         op = _pointwise_op(_E2E_SHAPE)
 
@@ -5604,6 +5605,7 @@ class TestSpanOverflowGenericReductionRangeTiling(InductorTestCase):
 class TestSpanOverflowLargeShapeContract(InductorTestCase):
     """Unit-style coverage for the real large shape used in E2E testing."""
 
+    @config.patch({"loop_tiling_lowering": "legacy"})  # reads the legacy stamp
     def test_large_shape_planner_adapter_and_coarse_tile_match_manual_hint(self):
         auto_op = _pointwise_op(_E2E_SHAPE, name="auto_buf")
         manual_op = _pointwise_op(_E2E_SHAPE, name="manual_buf")

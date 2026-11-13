@@ -46,6 +46,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 import sympy
 from sympy import Integer, Mod, Symbol, floor, simplify, sympify  # noqa: F401
 
@@ -94,6 +95,8 @@ from torch_spyre._inductor.wsr.coarse_tile import (
     plan_coarse_tile_groups,
     reduction_loop_vars,
 )
+
+
 from torch_spyre._inductor.wsr.tile_prediction import (
     _rejection_reason,
     predict_frame,
@@ -137,6 +140,16 @@ from utils_inductor import (
     ir_input_loader,
     patch_tiling_helper,
 )
+
+
+@pytest.fixture(autouse=True)
+def _legacy_transform():
+    """This file tests the legacy transform's internals (the CoarseTileInfo it stamps,
+    its planner and its phases), which ``coarse_tile_post_stickify`` runs only under
+    ``loop_tiling_lowering == "legacy"``. They go with the transform."""
+    with config.patch({"loop_tiling_lowering": "legacy"}):
+        yield
+
 
 _FP16 = DataFormats.SEN169_FP16
 

@@ -31,7 +31,7 @@ import pytest
 import torch  # noqa: F401  (must precede torch_spyre._inductor imports)
 from torch._inductor.ir import ComputedBuffer
 
-from torch_spyre._inductor import passes
+from torch_spyre._inductor import config, passes
 from torch_spyre._inductor.cost_features import extract_op_features
 from torch_spyre._inductor.loop_info import CoarseTileInfo, LoopShim
 from torch_spyre._inductor.loop_node import all_ops
@@ -77,6 +77,7 @@ def _features_both_ways(case):
     with (
         mock.patch.object(coarse_tile, "coarse_tile_post_stickify", spy),
         mock.patch.object(passes, "coarse_tile_post_stickify", spy),
+        config.patch({"loop_tiling_lowering": "legacy"}),
     ):
         compile_span_overflow(fn, args, limit)
     return rows
@@ -127,6 +128,7 @@ def _shim_swapped_in(enabled=True):
     with (
         mock.patch.object(coarse_tile, "coarse_tile_post_stickify", spy),
         mock.patch.object(passes, "coarse_tile_post_stickify", spy),
+        config.patch({"loop_tiling_lowering": "legacy"}),
     ):
         yield
 
