@@ -42,6 +42,10 @@ Applying them in filename order works from an empty database.
 | `72-ops-audit-events.sql` | `ops_audit_events`, `v_ops_audit_events` | — |
 | `73-ci-access-audit.sql` | `ci_access_audit`, `v_ci_access_audit` | — |
 | `74-model-priority-events.sql` | `model_priority_events`, `v_model_priority` | — |
+| `81-bench-environments.sql` | `environments`, `node_classes`, `environment_fingerprints`, `environment_nodes`, `environment_qualifications`, `v_environments`, `v_node_classes`, `v_environment_fingerprints`, `v_environment_nodes`, `v_environment_qualified` | — |
+| `82-run-placements.sql` | `run_placements`, `v_run_placements_effective`, `v_run_devices` | — |
+| `83-result-invalidations.sql` | `result_invalidations`, `v_invalidation_state`, `v_invalidated_runs` | 49, 82 |
+| `84-bench-views.sql` | `v_bench_attrs`, `v_bench_results` | 20, 30, 49, 60, 81, 82, 83 |
 
 Column names `chat_turns` shares with `vigil_ops.analyst_turns`, so one `UNION ALL` view can read both:
 
