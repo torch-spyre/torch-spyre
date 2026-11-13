@@ -49,6 +49,7 @@ from torch_spyre._inductor.loop_info import CoarseTileInfo
 from torch_spyre._inductor.pass_utils import PerCoreView
 
 from utils_inductor import expects_raise
+from torch_spyre._inductor.loop_facts import read_advance
 from torch_spyre._inductor.loop_node import all_ops
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 from torch_spyre._inductor.scratchpad import sa_cooptimizer as sa
@@ -264,6 +265,7 @@ class CollectTilingPasses(CustomPreSchedulingPasses):
     """
 
     tiling: dict[str, CoarseTileInfo] = {}
+    read_advances: dict[str, list[tuple]] = {}
     core_splits: dict[str, dict[int, int]] = {}
     lx_resident: set[str] = set()
 
@@ -277,6 +279,16 @@ class CollectTilingPasses(CustomPreSchedulingPasses):
             if getattr(op, "loop_info", None) is not None
         ]
         type(self).tiling = {op.get_name(): op.loop_info for op in tiled}
+        # Per op, the advance of each read per trip at each level, from the record or
+        # the index, whichever the op carries.
+        type(self).read_advances = {
+            op.get_name(): [
+                tuple(read_advance(op, dep))
+                for dep in op.get_read_writes().reads
+                if isinstance(dep, MemoryDep)
+            ]
+            for op in tiled
+        }
         type(self).core_splits = {
             op.get_name(): dict(op.op_it_space_splits[0])
             for op in tiled
@@ -1207,9 +1219,10 @@ class TileOwnershipGroupingTests(unittest.TestCase):
             and not name.startswith("coarse_tile_copy_")
         ]
         # The redirected read reached codegen advancing a tile's 16 rows along
-        # dim 0: without this the body would pass on a read held still.
-        outer_levels = [levels[0] for levels in tiling[consumer].tiled_dims_per_read]
-        self.assertIn([(0, 16)], outer_levels, _describe(tiling))
+        # dim 0 (16 rows of 8192 elements): without this the body would pass on a
+        # read held still.
+        outer = [advance[0] for advance in CollectTilingPasses.read_advances[consumer]]
+        self.assertIn(16 * 64 * 128, outer, _describe(tiling))
 
     def test_untiled_op_splits_a_skip_connection_into_two_nests(self):
         # a -> b -> c with a -> c as well. a and c may only be tiled d0:4 and

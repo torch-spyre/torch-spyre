@@ -364,19 +364,17 @@ def _forced_view(lowering, view, levels):
     return ((out.cpu().float() - fn(x.float())).abs() > 0.05).float().mean().item()
 
 
-@expects_raise
-def test_a_read_through_a_permuted_view_is_refused_under_plan():
+@pytest.mark.parametrize("dim, count", [(0, 8), (1, 8), (2, 8), (0, 2)])
+def test_a_read_through_a_permuted_view_is_right_under_plan(dim, count):
     """The op iterates (8, 64, 512) over an input stored (64, 8, 512): its dim 0 is the
-    buffer's dim 1, so 'dim 0' of the buffer has another stride (4096, not 512).
-    Legacy compiles it (it leaves the group whole); the plan refuses it, naming the
-    view, rather than carry a step for a view it does not model.
-
-    TODO: when a read through a reordering view is lowered, this becomes a positive
-    test."""
+    buffer's dim 1, so the buffer's stride for 'dim 0' is not the op's (4096, not 512).
+    The step comes from the access's own index before the divide, so the view's order
+    does not matter, including when the tiled dim is squeezed to extent 1. (The first
+    draft of the plan refused this read, as the stage-7a.2 pass had to; the allocator's
+    permuted consumers tile through such views, and the values are right.)"""
     permute = lambda t: t.permute(1, 0, 2)  # noqa: E731
-    assert _forced_view("legacy", permute, [(0, 8)]) == 0.0
-    with pytest.raises(Exception, match="view that reorders"):
-        _forced_view("plan", permute, [(0, 8)])
+    assert _forced_view("legacy", permute, [(dim, count)]) == 0.0
+    assert _forced_view("plan", permute, [(dim, count)]) == 0.0
 
 
 def test_a_read_through_a_plain_view_is_converted_under_plan():

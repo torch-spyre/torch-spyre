@@ -244,7 +244,9 @@ def _tile_step(
     """The host advance of one access per trip: the coefficient of the tiled dim's
     index symbol times the tile extent, read from the access BEFORE the divide. A
     dim that will be squeezed out (tile extent 1) is no special case: its symbol is
-    still in the undivided index. An access that does not mention the symbol (a
+    still in the undivided index. The step is right for a read through a view that
+    reorders or strides the op's dims too, because it comes from the access and not
+    from the buffer's strides. An access that does not mention the symbol (a
     broadcast read) does not advance."""
     from ..spyre_kernel import SpyreKernel
 
@@ -253,29 +255,7 @@ def _tile_step(
     symbol = SpyreKernel._host_dim_to_index_symbol(op, key)
     if symbol not in dep.index.free_symbols:
         return sympy.S.Zero
-    if not tiled.in_reduction:
-        _require_plain_view(graph, op, tiled.position, symbol, dep)
     return access_step(dep.index, symbol, extent, sympy.S.Zero)
-
-
-def _require_plain_view(
-    graph: Any, op: ComputedBuffer, position: int, symbol: sympy.Symbol, dep: MemoryDep
-) -> None:
-    """Refuse a read of a buffer of the op's own rank through a view that reorders or
-    strides the tiled dim: the op's dim ``position`` is then another dim of the
-    buffer, and the plan models no such view. A buffer of another rank (a
-    broadcast, a matmul operand) is read through its index as it is."""
-    buffer = graph.get_buffer(dep.name)
-    if len(buffer.get_size()) != len(op.data.ranges):
-        return
-    stride = sympy.sympify(buffer.get_stride()[position])
-    coefficient = dep.index.coeff(symbol)
-    if coefficient != stride:
-        raise Unsupported(
-            f"lower_loop_tiling: {op.get_operation_name()} reads {dep.name} through "
-            f"a view that reorders or strides its dims (dim {position}: index step "
-            f"{coefficient}, buffer stride {stride})."
-        )
 
 
 @dataclass
