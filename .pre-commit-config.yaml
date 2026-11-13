@@ -99,6 +99,12 @@ repos:
         additional_dependencies: [PyYAML, regex]
         files: (^|/)(AGENTS\.md|CLAUDE\.md|\.pre-commit-config\.yaml)|(^|/)\.claude/skills/.*|(^|/)\.agents/.*
         pass_filenames: false
+      - id: bench-validate
+        name: Validate benchmark definitions
+        entry: make -s bench-validate
+        language: system
+        files: ^(benchmarks/.*\.ya?ml|mk/bench\.mk)$
+        pass_filenames: false
       # Keep `suggestion` last
       - id: suggestion
         name: Suggestion

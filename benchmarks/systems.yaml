@@ -1,0 +1,12 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/torch-spyre/torch-spyre/main/extensions/spyre-bench/spyre_bench/core/schemas/resources.schema.json
+apiVersion: bench/v1alpha1
+kind: System
+metadata:
+  name: op-library
+  description: Operator library under test; the accelerator backend is an unhashed comparison axis.
+spec:
+  type: kernel/op-library
+  backend: spyre
+  library: torch-spyre
+  precision: fp16
+  harness: harness-a

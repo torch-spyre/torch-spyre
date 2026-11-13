@@ -1,0 +1,104 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/torch-spyre/torch-spyre/main/extensions/spyre-bench/spyre_bench/core/schemas/resources.schema.json
+apiVersion: bench/v1alpha1
+kind: Project
+metadata:
+  name: torch-spyre
+spec:
+  component: torch-spyre
+  packs:
+    - name: kernel
+      version: '0.2'
+    - name: spyre
+      version: '0.2'
+  runner: kernel-bench
+  default_suites:
+    - ops
+  default_environment: one-device
+  visibility: public
+  series_labels:
+    - env.label.device.count
+---
+apiVersion: bench/v1alpha1
+kind: Suite
+metadata:
+  name: ops
+  description: Operator-level kernel benchmarks, one Benchmark per operation name.
+spec:
+  type: perf
+  pr_selectable: true
+---
+apiVersion: bench/v1alpha1
+kind: Environment
+metadata:
+  name: one-device
+  description: One accelerator device; the placer decides where.
+spec:
+  devices:
+    requests:
+      - name: cards
+        device_class: spyre/pf
+        count: 1
+  labels:
+    device.count: 1
+---
+apiVersion: bench/v1alpha1
+kind: Selection
+metadata:
+  name: smoke
+  description: One case, one repeat; never ingested.
+spec:
+  cases:
+    - matmul
+  run:
+    repeats_min: 1
+---
+apiVersion: bench/v1alpha1
+kind: Selection
+metadata:
+  name: ops-sanity
+  description: Smallest operator set a PR may request.
+  annotations:
+    schedule.preferred: nightly
+    schedule.fallback: weekly
+    schedule.priority: '80'
+spec:
+  selector:
+    suites:
+      - ops
+    groupings:
+      tier:
+        at_most: sanity
+---
+apiVersion: bench/v1alpha1
+kind: Selection
+metadata:
+  name: ops-core
+  description: Default operator set.
+  annotations:
+    schedule.preferred: nightly
+    schedule.fallback: weekly
+    schedule.est_hours: '1.5'
+    schedule.priority: '80'
+spec:
+  selector:
+    suites:
+      - ops
+    groupings:
+      tier:
+        at_most: core
+---
+apiVersion: bench/v1alpha1
+kind: Selection
+metadata:
+  name: ops-extended
+  description: Every declared operator.
+  annotations:
+    schedule.preferred: weekly
+    schedule.priority: '40'
+spec:
+  selector:
+    suites:
+      - ops
+    groupings:
+      tier:
+        at_most: extended
