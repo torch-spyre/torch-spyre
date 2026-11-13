@@ -1860,7 +1860,6 @@ class TestSolverCapabilities(unittest.TestCase):
         "generates_divisions",
         "chooses_tilings",
         "tilings_from_menu",
-        "linear_cost_only",
     )
 
     def _answers(self, cls) -> dict[str, bool]:
@@ -1902,7 +1901,6 @@ class TestSolverCapabilities(unittest.TestCase):
                 "decides_lx_relayouts": True,
                 "chooses_tilings": True,
                 "tilings_from_menu": True,
-                "linear_cost_only": True,
             },
             ExhaustiveSearchSolver.wrapping(GreedyLayoutSolver): joint,
         }
@@ -1951,8 +1949,8 @@ class TestSolverCapabilities(unittest.TestCase):
         type("Placement", (MemoryPlanSolver,), placement(**all_false))
 
         missing = placement(**all_false)
-        del missing["linear_cost_only"]
-        with self.assertRaisesRegex(TypeError, "must answer linear_cost_only"):
+        del missing["tilings_from_menu"]
+        with self.assertRaisesRegex(TypeError, "must answer tilings_from_menu"):
             type("Missing", (MemoryPlanSolver,), missing)
         for implied in ("decides_lx_relayouts", "generates_divisions"):
             with (

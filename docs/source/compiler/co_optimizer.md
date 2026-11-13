@@ -293,9 +293,7 @@ every division scores identically and the search has nothing left to optimize on
 side that traffic term is the first level of the lexicographic ladder in
 [CpSatLayoutSolver](scratchpad_planning.md#cpsatlayoutsolver), whose later levels break the
 remaining ties by cut count, parallelism, division balance and tile count; CP-SAT also takes
-that ladder when `cost_expr_to_cpsat` cannot lower the expression, and whenever
-`auto_coarse_tiling` is on, since the allocator then withholds the expression (the model is flat
-in tile size and cut count).
+that ladder when `cost_expr_to_cpsat` cannot lower the expression.
 
 :::{warning}
 Even when the expression survives, parts of the model go quiet. Both engines price the *same*
@@ -358,16 +356,15 @@ represented and survives scheduling and codegen — is implemented and documente
 points to the design RFC. What's described here is specifically the *solver's* ability to
 choose a coarse tiling as part of the joint search, which is a separate, newer effort.
 
-At a high level: both solvers decide tiling jointly with LX placement and work division, but
-rank it differently. CP-SAT does so in the *same* constraint model, just ranked by a different
-objective. When `auto_coarse_tiling` is on,
-`cost_expr` is dropped and residency, division, and tiling are all still decided together, but
-now ranked by an ordered sequence of tie-breaks instead: HBM traffic first, then fewest
-tiling cuts, then parallelism, then division shape, then tile count, each one only resolving
-ties the step before leaves open. Simulated annealing picks a tiling jointly with division too,
-through `OpSplitSpace`, and keeps ranking by `cost_expr`, which prices the tiling through its
-tile-count symbols: the loop reaches the price mainly through the operands it re-reads, beside
-the residency the tiling makes possible. Either way there is one solve: once it picks a tiling,
+At a high level: both solvers decide tiling jointly with LX placement and work division, and
+both rank it by `cost_expr`, which prices the tiling through its tile-count symbols: the loop
+reaches the price mainly through the operands it re-reads, beside the residency the tiling makes
+possible. CP-SAT decides it in the *same* constraint model; simulated annealing picks a tiling
+through `OpSplitSpace`. CP-SAT minimizes the expression alone, which is built from the untiled
+graph and so holds no full buffer for a cut; simulated annealing adds that copy-out traffic
+beside it at the HBM rate. If the expression cannot be built or lowered, CP-SAT falls back to an ordered sequence of tie-breaks:
+HBM traffic first, then fewest tiling cuts, then parallelism, then division shape, then tile
+count, each one only resolving ties the step before leaves open. Either way there is one solve: once it picks a tiling,
 the graph is physically rewritten to apply it, the divisions the solve chose are committed onto
 the tiled graph's ops, and the placement stands.
 
@@ -380,10 +377,10 @@ the tiled graph's ops, and the placement stands.
   output-axis tilings, each with its own division menu; a producer/consumer pair is only
   compatible if they agree on which slice of the shared buffer each tile and core owns.
   Consecutive ops sharing a loop nest form a loop group, and every producer/consumer edge
-  inside one must be compatible. The solve ranks plans with the lexicographic ladder described
-  above, not `cost_expr`. It places the graph its tilings produce: a *cut* (a tiled op whose
-  value must leave its nest) gets a copy op that drains each tile into a full-sized HBM
-  buffer, and the first ladder stage charges that copy's traffic. The tile itself stays an LX
+  inside one must be compatible. The solve ranks plans by `cost_expr` as described above. It
+  places the graph its tilings produce: a *cut* (a tiled op whose value must leave its nest)
+  gets a copy op that drains each tile into a full-sized HBM buffer, which `cost_expr` does not
+  see and the first stage of the fallback charges. The tile itself stays an LX
   candidate, but only under a division with no reduction split, since the copy reads it core
   for core. A buffer a tiled op reads lives until that op's nest ends, and an input clone it
   reads is held from the nest's start. Once it picks a tiling, `apply_chosen_tilings`
@@ -427,8 +424,10 @@ solvers differ in what "substitute and evaluate" compiles down to:
   decision variable (`sym_map[t.buffer.sym_is_lx.name] = t.in_buffer`, and similarly for
   `sym_core_divs`), then hands the whole expression, still unevaluated, to the constraint model
   as the objective to minimize via `cost_expr_to_cpsat(...)`
-  (`scratchpad/cpsat_expr_printer.py`). CP-SAT never evaluates `cost_expr` in Python; it
-  searches the symbolic constraint space directly.
+  (`scratchpad/cpsat_expr_printer.py`). The printer evaluates each sub-expression once, at
+  every point of the decisions it reads, and hands CP-SAT those tables, lowering term by term
+  only what reads too many decisions to enumerate; CP-SAT then searches the constraint space
+  directly, with no evaluation per candidate.
 - **Simulated annealing (compiled, then evaluated numerically per move)**: `_build_score_fn`
   (`scratchpad/sa_cooptimizer.py`) instead compiles `cost_expr` once via `sympy.lambdify` into
   a plain Python function of `(chosen, resident)`, and calls that function fresh for every

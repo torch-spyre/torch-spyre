@@ -648,10 +648,6 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
     def tilings_from_menu(cls) -> bool:
         return True
 
-    @classmethod
-    def linear_cost_only(cls) -> bool:
-        return True
-
     def __init__(
         self,
         buffers: Sequence[LifetimeBoundBuffer],
@@ -862,7 +858,9 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 buffer_map[symbol.name] = (t, t.cp_tile_counts_raw[key])
 
         try:
-            cp_cost = cost_expr_to_cpsat(model, sym_map, buffer_map, cost_expr)
+            cp_cost = cost_expr_to_cpsat(
+                model, sym_map, buffer_map, cost_expr, config.cpsat_max_table_entries
+            )
             if not isinstance(cp_cost, (int, float)):
                 # if the cost is non-constant, we minimize it
                 # if the cost is constant, we use any solution
@@ -1422,6 +1420,13 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 "[CP-SAT layout solver] cut tiebreak over %d candidate cut(s)",
                 len(cut_terms),
             )
+            # OR-tools 9.15 aborts the process when an LNS sub-solve's hint (the
+            # incumbent) lies below a domain its presolve reduced: the hint is
+            # not clamped before the encoding lookup. Tiling solves produce such
+            # sub-solves; this solve passes no hint, so without LNS none exists.
+            # TODO: drop once the pinned OR-tools contains google/or-tools@cd4ed0991
+            # (google/or-tools#5288).
+            solver.parameters.use_lns = False
         # Tile counts, so the last stage can prefer the coarsest tiling. Empty
         # unless the joint solve is choosing tilings, like ``cut_terms``.
         tile_terms = self._tile_count_terms(model, tensors)
@@ -1440,10 +1445,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             return result
 
         if cost_expr is not None:
-            # Only reached with auto_coarse_tiling off: the allocator withholds the
-            # expression when tiling is a solver axis, because the cost model is
-            # flat in tile size and cut count. Unchanged behaviour otherwise --
-            # a successful cost solve returns here and the ladder is skipped.
+            # A successful cost solve returns here and the ladder is skipped.
             status = self._minimize_cost_expr(model, solver, tensors, cost_expr)
 
         if status is None:
