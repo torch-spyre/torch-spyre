@@ -115,10 +115,6 @@ class FirstFitLayoutSolver(MemoryPlanSolver):
     def tilings_from_menu(cls) -> bool:
         return False
 
-    @classmethod
-    def linear_cost_only(cls) -> bool:
-        return False
-
     def _all_minus(
         self,
         gaps: list[Gap],
