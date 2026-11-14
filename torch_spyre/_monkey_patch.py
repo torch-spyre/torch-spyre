@@ -241,6 +241,81 @@ def _transfer_reserved(src, spec: _DynamicSpec) -> "torch.Tensor":
     return dst
 
 
+def _check_layout_for_reservation(device_layout, spec: _DynamicSpec, size, stride):
+    """Refuse an explicit device layout that cannot hold the reservation.
+
+    The layout describes the buffer at ``max``, so the reserved host dimension
+    must occupy exactly one device dimension, whole, with extent ``max``: that
+    is the dimension the transfer and every later ``resize_`` move along. A
+    device dimension is "the reserved one" when its stride-map entry is the
+    host stride of the reserved dimension. The native allocation re-checks the
+    same rules; this pure function exists for the earlier, clearer error.
+    """
+    device_size = list(device_layout.device_size)
+    stride_map = list(device_layout.stride_map)
+    where = f"dynamic={{{spec.dim}: ...}} together with device_layout="
+    if not device_size or len(stride_map) != len(device_size):
+        raise ValueError(f"{where}: the layout has no usable device dimensions")
+    host_stride = stride[spec.dim]
+    carriers = [
+        d
+        for d, (s, n) in enumerate(zip(stride_map, device_size))
+        if s == host_stride and n > 1
+    ]
+    if len(carriers) != 1:
+        raise ValueError(
+            f"{where}: the reserved host dimension {spec.dim} (host stride "
+            f"{host_stride}) must occupy exactly one device dimension of the "
+            f"layout, found {len(carriers)} (device_size={device_size}, "
+            f"stride_map={stride_map})"
+        )
+    (carrier,) = carriers
+    if carrier == len(device_size) - 1:
+        raise ValueError(
+            f"{where}: the reserved host dimension {spec.dim} lands on the "
+            "stick-elements dimension of the layout, which cannot be resized"
+        )
+    if device_size[carrier] != spec.max:
+        raise ValueError(
+            f"{where}: the layout describes the buffer at the declared max, so "
+            f"device dimension {carrier} (the reserved host dimension "
+            f"{spec.dim}) must have extent max={spec.max}, got "
+            f"{device_size[carrier]}"
+        )
+
+
+def _transfer_reserved_with_layout(src, spec: _DynamicSpec, device_layout):
+    """``_transfer_reserved`` with the device layout given instead of derived.
+
+    Same sequence: allocate at the ceiling, copy the real rows in, mark the
+    dimension dynamic. The layout is checked against the declaration first,
+    here and again natively.
+    """
+    import torch
+
+    _check_layout_for_reservation(device_layout, spec, src.size(), src.stride())
+
+    if not torch.spyre.is_initialized():
+        torch.spyre._impl._lazy_init()
+
+    from torch_spyre._C import copy_tensor, spyre_empty_reserved_with_layout
+
+    dst = spyre_empty_reserved_with_layout(
+        src.size(),
+        src.stride(),
+        src.dtype,
+        device_layout,
+        spec.dim,
+        spec.min,
+        spec.max,
+        spec.granularity,
+    )
+    copy_tensor(src, dst, non_blocking=False)
+    # Bare mark, for the same reasons as in _transfer_reserved.
+    torch._dynamo.mark_dynamic(dst, spec.dim)
+    return dst
+
+
 def _sharding_key(tensor) -> tuple | None:
     """Address-free sharding signature of a real Spyre tensor, else None.
 
@@ -370,16 +445,15 @@ def _patch_tensor_for_spyre():
 
     def spyre_to(self, *args, device_layout=None, dynamic=None, **kwargs):
         if dynamic is not None:
-            if device_layout is not None:
-                raise ValueError(
-                    "dynamic= cannot be combined with device_layout=: a "
-                    "reserved tensor's layout is derived from its max size"
-                )
             dtype = _parse_dynamic_to_args(self, args, kwargs)
             spec = _parse_dynamic_spec(dynamic, self.size())
             # Convert on the host first: the reserved buffer is allocated
             # and filled at the dtype the caller asked for.
             src = self if dtype is None or dtype == self.dtype else orig_to(self, dtype)
+            if device_layout is not None:
+                # The caller's layout describes the buffer at the declared
+                # max; it is checked against the declaration, not derived.
+                return _transfer_reserved_with_layout(src, spec, device_layout)
             return _transfer_reserved(src, spec)
         if device_layout is None:
             # During Dynamo tracing this wrapper is an allow_in_graph leaf: keep
