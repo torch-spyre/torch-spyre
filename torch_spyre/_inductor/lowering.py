@@ -48,6 +48,7 @@ from .constants import (
     DEVICE_NAME,
     DLFLOAT16_MAX,
     FP8_E4M3FN_MAX,
+    THREEFRY_STAGE_OPS,
     QUANTSCALEPERTOKENFP8_CLIP_MAX,
     QUANTSCALEPERTOKENFP8_CLIP_MIN,
     QUANTSCALEPERTOKENFP8_OP,
@@ -1480,6 +1481,29 @@ def lower_silu(x):
     )
     pw.realize()
     return pw
+
+
+for _stage in THREEFRY_STAGE_OPS:
+    ensure_default_handler(f"threefry_{_stage.removeprefix('threefry')}")
+
+
+@register_spyre_lowering(
+    torch.ops.spyre.threefry4x16_stage, type_promotion_kind=None, broadcast=True
+)
+def lower_threefry4x16_stage(a, b, stage):
+    name = f"threefry{stage}"
+    if name not in THREEFRY_STAGE_OPS:
+        raise ValueError(f"unknown Threefry stage {stage!r}")
+    fn = lowering.ops_wrapper(f"threefry_{stage}")
+    load_a, load_b = a.make_loader(), b.make_loader()
+    return Pointwise.create(
+        device=a.get_device(),
+        dtype=torch.int32,
+        inner_fn=lambda index: fn(load_a(index), load_b(index)),
+        ranges=a.get_size(),
+        origin_node=a.get_origin_node(),
+        traceback=a.get_traceback(),
+    )
 
 
 @register_spyre_lowering(torch.ops.spyre.softplus)

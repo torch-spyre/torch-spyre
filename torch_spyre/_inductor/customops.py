@@ -266,6 +266,23 @@ def _(
     return input.new_empty(input.size())
 
 
+@torch.library.custom_op(
+    "spyre::threefry4x16_stage", mutates_args=(), device_types="spyre"
+)
+def threefry4x16_stage(a: torch.Tensor, b: torch.Tensor, stage: str) -> torch.Tensor:
+    """One stage of Threefry-4x16-13 on int32 tensors; see torch_spyre.rng_threefry.
+
+    Round stages take the state halves (A, B) and return one of them;
+    injections take a half and the key. ``b`` broadcasts against ``a``.
+    """
+    pass
+
+
+@threefry4x16_stage.register_fake
+def _(a: torch.Tensor, b: torch.Tensor, stage: str):
+    return a.new_empty(torch.broadcast_shapes(a.shape, b.shape))
+
+
 @torch.library.custom_op("spyre::empty", mutates_args=(), device_types="spyre")
 def spyre_empty(
     size: Sequence[int],

@@ -187,11 +187,28 @@ SPYRE_FP32_OPS = [
 ]
 
 # Native integer op names.  SpyreOpFuncs.add/mul emit these names directly when
-# their operands are IEEE_INT32 tensors.  Every check that needs to recognise a
-# native int32 op uses this set as its single source of truth.
+# their operands are IEEE_INT32 tensors, and the Threefry stage ops take int32
+# only.  Every check that needs to recognise a native int32 op uses this set as
+# its single source of truth.
 ADDI32TOI32_OP = "addi32toi32"
 MULI32TOI32_OP = "muli32toi32"
-SPYRE_INT32_OPS: frozenset[str] = frozenset({ADDI32TOI32_OP, MULI32TOI32_OP})
+# Threefry-4x16-13 as stage ops on the int32 halves of its 64-bit state; see
+# torch_spyre.rng_threefry.
+THREEFRY_STAGE_OPS: tuple[str, ...] = (
+    "threefryinj0a",
+    "threefryr0123a",
+    "threefryr0123b",
+    "threefryinj1a",
+    "threefryinj1b",
+    "threefryr4567a",
+    "threefryr4567b",
+    "threefryinj2b",
+    "threefryinj3a",
+    "threefryr12a",
+)
+SPYRE_INT32_OPS: frozenset[str] = frozenset(
+    {ADDI32TOI32_OP, MULI32TOI32_OP, *THREEFRY_STAGE_OPS}
+)
 
 # DLFloat16's largest finite value (0x7FFE); 0x7FFF is NaN-Infinity.
 DLFLOAT16_MAX = (1.0 + 510.0 / 512.0) * float(2**32)
