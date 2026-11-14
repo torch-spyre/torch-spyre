@@ -75,6 +75,13 @@ sink_collective_waits: bool = os.getenv("SPYRE_SINK_COLLECTIVE_WAITS", "0").lowe
     "yes",
 )
 
+# Sparse physical core placement for ops using fewer cores than the card
+# has: "stride" (default) spreads slices at equal stride i*(sencores/n);
+# "neg_shift" dispatches logical slice i to (i - n//2) % sencores, which
+# balances the two 16-core halves (low ids of the first, high ids of the
+# second) — the scheme validated by the [0, 31] two-core experiment.
+core_placement_mode: str = os.environ.get("SPYRE_CORE_PLACEMENT", "stride")
+
 # Select who allocates the HBM pool for an SDSC bundle's intermediates:
 # False (default) has the backend self-allocate via
 # sdscbundle.device_mem_allocate, exactly matching pre-existing behavior.

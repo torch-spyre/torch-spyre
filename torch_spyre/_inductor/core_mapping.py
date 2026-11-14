@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
@@ -631,6 +632,40 @@ def apply_core_stride(
     }
     span = num_cores * stride
     return rewritten, span, tuple(range(0, span, stride))
+
+
+def apply_neg_shift(
+    core_map: Mapping[Symbol, Expr], num_cores: int, physical_cores: int
+) -> tuple[dict[Symbol, Expr], int, tuple[int, ...]]:
+    """Place ``num_cores`` logical slices with a downward half-count shift.
+
+    Logical slice ``i`` dispatches physical core ``(i - num_cores // 2)
+    % physical_cores``. The resulting set balances the two 16-core halves
+    of the card (low ids of the first half, high ids of the second) at
+    every active count, mirroring the validated [0, 31] two-core placement.
+    Owners are rewritten so each physical id maps back to its logical slice
+    via ``(core_id + num_cores // 2) % physical_cores``. Returns the
+    rewritten map, the fold size (``max(physical_cores, num_cores)``), and
+    the dispatched physical ids. A no-op for ``num_cores <= 1``, when the
+    slice count does not divide the physical core count, or when the shift
+    would be zero.
+    """
+    min_shift = int(os.environ.get("SPYRE_NEG_SHIFT_MIN", "2"))
+    if (
+        num_cores < min_shift
+        or num_cores >= physical_cores
+        or physical_cores % num_cores != 0
+    ):
+        return dict(core_map), num_cores, tuple(range(num_cores))
+    shift = num_cores // 2
+    ids = tuple((i - shift) % physical_cores for i in range(num_cores))
+    span = max(physical_cores, num_cores)
+    core_id = Symbol("core_id")
+    logical = (core_id + shift) % physical_cores
+    rewritten = {
+        dim: owner.xreplace({core_id: logical}) for dim, owner in core_map.items()
+    }
+    return rewritten, span, ids
 
 
 def matmul_reduction_dim(

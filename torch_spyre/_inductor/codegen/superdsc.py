@@ -52,9 +52,11 @@ from torch_spyre._inductor.constants import (
 )
 from torch_spyre._inductor.core_mapping import (
     apply_core_stride,
+    apply_neg_shift,
     matmul_reduction_dim,
     resolve_core_stride,
 )
+from torch_spyre._inductor.config import core_placement_mode
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
 from torch_spyre._inductor.indirect_access import (
     compute_indirect_max_dim_sizes,
@@ -2180,14 +2182,14 @@ def _finalize_tensor_work_divisions(
         )
         tensor_cores = effective.num_cores or num_cores
         tensor_owners = math.prod(effective.work_slices.values())
-        # A strided (sparse) assignment widens the operation's core span
-        # (num_cores = slices * stride) while only the strided ids are
-        # dispatched, so the slice count divides the span instead of equalling
-        # it. That shape is admitted only when the dispatched list is exactly
-        # one core per slice.
+
+        # A sparse assignment (equal stride or neg shift) widens the
+        # operation's core span to the physical core count while only the
+        # dispatched ids carry work, so the slice count can be below the
+        # span without dividing it. That shape is admitted only when the
+        # dispatched list is exactly one core per slice.
         sparse_span = (
             num_cores > tensor_owners
-            and num_cores % tensor_owners == 0
             and tensor_cores == num_cores
             and bool(completed_producer_cores)
             and len(completed_producer_cores) == tensor_owners
@@ -2852,7 +2854,10 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             completed_producer_cores,
         )
         operation_cores = math.prod(dim_splits.values())
-        core_id_to_work_slice, operation_span, destination_ids = apply_core_stride(
+        _place = (
+            apply_neg_shift if core_placement_mode == "neg_shift" else apply_core_stride
+        )
+        core_id_to_work_slice, operation_span, destination_ids = _place(
             core_id_to_work_slice, operation_cores, _spyre_config.sencores
         )
         active = set(destination_ids)
@@ -2861,13 +2866,22 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             division = arg.work_division
             assert division is not None
             logical_cores = division.num_cores or num_cores
-            owner_map, physical_span, tensor_ids = apply_core_stride(
+            owner_map, physical_span, tensor_ids = _place(
                 division.core_id_to_work_slice, logical_cores, _spyre_config.sencores
             )
             num_cores = max(num_cores, physical_span)
             if index == 0 and completed_producer_cores:
-                stride = resolve_core_stride(logical_cores, _spyre_config.sencores)
-                tensor_ids = tuple(core * stride for core in completed_producer_cores)
+                if core_placement_mode == "neg_shift":
+                    shift = logical_cores // 2
+                    tensor_ids = tuple(
+                        (core - shift) % _spyre_config.sencores
+                        for core in completed_producer_cores
+                    )
+                else:
+                    stride = resolve_core_stride(logical_cores, _spyre_config.sencores)
+                    tensor_ids = tuple(
+                        core * stride for core in completed_producer_cores
+                    )
                 completed_producer_cores = tensor_ids
             arg.active_core_ids = tensor_ids
             active.update(tensor_ids)
@@ -2875,8 +2889,14 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
                 division.work_slices, owner_map, num_cores=physical_span
             )
         active_core_ids = tuple(sorted(active))
-    elif resolve_core_stride(num_cores, _spyre_config.sencores) > 1:
-        core_id_to_work_slice, num_cores, completed_producer_cores = apply_core_stride(
+    elif (
+        resolve_core_stride(num_cores, _spyre_config.sencores) > 1
+        or core_placement_mode == "neg_shift"
+    ):
+        _place = (
+            apply_neg_shift if core_placement_mode == "neg_shift" else apply_core_stride
+        )
+        core_id_to_work_slice, num_cores, completed_producer_cores = _place(
             core_id_to_work_slice, num_cores, _spyre_config.sencores
         )
     if not is_relayout:
