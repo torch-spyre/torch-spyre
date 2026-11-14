@@ -14,6 +14,7 @@ SELECT
     max(r.audit_timestamp)            AS seen_at
 FROM v_artifact_results_published AS r
 WHERE r.state != 'running'
+  AND r.artifact_id NOT IN (SELECT artifact_id FROM artifacts WHERE component = 'reference')
 GROUP BY r.artifact_id, r.run_id, r.test_type;
 
 -- Everything a subscription can fire on, one row per (event_type, event_key, artifact).
@@ -26,17 +27,20 @@ SELECT 'artifact.tagged' AS event_type, t.tag AS event_key, t.artifact_id AS art
        argMin(t.props, t.ts) AS tag_props, '' AS test_type, '' AS state,
        min(t.audit_timestamp) AS seen_at
 FROM artifact_tags AS t
+WHERE t.tag_family != 'reference'
+  AND t.artifact_id NOT IN (SELECT artifact_id FROM artifacts WHERE component = 'reference')
 GROUP BY t.tag, t.artifact_id
 UNION ALL
 SELECT 'artifact.recorded', '', a.artifact_id, min(a.ts), '', '', CAST(map(), 'Map(String, String)'), '', '',
        min(a.audit_timestamp)
 FROM artifacts AS a
+WHERE a.component != 'reference'
 GROUP BY a.artifact_id
 UNION ALL
 SELECT 'artifact.promoted', '', a.artifact_id, min(a.ts), '', '', CAST(map(), 'Map(String, String)'), '', '',
        min(a.audit_timestamp)
 FROM artifacts AS a
-WHERE a.origin = 'promoted'
+WHERE a.origin = 'promoted' AND a.component != 'reference'
 GROUP BY a.artifact_id
 UNION ALL
 SELECT 'results.recorded', concat(toString(v.run_id), '/', v.test_type), v.artifact_id, v.ts, '', '',
@@ -76,7 +80,8 @@ SELECT
     s.owner            AS owner
 FROM v_artifacts AS a
 CROSS JOIN (SELECT * FROM artifact_subscriptions FINAL) AS s
-WHERE (s.component = '' OR s.component = a.component)
+WHERE a.component != 'reference'
+  AND (s.component = '' OR s.component = a.component)
   AND (s.arch = '' OR s.arch = a.arch)
   AND (s.kind = '' OR s.kind = a.kind)
   AND (s.artifact_name = '' OR s.artifact_name = a.artifact_name);
@@ -211,7 +216,8 @@ LEFT JOIN
     FROM v_dispatch_verdicts
     GROUP BY artifact_id
 ) AS v ON v.artifact_id = e.artifact_id
-WHERE ({component:String} = '' OR {component:String} = a.component)
+WHERE a.component != 'reference'
+  AND ({component:String} = '' OR {component:String} = a.component)
   AND ({arch:String} = '' OR {arch:String} = a.arch)
   AND ({kind:String} = '' OR {kind:String} = a.kind)
   AND ({artifact_name:String} = '' OR {artifact_name:String} = a.artifact_name)

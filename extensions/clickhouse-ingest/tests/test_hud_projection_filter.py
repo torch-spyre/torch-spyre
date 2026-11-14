@@ -12,24 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The HUD projection takes measured model-level spyre-inference rows only, and migration 023
-leaves the MV identical to its schema file."""
+"""The HUD projection takes measured model-level spyre-inference rows only, and the latest
+migration of the MV leaves it identical to its schema file."""
 
 import pytest
 import regex as re
 from spyre_clickhouse_ingest.apply_schema import SCHEMA_DIR, SchemaApplier
 
-MIGRATION = SCHEMA_DIR / "migrations" / "023_hud_mv_measured_model_rows.sql"
+MIGRATION = SCHEMA_DIR / "migrations" / "025_hud_mv_skips_reference_rows.sql"
 
 
 def _mv(sql: str) -> str:
-    m = re.search(
-        r"CREATE MATERIALIZED VIEW (?:IF NOT EXISTS )?oss_ci_benchmark_v3_mv\b.*?;",
-        sql,
-        re.S,
-    )
-    assert m
-    return re.sub(r"\s+", " ", m.group(0).replace("IF NOT EXISTS ", ""))
+    """The MV statement with comments stripped (a ';' inside a comment ends no statement)."""
+    (stmt,) = [
+        x
+        for x in SchemaApplier.statements(sql)
+        if re.match(
+            r"CREATE MATERIALIZED VIEW (?:IF NOT EXISTS )?oss_ci_benchmark_v3_mv\b", x
+        )
+    ]
+    return re.sub(r"\s+", " ", stmt.replace("IF NOT EXISTS ", ""))
 
 
 def test_the_migration_recreates_the_mv_as_the_schema_file_defines_it():
@@ -83,3 +85,14 @@ def test_only_measured_model_rows_reach_the_hud(
     n = s.query("SELECT count() FROM oss_ci_benchmark_v3", "CSV").data()
     n = n.decode() if isinstance(n, bytes) else n
     assert int(n.strip()) == (1 if projected else 0)
+
+
+def test_the_mv_migrations_can_be_rerun():
+    # Rerunning 023 reinstalls the MV without the later filter; 025 is the way back.
+    for n in (
+        "023_hud_mv_measured_model_rows.sql",
+        "025_hud_mv_skips_reference_rows.sql",
+    ):
+        assert SchemaApplier.RERUNNABLE.search(
+            (SCHEMA_DIR / "migrations" / n).read_text()
+        )

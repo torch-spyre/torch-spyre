@@ -37,6 +37,7 @@ FROM
                run_id, 1 AS in_results, 0 AS in_cases, test_type != 'smoke' AS non_smoke
         FROM v_artifact_results_published
         WHERE state != 'running'
+          AND artifact_id NOT IN (SELECT artifact_id FROM artifacts WHERE component = 'reference')
         UNION ALL
         SELECT toDate(min(ts)) AS day, '' AS arch, run_id, 0 AS in_results, 1 AS in_cases,
                0 AS non_smoke
