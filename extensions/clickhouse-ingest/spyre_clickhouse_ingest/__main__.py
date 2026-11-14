@@ -17,7 +17,7 @@
 import sys
 
 # `results` modes that never reach ClickHouse; they run on the standard library alone.
-OFFLINE_FLAGS = ("--offline", "--validate-only", "--upload")
+OFFLINE_FLAGS = ("--offline", "--validate-only", "--upload", "--check")
 
 
 def main(argv=None):
