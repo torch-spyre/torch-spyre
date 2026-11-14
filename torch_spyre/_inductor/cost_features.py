@@ -188,6 +188,19 @@ def _input_traffic(name: str):
     return None, None, None, None
 
 
+def _tile_row_extent(op, row_dim, rows):
+    """The rows one tile of ``op``'s output spans: the innermost tile extent its
+    committed tiling records for ``row_dim``, the same whether the op is sized for
+    one tile (a ``for_each_tile`` body) or for the whole loop, in LX or HBM;
+    ``rows`` when no level tiles that dim."""
+    levels = getattr(getattr(op, "loop_info", None), "output_tiled_dims", None) or []
+    for level in reversed(levels):
+        for dim, extent in level:
+            if dim == row_dim:
+                return _int(extent, rows)
+    return rows
+
+
 def _loop_features(op):
     """(loop_trip, tiles_reduction_dim, tiles_output_dim) from the coarse-tiling
     ``loop_info`` (loop_info.py / coarse_tile.py). ``loop_trip`` = product of
@@ -1437,10 +1450,10 @@ def extract_op_features(
 
     # Per-core per-tile pass-row height for the UNDERFILL derate -- only for OUTPUT-dim
     # (pointwise) tiling (a reduction's tiny output has no pass-row height). The "rows"
-    # is the partition device dim (out_dims[-2]); an HBM full-buffer output reports the
-    # UNTILED height, so divide by loop_trip to recover the per-tile slice, whereas an
-    # LX intermediate is already allocated per-tile. Then divide by the ROW-dim core
-    # split -- NOT total cores: at extreme tiling the planner may split COLUMNS instead
+    # is the partition device dim (out_dims[-2]) of ONE tile, as its committed tiling
+    # records it (``_tile_row_extent``), whatever the output's residency. Then divide
+    # by the ROW-dim core split -- NOT total cores: at extreme tiling the planner may
+    # split COLUMNS instead
     # (rows/tile < col-sticks), leaving each core a full row tile (no underfill). 0.0 =
     # N/A -> no derate.
     tile_rows_per_core = 0.0
@@ -1464,8 +1477,7 @@ def extract_op_features(
             # tiles. Not loop_trip, which also counts reduction tiles.
             rows = rows / output_tiles
         else:
-            # full-buffer alloc: per-tile slice is rows / loop_trip
-            rows = rows / loop_trip * (1 - out_is_lx) + rows * out_is_lx
+            rows = _tile_row_extent(op, len(out_size) - 2, rows)
         # `loop_trip > 1` is guaranteed by the branch condition; `_row_split` can in
         # principle return 0 if a split map ever records one, and this term is a
         # diagnostic -- a ZeroDivisionError here would take down a compile for a number

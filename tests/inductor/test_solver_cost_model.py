@@ -776,6 +776,31 @@ def test_extractor_reads_residency_from_is_lx(monkeypatch):
     assert feature.cores == cores
 
 
+@pytest.mark.parametrize("rows", [2048, 16384])
+def test_a_committed_tile_height_does_not_depend_on_residency(rows):
+    """A committed row tiling's per-tile height is its tile extent, whether the op
+    is sized for one tile (a ``for_each_tile`` body) or for the whole loop, and
+    whether its output is in LX or HBM: the LX-spill working set must not charge
+    residency."""
+    from torch._inductor.virtualized import V
+    from torch_spyre._inductor.loop_info import CoarseTileInfo
+
+    op = _extractable_op("buf1", [])
+    op.get_size = lambda: [rows, 128]
+    op.loop_info = CoarseTileInfo(
+        loop_group_id=(0,),
+        loop_count=[8],
+        loop_tiled_dims=[[0]],
+        output_tiled_dims=[[(0, 2048)]],
+    )
+    is_lx = sympy.Symbol("is_lx_buf1", integer=True, nonnegative=True)
+    graph = _StubGraph(inputs=[], outputs=[])
+    graph.get_buffer = lambda name: _extractable_op(name, [])
+    with V.set_graph_handler(graph):
+        feature = dcm.extract_op_features(op, is_lx={"buf1": is_lx})
+    assert feature.tile_rows_per_core == 2048
+
+
 @pytest.mark.parametrize("placement", [None, {"buf0": True, "buf1": False}])
 def test_extractor_without_buffers_keeps_committed_or_explicit_placement(placement):
     from torch._inductor.virtualized import V
