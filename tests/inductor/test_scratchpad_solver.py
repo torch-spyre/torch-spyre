@@ -56,12 +56,12 @@ try:
     from torch_spyre._inductor.scratchpad.cpsat_expr_printer import (
         _CORE_INV_SCALE,
         _MAX_PRODUCT_BOUND,
-        _LINEARIZE_TOLERANCE,
+        _MINMAX_TOLERANCE,
         _QUANTIZE_TOLERANCE,
         _SympyExprToCpSat,
         _simplify_eq_conjunction,
         power_of_two_scale,
-        ramer_douglas_peucker,
+        round_scaled,
     )
     from torch_spyre._inductor.scratchpad.ilp_solver_ortools import CpSatLayoutSolver
 
@@ -2121,75 +2121,52 @@ class TestSympyExprToCpSatPrinter(TestCase):
         self.assertEqual(solver.ObjectiveValue(), 20)
         self.assertEqual(solver.Value(sym_map["x"]), 10)
 
-    def test_fractional_power_is_within_tolerance_at_every_candidate(self):
-        # A fractional power of a split or tile symbol lowers through the values
-        # the symbol can take: a split with no menu takes the core range, a
-        # tile count takes its menu, here far past the core count.
+    def test_fractional_power_is_its_value_at_every_division(self):
+        # A fractional power of a split or tile symbol lowers to the table of
+        # its values over its buffer's menu, here a tile count far past the
+        # core count. A symbolic exponent, or a symbol with no menu, is left
+        # alone.
         tiles = [d for d in range(1, 4097) if 4096 % d == 0] + [3, 6, 12, 48, 768]
-        for name, buffer_map, values in (
-            ("split_x", {}, range(1, 33)),
-            ("tile_x", {"tile_x": (None, tiles)}, tiles),
-        ):
-            sym = sympy.Symbol(name, integer=True, positive=True)
-            printer = _SympyExprToCpSat(cp_model.CpModel(), {}, buffer_map)
+        menu = {"split_x": [1 + i % 32 for i in range(len(tiles))], "tile_x": tiles}
+        model, _, sym_map, buffer_map, symbols = self._one_buffer(menu)
+        printer = _SympyExprToCpSat(model, sym_map, buffer_map)
+        for sym in symbols:
             for exp in (0.25, sympy.Rational(1, 4), 0.15, 0.68, 0.75, -0.25):
-                with self.subTest(name=name, exp=exp):
-                    approx = printer._inv_log_sym(sym**exp)
-                    self.assertIsInstance(approx, sympy.Piecewise)
-                    for v in values:
-                        want = v ** float(exp)
-                        got = float(approx.subs(sym, v))
-                        self.assertLessEqual(
-                            abs(got - want), _LINEARIZE_TOLERANCE * want
-                        )
+                with self.subTest(name=sym.name, exp=exp):
+                    arg, xs, table = printer._power_table(sym**exp).args
+                    self.assertEqual(arg, sym)
+                    self.assertEqual(list(xs), sorted(set(menu[sym.name])))
+                    for x, y in zip(xs, table):
+                        want = int(x) ** float(exp)
+                        self.assertAlmostEqual(float(y), want, delta=1e-12 * want)
         n = sympy.Symbol("n")
-        split = sympy.Symbol("split_x", integer=True, positive=True)
-        printer = _SympyExprToCpSat(cp_model.CpModel(), {}, {})
-        self.assertEqual(printer._inv_log_sym(split**n), split**n)
-
-    def test_ramer_douglas_peucker_keeps_the_points_a_line_misses(self):
-        # Collinear points keep only the ends; a kink is kept, and points
-        # within the tolerance of the line through their neighbours are not.
-        xs = list(range(10))
-        self.assertEqual(
-            ramer_douglas_peucker(xs, [2 * x + 1 for x in xs], 0.0), [0, 9]
-        )
-        kinked = [6 - abs(x - 4) for x in xs]
-        self.assertEqual(ramer_douglas_peucker(xs, kinked, 0.01), [0, 4, 9])
-        bumped = [10.0, 10.0, 10.05, 10.0, 10.0]
-        self.assertEqual(ramer_douglas_peucker(range(5), bumped, 0.01), [0, 4])
-        self.assertEqual(
-            ramer_douglas_peucker(range(5), bumped, 0.001), [0, 1, 2, 3, 4]
-        )
-
-    def test_fractional_power_past_the_knot_limit_raises(self):
-        # A curve that needs more breakpoints than the limit is a lowering
-        # error, not a coarser objective.
-        split = sympy.Symbol("split_x", integer=True, positive=True)
-        printer = _SympyExprToCpSat(cp_model.CpModel(), {}, {})
-        module = "torch_spyre._inductor.scratchpad.cpsat_expr_printer"
-        with mock.patch(f"{module}._LINEARIZE_MAX_BREAKPOINTS", 2):
-            with self.assertRaisesRegex(ValueError, "breakpoints"):
-                printer._inv_log_sym(split**0.25)
+        self.assertEqual(printer._power_table(symbols[0] ** n), symbols[0] ** n)
+        free = sympy.Symbol("split_free", integer=True, positive=True)
+        self.assertEqual(printer._power_table(free**0.25), free**0.25)
 
     def test_negative_power_with_a_zero_candidate_is_left_alone(self):
         tile = sympy.Symbol("tile_x", integer=True, nonnegative=True)
-        printer = _SympyExprToCpSat(cp_model.CpModel(), {}, {"tile_x": (None, [0, 2])})
-        self.assertEqual(printer._inv_log_sym(tile**-0.5), tile**-0.5)
+        model, _, sym_map, buffer_map, _ = self._one_buffer({"tile_x": [0, 2]})
+        printer = _SympyExprToCpSat(model, sym_map, buffer_map)
+        self.assertEqual(printer._power_table(tile**-0.5), tile**-0.5)
 
     def test_fractional_power_inside_max_matches_brute_force(self):
         # The power sits inside a Max, as the PT efficiency sits inside the cost
         # model's min(compute, mem): the solve picks the candidate a brute
-        # force over the exact power picks, at its value within tolerance.
-        split = sympy.Symbol("split_s", integer=True, positive=True)
+        # force over the exact power picks. No variable multiplies the Max, so
+        # each of its numbers is within _MINMAX_TOLERANCE.
+        menu = {"split_s": list(range(1, 33))}
+        model, _, sym_map, buffer_map, (split,) = self._one_buffer(menu)
         expr = sympy.Max(300 * split**0.25, 1600 - 50 * split)
-        solver, sym_map = self._optimize(expr, {"split_s": (1, 32)}, maximize=False)
+        model.minimize(_SympyExprToCpSat(model, sym_map, buffer_map).convert(expr))
+        solver = cp_model.CpSolver()
+        self.assertEqual(solver.solve(model), cp_model.OPTIMAL)
         exact = {s: max(300 * s**0.25, 1600 - 50 * s) for s in range(1, 33)}
         best = min(exact, key=exact.get)
-        self.assertEqual(solver.Value(sym_map["split_s"]), best)
+        self.assertEqual(solver.value(sym_map["split_s"]), best)
         self.assertLessEqual(
-            abs(solver.ObjectiveValue() - exact[best]),
-            _LINEARIZE_TOLERANCE * exact[best],
+            abs(solver.objective_value - exact[best]),
+            _MINMAX_TOLERANCE * (1600 + 50 * best),
         )
 
     def test_an_ite_condition_becomes_and_or(self):
@@ -2267,7 +2244,7 @@ class TestSympyExprToCpSatPrinter(TestCase):
         exact = [max(300 * p**0.25, 1600 - 50 * p) for p in products]
         self.assertEqual(exact[solver.value(division)], min(exact))
         self.assertLessEqual(
-            abs(solver.objective_value - min(exact)), _LINEARIZE_TOLERANCE * min(exact)
+            abs(solver.objective_value - min(exact)), _QUANTIZE_TOLERANCE * min(exact)
         )
 
     def test_a_product_of_two_max_factors_keeps_its_number_outside(self):
@@ -2304,24 +2281,28 @@ class TestSympyExprToCpSatPrinter(TestCase):
         return model, division, sym_map, buffer_map, symbols
 
     def test_a_curve_over_one_buffer_is_its_quantized_value_table(self):
-        # Within the RDP and quantization budgets of the exact power at every
-        # division, through one element lookup.
+        # Within the quantization budget of the exact power at every division,
+        # through one element lookup. A power of one symbol reaches the
+        # printer, which lowers it; one of a product is merged first.
         menu = {"split_a": [1, 2, 4, 8, 16, 32], "tile_a": [1, 4, 2, 64, 8, 512]}
-        model, division, sym_map, buffer_map, (a, t) = self._one_buffer(menu)
-        expr = 7.0 * (a * t) ** 0.15
-        printer = _SympyExprToCpSat(model, sym_map, buffer_map)
-        cp_expr = printer.convert(expr)
-        budget = (1 + _LINEARIZE_TOLERANCE) * (1 + _QUANTIZE_TOLERANCE) - 1
-        for i, values in enumerate(zip(*menu.values())):
-            with self.subTest(division=i):
-                fixed = model.clone()
-                fixed.add(division == i)
-                solver = cp_model.CpSolver()
-                self.assertEqual(solver.solve(fixed), cp_model.OPTIMAL)
-                exact = 7.0 * math.prod(values) ** 0.15
-                self.assertLessEqual(
-                    abs(solver.float_value(cp_expr) - exact), budget * exact
-                )
+        budget = _QUANTIZE_TOLERANCE
+        for merged in (True, False):
+            model, division, sym_map, buffer_map, (a, t) = self._one_buffer(menu)
+            expr = 7.0 * (a * t if merged else a) ** 0.15
+            printer = _SympyExprToCpSat(model, sym_map, buffer_map)
+            self.assertEqual(printer._rewrite(expr).has(sympy.Pow), not merged)
+            cp_expr = printer.convert(expr)
+            for i, values in enumerate(zip(*menu.values())):
+                with self.subTest(merged=merged, division=i):
+                    fixed = model.clone()
+                    fixed.add(division == i)
+                    solver = cp_model.CpSolver()
+                    self.assertEqual(solver.solve(fixed), cp_model.OPTIMAL)
+                    product = math.prod(values) if merged else values[0]
+                    exact = 7.0 * product**0.15
+                    self.assertLessEqual(
+                        abs(solver.float_value(cp_expr) - exact), budget * exact
+                    )
 
     def test_a_derate_product_is_pushed_into_the_byte_min(self):
         # mem * (1 / eff) * (1 / spill): residency-gated bytes in a Min times two
@@ -2348,9 +2329,38 @@ class TestSympyExprToCpSatPrinter(TestCase):
         costs = {(i, r): exact(p, r) for i, p in enumerate(products) for r in (0, 1)}
         best = min(costs.values())
         chosen = (solver.value(division), solver.value(sym_map["is_lx_x"]))
-        budget = 2 * ((1 + _LINEARIZE_TOLERANCE) * (1 + _QUANTIZE_TOLERANCE) - 1)
+        budget = 2 * _QUANTIZE_TOLERANCE
         self.assertLessEqual(costs[chosen] - best, budget * best)
         self.assertLessEqual(abs(solver.objective_value - best), budget * best)
+
+    def test_round_scaled_rounds_half_to_even_at_full_precision(self):
+        self.assertEqual(round_scaled(sympy.Rational(5, 2), 1), 2)
+        self.assertEqual(round_scaled(sympy.Rational(7, 2), 1), 4)
+        self.assertEqual(round_scaled(sympy.Float(0.1), 2**40), round(0.1 * 2**40))
+        self.assertEqual(
+            round_scaled(sympy.Float(8820.2702261091), 2**31),
+            round(8820.2702261091 * 2**31),
+        )
+
+    def test_integers_past_int64_evaluate_without_overflow(self):
+        # Exactly rounded coefficients can outgrow int64; candidate values are
+        # Python integers through every operation.
+        model = cp_model.CpModel()
+        division = model.new_int_var(0, 2, "division")
+        owner = types.SimpleNamespace(division=division)
+        printer = _SympyExprToCpSat(model, {}, {"split_a": (owner, [1, 2, 4])})
+        a = sympy.Symbol("split_a", integer=True, positive=True)
+        # A Piecewise of small integers evaluates to an int64 array.
+        branch = sympy.Piecewise((1, a > 1), (2, True))
+        big = 3 * 2**70
+        for expr, want in (
+            (sympy.Min(branch, big), [2, 1, 1]),
+            (branch + big, [big + 2, big + 1, big + 1]),
+            (branch * big, [2 * big, big, big]),
+        ):
+            with self.subTest(expr=type(expr).__name__):
+                _, values = printer._candidate_values(expr)
+                self.assertEqual(list(values), want)
 
     def test_a_negative_product_pushed_into_a_min_keeps_its_value(self):
         # c * Min(R, W) * D with c < 0, D a derate over a buffer's curve (the
@@ -2367,7 +2377,7 @@ class TestSympyExprToCpSatPrinter(TestCase):
         term = sympy.Min(10 * x + 7, 6 * y + 20) * derate
         expr = 1000 - 2 * term
         cp_expr = _SympyExprToCpSat(model, sym_map, buffer_map).convert(expr)
-        budget = (1 + _LINEARIZE_TOLERANCE) * (1 + _QUANTIZE_TOLERANCE) - 1
+        budget = _QUANTIZE_TOLERANCE
         cases = itertools.product(range(4), ((0, 0), (1, 5), (5, 1), (3, 3)))
         for i, (vx, vy) in cases:
             with self.subTest(division=i, x=vx, y=vy):
@@ -2382,6 +2392,123 @@ class TestSympyExprToCpSatPrinter(TestCase):
                 size = float(2 * term.subs(values))
                 self.assertLessEqual(
                     abs(solver.float_value(cp_expr) - want), budget * size
+                )
+
+    def test_nested_scales_do_not_compound_past_int64(self):
+        # Three nested Min over floats: the outermost takes one scale and the
+        # others take it in turn, so every number is rounded once. A scale per
+        # level multiplies up, here past int64 against the 1e6 coefficient.
+        model = cp_model.CpModel()
+        sym_map = {n: model.new_int_var(0, 1000, n) for n in ("x", "y")}
+        x, y = sympy.symbols("x y", integer=True, nonnegative=True)
+        expr = sympy.Min(
+            1e6 * x + 0.37,
+            3.3e5 + sympy.Min(0.77e6 * y + 1.1, 5.5e5 + sympy.Min(0.31e6 * x, 2.9e5)),
+        )
+        cp_expr = _SympyExprToCpSat(model, dict(sym_map), {}).convert(expr)
+        self.assertEqual(model.validate(), "")
+        for vx, vy in ((0, 0), (1, 1), (3, 0), (0, 3), (2, 1), (1000, 1000)):
+            with self.subTest(x=vx, y=vy):
+                fixed = model.clone()
+                fixed.add(sym_map["x"] == vx)
+                fixed.add(sym_map["y"] == vy)
+                solver = cp_model.CpSolver()
+                self.assertEqual(solver.solve(fixed), cp_model.OPTIMAL)
+                want = float(expr.subs({x: vx, y: vy}))
+                self.assertAlmostEqual(
+                    solver.float_value(cp_expr),
+                    want,
+                    delta=_MINMAX_TOLERANCE * max(want, 1),
+                )
+
+    def test_a_choice_among_numbers_carries_its_terms_coefficient(self):
+        # c * D1 * D2 * choice inside a Min: a variable multiplies each derate,
+        # so each takes a coarse scale of its own; the choice, a Piecewise of
+        # numbers, takes the coefficient, rounded once per branch. On a scale
+        # of its own it leaves a coefficient that rounds to zero.
+        menu = {"split_a": [1, 2, 4, 8, 16], "tile_a": [8, 4, 2, 64, 1]}
+        model, division, sym_map, buffer_map, (a, t) = self._one_buffer(menu)
+        sym_map["is_lx_x"] = model.new_bool_var("is_lx_x")
+        lx = sympy.Symbol("is_lx_x", integer=True, nonnegative=True)
+        derates = sympy.Max(1, 4 / (a * t) ** 0.5) * sympy.Max(1, 0.9 * (a * t) ** 0.06)
+        choice = sympy.Piecewise((7.1e4, sympy.Eq(lx, 1)), (9.3e4, True))
+        expr = sympy.Min(1e7, 3e-3 * derates * choice + 11.0)
+        cp_expr = _SympyExprToCpSat(model, sym_map, buffer_map).convert(expr)
+        budget = 2 * _QUANTIZE_TOLERANCE
+        products = [math.prod(c) for c in zip(*menu.values())]
+        for (i, p), r in itertools.product(enumerate(products), (0, 1)):
+            with self.subTest(division=i, is_lx=r):
+                fixed = model.clone()
+                fixed.add(division == i)
+                fixed.add(sym_map["is_lx_x"] == r)
+                solver = cp_model.CpSolver()
+                self.assertEqual(solver.solve(fixed), cp_model.OPTIMAL)
+                d = max(1, 4 / p**0.5) * max(1, 0.9 * p**0.06)
+                want = min(1e7, 3e-3 * d * (7.1e4 if r else 9.3e4) + 11.0)
+                self.assertLessEqual(
+                    abs(solver.float_value(cp_expr) - want), budget * want
+                )
+
+    def test_a_literal_leaves_a_node_on_the_scale_around_it(self):
+        # (1 - lit) * D inside a Min: a literal widens no product, so both
+        # copies of D take the Min's scale and cancel exactly under the literal.
+        model, division, sym_map, buffer_map, (a,) = self._one_buffer(
+            {"split_a": [1, 2, 4, 8, 16]}
+        )
+        sym_map["is_lx_x"] = model.new_bool_var("is_lx_x")
+        lx = sympy.Symbol("is_lx_x", integer=True, nonnegative=True)
+        derate = sympy.Max(0.93, 0.1 * a**0.5)
+        expr = sympy.Min(5000, 4321.7 * derate - 4321.7 * lx * derate + 7 * lx)
+        cp_expr = _SympyExprToCpSat(model, sym_map, buffer_map).convert(expr)
+        for i in range(5):
+            with self.subTest(division=i):
+                fixed = model.clone()
+                fixed.add(division == i)
+                fixed.add(sym_map["is_lx_x"] == 1)
+                solver = cp_model.CpSolver()
+                self.assertEqual(solver.solve(fixed), cp_model.OPTIMAL)
+                self.assertAlmostEqual(solver.float_value(cp_expr), 7.0, delta=1e-9)
+
+    def test_a_curve_prints_where_tables_are_off(self):
+        # A product retried without tables (one had widened it past the bound)
+        # still lowers its curves: a curve is one lookup either way.
+        menu = {"split_a": [1, 2, 4, 8]}
+        model, division, sym_map, buffer_map, (a,) = self._one_buffer(menu)
+        printer = _SympyExprToCpSat(model, sym_map, buffer_map)
+        printer._allow_tables = False
+        cp_expr = printer._print(printer._power_table(a**0.5))
+        for i, value in enumerate(menu["split_a"]):
+            with self.subTest(division=i):
+                fixed = model.clone()
+                fixed.add(division == i)
+                solver = cp_model.CpSolver()
+                self.assertEqual(solver.solve(fixed), cp_model.OPTIMAL)
+                want = value**0.5
+                self.assertLessEqual(
+                    abs(solver.float_value(cp_expr) - want), _QUANTIZE_TOLERANCE * want
+                )
+
+    def test_a_curve_nothing_multiplies_prints_past_the_product_bound(self):
+        # A curve alone in its term takes the Min's scale and the term's
+        # coefficient; its integers pass _MAX_PRODUCT_BOUND here. That bound is
+        # for a product's factors, and the curve is still one lookup.
+        menu = {"split_a": [1, 2, 4, 8, 16]}
+        model, division, sym_map, buffer_map, (a,) = self._one_buffer(menu)
+        sym_map["x"] = model.new_int_var(0, 1000, "x")
+        x = sympy.Symbol("x", integer=True, nonnegative=True)
+        expr = sympy.Min(3.7e6 + 1.5 * x, 1.3e6 * a**0.5)
+        cp_expr = _SympyExprToCpSat(model, sym_map, buffer_map).convert(expr)
+        self.assertEqual(model.validate(), "")
+        for (i, value), vx in itertools.product(enumerate(menu["split_a"]), (0, 1000)):
+            with self.subTest(division=i, x=vx):
+                fixed = model.clone()
+                fixed.add(division == i)
+                fixed.add(sym_map["x"] == vx)
+                solver = cp_model.CpSolver()
+                self.assertEqual(solver.solve(fixed), cp_model.OPTIMAL)
+                want = min(3.7e6 + 1.5 * vx, 1.3e6 * value**0.5)
+                self.assertAlmostEqual(
+                    solver.float_value(cp_expr), want, delta=_MINMAX_TOLERANCE * want
                 )
 
     def test_negated_and_unnamed_boolean_products_preserve_every_assignment(self):
