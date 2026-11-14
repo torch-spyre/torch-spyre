@@ -45,7 +45,7 @@ from utils_inductor import expects_raise
 
 import torch_spyre  # noqa: F401
 import torch_spyre._inductor.config as spyre_config
-from torch_spyre._C import get_spyre_tensor_layout
+from torch_spyre._C import get_spyre_tensor_layout, SpyreTensorLayout
 from torch_spyre._inductor.wsr import for_each_tile
 from torch_spyre.execution.kernel_cache import get_cache_root_dir
 
@@ -166,3 +166,31 @@ def test_the_reserved_tail_is_never_read():
 
     assert torch.isfinite(out).all()
     torch.testing.assert_close(out, F.gelu(x[:rows].float()), atol=ATOL, rtol=RTOL)
+
+
+def test_a_loop_over_a_dim_declared_with_an_explicit_layout_is_right_at_every_size():
+    """The declaration given together with device_layout= (#6027).
+
+    The layout is the one the transfer would derive at the maximum, given
+    explicitly, so this covers the plumbing: the compiler reads the layout and
+    the contract off the tensor and builds the loop at the declared maximum,
+    one graph and one kernel across SIZES, with the layout pinned throughout.
+    """
+    x = torch.rand(SPEC["max"], COLS, dtype=torch.float16)
+    explicit = SpyreTensorLayout((SPEC["max"], COLS), torch.float16)
+    y = x.to(DEVICE, dynamic={0: SPEC}, device_layout=explicit)
+    layout = str(get_spyre_tensor_layout(y))
+    assert layout == str(explicit)
+    compiled = torch.compile(tiled_gelu, fullgraph=True)
+
+    for n in SIZES:
+        if y.size(0) != n:
+            y.resize_((n, COLS))
+        out = compiled(y).cpu().float()
+        assert str(get_spyre_tensor_layout(y)) == layout, f"layout changed at {n} rows"
+        torch.testing.assert_close(
+            out, F.gelu(x[:n].float()), atol=ATOL, rtol=RTOL, msg=f"at {n} rows"
+        )
+
+    assert counters["stats"]["unique_graphs"] == 1
+    assert _kernel_cache_entries() == 1

@@ -471,16 +471,46 @@ y.resize_((141, 1024))  # RuntimeError: not a multiple of granularity
 ```
 
 A resize within the reservation never reallocates, and the
-`SpyreTensorLayout` stays identical for every size in range. This is what keeps
-the layout part of a compiled graph's guards from changing as the size changes.
+`SpyreTensorLayout` stays identical for every size in range, whether it was
+derived from `max` or given explicitly (next section). This is what keeps the
+layout part of a compiled graph's guards from changing as the size changes.
 Only the reserved dimension may change; the rank and every other dimension must
 stay the same, otherwise `resize_` raises.
+
+#### Declaring with an explicit device layout
+
+`dynamic=` can be combined with `device_layout=`. The layout then describes the
+reserved buffer, so it is the layout of the tensor at `max`, not at its current
+size:
+
+```
+ids = torch.arange(12 * 32, dtype=torch.int32).reshape(12, 32, 1)
+# One int32 id per 128-byte stick, 16 rows reserved.
+layout = SpyreTensorLayout(
+    [16, 1, 32, 32], [32, 0, 1, 0], get_device_dtype(torch.int32),
+    {(0,): 16, (2,): 32, (1, 3): 1},
+)
+spec = {0: {"min": 8, "max": 16, "granularity": 1}}
+d = ids.to("spyre", device_layout=layout, dynamic=spec)
+d.resize_((9, 32, 1))  # exact, the layout stays the one given
+```
+
+The reserved host dimension must occupy exactly one device dimension of the
+layout, whole: the device dimension whose `stride_map` entry is the host stride
+of the reserved dimension. That dimension's extent must be `max`, and it cannot
+be the stick-elements dimension. A layout that folds the reserved dimension
+into another, splits it across the stick, or sizes it for anything but `max`
+is refused with a `ValueError` before anything is allocated. The derived layout
+satisfies these rules by construction, so giving
+`SpyreTensorLayout(max_shape, dtype)` explicitly is the same as the call
+without `device_layout=`.
 
 #### Restrictions
 
 - `dynamic=` applies only to an eager, CPU to `"spyre"` call of `to()`. Make the
-  call before compiling, not inside a compiled function. It cannot be combined
-  with `device_layout=`. `dtype=` is honoured (the conversion happens on the
+  call before compiling, not inside a compiled function. `device_layout=` may be
+  given with it, as a layout for the tensor at `max` (see "Declaring with an
+  explicit device layout"). `dtype=` is honoured (the conversion happens on the
   host before the transfer); a non-default `memory_format` is rejected.
   `non_blocking=True` is accepted, but the transfer is always synchronous.
 - Only dimension 0, the outermost dimension, can be reserved, and only one
