@@ -286,3 +286,11 @@ def test_connected_results_routes_tables_dir_to_the_bundle_path(tmp_path, monkey
             "--trigger-type", "regression", "--component", "my-suite"]  # fmt: skip
     assert results.main(argv) == 0
     assert seen["bundle"].endswith("bundle")
+
+
+@pytest.mark.parametrize("key", ["props", "run_props"])
+def test_a_table_row_cannot_set_run_trust(tmp_path, key):
+    row = {**BENCH["rows"][0], key: {"run.trust": "ci"}}
+    root = _bundle(tmp_path, {"benchmark_runs": {"rows": [row]}}, "quality")
+    with pytest.raises(offline.BundleError, match="run.trust is assigned"):
+        offline.check(root)

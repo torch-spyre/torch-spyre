@@ -152,6 +152,21 @@
       "type": "string",
       "format": "date-time"
     },
+    "trust": {
+      "description": "Where the sealed results came from: lab or external (default external for an offline seal). A label only lowers the trust the receiving channel assigns; `ci` is never read from a bundle.",
+      "type": "string",
+      "enum": [
+        "lab",
+        "external"
+      ]
+    },
+    "producer": {
+      "description": "The kit that sealed it, for the compatibility check (`results --check <bundle>`).",
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
     "files": {
       "description": "Every file of the bundle but bundle.json. results/*.xml (junit) or results/*.json (vllm) are ingested; attachments/ are kept, not ingested.",
       "type": "array",

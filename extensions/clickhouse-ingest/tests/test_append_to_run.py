@@ -45,7 +45,7 @@ class Fake:
         self, target=FIRST, shas=("old",), taken=(), listed="", counts=(0, 1, 2.0)
     ):
         self.target, self.shas, self.taken, self.listed = target, shas, taken, listed
-        self.counts, self.inserted = counts, []
+        self.counts, self.inserted, self.trust = counts, [], ()
 
     def set_client_setting(self, k, v):
         pass
@@ -53,6 +53,9 @@ class Fake:
     def query(self, sql, parameters=None):
         if "bundle_kind" in sql:
             rows = [list(self.target)] if self.target else []
+        elif "run.trust" in sql:
+            assert "v_artifact_results_published" in sql
+            rows = [[t] for t in self.trust]
         elif "bundle_files" in sql:
             rows = [[self.listed]]
         elif "bundle_sha256" in sql:
@@ -75,7 +78,7 @@ class Fake:
 
 @pytest.fixture
 def online(monkeypatch):
-    state = SimpleNamespace(client=Fake(), calls=[])
+    state = SimpleNamespace(client=Fake(), calls=[], trusts=[])
     monkeypatch.setattr(client.ClickHouse, "connect", lambda **kw: state.client)
     monkeypatch.setattr(client, "tables_present", lambda *a, **k: True)
     monkeypatch.setattr(
@@ -84,8 +87,9 @@ def online(monkeypatch):
     )  # fmt: skip
     monkeypatch.setattr(
         bundle, "write_junit",
-        lambda db, root, meta, aid, rid, props, strict: state.calls.append(
-            bundle.results_argv(meta, root, aid, rid, props, strict)
+        lambda db, root, meta, aid, rid, props, strict: (
+            state.calls.append(bundle.results_argv(meta, root, aid, rid, props, strict)),
+            state.trusts.append(props.get("run.trust")),
         ),
     )  # fmt: skip
     monkeypatch.setenv("CLICKHOUSE_DB_V2", "spyre_v2")
@@ -309,3 +313,50 @@ def test_the_prop_changes_no_row_id():
     assert plain[:2] == tagged[:2]
     assert tagged[2]["upload_id"] == UPLOAD and tagged[3]["round"] == "1"
     assert "upload_id" not in plain[2] and "upload_id" not in plain[3]
+
+
+@pytest.mark.parametrize(
+    "earlier, channel, recorded",
+    [
+        (("external",), "ci", "external"),
+        (("lab", "external"), "ci", "external"),
+        (("lab",), "ci", "lab"),
+        (("lab",), "external", "external"),
+        ((), "ci", "ci"),
+        (("",), "ci", "ci"),
+    ],
+)
+def test_an_append_round_never_raises_the_runs_trust(
+    tmp_path, online, capsys, earlier, channel, recorded
+):
+    online.client.trust = earlier
+    code, report = _run(_root(tmp_path), capsys, "--channel-trust", channel)
+    assert code == 0 and report["trust"] == recorded
+    assert online.trusts == [recorded]
+
+
+@pytest.mark.parametrize(
+    "earlier, own, recorded",
+    [
+        (("ci",), "", "ci"),
+        (("external",), "", "external"),
+        (("lab",), "ci", "lab"),
+        ((), "", None),
+    ],
+)
+def test_an_append_round_neither_raises_nor_erases_the_runs_trust(
+    tmp_path, online, capsys, earlier, own, recorded
+):
+    online.client.trust = earlier
+    flags = ["--channel-trust", own] if own else []
+    code, report = _run(_root(tmp_path), capsys, *flags)
+    assert code == 0 and report.get("trust") == recorded
+    assert online.trusts == [recorded]
+
+
+def test_a_first_round_without_trust_does_not_cap_a_later_ci_round(
+    tmp_path, online, capsys
+):
+    online.client.trust = ()
+    code, report = _run(_root(tmp_path), capsys, "--channel-trust", "ci")
+    assert code == 0 and report["trust"] == "ci"

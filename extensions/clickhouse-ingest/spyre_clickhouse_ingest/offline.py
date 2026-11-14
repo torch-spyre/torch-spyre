@@ -31,6 +31,7 @@ import argparse
 import base64
 import contextlib
 import getpass
+import gzip
 import hashlib
 import json
 import math
@@ -48,10 +49,15 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as etree
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 SCHEMA_VERSION = 1
+KIT = "spyre-clickhouse-ingest"
+# What a sealer may claim about its own source; `ci` is assigned by the receiving channel only.
+TRUST_LABELS = ("lab", "external")
+CHANNEL_TRUST = ("external", "lab", "ci")  # least to most trusted
+DEFAULT_TRUST = "external"
 BUNDLE_FILE = "bundle.json"
 FAILED, REJECTED, INCOMPLETE = 1, 2, 3
 STATUS = {FAILED: "failed", REJECTED: "rejected", INCOMPLETE: "incomplete"}
@@ -98,6 +104,82 @@ class BundleError(Exception):
     def __init__(self, message: str, code: int = REJECTED):
         super().__init__(message)
         self.code = code
+
+
+def kit_version() -> str:
+    try:
+        from importlib.metadata import version
+
+        return version(KIT)
+    except Exception:  # noqa: BLE001 -- running from a bare offline.py
+        return "unknown"
+
+
+def effective_trust(label: str = "", channel: str = "") -> str:
+    """The trust recorded: '' when neither the bundle nor the channel says. Otherwise the
+    channel's level (the lowest, `external`, when a labelled bundle arrives without one),
+    lowered by the bundle's label if that is lower. A bundle never raises its trust."""
+    if not (label or channel):
+        return ""
+    levels = [t for t in (label, channel or DEFAULT_TRUST) if t]
+    return min(levels, key=CHANNEL_TRUST.index)
+
+
+def receipt_id(content_sha256: str, upload_id: str = "") -> str:
+    """RCPT-XXXX-XXXX-XXXX-XXXX, from the bundle digest and the upload id; recomputable by
+    whoever holds both."""
+    h = (
+        hashlib.sha256(f"{content_sha256}\0{upload_id}".encode())
+        .hexdigest()[:16]
+        .upper()
+    )
+    return "RCPT-" + "-".join(h[i : i + 4] for i in range(0, 16, 4))
+
+
+def preflight(path: Path = None) -> dict:
+    """What this ingest accepts, and when `path` names a bundle, whether it can read it."""
+    out = {
+        "kit": KIT, "kit_version": kit_version(), "schema_versions": [SCHEMA_VERSION],
+        "kinds": list(KINDS), "trust_labels": list(TRUST_LABELS),
+    }  # fmt: skip
+    if path is None:
+        return out
+    with opened(path) as root:
+        f = root / BUNDLE_FILE
+        if not f.is_file():
+            raise BundleError(f"no {BUNDLE_FILE} in {path}", INCOMPLETE)
+        try:
+            meta = json.loads(f.read_text())
+        except (json.JSONDecodeError, UnicodeDecodeError) as err:
+            raise BundleError(f"{BUNDLE_FILE} is not JSON: {err}") from None
+        invalid = ""
+        try:
+            check(root)
+        except BundleError as err:
+            invalid = str(err)
+    if not isinstance(meta, dict):
+        raise BundleError(f"{BUNDLE_FILE} is not a JSON object")
+    version = meta.get("schema_version", SCHEMA_VERSION)
+    unknown = sorted(set(meta) - set(schema()["properties"]))
+    producer = meta.get("producer") if isinstance(meta.get("producer"), dict) else {}
+    out["bundle"] = {"schema_version": version, "producer": producer,
+                     "kind": meta.get("kind", "junit"), "trust": meta.get("trust", "")}  # fmt: skip
+    problems = []
+    if not isinstance(version, int) or version > SCHEMA_VERSION:
+        problems.append(
+            f"schema_version {version!r} is newer than this ingest ({SCHEMA_VERSION}): "
+            "upgrade the connected ingest, or re-seal with an older kit"
+        )
+    if unknown:
+        problems.append(
+            f"fields this ingest does not know: {unknown}: upgrade the connected ingest, "
+            "or re-seal with an older kit"
+        )
+    if invalid and not problems:
+        problems.append(f"does not validate: {invalid}")
+    out["compatible"] = not problems
+    out["problems"] = problems
+    return out
 
 
 def schema() -> dict:
@@ -356,6 +438,10 @@ def benchmark_entries(path: Path) -> list:
             raise BundleError(f"{where}: unknown key(s) {sorted(unknown)}")
         for key in ("props", "run_props"):
             m = b.get(key, {})
+            if isinstance(m, dict) and "run.trust" in m:
+                raise BundleError(
+                    f"{where}: run.trust is assigned by the receiving channel"
+                )
             if not isinstance(m, dict) or not all(
                 isinstance(v, (str, int, float)) and not isinstance(v, bool)
                 for v in m.values()
@@ -403,6 +489,12 @@ def check_tables(root: Path, meta: dict, results: list) -> None:
             table, rows = load_rows(root / p)
         except RowError as err:
             raise BundleError(str(err)) from None
+        if any(
+            isinstance(r, dict)
+            and any("run.trust" in (r.get(k) or {}) for k in ("props", "run_props"))
+            for r in rows
+        ):
+            raise BundleError(f"{p}: run.trust is assigned by the receiving channel")
         if table in loaded:
             raise BundleError(f"{table} appears twice")
         loaded[table] = rows
@@ -592,27 +684,102 @@ def opened(path: Path):
         yield top
 
 
+def _plain(info: tarfile.TarInfo) -> tarfile.TarInfo:
+    info.mtime, info.uid, info.gid, info.uname, info.gname, info.mode = (
+        0,
+        0,
+        0,
+        "",
+        "",
+        0o644,
+    )
+    return info
+
+
 def pack(root: Path, tgz: Path) -> Path:
-    with tarfile.open(tgz, "w:gz") as tar:
+    """A .tgz of the bundle whose bytes depend on its content alone (no times, owners or modes)."""
+    with contextlib.ExitStack() as stack:
+        raw = stack.enter_context(tgz.open("wb"))
+        gz = stack.enter_context(
+            gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0)
+        )
+        tar = stack.enter_context(tarfile.open(fileobj=gz, mode="w"))
         for p in [BUNDLE_FILE, *bundle_files(root)]:
-            tar.add(root / p, arcname=p)
+            tar.add(root / p, arcname=p, filter=_plain)
     return tgz
 
 
-def _earliest_suite(paths) -> str:
-    """The earliest <testsuite timestamp>, as UTC; pytest writes it naive, in local time."""
-    stamps = []
+def _suite_end(start: datetime, text: str) -> datetime:
+    """`start` plus the suite's time; `start` itself when the time is unusable."""
+    try:
+        seconds = float(text or 0)
+        if math.isfinite(seconds) and seconds >= 0:
+            return start + timedelta(seconds=seconds)
+    except (ValueError, OverflowError):
+        pass
+    return start
+
+
+def _suite_window(paths) -> tuple:
+    """(first start, last end, zone-less count) over the <testsuite>s' timestamps and times, as
+    UTC. A zone-less timestamp is read as UTC, as the dashboard reads it."""
+    starts, ends, naive, dropped = [], [], 0, 0
     for xml in paths:
         with contextlib.suppress(etree.ParseError, OSError):
             for suite in etree.parse(xml).getroot().iter("testsuite"):
-                with contextlib.suppress(ValueError):
-                    ts = datetime.fromisoformat(suite.get("timestamp", ""))
-                    stamps.append(ts if ts.tzinfo else ts.astimezone())
+                text = suite.get("timestamp", "")
+                try:
+                    ts = datetime.fromisoformat(text.replace("Z", "+00:00"))
+                    naive += ts.tzinfo is None
+                    ts = (
+                        ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+                    ).astimezone(timezone.utc)
+                except (ValueError, OverflowError):
+                    dropped += bool(text)
+                    continue
+                starts.append(ts)
+                ends.append(_suite_end(ts, suite.get("time", "0")))
+    if dropped:
+        print(
+            f"[warn] {dropped} JUnit timestamp(s) could not be read and were ignored "
+            "(Python before 3.11 reads only some ISO-8601 forms)",
+            file=sys.stderr,
+        )
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
     return (
-        min(stamps).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        if stamps
-        else ""
+        min(starts).strftime(fmt) if starts else "",
+        max(ends).strftime(fmt) if ends else "",
+        naive,
     )
+
+
+_SUITE_TAG = re.compile(rb"<testsuite\b(?:\"[^\"]*\"|'[^']*'|[^>\"'])*>")
+_HOSTNAME = re.compile(rb"(\shostname\s*=\s*)(?:\"[^\"]+\"|'[^']+')")
+
+
+def _scrub_hostnames(root: Path, host: str) -> tuple:
+    """Blank every non-empty hostname attribute of the <testsuite> tags in results/*.xml, byte
+    for byte otherwise. Returns (attributes blanked, files that still mention `host`)."""
+    blanked, mentions = 0, []
+    for p in sorted((root / "results").iterdir()):
+        data = p.read_bytes()
+        new, n = data, 0
+        if p.suffix.lower() == ".xml":
+
+            def tag(m):
+                nonlocal n
+                out, k = _HOSTNAME.subn(rb'\1""', m.group(0))
+                n += k
+                return out
+
+            new = _SUITE_TAG.sub(tag, data)
+        if n:
+            p.chmod(p.stat().st_mode | 0o200)
+            p.write_bytes(new)
+            blanked += n
+        if any(n.encode() in new for n in {host, host.split(".")[0]} if n):
+            mentions.append(p.name)
+    return blanked, mentions
 
 
 def _arch(value: str) -> str:
@@ -620,7 +787,7 @@ def _arch(value: str) -> str:
     return "x86_64" if a in ("amd64", "x86", "x86-64") else a
 
 
-def write(args) -> Path:
+def write(args, validate_times: bool = True) -> Path:
     """The bundle these `results` flags describe, written to --out (a folder, or a .tgz)."""
     kind = "vllm" if (args.kind == "vllm" or args.vllm_results_dir) else args.kind
     if getattr(args, "benchmarks_dir", ""):
@@ -671,11 +838,48 @@ def write(args) -> Path:
         meta["tags"] = list(args.tags)
     if args.perf:
         meta["perf"] = dict(args.perf)
-    started = args.triggered_at or (_earliest_suite(results) if kind == "junit" else "")
-    if started:
-        meta["started_at"] = started
-    meta["ended_at"] = _now()
-    meta["runner"] = {"host": socket.gethostname(), "user": getpass.getuser()}
+    first, last, naive = _suite_window(results) if kind == "junit" else ("", "", 0)
+    if naive and not (args.triggered_at and getattr(args, "ended_at", "")):
+        print(
+            f"[warn] {naive} JUnit timestamp(s) carry no time zone; read as UTC "
+            "(--triggered-at / --ended-at override)",
+            file=sys.stderr,
+        )
+    given_end = getattr(args, "ended_at", "")
+    for flag, value in (
+        ("--triggered-at", args.triggered_at),
+        ("--ended-at", given_end),
+    ):
+        if validate_times and value and not _date_time(value):
+            raise BundleError(f"{flag} {value!r} is not an ISO-8601 time with a zone")
+    if args.triggered_at or first:
+        meta["started_at"] = args.triggered_at or first
+    if given_end or last:
+        meta["ended_at"] = given_end or last
+    if (
+        _date_time(meta.get("ended_at", ""))
+        and _date_time(meta.get("started_at", ""))
+        and _ts(meta["ended_at"]) < _ts(meta["started_at"])
+    ):
+        if given_end:
+            raise BundleError("--ended-at is before the start time")
+        print(
+            f"[warn] the last suite ends before the start time {meta['started_at']}; "
+            "ended_at set to the start",
+            file=sys.stderr,
+        )
+        meta["ended_at"] = meta["started_at"]
+    trust = getattr(args, "seal_trust", DEFAULT_TRUST)
+    if trust:
+        meta["trust"] = trust
+    meta["producer"] = {"name": KIT, "version": kit_version()}
+    runner = {}
+    if not getattr(args, "redact_host", False):
+        runner["host"] = socket.gethostname()
+    if not getattr(args, "redact_user", False):
+        runner["user"] = getpass.getuser()
+    if runner:
+        meta["runner"] = runner
     out = (
         Path(args.out)
         if args.out
@@ -688,6 +892,17 @@ def write(args) -> Path:
     (root / "results").mkdir(parents=True, exist_ok=True)
     for p in results:
         shutil.copy2(p, root / "results" / p.name)
+    if getattr(args, "redact_host", False):
+        blanked, mentions = _scrub_hostnames(root, socket.gethostname())
+        print(
+            f"[info] blanked {blanked} testsuite hostname attribute(s)", file=sys.stderr
+        )
+        if mentions:
+            print(
+                f"[warn] the sealing host name is still in {mentions}; --redact-host "
+                "only blanks the testsuite hostname attribute",
+                file=sys.stderr,
+            )
     if extra:
         (root / "attachments").mkdir(exist_ok=True)
         for p in extra:
@@ -896,6 +1111,20 @@ def add_offline_options(parser) -> None:
     g.add_argument("--root", default="",
                    help=f"results folder template with {{arch}}; default ${ENV_ROOT}")  # fmt: skip
     g.add_argument("--kind", choices=tuple(KINDS), default="junit")
+    g.add_argument("--ended-at", default="",
+                   help="--offline: ISO-8601 end time; default the last JUnit suite's end, else none")  # fmt: skip
+    g.add_argument("--seal-trust", choices=TRUST_LABELS, default=DEFAULT_TRUST,
+                   help=f"--offline: where the results came from (default {DEFAULT_TRUST}); "
+                   "the receiving channel decides the trust it records, and never accepts `ci` from a bundle")  # fmt: skip
+    g.add_argument("--redact-host", action="store_true",
+                   help="--offline: leave the sealing host out of bundle.json and blank the JUnit testsuite hostname")  # fmt: skip
+    g.add_argument("--redact-user", action="store_true",
+                   help="--offline: leave the sealing user out of bundle.json")  # fmt: skip
+    g.add_argument("--channel-trust", choices=CHANNEL_TRUST, default="",
+                   help="--from-bundle: the trust the receiving channel assigns (ci, lab, external); "
+                   "the bundle's own label can only lower it")  # fmt: skip
+    g.add_argument("--check", nargs="?", const=True, default=None, metavar="BUNDLE",
+                   help="print what this ingest accepts; with BUNDLE, whether it can read that bundle")  # fmt: skip
     g.add_argument(
         "--vllm-results-dir", default="", help="vLLM bench *.json (implies --kind vllm)"
     )
@@ -981,6 +1210,20 @@ def main(argv=None) -> int:
     if ignored:
         print(f"[warn] not recorded in a bundle: {' '.join(ignored)}", file=sys.stderr)
     try:
+        if args.channel_trust:
+            raise BundleError(
+                "--channel-trust applies to --from-bundle, not sealing or uploading"
+            )
+        if args.check is not None:
+            if args.offline or args.from_bundle or args.upload or args.validate_only:
+                raise BundleError(
+                    "--check stands alone: drop --offline/--upload/--from-bundle"
+                )
+            if args.check == "":
+                raise BundleError("--check wants a bundle path, or none at all")
+            out = preflight(Path(args.check) if isinstance(args.check, str) else None)
+            print(json.dumps(out, sort_keys=True))
+            return 0 if out.get("compatible", True) else REJECTED
         if args.validate_only:
             if not args.from_bundle:
                 raise BundleError("--validate-only needs --from-bundle <dir|tgz>")
