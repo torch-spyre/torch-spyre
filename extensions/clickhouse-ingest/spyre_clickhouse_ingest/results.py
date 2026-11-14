@@ -1591,8 +1591,14 @@ def _admitted_legs(legs: dict):
 
 def _write_named_artifact_verdicts(client, v2db: str, args, legs: dict) -> bool:
     """Register what the leg ran (and tag it), then its verdicts."""
-    run_url = _opt(args, "run_url") or _gha_run_url(args)
     result_props = dict(_opt(args, "result_props") or [])
+    if "run.trust" in result_props:
+        raise SystemExit(
+            "run.trust is assigned by the receiving channel, not passed in"
+        )
+    run_url = _opt(args, "run_url") or _gha_run_url(args)
+    if _opt(args, "assigned_trust"):
+        result_props["run.trust"] = args.assigned_trust
     source = result_props.pop("source", "") or (
         "jenkins" if _opt(args, "jenkins_run_key") else "gha"
     )
@@ -1841,16 +1847,20 @@ def _ingest_kind(argv, args) -> int:
     with tempfile.TemporaryDirectory(prefix="results-") as tmp:
         off.out = str(Path(tmp) / "bundle")
         try:
-            args.from_bundle = str(offline.write(off))
+            off.seal_trust = ""
+            off.ended_at = off.ended_at or offline._now()
+            args.from_bundle = str(offline.write(off, validate_times=False))
         except offline.BundleError as err:
             print(json.dumps({"status": offline.STATUS[err.code], "reason": str(err)}))
             return err.code
         return bundle.ingest(args)
 
 
-def main(argv=None):
+def main(argv=None, assigned_trust=""):
+    """`assigned_trust` is for bundle.write_junit only: no command-line flag can set it."""
     args = build_parser().parse_args(argv)
-    if args.offline or args.validate_only or args.upload:
+    args.assigned_trust = assigned_trust
+    if args.offline or args.validate_only or args.upload or args.check is not None:
         return offline_main(argv)
     if args.from_bundle:
         from spyre_clickhouse_ingest.bundle import ingest
@@ -1864,6 +1874,10 @@ def main(argv=None):
         or args.tables_dir
     ):
         return _ingest_kind(argv, args)
+    if args.channel_trust:
+        raise SystemExit(
+            "--channel-trust applies to --from-bundle and the vllm/sendnn/benchmarks/tables direct ingests"
+        )
     args.arch = args.arch or _platform.machine() or ""
     args.platform = args.arch
     # Resolved once here rather than re-tested at each call site, so the two paths cannot

@@ -253,6 +253,7 @@ results only: its artifact must already be in spyre_v2, and a manual bundle adds
 | write + upload | `results --offline --upload [--wait] <the usual flags>` |
 | upload one | `results --upload <dir\|tgz> [--as-folder] [--wait]` |
 | check one | `results --from-bundle <dir\|tgz> --validate-only` |
+| compatibility | `results --check [<dir\|tgz>]` |
 | record one (the relay) | `results --from-bundle <dir\|tgz> --strict` |
 
 A **connected** run records every kind directly with the same flags, no `--offline`:
@@ -286,6 +287,55 @@ On a host without network access, use either:
   `python -m spyre_clickhouse_ingest results --offline ...`;
 - or just `spyre_clickhouse_ingest/offline.py` with `bundle.schema.json` beside it:
   `python offline.py --offline ...` (same flags).
+
+### Sealing for a site without a route to the database
+
+- **Repeatable.** Sealing the same results twice gives the same bundle sha256 (and the same
+  `.tgz` bytes) on the same host with the same kit version (the host and user in `runner`, and
+  `producer.version`, are part of the digest unless redacted or the same), so a retried seal is a duplicate upload, not a second run. The seal time is not
+  recorded; `ended_at` is the last JUnit suite's end, or `--ended-at`, or absent.
+- **Redaction.** `bundle.json` records the sealing host and user under `runner`;
+  `--redact-host` and `--redact-user` leave them out. `--redact-host` also blanks the
+  `hostname` attribute (either quote style) of JUnit `<testsuite>` elements in `results/*.xml`,
+  byte for byte otherwise, and reports how many it blanked and which files still contain the
+  host name (for example in `system-out`). Redaction does not cover JUnit `<properties>`, `system-out`,
+  `run_url` or attachments, and the host-name check does not read non-ASCII-compatible XML
+  (such as UTF-16) or reliably tell a short host name from other text; the digest also depends on `producer.version` and, in a `.tgz`,
+  on the zlib build. An `--append-to-run` round carries the run's earlier trust forward when it has none of its
+  own, records the lower of the two when it has both, and writes nothing when neither exists. If the first round had no trust, a later round's own
+  trust is recorded as it is. A duplicate or dry run prints no receipt. `--check` stands alone
+  and needs a path or none.
+- **Trust label.** `--seal-trust lab|external` (default `external`) is recorded as `trust` in
+  `bundle.json`. It is a claim: the receiving channel decides the level, and the lower of the
+  two is recorded as `run.trust` on the run's verdict.
+  - `--channel-trust ci|lab|external` is the trusted-operator flag for `--from-bundle` and the
+    direct vllm/sendnn/benchmarks/tables ingests: whoever can run the ingest can assert a
+    level, as they can already write the database. It is an error with `--offline`/`--upload`,
+    `--validate-only`, `--check` and on the direct JUnit path.
+  - A labelled bundle with no channel level is recorded as `external`; a bundle with neither
+    a label nor a channel level records no `run.trust`, as before. A bundle can lower its
+    trust, never raise it; `ci` is refused in a bundle.
+  - Rejected: a `run.trust` key in the `props` or `run_props` of benchmark rows or table rows,
+    in `--bundle-prop`, and in `--result-prop`. Accepted, because it never reaches the
+    verdict: a JUnit `<property>` (it becomes a `test_case_runs` prop), a capability `sig`
+    entry (part of the capability identity) and `tags` (tag values).
+  - An `--append-to-run` round reads the run's earlier `run.trust` from
+    `v_artifact_results_published`, so retracted rounds do not count. `artifact_results` is
+    append-only, so no merge can drop an older verdict's trust.
+- **Time zones.** A JUnit timestamp without a zone is read as UTC (a warning says so whenever
+  a time is taken from such a file), whatever the sealing host's zone; the dashboard reads it
+  the same way. This is a change: sealing used to read it in the sealing host's local zone.
+  For `--offline`, `--triggered-at`/`--ended-at` must carry a zone, and an end before the
+  start is clamped to the start with a warning.
+- **Compatibility.** `results --check` prints the schema versions, kinds and trust labels this
+  ingest accepts. `results --check <bundle>` also says whether it can read that bundle (exit 2
+  and a message naming the side to upgrade when not). A sealed bundle carries `producer`
+  (kit name and version) for this. An ingest older than the kit refuses `trust` and `producer`
+  as unknown keys: upgrade the connected side first.
+- **Receipt.** `results --from-bundle` adds `receipt` to its report and prints it to stderr,
+  `RCPT-XXXX-XXXX-XXXX-XXXX`, the first 16 hex digits of sha256(`<bundle sha256>` NUL
+  `<upload_id>`), grouped. `upload_id` comes from `--bundle-prop upload_id=<id>` (empty
+  otherwise), so the site can recompute it from the digest it sealed.
 
 ### The bundle
 
