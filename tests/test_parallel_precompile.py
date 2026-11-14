@@ -89,3 +89,75 @@ def test_a_failure_in_the_caller_kills_the_children(monkeypatch):
             raise KeyboardInterrupt
     assert time.time() - started < 10
     assert not pool.running
+
+
+@pytest.mark.parametrize("name", pp._DEVICE_ENTRY_POINTS)
+def test_a_child_cannot_reach_the_runtime(monkeypatch, name):
+    import torch_spyre._C as spyre_c
+
+    if not hasattr(spyre_c, name):
+        pytest.skip(f"this build of torch_spyre._C has no {name}")
+
+    def fake_inner():
+        getattr(spyre_c, name)()  # refused before any argument is checked
+
+    monkeypatch.setattr(spyre_inductor, "_spyre_inner_compile", fake_inner)
+    with pp.fork_inner_compiles(1) as pool:
+        spyre_inductor._spyre_inner_compile()
+    assert (pool.ok, pool.failed) == (0, 1)
+
+
+def test_fork_while_threads_run_and_hold_a_lock(monkeypatch, tmp_path):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    lock, release = threading.Lock(), threading.Event()
+
+    def holder():
+        with lock:
+            release.wait(30)
+
+    held = threading.Thread(target=holder)
+    held.start()
+    executor = ThreadPoolExecutor(4)  # live pool threads at fork time
+    list(executor.map(abs, range(8)))
+
+    def fake_inner(name):
+        assert threading.active_count() == 1  # only this thread survives fork
+        (tmp_path / name).write_text("done")  # compile work that needs no lock
+
+    monkeypatch.setattr(spyre_inductor, "_spyre_inner_compile", fake_inner)
+    try:
+        with pp.fork_inner_compiles(2, timeout_s=20) as pool:
+            for i in range(4):
+                spyre_inductor._spyre_inner_compile(f"g{i}")
+        assert (pool.ok, pool.failed) == (4, 0)
+        assert len(list(tmp_path.iterdir())) == 4
+    finally:
+        release.set()
+        held.join()
+    assert lock.acquire(timeout=5)  # the parent's lock and pool are unaffected
+    lock.release()
+    assert list(executor.map(abs, [-1])) == [1]
+    executor.shutdown()
+
+
+def test_second_pass_check_reports_hits_and_misses(monkeypatch):
+    from torch._dynamo.utils import counters
+
+    warnings = []
+    monkeypatch.setattr(pp.logger, "warning", lambda *a: warnings.append(a))
+    with pp.SecondPassCheck(expected=2) as check:
+        counters["inductor"]["fxgraph_cache_hit"] += 2
+    assert (check.hits, check.misses) == (2, 0)
+    assert not warnings
+    with pp.SecondPassCheck(expected=2) as check:  # a graph no child compiled
+        counters["inductor"]["fxgraph_cache_hit"] += 2
+        counters["inductor"]["fxgraph_cache_miss"] += 1
+    assert (check.hits, check.misses) == (2, 1)
+    assert not warnings
+    with pp.SecondPassCheck(expected=2) as check:  # a child's compile was lost
+        counters["inductor"]["fxgraph_cache_hit"] += 1
+        counters["inductor"]["fxgraph_cache_miss"] += 1
+    assert (check.hits, check.misses) == (1, 1)
+    assert len(warnings) == 1

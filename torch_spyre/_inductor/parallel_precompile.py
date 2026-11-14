@@ -25,13 +25,28 @@ most ``n`` at once, and this process gets a stand-in graph that raises
 caller then resets those frames (``torch._dynamo.reset_code``) and runs the graphs
 again: each compile now finds the children's entries in the caches. A child that
 fails only costs time, because the second run compiles whatever is missing.
+``SecondPassCheck`` around that second run logs a warning with the numbers when
+any compile missed the FX graph cache, so a lost speedup does not go unnoticed.
+
+What a child may use: the compile itself (Python, the Inductor and Spyre lowering
+code, CP-SAT, and dbo-opt as a subprocess). What it may not use: the device. Every
+Python entry point of the Spyre runtime (start, allocation, copies, fills, streams,
+synchronize, kernel preparation) raises in a child, and so does the eager copy op.
+The child runs on one thread with ``compile_threads = 1``, so it starts no worker
+pool of its own (#4427's pool stays in the parent), and it never takes a lock that
+another thread of the parent could hold at fork time: such a lock stays held in
+the child, so a compile that needed it would hang and be killed by the timeout.
+
+Limits: Linux only (``os.fork``). Each child is a copy-on-write copy of the caller.
+For a vLLM engine with Granite 3.3 8B and 8 workers, the peak resident memory of the
+process tree grew from 16.9 GB to 25.1 GB (about 1 GB per child).
 """
 
 import contextlib
 import os
 import signal
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 from .logging_utils import get_inductor_logger
 
@@ -59,8 +74,27 @@ class _StandIn:
         )
 
 
+# The ``torch_spyre._C`` functions that reach the runtime or the device.
+_DEVICE_ENTRY_POINTS = (
+    "start_runtime",
+    "free_runtime",
+    "set_device",
+    "synchronize",
+    "spyre_empty_with_layout",
+    "spyre_empty_reserved",
+    "empty_with_layout",
+    "copy_tensor",
+    "copy_kv_page_raw",
+    "fill_tensor",
+    "get_composite_address",
+    "get_stream_from_pool",
+    "set_current_stream",
+    "prepare_kernel",
+)
+
+
 def _no_device(*args: Any, **kwargs: Any) -> Any:
-    raise RuntimeError("parallel precompile: a forked compile tried a device copy")
+    raise RuntimeError("parallel precompile: a forked compile tried to use the device")
 
 
 def _child_setup() -> None:
@@ -73,7 +107,10 @@ def _child_setup() -> None:
     signal.signal(signal.SIGCHLD, signal.SIG_DFL)
     torch.set_num_threads(1)  # the parent's OpenMP pool does not survive fork()
     torch._inductor.config.compile_threads = 1  # the parent's worker pool is not ours
-    spyre_c.copy_tensor = spyre_eager.copy_tensor = _no_device  # device stays here
+    for name in _DEVICE_ENTRY_POINTS:  # the device stays with the caller
+        if hasattr(spyre_c, name):
+            setattr(spyre_c, name, _no_device)
+    spyre_eager.copy_tensor = _no_device
 
 
 class _Pool:
@@ -174,3 +211,48 @@ def fork_inner_compiles(workers: int, timeout_s: float = 300.0):
         pool.workers,
         time.time() - started,
     )
+
+
+class SecondPassCheck:
+    """Count FX graph cache hits and misses of the run after the precompile.
+
+    Use it around the second run of the graphs, as a context manager or with
+    ``finish()``. ``expected`` is the number of compiles the children finished
+    (``pool.ok``). Fewer hits than that (or, without ``expected``, any miss) logs a
+    warning with the numbers, because the children's work was then lost.
+    """
+
+    def __init__(self, expected: Optional[int] = None) -> None:
+        from torch._dynamo.utils import counters
+
+        self._counters = counters["inductor"]
+        self._start = (
+            self._counters["fxgraph_cache_hit"],
+            self._counters["fxgraph_cache_miss"],
+        )
+        self.expected = expected
+        self.hits = self.misses = 0
+
+    def finish(self) -> tuple[int, int]:
+        self.hits = self._counters["fxgraph_cache_hit"] - self._start[0]
+        self.misses = self._counters["fxgraph_cache_miss"] - self._start[1]
+        if self.expected is None:
+            lost = self.misses > 0
+        else:  # misses beyond that are graphs the children never compiled
+            lost = self.hits < self.expected
+        log = logger.warning if lost else logger.info
+        log(
+            "parallel precompile: the second run hit the FX graph cache %d times "
+            "(children finished %s) and compiled %d graphs%s",
+            self.hits,
+            self.expected,
+            self.misses,
+            ": the children's work was lost" if lost else "",
+        )
+        return self.hits, self.misses
+
+    def __enter__(self) -> "SecondPassCheck":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.finish()
