@@ -295,7 +295,7 @@ class SymbolicTiledFeatureTest(TestCase):
         """With the tiling derates priced as the solver prices them
         (``_COST_PARAMS``), each captured op's tiled cost lowers through the
         real CP-SAT converter: its fractional powers of the symbolic tile
-        height, over a residency literal and a split, linearize."""
+        height, over a residency literal and a split, become tables."""
         try:
             from ortools.sat.python import cp_model
         except ImportError:
