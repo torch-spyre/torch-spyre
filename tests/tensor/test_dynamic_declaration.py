@@ -23,6 +23,7 @@ and unknown-key rejection in the same validation pass.
 """
 
 import warnings
+from types import SimpleNamespace
 
 import torch
 from torch.testing._internal.common_utils import run_tests, TestCase
@@ -30,10 +31,12 @@ from torch.testing._internal.common_utils import run_tests, TestCase
 import torch_spyre  # noqa: F401
 from torch_spyre._C import (
     get_reserved_dims,
+    get_spyre_tensor_layout,
     spyre_empty_reserved,
     SpyreTensorLayout,
 )
 from torch_spyre._inductor import config as inductor_config
+from torch_spyre._monkey_patch import _check_layout_for_reservation, _DynamicSpec
 
 DEVICE = torch.device("spyre")
 
@@ -177,15 +180,63 @@ class TestDynamicDeclarationValidation(TestCase):
         with self.assertRaisesRegex(RuntimeError, "overflow"):
             spyre_empty_reserved((560, 1024), (1024, 1), torch.float16, 0, 70, 2**62, 2)
 
-    def test_device_layout_with_dynamic_rejected(self) -> None:
-        # An explicit layout would be silently ignored otherwise.
+    def test_device_layout_not_at_max_rejected(self) -> None:
+        # The explicit layout describes the buffer at the declared max. A
+        # layout for today's 560 rows would be silently too small for 630.
         stl = SpyreTensorLayout((560, 1024), torch.float16)
-        with self.assertRaisesRegex(ValueError, "device_layout"):
+        with self.assertRaisesRegex(ValueError, "extent max=630, got 560"):
             self.x.to(
                 DEVICE,
                 device_layout=stl,
                 dynamic={0: {"min": 70, "max": 630, "granularity": 70}},
             )
+
+    def test_device_layout_reserved_dim_on_stick_rejected(self) -> None:
+        # dim_order puts host dim 0 in the stick: the reserved rows would be
+        # interleaved across sticks and could not be resized in place.
+        stl = SpyreTensorLayout((630, 1024), (1024, 1), torch.float16, [1, 0])
+        with self.assertRaisesRegex(ValueError, "exactly one device dimension"):
+            self.x.to(
+                DEVICE,
+                device_layout=stl,
+                dynamic={0: {"min": 70, "max": 630, "granularity": 70}},
+            )
+
+    def test_device_layout_at_max_accepted(self) -> None:
+        # The derived layout at max, given explicitly: accepted, the tensor
+        # keeps its real shape and carries the declaration.
+        stl = SpyreTensorLayout((630, 1024), torch.float16)
+        y = self.x.to(
+            DEVICE,
+            device_layout=stl,
+            dynamic={0: {"min": 70, "max": 630, "granularity": 70}},
+        )
+        self.assertEqual(tuple(y.shape), (560, 1024))
+        self.assertEqual(
+            get_reserved_dims(y), {0: {"min": 70, "max": 630, "granularity": 70}}
+        )
+        self.assertEqual(
+            list(get_spyre_tensor_layout(y).device_size), list(stl.device_size)
+        )
+
+    def test_layout_check_is_a_pure_function(self) -> None:
+        # The rule, without a device: the reserved host dim must sit whole in
+        # exactly one device dim, not the stick one, with extent max.
+        spec = _DynamicSpec(dim=0, min=8, max=16, granularity=1)
+        size, stride = (12, 32, 1), (32, 1, 1)
+        ok = SimpleNamespace(device_size=[16, 1, 32, 32], stride_map=[32, 0, 1, 0])
+        _check_layout_for_reservation(ok, spec, size, stride)
+        too_small = SimpleNamespace(
+            device_size=[12, 1, 32, 32], stride_map=[32, 0, 1, 0]
+        )
+        with self.assertRaisesRegex(ValueError, "extent max=16, got 12"):
+            _check_layout_for_reservation(too_small, spec, size, stride)
+        folded = SimpleNamespace(device_size=[1, 32, 32], stride_map=[0, 1, 0])
+        with self.assertRaisesRegex(ValueError, "found 0"):
+            _check_layout_for_reservation(folded, spec, size, stride)
+        on_stick = SimpleNamespace(device_size=[32, 1, 16], stride_map=[1, 0, 32])
+        with self.assertRaisesRegex(ValueError, "stick-elements"):
+            _check_layout_for_reservation(on_stick, spec, size, stride)
 
     def test_reserved_transfer_does_not_warn(self) -> None:
         # The transfer used to warn that compiled kernels were built for the
