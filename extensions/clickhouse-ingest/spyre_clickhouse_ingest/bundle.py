@@ -36,18 +36,22 @@ from .offline import (
     FAILED,
     MANUAL_PREFIX,
     STATUS,
+    CHANNEL_TRUST,
     BundleError,
     benchmark_entries,
     check,
     digest,
+    effective_trust,
     inbox_keys,
     is_manual,
     opened,
+    receipt_id,
     run_key,
     specs,
 )
 
 SOURCE = "bundle"
+TRUST_PROP = "run.trust"
 
 
 def run_id(meta: dict) -> str:
@@ -184,6 +188,20 @@ def check_append(
         )
 
 
+def prior_trust(client, db: str, aid: str, rid: str, test_type: str) -> str:
+    """The lowest run.trust the run's earlier verdicts carry; '' when none is recorded."""
+    rows = client.query(
+        f"SELECT DISTINCT props['{TRUST_PROP}'] FROM {db}.v_artifact_results_published "
+        "WHERE artifact_id = {aid:UUID} AND run_id = {rid:UUID} AND test_type = {t:String}",
+        parameters={"aid": aid, "rid": rid, "t": test_type},
+    ).result_rows
+    return min(
+        (r[0] for r in rows if r[0] in CHANNEL_TRUST),
+        key=CHANNEL_TRUST.index,
+        default="",
+    )
+
+
 def verdict_recorded(client, db: str, aid: str, rid: str, test_type: str) -> bool:
     return (
         client.query(
@@ -218,7 +236,7 @@ def results_argv(meta: dict, root: Path, aid: str, rid: str, props: dict, strict
     for tag in meta.get("tags", []):
         argv += ["--tag", tag]
     for k, v in props.items():
-        if v:
+        if v and k != TRUST_PROP:
             argv += ["--result-prop", f"{k}={v}"]
     from .writer import upload_row_props
 
@@ -245,8 +263,20 @@ def ingest(args) -> int:
     except BundleError as err:
         print(json.dumps({"status": STATUS[err.code], "reason": str(err)}))
         return err.code
+    if report.get("status") != "ingested":
+        report.pop("receipt", None)
     print(json.dumps(report, sort_keys=True))
+    if report.get("receipt"):
+        print(receipt_text(report), file=sys.stderr)
     return 0
+
+
+def receipt_text(report: dict) -> str:
+    """The printable receipt: what was recorded and the id to quote when asking about it."""
+    rows = [("receipt", report["receipt"]), ("status", report.get("status", "")),
+            ("bundle sha256", report.get("bundle_sha256", "")), ("run id", report.get("run_id", "")),
+            ("artifact", report.get("artifact_id", "")), ("trust", report.get("trust", ""))]  # fmt: skip
+    return "\n".join(f"{k:<14} {v}" for k, v in rows if v)
 
 
 def _ingest(root: Path, args) -> dict:
@@ -292,9 +322,17 @@ def _ingest(root: Path, args) -> dict:
     aid, rid = r.artifact_id, run_id(meta)
     report = {"run_key": meta["run_key"], "run_id": rid, "artifact_id": aid, "artifact_from": via,
               "test_type": meta["test_type"], "arch": meta["arch"], "bundle_sha256": sha}  # fmt: skip
+    extra = dict(getattr(args, "bundle_prop", None) or [])
+    if TRUST_PROP in extra:
+        raise BundleError(
+            f"{TRUST_PROP} is assigned by the receiving channel, not passed in"
+        )
+    trust = effective_trust(meta.get("trust", ""), getattr(args, "channel_trust", ""))
+    if trust:
+        report["trust"] = trust
+    report["receipt"] = receipt_id(sha, extra.get("upload_id", ""))
     seen, files = existing_run(client, db, rid, meta["component"])
     names = {Path(p).name for p in (root / "results").iterdir()}
-    extra = dict(getattr(args, "bundle_prop", None) or [])
     append = getattr(args, "append_to_run", False)
     if append:
         if sha in seen:
@@ -307,6 +345,10 @@ def _ingest(root: Path, args) -> dict:
             client, db, rid, meta["component"], extra["upload_id"]
         )
         check_append(target, names, taken, meta, aid, rid)
+        earlier = prior_trust(client, db, aid, rid, meta["test_type"])
+        if earlier:
+            trust = effective_trust(trust, earlier)
+            report["trust"] = trust
         report["append"] = True
     elif seen == {sha}:
         return {**report, "status": "duplicate"}
@@ -321,7 +363,7 @@ def _ingest(root: Path, args) -> dict:
     props = {**extra, "source": SOURCE, "uploader": uploader, "bundle_sha256": sha,
              "bundle_url": args.bundle_url, "bundle_kind": meta.get("kind", "junit"),
              "bundle_files": "\n".join(sorted(names)),
-             **({"round": "1"} if append else {})}  # fmt: skip
+             **({"round": "1"} if append else {}), **({TRUST_PROP: trust} if trust else {})}  # fmt: skip
     if meta.get("kind") == "vllm":
         report["benchmark_runs"] = write_vllm(client, db, root, meta, aid, rid, props)
     elif meta.get("kind") == "sendnn":
@@ -350,7 +392,10 @@ def write_junit(db, root, meta, aid, rid, props, strict) -> None:
     # stdout carries only this command's one-line JSON report.
     try:
         with contextlib.redirect_stdout(sys.stderr):
-            results(results_argv(meta, root, aid, rid, props, strict))
+            results(
+                results_argv(meta, root, aid, rid, props, strict),
+                assigned_trust=props.get(TRUST_PROP, ""),
+            )
     except SystemExit as exit_:
         if exit_.code not in (0, None):
             raise BundleError(f"results exited {exit_.code}", FAILED) from None
