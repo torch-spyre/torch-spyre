@@ -31,7 +31,7 @@ Applying them in filename order works from an empty database.
 | `57-failure-forensics-views.sql` | `v_result_run_context`, `v_failure_fingerprint`, `v_case_run_history`, `v_failure_recurrence`, `v_failure_first_seen`, `v_failure_groups` | 10, 20, 45, 47, 53 |
 | `58-ci-event-records.sql` | `poller_decisions`, `ci_write_failures`, `merge_queue_events` | — |
 | `59-ci-request-views.sql` | `v_ci_requests`, `v_ci_cell_durations` | 20, 42, 50 |
-| `60-benchmark-views.sql` | 5 `v_benchmark_*` views | 20, 30, 50 |
+| `60-benchmark-views.sql` | `benchmark_excluded_record_types`, `v_benchmark_runs_measured`, 5 `v_benchmark_*` views | 20, 30, 50 |
 | `62-benchmark-verdicts.sql` | `benchmark_metric_policy`, `v_benchmark_metric_verdicts`, `v_benchmark_gate`, `benchmark_metric_verdicts` + its refreshable MV | 60 |
 | `63-perf-regression-gate.sql` | `v_perf_regression_gate` | 20, 62 |
 | `64-rbac.sql` | `rbac_roles`, `rbac_bindings`, each with a `*_versions` log and MV | — |
@@ -61,6 +61,12 @@ The `50`/`51`/`52` split is by what a view reads, not by taste: the artifact and
 families are independent, and `v_run_coverage` is separate because it measures the join between
 them (`artifact_results` to `test_case_runs`). The `51` tier views read `artifact_results` only
 to learn which tier a run's leg was dispatched for.
+
+Comparison targets are not measurements: a `benchmark_runs` row with `run.ref_only = '1'` (or
+`run.record_type = 'reference'`) is dropped by `v_benchmark_runs_measured`, which the benchmark views
+read, and by the HUD projection (an MV cannot read a view). The trend, backend-compare and verdict
+views also skip the record types in `benchmark_excluded_record_types`; the artifact, tag, coverage and
+dispatch views skip `component = 'reference'` artifacts and `tag_family = 'reference'` tags.
 
 `70-` is named for what it is — a projection of `benchmark_runs` into the shape the PyTorch HUD
 reads — rather than for a table, because the tables it declares carry upstream's names

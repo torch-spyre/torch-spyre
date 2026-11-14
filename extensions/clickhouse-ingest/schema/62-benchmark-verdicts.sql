@@ -106,6 +106,7 @@ FROM (
                     ARRAY JOIN arrayFlatten(arrayMap(kv -> arrayMap(v -> (kv.1, v), kv.2),
                                CAST(samples, 'Array(Tuple(String, Array(Float64)))'))) AS s
                     WHERE s.2 != 0
+                      AND record_type NOT IN (SELECT record_type FROM benchmark_excluded_record_types)
                     GROUP BY run_id, benchmark_id, component, backend, arch, source_job, metric
                 )
                 WINDOW w AS (PARTITION BY component, benchmark_id, backend, arch, source_job, metric

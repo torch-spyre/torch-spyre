@@ -44,6 +44,8 @@ SELECT
     uniqExact(t.artifact_id) > 1       AS is_rolling  -- within this (component, arch, artifact_name) slot
 FROM artifact_tags AS t
 INNER JOIN v_artifacts AS a ON a.artifact_id = t.artifact_id
+-- Comparison-target artifacts are not builds; the tag and result views below inherit this.
+WHERE t.tag_family != 'reference' AND a.component != 'reference'
 GROUP BY tag, component, arch, artifact_name;
 
 -- The tag picker: one row per tag, so the UI lists channels without resolving each. arch_list
@@ -82,6 +84,7 @@ FROM
                AS slot_artifacts
     FROM artifact_tags AS at
     LEFT JOIN v_artifacts AS a ON a.artifact_id = at.artifact_id
+    WHERE at.tag_family != 'reference' AND ifNull(a.component, '') != 'reference'
 ) AS t
 GROUP BY tag;
 
@@ -286,7 +289,8 @@ LEFT JOIN (
           AND props['upload_id'] IN (SELECT toString(upload_id) FROM v_retracted_rounds)
         GROUP BY run_id
     ) AS d ON d.run_id = rc.run_id
-) AS c ON c.run_id = r.run_id;
+) AS c ON c.run_id = r.run_id
+WHERE ifNull(a.component, '') != 'reference';
 
 -- Combined functional + performance results for every artifact in one tag. INNER JOIN on the
 -- tag-resolved artifact_id, not tag directly, is what makes this safe (see v_tag_resolution).

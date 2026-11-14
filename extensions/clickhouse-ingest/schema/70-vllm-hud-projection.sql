@@ -133,8 +133,10 @@ FROM benchmark_runs AS r
 INNER JOIN benchmarks AS b USING (benchmark_id)
 ARRAY JOIN arrayZip(mapKeys(r.measurements), mapValues(r.measurements)) AS m
 -- Measured model-level rows only: predicted backends and experiment subjects share these tables.
+-- The run.ref_only / run.record_type test is v_benchmark_runs_measured's, which an MV cannot read.
 WHERE r.component = 'spyre-inference' AND r.backend = 'spyre' AND b.props['record_type'] = 'model'
-  AND NOT startsWith(r.props['source_file'], 'optbench-');
+  AND NOT startsWith(r.props['source_file'], 'optbench-')
+  AND r.props['run.ref_only'] != '1' AND r.props['run.record_type'] != 'reference';
 
 -- ── upstream's dropdown table, its own definition ───────────────────────────────────────────
 -- Keeps oss_ci_benchmark_names/_branches fast, and is where the PREWHERE lands. Copied from

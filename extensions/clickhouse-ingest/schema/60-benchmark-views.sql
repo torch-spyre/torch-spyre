@@ -1,6 +1,23 @@
 -- Views over benchmarks / benchmark_runs: the wide shape the dashboard already speaks, and the
 -- backend ratio v1 stored as a column. Regression verdicts are 62-benchmark-verdicts.sql.
 
+-- Record types that are not a benchmark's own measurement series: a comparison target
+-- (reference) or a run's internal trace. The trend, backend-compare and verdict views skip them;
+-- v_benchmark_results_enriched keeps these for readers of the trace; it drops only runs marked
+-- as references (v_benchmark_runs_measured), never a case by its record_type.
+CREATE VIEW IF NOT EXISTS benchmark_excluded_record_types AS
+SELECT * FROM values(
+    'record_type String',
+    'reference', 'step_trace', 'span', 'trace_phase', 'trace_step', 'trace_kernel', 'compile_pass'
+);
+
+-- benchmark_runs without comparison targets. A reference value is stored as a run row
+-- (run.ref_only) and is never a measurement of ours; an MV cannot read through a view, so
+-- 70-vllm-hud-projection.sql repeats this predicate.
+CREATE VIEW IF NOT EXISTS v_benchmark_runs_measured AS
+SELECT * FROM benchmark_runs
+WHERE props['run.ref_only'] != '1' AND props['run.record_type'] != 'reference';
+
 -- Every benchmark measurement with its identity, run context and tag resolved -- the base join
 -- for everything below.
 CREATE VIEW IF NOT EXISTS v_benchmark_results_enriched AS
@@ -43,7 +60,7 @@ SELECT
     ifNull(parseDateTimeBestEffortOrNull(r.props['run_utc'], 'UTC')::Nullable(DateTime), r.ts) AS run_ts,
     if(isNull(parseDateTimeBestEffortOrNull(r.props['run_utc'], 'UTC')), 'ingest', 'run_utc') AS ts_source,
     ar.test_type, ar.state
-FROM benchmark_runs AS r
+FROM v_benchmark_runs_measured AS r
 INNER JOIN benchmarks AS b USING (benchmark_id)
 -- Deduped to one artifact_results row per run first: a plain MergeTree with no dedup key would
 -- otherwise let a re-ingested leg double every measurement. Latest by (ts, audit_timestamp): a
@@ -102,6 +119,7 @@ SELECT
     value / baseline_value   AS ratio
 FROM v_benchmark_results_enriched
 WHERE measurements['spyre_ms'] != 0 AND measurements['cpu_ms'] != 0
+  AND record_type NOT IN (SELECT record_type FROM benchmark_excluded_record_types)
 UNION ALL
 SELECT
     t.run_id, t.benchmark_id, t.component, t.name, t.arch, t.record_type, t.kernel_name,
@@ -116,6 +134,7 @@ FROM
     FROM v_benchmark_results_enriched
     ARRAY JOIN CAST(measurements, 'Array(Tuple(String, Float64))') AS m
     WHERE backend != 'sendnn' AND m.2 != 0
+      AND record_type NOT IN (SELECT record_type FROM benchmark_excluded_record_types)
 ) AS t
 ASOF INNER JOIN
 (
@@ -139,6 +158,7 @@ SELECT
     uniqExact(run_id) AS runs
 FROM v_benchmark_results_enriched
 ARRAY JOIN CAST(measurements, 'Array(Tuple(String, Float64))') AS m
+WHERE record_type NOT IN (SELECT record_type FROM benchmark_excluded_record_types)
 GROUP BY day, benchmark_id, name, component, backend, arch, metric;
 
 -- One row per (benchmark run, tag its artifact holds now): which image a perf number came from,
@@ -169,7 +189,7 @@ SELECT
 FROM
 (
     SELECT run_id, any(component) AS component, any(props['arch']) AS arch, min(ts) AS run_ts
-    FROM benchmark_runs
+    FROM v_benchmark_runs_measured
     GROUP BY run_id
 ) AS r
 -- One artifact per run, the latest verdict's, as v_benchmark_results_enriched picks it.
