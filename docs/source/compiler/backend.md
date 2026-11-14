@@ -33,9 +33,10 @@ SuperDSC (Super Design Space Config) is a JSON-based intermediate representation
 
 | Field | Purpose |
 |---|---|
-| `coreFoldProp_` | How the iteration space is divided across cores (for example `{"factor_": 2}` for a 2-core split). |
+| `coreFoldProp_` | Positional physical core span. It includes unused positions when work slices use sparse core IDs. |
+| `numCoresUsed_` | Positional physical core span at the SuperDSC level. The nested DSC count and `coreIdsUsed_` list only cores that run the operation. |
 | `numWkSlicesPerDim_` | Number of work slices per iteration dimension. `{"c0": 2, "c1": 1}` says dim `c0` is split two ways and dim `c1` is not split. |
-| `coreIdToWkSlice_` | Maps each core ID to the slice indices it owns. |
+| `coreIdToWkSlice_` | Maps each active core ID to the slice indices it owns. Inactive positions in a sparse core fold are not listed. |
 | `dscs_` | Array of `DesignSpaceConfig` entries, one per compute configuration. |
 
 Each `dscs_` entry is a complete description of one compute configuration:
@@ -46,7 +47,7 @@ Each `dscs_` entry is a complete description of one compute configuration:
 | `dataStageParam_` | Per-core dimension sizes for the steady-state (`ss_`) and epilogue (`el_`) passes. Tells the runtime how to partition data for transfer into scratchpad. |
 | `primaryDsInfo_` | Tiling information per logical role (`INPUT`, `KERNEL`, `OUTPUT`, `KERNEL_IDX`): `layoutDimOrder_`, `stickDimOrder_`, `stickSize_`. |
 | `labeledDs_` | Tensor descriptors. Each entry pairs a tensor argument with its `dsType_` (tiling layout class), `dataFormat_` (for example `SEN169_FP16`), and `memOrg_` (HBM or LX residency). The `layoutDimOrder_` of each entry is independent: two arguments of the same op can pick different dim orders. |
-| `scheduleTree_` | Allocate nodes, one per tensor, with memory placement (HBM or LX scratchpad), dimension ordering, per-core start addresses via fold mappings, and coordinate information. |
+| `scheduleTree_` | Allocate nodes, one per tensor, with memory placement (HBM or LX scratchpad), dimension ordering, per-core start addresses via fold mappings, and coordinate information. A shuffle can give its source and destination separate slice mappings. Each mapping lists the physical cores that own that tensor. |
 | `computeOp_` | One entry per operation, encoding the execution unit (`PT` or `SFP`), op name, data format, fidelity, and input/output tensor references. |
 | `debug_handle_` | Per-operation provenance metadata linking the DSC back to source code. Contains a stable content hash and a `SourceLoc` (file, line, function) extracted from the FX graph's `stack_trace`. |
 

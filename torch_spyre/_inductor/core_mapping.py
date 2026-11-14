@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
@@ -588,6 +589,83 @@ def core_to_slice_mapping(
         result[dims[dim]] = coordinate
         stride *= split
     return result
+
+
+def resolve_core_stride(num_cores: int, physical_cores: int) -> int:
+    """Spread ``num_cores`` logical slices evenly over a wider physical span.
+
+    Returns the largest ``S`` with ``num_cores * S <= physical_cores`` and
+    ``physical_cores % num_cores == 0``, so slice ``i`` lands on physical core
+    ``i * S`` and every placement uses equally spaced ids. Returns 1 (no
+    spreading) when ``num_cores`` does not divide ``physical_cores``, when
+    either count is non-positive, or when there is only one slice to place:
+    with nothing to space out, widening the fold would only add overhead.
+    """
+    if num_cores <= 1 or physical_cores <= 0 or physical_cores % num_cores != 0:
+        return 1
+    return physical_cores // num_cores
+
+
+def apply_core_stride(
+    core_map: Mapping[Symbol, Expr], num_cores: int, physical_cores: int
+) -> tuple[dict[Symbol, Expr], int, tuple[int, ...]]:
+    """Place ``num_cores`` logical slices onto a strided physical core span.
+
+    ``core_map`` holds formulas in ``Symbol("core_id")`` over the logical
+    range ``0..num_cores-1``. The backend's core fold is positional: its size
+    is the highest id in use plus one, and the dispatched set is whatever ids
+    are actually listed, so a wider, evenly spaced span is a legal physical
+    placement as long as exactly one physical id per logical slice is
+    dispatched. ``resolve_core_stride`` picks that spacing from the physical
+    core count; a stride of 1 returns ``core_map`` unchanged.
+
+    Returns the rewritten map, the widened fold size (``num_cores * stride``),
+    and the dispatched physical ids.
+    """
+    stride = resolve_core_stride(num_cores, physical_cores)
+    if stride == 1:
+        return dict(core_map), num_cores, tuple(range(num_cores))
+    core_id = Symbol("core_id")
+    rewritten = {
+        dim: owner.xreplace({core_id: floor(core_id / stride)})
+        for dim, owner in core_map.items()
+    }
+    span = num_cores * stride
+    return rewritten, span, tuple(range(0, span, stride))
+
+
+def apply_neg_shift(
+    core_map: Mapping[Symbol, Expr], num_cores: int, physical_cores: int
+) -> tuple[dict[Symbol, Expr], int, tuple[int, ...]]:
+    """Place ``num_cores`` logical slices with a downward half-count shift.
+
+    Logical slice ``i`` dispatches physical core ``(i - num_cores // 2)
+    % physical_cores``. The resulting set balances the two 16-core halves
+    of the card (low ids of the first half, high ids of the second) at
+    every active count, mirroring the validated [0, 31] two-core placement.
+    Owners are rewritten so each physical id maps back to its logical slice
+    via ``(core_id + num_cores // 2) % physical_cores``. Returns the
+    rewritten map, the fold size (``max(physical_cores, num_cores)``), and
+    the dispatched physical ids. A no-op for ``num_cores <= 1``, when the
+    slice count does not divide the physical core count, or when the shift
+    would be zero.
+    """
+    min_shift = int(os.environ.get("SPYRE_NEG_SHIFT_MIN", "2"))
+    if (
+        num_cores < min_shift
+        or num_cores >= physical_cores
+        or physical_cores % num_cores != 0
+    ):
+        return dict(core_map), num_cores, tuple(range(num_cores))
+    shift = num_cores // 2
+    ids = tuple((i - shift) % physical_cores for i in range(num_cores))
+    span = max(physical_cores, num_cores)
+    core_id = Symbol("core_id")
+    logical = (core_id + shift) % physical_cores
+    rewritten = {
+        dim: owner.xreplace({core_id: logical}) for dim, owner in core_map.items()
+    }
+    return rewritten, span, ids
 
 
 def matmul_reduction_dim(

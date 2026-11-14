@@ -27,9 +27,9 @@ from torch_spyre._inductor.constants import (
     POOL_OPS,
 )
 from torch_spyre._inductor.errors import Unsupported
-from torch_spyre._inductor.sharded_hbm import verify_non_unified_split
 from torch_spyre._inductor.op_spec import TensorWorkDivision
 from torch_spyre._inductor.pass_utils import coeff_through_floor
+from torch_spyre._inductor.sharded_hbm import verify_non_unified_split
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1486,8 +1486,10 @@ def generate_sdsc(
             extra["allocateNode_"] = alloc_node
         return extra
 
-    active_core_ids = sdsc_spec.completed_producer_cores or tuple(
-        range(sdsc_spec.num_cores)
+    active_core_ids = (
+        sdsc_spec.active_core_ids
+        or sdsc_spec.completed_producer_cores
+        or tuple(range(sdsc_spec.num_cores))
     )
     return (
         {
@@ -1508,7 +1510,12 @@ def generate_sdsc(
                 },
                 "coreFoldProp_": {"factor_": sdsc_spec.num_cores, "label_": "core"},
                 "coreletFoldProp_": {"factor_": 1, "label_": "corelet"},
-                "numCoresUsed_": len(active_core_ids),
+                # The SuperDSC count covers the positional core fold, including
+                # its unused positions. The nested DSC count and coreIdsUsed_
+                # still describe only the cores that execute this operation.
+                # A smaller top-level count aliases runtime correction symbols
+                # for nonadjacent cores in a sparse HBM output copy.
+                "numCoresUsed_": sdsc_spec.num_cores,
                 "coreIdToDsc_": {str(c): 0 for c in active_core_ids},
                 # The top-level map is the operation schedule. Each shuffle
                 # tensor's physical owners are carried separately on its
@@ -1522,13 +1529,13 @@ def generate_sdsc(
                 # Window dims (ki/kj) are not real dims of any tensor for pool
                 # operations and hence should not be emitted
                 "coreIdToWkSlice_": {
-                    core: {
-                        dim: slc
-                        for dim, slc in slices.items()
+                    str(core): {
+                        str(dim): slc
+                        for dim, slc in core_id_to_wk_slice[str(core)].items()
                         if sdsc_spec.opfunc not in POOL_OPS
                         or dim not in sdsc_spec.window_dims
                     }
-                    for core, slices in core_id_to_wk_slice.items()
+                    for core in active_core_ids
                 },
                 "coreIdToDscSchedule": {
                     str(c): [[-1, 0, 0, 0]] for c in active_core_ids
@@ -1760,9 +1767,11 @@ def generate_sdsc(
                                                     tensor.work_division.num_cores
                                                     or sdsc_spec.num_cores
                                                 ).items()
-                                                if i != 0
-                                                or not sdsc_spec.completed_producer_cores
-                                                or int(core) in active_core_ids
+                                                if (
+                                                    not tensor.active_core_ids
+                                                    or int(core)
+                                                    in tensor.active_core_ids
+                                                )
                                             }
                                             if sdsc_spec.opfunc == "shuffle"
                                             and tensor.work_division is not None

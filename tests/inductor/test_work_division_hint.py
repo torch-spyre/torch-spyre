@@ -12,62 +12,60 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections.abc import Sequence
-from contextlib import contextmanager
-from dataclasses import replace
 import json
 import logging
 import logging.handlers
 import math
-import regex as re
+from collections.abc import Sequence
+from contextlib import contextmanager
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock, patch as mock_patch
+from unittest.mock import MagicMock
+from unittest.mock import patch as mock_patch
 
 import pytest
+import regex as re
 import sympy
-from sympy import Eq, floor, Integer, Mod, Piecewise, Symbol
 import torch
 import torch.fx.traceback
-from torch.fx.graph_module import GraphModule
+from for_each_tile_fixtures import (
+    carried_expert_sum_fn,
+    carried_routed_expert_sum_fn,
+)
+from sympy import Eq, Integer, Mod, Piecewise, Symbol, floor
 from torch._decomp import get_decompositions
 from torch._dynamo.test_case import (
     TestCase as DynamoTestCase,
 )
-from torch._functorch.aot_autograd import aot_module_simplified
 from torch._functorch._aot_autograd.utils import make_boxed_func
-from torch._inductor.test_case import TestCase as InductorTestCase
+from torch._functorch.aot_autograd import aot_module_simplified
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ir import NoneLayout
-from torch._inductor.utils import run_and_get_code, InputType
+from torch._inductor.test_case import TestCase as InductorTestCase
+from torch._inductor.utils import InputType, run_and_get_code
+from torch.fx.graph_module import GraphModule
+from utils_inductor import (
+    capture_backend_output_dirs,
+    mock_backend_compiler,
+    opspec_summaries,
+)
 
-from torch_spyre._inductor import config, spyre_hint
 import torch_spyre._inductor.core_mapping as core_mapping_module
-import torch_spyre._inductor.scratchpad.lx_relayout as lx_relayout_module
 import torch_spyre._inductor.scheduler as scheduler_module
+import torch_spyre._inductor.scratchpad.allocator as allocator_module
+import torch_spyre._inductor.scratchpad.lx_relayout as lx_relayout_module
 import torch_spyre._inductor.work_division as _wd
 import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
-from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 from torch_spyre._C import DataFormats, SpyreTensorLayout
+from torch_spyre._inductor import config, spyre_hint
 from torch_spyre._inductor.codegen.superdsc import compile_op_spec, parse_op_spec
 from torch_spyre._inductor.constants import (
     BATCH_MATMUL_OP,
     IDENTITY_OP,
 )
+from torch_spyre._inductor.core_mapping import remap_work_division
 from torch_spyre._inductor.ir import FixedTiledLayout
-from for_each_tile_fixtures import (
-    carried_expert_sum_fn,
-    carried_routed_expert_sum_fn,
-)
-from utils_inductor import (
-    opspec_summaries,
-    mock_backend_compiler,
-    capture_backend_output_dirs,
-)
-from torch_spyre._inductor.scratchpad.lx_relayout import (
-    LXRelayoutPlan,
-    work_division_from_view,
-)
 from torch_spyre._inductor.op_spec import (
     LX_RELAYOUT_INFO_KEY,
     OpSpec,
@@ -75,16 +73,22 @@ from torch_spyre._inductor.op_spec import (
     TensorWorkDivision,
 )
 from torch_spyre._inductor.pass_utils import PerCoreView
-import torch_spyre._inductor.scratchpad.allocator as allocator_module
 from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
 from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
     FirstFitLayoutSolver,
 )
 from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
-from torch_spyre._inductor.spyre_kernel import SpyreKernel, _iter_op_specs
+from torch_spyre._inductor.scratchpad.lx_relayout import (
+    LXRelayoutPlan,
+    work_division_from_view,
+)
 from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
-from torch_spyre._inductor.core_mapping import remap_work_division
-from torch_spyre._inductor.spyre_kernel import simplify_op_spec
+from torch_spyre._inductor.spyre_kernel import (
+    SpyreKernel,
+    _iter_op_specs,
+    simplify_op_spec,
+)
+from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 
 _LAUNCH_JOBPLAN = "torch_spyre.execution.kernel_runner.launch_jobplan"
 _PREPARE_KERNEL = "torch_spyre.execution.kernel_runner.prepare_kernel"
@@ -1441,6 +1445,40 @@ def _compile_spec(spec, normalize=True):
     ]
 
 
+@config.patch({"sencores": 32})
+def test_sparse_relayout_preserves_distinct_source_and_destination_slices():
+    """Shuffle reads and writes the same physical cores as adjacent stages."""
+    row, feature = Symbol("sparse_row"), Symbol("sparse_feature")
+    source = _view({0: 2}, {0: _CORE_ID}, 2)
+    destination = _view({1: 2}, {1: _CORE_ID}, 2)
+    spec = _completed_route_spec(
+        source,
+        destination,
+        [2, 2, 64],
+        [row, feature, Integer(0)],
+        {row: (Integer(2), 1), feature: (Integer(2), 2)},
+        (),
+        512,
+    )
+    root, allocations = _compile_spec(spec)
+    active = {"0", "16"}
+    assert root["coreFoldProp_"]["factor_"] == 32
+    assert set(root["coreIdToDsc_"]) == active
+    assert set(root["coreIdToWkSlice_"]) == active
+    assert root["dscs_"][0]["shuffle"]["coreIdsUsed_"] == [0, 16]
+    source_map, destination_map = [
+        node["coordinates_"]["coreIdToWkSlice_"] for node in allocations
+    ]
+    assert set(source_map) == active
+    assert set(destination_map) == active
+    assert source_map["0"] == {"mb": 0, "x": 0, "out": 0}
+    assert source_map["16"] == {"mb": 1, "x": 0, "out": 0}
+    assert destination_map["0"] == {"mb": 0, "x": 0, "out": 0}
+    assert destination_map["16"] == {"mb": 0, "x": 0, "out": 1}
+    assert spec.args[0].work_division.num_cores == 2
+    assert spec.args[1].work_division.num_cores == 2
+
+
 def test_lx_relayout_normalizes_ownership_and_lowers_only_in_superdsc():
     m, n = Symbol("m"), Symbol("n")
     source_view = PerCoreView(
@@ -1492,11 +1530,14 @@ def test_lx_relayout_normalizes_ownership_and_lowers_only_in_superdsc():
         {Symbol("z0"): 2, m: 4},
     ]
     assert root["numWkSlicesPerDim_"] == {"mb": 1, "x": 8, "out": 1}
+    active = [4 * core for core in range(8)]
+    assert root["dscs_"][0]["shuffle"]["coreIdsUsed_"] == active
     maps = [node["coordinates_"]["coreIdToWkSlice_"] for node in allocations]
-    assert [maps[0][str(i)]["x"] for i in range(8)] == [i // 2 for i in range(8)]
-    assert [maps[0][str(i)]["out"] for i in range(8)] == [i % 2 for i in range(8)]
-    assert [maps[1][str(i)]["x"] for i in range(8)] == [i % 2 for i in range(8)]
-    assert [maps[1][str(i)]["out"] for i in range(8)] == [i // 2 for i in range(8)]
+    assert all(set(mapping) == {str(core) for core in active} for mapping in maps)
+    assert [maps[0][str(core)]["x"] for core in active] == [i // 2 for i in range(8)]
+    assert [maps[0][str(core)]["out"] for core in active] == [i % 2 for i in range(8)]
+    assert [maps[1][str(core)]["x"] for core in active] == [i % 2 for i in range(8)]
+    assert [maps[1][str(core)]["out"] for core in active] == [i // 2 for i in range(8)]
     coord_info = [node["coordinates_"]["coordInfo"] for node in allocations]
     assert coord_info[0]["x"]["folds"]["dim_prop_func"][0]["Affine"]["alpha_"] == 2
     assert coord_info[1]["x"]["folds"]["dim_prop_func"][0]["Affine"]["alpha_"] == 4
@@ -2300,7 +2341,12 @@ def test_completed_reduction_relayout_device(
         root
         for root in roots
         if "shuffle" in root["dscs_"][0]
-        and set(root["coreIdToDsc_"]) == {str(c) for c in range(k - 1, 32, k)}
+        and {
+            int(core)
+            for node in root["dscs_"][0]["shuffle"]["scheduleTree_"][:1]
+            for core in node["coordinates_"]["coreIdToWkSlice_"]
+        }
+        == set(range(k - 1, 32, k))
     ]
     assert len(copies) == int(enabled)
     if enabled:
@@ -2358,7 +2404,8 @@ def test_completed_reduction_routes_survive_alignment_unchanged():
     assert set(root["dscs_"][0]) == {"shuffle"}
     assert spec.completed_producer_cores == (3, 7)
     assert "prodConsList" not in root
-    assert root["numCoresUsed_"] == 2
+    assert root["numCoresUsed_"] == 8
+    assert set(root["coreIdToWkSlice_"]) == {str(core) for core in range(8)}
     source_map, destination_map = [
         node["coordinates_"]["coreIdToWkSlice_"] for node in allocations
     ]
@@ -2392,8 +2439,8 @@ def test_completed_reduction_can_copy_to_its_sixteen_consumers():
         65536,
     )
     from torch_spyre._inductor.op_spec_validation import (
-        _check_completed_reduction_route,
         OpSpecValidationError,
+        _check_completed_reduction_route,
     )
 
     _check_completed_reduction_route(spec, "test")
@@ -2410,7 +2457,7 @@ def test_completed_reduction_can_copy_to_its_sixteen_consumers():
         allocation["coordinates_"]["coreIdToWkSlice_"] for allocation in allocations
     ]
     assert set(source_map) == {str(2 * c + 1) for c in range(16)}
-    assert set(destination_map) == {str(c) for c in range(16)}
+    assert set(destination_map) == {str(2 * c) for c in range(16)}
 
 
 @config.patch({"sencores": 32})
@@ -2443,8 +2490,8 @@ def test_completed_reduction_gathers_finished_output_halves():
         65536,
     )
     from torch_spyre._inductor.op_spec_validation import (
-        _check_completed_reduction_route,
         OpSpecValidationError,
+        _check_completed_reduction_route,
     )
 
     _check_completed_reduction_route(spec, "test")
@@ -2460,7 +2507,7 @@ def test_completed_reduction_gathers_finished_output_halves():
             )
     root, allocations = _compile_spec(spec)
     assert "prodConsList" not in root
-    assert root["numCoresUsed_"] == 16
+    assert root["numCoresUsed_"] == 32
     source_map, destination_map = [
         allocation["coordinates_"]["coreIdToWkSlice_"] for allocation in allocations
     ]
@@ -2631,11 +2678,10 @@ def test_contraction_requires_disjoint_full_physical_spans(
 def test_relayout_codegen_wraps_only_a_contracted_operation_frame(
     source_cores, destination_cores
 ):
-    """Keep tensor domains distinct while scheduling every required core.
+    """Keep tensor domains distinct while scheduling each required physical core.
 
-    This regression covers the existing codegen behavior on main. This PR
-    does not change that path. C4 tracks replacing the shape-derived frame
-    correction with explicit domains end-to-end in torch-spyre#5716.
+    A contraction repeats the destination frame. A sparse placement maps each
+    tensor's logical domain to its own physical core IDs.
     """
     row, feature = Symbol("row"), Symbol("feature")
     source = TensorWorkDivision(
@@ -2675,19 +2721,28 @@ def test_relayout_codegen_wraps_only_a_contracted_operation_frame(
     parsed, renamed = parse_op_spec(spec)
     r, f = renamed[row], renamed[feature]
     assert parsed.opfunc == "shuffle", "unequal ownership became an ordinary identity"
-    assert parsed.num_cores == max(source_cores, destination_cores)
+    source_stride = 32 // source_cores
+    destination_stride = 32 // destination_cores
+    assert parsed.num_cores == 32
     assert parsed.work_slices == {r: destination_cores, f: 1}
     assert parsed.core_id_to_work_slice[f] == 0
+    assert parsed.active_core_ids == tuple(
+        sorted(set(range(0, 32, source_stride)) | set(range(0, 32, destination_stride)))
+    )
     actual_source, actual_destination = [arg.work_division for arg in parsed.args]
-    assert actual_source.num_cores == source_cores
+    assert actual_source.num_cores == 32
     assert actual_source.work_slices == {r: source_cores // 2, f: 2}
+    source_core = floor(_CORE_ID / source_stride) if source_stride > 1 else _CORE_ID
     assert actual_source.core_id_to_work_slice == {
-        r: floor(_CORE_ID / 2),
-        f: Mod(_CORE_ID, 2),
+        r: floor(source_core / 2),
+        f: Mod(source_core, 2),
     }
-    assert actual_destination.num_cores == destination_cores
+    assert actual_destination.num_cores == 32
     assert actual_destination.work_slices == {r: destination_cores, f: 1}
-    assert actual_destination.core_id_to_work_slice == {r: _CORE_ID, f: 0}
+    destination_core = (
+        floor(_CORE_ID / destination_stride) if destination_stride > 1 else _CORE_ID
+    )
+    assert actual_destination.core_id_to_work_slice == {r: destination_core, f: 0}
     assert not actual_source.same_ownership(actual_destination)
     assert spec.core_id_to_work_slice == {row: _CORE_ID, feature: 0}
     assert spec.args[0].work_division is source
@@ -2745,26 +2800,24 @@ def test_relayout_operation_frame_keeps_tensor_domains(source_cores, destination
     original_tensor_domains = [arg.work_division.num_cores for arg in spec.args]
     parsed, _ = parse_op_spec(spec)
     assert operation_cores == destination_cores
-    assert parsed.num_cores == max(source_cores, destination_cores)
-    assert (
-        [arg.work_division.num_cores for arg in parsed.args]
-        == original_tensor_domains
-        == [source_cores, destination_cores]
-    )
+    source_stride = 32 // source_cores
+    destination_stride = 32 // destination_cores
+    assert parsed.num_cores == 32
+    assert [arg.work_division.num_cores for arg in parsed.args] == [32, 32]
+    assert original_tensor_domains == [source_cores, destination_cores]
     (split_dim,) = [dim for dim, count in parsed.work_slices.items() if count > 1]
     owner = parsed.core_id_to_work_slice[split_dim]
-    if source_cores <= destination_cores:
-        core = Symbol("physical_core", integer=True)
-        assert (
-            sympy.simplify(Mod(owner.subs(_CORE_ID, core) - core, parsed.num_cores))
-            == 0
-        ), "equal/expanded operation frame was repeated"
-    assert [int(owner.subs(_CORE_ID, core)) for core in range(parsed.num_cores)] == [
-        core % destination_cores for core in range(parsed.num_cores)
+    active_cores = [destination_stride * core for core in range(operation_cores)]
+    assert [int(owner.subs(_CORE_ID, core)) for core in active_cores] == [
+        core for core in range(destination_cores)
     ]
-    for argument, physical_count, expected in zip(
-        parsed.args, [source_cores, destination_cores], [source_owner, _CORE_ID]
+    for argument, original_count, stride, expected in zip(
+        parsed.args,
+        [source_cores, destination_cores],
+        [source_stride, destination_stride],
+        [source_owner, _CORE_ID],
     ):
+        assert argument.active_core_ids == tuple(range(0, 32, stride))
         (dimension,) = [
             dim
             for dim, count in argument.work_division.work_slices.items()
@@ -2772,8 +2825,8 @@ def test_relayout_operation_frame_keeps_tensor_domains(source_cores, destination
         ]
         formula = argument.work_division.core_id_to_work_slice[dimension]
         assert [
-            int(formula.subs(_CORE_ID, core)) for core in range(physical_count)
-        ] == [int(expected.subs(_CORE_ID, core)) for core in range(physical_count)]
+            int(formula.subs(_CORE_ID, stride * core)) for core in range(original_count)
+        ] == [int(expected.subs(_CORE_ID, core)) for core in range(original_count)]
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -2844,6 +2897,7 @@ def test_hinted_view_fx_rewrite_and_refusals(monkeypatch, leading_batch, violati
 
     import torch
     from torch.fx import Graph, GraphModule
+
     from torch_spyre._inductor import materialize_hinted_views as pass_module
 
     monkeypatch.setattr(pass_module, "DEVICE_NAME", "cpu")
